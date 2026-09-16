@@ -2,6 +2,32 @@
 
 use crate::hash::{Digest, Hmac};
 
+/// Error returned by the fallible PBKDF2 entry point [`try_pbkdf2`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// `iterations` was zero. RFC 8018 §5.2 requires at least one PRF round
+    /// (`c` is a positive integer); with zero rounds no output block would
+    /// be derived at all.
+    ZeroIterations,
+    /// `out.len()` would need more than `2^32 - 1` output blocks, which the
+    /// RFC 8018 §5.2 32-bit block counter cannot address.
+    OutputTooLong,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::ZeroIterations => f.write_str("PBKDF2 requires at least one iteration"),
+            Error::OutputTooLong => {
+                f.write_str("PBKDF2 output length exceeds RFC 8018 §5.2 limit (2^32 - 1 blocks)")
+            }
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
 /// Derives a key of length `out.len()` from `password` and `salt` using
 /// PBKDF2 with `iterations` rounds of HMAC-`D` as the PRF.
 ///
@@ -16,7 +42,8 @@ use crate::hash::{Digest, Hmac};
 /// hundreds of GiB even for SHA-256 — and is unreachable in practice;
 /// enforcing it makes a future caller's bug fail loudly rather than wrap
 /// the counter into `block_index = 1` and silently re-derive the first
-/// blocks.
+/// blocks. Callers that take the iteration count or the output length from
+/// untrusted input should use the fallible [`try_pbkdf2`] instead.
 ///
 /// ```
 /// use purecrypto::hash::Sha256;
@@ -26,16 +53,43 @@ use crate::hash::{Digest, Hmac};
 /// pbkdf2::<Sha256>(b"password", b"salt", 4096, &mut key);
 /// ```
 pub fn pbkdf2<D: Digest>(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
-    assert!(iterations >= 1, "PBKDF2 requires at least one iteration");
+    try_pbkdf2::<D>(password, salt, iterations, out).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Fallible PBKDF2: like [`pbkdf2`], but returns [`Error::ZeroIterations`]
+/// when `iterations == 0` and [`Error::OutputTooLong`] when `out.len()`
+/// exceeds the RFC 8018 §5.2 block-counter limit, instead of panicking.
+/// Behaviour is otherwise byte-for-byte identical for valid parameters, and
+/// `out` is left untouched on error.
+///
+/// ```
+/// use purecrypto::hash::Sha256;
+/// use purecrypto::kdf::{Pbkdf2Error, try_pbkdf2};
+///
+/// let mut key = [0u8; 32];
+/// assert_eq!(
+///     try_pbkdf2::<Sha256>(b"password", b"salt", 0, &mut key),
+///     Err(Pbkdf2Error::ZeroIterations)
+/// );
+/// assert!(try_pbkdf2::<Sha256>(b"password", b"salt", 4096, &mut key).is_ok());
+/// ```
+pub fn try_pbkdf2<D: Digest>(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    out: &mut [u8],
+) -> Result<(), Error> {
+    if iterations == 0 {
+        return Err(Error::ZeroIterations);
+    }
 
     let hlen = D::OUTPUT_LEN;
     // RFC 8018 §5.2 step 1: derived-key length must fit within the
     // 32-bit block counter. The maximum is (2^32 - 1) * hlen bytes.
     let max_len = (u32::MAX as usize).saturating_mul(hlen);
-    assert!(
-        out.len() <= max_len,
-        "PBKDF2 output length exceeds RFC 8018 §5.2 limit (2^32 - 1 blocks)",
-    );
+    if out.len() > max_len {
+        return Err(Error::OutputTooLong);
+    }
 
     // Key the HMAC with the password exactly once. Each U_j is then a cheap
     // `clone()` of this keyed state, which skips re-deriving the ipad/opad
@@ -46,12 +100,13 @@ pub fn pbkdf2<D: Digest>(password: &[u8], salt: &[u8], iterations: u32, out: &mu
     let mut block_index: u32 = 1;
     for chunk in out.chunks_mut(hlen) {
         derive_block::<D>(&prf, salt, iterations, block_index, chunk);
-        // Use checked_add so an off-by-one bug would trip the assert
+        // Use checked_add so an off-by-one bug would trip the length check
         // above on entry rather than silently wrap to 1.
         block_index = block_index
             .checked_add(1)
             .expect("PBKDF2 block counter overflowed 2^32");
     }
+    Ok(())
 }
 
 /// Computes one PBKDF2 output block `T_i = U_1 ^ U_2 ^ … ^ U_c` and copies its
@@ -155,5 +210,31 @@ mod tests {
         let mut short = [0u8; 20];
         pbkdf2::<Sha256>(b"pw", b"salt", 10, &mut short);
         assert_eq!(short, full[..20]);
+    }
+
+    /// The fallible form reports a zero iteration count as an error, leaves
+    /// the output untouched, and otherwise matches the panicking form byte
+    /// for byte.
+    #[test]
+    fn try_pbkdf2_rejects_zero_iterations_and_matches_infallible() {
+        let mut out = [0xAAu8; 32];
+        assert_eq!(
+            try_pbkdf2::<Sha256>(b"pw", b"salt", 0, &mut out),
+            Err(Error::ZeroIterations)
+        );
+        assert_eq!(out, [0xAAu8; 32], "output must be untouched on error");
+
+        let mut a = [0u8; 40];
+        let mut b = [0u8; 40];
+        pbkdf2::<Sha256>(b"pw", b"salt", 7, &mut a);
+        assert_eq!(try_pbkdf2::<Sha256>(b"pw", b"salt", 7, &mut b), Ok(()));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one iteration")]
+    fn pbkdf2_zero_iterations_still_panics() {
+        let mut out = [0u8; 32];
+        pbkdf2::<Sha256>(b"pw", b"salt", 0, &mut out);
     }
 }

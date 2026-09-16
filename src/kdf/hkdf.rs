@@ -156,12 +156,34 @@ pub fn try_hkdf_expand<D: Digest>(
 }
 
 /// One-shot HKDF: `Extract` then `Expand` into `out`.
+///
+/// # Panics
+/// Panics if `out.len() > 255 * HashLen` (the RFC 5869 maximum). Callers that
+/// derive the output length from untrusted input should use the fallible
+/// [`try_hkdf`] instead.
 pub fn hkdf<D: Digest>(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) {
+    try_hkdf::<D>(salt, ikm, info, out).expect("HKDF output too long (> 255 * HashLen)");
+}
+
+/// Fallible one-shot HKDF: like [`hkdf`], but returns
+/// [`Error::OutputTooLong`] instead of panicking when
+/// `out.len() > 255 * HashLen`. The length is checked before any key material
+/// is derived, and `out` is left untouched on error.
+pub fn try_hkdf<D: Digest>(
+    salt: &[u8],
+    ikm: &[u8],
+    info: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error> {
+    if out.len() > 255 * D::OUTPUT_LEN {
+        return Err(Error::OutputTooLong);
+    }
     let mut prk = hkdf_extract::<D>(salt, ikm);
-    hkdf_expand::<D>(&prk, info, out);
+    let res = try_hkdf_expand::<D>(&prk, info, out);
     // The PRK is as sensitive as the IKM it came from and the caller never
     // sees it; wipe it rather than leaving it in this frame.
     super::wipe(prk.as_mut());
+    res
 }
 
 #[cfg(test)]
@@ -230,6 +252,25 @@ mod parts_tests {
         let prk = hkdf_extract::<Sha256>(b"", b"");
         let mut out = alloc::vec![0u8; 255 * 32 + 1];
         assert!(try_hkdf_expand_parts::<Sha256>(&prk, &[b"i"], &mut out).is_err());
+    }
+
+    /// The one-shot fallible form rejects an over-long output up front
+    /// (leaving the buffer untouched) and otherwise matches `hkdf`.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn try_hkdf_rejects_over_long_output_and_matches_infallible() {
+        let mut out = alloc::vec![0x5Au8; 255 * 32 + 1];
+        assert_eq!(
+            try_hkdf::<Sha256>(b"s", b"ikm", b"info", &mut out),
+            Err(Error::OutputTooLong)
+        );
+        assert!(out.iter().all(|&b| b == 0x5A), "output untouched on error");
+
+        let mut a = [0u8; 70];
+        let mut b = [0u8; 70];
+        hkdf::<Sha256>(b"s", b"ikm", b"info", &mut a);
+        assert_eq!(try_hkdf::<Sha256>(b"s", b"ikm", b"info", &mut b), Ok(()));
+        assert_eq!(a, b);
     }
 }
 

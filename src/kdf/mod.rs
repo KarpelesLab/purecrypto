@@ -33,14 +33,14 @@ pub mod scrypt;
 #[cfg(feature = "alloc")]
 pub use bcrypt_pbkdf::{Error as BcryptPbkdfError, bcrypt_pbkdf};
 pub use hkdf::{
-    Error as HkdfError, hkdf, hkdf_expand, hkdf_extract, hkdf_extract_parts, try_hkdf_expand,
-    try_hkdf_expand_parts,
+    Error as HkdfError, hkdf, hkdf_expand, hkdf_extract, hkdf_extract_parts, try_hkdf,
+    try_hkdf_expand, try_hkdf_expand_parts,
 };
 pub use kbkdf::{
     CmacAes128Prf, CmacAes256Prf, Error as KbkdfError, HmacPrf, HmacSha256Prf, HmacSha384Prf,
     HmacSha512Prf, Prf, kbkdf_counter, kbkdf_counter_fixed, kbkdf_feedback, kbkdf_feedback_fixed,
 };
-pub use pbkdf2::pbkdf2;
+pub use pbkdf2::{Error as Pbkdf2Error, pbkdf2, try_pbkdf2};
 
 /// Best-effort wipe of a secret buffer via [`crate::zeroize::Zeroize`]
 /// (volatile stores plus a compiler fence, so the writes are not elided as

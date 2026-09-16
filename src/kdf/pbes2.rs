@@ -97,8 +97,10 @@ pub enum Error {
     /// derived key was somehow wrong. Returned as one variant to avoid a
     /// padding oracle.
     Decryption,
-    /// KDF parameters below the floor we accept: an iteration count under
-    /// 10_000, or an empty PBKDF2 salt.
+    /// KDF parameters below the floor we accept. On [`decrypt`]: an
+    /// iteration count under 10_000, or an empty PBKDF2 salt. On
+    /// [`try_encrypt`]: a `salt_len` under 8 bytes (RFC 8018 §A.2), or a
+    /// zero iteration count.
     WeakKdfParameters,
     /// Iteration count above the ceiling we accept (currently
     /// 10_000_000). The count is attacker-controlled on decrypt; without
@@ -160,13 +162,42 @@ const PEM_LABEL: &str = "ENCRYPTED PRIVATE KEY";
 
 /// Encrypts `pkcs8_der` with `password`. Generates random salt + IV.
 /// Returns the DER-encoded `EncryptedPrivateKeyInfo`.
+///
+/// # Panics
+/// Panics if `params.salt_len < 8` (RFC 8018 §A.2 minimum) or the PBKDF2
+/// iteration count in `params.kdf` is zero. Callers whose parameters come
+/// from configuration or user input should use the fallible
+/// [`try_encrypt`] instead.
 pub fn encrypt(
     pkcs8_der: &[u8],
     password: &[u8],
     params: &Pbes2Params,
     rng: &mut impl RngCore,
 ) -> Vec<u8> {
-    assert!(params.salt_len >= 8, "PBES2 salt must be at least 8 bytes");
+    try_encrypt(pkcs8_der, password, params, rng)
+        .unwrap_or_else(|e| panic!("PBES2 parameters rejected: {e}"))
+}
+
+/// Fallible [`encrypt`]: returns [`Error::WeakKdfParameters`] when
+/// `params.salt_len < 8` or the PBKDF2 iteration count is zero, instead of
+/// panicking. No randomness is drawn and no key is derived on error.
+pub fn try_encrypt(
+    pkcs8_der: &[u8],
+    password: &[u8],
+    params: &Pbes2Params,
+    rng: &mut impl RngCore,
+) -> Result<Vec<u8>, Error> {
+    if params.salt_len < 8 {
+        return Err(Error::WeakKdfParameters);
+    }
+    let iterations = match params.kdf {
+        KdfChoice::Pbkdf2HmacSha256 { iterations } | KdfChoice::Pbkdf2HmacSha512 { iterations } => {
+            iterations
+        }
+    };
+    if iterations == 0 {
+        return Err(Error::WeakKdfParameters);
+    }
 
     // 1. Salt.
     let mut salt = alloc::vec![0u8; params.salt_len];
@@ -211,7 +242,9 @@ pub fn encrypt(
     let outer_algid = encode_sequence(&[oid_tlv(OID_PBES2), pbes2_params].concat());
 
     // 6. Final EncryptedPrivateKeyInfo.
-    encode_sequence(&[outer_algid, encode_octet_string(&ciphertext)].concat())
+    Ok(encode_sequence(
+        &[outer_algid, encode_octet_string(&ciphertext)].concat(),
+    ))
 }
 
 /// Decrypts the encrypted-PKCS#8 envelope with `password`. Returns the
@@ -307,6 +340,10 @@ fn wipe(buf: &mut [u8]) {
 
 /// PEM-wrapped variant of [`encrypt`] using the RFC 7468 §11
 /// `ENCRYPTED PRIVATE KEY` label.
+///
+/// # Panics
+/// As [`encrypt`]: on a salt shorter than 8 bytes or a zero iteration count.
+/// See [`try_encrypt_pem`] for the fallible form.
 pub fn encrypt_pem(
     pkcs8_der: &[u8],
     password: &[u8],
@@ -314,6 +351,16 @@ pub fn encrypt_pem(
     rng: &mut impl RngCore,
 ) -> String {
     pem_encode(PEM_LABEL, &encrypt(pkcs8_der, password, params, rng))
+}
+
+/// PEM-wrapped variant of [`try_encrypt`].
+pub fn try_encrypt_pem(
+    pkcs8_der: &[u8],
+    password: &[u8],
+    params: &Pbes2Params,
+    rng: &mut impl RngCore,
+) -> Result<String, Error> {
+    try_encrypt(pkcs8_der, password, params, rng).map(|der| pem_encode(PEM_LABEL, &der))
 }
 
 /// PEM-wrapped variant of [`decrypt`].
@@ -655,6 +702,56 @@ mod tests {
         v.extend_from_slice(&[0x30, 0x0e, 0x04, 0x0c]);
         v.extend_from_slice(b"hello PKCS#8");
         v
+    }
+
+    /// `try_encrypt` refuses a short salt and a zero iteration count as
+    /// `WeakKdfParameters` (the same variant `decrypt` uses for the floor)
+    /// and never touches the RNG when it does; for valid parameters it
+    /// produces exactly what `encrypt` does.
+    #[test]
+    fn try_encrypt_rejects_weak_parameters_without_drawing_randomness() {
+        let inner = synthetic_pkcs8();
+        let short_salt = Pbes2Params {
+            salt_len: 7,
+            ..Pbes2Params::default()
+        };
+        let mut rng = test_rng(b"seed");
+        assert_eq!(
+            try_encrypt(&inner, b"pass", &short_salt, &mut rng),
+            Err(Error::WeakKdfParameters)
+        );
+        let zero_iter = Pbes2Params {
+            kdf: KdfChoice::Pbkdf2HmacSha512 { iterations: 0 },
+            ..Pbes2Params::default()
+        };
+        assert_eq!(
+            try_encrypt(&inner, b"pass", &zero_iter, &mut rng),
+            Err(Error::WeakKdfParameters)
+        );
+        assert_eq!(
+            try_encrypt_pem(&inner, b"pass", &zero_iter, &mut rng),
+            Err(Error::WeakKdfParameters)
+        );
+        // Both rejected calls left the RNG stream untouched: the same seed
+        // now yields the same blob through either entry point.
+        let params = Pbes2Params {
+            kdf: KdfChoice::Pbkdf2HmacSha256 { iterations: 10_000 },
+            ..Pbes2Params::default()
+        };
+        let via_try = try_encrypt(&inner, b"pass", &params, &mut rng).unwrap();
+        let via_panicking = encrypt(&inner, b"pass", &params, &mut test_rng(b"seed"));
+        assert_eq!(via_try, via_panicking);
+        assert_eq!(decrypt(&via_try, b"pass"), Ok(inner));
+    }
+
+    #[test]
+    #[should_panic(expected = "PBES2 parameters rejected")]
+    fn encrypt_short_salt_still_panics() {
+        let params = Pbes2Params {
+            salt_len: 4,
+            ..Pbes2Params::default()
+        };
+        let _ = encrypt(&synthetic_pkcs8(), b"pass", &params, &mut test_rng(b"seed"));
     }
 
     #[test]
