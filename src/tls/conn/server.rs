@@ -1022,8 +1022,12 @@ impl<R: RngCore> ServerConnection<R> {
         engine_mode: super::super::quic_hooks::EngineMode,
         hooks: Option<super::super::quic_hooks::BoxedHooks>,
     ) -> Self {
+        // RFC 8446 §5: a change_cipher_spec record received before the first
+        // ClientHello is an unexpected record type, not middlebox noise.
+        let mut core = ConnectionCore::new();
+        core.set_ccs_window_open(false);
         ServerConnection {
-            core: ConnectionCore::new(),
+            core,
             config,
             rng,
             state: State::WaitClientHello,
@@ -1836,6 +1840,10 @@ impl<R: RngCore> ServerConnection<R> {
         };
 
         let ch = ClientHello::decode(body)?;
+        // RFC 8446 §5: from the first ClientHello on, a peer in middlebox-
+        // compatibility mode may send a dummy change_cipher_spec (it does so
+        // right after CH2 following an HRR); drop those until its Finished.
+        self.core.set_ccs_window_open(true);
 
         // RFC 8446 §4.1.4: CH2 after HRR must echo CH1 unmodified except for
         // the narrow list of permitted edits (key_share narrowed to the
@@ -3732,6 +3740,24 @@ mod tests {
             server.server_hs_secret_bytes(),
             from_hex_vec("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
         );
+    }
+
+    /// RFC 8446 §5: "If an implementation detects a change_cipher_spec
+    /// record received before the first ClientHello message ... it MUST be
+    /// treated as an unexpected record type." The server used to drop it as
+    /// middlebox noise.
+    #[test]
+    fn ccs_before_the_first_client_hello_is_unexpected() {
+        let rng = ScriptedRng {
+            data: Vec::new(),
+            pos: 0,
+        };
+        let mut server = ServerConnection::new(test_server_config(), rng);
+        server.read_tls(&[20, 0x03, 0x03, 0, 1, 1]);
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(crate::tls::Error::UnexpectedMessage)
+        ));
     }
 
     /// A fixed wall-clock anchor for the ticket tests: `decrypt_ticket` now

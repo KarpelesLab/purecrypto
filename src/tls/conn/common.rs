@@ -178,6 +178,16 @@ impl ConnectionCore {
         self.ccs_window_open = false;
     }
 
+    /// Opens or closes the RFC 8446 §5 middlebox-compatibility window. The
+    /// core starts with it open (a client has sent its ClientHello by the
+    /// time it reads anything); a server closes it at construction and opens
+    /// it once the first ClientHello has been received, since a
+    /// `change_cipher_spec` "before the first ClientHello message" MUST be
+    /// treated as an unexpected record type.
+    pub(crate) fn set_ccs_window_open(&mut self, open: bool) {
+        self.ccs_window_open = open;
+    }
+
     /// Feeds received TLS bytes into the input buffer.
     pub(crate) fn read_tls(&mut self, bytes: &[u8]) {
         self.inbuf.extend_from_slice(bytes);
