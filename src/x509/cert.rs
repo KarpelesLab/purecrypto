@@ -29,6 +29,23 @@ const PEM_LABEL: &str = "CERTIFICATE";
 /// cap fires, small. Real certificates carry a handful of entries.
 const MAX_POLICY_ENTRIES: usize = 256;
 
+/// Upper bound on the number of entries accepted in a certificate's
+/// `extensions` field.
+///
+/// Duplicate-extension detection in [`Certificate::walk_extensions`] is a
+/// linear scan over the OIDs seen so far, so one walk is quadratic in the
+/// entry count — and every extension accessor (`key_usage`,
+/// `basic_constraints`, `subject_alt_names`, …) walks the field afresh, more
+/// than a dozen times per certificate during path validation, for every
+/// certificate in a peer-supplied chain, before anything about the chain is
+/// trusted. A 128 KiB TLS `Certificate` message can carry a single cert with
+/// ~10 000 minimal, distinct extensions, which would cost on the order of
+/// 10^9 slice comparisons per handshake. Real certificates carry well under
+/// twenty extensions (the CA/Browser Forum profile lists about a dozen), so
+/// 64 is far above anything conformant; the CRL parser bounds
+/// `crlExtensions` the same way.
+const MAX_CERT_EXTENSIONS: usize = 64;
+
 /// A parsed/owned X.509 certificate, stored as its DER encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Certificate {
@@ -1238,6 +1255,11 @@ impl Certificate {
             let mut ext = exts.read_sequence()?;
             let id = parse_oid(ext.read_oid()?)?;
             if seen.iter().any(|prior| prior.as_slice() == id.as_slice()) {
+                return Err(Error::Malformed);
+            }
+            // Bound the quadratic duplicate scan (see `MAX_CERT_EXTENSIONS`)
+            // before it is fed another entry.
+            if seen.len() >= MAX_CERT_EXTENSIONS {
                 return Err(Error::Malformed);
             }
             seen.push(id.clone());
@@ -2676,6 +2698,46 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         let cert = forge_cert_with_version_and_exts(2, &exts);
         cert.check_well_formed().unwrap();
         assert_eq!(cert.extensions().unwrap().len(), 2);
+    }
+
+    /// One distinct, non-critical private-arc extension per index, so a
+    /// forged certificate can carry an arbitrary number of entries without
+    /// tripping the duplicate-OID guard.
+    fn distinct_private_extensions(n: usize) -> Vec<Extension> {
+        (0..n)
+            .map(|i| Extension {
+                oid: alloc::vec![1, 3, 6, 1, 4, 1, 99_999, i as u64],
+                critical: false,
+                value: alloc::vec![0x05, 0x00], // NULL
+            })
+            .collect()
+    }
+
+    /// The per-certificate extension count is bounded: the duplicate-OID scan
+    /// is quadratic and re-run by every accessor, so a peer must not be able
+    /// to pack thousands of distinct extensions into one cert and turn chain
+    /// validation into a CPU sink. Exactly the cap parses; one more is
+    /// Malformed from every accessor, not only from `extensions()`.
+    #[test]
+    fn extension_count_is_capped() {
+        let at_cap = forge_cert_with_version_and_exts(
+            2,
+            &distinct_private_extensions(super::MAX_CERT_EXTENSIONS),
+        );
+        assert_eq!(
+            at_cap.extensions().unwrap().len(),
+            super::MAX_CERT_EXTENSIONS
+        );
+        at_cap.check_well_formed().unwrap();
+
+        let over = forge_cert_with_version_and_exts(
+            2,
+            &distinct_private_extensions(super::MAX_CERT_EXTENSIONS + 1),
+        );
+        assert!(matches!(over.extensions(), Err(Error::Malformed)));
+        assert!(matches!(over.subject_alt_names(), Err(Error::Malformed)));
+        assert!(matches!(over.basic_constraints(), Err(Error::Malformed)));
+        assert!(matches!(over.check_well_formed(), Err(Error::Malformed)));
     }
 
     /// Wraps a dNSName byte string into a single `GeneralSubtree` SEQUENCE
