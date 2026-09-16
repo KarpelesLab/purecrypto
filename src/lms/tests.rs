@@ -936,3 +936,45 @@ fn lms_all_ots_widths_roundtrip() {
         assert!(!pk.verify(b"width", &bad), "{ots:?}");
     }
 }
+
+/// Every leaf of a tree signs from the node cache and verifies, including
+/// after a reload (which rebuilds the cache lazily) part-way through.
+#[test]
+fn lms_every_leaf_signs_from_cache() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"lms-all-leaves", b"n", &[]);
+    let mut sk = LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W2, &mut rng);
+    let pk = sk.public_key();
+    for q in 0..16u32 {
+        let s = sk.sign(&mut rng, b"leaf").unwrap();
+        assert_eq!(u32::from_be_bytes([s[0], s[1], s[2], s[3]]), q);
+        assert!(pk.verify(b"leaf", &s), "leaf {q}");
+    }
+    let mut sk = LmsPrivateKey::from_bytes(&sk.to_bytes()).unwrap();
+    for q in 16..32u32 {
+        let s = sk.sign(&mut rng, b"leaf").unwrap();
+        assert_eq!(u32::from_be_bytes([s[0], s[1], s[2], s[3]]), q);
+        assert!(pk.verify(b"leaf", &s), "leaf {q} after reload");
+    }
+    assert_eq!(sk.sign(&mut rng, b"leaf"), Err(Error::Exhausted));
+}
+
+/// A reloaded key whose stored root was corrupted fails closed on its first
+/// signature — the rebuilt cache disagrees with the root — without consuming
+/// a leaf, and keeps failing the same way.
+#[test]
+fn lms_reload_refuses_corrupted_root_without_burning_a_leaf() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"lms-bad-root", b"n", &[]);
+    let sk = LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &mut rng);
+    let mut bytes = sk.to_bytes();
+    bytes[28 + N + 3] ^= 0x40; // inside the appended root
+    let mut bad = LmsPrivateKey::from_bytes(&bytes).expect("root is trusted at load");
+    assert_eq!(bad.remaining(), 32);
+    assert_eq!(bad.sign(&mut rng, b"m"), Err(Error::Tampered));
+    assert_eq!(bad.remaining(), 32, "no leaf may be consumed");
+    assert_eq!(bad.sign(&mut rng, b"m"), Err(Error::Tampered));
+    let mut sig = alloc::vec![0u8; bad.signature_len()];
+    assert_eq!(
+        bad.sign_into(&mut rng, b"m", &mut sig),
+        Err(Error::Tampered)
+    );
+}

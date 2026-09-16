@@ -26,6 +26,22 @@
 //!
 //! Secret material (the seed and identifier) is wiped on drop.
 //!
+//! # Signing cost
+//!
+//! With the `alloc` feature a private key keeps a cache of Merkle nodes (a
+//! signer-side structure that holds only public hashes and is never
+//! serialized), so a signature costs one LM-OTS signature plus `O(h)` cached
+//! reads. The cache is built at key generation — it *is* key generation — or
+//! lazily on the first signature after [`LmsPrivateKey::from_bytes`] /
+//! [`HssPrivateKey::from_bytes`], which therefore costs one full `O(2^h)`
+//! tree derivation once per process for each level that signs. For `H20` and
+//! `H25` only the top 16 levels stay resident and the bottom subtree
+//! containing the current leaf is regenerated every `2^5` / `2^10`
+//! signatures; the cache never exceeds about 2.1 MiB per tree. The
+//! allocator-less build (no `alloc`) has nowhere to keep such a cache and
+//! derives each authentication path from the seed, i.e. an `O(2^h)` pass per
+//! signature — fine for `H5`/`H10`, impractical above that.
+//!
 //! # Validation
 //!
 //! Verified against the RFC 8554 Appendix F test vectors: Test Case 1 (a
@@ -38,6 +54,7 @@
     doc = "[`LmsPrivateKey::sign`]: crate#no_std",
     doc = "[`HssPrivateKey::sign`]: crate#no_std",
     doc = "[`HssPrivateKey::to_bytes`]: crate#no_std",
+    doc = "[`HssPrivateKey::from_bytes`]: crate#no_std",
     doc = "[`LmsPrivateKey::to_bytes`]: crate#no_std",
     doc = "[`HssPrivateKey::remaining`]: crate#no_std"
 )]
@@ -72,22 +89,24 @@ pub enum Error {
     InvalidLevels,
     /// Serialized key/signature bytes were malformed.
     Malformed,
-    /// A legacy (pre-root-bearing) serialized private key encodes a tree taller
-    /// than the legacy recompute cap (`H15`). Loading it would require
-    /// recomputing the Merkle root from the seed — an `O(2^h)` full-keygen pass
-    /// (tens of seconds to minutes for `H20`/`H25`) that an attacker could
-    /// trigger as a CPU-DoS by feeding an untrusted file. The current
-    /// serialization stores the public root, so re-saving such a key with this
-    /// build (load it once on a host you control, then call `to_bytes`) — or
-    /// regenerating it — removes the limit; the new format loads any height
-    /// instantly.
+    /// A legacy (pre-`v3` HSS, or root-less LMS) serialized private key
+    /// encodes a tree taller than the legacy load cap (`H15`) at a level that
+    /// loading must fully derive from its seed — an `O(2^h)` key-generation
+    /// pass (tens of seconds to minutes for `H20`/`H25`) that an attacker
+    /// could trigger as a CPU-DoS by feeding an untrusted, unauthenticated
+    /// file. Re-saving such a key with this build (load it once on a host you
+    /// control, then call `to_bytes`) — or regenerating it — removes the
+    /// limit: the current formats are authenticated or carry every value the
+    /// loader needs, so they load any height without derivation.
     LegacyKeyTooTall,
-    /// A serialized HSS private key failed its integrity check: either the
-    /// authentication tag of the current (`v2`) format did not verify, or a
-    /// stored child-level root disagreed with the root that level's own seed
-    /// derives. Both mean the key file was modified after it was written, which
-    /// for a multi-level key is a *forgery* vector (see
-    /// [`HssPrivateKey::from_bytes`]), so the key is refused rather than loaded.
+    /// A serialized private key failed its integrity check: the authentication
+    /// tag of a tagged HSS format did not verify, a stored child-level root
+    /// disagrees with the root that level's own seed derives, or a stored tree
+    /// root disagrees with the root that tree's own seed derives (detected when
+    /// the tree is first built for signing). Each means the key file was
+    /// modified after it was written, which for a multi-level key is a
+    /// *forgery* vector (see [`HssPrivateKey::from_bytes`]), so the key is
+    /// refused rather than used.
     #[cfg_attr(
         not(feature = "alloc"),
         doc = "",
@@ -96,14 +115,15 @@ pub enum Error {
     Tampered,
 }
 
-/// Maximum tree height for which the LEGACY (root-less, 60-byte / `4 + L*60`)
-/// private-key serialization will recompute the Merkle root on load.
+/// Maximum tree height that an UNAUTHENTICATED legacy private-key
+/// serialization (root-less LMS; root-less or untagged HSS) may ask the loader
+/// to derive from its seed.
 ///
-/// `H15` (`2^15 = 32768` leaves) recomputes in well under a second on the worst
+/// `H15` (`2^15 = 32768` leaves) derives in well under a second on the worst
 /// supported LM-OTS set and covers the common `H5`/`H10`/`H15` deployments.
-/// Taller legacy keys are rejected with [`Error::LegacyKeyTooTall`] to deny a
-/// CPU-DoS via an untrusted file. The NEW (root-bearing) format carries the
-/// public root and imposes no height limit.
+/// Taller legacy trees are rejected with [`Error::LegacyKeyTooTall`] to deny a
+/// CPU-DoS via an untrusted file. Authenticated (tagged) formats verify their
+/// tag before any derivation and impose no height limit.
 const LEGACY_RECOMPUTE_MAX_H: u32 = 15;
 
 /// Wipes a byte buffer through [`crate::zeroize::Zeroize`]: volatile stores
@@ -148,6 +168,10 @@ pub struct LmsPublicKey {
 /// leaf index `q` is part of the key state and is advanced by every
 /// [`sign`][Self::sign]. Re-persist [`to_bytes`][Self::to_bytes] after each
 /// signature. Not [`Clone`] by design.
+///
+/// With `alloc`, the key carries an in-memory Merkle node cache so signing is
+/// `O(h)` (see the module documentation's *Signing cost*); the cache holds
+/// public hashes only and is not part of the serialization.
 #[cfg_attr(
     not(feature = "alloc"),
     doc = "",
@@ -163,6 +187,10 @@ pub struct LmsPrivateKey {
     q: u32,
     /// Cached tree root (so signing and `public_key` need not recompute it).
     root: [u8; N],
+    /// Merkle node cache; `None` after [`from_bytes`](Self::from_bytes) until
+    /// the first signature builds it.
+    #[cfg(feature = "alloc")]
+    cache: Option<tree::NodeCache>,
 }
 
 impl LmsPrivateKey {
@@ -178,6 +206,12 @@ impl LmsPrivateKey {
         i_id: &[u8; 16],
         seed: &[u8; N],
     ) -> Self {
+        #[cfg(feature = "alloc")]
+        let (root, cache) = {
+            let cache = tree::NodeCache::build(lms_type, ots_type, i_id, seed);
+            (cache.root(), Some(cache))
+        };
+        #[cfg(not(feature = "alloc"))]
         let root = tree::compute_root(lms_type, ots_type, i_id, seed);
         LmsPrivateKey {
             lms_type,
@@ -186,6 +220,8 @@ impl LmsPrivateKey {
             seed: *seed,
             q: 0,
             root,
+            #[cfg(feature = "alloc")]
+            cache,
         }
     }
 
@@ -229,6 +265,11 @@ impl LmsPrivateKey {
         self.lms_type.leaves().saturating_sub(self.q as u64)
     }
 
+    /// True once every leaf has been consumed.
+    fn is_exhausted(&self) -> bool {
+        self.q as u64 >= self.lms_type.leaves()
+    }
+
     /// Signs `message`, advancing the internal leaf index `q`.
     ///
     /// `rng` supplies the per-signature LM-OTS randomizer `C`; it SHOULD be a
@@ -241,6 +282,84 @@ impl LmsPrivateKey {
         self.sign_with_c(message, &c)
     }
 
+    /// Makes leaf `q`'s authentication path available to
+    /// [`sign_reserved_into`](Self::sign_reserved_into).
+    ///
+    /// With `alloc` this builds the node cache on first use (after a
+    /// [`from_bytes`](Self::from_bytes) load) — a full `O(2^h)` derivation —
+    /// and refuses with [`Error::Tampered`] if the derived root disagrees with
+    /// the stored one, so a key file with a corrupted root fails closed instead
+    /// of burning leaves on signatures that could never verify. It then makes
+    /// sure the bottom subtree holding `q` is built. Without `alloc` there is
+    /// nothing to prepare.
+    ///
+    /// Produces no signature material, so it runs *before* the leaf is
+    /// reserved; an error here leaves the state untouched.
+    fn prepare_leaf(&mut self, q: u32) -> Result<(), Error> {
+        #[cfg(feature = "alloc")]
+        {
+            if self.cache.is_none() {
+                let cache =
+                    tree::NodeCache::build(self.lms_type, self.ots_type, &self.i_id, &self.seed);
+                let same: bool = cache.root()[..].ct_eq(&self.root[..]).into();
+                if !same {
+                    return Err(Error::Tampered);
+                }
+                self.cache = Some(cache);
+            }
+            let cache = self.cache.as_mut().expect("just built");
+            cache.prepare(self.lms_type, self.ots_type, &self.i_id, &self.seed, q);
+        }
+        #[cfg(not(feature = "alloc"))]
+        let _ = q;
+        Ok(())
+    }
+
+    /// Reserves the next leaf: advances `q` past it and returns it.
+    ///
+    /// This is the SP 800-208 §8.1 order — the index is consumed *before* any
+    /// signature byte exists. If signing then aborts part-way (a panic
+    /// unwinding through the caller's buffer), the state has already moved
+    /// past the leaf, so no later call can re-sign a leaf whose partial
+    /// signature the caller may still hold.
+    fn reserve_leaf(&mut self) -> Result<u32, Error> {
+        if self.is_exhausted() {
+            return Err(Error::Exhausted);
+        }
+        let q = self.q;
+        self.q += 1;
+        Ok(q)
+    }
+
+    /// Signs `message` with the already-reserved leaf `q` and randomizer `c`
+    /// into `out` (exactly [`signature_len`](Self::signature_len) octets).
+    ///
+    /// [`prepare_leaf`](Self::prepare_leaf)`(q)` must have succeeded first.
+    fn sign_reserved_into(&self, q: u32, c: &[u8; N], message: &[u8], out: &mut [u8]) -> usize {
+        #[cfg(feature = "alloc")]
+        {
+            let cache = self.cache.as_ref().expect("prepare_leaf builds the cache");
+            tree::sign(
+                self.lms_type,
+                self.ots_type,
+                &self.i_id,
+                &self.seed,
+                q,
+                c,
+                message,
+                out,
+                |node| cache.node(node),
+            )
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            let (lms, ots, i_id, seed) = (self.lms_type, self.ots_type, &self.i_id, &self.seed);
+            tree::sign(lms, ots, i_id, seed, q, c, message, out, |node| {
+                tree::node_value(lms, ots, i_id, seed, node)
+            })
+        }
+    }
+
     /// Signs with a caller-supplied randomizer `c` (used to reproduce the RFC
     /// 8554 vectors, which fix `C`). Advances `q`.
     fn sign_with_c_into(
@@ -249,30 +368,15 @@ impl LmsPrivateKey {
         c: &[u8; N],
         out: &mut [u8],
     ) -> Result<usize, Error> {
-        if self.q as u64 >= self.lms_type.leaves() {
+        if self.is_exhausted() {
             return Err(Error::Exhausted);
         }
         if out.len() != self.signature_len() {
             return Err(Error::InvalidKey);
         }
-        // Reserve the leaf BEFORE any signature byte exists (SP 800-208
-        // §8.1): the index is consumed first, then signed. If signing were to
-        // abort part-way (a panic unwinding through the caller's buffer), the
-        // state has already moved past `q`, so no later call can re-sign the
-        // leaf whose partial signature the caller may still hold.
-        let q = self.q;
-        self.q += 1;
-        let n = tree::sign(
-            self.lms_type,
-            self.ots_type,
-            &self.i_id,
-            &self.seed,
-            q,
-            c,
-            message,
-            out,
-        );
-        Ok(n)
+        self.prepare_leaf(self.q)?;
+        let q = self.reserve_leaf()?;
+        Ok(self.sign_reserved_into(q, c, message, out))
     }
 
     /// Signs with a caller-supplied randomizer, returning a heap signature.
@@ -319,6 +423,8 @@ impl LmsPrivateKey {
     /// pass. The layout is a pure superset of the legacy 60-byte form (the root
     /// is appended at the end), so older builds' parsers are unaffected and this
     /// build still reads legacy bytes (see [`from_bytes`](Self::from_bytes)).
+    /// The Merkle node cache is deliberately not serialized: it is public data
+    /// the seed regenerates.
     #[cfg(feature = "alloc")]
     pub fn to_bytes(&self) -> Vec<u8> {
         self.to_bytes_array().to_vec()
@@ -350,26 +456,27 @@ impl LmsPrivateKey {
     ///
     /// Length-discriminated and backward compatible:
     /// * **92 bytes** — the current root-bearing format. The stored root is
-    ///   read directly and **trusted** (no recompute), so a key of any height
-    ///   loads in constant time.
+    ///   read directly (no recompute), so a key of any height loads in constant
+    ///   time.
     /// * **60 bytes** — the LEGACY root-less format. The root is recomputed via
     ///   an `O(2^h)` keygen-equivalent pass; to deny a CPU-DoS from an untrusted
     ///   file this path is capped at `H15` (`LEGACY_RECOMPUTE_MAX_H`) and returns
     ///   [`Error::LegacyKeyTooTall`] above it.
     /// * any other length — [`Error::Malformed`].
     ///
-    /// # Trusting the stored root is safe (fast path)
+    /// # The stored root is public, and checked before it matters
     ///
     /// The root is NOT secret — it is the public key value `T[1]`
-    /// (`encode_public_key` = `type || type || I || T[1]`). It is used only by
-    /// [`public_key`](Self::public_key); signing recomputes the authentication
-    /// path from the seed and never reads `self.root`. A tampered root therefore
-    /// yields a wrong public key under which genuine signatures simply fail to
-    /// verify — a fail-closed self-DoS, never a forgery (the attacker lacks the
-    /// seed). Re-deriving the root on every load to validate a public value
-    /// would cost a full keygen and buy nothing: an attacker able to rewrite the
-    /// key file could already force catastrophic LM-OTS reuse, which is far
-    /// worse. So the stored root is taken as-is and deliberately NOT recomputed.
+    /// (`encode_public_key` = `type || type || I || T[1]`). Loading trusts it
+    /// so that `from_bytes` stays constant-time. The first signature after a
+    /// load rebuilds the Merkle node cache from the seed (with `alloc`) and
+    /// compares the derived root with the stored one, refusing with
+    /// [`Error::Tampered`] on a mismatch — before any leaf is consumed. A
+    /// tampered root can therefore only cause a fail-closed self-DoS, never a
+    /// forgery (the attacker lacks the seed) and never a wasted one-time key.
+    /// Re-deriving the root on every load would cost a full keygen and buy
+    /// nothing more: an attacker able to rewrite the key file could already
+    /// force catastrophic LM-OTS reuse by rewinding `q`, which is far worse.
     #[cfg_attr(
         not(feature = "alloc"),
         doc = "",
@@ -414,6 +521,8 @@ impl LmsPrivateKey {
             seed,
             q,
             root,
+            #[cfg(feature = "alloc")]
+            cache: None,
         })
     }
 }
@@ -783,6 +892,7 @@ impl HssPrivateKey {
             &c,
             signed,
             &mut sig,
+            |node| tree::node_value(lv.lms_type, lv.ots_type, &lv.i_id, &lv.seed, node),
         );
         out.extend_from_slice(&sig);
         if i + 1 < l {
