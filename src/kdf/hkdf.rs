@@ -23,8 +23,7 @@ impl core::fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// HKDF-Extract: derives a pseudorandom key from input keying material `ikm`
 /// and an optional `salt`. An empty salt is treated as `HashLen` zero bytes.

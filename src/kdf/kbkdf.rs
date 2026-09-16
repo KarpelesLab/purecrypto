@@ -68,8 +68,7 @@ impl core::fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// A pseudorandom function for use as the KBKDF PRF.
 ///
