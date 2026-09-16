@@ -114,8 +114,10 @@ impl NewReno {
     /// Drops `sent_bytes` off `bytes_in_flight` and, on the
     /// most-recently-sent lost packet's `time_sent`, evaluates whether
     /// to enter a new congestion-recovery period (the
-    /// `OnCongestionEvent` step). Persistent congestion is signaled
-    /// separately via [`Self::on_persistent_congestion`].
+    /// `OnCongestionEvent` step). The §B.8 persistent-congestion check is
+    /// the loss state's ([`crate::quic::loss::LossState::in_persistent_congestion`]);
+    /// when it holds, the connection follows up with
+    /// [`Self::on_persistent_congestion`].
     pub(crate) fn on_packets_lost(&mut self, lost: &[SentPacket], _now: Duration) {
         if lost.is_empty() {
             return;
@@ -148,11 +150,11 @@ impl NewReno {
         self.cwnd = core::cmp::max(new_ssthresh, min);
     }
 
-    /// RFC 9002 Appendix B — `OnPersistentCongestion`.
-    ///
-    /// Resets `cwnd` to `kMinimumWindow` and clears recovery. Per
-    /// §B.7, `ssthresh` is left as-is (so a subsequent slow-start
-    /// will accelerate up to it).
+    /// RFC 9002 §7.6.3 / §B.8 — the tail of `OnPacketsLost` once persistent
+    /// congestion is established: `congestion_window = kMinimumWindow` and
+    /// `congestion_recovery_start_time = 0`, so the sender restarts in slow
+    /// start. `ssthresh` (already halved by the congestion event) is left
+    /// as-is, so that slow start only runs up to it.
     pub(crate) fn on_persistent_congestion(&mut self) {
         self.cwnd = k_minimum_window(self.max_datagram_size);
         self.recovery_start_time = None;

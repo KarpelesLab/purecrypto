@@ -3,8 +3,10 @@
 //! Full implementation of the RFC 9002 loss recovery state machine. Tracks
 //! per-PN-space [`SentPacket`] state, the RTT estimator (latest_rtt /
 //! smoothed_rtt / rttvar / min_rtt — RFC 9002 §5.3), the PTO timer
-//! (RFC 9002 §6.2), and packet-threshold + time-threshold loss detection
-//! (RFC 9002 §6.1).
+//! (RFC 9002 §6.2), packet-threshold + time-threshold loss detection
+//! (RFC 9002 §6.1) and the §7.6 persistent-congestion test the congestion
+//! controller consults for every batch of lost packets
+//! ([`LossState::in_persistent_congestion`]).
 //!
 //! Pseudocode in Appendix A of RFC 9002 is followed step-for-step; each
 //! non-trivial function names the section it implements. Where the
@@ -122,7 +124,9 @@ pub(crate) struct LossState {
     pub(crate) rttvar: Duration,
     /// `min_rtt` (§A.1.2). `Duration::MAX` sentinel until first sample.
     pub(crate) min_rtt: Duration,
-    /// Set when the first RTT sample lands (§5.3).
+    /// `first_rtt_sample` (§A.1.2) — the time the first RTT sample was
+    /// obtained, `None` until then. §7.6.1 only lets packets sent after it
+    /// count towards persistent congestion.
     pub(crate) first_rtt_sample: Option<Duration>,
     /// Peer's advertised `max_ack_delay` (RFC 9000 §18.2). 25 ms default.
     pub(crate) max_ack_delay: Duration,
@@ -141,9 +145,6 @@ pub(crate) struct LossState {
     pub(crate) per_space: [PerSpace; 3],
 
     // ---- PTO probe bookkeeping (RFC 9002 §6.2.4 / §7.5) --------------------
-    /// True once a PTO has fired without subsequent ack progress. Cleared
-    /// by [`Self::on_ack_received`] when any newly-acked packet shows up.
-    pub(crate) pto_outstanding: bool,
     /// The packet-number space whose PTO expired most recently and still owes
     /// probe packets, with [`Self::probe_credit`] counting how many. `None`
     /// once the probes have gone out or an ACK showed progress.
@@ -157,11 +158,18 @@ pub(crate) struct LossState {
     /// while the window is full, so a peer that stopped acknowledging can be
     /// provoked into revealing what was lost.
     probe_credit: u8,
-    /// True once we have flagged a persistent-congestion event to the
-    /// caller. Cleared once the caller has consumed
-    /// [`Self::take_persistent_congestion`]. Used so the same event isn't
-    /// reported twice.
-    pub(crate) persistent_congestion_pending: bool,
+
+    // ---- Persistent congestion (RFC 9002 §7.6) ------------------------------
+    /// `time_sent` of every acknowledged packet that was sent no earlier
+    /// than the oldest packet still in flight, across all packet-number
+    /// spaces. [`Self::in_persistent_congestion`] consults it to tell an
+    /// acknowledged packet apart from a lost one when it checks that nothing
+    /// sent between two lost packets got through (§7.6.2). Anything older
+    /// can never fall between two packets that are still awaiting a
+    /// verdict, so [`Self::prune_acked_send_times`] drops it; the packet
+    /// threshold keeps the oldest in-flight packet within a few packet
+    /// numbers of the largest acknowledged one, which keeps this short.
+    acked_send_times: Vec<Duration>,
 
     /// Connection facts RFC 9002 §A.8 consults when arming the timer.
     pub(crate) ctx: LossContext,
@@ -221,10 +229,9 @@ impl LossState {
                 PerSpace::default(),
                 PerSpace::default(),
             ],
-            pto_outstanding: false,
             probe_space: None,
             probe_credit: 0,
-            persistent_congestion_pending: false,
+            acked_send_times: Vec::new(),
             ctx: LossContext::default(),
         }
     }
@@ -389,8 +396,15 @@ impl LossState {
         {
             // RFC 9002 §5.3 — UpdateRtt.
             let latest = now.saturating_sub(largest_pkt.time_sent);
-            self.update_rtt(latest, ack_delay, space);
+            self.update_rtt(latest, ack_delay, space, now);
         }
+
+        // §7.6.2 — remember when the acknowledged packets were sent, so a
+        // later loss batch can tell that something sent between two of its
+        // packets did get through.
+        self.acked_send_times
+            .extend(newly_acked.iter().map(|p| p.time_sent));
+        self.prune_acked_send_times();
 
         // §A.7 step "DetectAndRemoveLostPackets" is invoked separately by
         // the caller (so the caller can hand the lost packets to the
@@ -410,9 +424,7 @@ impl LossState {
             if self.peer_completed_address_validation() {
                 self.pto_count = 0;
             }
-            self.pto_outstanding = false;
             self.clear_probe();
-            self.persistent_congestion_pending = false;
         }
 
         // §A.7 final step: re-arm loss-detection timer.
@@ -421,8 +433,14 @@ impl LossState {
         newly_acked
     }
 
-    /// RFC 9002 §5.3 — `UpdateRtt`.
-    fn update_rtt(&mut self, latest_rtt: Duration, ack_delay: Duration, space: PnSpaceId) {
+    /// RFC 9002 §5.3 — `UpdateRtt`. `now` is when the sample was taken.
+    fn update_rtt(
+        &mut self,
+        latest_rtt: Duration,
+        ack_delay: Duration,
+        space: PnSpaceId,
+        now: Duration,
+    ) {
         self.latest_rtt = latest_rtt;
         // §5.2 — min_rtt tracks the minimum observed RTT.
         if latest_rtt < self.min_rtt {
@@ -430,7 +448,7 @@ impl LossState {
         }
         // First sample: initialize.
         if self.first_rtt_sample.is_none() {
-            self.first_rtt_sample = Some(latest_rtt);
+            self.first_rtt_sample = Some(now);
             self.smoothed_rtt = latest_rtt;
             self.rttvar = latest_rtt / 2;
             return;
@@ -523,9 +541,109 @@ impl LossState {
             }
         }
 
-        // Re-arm the loss-detection timer with the updated loss_time.
+        // Re-arm the loss-detection timer with the updated loss_time. The
+        // acknowledged-send-time record is deliberately left alone here:
+        // `in_persistent_congestion` still needs it for this batch, and the
+        // next ACK prunes it.
         self.set_loss_detection_timer(now);
         lost
+    }
+
+    /// RFC 9002 §7.6.1 — the persistent-congestion duration:
+    /// `(smoothed_rtt + max(4 × rttvar, kGranularity) + max_ack_delay) ×
+    /// kPersistentCongestionThreshold`. The PTO here always includes
+    /// `max_ack_delay`, whatever the space the lost packets were sent in.
+    pub(crate) fn persistent_congestion_duration(&self) -> Duration {
+        self.pto_period()
+            .saturating_mul(K_PERSISTENT_CONGESTION_THRESHOLD)
+    }
+
+    /// RFC 9002 §7.6.2 / §B.9 `InPersistentCongestion` — whether `lost`, a
+    /// batch [`Self::detect_lost`] just declared lost (and so no longer
+    /// tracks), establishes persistent congestion.
+    ///
+    /// It does when two ack-eliciting packets in the batch were sent at
+    /// least [`Self::persistent_congestion_duration`] apart, every packet
+    /// sent between them was declared lost and none was acknowledged, and
+    /// both were sent after the first RTT sample was taken (§7.6.1 — before
+    /// that the duration is a guess, so §B.8 only considers packets sent
+    /// after `first_rtt_sample`).
+    ///
+    /// Like the reference §B.8 pseudocode this is evaluated over one
+    /// `DetectAndRemoveLostPackets` batch, so both edges come from the
+    /// space that batch was detected in; a period that only spans losses
+    /// declared on different occasions (or in different spaces) is not
+    /// recognised. The "nothing between them got through" condition, on the
+    /// other hand, is checked across all packet-number spaces as §7.6.2
+    /// requires: a packet sent between the two edges in *any* space breaks
+    /// the period if it was acknowledged, or if it is still in flight (its
+    /// fate is not known yet, so it has not been declared lost either).
+    /// Packets that were never in flight (ACK-only) are not tracked and
+    /// therefore not considered, as in the reference. Within a space,
+    /// packet-number order is send order and both loss rules are monotone
+    /// in it, so a batch is a prefix of the space's in-flight packets and
+    /// the walk below simply follows send time.
+    pub(crate) fn in_persistent_congestion(&self, lost: &[SentPacket]) -> bool {
+        let Some(first_sample) = self.first_rtt_sample else {
+            return false;
+        };
+        let duration = self.persistent_congestion_duration();
+        let mut batch: Vec<&SentPacket> =
+            lost.iter().filter(|p| p.time_sent > first_sample).collect();
+        batch.sort_by_key(|p| p.time_sent);
+        // `run_start`: send time of the earliest ack-eliciting packet of the
+        // current run of losses with nothing acknowledged or outstanding in
+        // between. `prev`: send time of the previous packet in the batch.
+        let mut run_start: Option<Duration> = None;
+        let mut prev: Option<Duration> = None;
+        for p in batch {
+            if let Some(prev_t) = prev
+                && self.progress_between(prev_t, p.time_sent)
+            {
+                run_start = None;
+            }
+            prev = Some(p.time_sent);
+            if !p.ack_eliciting {
+                continue;
+            }
+            match run_start {
+                None => run_start = Some(p.time_sent),
+                Some(start) if p.time_sent.saturating_sub(start) >= duration => return true,
+                Some(_) => {}
+            }
+        }
+        false
+    }
+
+    /// §7.6.2 — did anything sent between two lost packets (sent at `lo` and
+    /// `hi`, in any space) get acknowledged, or is it still awaiting a
+    /// verdict? An acknowledgment counts even for a packet sent in the same
+    /// instant as an edge (something sent then did get through); a packet
+    /// still in flight only counts strictly between, since the packet
+    /// threshold routinely declares a packet lost while its
+    /// same-instant successors are still pending.
+    fn progress_between(&self, lo: Duration, hi: Duration) -> bool {
+        self.acked_send_times.iter().any(|&t| lo <= t && t <= hi)
+            || self.per_space.iter().any(|ps| {
+                ps.sent_packets
+                    .values()
+                    .any(|q| lo < q.time_sent && q.time_sent < hi)
+            })
+    }
+
+    /// Drops every recorded acknowledged send time older than the oldest
+    /// packet still in flight in any space (all of them once nothing is in
+    /// flight): no future loss batch can have an edge sent before that.
+    fn prune_acked_send_times(&mut self) {
+        let oldest = self
+            .per_space
+            .iter()
+            .filter_map(|ps| ps.sent_packets.values().next().map(|p| p.time_sent))
+            .min();
+        match oldest {
+            Some(t) => self.acked_send_times.retain(|&a| a >= t),
+            None => self.acked_send_times.clear(),
+        }
     }
 
     /// RFC 9002 Appendix A — `OnLossDetectionTimeout`.
@@ -577,7 +695,6 @@ impl LossState {
             }
         };
         self.pto_count = self.pto_count.saturating_add(1).min(PTO_BACKOFF_CAP);
-        self.pto_outstanding = true;
         self.arm_probe(space);
         self.set_loss_detection_timer(now);
         Some(TimeoutAction::Pto(space))
@@ -776,37 +893,9 @@ impl LossState {
         if self.probe_space == Some(space) {
             self.clear_probe();
         }
+        self.prune_acked_send_times();
         self.set_loss_detection_timer(now);
         drained
-    }
-
-    /// Returns whether a persistent-congestion event was detected since
-    /// the last call. One-shot: once consumed, must not re-fire until
-    /// fresh progress (an ack) clears `pto_outstanding` and a new
-    /// burst of PTOs accumulates.
-    ///
-    /// Approximation of RFC 9002 §7.6: if `pto_count ≥
-    /// kPersistentCongestionThreshold` and no successful ack has been
-    /// received since the first PTO, signal persistent congestion. The
-    /// full rule also checks that the span of the lost packets exceeds
-    /// `(smoothed_rtt + max(4×rttvar, kG) + max_ack_delay) ×
-    /// (2^kPersistentCongestionThreshold − 1)`; three consecutive PTO
-    /// expiries without an ACK cover at least that span, and the only
-    /// observable effect is a `cwnd → kMinimumWindow` reset, which is safe
-    /// to be slightly conservative about.
-    pub(crate) fn take_persistent_congestion(&mut self) -> bool {
-        if self.pto_count >= K_PERSISTENT_CONGESTION_THRESHOLD
-            && self.pto_outstanding
-            && !self.persistent_congestion_pending
-        {
-            // Mark as reported so subsequent calls return false until an
-            // ack arrives (clears `pto_outstanding`) or a discarded space
-            // resets `pto_count`.
-            self.persistent_congestion_pending = true;
-            true
-        } else {
-            false
-        }
     }
 
     /// True iff any packet-number space has ack-eliciting packets in flight —
@@ -925,6 +1014,7 @@ mod tests {
             Duration::from_millis(80),
             Duration::ZERO,
             PnSpaceId::Initial,
+            Duration::from_secs(1),
         );
         assert_eq!(s.smoothed_rtt, Duration::from_millis(80));
         assert_eq!(s.rttvar, Duration::from_millis(40));
@@ -939,6 +1029,7 @@ mod tests {
             Duration::from_millis(80),
             Duration::ZERO,
             PnSpaceId::Initial,
+            Duration::from_secs(1),
         );
         // After 1st: smoothed=80ms rttvar=40ms.
         // 2nd sample = 100ms, no ack_delay, min_rtt=80ms still.
@@ -946,6 +1037,7 @@ mod tests {
             Duration::from_millis(100),
             Duration::ZERO,
             PnSpaceId::Initial,
+            Duration::from_secs(1),
         );
         // adjusted = 100 (since min_rtt + 0 <= 100? yes — 80 <= 100 — but ack_delay=0 so adjusted=100).
         // diff = |80 - 100| = 20ms
@@ -958,6 +1050,7 @@ mod tests {
             Duration::from_millis(60),
             Duration::ZERO,
             PnSpaceId::Initial,
+            Duration::from_secs(1),
         );
         // adjusted = 60; min_rtt updates to 60.
         // diff = |82.5 - 60| = 22.5ms
@@ -1280,6 +1373,11 @@ mod tests {
         assert_eq!(s.smoothed_rtt, Duration::from_millis(50));
         assert_eq!(s.rttvar, Duration::from_millis(25));
         assert_eq!(s.min_rtt, Duration::from_millis(50));
+        assert_eq!(
+            s.first_rtt_sample,
+            Some(Duration::from_millis(50)),
+            "§A.1.2: the time the first sample was obtained"
+        );
     }
 
     /// Regression test for the QUIC ACK-range CPU-exhaustion DoS.
@@ -1394,18 +1492,247 @@ mod tests {
         assert_eq!(s.loss_detection_timer, None);
     }
 
+    /// RFC 9002 §7.6.1 — the duration is `PTO × kPersistentCongestionThreshold`
+    /// with `max_ack_delay` always included.
     #[test]
-    fn persistent_congestion_after_threshold_ptos() {
+    fn persistent_congestion_duration_is_three_ptos() {
+        let mut s = LossState::new();
+        s.smoothed_rtt = Duration::from_millis(100);
+        s.rttvar = Duration::from_millis(25);
+        s.max_ack_delay = Duration::from_millis(25);
+        assert_eq!(
+            s.persistent_congestion_duration(),
+            Duration::from_millis(3 * 225)
+        );
+    }
+
+    /// Sends and acknowledges one Application packet so the state has an
+    /// RTT sample taken at `t = 100 ms` (`smoothed_rtt = 100 ms`,
+    /// `rttvar = 50 ms`).
+    fn state_with_rtt_sample() -> LossState {
         let mut s = LossState::new();
         s.ctx.is_server = true;
-        s.on_packet_sent(PnSpaceId::Initial, mk_packet(0, true, true, Duration::ZERO));
-        for _ in 0..K_PERSISTENT_CONGESTION_THRESHOLD {
-            let now = s.loss_detection_timer.expect("armed");
-            assert!(s.on_loss_detection_timeout(now).is_some());
+        s.ctx.handshake_confirmed = true;
+        s.on_packet_sent(
+            PnSpaceId::Application,
+            mk_packet(0, true, true, Duration::ZERO),
+        );
+        let acked = s.on_ack_received(
+            PnSpaceId::Application,
+            &[0u64..=0u64],
+            Duration::ZERO,
+            Duration::from_millis(100),
+        );
+        assert_eq!(acked.len(), 1);
+        assert_eq!(s.first_rtt_sample, Some(Duration::from_millis(100)));
+        s
+    }
+
+    /// Sends Application packets 1..=5 at the given times, then packet 6 at
+    /// 1600 ms and acknowledges it at 1700 ms (a 100 ms sample), and returns
+    /// the batch `detect_lost` declares lost at that point.
+    fn lose_flight(s: &mut LossState, times_ms: [u64; 5]) -> Vec<SentPacket> {
+        for (i, t) in times_ms.iter().enumerate() {
+            s.on_packet_sent(
+                PnSpaceId::Application,
+                mk_packet(i as u64 + 1, true, true, Duration::from_millis(*t)),
+            );
         }
-        assert_eq!(s.pto_count, K_PERSISTENT_CONGESTION_THRESHOLD);
-        assert!(s.take_persistent_congestion());
-        // Cleared on consume.
-        assert!(!s.take_persistent_congestion());
+        s.on_packet_sent(
+            PnSpaceId::Application,
+            mk_packet(6, true, true, Duration::from_millis(1600)),
+        );
+        let acked = s.on_ack_received(
+            PnSpaceId::Application,
+            &[6u64..=6u64],
+            Duration::ZERO,
+            Duration::from_millis(1700),
+        );
+        assert_eq!(acked.len(), 1);
+        s.detect_lost(PnSpaceId::Application, Duration::from_millis(1700))
+    }
+
+    /// RFC 9002 §7.6.2 (1) — two lost ack-eliciting packets sent further
+    /// apart than the duration, with everything between them lost too and
+    /// an RTT sample taken before the first: persistent congestion.
+    #[test]
+    fn persistent_congestion_when_losses_span_the_duration() {
+        let mut s = state_with_rtt_sample();
+        let lost = lose_flight(&mut s, [200, 400, 1000, 1300, 1500]);
+        assert_eq!(lost.len(), 5, "packets 1..=5 all lost");
+        let duration = s.persistent_congestion_duration();
+        assert!(
+            Duration::from_millis(1300) >= duration,
+            "test premise: the span exceeds {duration:?}"
+        );
+        assert!(s.in_persistent_congestion(&lost));
+        // Lost packets sent before the first RTT sample are not
+        // considered (§7.6.1 / §B.8).
+        let mut fresh = LossState::new();
+        fresh.first_rtt_sample = Some(Duration::from_millis(1400));
+        assert!(!fresh.in_persistent_congestion(&lost));
+        // The edges have to be ack-eliciting: with only packets 3 and 4
+        // (1000 ms and 1300 ms) ack-eliciting, the losses span 300 ms.
+        let padding: Vec<SentPacket> = lost
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                if p.pn != 3 && p.pn != 4 {
+                    p.ack_eliciting = false;
+                }
+                p
+            })
+            .collect();
+        assert!(!s.in_persistent_congestion(&padding));
+    }
+
+    /// RFC 9002 §7.6.2 (2) — a packet acknowledged between the two lost
+    /// edges means the period was not one of persistent congestion, whether
+    /// it lived in the same space or (§7.6.2 "across packet number spaces")
+    /// another one; so does a packet in another space whose fate is still
+    /// unknown.
+    #[test]
+    fn persistent_congestion_needs_nothing_acked_in_between() {
+        // Same space: packet 3 (sent at 1000 ms) is acknowledged.
+        let mut s = state_with_rtt_sample();
+        for (pn, t) in [(1, 200), (2, 400), (3, 1000), (4, 1300), (5, 1500)] {
+            s.on_packet_sent(
+                PnSpaceId::Application,
+                mk_packet(pn, true, true, Duration::from_millis(t)),
+            );
+        }
+        s.on_packet_sent(
+            PnSpaceId::Application,
+            mk_packet(6, true, true, Duration::from_millis(1600)),
+        );
+        let _ = s.on_ack_received(
+            PnSpaceId::Application,
+            &[3u64..=3u64, 6u64..=6u64],
+            Duration::ZERO,
+            Duration::from_millis(1700),
+        );
+        let lost = s.detect_lost(PnSpaceId::Application, Duration::from_millis(1700));
+        assert_eq!(lost.len(), 4);
+        assert!(!s.in_persistent_congestion(&lost));
+
+        // Another space: a Handshake packet sent at 1000 ms, between
+        // Application packets 2 and 3, is acknowledged (at 1100 ms) or is
+        // still in flight when the Application batch is judged. Either way
+        // the batch does not establish persistent congestion: the Handshake
+        // packet was sent between its edges and has not been declared lost.
+        for acked in [true, false] {
+            let mut s = state_with_rtt_sample();
+            for (pn, t) in [(1, 200), (2, 400)] {
+                s.on_packet_sent(
+                    PnSpaceId::Application,
+                    mk_packet(pn, true, true, Duration::from_millis(t)),
+                );
+            }
+            s.on_packet_sent(
+                PnSpaceId::Handshake,
+                mk_packet(0, true, true, Duration::from_millis(1000)),
+            );
+            if acked {
+                let got = s.on_ack_received(
+                    PnSpaceId::Handshake,
+                    &[0u64..=0u64],
+                    Duration::ZERO,
+                    Duration::from_millis(1100),
+                );
+                assert_eq!(got.len(), 1);
+            }
+            for (pn, t) in [(3, 1200), (4, 1300), (5, 1500), (6, 1600)] {
+                s.on_packet_sent(
+                    PnSpaceId::Application,
+                    mk_packet(pn, true, true, Duration::from_millis(t)),
+                );
+            }
+            let got = s.on_ack_received(
+                PnSpaceId::Application,
+                &[6u64..=6u64],
+                Duration::ZERO,
+                Duration::from_millis(1700),
+            );
+            assert_eq!(got.len(), 1);
+            let lost = s.detect_lost(PnSpaceId::Application, Duration::from_millis(1700));
+            assert_eq!(lost.len(), 5);
+            assert!(
+                Duration::from_millis(1300) >= s.persistent_congestion_duration(),
+                "test premise: the batch would otherwise qualify"
+            );
+            assert!(
+                !s.in_persistent_congestion(&lost),
+                "handshake packet acked={acked}"
+            );
+        }
+    }
+
+    /// RFC 9002 §7.6.2 (3) — no RTT sample before the losses: the very ACK
+    /// that reveals them takes the first sample, so every lost packet
+    /// predates it and none counts.
+    #[test]
+    fn persistent_congestion_needs_an_rtt_sample() {
+        let mut s = LossState::new();
+        s.ctx.is_server = true;
+        s.ctx.handshake_confirmed = true;
+        assert!(s.first_rtt_sample.is_none());
+        let lost = lose_flight(&mut s, [200, 400, 1000, 1300, 1500]);
+        assert_eq!(lost.len(), 5);
+        assert_eq!(s.first_rtt_sample, Some(Duration::from_millis(1700)));
+        assert!(!s.in_persistent_congestion(&lost));
+    }
+
+    /// RFC 9002 §7.6.2 (4) — losses closer together than the duration are
+    /// ordinary losses.
+    #[test]
+    fn persistent_congestion_needs_the_full_duration() {
+        let mut s = state_with_rtt_sample();
+        let lost = lose_flight(&mut s, [200, 300, 400, 500, 600]);
+        assert_eq!(lost.len(), 5);
+        assert!(Duration::from_millis(400) < s.persistent_congestion_duration());
+        assert!(!s.in_persistent_congestion(&lost));
+    }
+
+    /// The acknowledged-send-time record only keeps what can still fall
+    /// between two packets awaiting a verdict.
+    #[test]
+    fn acked_send_times_are_pruned() {
+        let mut s = state_with_rtt_sample();
+        assert!(s.acked_send_times.is_empty(), "nothing in flight");
+        s.on_packet_sent(
+            PnSpaceId::Application,
+            mk_packet(1, true, true, Duration::from_millis(200)),
+        );
+        for pn in 2..=4u64 {
+            s.on_packet_sent(
+                PnSpaceId::Application,
+                mk_packet(pn, true, true, Duration::from_millis(200 + pn)),
+            );
+            let _ = s.on_ack_received(
+                PnSpaceId::Application,
+                &[pn..=pn],
+                Duration::ZERO,
+                Duration::from_millis(300 + pn),
+            );
+        }
+        assert_eq!(s.acked_send_times.len(), 3, "packet 1 is still pending");
+        let lost = s.detect_lost(PnSpaceId::Application, Duration::from_millis(400));
+        assert_eq!(lost.len(), 1);
+        assert_eq!(
+            s.acked_send_times.len(),
+            3,
+            "kept until the batch has been judged"
+        );
+        s.on_packet_sent(
+            PnSpaceId::Application,
+            mk_packet(5, true, true, Duration::from_millis(500)),
+        );
+        let _ = s.on_ack_received(
+            PnSpaceId::Application,
+            &[5u64..=5u64],
+            Duration::ZERO,
+            Duration::from_millis(600),
+        );
+        assert!(s.acked_send_times.is_empty(), "nothing left in flight");
     }
 }

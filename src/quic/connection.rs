@@ -2257,14 +2257,26 @@ impl QuicConnection {
         }
     }
 
-    /// Feeds a batch of newly-declared-lost packets to congestion control and
-    /// re-queues the bytes they carried. Mirrors steps 5, 6 and 6b of the ACK
-    /// handler, for the timer-driven path which has no `Result` to propagate.
-    fn handle_lost_packets(&mut self, lost: &[SentPacket], now: Duration) {
+    /// RFC 9002 §B.8 `OnPacketsLost` — hands a batch `detect_lost` just
+    /// declared lost to the congestion controller: the in-flight packets
+    /// leave `bytes_in_flight` and open a recovery period, then the §7.6
+    /// persistent-congestion test collapses the window to `kMinimumWindow`
+    /// if the batch establishes it.
+    fn feed_lost_to_cc(&mut self, lost: &[SentPacket], now: Duration) {
         let in_flight: Vec<SentPacket> = lost.iter().filter(|p| p.in_flight).cloned().collect();
         if !in_flight.is_empty() {
             self.endpoint.cc.on_packets_lost(&in_flight, now);
         }
+        if self.endpoint.loss.in_persistent_congestion(lost) {
+            self.endpoint.cc.on_persistent_congestion();
+        }
+    }
+
+    /// Feeds a batch of newly-declared-lost packets to congestion control and
+    /// re-queues the bytes they carried. Mirrors steps 5, 6 and 6b of the ACK
+    /// handler, for the timer-driven path which has no `Result` to propagate.
+    fn handle_lost_packets(&mut self, lost: &[SentPacket], now: Duration) {
+        self.feed_lost_to_cc(lost, now);
         for pkt in lost {
             if !pkt.retransmit_hint.is_empty() {
                 // A malformed hint can only come from our own encoder; drop it
@@ -5235,13 +5247,11 @@ impl QuicConnection {
                         self.process_ecn_ack(ack_ecn, event_time);
                     }
                     // 5. Detect newly-lost packets (packet-threshold +
-                    //    time-threshold).
+                    //    time-threshold) and feed them to congestion
+                    //    control, persistent-congestion check included
+                    //    (RFC 9002 §B.8).
                     let lost = self.endpoint.loss.detect_lost(space_id, now);
-                    let in_flight_lost: Vec<SentPacket> =
-                        lost.iter().filter(|p| p.in_flight).cloned().collect();
-                    if !in_flight_lost.is_empty() {
-                        self.endpoint.cc.on_packets_lost(&in_flight_lost, now);
-                    }
+                    self.feed_lost_to_cc(&lost, now);
                     // 6. Re-queue CRYPTO bytes for each lost packet via
                     //    its retransmit_hint blob.
                     for pkt in &lost {
@@ -5277,13 +5287,6 @@ impl QuicConnection {
                             }
                         }
                     }
-                    // 7. Persistent congestion: if loss has accumulated
-                    //    enough PTOs without progress, signal cwnd
-                    //    reset to NewReno.
-                    if self.endpoint.loss.take_persistent_congestion() {
-                        self.endpoint.cc.on_persistent_congestion();
-                    }
-
                     // Keep the per-space `largest_acked_tx` up to date for the
                     // sender-side bookkeeping that reads it.
                     let space = match level {
@@ -8807,16 +8810,16 @@ mod tests {
             "probes are ack-eliciting and loss-tracked like any packet"
         );
 
-        // Two more silent PTOs: §7.6 persistent congestion is detected
-        // exactly as before.
+        // Two more silent PTOs keep backing the timer off.
         s.on_timeout(Duration::from_secs(10));
         s.on_timeout(Duration::from_secs(20));
         assert_eq!(s.endpoint.loss.pto_count, 3);
-        assert!(s.endpoint.loss.take_persistent_congestion());
 
         // The probes reach the client; its ACK shows progress, drops the
         // unspent credit, reveals the earlier flight as lost and reopens the
-        // window — data flows again under normal congestion control.
+        // window — data flows again under normal congestion control. The
+        // flight went out within microseconds, so its loss halves the window
+        // without establishing §7.6 persistent congestion.
         assert_eq!(
             s.endpoint.loss.probe_credit(PnSpaceId::Application),
             K_PTO_PROBES
@@ -8833,7 +8836,179 @@ mod tests {
             "an ACK clears the credit"
         );
         assert!(s.endpoint.cc.can_send(), "the ACK opened the window");
+        assert!(
+            s.endpoint.cc.cwnd
+                > crate::quic::congestion::k_minimum_window(s.endpoint.cc.max_datagram_size),
+            "a flight sent all at once is not persistent congestion"
+        );
         assert!(!s.pop_datagram().is_empty(), "data flows again");
+    }
+
+    /// Completes a handshake, has the server send a window's worth of stream
+    /// data that the client does not receive, and returns both endpoints
+    /// with the flight's datagrams in send order. The server's connection
+    /// clock is moved ten seconds into the past so the flight's send times
+    /// can be backdated (see [`backdate_flight`]) while staying after the
+    /// handshake's first RTT sample.
+    fn unacknowledged_flight() -> (QuicConnection, QuicConnection, Vec<Vec<u8>>) {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(256 * 1024, 1024 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        let addr = ip4(192, 0, 2, 1, 1111);
+        quiesce(&mut c, &mut s, addr);
+        assert!(s.endpoint.loss.first_rtt_sample.is_some());
+
+        let id = c.open_bidi().expect("open");
+        c.write(id, b"go").expect("write");
+        let dg = c.pop_datagram();
+        s.feed_datagram(&dg).expect("server feed");
+        s.write(id, &[0x33; 64 * 1024]).expect("server write");
+        let mut flight: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let out = s.pop_datagram();
+            if out.is_empty() {
+                break;
+            }
+            flight.push(out);
+        }
+        assert!(flight.len() >= 5, "test premise: a multi-packet flight");
+        assert_eq!(
+            s.endpoint.loss.per_space[PnSpaceId::Application as usize]
+                .sent_packets
+                .len(),
+            flight.len(),
+            "one tracked packet per datagram"
+        );
+        s.set_start_for_test(Instant::now() - Duration::from_secs(10));
+        (c, s, flight)
+    }
+
+    /// Rewrites the send time of every in-flight Application packet of `s`
+    /// to `now - age(index, count)`.
+    fn backdate_flight(s: &mut QuicConnection, age: impl Fn(usize, usize) -> Duration) {
+        let now = s.now_since_start();
+        let sent = &mut s.endpoint.loss.per_space[PnSpaceId::Application as usize].sent_packets;
+        let n = sent.len();
+        for (i, p) in sent.values_mut().enumerate() {
+            p.time_sent = now - age(i, n);
+        }
+    }
+
+    /// Delivers `datagrams` to the client and returns the last datagram it
+    /// answers with, which carries an ACK frame covering all of them.
+    fn client_ack(c: &mut QuicConnection, datagrams: &[&[u8]]) -> Vec<u8> {
+        for dg in datagrams {
+            c.feed_datagram(dg).expect("client feed");
+        }
+        let mut last = Vec::new();
+        loop {
+            let out = c.pop_datagram();
+            if out.is_empty() {
+                break;
+            }
+            last = out;
+        }
+        assert!(!last.is_empty(), "the client acknowledges what it received");
+        last
+    }
+
+    /// RFC 9002 §7.6 — the client acknowledges only the last packet of a
+    /// flight that reads as sent over the last two seconds; the rest are
+    /// declared lost in one batch spanning far more than
+    /// `3 × PTO`, with nothing acknowledged in between and an RTT sample
+    /// taken before the first, so the window collapses to `kMinimumWindow`
+    /// and recovery state is cleared (§7.6.3 / §B.8).
+    #[test]
+    fn persistent_congestion_collapses_the_window() {
+        use crate::quic::congestion::k_minimum_window;
+        let (mut c, mut s, flight) = unacknowledged_flight();
+        // First packet 2 s ago, second 1.5 s ago, the rest 1 s ago and the
+        // last one just now.
+        backdate_flight(&mut s, |i, n| match i {
+            0 => Duration::from_secs(2),
+            1 => Duration::from_millis(1500),
+            _ if i + 1 == n => Duration::from_millis(1),
+            _ => Duration::from_secs(1),
+        });
+        let ack = client_ack(&mut c, &[flight.last().expect("flight")]);
+        let before = s.endpoint.cc.cwnd;
+        assert!(before > k_minimum_window(s.endpoint.cc.max_datagram_size));
+        s.feed_datagram(&ack).expect("server feed ack");
+        assert!(
+            Duration::from_secs(1) >= s.endpoint.loss.persistent_congestion_duration(),
+            "test premise: the losses span the duration"
+        );
+        assert_eq!(
+            s.endpoint.cc.cwnd,
+            k_minimum_window(s.endpoint.cc.max_datagram_size),
+            "cwnd collapses to kMinimumWindow"
+        );
+        assert!(
+            s.endpoint.cc.recovery_start_time.is_none(),
+            "§B.8: congestion_recovery_start_time = 0"
+        );
+        assert!(
+            s.endpoint.cc.ssthresh < before,
+            "the congestion event halved ssthresh first"
+        );
+    }
+
+    /// RFC 9002 §7.6.2 — the same flight, but the client also received (and
+    /// acknowledges) the packet sent 1.5 s ago: something sent between the
+    /// lost packets got through, so this is ordinary loss — one halving,
+    /// recovery entered, no collapse.
+    #[test]
+    fn persistent_congestion_needs_nothing_acked_in_between() {
+        use crate::quic::congestion::k_minimum_window;
+        let (mut c, mut s, flight) = unacknowledged_flight();
+        backdate_flight(&mut s, |i, n| match i {
+            0 => Duration::from_secs(2),
+            1 => Duration::from_millis(1500),
+            _ if i + 1 == n => Duration::from_millis(1),
+            _ => Duration::from_secs(1),
+        });
+        let ack = client_ack(&mut c, &[&flight[1], flight.last().expect("flight")]);
+        let before = s.endpoint.cc.cwnd;
+        s.feed_datagram(&ack).expect("server feed ack");
+        let min = k_minimum_window(s.endpoint.cc.max_datagram_size);
+        assert!(s.endpoint.cc.cwnd > min, "no collapse");
+        assert!(
+            s.endpoint.cc.cwnd < before,
+            "but the loss halved the window"
+        );
+        assert!(
+            s.endpoint.cc.recovery_start_time.is_some(),
+            "ordinary loss recovery"
+        );
+    }
+
+    /// RFC 9002 §7.6.1 — losses closer together than the persistent
+    /// congestion duration are ordinary losses: the window is halved, not
+    /// collapsed.
+    #[test]
+    fn losses_within_the_duration_only_halve_the_window() {
+        use crate::quic::congestion::k_minimum_window;
+        let (mut c, mut s, flight) = unacknowledged_flight();
+        // The whole flight went out within 20 ms.
+        backdate_flight(&mut s, |i, n| match i {
+            0 => Duration::from_millis(20),
+            _ if i + 1 == n => Duration::from_millis(1),
+            _ => Duration::from_millis(10),
+        });
+        let ack = client_ack(&mut c, &[flight.last().expect("flight")]);
+        let before = s.endpoint.cc.cwnd;
+        s.feed_datagram(&ack).expect("server feed ack");
+        assert!(
+            Duration::from_millis(20) < s.endpoint.loss.persistent_congestion_duration(),
+            "test premise: the losses do not span the duration"
+        );
+        let min = k_minimum_window(s.endpoint.cc.max_datagram_size);
+        assert!(s.endpoint.cc.cwnd > min, "no collapse");
+        assert!(
+            s.endpoint.cc.cwnd < before,
+            "but the loss halved the window"
+        );
+        assert!(s.endpoint.cc.recovery_start_time.is_some());
     }
 
     /// RFC 9002 §6.2.4 — a probe must be ack-eliciting. When the only thing
