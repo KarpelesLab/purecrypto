@@ -16,9 +16,9 @@
 //!
 //! AEZ is a CAESAR candidate; it is well analyzed but not standardized or used
 //! in TLS, so it is provided here as a toolkit primitive. Like [`AEGIS`] it is
-//! constant-time on a constant-time AES core (this crate's software AES round is
-//! table-free; the round is not yet hardware-accelerated, so AEZ currently runs
-//! at software-AES speed).
+//! built on the bare AES round, which dispatches to the hardware AES extension
+//! (AES-NI / ARMv8 `aese`+`aesmc`) when present and otherwise to this crate's
+//! table-free constant-time software round; both are constant-time.
 //!
 //! ```
 //! # #[cfg(feature = "alloc")] {

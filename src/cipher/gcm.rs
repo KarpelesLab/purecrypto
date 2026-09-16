@@ -65,9 +65,10 @@ pub struct Gcm<C: BlockCipher> {
     cipher: C,
     /// Hash subkey `H = E_K(0¹²⁸)`.
     h: u128,
-    /// Whether to use the hardware (PCLMULQDQ) GHASH multiply. Probed once at
-    /// construction; the software `gf_mul` is the fallback. Only present on the
-    /// one target that currently has a hardware GHASH backend.
+    /// Whether to use the hardware (PCLMULQDQ / PMULL) GHASH multiply. Probed
+    /// once at construction; the software `gf_mul` is the fallback. Only
+    /// present on the targets that have a hardware GHASH backend (x86_64 and
+    /// aarch64, with `std` for the runtime feature probe).
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     ghash_hw: bool,
     /// Precomputed hash-subkey powers `hpow[i] = H^{i+1}` for the aggregated
