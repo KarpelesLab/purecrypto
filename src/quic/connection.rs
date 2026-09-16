@@ -449,6 +449,8 @@ const ERROR_FRAME_ENCODING: u64 = 0x07;
 const ERROR_TRANSPORT_PARAMETER: u64 = 0x08;
 /// RFC 9000 §20.1 — `PROTOCOL_VIOLATION`.
 const ERROR_PROTOCOL_VIOLATION: u64 = 0x0a;
+/// RFC 9000 §20.1 — `AEAD_LIMIT_REACHED` (RFC 9001 §6.6).
+const ERROR_AEAD_LIMIT_REACHED: u64 = 0x0e;
 /// RFC 9000 §20.1 — the `CRYPTO_ERROR` range (`0x0100`-`0x01ff`): RFC 9001
 /// §4.8 maps a TLS alert of description `d` to `0x0100 | d`.
 const ERROR_CRYPTO_BASE: u64 = 0x0100;
@@ -1426,8 +1428,9 @@ impl QuicConnection {
             };
             // RFC 9000 §10.2.2 — a CONNECTION_CLOSE in one of the coalesced
             // packets ends the connection; the packets behind it belong to
-            // state that no longer exists.
-            if self.draining {
+            // state that no longer exists. Likewise once a packet has put us
+            // in the closing state (RFC 9001 §6.6 integrity limit).
+            if self.draining || self.pending_close.is_some() {
                 break;
             }
             if consumed == 0 {
@@ -4283,22 +4286,22 @@ impl QuicConnection {
 
     /// RFC 9001 §6.6 — record an AEAD authentication failure on the rx
     /// side of `level`. Returns `Ok(true)` if this failure just crossed
-    /// the integrity limit (the connection is now closed; the caller
-    /// should treat the packet as silently dropped). Returns `Ok(false)`
-    /// for a sub-threshold failure (the caller should propagate the
-    /// AEAD error so the bad bytes are discarded but the connection
-    /// stays up).
+    /// the integrity limit (the connection is now closing with
+    /// AEAD_LIMIT_REACHED; the caller should treat the packet as silently
+    /// dropped). Returns `Ok(false)` for a sub-threshold failure (the
+    /// caller should propagate the AEAD error so the bad bytes are
+    /// discarded but the connection stays up).
     fn bump_rx_aead_failure(&mut self, level: Level) -> Result<bool, Error> {
         let lk = self.endpoint.crypto.at_mut(level);
         lk.rx_aead_failures = lk.rx_aead_failures.saturating_add(1);
         let failed = lk.rx_aead_failures;
         let limit = lk.effective_integrity_limit();
         if failed >= limit {
-            // RFC 9000 §10.3 / RFC 9001 §6.6 — close with
-            // AEAD_LIMIT_REACHED (transport error 0x0e). The existing
-            // shutdown style is flag-driven (`self.closed = true`) and
-            // pop_datagram becomes a no-op; we mirror that.
-            self.closed = true;
+            // RFC 9001 §6.6 — "the endpoint MUST immediately close the
+            // connection with a connection error of type
+            // AEAD_LIMIT_REACHED": enter the closing state and queue the
+            // CONNECTION_CLOSE rather than going silent.
+            self.close_with_transport_error(ERROR_AEAD_LIMIT_REACHED);
             return Ok(true);
         }
         Ok(false)
@@ -5638,17 +5641,21 @@ impl QuicConnection {
         // close the connection with AEAD_LIMIT_REACHED. (Key update is
         // the well-behaved escape hatch; the close path is the
         // mandatory fallback when no update is initiated in time.)
+        // A connection that is already closing builds nothing but its
+        // CONNECTION_CLOSE (RFC 9000 §10.2.1) — including the levels that
+        // follow the one whose key limit was just hit.
+        if self.closed || self.pending_close.is_some() {
+            return None;
+        }
         {
             let lk = self.endpoint.crypto.at(level);
             if lk.tx_packets >= lk.effective_usage_limit() {
-                // Trigger close. RFC 9000 §10.3 says we SHOULD emit a
-                // CONNECTION_CLOSE, but the existing connection
-                // shutdown style here is to flip `closed` (no further
-                // pop_datagram output) and let the error surface to
-                // the caller through the next inbound feed. Returning
-                // None from build_packet_with_pad mirrors the existing
-                // "nothing to emit" shape.
-                self.closed = true;
+                // RFC 9001 §6.6: "the endpoint MUST close the connection with
+                // a connection error of type AEAD_LIMIT_REACHED". Enter the
+                // closing state and queue the CONNECTION_CLOSE; flipping
+                // `closed` silently left the peer to find out by idle
+                // timeout.
+                self.close_with_transport_error(ERROR_AEAD_LIMIT_REACHED);
                 return None;
             }
         }
@@ -12791,13 +12798,66 @@ mod tests {
         // sees the data.
         for _ in 0..16 {
             let _ = pump(&mut c, &mut s);
-            if c.closed {
+            if c.is_closing() {
                 break;
             }
         }
+        // RFC 9001 §6.6 — the close is a CONNECTION_CLOSE carrying
+        // AEAD_LIMIT_REACHED, not a silent local shutdown: the client enters
+        // the closing state and the peer learns the reason.
         assert!(
-            c.closed,
+            c.is_closing(),
             "client must close after tx_packets crosses the usage limit override"
+        );
+        let info = c.close_info().expect("close info");
+        assert_eq!(info.error_code, ERROR_AEAD_LIMIT_REACHED);
+        assert_eq!(info.kind, CloseKind::Transport);
+        let _ = pump(&mut c, &mut s);
+        assert!(s.is_draining(), "the peer received the CONNECTION_CLOSE");
+        let peer = s.close_info().expect("peer close info");
+        assert_eq!(peer.initiator, CloseInitiator::Peer);
+        assert_eq!(peer.error_code, ERROR_AEAD_LIMIT_REACHED);
+    }
+
+    /// RFC 9001 §6.6 — crossing the rx *integrity* limit likewise MUST close
+    /// the connection with AEAD_LIMIT_REACHED, via CONNECTION_CLOSE.
+    #[test]
+    fn rx_integrity_limit_closes_with_aead_limit_reached() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        c.endpoint
+            .crypto
+            .at_mut(Level::OneRtt)
+            .integrity_limit_override = Some(2);
+        // Two forged 1-RTT packets addressed to the client's CID: they carry
+        // a valid short header (so header protection is removed and the AEAD
+        // is tried) but garbage everywhere else.
+        let mut forged = alloc::vec![0x43u8];
+        forged.extend_from_slice(c.endpoint.cids.local.as_slice());
+        forged.extend(core::iter::repeat_n(0x5Au8, 64));
+        c.feed_datagram(&forged)
+            .expect("first failure is a silent drop");
+        assert!(!c.is_closing());
+        forged[20] ^= 0xFF;
+        c.feed_datagram(&forged)
+            .expect("second failure trips the limit");
+        assert!(
+            c.is_closing(),
+            "integrity limit must enter the closing state"
+        );
+        let info = c.close_info().expect("close info");
+        assert_eq!(info.error_code, ERROR_AEAD_LIMIT_REACHED);
+        assert_eq!(info.kind, CloseKind::Transport);
+        let close = c.pop_datagram();
+        assert!(!close.is_empty(), "a CONNECTION_CLOSE is emitted");
+        s.feed_datagram(&close).expect("server feed");
+        assert!(s.is_draining());
+        assert_eq!(
+            s.close_info().expect("peer close info").error_code,
+            ERROR_AEAD_LIMIT_REACHED
         );
     }
 
