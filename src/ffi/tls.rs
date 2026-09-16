@@ -24,7 +24,7 @@ use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::{
     AlertDescription, ClientAuth, Config, ConfigBuilder, Connection, CrlStore, Error,
-    HandshakeStatus, ProtocolVersion, RootCertStore, SigningKey,
+    HandshakeStatus, ProtocolVersion, RootCertStore, Secret32, SigningKey,
 };
 
 /// TLS / DTLS role.
@@ -102,23 +102,14 @@ pub struct PcTlsCfg {
     cert: Option<CertAndKey>,
     alpn: Vec<Vec<u8>>,
     verify_certs: bool,
-    cookie_secret: Option<[u8; 32]>,
+    /// DTLS server cookie secret; a [`Secret32`] so it is wiped when the
+    /// config's storage is handed back to the allocator on `pc_tls_cfg_free`.
+    cookie_secret: Option<Secret32>,
     no_cookie: bool,
     /// DTLS server: canonical `v6-or-v4-mapped ‖ port_be` encoding of the
     /// peer this connection will be fed from (see
     /// [`pc_dtls_cfg_set_peer_addr`]).
     peer_addr: Option<[u8; 18]>,
-}
-
-impl Drop for PcTlsCfg {
-    fn drop(&mut self) {
-        // The DTLS cookie secret is long-lived key material; scrub it before
-        // the config's storage is handed back to the allocator on
-        // pc_tls_cfg_free.
-        if let Some(secret) = self.cookie_secret.as_mut() {
-            wipe_array(secret);
-        }
-    }
 }
 
 struct CertAndKey {
@@ -248,8 +239,8 @@ impl PcTlsCfg {
         if let Some(sni) = &self.server_name {
             b = b.server_name(sni.clone());
         }
-        if let Some(secret) = self.cookie_secret {
-            b = b.cookie_secret(secret);
+        if let Some(secret) = &self.cookie_secret {
+            b = b.cookie_secret(secret.clone());
         }
         if self.no_cookie {
             b = b.no_cookie();
@@ -618,11 +609,13 @@ pub unsafe extern "C" fn pc_dtls_cfg_set_cookie_secret(
         let Some(bytes) = (unsafe { slice(secret, secret_len) }) else {
             return PcStatus::NullPointer;
         };
-        let buf: [u8; 32] = match bytes.try_into() {
+        let mut buf: [u8; 32] = match bytes.try_into() {
             Ok(a) => a,
             Err(_) => return PcStatus::Unsupported,
         };
-        unsafe { &mut *cfg }.cookie_secret = Some(buf);
+        unsafe { &mut *cfg }.cookie_secret = Some(Secret32::from(buf));
+        // `Secret32::from` copied the array; scrub the stack copy.
+        wipe_array(&mut buf);
         PcStatus::Ok
     })
 }

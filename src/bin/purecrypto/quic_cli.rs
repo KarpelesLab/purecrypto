@@ -248,8 +248,8 @@ pub(crate) fn run_server(args: Args) {
             let mut secret = [0u8; 32];
             purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
             qcfg.require_retry = true;
-            qcfg.retry_secret = Some(secret);
-            // `retry_secret` stores a Copy of the array; scrub our stack copy.
+            qcfg.retry_secret = Some(secret.into());
+            // `Secret32::from` copies the array; scrub our stack copy.
             zero_buf(&mut secret);
         }
         Ok(qcfg)

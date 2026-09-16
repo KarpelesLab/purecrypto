@@ -211,10 +211,11 @@ pub struct QuicConfig {
     /// Server-only — HMAC-SHA256 key used to authenticate the stateless
     /// retry token. MUST be cryptographically random; rotate on a coarse
     /// interval (hours). When `None`, retry-token minting + validation is
-    /// disabled (and `require_retry` is treated as `false`).
+    /// disabled (and `require_retry` is treated as `false`). Wiped when the
+    /// config (and the connection built from it) is dropped.
     ///
     /// Ignored on the client side.
-    pub retry_secret: Option<[u8; 32]>,
+    pub retry_secret: Option<crate::tls::Secret32>,
     /// Server-only — long-lived secret keying RFC 9000 §10.3.1 stateless-reset
     /// tokens. Every reset token this endpoint advertises (its handshake-CID
     /// token in transport parameters, and every `NEW_CONNECTION_ID` token) is
@@ -652,7 +653,7 @@ pub struct QuicConnection {
     require_retry: bool,
     /// Server-only — the HMAC key for stateless retry tokens. `None`
     /// disables minting and validation (and forces `require_retry = false`).
-    retry_secret: Option<[u8; 32]>,
+    retry_secret: Option<crate::tls::Secret32>,
     /// Server-side — `true` once we've emitted a Retry packet. We expect
     /// the client to retransmit its ClientHello with a token; subsequent
     /// Initials without a valid token are dropped.
@@ -1113,7 +1114,7 @@ impl QuicConnection {
         validate_local_transport_params(&cfg.transport_params)?;
         let endpoint = build_pending_endpoint();
         let require_retry = cfg.require_retry && cfg.retry_secret.is_some();
-        let retry_secret = cfg.retry_secret;
+        let retry_secret = cfg.retry_secret.clone();
 
         // The server doesn't yet know any of its own CIDs (the SCID is
         // chosen on receipt of the first Initial); we seed `cid_local`
@@ -1507,7 +1508,7 @@ impl QuicConnection {
         }
 
         let secret = match self.retry_secret.as_ref() {
-            Some(s) => *s,
+            Some(s) => s.clone(),
             None => return Ok(None),
         };
 
@@ -1570,7 +1571,7 @@ impl QuicConnection {
             // `retry_source_connection_id` — is a value *we* chose, not one
             // the client (or whoever replayed the token) picked.
             let token = crate::quic::retry::mint(
-                &secret,
+                secret.as_bytes(),
                 &addr_bytes,
                 &odcid_bytes,
                 retry_scid.as_slice(),
@@ -1607,7 +1608,8 @@ impl QuicConnection {
             None => return Ok(None),
         };
         let addr_bytes = encode_retry_addr(&peer_addr);
-        match crate::quic::retry::validate(&secret, &addr_bytes, hdr.token, self.now_secs) {
+        match crate::quic::retry::validate(secret.as_bytes(), &addr_bytes, hdr.token, self.now_secs)
+        {
             Ok((odcid, retry_scid)) => {
                 // L-8: the retried Initial MUST be addressed to the SCID we
                 // put in the Retry packet, which the token binds. Without the
@@ -6624,8 +6626,8 @@ fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
     // Session resumption. Without a ticket key the server issues no
     // NewSessionTicket at all, so clients can never resume — which is why
     // this must be propagated for 0-RTT to be reachable.
-    if let Some(key) = cfg.tls.ticket_key {
-        sc = sc.with_ticket_key(key);
+    if let Some(key) = &cfg.tls.ticket_key {
+        sc = sc.with_ticket_key(*key.as_bytes());
     }
     if cfg.enable_early_data {
         // RFC 9001 §4.6.1: a QUIC server MUST advertise exactly 0xffffffff.
@@ -7687,7 +7689,7 @@ mod tests {
     /// NewSessionTicket at all) and both sides opt into early data.
     fn zero_rtt_configs() -> (crate::tls::Config, crate::tls::Config, TransportParameters) {
         let (mut server_cfg_tls, cert_der) = ed25519_server();
-        server_cfg_tls.ticket_key = Some([0x5c; 32]);
+        server_cfg_tls.ticket_key = Some([0x5c; 32].into());
         let mut roots = crate::tls::RootCertStore::new();
         roots.add_der(cert_der).unwrap();
         let client_cfg = crate::tls::Config {
@@ -9768,7 +9770,7 @@ mod tests {
             tls: server_cfg_tls,
             transport_params: loopback_params(),
             require_retry: true,
-            retry_secret: Some(retry_secret),
+            retry_secret: Some(retry_secret.into()),
             ..QuicConfig::default()
         })
         .expect("server build");
@@ -12367,7 +12369,7 @@ mod tests {
             tls: server_cfg_tls,
             transport_params: loopback_params(),
             require_retry: true,
-            retry_secret: Some([0x77; 32]),
+            retry_secret: Some([0x77; 32].into()),
             ..QuicConfig::default()
         })
         .expect("server build");

@@ -1554,8 +1554,8 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<Conf
     if let Some(ca) = &cfg.client_auth {
         sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
     }
-    if let Some(tk) = cfg.ticket_key {
-        sc = sc.with_ticket_key(tk);
+    if let Some(tk) = &cfg.ticket_key {
+        sc = sc.with_ticket_key(*tk.as_bytes());
     }
     if cfg.max_early_data_size > 0 {
         sc = sc.with_max_early_data(cfg.max_early_data_size);
@@ -1620,8 +1620,8 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     if let Some(ca) = &cfg.client_auth {
         sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
     }
-    if let Some(tk) = cfg.ticket_key {
-        sc = sc.with_ticket_key(tk);
+    if let Some(tk) = &cfg.ticket_key {
+        sc = sc.with_ticket_key(*tk.as_bytes());
     }
     if let Some(ocsp) = cfg.stapled_ocsp_response.clone() {
         sc = sc.with_stapled_ocsp_response(ocsp);
@@ -1736,11 +1736,11 @@ fn build_dtls12_server(
         // ML-DSA are not common in TLS 1.2 practice.
         _ => return Err(Error::UnsupportedVersion),
     };
-    if let Some(secret) = cfg.cookie_secret {
-        sc = sc.with_cookie_secret(secret);
+    if let Some(secret) = &cfg.cookie_secret {
+        sc = sc.with_cookie_secret(*secret.as_bytes());
     }
-    if let Some(previous) = cfg.previous_cookie_secret {
-        sc = sc.with_previous_cookie_secret(previous);
+    if let Some(previous) = &cfg.previous_cookie_secret {
+        sc = sc.with_previous_cookie_secret(*previous.as_bytes());
     }
     if !cfg.require_cookie {
         sc = sc.require_cookie_exchange(false);
@@ -1774,11 +1774,11 @@ fn build_dtls13_server(
     let chain = id.cert_chain.clone();
     let server_key = id.key.to_server_key_13();
     let mut sc = crate::dtls::ServerConfig13Internal::with_signing_key(chain, server_key);
-    if let Some(secret) = cfg.cookie_secret {
-        sc = sc.with_cookie_secret(secret);
+    if let Some(secret) = &cfg.cookie_secret {
+        sc = sc.with_cookie_secret(*secret.as_bytes());
     }
-    if let Some(previous) = cfg.previous_cookie_secret {
-        sc = sc.with_previous_cookie_secret(previous);
+    if let Some(previous) = &cfg.previous_cookie_secret {
+        sc = sc.with_previous_cookie_secret(*previous.as_bytes());
     }
     if !cfg.require_cookie {
         sc = sc.with_no_cookie();
@@ -2412,7 +2412,7 @@ mod tests {
 
             // Server: an ECH key ring on a DTLS server config.
             let mut cfg = dtls_server_cfg_without_cookie_secret(version);
-            cfg.cookie_secret = Some([0x42u8; 32]);
+            cfg.cookie_secret = Some([0x42u8; 32].into());
             assert!(Connection::server(&cfg).is_ok());
             cfg.ech_server = Some(EchServer::new(
                 EchKeyRing::from_pairs(alloc::vec![]),
@@ -2449,7 +2449,7 @@ mod tests {
 
         // Explicit secret -> allowed.
         let mut cfg = dtls_server_cfg_without_cookie_secret(ProtocolVersion::DTLSv1_3);
-        cfg.cookie_secret = Some([0x42u8; 32]);
+        cfg.cookie_secret = Some([0x42u8; 32].into());
         assert!(Connection::server(&cfg).is_ok());
 
         // Explicit opt-out (require_cookie = false) -> allowed.

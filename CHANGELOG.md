@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(tls)* **breaking:** `Config::ticket_key`, `Config::cookie_secret`,
+  `Config::previous_cookie_secret` and `QuicConfig::retry_secret` are now
+  `Option<tls::Secret32>` instead of `Option<[u8; 32]>`, so the keys are
+  wiped when the config is dropped. The builder methods accept both a
+  `[u8; 32]` and a `Secret32`; direct field writes need `.into()`.
+
 ## [0.8.7](https://github.com/KarpelesLab/purecrypto/compare/v0.8.6...v0.8.7) - 2026-09-16
 
 ### Fixed

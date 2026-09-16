@@ -189,9 +189,9 @@ pub(crate) fn run(args: Args) {
             let mut secret = [0u8; 32];
             purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
             builder = builder.cookie_secret(secret);
-            // `cookie_secret` takes the array by value (Copy), so our
-            // stack copy survives; scrub it as `pc_quic_new` does for
-            // the QUIC retry secret (commit 316e8a2).
+            // `cookie_secret` copies the array into a wiping `Secret32`,
+            // so our stack copy survives; scrub it as `pc_quic_new` does
+            // for the QUIC retry secret (commit 316e8a2).
             zero_buf(&mut secret);
         }
     }

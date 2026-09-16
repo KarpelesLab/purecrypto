@@ -17,6 +17,7 @@ use crate::signature_registry::SignaturePolicy;
 use super::groups::NamedGroup;
 use super::keylog::KeyLog;
 use super::pki::{CrlStore, RootCertStore};
+use super::secret::Secret32;
 use super::version::ProtocolVersion;
 use crate::x509::Time;
 
@@ -260,7 +261,8 @@ pub struct Config {
     /// `ClientHello`.
     pub stapled_ocsp_response: Option<Vec<u8>>,
     /// TLS 1.2 / TLS 1.3 session-ticket key. `None` = no tickets issued.
-    pub ticket_key: Option<[u8; 32]>,
+    /// Wiped when the `Config` is dropped (see [`Secret32`]).
+    pub ticket_key: Option<Secret32>,
     /// Cap on bytes the server accepts as 0-RTT early data. `0` = no 0-RTT.
     pub max_early_data_size: u32,
     /// 0-RTT replay protection (TLS 1.3 server). `None` = skip the check.
@@ -389,13 +391,14 @@ pub struct Config {
 
     // ---- DTLS-only (inert when version is TLS) ----
     /// 32-byte secret for stateless cookie issuance / validation. `None` on
-    /// the DTLS server = cookie exchange is skipped (test-only).
-    pub cookie_secret: Option<[u8; 32]>,
+    /// the DTLS server = cookie exchange is skipped (test-only). Wiped when
+    /// the `Config` is dropped (see [`Secret32`]).
+    pub cookie_secret: Option<Secret32>,
     /// The cookie secret in use before the last rotation. Cookies are
     /// minted only under [`Self::cookie_secret`] but accepted under either,
     /// so rotating does not strand clients whose cookie is in flight; one
     /// generation only — a cookie from two rotations ago is refused.
-    pub previous_cookie_secret: Option<[u8; 32]>,
+    pub previous_cookie_secret: Option<Secret32>,
     /// When `true`, the DTLS server mandates a cookie round-trip before
     /// allocating per-connection state. Default `true` on server, ignored
     /// on client. **Setting this to `false` turns the server into a >3x
@@ -796,9 +799,10 @@ impl ConfigBuilder {
         self.inner.client_auth = Some(auth);
         self
     }
-    /// DTLS server: long-lived 32-byte cookie secret.
-    pub fn cookie_secret(mut self, secret: [u8; 32]) -> Self {
-        self.inner.cookie_secret = Some(secret);
+    /// DTLS server: long-lived 32-byte cookie secret (a `[u8; 32]` or a
+    /// [`Secret32`]).
+    pub fn cookie_secret(mut self, secret: impl Into<Secret32>) -> Self {
+        self.inner.cookie_secret = Some(secret.into());
         self.inner.require_cookie = true;
         self
     }
@@ -806,8 +810,8 @@ impl ConfigBuilder {
     /// replaced. Cookies minted under it stay valid for their max-age, so
     /// a rotation does not abort handshakes in flight
     /// ([`Config::previous_cookie_secret`]).
-    pub fn previous_cookie_secret(mut self, secret: [u8; 32]) -> Self {
-        self.inner.previous_cookie_secret = Some(secret);
+    pub fn previous_cookie_secret(mut self, secret: impl Into<Secret32>) -> Self {
+        self.inner.previous_cookie_secret = Some(secret.into());
         self
     }
     /// DTLS server: disable the cookie exchange (tests only).
@@ -885,9 +889,10 @@ impl ConfigBuilder {
         self.inner.stapled_ocsp_response = Some(der);
         self
     }
-    /// TLS 1.2 / 1.3 server: session-ticket / NewSessionTicket key.
-    pub fn ticket_key(mut self, key: [u8; 32]) -> Self {
-        self.inner.ticket_key = Some(key);
+    /// TLS 1.2 / 1.3 server: session-ticket / NewSessionTicket key (a
+    /// `[u8; 32]` or a [`Secret32`]).
+    pub fn ticket_key(mut self, key: impl Into<Secret32>) -> Self {
+        self.inner.ticket_key = Some(key.into());
         self
     }
     /// TLS 1.3 server: 0-RTT max early data size.
