@@ -878,6 +878,15 @@ impl DtlsClientConnection12 {
             return Err(Error::UnexpectedMessage);
         }
         let sh = ServerHello::decode_dtls(body)?;
+        // RFC 5246 §7.4.1.3: `SessionID<0..32>`. This client never offers a
+        // session ticket or a session id, so it never resumes and the echo
+        // rule of RFC 5077 §3.4 does not apply: a non-empty id is simply a
+        // server-assigned one we will never present again. An oversized id
+        // is a protocol violation, though, and is refused like the TLS 1.2
+        // client refuses it.
+        if sh.session_id.len() > 32 {
+            return Err(Error::IllegalParameter);
+        }
         // RFC 5246 §7.4.1.3: the SH's `cipher_suite` MUST be one of those the
         // client offered. We additionally require it to be a member of our
         // SUITES_12 table; an unknown / non-offered codepoint is a fatal

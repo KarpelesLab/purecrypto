@@ -916,6 +916,15 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         }
         // Decode the DTLS-flavoured ClientHello body.
         let parsed = parse_dtls_client_hello(body)?;
+        // RFC 5246 §7.4.1.2: `SessionID<0..32>`. This server keeps no
+        // session cache and never echoes the id (its ServerHello always
+        // carries an empty one), so nothing downstream depends on it —
+        // but an oversized id is a protocol violation and is refused
+        // before anything else is decided from the hello, as the TLS 1.2
+        // server does.
+        if parsed.session_id.len() > 32 {
+            return Err(Error::IllegalParameter);
+        }
 
         // Fail closed: a server that asks for cookie enforcement but never
         // supplied a `cookie_secret` MUST NOT silently degrade to the

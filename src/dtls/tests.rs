@@ -923,6 +923,129 @@ fn exporter_agrees_both_sides_12() {
     assert_ne!(c_out, c_empty);
 }
 
+/// Rewrites the `session_id` of the (single, unfragmented) hello carried
+/// by an epoch-0 handshake record `dgram` to `n` bytes of `0xab`, fixing
+/// the handshake header's `length` / `fragment_length` and the record's
+/// `length`. Layout: 13-byte record header, 12-byte handshake header, then
+/// `version(2) ‖ random(32) ‖ session_id<0..2^8-1> ‖ …` for both the
+/// ClientHello and the ServerHello.
+fn with_session_id(dgram: &[u8], n: usize) -> Vec<u8> {
+    const REC: usize = 13;
+    const HS: usize = 12;
+    let body = &dgram[REC + HS..];
+    let old_len = body[34] as usize;
+    let mut new_body = Vec::with_capacity(body.len() + n);
+    new_body.extend_from_slice(&body[..34]);
+    new_body.push(n as u8);
+    new_body.extend(core::iter::repeat_n(0xab, n));
+    new_body.extend_from_slice(&body[35 + old_len..]);
+    let mut out = Vec::with_capacity(REC + HS + new_body.len());
+    out.extend_from_slice(&dgram[..REC + HS]);
+    out.extend_from_slice(&new_body);
+    let len = new_body.len() as u32;
+    // Handshake `length` (bytes 1..4) and `fragment_length` (bytes 9..12).
+    for off in [REC + 1, REC + 9] {
+        out[off] = (len >> 16) as u8;
+        out[off + 1] = (len >> 8) as u8;
+        out[off + 2] = len as u8;
+    }
+    let rec_len = (HS as u32 + len) as u16;
+    out[11..13].copy_from_slice(&rec_len.to_be_bytes());
+    out
+}
+
+/// RFC 5246 §7.4.1.2: `SessionID<0..32>`. The DTLS 1.2 server used to take
+/// a `session_id` of any length its `u8` prefix allows. A 33-byte one must
+/// be refused — silently, being spoofable epoch-0 input — while the
+/// 32-byte maximum is still served. Mirrors the TLS 1.2 server.
+#[test]
+fn oversized_client_hello_session_id_is_dropped_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let ch = client.pop_outbound_datagrams().remove(0);
+
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-sid-33", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    assert_eq!(server.feed_datagram(&with_session_id(&ch, 33)), Ok(()));
+    assert!(
+        server.pop_outbound_datagrams().is_empty(),
+        "a 33-byte session_id must not be served"
+    );
+    // The maximum legal length is served with a full flight.
+    assert_eq!(server.feed_datagram(&with_session_id(&ch, 32)), Ok(()));
+    assert!(!server.pop_outbound_datagrams().is_empty());
+}
+
+/// RFC 5246 §7.4.1.3: the DTLS 1.2 client ignored the ServerHello's
+/// `session_id` entirely. A server-assigned id of legal length is fine
+/// (this client never resumes, so nothing is echoed or compared), but an
+/// oversized one is a protocol violation: dropped as spoofable epoch-0
+/// input, without derailing the genuine ServerHello that follows.
+#[test]
+fn oversized_server_hello_session_id_is_dropped_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-sh-sid", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    for dg in client.pop_outbound_datagrams() {
+        server.feed_datagram(&dg).unwrap();
+    }
+    let flight = server.pop_outbound_datagrams();
+    // First record: the ServerHello (one fragment).
+    assert_eq!(flight[0][13], crate::tls::codec::hs_type::SERVER_HELLO);
+    assert_eq!(
+        client.feed_datagram(&with_session_id(&flight[0], 33)),
+        Ok(())
+    );
+    for dg in &flight[1..] {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(
+        client.pop_outbound_datagrams().is_empty(),
+        "the client must not have acted on the oversized ServerHello"
+    );
+    // The genuine ServerHello (as the server would retransmit it) is then
+    // processed normally: the buffered rest of the flight drains and the
+    // client answers with its own flight.
+    client.feed_datagram(&flight[0]).unwrap();
+    let client_flight = client.pop_outbound_datagrams();
+    assert_eq!(client_flight.len(), 3, "CKE, CCS, Finished");
+    for dg in &client_flight {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(server.is_handshake_complete());
+
+    // A 32-byte server-assigned id is a legal ServerHello the client acts
+    // on. (The spliced hello no longer matches the server's transcript, so
+    // only the client's acceptance is checked here — on a fresh pair.)
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-sh-sid-32", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    for dg in client.pop_outbound_datagrams() {
+        server.feed_datagram(&dg).unwrap();
+    }
+    let flight = server.pop_outbound_datagrams();
+    assert_eq!(
+        client.feed_datagram(&with_session_id(&flight[0], 32)),
+        Ok(())
+    );
+    for dg in &flight[1..] {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(
+        client.pop_outbound_datagrams().len(),
+        3,
+        "a 32-byte session_id must be accepted"
+    );
+}
+
 /// DTLS 1.3 end-to-end loopback tests.
 mod dtls13 {
     use super::*;
