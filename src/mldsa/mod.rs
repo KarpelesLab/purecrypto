@@ -1300,6 +1300,75 @@ mod tests {
         "../../testdata/mldsa87_sigver.kat"
     );
 
+    // ACVP FIPS 204 sigGen vectors for the *external* interface, hedged
+    // (`deterministic = false`, `signatureInterface = external`, pure, with a
+    // non-empty context), from the same internalProjection.json: lines are
+    // `sk rnd ctx msg sig`. The `acvp_tests!` sigGen vectors above are all
+    // deterministic (`rnd = 0³²`) and drive `sign_internal` with a bare `M'`,
+    // so neither the placement of `rnd` in `ρ'' = H(K ‖ rnd ‖ μ)` nor the
+    // `0 ‖ |ctx| ‖ ctx ‖ M` framing was pinned by NIST vectors before.
+    macro_rules! acvp_ext_tests {
+        ($name:ident, $sk_ty:ty, $k:expr, $l:expr, $params:expr, $file:expr) => {
+            #[test]
+            fn $name() {
+                let mut n = 0;
+                for line in include_str!($file).lines() {
+                    let mut it = line.split_whitespace();
+                    let sk = unhex(it.next().unwrap());
+                    let rnd: [u8; 32] = unhex(it.next().unwrap()).try_into().unwrap();
+                    let ctx = unhex(it.next().unwrap());
+                    let msg = unhex(it.next().unwrap());
+                    let sig_exp = unhex(it.next().unwrap());
+                    assert!(!ctx.is_empty() && ctx.len() <= 255);
+                    // Hedged signing with the vector's `rnd`, through the
+                    // crate's own M' framing.
+                    let mut pfx = [0u8; 2];
+                    let mut sig = alloc::vec![0u8; $params.sig];
+                    sign_internal::<$k, $l>(
+                        &sk,
+                        &rnd,
+                        &m_prime_parts(&mut pfx, &ctx, &msg),
+                        &$params,
+                        &mut sig,
+                    );
+                    assert_eq!(sig, sig_exp, "hedged external signature");
+                    // The public external verifier accepts it under exactly
+                    // this (msg, ctx), with the public key derived from sk.
+                    let pk = <$sk_ty>::from_bytes(&sk).unwrap().public_key();
+                    assert!(pk.verify(&sig_exp, &msg, &ctx));
+                    assert!(!pk.verify(&sig_exp, &msg, b""));
+                    n += 1;
+                }
+                assert_eq!(n, 2, "every fixture line must run");
+            }
+        };
+    }
+
+    acvp_ext_tests!(
+        acvp_siggen_ext_44,
+        MlDsa44PrivateKey,
+        4,
+        4,
+        P44,
+        "../../testdata/mldsa44_siggen_ext.kat"
+    );
+    acvp_ext_tests!(
+        acvp_siggen_ext_65,
+        MlDsa65PrivateKey,
+        6,
+        5,
+        P65,
+        "../../testdata/mldsa65_siggen_ext.kat"
+    );
+    acvp_ext_tests!(
+        acvp_siggen_ext_87,
+        MlDsa87PrivateKey,
+        8,
+        7,
+        P87,
+        "../../testdata/mldsa87_siggen_ext.kat"
+    );
+
     #[cfg(feature = "der")]
     #[test]
     fn spki_matches_openssl() {
