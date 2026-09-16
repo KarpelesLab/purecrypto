@@ -332,8 +332,14 @@ Behaviour worth knowing:
   all three TLS 1.3 suites; and Ed25519, Ed448, ECDSA and RSA peer
   signatures.
 - `s_server` is a one-shot test server: it accepts one connection, exchanges
-  data, and exits. Over TCP `-accept` takes a port and always binds
-  `127.0.0.1`; the DTLS and QUIC servers accept `host:port` as well.
+  data, and exits (over TCP it also gives up after 60 s without a client).
+  `-accept` takes a bare port, which binds `127.0.0.1`; the DTLS and QUIC
+  servers accept `host:port` as well.
+- `-accept 0` (or `host:0`) lets the kernel pick a free port. All three
+  servers print the address they actually bound in their `listening on …`
+  stderr banner, so a harness can start the server first and read the port
+  back from that line, rather than probing for a free port and hoping nobody
+  takes it before the server binds. `-quiet` suppresses the banner.
 - A TCP close without a TLS `close_notify` is reported as a possible
   truncation on stderr and the client exits non-zero.
 - `-key` must match `-cert`; a mismatch is refused before listening.

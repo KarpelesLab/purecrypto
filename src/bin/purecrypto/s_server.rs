@@ -199,6 +199,11 @@ pub(crate) fn run(args: Args) {
 
     match version {
         ProtocolVersion::Tls12 | ProtocolVersion::Tls13 => {
+            // `-accept 0` asks the kernel for a free port. The banner below
+            // reports the address that was actually bound, so a harness can
+            // read the port back from it instead of probing for a free one
+            // itself (a probe-then-release port can be taken by another
+            // process before the server binds it).
             let port: u16 = args
                 .value("-accept")
                 .unwrap_or("4433")
@@ -206,12 +211,13 @@ pub(crate) fn run(args: Args) {
                 .unwrap_or_else(|_| die("-accept expects a port number"));
             let listener = TcpListener::bind(("127.0.0.1", port))
                 .unwrap_or_else(|e| die(format!("cannot bind 127.0.0.1:{port}: {e}")));
+            let bound = listener
+                .local_addr()
+                .unwrap_or_else(|e| die(format!("cannot read the bound address: {e}")));
             if !quiet {
-                eprintln!("listening on 127.0.0.1:{port}");
+                eprintln!("listening on {bound}");
             }
-            let (mut sock, peer) = listener
-                .accept()
-                .unwrap_or_else(|e| die(format!("accept failed: {e}")));
+            let (mut sock, peer) = accept_with_deadline(&listener, ACCEPT_DEADLINE);
             if !quiet {
                 eprintln!("accepted connection from {peer}");
             }
@@ -222,7 +228,48 @@ pub(crate) fn run(args: Args) {
         ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13 => {
             // `-Verify` was already rejected above, before the config was built.
             let accept = args.value("-accept").unwrap_or("127.0.0.1:4434");
-            run_udp(&cfg, accept, mtu, quiet);
+            // `-accept` takes `host:port` or a bare `PORT` (including `0` for
+            // a kernel-chosen one), matching the TCP and QUIC servers; a bare
+            // port binds 127.0.0.1.
+            let accept = if accept.contains(':') {
+                accept.to_string()
+            } else {
+                format!("127.0.0.1:{accept}")
+            };
+            run_udp(&cfg, &accept, mtu, quiet);
+        }
+    }
+}
+
+/// How long the single-shot TCP server waits for its one client before
+/// giving up, so a client that never connects (a failed test, a mistyped
+/// port) cannot leave the process blocked in `accept()` forever. The DTLS
+/// path bounds its first `recv_from` the same way.
+const ACCEPT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// `TcpListener::accept` with a deadline: std has no accept timeout, so the
+/// listener is polled non-blocking until a client arrives or `deadline`
+/// elapses. The accepted stream is returned in blocking mode (on the BSDs an
+/// accepted socket inherits the listener's non-blocking flag).
+fn accept_with_deadline(listener: &TcpListener, deadline: Duration) -> (TcpStream, SocketAddr) {
+    listener
+        .set_nonblocking(true)
+        .unwrap_or_else(|e| die(format!("cannot poll the listener: {e}")));
+    let start = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((sock, peer)) => {
+                sock.set_nonblocking(false)
+                    .unwrap_or_else(|e| die(format!("accept failed: {e}")));
+                return (sock, peer);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed() > deadline {
+                    die(format!("no client connected within {deadline:?}"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => die(format!("accept failed: {e}")),
         }
     }
 }
