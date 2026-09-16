@@ -436,6 +436,20 @@ fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream) {
             Err(_) => break,
         }
     }
+    // Tell the peer we are done (RFC 8446 §6.1 / RFC 5246 §7.2.1) rather
+    // than just dropping the socket: without a close_notify the server sees
+    // a bare FIN, which is indistinguishable from a truncation attack — the
+    // very thing this client warns about on the receiving side. Failures are
+    // ignored (the peer may already be gone).
+    if !conn.received_close_notify() {
+        let _ = conn.close();
+        if let Ok(out) = conn.pop()
+            && !out.is_empty()
+        {
+            let _ = sock.write_all(&out);
+            let _ = sock.flush();
+        }
+    }
     let _ = stdout.flush();
 }
 

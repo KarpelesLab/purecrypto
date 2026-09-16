@@ -1784,6 +1784,204 @@ fn s_client_loopback() {
     );
 }
 
+/// `s_client` must end its session with a close_notify (RFC 8446 §6.1)
+/// instead of just dropping the socket: a server that reads on sees a bare
+/// FIN otherwise, which is exactly the truncation signal the client itself
+/// warns about. Here the server replies without closing, so the only way it
+/// can observe a close_notify is if the client sent one on exit.
+#[test]
+fn s_client_sends_close_notify_on_exit() {
+    use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
+    use purecrypto::tls::{Config, Connection, HandshakeStatus, SigningKey};
+    use purecrypto::x509::{Certificate, DistinguishedName, Time, Validity};
+    use std::net::TcpListener;
+
+    const KEY: &str = include_str!("../testdata/rsa2048_test_a.pem");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        let signing = RsaPrivateKey::<32>::from_pkcs1_pem(KEY).unwrap();
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(
+            &signing,
+            &DistinguishedName::common_name("127.0.0.1"),
+            &validity,
+            1,
+            false,
+        )
+        .unwrap();
+        let key = BoxedRsaPrivateKey::from_pkcs1_pem(KEY).unwrap();
+        let cfg = Config::builder()
+            .tls_only()
+            .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
+            .identity(vec![cert.to_der().to_vec()], SigningKey::Rsa(key))
+            .build();
+        let mut conn = Connection::server(&cfg).expect("server config");
+        let mut read_buf = [0u8; 8192];
+        loop {
+            let out = conn.pop().unwrap_or_default();
+            if !out.is_empty() {
+                sock.write_all(&out).unwrap();
+            }
+            match conn.handshake().unwrap() {
+                HandshakeStatus::Complete => break,
+                HandshakeStatus::WantWrite => continue,
+                HandshakeStatus::WantRead => {
+                    let n = sock.read(&mut read_buf).expect("read");
+                    assert!(n != 0, "peer closed during handshake");
+                    conn.feed(&read_buf[..n]).expect("feed");
+                }
+            }
+        }
+        let mut got = conn.recv().unwrap_or_default();
+        while got.is_empty() {
+            let n = sock.read(&mut read_buf).unwrap();
+            assert!(n != 0, "client closed before sending PING");
+            conn.feed(&read_buf[..n]).unwrap();
+            got = conn.recv().unwrap_or_default();
+        }
+        // Reply, but do NOT close: whatever closure alert arrives next is
+        // the client's.
+        conn.send(b"PONG").unwrap();
+        let out = conn.pop().unwrap_or_default();
+        sock.write_all(&out).unwrap();
+        sock.flush().unwrap();
+        loop {
+            let n = sock.read(&mut read_buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            let _ = conn.feed(&read_buf[..n]);
+            if conn.received_close_notify() {
+                break;
+            }
+        }
+        conn.received_close_notify()
+    });
+
+    let (out, ok) = run(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-quiet",
+        ],
+        b"PING",
+    );
+    let saw_close_notify = server.join().unwrap();
+    assert!(ok, "s_client exited with failure");
+    assert!(
+        out.contains("PONG"),
+        "expected PONG in stdout, got: {out:?}"
+    );
+    assert!(
+        saw_close_notify,
+        "s_client dropped the connection without sending close_notify"
+    );
+}
+
+/// The echo-mode `s_server` (no `-www`) must likewise end its session with a
+/// close_notify, so a client reading to EOF can tell a clean end of stream
+/// from a truncated one. A library client sends one line, reads the echo,
+/// then reads on until the TCP EOF and checks the closure alert arrived.
+#[test]
+fn s_server_echo_sends_close_notify_on_exit() {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::tls::{Config, Connection, HandshakeStatus};
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let dir = std::env::temp_dir().join(format!("pc_s_server_close_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+    let key = Ed25519PrivateKey::generate(&mut OsRng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ed25519(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
+
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-accept",
+        &port.to_string(),
+    ]);
+
+    let cfg = Config::builder()
+        .tls_only()
+        .rng(std::sync::Arc::new(OsRng))
+        .verify_certificates(false)
+        .server_name("127.0.0.1")
+        .build();
+    let mut conn = Connection::client(&cfg).expect("client config");
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let mut read_buf = [0u8; 8192];
+    loop {
+        let out = conn.pop().unwrap_or_default();
+        if !out.is_empty() {
+            sock.write_all(&out).unwrap();
+        }
+        match conn.handshake().unwrap() {
+            HandshakeStatus::Complete => break,
+            HandshakeStatus::WantWrite => continue,
+            HandshakeStatus::WantRead => {
+                let n = sock.read(&mut read_buf).expect("read");
+                assert!(n != 0, "server closed during handshake");
+                conn.feed(&read_buf[..n]).expect("feed");
+            }
+        }
+    }
+    conn.send(b"PING\n").unwrap();
+    let out = conn.pop().unwrap_or_default();
+    sock.write_all(&out).unwrap();
+    sock.flush().unwrap();
+    // Read the echo, then keep reading until the server ends the session.
+    let mut echoed = Vec::new();
+    loop {
+        let n = sock.read(&mut read_buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        conn.feed(&read_buf[..n]).unwrap();
+        echoed.extend(conn.recv().unwrap_or_default());
+        if conn.received_close_notify() {
+            break;
+        }
+    }
+    let _ = server_proc.wait_with_output();
+    assert_eq!(echoed, b"PING\n");
+    assert!(
+        conn.received_close_notify(),
+        "s_server ended the session without a close_notify"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// FC-3: a server that drops the TCP connection *without* sending
 /// close_notify has truncated the stream (or an on-path attacker has). The
 /// data received so far is still printed, but s_client must warn and exit

@@ -301,10 +301,25 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool) 
                             break;
                         }
                     }
+                    // The peer said goodbye: answer in kind and stop, rather
+                    // than idling until the read timeout.
+                    if conn.received_close_notify() {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
         }
+        // End the session with a close_notify (RFC 8446 §6.1) so the client
+        // can tell a clean end of stream from a cut one — its own truncation
+        // warning fires on a bare FIN. `-www` already does this above.
+        let _ = conn.close();
+        let out = conn.pop().unwrap_or_default();
+        if !out.is_empty() {
+            let _ = sock.write_all(&out);
+            let _ = sock.flush();
+        }
+        let _ = sock.shutdown(std::net::Shutdown::Write);
     }
 }
 
