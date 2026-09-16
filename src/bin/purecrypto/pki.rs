@@ -145,13 +145,22 @@ pub(crate) fn load_key(path: &str) -> PrivateKey {
 /// `\n` in a CN would corrupt subsequent records, and `parse_revoked_jsonl`
 /// can be tricked into reading the wrong field if `\\"` appears unescaped.
 pub(crate) fn parse_subject(subj: &str) -> DistinguishedName {
+    try_parse_subject(subj).unwrap_or_else(|e| die(e))
+}
+
+/// [`parse_subject`] returning the diagnostic instead of exiting, for callers
+/// that report it in their own error (the certificate-template loader's
+/// `[name_constraints]` `permitted_dn` / `excluded_dn` entries use the same
+/// `/CN=.../O=...` syntax). Attributes: `CN`, `O`, `OU`, `C`, and the PKCS#9
+/// `emailAddress` (also spelled `E`), case-insensitively.
+pub(crate) fn try_parse_subject(subj: &str) -> Result<DistinguishedName, String> {
     let mut dn = DistinguishedName::new();
     for part in subj.split('/').filter(|s| !s.is_empty()) {
         let Some((k, v)) = part.split_once('=') else {
-            die(format!("malformed subject component: {part}"));
+            return Err(format!("malformed subject component: {part}"));
         };
         if v.bytes().any(|b| b < 0x20) {
-            die(format!(
+            return Err(format!(
                 "subject attribute {} contains a control character",
                 k.trim()
             ));
@@ -161,10 +170,11 @@ pub(crate) fn parse_subject(subj: &str) -> DistinguishedName {
             "O" => dn.organization = Some(v.into()),
             "OU" => dn.organizational_unit = Some(v.into()),
             "C" => dn.country = Some(v.into()),
-            other => die(format!("unsupported subject attribute: {other}")),
+            "EMAILADDRESS" | "E" => dn.email_address = Some(v.into()),
+            other => return Err(format!("unsupported subject attribute: {other}")),
         }
     }
-    dn
+    Ok(dn)
 }
 
 /// Escapes `s` for safe embedding inside a JSON string literal (used by the

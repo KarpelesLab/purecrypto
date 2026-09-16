@@ -6693,3 +6693,155 @@ fn pkeyutl_verify_pubin_requires_a_public_key() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A template's `[name_constraints]` section can scope a sub-CA by
+/// rfc822Name, URI and directoryName subtrees, not just dNSName: the issued
+/// certificate's extension parses back with exactly those subtrees.
+#[test]
+fn template_name_constraints_email_and_dn_subtrees() {
+    use purecrypto::der::Reader;
+    let dir = std::env::temp_dir().join(format!("pc_nc_forms_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_str().unwrap().to_string();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(run(&["ca", "init", "-dir", &d, "-cn", "Forms Root"], b"").1);
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("sub.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("sub.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("sub.pub"), pub_pem).unwrap();
+
+    let tmpl = r#"name = "scoped-sub-ca"
+
+[basic_constraints]
+ca = true
+path_len = 0
+
+[key_usage]
+critical = true
+key_cert_sign = true
+crl_sign = true
+
+[name_constraints]
+permitted_dns = [".corp.example"]
+permitted_email = [".corp.example", "ops@corp.example"]
+permitted_dn = ["/O=Example Corp/C=US"]
+excluded_uri = [".evil.example"]
+excluded_dn = ["/OU=Contractors"]
+"#;
+    std::fs::write(dir.join("scoped.toml"), tmpl).unwrap();
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-ca",
+            "-template-file",
+            &p("scoped.toml"),
+            "-pubkey",
+            &p("sub.pub"),
+            "-cn",
+            "Scoped Sub CA",
+            "-out",
+            &p("sub.crt"),
+        ],
+        b"",
+    );
+    assert!(ok, "issuing the scoped sub-CA failed: {err}");
+
+    let pem = std::fs::read_to_string(dir.join("sub.crt")).unwrap();
+    let cert = purecrypto::x509::Certificate::from_pem(&pem).unwrap();
+    let nc = cert
+        .name_constraints()
+        .expect("extension parses")
+        .expect("extension present");
+    assert_eq!(nc.permitted.dns, [".corp.example"]);
+    assert_eq!(nc.permitted.email, [".corp.example", "ops@corp.example"]);
+    assert!(nc.permitted.uri.is_empty());
+    assert!(nc.excluded.dns.is_empty());
+    assert!(nc.excluded.email.is_empty());
+    assert_eq!(nc.excluded.uri, [".evil.example"]);
+    assert_eq!(nc.permitted.directory.len(), 1);
+    assert_eq!(nc.excluded.directory.len(), 1);
+
+    // Decode a directoryName subtree (`Name ::= SEQUENCE OF SET OF
+    // AttributeTypeAndValue`) into (attribute OID, value) pairs.
+    let rdns = |name_der: &[u8]| -> Vec<(Vec<u8>, String)> {
+        let mut out = Vec::new();
+        let mut r = Reader::new(name_der);
+        let mut seq = r.read_sequence().unwrap();
+        while !seq.is_empty() {
+            let set = seq.read_tlv(0x31).unwrap();
+            let mut set_r = Reader::new(set);
+            let mut atv = set_r.read_sequence().unwrap();
+            let oid = atv.read_oid().unwrap().to_vec();
+            let (_tag, value) = atv.read_any().unwrap();
+            out.push((oid, String::from_utf8(value.to_vec()).unwrap()));
+        }
+        out
+    };
+    // countryName 2.5.4.6, organizationName 2.5.4.10, organizationalUnitName
+    // 2.5.4.11 — the library encodes a DN's RDNs in C, O, OU, CN order
+    // whatever order `-subj` listed them in.
+    assert_eq!(
+        rdns(&nc.permitted.directory[0]),
+        [
+            (vec![0x55, 0x04, 0x06], "US".to_string()),
+            (vec![0x55, 0x04, 0x0a], "Example Corp".to_string()),
+        ]
+    );
+    assert_eq!(
+        rdns(&nc.excluded.directory[0]),
+        [(vec![0x55, 0x04, 0x0b], "Contractors".to_string())]
+    );
+
+    // A malformed DN entry is refused before anything is issued.
+    std::fs::write(
+        dir.join("bad.toml"),
+        "name = \"bad\"\n\n[basic_constraints]\nca = true\n\n[name_constraints]\npermitted_dn = [\"/X=1\"]\n",
+    )
+    .unwrap();
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-ca",
+            "-template-file",
+            &p("bad.toml"),
+            "-pubkey",
+            &p("sub.pub"),
+            "-cn",
+            "Bad Sub CA",
+            "-out",
+            &p("bad.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("name_constraints.permitted_dn")
+            && err.contains("unsupported subject attribute"),
+        "got: {err}"
+    );
+    assert!(!dir.join("bad.crt").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

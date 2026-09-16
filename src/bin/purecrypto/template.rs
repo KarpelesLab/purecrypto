@@ -585,18 +585,71 @@ fn parse_ip(s: &str) -> Result<GeneralName, TemplateError> {
     }
 }
 
+/// `[name_constraints]`: one `permitted_*` / `excluded_*` string array per
+/// name form the library enforces (RFC 5280 §4.2.1.10):
+///
+/// * `*_dns` — dNSName subtrees (`".example.com"`, `"example.com"`);
+/// * `*_email` — rfc822Name subtrees (a mailbox, a host, or a leading-dot
+///   domain);
+/// * `*_uri` — uniformResourceIdentifier subtrees (a host or leading-dot
+///   domain, matched against the URI's host);
+/// * `*_dn` — directoryName subtrees in the CLI's `-subj` syntax
+///   (`"/O=Example Corp/C=US"`), matching every name they are an RDN prefix
+///   of.
+///
+/// The IA5String forms must be ASCII. Order within each side is the order
+/// written, form by form.
 fn parse_name_constraints(
     tbl: &TomlTable,
 ) -> Result<(Vec<GeneralName>, Vec<GeneralName>), TemplateError> {
-    reject_unknown_keys(tbl, "name_constraints", &["permitted_dns", "excluded_dns"])?;
-    let permitted = string_array_field(tbl, "permitted_dns")?
-        .into_iter()
-        .map(GeneralName::Dns)
-        .collect();
-    let excluded = string_array_field(tbl, "excluded_dns")?
-        .into_iter()
-        .map(GeneralName::Dns)
-        .collect();
+    reject_unknown_keys(
+        tbl,
+        "name_constraints",
+        &[
+            "permitted_dns",
+            "excluded_dns",
+            "permitted_email",
+            "excluded_email",
+            "permitted_uri",
+            "excluded_uri",
+            "permitted_dn",
+            "excluded_dn",
+        ],
+    )?;
+    let mut permitted = Vec::new();
+    let mut excluded = Vec::new();
+    for (side, out) in [("permitted", &mut permitted), ("excluded", &mut excluded)] {
+        let ia5 = |form: &str, s: String| -> Result<String, TemplateError> {
+            if s.is_ascii() {
+                Ok(s)
+            } else {
+                bad(
+                    &format!("name_constraints.{side}_{form}"),
+                    &format!("`{s}` is not ASCII (IA5String)"),
+                )
+            }
+        };
+        for s in string_array_field(tbl, &format!("{side}_dns"))? {
+            out.push(GeneralName::Dns(ia5("dns", s)?));
+        }
+        for s in string_array_field(tbl, &format!("{side}_email"))? {
+            out.push(GeneralName::Email(ia5("email", s)?));
+        }
+        for s in string_array_field(tbl, &format!("{side}_uri"))? {
+            out.push(GeneralName::Uri(ia5("uri", s)?));
+        }
+        for s in string_array_field(tbl, &format!("{side}_dn"))? {
+            let field = format!("name_constraints.{side}_dn");
+            let dn = crate::pki::try_parse_subject(&s).map_err(|e| TemplateError::BadValue {
+                field: field.clone(),
+                reason: format!("`{s}`: {e}"),
+            })?;
+            if dn == purecrypto::x509::DistinguishedName::new() {
+                return bad(&field, &format!("`{s}` names no attribute"));
+            }
+            out.push(GeneralName::DirectoryName(dn));
+        }
+    }
     Ok((permitted, excluded))
 }
 
@@ -759,6 +812,65 @@ totally_real_bit = true
         // The correctly spelled keys still parse.
         let ok = "name = \"x\"\n\n[name_constraints]\npermitted_dns = [\"example\"]\n";
         assert!(CertTemplate::from_toml(ok).is_ok());
+    }
+
+    /// `[name_constraints]` takes every name form the library enforces —
+    /// rfc822Name, URI and directoryName subtrees alongside dNSName — on
+    /// both the permitted and the excluded side, with DNs in the CLI's
+    /// `-subj` syntax. Only DNS used to be accepted, so an email-scoped or
+    /// DN-scoped sub-CA could not be expressed at all.
+    #[test]
+    fn name_constraints_accept_email_uri_and_dn_subtrees() {
+        use purecrypto::x509::DistinguishedName;
+        let src = "name = \"x\"\n\n[name_constraints]\n\
+                   permitted_dns = [\".example.com\"]\n\
+                   permitted_email = [\".example.com\", \"ops@example.com\"]\n\
+                   permitted_dn = [\"/O=Example Corp/C=US\", \"/E=ca@example.com\"]\n\
+                   excluded_uri = [\".evil.example\"]\n\
+                   excluded_dn = [\"/OU=Contractors\"]\n";
+        let t = CertTemplate::from_toml(src).unwrap();
+        assert_eq!(
+            t.name_constraints_permitted,
+            vec![
+                GeneralName::Dns(".example.com".into()),
+                GeneralName::Email(".example.com".into()),
+                GeneralName::Email("ops@example.com".into()),
+                GeneralName::DirectoryName(
+                    DistinguishedName::new()
+                        .with_organization("Example Corp")
+                        .with_country("US")
+                ),
+                GeneralName::DirectoryName(
+                    DistinguishedName::new().with_email_address("ca@example.com")
+                ),
+            ]
+        );
+        assert_eq!(
+            t.name_constraints_excluded,
+            vec![
+                GeneralName::Uri(".evil.example".into()),
+                GeneralName::DirectoryName(
+                    DistinguishedName::new().with_organizational_unit("Contractors")
+                ),
+            ]
+        );
+
+        // Malformed entries are errors naming the field, never a silently
+        // narrower (or wider) constraint.
+        for body in [
+            "permitted_dn = [\"/X=1\"]",
+            "excluded_dn = [\"/\"]",
+            "permitted_email = [\"\\u00fc@example.com\"]",
+            "excluded_uri = [\"h\\u00f6st.example\"]",
+            "permitted_dns = [\"\\u00fc.example\"]",
+        ] {
+            let src = format!("name = \"x\"\n\n[name_constraints]\n{body}\n");
+            let err = CertTemplate::from_toml(&src).unwrap_err();
+            assert!(
+                matches!(&err, TemplateError::BadValue { field, .. } if field.starts_with("name_constraints.")),
+                "{body:?} must be rejected by field, got {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -301,6 +301,23 @@ purecrypto ca show     -dir DIR
 purecrypto ca list-templates
 ```
 
+A template file (`-template-file x.toml`, same TOML shape as the built-ins
+`ca list-templates` prints) may scope a sub-CA with a `[name_constraints]`
+section. Each key is a string array of subtrees, one `permitted_*` /
+`excluded_*` pair per name form (RFC 5280 §4.2.1.10):
+
+```toml
+[name_constraints]
+permitted_dns   = [".corp.example"]                 # dNSName
+permitted_email = [".corp.example", "ops@corp.example"]  # rfc822Name
+permitted_uri   = [".corp.example"]                 # URI host
+permitted_dn    = ["/O=Example Corp/C=US"]          # directoryName, -subj syntax
+excluded_dns    = ["internal.corp.example"]
+```
+
+`-subj` (and the `*_dn` entries) accept `CN`, `O`, `OU`, `C` and
+`emailAddress` (also `E`). Unknown keys in any template section are errors.
+
 Issued and revoked certificates are appended to JSON-lines ledgers in `DIR`
 (opened without following symlinks). `ca crl` emits a CRL carrying a
 monotonic `cRLNumber` from `DIR/crlnumber`. The same CA-certificate and key
