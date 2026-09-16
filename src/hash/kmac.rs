@@ -454,6 +454,89 @@ mod tests {
         );
     }
 
+    // KMAC samples 3 (KMAC128) and 5 (KMAC256) over the 200-byte message
+    // 00..C7 — longer than the 168-byte rate, so the absorb spans blocks —
+    // plus the KMACXOF samples 1-5, which pin the XOF-mode `right_encode(0)`
+    // trailer that the fixed-output samples never exercise. All verified with
+    // `openssl mac` (OpenSSL 3.6, `-macopt xof:1` for the XOF cases).
+    #[test]
+    fn kmac_and_kmacxof_nist_samples_long_data() {
+        use super::super::XofReader;
+        let key = sample_key();
+        let data4 = [0x00u8, 0x01, 0x02, 0x03];
+        let data200: [u8; 200] = core::array::from_fn(|i| i as u8);
+
+        // KMAC128 sample 3.
+        let mut out = [0u8; 32];
+        let mut m = Kmac128::new(&key, b"My Tagged Application");
+        m.update(&data200);
+        m.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<32>("1f5b4e6cca02209e0dcb5ca635b89a15e271ecc760071dfd805faa38f9729230")
+        );
+
+        // KMAC256 sample 5.
+        let mut out = [0u8; 64];
+        let mut m = Kmac256::new(&key, b"");
+        m.update(&data200);
+        m.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<64>(
+                "75358cf39e41494e949707927cee0af20a3ff553904c86b08f21cc414bcfd691589d27cf5e15369cbbff8b9a4c2eb17800855d0235ff635da82533ec6b759b69"
+            )
+        );
+
+        // KMACXOF128 samples 1, 2, 3 (256-bit outputs).
+        let mut out = [0u8; 32];
+        let mut x = KmacXof128::new(&key, b"");
+        x.update(&data4);
+        x.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<32>("cd83740bbd92ccc8cf032b1481a0f4460e7ca9dd12b08a0c4031178bacd6ec35")
+        );
+        let mut x = KmacXof128::new(&key, b"My Tagged Application");
+        x.update(&data4);
+        x.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<32>("31a44527b4ed9f5c6101d11de6d26f0620aa5c341def41299657fe9df1a3b16c")
+        );
+        let mut x = KmacXof128::new(&key, b"My Tagged Application");
+        x.update(&data200);
+        // Squeeze in two pieces through the reader, as a caller would.
+        let mut r = x.finalize_xof();
+        r.read(&mut out[..11]);
+        r.read(&mut out[11..]);
+        assert_eq!(
+            out,
+            from_hex::<32>("47026c7cd793084aa0283c253ef658490c0db61438b8326fe9bddf281b83ae0f")
+        );
+
+        // KMACXOF256 samples 4, 5 (512-bit outputs).
+        let mut out = [0u8; 64];
+        let mut x = KmacXof256::new(&key, b"My Tagged Application");
+        x.update(&data4);
+        x.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<64>(
+                "1755133f1534752aad0748f2c706fb5c784512cab835cd15676b16c0c6647fa96faa7af634a0bf8ff6df39374fa00fad9a39e322a7c92065a64eb1fb0801eb2b"
+            )
+        );
+        let mut x = KmacXof256::new(&key, b"");
+        x.update(&data200);
+        x.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<64>(
+                "ff7b171f1e8a2b24683eed37830ee797538ba8dc563f6da1e667391a75edc02ca633079f81ce12a25f45615ec89972031d18337331d24ceb8f8ca8e6a19fd98b"
+            )
+        );
+    }
+
     // SP 800-185 cSHAKE128 sample 1: N="", S="Email Signature", data=00010203.
     #[test]
     fn cshake128_sample() {
