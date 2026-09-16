@@ -172,10 +172,12 @@ impl CertTemplate {
                 }
                 "subject_key_identifier" => {
                     let tbl = require_table(value, "subject_key_identifier")?;
+                    reject_unknown_keys(tbl, "subject_key_identifier", &["include"])?;
                     t.include_ski = bool_field(tbl, "include", true)?;
                 }
                 "authority_key_identifier" => {
                     let tbl = require_table(value, "authority_key_identifier")?;
+                    reject_unknown_keys(tbl, "authority_key_identifier", &["include"])?;
                     t.include_aki = bool_field(tbl, "include", true)?;
                 }
                 "name_constraints" => {
@@ -449,7 +451,26 @@ fn parse_oid_arcs(s: &str, field: &str) -> Result<Vec<u64>, TemplateError> {
     Ok(out)
 }
 
+/// Rejects any key of `tbl` not in `known`. Every section parser calls this
+/// so a misspelled key is an error rather than a silently dropped
+/// extension: `[name_constraints] permitted-dns = […]` used to parse fine
+/// and issue an *unconstrained* sub-CA, and a typo'd `[subject_alt_name]`
+/// list yielded a certificate with no SAN at all.
+fn reject_unknown_keys(
+    tbl: &TomlTable,
+    section: &str,
+    known: &[&str],
+) -> Result<(), TemplateError> {
+    for k in tbl.keys() {
+        if !known.contains(&k.as_str()) {
+            return bad(&format!("{section}.{k}"), "unknown key");
+        }
+    }
+    Ok(())
+}
+
 fn parse_basic_constraints(tbl: &TomlTable) -> Result<BasicConstraintsT, TemplateError> {
+    reject_unknown_keys(tbl, "basic_constraints", &["ca", "path_len"])?;
     let ca = bool_field(tbl, "ca", false)?;
     let path_len = match tbl.get("path_len") {
         None => None,
@@ -530,6 +551,11 @@ fn parse_eku(tbl: &TomlTable) -> Result<Vec<Vec<u64>>, TemplateError> {
 }
 
 fn parse_san(tbl: &TomlTable) -> Result<(bool, Vec<GeneralName>), TemplateError> {
+    reject_unknown_keys(
+        tbl,
+        "subject_alt_name",
+        &["from_csr", "dns", "email", "uri", "ip"],
+    )?;
     let from_csr = bool_field(tbl, "from_csr", false)?;
     let mut out: Vec<GeneralName> = Vec::new();
     for s in string_array_field(tbl, "dns")? {
@@ -615,6 +641,7 @@ fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
 fn parse_name_constraints(
     tbl: &TomlTable,
 ) -> Result<(Vec<GeneralName>, Vec<GeneralName>), TemplateError> {
+    reject_unknown_keys(tbl, "name_constraints", &["permitted_dns", "excluded_dns"])?;
     let permitted = string_array_field(tbl, "permitted_dns")?
         .into_iter()
         .map(GeneralName::Dns)
@@ -627,6 +654,7 @@ fn parse_name_constraints(
 }
 
 fn parse_policies(tbl: &TomlTable) -> Result<Vec<Vec<u64>>, TemplateError> {
+    reject_unknown_keys(tbl, "certificate_policies", &["policies"])?;
     let mut out = Vec::new();
     for s in string_array_field(tbl, "policies")? {
         out.push(parse_oid_arcs(&s, "certificate_policies.policies")?);
@@ -635,6 +663,7 @@ fn parse_policies(tbl: &TomlTable) -> Result<Vec<Vec<u64>>, TemplateError> {
 }
 
 fn parse_crldp(tbl: &TomlTable) -> Result<Vec<String>, TemplateError> {
+    reject_unknown_keys(tbl, "crl_distribution_points", &["urls"])?;
     string_array_field(tbl, "urls")
 }
 
@@ -757,6 +786,32 @@ totally_real_bit = true
 "#;
         let err = CertTemplate::from_toml(src).unwrap_err();
         assert!(matches!(err, TemplateError::BadValue { .. }));
+    }
+
+    /// A misspelled key in any section must be an error, not a silently
+    /// dropped extension: `permitted-dns` in `[name_constraints]` used to
+    /// parse fine and produce an unconstrained sub-CA profile.
+    #[test]
+    fn rejects_unknown_keys_in_every_section() {
+        for body in [
+            "[basic_constraints]\nca = true\npathlen = 3\n",
+            "[subject_alt_name]\ndns_names = [\"a.example\"]\n",
+            "[name_constraints]\npermitted-dns = [\"example\"]\n",
+            "[certificate_policies]\npolicy = [\"1.2.3\"]\n",
+            "[crl_distribution_points]\nurl = [\"http://x/crl\"]\n",
+            "[subject_key_identifier]\ninclud = true\n",
+            "[authority_key_identifier]\nenabled = true\n",
+        ] {
+            let src = format!("name = \"x\"\n\n{body}");
+            let err = CertTemplate::from_toml(&src).unwrap_err();
+            assert!(
+                matches!(err, TemplateError::BadValue { .. }),
+                "{body:?} must be rejected, got {err:?}"
+            );
+        }
+        // The correctly spelled keys still parse.
+        let ok = "name = \"x\"\n\n[name_constraints]\npermitted_dns = [\"example\"]\n";
+        assert!(CertTemplate::from_toml(ok).is_ok());
     }
 
     #[test]
