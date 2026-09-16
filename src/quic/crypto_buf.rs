@@ -25,7 +25,7 @@
 //! fragment whose start lies before `next_offset` is trimmed at the
 //! boundary.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use crate::tls::Error;
@@ -62,8 +62,9 @@ pub(crate) const MAX_PENDING_FRAGMENTS: usize = 32;
 ///
 /// Outbound side: [`enqueue_outbound`](Self::enqueue_outbound) appends
 /// bytes from the TLS engine, [`carve`](Self::carve) hands the next chunk
-/// to the packet assembler, and [`last_chunk`](Self::last_chunk) lets the
-/// PTO timer retransmit the most recent chunk on loss.
+/// to the packet assembler, and [`requeue_range`](Self::requeue_range)
+/// schedules a previously-sent range for retransmission (loss detection
+/// and PTO probes).
 #[derive(Default)]
 pub(crate) struct CryptoBuf {
     /// Number of in-order bytes the receiver has released.
@@ -77,17 +78,25 @@ pub(crate) struct CryptoBuf {
     /// bytes have already been carved into outbound CRYPTO frames at this
     /// level).
     outbound_offset: u64,
-    /// The most recent chunk we carved, retained for PTO retransmit. Tuple
-    /// is `(offset, bytes)`. `None` until the first carve.
+    /// The most recent chunk we carved, retained for the post-Retry
+    /// ClientHello re-emission. Tuple is `(offset, bytes)`. `None` until the
+    /// first carve.
     last_sent: Option<(u64, Vec<u8>)>,
+    /// Previously-sent ranges queued for retransmission, each with the
+    /// offset it was originally carved at, ahead of any fresh `outbound`
+    /// bytes. Kept apart from `outbound` (which is one contiguous run
+    /// starting at `outbound_offset`) so that ranges re-queued out of order
+    /// or with gaps between them — two lost packets around an acknowledged
+    /// one — keep their own offsets instead of being re-stamped wrongly.
+    rtx: VecDeque<(u64, Vec<u8>)>,
     /// History of every CRYPTO chunk we have ever carved at this level,
     /// keyed by start offset. RFC 9002 loss detection (`requeue_range`)
     /// looks up the exact bytes for a previously-sent CRYPTO range and
-    /// re-prepends them to the outbound queue. The TLS engine reads
-    /// each handshake byte exactly once on output, so this map is the
-    /// only source-of-truth for retransmittable CRYPTO bytes at this
-    /// level. Bounded in practice by the handshake size (typically a few
-    /// KiB per level; tens of KiB with a full cert chain).
+    /// queues them in `rtx`. The TLS engine reads each handshake byte
+    /// exactly once on output, so this map is the only source-of-truth for
+    /// retransmittable CRYPTO bytes at this level. Bounded in practice by
+    /// the handshake size (typically a few KiB per level; tens of KiB with
+    /// a full cert chain).
     sent_history: BTreeMap<u64, Vec<u8>>,
 }
 
@@ -218,28 +227,45 @@ impl CryptoBuf {
         self.outbound.extend_from_slice(data);
     }
 
-    /// True if outbound bytes are queued waiting to be put in CRYPTO frames.
+    /// True if bytes are queued waiting to be put in CRYPTO frames — fresh
+    /// outbound bytes or ranges awaiting retransmission.
     pub(crate) fn outbound_pending(&self) -> bool {
-        !self.outbound.is_empty()
+        !self.outbound.is_empty() || !self.rtx.is_empty()
     }
 
-    /// Number of outbound bytes queued.
+    /// Number of bytes queued, retransmissions included.
     pub(crate) fn outbound_len(&self) -> usize {
-        self.outbound.len()
+        self.outbound.len() + self.rtx.iter().map(|(_, b)| b.len()).sum::<usize>()
     }
 
     /// Current outbound offset (how many bytes have been carved so far).
-    /// Used as the Phase-4 in-flight predicate for the PTO timer.
     pub(crate) fn outbound_offset_for_test(&self) -> u64 {
         self.outbound_offset
     }
 
-    /// Removes up to `cap` bytes from the outbound queue, returns
-    /// `(offset, chunk)` ready to be wrapped in a CRYPTO frame.
+    /// Hands out the next chunk to be wrapped in a CRYPTO frame, as
+    /// `(offset, chunk)` of at most `cap` bytes: a queued retransmission
+    /// first (at the offset it was originally sent at, split if it exceeds
+    /// `cap`), otherwise the next `cap` fresh outbound bytes.
     ///
-    /// Returns `None` if no bytes are queued. Side-effect: stores
-    /// `(offset, chunk.clone())` as `last_sent` for PTO retransmit.
+    /// Returns `None` if nothing is queued. Side-effect: records the chunk
+    /// in `sent_history` (and as `last_sent`).
     pub(crate) fn carve(&mut self, cap: usize) -> Option<(u64, Vec<u8>)> {
+        if let Some((offset, mut chunk)) = self.rtx.pop_front() {
+            if chunk.len() > cap {
+                let tail = chunk.split_off(cap);
+                self.rtx.push_front((offset + cap as u64, tail));
+            }
+            self.last_sent = Some((offset, chunk.clone()));
+            // A re-carve is byte-identical to the original; only ever grow
+            // the history entry (a split retransmission must not shadow the
+            // full chunk that `requeue_range` may need to reconstruct).
+            let known = self.sent_history.get(&offset).map_or(0, Vec::len);
+            if chunk.len() >= known {
+                self.sent_history.insert(offset, chunk.clone());
+            }
+            return Some((offset, chunk));
+        }
         if self.outbound.is_empty() {
             return None;
         }
@@ -249,28 +275,33 @@ impl CryptoBuf {
         self.outbound_offset += chunk.len() as u64;
         self.last_sent = Some((offset, chunk.clone()));
         // Record in sent-history for RFC 9002 retransmit-on-loss.
-        // The same offset may be carved more than once (PTO retransmit
-        // via `schedule_last_chunk_retransmit`); we overwrite with the
-        // freshest copy, which is byte-identical.
         self.sent_history.insert(offset, chunk.clone());
         Some((offset, chunk))
     }
 
-    /// Re-prepends a previously-carved CRYPTO range back to the front of
-    /// the outbound queue, so the next [`carve`](Self::carve) call hands
-    /// it back to the packet assembler. Used by the RFC 9002 packet-
-    /// threshold / time-threshold loss path: when the connection
-    /// determines that a packet carrying CRYPTO at `[offset, offset+length)`
-    /// was lost, it calls this method to schedule retransmission.
+    /// Queues a previously-carved CRYPTO range for retransmission, so the
+    /// next [`carve`](Self::carve) calls hand it back to the packet
+    /// assembler before any fresh bytes. Used by the RFC 9002 loss path
+    /// (packet- and time-threshold loss) and by PTO probes (§6.2.4): when
+    /// the connection wants the CRYPTO bytes at `[offset, offset+length)`
+    /// re-sent, it calls this method.
     ///
-    /// The retransmitted bytes are looked up in [`Self::sent_history`].
-    /// If the exact range cannot be reconstructed (e.g. the history
-    /// entry is missing — never happens in practice because every carve
-    /// records an entry), the call is a no-op.
+    /// The bytes are looked up in [`Self::sent_history`]. If the exact
+    /// range cannot be reconstructed (e.g. the history entry is missing —
+    /// never happens in practice because every carve records an entry),
+    /// the call is a no-op. A range already queued (a lost packet that a
+    /// PTO probe also chose to re-send) is not queued twice.
     ///
-    /// Returns `true` if any byte was re-queued.
+    /// Returns `true` if any byte was queued.
     pub(crate) fn requeue_range(&mut self, offset: u64, length: u64) -> bool {
         if length == 0 {
+            return false;
+        }
+        if self
+            .rtx
+            .iter()
+            .any(|(o, b)| *o <= offset && o + b.len() as u64 >= offset + length)
+        {
             return false;
         }
         // Find the history entry whose start is ≤ offset and which
@@ -299,13 +330,7 @@ impl CryptoBuf {
             bytes_to_requeue.extend_from_slice(&entry_bytes[local_skip..local_skip + local_take]);
             cursor += local_take as u64;
         }
-        // Splice at the front so the next carve hands them out first.
-        // We also rewind `outbound_offset` so the re-carved chunk gets
-        // its original offset stamped on the CRYPTO frame.
-        let mut new_buf = bytes_to_requeue;
-        new_buf.append(&mut self.outbound);
-        self.outbound = new_buf;
-        self.outbound_offset = offset;
+        self.rtx.push_back((offset, bytes_to_requeue));
         true
     }
 
@@ -337,22 +362,15 @@ impl CryptoBuf {
         }
     }
 
-    /// Re-queue the most recent chunk at the *front* of `outbound` so it
-    /// will be re-carved on the next packet build. Used by the PTO timer
-    /// for the only level where we have a `last_sent` to retransmit.
+    /// Queues the most recent chunk for retransmission ahead of everything
+    /// else. Used after a Retry to re-emit the ClientHello under the new
+    /// Initial keys (RFC 9000 §17.2.5.2).
     ///
     /// Returns `true` if a retransmit was scheduled. A no-op (and
     /// `false`) if no chunk has ever been sent at this level.
     pub(crate) fn schedule_last_chunk_retransmit(&mut self) -> bool {
         if let Some((off, bytes)) = self.last_sent.as_ref() {
-            // Rewind the outbound offset and prepend the bytes. Since
-            // `outbound` already contains anything queued after `last_sent`
-            // (carved *after* the chunk was carved), splicing at the front
-            // re-establishes the original byte stream.
-            let mut new_buf = bytes.clone();
-            new_buf.append(&mut self.outbound);
-            self.outbound = new_buf;
-            self.outbound_offset = *off;
+            self.rtx.push_front((*off, bytes.clone()));
             true
         } else {
             false
@@ -463,8 +481,9 @@ mod tests {
 
     #[test]
     fn schedule_retransmit_with_pending_after() {
-        // After carving "AAA" we enqueue more bytes ("CCC"). PTO schedules
-        // the retransmit of "AAA" — that re-prepends, leaving "AAA" + "CCC".
+        // After carving "AAA" we enqueue more bytes ("CCC"). The retransmit
+        // of "AAA" goes out first, at its own offset, then the fresh bytes
+        // at theirs.
         let mut b = CryptoBuf::new();
         b.enqueue_outbound(b"AAA");
         let (off1, c1) = b.carve(3).expect("carve");
@@ -473,11 +492,44 @@ mod tests {
         b.enqueue_outbound(b"CCC"); // appended after AAA in the byte stream
 
         let _ = b.schedule_last_chunk_retransmit();
-        // Carve everything; first 3 bytes should be the retransmitted AAA,
-        // and the offset rewinds.
-        let (off, chunk) = b.carve(100).expect("carve all");
+        assert_eq!(b.outbound_len(), 6);
+        let (off, chunk) = b.carve(100).expect("retransmit first");
         assert_eq!(off, 0);
-        assert_eq!(chunk, b"AAACCC");
+        assert_eq!(chunk, b"AAA");
+        let (off, chunk) = b.carve(100).expect("then the fresh bytes");
+        assert_eq!(off, 3);
+        assert_eq!(chunk, b"CCC");
+        assert!(!b.outbound_pending());
+    }
+
+    /// Two lost ranges around an acknowledged one keep their own offsets
+    /// when re-sent: the old "splice at the front of `outbound`" scheme
+    /// re-stamped the second range at the first one's end, corrupting the
+    /// CRYPTO stream whenever more than one packet of a level was lost.
+    #[test]
+    fn requeue_keeps_offsets_for_non_adjacent_ranges() {
+        let mut b = CryptoBuf::new();
+        b.enqueue_outbound(b"AAABBBCCC");
+        assert_eq!(b.carve(3).expect("carve"), (0, b"AAA".to_vec()));
+        assert_eq!(b.carve(3).expect("carve"), (3, b"BBB".to_vec()));
+        assert_eq!(b.carve(3).expect("carve"), (6, b"CCC".to_vec()));
+        // Packets carrying AAA and CCC are lost (in ascending order, as
+        // loss detection reports them); BBB was acknowledged.
+        assert!(b.requeue_range(0, 3));
+        assert!(b.requeue_range(6, 3));
+        assert!(!b.requeue_range(6, 3), "already queued");
+        assert_eq!(b.outbound_len(), 6);
+        assert_eq!(b.carve(100).expect("first"), (0, b"AAA".to_vec()));
+        assert_eq!(b.carve(100).expect("second"), (6, b"CCC".to_vec()));
+        assert!(b.carve(100).is_none());
+        // Fresh bytes continue at the high-water mark.
+        b.enqueue_outbound(b"DDD");
+        assert_eq!(b.carve(100).expect("fresh"), (9, b"DDD".to_vec()));
+        // A retransmission larger than the budget is split, keeping offsets.
+        assert!(b.requeue_range(0, 3));
+        assert_eq!(b.carve(2).expect("head"), (0, b"AA".to_vec()));
+        assert_eq!(b.carve(2).expect("tail"), (2, b"A".to_vec()));
+        assert!(!b.outbound_pending());
     }
 
     #[test]
