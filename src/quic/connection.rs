@@ -905,6 +905,15 @@ fn validate_local_transport_params(tp: &TransportParameters) -> Result<(), Error
         // ours; see MAX_LOCAL_ACTIVE_CID_LIMIT.
         return Err(Error::IllegalParameter);
     }
+    // RFC 9000 §18.2: `ack_delay_exponent` above 20 and `max_ack_delay` of
+    // 2^14 ms or more are invalid. We scale our own ACK Delay field by
+    // `2^ack_delay_exponent`, so an out-of-range local value would also be a
+    // shift overflow; refuse it up front like the peer would.
+    if tp.ack_delay_exponent.is_some_and(|v| v > 20)
+        || tp.max_ack_delay_ms.is_some_and(|v| v >= 1 << 14)
+    {
+        return Err(Error::IllegalParameter);
+    }
     Ok(())
 }
 
@@ -5891,16 +5900,18 @@ impl QuicConnection {
         // ACK frame, if any. RFC 9000 §13.2.5: the `ack_delay` field is
         // the time the receiver delayed sending the ACK, in scaled units.
         // Initial and Handshake spaces always use exponent 3; the
-        // Application space uses the peer's `ack_delay_exponent` transport
-        // parameter (default 3 per §18.2).
+        // Application space uses the `ack_delay_exponent` transport
+        // parameter *of the endpoint sending the ACK* (§19.3: "the
+        // ack_delay_exponent transport parameter sent by the sender of the
+        // ACK frame"), i.e. ours — the peer decodes with what we advertised.
+        // The peer's exponent applies only when we *read* its ACKs
+        // (`dispatch_frames`). Default 3 per §18.2.
         let now_us = self.now_since_start().as_micros().min(u128::from(u64::MAX)) as u64;
         let ack_exp_for_emit: u32 = match level {
             Level::Initial | Level::Handshake => 3,
-            Level::EarlyData | Level::OneRtt => self
-                .peer_params
-                .as_ref()
-                .and_then(|p| p.ack_delay_exponent)
-                .unwrap_or(3) as u32,
+            Level::EarlyData | Level::OneRtt => {
+                self.our_params.ack_delay_exponent.unwrap_or(3) as u32
+            }
         };
         let space_ref = match level {
             Level::Initial => &self.endpoint.pn.initial,
@@ -12382,6 +12393,94 @@ mod tests {
                 .is_none()
                 || !s.endpoint.pn.application.ack_eliciting_pending
         );
+    }
+
+    /// RFC 9000 §19.3 — the ACK Delay field is scaled by the
+    /// `ack_delay_exponent` "sent by the sender of the ACK frame": ours,
+    /// which is what the peer will decode it with. It used to be scaled by
+    /// the *peer's* exponent, so whenever the two differed the peer's RTT
+    /// samples were off by the ratio of the two (here 2^7).
+    #[test]
+    fn outbound_ack_delay_is_scaled_by_our_own_exponent() {
+        let (server_cfg_tls, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        // Server: exponent 10; client: the default 3.
+        let mut server_params = loopback_params();
+        server_params.ack_delay_exponent = Some(10);
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: server_params,
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        // An ack-eliciting packet that "arrived" 80 ms ago. The connection is
+        // only milliseconds old, so move its clock anchor back first or the
+        // subtraction saturates at t=0.
+        s.set_start_for_test(Instant::now() - Duration::from_secs(1));
+        s.endpoint.pn.application.pending_ack.insert(7);
+        s.endpoint.pn.application.ack_eliciting_pending = true;
+        let now_us = s.now_since_start().as_micros() as u64;
+        s.endpoint.pn.application.largest_eliciting_arrival_us =
+            Some(now_us.saturating_sub(80_000));
+        let (payload, meta) = s
+            .assemble_payload(Level::OneRtt, PayloadScope::Full)
+            .expect("an ACK is pending");
+        assert!(meta.carried_ack);
+        let (frame, _) = Frame::decode(&payload).expect("ACK frame first");
+        let Frame::Ack { ack_delay, .. } = frame else {
+            panic!("expected ACK, got {frame:?}");
+        };
+        // Decoded the way the client will: with the server's exponent.
+        let decoded_us = ack_delay << 10;
+        assert!(
+            (79_000..100_000).contains(&decoded_us),
+            "ack_delay {ack_delay} decodes to {decoded_us} us with exponent 10"
+        );
+    }
+
+    /// RFC 9000 §18.2 — a locally-configured `ack_delay_exponent` above 20
+    /// or `max_ack_delay` of 2^14 ms or more is invalid and is refused at
+    /// construction, the same way the peer's would be.
+    #[test]
+    fn out_of_range_local_ack_params_rejected_at_construction() {
+        let (server_cfg_tls, _) = ed25519_server();
+        let mut params = loopback_params();
+        params.ack_delay_exponent = Some(21);
+        let r = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls.clone(),
+            transport_params: params,
+            ..QuicConfig::default()
+        });
+        assert!(matches!(r, Err(Error::IllegalParameter)));
+        let mut params = loopback_params();
+        params.max_ack_delay_ms = Some(1 << 14);
+        let r = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: params,
+            ..QuicConfig::default()
+        });
+        assert!(matches!(r, Err(Error::IllegalParameter)));
     }
 
     // QUIC-1 — RFC 9001 §6.6: per-key tx usage limit. We drop the
