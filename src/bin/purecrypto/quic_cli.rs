@@ -26,10 +26,8 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, zero_buf};
-use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::quic::{QuicConfig, QuicConnection, QuicServer, StreamId, TransportParameters};
 use purecrypto::rng::OsRng;
-use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
     Config as TlsConfig, ProtocolVersion as PcVersion, RootCertStore, SigningKey,
 };
@@ -58,17 +56,12 @@ fn load_signing_key(key_path: &str) -> SigningKey {
     crate::util::warn_if_world_readable_key(key_path);
     let key_pem = std::fs::read_to_string(key_path)
         .unwrap_or_else(|e| die(format!("cannot read key file {key_path}: {e}")));
-    if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(&key_pem) {
-        SigningKey::Rsa(k)
-    } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(&key_pem) {
-        SigningKey::Ecdsa(k)
-    } else if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(&key_pem) {
-        SigningKey::Ed25519(k)
-    } else {
+    crate::util::signing_key_from_pem(&key_pem).unwrap_or_else(|| {
         die(format!(
-            "{key_path}: server key must be RSA (PKCS#1), ECDSA (SEC1), or Ed25519 (PKCS#8)"
-        ));
-    }
+            "{key_path}: server key must be RSA (PKCS#1 or PKCS#8), ECDSA (SEC1 or PKCS#8), \
+             Ed25519 or Ed448 (PKCS#8)"
+        ))
+    })
 }
 
 /// Standard QUIC transport-parameters defaults used by both client and
@@ -169,8 +162,14 @@ pub(crate) fn run_client(args: Args) {
 
     let mut qc = QuicConnection::client(qcfg, server_name)
         .unwrap_or_else(|e| die(format!("QUIC client config rejected: {e:?}")));
+    // One clock for the connection's whole life: `on_timeout` takes the time
+    // since the connection was created, and the engine's own packet clock
+    // starts here too. Restarting it per phase made the data phase report a
+    // time that jumped back to zero, delaying PTO / loss detection by the
+    // handshake duration.
+    let epoch = Instant::now();
 
-    drive_quic_handshake(&mut qc, &socket, None, Duration::from_secs(30));
+    drive_quic_handshake(&mut qc, &socket, None, epoch, Duration::from_secs(30));
 
     // Security-relevant, so it goes to stderr regardless of -quiet: an
     // unattended `-quiet -insecure` pipeline must not be able to hide that
@@ -190,7 +189,7 @@ pub(crate) fn run_client(args: Args) {
         );
     }
 
-    drive_quic_data_client(&mut qc, &socket, Duration::from_secs(30));
+    drive_quic_data_client(&mut qc, &socket, epoch, Duration::from_secs(30));
 }
 
 // ====================================================================
@@ -255,6 +254,12 @@ pub(crate) fn run_server(args: Args) {
         }
         Ok(qcfg)
     };
+
+    // Validate the identity once, up front: the factory is otherwise first
+    // run when the first Initial arrives, so a cert/key mismatch (which
+    // `try_identity` reports by name) would surface long after "listening"
+    // was printed. `s_server` refuses the same before listening.
+    let _ = make_config();
 
     let socket = UdpSocket::bind(&bind_addr)
         .unwrap_or_else(|e| die(format!("cannot bind UDP {bind_addr}: {e}")));
@@ -441,6 +446,7 @@ fn drive_quic_handshake(
     qc: &mut QuicConnection,
     sock: &UdpSocket,
     peer_addr: Option<SocketAddr>,
+    epoch: Instant,
     deadline: Duration,
 ) {
     let start = Instant::now();
@@ -462,12 +468,11 @@ fn drive_quic_handshake(
                 die(format!("UDP send failed: {e}"));
             }
         }
-        // 2. Choose a read deadline: bounded by next QUIC timeout and a
-        //    50 ms cap so we still tick PTO timers if the wire is quiet.
-        let next = qc.next_timeout().unwrap_or(Duration::from_millis(50));
-        let wait = next.min(Duration::from_millis(50));
-        sock.set_read_timeout(Some(wait.max(Duration::from_millis(1))))
-            .ok();
+        // 2. Choose a read deadline: bounded by the next QUIC timer (an
+        //    absolute time since `epoch`) and a 50 ms cap so we still tick
+        //    PTO timers if the wire is quiet.
+        let wait = quic_wait(qc, epoch);
+        sock.set_read_timeout(Some(wait)).ok();
         // 3. Recv. We use the connected-socket `recv` path; `peer_addr`
         //    is informational (already locked in by `connect()`).
         match sock.recv(&mut buf) {
@@ -492,7 +497,7 @@ fn drive_quic_handshake(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                qc.on_timeout(start.elapsed());
+                qc.on_timeout(epoch.elapsed());
             }
             Err(e) => die(format!("UDP recv failed: {e}")),
         }
@@ -509,6 +514,17 @@ fn drive_quic_handshake(
     }
 }
 
+/// How long to block in `recv` before ticking the engine: until its next
+/// timer (`next_timeout` is absolute, measured from `epoch`), capped at
+/// 50 ms so a quiet wire still gets regular `on_timeout` calls, and at
+/// least 1 ms (a zero read timeout means "block forever" to the socket).
+fn quic_wait(qc: &QuicConnection, epoch: Instant) -> Duration {
+    qc.next_timeout()
+        .map(|t| t.saturating_sub(epoch.elapsed()))
+        .unwrap_or(Duration::from_millis(50))
+        .clamp(Duration::from_millis(1), Duration::from_millis(50))
+}
+
 /// Pumps `qc.pop_datagram` until empty, sending each on `sock`.
 fn drain_outbound(qc: &mut QuicConnection, sock: &UdpSocket) {
     loop {
@@ -522,7 +538,12 @@ fn drain_outbound(qc: &mut QuicConnection, sock: &UdpSocket) {
 
 /// Client data path: send `stdin` (if piped) over one bidi stream, dump
 /// inbound stream bytes to stdout until that stream's FIN, then exit.
-fn drive_quic_data_client(qc: &mut QuicConnection, sock: &UdpSocket, deadline: Duration) {
+fn drive_quic_data_client(
+    qc: &mut QuicConnection,
+    sock: &UdpSocket,
+    epoch: Instant,
+    deadline: Duration,
+) {
     // Open a bidirectional stream up-front; the server side accepts it
     // implicitly the first time any STREAM frame for the id arrives.
     let stream_id = match qc.open_bidi() {
@@ -577,10 +598,7 @@ fn drive_quic_data_client(qc: &mut QuicConnection, sock: &UdpSocket, deadline: D
 
         drain_outbound(qc, sock);
 
-        let next = qc.next_timeout().unwrap_or(Duration::from_millis(50));
-        let wait = next.min(Duration::from_millis(50));
-        sock.set_read_timeout(Some(wait.max(Duration::from_millis(1))))
-            .ok();
+        sock.set_read_timeout(Some(quic_wait(qc, epoch))).ok();
         match sock.recv(&mut net_buf) {
             Ok(n) if n > 0 => {
                 if qc.feed_datagram(&net_buf[..n]).is_err() {
@@ -594,7 +612,7 @@ fn drive_quic_data_client(qc: &mut QuicConnection, sock: &UdpSocket, deadline: D
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                qc.on_timeout(start.elapsed());
+                qc.on_timeout(epoch.elapsed());
             }
             Err(_) => break,
         }
