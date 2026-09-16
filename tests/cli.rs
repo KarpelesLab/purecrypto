@@ -6,27 +6,18 @@ use std::process::{Command, Stdio};
 
 /// Runs the CLI with `args`, feeding `stdin`, returning `(stdout, success)`.
 fn run(args: &[&str], stdin: &[u8]) -> (String, bool) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn purecrypto");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin)
-        .expect("write stdin");
-    let out = child.wait_with_output().expect("wait");
-    (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        out.status.success(),
-    )
+    let (out, _err, ok) = run_capture(args, stdin);
+    (out, ok)
 }
 
 /// Like [`run`] but also returns stderr.
+///
+/// A Rust panic exits with status 101, which is a failure like any other
+/// to `status.success()`. Every "must be refused" assertion in this file
+/// is written as `assert!(!ok)`, so without this guard a subcommand that
+/// crashed instead of diagnosing its input would pass those tests. The
+/// binary must never panic on any input, so 101 fails the test outright,
+/// with stderr (the panic message) attached.
 fn run_capture(args: &[&str], stdin: &[u8]) -> (String, String, bool) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
         .args(args)
@@ -42,9 +33,15 @@ fn run_capture(args: &[&str], stdin: &[u8]) -> (String, String, bool) {
         .write_all(stdin)
         .expect("write stdin");
     let out = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "purecrypto {args:?} panicked (exit 101); stderr: {stderr}"
+    );
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        stderr,
         out.status.success(),
     )
 }
@@ -170,8 +167,10 @@ fn hash_sha256_stdin() {
 
 #[test]
 fn hash_unknown_algorithm_fails() {
-    let (_, ok) = run(&["hash", "nope"], b"x");
+    let (out, err, ok) = run_capture(&["hash", "nope"], b"x");
     assert!(!ok);
+    assert!(out.is_empty(), "nothing may be emitted: {out:?}");
+    assert!(err.contains("unknown hash algorithm: nope"), "got: {err}");
 }
 
 /// `docs/cli.md` promises `-flag` and `--flag` are interchangeable. Several
@@ -566,7 +565,7 @@ fn req_rejects_subject_with_newline() {
         "genpkey failed"
     );
 
-    let (_, ok) = run(
+    let (_o, err, ok) = run_capture(
         &[
             "req",
             "-key",
@@ -579,6 +578,11 @@ fn req_rejects_subject_with_newline() {
         b"",
     );
     assert!(!ok, "req should fail on subject with control char");
+    assert!(
+        err.contains("subject attribute CN contains a control character"),
+        "got: {err}"
+    );
+    assert!(!dir.join("evil.csr").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -711,7 +715,7 @@ fn ca_subcommand_full_flow() {
     // A serial this CA never issued is refused (it would sit on the CRL
     // forever), and revoking the same serial twice is a no-op rather than a
     // duplicate CRL entry.
-    let (_o, _e, ok) = run_capture(
+    let (_o, err, ok) = run_capture(
         &[
             "ca",
             "revoke",
@@ -723,6 +727,7 @@ fn ca_subcommand_full_flow() {
         b"",
     );
     assert!(!ok, "revoking a never-issued serial should fail");
+    assert!(err.contains("never issued"), "got: {err}");
     let (dup_out, _e, ok) = run_capture(
         &[
             "ca",
@@ -1833,6 +1838,12 @@ fn ca_init_refuses_to_write_through_a_symlink() {
 
     let (_o, err, ok) = run_capture(&["ca", "init", "-dir", ca.to_str().unwrap()], b"");
     assert!(!ok, "ca init should refuse the pre-planted symlink: {err}");
+    // Refused either as a symlink or, by the create_new path, as an existing
+    // file — never overwritten.
+    assert!(
+        err.contains("symbolic link") || err.contains("refusing to overwrite existing file"),
+        "got: {err}"
+    );
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
         "important\n",
@@ -2360,6 +2371,7 @@ fn ca_issue_refuses_symlinked_ledger() {
         b"",
     );
     assert!(!ok, "ca issue must refuse the symlinked ledger: {err}");
+    assert!(err.contains("symbolic link"), "got: {err}");
     assert_eq!(
         std::fs::read_to_string(&victim).unwrap(),
         "important\n",
@@ -3745,7 +3757,7 @@ fn enc_aes_gcm_roundtrip() {
     let mut ct = std::fs::read(dir.join("ct.bin")).unwrap();
     *ct.last_mut().unwrap() ^= 1;
     std::fs::write(dir.join("ct_bad.bin"), &ct).unwrap();
-    let (_o, ok) = run(
+    let (_o, err, ok) = run_capture(
         &[
             "enc",
             "-alg",
@@ -3763,6 +3775,11 @@ fn enc_aes_gcm_roundtrip() {
         b"",
     );
     assert!(!ok, "tampered AES-GCM ciphertext must be rejected");
+    assert!(err.contains("authentication tag"), "got: {err}");
+    assert!(
+        !dir.join("rt_bad.bin").exists(),
+        "nothing may be written on a tag failure"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5140,11 +5157,12 @@ fn crl_inspect_verify_serial() {
         b"",
     );
     assert!(ok);
-    let (_o, ok) = run(
+    let (out, ok) = run(
         &["crl", "-in", &p("ca.crl"), "-serial", "999", "-is-revoked"],
         b"",
     );
     assert!(!ok);
+    assert!(out.contains("not revoked"), "got: {out:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -6199,7 +6217,7 @@ fn ca_issue_failure_does_not_consume_index_or_ledger_row() {
     let ledger_before = std::fs::read_to_string(dir.join("issued.jsonl")).unwrap_or_default();
 
     // Refused validity.
-    let (_o, _e, ok) = run_capture(
+    let (_o, err, ok) = run_capture(
         &[
             "ca",
             "issue",
@@ -6217,9 +6235,10 @@ fn ca_issue_failure_does_not_consume_index_or_ledger_row() {
         b"",
     );
     assert!(!ok, "-days 0 must be refused");
+    assert!(err.contains("-days must be at least 1"), "got: {err}");
     // Unwritable output path.
     let bad_out = dir.join("no-such-dir").join("b.crt");
-    let (_o, _e, ok) = run_capture(
+    let (_o, err, ok) = run_capture(
         &[
             "ca",
             "issue",
@@ -6235,6 +6254,10 @@ fn ca_issue_failure_does_not_consume_index_or_ledger_row() {
         b"",
     );
     assert!(!ok, "an unwritable -out must fail");
+    assert!(
+        err.contains("cannot") && err.contains("no-such-dir"),
+        "got: {err}"
+    );
 
     assert_eq!(
         std::fs::read_to_string(dir.join("serial")).unwrap(),
