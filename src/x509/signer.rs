@@ -22,10 +22,17 @@ use crate::slhdsa;
 /// secp256k1 → SHA-256, P-384 → SHA-384, P-521 → SHA-512); Ed25519 signs
 /// `id-Ed25519` (PureEdDSA over SHA-512, RFC 8410); ML-DSA signs under the
 /// matching `id-ml-dsa-N` OID (NIST FIPS 204 / draft-ietf-lamps-dilithium-
-/// certificates). ML-DSA signing is hedged with randomness from a caller-
-/// supplied RNG; the public APIs that take a `CertSigner` thread the RNG
-/// through via the `*_general_with_rng` helpers, falling back to a
-/// transcript-keyed HMAC-DRBG when no RNG is supplied.
+/// certificates) and SLH-DSA under its parameter set's OID (FIPS 205).
+///
+/// Every variant signs **deterministically** through the public issuance
+/// APIs (`Certificate::self_signed_general`, `issue_general`, the CSR / CRL /
+/// OCSP builders): RSA PKCS#1 v1.5 and Ed25519/Ed448 are deterministic by
+/// construction, ECDSA derives its nonce per RFC 6979, and ML-DSA / SLH-DSA
+/// use their FIPS deterministic variants (hedging randomness set to the zero
+/// string). No RNG is threaded through certificate issuance; a caller that
+/// wants hedged PQ signatures signs the TBS out-of-band (see
+/// [`SignatureAlgId`] and `Certificate::prepare`) and assembles the
+/// certificate with `Certificate::from_der`.
 #[non_exhaustive]
 pub enum CertSigner<'a> {
     /// An RSA signing key.

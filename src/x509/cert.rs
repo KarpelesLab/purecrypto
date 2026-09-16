@@ -647,7 +647,10 @@ impl Certificate {
     }
 
     /// The subject's public key as an algorithm-agnostic [`AnyPublicKey`]
-    /// (RSA of any size, or P-256 ECDSA).
+    /// (every SPKI algorithm [`AnyPublicKey::from_spki_der`] accepts; an
+    /// `id-RSASSA-PSS` key SPKI is [`Error::UnsupportedAlgorithm`]).
+    ///
+    /// [`AnyPublicKey::from_spki_der`]: super::AnyPublicKey::from_spki_der
     pub fn subject_public_key(&self) -> Result<super::AnyPublicKey, Error> {
         super::AnyPublicKey::from_spki_der(self.spki_der()?)
     }
@@ -656,12 +659,13 @@ impl Certificate {
     ///
     /// Both sides are compared as their *canonical* `SubjectPublicKeyInfo`
     /// re-encoding ([`AnyPublicKey::to_spki_der`]), so the answer is
-    /// independent of how the certificate happened to encode the key — an RSA
-    /// key certified under an `id-RSASSA-PSS` AlgorithmIdentifier still matches
-    /// the same key presented as plain `rsaEncryption`, and non-canonical
-    /// parameter encodings do not cause false negatives. Different algorithms
-    /// (or the same algorithm on a different curve / parameter set) never
-    /// match. Errors only when the certificate's SPKI cannot be parsed.
+    /// independent of how the certificate happened to encode the key —
+    /// non-canonical parameter encodings do not cause false negatives.
+    /// Different algorithms (or the same algorithm on a different curve /
+    /// parameter set) never match. Errors only when the certificate's SPKI
+    /// cannot be parsed by [`subject_public_key`](Self::subject_public_key),
+    /// which includes an RSA key certified under an `id-RSASSA-PSS`
+    /// AlgorithmIdentifier (that restriction has no `AnyPublicKey` form).
     ///
     /// This is the check behind "does this private key belong to this
     /// certificate": derive the public key from the private key and pass it
@@ -709,7 +713,9 @@ impl Certificate {
     }
 
     /// Verifies the certificate signature against `issuer`, dispatching on the
-    /// certificate's `signatureAlgorithm` (RSA-PKCS#1 or ECDSA over SHA-256/384).
+    /// certificate's `signatureAlgorithm` OID through
+    /// [`crate::signature_registry`] (RSA PKCS#1 v1.5 and PSS, ECDSA on every
+    /// supported curve, Ed25519/Ed448, SM2, ML-DSA, SLH-DSA).
     ///
     /// As mandated by RFC 5280 §4.1.1.2, this first confirms the outer
     /// `signatureAlgorithm` is byte-identical to the inner

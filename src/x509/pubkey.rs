@@ -161,10 +161,16 @@ impl AnyPublicKey {
     /// * `id-ecPublicKey` — named-curve OID, then no trailing junk.
     /// * `id-Ed25519` — no parameters.
     /// * `id-Ed448` — no parameters.
-    /// * `id-RSASSA-PSS` — parameter block accepted as-is; the verifier
-    ///   hard-codes the SHA-256 / MGF1-SHA-256 / salt=32 set, so trailing
-    ///   junk after that block is rejected.
+    /// * `id-X25519` / `id-X448` — no parameters.
     /// * `id-ml-dsa-*` / SLH-DSA — bare OID, no parameters.
+    ///
+    /// An `id-RSASSA-PSS` (PSS-key-restricted, RFC 4055 §1.2) SPKI is **not**
+    /// parsed here and yields [`Error::UnsupportedAlgorithm`]: this enum has
+    /// no variant that carries the PSS restriction, and mapping it to
+    /// [`AnyPublicKey::Rsa`] would silently drop it (the re-encoded SPKI
+    /// would then verify PKCS#1 v1.5 signatures the issuer forbade). Such
+    /// keys are verified only through the `rsa-pss-pss-sha256` entry of
+    /// [`crate::signature_registry`], which takes the raw SPKI bytes.
     pub fn from_spki_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut spki = reader.read_sequence()?;

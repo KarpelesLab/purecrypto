@@ -15,10 +15,10 @@ the caller has to name the id explicitly.
 | `rsa-pkcs1-sha256`          | `1.2.840.113549.1.1.11`         | `0x0401`       | yes |
 | `rsa-pkcs1-sha384`          | `1.2.840.113549.1.1.12`         | `0x0501`       | yes |
 | `rsa-pkcs1-sha512`          | `1.2.840.113549.1.1.13`         | (none)         | opt-in |
-| `rsa-pss-rsae-sha256`       | `1.2.840.113549.1.1.11` (RSAE)  | `0x0804`       | yes |
-| `rsa-pss-rsae-sha384`       | `1.2.840.113549.1.1.12` (RSAE)  | `0x0805`       | yes |
-| `rsa-pss-rsae-sha512`       | `1.2.840.113549.1.1.13` (RSAE)  | `0x0806`       | yes |
-| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (PSS keys) | (none)      | opt-in |
+| `rsa-pss-rsae-sha256`       | (TLS only, `rsaEncryption` key) | `0x0804`       | yes |
+| `rsa-pss-rsae-sha384`       | (TLS only, `rsaEncryption` key) | `0x0805`       | yes |
+| `rsa-pss-rsae-sha512`       | (TLS only, `rsaEncryption` key) | `0x0806`       | yes |
+| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (`id-RSASSA-PSS`; SHA-256 / MGF1-SHA-256 / salt 32 only) | (none) | opt-in |
 | `ecdsa-with-sha256`         | `1.2.840.10045.4.3.2` (any curve) | (none)       | yes |
 | `ecdsa-with-sha384`         | `1.2.840.10045.4.3.3` (any curve) | (none)       | yes |
 | `ecdsa-with-sha512`         | `1.2.840.10045.4.3.4` (any curve) | (none)       | yes |
@@ -27,16 +27,26 @@ the caller has to name the id explicitly.
 | `ecdsa-secp521r1-sha512`    | (TLS only, strict curve)        | `0x0603`       | yes |
 | `ecdsa-secp256r1-sha384/512`, `ecdsa-secp384r1-sha256/512`, `ecdsa-secp521r1-sha256/384` | cross-hash, policy only | (none) | opt-in |
 | `ecdsa-secp256k1-sha256/384/512` | secp256k1, policy only      | (none)         | opt-in |
+| `ecdsa-brainpoolP256r1-sha256`, `ecdsa-brainpoolP384r1-sha384`, `ecdsa-brainpoolP512r1-sha512` | Brainpool (RFC 5639), policy only | (none) | opt-in |
+| `sm2-with-sm3`              | `1.2.156.10197.1.501`           | (none)         | opt-in |
 | `ed25519`                   | `1.3.101.112`                   | `0x0807`       | yes |
 | `ed448`                     | `1.3.101.113`                   | `0x0808`       | yes |
 | `ml-dsa-44` / `-65` / `-87` | `2.16.840.1.101.3.4.3.17/18/19` | `0x0904/05/06` | yes (FIPS 204) |
 | `slh-dsa-sha2-128s/128f/192s/192f/256s/256f`, `slh-dsa-shake-128s/128f/192s/192f/256s/256f` | `2.16.840.1.101.3.4.3.20..31` | (none) | opt-in (FIPS 205) |
 
 The matched-curve, matched-hash ECDSA pairs (P-256 with SHA-256, and so on)
-have IANA TLS scheme codes. Cross-hash pairs and every secp256k1 entry are
-reachable for chain dispatch through the OID-keyed `ecdsa-with-shaN` entries,
-which accept any supported curve, and as fine-grained policy-keyed entries
-for TLS opt-in.
+have IANA TLS scheme codes. Cross-hash pairs and every secp256k1 and
+Brainpool entry are reachable for chain dispatch through the OID-keyed
+`ecdsa-with-shaN` entries, which accept any supported curve, and as
+fine-grained policy-keyed entries for TLS opt-in.
+
+The three `rsa-pss-rsae-*` entries carry **no** X.509 OID: in X.509 the
+`sha*WithRSAEncryption` OIDs mean PKCS#1 v1.5 and belong to the
+`rsa-pkcs1-*` entries, while an RSA-PSS certificate signature is
+`id-RSASSA-PSS` and dispatches to `rsa-pss-pss-sha256`. That entry accepts
+both an `rsaEncryption` SPKI and a PSS-restricted `id-RSASSA-PSS` SPKI
+(parameters absent, or exactly the SHA-256 / MGF1-SHA-256 / salt-32 set);
+the `rsa-pkcs1-*` entries refuse a PSS-restricted key (RFC 4055 §1.2).
 
 ML-DSA is on the default whitelist. SLH-DSA's twelve parameter sets are
 registered but never on the default whitelist: signatures are 7 to 50 KB and

@@ -7,8 +7,10 @@
 //!    equality, selection and ordering. Everything secret-dependent rests on
 //!    this layer. Its sibling [`zeroize`] wipes secrets with volatile stores.
 //! 2. Hashing, symmetric ciphers, constant-time bignum arithmetic, asymmetric
-//!    keys (RSA, ECDSA, Ed25519), the post-quantum schemes ML-KEM, ML-DSA and
-//!    SLH-DSA, ASN.1, X.509, and TLS/DTLS — added on top as the project grows.
+//!    keys (RSA, ECDSA, EdDSA, X25519/X448, finite-field DH), the post-quantum
+//!    schemes ML-KEM, ML-DSA, SLH-DSA, Falcon, LMS and XMSS, ASN.1, X.509 and
+//!    PKCS#12, HPKE, and the TLS / DTLS / QUIC engines — each behind its own
+//!    Cargo feature.
 //!
 //! `purecrypto` is usable as a Rust library, a C library, and a standalone
 //! command-line tool.
