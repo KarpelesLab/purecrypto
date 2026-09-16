@@ -32,10 +32,12 @@
 //!
 //! If the destination is the negation of a whitelisted offline key, the summand
 //! `Q_i + W` is the point at infinity, the tweak drops out and the ring key
-//! collapses to `K_i = P_i`: the online key alone then produces a valid proof.
-//! This is accepted deliberately (upstream does the same). The resulting output
-//! is spendable only by the holder of `q_i` — the offline half of the very same
-//! whitelist entry — so no funds can be diverted by it.
+//! collapses to `K_i = P_i`: the online key alone then opens the ring entry.
+//! [`verify`] accepts such a proof deliberately (upstream does the same). The
+//! resulting output is spendable only by the holder of `q_i` — the offline half
+//! of the very same whitelist entry — so no funds can be diverted by it. Note
+//! that [`sign`] cannot *produce* one: the summed secret is `0` there, which it
+//! rejects along with every other non-canonical scalar.
 //!
 //! # Construction
 //!
