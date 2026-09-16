@@ -24,7 +24,12 @@ fn parse_slhdsa_spki(spki: &[u8], expected_set: ParamSet) -> Result<PublicKey, E
     if alg.as_slice() != expected_set.oid() {
         return Err(Error::UnsupportedAlgorithm);
     }
+    // draft-ietf-lamps-x509-slhdsa §4: bare OID, parameters absent; nothing
+    // may follow the subjectPublicKey BIT STRING (mirrors
+    // `x509::pubkey::from_spki_der` and the other registry parsers).
+    algid.finish()?;
     let key_bits = outer.read_bit_string()?;
+    outer.finish()?;
     PublicKey::from_bytes(expected_set, key_bits).map_err(|_| Error::Malformed)
 }
 
@@ -171,5 +176,37 @@ mod tests {
         by_id.verify(&spki, b"hi", &sig).unwrap();
         let by_oid = find_by_oid(OID_SHA2_128F).unwrap();
         assert_eq!(by_oid.id(), "slh-dsa-sha2-128f");
+    }
+
+    /// The registry SPKI parser must be as strict as `x509::pubkey`: NULL
+    /// parameters inside the AlgorithmIdentifier or junk after the
+    /// subjectPublicKey BIT STRING is rejected.
+    #[test]
+    fn slh_dsa_spki_trailing_junk_rejected() {
+        use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
+        let mut rng = HmacDrbg::<Sha256>::new(b"reg-slhdsa-junk", b"n", &[]);
+        let (sk, pk) = PrivateKey::generate(ParamSet::Sha2_128f, &mut rng);
+        let sig = sk.sign(&mut rng, b"hi", b"").unwrap();
+        let algo = find_by_id("slh-dsa-sha2-128f").unwrap();
+        let key_bits = pk.to_bytes();
+
+        let algid = encode_sequence(&[oid_tlv(OID_SHA2_128F), alloc::vec![0x05, 0x00]].concat());
+        let inner_junk = encode_sequence(&[algid, encode_bit_string(key_bits)].concat());
+        assert!(algo.verify(&inner_junk, b"hi", &sig).is_err());
+
+        let algid = encode_sequence(&oid_tlv(OID_SHA2_128F));
+        let outer_junk = encode_sequence(
+            &[algid, encode_bit_string(key_bits), alloc::vec![0x05, 0x00]].concat(),
+        );
+        assert!(algo.verify(&outer_junk, b"hi", &sig).is_err());
+        // The canonical encoding still verifies.
+        let good = encode_sequence(
+            &[
+                encode_sequence(&oid_tlv(OID_SHA2_128F)),
+                encode_bit_string(key_bits),
+            ]
+            .concat(),
+        );
+        algo.verify(&good, b"hi", &sig).unwrap();
     }
 }

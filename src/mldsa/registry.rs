@@ -19,7 +19,14 @@ fn parse_mldsa_spki<'a>(spki: &'a [u8], expected_oid: &[u64]) -> Result<&'a [u8]
     if alg.as_slice() != expected_oid {
         return Err(Error::UnsupportedAlgorithm);
     }
-    Ok(outer.read_bit_string()?)
+    // draft-ietf-lamps-dilithium-certificates §4: the AlgorithmIdentifier is
+    // the bare OID with parameters absent, and nothing may follow the
+    // subjectPublicKey BIT STRING (mirrors `x509::pubkey::from_spki_der`
+    // and the ECDSA / EdDSA registry parsers).
+    algid.finish()?;
+    let key_bits = outer.read_bit_string()?;
+    outer.finish()?;
+    Ok(key_bits)
 }
 
 /// `ml-dsa-44` (FIPS 204, security level 2).
@@ -114,6 +121,39 @@ mod tests {
         assert_eq!(by_oid.id(), "ml-dsa-65");
         // TLS scheme 0x0905 (draft-ietf-tls-mldsa).
         assert_eq!(algo.tls_schemes(), &[0x0905u16]);
+    }
+
+    /// The registry SPKI parser must be as strict as `x509::pubkey`: a
+    /// trailing NULL inside the AlgorithmIdentifier (parameters MUST be
+    /// absent) or junk after the subjectPublicKey BIT STRING is rejected.
+    #[test]
+    fn ml_dsa_spki_trailing_junk_rejected() {
+        use crate::der::{Reader, encode_bit_string, encode_sequence, oid_tlv};
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"reg-mldsa-junk", b"n", &[]);
+        let (sk, pk) = MlDsa65PrivateKey::generate(&mut rng);
+        let sig = sk.sign(&mut rng, b"hi", b"").unwrap();
+        let algo = find_by_id("ml-dsa-65").unwrap();
+
+        let good = AnyPublicKey::MlDsa65(pk).to_spki_der();
+        algo.verify(&good, b"hi", &sig).unwrap();
+        let key_bits = {
+            let mut outer = Reader::new(&good).read_sequence().unwrap();
+            outer.read_sequence().unwrap();
+            outer.read_bit_string().unwrap()
+        };
+
+        // NULL parameters inside the AlgorithmIdentifier.
+        let algid =
+            encode_sequence(&[oid_tlv(oid::ID_ML_DSA_65), alloc::vec![0x05, 0x00]].concat());
+        let inner_junk = encode_sequence(&[algid, encode_bit_string(key_bits)].concat());
+        assert!(algo.verify(&inner_junk, b"hi", &sig).is_err());
+
+        // Junk after the BIT STRING.
+        let algid = encode_sequence(&oid_tlv(oid::ID_ML_DSA_65));
+        let outer_junk = encode_sequence(
+            &[algid, encode_bit_string(key_bits), alloc::vec![0x05, 0x00]].concat(),
+        );
+        assert!(algo.verify(&outer_junk, b"hi", &sig).is_err());
     }
 
     #[test]
