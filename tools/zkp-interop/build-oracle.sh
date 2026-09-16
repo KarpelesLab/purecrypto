@@ -28,5 +28,5 @@ cd "$repo"
   --enable-benchmark=no \
   --enable-tests=no \
   --enable-exhaustive-tests=no
-make -j"$(nproc)"
+make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 echo "built: $repo/.libs/libsecp256k1.a"

@@ -30,10 +30,16 @@ attribution. The clean-room route is a deliberate choice to keep this crate's
 Then compile and run the per-module generator you need, e.g.
 
     cc gen-rangeproof-vectors.c -I oracle/include oracle/.libs/libsecp256k1.a \
+       oracle/.libs/libsecp256k1_precomputed.a \
        -o gen-rangeproof && ./gen-rangeproof > vectors/rangeproof.json
 
-There is one `gen-*.c` per module that has vectors; each is self-contained
-and rewrites its own JSON file deterministically.
+(secp256k1-zkp ships its precomputed tables as a separate archive, so both
+`.a` files are needed.) Generators exist for four of the vector files —
+`gen-pedersen-vectors.c`, `gen-rangeproof-vectors.c`,
+`gen-sign_to_contract-vectors.c` and `gen-surjection-vectors.c`; each is
+self-contained and rewrites its own JSON file deterministically. The
+`ecdsa_adaptor.json`, `halfagg.json` and `whitelist.json` vectors have no
+generator here (see `vectors/STATUS.md` for their provenance).
 
 Neither script runs in CI: CI consumes the committed JSON only, so the test
 suite stays hermetic and offline.
