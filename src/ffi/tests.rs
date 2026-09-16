@@ -68,6 +68,76 @@ fn aead_encrypt_rejects_bad_nonce_lengths() {
     }
 }
 
+/// The KDF entry points surface a parameter the KDF itself rejects — a zero
+/// PBKDF2 iteration count, an HKDF output past `255 * HashLen` — as
+/// `PC_UNSUPPORTED` with nothing written, rather than as a caught panic
+/// (`PC_INTERNAL`). The fallible `try_*` KDFs report these directly, so no
+/// pre-screen in the wrapper can drift out of step with the library.
+#[test]
+fn kdf_parameter_misuse_is_unsupported_not_internal() {
+    let pw = b"pw";
+    let salt = b"salt";
+    let mut out = vec![0xAAu8; 32];
+    let st = unsafe {
+        kdf::pc_pbkdf2(
+            hash::id::SHA256,
+            pw.as_ptr(),
+            pw.len(),
+            salt.as_ptr(),
+            salt.len(),
+            0,
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Unsupported);
+    assert!(out.iter().all(|&b| b == 0xAA), "nothing may be written");
+    let st = unsafe {
+        kdf::pc_pbkdf2(
+            hash::id::SHA256,
+            pw.as_ptr(),
+            pw.len(),
+            salt.as_ptr(),
+            salt.len(),
+            1,
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+
+    let mut big = vec![0xAAu8; 255 * 32 + 1];
+    let st = unsafe {
+        kdf::pc_hkdf(
+            hash::id::SHA256,
+            salt.as_ptr(),
+            salt.len(),
+            pw.as_ptr(),
+            pw.len(),
+            core::ptr::null(),
+            0,
+            big.as_mut_ptr(),
+            big.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Unsupported);
+    assert!(big.iter().all(|&b| b == 0xAA), "nothing may be written");
+    let st = unsafe {
+        kdf::pc_hkdf(
+            hash::id::SHA256,
+            salt.as_ptr(),
+            salt.len(),
+            pw.as_ptr(),
+            pw.len(),
+            core::ptr::null(),
+            0,
+            big.as_mut_ptr(),
+            255 * 32,
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+}
+
 /// Sets a single ALPN protocol ("test") on a QUIC config. ALPN is
 /// mandatory for QUIC (RFC 9001 §8.1) — `pc_quic_new` rejects a config
 /// without it.

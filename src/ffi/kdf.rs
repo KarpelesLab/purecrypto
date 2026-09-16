@@ -6,8 +6,8 @@ use crate::hash::{Sha256, Sha384, Sha512};
 use crate::kdf::argon2::{Argon2Params, Argon2Type, argon2};
 use crate::kdf::scrypt::scrypt;
 use crate::kdf::{
-    CmacAes128Prf, CmacAes256Prf, HmacSha256Prf, HmacSha384Prf, HmacSha512Prf, Prf, hkdf,
-    kbkdf_counter, kbkdf_feedback, pbkdf2,
+    CmacAes128Prf, CmacAes256Prf, HmacSha256Prf, HmacSha384Prf, HmacSha512Prf, Prf, kbkdf_counter,
+    kbkdf_feedback, try_hkdf, try_pbkdf2,
 };
 
 /// Argon2 variant identifiers.
@@ -149,7 +149,8 @@ pub unsafe extern "C" fn pc_kbkdf_feedback(
 }
 
 /// HKDF (RFC 5869). `hash` is `PC_SHA{256,384,512}`. `out_len` is the desired
-/// output length.
+/// output length; a request past the RFC 5869 ceiling of `255 * HashLen`
+/// bytes returns [`PcStatus::Unsupported`].
 ///
 /// # Safety
 /// All pointers valid for their lengths.
@@ -176,13 +177,16 @@ pub unsafe extern "C" fn pc_hkdf(
         let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
         };
-        match hash {
-            id::SHA256 => hkdf::<Sha256>(s, k, i, buf),
-            id::SHA384 => hkdf::<Sha384>(s, k, i, buf),
-            id::SHA512 => hkdf::<Sha512>(s, k, i, buf),
+        let res = match hash {
+            id::SHA256 => try_hkdf::<Sha256>(s, k, i, buf),
+            id::SHA384 => try_hkdf::<Sha384>(s, k, i, buf),
+            id::SHA512 => try_hkdf::<Sha512>(s, k, i, buf),
             _ => return PcStatus::Unsupported,
+        };
+        match res {
+            Ok(()) => PcStatus::Ok,
+            Err(_) => PcStatus::Unsupported,
         }
-        PcStatus::Ok
     })
 }
 
@@ -210,16 +214,18 @@ pub unsafe extern "C" fn pc_pbkdf2(
         let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
         };
-        if iterations == 0 {
-            return PcStatus::Unsupported;
-        }
-        match hash {
-            id::SHA256 => pbkdf2::<Sha256>(p, s, iterations, buf),
-            id::SHA384 => pbkdf2::<Sha384>(p, s, iterations, buf),
-            id::SHA512 => pbkdf2::<Sha512>(p, s, iterations, buf),
+        // A zero iteration count (or an output past the RFC 8018 block-counter
+        // limit) is reported by the fallible KDF itself; no pre-screen needed.
+        let res = match hash {
+            id::SHA256 => try_pbkdf2::<Sha256>(p, s, iterations, buf),
+            id::SHA384 => try_pbkdf2::<Sha384>(p, s, iterations, buf),
+            id::SHA512 => try_pbkdf2::<Sha512>(p, s, iterations, buf),
             _ => return PcStatus::Unsupported,
+        };
+        match res {
+            Ok(()) => PcStatus::Ok,
+            Err(_) => PcStatus::Unsupported,
         }
-        PcStatus::Ok
     })
 }
 

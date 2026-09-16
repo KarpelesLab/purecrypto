@@ -11,9 +11,9 @@ use crate::util::{
 };
 use purecrypto::ascon::AsconAead128;
 use purecrypto::cipher::{
-    Aegis128L, Aegis256, Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256,
-    Aes256Ccm, Aes256Ccm8, Aes256Gcm, Aes256Kw, Aes256Kwp, AesGcmSiv, AesSiv, ChaCha20Poly1305,
-    XChaCha20Poly1305,
+    AeadError, Aegis128L, Aegis256, Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp,
+    Aes256, Aes256Ccm, Aes256Ccm8, Aes256Gcm, Aes256Kw, Aes256Kwp, AesGcmSiv, AesSiv,
+    ChaCha20Poly1305, XChaCha20Poly1305,
 };
 
 #[derive(Clone, Copy)]
@@ -108,28 +108,35 @@ fn key_size(alg: Algo) -> usize {
     }
 }
 
-/// CCM accepts only a 7..=13-byte nonce (RFC 3610). The `Ccm::validate` path
-/// asserts this internally, so a wrong-length nonce would `panic!` instead of
-/// reaching the CLI's clean `die()`. Guard it here, mirroring the explicit
-/// nonce-length checks the sibling AEAD arms perform via `try_into`.
-fn ccm_check_nonce(nonce: &[u8]) {
-    if !(7..=13).contains(&nonce.len()) {
-        die("AES-CCM nonce must be 7..=13 bytes (12 recommended)");
+/// Unwraps a fallible AEAD encrypt (AES-GCM / AES-CCM take the nonce as a
+/// slice and judge its length themselves), turning a rejected nonce or
+/// input length into a clean `die()` rather than a panic.
+fn aead_tag<const N: usize>(alg_name: &str, res: Result<[u8; N], AeadError>) -> [u8; N] {
+    res.unwrap_or_else(|e| die(format!("{alg_name}: {e}")))
+}
+
+/// The decrypt-side twin of [`aead_tag`]: `true` verified, `false` tag
+/// mismatch, and a clean `die()` for a nonce or input length the mode
+/// rejects.
+fn aead_ok(alg_name: &str, res: Result<(), AeadError>) -> bool {
+    match res {
+        Ok(()) => true,
+        Err(AeadError::TagMismatch) => false,
+        Err(e) => die(format!("{alg_name}: {e}")),
     }
 }
 
 fn aead_encrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], buf: &mut Vec<u8>) {
-    if let Algo::Aes128Ccm | Algo::Aes256Ccm | Algo::Aes128Ccm8 | Algo::Aes256Ccm8 = alg {
-        ccm_check_nonce(nonce);
-    }
     let tag = match alg {
         Algo::Aes128Gcm => {
             let k: [u8; 16] = key.try_into().expect("aes-128 key length");
-            Aes128Gcm::new(Aes128::new(&k)).encrypt(nonce, aad, buf.as_mut_slice())
+            let res = Aes128Gcm::new(Aes128::new(&k)).try_encrypt(nonce, aad, buf.as_mut_slice());
+            aead_tag("AES-128-GCM", res)
         }
         Algo::Aes256Gcm => {
             let k: [u8; 32] = key.try_into().expect("aes-256 key length");
-            Aes256Gcm::new(Aes256::new(&k)).encrypt(nonce, aad, buf.as_mut_slice())
+            let res = Aes256Gcm::new(Aes256::new(&k)).try_encrypt(nonce, aad, buf.as_mut_slice());
+            aead_tag("AES-256-GCM", res)
         }
         Algo::ChaCha20P1305 => {
             let k: [u8; 32] = key.try_into().expect("chacha20-poly1305 key length");
@@ -140,32 +147,37 @@ fn aead_encrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], buf: &mut Vec<u
         }
         Algo::Aes128Ccm => {
             let k: [u8; 16] = key.try_into().expect("aes-128 key length");
-            Aes128Ccm::new(Aes128::new(&k)).encrypt(nonce, aad, buf.as_mut_slice())
+            let res = Aes128Ccm::new(Aes128::new(&k)).try_encrypt(nonce, aad, buf.as_mut_slice());
+            aead_tag("AES-128-CCM", res)
         }
         Algo::Aes256Ccm => {
             let k: [u8; 32] = key.try_into().expect("aes-256 key length");
-            Aes256Ccm::new(Aes256::new(&k)).encrypt(nonce, aad, buf.as_mut_slice())
+            let res = Aes256Ccm::new(Aes256::new(&k)).try_encrypt(nonce, aad, buf.as_mut_slice());
+            aead_tag("AES-256-CCM", res)
         }
         Algo::Aes128Ccm8 => {
             let k: [u8; 16] = key.try_into().expect("aes-128 key length");
-            let t = Aes128Ccm8::new(Aes128::new(&k)).encrypt(nonce, aad, buf.as_mut_slice());
-            // CCM8 has an 8-byte tag; pad to 16 to keep the output framing uniform.
-            let mut padded = [0u8; 16];
-            padded[..8].copy_from_slice(&t);
-            buf.extend_from_slice(&padded[..8]);
+            let res = Aes128Ccm8::new(Aes128::new(&k)).try_encrypt(nonce, aad, buf.as_mut_slice());
+            // CCM8 has an 8-byte tag: append it as-is (the decrypt side
+            // splits on `tag_len`).
+            buf.extend_from_slice(&aead_tag("AES-128-CCM8", res));
             return;
         }
         Algo::Aes256Ccm8 => {
             let k: [u8; 32] = key.try_into().expect("aes-256 key length");
-            let t = Aes256Ccm8::new(Aes256::new(&k)).encrypt(nonce, aad, buf.as_mut_slice());
-            buf.extend_from_slice(&t);
+            let res = Aes256Ccm8::new(Aes256::new(&k)).try_encrypt(nonce, aad, buf.as_mut_slice());
+            buf.extend_from_slice(&aead_tag("AES-256-CCM8", res));
             return;
         }
         Algo::Aes128GcmSiv | Algo::Aes256GcmSiv => {
             let n: [u8; 12] = nonce
                 .try_into()
                 .unwrap_or_else(|_| die("nonce must be 12 bytes for AES-GCM-SIV"));
-            AesGcmSiv::new(key).encrypt(&n, aad, buf.as_mut_slice())
+            // `key_size` already matched the key to the algorithm; `try_new`
+            // re-checks so the two tables can never drift into a panic.
+            AesGcmSiv::try_new(key)
+                .unwrap_or_else(|e| die(format!("AES-GCM-SIV: {e}")))
+                .encrypt(&n, aad, buf.as_mut_slice())
         }
         Algo::XChaCha20P1305 => {
             let k: [u8; 32] = key.try_into().expect("xchacha20-poly1305 key length");
@@ -177,7 +189,10 @@ fn aead_encrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], buf: &mut Vec<u
         Algo::Aes128Siv | Algo::Aes256Siv => {
             // AES-SIV is deterministic: the nonce is supplied as the single
             // associated-data header and the output is `V ‖ ciphertext`.
-            let out = AesSiv::new(key).seal(&[nonce], buf.as_slice());
+            let siv = AesSiv::try_new(key).unwrap_or_else(|e| die(format!("AES-SIV: {e}")));
+            let out = siv
+                .try_seal(&[nonce], buf.as_slice())
+                .unwrap_or_else(|e| die(format!("AES-SIV: {e}")));
             *buf = out;
             return;
         }
@@ -211,9 +226,12 @@ fn aead_decrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], ct_and_tag: &[u
     // AES-SIV's output is `V ‖ ciphertext` (V prepended), with the nonce passed
     // as the single associated-data header; handle it before the append-tag path.
     if let Algo::Aes128Siv | Algo::Aes256Siv = alg {
-        return AesSiv::new(key)
-            .open(&[nonce], ct_and_tag)
-            .unwrap_or_else(|_| die("authentication tag verification failed"));
+        let siv = AesSiv::try_new(key).unwrap_or_else(|e| die(format!("AES-SIV: {e}")));
+        return match siv.try_open(&[nonce], ct_and_tag) {
+            Ok(pt) => pt,
+            Err(AeadError::TagMismatch) => die("authentication tag verification failed"),
+            Err(e) => die(format!("AES-SIV: {e}")),
+        };
     }
     let tag_len = match alg {
         Algo::Aes128Ccm8 | Algo::Aes256Ccm8 => 8,
@@ -223,24 +241,19 @@ fn aead_decrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], ct_and_tag: &[u
         die("ciphertext shorter than the authentication tag");
     }
     let (ct, tag) = ct_and_tag.split_at(ct_and_tag.len() - tag_len);
-    if let Algo::Aes128Ccm | Algo::Aes256Ccm | Algo::Aes128Ccm8 | Algo::Aes256Ccm8 = alg {
-        ccm_check_nonce(nonce);
-    }
     let mut buf = ct.to_vec();
     let ok = match alg {
         Algo::Aes128Gcm => {
             let k: [u8; 16] = key.try_into().expect("aes-128 key length");
             let t: [u8; 16] = tag.try_into().unwrap();
-            Aes128Gcm::new(Aes128::new(&k))
-                .decrypt(nonce, aad, &mut buf, &t)
-                .is_ok()
+            let res = Aes128Gcm::new(Aes128::new(&k)).try_decrypt(nonce, aad, &mut buf, &t);
+            aead_ok("AES-128-GCM", res)
         }
         Algo::Aes256Gcm => {
             let k: [u8; 32] = key.try_into().expect("aes-256 key length");
             let t: [u8; 16] = tag.try_into().unwrap();
-            Aes256Gcm::new(Aes256::new(&k))
-                .decrypt(nonce, aad, &mut buf, &t)
-                .is_ok()
+            let res = Aes256Gcm::new(Aes256::new(&k)).try_decrypt(nonce, aad, &mut buf, &t);
+            aead_ok("AES-256-GCM", res)
         }
         Algo::ChaCha20P1305 => {
             let k: [u8; 32] = key.try_into().expect("chacha20 key length");
@@ -255,37 +268,36 @@ fn aead_decrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], ct_and_tag: &[u
         Algo::Aes128Ccm => {
             let k: [u8; 16] = key.try_into().expect("aes-128 key length");
             let t: [u8; 16] = tag.try_into().unwrap();
-            Aes128Ccm::new(Aes128::new(&k))
-                .decrypt(nonce, aad, &mut buf, &t)
-                .is_ok()
+            let res = Aes128Ccm::new(Aes128::new(&k)).try_decrypt(nonce, aad, &mut buf, &t);
+            aead_ok("AES-128-CCM", res)
         }
         Algo::Aes256Ccm => {
             let k: [u8; 32] = key.try_into().expect("aes-256 key length");
             let t: [u8; 16] = tag.try_into().unwrap();
-            Aes256Ccm::new(Aes256::new(&k))
-                .decrypt(nonce, aad, &mut buf, &t)
-                .is_ok()
+            let res = Aes256Ccm::new(Aes256::new(&k)).try_decrypt(nonce, aad, &mut buf, &t);
+            aead_ok("AES-256-CCM", res)
         }
         Algo::Aes128Ccm8 => {
             let k: [u8; 16] = key.try_into().expect("aes-128 key length");
             let t: [u8; 8] = tag.try_into().unwrap();
-            Aes128Ccm8::new(Aes128::new(&k))
-                .decrypt(nonce, aad, &mut buf, &t)
-                .is_ok()
+            let res = Aes128Ccm8::new(Aes128::new(&k)).try_decrypt(nonce, aad, &mut buf, &t);
+            aead_ok("AES-128-CCM8", res)
         }
         Algo::Aes256Ccm8 => {
             let k: [u8; 32] = key.try_into().expect("aes-256 key length");
             let t: [u8; 8] = tag.try_into().unwrap();
-            Aes256Ccm8::new(Aes256::new(&k))
-                .decrypt(nonce, aad, &mut buf, &t)
-                .is_ok()
+            let res = Aes256Ccm8::new(Aes256::new(&k)).try_decrypt(nonce, aad, &mut buf, &t);
+            aead_ok("AES-256-CCM8", res)
         }
         Algo::Aes128GcmSiv | Algo::Aes256GcmSiv => {
             let n: [u8; 12] = nonce
                 .try_into()
                 .unwrap_or_else(|_| die("nonce must be 12 bytes for AES-GCM-SIV"));
             let t: [u8; 16] = tag.try_into().unwrap();
-            AesGcmSiv::new(key).decrypt(&n, aad, &mut buf, &t).is_ok()
+            AesGcmSiv::try_new(key)
+                .unwrap_or_else(|e| die(format!("AES-GCM-SIV: {e}")))
+                .decrypt(&n, aad, &mut buf, &t)
+                .is_ok()
         }
         Algo::XChaCha20P1305 => {
             let k: [u8; 32] = key.try_into().expect("xchacha20 key length");
@@ -490,9 +502,13 @@ pub(crate) fn run(args: Args) {
                     zero_buf(&mut key);
                     die("missing -nonce HEX (12 bytes for GCM/ChaCha20-Poly1305)")
                 });
-            // An empty nonce is invalid for every AEAD here (AES-GCM
-            // would otherwise accept it; the FFI rejects it). Reject
-            // cleanly before touching the cipher.
+            // The fixed-size nonce AEADs reject an empty nonce via
+            // `try_into`, and AES-GCM / AES-CCM via their fallible API. The
+            // one mode that would accept it is AES-SIV, where `-nonce` is a
+            // free-form associated-data header — an empty one turns a
+            // nonce-based invocation into a deterministic one, which is
+            // never what an `enc` user meant. Refuse it for every mode so
+            // the message is uniform.
             if nonce.is_empty() {
                 zero_buf(&mut key);
                 die("-nonce must not be empty");

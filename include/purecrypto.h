@@ -254,6 +254,9 @@ pc_status pc_hmac(int32_t alg, const uint8_t *key, size_t key_len,
  * success *ct_and_tag_len = pt_len + tag_len (16 by default, 8 for CCM8).
  * pc_aead_decrypt verifies the tag before any plaintext is written and returns
  * PC_VERIFICATION on mismatch (CCM additionally wipes the working buffer).
+ * A nonce length the algorithm does not accept (empty for AES-GCM, outside
+ * 7..=13 bytes for AES-CCM, anything but the fixed size for the others) is
+ * PC_UNSUPPORTED from both, with nothing written to the output buffer.
  */
 pc_status pc_aead_encrypt(int32_t alg, const uint8_t *key, size_t key_len,
                           const uint8_t *nonce, size_t nonce_len,
@@ -305,7 +308,11 @@ pc_status pc_ascon_cxof(const uint8_t *custom, size_t custom_len,
                         const uint8_t *data, size_t data_len,
                         uint8_t *out, size_t out_len);
 
-/* ---- KDFs ---- */
+/* ---- KDFs ----
+ * pc_hkdf returns PC_UNSUPPORTED when out_len exceeds the RFC 5869 ceiling of
+ * 255 * HashLen bytes; pc_pbkdf2 returns PC_UNSUPPORTED when iterations is 0
+ * (RFC 8018 requires at least one PRF round). Neither writes to out in that
+ * case. */
 pc_status pc_hkdf(int32_t hash,
                   const uint8_t *salt, size_t salt_len,
                   const uint8_t *ikm, size_t ikm_len,

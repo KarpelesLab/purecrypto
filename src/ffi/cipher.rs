@@ -7,9 +7,9 @@ use alloc::vec::Vec;
 use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::ascon::AsconAead128;
 use crate::cipher::{
-    Aegis128L, Aegis256, Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256,
-    Aes256Ccm, Aes256Ccm8, Aes256Gcm, Aes256Kw, Aes256Kwp, AesCmac128, AesCmac256, AesGcmSiv,
-    AesGmac128, AesGmac256, AesSiv, ChaCha20Poly1305, XChaCha20Poly1305,
+    AeadError, Aegis128L, Aegis256, Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp,
+    Aes256, Aes256Ccm, Aes256Ccm8, Aes256Gcm, Aes256Kw, Aes256Kwp, AesCmac128, AesCmac256,
+    AesGcmSiv, AesGmac128, AesGmac256, AesSiv, ChaCha20Poly1305, XChaCha20Poly1305,
 };
 
 /// Owns a stack copy of secret key bytes and scrubs them on drop. Each
@@ -98,22 +98,24 @@ fn aead_tag_size(alg: i32) -> usize {
     }
 }
 
-/// Whether `len` is an acceptable nonce length for `alg`.
+/// Whether `len` is an acceptable nonce length for `alg`, for the algorithms
+/// whose nonce is a fixed-size array. It is checked before the caller's
+/// plaintext is copied into the working buffer, so a wrong length costs
+/// nothing; `AeadBuf` scrubs that copy on every exit path regardless.
 ///
-/// Checked *before* the caller's plaintext is copied into the working buffer:
-/// the per-algorithm length checks used to live inside the algorithm match,
-/// after `p.to_vec()`, so a wrong nonce length returned `PC_UNSUPPORTED` with
-/// a full unwiped copy of the plaintext handed straight back to the
-/// allocator. (AES-SIV is excluded: there the `nonce` argument is an
-/// associated-data header of any length, not a nonce.)
+/// AES-GCM and AES-CCM take a variable-length nonce slice and are not listed:
+/// their `try_encrypt` / `try_decrypt` report an unacceptable length as
+/// [`AeadError::InvalidNonceLength`], which the arms map to `PC_UNSUPPORTED`.
+/// AES-SIV is excluded too: there the `nonce` argument is an associated-data
+/// header of any length, not a nonce.
 fn aead_nonce_ok(alg: i32, len: usize) -> bool {
     match alg {
-        // GCM accepts any non-empty nonce (96 bits is the canonical size).
-        aead_id::AES128_GCM | aead_id::AES256_GCM => len != 0,
-        // RFC 3610 §2: 7..=13 octets.
-        aead_id::AES128_CCM | aead_id::AES256_CCM | aead_id::AES128_CCM8 | aead_id::AES256_CCM8 => {
-            (7..=13).contains(&len)
-        }
+        aead_id::AES128_GCM
+        | aead_id::AES256_GCM
+        | aead_id::AES128_CCM
+        | aead_id::AES256_CCM
+        | aead_id::AES128_CCM8
+        | aead_id::AES256_CCM8 => true,
         aead_id::CHACHA20_POLY1305 | aead_id::AES128_GCM_SIV | aead_id::AES256_GCM_SIV => len == 12,
         aead_id::XCHACHA20_POLY1305 => len == 24,
         aead_id::AEGIS128L | aead_id::ASCON_AEAD128 => len == 16,
@@ -121,6 +123,17 @@ fn aead_nonce_ok(alg: i32, len: usize) -> bool {
         // AES-SIV's `nonce` argument is an AD header: any length goes.
         aead_id::AES128_SIV | aead_id::AES256_SIV => true,
         _ => false,
+    }
+}
+
+/// Folds a fallible AEAD decrypt into the `ok` flag the decrypt arms share:
+/// `Some(true)` verified, `Some(false)` tag mismatch, `None` a parameter the
+/// mode rejects (surfaced by the caller as `PC_UNSUPPORTED`).
+fn decrypt_ok(res: Result<(), AeadError>) -> Option<bool> {
+    match res {
+        Ok(()) => Some(true),
+        Err(AeadError::TagMismatch) => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -182,9 +195,14 @@ pub unsafe extern "C" fn pc_aead_encrypt(
         // AES-SIV uses a single-AD form (the `nonce` argument is the AD header)
         // and emits `V ‖ ciphertext`, so it does not fit the append-tag shape.
         if is_siv(alg) {
-            let out = match alg {
-                aead_id::AES128_SIV | aead_id::AES256_SIV => AesSiv::new(k).seal(&[n], p),
-                _ => unreachable!(),
+            // `aead_key_size` already matched the key length to the
+            // algorithm id; `try_new` re-checks it so a table drift can
+            // never reach a panic.
+            let Ok(siv) = AesSiv::try_new(k) else {
+                return PcStatus::Unsupported;
+            };
+            let Ok(out) = siv.try_seal(&[n], p) else {
+                return PcStatus::Unsupported;
             };
             return unsafe { out_write(&out, ct_and_tag, ct_and_tag_len) };
         }
@@ -194,18 +212,23 @@ pub unsafe extern "C" fn pc_aead_encrypt(
         // return, not on a caught panic.
         let mut work = AeadBuf(p.to_vec());
         let buf = &mut work.0;
+        // The GCM / CCM arms take the nonce as a slice and let the fallible
+        // cipher API judge its length; an `Err` here is a nonce (or input)
+        // length the mode rejects, never a tag failure.
         let tag: Vec<u8> = match alg {
             aead_id::AES128_GCM => {
                 let key = KeyBuf::<16>(k.try_into().unwrap());
-                Aes128Gcm::new(Aes128::new(key.r()))
-                    .encrypt(n, a, buf)
-                    .to_vec()
+                match Aes128Gcm::new(Aes128::new(key.r())).try_encrypt(n, a, buf) {
+                    Ok(t) => t.to_vec(),
+                    Err(_) => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES256_GCM => {
                 let key = KeyBuf::<32>(k.try_into().unwrap());
-                Aes256Gcm::new(Aes256::new(key.r()))
-                    .encrypt(n, a, buf)
-                    .to_vec()
+                match Aes256Gcm::new(Aes256::new(key.r())).try_encrypt(n, a, buf) {
+                    Ok(t) => t.to_vec(),
+                    Err(_) => return PcStatus::Unsupported,
+                }
             }
             aead_id::CHACHA20_POLY1305 => {
                 let key = KeyBuf::<32>(k.try_into().unwrap());
@@ -219,34 +242,41 @@ pub unsafe extern "C" fn pc_aead_encrypt(
             }
             aead_id::AES128_CCM => {
                 let key = KeyBuf::<16>(k.try_into().unwrap());
-                Aes128Ccm::new(Aes128::new(key.r()))
-                    .encrypt(n, a, buf)
-                    .to_vec()
+                match Aes128Ccm::new(Aes128::new(key.r())).try_encrypt(n, a, buf) {
+                    Ok(t) => t.to_vec(),
+                    Err(_) => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES256_CCM => {
                 let key = KeyBuf::<32>(k.try_into().unwrap());
-                Aes256Ccm::new(Aes256::new(key.r()))
-                    .encrypt(n, a, buf)
-                    .to_vec()
+                match Aes256Ccm::new(Aes256::new(key.r())).try_encrypt(n, a, buf) {
+                    Ok(t) => t.to_vec(),
+                    Err(_) => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES128_CCM8 => {
                 let key = KeyBuf::<16>(k.try_into().unwrap());
-                Aes128Ccm8::new(Aes128::new(key.r()))
-                    .encrypt(n, a, buf)
-                    .to_vec()
+                match Aes128Ccm8::new(Aes128::new(key.r())).try_encrypt(n, a, buf) {
+                    Ok(t) => t.to_vec(),
+                    Err(_) => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES256_CCM8 => {
                 let key = KeyBuf::<32>(k.try_into().unwrap());
-                Aes256Ccm8::new(Aes256::new(key.r()))
-                    .encrypt(n, a, buf)
-                    .to_vec()
+                match Aes256Ccm8::new(Aes256::new(key.r())).try_encrypt(n, a, buf) {
+                    Ok(t) => t.to_vec(),
+                    Err(_) => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES128_GCM_SIV | aead_id::AES256_GCM_SIV => {
                 let nonce: [u8; 12] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                AesGcmSiv::new(k).encrypt(&nonce, a, buf).to_vec()
+                let Ok(siv) = AesGcmSiv::try_new(k) else {
+                    return PcStatus::Unsupported;
+                };
+                siv.encrypt(&nonce, a, buf).to_vec()
             }
             aead_id::XCHACHA20_POLY1305 => {
                 let key = KeyBuf::<32>(k.try_into().unwrap());
@@ -329,11 +359,10 @@ pub unsafe extern "C" fn pc_aead_decrypt(
         }
         // AES-SIV: input is `V ‖ ciphertext`; the `nonce` argument is the AD.
         if is_siv(alg) {
-            let res = match alg {
-                aead_id::AES128_SIV | aead_id::AES256_SIV => AesSiv::new(k).open(&[n], blob),
-                _ => unreachable!(),
+            let Ok(siv) = AesSiv::try_new(k) else {
+                return PcStatus::Unsupported;
             };
-            return match res {
+            return match siv.try_open(&[n], blob) {
                 Ok(mut pt_bytes) => {
                     let st = unsafe { out_write(&pt_bytes, pt, pt_len) };
                     // Scrub the recovered plaintext before its backing
@@ -342,7 +371,8 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                     wipe_vec(&mut pt_bytes);
                     st
                 }
-                Err(_) => PcStatus::Verification,
+                Err(AeadError::TagMismatch) => PcStatus::Verification,
+                Err(_) => PcStatus::Unsupported,
             };
         }
         let tag_size = aead_tag_size(alg);
@@ -353,24 +383,22 @@ pub unsafe extern "C" fn pc_aead_decrypt(
         let mut buf: Vec<u8> = ct.to_vec();
         let ok = match alg {
             aead_id::AES128_GCM => {
-                if n.is_empty() {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<16>(k.try_into().unwrap());
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aes128Gcm::new(Aes128::new(key.r()))
-                    .decrypt(n, a, &mut buf, &t)
-                    .is_ok()
+                let res = Aes128Gcm::new(Aes128::new(key.r())).try_decrypt(n, a, &mut buf, &t);
+                match decrypt_ok(res) {
+                    Some(ok) => ok,
+                    None => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES256_GCM => {
-                if n.is_empty() {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<32>(k.try_into().unwrap());
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aes256Gcm::new(Aes256::new(key.r()))
-                    .decrypt(n, a, &mut buf, &t)
-                    .is_ok()
+                let res = Aes256Gcm::new(Aes256::new(key.r())).try_decrypt(n, a, &mut buf, &t);
+                match decrypt_ok(res) {
+                    Some(ok) => ok,
+                    None => return PcStatus::Unsupported,
+                }
             }
             aead_id::CHACHA20_POLY1305 => {
                 let key = KeyBuf::<32>(k.try_into().unwrap());
@@ -384,44 +412,40 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                     .is_ok()
             }
             aead_id::AES128_CCM => {
-                if !(7..=13).contains(&n.len()) {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<16>(k.try_into().unwrap());
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aes128Ccm::new(Aes128::new(key.r()))
-                    .decrypt(n, a, &mut buf, &t)
-                    .is_ok()
+                let res = Aes128Ccm::new(Aes128::new(key.r())).try_decrypt(n, a, &mut buf, &t);
+                match decrypt_ok(res) {
+                    Some(ok) => ok,
+                    None => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES256_CCM => {
-                if !(7..=13).contains(&n.len()) {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<32>(k.try_into().unwrap());
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aes256Ccm::new(Aes256::new(key.r()))
-                    .decrypt(n, a, &mut buf, &t)
-                    .is_ok()
+                let res = Aes256Ccm::new(Aes256::new(key.r())).try_decrypt(n, a, &mut buf, &t);
+                match decrypt_ok(res) {
+                    Some(ok) => ok,
+                    None => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES128_CCM8 => {
-                if !(7..=13).contains(&n.len()) {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<16>(k.try_into().unwrap());
                 let t: [u8; 8] = tag.try_into().unwrap();
-                Aes128Ccm8::new(Aes128::new(key.r()))
-                    .decrypt(n, a, &mut buf, &t)
-                    .is_ok()
+                let res = Aes128Ccm8::new(Aes128::new(key.r())).try_decrypt(n, a, &mut buf, &t);
+                match decrypt_ok(res) {
+                    Some(ok) => ok,
+                    None => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES256_CCM8 => {
-                if !(7..=13).contains(&n.len()) {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<32>(k.try_into().unwrap());
                 let t: [u8; 8] = tag.try_into().unwrap();
-                Aes256Ccm8::new(Aes256::new(key.r()))
-                    .decrypt(n, a, &mut buf, &t)
-                    .is_ok()
+                let res = Aes256Ccm8::new(Aes256::new(key.r())).try_decrypt(n, a, &mut buf, &t);
+                match decrypt_ok(res) {
+                    Some(ok) => ok,
+                    None => return PcStatus::Unsupported,
+                }
             }
             aead_id::AES128_GCM_SIV | aead_id::AES256_GCM_SIV => {
                 let nonce: [u8; 12] = match n.try_into() {
@@ -429,7 +453,10 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                     Err(_) => return PcStatus::Unsupported,
                 };
                 let t: [u8; 16] = tag.try_into().unwrap();
-                AesGcmSiv::new(k).decrypt(&nonce, a, &mut buf, &t).is_ok()
+                let Ok(siv) = AesGcmSiv::try_new(k) else {
+                    return PcStatus::Unsupported;
+                };
+                siv.decrypt(&nonce, a, &mut buf, &t).is_ok()
             }
             aead_id::XCHACHA20_POLY1305 => {
                 let key = KeyBuf::<32>(k.try_into().unwrap());
