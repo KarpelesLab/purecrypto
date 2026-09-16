@@ -35,9 +35,9 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use crate::quic::connection::{ERROR_FINAL_SIZE, ERROR_FLOW_CONTROL, Role};
+use crate::quic::connection::Role;
 use crate::quic::frame::{Frame, StreamDir};
-use crate::quic::stream::{RecvState, SendState, Stream, StreamId};
+use crate::quic::stream::{RecvState, SendState, Stream, StreamError, StreamId};
 use crate::quic::transport_params::TransportParameters;
 use crate::quic::varint;
 use crate::tls::Error;
@@ -344,12 +344,6 @@ pub(crate) struct Streams {
     pub(crate) self_initial_max_stream_data_uni: u64,
 
     pub(crate) role: Role,
-
-    /// RFC 9000 §20.1 transport error code for the most recent rejection —
-    /// `FLOW_CONTROL_ERROR`, `FINAL_SIZE_ERROR` — taken by the connection's
-    /// frame dispatcher so the CONNECTION_CLOSE it sends names the actual
-    /// violation instead of a blanket PROTOCOL_VIOLATION.
-    pub(crate) last_error_code: Option<u64>,
 }
 
 impl Streams {
@@ -417,15 +411,7 @@ impl Streams {
                 .unwrap_or(0),
             self_initial_max_stream_data_uni: our_params.initial_max_stream_data_uni.unwrap_or(0),
             role,
-            last_error_code: None,
         }
-    }
-
-    /// Takes the RFC 9000 §20.1 transport error code recorded for the most
-    /// recent rejection, if any. Consumed by the connection's frame
-    /// dispatcher when a stream frame is refused.
-    pub(crate) fn take_error_code(&mut self) -> Option<u64> {
-        self.last_error_code.take()
     }
 
     /// Mark `id` as ready to send. No-op if already queued.
@@ -704,14 +690,15 @@ impl Streams {
     // Inbound side — dispatched from connection's frame handler.
     // ====================================================================
 
-    /// Inbound STREAM frame.
+    /// Inbound STREAM frame. A rejection names the RFC 9000 §20.1 code the
+    /// connection must close with.
     pub(crate) fn on_stream(
         &mut self,
         id: u64,
         offset: u64,
         fin: bool,
         data: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<(), StreamError> {
         // RFC 9000 §4.6 — admit the stream (and enforce STREAM_LIMIT)
         // BEFORE charging any connection-level flow-control credit. A
         // peer probing unknown stream IDs above its advertised limit
@@ -732,7 +719,7 @@ impl Streams {
             let end = offset.saturating_add(data.len() as u64);
             let high = self.stream_high_offset.get(&id).copied().unwrap_or(0);
             if end > high {
-                return Err(Error::Decode);
+                return Err(StreamError::FinalSize);
             }
             return Ok(());
         }
@@ -752,9 +739,8 @@ impl Streams {
             // peer's MAX_DATA is rejected before we mutate any state.
             let projected = self.conn_recv_used.saturating_add(new_high);
             if projected > self.conn_recv_max {
-                // FLOW_CONTROL_ERROR equivalent (RFC 9000 §11.2).
-                self.last_error_code = Some(ERROR_FLOW_CONTROL);
-                return Err(Error::Decode);
+                // RFC 9000 §4.1 — FLOW_CONTROL_ERROR.
+                return Err(StreamError::FlowControl);
             }
             Some(projected)
         } else {
@@ -762,7 +748,9 @@ impl Streams {
         };
 
         let stream = self.map.get_mut(&id).expect("just-ensured");
-        let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
+        // RFC 9000 §19.8 — STREAM on a send-only (locally-initiated
+        // unidirectional) stream is a STREAM_STATE_ERROR.
+        let recv = stream.recv.as_mut().ok_or(StreamError::StreamState)?;
         // We no longer use the contig-progress return value at the
         // connection level — the QUIC-3 fix above already charged
         // conn-level credit against the high-water mark. The per-stream
@@ -773,20 +761,15 @@ impl Streams {
         // final-size violation) is a connection error, but until the caller
         // acts on that the counters must not be left perturbed by a frame
         // that was never applied.
-        let on_data = recv.on_data(offset, data, fin);
-        if on_data.is_err() {
-            // RFC 9000 §4.5 / §4.1 — `on_data` recorded whether this was a
-            // final-size or a flow-control violation.
-            let code = recv.last_error_code.take();
-            self.last_error_code = code;
-            return on_data.map(|_| ());
-        }
+        // RFC 9000 §4.5 / §4.1 — `on_data` reports a per-stream flow-control
+        // or final-size violation as such.
+        recv.on_data(offset, data, fin)?;
         if let Some(projected) = projected {
             self.conn_recv_used = projected;
             self.stream_high_offset.insert(id, end);
         }
         let stream = self.map.get_mut(&id).expect("just-ensured");
-        let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
+        let recv = stream.recv.as_mut().ok_or(StreamError::StreamState)?;
         // L-3: if we have already sent STOP_SENDING on this stream,
         // `on_data` silently DROPS the payload (returns Ok(0)) — but the
         // high-water bytes (`new_high`) were just charged to
@@ -838,13 +821,14 @@ impl Streams {
         }
     }
 
-    /// Inbound RESET_STREAM.
+    /// Inbound RESET_STREAM. A rejection names the RFC 9000 §20.1 code the
+    /// connection must close with.
     pub(crate) fn on_reset(
         &mut self,
         id: u64,
         app_error: u64,
         final_size: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<(), StreamError> {
         if !self.ensure_remote_stream_exists(id)? {
             // Retired stream (QUIC-A2): a duplicate or late RESET_STREAM
             // for a stream that already reached a terminal state carries
@@ -860,24 +844,20 @@ impl Streams {
         if final_size < prev_high {
             // FINAL_SIZE_ERROR — final size below an offset already
             // observed on the stream (RFC 9000 §4.5).
-            self.last_error_code = Some(ERROR_FINAL_SIZE);
-            return Err(Error::Decode);
+            return Err(StreamError::FinalSize);
         }
         let new_high = final_size - prev_high;
         let projected = self.conn_recv_used.saturating_add(new_high);
         if projected > self.conn_recv_max {
-            // FLOW_CONTROL_ERROR (RFC 9000 §11.2).
-            self.last_error_code = Some(ERROR_FLOW_CONTROL);
-            return Err(Error::Decode);
+            // FLOW_CONTROL_ERROR (RFC 9000 §4.1).
+            return Err(StreamError::FlowControl);
         }
         let stream = self.map.get_mut(&id).expect("just-ensured");
-        let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
+        // RFC 9000 §19.4 — RESET_STREAM on a send-only stream is a
+        // STREAM_STATE_ERROR.
+        let recv = stream.recv.as_mut().ok_or(StreamError::StreamState)?;
         let already_reset = matches!(recv.state, RecvState::ResetRecvd | RecvState::ResetRead);
-        if let Err(e) = recv.on_reset(app_error, final_size) {
-            let code = recv.last_error_code.take();
-            self.last_error_code = code;
-            return Err(e);
-        }
+        recv.on_reset(app_error, final_size)?;
         // The application will never read the discarded remainder of
         // the stream; count it as consumed exactly once, so the
         // connection-level window does not leak. Credit only the bytes
@@ -909,7 +889,7 @@ impl Streams {
 
     /// Inbound STOP_SENDING. RFC 9000 §3.5: triggers us to RESET_STREAM
     /// our own send side with the same application error code.
-    pub(crate) fn on_stop_sending(&mut self, id: u64, app_error: u64) -> Result<(), Error> {
+    pub(crate) fn on_stop_sending(&mut self, id: u64, app_error: u64) -> Result<(), StreamError> {
         // RFC 9000 §19.5: STOP_SENDING targets our send half. A peer-initiated
         // unidirectional stream has no local send half, so such a frame is a
         // STREAM_STATE_ERROR. Reject it BEFORE lazily instantiating any state,
@@ -929,7 +909,7 @@ impl Streams {
         let stream = self.map.get_mut(&id).expect("just-ensured");
         // RFC 9000 §19.5: receiving STOP_SENDING for a receive-only stream
         // is a STREAM_STATE_ERROR.
-        let send = stream.send.as_mut().ok_or(Error::InappropriateState)?;
+        let send = stream.send.as_mut().ok_or(StreamError::StreamState)?;
         send.enter_reset(app_error);
         self.enqueue_ready(id);
         Ok(())
@@ -950,7 +930,7 @@ impl Streams {
     }
 
     /// Inbound MAX_STREAM_DATA.
-    pub(crate) fn on_max_stream_data(&mut self, id: u64, limit: u64) -> Result<(), Error> {
+    pub(crate) fn on_max_stream_data(&mut self, id: u64, limit: u64) -> Result<(), StreamError> {
         // RFC 9000 §19.10: MAX_STREAM_DATA grants credit to our send half. A
         // peer-initiated unidirectional stream has no local send half, so such
         // a frame is a STREAM_STATE_ERROR. Reject it BEFORE lazily creating any
@@ -971,7 +951,7 @@ impl Streams {
         let stream = self.map.get_mut(&id).expect("just-ensured");
         // RFC 9000 §19.10: receiving MAX_STREAM_DATA on a recv-only
         // stream is a STREAM_STATE_ERROR.
-        let send = stream.send.as_mut().ok_or(Error::InappropriateState)?;
+        let send = stream.send.as_mut().ok_or(StreamError::StreamState)?;
         if limit > send.peer_max_data {
             send.peer_max_data = limit;
             if let Some(prev) = send.blocked_at
@@ -996,7 +976,11 @@ impl Streams {
 
     /// Inbound STREAM_DATA_BLOCKED — same recovery as
     /// [`Self::on_data_blocked`], at the stream level.
-    pub(crate) fn on_stream_data_blocked(&mut self, id: u64, limit: u64) -> Result<(), Error> {
+    pub(crate) fn on_stream_data_blocked(
+        &mut self,
+        id: u64,
+        limit: u64,
+    ) -> Result<(), StreamError> {
         if let Some(stream) = self.map.get_mut(&id)
             && let Some(recv) = stream.recv.as_mut()
             && recv.max_data > limit
@@ -1439,7 +1423,7 @@ impl Streams {
     /// protocol violation can never lazily create a recv-only stream, advance
     /// `peer_uni_used`, or queue MAX_STREAMS as a side effect. Locally-opened
     /// and bidirectional ids fall through to the normal handler path.
-    fn reject_send_half_frame_on_peer_uni(&self, id: u64) -> Result<(), Error> {
+    fn reject_send_half_frame_on_peer_uni(&self, id: u64) -> Result<(), StreamError> {
         let sid = StreamId(id);
         if !sid.is_uni() {
             return Ok(());
@@ -1450,7 +1434,7 @@ impl Streams {
         };
         if peer_initiated {
             // No local send half exists, nor will one ever — reject.
-            return Err(Error::InappropriateState);
+            return Err(StreamError::StreamState);
         }
         Ok(())
     }
@@ -1583,7 +1567,7 @@ impl Streams {
     /// Returns `Ok(true)` when `id` is live in [`Self::map`] afterwards and
     /// `Ok(false)` when it names an ALREADY-RETIRED stream, in which case
     /// the caller must ignore the frame rather than act on it.
-    fn ensure_remote_stream_exists(&mut self, id: u64) -> Result<bool, Error> {
+    fn ensure_remote_stream_exists(&mut self, id: u64) -> Result<bool, StreamError> {
         if self.map.contains_key(&id) {
             return Ok(true);
         }
@@ -1593,7 +1577,7 @@ impl Streams {
         if !self.is_peer_initiated(sid) {
             // Peer is referencing a stream we should have opened — but
             // didn't. Per RFC 9000 §19.8 this is STREAM_STATE_ERROR.
-            return Err(Error::Decode);
+            return Err(StreamError::StreamState);
         }
         if self.stream_high_offset.contains_key(&id) {
             // Retired by `reap_if_terminal`, not new.
@@ -1602,7 +1586,7 @@ impl Streams {
         // QUIC-A2 — hard ceiling on live stream state, independent of the
         // per-direction stream limits below.
         if self.map.len() >= self.live_stream_cap() {
-            return Err(Error::Decode); // STREAM_LIMIT_ERROR
+            return Err(StreamError::StreamLimit);
         }
         // Stream-limit check (RFC 9000 §4.6).
         if sid.is_bidi() {
@@ -1611,7 +1595,7 @@ impl Streams {
             // count of streams the peer has opened.
             let used = self.peer_bidi_used.max((id / 4) + 1);
             if used > self.self_max_bidi {
-                return Err(Error::Decode); // STREAM_LIMIT_ERROR
+                return Err(StreamError::StreamLimit);
             }
             self.peer_bidi_used = used;
             let peer_max_data = self.peer_initial_max_stream_data_bidi_local;
@@ -1621,7 +1605,7 @@ impl Streams {
         } else {
             let used = self.peer_uni_used.max((id / 4) + 1);
             if used > self.self_max_uni {
-                return Err(Error::Decode);
+                return Err(StreamError::StreamLimit);
             }
             self.peer_uni_used = used;
             let self_max_data = self.self_initial_max_stream_data_uni;
@@ -2360,7 +2344,7 @@ mod tests {
 
     /// If a STREAM frame's high-water advance would push
     /// `conn_recv_used` above `conn_recv_max`, the frame must be
-    /// rejected with a FLOW_CONTROL_ERROR-mapping `Error::Decode`.
+    /// rejected as a FLOW_CONTROL_ERROR.
     #[test]
     fn quic3_conn_fc_overflow_rejects_frame() {
         let our = TransportParameters {
@@ -2405,7 +2389,10 @@ mod tests {
         let mut s = Streams::new(Role::Server, &our, &peer);
         let before = s.conn_recv_used;
         // 100 bytes blows the 16-byte per-stream window.
-        assert!(s.on_stream(0, 0, false, &[0u8; 100]).is_err());
+        assert_eq!(
+            s.on_stream(0, 0, false, &[0u8; 100]),
+            Err(StreamError::FlowControl)
+        );
         assert_eq!(
             s.conn_recv_used, before,
             "a rejected frame must not charge connection-level credit"
@@ -2414,18 +2401,17 @@ mod tests {
             !s.stream_high_offset.contains_key(&0),
             "nor move the stream's high-water mark"
         );
-        assert_eq!(s.take_error_code(), Some(ERROR_FLOW_CONTROL));
 
         // Same for a final-size violation.
         let mut s = Streams::new(Role::Server, &our, &peer);
         s.on_stream(0, 0, false, &[0u8; 8]).expect("in-window data");
         let before = s.conn_recv_used;
-        assert!(
-            s.on_stream(0, 0, true, &[0u8; 2]).is_err(),
+        assert_eq!(
+            s.on_stream(0, 0, true, &[0u8; 2]),
+            Err(StreamError::FinalSize),
             "a FIN below data already received is a FINAL_SIZE_ERROR"
         );
         assert_eq!(s.conn_recv_used, before);
-        assert_eq!(s.take_error_code(), Some(ERROR_FINAL_SIZE));
     }
 
     /// A STREAM frame on a peer-initiated stream ID that exceeds the
@@ -2450,7 +2436,11 @@ mod tests {
         let mut s = Streams::new(Role::Server, &our, &peer);
         let before = s.conn_recv_used;
         let err = s.on_stream(4, 0, false, &[0u8; 100]);
-        assert!(err.is_err(), "must reject stream over STREAM_LIMIT");
+        assert_eq!(
+            err,
+            Err(StreamError::StreamLimit),
+            "must reject stream over STREAM_LIMIT"
+        );
         assert_eq!(s.conn_recv_used, before, "conn FC must not be charged");
         assert!(
             !s.stream_high_offset.contains_key(&4),

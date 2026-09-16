@@ -96,7 +96,7 @@ use crate::quic::server::{
     build_pending_endpoint, build_tls_engine as build_server_engine, initial_rx_keys,
     install_initial_keys, random_default_scid, set_cids_from_first_initial,
 };
-use crate::quic::stream::StreamId;
+use crate::quic::stream::{StreamError, StreamId};
 use crate::quic::streams::Streams;
 use crate::quic::tls_glue::HookHandle;
 use crate::quic::transport_params::{PreferredAddress, TransportParameters};
@@ -442,6 +442,10 @@ const ERROR_APPLICATION_ERROR: u64 = 0x0c;
 
 /// RFC 9000 §20.1 — `FLOW_CONTROL_ERROR`.
 pub(crate) const ERROR_FLOW_CONTROL: u64 = 0x03;
+/// RFC 9000 §20.1 — `STREAM_LIMIT_ERROR`.
+pub(crate) const ERROR_STREAM_LIMIT: u64 = 0x04;
+/// RFC 9000 §20.1 — `STREAM_STATE_ERROR`.
+pub(crate) const ERROR_STREAM_STATE: u64 = 0x05;
 /// RFC 9000 §20.1 — `FINAL_SIZE_ERROR`.
 pub(crate) const ERROR_FINAL_SIZE: u64 = 0x06;
 /// RFC 9000 §20.1 — `FRAME_ENCODING_ERROR`.
@@ -5077,6 +5081,13 @@ impl QuicConnection {
         Ok(datagram.len())
     }
 
+    /// A stream-layer rejection: record the RFC 9000 §20.1 code it names so
+    /// the CONNECTION_CLOSE carries it, and hand back the error to propagate.
+    fn stream_error(&mut self, e: StreamError) -> Error {
+        self.pending_error_code = Some(e.code());
+        e.into()
+    }
+
     /// Parse frames from a decrypted packet payload and apply them.
     fn dispatch_frames(&mut self, level: Level, pn: u64, payload: &[u8]) -> Result<(), Error> {
         let mut ack_eliciting = false;
@@ -5361,12 +5372,11 @@ impl QuicConnection {
                         None => Ok(()),
                     };
                     if let Err(e) = result {
-                        // RFC 9000 §4.1 / §4.5 — report the violation the
-                        // stream layer identified (FLOW_CONTROL_ERROR,
-                        // FINAL_SIZE_ERROR) rather than a blanket code.
-                        self.pending_error_code =
-                            self.streams.as_mut().and_then(|s| s.take_error_code());
-                        return Err(e);
+                        // RFC 9000 §20.1 — close with the code the stream
+                        // layer identified (FLOW_CONTROL_ERROR,
+                        // STREAM_LIMIT_ERROR, STREAM_STATE_ERROR,
+                        // FINAL_SIZE_ERROR) rather than a blanket one.
+                        return Err(self.stream_error(e));
                     }
                 }
                 Frame::ResetStream {
@@ -5380,15 +5390,17 @@ impl QuicConnection {
                         None => Ok(()),
                     };
                     if let Err(e) = result {
-                        self.pending_error_code =
-                            self.streams.as_mut().and_then(|s| s.take_error_code());
-                        return Err(e);
+                        return Err(self.stream_error(e));
                     }
                 }
                 Frame::StopSending { id, code } => {
                     ack_eliciting = true;
-                    if let Some(streams) = self.streams.as_mut() {
-                        streams.on_stop_sending(id, code)?;
+                    let result = match self.streams.as_mut() {
+                        Some(streams) => streams.on_stop_sending(id, code),
+                        None => Ok(()),
+                    };
+                    if let Err(e) = result {
+                        return Err(self.stream_error(e));
                     }
                 }
                 Frame::MaxData(v) => {
@@ -5399,8 +5411,12 @@ impl QuicConnection {
                 }
                 Frame::MaxStreamData { id, limit } => {
                     ack_eliciting = true;
-                    if let Some(streams) = self.streams.as_mut() {
-                        streams.on_max_stream_data(id, limit)?;
+                    let result = match self.streams.as_mut() {
+                        Some(streams) => streams.on_max_stream_data(id, limit),
+                        None => Ok(()),
+                    };
+                    if let Err(e) = result {
+                        return Err(self.stream_error(e));
                     }
                 }
                 Frame::MaxStreams { dir, limit } => {
@@ -5417,8 +5433,12 @@ impl QuicConnection {
                 }
                 Frame::StreamDataBlocked { id, limit } => {
                     ack_eliciting = true;
-                    if let Some(streams) = self.streams.as_mut() {
-                        streams.on_stream_data_blocked(id, limit)?;
+                    let result = match self.streams.as_mut() {
+                        Some(streams) => streams.on_stream_data_blocked(id, limit),
+                        None => Ok(()),
+                    };
+                    if let Err(e) = result {
+                        return Err(self.stream_error(e));
                     }
                 }
                 Frame::StreamsBlocked { dir, limit } => {
@@ -13761,5 +13781,131 @@ mod tests {
             s.endpoint.loss.loss_detection_timer.is_some(),
             "re-armed once the budget allows a probe"
         );
+    }
+
+    /// RFC 9000 §4.6 / §20.1 — a peer that opens a stream beyond the limit
+    /// we advertised is closed with STREAM_LIMIT_ERROR (0x04), end to end:
+    /// the CONNECTION_CLOSE the server queues names that code, not a generic
+    /// FRAME_ENCODING_ERROR.
+    #[test]
+    fn stream_beyond_max_streams_closes_with_stream_limit_error() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        let addr = ip4(192, 0, 2, 1, 1111);
+        quiesce(&mut c, &mut s, addr);
+        // The server allows 100 client-initiated bidirectional streams
+        // (ids 0..=396). Let the client misbehave: pretend it was granted
+        // more and open the 101st (id 400).
+        let streams = c.streams.as_mut().expect("streams");
+        streams.peer_max_bidi = 1000;
+        let mut last = c.open_bidi().expect("open");
+        for _ in 0..100 {
+            last = c.open_bidi().expect("open");
+        }
+        assert_eq!(last.value(), 400);
+        c.write(last, b"too many").expect("write");
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        let err = s.feed_datagram(&dg).unwrap_err();
+        assert!(matches!(err, Error::Decode), "{err:?}");
+        assert!(s.is_closing());
+        let info = s.close_info().expect("closing");
+        assert_eq!(info.kind, CloseKind::Transport);
+        assert_eq!(info.error_code, ERROR_STREAM_LIMIT);
+        // The CONNECTION_CLOSE on the wire carries the same code.
+        let close = s.pop_datagram();
+        assert!(!close.is_empty());
+        c.feed_datagram(&close).expect("client feed close");
+        let seen = c.close_info().expect("peer close");
+        assert_eq!(seen.initiator, CloseInitiator::Peer);
+        assert_eq!(seen.error_code, ERROR_STREAM_LIMIT);
+    }
+
+    /// RFC 9000 §19.10 / §19.5 / §20.1 — MAX_STREAM_DATA (or STOP_SENDING)
+    /// for a stream that has no local send half is STREAM_STATE_ERROR
+    /// (0x05), whether the stream is a peer-initiated unidirectional one or
+    /// a locally-initiated one we never opened.
+    #[test]
+    fn max_stream_data_on_receive_only_stream_is_stream_state_error() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        let addr = ip4(192, 0, 2, 1, 1111);
+        quiesce(&mut c, &mut s, addr);
+        // Stream 2 is a client-initiated unidirectional stream: receive-only
+        // at the server.
+        let mut payload = Vec::new();
+        Frame::MaxStreamData {
+            id: 2,
+            limit: 1 << 20,
+        }
+        .encode(&mut payload);
+        let err = s.dispatch_frames(Level::OneRtt, 100, &payload).unwrap_err();
+        assert!(matches!(err, Error::InappropriateState), "{err:?}");
+        assert_eq!(s.pending_error_code, Some(ERROR_STREAM_STATE));
+
+        let mut payload = Vec::new();
+        Frame::StopSending { id: 2, code: 7 }.encode(&mut payload);
+        let err = s.dispatch_frames(Level::OneRtt, 101, &payload).unwrap_err();
+        assert!(matches!(err, Error::InappropriateState), "{err:?}");
+        assert_eq!(s.pending_error_code, Some(ERROR_STREAM_STATE));
+
+        // A server-initiated bidirectional stream the server never opened
+        // (id 1) cannot be referenced by the client either (§19.8).
+        let mut payload = Vec::new();
+        Frame::Stream {
+            id: 1,
+            offset: 0,
+            fin: false,
+            data: b"?",
+        }
+        .encode(&mut payload);
+        let err = s.dispatch_frames(Level::OneRtt, 102, &payload).unwrap_err();
+        assert!(matches!(err, Error::InappropriateState), "{err:?}");
+        assert_eq!(s.pending_error_code, Some(ERROR_STREAM_STATE));
+    }
+
+    /// RFC 9000 §4.5 / §20.1 — a STREAM frame whose FIN contradicts the
+    /// final size already received is FINAL_SIZE_ERROR (0x06); §4.1 — data
+    /// beyond the stream's flow-control credit is FLOW_CONTROL_ERROR (0x03).
+    #[test]
+    fn conflicting_final_sizes_close_with_final_size_error() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        let addr = ip4(192, 0, 2, 1, 1111);
+        quiesce(&mut c, &mut s, addr);
+        let mut first = Vec::new();
+        Frame::Stream {
+            id: 0,
+            offset: 0,
+            fin: true,
+            data: &[0x11; 10],
+        }
+        .encode(&mut first);
+        s.dispatch_frames(Level::OneRtt, 100, &first)
+            .expect("first FIN accepted");
+        let mut second = Vec::new();
+        Frame::Stream {
+            id: 0,
+            offset: 0,
+            fin: true,
+            data: &[0x11; 20],
+        }
+        .encode(&mut second);
+        let err = s.dispatch_frames(Level::OneRtt, 101, &second).unwrap_err();
+        assert!(matches!(err, Error::Decode), "{err:?}");
+        assert_eq!(s.pending_error_code, Some(ERROR_FINAL_SIZE));
+
+        // Flow control: the server granted 64 KiB per stream.
+        let mut over = Vec::new();
+        Frame::Stream {
+            id: 4,
+            offset: (1 << 16) - 1,
+            fin: false,
+            data: &[0x22; 2],
+        }
+        .encode(&mut over);
+        let err = s.dispatch_frames(Level::OneRtt, 102, &over).unwrap_err();
+        assert!(matches!(err, Error::Decode), "{err:?}");
+        assert_eq!(s.pending_error_code, Some(ERROR_FLOW_CONTROL));
     }
 }
