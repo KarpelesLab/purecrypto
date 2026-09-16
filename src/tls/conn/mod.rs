@@ -10,6 +10,10 @@ mod stream;
 mod ticket12;
 
 pub(crate) use client::ClientConfig;
+// Only the QUIC loopback tests reach the client engine's ECH outcome from
+// outside this module.
+#[cfg(all(test, feature = "ech", feature = "quic"))]
+pub(crate) use client::EchOutcome;
 #[allow(unused_imports)]
 pub(crate) use client::{ClientCertConfig, ClientConnection, ReceivedSessionTicket, StoredSession};
 pub(crate) use client12::ClientConfig12;

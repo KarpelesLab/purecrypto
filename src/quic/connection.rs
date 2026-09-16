@@ -6172,6 +6172,14 @@ impl QuicConnection {
 // the public `tls::Config` so the new_for_quic constructors can consume
 // it. Mirrors the build_tls13_* helpers in tls::connection but inlined
 // here so we don't add a new public API in `tls::`.
+//
+// Keep the two in sync: every `Config` option that is meaningful over
+// QUIC must be copied here too, or it is silently ignored for QUIC
+// connections while honoured for TLS ones. The options deliberately NOT
+// copied are `record_size_limit` (RFC 8449 is a record-layer extension and
+// QUIC has no records), `cipher_suites` / `min_version` (the QUIC engine
+// offers its own fixed TLS 1.3 set; `offer_tls12` stays off), and the
+// DTLS-only cookie settings.
 // ---------------------------------------------------------------------
 
 fn build_client_tls_config(
@@ -6202,7 +6210,27 @@ fn build_client_tls_config(
             cc = cc.with_client_cert(c);
         }
     }
+    cc = cc.with_server_cert_type_preference(cfg.tls.server_cert_type_preference.clone());
+    cc = cc.with_client_cert_type_preference(cfg.tls.client_cert_type_preference.clone());
+    for spki in &cfg.tls.expected_raw_public_keys {
+        cc = cc.add_expected_raw_public_key(spki.clone());
+    }
+    if let Some(spki) = cfg.tls.raw_public_key_spki.clone() {
+        cc = cc.with_client_raw_public_key_spki(spki);
+    }
     cc.key_log = cfg.tls.key_log.clone();
+    // ECH and certificate compression are TLS 1.3 handshake features that
+    // apply to QUIC unchanged (ECH is how HTTP/3 hides its SNI); the engine
+    // handles both identically in QUIC mode, so honour the configuration
+    // instead of dropping it on the floor.
+    #[cfg(feature = "ech")]
+    {
+        cc.ech = cfg.tls.ech.clone();
+    }
+    #[cfg(feature = "cert-compression")]
+    {
+        cc = cc.with_cert_compression_algorithms(cfg.tls.cert_compression_algorithms.clone());
+    }
     // Resumption. The TLS client offers `early_data` in its ClientHello
     // whenever the stored session carries a non-zero `max_early_data_size`,
     // so a caller who resumed without opting into 0-RTT gets the ticket with
@@ -6251,6 +6279,34 @@ fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
         sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
     }
     sc = sc.with_signature_policy(cfg.tls.signature_policy.clone());
+    if let Some(t) = cfg.tls.verification_time.clone() {
+        sc = sc.with_verification_time(t);
+    }
+    if let Some(crl) = cfg.tls.stapled_crl.clone() {
+        sc = sc.with_stapled_crl(crl);
+    }
+    if let Some(ocsp) = cfg.tls.stapled_ocsp_response.clone() {
+        sc = sc.with_stapled_ocsp_response(ocsp);
+    }
+    sc = sc.with_server_cert_type_preference(cfg.tls.server_cert_type_preference.clone());
+    sc = sc.with_client_cert_type_preference(cfg.tls.client_cert_type_preference.clone());
+    if let Some(spki) = cfg.tls.raw_public_key_spki.clone() {
+        sc = sc.with_raw_public_key_spki(spki);
+    }
+    for spki in &cfg.tls.expected_client_raw_public_keys {
+        sc = sc.add_expected_client_raw_public_key(spki.clone());
+    }
+    if let Some(g) = cfg.tls.preferred_key_exchange_group {
+        sc = sc.with_preferred_key_exchange_group(g);
+    }
+    #[cfg(feature = "cert-compression")]
+    {
+        sc = sc.with_cert_compression_algorithms(cfg.tls.cert_compression_algorithms.clone());
+    }
+    #[cfg(feature = "ech")]
+    if let Some(ech) = cfg.tls.ech_server.clone() {
+        sc = sc.with_ech_server(ech);
+    }
     sc.key_log = cfg.tls.key_log.clone();
     // Session resumption. Without a ticket key the server issues no
     // NewSessionTicket at all, so clients can never resume — which is why
@@ -6264,6 +6320,12 @@ fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
         // its own flow control — and any other value is a protocol violation
         // the client must reject.
         sc = sc.with_max_early_data(QUIC_MAX_EARLY_DATA_SIZE);
+        // The TLS-side anti-replay window is the only in-process defence
+        // against a replayed 0-RTT flight (RFC 9001 §9.2); it was silently
+        // dropped here while `Connection::server` honoured it.
+        if let Some(rw) = cfg.tls.replay_window.clone() {
+            sc = sc.with_replay_window(rw);
+        }
     }
     Ok(sc)
 }
@@ -6557,6 +6619,117 @@ mod tests {
         assert!(
             client.pop_datagram().is_empty(),
             "idle close is silent (no CONNECTION_CLOSE on the wire)"
+        );
+    }
+
+    /// ECH configured on the shared `tls::Config` must be honoured over
+    /// QUIC: the client's outer ClientHello carries `public.example`, the
+    /// server decapsulates the inner hello, and the client observes the
+    /// accept confirmation. Before this, `build_client_tls_config` /
+    /// `build_server_tls_config` never copied `ech` / `ech_server`, so a
+    /// QUIC (HTTP/3) client configured for ECH silently sent its SNI in
+    /// the clear.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn quic_loopback_honours_ech_config() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::conn::EchOutcome;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::{EchClient, EchConfigList, EchServer, HpkeSymCipherSuite};
+
+        let (mut server_cfg_tls, cert_der) = ed25519_server();
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"quic-ech-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x33,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let list = EchConfigList::new(alloc::vec![pair.config().clone()]);
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+        server_cfg_tls.ech_server = Some(EchServer::new(ring, list.clone()));
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ech: Some(EchClient::from_config_list(list)),
+            ..Config::default()
+        };
+        let mut client = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut server = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        drive_until_complete(&mut client, &mut server, 8);
+        let EngineSide::Client(engine) = &client.engine else {
+            panic!("client side");
+        };
+        assert_eq!(engine.ech_outcome(), Some(EchOutcome::Accepted));
+    }
+
+    /// RFC 8879 certificate compression configured on the shared
+    /// `tls::Config` is offered and negotiated over QUIC exactly as over
+    /// TLS (the server records the client's zlib offer). Before this the
+    /// QUIC adapters dropped `cert_compression_algorithms`.
+    #[cfg(feature = "cert-compression")]
+    #[test]
+    fn quic_loopback_honours_cert_compression_config() {
+        use crate::tls::cert_compression;
+        let (mut server_cfg_tls, cert_der) = ed25519_server();
+        server_cfg_tls.cert_compression_algorithms = cert_compression::default_algorithms();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            cert_compression_algorithms: cert_compression::default_algorithms(),
+            ..Config::default()
+        };
+        let mut client = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut server = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        drive_until_complete(&mut client, &mut server, 8);
+        let EngineSide::Server(engine) = &server.engine else {
+            panic!("server side");
+        };
+        assert_eq!(
+            engine.peer_cert_compression_algorithms(),
+            &[cert_compression::algorithm::ZLIB]
         );
     }
 
