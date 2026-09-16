@@ -1999,6 +1999,12 @@ impl ClientConnection {
     /// Processes all buffered records, advancing the handshake. On a protocol
     /// error it queues a fatal alert and returns the error.
     pub fn process_new_packets(&mut self) -> Result<(), Error> {
+        // RFC 8446 §6.1: "Any data received after a closure alert has been
+        // received MUST be ignored."
+        if self.received_close_notify {
+            self.core.discard_input();
+            return Ok(());
+        }
         loop {
             match self.core.next_message() {
                 Ok(Some(Incoming::Handshake(msg))) => {
@@ -2040,6 +2046,9 @@ impl ClientConnection {
                         }
                         self.received_close_notify = true;
                         self.state = State::Closed;
+                        // RFC 8446 §6.1: whatever follows the closure alert
+                        // is ignored, including bytes already buffered.
+                        self.core.discard_input();
                         return Ok(());
                     }
                     self.state = State::Closed;

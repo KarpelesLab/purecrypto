@@ -7597,6 +7597,54 @@ mod audit_regression_tests {
         );
     }
 
+    /// RFC 8446 §6.1: "Any data received after a closure alert has been
+    /// received MUST be ignored." Records coalesced behind the peer's
+    /// `close_notify` — or fed after it — used to be decrypted and handed to
+    /// the application, and a handshake message there even produced an
+    /// alert.
+    #[test]
+    fn data_after_close_notify_is_ignored() {
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, mut server) = connected_pair(server_config, cert_der, b"after-close");
+
+        // Server: close_notify, then (illegally) more application data and
+        // a KeyUpdate, all in one flight.
+        server.send_close_notify();
+        server.send_application_data(b"after close").unwrap();
+        server.request_key_update().unwrap();
+        let flight = server.write_tls();
+        client.read_tls(&flight);
+        client.process_new_packets().unwrap();
+        assert!(client.received_close_notify());
+        assert!(
+            client.take_received_plaintext().is_empty(),
+            "data behind close_notify must not reach the application"
+        );
+        assert!(
+            client.write_tls().is_empty(),
+            "nothing behind close_notify may be answered (no KeyUpdate reply, no alert)"
+        );
+
+        // Later bytes are ignored just the same.
+        server.send_application_data(b"still after close").unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert!(client.take_received_plaintext().is_empty());
+        assert!(client.write_tls().is_empty());
+
+        // And symmetrically on the server.
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, mut server) = connected_pair(server_config, cert_der, b"after-close-s");
+        client.send_close_notify();
+        client.send_application_data(b"after close").unwrap();
+        client.read_tls(&[]);
+        server.read_tls(&client.write_tls());
+        server.process_new_packets().unwrap();
+        assert!(server.received_close_notify());
+        assert!(server.take_received_plaintext().is_empty());
+        assert!(server.write_tls().is_empty());
+    }
+
     /// MEDIUM 2(b) — the transcript must stop growing once the handshake is
     /// done. Post-handshake `KeyUpdate` / `NewSessionTicket` bytes are not an
     /// input to any transcript hash, so buffering them let a peer grow our

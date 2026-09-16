@@ -183,6 +183,16 @@ impl ConnectionCore {
         self.inbuf.extend_from_slice(bytes);
     }
 
+    /// Drops every received byte not yet handed to the state machine.
+    /// RFC 8446 §6.1: "Any data received after a closure alert has been
+    /// received MUST be ignored" — the engines call this once the peer's
+    /// `close_notify` has been processed, so records coalesced behind it
+    /// (or fed later) are neither decrypted nor delivered.
+    pub(crate) fn discard_input(&mut self) {
+        self.inbuf.clear();
+        self.hs_pending.clear();
+    }
+
     /// Removes and returns all bytes queued for transmission.
     pub(crate) fn write_tls(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.outbuf)
