@@ -298,17 +298,18 @@ fn poly128_step(k128: u128, acc: &mut u128, m: u128) {
 //  L3-HASH
 // ---------------------------------------------------------------------------
 
-/// Constant-time `x mod (2³⁶ − 5)` for `x < 2⁵⁵`.
+/// Constant-time `x mod (2³⁶ − 5)` for any `x`.
 ///
 /// A `%` on a secret is variable time on many targets (and the hardware
 /// divider's latency is operand-dependent even where it is not a libcall), so
 /// fold instead: `2³⁶ ≡ 5 (mod p36)`, hence `x ≡ (x mod 2³⁶) + 5·(x >> 36)`.
-/// Two folds bring any `x < 2⁵⁵` below `2³⁶ + 5`, and two conditional
-/// subtractions finish the reduction.
+/// Two folds bring any `u64` below `2³⁶ + 5`, and two conditional
+/// subtractions finish the reduction. Used both for the L3-HASH inner product
+/// (`x < 2⁵⁵`) and for reducing the secret L3 key words at setup.
 #[inline]
 fn reduce_p36(x: u64) -> u64 {
     const LOW36: u64 = (1u64 << 36) - 1;
-    // x < 2⁵⁵ ⇒ hi < 2¹⁹ ⇒ r1 < 2³⁶ + 5·2¹⁹ < 2³⁷.
+    // x < 2⁶⁴ ⇒ hi < 2²⁸ ⇒ r1 < 2³⁶ + 5·2²⁸ < 2³⁷.
     let r1 = (x & LOW36) + 5 * (x >> 36);
     // r1 < 2³⁷ ⇒ r2 < 2³⁶ + 5.
     let r2 = (r1 & LOW36) + 5 * (r1 >> 36);
@@ -554,7 +555,9 @@ impl<const ITER: usize> UmacInner<ITER> {
             for (j, slot) in words.iter_mut().enumerate() {
                 let base = i * 64 + j * 8;
                 let raw: [u8; 8] = l3k1_buf[base..base + 8].try_into().unwrap();
-                *slot = u64::from_be_bytes(raw) % P36;
+                // Key material: reduce by folding, not with `%` (see
+                // `reduce_p36` for why a division on a secret is avoided).
+                *slot = reduce_p36(u64::from_be_bytes(raw));
             }
         }
 
@@ -1134,11 +1137,24 @@ mod tests {
                 "poly128 rand m={m128:#x}"
             );
 
-            // L3-HASH inputs are < 2⁵⁵.
+            // L3-HASH inputs are < 2⁵⁵; the L3 key words use the full range.
             let x = next() >> 9;
             assert_eq!(reduce_p36(x), x % P36, "reduce_p36 x={x:#x}");
+            let x = next();
+            assert_eq!(reduce_p36(x), x % P36, "reduce_p36 full-range x={x:#x}");
         }
-        for &x in &[0u64, 1, P36 - 1, P36, P36 + 1, 1 << 36, (1u64 << 55) - 1] {
+        for &x in &[
+            0u64,
+            1,
+            P36 - 1,
+            P36,
+            P36 + 1,
+            1 << 36,
+            (1u64 << 55) - 1,
+            1 << 55,
+            u64::MAX - P36,
+            u64::MAX,
+        ] {
             assert_eq!(reduce_p36(x), x % P36, "reduce_p36 edge x={x:#x}");
         }
     }
