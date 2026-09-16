@@ -395,6 +395,131 @@ mod tests {
         );
     }
 
+    /// X.690 §8.1.3 / §10.1: the only length forms DER permits are the short
+    /// form and a minimal definite long form. Everything else — the
+    /// indefinite marker `0x80`, the reserved `0xFF`, more length octets than
+    /// `usize` can hold, and a length that overruns the enclosing element —
+    /// must be an error, never a panic or a silent re-slice.
+    #[test]
+    fn rejects_indefinite_reserved_and_oversized_lengths() {
+        // Indefinite form (BER only).
+        assert_eq!(
+            Reader::new(&[0x30, 0x80, 0x00, 0x00])
+                .read_sequence()
+                .map(|_| ()),
+            Err(Error::InvalidLength)
+        );
+        // 0xFF is reserved for future extension.
+        assert_eq!(
+            Reader::new(&[0x04, 0xff, 0x00]).read_octet_string(),
+            Err(Error::InvalidLength)
+        );
+        // Nine length octets never fit a usize.
+        assert_eq!(
+            Reader::new(&[0x04, 0x89, 1, 2, 3, 4, 5, 6, 7, 8, 9]).read_octet_string(),
+            Err(Error::InvalidLength)
+        );
+        // Four length octets encoding 2^32 − 1: representable (on every
+        // target), but far past the end of the input — no overflow, just
+        // truncation.
+        assert_eq!(
+            Reader::new(&[0x04, 0x84, 0xff, 0xff, 0xff, 0xff, 0x00]).read_octet_string(),
+            Err(Error::Truncated)
+        );
+        // Eight length octets of 0xFF: either too wide for the target's
+        // usize (32-bit) or a length beyond the buffer (64-bit); both are
+        // errors and neither wraps.
+        let huge = [0x04, 0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(matches!(
+            Reader::new(&huge).read_octet_string(),
+            Err(Error::InvalidLength) | Err(Error::Truncated)
+        ));
+        // An inner element may not extend past its enclosing SEQUENCE: the
+        // OCTET STRING claims 5 octets, the SEQUENCE only holds 3.
+        let mut inner = Reader::new(&[0x30, 0x03, 0x04, 0x05, 0x00, 0x00, 0x00])
+            .read_sequence()
+            .unwrap();
+        assert_eq!(inner.read_octet_string(), Err(Error::Truncated));
+    }
+
+    /// X.690 §8.3 (INTEGER), §8.2 / §11.1 (BOOLEAN), §8.8 (NULL), §8.6 (BIT
+    /// STRING) canonical-form rules on the strict readers.
+    #[test]
+    fn rejects_non_canonical_primitive_values() {
+        // INTEGER: empty, negative, and non-minimal leading zero all fail the
+        // unsigned reader; a needed leading zero and plain zero pass.
+        for bad in [
+            &[0x02u8, 0x00][..],
+            &[0x02, 0x01, 0x80],
+            &[0x02, 0x02, 0x00, 0x7f],
+        ] {
+            assert_eq!(
+                Reader::new(bad).read_unsigned_integer_bytes(),
+                Err(Error::Malformed),
+                "{bad:02x?}"
+            );
+        }
+        assert_eq!(
+            Reader::new(&[0x02, 0x02, 0x00, 0x80])
+                .read_unsigned_integer_bytes()
+                .unwrap(),
+            &[0x00, 0x80]
+        );
+        assert_eq!(
+            Reader::new(&[0x02, 0x01, 0x00])
+                .read_unsigned_integer_bytes()
+                .unwrap(),
+            &[0x00]
+        );
+        // BOOLEAN: DER TRUE is exactly 0xFF; any other non-zero octet, or a
+        // multi-octet body, is rejected.
+        assert_eq!(Reader::new(&[0x01, 0x01, 0xff]).read_boolean(), Ok(true));
+        assert_eq!(Reader::new(&[0x01, 0x01, 0x00]).read_boolean(), Ok(false));
+        for bad in [
+            &[0x01u8, 0x01, 0x01][..],
+            &[0x01, 0x02, 0x00, 0x00],
+            &[0x01, 0x00],
+        ] {
+            assert_eq!(
+                Reader::new(bad).read_boolean(),
+                Err(Error::Malformed),
+                "{bad:02x?}"
+            );
+        }
+        // NULL carries no content.
+        assert_eq!(
+            Reader::new(&[0x05, 0x01, 0x00]).read_null(),
+            Err(Error::Malformed)
+        );
+        // BIT STRING: the unused-bits octet is mandatory, and this reader only
+        // accepts zero unused bits (all key / signature uses).
+        assert_eq!(
+            Reader::new(&[0x03, 0x00]).read_bit_string(),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            Reader::new(&[0x03, 0x02, 0x01, 0xfe]).read_bit_string(),
+            Err(Error::Malformed)
+        );
+    }
+
+    /// `parse_oid` must refuse a sub-identifier that does not fit `u64`
+    /// rather than wrapping, and still accept `u64::MAX` itself.
+    #[test]
+    fn oid_arc_overflow_is_rejected() {
+        // 2^64 in base-128 is `2` followed by nine zero groups: 10 octets.
+        let two_pow_64 = [
+            0x2a, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
+        ];
+        assert_eq!(parse_oid(&two_pow_64), Err(Error::Malformed));
+        // 2^64 − 1 is `1` followed by nine all-ones groups: exactly u64::MAX.
+        let max = [
+            0x2a, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+        ];
+        assert_eq!(parse_oid(&max).unwrap(), vec![1, 2, u64::MAX]);
+        assert_eq!(encode_oid_arcs(&[1, 2, u64::MAX]), max);
+    }
+
     #[test]
     fn rejects_malformed() {
         // Truncated: claims 5 bytes but only 2 follow.
