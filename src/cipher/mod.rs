@@ -217,3 +217,56 @@ impl core::fmt::Display for TagMismatch {
 }
 
 impl core::error::Error for TagMismatch {}
+
+/// Error returned by the fallible AEAD entry points (`try_new`,
+/// `try_encrypt`, `try_decrypt`, `try_seal`, `try_open`) when a
+/// caller-supplied parameter is outside what the mode accepts.
+///
+/// The infallible forms (`new`, `encrypt`, `decrypt`, …) panic on the same
+/// conditions; the fallible twins exist so callers that take key, nonce or
+/// input lengths from untrusted input can reject them without a panic guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AeadError {
+    /// The key length does not select any variant of the mode (e.g. AES-SIV
+    /// needs 32 or 64 bytes, AES-GCM-SIV 16 or 32).
+    InvalidKeyLength,
+    /// The nonce length is outside the mode's permitted range (e.g. empty
+    /// for AES-GCM, outside `7..=13` bytes for AES-CCM).
+    InvalidNonceLength,
+    /// The tag length is not one the mode defines (AES-CCM: 4, 6, 8, 10,
+    /// 12, 14 or 16 bytes).
+    InvalidTagLength,
+    /// The plaintext / ciphertext or associated data exceeds the mode's
+    /// standardised maximum (e.g. the per-nonce CCM payload cap, or GCM's
+    /// `2^39 − 256` bits).
+    InputTooLong,
+    /// More associated-data components than the mode can bind (AES-SIV:
+    /// [`AesSiv::MAX_ASSOCIATED_DATA`]).
+    TooManyAssociatedData,
+    /// The authentication tag did not verify; the ciphertext is inauthentic.
+    TagMismatch,
+}
+
+impl core::fmt::Display for AeadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AeadError::InvalidKeyLength => f.write_str("AEAD key length not supported"),
+            AeadError::InvalidNonceLength => f.write_str("AEAD nonce length not supported"),
+            AeadError::InvalidTagLength => f.write_str("AEAD tag length not supported"),
+            AeadError::InputTooLong => f.write_str("AEAD input exceeds the mode's length limit"),
+            AeadError::TooManyAssociatedData => {
+                f.write_str("AEAD associated-data component count exceeds the mode's limit")
+            }
+            AeadError::TagMismatch => f.write_str("AEAD authentication tag mismatch"),
+        }
+    }
+}
+
+impl core::error::Error for AeadError {}
+
+impl From<TagMismatch> for AeadError {
+    fn from(_: TagMismatch) -> Self {
+        AeadError::TagMismatch
+    }
+}

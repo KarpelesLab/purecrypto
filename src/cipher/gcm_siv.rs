@@ -11,7 +11,7 @@
 //! `x¹²⁸ + x¹²⁷ + x¹²⁶ + x¹²¹ + 1` — this is *not* the GHASH bit ordering, so
 //! it is implemented separately from `gcm::gf_mul`.
 
-use super::{Aes128, Aes256, BlockCipher, TagMismatch};
+use super::{AeadError, Aes128, Aes256, BlockCipher, TagMismatch};
 use crate::ct::ConstantTimeEq;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -121,8 +121,17 @@ impl AesGcmSiv {
     /// key-generating key.
     ///
     /// # Panics
-    /// Panics if `key.len()` is not 16 or 32.
+    /// Panics if `key.len()` is not 16 or 32. See [`try_new`](Self::try_new)
+    /// for the fallible form.
     pub fn new(key: &[u8]) -> Self {
+        Self::try_new(key).unwrap_or_else(|_| {
+            panic!("AES-GCM-SIV key must be 16 bytes (AES-128) or 32 bytes (AES-256)")
+        })
+    }
+
+    /// Fallible [`new`](Self::new): returns [`AeadError::InvalidKeyLength`]
+    /// instead of panicking when `key.len()` is neither 16 nor 32.
+    pub fn try_new(key: &[u8]) -> Result<Self, AeadError> {
         let mut kgk = [0u8; 32];
         let cipher = match key.len() {
             16 => {
@@ -133,13 +142,13 @@ impl AesGcmSiv {
                 kgk.copy_from_slice(key);
                 Cipher::Aes256(Aes256::new(key.try_into().unwrap()))
             }
-            _ => panic!("AES-GCM-SIV key must be 16 bytes (AES-128) or 32 bytes (AES-256)"),
+            _ => return Err(AeadError::InvalidKeyLength),
         };
-        AesGcmSiv {
+        Ok(AesGcmSiv {
             cipher,
             key_len: key.len(),
             kgk,
-        }
+        })
     }
 
     /// Derives the per-nonce message-authentication key and message-encryption
@@ -512,5 +521,35 @@ mod tests {
         bad[0] ^= 1;
         assert!(siv.decrypt(&nonce, aad, &mut buf, &bad).is_err());
         assert_eq!(buf, [0u8; 32]);
+    }
+
+    /// `try_new` reports a key length that selects neither AES-128 nor
+    /// AES-256; for a valid key it builds the same context as `new`.
+    #[test]
+    fn try_new_rejects_bad_key_lengths() {
+        for bad in [0usize, 15, 17, 24, 31, 33, 64] {
+            assert!(
+                matches!(
+                    AesGcmSiv::try_new(&alloc::vec![0u8; bad]),
+                    Err(AeadError::InvalidKeyLength)
+                ),
+                "key len {bad}"
+            );
+        }
+        let key = [0x5Au8; 32];
+        let nonce = [1u8; 12];
+        let mut a = [9u8; 20];
+        let mut b = a;
+        let ta = AesGcmSiv::new(&key).encrypt(&nonce, b"", &mut a);
+        let tb = AesGcmSiv::try_new(&key)
+            .unwrap()
+            .encrypt(&nonce, b"", &mut b);
+        assert_eq!((a, ta), (b, tb));
+    }
+
+    #[test]
+    #[should_panic(expected = "AES-GCM-SIV key must be 16 bytes")]
+    fn new_bad_key_length_still_panics() {
+        let _ = AesGcmSiv::new(&[0u8; 24]);
     }
 }

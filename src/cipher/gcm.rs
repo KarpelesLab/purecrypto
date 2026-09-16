@@ -8,7 +8,7 @@
 //! A given (key, nonce) pair must **never** be reused: nonce reuse in GCM is
 //! catastrophic, revealing the hash subkey and breaking authenticity.
 
-use super::{BlockCipher, TagMismatch};
+use super::{AeadError, BlockCipher, TagMismatch};
 use crate::ct::ConstantTimeEq;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -356,23 +356,35 @@ impl<C: BlockCipher> Gcm<C> {
     /// bytes. Above this, the 32-bit GCTR counter wraps and reuses keystream.
     pub const MAX_PLAINTEXT_LEN: u64 = (1u64 << 36) - 32;
 
-    fn validate(nonce: &[u8], buffer: &[u8]) {
+    fn validate(nonce: &[u8], buffer: &[u8]) -> Result<(), AeadError> {
         // On 16/32-bit targets (e.g. `wasm32`) `MAX_NONCE_LEN` saturates to
         // `usize::MAX`, so `nonce.len() <= MAX_NONCE_LEN` is trivially true —
         // no addressable slice can reach 2^61 bytes there. The check is kept
         // for its meaning on 64-bit targets; silence the vacuous-comparison
         // lint that only fires where `usize` is narrower than 61 bits.
         #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            assert!(
-                !nonce.is_empty() && nonce.len() <= Self::MAX_NONCE_LEN,
-                "AES-GCM nonce must be 1..=2^61-1 bytes (NIST SP 800-38D §5.2.1.1)"
-            );
+        if nonce.is_empty() || nonce.len() > Self::MAX_NONCE_LEN {
+            return Err(AeadError::InvalidNonceLength);
         }
-        assert!(
-            (buffer.len() as u64) <= Self::MAX_PLAINTEXT_LEN,
-            "AES-GCM plaintext exceeds 2^39 − 256 bits (NIST SP 800-38D §5.2.1.1)"
-        );
+        if (buffer.len() as u64) > Self::MAX_PLAINTEXT_LEN {
+            return Err(AeadError::InputTooLong);
+        }
+        Ok(())
+    }
+
+    /// The panic the infallible entry points raise for a parameter the
+    /// fallible twins would have reported as `e`. Kept mode-specific so the
+    /// documented panic messages cite the limit that was crossed.
+    fn reject(e: AeadError) -> ! {
+        match e {
+            AeadError::InvalidNonceLength => {
+                panic!("AES-GCM nonce must be 1..=2^61-1 bytes (NIST SP 800-38D §5.2.1.1)")
+            }
+            AeadError::InputTooLong => {
+                panic!("AES-GCM plaintext exceeds 2^39 − 256 bits (NIST SP 800-38D §5.2.1.1)")
+            }
+            other => panic!("AES-GCM: {other}"),
+        }
     }
 
     /// Encrypts `buffer` in place and returns the 16-byte authentication tag,
@@ -380,16 +392,32 @@ impl<C: BlockCipher> Gcm<C> {
     ///
     /// # Panics
     /// Panics if `nonce.is_empty()` or `buffer.len()` exceeds the NIST
-    /// SP 800-38D plaintext cap (`2^39 − 256` bits).
+    /// SP 800-38D plaintext cap (`2^39 − 256` bits). Callers whose nonce
+    /// length comes from untrusted input should use
+    /// [`try_encrypt`](Self::try_encrypt).
     pub fn encrypt(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> [u8; 16] {
-        Self::validate(nonce, buffer);
+        self.try_encrypt(nonce, aad, buffer)
+            .unwrap_or_else(|e| Self::reject(e))
+    }
+
+    /// Fallible [`encrypt`](Self::encrypt): returns
+    /// [`AeadError::InvalidNonceLength`] for an empty (or > `2^61 − 1` byte)
+    /// nonce and [`AeadError::InputTooLong`] past the NIST plaintext cap,
+    /// instead of panicking. `buffer` is untouched on error.
+    pub fn try_encrypt(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<[u8; 16], AeadError> {
+        Self::validate(nonce, buffer)?;
         let j0 = self.j0(nonce);
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
         if let Some(tag) = self.crypt_fused(j0, aad, buffer, true) {
-            return tag;
+            return Ok(tag);
         }
         self.gctr(inc32(j0), buffer);
-        self.tag(j0, aad, buffer)
+        Ok(self.tag(j0, aad, buffer))
     }
 
     /// Verifies `tag` and, only if it matches, decrypts `buffer` in place.
@@ -414,6 +442,8 @@ impl<C: BlockCipher> Gcm<C> {
     ///
     /// # Panics
     /// Panics if `nonce.is_empty()` or `buffer.len()` exceeds the NIST cap.
+    /// Callers whose nonce length comes from untrusted input should use
+    /// [`try_decrypt`](Self::try_decrypt).
     pub fn decrypt(
         &self,
         nonce: &[u8],
@@ -421,7 +451,26 @@ impl<C: BlockCipher> Gcm<C> {
         buffer: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<(), TagMismatch> {
-        Self::validate(nonce, buffer);
+        match self.try_decrypt(nonce, aad, buffer, tag) {
+            Ok(()) => Ok(()),
+            Err(AeadError::TagMismatch) => Err(TagMismatch),
+            Err(e) => Self::reject(e),
+        }
+    }
+
+    /// Fallible [`decrypt`](Self::decrypt): reports a bad nonce length or an
+    /// over-long input as [`AeadError::InvalidNonceLength`] /
+    /// [`AeadError::InputTooLong`] instead of panicking, and a failed tag
+    /// check as [`AeadError::TagMismatch`]. The buffer contract is the same
+    /// as `decrypt`'s: on any error it holds the original ciphertext.
+    pub fn try_decrypt(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        buffer: &mut [u8],
+        tag: &[u8; 16],
+    ) -> Result<(), AeadError> {
+        Self::validate(nonce, buffer)?;
         let j0 = self.j0(nonce);
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
         if let Some(expected) = self.crypt_fused(j0, aad, buffer, false) {
@@ -433,12 +482,12 @@ impl<C: BlockCipher> Gcm<C> {
             // restores the ciphertext before returning, upholding the
             // documented contract. The plaintext never leaves this function.
             self.gctr(inc32(j0), buffer);
-            return Err(TagMismatch);
+            return Err(AeadError::TagMismatch);
         }
         // GHASH is computed over the ciphertext, which is still in `buffer`.
         let expected = self.tag(j0, aad, buffer);
         if !bool::from(expected.ct_eq(tag)) {
-            return Err(TagMismatch);
+            return Err(AeadError::TagMismatch);
         }
         self.gctr(inc32(j0), buffer);
         Ok(())
@@ -900,5 +949,50 @@ mod tests {
         let mut bad_aad = aad;
         bad_aad[0] ^= 1;
         assert_eq!(g.decrypt(&nonce, &bad_aad, &mut ct, &tag), Err(TagMismatch));
+    }
+
+    /// The fallible forms report an empty nonce as an error with the buffer
+    /// untouched, map a bad tag to `AeadError::TagMismatch`, and otherwise
+    /// agree byte for byte with the panicking forms.
+    #[test]
+    fn try_forms_reject_empty_nonce_and_match_infallible() {
+        let g = gcm128("00000000000000000000000000000000");
+        let mut buf = *b"twelve bytes";
+        assert_eq!(
+            g.try_encrypt(&[], b"", &mut buf),
+            Err(AeadError::InvalidNonceLength)
+        );
+        assert_eq!(&buf, b"twelve bytes", "buffer untouched on error");
+        assert_eq!(
+            g.try_decrypt(&[], b"", &mut buf, &[0u8; 16]),
+            Err(AeadError::InvalidNonceLength)
+        );
+        assert_eq!(&buf, b"twelve bytes");
+
+        let nonce = [7u8; 12];
+        let mut a = *b"twelve bytes";
+        let mut b = *b"twelve bytes";
+        let tag_a = g.encrypt(&nonce, b"aad", &mut a);
+        let tag_b = g.try_encrypt(&nonce, b"aad", &mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(tag_a, tag_b);
+
+        let mut bad = tag_b;
+        bad[3] ^= 1;
+        assert_eq!(
+            g.try_decrypt(&nonce, b"aad", &mut b, &bad),
+            Err(AeadError::TagMismatch)
+        );
+        assert_eq!(a, b, "ciphertext restored on tag failure");
+        assert_eq!(g.try_decrypt(&nonce, b"aad", &mut b, &tag_b), Ok(()));
+        assert_eq!(&b, b"twelve bytes");
+    }
+
+    #[test]
+    #[should_panic(expected = "AES-GCM nonce must be 1..=2^61-1 bytes")]
+    fn encrypt_empty_nonce_still_panics() {
+        let g = gcm128("00000000000000000000000000000000");
+        let mut buf = [0u8; 4];
+        let _ = g.encrypt(&[], b"", &mut buf);
     }
 }

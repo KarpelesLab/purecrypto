@@ -16,7 +16,7 @@
 //! maximum payload length for an `n`-byte nonce is `2^(8·(15-n)) − 1` bytes;
 //! with the standard 12-byte nonce that is `2^24 − 1 ≈ 16 MiB`.
 
-use super::{BlockCipher, TagMismatch};
+use super::{AeadError, BlockCipher, TagMismatch};
 use crate::ct::ConstantTimeEq;
 
 /// Streaming CBC-MAC over a [`BlockCipher`], producing a 16-byte tag.
@@ -84,7 +84,8 @@ impl<C: BlockCipher> Drop for CbcMac<'_, C> {
 /// AES-CCM context with a `M`-byte tag.
 ///
 /// `M` must be one of `{4, 6, 8, 10, 12, 14, 16}`; instantiating with any
-/// other value will panic at construction.
+/// other value panics in [`new`](Self::new) and is reported as
+/// [`AeadError::InvalidTagLength`] by [`try_new`](Self::try_new).
 #[derive(Clone)]
 pub struct Ccm<C: BlockCipher, const M: usize> {
     cipher: C,
@@ -92,12 +93,38 @@ pub struct Ccm<C: BlockCipher, const M: usize> {
 
 impl<C: BlockCipher, const M: usize> Ccm<C, M> {
     /// Creates a CCM context from a pre-keyed block cipher.
+    ///
+    /// # Panics
+    /// Panics if the tag length `M` is not one of 4, 6, 8, 10, 12, 14, 16.
+    /// See [`try_new`](Self::try_new) for the fallible form.
     pub fn new(cipher: C) -> Self {
-        assert!(
-            matches!(M, 4 | 6 | 8 | 10 | 12 | 14 | 16),
-            "AES-CCM tag length M must be one of 4, 6, 8, 10, 12, 14, 16"
-        );
-        Self { cipher }
+        Self::try_new(cipher).unwrap_or_else(|e| Self::reject(e))
+    }
+
+    /// Fallible [`new`](Self::new): returns [`AeadError::InvalidTagLength`]
+    /// instead of panicking when `M` is not a CCM tag length.
+    pub fn try_new(cipher: C) -> Result<Self, AeadError> {
+        if !matches!(M, 4 | 6 | 8 | 10 | 12 | 14 | 16) {
+            return Err(AeadError::InvalidTagLength);
+        }
+        Ok(Self { cipher })
+    }
+
+    /// The panic the infallible entry points raise for a parameter the
+    /// fallible twins would have reported as `e`.
+    fn reject(e: AeadError) -> ! {
+        match e {
+            AeadError::InvalidTagLength => {
+                panic!("AES-CCM tag length M must be one of 4, 6, 8, 10, 12, 14, 16")
+            }
+            AeadError::InvalidNonceLength => {
+                panic!("AES-CCM nonce length must be in 7..=13 bytes")
+            }
+            AeadError::InputTooLong => {
+                panic!("AES-CCM payload length exceeds the limit for this nonce length")
+            }
+            other => panic!("AES-CCM: {other}"),
+        }
     }
 
     /// Encrypts `buffer` in place and returns the `M`-byte authentication tag.
@@ -105,10 +132,24 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
     /// # Panics
     /// Panics if `nonce.len()` is outside `7..=13` bytes, or if `buffer.len()`
     /// exceeds the per-nonce payload cap `2^(8·(15 − nonce.len())) − 1` bytes
-    /// (NIST SP 800-38C). Callers passing untrusted nonce lengths should
-    /// validate them first.
+    /// (NIST SP 800-38C). Callers passing untrusted nonce lengths should use
+    /// [`try_encrypt`](Self::try_encrypt).
     pub fn encrypt(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> [u8; M] {
-        self.validate(nonce, buffer.len());
+        self.try_encrypt(nonce, aad, buffer)
+            .unwrap_or_else(|e| Self::reject(e))
+    }
+
+    /// Fallible [`encrypt`](Self::encrypt): returns
+    /// [`AeadError::InvalidNonceLength`] for a nonce outside `7..=13` bytes
+    /// and [`AeadError::InputTooLong`] past the per-nonce payload cap, instead
+    /// of panicking. `buffer` is untouched on error.
+    pub fn try_encrypt(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<[u8; M], AeadError> {
+        Self::validate(nonce, buffer.len())?;
 
         let t = self.mac(nonce, aad, buffer);
         let s0 = self.gen_s(nonce, 0);
@@ -120,7 +161,7 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
         for i in 0..M {
             out[i] = t[i] ^ s0[i];
         }
-        out
+        Ok(out)
     }
 
     /// Decrypts `buffer` in place and verifies `tag`. On verification failure,
@@ -130,8 +171,8 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
     /// # Panics
     /// Panics if `nonce.len()` is outside `7..=13` bytes, or if `buffer.len()`
     /// exceeds the per-nonce payload cap `2^(8·(15 − nonce.len())) − 1` bytes
-    /// (NIST SP 800-38C). Callers passing untrusted nonce lengths should
-    /// validate them first.
+    /// (NIST SP 800-38C). Callers passing untrusted nonce lengths should use
+    /// [`try_decrypt`](Self::try_decrypt).
     pub fn decrypt(
         &self,
         nonce: &[u8],
@@ -139,7 +180,26 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
         buffer: &mut [u8],
         tag: &[u8; M],
     ) -> Result<(), TagMismatch> {
-        self.validate(nonce, buffer.len());
+        match self.try_decrypt(nonce, aad, buffer, tag) {
+            Ok(()) => Ok(()),
+            Err(AeadError::TagMismatch) => Err(TagMismatch),
+            Err(e) => Self::reject(e),
+        }
+    }
+
+    /// Fallible [`decrypt`](Self::decrypt): reports a bad nonce length or an
+    /// over-long input as [`AeadError::InvalidNonceLength`] /
+    /// [`AeadError::InputTooLong`] (with `buffer` untouched) instead of
+    /// panicking, and a failed tag check as [`AeadError::TagMismatch`] (with
+    /// `buffer` wiped, as `decrypt` does).
+    pub fn try_decrypt(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        buffer: &mut [u8],
+        tag: &[u8; M],
+    ) -> Result<(), AeadError> {
+        Self::validate(nonce, buffer.len())?;
 
         // CCM's tag is over plaintext, so CTR-decrypt first.
         self.ctr_xor(nonce, 1, buffer);
@@ -157,28 +217,24 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
             // Wipe the (now-decrypted) buffer so a caller can't accidentally
             // use unauthenticated plaintext after ignoring the error.
             crate::zeroize::Zeroize::zeroize(buffer);
-            Err(TagMismatch)
+            Err(AeadError::TagMismatch)
         }
     }
 
-    fn validate(&self, nonce: &[u8], payload_len: usize) {
-        assert!(
-            (7..=13).contains(&nonce.len()),
-            "AES-CCM nonce length must be in 7..=13 bytes"
-        );
+    fn validate(nonce: &[u8], payload_len: usize) -> Result<(), AeadError> {
+        if !(7..=13).contains(&nonce.len()) {
+            return Err(AeadError::InvalidNonceLength);
+        }
         let q = 15 - nonce.len();
         let max = if q >= 16 {
             u128::MAX
         } else {
             (1u128 << (8 * q)) - 1
         };
-        assert!(
-            (payload_len as u128) <= max,
-            "AES-CCM payload length {} exceeds limit {} for nonce length {}",
-            payload_len,
-            max,
-            nonce.len(),
-        );
+        if (payload_len as u128) > max {
+            return Err(AeadError::InputTooLong);
+        }
+        Ok(())
     }
 
     /// Builds B_0, encoded AAD, and padded payload, runs them through CBC-MAC,
@@ -446,5 +502,83 @@ mod tests {
         tag[0] ^= 1;
         assert!(ccm.decrypt(&nonce, aad, &mut buf, &tag).is_err());
         assert_eq!(buf, [0u8; 16]);
+    }
+
+    /// `try_new` reports a tag length CCM does not define; `new` panics on it.
+    #[test]
+    fn try_new_rejects_undefined_tag_length() {
+        let key = [0x42u8; 16];
+        assert!(matches!(
+            Ccm::<Aes128, 5>::try_new(Aes128::new(&key)),
+            Err(AeadError::InvalidTagLength)
+        ));
+        assert!(Ccm::<Aes128, 4>::try_new(Aes128::new(&key)).is_ok());
+        assert!(Aes128Ccm8::try_new(Aes128::new(&key)).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "tag length M must be one of")]
+    fn new_undefined_tag_length_still_panics() {
+        let _ = Ccm::<Aes128, 7>::new(Aes128::new(&[0u8; 16]));
+    }
+
+    /// The fallible forms reject nonces outside `7..=13` bytes and payloads
+    /// past the per-nonce cap without touching the buffer, map a bad tag to
+    /// `AeadError::TagMismatch` (wiping the buffer, as `decrypt` does), and
+    /// otherwise agree byte for byte with the panicking forms.
+    #[test]
+    fn try_forms_reject_bad_nonce_lengths_and_match_infallible() {
+        let ccm = Aes128Ccm::new(Aes128::new(&[0x42u8; 16]));
+        let pt = *b"sixteen byte msg";
+        for bad in [0usize, 6, 14] {
+            let nonce = alloc::vec![0u8; bad];
+            let mut buf = pt;
+            assert_eq!(
+                ccm.try_encrypt(&nonce, b"", &mut buf),
+                Err(AeadError::InvalidNonceLength),
+                "nonce len {bad}"
+            );
+            assert_eq!(buf, pt, "buffer untouched on error");
+            assert_eq!(
+                ccm.try_decrypt(&nonce, b"", &mut buf, &[0u8; 16]),
+                Err(AeadError::InvalidNonceLength)
+            );
+            assert_eq!(buf, pt);
+        }
+        // A 13-byte nonce leaves q = 2, so the payload cap is 2^16 − 1.
+        let n13 = [1u8; 13];
+        let mut big = alloc::vec![0u8; 1 << 16];
+        assert_eq!(
+            ccm.try_encrypt(&n13, b"", &mut big),
+            Err(AeadError::InputTooLong)
+        );
+        assert!(big.iter().all(|&b| b == 0));
+
+        let nonce = [3u8; 12];
+        let mut a = pt;
+        let mut b = pt;
+        let tag_a = ccm.encrypt(&nonce, b"aad", &mut a);
+        let tag_b = ccm.try_encrypt(&nonce, b"aad", &mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(tag_a, tag_b);
+
+        let mut bad = tag_b;
+        bad[0] ^= 1;
+        assert_eq!(
+            ccm.try_decrypt(&nonce, b"aad", &mut b, &bad),
+            Err(AeadError::TagMismatch)
+        );
+        assert_eq!(b, [0u8; 16], "buffer wiped on tag failure");
+        let mut c = a;
+        assert_eq!(ccm.try_decrypt(&nonce, b"aad", &mut c, &tag_b), Ok(()));
+        assert_eq!(c, pt);
+    }
+
+    #[test]
+    #[should_panic(expected = "nonce length must be in 7..=13")]
+    fn encrypt_short_nonce_still_panics() {
+        let ccm = Aes128Ccm::new(Aes128::new(&[0u8; 16]));
+        let mut buf = [0u8; 4];
+        let _ = ccm.encrypt(&[0u8; 6], b"", &mut buf);
     }
 }

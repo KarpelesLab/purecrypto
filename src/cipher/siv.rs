@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use super::cmac::Cmac;
 use super::ctr::Ctr;
-use super::{Aes128, Aes256, TagMismatch};
+use super::{AeadError, Aes128, Aes256, TagMismatch};
 use crate::ct::ConstantTimeEq;
 use crate::zeroize::{Zeroize, Zeroizing};
 
@@ -62,8 +62,17 @@ impl AesSiv {
     /// selects AES-128-SIV; a 64-byte key selects AES-256-SIV.
     ///
     /// # Panics
-    /// Panics if `key.len()` is not 32 or 64.
+    /// Panics if `key.len()` is not 32 or 64. See [`try_new`](Self::try_new)
+    /// for the fallible form.
     pub fn new(key: &[u8]) -> Self {
+        Self::try_new(key).unwrap_or_else(|_| {
+            panic!("AES-SIV key must be 32 bytes (AES-128) or 64 bytes (AES-256)")
+        })
+    }
+
+    /// Fallible [`new`](Self::new): returns [`AeadError::InvalidKeyLength`]
+    /// instead of panicking when `key.len()` is neither 32 nor 64.
+    pub fn try_new(key: &[u8]) -> Result<Self, AeadError> {
         let cipher = match key.len() {
             32 => {
                 let (k1, k2) = key.split_at(16);
@@ -79,9 +88,9 @@ impl AesSiv {
                     ctr: Aes256::new(k2.try_into().unwrap()),
                 }
             }
-            _ => panic!("AES-SIV key must be 32 bytes (AES-128) or 64 bytes (AES-256)"),
+            _ => return Err(AeadError::InvalidKeyLength),
         };
-        AesSiv { cipher }
+        Ok(AesSiv { cipher })
     }
 
     /// CMAC of `data` under the S2V key half.
@@ -108,9 +117,10 @@ impl AesSiv {
         // RFC 5297 §2.4: S2V takes at most 127 strings — `n − 1 ≤ 126`
         // headers plus the plaintext. Past that the `dbl()` chain reaches
         // 2^127·D and the mixing argument no longer holds; the reference
-        // implementation refuses it, so do we (the same fail-loud style as the
-        // key-length check in `new`).
-        assert!(
+        // implementation refuses it, so do we. Every public entry point
+        // (`try_seal` / `try_open`, which `seal` / `open` delegate to) has
+        // already rejected the case, so this only guards internal callers.
+        debug_assert!(
             ad.len() <= Self::MAX_ASSOCIATED_DATA,
             "AES-SIV: at most 126 associated-data components (RFC 5297 §2.4)"
         );
@@ -178,17 +188,37 @@ impl AesSiv {
     ///
     /// # Panics
     /// If `associated_data.len()` exceeds [`MAX_ASSOCIATED_DATA`]
-    /// (RFC 5297 §2.4).
+    /// (RFC 5297 §2.4). See [`try_seal`](Self::try_seal) for the fallible
+    /// form.
     ///
     /// [`MAX_ASSOCIATED_DATA`]: Self::MAX_ASSOCIATED_DATA
     pub fn seal(&self, associated_data: &[&[u8]], plaintext: &[u8]) -> Vec<u8> {
+        self.try_seal(associated_data, plaintext)
+            .unwrap_or_else(|_| {
+                panic!("AES-SIV: at most 126 associated-data components (RFC 5297 §2.4)")
+            })
+    }
+
+    /// Fallible [`seal`](Self::seal): returns
+    /// [`AeadError::TooManyAssociatedData`] instead of panicking when
+    /// `associated_data.len()` exceeds [`MAX_ASSOCIATED_DATA`].
+    ///
+    /// [`MAX_ASSOCIATED_DATA`]: Self::MAX_ASSOCIATED_DATA
+    pub fn try_seal(
+        &self,
+        associated_data: &[&[u8]],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, AeadError> {
+        if associated_data.len() > Self::MAX_ASSOCIATED_DATA {
+            return Err(AeadError::TooManyAssociatedData);
+        }
         let v = self.s2v(associated_data, plaintext);
         let q = Self::ctr_iv(&v);
         let mut out = Vec::with_capacity(16 + plaintext.len());
         out.extend_from_slice(&v);
         out.extend_from_slice(plaintext);
         self.ctr_xor(&q, &mut out[16..]);
-        out
+        Ok(out)
     }
 
     /// Verifies and decrypts an `V ‖ ciphertext` blob produced by
@@ -200,12 +230,30 @@ impl AesSiv {
     ///
     /// # Panics
     /// If `associated_data.len()` exceeds [`MAX_ASSOCIATED_DATA`]
-    /// (RFC 5297 §2.4).
+    /// (RFC 5297 §2.4). See [`try_open`](Self::try_open) for the fallible
+    /// form.
     ///
     /// [`MAX_ASSOCIATED_DATA`]: Self::MAX_ASSOCIATED_DATA
     pub fn open(&self, associated_data: &[&[u8]], input: &[u8]) -> Result<Vec<u8>, TagMismatch> {
+        match self.try_open(associated_data, input) {
+            Ok(pt) => Ok(pt),
+            Err(AeadError::TagMismatch) => Err(TagMismatch),
+            Err(_) => panic!("AES-SIV: at most 126 associated-data components (RFC 5297 §2.4)"),
+        }
+    }
+
+    /// Fallible [`open`](Self::open): returns
+    /// [`AeadError::TooManyAssociatedData`] instead of panicking when
+    /// `associated_data.len()` exceeds [`MAX_ASSOCIATED_DATA`], and
+    /// [`AeadError::TagMismatch`] when the synthetic IV does not verify.
+    ///
+    /// [`MAX_ASSOCIATED_DATA`]: Self::MAX_ASSOCIATED_DATA
+    pub fn try_open(&self, associated_data: &[&[u8]], input: &[u8]) -> Result<Vec<u8>, AeadError> {
+        if associated_data.len() > Self::MAX_ASSOCIATED_DATA {
+            return Err(AeadError::TooManyAssociatedData);
+        }
         if input.len() < 16 {
-            return Err(TagMismatch);
+            return Err(AeadError::TagMismatch);
         }
         let mut v = [0u8; 16];
         v.copy_from_slice(&input[..16]);
@@ -220,7 +268,7 @@ impl AesSiv {
             // Discard the unauthenticated plaintext (volatile wipe, so the
             // stores cannot be elided as dead).
             plaintext.zeroize();
-            Err(TagMismatch)
+            Err(AeadError::TagMismatch)
         }
     }
 }
@@ -367,5 +415,56 @@ mod tests {
         let out = siv.seal(&[], &[]);
         assert_eq!(out.len(), 16);
         assert_eq!(siv.open(&[], &out).unwrap(), Vec::<u8>::new());
+    }
+
+    /// The fallible constructor reports a key length that selects no
+    /// variant; the fallible seal/open report the S2V component limit and a
+    /// bad synthetic IV, and otherwise match the panicking forms.
+    #[test]
+    fn try_forms_report_errors_and_match_infallible() {
+        for bad in [0usize, 16, 31, 33, 48, 65] {
+            assert!(
+                matches!(
+                    AesSiv::try_new(&alloc::vec![0u8; bad]),
+                    Err(AeadError::InvalidKeyLength)
+                ),
+                "key len {bad}"
+            );
+        }
+        let siv = AesSiv::try_new(&[0x11u8; 64]).unwrap();
+        let hdr: &[u8] = b"h";
+        let too_many = alloc::vec![hdr; AesSiv::MAX_ASSOCIATED_DATA + 1];
+        assert_eq!(
+            siv.try_seal(&too_many, b"pt"),
+            Err(AeadError::TooManyAssociatedData)
+        );
+        assert_eq!(
+            siv.try_open(&too_many, &[0u8; 20]),
+            Err(AeadError::TooManyAssociatedData)
+        );
+
+        let sealed = siv.try_seal(&[b"ad"], b"plaintext").unwrap();
+        assert_eq!(
+            sealed,
+            AesSiv::new(&[0x11u8; 64]).seal(&[b"ad"], b"plaintext")
+        );
+        assert_eq!(
+            siv.try_open(&[b"ad"], &sealed).unwrap(),
+            b"plaintext".to_vec()
+        );
+        assert_eq!(
+            siv.try_open(&[b"other"], &sealed),
+            Err(AeadError::TagMismatch)
+        );
+        assert_eq!(
+            siv.try_open(&[b"ad"], &sealed[..15]),
+            Err(AeadError::TagMismatch)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "AES-SIV key must be 32 bytes")]
+    fn new_bad_key_length_still_panics() {
+        let _ = AesSiv::new(&[0u8; 16]);
     }
 }
