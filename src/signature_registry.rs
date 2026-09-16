@@ -375,6 +375,50 @@ pub use policy::SignaturePolicy;
 mod tests {
     use super::*;
 
+    /// The lookups are first-match linear scans over `ALGORITHMS`, so a
+    /// duplicated id, X.509 OID, or TLS scheme code point would make
+    /// dispatch depend on slice order — the exact bug the PSS-RSAE entries
+    /// once had when they also listed the PKCS#1 `sha*WithRSAEncryption`
+    /// OIDs. Every key must be unique across the whole table, and looking an
+    /// entry up by each of its own keys must return that entry.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn registry_keys_are_unique_and_round_trip() {
+        use alloc::vec::Vec;
+        let mut ids: Vec<&str> = Vec::new();
+        let mut oids: Vec<&[u64]> = Vec::new();
+        let mut schemes: Vec<u16> = Vec::new();
+        for algo in ALGORITHMS {
+            let id = algo.id();
+            assert!(!id.is_empty(), "empty id");
+            assert!(!ids.contains(&id), "duplicate id {id}");
+            ids.push(id);
+            assert_eq!(find_by_id(id).unwrap().id(), id);
+            for oid in algo.x509_oids() {
+                assert!(!oids.contains(oid), "{id}: duplicate OID {oid:?}");
+                oids.push(oid);
+                assert_eq!(find_by_oid(oid).unwrap().id(), id, "OID {oid:?}");
+            }
+            for &scheme in algo.tls_schemes() {
+                assert!(
+                    !schemes.contains(&scheme),
+                    "{id}: duplicate TLS scheme {scheme:#06x}"
+                );
+                schemes.push(scheme);
+                assert_eq!(
+                    find_by_tls_scheme(scheme).unwrap().id(),
+                    id,
+                    "scheme {scheme:#06x}"
+                );
+            }
+        }
+        // Unknown keys resolve to nothing rather than to a neighbour.
+        assert!(find_by_id("").is_none());
+        assert!(find_by_oid(&[]).is_none());
+        assert!(find_by_oid(&[1, 2, 840, 113549, 1, 1]).is_none());
+        assert!(find_by_tls_scheme(0x0000).is_none());
+    }
+
     #[cfg(all(feature = "rsa", feature = "ec", feature = "alloc"))]
     #[test]
     fn registry_has_modern_entries() {
