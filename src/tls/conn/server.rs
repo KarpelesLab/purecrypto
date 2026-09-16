@@ -2996,10 +2996,12 @@ impl<R: RngCore> ServerConnection<R> {
         let suite = self.suite.expect("suite set");
         let chts = self.client_hs_secret.as_ref().expect("client hs secret");
 
+        // RFC 8446 §4.4.4: an incorrect Finished MUST terminate the
+        // connection with `decrypt_error`.
         let th = self.core.transcript.current_hash();
         let expected = finished_verify_data(suite.hash, chts, th.as_slice());
         if !bool::from(expected.as_slice().ct_eq(body)) {
-            return Err(Error::HandshakeFailure);
+            return Err(Error::DecryptError);
         }
         self.core.transcript.update(raw);
 

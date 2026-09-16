@@ -7561,6 +7561,42 @@ mod audit_regression_tests {
         assert!(!server.is_handshake_complete());
     }
 
+    /// RFC 8446 §4.4.4: "Recipients of Finished messages MUST verify that
+    /// the contents are correct and if incorrect MUST terminate the
+    /// connection with a decrypt_error alert." The engines answered a bad
+    /// `verify_data` with `handshake_failure`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn finished_mismatch_is_decrypt_error() {
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"fin-mismatch-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"fin-mismatch-s", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        let ch = client.write_tls();
+        server.read_tls(&ch);
+        server.process_new_packets().unwrap();
+        let _flight = server.write_tls();
+
+        // The server now awaits the client Finished: hand it one whose
+        // verify_data is garbage (well-formed, wrong MAC).
+        let mut forged = alloc::vec![crate::tls::codec::hs_type::FINISHED, 0, 0, 32];
+        forged.extend_from_slice(&[0u8; 32]);
+        let err = server.handle_handshake_for_test(forged).unwrap_err();
+        assert!(
+            matches!(err, Error::DecryptError),
+            "a bad Finished must be decrypt_error, got {err:?}"
+        );
+    }
+
     /// MEDIUM 2(b) — the transcript must stop growing once the handshake is
     /// done. Post-handshake `KeyUpdate` / `NewSessionTicket` bytes are not an
     /// input to any transcript hash, so buffering them let a peer grow our
