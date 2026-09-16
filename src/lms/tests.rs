@@ -796,3 +796,143 @@ fn hss_from_bytes_rejects_bad_length() {
         Some(Error::Malformed)
     );
 }
+
+/// The leaf index is reserved BEFORE the signature is produced (SP 800-208
+/// §8.1). If signing aborts part-way — here the bottom level's randomizer RNG
+/// panics after the pinned upper level has already signed — the state must
+/// still have moved past the leaf, so the next call cannot re-sign it.
+#[cfg(feature = "std")]
+#[test]
+fn hss_aborted_sign_still_burns_its_leaf() {
+    struct PanicRng;
+    impl crate::rng::RngCore for PanicRng {
+        fn fill_bytes(&mut self, _dest: &mut [u8]) {
+            panic!("rng failure mid-sign");
+        }
+    }
+
+    let mut rng = HmacDrbg::<Sha256>::new(b"hss-abort", b"n", &[]);
+    let mut key = HssPrivateKey::generate(
+        &[
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+        ],
+        &mut rng,
+    )
+    .unwrap();
+    let pk = key.public_key();
+    assert_eq!(key.remaining(), 32);
+
+    // Silence the panic message for this deliberate unwind.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(alloc::boxed::Box::new(|_| {}));
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        key.sign(&mut PanicRng, b"aborted")
+    }));
+    std::panic::set_hook(prev);
+    assert!(res.is_err(), "the panicking rng must unwind out of sign");
+
+    // Leaf 0 was consumed by the aborted attempt; the next signature is on
+    // leaf 1 and still verifies.
+    assert_eq!(key.remaining(), 31, "aborted sign must have burnt its leaf");
+    let sig = key.sign(&mut rng, b"after-abort").unwrap();
+    assert_eq!(bottom_leaf_q(&sig), 1, "leaf 0 must never be signed again");
+    assert!(pk.verify(b"after-abort", &sig));
+}
+
+/// Same reservation order for a single-tree key: `q` moves before `tree::sign`
+/// runs, and the emitted signature carries the reserved (pre-advance) leaf.
+#[test]
+fn lms_signature_carries_reserved_leaf() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"lms-reserve", b"n", &[]);
+    let mut sk = LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &mut rng);
+    let pk = sk.public_key();
+    for expected_q in 0..3u32 {
+        let sig = sk.sign(&mut rng, b"m").unwrap();
+        let q = u32::from_be_bytes([sig[0], sig[1], sig[2], sig[3]]);
+        assert_eq!(q, expected_q);
+        assert_eq!(sk.remaining(), 32 - u64::from(expected_q) - 1);
+        assert!(pk.verify(b"m", &sig));
+    }
+}
+
+/// Verification binds both typecodes of the signature to the public key's and
+/// rejects any length that does not match them (RFC 8554 §5.4.2 / §4.6 step 2).
+#[test]
+fn lms_verify_rejects_typecode_mismatch_and_wrong_length() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"lms-typecode", b"n", &[]);
+    let mut sk = LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W4, &mut rng);
+    let pk = sk.public_key();
+    let sig = sk.sign(&mut rng, b"typed").unwrap();
+    assert!(pk.verify(b"typed", &sig));
+    let ots_len = LmotsType::Sha256N32W4.sig_len();
+
+    // LM-OTS typecode in the signature != the key's (W4 -> W8 / W2 / unknown).
+    for bad_ots in [4u32, 2, 0, 5, u32::MAX] {
+        let mut s = sig.clone();
+        s[4..8].copy_from_slice(&bad_ots.to_be_bytes());
+        assert!(
+            !pk.verify(b"typed", &s),
+            "ots typecode {bad_ots} must reject"
+        );
+    }
+    // LMS typecode in the signature != the key's (H5 -> H10 / unknown).
+    let lms_off = 4 + ots_len;
+    for bad_lms in [6u32, 0, 4, 10, u32::MAX] {
+        let mut s = sig.clone();
+        s[lms_off..lms_off + 4].copy_from_slice(&bad_lms.to_be_bytes());
+        assert!(
+            !pk.verify(b"typed", &s),
+            "lms typecode {bad_lms} must reject"
+        );
+    }
+    // Any length other than the exact one is rejected — including a valid
+    // signature with a trailing byte, and one truncated by a single byte.
+    assert!(!pk.verify(b"typed", &sig[..sig.len() - 1]));
+    let mut longer = sig.clone();
+    longer.push(0);
+    assert!(!pk.verify(b"typed", &longer));
+    assert!(!pk.verify(b"typed", &[]));
+    assert!(!pk.verify(b"typed", &sig[..7]));
+    // Leaf index >= 2^h is rejected even if everything else parses.
+    let mut s = sig.clone();
+    s[..4].copy_from_slice(&32u32.to_be_bytes());
+    assert!(!pk.verify(b"typed", &s), "q = 2^h must reject");
+
+    // A public key with a mismatching pair (W8 instead of W4) rejects too.
+    let mut pk_bytes = pk.to_bytes().to_vec();
+    pk_bytes[4..8].copy_from_slice(&4u32.to_be_bytes());
+    assert!(!verify_lms(&pk_bytes, b"typed", &sig));
+    // ... and an unknown typecode in the key is refused at parse time.
+    pk_bytes[4..8].copy_from_slice(&9u32.to_be_bytes());
+    assert_eq!(
+        LmsPublicKey::from_bytes(&pk_bytes).err(),
+        Some(Error::InvalidKey)
+    );
+    assert!(!verify_lms(&pk_bytes, b"typed", &sig));
+}
+
+/// Sign/verify round-trip for every LM-OTS width. The RFC 8554 vectors only
+/// pin `W4` and `W8`; this keeps `coef` / `Cksm` (`w = 1, 2`) consistent
+/// between the signer and the verifier, and checks each is length-exact.
+#[test]
+fn lms_all_ots_widths_roundtrip() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"lms-widths", b"n", &[]);
+    for ots in [
+        LmotsType::Sha256N32W1,
+        LmotsType::Sha256N32W2,
+        LmotsType::Sha256N32W4,
+        LmotsType::Sha256N32W8,
+    ] {
+        let mut sk = LmsPrivateKey::generate(LmsType::Sha256M32H5, ots, &mut rng);
+        let pk = sk.public_key();
+        let sig = sk.sign(&mut rng, b"width").unwrap();
+        assert_eq!(sig.len(), signature_len(LmsType::Sha256M32H5, ots));
+        assert!(pk.verify(b"width", &sig), "{ots:?}");
+        assert!(!pk.verify(b"other", &sig), "{ots:?}");
+        // Corrupt one Winternitz chain element: the recovered public key changes.
+        let mut bad = sig.clone();
+        bad[4 + 4 + N + 5] ^= 1;
+        assert!(!pk.verify(b"width", &bad), "{ots:?}");
+    }
+}

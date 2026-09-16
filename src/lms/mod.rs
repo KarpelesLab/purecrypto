@@ -255,17 +255,23 @@ impl LmsPrivateKey {
         if out.len() != self.signature_len() {
             return Err(Error::InvalidKey);
         }
+        // Reserve the leaf BEFORE any signature byte exists (SP 800-208
+        // §8.1): the index is consumed first, then signed. If signing were to
+        // abort part-way (a panic unwinding through the caller's buffer), the
+        // state has already moved past `q`, so no later call can re-sign the
+        // leaf whose partial signature the caller may still hold.
+        let q = self.q;
+        self.q += 1;
         let n = tree::sign(
             self.lms_type,
             self.ots_type,
             &self.i_id,
             &self.seed,
-            self.q,
+            q,
             c,
             message,
             out,
         );
-        self.q += 1;
         Ok(n)
     }
 
@@ -691,6 +697,12 @@ impl HssPrivateKey {
         if self.remaining() == 0 {
             return Err(Error::Exhausted);
         }
+        // Reserve the bottom leaf BEFORE any signature byte exists (SP 800-208
+        // §8.1): the state moves past `q_bottom` first, so an abort part-way
+        // through signing (e.g. a panicking `rng`) can never be followed by a
+        // second signature on the same one-time key.
+        let q_bottom = self.q[l - 1];
+        self.advance();
 
         let mut out = Vec::new();
         out.extend_from_slice(&((l - 1) as u32).to_be_bytes());
@@ -700,23 +712,25 @@ impl HssPrivateKey {
                 // Pinned non-bottom level: its one-time key re-signs the same
                 // child public key on every call, so `C` MUST be deterministic
                 // (`None` selects the seed-derived randomizer).
-                self.append_level_signature(&mut out, i, message, None);
+                self.append_level_signature(&mut out, i, self.q[i], message, None);
             } else {
                 // Bottom level: `q` advances with every signature, so a fresh
                 // random `C` never re-randomizes an already-used one-time key.
                 let mut c = [0u8; N];
                 rng.fill_bytes(&mut c);
-                self.append_level_signature(&mut out, i, message, Some(&c));
+                self.append_level_signature(&mut out, i, q_bottom, message, Some(&c));
             }
         }
 
-        self.advance();
         Ok(out)
     }
 
     /// Appends `sig[i]` (signing either `pub[i+1]` or the message) and, for
     /// non-final levels, the signed public key `pub[i+1]`.
     ///
+    /// `q` is the leaf of level `i` to sign with — the caller has already
+    /// reserved it, so it is passed explicitly rather than read from `self.q`
+    /// (which, for the bottom level, has moved on by then).
     /// `c` is the LM-OTS randomizer; `None` derives it deterministically from
     /// the level's secret seed and the signed bytes via [`ots::derive_c`].
     ///
@@ -733,6 +747,7 @@ impl HssPrivateKey {
         &self,
         out: &mut Vec<u8>,
         i: usize,
+        q: u32,
         message: &[u8],
         c: Option<&[u8; N]>,
     ) {
@@ -756,7 +771,7 @@ impl HssPrivateKey {
         };
         let c = match c {
             Some(c) => *c,
-            None => ots::derive_c(&lv.i_id, &lv.seed, self.q[i], signed),
+            None => ots::derive_c(&lv.i_id, &lv.seed, q, signed),
         };
         let mut sig = alloc::vec![0u8; signature_len(lv.lms_type, lv.ots_type)];
         tree::sign(
@@ -764,7 +779,7 @@ impl HssPrivateKey {
             lv.ots_type,
             &lv.i_id,
             &lv.seed,
-            self.q[i],
+            q,
             &c,
             signed,
             &mut sig,
@@ -783,12 +798,14 @@ impl HssPrivateKey {
         if self.remaining() == 0 {
             return Err(Error::Exhausted);
         }
+        let q_bottom = self.q[l - 1];
+        self.advance();
         let mut out = Vec::new();
         out.extend_from_slice(&((l - 1) as u32).to_be_bytes());
         for (i, c) in c_per_level.iter().enumerate().take(l) {
-            self.append_level_signature(&mut out, i, message, Some(c));
+            let q = if i + 1 < l { self.q[i] } else { q_bottom };
+            self.append_level_signature(&mut out, i, q, message, Some(c));
         }
-        self.advance();
         Ok(out)
     }
 
