@@ -21,8 +21,6 @@ use std::time::{Duration, Instant};
 
 use crate::pki::format_dn;
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn};
-use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
-use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
     Config, Connection, HandshakeStatus, ProtocolVersion as PcVersion, RootCertStore, SigningKey,
 };
@@ -145,17 +143,12 @@ fn load_client_identity(cert_path: &str, key_path: &str) -> (Vec<Vec<u8>>, Signi
     crate::util::warn_if_world_readable_key(key_path);
     let key_pem = std::fs::read_to_string(key_path)
         .unwrap_or_else(|e| die(format!("cannot read key file {key_path}: {e}")));
-    let key = if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(&key_pem) {
-        SigningKey::Ed25519(k)
-    } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(&key_pem) {
-        SigningKey::Ecdsa(k)
-    } else if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(&key_pem) {
-        SigningKey::Rsa(k)
-    } else {
+    let key = crate::util::signing_key_from_pem(&key_pem).unwrap_or_else(|| {
         die(format!(
-            "{key_path}: client cert key must be Ed25519 (PKCS#8), ECDSA (SEC1), or RSA (PKCS#1)"
-        ));
-    };
+            "{key_path}: client cert key must be RSA (PKCS#1 or PKCS#8), ECDSA (SEC1 or PKCS#8), \
+             Ed25519 or Ed448 (PKCS#8)"
+        ))
+    });
     (chain, key)
 }
 

@@ -96,12 +96,17 @@ fn load_priv(path: &str) -> PrivKey {
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
         return PrivKey::Rsa(k);
     }
+    if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(pem) {
+        return PrivKey::Rsa(k);
+    }
     // SM2 keys share the SEC1 `EC PRIVATE KEY` PEM label with ECDSA keys; the
     // SM2 parser rejects every non-SM2 curve, routing SM2 to SM2-PKE.
     if let Ok(k) = Sm2PrivateKey::from_sec1_pem(pem) {
         return PrivKey::Sm2(k);
     }
-    die("unrecognized private key for encrypt/decrypt (expected RSA PKCS#1 or SM2 SEC1 PEM)");
+    die(
+        "unrecognized private key for encrypt/decrypt (expected RSA PKCS#1/PKCS#8 or SM2 SEC1 PEM)",
+    );
 }
 
 /// Loads a private key as a boxed unified [`key::PrivateKey`] trait object for

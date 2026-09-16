@@ -41,6 +41,15 @@ fn curve_name(c: CurveId) -> &'static str {
 
 /// Tries every supported PKCS#8 private-key flavor.
 fn parse_pkcs8(pem: &str) -> Option<Key> {
+    // RSA / EC keys in the PKCS#8 envelope (what `openssl genpkey` and
+    // `openssl pkey` write by default) — not just the legacy PKCS#1 / SEC1
+    // forms `genpkey` here emits.
+    if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(pem) {
+        return Some(Key::Rsa(k));
+    }
+    if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem(pem) {
+        return Some(Key::Ec(k));
+    }
     if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(pem) {
         return Some(Key::Ed25519(k));
     }
