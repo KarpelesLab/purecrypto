@@ -14,6 +14,9 @@ use crate::rng::{CryptoRng, RngCore};
 
 use super::config::Config;
 use super::error::Error;
+#[cfg(feature = "dtls")]
+use super::opts::DtlsOpts;
+use super::opts::{ClientOpts, CommonOpts, ServerOpts};
 use super::version::ProtocolVersion;
 
 /// Type-erased RNG the public [`Connection`] hands to its engines: the
@@ -1374,6 +1377,15 @@ fn cipher_suite_name(id: u16) -> &'static str {
 }
 
 // ---- Engine builders --------------------------------------------------------
+//
+// Each builder translates the shared `Config` into one engine's own config
+// type. To keep them from drifting apart, every builder consumes the option
+// groups of `Config::parts` (see `super::opts`) by destructuring them WITHOUT
+// `..`: a field added to `Config` is a compile error in each builder until it
+// is forwarded, refused (fail closed), or explicitly marked inert with a
+// `let _ = field;` and a reason. The TLS 1.3 translation is shared with the
+// QUIC adapters in `crate::quic::connection` through `tls13_client_config` /
+// `tls13_server_config`, so the two cannot diverge.
 
 /// The client's intended server name, used for SNI and (when enabled) hostname
 /// verification. A name is **required only when `verify_certificates` is on** —
@@ -1382,63 +1394,162 @@ fn cipher_suite_name(id: u16) -> &'static str {
 /// a device by IP), the name is optional; an empty string means "no SNI, no
 /// hostname check", which the engines honour by omitting the SNI extension.
 fn client_server_name(cfg: &Config) -> Result<&str, Error> {
-    match cfg.server_name.as_deref() {
+    resolve_server_name(cfg.server_name.as_deref(), cfg.verify_certificates)
+}
+
+/// [`client_server_name`] over the already-split `ClientOpts` values.
+fn resolve_server_name(
+    server_name: Option<&str>,
+    verify_certificates: bool,
+) -> Result<&str, Error> {
+    match server_name {
         Some(name) => Ok(name),
-        None if !cfg.verify_certificates => Ok(""),
+        None if !verify_certificates => Ok(""),
         None => Err(Error::MissingServerName),
     }
 }
 
-fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Error> {
-    let mut cc = super::conn::ClientConfig::new(cfg.roots.clone_store());
-    cc.verify_certificates = cfg.verify_certificates;
-    cc.cipher_suites = cfg.cipher_suites.clone();
-    // Offer TLS 1.2 alongside 1.3 when the configured range spans down to 1.2
-    // and we are not resuming a (1.3-only) session — so a 1.2-only server can
-    // negotiate and the engine can downgrade. Pinned `min == 1.3` keeps a pure
-    // 1.3 ClientHello.
-    cc.offer_tls12 = cfg.min_version != ProtocolVersion::TLSv1_3 && cfg.resumption.is_none();
-    if !cfg.alpn_protocols.is_empty() {
-        cc = cc.with_alpn(cfg.alpn_protocols.clone());
-    }
-    if !cfg.crls.is_empty() {
-        cc = cc.with_crls(cfg.crls.clone_store());
-    }
-    if let Some(t) = cfg.verification_time.clone() {
-        cc.verification_time = Some(t);
-    }
-    if let Some(rsl) = cfg.record_size_limit {
-        cc = cc.with_record_size_limit(rsl);
-    }
-    cc = cc.with_signature_policy(cfg.signature_policy.clone());
-    if let Some(id) = &cfg.identity {
-        let cc_cfg = client_cert_from_signing(id);
-        if let Some(c) = cc_cfg {
-            cc = cc.with_client_cert(c);
+/// Which transport a TLS 1.3 engine config is being built for.
+///
+/// QUIC (RFC 9001) carries the TLS 1.3 handshake without TLS records and
+/// pins the version, so the record-layer options and the version range do
+/// not apply there; the QUIC adapter also owns 0-RTT sizing and resumption.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tls13Transport {
+    /// A stream transport (TCP): the TLS record layer is in use.
+    Tls,
+    /// QUIC: no record layer, TLS 1.3 only.
+    Quic,
+}
+
+/// Translates `cfg` into the TLS 1.3 client engine's config. Shared by
+/// [`build_tls13_client`] and the QUIC client adapter; `quic_session` is the
+/// QUIC caller's stored session (QUIC resumes from
+/// `QuicConfig::resumption`, which carries the transport parameters the
+/// ticket was issued under, not from `Config::resumption`).
+pub(crate) fn tls13_client_config(
+    cfg: &Config,
+    transport: Tls13Transport,
+    quic_session: Option<super::conn::StoredSession>,
+) -> Result<super::conn::ClientConfig, Error> {
+    let parts = cfg.parts();
+    let CommonOpts {
+        min_version,
+        max_version,
+        identity,
+        roots,
+        crls,
+        signature_policy,
+        verification_time,
+        alpn_protocols,
+        record_size_limit,
+        require_extended_master_secret,
+        server_cert_type_preference,
+        client_cert_type_preference,
+        raw_public_key_spki,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_algorithms,
+        key_log,
+        rng,
+        signer,
+    } = parts.common;
+    let ClientOpts {
+        server_name,
+        verify_certificates,
+        cipher_suites,
+        expected_raw_public_keys,
+        #[cfg(feature = "ech")]
+        ech,
+        resumption,
+    } = parts.client;
+    // Inert here: `max_version` chose this engine; EMS (RFC 7627) is a TLS
+    // 1.2 mechanism; `rng` is drawn through `config_rng` and `signer` through
+    // `Connection::drive`; the caller resolves `server_name` (see
+    // `client_server_name` / `QuicConnection::client`).
+    let _ = (
+        max_version,
+        require_extended_master_secret,
+        rng,
+        signer,
+        server_name,
+    );
+
+    let mut cc = super::conn::ClientConfig::new(roots.clone_store());
+    cc.verify_certificates = verify_certificates;
+    match transport {
+        Tls13Transport::Tls => {
+            cc.cipher_suites = cipher_suites.map(<[u16]>::to_vec);
+            // Offer TLS 1.2 alongside 1.3 when the configured range spans down
+            // to 1.2 and we are not resuming a (1.3-only) session — so a
+            // 1.2-only server can negotiate and the engine can downgrade.
+            // Pinned `min == 1.3` keeps a pure 1.3 ClientHello.
+            cc.offer_tls12 = min_version != ProtocolVersion::TLSv1_3 && resumption.is_none();
+            if let Some(rsl) = record_size_limit {
+                cc = cc.with_record_size_limit(rsl);
+            }
+        }
+        Tls13Transport::Quic => {
+            // QUIC v1 is TLS 1.3 only (`offer_tls12` stays off and
+            // `min_version` is moot) and has no record layer, so RFC 8449
+            // does not apply. The QUIC engine offers its own fixed TLS 1.3
+            // suite set, so the client restriction is not forwarded either.
+            let _ = (min_version, record_size_limit, cipher_suites);
         }
     }
-    cc = cc.with_server_cert_type_preference(cfg.server_cert_type_preference.clone());
-    cc = cc.with_client_cert_type_preference(cfg.client_cert_type_preference.clone());
-    for spki in &cfg.expected_raw_public_keys {
+    if !alpn_protocols.is_empty() {
+        cc = cc.with_alpn(alpn_protocols.to_vec());
+    }
+    if !crls.is_empty() {
+        cc = cc.with_crls(crls.clone_store());
+    }
+    if let Some(t) = verification_time {
+        cc.verification_time = Some(t.clone());
+    }
+    cc = cc.with_signature_policy(signature_policy.clone());
+    if let Some(id) = identity
+        && let Some(c) = client_cert_from_signing(id)
+    {
+        cc = cc.with_client_cert(c);
+    }
+    cc = cc.with_server_cert_type_preference(server_cert_type_preference.to_vec());
+    cc = cc.with_client_cert_type_preference(client_cert_type_preference.to_vec());
+    for spki in expected_raw_public_keys {
         cc = cc.add_expected_raw_public_key(spki.clone());
     }
-    if let Some(spki) = cfg.raw_public_key_spki.clone() {
-        cc = cc.with_client_raw_public_key_spki(spki);
+    if let Some(spki) = raw_public_key_spki {
+        cc = cc.with_client_raw_public_key_spki(spki.to_vec());
     }
-    cc.key_log = cfg.key_log.clone();
+    cc.key_log = key_log.clone();
+    // ECH and certificate compression are TLS 1.3 handshake features that
+    // apply to QUIC unchanged (ECH is how HTTP/3 hides its SNI).
     #[cfg(feature = "ech")]
     {
-        cc.ech = cfg.ech.clone();
+        cc.ech = ech.clone();
     }
     #[cfg(feature = "cert-compression")]
     {
-        cc = cc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
+        cc = cc.with_cert_compression_algorithms(cert_compression_algorithms.to_vec());
     }
-    // Prime PSK resumption from a stored TLS 1.3 session, if one was supplied
-    // (a 1.2 session here is simply ignored — version mismatch).
-    if let Some(ResumptionSession(ResumptionSessionKind::Tls13(s))) = &cfg.resumption {
-        cc = cc.with_session(s.clone());
+    match transport {
+        // Prime PSK resumption from a stored TLS 1.3 session, if one was
+        // supplied (a 1.2 session here is simply ignored — version mismatch).
+        Tls13Transport::Tls => {
+            if let Some(ResumptionSession(ResumptionSessionKind::Tls13(s))) = resumption {
+                cc = cc.with_session(s.clone());
+            }
+        }
+        Tls13Transport::Quic => {
+            let _ = resumption;
+            if let Some(s) = quic_session {
+                cc = cc.with_session(s);
+            }
+        }
     }
+    Ok(cc)
+}
+
+fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Error> {
+    let cc = tls13_client_config(cfg, Tls13Transport::Tls, None)?;
     let server_name = client_server_name(cfg)?;
     super::conn::ClientConnection::new(cc, server_name, &mut config_rng(cfg)?)
 }
@@ -1447,42 +1558,91 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
 /// Shared by [`build_tls12_client`] (fresh handshake) and
 /// [`build_tls12_client_adopt`] (version-spanning downgrade).
 fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Error> {
-    let mut cc = super::conn::ClientConfig12::new(cfg.roots.clone_store());
-    cc.verify_certificates = cfg.verify_certificates;
-    cc.cipher_suites = cfg.cipher_suites.clone();
-    if !cfg.alpn_protocols.is_empty() {
-        cc = cc.with_alpn(cfg.alpn_protocols.clone());
+    let parts = cfg.parts();
+    let CommonOpts {
+        min_version,
+        max_version,
+        identity,
+        roots,
+        crls,
+        signature_policy,
+        verification_time,
+        alpn_protocols,
+        record_size_limit,
+        require_extended_master_secret,
+        server_cert_type_preference,
+        client_cert_type_preference,
+        raw_public_key_spki,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_algorithms,
+        key_log,
+        rng,
+        signer,
+    } = parts.common;
+    let ClientOpts {
+        server_name,
+        verify_certificates,
+        cipher_suites,
+        expected_raw_public_keys,
+        #[cfg(feature = "ech")]
+        ech,
+        resumption,
+    } = parts.client;
+    // Inert on the TLS 1.2 engine: RFC 7250 raw public keys, RFC 8879
+    // certificate compression and ECH are TLS 1.3 features (see the `Config`
+    // field docs); `rng` is drawn through `config_rng`, `signer` through
+    // `Connection::drive`, and the caller resolves `server_name`.
+    let _ = (
+        server_cert_type_preference,
+        client_cert_type_preference,
+        raw_public_key_spki,
+        expected_raw_public_keys,
+        rng,
+        signer,
+        server_name,
+    );
+    #[cfg(feature = "cert-compression")]
+    let _ = cert_compression_algorithms;
+    #[cfg(feature = "ech")]
+    let _ = ech;
+    #[cfg(not(feature = "tls-legacy"))]
+    let _ = (min_version, max_version);
+
+    let mut cc = super::conn::ClientConfig12::new(roots.clone_store());
+    cc.verify_certificates = verify_certificates;
+    cc.cipher_suites = cipher_suites.map(<[u16]>::to_vec);
+    if !alpn_protocols.is_empty() {
+        cc = cc.with_alpn(alpn_protocols.to_vec());
     }
-    if !cfg.crls.is_empty() {
-        cc = cc.with_crls(cfg.crls.clone_store());
+    if !crls.is_empty() {
+        cc = cc.with_crls(crls.clone_store());
     }
-    if let Some(t) = cfg.verification_time.clone() {
-        cc = cc.with_verification_time(t);
+    if let Some(t) = verification_time {
+        cc = cc.with_verification_time(t.clone());
     }
-    if let Some(rsl) = cfg.record_size_limit {
+    if let Some(rsl) = record_size_limit {
         cc = cc.with_record_size_limit(rsl);
     }
-    cc = cc.with_signature_policy(cfg.signature_policy.clone());
-    cc = cc.with_require_ems(cfg.require_extended_master_secret);
-    if let Some(id) = &cfg.identity {
-        let cc_cfg = client_cert_from_signing(id);
-        if let Some(c) = cc_cfg {
-            cc = cc.with_client_cert(c);
-        }
+    cc = cc.with_signature_policy(signature_policy.clone());
+    cc = cc.with_require_ems(require_extended_master_secret);
+    if let Some(id) = identity
+        && let Some(c) = client_cert_from_signing(id)
+    {
+        cc = cc.with_client_cert(c);
     }
-    cc.key_log = cfg.key_log.clone();
+    cc.key_log = key_log.clone();
     #[cfg(feature = "tls-legacy")]
     {
-        cc = cc.with_min_version(cfg.min_version);
+        cc = cc.with_min_version(min_version);
         // The 1.2 engine caps at TLS 1.2; only propagate a lower max so a
         // legacy-only caller offers `legacy_version` ≤ 1.1 and no AEAD suites.
-        if cfg.max_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16() {
-            cc = cc.with_max_version(cfg.max_version);
+        if max_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16() {
+            cc = cc.with_max_version(max_version);
         }
     }
     // Prime RFC 5077 ticket resumption from a stored TLS 1.2 session, if one
     // was supplied (a 1.3 session here is simply ignored — version mismatch).
-    if let Some(ResumptionSession(ResumptionSessionKind::Tls12(s))) = &cfg.resumption {
+    if let Some(ResumptionSession(ResumptionSessionKind::Tls12(s))) = resumption {
         cc = cc.with_session(s.clone());
     }
     Ok(cc)
@@ -1512,10 +1672,10 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
     super::conn::ClientConnection12::new(cc, server_name, &mut config_rng(cfg)?)
 }
 
-fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<ConfigRng>, Error> {
-    let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
+/// The TLS 1.3 server engine config for `id`'s chain and signing key.
+fn tls13_server_config_from_identity(id: &super::config::Identity) -> super::conn::ServerConfig {
     let chain = id.cert_chain.clone();
-    let mut sc = match &id.key {
+    match &id.key {
         super::config::SigningKey::Rsa(k) => super::conn::ServerConfig::with_rsa(chain, k.clone()),
         super::config::SigningKey::Ecdsa(k) => {
             super::conn::ServerConfig::with_ecdsa(chain, k.clone())
@@ -1541,64 +1701,208 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<Conf
         super::config::SigningKey::External { schemes } => {
             super::conn::ServerConfig::with_external(chain, schemes.clone())
         }
-    };
-    if !cfg.alpn_protocols.is_empty() {
-        sc = sc.with_alpn(cfg.alpn_protocols.clone());
     }
-    if !cfg.crls.is_empty() {
-        sc = sc.with_crls(cfg.crls.clone_store());
+}
+
+/// Translates `cfg` into the TLS 1.3 server engine's config. Shared by
+/// [`build_tls13_server`] and the QUIC server adapter.
+pub(crate) fn tls13_server_config(
+    cfg: &Config,
+    transport: Tls13Transport,
+) -> Result<super::conn::ServerConfig, Error> {
+    let parts = cfg.parts();
+    let CommonOpts {
+        min_version,
+        max_version,
+        identity,
+        roots,
+        crls,
+        signature_policy,
+        verification_time,
+        alpn_protocols,
+        record_size_limit,
+        require_extended_master_secret,
+        server_cert_type_preference,
+        client_cert_type_preference,
+        raw_public_key_spki,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_algorithms,
+        key_log,
+        rng,
+        signer,
+    } = parts.common;
+    let ServerOpts {
+        client_auth,
+        stapled_crl,
+        stapled_ocsp_response,
+        ticket_key,
+        max_early_data_size,
+        #[cfg(feature = "std")]
+        replay_window,
+        expected_client_raw_public_keys,
+        preferred_key_exchange_group,
+        #[cfg(feature = "ech")]
+        ech_server,
+    } = parts.server;
+    // Inert here: the version pair chose this engine; EMS is TLS 1.2 only;
+    // a server's trust anchors for mTLS come from `client_auth`, not `roots`;
+    // `rng` is drawn through `config_rng` and `signer` through
+    // `Connection::drive`.
+    let _ = (
+        min_version,
+        max_version,
+        require_extended_master_secret,
+        roots,
+        rng,
+        signer,
+    );
+
+    let id = identity.ok_or(Error::InappropriateState)?;
+    if transport == Tls13Transport::Quic
+        && matches!(id.key, super::config::SigningKey::External { .. })
+    {
+        // External (suspend/resume) signing is not wired through the QUIC
+        // driver — the QUIC connection has no `provide_signature` resume path
+        // — so reject it at construction rather than stalling the handshake.
+        return Err(Error::InappropriateState);
     }
-    if let Some(rsl) = cfg.record_size_limit {
-        sc = sc.with_record_size_limit(rsl);
+    let mut sc = tls13_server_config_from_identity(id);
+    if !alpn_protocols.is_empty() {
+        sc = sc.with_alpn(alpn_protocols.to_vec());
     }
-    if let Some(ca) = &cfg.client_auth {
+    if !crls.is_empty() {
+        sc = sc.with_crls(crls.clone_store());
+    }
+    if let Some(ca) = client_auth {
         sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
     }
-    if let Some(tk) = &cfg.ticket_key {
+    if let Some(tk) = ticket_key {
         sc = sc.with_ticket_key(*tk.as_bytes());
     }
-    if cfg.max_early_data_size > 0 {
-        sc = sc.with_max_early_data(cfg.max_early_data_size);
+    match transport {
+        Tls13Transport::Tls => {
+            if let Some(rsl) = record_size_limit {
+                sc = sc.with_record_size_limit(rsl);
+            }
+            if max_early_data_size > 0 {
+                sc = sc.with_max_early_data(max_early_data_size);
+            }
+            #[cfg(feature = "std")]
+            if let Some(rw) = replay_window {
+                sc = sc.with_replay_window(rw.clone());
+            }
+        }
+        Tls13Transport::Quic => {
+            // No record layer, so RFC 8449 does not apply. RFC 9001 §4.6.1
+            // fixes the advertised early-data size at 0xffffffff, and the
+            // QUIC adapter sets it — together with the replay window — only
+            // when `QuicConfig::enable_early_data` opts in.
+            let _ = (record_size_limit, max_early_data_size);
+            #[cfg(feature = "std")]
+            let _ = replay_window;
+        }
     }
-    #[cfg(feature = "std")]
-    if let Some(rw) = cfg.replay_window.clone() {
-        sc = sc.with_replay_window(rw);
+    if let Some(crl) = stapled_crl {
+        sc = sc.with_stapled_crl(crl.to_vec());
     }
-    if let Some(crl) = cfg.stapled_crl.clone() {
-        sc = sc.with_stapled_crl(crl);
+    if let Some(ocsp) = stapled_ocsp_response {
+        sc = sc.with_stapled_ocsp_response(ocsp.to_vec());
     }
-    if let Some(ocsp) = cfg.stapled_ocsp_response.clone() {
-        sc = sc.with_stapled_ocsp_response(ocsp);
+    sc = sc.with_server_cert_type_preference(server_cert_type_preference.to_vec());
+    sc = sc.with_client_cert_type_preference(client_cert_type_preference.to_vec());
+    if let Some(spki) = raw_public_key_spki {
+        sc = sc.with_raw_public_key_spki(spki.to_vec());
     }
-    sc = sc.with_server_cert_type_preference(cfg.server_cert_type_preference.clone());
-    sc = sc.with_client_cert_type_preference(cfg.client_cert_type_preference.clone());
-    if let Some(spki) = cfg.raw_public_key_spki.clone() {
-        sc = sc.with_raw_public_key_spki(spki);
-    }
-    for spki in &cfg.expected_client_raw_public_keys {
+    for spki in expected_client_raw_public_keys {
         sc = sc.add_expected_client_raw_public_key(spki.clone());
     }
-    sc = sc.with_signature_policy(cfg.signature_policy.clone());
+    sc = sc.with_signature_policy(signature_policy.clone());
     #[cfg(feature = "cert-compression")]
     {
-        sc = sc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
+        sc = sc.with_cert_compression_algorithms(cert_compression_algorithms.to_vec());
     }
     #[cfg(feature = "ech")]
-    if let Some(ech) = cfg.ech_server.clone() {
+    if let Some(ech) = ech_server.clone() {
         sc = sc.with_ech_server(ech);
     }
-    if let Some(g) = cfg.preferred_key_exchange_group {
+    if let Some(g) = preferred_key_exchange_group {
         sc = sc.with_preferred_key_exchange_group(g);
     }
-    if let Some(t) = cfg.verification_time.clone() {
-        sc = sc.with_verification_time(t);
+    if let Some(t) = verification_time {
+        sc = sc.with_verification_time(t.clone());
     }
-    sc.key_log = cfg.key_log.clone();
+    sc.key_log = key_log.clone();
+    Ok(sc)
+}
+
+fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<ConfigRng>, Error> {
+    let sc = tls13_server_config(cfg, Tls13Transport::Tls)?;
     Ok(super::conn::ServerConnection::new(sc, config_rng(cfg)?))
 }
 
 fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<ConfigRng>, Error> {
-    let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
+    let parts = cfg.parts();
+    let CommonOpts {
+        min_version,
+        max_version,
+        identity,
+        roots,
+        crls,
+        signature_policy,
+        verification_time,
+        alpn_protocols,
+        record_size_limit,
+        require_extended_master_secret,
+        server_cert_type_preference,
+        client_cert_type_preference,
+        raw_public_key_spki,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_algorithms,
+        key_log,
+        rng,
+        signer,
+    } = parts.common;
+    let ServerOpts {
+        client_auth,
+        stapled_crl,
+        stapled_ocsp_response,
+        ticket_key,
+        max_early_data_size,
+        #[cfg(feature = "std")]
+        replay_window,
+        expected_client_raw_public_keys,
+        preferred_key_exchange_group,
+        #[cfg(feature = "ech")]
+        ech_server,
+    } = parts.server;
+    // Inert on the TLS 1.2 engine (see the `Config` field docs): a server's
+    // trust anchors for mTLS come from `client_auth`; there is no per-cert
+    // extension slot for a stapled CRL, no 0-RTT, no RFC 7250 raw public keys,
+    // no RFC 8879 compression, no ECH and no HelloRetryRequest group
+    // preference. `rng` is drawn through `config_rng`, `signer` through
+    // `Connection::drive`.
+    let _ = (
+        roots,
+        stapled_crl,
+        max_early_data_size,
+        server_cert_type_preference,
+        client_cert_type_preference,
+        raw_public_key_spki,
+        expected_client_raw_public_keys,
+        preferred_key_exchange_group,
+        rng,
+        signer,
+    );
+    #[cfg(feature = "std")]
+    let _ = replay_window;
+    #[cfg(feature = "cert-compression")]
+    let _ = cert_compression_algorithms;
+    #[cfg(feature = "ech")]
+    let _ = ech_server;
+    #[cfg(not(feature = "tls-legacy"))]
+    let _ = min_version;
+
+    let id = identity.ok_or(Error::InappropriateState)?;
     let chain = id.cert_chain.clone();
     let mut sc = id
         .key
@@ -1607,69 +1911,222 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     // RFC 8446 §4.1.3 downgrade sentinel: only set it when this deployment is
     // actually TLS-1.3-capable (a version-spanning server). A pinned `max=1.2`
     // server must not, or 1.3-capable clients would abort.
-    sc = sc.with_supports_tls13(cfg.max_version == ProtocolVersion::TLSv1_3);
-    if !cfg.alpn_protocols.is_empty() {
-        sc = sc.with_alpn(cfg.alpn_protocols.clone());
+    sc = sc.with_supports_tls13(max_version == ProtocolVersion::TLSv1_3);
+    if !alpn_protocols.is_empty() {
+        sc = sc.with_alpn(alpn_protocols.to_vec());
     }
-    if !cfg.crls.is_empty() {
-        sc = sc.with_crls(cfg.crls.clone_store());
+    if !crls.is_empty() {
+        sc = sc.with_crls(crls.clone_store());
     }
-    if let Some(rsl) = cfg.record_size_limit {
+    if let Some(rsl) = record_size_limit {
         sc = sc.with_record_size_limit(rsl);
     }
-    if let Some(ca) = &cfg.client_auth {
+    if let Some(ca) = client_auth {
         sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
     }
-    if let Some(tk) = &cfg.ticket_key {
+    if let Some(tk) = ticket_key {
         sc = sc.with_ticket_key(*tk.as_bytes());
     }
-    if let Some(ocsp) = cfg.stapled_ocsp_response.clone() {
-        sc = sc.with_stapled_ocsp_response(ocsp);
+    if let Some(ocsp) = stapled_ocsp_response {
+        sc = sc.with_stapled_ocsp_response(ocsp.to_vec());
     }
-    sc = sc.with_signature_policy(cfg.signature_policy.clone());
-    sc = sc.with_require_ems(cfg.require_extended_master_secret);
-    if let Some(t) = cfg.verification_time.clone() {
-        sc = sc.with_verification_time(t);
+    sc = sc.with_signature_policy(signature_policy.clone());
+    sc = sc.with_require_ems(require_extended_master_secret);
+    if let Some(t) = verification_time {
+        sc = sc.with_verification_time(t.clone());
     }
-    sc.key_log = cfg.key_log.clone();
+    sc.key_log = key_log.clone();
     #[cfg(feature = "tls-legacy")]
     {
-        sc = sc.with_min_version(cfg.min_version);
+        sc = sc.with_min_version(min_version);
     }
     Ok(super::conn::ServerConnection12::new(sc, config_rng(cfg)?))
 }
 
-/// The DTLS engines implement neither Encrypted Client Hello nor its
-/// GREASE form. A `Config` that asks for ECH but negotiates DTLS would
-/// otherwise silently send the server name in the clear, so refuse to
-/// build the connection instead (mirroring the fail-closed posture of the
-/// cookie and client-auth checks below).
+/// The `Config` options a DTLS client engine consumes, checked once for both
+/// DTLS versions by [`dtls_client_opts`].
 #[cfg(feature = "dtls")]
-fn reject_ech_over_dtls(cfg: &Config) -> Result<(), Error> {
+struct DtlsClientOpts<'a> {
+    roots: &'a super::pki::RootCertStore,
+    server_name: &'a str,
+    verify_certificates: bool,
+    crls: &'a super::pki::CrlStore,
+    verification_time: Option<&'a crate::x509::Time>,
+    signature_policy: &'a crate::signature_registry::SignaturePolicy,
+    key_log: &'a Option<alloc::sync::Arc<dyn super::keylog::KeyLog>>,
+    cipher_suites: Option<&'a [u16]>,
+    alpn_protocols: &'a [Vec<u8>],
+    require_extended_master_secret: bool,
+    max_record_size: usize,
+}
+
+/// Takes `cfg` apart for a DTLS client and refuses, with
+/// [`Error::InappropriateState`], any option the DTLS engines cannot honour
+/// where ignoring it would weaken what the caller asked for: ECH (the server
+/// name would go out in the clear), a client identity (the client would
+/// connect anonymously — the DTLS engines never send a `Certificate`), a
+/// `record_size_limit` (RFC 8449 is not implemented over DTLS), and RFC 7250
+/// raw public keys (a pinned raw key with `verify_certificates` off would
+/// leave the peer entirely unauthenticated). This mirrors the fail-closed
+/// posture of the cookie and client-auth checks in the server builders.
+#[cfg(feature = "dtls")]
+fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
+    let parts = cfg.parts();
+    let CommonOpts {
+        min_version,
+        max_version,
+        identity,
+        roots,
+        crls,
+        signature_policy,
+        verification_time,
+        alpn_protocols,
+        record_size_limit,
+        require_extended_master_secret,
+        server_cert_type_preference,
+        client_cert_type_preference,
+        raw_public_key_spki,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_algorithms,
+        key_log,
+        rng,
+        signer,
+    } = parts.common;
+    let ClientOpts {
+        server_name,
+        verify_certificates,
+        cipher_suites,
+        expected_raw_public_keys,
+        #[cfg(feature = "ech")]
+        ech,
+        resumption,
+    } = parts.client;
+    let DtlsOpts {
+        cookie_secret,
+        previous_cookie_secret,
+        require_cookie,
+        max_record_size,
+        peer_address,
+    } = parts.dtls;
+    // Inert on a DTLS client: the version pair chose the engine; the cookie
+    // knobs and the peer address are server-side; `rng` is drawn through
+    // `config_rng` and `signer` through `Connection::drive` (a signer without
+    // an identity is impossible — `ConfigBuilder::private_key` sets both, and
+    // an identity is refused below); a stored session is always a TLS one
+    // (the DTLS servers issue no tickets), so `resumption` never matches —
+    // the documented "wrong version is ignored" rule. RFC 8879 certificate
+    // compression is not implemented over DTLS: the advertisement is not
+    // sent, and the peer's certificate arrives uncompressed.
+    let _ = (
+        min_version,
+        max_version,
+        cookie_secret,
+        previous_cookie_secret,
+        require_cookie,
+        peer_address,
+        rng,
+        signer,
+        resumption,
+    );
+    #[cfg(feature = "cert-compression")]
+    let _ = cert_compression_algorithms;
+
+    // Fail closed (see the doc comment above).
     #[cfg(feature = "ech")]
-    if cfg.ech.is_some() || cfg.ech_server.is_some() {
+    if ech.is_some() {
         return Err(Error::InappropriateState);
     }
-    let _ = cfg;
-    Ok(())
+    if identity.is_some() || record_size_limit.is_some() {
+        return Err(Error::InappropriateState);
+    }
+    if server_cert_type_preference != [0]
+        || client_cert_type_preference != [0]
+        || raw_public_key_spki.is_some()
+        || !expected_raw_public_keys.is_empty()
+    {
+        return Err(Error::InappropriateState);
+    }
+    let server_name = resolve_server_name(server_name, verify_certificates)?;
+    Ok(DtlsClientOpts {
+        roots,
+        server_name,
+        verify_certificates,
+        crls,
+        verification_time,
+        signature_policy,
+        key_log,
+        cipher_suites,
+        alpn_protocols,
+        require_extended_master_secret,
+        max_record_size,
+    })
+}
+
+/// Applies a [`Config::cipher_suites`] restriction to a DTLS engine's
+/// supported suite list: keeps the engine's suites that the caller listed, in
+/// the caller's order, and fails closed with
+/// [`Error::NoUsableCipherSuites`] when nothing is left — exactly as the TLS
+/// engines do — so a typo'd list cannot silently re-enable every suite.
+#[cfg(feature = "dtls")]
+fn restrict_dtls_cipher_suites(
+    supported: Vec<super::codec::CipherSuite>,
+    wanted: Option<&[u16]>,
+) -> Result<Vec<super::codec::CipherSuite>, Error> {
+    let Some(wanted) = wanted else {
+        return Ok(supported);
+    };
+    let mut picked: Vec<super::codec::CipherSuite> = Vec::new();
+    for &id in wanted {
+        if let Some(s) = supported.iter().find(|s| s.0 == id)
+            && !picked.contains(s)
+        {
+            picked.push(*s);
+        }
+    }
+    if picked.is_empty() {
+        return Err(Error::NoUsableCipherSuites);
+    }
+    Ok(picked)
 }
 
 #[cfg(feature = "dtls")]
 fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection12, Error> {
-    reject_ech_over_dtls(cfg)?;
-    let server_name = client_server_name(cfg)?;
-    let mut dc = crate::dtls::ClientConfig12Internal::new(cfg.roots.clone_store(), server_name);
-    if !cfg.verify_certificates {
+    let DtlsClientOpts {
+        roots,
+        server_name,
+        verify_certificates,
+        crls,
+        verification_time,
+        signature_policy,
+        key_log,
+        cipher_suites,
+        alpn_protocols,
+        require_extended_master_secret,
+        max_record_size,
+    } = dtls_client_opts(cfg)?;
+    // DTLS 1.2 fragments handshake records at a fixed 1100 bytes (see
+    // `Config::max_record_size`). The DTLS 1.2 engine always offers and
+    // derives with EMS but does not yet enforce the server's echo, and does
+    // not implement ALPN; see the `Config` docs.
+    let _ = (
+        max_record_size,
+        require_extended_master_secret,
+        alpn_protocols,
+    );
+
+    let mut dc = crate::dtls::ClientConfig12Internal::new(roots.clone_store(), server_name);
+    if !verify_certificates {
         dc = dc.without_certificate_verification();
     }
-    if !cfg.crls.is_empty() {
-        dc = dc.with_crls(cfg.crls.clone_store());
+    if !crls.is_empty() {
+        dc = dc.with_crls(crls.clone_store());
     }
-    if let Some(t) = cfg.verification_time.clone() {
-        dc = dc.with_verification_time(t);
+    if let Some(t) = verification_time {
+        dc = dc.with_verification_time(t.clone());
     }
-    dc = dc.with_signature_policy(cfg.signature_policy.clone());
-    dc.key_log = cfg.key_log.clone();
+    dc = dc.with_signature_policy(signature_policy.clone());
+    dc.cipher_suites = restrict_dtls_cipher_suites(dc.cipher_suites, cipher_suites)?;
+    dc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsClientConnection12::new(
         dc,
         Vec::new(),
@@ -1679,21 +2136,38 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
 
 #[cfg(feature = "dtls")]
 fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection13, Error> {
-    reject_ech_over_dtls(cfg)?;
-    let server_name = client_server_name(cfg)?;
-    let mut dc = crate::dtls::ClientConfig13Internal::new(cfg.roots.clone_store(), server_name);
-    if !cfg.verify_certificates {
+    let DtlsClientOpts {
+        roots,
+        server_name,
+        verify_certificates,
+        crls,
+        verification_time,
+        signature_policy,
+        key_log,
+        cipher_suites,
+        alpn_protocols,
+        require_extended_master_secret,
+        max_record_size,
+    } = dtls_client_opts(cfg)?;
+    // EMS is a TLS 1.2 mechanism (DTLS 1.3 binds every secret to the
+    // transcript).
+    let _ = require_extended_master_secret;
+
+    let mut dc = crate::dtls::ClientConfig13Internal::new(roots.clone_store(), server_name);
+    if !verify_certificates {
         dc = dc.without_certificate_verification();
     }
-    if !cfg.crls.is_empty() {
-        dc = dc.with_crls(cfg.crls.clone_store());
+    if !crls.is_empty() {
+        dc = dc.with_crls(crls.clone_store());
     }
-    if let Some(t) = cfg.verification_time.clone() {
-        dc = dc.with_verification_time(t);
+    if let Some(t) = verification_time {
+        dc = dc.with_verification_time(t.clone());
     }
-    dc = dc.with_signature_policy(alloc::sync::Arc::new(cfg.signature_policy.clone()));
-    dc.max_record_size = cfg.max_record_size;
-    dc.key_log = cfg.key_log.clone();
+    dc = dc.with_signature_policy(alloc::sync::Arc::new(signature_policy.clone()));
+    dc.cipher_suites = restrict_dtls_cipher_suites(dc.cipher_suites, cipher_suites)?;
+    dc.alpn_protocols = alpn_protocols.to_vec();
+    dc.max_record_size = max_record_size;
+    dc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsClientConnection13::new(
         dc,
         Vec::new(),
@@ -1701,28 +2175,167 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     ))
 }
 
+/// The `Config` options a DTLS server engine consumes, checked once for both
+/// DTLS versions by [`dtls_server_opts`].
+#[cfg(feature = "dtls")]
+struct DtlsServerOpts<'a> {
+    identity: &'a super::config::Identity,
+    cookie_secret: Option<&'a super::secret::Secret32>,
+    previous_cookie_secret: Option<&'a super::secret::Secret32>,
+    require_cookie: bool,
+    peer_address: &'a [u8],
+    key_log: &'a Option<alloc::sync::Arc<dyn super::keylog::KeyLog>>,
+    signature_policy: &'a crate::signature_registry::SignaturePolicy,
+    alpn_protocols: &'a [Vec<u8>],
+    require_extended_master_secret: bool,
+    max_record_size: usize,
+}
+
+/// Takes `cfg` apart for a DTLS server, failing closed on what the DTLS
+/// engines cannot honour:
+///
+/// * a cookie-requiring server with no `cookie_secret` —
+///   [`Error::InappropriateState`]. RFC 6347 §4.2.1 / RFC 9147 §5.1: the
+///   cookie exchange defeats blind amplification attacks; silently disabling
+///   it under a misconfiguration is the 50-100x DoS amplification vector, so
+///   the operator must make a deliberate choice (`ConfigBuilder::no_cookie`);
+/// * `client_auth` — [`Error::UnsupportedVersion`]. The DTLS servers never
+///   emit a `CertificateRequest`, so access control would fail OPEN,
+///   admitting every anonymous client;
+/// * ECH, a `record_size_limit`, or RFC 7250 raw public keys /
+///   certificate-type preferences — [`Error::InappropriateState`], as in
+///   [`dtls_client_opts`].
+#[cfg(feature = "dtls")]
+fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
+    let parts = cfg.parts();
+    let CommonOpts {
+        min_version,
+        max_version,
+        identity,
+        roots,
+        crls,
+        signature_policy,
+        verification_time,
+        alpn_protocols,
+        record_size_limit,
+        require_extended_master_secret,
+        server_cert_type_preference,
+        client_cert_type_preference,
+        raw_public_key_spki,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_algorithms,
+        key_log,
+        rng,
+        signer,
+    } = parts.common;
+    let ServerOpts {
+        client_auth,
+        stapled_crl,
+        stapled_ocsp_response,
+        ticket_key,
+        max_early_data_size,
+        #[cfg(feature = "std")]
+        replay_window,
+        expected_client_raw_public_keys,
+        preferred_key_exchange_group,
+        #[cfg(feature = "ech")]
+        ech_server,
+    } = parts.server;
+    let DtlsOpts {
+        cookie_secret,
+        previous_cookie_secret,
+        require_cookie,
+        max_record_size,
+        peer_address,
+    } = parts.dtls;
+    // Inert on a DTLS server (see the `Config` docs): the version pair chose
+    // the engine; `roots` / `crls` / `verification_time` only serve mTLS,
+    // which is refused below; the DTLS servers issue no session tickets,
+    // accept no 0-RTT (so `max_early_data_size` and the replay window have
+    // nothing to guard), staple nothing, do not compress certificates and do
+    // not bias the key-exchange group. `rng` is drawn through `config_rng`
+    // and `signer` through `Connection::drive`.
+    let _ = (
+        min_version,
+        max_version,
+        roots,
+        crls,
+        verification_time,
+        stapled_crl,
+        stapled_ocsp_response,
+        ticket_key,
+        max_early_data_size,
+        preferred_key_exchange_group,
+        rng,
+        signer,
+    );
+    #[cfg(feature = "std")]
+    let _ = replay_window;
+    #[cfg(feature = "cert-compression")]
+    let _ = cert_compression_algorithms;
+
+    let identity = identity.ok_or(Error::InappropriateState)?;
+    #[cfg(feature = "ech")]
+    if ech_server.is_some() {
+        return Err(Error::InappropriateState);
+    }
+    if require_cookie && cookie_secret.is_none() {
+        return Err(Error::InappropriateState);
+    }
+    if client_auth.is_some() {
+        return Err(Error::UnsupportedVersion);
+    }
+    if record_size_limit.is_some()
+        || server_cert_type_preference != [0]
+        || client_cert_type_preference != [0]
+        || raw_public_key_spki.is_some()
+        || !expected_client_raw_public_keys.is_empty()
+    {
+        return Err(Error::InappropriateState);
+    }
+    Ok(DtlsServerOpts {
+        identity,
+        cookie_secret,
+        previous_cookie_secret,
+        require_cookie,
+        peer_address,
+        key_log,
+        signature_policy,
+        alpn_protocols,
+        require_extended_master_secret,
+        max_record_size,
+    })
+}
+
 #[cfg(feature = "dtls")]
 fn build_dtls12_server(
     cfg: &Config,
 ) -> Result<crate::dtls::DtlsServerConnection12<ConfigRng>, Error> {
-    reject_ech_over_dtls(cfg)?;
-    let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
-    // RFC 6347 §4.2.1: the cookie exchange defeats blind amplification
-    // attacks. We refuse to construct a server that claims to require the
-    // exchange but cannot mint cookies — silently disabling cookies under a
-    // misconfiguration is the 50-100x DoS amplification vector. Fail-closed
-    // so the operator makes a deliberate choice.
-    if cfg.require_cookie && cfg.cookie_secret.is_none() {
-        return Err(Error::InappropriateState);
-    }
-    // The DTLS 1.2 server never emits a `CertificateRequest`, so a configured
-    // `client_auth` would be silently ignored — access control would fail
-    // OPEN, admitting every anonymous client. Refuse to build instead.
-    if cfg.client_auth.is_some() {
-        return Err(Error::UnsupportedVersion);
-    }
-    let chain = id.cert_chain.clone();
-    let mut sc = match &id.key {
+    let DtlsServerOpts {
+        identity,
+        cookie_secret,
+        previous_cookie_secret,
+        require_cookie,
+        peer_address,
+        key_log,
+        signature_policy,
+        alpn_protocols,
+        require_extended_master_secret,
+        max_record_size,
+    } = dtls_server_opts(cfg)?;
+    // The DTLS 1.2 server verifies no client certificate (so the signature
+    // policy has nothing to govern), fragments at a fixed 1100 bytes, always
+    // echoes EMS when offered but does not yet enforce it, and does not
+    // implement ALPN; see the `Config` docs.
+    let _ = (
+        signature_policy,
+        max_record_size,
+        require_extended_master_secret,
+        alpn_protocols,
+    );
+
+    let chain = identity.cert_chain.clone();
+    let mut sc = match &identity.key {
         super::config::SigningKey::Ecdsa(k) => {
             crate::dtls::ServerConfig12Internal::with_ecdsa(chain, k.clone())
         }
@@ -1736,19 +2349,19 @@ fn build_dtls12_server(
         // ML-DSA are not common in TLS 1.2 practice.
         _ => return Err(Error::UnsupportedVersion),
     };
-    if let Some(secret) = &cfg.cookie_secret {
+    if let Some(secret) = cookie_secret {
         sc = sc.with_cookie_secret(*secret.as_bytes());
     }
-    if let Some(previous) = &cfg.previous_cookie_secret {
+    if let Some(previous) = previous_cookie_secret {
         sc = sc.with_previous_cookie_secret(*previous.as_bytes());
     }
-    if !cfg.require_cookie {
+    if !require_cookie {
         sc = sc.require_cookie_exchange(false);
     }
-    sc.key_log = cfg.key_log.clone();
+    sc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
-        cfg.peer_address.clone(),
+        peer_address.to_vec(),
         config_rng(cfg)?,
     ))
 }
@@ -1757,42 +2370,53 @@ fn build_dtls12_server(
 fn build_dtls13_server(
     cfg: &Config,
 ) -> Result<crate::dtls::DtlsServerConnection13<ConfigRng>, Error> {
-    reject_ech_over_dtls(cfg)?;
-    let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
-    // RFC 9147 §5.1: DTLS 1.3 retains the cookie-based stateless rejection
-    // for the same DoS-amplification reason. Mirror the fail-closed posture
-    // of `build_dtls12_server`.
-    if cfg.require_cookie && cfg.cookie_secret.is_none() {
-        return Err(Error::InappropriateState);
-    }
-    // As in `build_dtls12_server`: the DTLS 1.3 server does not request client
-    // certificates, so honouring a `client_auth` configuration is impossible —
-    // fail closed rather than admit unauthenticated clients.
-    if cfg.client_auth.is_some() {
-        return Err(Error::UnsupportedVersion);
-    }
-    let chain = id.cert_chain.clone();
-    let server_key = id.key.to_server_key_13();
+    let DtlsServerOpts {
+        identity,
+        cookie_secret,
+        previous_cookie_secret,
+        require_cookie,
+        peer_address,
+        key_log,
+        signature_policy,
+        alpn_protocols,
+        require_extended_master_secret,
+        max_record_size,
+    } = dtls_server_opts(cfg)?;
+    // The DTLS 1.3 server verifies no client certificate (so the signature
+    // policy has nothing to govern), EMS is a TLS 1.2 mechanism, and ALPN is
+    // not implemented; see the `Config` docs.
+    let _ = (
+        signature_policy,
+        require_extended_master_secret,
+        alpn_protocols,
+    );
+
+    let chain = identity.cert_chain.clone();
+    let server_key = identity.key.to_server_key_13();
     let mut sc = crate::dtls::ServerConfig13Internal::with_signing_key(chain, server_key);
-    if let Some(secret) = &cfg.cookie_secret {
+    if let Some(secret) = cookie_secret {
         sc = sc.with_cookie_secret(*secret.as_bytes());
     }
-    if let Some(previous) = &cfg.previous_cookie_secret {
+    if let Some(previous) = previous_cookie_secret {
         sc = sc.with_previous_cookie_secret(*previous.as_bytes());
     }
-    if !cfg.require_cookie {
+    if !require_cookie {
         sc = sc.with_no_cookie();
     }
-    sc.max_record_size = cfg.max_record_size;
-    sc.key_log = cfg.key_log.clone();
+    sc.max_record_size = max_record_size;
+    sc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
-        cfg.peer_address.clone(),
+        peer_address.to_vec(),
         config_rng(cfg)?,
     ))
 }
 
-fn client_cert_from_signing(id: &super::config::Identity) -> Option<super::conn::ClientCertConfig> {
+/// The TLS 1.3 / TLS 1.2 client-certificate config for `id`'s chain and
+/// signing key (mTLS). Shared with the QUIC client adapter.
+pub(crate) fn client_cert_from_signing(
+    id: &super::config::Identity,
+) -> Option<super::conn::ClientCertConfig> {
     Some(match &id.key {
         super::config::SigningKey::Rsa(k) => {
             super::conn::ClientCertConfig::with_rsa(id.cert_chain.clone(), k.clone())
@@ -2488,6 +3112,150 @@ mod tests {
                 required: false,
             });
             assert!(Connection::server(&cfg).is_err());
+        }
+    }
+
+    /// Pump two DTLS [`Connection`]s (one datagram per `pop`) until both
+    /// sides report a completed handshake. Panics if it stalls.
+    #[cfg(feature = "dtls")]
+    fn drive_dtls_pair(client: &mut Connection, server: &mut Connection) {
+        for _ in 0..64 {
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            loop {
+                let out = server.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                client.feed(&out).unwrap();
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                return;
+            }
+        }
+        panic!("DTLS handshake did not complete");
+    }
+
+    /// A DTLS client `Config` (verification off, SNI `dtls.example`) pinned
+    /// to `version`.
+    #[cfg(feature = "dtls")]
+    fn dtls_client_builder(version: ProtocolVersion) -> super::super::ConfigBuilder {
+        Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(version, version)
+            .verify_certificates(false)
+            .server_name("dtls.example")
+    }
+
+    /// `Config::cipher_suites` used to be silently ignored by the DTLS
+    /// clients (the full suite set was offered whatever the caller wrote).
+    /// It now restricts the offer exactly as over TLS — the negotiated suite
+    /// is the one listed — and fails closed with `NoUsableCipherSuites` when
+    /// the list matches nothing the engine supports.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_client_honours_cipher_suites_restriction() {
+        const ECDHE_ECDSA_CHACHA20: u16 = 0xCCA9;
+        const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+        for (version, suite, other) in [
+            (
+                ProtocolVersion::DTLSv1_2,
+                ECDHE_ECDSA_CHACHA20,
+                TLS_CHACHA20_POLY1305_SHA256,
+            ),
+            (
+                ProtocolVersion::DTLSv1_3,
+                TLS_CHACHA20_POLY1305_SHA256,
+                ECDHE_ECDSA_CHACHA20,
+            ),
+        ] {
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            let client_cfg = dtls_client_builder(version).cipher_suites(&[suite]).build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert_eq!(
+                client.negotiated_cipher_suite(),
+                Some(suite),
+                "{version:?}: the client must negotiate the one suite it listed"
+            );
+            assert_eq!(server.negotiated_cipher_suite(), Some(suite));
+
+            // A list naming only suites of the other DTLS version leaves this
+            // engine nothing to offer: refuse at construction rather than
+            // falling back to the full set.
+            let client_cfg = dtls_client_builder(version)
+                .cipher_suites(&[other, 0x0000])
+                .build();
+            assert!(matches!(
+                Connection::client(&client_cfg),
+                Err(Error::NoUsableCipherSuites)
+            ));
+        }
+    }
+
+    /// `Config` options the DTLS engines cannot honour, and whose silent
+    /// loss would weaken what the caller asked for, are refused at
+    /// construction with `InappropriateState` instead of being dropped:
+    /// a client identity (the DTLS engines never send a `Certificate`), a
+    /// `record_size_limit` (RFC 8449 is not implemented over DTLS), and RFC
+    /// 7250 raw public keys / certificate-type preferences on either side.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_refuses_options_it_cannot_honour() {
+        type ClientTweak<'a> =
+            Box<dyn Fn(super::super::ConfigBuilder) -> super::super::ConfigBuilder + 'a>;
+        type ServerTweak = Box<dyn Fn(&mut Config)>;
+        let (key, leaf) = ecdsa_identity(b"dtls-unsupported", "client.example");
+        for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
+            // Control: the plain client and server configs build.
+            assert!(Connection::client(&dtls_client_builder(version).build()).is_ok());
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            assert!(Connection::server(&server_cfg).is_ok());
+
+            let client_variants: [ClientTweak<'_>; 5] = [
+                Box::new(|b| {
+                    b.identity(
+                        alloc::vec![leaf.clone()],
+                        super::super::config::SigningKey::Ecdsa(key.clone()),
+                    )
+                }),
+                Box::new(|b| b.record_size_limit(1000)),
+                Box::new(|b| b.server_cert_type_preference(alloc::vec![2, 0])),
+                Box::new(|b| b.add_expected_raw_public_key(alloc::vec![0x30, 0x00])),
+                Box::new(|b| b.raw_public_key_spki(alloc::vec![0x30, 0x00])),
+            ];
+            for (i, variant) in client_variants.iter().enumerate() {
+                let cfg = variant(dtls_client_builder(version)).build();
+                assert!(
+                    matches!(Connection::client(&cfg), Err(Error::InappropriateState)),
+                    "{version:?}: client variant {i} must be refused"
+                );
+            }
+
+            let server_variants: [ServerTweak; 4] = [
+                Box::new(|c| c.record_size_limit = Some(1000)),
+                Box::new(|c| c.client_cert_type_preference = alloc::vec![2, 0]),
+                Box::new(|c| {
+                    c.expected_client_raw_public_keys = alloc::vec![alloc::vec![0x30, 0x00]]
+                }),
+                Box::new(|c| c.raw_public_key_spki = Some(alloc::vec![0x30, 0x00])),
+            ];
+            for (i, variant) in server_variants.iter().enumerate() {
+                let mut cfg = server_cfg.clone();
+                variant(&mut cfg);
+                assert!(
+                    matches!(Connection::server(&cfg), Err(Error::InappropriateState)),
+                    "{version:?}: server variant {i} must be refused"
+                );
+            }
         }
     }
 

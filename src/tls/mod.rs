@@ -81,6 +81,7 @@ mod groups;
 pub(crate) mod keylog;
 #[cfg(feature = "mio")]
 pub mod mio;
+pub(crate) mod opts;
 pub(crate) mod peek;
 pub(crate) mod pki;
 pub(crate) mod quic_hooks;
@@ -97,6 +98,8 @@ pub(crate) use conn::ClientCertConfig;
 #[cfg(feature = "std")]
 pub(crate) use conn::ReplayWindow;
 pub use connection::{Connection, HandshakeStatus, ResumptionSession, SignatureRequest, Step};
+#[cfg(feature = "quic")]
+pub(crate) use connection::{Tls13Transport, tls13_client_config, tls13_server_config};
 pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
 pub use groups::NamedGroup;

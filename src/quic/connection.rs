@@ -104,7 +104,9 @@ use crate::quic::varint;
 use crate::rng::{OsRng, RngCore};
 use crate::tls::conn::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 use crate::tls::quic_hooks::{Direction, Level};
-use crate::tls::{AlertDescription, Error};
+use crate::tls::{
+    AlertDescription, Error, Tls13Transport, tls13_client_config, tls13_server_config,
+};
 
 /// Maps a TLS encryption level to its QUIC packet-number space
 /// (RFC 9000 §12.3). 0-RTT and 1-RTT share the Application space.
@@ -6485,16 +6487,17 @@ impl QuicConnection {
 // ---------------------------------------------------------------------
 // Adapter helpers: build a pub(crate) ClientConfig / ServerConfig from
 // the public `tls::Config` so the new_for_quic constructors can consume
-// it. Mirrors the build_tls13_* helpers in tls::connection but inlined
-// here so we don't add a new public API in `tls::`.
-//
-// Keep the two in sync: every `Config` option that is meaningful over
-// QUIC must be copied here too, or it is silently ignored for QUIC
-// connections while honoured for TLS ones. The options deliberately NOT
-// copied are `record_size_limit` (RFC 8449 is a record-layer extension and
-// QUIC has no records), `cipher_suites` / `min_version` (the QUIC engine
-// offers its own fixed TLS 1.3 set; `offer_tls12` stays off), and the
-// DTLS-only cookie settings.
+// it. The translation itself is `tls::connection`'s `tls13_client_config`
+// / `tls13_server_config` in QUIC mode — the same code path as
+// `Connection::client` / `Connection::server` — so every `Config` option
+// the TLS 1.3 engine honours over TLS is honoured over QUIC too, and a new
+// option must be classified there for both transports before it compiles.
+// QUIC mode skips only what has no meaning here: `record_size_limit` (RFC
+// 8449 is a record-layer extension and QUIC has no records),
+// `cipher_suites` / `min_version` (the QUIC engine offers its own fixed
+// TLS 1.3 set; `offer_tls12` stays off), `Config::resumption` (QUIC resumes
+// from `QuicConfig::resumption`, which carries the transport parameters
+// alongside the ticket), and the DTLS-only cookie settings.
 // ---------------------------------------------------------------------
 
 fn build_client_tls_config(
@@ -6509,55 +6512,18 @@ fn build_client_tls_config(
     if cfg.tls.alpn_protocols.is_empty() {
         return Err(Error::NoApplicationProtocol);
     }
-    let mut cc = ClientConfig::new(cfg.tls.roots.clone_store());
-    cc.verify_certificates = cfg.tls.verify_certificates;
-    cc = cc.with_alpn(cfg.tls.alpn_protocols.clone());
-    if !cfg.tls.crls.is_empty() {
-        cc = cc.with_crls(cfg.tls.crls.clone_store());
-    }
-    if let Some(t) = cfg.tls.verification_time.clone() {
-        cc.verification_time = Some(t);
-    }
-    cc = cc.with_signature_policy(cfg.tls.signature_policy.clone());
-    if let Some(id) = &cfg.tls.identity {
-        let cc_cfg = client_cert_from_signing(id);
-        if let Some(c) = cc_cfg {
-            cc = cc.with_client_cert(c);
-        }
-    }
-    cc = cc.with_server_cert_type_preference(cfg.tls.server_cert_type_preference.clone());
-    cc = cc.with_client_cert_type_preference(cfg.tls.client_cert_type_preference.clone());
-    for spki in &cfg.tls.expected_raw_public_keys {
-        cc = cc.add_expected_raw_public_key(spki.clone());
-    }
-    if let Some(spki) = cfg.tls.raw_public_key_spki.clone() {
-        cc = cc.with_client_raw_public_key_spki(spki);
-    }
-    cc.key_log = cfg.tls.key_log.clone();
-    // ECH and certificate compression are TLS 1.3 handshake features that
-    // apply to QUIC unchanged (ECH is how HTTP/3 hides its SNI); the engine
-    // handles both identically in QUIC mode, so honour the configuration
-    // instead of dropping it on the floor.
-    #[cfg(feature = "ech")]
-    {
-        cc.ech = cfg.tls.ech.clone();
-    }
-    #[cfg(feature = "cert-compression")]
-    {
-        cc = cc.with_cert_compression_algorithms(cfg.tls.cert_compression_algorithms.clone());
-    }
     // Resumption. The TLS client offers `early_data` in its ClientHello
     // whenever the stored session carries a non-zero `max_early_data_size`,
     // so a caller who resumed without opting into 0-RTT gets the ticket with
     // that field zeroed: PSK resumption without early data.
-    if let Some(session) = cfg.resumption.as_ref() {
+    let session = cfg.resumption.as_ref().map(|session| {
         let mut stored = session.tls.clone();
         if !offer_early_data {
             stored.max_early_data_size = None;
         }
-        cc = cc.with_session(stored);
-    }
-    Ok(cc)
+        stored
+    });
+    tls13_client_config(&cfg.tls, Tls13Transport::Quic, session)
 }
 
 fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
@@ -6566,69 +6532,7 @@ fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
     if cfg.tls.alpn_protocols.is_empty() {
         return Err(Error::NoApplicationProtocol);
     }
-    let id = cfg.tls.identity.as_ref().ok_or(Error::InappropriateState)?;
-    let chain = id.cert_chain.clone();
-    let mut sc = match &id.key {
-        crate::tls::SigningKey::Rsa(k) => ServerConfig::with_rsa(chain, k.clone()),
-        crate::tls::SigningKey::Ecdsa(k) => ServerConfig::with_ecdsa(chain, k.clone()),
-        crate::tls::SigningKey::Ed25519(k) => ServerConfig::with_ed25519(chain, k.clone()),
-        crate::tls::SigningKey::Ed448(k) => ServerConfig::with_ed448(chain, k.clone()),
-        #[cfg(feature = "mldsa")]
-        crate::tls::SigningKey::MlDsa44(k) => ServerConfig::with_mldsa44(chain, k.clone()),
-        #[cfg(feature = "mldsa")]
-        crate::tls::SigningKey::MlDsa65(k) => ServerConfig::with_mldsa65(chain, k.clone()),
-        #[cfg(feature = "mldsa")]
-        crate::tls::SigningKey::MlDsa87(k) => ServerConfig::with_mldsa87(chain, k.clone()),
-        // External (suspend/resume) signing is not wired through the QUIC
-        // driver — the QUIC connection has no `provide_signature` resume path —
-        // so reject it at construction rather than stalling the handshake.
-        crate::tls::SigningKey::External { .. } => return Err(Error::InappropriateState),
-    };
-    if !cfg.tls.alpn_protocols.is_empty() {
-        sc = sc.with_alpn(cfg.tls.alpn_protocols.clone());
-    }
-    if !cfg.tls.crls.is_empty() {
-        sc = sc.with_crls(cfg.tls.crls.clone_store());
-    }
-    if let Some(ca) = &cfg.tls.client_auth {
-        sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
-    }
-    sc = sc.with_signature_policy(cfg.tls.signature_policy.clone());
-    if let Some(t) = cfg.tls.verification_time.clone() {
-        sc = sc.with_verification_time(t);
-    }
-    if let Some(crl) = cfg.tls.stapled_crl.clone() {
-        sc = sc.with_stapled_crl(crl);
-    }
-    if let Some(ocsp) = cfg.tls.stapled_ocsp_response.clone() {
-        sc = sc.with_stapled_ocsp_response(ocsp);
-    }
-    sc = sc.with_server_cert_type_preference(cfg.tls.server_cert_type_preference.clone());
-    sc = sc.with_client_cert_type_preference(cfg.tls.client_cert_type_preference.clone());
-    if let Some(spki) = cfg.tls.raw_public_key_spki.clone() {
-        sc = sc.with_raw_public_key_spki(spki);
-    }
-    for spki in &cfg.tls.expected_client_raw_public_keys {
-        sc = sc.add_expected_client_raw_public_key(spki.clone());
-    }
-    if let Some(g) = cfg.tls.preferred_key_exchange_group {
-        sc = sc.with_preferred_key_exchange_group(g);
-    }
-    #[cfg(feature = "cert-compression")]
-    {
-        sc = sc.with_cert_compression_algorithms(cfg.tls.cert_compression_algorithms.clone());
-    }
-    #[cfg(feature = "ech")]
-    if let Some(ech) = cfg.tls.ech_server.clone() {
-        sc = sc.with_ech_server(ech);
-    }
-    sc.key_log = cfg.tls.key_log.clone();
-    // Session resumption. Without a ticket key the server issues no
-    // NewSessionTicket at all, so clients can never resume — which is why
-    // this must be propagated for 0-RTT to be reachable.
-    if let Some(key) = &cfg.tls.ticket_key {
-        sc = sc.with_ticket_key(*key.as_bytes());
-    }
+    let mut sc = tls13_server_config(&cfg.tls, Tls13Transport::Quic)?;
     if cfg.enable_early_data {
         // RFC 9001 §4.6.1: a QUIC server MUST advertise exactly 0xffffffff.
         // The byte budget is meaningless here — QUIC bounds early data with
@@ -6636,47 +6540,12 @@ fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
         // the client must reject.
         sc = sc.with_max_early_data(QUIC_MAX_EARLY_DATA_SIZE);
         // The TLS-side anti-replay window is the only in-process defence
-        // against a replayed 0-RTT flight (RFC 9001 §9.2); it was silently
-        // dropped here while `Connection::server` honoured it.
+        // against a replayed 0-RTT flight (RFC 9001 §9.2).
         if let Some(rw) = cfg.tls.replay_window.clone() {
             sc = sc.with_replay_window(rw);
         }
     }
     Ok(sc)
-}
-
-fn client_cert_from_signing(
-    id: &crate::tls::Identity,
-) -> Option<crate::tls::conn::ClientCertConfig> {
-    Some(match &id.key {
-        crate::tls::SigningKey::Rsa(k) => {
-            crate::tls::conn::ClientCertConfig::with_rsa(id.cert_chain.clone(), k.clone())
-        }
-        crate::tls::SigningKey::Ecdsa(k) => {
-            crate::tls::conn::ClientCertConfig::with_ecdsa(id.cert_chain.clone(), k.clone())
-        }
-        crate::tls::SigningKey::Ed25519(k) => {
-            crate::tls::conn::ClientCertConfig::with_ed25519(id.cert_chain.clone(), k.clone())
-        }
-        crate::tls::SigningKey::Ed448(k) => {
-            crate::tls::conn::ClientCertConfig::with_ed448(id.cert_chain.clone(), k.clone())
-        }
-        #[cfg(feature = "mldsa")]
-        crate::tls::SigningKey::MlDsa44(k) => {
-            crate::tls::conn::ClientCertConfig::with_mldsa44(id.cert_chain.clone(), k.clone())
-        }
-        #[cfg(feature = "mldsa")]
-        crate::tls::SigningKey::MlDsa65(k) => {
-            crate::tls::conn::ClientCertConfig::with_mldsa65(id.cert_chain.clone(), k.clone())
-        }
-        #[cfg(feature = "mldsa")]
-        crate::tls::SigningKey::MlDsa87(k) => {
-            crate::tls::conn::ClientCertConfig::with_mldsa87(id.cert_chain.clone(), k.clone())
-        }
-        // External (suspend/resume) signing is not wired through the QUIC
-        // driver; treat it as "no client certificate" rather than stalling.
-        crate::tls::SigningKey::External { .. } => return None,
-    })
 }
 
 /// Maps a TLS-1.3 cipher-suite identifier to the matching AEAD algorithm

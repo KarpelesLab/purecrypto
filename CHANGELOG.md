@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Option<tls::Secret32>` instead of `Option<[u8; 32]>`, so the keys are
   wiped when the config is dropped. The builder methods accept both a
   `[u8; 32]` and a `Secret32`; direct field writes need `.into()`.
+- *(tls)* the DTLS engines now honour `Config::cipher_suites` (client) and
+  the DTLS 1.3 client offers `Config::alpn_protocols`; a DTLS `Config` that
+  sets a client identity, a `record_size_limit`, or RFC 7250 raw public
+  keys / certificate-type preferences is refused with `InappropriateState`
+  instead of silently ignored. `ConfigBuilder` documents which protocols
+  honour each option, and every engine builder (TLS, DTLS, QUIC) consumes
+  one exhaustive split of `Config` so a new option cannot be added without
+  being classified for each protocol.
 
 ## [0.8.7](https://github.com/KarpelesLab/purecrypto/compare/v0.8.6...v0.8.7) - 2026-09-16
 

@@ -615,6 +615,46 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 }
 
 /// Fluent builder for [`Config`].
+///
+/// # Which protocols honour which option
+///
+/// One `Config` serves every engine, but not every option has a meaning on
+/// every protocol. The table below is the contract; an option marked
+/// **refused** makes [`Connection::client`](super::Connection::client) /
+/// [`Connection::server`](super::Connection::server) fail (with
+/// [`Error::InappropriateState`](super::Error::InappropriateState) unless
+/// noted) rather than silently drop the setting, because dropping it would
+/// weaken what the caller asked for. **inert** means the option has no
+/// effect on that protocol by design (the field docs say why).
+///
+/// | Option | TLS 1.3 | TLS 1.2 | DTLS 1.3 | DTLS 1.2 | QUIC |
+/// |---|---|---|---|---|---|
+/// | `versions` / `min_version` / `max_version` | yes | yes | yes | yes | inert (TLS 1.3 only) |
+/// | `rng`, `roots`, `crls`, `verification_time`, `signature_policy`, `key_log` | yes | yes | yes | yes | yes |
+/// | `server_name`, `verify_certificates` | yes | yes | yes | yes | yes |
+/// | `identity` / `try_identity` (server) | yes | RSA, ECDSA | yes | RSA, ECDSA, External | yes, not External |
+/// | `identity` (client, mTLS) | yes | yes | **refused** | **refused** | yes |
+/// | `private_key` / `try_private_key` ([`HandshakeSigner`](super::HandshakeSigner)) | yes | no ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes | yes | **refused** |
+/// | `client_auth` | yes | yes | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes |
+/// | `alpn` | yes | yes | client only | inert | yes (required) |
+/// | `cipher_suites` (client) | yes | yes | yes | yes | inert (fixed TLS 1.3 set) |
+/// | `record_size_limit` | yes | yes | **refused** | **refused** | inert (no records) |
+/// | `require_extended_master_secret` | inert | yes | inert | inert (EMS always offered, not yet enforced) | inert |
+/// | `stapled_ocsp_response` | yes | yes | inert | inert | yes |
+/// | `stapled_crl` | yes | inert | inert | inert | yes |
+/// | `ticket_key` | yes | yes | inert (no tickets) | inert (no tickets) | yes |
+/// | `max_early_data`, `replay_window` | yes | inert | inert (no 0-RTT) | inert (no 0-RTT) | via `QuicConfig::enable_early_data` |
+/// | `resumption_session` | yes | yes | inert | inert | via `QuicConfig::resumption` |
+/// | `preferred_key_exchange_group` | yes | inert | inert | inert | yes |
+/// | RFC 7250 raw public keys / cert-type preferences | yes | inert | **refused** | **refused** | yes |
+/// | `ech` / `ech_server` | yes | inert | **refused** | **refused** | yes |
+/// | `cert_compression_algorithms` | yes | inert | inert | inert | yes |
+/// | `cookie_secret`, `previous_cookie_secret`, `no_cookie`, `peer_address` | inert | inert | yes | yes | inert |
+/// | `max_record_size` | inert | inert | yes | inert (fixed 1100) | inert |
+///
+/// Internally every engine builder consumes the same exhaustive split of
+/// `Config`, so a new option cannot be added without deciding, for each
+/// protocol, whether it is forwarded, refused, or inert.
 pub struct ConfigBuilder {
     inner: Config,
 }
