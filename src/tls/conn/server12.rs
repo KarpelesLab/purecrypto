@@ -468,6 +468,10 @@ pub struct ServerConnection12<R: RngCore> {
     /// transport close (truncation attack) — `state` alone can't, since
     /// failure paths also park the connection in [`State::Closed`].
     received_close_notify: bool,
+    /// True once we have queued our own `close_notify`. RFC 5246 §7.2.1 /
+    /// RFC 8446 §6.1: the sender MUST NOT send more data afterwards, so
+    /// [`Self::send_application_data`] refuses once this is set.
+    sent_close_notify: bool,
     /// True once the handshake has actually completed (the client's Finished
     /// verified and the engine entered [`State::Connected`]). Sticky: it stays
     /// set after a later transition to [`State::Closed`], and — unlike
@@ -629,6 +633,7 @@ impl<R: RngCore> ServerConnection12<R> {
             rng,
             state: State::WaitClientHello,
             received_close_notify: false,
+            sent_close_notify: false,
             handshake_completed: false,
             inbuf: Vec::new(),
             in_off: 0,
@@ -813,9 +818,12 @@ impl<R: RngCore> ServerConnection12<R> {
         self.received_close_notify
     }
 
-    /// Sends application data (only valid once the handshake completes).
+    /// Sends application data (only valid once the handshake completes, and
+    /// only until [`Self::send_close_notify`] — RFC 5246 §7.2.1 forbids
+    /// sending anything after our own `close_notify`; both misuses are
+    /// reported as `InappropriateState`).
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.state != State::Connected {
+        if self.state != State::Connected || self.sent_close_notify {
             return Err(Error::InappropriateState);
         }
         // Fragment to at most 2^14 bytes per record (RFC 5246 §6.2.1), or
@@ -874,8 +882,15 @@ impl<R: RngCore> ServerConnection12<R> {
         core::mem::take(&mut self.app_in)
     }
 
-    /// Queues a `close_notify` warning alert.
+    /// Queues a `close_notify` warning alert. Idempotent: a second call is a
+    /// no-op. Afterwards [`Self::send_application_data`] is refused
+    /// (RFC 5246 §7.2.1); the read side stays open for the peer's own
+    /// `close_notify` and any data it sends before it.
     pub fn send_close_notify(&mut self) {
+        if self.sent_close_notify {
+            return;
+        }
+        self.sent_close_notify = true;
         let body = [1u8, AlertDescription::CloseNotify.as_u8()];
         let _ = self.emit_alert(&body);
     }

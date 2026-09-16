@@ -394,6 +394,15 @@ impl ConnectionCore {
         }
     }
 
+    /// True once [`Self::send_close_notify`] has queued our `close_notify`.
+    /// RFC 8446 §6.1: "the sender MUST NOT send any more data" afterwards —
+    /// the engines refuse `send_application_data` once this is set. Only the
+    /// write side is closed; reading continues until the peer's own
+    /// `close_notify` (half-close).
+    pub(crate) fn sent_close_notify(&self) -> bool {
+        self.sent_close_notify
+    }
+
     pub(crate) fn emit_record(&mut self, ct: ContentType, payload: &[u8]) {
         match &mut self.write {
             Some(crypter) => match crypter.encrypt(ct, payload) {

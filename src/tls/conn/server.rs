@@ -1372,14 +1372,17 @@ impl<R: RngCore> ServerConnection<R> {
         tls_exporter(suite.hash, ems, label, context, out)
     }
 
-    /// Sends application data (only valid once the handshake completes).
+    /// Sends application data (only valid once the handshake completes, and
+    /// only until [`Self::send_close_notify`]: RFC 8446 §6.1 forbids sending
+    /// anything after our own `close_notify`. Both misuses are reported as
+    /// `InappropriateState`; the read side is unaffected).
     ///
     /// Returns `Err(TooManyRecords)` if the write side hit the per-key
     /// record-sequence cap and the record could not be protected — the bytes
     /// were NOT transmitted. [`Self::maybe_auto_key_update`] normally rekeys
     /// long before that point.
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.state != State::Connected {
+        if self.state != State::Connected || self.core.sent_close_notify() {
             return Err(Error::InappropriateState);
         }
         self.maybe_auto_key_update()?;

@@ -7361,6 +7361,78 @@ mod tls12_loopback_tests {
         assert!(matches!(client2.process_new_packets(), Err(Error::Decode)));
     }
 
+    /// RFC 5246 §7.2.1: after sending `close_notify` the sender MUST NOT
+    /// send any more data. Both TLS 1.2 engines refuse
+    /// `send_application_data` with `InappropriateState` once their own
+    /// `close_notify` is queued, keep reading (half-close), and treat a
+    /// second `send_close_notify` as a no-op.
+    #[test]
+    fn tls12_send_after_own_close_notify_is_refused() {
+        let (server_config, cert_der) = rsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"close12-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"close12-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        client.send_close_notify();
+        assert!(matches!(
+            client.send_application_data(b"too late"),
+            Err(Error::InappropriateState)
+        ));
+        let flight = client.write_tls();
+        let rec = super::super::codec::read_record(&flight).unwrap().unwrap();
+        assert_eq!(rec.content_type, ContentType::Alert);
+        assert_eq!(
+            rec.len,
+            flight.len(),
+            "exactly one record: the close_notify"
+        );
+        // Half-close: the client still reads what the server sends first.
+        server.send_application_data(b"last words").unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"last words");
+        server.read_tls(&flight);
+        server.process_new_packets().unwrap();
+        assert!(server.received_close_notify());
+
+        server.send_close_notify();
+        assert!(matches!(
+            server.send_application_data(b"too late"),
+            Err(Error::InappropriateState)
+        ));
+        let _ = server.write_tls();
+        server.send_close_notify();
+        assert!(
+            server.write_tls().is_empty(),
+            "second close_notify is a no-op"
+        );
+    }
+
     /// Records whose `legacy_version` field is below 0x0301 (SSL 3.0 or
     /// earlier) MUST be rejected at the record layer by both client and
     /// server.
@@ -8869,9 +8941,11 @@ mod audit_regression_tests {
         let (mut client, mut server) = connected_pair(server_config, cert_der, b"after-close");
 
         // Server: close_notify, then (illegally) more application data and
-        // a KeyUpdate, all in one flight.
+        // a KeyUpdate, all in one flight. `send_application_data` itself
+        // refuses after close_notify (RFC 8446 §6.1), so the illegal record
+        // is forced out through the raw test hook.
         server.send_close_notify();
-        server.send_application_data(b"after close").unwrap();
+        server.emit_unfragmented_application_data_for_test(b"after close");
         server.request_key_update().unwrap();
         let flight = server.write_tls();
         client.read_tls(&flight);
@@ -8887,7 +8961,7 @@ mod audit_regression_tests {
         );
 
         // Later bytes are ignored just the same.
-        server.send_application_data(b"still after close").unwrap();
+        server.emit_unfragmented_application_data_for_test(b"still after close");
         client.read_tls(&server.write_tls());
         client.process_new_packets().unwrap();
         assert!(client.take_received_plaintext().is_empty());
@@ -8897,12 +8971,54 @@ mod audit_regression_tests {
         let (server_config, cert_der) = rsa_server();
         let (mut client, mut server) = connected_pair(server_config, cert_der, b"after-close-s");
         client.send_close_notify();
-        client.send_application_data(b"after close").unwrap();
+        client.emit_unfragmented_application_data_for_test(b"after close");
         client.read_tls(&[]);
         server.read_tls(&client.write_tls());
         server.process_new_packets().unwrap();
         assert!(server.received_close_notify());
         assert!(server.take_received_plaintext().is_empty());
+        assert!(server.write_tls().is_empty());
+    }
+
+    /// RFC 8446 §6.1 / RFC 5246 §7.2.1: after sending `close_notify` the
+    /// sender MUST NOT send any more data. `send_application_data` refuses
+    /// with `InappropriateState` on every engine once our own `close_notify`
+    /// is queued, while the read side stays open (half-close): data the peer
+    /// sends before its own `close_notify` is still delivered.
+    #[test]
+    fn send_after_own_close_notify_is_refused() {
+        // ---- TLS 1.3, both roles ----
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, mut server) = connected_pair(server_config, cert_der, b"close-then-send");
+        client.send_close_notify();
+        assert!(matches!(
+            client.send_application_data(b"too late"),
+            Err(Error::InappropriateState)
+        ));
+        // Only the close_notify went out.
+        let flight = client.write_tls();
+        let rec = super::super::codec::read_record(&flight).unwrap().unwrap();
+        assert_eq!(
+            rec.len,
+            flight.len(),
+            "exactly one record: the close_notify"
+        );
+        // Half-close: the client still reads what the server sends.
+        server.send_application_data(b"last words").unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"last words");
+        server.read_tls(&flight);
+        server.process_new_packets().unwrap();
+        assert!(server.received_close_notify());
+        server.send_close_notify();
+        assert!(matches!(
+            server.send_application_data(b"too late"),
+            Err(Error::InappropriateState)
+        ));
+        // Idempotent: a second close_notify queues nothing further.
+        let _ = server.write_tls();
+        server.send_close_notify();
         assert!(server.write_tls().is_empty());
     }
 
