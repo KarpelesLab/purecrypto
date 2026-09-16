@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/KarpelesLab/purecrypto/compare/v0.8.7...v0.9.0) - 2026-09-16
+
+### Added
+
+- *(cli)* email, URI and DN subtrees in template name constraints
+- *(pkcs12)* caller-tunable parse work limits, MAC KDF on the budget
+- *(fuzz)* reach the encrypted-flight TLS decoders directly
+- *(quic)* [**breaking**] honour Config::cipher_suites and offer X25519MLKEM768
+- *(x509,tls)* [**breaking**] enforce every nameConstraints form, critical or not
+- *(tls)* [**breaking**] RFC 7250 raw public keys on TLS 1.2
+- *(tls)* [**breaking**] rsa_pss_pss_* schemes, tied to the leaf's SPKI form
+- *(x509)* [**breaking**] honour RSASSA-PSS-params on X.509 signatures
+- *(cli)* [**breaking**] persist LMS/HSS keys in the cached form
+- *(ffi)* pc_lms/pc_hss_private_to_bytes_with_cache
+- *(lms)* serialize the Merkle node cache and add warm_cache()
+- *(quic)* detect RFC 9002 §7.6 persistent congestion from lost packets
+- *(lms)* [**breaking**] RFC 8554 §6 HSS with per-level state and a v3 key format
+- *(quic)* [**breaking**] wipe the stateless-reset key on drop
+- *(tls)* [**breaking**] RFC 8734 Brainpool signature schemes; refuse secp256k1/SM2 identities
+- *(x509)* represent id-RSASSA-PSS public keys with their RFC 4055 restriction
+- *(dtls)* negotiate ALPN over DTLS 1.2 and 1.3
+- *(tls)* [**breaking**] wipe Config secrets on drop
+- *(cli)* let the servers bind port 0 and report the bound port
+- *(hash)* fallible BLAKE2 MAC/XOF and TurboSHAKE constructors
+- *(cipher)* fallible AEAD parameter checks
+- *(kdf)* add try_pbkdf2, try_hkdf and pbes2::try_encrypt
+- *(tls)* extended master secret on the TLS 1.0/1.1 legacy path
+- *(tls)* enforce our advertised record_size_limit on received records
+
+### Fixed
+
+- *(ffi)* emit the DN emailAddress in pc_cert_analyze
+- *(cli)* tighten the template TOML parser to TOML 1.0
+- *(cli)* refuse stray positionals, honour -pubin, `-` for every input
+- *(ffi)* share the private-key loader between the TLS and QUIC configs
+- *(ffi)* define every out-parameter on every return path
+- *(ffi)* report PC_CLOSED on sends after a local close
+- *(tls)* fail closed when only RawPublicKey was offered and the server stays silent
+- *(tls)* bound KeyUpdate floods by run length, not a lifetime cap
+- *(tls)* admit 2^14 + 2048-byte records under TLS 1.2 CBC suites
+- *(ech)* reject a mis-sized HRR ECH extension with decode_error
+- *(tls)* refuse send_application_data after our own close_notify
+- *(tls)* answer a post-handshake HelloRequest with a warning, not a fatal alert
+- *(quic)* map extension errors to their own CRYPTO_ERROR alerts
+- *(quic)* recognise persistent congestion across loss batches
+- *(tls)* offer rsa_pss_rsae_sha512 in signature_algorithms
+- *(ffi)* refuse secp256k1 / SM2 identities at configuration time
+- *(dtls)* enforce Extended Master Secret over DTLS 1.2
+- *(cli)* name the accepted nonce range when enc rejects a nonce
+- *(quic)* reject CID frames RFC 9000 19.15/19.16 forbid
+- *(quic)* close stream-layer violations with their RFC 9000 error codes
+- *(quic)* drive loss recovery from the RFC 9002 loss-detection timer
+- *(quic)* queue CRYPTO retransmissions with their own offsets
+- *(tls)* accept OCSP stapling on the TLS 1.0/1.1 legacy client and server
+- *(tls)* abort with missing_extension on a ClientHello lacking mandatory extensions
+- *(tls)* clamp a client record_size_limit above the maximum in the 1.2 server
+- *(examples)* lean-feature builds and verified handshakes
+- *(cli)* TOML `\b`/`\f` escapes, duplicate table headers, std IP parsing
+- *(cli)* tighten PKI input validation and accept Ed448 signing keys
+- *(cli)* validate the q_server identity before listening, keep one QUIC clock
+- *(cli)* refuse a non-RSA/ECDSA key for `s_server -tls1_2` up front
+- *(cli)* accept PKCS#8 RSA/EC private keys in the key loaders
+- *(cli)* refuse `kdf pbkdf2 -iter 0` instead of panicking
+- *(cli)* reject unknown keys in every certificate-template section
+- *(cli)* treat -flag and --flag alike, refuse a trailing value flag
+- *(cli)* keep CA state untouched when `ca issue` / `sign-csr` fail
+- *(cli)* send close_notify when s_client / s_server echo mode exit
+- *(cli)* emit IP subjectAltName entries as iPAddress, not dNSName
+- *(ffi)* screen requested output lengths like input lengths
+- *(ffi)* accept PKCS#8 EC private keys in set_certificate
+- *(tls)* let the shared codec own the TLS 1.2 session_id bound
+- *(tls)* pick the client CertificateVerify scheme from the CertificateRequest
+- *(tls)* treat a change_cipher_spec before the first ClientHello as unexpected
+- *(tls)* never let a stored session downgrade real ECH to a cleartext SNI
+- *(tls)* build the ECH outer/inner ClientHello per draft-ietf-tls-esni-22 §6.1
+- *(tls)* bound legacy_session_id to 32 bytes in the shared hello codec
+- *(tls)* ignore everything received after the peer's close_notify
+- *(tls)* abort on extensions the client never offered
+- *(tls)* terminate on a bad Finished with decrypt_error
+- *(tls)* only accept a CompressedCertificate algorithm the client advertised
+- *(tls)* require the client CertificateVerify scheme to be one we offered
+- *(tls)* clamp, not reject, a client record_size_limit above the protocol max
+- *(tls)* echo the index of the PSK identity the server actually selected
+- *(tls)* stop enforcing the sender's per-key record cap on the read side
+
+### Other
+
+- *(tls)* keep lean feature builds and docs clean after the sweep
+- *(cli)* fail on a panic and name the expected error at every !ok site
+- *(rsa)* gate the AnyPublicKey SPKI cross-check on x509
+- *(lms)* fix an intra-doc link in the allocator-less build
+- *(tls)* gate the master-secret test hook on tls-legacy
+- *(lms)* cache Merkle nodes so signing is O(h) instead of a full keygen
+- *(kdf)* gate pbes2 on the rng feature it uses
+- *(tls)* split Config exhaustively for every engine builder
+- *(cli)* take server ports from the listening banner and bound waits
+- *(ffi,cli)* route parameter checks through the fallible KDF and AEAD APIs
+- *(ffi)* say pc_quic_initiate_key_update waits for handshake confirmation
+- *(tools)* correct the zkp-interop oracle instructions
+- *(fuzz)* add pkcs12_parse, falcon_verify, mldsa_verify, slhdsa_verify
+- *(cli)* fix claims that did not match the binary
+- *(cli)* cover the key-loader, PKI-validation and QUIC/TLS 1.2 fixes
+- *(cli)* wait for DTLS servers to report listening before connecting
+- *(cli)* cover the DTLS retransmit backoff against a silent peer
+
 ### Changed
 
 - *(x509)* **breaking:** `NameConstraints` is now `{ permitted, excluded }`
