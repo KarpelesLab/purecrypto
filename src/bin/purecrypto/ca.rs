@@ -469,11 +469,13 @@ fn run_issue(args: Args) {
         .subject()
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
 
-    // The certificate serial is a fresh 64-bit CSPRNG draw (BR §7.1); the
-    // on-disk counter is only the audit index recorded in `issued.jsonl`.
-    let index = allocate_index(&ca);
-    let serial = random_serial();
+    // Validate the request-derived inputs BEFORE touching CA state: a refused
+    // `-days` must not consume an audit index (see `run_sign_csr`).
     let validity = validity_days(days_n);
+    // The certificate serial is a fresh 64-bit CSPRNG draw (BR §7.1); the
+    // on-disk counter is only the audit index recorded in `issued.jsonl`,
+    // and is allocated once the certificate has been delivered.
+    let serial = random_serial();
 
     let cert = if let Some(tmpl) = template {
         let issuer_ski = issuer_ski_bytes(&root_cert);
@@ -515,6 +517,14 @@ fn run_issue(args: Args) {
         .unwrap_or_else(|e| die(format!("cannot issue cert: {e}")))
     };
 
+    // Deliver the certificate BEFORE touching the CA's state: a failed `-out`
+    // write must not consume an audit index or leave a ledger row for a
+    // certificate nobody ever received. The reverse failure — delivered but
+    // not recorded — still fails loudly, with the serial named below for the
+    // operator.
+    write_output(args.value("-out"), cert.to_pem().as_bytes());
+    let index = allocate_index(&ca);
+
     // Record in issued.jsonl. Every string field goes through `json_escape`
     // so a control character or `"` in a SAN / subject cannot corrupt the
     // one-record-per-line invariant the parser depends on.
@@ -533,8 +543,6 @@ fn run_issue(args: Args) {
         now_unix()
     );
     append_line(&ca.issued(), &record);
-
-    write_output(args.value("-out"), cert.to_pem().as_bytes());
     // Serials are random now, so the operator cannot infer one: always say
     // what was issued (on stderr, so `-out -` piping stays clean). `ca revoke
     // -serial` accepts either form printed here.
@@ -623,9 +631,10 @@ fn run_sign_csr(args: Args) {
         );
     }
 
-    let index = allocate_index(&ca);
-    let serial = random_serial();
+    // Validate `-days` before touching CA state; the audit index is
+    // allocated only once the certificate has been delivered.
     let validity = validity_days(days_n);
+    let serial = random_serial();
 
     let cert = if let Some(tmpl) = template {
         let issuer_ski = issuer_ski_bytes(&root_cert);
@@ -670,6 +679,10 @@ fn run_sign_csr(args: Args) {
         .unwrap_or_else(|e| die(format!("cannot issue cert from CSR: {e}")))
     };
 
+    // Deliver before touching CA state (see `run_issue`).
+    write_output(args.value("-out"), cert.to_pem().as_bytes());
+    let index = allocate_index(&ca);
+
     let subject = subject_from_csr;
     let sans_json = sans
         .iter()
@@ -686,8 +699,6 @@ fn run_sign_csr(args: Args) {
         now_unix()
     );
     append_line(&ca.issued(), &record);
-
-    write_output(args.value("-out"), cert.to_pem().as_bytes());
     eprintln!("issued serial {serial} ({serial:#x}), index {index}");
 }
 

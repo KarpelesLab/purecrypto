@@ -5757,3 +5757,100 @@ fn dtls_client_retransmits_with_exponential_backoff() {
         "too many retransmits in 8 s: {arrivals:?}"
     );
 }
+
+/// A `ca issue` that fails must leave the CA state untouched: a refused
+/// `-days` used to consume an audit index (the `serial` counter advanced
+/// with no ledger row), and an unwritable `-out` used to append the ledger
+/// row — recording, and later letting `ca revoke` accept, a certificate
+/// nobody ever received.
+#[test]
+fn ca_issue_failure_does_not_consume_index_or_ledger_row() {
+    let dir = std::env::temp_dir().join(format!("pc_ca_fail_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = dir.to_str().unwrap().to_string();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    assert!(run(&["ca", "init", "-dir", &d, "-cn", "Fail CA"], b"").1);
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "EC", "-out", &p("leaf.key")],
+            b""
+        )
+        .1
+    );
+    let (pubk, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(p("leaf.pub"), pubk).unwrap();
+    let serial_before = std::fs::read_to_string(dir.join("serial")).unwrap();
+    let ledger_before = std::fs::read_to_string(dir.join("issued.jsonl")).unwrap_or_default();
+
+    // Refused validity.
+    let (_o, _e, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "x",
+            "-days",
+            "0",
+            "-out",
+            &p("a.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok, "-days 0 must be refused");
+    // Unwritable output path.
+    let bad_out = dir.join("no-such-dir").join("b.crt");
+    let (_o, _e, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "y",
+            "-out",
+            bad_out.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert!(!ok, "an unwritable -out must fail");
+
+    assert_eq!(
+        std::fs::read_to_string(dir.join("serial")).unwrap(),
+        serial_before,
+        "a failed issuance consumed an audit index"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("issued.jsonl")).unwrap_or_default(),
+        ledger_before,
+        "a failed issuance left a ledger row for a certificate that was never delivered"
+    );
+    // A good issuance afterwards still works and records exactly one row.
+    assert!(
+        run(
+            &[
+                "ca",
+                "issue",
+                "-dir",
+                &d,
+                "-pubkey",
+                &p("leaf.pub"),
+                "-cn",
+                "z",
+                "-out",
+                &p("c.crt")
+            ],
+            b"",
+        )
+        .1
+    );
+    let ledger = std::fs::read_to_string(dir.join("issued.jsonl")).unwrap();
+    assert_eq!(ledger.lines().count(), ledger_before.lines().count() + 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
