@@ -446,7 +446,7 @@ impl LmsPrivateKey {
     }
 
     /// Whether the node cache is built, i.e. whether the next signature is
-    /// `O(h)` and [`to_bytes_with_cache`](Self::to_bytes_with_cache) will
+    /// `O(h)` and [`to_bytes_with_cache`][Self::to_bytes_with_cache] will
     /// include it. Always `false` without `alloc`.
     #[cfg_attr(
         not(feature = "alloc"),
