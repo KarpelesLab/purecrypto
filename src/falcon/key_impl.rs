@@ -41,7 +41,11 @@ impl PrivateKey for FalconPrivateKey {
     ) -> Result<Vec<u8>, Error> {
         params.reader().finish()?;
         let mut rng = rng;
-        Ok(self.sign(msg, &mut rng))
+        // The facade contract is "errors, never panics": route through the
+        // fallible signer so an exhausted sampler budget (unreachable for a
+        // key `generate`/`from_bytes` accepted, but the inherent `sign`
+        // panics on it) surfaces as `Error::Signature`.
+        self.try_sign(msg, &mut rng).map_err(|_| Error::Signature)
     }
 }
 
