@@ -283,6 +283,113 @@ fn tampered_ciphertext_rejected() {
     );
 }
 
+/// RFC 9180 §7.1.3 / §7.1.4: the DHKEMs must refuse a peer public key that
+/// is off the curve (NIST) or whose DH output is all-zero (X25519 low-order
+/// points), on every side that deserializes one — `pkR` at `Encap`, `enc`
+/// at `Decap`, and `pkS` at `AuthDecap`.
+#[test]
+fn kem_rejects_invalid_public_keys() {
+    let info = b"info";
+    let mut rng = drbg();
+
+    // X25519: the all-zero u-coordinate and the order-8 point both yield an
+    // all-zero shared secret, which §7.1.4 requires the KEM to reject.
+    let x = CipherSuite::new(
+        HpkeKem::DhkemX25519HkdfSha256,
+        HpkeKdf::HkdfSha256,
+        HpkeAead::Aes128Gcm,
+    );
+    let (sk_r, pk_r) = x.kem.generate_key_pair(&mut rng).unwrap();
+    let (sk_s, _pk_s) = x.kem.generate_key_pair(&mut rng).unwrap();
+    let low_order = [
+        [0u8; 32],
+        hex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800")
+            .try_into()
+            .unwrap(),
+    ];
+    for bad in &low_order {
+        assert_eq!(
+            setup_sender(&mut rng, x, bad, info).err(),
+            Some(Error::InvalidDhOutput),
+            "Encap with a low-order pkR"
+        );
+        assert_eq!(
+            setup_sender_auth(&mut rng, x, bad, info, &sk_s).err(),
+            Some(Error::InvalidDhOutput),
+            "AuthEncap with a low-order pkR"
+        );
+        assert_eq!(
+            setup_receiver(x, bad, &sk_r, info).err(),
+            Some(Error::InvalidDhOutput),
+            "Decap with a low-order enc"
+        );
+        assert_eq!(
+            setup_receiver_auth(x, &pk_r, &sk_r, info, bad).err(),
+            Some(Error::InvalidDhOutput),
+            "AuthDecap with a low-order pkS"
+        );
+    }
+
+    // NIST curves: a point off the curve, a compressed encoding, and a
+    // wrong-length key are all `InvalidKey` before any DH is attempted.
+    for kem in [
+        HpkeKem::DhkemP256HkdfSha256,
+        HpkeKem::DhkemP384HkdfSha384,
+        HpkeKem::DhkemP521HkdfSha512,
+    ] {
+        let suite = CipherSuite::new(kem, HpkeKdf::HkdfSha256, HpkeAead::Aes128Gcm);
+        let (sk_r, pk_r) = kem.generate_key_pair(&mut rng).unwrap();
+        let (sk_s, pk_s) = kem.generate_key_pair(&mut rng).unwrap();
+
+        let mut off_curve = pk_r.clone();
+        *off_curve.last_mut().unwrap() ^= 0x01;
+        let mut compressed = pk_r.clone();
+        compressed[0] = 0x02;
+        let short = pk_r[..pk_r.len() - 1].to_vec();
+        for bad in [&off_curve, &compressed, &short] {
+            assert_eq!(
+                setup_sender(&mut rng, suite, bad, info).err(),
+                Some(Error::InvalidKey),
+                "{kem:?}: Encap with an invalid pkR"
+            );
+            assert_eq!(
+                setup_sender_auth(&mut rng, suite, bad, info, &sk_s).err(),
+                Some(Error::InvalidKey),
+                "{kem:?}: AuthEncap with an invalid pkR"
+            );
+            assert_eq!(
+                setup_receiver_auth(suite, &pk_r, &sk_r, info, bad).err(),
+                Some(Error::InvalidKey),
+                "{kem:?}: AuthDecap with an invalid pkS"
+            );
+        }
+        // `enc` is length-checked first (`InvalidEnc`), then curve-checked.
+        assert_eq!(
+            setup_receiver(suite, &off_curve, &sk_r, info).err(),
+            Some(Error::InvalidKey),
+            "{kem:?}: Decap with an off-curve enc"
+        );
+        assert_eq!(
+            setup_receiver(suite, &short, &sk_r, info).err(),
+            Some(Error::InvalidEnc),
+            "{kem:?}: Decap with a short enc"
+        );
+        // A private scalar of zero (or one that is not `Nsk` bytes) is not a
+        // key either.
+        let zero_sk = alloc::vec![0u8; kem.n_sk()];
+        assert_eq!(
+            setup_receiver(suite, &pk_s, &zero_sk, info).err(),
+            Some(Error::InvalidKey),
+            "{kem:?}: Decap with skR = 0"
+        );
+        assert_eq!(
+            setup_sender_auth(&mut rng, suite, &pk_r, info, &sk_s[1..]).err(),
+            Some(Error::InvalidKey),
+            "{kem:?}: AuthEncap with a short skS"
+        );
+    }
+}
+
 #[test]
 fn derive_key_pair_is_deterministic() {
     let ikm = hex("7268600d403fce431561aef583ee1613527cff655c1343f29812e6\
