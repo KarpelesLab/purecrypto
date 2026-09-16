@@ -2177,7 +2177,7 @@ impl ClientConnection12 {
 
     /// Test hook: the derived 48-byte master secret, once the key exchange
     /// has completed.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tls-legacy"))]
     pub(crate) fn master_secret_for_test(&self) -> Option<[u8; 48]> {
         self.master
     }
