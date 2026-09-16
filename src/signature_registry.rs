@@ -27,8 +27,8 @@
 //! adding an algorithm to `ALGORITHMS` does NOT auto-permit it; the caller
 //! has to add the id explicitly. The shipped default
 //! `SignaturePolicy::modern` permits the modern IANA-blessed set —
-//! RSA-PSS-RSAE / RSA-PKCS1 with SHA-256/384, ECDSA, Ed25519/Ed448, and
-//! ML-DSA — with RSA keys ≥ 2048 bits. For ECDSA the two dispatch paths
+//! RSA-PSS-RSAE / RSA-PSS-PSS / RSA-PKCS1 with SHA-256/384, ECDSA,
+//! Ed25519/Ed448, and ML-DSA — with RSA keys ≥ 2048 bits. For ECDSA the two dispatch paths
 //! differ: X.509 chain signatures are keyed by the signature OID
 //! (`ecdsa-with-sha256/384/512`), which does not pin a curve, so any
 //! supported curve (P-256 / P-384 / P-521 / secp256k1) is accepted with the
@@ -89,9 +89,16 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     &crate::rsa::registry::PssRsaeSha384,
     #[cfg(all(feature = "rsa", feature = "alloc"))]
     &crate::rsa::registry::PssRsaeSha512,
-    // RSA-PSS with a PSS-key-restricted SPKI (`id-RSASSA-PSS`).
+    // RSA-PSS with a PSS-key-restricted SPKI (`id-RSASSA-PSS`), one entry
+    // per SHA-2 digest. Only the SHA-256 entry carries the X.509 OID;
+    // `AnyPublicKey::signature_algorithm` routes a PSS-restricted key to the
+    // entry for the digest its restriction names.
     #[cfg(all(feature = "rsa", feature = "alloc"))]
     &crate::rsa::registry::PssPssSha256,
+    #[cfg(all(feature = "rsa", feature = "alloc"))]
+    &crate::rsa::registry::PssPssSha384,
+    #[cfg(all(feature = "rsa", feature = "alloc"))]
+    &crate::rsa::registry::PssPssSha512,
     // OID-keyed ECDSA entries (X.509 chain dispatch).
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::EcdsaSha256AnyCurve,
@@ -247,6 +254,10 @@ mod policy {
         /// Permitted ids:
         ///   * `rsa-pkcs1-sha256`, `rsa-pkcs1-sha384`
         ///   * `rsa-pss-rsae-sha256`, `rsa-pss-rsae-sha384`, `rsa-pss-rsae-sha512`
+        ///   * `rsa-pss-pss-sha256`, `rsa-pss-pss-sha384`, `rsa-pss-pss-sha512`
+        ///     — `id-RSASSA-PSS` chain signatures (RFC 4055), including
+        ///     under a PSS-key-restricted issuer key
+        ///     ([`AnyPublicKey::RsaPss`](crate::x509::AnyPublicKey::RsaPss))
         ///   * `ecdsa-with-sha256`, `ecdsa-with-sha384`, `ecdsa-with-sha512`
         ///     — the OID-keyed X.509 chain-dispatch entries. The
         ///     `ecdsa-with-SHA-N` OID does not pin a curve, so these accept
@@ -275,6 +286,9 @@ mod policy {
                 "rsa-pss-rsae-sha256",
                 "rsa-pss-rsae-sha384",
                 "rsa-pss-rsae-sha512",
+                "rsa-pss-pss-sha256",
+                "rsa-pss-pss-sha384",
+                "rsa-pss-pss-sha512",
                 // X.509-chain dispatch entries (OID-keyed; any supported curve).
                 // The matched-pair entries below pin the curve for TLS 1.3
                 // CertificateVerify (one per IANA scheme code point).
@@ -561,6 +575,7 @@ mod tests {
         #[allow(unused_mut)]
         let mut cases: alloc::vec::Vec<(CertSigner<'_>, &str, bool)> = alloc::vec![
             (CertSigner::Rsa(&rsa), "rsa-pkcs1-sha256", true),
+            (CertSigner::RsaPss(&rsa), "rsa-pss-pss-sha256", true),
             (CertSigner::Ecdsa(&ec[0]), "ecdsa-with-sha256", true),
             (CertSigner::Ecdsa(&ec[1]), "ecdsa-with-sha384", true),
             (CertSigner::Ecdsa(&ec[2]), "ecdsa-with-sha512", true),

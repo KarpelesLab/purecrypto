@@ -34,7 +34,7 @@ pub use ocsp::{
     OcspResponseBuilder, OcspResponseStatus, OcspSingleResponse, PreparedOcsp,
 };
 pub use privkey::{AnyPrivateKey, Pkcs8ReadOptions};
-pub use pubkey::AnyPublicKey;
+pub use pubkey::{AnyPublicKey, PssHash, PssParams, PssRestriction};
 pub use sct::{CtLog, Sct, SctVerification, SctVersion};
 pub use signer::{CertSigner, SignatureAlgId};
 pub use time::{Time, Validity};

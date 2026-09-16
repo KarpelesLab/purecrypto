@@ -177,6 +177,7 @@ fn key_json(cert: &Certificate) -> String {
     };
     let (alg, curve, bits): (&str, Option<&str>, Option<usize>) = match &pk {
         AnyPublicKey::Rsa(k) => ("RSA", None, Some(k.modulus().bit_len())),
+        AnyPublicKey::RsaPss(k, _) => ("RSA-PSS", None, Some(k.modulus().bit_len())),
         AnyPublicKey::Ecdsa(k) => ("ECDSA", Some(curve_label(k.curve())), None),
         AnyPublicKey::Ed25519(_) => ("Ed25519", None, None),
         AnyPublicKey::X25519(_) => ("X25519", None, None),

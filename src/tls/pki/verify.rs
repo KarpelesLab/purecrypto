@@ -33,7 +33,7 @@
 
 use super::crls::CrlStore;
 use super::store::{RootCertStore, TrustAnchor};
-use crate::signature_registry::{SignaturePolicy, find_by_oid};
+use crate::signature_registry::SignaturePolicy;
 use crate::tls::Error;
 use crate::x509::{AnyPublicKey, Certificate, Time, Validity, oid};
 use alloc::vec::Vec;
@@ -529,7 +529,7 @@ fn check_revocation(
         let Ok(crl_sig_alg) = crl.signature_algorithm_oid() else {
             continue;
         };
-        let Some(crl_algo) = find_by_oid(&crl_sig_alg) else {
+        let Some(crl_algo) = issuer_key.signature_algorithm(&crl_sig_alg) else {
             continue;
         };
         if !policy.permits(crl_algo, &issuer_spki) {
@@ -573,9 +573,11 @@ fn check_revocation(
 
 /// Verifies the signature on `cert` under `issuer_key`, gating on `policy`.
 ///
-/// Looks up the certificate's `signatureAlgorithm` OID in the registry,
-/// rejects any algorithm not on the whitelist (with `BadCertificate`), and
-/// only then delegates to the issuer key's verifier.
+/// Resolves the certificate's `signatureAlgorithm` OID to the registry entry
+/// the issuer key dispatches to ([`AnyPublicKey::signature_algorithm`] — the
+/// entry a PSS-restricted key routes to depends on its restriction, not the
+/// OID alone), rejects any algorithm not on the whitelist (with
+/// `BadCertificate`), and only then delegates to the issuer key's verifier.
 fn verify_cert_against_issuer(
     cert: &Certificate,
     issuer_key: &AnyPublicKey,
@@ -584,7 +586,9 @@ fn verify_cert_against_issuer(
     let sig_alg = cert
         .signature_algorithm_oid()
         .map_err(|_| Error::BadCertificate)?;
-    let algo = find_by_oid(&sig_alg).ok_or(Error::BadCertificate)?;
+    let algo = issuer_key
+        .signature_algorithm(&sig_alg)
+        .ok_or(Error::BadCertificate)?;
     let issuer_spki = issuer_key.to_spki_der();
     if !policy.permits(algo, &issuer_spki) {
         return Err(Error::BadCertificate);
@@ -3756,5 +3760,154 @@ mod tests {
             verify_chain_now(&store, &chain),
             Err(Error::BadCertificate)
         ));
+    }
+
+    /// A CA whose SPKI is `id-RSASSA-PSS` (RFC 4055, SHA-256-restricted)
+    /// issues an intermediate and a leaf with `id-RSASSA-PSS` signatures; the
+    /// chain validates under the default `modern()` policy through the
+    /// `rsa-pss-pss-sha256` entry. Under the same PSS-restricted key a
+    /// PKCS#1 v1.5 signature is refused, and a leaf issued with SHA-256 PSS
+    /// is refused when the CA's SPKI pins the key to SHA-384 instead.
+    #[test]
+    fn pss_restricted_ca_chain_validates_under_modern_policy() {
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::{AnyPublicKey, CertSigner, PssHash, PssRestriction};
+
+        let ca_key = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let int_key = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_b().to_pkcs1_der()).unwrap();
+        let mut rng = crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"pss-ca-chain", b"n", &[]);
+        let leaf_key =
+            crate::ec::BoxedEcdsaPrivateKey::generate(crate::ec::CurveId::P256, &mut rng);
+        let ca_signer = CertSigner::RsaPss(&ca_key);
+        let int_signer = CertSigner::RsaPss(&int_key);
+        let ca_name = DistinguishedName::common_name("pss-root");
+        let int_name = DistinguishedName::common_name("pss-int");
+        let leaf_name = DistinguishedName::common_name("pss-leaf");
+
+        let root =
+            Certificate::self_signed_general(&ca_signer, &ca_name, &validity(), 1, true, &[])
+                .unwrap();
+        // The CA certifies itself as a PSS-restricted key, and the
+        // certificate's own signature is `id-RSASSA-PSS`.
+        assert!(matches!(
+            root.subject_public_key().unwrap(),
+            AnyPublicKey::RsaPss(_, r) if r == PssRestriction::for_hash(PssHash::Sha256)
+        ));
+        assert_eq!(
+            root.signature_algorithm_oid().unwrap().as_slice(),
+            oid::ID_RSASSA_PSS
+        );
+        let int = Certificate::issue_general(
+            &ca_signer,
+            &ca_name,
+            &int_name,
+            &int_signer.public_key(),
+            &validity(),
+            2,
+            true,
+            &[],
+        )
+        .unwrap();
+        let leaf = Certificate::issue_general(
+            &int_signer,
+            &int_name,
+            &leaf_name,
+            &AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity(),
+            3,
+            false,
+            &["pss.example"],
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let chain = alloc::vec![leaf.to_der().to_vec(), int.to_der().to_vec()];
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let leaf_pub = verify_chain(&store, &chain, Some(&now), &policy()).unwrap();
+        assert!(matches!(leaf_pub, AnyPublicKey::Ecdsa(_)));
+        // The chain's signatures are gated as `rsa-pss-pss-sha256`, which a
+        // policy without it refuses.
+        let no_pss = SignaturePolicy::empty()
+            .permit("ecdsa-with-sha256")
+            .permit("rsa-pkcs1-sha256")
+            .permit("rsa-pss-rsae-sha256");
+        assert!(matches!(
+            verify_chain(&store, &chain, Some(&now), &no_pss),
+            Err(Error::BadCertificate)
+        ));
+
+        // PKCS#1 v1.5 under the PSS-restricted CA key: the leaf is signed
+        // with `sha256WithRSAEncryption` by the same private key, and the
+        // chain is refused (RFC 4055 §1.2).
+        let leaf_v15 = Certificate::issue_general(
+            &CertSigner::Rsa(&ca_key),
+            &ca_name,
+            &leaf_name,
+            &AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity(),
+            4,
+            false,
+            &["pss.example"],
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_chain(&store, &[leaf_v15.to_der().to_vec()], Some(&now), &policy()),
+            Err(Error::BadCertificate)
+        ));
+        // ... whereas the same certificate under the CA's `rsaEncryption`
+        // form would verify — the refusal is the restriction, not the math.
+        leaf_v15
+            .verify_signature_with(&AnyPublicKey::Rsa(ca_key.public_key()))
+            .unwrap();
+
+        // Mismatched restriction: a trust anchor certifying the same CA key
+        // pinned to SHA-384 refuses the SHA-256 PSS signature on the leaf.
+        let ca_sha384 = AnyPublicKey::RsaPss(
+            ca_key.public_key(),
+            PssRestriction::for_hash(PssHash::Sha384),
+        );
+        let leaf_direct = Certificate::issue_general(
+            &ca_signer,
+            &ca_name,
+            &leaf_name,
+            &AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity(),
+            5,
+            false,
+            &["pss.example"],
+        )
+        .unwrap();
+        let root_sha384 = Certificate::issue_general(
+            &ca_signer,
+            &ca_name,
+            &ca_name,
+            &ca_sha384,
+            &validity(),
+            6,
+            true,
+            &[],
+        )
+        .unwrap();
+        let mut store_384 = RootCertStore::new();
+        store_384.add_der(root_sha384.to_der().to_vec()).unwrap();
+        assert!(matches!(
+            verify_chain(
+                &store_384,
+                &[leaf_direct.to_der().to_vec()],
+                Some(&now),
+                &policy()
+            ),
+            Err(Error::BadCertificate)
+        ));
+        assert!(leaf_direct.verify_signature_with(&ca_sha384).is_err());
+        // Sanity: the correctly-restricted anchor accepts the same leaf.
+        verify_chain(
+            &store,
+            &[leaf_direct.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
     }
 }

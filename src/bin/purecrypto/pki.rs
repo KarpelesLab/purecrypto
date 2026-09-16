@@ -217,6 +217,14 @@ pub(crate) fn format_dn(dn: &DistinguishedName) -> String {
 pub(crate) fn describe_key(key: &AnyPublicKey) -> String {
     match key {
         AnyPublicKey::Rsa(k) => format!("RSA, {} bits", k.modulus().bit_len()),
+        AnyPublicKey::RsaPss(k, restriction) => format!(
+            "RSA-PSS, {} bits{}",
+            k.modulus().bit_len(),
+            match restriction.hash() {
+                Some(h) => format!(", restricted to {:?}", h),
+                None => String::new(),
+            }
+        ),
         AnyPublicKey::Ecdsa(k) => format!(
             "ECDSA, {}",
             match k.curve() {

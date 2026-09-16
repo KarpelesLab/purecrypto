@@ -648,9 +648,11 @@ impl Certificate {
 
     /// The subject's public key as an algorithm-agnostic [`AnyPublicKey`]
     /// (every SPKI algorithm [`AnyPublicKey::from_spki_der`] accepts; an
-    /// `id-RSASSA-PSS` key SPKI is [`Error::UnsupportedAlgorithm`]).
+    /// `id-RSASSA-PSS` key SPKI is [`AnyPublicKey::RsaPss`] with its RFC
+    /// 4055 restriction preserved).
     ///
     /// [`AnyPublicKey::from_spki_der`]: super::AnyPublicKey::from_spki_der
+    /// [`AnyPublicKey::RsaPss`]: super::AnyPublicKey::RsaPss
     pub fn subject_public_key(&self) -> Result<super::AnyPublicKey, Error> {
         super::AnyPublicKey::from_spki_der(self.spki_der()?)
     }
@@ -662,19 +664,33 @@ impl Certificate {
     /// independent of how the certificate happened to encode the key —
     /// non-canonical parameter encodings do not cause false negatives.
     /// Different algorithms (or the same algorithm on a different curve /
-    /// parameter set) never match. Errors only when the certificate's SPKI
-    /// cannot be parsed by [`subject_public_key`](Self::subject_public_key),
-    /// which includes an RSA key certified under an `id-RSASSA-PSS`
-    /// AlgorithmIdentifier (that restriction has no `AnyPublicKey` form).
+    /// parameter set) never match, with one deliberate exception: the two
+    /// RSA forms ([`AnyPublicKey::Rsa`] and [`AnyPublicKey::RsaPss`]) are
+    /// compared on the RSA key itself, so an RSA private key's public half
+    /// (always the `rsaEncryption` form) matches a certificate that
+    /// certifies the same modulus under an `id-RSASSA-PSS`
+    /// AlgorithmIdentifier — the key does belong to that certificate; the
+    /// PSS restriction governs how it may be *used*, which is
+    /// [`subject_public_key`](Self::subject_public_key)'s job to report.
+    /// Errors only when the certificate's SPKI cannot be parsed.
     ///
     /// This is the check behind "does this private key belong to this
     /// certificate": derive the public key from the private key and pass it
     /// here (e.g. before installing a TLS identity or signing with a CA key).
     ///
     /// [`AnyPublicKey::to_spki_der`]: super::AnyPublicKey::to_spki_der
+    /// [`AnyPublicKey::Rsa`]: super::AnyPublicKey::Rsa
+    /// [`AnyPublicKey::RsaPss`]: super::AnyPublicKey::RsaPss
     pub fn subject_public_key_matches(&self, key: &super::AnyPublicKey) -> Result<bool, Error> {
-        let certified = self.subject_public_key()?.to_spki_der();
-        Ok(certified == key.to_spki_der())
+        use super::AnyPublicKey;
+        let certified = self.subject_public_key()?;
+        Ok(match (&certified, key) {
+            (AnyPublicKey::Rsa(a) | AnyPublicKey::RsaPss(a, _), AnyPublicKey::Rsa(b))
+            | (AnyPublicKey::Rsa(a), AnyPublicKey::RsaPss(b, _)) => {
+                a.to_pkcs1_der() == b.to_pkcs1_der()
+            }
+            _ => certified.to_spki_der() == key.to_spki_der(),
+        })
     }
 
     /// The DER `SubjectPublicKeyInfo` exactly as encoded in the certificate
@@ -1704,6 +1720,60 @@ mod tests {
     /// `subject_public_key_matches` is a canonical-SPKI comparison: the
     /// certified key matches itself and not a different key of the same
     /// algorithm.
+    /// An RSA private key's public half (`rsaEncryption`) belongs to a
+    /// certificate that certifies the same modulus as an `id-RSASSA-PSS`
+    /// key, and vice versa; a different RSA key never matches either form.
+    #[test]
+    fn subject_public_key_matches_across_rsa_forms() {
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::{AnyPublicKey, CertSigner, DistinguishedName, PssHash, PssRestriction};
+        let key_a = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let key_b = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_b().to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("forms.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let pss_cert = Certificate::self_signed_general(
+            &CertSigner::RsaPss(&key_a),
+            &name,
+            &validity,
+            1,
+            false,
+            &[],
+        )
+        .unwrap();
+        let rsa_cert = Certificate::self_signed_general(
+            &CertSigner::Rsa(&key_a),
+            &name,
+            &validity,
+            2,
+            false,
+            &[],
+        )
+        .unwrap();
+        let a_rsa = AnyPublicKey::Rsa(key_a.public_key());
+        let a_pss = AnyPublicKey::RsaPss(
+            key_a.public_key(),
+            PssRestriction::for_hash(PssHash::Sha384),
+        );
+        let b_rsa = AnyPublicKey::Rsa(key_b.public_key());
+        for cert in [&pss_cert, &rsa_cert] {
+            assert!(cert.subject_public_key_matches(&a_rsa).unwrap());
+            assert!(!cert.subject_public_key_matches(&b_rsa).unwrap());
+        }
+        // An `rsaEncryption` certificate matches any PSS form of its key.
+        assert!(rsa_cert.subject_public_key_matches(&a_pss).unwrap());
+        // Two PSS forms of the same key with different restrictions are
+        // compared as canonical SPKIs and differ.
+        let a_pss256 = AnyPublicKey::RsaPss(
+            key_a.public_key(),
+            PssRestriction::for_hash(PssHash::Sha256),
+        );
+        assert!(pss_cert.subject_public_key_matches(&a_pss256).unwrap());
+        assert!(!pss_cert.subject_public_key_matches(&a_pss).unwrap());
+    }
+
     #[test]
     fn subject_public_key_matches_distinguishes_keys() {
         use crate::ec::Ed25519PrivateKey;

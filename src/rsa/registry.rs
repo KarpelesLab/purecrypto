@@ -2,36 +2,37 @@
 //!
 //! Zero-sized types — four PKCS#1 v1.5 (SHA-1 legacy + SHA-256/384/512),
 //! three RSA-PSS-RSAE (TLS-scheme-keyed; MGF1 = same hash, salt-len =
-//! hash-len), and one PSS-key-restricted `id-RSASSA-PSS` entry — each
-//! implementing [`SignatureAlgorithm`]. Each `verify` parses the SPKI to
-//! recover the RSA public key, then delegates to the existing
-//! `BoxedRsaPublicKey::verify_pkcs1v15` / `verify_pss`.
+//! hash-len), and three PSS-key-restricted `id-RSASSA-PSS` entries (one per
+//! SHA-2 digest) — each implementing [`SignatureAlgorithm`]. Each `verify`
+//! parses the SPKI to recover the RSA public key, then delegates to the
+//! existing `BoxedRsaPublicKey::verify_pkcs1v15` / `verify_pss`.
 
-use crate::der::{Reader, parse_oid, tag};
+use crate::der::{Reader, parse_oid};
 use crate::hash::{Sha1, Sha256, Sha384, Sha512};
 use crate::rsa::BoxedRsaPublicKey;
 use crate::signature_registry::SignatureAlgorithm;
-use crate::x509::{Error, oid};
+use crate::x509::{Error, PssHash, PssRestriction, oid};
 
 /// Parses the SPKI to extract an RSA public key. Accepts the common
 /// `rsaEncryption` OID always, and the PSS-key-restricted `id-RSASSA-PSS`
-/// OID (RFC 4055 §1.2) only when `allow_pss_key` is set.
+/// OID (RFC 4055 §1.2) only for a PSS entry — `pss` names the digest the
+/// entry verifies with (MGF1 over the same digest, salt = digest length).
 ///
 /// RFC 4055 §1.2 makes `id-RSASSA-PSS` a *key restriction*: "the key MUST
 /// only be used with RSASSA-PSS". So the PKCS#1 v1.5 registry entries pass
-/// `false` — verifying a v1.5 signature under a PSS-restricted key would
+/// `None` — verifying a v1.5 signature under a PSS-restricted key would
 /// ignore the very restriction the issuer encoded — while the PSS entries
-/// pass `true`.
+/// pass their digest.
 ///
 /// For `rsaEncryption` the explicit `NULL` parameters are required
 /// (RFC 3279 §2.3.1). For `id-RSASSA-PSS` the parameters are either absent
-/// (an unrestricted PSS key) or an `RSASSA-PSS-params` SEQUENCE, which is
-/// validated against the single parameter set the registry's PSS verifier
-/// implements (SHA-256 / MGF1-SHA-256 / saltLength 32 / trailerField 1) —
-/// any other restriction is rejected rather than silently verified with
-/// the wrong parameters. Trailing junk inside the AlgorithmIdentifier
-/// SEQUENCE or after the BIT STRING is rejected (strict DER).
-fn parse_rsa_spki(spki: &[u8], allow_pss_key: bool) -> Result<BoxedRsaPublicKey, Error> {
+/// (an unrestricted PSS key) or an `RSASSA-PSS-params` SEQUENCE, decoded by
+/// [`PssRestriction::decode`] and then required to permit exactly this
+/// entry's parameter set — a key restricted to any other set is rejected
+/// rather than silently verified with the wrong parameters. Trailing junk
+/// inside the AlgorithmIdentifier SEQUENCE or after the BIT STRING is
+/// rejected (strict DER).
+fn parse_rsa_spki(spki: &[u8], pss: Option<PssHash>) -> Result<BoxedRsaPublicKey, Error> {
     let mut reader = Reader::new(spki);
     let mut outer = reader.read_sequence()?;
     let mut algid = outer.read_sequence()?;
@@ -40,15 +41,14 @@ fn parse_rsa_spki(spki: &[u8], allow_pss_key: bool) -> Result<BoxedRsaPublicKey,
         algid.read_null()?;
         algid.finish()?;
     } else if alg.as_slice() == oid::ID_RSASSA_PSS {
-        if !allow_pss_key {
-            // RFC 4055 §1.2: a PSS-restricted key must not verify PKCS#1
-            // v1.5 signatures.
+        // RFC 4055 §1.2: a PSS-restricted key must not verify PKCS#1 v1.5
+        // signatures.
+        let hash = pss.ok_or(Error::UnsupportedAlgorithm)?;
+        let restriction = PssRestriction::decode(&mut algid)?;
+        algid.finish()?;
+        if !restriction.permits(hash) {
             return Err(Error::UnsupportedAlgorithm);
         }
-        if !algid.is_empty() {
-            check_rsassa_pss_params(&mut algid)?;
-        }
-        algid.finish()?;
     } else {
         return Err(Error::UnsupportedAlgorithm);
     }
@@ -58,85 +58,11 @@ fn parse_rsa_spki(spki: &[u8], allow_pss_key: bool) -> Result<BoxedRsaPublicKey,
     Ok(BoxedRsaPublicKey::from_pkcs1_der(key_bits)?)
 }
 
-/// Validates an `RSASSA-PSS-params` SEQUENCE (RFC 4055 §3.1) against the one
-/// parameter set the registry's PSS verifier implements: hashAlgorithm
-/// SHA-256, maskGenAlgorithm MGF1 with SHA-256, saltLength 32, trailerField 1.
-///
-/// DER `DEFAULT` handling is load-bearing: an *absent* field encodes the
-/// SHA-1 / MGF1-SHA-1 / saltLength 20 default, which is **not** the supported
-/// set, so the hash, MGF, and salt fields must all be explicitly present.
-/// `trailerField` may be absent (its DEFAULT 1 *is* the supported value) or
-/// present with value 1.
-fn check_rsassa_pss_params(algid: &mut Reader) -> Result<(), Error> {
-    let mut params = algid.read_sequence()?;
-    // hashAlgorithm [0] EXPLICIT, DEFAULT sha1 — must be present: SHA-256.
-    if params.peek_tag() != Some(tag::context(0)) {
-        return Err(Error::UnsupportedAlgorithm);
-    }
-    let body = params.read_tlv(tag::context(0))?;
-    check_hash_algid(body, oid::ID_SHA256)?;
-    // maskGenAlgorithm [1] EXPLICIT, DEFAULT mgf1SHA1 — must be present:
-    // MGF1 parameterized with SHA-256.
-    if params.peek_tag() != Some(tag::context(1)) {
-        return Err(Error::UnsupportedAlgorithm);
-    }
-    let body = params.read_tlv(tag::context(1))?;
-    let mut r = Reader::new(body);
-    let mut mgf = r.read_sequence()?;
-    if parse_oid(mgf.read_oid()?)?.as_slice() != oid::ID_MGF1 {
-        return Err(Error::UnsupportedAlgorithm);
-    }
-    let mgf_hash = mgf.read_element()?;
-    mgf.finish()?;
-    r.finish()?;
-    check_hash_algid(mgf_hash, oid::ID_SHA256)?;
-    // saltLength [2] EXPLICIT, DEFAULT 20 — must be present: 32.
-    if params.peek_tag() != Some(tag::context(2)) {
-        return Err(Error::UnsupportedAlgorithm);
-    }
-    let body = params.read_tlv(tag::context(2))?;
-    let mut r = Reader::new(body);
-    let salt_ok = r.read_integer_bytes()? == [32];
-    r.finish()?;
-    if !salt_ok {
-        return Err(Error::UnsupportedAlgorithm);
-    }
-    // trailerField [3] EXPLICIT, DEFAULT 1 — absent or explicitly 1.
-    if !params.is_empty() {
-        let body = params.read_tlv(tag::context(3))?;
-        let mut r = Reader::new(body);
-        let trailer_ok = r.read_integer_bytes()? == [1];
-        r.finish()?;
-        if !trailer_ok {
-            return Err(Error::UnsupportedAlgorithm);
-        }
-    }
-    params.finish()?;
-    Ok(())
-}
-
-/// Checks that `der` is exactly one hash `AlgorithmIdentifier` SEQUENCE whose
-/// OID is `want`, with parameters absent or NULL (RFC 4055 §2.1 allows both
-/// encodings for the SHA-2 family).
-fn check_hash_algid(der: &[u8], want: &[u64]) -> Result<(), Error> {
-    let mut r = Reader::new(der);
-    let mut h = r.read_sequence()?;
-    if parse_oid(h.read_oid()?)?.as_slice() != want {
-        return Err(Error::UnsupportedAlgorithm);
-    }
-    if !h.is_empty() {
-        h.read_null()?;
-    }
-    h.finish()?;
-    r.finish()?;
-    Ok(())
-}
-
 /// Returns the modulus length, in bits, of the RSA key inside `spki` — or
 /// `None` when this entry would not accept the key at all, so the key-size
 /// policy hook agrees with `verify`.
-fn rsa_bits(spki: &[u8], allow_pss_key: bool) -> Option<u32> {
-    parse_rsa_spki(spki, allow_pss_key)
+fn rsa_bits(spki: &[u8], pss: Option<PssHash>) -> Option<u32> {
+    parse_rsa_spki(spki, pss)
         .ok()
         .map(|k| k.modulus().bit_len() as u32)
 }
@@ -151,18 +77,18 @@ macro_rules! rsa_pkcs1_entry {
             fn x509_oids(&self) -> &'static [&'static [u64]] { &[$oid] }
             fn tls_schemes(&self) -> &'static [u16] { $tls }
             fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
-                // `false`: RFC 4055 §1.2 forbids verifying PKCS#1 v1.5 under
+                // `None`: RFC 4055 §1.2 forbids verifying PKCS#1 v1.5 under
                 // an `id-RSASSA-PSS` (PSS-restricted) key.
-                let key = parse_rsa_spki(spki, false)?;
+                let key = parse_rsa_spki(spki, None)?;
                 key.verify_pkcs1v15::<$digest>(message, signature).map_err(Error::Rsa)
             }
-            fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> { rsa_bits(spki, false) }
+            fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> { rsa_bits(spki, None) }
         }
     };
 }
 
 macro_rules! rsa_pss_entry {
-    ($(#[$m:meta])* $name:ident, $id:expr, $oids:expr, $tls:expr, $digest:ty) => {
+    ($(#[$m:meta])* $name:ident, $id:expr, $oids:expr, $tls:expr, $digest:ty, $pss_hash:expr) => {
         $(#[$m])*
         pub(crate) struct $name;
 
@@ -171,10 +97,12 @@ macro_rules! rsa_pss_entry {
             fn x509_oids(&self) -> &'static [&'static [u64]] { $oids }
             fn tls_schemes(&self) -> &'static [u16] { $tls }
             fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
-                let key = parse_rsa_spki(spki, true)?;
+                let key = parse_rsa_spki(spki, Some($pss_hash))?;
                 key.verify_pss::<$digest>(message, signature).map_err(Error::Rsa)
             }
-            fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> { rsa_bits(spki, true) }
+            fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> {
+                rsa_bits(spki, Some($pss_hash))
+            }
         }
     };
 }
@@ -233,7 +161,8 @@ rsa_pss_entry!(
     "rsa-pss-rsae-sha256",
     &[],
     &[0x0804],
-    Sha256
+    Sha256,
+    PssHash::Sha256
 );
 rsa_pss_entry!(
     /// `rsa_pss_rsae_sha384`. TLS scheme `0x0805`; no X.509 OID.
@@ -241,7 +170,8 @@ rsa_pss_entry!(
     "rsa-pss-rsae-sha384",
     &[],
     &[0x0805],
-    Sha384
+    Sha384,
+    PssHash::Sha384
 );
 rsa_pss_entry!(
     /// `rsa_pss_rsae_sha512`. TLS scheme `0x0806`; no X.509 OID.
@@ -249,16 +179,24 @@ rsa_pss_entry!(
     "rsa-pss-rsae-sha512",
     &[],
     &[0x0806],
-    Sha512
+    Sha512,
+    PssHash::Sha512
 );
 
 // RSA-PSS with PSS-key-restricted SPKI (`id-RSASSA-PSS` as the key OID).
 // The X.509 signatureAlgorithm OID is also `id-RSASSA-PSS`; the hash and
-// MGF parameters live inside the AlgorithmIdentifier parameters. The
-// registry entry implements only the SHA-256 / MGF1-SHA-256 / salt = 32
-// parameter set, which is what real-world PSS-PSS issuers overwhelmingly
-// use today; SPKIs whose RSASSA-PSS-params restrict the key to any other
-// set are rejected by `parse_rsa_spki` rather than mis-verified.
+// MGF parameters live inside the AlgorithmIdentifier parameters. One entry
+// per SHA-2 digest, each implementing the MGF1-same-digest / salt = digest
+// length profile; an SPKI whose RSASSA-PSS-params restrict the key to
+// another set is rejected by `parse_rsa_spki` rather than mis-verified.
+//
+// Only the SHA-256 entry carries the X.509 OID (the registry's OID lookup
+// is first-match and keys must be unique). The digest a PSS chain
+// signature actually needs is fixed by the *key's* restriction, so
+// `AnyPublicKey::signature_algorithm` routes an `id-RSASSA-PSS` signature
+// under an `AnyPublicKey::RsaPss` key to the entry for that digest; the OID
+// lookup alone (an `rsaEncryption` key signed with `id-RSASSA-PSS`) reaches
+// the SHA-256 entry, the set real-world PSS issuers overwhelmingly use.
 rsa_pss_entry!(
     /// RSA-PSS over a PSS-key-restricted SPKI, SHA-256. X.509 OID
     /// `id-RSASSA-PSS` (1.2.840.113549.1.1.10), no TLS scheme. Also
@@ -269,7 +207,30 @@ rsa_pss_entry!(
     "rsa-pss-pss-sha256",
     &[oid::ID_RSASSA_PSS],
     &[],
-    Sha256
+    Sha256,
+    PssHash::Sha256
+);
+rsa_pss_entry!(
+    /// RSA-PSS over a PSS-key-restricted SPKI, SHA-384 (MGF1-SHA-384, salt
+    /// 48). Reached through `AnyPublicKey::signature_algorithm` for a key
+    /// restricted to SHA-384; no X.509 OID of its own, no TLS scheme.
+    PssPssSha384,
+    "rsa-pss-pss-sha384",
+    &[],
+    &[],
+    Sha384,
+    PssHash::Sha384
+);
+rsa_pss_entry!(
+    /// RSA-PSS over a PSS-key-restricted SPKI, SHA-512 (MGF1-SHA-512, salt
+    /// 64). Reached through `AnyPublicKey::signature_algorithm` for a key
+    /// restricted to SHA-512; no X.509 OID of its own, no TLS scheme.
+    PssPssSha512,
+    "rsa-pss-pss-sha512",
+    &[],
+    &[],
+    Sha512,
+    PssHash::Sha512
 );
 
 #[cfg(test)]
@@ -427,6 +388,60 @@ mod tests {
         assert_eq!(algo.rsa_modulus_bits(&pss_spki(None)), Some(2048));
         let bad_hash = pss_params(oid::ID_SHA384, oid::ID_SHA256, 32);
         assert_eq!(algo.rsa_modulus_bits(&pss_spki(Some(bad_hash))), None);
+    }
+
+    /// The SHA-384 / SHA-512 PSS-PSS entries mirror the SHA-256 one: an
+    /// unrestricted key or a key restricted to exactly their profile
+    /// verifies, a key restricted to another digest does not, and a
+    /// signature over the other digest never verifies. Neither carries the
+    /// `id-RSASSA-PSS` OID (that lookup stays with SHA-256); the key's
+    /// restriction routes to them via `AnyPublicKey::signature_algorithm`.
+    #[test]
+    fn pss_pss_sha384_and_sha512_follow_the_key_restriction() {
+        let key = rsa_test_key_a();
+        let mut rng = crate::rng::HmacDrbg::<Sha256>::new(b"reg-pss-384-512", b"n", &[]);
+        let sig384 = key.sign_pss::<Sha384, _>(b"hi", &mut rng).unwrap();
+        let sig512 = key.sign_pss::<Sha512, _>(b"hi", &mut rng).unwrap();
+        let a384 = find_by_id("rsa-pss-pss-sha384").unwrap();
+        let a512 = find_by_id("rsa-pss-pss-sha512").unwrap();
+        assert!(a384.x509_oids().is_empty() && a512.x509_oids().is_empty());
+        assert!(a384.tls_schemes().is_empty() && a512.tls_schemes().is_empty());
+
+        let r384 = pss_spki(Some(pss_params(oid::ID_SHA384, oid::ID_SHA384, 48)));
+        let r512 = pss_spki(Some(pss_params(oid::ID_SHA512, oid::ID_SHA512, 64)));
+        let r256 = pss_spki(Some(pss_params(oid::ID_SHA256, oid::ID_SHA256, 32)));
+        a384.verify(&pss_spki(None), b"hi", &sig384).unwrap();
+        a384.verify(&r384, b"hi", &sig384).unwrap();
+        a512.verify(&pss_spki(None), b"hi", &sig512).unwrap();
+        a512.verify(&r512, b"hi", &sig512).unwrap();
+        // Wrong digest for the entry, or a key pinned elsewhere.
+        assert!(a384.verify(&pss_spki(None), b"hi", &sig512).is_err());
+        assert!(a384.verify(&r256, b"hi", &sig384).is_err());
+        assert!(a384.verify(&r512, b"hi", &sig384).is_err());
+        assert!(a512.verify(&r256, b"hi", &sig512).is_err());
+        assert_eq!(a384.rsa_modulus_bits(&r384), Some(2048));
+        assert_eq!(a384.rsa_modulus_bits(&r256), None);
+        // The RSAE entries apply the same per-digest restriction check (a
+        // key pinned to SHA-384 verifies `rsa_pss_rsae_sha384`, not
+        // `rsa_pss_rsae_sha256`).
+        find_by_id("rsa-pss-rsae-sha384")
+            .unwrap()
+            .verify(&r384, b"hi", &sig384)
+            .unwrap();
+        assert!(
+            find_by_id("rsa-pss-rsae-sha256")
+                .unwrap()
+                .verify(&r384, b"hi", &sig384)
+                .is_err()
+        );
+        // The key's own dispatch picks the entry for its digest.
+        let any = AnyPublicKey::from_spki_der(&r384).unwrap();
+        assert_eq!(
+            any.signature_algorithm(oid::ID_RSASSA_PSS).unwrap().id(),
+            "rsa-pss-pss-sha384"
+        );
+        any.verify(oid::ID_RSASSA_PSS, b"hi", &sig384).unwrap();
+        assert!(any.verify(oid::ID_RSASSA_PSS, b"hi", &sig512).is_err());
     }
 
     /// RFC 4055 §1.2: an `id-RSASSA-PSS` SPKI is a *restricted* key — "the

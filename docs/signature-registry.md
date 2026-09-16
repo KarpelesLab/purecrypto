@@ -18,7 +18,8 @@ the caller has to name the id explicitly.
 | `rsa-pss-rsae-sha256`       | (TLS only, `rsaEncryption` key) | `0x0804`       | yes |
 | `rsa-pss-rsae-sha384`       | (TLS only, `rsaEncryption` key) | `0x0805`       | yes |
 | `rsa-pss-rsae-sha512`       | (TLS only, `rsaEncryption` key) | `0x0806`       | yes |
-| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (`id-RSASSA-PSS`; SHA-256 / MGF1-SHA-256 / salt 32 only) | (none) | opt-in |
+| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (`id-RSASSA-PSS`; SHA-256 / MGF1-SHA-256 / salt 32) | (none) | yes |
+| `rsa-pss-pss-sha384`, `rsa-pss-pss-sha512` | `id-RSASSA-PSS` via the key's restriction (SHA-384 / salt 48, SHA-512 / salt 64) | (none) | yes |
 | `ecdsa-with-sha256`         | `1.2.840.10045.4.3.2` (any curve) | (none)       | yes |
 | `ecdsa-with-sha384`         | `1.2.840.10045.4.3.3` (any curve) | (none)       | yes |
 | `ecdsa-with-sha512`         | `1.2.840.10045.4.3.4` (any curve) | (none)       | yes |
@@ -43,10 +44,17 @@ fine-grained policy-keyed entries for TLS opt-in.
 The three `rsa-pss-rsae-*` entries carry **no** X.509 OID: in X.509 the
 `sha*WithRSAEncryption` OIDs mean PKCS#1 v1.5 and belong to the
 `rsa-pkcs1-*` entries, while an RSA-PSS certificate signature is
-`id-RSASSA-PSS` and dispatches to `rsa-pss-pss-sha256`. That entry accepts
+`id-RSASSA-PSS`. Its OID lookup reaches `rsa-pss-pss-sha256`, which accepts
 both an `rsaEncryption` SPKI and a PSS-restricted `id-RSASSA-PSS` SPKI
-(parameters absent, or exactly the SHA-256 / MGF1-SHA-256 / salt-32 set);
-the `rsa-pkcs1-*` entries refuse a PSS-restricted key (RFC 4055 §1.2).
+(parameters absent, or exactly the SHA-256 / MGF1-SHA-256 / salt-32 set).
+
+A PSS-restricted key parses to `x509::AnyPublicKey::RsaPss` with its RFC
+4055 `PssRestriction` preserved, and `AnyPublicKey::signature_algorithm`
+routes an `id-RSASSA-PSS` signature under it to the `rsa-pss-pss-*` entry for
+the digest the restriction names (SHA-256 when unrestricted) — the chain
+verifier, CRL and OCSP gates whitelist that entry, not the bare OID lookup.
+Every PSS entry refuses a key restricted to another digest, and the
+`rsa-pkcs1-*` entries refuse a PSS-restricted key outright (RFC 4055 §1.2).
 
 ML-DSA is on the default whitelist. SLH-DSA's twelve parameter sets are
 registered but never on the default whitelist: signatures are 7 to 50 KB and

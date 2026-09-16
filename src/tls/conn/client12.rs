@@ -472,7 +472,11 @@ pub(crate) fn record_fragment_cap(peer_limit: Option<u16>) -> usize {
 /// negotiated suite's signature half requires).
 fn key_matches_sig_kind(key: &AnyPublicKey, kind: SigKind) -> bool {
     match (key, kind) {
-        (AnyPublicKey::Rsa(_), SigKind::Rsa) => true,
+        // A PSS-restricted leaf still authenticates `ECDHE-RSA-*` suites:
+        // the ServerKeyExchange signature is verified through the registry
+        // under the scheme the server chose, and the `rsa_pss_*` entries
+        // honour the restriction while `rsa_pkcs1_*` refuse the key.
+        (AnyPublicKey::Rsa(_) | AnyPublicKey::RsaPss(..), SigKind::Rsa) => true,
         (AnyPublicKey::Ecdsa(_), SigKind::Ecdsa) => true,
         // Ed25519 / ML-DSA leaves don't fit either RSA or ECDSA TLS-1.2 ECDHE
         // suites (there are no IANA-assigned `TLS_ECDHE_EDDSA_*` or

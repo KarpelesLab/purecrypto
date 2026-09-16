@@ -84,7 +84,7 @@ use crate::der::{
 };
 use crate::hash::{sha1, sha256, sha384, sha512};
 use crate::rng::RngCore;
-use crate::signature_registry::{SignaturePolicy, find_by_oid};
+use crate::signature_registry::SignaturePolicy;
 
 const PEM_LABEL: &str = "OCSP RESPONSE";
 
@@ -425,7 +425,9 @@ impl OcspResponse {
         policy: &SignaturePolicy,
     ) -> Result<(), Error> {
         let p = self.basic_parts()?;
-        let algo = find_by_oid(&p.sig_alg).ok_or(Error::Verification)?;
+        let algo = key
+            .signature_algorithm(&p.sig_alg)
+            .ok_or(Error::Verification)?;
         if !policy.permits(algo, &key.to_spki_der()) {
             return Err(Error::Verification);
         }
@@ -1056,7 +1058,9 @@ fn verify_cert_signature_with_policy(
     policy: &SignaturePolicy,
 ) -> Result<(), Error> {
     let sig_alg = cert.signature_algorithm_oid()?;
-    let algo = find_by_oid(&sig_alg).ok_or(Error::Verification)?;
+    let algo = issuer_key
+        .signature_algorithm(&sig_alg)
+        .ok_or(Error::Verification)?;
     if !policy.permits(algo, &issuer_key.to_spki_der()) {
         return Err(Error::Verification);
     }
