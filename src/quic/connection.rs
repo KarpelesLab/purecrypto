@@ -3704,14 +3704,27 @@ impl QuicConnection {
 
         // Replay the ClientHello: the engine produced the bytes once at
         // construction time and they were enqueued into the Initial
-        // outbound CryptoBuf. The first Initial we sent had PN 0; we
-        // need to rewind both the PN counter (RFC 9001 §5.2: "the
-        // client uses a fresh packet-number space" after Retry —
-        // implementations universally rewind to 0) AND rewind the
-        // outbound CRYPTO offset (the bytes-to-send are the same
-        // ClientHello, just under different keys + different DCID).
-        self.endpoint.pn.initial.next_tx = 0;
+        // outbound CryptoBuf. Rewind the outbound CRYPTO offset (the
+        // bytes-to-send are the same ClientHello, just under different keys
+        // + different DCID) — but NOT the packet number. RFC 9000 §17.2.5.3:
+        // "A client MUST NOT reset the packet number for any packet number
+        // space after processing a Retry packet." The Initial keys change
+        // with the DCID, so the sequence simply continues from where it was.
+        //
+        // The Initial(s) sent before the Retry can never be acknowledged —
+        // the server that sent the Retry kept no state for them — so take
+        // them out of loss recovery now (RFC 9002 §A.10 bookkeeping, not a
+        // congestion event) rather than have them declared lost later and
+        // their CRYPTO retransmitted a second time.
         self.endpoint.pn.initial.largest_acked_tx = None;
+        let drained = self.endpoint.loss.discard_keys(PnSpaceId::Initial);
+        let stranded: u64 = drained
+            .iter()
+            .filter(|p| p.in_flight)
+            .map(|p| p.sent_bytes as u64)
+            .sum();
+        self.endpoint.cc.bytes_in_flight =
+            self.endpoint.cc.bytes_in_flight.saturating_sub(stranded);
 
         // Rewind the Initial-level CryptoBuf so the ClientHello bytes
         // get re-carved into a fresh packet under the new keys.
@@ -9605,6 +9618,71 @@ mod tests {
         })
         .expect("server build");
         (client, server)
+    }
+
+    /// RFC 9000 §17.2.5.3 — "A client MUST NOT reset the packet number for
+    /// any packet number space after processing a Retry packet." The Initial
+    /// keys change with the DCID but the sequence continues; the pre-Retry
+    /// Initial, which can never be acknowledged, leaves loss recovery instead
+    /// of being declared lost and retransmitted a second time later.
+    #[test]
+    fn retry_does_not_reset_the_initial_packet_number() {
+        let (mut c, mut s) = retry_loopback_pair([0x51u8; 32]);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4433);
+        s.set_peer_addr(addr);
+        s.set_now_secs(1_000);
+        c.set_peer_addr(addr);
+        let first = c.pop_datagram();
+        assert_eq!(c.endpoint.pn.initial.next_tx, 1);
+        assert!(c.endpoint.cc.bytes_in_flight > 0);
+        s.feed_datagram_from(addr, &first).expect("server feed");
+        let retry = s.pop_datagram();
+        assert!(
+            (retry[0] & 0x80) != 0 && ((retry[0] >> 4) & 0x03) == 0x03,
+            "server answers with a Retry"
+        );
+        c.feed_datagram(&retry).expect("client feed");
+        assert!(c.retry_processed);
+        assert_eq!(
+            c.endpoint.pn.initial.next_tx, 1,
+            "the Initial packet number continues after Retry"
+        );
+        let initial = &c.endpoint.loss.per_space[PnSpaceId::Initial as usize];
+        assert!(
+            initial.sent_packets.is_empty(),
+            "the unacknowledgeable pre-Retry Initial leaves loss recovery"
+        );
+        assert_eq!(c.endpoint.cc.bytes_in_flight, 0);
+        let retried = c.pop_datagram();
+        assert!(first_packet_is_initial(&retried));
+        assert_eq!(c.endpoint.pn.initial.next_tx, 2);
+        let tracked: Vec<u64> = c.endpoint.loss.per_space[PnSpaceId::Initial as usize]
+            .sent_packets
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(tracked, alloc::vec![1u64], "the retried Initial is PN 1");
+        s.feed_datagram_from(addr, &retried).expect("server feed");
+        for _ in 0..8 {
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                c.feed_datagram(&dg).expect("client feed");
+            }
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                s.feed_datagram_from(addr, &dg).expect("server feed");
+            }
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
     }
 
     /// H-1 — RFC 9000 §14.1: a server MUST discard an Initial carried in a
