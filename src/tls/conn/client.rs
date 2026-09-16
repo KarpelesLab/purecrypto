@@ -837,6 +837,11 @@ pub(crate) struct ClientEchState {
     /// needed to re-pad CH2-inner identically on the HRR retry path.
     /// `None` on GREASE-only ECH.
     pub(crate) maximum_name_length: Option<u8>,
+    /// CH1-outer's `random`. draft-ietf-tls-esni-22 §6.1: the client MUST
+    /// generate a fresh `ClientHelloOuter.random`, independent of
+    /// `ClientHelloInner.random` (`client_random`); RFC 8446 §4.1.2 then
+    /// requires CH2-outer to reuse it on the HRR retry path.
+    pub(crate) outer_random: [u8; 32],
     /// `true` once the live transcript has been swapped from CH1-outer
     /// to the inner sequence. Set by the HRR retry path when the HRR's
     /// `encrypted_client_hello` confirmation signal validates; the SH
@@ -1470,6 +1475,7 @@ impl ClientConnection {
                 inner_ch1_random,
                 maximum_name_length,
                 public_name,
+                outer_random,
             }) => {
                 conn.ech_state = Some(ClientEchState {
                     inner_ch_bytes,
@@ -1482,6 +1488,7 @@ impl ClientConnection {
                     inner_transcript_swapped: false,
                     outer_public_name: public_name,
                     retry_configs: None,
+                    outer_random,
                 });
                 outer_ch
             }
@@ -1611,6 +1618,17 @@ impl ClientConnection {
         // this function is identical across feature combinations.
         #[cfg(not(feature = "ech"))]
         let _ = ech_override;
+        // draft-ietf-tls-esni-22 §6.1: ClientHelloInner "MUST NOT offer to
+        // negotiate TLS 1.2 or below" — only the outer hello may carry the
+        // version-spanning offer (the backend must never downgrade a sealed
+        // hello). The inner form of `encrypted_client_hello` identifies the
+        // inner build.
+        #[cfg(feature = "ech")]
+        let ech_inner = ech_override
+            .is_some_and(|b| b == crate::tls::ech::inner::inner_extension_body().as_slice());
+        #[cfg(not(feature = "ech"))]
+        let ech_inner = false;
+        let offer_tls12 = self.offer_tls12 && !ech_inner;
         let mut key_shares = Vec::new();
         for &g in groups {
             if !share_only.is_empty() && !share_only.contains(&g) {
@@ -1638,7 +1656,7 @@ impl ClientConnection {
         let mut extensions = alloc::vec![
             ext::supported_groups_list(groups),
             ext::signature_algorithms(),
-            if self.offer_tls12 {
+            if offer_tls12 {
                 // Offer both 1.3 and 1.2 so a 1.2-only server can negotiate.
                 ext::client_supported_versions_with_tls12()
             } else {
@@ -1652,7 +1670,7 @@ impl ClientConnection {
         // `renegotiation_info` only if we offered it, and our 1.2 engine
         // rejects a ServerHello missing the echo). The pure-1.3 CH omits all
         // three; a 1.3 server ignores them.
-        if self.offer_tls12 {
+        if offer_tls12 {
             extensions.push(ext::ec_point_formats());
             extensions.push(ext::extended_master_secret_empty());
             extensions.push(ext::renegotiation_info_empty());
@@ -2858,7 +2876,7 @@ impl ClientConnection {
 
         // Snapshot the per-CH1 ECH state without holding a borrow of
         // `self` across `build_client_hello`/`seal_into_skeleton`.
-        let (sym, config_id, maximum_name_length) = {
+        let (sym, config_id, maximum_name_length, outer_random) = {
             let state = self.ech_state.as_ref().ok_or(Error::EchDecryptionFailed)?;
             (
                 state.sym.ok_or(Error::EchDecryptionFailed)?,
@@ -2866,6 +2884,7 @@ impl ClientConnection {
                 state
                     .maximum_name_length
                     .ok_or(Error::EchDecryptionFailed)?,
+                state.outer_random,
             )
         };
 
@@ -2899,8 +2918,10 @@ impl ClientConnection {
         if padded.len() + crate::tls::ech::outer::HPKE_TAG_LEN > 0xFFFF {
             return Err(Error::IllegalParameter);
         }
+        // RFC 8446 §4.1.2: CH2 keeps CH1's `random` — for the outer hello
+        // that is CH1-outer's own (fresh, §6.1) random, not the inner one.
         let skeleton = self.build_client_hello(
-            random,
+            outer_random,
             public_name_str,
             &suites,
             &groups,
@@ -3833,6 +3854,8 @@ pub(crate) struct EchSealOutput {
     /// `ECHConfig.public_name` used as the outer CH's SNI; on rejection
     /// the server certificate is verified against this name.
     pub public_name: String,
+    /// The fresh `random` the outer CH was built with (draft §6.1).
+    pub outer_random: [u8; 32],
 }
 
 /// draft-ietf-tls-esni-22 §6. Returns `Some(EchSealOutput)` if a
@@ -3885,6 +3908,13 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     let maximum_name_length = contents.maximum_name_length;
     let public_name_str = String::from(core::str::from_utf8(&contents.public_name).ok()?);
     let inner_marker = crate::tls::ech::inner::inner_extension_body();
+    // draft-ietf-tls-esni-22 §6.1: "It MUST generate a fresh
+    // ClientHelloOuter.random using a secure random number generator." The
+    // inner hello keeps `random` (the connection's `client_random`, which
+    // also seeds the accept-confirmation signals); the outer hello gets its
+    // own, so a passive observer cannot link the two.
+    let mut outer_random: Random = [0u8; 32];
+    rng.fill_bytes(&mut outer_random);
     // draft-ietf-tls-esni-22 §6.1: `key_share` is one of the
     // outer-extensions that gets compressed across the seam, so the
     // inner and outer CHs MUST present the same `key_share` bytes —
@@ -3919,7 +3949,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     // fall back to sealing the inner CH verbatim (correct, just larger).
     let reference_outer = conn
         .build_client_hello(
-            random,
+            outer_random,
             public_name_str.clone(),
             effective_suites,
             groups,
@@ -3974,7 +4004,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
             // plain (non-ECH) CH1 rather than panicking.
             conn_for_closure
                 .build_client_hello(
-                    random,
+                    outer_random,
                     public_name_closure.clone(),
                     &suites_owned,
                     &groups_owned,
@@ -4005,6 +4035,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
         inner_ch1_random,
         maximum_name_length,
         public_name: public_name_str,
+        outer_random,
     })
 }
 
@@ -4646,6 +4677,69 @@ mod tests {
             .unwrap()
             .expect("inner SNI present");
         assert_eq!(inner_sni_parsed, inner_sni);
+
+        // draft-ietf-tls-esni-22 §6.1: the outer hello carries a fresh
+        // random of its own; the inner one is the connection's.
+        assert_ne!(
+            outer_ch.random, inner_ch.random,
+            "ClientHelloOuter.random must be independent of ClientHelloInner.random"
+        );
+        assert_eq!(inner_ch.random, client.client_random());
+    }
+
+    /// draft-ietf-tls-esni-22 §6.1: ClientHelloInner "MUST NOT offer to
+    /// negotiate TLS 1.2 or below". A version-spanning client (the default
+    /// `min 1.2 / max 1.3` range) used to put its hybrid `supported_versions`
+    /// in the inner hello as well; only the outer may offer TLS 1.2.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_inner_hello_offers_tls13_only() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::outer::try_decap_inner;
+
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-inner-ver-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x21,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let list = crate::tls::ech::EchConfigList::new(alloc::vec![pair.config().clone()]);
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+        let mut cfg = ClientConfig::new(RootCertStore::new());
+        cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
+        cfg.offer_tls12 = true;
+        let mut rng = HmacDrbg::<Sha256>::new(b"ech-inner-ver-client", b"nonce", &[]);
+        let mut client = ClientConnection::new(cfg, "secret.example", &mut rng).unwrap();
+        let out = client.write_tls();
+        let outer_msg = read_record(&out).unwrap().unwrap().fragment.to_vec();
+        let outer_ch = ClientHello::decode(&outer_msg[4..]).unwrap();
+        let inner_msg = try_decap_inner(&outer_msg, &ring)
+            .expect("server-side decap")
+            .inner_ch_bytes;
+        let inner_ch = ClientHello::decode(&inner_msg[4..]).unwrap();
+
+        let versions = |ch: &ClientHello| {
+            ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
+                .expect("supported_versions")
+                .to_vec()
+        };
+        // Outer: [1.3, 1.2]; inner: [1.3] only.
+        assert_eq!(
+            versions(&outer_ch),
+            alloc::vec![0x04, 0x03, 0x04, 0x03, 0x03]
+        );
+        assert_eq!(versions(&inner_ch), alloc::vec![0x02, 0x03, 0x04]);
     }
 
     /// draft-ietf-tls-esni-22 §6.1.4/§6.1.6: when the client attempted
@@ -4743,6 +4837,11 @@ mod tests {
             .find(|(t, _)| t.0 == 0x002c)
             .expect("CH2 echoes the cookie");
         assert_eq!(echoed.1, alloc::vec![0x00, 0x04, 0xde, 0xad, 0xbe, 0xef]);
+        // RFC 8446 §4.1.2: CH2-outer reuses CH1-outer's (fresh, draft §6.1)
+        // random — not the inner one.
+        let outer_random = client.ech_state.as_ref().unwrap().outer_random;
+        assert_eq!(ch2.random, outer_random);
+        assert_ne!(ch2.random, client.client_random());
     }
 
     /// A HelloRetryRequest cookie is echoed verbatim in CH2, so an
