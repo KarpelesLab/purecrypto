@@ -588,11 +588,16 @@ impl LossState {
             self.loss_detection_timer = None;
             return;
         }
-        // 3. PTO time = `time_of_last_ack_eliciting_packet + PTO × 2^pto_count`.
-        //    Choose the space with the most-recent ack-eliciting send;
-        //    that produces the latest deadline, which is what the spec
-        //    pseudocode picks (§A.8 GetPtoTimeAndSpace).
-        let mut latest_ack_eliciting: Option<(Duration, PnSpaceId)> = None;
+        // 3. PTO time, per §A.8 `GetPtoTimeAndSpace`: for every space that
+        //    still has ack-eliciting packets in flight, `time_of_last_ack_
+        //    eliciting_packet + PTO(space) × 2^pto_count`, and the timer is
+        //    the EARLIEST of those. (It used to take the space with the most
+        //    recent send and anchor on it even when that space had nothing
+        //    left in flight, which both picked the wrong space and fired
+        //    late.)
+        let backoff = self.pto_count.min(PTO_BACKOFF_CAP);
+        let mult = 1u64.checked_shl(backoff).unwrap_or(u64::MAX);
+        let mut earliest: Option<Duration> = None;
         for (i, space_id) in [
             PnSpaceId::Initial,
             PnSpaceId::Handshake,
@@ -601,32 +606,28 @@ impl LossState {
         .iter()
         .enumerate()
         {
-            if let Some(t) = self.per_space[i].time_of_last_ack_eliciting_packet {
-                latest_ack_eliciting = Some(match latest_ack_eliciting {
-                    Some((prev, prev_space)) if prev > t => (prev, prev_space),
-                    _ => (t, *space_id),
-                });
+            let ps = &self.per_space[i];
+            if !ps.sent_packets.values().any(|p| p.ack_eliciting) {
+                continue;
             }
+            let Some(anchor) = ps.time_of_last_ack_eliciting_packet else {
+                continue;
+            };
+            let pto_base = match space_id {
+                PnSpaceId::Initial | PnSpaceId::Handshake => self.pto_period_handshake(),
+                PnSpaceId::Application => self.pto_period(),
+            };
+            let pto = match pto_base.checked_mul(u32::try_from(mult).unwrap_or(u32::MAX)) {
+                Some(d) => d,
+                None => Duration::from_secs(60),
+            };
+            let t = anchor.saturating_add(pto);
+            earliest = Some(match earliest {
+                Some(prev) if prev <= t => prev,
+                _ => t,
+            });
         }
-        let (anchor, space) = match latest_ack_eliciting {
-            Some(v) => v,
-            None => {
-                self.loss_detection_timer = None;
-                return;
-            }
-        };
-        // PTO duration with backoff.
-        let backoff = self.pto_count.min(PTO_BACKOFF_CAP);
-        let pto_base = match space {
-            PnSpaceId::Initial | PnSpaceId::Handshake => self.pto_period_handshake(),
-            PnSpaceId::Application => self.pto_period(),
-        };
-        let mult = 1u64.checked_shl(backoff).unwrap_or(u64::MAX);
-        let pto = match pto_base.checked_mul(u32::try_from(mult).unwrap_or(u32::MAX)) {
-            Some(d) => d,
-            None => Duration::from_secs(60),
-        };
-        self.loss_detection_timer = Some(anchor.saturating_add(pto));
+        self.loss_detection_timer = earliest;
     }
 
     /// The earliest pending time-threshold loss deadline across all spaces,
@@ -1061,6 +1062,40 @@ mod tests {
         assert_eq!(s.pto_count, 0);
         assert!(s.loss_detection_timer.is_none());
         assert!(s.first_rtt_sample.is_none());
+    }
+
+    /// RFC 9002 §A.8 `GetPtoTimeAndSpace` — the PTO timer is the earliest
+    /// per-space deadline among spaces with ack-eliciting packets in flight,
+    /// each anchored on its own last ack-eliciting send.
+    #[test]
+    fn pto_timer_is_the_earliest_space_deadline() {
+        let mut s = LossState::new();
+        // Handshake in flight since t=0; Application sent later at t=500ms.
+        s.on_packet_sent(
+            PnSpaceId::Handshake,
+            mk_packet(0, true, true, Duration::ZERO),
+        );
+        s.on_packet_sent(
+            PnSpaceId::Application,
+            mk_packet(0, true, true, Duration::from_millis(500)),
+        );
+        assert_eq!(
+            s.loss_detection_timer,
+            Some(s.pto_period_handshake()),
+            "the older Handshake deadline fires first"
+        );
+        // Once the Handshake packet is acked, only the Application space
+        // counts — anchored on ITS last send, with max_ack_delay included.
+        let _ = s.on_ack_received(
+            PnSpaceId::Handshake,
+            &[0u64..=0u64],
+            Duration::ZERO,
+            Duration::from_millis(600),
+        );
+        assert_eq!(
+            s.loss_detection_timer,
+            Some(Duration::from_millis(500) + s.pto_period())
+        );
     }
 
     #[test]
