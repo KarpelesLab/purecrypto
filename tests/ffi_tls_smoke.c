@@ -200,6 +200,9 @@ int main(void) {
   if (pc_tls_received_close_notify(client) != 0)
     return fail("close_notify reported before any close");
   if (pc_tls_close(server) != PC_OK) return fail("pc_tls_close server");
+  /* The closing side's own sends are refused by name from now on. */
+  if (pc_tls_send(server, hi, sizeof(hi) - 1) != PC_CLOSED)
+    return fail("pc_tls_send after a local close should report PC_CLOSED");
   n = sizeof(buf);
   if (pc_tls_pop(server, buf, &n) != PC_OK) return fail("pop close_notify");
   if (n == 0) return fail("server emitted no close_notify");

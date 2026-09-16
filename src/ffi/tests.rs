@@ -1941,3 +1941,256 @@ fn ec_self_signed_pem_rejects_unencodable_days() {
     assert!(pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
     unsafe { ec::pc_ec_free(key) };
 }
+
+// ---- Closed connections report `Closed` on the send paths -----------------
+
+/// A local `pc_tls_close` must make every later `pc_tls_send` on that handle
+/// come back as `Closed` by name — not `Ok` for a record the peer is bound
+/// to ignore, and not an unexplained `Internal`. The peer's view of the
+/// close is unchanged: its `pc_tls_recv` reports the TLS-level EOF.
+#[test]
+fn tls_send_after_local_close_reports_closed() {
+    let (client, server) = tls13_loopback_pair();
+    let msg = b"after close";
+
+    assert_eq!(unsafe { tls::pc_tls_close(server) }, PcStatus::Ok);
+    for _ in 0..2 {
+        assert_eq!(
+            unsafe { tls::pc_tls_send(server, msg.as_ptr(), msg.len()) },
+            PcStatus::Closed
+        );
+    }
+    // Idempotent, and still `Closed` afterwards.
+    assert_eq!(unsafe { tls::pc_tls_close(server) }, PcStatus::Ok);
+    assert_eq!(
+        unsafe { tls::pc_tls_send(server, msg.as_ptr(), msg.len()) },
+        PcStatus::Closed
+    );
+    // The close_notify itself is still delivered to the peer.
+    unsafe { pump_wire(server, client) };
+    assert_eq!(unsafe { tls::pc_tls_received_close_notify(client) }, 1);
+    let mut len = 0usize;
+    assert_eq!(
+        unsafe { tls::pc_tls_recv(client, core::ptr::null_mut(), &mut len) },
+        PcStatus::Closed
+    );
+    assert_eq!(len, 0);
+    unsafe {
+        tls::pc_tls_free(client);
+        tls::pc_tls_free(server);
+    }
+}
+
+/// Moves every pending datagram from `from` to `to`, returning how many
+/// bytes moved (0 when nothing was pending).
+unsafe fn pump_quic(from: *mut quic::PcQuic, to: *mut quic::PcQuic) -> usize {
+    let mut total = 0usize;
+    for _ in 0..64 {
+        let dg = read_out(|p, l| unsafe { quic::pc_quic_pop_datagram(from, p, l) });
+        if dg.is_empty() {
+            break;
+        }
+        total += dg.len();
+        assert_eq!(
+            unsafe { quic::pc_quic_feed_datagram(to, dg.as_ptr(), dg.len()) },
+            PcStatus::Ok
+        );
+    }
+    total
+}
+
+/// Builds a handshaken QUIC loopback pair `(client, server)` from the given
+/// server identity, driven exactly as `tests/ffi_quic_smoke.c` drives it:
+/// the client trusts the leaf as a root, both sides pump datagrams until
+/// `pc_quic_is_handshake_complete` reports 1 on each, ticking the PTO timer
+/// whenever nothing moves. Caller frees both.
+fn quic_loopback_pair_with(
+    chain_pem: &str,
+    key_pem: &str,
+) -> (*mut quic::PcQuic, *mut quic::PcQuic) {
+    let scfg = quic::pc_quic_cfg_new(1 /* server */);
+    assert!(!scfg.is_null());
+    unsafe {
+        assert_eq!(
+            quic::pc_quic_cfg_set_certificate(
+                scfg,
+                chain_pem.as_ptr(),
+                chain_pem.len(),
+                key_pem.as_ptr(),
+                key_pem.len()
+            ),
+            PcStatus::Ok
+        );
+    }
+    set_test_alpn(scfg);
+    let server = unsafe { quic::pc_quic_new(scfg) };
+    unsafe { quic::pc_quic_cfg_free(scfg) };
+    assert!(!server.is_null());
+
+    let ccfg = quic::pc_quic_cfg_new(0 /* client */);
+    assert!(!ccfg.is_null());
+    unsafe {
+        assert_eq!(
+            quic::pc_quic_cfg_add_root_pem(ccfg, chain_pem.as_ptr(), chain_pem.len()),
+            PcStatus::Ok
+        );
+        let sni = b"loopback.example\0";
+        assert_eq!(
+            quic::pc_quic_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char),
+            PcStatus::Ok
+        );
+    }
+    set_test_alpn(ccfg);
+    let client = unsafe { quic::pc_quic_new(ccfg) };
+    unsafe { quic::pc_quic_cfg_free(ccfg) };
+    assert!(!client.is_null());
+
+    // ::ffff:127.0.0.1
+    let v4mapped = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1];
+    for q in [client, server] {
+        assert_eq!(
+            unsafe { quic::pc_quic_set_peer_addr(q, v4mapped.as_ptr(), 16, 4433) },
+            PcStatus::Ok
+        );
+    }
+
+    let done = |q: *const quic::PcQuic| {
+        let mut v = 0i32;
+        assert_eq!(
+            unsafe { quic::pc_quic_is_handshake_complete(q, &mut v) },
+            PcStatus::Ok
+        );
+        v == 1
+    };
+    for _ in 0..32 {
+        if done(client) && done(server) {
+            break;
+        }
+        let c_to_s = unsafe { pump_quic(client, server) };
+        let s_to_c = unsafe { pump_quic(server, client) };
+        if c_to_s == 0 && s_to_c == 0 {
+            for q in [client, server] {
+                let (mut s, mut ns, mut has) = (0u64, 0u32, 0i32);
+                assert_eq!(
+                    unsafe { quic::pc_quic_next_timeout(q, &mut s, &mut ns, &mut has) },
+                    PcStatus::Ok
+                );
+                assert_eq!(
+                    unsafe { quic::pc_quic_on_timeout(q, s + 1, ns) },
+                    PcStatus::Ok
+                );
+            }
+        }
+    }
+    assert!(done(client), "client handshake did not complete");
+    assert!(done(server), "server handshake did not complete");
+    // Drain the post-handshake control flights (NEW_CID / HANDSHAKE_DONE).
+    for _ in 0..8 {
+        let a = unsafe { pump_quic(client, server) };
+        let b = unsafe { pump_quic(server, client) };
+        if a == 0 && b == 0 {
+            break;
+        }
+    }
+    (client, server)
+}
+
+/// [`quic_loopback_pair_with`] under the P-256 [`loopback_identity`].
+fn quic_loopback_pair() -> (*mut quic::PcQuic, *mut quic::PcQuic) {
+    let (chain_pem, key_pem) = loopback_identity();
+    quic_loopback_pair_with(&chain_pem, &key_pem)
+}
+
+/// After a local `pc_quic_close` every send-side entry point reports
+/// `Closed` by name (with its out-parameter zeroed) rather than `Internal`
+/// or a silently discarded write, and the peer — once it has drained the
+/// CONNECTION_CLOSE — reports the same for its own send paths.
+#[test]
+fn quic_send_paths_after_local_close_report_closed() {
+    let (client, server) = quic_loopback_pair();
+    let payload = b"ping";
+
+    // Live: a stream opens and takes data.
+    let mut sid = u64::MAX;
+    assert_eq!(
+        unsafe { quic::pc_quic_open_bidi(client, &mut sid) },
+        PcStatus::Ok
+    );
+    let mut written = 0usize;
+    assert_eq!(
+        unsafe {
+            quic::pc_quic_stream_write(client, sid, payload.as_ptr(), payload.len(), &mut written)
+        },
+        PcStatus::Ok
+    );
+    assert_eq!(written, payload.len());
+
+    assert_eq!(
+        unsafe { quic::pc_quic_close(client, 0x42, core::ptr::null(), 0) },
+        PcStatus::Ok
+    );
+
+    let mut id = u64::MAX;
+    assert_eq!(
+        unsafe { quic::pc_quic_open_bidi(client, &mut id) },
+        PcStatus::Closed
+    );
+    assert_eq!(id, 0, "id_out is zeroed on error");
+    id = u64::MAX;
+    assert_eq!(
+        unsafe { quic::pc_quic_open_uni(client, &mut id) },
+        PcStatus::Closed
+    );
+    assert_eq!(id, 0);
+    written = usize::MAX;
+    assert_eq!(
+        unsafe {
+            quic::pc_quic_stream_write(client, sid, payload.as_ptr(), payload.len(), &mut written)
+        },
+        PcStatus::Closed
+    );
+    assert_eq!(written, 0, "written_out is zeroed on error");
+    let mut cap = usize::MAX;
+    assert_eq!(
+        unsafe { quic::pc_quic_stream_send_capacity(client, sid, &mut cap) },
+        PcStatus::Closed
+    );
+    assert_eq!(cap, 0);
+    assert_eq!(
+        unsafe { quic::pc_quic_stream_finish(client, sid) },
+        PcStatus::Closed
+    );
+    assert_eq!(
+        unsafe { quic::pc_quic_stream_reset(client, sid, 1) },
+        PcStatus::Closed
+    );
+    assert_eq!(
+        unsafe { quic::pc_quic_stream_stop_sending(client, sid, 1) },
+        PcStatus::Closed
+    );
+    assert_eq!(
+        unsafe { quic::pc_quic_send_datagram(client, payload.as_ptr(), payload.len()) },
+        PcStatus::Closed
+    );
+    assert_eq!(
+        unsafe { quic::pc_quic_initiate_key_update(client) },
+        PcStatus::Closed
+    );
+
+    // The peer drains the CONNECTION_CLOSE and is now draining: same answer.
+    assert!(unsafe { pump_quic(client, server) } > 0);
+    let mut sid2 = 0u64;
+    assert_eq!(
+        unsafe { quic::pc_quic_open_bidi(server, &mut sid2) },
+        PcStatus::Closed
+    );
+    assert_eq!(
+        unsafe { quic::pc_quic_send_datagram(server, payload.as_ptr(), payload.len()) },
+        PcStatus::Closed
+    );
+
+    unsafe {
+        quic::pc_quic_free(client);
+        quic::pc_quic_free(server);
+    }
+}

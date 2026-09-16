@@ -279,6 +279,15 @@ int main(void) {
   const uint8_t reason[] = "done";
   if (pc_quic_close(client, 0x42, reason, sizeof(reason) - 1) != PC_OK)
     return fail("pc_quic_close");
+  /* A closing endpoint's send paths report PC_CLOSED by name, with the
+   * out-parameter zeroed. */
+  uint64_t dead_id = 1;
+  if (pc_quic_open_bidi(client, &dead_id) != PC_CLOSED || dead_id != 0)
+    return fail("pc_quic_open_bidi after close should report PC_CLOSED");
+  size_t dead_written = 1;
+  if (pc_quic_stream_write(client, cid, ping, sizeof(ping) - 1, &dead_written) != PC_CLOSED
+      || dead_written != 0)
+    return fail("pc_quic_stream_write after close should report PC_CLOSED");
   if (pump_all(client, server) == (size_t)-1) return fail("pump close c->s");
 
   uint64_t code = 0;

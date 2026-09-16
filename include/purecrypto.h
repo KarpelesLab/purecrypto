@@ -79,7 +79,10 @@ typedef enum {
   PC_WANT_READ = -7,       /* engine has nothing to emit; feed more bytes */
   PC_WANT_WRITE = -8,      /* engine has bytes to send; drain via pc_tls_pop */
   PC_WANT_HANDSHAKE = -9,  /* application I/O attempted before handshake done */
-  PC_CLOSED = -10,         /* peer's close_notify processed: TLS-level EOF */
+  PC_CLOSED = -10,         /* connection closed: the peer's close_notify was
+                              processed (TLS-level EOF), pc_tls_close /
+                              pc_quic_close was called on this handle, or a
+                              QUIC connection is closing / draining / closed */
   PC_TLS_ALERT = -11,      /* a fatal TLS alert was received */
   PC_BAD_CONFIG = -12,     /* cfg incomplete for its role (pc_tls_cfg_validate) */
   PC_KEY_MISMATCH = -13    /* private key is not the leaf certificate's key
@@ -783,7 +786,9 @@ pc_status pc_tls_feed(PcTls *tls, const uint8_t *wire_in, size_t in_len, size_t 
  * the required length. */
 pc_status pc_tls_pop(PcTls *tls, uint8_t *wire_out, size_t *out_len);
 /* PC_WANT_HANDSHAKE before the handshake completes; PC_CLOSED once the
- * peer's close_notify has been received. */
+ * peer's close_notify has been received or pc_tls_close was called on this
+ * handle (TLS and DTLS alike) — nothing is queued in either case, and
+ * PC_INTERNAL is reserved for genuine engine faults. */
 pc_status pc_tls_send(PcTls *tls, const uint8_t *app_in, size_t in_len);
 /* PC_CLOSED (with *out_len == 0) once no plaintext is pending AND the
  * peer's close_notify has been processed — the TLS-level EOF. Plaintext
@@ -793,6 +798,10 @@ pc_status pc_tls_recv(PcTls *tls, uint8_t *app_out, size_t *out_len);
 /* PC_OK complete, PC_WANT_WRITE / PC_WANT_READ to keep pumping, PC_TLS_ALERT
  * / PC_CLOSED / PC_INTERNAL on engine failure (see pc_tls_feed). */
 pc_status pc_tls_handshake(PcTls *tls);
+/* Queues a close_notify (TLS; DTLS exchanges none) and marks the handle
+ * closed: every later pc_tls_send returns PC_CLOSED. Drain the alert with
+ * pc_tls_pop; plaintext the peer sent before its own close_notify stays
+ * readable through pc_tls_recv. Idempotent. */
 pc_status pc_tls_close(PcTls *tls);
 /* 1 once the peer's close_notify has been processed, 0 otherwise, -1 on a
  * NULL handle. A transport EOF with 0 here is a truncated stream. Always 0
@@ -879,6 +888,13 @@ pc_status pc_quic_next_timeout(const PcQuic *q,
 pc_status pc_quic_on_timeout(PcQuic *q,
                              uint64_t since_start_secs, uint32_t since_start_nanos);
 
+/* Every send-side call below — open_bidi / open_uni, stream_write,
+ * stream_finish, stream_send_capacity, stream_reset, stream_stop_sending,
+ * send_datagram, initiate_key_update — returns PC_CLOSED once the
+ * connection is closing (pc_quic_close was called), draining (the peer
+ * closed) or closed (idle timeout / stateless reset / lingering period
+ * over). Nothing is queued then; PC_INTERNAL is reserved for genuine
+ * engine faults (unknown stream id, finished/reset send side, ...). */
 pc_status pc_quic_open_bidi(PcQuic *q, uint64_t *id_out);
 pc_status pc_quic_open_uni(PcQuic *q, uint64_t *id_out);
 pc_status pc_quic_stream_write(PcQuic *q, uint64_t id,

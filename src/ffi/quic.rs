@@ -12,7 +12,9 @@
 //!  - `WantRead`     — engine has no datagram to emit yet
 //!  - `WantWrite`    — engine has a datagram to send; drain via `pc_quic_pop_datagram`
 //!  - `WantHandshake`— application I/O attempted before the handshake completed
-//!  - `Closed`       — connection closed (stateless reset or local close)
+//!  - `Closed`       — the connection is closing or closed (a local
+//!    `pc_quic_close`, the peer's CONNECTION_CLOSE, an idle timeout or a
+//!    stateless reset); every send-side entry point reports it by name
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -641,6 +643,17 @@ pub unsafe extern "C" fn pc_quic_pop_datagram(
     })
 }
 
+/// `Some(Closed)` once the connection can no longer carry application data
+/// in the send direction: it is closing (a local [`pc_quic_close`] queued
+/// the CONNECTION_CLOSE), draining (the peer closed), or fully closed (idle
+/// timeout, stateless reset, or the closing/draining period expired). The
+/// send-side entry points check this first so the caller gets `Closed` by
+/// name instead of an unexplained `Internal` (or a silently discarded
+/// write) from an engine that will never transmit again.
+fn closed_status(conn: &QuicConnection) -> Option<PcStatus> {
+    (conn.is_closed() || conn.is_draining() || conn.is_closing()).then_some(PcStatus::Closed)
+}
+
 // ---- Handshake state ------------------------------------------------------
 
 /// Returns `Ok` if the handshake is complete, `WantRead` otherwise. The
@@ -749,7 +762,8 @@ pub unsafe extern "C" fn pc_quic_on_timeout(
 // ---- Streams --------------------------------------------------------------
 
 /// Opens a new client-initiated bidirectional stream. The 62-bit stream
-/// id is written to `*id_out`.
+/// id is written to `*id_out` (`0` on any error). Returns
+/// [`PcStatus::Closed`] once the connection is closing or closed.
 ///
 /// # Safety
 /// `q`, `id_out` valid.
@@ -759,7 +773,11 @@ pub unsafe extern "C" fn pc_quic_open_bidi(q: *mut PcQuic, id_out: *mut u64) -> 
         if q.is_null() || id_out.is_null() {
             return PcStatus::NullPointer;
         }
+        unsafe { *id_out = 0 };
         let conn = &mut unsafe { &mut *q }.inner;
+        if let Some(st) = closed_status(conn) {
+            return st;
+        }
         match conn.open_bidi() {
             Ok(id) => {
                 unsafe { *id_out = id.value() };
@@ -770,7 +788,9 @@ pub unsafe extern "C" fn pc_quic_open_bidi(q: *mut PcQuic, id_out: *mut u64) -> 
     })
 }
 
-/// Opens a new client-initiated unidirectional (send-only) stream.
+/// Opens a new client-initiated unidirectional (send-only) stream. As
+/// [`pc_quic_open_bidi`]: `*id_out = 0` on error, [`PcStatus::Closed`] once
+/// the connection is closing or closed.
 ///
 /// # Safety
 /// `q`, `id_out` valid.
@@ -780,7 +800,11 @@ pub unsafe extern "C" fn pc_quic_open_uni(q: *mut PcQuic, id_out: *mut u64) -> P
         if q.is_null() || id_out.is_null() {
             return PcStatus::NullPointer;
         }
+        unsafe { *id_out = 0 };
         let conn = &mut unsafe { &mut *q }.inner;
+        if let Some(st) = closed_status(conn) {
+            return st;
+        }
         match conn.open_uni() {
             Ok(id) => {
                 unsafe { *id_out = id.value() };
@@ -792,7 +816,9 @@ pub unsafe extern "C" fn pc_quic_open_uni(q: *mut PcQuic, id_out: *mut u64) -> P
 }
 
 /// Queues `data` for transmission on `id`. `*written_out` receives the
-/// number of bytes accepted (0 when the credit is exhausted).
+/// number of bytes accepted (0 when the credit is exhausted, and 0 on every
+/// error). Returns [`PcStatus::Closed`] once the connection is closing or
+/// closed; nothing is queued then.
 ///
 /// # Safety
 /// All pointers valid for their declared lengths.
@@ -808,10 +834,14 @@ pub unsafe extern "C" fn pc_quic_stream_write(
         if q.is_null() || written_out.is_null() {
             return PcStatus::NullPointer;
         }
+        unsafe { *written_out = 0 };
         let Some(b) = (unsafe { slice(data, len) }) else {
             return PcStatus::NullPointer;
         };
         let conn = &mut unsafe { &mut *q }.inner;
+        if let Some(st) = closed_status(conn) {
+            return st;
+        }
         match conn.write(StreamId(id), b) {
             Ok(n) => {
                 unsafe { *written_out = n };
@@ -829,7 +859,8 @@ pub unsafe extern "C" fn pc_quic_stream_write(
 /// credit from the peer.
 ///
 /// Returns [`PcStatus::Internal`] if `id` is unknown, has no send side, or is
-/// already finished or reset.
+/// already finished or reset, and [`PcStatus::Closed`] once the connection
+/// is closing or closed. `*out = 0` on every error.
 ///
 /// # Safety
 /// `q`, `out` valid.
@@ -843,7 +874,11 @@ pub unsafe extern "C" fn pc_quic_stream_send_capacity(
         if q.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
+        unsafe { *out = 0 };
         let conn = &unsafe { &*q }.inner;
+        if let Some(st) = closed_status(conn) {
+            return st;
+        }
         match conn.send_capacity(StreamId(id)) {
             Ok(n) => {
                 unsafe { *out = n };
@@ -854,7 +889,8 @@ pub unsafe extern "C" fn pc_quic_stream_send_capacity(
     })
 }
 
-/// Signals FIN on `id`'s send side.
+/// Signals FIN on `id`'s send side. Returns [`PcStatus::Closed`] once the
+/// connection is closing or closed.
 ///
 /// # Safety
 /// `q` valid.
@@ -865,6 +901,9 @@ pub unsafe extern "C" fn pc_quic_stream_finish(q: *mut PcQuic, id: u64) -> PcSta
             return PcStatus::NullPointer;
         }
         let conn = &mut unsafe { &mut *q }.inner;
+        if let Some(st) = closed_status(conn) {
+            return st;
+        }
         match conn.finish(StreamId(id)) {
             Ok(()) => PcStatus::Ok,
             Err(_) => PcStatus::Internal,
@@ -936,6 +975,7 @@ pub unsafe extern "C" fn pc_quic_stream_read(
 }
 
 /// Aborts the send side of `id` with the given application error code.
+/// Returns [`PcStatus::Closed`] once the connection is closing or closed.
 ///
 /// # Safety
 /// `q` valid.
@@ -946,6 +986,9 @@ pub unsafe extern "C" fn pc_quic_stream_reset(q: *mut PcQuic, id: u64, app_error
             return PcStatus::NullPointer;
         }
         let conn = &mut unsafe { &mut *q }.inner;
+        if let Some(st) = closed_status(conn) {
+            return st;
+        }
         match conn.reset(StreamId(id), app_error) {
             Ok(()) => PcStatus::Ok,
             Err(_) => PcStatus::Internal,
@@ -954,7 +997,8 @@ pub unsafe extern "C" fn pc_quic_stream_reset(q: *mut PcQuic, id: u64, app_error
 }
 
 /// Asks the peer to abort sending on `id` with the given application
-/// error code.
+/// error code. Returns [`PcStatus::Closed`] once the connection is closing
+/// or closed.
 ///
 /// # Safety
 /// `q` valid.
@@ -969,6 +1013,9 @@ pub unsafe extern "C" fn pc_quic_stream_stop_sending(
             return PcStatus::NullPointer;
         }
         let conn = &mut unsafe { &mut *q }.inner;
+        if let Some(st) = closed_status(conn) {
+            return st;
+        }
         match conn.stop_sending(StreamId(id), app_error) {
             Ok(()) => PcStatus::Ok,
             Err(_) => PcStatus::Internal,
@@ -978,10 +1025,10 @@ pub unsafe extern "C" fn pc_quic_stream_stop_sending(
 
 // ---- Unreliable datagrams (RFC 9221) --------------------------------------
 
-/// Queues `data` for transmission as a DATAGRAM frame. Returns
-/// `WantHandshake` before the handshake completes; `BadEncoding` if the
-/// peer didn't advertise `max_datagram_frame_size` or the payload would
-/// exceed the limit.
+/// Queues `data` for transmission as a DATAGRAM frame. Returns `Closed`
+/// once the connection is closing or closed, `WantHandshake` before the
+/// handshake completes, and `BadEncoding` if the peer didn't advertise
+/// `max_datagram_frame_size` or the payload would exceed the limit.
 ///
 /// # Safety
 /// All pointers valid for their declared lengths.
@@ -999,6 +1046,9 @@ pub unsafe extern "C" fn pc_quic_send_datagram(
             return PcStatus::NullPointer;
         };
         let conn = &mut unsafe { &mut *q }.inner;
+        if let Some(st) = closed_status(conn) {
+            return st;
+        }
         if !conn.is_handshake_complete() {
             return PcStatus::WantHandshake;
         }
@@ -1160,7 +1210,8 @@ pub unsafe extern "C" fn pc_quic_close_info(
 
 // ---- Key update (RFC 9001 §6) --------------------------------------------
 
-/// Initiates a 1-RTT key update. Returns [`PcStatus::Internal`] when the
+/// Initiates a 1-RTT key update. Returns [`PcStatus::Closed`] once the
+/// connection is closing or closed, and [`PcStatus::Internal`] when the
 /// handshake isn't yet *confirmed* (RFC 9001 §4.1.2: on a client that means
 /// HANDSHAKE_DONE has been received, so it can lag `pc_quic_is_handshake_complete`
 /// by one round trip) or a previous update is still unconfirmed (RFC 9001
@@ -1175,6 +1226,9 @@ pub unsafe extern "C" fn pc_quic_initiate_key_update(q: *mut PcQuic) -> PcStatus
             return PcStatus::NullPointer;
         }
         let conn = &mut unsafe { &mut *q }.inner;
+        if let Some(st) = closed_status(conn) {
+            return st;
+        }
         match conn.initiate_key_update() {
             Ok(()) => PcStatus::Ok,
             Err(_) => PcStatus::Internal,

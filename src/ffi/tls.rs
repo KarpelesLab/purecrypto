@@ -708,6 +708,13 @@ pub struct PcTls {
     /// Decrypted application bytes already drained from the engine but not yet
     /// delivered. Re-served by the next [`pc_tls_recv`] (same rationale).
     pending_recv: Option<Vec<u8>>,
+    /// Set by [`pc_tls_close`]. The engines keep accepting application data
+    /// after their own close_notify (RFC 8446 §6.1 only forbids *reading*
+    /// after one), so without this flag a `pc_tls_send` on a handle the
+    /// caller had already closed would either succeed (TLS: a record the
+    /// peer must ignore) or come back as an unexplained `Internal`. Tracking
+    /// the local close here lets it be reported by name, as `Closed`.
+    closed_locally: bool,
 }
 
 impl Drop for PcTls {
@@ -752,6 +759,7 @@ pub unsafe extern "C" fn pc_tls_new(cfg: *const PcTlsCfg) -> *mut PcTls {
             inner,
             pending_pop: None,
             pending_recv: None,
+            closed_locally: false,
         }))
     })
 }
@@ -893,7 +901,10 @@ pub unsafe extern "C" fn pc_tls_pop(
 
 /// Encrypts `len` application bytes for transmission. Returns
 /// [`PcStatus::WantHandshake`] when called before the handshake completes
-/// and [`PcStatus::Closed`] once the peer's close_notify has been received.
+/// and [`PcStatus::Closed`] once the connection has been closed from either
+/// side — the peer's close_notify has been received, or [`pc_tls_close`] was
+/// called on this handle (TLS and DTLS alike). Nothing is queued in either
+/// case.
 ///
 /// # Safety
 /// All pointers valid for their declared lengths.
@@ -910,7 +921,14 @@ pub unsafe extern "C" fn pc_tls_send(
         let Some(b) = (unsafe { slice(app_in, in_len) }) else {
             return PcStatus::NullPointer;
         };
-        let conn = &mut unsafe { &mut *tls }.inner;
+        let handle = unsafe { &mut *tls };
+        // A locally closed handle is reported before the handshake check:
+        // `Closed` is the more specific answer, and a caller that closed
+        // mid-handshake must not be told to keep handshaking.
+        if handle.closed_locally {
+            return PcStatus::Closed;
+        }
+        let conn = &mut handle.inner;
         if !conn.is_handshake_complete() {
             return PcStatus::WantHandshake;
         }
@@ -1183,7 +1201,10 @@ pub unsafe extern "C" fn pc_tls_peer_certificate(
     })
 }
 
-/// Sends a close_notify and transitions the connection to Closed.
+/// Queues a close_notify (TLS; DTLS engines exchange none) and marks the
+/// handle closed: every later [`pc_tls_send`] returns [`PcStatus::Closed`].
+/// Drain the alert with [`pc_tls_pop`]. Plaintext the peer sent before its
+/// own close_notify stays readable through [`pc_tls_recv`]. Idempotent.
 ///
 /// # Safety
 /// `tls` valid.
@@ -1193,8 +1214,9 @@ pub unsafe extern "C" fn pc_tls_close(tls: *mut PcTls) -> PcStatus {
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        let conn = &mut unsafe { &mut *tls }.inner;
-        let _ = conn.close();
+        let handle = unsafe { &mut *tls };
+        let _ = handle.inner.close();
+        handle.closed_locally = true;
         PcStatus::Ok
     })
 }
