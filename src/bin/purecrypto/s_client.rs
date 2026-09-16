@@ -468,9 +468,18 @@ fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, mtu: usize, de
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                // Fire any pending timer.
-                if let Some(t) = conn.next_timeout() {
-                    conn.on_timeout(t);
+                // Fire the retransmit timer only once its deadline has
+                // actually passed on the engine's clock (elapsed since we
+                // started driving it). Passing the deadline itself as
+                // `now` on every socket timeout made the engine believe
+                // the deadline had arrived every 500 ms, collapsing the
+                // 1 s → 60 s backoff (RFC 6347 §4.2.4.1) into a
+                // retransmit per socket timeout and a give-up after ~3 s.
+                let now = start.elapsed();
+                if let Some(t) = conn.next_timeout()
+                    && now >= t
+                {
+                    conn.on_timeout(now);
                 }
             }
             Err(e) => die(format!("UDP recv failed: {e}")),
