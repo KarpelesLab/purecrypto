@@ -1349,6 +1349,25 @@ impl ClientConnection {
             }
         }
 
+        // Real ECH and PSK resumption are not wired together yet
+        // (`seal_real_ech_on_ch1` declines to seal when a PSK is offered).
+        // ECH must win that conflict: it exists to keep `server_name` off the
+        // wire, whereas the ticket only saves a certificate round trip.
+        // Falling back to the plain (GREASE-shaped) hello would put the real
+        // SNI in cleartext on every resumed connection — so drop the session
+        // and run a full, sealed handshake instead.
+        #[cfg(feature = "ech")]
+        if config.session.is_some()
+            && matches!(
+                config.ech,
+                Some(crate::tls::ech::EchClient {
+                    mode: crate::tls::ech::EchClientMode::Real(_)
+                })
+            )
+        {
+            config.session = None;
+        }
+
         // If resuming, restrict the cipher-suite offer to suites whose hash
         // matches the session's. The PSK binder and handshake key schedule
         // are tied to that hash.
@@ -4740,6 +4759,71 @@ mod tests {
             alloc::vec![0x04, 0x03, 0x04, 0x03, 0x03]
         );
         assert_eq!(versions(&inner_ch), alloc::vec![0x02, 0x03, 0x04]);
+    }
+
+    /// Real ECH and PSK resumption are not combined yet; when both are
+    /// configured the client used to give up on sealing and send a plain
+    /// hello with the real `server_name` in cleartext — exactly what ECH
+    /// exists to prevent. The session must yield to ECH instead.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_real_config_wins_over_a_stored_session() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::EchKeyPair;
+
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-psk-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x77,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let list = crate::tls::ech::EchConfigList::new(alloc::vec![pair.config().clone()]);
+
+        let inner_sni = "secret.example";
+        let session = StoredSession {
+            server_name: inner_sni.into(),
+            ticket: alloc::vec![0x41; 16],
+            psk: crate::zeroize::Zeroizing::new(alloc::vec![0x5a; 32]),
+            age_add: 0,
+            lifetime_seconds: 7200,
+            received_at: system_now().unwrap_or_else(|| Time::from_unix(0)),
+            max_early_data_size: None,
+            negotiated_alpn: None,
+            verify_certificates: true,
+            cipher_suite_hash: HashAlg::Sha256,
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256.0,
+        };
+        let mut cfg = ClientConfig::new(RootCertStore::new()).with_session(session);
+        cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
+        let mut rng = HmacDrbg::<Sha256>::new(b"ech-psk-client", b"nonce", &[]);
+        let mut client = ClientConnection::new(cfg, inner_sni, &mut rng).unwrap();
+
+        assert!(client.psk_offered.is_none(), "the session must be dropped");
+        assert!(client.ech_state.is_some(), "the hello must be sealed");
+        let out = client.write_tls();
+        assert!(
+            !out.windows(inner_sni.len())
+                .any(|w| w == inner_sni.as_bytes()),
+            "the real server_name must not appear in cleartext"
+        );
+        let outer_msg = read_record(&out).unwrap().unwrap().fragment.to_vec();
+        let outer_ch = ClientHello::decode(&outer_msg[4..]).unwrap();
+        assert!(ext::find(&outer_ch.extensions, ExtensionType::PRE_SHARED_KEY).is_none());
+        let sni = crate::tls::codec::extension::parse_server_name(
+            ext::find(&outer_ch.extensions, ExtensionType::SERVER_NAME).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sni, "public.example");
     }
 
     /// draft-ietf-tls-esni-22 §6.1.4/§6.1.6: when the client attempted
