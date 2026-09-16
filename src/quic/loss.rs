@@ -11,12 +11,14 @@
 //! pseudocode references `loss_detection_timer`, we materialize that as
 //! [`LossState::loss_detection_timer`].
 //!
-//! In addition to the RFC 9002 state machine, this module preserves the
-//! Phase-4 driver-facing shim API ([`LossState::arm`],
-//! [`LossState::disarm`], [`LossState::has_fired`],
-//! [`LossState::next_deadline`], [`LossState::on_fire`],
-//! [`LossState::on_handshake_progress`], [`LossState::is_armed`]) so the
-//! connection-level call sites stay surgical.
+//! The connection drives this state machine through exactly the Appendix A
+//! entry points: [`LossState::on_packet_sent`], [`LossState::on_ack_received`],
+//! [`LossState::detect_lost`], [`LossState::on_loss_detection_timeout`] and
+//! [`LossState::discard_keys`], each of which re-arms the timer with
+//! [`LossState::set_loss_detection_timer`]. The handful of connection facts
+//! §A.8 consults (role, handshake confirmation, key availability, the
+//! server's anti-amplification state) live in [`LossContext`], which the
+//! connection refreshes before the timer is recomputed.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -138,22 +140,22 @@ pub(crate) struct LossState {
     /// Per-PN-space state, indexed by `PnSpaceId as usize`.
     pub(crate) per_space: [PerSpace; 3],
 
-    // ---- Persistent-congestion bookkeeping (RFC 9002 §7.6) ----------------
-    /// Time of the most recent ack-eliciting packet whose ack would
-    /// reset PTO progress. Used by the persistent-congestion
-    /// approximation described in [`Self::on_timeout`].
-    pub(crate) last_progress_time: Option<Duration>,
+    // ---- PTO probe bookkeeping (RFC 9002 §6.2.4 / §7.5) --------------------
     /// True once a PTO has fired without subsequent ack progress. Cleared
     /// by [`Self::on_ack_received`] when any newly-acked packet shows up.
     pub(crate) pto_outstanding: bool,
-    /// RFC 9002 §7.5 — ack-eliciting 1-RTT packets the sender may still
-    /// emit *past* the congestion window as PTO probes. Armed to
-    /// [`K_PTO_PROBES`] when a PTO fires with ack-eliciting application
-    /// data in flight, consumed one per probe packet actually emitted, and
-    /// cleared by ack progress. Probes still count toward `bytes_in_flight`
-    /// and are loss-tracked like any other packet; the credit only lets
-    /// them *leave* while the window is full, so a peer that stopped
-    /// acknowledging can be provoked into revealing what was lost.
+    /// The packet-number space whose PTO expired most recently and still owes
+    /// probe packets, with [`Self::probe_credit`] counting how many. `None`
+    /// once the probes have gone out or an ACK showed progress.
+    probe_space: Option<PnSpaceId>,
+    /// RFC 9002 §6.2.4 / §7.5 — ack-eliciting packets the sender may still
+    /// emit in [`Self::probe_space`] *past* the congestion window as PTO
+    /// probes. Armed to [`K_PTO_PROBES`] when a PTO fires, consumed one per
+    /// ack-eliciting packet actually built in that space, and cleared by ack
+    /// progress. Probes still count toward `bytes_in_flight` and are
+    /// loss-tracked like any other packet; the credit only lets them *leave*
+    /// while the window is full, so a peer that stopped acknowledging can be
+    /// provoked into revealing what was lost.
     probe_credit: u8,
     /// True once we have flagged a persistent-congestion event to the
     /// caller. Cleared once the caller has consumed
@@ -161,12 +163,44 @@ pub(crate) struct LossState {
     /// reported twice.
     pub(crate) persistent_congestion_pending: bool,
 
-    // ---- Phase-4 shim state -----------------------------------------------
-    /// Phase-4-compatible "armed-at" anchor. Drives the simple
-    /// [`arm`/`has_fired`/`next_deadline`/`on_fire`] surface used by
-    /// the connection driver. Independent of `loss_detection_timer`,
-    /// which is RFC-9002-driven.
-    shim_armed_at: Option<Duration>,
+    /// Connection facts RFC 9002 §A.8 consults when arming the timer.
+    pub(crate) ctx: LossContext,
+}
+
+/// The connection-level facts RFC 9002 Appendix A reads while arming the
+/// loss-detection timer (`SetLossDetectionTimer`, `GetPtoTimeAndSpace`,
+/// `PeerCompletedAddressValidation`). The connection refreshes these before
+/// every timer recomputation it triggers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LossContext {
+    /// This endpoint is the server.
+    pub(crate) is_server: bool,
+    /// RFC 9001 §4.1.2 — the handshake is confirmed. Until then the
+    /// Application space gets no PTO timer (§6.2.1) and the client keeps
+    /// probing even with nothing in flight (§6.2.2.1).
+    pub(crate) handshake_confirmed: bool,
+    /// Handshake write keys are installed — decides whether the client's
+    /// anti-deadlock probe is a Handshake or a padded Initial packet.
+    pub(crate) has_handshake_keys: bool,
+    /// Client only: an ACK for one of our Handshake packets has arrived, so
+    /// the server has validated our address (§6.2.2.1).
+    pub(crate) peer_handshake_acked: bool,
+    /// Server only: the RFC 9000 §8.1 anti-amplification budget is
+    /// exhausted, so nothing could be sent if the timer fired (§6.2.2.1).
+    pub(crate) at_amplification_limit: bool,
+}
+
+/// What [`LossState::on_loss_detection_timeout`] decided the expired timer
+/// was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeoutAction {
+    /// RFC 9002 §6.1.2 — a time-threshold loss deadline passed in `space`:
+    /// the caller runs [`LossState::detect_lost`] there and handles the lost
+    /// packets.
+    DetectLoss(PnSpaceId),
+    /// RFC 9002 §6.2.4 — the PTO expired for `space`: the caller sends one or
+    /// two ack-eliciting probe packets there.
+    Pto(PnSpaceId),
 }
 
 impl LossState {
@@ -187,43 +221,69 @@ impl LossState {
                 PerSpace::default(),
                 PerSpace::default(),
             ],
-            last_progress_time: None,
             pto_outstanding: false,
+            probe_space: None,
             probe_credit: 0,
             persistent_congestion_pending: false,
-            shim_armed_at: None,
+            ctx: LossContext::default(),
         }
     }
 
-    /// RFC 9002 §6.2.4 — a PTO fired: allow [`K_PTO_PROBES`] probe packets
-    /// past the congestion window, provided the application space has
-    /// ack-eliciting packets in flight for the probes to elicit an ACK
-    /// about. With nothing in flight there is nothing to probe for, and
-    /// arming would turn every idle timer tick into a PING.
-    fn arm_probe_credit(&mut self) {
-        if self.has_ack_eliciting_in_flight() {
-            self.probe_credit = K_PTO_PROBES;
-        }
+    /// RFC 9002 §6.2.4 — a PTO fired for `space`: allow [`K_PTO_PROBES`]
+    /// ack-eliciting probe packets there, past the congestion window (§7.5).
+    fn arm_probe(&mut self, space: PnSpaceId) {
+        self.probe_space = Some(space);
+        self.probe_credit = K_PTO_PROBES;
     }
 
-    /// Probe packets still permitted past the congestion window (§7.5).
+    /// Forget any probes still owed.
+    fn clear_probe(&mut self) {
+        self.probe_space = None;
+        self.probe_credit = 0;
+    }
+
+    /// The space whose PTO probes are still owed, if any.
     #[inline]
-    pub(crate) fn probe_credit(&self) -> u8 {
-        self.probe_credit
+    pub(crate) fn probe_space(&self) -> Option<PnSpaceId> {
+        self.probe_space
     }
 
-    /// An ack-eliciting 1-RTT probe packet was emitted; spend one credit.
+    /// Probe packets still permitted in `space` past the congestion window
+    /// (§7.5). Zero for every space but [`Self::probe_space`].
+    #[inline]
+    pub(crate) fn probe_credit(&self, space: PnSpaceId) -> u8 {
+        if self.probe_space == Some(space) {
+            self.probe_credit
+        } else {
+            0
+        }
+    }
+
+    /// An ack-eliciting probe packet was emitted in [`Self::probe_space`];
+    /// spend one credit.
     #[inline]
     pub(crate) fn consume_probe_credit(&mut self) {
         self.probe_credit = self.probe_credit.saturating_sub(1);
+        if self.probe_credit == 0 {
+            self.probe_space = None;
+        }
     }
 
-    /// True while a PTO has fired and *no* probe has gone out since: §6.2.4
-    /// requires at least one ack-eliciting packet, so if nothing else
-    /// ack-eliciting is available the packet builder adds a PING.
+    /// True while a PTO has fired for `space` and *no* probe has gone out
+    /// since: §6.2.4 requires at least one ack-eliciting packet, so if
+    /// nothing else ack-eliciting is available the packet builder adds a
+    /// PING.
     #[inline]
-    pub(crate) fn probe_needs_ping(&self) -> bool {
-        self.probe_credit == K_PTO_PROBES
+    pub(crate) fn probe_needs_ping(&self, space: PnSpaceId) -> bool {
+        self.probe_space == Some(space) && self.probe_credit == K_PTO_PROBES
+    }
+
+    /// RFC 9002 §A.8 `PeerCompletedAddressValidation`: a server assumes its
+    /// client validated it implicitly; a client knows once one of its
+    /// Handshake packets is acknowledged or the handshake is confirmed.
+    #[inline]
+    pub(crate) fn peer_completed_address_validation(&self) -> bool {
+        self.ctx.is_server || self.ctx.peer_handshake_acked || self.ctx.handshake_confirmed
     }
 
     /// Configure the peer's transport parameters (after the handshake
@@ -336,18 +396,23 @@ impl LossState {
         // the caller (so the caller can hand the lost packets to the
         // congestion controller).
 
-        // Progress: clear pto_count and PTO-outstanding flag (§A.6 / §6.2.2).
-        // Any unspent probe credit goes too — the window is the authority
-        // again now that the peer is acknowledging.
+        // Progress (§A.7): the peer is acknowledging, so any PTO backoff and
+        // unspent probe credit are stale — the window is the authority
+        // again. `pto_count` itself is only reset once the peer is known to
+        // have validated our address (§6.2.2.1): a client whose Initial was
+        // acknowledged but whose Handshake packets were not keeps backing
+        // off, so the anti-deadlock probes do not hammer an amplification-
+        // limited server.
         if !newly_acked.is_empty() {
-            self.pto_count = 0;
+            if space == PnSpaceId::Handshake {
+                self.ctx.peer_handshake_acked = true;
+            }
+            if self.peer_completed_address_validation() {
+                self.pto_count = 0;
+            }
             self.pto_outstanding = false;
-            self.probe_credit = 0;
+            self.clear_probe();
             self.persistent_congestion_pending = false;
-            self.last_progress_time = Some(now);
-            // Phase-4 shim: any ack progress also resets the shim
-            // backoff and re-arms from `now`.
-            self.shim_armed_at = Some(now);
         }
 
         // §A.7 final step: re-arm loss-detection timer.
@@ -465,70 +530,73 @@ impl LossState {
 
     /// RFC 9002 Appendix A — `OnLossDetectionTimeout`.
     ///
-    /// Returns the `retransmit_hint`s of any packet(s) the caller should
-    /// re-queue. If the timer fired for time-threshold loss (the
-    /// `loss_time` path), this returns the hints of the lost packets;
-    /// otherwise it fired for PTO, and we return the hints of the
-    /// oldest ack-eliciting packet(s) in the appropriate space (or an
-    /// empty vector if there are none — the caller then sends a PING
-    /// per §6.2.4).
-    pub(crate) fn on_timeout(&mut self, now: Duration) -> Vec<Vec<u8>> {
-        // First check if any loss_time has fired (§A.10 step 1).
-        let (earliest_loss_time, earliest_loss_space) = self.earliest_loss_time();
-        if let (Some(t), Some(space)) = (earliest_loss_time, earliest_loss_space)
+    /// Returns `None` when the timer is not armed or has not expired at
+    /// `now`. Otherwise decides what it expired for: a pending time-threshold
+    /// loss deadline ([`TimeoutAction::DetectLoss`] — the caller runs
+    /// [`Self::detect_lost`] for that space, which re-arms the timer) or the
+    /// PTO ([`TimeoutAction::Pto`]). On PTO expiry `pto_count` is bumped, the
+    /// §6.2.4 probe credit is armed for the space the caller must probe, and
+    /// the timer is re-armed with the doubled backoff (§6.2.4).
+    ///
+    /// At most one PTO fires per call: a clock that jumped several PTO
+    /// periods ahead yields one expiry now and the next on the following
+    /// call, so a single late timer tick cannot inflate the backoff.
+    pub(crate) fn on_loss_detection_timeout(&mut self, now: Duration) -> Option<TimeoutAction> {
+        let deadline = self.loss_detection_timer?;
+        if deadline > now {
+            return None;
+        }
+        // §A.9 step 1 — time-threshold loss first.
+        if let (Some(t), Some(space)) = self.earliest_loss_time()
             && t <= now
         {
-            let lost = self.detect_lost(space, now);
-            let mut hints: Vec<Vec<u8>> = Vec::new();
-            for p in lost {
-                hints.push(p.retransmit_hint);
+            return Some(TimeoutAction::DetectLoss(space));
+        }
+        // §A.9 step 2 — PTO. With nothing in flight this is the client's
+        // anti-deadlock probe (§6.2.2.1): a Handshake packet once Handshake
+        // keys exist, otherwise a padded Initial.
+        let space = if !self.has_ack_eliciting_in_flight() {
+            if self.peer_completed_address_validation() {
+                // Nothing to probe for; the timer was stale. Re-arm (which
+                // disarms it) and report nothing.
+                self.set_loss_detection_timer(now);
+                return None;
             }
-            return hints;
-        }
-
-        // Otherwise it's a PTO. §6.2.4 — increment `pto_count` and send
-        // probe packets. We surface the retransmit hints of the OLDEST
-        // ack-eliciting packets across all spaces with outstanding
-        // ack-eliciting data (capped at 2 — §6.2.4 "send one or two
-        // probe packets").
-        self.pto_count = self.pto_count.saturating_add(1);
-        self.pto_outstanding = true;
-        self.arm_probe_credit();
-        // Phase-4 shim accounting.
-        if self.shim_armed_at.is_some() {
-            self.shim_armed_at = Some(now);
-        }
-
-        let mut hints: Vec<Vec<u8>> = Vec::new();
-        for space in [
-            PnSpaceId::Initial,
-            PnSpaceId::Handshake,
-            PnSpaceId::Application,
-        ] {
-            let ps = &self.per_space[space as usize];
-            if let Some((_pn, pkt)) = ps
-                .sent_packets
-                .iter()
-                .find(|(_, p)| p.ack_eliciting && !p.retransmit_hint.is_empty())
-            {
-                hints.push(pkt.retransmit_hint.clone());
-                if hints.len() >= 2 {
-                    break;
+            if self.ctx.has_handshake_keys {
+                PnSpaceId::Handshake
+            } else {
+                PnSpaceId::Initial
+            }
+        } else {
+            match self.pto_time_and_space(now) {
+                Some((_, space)) => space,
+                None => {
+                    self.set_loss_detection_timer(now);
+                    return None;
                 }
             }
-        }
-
-        // Re-arm with backoff.
+        };
+        self.pto_count = self.pto_count.saturating_add(1).min(PTO_BACKOFF_CAP);
+        self.pto_outstanding = true;
+        self.arm_probe(space);
         self.set_loss_detection_timer(now);
-        hints
+        Some(TimeoutAction::Pto(space))
     }
 
-    /// RFC 9002 §6.2.2 — `PTOPeriod`.
-    ///
-    /// `pto = smoothed_rtt + max(4 × rttvar, kGranularity) + max_ack_delay`.
-    /// The Initial+Handshake spaces use `max_ack_delay = 0` per §6.2.1;
-    /// the caller decides which to use. This default returns the
-    /// 1-RTT-applicable value (with `max_ack_delay`).
+    /// The `n` oldest ack-eliciting packets still outstanding in `space`, in
+    /// send order — what a PTO probe retransmits when there is no new data
+    /// to send (RFC 9002 §6.2.4). The packets stay in flight: they are
+    /// neither acknowledged nor lost yet, only re-sent.
+    pub(crate) fn oldest_ack_eliciting(&self, space: PnSpaceId, n: usize) -> Vec<SentPacket> {
+        self.per_space[space as usize]
+            .sent_packets
+            .values()
+            .filter(|p| p.ack_eliciting)
+            .take(n)
+            .cloned()
+            .collect()
+    }
+
     /// RFC 9000 §9.4 — discard the RTT estimate after confirming a peer's
     /// migration to a new path, returning the estimator to the §5.3 initial
     /// values. `min_rtt` in particular must go: it is a floor derived from a
@@ -541,93 +609,109 @@ impl LossState {
         self.first_rtt_sample = None;
     }
 
-    pub(crate) fn pto_period(&self) -> Duration {
-        let four_rttvar = self.rttvar.saturating_mul(4);
-        let g = core::cmp::max(four_rttvar, K_GRANULARITY);
-        self.smoothed_rtt
-            .saturating_add(g)
-            .saturating_add(self.max_ack_delay)
-    }
-
-    /// PTO period for the Initial / Handshake spaces, which omit
-    /// `max_ack_delay` per RFC 9002 §6.2.1.
-    pub(crate) fn pto_period_handshake(&self) -> Duration {
+    /// RFC 9002 §6.2.1 — the PTO period without `max_ack_delay`:
+    /// `smoothed_rtt + max(4 × rttvar, kGranularity)`. This is the whole
+    /// period for the Initial and Handshake spaces; the Application space
+    /// adds `max_ack_delay` (see [`Self::pto_period`]). Before the first RTT
+    /// sample the §5.3 initial values make it `333 ms + 4 × 166.5 ms`
+    /// (§6.2.2).
+    pub(crate) fn pto_base(&self) -> Duration {
         let four_rttvar = self.rttvar.saturating_mul(4);
         let g = core::cmp::max(four_rttvar, K_GRANULARITY);
         self.smoothed_rtt.saturating_add(g)
     }
 
-    /// RFC 9002 Appendix A — `SetLossDetectionTimer`.
+    /// RFC 9002 §6.2.1 — `PTO` for the Application space:
+    /// `smoothed_rtt + max(4 × rttvar, kGranularity) + max_ack_delay`. Also
+    /// what RFC 9000 §10.1 / §10.2 mean by "the PTO" when sizing the idle
+    /// and closing periods.
+    pub(crate) fn pto_period(&self) -> Duration {
+        self.pto_base().saturating_add(self.max_ack_delay)
+    }
+
+    /// `2^pto_count`, capped so the multiplication below cannot overflow.
+    fn pto_backoff(&self) -> u32 {
+        1u32 << self.pto_count.min(PTO_BACKOFF_CAP)
+    }
+
+    /// `d × 2^pto_count`, saturating at one minute rather than overflowing.
+    fn backed_off(&self, d: Duration) -> Duration {
+        d.checked_mul(self.pto_backoff())
+            .unwrap_or(Duration::from_secs(60))
+    }
+
+    /// RFC 9002 §A.8 — `GetPtoTimeAndSpace`.
     ///
-    /// Recomputes [`Self::loss_detection_timer`] from the current state.
-    /// The timer fires at the earliest of:
-    ///   * `loss_time` across all spaces (time-threshold loss), OR
-    ///   * `time_of_last_ack_eliciting_packet + PTO × 2^pto_count` for
-    ///     the space with the most recent ack-eliciting send.
-    pub(crate) fn set_loss_detection_timer(&mut self, _now: Duration) {
-        // 1. Earliest loss_time wins (§A.8 step "GetLossTimeAndSpace").
-        let (loss_time, _loss_space) = self.earliest_loss_time();
-        if let Some(t) = loss_time {
-            self.loss_detection_timer = Some(t);
-            return;
-        }
-        // 2. No outstanding ack-eliciting → disarm.
-        let mut any_ack_eliciting = false;
-        for space_idx in 0..3 {
-            for p in self.per_space[space_idx].sent_packets.values() {
-                if p.ack_eliciting {
-                    any_ack_eliciting = true;
-                    break;
-                }
+    /// The PTO deadline and the space it belongs to: for every space with
+    /// ack-eliciting packets in flight, `time_of_last_ack_eliciting_packet +
+    /// PTO(space) × 2^pto_count`, and the earliest wins. The Application
+    /// space is skipped until the handshake is confirmed (§6.2.1) and is the
+    /// only one whose period includes `max_ack_delay`. With nothing in
+    /// flight the client's anti-deadlock deadline (§6.2.2.1) starts from
+    /// `now`. `None` when no space qualifies.
+    pub(crate) fn pto_time_and_space(&self, now: Duration) -> Option<(Duration, PnSpaceId)> {
+        let duration = self.backed_off(self.pto_base());
+        if !self.has_ack_eliciting_in_flight() {
+            if self.peer_completed_address_validation() {
+                return None;
             }
-            if any_ack_eliciting {
-                break;
-            }
+            let space = if self.ctx.has_handshake_keys {
+                PnSpaceId::Handshake
+            } else {
+                PnSpaceId::Initial
+            };
+            return Some((now.saturating_add(duration), space));
         }
-        if !any_ack_eliciting {
-            self.loss_detection_timer = None;
-            return;
-        }
-        // 3. PTO time, per §A.8 `GetPtoTimeAndSpace`: for every space that
-        //    still has ack-eliciting packets in flight, `time_of_last_ack_
-        //    eliciting_packet + PTO(space) × 2^pto_count`, and the timer is
-        //    the EARLIEST of those. (It used to take the space with the most
-        //    recent send and anchor on it even when that space had nothing
-        //    left in flight, which both picked the wrong space and fired
-        //    late.)
-        let backoff = self.pto_count.min(PTO_BACKOFF_CAP);
-        let mult = 1u64.checked_shl(backoff).unwrap_or(u64::MAX);
-        let mut earliest: Option<Duration> = None;
-        for (i, space_id) in [
+        let mut earliest: Option<(Duration, PnSpaceId)> = None;
+        for space in [
             PnSpaceId::Initial,
             PnSpaceId::Handshake,
             PnSpaceId::Application,
-        ]
-        .iter()
-        .enumerate()
-        {
-            let ps = &self.per_space[i];
+        ] {
+            let ps = &self.per_space[space as usize];
             if !ps.sent_packets.values().any(|p| p.ack_eliciting) {
                 continue;
+            }
+            let mut duration = duration;
+            if space == PnSpaceId::Application {
+                if !self.ctx.handshake_confirmed {
+                    return earliest;
+                }
+                duration = duration.saturating_add(self.backed_off(self.max_ack_delay));
             }
             let Some(anchor) = ps.time_of_last_ack_eliciting_packet else {
                 continue;
             };
-            let pto_base = match space_id {
-                PnSpaceId::Initial | PnSpaceId::Handshake => self.pto_period_handshake(),
-                PnSpaceId::Application => self.pto_period(),
-            };
-            let pto = match pto_base.checked_mul(u32::try_from(mult).unwrap_or(u32::MAX)) {
-                Some(d) => d,
-                None => Duration::from_secs(60),
-            };
-            let t = anchor.saturating_add(pto);
-            earliest = Some(match earliest {
-                Some(prev) if prev <= t => prev,
-                _ => t,
-            });
+            let t = anchor.saturating_add(duration);
+            if earliest.is_none_or(|(prev, _)| t < prev) {
+                earliest = Some((t, space));
+            }
         }
-        self.loss_detection_timer = earliest;
+        earliest
+    }
+
+    /// RFC 9002 Appendix A — `SetLossDetectionTimer`.
+    ///
+    /// Recomputes [`Self::loss_detection_timer`] from the current state. The
+    /// timer is the earliest `loss_time` across all spaces if any is pending
+    /// (§6.1.2); otherwise it is cancelled while a server is at its
+    /// anti-amplification limit or while nothing ack-eliciting is in flight
+    /// and the peer has validated our address (§6.2.2.1); otherwise it is the
+    /// PTO deadline from [`Self::pto_time_and_space`].
+    pub(crate) fn set_loss_detection_timer(&mut self, now: Duration) {
+        if let (Some(t), _) = self.earliest_loss_time() {
+            self.loss_detection_timer = Some(t);
+            return;
+        }
+        if self.ctx.is_server && self.ctx.at_amplification_limit {
+            self.loss_detection_timer = None;
+            return;
+        }
+        if !self.has_ack_eliciting_in_flight() && self.peer_completed_address_validation() {
+            self.loss_detection_timer = None;
+            return;
+        }
+        self.loss_detection_timer = self.pto_time_and_space(now).map(|(t, _)| t);
     }
 
     /// The earliest pending time-threshold loss deadline across all spaces,
@@ -676,8 +760,11 @@ impl LossState {
     /// — without a source of ACKs for a space whose keys are gone, those bytes
     /// would otherwise stay counted for the life of the connection and
     /// eventually wedge `can_send()` at `false` (H-6).
+    ///
+    /// Per §A.10 the PTO backoff restarts too, and any probes still owed in
+    /// the discarded space are forgotten. `now` anchors the re-armed timer.
     #[must_use = "the drained packets must be removed from bytes_in_flight (RFC 9002 §A.10)"]
-    pub(crate) fn discard_keys(&mut self, space: PnSpaceId) -> Vec<SentPacket> {
+    pub(crate) fn discard_keys(&mut self, space: PnSpaceId, now: Duration) -> Vec<SentPacket> {
         let ps = &mut self.per_space[space as usize];
         let drained: Vec<SentPacket> = core::mem::take(&mut ps.sent_packets)
             .into_values()
@@ -685,7 +772,11 @@ impl LossState {
         ps.largest_acked_packet = None;
         ps.loss_time = None;
         ps.time_of_last_ack_eliciting_packet = None;
-        self.set_loss_detection_timer(Duration::ZERO);
+        self.pto_count = 0;
+        if self.probe_space == Some(space) {
+            self.clear_probe();
+        }
+        self.set_loss_detection_timer(now);
         drained
     }
 
@@ -694,23 +785,23 @@ impl LossState {
     /// fresh progress (an ack) clears `pto_outstanding` and a new
     /// burst of PTOs accumulates.
     ///
-    /// Phase-5 approximation per the brief: if `pto_count ≥
+    /// Approximation of RFC 9002 §7.6: if `pto_count ≥
     /// kPersistentCongestionThreshold` and no successful ack has been
     /// received since the first PTO, signal persistent congestion. The
-    /// full RFC 9002 §7.6 rule requires also checking that the duration
-    /// since first PTO exceeds `(smoothed_rtt + max(4×rttvar, kG) +
-    /// max_ack_delay) × (2^kPersistentCongestionThreshold − 1)`; we
-    /// don't make this distinction in Phase 5 because the only
-    /// observable effect is a `cwnd → kMinimumWindow` reset, which is
-    /// safe to be slightly conservative about.
+    /// full rule also checks that the span of the lost packets exceeds
+    /// `(smoothed_rtt + max(4×rttvar, kG) + max_ack_delay) ×
+    /// (2^kPersistentCongestionThreshold − 1)`; three consecutive PTO
+    /// expiries without an ACK cover at least that span, and the only
+    /// observable effect is a `cwnd → kMinimumWindow` reset, which is safe
+    /// to be slightly conservative about.
     pub(crate) fn take_persistent_congestion(&mut self) -> bool {
         if self.pto_count >= K_PERSISTENT_CONGESTION_THRESHOLD
             && self.pto_outstanding
             && !self.persistent_congestion_pending
         {
-            // Mark as reported so subsequent calls return false until
-            // either an ack arrives (clears `pto_outstanding`) or a
-            // disarm clears `pto_count`.
+            // Mark as reported so subsequent calls return false until an
+            // ack arrives (clears `pto_outstanding`) or a discarded space
+            // resets `pto_count`.
             self.persistent_congestion_pending = true;
             true
         } else {
@@ -718,96 +809,20 @@ impl LossState {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Phase-4 shim API
-    // -----------------------------------------------------------------------
-    // Connection-level driver still uses arm/disarm/has_fired/next_deadline
-    // /on_fire/on_handshake_progress. Bridge to the underlying RFC 9002
-    // state where it makes sense; otherwise track a parallel "shim"
-    // anchor that mirrors Phase-4 semantics.
-
-    /// Phase-4 shim: arms the PTO at `now`. Re-arms if already armed.
-    pub(crate) fn arm(&mut self, now: Duration) {
-        self.shim_armed_at = Some(now);
-    }
-
-    /// Phase-4 shim: disarms the shim PTO entirely. Also clears
-    /// `pto_count`. The RFC 9002 state (`sent_packets`, `loss_time`,
-    /// …) is left untouched — callers that want to wipe a space's
-    /// state use [`discard_keys`].
-    pub(crate) fn disarm(&mut self) {
-        self.shim_armed_at = None;
-        self.pto_count = 0;
-        self.pto_outstanding = false;
-        self.probe_credit = 0;
-        self.persistent_congestion_pending = false;
-    }
-
-    /// Phase-4 shim: true iff the shim PTO is armed.
-    pub(crate) fn is_armed(&self) -> bool {
-        self.shim_armed_at.is_some()
-    }
-
-    /// Phase-4 shim: time-until-fire from `now`. Returns
-    /// `Some(Duration::ZERO)` if the deadline has already passed,
-    /// `None` if not armed. The deadline is `armed_at + base_pto ×
-    /// 2^pto_count`. `base_pto = 2 × kInitialRtt` when there is no
-    /// RTT sample (the Phase-4 expectation), otherwise
-    /// [`Self::pto_period_handshake`].
-    pub(crate) fn next_deadline(&self, now: Duration) -> Option<Duration> {
-        let armed_at = self.shim_armed_at?;
-        let base = if self.first_rtt_sample.is_some() {
-            self.pto_period_handshake()
-        } else {
-            K_INITIAL_RTT.saturating_mul(2)
-        };
-        let backoff = self.pto_count.min(PTO_BACKOFF_CAP);
-        let mult = 1u64.checked_shl(backoff).unwrap_or(u64::MAX);
-        let pto = match base.checked_mul(u32::try_from(mult).unwrap_or(u32::MAX)) {
-            Some(d) => d.min(Duration::from_secs(60)),
-            None => Duration::from_secs(60),
-        };
-        let deadline = armed_at.saturating_add(pto);
-        Some(deadline.saturating_sub(now))
-    }
-
-    /// Phase-4 shim: true if the shim deadline has elapsed at `now`.
-    pub(crate) fn has_fired(&self, now: Duration) -> bool {
-        match self.next_deadline(now) {
-            Some(d) => d == Duration::ZERO,
-            None => false,
-        }
-    }
-
-    /// Phase-4 shim: records that the PTO fired. Bumps `pto_count`,
-    /// caps at [`PTO_BACKOFF_CAP`], re-arms the shim anchor from
-    /// `now`, flips `pto_outstanding` so the persistent-congestion
-    /// check can find it, and arms the §7.5 probe credit.
-    pub(crate) fn on_fire(&mut self, now: Duration) {
-        self.pto_count = self.pto_count.saturating_add(1).min(PTO_BACKOFF_CAP);
-        self.pto_outstanding = true;
-        self.arm_probe_credit();
-        self.shim_armed_at = Some(now);
-    }
-
-    /// True iff the application space has ack-eliciting packets in flight —
+    /// True iff any packet-number space has ack-eliciting packets in flight —
     /// the RFC 9002 §6.2.1 condition for the PTO timer to be armed at all.
     pub(crate) fn has_ack_eliciting_in_flight(&self) -> bool {
-        self.per_space[PnSpaceId::Application as usize]
+        self.per_space
+            .iter()
+            .any(|ps| ps.sent_packets.values().any(|p| p.ack_eliciting))
+    }
+
+    /// True iff `space` has ack-eliciting packets in flight.
+    pub(crate) fn space_has_ack_eliciting_in_flight(&self, space: PnSpaceId) -> bool {
+        self.per_space[space as usize]
             .sent_packets
             .values()
             .any(|p| p.ack_eliciting)
-    }
-
-    /// Phase-4 shim: ack-eliciting progress observed. Resets
-    /// `pto_count`, clears `pto_outstanding`, re-arms shim from `now`.
-    pub(crate) fn on_handshake_progress(&mut self, now: Duration) {
-        self.pto_count = 0;
-        self.pto_outstanding = false;
-        self.probe_credit = 0;
-        self.persistent_congestion_pending = false;
-        self.last_progress_time = Some(now);
-        self.shim_armed_at = Some(now);
     }
 }
 
@@ -960,25 +975,161 @@ mod tests {
         assert!(delta < Duration::from_micros(2), "smoothed={got:?}");
     }
 
-    /// Test 4 — PTO backoff doubles per consecutive timeout. The shim
-    /// API tracks the same `pto_count` as the RFC 9002 state.
+    /// Test 4 — RFC 9002 §6.2.2 / §6.2.4: before any RTT sample the PTO is
+    /// `kInitialRtt + 4 × kInitialRtt/2 = 999 ms` from the last ack-eliciting
+    /// send, the timer fires exactly then (not a moment earlier), and every
+    /// consecutive expiry doubles the period (`2^pto_count`) while the anchor
+    /// stays the last ack-eliciting send.
     #[test]
-    fn pto_backoff_doubles() {
+    fn pto_fires_at_computed_time_and_backs_off() {
         let mut s = LossState::new();
-        s.arm(Duration::ZERO);
-        // Initial PTO with no RTT sample: 2 * kInitialRtt = 666ms.
-        let base = K_INITIAL_RTT * 2;
-        assert_eq!(s.next_deadline(Duration::ZERO), Some(base), "initial pto");
-        s.on_fire(base);
-        // After 1 fire: pto_count=1; deadline = base * 2 from `base`.
-        assert_eq!(s.next_deadline(base), Some(base * 2), "after 1 timeout");
-        s.on_fire(base * 3);
-        // pto_count=2; deadline = base * 4.
+        s.ctx.is_server = true;
+        s.on_packet_sent(PnSpaceId::Initial, mk_packet(0, true, true, Duration::ZERO));
+        let base = K_INITIAL_RTT + (K_INITIAL_RTT / 2) * 4;
+        assert_eq!(base, Duration::from_millis(999));
+        assert_eq!(s.pto_base(), base);
+        assert_eq!(s.loss_detection_timer, Some(base), "initial pto");
         assert_eq!(
-            s.next_deadline(base * 3),
-            Some(base * 4),
-            "after 2 timeouts"
+            s.on_loss_detection_timeout(base - Duration::from_millis(1)),
+            None,
+            "not yet"
         );
+        assert_eq!(
+            s.on_loss_detection_timeout(base),
+            Some(TimeoutAction::Pto(PnSpaceId::Initial))
+        );
+        assert_eq!(s.pto_count, 1);
+        assert_eq!(s.probe_space(), Some(PnSpaceId::Initial));
+        assert_eq!(s.probe_credit(PnSpaceId::Initial), K_PTO_PROBES);
+        assert!(s.probe_needs_ping(PnSpaceId::Initial));
+        assert_eq!(s.loss_detection_timer, Some(base * 2), "after 1 timeout");
+        // The clock jumping far past the deadline still fires once per call.
+        assert_eq!(
+            s.on_loss_detection_timeout(Duration::from_secs(60)),
+            Some(TimeoutAction::Pto(PnSpaceId::Initial))
+        );
+        assert_eq!(s.pto_count, 2);
+        assert_eq!(s.loss_detection_timer, Some(base * 4), "after 2 timeouts");
+        // Progress: an ACK resets the backoff and re-arms from the remaining
+        // in-flight packet (none here — so the timer is disarmed).
+        let _ = s.on_ack_received(
+            PnSpaceId::Initial,
+            &[0u64..=0u64],
+            Duration::ZERO,
+            Duration::from_secs(61),
+        );
+        assert_eq!(s.pto_count, 0);
+        assert_eq!(s.probe_space(), None);
+        assert_eq!(s.loss_detection_timer, None);
+    }
+
+    /// RFC 9002 §6.2.1 — the Application space gets no PTO timer until the
+    /// handshake is confirmed, and its period includes `max_ack_delay`
+    /// (backed off with the rest) once it does.
+    #[test]
+    fn application_pto_waits_for_handshake_confirmation() {
+        let mut s = LossState::new();
+        s.ctx.is_server = true;
+        s.on_packet_sent(
+            PnSpaceId::Application,
+            mk_packet(0, true, true, Duration::from_millis(100)),
+        );
+        assert_eq!(s.loss_detection_timer, None, "not confirmed yet");
+        s.ctx.handshake_confirmed = true;
+        s.set_loss_detection_timer(Duration::from_millis(100));
+        assert_eq!(
+            s.loss_detection_timer,
+            Some(Duration::from_millis(100) + s.pto_period())
+        );
+        assert_eq!(s.pto_period(), s.pto_base() + Duration::from_millis(25));
+        assert_eq!(
+            s.on_loss_detection_timeout(Duration::from_secs(5)),
+            Some(TimeoutAction::Pto(PnSpaceId::Application))
+        );
+        assert_eq!(
+            s.loss_detection_timer,
+            Some(Duration::from_millis(100) + s.pto_period() * 2)
+        );
+    }
+
+    /// RFC 9002 §6.2.2.1 — a client keeps a PTO armed with nothing in flight
+    /// until the server acknowledges a Handshake packet (or the handshake is
+    /// confirmed); the probe is a padded Initial without Handshake keys and a
+    /// Handshake packet with them. A server never probes on an empty flight.
+    #[test]
+    fn client_probes_with_nothing_in_flight_until_validated() {
+        let mut s = LossState::new();
+        let now = Duration::from_secs(1);
+        s.set_loss_detection_timer(now);
+        assert_eq!(s.loss_detection_timer, Some(now + s.pto_base()));
+        assert_eq!(
+            s.on_loss_detection_timeout(now + s.pto_base()),
+            Some(TimeoutAction::Pto(PnSpaceId::Initial))
+        );
+        s.ctx.has_handshake_keys = true;
+        assert_eq!(
+            s.on_loss_detection_timeout(Duration::from_secs(30)),
+            Some(TimeoutAction::Pto(PnSpaceId::Handshake))
+        );
+        // A Handshake ACK ends the anti-deadlock probing.
+        s.on_packet_sent(
+            PnSpaceId::Handshake,
+            mk_packet(0, true, true, Duration::from_secs(31)),
+        );
+        let _ = s.on_ack_received(
+            PnSpaceId::Handshake,
+            &[0u64..=0u64],
+            Duration::ZERO,
+            Duration::from_secs(32),
+        );
+        assert!(s.ctx.peer_handshake_acked);
+        assert_eq!(s.pto_count, 0, "validated peer: backoff reset");
+        assert_eq!(s.loss_detection_timer, None);
+        // A server with nothing in flight has no timer either.
+        let mut srv = LossState::new();
+        srv.ctx.is_server = true;
+        srv.set_loss_detection_timer(now);
+        assert_eq!(srv.loss_detection_timer, None);
+        assert_eq!(srv.on_loss_detection_timeout(Duration::from_secs(9)), None);
+    }
+
+    /// RFC 9002 §6.2.2.1 — a server at its anti-amplification limit cannot
+    /// send a probe, so its timer is cancelled until a client datagram lifts
+    /// the limit.
+    #[test]
+    fn server_timer_is_cancelled_at_amplification_limit() {
+        let mut s = LossState::new();
+        s.ctx.is_server = true;
+        s.ctx.at_amplification_limit = true;
+        s.on_packet_sent(PnSpaceId::Initial, mk_packet(0, true, true, Duration::ZERO));
+        assert_eq!(s.loss_detection_timer, None);
+        s.ctx.at_amplification_limit = false;
+        s.set_loss_detection_timer(Duration::from_millis(50));
+        assert_eq!(s.loss_detection_timer, Some(s.pto_base()));
+    }
+
+    /// The §6.2.4 probe credit belongs to the space whose PTO expired and is
+    /// spent one ack-eliciting packet at a time.
+    #[test]
+    fn probe_credit_is_per_space() {
+        let mut s = LossState::new();
+        s.ctx.is_server = true;
+        s.on_packet_sent(
+            PnSpaceId::Handshake,
+            mk_packet(0, true, true, Duration::ZERO),
+        );
+        assert_eq!(
+            s.on_loss_detection_timeout(Duration::from_secs(2)),
+            Some(TimeoutAction::Pto(PnSpaceId::Handshake))
+        );
+        assert_eq!(s.probe_credit(PnSpaceId::Handshake), K_PTO_PROBES);
+        assert_eq!(s.probe_credit(PnSpaceId::Application), 0);
+        assert!(!s.probe_needs_ping(PnSpaceId::Application));
+        s.consume_probe_credit();
+        assert!(!s.probe_needs_ping(PnSpaceId::Handshake));
+        assert_eq!(s.probe_credit(PnSpaceId::Handshake), 1);
+        s.consume_probe_credit();
+        assert_eq!(s.probe_space(), None);
     }
 
     /// Test 5 — packet-threshold loss per RFC 9002 §6.1.1. We send PNs
@@ -1070,6 +1221,8 @@ mod tests {
     #[test]
     fn pto_timer_is_the_earliest_space_deadline() {
         let mut s = LossState::new();
+        s.ctx.is_server = true;
+        s.ctx.handshake_confirmed = true;
         // Handshake in flight since t=0; Application sent later at t=500ms.
         s.on_packet_sent(
             PnSpaceId::Handshake,
@@ -1081,7 +1234,7 @@ mod tests {
         );
         assert_eq!(
             s.loss_detection_timer,
-            Some(s.pto_period_handshake()),
+            Some(s.pto_base()),
             "the older Handshake deadline fires first"
         );
         // Once the Handshake packet is acked, only the Application space
@@ -1192,7 +1345,7 @@ mod tests {
     fn discard_keys_wipes_space() {
         let mut s = LossState::new();
         s.on_packet_sent(PnSpaceId::Initial, mk_packet(0, true, true, Duration::ZERO));
-        let drained = s.discard_keys(PnSpaceId::Initial);
+        let drained = s.discard_keys(PnSpaceId::Initial, Duration::from_secs(1));
         assert!(!drained.is_empty(), "outstanding packets must be returned");
         assert!(s.per_space[0].sent_packets.is_empty());
         assert!(s.per_space[0].largest_acked_packet.is_none());
@@ -1219,39 +1372,38 @@ mod tests {
         assert_eq!(parsed, hints);
     }
 
+    /// RFC 9002 §A.10 — discarding a space restarts the PTO backoff and
+    /// forgets probes owed there.
     #[test]
-    fn shim_disarm_clears_state() {
+    fn discard_keys_resets_backoff_and_probes() {
         let mut s = LossState::new();
-        s.arm(Duration::ZERO);
-        s.on_fire(Duration::from_millis(666));
-        s.disarm();
-        assert!(!s.is_armed());
-        assert!(s.next_deadline(Duration::ZERO).is_none());
-        assert_eq!(s.pto_count, 0);
-    }
-
-    #[test]
-    fn shim_handshake_progress_resets_backoff() {
-        let mut s = LossState::new();
-        s.arm(Duration::ZERO);
-        s.on_fire(Duration::from_millis(666));
-        s.on_fire(Duration::from_millis(2_000));
-        s.on_handshake_progress(Duration::from_secs(5));
-        assert_eq!(s.pto_count, 0);
-        // base = 2 * kInitialRtt = 666ms.
-        assert_eq!(
-            s.next_deadline(Duration::from_secs(5)),
-            Some(K_INITIAL_RTT * 2)
+        s.ctx.is_server = true;
+        s.on_packet_sent(PnSpaceId::Initial, mk_packet(0, true, true, Duration::ZERO));
+        assert!(
+            s.on_loss_detection_timeout(Duration::from_secs(2))
+                .is_some()
         );
+        assert!(
+            s.on_loss_detection_timeout(Duration::from_secs(4))
+                .is_some()
+        );
+        assert_eq!(s.pto_count, 2);
+        let _ = s.discard_keys(PnSpaceId::Initial, Duration::from_secs(4));
+        assert_eq!(s.pto_count, 0);
+        assert_eq!(s.probe_space(), None);
+        assert_eq!(s.loss_detection_timer, None);
     }
 
     #[test]
     fn persistent_congestion_after_threshold_ptos() {
         let mut s = LossState::new();
-        s.arm(Duration::ZERO);
+        s.ctx.is_server = true;
+        s.on_packet_sent(PnSpaceId::Initial, mk_packet(0, true, true, Duration::ZERO));
         for _ in 0..K_PERSISTENT_CONGESTION_THRESHOLD {
-            s.on_fire(Duration::from_millis(666));
+            let now = s.loss_detection_timer.expect("armed");
+            assert!(s.on_loss_detection_timeout(now).is_some());
         }
+        assert_eq!(s.pto_count, K_PERSISTENT_CONGESTION_THRESHOLD);
         assert!(s.take_persistent_congestion());
         // Cleared on consume.
         assert!(!s.take_persistent_congestion());

@@ -81,7 +81,8 @@ use crate::quic::ecn::{EcnCodepoint, EcnValidation};
 use crate::quic::endpoint::Endpoint;
 use crate::quic::frame::{EcnCounts, Frame, FrameIter, StreamDir, build_ack_ranges_raw};
 use crate::quic::loss::{
-    CryptoHint, SentPacket, StreamHint, build_retransmit_hint, parse_retransmit_hint,
+    CryptoHint, K_PTO_PROBES, SentPacket, StreamHint, TimeoutAction, build_retransmit_hint,
+    parse_retransmit_hint,
 };
 use crate::quic::path::{Path, PathChallengeState};
 use crate::quic::pkt::{
@@ -1460,6 +1461,11 @@ impl QuicConnection {
             rest = &rest[consumed..];
         }
         self.check_handshake_complete();
+        // RFC 9002 §A.7 / §6.2.2.1 — what arrived may have installed keys,
+        // confirmed the handshake or replenished the server's
+        // anti-amplification budget; re-arm the timer against the new facts.
+        let now = self.now_since_start();
+        self.refresh_loss_timer(now);
         Ok(())
     }
 
@@ -1741,6 +1747,9 @@ impl QuicConnection {
     /// builds. Returns the assembled datagram or an empty `Vec` if
     /// nothing is pending OR the build was rejected by the AMP cap.
     fn pop_datagram_inner(&mut self) -> Vec<u8> {
+        // The packets built below register with loss recovery, which arms
+        // the timer from the RFC 9002 §A.8 facts in `LossContext`.
+        self.sync_loss_context();
         // Try to pack Initial → Handshake → 1-RTT into one datagram.
         // Each level contributes at most one packet (per RFC 9000 §12.2:
         // coalesced packets share a UDP datagram but each has its own
@@ -1892,21 +1901,12 @@ impl QuicConnection {
         self.active_path.note_sent(datagram.len());
 
         self.endpoint.sent_first_datagram = true;
-        // Arm the PTO if any CRYPTO chunk was actually carved in this
-        // build (i.e., a level has a non-empty `last_sent`). This is
-        // the Phase-4 stand-in for RFC 9002's "in-flight ack-eliciting
-        // packet" predicate. Phase 6: also arm when any stream has
-        // unacked chunks.
-        // RFC 9002 §6.2.1: the timer is armed whenever ack-eliciting packets
-        // are in flight — a lone PATH_CHALLENGE, DATAGRAM or PING counts too,
-        // or the probe that would reveal its loss could never be sent.
-        if !self.endpoint.loss.is_armed()
-            && (self.has_unconfirmed_crypto_last_sent()
-                || self.has_unacked_streams()
-                || self.endpoint.loss.has_ack_eliciting_in_flight())
-        {
-            self.endpoint.loss.arm(Duration::ZERO);
-        }
+        // RFC 9002 §A.5 — `seal_packet` registered every packet in this
+        // datagram with loss recovery, which armed the timer. The bytes just
+        // charged to the §8.1 budget may have changed the server's
+        // anti-amplification state (§6.2.2.1), so recompute once more.
+        let now = self.now_since_start();
+        self.refresh_loss_timer(now);
         datagram
     }
 
@@ -1919,30 +1919,6 @@ impl QuicConnection {
                 {
                     return true;
                 }
-            }
-        }
-        false
-    }
-
-    /// True if any level has a `last_sent` chunk that the peer hasn't
-    /// acked yet. Phase 4 doesn't track per-PN in-flight; this is the
-    /// proxy used to arm the PTO.
-    fn has_unconfirmed_crypto_last_sent(&self) -> bool {
-        for lvl in [Level::Initial, Level::Handshake] {
-            // schedule_last_chunk_retransmit returns true when there's a
-            // `last_sent` AND no progress signal has cleared it. We use
-            // a peek-only check: a level has a last_sent iff its
-            // CryptoBuf carve has happened. We don't have a peek API on
-            // CryptoBuf, so we use outbound_offset > 0 as the proxy —
-            // any level that has carved at least one chunk has an
-            // outbound_offset > 0.
-            //
-            // (See `CryptoBuf::carve` — `outbound_offset` only advances
-            // there, and never rewinds except via
-            // `schedule_last_chunk_retransmit`, which the PTO calls.)
-            let buf = self.endpoint.bufs.at(lvl);
-            if buf.outbound_offset_for_test() > 0 {
-                return true;
             }
         }
         false
@@ -1996,10 +1972,17 @@ impl QuicConnection {
             if !self.datagram_queues.outbound.is_empty() {
                 return true;
             }
-            // RFC 9002 §6.2.4 — a PTO probe still owed (PING if need be).
-            if self.endpoint.loss.probe_needs_ping() {
-                return true;
-            }
+        }
+        // RFC 9002 §6.2.4 — a PTO probe still owed in this level's space
+        // (a PING if need be). Never in a 0-RTT packet: 0-RTT shares the
+        // Application space with 1-RTT, which carries the probe.
+        if !matches!(level, Level::EarlyData)
+            && self
+                .endpoint
+                .loss
+                .probe_needs_ping(pn_space_of_level(level))
+        {
+            return true;
         }
         false
     }
@@ -2127,6 +2110,127 @@ impl QuicConnection {
         }
     }
 
+    /// Refreshes the connection facts RFC 9002 §A.8 consults when arming the
+    /// loss-detection timer (see [`LossContext`]).
+    fn sync_loss_context(&mut self) {
+        let is_server = self.role == Role::Server;
+        let has_handshake_keys = self.endpoint.crypto.at(Level::Handshake).tx.is_some();
+        // RFC 9002 §6.2.2.1: a server at the RFC 9000 §8.1 anti-amplification
+        // limit could not send a probe, so its timer is not set until a
+        // client datagram replenishes the budget (`can_send` is always true
+        // once the path is validated).
+        let at_amplification_limit = is_server && !self.active_path.can_send(1);
+        let ctx = &mut self.endpoint.loss.ctx;
+        ctx.is_server = is_server;
+        ctx.handshake_confirmed = self.handshake_confirmed;
+        ctx.has_handshake_keys = has_handshake_keys;
+        ctx.at_amplification_limit = at_amplification_limit;
+    }
+
+    /// RFC 9002 Appendix A `SetLossDetectionTimer`, run after an event the
+    /// loss state cannot see on its own changed what the timer depends on
+    /// (§A.8): keys installed or discarded, the handshake confirmed, the
+    /// server's anti-amplification budget spent or replenished.
+    fn refresh_loss_timer(&mut self, now: Duration) {
+        self.sync_loss_context();
+        self.endpoint.loss.set_loss_detection_timer(now);
+    }
+
+    /// RFC 9002 §6.2.4 — the PTO expired for `space`: queue what the one or
+    /// two probe packets the next `pop_datagram` builds there must carry.
+    ///
+    /// New data goes first if the space has any; otherwise the oldest
+    /// unacknowledged ack-eliciting packets (at most [`K_PTO_PROBES`]) have
+    /// their contents re-sent — they stay in flight, neither acknowledged
+    /// nor declared lost; with neither, the packet builder adds a PING
+    /// (`probe_needs_ping`). As §6.2.4 recommends, the other spaces with
+    /// data in flight get their oldest packet re-sent too, coalesced into
+    /// the same datagram where possible — except the Application space
+    /// before the handshake is confirmed (§6.2.1).
+    fn send_pto_probes(&mut self, space: PnSpaceId) {
+        if !self.space_has_new_data(space) {
+            for pkt in self
+                .endpoint
+                .loss
+                .oldest_ack_eliciting(space, usize::from(K_PTO_PROBES))
+            {
+                self.requeue_for_probe(&pkt);
+            }
+        }
+        for other in [
+            PnSpaceId::Initial,
+            PnSpaceId::Handshake,
+            PnSpaceId::Application,
+        ] {
+            if other == space
+                || !self.endpoint.loss.space_has_ack_eliciting_in_flight(other)
+                || (other == PnSpaceId::Application && !self.handshake_confirmed)
+                || self.space_has_new_data(other)
+            {
+                continue;
+            }
+            for pkt in self.endpoint.loss.oldest_ack_eliciting(other, 1) {
+                self.requeue_for_probe(&pkt);
+            }
+        }
+        // RFC 9000 §19.20 — an unacknowledged HANDSHAKE_DONE always rides
+        // the probe: a client that never receives it never confirms the
+        // handshake (RFC 9001 §4.1.2), and the frame costs a single byte.
+        if !self.handshake_done_acked
+            && self.endpoint.loss.per_space[PnSpaceId::Application as usize]
+                .sent_packets
+                .values()
+                .any(|p| p.handshake_done)
+        {
+            self.handshake_done_pending = true;
+        }
+    }
+
+    /// True if `space` has ack-eliciting data queued that has never been
+    /// sent — what a PTO probe should carry in preference to a
+    /// retransmission (RFC 9002 §6.2.4). Pending ACKs do not count: they
+    /// are not ack-eliciting.
+    fn space_has_new_data(&self, space: PnSpaceId) -> bool {
+        match space {
+            PnSpaceId::Initial => self.endpoint.bufs.at(Level::Initial).outbound_pending(),
+            PnSpaceId::Handshake => self.endpoint.bufs.at(Level::Handshake).outbound_pending(),
+            PnSpaceId::Application => {
+                self.endpoint.bufs.at(Level::OneRtt).outbound_pending()
+                    || self.streams.as_ref().is_some_and(|s| s.has_pending())
+                    || !self.datagram_queues.outbound.is_empty()
+                    || self.path.has_pending_response()
+                    || self.path.has_pending_challenge()
+                    || self
+                        .cid_remote
+                        .as_ref()
+                        .is_some_and(|p| !p.pending_retire.is_empty())
+                    || (self.handshake_complete && !self.new_cids_issued)
+                    || self.handshake_done_pending
+            }
+        }
+    }
+
+    /// Queues the retransmittable contents of `pkt` — CRYPTO ranges, STREAM
+    /// chunks, HANDSHAKE_DONE — for the next packet build, as a PTO probe
+    /// (RFC 9002 §6.2.4). Unlike [`Self::handle_lost_packets`] this is not
+    /// a loss event: the packet stays in flight and congestion control is
+    /// not told anything. DATAGRAM, PATH_* and CID frames are never
+    /// re-sent (RFC 9221 §5, RFC 9000 §13.3).
+    fn requeue_for_probe(&mut self, pkt: &SentPacket) {
+        if !pkt.retransmit_hint.is_empty() {
+            // A malformed hint can only come from our own encoder.
+            let _ = self.requeue_from_hint(&pkt.retransmit_hint);
+        }
+        if let Some(streams) = self.streams.as_mut() {
+            for h in &pkt.stream_hints {
+                streams.on_chunk_lost(h.id, h.offset, h.length, h.fin);
+            }
+        }
+        if pkt.handshake_done && !self.handshake_done_acked {
+            self.handshake_done_pending = true;
+        }
+    }
+
     /// RFC 9000 §19.20 / §13.3 — HANDSHAKE_DONE is retransmitted until some
     /// copy is acknowledged: an acked carrier settles it for good, a lost
     /// carrier re-queues it unless one was already acked.
@@ -2201,9 +2305,10 @@ impl QuicConnection {
             .map(|t| self.last_recv_activity.saturating_add(t))
     }
 
-    /// Time of the next internal event — the earlier of the PTO firing and the
-    /// RFC 9000 §10.1 idle-timeout deadline (both measured from connection
-    /// construction). `None` if neither timer is armed.
+    /// Time of the next internal event — the earliest of the RFC 9002
+    /// loss-detection timer (time-threshold loss or PTO), the RFC 9000 §10.1
+    /// idle-timeout deadline and any path-validation deadline, all measured
+    /// from connection construction. `None` if no timer is armed.
     pub fn next_timeout(&self) -> Option<Duration> {
         // While closing or draining the only timer that matters is the
         // 3x-PTO close deadline (RFC 9000 §10.2); loss recovery is over and
@@ -2211,17 +2316,12 @@ impl QuicConnection {
         if let Some(deadline) = self.close_deadline {
             return Some(deadline);
         }
-        let pto = self.endpoint.loss.next_deadline(Duration::ZERO);
-        let base = match (pto, self.idle_deadline()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, b) => b,
-        };
-        // RFC 9002 §6.1.2 — the time-threshold loss deadline is a timer of its
-        // own. Without it, `detect_lost` only ever ran from the ACK handler, so
-        // a peer that stopped acknowledging left `bytes_in_flight` pinned
-        // forever (H-6).
-        let base = match (base, self.endpoint.loss.next_loss_time().map(|(t, _)| t)) {
+        // RFC 9002 Appendix A — the loss-detection timer as
+        // `set_loss_detection_timer` last computed it: the earliest
+        // time-threshold loss deadline (§6.1.2) or, failing one, the PTO
+        // (§6.2.1).
+        let loss = self.endpoint.loss.loss_detection_timer;
+        let base = match (loss, self.idle_deadline()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, b) => b,
@@ -2241,46 +2341,18 @@ impl QuicConnection {
         // RFC 9001 §6.5 — drop retained previous-phase read keys once
         // 3×PTO has elapsed since the key-phase commit installed them.
         self.maybe_discard_prev_rx_keys(now_since_start);
-        // RFC 9002 §6.1.2 / Appendix A `OnLossDetectionTimeout` — run
-        // time-threshold loss detection on the timer (H-6).
+        // RFC 9002 Appendix A `OnLossDetectionTimeout`: time-threshold loss
+        // detection first (§6.1.2), then — if the timer that expired was the
+        // PTO — one round of probes in the space it expired for (§6.2.4).
+        // The loss state re-arms the timer itself in both cases.
+        self.sync_loss_context();
         self.detect_lost_on_timer(now_since_start);
-        if self.endpoint.loss.has_fired(now_since_start) {
-            // RFC 9002 §6.2.4: on PTO, send a probe — Phase 4 implements
-            // this as "retransmit the last CRYPTO chunk at *every* level
-            // that has one." That means a server whose Initial+Handshake
-            // flight was dropped resends BOTH packets in one PTO event;
-            // the client's peer needs both to derive Handshake-level
-            // keys (from the ServerHello) and then read the rest of the
-            // server's Finished. `on_fire` also arms the §7.5 probe
-            // credit that lets the 1-RTT probes past a full congestion
-            // window (see `build_packet_with_pad`), with a PING as the
-            // fallback when nothing retransmittable is left.
-            self.endpoint.loss.on_fire(now_since_start);
-            for lvl in [Level::Initial, Level::Handshake] {
-                let _ = self
-                    .endpoint
-                    .bufs
-                    .at_mut(lvl)
-                    .schedule_last_chunk_retransmit();
-            }
-            // Phase 6: requeue all sent-but-unconfirmed stream chunks
-            // at the 1-RTT level. Without per-frame ack bookkeeping
-            // this is best-effort (may re-send acked bytes); the
-            // receiver's reassembly drops duplicates.
-            if let Some(streams) = self.streams.as_mut() {
-                streams.on_pto();
-            }
-            // RFC 9002 §6.2.4 — an unacknowledged HANDSHAKE_DONE rides the
-            // probe: a client that never receives it never confirms the
-            // handshake (RFC 9001 §4.1.2).
-            if !self.handshake_done_acked
-                && self.endpoint.loss.per_space[PnSpaceId::Application as usize]
-                    .sent_packets
-                    .values()
-                    .any(|p| p.handshake_done)
-            {
-                self.handshake_done_pending = true;
-            }
+        if let Some(TimeoutAction::Pto(space)) = self
+            .endpoint
+            .loss
+            .on_loss_detection_timeout(now_since_start)
+        {
+            self.send_pto_probes(space);
         }
         // RFC 9000 §10.1: if the negotiated idle timeout has elapsed since the
         // last packet we processed, silently close (no CONNECTION_CLOSE) and
@@ -3717,7 +3789,8 @@ impl QuicConnection {
         // congestion event) rather than have them declared lost later and
         // their CRYPTO retransmitted a second time.
         self.endpoint.pn.initial.largest_acked_tx = None;
-        let drained = self.endpoint.loss.discard_keys(PnSpaceId::Initial);
+        let now = self.now_since_start();
+        let drained = self.endpoint.loss.discard_keys(PnSpaceId::Initial, now);
         let stranded: u64 = drained
             .iter()
             .filter(|p| p.in_flight)
@@ -4099,10 +4172,9 @@ impl QuicConnection {
             // client confirms on receiving that frame (`Frame::HandshakeDone`).
             if self.role == Role::Server {
                 self.handshake_confirmed = true;
+                self.endpoint.loss.ctx.handshake_confirmed = true;
                 self.handshake_done_pending = true;
             }
-            // Disarm the PTO: handshake is done, nothing to retransmit.
-            self.endpoint.loss.disarm();
             // RFC 9001 §4.9 — discard finished encryption levels now that the
             // handshake is complete. Without this, a peer whose PTO is still
             // armed (its own handshake flight was lost) keeps retransmitting
@@ -4112,6 +4184,8 @@ impl QuicConnection {
             // keys both stops the sender emitting those packets and makes the
             // receiver drop any already-in-flight ones (the rx-key `None`
             // branch in `feed_long_header_packet` silently discards them).
+            // Discarding a space also restarts the PTO backoff (RFC 9002
+            // §A.10), so nothing needs disarming here.
             self.discard_handshake_levels();
             self.resolve_early_data();
         }
@@ -4202,7 +4276,8 @@ impl QuicConnection {
             // (H-6: this used to be silently skipped, leaking every
             // Initial/Handshake packet in flight at handshake completion into
             // `bytes_in_flight` forever.)
-            let drained = self.endpoint.loss.discard_keys(pn_space_of_level(lvl));
+            let now = self.now_since_start();
+            let drained = self.endpoint.loss.discard_keys(pn_space_of_level(lvl), now);
             let stranded: u64 = drained
                 .iter()
                 .filter(|p| p.in_flight)
@@ -4274,10 +4349,20 @@ impl QuicConnection {
             return true;
         }
         // RFC 9002 §6.2.4 — a PTO probe still owed (PING if need be).
-        if self.endpoint.loss.probe_needs_ping() {
+        if self.probe_ping_owed() {
             return true;
         }
         false
+    }
+
+    /// RFC 9002 §6.2.4 — a PTO expired and no ack-eliciting probe has left
+    /// yet in the space it expired for, so a packet (a bare PING if nothing
+    /// else is pending) is owed there.
+    fn probe_ping_owed(&self) -> bool {
+        self.endpoint
+            .loss
+            .probe_space()
+            .is_some_and(|space| self.endpoint.loss.probe_needs_ping(space))
     }
 
     /// Parses one packet at the start of `buf`, dispatches its frames,
@@ -5174,10 +5259,8 @@ impl QuicConnection {
                         self.endpoint.cc.on_persistent_congestion();
                     }
 
-                    // Phase-4 / Phase-7 compatibility: keep the
-                    // per-space `largest_acked_tx` updated and reset the
-                    // PTO shim. The RFC 9002 surface has already done
-                    // the equivalent inside loss.on_ack_received.
+                    // Keep the per-space `largest_acked_tx` up to date for the
+                    // sender-side bookkeeping that reads it.
                     let space = match level {
                         Level::Initial => &mut self.endpoint.pn.initial,
                         Level::Handshake => &mut self.endpoint.pn.handshake,
@@ -5187,9 +5270,6 @@ impl QuicConnection {
                         Some(prev) => prev.max(largest),
                         None => largest,
                     });
-                    if !acked.is_empty() {
-                        self.endpoint.loss.on_handshake_progress(now);
-                    }
                     // Not ack-eliciting.
                 }
                 Frame::Crypto { offset, data } => {
@@ -5226,6 +5306,7 @@ impl QuicConnection {
                     // at that level is still outstanding.
                     if !self.handshake_confirmed {
                         self.handshake_confirmed = true;
+                        self.endpoint.loss.ctx.handshake_confirmed = true;
                         self.discard_level(Level::Handshake);
                     }
                 }
@@ -5539,9 +5620,9 @@ impl QuicConnection {
     /// Parses a [`SentPacket::retransmit_hint`] blob and re-queues the
     /// referenced CRYPTO bytes back into the outbound queue of the
     /// appropriate level. Used by the RFC 9002 packet-threshold /
-    /// time-threshold loss path to schedule retransmission of lost
-    /// CRYPTO data. STREAM data is requeued through the Phase-6
-    /// `streams.on_pto` path; DATAGRAM frames are NOT retransmitted
+    /// time-threshold loss path (and by PTO probes) to schedule
+    /// retransmission of CRYPTO data. STREAM data is requeued through
+    /// `Streams::on_chunk_lost`; DATAGRAM frames are NOT retransmitted
     /// (RFC 9221 §5).
     fn requeue_from_hint(&mut self, hint: &[u8]) -> Result<(), Error> {
         let hints = parse_retransmit_hint(hint)?;
@@ -5635,9 +5716,13 @@ impl QuicConnection {
         // Phase 8 — DATAGRAM frames live only at the 1-RTT level.
         let has_datagrams = matches!(level, Level::OneRtt | Level::EarlyData)
             && !self.datagram_queues.outbound.is_empty();
-        // RFC 9002 §6.2.4 — a PTO probe owed with nothing else to carry it.
-        let has_probe_ping =
-            matches!(level, Level::OneRtt) && self.endpoint.loss.probe_needs_ping();
+        // RFC 9002 §6.2.4 — a PTO probe owed in this level's space with
+        // nothing else to carry it.
+        let has_probe_ping = !zero_rtt
+            && self
+                .endpoint
+                .loss
+                .probe_needs_ping(pn_space_of_level(level));
         if !has_crypto
             && !has_pending_ack
             && !has_streams
@@ -5691,10 +5776,11 @@ impl QuicConnection {
         // validation succeeds. `peer_addr_validated` is what tracks that.
         //
         // RFC 9002 §7.5: a PTO probe MUST NOT be blocked by the window. While
-        // the PTO credit is armed, 1-RTT packets are built at full scope even
-        // with `bytes_in_flight >= cwnd`; each ack-eliciting one spends a
-        // credit, so the bypass is worth exactly the §6.2.4 probe count.
-        let probing = matches!(level, Level::OneRtt) && self.endpoint.loss.probe_credit() > 0;
+        // the PTO credit is armed for this level's space, packets there are
+        // built at full scope even with `bytes_in_flight >= cwnd`; each
+        // ack-eliciting one spends a credit, so the bypass is worth exactly
+        // the §6.2.4 probe count.
+        let probing = !zero_rtt && self.endpoint.loss.probe_credit(pn_space_of_level(level)) > 0;
         // RFC 9001 §4.6.1: 0.5-RTT data — what a server may send between its
         // own Finished and the client's — goes to a peer that has not
         // authenticated. That is fine for a server that asked for no
@@ -6254,19 +6340,24 @@ impl QuicConnection {
                 meta.ack_eliciting = true;
                 meta.in_flight = true;
             }
+        }
 
-            // RFC 9002 §6.2.4 — a PTO fired and no probe has gone out yet:
-            // the probe MUST be ack-eliciting, so if nothing above was, add
-            // a PING. (Non-probing per RFC 9000 §9.1, hence `full`.)
-            if matches!(level, Level::OneRtt)
-                && full
-                && !meta.ack_eliciting
-                && self.endpoint.loss.probe_needs_ping()
-            {
-                Frame::Ping.encode(&mut out);
-                meta.ack_eliciting = true;
-                meta.in_flight = true;
-            }
+        // RFC 9002 §6.2.4 — a PTO fired for this level's space and no probe
+        // has gone out yet: the probe MUST be ack-eliciting, so if nothing
+        // above was, add a PING. (Non-probing per RFC 9000 §9.1, hence
+        // `full`; never in a 0-RTT packet, whose space the 1-RTT packet
+        // probes for.)
+        if !matches!(level, Level::EarlyData)
+            && full
+            && !meta.ack_eliciting
+            && self
+                .endpoint
+                .loss
+                .probe_needs_ping(pn_space_of_level(level))
+        {
+            Frame::Ping.encode(&mut out);
+            meta.ack_eliciting = true;
+            meta.in_flight = true;
         }
 
         if out.is_empty() {
@@ -7038,9 +7129,13 @@ mod tests {
         let _dropped = s.pop_datagram();
         assert!(!_dropped.is_empty(), "server must have emitted a reply");
 
-        // The server's PTO should now eventually fire. With kInitialRtt
-        // = 333 ms, the initial PTO is 666 ms; we tick to 1 s.
-        s.on_timeout(Duration::from_millis(1_000));
+        // The server's PTO fires at the deadline it computed (RFC 9002
+        // §6.2.2: `kInitialRtt + 4 × kInitialRtt/2 = 999 ms` after the last
+        // ack-eliciting send, no RTT sample yet) — not a moment before.
+        let deadline = s.next_timeout().expect("PTO armed");
+        s.on_timeout(deadline - Duration::from_millis(1));
+        assert!(s.pop_datagram().is_empty(), "nothing before the deadline");
+        s.on_timeout(deadline);
         // After PTO the server should have re-queued its CRYPTO; pop
         // another datagram from it.
         let dg2 = s.pop_datagram();
@@ -7351,9 +7446,9 @@ mod tests {
         );
     }
 
-    /// Test 13 — drop every third datagram in each direction. The
-    /// Phase-4 PTO retransmits the lost flight; the handshake still
-    /// completes within a defensive bound of 50 PTO events.
+    /// Test 13 — drop every third datagram in each direction. The PTO
+    /// probes re-send the lost CRYPTO; the handshake still completes
+    /// within a defensive bound of 50 PTO events.
     #[test]
     fn drop_every_third_packet() {
         let (mut c, mut s) = loopback_pair();
@@ -8742,7 +8837,7 @@ mod tests {
             !s.endpoint.cc.can_send(),
             "test premise: the window is full"
         );
-        assert_eq!(s.endpoint.loss.probe_credit(), 0);
+        assert_eq!(s.endpoint.loss.probe_credit(PnSpaceId::Application), 0);
         assert!(
             s.pop_datagram().is_empty(),
             "test premise: the window holds everything back"
@@ -8752,7 +8847,10 @@ mod tests {
         // ack-eliciting probes, then the window closes the door again.
         let before_in_flight = s.endpoint.cc.bytes_in_flight;
         s.on_timeout(Duration::from_secs(5));
-        assert_eq!(s.endpoint.loss.probe_credit(), K_PTO_PROBES);
+        assert_eq!(
+            s.endpoint.loss.probe_credit(PnSpaceId::Application),
+            K_PTO_PROBES
+        );
         let mut probes: Vec<Vec<u8>> = Vec::new();
         loop {
             let out = s.pop_datagram();
@@ -8766,7 +8864,11 @@ mod tests {
             usize::from(K_PTO_PROBES),
             "exactly the probe credit leaves past the window"
         );
-        assert_eq!(s.endpoint.loss.probe_credit(), 0, "spent per probe emitted");
+        assert_eq!(
+            s.endpoint.loss.probe_credit(PnSpaceId::Application),
+            0,
+            "spent per probe emitted"
+        );
         assert!(
             s.endpoint.cc.bytes_in_flight > before_in_flight,
             "probes count toward bytes_in_flight"
@@ -8791,7 +8893,10 @@ mod tests {
         // The probes reach the client; its ACK shows progress, drops the
         // unspent credit, reveals the earlier flight as lost and reopens the
         // window — data flows again under normal congestion control.
-        assert_eq!(s.endpoint.loss.probe_credit(), K_PTO_PROBES);
+        assert_eq!(
+            s.endpoint.loss.probe_credit(PnSpaceId::Application),
+            K_PTO_PROBES
+        );
         for p in &probes {
             c.feed_datagram(p).expect("client feed probe");
         }
@@ -8799,7 +8904,7 @@ mod tests {
         assert!(!ack.is_empty());
         s.feed_datagram(&ack).expect("server feed ack");
         assert_eq!(
-            s.endpoint.loss.probe_credit(),
+            s.endpoint.loss.probe_credit(PnSpaceId::Application),
             0,
             "an ACK clears the credit"
         );
@@ -8823,7 +8928,7 @@ mod tests {
 
         // Nothing in flight: a PTO tick probes nothing.
         s.on_timeout(Duration::from_secs(5));
-        assert_eq!(s.endpoint.loss.probe_credit(), 0);
+        assert_eq!(s.endpoint.loss.probe_space(), None);
         assert!(
             s.pop_datagram().is_empty(),
             "no PING with nothing to probe for"
@@ -8837,7 +8942,7 @@ mod tests {
 
         // The PTO fires; with nothing to retransmit the probe is a PING.
         s.on_timeout(Duration::from_secs(10));
-        assert!(s.endpoint.loss.probe_needs_ping());
+        assert!(s.endpoint.loss.probe_needs_ping(PnSpaceId::Application));
         let ping = s.pop_datagram();
         assert!(!ping.is_empty(), "§6.2.4: at least one ack-eliciting probe");
         assert!(ping.len() < 64, "a bare PING, not a padded probe");
@@ -13418,6 +13523,243 @@ mod tests {
             server.readable_streams().count(),
             0,
             "1-RTT stream data must not be delivered before the handshake completes"
+        );
+    }
+
+    /// RFC 9002 §6.2.1 / §6.2.2 / §6.2.4 through the connection: before any
+    /// RTT sample the PTO is `kInitialRtt + 4 × kInitialRtt/2 = 999 ms`,
+    /// anchored on the last ack-eliciting send and without `max_ack_delay`
+    /// in the Initial space; the timer fires exactly then, each consecutive
+    /// expiry doubles the period, and a probe (not a replay of the whole
+    /// flight) goes out per expiry.
+    #[test]
+    fn pto_fires_at_the_computed_time_and_backs_off() {
+        let (mut c, mut s) = loopback_pair();
+        let dg = c.pop_datagram();
+        s.feed_datagram(&dg).expect("server feed");
+        // The server's Initial + Handshake flight is lost.
+        assert!(!s.pop_datagram().is_empty());
+        let anchor = |s: &QuicConnection| {
+            [PnSpaceId::Initial, PnSpaceId::Handshake]
+                .into_iter()
+                .filter_map(|sp| {
+                    s.endpoint.loss.per_space[sp as usize].time_of_last_ack_eliciting_packet
+                })
+                .min()
+                .expect("a handshake packet in flight")
+        };
+        let pto = s.endpoint.loss.pto_base();
+        assert_eq!(pto, Duration::from_millis(999), "§6.2.2 initial PTO");
+        let deadline = s.next_timeout().expect("PTO armed");
+        assert_eq!(deadline, anchor(&s) + pto, "anchored on the last send");
+
+        // A tick just before the deadline changes nothing.
+        s.on_timeout(deadline - Duration::from_millis(1));
+        assert_eq!(s.endpoint.loss.pto_count, 0);
+        assert!(s.pop_datagram().is_empty());
+
+        // The deadline itself: one PTO, one probe datagram.
+        s.on_timeout(deadline);
+        assert_eq!(s.endpoint.loss.pto_count, 1);
+        let probe = s.pop_datagram();
+        assert!(!probe.is_empty(), "a probe leaves");
+        assert!(
+            s.pop_datagram().is_empty(),
+            "one probe datagram per PTO expiry"
+        );
+        // Backoff: 2 × PTO from the probe's own send.
+        let expected = anchor(&s) + pto * 2;
+        assert_eq!(s.next_timeout(), Some(expected), "2^pto_count backoff");
+        s.on_timeout(expected);
+        assert_eq!(s.endpoint.loss.pto_count, 2);
+        assert_eq!(
+            s.next_timeout(),
+            Some(anchor(&s) + pto * 4),
+            "doubles again"
+        );
+
+        // Progress from the client resets the backoff and the handshake
+        // completes normally.
+        c.feed_datagram(&probe).expect("client feed");
+        drive_until_complete(&mut c, &mut s, 8);
+        assert_eq!(s.endpoint.loss.pto_count, 0);
+    }
+
+    /// RFC 9002 §6.2.4 — a PTO probe re-sends the oldest unacknowledged
+    /// data of the space that timed out, at most two packets' worth; the
+    /// rest of the flight stays in flight untouched (no loss is declared,
+    /// `bytes_in_flight` only grows by the probes). Once the peer's ACK
+    /// arrives, the backoff resets and the timer is re-armed for what is
+    /// still outstanding.
+    #[test]
+    fn pto_probe_resends_oldest_data_not_the_flight() {
+        use crate::quic::loss::K_PTO_PROBES;
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+        let addr = ip4(192, 0, 2, 1, 1111);
+        quiesce(&mut c, &mut s, addr);
+        assert!(!s.endpoint.loss.has_ack_eliciting_in_flight());
+
+        let id = c.open_bidi().expect("open");
+        c.write(id, b"go").expect("write");
+        let dg = c.pop_datagram();
+        s.feed_datagram(&dg).expect("server feed");
+        s.write(id, &[0x5a; 6000]).expect("server write");
+        let mut flight = 0usize;
+        while !s.pop_datagram().is_empty() {
+            flight += 1;
+        }
+        assert!(flight >= 4, "several packets in flight: {flight}");
+        let app = PnSpaceId::Application;
+        let in_flight_before: Vec<u64> = s.endpoint.loss.per_space[app as usize]
+            .sent_packets
+            .keys()
+            .copied()
+            .collect();
+        let oldest: Vec<u64> = s.endpoint.loss.per_space[app as usize]
+            .sent_packets
+            .values()
+            .filter(|p| p.ack_eliciting)
+            .take(usize::from(K_PTO_PROBES))
+            .map(|p| p.stream_hints[0].offset)
+            .collect();
+        assert_eq!(oldest.len(), 2);
+        let before_in_flight = s.endpoint.cc.bytes_in_flight;
+        assert!(
+            s.endpoint.cc.can_send(),
+            "the window is open: cwnd is not what limits the probes"
+        );
+
+        s.on_timeout(Duration::from_secs(5));
+        assert_eq!(s.endpoint.loss.pto_count, 1);
+        let mut probes: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let out = s.pop_datagram();
+            if out.is_empty() {
+                break;
+            }
+            probes.push(out);
+        }
+        assert_eq!(
+            probes.len(),
+            usize::from(K_PTO_PROBES),
+            "two probes, not the flight"
+        );
+        let sent = &s.endpoint.loss.per_space[app as usize].sent_packets;
+        assert!(
+            in_flight_before.iter().all(|pn| sent.contains_key(pn)),
+            "the original flight is still in flight — nothing was declared lost"
+        );
+        let resent: Vec<u64> = sent
+            .values()
+            .rev()
+            .take(probes.len())
+            .map(|p| p.stream_hints[0].offset)
+            .collect();
+        assert_eq!(
+            resent.iter().rev().copied().collect::<Vec<_>>(),
+            oldest,
+            "the probes carry the oldest unacknowledged chunks"
+        );
+        assert_eq!(
+            s.endpoint.cc.bytes_in_flight,
+            before_in_flight + probes.iter().map(Vec::len).sum::<usize>() as u64,
+            "bytes_in_flight grows by exactly the probes"
+        );
+
+        // The peer acknowledges the probes: backoff reset, the packets between
+        // are declared lost by the packet threshold and requeued, and the
+        // timer is re-armed for what remains outstanding.
+        for p in &probes {
+            c.feed_datagram(p).expect("client feed");
+        }
+        let ack = c.pop_datagram();
+        assert!(!ack.is_empty());
+        s.feed_datagram(&ack).expect("server feed ack");
+        assert_eq!(s.endpoint.loss.pto_count, 0, "ack resets the backoff");
+        assert_eq!(s.endpoint.loss.probe_space(), None);
+        let timer = s.endpoint.loss.loss_detection_timer.expect("re-armed");
+        assert!(s.next_timeout().is_some_and(|t| t <= timer));
+        assert!(
+            s.endpoint.loss.has_ack_eliciting_in_flight(),
+            "the newest original packet is still outstanding"
+        );
+        assert!(!s.pop_datagram().is_empty(), "lost data is retransmitted");
+    }
+
+    /// RFC 9002 §6.2.2.1 — a client whose Initial was acknowledged but who
+    /// has no Handshake keys yet keeps a PTO armed with nothing in flight,
+    /// and its probe is a padded Initial: without it an amplification-limited
+    /// server whose reply was lost could never be unblocked.
+    #[test]
+    fn client_sends_anti_deadlock_probe_without_handshake_keys() {
+        let (mut c, _s) = loopback_pair();
+        let first = c.pop_datagram();
+        assert!(first.len() >= MIN_INITIAL_DATAGRAM);
+        // The server acknowledged the Initial (say, with an ACK-only
+        // Initial) but its ServerHello never arrived.
+        let now = c.now_since_start();
+        let acked =
+            c.endpoint
+                .loss
+                .on_ack_received(PnSpaceId::Initial, &[0..=0], Duration::ZERO, now);
+        assert_eq!(acked.len(), 1);
+        c.endpoint.cc.on_packets_acked(&acked);
+        assert!(!c.endpoint.loss.has_ack_eliciting_in_flight());
+        c.on_timeout(now);
+        let deadline = c
+            .endpoint
+            .loss
+            .loss_detection_timer
+            .expect("§6.2.2.1: the client keeps probing until the server validates it");
+        assert!(c.next_timeout().is_some_and(|t| t <= deadline));
+        c.on_timeout(deadline);
+        assert_eq!(c.endpoint.loss.probe_space(), Some(PnSpaceId::Initial));
+        let probe = c.pop_datagram();
+        assert!(first_packet_is_initial(&probe), "an Initial probe");
+        assert!(probe.len() >= MIN_INITIAL_DATAGRAM, "padded (§14.1)");
+        assert!(
+            c.endpoint
+                .loss
+                .space_has_ack_eliciting_in_flight(PnSpaceId::Initial),
+            "the probe is ack-eliciting"
+        );
+        assert!(c.pop_datagram().is_empty(), "one probe");
+    }
+
+    /// RFC 9002 §6.2.2.1 — a server at the RFC 9000 §8.1 anti-amplification
+    /// limit cannot send a probe, so its timer is not set; the next client
+    /// datagram replenishes the budget and re-arms it.
+    #[test]
+    fn server_pto_timer_waits_for_amplification_budget() {
+        let (mut c, mut s) = loopback_pair();
+        let dg = c.pop_datagram();
+        assert_eq!(dg.len(), 1200);
+        s.feed_datagram(&dg).expect("server feed");
+        // Budget: 3 × 1200. The reply and two PTO probes spend all of it.
+        assert_eq!(s.pop_datagram().len(), 1200);
+        for round in 0..2 {
+            let deadline = s.next_timeout().expect("PTO armed");
+            s.on_timeout(deadline);
+            assert_eq!(s.endpoint.loss.pto_count, round + 1);
+            assert_eq!(s.pop_datagram().len(), 1200, "probe {round}");
+        }
+        assert!(!s.active_path.can_send(1), "test premise: budget exhausted");
+        assert_eq!(
+            s.endpoint.loss.loss_detection_timer, None,
+            "no timer while a probe could not be sent"
+        );
+        // The client's own PTO re-sends its (padded) Initial, which
+        // replenishes the budget and re-arms the server's timer.
+        let c_deadline = c.next_timeout().expect("client PTO armed");
+        c.on_timeout(c_deadline);
+        let again = c.pop_datagram();
+        assert!(first_packet_is_initial(&again) && again.len() >= MIN_INITIAL_DATAGRAM);
+        s.feed_datagram(&again).expect("server feed");
+        assert!(s.active_path.can_send(1));
+        assert!(
+            s.endpoint.loss.loss_detection_timer.is_some(),
+            "re-armed once the budget allows a probe"
         );
     }
 }

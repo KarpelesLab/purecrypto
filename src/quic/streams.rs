@@ -535,11 +535,22 @@ impl Streams {
     }
 
     /// RFC 9001 §4.6 — the server rejected our 0-RTT. Every byte we sent in
-    /// 0-RTT packets must be retransmitted at the 1-RTT level; the send-side
-    /// bookkeeping already tracks carved-but-unacked chunks, so requeueing
-    /// them is the same operation a PTO performs.
+    /// 0-RTT packets must be retransmitted at the 1-RTT level: requeue every
+    /// sent-but-unconfirmed chunk so the next packet build re-emits it
+    /// (chunks whose ranges have meanwhile been acked are pruned by
+    /// `requeue_all_sent`; the receiver's reassembly drops duplicates).
     pub(crate) fn requeue_all_unacked(&mut self) {
-        self.on_pto();
+        for (&id, stream) in self.map.iter_mut() {
+            if let Some(send) = stream.send.as_mut()
+                && send.has_unacked()
+            {
+                send.requeue_all_sent();
+                if !self.ready_set.contains(&id) {
+                    self.ready_set.insert(id);
+                    self.ready_to_send.push_back(id);
+                }
+            }
+        }
     }
 
     /// Iterator over IDs of streams that can accept at least one byte now.
@@ -1404,26 +1415,6 @@ impl Streams {
         };
         if moved {
             self.enqueue_ready(id);
-        }
-    }
-
-    /// On PTO: requeue every sent-but-unconfirmed stream chunk so the
-    /// next packet build re-emits it. RFC 9002 §6.2.4 says to send a
-    /// probe; we retransmit all unacked stream data (chunks whose
-    /// ranges have meanwhile been acked are pruned by
-    /// `requeue_all_sent`). Duplicates are dropped by the receiver's
-    /// reassembly.
-    pub(crate) fn on_pto(&mut self) {
-        for (&id, stream) in self.map.iter_mut() {
-            if let Some(send) = stream.send.as_mut()
-                && send.has_unacked()
-            {
-                send.requeue_all_sent();
-                if !self.ready_set.contains(&id) {
-                    self.ready_set.insert(id);
-                    self.ready_to_send.push_back(id);
-                }
-            }
         }
     }
 
