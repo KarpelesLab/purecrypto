@@ -120,13 +120,17 @@ pub use algorithm::{
 pub use crate::dispatch_digest;
 pub use blake2::{
     Blake2b256, Blake2b384, Blake2b512, Blake2bMac, Blake2s256, Blake2sMac, Blake2xb,
-    Blake2xbReader, Blake2xs, Blake2xsReader, blake2b256, blake2b384, blake2b512, blake2s256,
+    Blake2xbReader, Blake2xs, Blake2xsReader, Error as Blake2Error, blake2b256, blake2b384,
+    blake2b512, blake2s256,
 };
 pub use blake3::{Blake3, Blake3Reader, blake3};
 pub use hmac::{
     Hmac, HmacSha224, HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256,
 };
-pub use k12::{KangarooTwelve, MarsupilamiFourteen, TurboShake128, TurboShake256, k12, m14};
+pub use k12::{
+    Error as TurboShakeError, KangarooTwelve, MarsupilamiFourteen, TurboShake128, TurboShake256,
+    k12, m14,
+};
 pub use keccak::KeccakReader;
 pub use kmac::{
     CShake128, CShake256, Kmac128, Kmac256, KmacXof128, KmacXof256, ParallelHash128,

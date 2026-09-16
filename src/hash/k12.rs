@@ -16,6 +16,27 @@
 
 use super::keccak::{Keccak, KeccakReader};
 
+/// Error returned by [`TurboShake128::try_new`] / [`TurboShake256::try_new`]
+/// when the domain-separation byte is outside `0x01..=0x7F`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// The domain byte is `0x00` or has its top bit set. TurboSHAKE requires
+    /// `0x01..=0x7F`: the top bit of the final block byte is the pad10*1
+    /// terminator, and `0x00` would leave no domain separation at all.
+    InvalidDomain,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::InvalidDomain => f.write_str("TurboSHAKE domain must be in 0x01..=0x7F"),
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
 const TS128_RATE: usize = 168;
 const TS256_RATE: usize = 136;
 const ROUNDS: usize = 12;
@@ -43,16 +64,23 @@ macro_rules! turboshake {
             /// (`0x01..=0x7F`).
             ///
             /// # Panics
-            /// Panics if `domain` is outside `0x01..=0x7F`.
+            /// Panics if `domain` is outside `0x01..=0x7F`. See
+            /// [`try_new`](Self::try_new) for the fallible form.
             pub fn new(domain: u8) -> Self {
-                assert!(
-                    (0x01..=0x7F).contains(&domain),
-                    "TurboSHAKE domain must be in 0x01..=0x7F"
-                );
-                $name {
+                Self::try_new(domain)
+                    .unwrap_or_else(|_| panic!("TurboSHAKE domain must be in 0x01..=0x7F"))
+            }
+
+            /// Fallible [`new`](Self::new): returns [`Error::InvalidDomain`]
+            /// instead of panicking when `domain` is outside `0x01..=0x7F`.
+            pub fn try_new(domain: u8) -> Result<Self, Error> {
+                if !(0x01..=0x7F).contains(&domain) {
+                    return Err(Error::InvalidDomain);
+                }
+                Ok($name {
                     keccak: Keccak::with_rounds($rate, ROUNDS),
                     domain,
-                }
+                })
             }
             /// Feeds input.
             pub fn update(&mut self, data: &[u8]) {
@@ -366,6 +394,39 @@ mod tests {
     use super::*;
     use crate::hash::XofReader;
     use crate::test_util::from_hex;
+
+    /// `try_new` reports a domain byte outside `0x01..=0x7F`; for a valid
+    /// one it squeezes the same stream as `new`.
+    #[test]
+    fn turboshake_try_new_rejects_bad_domain_and_matches_infallible() {
+        for bad in [0x00u8, 0x80, 0xFF] {
+            assert_eq!(
+                TurboShake128::try_new(bad).err(),
+                Some(Error::InvalidDomain),
+                "{bad:#04x}"
+            );
+            assert_eq!(
+                TurboShake256::try_new(bad).err(),
+                Some(Error::InvalidDomain),
+                "{bad:#04x}"
+            );
+        }
+        let mut a = [0u8; 40];
+        let mut b = [0u8; 40];
+        let mut x = TurboShake128::new(0x1F);
+        x.update(b"msg");
+        x.finalize_into(&mut a);
+        let mut x = TurboShake128::try_new(0x1F).unwrap();
+        x.update(b"msg");
+        x.finalize_into(&mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    #[should_panic(expected = "domain must be in 0x01..=0x7F")]
+    fn turboshake_new_bad_domain_still_panics() {
+        let _ = TurboShake256::new(0x80);
+    }
 
     /// `input[i] = i % 251`, the KangarooTwelve test pattern.
     fn ptn(buf: &mut [u8]) {

@@ -7,6 +7,34 @@
 use super::{Digest, Mac};
 use crate::ct::{Choice, ConstantTimeEq};
 
+/// Error returned by the fallible BLAKE2 constructors ([`Blake2bMac::try_new`],
+/// [`Blake2sMac::try_new`], [`Blake2xb::try_new`], [`Blake2xs::try_new`], …)
+/// when a caller-chosen parameter is outside what RFC 7693 allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// The output length is zero or exceeds the variant's maximum (64 bytes
+    /// for BLAKE2b, 32 for BLAKE2s, `u32::MAX` / `u16::MAX` for the
+    /// BLAKE2Xb / BLAKE2Xs XOF length field).
+    InvalidOutputLength,
+    /// The key exceeds half a block (64 bytes for BLAKE2b, 32 for BLAKE2s;
+    /// RFC 7693 §2.5).
+    KeyTooLong,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::InvalidOutputLength => {
+                f.write_str("BLAKE2 output length outside the variant's range")
+            }
+            Error::KeyTooLong => f.write_str("BLAKE2 key longer than half a block"),
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
 /// Message-word schedule (12 rounds). BLAKE2b uses all 12; BLAKE2s uses the
 /// first 10.
 #[rustfmt::skip]
@@ -571,18 +599,28 @@ impl Blake2bMac {
     /// a longer key would wrap the parameter-block length field and panic
     /// out-of-bounds while padding the key block.
     pub fn new(key: &[u8], out_len: usize) -> Self {
-        assert!(
-            (1..=64).contains(&out_len),
-            "Blake2bMac out_len must be in 1..=64 (RFC 7693 §2.5)",
-        );
-        assert!(
-            key.len() <= 64,
-            "Blake2bMac key must be <= 64 bytes (RFC 7693 §2.5)",
-        );
-        Blake2bMac {
+        Self::try_new(key, out_len).unwrap_or_else(|e| match e {
+            Error::InvalidOutputLength => {
+                panic!("Blake2bMac out_len must be in 1..=64 (RFC 7693 §2.5)")
+            }
+            _ => panic!("Blake2bMac key must be <= 64 bytes (RFC 7693 §2.5)"),
+        })
+    }
+
+    /// Fallible [`new`](Self::new): returns [`Error::InvalidOutputLength`]
+    /// for `out_len` outside `1..=64` and [`Error::KeyTooLong`] for a key
+    /// over 64 bytes, instead of panicking.
+    pub fn try_new(key: &[u8], out_len: usize) -> Result<Self, Error> {
+        if !(1..=64).contains(&out_len) {
+            return Err(Error::InvalidOutputLength);
+        }
+        if key.len() > 64 {
+            return Err(Error::KeyTooLong);
+        }
+        Ok(Blake2bMac {
             state: Blake2bState::with_key(out_len, key),
             out_len,
-        }
+        })
     }
 
     /// Unkeyed BLAKE2b with variable `out_len` (1..=64). Equivalent to
@@ -592,14 +630,20 @@ impl Blake2bMac {
     /// # Panics
     /// Panics if `out_len` is 0 or > 64.
     pub fn new_unkeyed(out_len: usize) -> Self {
-        assert!(
-            (1..=64).contains(&out_len),
-            "Blake2bMac out_len must be in 1..=64 (RFC 7693 §2.5)",
-        );
-        Blake2bMac {
+        Self::try_new_unkeyed(out_len)
+            .unwrap_or_else(|_| panic!("Blake2bMac out_len must be in 1..=64 (RFC 7693 §2.5)"))
+    }
+
+    /// Fallible [`new_unkeyed`](Self::new_unkeyed): returns
+    /// [`Error::InvalidOutputLength`] for `out_len` outside `1..=64`.
+    pub fn try_new_unkeyed(out_len: usize) -> Result<Self, Error> {
+        if !(1..=64).contains(&out_len) {
+            return Err(Error::InvalidOutputLength);
+        }
+        Ok(Blake2bMac {
             state: Blake2bState::new(out_len),
             out_len,
-        }
+        })
     }
     /// Feeds message bytes.
     pub fn update(&mut self, data: &[u8]) {
@@ -673,18 +717,28 @@ impl Blake2sMac {
     /// half a block (32 bytes); a longer key would wrap the parameter-block
     /// length field and panic out-of-bounds while padding the key block.
     pub fn new(key: &[u8], out_len: usize) -> Self {
-        assert!(
-            (1..=32).contains(&out_len),
-            "Blake2sMac out_len must be in 1..=32 (RFC 7693 §2.5)",
-        );
-        assert!(
-            key.len() <= 32,
-            "Blake2sMac key must be <= 32 bytes (RFC 7693 §2.5)",
-        );
-        Blake2sMac {
+        Self::try_new(key, out_len).unwrap_or_else(|e| match e {
+            Error::InvalidOutputLength => {
+                panic!("Blake2sMac out_len must be in 1..=32 (RFC 7693 §2.5)")
+            }
+            _ => panic!("Blake2sMac key must be <= 32 bytes (RFC 7693 §2.5)"),
+        })
+    }
+
+    /// Fallible [`new`](Self::new): returns [`Error::InvalidOutputLength`]
+    /// for `out_len` outside `1..=32` and [`Error::KeyTooLong`] for a key
+    /// over 32 bytes, instead of panicking.
+    pub fn try_new(key: &[u8], out_len: usize) -> Result<Self, Error> {
+        if !(1..=32).contains(&out_len) {
+            return Err(Error::InvalidOutputLength);
+        }
+        if key.len() > 32 {
+            return Err(Error::KeyTooLong);
+        }
+        Ok(Blake2sMac {
             state: Blake2sState::with_key(out_len, key),
             out_len,
-        }
+        })
     }
     /// Feeds message bytes.
     pub fn update(&mut self, data: &[u8]) {
@@ -765,15 +819,27 @@ impl Blake2xb {
     /// Panics if `out_len` is 0 or exceeds `u32::MAX` (the width of the XOF
     /// length field in the BLAKE2 parameter block).
     pub fn new(out_len: usize) -> Self {
-        assert!(out_len > 0, "Blake2xb output length must be > 0");
-        let xof_len = u32::try_from(out_len)
-            .expect("Blake2xb output length must fit in the 32-bit XOF length field");
-        Blake2xb {
+        Self::try_new(out_len).unwrap_or_else(|_| {
+            if out_len == 0 {
+                panic!("Blake2xb output length must be > 0")
+            }
+            panic!("Blake2xb output length must fit in the 32-bit XOF length field")
+        })
+    }
+
+    /// Fallible [`new`](Self::new): returns [`Error::InvalidOutputLength`]
+    /// when `out_len` is 0 or exceeds `u32::MAX`, instead of panicking.
+    pub fn try_new(out_len: usize) -> Result<Self, Error> {
+        if out_len == 0 {
+            return Err(Error::InvalidOutputLength);
+        }
+        let xof_len = u32::try_from(out_len).map_err(|_| Error::InvalidOutputLength)?;
+        Ok(Blake2xb {
             state: Blake2bState::from_h(iv_from_param_b(&param_b(
                 64, 0, 1, 1, 0, 0, xof_len, 0, 0,
             ))),
             xof_len,
-        }
+        })
     }
     /// Feeds input.
     pub fn update(&mut self, data: &[u8]) {
@@ -873,15 +939,27 @@ impl Blake2xs {
     /// Panics if `out_len` is 0 or exceeds `u16::MAX` (the width of the XOF
     /// length field in the BLAKE2s parameter block).
     pub fn new(out_len: usize) -> Self {
-        assert!(out_len > 0, "Blake2xs output length must be > 0");
-        let xof_len = u16::try_from(out_len)
-            .expect("Blake2xs output length must fit in the 16-bit XOF length field");
-        Blake2xs {
+        Self::try_new(out_len).unwrap_or_else(|_| {
+            if out_len == 0 {
+                panic!("Blake2xs output length must be > 0")
+            }
+            panic!("Blake2xs output length must fit in the 16-bit XOF length field")
+        })
+    }
+
+    /// Fallible [`new`](Self::new): returns [`Error::InvalidOutputLength`]
+    /// when `out_len` is 0 or exceeds `u16::MAX`, instead of panicking.
+    pub fn try_new(out_len: usize) -> Result<Self, Error> {
+        if out_len == 0 {
+            return Err(Error::InvalidOutputLength);
+        }
+        let xof_len = u16::try_from(out_len).map_err(|_| Error::InvalidOutputLength)?;
+        Ok(Blake2xs {
             state: Blake2sState::from_h(iv_from_param_s(&param_s(
                 32, 0, 1, 1, 0, 0, xof_len, 0, 0,
             ))),
             xof_len,
-        }
+        })
     }
     /// Feeds input.
     pub fn update(&mut self, data: &[u8]) {
@@ -960,6 +1038,89 @@ impl Drop for Blake2xsReader {
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
+
+    /// The fallible constructors report out-of-range output lengths and
+    /// over-long keys as errors; for valid parameters they build the same
+    /// state as the panicking forms (same tag / same XOF stream).
+    #[test]
+    fn try_constructors_report_errors_and_match_infallible() {
+        assert_eq!(
+            Blake2bMac::try_new(b"k", 0).err(),
+            Some(Error::InvalidOutputLength)
+        );
+        assert_eq!(
+            Blake2bMac::try_new(b"k", 65).err(),
+            Some(Error::InvalidOutputLength)
+        );
+        assert_eq!(
+            Blake2bMac::try_new(&[0u8; 65], 32).err(),
+            Some(Error::KeyTooLong)
+        );
+        assert_eq!(
+            Blake2bMac::try_new_unkeyed(65).err(),
+            Some(Error::InvalidOutputLength)
+        );
+        assert_eq!(
+            Blake2sMac::try_new(b"k", 33).err(),
+            Some(Error::InvalidOutputLength)
+        );
+        assert_eq!(
+            Blake2sMac::try_new(&[0u8; 33], 16).err(),
+            Some(Error::KeyTooLong)
+        );
+        assert_eq!(Blake2xb::try_new(0).err(), Some(Error::InvalidOutputLength));
+        assert_eq!(Blake2xs::try_new(0).err(), Some(Error::InvalidOutputLength));
+        assert_eq!(
+            Blake2xs::try_new(usize::from(u16::MAX) + 1).err(),
+            Some(Error::InvalidOutputLength)
+        );
+
+        let mut a = [0u8; 40];
+        let mut b = [0u8; 40];
+        let mut m = Blake2bMac::new(b"key", 40);
+        m.update(b"msg");
+        m.finalize_into(&mut a);
+        let mut m = Blake2bMac::try_new(b"key", 40).unwrap();
+        m.update(b"msg");
+        m.finalize_into(&mut b);
+        assert_eq!(a, b);
+
+        let mut a = [0u8; 24];
+        let mut b = [0u8; 24];
+        let mut m = Blake2sMac::new(b"key", 24);
+        m.update(b"msg");
+        m.finalize_into(&mut a);
+        let mut m = Blake2sMac::try_new(b"key", 24).unwrap();
+        m.update(b"msg");
+        m.finalize_into(&mut b);
+        assert_eq!(a, b);
+
+        let mut a = [0u8; 100];
+        let mut b = [0u8; 100];
+        let mut x = Blake2xb::new(100);
+        x.update(b"msg");
+        x.finalize_into(&mut a);
+        let mut x = Blake2xb::try_new(100).unwrap();
+        x.update(b"msg");
+        x.finalize_into(&mut b);
+        assert_eq!(a[..], b[..]);
+
+        let mut a = [0u8; 70];
+        let mut b = [0u8; 70];
+        let mut x = Blake2xs::new(70);
+        x.update(b"msg");
+        x.finalize_into(&mut a);
+        let mut x = Blake2xs::try_new(70).unwrap();
+        x.update(b"msg");
+        x.finalize_into(&mut b);
+        assert_eq!(a[..], b[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out_len must be in 1..=64")]
+    fn blake2b_mac_bad_out_len_still_panics() {
+        let _ = Blake2bMac::new(b"k", 65);
+    }
 
     // RFC 7693 Appendix A/E reference vectors for "abc".
     #[test]
