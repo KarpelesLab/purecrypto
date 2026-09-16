@@ -1,6 +1,6 @@
 //! C ABI for HKDF, PBKDF2, scrypt, and Argon2.
 
-use super::common::{PcStatus, guard, slice, wipe_array};
+use super::common::{PcStatus, guard, slice, slice_mut, wipe_array};
 use super::hash::id;
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::kdf::argon2::{Argon2Params, Argon2Type, argon2};
@@ -63,19 +63,14 @@ pub unsafe extern "C" fn pc_kbkdf_counter(
         ) else {
             return PcStatus::NullPointer;
         };
-        if out.is_null() && out_len > 0 {
+        let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
-        }
+        };
         if let Some(want) = kbkdf_cmac_key_len(prf)
             && ki.len() != want
         {
             return PcStatus::Unsupported;
         }
-        let buf = if out_len == 0 {
-            &mut [][..]
-        } else {
-            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
-        };
         fn run<P: Prf>(ki: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) -> PcStatus {
             match kbkdf_counter::<P>(ki, label, context, out) {
                 Ok(()) => PcStatus::Ok,
@@ -122,19 +117,14 @@ pub unsafe extern "C" fn pc_kbkdf_feedback(
         ) else {
             return PcStatus::NullPointer;
         };
-        if out.is_null() && out_len > 0 {
+        let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
-        }
+        };
         if let Some(want) = kbkdf_cmac_key_len(prf)
             && ki.len() != want
         {
             return PcStatus::Unsupported;
         }
-        let buf = if out_len == 0 {
-            &mut [][..]
-        } else {
-            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
-        };
         fn run<P: Prf>(
             ki: &[u8],
             iv: &[u8],
@@ -183,13 +173,8 @@ pub unsafe extern "C" fn pc_hkdf(
         ) else {
             return PcStatus::NullPointer;
         };
-        if out.is_null() && out_len > 0 {
+        let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
-        }
-        let buf = if out_len == 0 {
-            &mut [][..]
-        } else {
-            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
         };
         match hash {
             id::SHA256 => hkdf::<Sha256>(s, k, i, buf),
@@ -222,17 +207,12 @@ pub unsafe extern "C" fn pc_pbkdf2(
         }) else {
             return PcStatus::NullPointer;
         };
-        if out.is_null() && out_len > 0 {
+        let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
-        }
+        };
         if iterations == 0 {
             return PcStatus::Unsupported;
         }
-        let buf = if out_len == 0 {
-            &mut [][..]
-        } else {
-            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
-        };
         match hash {
             id::SHA256 => pbkdf2::<Sha256>(p, s, iterations, buf),
             id::SHA384 => pbkdf2::<Sha384>(p, s, iterations, buf),
@@ -287,9 +267,9 @@ pub unsafe extern "C" fn pc_scrypt(
         }) else {
             return PcStatus::NullPointer;
         };
-        if out.is_null() && out_len > 0 {
+        let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
-        }
+        };
         if n == 0 || !n.is_power_of_two() || r == 0 {
             return PcStatus::Unsupported;
         }
@@ -309,11 +289,6 @@ pub unsafe extern "C" fn pc_scrypt(
             return PcStatus::Unsupported;
         }
         let log_n = n.trailing_zeros() as u8;
-        let buf = if out_len == 0 {
-            &mut [][..]
-        } else {
-            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
-        };
         match scrypt(pw, s, log_n, r, p, buf) {
             Ok(()) => PcStatus::Ok,
             Err(_) => {
@@ -356,9 +331,9 @@ pub unsafe extern "C" fn pc_argon2(
         }) else {
             return PcStatus::NullPointer;
         };
-        if out.is_null() && out_len > 0 {
+        let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
-        }
+        };
         // Argon2 allocates `m_cost · 1024` bytes; reject before dispatch so an
         // oversized request is a status code, not a `handle_alloc_error` abort
         // that `guard` cannot catch. The `usize` conversion additionally keeps
@@ -381,11 +356,6 @@ pub unsafe extern "C" fn pc_argon2(
             parallelism,
             variant,
             version: 0x13,
-        };
-        let buf = if out_len == 0 {
-            &mut [][..]
-        } else {
-            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
         };
         match argon2(&params, pw, s, &[], &[], buf) {
             Ok(()) => PcStatus::Ok,

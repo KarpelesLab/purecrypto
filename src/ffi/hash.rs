@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, slice_mut};
 use crate::ascon::{AsconCxof128, AsconHash256, AsconXof128};
 use crate::hash::{
     Digest, ExtendableOutput, HashAlgorithm, Hasher, Hmac, HmacSha224, HmacSha256, HmacSha384,
@@ -254,13 +254,8 @@ pub unsafe extern "C" fn pc_ascon_xof(
         let Some(input) = (unsafe { slice(data, data_len) }) else {
             return PcStatus::NullPointer;
         };
-        if out.is_null() && out_len > 0 {
+        let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
-        }
-        let buf = if out_len == 0 {
-            &mut [][..]
-        } else {
-            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
         };
         let mut x = AsconXof128::new();
         x.update(input);
@@ -293,13 +288,8 @@ pub unsafe extern "C" fn pc_ascon_cxof(
         if z.len() > AsconCxof128::MAX_CUSTOMIZATION_LEN {
             return PcStatus::Unsupported;
         }
-        if out.is_null() && out_len > 0 {
+        let Some(buf) = (unsafe { slice_mut(out, out_len) }) else {
             return PcStatus::NullPointer;
-        }
-        let buf = if out_len == 0 {
-            &mut [][..]
-        } else {
-            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
         };
         AsconCxof128::xof(z, input, buf);
         PcStatus::Ok

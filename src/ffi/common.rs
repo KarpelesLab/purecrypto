@@ -96,6 +96,32 @@ pub(super) unsafe fn slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     Some(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
+/// Borrows `len` writable bytes at `ptr` as a mutable slice — the output
+/// counterpart of [`slice`], with the same screening: a zero length yields an
+/// empty slice (even if `ptr` is NULL), a NULL pointer with non-zero length,
+/// a length above `isize::MAX`, or a `ptr + len` that wraps the address space
+/// all yield `None`. Used by the entry points whose `out_len` is a requested
+/// length rather than an in/out capacity (the KDFs, XOFs, `pc_rand_bytes`),
+/// so a negative `ssize_t` widened to `size_t` is a status code and not an
+/// unbounded write.
+///
+/// # Safety
+/// `ptr` must point to `len` writable bytes that outlive the call, and no
+/// other reference to them may be live while the slice is.
+pub(super) unsafe fn slice_mut<'a>(ptr: *mut u8, len: usize) -> Option<&'a mut [u8]> {
+    if len == 0 {
+        return Some(&mut []);
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    if len > isize::MAX as usize {
+        return None;
+    }
+    (ptr as usize).checked_add(len)?;
+    Some(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
+}
+
 /// Copies `data` into the caller's `out` buffer using the in/out length
 /// convention: `*out_len` holds the buffer capacity on entry and is always set
 /// to the required length on return. Returns [`PcStatus::BufferTooSmall`] (with
@@ -193,5 +219,26 @@ mod tests {
         // ptr + len wraps the address space.
         let high = usize::MAX - 8;
         assert_eq!(unsafe { super::slice(high as *const u8, 64) }, None);
+    }
+
+    /// The output-side helper must apply the same screening: a C caller
+    /// passing `(size_t)-1` as a requested output length must get a status
+    /// code, not a slice the KDF then writes through.
+    #[test]
+    fn slice_mut_rejects_oversized_and_wrapping_lengths() {
+        let mut buf = [1u8, 2, 3];
+        assert_eq!(
+            unsafe { super::slice_mut(buf.as_mut_ptr(), 3) }.map(|s| s.len()),
+            Some(3)
+        );
+        assert_eq!(
+            unsafe { super::slice_mut(core::ptr::null_mut(), 0) }.map(|s| s.len()),
+            Some(0)
+        );
+        assert!(unsafe { super::slice_mut(core::ptr::null_mut(), 1) }.is_none());
+        assert!(unsafe { super::slice_mut(buf.as_mut_ptr(), usize::MAX) }.is_none());
+        assert!(unsafe { super::slice_mut(buf.as_mut_ptr(), isize::MAX as usize + 1) }.is_none());
+        let high = usize::MAX - 8;
+        assert!(unsafe { super::slice_mut(high as *mut u8, 64) }.is_none());
     }
 }

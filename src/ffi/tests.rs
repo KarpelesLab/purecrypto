@@ -155,6 +155,39 @@ fn rand_fills() {
     assert!(buf.iter().any(|&b| b != 0));
 }
 
+/// A requested output length a C caller can produce by accident (a negative
+/// `ssize_t` widened to `size_t`) must be refused with a status code by the
+/// entry points whose `out_len` is a plain length, not an in/out capacity —
+/// the same screening the input-side `slice` helper already applies. Before
+/// `slice_mut` these built a `from_raw_parts_mut` slice straight from the
+/// caller's length and wrote through it.
+#[test]
+fn requested_output_lengths_are_screened() {
+    let mut buf = [0u8; 32];
+    let st = unsafe { super::rng::pc_rand_bytes(buf.as_mut_ptr(), usize::MAX) };
+    assert_eq!(st, PcStatus::NullPointer);
+    // A zero length is fine even with a NULL buffer (nothing is written).
+    let st = unsafe { super::rng::pc_rand_bytes(core::ptr::null_mut(), 0) };
+    assert_eq!(st, PcStatus::Ok);
+    let st = unsafe {
+        kdf::pc_hkdf(
+            hash::id::SHA256,
+            core::ptr::null(),
+            0,
+            buf.as_ptr(),
+            buf.len(),
+            core::ptr::null(),
+            0,
+            buf.as_mut_ptr(),
+            isize::MAX as usize + 1,
+        )
+    };
+    assert_eq!(st, PcStatus::NullPointer);
+    let st = unsafe { hash::pc_ascon_xof(buf.as_ptr(), buf.len(), buf.as_mut_ptr(), usize::MAX) };
+    assert_eq!(st, PcStatus::NullPointer);
+    assert!(buf.iter().all(|&b| b == 0), "nothing may be written");
+}
+
 #[test]
 fn ec_generate_sign_verify() {
     let key = ec::pc_ec_generate(ec::curve::P256);
