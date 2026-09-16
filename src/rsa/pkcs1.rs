@@ -328,6 +328,95 @@ mod tests {
         );
     }
 
+    /// RFC 8017 §8.2.2 step 4 requires comparing the *whole* encoded message
+    /// `EM' = 0x00 ‖ 0x01 ‖ PS ‖ 0x00 ‖ T` against the recovered one. A
+    /// verifier that instead parses `EM` — skips the `0xFF` run, finds the
+    /// `0x00`, then only checks that `T` follows — accepts encodings with a
+    /// short `PS` and trailing garbage after `T`, which is exactly what makes
+    /// the Bleichenbacher `e = 3` cube-root forgery (2006) and its `DigestInfo`
+    /// parameter variants (CVE-2006-4339 and successors) work. This pins the
+    /// strict behaviour: every malformed `EM` below is signed with the real
+    /// private key (so the signature is a perfectly valid RSA representative
+    /// of that `EM`) and must still be refused, while a canonical `EM`
+    /// assembled the same way is accepted.
+    #[test]
+    fn pkcs1v15_verify_rejects_malformed_encodings() {
+        use crate::bignum::Uint;
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let msg = b"strict EMSA-PKCS1-v1_5 comparison";
+        let k = 256usize;
+        let t: Vec<u8> = [
+            <Sha256 as Pkcs1Digest>::DIGEST_INFO_PREFIX,
+            Sha256::digest(msg).as_ref(),
+        ]
+        .concat();
+        let ps_len = k - t.len() - 3;
+
+        // Signs an arbitrary `k`-octet encoded message with the private key.
+        let sign_em = |em: &[u8]| -> Vec<u8> {
+            assert_eq!(em.len(), k);
+            assert_eq!(em[0], 0x00, "EM must be < n");
+            let mut out = alloc::vec![0u8; k];
+            key.raw(&Uint::<32>::from_be_bytes(em))
+                .write_be_bytes(&mut out);
+            out
+        };
+
+        // Canonical: 00 01 FF…FF 00 T — must verify (proves the harness).
+        let canonical = [&[0x00, 0x01][..], &alloc::vec![0xffu8; ps_len], &[0x00], &t].concat();
+        pk.verify_pkcs1v15::<Sha256>(msg, &sign_em(&canonical))
+            .unwrap();
+
+        let garbage = alloc::vec![0x42u8; ps_len - 8];
+        let malformed: [(&str, Vec<u8>); 5] = [
+            (
+                "short PS + trailing garbage after T (Bleichenbacher '06 shape)",
+                [&[0x00, 0x01][..], &[0xff; 8], &[0x00], &t, &garbage].concat(),
+            ),
+            (
+                "T followed by a single trailing octet",
+                [
+                    &[0x00, 0x01][..],
+                    &alloc::vec![0xffu8; ps_len - 1],
+                    &[0x00],
+                    &t,
+                    &[0x00],
+                ]
+                .concat(),
+            ),
+            ("non-0xFF octet inside PS", {
+                let mut em = canonical.clone();
+                em[2 + ps_len / 2] = 0xfe;
+                em
+            }),
+            ("block type 0x02 instead of 0x01", {
+                let mut em = canonical.clone();
+                em[1] = 0x02;
+                em
+            }),
+            (
+                "PS shorter than 8 octets padded with zeros before T",
+                [
+                    &[0x00, 0x01][..],
+                    &[0xff; 7],
+                    &[0x00],
+                    &alloc::vec![0u8; ps_len - 7],
+                    &t,
+                ]
+                .concat(),
+            ),
+        ];
+        for (what, em) in &malformed {
+            assert_eq!(em.len(), k, "{what}");
+            assert_eq!(
+                pk.verify_pkcs1v15::<Sha256>(msg, &sign_em(em)),
+                Err(Error::Verification),
+                "{what} must be rejected"
+            );
+        }
+    }
+
     // ---- RSA-2: implicit-rejection (decrypt_pkcs1v15_session) ----
 
     /// Round-trip: a real PKCS#1 v1.5 ciphertext decrypts to its original
