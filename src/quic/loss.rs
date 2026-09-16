@@ -73,6 +73,10 @@ pub(crate) struct SentPacket {
     /// confirms the ranges (pruning the sender's retransmission state);
     /// on loss, it queues them for retransmission.
     pub(crate) stream_hints: Vec<StreamHint>,
+    /// True if this packet carried the server's HANDSHAKE_DONE frame
+    /// (RFC 9000 §19.20). The connection re-queues the frame if the packet
+    /// is declared lost before any copy of it is acknowledged.
+    pub(crate) handshake_done: bool,
 }
 
 /// One STREAM frame's `(id, offset, length, fin)` as carried by a sent
@@ -880,6 +884,7 @@ mod tests {
             time_sent,
             retransmit_hint: Vec::new(),
             stream_hints: Vec::new(),
+            handshake_done: false,
         }
     }
 

@@ -837,6 +837,19 @@ pub struct QuicConnection {
     /// keyed" from "keyed, then discarded on handshake completion" (RFC 9001
     /// §4.9.1) so a later Initial can never be mistaken for the first one.
     initial_keys_installed: bool,
+    /// RFC 9001 §4.1.2 — the handshake is *confirmed*: at the server once
+    /// it completes, at the client once a HANDSHAKE_DONE frame arrives.
+    /// Gates key updates (RFC 9001 §6.2) and the discard of Handshake keys
+    /// (§4.9.2).
+    handshake_confirmed: bool,
+    /// Server-only — a HANDSHAKE_DONE frame is owed to the peer: set when
+    /// the handshake completes (RFC 9001 §4.1.2 "MUST send ... as soon as
+    /// the handshake is complete") and again when the packet carrying it is
+    /// declared lost or probed for.
+    handshake_done_pending: bool,
+    /// Server-only — some packet carrying HANDSHAKE_DONE was acknowledged;
+    /// later losses of other copies need no retransmission.
+    handshake_done_acked: bool,
 }
 
 enum EngineSide {
@@ -879,6 +892,9 @@ pub(crate) struct PacketMeta {
     /// [`SentPacket`] so the ack path can confirm the ranges and the
     /// loss path can queue them for retransmission.
     pub(crate) stream_hints: Vec<StreamHint>,
+    /// True if this packet carries the server's HANDSHAKE_DONE frame
+    /// (RFC 9000 §19.20), so loss recovery can re-queue it.
+    pub(crate) handshake_done: bool,
 }
 
 /// Rejects locally-advertised transport parameters that QUIC v1 forbids.
@@ -1046,6 +1062,9 @@ impl QuicConnection {
             reset_token_pinned: false,
             require_client_auth: false,
             initial_keys_installed: false,
+            handshake_confirmed: false,
+            handshake_done_pending: false,
+            handshake_done_acked: false,
         };
 
         // RFC 9001 §4.6.1 — with 0-RTT in play the client must apply the
@@ -1178,6 +1197,9 @@ impl QuicConnection {
             reset_token_pinned,
             require_client_auth,
             initial_keys_installed: false,
+            handshake_confirmed: false,
+            handshake_done_pending: false,
+            handshake_done_acked: false,
         })
     }
 
@@ -1964,6 +1986,9 @@ impl QuicConnection {
             if self.handshake_complete && !self.new_cids_issued {
                 return true;
             }
+            if self.handshake_done_pending {
+                return true;
+            }
             // Phase 8 — DATAGRAM frames awaiting transmission.
             if !self.datagram_queues.outbound.is_empty() {
                 return true;
@@ -2099,6 +2124,18 @@ impl QuicConnection {
         }
     }
 
+    /// RFC 9000 §19.20 / §13.3 — HANDSHAKE_DONE is retransmitted until some
+    /// copy is acknowledged: an acked carrier settles it for good, a lost
+    /// carrier re-queues it unless one was already acked.
+    fn note_handshake_done_fate(&mut self, acked: &[SentPacket], lost: &[SentPacket]) {
+        if acked.iter().any(|p| p.handshake_done) {
+            self.handshake_done_acked = true;
+        }
+        if !self.handshake_done_acked && lost.iter().any(|p| p.handshake_done) {
+            self.handshake_done_pending = true;
+        }
+    }
+
     /// Feeds a batch of newly-declared-lost packets to congestion control and
     /// re-queues the bytes they carried. Mirrors steps 5, 6 and 6b of the ACK
     /// handler, for the timer-driven path which has no `Result` to propagate.
@@ -2114,6 +2151,7 @@ impl QuicConnection {
                 let _ = self.requeue_from_hint(&pkt.retransmit_hint);
             }
         }
+        self.note_handshake_done_fate(&[], lost);
         if let Some(streams) = self.streams.as_mut() {
             for pkt in lost {
                 for h in &pkt.stream_hints {
@@ -2228,6 +2266,17 @@ impl QuicConnection {
             // receiver's reassembly drops duplicates.
             if let Some(streams) = self.streams.as_mut() {
                 streams.on_pto();
+            }
+            // RFC 9002 §6.2.4 — an unacknowledged HANDSHAKE_DONE rides the
+            // probe: a client that never receives it never confirms the
+            // handshake (RFC 9001 §4.1.2).
+            if !self.handshake_done_acked
+                && self.endpoint.loss.per_space[PnSpaceId::Application as usize]
+                    .sent_packets
+                    .values()
+                    .any(|p| p.handshake_done)
+            {
+                self.handshake_done_pending = true;
             }
         }
         // RFC 9000 §10.1: if the negotiated idle timeout has elapsed since the
@@ -3178,7 +3227,10 @@ impl QuicConnection {
     /// `Self::commit_rx_key_phase_flip` — no application call is
     /// needed for that direction.
     pub fn initiate_key_update(&mut self) -> Result<(), Error> {
-        if self.closed || !self.handshake_complete {
+        // RFC 9001 §6.2: "An endpoint MUST NOT initiate a key update prior
+        // to having confirmed the handshake" — for a client that means having
+        // received HANDSHAKE_DONE, not merely having completed TLS.
+        if self.closed || !self.handshake_confirmed {
             return Err(Error::InappropriateState);
         }
         let lk = self.endpoint.crypto.at(Level::OneRtt);
@@ -4026,6 +4078,13 @@ impl QuicConnection {
         if engine_done && keys_done && !self.handshake_complete {
             self.handshake_complete = true;
             self.endpoint.handshake_complete = true;
+            // RFC 9001 §4.1.2: the server considers the handshake confirmed
+            // as soon as it completes, and MUST then send HANDSHAKE_DONE; the
+            // client confirms on receiving that frame (`Frame::HandshakeDone`).
+            if self.role == Role::Server {
+                self.handshake_confirmed = true;
+                self.handshake_done_pending = true;
+            }
             // Disarm the PTO: handshake is done, nothing to retransmit.
             self.endpoint.loss.disarm();
             // RFC 9001 §4.9 — discard finished encryption levels now that the
@@ -4078,9 +4137,8 @@ impl QuicConnection {
     /// longer requeue them), and clear the matching loss-recovery / PN-space
     /// bookkeeping.
     ///
-    /// Which levels are safe to discard is role-dependent, because this engine
-    /// does not implement the HANDSHAKE_DONE *confirmation* signal (RFC 9001
-    /// §4.9.2):
+    /// Which levels are safe to discard here is role-dependent (RFC 9001
+    /// §4.9.2 ties the Handshake discard to *confirmation*):
     ///
     /// * **Server** — completion means it has received the client's Finished,
     ///   so the Initial and Handshake levels are both finished for good.
@@ -4092,16 +4150,28 @@ impl QuicConnection {
     ///   Finished (a Handshake-level CRYPTO) may still be in flight and need
     ///   PTO retransmission until the server acknowledges it. Discarding the
     ///   Handshake keys here would strand a lost client Finished and hang the
-    ///   server, so the client discards only the Initial level. Discarding
-    ///   Initial is always safe once Handshake keys exist (RFC 9001 §4.9.1)
-    ///   and makes the client drop any stale retransmitted server Initial via
-    ///   the rx-key `None` branch in `feed_long_header_packet`.
+    ///   server, so the client discards only the Initial level now and the
+    ///   Handshake level when the server's HANDSHAKE_DONE confirms the
+    ///   handshake (see `Frame::HandshakeDone` in `dispatch_frames`).
+    ///   Discarding Initial is always safe once Handshake keys exist (RFC
+    ///   9001 §4.9.1) and makes the client drop any stale retransmitted
+    ///   server Initial via the rx-key `None` branch in
+    ///   `feed_long_header_packet`.
     fn discard_handshake_levels(&mut self) {
         let levels: &[Level] = match self.role {
             Role::Server => &[Level::Initial, Level::Handshake],
             Role::Client => &[Level::Initial],
         };
         for &lvl in levels {
+            self.discard_level(lvl);
+        }
+    }
+
+    /// Discards one finished encryption level (RFC 9001 §4.9): both
+    /// directions' keys, the level's CRYPTO byte streams, its loss-recovery
+    /// state and its packet-number space.
+    fn discard_level(&mut self, lvl: Level) {
+        {
             let lk = self.endpoint.crypto.at_mut(lvl);
             lk.tx = None;
             lk.rx = None;
@@ -4174,6 +4244,9 @@ impl QuicConnection {
             return true;
         }
         if self.handshake_complete && !self.new_cids_issued {
+            return true;
+        }
+        if self.handshake_done_pending {
             return true;
         }
         // Pending Retry datagram (server-side, before pop drains it).
@@ -5050,6 +5123,7 @@ impl QuicConnection {
                             self.requeue_from_hint(&pkt.retransmit_hint)?;
                         }
                     }
+                    self.note_handshake_done_fate(&acked, &lost);
                     // 6a. CRYPTO chunk accounting: acked packets confirm
                     //     their CRYPTO ranges — prune the per-level
                     //     sent-history so post-handshake CRYPTO
@@ -5128,11 +5202,16 @@ impl QuicConnection {
                     if self.role == Role::Server {
                         return Err(Error::IllegalParameter);
                     }
-                    // Server → client only, RFC 9000 §7.3. We treat it
-                    // as a confirmation that the server has installed
-                    // 1-RTT keys; the TLS engine independently signals
-                    // its own completion.
                     ack_eliciting = true;
+                    // RFC 9001 §4.1.2: HANDSHAKE_DONE confirms the handshake
+                    // at the client. §4.9.2: the client discards its
+                    // Handshake keys on confirmation — the server can only
+                    // have sent this once it held our Finished, so nothing
+                    // at that level is still outstanding.
+                    if !self.handshake_confirmed {
+                        self.handshake_confirmed = true;
+                        self.discard_level(Level::Handshake);
+                    }
                 }
                 Frame::ConnectionClose {
                     error,
@@ -5535,7 +5614,8 @@ impl QuicConnection {
                     .as_ref()
                     .map(|p| !p.pending_retire.is_empty())
                     .unwrap_or(false)
-                || (self.handshake_complete && !self.new_cids_issued));
+                || (self.handshake_complete && !self.new_cids_issued)
+                || self.handshake_done_pending);
         // Phase 8 — DATAGRAM frames live only at the 1-RTT level.
         let has_datagrams = matches!(level, Level::OneRtt | Level::EarlyData)
             && !self.datagram_queues.outbound.is_empty();
@@ -5898,6 +5978,7 @@ impl QuicConnection {
             time_sent: now,
             retransmit_hint,
             stream_hints: meta.stream_hints.clone(),
+            handshake_done: meta.handshake_done,
         };
         self.endpoint.loss.on_packet_sent(space_id, sent_pkt);
         if meta.in_flight {
@@ -6024,6 +6105,16 @@ impl QuicConnection {
         // path / CID housekeeping below is kept inside its own guard.
         if matches!(level, Level::OneRtt | Level::EarlyData) {
             if matches!(level, Level::OneRtt) {
+                // HANDSHAKE_DONE (RFC 9000 §19.20): the server MUST send it
+                // as soon as the handshake completes (RFC 9001 §4.1.2). It is
+                // ack-eliciting and re-queued if its packet is lost.
+                if full && self.handshake_done_pending {
+                    Frame::HandshakeDone.encode(&mut out);
+                    meta.ack_eliciting = true;
+                    meta.in_flight = true;
+                    meta.handshake_done = true;
+                    self.handshake_done_pending = false;
+                }
                 // PATH_RESPONSE (RFC 9000 §8.2.2): emit one per pending
                 // request before everything else. They're tiny (9 bytes
                 // each) and high-priority. Only the ones owed on the path
@@ -8479,6 +8570,7 @@ mod tests {
                     time_sent: Duration::ZERO,
                     retransmit_hint: Vec::new(),
                     stream_hints: Vec::new(),
+                    handshake_done: false,
                 },
             );
             s.endpoint.cc.on_packet_sent(1200);
@@ -8516,6 +8608,7 @@ mod tests {
                     time_sent: Duration::from_millis(100),
                     retransmit_hint: Vec::new(),
                     stream_hints: Vec::new(),
+                    handshake_done: false,
                 },
             );
         }
@@ -10612,6 +10705,75 @@ mod tests {
         );
     }
 
+    /// RFC 9001 §4.1.2 — the server MUST send HANDSHAKE_DONE as soon as the
+    /// handshake completes; the client confirms the handshake on it, discards
+    /// its Handshake keys (§4.9.2) and only then may initiate a key update
+    /// (§6.2). The frame was never emitted, so a conforming client never
+    /// confirmed. A lost carrier is retransmitted on the PTO.
+    #[test]
+    fn server_sends_handshake_done_and_client_confirms_on_it() {
+        let (mut c, mut s) = loopback_pair();
+        let first = c.pop_datagram();
+        s.feed_datagram(&first).expect("server feed");
+        loop {
+            let dg = s.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            c.feed_datagram(&dg).expect("client feed");
+        }
+        assert!(
+            c.is_handshake_complete(),
+            "client processed the server Finished"
+        );
+        loop {
+            let dg = c.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            s.feed_datagram(&dg).expect("server feed");
+        }
+        assert!(s.is_handshake_complete() && s.handshake_confirmed);
+        // Complete but not confirmed: Handshake keys retained, no key update.
+        assert!(!c.handshake_confirmed);
+        assert!(c.endpoint.crypto.at(Level::Handshake).rx.is_some());
+        assert!(matches!(
+            c.initiate_key_update(),
+            Err(Error::InappropriateState)
+        ));
+
+        // The server's first 1-RTT flight carries HANDSHAKE_DONE — lose it.
+        let lost = s.pop_datagram();
+        assert!(!lost.is_empty() && lost[0] & 0x80 == 0, "a 1-RTT datagram");
+        assert!(!s.handshake_done_pending, "the frame went out");
+        let in_flight = s.endpoint.loss.per_space[PnSpaceId::Application as usize]
+            .sent_packets
+            .values()
+            .any(|p| p.handshake_done);
+        assert!(in_flight, "loss recovery tracks the HANDSHAKE_DONE carrier");
+        // The PTO re-queues it.
+        s.on_timeout(Duration::from_secs(5));
+        assert!(s.handshake_done_pending, "PTO re-queues HANDSHAKE_DONE");
+        let probe = s.pop_datagram();
+        assert!(!probe.is_empty());
+        c.feed_datagram(&probe).expect("client feed");
+        assert!(c.handshake_confirmed, "HANDSHAKE_DONE confirms the client");
+        assert!(
+            c.endpoint.crypto.at(Level::Handshake).rx.is_none()
+                && c.endpoint.crypto.at(Level::Handshake).tx.is_none(),
+            "Handshake keys discarded on confirmation (RFC 9001 §4.9.2)"
+        );
+        c.initiate_key_update()
+            .expect("a confirmed client may update keys");
+        // Once acknowledged, a later loss of the original carrier does not
+        // re-queue the frame.
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert!(s.handshake_done_acked);
+        assert!(!s.handshake_done_pending);
+    }
+
     /// Test — RFC 9221 round-trip via the public API. Both forms
     /// (0x30 / 0x31) decode through the codec; the integration test
     /// drives the length-prefixed 0x31 form end-to-end.
@@ -11850,6 +12012,7 @@ mod tests {
                     time_sent: Duration::from_millis(pn),
                     retransmit_hint: alloc::vec::Vec::new(),
                     stream_hints: alloc::vec::Vec::new(),
+                    handshake_done: false,
                 },
             );
         }
