@@ -1001,7 +1001,7 @@ impl<R: RngCore> ServerConnection12<R> {
     /// to the RFC 5246 §6.2.3.2 maximum, so a full 2^14-byte fragment
     /// produces a record past the `2^14 + 256` AEAD bound (the way a peer
     /// randomising its padding may). Exercises the client's CBC record cap.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tls-legacy"))]
     pub(super) fn test_emit_encrypted_max_padding(
         &mut self,
         ct: ContentType,

@@ -673,7 +673,7 @@ impl CbcRecordCrypter {
     /// way peers that randomise padding lengths may pad a record. Lets the
     /// tests build a full-size CBC record that exceeds the `2^14 + 256`
     /// AEAD bound but stays within the `2^14 + 2048` block-cipher bound.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tls-legacy"))]
     pub(crate) fn encrypt_max_padding(
         &mut self,
         ct: ContentType,

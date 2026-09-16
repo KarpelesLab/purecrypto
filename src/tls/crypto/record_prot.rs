@@ -98,7 +98,7 @@ impl RecordProtection {
     /// maximum RFC 5246 §6.2.3.2 allows (up to 256 bytes) instead of the
     /// minimum, to exercise the peer's record-size bound. AEAD records have
     /// no padding and are emitted unchanged.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tls-legacy"))]
     pub(crate) fn encrypt_max_padding(
         &mut self,
         ct: ContentType,

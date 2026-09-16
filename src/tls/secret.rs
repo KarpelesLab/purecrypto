@@ -5,7 +5,7 @@ use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A 32-byte symmetric secret held by a [`Config`](super::Config) (the
 /// session-ticket key, the DTLS cookie secrets) or a
-/// [`QuicConfig`](crate::quic::QuicConfig) (the retry secret), wiped when
+/// `QuicConfig` (the `quic` feature's retry secret), wiped when
 /// dropped.
 ///
 /// A bare `[u8; 32]` field is `Copy` and is never cleared, so a dropped or

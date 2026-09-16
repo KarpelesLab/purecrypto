@@ -11,7 +11,7 @@
 //! a fuzzer never gets a ServerHello past the client's key-share check, so
 //! it never reaches them. Each `pub fn` here hands raw bytes straight to one
 //! decoder (or to the real engine handler on a fresh, deterministic
-//! client), and [`dispatch`] selects among them on the first input byte so
+//! client), and [`dispatch`](crate::tls::fuzz::dispatch) selects among them on the first input byte so
 //! a single target covers the lot.
 //!
 //! Every wrapper discards the decoded value: the point is to surface
@@ -29,7 +29,7 @@ use crate::tls::conn::{ClientConfig, ClientConnection};
 use crate::tls::{Error, RootCertStore};
 use alloc::vec::Vec;
 
-/// Selector values understood by [`dispatch`]: the first input byte picks
+/// Selector values understood by [`dispatch`](crate::tls::fuzz::dispatch): the first input byte picks
 /// the decoder, the rest is its input.
 pub mod selector {
     /// [`handshake_header`](super::handshake_header).
@@ -118,6 +118,7 @@ pub fn dispatch(data: &[u8]) {
         RECORD => drop(record(body)),
         SERVER_KEY_EXCHANGE => drop(server_key_exchange(body)),
         CLIENT_KEY_EXCHANGE => drop(client_key_exchange(body)),
+        #[cfg(feature = "tls-legacy")]
         RSA_CLIENT_KEY_EXCHANGE => {
             if let Some((&ssl3, rest)) = body.split_first() {
                 drop(rsa_client_key_exchange(rest, ssl3 & 1 == 1));
@@ -304,7 +305,8 @@ pub fn client_key_exchange(body: &[u8]) -> Result<(), Error> {
 }
 
 /// TLS 1.2 static-RSA `ClientKeyExchange` body decoder; `ssl3` selects
-/// the SSL 3.0 framing (no length prefix).
+/// the SSL 3.0 framing (no length prefix). Only present with `tls-legacy`.
+#[cfg(feature = "tls-legacy")]
 pub fn rsa_client_key_exchange(body: &[u8], ssl3: bool) -> Result<(), Error> {
     codec::handshake12::RsaClientKeyExchange::decode(body, ssl3).map(drop)
 }
