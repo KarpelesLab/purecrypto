@@ -539,3 +539,60 @@ fn empty_password_accepts_both_bmp_encodings() {
     let pfx = pfx_under_bmp(&[]);
     assert_eq!(Pfx::parse(&pfx, PASSWORD).unwrap_err(), Error::MacMismatch);
 }
+
+// ---------------------------------------------------------------------------
+// PBES2 AES-GCM parameters
+// ---------------------------------------------------------------------------
+
+/// RFC 5084 §3.2: `GCMParameters.aes-ICVlen` has DEFAULT 12, so an envelope
+/// that omits it (or says 12 explicitly) carries a 12-byte tag we do not
+/// support. It must be refused as `UnsupportedAlgorithm` before any PBKDF2
+/// work, not split at a 16-byte tag boundary after the KDF and misreported
+/// as a wrong-password `Decryption` failure. An explicit 16 is the supported
+/// form and gets past the parameter checks. Mirrors the `crate::kdf::pbes2`
+/// guard for the PKCS#12-tolerant decryptor.
+#[test]
+fn pbes2_gcm_icvlen_default_is_12_and_unsupported() {
+    const OID_PBES2: &[u64] = &[1, 2, 840, 113549, 1, 5, 13];
+    const OID_PBKDF2: &[u64] = &[1, 2, 840, 113549, 1, 5, 12];
+    const OID_HMAC_SHA256: &[u64] = &[1, 2, 840, 113549, 2, 9];
+    const OID_AES256_GCM: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 1, 46];
+
+    let build = |icvlen: Option<u32>| {
+        let prf = encode_sequence(&[oid_tlv(OID_HMAC_SHA256), crate::der::encode_null()].concat());
+        let kdf_params = encode_sequence(
+            &[
+                encode_octet_string(&[0u8; 16]),
+                encode_integer(&2048u32.to_be_bytes()),
+                prf,
+            ]
+            .concat(),
+        );
+        let kdf = encode_sequence(&[oid_tlv(OID_PBKDF2), kdf_params].concat());
+        let mut gcm_params = encode_octet_string(&[0u8; 12]);
+        if let Some(icv) = icvlen {
+            gcm_params.extend_from_slice(&encode_integer(&icv.to_be_bytes()));
+        }
+        let enc =
+            encode_sequence(&[oid_tlv(OID_AES256_GCM), encode_sequence(&gcm_params)].concat());
+        let params = encode_sequence(&[kdf, enc].concat());
+        encode_sequence(&[oid_tlv(OID_PBES2), params].concat())
+    };
+    // 32 bytes of garbage "ciphertext": enough for a 16-byte tag split.
+    let ct = [0xa5u8; 32];
+    let run = |alg: Vec<u8>| pbes2_p12::decrypt(&alg, &ct, b"x", &mut Budget::new());
+
+    assert_eq!(
+        run(build(None)),
+        Err(Error::UnsupportedAlgorithm),
+        "absent aes-ICVlen is DEFAULT 12"
+    );
+    assert_eq!(
+        run(build(Some(12))),
+        Err(Error::UnsupportedAlgorithm),
+        "explicit 12-byte ICV"
+    );
+    // Explicit 16 passes the parameter checks; the garbage ciphertext then
+    // fails authentication instead.
+    assert_eq!(run(build(Some(16))), Err(Error::Decryption));
+}

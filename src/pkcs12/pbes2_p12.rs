@@ -129,7 +129,24 @@ pub(super) fn decrypt(
     let is_gcm = matches!(cipher, CipherKind::Aes128Gcm | CipherKind::Aes256Gcm);
     let iv = if is_gcm {
         let mut gp = enc.read_sequence()?;
-        gp.read_octet_string()?.to_vec()
+        let nonce = gp.read_octet_string()?.to_vec();
+        // RFC 5084 §3.2: an absent aes-ICVlen means the DEFAULT of 12, not
+        // the 16 we require. Treating absence as "fine" would split a
+        // 12-byte-tag envelope at the wrong offset — after running the
+        // KDF — and misreport a mere unsupported parameter as a wrong
+        // password / tampered blob. Resolve the default and refuse anything
+        // but a 16-byte tag before any PBKDF2 work (mirrors
+        // `crate::kdf::pbes2::parse_cipher_algid`).
+        let icv = if gp.peek_tag() == Some(tag::INTEGER) {
+            read_u32(gp.read_integer_bytes()?)?
+        } else {
+            12
+        };
+        if icv != 16 {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        gp.finish()?;
+        nonce
     } else {
         enc.read_octet_string()?.to_vec()
     };
