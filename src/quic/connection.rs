@@ -485,6 +485,12 @@ fn crypto_error_code(err: &Error) -> u64 {
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
+        // RFC 8446 §4.2 / §9.2: an extension the peer never offered, or a
+        // mandatory one it omitted, has its own alert code; the TLS engines'
+        // `alert_for` tables already report these as `unsupported_extension`
+        // (110) / `missing_extension` (109) rather than `handshake_failure`.
+        Error::UnsupportedExtension => AlertDescription::UnsupportedExtension,
+        Error::MissingExtension => AlertDescription::MissingExtension,
         _ => AlertDescription::HandshakeFailure,
     };
     ERROR_CRYPTO_BASE + u64::from(alert.as_u8())
@@ -6683,6 +6689,29 @@ mod tests {
     use crate::rng::HmacDrbg;
     use crate::tls::{Config, Identity, RootCertStore, SigningKey};
     use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    /// RFC 9001 §4.8: the CRYPTO_ERROR code carries the alert the TLS
+    /// engine would have sent. Extension-negotiation failures have their
+    /// own alert codes (RFC 8446 §6.2) and must not collapse into
+    /// `handshake_failure`.
+    #[test]
+    fn crypto_error_code_maps_extension_errors_to_their_own_alerts() {
+        assert_eq!(
+            crypto_error_code(&Error::UnsupportedExtension),
+            ERROR_CRYPTO_BASE + 110,
+            "unsupported_extension (110)"
+        );
+        assert_eq!(
+            crypto_error_code(&Error::MissingExtension),
+            ERROR_CRYPTO_BASE + 109,
+            "missing_extension (109)"
+        );
+        // The catch-all is unchanged for errors without a dedicated alert.
+        assert_eq!(
+            crypto_error_code(&Error::HandshakeFailure),
+            ERROR_CRYPTO_BASE + u64::from(AlertDescription::HandshakeFailure.as_u8())
+        );
+    }
 
     /// Builds a self-signed Ed25519 server `(Config, cert_der)` for use
     /// in loopback tests. Mirrors the Phase-3 `ed25519_server` helper.
