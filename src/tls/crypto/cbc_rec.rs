@@ -742,7 +742,15 @@ impl CbcRecordCrypter {
         // weakness; we therefore skip the per-byte padding scan in SSLv3 mode
         // (documented in the module header). TLS 1.0/1.1 require every padding
         // byte to equal `pad_len`, checked in constant time below.
-        if !self.ssl3 {
+        if self.ssl3 {
+            // RFC 6101 §5.2.3.2: the SSL 3.0 padding length "must be less than
+            // the cipher's block length". It is the only constraint SSLv3
+            // puts on its padding, so enforce it: a longer claim lets a
+            // forger strip whole blocks off the end of a record, which is
+            // extra freedom POODLE-style manipulation does not need to have.
+            // Constant time like the rest of the check.
+            good &= ct_le(pad_len + 1, bs);
+        } else {
             // Scan a fixed window (max TLS padding is 255 bytes) bounded by
             // `total`.
             let window = core::cmp::min(256, total);
@@ -1013,6 +1021,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// RFC 6101 §5.2.3.2: SSL 3.0 padding bytes are unchecked, but the
+    /// padding length must stay below the block size. A record whose length
+    /// byte claims a whole extra block of padding is rejected even though its
+    /// MAC (placed where the claim says) would verify.
+    #[test]
+    fn ssl3_padding_length_must_be_below_block_size() {
+        let enc_key = [0x11u8; 16];
+        let mk = [0x22u8; 20];
+        let iv = [0x33u8; 16];
+        let make = || {
+            CbcRecordCrypter::new_ssl3(CbcCipherAlg::Aes128, &enc_key, CbcMacAlg::Sha1, &mk, &iv)
+        };
+        // Hand-build `CBC(content || MAC || pad)` under the chained IV.
+        let craft = |enc: &CbcRecordCrypter, content: &[u8], pad: &[u8]| {
+            let mac = enc.compute_mac(
+                ContentType::ApplicationData,
+                ProtocolVersion::SSLv3,
+                content,
+            );
+            let mut buf = content.to_vec();
+            buf.extend_from_slice(&mac);
+            buf.extend_from_slice(pad);
+            assert!(buf.len().is_multiple_of(16));
+            enc.cipher.cbc_encrypt(&iv, &mut buf);
+            buf
+        };
+        // In-range padding with arbitrary (unauthenticated) filler: accepted.
+        let content = [0xabu8; 7];
+        let mut pad = [0x99u8; 5]; // 4 filler bytes + length byte 4
+        pad[4] = 4;
+        let rec = craft(&make(), &content, &pad);
+        let got = make()
+            .decrypt(ContentType::ApplicationData, ProtocolVersion::SSLv3, &rec)
+            .expect("SSLv3 padding below the block size decrypts");
+        assert_eq!(got, content);
+
+        // A padding claim of a full block (length byte 16 -> 17 bytes) on a
+        // record that could otherwise hold it: rejected.
+        let mut pad = [0x99u8; 17];
+        pad[16] = 16;
+        let rec = craft(&make(), &[0xabu8; 11], &pad);
+        assert!(matches!(
+            make().decrypt(ContentType::ApplicationData, ProtocolVersion::SSLv3, &rec),
+            Err(Error::BadRecordMac)
+        ));
     }
 
     #[test]
