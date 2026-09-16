@@ -40,7 +40,9 @@
 //! [`crate::tls::crypto::aead12::RecordCrypter12`] instances. This isolates
 //! the two protocol paths cleanly.
 
-use super::super::codec::{ParsedRecord, is_legal_record_version, read_record, write_record};
+use super::super::codec::{
+    ParsedRecord, is_legal_record_version, read_record_with_max, write_record,
+};
 use super::client::{ClientCertConfig, ClientKey};
 use super::common::MAX_HANDSHAKE_REASSEMBLY;
 use crate::ct::ConstantTimeEq;
@@ -1556,6 +1558,16 @@ impl ClientConnection12 {
         }
     }
 
+    /// Ceiling on an inbound record's fragment length: `2^14 + 2048` once a
+    /// CBC suite's read key is installed (RFC 5246 §6.2.3 — IV, MAC and up
+    /// to 256 bytes of padding on a full fragment), `2^14 + 256` for AEAD
+    /// suites and for the plaintext records before the server's CCS.
+    fn inbound_fragment_cap(&self) -> usize {
+        self.server_crypter
+            .as_ref()
+            .map_or(crate::tls::codec::MAX_FRAGMENT, |c| c.max_fragment_len())
+    }
+
     /// Pulls the next decoded message from the inbound buffer, or `Ok(None)`
     /// if more bytes are needed.
     fn next_message(&mut self) -> Result<Option<Incoming>, Error> {
@@ -1565,12 +1577,13 @@ impl ClientConnection12 {
                 return Ok(Some(Incoming::Handshake(msg)));
             }
 
+            let max_fragment = self.inbound_fragment_cap();
             let Some(ParsedRecord {
                 content_type,
                 version,
                 fragment,
                 len,
-            }) = read_record(&self.inbuf[self.in_off..])?
+            }) = read_record_with_max(&self.inbuf[self.in_off..], max_fragment)?
             else {
                 return Ok(None);
             };

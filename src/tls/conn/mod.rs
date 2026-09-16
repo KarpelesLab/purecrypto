@@ -6018,6 +6018,192 @@ mod tls12_loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"pong from server");
     }
 
+    /// A connected TLS 1.1 CBC pair (`TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA`),
+    /// handshake done, no application data exchanged yet.
+    #[cfg(feature = "tls-legacy")]
+    fn legacy_cbc_connected_pair(
+        seed: &[u8],
+    ) -> (ClientConnection12, ServerConnection12<HmacDrbg<Sha256>>) {
+        use crate::tls::ProtocolVersion;
+        let (server_config, cert_der) = rsa_server12();
+        let server_config = server_config.with_min_version(ProtocolVersion::TLSv1_1);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(seed, b"cbc-client", &[]);
+        let srng = HmacDrbg::<Sha256>::new(seed, b"cbc-server", &[]);
+        let cfg = ClientConfig12::new(roots)
+            .with_min_version(ProtocolVersion::TLSv1_1)
+            .with_max_version(ProtocolVersion::TLSv1_1);
+        let mut client = ClientConnection12::new_with_offer(
+            cfg,
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        (client, server)
+    }
+
+    /// A record header claiming a `len`-byte fragment, with no body.
+    fn bare_record_header(len: usize) -> Vec<u8> {
+        let mut h = alloc::vec![ContentType::ApplicationData.as_u8(), 0x03, 0x03];
+        h.extend_from_slice(&(len as u16).to_be_bytes());
+        h
+    }
+
+    /// RFC 5246 §6.2.3: a block-cipher `TLSCiphertext` may run to
+    /// `2^14 + 2048` bytes — a full 2^14 fragment plus IV, MAC and up to
+    /// 256 bytes of padding (GnuTLS, for one, randomises padding lengths).
+    /// The record layer used to cap every record at the AEAD / TLS 1.3
+    /// figure of `2^14 + 256`, so such records failed with
+    /// `record_overflow`. Under a CBC suite both TLS 1.2 engines now admit
+    /// the larger bound — and still refuse a plaintext over 2^14.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls12_cbc_records_may_exceed_the_aead_bound() {
+        use crate::tls::codec::{MAX_FRAGMENT, MAX_FRAGMENT_BLOCK, read_record_with_max};
+
+        let (mut client, mut server) = legacy_cbc_connected_pair(b"cbc-big-record");
+
+        // A real full-size record padded to the maximum: 16 (IV) + 16384 +
+        // 20 (HMAC-SHA1) + 252 (padding) = 2^14 + 288, past the AEAD bound.
+        let payload = alloc::vec![0x42u8; 1 << 14];
+        server
+            .test_emit_encrypted_max_padding(ContentType::ApplicationData, &payload)
+            .unwrap();
+        let big = server.write_tls();
+        let rec = read_record_with_max(&big, MAX_FRAGMENT_BLOCK)
+            .unwrap()
+            .unwrap();
+        assert!(
+            rec.fragment.len() > MAX_FRAGMENT,
+            "fixture must exceed the AEAD bound: {}",
+            rec.fragment.len()
+        );
+        assert_eq!(rec.len, big.len());
+        client.read_tls(&big);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), payload);
+
+        // Oversized *content* is still refused once the MAC checks out
+        // (RFC 5246 §6.2.1: TLSPlaintext.length <= 2^14).
+        let too_long = alloc::vec![0x43u8; (1 << 14) + 1];
+        server
+            .test_emit_encrypted_max_padding(ContentType::ApplicationData, &too_long)
+            .unwrap();
+        let bad = server.write_tls();
+        assert!(
+            bad.len() - 5 <= MAX_FRAGMENT_BLOCK,
+            "still within the record bound"
+        );
+        client.read_tls(&bad);
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::RecordOverflow)
+        ));
+
+        // Header-only checks of the bound itself, on the server side (the
+        // client above is closed by the failure): exactly 2^14 + 2048 is
+        // waited for, one more is `record_overflow`.
+        let (_, mut server) = legacy_cbc_connected_pair(b"cbc-bound-server");
+        server.read_tls(&bare_record_header(MAX_FRAGMENT_BLOCK));
+        server.process_new_packets().unwrap();
+        server.read_tls(&[]);
+        assert!(!server.is_handshaking(), "an incomplete record just waits");
+        let (_, mut server) = legacy_cbc_connected_pair(b"cbc-bound-server-2");
+        server.read_tls(&bare_record_header(MAX_FRAGMENT_BLOCK + 1));
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(Error::RecordOverflow)
+        ));
+        // And the client side of the bound.
+        let (mut client, _) = legacy_cbc_connected_pair(b"cbc-bound-client");
+        client.read_tls(&bare_record_header(MAX_FRAGMENT_BLOCK));
+        client.process_new_packets().unwrap();
+        let (mut client, _) = legacy_cbc_connected_pair(b"cbc-bound-client-2");
+        client.read_tls(&bare_record_header(MAX_FRAGMENT_BLOCK + 1));
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::RecordOverflow)
+        ));
+    }
+
+    /// The companion of `tls12_cbc_records_may_exceed_the_aead_bound`: under
+    /// an AEAD suite the TLS 1.2 engines keep the `2^14 + 256` ceiling
+    /// (RFC 5288 expansion is 24 bytes, so anything larger is garbage), on
+    /// both sides.
+    #[test]
+    fn tls12_aead_records_keep_the_tight_bound() {
+        use crate::tls::codec::MAX_FRAGMENT;
+
+        fn aead_pair(seed: &[u8]) -> (ClientConnection12, ServerConnection12<HmacDrbg<Sha256>>) {
+            let (server_config, cert_der) = rsa_server12();
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert_der).unwrap();
+            let mut crng = HmacDrbg::<Sha256>::new(seed, b"aead-client", &[]);
+            let srng = HmacDrbg::<Sha256>::new(seed, b"aead-server", &[]);
+            let mut client = ClientConnection12::new_with_offer(
+                ClientConfig12::new(roots),
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+            let mut server = ServerConnection12::new(server_config, srng);
+            for _ in 0..16 {
+                let c = client.write_tls();
+                if !c.is_empty() {
+                    server.read_tls(&c);
+                    server.process_new_packets().unwrap();
+                }
+                let s = server.write_tls();
+                if !s.is_empty() {
+                    client.read_tls(&s);
+                    client.process_new_packets().unwrap();
+                }
+                if c.is_empty() && s.is_empty() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            (client, server)
+        }
+
+        let (mut client, mut server) = aead_pair(b"aead-bound");
+        client.read_tls(&bare_record_header(MAX_FRAGMENT));
+        client.process_new_packets().unwrap();
+        server.read_tls(&bare_record_header(MAX_FRAGMENT));
+        server.process_new_packets().unwrap();
+        let (mut client, mut server) = aead_pair(b"aead-bound-2");
+        client.read_tls(&bare_record_header(MAX_FRAGMENT + 1));
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::RecordOverflow)
+        ));
+        server.read_tls(&bare_record_header(MAX_FRAGMENT + 1));
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(Error::RecordOverflow)
+        ));
+    }
+
     #[cfg(feature = "tls-legacy")]
     #[test]
     fn tls11_ecdhe_rsa_aes128_cbc_sha() {

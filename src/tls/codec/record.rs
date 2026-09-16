@@ -10,8 +10,18 @@ use crate::tls::{ContentType, Error, ProtocolVersion};
 use alloc::vec::Vec;
 
 /// Maximum plaintext/ciphertext fragment length (`2^14 + 256`, the TLS 1.3
-/// ciphertext cap).
+/// ciphertext cap, RFC 8446 §5.2). Also the bound applied to TLS 1.2 AEAD
+/// records: their expansion is at most 24 bytes (RFC 5288 §3), so the
+/// tighter cap costs nothing and rejects garbage sooner.
 pub(crate) const MAX_FRAGMENT: usize = (1 << 14) + 256;
+
+/// Maximum ciphertext fragment length for a TLS 1.2 block-cipher (CBC)
+/// record: `2^14 + 2048` (RFC 5246 §6.2.3). A CBC record carries the IV,
+/// up to a 32-byte MAC and up to 256 bytes of padding on top of the 2^14
+/// plaintext — and peers such as GnuTLS deliberately use random padding
+/// lengths, so a full-size record can legitimately exceed [`MAX_FRAGMENT`].
+#[cfg(feature = "tls-legacy")]
+pub(crate) const MAX_FRAGMENT_BLOCK: usize = (1 << 14) + 2048;
 
 /// One parsed record: its content type, fragment, and total wire length.
 pub(crate) struct ParsedRecord<'a> {
@@ -36,13 +46,24 @@ pub(crate) struct ParsedRecord<'a> {
 /// [`is_legal_record_version`] — TLS 1.2 / 1.3 accept `0x0301..=0x0303` and
 /// reject anything else (notably SSL 3.0, `0x0300`).
 pub(crate) fn read_record(buf: &[u8]) -> Result<Option<ParsedRecord<'_>>, Error> {
+    read_record_with_max(buf, MAX_FRAGMENT)
+}
+
+/// [`read_record`] with an explicit fragment-length ceiling. The TLS 1.2
+/// engines pass the bound their negotiated record protection permits —
+/// [`MAX_FRAGMENT_BLOCK`] once a CBC suite's read key is installed,
+/// [`MAX_FRAGMENT`] otherwise; the TLS 1.3 core always uses the latter.
+pub(crate) fn read_record_with_max(
+    buf: &[u8],
+    max_fragment: usize,
+) -> Result<Option<ParsedRecord<'_>>, Error> {
     if buf.len() < 5 {
         return Ok(None);
     }
     let content_type = ContentType::from_u8(buf[0]);
     let version = u16::from_be_bytes([buf[1], buf[2]]);
     let len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-    if len > MAX_FRAGMENT {
+    if len > max_fragment {
         return Err(Error::RecordOverflow);
     }
     let total = 5 + len;
@@ -129,6 +150,41 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// RFC 5246 §6.2.3: a TLS 1.2 block-cipher record may run to
+    /// `2^14 + 2048` bytes; the bound is the caller's choice, and the
+    /// default stays at the AEAD / TLS 1.3 figure.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn block_cipher_bound_admits_larger_records() {
+        fn header(len: usize) -> [u8; 5] {
+            let l = (len as u16).to_be_bytes();
+            [23u8, 0x03, 0x03, l[0], l[1]]
+        }
+        // Between the two bounds: refused by default, admitted under the
+        // block-cipher ceiling.
+        let mid = header(MAX_FRAGMENT + 1);
+        assert!(matches!(read_record(&mid), Err(Error::RecordOverflow)));
+        assert!(matches!(
+            read_record_with_max(&mid, MAX_FRAGMENT),
+            Err(Error::RecordOverflow)
+        ));
+        assert!(
+            read_record_with_max(&mid, MAX_FRAGMENT_BLOCK)
+                .unwrap()
+                .is_none()
+        );
+        // Exactly at, and one past, the block-cipher ceiling.
+        assert!(
+            read_record_with_max(&header(MAX_FRAGMENT_BLOCK), MAX_FRAGMENT_BLOCK)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            read_record_with_max(&header(MAX_FRAGMENT_BLOCK + 1), MAX_FRAGMENT_BLOCK),
+            Err(Error::RecordOverflow)
+        ));
     }
 
     #[test]

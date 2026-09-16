@@ -665,12 +665,44 @@ impl CbcRecordCrypter {
         version: ProtocolVersion,
         plaintext: &[u8],
     ) -> Vec<u8> {
+        self.encrypt_padded(ct, version, plaintext, 0)
+    }
+
+    /// Test hook: [`Self::encrypt`] with the padding stretched to the
+    /// longest RFC 5246 §6.2.3.2 permits (at most 256 bytes in total), the
+    /// way peers that randomise padding lengths may pad a record. Lets the
+    /// tests build a full-size CBC record that exceeds the `2^14 + 256`
+    /// AEAD bound but stays within the `2^14 + 2048` block-cipher bound.
+    #[cfg(test)]
+    pub(crate) fn encrypt_max_padding(
+        &mut self,
+        ct: ContentType,
+        version: ProtocolVersion,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        // Minimal padding is 1..=block_size bytes; each extra block adds
+        // `block_size`. Stop before the 256-byte ceiling.
+        let extra_blocks = (256 - self.block_size) / self.block_size;
+        self.encrypt_padded(ct, version, plaintext, extra_blocks)
+    }
+
+    /// Shared body of [`Self::encrypt`]: MAC, pad by the minimum plus
+    /// `extra_pad_blocks` whole blocks, then CBC-encrypt.
+    fn encrypt_padded(
+        &mut self,
+        ct: ContentType,
+        version: ProtocolVersion,
+        plaintext: &[u8],
+        extra_pad_blocks: usize,
+    ) -> Vec<u8> {
         let mac = self.compute_mac(ct, version, plaintext);
         let mut buf = Vec::with_capacity(plaintext.len() + mac.len() + self.block_size);
         buf.extend_from_slice(plaintext);
         buf.extend_from_slice(&mac);
         // TLS padding: append `pad_total` bytes each equal to `pad_total - 1`.
-        let pad_total = self.block_size - (buf.len() % self.block_size);
+        let pad_total =
+            self.block_size - (buf.len() % self.block_size) + extra_pad_blocks * self.block_size;
+        debug_assert!(pad_total <= 256);
         let pad_val = (pad_total - 1) as u8;
         buf.resize(buf.len() + pad_total, pad_val);
 

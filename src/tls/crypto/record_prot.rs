@@ -69,8 +69,46 @@ impl RecordProtection {
                     record_header[2],
                 ]));
                 let plain = c.decrypt(ct, version, fragment)?;
+                // RFC 5246 §6.2.1: the plaintext fragment MUST NOT exceed
+                // 2^14. The record layer admits CBC ciphertexts up to
+                // 2^14 + 2048 (§6.2.3) so oversized *padding* is accepted;
+                // this keeps oversized *content* out, as the AEAD arm does.
+                // Checked after the MAC verified, so the length is public.
+                if plain.len() > (1 << 14) {
+                    return Err(Error::RecordOverflow);
+                }
                 Ok((ct, plain))
             }
+        }
+    }
+
+    /// Largest ciphertext fragment a record protected under this scheme may
+    /// legally carry: RFC 5246 §6.2.3 allows `2^14 + 2048` for block ciphers
+    /// (IV + MAC + up to 256 bytes of padding on a full 2^14 fragment), while
+    /// AEAD records stay under the `2^14 + 256` TLS 1.3 / AEAD bound.
+    pub(crate) fn max_fragment_len(&self) -> usize {
+        match self {
+            RecordProtection::Aead(_) => crate::tls::codec::MAX_FRAGMENT,
+            #[cfg(feature = "tls-legacy")]
+            RecordProtection::Cbc(_) => crate::tls::codec::MAX_FRAGMENT_BLOCK,
+        }
+    }
+
+    /// Test hook: like [`Self::encrypt`], but a CBC record is padded to the
+    /// maximum RFC 5246 §6.2.3.2 allows (up to 256 bytes) instead of the
+    /// minimum, to exercise the peer's record-size bound. AEAD records have
+    /// no padding and are emitted unchanged.
+    #[cfg(test)]
+    pub(crate) fn encrypt_max_padding(
+        &mut self,
+        ct: ContentType,
+        version: ProtocolVersion,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        match self {
+            RecordProtection::Aead(c) => c.encrypt(ct, payload),
+            #[cfg(feature = "tls-legacy")]
+            RecordProtection::Cbc(c) => Ok(c.encrypt_max_padding(ct, version, payload)),
         }
     }
 }

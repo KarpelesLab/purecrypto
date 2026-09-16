@@ -32,7 +32,9 @@
 //! instances rather than reuse the TLS-1.3-shaped
 //! [`super::common::ConnectionCore`].
 
-use super::super::codec::{ParsedRecord, is_legal_record_version, read_record, write_record};
+use super::super::codec::{
+    ParsedRecord, is_legal_record_version, read_record_with_max, write_record,
+};
 use super::client12::{
     SUITES_12, SigKind, SuiteParams12, lookup_suite_12, parse_certificate_list_12,
 };
@@ -995,6 +997,26 @@ impl<R: RngCore> ServerConnection12<R> {
         Ok(())
     }
 
+    /// Test-only: like [`Self::emit_encrypted`], but a CBC record is padded
+    /// to the RFC 5246 §6.2.3.2 maximum, so a full 2^14-byte fragment
+    /// produces a record past the `2^14 + 256` AEAD bound (the way a peer
+    /// randomising its padding may). Exercises the client's CBC record cap.
+    #[cfg(test)]
+    pub(super) fn test_emit_encrypted_max_padding(
+        &mut self,
+        ct: ContentType,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        let version = self.negotiated_version;
+        let crypter = self
+            .server_crypter
+            .as_mut()
+            .ok_or(Error::InappropriateState)?;
+        let fragment = crypter.encrypt_max_padding(ct, version, payload)?;
+        write_record(&mut self.outbuf, ct, version, &fragment);
+        Ok(())
+    }
+
     /// Test-only: encrypt and emit an attacker-shaped record (any content
     /// type, any payload) under the server's outbound crypter. Used to drive
     /// hostile-peer hardening tests that need to inject post-handshake
@@ -1019,6 +1041,16 @@ impl<R: RngCore> ServerConnection12<R> {
         }
     }
 
+    /// Ceiling on an inbound record's fragment length: `2^14 + 2048` once a
+    /// CBC suite's read key is installed (RFC 5246 §6.2.3 — IV, MAC and up
+    /// to 256 bytes of padding on a full fragment), `2^14 + 256` for AEAD
+    /// suites and for the plaintext records before the client's CCS.
+    fn inbound_fragment_cap(&self) -> usize {
+        self.client_crypter
+            .as_ref()
+            .map_or(crate::tls::codec::MAX_FRAGMENT, |c| c.max_fragment_len())
+    }
+
     /// Pulls the next decoded message from the inbound buffer.
     fn next_message(&mut self) -> Result<Option<Incoming>, Error> {
         loop {
@@ -1026,12 +1058,13 @@ impl<R: RngCore> ServerConnection12<R> {
                 return Ok(Some(Incoming::Handshake(msg)));
             }
 
+            let max_fragment = self.inbound_fragment_cap();
             let Some(ParsedRecord {
                 content_type,
                 version,
                 fragment,
                 len,
-            }) = read_record(&self.inbuf[self.in_off..])?
+            }) = read_record_with_max(&self.inbuf[self.in_off..], max_fragment)?
             else {
                 return Ok(None);
             };

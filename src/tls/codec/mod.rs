@@ -21,8 +21,14 @@ pub(crate) use handshake12::{
 pub(crate) use primitives::{
     CipherSuite, ExtensionType, NamedGroup, Random, SignatureScheme, cert_type,
 };
+#[cfg(feature = "tls-legacy")]
 #[allow(unused_imports)]
-pub(crate) use record::{ParsedRecord, is_legal_record_version, read_record, write_record};
+pub(crate) use record::MAX_FRAGMENT_BLOCK;
+#[allow(unused_imports)]
+pub(crate) use record::{
+    MAX_FRAGMENT, ParsedRecord, is_legal_record_version, read_record, read_record_with_max,
+    write_record,
+};
 
 use super::Error;
 use alloc::vec::Vec;
