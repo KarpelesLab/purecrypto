@@ -16,9 +16,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, zero_buf};
-use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
-use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
     ClientAuth, Config, Connection, HandshakeStatus, ProtocolVersion as PcVersion, RootCertStore,
     SigningKey,
@@ -106,17 +104,12 @@ fn load_signing_key(key_path: &str) -> SigningKey {
     crate::util::warn_if_world_readable_key(key_path);
     let key_pem = std::fs::read_to_string(key_path)
         .unwrap_or_else(|e| die(format!("cannot read key file {key_path}: {e}")));
-    if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(&key_pem) {
-        SigningKey::Rsa(k)
-    } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(&key_pem) {
-        SigningKey::Ecdsa(k)
-    } else if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(&key_pem) {
-        SigningKey::Ed25519(k)
-    } else {
+    crate::util::signing_key_from_pem(&key_pem).unwrap_or_else(|| {
         die(format!(
-            "{key_path}: server key must be RSA (PKCS#1), ECDSA (SEC1), or Ed25519 (PKCS#8)"
-        ));
-    }
+            "{key_path}: server key must be RSA (PKCS#1 or PKCS#8), ECDSA (SEC1 or PKCS#8), \
+             Ed25519 or Ed448 (PKCS#8)"
+        ))
+    })
 }
 
 pub(crate) fn run(args: Args) {
@@ -161,6 +154,17 @@ pub(crate) fn run(args: Args) {
 
     let chain = load_cert_chain(cert_path);
     let key = load_signing_key(key_path);
+    // The TLS 1.2 server engine signs with RSA or ECDSA only; any other key
+    // is rejected by `Connection::server` as a bare `UnsupportedVersion` —
+    // after `accept()`, so the first client just sees a reset. Say why, up
+    // front.
+    if version == ProtocolVersion::Tls12
+        && !matches!(key, SigningKey::Rsa(_) | SigningKey::Ecdsa(_))
+    {
+        die(format!(
+            "{key_path}: -tls1_2 requires an RSA or ECDSA server key (Ed25519 / Ed448 are TLS 1.3 only)"
+        ));
+    }
 
     let mut builder = Config::builder()
         .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
