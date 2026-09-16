@@ -67,22 +67,42 @@ impl Args {
         self.tokens.iter()
     }
 
+    /// Whether argv token `tok` names flag `name`, treating the single- and
+    /// double-dash spellings as the same flag (`-out` ≡ `--out`), as
+    /// `docs/cli.md` promises for every option. Centralised here so no
+    /// subcommand can accept one spelling and silently drop the other — an
+    /// ignored `--salt` or `--info` used to derive a *different* key with
+    /// exit 0, and `rand … --out FILE` printed the bytes to stdout instead.
+    fn is_flag(tok: &str, name: &str) -> bool {
+        tok == name
+            || (tok.starts_with('-')
+                && name.starts_with('-')
+                && tok.trim_start_matches('-') == name.trim_start_matches('-')
+                && !tok.trim_start_matches('-').is_empty())
+    }
+
     /// The value following flag `name` (e.g. `-in file` → `Some("file")`).
+    /// `None` when the flag is absent. A flag given as the very last token
+    /// has no value and is a usage error: it must not fall back to the
+    /// default (`enc … -out` used to write ciphertext to stdout).
     pub(crate) fn value(&self, name: &str) -> Option<&str> {
-        let i = self.tokens.iter().position(|t| t == name)?;
-        self.tokens.get(i + 1).map(String::as_str)
+        let i = self.tokens.iter().position(|t| Self::is_flag(t, name))?;
+        match self.tokens.get(i + 1) {
+            Some(v) => Some(v.as_str()),
+            None => die(format!("missing value for {}", self.tokens[i])),
+        }
     }
 
     /// Whether the boolean flag `name` is present.
     pub(crate) fn flag(&self, name: &str) -> bool {
-        self.tokens.iter().any(|t| t == name)
+        self.tokens.iter().any(|t| Self::is_flag(t, name))
     }
 
     /// Returns the position (argv index, post-subcommand) of the last
     /// occurrence of `name`, if any. Useful for last-wins flag semantics
     /// (e.g. choosing between `-tls1_2` and `-dtls1_3`).
     pub(crate) fn last_pos(&self, name: &str) -> Option<usize> {
-        self.tokens.iter().rposition(|t| t == name)
+        self.tokens.iter().rposition(|t| Self::is_flag(t, name))
     }
 
     /// Positional arguments — tokens that are neither a flag nor the value of a
@@ -95,7 +115,7 @@ impl Args {
                 skip = false;
                 continue;
             }
-            if value_flags.contains(&t.as_str()) {
+            if value_flags.iter().any(|f| Self::is_flag(t, f)) {
                 skip = true; // consume this flag's value
                 continue;
             }

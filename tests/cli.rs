@@ -101,6 +101,62 @@ fn hash_unknown_algorithm_fails() {
     assert!(!ok);
 }
 
+/// `docs/cli.md` promises `-flag` and `--flag` are interchangeable. Several
+/// subcommands looked up only the single-dash spelling, so an optional
+/// `--salt` / `--info` was silently dropped (a *different* key derived with
+/// exit 0) and `rand … --out FILE` printed the bytes to stdout instead of
+/// writing the file. The equivalence now lives in the shared `Args`.
+#[test]
+fn double_dash_flags_are_equivalent_to_single_dash() {
+    let single = run(
+        &[
+            "kdf", "hkdf", "-ikm", "0b0b", "-salt", "0001", "-info", "f0f1", "-len", "16",
+        ],
+        b"",
+    );
+    let double = run(
+        &[
+            "kdf", "hkdf", "--ikm", "0b0b", "--salt", "0001", "--info", "f0f1", "--len", "16",
+        ],
+        b"",
+    );
+    let none = run(&["kdf", "hkdf", "-ikm", "0b0b", "-len", "16"], b"");
+    assert!(single.1 && double.1 && none.1);
+    assert_eq!(single.0, double.0, "--salt/--info must not be ignored");
+    assert_ne!(single.0, none.0);
+
+    let dir = std::env::temp_dir().join(format!("pc_ddash_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("seed.bin");
+    let (stdout, ok) = run(&["rand", "8", "--out", out.to_str().unwrap()], b"");
+    assert!(ok);
+    assert!(
+        stdout.is_empty(),
+        "--out must not fall back to stdout: {stdout:?}"
+    );
+    // `rand -out` writes the hex encoding (16 chars + newline) unless
+    // `-binary` is given.
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(written.trim().len(), 16, "got: {written:?}");
+    assert!(written.trim().bytes().all(|b| b.is_ascii_hexdigit()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A value-taking flag given as the last token has no value; it must be a
+/// usage error, not a silent fall-back to the default (`enc … -out` used to
+/// write the ciphertext to stdout, `x509 … -days` minted a 365-day cert).
+#[test]
+fn trailing_value_flag_without_value_is_an_error() {
+    let (out, err, ok) = run_capture(&["rand", "4", "-out"], b"");
+    assert!(!ok);
+    assert!(out.is_empty(), "nothing may be emitted: {out:?}");
+    assert!(err.contains("missing value for -out"), "got: {err}");
+    let (_out, err, ok) = run_capture(&["hash", "sha256", "--out"], b"abc");
+    assert!(!ok);
+    assert!(err.contains("missing value for --out"), "got: {err}");
+}
+
 #[test]
 fn rand_emits_hex() {
     let (out, ok) = run(&["rand", "16"], b"");
