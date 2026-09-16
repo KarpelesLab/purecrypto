@@ -7238,8 +7238,10 @@ mod tls12_loopback_tests {
     }
 
     /// A `HelloRequest` (RFC 5246 §7.4.1.1) is a renegotiation prompt. The
-    /// TLS 1.2 client refuses renegotiation entirely; receiving one — at any
-    /// state, but particularly after Connected — yields `UnexpectedMessage`.
+    /// TLS 1.2 client refuses renegotiation entirely: mid-handshake it is a
+    /// fatal `UnexpectedMessage`; after `Connected` it is ignored and
+    /// answered with a warning-level `no_renegotiation` alert (RFC 5746
+    /// §4.2), the connection staying open.
     #[test]
     fn tls12_client_rejects_hello_request_post_handshake() {
         // ---- Phase 1: mid-handshake plaintext HR ----
@@ -7301,17 +7303,62 @@ mod tls12_loopback_tests {
         }
         assert!(!client2.is_handshaking() && !server2.is_handshaking());
         // Have the server emit an AEAD-encrypted HelloRequest under its
-        // outbound crypter. The client must reject as `UnexpectedMessage`.
+        // outbound crypter. The client ignores it (RFC 5246 §7.4.1.1 "MAY
+        // ignore") and answers with a warning `no_renegotiation` alert
+        // (RFC 5746 §4.2) instead of failing the connection.
         let hr = HelloRequest.encode();
         server2
             .test_emit_encrypted(ContentType::Handshake, &hr)
             .unwrap();
         let s = server2.write_tls();
         client2.read_tls(&s);
-        assert!(matches!(
-            client2.process_new_packets(),
-            Err(Error::UnexpectedMessage)
-        ));
+        client2.process_new_packets().unwrap();
+        assert!(!client2.is_handshaking(), "the connection stays open");
+        assert!(!client2.received_close_notify());
+
+        // Exactly one alert record went out: content type `alert`, carrying
+        // a 2-byte body under AES-128-GCM (8-byte explicit nonce + 2 + 16-byte
+        // tag = 26).
+        let reply = client2.write_tls();
+        let rec = super::super::codec::read_record(&reply).unwrap().unwrap();
+        assert_eq!(rec.content_type, ContentType::Alert);
+        assert_eq!(rec.fragment.len(), 8 + 2 + 16);
+        assert_eq!(rec.len, reply.len(), "a single record");
+        // The server accepts it as a benign warning (RFC 5246 §7.2.1) — a
+        // fatal-level alert would have closed it — and the session keeps
+        // carrying data both ways.
+        server2.read_tls(&reply);
+        server2.process_new_packets().unwrap();
+        assert!(!server2.received_close_notify());
+        server2.send_application_data(b"still here").unwrap();
+        client2.read_tls(&server2.write_tls());
+        client2.process_new_packets().unwrap();
+        assert_eq!(client2.take_received_plaintext(), b"still here");
+        client2.send_application_data(b"and back").unwrap();
+        server2.read_tls(&client2.write_tls());
+        server2.process_new_packets().unwrap();
+        assert_eq!(server2.take_received_plaintext(), b"and back");
+
+        // Further prompts are ignored silently: one warning per connection.
+        for _ in 0..3 {
+            server2
+                .test_emit_encrypted(ContentType::Handshake, &hr)
+                .unwrap();
+        }
+        client2.read_tls(&server2.write_tls());
+        client2.process_new_packets().unwrap();
+        assert!(
+            client2.write_tls().is_empty(),
+            "repeated HelloRequests must not queue more alerts"
+        );
+
+        // A HelloRequest with a body is malformed (`struct { }`), even
+        // post-handshake.
+        server2
+            .test_emit_encrypted(ContentType::Handshake, &[0u8, 0, 0, 1, 0xAA])
+            .unwrap();
+        client2.read_tls(&server2.write_tls());
+        assert!(matches!(client2.process_new_packets(), Err(Error::Decode)));
     }
 
     /// Records whose `legacy_version` field is below 0x0301 (SSL 3.0 or

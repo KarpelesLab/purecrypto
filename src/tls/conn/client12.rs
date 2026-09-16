@@ -610,6 +610,11 @@ pub struct ClientConnection12 {
     /// transport close (truncation attack) — `state` alone can't, since
     /// failure paths also park the connection in [`State::Closed`].
     received_close_notify: bool,
+    /// True once we have answered a post-handshake `HelloRequest` with a
+    /// warning `no_renegotiation` alert. We reply once per connection and
+    /// silently ignore any further prompts, so a server streaming them
+    /// cannot make us queue an unbounded number of alerts.
+    hello_request_warned: bool,
     /// True once the handshake has actually completed (the server's Finished
     /// verified and the engine entered [`State::Connected`]). Sticky: it stays
     /// set after a later transition to [`State::Closed`], and — unlike
@@ -883,6 +888,7 @@ impl ClientConnection12 {
             server_name: String::from(server_name),
             state: State::WaitServerHello,
             received_close_notify: false,
+            hello_request_warned: false,
             handshake_completed: false,
             inbuf: Vec::new(),
             in_off: 0,
@@ -1022,6 +1028,7 @@ impl ClientConnection12 {
             server_name: String::from(server_name),
             state: State::WaitServerHello,
             received_close_notify: false,
+            hello_request_warned: false,
             handshake_completed: false,
             inbuf: Vec::new(),
             in_off: 0,
@@ -1698,12 +1705,28 @@ impl ClientConnection12 {
         let (msg_type, body) = read_handshake(&mut c)?;
 
         // RFC 5246 §7.4.1.1: `HelloRequest` is a renegotiation prompt. We do
-        // not support renegotiation — reject it whatever the current state.
-        // (Both before and after the handshake completes: a server that
-        // emits it mid-flight is misbehaving; one that emits it after we
-        // reach `Connected` is requesting renegotiation, which we refuse.)
+        // not support renegotiation. Once `Connected`, the client "MAY
+        // ignore" it, and RFC 5746 §4.2 recommends answering with a
+        // warning-level `no_renegotiation` alert so the server learns the
+        // request was declined without the connection being torn down. A
+        // server that emits it mid-handshake is misbehaving, and that stays
+        // a fatal `unexpected_message`.
         if msg_type == hs_type::HELLO_REQUEST {
-            return Err(Error::UnexpectedMessage);
+            if self.state != State::Connected {
+                return Err(Error::UnexpectedMessage);
+            }
+            // `struct { } HelloRequest`: a non-empty body is malformed.
+            if !body.is_empty() {
+                return Err(Error::Decode);
+            }
+            // One warning per connection; further prompts are ignored so a
+            // stream of them cannot make us queue an unbounded backlog.
+            if !self.hello_request_warned {
+                self.hello_request_warned = true;
+                let alert = [1u8, AlertDescription::NoRenegotiation.as_u8()]; // level = warning
+                self.emit_alert(&alert)?;
+            }
+            return Ok(());
         }
 
         match self.state {
