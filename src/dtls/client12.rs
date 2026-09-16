@@ -408,13 +408,15 @@ impl DtlsClientConnection12 {
                         self.out_dgrams.push(dg);
                     }
                 }
-                // A handshake retransmit makes every half-assembled inbound
-                // message stale (the peer resends its whole flight), so
-                // drop them — evicting any poisoned reassembly candidate
-                // seeded by a spoofed epoch-0 fragment, which otherwise has
-                // no expiry. Established connections keep their partials.
+                // If nothing of the peer's flight arrived since the last
+                // timer fire, drop the half-assembled inbound messages —
+                // evicting any poisoned reassembly candidate seeded by a
+                // spoofed epoch-0 fragment, which otherwise has no expiry.
+                // Partials that grew since then are kept: a fragmented
+                // Certificate must assemble across retransmissions under
+                // loss. Established connections keep their partials.
                 if self.state != State::Connected {
-                    self.reassembler.clear();
+                    self.reassembler.clear_if_stalled();
                 }
             }
             super::reliability::Action::GiveUp => {

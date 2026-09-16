@@ -2139,6 +2139,51 @@ mod dtls13 {
         assert_eq!(server.take_received(), b"after-lost-hrr");
     }
 
+    /// Regression: the default ServerHello carries an X25519MLKEM768 share
+    /// and is fragmented across two epoch-0 records. Under loss the two
+    /// fragments arrive in different rounds, and in between the client's
+    /// own retransmit timer fires. That timer used to wipe the client's
+    /// reassembler wholesale, discarding the fragment already held, so the
+    /// hello only assembled once both fragments survived the same round
+    /// trip. Fragments must accumulate across retransmissions (RFC 9147
+    /// §5.5 / RFC 6347 §4.2.3).
+    #[test]
+    fn fragmented_server_hello_survives_client_retransmit_timer() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-sh-frag", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        let flight = server.pop_outbound_datagrams();
+        // Two plaintext (legacy header, type 22) records: the two fragments
+        // of the ServerHello; everything after is protected.
+        assert!(flight.len() >= 3);
+        assert_eq!(flight[0][0], 0x16);
+        assert_eq!(flight[1][0], 0x16);
+        assert_eq!(flight[2][0] & 0b1110_0000, 0b0010_0000);
+        // Round 1: only the second fragment gets through.
+        client.feed_datagram(&flight[1]).unwrap();
+        // The client's CH retransmit timer fires in between.
+        let deadline = client.next_timeout().expect("CH in flight");
+        client.on_timeout(deadline);
+        let _ = client.pop_outbound_datagrams();
+        // Round 2: the first fragment (as the server would retransmit it)
+        // and the rest of the flight.
+        client.feed_datagram(&flight[0]).unwrap();
+        for dg in &flight[2..] {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(
+            client.is_handshake_complete(),
+            "ServerHello must assemble from fragments received across a retransmit"
+        );
+        assert!(pump_handshake_13(&mut client, &mut server));
+    }
+
     /// DTLS-2 / DTLS-4: the cookie-required CH1 path must NOT pin
     /// per-connection handshake state (suite, group, transcript). All such
     /// state must be derived from the cookie's `aux` payload on CH2.
@@ -3232,6 +3277,39 @@ mod security_regressions {
             r.feed(read_fragment(&good).unwrap()),
             Some((hs_type::CLIENT_HELLO, b"whole".to_vec()))
         );
+    }
+
+    /// `clear_if_stalled` keeps partials that grew since the previous call
+    /// (the peer's flight is trickling in), tolerates one fire without
+    /// progress (a lossy round trip), and drops them on the second
+    /// consecutive stalled fire (the flight has stopped; a poisoned
+    /// candidate must not outlive the retry).
+    #[test]
+    fn clear_if_stalled_keeps_growing_partials_and_drops_stale_ones() {
+        let mut r = Reassembler::new();
+        let first = raw_fragment(hs_type::CLIENT_HELLO, 8, 0, 0, b"abcd");
+        assert!(r.feed(read_fragment(&first).unwrap()).is_none());
+        r.clear_if_stalled(); // bytes arrived: kept, strike count reset
+        // A duplicate of already-held bytes is not progress …
+        assert!(r.feed(read_fragment(&first).unwrap()).is_none());
+        r.clear_if_stalled(); // … but a single stalled fire still keeps it.
+        let second = raw_fragment(hs_type::CLIENT_HELLO, 8, 0, 4, b"efgh");
+        assert_eq!(
+            r.feed(read_fragment(&second).unwrap()),
+            Some((hs_type::CLIENT_HELLO, b"abcdefgh".to_vec()))
+        );
+        // Next message: two consecutive stalled fires drop the partial.
+        let partial = raw_fragment(hs_type::CLIENT_HELLO, 8, 1, 0, b"abcd");
+        assert!(r.feed(read_fragment(&partial).unwrap()).is_none());
+        r.clear_if_stalled(); // progressed: kept
+        r.clear_if_stalled(); // stalled once: kept
+        r.clear_if_stalled(); // stalled twice: dropped
+        let tail = raw_fragment(hs_type::CLIENT_HELLO, 8, 1, 4, b"efgh");
+        assert!(
+            r.feed(read_fragment(&tail).unwrap()).is_none(),
+            "the stale partial must have been dropped"
+        );
+        assert_eq!(r.expected_msg_seq(), 1);
     }
 
     /// End-to-end: a single spoofed epoch-0 ClientHello fragment injected

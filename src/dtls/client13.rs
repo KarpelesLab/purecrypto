@@ -508,13 +508,16 @@ impl DtlsClientConnection13 {
         match self.retransmit.on_timeout(now) {
             super::reliability::Action::Retransmit => {
                 self.retransmit_in_flight();
-                // See the matching comment in the DTLS 1.3 server: a
-                // handshake retransmit makes every half-assembled inbound
-                // message stale, so drop them and with them any poisoned
-                // reassembly candidate seeded by a spoofed epoch-0
-                // fragment. Established connections keep their partials.
+                // See the matching comment in the DTLS 1.3 server: drop
+                // the half-assembled inbound messages only when nothing of
+                // the peer's flight arrived since the last timer fire. A
+                // fragmented ServerHello (hybrid key share) must assemble
+                // from fragments that survived different retransmissions;
+                // a stalled map is cleared to evict any poisoned candidate
+                // seeded by a spoofed epoch-0 fragment. Established
+                // connections keep their partials.
                 if self.state != State::Connected {
-                    self.reassembler.clear();
+                    self.reassembler.clear_if_stalled();
                 }
             }
             super::reliability::Action::GiveUp => {

@@ -560,17 +560,19 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         match self.retransmit.on_timeout(now) {
             super::reliability::Action::Retransmit => {
                 self.retransmit_in_flight();
-                // Handshake retransmit: the peer answers by resending its
-                // whole flight, so half-assembled inbound handshake
-                // messages are stale. Dropping them evicts any poisoned
-                // reassembly candidate seeded by a spoofed epoch-0
-                // fragment, which otherwise has no expiry at all. Only
-                // while still handshaking — an established connection's
-                // partials are AEAD-authenticated and must survive.
+                // Handshake retransmit: if nothing of the peer's flight
+                // arrived since the last timer fire, drop the half-assembled
+                // inbound handshake messages — evicting any poisoned
+                // reassembly candidate seeded by a spoofed epoch-0 fragment,
+                // which otherwise has no expiry at all. Partials that grew
+                // since then are kept so a fragmented message can assemble
+                // across retransmissions under loss. Only while still
+                // handshaking — an established connection's partials are
+                // AEAD-authenticated and must survive.
                 if self.state != State::Connected {
                     self.pre_state_reasm = None;
                     if let Some(r) = self.reassembler.as_mut() {
-                        r.clear();
+                        r.clear_if_stalled();
                     }
                 }
             }

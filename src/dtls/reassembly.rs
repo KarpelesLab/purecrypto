@@ -304,7 +304,21 @@ pub(crate) struct Reassembler {
     fifo_eviction: bool,
     /// Monotonic admission counter stamped on each new candidate.
     admit_counter: u64,
+    /// Set whenever `feed` stores bytes it had not seen before; consumed by
+    /// [`Self::clear_if_stalled`]. Tells the retransmit path whether the
+    /// peer's flight is still trickling in (keep the partials) or has
+    /// stopped arriving (drop them).
+    progressed: bool,
+    /// Consecutive [`Self::clear_if_stalled`] calls that saw no progress.
+    stalled_fires: u8,
 }
+
+/// Consecutive retransmit-timer fires without a single new byte before the
+/// in-progress reassemblies are dropped. Two: one lossy round trip in which
+/// the peer's retransmission happened to lose exactly the fragments still
+/// missing is common at the loss rates where fragments start to matter, two
+/// in a row means the flight has stopped (or was spoofed to begin with).
+const STALLED_FIRES_TO_CLEAR: u8 = 2;
 
 impl Reassembler {
     /// Creates a fresh reassembler waiting on `message_seq = 0`, with the
@@ -326,6 +340,8 @@ impl Reassembler {
             max_in_progress,
             fifo_eviction: false,
             admit_counter: 0,
+            progressed: false,
+            stalled_fires: 0,
         }
     }
 
@@ -470,13 +486,18 @@ impl Reassembler {
                 return None;
             }
         }
+        let mut stored_new = false;
         for (i, &b) in frag.fragment.iter().enumerate() {
             let idx = off + i;
             if entry.set_received(idx) {
                 entry.buf[idx] = b;
                 entry.received_count += 1;
+                stored_new = true;
             }
             // else: duplicate byte — already verified to agree above.
+        }
+        if stored_new {
+            self.progressed = true;
         }
 
         // Empty messages (ServerHelloDone, HelloRequest) complete on receipt
@@ -515,14 +536,38 @@ impl Reassembler {
     }
 
     /// Drops every in-progress reassembly, keeping `expected_msg_seq`.
-    ///
-    /// Called when the retransmit machine decides the peer's flight never
-    /// arrived and resends ours: the peer answers a retransmit by resending
-    /// its *whole* flight, so any half-assembled inbound message is stale
-    /// and holding on to it only preserves a poisoned candidate (and its
-    /// share of the `max_in_progress` budget) across the retry.
     pub(crate) fn clear(&mut self) {
         self.in_progress.clear();
+        self.progressed = false;
+        self.stalled_fires = 0;
+    }
+
+    /// Drops every in-progress reassembly once [`STALLED_FIRES_TO_CLEAR`]
+    /// consecutive calls have seen no new bytes arrive; a call that finds
+    /// progress keeps the partials and resets the count.
+    ///
+    /// Called from the retransmit timer. The partials are worth dropping
+    /// when the peer's flight has stopped arriving altogether: the retry
+    /// lands in a clean map, which is also the only expiry a poisoned
+    /// candidate seeded by a spoofed epoch-0 fragment ever gets. They are
+    /// worth keeping while the flight is trickling in under loss: a
+    /// fragmented ServerHello (hybrid key share) or Certificate must be
+    /// able to assemble from fragments that survived *different*
+    /// retransmissions (RFC 6347 §4.2.3 / RFC 9147 §5.5). Clearing on
+    /// every one of our own retransmits threw away what the peer had just
+    /// managed to deliver, so the handshake only completed once every
+    /// fragment survived the same round trip; one lossy round trip with
+    /// nothing new is still no evidence the flight has stopped, hence the
+    /// two-strike rule.
+    pub(crate) fn clear_if_stalled(&mut self) {
+        if core::mem::take(&mut self.progressed) {
+            self.stalled_fires = 0;
+            return;
+        }
+        self.stalled_fires += 1;
+        if self.stalled_fires >= STALLED_FIRES_TO_CLEAR {
+            self.clear();
+        }
     }
 
     /// Pops the next-expected message if it has already been fully
