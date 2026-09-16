@@ -112,7 +112,7 @@ fn key_size(alg: Algo) -> usize {
 /// slice and judge its length themselves), turning a rejected nonce or
 /// input length into a clean `die()` rather than a panic.
 fn aead_tag<const N: usize>(alg_name: &str, res: Result<[u8; N], AeadError>) -> [u8; N] {
-    res.unwrap_or_else(|e| die(format!("{alg_name}: {e}")))
+    res.unwrap_or_else(|e| aead_die(alg_name, e))
 }
 
 /// The decrypt-side twin of [`aead_tag`]: `true` verified, `false` tag
@@ -122,7 +122,22 @@ fn aead_ok(alg_name: &str, res: Result<(), AeadError>) -> bool {
     match res {
         Ok(()) => true,
         Err(AeadError::TagMismatch) => false,
-        Err(e) => die(format!("{alg_name}: {e}")),
+        Err(e) => aead_die(alg_name, e),
+    }
+}
+
+/// Dies on an AEAD parameter the mode rejected. The library's error text is
+/// mode-neutral; a nonce-length rejection is the one an operator hits by
+/// hand, so spell out the accepted range for the mode instead.
+fn aead_die(alg_name: &str, e: AeadError) -> ! {
+    match e {
+        AeadError::InvalidNonceLength if alg_name.contains("CCM") => die(format!(
+            "{alg_name}: AES-CCM nonce must be 7..=13 bytes (12 recommended)"
+        )),
+        AeadError::InvalidNonceLength => die(format!(
+            "{alg_name}: nonce must be at least 1 byte (12 recommended)"
+        )),
+        e => die(format!("{alg_name}: {e}")),
     }
 }
 
