@@ -384,6 +384,78 @@ fn rejects_truncated_inputs_without_panic() {
     assert!(!verify_kat(&pk, &msg, &[]));
 }
 
+/// Fuzz-style smoke test over the whole verification surface (key parser,
+/// both signature formats, decompression, hash-to-point, the norm
+/// accumulation): a fixed-seed PRNG mutates the KAT public keys and
+/// signatures — bit flips, truncation, extension, random bodies behind a
+/// valid header, and a mismatched degree — and every call must return rather
+/// than panic (debug builds check every arithmetic overflow here). Results are
+/// deliberately not asserted beyond "the genuine inputs still verify".
+#[test]
+fn verify_never_panics_on_mutated_inputs() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let cases = [
+        (f512_pk(), f512_msg(), f512_sig(), 400usize),
+        (f1024_pk(), f1024_msg(), f1024_sig(), 120),
+    ];
+    for (pk, msg, sig, rounds) in &cases {
+        assert!(verify_kat(pk, msg, sig));
+        for round in 0..*rounds {
+            let mut s = sig.clone();
+            let mut k = pk.clone();
+            match round % 6 {
+                // A few random bit flips in the signature body.
+                0 => {
+                    for _ in 0..1 + (next() % 4) {
+                        let i = 1 + (next() as usize % (s.len() - 1));
+                        s[i] ^= 1 << (next() % 8);
+                    }
+                }
+                // Truncate or extend the signature.
+                1 => {
+                    let len = 1 + (next() as usize % (s.len() + 64));
+                    s.resize(len, (next() & 0xFF) as u8);
+                }
+                // Random body behind a valid compressed or padded header.
+                2 => {
+                    let len = 42 + (next() as usize % 1500);
+                    s = (0..len).map(|_| (next() & 0xFF) as u8).collect();
+                    s[0] = (if next() & 1 == 0 { 0x20 } else { 0x30 }) | (s[0] & 0x0F);
+                }
+                // Flip bits in the public key body (off-modulus coefficients,
+                // dirty padding bits) or corrupt its header.
+                3 => {
+                    let i = next() as usize % k.len();
+                    k[i] ^= 1 << (next() % 8);
+                }
+                // Resize the public key.
+                4 => {
+                    let len = next() as usize % (k.len() + 16);
+                    k.resize(len, (next() & 0xFF) as u8);
+                }
+                // Restamp the degree nibble on both, so lengths disagree with
+                // the header at every layer.
+                _ => {
+                    s[0] = (s[0] & 0xF0) | (next() & 0x0F) as u8;
+                    k[0] = (next() & 0x0F) as u8;
+                }
+            }
+            let _ = verify_with_format(&k, msg, &s, Format::Compressed);
+            let _ = verify_with_format(&k, msg, &s, Format::Padded);
+            if let Ok(key) = FalconPublicKey::from_bytes(&k) {
+                let _ = key.verify_with_format(msg, &s, Format::Compressed);
+                let _ = key.verify(msg, &s);
+            }
+        }
+    }
+}
+
 #[test]
 fn falcon512_unpadded_rejects_extra_trailing_zero_byte() {
     // The unpadded (compressed) format is variable-length: a whole unused
