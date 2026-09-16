@@ -614,6 +614,75 @@ mod tests {
         }
     }
 
+    /// RFC 8439 Appendix A.3 edge-case vectors. The §2.5.2 example above
+    /// never reaches the interesting part of `finish`: these are the
+    /// published probes for a partially reduced accumulator that is still
+    /// above `p`, for the `+ s` addition overflowing 2¹²⁸, for a carry out of
+    /// an all-ones limb, and for a polynomial result landing exactly on
+    /// `2¹³⁰ − 5` / `2¹³⁰ − 6` (the constant-time `h − p` select).
+    #[test]
+    fn rfc8439_a3_edge_cases() {
+        fn tag(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
+            let mut p = Poly1305::new(key);
+            p.update(msg);
+            p.finish()
+        }
+        let r2 = from_hex::<16>("02000000000000000000000000000000");
+        let r1 = from_hex::<16>("01000000000000000000000000000000");
+        let ones = [0xffu8; 16];
+        let mut key = [0u8; 32];
+
+        // Test Vector #1: all-zero key and message → all-zero tag.
+        assert_eq!(tag(&key, &[0u8; 64]), [0u8; 16]);
+
+        // #5: r = 2, s = 0, one all-ones block. h = 2·(2¹²⁹ − 1) mod p = 3.
+        key[..16].copy_from_slice(&r2);
+        key[16..].fill(0);
+        assert_eq!(
+            tag(&key, &ones),
+            from_hex::<16>("03000000000000000000000000000000")
+        );
+
+        // #6: r = 2, s = 2¹²⁸ − 1, message block 2: the `+ s` step overflows
+        // 2¹²⁸ and must wrap.
+        key[16..].copy_from_slice(&ones);
+        assert_eq!(
+            tag(&key, &r2),
+            from_hex::<16>("03000000000000000000000000000000")
+        );
+
+        // #7: r = 1, s = 0, three blocks: an all-ones data limb with a carry
+        // arriving from the limb below.
+        key[..16].copy_from_slice(&r1);
+        key[16..].fill(0);
+        let msg7 = from_hex::<48>(
+            "ffffffffffffffffffffffffffffffff\
+             f0ffffffffffffffffffffffffffffff\
+             11000000000000000000000000000000",
+        );
+        assert_eq!(
+            tag(&key, &msg7),
+            from_hex::<16>("05000000000000000000000000000000")
+        );
+
+        // #8: r = 1, s = 0: the polynomial result is exactly 2¹³⁰ − 5, which
+        // must reduce to zero.
+        let msg8 = from_hex::<48>(
+            "ffffffffffffffffffffffffffffffff\
+             fbfefefefefefefefefefefefefefefe\
+             01010101010101010101010101010101",
+        );
+        assert_eq!(tag(&key, &msg8), [0u8; 16]);
+
+        // #9: r = 2, s = 0: the polynomial result is exactly 2¹³⁰ − 6, one
+        // below p, so the `h − p` candidate must be rejected.
+        key[..16].copy_from_slice(&r2);
+        assert_eq!(
+            tag(&key, &from_hex::<16>("fdffffffffffffffffffffffffffffff")),
+            from_hex::<16>("faffffffffffffffffffffffffffffff")
+        );
+    }
+
     #[test]
     fn streaming_matches_one_shot() {
         let key =
