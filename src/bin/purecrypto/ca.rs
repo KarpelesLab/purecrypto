@@ -201,7 +201,13 @@ fn load_root_key(ca: &CaDir) -> RootKey {
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
         return RootKey::Rsa(k);
     }
+    if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(pem) {
+        return RootKey::Rsa(k);
+    }
     if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(pem) {
+        return RootKey::Ec(k);
+    }
+    if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem(pem) {
         return RootKey::Ec(k);
     }
     if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(pem) {
@@ -283,12 +289,20 @@ fn serial_to_be_bytes(serial: u64) -> Vec<u8> {
 
 /// Days from `-days` (default 365).
 fn days(args: &Args) -> u64 {
-    args.value("-days")
+    let n = args
+        .value("-days")
         .map(|d| {
             d.parse::<u64>()
                 .unwrap_or_else(|_| die("invalid -days value"))
         })
-        .unwrap_or(365)
+        .unwrap_or(365);
+    // `validity_days` screens the certificate paths; the CRL path uses this
+    // value directly, and `-days 0` would publish a CRL whose nextUpdate
+    // equals thisUpdate — stale the moment it is signed.
+    if n == 0 {
+        die("-days must be at least 1");
+    }
+    n
 }
 
 fn ca_dir(args: &Args) -> CaDir {

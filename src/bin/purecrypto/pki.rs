@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::util::die;
-use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
+use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::{OsRng, RngCore};
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::x509::extension::{
@@ -22,20 +22,32 @@ pub(crate) enum PrivateKey {
     Rsa(BoxedRsaPrivateKey),
     Ec(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
+    Ed448(Ed448PrivateKey),
 }
 
 impl PrivateKey {
-    /// Loads an RSA PKCS#1, EC SEC1, or Ed25519 PKCS#8 private-key PEM.
+    /// Loads an RSA (PKCS#1 or PKCS#8), EC (SEC1 or PKCS#8), Ed25519 or
+    /// Ed448 (PKCS#8) private-key PEM — every key `genpkey` can produce
+    /// that `CertSigner` can sign with.
     pub(crate) fn from_pem(pem: &str) -> Option<Self> {
         if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
+            return Some(PrivateKey::Rsa(k));
+        }
+        if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(pem) {
             return Some(PrivateKey::Rsa(k));
         }
         if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(pem) {
             return Some(PrivateKey::Ec(k));
         }
-        Ed25519PrivateKey::from_pkcs8_pem(pem)
+        if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem(pem) {
+            return Some(PrivateKey::Ec(k));
+        }
+        if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(pem) {
+            return Some(PrivateKey::Ed25519(k));
+        }
+        Ed448PrivateKey::from_pkcs8_pem(pem)
             .ok()
-            .map(PrivateKey::Ed25519)
+            .map(PrivateKey::Ed448)
     }
 
     /// Borrows a certificate/CSR signer.
@@ -44,6 +56,7 @@ impl PrivateKey {
             PrivateKey::Rsa(k) => CertSigner::Rsa(k),
             PrivateKey::Ec(k) => CertSigner::Ecdsa(k),
             PrivateKey::Ed25519(k) => CertSigner::Ed25519(k),
+            PrivateKey::Ed448(k) => CertSigner::Ed448(k),
         }
     }
 
@@ -53,6 +66,7 @@ impl PrivateKey {
             PrivateKey::Rsa(k) => AnyPublicKey::Rsa(k.public_key()),
             PrivateKey::Ec(k) => AnyPublicKey::Ecdsa(k.public_key()),
             PrivateKey::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()),
+            PrivateKey::Ed448(k) => AnyPublicKey::Ed448(k.public_key()),
         }
     }
 }
@@ -480,7 +494,15 @@ pub(crate) fn parse_sans(spec: &str) -> Vec<String> {
     list.split(',')
         .map(|e| e.trim())
         .filter(|e| !e.is_empty())
-        .map(|e| e.strip_prefix("DNS:").unwrap_or(e).to_string())
+        .map(|e| {
+            // `parse_subject` screens control characters; a SAN carrying a
+            // newline or NUL is just as malformed (and unusable by every
+            // relying party), so refuse it rather than certify it.
+            if e.bytes().any(|b| b < 0x20 || b == 0x7f) {
+                die("subjectAltName entry contains a control character");
+            }
+            e.strip_prefix("DNS:").unwrap_or(e).to_string()
+        })
         .collect()
 }
 

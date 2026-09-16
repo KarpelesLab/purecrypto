@@ -18,7 +18,12 @@ fn days(args: &Args) -> u64 {
 
 fn serial(args: &Args) -> u64 {
     args.value("-set_serial")
-        .map(|s| s.parse().unwrap_or_else(|_| die("invalid -set_serial")))
+        .map(|s| match s.parse::<u64>() {
+            // RFC 5280 §4.1.2.2: the serial MUST be a positive integer
+            // (`random_serial` already excludes zero).
+            Ok(0) | Err(_) => die("-set_serial must be a positive integer"),
+            Ok(n) => n,
+        })
         .unwrap_or_else(random_serial)
 }
 
