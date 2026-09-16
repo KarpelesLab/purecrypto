@@ -408,12 +408,22 @@ pub unsafe extern "C" fn pc_tls_cfg_set_certificate(
 
 /// Maps [`Identity::check_key_matches_leaf`](crate::tls::Identity::check_key_matches_leaf)
 /// onto the FFI status space: a key that belongs to a different pair is
-/// [`PcStatus::KeyMismatch`]; a leaf that does not parse is `BadEncoding`.
+/// [`PcStatus::KeyMismatch`]; a leaf that does not parse is `BadEncoding`;
+/// an ECDSA key on a curve without a TLS signature scheme is `Unsupported`.
 pub(super) fn check_key_matches_leaf(
     chain_der: &[Vec<u8>],
     key: &SigningKey,
 ) -> Result<(), PcStatus> {
     use crate::tls::{Error, Identity};
+    // Same rule as `ConfigBuilder::try_identity`: an ECDSA key on a curve
+    // with no IANA TLS `SignatureScheme` (secp256k1, SM2) could never sign a
+    // handshake a conformant peer verifies, so refuse it at configuration
+    // time rather than after a full round trip.
+    if let SigningKey::Ecdsa(k) = key
+        && crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve()).is_none()
+    {
+        return Err(PcStatus::Unsupported);
+    }
     match Identity::new(chain_der.to_vec(), key.clone()).check_key_matches_leaf() {
         Ok(()) => Ok(()),
         Err(Error::IdentityKeyMismatch) => Err(PcStatus::KeyMismatch),
