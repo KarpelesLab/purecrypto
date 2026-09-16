@@ -4457,10 +4457,15 @@ impl QuicConnection {
             None => match self.endpoint.crypto.at(level).rx.as_ref() {
                 Some(k) => k,
                 None => {
-                    // Keys for this level aren't installed yet. RFC 9001
-                    // §5.7 says we MAY buffer; Phase 4 simplification is to
-                    // drop the packet (and the rest of the datagram).
-                    return Ok(datagram.len());
+                    // Keys for this level aren't installed (not yet, or
+                    // already discarded). RFC 9001 §5.7 says we MAY buffer;
+                    // we drop the packet instead. Only *this* packet: its
+                    // Length field is authoritative (RFC 9000 §12.2), so the
+                    // packets coalesced behind it — which may well be
+                    // readable, e.g. a Handshake packet behind a 0-RTT one we
+                    // rejected, or behind an Initial we no longer hold keys
+                    // for — are processed on their own.
+                    return Ok(pkt_total_len);
                 }
             },
         };
@@ -7059,6 +7064,53 @@ mod tests {
             c.endpoint.crypto.at(Level::Handshake).rx.is_some(),
             "ServerHello in the leading Initial must have installed \
              Handshake rx keys"
+        );
+    }
+
+    /// RFC 9000 §12.2 — a coalesced packet we hold no keys for is skipped by
+    /// its Length field; the packets behind it are still processed. The
+    /// keys-missing branch used to consume the *whole* datagram remainder, so
+    /// a 0-RTT packet a server had no keys for (0-RTT rejected or never
+    /// offered) took the client's coalesced 1-RTT packet down with it — and
+    /// an Initial retransmit swallowed the Handshake packet behind it once
+    /// the receiver had discarded its Initial keys.
+    #[test]
+    fn coalesced_packet_without_keys_is_skipped_not_the_datagram() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert!(
+            s.endpoint.crypto.at(Level::EarlyData).rx.is_none(),
+            "precondition: the server never installed 0-RTT keys"
+        );
+        let sid = c.open_bidi().expect("open");
+        c.write(sid, b"behind-the-junk").expect("write");
+        let onertt = c.pop_datagram();
+        assert!(
+            !onertt.is_empty() && onertt[0] & 0x80 == 0,
+            "a 1-RTT packet"
+        );
+        // A syntactically valid 0-RTT long header (with a correct Length
+        // field) that the server cannot open, coalesced in front of it.
+        let mut dg = alloc::vec![0xc0u8 | (0x01 << 4)];
+        dg.extend_from_slice(&QUIC_V1.to_be_bytes());
+        dg.push(s.endpoint.cids.local.len() as u8);
+        dg.extend_from_slice(s.endpoint.cids.local.as_slice());
+        dg.push(8);
+        dg.extend_from_slice(&[0x5Au8; 8]);
+        let junk = 48usize;
+        crate::quic::varint::encode(junk as u64, &mut dg);
+        dg.extend(core::iter::repeat_n(0x33u8, junk));
+        dg.extend_from_slice(&onertt);
+        s.feed_datagram(&dg).expect("junk is a silent drop");
+        let mut buf = [0u8; 32];
+        let (n, _) = s.read(sid, &mut buf).expect("server read");
+        assert_eq!(
+            &buf[..n],
+            b"behind-the-junk",
+            "the 1-RTT packet behind the unreadable 0-RTT packet must be processed"
         );
     }
 
