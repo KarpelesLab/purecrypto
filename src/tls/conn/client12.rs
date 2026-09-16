@@ -1225,10 +1225,15 @@ impl ClientConnection12 {
         const CAP: usize = 1 << 14;
         // BEAST (TLS 1.0 CBC) mitigation: split the leading byte into its own
         // record so the predictable IV an attacker could exploit only ever
-        // covers one chosen byte (the 1/n-1 record split). Applies only to the
-        // opt-in TLS 1.0 path; TLS 1.1+ uses a fresh explicit IV per record.
+        // covers one chosen byte (the 1/n-1 record split). Applies to every
+        // chained-IV version — SSL 3.0 chains exactly like TLS 1.0 — on the
+        // opt-in legacy path; TLS 1.1+ uses a fresh explicit IV per record.
         #[cfg(feature = "tls-legacy")]
-        if self.negotiated_version == ProtocolVersion::TLSv1_0 && data.len() > 1 {
+        if matches!(
+            self.negotiated_version,
+            ProtocolVersion::TLSv1_0 | ProtocolVersion::SSLv3
+        ) && data.len() > 1
+        {
             self.emit_encrypted(ContentType::ApplicationData, &data[..1])?;
             for chunk in data[1..].chunks(CAP) {
                 self.emit_encrypted(ContentType::ApplicationData, chunk)?;

@@ -24,9 +24,10 @@
 //! TLS 1.0 record format and cannot be fixed in the record crypter itself;
 //! the write side mitigates it with the 1/n-1 record split (the leading
 //! plaintext byte is sent in a record of its own — see
-//! `client12::send_application_data` and `server12::send_application_data`),
-//! and TLS 1.1+ removes the flaw outright with the per-record random explicit
-//! IV. Avoid TLS 1.0 CBC wherever the peer offers anything newer.
+//! `client12::send_application_data` and `server12::send_application_data`;
+//! SSL 3.0 chains the same way and gets the same split), and TLS 1.1+
+//! removes the flaw outright with the per-record random explicit IV. Avoid
+//! TLS 1.0 CBC wherever the peer offers anything newer.
 //!
 //! To blunt **Lucky13**, the decrypt path also equalises the number of
 //! hash-compression blocks the MAC computation performs: after the real HMAC it

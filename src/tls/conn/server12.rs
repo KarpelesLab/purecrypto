@@ -717,10 +717,15 @@ impl<R: RngCore> ServerConnection12<R> {
         // Fragment to at most 2^14 bytes per record (RFC 5246 §6.2.1).
         const CAP: usize = 1 << 14;
         // BEAST (TLS 1.0 CBC) mitigation: 1/n-1 record split of the first byte.
-        // Applies only to the opt-in TLS 1.0 path; TLS 1.1+ uses fresh explicit
+        // Applies to every chained-IV version — SSL 3.0 chains exactly like
+        // TLS 1.0 — on the opt-in legacy path; TLS 1.1+ uses fresh explicit
         // IVs.
         #[cfg(feature = "tls-legacy")]
-        if self.negotiated_version == ProtocolVersion::TLSv1_0 && data.len() > 1 {
+        if matches!(
+            self.negotiated_version,
+            ProtocolVersion::TLSv1_0 | ProtocolVersion::SSLv3
+        ) && data.len() > 1
+        {
             self.emit_encrypted(ContentType::ApplicationData, &data[..1])?;
             for chunk in data[1..].chunks(CAP) {
                 self.emit_encrypted(ContentType::ApplicationData, chunk)?;

@@ -5114,6 +5114,71 @@ mod tls12_loopback_tests {
         );
     }
 
+    /// BEAST (CVE-2011-3389) applies to every chained-IV CBC version, SSL
+    /// 3.0 included: both engines must send application data with the 1/n-1
+    /// record split there, exactly as they do for TLS 1.0. Counts the
+    /// records each side emits for a multi-byte write.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn ssl3_application_data_uses_the_one_n_minus_one_split() {
+        use crate::tls::codec::read_record;
+        fn count_records(mut bytes: &[u8]) -> usize {
+            let mut n = 0;
+            while let Some(rec) = read_record(bytes).unwrap() {
+                bytes = &bytes[rec.len..];
+                n += 1;
+            }
+            n
+        }
+        let (server_config, cert_der) = rsa_server12();
+        let server_config = server_config.with_min_version(crate::tls::ProtocolVersion::SSLv3);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"ssl3-beast-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ssl3-beast-s", b"nonce", &[]);
+        let cfg = ClientConfig12::new(roots)
+            .with_min_version(crate::tls::ProtocolVersion::SSLv3)
+            .with_max_version(crate::tls::ProtocolVersion::SSLv3);
+        let mut client = ClientConnection12::new_with_offer(
+            cfg,
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        client.send_application_data(b"ping from client").unwrap();
+        let c = client.write_tls();
+        assert_eq!(count_records(&c), 2, "client must 1/n-1 split on SSL 3.0");
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ping from client");
+
+        server.send_application_data(b"pong from server").unwrap();
+        let s = server.write_tls();
+        assert_eq!(count_records(&s), 2, "server must 1/n-1 split on SSL 3.0");
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"pong from server");
+    }
+
     #[cfg(feature = "tls-legacy")]
     #[test]
     fn ssl3_rsa_aes128_cbc_sha() {
