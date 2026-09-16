@@ -647,6 +647,34 @@ impl Sm2Signature {
     }
 }
 
+/// Checks the OPTIONAL `[1] EXPLICIT BIT STRING` publicKey of a SEC1
+/// `ECPrivateKey` against the scalar that was just parsed, consuming it when
+/// present. Mirrors the boxed EC parser: a private key whose embedded public
+/// key belongs to a *different* scalar is not a key at all, so it is rejected
+/// at parse time rather than surfacing later as an unverifiable signature.
+#[cfg(feature = "der")]
+fn check_embedded_public_key(
+    seq: &mut crate::der::Reader<'_>,
+    key: &Sm2PrivateKey,
+) -> Result<(), Error> {
+    use crate::der::{Reader, tag};
+    if seq.peek_tag() != Some(tag::context(1)) {
+        // Absent: the field is OPTIONAL.
+        return Ok(());
+    }
+    let field = seq
+        .read_tlv(tag::context(1))
+        .map_err(|_| Error::Malformed)?;
+    let mut pr = Reader::new(field);
+    let bits = pr.read_bit_string().map_err(|_| Error::Malformed)?;
+    pr.finish().map_err(|_| Error::Malformed)?;
+    let embedded = Sm2PublicKey::from_sec1(bits)?;
+    if embedded.to_sec1() != key.public_key().to_sec1() {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
+}
+
 /// SEC1 `ECPrivateKey` and PKIX `SubjectPublicKeyInfo` encoding, reusing the
 /// SM2 named-curve OID so PKCS#8 / PEM round-trips through the shared DER
 /// machinery.
@@ -672,6 +700,13 @@ impl Sm2PrivateKey {
 
     /// Parses a SEC1 `ECPrivateKey` DER structure (the named curve must be
     /// `sm2p256v1`).
+    ///
+    /// Strict, like [`BoxedEcdsaPrivateKey::from_sec1_der`]: the OPTIONAL
+    /// `[1]` publicKey is checked against the private scalar when present (a
+    /// key that disagrees with itself is rejected), and trailing data inside
+    /// the `[0]` parameters, inside the structure, or after it is rejected.
+    ///
+    /// [`BoxedEcdsaPrivateKey::from_sec1_der`]: super::boxed::BoxedEcdsaPrivateKey::from_sec1_der
     pub fn from_sec1_der(der: &[u8]) -> Result<Self, Error> {
         use crate::der::{Reader, parse_oid, tag};
         let mut outer = Reader::new(der);
@@ -687,10 +722,15 @@ impl Sm2PrivateKey {
         let mut pr = Reader::new(params);
         let arcs = parse_oid(pr.read_oid().map_err(|_| Error::Malformed)?)
             .map_err(|_| Error::Malformed)?;
+        pr.finish().map_err(|_| Error::Malformed)?;
         if CurveId::from_named_curve_oid(&arcs) != Some(CURVE) {
             return Err(Error::Malformed);
         }
-        Self::from_bytes(priv_bytes)
+        let key = Self::from_bytes(priv_bytes)?;
+        check_embedded_public_key(&mut seq, &key)?;
+        seq.finish().map_err(|_| Error::Malformed)?;
+        outer.finish().map_err(|_| Error::Malformed)?;
+        Ok(key)
     }
 
     /// Parses a SEC1 PEM EC private key (`sm2p256v1`).
@@ -717,7 +757,8 @@ impl Sm2PublicKey {
         crate::der::pem_encode("PUBLIC KEY", &self.to_spki_der())
     }
 
-    /// Parses a PKIX `SubjectPublicKeyInfo` for an SM2 key.
+    /// Parses a PKIX `SubjectPublicKeyInfo` for an SM2 key. Trailing data
+    /// after the structure is rejected.
     pub fn from_spki_der(der: &[u8]) -> Result<Self, Error> {
         use crate::der::{Reader, parse_oid};
         let mut reader = Reader::new(der);
@@ -736,6 +777,7 @@ impl Sm2PublicKey {
         algid.finish().map_err(|_| Error::Malformed)?;
         let key_bits = spki.read_bit_string().map_err(|_| Error::Malformed)?;
         spki.finish().map_err(|_| Error::Malformed)?;
+        reader.finish().map_err(|_| Error::Malformed)?;
         Self::from_sec1(key_bits)
     }
 }
@@ -917,6 +959,74 @@ mod tests {
         let sig = sk.sign(b"der", DEFAULT_ID, &mut rng).unwrap();
         let der = sig.to_der();
         assert_eq!(Sm2Signature::from_der(&der).unwrap(), sig);
+    }
+
+    /// The SEC1 / SPKI parsers must be as strict as the boxed EC ones: an
+    /// embedded `[1]` publicKey belonging to a different scalar, junk after
+    /// the curve OID inside `[0]`, and trailing data inside or after either
+    /// structure are all rejected — while keys without the optional public
+    /// key still load.
+    #[cfg(feature = "der")]
+    #[test]
+    fn sec1_and_spki_parsers_are_strict() {
+        use crate::der::{
+            encode_bit_string, encode_context, encode_integer, encode_octet_string,
+            encode_sequence, oid_tlv,
+        };
+        let mut rng = HmacDrbg::<Sha256>::new(b"sm2-strict", b"n", &[]);
+        let sk = Sm2PrivateKey::generate(&mut rng);
+        let other = Sm2PrivateKey::generate(&mut rng);
+
+        // Builds a SEC1 ECPrivateKey with the given `[0]` params body and
+        // optional `[1]` public key.
+        let sec1 = |params: &[u8], pubkey: Option<&Sm2PrivateKey>| {
+            let mut body = encode_integer(&[1]);
+            body.extend_from_slice(&encode_octet_string(&sk.to_bytes()));
+            body.extend_from_slice(&encode_context(0, params));
+            if let Some(k) = pubkey {
+                body.extend_from_slice(&encode_context(
+                    1,
+                    &encode_bit_string(&k.public_key().to_sec1()),
+                ));
+            }
+            encode_sequence(&body)
+        };
+        let oid = oid_tlv(CURVE.named_curve_oid());
+
+        // Baseline: with and without the optional public key.
+        for der in [sec1(&oid, Some(&sk)), sec1(&oid, None)] {
+            let k = Sm2PrivateKey::from_sec1_der(&der).unwrap();
+            assert_eq!(k.public_key().to_sec1(), sk.public_key().to_sec1());
+        }
+
+        // A public key belonging to a different scalar.
+        assert!(Sm2PrivateKey::from_sec1_der(&sec1(&oid, Some(&other))).is_err());
+
+        // Junk after the curve OID inside `[0]`.
+        let mut oid_junk = oid.clone();
+        oid_junk.extend_from_slice(&[0x05, 0x00]);
+        assert!(Sm2PrivateKey::from_sec1_der(&sec1(&oid_junk, None)).is_err());
+
+        // Trailing data inside the SEQUENCE (after `[1]`) and after it.
+        let inner = sec1(&oid, Some(&sk));
+        // Rebuild the SEQUENCE with an extra NULL element appended (the
+        // 2-byte header is `30 len`, the body is short-form).
+        let mut body = inner[2..].to_vec();
+        body.extend_from_slice(&[0x05, 0x00]);
+        assert!(Sm2PrivateKey::from_sec1_der(&encode_sequence(&body)).is_err());
+        let mut trailing = sec1(&oid, None);
+        trailing.push(0x00);
+        assert!(Sm2PrivateKey::from_sec1_der(&trailing).is_err());
+
+        // SPKI: trailing data after the structure.
+        let spki = sk.public_key().to_spki_der();
+        Sm2PublicKey::from_spki_der(&spki).unwrap();
+        let mut spki_trailing = spki.clone();
+        spki_trailing.push(0x00);
+        assert!(Sm2PublicKey::from_spki_der(&spki_trailing).is_err());
+
+        // The keys this crate emits still load.
+        Sm2PrivateKey::from_sec1_der(&sk.to_sec1_der()).unwrap();
     }
 
     /// An SM2 DER signature with an over-wide `r`/`s` must be rejected at
