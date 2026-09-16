@@ -1052,13 +1052,11 @@ impl<R: RngCore> ServerConnection12<R> {
         if msg_type != hs_type::CLIENT_HELLO {
             return Err(Error::UnexpectedMessage);
         }
+        // RFC 5246 §7.4.1.2: `SessionID<0..32>`. The shared codec rejects a
+        // longer one with `decode_error` before anything could echo it back
+        // (RFC 5077 §3.4 makes us echo it on resumption, and an oversized
+        // echo is itself a protocol violation).
         let ch = ClientHello::decode(body)?;
-        // RFC 5246 §7.4.1.2: `SessionID<0..32>`. Reject a longer one before
-        // anything could echo it back (RFC 5077 §3.4 makes us echo it on
-        // resumption, and an oversized echo is itself a protocol violation).
-        if ch.session_id.len() > 32 {
-            return Err(Error::IllegalParameter);
-        }
         self.client_session_id = ch.session_id.clone();
 
         // Version negotiation. Our engine tops out at TLS 1.2; a TLS 1.3
@@ -3487,9 +3485,6 @@ mod tests {
             &ch,
         );
         s.read_tls(&rec);
-        assert!(matches!(
-            s.process_new_packets(),
-            Err(Error::IllegalParameter)
-        ));
+        assert!(matches!(s.process_new_packets(), Err(Error::Decode)));
     }
 }
