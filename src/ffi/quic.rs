@@ -23,13 +23,12 @@ use core::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
-use crate::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
+use super::tls::{PcKey, parse_private_key_pem};
 use crate::quic::{
     CloseInitiator, CloseKind, QuicConfig, QuicConnection, Role as QuicRole, StreamId,
     TransportParameters,
 };
-use crate::rsa::BoxedRsaPrivateKey;
-use crate::tls::{Config, ConfigBuilder, ProtocolVersion, RootCertStore, SigningKey};
+use crate::tls::{Config, ConfigBuilder, ProtocolVersion, RootCertStore};
 
 /// QUIC v1 wire version. Mirrors the `PC_QUIC_V1` macro in
 /// `include/purecrypto.h`.
@@ -65,26 +64,12 @@ pub struct PcQuicCfg {
     require_retry: bool,
 }
 
+/// The identity `pc_quic_cfg_set_certificate` installs. The key is the
+/// TLS FFI's [`PcKey`], parsed by the same loader, so QUIC accepts exactly
+/// the key algorithms and PEM forms TLS does.
 struct CertAndKey {
     chain_der: Vec<Vec<u8>>,
     key: PcKey,
-}
-
-#[allow(clippy::large_enum_variant)]
-enum PcKey {
-    Rsa(BoxedRsaPrivateKey),
-    Ecdsa(BoxedEcdsaPrivateKey),
-    Ed25519(Ed25519PrivateKey),
-}
-
-impl PcKey {
-    fn to_signing_key(&self) -> SigningKey {
-        match self {
-            PcKey::Rsa(k) => SigningKey::Rsa(k.clone()),
-            PcKey::Ecdsa(k) => SigningKey::Ecdsa(k.clone()),
-            PcKey::Ed25519(k) => SigningKey::Ed25519(k.clone()),
-        }
-    }
 }
 
 impl PcQuicCfg {
@@ -226,7 +211,10 @@ pub unsafe extern "C" fn pc_quic_cfg_set_server_name(
 }
 
 /// Installs a server certificate chain (concatenated PEM, leaf first)
-/// plus a private key (PEM). Detects RSA / EC / Ed25519 from the key PEM.
+/// plus a private key (PEM). Detects RSA / EC / Ed25519 / Ed448 from the
+/// key PEM through the loader shared with `pc_tls_cfg_set_certificate`
+/// ([`parse_private_key_pem`]): PKCS#1 RSA, SEC1 EC, or PKCS#8 wrapping
+/// RSA / EC / Ed25519 / Ed448.
 ///
 /// # Safety
 /// All pointers valid for their declared lengths.
@@ -259,23 +247,7 @@ pub unsafe extern "C" fn pc_quic_cfg_set_certificate(
             Ok(s) => s,
             Err(_) => return PcStatus::BadEncoding,
         };
-        // Try formats in roughly best-known-first order, mirroring
-        // `pc_tls_cfg_set_certificate`: PKCS#1 RSA (the OpenSSL legacy
-        // `-----BEGIN RSA PRIVATE KEY-----`), PKCS#8 RSA (the modern
-        // `-----BEGIN PRIVATE KEY-----` envelope around an RSA key — what
-        // `openssl pkey` and `openssl genpkey` emit by default), SEC1 EC,
-        // PKCS#8 EC (`openssl genpkey -algorithm EC`), then PKCS#8 Ed25519.
-        let key = if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(key_str) {
-            PcKey::Rsa(k)
-        } else if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(key_str) {
-            PcKey::Rsa(k)
-        } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(key_str) {
-            PcKey::Ecdsa(k)
-        } else if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem(key_str) {
-            PcKey::Ecdsa(k)
-        } else if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(key_str) {
-            PcKey::Ed25519(k)
-        } else {
+        let Some(key) = parse_private_key_pem(key_str) else {
             return PcStatus::BadEncoding;
         };
         // Both halves parsed; now make sure they are the SAME pair (else the

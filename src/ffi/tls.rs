@@ -117,8 +117,11 @@ struct CertAndKey {
     key: PcKey,
 }
 
+/// A private key accepted by `pc_tls_cfg_set_certificate` and
+/// `pc_quic_cfg_set_certificate`. One type for both stacks, so the set of
+/// key algorithms the two C entry points accept can never drift apart.
 #[allow(clippy::large_enum_variant)]
-enum PcKey {
+pub(super) enum PcKey {
     Rsa(BoxedRsaPrivateKey),
     Ecdsa(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
@@ -126,13 +129,40 @@ enum PcKey {
 }
 
 impl PcKey {
-    fn to_signing_key(&self) -> SigningKey {
+    pub(super) fn to_signing_key(&self) -> SigningKey {
         match self {
             PcKey::Rsa(k) => SigningKey::Rsa(k.clone()),
             PcKey::Ecdsa(k) => SigningKey::Ecdsa(k.clone()),
             PcKey::Ed25519(k) => SigningKey::Ed25519(k.clone()),
             PcKey::Ed448(k) => SigningKey::Ed448(k.clone()),
         }
+    }
+}
+
+/// Parses the private-key PEM handed to `pc_tls_cfg_set_certificate` /
+/// `pc_quic_cfg_set_certificate` — the one loader both use, so they accept
+/// exactly the same forms: PKCS#1 RSA (the OpenSSL legacy
+/// `-----BEGIN RSA PRIVATE KEY-----`), SEC1 EC
+/// (`-----BEGIN EC PRIVATE KEY-----`), and PKCS#8
+/// (`-----BEGIN PRIVATE KEY-----`, what `openssl pkey` / `openssl genpkey`
+/// emit) wrapping RSA, EC, Ed25519 or Ed448. Formats are tried in roughly
+/// best-known-first order; the PKCS#8 parsers each check the algorithm OID,
+/// so the shared label is not ambiguous. `None` when nothing matches.
+pub(super) fn parse_private_key_pem(key_str: &str) -> Option<PcKey> {
+    if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(key_str) {
+        Some(PcKey::Rsa(k))
+    } else if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(key_str) {
+        Some(PcKey::Rsa(k))
+    } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(key_str) {
+        Some(PcKey::Ecdsa(k))
+    } else if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem(key_str) {
+        Some(PcKey::Ecdsa(k))
+    } else if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(key_str) {
+        Some(PcKey::Ed25519(k))
+    } else if let Ok(k) = Ed448PrivateKey::from_pkcs8_pem(key_str) {
+        Some(PcKey::Ed448(k))
+    } else {
+        None
     }
 }
 
@@ -339,7 +369,9 @@ pub unsafe extern "C" fn pc_tls_cfg_set_server_name(
 }
 
 /// Installs a certificate chain (concatenated PEM, leaf first) plus a private
-/// key (PEM). Detects RSA / EC / Ed25519 / Ed448 from the key PEM.
+/// key (PEM). Detects RSA / EC / Ed25519 / Ed448 from the key PEM; see
+/// [`parse_private_key_pem`] for the accepted forms (shared with
+/// `pc_quic_cfg_set_certificate`).
 ///
 /// # Safety
 /// All pointers valid for their lengths.
@@ -372,27 +404,7 @@ pub unsafe extern "C" fn pc_tls_cfg_set_certificate(
             Ok(s) => s,
             Err(_) => return PcStatus::BadEncoding,
         };
-        // Try formats in roughly best-known-first order: PKCS#1 RSA (the
-        // OpenSSL legacy `-----BEGIN RSA PRIVATE KEY-----`), PKCS#8 RSA
-        // (the modern `-----BEGIN PRIVATE KEY-----` envelope around an RSA
-        // key — what `openssl pkey` and `openssl genpkey` emit by default
-        // since 1.0.2), SEC1 EC, PKCS#8 EC (what `openssl genpkey -algorithm
-        // EC` and `openssl pkey` emit), then PKCS#8 Ed25519 / Ed448. The
-        // PKCS#8 parsers each check the algorithm OID, so the shared
-        // `-----BEGIN PRIVATE KEY-----` label is not ambiguous.
-        let key = if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(key_str) {
-            PcKey::Rsa(k)
-        } else if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(key_str) {
-            PcKey::Rsa(k)
-        } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(key_str) {
-            PcKey::Ecdsa(k)
-        } else if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem(key_str) {
-            PcKey::Ecdsa(k)
-        } else if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(key_str) {
-            PcKey::Ed25519(k)
-        } else if let Ok(k) = Ed448PrivateKey::from_pkcs8_pem(key_str) {
-            PcKey::Ed448(k)
-        } else {
+        let Some(key) = parse_private_key_pem(key_str) else {
             return PcStatus::BadEncoding;
         };
         // Both halves parsed; now make sure they are the SAME pair. Without

@@ -2330,3 +2330,101 @@ fn out_len_is_zeroed_on_error_paths() {
     assert_eq!((s, ns, has), (0, 0, 0));
     unsafe { tls::pc_tls_free(client) };
 }
+
+// ---- TLS and QUIC accept the same private-key forms -----------------------
+
+/// A self-signed identity `(chain_pem, key_pem)` for each key algorithm the
+/// two `*_cfg_set_certificate` entry points accept, keyed by the PEM form
+/// the loader must recognise.
+fn identities_for_every_key_form()
+-> Vec<(&'static str, alloc::string::String, alloc::string::String)> {
+    use crate::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+    let mut rng = crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"ffi-key-forms", b"nonce", &[]);
+    let name = DistinguishedName::common_name("loopback.example");
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2044, 1, 1, 0, 0, 0),
+    );
+    let cert = |signer: &CertSigner| {
+        Certificate::self_signed_general(signer, &name, &validity, 1, false, &["loopback.example"])
+            .unwrap()
+            .to_pem()
+    };
+    let ec = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let ed25519 = Ed25519PrivateKey::generate(&mut rng);
+    let ed448 = Ed448PrivateKey::generate(&mut rng);
+    vec![
+        ("EC SEC1", cert(&CertSigner::Ecdsa(&ec)), ec.to_sec1_pem()),
+        (
+            "EC PKCS#8",
+            cert(&CertSigner::Ecdsa(&ec)),
+            ec.to_pkcs8_pem(),
+        ),
+        (
+            "Ed25519 PKCS#8",
+            cert(&CertSigner::Ed25519(&ed25519)),
+            ed25519.to_pkcs8_pem(),
+        ),
+        (
+            "Ed448 PKCS#8",
+            cert(&CertSigner::Ed448(&ed448)),
+            ed448.to_pkcs8_pem(),
+        ),
+    ]
+}
+
+/// `pc_quic_cfg_set_certificate` used to have its own copy of the key
+/// loader, one arm short: an Ed448 key was `BadEncoding` for QUIC while
+/// TLS accepted it. Both entry points now share one loader, so every key
+/// form is accepted by both — and an Ed448 identity carries a QUIC
+/// handshake end to end.
+#[test]
+fn tls_and_quic_set_certificate_accept_the_same_key_forms() {
+    for (form, chain_pem, key_pem) in identities_for_every_key_form() {
+        let tcfg = tls::pc_tls_cfg_new(1, 0x0304);
+        assert!(!tcfg.is_null());
+        assert_eq!(
+            unsafe {
+                tls::pc_tls_cfg_set_certificate(
+                    tcfg,
+                    chain_pem.as_ptr(),
+                    chain_pem.len(),
+                    key_pem.as_ptr(),
+                    key_pem.len(),
+                )
+            },
+            PcStatus::Ok,
+            "TLS rejects {form}"
+        );
+        unsafe { tls::pc_tls_cfg_free(tcfg) };
+
+        let qcfg = quic::pc_quic_cfg_new(1);
+        assert!(!qcfg.is_null());
+        assert_eq!(
+            unsafe {
+                quic::pc_quic_cfg_set_certificate(
+                    qcfg,
+                    chain_pem.as_ptr(),
+                    chain_pem.len(),
+                    key_pem.as_ptr(),
+                    key_pem.len(),
+                )
+            },
+            PcStatus::Ok,
+            "QUIC rejects {form}"
+        );
+        unsafe { quic::pc_quic_cfg_free(qcfg) };
+    }
+
+    // The Ed448 identity is usable, not merely accepted: a full QUIC
+    // handshake completes under it, and the client sees that leaf.
+    let (_, chain_pem, key_pem) = identities_for_every_key_form().pop().unwrap();
+    let (client, server) = quic_loopback_pair_with(&chain_pem, &key_pem);
+    let leaf = read_out(|p, l| unsafe { quic::pc_quic_peer_certificate(client, p, l) });
+    assert_eq!(leaf, pem_decode(&chain_pem, "CERTIFICATE").unwrap());
+    unsafe {
+        quic::pc_quic_free(client);
+        quic::pc_quic_free(server);
+    }
+}

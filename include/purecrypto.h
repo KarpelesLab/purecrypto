@@ -872,8 +872,9 @@ void       pc_quic_cfg_free(PcQuicCfg *cfg);
 
 pc_status pc_quic_cfg_add_root_pem(PcQuicCfg *cfg, const uint8_t *pem, size_t len);
 pc_status pc_quic_cfg_set_server_name(PcQuicCfg *cfg, const char *sni);
-/* As pc_tls_cfg_set_certificate: a key that is not the leaf's returns
- * PC_KEY_MISMATCH. */
+/* Exactly as pc_tls_cfg_set_certificate (the two share one key loader):
+ * the key may be PKCS#1 RSA, SEC1 EC, or PKCS#8 (RSA, EC, Ed25519, Ed448),
+ * and a key that is not the leaf's returns PC_KEY_MISMATCH. */
 pc_status pc_quic_cfg_set_certificate(PcQuicCfg *cfg,
                                       const uint8_t *chain_pem, size_t chain_len,
                                       const uint8_t *key_pem,  size_t key_len);
