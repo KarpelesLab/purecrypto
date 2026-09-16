@@ -1312,6 +1312,40 @@ mod tests {
         assert_eq!(parsed, pk);
     }
 
+    /// The FIPS 204 *external* interface (`M' = 0 ‖ |ctx| ‖ ctx ‖ M`, and the
+    /// hedged/deterministic `rnd`) against an independent implementation.
+    /// The ACVP `sigGen` vectors above drive `sign_internal` with a bare `M'`,
+    /// so they never exercise the context-string framing; a wrong prefix
+    /// would still round-trip within this crate. These are OpenSSL 3.6
+    /// ML-DSA-65 deterministic signatures for seed `0³²` over the message
+    /// below, with and without a context string, so byte-equality with our
+    /// `sign_deterministic` pins the framing and `verify` accepts theirs.
+    #[test]
+    fn external_interface_matches_openssl() {
+        let msg = b"purecrypto ml-dsa external interface";
+        let (sk, pk) = MlDsa65PrivateKey::from_seed(&[0u8; 32]);
+        for (ctx, file) in [
+            (
+                &b"ctx-string-1"[..],
+                include_str!("../../testdata/mldsa65_openssl_sig_ctx.hex"),
+            ),
+            (
+                &b""[..],
+                include_str!("../../testdata/mldsa65_openssl_sig_noctx.hex"),
+            ),
+        ] {
+            let theirs = unhex(file.trim());
+            assert_eq!(theirs.len(), P65.sig);
+            assert!(
+                pk.verify(&theirs, msg, ctx),
+                "OpenSSL signature must verify"
+            );
+            assert!(!pk.verify(&theirs, msg, b"other"), "context is bound");
+            let ours = sk.sign_deterministic(msg, ctx).unwrap();
+            assert_eq!(&ours[..], &theirs[..], "deterministic signature bytes");
+        }
+    }
+
     #[test]
     fn roundtrip_and_reject() {
         let mut rng = HmacDrbg::<Sha256>::new(b"mldsa", b"nonce", &[]);
