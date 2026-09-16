@@ -1,6 +1,6 @@
 //! `purecrypto rand <nbytes>` — emit cryptographically secure random bytes.
 
-use crate::util::{Args, die, to_hex, write_output_with_mode};
+use crate::util::{Args, die, reject_extra_positionals, to_hex, write_output_with_mode};
 use purecrypto::rng::{OsRng, RngCore};
 
 /// Cap on a single `rand` invocation: 1 GiB. Above this we refuse rather
@@ -13,6 +13,7 @@ pub(crate) fn run(args: Args) {
     let Some(&n) = pos.first() else {
         die("usage: purecrypto rand <nbytes> [--binary] [-out file]");
     };
+    reject_extra_positionals(&pos, 1);
     let n: usize = n
         .parse()
         .unwrap_or_else(|_| die(format!("invalid byte count: {n}")));

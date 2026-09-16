@@ -323,19 +323,36 @@ where
     loaded
 }
 
-/// Reads all input: from `path` if `Some` and not `"-"`, otherwise from stdin.
+/// Whether this invocation has already read stdin as an input; see
+/// [`read_stdin_once`].
+static STDIN_CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reads stdin to EOF, once per invocation. Every input flag accepts `-`
+/// for stdin, but there is only one stdin: a second input resolving to it
+/// (`-keyfile - -in -`, or `-keyfile -` with the message left to default to
+/// stdin) would silently come back empty, so it is refused by name instead.
+pub(crate) fn read_stdin_once() -> Vec<u8> {
+    if STDIN_CONSUMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        die(
+            "stdin (`-`) is already used by another input; only one input per \
+             invocation can come from stdin",
+        );
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .unwrap_or_else(|e| die(format!("cannot read stdin: {e}")));
+    buf
+}
+
+/// Reads all input: from `path` if `Some` and not `"-"`, otherwise from stdin
+/// (see [`read_stdin_once`] for the one-stdin rule).
 pub(crate) fn read_input(path: Option<&str>) -> Vec<u8> {
     match path {
         Some(p) if p != "-" => {
             std::fs::read(p).unwrap_or_else(|e| die(format!("cannot read {p}: {e}")))
         }
-        _ => {
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut buf)
-                .unwrap_or_else(|e| die(format!("cannot read stdin: {e}")));
-            buf
-        }
+        _ => read_stdin_once(),
     }
 }
 
@@ -671,14 +688,31 @@ pub(crate) fn zero_buf(buf: &mut [u8]) {
 
 /// Reads raw bytes from `path` (no hex decoding). Use this for `-*file`
 /// flags that carry secret material — the caller is responsible for
-/// [`zero_buf`]-ing the result once it's no longer needed.
+/// [`zero_buf`]-ing the result once it's no longer needed. `-` reads stdin
+/// (see [`read_stdin_once`]).
 ///
 /// Also runs the same group/world-readable warning that
-/// [`warn_if_world_readable_key`] does, since key/AAD files are exactly the
-/// kind of thing that should not be `0o644`.
+/// [`warn_if_world_readable_key`] does, since key files are exactly the
+/// kind of thing that should not be `0o644`. Non-secret inputs (AAD, a
+/// peer's public key, a certificate) belong in [`read_input`] instead.
 pub(crate) fn read_secret_file(path: &str) -> Vec<u8> {
+    if path == "-" {
+        return read_stdin_once();
+    }
     warn_if_world_readable_key(path);
     std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")))
+}
+
+/// Refuses positional arguments beyond the `allowed` a subcommand takes.
+/// Extra positionals used to be silently ignored, so `hash sha256 a b`
+/// hashed `a` alone with exit 0 and a misplaced flag value vanished.
+pub(crate) fn reject_extra_positionals(pos: &[&str], allowed: usize) {
+    if pos.len() > allowed {
+        die(format!(
+            "unexpected argument(s): {} (run the command without arguments for its usage)",
+            pos[allowed..].join(" ")
+        ));
+    }
 }
 
 /// Parses a positive integer from a CLI flag.

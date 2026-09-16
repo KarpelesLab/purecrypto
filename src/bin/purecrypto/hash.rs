@@ -1,6 +1,9 @@
 //! `purecrypto hash <algorithm> [file]` — hash a file or stdin.
 
-use crate::util::{Args, die, parse_hex_flag, parse_usize_flag, read_input, to_hex, write_output};
+use crate::util::{
+    Args, die, parse_hex_flag, parse_usize_flag, read_input, reject_extra_positionals, to_hex,
+    write_output,
+};
 use purecrypto::ascon::{AsconCxof128, AsconHash256, AsconXof128};
 use purecrypto::hash::{self, Digest, ExtendableOutput, HashAlgorithm, XofReader};
 
@@ -62,6 +65,7 @@ pub(crate) fn run(args: Args) {
     let Some(&alg) = pos.first() else {
         die("usage: purecrypto hash <algorithm> [file]  (file defaults to stdin)");
     };
+    reject_extra_positionals(&pos, 2);
     let data = read_input(pos.get(1).copied());
 
     // Extendable-output functions need an explicit `-len`; route them first.

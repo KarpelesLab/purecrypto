@@ -63,8 +63,7 @@ fn text(crl: &CertificateRevocationList) {
 }
 
 fn verify(crl: &CertificateRevocationList, ca_path: &str) {
-    let ca_pem =
-        std::fs::read(ca_path).unwrap_or_else(|e| die(format!("cannot read {ca_path}: {e}")));
+    let ca_pem = read_input(Some(ca_path));
     let ca_pem = core::str::from_utf8(&ca_pem).unwrap_or_else(|_| die("CA file is not UTF-8 PEM"));
     let ca =
         Certificate::from_pem(ca_pem).unwrap_or_else(|e| die(format!("cannot parse CA cert: {e}")));

@@ -1124,6 +1124,7 @@ pub(crate) fn run(args: Args) {
         "-template-file",
     ]);
     let sub = positionals.first().copied().unwrap_or("");
+    crate::util::reject_extra_positionals(&positionals, 1);
 
     match sub {
         "init" => run_init(args),

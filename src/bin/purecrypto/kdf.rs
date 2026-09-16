@@ -477,6 +477,7 @@ pub(crate) fn run(args: Args) {
         "--out",
     ]);
     let sub = pos.first().copied().unwrap_or("");
+    crate::util::reject_extra_positionals(&pos, 1);
     match sub {
         "hkdf" => run_hkdf(args),
         "pbkdf2" => run_pbkdf2(args),

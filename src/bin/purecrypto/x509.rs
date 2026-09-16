@@ -297,7 +297,7 @@ pub(crate) fn run(args: Args) {
         )
         .unwrap_or_else(|e| die(format!("cannot parse CSR: {e}")));
 
-        let ca_raw = std::fs::read(ca_path).unwrap_or_else(|e| die(format!("read {ca_path}: {e}")));
+        let ca_raw = read_input(Some(ca_path));
         let ca = Certificate::from_pem(
             core::str::from_utf8(&ca_raw).unwrap_or_else(|_| die("CA is not PEM")),
         )

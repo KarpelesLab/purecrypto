@@ -15,6 +15,16 @@ Two conventions apply across the tool:
 - **Secrets on the command line leak** through `/proc/<pid>/cmdline`. Flags
   such as `-key HEX`, `-password STR`, and `-ikm HEX` warn on use; prefer the
   `-keyfile` / `-password-file` forms (`-password-file -` reads stdin).
+- **`-` means stdin for every input flag** — `-in`, `-keyfile`, `-aadfile`,
+  `-sigfile`, `-inkey`, `-peer`, `-ct`, `-CAfile`, `-CA`, `-CAkey`,
+  `-password-file`, and the positional file of `hash` / `mac`. There is only
+  one stdin, so at most one input per invocation may be `-` (a second is
+  refused, including the implicit stdin default when `-in` is omitted).
+  Files holding private keys are checked for group/other-readable permissions
+  and warned about; public inputs (AAD, peer public keys, certificates) are
+  not.
+- **Positional arguments beyond what a subcommand takes are refused** with
+  `unexpected argument(s): ...` rather than silently ignored.
 
 ## Contents
 
@@ -183,6 +193,12 @@ purecrypto pkeyutl verify  -inkey FILE [-pubin] [-pkeyopt OPT] -sigfile FILE -in
 `-pkeyopt` values: `rsa_padding_mode:oaep|pkcs1|pss`, `rsa_oaep_md:NAME`,
 `rsa_oaep_label:HEX`, `digest:sha224|sha256|sha384|sha512|sha1`. ECDSA,
 Ed25519/Ed448, ML-DSA, SLH-DSA, LMS/HSS and XMSS keys are routed by key type.
+
+`-pubin` declares `-inkey` to be a `PUBLIC KEY` (SPKI) PEM: it is read as
+public material (no permission warning) and anything else — a private key
+included — is refused. Without it, `verify` accepts an SPKI PEM or a private
+key (LMS/HSS/XMSS raw, SM2 SEC1, ...) whose public half is derived, with the
+private-key permission warning.
 An SM2 key routes to SM2-DSA for sign/verify and SM2-PKE for
 encrypt/decrypt; `-id STR` overrides the default signer identity.
 

@@ -1,6 +1,9 @@
 //! `purecrypto pkeyutl` — generic asymmetric encrypt/decrypt/sign/verify.
 
-use crate::util::{Args, SentinelLock, die, read_input, write_output, write_output_with_mode};
+use crate::util::{
+    Args, SentinelLock, die, read_input, read_secret_file, reject_extra_positionals, write_output,
+    write_output_with_mode,
+};
 use purecrypto::dispatch_digest;
 use purecrypto::ec::sm2::DEFAULT_ID;
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
@@ -90,9 +93,12 @@ enum PrivKey {
 }
 
 fn load_priv(path: &str) -> PrivKey {
-    crate::util::warn_if_world_readable_key(path);
-    let raw = std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")));
-    let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("key file is not UTF-8 PEM"));
+    load_priv_bytes(&read_secret_file(path))
+}
+
+/// [`load_priv`] over key bytes already read (so `-inkey -` is read once).
+fn load_priv_bytes(raw: &[u8]) -> PrivKey {
+    let pem = core::str::from_utf8(raw).unwrap_or_else(|_| die("key file is not UTF-8 PEM"));
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
         return PrivKey::Rsa(k);
     }
@@ -116,8 +122,7 @@ fn load_priv(path: &str) -> PrivKey {
 /// generic decoder then covers Ed25519/Ed448/ML-DSA/SLH-DSA and PKCS#8
 /// RSA/ECDSA.
 fn load_priv_dyn(path: &str) -> Box<dyn KeyPriv> {
-    crate::util::warn_if_world_readable_key(path);
-    let raw = std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")));
+    let raw = read_secret_file(path);
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("key file is not UTF-8 PEM"));
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
         return Box::new(k);
@@ -398,18 +403,18 @@ fn sm2_id(args: &Args) -> Vec<u8> {
     }
 }
 
-fn load_spki(path: &str) -> AnyPublicKey {
-    let raw = std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")));
-    let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("pubkey is not UTF-8 PEM"));
+/// Parses a `PUBLIC KEY` SPKI PEM from bytes already read (public material:
+/// no permission warning applies).
+fn load_spki(raw: &[u8]) -> AnyPublicKey {
+    let pem = core::str::from_utf8(raw).unwrap_or_else(|_| die("pubkey is not UTF-8 PEM"));
     AnyPublicKey::from_spki_pem(pem).unwrap_or_else(|e| die(format!("cannot parse SPKI PEM: {e}")))
 }
 
-/// Attempts to load an SM2 public key from `path`: a `PUBLIC KEY` SPKI PEM
-/// (preferred for `-pubin`), or the public half of an SM2 SEC1 private key.
-/// Returns `None` if the file is not an SM2 key.
-fn try_load_sm2_public(path: &str) -> Option<Sm2PublicKey> {
-    let raw = std::fs::read(path).ok()?;
-    let pem = core::str::from_utf8(&raw).ok()?;
+/// Attempts to read an SM2 public key out of key bytes: a `PUBLIC KEY` SPKI
+/// PEM (preferred for `-pubin`), or the public half of an SM2 SEC1 private
+/// key. Returns `None` if the bytes are not an SM2 key.
+fn try_load_sm2_public(raw: &[u8]) -> Option<Sm2PublicKey> {
+    let pem = core::str::from_utf8(raw).ok()?;
     if let Ok(der) = purecrypto::der::pem_decode(pem, "PUBLIC KEY")
         && let Ok(pk) = Sm2PublicKey::from_spki_der(&der)
     {
@@ -451,10 +456,19 @@ fn run_encrypt(args: Args) {
         .value("-inkey")
         .or_else(|| args.value("--inkey"))
         .unwrap_or_else(|| die("missing -inkey"));
+    let pubin = args.flag("-pubin") || args.flag("--pubin");
+    // Read the key once (it may be stdin): `-pubin` names public material,
+    // anything else is treated as a private key and gets the permission
+    // warning.
+    let raw_key = if pubin {
+        read_input(Some(inkey))
+    } else {
+        read_secret_file(inkey)
+    };
 
     // SM2 hybrid PKE (GB/T 32918.4 / RFC 8998): detect an SM2 key and route
     // before the RSA-only padding logic.
-    if let Some(pk) = try_load_sm2_public(inkey) {
+    if let Some(pk) = try_load_sm2_public(&raw_key) {
         let ct = pk
             .encrypt(&pt, &mut OsRng)
             .unwrap_or_else(|e| die(format!("SM2 encrypt failed: {e:?}")));
@@ -467,8 +481,8 @@ fn run_encrypt(args: Args) {
     if padding == "pkcs1" {
         warn_pkcs1_padding(/* decrypt = */ false);
     }
-    let ct = if args.flag("-pubin") || args.flag("--pubin") {
-        let any = load_spki(inkey);
+    let ct = if pubin {
+        let any = load_spki(&raw_key);
         let rsa = match any {
             AnyPublicKey::Rsa(k) => k,
             _ => die("RSA encrypt requires an RSA SPKI"),
@@ -487,7 +501,7 @@ fn run_encrypt(args: Args) {
             other => die(format!("unsupported rsa_padding_mode for encrypt: {other}")),
         }
     } else {
-        let key = load_priv(inkey);
+        let key = load_priv_bytes(&raw_key);
         let rsa = match key {
             PrivKey::Rsa(k) => k,
             _ => die("RSA encrypt requires an RSA key"),
@@ -574,7 +588,7 @@ fn run_sign(args: Args) {
         .value("-in")
         .or_else(|| args.value("--in"))
         .unwrap_or_else(|| die("missing -in FILE"));
-    let msg = std::fs::read(in_path).unwrap_or_else(|e| die(format!("cannot read {in_path}: {e}")));
+    let msg = read_input(Some(in_path));
     let opts = parse_opts(&args);
     let inkey = args
         .value("-inkey")
@@ -627,13 +641,12 @@ fn run_verify(args: Args) {
         .value("-in")
         .or_else(|| args.value("--in"))
         .unwrap_or_else(|| die("missing -in FILE"));
-    let msg = std::fs::read(in_path).unwrap_or_else(|e| die(format!("cannot read {in_path}: {e}")));
+    let msg = read_input(Some(in_path));
     let sig_path = args
         .value("-sigfile")
         .or_else(|| args.value("--sigfile"))
         .unwrap_or_else(|| die("missing -sigfile FILE"));
-    let sig =
-        std::fs::read(sig_path).unwrap_or_else(|e| die(format!("cannot read {sig_path}: {e}")));
+    let sig = read_input(Some(sig_path));
     let inkey = args
         .value("-inkey")
         .or_else(|| args.value("--inkey"))
@@ -641,28 +654,43 @@ fn run_verify(args: Args) {
     let opts = parse_opts(&args);
     let pss = matches!(opts.padding.as_deref(), Some("pss"));
 
-    // `-inkey` may be a raw LMS/HSS/XMSS or SM2/SEC1 PRIVATE key file
-    // (the public key is derived from it). Warn if it is group/world-
-    // readable, matching the other secret-key readers.
-    crate::util::warn_if_world_readable_key(inkey);
-    let raw_key = std::fs::read(inkey).unwrap_or_else(|e| die(format!("cannot read {inkey}: {e}")));
+    // `-pubin` (as for `encrypt`) says `-inkey` is a `PUBLIC KEY` SPKI PEM:
+    // it is read like any public input, and a private key handed in under
+    // it is refused rather than quietly used for its public half. Without
+    // the flag `-inkey` may also be a raw LMS/HSS/XMSS or SM2/SEC1 PRIVATE
+    // key file (the public key is derived from it), so it is read with the
+    // group/world-readable warning the other secret-key readers apply.
+    let pubin = args.flag("-pubin") || args.flag("--pubin");
+    let raw_key = if pubin {
+        read_input(Some(inkey))
+    } else {
+        read_secret_file(inkey)
+    };
+    let key_pem = core::str::from_utf8(&raw_key).ok();
+    if pubin && !key_pem.is_some_and(|pem| purecrypto::der::pem_decode(pem, "PUBLIC KEY").is_ok()) {
+        die("-pubin requires a `-----BEGIN PUBLIC KEY-----` (SPKI) PEM in -inkey");
+    }
 
     // Stateful hash-based signatures: the public key is derived from the raw
     // private-key file (deriving the public key does NOT advance state).
-    if let Some(ok) = stateful_verify(&raw_key, &msg, &sig) {
+    if !pubin && let Some(ok) = stateful_verify(&raw_key, &msg, &sig) {
         report_verify(ok);
         return;
     }
 
     // SM2 verification: accept either a `PUBLIC KEY` SPKI PEM (the SM2 named
-    // curve) or an SM2 SEC1 private key (deriving its public key — which does
-    // not expose the secret). The generic `AnyPublicKey` parser does not handle
-    // SM2, so detect it here and route to SM2-DSA (`Ecdsa-Sig-Value` signature).
-    if let Ok(pem) = core::str::from_utf8(&raw_key) {
+    // curve) or — without `-pubin` — an SM2 SEC1 private key (deriving its
+    // public key, which does not expose the secret). The generic
+    // `AnyPublicKey` parser does not handle SM2, so detect it here and route
+    // to SM2-DSA (`Ecdsa-Sig-Value` signature).
+    if let Some(pem) = key_pem {
         let pk = purecrypto::der::pem_decode(pem, "PUBLIC KEY")
             .ok()
             .and_then(|der| Sm2PublicKey::from_spki_der(&der).ok())
             .or_else(|| {
+                if pubin {
+                    return None;
+                }
                 Sm2PrivateKey::from_sec1_pem(pem)
                     .ok()
                     .map(|sk| sk.public_key())
@@ -723,6 +751,7 @@ pub(crate) fn run(args: Args) {
         "--id",
     ]);
     let sub = pos.first().copied().unwrap_or("");
+    reject_extra_positionals(&pos, 1);
     match sub {
         "encrypt" => run_encrypt(args),
         "decrypt" => run_decrypt(args),

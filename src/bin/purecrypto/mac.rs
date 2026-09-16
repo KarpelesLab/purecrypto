@@ -5,7 +5,8 @@
 //! `/proc/<pid>/cmdline`, so the hex form emits a warning to stderr.
 
 use crate::util::{
-    Args, die, parse_hex_flag, read_input, read_secret_file, to_hex_line, write_output, zero_buf,
+    Args, die, parse_hex_flag, read_input, read_secret_file, reject_extra_positionals, to_hex_line,
+    write_output, zero_buf,
 };
 use purecrypto::cipher::{Aes128, Aes256, AesCmac128, AesCmac256, AesGmac128, AesGmac256};
 use purecrypto::dispatch_digest;
@@ -115,10 +116,10 @@ pub(crate) fn run(args: Args) {
         "-out",
         "--out",
     ]);
-    let in_path = args
-        .value("-in")
-        .or_else(|| args.value("--in"))
-        .or_else(|| pos.first().copied());
+    let in_flag = args.value("-in").or_else(|| args.value("--in"));
+    // The message is `-in FILE` or a single positional, never both.
+    reject_extra_positionals(&pos, usize::from(in_flag.is_none()));
+    let in_path = in_flag.or_else(|| pos.first().copied());
     let msg = read_input(in_path);
 
     let tag = match alg.to_ascii_lowercase().as_str() {

@@ -130,10 +130,9 @@ pub(crate) fn require_key_matches_cert(
     }
 }
 
-/// Loads a private key from `path`, dying on any error.
+/// Loads a private key from `path` (`-` for stdin), dying on any error.
 pub(crate) fn load_key(path: &str) -> PrivateKey {
-    crate::util::warn_if_world_readable_key(path);
-    let raw = std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")));
+    let raw = crate::util::read_secret_file(path);
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die(format!("{path} is not PEM")));
     PrivateKey::from_pem(pem).unwrap_or_else(|| die(format!("cannot parse key in {path}")))
 }

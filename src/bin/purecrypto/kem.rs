@@ -1,6 +1,9 @@
 //! `purecrypto kem <subcommand>` — ML-KEM keygen / encaps / decaps.
 
-use crate::util::{Args, die, read_secret_file, write_output, write_output_with_mode};
+use crate::util::{
+    Args, die, read_input, read_secret_file, reject_extra_positionals, write_output,
+    write_output_with_mode,
+};
 use purecrypto::mlkem::{
     MlKem512Ciphertext, MlKem512DecapsKey, MlKem512EncapsKey, MlKem768Ciphertext,
     MlKem768DecapsKey, MlKem768EncapsKey, MlKem1024Ciphertext, MlKem1024DecapsKey,
@@ -104,8 +107,7 @@ fn run_encaps(args: Args) {
         .value("-out-ss")
         .unwrap_or_else(|| die("missing -out-ss FILE"));
 
-    let pem_bytes =
-        std::fs::read(peer_path).unwrap_or_else(|e| die(format!("cannot read {peer_path}: {e}")));
+    let pem_bytes = read_input(Some(peer_path));
     let pem = core::str::from_utf8(&pem_bytes).unwrap_or_else(|_| die("peer is not valid PEM"));
     let (set, _bytes) = parse_ek_pem(pem).unwrap_or_else(|| {
         die("invalid ML-KEM encapsulation key (parse or FIPS 203 §7.2 check failed)")
@@ -147,8 +149,7 @@ fn run_decaps(args: Args) {
     // group/world-readable (same convention as the other `-key` readers).
     let key_pem = read_secret_file(key_path);
     let key_pem = core::str::from_utf8(&key_pem).unwrap_or_else(|_| die("key is not valid PEM"));
-    let ct_bytes =
-        std::fs::read(ct_path).unwrap_or_else(|e| die(format!("cannot read {ct_path}: {e}")));
+    let ct_bytes = read_input(Some(ct_path));
 
     let ss = if let Ok(k) = MlKem768DecapsKey::from_pkcs8_pem(key_pem) {
         let ct: [u8; 1088] = ct_bytes
@@ -194,6 +195,7 @@ pub(crate) fn run(args: Args) {
         "--ct",
     ]);
     let sub = pos.first().copied().unwrap_or("");
+    reject_extra_positionals(&pos, 1);
     match sub {
         "keygen" => run_keygen(args),
         "encaps" => run_encaps(args),

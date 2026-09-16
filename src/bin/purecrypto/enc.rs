@@ -6,8 +6,8 @@
 //! but emit a warning to stderr, since they leak to `/proc/<pid>/cmdline`.
 
 use crate::util::{
-    Args, die, parse_hex_flag, read_input, read_secret_file, write_output, write_output_with_mode,
-    zero_buf,
+    Args, die, parse_hex_flag, read_input, read_secret_file, reject_extra_positionals,
+    write_output, write_output_with_mode, zero_buf,
 };
 use purecrypto::ascon::AsconAead128;
 use purecrypto::cipher::{
@@ -449,6 +449,14 @@ fn kw_unwrap(alg: Algo, kek: &[u8], ciphertext: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn run(args: Args) {
+    // `enc` takes no positional arguments: the input is `-in` (default
+    // stdin). A stray one used to be ignored.
+    reject_extra_positionals(
+        &args.positionals(&[
+            "-alg", "-key", "-keyfile", "-in", "-out", "-nonce", "-iv", "-aad", "-aadfile",
+        ]),
+        0,
+    );
     let alg_name = args
         .value("-alg")
         .or_else(|| args.value("--alg"))
@@ -482,7 +490,8 @@ pub(crate) fn run(args: Args) {
     let dest = args.value("-out").or_else(|| args.value("--out"));
     let decrypt = args.flag("-d") || args.flag("--decrypt");
     // AAD: same convention as the key — `-aadfile FILE` is preferred over the
-    // argv `-aad HEX` form.
+    // argv `-aad HEX` form. Associated data is authenticated, not secret, so
+    // the file is read like any other input: no permission warning.
     let aad = if let Some(hex) = args.value("-aad").or_else(|| args.value("--aad")) {
         eprintln!(
             "purecrypto: warning: -aad HEX exposes the AAD via /proc/<pid>/cmdline; \
@@ -490,7 +499,7 @@ pub(crate) fn run(args: Args) {
         );
         parse_hex_flag(hex, "-aad")
     } else if let Some(path) = args.value("-aadfile").or_else(|| args.value("--aadfile")) {
-        read_secret_file(path)
+        read_input(Some(path))
     } else {
         Vec::new()
     };

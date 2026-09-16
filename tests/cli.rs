@@ -6269,3 +6269,427 @@ fn ca_issue_failure_does_not_consume_index_or_ledger_row() {
     assert_eq!(ledger.lines().count(), ledger_before.lines().count() + 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Argument handling: stray positionals, `-` for stdin, non-secret inputs,
+// `pkeyutl verify -pubin`
+// ---------------------------------------------------------------------------
+
+/// Extra positional arguments used to be silently ignored, so
+/// `hash sha256 a b` hashed `a` alone with exit 0 and a flag value that
+/// lost its flag simply vanished. Every subcommand now refuses them.
+#[test]
+fn extra_positional_arguments_are_refused() {
+    let dir = std::env::temp_dir().join(format!("pc_extra_pos_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    std::fs::write(dir.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(dir.join("k.bin"), [7u8; 32]).unwrap();
+
+    let refused = |args: &[&str]| {
+        let (out, err, ok) = run_capture(args, b"");
+        assert!(!ok, "{args:?} must be refused");
+        assert!(
+            err.contains("unexpected argument(s): stray"),
+            "{args:?}: expected the stray-argument diagnostic, got stderr: {err}"
+        );
+        assert!(
+            out.is_empty(),
+            "{args:?}: nothing may be emitted, got {out:?}"
+        );
+    };
+    refused(&["hash", "sha256", &p("a.txt"), "stray"]);
+    refused(&["rand", "4", "stray"]);
+    refused(&[
+        "mac",
+        "-alg",
+        "hmac-sha256",
+        "-keyfile",
+        &p("k.bin"),
+        &p("a.txt"),
+        "stray",
+    ]);
+    // With `-in` the message is already named: any positional is extra.
+    refused(&[
+        "mac",
+        "-alg",
+        "hmac-sha256",
+        "-keyfile",
+        &p("k.bin"),
+        "-in",
+        &p("a.txt"),
+        "stray",
+    ]);
+    refused(&[
+        "enc",
+        "-alg",
+        "AES-256-GCM",
+        "-keyfile",
+        &p("k.bin"),
+        "-nonce",
+        "010203040506070809101112",
+        "-in",
+        &p("a.txt"),
+        "stray",
+    ]);
+    refused(&[
+        "kdf",
+        "hkdf",
+        "stray",
+        "-hash",
+        "sha256",
+        "-ikmfile",
+        &p("k.bin"),
+        "-len",
+        "16",
+    ]);
+    refused(&["kem", "keygen", "stray"]);
+    refused(&[
+        "pkeyutl",
+        "sign",
+        "stray",
+        "-inkey",
+        &p("k.bin"),
+        "-in",
+        &p("a.txt"),
+    ]);
+    refused(&[
+        "kex",
+        "-alg",
+        "X25519",
+        "-key",
+        &p("k.bin"),
+        "-peer",
+        &p("k.bin"),
+        "stray",
+    ]);
+    refused(&["ca", "init", "stray", "-dir", &p("ca")]);
+
+    // The legitimate forms still work.
+    let (out, ok) = run(&["hash", "sha256", &p("a.txt")], b"");
+    assert!(ok);
+    assert_eq!(out.trim().len(), 64);
+    let (out, ok) = run(&["hash", "sha256"], b"alpha");
+    assert!(ok);
+    assert_eq!(out.trim().len(), 64);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `-` names stdin for every input flag, and there is only one stdin: a
+/// second input resolving to it is refused instead of silently reading empty.
+#[test]
+fn dash_reads_stdin_for_file_flags() {
+    let dir = std::env::temp_dir().join(format!("pc_dash_stdin_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    let key = [0x42u8; 32];
+    std::fs::write(dir.join("k.bin"), key).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("k.bin"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+    std::fs::write(dir.join("msg.txt"), b"the message").unwrap();
+
+    // `-keyfile -`: the key arrives on stdin, the message from the file.
+    let (from_file, ok) = run(
+        &[
+            "mac",
+            "-alg",
+            "hmac-sha256",
+            "-keyfile",
+            &p("k.bin"),
+            "-in",
+            &p("msg.txt"),
+        ],
+        b"",
+    );
+    assert!(ok);
+    let (from_stdin, err, ok) = run_capture(
+        &[
+            "mac",
+            "-alg",
+            "hmac-sha256",
+            "-keyfile",
+            "-",
+            "-in",
+            &p("msg.txt"),
+        ],
+        &key,
+    );
+    assert!(ok, "{err}");
+    assert_eq!(
+        from_stdin, from_file,
+        "the key read from stdin must be the same key"
+    );
+    assert!(
+        !err.contains("group/other-readable"),
+        "stdin has no permissions to warn about: {err}"
+    );
+
+    // `-keyfile -` with the message left to default to stdin: two inputs on
+    // one stdin. Refused by name, nothing emitted.
+    let (out, err, ok) = run_capture(&["mac", "-alg", "hmac-sha256", "-keyfile", "-"], &key);
+    assert!(!ok);
+    assert!(out.is_empty(), "got {out:?}");
+    assert!(
+        err.contains("only one input per invocation can come from stdin"),
+        "got: {err}"
+    );
+    // Same for two explicit dashes.
+    let (_out, err, ok) = run_capture(
+        &["mac", "-alg", "hmac-sha256", "-keyfile", "-", "-in", "-"],
+        &key,
+    );
+    assert!(!ok);
+    assert!(err.contains("only one input per invocation"), "got: {err}");
+
+    // `pkeyutl sign -in -` / `verify -sigfile -`: a signature round trip
+    // with the message, then the signature, piped in.
+    let (key_pem, ok) = run(&["genpkey", "-algorithm", "ED25519"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("ed.key"), &key_pem).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("ed.key"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+    let (_o, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "sign",
+            "-inkey",
+            &p("ed.key"),
+            "-in",
+            "-",
+            "-out",
+            &p("msg.sig"),
+        ],
+        b"the message",
+    );
+    assert!(ok, "{err}");
+    let sig = std::fs::read(dir.join("msg.sig")).unwrap();
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("ed.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("ed.pub"), pub_pem).unwrap();
+    let (out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("ed.pub"),
+            "-pubin",
+            "-sigfile",
+            "-",
+            "-in",
+            &p("msg.txt"),
+        ],
+        &sig,
+    );
+    assert!(ok, "{err}");
+    assert!(out.contains("Signature verified"), "got {out:?}");
+
+    // `enc -aadfile -`: AAD from stdin round-trips.
+    let nonce = "010203040506070809101112";
+    let (_o, err, ok) = run_capture(
+        &[
+            "enc",
+            "-alg",
+            "AES-256-GCM",
+            "-keyfile",
+            &p("k.bin"),
+            "-nonce",
+            nonce,
+            "-aadfile",
+            "-",
+            "-in",
+            &p("msg.txt"),
+            "-out",
+            &p("ct.bin"),
+        ],
+        b"header",
+    );
+    assert!(ok, "{err}");
+    std::fs::write(dir.join("aad.bin"), b"header").unwrap();
+    let (pt, err, ok) = run_capture(
+        &[
+            "enc",
+            "-alg",
+            "AES-256-GCM",
+            "-keyfile",
+            &p("k.bin"),
+            "-nonce",
+            nonce,
+            "-d",
+            "-aadfile",
+            &p("aad.bin"),
+            "-in",
+            &p("ct.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "{err}");
+    assert_eq!(pt, "the message");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Associated data is authenticated, not secret: a world-readable
+/// `-aadfile` must not draw the private-key permission warning (the key
+/// file still does).
+#[cfg(unix)]
+#[test]
+fn aadfile_permissions_are_not_warned_about() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pc_aad_perms_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    std::fs::write(dir.join("k.bin"), [9u8; 32]).unwrap();
+    std::fs::set_permissions(dir.join("k.bin"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(dir.join("aad.bin"), b"public header").unwrap();
+    std::fs::set_permissions(dir.join("aad.bin"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(dir.join("pt.bin"), b"plain").unwrap();
+
+    let args = [
+        "enc",
+        "-alg",
+        "AES-256-GCM",
+        "-keyfile",
+        &p("k.bin"),
+        "-nonce",
+        "010203040506070809101112",
+        "-aadfile",
+        &p("aad.bin"),
+        "-in",
+        &p("pt.bin"),
+        "-out",
+        &p("ct.bin"),
+    ];
+    let (_out, err, ok) = run_capture(&args, b"");
+    assert!(ok, "{err}");
+    assert!(
+        !err.contains("group/other-readable"),
+        "a 0644 AAD file is not a secret, got stderr: {err}"
+    );
+
+    // The key file is still screened.
+    std::fs::set_permissions(dir.join("k.bin"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = std::fs::remove_file(dir.join("ct.bin"));
+    let (_out, err, ok) = run_capture(&args, b"");
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("k.bin is group/other-readable"),
+        "the key file warning must remain, got stderr: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `pkeyutl verify -pubin` was accepted and ignored: `-inkey` was
+/// auto-detected regardless, so a private key slipped through under a flag
+/// that promised a public one. The flag now means what it says.
+#[test]
+fn pkeyutl_verify_pubin_requires_a_public_key() {
+    let dir = std::env::temp_dir().join(format!("pc_verify_pubin_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "ED25519", "-out", &p("ed.key")],
+            b""
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("ed.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("ed.pub"), pub_pem).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // World-readable on purpose: public material must not be warned about.
+        std::fs::set_permissions(dir.join("ed.pub"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+    std::fs::write(dir.join("msg.bin"), b"sign me").unwrap();
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p("ed.key"),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("msg.sig")
+            ],
+            b"",
+        )
+        .1
+    );
+
+    // SPKI under -pubin: verifies, and no permission warning for public material.
+    let (out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("ed.pub"),
+            "-pubin",
+            "-sigfile",
+            &p("msg.sig"),
+            "-in",
+            &p("msg.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "{err}");
+    assert!(out.contains("Signature verified"), "got {out:?}");
+    assert!(!err.contains("group/other-readable"), "got: {err}");
+
+    // A private key under -pubin is refused by name.
+    let (out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("ed.key"),
+            "-pubin",
+            "-sigfile",
+            &p("msg.sig"),
+            "-in",
+            &p("msg.bin"),
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(out.is_empty(), "got {out:?}");
+    assert!(err.contains("-pubin requires"), "got: {err}");
+
+    // Without the flag the SPKI is still auto-detected, as before.
+    let (out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("ed.pub"),
+            "-sigfile",
+            &p("msg.sig"),
+            "-in",
+            &p("msg.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "{err}");
+    assert!(out.contains("Signature verified"), "got {out:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
