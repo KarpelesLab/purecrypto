@@ -464,8 +464,24 @@ mod tests {
         signature: [u8; 114],
     }
 
-    fn vectors() -> [Vector; 3] {
+    fn vectors() -> [Vector; 4] {
         [
+            // "11 octets" — a multi-byte message, empty context.
+            Vector {
+                seed: from_hex::<57>(
+                    "cd23d24f714274e744343237b93290f511f6425f98e64459ff203e8985083ffdf60500553abc0e05cd02184bdb89c4ccd67e187951267eb328",
+                ),
+                public: from_hex::<57>(
+                    "dcea9e78f35a1bf3499a831b10b86c90aac01cd84b67a0109b55a36e9328b1e365fce161d71ce7131a543ea4cb5f7e9f1d8b00696447001400",
+                ),
+                context: &[],
+                message: &[
+                    0x0c, 0x3e, 0x54, 0x40, 0x74, 0xec, 0x63, 0xb0, 0x26, 0x5e, 0x0c,
+                ],
+                signature: from_hex::<114>(
+                    "1f0a8888ce25e8d458a21130879b840a9089d999aaba039eaf3e3afa090a09d389dba82c4ff2ae8ac5cdfb7c55e94d5d961a29fe0109941e00b8dbdeea6d3b051068df7254c0cdc129cbe62db2dc957dbb47b51fd3f213fb8698f064774250a5028961c9bf8ffd973fe5d5c206492b140e00",
+                ),
+            },
             // "Blank" — empty message, empty context.
             Vector {
                 seed: from_hex::<57>(
@@ -557,7 +573,7 @@ mod tests {
 
             // A flipped message byte must not verify.
             let n = v.message.len();
-            let mut bad = [0u8; 8];
+            let mut bad = [0u8; 16];
             bad[..n].copy_from_slice(v.message);
             bad[n] = 0x01;
             assert!(pk.verify_ctx(&bad[..n + 1], &sig, v.context).is_err());

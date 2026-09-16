@@ -513,6 +513,46 @@ mod tests {
         );
     }
 
+    /// RFC 6979 A.2.5 with SHA-512: the digest (512 bits) is wider than the
+    /// order (256 bits), so both `bits2int` truncation and the HMAC-SHA-512
+    /// DRBG (64-byte `V`, truncated to 32 bytes per candidate) are on the
+    /// path — neither is covered by the SHA-256 vectors.
+    #[test]
+    fn rfc6979_sha512_vectors() {
+        use crate::hash::Sha512;
+        let sk = priv_key();
+        let pk = sk.public_key();
+        for (msg, r, s) in [
+            (
+                &b"sample"[..],
+                "8496a60b5e9b47c825488827e0495b0e3fa109ec4568fd3f8d1097678eb97f00",
+                "2362ab1adbe2b8adf9cb9edab740ea6049c028114f2460f96554f61fae3302fe",
+            ),
+            (
+                &b"test"[..],
+                "461d93f31b6540894788fd206c07cfa0cc35f46fa3c91816fff1040ad1581a04",
+                "39af9f15de0db8d97e72719c74820d304ce5226e32dedae67519e840d1194e55",
+            ),
+        ] {
+            let sig = sk.sign::<Sha512>(msg).unwrap();
+            assert_eq!(sig.r, fe_from_hex(r), "r mismatch for {msg:?}");
+            assert_eq!(sig.s, fe_from_hex(s), "s mismatch for {msg:?}");
+            pk.verify::<Sha512>(msg, &sig).unwrap();
+            // The runtime-curve path must produce the identical signature.
+            #[cfg(feature = "alloc")]
+            {
+                use crate::ec::boxed::BoxedEcdsaPrivateKey;
+                use crate::ec::curves::CurveId;
+                let boxed =
+                    BoxedEcdsaPrivateKey::from_bytes(CurveId::P256, &sk.to_bytes()).unwrap();
+                assert_eq!(
+                    boxed.sign::<Sha512>(msg).unwrap().to_bytes(CurveId::P256),
+                    sig.to_bytes().to_vec()
+                );
+            }
+        }
+    }
+
     #[test]
     fn verify_known_signature_and_negatives() {
         let pk = priv_key().public_key();

@@ -389,6 +389,59 @@ mod tests {
     }
 
     #[test]
+    fn rfc7748_test_vector_second() {
+        // RFC 7748 §5.2, second X25519 vector.
+        let scalar = hex32("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d");
+        let u = hex32("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493");
+        assert_eq!(
+            x25519(&scalar, &u),
+            hex32("95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957")
+        );
+    }
+
+    #[test]
+    fn rfc7748_iterated_one_and_thousand() {
+        // RFC 7748 §5.2: the (k, u) = (9, 9) recurrence after 1 and 1000
+        // iterations. Every step feeds the previous output back in as the
+        // scalar, so it exercises the ladder on arbitrary (unclamped-looking)
+        // scalar bytes and non-base-point u-coordinates.
+        let mut k = BASE_POINT;
+        let mut u = BASE_POINT;
+        let out = x25519(&k, &u);
+        assert_eq!(
+            out,
+            hex32("422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079")
+        );
+        u = k;
+        k = out;
+        for _ in 1..1000 {
+            let out = x25519(&k, &u);
+            u = k;
+            k = out;
+        }
+        assert_eq!(
+            k,
+            hex32("684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51")
+        );
+    }
+
+    #[test]
+    #[ignore = "1,000,000-iteration RFC 7748 vector is slow; run explicitly"]
+    fn rfc7748_iterated_million() {
+        let mut k = BASE_POINT;
+        let mut u = BASE_POINT;
+        for _ in 0..1_000_000 {
+            let out = x25519(&k, &u);
+            u = k;
+            k = out;
+        }
+        assert_eq!(
+            k,
+            hex32("7c3911e0ab2586fd864497297e575e6f3bc601c0883c30df5f4dd2d24f665424")
+        );
+    }
+
+    #[test]
     fn rfc7748_diffie_hellman() {
         // RFC 7748 §6.1.
         let a = X25519PrivateKey::from_bytes(hex32(
