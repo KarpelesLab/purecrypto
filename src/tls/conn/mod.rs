@@ -5117,6 +5117,143 @@ mod loopback_tests {
         );
     }
 
+    /// draft-ietf-tls-esni-22 §6.1.4: the `encrypted_client_hello`
+    /// extension in a HelloRetryRequest carries exactly
+    /// `opaque confirmation[8]`. Any other length is a malformed message
+    /// that "MUST abort the handshake with a `decode_error` alert" — not
+    /// `illegal_parameter`, and not an ECH rejection.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_hrr_extension_with_wrong_length_is_decode_error() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::{EchClient, EchConfigList, EchServer};
+
+        let mut srvkey_rng = HmacDrbg::<Sha256>::new(b"ech-hrr-len-srvkey", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut srvkey_rng);
+        let name = DistinguishedName::common_name("secret.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["secret.example"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-hrr-len-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x66,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let list = EchConfigList::new(alloc::vec![pair.config().clone()]);
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+        let server_config = ServerConfig::with_ed25519(alloc::vec![cert_der.clone()], key)
+            .with_ech_server(EchServer::new(ring, list.clone()))
+            .with_preferred_key_exchange_group(crate::tls::NamedGroup::Secp384r1);
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut client_cfg = ClientConfig::new(roots);
+        client_cfg.ech = Some(EchClient::from_config_list(list));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ech-hrr-len-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ech-hrr-len-s", b"nonce", &[]);
+
+        let mut client = ClientConnection::new_with_offer_partial_shares(
+            client_cfg,
+            "secret.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP384R1],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        // Drive CH1 → HRR.
+        let ch1 = client.write_tls();
+        server.read_tls(&ch1);
+        server.process_new_packets().unwrap();
+        let flight = server.write_tls();
+        assert!(!flight.is_empty(), "server must emit HRR");
+
+        // Pick out the handshake record carrying the HRR (the flight may
+        // also hold a middlebox-compat CCS record).
+        let (rec_start, rec_end) = {
+            let mut p = 0;
+            let mut found = None;
+            while p + 5 <= flight.len() {
+                let ct = flight[p];
+                let frag_len = ((flight[p + 3] as usize) << 8) | (flight[p + 4] as usize);
+                let end = p + 5 + frag_len;
+                assert!(end <= flight.len(), "truncated record");
+                if ct == 0x16 /* Handshake */ && frag_len > 4 && flight[p + 5] == 0x02 {
+                    found = Some((p, end));
+                    break;
+                }
+                p = end;
+            }
+            found.expect("no HRR handshake record found")
+        };
+        let mut hs = flight[rec_start + 5..rec_end].to_vec();
+        let payload_off = crate::tls::ech::accept_signal::locate_hrr_ech_signal_payload(&hs)
+            .expect("HRR carries the HRR signal extension");
+        // Extension layout: type(2) ‖ len(2) ‖ payload(8). Drop the last
+        // payload byte and shrink every enclosing length: the extension's
+        // own, the ServerHello extensions block, the handshake body and
+        // (below) the record.
+        assert_eq!(&hs[payload_off - 2..payload_off], &[0, 8]);
+        hs.remove(payload_off + 7);
+        hs[payload_off - 1] = 7;
+        // ServerHello: version(2) ‖ random(32) ‖ session_id<u8> ‖
+        // cipher_suite(2) ‖ compression(1) ‖ extensions<u16>, after the
+        // 4-byte handshake header.
+        let sid_len = hs[4 + 2 + 32] as usize;
+        let ext_len_off = 4 + 2 + 32 + 1 + sid_len + 2 + 1;
+        let ext_len = u16::from_be_bytes([hs[ext_len_off], hs[ext_len_off + 1]]) - 1;
+        hs[ext_len_off..ext_len_off + 2].copy_from_slice(&ext_len.to_be_bytes());
+        let body_len = (hs.len() - 4) as u32;
+        hs[1..4].copy_from_slice(&body_len.to_be_bytes()[1..]);
+
+        let mut tampered = flight[..rec_start].to_vec();
+        tampered.push(0x16);
+        tampered.extend_from_slice(&flight[rec_start + 1..rec_start + 3]);
+        tampered.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        tampered.extend_from_slice(&hs);
+        tampered.extend_from_slice(&flight[rec_end..]);
+
+        client.read_tls(&tampered);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(
+            matches!(err, crate::tls::Error::Decode),
+            "a 7-byte HRR ECH extension must be a decode_error, got {err:?}",
+        );
+        // And the alert on the wire is `decode_error` (50), fatal.
+        let out = client.write_tls();
+        assert_eq!(
+            &out[out.len() - 2..],
+            &[2, crate::tls::AlertDescription::DecodeError.as_u8()],
+            "fatal decode_error alert"
+        );
+    }
+
     /// End-to-end HelloRetryRequest: server with
     /// `preferred_key_exchange_group = SECP384R1` and client advertising
     /// `[X25519, SECP384R1]` but only shipping a share for X25519. The

@@ -2698,8 +2698,12 @@ impl ClientConnection {
             &hrr.extensions,
             crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO,
         ) {
+            // draft-ietf-tls-esni-22 §6.1.4: the HRR extension payload is
+            // exactly `opaque confirmation[8]`; any other length is a
+            // malformed message and "MUST abort the handshake with a
+            // `decode_error` alert" (not `illegal_parameter`).
             if ech_body.len() != 8 {
-                return Err(Error::IllegalParameter);
+                return Err(Error::Decode);
             }
             let mut received = [0u8; 8];
             received.copy_from_slice(ech_body);
