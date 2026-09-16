@@ -106,6 +106,10 @@ pub(crate) struct ClientConfig12Internal {
     /// legacy peers that predate RFC 7627. Forwarded from
     /// [`crate::tls::Config::require_extended_master_secret`].
     pub require_ems: bool,
+    /// ALPN protocols to offer (RFC 7301), in preference order. Empty (the
+    /// default) sends no `application_layer_protocol_negotiation`
+    /// extension. Forwarded from [`crate::tls::Config::alpn_protocols`].
+    pub alpn_protocols: Vec<Vec<u8>>,
     /// ECDHE groups advertised in the `supported_groups` extension, in
     /// descending preference order. Defaults to `[X25519, SECP256R1]`. The
     /// server picks the first match against its own preference; the client
@@ -128,6 +132,7 @@ impl ClientConfig12Internal {
             key_log: None,
             cipher_suites: SUITES_12.iter().map(|p| p.suite).collect(),
             require_ems: true,
+            alpn_protocols: Vec::new(),
             groups: alloc::vec![
                 NamedGroup::X25519,
                 NamedGroup::SECP256R1,
@@ -140,6 +145,13 @@ impl ClientConfig12Internal {
     /// [`Self::require_ems`]). Default `true`.
     pub fn with_require_ems(mut self, required: bool) -> Self {
         self.require_ems = required;
+        self
+    }
+
+    /// Offers the given ALPN protocols, in preference order (see
+    /// [`Self::alpn_protocols`]).
+    pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
+        self.alpn_protocols = protocols;
         self
     }
 
@@ -278,6 +290,9 @@ pub struct DtlsClientConnection12 {
     ems_offered: bool,
     /// RFC 7627 §3 — set when the server echoed EMS in its ServerHello.
     ems_negotiated: bool,
+    /// The ALPN protocol the server selected in its ServerHello (RFC 7301),
+    /// if any.
+    alpn_negotiated: Option<Vec<u8>>,
 }
 
 // The DTLS 1.2 master secret lives for the whole connection (exporters,
@@ -340,6 +355,7 @@ impl DtlsClientConnection12 {
             last_now: Duration::from_secs(0),
             ems_offered: true,
             ems_negotiated: false,
+            alpn_negotiated: None,
         };
         // We don't include the first CH in the transcript: per RFC 6347 §4.2.1,
         // "the initial ClientHello and HelloVerifyRequest are not included in
@@ -365,6 +381,11 @@ impl DtlsClientConnection12 {
     /// ChaCha20-Poly1305, AES-256-GCM-SHA384}).
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
         self.suite.map(|s| s.suite.0)
+    }
+
+    /// The ALPN protocol the server selected, if any.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_negotiated.as_deref()
     }
 
     /// RFC 5705 §4 — DTLS 1.2 application-layer Exporter. Computes
@@ -932,6 +953,19 @@ impl DtlsClientConnection12 {
         if self.config.require_ems && !self.ems_negotiated {
             return Err(Error::HandshakeFailure);
         }
+        // RFC 7301 §3.1: the server may select exactly one of the protocols
+        // we offered; an unsolicited or foreign selection is a protocol
+        // violation.
+        if let Some(alpn_body) = ext::find(&sh.extensions, crate::tls::codec::ExtensionType::ALPN) {
+            let selected = ext::parse_alpn(alpn_body)?;
+            let [proto] = selected.as_slice() else {
+                return Err(Error::IllegalParameter);
+            };
+            if !self.config.alpn_protocols.iter().any(|p| p == proto) {
+                return Err(Error::IllegalParameter);
+            }
+            self.alpn_negotiated = Some(proto.clone());
+        }
         self.server_random = Some(sh.random);
         self.transcript.update(raw);
         self.state = State::WaitCertificate;
@@ -1215,6 +1249,16 @@ impl DtlsClientConnection12 {
             // Always offer; the server echoes only when it also supports EMS.
             ext::extended_master_secret_empty(),
         ];
+        // RFC 7301: offer ALPN protocols when configured.
+        if !self.config.alpn_protocols.is_empty() {
+            let protos: Vec<&[u8]> = self
+                .config
+                .alpn_protocols
+                .iter()
+                .map(|p| p.as_slice())
+                .collect();
+            extensions.push(ext::alpn_protocols(&protos));
+        }
         // RFC 6066 §3: omit SNI when there is no server name (e.g. connecting by
         // IP with certificate verification off).
         if !self.config.server_name.is_empty() {

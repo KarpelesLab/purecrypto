@@ -166,6 +166,10 @@ pub(crate) struct ServerConfig13Internal {
     /// call, capped at 2^14, so callers keep payloads under the path MTU
     /// themselves.
     pub max_record_size: usize,
+    /// ALPN protocols this server accepts, in preference order (RFC 7301).
+    /// Empty (the default) ignores the client's offer. Forwarded from
+    /// [`crate::tls::Config::alpn_protocols`].
+    pub alpn_protocols: Vec<Vec<u8>>,
 }
 
 impl ServerConfig13Internal {
@@ -182,6 +186,7 @@ impl ServerConfig13Internal {
             signature_policy: Arc::new(SignaturePolicy::modern()),
             key_log: None,
             max_record_size: record::DEFAULT_MAX_RECORD_SIZE,
+            alpn_protocols: Vec::new(),
         }
     }
 
@@ -352,6 +357,9 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// Negotiated cipher suite parameters (set once we pick a suite from
     /// the cookie-validated CH).
     suite: Option<SuiteParams>,
+    /// ALPN protocol selected from the ClientHello (sent in
+    /// EncryptedExtensions), if any.
+    alpn_negotiated: Option<Vec<u8>>,
     /// `exporter_master_secret` (RFC 8446 §7.5), retained after the
     /// server-Finished derivation so [`Self::tls_exporter`] can be called
     /// any number of times once the handshake completes.
@@ -432,6 +440,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             pending_write_app_crypter: None,
             pending_flight: None,
             suite: None,
+            alpn_negotiated: None,
             exporter_secret: None,
             hrr_selected_group: None,
             pending_acks: Vec::new(),
@@ -460,6 +469,11 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         } else {
             None
         }
+    }
+
+    /// The ALPN protocol selected from the client's offer, if any.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_negotiated.as_deref()
     }
 
     /// RFC 8446 §7.5 / RFC 5705 — DTLS 1.3 application-layer Exporter.
@@ -1262,6 +1276,11 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .copied()
             .find(|s| ch.cipher_suites.contains(&s.suite))
             .ok_or(Error::HandshakeFailure)?;
+        // ALPN (RFC 7301): decided here, before any state is touched, so a
+        // no-overlap offer is rejected like any other unacceptable CH; it is
+        // pinned on `self` only once this CH is committed (below the HRR
+        // paths, which re-enter here with the cookie-bearing CH2).
+        let alpn_pick = super::select_alpn(&self.config.alpn_protocols, &ch.extensions)?;
 
         // Parse offered groups + offered shares. We need them both to
         // detect "send HRR-for-group-change" and to pick a share.
@@ -1616,6 +1635,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         self.reassembler = Some(reasm);
         self.server_random = Some(sr);
+        self.alpn_negotiated = alpn_pick;
 
         // ServerHello with the negotiated group's `key_share`; selects
         // DTLS 1.3 (`0xfefc`, RFC 9147 §5.3).
@@ -1786,10 +1806,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     }
 
     fn send_encrypted_extensions(&mut self) -> Result<(), Error> {
-        // EE body: extensions length (u16). Empty for our subset (no ALPN
-        // configured by the server in this commit).
+        // EE body: extensions length (u16), carrying the selected ALPN
+        // protocol (RFC 7301 §3.1 / RFC 8446 §4.3.1) when one was negotiated.
         let mut body = Vec::new();
-        with_len_u16(&mut body, |_| {});
+        let alpn = self.alpn_negotiated.clone();
+        with_len_u16(&mut body, |list| {
+            if let Some(proto) = &alpn {
+                let (ty, ext_body) = ext::alpn_protocols(&[proto.as_slice()]);
+                put_u16(list, ty.0);
+                with_len_u16(list, |b| b.extend_from_slice(&ext_body));
+            }
+        });
         let mut tls_msg = Vec::with_capacity(4 + body.len());
         tls_msg.push(hs_type::ENCRYPTED_EXTENSIONS);
         let n = body.len() as u32;

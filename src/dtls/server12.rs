@@ -88,6 +88,10 @@ pub(crate) struct ServerConfig12Internal {
     /// `false` only for legacy clients that predate RFC 7627. Forwarded from
     /// [`crate::tls::Config::require_extended_master_secret`].
     require_ems: bool,
+    /// ALPN protocols this server accepts, in preference order (RFC 7301).
+    /// Empty (the default) ignores the client's offer. Forwarded from
+    /// [`crate::tls::Config::alpn_protocols`].
+    alpn_protocols: Vec<Vec<u8>>,
     /// Allowed signature algorithms (reserved for client-auth in a future
     /// commit; currently unused on the server side because we don't accept
     /// client certificates yet).
@@ -108,6 +112,7 @@ impl ServerConfig12Internal {
             previous_cookie_secret: None,
             require_cookie_exchange: true,
             require_ems: true,
+            alpn_protocols: Vec::new(),
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
         }
@@ -125,6 +130,7 @@ impl ServerConfig12Internal {
             previous_cookie_secret: None,
             require_cookie_exchange: true,
             require_ems: true,
+            alpn_protocols: Vec::new(),
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
         }
@@ -143,6 +149,7 @@ impl ServerConfig12Internal {
             previous_cookie_secret: None,
             require_cookie_exchange: true,
             require_ems: true,
+            alpn_protocols: Vec::new(),
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
         }
@@ -184,6 +191,13 @@ impl ServerConfig12Internal {
     /// [`Self::require_ems`]). Default `true`.
     pub fn with_require_ems(mut self, required: bool) -> Self {
         self.require_ems = required;
+        self
+    }
+
+    /// Sets the ALPN protocols this server accepts, in preference order
+    /// (see [`Self::alpn_protocols`]).
+    pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
+        self.alpn_protocols = protocols;
         self
     }
 }
@@ -320,6 +334,9 @@ pub struct DtlsServerConnection12<R: RngCore> {
     /// RFC 7627 §5.1 — set when the client offered `extended_master_secret`
     /// and we echoed it. Drives the master-secret derivation choice.
     ems_negotiated: bool,
+    /// ALPN protocol selected from the ClientHello and echoed in the
+    /// ServerHello (RFC 7301), if any.
+    alpn_negotiated: Option<Vec<u8>>,
 }
 
 // The DTLS 1.2 master secret lives for the whole connection (exporters,
@@ -392,6 +409,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             last_now: Duration::from_secs(0),
             clock_driven: false,
             ems_negotiated: false,
+            alpn_negotiated: None,
         }
     }
 
@@ -407,6 +425,11 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// signing keys are supported; matches the TLS 1.2 server's scope.
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
         self.suite.map(|s| s.suite.0)
+    }
+
+    /// The ALPN protocol selected from the client's offer, if any.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_negotiated.as_deref()
     }
 
     /// RFC 5705 §4 — DTLS 1.2 application-layer Exporter. Computes
@@ -1092,6 +1115,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         if self.config.require_ems && !ems_negotiated {
             return Err(Error::HandshakeFailure);
         }
+        // ALPN (RFC 7301), decided into a local like everything else here.
+        let alpn_pick = super::select_alpn(&self.config.alpn_protocols, &parsed.extensions)?;
 
         // RFC 5746 §3.6: echo an empty `renegotiation_info` when the client
         // signalled secure renegotiation — either via the extension (whose
@@ -1135,6 +1160,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.suite = Some(suite);
         self.group = Some(group);
         self.ems_negotiated = ems_negotiated;
+        self.alpn_negotiated = alpn_pick;
         // Initialise the reassembler at expected_msg_seq = msg_seq + 1
         // (the client's next handshake msg after CH).
         let mut reasm = Reassembler::new();
@@ -1203,6 +1229,10 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let mut sh_exts: Vec<(ExtensionType, Vec<u8>)> = alloc::vec![ext::ec_point_formats()];
         if self.ems_negotiated {
             sh_exts.push(ext::extended_master_secret_empty());
+        }
+        // RFC 7301 §3.1: echo the single selected protocol.
+        if let Some(proto) = &self.alpn_negotiated {
+            sh_exts.push(ext::alpn_protocols(&[proto.as_slice()]));
         }
         // RFC 5746 §3.6: echo an empty `renegotiation_info` when the client
         // signalled secure renegotiation (decided in the validation phase).

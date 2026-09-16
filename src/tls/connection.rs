@@ -1242,10 +1242,12 @@ impl Connection {
             Engine::ClientTlsAuto(c) => c.alpn_protocol(),
             #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.alpn_protocol(),
-            // Reachable only when `dtls` is enabled (catches the DTLS variants
-            // not handled above); exhaustive over the TLS variants otherwise.
-            #[cfg_attr(not(feature = "dtls"), allow(unreachable_patterns))]
-            _ => None,
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(c) => c.alpn_protocol(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.alpn_protocol(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls12(c) => c.alpn_protocol(),
         }
     }
 
@@ -2105,12 +2107,12 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         max_record_size,
     } = dtls_client_opts(cfg)?;
     // DTLS 1.2 fragments handshake records at a fixed 1100 bytes (see
-    // `Config::max_record_size`) and does not implement ALPN; see the
-    // `Config` docs.
-    let _ = (max_record_size, alpn_protocols);
+    // `Config::max_record_size`).
+    let _ = max_record_size;
 
     let mut dc = crate::dtls::ClientConfig12Internal::new(roots.clone_store(), server_name)
-        .with_require_ems(require_extended_master_secret);
+        .with_require_ems(require_extended_master_secret)
+        .with_alpn(alpn_protocols.to_vec());
     if !verify_certificates {
         dc = dc.without_certificate_verification();
     }
@@ -2320,9 +2322,9 @@ fn build_dtls12_server(
         max_record_size,
     } = dtls_server_opts(cfg)?;
     // The DTLS 1.2 server verifies no client certificate (so the signature
-    // policy has nothing to govern), fragments at a fixed 1100 bytes, and
-    // does not implement ALPN; see the `Config` docs.
-    let _ = (signature_policy, max_record_size, alpn_protocols);
+    // policy has nothing to govern) and fragments at a fixed 1100 bytes; see
+    // the `Config` docs.
+    let _ = (signature_policy, max_record_size);
 
     let chain = identity.cert_chain.clone();
     let mut sc = match &identity.key {
@@ -2349,6 +2351,7 @@ fn build_dtls12_server(
         sc = sc.require_cookie_exchange(false);
     }
     sc = sc.with_require_ems(require_extended_master_secret);
+    sc = sc.with_alpn(alpn_protocols.to_vec());
     sc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
@@ -2374,13 +2377,9 @@ fn build_dtls13_server(
         max_record_size,
     } = dtls_server_opts(cfg)?;
     // The DTLS 1.3 server verifies no client certificate (so the signature
-    // policy has nothing to govern), EMS is a TLS 1.2 mechanism, and ALPN is
-    // not implemented; see the `Config` docs.
-    let _ = (
-        signature_policy,
-        require_extended_master_secret,
-        alpn_protocols,
-    );
+    // policy has nothing to govern) and EMS is a TLS 1.2 mechanism; see the
+    // `Config` docs.
+    let _ = (signature_policy, require_extended_master_secret);
 
     let chain = identity.cert_chain.clone();
     let server_key = identity.key.to_server_key_13();
@@ -2395,6 +2394,7 @@ fn build_dtls13_server(
         sc = sc.with_no_cookie();
     }
     sc.max_record_size = max_record_size;
+    sc.alpn_protocols = alpn_protocols.to_vec();
     sc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
@@ -3188,6 +3188,62 @@ mod tests {
                 Connection::client(&client_cfg),
                 Err(Error::NoUsableCipherSuites)
             ));
+        }
+    }
+
+    /// `Config::alpn_protocols` is negotiated over DTLS 1.2 and 1.3 (RFC
+    /// 7301): the server picks the first of its own preferences the client
+    /// offered and both sides report it; a client offer the server cannot
+    /// match is refused (the server answers nothing), and a client that
+    /// offered nothing negotiates nothing even against a server with
+    /// preferences.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_negotiates_alpn() {
+        for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            server_cfg.alpn_protocols = alloc::vec![b"coap".to_vec(), b"h2".to_vec()];
+
+            // Overlap: the server's first preference the client listed.
+            let client_cfg = dtls_client_builder(version)
+                .alpn(alloc::vec![b"h2".to_vec(), b"coap".to_vec()])
+                .build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert_eq!(client.alpn_selected(), Some(&b"coap"[..]), "{version:?}");
+            assert_eq!(server.alpn_selected(), Some(&b"coap"[..]), "{version:?}");
+
+            // No offer: nothing negotiated, handshake still completes.
+            let client_cfg = dtls_client_builder(version).build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert_eq!(client.alpn_selected(), None);
+            assert_eq!(server.alpn_selected(), None);
+
+            // No overlap: the server refuses the ClientHello (silently, as
+            // for any unauthenticated rejection) and never completes.
+            let client_cfg = dtls_client_builder(version)
+                .alpn(alloc::vec![b"http/1.1".to_vec()])
+                .build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            for _ in 0..8 {
+                loop {
+                    let out = client.pop().unwrap();
+                    if out.is_empty() {
+                        break;
+                    }
+                    server.feed(&out).unwrap();
+                }
+                assert!(
+                    server.pop().unwrap().is_empty(),
+                    "{version:?}: a no-overlap ALPN offer must not be answered"
+                );
+            }
+            assert!(!server.is_handshake_complete() && !client.is_handshake_complete());
         }
     }
 

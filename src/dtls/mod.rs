@@ -129,6 +129,31 @@ pub(crate) use server12::ServerConfig12Internal;
 pub use server13::DtlsServerConnection13;
 pub(crate) use server13::ServerConfig13Internal;
 
+/// Server-side ALPN selection (RFC 7301 §3.2), shared by the DTLS 1.2 and
+/// 1.3 servers and mirroring the TLS servers: when the client offered ALPN
+/// and this server has preferences, pick the first of *our* protocols the
+/// client listed; no overlap is `no_application_protocol`. A server without
+/// preferences ignores the offer (the client then proceeds without ALPN),
+/// and a client that offered nothing negotiates nothing.
+pub(crate) fn select_alpn(
+    ours: &[alloc::vec::Vec<u8>],
+    extensions: &[crate::tls::codec::RawExtension],
+) -> Result<Option<alloc::vec::Vec<u8>>, crate::tls::Error> {
+    use crate::tls::codec::{ExtensionType, extension as ext};
+    let Some(body) = ext::find(extensions, ExtensionType::ALPN) else {
+        return Ok(None);
+    };
+    let offered = ext::parse_alpn(body)?;
+    if ours.is_empty() {
+        return Ok(None);
+    }
+    ours.iter()
+        .find(|p| offered.iter().any(|o| o == *p))
+        .cloned()
+        .map(Some)
+        .ok_or(crate::tls::Error::NoApplicationProtocol)
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

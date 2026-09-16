@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wiped when the config is dropped. The builder methods accept both a
   `[u8; 32]` and a `Secret32`; direct field writes need `.into()`.
 - *(tls)* the DTLS engines now honour `Config::cipher_suites` (client) and
-  the DTLS 1.3 client offers `Config::alpn_protocols`; a DTLS `Config` that
+  negotiate `Config::alpn_protocols` (RFC 7301, both roles, DTLS 1.2 and
+  1.3 — `Connection::alpn_selected` reports the result); a DTLS `Config` that
   sets a client identity, a `record_size_limit`, or RFC 7250 raw public
   keys / certificate-type preferences is refused with `InappropriateState`
   instead of silently ignored. `ConfigBuilder` documents which protocols

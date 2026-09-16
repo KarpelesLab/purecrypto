@@ -637,7 +637,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `identity` (client, mTLS) | yes | yes | **refused** | **refused** | yes |
 /// | `private_key` / `try_private_key` ([`HandshakeSigner`](super::HandshakeSigner)) | yes | no ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes | yes | **refused** |
 /// | `client_auth` | yes | yes | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes |
-/// | `alpn` | yes | yes | client only | inert | yes (required) |
+/// | `alpn` | yes | yes | yes | yes | yes (required) |
 /// | `cipher_suites` (client) | yes | yes | yes | yes | inert (fixed TLS 1.3 set) |
 /// | `record_size_limit` | yes | yes | **refused** | **refused** | inert (no records) |
 /// | `require_extended_master_secret` | inert | yes | inert | yes | inert |
