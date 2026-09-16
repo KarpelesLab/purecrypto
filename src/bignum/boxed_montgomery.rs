@@ -334,11 +334,13 @@ impl BoxedMontModulus {
     /// the larger of the two, never the silent truncation that an
     /// unconditional `limbs_resized(self.limbs)` would impose.
     ///
-    /// Iteration count is a function of `max(self.limbs, exp.limbs())` —
-    /// both public quantities (the modulus width is public, and a caller
-    /// passing an exponent wider than the modulus is exposing the width by
-    /// construction). Two secret exponents of the same width through the
-    /// same modulus therefore still take the same time.
+    /// The loop runs over `max(self.limbs, s)` limbs, where `s` is the number
+    /// of *significant* limbs of `exp` (leading zero limbs stripped). For any
+    /// exponent below `2^(64·self.limbs)` — every RSA `d < n` and DH `x < p`,
+    /// however the caller padded its `Vec` — that is exactly `self.limbs`,
+    /// a public quantity, so the running time reveals nothing about the
+    /// exponent's value. Only an exponent that is itself wider than the
+    /// modulus makes the count depend on where its top set limb sits.
     pub fn pow(&self, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
         let base_m = self.to_mont_limbs(&base.limbs_resized(self.limbs));
         let mut one = vec![0 as Limb; self.limbs];
