@@ -48,16 +48,9 @@ use crate::ct::ConstantTimeEq;
 #[cfg(feature = "std")]
 use std::sync::{Arc, Mutex};
 
-/// Upper bound on post-handshake `KeyUpdate` messages we will process from
-/// the client (RFC 8446 §4.6.3). Each one costs two HKDF-Expand-Label pairs
-/// plus an AEAD key schedule on both sides, and each `update_requested` makes
-/// us emit our own reply — five bytes of handshake message and a ~27-byte
-/// record — with no natural backpressure if the peer never reads. A peer
-/// streaming them back to back would otherwise grow our queued output without
-/// any ceiling. Sixty-four covers any plausible legitimate rekeying schedule
-/// (the per-key record cap is 2²³ records, so 64 peer-initiated updates span
-/// well over 500 million records).
-const MAX_KEY_UPDATES_RECEIVED: u32 = 64;
+/// The `KeyUpdate` flood guard is shared with the client engine; see its
+/// definition for the rule.
+use super::client::MAX_CONSECUTIVE_KEY_UPDATES;
 
 /// Floor on the ciphertext-byte budget for the RFC 8446 §4.2.10 "skip
 /// rejected early data" window. A client whose 0-RTT offer we decline is
@@ -864,9 +857,10 @@ pub struct ServerConnection<R: RngCore> {
     /// in CH AND policy allows). Drives the early-read-key install and EOED
     /// expectation.
     early_data_accepted: bool,
-    /// Post-handshake `KeyUpdate` messages received from the client, capped
-    /// by [`MAX_KEY_UPDATES_RECEIVED`].
-    key_updates_received: u32,
+    /// Length of the current run of back-to-back `KeyUpdate`s from the
+    /// client (see [`MAX_CONSECUTIVE_KEY_UPDATES`]); reset by any other
+    /// record under the key an update retires.
+    consecutive_key_updates: u32,
     /// RFC 8446 §4.2.10: when 0-RTT is accepted, this tracks the remaining
     /// plaintext byte budget the client may consume under the early-data
     /// key. Initialized to `config.max_early_data_size` on 0-RTT acceptance;
@@ -1055,7 +1049,7 @@ impl<R: RngCore> ServerConnection<R> {
             rms: None,
             ks: None,
             early_data_accepted: false,
-            key_updates_received: 0,
+            consecutive_key_updates: 0,
             early_data_remaining: None,
             deferred_chts: None,
             client_cert_chain: Vec::new(),
@@ -1662,11 +1656,11 @@ impl<R: RngCore> ServerConnection<R> {
     /// and replies with our own `KeyUpdate(not_requested)` if the peer
     /// requested it.
     ///
-    /// Rate-limited by [`MAX_KEY_UPDATES_RECEIVED`]: each inbound
+    /// Flood-guarded by [`MAX_CONSECUTIVE_KEY_UPDATES`]: each inbound
     /// `KeyUpdate(update_requested)` costs us two HKDF-Expand-Label pairs, an
     /// AEAD key schedule and an outbound record, and a peer that never reads
-    /// can stream them back to back. Past the bound the connection is failed
-    /// as `PeerMisbehaved`.
+    /// can stream them back to back. Past that many in a row with no other
+    /// traffic the connection is failed as `PeerMisbehaved`.
     fn handle_key_update(&mut self, body: &[u8]) -> Result<(), Error> {
         // RFC 9001 §6: QUIC carries no TLS `KeyUpdate` — key updates happen
         // in the QUIC layer via the Key Phase bit. A peer sending one over a
@@ -1678,8 +1672,14 @@ impl<R: RngCore> ServerConnection<R> {
             return Err(Error::UnexpectedMessage);
         }
         let ku = KeyUpdate::decode(body)?;
-        self.key_updates_received = self.key_updates_received.saturating_add(1);
-        if self.key_updates_received > MAX_KEY_UPDATES_RECEIVED {
+        // Flood guard: a KeyUpdate that was the only record under the key it
+        // retires extends the back-to-back run; any other traffic under that
+        // key resets it.
+        if self.core.read_records_under_current_key() > 1 {
+            self.consecutive_key_updates = 0;
+        }
+        self.consecutive_key_updates = self.consecutive_key_updates.saturating_add(1);
+        if self.consecutive_key_updates > MAX_CONSECUTIVE_KEY_UPDATES {
             return Err(Error::PeerMisbehaved);
         }
         let suite = self.suite.ok_or(Error::IllegalParameter)?;

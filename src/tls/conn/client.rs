@@ -45,16 +45,28 @@ use alloc::vec::Vec;
 use crate::ct::ConstantTimeEq;
 use crate::zeroize::Zeroizing;
 
-/// Upper bound on post-handshake `KeyUpdate` messages we will process from
-/// the server (RFC 8446 §4.6.3). Each one costs two HKDF-Expand-Label pairs
-/// plus an AEAD key schedule, and each `update_requested` makes us emit our
-/// own reply — five bytes of handshake message and a ~27-byte record — with
-/// no natural backpressure if the peer never reads. A peer streaming them
-/// back to back would otherwise grow our queued output without any ceiling.
-/// Sixty-four covers any plausible legitimate rekeying schedule (the per-key
-/// record cap is 2²³ records, so 64 peer-initiated updates span well over
-/// 500 million records).
-const MAX_KEY_UPDATES_RECEIVED: u32 = 64;
+/// Flood guard on post-handshake `KeyUpdate` messages (RFC 8446 §4.6.3),
+/// shared by both TLS 1.3 engines.
+///
+/// Each inbound `KeyUpdate` costs two HKDF-Expand-Label pairs plus an AEAD
+/// key schedule, and each `update_requested` makes us emit our own reply —
+/// a five-byte handshake message in a ~27-byte record — with no natural
+/// backpressure if the peer never reads. A peer streaming them back to back
+/// would otherwise grow our queued output without any ceiling.
+///
+/// The rule is a bound on the *run* of back-to-back updates, not a lifetime
+/// count: a `KeyUpdate` that was the only record deprotected under the read
+/// key it retires (the read sequence number is at most 1 when it is
+/// processed — this also covers several `KeyUpdate`s coalesced into one
+/// record) extends the run; any other record under that key — application
+/// data, a ticket, an alert — resets it to zero. Once a run exceeds this
+/// constant the connection is failed as `PeerMisbehaved`. A peer that
+/// rekeys on a timer over live traffic is therefore never limited, however
+/// long the connection lives; only a peer sending nothing but `KeyUpdate`s,
+/// sixty-five in a row, is cut off. (The per-key record cap is 2²³, so a
+/// legitimate peer that rekeys *because* the key is exhausted always has
+/// traffic under it.)
+pub(crate) const MAX_CONSECUTIVE_KEY_UPDATES: u32 = 64;
 
 /// Upper bound on a HelloRetryRequest `cookie` we are willing to echo in the
 /// retry ClientHello (RFC 8446 §4.2.2). The wire vector allows up to 2^16-1
@@ -782,9 +794,10 @@ pub struct ClientConnection {
     /// already-sent ClientHello to a TLS 1.2 engine. No alert is emitted and no
     /// state advances.
     downgrade_to_tls12: bool,
-    /// Post-handshake `KeyUpdate` messages received from the server, capped
-    /// by [`MAX_KEY_UPDATES_RECEIVED`].
-    key_updates_received: u32,
+    /// Length of the current run of back-to-back `KeyUpdate`s from the
+    /// server (see [`MAX_CONSECUTIVE_KEY_UPDATES`]); reset by any other
+    /// record under the key an update retires.
+    consecutive_key_updates: u32,
     /// The exact ClientHello handshake-message bytes we emitted (header
     /// included), retained so a 1.2 downgrade can seed the TLS 1.2 engine's
     /// transcript with them without re-encoding.
@@ -1465,7 +1478,7 @@ impl ClientConnection {
             cr_signature_algorithms: Vec::new(),
             offer_tls12,
             downgrade_to_tls12: false,
-            key_updates_received: 0,
+            consecutive_key_updates: 0,
             sent_client_hello: Vec::new(),
             engine_mode,
             hooks,
@@ -2234,12 +2247,14 @@ impl ClientConnection {
             return Err(Error::UnexpectedMessage);
         }
         let ku = KeyUpdate::decode(body)?;
-        // Rate limit (see `MAX_KEY_UPDATES_RECEIVED`): every inbound
-        // `KeyUpdate(update_requested)` costs two HKDF-Expand-Label pairs, an
-        // AEAD key schedule and an outbound record, and a peer that never
-        // reads our replies can stream them back to back with no ceiling.
-        self.key_updates_received = self.key_updates_received.saturating_add(1);
-        if self.key_updates_received > MAX_KEY_UPDATES_RECEIVED {
+        // Flood guard (see `MAX_CONSECUTIVE_KEY_UPDATES`): a KeyUpdate that
+        // was the only record under the key it retires extends the
+        // back-to-back run; any other traffic under that key resets it.
+        if self.core.read_records_under_current_key() > 1 {
+            self.consecutive_key_updates = 0;
+        }
+        self.consecutive_key_updates = self.consecutive_key_updates.saturating_add(1);
+        if self.consecutive_key_updates > MAX_CONSECUTIVE_KEY_UPDATES {
             return Err(Error::PeerMisbehaved);
         }
         let suite = self.suite.ok_or(Error::IllegalParameter)?;

@@ -9406,6 +9406,119 @@ mod audit_regression_tests {
         );
     }
 
+    /// The mirror of `key_update_flood_is_rate_limited`: a server streaming
+    /// `KeyUpdate`s at the client, with nothing else under any of the keys,
+    /// is cut off by the client after `MAX_CONSECUTIVE_KEY_UPDATES` in a
+    /// row.
+    #[test]
+    fn key_update_flood_is_rate_limited_on_the_client_too() {
+        use super::client::MAX_CONSECUTIVE_KEY_UPDATES;
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, mut server) = connected_pair(server_config, cert_der, b"ku-flood-c");
+
+        for i in 0..MAX_CONSECUTIVE_KEY_UPDATES {
+            server.request_key_update().unwrap();
+            client.read_tls(&server.write_tls());
+            client
+                .process_new_packets()
+                .unwrap_or_else(|e| panic!("update {i} within the run must be accepted: {e:?}"));
+            // Keep the server's read key in step with the client's replies.
+            server.read_tls(&client.write_tls());
+            server.process_new_packets().unwrap();
+        }
+        server.request_key_update().unwrap();
+        client.read_tls(&server.write_tls());
+        assert!(
+            matches!(client.process_new_packets(), Err(Error::PeerMisbehaved)),
+            "the {}th back-to-back KeyUpdate must be refused",
+            MAX_CONSECUTIVE_KEY_UPDATES + 1
+        );
+    }
+
+    /// The flood guard bounds a *run* of back-to-back updates, not the
+    /// lifetime count: a peer that rekeys on a timer over a live connection
+    /// — application data under every key — may do so indefinitely. Both
+    /// directions, three times the cap.
+    #[test]
+    fn timer_style_key_updates_with_traffic_are_unlimited() {
+        use super::client::MAX_CONSECUTIVE_KEY_UPDATES;
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, mut server) = connected_pair(server_config, cert_der, b"ku-timer");
+
+        // Client-initiated rekeys, each preceded by a record under the key
+        // it retires; the server answers with data of its own before its
+        // next reply, so the client sees traffic under every key too.
+        for _ in 0..MAX_CONSECUTIVE_KEY_UPDATES * 3 {
+            client.send_application_data(b"tick").unwrap();
+            client.request_key_update().unwrap();
+            server.read_tls(&client.write_tls());
+            server.process_new_packets().unwrap();
+            assert_eq!(server.take_received_plaintext(), b"tick");
+            server.send_application_data(b"tock").unwrap();
+            client.read_tls(&server.write_tls());
+            client.process_new_packets().unwrap();
+            assert_eq!(client.take_received_plaintext(), b"tock");
+        }
+        // Server-initiated rekeys, same shape.
+        for _ in 0..MAX_CONSECUTIVE_KEY_UPDATES * 3 {
+            server.send_application_data(b"tick").unwrap();
+            server.request_key_update().unwrap();
+            client.read_tls(&server.write_tls());
+            client.process_new_packets().unwrap();
+            assert_eq!(client.take_received_plaintext(), b"tick");
+            client.send_application_data(b"tock").unwrap();
+            server.read_tls(&client.write_tls());
+            server.process_new_packets().unwrap();
+            assert_eq!(server.take_received_plaintext(), b"tock");
+        }
+        // And the connection is still fully usable afterwards.
+        client.send_application_data(b"done").unwrap();
+        server.read_tls(&client.write_tls());
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"done");
+    }
+
+    /// Traffic resets the run even after it has nearly reached the cap: a
+    /// single application-data record under a key lets a fresh run of
+    /// back-to-back updates begin.
+    #[test]
+    fn key_update_run_is_reset_by_traffic() {
+        use super::client::MAX_CONSECUTIVE_KEY_UPDATES;
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, mut server) = connected_pair(server_config, cert_der, b"ku-reset");
+
+        // A run of exactly the cap: every update (and every reply) is the
+        // only record under the key it retires, on both sides.
+        fn burst(client: &mut ClientConnection, server: &mut ServerConnection<HmacDrbg<Sha256>>) {
+            for _ in 0..MAX_CONSECUTIVE_KEY_UPDATES {
+                client.request_key_update().unwrap();
+                server.read_tls(&client.write_tls());
+                server.process_new_packets().unwrap();
+                client.read_tls(&server.write_tls());
+                client.process_new_packets().unwrap();
+            }
+        }
+        burst(&mut client, &mut server);
+        // One record under the current key in each direction, then a full
+        // run is allowed again.
+        client.send_application_data(b"breather").unwrap();
+        server.read_tls(&client.write_tls());
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"breather");
+        server.send_application_data(b"breather").unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"breather");
+        burst(&mut client, &mut server);
+        // Without a breather the next one tips the run over the cap.
+        client.request_key_update().unwrap();
+        server.read_tls(&client.write_tls());
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(Error::PeerMisbehaved)
+        ));
+    }
+
     /// MEDIUM 4 — the write side used to drop records silently once the
     /// per-key sequence cap was hit. It must now rekey itself before that
     /// point (RFC 8446 §5.5) so a long-lived connection keeps transmitting.

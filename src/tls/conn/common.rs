@@ -394,6 +394,14 @@ impl ConnectionCore {
         }
     }
 
+    /// Number of records deprotected under the *current* read key (the read
+    /// crypter's sequence number), or 0 before any read key is installed.
+    /// The engines' `KeyUpdate` flood guard uses it: a `KeyUpdate` that was
+    /// the only record under the key it retires extends a back-to-back run.
+    pub(crate) fn read_records_under_current_key(&self) -> u64 {
+        self.read.as_ref().map_or(0, |c| c.seq())
+    }
+
     /// True once [`Self::send_close_notify`] has queued our `close_notify`.
     /// RFC 8446 §6.1: "the sender MUST NOT send any more data" afterwards —
     /// the engines refuse `send_application_data` once this is set. Only the
