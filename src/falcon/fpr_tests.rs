@@ -248,6 +248,8 @@ fn round_to_int_never_panics_on_negate_overflow() {
 
 /// Per-operation throughput of the emulation (ignored by default; run with
 /// `cargo test --release --all-features falcon::fpr::fpr_tests::op_timing -- --ignored --nocapture`).
+// `std::time::Instant` only: this module is compiled under `alloc` alone too.
+#[cfg(feature = "std")]
 #[test]
 #[ignore]
 fn op_timing() {
@@ -555,7 +557,7 @@ fn differential_vs_reference_int_conversions() {
 
 #[test]
 fn differential_vs_reference_edge_table() {
-    let mut edges: std::vec::Vec<u64> = std::vec::Vec::new();
+    let mut edges: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     for sign in [0u64, 1] {
         for (e, f) in [
             (0u64, 0u64),      // zero

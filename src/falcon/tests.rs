@@ -848,6 +848,8 @@ fn decompress_rejects_magnitude_2048_accepts_2047() {
 /// Wall-clock signing throughput (ignored by default; run with
 /// `cargo test --release --all-features falcon::tests::sign_timing -- --ignored --nocapture`).
 /// Used to track the cost of the constant-time `fpr` emulation.
+// `std::time::Instant` only: this module is compiled under `alloc` alone too.
+#[cfg(feature = "std")]
 #[test]
 #[ignore]
 fn sign_timing() {
