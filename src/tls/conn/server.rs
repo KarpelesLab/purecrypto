@@ -2015,14 +2015,48 @@ impl<R: RngCore> ServerConnection<R> {
             return Err(Error::IllegalParameter);
         }
 
+        // RFC 8446 §9.2 mandatory-extension checks, all `missing_extension`:
+        //  * `pre_shared_key` without `psk_key_exchange_modes` (§4.2.9: the
+        //    server MUST abort);
+        //  * `supported_groups` and `key_share` come as a pair ("if
+        //    containing a supported_groups extension, it MUST also contain a
+        //    key_share extension, and vice versa");
+        //  * a TLS 1.3 ClientHello MUST carry `key_share` (an empty
+        //    `client_shares` list is fine — it requests an HRR) unless the
+        //    client only offers PSK-only key exchange (`psk_ke`, §4.2.8 /
+        //    §4.2.9). We do not implement `psk_ke`, so that lone legal shape
+        //    still fails below — with `handshake_failure`, since the CH
+        //    itself is well-formed.
+        let has_key_share = ext::find(&ch.extensions, ExtensionType::KEY_SHARE).is_some();
+        let has_supported_groups =
+            ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS).is_some();
+        let psk_offered = ext::find(&ch.extensions, ExtensionType::PRE_SHARED_KEY).is_some();
+        let psk_modes = match ext::find(&ch.extensions, ExtensionType::PSK_KEY_EXCHANGE_MODES) {
+            Some(modes_body) => Some(ext::parse_psk_key_exchange_modes(modes_body)?),
+            None => None,
+        };
+        if psk_offered && psk_modes.is_none() {
+            return Err(Error::MissingExtension);
+        }
+        if has_key_share != has_supported_groups {
+            return Err(Error::MissingExtension);
+        }
+        let psk_ke_only = psk_offered && psk_modes.as_deref().is_some_and(|m| !m.contains(&1));
+        if !has_key_share && !psk_ke_only {
+            return Err(Error::MissingExtension);
+        }
+
         // The client must accept a signature scheme our key can produce —
         // unless PSK is being used, in which case we sign nothing. For an
         // external key this picks the first advertised scheme the client
         // offered; for an in-process key it is the key's fixed scheme. The
         // choice is stashed so the CertificateVerify step reuses it.
+        // RFC 8446 §4.2.3: a server authenticating with a certificate MUST
+        // abort with `missing_extension` when `signature_algorithms` is
+        // absent (it is only optional for PSK-only key exchange).
         if psk_state.is_none() {
             let sig_algs = ext::find(&ch.extensions, ExtensionType::SIGNATURE_ALGORITHMS)
-                .ok_or(Error::HandshakeFailure)?;
+                .ok_or(Error::MissingExtension)?;
             let offered = ext::parse_signature_algorithms(sig_algs)?;
             let scheme = self
                 .config
@@ -3957,6 +3991,147 @@ mod tests {
             .on_client_hello(hs_type::CLIENT_HELLO, body, &raw)
             .unwrap_err();
         assert!(matches!(err, Error::IllegalParameter));
+    }
+
+    /// Feeds a forged TLS 1.3 ClientHello carrying exactly `extensions` to a
+    /// fresh server and returns the handshake error (if any).
+    fn forged_ch_result(
+        extensions: alloc::vec::Vec<(crate::tls::codec::ExtensionType, alloc::vec::Vec<u8>)>,
+    ) -> Result<(), Error> {
+        use crate::tls::codec::{CipherSuite, ClientHello};
+        let rng = ScriptedRng {
+            data: alloc::vec![0u8; 256],
+            pos: 0,
+        };
+        let mut server = ServerConnection::new(test_server_config(), rng);
+        let ch = ClientHello {
+            legacy_version: 0x0303,
+            random: [0x22; 32],
+            session_id: alloc::vec::Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::AES_128_GCM_SHA256],
+            extensions,
+        };
+        let raw = ch.encode();
+        server.on_client_hello(hs_type::CLIENT_HELLO, &raw[4..], &raw)
+    }
+
+    /// The extension set of a well-formed TLS 1.3 ClientHello: every
+    /// mandatory extension (RFC 8446 §9.2) plus `psk_key_exchange_modes`.
+    /// The §9.2 tests below drop one entry at a time.
+    fn well_formed_ch_extensions()
+    -> alloc::vec::Vec<(crate::tls::codec::ExtensionType, alloc::vec::Vec<u8>)> {
+        alloc::vec![
+            ext::client_supported_versions(),
+            ext::supported_groups_list(&[NamedGroup::X25519]),
+            ext::signature_algorithms(),
+            ext::psk_key_exchange_modes(&[1]),
+            ext::client_key_shares(&[(NamedGroup::X25519, alloc::vec![0x42u8; 32])]),
+        ]
+    }
+
+    /// The baseline forged CH must get past the §9.2 checks (it fails later,
+    /// on the bogus X25519 share, but never with `missing_extension`) so the
+    /// negative tests below prove something.
+    #[test]
+    fn well_formed_forged_ch_passes_mandatory_extension_checks() {
+        let err = forged_ch_result(well_formed_ch_extensions());
+        assert!(
+            !matches!(err, Err(Error::MissingExtension)),
+            "baseline CH was rejected as missing an extension: {err:?}"
+        );
+    }
+
+    /// RFC 8446 §9.2: a TLS 1.3 ClientHello without `key_share` (and not
+    /// offering PSK-only key exchange) MUST be refused with
+    /// `missing_extension`.
+    #[test]
+    fn server_missing_extension_when_key_share_absent() {
+        let exts: alloc::vec::Vec<_> = well_formed_ch_extensions()
+            .into_iter()
+            .filter(|(t, _)| {
+                *t != ExtensionType::KEY_SHARE && *t != ExtensionType::SUPPORTED_GROUPS
+            })
+            .collect();
+        let err = forged_ch_result(exts).unwrap_err();
+        assert!(matches!(err, Error::MissingExtension), "{err:?}");
+        assert_eq!(alert_for(&err), AlertDescription::MissingExtension);
+    }
+
+    /// RFC 8446 §9.2: `supported_groups` without `key_share` is
+    /// `missing_extension`.
+    #[test]
+    fn server_missing_extension_when_key_share_absent_but_groups_present() {
+        let exts: alloc::vec::Vec<_> = well_formed_ch_extensions()
+            .into_iter()
+            .filter(|(t, _)| *t != ExtensionType::KEY_SHARE)
+            .collect();
+        let err = forged_ch_result(exts).unwrap_err();
+        assert!(matches!(err, Error::MissingExtension), "{err:?}");
+        assert_eq!(alert_for(&err), AlertDescription::MissingExtension);
+    }
+
+    /// RFC 8446 §9.2: `key_share` without `supported_groups` is
+    /// `missing_extension`.
+    #[test]
+    fn server_missing_extension_when_supported_groups_absent() {
+        let exts: alloc::vec::Vec<_> = well_formed_ch_extensions()
+            .into_iter()
+            .filter(|(t, _)| *t != ExtensionType::SUPPORTED_GROUPS)
+            .collect();
+        let err = forged_ch_result(exts).unwrap_err();
+        assert!(matches!(err, Error::MissingExtension), "{err:?}");
+        assert_eq!(alert_for(&err), AlertDescription::MissingExtension);
+    }
+
+    /// RFC 8446 §4.2.3 / §9.2: certificate authentication without
+    /// `signature_algorithms` is `missing_extension`.
+    #[test]
+    fn server_missing_extension_when_signature_algorithms_absent() {
+        let exts: alloc::vec::Vec<_> = well_formed_ch_extensions()
+            .into_iter()
+            .filter(|(t, _)| *t != ExtensionType::SIGNATURE_ALGORITHMS)
+            .collect();
+        let err = forged_ch_result(exts).unwrap_err();
+        assert!(matches!(err, Error::MissingExtension), "{err:?}");
+        assert_eq!(alert_for(&err), AlertDescription::MissingExtension);
+    }
+
+    /// RFC 8446 §4.2.9: `pre_shared_key` without `psk_key_exchange_modes`
+    /// MUST abort with `missing_extension`.
+    #[test]
+    fn server_missing_extension_when_psk_offered_without_modes() {
+        let mut exts: alloc::vec::Vec<_> = well_formed_ch_extensions()
+            .into_iter()
+            .filter(|(t, _)| *t != ExtensionType::PSK_KEY_EXCHANGE_MODES)
+            .collect();
+        let (psk, _) =
+            ext::client_pre_shared_key_placeholder(&[(alloc::vec![0x77u8; 16], 0)], 32).unwrap();
+        exts.push(psk);
+        let err = forged_ch_result(exts).unwrap_err();
+        assert!(matches!(err, Error::MissingExtension), "{err:?}");
+        assert_eq!(alert_for(&err), AlertDescription::MissingExtension);
+    }
+
+    /// RFC 8446 §4.2.9: a client that only offers `psk_ke` may legally omit
+    /// `key_share` — that shape is well-formed, so the refusal (we do not
+    /// implement PSK-only key exchange) is `handshake_failure`, not
+    /// `missing_extension`.
+    #[test]
+    fn server_psk_ke_only_without_key_share_is_not_missing_extension() {
+        let mut exts: alloc::vec::Vec<_> = well_formed_ch_extensions()
+            .into_iter()
+            .filter(|(t, _)| {
+                *t != ExtensionType::KEY_SHARE
+                    && *t != ExtensionType::SUPPORTED_GROUPS
+                    && *t != ExtensionType::PSK_KEY_EXCHANGE_MODES
+            })
+            .collect();
+        exts.push(ext::psk_key_exchange_modes(&[0]));
+        let (psk, _) =
+            ext::client_pre_shared_key_placeholder(&[(alloc::vec![0x77u8; 16], 0)], 32).unwrap();
+        exts.push(psk);
+        let err = forged_ch_result(exts).unwrap_err();
+        assert!(matches!(err, Error::HandshakeFailure), "{err:?}");
     }
 
     /// Finding #1 (0-RTT anti-replay keyed on the WRONG binder): `try_accept_psk`
