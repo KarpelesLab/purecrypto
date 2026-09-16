@@ -1721,8 +1721,6 @@ impl QuicConnection {
         // coalesced packets share a UDP datagram but each has its own
         // header).
         let mut datagram: Vec<u8> = Vec::with_capacity(1200);
-        let need_first_initial_pad =
-            self.role == Role::Client && !self.endpoint.sent_first_datagram;
 
         // Snapshot what (if anything) we'll emit BEFORE building the
         // Initial packet: we need to know whether Handshake / 1-RTT
@@ -1734,22 +1732,31 @@ impl QuicConnection {
             && self.endpoint.crypto.at(Level::EarlyData).tx.is_some()
             && self.level_has_pending(Level::EarlyData);
         let handshake_will_emit = self.level_has_pending(Level::Handshake);
-        let onertt_will_emit = self.level_has_pending(Level::OneRtt);
 
-        // Decide if we need to inflate the Initial-level payload with
-        // PADDING frames (0x00). RFC 9000 §14.1: the client's first
-        // Initial-bearing datagram MUST be at least 1200 bytes total;
-        // the padding lives inside the AEAD-sealed Initial payload so
-        // it shares the same authentication tag.
-        // When a 0-RTT packet is coalesced behind it, the datagram reaches
-        // 1200 bytes on its own; padding the Initial to 1200 first would push
-        // the datagram past the MTU. Pad afterwards instead.
-        let initial_pad_target =
-            if need_first_initial_pad && initial_will_emit && !zero_rtt_will_emit {
-                Some(1200usize)
-            } else {
-                None
-            };
+        // RFC 9000 §14.1: a client MUST expand *every* datagram carrying an
+        // Initial packet to at least 1200 bytes — not just the first one; a
+        // server MUST discard any smaller Initial-bearing datagram, so an
+        // unpadded Initial ACK or a PTO-retransmitted ClientHello would
+        // simply be thrown away. A server MUST do the same for datagrams
+        // carrying an *ack-eliciting* Initial, which for this engine means
+        // one carrying CRYPTO (Initial packets carry nothing else that
+        // elicits an ACK).
+        let need_initial_pad = initial_will_emit
+            && (self.role == Role::Client
+                || self.endpoint.bufs.at(Level::Initial).outbound_pending());
+
+        // Where the PADDING goes: inside the Initial packet itself when it
+        // travels alone; inside the Handshake packet when one is coalesced
+        // behind it; and as a PADDING-only trailer at the 0-RTT level when a
+        // 0-RTT packet follows (padding the Initial first would push the
+        // datagram past the MTU). Padding lives inside an AEAD-sealed payload
+        // so it shares that packet's authentication tag.
+        let initial_pad_target = if need_initial_pad && !zero_rtt_will_emit && !handshake_will_emit
+        {
+            Some(1200usize)
+        } else {
+            None
+        };
 
         // Initial-level packet (may carry CRYPTO + ACK + PADDING).
         if let Some(pkt) =
@@ -1757,22 +1764,29 @@ impl QuicConnection {
         {
             datagram.extend_from_slice(&pkt);
         }
-        let _ = handshake_will_emit;
-        let _ = onertt_will_emit;
+        let initial_emitted = !datagram.is_empty();
 
         // 0-RTT packet (RFC 9001 §4.6): stream / DATAGRAM frames the
         // application queued before the handshake finished, coalesced behind
         // the Initial in the same datagram (§12.2). Only the client emits
         // these, only while its early keys are live.
+        let mut zero_rtt_emitted = false;
         if self.role == Role::Client
             && !self.early_keys_discarded
             && let Some(pkt) = self.build_packet_at(Level::EarlyData)
         {
             datagram.extend_from_slice(&pkt);
+            zero_rtt_emitted = true;
         }
 
-        // Handshake-level packet.
-        if let Some(pkt) = self.build_packet_at(Level::Handshake) {
+        // Handshake-level packet. It absorbs the §14.1 padding when it rides
+        // behind an Initial (PADDING is legal at every level, §12.4).
+        let handshake_pad = if need_initial_pad && initial_emitted && !zero_rtt_emitted {
+            Some((1200usize, datagram.len()))
+        } else {
+            None
+        };
+        if let Some(pkt) = self.build_packet_with_pad(Level::Handshake, handshake_pad) {
             datagram.extend_from_slice(&pkt);
         }
 
@@ -1811,16 +1825,25 @@ impl QuicConnection {
         if datagram.is_empty() {
             return Vec::new();
         }
-        // RFC 9000 §14.1 — the client's Initial-bearing datagrams must be at
-        // least 1200 bytes. With a 0-RTT packet coalesced in, the Initial was
-        // built unpadded, so top the datagram up here with a PADDING-only
-        // trailer at the 0-RTT level (PADDING is a legal 0-RTT frame and
-        // stays inside that packet's AEAD).
-        if need_first_initial_pad && initial_will_emit && datagram.len() < 1200 {
+        // RFC 9000 §14.1 — Initial-bearing datagrams must be at least 1200
+        // bytes. With a 0-RTT packet coalesced in, the Initial was built
+        // unpadded, so top the datagram up here with a PADDING-only trailer
+        // at the 0-RTT level (PADDING is a legal 0-RTT frame and stays inside
+        // that packet's AEAD). The same trailer, at the Handshake level,
+        // covers a Handshake packet we expected but did not build; failing
+        // that, a second Initial packet made only of PADDING is legal too.
+        if need_initial_pad && initial_emitted && datagram.len() < 1200 {
+            let trailer_level = if zero_rtt_emitted {
+                Level::EarlyData
+            } else if self.endpoint.crypto.at(Level::Handshake).tx.is_some() {
+                Level::Handshake
+            } else {
+                Level::Initial
+            };
             // An empty payload lets `seal_packet`'s pad arithmetic size the
             // PADDING run exactly against the remaining room.
             if let Some(pad_pkt) = self.seal_packet(
-                Level::EarlyData,
+                trailer_level,
                 Vec::new(),
                 Some((1200, datagram.len())),
                 Some(PacketMeta::default()),
@@ -3650,8 +3673,9 @@ impl QuicConnection {
 
         // Mark that the next outbound carries a token; the build-packet
         // path reads `self.retry_token` for the Initial-only Token field.
-        // Also clear `sent_first_datagram` so the re-emitted ClientHello
-        // gets padded to 1200 bytes again (RFC 9000 §14.1).
+        // The re-emitted ClientHello is padded to 1200 bytes like every
+        // other Initial-bearing datagram (RFC 9000 §14.1); `sent_first_datagram`
+        // is reset so the connection's "first flight" bookkeeping restarts.
         self.endpoint.sent_first_datagram = false;
 
         Ok(())
@@ -6948,6 +6972,97 @@ mod tests {
         assert!(
             s_full.endpoint.crypto.at(Level::Initial).rx.is_some(),
             "server must derive Initial keys from a >=1200 datagram"
+        );
+    }
+
+    /// RFC 9000 §14.1 — a client MUST expand *every* datagram carrying an
+    /// Initial packet to at least 1200 bytes, and a server every datagram
+    /// carrying an ack-eliciting Initial. Only the client's very first
+    /// datagram used to be padded: its Initial ACK + Handshake Finished
+    /// flight and a PTO-retransmitted ClientHello went out at ~100 bytes,
+    /// which a conforming server (this one included) is required to discard.
+    #[test]
+    fn every_initial_bearing_datagram_is_at_least_1200_bytes() {
+        let (mut c, mut s) = loopback_pair();
+        let mut client_initial_datagrams = 0usize;
+        for _ in 0..8 {
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                if first_packet_is_initial(&dg) {
+                    client_initial_datagrams += 1;
+                    assert!(
+                        dg.len() >= MIN_INITIAL_DATAGRAM,
+                        "client Initial-bearing datagram of {} bytes",
+                        dg.len()
+                    );
+                }
+                s.feed_datagram(&dg).expect("server feed");
+            }
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                if first_packet_is_initial(&dg) {
+                    // Ack-eliciting iff loss recovery tracks the Initial
+                    // packet just built (ACK-only packets are not in flight).
+                    let pn = s.endpoint.pn.initial.next_tx.saturating_sub(1);
+                    let eliciting = s.endpoint.loss.per_space[PnSpaceId::Initial as usize]
+                        .sent_packets
+                        .get(&pn)
+                        .is_some_and(|p| p.ack_eliciting);
+                    if eliciting {
+                        assert!(
+                            dg.len() >= MIN_INITIAL_DATAGRAM,
+                            "server ack-eliciting Initial datagram of {} bytes",
+                            dg.len()
+                        );
+                    }
+                }
+                c.feed_datagram(&dg).expect("client feed");
+            }
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        assert!(client_initial_datagrams >= 1);
+
+        // An ACK-only Initial — the server's Initial arrived without its
+        // coalesced Handshake packet — is padded too.
+        let (mut c, mut s) = loopback_pair();
+        let first = c.pop_datagram();
+        s.feed_datagram(&first).expect("server feed");
+        let reply = s.pop_datagram();
+        let hdr = LongHeader::parse(&reply).expect("server Initial");
+        assert_eq!(hdr.typ, LongType::Initial);
+        let initial_only = &reply[..hdr.payload_off + hdr.length as usize];
+        c.feed_datagram(initial_only).expect("client feed");
+        let ack = c.pop_datagram();
+        assert!(first_packet_is_initial(&ack), "an Initial ACK is owed");
+        assert!(
+            ack.len() >= MIN_INITIAL_DATAGRAM,
+            "ACK-only Initial datagram of {} bytes",
+            ack.len()
+        );
+
+        // A PTO retransmission of the ClientHello is padded too.
+        let (mut c, _s) = loopback_pair();
+        let first = c.pop_datagram();
+        assert!(first.len() >= MIN_INITIAL_DATAGRAM);
+        c.on_timeout(Duration::from_secs(3));
+        let retransmit = c.pop_datagram();
+        assert!(
+            first_packet_is_initial(&retransmit),
+            "the PTO must re-emit the Initial"
+        );
+        assert!(
+            retransmit.len() >= MIN_INITIAL_DATAGRAM,
+            "PTO-retransmitted Initial datagram of {} bytes",
+            retransmit.len()
         );
     }
 
