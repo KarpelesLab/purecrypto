@@ -3650,6 +3650,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::TooManyRecords => AlertDescription::InternalError,
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::UnsupportedExtension => AlertDescription::UnsupportedExtension,
+        Error::MissingExtension => AlertDescription::MissingExtension,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
         Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,

@@ -180,6 +180,10 @@ pub enum Error {
     /// handshake with an unsupported_extension alert"). Maps to
     /// `unsupported_extension`.
     UnsupportedExtension,
+    /// A handshake message lacks an extension the specification makes
+    /// mandatory for it (RFC 8446 §9.2 — e.g. a `CertificateRequest`
+    /// without `signature_algorithms`, §4.3.2). Maps to `missing_extension`.
+    MissingExtension,
     /// A PSK binder failed to verify, or another signed handshake-context
     /// authenticator was invalid. Maps to `decrypt_error` (RFC 8446 §6).
     DecryptError,
@@ -295,6 +299,7 @@ impl core::fmt::Display for Error {
             Error::TooManyRecords => f.write_str("per-key record-sequence cap reached"),
             Error::NoApplicationProtocol => f.write_str("no ALPN overlap with peer"),
             Error::UnsupportedExtension => f.write_str("peer sent an extension we did not offer"),
+            Error::MissingExtension => f.write_str("peer omitted a mandatory extension"),
             Error::DecryptError => f.write_str("TLS handshake decrypt error (binder/MAC)"),
             Error::InappropriateFallback => {
                 f.write_str("TLS_FALLBACK_SCSV offered below our maximum version")

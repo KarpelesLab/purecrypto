@@ -7479,36 +7479,29 @@ mod audit_regression_tests {
     /// RFC 8446 §4.4.3: a client `CertificateVerify` MUST use a scheme the
     /// server offered in its `CertificateRequest`. The server verified any
     /// scheme the signature registry knew, so `rsa_pss_rsae_sha512` — which
-    /// the CertificateRequest never offers — was accepted; it must be refused
-    /// with `illegal_parameter` before any verification work.
+    /// the CertificateRequest never offers — reached signature verification;
+    /// it must be refused with `illegal_parameter` before any verification
+    /// work. (The client engine no longer produces such a message itself, so
+    /// the CertificateVerify is forged at the server.)
+    #[cfg(feature = "std")]
     #[test]
     fn server_rejects_client_cert_verify_scheme_it_did_not_offer() {
-        use crate::hash::Sha512;
         use crate::tls::ClientCertConfig;
         const RSA_PSS_RSAE_SHA512: u16 = 0x0806;
 
         let (server_config, server_cert_der) = rsa_server();
-        let key = rsa_test_key_a();
-        let name = DistinguishedName::common_name("mtls-rsa-client");
-        let validity = Validity::new(
-            Time::utc(2024, 1, 1, 0, 0, 0),
-            Time::utc(2034, 1, 1, 0, 0, 0),
-        );
-        let client_cert_der = Certificate::self_signed(&key, &name, &validity, 1, false)
-            .unwrap()
-            .to_der()
-            .to_vec();
-        let signer = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
-
+        let (client_cert_der, _client_key) = ed25519_client_cert(b"cv-scheme");
         let mut server_roots = RootCertStore::new();
         server_roots.add_der(client_cert_der.clone()).unwrap();
         let server_config = server_config.with_client_auth(server_roots, true);
         let mut roots = RootCertStore::new();
         roots.add_der(server_cert_der).unwrap();
-        // An external client key that only produces the unoffered scheme.
+        // An external client key: the client emits its Certificate and then
+        // suspends for the signature, leaving the server exactly at
+        // `WaitClientCertVerify`.
         let cc = ClientCertConfig::with_external(
             alloc::vec![client_cert_der],
-            alloc::vec![RSA_PSS_RSAE_SHA512],
+            alloc::vec![crate::tls::codec::SignatureScheme::ED25519.0],
         );
         let mut crng = HmacDrbg::<Sha256>::new(b"cv-scheme-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"cv-scheme-s", b"nonce", &[]);
@@ -7520,45 +7513,30 @@ mod audit_regression_tests {
             &[NamedGroup::X25519],
         );
         let mut server = ServerConnection::new(server_config, srng);
+        let ch = client.write_tls();
+        server.read_tls(&ch);
+        server.process_new_packets().unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert!(
+            client.pending_signature().is_some(),
+            "client must be suspended for its CertificateVerify"
+        );
+        let cert_flight = client.write_tls();
+        server.read_tls(&cert_flight);
+        server.process_new_packets().unwrap();
 
-        let mut signed = false;
-        let mut server_err = None;
-        for _ in 0..16 {
-            let c = client.write_tls();
-            if !c.is_empty() {
-                server.read_tls(&c);
-                if let Err(e) = server.process_new_packets() {
-                    server_err = Some(e);
-                    break;
-                }
-            }
-            if let Some((scheme, content)) = client.pending_signature() {
-                assert_eq!(scheme, RSA_PSS_RSAE_SHA512);
-                // A genuine signature under that scheme: only the scheme
-                // check may reject it, not the verification itself.
-                let sig = signer.sign_pss::<Sha512, _>(&content, &mut crng).unwrap();
-                client.provide_signature(sig).unwrap();
-                signed = true;
-                continue;
-            }
-            let s = server.write_tls();
-            if !s.is_empty() {
-                client.read_tls(&s);
-                client.process_new_packets().unwrap();
-            }
-            if c.is_empty() && s.is_empty() {
-                break;
-            }
-        }
+        // A CertificateVerify under an unoffered scheme, with a signature
+        // that would never verify: the scheme gate must fire first.
+        let mut forged = alloc::vec![crate::tls::codec::hs_type::CERTIFICATE_VERIFY, 0, 0, 68];
+        forged.extend_from_slice(&RSA_PSS_RSAE_SHA512.to_be_bytes());
+        forged.extend_from_slice(&64u16.to_be_bytes());
+        forged.extend_from_slice(&[0x5au8; 64]);
+        let err = server.handle_handshake_for_test(forged).unwrap_err();
         assert!(
-            signed,
-            "the client must have signed with rsa_pss_rsae_sha512"
+            matches!(err, Error::IllegalParameter),
+            "an unoffered CertificateVerify scheme must be illegal_parameter, got {err:?}"
         );
-        assert!(
-            matches!(server_err, Some(Error::IllegalParameter)),
-            "an unoffered CertificateVerify scheme must be illegal_parameter, got {server_err:?}"
-        );
-        assert!(!server.is_handshake_complete());
     }
 
     /// RFC 8446 §4.4.4: "Recipients of Finished messages MUST verify that

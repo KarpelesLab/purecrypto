@@ -750,6 +750,10 @@ pub struct ClientConnection {
     /// mTLS: set when the server sent a `CertificateRequest` between EE and
     /// its `Certificate`. Drives client-cert emission after server Finished.
     cert_request_received: bool,
+    /// The `signature_algorithms` the server's `CertificateRequest` offered
+    /// (RFC 8446 §4.3.2). Our `CertificateVerify` MUST use one of them
+    /// (§4.4.3); a configured client key that cannot is not presented.
+    cr_signature_algorithms: Vec<SignatureScheme>,
 
     /// When `true`, our ClientHello offered TLS 1.2 alongside 1.3, so a 1.2
     /// ServerHello triggers a downgrade (see `downgrade_to_tls12`) rather than
@@ -1439,6 +1443,7 @@ impl ClientConnection {
             early_data_suite: None,
             deferred_client_hs_secret: None,
             cert_request_received: false,
+            cr_signature_algorithms: Vec::new(),
             offer_tls12,
             downgrade_to_tls12: false,
             key_updates_received: 0,
@@ -3298,8 +3303,30 @@ impl ClientConnection {
             if !ctx.is_empty() {
                 return Err(Error::IllegalParameter);
             }
-            let _exts = c.vec_u16()?;
+            let exts = c.vec_u16()?;
             c.expect_empty()?;
+            // RFC 8446 §4.3.2: "The signature_algorithms extension MUST be
+            // specified" — it is what our CertificateVerify scheme is chosen
+            // from (§4.4.3). Other extensions (certificate_authorities,
+            // oid_filters, ...) are advisory and ignored.
+            let mut ec = ReadCursor::new(exts);
+            let mut sig_algs: Option<Vec<SignatureScheme>> = None;
+            let mut count = 0usize;
+            while !ec.is_empty() {
+                let ty = ec.u16()?;
+                let body = ec.vec_u16()?;
+                count += 1;
+                if count > crate::tls::codec::MAX_EXTENSIONS {
+                    return Err(Error::Decode);
+                }
+                if ty == ExtensionType::SIGNATURE_ALGORITHMS.0 {
+                    if sig_algs.is_some() {
+                        return Err(Error::IllegalParameter);
+                    }
+                    sig_algs = Some(ext::parse_signature_algorithms(body)?);
+                }
+            }
+            self.cr_signature_algorithms = sig_algs.ok_or(Error::MissingExtension)?;
             self.cert_request_received = true;
             self.core.transcript.update(raw);
             // Stay in WaitCertificate — Certificate is the next message.
@@ -3651,31 +3678,35 @@ impl ClientConnection {
         // wire-legal when we have no cert configured; the server may then
         // close with `certificate_required` if it demanded one.
         if self.cert_request_received {
-            self.send_client_certificate();
-            let external = self
-                .config
-                .client_cert
-                .as_ref()
-                .is_some_and(|cc| matches!(cc.key, ClientKey::External { .. }));
-            if external {
-                // External mTLS key: stash the flight continuation and yield;
-                // the caller signs and resumes via `provide_signature`.
-                let cc = self.config.client_cert.as_ref().expect("client cert");
-                let scheme = cc.tls13_signature_scheme().ok_or(Error::HandshakeFailure)?;
-                let th = self.core.transcript.current_hash();
-                let content = certificate_verify_content(false, th.as_slice());
-                self.pending_flight = Some(PendingClientFlight {
-                    scheme,
-                    content,
-                    suite,
-                    cats,
-                    sats,
-                });
-                self.state = State::AwaitingCertVerifySignature;
-                return Ok(());
-            }
-            if self.config.client_cert.is_some() {
-                self.send_client_certificate_verify()?;
+            // RFC 8446 §4.4.3: the scheme MUST be one the CertificateRequest
+            // offered. A configured key that can sign under none of them is
+            // "no appropriate certificate": send an empty Certificate (and
+            // no CertificateVerify) and let the server's policy decide.
+            let scheme = self.client_cert_scheme();
+            self.send_client_certificate(scheme.is_some());
+            if let Some(scheme) = scheme {
+                let external = self
+                    .config
+                    .client_cert
+                    .as_ref()
+                    .is_some_and(|cc| matches!(cc.key, ClientKey::External { .. }));
+                if external {
+                    // External mTLS key: stash the flight continuation and
+                    // yield; the caller signs and resumes via
+                    // `provide_signature`.
+                    let th = self.core.transcript.current_hash();
+                    let content = certificate_verify_content(false, th.as_slice());
+                    self.pending_flight = Some(PendingClientFlight {
+                        scheme,
+                        content,
+                        suite,
+                        cats,
+                        sats,
+                    });
+                    self.state = State::AwaitingCertVerifySignature;
+                    return Ok(());
+                }
+                self.send_client_certificate_verify(scheme)?;
             }
         }
         self.finish_client_flight(suite, cats, sats)
@@ -3756,9 +3787,27 @@ impl ClientConnection {
 }
 
 impl ClientConnection {
-    /// mTLS: emit a `Certificate` carrying our configured chain (or an empty
-    /// chain if no client cert is configured).
-    fn send_client_certificate(&mut self) {
+    /// The scheme our `CertificateVerify` will use: the configured client
+    /// key's TLS 1.3 scheme (or, for an external key, its first acceptable
+    /// scheme) restricted to the server's `CertificateRequest`
+    /// `signature_algorithms` (RFC 8446 §4.4.3). `None` when no client cert
+    /// is configured or the key can sign under none of the offered schemes.
+    fn client_cert_scheme(&self) -> Option<SignatureScheme> {
+        let cc = self.config.client_cert.as_ref()?;
+        let offered = &self.cr_signature_algorithms;
+        match &cc.key {
+            ClientKey::External { schemes } => schemes
+                .iter()
+                .copied()
+                .find(|s| !s.is_rsa_pkcs1() && offered.contains(s)),
+            _ => cc.tls13_signature_scheme().filter(|s| offered.contains(s)),
+        }
+    }
+
+    /// mTLS: emit a `Certificate` carrying our configured chain, or an empty
+    /// chain when `present` is false (no client cert configured, or none
+    /// signable under a scheme the server offered).
+    fn send_client_certificate(&mut self, present: bool) {
         // RFC 7250 §4.4: when RawPublicKey was negotiated for the client
         // direction, the CertificateEntry list collapses to a single entry
         // whose body is the SPKI DER (no X.509 cert, no per-entry extensions).
@@ -3767,7 +3816,9 @@ impl ClientConnection {
         with_len_u24(&mut msg, |b| {
             b.push(0); // certificate_request_context: empty
             with_len_u24(b, |list| {
-                if rpk {
+                if !present {
+                    // Empty CertificateEntry list: "no certificate".
+                } else if rpk {
                     // Emit the configured SPKI; if RPK was negotiated without
                     // one configured, send an empty list (= "no certificate").
                     if let Some(spki) = self.config.raw_public_key_spki.as_ref() {
@@ -3787,8 +3838,9 @@ impl ClientConnection {
     }
 
     /// mTLS: sign the running transcript with the configured client key and
-    /// emit a `CertificateVerify`.
-    fn send_client_certificate_verify(&mut self) -> Result<(), Error> {
+    /// emit a `CertificateVerify` under `scheme` (already checked against
+    /// the server's CertificateRequest by [`Self::client_cert_scheme`]).
+    fn send_client_certificate_verify(&mut self, scheme: SignatureScheme) -> Result<(), Error> {
         let cc = self
             .config
             .client_cert
@@ -3796,7 +3848,6 @@ impl ClientConnection {
             .ok_or(Error::InappropriateState)?;
         let th = self.core.transcript.current_hash();
         let content = certificate_verify_content(false, th.as_slice());
-        let scheme = cc.tls13_signature_scheme().ok_or(Error::HandshakeFailure)?;
         let signature = match &cc.key {
             ClientKey::Rsa(_) => {
                 // The CertificateVerify needs an RNG; reuse our handshake one
@@ -4073,6 +4124,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::TooManyRecords => AlertDescription::InternalError,
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::UnsupportedExtension => AlertDescription::UnsupportedExtension,
+        Error::MissingExtension => AlertDescription::MissingExtension,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
         Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
@@ -4473,6 +4525,97 @@ mod tests {
             matches!(err, Error::Decode),
             "over-limit EE extension count must be rejected with Decode, got {err:?}"
         );
+    }
+
+    /// RFC 8446 §4.3.2 / §4.4.3: `CertificateRequest.signature_algorithms`
+    /// is mandatory and the client's CertificateVerify MUST use one of the
+    /// schemes it lists. The client used to ignore the list and sign with
+    /// its key's own scheme; a key that cannot sign under an offered scheme
+    /// must instead yield an empty Certificate.
+    #[test]
+    fn client_honours_certificate_request_signature_algorithms() {
+        use crate::tls::ClientCertConfig;
+
+        let cr = |sig_algs: Option<&[u16]>| -> Vec<u8> {
+            let mut exts = Vec::new();
+            if let Some(algs) = sig_algs {
+                exts.extend_from_slice(&ExtensionType::SIGNATURE_ALGORITHMS.0.to_be_bytes());
+                let mut list = Vec::new();
+                for a in algs {
+                    list.extend_from_slice(&a.to_be_bytes());
+                }
+                exts.extend_from_slice(&((list.len() + 2) as u16).to_be_bytes());
+                exts.extend_from_slice(&(list.len() as u16).to_be_bytes());
+                exts.extend_from_slice(&list);
+            }
+            let mut body = alloc::vec![0u8]; // empty certificate_request_context
+            body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+            body.extend_from_slice(&exts);
+            let mut raw = alloc::vec![hs_type::CERTIFICATE_REQUEST, 0, 0, body.len() as u8];
+            raw.extend_from_slice(&body);
+            raw
+        };
+        let client_with_ed25519 = |tag: &[u8]| {
+            let mut rng = HmacDrbg::<Sha256>::new(tag, b"nonce", &[]);
+            let key = crate::ec::Ed25519PrivateKey::generate(&mut rng);
+            let cc = ClientCertConfig::with_ed25519(alloc::vec![alloc::vec![0x30, 0x00]], key);
+            let config = ClientConfig::new(RootCertStore::new()).with_client_cert(cc);
+            let mut c = ClientConnection::new(config, "h", &mut rng).unwrap();
+            c.state = State::WaitCertificate;
+            c
+        };
+
+        // The key's scheme is offered: it is what we will sign with.
+        let mut client = client_with_ed25519(b"cr-offered");
+        let raw = cr(Some(&[
+            SignatureScheme::ECDSA_SECP256R1_SHA256.0,
+            SignatureScheme::ED25519.0,
+        ]));
+        client
+            .on_certificate(hs_type::CERTIFICATE_REQUEST, &raw[4..], &raw)
+            .unwrap();
+        assert_eq!(client.client_cert_scheme(), Some(SignatureScheme::ED25519));
+
+        // Not offered: no usable scheme, so the Certificate will be empty.
+        let mut client = client_with_ed25519(b"cr-unoffered");
+        let raw = cr(Some(&[SignatureScheme::ECDSA_SECP256R1_SHA256.0]));
+        client
+            .on_certificate(hs_type::CERTIFICATE_REQUEST, &raw[4..], &raw)
+            .unwrap();
+        assert_eq!(client.client_cert_scheme(), None);
+
+        // An external key picks its first scheme the server also offered.
+        let mut rng = HmacDrbg::<Sha256>::new(b"cr-external", b"nonce", &[]);
+        let cc = ClientCertConfig::with_external(
+            alloc::vec![alloc::vec![0x30, 0x00]],
+            alloc::vec![
+                SignatureScheme::ED448.0,
+                SignatureScheme::ECDSA_SECP384R1_SHA384.0
+            ],
+        );
+        let mut client = ClientConnection::new(
+            ClientConfig::new(RootCertStore::new()).with_client_cert(cc),
+            "h",
+            &mut rng,
+        )
+        .unwrap();
+        client.state = State::WaitCertificate;
+        let raw = cr(Some(&[SignatureScheme::ECDSA_SECP384R1_SHA384.0]));
+        client
+            .on_certificate(hs_type::CERTIFICATE_REQUEST, &raw[4..], &raw)
+            .unwrap();
+        assert_eq!(
+            client.client_cert_scheme(),
+            Some(SignatureScheme::ECDSA_SECP384R1_SHA384)
+        );
+
+        // No signature_algorithms at all: missing_extension.
+        let mut client = client_with_ed25519(b"cr-missing");
+        let raw = cr(None);
+        assert!(matches!(
+            client.on_certificate(hs_type::CERTIFICATE_REQUEST, &raw[4..], &raw),
+            Err(Error::MissingExtension)
+        ));
     }
 
     /// RFC 8446 §4.2: a server MUST NOT answer with an extension the client
