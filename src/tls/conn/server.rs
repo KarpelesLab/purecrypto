@@ -2958,6 +2958,14 @@ impl<R: RngCore> ServerConnection<R> {
         if scheme.is_rsa_pkcs1() {
             return Err(Error::IllegalParameter);
         }
+        // RFC 8446 §4.4.3: "If the CertificateVerify message is sent by a
+        // client, the signature algorithm MUST be one offered in the server's
+        // CertificateRequest message". Our CertificateRequest carries exactly
+        // `signature_algorithms()`; a scheme outside it is a protocol
+        // violation even if the signature registry could verify it.
+        if !ext::offered_signature_schemes().contains(&scheme) {
+            return Err(Error::IllegalParameter);
+        }
 
         // The transcript at this point includes everything up to (and not
         // including) this CertificateVerify, which is exactly the input the

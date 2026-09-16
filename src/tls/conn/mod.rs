@@ -7476,6 +7476,91 @@ mod audit_regression_tests {
         (client, server)
     }
 
+    /// RFC 8446 §4.4.3: a client `CertificateVerify` MUST use a scheme the
+    /// server offered in its `CertificateRequest`. The server verified any
+    /// scheme the signature registry knew, so `rsa_pss_rsae_sha512` — which
+    /// the CertificateRequest never offers — was accepted; it must be refused
+    /// with `illegal_parameter` before any verification work.
+    #[test]
+    fn server_rejects_client_cert_verify_scheme_it_did_not_offer() {
+        use crate::hash::Sha512;
+        use crate::tls::ClientCertConfig;
+        const RSA_PSS_RSAE_SHA512: u16 = 0x0806;
+
+        let (server_config, server_cert_der) = rsa_server();
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("mtls-rsa-client");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let client_cert_der = Certificate::self_signed(&key, &name, &validity, 1, false)
+            .unwrap()
+            .to_der()
+            .to_vec();
+        let signer = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+
+        let mut server_roots = RootCertStore::new();
+        server_roots.add_der(client_cert_der.clone()).unwrap();
+        let server_config = server_config.with_client_auth(server_roots, true);
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        // An external client key that only produces the unoffered scheme.
+        let cc = ClientCertConfig::with_external(
+            alloc::vec![client_cert_der],
+            alloc::vec![RSA_PSS_RSAE_SHA512],
+        );
+        let mut crng = HmacDrbg::<Sha256>::new(b"cv-scheme-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"cv-scheme-s", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_client_cert(cc),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        let mut signed = false;
+        let mut server_err = None;
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                if let Err(e) = server.process_new_packets() {
+                    server_err = Some(e);
+                    break;
+                }
+            }
+            if let Some((scheme, content)) = client.pending_signature() {
+                assert_eq!(scheme, RSA_PSS_RSAE_SHA512);
+                // A genuine signature under that scheme: only the scheme
+                // check may reject it, not the verification itself.
+                let sig = signer.sign_pss::<Sha512, _>(&content, &mut crng).unwrap();
+                client.provide_signature(sig).unwrap();
+                signed = true;
+                continue;
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            signed,
+            "the client must have signed with rsa_pss_rsae_sha512"
+        );
+        assert!(
+            matches!(server_err, Some(Error::IllegalParameter)),
+            "an unoffered CertificateVerify scheme must be illegal_parameter, got {server_err:?}"
+        );
+        assert!(!server.is_handshake_complete());
+    }
+
     /// MEDIUM 2(b) — the transcript must stop growing once the handshake is
     /// done. Post-handshake `KeyUpdate` / `NewSessionTicket` bytes are not an
     /// input to any transcript hash, so buffering them let a peer grow our
