@@ -197,6 +197,21 @@ impl Degree {
         }
     }
 
+    /// Largest [`Format::Compressed`] signature accepted, in bytes: header,
+    /// nonce, and up to `⌈11n/8⌉` bytes of compressed `s` — the reference
+    /// implementation's `FALCON_SIG_COMPRESSED_MAXSIZE(logn)`, which is also
+    /// what its signer bounds an unpadded signature by before retrying.
+    ///
+    /// The compressed form is variable-length and, unlike the padded one, is
+    /// *not* capped at [`sig_len`](Self::sig_len): the NIST KAT signer
+    /// (`nist.c`, `CRYPTO_BYTES`) and `falcon_sign_dyn` both emit `s`
+    /// encodings longer than `sig_len − 41` whenever the sampled vector needs
+    /// them (about 6·10⁻⁴ of Falcon-1024 signatures), and the reference
+    /// verifier accepts any length that decodes exactly.
+    const fn compressed_max_len(self) -> usize {
+        1 + NONCE_LEN + (11 * self.n()).div_ceil(8)
+    }
+
     /// Acceptance bound `⌊β²⌋` (spec §3.13, Table 3.3).
     const fn sig_bound(self) -> u64 {
         match self {
@@ -394,8 +409,9 @@ impl FalconPublicKey {
             }
         } else {
             // Unpadded: just needs room for the header + nonce, and must
-            // not exceed the padded length.
-            if sig.len() <= 1 + NONCE_LEN || sig.len() > self.degree.sig_len() {
+            // not exceed the reference's compressed-size bound (see
+            // `Degree::compressed_max_len` for why that is *not* `sig_len`).
+            if sig.len() <= 1 + NONCE_LEN || sig.len() > self.degree.compressed_max_len() {
                 return Err(Error::InvalidLength);
             }
         }

@@ -427,6 +427,49 @@ fn falcon1024_unpadded_rejects_extra_trailing_zero_byte() {
     );
 }
 
+/// The compressed format is variable-length, and its bound is the reference's
+/// `FALCON_SIG_COMPRESSED_MAXSIZE` (`41 + ⌈11n/8⌉` = 745 / 1449 bytes), not
+/// the padded `sig_len` (666 / 1280). The NIST KAT signer (`nist.c`) and
+/// `falcon_sign_dyn` legitimately emit `s` encodings longer than
+/// `sig_len − 41` whenever the sampled vector needs them, and the reference
+/// verifier accepts any length that decodes exactly; capping at `sig_len`
+/// rejected roughly 6·10⁻⁴ of valid Falcon-1024 compressed signatures. A
+/// well-formed compressed `s` of exactly the maximum length must therefore
+/// reach the norm check (`Ok(false)` here — it is not a real signature) and
+/// only one byte more is a length error.
+#[test]
+fn compressed_accepts_up_to_reference_maxsize() {
+    use super::{Degree, Error, NONCE_LEN};
+    for (pk, degree, max_len) in [
+        (f512_pk(), Degree::Falcon512, 745usize),
+        (f1024_pk(), Degree::Falcon1024, 1449),
+    ] {
+        let n = degree.n();
+        let key = FalconPublicKey::from_bytes(&pk).unwrap();
+        // |s_i| = 256 encodes in exactly 11 bits (sign, seven zero low bits,
+        // two unary zeros, terminator), so n coefficients fill ⌈11n/8⌉ bytes
+        // with no residual padding bits at all.
+        let s = compressed_s(&alloc::vec![(0u8, 0u32, 2u32); n]);
+        assert_eq!(s.len(), 11 * n / 8);
+        let mut sig = alloc::vec![0x20 | degree.logn()];
+        sig.extend_from_slice(&[0x5Au8; NONCE_LEN]);
+        sig.extend_from_slice(&s);
+        assert_eq!(sig.len(), max_len);
+        assert!(sig.len() > degree.sig_len(), "longer than the padded form");
+        assert_eq!(
+            key.verify_with_format(b"m", &sig, Format::Compressed),
+            Ok(false),
+            "maximum-length compressed signature must reach the norm check"
+        );
+        sig.push(0x00);
+        assert_eq!(
+            key.verify_with_format(b"m", &sig, Format::Compressed),
+            Err(Error::InvalidLength),
+            "one byte past the reference bound is a length error"
+        );
+    }
+}
+
 /// Falcon standardizes two encodings of the same signature, and the verifier
 /// used to accept both. That made signatures malleable: take a valid *unpadded*
 /// Falcon-512 signature (header `0x29`), rewrite byte 0 to `0x39` and zero-pad
