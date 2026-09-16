@@ -385,13 +385,17 @@ pub unsafe extern "C" fn pc_tls_cfg_set_certificate(
         // OpenSSL legacy `-----BEGIN RSA PRIVATE KEY-----`), PKCS#8 RSA
         // (the modern `-----BEGIN PRIVATE KEY-----` envelope around an RSA
         // key — what `openssl pkey` and `openssl genpkey` emit by default
-        // since 1.0.2), SEC1 EC, then PKCS#8 Ed25519. PKCS#8 with an EC key
-        // is not (yet) split out here; SEC1 covers the EC PEM path.
+        // since 1.0.2), SEC1 EC, PKCS#8 EC (what `openssl genpkey -algorithm
+        // EC` and `openssl pkey` emit), then PKCS#8 Ed25519 / Ed448. The
+        // PKCS#8 parsers each check the algorithm OID, so the shared
+        // `-----BEGIN PRIVATE KEY-----` label is not ambiguous.
         let key = if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(key_str) {
             PcKey::Rsa(k)
         } else if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(key_str) {
             PcKey::Rsa(k)
         } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(key_str) {
+            PcKey::Ecdsa(k)
+        } else if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem(key_str) {
             PcKey::Ecdsa(k)
         } else if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(key_str) {
             PcKey::Ed25519(k)

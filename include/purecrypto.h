@@ -710,6 +710,7 @@ void pc_tls_cfg_free(PcTlsCfg *cfg);
 pc_status pc_tls_cfg_add_root_pem(PcTlsCfg *cfg, const uint8_t *pem, size_t len);
 pc_status pc_tls_cfg_set_server_name(PcTlsCfg *cfg, const char *sni);
 /* Installs the cert chain (PEM, leaf first) + its private key (PEM). The key
+ * may be PKCS#1 RSA, SEC1 EC, or PKCS#8 (RSA, EC, Ed25519, Ed448). The key
  * MUST be the leaf's key: a key from a different pair is rejected up front
  * with PC_KEY_MISMATCH (both still parse, so this is distinct from
  * PC_BAD_ENCODING), instead of failing on the peer after a handshake. */

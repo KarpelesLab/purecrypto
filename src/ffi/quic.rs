@@ -262,12 +262,14 @@ pub unsafe extern "C" fn pc_quic_cfg_set_certificate(
         // `-----BEGIN RSA PRIVATE KEY-----`), PKCS#8 RSA (the modern
         // `-----BEGIN PRIVATE KEY-----` envelope around an RSA key — what
         // `openssl pkey` and `openssl genpkey` emit by default), SEC1 EC,
-        // then PKCS#8 Ed25519.
+        // PKCS#8 EC (`openssl genpkey -algorithm EC`), then PKCS#8 Ed25519.
         let key = if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(key_str) {
             PcKey::Rsa(k)
         } else if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(key_str) {
             PcKey::Rsa(k)
         } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(key_str) {
+            PcKey::Ecdsa(k)
+        } else if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem(key_str) {
             PcKey::Ecdsa(k)
         } else if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(key_str) {
             PcKey::Ed25519(k)

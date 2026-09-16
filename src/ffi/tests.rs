@@ -799,6 +799,53 @@ fn set_certificate_rejects_key_from_a_different_pair() {
     unsafe { quic::pc_quic_cfg_free(qcfg) };
 }
 
+/// An EC private key in the PKCS#8 envelope (`-----BEGIN PRIVATE KEY-----`,
+/// the default output of `openssl genpkey -algorithm EC` and `openssl pkey`)
+/// must be accepted by `set_certificate` on both the TLS and QUIC configs.
+/// Only the SEC1 `EC PRIVATE KEY` form used to be recognised, so the most
+/// common EC key file on disk was refused as `BadEncoding`.
+#[test]
+fn set_certificate_accepts_pkcs8_ec_key() {
+    use crate::ec::BoxedEcdsaPrivateKey;
+    let (chain_pem, sec1_pem) = loopback_identity();
+    let pkcs8_pem = BoxedEcdsaPrivateKey::from_sec1_pem(&sec1_pem)
+        .unwrap()
+        .to_pkcs8_pem();
+    assert!(pkcs8_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+
+    let scfg = tls::pc_tls_cfg_new(1 /* server */, 0x0304);
+    assert!(!scfg.is_null());
+    let st = unsafe {
+        tls::pc_tls_cfg_set_certificate(
+            scfg,
+            chain_pem.as_ptr(),
+            chain_pem.len(),
+            pkcs8_pem.as_ptr(),
+            pkcs8_pem.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    // The resulting config is complete: a server connection materialises.
+    let tls = unsafe { tls::pc_tls_new(scfg) };
+    assert!(!tls.is_null());
+    unsafe { tls::pc_tls_free(tls) };
+    unsafe { tls::pc_tls_cfg_free(scfg) };
+
+    let qcfg = quic::pc_quic_cfg_new(1 /* server */);
+    assert!(!qcfg.is_null());
+    let st = unsafe {
+        quic::pc_quic_cfg_set_certificate(
+            qcfg,
+            chain_pem.as_ptr(),
+            chain_pem.len(),
+            pkcs8_pem.as_ptr(),
+            pkcs8_pem.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    unsafe { quic::pc_quic_cfg_free(qcfg) };
+}
+
 #[test]
 fn tls_pop_and_recv_too_small_are_non_destructive() {
     let (chain_pem, key_pem) = loopback_identity();
