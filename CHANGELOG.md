@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one exhaustive split of `Config` so a new option cannot be added without
   being classified for each protocol.
 
+### Fixed
+
+- *(dtls)* enforce Extended Master Secret (RFC 7627 §5.3) over DTLS 1.2:
+  the server refuses a ClientHello without the EMS offer and the client
+  aborts when its offer is not echoed, unless
+  `Config::require_extended_master_secret` is set to `false`. The engines
+  offered and echoed EMS but never enforced it, so the default `true` was
+  silently ignored over DTLS.
+
 ## [0.8.7](https://github.com/KarpelesLab/purecrypto/compare/v0.8.6...v0.8.7) - 2026-09-16
 
 ### Fixed

@@ -294,8 +294,9 @@ pub struct Config {
     /// the extension the connection aborts with `handshake_failure`.
     /// This blocks the triple-handshake family of cross-protocol attacks
     /// the EMS extension exists to prevent. Set to `false` only to
-    /// interoperate with very old peers that predate RFC 7627. Inert
-    /// under TLS 1.3 (which derives all secrets transcript-bound). With the
+    /// interoperate with very old peers that predate RFC 7627. Honoured by
+    /// TLS 1.2 and DTLS 1.2 (client and server); inert on TLS 1.3 / DTLS
+    /// 1.3 / QUIC, which derive every secret transcript-bound. With the
     /// `tls-legacy` feature it is enforced on TLS 1.0/1.1 as well (RFC 7627
     /// covers every version from 1.0 up); SSL 3.0 has no extended master
     /// secret, so an SSL 3.0 handshake is refused unless this is `false`.
@@ -639,7 +640,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `alpn` | yes | yes | client only | inert | yes (required) |
 /// | `cipher_suites` (client) | yes | yes | yes | yes | inert (fixed TLS 1.3 set) |
 /// | `record_size_limit` | yes | yes | **refused** | **refused** | inert (no records) |
-/// | `require_extended_master_secret` | inert | yes | inert | inert (EMS always offered, not yet enforced) | inert |
+/// | `require_extended_master_secret` | inert | yes | inert | yes | inert |
 /// | `stapled_ocsp_response` | yes | yes | inert | inert | yes |
 /// | `stapled_crl` | yes | inert | inert | inert | yes |
 /// | `ticket_key` | yes | yes | inert (no tickets) | inert (no tickets) | yes |

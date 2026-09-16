@@ -99,6 +99,13 @@ pub(crate) struct ClientConfig12Internal {
     /// specific suite for tests). Unknown codepoints are accepted on the
     /// wire but the server's echo is validated against `lookup_suite_12`.
     pub cipher_suites: Vec<CipherSuite>,
+    /// RFC 7627 §5.3 — when `true` (the default), the server MUST echo the
+    /// `extended_master_secret` offer or the handshake aborts with
+    /// `handshake_failure`; without EMS the master secret is not bound to
+    /// the transcript (the triple-handshake family). `false` only for
+    /// legacy peers that predate RFC 7627. Forwarded from
+    /// [`crate::tls::Config::require_extended_master_secret`].
+    pub require_ems: bool,
     /// ECDHE groups advertised in the `supported_groups` extension, in
     /// descending preference order. Defaults to `[X25519, SECP256R1]`. The
     /// server picks the first match against its own preference; the client
@@ -120,12 +127,20 @@ impl ClientConfig12Internal {
             crls: CrlStore::new(),
             key_log: None,
             cipher_suites: SUITES_12.iter().map(|p| p.suite).collect(),
+            require_ems: true,
             groups: alloc::vec![
                 NamedGroup::X25519,
                 NamedGroup::SECP256R1,
                 NamedGroup::SECP384R1,
             ],
         }
+    }
+
+    /// Sets whether the server must echo Extended Master Secret (see
+    /// [`Self::require_ems`]). Default `true`.
+    pub fn with_require_ems(mut self, required: bool) -> Self {
+        self.require_ems = required;
+        self
     }
 
     /// Installs a [`CrlStore`] consulted during chain validation.
@@ -908,6 +923,14 @@ impl DtlsClientConnection12 {
         ) {
             ext::parse_extended_master_secret(ems_body)?;
             self.ems_negotiated = true;
+        }
+        // RFC 7627 §5.3: we always offer EMS, so a server that does not echo
+        // it either predates RFC 7627 or had the offer stripped by an
+        // attacker; either way the master secret would not be bound to the
+        // handshake transcript (the triple-handshake family). Abort unless
+        // the caller opted into legacy interop, as the TLS 1.2 client does.
+        if self.config.require_ems && !self.ems_negotiated {
+            return Err(Error::HandshakeFailure);
         }
         self.server_random = Some(sh.random);
         self.transcript.update(raw);

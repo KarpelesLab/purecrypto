@@ -3964,6 +3964,117 @@ mod audit_2026_09 {
         assert_eq!(server.take_received(), b"hello");
     }
 
+    /// Removes the (empty-bodied) `extended_master_secret` extension from a
+    /// single-datagram DTLS 1.2 ClientHello, fixing up the record, handshake,
+    /// fragment and extensions lengths.
+    fn strip_ems_from_dtls12_ch(ch: &[u8]) -> Vec<u8> {
+        fn dec16(b: &mut [u8], at: usize) {
+            let v = u16::from_be_bytes([b[at], b[at + 1]]) - 4;
+            b[at..at + 2].copy_from_slice(&v.to_be_bytes());
+        }
+        fn dec24(b: &mut [u8], at: usize) {
+            let v = (((b[at] as u32) << 16) | ((b[at + 1] as u32) << 8) | b[at + 2] as u32) - 4;
+            b[at] = (v >> 16) as u8;
+            b[at + 1] = (v >> 8) as u8;
+            b[at + 2] = v as u8;
+        }
+        let (pos, ext_len_at) = find_ems_in_dtls12_ch(ch);
+        assert_eq!(&ch[pos..pos + 4], &[0x00, 0x17, 0x00, 0x00]);
+        let mut out = ch.to_vec();
+        out.drain(pos..pos + 4);
+        dec16(&mut out, 11); // record length
+        dec24(&mut out, 14); // handshake total_length
+        dec24(&mut out, 22); // fragment_length
+        dec16(&mut out, ext_len_at); // extensions length
+        out
+    }
+
+    /// RFC 7627 §5.3: DTLS 1.2 inherits TLS 1.2's Extended Master Secret
+    /// rules, which the engines used to offer and echo but never enforce. A
+    /// server must refuse a ClientHello without the EMS offer, and a client
+    /// must abort when its offer is not echoed — otherwise the master secret
+    /// is not bound to the transcript (the triple-handshake family). Both
+    /// only while `require_ems` (the default) is on, so legacy interop
+    /// remains possible by opting out on both sides.
+    #[test]
+    fn extended_master_secret_is_enforced_12() {
+        fn server(cfg: PcServerConfig12, seed: &[u8]) -> DtlsServerConnection12<HmacDrbg<Sha256>> {
+            let srng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+            DtlsServerConnection12::new(Arc::new(cfg), b"client-addr".to_vec(), srng)
+        }
+        fn client(server_cert: &[u8], require_ems: bool) -> DtlsClientConnection12 {
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert.to_vec()).unwrap();
+            let cfg = PcClientConfig12::new(roots, "dtls.example")
+                .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0))
+                .with_require_ems(require_ems);
+            let mut crng = HmacDrbg::<Sha256>::new(b"dtls12-ems-client", b"nonce", &[]);
+            DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng)
+        }
+
+        // Server: a ClientHello without the EMS offer is dropped by default.
+        let (server_cfg, cert) = make_server();
+        let mut srv = server(server_cfg.require_cookie_exchange(false), b"ems-srv-1");
+        let mut cli = client(&cert, true);
+        let ch = cli.pop_outbound_datagrams().remove(0);
+        assert_eq!(srv.feed_datagram(&strip_ems_from_dtls12_ch(&ch)), Ok(()));
+        assert!(
+            srv.pop_outbound_datagrams().is_empty(),
+            "a ClientHello without the EMS offer must not be answered"
+        );
+        // The genuine hello (with EMS) is still accepted by that server.
+        srv.feed_datagram(&ch).unwrap();
+        assert!(!srv.pop_outbound_datagrams().is_empty());
+
+        // Server opted out: the no-EMS hello is answered, and the ServerHello
+        // carries no EMS echo — which a default client must refuse. The
+        // server flight travels in plaintext, so the client treats the bad
+        // ServerHello like any spoofable datagram: it is dropped rather than
+        // fatal, and no client flight (ClientKeyExchange / Finished) follows.
+        let (server_cfg, cert) = make_server();
+        let mut srv = server(
+            server_cfg
+                .require_cookie_exchange(false)
+                .with_require_ems(false),
+            b"ems-srv-2",
+        );
+        let mut cli = client(&cert, true);
+        let ch = cli.pop_outbound_datagrams().remove(0);
+        srv.feed_datagram(&strip_ems_from_dtls12_ch(&ch)).unwrap();
+        let flight = srv.pop_outbound_datagrams();
+        assert!(!flight.is_empty());
+        for dg in &flight {
+            cli.feed_datagram(dg).unwrap();
+        }
+        assert!(
+            cli.pop_outbound_datagrams().is_empty() && !cli.is_handshake_complete(),
+            "client must not continue when its EMS offer is not echoed"
+        );
+
+        // A client that opted out accepts the un-echoed ServerHello and
+        // continues with its own flight. (The handshake cannot be completed
+        // here: the EMS offer was stripped on the wire, so the two
+        // transcripts differ — a genuinely pre-RFC 7627 peer would omit it
+        // from its own transcript too.)
+        let (server_cfg, cert) = make_server();
+        let mut srv = server(
+            server_cfg
+                .require_cookie_exchange(false)
+                .with_require_ems(false),
+            b"ems-srv-3",
+        );
+        let mut cli = client(&cert, false);
+        let ch = cli.pop_outbound_datagrams().remove(0);
+        srv.feed_datagram(&strip_ems_from_dtls12_ch(&ch)).unwrap();
+        for dg in &srv.pop_outbound_datagrams() {
+            cli.feed_datagram(dg).unwrap();
+        }
+        assert!(
+            !cli.pop_outbound_datagrams().is_empty(),
+            "an opted-out client must continue without the EMS echo"
+        );
+    }
+
     // -----------------------------------------------------------------
     // DTLS-L3: a lost final server flight (DTLS 1.2) must be recoverable.
     // -----------------------------------------------------------------

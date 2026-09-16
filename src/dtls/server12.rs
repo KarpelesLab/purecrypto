@@ -82,6 +82,12 @@ pub(crate) struct ServerConfig12Internal {
     /// the server allocates any handshake state. When `false`, the cookie
     /// step is skipped — only safe for tests.
     require_cookie_exchange: bool,
+    /// RFC 7627 §5.3 — when `true` (the default), a ClientHello that does
+    /// not offer `extended_master_secret` is refused; without EMS the master
+    /// secret is not bound to the transcript (the triple-handshake family).
+    /// `false` only for legacy clients that predate RFC 7627. Forwarded from
+    /// [`crate::tls::Config::require_extended_master_secret`].
+    require_ems: bool,
     /// Allowed signature algorithms (reserved for client-auth in a future
     /// commit; currently unused on the server side because we don't accept
     /// client certificates yet).
@@ -101,6 +107,7 @@ impl ServerConfig12Internal {
             cookie_secret: None,
             previous_cookie_secret: None,
             require_cookie_exchange: true,
+            require_ems: true,
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
         }
@@ -117,6 +124,7 @@ impl ServerConfig12Internal {
             cookie_secret: None,
             previous_cookie_secret: None,
             require_cookie_exchange: true,
+            require_ems: true,
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
         }
@@ -134,6 +142,7 @@ impl ServerConfig12Internal {
             cookie_secret: None,
             previous_cookie_secret: None,
             require_cookie_exchange: true,
+            require_ems: true,
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
         }
@@ -168,6 +177,13 @@ impl ServerConfig12Internal {
     /// server reachable from untrusted networks.
     pub fn require_cookie_exchange(mut self, required: bool) -> Self {
         self.require_cookie_exchange = required;
+        self
+    }
+
+    /// Sets whether clients must offer Extended Master Secret (see
+    /// [`Self::require_ems`]). Default `true`.
+    pub fn with_require_ems(mut self, required: bool) -> Self {
+        self.require_ems = required;
         self
     }
 }
@@ -1068,6 +1084,14 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 }
                 None => false,
             };
+        // RFC 7627 §5.3: a client that does not offer EMS would get a master
+        // secret unbound from the transcript (the triple-handshake family).
+        // Refuse it unless the operator opted into legacy interop, as the
+        // TLS 1.2 server does. Still the validation phase: nothing has been
+        // committed, so the rejection leaves no trace.
+        if self.config.require_ems && !ems_negotiated {
+            return Err(Error::HandshakeFailure);
+        }
 
         // RFC 5746 §3.6: echo an empty `renegotiation_info` when the client
         // signalled secure renegotiation — either via the extension (whose

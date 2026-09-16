@@ -2105,16 +2105,12 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         max_record_size,
     } = dtls_client_opts(cfg)?;
     // DTLS 1.2 fragments handshake records at a fixed 1100 bytes (see
-    // `Config::max_record_size`). The DTLS 1.2 engine always offers and
-    // derives with EMS but does not yet enforce the server's echo, and does
-    // not implement ALPN; see the `Config` docs.
-    let _ = (
-        max_record_size,
-        require_extended_master_secret,
-        alpn_protocols,
-    );
+    // `Config::max_record_size`) and does not implement ALPN; see the
+    // `Config` docs.
+    let _ = (max_record_size, alpn_protocols);
 
-    let mut dc = crate::dtls::ClientConfig12Internal::new(roots.clone_store(), server_name);
+    let mut dc = crate::dtls::ClientConfig12Internal::new(roots.clone_store(), server_name)
+        .with_require_ems(require_extended_master_secret);
     if !verify_certificates {
         dc = dc.without_certificate_verification();
     }
@@ -2324,15 +2320,9 @@ fn build_dtls12_server(
         max_record_size,
     } = dtls_server_opts(cfg)?;
     // The DTLS 1.2 server verifies no client certificate (so the signature
-    // policy has nothing to govern), fragments at a fixed 1100 bytes, always
-    // echoes EMS when offered but does not yet enforce it, and does not
-    // implement ALPN; see the `Config` docs.
-    let _ = (
-        signature_policy,
-        max_record_size,
-        require_extended_master_secret,
-        alpn_protocols,
-    );
+    // policy has nothing to govern), fragments at a fixed 1100 bytes, and
+    // does not implement ALPN; see the `Config` docs.
+    let _ = (signature_policy, max_record_size, alpn_protocols);
 
     let chain = identity.cert_chain.clone();
     let mut sc = match &identity.key {
@@ -2358,6 +2348,7 @@ fn build_dtls12_server(
     if !require_cookie {
         sc = sc.require_cookie_exchange(false);
     }
+    sc = sc.with_require_ems(require_extended_master_secret);
     sc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
