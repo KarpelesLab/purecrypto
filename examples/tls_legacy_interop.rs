@@ -179,6 +179,9 @@ fn pc_client_vs_openssl_server(
         .min_version(version)
         .max_version(version)
         .cipher_suites(&[suite])
+        // RFC 7627 is undefined for SSL 3.0, so the (default) extended-master-
+        // secret requirement must be lifted there; TLS 1.0/1.1 negotiate it.
+        .require_extended_master_secret(version != ProtocolVersion::SSLv3)
         .roots(RootCertStore::new())
         .server_name("interop.example")
         .verify_certificates(false)
@@ -273,6 +276,7 @@ fn pc_server_vs_openssl_client(
         .min_version(version)
         .max_version(version)
         .cipher_suites(&[suite])
+        .require_extended_master_secret(version != ProtocolVersion::SSLv3)
         .identity(vec![cert_der.to_vec()], SigningKey::Rsa(key.clone()))
         .build();
     let mut conn = Connection::server(&cfg).map_err(|e| format!("server cfg: {e:?}"))?;

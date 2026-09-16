@@ -267,6 +267,32 @@ pub(crate) fn master_secret_legacy(
     out
 }
 
+/// RFC 7627 §3 `session_hash` for TLS 1.0/1.1: the 36-byte concatenation
+/// `MD5(handshake_messages) || SHA1(handshake_messages)` over the handshake
+/// messages up to and including `ClientKeyExchange` — the same digest pair
+/// the legacy `Finished` and signatures use.
+#[cfg(feature = "tls-legacy")]
+pub(crate) fn legacy_session_hash(handshake_messages: &[u8]) -> [u8; 36] {
+    use crate::hash::{Md5, Sha1};
+    let mut out = [0u8; 36];
+    out[..16].copy_from_slice(Md5::digest(handshake_messages).as_ref());
+    out[16..].copy_from_slice(Sha1::digest(handshake_messages).as_ref());
+    out
+}
+
+/// RFC 7627 §4 extended master secret for TLS 1.0/1.1:
+/// `PRF(pre_master_secret, "extended master secret", session_hash)[0..47]`
+/// with the version's own MD5/SHA-1 PRF, `session_hash` being
+/// [`legacy_session_hash`]. Binds the master secret to the full handshake
+/// transcript so that a triple-handshake attacker cannot obtain two sessions
+/// sharing one master secret (§1).
+#[cfg(feature = "tls-legacy")]
+pub(crate) fn extended_master_secret_legacy(premaster: &[u8], session_hash: &[u8]) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    prf_legacy(premaster, b"extended master secret", session_hash, &mut out);
+    out
+}
+
 /// TLS 1.0/1.1 `key_block` (RFC 2246 §6.3) using the legacy PRF. Seed order is
 /// `server_random || client_random`.
 #[cfg(feature = "tls-legacy")]

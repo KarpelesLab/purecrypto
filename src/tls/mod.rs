@@ -42,6 +42,18 @@
 //! *only* legacy versions — talking to a peer that rejects a TLS 1.2
 //! ClientHello — also lower `max_version`.
 //!
+//! RFC 7627 (extended master secret) and RFC 6066 OCSP stapling apply on
+//! TLS 1.0/1.1 exactly as on TLS 1.2: both roles offer/echo
+//! `extended_master_secret`, derive the master secret from the
+//! `MD5 || SHA-1` session hash with the version's PRF, and
+//! [`Config::require_extended_master_secret`] (default `true`) aborts a
+//! handshake whose peer does not. SSL 3.0 has no extended master secret at
+//! all, so an SSL 3.0 handshake additionally needs
+//! `require_extended_master_secret(false)`. Session tickets are never
+//! issued or accepted below TLS 1.2, so the RFC 7627 §5.3 resumption rule
+//! (an EMS session must not resume without EMS and vice versa) is enforced
+//! trivially there.
+//!
 //! **These versions are insecure (RFC 8996).** They rely on MD5/SHA-1 in the
 //! PRF and signatures, are subject to CBC padding-oracle attacks (Lucky13;
 //! the legacy CBC decrypt is constant-time + uniform-error but does not yet

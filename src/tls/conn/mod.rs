@@ -5178,9 +5178,15 @@ mod tls12_loopback_tests {
     #[cfg(feature = "tls-legacy")]
     fn run_legacy(suite: CipherSuite, version: crate::tls::ProtocolVersion) {
         let (server_config, cert_der) = rsa_server12();
+        // SSL 3.0 has no extended master secret, so the default `require_ems`
+        // refuses it: SSL 3.0 runs opt out on both sides. TLS 1.0/1.1 run
+        // with the default and must negotiate EMS.
+        let ssl3 = version == crate::tls::ProtocolVersion::SSLv3;
         // Floor the server at SSL 3.0 so it accepts every legacy version under
         // test (SSLv3 .. TLS 1.1).
-        let server_config = server_config.with_min_version(crate::tls::ProtocolVersion::SSLv3);
+        let server_config = server_config
+            .with_min_version(crate::tls::ProtocolVersion::SSLv3)
+            .with_require_ems(!ssl3);
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
 
@@ -5189,7 +5195,8 @@ mod tls12_loopback_tests {
 
         let cfg = ClientConfig12::new(roots)
             .with_min_version(version)
-            .with_max_version(version);
+            .with_max_version(version)
+            .with_require_ems(!ssl3);
         let mut client = ClientConnection12::new_with_offer(
             cfg,
             "loopback.example",
@@ -5219,6 +5226,8 @@ mod tls12_loopback_tests {
         assert!(!server.is_handshaking(), "server did not finish");
         assert_eq!(client.negotiated_cipher_suite(), Some(suite.0));
         assert_eq!(server.negotiated_cipher_suite(), Some(suite.0));
+        assert_eq!(client.ems_negotiated(), !ssl3);
+        assert_eq!(server.ems_negotiated(), !ssl3);
 
         client.send_application_data(b"ping from client").unwrap();
         let c = client.write_tls();
@@ -5388,14 +5397,17 @@ mod tls12_loopback_tests {
             n
         }
         let (server_config, cert_der) = rsa_server12();
-        let server_config = server_config.with_min_version(crate::tls::ProtocolVersion::SSLv3);
+        let server_config = server_config
+            .with_min_version(crate::tls::ProtocolVersion::SSLv3)
+            .with_require_ems(false);
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(b"ssl3-beast-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ssl3-beast-s", b"nonce", &[]);
         let cfg = ClientConfig12::new(roots)
             .with_min_version(crate::tls::ProtocolVersion::SSLv3)
-            .with_max_version(crate::tls::ProtocolVersion::SSLv3);
+            .with_max_version(crate::tls::ProtocolVersion::SSLv3)
+            .with_require_ems(false);
         let mut client = ClientConnection12::new_with_offer(
             cfg,
             "loopback.example",
@@ -5434,6 +5446,143 @@ mod tls12_loopback_tests {
         client.read_tls(&s);
         client.process_new_packets().unwrap();
         assert_eq!(client.take_received_plaintext(), b"pong from server");
+    }
+
+    /// Drives a TLS 1.0/1.1 legacy handshake with deterministic RNGs and
+    /// returns both peers' master secrets. `ems` selects whether the server
+    /// supports the extension (`false` pretends it predates RFC 7627, and
+    /// the client opts out of requiring it).
+    #[cfg(feature = "tls-legacy")]
+    fn legacy_master_secrets(
+        suite: CipherSuite,
+        version: crate::tls::ProtocolVersion,
+        ems: bool,
+    ) -> ([u8; 48], [u8; 48]) {
+        let (server_config, cert_der) = rsa_server12();
+        let server_config = server_config.with_min_version(crate::tls::ProtocolVersion::TLSv1_0);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"legacy-ems-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"legacy-ems-s", b"nonce", &[]);
+        let cfg = ClientConfig12::new(roots)
+            .with_min_version(version)
+            .with_max_version(version)
+            .with_require_ems(ems);
+        let mut client = ClientConnection12::new_with_offer(
+            cfg,
+            "loopback.example",
+            &mut crng,
+            &[suite],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        server.test_force_no_ems = !ems;
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert_eq!(client.negotiated_protocol_version(), Some(version));
+        assert_eq!(client.ems_negotiated(), ems);
+        assert_eq!(server.ems_negotiated(), ems);
+        (
+            client.master_secret_for_test().unwrap(),
+            server.master_secret_for_test().unwrap(),
+        )
+    }
+
+    /// RFC 7627 on TLS 1.0/1.1: both peers negotiate the extended master
+    /// secret by default, agree on it (both `Finished` verify and data
+    /// flows), and the result differs from the RFC 2246 §8.1 derivation the
+    /// same deterministic handshake produces without the extension.
+    #[cfg(feature = "tls-legacy")]
+    fn check_legacy_ems(suite: CipherSuite, version: crate::tls::ProtocolVersion) {
+        let (c_ems, s_ems) = legacy_master_secrets(suite, version, true);
+        assert_eq!(c_ems, s_ems, "EMS master secrets must agree");
+        let (c_plain, s_plain) = legacy_master_secrets(suite, version, false);
+        assert_eq!(c_plain, s_plain, "legacy master secrets must agree");
+        assert_ne!(
+            c_ems, c_plain,
+            "the extended master secret must differ from the legacy derivation"
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls10_extended_master_secret_static_rsa() {
+        check_legacy_ems(
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_0,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls10_extended_master_secret_ecdhe_rsa() {
+        check_legacy_ems(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_0,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls11_extended_master_secret_static_rsa() {
+        check_legacy_ems(
+            CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_1,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls11_extended_master_secret_ecdhe_rsa() {
+        check_legacy_ems(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA256,
+            crate::tls::ProtocolVersion::TLSv1_1,
+        );
+    }
+
+    /// RFC 7627 §5.3 on the legacy path: a client with the default
+    /// `require_ems` refuses a TLS 1.0 server that does not echo the
+    /// extension with `handshake_failure`.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls10_client_requires_ems_by_default() {
+        let (server_config, cert_der) = rsa_server12();
+        let server_config = server_config.with_min_version(crate::tls::ProtocolVersion::TLSv1_0);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"legacy-reqems-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"legacy-reqems-s", b"nonce", &[]);
+        let cfg = ClientConfig12::new(roots)
+            .with_min_version(crate::tls::ProtocolVersion::TLSv1_0)
+            .with_max_version(crate::tls::ProtocolVersion::TLSv1_0);
+        let mut client = ClientConnection12::new_with_offer(
+            cfg,
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        server.test_force_no_ems = true;
+        let err = drive_until_client_error_12(&mut client, &mut server);
+        assert!(
+            matches!(err, crate::tls::Error::HandshakeFailure),
+            "{err:?}"
+        );
     }
 
     #[cfg(feature = "tls-legacy")]

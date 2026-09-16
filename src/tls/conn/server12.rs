@@ -67,7 +67,10 @@ use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
 };
 #[cfg(feature = "tls-legacy")]
-use crate::tls::crypto::prf::{finished_verify_data_legacy, master_secret_legacy};
+use crate::tls::crypto::prf::{
+    extended_master_secret_legacy, finished_verify_data_legacy, legacy_session_hash,
+    master_secret_legacy,
+};
 use crate::tls::crypto::record_prot::RecordProtection;
 #[cfg(feature = "tls-legacy")]
 use crate::tls::crypto::ssl3;
@@ -138,6 +141,11 @@ pub(crate) struct ServerConfig12 {
     /// This prevents triple-handshake-style downgrades against clients
     /// that would happily speak legacy TLS 1.2. Set to `false` only to
     /// interoperate with very old clients that predate RFC 7627.
+    ///
+    /// Enforced identically on the opt-in `tls-legacy` TLS 1.0/1.1 path
+    /// (RFC 7627 covers every version from 1.0 up). SSL 3.0 has no extended
+    /// master secret: with the default an SSL 3.0 ClientHello is refused,
+    /// and opting into SSL 3.0 requires `require_ems = false`.
     pub(crate) require_ems: bool,
     /// Whether the *deployment* supports TLS 1.3 (i.e. this 1.2 engine is the
     /// downgrade target of a version-spanning server, not a pinned `max=1.2`
@@ -1455,6 +1463,30 @@ impl<R: RngCore> ServerConnection12<R> {
             self.peer_offered_ocsp_staple = true;
         }
 
+        // RFC 7627 applies to TLS 1.0/1.1 as well: echo `extended_master_secret`
+        // when the client offers it and derive the master secret from the
+        // `MD5 || SHA-1` session hash with the version's PRF (§3/§4). The
+        // extension is undefined for SSL 3.0 and never echoed there.
+        // `require_ems` (the default) is enforced exactly as on the 1.2 path,
+        // which makes SSL 3.0 — where EMS cannot be negotiated — refusable
+        // unless the deployment opted out.
+        #[cfg(test)]
+        let echo_ems = !self.test_force_no_ems;
+        #[cfg(not(test))]
+        let echo_ems = true;
+        let client_offered_ems =
+            match ext::find(&ch.extensions, ExtensionType::EXTENDED_MASTER_SECRET) {
+                Some(ems_body) => {
+                    ext::parse_extended_master_secret(ems_body)?;
+                    true
+                }
+                None => false,
+            };
+        if self.config.require_ems && (!client_offered_ems || is_ssl3) {
+            return Err(Error::HandshakeFailure);
+        }
+        self.ems_negotiated = client_offered_ems && echo_ems && !is_ssl3;
+
         // RFC 5746: the client signals secure renegotiation support either via
         // the `renegotiation_info` extension or the `TLS_EMPTY_RENEGOTIATION_-
         // INFO_SCSV` pseudo-suite (0x00FF). When signalled we MUST echo
@@ -1568,6 +1600,10 @@ impl<R: RngCore> ServerConnection12<R> {
         }
         if ls.kx == LegacyKx::EcdheRsa {
             extensions.push(ext::ec_point_formats());
+        }
+        // RFC 7627 §5.1: echo `extended_master_secret` when negotiated.
+        if self.ems_negotiated {
+            extensions.push(ext::extended_master_secret_empty());
         }
         // RFC 6066 §8: echo an empty `status_request` iff the client offered
         // it AND a staple is configured — the echo commits us to sending a
@@ -1725,6 +1761,13 @@ impl<R: RngCore> ServerConnection12<R> {
         };
 
         self.transcript.update(raw);
+        // RFC 7627 §3: the EMS `session_hash` covers the handshake messages
+        // through this `ClientKeyExchange` (a client `CertificateVerify`
+        // comes later and is excluded).
+        if self.ems_negotiated {
+            self.ems_session_hash =
+                Some(legacy_session_hash(self.transcript.buffered_bytes()).to_vec());
+        }
         let cr = self.client_random.expect("client_random set");
         let sr = self.server_random.expect("server_random set");
         let mut premaster = premaster;
@@ -1790,15 +1833,29 @@ impl<R: RngCore> ServerConnection12<R> {
         Ok(())
     }
 
-    /// Version-aware legacy master secret: the SSL 3.0 MD5/SHA cascade or the
-    /// TLS 1.0/1.1 legacy PRF.
+    /// Version-aware legacy master secret: the SSL 3.0 MD5/SHA cascade, or
+    /// the TLS 1.0/1.1 legacy PRF — over the RFC 7627 session hash when
+    /// `extended_master_secret` was negotiated, over the randoms otherwise.
     #[cfg(feature = "tls-legacy")]
     fn legacy_master_secret(&self, premaster: &[u8], cr: &Random, sr: &Random) -> [u8; 48] {
         if self.negotiated_version == ProtocolVersion::SSLv3 {
             ssl3::ssl3_master_secret(premaster, cr, sr)
+        } else if self.ems_negotiated {
+            let session_hash = self
+                .ems_session_hash
+                .as_ref()
+                .expect("EMS session_hash snapshot taken at ClientKeyExchange");
+            extended_master_secret_legacy(premaster, session_hash)
         } else {
             master_secret_legacy(premaster, cr, sr)
         }
+    }
+
+    /// Test hook: the derived 48-byte master secret, once the key exchange
+    /// has completed.
+    #[cfg(test)]
+    pub(crate) fn master_secret_for_test(&self) -> Option<[u8; 48]> {
+        self.master
     }
 
     /// Version-aware Finished `verify_data` over the current transcript bytes.
@@ -3185,13 +3242,83 @@ mod tests {
         assert_eq!(s.state, State::WaitClientKeyExchange);
     }
 
+    /// Feeds a forged TLS 1.0 static-RSA ClientHello carrying `extensions`
+    /// to a legacy-enabled server and returns the server plus the result.
+    #[cfg(feature = "tls-legacy")]
+    fn legacy_ch_result(
+        cfg: ServerConfig12,
+        extensions: Vec<(ExtensionType, Vec<u8>)>,
+        label: &[u8],
+    ) -> (ServerConnection12<HmacDrbg<Sha256>>, Result<(), Error>) {
+        let srng = HmacDrbg::<Sha256>::new(label, b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, srng);
+        let ch = ClientHello {
+            legacy_version: 0x0301,
+            random: [0x5a; 32],
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA],
+            extensions,
+        }
+        .encode();
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_0,
+            &ch,
+        );
+        s.read_tls(&rec);
+        let r = s.process_new_packets();
+        (s, r)
+    }
+
+    /// RFC 7627 on the legacy path: with the default `require_ems` a TLS 1.0
+    /// ClientHello without `extended_master_secret` is refused with
+    /// `handshake_failure`; one that offers it gets the echo in the legacy
+    /// ServerHello and the EMS derivation.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn legacy_server_requires_and_echoes_extended_master_secret() {
+        let legacy = || test_rsa_server_config().with_min_version(ProtocolVersion::TLSv1_0);
+        let (_, r) = legacy_ch_result(legacy(), Vec::new(), b"s12-legacy-noems");
+        assert!(matches!(r, Err(Error::HandshakeFailure)), "{r:?}");
+
+        let (mut s, r) = legacy_ch_result(
+            legacy(),
+            alloc::vec![ext::extended_master_secret_empty()],
+            b"s12-legacy-ems",
+        );
+        r.unwrap();
+        assert!(s.ems_negotiated());
+        // The legacy ServerHello echoes the extension.
+        let flight = s.write_tls();
+        let rec = read_record(&flight).unwrap().unwrap();
+        let (sh, version) = ServerHello::decode_relaxed(&rec.fragment[4..]).unwrap();
+        assert_eq!(version, 0x0301);
+        assert!(
+            ext::find(&sh.extensions, ExtensionType::EXTENDED_MASTER_SECRET).is_some(),
+            "legacy ServerHello must echo extended_master_secret"
+        );
+
+        // Opting out lets an EMS-less legacy client through (no echo).
+        let (s, r) = legacy_ch_result(
+            legacy().with_require_ems(false),
+            Vec::new(),
+            b"s12-legacy-noems-ok",
+        );
+        r.unwrap();
+        assert!(!s.ems_negotiated());
+    }
+
     /// RFC 8446 §4.1.3: a server that can speak TLS 1.2 but negotiates
     /// TLS 1.0/1.1 must mark `server_random` with `DOWNGRD\x00`, so a client
     /// that really offered 1.2/1.3 can detect the forced downgrade.
     #[cfg(feature = "tls-legacy")]
     #[test]
     fn legacy_server_sets_the_downgrade_sentinel() {
-        let cfg = test_rsa_server_config().with_min_version(ProtocolVersion::TLSv1_0);
+        let cfg = test_rsa_server_config()
+            .with_min_version(ProtocolVersion::TLSv1_0)
+            .with_require_ems(false);
         let srng = HmacDrbg::<Sha256>::new(b"s12-legacy-downgrd", b"nonce", &[]);
         let mut s = ServerConnection12::new(cfg, srng);
 
@@ -3239,7 +3366,9 @@ mod tests {
         use crate::test_util::rsa_test_key_a;
         use crate::tls::codec::handshake12::RsaClientKeyExchange;
 
-        let cfg = test_rsa_server_config().with_min_version(ProtocolVersion::TLSv1_0);
+        let cfg = test_rsa_server_config()
+            .with_min_version(ProtocolVersion::TLSv1_0)
+            .with_require_ems(false);
         let srng = HmacDrbg::<Sha256>::new(b"s12-rollback-s", b"nonce", &[]);
         let mut s = ServerConnection12::new(cfg, srng);
 

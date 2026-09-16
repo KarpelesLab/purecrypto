@@ -293,7 +293,10 @@ pub struct Config {
     /// This blocks the triple-handshake family of cross-protocol attacks
     /// the EMS extension exists to prevent. Set to `false` only to
     /// interoperate with very old peers that predate RFC 7627. Inert
-    /// outside TLS 1.2 (TLS 1.3 derives all secrets transcript-bound).
+    /// under TLS 1.3 (which derives all secrets transcript-bound). With the
+    /// `tls-legacy` feature it is enforced on TLS 1.0/1.1 as well (RFC 7627
+    /// covers every version from 1.0 up); SSL 3.0 has no extended master
+    /// secret, so an SSL 3.0 handshake is refused unless this is `false`.
     pub require_extended_master_secret: bool,
 
     // ---- RFC 7250 raw public keys (TLS 1.3 only) ----

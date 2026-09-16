@@ -68,7 +68,10 @@ use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
 };
 #[cfg(feature = "tls-legacy")]
-use crate::tls::crypto::prf::{finished_verify_data_legacy, master_secret_legacy};
+use crate::tls::crypto::prf::{
+    extended_master_secret_legacy, finished_verify_data_legacy, legacy_session_hash,
+    master_secret_legacy,
+};
 use crate::tls::crypto::record_prot::RecordProtection;
 #[cfg(feature = "tls-legacy")]
 use crate::tls::crypto::ssl3;
@@ -150,6 +153,13 @@ pub(crate) struct ClientConfig12 {
     /// `handshake_failure`, preventing the triple-handshake family of
     /// cross-protocol attacks. Set to `false` only to interoperate with
     /// servers that predate RFC 7627.
+    ///
+    /// RFC 7627 covers every TLS version from 1.0 up, so the requirement is
+    /// enforced identically on the opt-in `tls-legacy` TLS 1.0/1.1 path
+    /// (the session hash is then `MD5 || SHA-1` and the derivation uses the
+    /// version's PRF, §3/§4). SSL 3.0 has no extended master secret at all:
+    /// with the default an SSL 3.0 handshake is refused, and opting into
+    /// SSL 3.0 requires `require_ems = false` on both peers.
     pub require_ems: bool,
     /// Lowest protocol version this client will negotiate. Defaults to
     /// TLS 1.2. Lowered to TLS 1.0/1.1 via [`Self::with_min_version`] to opt
@@ -778,11 +788,10 @@ impl ClientConnection12 {
                 sid
             });
 
-        // Without the legacy opt-in this engine always tops out at TLS 1.2,
-        // so the ClientHello always carries `extended_master_secret`.
-        #[cfg(feature = "tls-legacy")]
-        let offers_ems = config.max_version.as_u16() >= ProtocolVersion::TLSv1_2.as_u16();
-        #[cfg(not(feature = "tls-legacy"))]
+        // RFC 7627 applies to every TLS version from 1.0 up, so the
+        // ClientHello always carries `extended_master_secret` — on the
+        // opt-in legacy path too. (An SSL 3.0 peer ignores it: the extension
+        // is undefined there and never negotiated.)
         let offers_ems = true;
         let mut conn = ClientConnection12 {
             config,
@@ -980,8 +989,7 @@ impl ClientConnection12 {
     /// Builds the ClientHello with all the TLS-1.2-required extensions.
     fn build_client_hello(&self, suites: &[CipherSuite], groups: &[NamedGroup]) -> Vec<u8> {
         // A client that tops out below TLS 1.2 (opt-in legacy) emits a clean
-        // pre-1.2 ClientHello: no `signature_algorithms` (1.2+ only) and no
-        // `extended_master_secret` (we run the legacy non-EMS derivation).
+        // pre-1.2 ClientHello: no `signature_algorithms` (1.2+ only).
         #[cfg(feature = "tls-legacy")]
         let pure_legacy = self.config.max_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16();
         #[cfg(not(feature = "tls-legacy"))]
@@ -997,10 +1005,9 @@ impl ClientConnection12 {
         // RFC 5746 §3.5: present `renegotiation_info` (empty) so a strict
         // server doesn't reject us. We never renegotiate.
         extensions.push(ext::renegotiation_info_empty());
-        // RFC 7627 §5.1: offer `extended_master_secret` on the modern path.
-        if !pure_legacy {
-            extensions.push(ext::extended_master_secret_empty());
-        }
+        // RFC 7627 §5.1: offer `extended_master_secret` — on every version,
+        // the extension is defined for TLS 1.0 through 1.2.
+        extensions.push(ext::extended_master_secret_empty());
         // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
         // server name (e.g. connecting by IP with certificate verification off).
         if !self.server_name.is_empty() {
@@ -1938,16 +1945,24 @@ impl ClientConnection12 {
             ext::parse_status_request_sh_ack(sr_body)?;
             self.server_echoed_ocsp_staple = true;
         }
-        // RFC 7627: the legacy derivation cannot produce an extended master
-        // secret. A server echoing the extension on a pre-1.2 ServerHello is
-        // asking for a key schedule we did not offer here; and a client that
-        // DID offer EMS (max_version ≥ 1.2) must not silently lose it by
-        // being pushed onto the legacy path.
-        if ext::find(&sh.extensions, ExtensionType::EXTENDED_MASTER_SECRET).is_some() {
-            return Err(Error::IllegalParameter);
-        }
-        if self.ems_offered && self.config.require_ems {
-            return Err(Error::HandshakeFailure);
+        // RFC 7627 applies to TLS 1.0/1.1 as well (§3/§4: the session hash
+        // is `MD5 || SHA-1` and the derivation uses the version's PRF). An
+        // echo is accepted exactly as on the 1.2 path; the extension is
+        // undefined for SSL 3.0, so an echo there is `illegal_parameter`.
+        // Without the echo `require_ems` (the default) aborts with
+        // `handshake_failure` — the master secret would otherwise not be
+        // bound to the transcript (triple-handshake exposure, §5.3).
+        if let Some(ems_body) = ext::find(&sh.extensions, ExtensionType::EXTENDED_MASTER_SECRET) {
+            ext::parse_extended_master_secret(ems_body)?;
+            if !self.ems_offered || sh_version == ProtocolVersion::SSLv3.as_u16() {
+                return Err(Error::IllegalParameter);
+            }
+            self.ems_negotiated = true;
+        } else {
+            self.ems_negotiated = false;
+            if self.ems_offered && self.config.require_ems {
+                return Err(Error::HandshakeFailure);
+            }
         }
         let ls = lookup_legacy_cbc(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
         self.negotiated_version = ProtocolVersion::from_u16(sh_version);
@@ -2060,6 +2075,14 @@ impl ClientConnection12 {
             }
         };
 
+        // RFC 7627 §3: the EMS `session_hash` covers the handshake messages
+        // through `ClientKeyExchange` — snapshot it now, before a
+        // `CertificateVerify` lands in the transcript.
+        if self.ems_negotiated {
+            self.ems_session_hash =
+                Some(legacy_session_hash(self.transcript.buffered_bytes()).to_vec());
+        }
+
         // CertificateVerify (RFC 5246 §7.4.8) signs CH..CKE; emit it now, after
         // the ClientKeyExchange is in the transcript.
         if send_cert_verify {
@@ -2129,14 +2152,29 @@ impl ClientConnection12 {
         Ok(())
     }
 
-    /// Version-aware legacy master secret (SSL 3.0 cascade or TLS 1.0/1.1 PRF).
+    /// Version-aware legacy master secret: the SSL 3.0 cascade, or the
+    /// TLS 1.0/1.1 PRF — over the RFC 7627 session hash when
+    /// `extended_master_secret` was negotiated, over the randoms otherwise.
     #[cfg(feature = "tls-legacy")]
     fn legacy_master_secret(&self, premaster: &[u8], cr: &Random, sr: &Random) -> [u8; 48] {
         if self.negotiated_version == ProtocolVersion::SSLv3 {
             ssl3::ssl3_master_secret(premaster, cr, sr)
+        } else if self.ems_negotiated {
+            let session_hash = self
+                .ems_session_hash
+                .as_ref()
+                .expect("EMS session_hash snapshot taken at ClientKeyExchange");
+            extended_master_secret_legacy(premaster, session_hash)
         } else {
             master_secret_legacy(premaster, cr, sr)
         }
+    }
+
+    /// Test hook: the derived 48-byte master secret, once the key exchange
+    /// has completed.
+    #[cfg(test)]
+    pub(crate) fn master_secret_for_test(&self) -> Option<[u8; 48]> {
+        self.master
     }
 
     /// Version-aware Finished `verify_data` over the current transcript bytes.
@@ -3262,13 +3300,18 @@ mod tests {
             Err(Error::HandshakeFailure)
         ));
 
-        // With the echo present the same ServerHello is accepted.
+        // With the echo present the same ServerHello (from a server that
+        // also does RFC 7627, as the default `require_ems` demands) is
+        // accepted.
         let mut c = legacy_client(legacy_only_cfg(), b"c12-legacy-reneg-ok");
         let sh = synth_legacy_sh_record(
             0x0301,
             [0x11u8; 32],
             CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
-            alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])],
+            alloc::vec![
+                (ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8]),
+                ext::extended_master_secret_empty(),
+            ],
         );
         c.read_tls(&sh);
         c.process_new_packets().unwrap();
@@ -3304,6 +3347,8 @@ mod tests {
         // The default (a legacy-only client that never offered 1.2/1.3)
         // accepts the marker, so our own legacy server stays interoperable.
         let mut lenient = legacy_client(legacy_only_cfg(), b"c12-legacy-downgrd-ok");
+        let mut exts = exts;
+        exts.push(ext::extended_master_secret_empty());
         let sh = synth_legacy_sh_record(
             0x0301,
             random,
@@ -3316,7 +3361,9 @@ mod tests {
 
     /// A client that offered TLS 1.2 (and therefore `extended_master_secret`)
     /// must not lose the EMS requirement by being pushed onto the legacy
-    /// path, which cannot derive an extended master secret.
+    /// path: RFC 7627 applies to TLS 1.0/1.1, so a legacy ServerHello that
+    /// omits the echo is refused unless `require_ems` is off, and one that
+    /// echoes it negotiates EMS.
     #[cfg(feature = "tls-legacy")]
     #[test]
     fn legacy_server_hello_cannot_strip_required_ems() {
@@ -3349,11 +3396,67 @@ mod tests {
         c.read_tls(&sh);
         c.process_new_packets().unwrap();
         assert_eq!(c.state, State::WaitCertificate);
+        assert!(!c.ems_negotiated());
 
-        // A legacy-only client never offers EMS, so the requirement cannot
-        // fire there.
-        let c = legacy_client(legacy_only_cfg(), b"c12-legacy-ems-pure");
-        assert!(!c.ems_offered);
+        // A legacy-only client offers EMS too (RFC 7627 covers TLS 1.0), and
+        // a TLS 1.0 ServerHello echoing it negotiates the extended master
+        // secret under the default requirement.
+        let mut c = legacy_client(legacy_only_cfg(), b"c12-legacy-ems-pure");
+        assert!(c.ems_offered);
+        let sh = synth_legacy_sh_record(
+            0x0301,
+            [0x33u8; 32],
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            alloc::vec![
+                (ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8]),
+                ext::extended_master_secret_empty(),
+            ],
+        );
+        c.read_tls(&sh);
+        c.process_new_packets().unwrap();
+        assert_eq!(c.state, State::WaitCertificate);
+        assert!(c.ems_negotiated());
+
+        // SSL 3.0 has no extended master secret: an echo there is
+        // `illegal_parameter`.
+        let ssl3 = || {
+            ClientConfig12::new(RootCertStore::new())
+                .with_min_version(ProtocolVersion::SSLv3)
+                .with_max_version(ProtocolVersion::SSLv3)
+        };
+        let mut c = legacy_client(ssl3(), b"c12-legacy-ems-ssl3");
+        let sh = synth_legacy_sh_record(
+            0x0300,
+            [0x33u8; 32],
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            alloc::vec![
+                (ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8]),
+                ext::extended_master_secret_empty(),
+            ],
+        );
+        c.read_tls(&sh);
+        assert!(matches!(
+            c.process_new_packets(),
+            Err(Error::IllegalParameter)
+        ));
+        // ... and without the echo the default requirement refuses SSL 3.0
+        // outright; opting out is what an SSL 3.0 deployment must do.
+        let mut c = legacy_client(ssl3(), b"c12-legacy-ems-ssl3-none");
+        let sh = synth_legacy_sh_record(
+            0x0300,
+            [0x33u8; 32],
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])],
+        );
+        c.read_tls(&sh);
+        assert!(matches!(
+            c.process_new_packets(),
+            Err(Error::HandshakeFailure)
+        ));
+        let mut c = legacy_client(ssl3().with_require_ems(false), b"c12-legacy-ems-ssl3-off");
+        c.read_tls(&sh);
+        c.process_new_packets().unwrap();
+        assert_eq!(c.state, State::WaitCertificate);
     }
 
     /// A client pinned below TLS 1.2 must not be pulled UP to 1.2 either.
