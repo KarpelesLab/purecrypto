@@ -49,6 +49,42 @@ fn run_capture(args: &[&str], stdin: &[u8]) -> (String, String, bool) {
     )
 }
 
+/// Spawns a `purecrypto` server subcommand and blocks until it reports
+/// `listening on …` on stderr, so the client is never started before the
+/// socket is bound. A fixed sleep is not enough: on a loaded machine a debug
+/// build can take longer than the sleep to load and cross-check the identity,
+/// and a UDP ClientHello sent to a still-unbound port comes back as
+/// `Connection refused`, which the client rightly treats as fatal.
+///
+/// The server must NOT be given `-quiet` (that suppresses the banner). Its
+/// stderr is drained on a helper thread for the process's lifetime so a later
+/// `eprintln!` in the server can never block or hit a closed pipe.
+fn spawn_server_wait_listening(args: &[&str]) -> std::process::Child {
+    use std::io::BufRead;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn purecrypto server");
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = stderr.read_line(&mut line).expect("read server stderr");
+        assert!(n > 0, "server exited before reporting `listening on`");
+        if line.contains("listening on") {
+            break;
+        }
+    }
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        let _ = stderr.read_to_string(&mut sink);
+    });
+    child
+}
+
 #[test]
 fn hash_sha256_stdin() {
     let (out, ok) = run(&["hash", "sha256"], b"abc");
@@ -2498,25 +2534,16 @@ fn s_dtls_client_s_dtls_server_roundtrip() {
     // Spawn s_dtls_server in a background process. Disable the cookie
     // exchange to keep the round-trip path short — the cookie path is
     // exercised by the DTLS unit tests.
-    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
-        .args([
-            "s_dtls_server",
-            "-cert",
-            cert_path.to_str().unwrap(),
-            "-key",
-            key_path.to_str().unwrap(),
-            "-accept",
-            &format!("127.0.0.1:{port}"),
-            "-no_cookie",
-            "-quiet",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn s_dtls_server");
-
-    // Give the server time to bind.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let server_proc = spawn_server_wait_listening(&[
+        "s_dtls_server",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-accept",
+        &format!("127.0.0.1:{port}"),
+        "-no_cookie",
+    ]);
 
     // s_dtls_client connects, sends one line, and expects the echo back.
     // `-insecure` skips peer-cert validation (the test fixture's cert isn't
@@ -2584,25 +2611,17 @@ fn s_client_s_server_dtls12_roundtrip() {
     std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
 
     // `s_server -dtls1_2` instead of `s_dtls_server`.
-    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
-        .args([
-            "s_server",
-            "-dtls1_2",
-            "-cert",
-            cert_path.to_str().unwrap(),
-            "-key",
-            key_path.to_str().unwrap(),
-            "-accept",
-            &format!("127.0.0.1:{port}"),
-            "-no_cookie",
-            "-quiet",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn s_server -dtls1_2");
-
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server",
+        "-dtls1_2",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-accept",
+        &format!("127.0.0.1:{port}"),
+        "-no_cookie",
+    ]);
 
     // `s_client -dtls1_2` instead of `s_dtls_client`.
     let (out, _ok) = run(
@@ -2662,25 +2681,17 @@ fn s_client_s_server_dtls13_roundtrip() {
     std::fs::write(&cert_path, cert.to_pem()).unwrap();
     std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
 
-    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
-        .args([
-            "s_server",
-            "-dtls1_3",
-            "-cert",
-            cert_path.to_str().unwrap(),
-            "-key",
-            key_path.to_str().unwrap(),
-            "-accept",
-            &format!("127.0.0.1:{port}"),
-            "-no_cookie",
-            "-quiet",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn s_server -dtls1_3");
-
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server",
+        "-dtls1_3",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-accept",
+        &format!("127.0.0.1:{port}"),
+        "-no_cookie",
+    ]);
 
     let (out, _ok) = run(
         &[
