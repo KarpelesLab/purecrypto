@@ -29,13 +29,22 @@
 //! # Signing cost
 //!
 //! With the `alloc` feature a private key keeps a cache of Merkle nodes (a
-//! signer-side structure that holds only public hashes and is never
-//! serialized), so a signature costs one LM-OTS signature plus `O(h)` cached
-//! reads. The cache is built at key generation — it *is* key generation — or
-//! lazily on the first signature after [`LmsPrivateKey::from_bytes`] /
-//! [`HssPrivateKey::from_bytes`], which therefore costs one full `O(2^h)`
-//! tree derivation once per process for each level that signs. For `H20` and
-//! `H25` only the top 16 levels stay resident and the bottom subtree
+//! signer-side structure that holds only public hashes), so a signature costs
+//! one LM-OTS signature plus `O(h)` cached reads. The cache is built at key
+//! generation — it *is* key generation. It is **not** part of the plain
+//! serialization ([`LmsPrivateKey::to_bytes`] / [`HssPrivateKey::to_bytes`]):
+//! after a [`LmsPrivateKey::from_bytes`] / [`HssPrivateKey::from_bytes`] of
+//! that form the cache is rebuilt from the seed, by default lazily on the
+//! first signature of each level, or when the caller chooses via
+//! [`LmsPrivateKey::warm_cache`] / [`HssPrivateKey::warm_cache`]. That
+//! rebuild is a full `O(2^h)` tree derivation once per process — see the
+//! cost table on [`LmsPrivateKey`]. A process that loads a key for a single
+//! signature (a CLI, a short-lived job) avoids it by persisting the *cached*
+//! form instead, [`LmsPrivateKey::to_bytes_with_cache`] /
+//! [`HssPrivateKey::to_bytes_with_cache`], which `from_bytes` also accepts:
+//! it carries the cache under the key file's integrity tag, so a load costs
+//! nothing beyond copying it (about 2 MiB for `H15` and above). For `H20`
+//! and `H25` only the top 16 levels stay resident and the bottom subtree
 //! containing the current leaf is regenerated every `2^5` / `2^10`
 //! signatures; the cache never exceeds about 2.1 MiB per tree. The
 //! allocator-less build (no `alloc`) has nowhere to keep such a cache and
@@ -56,6 +65,9 @@
     doc = "[`HssPrivateKey::to_bytes`]: crate#no_std",
     doc = "[`HssPrivateKey::from_bytes`]: crate#no_std",
     doc = "[`LmsPrivateKey::to_bytes`]: crate#no_std",
+    doc = "[`LmsPrivateKey::to_bytes_with_cache`]: crate#no_std",
+    doc = "[`HssPrivateKey::to_bytes_with_cache`]: crate#no_std",
+    doc = "[`HssPrivateKey::warm_cache`]: crate#no_std",
     doc = "[`HssPrivateKey::remaining`]: crate#no_std"
 )]
 
@@ -67,7 +79,6 @@ mod tree;
 
 pub use params::{LmotsType, LmsType};
 
-#[cfg(feature = "alloc")]
 use crate::ct::ConstantTimeEq;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -100,9 +111,11 @@ pub enum Error {
     /// loader needs, so they load any height without derivation.
     LegacyKeyTooTall,
     /// A serialized private key failed its integrity check: the authentication
-    /// tag of a tagged HSS format did not verify, a stored upper-level
-    /// signature does not verify against the level it signs, or a stored tree
-    /// root disagrees with the root that tree's own seed derives (detected when
+    /// tag of a tagged format (every HSS format since `v2`, and the cached
+    /// LMS form) did not verify, a stored upper-level signature does not
+    /// verify against the level it signs, a serialized node cache does not
+    /// hang together or disagrees with the stored root, or a stored tree root
+    /// disagrees with the root that tree's own seed derives (detected when
     /// the tree is first built for signing). Each means the key file was
     /// modified after it was written, which for a multi-level key is a
     /// *forgery* vector (see [`HssPrivateKey::from_bytes`]), so the key is
@@ -131,6 +144,50 @@ const LEGACY_RECOMPUTE_MAX_H: u32 = 15;
 #[inline]
 fn wipe(buf: &mut [u8]) {
     crate::zeroize::Zeroize::zeroize(buf);
+}
+
+// ===================================================================
+// Private-key file integrity tag (shared by the tagged LMS and HSS forms)
+// ===================================================================
+
+/// Length of the integrity tag that closes every tagged private-key
+/// serialization (`HMAC-SHA-256`).
+const TAG_LEN: usize = 32;
+
+/// `HMAC-SHA-256(seed, domain || I || body)` — the integrity tag of a tagged
+/// private-key serialization.
+///
+/// The key is the seed of the **top** tree in the file (the only tree of a
+/// single-level LMS file), deliberately: it is the only secret in the file
+/// that an attacker cannot substitute, because replacing it changes that
+/// tree's root and therefore the public key (signatures then simply fail to
+/// verify — a self-DoS, not a forgery). Every other byte of the file —
+/// including each lower level's `(typecodes, I, seed, q, root)`, the cached
+/// upper-level signatures and any serialized node cache — is covered by the
+/// tag, so an adversary who can write the file but not read it can neither
+/// substitute a level, rewind a leaf index nor plant a cache node. An
+/// adversary who *can* read the file already holds every seed and needs no
+/// attack at all, so keying the tag from in-file material loses nothing.
+fn privkey_tag(domain: &[u8], body: &[u8], i0: &[u8; 16], seed0: &[u8; N]) -> [u8; TAG_LEN] {
+    use crate::hash::{Hmac, Sha256};
+    let mut m = Hmac::<Sha256>::new(seed0);
+    m.update(domain);
+    m.update(i0);
+    m.update(body);
+    m.finalize()
+}
+
+/// Verifies a serialized tag against the body it covers, keyed by the
+/// `(I, seed)` of the level block that starts at `top_block` in `body`.
+fn check_tag(domain: &[u8], body: &[u8], tag: &[u8], top_block: usize) -> Result<(), Error> {
+    let mut i0 = [0u8; 16];
+    i0.copy_from_slice(&body[top_block + 8..top_block + 24]);
+    let mut seed0 = [0u8; N];
+    seed0.copy_from_slice(&body[top_block + 24..top_block + 24 + N]);
+    let want = privkey_tag(domain, body, &i0, &seed0);
+    wipe(&mut seed0);
+    let ok: bool = want[..].ct_eq(tag).into();
+    if ok { Ok(()) } else { Err(Error::Tampered) }
 }
 
 // ===================================================================
@@ -166,17 +223,41 @@ pub struct LmsPublicKey {
 ///
 /// **Stateful** — see the [module documentation](crate::lms). The next unused
 /// leaf index `q` is part of the key state and is advanced by every
-/// [`sign`][Self::sign]. Re-persist [`to_bytes`][Self::to_bytes] after each
-/// signature. Not [`Clone`] by design.
+/// [`sign`][Self::sign]. Re-persist [`to_bytes`][Self::to_bytes] (or
+/// [`to_bytes_with_cache`][Self::to_bytes_with_cache]) after each signature.
+/// Not [`Clone`] by design.
+///
+/// # The node cache, and what a load costs
 ///
 /// With `alloc`, the key carries an in-memory Merkle node cache so signing is
 /// `O(h)` (see the module documentation's *Signing cost*); the cache holds
-/// public hashes only and is not part of the serialization.
+/// public hashes only. Key generation builds it. A key loaded from the plain
+/// serialization ([`to_bytes`][Self::to_bytes]) has none, and rebuilds it
+/// from the seed — a full key generation — on the first signature, or when
+/// [`warm_cache`][Self::warm_cache] is called. Rough cost of that rebuild
+/// (one 2020s laptop core, release build; `W1` is the cheapest LM-OTS set
+/// and `W8` the dearest, about 16× more per leaf):
+///
+/// | Tree  | Leaves  | Rebuild (`W1` … `W8`) | Cache in memory / in file  |
+/// |-------|---------|-----------------------|----------------------------|
+/// | `H5`  | 32      | ≈ 1 ms … 20 ms        | 2 KiB                      |
+/// | `H10` | 1 024   | ≈ 40 ms … 0.5 s       | 64 KiB                     |
+/// | `H15` | 32 768  | ≈ 1.3 s … 16 s        | 2 MiB                      |
+/// | `H20` | ≈ 1 M   | ≈ 40 s … 8 min        | 2 MiB + 2 KiB bottom tier  |
+/// | `H25` | ≈ 33 M  | ≈ 20 min … 5 h        | 2 MiB + 64 KiB bottom tier |
+///
+/// (`H20`/`H25` additionally rebuild a 32- / 1024-leaf bottom subtree every
+/// `2^5` / `2^10` signatures.) A process that loads a key only to sign once
+/// or a few times should therefore persist the *cached* form,
+/// [`to_bytes_with_cache`][Self::to_bytes_with_cache], which
+/// [`from_bytes`][Self::from_bytes] loads without any derivation at the price
+/// of the file size in the last column.
 #[cfg_attr(
     not(feature = "alloc"),
     doc = "",
     doc = "[Self::sign]: crate#no_std",
-    doc = "[Self::to_bytes]: crate#no_std"
+    doc = "[Self::to_bytes]: crate#no_std",
+    doc = "[Self::to_bytes_with_cache]: crate#no_std"
 )]
 pub struct LmsPrivateKey {
     lms_type: LmsType,
@@ -187,11 +268,27 @@ pub struct LmsPrivateKey {
     q: u32,
     /// Cached tree root (so signing and `public_key` need not recompute it).
     root: [u8; N],
-    /// Merkle node cache; `None` after [`from_bytes`](Self::from_bytes) until
-    /// the first signature builds it.
+    /// Merkle node cache; `None` after a cache-less
+    /// [`from_bytes`](Self::from_bytes) until the first signature (or
+    /// [`warm_cache`](Self::warm_cache)) builds it.
     #[cfg(feature = "alloc")]
     cache: Option<tree::NodeCache>,
 }
+
+/// Leading magic of the cached single-tree LMS private-key serialization
+/// ([`LmsPrivateKey::to_bytes_with_cache`]). As a big-endian `u32` it is far
+/// outside the LMS typecode range that opens the plain form, and the plain
+/// form is length-discriminated besides, so the two can never be confused.
+#[cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`LmsPrivateKey::to_bytes_with_cache`]: crate#no_std"
+)]
+const LMS_CACHED_MAGIC: &[u8; 4] = b"LMC1";
+
+/// Domain separator of the cached LMS form's integrity tag (see
+/// [`privkey_tag`]).
+const LMS_CACHED_TAG_DOMAIN: &[u8] = b"purecrypto/lms/lms-privkey-cached-v1";
 
 impl LmsPrivateKey {
     /// Deterministically derives an LMS key pair from the identifier `i_id`
@@ -282,37 +379,89 @@ impl LmsPrivateKey {
         self.sign_with_c(message, &c)
     }
 
+    /// Builds the node cache's top tier if the key has none (after a
+    /// cache-less [`from_bytes`](Self::from_bytes) load) — a full `O(2^h)`
+    /// derivation — and refuses with [`Error::Tampered`] if the derived root
+    /// disagrees with the stored one, so a key file with a corrupted root
+    /// fails closed instead of burning leaves on signatures that could never
+    /// verify.
+    #[cfg(feature = "alloc")]
+    fn ensure_top_tier(&mut self) -> Result<&mut tree::NodeCache, Error> {
+        if self.cache.is_none() {
+            let cache =
+                tree::NodeCache::build(self.lms_type, self.ots_type, &self.i_id, &self.seed);
+            let same: bool = cache.root()[..].ct_eq(&self.root[..]).into();
+            if !same {
+                return Err(Error::Tampered);
+            }
+            self.cache = Some(cache);
+        }
+        Ok(self.cache.as_mut().expect("just built"))
+    }
+
     /// Makes leaf `q`'s authentication path available to
     /// [`sign_reserved_into`](Self::sign_reserved_into).
     ///
-    /// With `alloc` this builds the node cache on first use (after a
-    /// [`from_bytes`](Self::from_bytes) load) — a full `O(2^h)` derivation —
-    /// and refuses with [`Error::Tampered`] if the derived root disagrees with
-    /// the stored one, so a key file with a corrupted root fails closed instead
-    /// of burning leaves on signatures that could never verify. It then makes
-    /// sure the bottom subtree holding `q` is built. Without `alloc` there is
-    /// nothing to prepare.
+    /// With `alloc` this builds the node cache on first use (see
+    /// [`ensure_top_tier`](Self::ensure_top_tier)) and then makes sure the
+    /// bottom subtree holding `q` is built. Without `alloc` there is nothing
+    /// to prepare.
     ///
     /// Produces no signature material, so it runs *before* the leaf is
     /// reserved; an error here leaves the state untouched.
     fn prepare_leaf(&mut self, q: u32) -> Result<(), Error> {
         #[cfg(feature = "alloc")]
         {
-            if self.cache.is_none() {
-                let cache =
-                    tree::NodeCache::build(self.lms_type, self.ots_type, &self.i_id, &self.seed);
-                let same: bool = cache.root()[..].ct_eq(&self.root[..]).into();
-                if !same {
-                    return Err(Error::Tampered);
-                }
-                self.cache = Some(cache);
-            }
-            let cache = self.cache.as_mut().expect("just built");
-            cache.prepare(self.lms_type, self.ots_type, &self.i_id, &self.seed, q);
+            let (lms, ots, i_id, seed) = (self.lms_type, self.ots_type, self.i_id, self.seed);
+            self.ensure_top_tier()?.prepare(lms, ots, &i_id, &seed, q);
         }
         #[cfg(not(feature = "alloc"))]
         let _ = q;
         Ok(())
+    }
+
+    /// Builds the node cache now, if the key has none, instead of on the first
+    /// signature: the whole `O(2^h)` tree derivation (see the cost table on
+    /// the type) plus, for `H20`/`H25`, the bottom subtree holding the next
+    /// leaf. A no-op when the cache is already warm — after key generation,
+    /// after a load of the cached form, or after a signature.
+    ///
+    /// Lets a long-lived signer pay the rebuild at a time of its choosing (at
+    /// start-up, off the request path). Refuses with [`Error::Tampered`],
+    /// consuming nothing, if the stored root is not the one the seed derives.
+    /// Without `alloc` there is no cache and this returns `Ok(())` at once.
+    pub fn warm_cache(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "alloc")]
+        {
+            let (lms, ots, i_id, seed, q) =
+                (self.lms_type, self.ots_type, self.i_id, self.seed, self.q);
+            let cache = self.ensure_top_tier()?;
+            // Past the last leaf there is no subtree to prepare; the top tier
+            // alone is what a later `to_bytes_with_cache` should carry.
+            if (q as u64) < lms.leaves() {
+                cache.prepare(lms, ots, &i_id, &seed, q);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the node cache is built, i.e. whether the next signature is
+    /// `O(h)` and [`to_bytes_with_cache`](Self::to_bytes_with_cache) will
+    /// include it. Always `false` without `alloc`.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::to_bytes_with_cache]: crate#no_std"
+    )]
+    pub fn cache_is_warm(&self) -> bool {
+        #[cfg(feature = "alloc")]
+        {
+            self.cache.is_some()
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            false
+        }
     }
 
     /// Reserves the next leaf: advances `q` past it and returns it.
@@ -431,11 +580,52 @@ impl LmsPrivateKey {
     /// pass. The layout is a pure superset of the legacy 60-byte form (the root
     /// is appended at the end), so older builds' parsers are unaffected and this
     /// build still reads legacy bytes (see [`from_bytes`](Self::from_bytes)).
-    /// The Merkle node cache is deliberately not serialized: it is public data
-    /// the seed regenerates.
+    /// The Merkle node cache is not part of this form — it is public data the
+    /// seed regenerates, at the cost of a full key generation on the first
+    /// signature after a load; [`to_bytes_with_cache`](Self::to_bytes_with_cache)
+    /// is the form that carries it.
     #[cfg(feature = "alloc")]
     pub fn to_bytes(&self) -> Vec<u8> {
         self.to_bytes_array().to_vec()
+    }
+
+    /// Serializes the private key like [`to_bytes`](Self::to_bytes) **plus the
+    /// Merkle node cache**, so that [`from_bytes`](Self::from_bytes) restores
+    /// a key that signs in `O(h)` at once instead of first re-deriving the
+    /// tree (see the cost table on the type). This is the form to persist
+    /// after each signature when the key is loaded per signature, as a CLI
+    /// or a short-lived job does.
+    ///
+    /// Layout: `"LMC1" || plain(92) || u8(has_cache) || [cache] || tag(32)`,
+    /// where `plain` is exactly [`to_bytes_array`](Self::to_bytes_array),
+    /// `cache` (present iff `has_cache = 1`) is the full top tier and, for
+    /// `H20`/`H25`, the current bottom subtree, and `tag` is `HMAC-SHA-256`
+    /// over every preceding byte keyed by this key's seed, so a file edited
+    /// by someone who cannot read the seed — a flipped cache node, a rewound
+    /// `q` — is refused with [`Error::Tampered`]. Size: 129 bytes of framing
+    /// plus the cache (2 KiB for `H5`, 64 KiB for `H10`, 2 MiB for `H15`,
+    /// 2 MiB + 2 KiB for `H20`, 2 MiB + 64 KiB for `H25`).
+    ///
+    /// The cache is written as it is: a key whose cache is not built (loaded
+    /// from a cache-less form and not yet signed with) is written *without*
+    /// one, `has_cache = 0`, and loads exactly as the plain form would. Call
+    /// [`warm_cache`](Self::warm_cache) first to be sure the file carries it.
+    #[cfg(feature = "alloc")]
+    pub fn to_bytes_with_cache(&self) -> Vec<u8> {
+        let cache_len = self.cache.as_ref().map_or(0, tree::NodeCache::encoded_len);
+        let mut v = Vec::with_capacity(4 + PRIVKEY_LEN + 1 + cache_len + TAG_LEN);
+        v.extend_from_slice(LMS_CACHED_MAGIC);
+        v.extend_from_slice(&self.to_bytes_array());
+        match &self.cache {
+            Some(cache) => {
+                v.push(1);
+                cache.encode_into(&mut v);
+            }
+            None => v.push(0),
+        }
+        let tag = privkey_tag(LMS_CACHED_TAG_DOMAIN, &v, &self.i_id, &self.seed);
+        v.extend_from_slice(&tag);
+        v
     }
 
     /// Allocation-free counterpart of [`to_bytes`][Self::to_bytes]: the encoding
@@ -459,68 +649,70 @@ impl LmsPrivateKey {
         v
     }
 
-    /// Parses a private key produced by [`to_bytes`][Self::to_bytes], resuming
-    /// at the persisted `q`.
+    /// Parses a private key produced by [`to_bytes`][Self::to_bytes] or
+    /// [`to_bytes_with_cache`][Self::to_bytes_with_cache], resuming at the
+    /// persisted `q`.
     ///
-    /// Length-discriminated and backward compatible:
-    /// * **92 bytes** — the current root-bearing format. The stored root is
+    /// Format-discriminated and backward compatible:
+    /// * **`"LMC1"` magic** — the cached form. The trailing tag is verified
+    ///   first (keyed by the seed in the file); a modified file is rejected
+    ///   with [`Error::Tampered`]. The serialized cache is then adopted as it
+    ///   is — no tree is derived — after a cheap check that its root is the
+    ///   stored root (else [`Error::Tampered`]). Without `alloc` the tag is
+    ///   still verified and the framing checked, but the cache is dropped.
+    /// * **92 bytes** — the plain root-bearing format. The stored root is
     ///   read directly (no recompute), so a key of any height loads in constant
-    ///   time.
+    ///   time; the cache is rebuilt on the first signature.
     /// * **60 bytes** — the LEGACY root-less format. The root is recomputed via
     ///   an `O(2^h)` keygen-equivalent pass; to deny a CPU-DoS from an untrusted
     ///   file this path is capped at `H15` (`LEGACY_RECOMPUTE_MAX_H`) and returns
     ///   [`Error::LegacyKeyTooTall`] above it.
-    /// * any other length — [`Error::Malformed`].
+    /// * anything else — [`Error::Malformed`].
     ///
     /// # The stored root is public, and checked before it matters
     ///
     /// The root is NOT secret — it is the public key value `T[1]`
     /// (`encode_public_key` = `type || type || I || T[1]`). Loading trusts it
     /// so that `from_bytes` stays constant-time. The first signature after a
-    /// load rebuilds the Merkle node cache from the seed (with `alloc`) and
-    /// compares the derived root with the stored one, refusing with
-    /// [`Error::Tampered`] on a mismatch — before any leaf is consumed. A
+    /// cache-less load rebuilds the Merkle node cache from the seed (with
+    /// `alloc`) and compares the derived root with the stored one, refusing
+    /// with [`Error::Tampered`] on a mismatch — before any leaf is consumed. A
     /// tampered root can therefore only cause a fail-closed self-DoS, never a
     /// forgery (the attacker lacks the seed) and never a wasted one-time key.
     /// Re-deriving the root on every load would cost a full keygen and buy
     /// nothing more: an attacker able to rewrite the key file could already
     /// force catastrophic LM-OTS reuse by rewinding `q`, which is far worse.
+    /// The cached form skips that rebuild, and with it the seed-versus-root
+    /// check; its tag takes over the job — a file whose root or cache was
+    /// edited by someone without the seed fails the tag, and one written by
+    /// someone *with* the seed was never protected by any check.
     #[cfg_attr(
         not(feature = "alloc"),
         doc = "",
-        doc = "[Self::to_bytes]: crate#no_std"
+        doc = "[Self::to_bytes]: crate#no_std",
+        doc = "[Self::to_bytes_with_cache]: crate#no_std"
     )]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        const LEGACY_LEN: usize = 4 + 4 + 16 + N + 4;
-        const NEW_LEN: usize = LEGACY_LEN + N;
-        if bytes.len() != LEGACY_LEN && bytes.len() != NEW_LEN {
-            return Err(Error::Malformed);
+        if bytes.len() >= 4 && &bytes[..4] == LMS_CACHED_MAGIC {
+            return Self::from_bytes_cached(bytes);
         }
-        let lms_type =
-            LmsType::from_u32(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                .ok_or(Error::Malformed)?;
-        let ots_type =
-            LmotsType::from_u32(u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
-                .ok_or(Error::Malformed)?;
-        let mut i_id = [0u8; 16];
-        i_id.copy_from_slice(&bytes[8..24]);
-        let mut seed = [0u8; N];
-        seed.copy_from_slice(&bytes[24..24 + N]);
-        let q = u32::from_be_bytes([bytes[24 + N], bytes[25 + N], bytes[26 + N], bytes[27 + N]]);
-        if q as u64 > lms_type.leaves() {
-            return Err(Error::Malformed);
-        }
-        let root = if bytes.len() == NEW_LEN {
+        const LEGACY_LEN: usize = PRIVKEY_LEN - N;
+        let has_root = match bytes.len() {
+            PRIVKEY_LEN => true,
+            LEGACY_LEN => false,
+            _ => return Err(Error::Malformed),
+        };
+        let (lms_type, ots_type, i_id, seed, q, root) = Self::parse_block(bytes, has_root)?;
+        let root = match root {
             // Fast path: trust the stored public root (see method docs).
-            let mut r = [0u8; N];
-            r.copy_from_slice(&bytes[28 + N..28 + N + N]);
-            r
-        } else {
+            Some(r) => r,
             // Legacy path: recompute the root, but refuse a CPU-DoS-sized tree.
-            if lms_type.h() > LEGACY_RECOMPUTE_MAX_H {
-                return Err(Error::LegacyKeyTooTall);
+            None => {
+                if lms_type.h() > LEGACY_RECOMPUTE_MAX_H {
+                    return Err(Error::LegacyKeyTooTall);
+                }
+                tree::compute_root(lms_type, ots_type, &i_id, &seed)
             }
-            tree::compute_root(lms_type, ots_type, &i_id, &seed)
         };
         Ok(LmsPrivateKey {
             lms_type,
@@ -532,6 +724,95 @@ impl LmsPrivateKey {
             #[cfg(feature = "alloc")]
             cache: None,
         })
+    }
+
+    /// The cached-form loader — see [`from_bytes`](Self::from_bytes).
+    fn from_bytes_cached(bytes: &[u8]) -> Result<Self, Error> {
+        // "LMC1" || plain(92) || u8(has_cache) || [cache] || tag(32)
+        const HEAD: usize = 4 + PRIVKEY_LEN + 1;
+        if bytes.len() < HEAD + TAG_LEN {
+            return Err(Error::Malformed);
+        }
+        // Authenticate everything before trusting any of it; the tag key sits
+        // at fixed offsets in the plain block, whatever the rest contains.
+        let body = &bytes[..bytes.len() - TAG_LEN];
+        check_tag(LMS_CACHED_TAG_DOMAIN, body, &bytes[body.len()..], 4)?;
+        let (lms_type, ots_type, i_id, seed, q, root) =
+            Self::parse_block(&body[4..4 + PRIVKEY_LEN], true)?;
+        let root = root.expect("cached blocks carry the root");
+        let cache_bytes = &body[HEAD..];
+        let has_cache = match body[HEAD - 1] {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::Malformed),
+        };
+        if !has_cache {
+            if !cache_bytes.is_empty() {
+                return Err(Error::Malformed);
+            }
+        } else if tree::cache_encoded_len(lms_type.h(), cache_bytes) != Some(cache_bytes.len()) {
+            return Err(Error::Malformed);
+        }
+        #[cfg(feature = "alloc")]
+        let cache = if has_cache {
+            let cache = tree::NodeCache::decode(lms_type, cache_bytes)?;
+            let same: bool = cache.root()[..].ct_eq(&root[..]).into();
+            if !same {
+                return Err(Error::Tampered);
+            }
+            Some(cache)
+        } else {
+            None
+        };
+        Ok(LmsPrivateKey {
+            lms_type,
+            ots_type,
+            i_id,
+            seed,
+            q,
+            root,
+            #[cfg(feature = "alloc")]
+            cache,
+        })
+    }
+
+    /// Parses one `(lms_type, ots_type, I, seed, q, root?)` key block — the
+    /// plain LMS serialization, also the per-level block of every HSS format
+    /// — validating the typecodes and `q <= 2^h`. `block` must be exactly
+    /// [`PRIVKEY_LEN`] bytes, or `N` fewer without the root.
+    #[allow(clippy::type_complexity)]
+    fn parse_block(
+        block: &[u8],
+        has_root: bool,
+    ) -> Result<(LmsType, LmotsType, [u8; 16], [u8; N], u32, Option<[u8; N]>), Error> {
+        debug_assert_eq!(
+            block.len(),
+            if has_root {
+                PRIVKEY_LEN
+            } else {
+                PRIVKEY_LEN - N
+            }
+        );
+        let lms_type =
+            LmsType::from_u32(u32::from_be_bytes([block[0], block[1], block[2], block[3]]))
+                .ok_or(Error::Malformed)?;
+        let ots_type =
+            LmotsType::from_u32(u32::from_be_bytes([block[4], block[5], block[6], block[7]]))
+                .ok_or(Error::Malformed)?;
+        let mut i_id = [0u8; 16];
+        i_id.copy_from_slice(&block[8..24]);
+        let mut seed = [0u8; N];
+        seed.copy_from_slice(&block[24..24 + N]);
+        let q = u32::from_be_bytes([block[24 + N], block[25 + N], block[26 + N], block[27 + N]]);
+        if q as u64 > lms_type.leaves() {
+            return Err(Error::Malformed);
+        }
+        let root = has_root.then(|| {
+            let mut r = [0u8; N];
+            r.copy_from_slice(&block[28 + N..28 + N + N]);
+            r
+        });
+        Ok((lms_type, ots_type, i_id, seed, q, root))
     }
 }
 
@@ -584,15 +865,17 @@ pub fn verify_lms(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
 // HSS — multi-level stateful key
 // ===================================================================
 
-/// Length of the integrity tag appended by [`HssPrivateKey::to_bytes`].
-#[cfg(feature = "alloc")]
-const HSS_TAG_LEN: usize = 32;
-
-/// Leading magic of the current (`v3`) HSS private-key serialization. As a
+/// Leading magic of the plain (`v3`) HSS private-key serialization. As a
 /// big-endian `u32` it is far outside the `1..=8` level count that opens every
 /// earlier format, so the two framings can never be confused.
 #[cfg(feature = "alloc")]
 const HSS_V3_MAGIC: &[u8; 4] = b"HSS3";
+
+/// Leading magic of the cached (`v4`) HSS private-key serialization
+/// ([`HssPrivateKey::to_bytes_with_cache`]): `v3` plus one node-cache section
+/// per level.
+#[cfg(feature = "alloc")]
+const HSS_V4_MAGIC: &[u8; 4] = b"HSS4";
 
 /// Domain separator for the `v3` HSS private-key integrity tag, so the tag can
 /// never be confused with any other value derived from the same seed (the RFC
@@ -601,41 +884,24 @@ const HSS_V3_MAGIC: &[u8; 4] = b"HSS3";
 #[cfg(feature = "alloc")]
 const HSS_TAG_DOMAIN_V3: &[u8] = b"purecrypto/lms/hss-privkey-v3";
 
+/// Domain separator of the `v4` tag: a `v4` file is never a valid `v3` file
+/// with a different magic, whatever the tag.
+#[cfg(feature = "alloc")]
+const HSS_TAG_DOMAIN_V4: &[u8] = b"purecrypto/lms/hss-privkey-v4";
+
 /// Domain separator of the `v2` tag, kept to authenticate `v2` files on load.
 #[cfg(feature = "alloc")]
 const HSS_TAG_DOMAIN_V2: &[u8] = b"purecrypto/lms/hss-privkey-v2";
 
 /// Per-level block of every HSS private-key format since `v1`:
-/// `u32(lms_type) || u32(ots_type) || I(16) || seed(32) || u32(q) || root(32)`.
+/// `u32(lms_type) || u32(ots_type) || I(16) || seed(32) || u32(q) || root(32)`
+/// — the plain single-tree serialization, [`PRIVKEY_LEN`].
 #[cfg(feature = "alloc")]
-const HSS_LEVEL_LEN: usize = 4 + 4 + 16 + N + 4 + N;
+const HSS_LEVEL_LEN: usize = PRIVKEY_LEN;
 
 /// The root-less legacy per-level block (`HSS_LEVEL_LEN` without the root).
 #[cfg(feature = "alloc")]
 const HSS_LEGACY_LEVEL_LEN: usize = HSS_LEVEL_LEN - N;
-
-/// `HMAC-SHA-256(seed0, domain || I0 || body)` — the integrity tag of a
-/// serialized [`HssPrivateKey`].
-///
-/// The key is the **top** level's seed, deliberately: it is the only secret in
-/// the file that an attacker cannot substitute, because replacing it changes the
-/// top-level root and therefore the HSS public key (signatures then simply fail
-/// to verify — a self-DoS, not a forgery). Every other byte of the file,
-/// including each lower level's `(typecodes, I, seed, q, root)` and the cached
-/// upper-level signatures, is covered by the tag, so an adversary who can write
-/// the file but not read it can neither substitute a level nor rewind a leaf
-/// index. An adversary who *can* read the file already holds every seed and
-/// needs no attack at all, so keying the tag from in-file material loses
-/// nothing.
-#[cfg(feature = "alloc")]
-fn hss_tag(domain: &[u8], body: &[u8], i0: &[u8; 16], seed0: &[u8; N]) -> [u8; HSS_TAG_LEN] {
-    use crate::hash::{Hmac, Sha256};
-    let mut m = Hmac::<Sha256>::new(seed0);
-    m.update(domain);
-    m.update(i0);
-    m.update(body);
-    m.finalize()
-}
 
 #[cfg(feature = "alloc")]
 /// An HSS public (verification) key: `u32(L) || lms_public_key`.
@@ -928,7 +1194,9 @@ impl HssPrivateKey {
     /// level `i`'s parameter sets). This embeds the full state that MUST be
     /// persisted after each signature; loading it never derives a tree, so a
     /// key of any height loads instantly and only the first signature of a
-    /// level pays that level's cache build.
+    /// level pays that level's cache build (see the cost table on
+    /// [`LmsPrivateKey`]) — or none does, if the key is persisted with
+    /// [`to_bytes_with_cache`](Self::to_bytes_with_cache) instead.
     ///
     /// # The tag (and why it is not optional)
     ///
@@ -938,10 +1206,46 @@ impl HssPrivateKey {
     /// who can *write* the key file (but not read it) from rewinding a leaf
     /// index or substituting a level; see [`from_bytes`](Self::from_bytes).
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.serialize(false)
+    }
+
+    /// Serializes the private key like [`to_bytes`](Self::to_bytes) **plus
+    /// every level's Merkle node cache**, so that
+    /// [`from_bytes`](Self::from_bytes) restores a key whose next signature —
+    /// and next child-tree replacement — costs no tree derivation (see the
+    /// cost table on [`LmsPrivateKey`]). This is the form to persist after
+    /// each signature when the key is loaded per signature, as a CLI or a
+    /// short-lived job does.
+    ///
+    /// Layout (`v4`): `"HSS4" || u32(L) || level blocks || upper signatures`
+    /// exactly as in `v3`, then `for each level { u8(has_cache) || [cache] }`,
+    /// then the `tag(32)` over everything before it (keyed as in `v3`, under
+    /// a `v4` domain). Each `cache` is that level's full top tier plus, for
+    /// `H20`/`H25`, its current bottom subtree, so the file grows by 2 KiB
+    /// (`H5`), 64 KiB (`H10`) or 2 MiB (`H15` and above) per level.
+    ///
+    /// A level whose cache is not built (a key loaded from a cache-less form
+    /// whose level has not signed since) is written with `has_cache = 0` and
+    /// rebuilds lazily as the plain form does; call
+    /// [`warm_cache`](Self::warm_cache) first to make every level resident.
+    pub fn to_bytes_with_cache(&self) -> Vec<u8> {
+        self.serialize(true)
+    }
+
+    /// `v3` (`cached = false`) or `v4` (`cached = true`) serialization.
+    fn serialize(&self, cached: bool) -> Vec<u8> {
         let l = self.levels.len();
         let sigs: usize = self.signed_pubs.iter().map(Vec::len).sum();
-        let mut v = Vec::with_capacity(8 + l * HSS_LEVEL_LEN + sigs + HSS_TAG_LEN);
-        v.extend_from_slice(HSS_V3_MAGIC);
+        let caches: usize = if cached {
+            self.levels
+                .iter()
+                .map(|lv| 1 + lv.cache.as_ref().map_or(0, tree::NodeCache::encoded_len))
+                .sum()
+        } else {
+            0
+        };
+        let mut v = Vec::with_capacity(8 + l * HSS_LEVEL_LEN + sigs + caches + TAG_LEN);
+        v.extend_from_slice(if cached { HSS_V4_MAGIC } else { HSS_V3_MAGIC });
         v.extend_from_slice(&(l as u32).to_be_bytes());
         for lv in &self.levels {
             v.extend_from_slice(&lv.to_bytes_array());
@@ -949,10 +1253,50 @@ impl HssPrivateKey {
         for sig in &self.signed_pubs {
             v.extend_from_slice(sig);
         }
+        if cached {
+            for lv in &self.levels {
+                match &lv.cache {
+                    Some(cache) => {
+                        v.push(1);
+                        cache.encode_into(&mut v);
+                    }
+                    None => v.push(0),
+                }
+            }
+        }
         let top = &self.levels[0];
-        let tag = hss_tag(HSS_TAG_DOMAIN_V3, &v, &top.i_id, &top.seed);
+        let domain = if cached {
+            HSS_TAG_DOMAIN_V4
+        } else {
+            HSS_TAG_DOMAIN_V3
+        };
+        let tag = privkey_tag(domain, &v, &top.i_id, &top.seed);
         v.extend_from_slice(&tag);
         v
+    }
+
+    /// Builds every level's node cache now, if not already built, instead of
+    /// on each level's first use: for the bottom level that is the first
+    /// signature, for the levels above it their next child-tree replacement.
+    /// Costs one tree derivation per cold level (see the cost table on
+    /// [`LmsPrivateKey`]); a no-op for a key that was generated in this
+    /// process, loaded from the cached form, or already warmed.
+    ///
+    /// Refuses with [`Error::Tampered`], consuming nothing, if a level's
+    /// stored root is not the one its seed derives.
+    pub fn warm_cache(&mut self) -> Result<(), Error> {
+        for lv in &mut self.levels {
+            lv.warm_cache()?;
+        }
+        Ok(())
+    }
+
+    /// Whether every level's node cache is built, i.e. whether
+    /// [`to_bytes_with_cache`](Self::to_bytes_with_cache) will carry all of
+    /// them and no upcoming signature or child-tree replacement has a tree
+    /// derivation to pay first.
+    pub fn cache_is_warm(&self) -> bool {
+        self.levels.iter().all(LmsPrivateKey::cache_is_warm)
     }
 
     /// Parses a private key produced by [`to_bytes`](Self::to_bytes), resuming
@@ -990,6 +1334,13 @@ impl HssPrivateKey {
     /// `v3`, which loads instantly and is the only form that carries the
     /// cached upper-level signatures.
     ///
+    /// * **`v4`** (`"HSS4"` magic, [`to_bytes_with_cache`](Self::to_bytes_with_cache))
+    ///   — `v3` plus each level's node cache, loaded exactly like `v3` (tag
+    ///   first, then the upper signatures) with each present cache adopted
+    ///   after a cheap check that it hangs together and that its root is the
+    ///   level's stored root (else [`Error::Tampered`]). A level's cache that
+    ///   the file marks absent is rebuilt lazily, as after a `v3` load.
+    ///
     /// # Why the stored state must be authenticated
     ///
     /// The upper-level signatures and the child public keys they cover are
@@ -1012,8 +1363,13 @@ impl HssPrivateKey {
     /// genuinely wrote (its indices would replay used leaves); preventing that
     /// is the storage layer's job and inherent to every stateful scheme.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() >= 4 && &bytes[..4] == HSS_V3_MAGIC {
-            return Self::from_bytes_v3(bytes);
+        if bytes.len() >= 4 {
+            if &bytes[..4] == HSS_V3_MAGIC {
+                return Self::from_bytes_tagged(bytes, false);
+            }
+            if &bytes[..4] == HSS_V4_MAGIC {
+                return Self::from_bytes_tagged(bytes, true);
+            }
         }
         Self::from_bytes_legacy(bytes)
     }
@@ -1030,79 +1386,65 @@ impl HssPrivateKey {
         Ok(l)
     }
 
-    /// Parses one `(lms_type, ots_type, I, seed, q, root?)` level block,
-    /// validating the typecodes and `q <= 2^h`.
-    #[allow(clippy::type_complexity)]
-    fn parse_level(
-        block: &[u8],
-        has_root: bool,
-    ) -> Result<(LmsType, LmotsType, [u8; 16], [u8; N], u32, Option<[u8; N]>), Error> {
-        let lms_type =
-            LmsType::from_u32(u32::from_be_bytes([block[0], block[1], block[2], block[3]]))
-                .ok_or(Error::Malformed)?;
-        let ots_type =
-            LmotsType::from_u32(u32::from_be_bytes([block[4], block[5], block[6], block[7]]))
-                .ok_or(Error::Malformed)?;
-        let mut i_id = [0u8; 16];
-        i_id.copy_from_slice(&block[8..24]);
-        let mut seed = [0u8; N];
-        seed.copy_from_slice(&block[24..24 + N]);
-        let q = u32::from_be_bytes([block[24 + N], block[25 + N], block[26 + N], block[27 + N]]);
-        if q as u64 > lms_type.leaves() {
-            return Err(Error::Malformed);
-        }
-        let root = has_root.then(|| {
-            let mut r = [0u8; N];
-            r.copy_from_slice(&block[28 + N..28 + N + N]);
-            r
-        });
-        Ok((lms_type, ots_type, i_id, seed, q, root))
-    }
-
-    /// Verifies a serialized tag against the body it covers, keyed by the top
-    /// level's `(I, seed)` found at the given body offset.
-    fn check_tag(domain: &[u8], body: &[u8], tag: &[u8], top_block: usize) -> Result<(), Error> {
-        let mut i0 = [0u8; 16];
-        i0.copy_from_slice(&body[top_block + 8..top_block + 24]);
-        let mut seed0 = [0u8; N];
-        seed0.copy_from_slice(&body[top_block + 24..top_block + 24 + N]);
-        let want = hss_tag(domain, body, &i0, &seed0);
-        wipe(&mut seed0);
-        let ok: bool = want[..].ct_eq(tag).into();
-        if ok { Ok(()) } else { Err(Error::Tampered) }
-    }
-
-    /// The `v3` loader — see [`from_bytes`](Self::from_bytes).
-    fn from_bytes_v3(bytes: &[u8]) -> Result<Self, Error> {
+    /// The `v3` (`cached = false`) / `v4` (`cached = true`) loader — see
+    /// [`from_bytes`](Self::from_bytes).
+    fn from_bytes_tagged(bytes: &[u8], cached: bool) -> Result<Self, Error> {
         let l = Self::parse_level_count(&bytes[4..])?;
         let levels_end = 8 + l * HSS_LEVEL_LEN;
-        if bytes.len() < levels_end + HSS_TAG_LEN {
+        if bytes.len() < levels_end + TAG_LEN {
             return Err(Error::Malformed);
         }
-        // Parse the level blocks first: the signature lengths that follow
-        // depend on their parameter sets. Nothing here derives a tree.
+        // Parse the level blocks first: the signature and cache lengths that
+        // follow depend on their parameter sets. Nothing here derives a tree.
         let mut levels = Vec::with_capacity(l);
         for i in 0..l {
             let off = 8 + i * HSS_LEVEL_LEN;
             let (lms_type, ots_type, i_id, seed, q, root) =
-                Self::parse_level(&bytes[off..off + HSS_LEVEL_LEN], true)?;
+                LmsPrivateKey::parse_block(&bytes[off..off + HSS_LEVEL_LEN], true)?;
             levels.push(LmsPrivateKey {
                 lms_type,
                 ots_type,
                 i_id,
                 seed,
                 q,
-                root: root.expect("v3 blocks carry the root"),
+                root: root.expect("tagged blocks carry the root"),
                 cache: None,
             });
         }
         let sigs_len: usize = levels[..l - 1].iter().map(|lv| lv.signature_len()).sum();
-        if bytes.len() != levels_end + sigs_len + HSS_TAG_LEN {
+        let mut off = levels_end + sigs_len;
+        // Walk the `v4` cache sections to find where the tag starts, without
+        // decoding (allocating for) any of them until the tag has verified.
+        let mut cache_spans: Vec<Option<(usize, usize)>> = Vec::with_capacity(l);
+        if cached {
+            for lv in &levels {
+                let rest = bytes.get(off..).ok_or(Error::Malformed)?;
+                match rest.first() {
+                    Some(0) => {
+                        cache_spans.push(None);
+                        off += 1;
+                    }
+                    Some(1) => {
+                        let len = tree::cache_encoded_len(lv.lms_type.h(), &rest[1..])
+                            .ok_or(Error::Malformed)?;
+                        cache_spans.push(Some((off + 1, len)));
+                        off += 1 + len;
+                    }
+                    _ => return Err(Error::Malformed),
+                }
+            }
+        }
+        if bytes.len() != off + TAG_LEN {
             return Err(Error::Malformed);
         }
         // Authenticate the whole body before trusting any of it.
-        let body = &bytes[..bytes.len() - HSS_TAG_LEN];
-        Self::check_tag(HSS_TAG_DOMAIN_V3, body, &bytes[body.len()..], 8)?;
+        let body = &bytes[..off];
+        let domain = if cached {
+            HSS_TAG_DOMAIN_V4
+        } else {
+            HSS_TAG_DOMAIN_V3
+        };
+        check_tag(domain, body, &bytes[off..], 8)?;
 
         // The cached upper-level signatures must each verify under the level
         // that produced them, over the public key of the level below, and
@@ -1123,6 +1465,19 @@ impl HssPrivateKey {
             }
             signed_pubs.push(sig.to_vec());
         }
+
+        // Adopt each serialized cache: the tag vouches for its bytes, the
+        // decoder for its framing, and its root must be the stored one.
+        for (lv, span) in levels.iter_mut().zip(cache_spans) {
+            if let Some((at, len)) = span {
+                let cache = tree::NodeCache::decode(lv.lms_type, &bytes[at..at + len])?;
+                let same: bool = cache.root()[..].ct_eq(&lv.root[..]).into();
+                if !same {
+                    return Err(Error::Tampered);
+                }
+                lv.cache = Some(cache);
+            }
+        }
         Ok(HssPrivateKey {
             levels,
             signed_pubs,
@@ -1132,7 +1487,7 @@ impl HssPrivateKey {
     /// The `v2` / `v1` / legacy loader — see [`from_bytes`](Self::from_bytes).
     fn from_bytes_legacy(bytes: &[u8]) -> Result<Self, Error> {
         let l = Self::parse_level_count(bytes)?;
-        let (per, has_root, tagged) = if bytes.len() == 4 + l * HSS_LEVEL_LEN + HSS_TAG_LEN {
+        let (per, has_root, tagged) = if bytes.len() == 4 + l * HSS_LEVEL_LEN + TAG_LEN {
             (HSS_LEVEL_LEN, true, true)
         } else if bytes.len() == 4 + l * HSS_LEVEL_LEN {
             (HSS_LEVEL_LEN, true, false)
@@ -1141,15 +1496,15 @@ impl HssPrivateKey {
         } else {
             return Err(Error::Malformed);
         };
-        let body = &bytes[..bytes.len() - if tagged { HSS_TAG_LEN } else { 0 }];
+        let body = &bytes[..bytes.len() - if tagged { TAG_LEN } else { 0 }];
         if tagged {
-            Self::check_tag(HSS_TAG_DOMAIN_V2, body, &bytes[body.len()..], 4)?;
+            check_tag(HSS_TAG_DOMAIN_V2, body, &bytes[body.len()..], 4)?;
         }
         let mut levels = Vec::with_capacity(l);
         for level in 0..l {
             let off = 4 + level * per;
             let (lms_type, ots_type, i_id, seed, q, root) =
-                Self::parse_level(&body[off..off + per], has_root)?;
+                LmsPrivateKey::parse_block(&body[off..off + per], has_root)?;
             let is_bottom = level + 1 == l;
             // Pre-v3 formats never advanced a non-bottom level. A non-zero
             // index there can only come from a pre-mitigation key that has

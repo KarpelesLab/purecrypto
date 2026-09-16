@@ -106,8 +106,51 @@ pub(crate) fn encode_public_key(
 /// taller `H20` / `H25` sets only levels `0 ..= 15` are resident and the
 /// subtree of height `h - 15` that contains the current leaf is regenerated
 /// on demand. See [`NodeCache`] for the resulting memory bound.
-#[cfg(feature = "alloc")]
-const TOP_LEVELS: u32 = 15;
+pub(crate) const TOP_LEVELS: u32 = 15;
+
+/// The tallest bottom subtree (`h - T`) a *serialized* cache may declare:
+/// `H25` over a 15-level top tier. Together with [`TOP_LEVELS`] it bounds what
+/// [`cache_encoded_len`] lets a file make the loader allocate (about 2.1 MiB
+/// per tree) regardless of the `T` the file claims.
+const MAX_BOTTOM_LEVELS: u32 = 10;
+
+/// Parses the `u32(T)` that opens a serialized [`NodeCache`] section for a
+/// tree of height `h` and returns the section's total length, or `None` if
+/// `T` is absent or outside what this build accepts (`T <= min(h,
+/// TOP_LEVELS)` and `h - T <= MAX_BOTTOM_LEVELS`).
+///
+/// Lets a loader size and authenticate a whole key file *before* it decodes
+/// (and allocates) any cache, and lets an allocator-less build validate the
+/// framing of a cached file it will not keep the cache of. The layout is:
+///
+/// ```text
+/// u32(T) || top[1 .. 2^(T+1)]                       (2^(T+1) - 1 nodes of N)
+/// [ u32(sub_root) || bottom[1 .. 2^(B+1)] ]         only when h > T, B = h - T;
+///                                                   sub_root = 0: none built
+/// ```
+///
+/// Nodes are in node-number order (slot `0` of the heap layout is omitted);
+/// the bottom tier uses its local heap layout, as in [`NodeCache`].
+pub(crate) fn cache_encoded_len(h: u32, bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let t = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if t > h.min(TOP_LEVELS) || h - t > MAX_BOTTOM_LEVELS {
+        return None;
+    }
+    Some(cache_len_for(h, t))
+}
+
+/// The serialized length of a cache with top tier `T` for a tree of height
+/// `h` (see [`cache_encoded_len`]).
+fn cache_len_for(h: u32, t: u32) -> usize {
+    let mut n = 4 + ((1usize << (t + 1)) - 1) * N;
+    if h > t {
+        n += 4 + ((1usize << (h - t + 1)) - 1) * N;
+    }
+    n
+}
 
 /// A signer-side cache of Merkle nodes so that an authentication path costs
 /// `O(h)` array reads instead of a full `O(2^h)` re-derivation of the tree.
@@ -143,8 +186,11 @@ const TOP_LEVELS: u32 = 15;
 /// for `H20`, 1024 for `H25`.
 ///
 /// Cached nodes are public Merkle hashes (they are exactly what signatures
-/// carry), so the cache holds no secret material, is never serialized, and is
-/// rebuilt lazily from the seed after a key is loaded from bytes.
+/// carry), so the cache holds no secret material. A key's plain serialization
+/// leaves it out and the first signature after a load rebuilds it from the
+/// seed; the *cached* serialization ([`encode_into`](Self::encode_into),
+/// authenticated by the key file's tag) carries both tiers so a load costs
+/// nothing but the copy.
 #[cfg(feature = "alloc")]
 pub(crate) struct NodeCache {
     /// Tree height `h`.
@@ -168,8 +214,22 @@ impl NodeCache {
         i_id: &[u8; 16],
         seed: &[u8; N],
     ) -> Self {
+        Self::build_with_top_levels(lms, ots_type, i_id, seed, lms.h().min(TOP_LEVELS))
+    }
+
+    /// [`build`](Self::build) with an explicit top-tier depth
+    /// `top_levels <= h`. Production always passes `min(h, TOP_LEVELS)`;
+    /// tests use a shallower top tier to exercise the two-tier paths on a
+    /// tree small enough to derive in a debug build.
+    pub(crate) fn build_with_top_levels(
+        lms: LmsType,
+        ots_type: LmotsType,
+        i_id: &[u8; 16],
+        seed: &[u8; N],
+        top_levels: u32,
+    ) -> Self {
         let h = lms.h();
-        let top_levels = h.min(TOP_LEVELS);
+        debug_assert!(top_levels <= h);
         let top = build_subtree(lms, ots_type, i_id, seed, 1, h, top_levels);
         NodeCache {
             h,
@@ -182,6 +242,100 @@ impl NodeCache {
     /// The tree root `T[1]`.
     pub(crate) fn root(&self) -> [u8; N] {
         self.top[1]
+    }
+
+    /// Test hook: the node number of the built bottom subtree's root, if any.
+    #[cfg(test)]
+    pub(crate) fn bottom_root(&self) -> Option<u32> {
+        self.bottom.as_ref().map(|(r, _)| *r)
+    }
+
+    /// The length [`encode_into`](Self::encode_into) appends.
+    pub(crate) fn encoded_len(&self) -> usize {
+        cache_len_for(self.h, self.top_levels)
+    }
+
+    /// Appends the cache in the layout documented at [`cache_encoded_len`]:
+    /// the whole top tier and, for a two-tier cache, the bottom subtree if
+    /// one is built (`sub_root = 0` and zero-filled nodes otherwise, so the
+    /// length depends only on `(h, T)`).
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        out.reserve(self.encoded_len());
+        out.extend_from_slice(&self.top_levels.to_be_bytes());
+        for node in &self.top[1..] {
+            out.extend_from_slice(node);
+        }
+        if self.h > self.top_levels {
+            let b = self.h - self.top_levels;
+            match &self.bottom {
+                Some((sub_root, nodes)) => {
+                    out.extend_from_slice(&sub_root.to_be_bytes());
+                    for node in &nodes[1..] {
+                        out.extend_from_slice(node);
+                    }
+                }
+                None => {
+                    out.extend_from_slice(&0u32.to_be_bytes());
+                    out.resize(out.len() + ((1usize << (b + 1)) - 1) * N, 0);
+                }
+            }
+        }
+    }
+
+    /// Parses a section written by [`encode_into`](Self::encode_into) for a
+    /// tree of `lms`'s height. `bytes` must be exactly the section (its
+    /// length comes from [`cache_encoded_len`]).
+    ///
+    /// The caller has already authenticated the bytes (the key file's tag
+    /// covers them) and checks the returned root against the key's stored
+    /// root; this validates only what the tag cannot: the framing
+    /// ([`Error::Malformed`](super::Error::Malformed)) and that a bottom
+    /// subtree hangs off the top-tier node it claims to — its root must equal
+    /// that node ([`Error::Tampered`](super::Error::Tampered)), which pins
+    /// every bottom node to the top tier by collision resistance.
+    pub(crate) fn decode(lms: LmsType, bytes: &[u8]) -> Result<Self, super::Error> {
+        use super::Error;
+        let h = lms.h();
+        let len = cache_encoded_len(h, bytes).ok_or(Error::Malformed)?;
+        if bytes.len() != len {
+            return Err(Error::Malformed);
+        }
+        let top_levels = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let read_nodes = |at: usize, count: usize| -> Vec<[u8; N]> {
+            let mut v = alloc::vec![[0u8; N]; count + 1];
+            for (i, slot) in v[1..].iter_mut().enumerate() {
+                slot.copy_from_slice(&bytes[at + i * N..at + (i + 1) * N]);
+            }
+            v
+        };
+        let top_count = (1usize << (top_levels + 1)) - 1;
+        let top = read_nodes(4, top_count);
+        let mut bottom = None;
+        if h > top_levels {
+            let b = h - top_levels;
+            let at = 4 + top_count * N;
+            let sub_root =
+                u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+            if sub_root != 0 {
+                // `sub_root` must be a node at level `T` (its ancestor at
+                // level 0 is the root, node 1).
+                if sub_root >> top_levels != 1 {
+                    return Err(Error::Malformed);
+                }
+                let nodes = read_nodes(at + 4, (1usize << (b + 1)) - 1);
+                let linked: bool = nodes[1][..].ct_eq(&top[sub_root as usize][..]).into();
+                if !linked {
+                    return Err(Error::Tampered);
+                }
+                bottom = Some((sub_root, nodes));
+            }
+        }
+        Ok(NodeCache {
+            h,
+            top_levels,
+            top,
+            bottom,
+        })
     }
 
     /// Makes every node on leaf `q`'s authentication path available to
@@ -520,14 +674,7 @@ mod cache_tests {
         let i_id = [0x33u8; 16];
         let seed = [0x44u8; N];
         // Top tier holds levels 0..=7; bottom subtrees have height 3 (8 leaves).
-        let top_levels = 7;
-        let top = build_subtree(lms, ots, &i_id, &seed, 1, 10, top_levels);
-        let mut cache = NodeCache {
-            h: 10,
-            top_levels,
-            top,
-            bottom: None,
-        };
+        let mut cache = NodeCache::build_with_top_levels(lms, ots, &i_id, &seed, 7);
         assert_eq!(cache.root(), compute_root(lms, ots, &i_id, &seed));
         for q in [0u32, 7, 8, 9, 15, 16, 500, 511, 512, 1016, 1023, 3, 1023, 0] {
             cache.prepare(lms, ots, &i_id, &seed, q);
@@ -537,6 +684,69 @@ mod cache_tests {
             let (root, _) = cache.bottom.as_ref().unwrap();
             assert_eq!(*root, (1024 + q) >> 3, "bottom subtree root for {q}");
         }
+    }
+
+    /// The wire form round-trips both tiers exactly, its length is what the
+    /// probe predicts (with and without a built bottom subtree), and the
+    /// decoded cache serves the same paths as the original.
+    #[test]
+    fn encode_decode_roundtrip_both_tiers() {
+        let lms = LmsType::Sha256M32H10;
+        let ots = LmotsType::Sha256N32W1;
+        let i_id = [0x77u8; 16];
+        let seed = [0x88u8; N];
+        let mut cache = NodeCache::build_with_top_levels(lms, ots, &i_id, &seed, 7);
+
+        // No bottom subtree yet: `sub_root = 0`, zero-filled nodes.
+        let mut enc = Vec::new();
+        cache.encode_into(&mut enc);
+        assert_eq!(enc.len(), cache.encoded_len());
+        assert_eq!(cache_encoded_len(10, &enc), Some(enc.len()));
+        assert_eq!(enc.len(), 4 + 255 * N + 4 + 15 * N);
+        let dec = NodeCache::decode(lms, &enc).unwrap();
+        assert_eq!(dec.top, cache.top);
+        assert!(dec.bottom.is_none());
+
+        // With the subtree of leaf 500 built.
+        cache.prepare(lms, ots, &i_id, &seed, 500);
+        let mut enc = Vec::new();
+        cache.encode_into(&mut enc);
+        assert_eq!(enc.len(), cache.encoded_len());
+        let dec = NodeCache::decode(lms, &enc).unwrap();
+        assert_eq!(dec.top, cache.top);
+        assert_eq!(dec.bottom, cache.bottom);
+        for q in [496u32, 500, 503] {
+            let a = path(10, q, |n| dec.node(n));
+            let b = path(10, q, |n| node_value(lms, ots, &i_id, &seed, n));
+            assert_eq!(a, b, "leaf {q}");
+        }
+
+        // Framing errors: a wrong length, a `T` this build cannot hold, a
+        // `sub_root` that is not a level-`T` node.
+        assert_eq!(
+            NodeCache::decode(lms, &enc[..enc.len() - 1]).err(),
+            Some(super::super::Error::Malformed)
+        );
+        let mut bad = enc.clone();
+        bad[3] = 11;
+        assert_eq!(cache_encoded_len(10, &bad), None);
+        assert_eq!(
+            NodeCache::decode(lms, &bad).err(),
+            Some(super::super::Error::Malformed)
+        );
+        let mut bad = enc.clone();
+        bad[4 + 255 * N..4 + 255 * N + 4].copy_from_slice(&1u32.to_be_bytes());
+        assert_eq!(
+            NodeCache::decode(lms, &bad).err(),
+            Some(super::super::Error::Malformed)
+        );
+        // A bottom subtree whose root is not the top-tier node it claims.
+        let mut bad = enc.clone();
+        bad[4 + 255 * N + 4] ^= 0x01;
+        assert_eq!(
+            NodeCache::decode(lms, &bad).err(),
+            Some(super::super::Error::Tampered)
+        );
     }
 
     /// `build_subtree` with `keep < depth` stores exactly the top levels, and

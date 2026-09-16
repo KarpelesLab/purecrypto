@@ -631,7 +631,7 @@ fn v2_bytes(sk: &HssPrivateKey) -> Vec<u8> {
     i0.copy_from_slice(&v[12..28]);
     let mut seed0 = [0u8; N];
     seed0.copy_from_slice(&v[28..28 + N]);
-    let tag = hss_tag(HSS_TAG_DOMAIN_V2, &v, &i0, &seed0);
+    let tag = privkey_tag(HSS_TAG_DOMAIN_V2, &v, &i0, &seed0);
     v.extend_from_slice(&tag);
     v
 }
@@ -650,12 +650,12 @@ fn legacy_bytes(sk: &HssPrivateKey) -> Vec<u8> {
 /// can reach the checks behind the tag.
 fn retag_v3(bytes: &mut [u8]) {
     let n = bytes.len();
-    let (body, tag) = bytes.split_at_mut(n - HSS_TAG_LEN);
+    let (body, tag) = bytes.split_at_mut(n - TAG_LEN);
     let mut i0 = [0u8; 16];
     i0.copy_from_slice(&body[16..32]);
     let mut seed0 = [0u8; N];
     seed0.copy_from_slice(&body[32..32 + N]);
-    tag.copy_from_slice(&hss_tag(HSS_TAG_DOMAIN_V3, body, &i0, &seed0));
+    tag.copy_from_slice(&privkey_tag(HSS_TAG_DOMAIN_V3, body, &i0, &seed0));
 }
 
 /// `v3` round-trips: stored per-level state reproduces the public key, the
@@ -681,7 +681,7 @@ fn hss_v3_roundtrip() {
         bytes.len(),
         8 + 2 * HSS_LEVEL_LEN
             + signature_len(LmsType::Sha256M32H10, LmotsType::Sha256N32W4)
-            + HSS_TAG_LEN,
+            + TAG_LEN,
         "v3 = magic || L || level blocks || cached upper signature || tag"
     );
     let mut reloaded = HssPrivateKey::from_bytes(&bytes).unwrap();
@@ -747,7 +747,7 @@ fn hss_from_bytes_rejects_tampered_child_level() {
     .unwrap();
     let good = sk.to_bytes();
     let sig0_len = signature_len(LmsType::Sha256M32H5, LmotsType::Sha256N32W8);
-    assert_eq!(good.len(), 8 + 2 * HSS_LEVEL_LEN + sig0_len + HSS_TAG_LEN);
+    assert_eq!(good.len(), 8 + 2 * HSS_LEVEL_LEN + sig0_len + TAG_LEN);
     assert!(HssPrivateKey::from_bytes(&good).is_ok());
 
     // (a) v3: every byte is authenticated.
@@ -1284,4 +1284,483 @@ fn lms_all_ots_widths_roundtrip() {
         bad[4 + 4 + N + 5] ^= 1;
         assert!(!pk.verify(b"width", &bad), "{ots:?}");
     }
+}
+
+// ===================================================================
+// Cached serializations (LMS `LMC1`, HSS `v4`) and `warm_cache`
+// ===================================================================
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use crate::hash::Digest;
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize()
+}
+
+/// The RFC 8554 Test Case 2 key material: `((I, seed) top, (I, seed) bottom)`.
+fn tc2_seeds() -> ([u8; 16], [u8; N], [u8; 16], [u8; N]) {
+    let k = kat();
+    let pf = &k["tc2_priv"];
+    let mut ti = [0u8; 16];
+    ti.copy_from_slice(&pf[1]);
+    let mut ts = [0u8; N];
+    ts.copy_from_slice(&pf[0]);
+    let mut li = [0u8; 16];
+    li.copy_from_slice(&pf[3]);
+    let mut ls = [0u8; N];
+    ls.copy_from_slice(&pf[2]);
+    (ti, ts, li, ls)
+}
+
+/// An `H10/W1` key whose cache has a 7-level top tier, so that bottom
+/// subtrees (8 leaves each) exist on a tree small enough for a debug build —
+/// the shape production only reaches with `H20`/`H25`.
+fn two_tier_lms(i_id: &[u8; 16], seed: &[u8; N]) -> LmsPrivateKey {
+    let (lms, ots) = (LmsType::Sha256M32H10, LmotsType::Sha256N32W1);
+    let cache = tree::NodeCache::build_with_top_levels(lms, ots, i_id, seed, 7);
+    LmsPrivateKey {
+        lms_type: lms,
+        ots_type: ots,
+        i_id: *i_id,
+        seed: *seed,
+        q: 0,
+        root: cache.root(),
+        cache: Some(cache),
+    }
+}
+
+/// Length of the cache section of a two-tier `H10` cache with `T = 7`.
+const TWO_TIER_H10_CACHE_LEN: usize = 4 + 255 * N + 4 + 15 * N;
+
+/// Recomputes the tag of a (possibly edited) cached LMS serialization.
+fn retag_lmc(bytes: &mut [u8]) {
+    let n = bytes.len();
+    let (body, tag) = bytes.split_at_mut(n - TAG_LEN);
+    let mut i = [0u8; 16];
+    i.copy_from_slice(&body[12..28]);
+    let mut seed = [0u8; N];
+    seed.copy_from_slice(&body[28..28 + N]);
+    tag.copy_from_slice(&privkey_tag(LMS_CACHED_TAG_DOMAIN, body, &i, &seed));
+}
+
+/// Recomputes the tag of a (possibly edited) `v4` HSS serialization.
+fn retag_v4(bytes: &mut [u8]) {
+    let n = bytes.len();
+    let (body, tag) = bytes.split_at_mut(n - TAG_LEN);
+    let mut i0 = [0u8; 16];
+    i0.copy_from_slice(&body[16..32]);
+    let mut seed0 = [0u8; N];
+    seed0.copy_from_slice(&body[32..32 + N]);
+    tag.copy_from_slice(&privkey_tag(HSS_TAG_DOMAIN_V4, body, &i0, &seed0));
+}
+
+/// The plain serializations are byte-for-byte what the previous release
+/// wrote (goldens taken before the cached forms existed), and a trip through
+/// the cached form does not change them.
+#[test]
+fn plain_serializations_are_unchanged_goldens() {
+    let (ti, ts, li, ls) = tc2_seeds();
+    let hss = HssPrivateKey::from_levels(&[
+        (LmsType::Sha256M32H10, LmotsType::Sha256N32W4, ti, ts),
+        (LmsType::Sha256M32H5, LmotsType::Sha256N32W8, li, ls),
+    ])
+    .unwrap();
+    let v3 = hss.to_bytes();
+    assert_eq!(v3.len(), 2732);
+    assert_eq!(
+        sha256(&v3),
+        unhex("ac37e06723adf0a0740a77c7c2e8acfa141fe31ba48baa4c4840227781aa19ef")[..],
+        "HSS v3 golden"
+    );
+    let reloaded = HssPrivateKey::from_bytes(&hss.to_bytes_with_cache()).unwrap();
+    assert!(reloaded.cache_is_warm());
+    assert_eq!(reloaded.to_bytes(), v3);
+
+    let lms = LmsPrivateKey::from_seed(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &li, &ls);
+    let plain = lms.to_bytes();
+    assert_eq!(plain.len(), PRIVKEY_LEN);
+    assert_eq!(
+        sha256(&plain),
+        unhex("91982e43f50364845158d32911a1425b60b7e86a458d4aa19d907fe9ae2de4f6")[..],
+        "LMS plain golden"
+    );
+    let reloaded = LmsPrivateKey::from_bytes(&lms.to_bytes_with_cache()).unwrap();
+    assert!(reloaded.cache_is_warm());
+    assert_eq!(reloaded.to_bytes(), plain);
+    assert_eq!(reloaded.to_bytes_array()[..], plain[..]);
+}
+
+/// The cached LMS form round-trips both tiers and, re-persisted after every
+/// signature as a CLI does, signs byte-identically to a key that rebuilt its
+/// cache from the seed — across bottom-subtree boundaries in both.
+#[test]
+fn lms_cached_form_roundtrip_signs_identically_across_subtree_boundaries() {
+    let mut sk = two_tier_lms(&[0xa1u8; 16], &[0xb2u8; N]);
+    let pk = sk.public_key();
+    // The twin rebuilds a full-tree cache lazily from the plain form.
+    let mut cold = LmsPrivateKey::from_bytes(&sk.to_bytes()).unwrap();
+    assert!(!cold.cache_is_warm());
+    for i in 0..3u8 {
+        let c = [i; N];
+        assert_eq!(
+            sk.sign_with_c(b"m", &c).unwrap(),
+            cold.sign_with_c(b"m", &c).unwrap()
+        );
+    }
+    assert!(cold.cache_is_warm());
+
+    let bytes = sk.to_bytes_with_cache();
+    assert_eq!(&bytes[..4], b"LMC1");
+    assert_eq!(&bytes[4..4 + PRIVKEY_LEN], &sk.to_bytes_array()[..]);
+    assert_eq!(bytes[4 + PRIVKEY_LEN], 1);
+    assert_eq!(
+        bytes.len(),
+        4 + PRIVKEY_LEN + 1 + TWO_TIER_H10_CACHE_LEN + TAG_LEN
+    );
+    let mut warm = LmsPrivateKey::from_bytes(&bytes).unwrap();
+    assert!(warm.cache_is_warm());
+    assert_eq!(warm.remaining(), sk.remaining());
+    assert_eq!(warm.public_key(), pk);
+    // The bottom subtree of the last-signed leaf (2) came along.
+    assert_eq!(
+        warm.cache.as_ref().unwrap().bottom_root(),
+        Some((1024 + 2) >> 3)
+    );
+    assert_eq!(
+        warm.to_bytes_with_cache(),
+        bytes,
+        "cached form is canonical"
+    );
+
+    // Leaves 3 ..= 20 cross the 8-leaf subtree boundaries at 8 and 16.
+    for i in 3..21u32 {
+        let c = [i as u8; N];
+        let a = warm.sign_with_c(b"m", &c).unwrap();
+        let b = cold.sign_with_c(b"m", &c).unwrap();
+        assert_eq!(a, b, "leaf {i}");
+        assert_eq!(u32::from_be_bytes(a[..4].try_into().unwrap()), i);
+        assert!(pk.verify(b"m", &a));
+        warm = LmsPrivateKey::from_bytes(&warm.to_bytes_with_cache()).unwrap();
+        assert!(warm.cache_is_warm(), "leaf {i}");
+        assert_eq!(
+            warm.cache.as_ref().unwrap().bottom_root(),
+            Some((1024 + i) >> 3),
+            "leaf {i}"
+        );
+    }
+    assert_eq!(warm.remaining(), cold.remaining());
+    assert_eq!(warm.to_bytes(), cold.to_bytes());
+
+    // A key whose cache is not built is written without one, and loads as
+    // the plain form would.
+    let plain = LmsPrivateKey::from_bytes(&cold.to_bytes()).unwrap();
+    assert!(!plain.cache_is_warm());
+    let no_cache = plain.to_bytes_with_cache();
+    assert_eq!(no_cache.len(), 4 + PRIVKEY_LEN + 1 + TAG_LEN);
+    assert_eq!(no_cache[4 + PRIVKEY_LEN], 0);
+    let reloaded = LmsPrivateKey::from_bytes(&no_cache).unwrap();
+    assert!(!reloaded.cache_is_warm());
+    assert_eq!(reloaded.to_bytes(), cold.to_bytes());
+}
+
+/// Every byte of a cached LMS file is under the tag; what the tag cannot
+/// vouch for (a writer who holds the seed) is caught by the structural
+/// checks: the cached root must be the stored root, the bottom subtree must
+/// hang off the top tier, and the framing must be one this build accepts.
+#[test]
+fn lms_cached_form_rejects_tampering() {
+    let mut sk = two_tier_lms(&[0xc3u8; 16], &[0xd4u8; N]);
+    for i in 0..5u8 {
+        sk.sign_with_c(b"m", &[i; N]).unwrap();
+    }
+    let good = sk.to_bytes_with_cache();
+    assert!(LmsPrivateKey::from_bytes(&good).is_ok());
+    let n = good.len();
+    const HEAD: usize = 4 + PRIVKEY_LEN + 1;
+    let top_nodes = HEAD + 4;
+    let bottom = top_nodes + 255 * N;
+
+    // Any flipped byte fails the tag: a top-tier node, the bottom root id, a
+    // bottom node, the flag, the leaf index, the tag itself.
+    for off in [
+        top_nodes + 5,
+        top_nodes + 200 * N + 3,
+        bottom + 1,
+        bottom + 4 + 9 * N,
+        HEAD - 1,
+        4 + 24 + N + 3,
+        n - 1,
+        n - TAG_LEN,
+    ] {
+        let mut bad = good.clone();
+        bad[off] ^= 0x01;
+        assert_eq!(
+            LmsPrivateKey::from_bytes(&bad).err(),
+            Some(Error::Tampered),
+            "offset {off}"
+        );
+    }
+    // Length changes fail too (a shortened body hashes differently, a longer
+    // one moves the tag).
+    assert!(LmsPrivateKey::from_bytes(&good[..n - 1]).is_err());
+    let mut longer = good.clone();
+    longer.push(0);
+    assert!(LmsPrivateKey::from_bytes(&longer).is_err());
+    assert_eq!(
+        LmsPrivateKey::from_bytes(&good[..HEAD + TAG_LEN - 1]).err(),
+        Some(Error::Malformed)
+    );
+
+    // Retagged edits — beyond the threat model, but still refused.
+    let stored_root = 4 + 28 + N;
+    let mut t = good.clone();
+    t[stored_root + 7] ^= 0x01;
+    retag_lmc(&mut t);
+    assert_eq!(
+        LmsPrivateKey::from_bytes(&t).err(),
+        Some(Error::Tampered),
+        "stored root disagrees with the cached root"
+    );
+    let mut t = good.clone();
+    t[top_nodes + 7] ^= 0x01; // cached root, node 1
+    retag_lmc(&mut t);
+    assert_eq!(
+        LmsPrivateKey::from_bytes(&t).err(),
+        Some(Error::Tampered),
+        "cached root disagrees with the stored root"
+    );
+    let mut t = good.clone();
+    t[bottom + 4 + 7] ^= 0x01; // bottom subtree root, local node 1
+    retag_lmc(&mut t);
+    assert_eq!(
+        LmsPrivateKey::from_bytes(&t).err(),
+        Some(Error::Tampered),
+        "bottom subtree not linked to the top tier"
+    );
+    let mut t = good.clone();
+    t[HEAD + 3] = 11; // T = 11: taller top tier than the tree
+    retag_lmc(&mut t);
+    assert_eq!(LmsPrivateKey::from_bytes(&t).err(), Some(Error::Malformed));
+    let mut t = good.clone();
+    t[HEAD - 1] = 2;
+    retag_lmc(&mut t);
+    assert_eq!(LmsPrivateKey::from_bytes(&t).err(), Some(Error::Malformed));
+    let mut t = good.clone();
+    t[HEAD - 1] = 0; // "no cache" but cache bytes follow
+    retag_lmc(&mut t);
+    assert_eq!(LmsPrivateKey::from_bytes(&t).err(), Some(Error::Malformed));
+
+    // The tampered stored root is also caught by a cache-less load, at the
+    // first signature, with no leaf burnt (the pre-existing check).
+    let mut plain = sk.to_bytes();
+    plain[28 + N + 7] ^= 0x01;
+    let mut bad = LmsPrivateKey::from_bytes(&plain).unwrap();
+    assert_eq!(bad.warm_cache(), Err(Error::Tampered));
+    assert_eq!(bad.remaining(), sk.remaining());
+}
+
+/// `warm_cache` builds the cache once, is idempotent, refuses a corrupted
+/// root without consuming a leaf, and copes with an exhausted key.
+#[test]
+fn lms_warm_cache() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"lms-warm", b"n", &[]);
+    let sk = LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &mut rng);
+    assert!(sk.cache_is_warm(), "generation builds the cache");
+    let pk = sk.public_key();
+    let bytes = sk.to_bytes();
+
+    let mut cold = LmsPrivateKey::from_bytes(&bytes).unwrap();
+    assert!(!cold.cache_is_warm());
+    assert_eq!(cold.to_bytes_with_cache()[4 + PRIVKEY_LEN], 0);
+    cold.warm_cache().unwrap();
+    assert!(cold.cache_is_warm());
+    cold.warm_cache().unwrap();
+    assert_eq!(cold.remaining(), 32, "warming consumes nothing");
+    let cached = cold.to_bytes_with_cache();
+    assert_eq!(cached[4 + PRIVKEY_LEN], 1);
+    assert_eq!(cached.len(), 4 + PRIVKEY_LEN + 1 + 4 + 63 * N + TAG_LEN);
+    let s = cold.sign(&mut rng, b"m").unwrap();
+    assert!(pk.verify(b"m", &s));
+    assert_eq!(
+        LmsPrivateKey::from_bytes(&cached).unwrap().to_bytes(),
+        bytes,
+        "the cached form written before signing carries the pre-signature state"
+    );
+
+    // Corrupted root: refused, nothing built, nothing consumed.
+    let mut corrupt = bytes.clone();
+    corrupt[28 + N + 3] ^= 0x40;
+    let mut bad = LmsPrivateKey::from_bytes(&corrupt).unwrap();
+    assert_eq!(bad.warm_cache(), Err(Error::Tampered));
+    assert!(!bad.cache_is_warm());
+    assert_eq!(bad.remaining(), 32);
+
+    // Exhausted key: the top tier still builds (so the cached form carries
+    // it), and signing still reports exhaustion.
+    let mut exhausted = bytes.clone();
+    exhausted[24 + N..28 + N].copy_from_slice(&32u32.to_be_bytes());
+    let mut ex = LmsPrivateKey::from_bytes(&exhausted).unwrap();
+    ex.warm_cache().unwrap();
+    assert!(ex.cache_is_warm());
+    assert_eq!(ex.sign(&mut rng, b"m"), Err(Error::Exhausted));
+    let ex = LmsPrivateKey::from_bytes(&ex.to_bytes_with_cache()).unwrap();
+    assert!(ex.cache_is_warm());
+    assert_eq!(ex.remaining(), 0);
+}
+
+/// `v4` round-trips every level's cache, keeps `to_bytes` (`v3`) identical,
+/// and — re-persisted after each signature — signs byte-identically to a
+/// `v3`-loaded key through a bottom-tree exhaustion and replacement.
+#[test]
+fn hss_v4_roundtrip_signs_identically_through_tree_replacement() {
+    let (mut sk, _) = small_hss(b"hss-v4");
+    let pk = sk.public_key();
+    for i in 0..3u8 {
+        sk.sign_with_c(b"m", &[i; N]).unwrap();
+    }
+    let v3 = sk.to_bytes();
+    let v4 = sk.to_bytes_with_cache();
+    assert_eq!(&v4[..4], b"HSS4");
+    assert_eq!(&v4[4..v3.len() - TAG_LEN], &v3[4..v3.len() - TAG_LEN]);
+    assert_eq!(v4.len(), v3.len() + 2 * (1 + 4 + 63 * N));
+
+    let mut warm = HssPrivateKey::from_bytes(&v4).unwrap();
+    assert!(warm.cache_is_warm());
+    assert_eq!(warm.public_key(), pk);
+    assert_eq!(warm.remaining(), sk.remaining());
+    assert_eq!(warm.to_bytes(), v3, "v3 is unaffected by the cache");
+    assert_eq!(warm.to_bytes_with_cache(), v4, "v4 is canonical");
+
+    let mut cold = HssPrivateKey::from_bytes(&v3).unwrap();
+    assert!(!cold.cache_is_warm());
+
+    // 3 used of 32 bottom leaves: 40 more signatures exhaust the bottom tree
+    // and continue in its replacement (signed by the top level's leaf 1).
+    for i in 0..40u8 {
+        let c = [i; N];
+        let a = warm.sign_with_c(b"m", &c).unwrap();
+        let b = cold.sign_with_c(b"m", &c).unwrap();
+        assert_eq!(a, b, "signature {i}");
+        assert!(pk.verify(b"m", &a));
+        warm = HssPrivateKey::from_bytes(&warm.to_bytes_with_cache()).unwrap();
+        assert!(warm.cache_is_warm(), "signature {i}");
+    }
+    let a = warm.sign_with_c(b"m", &[0xff; N]).unwrap();
+    assert_eq!(a, cold.sign_with_c(b"m", &[0xff; N]).unwrap());
+    assert_eq!(
+        two_level_leaves(&a).0,
+        1,
+        "signing continues in the replacement tree"
+    );
+    assert_eq!(warm.to_bytes(), cold.to_bytes());
+
+    // Older formats still load, cache-less (`sk` is still on its initial
+    // trees, which is what those formats could express).
+    for bytes in [v1_bytes(&sk), v2_bytes(&sk), legacy_bytes(&sk)] {
+        let loaded = HssPrivateKey::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.public_key(), pk);
+    }
+}
+
+/// A `v4` file carries whichever caches are built: none after a `v3` load,
+/// only the bottom level's after one signature, all after `warm_cache`.
+#[test]
+fn hss_v4_carries_partial_caches_and_warm_cache_completes_them() {
+    let (sk, mut rng) = small_hss(b"hss-v4-partial");
+    let per_cache = 1 + 4 + 63 * N;
+    let base = sk.to_bytes().len();
+
+    let mut cold = HssPrivateKey::from_bytes(&sk.to_bytes()).unwrap();
+    assert!(!cold.cache_is_warm());
+    let none = cold.to_bytes_with_cache();
+    assert_eq!(none.len(), base + 2);
+    let loaded = HssPrivateKey::from_bytes(&none).unwrap();
+    assert!(!loaded.levels[0].cache_is_warm());
+    assert!(!loaded.levels[1].cache_is_warm());
+
+    cold.sign(&mut rng, b"m").unwrap();
+    assert!(!cold.levels[0].cache_is_warm());
+    assert!(cold.levels[1].cache_is_warm());
+    let bottom_only = cold.to_bytes_with_cache();
+    assert_eq!(bottom_only.len(), base + 1 + per_cache);
+    let mut loaded = HssPrivateKey::from_bytes(&bottom_only).unwrap();
+    assert!(!loaded.levels[0].cache_is_warm());
+    assert!(loaded.levels[1].cache_is_warm());
+    assert!(!loaded.cache_is_warm());
+
+    loaded.warm_cache().unwrap();
+    assert!(loaded.cache_is_warm());
+    assert_eq!(loaded.remaining(), cold.remaining());
+    let all = loaded.to_bytes_with_cache();
+    assert_eq!(all.len(), base + 2 * per_cache);
+    assert!(HssPrivateKey::from_bytes(&all).unwrap().cache_is_warm());
+    assert_eq!(loaded.to_bytes(), cold.to_bytes());
+}
+
+/// The `v4` tag covers the cache sections; a root that disagrees with a
+/// level's cache is refused even with a valid tag; framing errors are
+/// malformed.
+#[test]
+fn hss_v4_rejects_tampering() {
+    let (mut sk, mut rng) = small_hss(b"hss-v4-tamper");
+    sk.sign(&mut rng, b"m").unwrap();
+    let good = sk.to_bytes_with_cache();
+    assert!(HssPrivateKey::from_bytes(&good).is_ok());
+    let n = good.len();
+    let caches = sk.to_bytes().len() - TAG_LEN;
+    let per_cache = 1 + 4 + 63 * N;
+
+    for off in [
+        caches + 5,                 // level 0 root node
+        caches + 5 + 40 * N + 3,    // a level 0 node
+        caches + per_cache + 5 + 7, // level 1 root node
+        n - 1,                      // tag
+    ] {
+        let mut bad = good.clone();
+        bad[off] ^= 0x01;
+        assert_eq!(
+            HssPrivateKey::from_bytes(&bad).err(),
+            Some(Error::Tampered),
+            "offset {off}"
+        );
+    }
+    // A flipped flag changes the framing, which is checked before the tag.
+    let mut bad = good.clone();
+    bad[caches] ^= 0x01;
+    assert_eq!(
+        HssPrivateKey::from_bytes(&bad).err(),
+        Some(Error::Malformed)
+    );
+    assert!(HssPrivateKey::from_bytes(&good[..n - 1]).is_err());
+    assert!(HssPrivateKey::from_bytes(&good[..caches]).is_err());
+
+    // Retagged: level 1's stored root edited (its cache no longer matches).
+    // The upper signature over level 1's public key fails first — either way
+    // the file is refused as tampered.
+    let mut t = good.clone();
+    t[8 + HSS_LEVEL_LEN + 28 + N] ^= 0x01;
+    retag_v4(&mut t);
+    assert_eq!(HssPrivateKey::from_bytes(&t).err(), Some(Error::Tampered));
+    // Retagged: level 0's cached root edited (the stored root and the upper
+    // signature are untouched, so only the root-versus-cache check catches it).
+    let mut t = good.clone();
+    t[caches + 5 + 3] ^= 0x01;
+    retag_v4(&mut t);
+    assert_eq!(HssPrivateKey::from_bytes(&t).err(), Some(Error::Tampered));
+    // Retagged: an unknown flag value, and a `T` the tree cannot have.
+    let mut t = good.clone();
+    t[caches] = 2;
+    retag_v4(&mut t);
+    assert_eq!(HssPrivateKey::from_bytes(&t).err(), Some(Error::Malformed));
+    let mut t = good.clone();
+    t[caches + 4] = 6;
+    retag_v4(&mut t);
+    assert_eq!(HssPrivateKey::from_bytes(&t).err(), Some(Error::Malformed));
+    // A `v4` body under a `v3` magic (or vice versa) never verifies.
+    let mut t = good.clone();
+    t[..4].copy_from_slice(b"HSS3");
+    assert!(HssPrivateKey::from_bytes(&t).is_err());
+    let mut t = sk.to_bytes();
+    t[..4].copy_from_slice(b"HSS4");
+    assert!(HssPrivateKey::from_bytes(&t).is_err());
 }
