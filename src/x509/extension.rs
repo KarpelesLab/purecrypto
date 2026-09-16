@@ -9,7 +9,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::oid;
+use super::{DistinguishedName, oid};
 use crate::der::{
     Reader, encode_boolean, encode_context, encode_integer, encode_octet_string, encode_sequence,
     encode_tlv, oid_tlv, tag,
@@ -58,6 +58,10 @@ pub enum GeneralName {
     Email(String),
     /// `uniformResourceIdentifier` (`[6] IA5String`).
     Uri(String),
+    /// `directoryName` (`[4] Name`): an X.500 distinguished name. In a
+    /// `nameConstraints` subtree it matches every name it is an RDN-prefix
+    /// of (RFC 5280 §4.2.1.10).
+    DirectoryName(DistinguishedName),
 }
 
 impl GeneralName {
@@ -69,6 +73,9 @@ impl GeneralName {
             GeneralName::Email(s) => encode_tlv(0x81, s.as_bytes()),
             // [2] IMPLICIT IA5String → primitive context tag 0x82.
             GeneralName::Dns(s) => encode_tlv(0x82, s.as_bytes()),
+            // [4] EXPLICIT Name → constructed context tag 0xA4 wrapping the
+            // Name SEQUENCE (EXPLICIT because Name is a CHOICE).
+            GeneralName::DirectoryName(dn) => encode_tlv(0xA4, &dn.to_der()),
             // [6] IMPLICIT IA5String → primitive context tag 0x86.
             GeneralName::Uri(s) => encode_tlv(0x86, s.as_bytes()),
             // [7] IMPLICIT OCTET STRING → primitive context tag 0x87.
@@ -591,6 +598,24 @@ mod tests {
         assert_eq!(ext.value[2], 0x80);
         assert_eq!(ext.value[3], 0x14);
         assert_eq!(&ext.value[4..], &ski);
+    }
+
+    #[test]
+    fn general_name_directory_name_is_explicit_context_4() {
+        let dn = DistinguishedName::common_name("x").with_organization("Corp");
+        let der = GeneralName::DirectoryName(dn.clone()).to_der();
+        assert_eq!(der[0], 0xA4);
+        assert_eq!(&der[2..], dn.to_der().as_slice());
+        // In a SAN it sits alongside the other forms unchanged.
+        let ext = subject_alt_name(&[
+            GeneralName::Dns("h.example".into()),
+            GeneralName::DirectoryName(dn),
+        ]);
+        let mut r = Reader::new(&ext.value);
+        let mut seq = r.read_sequence().unwrap();
+        assert_eq!(seq.read_any().unwrap().0, 0x82);
+        assert_eq!(seq.read_any().unwrap().0, 0xA4);
+        assert!(seq.is_empty());
     }
 
     #[test]

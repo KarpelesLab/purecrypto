@@ -840,6 +840,91 @@ impl Certificate {
         Ok(out)
     }
 
+    /// The rfc822Name entries of the `subjectAltName` extension (RFC 5280
+    /// §4.2.1.6), verbatim, or an empty list if the certificate has no such
+    /// extension. Each entry must be non-empty printable ASCII (an IA5String
+    /// with no control characters), else the certificate is `Malformed`.
+    pub fn subject_alt_emails(&self) -> Result<Vec<String>, Error> {
+        let mut out = Vec::new();
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::SUBJECT_ALT_NAME {
+                walk_general_names(value, |t, v| {
+                    if t == 0x81 {
+                        out.push(String::from(ia5_san_name(v)?));
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// The uniformResourceIdentifier entries of the `subjectAltName`
+    /// extension, verbatim, or an empty list if the certificate has no such
+    /// extension. Each entry must be non-empty printable ASCII, else the
+    /// certificate is `Malformed`.
+    pub fn subject_alt_uris(&self) -> Result<Vec<String>, Error> {
+        let mut out = Vec::new();
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::SUBJECT_ALT_NAME {
+                walk_general_names(value, |t, v| {
+                    if t == 0x86 {
+                        out.push(String::from(ia5_san_name(v)?));
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// The directoryName entries of the `subjectAltName` extension as raw
+    /// DER `Name` TLVs, or an empty list if the certificate has no such
+    /// extension. Each entry must decode as an `RDNSequence`, else the
+    /// certificate is `Malformed`.
+    pub fn subject_alt_directory_names(&self) -> Result<Vec<Vec<u8>>, Error> {
+        let mut out = Vec::new();
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::SUBJECT_ALT_NAME {
+                walk_general_names(value, |t, v| {
+                    if t == 0xA4 {
+                        out.push(directory_name_tlv(v)?.to_vec());
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Bitmask of the `GeneralName` CHOICE alternatives present in the
+    /// `subjectAltName` extension: bit `n` is set when at least one `[n]`
+    /// entry exists (`otherName` is bit 0, `rfc822Name` bit 1, … ,
+    /// `registeredID` bit 8). Zero when there is no such extension. Used by
+    /// the chain validator to tell whether a name-constraint form it cannot
+    /// evaluate would actually apply to this certificate.
+    // Consumed only by the `tls`-gated path validator (`tls::pki`).
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub(crate) fn subject_alt_name_forms(&self) -> Result<u16, Error> {
+        let mut forms = 0u16;
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::SUBJECT_ALT_NAME {
+                walk_general_names(value, |t, _| {
+                    let choice = t & 0x1f;
+                    if choice <= 8 {
+                        forms |= 1 << choice;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        Ok(forms)
+    }
+
     /// Returns `(is_ca, path_len_constraint)` from the `basicConstraints`
     /// extension, or `None` if the certificate has none. `path_len_constraint`
     /// is `None` when omitted (i.e. unlimited).
@@ -898,11 +983,11 @@ impl Certificate {
     }
 
     /// Returns the parsed `nameConstraints` extension (RFC 5280 §4.2.1.10),
-    /// or `None` if the certificate has none. Only the dNSName and iPAddress
-    /// variants are surfaced — any other GeneralName variant inside the
-    /// constraint causes [`NameConstraints::has_unenforceable_permitted`]
-    /// (or the excluded counterpart) to be set so the chain validator can
-    /// fail closed on critical constraints it can't fully evaluate.
+    /// or `None` if the certificate has none. The dNSName, iPAddress,
+    /// rfc822Name, uniformResourceIdentifier and directoryName subtrees are
+    /// surfaced by form; any other GeneralName form is recorded in
+    /// [`NameSubtrees::unsupported_forms`] so the chain validator can fail
+    /// closed when a subordinate certificate presents a name of that form.
     pub fn name_constraints(&self) -> Result<Option<NameConstraints>, Error> {
         let mut out: Option<NameConstraints> = None;
         self.walk_extensions(|id, _critical, value| {
@@ -1354,6 +1439,26 @@ impl Certificate {
 ///   so they can never reach the hostname matcher. IPs belong in the
 ///   iPAddress (`[7]`) slot — see [`Certificate::subject_alt_ips`].
 pub(super) fn parse_dns_names(der: &[u8], out: &mut Vec<String>) -> Result<(), Error> {
+    walk_general_names(der, |t, value| {
+        if t == 0x82 {
+            let s = ia5_san_name(value)?;
+            if looks_like_ip_literal(s) {
+                return Err(Error::Malformed);
+            }
+            out.push(String::from(s));
+        }
+        Ok(())
+    })
+}
+
+/// Walks a `GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName` body
+/// (the value of a `subjectAltName` extension), handing each entry's raw
+/// tag and content octets to `f`. An empty list, or trailing bytes after
+/// the SEQUENCE, is `Malformed`.
+fn walk_general_names(
+    der: &[u8],
+    mut f: impl FnMut(u8, &[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
     let mut reader = Reader::new(der);
     let mut seq = reader.read_sequence()?;
     // RFC 5280 §4.2.1.6: `GeneralNames ::= SEQUENCE SIZE (1..MAX) OF
@@ -1363,27 +1468,22 @@ pub(super) fn parse_dns_names(der: &[u8], out: &mut Vec<String>) -> Result<(), E
     }
     while !seq.is_empty() {
         let (t, value) = seq.read_any()?;
-        if t == 0x82 {
-            if value.is_empty() {
-                return Err(Error::Malformed);
-            }
-            for &b in value {
-                // Reject non-ASCII, control characters (incl. NUL), and DEL.
-                if !(0x20..=0x7E).contains(&b) {
-                    return Err(Error::Malformed);
-                }
-            }
-            // SAFETY of unwrap: every byte is 0x20..=0x7E, which is valid UTF-8.
-            let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
-            if looks_like_ip_literal(s) {
-                return Err(Error::Malformed);
-            }
-            out.push(String::from(s));
-        }
+        f(t, value)?;
     }
     // No trailing bytes after the SEQUENCE inside extnValue.
     reader.finish()?;
     Ok(())
+}
+
+/// Validates a SAN entry carried as an IA5String (dNSName, rfc822Name,
+/// uniformResourceIdentifier): non-empty printable ASCII only, see
+/// [`ia5_name`]. A constraint may legitimately be empty (a dNSName `""`
+/// covers every host); a presented name may not.
+fn ia5_san_name(value: &[u8]) -> Result<&str, Error> {
+    if value.is_empty() {
+        return Err(Error::Malformed);
+    }
+    ia5_name(value)
 }
 
 /// An iPAddress SAN entry surfaced from a parsed cert.
@@ -1489,31 +1589,69 @@ pub(crate) fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 
 /// Parsed `nameConstraints` extension (RFC 5280 §4.2.1.10).
 ///
-/// The validator surfaces only the dNSName and iPAddress subtree types it
-/// can evaluate; if any constraint mentions a different GeneralName variant
-/// (otherName, directoryName, rfc822Name, uniformResourceIdentifier, …)
-/// the corresponding `has_unenforceable_*` flag is set so the chain
-/// validator can fail closed when the extension is critical.
+/// Every subtree form the chain validator evaluates — dNSName, iPAddress,
+/// rfc822Name, uniformResourceIdentifier and directoryName — is surfaced in
+/// its own list of [`NameSubtrees`]. The remaining `GeneralName` forms
+/// (otherName, x400Address, ediPartyName, registeredID) cannot be matched
+/// by this crate; a subtree of such a form is recorded in
+/// [`NameSubtrees::unsupported_forms`] so the validator can fail closed
+/// exactly when a subordinate certificate presents a name of that form,
+/// and stay silent otherwise (a name form with no name in the certificate
+/// has nothing to constrain).
+///
+/// Per RFC 5280 §6.1.4, the constraints apply regardless of whether the
+/// extension was marked critical.
 #[derive(Clone, Debug, Default)]
 pub struct NameConstraints {
-    /// Permitted dNSName subtrees. An entry of `".example.com"` permits
-    /// any host ending with `.example.com`; `"example.com"` permits that
-    /// exact name plus any subdomain.
-    pub permitted_dns: Vec<String>,
-    /// Excluded dNSName subtrees, same shape.
-    pub excluded_dns: Vec<String>,
-    /// Permitted iPAddress subtrees as `(address_octets, mask_octets)`.
-    /// IPv4 subtrees use 4-byte addr + 4-byte mask; IPv6 uses 16+16.
-    pub permitted_ip: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Excluded iPAddress subtrees, same shape.
-    pub excluded_ip: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Set if a permitted subtree references a GeneralName variant other
-    /// than dNSName / iPAddress — the chain validator MUST reject the
-    /// certificate when this is true and the extension is critical
-    /// (RFC 5280 §4.2 fail-closed).
-    pub has_unenforceable_permitted: bool,
-    /// Same, for excluded subtrees.
-    pub has_unenforceable_excluded: bool,
+    /// `permittedSubtrees`: for every name form with at least one entry
+    /// here, each name of that form in a subordinate certificate must fall
+    /// within one of the entries. A form with no entry is unrestricted.
+    pub permitted: NameSubtrees,
+    /// `excludedSubtrees`: a name matching any entry is refused.
+    pub excluded: NameSubtrees,
+}
+
+impl NameConstraints {
+    /// Bitmask (`1 << choice`) of the `GeneralName` CHOICE alternatives that
+    /// appear in either subtree list but cannot be evaluated by this crate.
+    /// See [`NameSubtrees::unsupported_forms`].
+    pub fn unsupported_forms(&self) -> u16 {
+        self.permitted.unsupported_forms | self.excluded.unsupported_forms
+    }
+}
+
+/// One `GeneralSubtrees` list of a [`NameConstraints`] extension, split by
+/// `GeneralName` form.
+#[derive(Clone, Debug, Default)]
+pub struct NameSubtrees {
+    /// dNSName subtrees. `".example.com"` covers any host ending with
+    /// `.example.com`; `"example.com"` covers that exact name plus any
+    /// subdomain; `""` covers every host.
+    pub dns: Vec<String>,
+    /// iPAddress subtrees as `(address_octets, mask_octets)`: 4 + 4 bytes
+    /// for IPv4, 16 + 16 for IPv6, the mask always in CIDR form.
+    pub ip: Vec<(Vec<u8>, Vec<u8>)>,
+    /// rfc822Name subtrees, verbatim: a full mailbox (`user@example.com`),
+    /// a host (`example.com`: every mailbox at exactly that host) or a
+    /// leading-dot domain (`.example.com`: every mailbox at any subdomain,
+    /// not the domain itself).
+    pub email: Vec<String>,
+    /// uniformResourceIdentifier subtrees, verbatim. They constrain the
+    /// host component of a URI and take the host / leading-dot domain forms
+    /// of [`NameSubtrees::email`].
+    pub uri: Vec<String>,
+    /// directoryName subtrees as the raw DER `Name` TLV. A subtree matches
+    /// a distinguished name when its RDN sequence is a prefix of the name's
+    /// (RFC 5280 §7.1, each RDN compared byte-for-byte, as the crate does
+    /// for issuer/subject chaining). An empty `Name` is a prefix of every
+    /// name.
+    pub directory: Vec<Vec<u8>>,
+    /// Bitmask of the `GeneralName` CHOICE alternatives this list mentions
+    /// that the crate cannot evaluate: bit `n` is set for `[n]`, so
+    /// `otherName` is `1 << 0`, `x400Address` `1 << 3`, `ediPartyName`
+    /// `1 << 5` and `registeredID` `1 << 8`. Every bit outside that set is
+    /// always clear.
+    pub unsupported_forms: u16,
 }
 
 /// Parses a `nameConstraints` extension body (the inner SEQUENCE of
@@ -1527,22 +1665,12 @@ fn parse_name_constraints(value: &[u8]) -> Result<NameConstraints, Error> {
     if seq.peek_tag() == Some(tag::context(0)) {
         any_subtrees = true;
         let body = seq.read_tlv(tag::context(0))?;
-        parse_subtrees(
-            body,
-            &mut out.permitted_dns,
-            &mut out.permitted_ip,
-            &mut out.has_unenforceable_permitted,
-        )?;
+        parse_subtrees(body, &mut out.permitted)?;
     }
     if seq.peek_tag() == Some(tag::context(1)) {
         any_subtrees = true;
         let body = seq.read_tlv(tag::context(1))?;
-        parse_subtrees(
-            body,
-            &mut out.excluded_dns,
-            &mut out.excluded_ip,
-            &mut out.has_unenforceable_excluded,
-        )?;
+        parse_subtrees(body, &mut out.excluded)?;
     }
     seq.finish()?;
     r.finish()?;
@@ -1585,16 +1713,36 @@ fn is_contiguous_cidr_mask(mask: &[u8]) -> bool {
     true
 }
 
-/// Parses a `GeneralSubtrees` (`SEQUENCE OF GeneralSubtree`) body.
+/// Validates an IA5String body carrying a name (a dNSName, rfc822Name or
+/// uniformResourceIdentifier): every byte must be printable ASCII
+/// (`0x20..=0x7E`). Control characters (NUL, newline, …) and DEL have no
+/// place in a name and can confuse a downstream matcher or log sink; a byte
+/// above `0x7E` is not IA5 at all.
+fn ia5_name(value: &[u8]) -> Result<&str, Error> {
+    if value.iter().any(|b| !(0x20..=0x7E).contains(b)) {
+        return Err(Error::Malformed);
+    }
+    // Every byte is 0x20..=0x7E, so this is valid UTF-8.
+    core::str::from_utf8(value).map_err(|_| Error::Malformed)
+}
+
+/// Validates the body of an EXPLICIT `[4] directoryName` — it must be exactly
+/// one well-formed `Name` TLV — and returns that TLV.
+fn directory_name_tlv(value: &[u8]) -> Result<&[u8], Error> {
+    let mut r = Reader::new(value);
+    let name = r.read_element()?;
+    r.finish()?;
+    let mut nr = Reader::new(name);
+    DistinguishedName::decode(&mut nr)?;
+    nr.finish()?;
+    Ok(name)
+}
+
+/// Parses a `GeneralSubtrees` (`SEQUENCE OF GeneralSubtree`) body into `out`.
 /// `GeneralSubtree ::= SEQUENCE { base GeneralName, minimum [0] DEFAULT 0,
 /// maximum [1] OPTIONAL }`. RFC 5280 §4.2.1.10 forbids both `minimum` (when
 /// not zero) and `maximum` — we refuse anything non-default.
-fn parse_subtrees(
-    body: &[u8],
-    dns_out: &mut Vec<String>,
-    ip_out: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    unenforceable: &mut bool,
-) -> Result<(), Error> {
+fn parse_subtrees(body: &[u8], out: &mut NameSubtrees) -> Result<(), Error> {
     let mut r = Reader::new(body);
     // RFC 5280 §4.2.1.10: `GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF
     // GeneralSubtree`. A present-but-empty permittedSubtrees would otherwise
@@ -1608,6 +1756,10 @@ fn parse_subtrees(
         let mut subtree = r.read_sequence()?;
         let (t, value) = subtree.read_any()?;
         match t {
+            // rfc822Name [1] IMPLICIT IA5String → primitive context 0x81.
+            // Kept verbatim; the three constraint shapes (mailbox, host,
+            // leading-dot domain) are told apart at match time.
+            0x81 => out.email.push(String::from(ia5_name(value)?)),
             // dNSName [2] IMPLICIT IA5String → primitive context 0x82.
             0x82 => {
                 // Mirror the SAN dNSName validation in `parse_dns_names` for
@@ -1624,15 +1776,18 @@ fn parse_subtrees(
                 // to forbid DNS names entirely (and a permitted `""` allows
                 // them all). It is accepted with exactly those semantics
                 // rather than making the certificate Malformed.
-                for &b in value {
-                    if !(0x20..=0x7E).contains(&b) {
-                        return Err(Error::Malformed);
-                    }
-                }
-                // SAFETY of unwrap: every byte is 0x20..=0x7E, valid UTF-8.
-                let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
-                dns_out.push(String::from(s));
+                out.dns.push(String::from(ia5_name(value)?));
             }
+            // directoryName [4] EXPLICIT Name → constructed context 0xA4
+            // wrapping the `Name` SEQUENCE. The Name must decode as an
+            // RDNSequence so the RDN-prefix matcher never meets bytes it
+            // cannot split; an empty Name is legal (it is a prefix of every
+            // name, so it permits / excludes all distinguished names).
+            0xA4 => out.directory.push(directory_name_tlv(value)?.to_vec()),
+            // uniformResourceIdentifier [6] IMPLICIT IA5String → primitive
+            // context 0x86. Constrains the host part of a URI (RFC 5280
+            // §4.2.1.10); kept verbatim.
+            0x86 => out.uri.push(String::from(ia5_name(value)?)),
             // iPAddress [7] IMPLICIT OCTET STRING → primitive context 0x87.
             // RFC 5280 §4.2.1.10: constraint is `address || mask`,
             // 8 bytes for IPv4 (4+4) or 32 bytes for IPv6 (16+16). The mask
@@ -1650,19 +1805,24 @@ fn parse_subtrees(
                     if !is_contiguous_cidr_mask(mask) {
                         return Err(Error::Malformed);
                     }
-                    ip_out.push((value[..half].to_vec(), mask.to_vec()));
+                    out.ip.push((value[..half].to_vec(), mask.to_vec()));
                 }
                 _ => return Err(Error::Malformed),
             },
-            // Any other GeneralName variant is something we can't evaluate.
-            // RFC 5280 §4.2 fail-closed: signal it so the validator can
-            // reject the chain when the extension is critical.
-            _ => {
-                *unenforceable = true;
-            }
+            // otherName [0], x400Address [3], ediPartyName [5] (all
+            // constructed) and registeredID [8] (primitive OID): forms this
+            // crate cannot match. Record the form; the validator rejects a
+            // subordinate certificate that presents a name of that form
+            // (which it could neither admit nor refuse correctly) and
+            // ignores the subtree otherwise.
+            0xA0 | 0xA3 | 0xA5 | 0x88 => out.unsupported_forms |= 1 << (t & 0x1f),
+            // Not a GeneralName encoding (wrong constructed bit, or a
+            // choice index above [8]).
+            _ => return Err(Error::Malformed),
         }
-        // RFC 5280 §4.2.1.10: minimum MUST be 0 (the DEFAULT); maximum MUST be
-        // absent. Anything else is non-conformant.
+        // RFC 5280 §4.2.1.10: minimum MUST be 0 (the DEFAULT, which DER
+        // never encodes explicitly); maximum MUST be absent. Anything else is
+        // non-conformant.
         if !subtree.is_empty() {
             return Err(Error::Malformed);
         }
@@ -2938,7 +3098,7 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         perm.extend_from_slice(&subtree);
         let body = encode_sequence(&perm);
         let nc = super::parse_name_constraints(&body).unwrap();
-        assert_eq!(nc.permitted_dns, alloc::vec![String::from("example.com")]);
+        assert_eq!(nc.permitted.dns, alloc::vec![String::from("example.com")]);
     }
 
     /// Every `SEQUENCE SIZE (1..MAX)` extension body must be rejected when
@@ -3236,11 +3396,9 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         // control char) must be rejected, mirroring the SAN dNSName parser.
         for bad in [b"evil\x00.example".as_slice(), b"evil\n.example".as_slice()] {
             let body = dns_subtree(bad);
-            let mut dns = alloc::vec::Vec::new();
-            let mut ip = alloc::vec::Vec::new();
-            let mut unenforceable = false;
+            let mut out = NameSubtrees::default();
             assert!(
-                super::parse_subtrees(&body, &mut dns, &mut ip, &mut unenforceable).is_err(),
+                super::parse_subtrees(&body, &mut out).is_err(),
                 "should reject {bad:?}"
             );
         }
@@ -3249,24 +3407,269 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         // CA/Browser Forum technically-constrained sub-CA form). It must parse
         // and be carried through to the matcher, not rejected as Malformed.
         let body = dns_subtree(b"");
-        let mut dns = alloc::vec::Vec::new();
-        let mut ip = alloc::vec::Vec::new();
-        let mut unenforceable = false;
-        super::parse_subtrees(&body, &mut dns, &mut ip, &mut unenforceable).unwrap();
-        assert_eq!(dns, alloc::vec![alloc::string::String::new()]);
-        assert!(!unenforceable);
+        let mut out = NameSubtrees::default();
+        super::parse_subtrees(&body, &mut out).unwrap();
+        assert_eq!(out.dns, alloc::vec![alloc::string::String::new()]);
+        assert_eq!(out.unsupported_forms, 0);
     }
 
     #[test]
     fn name_constraint_dns_subtree_accepts_normal_name() {
         let body = dns_subtree(b".example.com");
-        let mut dns = alloc::vec::Vec::new();
-        let mut ip = alloc::vec::Vec::new();
-        let mut unenforceable = false;
-        super::parse_subtrees(&body, &mut dns, &mut ip, &mut unenforceable).unwrap();
+        let mut out = NameSubtrees::default();
+        super::parse_subtrees(&body, &mut out).unwrap();
         assert_eq!(
-            dns,
+            out.dns,
             alloc::vec![alloc::string::String::from(".example.com")]
         );
+    }
+
+    /// Wraps one raw `GeneralName` TLV into a `GeneralSubtree` SEQUENCE,
+    /// optionally followed by raw trailing bytes (`minimum` / `maximum`).
+    fn subtree_of(base: &[u8], trailing: &[u8]) -> alloc::vec::Vec<u8> {
+        use crate::der::encode_sequence;
+        encode_sequence(&[base, trailing].concat())
+    }
+
+    /// A raw DER `Name` with a single `O=` attribute of the given string tag.
+    fn org_name(tag_byte: u8, value: &str) -> alloc::vec::Vec<u8> {
+        use crate::der::{encode_sequence, encode_string, encode_tlv, tag};
+        let atv =
+            encode_sequence(&[oid_tlv(oid::ORGANIZATION), encode_string(tag_byte, value)].concat());
+        encode_sequence(&encode_tlv(tag::SET, &atv))
+    }
+
+    /// Every evaluable form lands in its own list, verbatim; the forms the
+    /// crate cannot evaluate are recorded as a bitmask over the CHOICE index.
+    #[test]
+    fn name_constraint_subtrees_split_by_form() {
+        use crate::der::{encode_context, encode_sequence, encode_tlv, tag};
+        let name = org_name(tag::UTF8_STRING, "Corp");
+        let other_name = encode_context(
+            0,
+            &encode_sequence(
+                &[
+                    oid_tlv(&[1, 3, 6, 1, 4, 1, 311, 20, 2, 3]),
+                    encode_context(0, &encode_tlv(tag::UTF8_STRING, b"u@corp")),
+                ]
+                .concat(),
+            ),
+        );
+        let body = [
+            subtree_of(&encode_tlv(0x81, b".Example.COM"), &[]),
+            subtree_of(&encode_tlv(0x82, b"example.com"), &[]),
+            subtree_of(&encode_tlv(0xA4, &name), &[]),
+            subtree_of(&encode_tlv(0x86, b"host.example"), &[]),
+            subtree_of(&encode_tlv(0x87, &[10, 0, 0, 0, 255, 0, 0, 0]), &[]),
+            subtree_of(&other_name, &[]),
+            subtree_of(&encode_tlv(0x88, &[0x2b, 0x06, 0x01]), &[]),
+            subtree_of(&encode_context(3, &encode_sequence(&[])), &[]),
+            subtree_of(&encode_context(5, &encode_sequence(&[])), &[]),
+        ]
+        .concat();
+        let mut out = NameSubtrees::default();
+        super::parse_subtrees(&body, &mut out).unwrap();
+        assert_eq!(out.email, alloc::vec![String::from(".Example.COM")]);
+        assert_eq!(out.dns, alloc::vec![String::from("example.com")]);
+        assert_eq!(out.directory, alloc::vec![name]);
+        assert_eq!(out.uri, alloc::vec![String::from("host.example")]);
+        assert_eq!(
+            out.ip,
+            alloc::vec![(alloc::vec![10, 0, 0, 0], alloc::vec![255, 0, 0, 0])]
+        );
+        assert_eq!(
+            out.unsupported_forms,
+            (1 << 0) | (1 << 3) | (1 << 5) | (1 << 8)
+        );
+        // Through the extension body, into the two lists.
+        let nc_body = encode_sequence(
+            &[
+                encode_context(0, &subtree_of(&encode_tlv(0x81, b"corp.example"), &[])),
+                encode_context(1, &subtree_of(&other_name, &[])),
+            ]
+            .concat(),
+        );
+        let nc = super::parse_name_constraints(&nc_body).unwrap();
+        assert_eq!(
+            nc.permitted.email,
+            alloc::vec![String::from("corp.example")]
+        );
+        assert_eq!(nc.permitted.unsupported_forms, 0);
+        assert_eq!(nc.excluded.unsupported_forms, 1 << 0);
+        assert_eq!(nc.unsupported_forms(), 1 << 0);
+        // An empty directoryName (a prefix of every name) is legal.
+        let mut out = NameSubtrees::default();
+        super::parse_subtrees(
+            &subtree_of(&encode_tlv(0xA4, &encode_sequence(&[])), &[]),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.directory, alloc::vec![encode_sequence(&[])]);
+    }
+
+    /// RFC 5280 §4.2.1.10: `minimum` MUST be 0 and `maximum` MUST be absent.
+    #[test]
+    fn name_constraint_subtree_rejects_minimum_and_maximum() {
+        use crate::der::encode_tlv;
+        let base = encode_tlv(0x82, b"example.com");
+        // minimum [0] = 1
+        assert!(
+            super::parse_subtrees(
+                &subtree_of(&base, &[0x80, 0x01, 0x01]),
+                &mut NameSubtrees::default()
+            )
+            .is_err()
+        );
+        // minimum [0] = 0, explicitly encoded (non-DER for a DEFAULT value)
+        assert!(
+            super::parse_subtrees(
+                &subtree_of(&base, &[0x80, 0x01, 0x00]),
+                &mut NameSubtrees::default()
+            )
+            .is_err()
+        );
+        // maximum [1] = 5
+        assert!(
+            super::parse_subtrees(
+                &subtree_of(&base, &[0x81, 0x01, 0x05]),
+                &mut NameSubtrees::default()
+            )
+            .is_err()
+        );
+        // Sanity: without either the same subtree parses.
+        super::parse_subtrees(&subtree_of(&base, &[]), &mut NameSubtrees::default()).unwrap();
+    }
+
+    /// A directoryName subtree must wrap exactly one well-formed `Name`.
+    #[test]
+    fn name_constraint_subtree_rejects_malformed_directory_name() {
+        use crate::der::{encode_sequence, encode_tlv, tag};
+        let bad = [
+            // Not a SEQUENCE at all.
+            encode_tlv(0x04, b"x"),
+            // Two Names.
+            [
+                org_name(tag::UTF8_STRING, "a"),
+                org_name(tag::UTF8_STRING, "b"),
+            ]
+            .concat(),
+            // An RDN that is not a SET.
+            encode_sequence(&encode_sequence(&[])),
+            // An empty SET (SIZE (1..MAX)).
+            encode_sequence(&encode_tlv(tag::SET, &[])),
+            // A value with an unsupported string tag (BOOLEAN).
+            encode_sequence(&encode_tlv(
+                tag::SET,
+                &encode_sequence(&[oid_tlv(oid::ORGANIZATION), encode_tlv(0x01, &[0xff])].concat()),
+            )),
+            // A control character in the value.
+            org_name(tag::UTF8_STRING, "Co\u{0}rp"),
+            // Truncated.
+            org_name(tag::UTF8_STRING, "Corp")[..5].to_vec(),
+            // Nothing inside the [4].
+            alloc::vec![],
+        ];
+        for name in bad {
+            let body = subtree_of(&encode_tlv(0xA4, &name), &[]);
+            assert!(
+                super::parse_subtrees(&body, &mut NameSubtrees::default()).is_err(),
+                "should reject {name:02x?}"
+            );
+        }
+        // A primitive [4] is not how an EXPLICIT Name is encoded.
+        let body = subtree_of(&encode_tlv(0x84, &org_name(tag::UTF8_STRING, "Corp")), &[]);
+        assert!(super::parse_subtrees(&body, &mut NameSubtrees::default()).is_err());
+    }
+
+    /// rfc822Name / URI subtrees follow the dNSName byte rules; a tag that
+    /// is not a GeneralName alternative is malformed rather than "unsupported".
+    #[test]
+    fn name_constraint_subtree_rejects_bad_ia5_and_unknown_tags() {
+        use crate::der::encode_tlv;
+        for t in [0x81u8, 0x86] {
+            for bad in [
+                b"a\x00@x".as_slice(),
+                b"a\n".as_slice(),
+                b"\xc3\xa9".as_slice(),
+            ] {
+                let body = subtree_of(&encode_tlv(t, bad), &[]);
+                assert!(
+                    super::parse_subtrees(&body, &mut NameSubtrees::default()).is_err(),
+                    "tag {t:02x} should reject {bad:?}"
+                );
+            }
+        }
+        for t in [0x89u8, 0x80, 0xA1, 0xA2, 0xA6, 0xA7, 0xA8] {
+            let body = subtree_of(&encode_tlv(t, b"x"), &[]);
+            assert!(
+                super::parse_subtrees(&body, &mut NameSubtrees::default()).is_err(),
+                "tag {t:02x} should be malformed"
+            );
+        }
+    }
+
+    /// The SAN accessors for the rfc822Name / URI / directoryName forms and
+    /// the presence bitmask.
+    #[test]
+    fn subject_alt_name_accessors_by_form() {
+        use crate::der::{encode_sequence, encode_tlv, tag};
+        let dn = DistinguishedName::common_name("alias").with_organization("Corp");
+        let cert = forge_cert_with_version_and_exts(
+            2,
+            &[extension::subject_alt_name(&[
+                GeneralName::Dns("host.example".into()),
+                GeneralName::Email("a@example.com".into()),
+                GeneralName::Uri("https://example.com/".into()),
+                GeneralName::DirectoryName(dn.clone()),
+                GeneralName::IpV4([10, 0, 0, 1]),
+            ])],
+        );
+        assert_eq!(
+            cert.subject_alt_names().unwrap(),
+            vec![String::from("host.example")]
+        );
+        assert_eq!(
+            cert.subject_alt_emails().unwrap(),
+            vec![String::from("a@example.com")]
+        );
+        assert_eq!(
+            cert.subject_alt_uris().unwrap(),
+            vec![String::from("https://example.com/")]
+        );
+        assert_eq!(
+            cert.subject_alt_directory_names().unwrap(),
+            vec![dn.to_der()]
+        );
+        assert_eq!(
+            cert.subject_alt_name_forms().unwrap(),
+            (1 << 1) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7)
+        );
+        // No SAN at all: empty everything, zero mask.
+        let bare =
+            forge_cert_with_version_and_exts(2, &[extension::basic_constraints(false, None)]);
+        assert!(bare.subject_alt_emails().unwrap().is_empty());
+        assert!(bare.subject_alt_uris().unwrap().is_empty());
+        assert!(bare.subject_alt_directory_names().unwrap().is_empty());
+        assert_eq!(bare.subject_alt_name_forms().unwrap(), 0);
+        // Malformed entries of each form make the accessor fail.
+        let raw_san = |entries: &[alloc::vec::Vec<u8>]| Extension {
+            oid: oid::SUBJECT_ALT_NAME.to_vec(),
+            critical: false,
+            value: encode_sequence(&entries.concat()),
+        };
+        let cert = forge_cert_with_version_and_exts(2, &[raw_san(&[encode_tlv(0x81, b"")])]);
+        assert!(matches!(cert.subject_alt_emails(), Err(Error::Malformed)));
+        let cert = forge_cert_with_version_and_exts(2, &[raw_san(&[encode_tlv(0x86, b"a\x00")])]);
+        assert!(matches!(cert.subject_alt_uris(), Err(Error::Malformed)));
+        let cert = forge_cert_with_version_and_exts(
+            2,
+            &[raw_san(&[encode_tlv(0xA4, &encode_tlv(tag::SET, &[]))])],
+        );
+        assert!(cert.subject_alt_directory_names().is_err());
+        // ...while the other accessors on the same certificate are unaffected
+        // by an entry of a different form.
+        let cert = forge_cert_with_version_and_exts(2, &[raw_san(&[encode_tlv(0x81, b"")])]);
+        assert!(cert.subject_alt_names().unwrap().is_empty());
+        assert_eq!(cert.subject_alt_name_forms().unwrap(), 1 << 1);
     }
 }

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- *(x509)* **breaking:** `NameConstraints` is now `{ permitted, excluded }`
+  of `NameSubtrees`, each listing the dNSName, iPAddress, rfc822Name,
+  uniformResourceIdentifier and directoryName subtrees by form
+  (`permitted_dns` → `permitted.dns`, and so on); the
+  `has_unenforceable_*` flags are replaced by `NameSubtrees::unsupported_forms`,
+  a bitmask over the `GeneralName` CHOICE index of the forms the crate
+  cannot match (otherName, x400Address, ediPartyName, registeredID).
+  `GeneralName` gains `DirectoryName(DistinguishedName)`; `DistinguishedName`
+  gains `email_address` (PKCS#9 `emailAddress`, encoded as an IA5String
+  after the CN) plus `with_organizational_unit` / `with_email_address`
+  builders; `Certificate` gains `subject_alt_emails`, `subject_alt_uris`
+  and `subject_alt_directory_names`.
+- *(tls)* `RootCertStore::add_der` no longer refuses a root whose
+  `nameConstraints` use a form other than dNSName / iPAddress: every form is
+  now enforced, and the forms the validator cannot evaluate fail closed only
+  for a certificate that presents a name of that form.
+
 - *(tls)* **breaking:** `Config::ticket_key`, `Config::cookie_secret`,
   `Config::previous_cookie_secret` and `QuicConfig::retry_secret` are now
   `Option<tls::Secret32>` instead of `Option<[u8; 32]>`, so the keys are
@@ -26,6 +43,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(tls)* name constraints (RFC 5280 §4.2.1.10, §6.1.4) are enforced for
+  rfc822Name, uniformResourceIdentifier and directoryName subtrees, and
+  whether or not the extension is critical. Previously only dNSName and
+  iPAddress subtrees were evaluated; a chain carrying any other form was
+  rejected outright when the extension was critical and silently
+  unconstrained when it was not — so a CA/Browser Forum
+  technically-constrained sub-CA (non-critical `nameConstraints` with a
+  directoryName permitted subtree) received no directoryName / email / URI
+  enforcement at all. rfc822Name subtrees take the mailbox, host and
+  leading-dot domain forms and fall back to the subject's `emailAddress`
+  attributes when the SAN has no rfc822Name; URI subtrees apply to the
+  URI's host component (an IP-literal or host-less URI matches no
+  permitted subtree); directoryName subtrees match by RDN prefix, each RDN
+  compared byte-for-byte like issuer/subject chaining, against the subject
+  DN and every directoryName SAN entry. An otherName / x400Address /
+  ediPartyName / registeredID subtree now refuses only a subordinate
+  certificate that actually presents a name of that form.
+- *(tls)* a name form no in-scope CA constrains is unrestricted: a leaf whose
+  SAN holds only rfc822Name / URI entries validates under a CA that permits
+  only dNSName subtrees (it was refused as "nameless"). Only the leaf's
+  commonName is held to dNSName subtrees — an intermediate's CN is a display
+  name, never a hostname — so a SAN-less issuing CA below a
+  dNSName-constrained root now validates; and, per RFC 5280 §6.1.3(b), a
+  self-issued intermediate is not checked against the constraints.
 - *(dtls)* enforce Extended Master Secret (RFC 7627 §5.3) over DTLS 1.2:
   the server refuses a ClientHello without the EMS offer and the client
   aborts when its offer is not echoed, unless

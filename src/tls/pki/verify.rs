@@ -435,13 +435,10 @@ fn verify_chain_inner(
     }
 
     // RFC 5280 §6.1.4 — nameConstraints accumulated across every CA in the
-    // path, applied to the certificates beneath each. The matched trust
-    // anchor's own constraints (retained by the store at add time) seed the
-    // state, so a deliberately constrained root governs the whole path.
-    // Critical constraints referencing GeneralName variants we don't
-    // evaluate have already been rejected upstream — by
-    // check_critical_extensions_recognized for in-chain CAs, and by
-    // RootCertStore::add_der for the anchor.
+    // path, applied to the certificates beneath each, critical or not. The
+    // matched trust anchor's own constraints (retained by the store at add
+    // time) seed the state, so a deliberately constrained root governs the
+    // whole path.
     let anchor_nc = matched_anchor.and_then(|a| a.name_constraints.as_ref());
     enforce_name_constraints(path, anchor_nc)?;
 
@@ -762,15 +759,18 @@ fn enforce_anchor_constraints(
 ///
 /// This walks the presented chain from the topmost supplied CA downward: as
 /// each CA's constraints come into scope, they are enforced against the names
-/// of every certificate beneath it (intermediates and leaf), using the same
-/// `dns_in_subtree` / `ip_in_subtree` matchers. For each such certificate its
-/// dNSName / iPAddress SAN entries (with a DNS-plausible subject commonName
-/// standing in for the dNSName entries when the certificate has no dNSName
-/// SAN — see [`enforce_constraints_on_cert`]) must satisfy, for every
-/// in-scope CA constraint:
-///   * the cert must NOT match any excluded subtree (any match is fatal);
-///   * when a CA declares ANY permitted dNSName subtree, each of the cert's
-///     DNS SANs must match at least one such entry; same for iPAddress.
+/// of every certificate beneath it (intermediates and leaf) by
+/// [`enforce_constraints_on_cert`]. The constraints are applied whether or
+/// not the extension was marked critical (RFC 5280 §6.1.4 processes it
+/// regardless; CA/Browser Forum technically-constrained sub-CAs commonly
+/// carry it non-critical).
+///
+/// RFC 5280 §6.1.3(b): a self-issued certificate (subject equal to issuer)
+/// that is not the leaf is skipped — a CA re-certifying its own key under
+/// its own name is not a name the constraints were written for (its subject
+/// is the constrained CA's own, which need not sit inside the subtrees the
+/// CA imposes on others), and nothing in it is ever authenticated as an
+/// identity.
 ///
 /// `anchor_constraints` carries the matched trust anchor's own
 /// `nameConstraints` (parsed and retained by [`RootCertStore`] when the root
@@ -778,20 +778,6 @@ fn enforce_anchor_constraints(
 /// constraints are in scope for **every** certificate in the validated path
 /// — they seed the constraint state before the walk begins, exactly as an
 /// in-chain CA's constraints govern everything beneath it.
-///
-/// Scope / limitations:
-///   * directoryName (subject DN) subtree constraints are NOT evaluated: the
-///     parsed [`crate::x509::NameConstraints`] surfaces only dNSName and
-///     iPAddress subtrees, and any constraint referencing another
-///     GeneralName variant (including directoryName) sets a
-///     `has_unenforceable_*` flag that causes
-///     `check_critical_extensions_recognized` to reject the chain when the
-///     constraint is critical. directoryName-subtree matching is therefore
-///     flagged-for-review rather than implemented (possibly-wrong) here.
-///   * Constraints referencing GeneralName variants other than dNSName /
-///     iPAddress are skipped — a critical such constraint on an in-chain CA
-///     has already been rejected upstream, and an anchor carrying one is
-///     refused by [`RootCertStore::add_der`] regardless of criticality.
 fn enforce_name_constraints(
     certs: &[Certificate],
     anchor_constraints: Option<&crate::x509::NameConstraints>,
@@ -812,7 +798,7 @@ fn enforce_name_constraints(
     // `i - 1`, so a CA's constraints govern every certificate at a strictly
     // lower index. We accumulate constraints as they come into scope (higher
     // CAs first) and, for each subordinate certificate, enforce all in-scope
-    // CAs' constraints against that certificate's own SAN names. The trust
+    // CAs' constraints against that certificate's own names. The trust
     // anchor issued `certs[last]`, so its constraints are in scope from the
     // very first iteration.
     let mut in_scope: Vec<&crate::x509::NameConstraints> = Vec::new();
@@ -820,12 +806,17 @@ fn enforce_name_constraints(
         in_scope.push(nc);
     }
     for idx in (0..certs.len()).rev() {
+        let cert = &certs[idx];
+        let is_leaf = idx == 0;
+        let self_issued = !is_leaf
+            && cert.subject_der().map_err(|_| Error::BadCertificate)?
+                == cert.issuer_der().map_err(|_| Error::BadCertificate)?;
         // Constraints declared by CAs above this position must hold for the
         // certificate at `idx`. Only meaningful once at least one such
         // constraint is in scope, i.e. for certificates that have a
         // constraint-declaring CA above them.
-        if !in_scope.is_empty() {
-            enforce_constraints_on_cert(&certs[idx], &in_scope)?;
+        if !in_scope.is_empty() && !self_issued {
+            enforce_constraints_on_cert(cert, &in_scope, is_leaf)?;
         }
         // This certificate's own constraints (if it is a CA that declared
         // any) now come into scope for every certificate below it.
@@ -837,72 +828,106 @@ fn enforce_name_constraints(
 }
 
 /// Enforces the accumulated, in-scope name constraints (`active`) against a
-/// single subordinate certificate's dNSName and iPAddress SAN entries — and,
-/// when the certificate carries no dNSName SAN, against its subject
-/// commonName (see below).
+/// single subordinate certificate, per RFC 5280 §4.2.1.10 / §6.1.4 step (g).
 ///
-/// Each constraint in `active` is checked independently (intersection
-/// semantics across CAs): an excluded match in any CA is fatal, and a CA that
-/// declares any permitted dNSName / iPAddress subtree requires every
-/// corresponding SAN of `cert` to fall within one of its entries.
+/// Each constraint in `active` is checked independently, which yields the
+/// RFC's accumulated state (intersection of the permitted subtrees, union of
+/// the excluded ones): a name matching an excluded subtree of *any* in-scope
+/// CA is fatal, and every CA that declares a permitted subtree of some form
+/// requires every name of that form in `cert` to fall within one of its
+/// entries. A form no CA constrains is unrestricted — a leaf whose SAN holds
+/// only rfc822Name / URI entries passes a CA that permits only dNSName
+/// subtrees untouched, as the RFC requires.
+///
+/// The names of `cert` that take part, by form:
+///   * dNSName — the SAN dNSName entries, plus (leaf only) the subject
+///     commonName when the certificate carries no subjectAltName extension
+///     at all and the CN is DNS-plausible: `verify_hostname` falls back to
+///     the leaf's CN under exactly that condition (RFC 6125 §6.4.4), so a
+///     dNSName constraint must govern it too, or a CA constrained by only
+///     EXCLUDED subtrees could issue a SAN-less leaf whose CN sits inside the
+///     excluded subtree. The fallback is keyed on SAN-extension *presence*,
+///     not on the dNSName list being empty, so the two functions stay in
+///     lockstep (an IP-only-SAN certificate's CN is ignored by both).
+///     IP-shaped CNs are kept out (inert for hostname verification, and
+///     `dns_name_matches` refuses IP-shaped patterns). Only the leaf's CN is
+///     ever consumed as a hostname, so an intermediate CA's CN — a display
+///     name such as `Corp Issuing CA 1` — is not held to dNSName subtrees.
+///   * iPAddress — the SAN iPAddress entries.
+///   * rfc822Name — the SAN rfc822Name entries, or, when there are none, the
+///     PKCS#9 `emailAddress` attributes of the subject DN (§4.2.1.10).
+///   * uniformResourceIdentifier — the SAN URI entries; the constraint
+///     applies to each URI's host component ([`uri_in_subtree`]).
+///   * directoryName — the subject DN (unless empty) plus every SAN
+///     directoryName entry, matched by RDN prefix ([`dn_in_subtree`]).
+///   * otherName / x400Address / ediPartyName / registeredID — forms this
+///     crate cannot match. When some in-scope CA declares a subtree of such a
+///     form *and* `cert` presents a SAN entry of that form, the certificate
+///     is refused (it could be neither admitted nor excluded correctly);
+///     when `cert` presents no name of that form the subtree is inert and
+///     ignored, exactly as the RFC's per-form rule prescribes.
+///
+/// A dNSName wildcard SAN is treated as the subtree it spans when tested
+/// against excluded subtrees (see the body); the permitted direction needs
+/// no such treatment.
+///
+/// Beyond the RFC, a *leaf* with no subjectAltName extension and no
+/// DNS-plausible CN — nothing `verify_hostname` could ever match — is
+/// refused while some in-scope CA declares a permitted dNSName / iPAddress
+/// subtree: this validator serves TLS, and a nameless leaf under a
+/// host-constrained CA is never what the constraint intended (modern PKI —
+/// CA/B Forum BR §7.1.4.2 — requires a SAN on server certificates anyway).
+/// A CA that declared ONLY excluded subtrees does not by itself force a name
+/// to exist. Intermediates are exempt: their names are never authenticated,
+/// and a CA certificate carries no SAN as a rule.
 fn enforce_constraints_on_cert(
     cert: &Certificate,
     active: &[&crate::x509::NameConstraints],
+    is_leaf: bool,
 ) -> Result<(), Error> {
-    let mut dns = cert
-        .subject_alt_names()
-        .map_err(|_| Error::BadCertificate)?;
-    let ips = cert.subject_alt_ips().map_err(|_| Error::BadCertificate)?;
+    let bad = |_| Error::BadCertificate;
+    let has_san = cert.has_subject_alt_name().map_err(bad)?;
+    let mut dns = cert.subject_alt_names().map_err(bad)?;
+    let ips = cert.subject_alt_ips().map_err(bad)?;
+    let mut emails = cert.subject_alt_emails().map_err(bad)?;
+    let uris = cert.subject_alt_uris().map_err(bad)?;
+    let mut dir_names = cert.subject_alt_directory_names().map_err(bad)?;
+    let forms = cert.subject_alt_name_forms().map_err(bad)?;
+    let subject_der = cert.subject_der().map_err(bad)?;
 
-    // CN fallback parity with `verify_hostname` (which falls back to matching
-    // the subject commonName only when a certificate carries NO subjectAltName
-    // extension at all): a name constraint must govern every name a relying
-    // party might accept. When there is no SAN extension and the CN is
-    // plausible as a DNS name — judged by the same syntax checks
-    // `parse_dns_names` applies to SAN dNSName entries — the CN is evaluated
-    // against the permitted AND excluded dNSName subtrees exactly as if it
-    // were a dNSName (matching common practice, e.g. OpenSSL). Without this,
-    // a CA constrained by only EXCLUDED subtrees could issue a SAN-less leaf
-    // whose CN sits inside the excluded subtree and have it pass both this
-    // check and `verify_hostname`'s CN fallback. The condition is SAN-
-    // extension presence, NOT "the dNSName list is empty", so that the two
-    // functions stay in lockstep: `verify_hostname` ignores the CN of an
-    // IP-only-SAN certificate, so there is nothing for a dNSName constraint
-    // to govern there either. IP-shaped CNs are kept out of the dNSName
-    // evaluation; they are inert for hostname verification anyway —
-    // `verify_hostname` never consults the CN for IP-literal hosts, and
-    // `dns_name_matches` refuses IP-shaped patterns — so they are not checked
-    // against iPAddress constraints either.
-    if !cert
-        .has_subject_alt_name()
-        .map_err(|_| Error::BadCertificate)?
-        && let Some(cn) = cert
-            .subject()
-            .map_err(|_| Error::BadCertificate)?
-            .common_name
+    // CN fallback parity with `verify_hostname` (leaf only; see above).
+    if is_leaf
+        && !has_san
+        && let Some(cn) = cert.subject().map_err(bad)?.common_name
         && cn_is_plausible_dns_name(&cn)
     {
         dns.push(cn);
     }
+    // RFC 5280 §4.2.1.10: "When rfc822Name constraints are in place and the
+    // certificate does not include a subject alternative name [rfc822Name],
+    // the rfc822Name constraint MUST be applied to the attribute of type
+    // emailAddress in the subject distinguished name."
+    if emails.is_empty() {
+        emails = crate::x509::email_addresses_in_name(subject_der).map_err(bad)?;
+    }
+    // RFC 5280 §6.1.4 (g): the subject DN itself is a directoryName-form
+    // name, unless it is empty (permitted for an end entity whose SAN is
+    // critical, §4.1.2.6).
+    if dn_rdns(subject_der).is_some_and(|rdns| !rdns.is_empty()) {
+        dir_names.insert(0, subject_der.to_vec());
+    }
 
-    // Refuse certificates that present NO evaluable name at all (no SAN, no
-    // DNS-plausible CN) while governed by an active *permitted* constraint:
-    // the dNSName / iPAddress checks below only iterate the collected names,
-    // so a nameless certificate would slip past every permitted-subtree
-    // constraint trivially. When some active CA declared a permitted dNSName
-    // / iPAddress subtree, require the certificate to carry a name those
-    // constraints can apply to. (Modern PKI — CA/B Forum BR §7.1.4.2 —
-    // already requires SAN on server certs.) A CA that declared ONLY
-    // excluded subtrees does not by itself force a name to exist (RFC 5280:
-    // a name absent from the cert cannot violate an exclusion).
-    if dns.is_empty() && ips.is_empty() {
-        let any_permitted = active
+    // Nameless-leaf rule (see above): no SAN extension and no DNS-plausible
+    // CN. A SAN holding only names of other forms is not nameless — those
+    // names are simply of forms a dNSName / iPAddress subtree does not
+    // restrict.
+    if is_leaf && !has_san && dns.is_empty() {
+        let any_permitted_host = active
             .iter()
-            .any(|nc| !nc.permitted_dns.is_empty() || !nc.permitted_ip.is_empty());
-        if any_permitted {
+            .any(|nc| !nc.permitted.dns.is_empty() || !nc.permitted.ip.is_empty());
+        if any_permitted_host {
             return Err(Error::BadCertificate);
         }
-        return Ok(());
     }
 
     // A wildcard SAN authorises every host under its suffix, so an excluded
@@ -917,60 +942,89 @@ fn enforce_constraints_on_cert(
     // The permitted-subtree direction below needs no such treatment: a
     // wildcard is permitted only when its literal suffix already sits inside
     // a permitted base, which is the conservative answer.
-    let excluded_hit = |name: &str, base: &str| {
+    let excluded_dns_hit = |name: &str, base: &str| {
         dns_in_subtree(name, base)
             || name
                 .strip_prefix("*.")
                 .is_some_and(|apex| dns_in_subtree(base, apex))
     };
+    let ip_bytes = |ip: &crate::x509::SanIp| -> Vec<u8> {
+        match ip {
+            crate::x509::SanIp::V4(b) => b.to_vec(),
+            crate::x509::SanIp::V6(b) => b.to_vec(),
+        }
+    };
 
     for nc in active {
+        // A subtree form we cannot evaluate, constraining a form the
+        // certificate presents: fail closed.
+        if nc.unsupported_forms() & forms != 0 {
+            return Err(Error::BadCertificate);
+        }
+
         // Excluded subtrees: any match in any in-scope CA is fatal.
-        for name in &dns {
-            for base in &nc.excluded_dns {
-                if excluded_hit(name, base) {
-                    return Err(Error::BadCertificate);
-                }
-            }
-        }
-        for ip in &ips {
-            let bytes = match ip {
-                crate::x509::SanIp::V4(b) => &b[..],
-                crate::x509::SanIp::V6(b) => &b[..],
-            };
-            for (addr, mask) in &nc.excluded_ip {
-                if ip_in_subtree(bytes, addr, mask) {
-                    return Err(Error::BadCertificate);
-                }
-            }
-        }
-        // Permitted subtrees: when this CA declares ANY permitted dNSName
-        // subtree, every DNS SAN of `cert` must match at least one of them.
-        if !nc.permitted_dns.is_empty() {
-            for name in &dns {
-                if !nc
-                    .permitted_dns
+        let ex = &nc.excluded;
+        if dns
+            .iter()
+            .any(|n| ex.dns.iter().any(|b| excluded_dns_hit(n, b)))
+            || ips.iter().any(|ip| {
+                ex.ip
                     .iter()
-                    .any(|base| dns_in_subtree(name, base))
-                {
-                    return Err(Error::BadCertificate);
-                }
-            }
+                    .any(|(a, m)| ip_in_subtree(&ip_bytes(ip), a, m))
+            })
+            || emails
+                .iter()
+                .any(|n| ex.email.iter().any(|b| email_in_subtree(n, b)))
+            || uris
+                .iter()
+                .any(|n| ex.uri.iter().any(|b| uri_in_subtree(n, b)))
+            || dir_names
+                .iter()
+                .any(|n| ex.directory.iter().any(|b| dn_in_subtree(n, b)))
+        {
+            return Err(Error::BadCertificate);
         }
-        if !nc.permitted_ip.is_empty() {
-            for ip in &ips {
-                let bytes = match ip {
-                    crate::x509::SanIp::V4(b) => &b[..],
-                    crate::x509::SanIp::V6(b) => &b[..],
-                };
-                if !nc
-                    .permitted_ip
+
+        // Permitted subtrees: for each form this CA constrains, every name
+        // of that form must match at least one of its entries. A form with
+        // no permitted entry here is unrestricted by this CA.
+        let pm = &nc.permitted;
+        if !pm.dns.is_empty()
+            && !dns
+                .iter()
+                .all(|n| pm.dns.iter().any(|b| dns_in_subtree(n, b)))
+        {
+            return Err(Error::BadCertificate);
+        }
+        if !pm.ip.is_empty()
+            && !ips.iter().all(|ip| {
+                pm.ip
                     .iter()
-                    .any(|(addr, mask)| ip_in_subtree(bytes, addr, mask))
-                {
-                    return Err(Error::BadCertificate);
-                }
-            }
+                    .any(|(a, m)| ip_in_subtree(&ip_bytes(ip), a, m))
+            })
+        {
+            return Err(Error::BadCertificate);
+        }
+        if !pm.email.is_empty()
+            && !emails
+                .iter()
+                .all(|n| pm.email.iter().any(|b| email_in_subtree(n, b)))
+        {
+            return Err(Error::BadCertificate);
+        }
+        if !pm.uri.is_empty()
+            && !uris
+                .iter()
+                .all(|n| pm.uri.iter().any(|b| uri_in_subtree(n, b)))
+        {
+            return Err(Error::BadCertificate);
+        }
+        if !pm.directory.is_empty()
+            && !dir_names
+                .iter()
+                .all(|n| pm.directory.iter().any(|b| dn_in_subtree(n, b)))
+        {
+            return Err(Error::BadCertificate);
         }
     }
     Ok(())
@@ -1034,17 +1088,120 @@ fn ip_in_subtree(host: &[u8], addr: &[u8], mask: &[u8]) -> bool {
     true
 }
 
+/// True if `host` (the domain part of a mailbox, or the host component of a
+/// URI) falls within the host-form constraint `base` per RFC 5280 §4.2.1.10:
+/// * base "example.com" matches exactly that host;
+/// * base ".example.com" (leading dot) matches any host in the domain —
+///   "a.example.com", "a.b.example.com" — but NOT "example.com" itself.
+///
+/// Unlike dNSName subtrees, a host-form constraint without a leading dot
+/// names one host, not a domain. Case-insensitive (RFC 4343 §2).
+fn host_in_subtree(host: &str, base: &str) -> bool {
+    let host_l = host.to_ascii_lowercase();
+    let base_l = base.to_ascii_lowercase();
+    if base_l.starts_with('.') {
+        host_l.len() > base_l.len() && host_l.ends_with(&base_l)
+    } else {
+        host_l == base_l
+    }
+}
+
+/// True if the rfc822Name `mailbox` falls within the rfc822Name subtree
+/// `base` per RFC 5280 §4.2.1.10. `base` is either a full mailbox
+/// (`user@example.com`: exact match, the domain part compared
+/// case-insensitively and the local part verbatim, as RFC 5321 §2.4 leaves
+/// local-part case to the receiving host) or a host / leading-dot domain
+/// applied to the mailbox's domain part ([`host_in_subtree`]). A name
+/// without an `@` has no domain part and matches no subtree.
+fn email_in_subtree(mailbox: &str, base: &str) -> bool {
+    let Some((local, domain)) = mailbox.rsplit_once('@') else {
+        return false;
+    };
+    match base.rsplit_once('@') {
+        Some((base_local, base_domain)) => {
+            local == base_local && domain.eq_ignore_ascii_case(base_domain)
+        }
+        None => host_in_subtree(domain, base),
+    }
+}
+
+/// The host component of `uri` (`scheme://[userinfo@]host[:port]/…`), or
+/// `None` when the URI has no authority (`mailto:`, `urn:`, …), an empty
+/// host, or an IP-literal host (`[::1]`, `10.0.0.1`). RFC 5280 §4.2.1.10:
+/// "The constraint MUST be specified as a fully qualified domain name"; a
+/// URI whose host is an IP address can therefore match no host-name subtree.
+fn uri_host(uri: &str) -> Option<&str> {
+    let (scheme, rest) = uri.split_once(':')?;
+    // RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+    let mut scheme_bytes = scheme.bytes();
+    if !scheme_bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        || !scheme_bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let rest = rest.strip_prefix("//")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // `[…]` is an IP-literal (IPv6 or IPvFuture); a bare host never contains
+    // ':' so the split is unambiguous for the reg-name case.
+    if hostport.starts_with('[') {
+        return None;
+    }
+    let host = hostport.split_once(':').map_or(hostport, |(h, _)| h);
+    if host.is_empty() || looks_like_ip(host) {
+        return None;
+    }
+    Some(host)
+}
+
+/// True if the host component of `uri` falls within the URI subtree `base`
+/// (a host or leading-dot domain, [`host_in_subtree`]). A URI with no host
+/// name component ([`uri_host`]) matches no subtree.
+fn uri_in_subtree(uri: &str, base: &str) -> bool {
+    uri_host(uri).is_some_and(|host| host_in_subtree(host, base))
+}
+
+/// Splits a DER `Name` TLV into its RDN encodings (each the full
+/// `SET` TLV), or `None` if the bytes are not a well-formed
+/// `SEQUENCE OF RelativeDistinguishedName`.
+fn dn_rdns(name_der: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut reader = crate::der::Reader::new(name_der);
+    let mut seq = reader.read_sequence().ok()?;
+    reader.finish().ok()?;
+    let mut out = Vec::new();
+    while !seq.is_empty() {
+        out.push(seq.read_element().ok()?);
+    }
+    Some(out)
+}
+
+/// True if the distinguished name `name` (a DER `Name` TLV) falls within
+/// the directoryName subtree `base` (likewise): RFC 5280 §4.2.1.10 /
+/// §7.1 — the subtree's RDN sequence is a prefix of the name's, each RDN
+/// compared as the crate compares issuer and subject names, byte-for-byte
+/// (so encoding differences and a different RDN order are non-matches). An
+/// empty subtree is a prefix of every name. Undecodable bytes on either
+/// side never match.
+fn dn_in_subtree(name: &[u8], base: &[u8]) -> bool {
+    match (dn_rdns(name), dn_rdns(base)) {
+        (Some(n), Some(b)) => b.len() <= n.len() && n.iter().zip(&b).all(|(x, y)| x == y),
+        _ => false,
+    }
+}
+
 /// RFC 5280 §4.2: reject the certificate if it carries any critical extension
 /// whose OID we don't recognize. The handler set (basicConstraints, keyUsage,
 /// extKeyUsage, subjectAltName, nameConstraints) is intentionally narrow —
 /// every critical extension outside this set is treated as "we cannot enforce
 /// this constraint", which must result in rejection.
 ///
-/// `nameConstraints` is special: it's "recognized" only when every GeneralName
-/// subtree references a variant we evaluate (dNSName / iPAddress). If a
-/// critical constraint mentions any other type we route it through the same
-/// fail-closed path as an unknown OID — accepting it would let a constraint
-/// we can't check appear to have been honored.
+/// `nameConstraints` is recognized whenever it parses: every subtree form is
+/// evaluated by [`enforce_name_constraints`] irrespective of criticality, and
+/// a form the crate cannot evaluate is failed closed there exactly when the
+/// subordinate certificate presents a name of that form. A critical
+/// `nameConstraints` that does not parse is rejected here (the leaf's is
+/// otherwise never parsed).
 fn check_critical_extensions_recognized(
     cert: &Certificate,
     policy_processing: bool,
@@ -1075,16 +1232,9 @@ fn check_critical_extensions_recognized(
             continue;
         }
         if bytes == oid::NAME_CONSTRAINTS {
-            // Re-parse to confirm we can evaluate every subtree. If any
-            // unenforceable type slipped in, treat the critical extension
-            // as unknown and reject.
-            let nc = cert
-                .name_constraints()
+            cert.name_constraints()
                 .map_err(|_| Error::BadCertificate)?
                 .ok_or(Error::BadCertificate)?;
-            if nc.has_unenforceable_permitted || nc.has_unenforceable_excluded {
-                return Err(Error::BadCertificate);
-            }
             continue;
         }
         return Err(Error::BadCertificate);
@@ -3203,22 +3353,38 @@ mod tests {
     }
 
     #[test]
-    fn name_constraints_critical_with_unenforceable_type_rejected() {
-        // A critical nameConstraints carrying an rfc822Name (email) subtree
-        // is something we can't evaluate — the chain must fail closed.
+    fn name_constraints_critical_rfc822_subtree_is_evaluated() {
+        // A critical nameConstraints carrying an rfc822Name subtree is
+        // evaluated like any other form: a leaf with only a dNSName SAN
+        // presents no rfc822Name-form name, so it is unrestricted and the
+        // chain validates (it used to be refused as an unevaluable critical
+        // extension); a leaf with an out-of-range rfc822Name is refused.
         use crate::x509::GeneralName;
         let nc = crate::x509::extension::name_constraints(
             &[GeneralName::Email("admin@example.com".into())],
             &[],
         );
-        // SAN unrelated; the rejection comes from the extension being a
-        // critical unknown-shape rather than from SAN evaluation.
         let leaf_sans = [GeneralName::Dns("leaf.example".into())];
-        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
+        let (root, int, leaf) = build_chain_with_nc(nc.clone(), "nc-leaf", &leaf_sans);
 
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
         let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+
+        let leaf_sans = [
+            GeneralName::Dns("leaf.example".into()),
+            GeneralName::Email("other@example.com".into()),
+        ];
+        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
         assert!(matches!(
             verify_chain(
                 &store,
@@ -3605,25 +3771,31 @@ mod tests {
         .unwrap();
     }
 
-    /// Fail closed at add time: a root whose nameConstraints reference a
-    /// GeneralName variant the validator cannot evaluate (here rfc822Name)
-    /// is refused by `add_der` rather than installed with its constraints
-    /// silently ignored.
+    /// A root whose nameConstraints use a form other than dNSName /
+    /// iPAddress (here rfc822Name) is installed by `add_der` — every form is
+    /// evaluated — and the chain below it is unaffected when it presents no
+    /// name of that form (see `anchor_name_constraints_cover_every_form`
+    /// for the enforcement itself).
     #[test]
-    fn add_der_rejects_anchor_with_unenforceable_constraints() {
+    fn add_der_accepts_anchor_with_rfc822_constraints() {
         use crate::x509::GeneralName;
         let nc = crate::x509::extension::name_constraints(
             &[GeneralName::Email("admin@example.com".into())],
             &[],
         );
-        let (root, _int, _leaf) =
+        let (root, int, leaf) =
             build_anchor_nc_chain(Some(nc), "int.good.example", "host.good.example");
         let mut store = RootCertStore::new();
-        assert!(matches!(
-            store.add_der(root.to_der().to_vec()),
-            Err(Error::BadCertificate)
-        ));
-        assert!(store.is_empty());
+        store.add_der(root.to_der().to_vec()).unwrap();
+        assert_eq!(store.len(), 1);
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
     }
 
     /// Fail closed at add time: a root carrying a nameConstraints extension
@@ -3987,5 +4159,1151 @@ mod tests {
             &policy(),
         )
         .unwrap();
+    }
+
+    // ======================================================================
+    // RFC 5280 §4.2.1.10 — rfc822Name / uniformResourceIdentifier /
+    // directoryName subtrees, criticality-independent enforcement, and the
+    // fail-closed rule for subtree forms the crate cannot evaluate.
+    // ======================================================================
+
+    /// Builds `root → int → leaf`. `root_nc` / `int_nc` are optional
+    /// `nameConstraints` extensions for the root / intermediate. The
+    /// intermediate has subject `int_subject` and SAN `int_sans`, the leaf
+    /// subject `leaf_subject` and SAN `leaf_sans`; an empty SAN slice means
+    /// "no subjectAltName extension at all" (the CN fallback keys off
+    /// extension presence). `leaf_extra` is appended to the leaf's
+    /// extensions verbatim (raw SAN encodings the typed builder cannot
+    /// express). Returns `(root, int, leaf)`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_nc_chain(
+        root_nc: Option<crate::x509::Extension>,
+        int_nc: Option<crate::x509::Extension>,
+        int_subject: &DistinguishedName,
+        int_sans: &[crate::x509::GeneralName],
+        leaf_subject: &DistinguishedName,
+        leaf_sans: &[crate::x509::GeneralName],
+        leaf_extra: &[crate::x509::Extension],
+    ) -> (Certificate, Certificate, Certificate) {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::{
+            CertSigner, Extension, KeyUsageBits,
+            extension::{basic_constraints, extended_key_usage, key_usage, subject_alt_name},
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"nc-forms", b"n", &[]);
+        let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let int_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let root_signer = CertSigner::Ecdsa(&root_key);
+        let int_signer = CertSigner::Ecdsa(&int_key);
+        let root_name = DistinguishedName::common_name("nc-forms-root");
+
+        let mut root_exts: alloc::vec::Vec<Extension> = alloc::vec![
+            basic_constraints(true, None),
+            key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+        ];
+        root_exts.extend(root_nc);
+        let root = Certificate::self_signed_with_extensions(
+            &root_signer,
+            &root_name,
+            &validity(),
+            1,
+            &root_exts,
+        )
+        .unwrap();
+
+        let mut int_exts: alloc::vec::Vec<Extension> = alloc::vec![
+            basic_constraints(true, Some(0)),
+            key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+        ];
+        int_exts.extend(int_nc);
+        if !int_sans.is_empty() {
+            int_exts.push(subject_alt_name(int_sans));
+        }
+        let int_pub = crate::x509::AnyPublicKey::Ecdsa(int_key.public_key());
+        let int = Certificate::issue_with_extensions(
+            &root_signer,
+            &root_name,
+            int_subject,
+            &int_pub,
+            &validity(),
+            2,
+            &int_exts,
+        )
+        .unwrap();
+
+        let mut leaf_exts = alloc::vec![
+            basic_constraints(false, None),
+            key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+            extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+        ];
+        if !leaf_sans.is_empty() {
+            leaf_exts.push(subject_alt_name(leaf_sans));
+        }
+        leaf_exts.extend_from_slice(leaf_extra);
+        let leaf_pub = crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key());
+        let leaf = Certificate::issue_with_extensions(
+            &int_signer,
+            int_subject,
+            leaf_subject,
+            &leaf_pub,
+            &validity(),
+            3,
+            &leaf_exts,
+        )
+        .unwrap();
+        (root, int, leaf)
+    }
+
+    /// Verifies `[leaf, int]` anchored at `root` under the modern policy.
+    fn verify_nc_chain(
+        root: &Certificate,
+        int: &Certificate,
+        leaf: &Certificate,
+    ) -> Result<(), Error> {
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec())?;
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .map(|_| ())
+    }
+
+    /// `name_constraints(permitted, excluded)` with the criticality flag set
+    /// to `critical` (the builder always emits it critical).
+    fn nc_ext(
+        permitted: &[crate::x509::GeneralName],
+        excluded: &[crate::x509::GeneralName],
+        critical: bool,
+    ) -> crate::x509::Extension {
+        let mut ext = crate::x509::extension::name_constraints(permitted, excluded);
+        ext.critical = critical;
+        ext
+    }
+
+    /// A `nameConstraints` extension whose subtree bases are supplied as raw
+    /// `GeneralName` TLVs — for shapes the typed builder cannot express (IP
+    /// address + mask, otherName, a Name in a non-conventional RDN order).
+    fn nc_ext_raw(
+        permitted: &[Vec<u8>],
+        excluded: &[Vec<u8>],
+        critical: bool,
+    ) -> crate::x509::Extension {
+        use crate::der::{encode_context, encode_sequence};
+        let subtrees = |bases: &[Vec<u8>]| -> Vec<u8> {
+            bases.iter().flat_map(|b| encode_sequence(b)).collect()
+        };
+        let mut body = Vec::new();
+        if !permitted.is_empty() {
+            body.extend_from_slice(&encode_context(0, &subtrees(permitted)));
+        }
+        if !excluded.is_empty() {
+            body.extend_from_slice(&encode_context(1, &subtrees(excluded)));
+        }
+        crate::x509::Extension {
+            oid: oid::NAME_CONSTRAINTS.to_vec(),
+            critical,
+            value: encode_sequence(&body),
+        }
+    }
+
+    /// A raw DER `Name` from `(attribute OID, string tag, value)` RDNs, in
+    /// the order given.
+    fn raw_name(rdns: &[(&[u64], u8, &str)]) -> Vec<u8> {
+        use crate::der::{encode_sequence, encode_string, encode_tlv, oid_tlv, tag};
+        let body: Vec<u8> = rdns
+            .iter()
+            .flat_map(|(o, t, v)| {
+                let atv = encode_sequence(&[oid_tlv(o), encode_string(*t, v)].concat());
+                encode_tlv(tag::SET, &atv)
+            })
+            .collect();
+        encode_sequence(&body)
+    }
+
+    /// Verifies a leaf with subject `leaf_subject` and SAN `leaf_sans` under
+    /// an intermediate carrying `nc`.
+    fn leaf_under(
+        nc: crate::x509::Extension,
+        leaf_subject: &DistinguishedName,
+        leaf_sans: &[crate::x509::GeneralName],
+    ) -> Result<(), Error> {
+        let (root, int, leaf) = build_nc_chain(
+            None,
+            Some(nc),
+            &DistinguishedName::common_name("nc-forms-int"),
+            &[],
+            leaf_subject,
+            leaf_sans,
+            &[],
+        );
+        verify_nc_chain(&root, &int, &leaf)
+    }
+
+    fn corp_dn(cn: &str) -> DistinguishedName {
+        DistinguishedName::common_name(cn)
+            .with_country("US")
+            .with_organization("Corp")
+    }
+
+    fn corp_base() -> crate::x509::GeneralName {
+        crate::x509::GeneralName::DirectoryName(
+            DistinguishedName::new()
+                .with_country("US")
+                .with_organization("Corp"),
+        )
+    }
+
+    // ---- rfc822Name ------------------------------------------------------
+
+    #[test]
+    fn nc_rfc822_host_form_matches_exact_host_only() {
+        use crate::x509::GeneralName::{Dns, Email};
+        let nc = || nc_ext(&[Email("example.com".into())], &[], true);
+        let cn = DistinguishedName::common_name("mail");
+        leaf_under(nc(), &cn, &[Email("alice@example.com".into())]).unwrap();
+        // Domain part is case-insensitive.
+        leaf_under(nc(), &cn, &[Email("alice@EXAMPLE.COM".into())]).unwrap();
+        // A host-form constraint names one host: no subdomains.
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Email("alice@sub.example.com".into())]),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Email("alice@example.org".into())]),
+            Err(Error::BadCertificate)
+        ));
+        // One mailbox out of range poisons the certificate.
+        assert!(matches!(
+            leaf_under(
+                nc(),
+                &cn,
+                &[
+                    Email("alice@example.com".into()),
+                    Email("alice@example.org".into())
+                ]
+            ),
+            Err(Error::BadCertificate)
+        ));
+        // A name without a domain part matches no subtree.
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Email("alice".into())]),
+            Err(Error::BadCertificate)
+        ));
+        // Other name forms in the same SAN are unaffected by an rfc822Name
+        // permitted subtree.
+        leaf_under(
+            nc(),
+            &cn,
+            &[
+                Email("alice@example.com".into()),
+                Dns("anything.example.org".into()),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nc_rfc822_leading_dot_form_matches_subdomains_not_apex() {
+        use crate::x509::GeneralName::Email;
+        let nc = || nc_ext(&[Email(".example.com".into())], &[], true);
+        let cn = DistinguishedName::common_name("mail");
+        leaf_under(nc(), &cn, &[Email("alice@sub.example.com".into())]).unwrap();
+        leaf_under(nc(), &cn, &[Email("alice@a.b.example.com".into())]).unwrap();
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Email("alice@example.com".into())]),
+            Err(Error::BadCertificate)
+        ));
+        // Label boundary: "notexample.com" is not in ".example.com".
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Email("alice@notexample.com".into())]),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    #[test]
+    fn nc_rfc822_mailbox_form_is_exact() {
+        use crate::x509::GeneralName::Email;
+        let nc = || nc_ext(&[Email("alice@example.com".into())], &[], true);
+        let cn = DistinguishedName::common_name("mail");
+        leaf_under(nc(), &cn, &[Email("alice@example.com".into())]).unwrap();
+        leaf_under(nc(), &cn, &[Email("alice@Example.COM".into())]).unwrap();
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Email("bob@example.com".into())]),
+            Err(Error::BadCertificate)
+        ));
+        // The local part is compared verbatim (RFC 5321 §2.4).
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Email("Alice@example.com".into())]),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    #[test]
+    fn nc_rfc822_excluded_subtree() {
+        use crate::x509::GeneralName::Email;
+        let nc = || nc_ext(&[], &[Email(".blocked.example".into())], true);
+        let cn = DistinguishedName::common_name("mail");
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Email("x@mail.blocked.example".into())]),
+            Err(Error::BadCertificate)
+        ));
+        // The apex is outside a leading-dot exclusion...
+        leaf_under(nc(), &cn, &[Email("x@blocked.example".into())]).unwrap();
+        // ...and so is any other domain.
+        leaf_under(nc(), &cn, &[Email("x@ok.example".into())]).unwrap();
+        // Excluded wins over permitted.
+        let both = nc_ext(
+            &[Email(".example".into())],
+            &[Email(".blocked.example".into())],
+            true,
+        );
+        assert!(matches!(
+            leaf_under(both, &cn, &[Email("x@mail.blocked.example".into())]),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// RFC 5280 §4.2.1.10: with no rfc822Name SAN, the constraint applies to
+    /// the subject's `emailAddress` attribute(s); with one, the subject
+    /// attribute is not consulted.
+    #[test]
+    fn nc_rfc822_falls_back_to_subject_email_address() {
+        use crate::x509::GeneralName::{Dns, Email};
+        let nc = || nc_ext(&[Email("example.com".into())], &[], true);
+        let mut inside = DistinguishedName::common_name("host.example.org");
+        inside.email_address = Some("alice@example.com".into());
+        let mut outside = DistinguishedName::common_name("host.example.org");
+        outside.email_address = Some("alice@example.org".into());
+        let dns_only = [Dns("host.example.org".into())];
+        leaf_under(nc(), &inside, &dns_only).unwrap();
+        assert!(matches!(
+            leaf_under(nc(), &outside, &dns_only),
+            Err(Error::BadCertificate)
+        ));
+        // An rfc822Name SAN takes over: the out-of-range subject attribute
+        // is then ignored...
+        leaf_under(nc(), &outside, &[Email("bob@example.com".into())]).unwrap();
+        // ...and an in-range subject attribute does not rescue an
+        // out-of-range SAN.
+        assert!(matches!(
+            leaf_under(nc(), &inside, &[Email("bob@example.org".into())]),
+            Err(Error::BadCertificate)
+        ));
+        // A subject without emailAddress presents no rfc822Name-form name:
+        // unconstrained.
+        leaf_under(
+            nc(),
+            &DistinguishedName::common_name("host.example.org"),
+            &dns_only,
+        )
+        .unwrap();
+        // Excluded direction, via the subject attribute.
+        let ex = nc_ext(&[], &[Email("example.org".into())], true);
+        assert!(matches!(
+            leaf_under(ex, &outside, &dns_only),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    // ---- uniformResourceIdentifier ----------------------------------------
+
+    #[test]
+    fn nc_uri_host_form_matches_host_component() {
+        use crate::x509::GeneralName::Uri;
+        let nc = || nc_ext(&[Uri("example.com".into())], &[], true);
+        let cn = DistinguishedName::common_name("svc");
+        leaf_under(nc(), &cn, &[Uri("https://example.com/path?q=1#f".into())]).unwrap();
+        leaf_under(
+            nc(),
+            &cn,
+            &[Uri("https://user:pw@example.com:8443/x".into())],
+        )
+        .unwrap();
+        leaf_under(nc(), &cn, &[Uri("HTTPS://EXAMPLE.COM".into())]).unwrap();
+        leaf_under(nc(), &cn, &[Uri("ldap://example.com".into())]).unwrap();
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Uri("https://sub.example.com/".into())]),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Uri("https://example.org/".into())]),
+            Err(Error::BadCertificate)
+        ));
+        // Userinfo cannot smuggle the host: the host here is example.org.
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Uri("https://example.com@example.org/".into())]),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    #[test]
+    fn nc_uri_leading_dot_form_matches_subdomains_not_apex() {
+        use crate::x509::GeneralName::Uri;
+        let nc = || nc_ext(&[Uri(".example.com".into())], &[], true);
+        let cn = DistinguishedName::common_name("svc");
+        leaf_under(nc(), &cn, &[Uri("https://a.example.com/".into())]).unwrap();
+        leaf_under(nc(), &cn, &[Uri("https://a.b.example.com/".into())]).unwrap();
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Uri("https://example.com/".into())]),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Uri("https://notexample.com/".into())]),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// A URI whose host is an IP address, or which has no host at all,
+    /// falls within no host-name subtree: refused under a permitted list,
+    /// untouched by an excluded one.
+    #[test]
+    fn nc_uri_without_host_name_matches_no_subtree() {
+        use crate::x509::GeneralName::Uri;
+        let cn = DistinguishedName::common_name("svc");
+        for uri in [
+            "https://10.0.0.1/",
+            "https://[2001:db8::1]:443/",
+            "mailto:alice@example.com",
+            "urn:example:foo",
+            "https:///nohost",
+            "//example.com/no-scheme",
+        ] {
+            let pm = nc_ext(&[Uri("example.com".into())], &[], true);
+            assert!(
+                matches!(
+                    leaf_under(pm, &cn, &[Uri(uri.into())]),
+                    Err(Error::BadCertificate)
+                ),
+                "permitted: {uri}"
+            );
+            let ex = nc_ext(&[], &[Uri("example.com".into())], true);
+            leaf_under(ex, &cn, &[Uri(uri.into())])
+                .unwrap_or_else(|e| panic!("excluded: {uri}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn nc_uri_excluded_subtree() {
+        use crate::x509::GeneralName::Uri;
+        let nc = || nc_ext(&[], &[Uri(".blocked.example".into())], true);
+        let cn = DistinguishedName::common_name("svc");
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Uri("https://x.blocked.example/".into())]),
+            Err(Error::BadCertificate)
+        ));
+        leaf_under(nc(), &cn, &[Uri("https://blocked.example/".into())]).unwrap();
+        leaf_under(nc(), &cn, &[Uri("https://ok.example/".into())]).unwrap();
+    }
+
+    // ---- directoryName ----------------------------------------------------
+
+    #[test]
+    fn nc_directory_name_permitted_prefix_match() {
+        use crate::x509::GeneralName::Dns;
+        let nc = || nc_ext(&[corp_base()], &[], true);
+        let san = [Dns("host.example".into())];
+        // Longer subject with the constraint as RDN prefix: inside.
+        let mut deep = corp_dn("host.example");
+        deep.organizational_unit = Some("Eng".into());
+        leaf_under(nc(), &deep, &san).unwrap();
+        leaf_under(nc(), &corp_dn("host.example"), &san).unwrap();
+        // The bare prefix itself is inside too.
+        leaf_under(
+            nc(),
+            &DistinguishedName::new()
+                .with_country("US")
+                .with_organization("Corp"),
+            &san,
+        )
+        .unwrap();
+        // A differing RDN: outside.
+        assert!(matches!(
+            leaf_under(
+                nc(),
+                &DistinguishedName::common_name("host.example")
+                    .with_country("US")
+                    .with_organization("Other"),
+                &san
+            ),
+            Err(Error::BadCertificate)
+        ));
+        // A subject shorter than the constraint cannot have it as prefix.
+        assert!(matches!(
+            leaf_under(nc(), &DistinguishedName::new().with_country("US"), &san),
+            Err(Error::BadCertificate)
+        ));
+        // A subject with only a CN — the shape every other test uses —
+        // is outside as well.
+        assert!(matches!(
+            leaf_under(nc(), &DistinguishedName::common_name("host.example"), &san),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// The RDN sequence is ordered: `O=Corp, C=US` is not a prefix of
+    /// `C=US, O=Corp, CN=…`.
+    #[test]
+    fn nc_directory_name_rdn_order_matters() {
+        use crate::der::{encode_tlv, tag};
+        use crate::x509::GeneralName::Dns;
+        let swapped = raw_name(&[
+            (oid::ORGANIZATION, tag::UTF8_STRING, "Corp"),
+            (oid::COUNTRY, tag::PRINTABLE_STRING, "US"),
+        ]);
+        let nc = nc_ext_raw(&[encode_tlv(0xA4, &swapped)], &[], true);
+        assert!(matches!(
+            leaf_under(nc, &corp_dn("host.example"), &[Dns("host.example".into())]),
+            Err(Error::BadCertificate)
+        ));
+        // Sanity: the same RDNs in the subject's order do match.
+        let ordered = raw_name(&[
+            (oid::COUNTRY, tag::PRINTABLE_STRING, "US"),
+            (oid::ORGANIZATION, tag::UTF8_STRING, "Corp"),
+        ]);
+        let nc = nc_ext_raw(&[encode_tlv(0xA4, &ordered)], &[], true);
+        leaf_under(nc, &corp_dn("host.example"), &[Dns("host.example".into())]).unwrap();
+    }
+
+    /// RDNs are compared byte-for-byte, like issuer/subject chaining: a
+    /// PrintableString `O=Corp` in the constraint does not match the
+    /// UTF8String `O=Corp` the crate's builder emits.
+    #[test]
+    fn nc_directory_name_rdn_comparison_is_byte_exact() {
+        use crate::der::{encode_tlv, tag};
+        use crate::x509::GeneralName::Dns;
+        let printable = raw_name(&[
+            (oid::COUNTRY, tag::PRINTABLE_STRING, "US"),
+            (oid::ORGANIZATION, tag::PRINTABLE_STRING, "Corp"),
+        ]);
+        let nc = nc_ext_raw(&[encode_tlv(0xA4, &printable)], &[], true);
+        assert!(matches!(
+            leaf_under(nc, &corp_dn("host.example"), &[Dns("host.example".into())]),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    #[test]
+    fn nc_directory_name_excluded_subtree() {
+        use crate::x509::GeneralName::{DirectoryName, Dns};
+        let blocked = DirectoryName(
+            DistinguishedName::new()
+                .with_country("US")
+                .with_organization("Corp")
+                .with_organizational_unit("Blocked"),
+        );
+        let nc = || nc_ext(&[], core::slice::from_ref(&blocked), true);
+        let san = [Dns("host.example".into())];
+        let mut in_blocked = corp_dn("host.example");
+        in_blocked.organizational_unit = Some("Blocked".into());
+        assert!(matches!(
+            leaf_under(nc(), &in_blocked, &san),
+            Err(Error::BadCertificate)
+        ));
+        let mut in_eng = corp_dn("host.example");
+        in_eng.organizational_unit = Some("Eng".into());
+        leaf_under(nc(), &in_eng, &san).unwrap();
+        leaf_under(nc(), &corp_dn("host.example"), &san).unwrap();
+        // Excluded wins over permitted.
+        let both = nc_ext(&[corp_base()], core::slice::from_ref(&blocked), true);
+        assert!(matches!(
+            leaf_under(both, &in_blocked, &san),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// directoryName SAN entries are names of the directoryName form too.
+    #[test]
+    fn nc_directory_name_applies_to_san_directory_names() {
+        use crate::x509::GeneralName::{DirectoryName, Dns};
+        let nc = || nc_ext(&[corp_base()], &[], true);
+        let other = DirectoryName(
+            DistinguishedName::common_name("alias")
+                .with_country("US")
+                .with_organization("Other"),
+        );
+        let alias = DirectoryName(corp_dn("alias"));
+        leaf_under(
+            nc(),
+            &corp_dn("host.example"),
+            &[Dns("host.example".into()), alias],
+        )
+        .unwrap();
+        assert!(matches!(
+            leaf_under(
+                nc(),
+                &corp_dn("host.example"),
+                &[Dns("host.example".into()), other.clone()]
+            ),
+            Err(Error::BadCertificate)
+        ));
+        let ex = nc_ext(&[], &[corp_base()], true);
+        assert!(matches!(
+            leaf_under(
+                ex,
+                &DistinguishedName::common_name("host.example"),
+                &[Dns("host.example".into()), DirectoryName(corp_dn("alias"))]
+            ),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// An empty `Name` is an RDN-prefix of every name: permitted ⇒ every
+    /// DN is inside, excluded ⇒ every non-empty subject is refused. An
+    /// empty subject presents no directoryName-form name.
+    #[test]
+    fn nc_directory_name_empty_subtree_and_empty_subject() {
+        use crate::x509::GeneralName::{DirectoryName, Dns};
+        let san = [Dns("host.example".into())];
+        let empty = || DirectoryName(DistinguishedName::new());
+        leaf_under(
+            nc_ext(&[empty()], &[], true),
+            &corp_dn("host.example"),
+            &san,
+        )
+        .unwrap();
+        assert!(matches!(
+            leaf_under(
+                nc_ext(&[], &[empty()], true),
+                &corp_dn("host.example"),
+                &san
+            ),
+            Err(Error::BadCertificate)
+        ));
+        // Empty subject under a permitted directoryName subtree: nothing to
+        // constrain (the leaf still carries a dNSName, so the nameless-leaf
+        // rule is not what decides here).
+        leaf_under(
+            nc_ext(&[corp_base()], &[], true),
+            &DistinguishedName::new(),
+            &san,
+        )
+        .unwrap();
+        leaf_under(
+            nc_ext(&[], &[empty()], true),
+            &DistinguishedName::new(),
+            &san,
+        )
+        .unwrap();
+    }
+
+    // ---- criticality --------------------------------------------------------
+
+    /// RFC 5280 §6.1.4 processes nameConstraints regardless of criticality
+    /// — the non-critical form CA/Browser Forum TCSCs commonly use must be
+    /// enforced, for every subtree form.
+    #[test]
+    fn nc_non_critical_constraints_are_enforced() {
+        use crate::x509::GeneralName::{Dns, Email, Uri};
+        let cn = DistinguishedName::common_name("leaf");
+        assert!(matches!(
+            leaf_under(
+                nc_ext(&[Dns(".good.example".into())], &[], false),
+                &cn,
+                &[Dns("host.evil.example".into())]
+            ),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(
+            leaf_under(
+                nc_ext(&[Email("example.com".into())], &[], false),
+                &cn,
+                &[Email("x@example.org".into())]
+            ),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(
+            leaf_under(
+                nc_ext(&[], &[Uri(".blocked.example".into())], false),
+                &cn,
+                &[Uri("https://x.blocked.example/".into())]
+            ),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(
+            leaf_under(
+                nc_ext(&[corp_base()], &[], false),
+                &cn,
+                &[Dns("host.example".into())]
+            ),
+            Err(Error::BadCertificate)
+        ));
+        // And in-range names still pass a non-critical constraint.
+        leaf_under(
+            nc_ext(&[corp_base(), Dns(".good.example".into())], &[], false),
+            &corp_dn("host.good.example"),
+            &[Dns("host.good.example".into())],
+        )
+        .unwrap();
+    }
+
+    /// A CA/Browser Forum technically-constrained sub-CA: non-critical
+    /// nameConstraints with a dNSName + directoryName permitted subtree and
+    /// iPAddress `0.0.0.0/0` + `::/0` excluded.
+    #[test]
+    fn nc_cab_forum_technically_constrained_sub_ca() {
+        use crate::der::encode_tlv;
+        use crate::x509::GeneralName::{Dns, IpV4};
+        let tcsc = || {
+            let corp = DistinguishedName::new()
+                .with_country("US")
+                .with_organization("Corp");
+            nc_ext_raw(
+                &[
+                    Dns("corp.example".into()).to_der(),
+                    encode_tlv(0xA4, &corp.to_der()),
+                ],
+                &[encode_tlv(0x87, &[0u8; 8]), encode_tlv(0x87, &[0u8; 32])],
+                false,
+            )
+        };
+        leaf_under(
+            tcsc(),
+            &corp_dn("www.corp.example"),
+            &[Dns("www.corp.example".into()), Dns("corp.example".into())],
+        )
+        .unwrap();
+        // DNS name outside the permitted subtree.
+        assert!(matches!(
+            leaf_under(
+                tcsc(),
+                &corp_dn("www.other.example"),
+                &[Dns("www.other.example".into())]
+            ),
+            Err(Error::BadCertificate)
+        ));
+        // Subject outside the permitted directoryName subtree.
+        assert!(matches!(
+            leaf_under(
+                tcsc(),
+                &DistinguishedName::common_name("www.corp.example")
+                    .with_country("US")
+                    .with_organization("Other"),
+                &[Dns("www.corp.example".into())]
+            ),
+            Err(Error::BadCertificate)
+        ));
+        // Any IP address is excluded.
+        assert!(matches!(
+            leaf_under(
+                tcsc(),
+                &corp_dn("www.corp.example"),
+                &[Dns("www.corp.example".into()), IpV4([10, 1, 2, 3])]
+            ),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    // ---- per-form independence ----------------------------------------------
+
+    /// A leaf whose SAN holds only rfc822Name / URI entries is not
+    /// restricted by a CA that permits only dNSName subtrees: a name form
+    /// with no constraint is unrestricted (RFC 5280 §4.2.1.10). The SAN
+    /// extension is present, so the CN is not a dNSName fallback either.
+    #[test]
+    fn nc_leaf_with_only_email_or_uri_sans_passes_dns_only_permitted() {
+        use crate::x509::GeneralName::{Dns, Email, Uri};
+        let nc = || nc_ext(&[Dns(".good.example".into())], &[], true);
+        let cn = DistinguishedName::common_name("nc-leaf");
+        leaf_under(nc(), &cn, &[Email("alice@anywhere.example".into())]).unwrap();
+        leaf_under(nc(), &cn, &[Uri("https://anywhere.example/".into())]).unwrap();
+        // With a dNSName alongside, that dNSName is still held to the
+        // subtree.
+        assert!(matches!(
+            leaf_under(
+                nc(),
+                &cn,
+                &[
+                    Email("alice@anywhere.example".into()),
+                    Dns("host.evil.example".into())
+                ]
+            ),
+            Err(Error::BadCertificate)
+        ));
+        // Without any SAN, the CN fallback still applies — "nc-leaf" is
+        // outside `.good.example`.
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[]),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    // ---- unsupported subtree forms -----------------------------------------
+
+    /// A raw `otherName` GeneralName (`[0]`, constructed): a UPN-style
+    /// `SEQUENCE { type-id OID, value [0] EXPLICIT UTF8String }`.
+    fn other_name_tlv(value: &str) -> Vec<u8> {
+        use crate::der::{encode_context, encode_sequence, encode_string, oid_tlv, tag};
+        // Microsoft UPN 1.3.6.1.4.1.311.20.2.3.
+        let body = [
+            oid_tlv(&[1, 3, 6, 1, 4, 1, 311, 20, 2, 3]),
+            encode_context(0, &encode_string(tag::UTF8_STRING, value)),
+        ]
+        .concat();
+        encode_context(0, &encode_sequence(&body))
+    }
+
+    /// A raw `subjectAltName` extension from pre-encoded GeneralName TLVs.
+    fn raw_san(entries: &[Vec<u8>]) -> crate::x509::Extension {
+        crate::x509::Extension {
+            oid: oid::SUBJECT_ALT_NAME.to_vec(),
+            critical: false,
+            value: crate::der::encode_sequence(&entries.concat()),
+        }
+    }
+
+    /// An otherName subtree (a form the crate cannot match) is inert for a
+    /// certificate that presents no otherName — whether the extension is
+    /// critical or not — and fatal for one that does, in either direction.
+    #[test]
+    fn nc_unsupported_subtree_form_fails_closed_only_when_presented() {
+        use crate::x509::GeneralName::Dns;
+        let dns_tlv = Dns("host.example".into()).to_der();
+        let cn = DistinguishedName::common_name("host.example");
+        for critical in [true, false] {
+            // Permitted otherName, no otherName in the SAN: ignored.
+            let nc = nc_ext_raw(&[other_name_tlv("ca@corp")], &[], critical);
+            leaf_under(nc, &cn, &[Dns("host.example".into())]).unwrap();
+            // Excluded otherName, no otherName in the SAN: ignored.
+            let nc = nc_ext_raw(&[], &[other_name_tlv("ca@corp")], critical);
+            leaf_under(nc, &cn, &[Dns("host.example".into())]).unwrap();
+            // Either direction with an otherName in the SAN: refused.
+            for (pm, ex) in [
+                (alloc::vec![other_name_tlv("ca@corp")], alloc::vec![]),
+                (alloc::vec![], alloc::vec![other_name_tlv("ca@corp")]),
+            ] {
+                let (root, int, leaf) = build_nc_chain(
+                    None,
+                    Some(nc_ext_raw(&pm, &ex, critical)),
+                    &DistinguishedName::common_name("nc-forms-int"),
+                    &[],
+                    &cn,
+                    &[],
+                    &[raw_san(&[dns_tlv.clone(), other_name_tlv("user@corp")])],
+                );
+                assert!(matches!(
+                    verify_nc_chain(&root, &int, &leaf),
+                    Err(Error::BadCertificate)
+                ));
+            }
+        }
+        // A different unsupported form in the SAN (registeredID) is not
+        // what an otherName subtree constrains.
+        let registered_id = crate::der::encode_tlv(0x88, &[0x2b, 0x06, 0x01]);
+        let (root, int, leaf) = build_nc_chain(
+            None,
+            Some(nc_ext_raw(&[other_name_tlv("ca@corp")], &[], true)),
+            &DistinguishedName::common_name("nc-forms-int"),
+            &[],
+            &cn,
+            &[],
+            &[raw_san(&[dns_tlv.clone(), registered_id])],
+        );
+        verify_nc_chain(&root, &int, &leaf).unwrap();
+    }
+
+    // ---- trust-anchor constraints ---------------------------------------------
+
+    /// A root whose nameConstraints use the rfc822Name / directoryName /
+    /// otherName forms is accepted by `add_der` and enforced like an
+    /// in-chain CA's (including the fail-closed rule for otherName).
+    #[test]
+    fn anchor_name_constraints_cover_every_form() {
+        use crate::x509::GeneralName::{Dns, Email};
+        let int_dn = corp_dn("Corp Issuing CA");
+        let leaf_ok = corp_dn("host.corp.example");
+        let build = |root_nc, leaf_dn: &DistinguishedName, sans: &[crate::x509::GeneralName]| {
+            build_nc_chain(Some(root_nc), None, &int_dn, &[], leaf_dn, sans, &[])
+        };
+        // rfc822Name on the anchor.
+        let nc = nc_ext(&[Email("corp.example".into())], &[], true);
+        let (root, int, leaf) = build(nc.clone(), &leaf_ok, &[Email("a@corp.example".into())]);
+        verify_nc_chain(&root, &int, &leaf).unwrap();
+        let (root, int, leaf) = build(nc, &leaf_ok, &[Email("a@other.example".into())]);
+        assert!(matches!(
+            verify_nc_chain(&root, &int, &leaf),
+            Err(Error::BadCertificate)
+        ));
+        // directoryName on the anchor governs the intermediate as well.
+        let nc = nc_ext(&[corp_base()], &[], false);
+        let (root, int, leaf) = build(nc.clone(), &leaf_ok, &[Dns("host.corp.example".into())]);
+        verify_nc_chain(&root, &int, &leaf).unwrap();
+        let (root, int, leaf) = build_nc_chain(
+            Some(nc),
+            None,
+            &DistinguishedName::common_name("Rogue CA"),
+            &[],
+            &leaf_ok,
+            &[Dns("host.corp.example".into())],
+            &[],
+        );
+        assert!(matches!(
+            verify_nc_chain(&root, &int, &leaf),
+            Err(Error::BadCertificate)
+        ));
+        // otherName on the anchor: installed, inert without an otherName
+        // SAN, fatal with one.
+        let nc = nc_ext_raw(&[other_name_tlv("ca@corp")], &[], true);
+        let (root, int, leaf) = build(nc.clone(), &leaf_ok, &[Dns("host.corp.example".into())]);
+        verify_nc_chain(&root, &int, &leaf).unwrap();
+        let (root, int, leaf) = build_nc_chain(
+            Some(nc),
+            None,
+            &int_dn,
+            &[],
+            &leaf_ok,
+            &[],
+            &[raw_san(&[other_name_tlv("user@corp")])],
+        );
+        assert!(matches!(
+            verify_nc_chain(&root, &int, &leaf),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    // ---- RFC 5280 §6.1.3 per-certificate rules ----------------------------------
+
+    /// Only the leaf's commonName is ever used as a hostname, so only the
+    /// leaf's CN is held to dNSName subtrees: a SAN-less intermediate with
+    /// a display-name CN under a dNSName-constrained root validates.
+    #[test]
+    fn nc_intermediate_cn_is_not_a_dns_name() {
+        use crate::x509::GeneralName::Dns;
+        let nc = nc_ext(&[Dns(".corp.example".into())], &[], true);
+        let (root, int, leaf) = build_nc_chain(
+            Some(nc),
+            None,
+            &corp_dn("Corp Issuing CA 1"),
+            &[],
+            &corp_dn("host.corp.example"),
+            &[Dns("host.corp.example".into())],
+            &[],
+        );
+        verify_nc_chain(&root, &int, &leaf).unwrap();
+        // An intermediate's actual dNSName SAN is still held to the subtree.
+        let nc = nc_ext(&[Dns(".corp.example".into())], &[], true);
+        let (root, int, leaf) = build_nc_chain(
+            Some(nc),
+            None,
+            &corp_dn("Corp Issuing CA 1"),
+            &[Dns("ca.other.example".into())],
+            &corp_dn("host.corp.example"),
+            &[Dns("host.corp.example".into())],
+            &[],
+        );
+        assert!(matches!(
+            verify_nc_chain(&root, &int, &leaf),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// RFC 5280 §6.1.3(b): a self-issued certificate that is not the leaf is
+    /// not checked against the name constraints. `root(NC) → int → int'
+    /// (subject = issuer = int's name, new key, out-of-range SAN) → leaf`.
+    #[test]
+    fn nc_self_issued_intermediate_is_skipped() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::GeneralName::Dns;
+        use crate::x509::{
+            CertSigner, KeyUsageBits,
+            extension::{
+                basic_constraints, extended_key_usage, key_usage, name_constraints,
+                subject_alt_name,
+            },
+        };
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"nc-self-issued", b"n", &[]);
+        let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let int_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let int2_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let root_signer = CertSigner::Ecdsa(&root_key);
+        let int_signer = CertSigner::Ecdsa(&int_key);
+        let int2_signer = CertSigner::Ecdsa(&int2_key);
+        let root_name = DistinguishedName::common_name("si-root");
+        let int_name = DistinguishedName::common_name("si-int");
+        let ca_exts = |extra: &[crate::x509::Extension]| {
+            let mut v = alloc::vec![
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            ];
+            v.extend_from_slice(extra);
+            v
+        };
+        let root = Certificate::self_signed_with_extensions(
+            &root_signer,
+            &root_name,
+            &validity(),
+            1,
+            &ca_exts(&[name_constraints(&[Dns(".corp.example".into())], &[])]),
+        )
+        .unwrap();
+        let int = Certificate::issue_with_extensions(
+            &root_signer,
+            &root_name,
+            &int_name,
+            &crate::x509::AnyPublicKey::Ecdsa(int_key.public_key()),
+            &validity(),
+            2,
+            &ca_exts(&[]),
+        )
+        .unwrap();
+        // Self-issued re-key of `int`, carrying a dNSName outside the
+        // root's subtree.
+        let int2 = Certificate::issue_with_extensions(
+            &int_signer,
+            &int_name,
+            &int_name,
+            &crate::x509::AnyPublicKey::Ecdsa(int2_key.public_key()),
+            &validity(),
+            3,
+            &ca_exts(&[subject_alt_name(&[Dns("rekey.other.example".into())])]),
+        )
+        .unwrap();
+        let leaf = Certificate::issue_with_extensions(
+            &int2_signer,
+            &int_name,
+            &DistinguishedName::common_name("host.corp.example"),
+            &crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity(),
+            4,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+                subject_alt_name(&[Dns("host.corp.example".into())]),
+            ],
+        )
+        .unwrap();
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let chain = alloc::vec![
+            leaf.to_der().to_vec(),
+            int2.to_der().to_vec(),
+            int.to_der().to_vec(),
+        ];
+        verify_chain(&store, &chain, Some(&now), &policy()).unwrap();
+        // The leaf below it is still governed by the root's constraint.
+        let bad_leaf = Certificate::issue_with_extensions(
+            &int2_signer,
+            &int_name,
+            &DistinguishedName::common_name("host.other.example"),
+            &crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity(),
+            5,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+                subject_alt_name(&[Dns("host.other.example".into())]),
+            ],
+        )
+        .unwrap();
+        let chain = alloc::vec![
+            bad_leaf.to_der().to_vec(),
+            int2.to_der().to_vec(),
+            int.to_der().to_vec(),
+        ];
+        assert!(matches!(
+            verify_chain(&store, &chain, Some(&now), &policy()),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    // ---- matcher unit tests ---------------------------------------------------------
+
+    #[test]
+    fn host_in_subtree_semantics() {
+        assert!(super::host_in_subtree("example.com", "example.com"));
+        assert!(super::host_in_subtree("EXAMPLE.com", "example.COM"));
+        assert!(!super::host_in_subtree("a.example.com", "example.com"));
+        assert!(!super::host_in_subtree("example.com", ".example.com"));
+        assert!(super::host_in_subtree("a.example.com", ".example.com"));
+        assert!(super::host_in_subtree("a.b.example.com", ".example.com"));
+        assert!(!super::host_in_subtree("notexample.com", ".example.com"));
+        assert!(!super::host_in_subtree("", ".example.com"));
+        assert!(!super::host_in_subtree("example.com", ""));
+    }
+
+    #[test]
+    fn email_in_subtree_semantics() {
+        assert!(super::email_in_subtree("a@example.com", "example.com"));
+        assert!(super::email_in_subtree("a@x.example.com", ".example.com"));
+        assert!(super::email_in_subtree("a@example.com", "a@EXAMPLE.com"));
+        assert!(!super::email_in_subtree("A@example.com", "a@example.com"));
+        assert!(!super::email_in_subtree("b@example.com", "a@example.com"));
+        assert!(!super::email_in_subtree("a", "example.com"));
+        assert!(!super::email_in_subtree("a", "a@example.com"));
+        // The domain part is what follows the LAST '@'.
+        assert!(super::email_in_subtree(
+            "\"a@b\"@example.com",
+            "example.com"
+        ));
+        assert!(!super::email_in_subtree("a@b@evil.example", "b"));
+    }
+
+    #[test]
+    fn uri_host_extraction() {
+        assert_eq!(
+            super::uri_host("https://example.com/p"),
+            Some("example.com")
+        );
+        assert_eq!(super::uri_host("https://example.com"), Some("example.com"));
+        assert_eq!(
+            super::uri_host("https://example.com?x"),
+            Some("example.com")
+        );
+        assert_eq!(
+            super::uri_host("https://example.com#x"),
+            Some("example.com")
+        );
+        assert_eq!(
+            super::uri_host("https://u:p@example.com:8443/"),
+            Some("example.com")
+        );
+        assert_eq!(
+            super::uri_host("ldap://Example.COM:389/dc=x"),
+            Some("Example.COM")
+        );
+        assert_eq!(super::uri_host("https://10.0.0.1/"), None);
+        assert_eq!(super::uri_host("https://[::1]/"), None);
+        assert_eq!(super::uri_host("https://[::1]:8443/"), None);
+        assert_eq!(super::uri_host("mailto:a@example.com"), None);
+        assert_eq!(super::uri_host("urn:isbn:123"), None);
+        assert_eq!(super::uri_host("https:///path"), None);
+        assert_eq!(super::uri_host("//example.com/"), None);
+        assert_eq!(super::uri_host("example.com"), None);
+        assert_eq!(super::uri_host("1http://example.com/"), None);
+        assert_eq!(
+            super::uri_host("https://example.com@evil.example/"),
+            Some("evil.example")
+        );
+    }
+
+    #[test]
+    fn dn_in_subtree_semantics() {
+        use crate::der::tag;
+        let c = (oid::COUNTRY, tag::PRINTABLE_STRING, "US");
+        let o = (oid::ORGANIZATION, tag::UTF8_STRING, "Corp");
+        let cn = (oid::COMMON_NAME, tag::UTF8_STRING, "x");
+        let full = raw_name(&[c, o, cn]);
+        assert!(super::dn_in_subtree(&full, &raw_name(&[c, o])));
+        assert!(super::dn_in_subtree(&full, &raw_name(&[c])));
+        assert!(super::dn_in_subtree(&full, &raw_name(&[c, o, cn])));
+        assert!(super::dn_in_subtree(&full, &raw_name(&[])));
+        assert!(!super::dn_in_subtree(&full, &raw_name(&[o, c])));
+        assert!(!super::dn_in_subtree(&full, &raw_name(&[o])));
+        assert!(!super::dn_in_subtree(&raw_name(&[c]), &raw_name(&[c, o])));
+        assert!(!super::dn_in_subtree(&raw_name(&[]), &raw_name(&[c])));
+        // Not a Name on either side: no match.
+        assert!(!super::dn_in_subtree(&[0x30, 0x01], &raw_name(&[c])));
+        assert!(!super::dn_in_subtree(&full, &[0x04, 0x00]));
     }
 }

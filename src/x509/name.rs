@@ -18,6 +18,9 @@ pub struct DistinguishedName {
     pub organizational_unit: Option<String>,
     /// `commonName` (CN).
     pub common_name: Option<String>,
+    /// PKCS#9 `emailAddress` (RFC 5280 §4.1.2.6 legacy attribute; encoded
+    /// as an IA5String and placed last, after the CN).
+    pub email_address: Option<String>,
 }
 
 impl DistinguishedName {
@@ -46,6 +49,18 @@ impl DistinguishedName {
         self
     }
 
+    /// Builder setter for the organizational unit.
+    pub fn with_organizational_unit(mut self, ou: &str) -> Self {
+        self.organizational_unit = Some(String::from(ou));
+        self
+    }
+
+    /// Builder setter for the PKCS#9 `emailAddress` attribute.
+    pub fn with_email_address(mut self, email: &str) -> Self {
+        self.email_address = Some(String::from(email));
+        self
+    }
+
     /// Encodes the name as a DER `RDNSequence` (`SEQUENCE OF RelativeDistinguishedName`).
     pub(crate) fn to_der(&self) -> Vec<u8> {
         let mut rdns = Vec::new();
@@ -61,6 +76,9 @@ impl DistinguishedName {
         }
         if let Some(cn) = &self.common_name {
             rdns.extend_from_slice(&rdn(oid::COMMON_NAME, tag::UTF8_STRING, cn));
+        }
+        if let Some(email) = &self.email_address {
+            rdns.extend_from_slice(&rdn(oid::EMAIL_ADDRESS, tag::IA5_STRING, email));
         }
         encode_sequence(&rdns)
     }
@@ -114,6 +132,8 @@ impl DistinguishedName {
                     dn.organizational_unit = Some(s);
                 } else if arcs == oid::COUNTRY {
                     dn.country = Some(s);
+                } else if arcs == oid::EMAIL_ADDRESS {
+                    dn.email_address = Some(s);
                 }
                 // Unknown attributes are ignored.
             }
@@ -121,6 +141,42 @@ impl DistinguishedName {
         }
         Ok(dn)
     }
+}
+
+/// Every PKCS#9 `emailAddress` attribute value in a DER `Name` TLV, in
+/// order. RFC 5280 §4.2.1.10 uses these as the rfc822Name-form names of a
+/// certificate that has no rfc822Name subjectAltName entry; a name may
+/// carry several, so this walks the raw RDNSequence instead of relying on
+/// the single [`DistinguishedName::email_address`] slot.
+// Consumed only by the `tls`-gated path validator (`tls::pki`).
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+pub(crate) fn email_addresses_in_name(name_der: &[u8]) -> Result<Vec<String>, Error> {
+    let mut out = Vec::new();
+    let mut reader = Reader::new(name_der);
+    let mut seq = reader.read_sequence()?;
+    reader.finish()?;
+    while !seq.is_empty() {
+        let set = seq.read_tlv(tag::SET)?;
+        let mut set_reader = Reader::new(set);
+        if set_reader.is_empty() {
+            return Err(Error::Malformed);
+        }
+        while !set_reader.is_empty() {
+            let mut atv = set_reader.read_sequence()?;
+            let oid_body = atv.read_oid()?;
+            let (value_tag, value) = atv.read_any()?;
+            atv.finish()?;
+            if parse_oid(oid_body)?.as_slice() == oid::EMAIL_ADDRESS {
+                let s = decode_directory_string(value_tag, value)?;
+                if s.chars().any(|c| c.is_control()) {
+                    return Err(Error::Malformed);
+                }
+                out.push(s);
+            }
+        }
+        set_reader.finish()?;
+    }
+    Ok(out)
 }
 
 /// `TeletexString` / `T61String` tag.
@@ -189,6 +245,46 @@ fn rdn(attr_oid: &[u64], value_tag: u8, value: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `emailAddress` round-trips through the builder (as an IA5String,
+    /// after the CN) and is picked up by the decoder; `email_addresses_in_name`
+    /// sees every occurrence, in order, and ignores the other attributes.
+    #[test]
+    fn email_address_round_trip_and_raw_walk() {
+        let dn = DistinguishedName::common_name("x")
+            .with_organization("Corp")
+            .with_email_address("alice@example.com");
+        let der = dn.to_der();
+        let decoded = DistinguishedName::decode(&mut Reader::new(&der)).unwrap();
+        assert_eq!(decoded, dn);
+        // Last RDN is the IA5String emailAddress.
+        assert!(der.ends_with(&encode_string(tag::IA5_STRING, "alice@example.com")));
+        assert_eq!(
+            email_addresses_in_name(&der).unwrap(),
+            alloc::vec![String::from("alice@example.com")]
+        );
+        // Two emailAddress RDNs: the walker keeps both.
+        let two = encode_sequence(
+            &[
+                rdn(oid::COMMON_NAME, tag::UTF8_STRING, "x"),
+                rdn(oid::EMAIL_ADDRESS, tag::IA5_STRING, "a@example.com"),
+                rdn(oid::EMAIL_ADDRESS, tag::IA5_STRING, "b@example.org"),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            email_addresses_in_name(&two).unwrap(),
+            alloc::vec![String::from("a@example.com"), String::from("b@example.org")]
+        );
+        assert!(
+            email_addresses_in_name(&DistinguishedName::common_name("x").to_der())
+                .unwrap()
+                .is_empty()
+        );
+        // Malformed names are refused, not read as "no addresses".
+        assert!(email_addresses_in_name(&[0x30, 0x02, 0x31, 0x00]).is_err());
+        assert!(email_addresses_in_name(&[0x04, 0x00]).is_err());
+    }
 
     /// Builds a one-attribute `Name` (RDNSequence) DER whose single
     /// commonName carries `value` as a UTF8String body (verbatim bytes, so a

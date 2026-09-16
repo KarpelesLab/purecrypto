@@ -44,8 +44,8 @@ pub(crate) struct TrustAnchor {
 /// Roots that declare a `nameConstraints` extension keep it: the constraints
 /// are enforced over every chain that anchors at that root (RFC 5280 §6.1.4),
 /// the same way constraints declared by in-chain intermediate CAs are. See
-/// [`RootCertStore::add_der`] for the fail-closed handling of constraint
-/// shapes the validator cannot evaluate.
+/// [`RootCertStore::add_der`] for the handling of constraint forms the
+/// validator cannot evaluate.
 #[derive(Clone, Default)]
 pub struct RootCertStore {
     anchors: Vec<TrustAnchor>,
@@ -64,12 +64,15 @@ impl RootCertStore {
     ///
     /// A `nameConstraints` extension on the root is retained and enforced
     /// over every chain that anchors at it (RFC 5280 §6.1.4), exactly as an
-    /// in-chain CA's constraints would be. Because an admin installing a
-    /// constrained root does so deliberately, this fails closed: a root
-    /// whose `nameConstraints` extension does not parse, or whose subtrees
-    /// reference a GeneralName variant the validator cannot evaluate
-    /// (anything other than dNSName / iPAddress), is rejected rather than
-    /// added with its constraints silently ignored.
+    /// in-chain CA's constraints would be — every subtree form the
+    /// validator evaluates (dNSName, iPAddress, rfc822Name, URI,
+    /// directoryName) and, for the forms it cannot (otherName, x400Address,
+    /// ediPartyName, registeredID), the same fail-closed rule as for an
+    /// in-chain CA: a subordinate certificate presenting a name of such a
+    /// form is refused. Because an admin installing a constrained root does
+    /// so deliberately, a root whose `nameConstraints` extension does not
+    /// parse is rejected rather than added with its constraints silently
+    /// ignored.
     pub fn add_der(&mut self, der: Vec<u8>) -> Result<(), Error> {
         let cert = Certificate::from_der(der).map_err(|_| Error::BadCertificate)?;
         let subject_der = cert
@@ -81,11 +84,6 @@ impl RootCertStore {
             .map_err(|_| Error::BadCertificate)?;
         let spki_der = cert.spki_der().map_err(|_| Error::BadCertificate)?.to_vec();
         let name_constraints = cert.name_constraints().map_err(|_| Error::BadCertificate)?;
-        if let Some(nc) = &name_constraints
-            && (nc.has_unenforceable_permitted || nc.has_unenforceable_excluded)
-        {
-            return Err(Error::BadCertificate);
-        }
         // RFC 5937 anchor constraints: keep the anchor's own
         // `pathLenConstraint` and `extKeyUsage`, when it declares them, so the
         // validator can honour them (see [`TrustAnchor`]). Both are optional

@@ -25,11 +25,13 @@ mod time;
 
 #[cfg(all(feature = "mlkem", feature = "key"))]
 pub use anykey::{AnyDecapsulationKey, AnyEncapsulationKey, AnyKey, AnyKeyPublic};
-pub use cert::{Certificate, NameConstraints, PreparedCertificate, SanIp};
+pub use cert::{Certificate, NameConstraints, NameSubtrees, PreparedCertificate, SanIp};
 pub use crl::{CertificateRevocationList, CrlBuilder, CrlReason, PreparedCrl, RevokedCertificate};
 pub use csr::CertificationRequest;
 pub use extension::{Extension, GeneralName, KeyUsageBits};
 pub use name::DistinguishedName;
+#[cfg_attr(not(feature = "tls"), allow(unused_imports))]
+pub(crate) use name::email_addresses_in_name;
 pub use ocsp::{
     OcspCertStatus, OcspCheckOptions, OcspRequest, OcspRequestBuilder, OcspResponse,
     OcspResponseBuilder, OcspResponseStatus, OcspSingleResponse, PreparedOcsp,
@@ -116,6 +118,8 @@ pub mod oid {
     pub const ORGANIZATION: &[u64] = &[2, 5, 4, 10];
     /// `id-at-organizationalUnitName` (2.5.4.11).
     pub const ORGANIZATIONAL_UNIT: &[u64] = &[2, 5, 4, 11];
+    /// PKCS#9 `emailAddress` attribute (1.2.840.113549.1.9.1).
+    pub const EMAIL_ADDRESS: &[u64] = &[1, 2, 840, 113549, 1, 9, 1];
 
     /// `id-ce-basicConstraints` (2.5.29.19).
     pub const BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
