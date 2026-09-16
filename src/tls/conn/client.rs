@@ -3187,6 +3187,18 @@ impl ClientConnection {
             if self.config.cert_compression_algorithms.is_empty() {
                 return Err(Error::UnexpectedMessage);
             }
+            // RFC 8879 §3/§4: the peer may only compress with an algorithm
+            // from our `compress_certificate` advertisement. The decoder
+            // checks what this build *can* decompress; that is not the same
+            // set when the configured list names other algorithms, so pin the
+            // wire algorithm to the advertised list before decompressing.
+            let algorithm = body
+                .get(..2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                .ok_or(Error::CertDecompressionFailed)?;
+            if !self.config.cert_compression_algorithms.contains(&algorithm) {
+                return Err(Error::IllegalParameter);
+            }
             _decompressed = crate::tls::cert_compression::decode_compressed_certificate(body)?;
             &_decompressed
         } else if msg_type == hs_type::CERTIFICATE {
@@ -4309,6 +4321,42 @@ mod tests {
             matches!(err, Error::Decode),
             "over-limit EE extension count must be rejected with Decode, got {err:?}"
         );
+    }
+
+    /// RFC 8879 §3: a `CompressedCertificate` may only use an algorithm the
+    /// client advertised. A client advertising brotli alone used to accept a
+    /// zlib-compressed Certificate because the decoder only asked whether
+    /// zlib was *supported*; it must be refused as `illegal_parameter`.
+    #[cfg(feature = "cert-compression")]
+    #[test]
+    fn client_rejects_compressed_certificate_with_unadvertised_algorithm() {
+        use crate::tls::cert_compression::{algorithm, encode_compressed_certificate};
+
+        // An empty (but well-framed) Certificate body: context = [], list = [].
+        let cert_body = [0u8, 0, 0, 0];
+        let msg = encode_compressed_certificate(algorithm::ZLIB, &cert_body).unwrap();
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"cc-unadvertised", b"nonce", &[]);
+        let config = ClientConfig::new(RootCertStore::new())
+            .with_cert_compression_algorithms(alloc::vec![algorithm::BROTLI]);
+        let mut client = ClientConnection::new(config, "h", &mut rng).unwrap();
+        client.state = State::WaitCertificate;
+        assert!(matches!(
+            client.handle_handshake_for_test(msg.clone()),
+            Err(Error::IllegalParameter)
+        ));
+
+        // Control: with zlib advertised the message is decompressed and
+        // fails only later, on the empty certificate list.
+        let mut rng = HmacDrbg::<Sha256>::new(b"cc-advertised", b"nonce", &[]);
+        let config = ClientConfig::new(RootCertStore::new())
+            .with_cert_compression_algorithms(alloc::vec![algorithm::ZLIB]);
+        let mut client = ClientConnection::new(config, "h", &mut rng).unwrap();
+        client.state = State::WaitCertificate;
+        assert!(matches!(
+            client.handle_handshake_for_test(msg),
+            Err(Error::BadCertificate)
+        ));
     }
 
     /// Wave 3b.2: when [`ClientConfig::ech`] is set to a Real
