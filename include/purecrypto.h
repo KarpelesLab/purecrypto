@@ -576,8 +576,14 @@ void pc_sm2_free(PcSm2 *k);
 
 /* ---- LMS (single tree) ---- */
 PcLms *pc_lms_generate(int32_t lms_param, int32_t lmots_param); /* pc_lms_type, pc_lmots_type */
-PcLms *pc_lms_from_bytes(const uint8_t *bytes, size_t len);
+PcLms *pc_lms_from_bytes(const uint8_t *bytes, size_t len); /* plain or cached form */
 pc_status pc_lms_private_to_bytes(const PcLms *k, uint8_t *out, size_t *out_len);
+/* Same state plus the signer's Merkle node cache (2 KiB for H5, 64 KiB for
+ * H10, ~2 MiB for H15 and above): a handle loaded from these bytes signs at
+ * once, where one loaded from the plain form first re-derives its tree (a
+ * full key generation: seconds for H15, minutes for H20, hours for H25).
+ * Prefer it when each signature runs in a fresh process. */
+pc_status pc_lms_private_to_bytes_with_cache(const PcLms *k, uint8_t *out, size_t *out_len);
 pc_status pc_lms_public_to_bytes(const PcLms *k, uint8_t *out, size_t *out_len);
 /* Advances the handle's index; persist via pc_lms_private_to_bytes before use.
  * The output capacity is checked BEFORE signing: a size query (*out_len == 0)
@@ -592,8 +598,10 @@ void pc_lms_free(PcLms *k);
 
 /* ---- HSS (multi-level LMS) ---- */
 PcHss *pc_hss_generate(size_t levels, int32_t lms_param, int32_t lmots_param); /* levels 1..8 */
-PcHss *pc_hss_from_bytes(const uint8_t *bytes, size_t len);
+PcHss *pc_hss_from_bytes(const uint8_t *bytes, size_t len); /* plain or cached form */
 pc_status pc_hss_private_to_bytes(const PcHss *k, uint8_t *out, size_t *out_len);
+/* Cached form, one node cache per level (see pc_lms_private_to_bytes_with_cache). */
+pc_status pc_hss_private_to_bytes_with_cache(const PcHss *k, uint8_t *out, size_t *out_len);
 pc_status pc_hss_public_to_bytes(const PcHss *k, uint8_t *out, size_t *out_len);
 /* Advances the handle's state; persist via pc_hss_private_to_bytes before use.
  * Capacity is checked BEFORE signing (see pc_lms_sign): a size query never

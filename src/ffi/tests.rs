@@ -682,6 +682,90 @@ fn hss_sign_size_query_does_not_burn_a_key() {
     }
 }
 
+/// The cached serializations load through the same `*_from_bytes`, carry the
+/// same state (the plain serialization of the reloaded handle is identical),
+/// and the reloaded handle signs verifiably. The plain form is unaffected.
+#[test]
+fn lms_hss_cached_serialization_roundtrip() {
+    let msg = b"cached-form message";
+
+    let k = lms::pc_lms_generate(5 /* H5 */, 4 /* W8 */);
+    assert!(!k.is_null());
+    let mut sig = vec![0u8; 4096];
+    let mut cap = sig.len();
+    let st = unsafe { lms::pc_lms_sign(k, msg.as_ptr(), msg.len(), sig.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::Ok);
+    let plain = read_out(|o, l| unsafe { lms::pc_lms_private_to_bytes(k, o, l) });
+    let cached = read_out(|o, l| unsafe { lms::pc_lms_private_to_bytes_with_cache(k, o, l) });
+    assert_eq!(plain.len(), 92, "plain LMS form is unchanged");
+    assert_eq!(&cached[..4], b"LMC1");
+    // 4 magic + 92 + 1 flag + (4 + 63 nodes * 32) cache + 32 tag.
+    assert_eq!(cached.len(), 4 + 92 + 1 + 4 + 63 * 32 + 32);
+    let pk = read_out(|o, l| unsafe { lms::pc_lms_public_to_bytes(k, o, l) });
+    unsafe { lms::pc_lms_free(k) };
+
+    let k2 = unsafe { lms::pc_lms_from_bytes(cached.as_ptr(), cached.len()) };
+    assert!(!k2.is_null(), "cached form must load");
+    assert_eq!(
+        read_out(|o, l| unsafe { lms::pc_lms_private_to_bytes(k2, o, l) }),
+        plain,
+        "state survives the cached form"
+    );
+    let mut cap = sig.len();
+    let st = unsafe { lms::pc_lms_sign(k2, msg.as_ptr(), msg.len(), sig.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(u32::from_be_bytes(sig[..4].try_into().unwrap()), 1);
+    let st = unsafe {
+        lms::pc_lms_verify(
+            pk.as_ptr(),
+            pk.len(),
+            msg.as_ptr(),
+            msg.len(),
+            sig.as_ptr(),
+            cap,
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    unsafe { lms::pc_lms_free(k2) };
+    // A flipped cache byte is refused.
+    let mut bad = cached.clone();
+    bad[4 + 92 + 1 + 4 + 40] ^= 1;
+    assert!(unsafe { lms::pc_lms_from_bytes(bad.as_ptr(), bad.len()) }.is_null());
+
+    let h = lms::pc_hss_generate(2, 5 /* H5 */, 3 /* W4 */);
+    assert!(!h.is_null());
+    let plain = read_out(|o, l| unsafe { lms::pc_hss_private_to_bytes(h, o, l) });
+    let cached = read_out(|o, l| unsafe { lms::pc_hss_private_to_bytes_with_cache(h, o, l) });
+    assert_eq!(&plain[..4], b"HSS3");
+    assert_eq!(&cached[..4], b"HSS4");
+    assert_eq!(cached.len(), plain.len() + 2 * (1 + 4 + 63 * 32));
+    let pk = read_out(|o, l| unsafe { lms::pc_hss_public_to_bytes(h, o, l) });
+    unsafe { lms::pc_hss_free(h) };
+
+    let h2 = unsafe { lms::pc_hss_from_bytes(cached.as_ptr(), cached.len()) };
+    assert!(!h2.is_null(), "cached HSS form must load");
+    assert_eq!(
+        read_out(|o, l| unsafe { lms::pc_hss_private_to_bytes(h2, o, l) }),
+        plain
+    );
+    let mut sig = vec![0u8; 8192];
+    let mut cap = sig.len();
+    let st = unsafe { lms::pc_hss_sign(h2, msg.as_ptr(), msg.len(), sig.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::Ok);
+    let st = unsafe {
+        lms::pc_hss_verify(
+            pk.as_ptr(),
+            pk.len(),
+            msg.as_ptr(),
+            msg.len(),
+            sig.as_ptr(),
+            cap,
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    unsafe { lms::pc_hss_free(h2) };
+}
+
 #[test]
 fn xmss_sign_size_query_does_not_burn_a_key() {
     let msg = b"xmss size-query message";

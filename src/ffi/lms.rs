@@ -11,6 +11,12 @@
 //! or used. Reusing an older serialized state to sign a different message
 //! reuses a one-time key and is catastrophic (it can leak the signing key).
 //! There is no in-library file persistence — the caller owns it.
+//!
+//! [`pc_lms_private_to_bytes_with_cache`] / [`pc_hss_private_to_bytes_with_cache`]
+//! serialize the same state plus the signer's Merkle node cache, so that a
+//! handle loaded from those bytes signs at once instead of first re-deriving
+//! its tree (a full key generation per level). Use them when each signature
+//! runs in a fresh process; the `*_from_bytes` loaders accept both forms.
 
 use alloc::boxed::Box;
 
@@ -127,6 +133,33 @@ pub unsafe extern "C" fn pc_lms_private_to_bytes(
         // The serialization carries the live seed material; wipe the
         // temporary before its backing storage returns to the allocator.
         let mut ser = unsafe { &*k }.0.to_bytes();
+        let st = unsafe { out_write(&ser, out, out_len) };
+        wipe_vec(&mut ser);
+        st
+    })
+}
+
+/// Like [`pc_lms_private_to_bytes`] but in the cached form: the serialization
+/// also carries the key's Merkle node cache, so a later [`pc_lms_from_bytes`]
+/// yields a handle whose first signature costs `O(h)` instead of a full tree
+/// derivation (seconds for `H15`, minutes for `H20`, hours for `H25`).
+/// Prefer it when each signature runs in a fresh process. The output is
+/// roughly the cache size — 2 KiB for `H5`, 64 KiB for `H10`, 2 MiB for
+/// `H15` and above — and [`pc_lms_from_bytes`] accepts both forms.
+///
+/// # Safety
+/// `k` valid; buffer rules.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_lms_private_to_bytes_with_cache(
+    k: *const PcLms,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if k.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let mut ser = unsafe { &*k }.0.to_bytes_with_cache();
         let st = unsafe { out_write(&ser, out, out_len) };
         wipe_vec(&mut ser);
         st
@@ -310,6 +343,30 @@ pub unsafe extern "C" fn pc_hss_private_to_bytes(
         // The serialization carries the live seed material; wipe the
         // temporary before its backing storage returns to the allocator.
         let mut ser = unsafe { &*k }.0.to_bytes();
+        let st = unsafe { out_write(&ser, out, out_len) };
+        wipe_vec(&mut ser);
+        st
+    })
+}
+
+/// Like [`pc_hss_private_to_bytes`] but in the cached form (see
+/// [`pc_lms_private_to_bytes_with_cache`]): every level's node cache comes
+/// along, at about the cache size per level, and [`pc_hss_from_bytes`]
+/// accepts both forms.
+///
+/// # Safety
+/// `k` valid; buffer rules.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_hss_private_to_bytes_with_cache(
+    k: *const PcHss,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if k.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let mut ser = unsafe { &*k }.0.to_bytes_with_cache();
         let st = unsafe { out_write(&ser, out, out_len) };
         wipe_vec(&mut ser);
         st
