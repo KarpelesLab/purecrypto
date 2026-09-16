@@ -78,13 +78,15 @@ pub(crate) fn derive_x(i_id: &[u8; 16], seed: &[u8; N], q: u32, chain: u16, out:
 /// Derives a deterministic LM-OTS message randomizer
 /// `C = H(I || u32str(q) || u16str(0xfffd) || 0xff || SEED || message)`.
 ///
-/// Used for the *pinned* (non-bottom) levels of a multi-level HSS key, which
-/// re-emit the signature of the same fixed leaf over the same child public key
-/// on every `sign()` call. An LM-OTS key is one-time: re-signing it with a
-/// *different* `C` changes `Q = H(I || q || D_MESG || C || message)` and
-/// exposes the Winternitz chains at new coefficient vectors — catastrophic key
-/// reuse enabling forgery. Deriving `C` from the secret seed and the signed
-/// bytes makes every re-emission byte-identical.
+/// Used by the non-bottom levels of an HSS key when they sign a child tree's
+/// public key. Each such leaf signs exactly one child, so a random `C` would
+/// be equally safe; the deterministic one has two extra properties the HSS
+/// layer relies on: a regeneration interrupted before the state was persisted
+/// re-emits a *byte-identical* signature when it is retried (the child key is
+/// derived deterministically too, see [`derive_child`]), and the upper-level
+/// signature a pre-v3 serialized key implied (leaf `0`, this `C`) can be
+/// reproduced exactly when such a key is loaded, so no one-time key is ever
+/// exposed twice under different randomizers.
 ///
 /// The chain index `0xfffd` cannot collide with [`derive_x`] (whose chain
 /// indices are `< p <= 265`) and matches the C-randomizer index used by the
@@ -101,6 +103,31 @@ pub(crate) fn derive_c(i_id: &[u8; 16], seed: &[u8; N], q: u32, message: &[u8]) 
     h.update(seed);
     h.update(message);
     h.finalize()
+}
+
+/// Derives the `(I, SEED)` of the child LMS tree that leaf `q` of the tree
+/// `(i_id, seed)` signs in an HSS hierarchy:
+///
+/// * `SEED_child = H(I || u32str(q) || u16str(0xfffe) || 0xff || SEED)`
+/// * `I_child    = H(I || u32str(q) || u16str(0xffff) || 0xff || SEED)[0..16]`
+///
+/// This is the derivation of the RFC 8554 reference implementation
+/// (`SEED_CHILD_SEED` / `SEED_CHILD_I`), in the same `H(I || q || j || 0xff
+/// || SEED)` family as [`derive_x`] (`j < 265`) and [`derive_c`]
+/// (`j = 0xfffd`), so no two derivations share a preimage. Deriving children
+/// deterministically means a parent leaf always signs the *same* child key,
+/// whether the regeneration completes on the first attempt or is repeated
+/// after a crash — the leaf can never be found signing two different messages.
+#[cfg(feature = "alloc")]
+pub(crate) fn derive_child(i_id: &[u8; 16], seed: &[u8; N], q: u32) -> ([u8; 16], [u8; N]) {
+    let mut child_seed = [0u8; N];
+    derive_x(i_id, seed, q, 0xfffe, &mut child_seed);
+    let mut full_i = [0u8; N];
+    derive_x(i_id, seed, q, 0xffff, &mut full_i);
+    let mut child_i = [0u8; 16];
+    child_i.copy_from_slice(&full_i[..16]);
+    super::wipe(&mut full_i);
+    (child_i, child_seed)
 }
 
 /// Computes the LM-OTS public key `K` for leaf `q` from the master `seed`

@@ -100,8 +100,8 @@ pub enum Error {
     /// loader needs, so they load any height without derivation.
     LegacyKeyTooTall,
     /// A serialized private key failed its integrity check: the authentication
-    /// tag of a tagged HSS format did not verify, a stored child-level root
-    /// disagrees with the root that level's own seed derives, or a stored tree
+    /// tag of a tagged HSS format did not verify, a stored upper-level
+    /// signature does not verify against the level it signs, or a stored tree
     /// root disagrees with the root that tree's own seed derives (detected when
     /// the tree is first built for signing). Each means the key file was
     /// modified after it was written, which for a multi-level key is a
@@ -360,6 +360,14 @@ impl LmsPrivateKey {
         }
     }
 
+    /// Heap-allocating counterpart of [`sign_reserved_into`](Self::sign_reserved_into).
+    #[cfg(feature = "alloc")]
+    fn sign_reserved(&self, q: u32, c: &[u8; N], message: &[u8]) -> Vec<u8> {
+        let mut out = alloc::vec![0u8; self.signature_len()];
+        self.sign_reserved_into(q, c, message, &mut out);
+        out
+    }
+
     /// Signs with a caller-supplied randomizer `c` (used to reproduce the RFC
     /// 8554 vectors, which fix `C`). Advances `q`.
     fn sign_with_c_into(
@@ -576,51 +584,54 @@ pub fn verify_lms(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
 // HSS — multi-level stateful key
 // ===================================================================
 
-#[cfg(feature = "alloc")]
-/// One level of an HSS key: its parameter sets, identifier, and master seed.
-struct HssLevel {
-    lms_type: LmsType,
-    ots_type: LmotsType,
-    i_id: [u8; 16],
-    seed: [u8; N],
-}
-
-#[cfg(feature = "alloc")]
-impl Drop for HssLevel {
-    fn drop(&mut self) {
-        wipe(&mut self.seed);
-        wipe(&mut self.i_id);
-    }
-}
-
 /// Length of the integrity tag appended by [`HssPrivateKey::to_bytes`].
 #[cfg(feature = "alloc")]
 const HSS_TAG_LEN: usize = 32;
 
-/// Domain separator for the HSS private-key integrity tag, so the tag can never
-/// be confused with any other value derived from the same seed (the RFC 8554
-/// `derive_x` / `derive_c` preimages all start with `I(16) || u32(q)` and are
-/// plain SHA-256, not HMAC).
+/// Leading magic of the current (`v3`) HSS private-key serialization. As a
+/// big-endian `u32` it is far outside the `1..=8` level count that opens every
+/// earlier format, so the two framings can never be confused.
 #[cfg(feature = "alloc")]
-const HSS_TAG_DOMAIN: &[u8] = b"purecrypto/lms/hss-privkey-v2";
+const HSS_V3_MAGIC: &[u8; 4] = b"HSS3";
 
-/// `HMAC-SHA-256(seed0, HSS_TAG_DOMAIN || I0 || body)` — the integrity tag of a
+/// Domain separator for the `v3` HSS private-key integrity tag, so the tag can
+/// never be confused with any other value derived from the same seed (the RFC
+/// 8554 `derive_x` / `derive_c` / `derive_child` preimages all start with
+/// `I(16) || u32(q)` and are plain SHA-256, not HMAC) nor with a `v2` tag.
+#[cfg(feature = "alloc")]
+const HSS_TAG_DOMAIN_V3: &[u8] = b"purecrypto/lms/hss-privkey-v3";
+
+/// Domain separator of the `v2` tag, kept to authenticate `v2` files on load.
+#[cfg(feature = "alloc")]
+const HSS_TAG_DOMAIN_V2: &[u8] = b"purecrypto/lms/hss-privkey-v2";
+
+/// Per-level block of every HSS private-key format since `v1`:
+/// `u32(lms_type) || u32(ots_type) || I(16) || seed(32) || u32(q) || root(32)`.
+#[cfg(feature = "alloc")]
+const HSS_LEVEL_LEN: usize = 4 + 4 + 16 + N + 4 + N;
+
+/// The root-less legacy per-level block (`HSS_LEVEL_LEN` without the root).
+#[cfg(feature = "alloc")]
+const HSS_LEGACY_LEVEL_LEN: usize = HSS_LEVEL_LEN - N;
+
+/// `HMAC-SHA-256(seed0, domain || I0 || body)` — the integrity tag of a
 /// serialized [`HssPrivateKey`].
 ///
 /// The key is the **top** level's seed, deliberately: it is the only secret in
 /// the file that an attacker cannot substitute, because replacing it changes the
 /// top-level root and therefore the HSS public key (signatures then simply fail
 /// to verify — a self-DoS, not a forgery). Every other byte of the file,
-/// including each lower level's `(typecodes, I, seed, root)`, is covered by the
-/// tag, so an adversary who can write the file but not read it cannot mount the
-/// substituted-child-level forgery described on [`HssPrivateKey::from_bytes`].
-/// An adversary who *can* read the file already holds every seed and needs no
-/// attack at all, so keying the tag from in-file material loses nothing.
+/// including each lower level's `(typecodes, I, seed, q, root)` and the cached
+/// upper-level signatures, is covered by the tag, so an adversary who can write
+/// the file but not read it can neither substitute a level nor rewind a leaf
+/// index. An adversary who *can* read the file already holds every seed and
+/// needs no attack at all, so keying the tag from in-file material loses
+/// nothing.
 #[cfg(feature = "alloc")]
-fn hss_tag(body: &[u8], i0: &[u8; 16], seed0: &[u8; N]) -> [u8; HSS_TAG_LEN] {
+fn hss_tag(domain: &[u8], body: &[u8], i0: &[u8; 16], seed0: &[u8; N]) -> [u8; HSS_TAG_LEN] {
     use crate::hash::{Hmac, Sha256};
     let mut m = Hmac::<Sha256>::new(seed0);
-    m.update(HSS_TAG_DOMAIN);
+    m.update(domain);
     m.update(i0);
     m.update(body);
     m.finalize()
@@ -634,38 +645,43 @@ pub struct HssPublicKey {
 }
 
 #[cfg(feature = "alloc")]
-/// A multi-level HSS private (signing) key.
+/// A multi-level HSS private (signing) key (RFC 8554 §6).
 ///
-/// **Stateful** — see the [module documentation](crate::lms). Internally each
-/// of the `L` levels owns a *fixed* `(I, seed)`. Every [`sign`](Self::sign)
-/// advances the bottom level's leaf index; re-persist
+/// **Stateful** — see the [module documentation](crate::lms). Every
+/// [`sign`](Self::sign) advances the bottom level's leaf index and, when that
+/// level's tree is used up, replaces it (see below); re-persist
 /// [`to_bytes`](Self::to_bytes) afterwards. Not [`Clone`] by design.
 ///
-/// # Capacity and the fail-closed multi-level mitigation
+/// # Structure
 ///
-/// A literal RFC 8554 HSS regenerates each lower-level tree (a fresh `(I, seed)`
-/// signed by the next parent leaf) as it is exhausted, so the key can sign
-/// `prod(2^h_i)` messages with no LM-OTS key ever reused. This implementation
-/// does **not** regenerate lower trees — the per-level `(I, seed)` are fixed so
-/// it can reproduce the Appendix F Test Case 2 vector.
+/// Each of the `L` levels owns a live [`LmsPrivateKey`] with its own leaf
+/// index `q_i`. Level `i` (`i < L - 1`) does not sign messages: each of its
+/// leaves signs the public key of one tree at level `i + 1`. The signature
+/// over the *current* child tree is produced once and cached in the key (and
+/// in its serialization), so a message signature costs exactly one bottom-level
+/// LMS signature plus copying the `L - 1` cached upper-level signatures.
 ///
-/// Because the lower trees are fixed, advancing a higher level would reset the
-/// bottom leaf index while the bottom `(I, seed)` is unchanged, re-using the
-/// bottom tree's one-time keys on different messages — a catastrophic forgery
-/// vector. To prevent that, a multi-level key (`L >= 2`) is **capped at one
-/// bottom tree**: it issues only `2^h_bottom` signatures (every higher level
-/// pinned at leaf 0) and then returns [`Error::Exhausted`]. No LM-OTS key is
-/// ever used twice. This is a conservative fail-closed mitigation; the full
-/// multi-level HSS regeneration is flagged for future work. The bottom level's
-/// signing randomizer `C` is drawn from the RNG per signature; the pinned
-/// higher levels derive theirs deterministically so their fixed one-time keys
-/// always re-emit byte-identical signatures (see `append_level_signature`).
+/// When the bottom tree is exhausted, the next signature first replaces it: a
+/// fresh tree is derived from the parent's next leaf (`(I, SEED)` per the RFC
+/// 8554 reference implementation's child derivation, see `ots::derive_child`),
+/// that leaf signs the new public key (advancing the parent's `q`), and
+/// signing continues in the new tree. Exhausted parents are replaced the same
+/// way from their own parents, so the key issues `prod_i 2^h_i` signatures
+/// and reports [`Error::Exhausted`] only once the top tree has no leaf left.
+/// Replacing a tree costs one key generation of that height (`O(2^h)`); it
+/// happens once per `2^h_bottom` signatures for the bottom level and
+/// correspondingly rarer above.
+///
+/// No one-time key is ever used twice: leaves are reserved before they sign,
+/// every parent leaf signs exactly one child tree, and because child keys are
+/// derived deterministically a replacement interrupted before the state was
+/// persisted re-derives and re-signs the *same* child when retried.
 pub struct HssPrivateKey {
-    levels: Vec<HssLevel>,
-    /// Cached root of each level's tree (`roots[i] = T[1]` of level i).
-    roots: Vec<[u8; N]>,
-    /// Per-level next-unused leaf index.
-    q: Vec<u32>,
+    /// Live LMS key of each level, top level first.
+    levels: Vec<LmsPrivateKey>,
+    /// `signed_pubs[i]` is the LMS signature by level `i` over
+    /// `levels[i + 1].public_key()` (`L - 1` entries).
+    signed_pubs: Vec<Vec<u8>>,
 }
 
 #[cfg(feature = "alloc")]
@@ -673,32 +689,39 @@ impl HssPrivateKey {
     /// Builds an HSS key from a fixed `(lms_type, ots_type, I, seed)` per level
     /// (top level first). `L = levels.len()` must be 1..=8.
     ///
+    /// Each non-bottom level signs the level below with its leaf `0`, so the
+    /// returned key has `q = 1` at every level but the bottom. Trees that are
+    /// generated later, when one of these initial trees is exhausted, derive
+    /// their `(I, seed)` from the parent (see the type documentation).
+    ///
     /// This is the seeded constructor used to reproduce RFC 8554 Test Case 2.
     pub fn from_levels(levels: &[(LmsType, LmotsType, [u8; 16], [u8; N])]) -> Result<Self, Error> {
         let l = levels.len();
         if !(1..=8).contains(&l) {
             return Err(Error::InvalidLevels);
         }
-        let mut lv = Vec::with_capacity(l);
-        let mut roots = Vec::with_capacity(l);
+        let mut lv: Vec<LmsPrivateKey> = Vec::with_capacity(l);
         for &(lms_type, ots_type, i_id, seed) in levels {
-            roots.push(tree::compute_root(lms_type, ots_type, &i_id, &seed));
-            lv.push(HssLevel {
-                lms_type,
-                ots_type,
-                i_id,
-                seed,
-            });
+            lv.push(LmsPrivateKey::from_seed(lms_type, ots_type, &i_id, &seed));
+        }
+        let mut signed_pubs = Vec::with_capacity(l - 1);
+        for i in 0..l - 1 {
+            let (upper, lower) = lv.split_at_mut(i + 1);
+            signed_pubs.push(Self::sign_child(&mut upper[i], &lower[0])?);
         }
         Ok(HssPrivateKey {
             levels: lv,
-            roots,
-            q: alloc::vec![0u32; l],
+            signed_pubs,
         })
     }
 
     /// Generates a fresh `L`-level HSS key from a CSPRNG, using `params[i]` as
     /// the `(lms_type, ots_type)` for level `i` (top level first).
+    ///
+    /// The top level's `(I, seed)` come from `rng`; every lower level's initial
+    /// tree is derived from its parent's leaf `0` exactly as later replacement
+    /// trees are derived from later leaves, so the whole hierarchy is a
+    /// function of the top-level secret.
     pub fn generate<R: RngCore + CryptoRng>(
         params: &[(LmsType, LmotsType)],
         rng: &mut R,
@@ -708,13 +731,16 @@ impl HssPrivateKey {
             return Err(Error::InvalidLevels);
         }
         let mut levels = Vec::with_capacity(l);
+        let mut i_id = [0u8; 16];
+        let mut seed = [0u8; N];
+        rng.fill_bytes(&mut i_id);
+        rng.fill_bytes(&mut seed);
         for &(lms_type, ots_type) in params {
-            let mut i_id = [0u8; 16];
-            let mut seed = [0u8; N];
-            rng.fill_bytes(&mut i_id);
-            rng.fill_bytes(&mut seed);
             levels.push((lms_type, ots_type, i_id, seed));
+            (i_id, seed) = ots::derive_child(&i_id, &seed, 0);
         }
+        wipe(&mut i_id);
+        wipe(&mut seed);
         let sk = Self::from_levels(&levels);
         // `from_levels` has copied every level's `(i_id, seed)`; wipe the master
         // seeds left in the heap `Vec` before it frees — each reconstructs that
@@ -727,6 +753,16 @@ impl HssPrivateKey {
         sk
     }
 
+    /// Signs `child`'s public key with `parent`'s next leaf (reserved first),
+    /// using the deterministic randomizer, and returns the LMS signature.
+    fn sign_child(parent: &mut LmsPrivateKey, child: &LmsPrivateKey) -> Result<Vec<u8>, Error> {
+        let pk = child.public_key();
+        parent.prepare_leaf(parent.q)?;
+        let q = parent.reserve_leaf()?;
+        let c = ots::derive_c(&parent.i_id, &parent.seed, q, pk.to_bytes());
+        Ok(parent.sign_reserved(q, &c, pk.to_bytes()))
+    }
+
     /// The number of levels `L`.
     pub fn levels(&self) -> usize {
         self.levels.len()
@@ -734,229 +770,187 @@ impl HssPrivateKey {
 
     /// The matching HSS public key: `u32(L) || pub[0]`.
     pub fn public_key(&self) -> HssPublicKey {
-        let top = &self.levels[0];
-        let pub0 = tree::encode_public_key(top.lms_type, top.ots_type, &top.i_id, &self.roots[0]);
-        let mut bytes = Vec::with_capacity(4 + pub0.len());
+        let pub0 = self.levels[0].public_key();
+        let mut bytes = Vec::with_capacity(4 + pub0.to_bytes().len());
         bytes.extend_from_slice(&(self.levels.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(&pub0);
+        bytes.extend_from_slice(pub0.to_bytes());
         HssPublicKey { bytes }
     }
 
-    /// Total signatures still available before the whole key is exhausted.
-    ///
-    /// For a single-level key (`L == 1`) this is `2^h - q`, the number of unused
-    /// leaves of the one tree.
-    ///
-    /// For a multi-level key (`L >= 2`) it is `2^h_bottom - q_bottom`, the unused
-    /// leaves of the *bottom* tree only. See `advance` for why
-    /// the higher levels are deliberately pinned at leaf 0: advancing a higher
-    /// level would re-use the bottom tree's fixed LM-OTS keys, which is a
-    /// catastrophic key reuse. This conservative cap (one bottom tree's worth of
-    /// signatures) is the fail-closed mitigation for that finding.
-    pub fn remaining(&self) -> u64 {
+    /// Byte length of the signatures this key produces:
+    /// `u32(Nspk)`, then for each level its LMS signature, interleaved with the
+    /// `L - 1` signed child public keys (RFC 8554 §6.2). Constant for a given
+    /// parameter configuration, so callers can size buffers before signing.
+    pub fn signature_len(&self) -> usize {
         let l = self.levels.len();
-        let bottom = l - 1;
-        self.levels[bottom]
-            .lms_type
-            .leaves()
-            .saturating_sub(self.q[bottom] as u64)
+        4 + self
+            .levels
+            .iter()
+            .map(|lv| lv.signature_len())
+            .sum::<usize>()
+            + (l - 1) * PUBKEY_LEN
     }
 
-    /// Advances the leaf-index state by one signature.
+    /// Total signatures still available before the whole key is exhausted,
+    /// saturating at `u64::MAX`.
     ///
-    /// # Fail-closed multi-level behaviour (security mitigation)
+    /// Every unused leaf of level `i` is worth `prod_{j > i} 2^h_j` message
+    /// signatures (one whole subtree of fresh lower trees), so this is the
+    /// mixed-radix sum over the levels of `unused_leaves_i * prod_{j > i} 2^h_j`.
+    /// A fresh key reports `prod_i 2^h_i`.
+    pub fn remaining(&self) -> u64 {
+        let mut total: u64 = 0;
+        let mut per_leaf: u64 = 1;
+        for lv in self.levels.iter().rev() {
+            total = total.saturating_add(lv.remaining().saturating_mul(per_leaf));
+            per_leaf = per_leaf.saturating_mul(lv.lms_type.leaves());
+        }
+        total
+    }
+
+    /// Replaces every exhausted tree below the lowest level that still has a
+    /// leaf (RFC 8554 §6.2 step "if the bottom tree is exhausted").
     ///
-    /// Each HSS level here owns a *fixed* `(I, seed)`. A full RFC 8554 HSS would
-    /// replace an exhausted lower-level tree with a freshly-keyed one signed by
-    /// the next parent leaf, so every signature uses unique LM-OTS material.
-    /// This implementation does not regenerate lower trees, so allowing the
-    /// mixed-radix odometer to *carry* out of the bottom level would reset
-    /// `q_bottom` to 0 while the bottom `(I, seed)` is unchanged — re-using the
-    /// bottom tree's one-time keys to sign different messages. LM-OTS reuse
-    /// reveals Winternitz pre-images and permits universal forgery.
-    ///
-    /// To make reuse impossible, a multi-level key (`L >= 2`) is treated as
-    /// exhausted the moment the bottom tree would wrap: only the first
-    /// `2^h_bottom` signatures (with every higher level pinned at leaf 0) are
-    /// ever issued. The higher levels are never advanced. This caps capacity at
-    /// one bottom tree but guarantees no LM-OTS key is ever used twice.
-    ///
-    /// `L == 1` is an ordinary single LMS tree and simply advances `q[0]`.
-    ///
-    /// This only increments the bottom leaf index; it never carries into a
-    /// higher level. When the bottom tree is consumed, `q[bottom]` is left at
-    /// `leaves()` (the exhausted sentinel) so `remaining()` becomes 0 and the
-    /// *next* [`sign`](Self::sign) returns [`Error::Exhausted`]. It does not
-    /// itself return an error, so the signature for the just-consumed leaf
-    /// (including the final one) is always emitted.
-    fn advance(&mut self) {
-        let bottom = self.levels.len() - 1;
-        self.q[bottom] += 1;
+    /// Walking down from that level, each replacement reserves the parent's
+    /// next leaf, derives the child `(I, seed)` from it, generates the child
+    /// tree (`O(2^h)`), and caches the parent's signature over the new public
+    /// key. Returns [`Error::Exhausted`] if even the top tree has no leaf left.
+    fn replace_exhausted(&mut self) -> Result<(), Error> {
+        let l = self.levels.len();
+        let mut live = l - 1;
+        while self.levels[live].is_exhausted() {
+            if live == 0 {
+                return Err(Error::Exhausted);
+            }
+            live -= 1;
+        }
+        for j in live + 1..l {
+            let child = {
+                let (upper, lower) = self.levels.split_at_mut(j);
+                let parent = &mut upper[j - 1];
+                let old = &lower[0];
+                parent.prepare_leaf(parent.q)?;
+                let q = parent.reserve_leaf()?;
+                let (mut ci, mut cs) = ots::derive_child(&parent.i_id, &parent.seed, q);
+                let child = LmsPrivateKey::from_seed(old.lms_type, old.ots_type, &ci, &cs);
+                wipe(&mut ci);
+                wipe(&mut cs);
+                let pk = child.public_key();
+                let c = ots::derive_c(&parent.i_id, &parent.seed, q, pk.to_bytes());
+                self.signed_pubs[j - 1] = parent.sign_reserved(q, &c, pk.to_bytes());
+                child
+            };
+            // The exhausted tree is dropped here, wiping its seed.
+            self.levels[j] = child;
+        }
+        Ok(())
     }
 
     /// Signs `message` (RFC 8554 §6.2). Advances the internal state.
     ///
     /// `rng` supplies the bottom level's LM-OTS randomizer `C`; it SHOULD be a
-    /// CSPRNG. The pinned higher levels derive their `C` deterministically —
-    /// see `append_level_signature` for why that is mandatory.
+    /// CSPRNG. If the bottom tree is exhausted it is replaced first (see the
+    /// type documentation), which costs a key generation of the bottom height.
     /// **Persist [`to_bytes`](Self::to_bytes) before using the returned
     /// signature** — see the [module documentation](crate::lms).
     pub fn sign<R: RngCore>(&mut self, rng: &mut R, message: &[u8]) -> Result<Vec<u8>, Error> {
-        let l = self.levels.len();
         if self.remaining() == 0 {
             return Err(Error::Exhausted);
         }
-        // Reserve the bottom leaf BEFORE any signature byte exists (SP 800-208
-        // §8.1): the state moves past `q_bottom` first, so an abort part-way
-        // through signing (e.g. a panicking `rng`) can never be followed by a
-        // second signature on the same one-time key.
-        let q_bottom = self.q[l - 1];
-        self.advance();
-
-        let mut out = Vec::new();
-        out.extend_from_slice(&((l - 1) as u32).to_be_bytes());
-
-        for i in 0..l {
-            if i + 1 < l {
-                // Pinned non-bottom level: its one-time key re-signs the same
-                // child public key on every call, so `C` MUST be deterministic
-                // (`None` selects the seed-derived randomizer).
-                self.append_level_signature(&mut out, i, self.q[i], message, None);
-            } else {
-                // Bottom level: `q` advances with every signature, so a fresh
-                // random `C` never re-randomizes an already-used one-time key.
-                let mut c = [0u8; N];
-                rng.fill_bytes(&mut c);
-                self.append_level_signature(&mut out, i, q_bottom, message, Some(&c));
-            }
-        }
-
-        Ok(out)
-    }
-
-    /// Appends `sig[i]` (signing either `pub[i+1]` or the message) and, for
-    /// non-final levels, the signed public key `pub[i+1]`.
-    ///
-    /// `q` is the leaf of level `i` to sign with — the caller has already
-    /// reserved it, so it is passed explicitly rather than read from `self.q`
-    /// (which, for the bottom level, has moved on by then).
-    /// `c` is the LM-OTS randomizer; `None` derives it deterministically from
-    /// the level's secret seed and the signed bytes via [`ots::derive_c`].
-    ///
-    /// # Why pinned levels MUST use the deterministic randomizer
-    ///
-    /// Non-bottom levels are pinned at leaf 0 and sign the *fixed* child public
-    /// key, so the same LM-OTS key is re-emitted by every `sign()` call. Were a
-    /// fresh `C` drawn per call, `Q = H(I || q || D_MESG || C || pub[i+1])`
-    /// would change each time and the one-time Winternitz chains would be
-    /// exposed at different coefficient vectors — textbook LM-OTS reuse,
-    /// enabling offline forgery. With the seed-derived `C`, every emission of
-    /// an upper-level signature is byte-identical.
-    fn append_level_signature(
-        &self,
-        out: &mut Vec<u8>,
-        i: usize,
-        q: u32,
-        message: &[u8],
-        c: Option<&[u8; N]>,
-    ) {
+        self.replace_exhausted()?;
         let l = self.levels.len();
-        let lv = &self.levels[i];
-        // The signed bytes are either the child level's encoded public key
-        // (fixed size) or the caller's message; keep the encoded key alive in a
-        // local so both arms can borrow as a slice.
-        let child_pk;
-        let signed: &[u8] = if i + 1 < l {
-            let child = &self.levels[i + 1];
-            child_pk = tree::encode_public_key(
-                child.lms_type,
-                child.ots_type,
-                &child.i_id,
-                &self.roots[i + 1],
-            );
-            &child_pk
-        } else {
-            message
-        };
-        let c = match c {
-            Some(c) => *c,
-            None => ots::derive_c(&lv.i_id, &lv.seed, q, signed),
-        };
-        let mut sig = alloc::vec![0u8; signature_len(lv.lms_type, lv.ots_type)];
-        tree::sign(
-            lv.lms_type,
-            lv.ots_type,
-            &lv.i_id,
-            &lv.seed,
-            q,
-            &c,
-            signed,
-            &mut sig,
-            |node| tree::node_value(lv.lms_type, lv.ots_type, &lv.i_id, &lv.seed, node),
-        );
-        out.extend_from_slice(&sig);
-        if i + 1 < l {
-            out.extend_from_slice(signed); // pub[i+1]
-        }
+        let bottom = &mut self.levels[l - 1];
+        bottom.prepare_leaf(bottom.q)?;
+        // Reserve the bottom leaf BEFORE any signature byte exists and BEFORE
+        // touching the caller's RNG (SP 800-208 §8.1): an abort part-way
+        // through signing can never be followed by a second signature on the
+        // same one-time key.
+        let q = bottom.reserve_leaf()?;
+        let mut c = [0u8; N];
+        rng.fill_bytes(&mut c);
+        Ok(self.assemble(q, &c, message))
     }
 
-    /// Like [`sign`](Self::sign) but with caller-supplied per-level randomizers
-    /// `c_per_level[i]` (used to reproduce the RFC 8554 vectors). Advances state.
+    /// Assembles `u32(Nspk) || sig[0] || pub[1] || ... || sig[L-1]` for the
+    /// already-reserved bottom leaf `q` and randomizer `c`.
+    fn assemble(&self, q: u32, c: &[u8; N], message: &[u8]) -> Vec<u8> {
+        let l = self.levels.len();
+        let mut out = Vec::with_capacity(self.signature_len());
+        out.extend_from_slice(&((l - 1) as u32).to_be_bytes());
+        for i in 0..l - 1 {
+            out.extend_from_slice(&self.signed_pubs[i]);
+            out.extend_from_slice(self.levels[i + 1].public_key().to_bytes());
+        }
+        out.extend_from_slice(&self.levels[l - 1].sign_reserved(q, c, message));
+        out
+    }
+
+    /// Test hook: moves level `i` to leaf `q` (the vectors pin the leaf indices).
     #[cfg(test)]
-    fn sign_with_cs(&mut self, message: &[u8], c_per_level: &[[u8; N]]) -> Result<Vec<u8>, Error> {
-        let l = self.levels.len();
+    fn set_q(&mut self, i: usize, q: u32) {
+        self.levels[i].q = q;
+    }
+
+    /// Test hook: re-signs level `i + 1`'s public key with level `i`'s next
+    /// leaf and the caller-supplied randomizer `c` (the vectors pin `C`).
+    #[cfg(test)]
+    fn resign_child_with_c(&mut self, i: usize, c: &[u8; N]) {
+        let pk = self.levels[i + 1].public_key();
+        let parent = &mut self.levels[i];
+        parent.prepare_leaf(parent.q).unwrap();
+        let q = parent.reserve_leaf().unwrap();
+        self.signed_pubs[i] = parent.sign_reserved(q, c, pk.to_bytes());
+    }
+
+    /// Like [`sign`](Self::sign) but with a caller-supplied bottom-level
+    /// randomizer (used to reproduce the RFC 8554 vectors). Advances state.
+    #[cfg(test)]
+    fn sign_with_c(&mut self, message: &[u8], c: &[u8; N]) -> Result<Vec<u8>, Error> {
         if self.remaining() == 0 {
             return Err(Error::Exhausted);
         }
-        let q_bottom = self.q[l - 1];
-        self.advance();
-        let mut out = Vec::new();
-        out.extend_from_slice(&((l - 1) as u32).to_be_bytes());
-        for (i, c) in c_per_level.iter().enumerate().take(l) {
-            let q = if i + 1 < l { self.q[i] } else { q_bottom };
-            self.append_level_signature(&mut out, i, q, message, Some(c));
-        }
-        Ok(out)
+        self.replace_exhausted()?;
+        let l = self.levels.len();
+        let bottom = &mut self.levels[l - 1];
+        bottom.prepare_leaf(bottom.q)?;
+        let q = bottom.reserve_leaf()?;
+        Ok(self.assemble(q, c, message))
     }
 
     /// Serializes the private key **including every level's live leaf index**,
-    /// that level's cached public root, and a trailing integrity tag.
+    /// each level's cached public root, the cached upper-level signatures, and
+    /// a trailing integrity tag.
     ///
-    /// Layout (`v2`): `u32(L) || for each level { u32(lms_type) ||
-    /// u32(ots_type) || I(16) || seed(32) || u32(q) || root(32) } || tag(32)`.
-    /// This embeds the full state that MUST be persisted after each signature.
-    ///
-    /// Each appended root is the public value `T[1]` of that level's tree (the
-    /// child key the parent level signs); storing it lets
-    /// [`from_bytes`](Self::from_bytes) load any height instantly instead of
-    /// recomputing every level's root via a full `O(2^h)` keygen pass. The
-    /// per-level block is a pure superset of the legacy 60-byte block (the root
-    /// is appended at its end).
+    /// Layout (`v3`): `"HSS3" || u32(L) || for each level { u32(lms_type) ||
+    /// u32(ots_type) || I(16) || seed(32) || u32(q) || root(32) } || for each
+    /// level but the last { sig_i } || tag(32)`, where `sig_i` is level `i`'s
+    /// LMS signature over level `i + 1`'s public key (its length follows from
+    /// level `i`'s parameter sets). This embeds the full state that MUST be
+    /// persisted after each signature; loading it never derives a tree, so a
+    /// key of any height loads instantly and only the first signature of a
+    /// level pays that level's cache build.
     ///
     /// # The tag (and why it is not optional)
     ///
     /// `tag` is `HMAC-SHA-256` over every preceding byte, keyed by the **top
     /// level's secret seed** — the one piece of the file an attacker cannot
-    /// replace without also invalidating the public key. Without it, an
-    /// adversary who can *write* the key file (but not read it) can swap in a
-    /// lower level whose `(I, seed)` they chose themselves; the pinned top-level
-    /// one-time key then signs that attacker-controlled child public key, which
-    /// is a complete forgery chain. See [`from_bytes`](Self::from_bytes) for the
-    /// full argument and for how older, untagged files are handled.
+    /// replace without also invalidating the public key. It stops an adversary
+    /// who can *write* the key file (but not read it) from rewinding a leaf
+    /// index or substituting a level; see [`from_bytes`](Self::from_bytes).
     pub fn to_bytes(&self) -> Vec<u8> {
         let l = self.levels.len();
-        let mut v = Vec::with_capacity(4 + l * (4 + 4 + 16 + N + 4 + N) + HSS_TAG_LEN);
+        let sigs: usize = self.signed_pubs.iter().map(Vec::len).sum();
+        let mut v = Vec::with_capacity(8 + l * HSS_LEVEL_LEN + sigs + HSS_TAG_LEN);
+        v.extend_from_slice(HSS_V3_MAGIC);
         v.extend_from_slice(&(l as u32).to_be_bytes());
-        for (i, lv) in self.levels.iter().enumerate() {
-            v.extend_from_slice(&lv.lms_type.typecode().to_be_bytes());
-            v.extend_from_slice(&lv.ots_type.typecode().to_be_bytes());
-            v.extend_from_slice(&lv.i_id);
-            v.extend_from_slice(&lv.seed);
-            v.extend_from_slice(&self.q[i].to_be_bytes());
-            v.extend_from_slice(&self.roots[i]);
+        for lv in &self.levels {
+            v.extend_from_slice(&lv.to_bytes_array());
+        }
+        for sig in &self.signed_pubs {
+            v.extend_from_slice(sig);
         }
         let top = &self.levels[0];
-        let tag = hss_tag(&v, &top.i_id, &top.seed);
+        let tag = hss_tag(HSS_TAG_DOMAIN_V3, &v, &top.i_id, &top.seed);
         v.extend_from_slice(&tag);
         v
     }
@@ -964,60 +958,68 @@ impl HssPrivateKey {
     /// Parses a private key produced by [`to_bytes`](Self::to_bytes), resuming
     /// at each persisted per-level `q`.
     ///
-    /// Length-discriminated and backward compatible (per-level stride):
-    /// * `4 + L*92 + 32` — the current (`v2`) tagged root-bearing format. The
-    ///   trailing tag is verified first (against the top level's seed); every
-    ///   stored root is then trusted, so a key of any height loads in constant
-    ///   time. A modified file is rejected with [`Error::Tampered`].
-    /// * `4 + L*92` — the untagged root-bearing format written by earlier
-    ///   releases. There is no tag to check, so for `L >= 2` **every non-top
-    ///   level's root is recomputed from that level's own seed** and compared
-    ///   with the stored one; a mismatch is [`Error::Tampered`]. That costs
-    ///   about one signature's worth of hashing per level (signing already walks
-    ///   the whole tree), and is capped at `H15` (`LEGACY_RECOMPUTE_MAX_H`) per
-    ///   recomputed level to deny a CPU-DoS from an untrusted file.
-    /// * `4 + L*60` — the LEGACY root-less format. Each level's root is
-    ///   recomputed (an `O(2^h)` pass), capped per level at `H15` — taller
-    ///   levels return [`Error::LegacyKeyTooTall`].
-    /// * any other length — [`Error::Malformed`].
+    /// Format-discriminated and backward compatible:
+    /// * **`v3`** (`"HSS3"` magic) — the current format. The trailing tag is
+    ///   verified first (against the top level's seed); a modified file is
+    ///   rejected with [`Error::Tampered`]. Every cached upper-level signature
+    ///   is then verified against the levels it links and must use a leaf
+    ///   below that level's `q` (i.e. one already reserved). No tree is
+    ///   derived, so a key of any height loads in `O(L)` signature checks.
+    /// * **`v2`** (`4 + L*92 + 32` bytes, tagged) — the previous format, in
+    ///   which every non-bottom level was pinned at leaf `0` and re-signed its
+    ///   fixed child on every call. It is mapped onto the current structure:
+    ///   each non-bottom level's child signature — leaf `0`, deterministic
+    ///   randomizer, exactly the bytes the previous format emitted, so no
+    ///   one-time key is exposed twice — is produced now and that level's `q`
+    ///   becomes `1`. Producing it builds each non-bottom level's tree
+    ///   (`O(2^h)`); the tag is verified beforehand so this cannot be
+    ///   triggered by an untrusted file, and no height cap applies.
+    /// * **`v1`** (`4 + L*92`, untagged root-bearing) and **legacy**
+    ///   (`4 + L*60`, root-less) — mapped like `v2`, but with no tag to check
+    ///   every level that loading must derive (all non-bottom levels; every
+    ///   level of a root-less file; every non-top level of a `v1` file, whose
+    ///   stored root is recomputed and compared) is capped at `H15`
+    ///   (`LEGACY_RECOMPUTE_MAX_H`) and rejected with
+    ///   [`Error::LegacyKeyTooTall`] above it, to deny a CPU-DoS from an
+    ///   untrusted file. A non-bottom `q != 0` in these formats is
+    ///   [`Error::Malformed`]: they never produced one, and resuming it would
+    ///   pin a leaf that may already have signed something else.
+    /// * anything else — [`Error::Malformed`].
     ///
-    /// Re-save any key loaded from one of the two older formats: `to_bytes`
-    /// always emits the tagged `v2` form, which both loads faster and is the
-    /// only form with full tamper detection (see below).
+    /// Re-save any key loaded from an older format: `to_bytes` always emits
+    /// `v3`, which loads instantly and is the only form that carries the
+    /// cached upper-level signatures.
     ///
-    /// # Why the stored roots must NOT simply be trusted
+    /// # Why the stored state must be authenticated
     ///
-    /// A root is not secret, but in a multi-level key it is *signed*: under this
-    /// implementation's fail-closed mitigation every level above the bottom is
-    /// pinned at leaf `q = 0` and re-signs `typecode || typecode || I || root`
-    /// of the level below on **every** call to [`sign`](Self::sign). That value
-    /// therefore has to be identical on every call, forever — an LM-OTS key is
-    /// one-time, and signing two distinct messages with it reveals enough
-    /// Winternitz pre-images to forge a third.
+    /// The upper-level signatures and the child public keys they cover are
+    /// public, and the current design signs each child exactly once, so a
+    /// flipped child byte can no longer make a parent leaf sign twice as it
+    /// could in `v2`. The tag still matters, for two reasons that no
+    /// per-field check can replace:
     ///
-    /// All four fields of that signed child public key come straight out of the
-    /// key file. An adversary who can *write* the file therefore has two
-    /// distinct attacks, neither of which is fail-closed:
-    ///
-    /// 1. Flip a bit in a child level's stored root, `I`, or typecode. The next
-    ///    `sign()` emits a second, different top-level LM-OTS signature under
-    ///    the same `q = 0` key — classic one-time-key reuse.
-    /// 2. Replace a whole child level with `(I', seed')` of the adversary's own
-    ///    choosing and the matching root. The key then loads perfectly
-    ///    self-consistently, and the very first signature it produces hands the
-    ///    adversary a genuine top-level signature over a child public key whose
-    ///    seed *they* hold — a complete forgery chain, from a single signature.
-    ///
-    /// Recomputing the child roots from their seeds stops (1) but not (2): the
-    /// adversary knows the seed they substituted. Only the `v2` tag, keyed by a
-    /// secret the adversary does not have, stops both. Hence: `v2` files are
-    /// authenticated, older files get the recompute check as a best effort, and
-    /// the key material itself must still be protected at rest.
+    /// 1. **Index rewind.** Every `q` in the file is one-time-key state. An
+    ///    adversary who can write the file could decrement any of them, and
+    ///    the next signature would re-use a leaf. Only a tag keyed by a secret
+    ///    the adversary does not have makes such an edit detectable.
+    /// 2. **Level substitution.** Replacing a lower level with one whose seed
+    ///    the adversary holds would, in the older formats, be *signed* by the
+    ///    parent on load; with `v3` the stored parent signature would not
+    ///    verify — but only because the tag also prevents the adversary from
+    ///    supplying a fresh, self-consistent state of their own.
     ///
     /// No tag can stop a *wholesale rollback* to an older file that this code
-    /// genuinely wrote (its bottom `q` would replay used leaves); preventing
-    /// that is the storage layer's job and inherent to every stateful scheme.
+    /// genuinely wrote (its indices would replay used leaves); preventing that
+    /// is the storage layer's job and inherent to every stateful scheme.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() >= 4 && &bytes[..4] == HSS_V3_MAGIC {
+            return Self::from_bytes_v3(bytes);
+        }
+        Self::from_bytes_legacy(bytes)
+    }
+
+    /// Parses the `u32(L)` level count that opens every format.
+    fn parse_level_count(bytes: &[u8]) -> Result<usize, Error> {
         if bytes.len() < 4 {
             return Err(Error::Malformed);
         }
@@ -1025,115 +1027,188 @@ impl HssPrivateKey {
         if !(1..=8).contains(&l) {
             return Err(Error::Malformed);
         }
-        const LEGACY_PER: usize = 4 + 4 + 16 + N + 4;
-        const NEW_PER: usize = LEGACY_PER + N;
-        // `Tagged` also carries the roots; it just authenticates them as well.
-        let (per, has_root, tagged) = if bytes.len() == 4 + l * NEW_PER + HSS_TAG_LEN {
-            (NEW_PER, true, true)
-        } else if bytes.len() == 4 + l * NEW_PER {
-            (NEW_PER, true, false)
-        } else if bytes.len() == 4 + l * LEGACY_PER {
-            (LEGACY_PER, false, false)
+        Ok(l)
+    }
+
+    /// Parses one `(lms_type, ots_type, I, seed, q, root?)` level block,
+    /// validating the typecodes and `q <= 2^h`.
+    #[allow(clippy::type_complexity)]
+    fn parse_level(
+        block: &[u8],
+        has_root: bool,
+    ) -> Result<(LmsType, LmotsType, [u8; 16], [u8; N], u32, Option<[u8; N]>), Error> {
+        let lms_type =
+            LmsType::from_u32(u32::from_be_bytes([block[0], block[1], block[2], block[3]]))
+                .ok_or(Error::Malformed)?;
+        let ots_type =
+            LmotsType::from_u32(u32::from_be_bytes([block[4], block[5], block[6], block[7]]))
+                .ok_or(Error::Malformed)?;
+        let mut i_id = [0u8; 16];
+        i_id.copy_from_slice(&block[8..24]);
+        let mut seed = [0u8; N];
+        seed.copy_from_slice(&block[24..24 + N]);
+        let q = u32::from_be_bytes([block[24 + N], block[25 + N], block[26 + N], block[27 + N]]);
+        if q as u64 > lms_type.leaves() {
+            return Err(Error::Malformed);
+        }
+        let root = has_root.then(|| {
+            let mut r = [0u8; N];
+            r.copy_from_slice(&block[28 + N..28 + N + N]);
+            r
+        });
+        Ok((lms_type, ots_type, i_id, seed, q, root))
+    }
+
+    /// Verifies a serialized tag against the body it covers, keyed by the top
+    /// level's `(I, seed)` found at the given body offset.
+    fn check_tag(domain: &[u8], body: &[u8], tag: &[u8], top_block: usize) -> Result<(), Error> {
+        let mut i0 = [0u8; 16];
+        i0.copy_from_slice(&body[top_block + 8..top_block + 24]);
+        let mut seed0 = [0u8; N];
+        seed0.copy_from_slice(&body[top_block + 24..top_block + 24 + N]);
+        let want = hss_tag(domain, body, &i0, &seed0);
+        wipe(&mut seed0);
+        let ok: bool = want[..].ct_eq(tag).into();
+        if ok { Ok(()) } else { Err(Error::Tampered) }
+    }
+
+    /// The `v3` loader — see [`from_bytes`](Self::from_bytes).
+    fn from_bytes_v3(bytes: &[u8]) -> Result<Self, Error> {
+        let l = Self::parse_level_count(&bytes[4..])?;
+        let levels_end = 8 + l * HSS_LEVEL_LEN;
+        if bytes.len() < levels_end + HSS_TAG_LEN {
+            return Err(Error::Malformed);
+        }
+        // Parse the level blocks first: the signature lengths that follow
+        // depend on their parameter sets. Nothing here derives a tree.
+        let mut levels = Vec::with_capacity(l);
+        for i in 0..l {
+            let off = 8 + i * HSS_LEVEL_LEN;
+            let (lms_type, ots_type, i_id, seed, q, root) =
+                Self::parse_level(&bytes[off..off + HSS_LEVEL_LEN], true)?;
+            levels.push(LmsPrivateKey {
+                lms_type,
+                ots_type,
+                i_id,
+                seed,
+                q,
+                root: root.expect("v3 blocks carry the root"),
+                cache: None,
+            });
+        }
+        let sigs_len: usize = levels[..l - 1].iter().map(|lv| lv.signature_len()).sum();
+        if bytes.len() != levels_end + sigs_len + HSS_TAG_LEN {
+            return Err(Error::Malformed);
+        }
+        // Authenticate the whole body before trusting any of it.
+        let body = &bytes[..bytes.len() - HSS_TAG_LEN];
+        Self::check_tag(HSS_TAG_DOMAIN_V3, body, &bytes[body.len()..], 8)?;
+
+        // The cached upper-level signatures must each verify under the level
+        // that produced them, over the public key of the level below, and
+        // must use a leaf that level has already reserved (`q_sig < q_i`).
+        let mut signed_pubs = Vec::with_capacity(l - 1);
+        let mut off = levels_end;
+        for i in 0..l - 1 {
+            let sig = &bytes[off..off + levels[i].signature_len()];
+            off += sig.len();
+            let parent_pk = levels[i].public_key();
+            let child_pk = levels[i + 1].public_key();
+            if !tree::verify(parent_pk.to_bytes(), child_pk.to_bytes(), sig) {
+                return Err(Error::Tampered);
+            }
+            let sig_q = u32::from_be_bytes([sig[0], sig[1], sig[2], sig[3]]);
+            if sig_q >= levels[i].q {
+                return Err(Error::Tampered);
+            }
+            signed_pubs.push(sig.to_vec());
+        }
+        Ok(HssPrivateKey {
+            levels,
+            signed_pubs,
+        })
+    }
+
+    /// The `v2` / `v1` / legacy loader — see [`from_bytes`](Self::from_bytes).
+    fn from_bytes_legacy(bytes: &[u8]) -> Result<Self, Error> {
+        let l = Self::parse_level_count(bytes)?;
+        let (per, has_root, tagged) = if bytes.len() == 4 + l * HSS_LEVEL_LEN + HSS_TAG_LEN {
+            (HSS_LEVEL_LEN, true, true)
+        } else if bytes.len() == 4 + l * HSS_LEVEL_LEN {
+            (HSS_LEVEL_LEN, true, false)
+        } else if bytes.len() == 4 + l * HSS_LEGACY_LEVEL_LEN {
+            (HSS_LEGACY_LEVEL_LEN, false, false)
         } else {
             return Err(Error::Malformed);
         };
         let body = &bytes[..bytes.len() - if tagged { HSS_TAG_LEN } else { 0 }];
         if tagged {
-            // Authenticate the whole body before interpreting any of it. The
-            // top level's `I` and `seed` sit at fixed offsets in level 0's
-            // block (`4 + 8` and `4 + 24`), ahead of anything variable.
-            let mut i0 = [0u8; 16];
-            i0.copy_from_slice(&body[12..28]);
-            let mut seed0 = [0u8; N];
-            seed0.copy_from_slice(&body[28..28 + N]);
-            let want = hss_tag(body, &i0, &seed0);
-            wipe(&mut seed0);
-            let ok: bool = want[..].ct_eq(&bytes[body.len()..]).into();
-            if !ok {
-                return Err(Error::Tampered);
-            }
+            Self::check_tag(HSS_TAG_DOMAIN_V2, body, &bytes[body.len()..], 4)?;
         }
         let mut levels = Vec::with_capacity(l);
-        let mut roots = Vec::with_capacity(l);
-        let mut q = Vec::with_capacity(l);
-        let mut off = 4;
         for level in 0..l {
-            let lms_type = LmsType::from_u32(u32::from_be_bytes([
-                bytes[off],
-                bytes[off + 1],
-                bytes[off + 2],
-                bytes[off + 3],
-            ]))
-            .ok_or(Error::Malformed)?;
-            let ots_type = LmotsType::from_u32(u32::from_be_bytes([
-                bytes[off + 4],
-                bytes[off + 5],
-                bytes[off + 6],
-                bytes[off + 7],
-            ]))
-            .ok_or(Error::Malformed)?;
-            let mut i_id = [0u8; 16];
-            i_id.copy_from_slice(&bytes[off + 8..off + 24]);
-            let mut seed = [0u8; N];
-            seed.copy_from_slice(&bytes[off + 24..off + 24 + N]);
-            let qi = u32::from_be_bytes([
-                bytes[off + 24 + N],
-                bytes[off + 25 + N],
-                bytes[off + 26 + N],
-                bytes[off + 27 + N],
-            ]);
-            if qi as u64 > lms_type.leaves() {
+            let off = 4 + level * per;
+            let (lms_type, ots_type, i_id, seed, q, root) =
+                Self::parse_level(&body[off..off + per], has_root)?;
+            let is_bottom = level + 1 == l;
+            // Pre-v3 formats never advanced a non-bottom level. A non-zero
+            // index there can only come from a pre-mitigation key that has
+            // already wrapped into one-time-key reuse, or from tampering.
+            if !is_bottom && q != 0 {
                 return Err(Error::Malformed);
             }
-            let root = if has_root {
-                let mut r = [0u8; N];
-                r.copy_from_slice(&bytes[off + 28 + N..off + 28 + N + N]);
-                // A `v2` root is authenticated by the tag checked above. An
-                // untagged root of a level that a parent signs (any level but
-                // the top) MUST agree with what its own seed derives, or the
-                // pinned parent one-time key would sign a second, different
-                // child public key (see method docs). The top-level root is
-                // only ever the public key, so a bad one is a self-DoS and
-                // needs no check.
-                if !tagged && level > 0 {
-                    if lms_type.h() > LEGACY_RECOMPUTE_MAX_H {
-                        return Err(Error::LegacyKeyTooTall);
-                    }
-                    let derived = tree::compute_root(lms_type, ots_type, &i_id, &seed);
-                    let same: bool = derived[..].ct_eq(&r[..]).into();
+            // Which levels must loading derive from the seed? Non-bottom
+            // levels, to produce their child signature; root-less levels, to
+            // recover the root; and non-top levels of an untagged file, whose
+            // stored root is the message the parent signs and so must be
+            // checked against the seed. Without a tag to vouch for the file,
+            // each such derivation is capped to deny a CPU-DoS.
+            let derives = !is_bottom || root.is_none() || (!tagged && level > 0);
+            if !tagged && derives && lms_type.h() > LEGACY_RECOMPUTE_MAX_H {
+                return Err(Error::LegacyKeyTooTall);
+            }
+            let key = match root {
+                Some(r) if tagged || level == 0 => LmsPrivateKey {
+                    lms_type,
+                    ots_type,
+                    i_id,
+                    seed,
+                    q,
+                    root: r,
+                    cache: None,
+                },
+                Some(r) => {
+                    // Untagged non-top level: derive and compare the root.
+                    let mut key = LmsPrivateKey::from_seed(lms_type, ots_type, &i_id, &seed);
+                    let same: bool = key.root[..].ct_eq(&r[..]).into();
                     if !same {
                         return Err(Error::Tampered);
                     }
+                    key.q = q;
+                    key
                 }
-                r
-            } else {
-                // Legacy path: recompute, but refuse a CPU-DoS-sized tree.
-                if lms_type.h() > LEGACY_RECOMPUTE_MAX_H {
-                    return Err(Error::LegacyKeyTooTall);
+                None => {
+                    let mut key = LmsPrivateKey::from_seed(lms_type, ots_type, &i_id, &seed);
+                    key.q = q;
+                    key
                 }
-                tree::compute_root(lms_type, ots_type, &i_id, &seed)
             };
-            roots.push(root);
-            levels.push(HssLevel {
-                lms_type,
-                ots_type,
-                i_id,
-                seed,
-            });
-            q.push(qi);
-            off += per;
+            levels.push(key);
         }
-        debug_assert_eq!(off, body.len());
-        // Fail-closed invariant: under the multi-level mitigation every higher
-        // level stays pinned at leaf 0 (only the bottom level advances). A
-        // persisted multi-level key with any non-bottom q != 0 can only be a
-        // pre-mitigation key that has already wrapped — i.e. one that has, or is
-        // about to, re-use the bottom tree's LM-OTS keys. Reject it rather than
-        // resume into reuse.
-        if l >= 2 && q[..l - 1].iter().any(|&qi| qi != 0) {
-            return Err(Error::Malformed);
+        // Map onto the current structure: every non-bottom level signs its
+        // child with leaf 0 and the deterministic randomizer — byte-identical
+        // to what the older format emitted on every call — and moves to q = 1.
+        // (`prepare_leaf` inside `sign_child` builds any level not derived
+        // above and refuses a stored root the seed does not reproduce.)
+        let mut signed_pubs = Vec::with_capacity(l - 1);
+        for i in 0..l - 1 {
+            let (upper, lower) = levels.split_at_mut(i + 1);
+            signed_pubs.push(Self::sign_child(&mut upper[i], &lower[0])?);
         }
-        Ok(HssPrivateKey { levels, roots, q })
+        Ok(HssPrivateKey {
+            levels,
+            signed_pubs,
+        })
     }
 }
 

@@ -64,72 +64,15 @@ pub struct PcLms(Box<LmsPrivateKey>);
 /// An opaque, mutable multi-level HSS signing key.
 pub struct PcHss(Box<HssPrivateKey>);
 
-/// Hash output length shared by every supported LMS / LM-OTS parameter set
-/// (all are SHA-256 with `n = m = 32`, RFC 8554 Tables 1 and 2).
-const N: usize = 32;
-
 /// Exact encoded length of a single-tree LMS signature for the given
 /// parameter sets: `u32(q) || lmots_signature || u32(lms_type) || path[h]`
-/// (RFC 8554 §5.4), where the LM-OTS signature is `4 + n*(p+1)` bytes.
-/// LMS signature sizes are constant per parameter set, so the FFI sign
-/// entry points can check the caller's capacity BEFORE consuming a
-/// one-time key. Cross-checked against the actual encoding in tests.
+/// (RFC 8554 §5.4). LMS / HSS signature sizes are constant per parameter
+/// configuration, so the FFI sign entry points can check the caller's
+/// capacity BEFORE consuming a one-time key (the HSS length comes from
+/// [`HssPrivateKey::signature_len`]). Cross-checked against the actual
+/// encoding in tests.
 fn lms_sig_len(lms: LmsType, ots: LmotsType) -> usize {
-    4 + ots.sig_len() + 4 + lms.h() as usize * N
-}
-
-/// Exact encoded length of an HSS signature: `u32(Nspk)` followed by `L`
-/// LMS signatures interleaved with the `L - 1` signed child public keys
-/// (`24 + n` bytes each), RFC 8554 §6.2.
-///
-/// [`HssPrivateKey`] does not expose its per-level parameter sets, so they
-/// are recovered from the self-describing private serialization. The current
-/// format is `u32(L) || per level { u32(lms) || u32(ots) || I(16) ||
-/// seed(32) || u32(q) || root(32) } || tag(32)` (per-level = 92); the older
-/// untagged root-bearing form and the legacy root-less form (per-level = 60)
-/// are also accepted. The copy contains the master
-/// seeds and is wiped before returning. Returns `None` only on a malformed
-/// serialization (which would indicate an internal bug, not user input).
-fn hss_sig_len(key: &HssPrivateKey) -> Option<usize> {
-    let mut ser = key.to_bytes();
-    let result = hss_sig_len_from_private_bytes(&ser);
-    wipe_vec(&mut ser);
-    result
-}
-
-fn hss_sig_len_from_private_bytes(ser: &[u8]) -> Option<usize> {
-    // Only the type fields at the start of each level block are read, so every
-    // stride the library has ever emitted is length-discriminated and handled:
-    // the current tagged 92-byte stride (what `to_bytes()` writes), the older
-    // untagged 92-byte stride, and the legacy 60-byte one (kept in sync with
-    // `HssPrivateKey`).
-    const LEGACY_LEVEL_BYTES: usize = 4 + 4 + 16 + N + 4;
-    const NEW_LEVEL_BYTES: usize = LEGACY_LEVEL_BYTES + N;
-    const TAG_BYTES: usize = 32;
-    let l = u32::from_be_bytes(ser.get(..4)?.try_into().ok()?) as usize;
-    if l == 0 {
-        return None;
-    }
-    let level_bytes = if ser.len() == 4 + l * NEW_LEVEL_BYTES + TAG_BYTES
-        || ser.len() == 4 + l * NEW_LEVEL_BYTES
-    {
-        NEW_LEVEL_BYTES
-    } else if ser.len() == 4 + l * LEGACY_LEVEL_BYTES {
-        LEGACY_LEVEL_BYTES
-    } else {
-        return None;
-    };
-    let mut total = 4; // u32(Nspk)
-    for i in 0..l {
-        let off = 4 + i * level_bytes;
-        let lms = LmsType::from_u32(u32::from_be_bytes(ser[off..off + 4].try_into().ok()?))?;
-        let ots = LmotsType::from_u32(u32::from_be_bytes(ser[off + 4..off + 8].try_into().ok()?))?;
-        total += lms_sig_len(lms, ots);
-        if i + 1 < l {
-            total += 24 + N; // signed child LMS public key
-        }
-    }
-    Some(total)
+    crate::lms::signature_len(lms, ots)
 }
 
 // ---------------------------------------------------------------------------
@@ -428,9 +371,7 @@ pub unsafe extern "C" fn pc_hss_sign(
         let key = unsafe { &mut *k };
         // Capacity check BEFORE signing — sign() irreversibly burns a
         // one-time key, so a mere size query must not advance the state.
-        let Some(expected) = hss_sig_len(&key.0) else {
-            return PcStatus::Internal;
-        };
+        let expected = key.0.signature_len();
         if unsafe { *out_len } < expected {
             unsafe { *out_len = expected };
             return PcStatus::BufferTooSmall;
