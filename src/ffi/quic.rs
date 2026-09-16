@@ -1161,8 +1161,10 @@ pub unsafe extern "C" fn pc_quic_close_info(
 // ---- Key update (RFC 9001 §6) --------------------------------------------
 
 /// Initiates a 1-RTT key update. Returns [`PcStatus::Internal`] when the
-/// handshake isn't complete or a previous update is still unconfirmed
-/// (RFC 9001 §6.1).
+/// handshake isn't yet *confirmed* (RFC 9001 §4.1.2: on a client that means
+/// HANDSHAKE_DONE has been received, so it can lag `pc_quic_is_handshake_complete`
+/// by one round trip) or a previous update is still unconfirmed (RFC 9001
+/// §6.1).
 ///
 /// # Safety
 /// `q` valid.
