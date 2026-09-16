@@ -394,6 +394,13 @@ impl ConnectionCore {
             if !is_legal_record_version(version) {
                 return Err(Error::UnsupportedVersion);
             }
+            // RFC 8446 §5.1: a TLSPlaintext fragment is capped at 2^14 bytes
+            // (only protected TLSCiphertext records get the extra 256 bytes
+            // of AEAD expansion, checked after decryption). Anything longer
+            // is a `record_overflow`.
+            if !matches!(content_type, ContentType::ApplicationData) && fragment.len() > (1 << 14) {
+                return Err(Error::RecordOverflow);
+            }
             let fragment = fragment.to_vec();
             self.inbuf.drain(..len);
 
@@ -768,6 +775,19 @@ mod tests {
             core.take_received().is_empty(),
             "plaintext must not be readable before the handshake completes"
         );
+    }
+
+    /// RFC 8446 §5.1: a plaintext record longer than 2^14 bytes is a
+    /// `record_overflow` even though the record layer's framing allows the
+    /// ciphertext ceiling of 2^14 + 256.
+    #[test]
+    fn oversized_plaintext_record_is_record_overflow() {
+        let mut core = ConnectionCore::new();
+        let mut wire = alloc::vec![22u8, 0x03, 0x03];
+        wire.extend_from_slice(&((1u16 << 14) + 1).to_be_bytes());
+        wire.extend(core::iter::repeat_n(0u8, (1 << 14) + 1));
+        core.read_tls(&wire);
+        assert!(matches!(core.next_message(), Err(Error::RecordOverflow)));
     }
 
     /// A single fragment claiming to be larger than the cap is rejected

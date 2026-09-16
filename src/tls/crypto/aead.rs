@@ -91,6 +91,16 @@ impl Aead {
 /// most conservative bound that still leaves room for normal traffic.
 const MAX_RECORDS_PER_KEY: u64 = 1 << 23;
 
+/// Read-side ceiling on the record sequence number. RFC 8446 §5.5 bounds
+/// what a *sender* may protect under one key (it is the sender's plaintext
+/// the AES-GCM confidentiality bound protects, and the sender's job to
+/// rekey); the receiver's only hard requirement is §5.3's "the sequence
+/// number MUST NOT wrap". Enforcing the sender's cap on the read side used
+/// to fail the connection after 2²³ inbound records against peers that never
+/// initiate `KeyUpdate` on their own (OpenSSL, Go), which a long-lived bulk
+/// transfer reaches in a few GiB of small records.
+const MAX_READ_SEQ: u64 = u64::MAX;
+
 /// Soft threshold at which the write side should initiate a `KeyUpdate`
 /// (RFC 8446 §5.5: "before reaching" the limit). Leaving a margin of 2¹⁶
 /// records below [`MAX_RECORDS_PER_KEY`] gives the peer ample time to
@@ -123,15 +133,17 @@ impl RecordCrypter {
 
     /// The per-record nonce for the *current* sequence number — static IV XOR
     /// the 64-bit big-endian sequence number (right-aligned) — WITHOUT
-    /// advancing the counter. Returns `Err(TooManyRecords)` if the per-key cap
-    /// (RFC 8446 §5.5) has been reached; callers should `KeyUpdate` first.
+    /// advancing the counter. Returns `Err(TooManyRecords)` once the sequence
+    /// number reaches `cap`: the write side passes the RFC 8446 §5.5 per-key
+    /// limit ([`MAX_RECORDS_PER_KEY`], "`KeyUpdate` first"), the read side the
+    /// wrap-around guard ([`MAX_READ_SEQ`]).
     ///
     /// The read path deliberately peeks rather than consumes: a record that
     /// fails the AEAD check was never accepted, and the RFC 8446 §4.2.10
     /// "skip rejected early data" path must be able to discard it and try the
     /// *same* sequence number against the next record.
-    fn peek_nonce(&self) -> Result<[u8; 12], Error> {
-        if self.seq >= MAX_RECORDS_PER_KEY {
+    fn peek_nonce(&self, cap: u64) -> Result<[u8; 12], Error> {
+        if self.seq >= cap {
             return Err(Error::TooManyRecords);
         }
         let mut nonce = self.iv;
@@ -145,7 +157,7 @@ impl RecordCrypter {
     /// [`Self::peek_nonce`] followed by the counter increment (the write-side
     /// behaviour: a record we emit always consumes its sequence number).
     fn next_nonce(&mut self) -> Result<[u8; 12], Error> {
-        let nonce = self.peek_nonce()?;
+        let nonce = self.peek_nonce(MAX_RECORDS_PER_KEY)?;
         self.seq += 1;
         Ok(nonce)
     }
@@ -271,7 +283,7 @@ impl RecordCrypter {
         let mut buf = ct.to_vec();
         // Peek, don't consume: the sequence number advances only once the
         // AEAD has actually accepted the record (see `peek_nonce`).
-        let nonce = self.peek_nonce()?;
+        let nonce = self.peek_nonce(MAX_READ_SEQ)?;
         if !self.aead.decrypt(&nonce, header, &mut buf, &tag) {
             return Err(Error::BadRecordMac);
         }
@@ -414,6 +426,54 @@ mod tests {
         assert!(matches!(
             c.decrypt(&header, &bad[5..]),
             Err(Error::BadRecordMac)
+        ));
+    }
+
+    /// RFC 8446 §5.5 caps what a *sender* protects under one key; a receiver
+    /// that enforced the same cap failed the connection after 2²³ inbound
+    /// records against peers that never rekey on their own. The read side
+    /// must keep decrypting past the write-side cap (up to the §5.3 wrap
+    /// guard), while the write side still refuses to go past it.
+    #[test]
+    fn read_side_accepts_records_past_the_write_side_cap() {
+        let secret = Secret::new(&[0x77u8; 32]);
+        let (key, iv) = traffic_key_iv(HashAlg::Sha256, &secret, 16);
+        let aead = Aead::from_key(AeadAlg::Aes128Gcm, &key);
+
+        // A peer that never rekeyed: its record at sequence number 2^23 + 5.
+        let seq: u64 = MAX_RECORDS_PER_KEY + 5;
+        let mut nonce = iv;
+        for (i, b) in seq.to_be_bytes().iter().enumerate() {
+            nonce[4 + i] ^= b;
+        }
+        let mut inner = b"still readable".to_vec();
+        inner.push(ContentType::ApplicationData.as_u8());
+        let header = [23u8, 3, 3, 0, (inner.len() + 16) as u8];
+        let tag = aead.encrypt(&nonce, &header, &mut inner);
+        let mut fragment = inner;
+        fragment.extend_from_slice(&tag);
+
+        let mut reader = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &secret);
+        reader.set_seq_for_test(seq);
+        let (ct, content) = reader
+            .decrypt(&header, &fragment)
+            .expect("past the write cap");
+        assert_eq!(ct, ContentType::ApplicationData);
+        assert_eq!(content, b"still readable");
+        assert_eq!(reader.seq(), seq + 1);
+
+        // The write side still stops at the per-key cap.
+        let mut writer = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &secret);
+        writer.set_seq_for_test(MAX_RECORDS_PER_KEY);
+        assert!(matches!(
+            writer.encrypt(ContentType::ApplicationData, b"x"),
+            Err(Error::TooManyRecords)
+        ));
+        // And the read side refuses to let the sequence number wrap.
+        reader.set_seq_for_test(u64::MAX);
+        assert!(matches!(
+            reader.decrypt(&header, &fragment),
+            Err(Error::TooManyRecords)
         ));
     }
 

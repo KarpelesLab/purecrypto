@@ -27,7 +27,8 @@ pub(crate) struct ParsedRecord<'a> {
 }
 
 /// Attempts to parse one record from the front of `buf`. Returns `Ok(None)` if
-/// more bytes are needed.
+/// more bytes are needed, and `Err(RecordOverflow)` for a length field past
+/// [`MAX_FRAGMENT`] (RFC 8446 §5.2 / RFC 5246 §6.2.3: `record_overflow`).
 ///
 /// The record `legacy_version` field is returned but not validated here so
 /// that this helper stays useful for both TLS 1.2 and TLS 1.3 record paths.
@@ -42,7 +43,7 @@ pub(crate) fn read_record(buf: &[u8]) -> Result<Option<ParsedRecord<'_>>, Error>
     let version = u16::from_be_bytes([buf[1], buf[2]]);
     let len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
     if len > MAX_FRAGMENT {
-        return Err(Error::Decode);
+        return Err(Error::RecordOverflow);
     }
     let total = 5 + len;
     if buf.len() < total {
@@ -112,6 +113,22 @@ mod tests {
         // A truncated buffer needs more data.
         assert!(read_record(&out[..4]).unwrap().is_none());
         assert!(read_record(&out[..7]).unwrap().is_none());
+    }
+
+    /// RFC 8446 §5.2: a record whose length field exceeds `2^14 + 256` is a
+    /// `record_overflow`, not a `decode_error`.
+    #[test]
+    fn oversized_length_field_is_record_overflow() {
+        let len = (MAX_FRAGMENT + 1) as u16;
+        let mut hdr = alloc::vec![23u8, 0x03, 0x03];
+        hdr.extend_from_slice(&len.to_be_bytes());
+        assert!(matches!(read_record(&hdr), Err(Error::RecordOverflow)));
+        let ok = (MAX_FRAGMENT as u16).to_be_bytes();
+        assert!(
+            read_record(&[23u8, 0x03, 0x03, ok[0], ok[1]])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
