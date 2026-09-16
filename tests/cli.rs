@@ -5497,3 +5497,54 @@ fn xmss_genpkey_sign_verify_advances_key() {
     assert!(out.contains("verified"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The DTLS handshake driver must hand the engine the real monotonic clock,
+/// not the deadline it just asked for: `on_timeout(deadline)` claims every
+/// 500 ms socket poll is late, so the ClientHello was resent every 500 ms
+/// instead of at 1 s / 2 s / 4 s (RFC 6347 §4.2.4.1) and the retransmit
+/// budget was exhausted after ~3 s. Observed against a silent UDP sink.
+#[test]
+fn dtls_client_retransmits_with_exponential_backoff() {
+    let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = sink.local_addr().unwrap().port();
+    sink.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+        .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args([
+            "s_client",
+            "-dtls1_2",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-quiet",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    let mut arrivals = Vec::new();
+    let mut buf = [0u8; 2048];
+    while t0.elapsed() < std::time::Duration::from_secs(8) {
+        if sink.recv(&mut buf).is_ok() {
+            arrivals.push(t0.elapsed());
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        arrivals.len() >= 3,
+        "expected ClientHello retransmits, got {arrivals:?}"
+    );
+    // 1 s, then doubling: the second copy no earlier than ~1 s after the
+    // first, the third no earlier than ~3 s, and never more than five copies
+    // (0, 1, 3, 7 s, plus slack) inside the 8 s window.
+    let gap = |i: usize| (arrivals[i] - arrivals[0]).as_secs_f64();
+    assert!(gap(1) >= 0.9, "2nd ClientHello too early: {arrivals:?}");
+    assert!(gap(2) >= 2.7, "3rd ClientHello too early: {arrivals:?}");
+    assert!(
+        arrivals.len() <= 5,
+        "too many retransmits in 8 s: {arrivals:?}"
+    );
+}
