@@ -2309,8 +2309,11 @@ impl<R: RngCore> ServerConnection<R> {
             ext::server_key_share(*group, &server_pub),
             ext::server_supported_versions(),
         ];
-        if psk_state.is_some() {
-            sh_extensions.push(ext::server_pre_shared_key(0));
+        // RFC 8446 §4.2.11: `selected_identity` is the index of the identity
+        // whose ticket we actually resumed — not necessarily the first one
+        // the client offered.
+        if let Some(s) = psk_state.as_ref() {
+            sh_extensions.push(ext::server_pre_shared_key(s.selected_identity));
         }
         // `mut` is only required on the ECH-accept path (we patch the
         // accept signal into the encoded bytes). The `cfg_attr` keeps
@@ -3233,6 +3236,11 @@ struct AcceptedPsk {
     /// suite (the early-data keys are derived under it); `None` (a legacy
     /// ticket) therefore never carries early data.
     suite: Option<CipherSuite>,
+    /// Index of the identity that was selected in the client's
+    /// `pre_shared_key.identities` list — echoed back in
+    /// `ServerHello.pre_shared_key.selected_identity` (RFC 8446 §4.2.11) so
+    /// the client seeds its key schedule from the same PSK we did.
+    selected_identity: u16,
     /// The binder of the identity that was *actually selected* (the first one
     /// whose ticket decrypted cleanly), not necessarily identity index 0. The
     /// 0-RTT [`ReplayWindow`] MUST be keyed on this binder: keying on
@@ -3438,6 +3446,9 @@ impl<R: RngCore> ServerConnection<R> {
                 let expected_age_ms = now.saturating_sub(creation_secs).saturating_mul(1000);
                 client_age_ms.abs_diff(expected_age_ms) <= MAX_TICKET_AGE_DEVIATION_MS
             };
+            // `identities` came out of a `u16`-length wire vector whose
+            // entries are at least 7 bytes, so the index always fits.
+            let selected_identity = u16::try_from(idx).map_err(|_| Error::IllegalParameter)?;
             return Ok(Some(AcceptedPsk {
                 psk,
                 hash,
@@ -3445,6 +3456,7 @@ impl<R: RngCore> ServerConnection<R> {
                 age_fresh,
                 age_checked: true,
                 suite,
+                selected_identity,
                 selected_binder: presented.to_vec(),
                 client_leaf,
             }));

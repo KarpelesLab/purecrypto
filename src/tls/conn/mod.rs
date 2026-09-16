@@ -9105,6 +9105,87 @@ mod audit_regression_tests {
         );
     }
 
+    /// RFC 8446 §4.2.11: `ServerHello.pre_shared_key.selected_identity` is
+    /// the index of the identity the server actually resumed. The server used
+    /// to echo `0` whichever identity's ticket decrypted, so a client offering
+    /// several PSKs with an unusable one first would seed its key schedule
+    /// from the wrong PSK and fail at Finished.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
+    #[test]
+    fn server_echoes_the_index_of_the_selected_psk_identity() {
+        use crate::hash::Hmac;
+        use crate::tls::codec::{
+            ExtensionType, ReadCursor, ServerHello, extension as ext, read_handshake, read_record,
+        };
+        use crate::tls::crypto::{HashAlg, KeySchedule, binder_finished_key};
+
+        let (session, cert_der) = hrr_psk_session(b"psk-idx", 0);
+        let psk = session.psk.clone();
+        assert_eq!(session.cipher_suite_hash, HashAlg::Sha256);
+        let (server_config, _) = rsa_server();
+        let server_config = server_config.with_ticket_key([0x7cu8; 32]);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"psk-idx", b"c2", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"psk-idx", b"s2", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_session(session),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        // Rebuild the client's hello with two identities — junk first, the
+        // real ticket second — and the real binder recomputed over the new
+        // truncated hello (the junk binder is never checked: its ticket does
+        // not decrypt).
+        let ch1_rec = client.write_tls();
+        let mut ch = decode_ch_record(&ch1_rec);
+        let (ty, body) = ch.extensions.pop().expect("pre_shared_key is last");
+        assert_eq!(ty, ExtensionType::PRE_SHARED_KEY);
+        let (identities, _) = ext::parse_client_pre_shared_key(&body).unwrap();
+        let (real_ticket, age) = identities[0].clone();
+        let junk = alloc::vec![0x5au8; real_ticket.len()];
+        let (psk_ext, binders_len) =
+            ext::client_pre_shared_key_placeholder(&[(junk, 0), (real_ticket, age)], 32).unwrap();
+        ch.extensions.push(psk_ext);
+        let mut msg = ch.encode();
+        let truncated_len = msg.len() - binders_len;
+        let ks = KeySchedule::with_psk(HashAlg::Sha256, &psk);
+        let fk = binder_finished_key(HashAlg::Sha256, &ks.binder_key(b"res binder"));
+        let th = HashAlg::Sha256.hash(&msg[..truncated_len]);
+        let binder = Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice());
+        let n = msg.len();
+        msg[n - 32..].copy_from_slice(binder.as_ref());
+        let mut rec = alloc::vec![0x16u8, 0x03, 0x03];
+        rec.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&msg);
+
+        server.read_tls(&rec);
+        server
+            .process_new_packets()
+            .expect("the second identity must resume");
+        assert!(server.psk_used());
+        let flight = server.write_tls();
+        let sh_rec = read_record(&flight).unwrap().unwrap();
+        let mut c = ReadCursor::new(sh_rec.fragment);
+        let (ty, body) = read_handshake(&mut c).unwrap();
+        assert_eq!(ty, crate::tls::codec::hs_type::SERVER_HELLO);
+        let sh = ServerHello::decode(body).unwrap();
+        let selected = ext::parse_server_pre_shared_key(
+            ext::find(&sh.extensions, ExtensionType::PRE_SHARED_KEY).expect("PSK accepted"),
+        )
+        .unwrap();
+        assert_eq!(
+            selected, 1,
+            "selected_identity must name the identity whose ticket resumed"
+        );
+    }
+
     /// RFC 8446 §4.2.10: a 0-RTT offer that meets a HelloRetryRequest. The
     /// early-data records already on the wire are skipped by the server, CH2
     /// carries no `early_data` extension and goes out in plaintext, further
