@@ -24,7 +24,7 @@ pub mod argon2;
 mod bcrypt_pbkdf;
 mod hkdf;
 mod kbkdf;
-#[cfg(all(feature = "alloc", feature = "der"))]
+#[cfg(all(feature = "alloc", feature = "der", feature = "rng"))]
 pub mod pbes2;
 mod pbkdf2;
 #[cfg(feature = "alloc")]
