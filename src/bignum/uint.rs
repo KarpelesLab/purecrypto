@@ -402,6 +402,50 @@ mod tests {
     }
 
     #[test]
+    fn le_bytes_roundtrip_and_shr1() {
+        let v = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
+        let u = from_u128(v);
+        let mut buf = [0u8; 16];
+        u.write_le_bytes(&mut buf);
+        assert_eq!(buf, v.to_le_bytes());
+        assert_eq!(U128::from_le_bytes(&buf), u);
+        // Short input is zero-extended from the least-significant end; the
+        // second limb is fed by a partial final 8-byte group.
+        assert_eq!(U128::from_le_bytes(&[0x00, 0x01]), from_u128(0x100));
+        assert_eq!(
+            U128::from_le_bytes(&[0, 0, 0, 0, 0, 0, 0, 0, 0x2a]),
+            from_u128(0x2a << 64)
+        );
+        assert_eq!(U128::from_le_bytes(&[]), U128::ZERO);
+        // BE and LE codecs agree.
+        let mut be = [0u8; 16];
+        u.write_be_bytes(&mut be);
+        be.reverse();
+        assert_eq!(be, buf);
+
+        for &a in CASES {
+            assert_eq!(to_u128(&from_u128(a).shr1()), a >> 1, "shr1 of {a:#x}");
+        }
+        // The low bit of the high limb must carry into the low limb's top bit.
+        assert_eq!(from_u128(1 << 64).shr1(), Uint::from_limbs([1 << 63, 0]));
+    }
+
+    #[test]
+    fn divrem_matches_u128() {
+        for &a in CASES {
+            for &b in CASES {
+                if b == 0 {
+                    continue;
+                }
+                let (q, r) = from_u128(a).divrem(&from_u128(b));
+                assert_eq!(to_u128(&q), a / b, "{a:#x} / {b:#x}");
+                assert_eq!(to_u128(&r), a % b, "{a:#x} % {b:#x}");
+                assert_eq!(to_u128(&from_u128(a).reduce(&from_u128(b))), a % b);
+            }
+        }
+    }
+
+    #[test]
     fn larger_widths_compile_and_work() {
         // 4096-bit: exercises LIMBS > 32 (where derived array Default wouldn't
         // exist) and confirms the const-generic surface scales.

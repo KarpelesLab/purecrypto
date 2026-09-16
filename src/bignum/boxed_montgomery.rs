@@ -576,6 +576,28 @@ mod tests {
         assert_eq!(m.pow(&ct, &BoxedUint::from_u64(2753)), msg);
     }
 
+    /// `add_mod` / `sub_mod` against `u128` arithmetic on a 64-bit modulus,
+    /// including the wrap-around cases (sum >= n, a < b) and operands padded
+    /// with leading zero limbs.
+    #[test]
+    fn add_sub_mod_match_u128() {
+        let n: u64 = 0xFFFF_FFFF_FFFF_FFC5;
+        let m = BoxedMontModulus::new(&BoxedUint::from_u64(n));
+        let vals: [u64; 5] = [0, 1, n - 1, n / 2, 0x0123_4567_89ab_cdef];
+        for &a in &vals {
+            for &b in &vals {
+                let (ba, bb) = (BoxedUint::from_u64(a), BoxedUint::from_u64(b));
+                let sum = ((a as u128 + b as u128) % n as u128) as u64;
+                let diff = ((a as u128 + n as u128 - b as u128) % n as u128) as u64;
+                assert_eq!(m.add_mod(&ba, &bb), BoxedUint::from_u64(sum), "{a}+{b}");
+                assert_eq!(m.sub_mod(&ba, &bb), BoxedUint::from_u64(diff), "{a}-{b}");
+                // Wider-than-modulus (zero-padded) operands are resized.
+                let wide = BoxedUint::from_limbs(vec![a, 0, 0]);
+                assert_eq!(m.sub_mod(&wide, &bb), BoxedUint::from_u64(diff));
+            }
+        }
+    }
+
     #[test]
     #[should_panic(expected = "modulus must be nonzero")]
     fn new_zero_modulus_panics() {
