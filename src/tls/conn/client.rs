@@ -2272,6 +2272,21 @@ impl ClientConnection {
             return Err(Error::UnsupportedVersion);
         }
 
+        // RFC 8446 §4.1.3 / §4.2: a TLS 1.3 ServerHello carries only
+        // `key_share`, `pre_shared_key` and `supported_versions` — every one
+        // of which we offered. Anything else is an extension we never asked
+        // for, and the client MUST abort with `unsupported_extension`.
+        if sh.extensions.iter().any(|(ty, _)| {
+            !matches!(
+                *ty,
+                ExtensionType::KEY_SHARE
+                    | ExtensionType::PRE_SHARED_KEY
+                    | ExtensionType::SUPPORTED_VERSIONS
+            )
+        }) {
+            return Err(Error::UnsupportedExtension);
+        }
+
         // RFC 8446 §4.1.3: the ServerHello MUST echo `legacy_session_id` from
         // the ClientHello verbatim. This TLS 1.3 client never uses the
         // middlebox-compatibility session id — it always offers an empty
@@ -2499,6 +2514,24 @@ impl ClientConnection {
         // unexpected_message if a second one arrives).
         if self.hrr_processed {
             return Err(Error::UnexpectedMessage);
+        }
+
+        // RFC 8446 §4.1.4 / §4.2: a HelloRetryRequest may carry only
+        // `key_share`, `cookie`, `supported_versions` and (draft-ietf-tls-
+        // esni-22 §7.2.1) the ECH confirmation. Anything else is an
+        // unsolicited extension: abort with `unsupported_extension`.
+        if hrr.extensions.iter().any(|(ty, _)| {
+            let allowed = matches!(
+                *ty,
+                ExtensionType::KEY_SHARE
+                    | ExtensionType::SUPPORTED_VERSIONS
+                    | ExtensionType(0x002c)
+            );
+            #[cfg(feature = "ech")]
+            let allowed = allowed || *ty == ExtensionType::ENCRYPTED_CLIENT_HELLO;
+            !allowed
+        }) {
+            return Err(Error::UnsupportedExtension);
         }
 
         // RFC 8446 §4.1.4: like the real ServerHello, the HRR MUST echo
@@ -2967,6 +3000,34 @@ impl ClientConnection {
         // don't want the rejection to mask a protocol violation).
         #[cfg(feature = "ech")]
         let mut ech_retry_configs: Option<alloc::vec::Vec<u8>> = None;
+        // RFC 8446 §4.2: "Implementations MUST NOT send extension responses
+        // if the remote endpoint did not send the corresponding extension
+        // requests ... Upon receiving such an extension, an endpoint MUST
+        // abort the handshake with an unsupported_extension alert." Which
+        // EE-legal extensions this ClientHello offered (the §4.2 table
+        // limits what may appear in EncryptedExtensions at all):
+        #[cfg(feature = "ech")]
+        let ech_offered = self.config.ech.is_some();
+        #[cfg(not(feature = "ech"))]
+        let ech_offered = false;
+        let sni_offered = !self.server_name.is_empty() || ech_offered;
+        let alpn_offered = !self.config.alpn_protocols.is_empty();
+        let rsl_offered = self.config.record_size_limit.is_some();
+        let sct_offered = self
+            .config
+            .server_cert_type_preference
+            .iter()
+            .any(|t| *t != 0);
+        let cct_offered = self
+            .config
+            .client_cert_type_preference
+            .iter()
+            .any(|t| *t != 0);
+        let quic = self.engine_mode == super::super::quic_hooks::EngineMode::Quic;
+        // An extension type we never handle is reported only once the walk
+        // is done: the extension-count cap below has to trip first on an
+        // over-long list, whatever it is padded with.
+        let mut unknown_extension = false;
         if raw.len() >= 4 {
             let body = &raw[4..];
             let mut c = ReadCursor::new(body);
@@ -2995,6 +3056,26 @@ impl ClientConnection {
                     return Err(Error::IllegalParameter);
                 }
                 seen.push(ty);
+                let solicited = match ExtensionType(ty) {
+                    ExtensionType::SERVER_NAME => sni_offered,
+                    ExtensionType::SUPPORTED_GROUPS => true,
+                    ExtensionType::ALPN => alpn_offered,
+                    ExtensionType::RECORD_SIZE_LIMIT => rsl_offered,
+                    // Offered-or-not is decided by the 0-RTT state checked in
+                    // the `early_data` branch below.
+                    ExtensionType::EARLY_DATA => true,
+                    ExtensionType::SERVER_CERTIFICATE_TYPE => sct_offered,
+                    ExtensionType::CLIENT_CERTIFICATE_TYPE => cct_offered,
+                    ExtensionType::QUIC_TRANSPORT_PARAMETERS => quic,
+                    ExtensionType::ENCRYPTED_CLIENT_HELLO => ech_offered,
+                    _ => {
+                        unknown_extension = true;
+                        continue;
+                    }
+                };
+                if !solicited {
+                    return Err(Error::UnsupportedExtension);
+                }
                 if ty == crate::tls::codec::ExtensionType::ALPN.0 {
                     let names = ext::parse_alpn(ext_body)?;
                     if names.len() != 1 {
@@ -3084,6 +3165,9 @@ impl ClientConnection {
                     }
                 }
             }
+        }
+        if unknown_extension {
+            return Err(Error::UnsupportedExtension);
         }
 
         // ECH rejection (draft §7.1 / §6.1.6): the client attempted real
@@ -3929,6 +4013,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::RecordOverflow => AlertDescription::RecordOverflow,
         Error::TooManyRecords => AlertDescription::InternalError,
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
+        Error::UnsupportedExtension => AlertDescription::UnsupportedExtension,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
         Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
@@ -4298,16 +4383,22 @@ mod tests {
             raw
         }
 
-        // Exactly MAX_EXTENSIONS distinct, ignored extensions parse fine.
+        // Exactly MAX_EXTENSIONS distinct extensions get through the cap;
+        // being unsolicited they are then refused (RFC 8446 §4.2) — but by
+        // the post-walk `unsupported_extension`, not the cap's `Decode`.
         let mut rng = HmacDrbg::<Sha256>::new(b"h1-ee-cap-ok", b"nonce", &[]);
         let mut client =
             ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng).unwrap();
-        client
+        let err = client
             .on_encrypted_extensions(
                 hs_type::ENCRYPTED_EXTENSIONS,
                 &ee_with_n_exts(MAX_EXTENSIONS),
             )
-            .expect("exactly MAX_EXTENSIONS extensions accepted");
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedExtension),
+            "exactly MAX_EXTENSIONS must pass the cap, got {err:?}"
+        );
 
         // One more crosses the ceiling and is rejected with `Decode`.
         let mut rng2 = HmacDrbg::<Sha256>::new(b"h1-ee-cap-bad", b"nonce", &[]);
@@ -4323,6 +4414,107 @@ mod tests {
             matches!(err, Error::Decode),
             "over-limit EE extension count must be rejected with Decode, got {err:?}"
         );
+    }
+
+    /// RFC 8446 §4.2: a server MUST NOT answer with an extension the client
+    /// did not offer, and the client MUST abort with `unsupported_extension`
+    /// when it does. ServerHello and HelloRetryRequest have a fixed allowed
+    /// set; EncryptedExtensions is checked against what this ClientHello
+    /// actually offered.
+    #[test]
+    fn client_rejects_unsolicited_extensions() {
+        use crate::tls::codec::{CipherSuite, HRR_RANDOM, ServerHello};
+
+        let ee = |exts: &[(u16, Vec<u8>)]| -> Vec<u8> {
+            let mut all = Vec::new();
+            for (ty, body) in exts {
+                all.extend_from_slice(&ty.to_be_bytes());
+                all.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                all.extend_from_slice(body);
+            }
+            let mut b = Vec::new();
+            b.extend_from_slice(&(all.len() as u16).to_be_bytes());
+            b.extend_from_slice(&all);
+            let mut raw = alloc::vec![hs_type::ENCRYPTED_EXTENSIONS, 0];
+            raw.extend_from_slice(&(b.len() as u16).to_be_bytes());
+            raw.extend_from_slice(&b);
+            raw
+        };
+        let fresh = |tag: &[u8]| {
+            let mut rng = HmacDrbg::<Sha256>::new(tag, b"nonce", &[]);
+            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng).unwrap()
+        };
+
+        // ServerHello carrying ALPN (only legal in EncryptedExtensions).
+        let sh = ServerHello {
+            random: [0x11; 32],
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                ext::alpn_protocols(&[b"h2"]),
+            ],
+        };
+        let raw = sh.encode();
+        let mut client = fresh(b"unsol-sh");
+        let _ = client.write_tls();
+        assert!(matches!(
+            client.on_server_hello(hs_type::SERVER_HELLO, &raw[4..], &raw),
+            Err(Error::UnsupportedExtension)
+        ));
+
+        // HelloRetryRequest carrying `pre_shared_key` (ServerHello-only).
+        let hrr = ServerHello {
+            random: HRR_RANDOM,
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                ext::hrr_key_share(NamedGroup::SECP384R1),
+                ext::server_pre_shared_key(0),
+            ],
+        };
+        let raw = hrr.encode();
+        let mut client = fresh(b"unsol-hrr");
+        let _ = client.write_tls();
+        assert!(matches!(
+            client.on_server_hello(hs_type::SERVER_HELLO, &raw[4..], &raw),
+            Err(Error::UnsupportedExtension)
+        ));
+
+        // EncryptedExtensions: `quic_transport_parameters` on a TLS
+        // connection, an extension type we never offer at all, and ALPN
+        // when the client offered none.
+        for exts in [
+            alloc::vec![(
+                ExtensionType::QUIC_TRANSPORT_PARAMETERS.0,
+                alloc::vec![0u8; 4]
+            )],
+            alloc::vec![(0x0001u16, alloc::vec![0x01u8])], // max_fragment_length
+            alloc::vec![(ExtensionType::ALPN.0, ext::alpn_protocols(&[b"h2"]).1)],
+        ] {
+            let mut client = fresh(b"unsol-ee");
+            let _ = client.write_tls();
+            let err = client
+                .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &ee(&exts))
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::UnsupportedExtension),
+                "{exts:?} must be unsupported_extension, got {err:?}"
+            );
+        }
+        // Control: an offered extension (`supported_groups`) is accepted.
+        let mut client = fresh(b"unsol-ee-ok");
+        let _ = client.write_tls();
+        client
+            .on_encrypted_extensions(
+                hs_type::ENCRYPTED_EXTENSIONS,
+                &ee(&[(
+                    ExtensionType::SUPPORTED_GROUPS.0,
+                    ext::supported_groups_list(&[NamedGroup::X25519]).1,
+                )]),
+            )
+            .unwrap();
     }
 
     /// RFC 8879 §3: a `CompressedCertificate` may only use an algorithm the
