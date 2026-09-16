@@ -49,6 +49,53 @@ fn run_capture(args: &[&str], stdin: &[u8]) -> (String, String, bool) {
     )
 }
 
+/// A spawned `purecrypto` server subcommand, already listening.
+///
+/// `port` is the port the server actually bound, parsed from its
+/// `listening on <addr>` banner: the tests pass `-accept 0` and let the
+/// kernel pick, so two test runs (or any other process) can never collide on
+/// a port that was probed and released before the server bound it.
+struct ServerProc {
+    child: std::process::Child,
+    port: u16,
+    /// Everything the server wrote to stderr after the banner, for the
+    /// failure message when it does not exit in time.
+    stderr: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl ServerProc {
+    /// Longest a single-shot server is allowed to keep running after the
+    /// client side of a test has finished. The servers exit on their own
+    /// (one exchange, then a bounded idle/accept deadline), so this only
+    /// fires when something is genuinely stuck.
+    const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+    /// Waits for the server to exit on its own, killing it and failing the
+    /// test with its captured stderr if it has not within
+    /// [`EXIT_DEADLINE`](Self::EXIT_DEADLINE) — so a client failure can never
+    /// leave the test blocked forever in `wait()`.
+    fn finish(mut self) {
+        let start = std::time::Instant::now();
+        loop {
+            match self.child.try_wait().expect("poll server") {
+                Some(_) => return,
+                None if start.elapsed() > Self::EXIT_DEADLINE => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    let stderr = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+                    panic!(
+                        "server still running {:?} after the client finished; killed it. \
+                         Server stderr:\n{}",
+                        Self::EXIT_DEADLINE,
+                        *stderr
+                    );
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+}
+
 /// Spawns a `purecrypto` server subcommand and blocks until it reports
 /// `listening on …` on stderr, so the client is never started before the
 /// socket is bound. A fixed sleep is not enough: on a loaded machine a debug
@@ -56,10 +103,13 @@ fn run_capture(args: &[&str], stdin: &[u8]) -> (String, String, bool) {
 /// and a UDP ClientHello sent to a still-unbound port comes back as
 /// `Connection refused`, which the client rightly treats as fatal.
 ///
-/// The server must NOT be given `-quiet` (that suppresses the banner). Its
-/// stderr is drained on a helper thread for the process's lifetime so a later
-/// `eprintln!` in the server can never block or hit a closed pipe.
-fn spawn_server_wait_listening(args: &[&str]) -> std::process::Child {
+/// Pass `-accept 0` (or `127.0.0.1:0`) and read the kernel-chosen port back
+/// from the returned [`ServerProc::port`]. The server must NOT be given
+/// `-quiet` (that suppresses the banner). Its stderr is drained on a helper
+/// thread for the process's lifetime so a later `eprintln!` in the server can
+/// never block or hit a closed pipe; the drained text is kept for
+/// [`ServerProc::finish`]'s failure report.
+fn spawn_server_wait_listening(args: &[&str]) -> ServerProc {
     use std::io::BufRead;
     let mut child = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
         .args(args)
@@ -70,19 +120,42 @@ fn spawn_server_wait_listening(args: &[&str]) -> std::process::Child {
         .expect("spawn purecrypto server");
     let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
     let mut line = String::new();
-    loop {
+    let mut before_banner = String::new();
+    let port = loop {
         line.clear();
         let n = stderr.read_line(&mut line).expect("read server stderr");
-        assert!(n > 0, "server exited before reporting `listening on`");
-        if line.contains("listening on") {
-            break;
+        assert!(
+            n > 0,
+            "server exited before reporting `listening on`; stderr:\n{before_banner}"
+        );
+        if let Some(rest) = line.trim_start().strip_prefix("listening on ") {
+            // `listening on 127.0.0.1:PORT` / `[::1]:PORT`, optionally
+            // followed by ` (DTLS / UDP)` or ` (QUIC / UDP)`.
+            let addr = rest.split_whitespace().next().unwrap_or("");
+            let port = addr
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or_else(|| panic!("cannot parse a port from the banner {line:?}"));
+            assert!(port != 0, "server reported port 0 in its banner: {line:?}");
+            break port;
         }
-    }
+        before_banner.push_str(&line);
+    };
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = std::sync::Arc::clone(&captured);
     std::thread::spawn(move || {
-        let mut sink = String::new();
-        let _ = stderr.read_to_string(&mut sink);
+        let mut rest = String::new();
+        let _ = stderr.read_to_string(&mut rest);
+        if let Ok(mut s) = sink.lock() {
+            s.push_str(&rest);
+        }
     });
-    child
+    ServerProc {
+        child,
+        port,
+        stderr: captured,
+    }
 }
 
 #[test]
@@ -177,7 +250,11 @@ fn kdf_pbkdf2_zero_iterations_dies_cleanly() {
         b"",
     );
     assert!(!ok);
-    assert!(err.contains("-iter must be at least 1"), "got: {err}");
+    // The fallible KDF reports the zero count; the CLI names the flag.
+    assert!(
+        err.contains("-iter 0: PBKDF2 requires at least one iteration"),
+        "got: {err}"
+    );
     assert!(!err.contains("panicked"), "got: {err}");
 }
 
@@ -213,9 +290,9 @@ fn enc_kwp_short_ciphertext_dies_cleanly() {
 
 #[test]
 fn enc_ccm_bad_nonce_dies_cleanly() {
-    // AES-CCM accepts only a 7..=13-byte nonce (RFC 3610); `Ccm::validate`
-    // asserts this internally, so a wrong-length nonce must be rejected with a
-    // clean error rather than a panic/abort with a backtrace.
+    // AES-CCM accepts only a 7..=13-byte nonce (RFC 3610); the CLI goes
+    // through `Ccm::try_encrypt`, so a wrong-length nonce must be rejected
+    // with a clean, range-naming error rather than a panic with a backtrace.
     let bad_nonce = "00112233445566778899aabbccddeeff"; // 16 bytes (hex), out of range.
     for alg in ["AES-128-CCM", "AES-256-CCM", "AES-128-CCM8", "AES-256-CCM8"] {
         let key = if alg.starts_with("AES-256") {
@@ -1977,10 +2054,6 @@ fn s_server_echo_sends_close_notify_on_exit() {
     use purecrypto::tls::{Config, Connection, HandshakeStatus};
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
     let dir = std::env::temp_dir().join(format!("pc_s_server_close_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path = dir.join("server.pem");
@@ -2009,8 +2082,9 @@ fn s_server_echo_sends_close_notify_on_exit() {
         "-key",
         key_path.to_str().unwrap(),
         "-accept",
-        &port.to_string(),
+        "0",
     ]);
+    let port = server_proc.port;
 
     let cfg = Config::builder()
         .tls_only()
@@ -2053,7 +2127,7 @@ fn s_server_echo_sends_close_notify_on_exit() {
             break;
         }
     }
-    let _ = server_proc.wait_with_output();
+    server_proc.finish();
     assert_eq!(echoed, b"PING\n");
     assert!(
         conn.received_close_notify(),
@@ -2304,11 +2378,6 @@ fn s_client_s_server_roundtrip_alpn_keylog() {
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
-    // Pick a free port up front.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
     let dir = std::env::temp_dir().join(format!("pc_s_server_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path = dir.join("server.pem");
@@ -2333,28 +2402,21 @@ fn s_client_s_server_roundtrip_alpn_keylog() {
     std::fs::write(&cert_path, cert.to_pem()).unwrap();
     std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
 
-    // Spawn s_server in a background process (single-shot, `-www`).
-    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
-        .args([
-            "s_server",
-            "-cert",
-            cert_path.to_str().unwrap(),
-            "-key",
-            key_path.to_str().unwrap(),
-            "-accept",
-            &port.to_string(),
-            "-alpn",
-            "h2,http/1.1",
-            "-www",
-            "-quiet",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn s_server");
-
-    // Give the server time to bind.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Spawn s_server in a background process (single-shot, `-www`) on a
+    // kernel-chosen port, and wait for its banner rather than sleeping.
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-accept",
+        "0",
+        "-alpn",
+        "h2,http/1.1",
+        "-www",
+    ]);
+    let port = server_proc.port;
 
     // s_client connects, negotiates ALPN, dumps secrets to keylogfile.
     let (out, ok) = run(
@@ -2372,7 +2434,7 @@ fn s_client_s_server_roundtrip_alpn_keylog() {
         b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
     );
 
-    let _ = server_proc.wait_with_output();
+    server_proc.finish();
 
     assert!(ok, "s_client failed");
     assert!(
@@ -2508,26 +2570,17 @@ fn cli_ip_san_cert_is_well_formed_and_verifies_over_tls() {
     assert!(leaf.subject_alt_names().unwrap().is_empty());
 
     // End to end, on the verified path (no `-insecure`): the cookbook flow.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
-        .args([
-            "s_server",
-            "-cert",
-            &p("srv.crt"),
-            "-key",
-            &p("srv.key"),
-            "-accept",
-            &port.to_string(),
-            "-www",
-            "-quiet",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn s_server");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server",
+        "-cert",
+        &p("srv.crt"),
+        "-key",
+        &p("srv.key"),
+        "-accept",
+        "0",
+        "-www",
+    ]);
+    let port = server_proc.port;
     let (out, err, ok) = run_capture(
         &[
             "s_client",
@@ -2539,7 +2592,7 @@ fn cli_ip_san_cert_is_well_formed_and_verifies_over_tls() {
         ],
         b"GET / HTTP/1.0\r\n\r\n",
     );
-    let _ = server_proc.wait_with_output();
+    server_proc.finish();
     assert!(
         ok,
         "verified s_client against a CLI-minted IP-SAN cert failed: {err}"
@@ -2689,11 +2742,6 @@ fn s_client_s_server_tls12_roundtrip() {
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
-    // Pick a free port up front.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
     let dir = std::env::temp_dir().join(format!("pc_s_server_tls12_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path = dir.join("server.pem");
@@ -2717,25 +2765,18 @@ fn s_client_s_server_tls12_roundtrip() {
     std::fs::write(&cert_path, cert.to_pem()).unwrap();
     std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
 
-    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
-        .args([
-            "s_server",
-            "-tls1_2",
-            "-cert",
-            cert_path.to_str().unwrap(),
-            "-key",
-            key_path.to_str().unwrap(),
-            "-accept",
-            &port.to_string(),
-            "-www",
-            "-quiet",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn s_server");
-
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server",
+        "-tls1_2",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-accept",
+        "0",
+        "-www",
+    ]);
+    let port = server_proc.port;
 
     let (out, ok) = run(
         &[
@@ -2749,7 +2790,7 @@ fn s_client_s_server_tls12_roundtrip() {
         b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
     );
 
-    let _ = server_proc.wait_with_output();
+    server_proc.finish();
 
     assert!(ok, "s_client -tls1_2 failed");
     assert!(
@@ -2778,11 +2819,6 @@ fn s_dtls_client_s_dtls_server_roundtrip() {
     use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
-
-    // Pick a free UDP port up front by binding then dropping.
-    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
 
     let dir = std::env::temp_dir().join(format!("pc_s_dtls_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -2819,9 +2855,10 @@ fn s_dtls_client_s_dtls_server_roundtrip() {
         "-key",
         key_path.to_str().unwrap(),
         "-accept",
-        &format!("127.0.0.1:{port}"),
+        "127.0.0.1:0",
         "-no_cookie",
     ]);
+    let port = server_proc.port;
 
     // s_dtls_client connects, sends one line, and expects the echo back.
     // `-insecure` skips peer-cert validation (the test fixture's cert isn't
@@ -2838,7 +2875,7 @@ fn s_dtls_client_s_dtls_server_roundtrip() {
         b"hello\n",
     );
 
-    let _ = server_proc.wait_with_output();
+    server_proc.finish();
 
     // The CLI exits when the data-phase idle deadline fires; we don't
     // assert on the exit code (which is non-deterministic across CI
@@ -2860,10 +2897,6 @@ fn s_client_s_server_dtls12_roundtrip() {
     use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
-
-    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
 
     let dir = std::env::temp_dir().join(format!("pc_dtls12_unified_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -2897,9 +2930,10 @@ fn s_client_s_server_dtls12_roundtrip() {
         "-key",
         key_path.to_str().unwrap(),
         "-accept",
-        &format!("127.0.0.1:{port}"),
+        "0",
         "-no_cookie",
     ]);
+    let port = server_proc.port;
 
     // `s_client -dtls1_2` instead of `s_dtls_client`.
     let (out, _ok) = run(
@@ -2914,7 +2948,7 @@ fn s_client_s_server_dtls12_roundtrip() {
         b"hello\n",
     );
 
-    let _ = server_proc.wait_with_output();
+    server_proc.finish();
 
     assert!(
         out.contains("hello"),
@@ -2931,10 +2965,6 @@ fn s_client_s_server_dtls13_roundtrip() {
     use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
-
-    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
 
     let dir = std::env::temp_dir().join(format!("pc_dtls13_unified_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -2967,9 +2997,10 @@ fn s_client_s_server_dtls13_roundtrip() {
         "-key",
         key_path.to_str().unwrap(),
         "-accept",
-        &format!("127.0.0.1:{port}"),
+        "0",
         "-no_cookie",
     ]);
+    let port = server_proc.port;
 
     let (out, _ok) = run(
         &[
@@ -2983,7 +3014,7 @@ fn s_client_s_server_dtls13_roundtrip() {
         b"hello\n",
     );
 
-    let _ = server_proc.wait_with_output();
+    server_proc.finish();
 
     assert!(
         out.contains("hello"),
@@ -5132,11 +5163,6 @@ fn q_client_q_server_roundtrip() {
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
-    // Pick a free UDP port up front by binding then dropping.
-    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-
     // Self-signed Ed25519 cert for 127.0.0.1.
     let dir = std::env::temp_dir().join(format!("pc_quic_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -5160,38 +5186,31 @@ fn q_client_q_server_roundtrip() {
     std::fs::write(&cert_path, cert.to_pem()).unwrap();
     std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
 
-    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
-        .args([
-            "q_server",
-            "-accept",
-            &format!("127.0.0.1:{port}"),
-            "-cert",
-            cert_path.to_str().unwrap(),
-            "-key",
-            key_path.to_str().unwrap(),
-            "-alpn",
-            "h3",
-            "-www",
-            "-quiet",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn q_server");
+    let server_proc = spawn_server_wait_listening(&[
+        "q_server",
+        "-accept",
+        "127.0.0.1:0",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-alpn",
+        "h3",
+        "-www",
+    ]);
+    let port = server_proc.port;
 
-    // Run the client, retrying until the server has bound its UDP socket. A
-    // single fixed sleep races the server's spawn + bind on a slow CI host
-    // (this test has flaked on Windows runners): the client then `connect()`s
-    // to an as-yet-unbound port, gets an ICMP port-unreachable, and exits
-    // before the server is ready. `q_server` stays up ~30s and is one-shot, and
-    // a run that yields no body means no handshake completed — so the server is
-    // still listening and the client can safely be retried until it answers.
-    // (The retries fit well inside the server's 30s `overall_deadline`: 40
-    // attempts of a 200ms sleep plus a fast-failing client run stay under it,
-    // and 15 attempts proved too few on a loaded Windows runner.)
+    // The banner wait above guarantees the UDP socket is bound before the
+    // client's first Initial, so the old race (an ICMP port-unreachable on a
+    // slow host, which the client treats as fatal) is gone. A couple of
+    // retries remain as insurance against a lost loopback datagram: a run
+    // that yields no body means no handshake completed, so the one-shot
+    // server (up ~30 s) is still listening and can be asked again.
     let mut out = String::new();
-    for _ in 0..40 {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         let (o, _ok) = run(
             &[
                 "q_client",
@@ -5211,7 +5230,7 @@ fn q_client_q_server_roundtrip() {
         out = o;
     }
 
-    let _ = server_proc.wait_with_output();
+    server_proc.finish();
 
     assert!(
         out.contains("hello from purecrypto q_server"),
@@ -5479,9 +5498,6 @@ fn s_server_and_pkey_accept_pkcs8_ec_key() {
         "pkey -pubout: {out}"
     );
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
     let server_proc = spawn_server_wait_listening(&[
         "s_server",
         "-cert",
@@ -5489,9 +5505,10 @@ fn s_server_and_pkey_accept_pkcs8_ec_key() {
         "-key",
         &p("pkcs8.key"),
         "-accept",
-        &port.to_string(),
+        "0",
         "-www",
     ]);
+    let port = server_proc.port;
     let (out, err, ok) = run_capture(
         &[
             "s_client",
@@ -5502,7 +5519,7 @@ fn s_server_and_pkey_accept_pkcs8_ec_key() {
         ],
         b"GET / HTTP/1.0\r\n\r\n",
     );
-    let _ = server_proc.wait_with_output();
+    server_proc.finish();
     assert!(ok, "s_client failed: {err}");
     assert!(out.contains("hello from purecrypto s_server"), "{out:?}");
     let _ = std::fs::remove_dir_all(&dir);
