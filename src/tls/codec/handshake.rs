@@ -133,6 +133,18 @@ fn parse_extensions(bytes: &[u8]) -> Result<Vec<RawExtension>, Error> {
     Ok(out)
 }
 
+/// Reads a `legacy_session_id<0..32>` (RFC 8446 §4.1.2/§4.1.3, RFC 5246
+/// §7.4.1.2/§7.4.1.3). The wire vector allows 255 bytes, the field 32; a
+/// longer one is out of the specified range — `decode_error` (RFC 8446 §6.2)
+/// — and must never be echoed back.
+fn read_session_id(c: &mut ReadCursor<'_>) -> Result<Vec<u8>, Error> {
+    let sid = c.vec_u8()?;
+    if sid.len() > 32 {
+        return Err(Error::Decode);
+    }
+    Ok(sid.to_vec())
+}
+
 fn read_random(c: &mut ReadCursor<'_>) -> Result<Random, Error> {
     let mut r = [0u8; 32];
     r.copy_from_slice(c.take(32)?);
@@ -229,7 +241,7 @@ impl ClientHello {
         let mut c = ReadCursor::new(body);
         let legacy_version = c.u16()?;
         let random = read_random(&mut c)?;
-        let session_id = c.vec_u8()?.to_vec();
+        let session_id = read_session_id(&mut c)?;
         let legacy_cookie = c.vec_u8()?.to_vec();
         let cs_bytes = c.vec_u16()?;
         if cs_bytes.len() % 2 != 0 {
@@ -277,7 +289,7 @@ impl ClientHello {
         let mut c = ReadCursor::new(body);
         let legacy_version = c.u16()?;
         let random = read_random(&mut c)?;
-        let session_id = c.vec_u8()?.to_vec();
+        let session_id = read_session_id(&mut c)?;
         let cs_bytes = c.vec_u16()?;
         let mut cs = ReadCursor::new(cs_bytes);
         let mut cipher_suites = Vec::new();
@@ -363,7 +375,7 @@ impl ServerHello {
             return Err(Error::Decode);
         }
         let random = read_random(&mut c)?;
-        let session_id = c.vec_u8()?.to_vec();
+        let session_id = read_session_id(&mut c)?;
         let cipher_suite = CipherSuite(c.u16()?);
         let compression = c.u8()?;
         if compression != 0 {
@@ -412,7 +424,7 @@ impl ServerHello {
             return Err(Error::Decode);
         }
         let random = read_random(&mut c)?;
-        let session_id = c.vec_u8()?.to_vec();
+        let session_id = read_session_id(&mut c)?;
         let cipher_suite = CipherSuite(c.u16()?);
         let compression = c.u8()?;
         if compression != 0 {
@@ -620,6 +632,73 @@ mod tests {
         let (ty, body) = read_handshake(&mut c).unwrap();
         assert_eq!(ty, hs_type::SERVER_HELLO);
         assert_eq!(ServerHello::decode(body).unwrap(), sh);
+    }
+
+    /// RFC 8446 §4.1.2 / §4.1.3 (and RFC 5246 §7.4.1.2 / §7.4.1.3):
+    /// `legacy_session_id` is `<0..32>`. The `u8` wire vector can carry up
+    /// to 255 bytes; anything past 32 is out of range — `decode_error` — and
+    /// must be rejected on both hellos rather than echoed.
+    #[test]
+    fn rejects_session_id_longer_than_32_bytes() {
+        let ch = |n: usize| {
+            ClientHello {
+                legacy_version: 0x0303,
+                random: [0x11; 32],
+                session_id: alloc::vec![0xab; n],
+                cipher_suites: alloc::vec![CipherSuite::AES_128_GCM_SHA256],
+                extensions: alloc::vec![(
+                    ExtensionType::SUPPORTED_VERSIONS,
+                    alloc::vec![0x02, 0x03, 0x04]
+                )],
+            }
+            .encode()
+        };
+        assert!(ClientHello::decode(&ch(32)[4..]).is_ok());
+        assert!(matches!(
+            ClientHello::decode(&ch(33)[4..]),
+            Err(Error::Decode)
+        ));
+        #[cfg(feature = "dtls")]
+        {
+            let dch = |n: usize| {
+                ClientHello {
+                    legacy_version: 0xfefd,
+                    random: [0x11; 32],
+                    session_id: alloc::vec![0xab; n],
+                    cipher_suites: alloc::vec![CipherSuite::AES_128_GCM_SHA256],
+                    extensions: Vec::new(),
+                }
+                .encode_dtls(&[])
+            };
+            assert!(ClientHello::decode_dtls(&dch(32)[4..]).is_ok());
+            assert!(matches!(
+                ClientHello::decode_dtls(&dch(33)[4..]),
+                Err(Error::Decode)
+            ));
+        }
+
+        let sh = |n: usize| {
+            ServerHello {
+                random: [0x22; 32],
+                session_id: alloc::vec![0xcd; n],
+                cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+                extensions: alloc::vec![(
+                    ExtensionType::SUPPORTED_VERSIONS,
+                    alloc::vec![0x03, 0x04]
+                )],
+            }
+            .encode()
+        };
+        assert!(ServerHello::decode(&sh(32)[4..]).is_ok());
+        assert!(matches!(
+            ServerHello::decode(&sh(33)[4..]),
+            Err(Error::Decode)
+        ));
+        #[cfg(feature = "tls-legacy")]
+        assert!(matches!(
+            ServerHello::decode_relaxed(&sh(33)[4..]),
+            Err(Error::Decode)
+        ));
     }
 
     #[test]
