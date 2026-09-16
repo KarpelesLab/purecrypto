@@ -109,7 +109,11 @@ pub(crate) fn offered_signature_schemes() -> Vec<SignatureScheme> {
     // The `rsa_pss_pss_*` schemes (RFC 8446 §4.2.3) are offered for the
     // same reason: an identity whose leaf carries an `id-RSASSA-PSS` SPKI
     // can only sign under them, and all three digests are listed because a
-    // PSS-restricted key pins the digest the peer must use.
+    // PSS-restricted key pins the digest the peer must use. The
+    // `rsa_pss_rsae_*` family is offered with all three digests too, so a
+    // peer that signs SHA-512 PSS over an `rsaEncryption` key (as the
+    // registry verifies and `SignaturePolicy::modern()` permits) is not
+    // turned away for a scheme we could have accepted.
     let base = [
         SignatureScheme::ED25519,
         SignatureScheme::ED448,
@@ -118,6 +122,7 @@ pub(crate) fn offered_signature_schemes() -> Vec<SignatureScheme> {
         SignatureScheme::ECDSA_SECP521R1_SHA512,
         SignatureScheme::RSA_PSS_RSAE_SHA256,
         SignatureScheme::RSA_PSS_RSAE_SHA384,
+        SignatureScheme::RSA_PSS_RSAE_SHA512,
         SignatureScheme::RSA_PSS_PSS_SHA256,
         SignatureScheme::RSA_PSS_PSS_SHA384,
         SignatureScheme::RSA_PSS_PSS_SHA512,

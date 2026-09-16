@@ -5318,12 +5318,45 @@ mod tls12_loopback_tests {
     #[test]
     fn server12_refuses_keys_without_a_tls12_signature_scheme() {
         use crate::tls::Error;
+        use crate::tls::codec::SignatureScheme;
         use crate::tls::codec::extension as ext;
         let tls12 = ext::parse_signature_algorithms(&ext::signature_algorithms_tls12().1).unwrap();
         let tls13 = ext::parse_signature_algorithms(&ext::signature_algorithms().1).unwrap();
         assert!(!tls12.iter().any(|s| s.is_brainpool_tls13()));
         assert!(tls13.iter().any(|s| s.is_brainpool_tls13()));
         assert!(tls12.iter().all(|s| tls13.contains(s)));
+        // Both RSA-PSS families are offered with all three digests, on both
+        // versions (RFC 8446 §4.2.3 defines them for TLS 1.2 as well), and
+        // every offered scheme is one the registry can verify under the
+        // default policy — an offer the receiver would then refuse is
+        // pointless, and a permitted scheme left out of the offer turns a
+        // peer away for no reason.
+        for scheme in [
+            SignatureScheme::RSA_PSS_RSAE_SHA256,
+            SignatureScheme::RSA_PSS_RSAE_SHA384,
+            SignatureScheme::RSA_PSS_RSAE_SHA512,
+            SignatureScheme::RSA_PSS_PSS_SHA256,
+            SignatureScheme::RSA_PSS_PSS_SHA384,
+            SignatureScheme::RSA_PSS_PSS_SHA512,
+        ] {
+            assert!(
+                tls12.contains(&scheme),
+                "{scheme:?} missing from the 1.2 offer"
+            );
+            assert!(
+                tls13.contains(&scheme),
+                "{scheme:?} missing from the 1.3 offer"
+            );
+        }
+        let policy = crate::signature_registry::SignaturePolicy::modern();
+        for scheme in &tls13 {
+            let algo = crate::signature_registry::find_by_tls_scheme(scheme.0)
+                .unwrap_or_else(|| panic!("{scheme:?} offered but unknown to the registry"));
+            assert!(
+                policy.permits(algo, &[]),
+                "{scheme:?} offered but not permitted by SignaturePolicy::modern()"
+            );
+        }
         for curve in [
             CurveId::BrainpoolP256r1,
             CurveId::BrainpoolP384r1,
@@ -8580,17 +8613,20 @@ mod audit_regression_tests {
     }
 
     /// RFC 8446 §4.4.3: a client `CertificateVerify` MUST use a scheme the
-    /// server offered in its `CertificateRequest`. The server verified any
-    /// scheme the signature registry knew, so `rsa_pss_rsae_sha512` — which
-    /// the CertificateRequest never offers — reached signature verification;
-    /// it must be refused with `illegal_parameter` before any verification
-    /// work. (The client engine no longer produces such a message itself, so
+    /// server offered in its `CertificateRequest`. The server used to run
+    /// straight into signature verification for any scheme, so an unoffered
+    /// one must be refused with `illegal_parameter` before any verification
+    /// work. The forgery names `ecdsa_sha1` (0x0203): well-formed, never
+    /// offered, and outside the `rsa_pkcs1_*` family that a separate gate
+    /// refuses — every scheme the registry can verify is now in the default
+    /// offer, so an offered-list gap cannot be staged with a registered
+    /// scheme. (The client engine never produces such a message itself, so
     /// the CertificateVerify is forged at the server.)
     #[cfg(feature = "std")]
     #[test]
     fn server_rejects_client_cert_verify_scheme_it_did_not_offer() {
         use crate::tls::ClientCertConfig;
-        const RSA_PSS_RSAE_SHA512: u16 = 0x0806;
+        const ECDSA_SHA1: u16 = 0x0203;
 
         let (server_config, server_cert_der) = rsa_server();
         let (client_cert_der, _client_key) = ed25519_client_cert(b"cv-scheme");
@@ -8632,7 +8668,7 @@ mod audit_regression_tests {
         // A CertificateVerify under an unoffered scheme, with a signature
         // that would never verify: the scheme gate must fire first.
         let mut forged = alloc::vec![crate::tls::codec::hs_type::CERTIFICATE_VERIFY, 0, 0, 68];
-        forged.extend_from_slice(&RSA_PSS_RSAE_SHA512.to_be_bytes());
+        forged.extend_from_slice(&ECDSA_SHA1.to_be_bytes());
         forged.extend_from_slice(&64u16.to_be_bytes());
         forged.extend_from_slice(&[0x5au8; 64]);
         let err = server.handle_handshake_for_test(forged).unwrap_err();
