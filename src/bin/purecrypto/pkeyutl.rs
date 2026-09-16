@@ -197,12 +197,16 @@ fn build_params<'a>(
 // Stateful hash-based signatures (LMS / HSS / XMSS / XMSS^MT)
 //
 // These keys carry a one-time-key index that advances on every signature. The
-// CLI stores the raw `to_bytes()` serialization (NOT PEM). On `sign` we:
+// CLI stores the raw `to_bytes()` serialization (NOT PEM) — for LMS/HSS the
+// cached form, `to_bytes_with_cache()`, since every `sign` is a fresh process
+// and the plain form would make each one re-derive the whole tree first (a
+// full key generation per signature: seconds for H15, minutes for H20). On
+// `sign` we:
 //   1. load the private key from the FILE (stdin is rejected — we must write
 //      the advanced state back to a real path),
 //   2. produce the signature (which advances the in-memory index),
 //   3. ATOMICALLY rewrite the key file (temp + rename) with the advanced
-//      `to_bytes()` BEFORE emitting the signature, and
+//      serialization BEFORE emitting the signature, and
 //   4. warn loudly on stderr that the key has advanced and the old copy must
 //      never be reused.
 // `verify` derives the public key from the same raw key file (deriving the
@@ -340,12 +344,12 @@ fn stateful_sign(key_path: &str, msg: &[u8]) -> Vec<u8> {
         StatefulKey::Lms(mut k) => {
             let s = LmsPrivateKey::sign(&mut k, &mut OsRng, msg)
                 .unwrap_or_else(|e| die(format!("LMS sign failed: {e:?}")));
-            (s, k.to_bytes())
+            (s, k.to_bytes_with_cache())
         }
         StatefulKey::Hss(mut k) => {
             let s = HssPrivateKey::sign(&mut k, &mut OsRng, msg)
                 .unwrap_or_else(|e| die(format!("HSS sign failed: {e:?}")));
-            (s, k.to_bytes())
+            (s, k.to_bytes_with_cache())
         }
         StatefulKey::Xmss(mut k) => {
             let s = XmssPrivateKey::sign(&mut k, msg)

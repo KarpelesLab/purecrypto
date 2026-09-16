@@ -149,20 +149,25 @@ fn xmssmt_from_name(name: &str) -> Option<XmssMtParamSet> {
 }
 
 /// Generates a stateful hash-based signing key (LMS/HSS/XMSS/XMSS^MT) and
-/// returns its raw serialized private-key bytes (`to_bytes`), or `None` if
-/// `algorithm` is not a stateful algorithm name.
+/// returns its raw serialized private-key bytes, or `None` if `algorithm` is
+/// not a stateful algorithm name.
 ///
 /// The bytes embed the live one-time-key index; the CLI writes them verbatim
 /// and `pkeyutl sign` rewrites the file after every signature (see `pkeyutl`).
+/// LMS/HSS keys use the *cached* form (`to_bytes_with_cache`): every
+/// `pkeyutl sign` is a fresh process, and without the cache each one would
+/// first re-derive the whole tree — a full key generation per signature
+/// (seconds for `H15`, minutes for `H20`). The file is the cache size: about
+/// 2 KiB for `H5`, 64 KiB for `H10`, 2 MiB for `H15` and above, per level.
 fn stateful_key_bytes(algorithm: &str) -> Option<Vec<u8>> {
     let up = algorithm.to_ascii_uppercase();
     if let Some((lms, ots)) = lms_from_name(&up) {
-        return Some(LmsPrivateKey::generate(lms, ots, &mut OsRng).to_bytes());
+        return Some(LmsPrivateKey::generate(lms, ots, &mut OsRng).to_bytes_with_cache());
     }
     if let Some(levels) = hss_from_name(&up) {
         let sk = HssPrivateKey::generate(&levels, &mut OsRng)
             .unwrap_or_else(|e| die(format!("HSS keygen failed: {e:?}")));
-        return Some(sk.to_bytes());
+        return Some(sk.to_bytes_with_cache());
     }
     if up.starts_with("XMSSMT-") {
         let set = xmssmt_from_name(&up)

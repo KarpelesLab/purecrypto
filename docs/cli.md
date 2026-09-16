@@ -135,7 +135,16 @@ Output format:
 - EC / SM2: `-----BEGIN EC PRIVATE KEY-----` (SEC1)
 - LMS / HSS / XMSS / XMSS^MT: the raw binary state serialization (not
   PEM — it carries the live one-time-key index and is rewritten by
-  `pkeyutl sign`; `pkey -in` does not read it)
+  `pkeyutl sign`; `pkey -in` does not read it). LMS/HSS files use the
+  library's *cached* form (`to_bytes_with_cache`), which also carries the
+  signer's Merkle node cache: every `pkeyutl sign` is a fresh process, and
+  without it each one would first re-derive the whole tree — a full key
+  generation per signature (about 2 s for `H15`, 40 s for `H20`, hours for
+  `H25`). The price is the file size: roughly 2 KiB for `H5`, 64 KiB for
+  `H10` and 2 MiB for `H15` and above, per HSS level, rewritten on every
+  signature. The plain form written by older releases still loads (the
+  first signature after it pays the rebuild once, and rewrites the file in
+  the cached form).
 - Everything else: `-----BEGIN PRIVATE KEY-----` (PKCS#8, algorithm
   identified by the embedded OID)
 
@@ -148,7 +157,9 @@ Output format:
 
 > **Stateful keys.** LMS/HSS and XMSS keys advance an index on every
 > signature. `pkeyutl sign` rewrites the key file in place after signing and
-> refuses to sign if it cannot; never copy a stateful key file.
+> refuses to sign if it cannot; never copy a stateful key file. LMS/HSS key
+> files written by this release are not readable by releases that predate
+> the cached form.
 
 ## `pkey`
 
