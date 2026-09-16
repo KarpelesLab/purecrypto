@@ -28,7 +28,11 @@ pub fn inv_mod_boxed(a: &BoxedUint, m: &BoxedUint) -> Option<BoxedUint> {
         let (new_s, new_neg) = signed_sub_boxed(&old_s, old_neg, &qs, s_neg);
         old_s = s;
         old_neg = s_neg;
-        s = new_s;
+        // `|new_s| <= m` (Bézout), so trimming to `m`'s width drops only zero
+        // limbs. Without this, `mul` widens by `m.limbs()` and `add` by one
+        // limb on every step, so `s` grows linearly with the iteration count
+        // and the whole loop goes quadratic: ~35 ms for a 1024-bit inverse.
+        s = BoxedUint::from_limbs(new_s.limbs_resized(m.limbs()));
         s_neg = new_neg;
     }
 
@@ -192,6 +196,66 @@ mod tests {
         let a = Uint::<2>::from_u64(0x9e3779b97f4a7c15);
         let inv = inv_mod(&a, &m).expect("a coprime to m");
         assert!(bool::from(modulus.mul_mod(&a, &inv).ct_eq(&Uint::ONE)));
+    }
+
+    /// `inv_mod_boxed` on RSA-prime-sized operands: the inverse must satisfy
+    /// `a · a⁻¹ ≡ 1 (mod m)` for odd and even multi-limb moduli, agree with
+    /// the fixed-width `inv_mod`, and report `None` when `gcd(a, m) != 1`.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn boxed_inverse_multi_limb() {
+        use super::super::BoxedMontModulus;
+        use alloc::vec::Vec;
+
+        let mut s = 0x5EED_1234_ABCD_EF01u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+
+        // 1024-bit odd modulus, random residue: Montgomery check.
+        for _ in 0..3 {
+            let mut m_limbs: Vec<u64> = (0..16).map(|_| next()).collect();
+            m_limbs[0] |= 1;
+            let m = BoxedUint::from_limbs(m_limbs);
+            let a_limbs: Vec<u64> = (0..16).map(|_| next()).collect();
+            let a = BoxedUint::from_limbs(a_limbs).reduce(&m);
+            if let Some(inv) = inv_mod_boxed(&a, &m) {
+                assert!(inv.lt(&m), "inverse must be reduced");
+                let mont = BoxedMontModulus::new(&m);
+                assert_eq!(mont.mul_mod(&a, &inv), BoxedUint::from_u64(1));
+            }
+        }
+
+        // Even modulus (an RSA φ(n)-like value) with e = 65537: check via
+        // widening multiply and long division.
+        let mut phi_limbs: Vec<u64> = (0..16).map(|_| next()).collect();
+        phi_limbs[0] &= !1;
+        let phi = BoxedUint::from_limbs(phi_limbs);
+        let e = BoxedUint::from_u64(65537);
+        if let Some(d) = inv_mod_boxed(&e, &phi) {
+            assert!(d.lt(&phi));
+            assert_eq!(e.mul(&d).reduce(&phi), BoxedUint::from_u64(1));
+        }
+
+        // Agrees with the fixed-width routine on a 128-bit odd modulus.
+        let m2 = Uint::<2>::from_limbs([0x1234_5678_9abc_def1, 0x0fed_cba9_8765_4321]);
+        let a2 = Uint::<2>::from_u64(0x9e37_79b9_7f4a_7c15);
+        let want = inv_mod(&a2, &m2).expect("coprime");
+        let got = inv_mod_boxed(
+            &BoxedUint::from_limbs(a2.as_limbs().to_vec()),
+            &BoxedUint::from_limbs(m2.as_limbs().to_vec()),
+        )
+        .expect("coprime");
+        assert_eq!(got.as_limbs()[..2], want.as_limbs()[..]);
+
+        // Not invertible: shared factor 3.
+        let m3 = BoxedUint::from_u64(3).mul(&BoxedUint::from_limbs(alloc::vec![u64::MAX, 7]));
+        let a3 = BoxedUint::from_u64(3).mul(&BoxedUint::from_limbs(alloc::vec![5, 1]));
+        assert!(inv_mod_boxed(&a3, &m3).is_none());
+        assert!(inv_mod_boxed(&BoxedUint::zero(2), &m3).is_none());
     }
 
     #[test]
