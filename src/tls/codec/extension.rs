@@ -222,14 +222,41 @@ pub(crate) fn record_size_limit(limit: u16) -> RawExtension {
     (ExtensionType::RECORD_SIZE_LIMIT, body)
 }
 
-/// Parses a `record_size_limit` extension body.
+/// The largest `record_size_limit` a TLS 1.3 endpoint may send: the 2^14
+/// plaintext ceiling plus the inner content-type byte (RFC 8449 §4).
+pub(crate) const RECORD_SIZE_LIMIT_MAX: u16 = (1 << 14) + 1;
+
+/// Parses a `record_size_limit` extension body as received by a **client**.
+///
+/// RFC 8449 §4: a value below 64 is `illegal_parameter`. A value above the
+/// protocol maximum is one the server is forbidden from sending, and a
+/// client MAY abort on it — this parser does.
 pub(crate) fn parse_record_size_limit(body: &[u8]) -> Result<u16, Error> {
+    let v = parse_record_size_limit_raw(body)?;
+    if v > RECORD_SIZE_LIMIT_MAX {
+        return Err(Error::IllegalParameter);
+    }
+    Ok(v)
+}
+
+/// Parses a `record_size_limit` extension body as received by a **server**.
+///
+/// RFC 8449 §4: "A server MUST NOT enforce this restriction; a client might
+/// advertise a higher limit that is enabled by an extension or version the
+/// server does not understand." So a value above the protocol maximum is
+/// clamped to it rather than rejected; a value below 64 is still
+/// `illegal_parameter`.
+pub(crate) fn parse_record_size_limit_server(body: &[u8]) -> Result<u16, Error> {
+    Ok(parse_record_size_limit_raw(body)?.min(RECORD_SIZE_LIMIT_MAX))
+}
+
+fn parse_record_size_limit_raw(body: &[u8]) -> Result<u16, Error> {
     let mut c = ReadCursor::new(body);
     let v = c.u16()?;
     c.expect_empty()?;
-    // RFC 8449 §4: limit must be in `64..=2^14+1`. Anything else closes the
-    // connection with `illegal_parameter`.
-    if !(64..=(1u16 << 14) + 1).contains(&v) {
+    // RFC 8449 §4: "endpoints MUST NOT send a value smaller than 64" and a
+    // receiver treats one as `illegal_parameter`.
+    if v < 64 {
         return Err(Error::IllegalParameter);
     }
     Ok(v)
@@ -702,6 +729,41 @@ mod tests {
         assert!(client_offers_tls13(&[2, 0x03, 0x04]).unwrap());
         assert!(client_offers_tls13(&[2, 0x03, 0x04, 0x00]).is_err());
         assert!(!client_offers_tls13(&[2, 0x03, 0x03]).unwrap());
+    }
+
+    /// RFC 8449 §4: both parsers refuse a limit below 64; above the protocol
+    /// maximum the client-side parser aborts (a MAY the client takes) while
+    /// the server-side one clamps (a MUST NOT enforce for servers).
+    #[test]
+    fn record_size_limit_bounds_per_role() {
+        let body = |v: u16| v.to_be_bytes().to_vec();
+        assert!(matches!(
+            parse_record_size_limit(&body(63)),
+            Err(Error::IllegalParameter)
+        ));
+        assert!(matches!(
+            parse_record_size_limit_server(&body(63)),
+            Err(Error::IllegalParameter)
+        ));
+        assert_eq!(parse_record_size_limit(&body(64)).unwrap(), 64);
+        assert_eq!(
+            parse_record_size_limit(&body(RECORD_SIZE_LIMIT_MAX)).unwrap(),
+            RECORD_SIZE_LIMIT_MAX
+        );
+        assert!(matches!(
+            parse_record_size_limit(&body(RECORD_SIZE_LIMIT_MAX + 1)),
+            Err(Error::IllegalParameter)
+        ));
+        assert_eq!(
+            parse_record_size_limit_server(&body(RECORD_SIZE_LIMIT_MAX + 1)).unwrap(),
+            RECORD_SIZE_LIMIT_MAX
+        );
+        assert_eq!(
+            parse_record_size_limit_server(&body(0xFFFF)).unwrap(),
+            RECORD_SIZE_LIMIT_MAX
+        );
+        // Trailing bytes are a malformed extension either way.
+        assert!(parse_record_size_limit_server(&[0x40, 0x00, 0x00]).is_err());
     }
 
     /// Round-trip a single host_name through `server_name` ↔ `parse_server_name`.

@@ -2053,9 +2053,12 @@ impl<R: RngCore> ServerConnection<R> {
             }
         }
 
-        // record_size_limit: parse the peer's advertisement.
+        // record_size_limit: parse the peer's advertisement. RFC 8449 §4: a
+        // server MUST NOT reject a value above the protocol maximum (the
+        // client may be advertising for an extension we don't know); it is
+        // clamped to 2^14 + 1 instead.
         if let Some(rsl_body) = ext::find(&ch.extensions, ExtensionType::RECORD_SIZE_LIMIT) {
-            let limit = ext::parse_record_size_limit(rsl_body)?;
+            let limit = ext::parse_record_size_limit_server(rsl_body)?;
             self.core.set_peer_record_size_limit(limit);
         }
 

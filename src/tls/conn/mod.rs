@@ -1663,6 +1663,63 @@ mod loopback_tests {
 
     /// ALPN: both sides negotiate `h2` when the server's preference also
     /// includes it.
+    /// RFC 8449 §4: a client may advertise a `record_size_limit` above the
+    /// TLS 1.3 maximum (a future extension could enable it) and "a server
+    /// MUST NOT enforce this restriction". The server used to abort with
+    /// `illegal_parameter`; it must clamp to 2^14 + 1 and carry on.
+    #[test]
+    fn server_clamps_record_size_limit_above_protocol_max() {
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"rsl-clamp-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rsl-clamp-server", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_record_size_limit(0xFFFF),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server
+                    .process_new_packets()
+                    .expect("an over-max record_size_limit must not abort the server");
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // The clamped limit still bounds the server's records at the
+        // protocol maximum: 40,000 bytes must go out as several records of
+        // at most 2^14 plaintext each and arrive intact.
+        let big = alloc::vec![0x42u8; 40_000];
+        server.send_application_data(&big).unwrap();
+        let s = server.write_tls();
+        let mut records = 0;
+        let mut off = 0;
+        while let Some(rec) = crate::tls::codec::read_record(&s[off..]).unwrap() {
+            assert!(rec.fragment.len() <= (1 << 14) + 256);
+            records += 1;
+            off += rec.len;
+        }
+        assert!(records >= 3, "40,000 bytes need at least three records");
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), big);
+    }
+
     #[test]
     fn alpn_negotiates_h2() {
         let (server_config, cert_der) = rsa_server();
