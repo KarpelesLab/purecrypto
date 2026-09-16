@@ -903,6 +903,11 @@ impl Certificate {
                 let mut oids = Vec::new();
                 let mut r = Reader::new(value);
                 let mut seq = r.read_sequence()?;
+                // RFC 5280 §4.2.1.4: `certificatePolicies ::= SEQUENCE SIZE
+                // (1..MAX) OF PolicyInformation` — an empty list is malformed.
+                if seq.is_empty() {
+                    return Err(Error::Malformed);
+                }
                 // PolicyInformation ::= SEQUENCE { policyIdentifier OID,
                 //   policyQualifiers SEQUENCE OF .. OPTIONAL }
                 while !seq.is_empty() {
@@ -1129,6 +1134,14 @@ impl Certificate {
             if id == oid::EXT_KEY_USAGE {
                 let mut r = Reader::new(value);
                 let mut seq = r.read_sequence()?;
+                // RFC 5280 §4.2.1.12: `ExtKeyUsageSyntax ::= SEQUENCE SIZE
+                // (1..MAX) OF KeyPurposeId`. An empty list is malformed —
+                // and must not be mistaken for "no extKeyUsage extension"
+                // (an unconstrained certificate) by callers that key off
+                // the returned list being empty.
+                if seq.is_empty() {
+                    return Err(Error::Malformed);
+                }
                 while !seq.is_empty() {
                     let raw = seq.read_oid()?;
                     out.push(parse_oid(raw)?);
@@ -1312,6 +1325,11 @@ impl Certificate {
 pub(super) fn parse_dns_names(der: &[u8], out: &mut Vec<String>) -> Result<(), Error> {
     let mut reader = Reader::new(der);
     let mut seq = reader.read_sequence()?;
+    // RFC 5280 §4.2.1.6: `GeneralNames ::= SEQUENCE SIZE (1..MAX) OF
+    // GeneralName` — an empty subjectAltName is malformed.
+    if seq.is_empty() {
+        return Err(Error::Malformed);
+    }
     while !seq.is_empty() {
         let (t, value) = seq.read_any()?;
         if t == 0x82 {
@@ -1354,6 +1372,10 @@ pub enum SanIp {
 fn parse_ip_addresses(der: &[u8], out: &mut Vec<SanIp>) -> Result<(), Error> {
     let mut reader = Reader::new(der);
     let mut seq = reader.read_sequence()?;
+    // `GeneralNames ::= SEQUENCE SIZE (1..MAX)` (parity with `parse_dns_names`).
+    if seq.is_empty() {
+        return Err(Error::Malformed);
+    }
     while !seq.is_empty() {
         let (t, value) = seq.read_any()?;
         if t == 0x87 {
@@ -1543,6 +1565,14 @@ fn parse_subtrees(
     unenforceable: &mut bool,
 ) -> Result<(), Error> {
     let mut r = Reader::new(body);
+    // RFC 5280 §4.2.1.10: `GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF
+    // GeneralSubtree`. A present-but-empty permittedSubtrees would otherwise
+    // parse as "no permitted subtree declared" — i.e. unconstrained — when
+    // the only sane reading of an empty permitted set is that nothing is
+    // permitted. Refuse the malformed encoding outright.
+    if r.is_empty() {
+        return Err(Error::Malformed);
+    }
     while !r.is_empty() {
         let mut subtree = r.read_sequence()?;
         let (t, value) = subtree.read_any()?;
@@ -2499,6 +2529,46 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         let body = encode_sequence(&perm);
         let nc = super::parse_name_constraints(&body).unwrap();
         assert_eq!(nc.permitted_dns, alloc::vec![String::from("example.com")]);
+    }
+
+    /// Every `SEQUENCE SIZE (1..MAX)` extension body must be rejected when
+    /// empty rather than read as "extension present but constrains nothing":
+    /// an empty extKeyUsage would otherwise pass the chain validator's
+    /// "no EKU ⇒ unconstrained" test, an empty permittedSubtrees would read
+    /// as "everything permitted", and an empty subjectAltName /
+    /// certificatePolicies is simply malformed (RFC 5280 §4.2.1.4, §4.2.1.6,
+    /// §4.2.1.10, §4.2.1.12).
+    #[test]
+    fn empty_size_constrained_extension_bodies_are_rejected() {
+        use crate::der::encode_sequence;
+        let empty_seq = encode_sequence(&[]);
+        let ext = |o: &[u64]| Extension {
+            oid: o.to_vec(),
+            critical: false,
+            value: empty_seq.clone(),
+        };
+
+        let cert = forge_cert_with_version_and_exts(2, &[ext(oid::EXT_KEY_USAGE)]);
+        assert!(matches!(cert.extended_key_usages(), Err(Error::Malformed)));
+
+        let cert = forge_cert_with_version_and_exts(2, &[ext(oid::SUBJECT_ALT_NAME)]);
+        assert!(matches!(cert.subject_alt_names(), Err(Error::Malformed)));
+        assert!(matches!(cert.subject_alt_ips(), Err(Error::Malformed)));
+
+        let cert = forge_cert_with_version_and_exts(2, &[ext(oid::CERTIFICATE_POLICIES)]);
+        assert!(matches!(cert.certificate_policies(), Err(Error::Malformed)));
+
+        // permittedSubtrees [0] present but empty.
+        let body = encode_sequence(&[0xA0, 0x00]);
+        assert!(super::parse_name_constraints(&body).is_err());
+        // excludedSubtrees [1] present but empty, alongside a real permitted
+        // entry — the empty list still poisons the whole extension.
+        let mut perm = alloc::vec![0xA0u8];
+        let subtree = encode_sequence(&[0x82, 0x01, b'a']);
+        perm.push(subtree.len() as u8);
+        perm.extend_from_slice(&subtree);
+        perm.extend_from_slice(&[0xA1, 0x00]);
+        assert!(super::parse_name_constraints(&encode_sequence(&perm)).is_err());
     }
 
     /// Forges a TBSCertificate with a caller-controlled `version` tag and an
