@@ -15,12 +15,13 @@
 //!
 //!   Because that import cannot signal failure, the buffer is requested in
 //!   chunks of at most 65536 bytes (the `crypto.getRandomValues` per-call
-//!   cap), each pre-poisoned with a sentinel pattern and checked afterwards —
-//!   including its final bytes — so glue that silently no-ops, or fills only
-//!   the first `getRandomValues`-sized chunk, panics instead of yielding keys
-//!   derived from stale linear memory. See [`host_fill`](super::host_fill).
-//!   Do not rely on this as a randomness check — it only rejects "the host
-//!   did not write (all of) the bytes".
+//!   cap) and at least 16 bytes (shorter draws are served from a 16-byte
+//!   scratch buffer), each pre-poisoned with a sentinel pattern and checked
+//!   afterwards — including its final bytes — so glue that silently no-ops,
+//!   or fills only the first `getRandomValues`-sized chunk, panics instead of
+//!   yielding keys derived from stale linear memory. See
+//!   [`host_fill`](super::host_fill). Do not rely on this as a randomness
+//!   check — it only rejects "the host did not write (all of) the bytes".
 //!
 //! * **WASI preview 1** — `wasm32-wasip1` with the `wasi-getrandom` feature.
 //!   Calls `random_get` from the `wasi_snapshot_preview1` module; no host glue
@@ -32,8 +33,9 @@
 //! const imports = {
 //!   purecrypto: {
 //!     random_get(ptr, len) {
-//!       // `len` never exceeds 65536 (the crypto.getRandomValues per-call
-//!       // cap): the library chunks larger requests on its side.
+//!       // `len` is always 16..=65536 (the crypto.getRandomValues per-call
+//!       // cap): the library chunks larger requests, and pads shorter ones,
+//!       // on its side.
 //!       crypto.getRandomValues(new Uint8Array(memory.buffer, ptr, len));
 //!     },
 //!   },
@@ -61,7 +63,8 @@ mod backend {
     unsafe extern "C" {
         /// Fills `len` bytes starting at `ptr` with CSPRNG output. Supplied by
         /// the embedder; the contract is to write exactly `len` bytes or trap.
-        /// `len` is at most `host_fill::MAX_CHUNK` (65536) bytes per call.
+        /// `len` is between `host_fill::TAIL_WINDOW` (16) and
+        /// `host_fill::MAX_CHUNK` (65536) bytes per call.
         pub(super) fn random_get(ptr: *mut u8, len: usize);
     }
 

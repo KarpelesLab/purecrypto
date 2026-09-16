@@ -12,10 +12,11 @@
 //! `arc4random_buf` aborts internally), so this one must too.
 //!
 //! The defence is to never ask the host for more than [`MAX_CHUNK`] bytes at
-//! once, pre-poison each chunk with a position-dependent sentinel pattern,
-//! and verify after the call that the pattern is gone — including from the
-//! final bytes of the chunk, so "wrote only a prefix" is caught as well as
-//! "wrote nothing". Chunking on this side matters: `crypto.getRandomValues`
+//! once (nor fewer than `TAIL_WINDOW`, so an honest short draw cannot match
+//! the sentinel by chance), pre-poison each chunk with a position-dependent
+//! sentinel pattern, and verify after the call that the pattern is gone —
+//! including from the final bytes of the chunk, so "wrote only a prefix" is
+//! caught as well as "wrote nothing". Chunking on this side matters: `crypto.getRandomValues`
 //! rejects requests above 65536 bytes, so host glue typically loops over
 //! chunks of that size, and glue whose loop stops after the first chunk
 //! would otherwise pass a single whole-buffer "did anything change?" check
@@ -33,8 +34,13 @@ pub(super) const MAX_CHUNK: usize = 65536;
 
 /// Number of trailing bytes of each chunk that must no longer hold the
 /// sentinel. A genuine random draw matches the sentinel there with
-/// probability 2^-128, so the check cannot false-positive in practice;
-/// chunks shorter than this get only the whole-chunk check.
+/// probability 2^-128, so the check cannot false-positive in practice.
+///
+/// This is also the smallest request ever handed to the host: a shorter
+/// `dest` is served through a `TAIL_WINDOW`-byte scratch buffer and the
+/// prefix copied out. Checking a short chunk directly would fail closed on an
+/// honest host whenever its output happened to equal the sentinel — for a
+/// one-byte draw that is one call in 256.
 const TAIL_WINDOW: usize = 16;
 
 /// Byte written at index `i` before calling the host, so that "the host
@@ -82,15 +88,34 @@ pub(super) fn check(chunk: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Fills `dest` through `host`, handing it at most [`MAX_CHUNK`] bytes per
-/// call and failing closed (panicking) on any chunk the host did not fill.
+/// Fills `dest` through `host`, handing it between [`TAIL_WINDOW`] and
+/// [`MAX_CHUNK`] bytes per call and failing closed (panicking) on any chunk
+/// the host did not fill.
 pub(super) fn fill_chunked(dest: &mut [u8], mut host: impl FnMut(&mut [u8])) {
     for chunk in dest.chunks_mut(MAX_CHUNK) {
-        poison(chunk);
-        host(chunk);
-        if let Err(what) = check(chunk) {
-            panic!("purecrypto.random_get host import {what}");
+        if chunk.len() < TAIL_WINDOW {
+            // Only the last chunk can be this short. Draw a full window so
+            // the sentinel check keeps its 2^-128 false-positive rate, then
+            // hand back the prefix. The unused tail is fresh entropy nobody
+            // will consume; wipe it rather than leave it on the stack.
+            let mut scratch = [0u8; TAIL_WINDOW];
+            fill_one(&mut scratch, &mut host);
+            chunk.copy_from_slice(&scratch[..chunk.len()]);
+            crate::zeroize::Zeroize::zeroize(&mut scratch);
+        } else {
+            fill_one(chunk, &mut host);
         }
+    }
+}
+
+/// One poisoned, checked host call over `chunk` (`TAIL_WINDOW..=MAX_CHUNK`
+/// bytes).
+fn fill_one(chunk: &mut [u8], host: &mut impl FnMut(&mut [u8])) {
+    debug_assert!((TAIL_WINDOW..=MAX_CHUNK).contains(&chunk.len()));
+    poison(chunk);
+    host(chunk);
+    if let Err(what) = check(chunk) {
+        panic!("purecrypto.random_get host import {what}");
     }
 }
 
@@ -158,18 +183,64 @@ mod tests {
         }
     }
 
+    /// A request shorter than the check window is served from one full-window
+    /// draw: the host sees `TAIL_WINDOW` bytes, and `dest` gets the prefix of
+    /// what it wrote.
     #[test]
-    fn short_requests_are_a_single_chunk() {
-        let mut dest = [0u8; 8];
-        let mut calls = 0;
+    fn short_requests_draw_a_full_window() {
+        for len in 1..TAIL_WINDOW {
+            let mut dest = vec![0u8; len];
+            let mut calls = 0;
+            let mut host = MockHost::new();
+            let mut expect = MockHost::new();
+            fill_chunked(&mut dest, |chunk| {
+                calls += 1;
+                assert_eq!(chunk.len(), TAIL_WINDOW, "len {len}");
+                let n = chunk.len();
+                host.write_prefix(chunk, n);
+            });
+            assert_eq!(calls, 1, "len {len}");
+            let mut want = vec![0u8; len];
+            expect.write_prefix(&mut want, len);
+            assert_eq!(dest, want, "len {len}");
+        }
+    }
+
+    /// Regression: a one-byte draw whose value happens to equal the sentinel
+    /// byte used to be rejected as "wrote nothing" — an honest host tripped it
+    /// once in 256 calls. Padding the request to a full window makes such a
+    /// coincidence 2^-128 instead.
+    #[test]
+    fn short_draw_equal_to_the_sentinel_is_accepted() {
+        for len in 1..TAIL_WINDOW {
+            let mut dest = vec![0u8; len];
+            let mut host = MockHost::new();
+            fill_chunked(&mut dest, |chunk| {
+                // Exactly the bytes `check` would have refused had the request
+                // been `len` bytes long, followed by genuine-looking output.
+                for (i, b) in chunk[..len].iter_mut().enumerate() {
+                    *b = sentinel(i);
+                }
+                let n = chunk.len();
+                host.write_prefix(&mut chunk[len..], n - len);
+            });
+            assert!(holds_sentinel(&dest), "len {len}");
+        }
+    }
+
+    /// A trailing chunk shorter than the window (a `dest` just past a chunk
+    /// boundary) takes the same padded path as a short request.
+    #[test]
+    fn trailing_short_chunk_draws_a_full_window() {
+        let mut dest = vec![0u8; MAX_CHUNK + 3];
         let mut host = MockHost::new();
         fill_chunked(&mut dest, |chunk| {
-            calls += 1;
-            assert_eq!(chunk.len(), 8);
-            host.write_prefix(chunk, 8);
+            host.requests.push(chunk.len());
+            let n = chunk.len();
+            host.write_prefix(chunk, n);
         });
-        assert_eq!(calls, 1);
-        assert!(!holds_sentinel(&dest));
+        assert_eq!(host.requests, [MAX_CHUNK, TAIL_WINDOW]);
+        assert!(!holds_sentinel(&dest[MAX_CHUNK..]));
     }
 
     /// The regression this module exists for: glue that fills the first
@@ -217,14 +288,14 @@ mod tests {
         fill_chunked(&mut dest, |chunk| chunk.fill(0));
     }
 
-    /// Below the 16-byte window a genuine all-zero draw is plausible, so
-    /// the all-zero check must not fire there (matching the pre-existing
-    /// behaviour).
+    /// A short request is padded to the full window before the host call, so
+    /// a host that zeroes the buffer is caught there too: an honest 16-byte
+    /// draw is all-zero with probability 2^-128.
     #[test]
-    fn short_all_zero_draw_is_accepted() {
+    #[should_panic(expected = "returned all-zero bytes")]
+    fn short_all_zero_draw_is_rejected() {
         let mut dest = [0u8; 8];
         fill_chunked(&mut dest, |chunk| chunk.fill(0));
-        assert_eq!(dest, [0u8; 8]);
     }
 
     #[test]
