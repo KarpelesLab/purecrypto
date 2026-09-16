@@ -16,7 +16,11 @@ pub const LIMB_BITS: usize = 64;
 /// `==` and the derived comparisons are **not** constant time; use the
 /// [`ConstantTimeEq`] / [`ConstantTimeGreater`] / [`ConstantTimeLess`] methods
 /// when comparing secret values.
+// `repr(transparent)`: the `DefaultIsZeroes` impl in `crate::zeroize` wipes a
+// `[Uint<LIMBS>]` as raw bytes on the strength of this being exactly a
+// `[Limb; LIMBS]` in memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct Uint<const LIMBS: usize> {
     limbs: [Limb; LIMBS],
 }
