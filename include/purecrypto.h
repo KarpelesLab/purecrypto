@@ -480,7 +480,8 @@ pc_status pc_cert_public_key_spki(const PcCert *cert, uint8_t *out,
                                   size_t *out_len);
 pc_status pc_cert_verify(const PcCert *cert, const PcCert *issuer);
 /* Writes a JSON summary of `cert` to `out` (out-buffer convention). Fields:
- * subject/issuer (CN/O/OU/C), validity (Unix seconds), serial (hex),
+ * subject/issuer ({cn, o, ou, c, email} — the PKCS#9 emailAddress attribute
+ * as `email`; each null when absent), validity (Unix seconds), serial (hex),
  * key {algorithm, curve, bits}, signature algorithm OID, subjectAltName
  * DNS/IP lists, basic constraints, keyUsage bits, extended key usage OIDs.
  * The exact JSON shape is NOT part of the stable ABI — parse defensively. */

@@ -163,13 +163,17 @@ fn curve_label(c: CurveId) -> &'static str {
     }
 }
 
+/// Every attribute [`DistinguishedName`] carries, as
+/// `{"cn","o","ou","c","email"}` (`null` when absent). `email` is the
+/// PKCS#9 `emailAddress` attribute (RFC 5280 §4.1.2.6).
 fn dn_json(dn: &DistinguishedName) -> String {
     format!(
-        "{{\"cn\":{},\"o\":{},\"ou\":{},\"c\":{}}}",
+        "{{\"cn\":{},\"o\":{},\"ou\":{},\"c\":{},\"email\":{}}}",
         jopt(&dn.common_name),
         jopt(&dn.organization),
         jopt(&dn.organizational_unit),
         jopt(&dn.country),
+        jopt(&dn.email_address),
     )
 }
 

@@ -2428,3 +2428,63 @@ fn tls_and_quic_set_certificate_accept_the_same_key_forms() {
         quic::pc_quic_free(server);
     }
 }
+
+// ---- pc_cert_analyze reports every DN attribute ----------------------------
+
+/// The analyze JSON used to drop a DN's PKCS#9 `emailAddress` (the one
+/// attribute `DistinguishedName` carries beyond CN/O/OU/C), so a C caller
+/// could not see it on either subject or issuer.
+#[test]
+fn cert_analyze_reports_dn_email_address() {
+    use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+    let mut rng = crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"ffi-dn-email", b"nonce", &[]);
+    let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let name = DistinguishedName::common_name("mail.example")
+        .with_organization("Example Corp")
+        .with_organizational_unit("Ops")
+        .with_country("US")
+        .with_email_address("ops@mail.example");
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2044, 1, 1, 0, 0, 0),
+    );
+    let pem = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&key),
+        &name,
+        &validity,
+        7,
+        false,
+        &["mail.example"],
+    )
+    .unwrap()
+    .to_pem();
+
+    let cert = unsafe { x509::pc_cert_from_pem(pem.as_ptr(), pem.len()) };
+    assert!(!cert.is_null());
+    let json = read_out(|p, l| unsafe { x509::pc_cert_analyze(cert, p, l) });
+    let json = core::str::from_utf8(&json).unwrap();
+    let dn = r#"{"cn":"mail.example","o":"Example Corp","ou":"Ops","c":"US","email":"ops@mail.example"}"#;
+    assert!(json.contains(&alloc::format!("\"subject\":{dn}")), "{json}");
+    // Self-signed: the issuer is the same name, so it carries the email too.
+    assert_eq!(
+        json.matches("\"email\":\"ops@mail.example\"").count(),
+        2,
+        "{json}"
+    );
+    unsafe { x509::pc_cert_free(cert) };
+
+    // Absent attributes are explicit nulls, not missing keys.
+    let (chain_pem, _) = loopback_identity();
+    let cert = unsafe { x509::pc_cert_from_pem(chain_pem.as_ptr(), chain_pem.len()) };
+    assert!(!cert.is_null());
+    let json = read_out(|p, l| unsafe { x509::pc_cert_analyze(cert, p, l) });
+    let json = core::str::from_utf8(&json).unwrap();
+    assert!(
+        json.contains(
+            r#""subject":{"cn":"loopback.example","o":null,"ou":null,"c":null,"email":null}"#
+        ),
+        "{json}"
+    );
+    unsafe { x509::pc_cert_free(cert) };
+}
