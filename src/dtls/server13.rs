@@ -1519,11 +1519,34 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             hrr_group = None;
             next_out_msg_seq = 0;
         } else {
-            // Cookie-off CH2 (post group-HRR): the transcript must be
-            // rewritten as `message_hash(CH1) ‖ HRR` (RFC 8446 §4.4.1).
-            // `replace_with_message_hash()` is not idempotent and the
-            // checks below can still fail, so the rewrite is deferred to
-            // the commit phase.
+            // Cookie-off CH2 (post group-HRR). If the HelloRetryRequest was
+            // lost, what arrives instead is the client's verbatim
+            // retransmission of CH1 (RFC 9147 §5.8.1): it carries no share
+            // for the HRR-selected group and used to be dropped as an
+            // illegal CH2, so the client retransmitted a hello the server
+            // never answered until its budget ran out. The cookie path is
+            // immune (a cookie-less hello re-enters the stateless HRR path);
+            // mirror that here by re-issuing the same HRR when the hello is
+            // byte-identical to the CH1 the transcript still holds. Anything
+            // else falls through to the CH2 checks below.
+            let hrr_needs = self.hrr_selected_group;
+            if hrr_needs.is_some_and(|g| !client_shares.iter().any(|(sg, _)| *sg == g)) {
+                let mut tls_ch1 = Vec::with_capacity(4 + body.len());
+                tls_ch1.push(hs_type::CLIENT_HELLO);
+                let n = body.len() as u32;
+                tls_ch1.push(((n >> 16) & 0xff) as u8);
+                tls_ch1.push(((n >> 8) & 0xff) as u8);
+                tls_ch1.push((n & 0xff) as u8);
+                tls_ch1.extend_from_slice(body);
+                if self.transcript.buffered_bytes() == tls_ch1.as_slice() {
+                    self.emit_hello_retry_request(None)?;
+                    return Ok(());
+                }
+            }
+            // The transcript must be rewritten as `message_hash(CH1) ‖ HRR`
+            // (RFC 8446 §4.4.1). `replace_with_message_hash()` is not
+            // idempotent and the checks below can still fail, so the
+            // rewrite is deferred to the commit phase.
             plan = TranscriptPlan::ReplayGroupHrr;
             sel_suite = self.suite.ok_or(Error::InappropriateState)?;
             hrr_group = self.hrr_selected_group;

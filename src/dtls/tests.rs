@@ -2078,6 +2078,67 @@ mod dtls13 {
         assert_eq!(server.take_received(), b"ping-hrr");
     }
 
+    /// Regression: with the cookie exchange off, a group-upgrade
+    /// HelloRetryRequest that is lost on the wire used to wedge the
+    /// handshake. The client's retransmit timer resends CH1 verbatim, the
+    /// server (already in `WaitSecondClientHello`) saw no share for the
+    /// group it had demanded, rejected the hello as an illegal CH2 and —
+    /// this being spoofable epoch-0 input — dropped it silently. Nothing
+    /// ever re-sent the HRR, so the client retransmitted into the void
+    /// until its budget ran out (RFC 9147 §5.8.1). A byte-identical CH1
+    /// must be answered with the same HRR again, as the stateless cookie
+    /// path already does.
+    #[test]
+    fn lost_group_hrr_is_reissued_on_retransmitted_client_hello() {
+        use crate::tls::codec::NamedGroup;
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.key_share_groups = Some(alloc::vec![NamedGroup::SECP256R1]);
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-cl-hrr-lost", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-srv-hrr-lost", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        let hrr = server.pop_outbound_datagrams();
+        assert_eq!(hrr.len(), 1, "group-upgrade HRR expected");
+        // Lose the HRR: the client's timer fires and CH1 goes out again.
+        let deadline = client.next_timeout().expect("CH1 retransmit armed");
+        client.on_timeout(deadline);
+        let ch1_again = client.pop_outbound_datagrams();
+        assert!(!ch1_again.is_empty(), "client should retransmit CH1");
+        for dg in &ch1_again {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr_again = server.pop_outbound_datagrams();
+        assert_eq!(
+            hrr_again.len(),
+            1,
+            "server must answer the retransmitted CH1 with the HRR again"
+        );
+        // Same HRR bytes apart from the record sequence number (bytes 5..11).
+        assert_eq!(hrr_again[0][..5], hrr[0][..5]);
+        assert_eq!(hrr_again[0][11..], hrr[0][11..]);
+        for dg in &hrr_again {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(pump_handshake_13(&mut client, &mut server));
+        client.send(b"after-lost-hrr").unwrap();
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"after-lost-hrr");
+    }
+
     /// DTLS-2 / DTLS-4: the cookie-required CH1 path must NOT pin
     /// per-connection handshake state (suite, group, transcript). All such
     /// state must be derived from the cookie's `aux` payload on CH2.
