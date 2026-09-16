@@ -506,6 +506,110 @@ mod tests {
         assert!(!policy.permits(find_by_id("ed448").unwrap(), &[]));
     }
 
+    /// Every `x509::CertSigner` variant issues a self-signed certificate
+    /// whose `signatureAlgorithm` OID resolves to a registry entry that
+    /// verifies the certificate under its own subject key, and the default
+    /// `modern()` policy's verdict on that entry is the documented one:
+    /// every NIST/Ed/ML-DSA signer is permitted, secp256k1 and Brainpool
+    /// chain signatures ride the OID-keyed `ecdsa-with-sha*` entries (so
+    /// they are permitted too), and SLH-DSA is opt-in only.
+    #[cfg(all(feature = "rsa", feature = "ec", feature = "alloc"))]
+    #[test]
+    fn every_cert_signer_verifies_through_registry_and_policy() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"registry-all-signers", b"nonce", &[]);
+        let name = DistinguishedName::common_name("registry.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let policy = SignaturePolicy::modern();
+
+        let rsa = crate::test_util::rsa_test_key_a();
+        let rsa = BoxedRsaPrivateKey::from_pkcs1_der(&rsa.to_pkcs1_der()).unwrap();
+        let ec: alloc::vec::Vec<BoxedEcdsaPrivateKey> = [
+            CurveId::P256,
+            CurveId::P384,
+            CurveId::P521,
+            CurveId::Secp256k1,
+            CurveId::BrainpoolP256r1,
+            CurveId::BrainpoolP384r1,
+            CurveId::BrainpoolP512r1,
+        ]
+        .into_iter()
+        .map(|c| BoxedEcdsaPrivateKey::generate(c, &mut rng))
+        .collect();
+        let ed25519 = Ed25519PrivateKey::generate(&mut rng);
+        let ed448 = Ed448PrivateKey::generate(&mut rng);
+        #[cfg(feature = "mldsa")]
+        let (ml44, _) = crate::mldsa::MlDsa44PrivateKey::generate(&mut rng);
+        #[cfg(feature = "mldsa")]
+        let (ml65, _) = crate::mldsa::MlDsa65PrivateKey::generate(&mut rng);
+        #[cfg(feature = "mldsa")]
+        let (ml87, _) = crate::mldsa::MlDsa87PrivateKey::generate(&mut rng);
+        #[cfg(feature = "slhdsa")]
+        let (slh, _) =
+            crate::slhdsa::PrivateKey::generate(crate::slhdsa::ParamSet::Sha2_128f, &mut rng);
+
+        // (signer, registry id the OID must resolve to, permitted by modern()).
+        // Only pushed to under `mldsa` / `slhdsa`.
+        #[allow(unused_mut)]
+        let mut cases: alloc::vec::Vec<(CertSigner<'_>, &str, bool)> = alloc::vec![
+            (CertSigner::Rsa(&rsa), "rsa-pkcs1-sha256", true),
+            (CertSigner::Ecdsa(&ec[0]), "ecdsa-with-sha256", true),
+            (CertSigner::Ecdsa(&ec[1]), "ecdsa-with-sha384", true),
+            (CertSigner::Ecdsa(&ec[2]), "ecdsa-with-sha512", true),
+            (CertSigner::Ecdsa(&ec[3]), "ecdsa-with-sha256", true),
+            (CertSigner::Ecdsa(&ec[4]), "ecdsa-with-sha256", true),
+            (CertSigner::Ecdsa(&ec[5]), "ecdsa-with-sha384", true),
+            (CertSigner::Ecdsa(&ec[6]), "ecdsa-with-sha512", true),
+            (CertSigner::Ed25519(&ed25519), "ed25519", true),
+            (CertSigner::Ed448(&ed448), "ed448", true),
+        ];
+        #[cfg(feature = "mldsa")]
+        {
+            cases.push((CertSigner::MlDsa44(&ml44), "ml-dsa-44", true));
+            cases.push((CertSigner::MlDsa65(&ml65), "ml-dsa-65", true));
+            cases.push((CertSigner::MlDsa87(&ml87), "ml-dsa-87", true));
+        }
+        #[cfg(feature = "slhdsa")]
+        cases.push((CertSigner::SlhDsa(&slh), "slh-dsa-sha2-128f", false));
+
+        for (signer, id, permitted) in &cases {
+            let cert =
+                Certificate::self_signed_general(signer, &name, &validity, 1, false, &[]).unwrap();
+            let subject = cert.subject_public_key().unwrap();
+            // The subject key the certificate carries is the signer's key.
+            assert_eq!(
+                subject.to_spki_der(),
+                signer.public_key().to_spki_der(),
+                "{id}"
+            );
+            cert.verify_signature_with(&subject)
+                .unwrap_or_else(|e| panic!("{id}: {e:?}"));
+            let oid = cert.signature_algorithm_oid().unwrap();
+            let algo = find_by_oid(&oid).unwrap_or_else(|| panic!("{id}: OID not in registry"));
+            assert_eq!(algo.id(), *id);
+            assert_eq!(
+                policy.permits(algo, &subject.to_spki_der()),
+                *permitted,
+                "modern() verdict for {id}"
+            );
+            // Tampering with the TBS breaks verification through the same path.
+            let mut der = cert.to_der().to_vec();
+            let flip = der.len() / 2;
+            der[flip] ^= 0x01;
+            if let Ok(bad) = Certificate::from_der(der) {
+                assert!(bad.verify_signature_with(&subject).is_err(), "{id}");
+            }
+        }
+    }
+
     #[cfg(all(feature = "rsa", feature = "alloc"))]
     #[test]
     fn min_rsa_bits_floor_rejects_small_keys() {

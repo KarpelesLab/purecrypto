@@ -171,6 +171,121 @@ mod tests {
     use crate::test_util::from_hex_vec;
     use crate::x509::Certificate;
 
+    /// Every in-process `ServerKey` type round-trips through
+    /// `sign_certificate_verify` -> `verify_signature`: the scheme the
+    /// signer reports resolves in the registry, is permitted by the default
+    /// `modern()` policy, and its `verify` accepts the signature over the
+    /// SPKI re-encoded from the matching `AnyPublicKey`. This pins the
+    /// scheme <-> hash <-> signature-encoding agreement between the TLS
+    /// signer, the registry entry and the x509 SPKI codec for each
+    /// algorithm.
+    #[test]
+    fn every_server_key_type_round_trips_certificate_verify() {
+        use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
+        use crate::rng::HmacDrbg;
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::AnyPublicKey;
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"cv-all-keys", b"nonce", &[]);
+        let content = certificate_verify_content(true, &[0x5a; 32]);
+
+        let rsa = crate::test_util::rsa_test_key_a();
+        let rsa = BoxedRsaPrivateKey::from_pkcs1_der(&rsa.to_pkcs1_der()).unwrap();
+        let p256 = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let p384 = BoxedEcdsaPrivateKey::generate(CurveId::P384, &mut rng);
+        let p521 = BoxedEcdsaPrivateKey::generate(CurveId::P521, &mut rng);
+        let ed25519 = Ed25519PrivateKey::generate(&mut rng);
+        let ed448 = Ed448PrivateKey::generate(&mut rng);
+
+        // Only pushed to under `mldsa`.
+        #[allow(unused_mut)]
+        let mut cases: Vec<(ServerKey, AnyPublicKey, SignatureScheme)> = alloc::vec![
+            (
+                ServerKey::Rsa(rsa.clone()),
+                AnyPublicKey::Rsa(rsa.public_key()),
+                SignatureScheme::RSA_PSS_RSAE_SHA256,
+            ),
+            (
+                ServerKey::Ecdsa(p256.clone()),
+                AnyPublicKey::Ecdsa(p256.public_key()),
+                SignatureScheme::ECDSA_SECP256R1_SHA256,
+            ),
+            (
+                ServerKey::Ecdsa(p384.clone()),
+                AnyPublicKey::Ecdsa(p384.public_key()),
+                SignatureScheme::ECDSA_SECP384R1_SHA384,
+            ),
+            (
+                ServerKey::Ecdsa(p521.clone()),
+                AnyPublicKey::Ecdsa(p521.public_key()),
+                SignatureScheme::ECDSA_SECP521R1_SHA512,
+            ),
+            (
+                ServerKey::Ed25519(ed25519.clone()),
+                AnyPublicKey::Ed25519(ed25519.public_key()),
+                SignatureScheme::ED25519,
+            ),
+            (
+                ServerKey::Ed448(ed448.clone()),
+                AnyPublicKey::Ed448(ed448.public_key()),
+                SignatureScheme::ED448,
+            ),
+        ];
+        #[cfg(feature = "mldsa")]
+        {
+            let (sk, pk) = crate::mldsa::MlDsa44PrivateKey::generate(&mut rng);
+            cases.push((
+                ServerKey::MlDsa44(sk),
+                AnyPublicKey::MlDsa44(pk),
+                SignatureScheme::MLDSA44,
+            ));
+            let (sk, pk) = crate::mldsa::MlDsa65PrivateKey::generate(&mut rng);
+            cases.push((
+                ServerKey::MlDsa65(sk),
+                AnyPublicKey::MlDsa65(pk),
+                SignatureScheme::MLDSA65,
+            ));
+            let (sk, pk) = crate::mldsa::MlDsa87PrivateKey::generate(&mut rng);
+            cases.push((
+                ServerKey::MlDsa87(sk),
+                AnyPublicKey::MlDsa87(pk),
+                SignatureScheme::MLDSA87,
+            ));
+        }
+
+        let policy = SignaturePolicy::modern();
+        for (key, pk, want_scheme) in &cases {
+            let (scheme, sig) = sign_certificate_verify(key, &content, &mut rng).unwrap();
+            assert_eq!(scheme, *want_scheme, "scheme for {want_scheme:?}");
+            assert_eq!(signature_scheme_for(key), scheme);
+            let algo = find_by_tls_scheme(scheme.0).expect("scheme in registry");
+            assert!(
+                policy.permits(algo, &pk.to_spki_der()),
+                "modern() must permit {}",
+                algo.id()
+            );
+            verify_signature(scheme, pk, &content, &sig, &policy)
+                .unwrap_or_else(|e| panic!("{}: {e:?}", algo.id()));
+            // Wrong content: a bad signature, never a decode/misbehaviour error.
+            let other = certificate_verify_content(false, &[0x5a; 32]);
+            assert!(matches!(
+                verify_signature(scheme, pk, &other, &sig, &policy),
+                Err(Error::BadCertificate)
+            ));
+            // Every other case's key must be rejected as a key/scheme
+            // mismatch, not verified.
+            for (_, other_pk, other_scheme) in &cases {
+                if other_scheme != want_scheme {
+                    assert!(
+                        verify_signature(scheme, other_pk, &content, &sig, &policy).is_err(),
+                        "{} accepted a signature under a {other_scheme:?} key",
+                        algo.id()
+                    );
+                }
+            }
+        }
+    }
+
     // RFC 8448 §3: verify the server's CertificateVerify (rsa_pss_rsae_sha256,
     // RSA-1024 certified key) over the reconstructed transcript.
     #[test]

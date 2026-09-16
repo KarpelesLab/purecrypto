@@ -722,6 +722,103 @@ mod loopback_tests {
         (ServerConfig::with_ed448(alloc::vec![der.clone()], key), der)
     }
 
+    /// An ECDSA self-signed server config on `curve` plus its certificate
+    /// DER. The certificate is signed with the curve's matched hash and
+    /// the server signs `CertificateVerify` with the matching IANA scheme.
+    fn ecdsa_server(curve: crate::ec::CurveId) -> (ServerConfig, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"loopback-ecdsa-key", b"nonce", &[]);
+        let key = crate::ec::BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (ServerConfig::with_ecdsa(alloc::vec![der.clone()], key), der)
+    }
+
+    /// One TLS 1.3 handshake per ECDSA curve with an IANA signature scheme:
+    /// the chain signature (`ecdsa-with-SHA*`, any-curve entry) and the
+    /// `CertificateVerify` (strict curve/hash entry) both go through the
+    /// registry, so a completed handshake pins the curve <-> hash <-> scheme
+    /// mapping end to end for P-256, P-384 and P-521.
+    #[test]
+    fn ecdsa_server_certificates_all_nist_curves() {
+        for curve in [
+            crate::ec::CurveId::P256,
+            crate::ec::CurveId::P384,
+            crate::ec::CurveId::P521,
+        ] {
+            run_with(
+                ecdsa_server(curve),
+                &[CipherSuite::AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+        }
+    }
+
+    /// ML-DSA-44 and ML-DSA-87 server certificates complete a handshake
+    /// (ML-DSA-65 is covered by `tls_mldsa_server_cert`), so all three
+    /// `id-ml-dsa-*` OIDs and `mldsa*` scheme code points are exercised.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn mldsa44_and_mldsa87_server_certificates() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"loopback-mldsa-44-87", b"nonce", &[]);
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let (sk44, _) = crate::mldsa::MlDsa44PrivateKey::generate(&mut rng);
+        let cert = Certificate::self_signed_general(
+            &CertSigner::MlDsa44(&sk44),
+            &name,
+            &validity,
+            1,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        run_with(
+            (
+                ServerConfig::with_mldsa44(alloc::vec![der.clone()], sk44),
+                der,
+            ),
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+
+        let (sk87, _) = crate::mldsa::MlDsa87PrivateKey::generate(&mut rng);
+        let cert = Certificate::self_signed_general(
+            &CertSigner::MlDsa87(&sk87),
+            &name,
+            &validity,
+            1,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        run_with(
+            (
+                ServerConfig::with_mldsa87(alloc::vec![der.clone()], sk87),
+                der,
+            ),
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
     /// Runs a full in-process handshake with an RSA server, then exchanges
     /// application data in both directions.
     fn run(suites: &[CipherSuite], groups: &[NamedGroup]) {
