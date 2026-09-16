@@ -1779,7 +1779,21 @@ impl QuicConnection {
             && !self.early_keys_discarded
             && self.endpoint.crypto.at(Level::EarlyData).tx.is_some()
             && self.level_has_pending(Level::EarlyData);
-        let handshake_will_emit = self.level_has_pending(Level::Handshake);
+        // RFC 9000 §14 — the datagram must fit the path (§14.1: 1200 bytes
+        // until a larger size is known to work) and the peer's
+        // `max_udp_payload_size`. Every packet coalesced behind the first is
+        // carved to the room left, and a level whose packet could not fit at
+        // all waits for the next datagram: a ClientHello or ServerHello that
+        // outgrows one Initial (an X25519MLKEM768 share or ciphertext,
+        // draft-ietf-tls-ecdhe-mlkem) then crosses in two Initial-bearing
+        // datagrams rather than one oversized one.
+        let budget = self.datagram_budget();
+        let initial_fills_datagram = initial_will_emit
+            && self.endpoint.bufs.at(Level::Initial).outbound_len()
+                + self.packet_overhead(Level::Initial)
+                >= budget;
+        let handshake_will_emit =
+            !initial_fills_datagram && self.level_has_pending(Level::Handshake);
 
         // RFC 9000 §14.1: a client MUST expand *every* datagram carrying an
         // Initial packet to at least 1200 bytes — not just the first one; a
@@ -1799,7 +1813,8 @@ impl QuicConnection {
         // 0-RTT packet follows (padding the Initial first would push the
         // datagram past the MTU). Padding lives inside an AEAD-sealed payload
         // so it shares that packet's authentication tag.
-        let initial_pad_target = if need_initial_pad && !zero_rtt_will_emit && !handshake_will_emit
+        let initial_pad_target = if need_initial_pad
+            && (initial_fills_datagram || (!zero_rtt_will_emit && !handshake_will_emit))
         {
             Some(1200usize)
         } else {
@@ -1808,7 +1823,7 @@ impl QuicConnection {
 
         // Initial-level packet (may carry CRYPTO + ACK + PADDING).
         if let Some(pkt) =
-            self.build_packet_with_pad(Level::Initial, initial_pad_target.map(|t| (t, 0)))
+            self.build_packet_with_pad(Level::Initial, initial_pad_target.map(|t| (t, 0)), budget)
         {
             datagram.extend_from_slice(&pkt);
         }
@@ -1821,7 +1836,8 @@ impl QuicConnection {
         let mut zero_rtt_emitted = false;
         if self.role == Role::Client
             && !self.early_keys_discarded
-            && let Some(pkt) = self.build_packet_at(Level::EarlyData)
+            && let Some(room) = self.coalesce_room(Level::EarlyData, budget, datagram.len())
+            && let Some(pkt) = self.build_packet_with_pad(Level::EarlyData, None, room)
         {
             datagram.extend_from_slice(&pkt);
             zero_rtt_emitted = true;
@@ -1834,7 +1850,9 @@ impl QuicConnection {
         } else {
             None
         };
-        if let Some(pkt) = self.build_packet_with_pad(Level::Handshake, handshake_pad) {
+        if let Some(room) = self.coalesce_room(Level::Handshake, budget, datagram.len())
+            && let Some(pkt) = self.build_packet_with_pad(Level::Handshake, handshake_pad, room)
+        {
             datagram.extend_from_slice(&pkt);
         }
 
@@ -1859,7 +1877,9 @@ impl QuicConnection {
         } else {
             None
         };
-        if let Some(pkt) = self.build_packet_with_pad(Level::OneRtt, onertt_pad) {
+        if let Some(room) = self.coalesce_room(Level::OneRtt, budget, datagram.len())
+            && let Some(pkt) = self.build_packet_with_pad(Level::OneRtt, onertt_pad, room)
+        {
             datagram.extend_from_slice(&pkt);
         }
         // L-6: only a drop in the *challenge* count exempts this datagram
@@ -1881,9 +1901,15 @@ impl QuicConnection {
         // covers a Handshake packet we expected but did not build; failing
         // that, a second Initial packet made only of PADDING is legal too.
         if need_initial_pad && initial_emitted && datagram.len() < 1200 {
+            // While Initial CRYPTO is still owed the peer cannot have
+            // Handshake keys yet (they follow the complete ServerHello), so
+            // the trailer stays at the Initial level rather than arriving as
+            // a packet it must drop.
             let trailer_level = if zero_rtt_emitted {
                 Level::EarlyData
-            } else if self.endpoint.crypto.at(Level::Handshake).tx.is_some() {
+            } else if self.endpoint.crypto.at(Level::Handshake).tx.is_some()
+                && !self.endpoint.bufs.at(Level::Initial).outbound_pending()
+            {
                 Level::Handshake
             } else {
                 Level::Initial
@@ -1936,6 +1962,58 @@ impl QuicConnection {
             }
         }
         false
+    }
+
+    /// RFC 9000 §14 — the largest datagram this connection sends: the
+    /// congestion controller's `max_datagram_size` (the §14.1 1200-byte
+    /// floor until a larger path MTU is known), capped by the peer's
+    /// `max_udp_payload_size` (§18.2) once its transport parameters are in.
+    fn datagram_budget(&self) -> usize {
+        let mut budget = usize::try_from(self.endpoint.cc.max_datagram_size).unwrap_or(usize::MAX);
+        if let Some(peer_max) = self
+            .peer_params
+            .as_ref()
+            .and_then(|p| p.max_udp_payload_size)
+        {
+            budget = budget.min(usize::try_from(peer_max).unwrap_or(usize::MAX));
+        }
+        budget.max(MIN_INITIAL_DATAGRAM)
+    }
+
+    /// Upper bound on the bytes a packet at `level` adds around its payload:
+    /// the header with the current CIDs (and, for a client Initial, the
+    /// Retry token), a 4-byte packet number, a 4-byte Length field and the
+    /// AEAD tag.
+    fn packet_overhead(&self, level: Level) -> usize {
+        let dcid = self.endpoint.cids.peer.len();
+        let scid = self.endpoint.cids.local.len();
+        let tag = 16;
+        match level {
+            Level::OneRtt => 1 + dcid + 4 + tag,
+            Level::Initial => {
+                let token = if self.role == Role::Client {
+                    self.retry_token.len()
+                } else {
+                    0
+                };
+                1 + 4 + 1 + dcid + 1 + scid + 4 + token + 4 + 4 + tag
+            }
+            Level::Handshake | Level::EarlyData => 1 + 4 + 1 + dcid + 1 + scid + 4 + 4 + tag,
+        }
+    }
+
+    /// The room a packet at `level` may take when coalesced into a datagram
+    /// that already holds `used` bytes of a `budget`-byte datagram, or `None`
+    /// when what is left could not carry a useful payload — the level then
+    /// waits for the next datagram. A datagram with nothing in it yet always
+    /// has room, so a packet is never starved.
+    fn coalesce_room(&self, level: Level, budget: usize, used: usize) -> Option<usize> {
+        const MIN_COALESCED_PAYLOAD: usize = 32;
+        if used == 0 {
+            return Some(budget);
+        }
+        let room = budget.saturating_sub(used);
+        (room >= self.packet_overhead(level) + MIN_COALESCED_PAYLOAD).then_some(room)
     }
 
     /// True if `level` currently has CRYPTO or pending-ACK bytes to send.
@@ -3825,18 +3903,21 @@ impl QuicConnection {
         self.endpoint.cc.bytes_in_flight =
             self.endpoint.cc.bytes_in_flight.saturating_sub(stranded);
 
-        // Rewind the Initial-level CryptoBuf so the ClientHello bytes
-        // get re-carved into a fresh packet under the new keys.
+        // Rewind the Initial-level CryptoBuf so the ClientHello bytes get
+        // re-carved under the new keys — EVERY CRYPTO byte ever sent, not
+        // just the last chunk: a ClientHello with an X25519MLKEM768 key
+        // share spans two Initial packets, and the server that sent the
+        // Retry kept none of it. The drained packets' retransmit hints name
+        // the ranges each one carried, in send order.
+        for pkt in &drained {
+            if !pkt.retransmit_hint.is_empty() {
+                let _ = self.requeue_from_hint(&pkt.retransmit_hint);
+            }
+        }
         let buf = self.endpoint.bufs.at_mut(Level::Initial);
-        // `schedule_last_chunk_retransmit` would only re-queue the most
-        // recent chunk; for Retry we want EVERY CRYPTO byte we ever sent
-        // to be re-emitted. The Phase 4 model only ever carves a single
-        // chunk per level (CRYPTO_CHUNK_CAP = 1100, ClientHello fits in
-        // one chunk), so the last_sent path is equivalent to "all the
-        // bytes" here. Defensive comment: if a ClientHello ever needs
-        // multiple chunks (e.g. post-quantum chain in PSK), this code
-        // would need a full rewind.
-        let _ = buf.schedule_last_chunk_retransmit();
+        if !buf.outbound_pending() {
+            let _ = buf.schedule_last_chunk_retransmit();
+        }
 
         // Mark that the next outbound carries a token; the build-packet
         // path reads `self.retry_token` for the Initial-only Token field.
@@ -3935,19 +4016,20 @@ impl QuicConnection {
                     _ => None,
                 });
             }
-            let suite = self.negotiated_suite;
+            // RFC 9001 §5.3 — a suite QUIC has no packet protection for
+            // (the CCM suites) cannot key the connection; fail the handshake
+            // rather than leave the secrets uninstalled and the peer waiting.
+            let Some(alg) = self.negotiated_suite.and_then(suite_to_aead) else {
+                return Err(Error::HandshakeFailure);
+            };
             for (lvl, dir, secret) in events {
-                if let Some(suite_id) = suite
-                    && let Some(alg) = suite_to_aead(suite_id)
-                {
-                    let keys = derive_dir_keys(alg, &secret);
-                    match dir {
-                        Direction::Tx => {
-                            self.endpoint.crypto.at_mut(lvl).tx = Some(keys);
-                        }
-                        Direction::Rx => {
-                            self.endpoint.crypto.at_mut(lvl).rx = Some(keys);
-                        }
+                let keys = derive_dir_keys(alg, &secret);
+                match dir {
+                    Direction::Tx => {
+                        self.endpoint.crypto.at_mut(lvl).tx = Some(keys);
+                    }
+                    Direction::Rx => {
+                        self.endpoint.crypto.at_mut(lvl).rx = Some(keys);
                     }
                 }
             }
@@ -5729,7 +5811,8 @@ impl QuicConnection {
     /// bytes include the header, AEAD-sealed payload, and 16-byte tag,
     /// with header protection applied.
     fn build_packet_at(&mut self, level: Level) -> Option<Vec<u8>> {
-        self.build_packet_with_pad(level, None)
+        let room = self.datagram_budget();
+        self.build_packet_with_pad(level, None, room)
     }
 
     /// Like [`build_packet_at`], but with optional PADDING to inflate the
@@ -5737,10 +5820,13 @@ impl QuicConnection {
     /// ciphertext + tag). `pad` is `Some((target_total, other_pkts_len))`
     /// where `other_pkts_len` is the number of bytes already in the
     /// datagram (used to compute how much room is left for this packet).
+    /// `room` is the most bytes the whole packet may take (RFC 9000 §14 —
+    /// what is left of the datagram); the payload is carved to fit it.
     fn build_packet_with_pad(
         &mut self,
         level: Level,
         pad: Option<(usize, usize)>,
+        room: usize,
     ) -> Option<Vec<u8>> {
         // Phase 4 emits Initial, Handshake, and 1-RTT. Phase 6 adds
         // STREAM and flow-control frames to the 1-RTT level. Phase 7
@@ -5864,7 +5950,8 @@ impl QuicConnection {
         // right one. Handshake-level packets use the same CID pair as
         // Initial (peer's chosen SCID we observed on the server's first
         // long-header packet).
-        let (payload, meta) = self.assemble_payload(level, scope)?;
+        let payload_cap = room.saturating_sub(self.packet_overhead(level));
+        let (payload, meta) = self.assemble_payload(level, scope, payload_cap)?;
         if payload.is_empty() {
             return None;
         }
@@ -5957,8 +6044,11 @@ impl QuicConnection {
                 4
             };
             // Pick length-field width based on the final payload size we
-            // are about to commit to. We do a single iteration: assume 2
-            // bytes; that decision holds for any payload up to ~16 KiB.
+            // are about to commit to: assume 2 bytes, which holds for any
+            // payload up to ~16 KiB, and correct below for the one case
+            // where it does not — a PADDING-only trailer so small that the
+            // Length field fits one byte, which would leave the datagram a
+            // byte short of the target.
             let length_field_bytes = 2;
             // A 1-RTT packet uses the short header (RFC 9000 §17.3): first
             // byte + DCID + PN, with no version, SCID, token, or Length
@@ -5979,7 +6069,12 @@ impl QuicConnection {
             };
             let pn_and_tag = pn_len as usize + 16;
             let needed_pkt_len = target_total.saturating_sub(already_in_datagram);
-            let payload_needed = needed_pkt_len.saturating_sub(header_overhead + pn_and_tag);
+            let mut payload_needed = needed_pkt_len.saturating_sub(header_overhead + pn_and_tag);
+            if !matches!(level, Level::OneRtt)
+                && pn_and_tag + payload.len().max(payload_needed) < 64
+            {
+                payload_needed += 1;
+            }
             if payload.len() < payload_needed {
                 let extra = payload_needed - payload.len();
                 payload.extend(core::iter::repeat_n(0u8, extra));
@@ -6162,6 +6257,7 @@ impl QuicConnection {
         &mut self,
         level: Level,
         scope: PayloadScope,
+        payload_cap: usize,
     ) -> Option<(Vec<u8>, PacketMeta)> {
         let mut out: Vec<u8> = Vec::new();
         let mut meta = PacketMeta::default();
@@ -6235,7 +6331,9 @@ impl QuicConnection {
         // packet used to overshoot 1200 bytes, black-holing the handshake
         // against a peer that advertised `max_udp_payload_size = 1200` (the
         // minimum §18.2 permits). The stream path below already does this.
-        let crypto_room = CRYPTO_CHUNK_CAP.saturating_sub(out.len());
+        // `payload_cap` is what the datagram has left for this packet (RFC
+        // 9000 §14): a packet coalesced behind a full Initial carves less.
+        let crypto_room = CRYPTO_CHUNK_CAP.min(payload_cap).saturating_sub(out.len());
         if full
             && crypto_room > 0
             && let Some((offset, data)) = self.endpoint.bufs.at_mut(level).carve(crypto_room)
@@ -6343,7 +6441,9 @@ impl QuicConnection {
                 const ONERTT_PAYLOAD_CAP: usize = 1100;
                 let pre_streams_len = out.len();
                 loop {
-                    let remaining = ONERTT_PAYLOAD_CAP.saturating_sub(out.len());
+                    let remaining = ONERTT_PAYLOAD_CAP
+                        .min(payload_cap)
+                        .saturating_sub(out.len());
                     if remaining < 4 {
                         break;
                     }
@@ -6384,7 +6484,9 @@ impl QuicConnection {
             // followed by other frames without ambiguity).
             const ONERTT_PAYLOAD_CAP_DG: usize = 1100;
             while full && !self.datagram_queues.outbound.is_empty() {
-                let remaining = ONERTT_PAYLOAD_CAP_DG.saturating_sub(out.len());
+                let remaining = ONERTT_PAYLOAD_CAP_DG
+                    .min(payload_cap)
+                    .saturating_sub(out.len());
                 if remaining < 2 {
                     break;
                 }
@@ -6499,11 +6601,12 @@ impl QuicConnection {
 // the TLS 1.3 engine honours over TLS is honoured over QUIC too, and a new
 // option must be classified there for both transports before it compiles.
 // QUIC mode skips only what has no meaning here: `record_size_limit` (RFC
-// 8449 is a record-layer extension and QUIC has no records),
-// `cipher_suites` / `min_version` (the QUIC engine offers its own fixed
-// TLS 1.3 set; `offer_tls12` stays off), `Config::resumption` (QUIC resumes
-// from `QuicConfig::resumption`, which carries the transport parameters
-// alongside the ticket), and the DTLS-only cookie settings.
+// 8449 is a record-layer extension and QUIC has no records), `min_version`
+// (QUIC v1 is TLS 1.3 only; `offer_tls12` stays off), `Config::resumption`
+// (QUIC resumes from `QuicConfig::resumption`, which carries the transport
+// parameters alongside the ticket), and the DTLS-only cookie settings.
+// `cipher_suites` narrows the client's offer within the suites RFC 9001
+// §5.3 permits — see `crate::quic::client::offered_cipher_suites`.
 // ---------------------------------------------------------------------
 
 fn build_client_tls_config(
@@ -6636,16 +6739,27 @@ mod tests {
     /// Constructs a (client, server) pair sharing trust roots, both
     /// running in QUIC mode against the loopback Ed25519 server cert.
     fn loopback_pair() -> (QuicConnection, QuicConnection) {
-        let (server_cfg_tls, cert_der) = ed25519_server();
+        loopback_pair_with(|_| {}, |_| {})
+    }
+
+    /// [`loopback_pair`] with the client's and the server's TLS `Config`
+    /// adjusted before the connections are built.
+    fn loopback_pair_with(
+        client: impl FnOnce(&mut Config),
+        server: impl FnOnce(&mut Config),
+    ) -> (QuicConnection, QuicConnection) {
+        let (mut server_cfg_tls, cert_der) = ed25519_server();
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
-        let client_cfg = Config {
+        let mut client_cfg = Config {
             roots,
             alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
         };
+        client(&mut client_cfg);
+        server(&mut server_cfg_tls);
 
         let client_params = loopback_params();
         let server_params = loopback_params();
@@ -6666,6 +6780,33 @@ mod tests {
         })
         .expect("server build");
         (client, server)
+    }
+
+    /// Pops every datagram `from` has queued, in order, without delivering
+    /// it — the whole of a flight. A client's first flight is two
+    /// Initial-bearing datagrams: its ClientHello carries an X25519MLKEM768
+    /// key share and does not fit one 1200-byte Initial (see
+    /// `crate::quic::client::QUIC_CLIENT_GROUPS`); so is the server's, whose
+    /// ServerHello carries the KEM ciphertext.
+    fn drain_datagrams(from: &mut QuicConnection) -> Vec<Vec<u8>> {
+        let mut flight = Vec::new();
+        loop {
+            let dg = from.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            flight.push(dg);
+        }
+        flight
+    }
+
+    /// Delivers every datagram `from` has queued to `to`, returning them.
+    fn feed_flight(from: &mut QuicConnection, to: &mut QuicConnection) -> Vec<Vec<u8>> {
+        let flight = drain_datagrams(from);
+        for dg in &flight {
+            to.feed_datagram(dg).expect("feed");
+        }
+        flight
     }
 
     /// Drives `client ↔ server` until both report
@@ -7047,14 +7188,13 @@ mod tests {
     fn pto_retransmit_completes_handshake() {
         let (mut c, mut s) = loopback_pair();
 
-        // Round 1: client emits its first Initial; server processes and
+        // Round 1: client emits its first flight; server processes and
         // produces a reply — but we DROP that reply.
-        let dg = c.pop_datagram();
-        assert!(!dg.is_empty());
-        s.feed_datagram(&dg).expect("server feed");
+        let flight = feed_flight(&mut c, &mut s);
+        assert!(!flight.is_empty());
         // Drop the server's first reply (don't deliver to the client).
-        let _dropped = s.pop_datagram();
-        assert!(!_dropped.is_empty(), "server must have emitted a reply");
+        let dropped = drain_datagrams(&mut s);
+        assert!(!dropped.is_empty(), "server must have emitted a reply");
 
         // The server's PTO fires at the deadline it computed (RFC 9002
         // §6.2.2: `kInitialRtt + 4 × kInitialRtt/2 = 999 ms` after the last
@@ -7259,23 +7399,32 @@ mod tests {
     /// coalesced packet to a legitimate datagram to drop the real packet
     /// and/or induce a connection error.
     ///
-    /// The server's first reply to the client's Initial is a coalesced
-    /// datagram: Initial(ServerHello) || Handshake(EE/Cert/CV/Fin). We
-    /// flip a byte inside the SECOND coalesced packet's ciphertext
-    /// (leaving its unprotected Length field intact) and assert that the
-    /// client still fully processes the FIRST (Initial) packet — i.e. it
-    /// records the Initial PN as received and derives Handshake keys from
-    /// the ServerHello — and that the connection is not closed.
+    /// The server's reply to the client's first flight ends in a coalesced
+    /// datagram: Initial(ServerHello tail) || Handshake(EE/Cert/CV/Fin) —
+    /// the ServerHello carries an ML-KEM ciphertext and spans two Initials,
+    /// the first of which travels alone. We flip a byte inside the SECOND
+    /// coalesced packet's ciphertext (leaving its unprotected Length field
+    /// intact) and assert that the client still fully processes the FIRST
+    /// (Initial) packet — i.e. it records the Initial PN as received and
+    /// derives Handshake keys from the now-complete ServerHello — and that
+    /// the connection is not closed.
     #[test]
     fn feed_datagram_coalesced_trailing_aead_fail_keeps_leading() {
         let (mut c, mut s) = loopback_pair();
 
-        // Client → server: first Initial.
-        let dg = c.pop_datagram();
-        assert!(!dg.is_empty());
-        s.feed_datagram(&dg).expect("server feed initial");
+        // Client → server: the first flight.
+        assert!(!feed_flight(&mut c, &mut s).is_empty());
 
-        // Server → client: the coalesced Initial || Handshake reply.
+        // Server → client: the lone Initial with the head of the ServerHello
+        // is delivered as is; it installs no Handshake keys yet.
+        let head = s.pop_datagram();
+        assert!(first_packet_is_initial(&head), "the ServerHello head");
+        c.feed_datagram(&head).expect("client feed head");
+        assert!(c.endpoint.crypto.at(Level::Handshake).rx.is_none());
+        let seen_before = c.endpoint.pn.initial.largest_rx;
+        assert!(seen_before.is_some());
+
+        // Then the coalesced Initial || Handshake reply.
         let reply = s.pop_datagram();
         assert!(!reply.is_empty(), "server must emit a coalesced reply");
 
@@ -7298,9 +7447,6 @@ mod tests {
         let mut tampered = reply.clone();
         tampered[flip] ^= 0x01;
 
-        // Before: client has seen nothing.
-        assert!(c.endpoint.pn.initial.largest_rx.is_none());
-
         // Feed the tampered coalesced datagram. The leading Initial
         // packet MUST be processed; the trailing junk packet MUST be a
         // silent drop, not a connection error (RFC 9000 §12.2).
@@ -7311,7 +7457,7 @@ mod tests {
         );
         assert!(!c.closed, "a trailing AEAD failure must not close the conn");
         assert!(
-            c.endpoint.pn.initial.largest_rx.is_some(),
+            c.endpoint.pn.initial.largest_rx > seen_before,
             "the leading valid Initial packet MUST be processed despite \
              the trailing packet failing AEAD (RFC 9000 §12.2)"
         );
@@ -7532,6 +7678,177 @@ mod tests {
         (client, server)
     }
 
+    /// Completes the handshake, then sends a request on a fresh client
+    /// stream and a reply on it — proof that both directions' 1-RTT packet
+    /// protection (AEAD and header protection) work under the negotiated
+    /// suite.
+    fn handshake_and_echo(c: &mut QuicConnection, s: &mut QuicConnection) {
+        drive_until_complete(c, s, 4);
+        let id = c.open_bidi().expect("open");
+        c.write(id, b"ping").expect("client write");
+        for _ in 0..4 {
+            pump(c, s);
+            if s.readable_streams().next().is_some() {
+                break;
+            }
+        }
+        let sid = s.readable_streams().next().expect("request delivered");
+        let mut buf = [0u8; 16];
+        let (n, _) = s.read(sid, &mut buf).expect("server read");
+        assert_eq!(&buf[..n], b"ping");
+        s.write(sid, b"pong").expect("server write");
+        for _ in 0..4 {
+            pump(c, s);
+            if c.readable_streams().next().is_some() {
+                break;
+            }
+        }
+        let (n, _) = c.read(id, &mut buf).expect("client read");
+        assert_eq!(&buf[..n], b"pong");
+    }
+
+    /// `Config::cipher_suites` used to be ignored over QUIC. Each suite RFC
+    /// 9001 §5.3 permits can now be forced on its own: the handshake
+    /// negotiates exactly it, the packet protection is keyed for its AEAD
+    /// (with the matching header-protection algorithm, §5.4.3 / §5.4.4)
+    /// and 1-RTT data flows both ways.
+    #[test]
+    fn cipher_suite_restriction_is_honoured_over_quic() {
+        for (suite, alg) in [
+            (0x1301u16, AeadAlg::Aes128Gcm),
+            (0x1302, AeadAlg::Aes256Gcm),
+            (0x1303, AeadAlg::ChaCha20Poly1305),
+        ] {
+            let (mut c, mut s) =
+                loopback_pair_with(|cfg| cfg.cipher_suites = Some(alloc::vec![suite]), |_| {});
+            handshake_and_echo(&mut c, &mut s);
+            assert_eq!(
+                c.negotiated_cipher_suite(),
+                Some(suite),
+                "client {suite:#06x}"
+            );
+            assert_eq!(
+                s.negotiated_cipher_suite(),
+                Some(suite),
+                "server {suite:#06x}"
+            );
+            for conn in [&c, &s] {
+                let keys = conn.endpoint.crypto.at(Level::OneRtt);
+                assert_eq!(keys.tx.as_ref().expect("1-RTT tx keys").alg, alg);
+                assert_eq!(keys.rx.as_ref().expect("1-RTT rx keys").alg, alg);
+            }
+        }
+        // A wider restriction is still a restriction: the server (which
+        // picks by its own preference, RFC 8446 §4.1.3) stays inside it.
+        let (mut c, mut s) = loopback_pair_with(
+            |cfg| cfg.cipher_suites = Some(alloc::vec![0x1303, 0x1302]),
+            |_| {},
+        );
+        handshake_and_echo(&mut c, &mut s);
+        assert_eq!(c.negotiated_cipher_suite(), Some(0x1302));
+    }
+
+    /// RFC 9001 §5.3 — `TLS_AES_128_CCM_8_SHA256` MUST NOT be used with QUIC,
+    /// and this crate's packet protection has no CCM at all: the CCM suites
+    /// are dropped from a `cipher_suites` restriction, and one that names
+    /// nothing else is refused at construction rather than offered.
+    #[test]
+    fn ccm_suites_are_refused_over_quic() {
+        for suites in [alloc::vec![0x1305u16], alloc::vec![0x1304, 0x1305]] {
+            let (server_cfg_tls, cert_der) = ed25519_server();
+            let _ = server_cfg_tls;
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert_der).unwrap();
+            let client_cfg = Config {
+                roots,
+                alpn_protocols: alloc::vec![b"test".to_vec()],
+                cipher_suites: Some(suites.clone()),
+                ..Config::default()
+            };
+            let r = QuicConnection::client(
+                QuicConfig {
+                    tls: client_cfg,
+                    transport_params: loopback_params(),
+                    ..QuicConfig::default()
+                },
+                "loopback.example",
+            );
+            assert!(
+                matches!(r, Err(Error::NoUsableCipherSuites)),
+                "{suites:x?} must be refused, got {:?}",
+                r.err()
+            );
+        }
+        // A CCM suite alongside a usable one is simply not offered.
+        let (mut c, mut s) = loopback_pair_with(
+            |cfg| cfg.cipher_suites = Some(alloc::vec![0x1305, 0x1303]),
+            |_| {},
+        );
+        handshake_and_echo(&mut c, &mut s);
+        assert_eq!(c.negotiated_cipher_suite(), Some(0x1303));
+    }
+
+    /// The client offers the same key-exchange groups over QUIC as over
+    /// TLS, X25519MLKEM768 first. Its 1216-byte share pushes the ClientHello
+    /// past one Initial, so the first flight is two Initial-bearing
+    /// datagrams, each padded to the RFC 9000 §14.1 minimum and none larger
+    /// than it (§14: nothing bigger than 1200 bytes before the path is known
+    /// to carry more); the server's ServerHello, with the 1120-byte KEM
+    /// ciphertext, comes back the same way, and the handshake still
+    /// completes in a single round trip.
+    #[test]
+    fn hybrid_key_share_spans_two_initials_and_completes_in_one_round_trip() {
+        let (mut c, mut s) = loopback_pair();
+        let flight = feed_flight(&mut c, &mut s);
+        assert_eq!(flight.len(), 2, "the ClientHello needs two Initials");
+        for dg in &flight {
+            assert!(first_packet_is_initial(dg));
+            assert_eq!(dg.len(), MIN_INITIAL_DATAGRAM);
+        }
+        let reply = feed_flight(&mut s, &mut c);
+        assert_eq!(reply.len(), 2, "the ServerHello needs two Initials");
+        for dg in &reply {
+            assert!(first_packet_is_initial(dg));
+            assert_eq!(dg.len(), MIN_INITIAL_DATAGRAM);
+        }
+        assert!(
+            c.is_handshake_complete(),
+            "the client finishes on the server's first flight"
+        );
+        // The ML-KEM secret is bound into the key schedule like any other:
+        // the client's Finished completes the server, and data flows.
+        handshake_and_echo(&mut c, &mut s);
+    }
+
+    /// A server's `preferred_key_exchange_group` reaches the QUIC engine as
+    /// it reaches the TLS one (RFC 8446 §4.1.4: it asks for a
+    /// HelloRetryRequest when the client advertises the group without a
+    /// share for it). This client ships a share for every group it offers,
+    /// so the server takes the client's first preference — the hybrid one,
+    /// two Initials each way — and the handshake completes, over QUIC
+    /// exactly as over TLS.
+    #[test]
+    fn server_preferred_key_exchange_group_is_accepted_over_quic() {
+        use crate::tls::NamedGroup;
+        let (mut c, mut s) = loopback_pair_with(
+            |_| {},
+            |cfg| cfg.preferred_key_exchange_group = Some(NamedGroup::Secp384r1),
+        );
+        feed_flight(&mut c, &mut s);
+        let reply = feed_flight(&mut s, &mut c);
+        assert_eq!(
+            reply
+                .iter()
+                .filter(|dg| first_packet_is_initial(dg))
+                .count(),
+            2,
+            "the offered hybrid share is taken, no HelloRetryRequest: {:?}",
+            reply.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(c.is_handshake_complete());
+        handshake_and_echo(&mut c, &mut s);
+    }
+
     /// Drives one round of `c → s` then `s → c` datagram exchange.
     /// Returns `true` if anything moved.
     fn pump(c: &mut QuicConnection, s: &mut QuicConnection) -> bool {
@@ -7667,12 +7984,16 @@ mod tests {
         let n = c.write(id, b"GET /early").expect("write early data");
         assert_eq!(n, 10);
 
-        // The client's first flight carries Initial + 0-RTT coalesced, and is
-        // still a full-size datagram per RFC 9000 §14.1.
-        let first = c.pop_datagram();
-        assert!(!first.is_empty());
-        assert_eq!(first.len(), 1200, "§14.1: Initial-bearing datagram >= 1200");
-        s.feed_datagram(&first).expect("server feed 0-RTT flight");
+        // The client's first flight carries the 0-RTT packet coalesced behind
+        // the tail of the ClientHello, and every Initial-bearing datagram is
+        // still full-size per RFC 9000 §14.1.
+        let flight = drain_datagrams(&mut c);
+        assert!(!flight.is_empty());
+        for dg in &flight {
+            assert!(first_packet_is_initial(dg));
+            assert_eq!(dg.len(), 1200, "§14.1: Initial-bearing datagram >= 1200");
+            s.feed_datagram(dg).expect("server feed 0-RTT flight");
+        }
 
         // The server has the early data before it has finished the handshake.
         assert!(!s.is_handshake_complete());
@@ -11003,8 +11324,7 @@ mod tests {
     #[test]
     fn server_sends_handshake_done_and_client_confirms_on_it() {
         let (mut c, mut s) = loopback_pair();
-        let first = c.pop_datagram();
-        s.feed_datagram(&first).expect("server feed");
+        feed_flight(&mut c, &mut s);
         loop {
             let dg = s.pop_datagram();
             if dg.is_empty() {
@@ -11985,15 +12305,17 @@ mod tests {
         for (name, mutate) in cases {
             let (mut c, mut s) = loopback_pair();
 
-            // Drive the client → server first Initial so that the
+            // Drive the client → server first flight so that the
             // server's `endpoint.cids.peer` is set (validator needs the
-            // ISCID to compare against). After this call, the
-            // legitimate client TP has already been validated + stored
-            // — we test the validator directly with a tampered struct.
-            let initial = c.pop_datagram();
-            assert!(!initial.is_empty(), "{name}: client emitted CH");
-            s.feed_datagram(&initial)
-                .unwrap_or_else(|_| panic!("{name}: server feeds CH"));
+            // ISCID to compare against). After this, the legitimate
+            // client TP has already been validated + stored — we test the
+            // validator directly with a tampered struct.
+            let flight = drain_datagrams(&mut c);
+            assert!(!flight.is_empty(), "{name}: client emitted CH");
+            for dg in &flight {
+                s.feed_datagram(dg)
+                    .unwrap_or_else(|_| panic!("{name}: server feeds CH"));
+            }
             assert!(
                 s.peer_transport_params().is_some(),
                 "{name}: legitimate client TP arrived"
@@ -13012,7 +13334,7 @@ mod tests {
         s.endpoint.pn.application.largest_eliciting_arrival_us =
             Some(now_us.saturating_sub(80_000));
         let (payload, meta) = s
-            .assemble_payload(Level::OneRtt, PayloadScope::Full)
+            .assemble_payload(Level::OneRtt, PayloadScope::Full, 1100)
             .expect("an ACK is pending");
         assert!(meta.carried_ack);
         let (frame, _) = Frame::decode(&payload).expect("ACK frame first");
@@ -13631,14 +13953,15 @@ mod tests {
     /// anchored on the last ack-eliciting send and without `max_ack_delay`
     /// in the Initial space; the timer fires exactly then, each consecutive
     /// expiry doubles the period, and a probe (not a replay of the whole
-    /// flight) goes out per expiry.
+    /// flight) goes out per expiry — at most the two full-sized datagrams
+    /// §6.2.4 allows, which the two Initials of a ServerHello carrying an
+    /// ML-KEM ciphertext fill.
     #[test]
     fn pto_fires_at_the_computed_time_and_backs_off() {
         let (mut c, mut s) = loopback_pair();
-        let dg = c.pop_datagram();
-        s.feed_datagram(&dg).expect("server feed");
+        feed_flight(&mut c, &mut s);
         // The server's Initial + Handshake flight is lost.
-        assert!(!s.pop_datagram().is_empty());
+        assert!(!drain_datagrams(&mut s).is_empty());
         let anchor = |s: &QuicConnection| {
             [PnSpaceId::Initial, PnSpaceId::Handshake]
                 .into_iter()
@@ -13658,14 +13981,14 @@ mod tests {
         assert_eq!(s.endpoint.loss.pto_count, 0);
         assert!(s.pop_datagram().is_empty());
 
-        // The deadline itself: one PTO, one probe datagram.
+        // The deadline itself: one PTO, at most two probe datagrams.
         s.on_timeout(deadline);
         assert_eq!(s.endpoint.loss.pto_count, 1);
-        let probe = s.pop_datagram();
-        assert!(!probe.is_empty(), "a probe leaves");
+        let probes = drain_datagrams(&mut s);
         assert!(
-            s.pop_datagram().is_empty(),
-            "one probe datagram per PTO expiry"
+            (1..=2).contains(&probes.len()),
+            "§6.2.4: one or two probe datagrams per PTO expiry, got {}",
+            probes.len()
         );
         // Backoff: 2 × PTO from the probe's own send.
         let expected = anchor(&s) + pto * 2;
@@ -13680,7 +14003,9 @@ mod tests {
 
         // Progress from the client resets the backoff and the handshake
         // completes normally.
-        c.feed_datagram(&probe).expect("client feed");
+        for probe in &probes {
+            c.feed_datagram(probe).expect("client feed");
+        }
         drive_until_complete(&mut c, &mut s, 8);
         assert_eq!(s.endpoint.loss.pto_count, 0);
     }
@@ -13833,16 +14158,28 @@ mod tests {
     #[test]
     fn server_pto_timer_waits_for_amplification_budget() {
         let (mut c, mut s) = loopback_pair();
-        let dg = c.pop_datagram();
-        assert_eq!(dg.len(), 1200);
-        s.feed_datagram(&dg).expect("server feed");
-        // Budget: 3 × 1200. The reply and two PTO probes spend all of it.
-        assert_eq!(s.pop_datagram().len(), 1200);
-        for round in 0..2 {
+        let flight = feed_flight(&mut c, &mut s);
+        assert!(flight.iter().all(|dg| dg.len() == 1200));
+        // Budget: 3 × what the client sent. The reply and the PTO probes —
+        // full-sized datagrams, every one — spend all of it.
+        let mut budget = 3 * 1200 * flight.len();
+        for dg in drain_datagrams(&mut s) {
+            assert_eq!(dg.len(), 1200);
+            budget -= 1200;
+        }
+        let mut round = 0u32;
+        while budget > 0 {
             let deadline = s.next_timeout().expect("PTO armed");
             s.on_timeout(deadline);
-            assert_eq!(s.endpoint.loss.pto_count, round + 1);
-            assert_eq!(s.pop_datagram().len(), 1200, "probe {round}");
+            round += 1;
+            assert!(round <= 8, "the probes must exhaust the budget");
+            assert_eq!(s.endpoint.loss.pto_count, round);
+            let probes = drain_datagrams(&mut s);
+            assert!(!probes.is_empty(), "probe {round}");
+            for dg in probes {
+                assert_eq!(dg.len(), 1200, "probe {round}");
+                budget -= 1200;
+            }
         }
         assert!(!s.active_path.can_send(1), "test premise: budget exhausted");
         assert_eq!(

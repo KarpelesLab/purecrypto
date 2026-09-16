@@ -31,9 +31,13 @@ use super::pn::decode_packet_number;
 /// - `Ok(Some(info))` — the Initial decrypted and a complete ClientHello was
 ///   recovered; `info` carries its SNI and ALPN.
 /// - `Ok(None)` — the datagram is too short to hold the whole packet, or the
-///   ClientHello's CRYPTO stream isn't complete in this datagram. (A client's
-///   first Initial is padded to ≥1200 bytes and the ClientHello virtually always
-///   fits in one datagram; feed the first datagram you receive.)
+///   ClientHello's CRYPTO stream isn't complete in this datagram. A client's
+///   first Initial is padded to ≥1200 bytes and a ClientHello with classical
+///   key shares fits in one datagram — but one carrying an X25519MLKEM768
+///   share (1216 bytes; this crate's own client offers it, as do current
+///   browsers) needs two, and the ALPN extension lands in the second. Keep
+///   the datagram and hand it, with the next one from the same client, to
+///   [`peek_initial_sni_datagrams`].
 /// - `Err(_)` — not a QUIC v1 Initial long-header packet
 ///   ([`Error::UnsupportedVersion`] for a non-v1 version), or the AEAD tag failed
 ///   (wrong DCID / tampered / not actually an Initial we can read), or the frames
@@ -41,23 +45,57 @@ use super::pn::decode_packet_number;
 ///
 /// Initial AEAD is always AES-128-GCM with SHA-256 keys (RFC 9001 §5.2). The
 /// packet number is decoded against a baseline of 0 — correct for a client's
-/// first Initial (the cert-selection use case); a coalesced or retransmitted
-/// Initial carrying a large packet number is out of scope for this stateless peek.
+/// first Initials (the cert-selection use case); a retransmitted Initial
+/// carrying a large packet number is out of scope for this stateless peek.
 ///
 /// This decrypts attacker-controlled bytes with publicly-derivable keys, exactly
 /// like the TCP [`peek_client_hello`](crate::tls::peek_client_hello); it touches
 /// no secret material, never panics on malformed input, and bounds CRYPTO
 /// reassembly (64 KiB / 32 fragments) against a pre-handshake flood.
 pub fn peek_initial_sni(datagram: &[u8]) -> Result<Option<ClientHelloInfo>, Error> {
+    peek_initial_sni_datagrams(&[datagram])
+}
+
+/// [`peek_initial_sni`] over the Initial packets of several datagrams from the
+/// same client, in the order they arrived — for a ClientHello that did not
+/// fit the first one (see there). Each datagram is checked like the single
+/// one: it must start with a readable QUIC v1 Initial keyed by its own DCID
+/// (all of a client's first Initials share the DCID, so the keys are derived
+/// once), and the CRYPTO stream is reassembled across all of them. Returns
+/// `Ok(None)` while the ClientHello is still incomplete.
+pub fn peek_initial_sni_datagrams(datagrams: &[&[u8]]) -> Result<Option<ClientHelloInfo>, Error> {
     // The ClientHello's CRYPTO stream can be split across several Initial
-    // packets coalesced into one datagram (ngtcp2/curl do this), so walk every
-    // coalesced Initial — exactly like the engine's `feed_datagram` — feeding
-    // all CRYPTO into one reassembly buffer. The CryptoBuf caps (64 KiB / 32
-    // fragments) bound a pre-handshake flood.
+    // packets — coalesced into one datagram (ngtcp2/curl do this) or spread
+    // over two (a post-quantum key share) — so walk every Initial of every
+    // datagram, exactly like the engine's `feed_datagram`, feeding all CRYPTO
+    // into one reassembly buffer. The CryptoBuf caps (64 KiB / 32 fragments)
+    // bound a pre-handshake flood.
     let mut crypto = CryptoBuf::new();
     let mut handshake: Vec<u8> = Vec::new();
-    // Coalesced Initials share the client DCID, so the keys are derived once.
-    let mut keys: Option<DirKeys> = None;
+    // A client's first Initials share its chosen DCID, so the keys are
+    // derived once and re-derived only if a datagram names another.
+    let mut keys: Option<(Vec<u8>, DirKeys)> = None;
+
+    for datagram in datagrams {
+        if let Some(info) = peek_datagram_crypto(datagram, &mut keys, &mut crypto, &mut handshake)?
+        {
+            return Ok(Some(info));
+        }
+    }
+    // Walked every packet; the ClientHello isn't complete in these datagrams
+    // (the rest is in a later one).
+    Ok(None)
+}
+
+/// Walks the coalesced Initial packets of one datagram, feeding their CRYPTO
+/// frames into the shared reassembly state, and reports the ClientHello as
+/// soon as it is complete.
+fn peek_datagram_crypto(
+    datagram: &[u8],
+    keys: &mut Option<(Vec<u8>, DirKeys)>,
+    crypto: &mut CryptoBuf,
+    handshake: &mut Vec<u8>,
+) -> Result<Option<ClientHelloInfo>, Error> {
     let mut off = 0usize;
 
     while off < datagram.len() {
@@ -101,10 +139,14 @@ pub fn peek_initial_sni(datagram: &[u8]) -> Result<Option<ClientHelloInfo>, Erro
         }
 
         // RFC 9001 §5.2: derive the client's Initial read keys from the DCID.
-        let keys = keys.get_or_insert_with(|| {
+        if keys.as_ref().is_none_or(|(dcid, _)| dcid != hdr.dcid) {
             let (client_secret, _server_secret) = derive_initial_secrets(hdr.dcid);
-            derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret)
-        });
+            *keys = Some((
+                hdr.dcid.to_vec(),
+                derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret),
+            ));
+        }
+        let keys = &keys.as_ref().expect("derived above").1;
 
         // Owned copy of this packet — header protection and AEAD mutate it, and
         // we must not touch the caller's `datagram`.
@@ -162,15 +204,13 @@ pub fn peek_initial_sni(datagram: &[u8]) -> Result<Option<ClientHelloInfo>, Erro
         }
 
         // A complete ClientHello yet? (Shared with the TCP peek.)
-        if let Some(info) = crate::tls::peek::client_hello_info_from_handshake(&handshake)? {
+        if let Some(info) = crate::tls::peek::client_hello_info_from_handshake(handshake)? {
             return Ok(Some(info));
         }
 
         off += pkt_total;
     }
 
-    // Walked every coalesced packet; the ClientHello isn't complete in this
-    // datagram (the rest is in a later one).
     Ok(None)
 }
 
@@ -179,9 +219,9 @@ mod tests {
     use super::*;
     use crate::quic::{QuicConfig, QuicConnection};
 
-    /// Build a real client Initial via the QUIC client engine, then prove
-    /// `peek_initial_sni` decrypts it and recovers the SNI + ALPN.
-    fn client_initial_datagram(server_name: &str, alpn: &[&[u8]]) -> Vec<u8> {
+    /// Build a real client first flight via the QUIC client engine: the
+    /// Initial datagrams carrying the ClientHello, in send order.
+    fn client_initial_datagrams(server_name: &str, alpn: &[&[u8]]) -> Vec<Vec<u8>> {
         let tls = crate::tls::Config::builder()
             .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .tls_only()
@@ -194,20 +234,48 @@ mod tests {
             ..QuicConfig::default()
         };
         let mut client = QuicConnection::client(cfg, server_name).expect("client");
-        // The first emitted datagram carries the Initial with the ClientHello.
-        let dg = client.pop_datagram();
-        assert!(!dg.is_empty(), "expected an Initial datagram");
-        dg
+        let mut flight = Vec::new();
+        loop {
+            let dg = client.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            flight.push(dg);
+        }
+        assert!(!flight.is_empty(), "expected an Initial datagram");
+        flight
     }
 
+    /// The first datagram of the flight (enough for every test that only
+    /// needs a readable Initial).
+    fn client_initial_datagram(server_name: &str, alpn: &[&[u8]]) -> Vec<u8> {
+        client_initial_datagrams(server_name, alpn).swap_remove(0)
+    }
+
+    /// The crate's own client offers an X25519MLKEM768 share, so its
+    /// ClientHello spans two Initial datagrams: the first alone is
+    /// incomplete (`Ok(None)`), the pair yields the SNI + ALPN, and neither
+    /// datagram is mutated.
     #[test]
     fn peeks_sni_and_alpn_from_real_initial() {
-        let dg = client_initial_datagram("h3.example", &[b"h3"]);
-        let before = dg.clone();
-        let info = peek_initial_sni(&dg).expect("ok").expect("complete CH");
+        let flight = client_initial_datagrams("h3.example", &[b"h3"]);
+        assert_eq!(
+            flight.len(),
+            2,
+            "a hybrid-share ClientHello spans two Initials"
+        );
+        let before = flight.clone();
+        assert!(
+            peek_initial_sni(&flight[0]).expect("ok").is_none(),
+            "the ClientHello is incomplete in the first datagram"
+        );
+        let refs: Vec<&[u8]> = flight.iter().map(Vec::as_slice).collect();
+        let info = peek_initial_sni_datagrams(&refs)
+            .expect("ok")
+            .expect("complete CH");
         assert_eq!(info.server_name.as_deref(), Some("h3.example"));
         assert_eq!(info.alpn_protocols, alloc::vec![b"h3".to_vec()]);
-        assert_eq!(dg, before, "peek must not mutate the datagram");
+        assert_eq!(flight, before, "peek must not mutate the datagrams");
     }
 
     #[test]

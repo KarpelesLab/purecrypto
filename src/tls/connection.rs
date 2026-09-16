@@ -1493,9 +1493,12 @@ pub(crate) fn tls13_client_config(
         Tls13Transport::Quic => {
             // QUIC v1 is TLS 1.3 only (`offer_tls12` stays off and
             // `min_version` is moot) and has no record layer, so RFC 8449
-            // does not apply. The QUIC engine offers its own fixed TLS 1.3
-            // suite set, so the client restriction is not forwarded either.
-            let _ = (min_version, record_size_limit, cipher_suites);
+            // does not apply. The suite restriction is forwarded: the QUIC
+            // client narrows its GCM / ChaCha20 offer by it (RFC 9001 §5.3
+            // rules the CCM suites out, so those entries are dropped) — see
+            // `crate::quic::client::offered_cipher_suites`.
+            cc.cipher_suites = cipher_suites.map(<[u16]>::to_vec);
+            let _ = (min_version, record_size_limit);
         }
     }
     if !alpn_protocols.is_empty() {

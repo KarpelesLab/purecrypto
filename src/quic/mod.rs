@@ -63,7 +63,7 @@ pub use connection::{
     QuicSession, Role,
 };
 pub use ecn::EcnCodepoint;
-pub use peek::peek_initial_sni;
+pub use peek::{peek_initial_sni, peek_initial_sni_datagrams};
 // Re-export so callers can name the peek's return type from `quic` directly.
 pub use crate::tls::ClientHelloInfo;
 pub use server::{DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_HALF_OPEN, QuicServer};

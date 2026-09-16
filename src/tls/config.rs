@@ -654,7 +654,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `private_key` / `try_private_key` ([`HandshakeSigner`](super::HandshakeSigner)) | yes | no ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes | yes | **refused** |
 /// | `client_auth` | yes | yes | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes |
 /// | `alpn` | yes | yes | yes | yes | yes (required) |
-/// | `cipher_suites` (client) | yes | yes | yes | yes | inert (fixed TLS 1.3 set) |
+/// | `cipher_suites` (client) | yes | yes | yes | yes | yes (GCM / ChaCha20 only: RFC 9001 §5.3) |
 /// | `record_size_limit` | yes | yes | **refused** | **refused** | inert (no records) |
 /// | `require_extended_master_secret` | inert | yes | inert | yes | inert |
 /// | `stapled_ocsp_response` | yes | yes | inert | inert | yes |
