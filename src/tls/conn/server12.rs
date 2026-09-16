@@ -1166,8 +1166,12 @@ impl<R: RngCore> ServerConnection12<R> {
         }
 
         // record_size_limit echo (currently advisory on the write side).
+        // RFC 8449 §4: a server MUST NOT enforce the protocol maximum on the
+        // client's value (it may be enabled by an extension or version we
+        // do not understand), so it is clamped rather than rejected; only a
+        // value below 64 is `illegal_parameter`.
         if let Some(rsl_body) = ext::find(&ch.extensions, ExtensionType::RECORD_SIZE_LIMIT) {
-            let _limit = ext::parse_record_size_limit(rsl_body)?;
+            let _limit = ext::parse_record_size_limit_server(rsl_body)?;
             self.peer_offered_record_size_limit = true;
         }
 
@@ -3486,5 +3490,55 @@ mod tests {
         );
         s.read_tls(&rec);
         assert!(matches!(s.process_new_packets(), Err(Error::Decode)));
+    }
+
+    /// RFC 8449 §4: "A server MUST NOT enforce this restriction" — a client
+    /// advertising a `record_size_limit` above the protocol maximum is
+    /// clamped, not refused, while a value below 64 stays `illegal_parameter`.
+    #[test]
+    fn server12_clamps_record_size_limit_above_protocol_max() {
+        fn hello_with_limit(limit: u16) -> Vec<u8> {
+            let mut crng = HmacDrbg::<Sha256>::new(b"s12-rsl-c", b"nonce", &[]);
+            let mut random = [0u8; 32];
+            crng.fill_bytes(&mut random);
+            let ch = ClientHello {
+                legacy_version: 0x0303,
+                random,
+                session_id: Vec::new(),
+                cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+                extensions: alloc::vec![
+                    ext::signature_algorithms(),
+                    ext::supported_groups_list(&[NamedGroup::X25519]),
+                    ext::ec_point_formats(),
+                    ext::extended_master_secret_empty(),
+                    ext::record_size_limit(limit),
+                ],
+            }
+            .encode();
+            let mut rec = Vec::new();
+            write_record(
+                &mut rec,
+                ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                &ch,
+            );
+            rec
+        }
+
+        let cfg = test_rsa_server_config();
+        let rng = HmacDrbg::<Sha256>::new(b"s12-rsl", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, rng);
+        s.read_tls(&hello_with_limit(65535));
+        assert!(s.process_new_packets().is_ok());
+        assert!(s.peer_offered_record_size_limit);
+
+        let cfg = test_rsa_server_config();
+        let rng = HmacDrbg::<Sha256>::new(b"s12-rsl", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, rng);
+        s.read_tls(&hello_with_limit(63));
+        assert!(matches!(
+            s.process_new_packets(),
+            Err(Error::IllegalParameter)
+        ));
     }
 }
