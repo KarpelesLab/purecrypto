@@ -5257,17 +5257,335 @@ fn cli_subcommand_table_help() {
             .unwrap();
         drop(child.stdin.take()); // EOF
         let out = child.wait_with_output().unwrap();
-        // Some subcommands accept a no-arg invocation (e.g. `purecrypto help`).
-        // Each subcommand we test here treats no-args as an error and prints a
-        // recognizable hint. We accept either non-zero exit OR a help-like
-        // stdout that contains the subcommand name (so the binding is bound).
-        let combined = String::from_utf8_lossy(&out.stdout).into_owned()
-            + &String::from_utf8_lossy(&out.stderr);
+        // With no arguments a subcommand either dies with a clean
+        // `purecrypto: …` diagnostic (non-zero exit) or prints a usage text
+        // naming itself (`ca` lists its verbs and exits 0). Either way it
+        // must never panic. (The previous assertion accepted any non-empty
+        // output, so a backtrace passed.)
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(
-            !out.status.success() || combined.contains(sub) || !combined.is_empty(),
-            "subcommand `{sub}` produced no output / bad status: {combined}"
+            !stderr.contains("panicked"),
+            "subcommand `{sub}` panicked: {stderr}"
+        );
+        let clean_error = !out.status.success() && stderr.contains("purecrypto:");
+        let usage_text = (stdout + &stderr).contains(sub);
+        assert!(
+            clean_error || usage_text,
+            "subcommand `{sub}` must print a clean diagnostic or usage, got: {stderr}"
         );
     }
+}
+
+/// `-set_serial 0` must be refused: RFC 5280 §4.1.2.2 requires a positive
+/// serial (the random default already excludes zero).
+#[test]
+fn x509_set_serial_zero_is_refused() {
+    let dir = std::env::temp_dir().join(format!("pc_serial0_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("k.pem").to_str().unwrap().to_string();
+    assert!(run(&["genpkey", "-algorithm", "ED25519", "-out", &key], b"").1);
+    let (_o, err, ok) = run_capture(
+        &[
+            "x509",
+            "-new",
+            "-key",
+            &key,
+            "-subj",
+            "/CN=a",
+            "-set_serial",
+            "0",
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(err.contains("positive integer"), "got: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `ca crl -days 0` would publish a CRL whose nextUpdate equals thisUpdate.
+/// A subjectAltName entry carrying a control character is refused too.
+#[test]
+fn ca_crl_zero_days_and_control_char_sans_are_refused() {
+    let dir = std::env::temp_dir().join(format!("pc_ca_crl0_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = dir.to_str().unwrap().to_string();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    assert!(run(&["ca", "init", "-dir", &d, "-cn", "CRL CA"], b"").1);
+    let (_o, err, ok) = run_capture(&["ca", "crl", "-dir", &d, "-days", "0"], b"");
+    assert!(!ok);
+    assert!(err.contains("-days must be at least 1"), "got: {err}");
+    assert!(run(&["ca", "crl", "-dir", &d, "-days", "1"], b"").1);
+
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "EC", "-out", &p("leaf.key")],
+            b""
+        )
+        .1
+    );
+    let (pubk, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(p("leaf.pub"), pubk).unwrap();
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "x",
+            "-sans",
+            "a.example\nb.example",
+            "-out",
+            &p("x.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(err.contains("control character"), "got: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ed448 keys come out of `genpkey` and `ca init -algorithm ED448`, and the
+/// library's `CertSigner` signs with them, but the CLI's key loader only knew
+/// RSA / EC / Ed25519, so `req`, `x509 -new` and `x509 -req -CAkey` refused
+/// them with "cannot parse key". PKCS#8-wrapped RSA/EC keys are accepted now
+/// as well.
+#[test]
+fn req_and_x509_accept_ed448_keys() {
+    let dir = std::env::temp_dir().join(format!("pc_ed448_pki_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "ED448", "-out", &p("ca.key")],
+            b""
+        )
+        .1
+    );
+    let (_o, err, ok) = run_capture(
+        &[
+            "x509",
+            "-new",
+            "-ca",
+            "-key",
+            &p("ca.key"),
+            "-subj",
+            "/CN=Ed448 CA",
+            "-out",
+            &p("ca.crt"),
+        ],
+        b"",
+    );
+    assert!(ok, "x509 -new with an Ed448 key failed: {err}");
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "ED448", "-out", &p("leaf.key")],
+            b""
+        )
+        .1
+    );
+    let (_o, err, ok) = run_capture(
+        &[
+            "req",
+            "-key",
+            &p("leaf.key"),
+            "-subj",
+            "/CN=leaf",
+            "-out",
+            &p("leaf.csr"),
+        ],
+        b"",
+    );
+    assert!(ok, "req with an Ed448 key failed: {err}");
+    let (_o, err, ok) = run_capture(
+        &[
+            "x509",
+            "-req",
+            "-in",
+            &p("leaf.csr"),
+            "-CA",
+            &p("ca.crt"),
+            "-CAkey",
+            &p("ca.key"),
+            "-out",
+            &p("leaf.crt"),
+        ],
+        b"",
+    );
+    assert!(ok, "x509 -req with an Ed448 CA key failed: {err}");
+    let leaf =
+        purecrypto::x509::Certificate::from_pem(&std::fs::read_to_string(p("leaf.crt")).unwrap())
+            .unwrap();
+    let ca =
+        purecrypto::x509::Certificate::from_pem(&std::fs::read_to_string(p("ca.crt")).unwrap())
+            .unwrap();
+    leaf.verify_signature_with(&ca.subject_public_key().unwrap())
+        .expect("leaf must verify under the Ed448 CA");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An EC key in the PKCS#8 envelope (`openssl genpkey -algorithm EC`'s
+/// default output) must be accepted by `s_server -key` (and by `pkey`): the
+/// server's loader only knew the SEC1 form and refused it as "server key
+/// must be RSA (PKCS#1), ECDSA (SEC1), or Ed25519 (PKCS#8)".
+#[test]
+fn s_server_and_pkey_accept_pkcs8_ec_key() {
+    use purecrypto::ec::BoxedEcdsaPrivateKey;
+
+    let dir = std::env::temp_dir().join(format!("pc_pkcs8ec_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "EC", "-out", &p("sec1.key")],
+            b""
+        )
+        .1
+    );
+    let pkcs8 =
+        BoxedEcdsaPrivateKey::from_sec1_pem(&std::fs::read_to_string(p("sec1.key")).unwrap())
+            .unwrap()
+            .to_pkcs8_pem();
+    assert!(pkcs8.starts_with("-----BEGIN PRIVATE KEY-----"));
+    std::fs::write(p("pkcs8.key"), &pkcs8).unwrap();
+    assert!(
+        run(
+            &[
+                "x509",
+                "-new",
+                "-key",
+                &p("pkcs8.key"),
+                "-subj",
+                "/CN=127.0.0.1",
+                "-san",
+                "127.0.0.1",
+                "-out",
+                &p("srv.crt"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let (out, ok) = run(&["pkey", "-in", &p("pkcs8.key"), "-pubout"], b"");
+    assert!(
+        ok && out.contains("BEGIN PUBLIC KEY"),
+        "pkey -pubout: {out}"
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server",
+        "-cert",
+        &p("srv.crt"),
+        "-key",
+        &p("pkcs8.key"),
+        "-accept",
+        &port.to_string(),
+        "-www",
+    ]);
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-quiet",
+        ],
+        b"GET / HTTP/1.0\r\n\r\n",
+    );
+    let _ = server_proc.wait_with_output();
+    assert!(ok, "s_client failed: {err}");
+    assert!(out.contains("hello from purecrypto s_server"), "{out:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `s_server -tls1_2` with an Ed25519 key used to start listening and fail
+/// only after `accept()` with a bare `UnsupportedVersion`; it must be
+/// refused up front with a message naming the limitation.
+#[test]
+fn s_server_tls12_refuses_ed25519_key_up_front() {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let dir = std::env::temp_dir().join(format!("pc_tls12_ed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+    let key = Ed25519PrivateKey::generate(&mut OsRng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ed25519(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
+    let (_out, err, ok) = run_capture(
+        &[
+            "s_server",
+            "-tls1_2",
+            "-cert",
+            cert_path.to_str().unwrap(),
+            "-key",
+            key_path.to_str().unwrap(),
+            "-accept",
+            "1",
+            "-www",
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(err.contains("RSA or ECDSA"), "got: {err}");
+    assert!(!err.contains("UnsupportedVersion"), "got: {err}");
+    assert!(
+        !err.contains("listening"),
+        "must be refused before listening: {err}"
+    );
+
+    // The QUIC server must likewise refuse a key from a different pair
+    // before it starts listening (it used to validate the identity only
+    // when the first Initial arrived, hanging ~30 s here).
+    let other = Ed25519PrivateKey::generate(&mut OsRng);
+    let other_path = dir.join("other.key");
+    std::fs::write(&other_path, other.to_pkcs8_pem()).unwrap();
+    let (_out, err, ok) = run_capture(
+        &[
+            "q_server",
+            "-cert",
+            cert_path.to_str().unwrap(),
+            "-key",
+            other_path.to_str().unwrap(),
+            "-alpn",
+            "h3",
+            "-accept",
+            "127.0.0.1:1",
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(err.contains("does not match"), "got: {err}");
+    assert!(
+        !err.contains("listening"),
+        "must be refused before listening: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
