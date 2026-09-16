@@ -1639,8 +1639,24 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     Ok(super::conn::ServerConnection12::new(sc, config_rng(cfg)?))
 }
 
+/// The DTLS engines implement neither Encrypted Client Hello nor its
+/// GREASE form. A `Config` that asks for ECH but negotiates DTLS would
+/// otherwise silently send the server name in the clear, so refuse to
+/// build the connection instead (mirroring the fail-closed posture of the
+/// cookie and client-auth checks below).
+#[cfg(feature = "dtls")]
+fn reject_ech_over_dtls(cfg: &Config) -> Result<(), Error> {
+    #[cfg(feature = "ech")]
+    if cfg.ech.is_some() || cfg.ech_server.is_some() {
+        return Err(Error::InappropriateState);
+    }
+    let _ = cfg;
+    Ok(())
+}
+
 #[cfg(feature = "dtls")]
 fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection12, Error> {
+    reject_ech_over_dtls(cfg)?;
     let server_name = client_server_name(cfg)?;
     let mut dc = crate::dtls::ClientConfig12Internal::new(cfg.roots.clone_store(), server_name);
     if !cfg.verify_certificates {
@@ -1663,6 +1679,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
 
 #[cfg(feature = "dtls")]
 fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection13, Error> {
+    reject_ech_over_dtls(cfg)?;
     let server_name = client_server_name(cfg)?;
     let mut dc = crate::dtls::ClientConfig13Internal::new(cfg.roots.clone_store(), server_name);
     if !cfg.verify_certificates {
@@ -1688,6 +1705,7 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
 fn build_dtls12_server(
     cfg: &Config,
 ) -> Result<crate::dtls::DtlsServerConnection12<ConfigRng>, Error> {
+    reject_ech_over_dtls(cfg)?;
     let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
     // RFC 6347 §4.2.1: the cookie exchange defeats blind amplification
     // attacks. We refuse to construct a server that claims to require the
@@ -1739,6 +1757,7 @@ fn build_dtls12_server(
 fn build_dtls13_server(
     cfg: &Config,
 ) -> Result<crate::dtls::DtlsServerConnection13<ConfigRng>, Error> {
+    reject_ech_over_dtls(cfg)?;
     let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
     // RFC 9147 §5.1: DTLS 1.3 retains the cookie-based stateless rejection
     // for the same DoS-amplification reason. Mirror the fail-closed posture
@@ -2359,6 +2378,52 @@ mod tests {
     // amplification mitigation. A server that intends to require it but
     // forgot to wire a cookie secret used to silently downgrade to "no
     // cookies" — the AND-combine of `require_cookie && cookie_secret`.
+
+    /// ECH is a TLS-only feature in this crate: the DTLS engines never emit
+    /// or process the extension, so a DTLS `Config` carrying an `EchClient`
+    /// (even the GREASE form) or an `EchServer` must fail at construction
+    /// rather than silently downgrade to a cleartext SNI.
+    #[cfg(all(feature = "dtls", feature = "ech"))]
+    #[test]
+    fn dtls_refuses_ech_configuration() {
+        use crate::tls::ech::keys::EchKeyRing;
+        use crate::tls::ech::{EchClient, EchConfigList, EchServer};
+        for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
+            // Client: ECH configured, DTLS negotiated.
+            let cfg = Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .versions(version, version)
+                .roots(RootCertStore::new())
+                .server_name("dtls.example")
+                .ech(EchClient::default_grease())
+                .build();
+            assert!(matches!(
+                Connection::client(&cfg),
+                Err(Error::InappropriateState)
+            ));
+            // Same config without ECH builds.
+            let cfg = Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .versions(version, version)
+                .roots(RootCertStore::new())
+                .server_name("dtls.example")
+                .build();
+            assert!(Connection::client(&cfg).is_ok());
+
+            // Server: an ECH key ring on a DTLS server config.
+            let mut cfg = dtls_server_cfg_without_cookie_secret(version);
+            cfg.cookie_secret = Some([0x42u8; 32]);
+            assert!(Connection::server(&cfg).is_ok());
+            cfg.ech_server = Some(EchServer::new(
+                EchKeyRing::from_pairs(alloc::vec![]),
+                EchConfigList::new(alloc::vec![]),
+            ));
+            assert!(matches!(
+                Connection::server(&cfg),
+                Err(Error::InappropriateState)
+            ));
+        }
+    }
     // Fail-closed: refuse to construct the engine.
     // Exercises the DTLS engine paths.
     #[cfg(feature = "dtls")]
