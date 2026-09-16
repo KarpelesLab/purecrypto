@@ -310,7 +310,7 @@ pub struct Config {
     /// secret, so an SSL 3.0 handshake is refused unless this is `false`.
     pub require_extended_master_secret: bool,
 
-    // ---- RFC 7250 raw public keys (TLS 1.3 only) ----
+    // ---- RFC 7250 raw public keys (TLS 1.3 and TLS 1.2) ----
     /// Server-cert-type preference list offered in the `server_certificate_type`
     /// extension (RFC 7250 §3). Default `[0]` (X.509 only) leaves the extension
     /// off the wire. Set to e.g. `[2]` (RawPublicKey only) or `[2, 0]`
@@ -325,9 +325,10 @@ pub struct Config {
     /// Wire encoding and defaults mirror `server_cert_type_preference`.
     pub client_cert_type_preference: Vec<u8>,
     /// Bare `SubjectPublicKeyInfo` DER for THIS endpoint to send as the single
-    /// `CertificateEntry` body when `RawPublicKey` is the negotiated cert type
-    /// (RFC 7250) — the server's identity for the `server_certificate_type`
-    /// path (§4.2), or the client's identity for the mTLS
+    /// `CertificateEntry` body (TLS 1.3) or as the whole `Certificate` body
+    /// (TLS 1.2, RFC 7250 §3) when `RawPublicKey` is the negotiated cert type
+    /// — the server's identity for the `server_certificate_type` path
+    /// (§4.2), or the client's identity for the mTLS
     /// `client_certificate_type` path (§4.4). MUST correspond to the signing
     /// key (the server identity / the client `identity`). When `RawPublicKey`
     /// is advertised but this is unset, the endpoint falls back to its X.509
@@ -338,7 +339,14 @@ pub struct Config {
     /// the server's CertificateEntry body must constant-time match one of
     /// these entries — there is no X.509 PKI to fall back on, so trust must
     /// be established out-of-band. Hostname verification is skipped under
-    /// RawPublicKey.
+    /// RawPublicKey. A non-empty allowlist is enforced whether or not
+    /// [`verify_certificates`](Self::verify_certificates) is on (it is the
+    /// out-of-band authentication that setting invites); with verification
+    /// on and no allowlist a raw key is refused. On TLS 1.2 (and a
+    /// version-spanning connection that negotiates 1.2) the same allowlist
+    /// authenticates the server exactly as on TLS 1.3, and a
+    /// `server_cert_type_preference` without `X509` fails closed against a
+    /// server that does not negotiate raw public keys.
     pub expected_raw_public_keys: Vec<Vec<u8>>,
     /// Server: allowlist of bare `SubjectPublicKeyInfo` DER bytes accepted
     /// as a *client's* identity when `RawPublicKey` is the negotiated
@@ -655,7 +663,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `max_early_data`, `replay_window` | yes | inert | inert (no 0-RTT) | inert (no 0-RTT) | via `QuicConfig::enable_early_data` |
 /// | `resumption_session` | yes | yes | inert | inert | via `QuicConfig::resumption` |
 /// | `preferred_key_exchange_group` | yes | inert | inert | inert | yes |
-/// | RFC 7250 raw public keys / cert-type preferences | yes | inert | **refused** | **refused** | yes |
+/// | RFC 7250 raw public keys / cert-type preferences | yes | yes | **refused** | **refused** | yes |
 /// | `ech` / `ech_server` | yes | inert | **refused** | **refused** | yes |
 /// | `cert_compression_algorithms` | yes | inert | inert | inert | yes |
 /// | `cookie_secret`, `previous_cookie_secret`, `no_cookie`, `peer_address` | inert | inert | yes | yes | inert |

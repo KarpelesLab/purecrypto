@@ -3488,24 +3488,14 @@ impl ClientConnection {
         if self.negotiated_server_cert_type == crate::tls::codec::cert_type::RAW_PUBLIC_KEY {
             let spki = self.cert_chain.first().ok_or(Error::BadCertificate)?;
             let leaf_key = AnyPublicKey::from_spki_der(spki).map_err(|_| Error::BadCertificate)?;
-            if self.config.verify_certificates {
-                if self.config.expected_raw_public_keys.is_empty() {
-                    // No allowlist configured but verification is on — there
-                    // is no way to establish trust, so refuse.
-                    return Err(Error::BadCertificate);
-                }
-                // Constant-time membership check: walk every entry so the
-                // match position doesn't leak via timing.
-                let mut matched = crate::ct::Choice::from(0u8);
-                for accepted in &self.config.expected_raw_public_keys {
-                    if accepted.len() == spki.len() {
-                        matched |= accepted.as_slice().ct_eq(spki.as_slice());
-                    }
-                }
-                if !bool::from(matched) {
-                    return Err(Error::BadCertificate);
-                }
-            }
+            // The allowlist decision is shared with the TLS 1.2 engine
+            // (`check_raw_public_key`): a configured pin is always
+            // enforced, and verification-on with no pin is refused.
+            super::common::check_raw_public_key(
+                self.config.verify_certificates,
+                &self.config.expected_raw_public_keys,
+                spki,
+            )?;
             let th = self.core.transcript.current_hash();
             let content = certificate_verify_content(true, th.as_slice());
             verify_signature(

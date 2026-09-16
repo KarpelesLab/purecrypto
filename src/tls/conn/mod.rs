@@ -5465,6 +5465,267 @@ mod tls12_loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"pong from server");
     }
 
+    /// Pumps a TLS 1.2 pair until both sides finish or one of them fails,
+    /// surfacing the first error. The RFC 7250 raw-public-key tests below
+    /// exercise refusals as well as completions.
+    fn drive12(
+        client: &mut ClientConnection12,
+        server: &mut ServerConnection12<HmacDrbg<Sha256>>,
+    ) -> Result<(), crate::tls::Error> {
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets()?;
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets()?;
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !client.is_handshaking() && !server.is_handshaking(),
+            "handshake stalled"
+        );
+        Ok(())
+    }
+
+    /// A P-256 server identity for the RFC 7250 tests, accepting `prefs` as
+    /// its `server_certificate_type` set: the config (a self-signed leaf is
+    /// attached so the X.509 path stays available) and the bare SPKI it
+    /// presents as a raw public key.
+    fn rpk_server12(prefs: Vec<u8>) -> (ServerConfig12, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"loopback-rpk12-key", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let spki = crate::x509::AnyPublicKey::Ecdsa(key.public_key()).to_spki_der();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        let config = ServerConfig12::with_ecdsa(alloc::vec![der], key)
+            .with_raw_public_key_spki(spki.clone())
+            .with_server_cert_type_preference(prefs);
+        (config, spki)
+    }
+
+    /// RFC 7250 on TLS 1.2: the server's `Certificate` carries its bare SPKI
+    /// (§3 — no chain at all), the client authenticates it against its
+    /// allowlist with an empty trust store and verification on, the
+    /// `ServerKeyExchange` verifies under that key, and application data
+    /// round-trips both ways.
+    #[test]
+    fn tls12_server_raw_public_key_loopback() {
+        use crate::tls::codec::cert_type;
+        let (server_config, spki) =
+            rpk_server12(alloc::vec![cert_type::RAW_PUBLIC_KEY, cert_type::X509]);
+        let client_cfg = ClientConfig12::new(RootCertStore::new())
+            .with_server_cert_type_preference(alloc::vec![
+                cert_type::RAW_PUBLIC_KEY,
+                cert_type::X509,
+            ])
+            .add_expected_raw_public_key(spki.clone());
+        let mut crng = HmacDrbg::<Sha256>::new(b"rpk12-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rpk12-server", b"nonce", &[]);
+        let mut client =
+            ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+        let mut server = ServerConnection12::new(server_config, srng);
+        drive12(&mut client, &mut server).unwrap();
+        assert_eq!(client.peer_certificates(), core::slice::from_ref(&spki));
+
+        client.send_application_data(b"ping rpk12").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ping rpk12");
+        server.send_application_data(b"pong rpk12").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"pong rpk12");
+    }
+
+    /// A pinned key that does not match the server's SPKI is refused with
+    /// `bad_certificate` — with verification on and, since a configured pin
+    /// is the out-of-band authentication that mode defers to, with it off.
+    /// Verification on with no pin at all is refused the same way: there is
+    /// nothing to establish trust against.
+    #[test]
+    fn tls12_wrong_pinned_raw_public_key_is_refused() {
+        use crate::tls::Error;
+        use crate::tls::codec::cert_type;
+        fn attempt(verify: bool, pin: Option<Vec<u8>>) -> Result<(), Error> {
+            let (server_config, _spki) =
+                rpk_server12(alloc::vec![cert_type::RAW_PUBLIC_KEY, cert_type::X509]);
+            let mut client_cfg = ClientConfig12::new(RootCertStore::new())
+                .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
+            if let Some(pin) = pin {
+                client_cfg = client_cfg.add_expected_raw_public_key(pin);
+            }
+            client_cfg.verify_certificates = verify;
+            let mut crng = HmacDrbg::<Sha256>::new(b"rpk12-wrong-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"rpk12-wrong-s", b"nonce", &[]);
+            let mut client =
+                ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection12::new(server_config, srng);
+            drive12(&mut client, &mut server)
+        }
+        let (_, spki) = rpk_server12(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
+        let mut wrong = spki.clone();
+        let last = wrong.len() - 1;
+        wrong[last] ^= 0x01;
+        assert!(matches!(
+            attempt(true, Some(wrong.clone())),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(
+            attempt(false, Some(wrong)),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(attempt(true, None), Err(Error::BadCertificate)));
+        // The matching pin succeeds in either mode (control).
+        attempt(true, Some(spki.clone())).unwrap();
+        attempt(false, Some(spki)).unwrap();
+    }
+
+    /// RFC 7250 §4.4 on TLS 1.2 (mTLS): the server requires a client
+    /// certificate and accepts `RawPublicKey`; the client presents its bare
+    /// SPKI (no chain) and signs `CertificateVerify` with the matching key.
+    /// The raw key is authenticated only against the server's allowlist: a
+    /// key not on it is `bad_certificate`, and with no allowlist at all the
+    /// server never selects `RawPublicKey` — X.509 is assumed, the client
+    /// has no chain to send, and `required` makes that `certificate_required`.
+    #[test]
+    fn tls12_client_raw_public_key_mtls_loopback() {
+        use crate::tls::Error;
+        use crate::tls::codec::cert_type;
+        use crate::tls::conn::ClientCertConfig;
+        #[derive(Clone, Copy)]
+        enum Allow {
+            Client,
+            Other,
+            Nobody,
+        }
+        fn attempt(allow: Allow) -> Result<Vec<Vec<u8>>, Error> {
+            let (server_config, server_der) = ecdsa_server12();
+            let mut ckeygen = HmacDrbg::<Sha256>::new(b"crpk12-key", b"nonce", &[]);
+            let client_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut ckeygen);
+            let client_spki =
+                crate::x509::AnyPublicKey::Ecdsa(client_key.public_key()).to_spki_der();
+            let mut server_config = server_config
+                .with_client_auth(RootCertStore::new(), true)
+                .with_client_cert_type_preference(alloc::vec![
+                    cert_type::RAW_PUBLIC_KEY,
+                    cert_type::X509,
+                ]);
+            match allow {
+                Allow::Client => {
+                    server_config =
+                        server_config.add_expected_client_raw_public_key(client_spki.clone());
+                }
+                Allow::Other => {
+                    let mut okeygen = HmacDrbg::<Sha256>::new(b"crpk12-other", b"nonce", &[]);
+                    let other = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut okeygen);
+                    server_config = server_config.add_expected_client_raw_public_key(
+                        crate::x509::AnyPublicKey::Ecdsa(other.public_key()).to_spki_der(),
+                    );
+                }
+                Allow::Nobody => {}
+            }
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_der).unwrap();
+            let client_cfg = ClientConfig12::new(roots)
+                .with_client_cert(ClientCertConfig::with_ecdsa(Vec::new(), client_key))
+                .with_client_cert_type_preference(alloc::vec![
+                    cert_type::RAW_PUBLIC_KEY,
+                    cert_type::X509,
+                ])
+                .with_client_raw_public_key_spki(client_spki);
+            let mut crng = HmacDrbg::<Sha256>::new(b"crpk12-client", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"crpk12-server", b"nonce", &[]);
+            let mut client =
+                ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection12::new(server_config, srng);
+            drive12(&mut client, &mut server)?;
+            client.send_application_data(b"crpk12").unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets()?;
+            assert_eq!(server.take_received_plaintext(), b"crpk12");
+            Ok(server.peer_certificates().to_vec())
+        }
+        let mut ckeygen = HmacDrbg::<Sha256>::new(b"crpk12-key", b"nonce", &[]);
+        let client_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut ckeygen);
+        let client_spki = crate::x509::AnyPublicKey::Ecdsa(client_key.public_key()).to_spki_der();
+        assert_eq!(attempt(Allow::Client).unwrap(), alloc::vec![client_spki]);
+        assert!(matches!(attempt(Allow::Other), Err(Error::BadCertificate)));
+        assert!(matches!(
+            attempt(Allow::Nobody),
+            Err(Error::CertificateRequired)
+        ));
+    }
+
+    /// RFC 7250 §4.2 fail-closed on the server: a client that only accepts a
+    /// raw public key gets `handshake_failure` from a server that has none
+    /// to offer — whether X.509-only by configuration or willing but without
+    /// an SPKI — instead of an X.509 chain it would not verify. The same
+    /// willing-but-keyless server does complete with a client whose offer
+    /// also lists X.509: it selects (and echoes) X.509 and the chain is
+    /// verified as usual.
+    #[test]
+    fn tls12_server_without_a_raw_public_key_refuses_a_raw_key_only_client() {
+        use crate::tls::Error;
+        use crate::tls::codec::cert_type;
+        fn attempt(server_prefs: Vec<u8>, client_prefs: Vec<u8>) -> Result<Vec<Vec<u8>>, Error> {
+            let (server_config, der) = ecdsa_server12();
+            let server_config = server_config.with_server_cert_type_preference(server_prefs);
+            let mut roots = RootCertStore::new();
+            roots.add_der(der.clone()).unwrap();
+            let client_cfg = ClientConfig12::new(roots)
+                .with_server_cert_type_preference(client_prefs)
+                .add_expected_raw_public_key(alloc::vec![0x30, 0x00]);
+            let mut crng = HmacDrbg::<Sha256>::new(b"rpk12-x509-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"rpk12-x509-s", b"nonce", &[]);
+            let mut client =
+                ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection12::new(server_config, srng);
+            drive12(&mut client, &mut server)?;
+            assert_eq!(client.peer_certificates(), &[der][..]);
+            Ok(client.peer_certificates().to_vec())
+        }
+        let x509_only = alloc::vec![cert_type::X509];
+        let rpk_first = alloc::vec![cert_type::RAW_PUBLIC_KEY, cert_type::X509];
+        let rpk_only = alloc::vec![cert_type::RAW_PUBLIC_KEY];
+        assert!(matches!(
+            attempt(x509_only.clone(), rpk_only.clone()),
+            Err(Error::HandshakeFailure)
+        ));
+        assert!(matches!(
+            attempt(rpk_first.clone(), rpk_only),
+            Err(Error::HandshakeFailure)
+        ));
+        assert_eq!(attempt(rpk_first, rpk_first_client()).unwrap().len(), 1);
+        assert_eq!(attempt(x509_only, rpk_first_client()).unwrap().len(), 1);
+
+        fn rpk_first_client() -> Vec<u8> {
+            alloc::vec![cert_type::RAW_PUBLIC_KEY, cert_type::X509]
+        }
+    }
+
     /// Issue #30 — `received_close_notify()` on the TLS 1.2 engines:
     /// false until the peer's close_notify is processed (transport EOF
     /// there means truncation), true after.

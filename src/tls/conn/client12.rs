@@ -17,8 +17,13 @@
 //! would obscure both paths.
 //!
 //! Supports mTLS via [`ClientConfig12::with_client_cert`] (sharing the same
-//! [`ClientCertConfig`] type as the TLS 1.3 client) and RFC 5077 session
-//! tickets via [`ClientConfig12::with_session`]. The abbreviated resumed
+//! [`ClientCertConfig`] type as the TLS 1.3 client), RFC 5077 session
+//! tickets via [`ClientConfig12::with_session`], and RFC 7250 raw public
+//! keys in both directions (the `server_certificate_type` /
+//! `client_certificate_type` extensions, negotiated in the ServerHello; a
+//! `Certificate` then carries a bare `SubjectPublicKeyInfo` instead of a
+//! chain, and the server's key is authenticated against the
+//! [`ClientConfig12::add_expected_raw_public_key`] allowlist). The abbreviated resumed
 //! handshake (RFC 5077 §3.4) skips Certificate / SKE / SHDone on both sides.
 //! Session resumption via the legacy `session_id` cache is not implemented:
 //! only a `session_ticket` carries resumable state. When we present a ticket
@@ -51,11 +56,12 @@ use crate::tls::codec::extension as ext;
 use crate::tls::codec::handshake12::RsaClientKeyExchange;
 use crate::tls::codec::handshake12::{
     CertificateRequest12, ClientKeyExchange, NewSessionTicket12, ServerHelloDone,
-    ServerKeyExchange, signed_message,
+    ServerKeyExchange, decode_raw_public_key_certificate, encode_raw_public_key_certificate,
+    signed_message,
 };
 use crate::tls::codec::{
-    CipherSuite, ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, hs_type,
-    read_handshake, with_len_u16, with_len_u24,
+    CipherSuite, ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello,
+    cert_type, hs_type, read_handshake, with_len_u16, with_len_u24,
 };
 use crate::tls::crypto::HashAlg;
 use crate::tls::crypto::aead12::RecordCrypter12;
@@ -172,6 +178,26 @@ pub(crate) struct ClientConfig12 {
     /// TLS 1.2.
     #[cfg(feature = "tls-legacy")]
     pub max_version: ProtocolVersion,
+    /// RFC 7250 §3 `server_certificate_type` preference list offered in the
+    /// ClientHello (`0 = X509`, `2 = RawPublicKey`), most preferred first.
+    /// The default `[0]` keeps the extension off the wire. Mirrors
+    /// [`super::client::ClientConfig::server_cert_type_preference`].
+    pub server_cert_type_preference: Vec<u8>,
+    /// RFC 7250 §3 `client_certificate_type` preference list for the mTLS
+    /// direction; same encoding and default as `server_cert_type_preference`.
+    pub client_cert_type_preference: Vec<u8>,
+    /// Allowlist of bare `SubjectPublicKeyInfo` DER blobs accepted as the
+    /// server's raw public key once `RawPublicKey` is negotiated. There is
+    /// no chain behind a raw key, so this list is the entire trust root; see
+    /// [`super::common::check_raw_public_key`] for how it combines with
+    /// `verify_certificates`.
+    pub expected_raw_public_keys: Vec<Vec<u8>>,
+    /// The bare `SubjectPublicKeyInfo` DER this client sends as its
+    /// `Certificate` when `RawPublicKey` is the negotiated
+    /// `client_certificate_type` (mTLS, RFC 7250 §4.4). Must correspond to
+    /// the `client_cert` signing key; without it a raw-key `Certificate` is
+    /// sent empty ("no certificate").
+    pub raw_public_key_spki: Option<Vec<u8>>,
 }
 
 impl ClientConfig12 {
@@ -197,7 +223,56 @@ impl ClientConfig12 {
             min_version: ProtocolVersion::TLSv1_2,
             #[cfg(feature = "tls-legacy")]
             max_version: ProtocolVersion::TLSv1_2,
+            server_cert_type_preference: alloc::vec![cert_type::X509],
+            client_cert_type_preference: alloc::vec![cert_type::X509],
+            expected_raw_public_keys: Vec::new(),
+            raw_public_key_spki: None,
         }
+    }
+
+    /// Sets the RFC 7250 `server_certificate_type` preference list offered
+    /// in the ClientHello (`0 = X509`, `2 = RawPublicKey`; most preferred
+    /// first). An empty list is coerced to `[0]`. A list without `X509`
+    /// makes the handshake fail closed against a server that does not
+    /// negotiate raw public keys — the client never falls back to an X.509
+    /// chain it did not offer to accept.
+    pub fn with_server_cert_type_preference(mut self, prefs: Vec<u8>) -> Self {
+        self.server_cert_type_preference = if prefs.is_empty() {
+            alloc::vec![cert_type::X509]
+        } else {
+            prefs
+        };
+        self
+    }
+
+    /// Sets the RFC 7250 `client_certificate_type` preference list (mTLS).
+    /// Same semantics as [`with_server_cert_type_preference`](Self::with_server_cert_type_preference);
+    /// combine with [`with_client_raw_public_key_spki`](Self::with_client_raw_public_key_spki)
+    /// and a [`with_client_cert`](Self::with_client_cert) whose key matches.
+    pub fn with_client_cert_type_preference(mut self, prefs: Vec<u8>) -> Self {
+        self.client_cert_type_preference = if prefs.is_empty() {
+            alloc::vec![cert_type::X509]
+        } else {
+            prefs
+        };
+        self
+    }
+
+    /// Sets the bare `SubjectPublicKeyInfo` DER sent as this client's
+    /// `Certificate` when `RawPublicKey` is the negotiated
+    /// `client_certificate_type` (RFC 7250 §4.4). Must match the
+    /// `client_cert` signing key.
+    pub fn with_client_raw_public_key_spki(mut self, spki_der: Vec<u8>) -> Self {
+        self.raw_public_key_spki = Some(spki_der);
+        self
+    }
+
+    /// Appends an accepted server raw public key (bare `SubjectPublicKeyInfo`
+    /// DER) to the allowlist consulted when `RawPublicKey` is negotiated
+    /// (RFC 7250 §4.2).
+    pub fn add_expected_raw_public_key(mut self, spki_der: Vec<u8>) -> Self {
+        self.expected_raw_public_keys.push(spki_der);
+        self
     }
 
     /// Lowers the minimum negotiable version to opt into the deprecated
@@ -677,6 +752,12 @@ pub struct ClientConnection12 {
     /// captured for caller inspection via [`Self::peer_ocsp_response`] and
     /// for chain-bound verification once the leaf's issuer is known.
     peer_ocsp_response: Option<Vec<u8>>,
+    /// RFC 7250: the certificate type the server's `Certificate` carries.
+    /// `X509` unless the ServerHello selected `RawPublicKey` from our offer.
+    negotiated_server_cert_type: u8,
+    /// RFC 7250 §4.4: the certificate type our own `Certificate` must carry
+    /// under mTLS. `X509` unless the ServerHello selected `RawPublicKey`.
+    negotiated_client_cert_type: u8,
 }
 
 // Unlike the TLS 1.3 schedule (whose secrets are consumed as the handshake
@@ -851,6 +932,8 @@ impl ClientConnection12 {
             ems_session_hash: None,
             server_echoed_ocsp_staple: false,
             peer_ocsp_response: None,
+            negotiated_server_cert_type: cert_type::X509,
+            negotiated_client_cert_type: cert_type::X509,
         };
         let hello = conn.build_client_hello(&offered_suites, groups);
         // Update the transcript even though the hash isn't selected yet —
@@ -982,6 +1065,8 @@ impl ClientConnection12 {
             ems_session_hash: None,
             server_echoed_ocsp_staple: false,
             peer_ocsp_response: None,
+            negotiated_server_cert_type: cert_type::X509,
+            negotiated_client_cert_type: cert_type::X509,
         };
         // Seed the transcript with the EXACT bytes the 1.3 engine sent (the
         // 1.2 server hashed these same bytes). The hash alg stays unpinned
@@ -1045,6 +1130,22 @@ impl ClientConnection12 {
             .map(|s| s.ticket.as_slice())
             .unwrap_or(&[]);
         extensions.push(ext::session_ticket(ticket_bytes));
+        // RFC 7250 §3 server_certificate_type / client_certificate_type,
+        // emitted exactly when the TLS 1.3 engine emits them (the preference
+        // list names something other than X.509) so a version-spanning
+        // ClientHello and this engine's own agree on what was offered.
+        if self.offers_server_cert_type() {
+            extensions.push(ext::cert_type_list(
+                ExtensionType::SERVER_CERTIFICATE_TYPE,
+                &self.config.server_cert_type_preference,
+            ));
+        }
+        if self.offers_client_cert_type() {
+            extensions.push(ext::cert_type_list(
+                ExtensionType::CLIENT_CERTIFICATE_TYPE,
+                &self.config.client_cert_type_preference,
+            ));
+        }
 
         // RFC 7507 §4: caller opted into emitting `TLS_FALLBACK_SCSV`
         // (`0x5600`) to flag a deliberate downgrade. Prepend it to the wire
@@ -1619,6 +1720,79 @@ impl ClientConnection12 {
         }
     }
 
+    /// Whether the ClientHello carries `server_certificate_type` (RFC 7250
+    /// §3): only when the preference list names something other than X.509.
+    fn offers_server_cert_type(&self) -> bool {
+        self.config
+            .server_cert_type_preference
+            .iter()
+            .any(|t| *t != cert_type::X509)
+    }
+
+    /// Whether the ClientHello carries `client_certificate_type`.
+    fn offers_client_cert_type(&self) -> bool {
+        self.config
+            .client_cert_type_preference
+            .iter()
+            .any(|t| *t != cert_type::X509)
+    }
+
+    /// RFC 7250 §4.2: settles both certificate types from the ServerHello
+    /// extensions. A selection must answer an offer (RFC 5246 §7.4.1.4 —
+    /// `unsupported_extension` otherwise) and name a type we offered
+    /// (`illegal_parameter` otherwise). A server that stays silent on
+    /// `server_certificate_type` is using X.509 for its own identity; when
+    /// our offer did not include X.509 that cannot be honoured, so the
+    /// handshake fails closed (`handshake_failure`) rather than proceed to
+    /// a chain the caller never agreed to accept — a pinned raw key with
+    /// X.509 verification off would otherwise leave the peer
+    /// unauthenticated. Silence on `client_certificate_type` only concerns
+    /// our own identity: X.509 is assumed, as the RFC prescribes.
+    fn negotiate_cert_types(
+        &mut self,
+        extensions: &[(ExtensionType, Vec<u8>)],
+    ) -> Result<(), Error> {
+        let sct = ext::find(extensions, ExtensionType::SERVER_CERTIFICATE_TYPE);
+        let cct = ext::find(extensions, ExtensionType::CLIENT_CERTIFICATE_TYPE);
+        if !self.offers_server_cert_type() && sct.is_some() {
+            return Err(Error::UnsupportedExtension);
+        }
+        if !self.offers_client_cert_type() && cct.is_some() {
+            return Err(Error::UnsupportedExtension);
+        }
+        match sct {
+            Some(body) => {
+                let selected = ext::parse_cert_type_selection(body)?;
+                if !self.config.server_cert_type_preference.contains(&selected) {
+                    return Err(Error::IllegalParameter);
+                }
+                self.negotiated_server_cert_type = selected;
+            }
+            None => {
+                if self.offers_server_cert_type()
+                    && !self
+                        .config
+                        .server_cert_type_preference
+                        .contains(&cert_type::X509)
+                {
+                    return Err(Error::HandshakeFailure);
+                }
+                self.negotiated_server_cert_type = cert_type::X509;
+            }
+        }
+        match cct {
+            Some(body) => {
+                let selected = ext::parse_cert_type_selection(body)?;
+                if !self.config.client_cert_type_preference.contains(&selected) {
+                    return Err(Error::IllegalParameter);
+                }
+                self.negotiated_client_cert_type = selected;
+            }
+            None => self.negotiated_client_cert_type = cert_type::X509,
+        }
+        Ok(())
+    }
+
     fn on_server_hello(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
         if msg_type != hs_type::SERVER_HELLO {
             return Err(Error::UnexpectedMessage);
@@ -1716,6 +1890,10 @@ impl ClientConnection12 {
             ext::parse_status_request_sh_ack(sr_body)?;
             self.server_echoed_ocsp_staple = true;
         }
+        // RFC 7250 §4.2: certificate-type selection. Settled on the resumed
+        // path too — a ServerHello that mishandles our offer is a protocol
+        // error whether or not a Certificate follows.
+        self.negotiate_cert_types(&sh.extensions)?;
 
         // RFC 5077 §3.4: a server that accepts our ticket MUST echo the
         // `session_id` we sent alongside it; one that falls back to a full
@@ -1823,30 +2001,52 @@ impl ClientConnection12 {
         if msg_type != hs_type::CERTIFICATE {
             return Err(Error::UnexpectedMessage);
         }
-        let chain = parse_certificate_list_12(body)?;
-        if chain.is_empty() {
-            return Err(Error::BadCertificate);
-        }
-
-        // Reject malformed leaves regardless of policy.
-        let leaf = Certificate::from_der(chain[0].clone()).map_err(|_| Error::BadCertificate)?;
-        leaf.check_well_formed()
-            .map_err(|_| Error::BadCertificate)?;
-
-        let leaf_key = if self.config.verify_certificates {
-            let now = self.config.verification_time.clone().or_else(system_now);
-            let key = verify_chain_with_crls(
-                &self.config.roots,
-                &self.config.crls,
-                &chain,
-                now.as_ref(),
-                &self.config.signature_policy,
+        let (chain, leaf_key) = if self.negotiated_server_cert_type == cert_type::RAW_PUBLIC_KEY {
+            // RFC 7250 §3: the message carries one bare
+            // `SubjectPublicKeyInfo` in place of the chain. There is no PKI
+            // behind it — trust is the configured allowlist (shared with the
+            // TLS 1.3 engine) — and no host name to match. A server that
+            // negotiated a raw key and then sent none has nothing to
+            // authenticate with.
+            let spki = decode_raw_public_key_certificate(body)?;
+            if spki.is_empty() {
+                return Err(Error::BadCertificate);
+            }
+            let key = AnyPublicKey::from_spki_der(&spki).map_err(|_| Error::BadCertificate)?;
+            super::common::check_raw_public_key(
+                self.config.verify_certificates,
+                &self.config.expected_raw_public_keys,
+                &spki,
             )?;
-            verify_hostname(&leaf, &self.server_name)?;
-            key
+            (alloc::vec![spki], key)
         } else {
-            leaf.subject_public_key()
-                .map_err(|_| Error::BadCertificate)?
+            let chain = parse_certificate_list_12(body)?;
+            if chain.is_empty() {
+                return Err(Error::BadCertificate);
+            }
+
+            // Reject malformed leaves regardless of policy.
+            let leaf =
+                Certificate::from_der(chain[0].clone()).map_err(|_| Error::BadCertificate)?;
+            leaf.check_well_formed()
+                .map_err(|_| Error::BadCertificate)?;
+
+            let key = if self.config.verify_certificates {
+                let now = self.config.verification_time.clone().or_else(system_now);
+                let key = verify_chain_with_crls(
+                    &self.config.roots,
+                    &self.config.crls,
+                    &chain,
+                    now.as_ref(),
+                    &self.config.signature_policy,
+                )?;
+                verify_hostname(&leaf, &self.server_name)?;
+                key
+            } else {
+                leaf.subject_public_key()
+                    .map_err(|_| Error::BadCertificate)?
+            };
+            (chain, key)
         };
 
         // Legacy: every supported legacy CBC suite is RSA-authenticated. The
@@ -1950,6 +2150,9 @@ impl ClientConnection12 {
             ext::parse_status_request_sh_ack(sr_body)?;
             self.server_echoed_ocsp_staple = true;
         }
+        // RFC 7250 is defined for every extension-capable version, so the
+        // certificate types are settled exactly as on the 1.2 path.
+        self.negotiate_cert_types(&sh.extensions)?;
         // RFC 7627 applies to TLS 1.0/1.1 as well (§3/§4: the session hash
         // is `MD5 || SHA-1` and the derivation uses the version's PRF). An
         // echo is accepted exactly as on the 1.2 path; the extension is
@@ -2037,10 +2240,7 @@ impl ClientConnection12 {
         // `CertificateVerify` (over CH..CKE) follows it — but only when we
         // actually present a key. An empty `Certificate` (no client cert
         // configured) is allowed; the server then decides per its policy.
-        let send_cert_verify = self.cert_request_received && self.config.client_cert.is_some();
-        if self.cert_request_received {
-            self.send_client_certificate();
-        }
+        let send_cert_verify = self.cert_request_received && self.send_client_certificate();
 
         let premaster: Vec<u8> = match ls.kx {
             LegacyKx::EcdheRsa => {
@@ -2238,7 +2438,14 @@ impl ClientConnection12 {
         // directly, else the in-chain signer), never `cert_chain[1]`, which
         // is peer-chosen and unvalidated when the path closed at the leaf.
         // With `verify_certificates` off (pinned-key flows), skip the check
-        // entirely — the caller has opted out of PKI altogether.
+        // entirely — the caller has opted out of PKI altogether. A raw
+        // public key (RFC 7250) has no issuer to bind a staple to: the
+        // response is not authoritative for anything and is not retained.
+        if self.negotiated_server_cert_type == cert_type::RAW_PUBLIC_KEY {
+            self.transcript.update(raw);
+            self.state = self.state_after_certificate_status();
+            return Ok(());
+        }
         if self.config.verify_certificates {
             let leaf_der = self.cert_chain.first().ok_or(Error::BadCertificate)?;
             let leaf = crate::x509::Certificate::from_der(leaf_der.clone())
@@ -2385,9 +2592,7 @@ impl ClientConnection12 {
         // Certificate FIRST (RFC 5246 §7.3) — feed it into the transcript
         // before the CKE so the EMS session_hash includes it.
         let suite = self.suite.expect("suite set");
-        if self.cert_request_received {
-            self.send_client_certificate();
-        }
+        let presented = self.cert_request_received && self.send_client_certificate();
 
         // Emit ClientKeyExchange.
         let cke = ClientKeyExchange { point: our_point }.encode();
@@ -2443,7 +2648,7 @@ impl ClientConnection12 {
         // emitted ABOVE so the EMS session_hash snapshot covers them
         // exactly. CertificateVerify follows next because it is signed over
         // the transcript through CKE.
-        if self.cert_request_received && self.config.client_cert.is_some() {
+        if presented {
             self.send_client_certificate_verify()?;
         }
 
@@ -2476,20 +2681,36 @@ impl ClientConnection12 {
 
     /// mTLS: emit our `Certificate` (TLS 1.2 RFC 5246 §7.4.6). The chain is
     /// our configured one, or empty when no client cert is configured (the
-    /// server then decides per its `required` flag).
-    fn send_client_certificate(&mut self) {
-        let mut msg = alloc::vec![hs_type::CERTIFICATE];
-        with_len_u24(&mut msg, |b| {
-            with_len_u24(b, |list| {
-                if let Some(cc) = self.config.client_cert.as_ref() {
-                    for cert in cc.chain() {
-                        with_len_u24(list, |c| c.extend_from_slice(cert));
+    /// server then decides per its `required` flag). Under a negotiated
+    /// `RawPublicKey` (RFC 7250 §4.4) the message carries the configured
+    /// bare SPKI instead — or nothing, when no SPKI is configured. Returns
+    /// whether a key was presented, i.e. whether a `CertificateVerify` must
+    /// follow the `ClientKeyExchange`.
+    fn send_client_certificate(&mut self) -> bool {
+        let rpk = self.negotiated_client_cert_type == cert_type::RAW_PUBLIC_KEY;
+        let (msg, presented) = if rpk {
+            let spki = self
+                .config
+                .client_cert
+                .as_ref()
+                .and(self.config.raw_public_key_spki.as_deref());
+            (encode_raw_public_key_certificate(spki), spki.is_some())
+        } else {
+            let mut msg = alloc::vec![hs_type::CERTIFICATE];
+            with_len_u24(&mut msg, |b| {
+                with_len_u24(b, |list| {
+                    if let Some(cc) = self.config.client_cert.as_ref() {
+                        for cert in cc.chain() {
+                            with_len_u24(list, |c| c.extend_from_slice(cert));
+                        }
                     }
-                }
+                });
             });
-        });
+            (msg, self.config.client_cert.is_some())
+        };
         self.transcript.update(&msg);
         self.write_plain_record(ContentType::Handshake, &msg);
+        presented
     }
 
     /// mTLS: emit `CertificateVerify` (RFC 5246 §7.4.8). The signature is
@@ -3099,6 +3320,100 @@ mod tests {
         assert!(matches!(
             c.process_new_packets(),
             Err(Error::UnsupportedVersion)
+        ));
+    }
+
+    /// RFC 7250 §3: `server_certificate_type` rides the ClientHello only
+    /// when the preference list names something other than X.509 — the
+    /// default configuration leaves the wire format untouched.
+    #[test]
+    fn client12_offers_server_certificate_type_only_when_configured() {
+        fn offered(prefs: Vec<u8>) -> Option<Vec<u8>> {
+            let mut rng = HmacDrbg::<Sha256>::new(b"c12-rpk-offer", b"nonce", &[]);
+            let cfg =
+                ClientConfig12::new(RootCertStore::new()).with_server_cert_type_preference(prefs);
+            let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
+            let out = c.write_tls();
+            let rec = read_record(&out).unwrap().unwrap();
+            let mut cur = ReadCursor::new(rec.fragment);
+            assert_eq!(cur.u8().unwrap(), hs_type::CLIENT_HELLO);
+            let ch = ClientHello::decode(cur.vec_u24().unwrap()).unwrap();
+            ext::find(&ch.extensions, ExtensionType::SERVER_CERTIFICATE_TYPE).map(<[u8]>::to_vec)
+        }
+        assert_eq!(offered(alloc::vec![cert_type::X509]), None);
+        // CertificateTypeList: u8 length, then the types in our order.
+        assert_eq!(
+            offered(alloc::vec![cert_type::RAW_PUBLIC_KEY, cert_type::X509]),
+            Some(alloc::vec![2, cert_type::RAW_PUBLIC_KEY, cert_type::X509])
+        );
+    }
+
+    /// Drives a client that offered `prefs` for `server_certificate_type`
+    /// through a synthesised ServerHello carrying `reply` (if any) and
+    /// returns the outcome; on success the settled type is checked.
+    fn rpk_server_hello_outcome(prefs: Vec<u8>, reply: Option<u8>) -> Result<(), Error> {
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-rpk-sh", b"nonce", &[]);
+        let cfg = ClientConfig12::new(RootCertStore::new())
+            .with_server_cert_type_preference(prefs)
+            .add_expected_raw_public_key(alloc::vec![0x30, 0x00]);
+        let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
+        let _ = c.write_tls();
+        let mut exts = alloc::vec![
+            ext::renegotiation_info_empty(),
+            ext::extended_master_secret_empty(),
+        ];
+        if let Some(selected) = reply {
+            exts.push(ext::cert_type_selection(
+                ExtensionType::SERVER_CERTIFICATE_TYPE,
+                selected,
+            ));
+        }
+        c.read_tls(&synth_sh_record(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            exts,
+        ));
+        let outcome = c.process_new_packets();
+        if outcome.is_ok() {
+            assert_eq!(c.state, State::WaitCertificate);
+            assert_eq!(
+                c.negotiated_server_cert_type,
+                reply.unwrap_or(cert_type::X509)
+            );
+        }
+        outcome
+    }
+
+    /// RFC 7250 §4.2 / RFC 5246 §7.4.1.4: a ServerHello
+    /// `server_certificate_type` must answer an offer and pick from it. A
+    /// server that ignores an offer without X.509 in it is refused — the
+    /// client never falls back to a chain it did not agree to accept —
+    /// while an offer that lists X.509 proceeds on that assumption.
+    #[test]
+    fn client12_polices_the_server_certificate_type_reply() {
+        use cert_type::{RAW_PUBLIC_KEY, X509};
+        // Answering the offer with a type drawn from it.
+        rpk_server_hello_outcome(alloc::vec![RAW_PUBLIC_KEY, X509], Some(RAW_PUBLIC_KEY)).unwrap();
+        rpk_server_hello_outcome(alloc::vec![RAW_PUBLIC_KEY, X509], Some(X509)).unwrap();
+        rpk_server_hello_outcome(alloc::vec![RAW_PUBLIC_KEY], Some(RAW_PUBLIC_KEY)).unwrap();
+        // Silence means X.509 — acceptable only when it was offered.
+        rpk_server_hello_outcome(alloc::vec![RAW_PUBLIC_KEY, X509], None).unwrap();
+        assert!(matches!(
+            rpk_server_hello_outcome(alloc::vec![RAW_PUBLIC_KEY], None),
+            Err(Error::HandshakeFailure)
+        ));
+        // A type we did not offer.
+        assert!(matches!(
+            rpk_server_hello_outcome(alloc::vec![RAW_PUBLIC_KEY], Some(X509)),
+            Err(Error::IllegalParameter)
+        ));
+        assert!(matches!(
+            rpk_server_hello_outcome(alloc::vec![RAW_PUBLIC_KEY, X509], Some(1)),
+            Err(Error::IllegalParameter)
+        ));
+        // A reply we never solicited.
+        assert!(matches!(
+            rpk_server_hello_outcome(alloc::vec![X509], Some(X509)),
+            Err(Error::UnsupportedExtension)
         ));
     }
 

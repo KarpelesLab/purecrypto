@@ -233,6 +233,49 @@ impl RsaClientKeyExchange {
     }
 }
 
+/// Encodes a TLS 1.2 `Certificate` handshake message carrying a raw public
+/// key (RFC 7250 §3). When `RawPublicKey` is the negotiated certificate type
+/// the X.509 `certificate_list` is replaced by a single vector:
+///
+/// ```text
+/// struct {
+///     select (certificate_type) {
+///         case RawPublicKey:
+///             opaque ASN.1_subjectPublicKeyInfo<1..2^24-1>;
+///         case X.509:
+///             ASN.1Cert certificate_list<0..2^24-1>;
+///     };
+/// } Certificate;
+/// ```
+///
+/// `None` encodes a zero-length vector — the "no certificate" a client sends
+/// when it has no raw key to present (the raw-key counterpart of an empty
+/// `certificate_list`, as OpenSSL emits and accepts it).
+pub(crate) fn encode_raw_public_key_certificate(spki: Option<&[u8]>) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u8(&mut out, hs_type::CERTIFICATE);
+    with_len_u24(&mut out, |b| {
+        with_len_u24(b, |k| {
+            if let Some(spki) = spki {
+                k.extend_from_slice(spki);
+            }
+        });
+    });
+    out
+}
+
+/// Decodes the body of a TLS 1.2 `Certificate` message received while
+/// `RawPublicKey` is the negotiated certificate type (RFC 7250 §3; see
+/// [`encode_raw_public_key_certificate`]): the bare `SubjectPublicKeyInfo`
+/// DER, or an empty vector for a peer that presented no key. Trailing bytes
+/// are a decode error — the message is exactly one u24-length vector.
+pub(crate) fn decode_raw_public_key_certificate(body: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut c = ReadCursor::new(body);
+    let spki = c.vec_u24()?.to_vec();
+    c.expect_empty()?;
+    Ok(spki)
+}
+
 /// `CertificateRequest` for TLS 1.2 (RFC 5246 §7.4.4). This wire format is
 /// distinct from TLS 1.3's `CertificateRequest` (RFC 8446 §4.3.2), which
 /// carries extensions instead.

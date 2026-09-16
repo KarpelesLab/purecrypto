@@ -407,14 +407,16 @@ pub(crate) fn parse_cert_type_list(body: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 /// Builds a `client_certificate_type` / `server_certificate_type` extension
-/// for an EncryptedExtensions reply (RFC 7250 §3): the bare selected byte.
+/// for the server's reply (RFC 7250 §3) — EncryptedExtensions on TLS 1.3,
+/// ServerHello on TLS 1.2: the bare selected byte.
 pub(crate) fn cert_type_selection(ty: ExtensionType, selected: u8) -> RawExtension {
     let body = alloc::vec![selected];
     (ty, body)
 }
 
-/// Parses an EncryptedExtensions `client_certificate_type` /
-/// `server_certificate_type` body: a single `u8` (RFC 7250 §3).
+/// Parses a server-reply (EncryptedExtensions / TLS 1.2 ServerHello)
+/// `client_certificate_type` / `server_certificate_type` body: a single
+/// `u8` (RFC 7250 §3).
 pub(crate) fn parse_cert_type_selection(body: &[u8]) -> Result<u8, Error> {
     let mut c = ReadCursor::new(body);
     let v = c.u8()?;

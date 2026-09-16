@@ -18,8 +18,12 @@
 //! `Finished`.
 //!
 //! Supports mTLS (RFC 5246 §7.4.4 + §7.4.6 + §7.4.8) via
-//! [`ServerConfig12::with_client_auth`] and RFC 5077 stateless session
-//! tickets via [`ServerConfig12::with_ticket_key`].
+//! [`ServerConfig12::with_client_auth`], RFC 5077 stateless session
+//! tickets via [`ServerConfig12::with_ticket_key`], and RFC 7250 raw public
+//! keys in both directions (`server_certificate_type` /
+//! `client_certificate_type`, selected in the ServerHello; the `Certificate`
+//! then carries a bare `SubjectPublicKeyInfo`, and a client's raw key is
+//! authenticated against [`ServerConfig12::add_expected_client_raw_public_key`]).
 //!
 //! # Record-layer note
 //!
@@ -51,11 +55,12 @@ use crate::tls::codec::extension as ext;
 use crate::tls::codec::handshake12::RsaClientKeyExchange;
 use crate::tls::codec::handshake12::{
     CertificateRequest12, ClientKeyExchange, NewSessionTicket12, ServerHelloDone,
-    ServerKeyExchange, signed_message,
+    ServerKeyExchange, decode_raw_public_key_certificate, encode_raw_public_key_certificate,
+    signed_message,
 };
 use crate::tls::codec::{
     ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
-    hs_type, read_handshake, with_len_u24,
+    cert_type, hs_type, read_handshake, with_len_u24,
 };
 use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
@@ -159,6 +164,24 @@ pub(crate) struct ServerConfig12 {
     /// the deprecated legacy suites (off by default; see the module docs).
     #[cfg(feature = "tls-legacy")]
     pub(crate) min_version: ProtocolVersion,
+    /// RFC 7250 §3 `server_certificate_type` accept-set (`0 = X509`,
+    /// `2 = RawPublicKey`). Defaults to `[X509]`; `RawPublicKey` is only
+    /// ever selected when `raw_public_key_spki` is set. Mirrors
+    /// [`super::server::ServerConfig`].
+    server_cert_type_preference: Vec<u8>,
+    /// RFC 7250 §3 `client_certificate_type` accept-set for mTLS.
+    /// `RawPublicKey` is only ever selected while
+    /// `expected_client_raw_public_keys` is non-empty.
+    client_cert_type_preference: Vec<u8>,
+    /// The bare `SubjectPublicKeyInfo` DER sent as our `Certificate` when
+    /// `RawPublicKey` is the negotiated server certificate type (RFC 7250
+    /// §4.2). Must correspond to `key`.
+    raw_public_key_spki: Option<Vec<u8>>,
+    /// Allowlist of client raw public keys (bare `SubjectPublicKeyInfo`
+    /// DER) accepted under `client_certificate_type = RawPublicKey` (RFC
+    /// 7250 §4.4). A raw key has no chain, so this list is the entire trust
+    /// root for that path.
+    expected_client_raw_public_keys: Vec<Vec<u8>>,
 }
 
 /// Client-authentication policy for a TLS 1.2 server (RFC 5246 §7.4.4 +
@@ -197,7 +220,53 @@ impl ServerConfig12 {
             supports_tls13: false,
             #[cfg(feature = "tls-legacy")]
             min_version: ProtocolVersion::TLSv1_2,
+            server_cert_type_preference: alloc::vec![cert_type::X509],
+            client_cert_type_preference: alloc::vec![cert_type::X509],
+            raw_public_key_spki: None,
+            expected_client_raw_public_keys: Vec::new(),
         }
+    }
+
+    /// Sets the RFC 7250 `server_certificate_type` accept-set (`0 = X509`,
+    /// `2 = RawPublicKey`). An empty list is coerced to `[X509]`. Combine
+    /// with [`with_raw_public_key_spki`](Self::with_raw_public_key_spki) —
+    /// without an SPKI to send, `RawPublicKey` is never selected.
+    pub fn with_server_cert_type_preference(mut self, prefs: Vec<u8>) -> Self {
+        self.server_cert_type_preference = if prefs.is_empty() {
+            alloc::vec![cert_type::X509]
+        } else {
+            prefs
+        };
+        self
+    }
+
+    /// Sets the RFC 7250 `client_certificate_type` accept-set (mTLS). Same
+    /// semantics as [`with_server_cert_type_preference`](Self::with_server_cert_type_preference);
+    /// `RawPublicKey` is only selected once
+    /// [`add_expected_client_raw_public_key`](Self::add_expected_client_raw_public_key)
+    /// has given the server something to authenticate a raw key against.
+    pub fn with_client_cert_type_preference(mut self, prefs: Vec<u8>) -> Self {
+        self.client_cert_type_preference = if prefs.is_empty() {
+            alloc::vec![cert_type::X509]
+        } else {
+            prefs
+        };
+        self
+    }
+
+    /// Sets the bare `SubjectPublicKeyInfo` DER sent as our `Certificate`
+    /// when `RawPublicKey` is negotiated (RFC 7250 §4.2). Must match the
+    /// configured signing key.
+    pub fn with_raw_public_key_spki(mut self, spki_der: Vec<u8>) -> Self {
+        self.raw_public_key_spki = Some(spki_der);
+        self
+    }
+
+    /// Appends an accepted client raw public key (bare `SubjectPublicKeyInfo`
+    /// DER) to the mTLS allowlist (RFC 7250 §4.4).
+    pub fn add_expected_client_raw_public_key(mut self, spki_der: Vec<u8>) -> Self {
+        self.expected_client_raw_public_keys.push(spki_der);
+        self
     }
 
     /// Marks this 1.2 engine as the downgrade target of a 1.3-capable
@@ -526,6 +595,16 @@ pub struct ServerConnection12<R: RngCore> {
     /// instant the ClientKeyExchange is fed into the transcript. Used as
     /// the `session_hash` input to `extended_master_secret`.
     ems_session_hash: Option<Vec<u8>>,
+    /// RFC 7250: whether the client offered `server_certificate_type` —
+    /// drives whether the ServerHello echoes our selection.
+    peer_offered_server_cert_type: bool,
+    /// RFC 7250: whether the client offered `client_certificate_type`.
+    peer_offered_client_cert_type: bool,
+    /// The certificate type our `Certificate` carries (`X509` unless
+    /// `RawPublicKey` was negotiated).
+    negotiated_server_cert_type: u8,
+    /// The certificate type the client's `Certificate` must carry under mTLS.
+    negotiated_client_cert_type: u8,
 }
 
 // Unlike the TLS 1.3 schedule (whose secrets are consumed as the handshake
@@ -590,6 +669,10 @@ impl<R: RngCore> ServerConnection12<R> {
             ems_session_hash: None,
             #[cfg(test)]
             test_force_no_ems: false,
+            peer_offered_server_cert_type: false,
+            peer_offered_client_cert_type: false,
+            negotiated_server_cert_type: cert_type::X509,
+            negotiated_client_cert_type: cert_type::X509,
         }
     }
 
@@ -1157,6 +1240,10 @@ impl<R: RngCore> ServerConnection12<R> {
             let _ = ext::client_offers_tls13(body)?;
         }
 
+        // RFC 7250 §4.2: certificate-type negotiation, before anything is
+        // committed to the transcript (a no-overlap offer is refused).
+        self.negotiate_cert_types(&ch.extensions)?;
+
         // RFC 5246 §7.4.1.4.1: TLS 1.2 ClientHello MUST carry
         // `signature_algorithms`. (Required regardless of resumption: we may
         // fall back to a fresh handshake if the ticket is bad.)
@@ -1464,6 +1551,10 @@ impl<R: RngCore> ServerConnection12<R> {
             self.peer_server_name = ext::parse_server_name(sni_body)?;
         }
 
+        // RFC 7250 is defined for every extension-capable version: settle
+        // the certificate types exactly as on the 1.2 path.
+        self.negotiate_cert_types(&ch.extensions)?;
+
         // RFC 6066 §8 (OCSP stapling) predates TLS 1.2: remember the offer so
         // the legacy ServerHello echoes it and a `CertificateStatus` follows
         // `Certificate` whenever a staple is configured.
@@ -1620,6 +1711,7 @@ impl<R: RngCore> ServerConnection12<R> {
         if self.peer_offered_ocsp_staple && self.config.stapled_ocsp_response.is_some() {
             extensions.push(ext::status_request_sh_ack());
         }
+        self.push_cert_type_selections(&mut extensions);
         let sh = ServerHello {
             random: sr,
             session_id: Vec::new(),
@@ -1987,10 +2079,25 @@ impl<R: RngCore> ServerConnection12<R> {
         // carried across it. Fall back to a full handshake, which re-verifies
         // the chain from scratch.
         if let Some(leaf) = parsed.client_leaf.as_ref() {
-            let cert = crate::x509::Certificate::from_der(leaf.clone()).ok()?;
-            let validity = cert.validity().ok()?;
-            if !validity.accepts(&crate::x509::Time::from_unix(now)) {
-                return None;
+            match crate::x509::Certificate::from_der(leaf.clone()) {
+                Ok(cert) => {
+                    let validity = cert.validity().ok()?;
+                    if !validity.accepts(&crate::x509::Time::from_unix(now)) {
+                        return None;
+                    }
+                }
+                // RFC 7250: a raw-key client identity is a bare SPKI with no
+                // validity period; it remains acceptable exactly while it
+                // is on this listener's allowlist (the whole trust root for
+                // that path). Anything else is unparsable — full handshake.
+                Err(_) => {
+                    super::common::check_raw_public_key(
+                        true,
+                        &self.config.expected_client_raw_public_keys,
+                        leaf,
+                    )
+                    .ok()?;
+                }
             }
         }
         let suite_code = crate::tls::codec::CipherSuite(parsed.cipher_suite);
@@ -2024,6 +2131,61 @@ impl<R: RngCore> ServerConnection12<R> {
             ems_used: parsed.ems_used,
             client_leaf: parsed.client_leaf.clone(),
         })
+    }
+
+    /// RFC 7250 §4.2: settles both certificate types from the ClientHello.
+    /// Each offered list is walked in the client's preference order and the
+    /// first entry in our accept-set wins; an offer with no usable overlap
+    /// is refused (`handshake_failure`, as the TLS 1.3 engine does). A
+    /// client that does not offer an extension is using X.509 for that
+    /// direction. `RawPublicKey` is only usable for our own identity when
+    /// there is an SPKI to send, and for the client's when there is an
+    /// allowlist to authenticate it against — a raw key has no chain, so
+    /// without one anything the client generated on the spot would satisfy
+    /// `client_auth.required` (fail closed, RFC 7250 §4.4).
+    fn negotiate_cert_types(
+        &mut self,
+        extensions: &[(ExtensionType, Vec<u8>)],
+    ) -> Result<(), Error> {
+        if let Some(body) = ext::find(extensions, ExtensionType::SERVER_CERTIFICATE_TYPE) {
+            let offered = ext::parse_cert_type_list(body)?;
+            self.peer_offered_server_cert_type = true;
+            let chosen = offered.iter().copied().find(|ct| {
+                self.config.server_cert_type_preference.contains(ct)
+                    && (*ct != cert_type::RAW_PUBLIC_KEY
+                        || self.config.raw_public_key_spki.is_some())
+            });
+            self.negotiated_server_cert_type = chosen.ok_or(Error::HandshakeFailure)?;
+        }
+        if let Some(body) = ext::find(extensions, ExtensionType::CLIENT_CERTIFICATE_TYPE) {
+            let offered = ext::parse_cert_type_list(body)?;
+            self.peer_offered_client_cert_type = true;
+            let chosen = offered.iter().copied().find(|ct| {
+                self.config.client_cert_type_preference.contains(ct)
+                    && (*ct != cert_type::RAW_PUBLIC_KEY
+                        || !self.config.expected_client_raw_public_keys.is_empty())
+            });
+            self.negotiated_client_cert_type = chosen.ok_or(Error::HandshakeFailure)?;
+        }
+        Ok(())
+    }
+
+    /// RFC 7250 §4.2: echo the selected certificate type for each direction
+    /// the client asked about, and only those (RFC 5246 §7.4.1.4). Echoing
+    /// an explicit `X509` is legal and removes any ambiguity.
+    fn push_cert_type_selections(&self, extensions: &mut Vec<(ExtensionType, Vec<u8>)>) {
+        if self.peer_offered_server_cert_type {
+            extensions.push(ext::cert_type_selection(
+                ExtensionType::SERVER_CERTIFICATE_TYPE,
+                self.negotiated_server_cert_type,
+            ));
+        }
+        if self.peer_offered_client_cert_type {
+            extensions.push(ext::cert_type_selection(
+                ExtensionType::CLIENT_CERTIFICATE_TYPE,
+                self.negotiated_client_cert_type,
+            ));
+        }
     }
 
     fn send_server_hello(&mut self) -> Result<(), Error> {
@@ -2065,6 +2227,7 @@ impl<R: RngCore> ServerConnection12<R> {
         if self.peer_offered_ocsp_staple && self.config.stapled_ocsp_response.is_some() {
             extensions.push(ext::status_request_sh_ack());
         }
+        self.push_cert_type_selections(&mut extensions);
 
         // RFC 5077 §3.4: echo the client's `session_id` iff we resumed its
         // ticket (the client distinguishes the abbreviated flight by this
@@ -2088,6 +2251,14 @@ impl<R: RngCore> ServerConnection12<R> {
     }
 
     fn send_certificate(&mut self) {
+        // RFC 7250 §3: under a negotiated `RawPublicKey` the body is our
+        // bare SPKI (negotiation already required it to be configured).
+        if self.negotiated_server_cert_type == cert_type::RAW_PUBLIC_KEY {
+            let msg = encode_raw_public_key_certificate(self.config.raw_public_key_spki.as_deref());
+            self.transcript.update(&msg);
+            self.write_plain_record(ContentType::Handshake, &msg);
+            return;
+        }
         // TLS 1.2 Certificate body: u24-length list of u24-length cert DERs
         // (no per-cert extensions).
         let mut msg = alloc::vec![hs_type::CERTIFICATE];
@@ -2166,7 +2337,19 @@ impl<R: RngCore> ServerConnection12<R> {
         if msg_type != hs_type::CERTIFICATE {
             return Err(Error::UnexpectedMessage);
         }
-        let chain = parse_certificate_list_12(body)?;
+        let rpk = self.negotiated_client_cert_type == cert_type::RAW_PUBLIC_KEY;
+        // RFC 7250 §3: a raw-key `Certificate` is one bare SPKI (empty for
+        // "no certificate"); the X.509 form is the usual chain.
+        let chain = if rpk {
+            let spki = decode_raw_public_key_certificate(body)?;
+            if spki.is_empty() {
+                Vec::new()
+            } else {
+                alloc::vec![spki]
+            }
+        } else {
+            parse_certificate_list_12(body)?
+        };
         let policy = self
             .config
             .client_auth
@@ -2179,6 +2362,25 @@ impl<R: RngCore> ServerConnection12<R> {
             self.transcript.update(raw);
             self.client_cert_chain.clear();
             self.client_leaf_key = None;
+            self.state = State::WaitClientKeyExchange;
+            return Ok(());
+        }
+        if rpk {
+            // RFC 7250 §4.4 leaves trust in a client raw key to the
+            // application — here the configured allowlist, checked through
+            // the helper the TLS 1.3 engine uses. Negotiation never selects
+            // `RawPublicKey` with an empty allowlist, so `verify` is
+            // unconditionally on.
+            let spki = &chain[0];
+            super::common::check_raw_public_key(
+                true,
+                &self.config.expected_client_raw_public_keys,
+                spki,
+            )?;
+            let leaf_key = AnyPublicKey::from_spki_der(spki).map_err(|_| Error::BadCertificate)?;
+            self.transcript.update(raw);
+            self.client_cert_chain = chain;
+            self.client_leaf_key = Some(leaf_key);
             self.state = State::WaitClientKeyExchange;
             return Ok(());
         }

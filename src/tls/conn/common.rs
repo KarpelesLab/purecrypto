@@ -625,6 +625,49 @@ impl ConnectionCore {
     }
 }
 
+/// RFC 7250 trust decision for a peer's raw public key, shared by every
+/// engine that negotiates `RawPublicKey`: `spki` is the bare
+/// `SubjectPublicKeyInfo` DER the peer put in its `Certificate`, `allowlist`
+/// the operator-configured pins. A raw key has no chain to validate, so the
+/// allowlist is the entire trust root:
+///
+/// * a non-empty allowlist must contain `spki` — checked in constant time
+///   over every entry so the match position does not leak (lengths are
+///   public), and enforced whether or not X.509 verification is on, since a
+///   configured pin is the out-of-band authentication that
+///   `verify_certificates(false)` defers to;
+/// * an empty allowlist with verification on has nothing to establish trust
+///   against, so the key is refused;
+/// * an empty allowlist with verification off accepts the key unverified,
+///   exactly as an X.509 leaf is accepted in that mode.
+///
+/// Errors with [`Error::BadCertificate`].
+pub(super) fn check_raw_public_key(
+    verify_certificates: bool,
+    allowlist: &[Vec<u8>],
+    spki: &[u8],
+) -> Result<(), Error> {
+    use crate::ct::ConstantTimeEq;
+    if allowlist.is_empty() {
+        return if verify_certificates {
+            Err(Error::BadCertificate)
+        } else {
+            Ok(())
+        };
+    }
+    let mut matched = crate::ct::Choice::from(0u8);
+    for accepted in allowlist {
+        if accepted.len() == spki.len() {
+            matched |= accepted.as_slice().ct_eq(spki);
+        }
+    }
+    if bool::from(matched) {
+        Ok(())
+    } else {
+        Err(Error::BadCertificate)
+    }
+}
+
 /// Parses a 2-byte alert body.
 fn parse_alert(body: &[u8]) -> Result<Incoming, Error> {
     if body.len() != 2 {

@@ -1590,19 +1590,11 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         ech,
         resumption,
     } = parts.client;
-    // Inert on the TLS 1.2 engine: RFC 7250 raw public keys, RFC 8879
-    // certificate compression and ECH are TLS 1.3 features (see the `Config`
-    // field docs); `rng` is drawn through `config_rng`, `signer` through
-    // `Connection::drive`, and the caller resolves `server_name`.
-    let _ = (
-        server_cert_type_preference,
-        client_cert_type_preference,
-        raw_public_key_spki,
-        expected_raw_public_keys,
-        rng,
-        signer,
-        server_name,
-    );
+    // Inert on the TLS 1.2 engine: RFC 8879 certificate compression and ECH
+    // are TLS 1.3 features (see the `Config` field docs); `rng` is drawn
+    // through `config_rng`, `signer` through `Connection::drive`, and the
+    // caller resolves `server_name`.
+    let _ = (rng, signer, server_name);
     #[cfg(feature = "cert-compression")]
     let _ = cert_compression_algorithms;
     #[cfg(feature = "ech")]
@@ -1631,6 +1623,17 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         && let Some(c) = client_cert_from_signing(id)
     {
         cc = cc.with_client_cert(c);
+    }
+    // RFC 7250 raw public keys, forwarded exactly as to the TLS 1.3 engine so
+    // a version-spanning handshake authenticates the peer the same way
+    // whichever version is negotiated.
+    cc = cc.with_server_cert_type_preference(server_cert_type_preference.to_vec());
+    cc = cc.with_client_cert_type_preference(client_cert_type_preference.to_vec());
+    for spki in expected_raw_public_keys {
+        cc = cc.add_expected_raw_public_key(spki.clone());
+    }
+    if let Some(spki) = raw_public_key_spki {
+        cc = cc.with_client_raw_public_key_spki(spki.to_vec());
     }
     cc.key_log = key_log.clone();
     #[cfg(feature = "tls-legacy")]
@@ -1879,18 +1882,13 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     } = parts.server;
     // Inert on the TLS 1.2 engine (see the `Config` field docs): a server's
     // trust anchors for mTLS come from `client_auth`; there is no per-cert
-    // extension slot for a stapled CRL, no 0-RTT, no RFC 7250 raw public keys,
-    // no RFC 8879 compression, no ECH and no HelloRetryRequest group
-    // preference. `rng` is drawn through `config_rng`, `signer` through
-    // `Connection::drive`.
+    // extension slot for a stapled CRL, no 0-RTT, no RFC 8879 compression,
+    // no ECH and no HelloRetryRequest group preference. `rng` is drawn
+    // through `config_rng`, `signer` through `Connection::drive`.
     let _ = (
         roots,
         stapled_crl,
         max_early_data_size,
-        server_cert_type_preference,
-        client_cert_type_preference,
-        raw_public_key_spki,
-        expected_client_raw_public_keys,
         preferred_key_exchange_group,
         rng,
         signer,
@@ -1936,6 +1934,15 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     sc = sc.with_require_ems(require_extended_master_secret);
     if let Some(t) = verification_time {
         sc = sc.with_verification_time(t.clone());
+    }
+    // RFC 7250 raw public keys, forwarded exactly as to the TLS 1.3 engine.
+    sc = sc.with_server_cert_type_preference(server_cert_type_preference.to_vec());
+    sc = sc.with_client_cert_type_preference(client_cert_type_preference.to_vec());
+    if let Some(spki) = raw_public_key_spki {
+        sc = sc.with_raw_public_key_spki(spki.to_vec());
+    }
+    for spki in expected_client_raw_public_keys {
+        sc = sc.add_expected_client_raw_public_key(spki.clone());
     }
     sc.key_log = key_log.clone();
     #[cfg(feature = "tls-legacy")]
@@ -2625,6 +2632,118 @@ mod tests {
             server.negotiated_cipher_suite(),
             client.negotiated_cipher_suite()
         );
+    }
+
+    /// A version-spanning server `Config` whose identity is also offered as
+    /// an RFC 7250 raw public key, plus the bare SPKI clients pin.
+    fn rpk_auto_server_cfg() -> (Config, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"tls-auto-rpk", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let spki = crate::x509::AnyPublicKey::Ecdsa(key.public_key()).to_spki_der();
+        let name = DistinguishedName::common_name("tls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["tls.example"],
+        )
+        .unwrap();
+        let cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3)
+            .identity(
+                alloc::vec![cert.to_der().to_vec()],
+                super::super::config::SigningKey::Ecdsa(key),
+            )
+            .raw_public_key_spki(spki.clone())
+            .server_cert_type_preference(alloc::vec![2, 0])
+            .build();
+        (cfg, spki)
+    }
+
+    /// A client `Config` that accepts only a raw public key pinned to `pin`,
+    /// with X.509 verification off (the pin is its whole authentication),
+    /// offering TLS 1.2 up to `max`.
+    fn pinned_client_cfg(max: ProtocolVersion, pin: Vec<u8>) -> Config {
+        Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_2, max)
+            .server_name("tls.example")
+            .verify_certificates(false)
+            .server_cert_type_preference(alloc::vec![2])
+            .add_expected_raw_public_key(pin)
+            .build()
+    }
+
+    /// Like [`drive_pair`] but surfaces the first failure instead of
+    /// panicking, for handshakes that are expected to be refused.
+    fn try_drive_pair(client: &mut Connection, server: &mut Connection) -> Result<(), Error> {
+        for _ in 0..64 {
+            client.handshake()?;
+            let c = client.pop()?;
+            if !c.is_empty() {
+                server.feed(&c)?;
+            }
+            server.handshake()?;
+            let s = server.pop()?;
+            if !s.is_empty() {
+                client.feed(&s)?;
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                return Ok(());
+            }
+        }
+        panic!("handshake did not complete");
+    }
+
+    /// RFC 7250 through the public `Config`: a client that pins the server's
+    /// raw public key with `verify_certificates(false)` and is capped at
+    /// TLS 1.2 authenticates the server over TLS 1.2 exactly as it would
+    /// over 1.3 — a bare SPKI in the `Certificate`, checked against the pin
+    /// — and a wrong pin is refused instead of silently accepted.
+    #[test]
+    fn pinned_raw_public_key_authenticates_over_tls12() {
+        let (server_cfg, spki) = rpk_auto_server_cfg();
+        let mut client =
+            Connection::client(&pinned_client_cfg(ProtocolVersion::TLSv1_2, spki.clone())).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        try_drive_pair(&mut client, &mut server).unwrap();
+        assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
+        assert_eq!(server.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
+        assert_eq!(client.peer_certificates(), core::slice::from_ref(&spki));
+
+        let mut wrong = spki;
+        let last = wrong.len() - 1;
+        wrong[last] ^= 0x01;
+        let mut client =
+            Connection::client(&pinned_client_cfg(ProtocolVersion::TLSv1_2, wrong)).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        assert!(matches!(
+            try_drive_pair(&mut client, &mut server),
+            Err(Error::BadCertificate)
+        ));
+        assert!(!client.is_handshake_complete());
+    }
+
+    /// The same pinned client, allowed up to TLS 1.3, still negotiates 1.3
+    /// with the same server — wiring RFC 7250 into the 1.2 engine changed
+    /// nothing about version selection or the 1.3 raw-key path.
+    #[test]
+    fn pinned_raw_public_key_still_negotiates_tls13_when_available() {
+        let (server_cfg, spki) = rpk_auto_server_cfg();
+        let mut client =
+            Connection::client(&pinned_client_cfg(ProtocolVersion::TLSv1_3, spki.clone())).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        try_drive_pair(&mut client, &mut server).unwrap();
+        assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+        assert_eq!(server.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+        assert_eq!(client.peer_certificates(), core::slice::from_ref(&spki));
     }
 
     /// A server pinned to TLS 1.3 (`min == max == 1.3`) still refuses a
