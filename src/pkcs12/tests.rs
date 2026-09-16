@@ -221,17 +221,27 @@ fn aggregate_kdf_budget_is_shared_across_bags() {
     let pfx = mac_sealed_pfx(&shrouded_bag_content_info(4, 2000));
     let pw_bmp = password_to_bmp(PASSWORD);
 
-    // A pool that covers only the first two bags: the third is refused, even
-    // though it is perfectly well-formed and would have decrypted.
+    // The MAC KDF (2048 rounds in `mac_sealed_pfx`) draws on the same pool
+    // first. A pool that then covers only the first bag: the second is
+    // refused, even though it is perfectly well-formed and would have
+    // decrypted.
+    let mut budget = Budget {
+        remaining: 5000,
+        ..Budget::new()
+    };
     assert_eq!(
-        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, Budget { remaining: 5000 }).unwrap_err(),
+        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, &mut budget).unwrap_err(),
         Error::WorkBudgetExceeded,
     );
-    // With room for all four, the same archive parses — so the budget is what
-    // rejected it above, not the archive being malformed.
-    let parsed = Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, Budget { remaining: 8000 })
-        .expect("in budget");
+    // With room for the MAC and all four bags, the same archive parses — so
+    // the budget is what rejected it above, not the archive being malformed.
+    let mut budget = Budget {
+        remaining: 2048 + 8000,
+        ..Budget::new()
+    };
+    let parsed = Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, &mut budget).expect("in budget");
     assert_eq!(parsed.keys.len(), 4);
+    assert_eq!(budget.remaining, 0, "exact fit: MAC + four bags");
 }
 
 /// The same budget must span *ContentInfo* boundaries, not restart per
@@ -244,12 +254,20 @@ fn aggregate_kdf_budget_spans_content_infos() {
     }
     let pfx = mac_sealed_pfx(&cis);
     let pw_bmp = password_to_bmp(PASSWORD);
+    let mut budget = Budget {
+        remaining: 5000,
+        ..Budget::new()
+    };
     assert_eq!(
-        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, Budget { remaining: 5000 }).unwrap_err(),
+        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, &mut budget).unwrap_err(),
         Error::WorkBudgetExceeded,
     );
+    let mut budget = Budget {
+        remaining: 2048 + 8000,
+        ..Budget::new()
+    };
     assert_eq!(
-        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, Budget { remaining: 8000 })
+        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, &mut budget)
             .expect("in budget")
             .keys
             .len(),
@@ -311,7 +329,10 @@ fn content_info_count_is_capped() {
 /// and a huge `iterations * passes` product saturates instead of wrapping.
 #[test]
 fn budget_charge_arithmetic() {
-    let mut b = Budget { remaining: 100 };
+    let mut b = Budget {
+        remaining: 100,
+        ..Budget::new()
+    };
     b.charge(40, 2).expect("80 of 100");
     assert_eq!(b.remaining, 20);
     b.charge(20, 1).expect("exact fit");
@@ -319,7 +340,10 @@ fn budget_charge_arithmetic() {
     assert_eq!(b.charge(1, 1).unwrap_err(), Error::WorkBudgetExceeded);
 
     // `passes = 0` still charges one run's worth (never free).
-    let mut b = Budget { remaining: 10 };
+    let mut b = Budget {
+        remaining: 10,
+        ..Budget::new()
+    };
     assert_eq!(b.charge(11, 0).unwrap_err(), Error::WorkBudgetExceeded);
 
     // No wrap on a hostile product.
@@ -386,7 +410,13 @@ fn pbmac1_mac_data(
 }
 
 fn pbmac1_verify(mac: &[u8], content: &[u8], password: &str) -> Result<(), Error> {
-    verify_mac(mac, content, password, &password_to_bmp(password))
+    verify_mac(
+        mac,
+        content,
+        password,
+        &password_to_bmp(password),
+        &mut Budget::new(),
+    )
 }
 
 #[test]
@@ -595,4 +625,141 @@ fn pbes2_gcm_icvlen_default_is_12_and_unsupported() {
     // Explicit 16 passes the parameter checks; the garbage ciphertext then
     // fails authentication instead.
     assert_eq!(run(build(Some(16))), Err(Error::Decryption));
+}
+
+// ---------------------------------------------------------------------------
+// MAC-first ordering and caller-tunable work limits
+// ---------------------------------------------------------------------------
+
+/// A `pkcs8ShroudedKeyBag` whose legacy-PBE AlgorithmIdentifier declares
+/// `iterations` rounds over garbage ciphertext. It is never decryptable, and
+/// must never be *attempted* unless the file MAC verified first.
+fn hostile_legacy_bag(iterations: u32) -> Vec<u8> {
+    let params = encode_sequence(
+        &[
+            encode_octet_string(&[0x5a; 8]),
+            encode_integer(&iterations.to_be_bytes()),
+        ]
+        .concat(),
+    );
+    let alg = encode_sequence(&[oid_tlv(OID_PBE_SHA1_3DES), params].concat());
+    let epki = encode_sequence(&[alg, encode_octet_string(&[0u8; 32])].concat());
+    encode_safe_bag(OID_PKCS8_SHROUDED_KEY_BAG, &epki, None, None)
+}
+
+/// Seals `content_infos` under [`PASSWORD`] with a *one-iteration* SHA-256
+/// MAC, so verifying (and failing) the MAC costs nothing measurable.
+fn cheaply_sealed_pfx(content_infos: &[u8]) -> Vec<u8> {
+    let auth_safe = encode_sequence(content_infos);
+    let auth_safe_ci = encode_data_content_info(&auth_safe);
+    let mac_data = build_mac_data(&auth_safe, &password_to_bmp(PASSWORD), &[0x77; 8], 1);
+    encode_sequence(&[encode_integer(&[0x03]), auth_safe_ci, mac_data].concat())
+}
+
+/// The MAC is checked before any bag KDF runs. A file whose bags declare
+/// the maximum iteration count 64 times over (1.3 billion SHA-1 rounds if
+/// they were touched) but whose MAC fails is rejected after one cheap MAC
+/// derivation — proved two ways: a budget too small for a single bag still
+/// yields `MacMismatch` (a bag charge would have surfaced as
+/// `WorkBudgetExceeded` instead), and the call is fast.
+#[test]
+fn bad_mac_is_rejected_before_any_bag_kdf() {
+    let mut bags = Vec::new();
+    for _ in 0..64 {
+        bags.extend_from_slice(&hostile_legacy_bag(MAX_ITERATIONS));
+    }
+    let pfx = cheaply_sealed_pfx(&encode_data_content_info(&encode_sequence(&bags)));
+
+    let tiny = ParseLimits {
+        max_total_iterations: 16,
+        ..ParseLimits::default()
+    };
+    #[cfg(feature = "std")]
+    let start = std::time::Instant::now();
+    assert_eq!(
+        Pfx::parse_with_limits(&pfx, "wrong", &tiny).unwrap_err(),
+        Error::MacMismatch,
+        "the bags were charged (so run) before the MAC was checked"
+    );
+    assert_eq!(Pfx::parse(&pfx, "wrong").unwrap_err(), Error::MacMismatch);
+    // An empty password retries the MAC under its second encoding — still
+    // no bag work.
+    assert_eq!(Pfx::parse(&pfx, "").unwrap_err(), Error::MacMismatch);
+    // With the right password the first bag *is* charged — and refused
+    // before it runs, under the tiny budget and under the default one
+    // (10 M rounds x 2 derivations is the whole default pool, and the MAC
+    // already took one round of it).
+    assert_eq!(
+        Pfx::parse_with_limits(&pfx, PASSWORD, &tiny).unwrap_err(),
+        Error::WorkBudgetExceeded
+    );
+    assert_eq!(
+        Pfx::parse(&pfx, PASSWORD).unwrap_err(),
+        Error::WorkBudgetExceeded
+    );
+    #[cfg(feature = "std")]
+    assert!(
+        start.elapsed() < core::time::Duration::from_secs(5),
+        "a rejected archive must not burn its declared iterations: {:?}",
+        start.elapsed()
+    );
+}
+
+/// `parse_with_limits` lowers both ceilings below the defaults: the OpenSSL
+/// fixture's 2048-iteration MAC then trips whichever is tighter, and the
+/// defaults still accept it.
+#[test]
+fn parse_limits_lower_the_ceilings() {
+    assert_eq!(ParseLimits::default().max_iterations, MAX_ITERATIONS);
+    assert_eq!(
+        ParseLimits::default().max_total_iterations,
+        MAX_TOTAL_ITERATIONS
+    );
+
+    let strict = ParseLimits {
+        max_iterations: 1000,
+        ..ParseLimits::default()
+    };
+    assert_eq!(
+        Pfx::parse_with_limits(P12_DEFAULT, PASSWORD, &strict).unwrap_err(),
+        Error::BadParameters
+    );
+    let poor = ParseLimits {
+        max_total_iterations: 100,
+        ..ParseLimits::default()
+    };
+    assert_eq!(
+        Pfx::parse_with_limits(P12_DEFAULT, PASSWORD, &poor).unwrap_err(),
+        Error::WorkBudgetExceeded
+    );
+    let parsed = Pfx::parse_with_limits(P12_DEFAULT, PASSWORD, &ParseLimits::default())
+        .expect("defaults accept the fixture");
+    assert_eq!(parsed.keys.len(), 1);
+}
+
+/// The MAC KDF draws on the same aggregate pool as the bag KDFs, and is
+/// charged before it runs.
+#[test]
+fn mac_kdf_is_charged_against_the_budget() {
+    // MAC: 2048 rounds (`mac_sealed_pfx`); one bag: 2000 rounds.
+    let pfx = mac_sealed_pfx(&shrouded_bag_content_info(1, 2000));
+    let pw_bmp = password_to_bmp(PASSWORD);
+    let run = |remaining: u64| {
+        let mut budget = Budget {
+            remaining,
+            ..Budget::new()
+        };
+        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, &mut budget).map(|p| p.keys.len())
+    };
+    assert_eq!(
+        run(2047).unwrap_err(),
+        Error::WorkBudgetExceeded,
+        "MAC refused"
+    );
+    assert_eq!(
+        run(4047).unwrap_err(),
+        Error::WorkBudgetExceeded,
+        "bag refused"
+    );
+    assert_eq!(run(4048).expect("exact fit"), 1);
 }

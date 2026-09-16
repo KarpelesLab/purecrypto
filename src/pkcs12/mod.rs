@@ -31,6 +31,25 @@
 //! returns [`Error::MacMismatch`] for a wrong password without leaking
 //! plaintext. Password-derived key material (BMP password, derived keys, the
 //! recovered PKCS#8 DER) is zeroed on drop of the returned [`Parsed`].
+//!
+//! # Work limits
+//!
+//! Every iteration count in the file is attacker-controlled, so the parser
+//! bounds the password-derivation work it will do. The `MacData` is always
+//! checked *first* — RFC 7292 computes the MAC over the `AuthenticatedSafe`
+//! content as stored, so no bag needs decrypting to verify it — which means a
+//! file with a wrong MAC costs at most one MAC KDF (two for an empty
+//! password, which has two encodings), never a bag KDF. On top of that:
+//!
+//! * no single iteration count may exceed [`ParseLimits::max_iterations`]
+//!   (default 10 000 000), or the archive is [`Error::BadParameters`]; and
+//! * every derivation — the MAC KDF included — charges its cost against an
+//!   aggregate [`ParseLimits::max_total_iterations`] budget (default
+//!   20 000 000) *before* it runs, failing with
+//!   [`Error::WorkBudgetExceeded`] once the pool is spent.
+//!
+//! [`Pfx::parse`] uses the defaults; [`Pfx::parse_with_limits`] lets a caller
+//! that handles untrusted uploads lower both ceilings.
 
 #![cfg(feature = "pkcs12")]
 
@@ -134,18 +153,73 @@ const MAX_CONTENT_INFOS: usize = 256;
 /// Cap on the number of `SafeBag`s in one `SafeContents`.
 const MAX_SAFE_BAGS: usize = 256;
 
-/// The remaining aggregate KDF work allowed while parsing one archive.
+/// Ceilings on the password-derivation work one [`Pfx::parse_with_limits`]
+/// call may spend on an archive. [`ParseLimits::default`] is what
+/// [`Pfx::parse`] uses; lower either field for archives from untrusted
+/// sources. Both apply to every derivation the file asks for — the MAC KDF,
+/// PBKDF2 inside PBES2 envelopes, and the legacy PKCS#12 PBE — and are
+/// enforced *before* the derivation runs, so a rejected archive costs
+/// nothing beyond DER parsing and (for a total-budget rejection) whatever
+/// earlier derivations already succeeded.
+///
+/// The MAC is verified before any bag is decrypted, so a wrong password or a
+/// tampered file is rejected after at most one MAC KDF (two for an empty
+/// password) whatever the bags declare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParseLimits {
+    /// Ceiling on any single iteration count in the file. An archive
+    /// declaring more anywhere is [`Error::BadParameters`]. Default
+    /// 10 000 000 (`MAX_ITERATIONS`); OpenSSL emits 2 048 – 600 000.
+    pub max_iterations: u32,
+    /// Aggregate budget for the whole parse. Every derivation charges
+    /// `iterations × output blocks` against it before running, and the parse
+    /// fails with [`Error::WorkBudgetExceeded`] once the pool is spent — so
+    /// total CPU is bounded however many encrypted bags the file packs.
+    /// Default 20 000 000 (`MAX_TOTAL_ITERATIONS`).
+    pub max_total_iterations: u64,
+}
+
+impl Default for ParseLimits {
+    fn default() -> Self {
+        ParseLimits {
+            max_iterations: MAX_ITERATIONS,
+            max_total_iterations: MAX_TOTAL_ITERATIONS,
+        }
+    }
+}
+
+/// The remaining aggregate KDF work allowed while parsing one archive, plus
+/// the per-derivation ceiling.
 ///
 /// Threaded by `&mut` through the whole parse so that every password-based
-/// derivation draws from the same pool; see [`MAX_TOTAL_ITERATIONS`].
+/// derivation draws from the same pool; see [`ParseLimits`].
 struct Budget {
     remaining: u64,
+    max_iterations: u32,
 }
 
 impl Budget {
+    /// The default pool, for tests that drive the internals directly.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::from_limits(&ParseLimits::default())
+    }
+
+    fn from_limits(limits: &ParseLimits) -> Self {
         Budget {
-            remaining: MAX_TOTAL_ITERATIONS,
+            remaining: limits.max_total_iterations,
+            max_iterations: limits.max_iterations,
+        }
+    }
+
+    /// Screens one iteration count against the accepted band
+    /// (`MIN_ITERATIONS..=max_iterations`), before the derivation runs.
+    fn check_iterations(&self, iterations: u32) -> Result<(), Error> {
+        if (MIN_ITERATIONS..=self.max_iterations).contains(&iterations) {
+            Ok(())
+        } else {
+            Err(Error::BadParameters)
         }
     }
 
@@ -276,29 +350,38 @@ impl Pfx {
     /// PBE-encrypted bags. OpenSSL's `PKCS12_parse` does the same. A
     /// non-empty password has one encoding and is never retried.
     pub fn parse(der: &[u8], password: &str) -> Result<Parsed, Error> {
+        Self::parse_with_limits(der, password, &ParseLimits::default())
+    }
+
+    /// [`Pfx::parse`] with caller-chosen ceilings on the password-derivation
+    /// work the archive may demand (see [`ParseLimits`] and the module-level
+    /// *Work limits* section). One budget spans the whole call, including
+    /// the empty-password retry.
+    pub fn parse_with_limits(
+        der: &[u8],
+        password: &str,
+        limits: &ParseLimits,
+    ) -> Result<Parsed, Error> {
+        let mut budget = Budget::from_limits(limits);
         let mut pw_bmp = password_to_bmp(password);
-        let mut result = Self::parse_inner(der, password, &pw_bmp);
+        let mut result = Self::parse_budgeted(der, password, &pw_bmp, &mut budget);
         // Wipe the BMP password copy regardless of outcome.
         crate::zeroize::Zeroize::zeroize(&mut pw_bmp);
         if password.is_empty() && matches!(result, Err(Error::MacMismatch)) {
-            result = Self::parse_inner(der, password, &[]);
+            result = Self::parse_budgeted(der, password, &[], &mut budget);
         }
         result
     }
 
-    fn parse_inner(der: &[u8], password: &str, pw_bmp: &[u8]) -> Result<Parsed, Error> {
-        Self::parse_budgeted(der, password, pw_bmp, Budget::new())
-    }
-
-    /// The body of [`Pfx::parse`], with the aggregate KDF-work budget supplied
-    /// by the caller. Tests use a deliberately tiny budget so the accounting
-    /// can be exercised without actually burning [`MAX_TOTAL_ITERATIONS`]
-    /// rounds of PBKDF2.
+    /// The body of [`Pfx::parse_with_limits`], drawing on the caller's
+    /// budget. Tests use a deliberately tiny pool so the accounting can be
+    /// exercised without actually burning [`MAX_TOTAL_ITERATIONS`] rounds of
+    /// PBKDF2.
     fn parse_budgeted(
         der: &[u8],
         password: &str,
         pw_bmp: &[u8],
-        mut budget: Budget,
+        budget: &mut Budget,
     ) -> Result<Parsed, Error> {
         // PFX ::= SEQUENCE { version INTEGER (3), authSafe ContentInfo,
         //                    macData MacData OPTIONAL }
@@ -324,8 +407,11 @@ impl Pfx {
         pfx.finish()?;
 
         // ---- MAC verification (the gate) ----
+        // Runs before any bag is looked at: the MAC covers the stored
+        // AuthenticatedSafe bytes, so a bad password / tampered file is
+        // refused after at most this one derivation.
         let mac = mac_data.ok_or(Error::MissingMac)?;
-        verify_mac(mac, auth_safe_data, password, pw_bmp)?;
+        verify_mac(mac, auth_safe_data, password, pw_bmp, budget)?;
 
         // ---- Walk the AuthenticatedSafe ----
         // AuthenticatedSafe ::= SEQUENCE OF ContentInfo
@@ -356,15 +442,15 @@ impl Pfx {
                 let body = ctx.read_tlv(tag::context(0))?;
                 let mut octet = Reader::new(body);
                 let safe_contents = octet.read_octet_string()?;
-                parse_safe_contents(safe_contents, pw_bmp, password, &mut out, &mut budget)?;
+                parse_safe_contents(safe_contents, pw_bmp, password, &mut out, budget)?;
             } else if oid == OID_ENCRYPTED_DATA {
                 // [0] EXPLICIT EncryptedData ::= SEQUENCE { version,
                 //   EncryptedContentInfo }
                 let inner = ci.read_element()?;
                 let mut ctx = Reader::new(inner);
                 let body = ctx.read_tlv(tag::context(0))?;
-                let plain = decrypt_encrypted_data(body, pw_bmp, password, &mut budget)?;
-                parse_safe_contents(&plain, pw_bmp, password, &mut out, &mut budget)?;
+                let plain = decrypt_encrypted_data(body, pw_bmp, password, budget)?;
+                parse_safe_contents(&plain, pw_bmp, password, &mut out, budget)?;
             } else {
                 return Err(Error::UnsupportedAlgorithm);
             }
@@ -668,9 +754,7 @@ fn decrypt_pbe_blob(
         let mut params = alg_seq.read_sequence()?;
         let salt = params.read_octet_string()?.to_vec();
         let iterations = read_iterations(&mut params)?;
-        if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
-            return Err(Error::BadParameters);
-        }
+        budget.check_iterations(iterations)?;
         // Two RFC 7292 §B derivations run below (the 3DES key and the IV).
         budget.charge(iterations, 2)?;
         return pbe_sha1_3des_decrypt(pw_bmp, &salt, iterations, ciphertext);
@@ -773,13 +857,21 @@ fn ct_nonzero_u8(x: u8) -> u8 {
 // ---- MAC ----------------------------------------------------------------
 
 /// Verifies the file MAC. `mac` is the raw DER of the `MacData` element,
-/// `content` is the AuthenticatedSafe bytes the MAC is computed over.
+/// `content` is the AuthenticatedSafe bytes the MAC is computed over. The
+/// MAC KDF is subject to the same per-run ceiling and aggregate budget as
+/// every other derivation, charged before it runs.
 ///
 /// `MacData ::= SEQUENCE { mac DigestInfo, macSalt OCTET STRING,
 ///                         iterations INTEGER DEFAULT 1 }`
 /// `DigestInfo ::= SEQUENCE { digestAlgorithm AlgorithmIdentifier,
 ///                            digest OCTET STRING }`
-fn verify_mac(mac: &[u8], content: &[u8], password: &str, pw_bmp: &[u8]) -> Result<(), Error> {
+fn verify_mac(
+    mac: &[u8],
+    content: &[u8],
+    password: &str,
+    pw_bmp: &[u8],
+    budget: &mut Budget,
+) -> Result<(), Error> {
     let mut reader = Reader::new(mac);
     let mut md = reader.read_sequence()?;
 
@@ -799,8 +891,9 @@ fn verify_mac(mac: &[u8], content: &[u8], password: &str, pw_bmp: &[u8]) -> Resu
     md.finish().ok();
     // The MAC iteration count is attacker-controlled; cap it so a crafted
     // MacData can't demand billions of hash iterations before the (failing)
-    // comparison (a decryption-as-DoS vector).
-    if iterations > MAX_ITERATIONS {
+    // comparison (a decryption-as-DoS vector). `DEFAULT 1` means 0 is
+    // tolerated here, unlike the bag KDFs.
+    if iterations > budget.max_iterations {
         return Err(Error::BadParameters);
     }
 
@@ -808,13 +901,16 @@ fn verify_mac(mac: &[u8], content: &[u8], password: &str, pw_bmp: &[u8]) -> Resu
 
     // Compute the expected tag for the password and compare in constant time.
     let computed = if oid == OID_SHA1 || oid == OID_HMAC_SHA1 {
+        // One RFC 7292 §B derivation (the MAC key fits a single PRF block).
+        budget.charge(iterations, 1)?;
         sha_based_hmac(PkcsHash::Sha1, pw_bmp, &salt, iterations, content)
     } else if oid == OID_SHA256 || oid == OID_HMAC_SHA256 {
+        budget.charge(iterations, 1)?;
         sha_based_hmac(PkcsHash::Sha256, pw_bmp, &salt, iterations, content)
     } else if oid == OID_PBMAC1 {
         // RFC 9579: the digestAlgorithm SEQUENCE carries PBKDF2 + an inner
         // HMAC AlgorithmIdentifier. Reuse the remaining `alg` reader.
-        pbmac1_compute(&mut alg, password, content)?
+        pbmac1_compute(&mut alg, password, content, budget)?
     } else {
         return Err(Error::UnsupportedAlgorithm);
     };
@@ -856,7 +952,12 @@ fn sha_based_hmac(
 /// Computes a PBMAC1 (RFC 9579) tag. `alg` is positioned just after the
 /// PBMAC1 OID, at the `PBMAC1-params ::= SEQUENCE { keyDerivationFunc,
 /// messageAuthScheme }`. Only PBKDF2(HMAC-SHA-256) + HMAC-SHA-256 is wired.
-fn pbmac1_compute(alg: &mut Reader<'_>, password: &str, content: &[u8]) -> Result<Vec<u8>, Error> {
+fn pbmac1_compute(
+    alg: &mut Reader<'_>,
+    password: &str,
+    content: &[u8],
+    budget: &mut Budget,
+) -> Result<Vec<u8>, Error> {
     let mut params = alg.read_sequence()?;
     // keyDerivationFunc: SEQUENCE { OID id-PBKDF2, PBKDF2-params }.
     let mut kdf = params.read_sequence()?;
@@ -903,9 +1004,9 @@ fn pbmac1_compute(alg: &mut Reader<'_>, password: &str, content: &[u8]) -> Resul
         return Err(Error::UnsupportedAlgorithm);
     }
 
-    if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
-        return Err(Error::BadParameters);
-    }
+    budget.check_iterations(iterations)?;
+    // PBKDF2 runs `iterations` rounds per 32-byte HMAC-SHA-256 output block.
+    budget.charge(iterations, key_len.div_ceil(32) as u64)?;
     let mut key = vec![0u8; key_len];
     crate::kdf::pbkdf2::<Sha256>(password.as_bytes(), &salt, iterations, &mut key);
     let tag = Hmac::<Sha256>::mac(&key, content);

@@ -29,11 +29,12 @@ const OID_AES256_CBC: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 1, 42];
 const OID_AES128_GCM: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 1, 6];
 const OID_AES256_GCM: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 1, 46];
 
-/// Iteration band accepted for PKCS#12 PBES2 content. The file MAC is the
+/// Iteration floor accepted for PKCS#12 PBES2 content. The file MAC is the
 /// real integrity gate; 1024 is below OpenSSL's 2048 default but rejects
-/// pathological values, and the ceiling bounds a hostile file's CPU cost.
+/// pathological values. The ceiling that bounds a hostile file's CPU cost is
+/// the caller's [`super::ParseLimits::max_iterations`], applied through the
+/// shared [`super::Budget`] together with the aggregate work budget.
 const MIN_ITER: u32 = 1024;
-const MAX_ITER: u32 = 10_000_000;
 
 enum Prf {
     Sha1,
@@ -86,9 +87,10 @@ pub(super) fn decrypt(
     let mut p = kdf.read_sequence()?;
     let salt = p.read_octet_string()?.to_vec();
     let iterations = read_u32(p.read_integer_bytes()?)?;
-    if !(MIN_ITER..=MAX_ITER).contains(&iterations) {
+    if iterations < MIN_ITER {
         return Err(Error::BadParameters);
     }
+    budget.check_iterations(iterations)?;
     // Optional keyLength INTEGER.
     let mut explicit_key_len: Option<usize> = None;
     if let Some(t) = p.peek_tag()
