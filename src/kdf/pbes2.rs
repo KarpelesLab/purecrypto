@@ -425,15 +425,21 @@ fn parse_cipher_algid(r: &mut Reader<'_>) -> Result<(CipherChoice, Vec<u8>), Err
             .read_octet_string()
             .map_err(|_| Error::BadEncoding)?
             .to_vec();
-        if let Some(tag) = gcm.peek_tag()
+        // RFC 5084 §3.2: an absent aes-ICVlen means the DEFAULT of 12, not
+        // the 16 we require. Treating absence as "fine" would split a
+        // 12-byte-tag envelope at the wrong offset and misreport a mere
+        // unsupported parameter as a wrong password / tampered blob.
+        let icv = if let Some(tag) = gcm.peek_tag()
             && tag == crate::der::tag::INTEGER
         {
-            let icv = integer_to_u32(gcm.read_integer_bytes().map_err(|_| Error::BadEncoding)?)?;
-            // We only support a 16-byte tag (RFC 5084 strongly recommends
-            // 16; anything else opens us to truncation attacks).
-            if icv != 16 {
-                return Err(Error::UnsupportedAlgorithm);
-            }
+            integer_to_u32(gcm.read_integer_bytes().map_err(|_| Error::BadEncoding)?)?
+        } else {
+            12
+        };
+        // We only support a 16-byte tag (RFC 5084 strongly recommends 16;
+        // anything else opens us to truncation attacks).
+        if icv != 16 {
+            return Err(Error::UnsupportedAlgorithm);
         }
         gcm.finish().map_err(|_| Error::BadEncoding)?;
         Ok((CipherChoice::Aes256Gcm, nonce))
@@ -879,6 +885,56 @@ mod tests {
         let outer_algid = encode_sequence(&[oid_tlv(OID_PBES2), pbes2_params].concat());
         let blob = encode_sequence(&[outer_algid, encode_octet_string(&ct)].concat());
         assert_eq!(decrypt(&blob, b"x"), Err(Error::ExcessiveKdfParameters));
+    }
+
+    /// RFC 5084 §3.2: `GCMParameters.aes-ICVlen` has DEFAULT 12, so an
+    /// envelope that omits it (or says 12 explicitly) carries a 12-byte
+    /// tag we do not support. It must be refused as `UnsupportedAlgorithm`
+    /// up front, not split at a 16-byte tag boundary and then misreported
+    /// as a wrong-password `Decryption` failure. An explicit 16 is the
+    /// supported form and gets past the parameter checks.
+    #[test]
+    fn gcm_icvlen_default_is_12_and_unsupported() {
+        let build = |icvlen: Option<u32>| {
+            let salt = [0u8; 16];
+            let prf = encode_sequence(
+                &[oid_tlv(OID_HMAC_WITH_SHA256), crate::der::encode_null()].concat(),
+            );
+            let kdf_params = encode_sequence(
+                &[
+                    encode_octet_string(&salt),
+                    encode_integer(&20_000u32.to_be_bytes()),
+                    prf,
+                ]
+                .concat(),
+            );
+            let kdf_algid = encode_sequence(&[oid_tlv(OID_PBKDF2), kdf_params].concat());
+            let nonce = [0u8; 12];
+            let mut gcm_params = encode_octet_string(&nonce);
+            if let Some(icv) = icvlen {
+                gcm_params.extend_from_slice(&encode_integer(&icv.to_be_bytes()));
+            }
+            let cipher_algid =
+                encode_sequence(&[oid_tlv(OID_AES256_GCM), encode_sequence(&gcm_params)].concat());
+            let pbes2_params = encode_sequence(&[kdf_algid, cipher_algid].concat());
+            let outer_algid = encode_sequence(&[oid_tlv(OID_PBES2), pbes2_params].concat());
+            // 16 bytes of bogus ciphertext ‖ tag: enough to reach the AEAD.
+            let ct = alloc::vec![0u8; 32];
+            encode_sequence(&[outer_algid, encode_octet_string(&ct)].concat())
+        };
+        assert_eq!(
+            decrypt(&build(None), b"x"),
+            Err(Error::UnsupportedAlgorithm),
+            "absent aes-ICVlen is DEFAULT 12"
+        );
+        assert_eq!(
+            decrypt(&build(Some(12)), b"x"),
+            Err(Error::UnsupportedAlgorithm),
+            "explicit 12-byte ICV"
+        );
+        // Explicit 16 passes the parameter checks; the garbage ciphertext
+        // then fails authentication instead.
+        assert_eq!(decrypt(&build(Some(16)), b"x"), Err(Error::Decryption));
     }
 
     /// Handcraft an EncryptedPrivateKeyInfo with HMAC-SHA-1 PRF — we
