@@ -832,6 +832,11 @@ pub struct QuicConnection {
     /// and no application data may be written to it in the meantime
     /// (0.5-RTT, RFC 9001 §4.6.1).
     require_client_auth: bool,
+    /// Server-only — set once the first *authenticated* client Initial has
+    /// installed the Initial keys and the CID pair. Distinguishes "never
+    /// keyed" from "keyed, then discarded on handshake completion" (RFC 9001
+    /// §4.9.1) so a later Initial can never be mistaken for the first one.
+    initial_keys_installed: bool,
 }
 
 enum EngineSide {
@@ -1031,6 +1036,7 @@ impl QuicConnection {
             pending_error_code: None,
             reset_token_pinned: false,
             require_client_auth: false,
+            initial_keys_installed: false,
         };
 
         // RFC 9001 §4.6.1 — with 0-RTT in play the client must apply the
@@ -1162,6 +1168,7 @@ impl QuicConnection {
             pending_error_code: None,
             reset_token_pinned,
             require_client_auth,
+            initial_keys_installed: false,
         })
     }
 
@@ -4229,6 +4236,7 @@ impl QuicConnection {
         };
         set_cids_from_first_initial(&mut self.endpoint, peer_scid, our_scid);
         install_initial_keys(&mut self.endpoint, dcid);
+        self.initial_keys_installed = true;
         // Seed the local CID pool with our SCID at sequence 0, carrying the
         // exact stateless-reset token we advertised in our transport
         // parameters (RFC 9000 §10.3.1) so server and client agree on it.
@@ -4393,8 +4401,21 @@ impl QuicConnection {
         // single forged Initial from any source address pin this connection's
         // Initial keys, CIDs and ODCID to an attacker-chosen DCID, which
         // black-holes the genuine client's handshake.
+        //
+        // Only a connection that has never keyed its Initial level is waiting
+        // for a first Initial. Once the handshake completes the server
+        // *discards* its Initial keys (`discard_handshake_levels`), so `rx`
+        // is `None` again — but that is a finished level, not an unkeyed one.
+        // Without the `initial_keys_installed` guard, any observer who has
+        // seen this connection's CID on the wire could send a ≥1200-byte
+        // Initial addressed to it: Initial keys derive from the DCID alone
+        // (RFC 9001 §5.2), so it would authenticate, and `commit_first_initial`
+        // would re-pin the CID pair to the forger's SCID, rewrite the ODCID and
+        // re-install Initial keys — killing an established connection with one
+        // packet. RFC 9001 §4.9.1: once discarded, Initial packets are dropped.
         let tentative_first_initial = self.role == Role::Server
             && level == Level::Initial
+            && !self.initial_keys_installed
             && self.endpoint.crypto.at(Level::Initial).rx.is_none();
         let tentative_rx_keys = if tentative_first_initial {
             // Reject a malformed SCID now, before spending an AEAD open on it.
@@ -12499,6 +12520,82 @@ mod tests {
         );
         drive_until_complete(&mut client, &mut server, 8);
         assert!(client.is_handshake_complete() && server.is_handshake_complete());
+    }
+
+    /// Seals `plaintext` as a v1 Initial addressed to `dcid`, under the keys
+    /// RFC 9001 §5.2 derives from that DCID alone — exactly what any observer
+    /// of the connection's CIDs can forge.
+    fn seal_forged_initial(dcid: &[u8], scid: &[u8], plaintext: &mut [u8]) -> Vec<u8> {
+        use crate::quic::crypto::{aead_seal, derive_dir_keys, derive_initial_secrets};
+        use crate::quic::pkt::{apply_header_protection, build_long_header};
+        let (client_secret, _) = derive_initial_secrets(dcid);
+        let keys = derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret);
+        let (pn, pn_len) = (0u64, 1u8);
+        let length_field = pn_len as u64 + plaintext.len() as u64 + 16;
+        let (mut pkt, pn_offset) = build_long_header(
+            LongType::Initial,
+            QUIC_V1,
+            dcid,
+            scid,
+            &[],
+            pn,
+            pn_len,
+            length_field,
+        );
+        let tag = aead_seal(&keys, pn, &pkt, plaintext);
+        pkt.extend_from_slice(plaintext);
+        pkt.extend_from_slice(&tag);
+        let sample: [u8; 16] = pkt[pn_offset + 4..pn_offset + 20].try_into().unwrap();
+        let mask = keys.hp.mask(&sample).unwrap();
+        apply_header_protection(&mut pkt, pn_offset, pn_len, &mask, true);
+        pkt
+    }
+
+    /// RFC 9001 §4.9.1 — once the server has discarded its Initial keys, an
+    /// Initial packet is dropped, full stop. The "first Initial" path used to
+    /// re-arm on `rx.is_none()`, which is also true *after* the discard: a
+    /// forged Initial addressed to the connection's own CID then authenticated
+    /// (Initial keys derive from the DCID) and re-pinned the CID pair, the
+    /// ODCID and the Initial keys, killing an established connection.
+    #[test]
+    fn established_server_ignores_a_forged_initial_for_its_own_cid() {
+        let (mut client, mut server) = loopback_pair();
+        drive_until_complete(&mut client, &mut server, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut client, &mut server);
+        }
+        assert!(
+            server.endpoint.crypto.at(Level::Initial).rx.is_none(),
+            "precondition: server discarded its Initial keys on completion"
+        );
+        let peer_before = server.endpoint.cids.peer;
+        let odcid_before = server.original_dcid;
+        // PING plus enough PADDING to clear the §14.1 datagram floor.
+        let mut plain = alloc::vec![0x01u8];
+        plain.resize(MIN_INITIAL_DATAGRAM, 0x00);
+        let forged = seal_forged_initial(
+            server.endpoint.cids.local.as_slice(),
+            &[0xEE; 8],
+            &mut plain,
+        );
+        assert!(forged.len() >= MIN_INITIAL_DATAGRAM);
+        server.feed_datagram(&forged).expect("forgery is dropped");
+        assert_eq!(server.endpoint.cids.peer, peer_before, "peer CID re-pinned");
+        assert_eq!(server.original_dcid, odcid_before, "ODCID rewritten");
+        assert!(
+            server.endpoint.crypto.at(Level::Initial).rx.is_none(),
+            "Initial keys must stay discarded"
+        );
+        assert!(!server.is_closed() && !server.is_closing() && !server.is_draining());
+        // The connection keeps working end to end.
+        let sid = client.open_bidi().expect("open");
+        client.write(sid, b"still-alive").expect("write");
+        for _ in 0..4 {
+            let _ = pump(&mut client, &mut server);
+        }
+        let mut buf = [0u8; 32];
+        let (n, _) = server.read(sid, &mut buf).expect("server read");
+        assert_eq!(&buf[..n], b"still-alive");
     }
 
     /// A server that REQUIRES a client certificate, against a client that has
