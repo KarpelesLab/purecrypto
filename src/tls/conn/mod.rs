@@ -1595,6 +1595,69 @@ mod loopback_tests {
         );
     }
 
+    /// RFC 7250 §4.2: a server that does not implement raw public keys
+    /// ignores the client's `server_certificate_type` offer and sends an
+    /// EncryptedExtensions without it — which means X.509. A client that
+    /// offered *only* RawPublicKey never offered X.509, so it must abort
+    /// (`handshake_failure`) instead of assuming X.509 and trying to read
+    /// the server's leaf as a certificate. Loopback against a server that
+    /// negotiates RPK but is told to stay silent about it.
+    #[test]
+    fn client_offering_only_raw_public_key_aborts_when_server_is_silent() {
+        use crate::tls::codec::cert_type;
+        use crate::x509::AnyPublicKey;
+
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"rpk-silent-key", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut keygen_rng);
+        let spki = AnyPublicKey::Ed25519(key.public_key()).to_spki_der();
+        let server_config = ServerConfig::with_ed25519(alloc::vec::Vec::new(), key)
+            .with_raw_public_key_spki(spki.clone())
+            .with_server_cert_type_preference(alloc::vec![
+                cert_type::RAW_PUBLIC_KEY,
+                cert_type::X509,
+            ]);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"rpk-silent-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rpk-silent-server", b"nonce", &[]);
+        let client_cfg = ClientConfig::new(RootCertStore::new())
+            .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY])
+            .add_expected_raw_public_key(spki);
+        let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng).unwrap();
+        let mut server = ServerConnection::new(server_config, srng);
+        server.suppress_server_cert_type_echo_for_test();
+
+        // CH → server flight (SH, EE without server_certificate_type, ...).
+        let ch = client.write_tls();
+        server.read_tls(&ch);
+        server.process_new_packets().unwrap();
+        let flight = server.write_tls();
+        client.read_tls(&flight);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(
+            matches!(err, crate::tls::Error::HandshakeFailure),
+            "silent server + RPK-only offer must be handshake_failure, got {err:?}"
+        );
+        // The engine is closed by the failure: never `Connected`, so no
+        // application data is accepted.
+        assert!(
+            matches!(
+                client.send_application_data(b"x"),
+                Err(crate::tls::Error::InappropriateState)
+            ),
+            "the failed client accepts no application data"
+        );
+        // The server sees the fatal handshake_failure alert.
+        let alert = client.write_tls();
+        assert!(!alert.is_empty(), "the client tells the server why");
+        server.read_tls(&alert);
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(crate::tls::Error::AlertReceived(
+                crate::tls::AlertDescription::HandshakeFailure
+            ))
+        ));
+    }
+
     /// If the client only offers RawPublicKey but the server has no SPKI
     /// configured, negotiation cannot pick a usable type and the server
     /// terminates with `handshake_failure`.

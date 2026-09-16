@@ -3272,6 +3272,22 @@ impl ClientConnection {
         if unknown_extension {
             return Err(Error::UnsupportedExtension);
         }
+        // RFC 7250 §4.2: a server that omits `server_certificate_type` from
+        // EncryptedExtensions has selected X.509 (the absence *is* the
+        // X.509 selection; `negotiated_server_cert_type` still holds its
+        // X.509 default). If we offered only RawPublicKey the server is
+        // about to authenticate with a certificate type we never offered
+        // — fail closed rather than try to read its leaf as X.509. Mirrors
+        // the TLS 1.2 client. (An explicit selection outside our offer was
+        // already `illegal_parameter` in the walk above.)
+        if self.negotiated_server_cert_type == crate::tls::codec::cert_type::X509
+            && !self
+                .config
+                .server_cert_type_preference
+                .contains(&crate::tls::codec::cert_type::X509)
+        {
+            return Err(Error::HandshakeFailure);
+        }
 
         // ECH rejection (draft §7.1 / §6.1.6): the client attempted real
         // ECH (we have `ech_state`), the SH did not signal accept
@@ -4456,6 +4472,64 @@ mod tests {
         client
             .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw_ok)
             .unwrap();
+    }
+
+    /// RFC 7250 §4.2: an EncryptedExtensions without
+    /// `server_certificate_type` selects X.509. A client that offered only
+    /// RawPublicKey must fail closed (`handshake_failure`); one that also
+    /// offered X.509 falls back to it; an explicit RawPublicKey selection
+    /// is accepted either way.
+    #[test]
+    fn client_offering_only_raw_public_key_rejects_ee_without_selection() {
+        use crate::tls::codec::cert_type;
+        // Empty EE: extensions_len = 0.
+        let empty_ee = alloc::vec![hs_type::ENCRYPTED_EXTENSIONS, 0x00, 0x00, 0x02, 0x00, 0x00];
+        // EE selecting RawPublicKey: server_certificate_type(0x0014), len 1, 2.
+        let rpk_ee = alloc::vec![
+            hs_type::ENCRYPTED_EXTENSIONS,
+            0x00,
+            0x00,
+            0x07,
+            0x00,
+            0x05,
+            0x00,
+            0x14,
+            0x00,
+            0x01,
+            cert_type::RAW_PUBLIC_KEY,
+        ];
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"ee-rpk-only", b"nonce", &[]);
+        let cfg = ClientConfig::new(RootCertStore::new())
+            .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
+        let mut client = ClientConnection::new(cfg, "h", &mut rng).unwrap();
+        assert!(matches!(
+            client.on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &empty_ee),
+            Err(Error::HandshakeFailure)
+        ));
+
+        let cfg = ClientConfig::new(RootCertStore::new())
+            .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
+        let mut client = ClientConnection::new(cfg, "h", &mut rng).unwrap();
+        client
+            .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &rpk_ee)
+            .unwrap();
+        assert_eq!(
+            client.negotiated_server_cert_type,
+            cert_type::RAW_PUBLIC_KEY
+        );
+
+        // Offered [RawPublicKey, X509]: silence means X.509, which we offered.
+        let cfg =
+            ClientConfig::new(RootCertStore::new()).with_server_cert_type_preference(alloc::vec![
+                cert_type::RAW_PUBLIC_KEY,
+                cert_type::X509
+            ]);
+        let mut client = ClientConnection::new(cfg, "h", &mut rng).unwrap();
+        client
+            .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &empty_ee)
+            .unwrap();
+        assert_eq!(client.negotiated_server_cert_type, cert_type::X509);
     }
 
     /// TLS-CORE-6 — RFC 8446 §4.2.10: a server MUST NOT accept early data

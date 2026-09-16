@@ -861,6 +861,13 @@ pub struct ServerConnection<R: RngCore> {
     /// client (see [`MAX_CONSECUTIVE_KEY_UPDATES`]); reset by any other
     /// record under the key an update retires.
     consecutive_key_updates: u32,
+    /// Test-only: leave `server_certificate_type` out of EncryptedExtensions
+    /// even though the client offered it — the behaviour of a server that
+    /// does not implement RFC 7250 and ignores the extension. Lets a
+    /// loopback test check that a client which offered only RawPublicKey
+    /// fails closed (RFC 7250 §4.2: absence means X.509).
+    #[cfg(test)]
+    suppress_server_cert_type_echo: bool,
     /// RFC 8446 §4.2.10: when 0-RTT is accepted, this tracks the remaining
     /// plaintext byte budget the client may consume under the early-data
     /// key. Initialized to `config.max_early_data_size` on 0-RTT acceptance;
@@ -1050,6 +1057,8 @@ impl<R: RngCore> ServerConnection<R> {
             ks: None,
             early_data_accepted: false,
             consecutive_key_updates: 0,
+            #[cfg(test)]
+            suppress_server_cert_type_echo: false,
             early_data_remaining: None,
             deferred_chts: None,
             client_cert_chain: Vec::new(),
@@ -1391,6 +1400,14 @@ impl<R: RngCore> ServerConnection<R> {
     #[cfg(test)]
     pub(crate) fn emit_unfragmented_application_data_for_test(&mut self, data: &[u8]) {
         self.core.emit_unfragmented_application_data_for_test(data);
+    }
+
+    /// Test hook: behave like a server that does not implement RFC 7250 —
+    /// negotiate as usual but never echo `server_certificate_type` in
+    /// EncryptedExtensions. See `suppress_server_cert_type_echo`.
+    #[cfg(test)]
+    pub(crate) fn suppress_server_cert_type_echo_for_test(&mut self) {
+        self.suppress_server_cert_type_echo = true;
     }
 
     /// Test hook: fast-forward the write-side record sequence counter.
@@ -2785,7 +2802,12 @@ impl<R: RngCore> ServerConnection<R> {
                 // client_certificate_type selection back if-and-only-if the
                 // client offered the extension. Echoing X.509 explicitly is
                 // legal and removes ambiguity.
-                if self.peer_offered_server_cert_type {
+                #[cfg(test)]
+                let echo_server_cert_type =
+                    self.peer_offered_server_cert_type && !self.suppress_server_cert_type_echo;
+                #[cfg(not(test))]
+                let echo_server_cert_type = self.peer_offered_server_cert_type;
+                if echo_server_cert_type {
                     let (ty, body) = ext::cert_type_selection(
                         ExtensionType::SERVER_CERTIFICATE_TYPE,
                         self.negotiated_server_cert_type,
