@@ -209,7 +209,7 @@ struct Hosted {
 /// connection's own state has been dropped.
 pub struct QuicServer {
     make_config: Box<dyn FnMut() -> Result<QuicConfig, Error>>,
-    reset_key: [u8; 32],
+    reset_key: crate::tls::Secret32,
     /// Hard cap on hosted connections. An unrecognised Initial arriving while
     /// the table is full is dropped rather than accepted (H-2).
     max_connections: usize,
@@ -250,19 +250,22 @@ impl QuicServer {
     {
         let mut reset_key = [0u8; 32];
         OsRng.fill_bytes(&mut reset_key);
-        Self::with_reset_key(reset_key, make_config)
+        Self::with_reset_key(crate::tls::Secret32::from(reset_key), make_config)
     }
 
     /// Like [`Self::new`] but with an explicit stateless-reset key (RFC 9000
     /// §10.3.1). Persist the key across restarts so a restarted server can
     /// still reset connections established by its previous instance.
-    pub fn with_reset_key<F>(reset_key: [u8; 32], make_config: F) -> Result<Self, Error>
+    pub fn with_reset_key<F>(
+        reset_key: impl Into<crate::tls::Secret32>,
+        make_config: F,
+    ) -> Result<Self, Error>
     where
         F: FnMut() -> Result<QuicConfig, Error> + 'static,
     {
         Ok(QuicServer {
             make_config: Box::new(make_config),
-            reset_key,
+            reset_key: reset_key.into(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_half_open: DEFAULT_MAX_HALF_OPEN,
             conns: HashMap::new(),
@@ -580,7 +583,7 @@ impl QuicServer {
             }
         }
         let mut cfg = (self.make_config)()?;
-        cfg.reset_key = Some(self.reset_key);
+        cfg.reset_key = Some(self.reset_key.clone());
         let mut conn = QuicConnection::server(cfg)?;
         conn.set_peer_addr(from);
         conn.set_now_secs(self.now_secs);
@@ -608,7 +611,7 @@ impl QuicServer {
         if triggering_len <= MIN_STATELESS_RESET_LEN {
             return;
         }
-        let token = stateless_reset_token(&self.reset_key, dcid);
+        let token = stateless_reset_token(self.reset_key.as_bytes(), dcid);
         let len = (triggering_len - 1).max(MIN_STATELESS_RESET_LEN);
         let pkt = build_stateless_reset(&mut OsRng, &token, len);
         self.push_pending(from, EcnCodepoint::NotEct, pkt);

@@ -228,7 +228,7 @@ pub struct QuicConfig {
     /// shared across every hosted connection.
     ///
     /// Ignored on the client side.
-    pub reset_key: Option<[u8; 32]>,
+    pub reset_key: Option<crate::tls::Secret32>,
     /// Client-only — a session from an earlier connection to the same server,
     /// taken with [`QuicConnection::take_session`]. Resumes the TLS handshake
     /// via PSK and, when the ticket allows it, enables 0-RTT: streams opened
@@ -696,7 +696,7 @@ pub struct QuicConnection {
     /// Server-only — resolved RFC 9000 §10.3.1 stateless-reset key (random per
     /// connection unless the hosting [`QuicServer`] supplied a shared one).
     /// Every reset token we advertise is `HMAC-SHA256(reset_key, cid)[..16]`.
-    reset_key: [u8; 32],
+    reset_key: crate::tls::Secret32,
     /// Path-validation state (RFC 9000 §8.2).
     path: PathChallengeState,
     /// Local CID pool — CIDs we issued to the peer. Initialized once we
@@ -979,10 +979,10 @@ impl QuicConnection {
         // Even a client issues NEW_CONNECTION_ID frames, each carrying a
         // stateless-reset token; derive them from a real key (random unless the
         // caller supplied one) so they are unpredictable (RFC 9000 §10.3.1).
-        let reset_key = cfg.reset_key.unwrap_or_else(|| {
+        let reset_key = cfg.reset_key.clone().unwrap_or_else(|| {
             let mut k = [0u8; 32];
             OsRng.fill_bytes(&mut k);
-            k
+            crate::tls::Secret32::from(k)
         });
         let scid = random_default_cid();
         let endpoint = build_initial_endpoint(dcid, scid);
@@ -1129,10 +1129,10 @@ impl QuicConnection {
         // Resolve the stateless-reset key (RFC 9000 §10.3.1) and choose our
         // handshake SCID now — before serialising transport parameters — so the
         // seq-0 `stateless_reset_token` we advertise is derivable from that CID.
-        let reset_key = cfg.reset_key.unwrap_or_else(|| {
+        let reset_key = cfg.reset_key.clone().unwrap_or_else(|| {
             let mut k = [0u8; 32];
             OsRng.fill_bytes(&mut k);
-            k
+            crate::tls::Secret32::from(k)
         });
         let pending_scid = crate::quic::server::random_default_scid();
         let mut params = cfg.transport_params.clone();
@@ -1143,7 +1143,7 @@ impl QuicConnection {
         // Advertise a derivable seq-0 reset token unless the caller pinned one.
         if params.stateless_reset_token.is_none() {
             params.stateless_reset_token = Some(crate::quic::reset::stateless_reset_token(
-                &reset_key,
+                reset_key.as_bytes(),
                 &pending_scid,
             ));
         }
@@ -4442,9 +4442,11 @@ impl QuicConnection {
             // never recognise a reset for this connection (RFC 9000 §10.3.1).
             // A caller-pinned token is left alone.
             if !self.reset_token_pinned {
-                self.our_params.stateless_reset_token = Some(
-                    crate::quic::reset::stateless_reset_token(&self.reset_key, &retry_scid),
-                );
+                self.our_params.stateless_reset_token =
+                    Some(crate::quic::reset::stateless_reset_token(
+                        self.reset_key.as_bytes(),
+                        &retry_scid,
+                    ));
             }
             retry_scid
         } else {
@@ -6457,7 +6459,8 @@ impl QuicConnection {
             // Random 8-byte CID; its reset token is derived from our static
             // reset key (RFC 9000 §10.3.1) so a router can recompute it later.
             let cid = ConnectionId::random(&mut rng, 8);
-            let reset_token = crate::quic::reset::stateless_reset_token(&self.reset_key, &cid);
+            let reset_token =
+                crate::quic::reset::stateless_reset_token(self.reset_key.as_bytes(), &cid);
             let entry = CidEntry {
                 cid,
                 sequence: next_seq,
@@ -9986,7 +9989,8 @@ mod tests {
             s.retry_scid(),
             "after a Retry the server answers to the Retry SCID"
         );
-        let expected = crate::quic::reset::stateless_reset_token(&s.reset_key, &handshake_cid);
+        let expected =
+            crate::quic::reset::stateless_reset_token(s.reset_key.as_bytes(), &handshake_cid);
         assert_eq!(
             s.our_params.stateless_reset_token,
             Some(expected),
