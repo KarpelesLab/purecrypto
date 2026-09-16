@@ -750,6 +750,10 @@ pub struct QuicConnection {
     /// exactly like `current_rx_ecn`. `None` for plain `feed_datagram`
     /// callers, which therefore never migrate.
     current_rx_addr: Option<SocketAddr>,
+    /// The Destination Connection ID of the packet whose frames are being
+    /// dispatched. RFC 9000 §19.16 forbids a RETIRE_CONNECTION_ID frame from
+    /// naming the connection ID of the very packet carrying it.
+    rx_packet_dcid: Vec<u8>,
     current_rx_len: usize,
     /// Whether the packet currently being dispatched carried a non-probing
     /// frame (RFC 9000 §9.1). Only a non-probing packet can move us to a new
@@ -1047,6 +1051,7 @@ impl QuicConnection {
             migration: None,
             peer_addr_validated: false,
             current_rx_addr: None,
+            rx_packet_dcid: Vec::new(),
             current_rx_len: 0,
             rx_non_probing: false,
             pending_close: None,
@@ -1182,6 +1187,7 @@ impl QuicConnection {
             migration: None,
             peer_addr_validated: false,
             current_rx_addr: None,
+            rx_packet_dcid: Vec::new(),
             current_rx_len: 0,
             rx_non_probing: false,
             pending_close: None,
@@ -4805,6 +4811,7 @@ impl QuicConnection {
 
         // Parse frames. Dispatch on the cleartext.
         let cleartext: Vec<u8> = payload.to_vec();
+        self.rx_packet_dcid = hdr.dcid.to_vec();
         self.dispatch_frames(level, pn, &cleartext)?;
 
         // G-4: a non-VN packet from the peer has been successfully
@@ -5068,6 +5075,7 @@ impl QuicConnection {
         }
 
         let cleartext: Vec<u8> = payload.to_vec();
+        self.rx_packet_dcid = hdr.dcid.to_vec();
         self.dispatch_frames(Level::OneRtt, pn, &cleartext)?;
         // RFC 9000 §9.3 — the packet authenticated, so its source address is
         // now trustworthy enough to act on. `largest_rx` was read before
@@ -5488,6 +5496,14 @@ impl QuicConnection {
                     // advances our knowledge, we owe the peer RETIRE
                     // frames for the dropped sequences.
                     ack_eliciting = true;
+                    // RFC 9000 §19.15: "An endpoint that is sending packets
+                    // with a zero-length Destination Connection ID MUST treat
+                    // receipt of a NEW_CONNECTION_ID frame as a connection
+                    // error of type PROTOCOL_VIOLATION" (the IllegalParameter
+                    // mapping).
+                    if self.endpoint.cids.peer.is_empty() {
+                        return Err(Error::IllegalParameter);
+                    }
                     // RFC 9000 §19.15: "Receiving a value in the
                     // Retire Prior To field that is greater than that in
                     // the Sequence Number field MUST be treated as a
@@ -5531,10 +5547,24 @@ impl QuicConnection {
                     // local CIDs (in `cid_local`).
                     ack_eliciting = true;
                     if let Some(pool) = self.cid_local.as_mut() {
+                        // §19.16: "The sequence number specified in a
+                        // RETIRE_CONNECTION_ID frame MUST NOT refer to the
+                        // Destination Connection ID field of the packet in
+                        // which the frame is contained" — a
+                        // PROTOCOL_VIOLATION (the IllegalParameter mapping).
+                        let own_dcid = &self.rx_packet_dcid;
+                        if !own_dcid.is_empty()
+                            && pool
+                                .entries
+                                .get(&seq)
+                                .is_some_and(|e| e.cid.as_slice() == own_dcid.as_slice())
+                        {
+                            return Err(Error::IllegalParameter);
+                        }
                         // Per §19.16, a RETIRE referencing a sequence
                         // the peer has never seen is a protocol error.
-                        // Phase 7 conservatively treats "unknown
-                        // sequence" as a soft ignore (returns Ok(None)).
+                        // Retiring an already-retired sequence is a soft
+                        // ignore (returns Ok(None)).
                         let _ = pool.retire(seq)?;
                     }
                 }
@@ -13907,5 +13937,81 @@ mod tests {
         let err = s.dispatch_frames(Level::OneRtt, 102, &over).unwrap_err();
         assert!(matches!(err, Error::Decode), "{err:?}");
         assert_eq!(s.pending_error_code, Some(ERROR_FLOW_CONTROL));
+    }
+
+    /// RFC 9000 §19.16 — a RETIRE_CONNECTION_ID frame must not name the
+    /// Destination Connection ID of the packet carrying it. The client here
+    /// retires the server's handshake CID (sequence 0) while still
+    /// addressing the server by it: PROTOCOL_VIOLATION, end to end. The
+    /// same frame is fine once the client has switched to the CID the
+    /// server issued after the handshake.
+    #[test]
+    fn retire_connection_id_naming_the_packets_own_dcid_is_a_protocol_violation() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        let addr = ip4(192, 0, 2, 1, 1111);
+        quiesce(&mut c, &mut s, addr);
+        {
+            let pool = s.cid_local.as_ref().expect("local pool");
+            assert!(pool.entries.len() >= 2, "a post-handshake CID was issued");
+        }
+        // The client's outbound DCID is still the server's sequence-0 CID.
+        assert_eq!(
+            c.endpoint.cids.peer,
+            s.cid_local.as_ref().unwrap().entries[&0].cid
+        );
+        c.cid_remote
+            .as_mut()
+            .expect("remote pool")
+            .pending_retire
+            .push(0);
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        let err = s.feed_datagram(&dg).unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter), "{err:?}");
+        let info = s.close_info().expect("closing");
+        assert_eq!(info.error_code, ERROR_PROTOCOL_VIOLATION);
+
+        // Legitimate: a packet addressed to the new CID may retire the old.
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        quiesce(&mut c, &mut s, addr);
+        let new_cid = s.cid_local.as_ref().unwrap().entries[&1].cid;
+        c.endpoint.cids.peer = new_cid;
+        c.cid_remote
+            .as_mut()
+            .expect("remote pool")
+            .pending_retire
+            .push(0);
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        s.feed_datagram(&dg)
+            .expect("retiring the previous CID is fine");
+        assert!(!s.is_closing());
+        assert!(!s.cid_local.as_ref().unwrap().entries.contains_key(&0));
+    }
+
+    /// RFC 9000 §19.15 — an endpoint sending packets with a zero-length
+    /// Destination Connection ID must treat NEW_CONNECTION_ID as a
+    /// PROTOCOL_VIOLATION: the peer chose to be addressed by no CID at all.
+    #[test]
+    fn new_connection_id_with_zero_length_peer_cid_is_a_protocol_violation() {
+        // A fresh client: its remote-CID pool is not populated yet, so the
+        // zero-length rule is the only thing that can reject the frame.
+        let (mut c, _s) = loopback_pair();
+        let mut payload = Vec::new();
+        Frame::NewConnectionId {
+            seq: 7,
+            retire_prior_to: 0,
+            cid: &[0xAB; 8],
+            reset_token: [1u8; 16],
+        }
+        .encode(&mut payload);
+        c.dispatch_frames(Level::OneRtt, 100, &payload)
+            .expect("accepted while the peer has a real CID");
+        c.endpoint.cids.peer = ConnectionId::from_slice(&[]).expect("empty CID");
+        let err = c.dispatch_frames(Level::OneRtt, 101, &payload).unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter), "{err:?}");
+        assert_eq!(transport_error_code(&err), ERROR_PROTOCOL_VIOLATION);
     }
 }
