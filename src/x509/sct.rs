@@ -299,8 +299,8 @@ impl Sct {
         let Ok(key) = super::AnyPublicKey::from_spki_der(&log.spki_der) else {
             return false;
         };
-        key.verify(sig_alg_oid, signed_data, &self.signature)
-            .is_ok()
+        let sig_alg = super::SignatureAlgorithmIdentifier::from_oid(sig_alg_oid);
+        key.verify(&sig_alg, signed_data, &self.signature).is_ok()
     }
 }
 

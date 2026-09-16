@@ -326,17 +326,8 @@ const WEAK_CSR_SIGNATURE_ALGS: &[(&[u64], &str)] = &[
 
 /// The arcs of the CSR's `signatureAlgorithm` field, or `None` if the DER
 /// cannot be walked (the caller treats that as a policy failure).
-///
-/// `CertificationRequest` exposes no accessor for this field, so we re-walk
-/// the outer `CertificationRequest ::= SEQUENCE { certificationRequestInfo,
-/// signatureAlgorithm, signature }` ourselves.
 fn csr_signature_algorithm(csr: &CertificationRequest) -> Option<Vec<u64>> {
-    use purecrypto::der::{Reader, parse_oid};
-    let mut r = Reader::new(csr.to_der());
-    let mut seq = r.read_sequence().ok()?;
-    seq.read_element().ok()?; // certificationRequestInfo
-    let mut algid = seq.read_sequence().ok()?; // signatureAlgorithm
-    parse_oid(algid.read_oid().ok()?).ok()
+    csr.signature_algorithm_oid().ok()
 }
 
 /// Verifies a submitted CSR's self-signature **and** screens it against the

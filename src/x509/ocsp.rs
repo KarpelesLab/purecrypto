@@ -76,7 +76,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{
-    AnyPublicKey, CertSigner, Certificate, CrlReason, Error, Extension, SignatureAlgId, Time, oid,
+    AnyPublicKey, CertSigner, Certificate, CrlReason, Error, Extension, SignatureAlgId,
+    SignatureAlgorithmIdentifier, Time, oid,
 };
 use crate::der::{
     Reader, encode_bit_string, encode_context, encode_integer, encode_null, encode_octet_string,
@@ -193,7 +194,7 @@ struct BasicParts<'a> {
     /// Raw `tbsResponseData` TLV — what the signature covers.
     tbs: &'a [u8],
     /// Outer signature algorithm OID arcs.
-    sig_alg: Vec<u64>,
+    sig_algid: &'a [u8],
     /// Signature bits (no unused-bits octet).
     signature: &'a [u8],
     /// Raw `[0] EXPLICIT SEQUENCE OF Certificate` content (without the
@@ -360,12 +361,10 @@ impl OcspResponse {
         let mut outer = Reader::new(basic);
         let mut bocsp = outer.read_sequence()?;
         let tbs = bocsp.read_element()?;
-        let mut alg = bocsp.read_sequence()?;
-        let sig_alg = parse_oid(alg.read_oid()?)?;
-        // We don't enforce algid-parameters byte equality here — there's no
-        // RFC 6960 §4 mandate that the algorithm identifier match anything
-        // inside `tbsResponseData` (unlike RFC 5280 §4.1.1.2's
-        // inner/outer requirement).
+        // There is no RFC 6960 §4 mandate that the algorithm identifier
+        // match anything inside `tbsResponseData` (unlike RFC 5280
+        // §4.1.1.2's inner/outer requirement), so it is only decoded.
+        let sig_algid = bocsp.read_element()?;
         let signature = bocsp.read_bit_string()?;
         let certs_inner = if !bocsp.is_empty() && bocsp.peek_tag() == Some(tag::context(0)) {
             let body = bocsp.read_tlv(tag::context(0))?;
@@ -381,15 +380,23 @@ impl OcspResponse {
         bocsp.finish()?;
         Ok(BasicParts {
             tbs,
-            sig_alg,
+            sig_algid,
             signature,
             certs_inner,
         })
     }
 
-    /// The OID arcs of the inner BasicOCSPResponse `signatureAlgorithm`.
+    /// The OID arcs of the inner BasicOCSPResponse `signatureAlgorithm`,
+    /// parameters ignored; see [`signature_algorithm`](Self::signature_algorithm).
     pub fn signature_algorithm_oid(&self) -> Result<Vec<u64>, Error> {
-        Ok(self.basic_parts()?.sig_alg)
+        super::sigalg::algid_oid(self.basic_parts()?.sig_algid)
+    }
+
+    /// The inner BasicOCSPResponse `signatureAlgorithm` — OID plus the
+    /// parameters that select the verifier (the `RSASSA-PSS-params` of an
+    /// `id-RSASSA-PSS` signature, RFC 4055 §3.1).
+    pub fn signature_algorithm(&self) -> Result<SignatureAlgorithmIdentifier, Error> {
+        SignatureAlgorithmIdentifier::from_der(self.basic_parts()?.sig_algid)
     }
 
     /// Verifies the BasicOCSPResponse signature over `tbsResponseData`
@@ -408,7 +415,8 @@ impl OcspResponse {
     /// which folds that gate in.
     pub fn verify_signature_with(&self, key: &AnyPublicKey) -> Result<(), Error> {
         let p = self.basic_parts()?;
-        key.verify(&p.sig_alg, p.tbs, p.signature)
+        let alg = SignatureAlgorithmIdentifier::from_der(p.sig_algid)?;
+        key.verify(&alg, p.tbs, p.signature)
     }
 
     /// Like [`verify_signature_with`](Self::verify_signature_with), but first
@@ -425,13 +433,12 @@ impl OcspResponse {
         policy: &SignaturePolicy,
     ) -> Result<(), Error> {
         let p = self.basic_parts()?;
-        let algo = key
-            .signature_algorithm(&p.sig_alg)
-            .ok_or(Error::Verification)?;
+        let alg = SignatureAlgorithmIdentifier::from_der(p.sig_algid)?;
+        let algo = key.signature_algorithm(&alg).ok_or(Error::Verification)?;
         if !policy.permits(algo, &key.to_spki_der()) {
             return Err(Error::Verification);
         }
-        key.verify(&p.sig_alg, p.tbs, p.signature)
+        key.verify(&alg, p.tbs, p.signature)
     }
 
     /// `producedAt` — when the responder generated the response.
@@ -1057,7 +1064,7 @@ fn verify_cert_signature_with_policy(
     issuer_key: &AnyPublicKey,
     policy: &SignaturePolicy,
 ) -> Result<(), Error> {
-    let sig_alg = cert.signature_algorithm_oid()?;
+    let sig_alg = cert.signature_algorithm()?;
     let algo = issuer_key
         .signature_algorithm(&sig_alg)
         .ok_or(Error::Verification)?;
@@ -1640,6 +1647,55 @@ mod tests {
         assert!(OcspResponse::from_der(der.clone()).is_err());
         assert!(OcspResponse::from_pem(&pem_encode(PEM_LABEL, &der)).is_err());
         OcspResponse::from_pem(&resp.to_pem()).unwrap();
+    }
+
+    /// A `BasicOCSPResponse` signed `id-RSASSA-PSS` by an issuer whose
+    /// certificate carries a plain `rsaEncryption` key: the signature's
+    /// `RSASSA-PSS-params` pick the digest (SHA-384 here, which used to be
+    /// verified as SHA-256 and fail), the policy gate whitelists that entry,
+    /// and the full `check_for_cert` path accepts the response.
+    #[test]
+    fn pss_signed_response_verifies_under_its_parameters() {
+        use crate::x509::{PssHash, PssParams};
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let now = Time::utc(2026, 1, 2, 0, 0, 0);
+        for hash in [PssHash::Sha256, PssHash::Sha384, PssHash::Sha512] {
+            let signer = CertSigner::RsaPss(&issuer_key, hash);
+            let resp = OcspResponseBuilder::good(
+                &leaf,
+                &issuer,
+                Time::utc(2026, 1, 1, 0, 0, 0),
+                Some(Time::utc(2026, 1, 8, 0, 0, 0)),
+            )
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+            assert_eq!(resp.signature_algorithm_oid().unwrap(), oid::ID_RSASSA_PSS);
+            assert_eq!(
+                resp.signature_algorithm().unwrap().pss_params(),
+                Some(&PssParams::for_hash(hash))
+            );
+            let issuer_pub = issuer.subject_public_key().unwrap();
+            assert!(matches!(issuer_pub, AnyPublicKey::Rsa(_)));
+            resp.verify_signature_with(&issuer_pub).unwrap();
+            resp.verify_signature_with_policy(&issuer_pub, &SignaturePolicy::modern())
+                .unwrap();
+            let without = SignaturePolicy::empty().permit("rsa-pkcs1-sha256");
+            assert!(matches!(
+                resp.verify_signature_with_policy(&issuer_pub, &without),
+                Err(Error::Verification)
+            ));
+            assert_eq!(
+                resp.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
+                OcspCertStatus::Good
+            );
+            let mut der = resp.to_der().to_vec();
+            let i = der.len() * 2 / 3;
+            der[i] ^= 0x01;
+            if let Ok(bad) = OcspResponse::from_der(der) {
+                assert!(bad.verify_signature_with(&issuer_pub).is_err());
+            }
+        }
     }
 
     #[test]

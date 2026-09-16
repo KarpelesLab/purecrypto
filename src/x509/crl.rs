@@ -347,7 +347,7 @@ struct CrlParts<'a> {
     /// Raw `TBSCertList` TLV (used for signature verification).
     tbs: &'a [u8],
     /// Outer signature algorithm OID arcs.
-    sig_alg: Vec<u64>,
+    sig_algid: &'a [u8],
     /// Signature bits.
     signature: &'a [u8],
 }
@@ -391,15 +391,14 @@ impl CertificateRevocationList {
         let mut outer = Reader::new(&self.der);
         let mut crl = outer.read_sequence()?;
         let tbs = crl.read_element()?;
-        let mut alg = crl.read_sequence()?;
-        let sig_alg = parse_oid(alg.read_oid()?)?;
+        let sig_algid = crl.read_element()?;
         let signature = crl.read_bit_string()?;
         // Strict DER (X.690 §11): no trailing bytes inside the outer
         // SEQUENCE.
         crl.finish()?;
         Ok(CrlParts {
             tbs,
-            sig_alg,
+            sig_algid,
             signature,
         })
     }
@@ -495,9 +494,17 @@ impl CertificateRevocationList {
         }
     }
 
-    /// The OID arcs of the CRL's outer `signatureAlgorithm` field.
+    /// The OID arcs of the CRL's outer `signatureAlgorithm` field,
+    /// parameters ignored; see [`signature_algorithm`](Self::signature_algorithm).
     pub fn signature_algorithm_oid(&self) -> Result<Vec<u64>, Error> {
-        Ok(self.parts()?.sig_alg)
+        super::sigalg::algid_oid(self.parts()?.sig_algid)
+    }
+
+    /// The CRL's outer `signatureAlgorithm` — OID plus the parameters that
+    /// select the verifier (the `RSASSA-PSS-params` of an `id-RSASSA-PSS`
+    /// signature, RFC 4055 §3.1).
+    pub fn signature_algorithm(&self) -> Result<super::SignatureAlgorithmIdentifier, Error> {
+        super::SignatureAlgorithmIdentifier::from_der(self.parts()?.sig_algid)
     }
 
     /// Verifies the CRL signature against `issuer_key`, dispatching on the
@@ -518,7 +525,8 @@ impl CertificateRevocationList {
     pub fn verify_signature_with(&self, issuer_key: &AnyPublicKey) -> Result<(), Error> {
         self.check_signature_algid_consistent()?;
         let parts = self.parts()?;
-        issuer_key.verify(&parts.sig_alg, parts.tbs, parts.signature)
+        let alg = super::SignatureAlgorithmIdentifier::from_der(parts.sig_algid)?;
+        issuer_key.verify(&alg, parts.tbs, parts.signature)
     }
 
     /// Returns a sub-reader positioned at the optional `crlExtensions [0]`
@@ -885,6 +893,76 @@ mod tests {
         assert!(crl.is_revoked(&[0x00, 0x01]).unwrap());
         // A different serial: not revoked.
         assert!(!crl.is_revoked(&[0x07]).unwrap());
+    }
+
+    /// An `id-RSASSA-PSS` CRL signature carries its `RSASSA-PSS-params`
+    /// (RFC 4055 §3.1) in both `TBSCertList.signature` and the outer
+    /// `signatureAlgorithm`; verification honours the digest they name
+    /// under either form of the issuer key, and the two-phase path writes
+    /// the same identifier.
+    #[test]
+    fn pss_signed_crl_verifies_under_its_parameters() {
+        use crate::x509::{PssHash, PssParams, PssRestriction, SignatureAlgorithmIdentifier};
+        let key = rsa_a();
+        let dn = issuer_dn();
+        let build = || {
+            let mut b = CrlBuilder::new(
+                &dn,
+                Time::utc(2026, 1, 1, 0, 0, 0),
+                Some(Time::utc(2026, 12, 31, 0, 0, 0)),
+            );
+            b.revoke(&[0x01], Time::utc(2026, 2, 1, 0, 0, 0), None);
+            b
+        };
+        let rsa_form = AnyPublicKey::Rsa(key.public_key());
+        for (hash, alg_id) in [
+            (PssHash::Sha256, SignatureAlgId::RsaPssSha256),
+            (PssHash::Sha384, SignatureAlgId::RsaPssSha384),
+            (PssHash::Sha512, SignatureAlgId::RsaPssSha512),
+        ] {
+            let signer = CertSigner::RsaPss(&key, hash);
+            let crl = build().sign(&signer).unwrap();
+            let want = SignatureAlgorithmIdentifier::rsa_pss(PssParams::for_hash(hash));
+            assert_eq!(crl.signature_algorithm().unwrap(), want);
+            assert_eq!(crl.signature_algorithm_oid().unwrap(), oid::ID_RSASSA_PSS);
+            crl.check_signature_algid_consistent().unwrap();
+            // The PSS-restricted issuer key the signer certifies, and the
+            // plain `rsaEncryption` form of the same key.
+            crl.verify_signature_with(&signer.public_key()).unwrap();
+            crl.verify_signature_with(&rsa_form).unwrap();
+            crl.verify_signature_with(&AnyPublicKey::RsaPss(
+                key.public_key(),
+                PssRestriction::Unrestricted,
+            ))
+            .unwrap();
+            // A key restricted to another digest refuses it.
+            let other = if hash == PssHash::Sha512 {
+                PssHash::Sha256
+            } else {
+                PssHash::Sha512
+            };
+            assert_eq!(
+                crl.verify_signature_with(&AnyPublicKey::RsaPss(
+                    key.public_key(),
+                    PssRestriction::for_hash(other),
+                ))
+                .err(),
+                Some(Error::UnsupportedAlgorithm)
+            );
+            assert!(crl.is_revoked(&[0x01]).unwrap());
+            // Two-phase: the same identifier, an external PSS signature.
+            let prepared = build().prepare(alg_id);
+            let sig = signer.sign(prepared.tbs()).unwrap();
+            let two_phase = prepared.finish(&sig);
+            assert_eq!(two_phase.to_der(), crl.to_der());
+            two_phase.verify_signature_with(&rsa_form).unwrap();
+            let mut der = crl.to_der().to_vec();
+            let i = der.len() / 2;
+            der[i] ^= 0x01;
+            if let Ok(bad) = CertificateRevocationList::from_der(der) {
+                assert!(bad.verify_signature_with(&rsa_form).is_err());
+            }
+        }
     }
 
     #[test]

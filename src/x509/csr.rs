@@ -30,7 +30,7 @@ struct CsrParts<'a> {
     /// Raw `CertificationRequestInfo` element (TLV), used for signing.
     cri: &'a [u8],
     /// `signatureAlgorithm` OID arcs.
-    sig_alg: Vec<u64>,
+    sig_algid: &'a [u8],
     /// Signature bits.
     signature: &'a [u8],
 }
@@ -131,15 +131,14 @@ impl CertificationRequest {
         let mut outer = Reader::new(&self.der);
         let mut csr = outer.read_sequence()?;
         let cri = csr.read_element()?;
-        let mut alg = csr.read_sequence()?;
-        let sig_alg = parse_oid(alg.read_oid()?)?;
+        let sig_algid = csr.read_element()?;
         let signature = csr.read_bit_string()?;
         // Strict DER (X.690 §11): no trailing bytes inside the outer
         // SEQUENCE.
         csr.finish()?;
         Ok(CsrParts {
             cri,
-            sig_alg,
+            sig_algid,
             signature,
         })
     }
@@ -249,6 +248,19 @@ impl CertificationRequest {
         Ok(out)
     }
 
+    /// The OID arcs of the request's `signatureAlgorithm` field, parameters
+    /// ignored; see [`signature_algorithm`](Self::signature_algorithm).
+    pub fn signature_algorithm_oid(&self) -> Result<Vec<u64>, Error> {
+        super::sigalg::algid_oid(self.parts()?.sig_algid)
+    }
+
+    /// The request's `signatureAlgorithm` — OID plus the parameters that
+    /// select the verifier (the `RSASSA-PSS-params` of an `id-RSASSA-PSS`
+    /// signature, RFC 4055 §3.1).
+    pub fn signature_algorithm(&self) -> Result<super::SignatureAlgorithmIdentifier, Error> {
+        super::SignatureAlgorithmIdentifier::from_der(self.parts()?.sig_algid)
+    }
+
     /// Verifies the request's self-signature against its own public key.
     ///
     /// A PKCS#10 `CertificationRequestInfo` carries no inner signature
@@ -263,7 +275,8 @@ impl CertificationRequest {
     pub fn verify_self_signed(&self) -> Result<(), Error> {
         let parts = self.parts()?;
         let key = self.public_key()?;
-        key.verify(&parts.sig_alg, parts.cri, parts.signature)
+        let alg = super::SignatureAlgorithmIdentifier::from_der(parts.sig_algid)?;
+        key.verify(&alg, parts.cri, parts.signature)
     }
 }
 
@@ -428,6 +441,61 @@ mod tests {
         )
         .unwrap();
         assert!(csr.extension_requests().unwrap().is_empty());
+    }
+
+    /// A CSR self-signed with `id-RSASSA-PSS` carries its `RSASSA-PSS-params`
+    /// in `signatureAlgorithm`; the self-signature verifies under the
+    /// digest they name (the subject key is the PSS-restricted form the
+    /// signer certifies), and a CA issues from it.
+    #[test]
+    fn pss_signed_csr_verifies_under_its_parameters() {
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::{AnyPublicKey, PssHash, PssParams, PssRestriction};
+        let key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&crate::test_util::rsa_test_key_a().to_pkcs1_der())
+                .unwrap();
+        for hash in [PssHash::Sha256, PssHash::Sha384, PssHash::Sha512] {
+            let signer = CertSigner::RsaPss(&key, hash);
+            let csr = CertificationRequest::create(
+                &signer,
+                &DistinguishedName::common_name("pss.example"),
+                &["pss.example"],
+            )
+            .unwrap();
+            assert_eq!(
+                csr.signature_algorithm_oid().unwrap(),
+                crate::x509::oid::ID_RSASSA_PSS
+            );
+            assert_eq!(
+                csr.signature_algorithm().unwrap().pss_params(),
+                Some(&PssParams::for_hash(hash))
+            );
+            assert!(matches!(
+                csr.public_key().unwrap(),
+                AnyPublicKey::RsaPss(_, r) if r == PssRestriction::for_hash(hash)
+            ));
+            csr.verify_self_signed().unwrap();
+            let mut der = csr.to_der().to_vec();
+            let i = der.len() / 2;
+            der[i] ^= 0x01;
+            if let Ok(bad) = CertificationRequest::from_der(der) {
+                assert!(bad.verify_self_signed().is_err());
+            }
+            let ca_key = ec_signer_key();
+            let ca_signer = CertSigner::Ecdsa(&ca_key);
+            let ca_name = DistinguishedName::common_name("Issuing CA");
+            let validity = Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            );
+            let cert = Certificate::issue_from_csr(&ca_signer, &ca_name, &csr, &validity, 7, false)
+                .unwrap();
+            cert.verify_signature_with(&ca_signer.public_key()).unwrap();
+            assert!(matches!(
+                cert.subject_public_key().unwrap(),
+                AnyPublicKey::RsaPss(_, r) if r == PssRestriction::for_hash(hash)
+            ));
+        }
     }
 
     #[test]

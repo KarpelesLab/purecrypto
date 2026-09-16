@@ -19,9 +19,10 @@ use crate::slhdsa;
 /// A certificate/CSR signing key.
 ///
 /// RSA signs with PKCS#1 v1.5 over SHA-256 (`sha256WithRSAEncryption`) or,
-/// as [`RsaPss`](Self::RsaPss), RSASSA-PSS over SHA-256 (`id-RSASSA-PSS`,
-/// RFC 4055); ECDSA signs `ecdsa-with-SHAxxx` with the hash matched to the
-/// curve (P-256 and secp256k1 → SHA-256, P-384 → SHA-384, P-521 → SHA-512);
+/// as [`RsaPss`](Self::RsaPss), RSASSA-PSS over the named SHA-2 digest
+/// (`id-RSASSA-PSS` with explicit `RSASSA-PSS-params`, RFC 4055); ECDSA
+/// signs `ecdsa-with-SHAxxx` with the hash matched to the curve (P-256 and
+/// secp256k1 → SHA-256, P-384 → SHA-384, P-521 → SHA-512);
 /// Ed25519 signs `id-Ed25519` (PureEdDSA over SHA-512, RFC 8410); ML-DSA
 /// signs under the matching `id-ml-dsa-N` OID (NIST FIPS 204 /
 /// draft-ietf-lamps-dilithium-certificates) and SLH-DSA under its parameter
@@ -44,12 +45,16 @@ pub enum CertSigner<'a> {
     /// key it certifies for itself is `rsaEncryption`.
     Rsa(&'a BoxedRsaPrivateKey),
     /// An RSA signing key used as a PSS-restricted CA key (RFC 4055): signs
-    /// RSASSA-PSS with SHA-256 / MGF1-SHA-256 / salt 32 under
-    /// `id-RSASSA-PSS`, and [`public_key`](Self::public_key) is an
-    /// [`AnyPublicKey::RsaPss`] pinned to exactly that parameter set, so a
-    /// self-signed CA built from it carries an `id-RSASSA-PSS` SPKI that
-    /// refuses PKCS#1 v1.5.
-    RsaPss(&'a BoxedRsaPrivateKey),
+    /// RSASSA-PSS with the named digest, MGF1 over the same digest and a
+    /// salt as long as the digest ([`PssParams::for_hash`]) under
+    /// `id-RSASSA-PSS` with those `RSASSA-PSS-params` written into the
+    /// signature `AlgorithmIdentifier`, and [`public_key`](Self::public_key)
+    /// is an [`AnyPublicKey::RsaPss`] pinned to exactly that parameter set,
+    /// so a self-signed CA built from it carries an `id-RSASSA-PSS` SPKI
+    /// that refuses PKCS#1 v1.5.
+    ///
+    /// [`PssParams::for_hash`]: super::PssParams::for_hash
+    RsaPss(&'a BoxedRsaPrivateKey, PssHash),
     /// An ECDSA signing key.
     Ecdsa(&'a BoxedEcdsaPrivateKey),
     /// An Ed25519 signing key.
@@ -102,6 +107,12 @@ pub enum SignatureAlgId {
     /// certified as `rsaEncryption` or as an `id-RSASSA-PSS` key restricted
     /// to (or compatible with) this set.
     RsaPssSha256,
+    /// `id-RSASSA-PSS` — RSASSA-PSS over SHA-384 with MGF1-SHA-384 and a
+    /// 48-octet salt, parameters written into the `AlgorithmIdentifier`.
+    RsaPssSha384,
+    /// `id-RSASSA-PSS` — RSASSA-PSS over SHA-512 with MGF1-SHA-512 and a
+    /// 64-octet salt, parameters written into the `AlgorithmIdentifier`.
+    RsaPssSha512,
     /// `ecdsa-with-SHA256`. Signature is the `Ecdsa-Sig-Value` DER SEQUENCE.
     EcdsaSha256,
     /// `ecdsa-with-SHA384`. Signature is the `Ecdsa-Sig-Value` DER SEQUENCE.
@@ -130,7 +141,9 @@ impl SignatureAlgId {
             SignatureAlgId::RsaPkcs1Sha256 => oid::SHA256_WITH_RSA,
             SignatureAlgId::RsaPkcs1Sha384 => oid::SHA384_WITH_RSA,
             SignatureAlgId::RsaPkcs1Sha512 => oid::SHA512_WITH_RSA,
-            SignatureAlgId::RsaPssSha256 => oid::ID_RSASSA_PSS,
+            SignatureAlgId::RsaPssSha256
+            | SignatureAlgId::RsaPssSha384
+            | SignatureAlgId::RsaPssSha512 => oid::ID_RSASSA_PSS,
             SignatureAlgId::EcdsaSha256 => oid::ECDSA_WITH_SHA256,
             SignatureAlgId::EcdsaSha384 => oid::ECDSA_WITH_SHA384,
             SignatureAlgId::EcdsaSha512 => oid::ECDSA_WITH_SHA512,
@@ -149,8 +162,8 @@ impl SignatureAlgId {
     /// NULL `parameters`, RSA-PSS its `RSASSA-PSS-params`; everything else
     /// is the bare OID, matching [`CertSigner::algorithm_identifier`].
     pub(crate) fn algorithm_identifier(self) -> Vec<u8> {
-        if self == SignatureAlgId::RsaPssSha256 {
-            return rsassa_pss_sha256_algid();
+        if let Some(hash) = self.pss_hash() {
+            return rsassa_pss_algid(hash);
         }
         algorithm_identifier(
             self.sig_alg_oid(),
@@ -162,23 +175,38 @@ impl SignatureAlgId {
             ),
         )
     }
+
+    /// The PSS digest of the three `RsaPss*` variants, `None` otherwise.
+    fn pss_hash(self) -> Option<PssHash> {
+        match self {
+            SignatureAlgId::RsaPssSha256 => Some(PssHash::Sha256),
+            SignatureAlgId::RsaPssSha384 => Some(PssHash::Sha384),
+            SignatureAlgId::RsaPssSha512 => Some(PssHash::Sha512),
+            _ => None,
+        }
+    }
 }
 
-/// The `id-RSASSA-PSS` signature `AlgorithmIdentifier` naming the SHA-256 /
-/// MGF1-SHA-256 / salt-32 parameter set (RFC 4055 §3.1) — the set
-/// [`CertSigner::RsaPss`] and [`SignatureAlgId::RsaPssSha256`] sign with.
-fn rsassa_pss_sha256_algid() -> Vec<u8> {
-    let params = PssRestriction::for_hash(PssHash::Sha256).encode_params();
+/// The `id-RSASSA-PSS` signature `AlgorithmIdentifier` naming the
+/// `hash` / MGF1-`hash` / salt = digest-length parameter set (RFC 4055
+/// §3.1, [`PssParams::for_hash`](super::PssParams::for_hash)) — the set
+/// [`CertSigner::RsaPss`] and the `SignatureAlgId::RsaPss*` variants sign
+/// with.
+fn rsassa_pss_algid(hash: PssHash) -> Vec<u8> {
+    let params = PssRestriction::for_hash(hash).encode_params();
     encode_sequence(&[oid_tlv(oid::ID_RSASSA_PSS), params].concat())
 }
 
-/// Signs `tbs` with RSASSA-PSS over SHA-256 and a deterministic 32-octet
-/// salt. The salt is derived (HMAC-DRBG) from the public modulus and the
-/// message: PSS's security does not rest on salt secrecy or unpredictability
-/// — a verifier recovers the salt from the signature — so a public, message-
-/// bound derivation keeps issuance deterministic like every other
-/// [`CertSigner`] variant without weakening the signature.
-fn sign_pss_sha256_deterministic(key: &BoxedRsaPrivateKey, tbs: &[u8]) -> Result<Vec<u8>, Error> {
+/// Signs `tbs` with RSASSA-PSS over `D` and a deterministic salt as long as
+/// the digest. The salt is derived (HMAC-DRBG) from the public modulus and
+/// the message: PSS's security does not rest on salt secrecy or
+/// unpredictability — a verifier recovers the salt from the signature — so
+/// a public, message-bound derivation keeps issuance deterministic like
+/// every other [`CertSigner`] variant without weakening the signature.
+fn sign_pss_deterministic<D: Digest>(
+    key: &BoxedRsaPrivateKey,
+    tbs: &[u8],
+) -> Result<Vec<u8>, Error> {
     let modulus = key.public_key().to_pkcs1_der();
     let seed = Sha256::digest(&modulus);
     let nonce = Sha256::digest(tbs);
@@ -187,7 +215,7 @@ fn sign_pss_sha256_deterministic(key: &BoxedRsaPrivateKey, tbs: &[u8]) -> Result
         nonce.as_ref(),
         b"purecrypto x509 RSASSA-PSS salt",
     );
-    Ok(key.sign_pss::<Sha256, _>(tbs, &mut drbg)?)
+    Ok(key.sign_pss::<D, _>(tbs, &mut drbg)?)
 }
 
 impl CertSigner<'_> {
@@ -195,7 +223,7 @@ impl CertSigner<'_> {
     pub(crate) fn sig_alg_oid(&self) -> &'static [u64] {
         match self {
             CertSigner::Rsa(_) => oid::SHA256_WITH_RSA,
-            CertSigner::RsaPss(_) => oid::ID_RSASSA_PSS,
+            CertSigner::RsaPss(..) => oid::ID_RSASSA_PSS,
             CertSigner::Ecdsa(k) => match k.curve() {
                 CurveId::P256
                 | CurveId::Secp256k1
@@ -223,8 +251,8 @@ impl CertSigner<'_> {
     /// `RSASSA-PSS-params`; everything else (ECDSA, Ed25519, ML-DSA) is the
     /// bare OID, no parameters.
     pub(crate) fn algorithm_identifier(&self) -> Vec<u8> {
-        if matches!(self, CertSigner::RsaPss(_)) {
-            return rsassa_pss_sha256_algid();
+        if let CertSigner::RsaPss(_, hash) = self {
+            return rsassa_pss_algid(*hash);
         }
         algorithm_identifier(self.sig_alg_oid(), matches!(self, CertSigner::Rsa(_)))
     }
@@ -239,7 +267,11 @@ impl CertSigner<'_> {
     pub(crate) fn sign(&self, tbs: &[u8]) -> Result<Vec<u8>, Error> {
         match self {
             CertSigner::Rsa(k) => Ok(k.sign_pkcs1v15::<Sha256>(tbs)?),
-            CertSigner::RsaPss(k) => sign_pss_sha256_deterministic(k, tbs),
+            CertSigner::RsaPss(k, hash) => match hash {
+                PssHash::Sha256 => sign_pss_deterministic::<Sha256>(k, tbs),
+                PssHash::Sha384 => sign_pss_deterministic::<Sha384>(k, tbs),
+                PssHash::Sha512 => sign_pss_deterministic::<Sha512>(k, tbs),
+            },
             CertSigner::Ecdsa(k) => {
                 let curve = k.curve();
                 let sig = match curve {
@@ -316,8 +348,8 @@ impl CertSigner<'_> {
     pub fn public_key(&self) -> AnyPublicKey {
         match self {
             CertSigner::Rsa(k) => AnyPublicKey::Rsa(k.public_key()),
-            CertSigner::RsaPss(k) => {
-                AnyPublicKey::RsaPss(k.public_key(), PssRestriction::for_hash(PssHash::Sha256))
+            CertSigner::RsaPss(k, hash) => {
+                AnyPublicKey::RsaPss(k.public_key(), PssRestriction::for_hash(*hash))
             }
             CertSigner::Ecdsa(k) => AnyPublicKey::Ecdsa(k.public_key()),
             CertSigner::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()),

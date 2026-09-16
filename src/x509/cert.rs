@@ -56,8 +56,8 @@ pub struct Certificate {
 struct CertParts<'a> {
     /// Raw `TBSCertificate` element (tag-length-value), used for signing.
     tbs: &'a [u8],
-    /// `signatureAlgorithm` OID arcs.
-    sig_alg: Vec<u64>,
+    /// Raw `signatureAlgorithm` `AlgorithmIdentifier` (tag-length-value).
+    sig_algid: &'a [u8],
     /// Signature bits.
     signature: &'a [u8],
 }
@@ -469,8 +469,7 @@ impl Certificate {
         let mut outer = Reader::new(&self.der);
         let mut cert = outer.read_sequence()?;
         let tbs = cert.read_element()?;
-        let mut alg = cert.read_sequence()?;
-        let sig_alg = parse_oid(alg.read_oid()?)?;
+        let sig_algid = cert.read_element()?;
         let signature = cert.read_bit_string()?;
         // Strict DER (X.690 §11): no trailing bytes inside the outer
         // SEQUENCE. Two parsers must agree on what was signed; trailing
@@ -479,7 +478,7 @@ impl Certificate {
         cert.finish()?;
         Ok(CertParts {
             tbs,
-            sig_alg,
+            sig_algid,
             signature,
         })
     }
@@ -554,11 +553,7 @@ impl Certificate {
     /// Returns the DER bytes of the outer `signatureAlgorithm`
     /// AlgorithmIdentifier (RFC 5280 §4.1.1.2).
     pub(crate) fn outer_signature_algid_der(&self) -> Result<&[u8], Error> {
-        let mut outer = Reader::new(&self.der);
-        let mut cert = outer.read_sequence()?;
-        cert.read_element()?; // skip TBSCertificate
-        let bytes = cert.read_element()?;
-        Ok(bytes)
+        Ok(self.parts()?.sig_algid)
     }
 
     /// RFC 5280 §4.1.1.2: the inner and outer signature AlgorithmIdentifier
@@ -639,7 +634,7 @@ impl Certificate {
     ) -> Result<(), Error> {
         self.check_signature_algid_consistent()?;
         let parts = self.parts()?;
-        if parts.sig_alg.as_slice() != oid::SHA256_WITH_RSA {
+        if super::sigalg::algid_oid(parts.sig_algid)? != oid::SHA256_WITH_RSA {
             return Err(Error::UnsupportedAlgorithm);
         }
         issuer_key.verify_pkcs1v15::<Sha256>(parts.tbs, parts.signature)?;
@@ -729,7 +724,8 @@ impl Certificate {
     }
 
     /// Verifies the certificate signature against `issuer`, dispatching on the
-    /// certificate's `signatureAlgorithm` OID through
+    /// certificate's `signatureAlgorithm` — OID and parameters, see
+    /// [`signature_algorithm`](Self::signature_algorithm) — through
     /// [`crate::signature_registry`] (RSA PKCS#1 v1.5 and PSS, ECDSA on every
     /// supported curve, Ed25519/Ed448, SM2, ML-DSA, SLH-DSA).
     ///
@@ -752,14 +748,27 @@ impl Certificate {
     pub fn verify_signature_with(&self, issuer: &super::AnyPublicKey) -> Result<(), Error> {
         self.check_signature_algid_consistent()?;
         let parts = self.parts()?;
-        issuer.verify(&parts.sig_alg, parts.tbs, parts.signature)
+        let alg = super::SignatureAlgorithmIdentifier::from_der(parts.sig_algid)?;
+        issuer.verify(&alg, parts.tbs, parts.signature)
     }
 
-    /// The OID arcs of the certificate's outer `signatureAlgorithm` field.
-    /// Useful for routing the verify through the signature-algorithm registry
-    /// or for inspection (e.g. CLI tooling printing a chain).
+    /// The OID arcs of the certificate's outer `signatureAlgorithm` field,
+    /// parameters ignored. Useful for inspection (e.g. CLI tooling printing
+    /// a chain); routing a verify through the signature-algorithm registry
+    /// takes [`signature_algorithm`](Self::signature_algorithm), which
+    /// carries the parameters an `id-RSASSA-PSS` signature needs.
     pub fn signature_algorithm_oid(&self) -> Result<Vec<u64>, Error> {
-        Ok(self.parts()?.sig_alg)
+        super::sigalg::algid_oid(self.parts()?.sig_algid)
+    }
+
+    /// The certificate's outer `signatureAlgorithm` — OID plus the
+    /// parameters that select the verifier (the `RSASSA-PSS-params` of an
+    /// `id-RSASSA-PSS` signature, RFC 4055 §3.1). See
+    /// [`SignatureAlgorithmIdentifier::from_der`] for what is rejected.
+    ///
+    /// [`SignatureAlgorithmIdentifier::from_der`]: super::SignatureAlgorithmIdentifier::from_der
+    pub fn signature_algorithm(&self) -> Result<super::SignatureAlgorithmIdentifier, Error> {
+        super::SignatureAlgorithmIdentifier::from_der(self.parts()?.sig_algid)
     }
 
     /// The certificate's validity period (`notBefore` / `notAfter`).
@@ -1706,6 +1715,7 @@ fn read_skipcerts(body: &[u8]) -> Result<u32, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::der::oid_tlv;
     use crate::test_util::{rsa_test_key_a, rsa_test_key_b};
     use crate::x509::Time;
     use alloc::vec;
@@ -1735,7 +1745,7 @@ mod tests {
             Time::utc(2034, 1, 1, 0, 0, 0),
         );
         let pss_cert = Certificate::self_signed_general(
-            &CertSigner::RsaPss(&key_a),
+            &CertSigner::RsaPss(&key_a, PssHash::Sha256),
             &name,
             &validity,
             1,
@@ -2015,6 +2025,330 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
             cert.verify_signature_with(&pub_key),
             Err(Error::Malformed)
         ));
+    }
+
+    /// Assembles `Certificate { tbs, outer_algid, sig }` around a hand-built
+    /// self-issued TBS for RSA test key A whose inner `signature` field is
+    /// `inner_algid`; `sign` produces the signature over the TBS bytes.
+    fn assemble_rsa_cert(
+        inner_algid: &[u8],
+        outer_algid: &[u8],
+        sign: impl FnOnce(&[u8]) -> Vec<u8>,
+    ) -> Certificate {
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("pss params");
+        let spki = rsa_spki(&key.public_key());
+        let tbs = build_tbs_raw(1, &name, &name, &validity(), &spki, inner_algid, &[]);
+        let sig = sign(&tbs);
+        Certificate::from_der(encode_sequence(
+            &[tbs, outer_algid.to_vec(), encode_bit_string(&sig)].concat(),
+        ))
+        .unwrap()
+    }
+
+    /// The `id-RSASSA-PSS` `AlgorithmIdentifier` naming `params`.
+    fn pss_algid(params: crate::x509::PssParams) -> Vec<u8> {
+        let params = crate::x509::PssRestriction::Restricted(params).encode_params();
+        encode_sequence(&[oid_tlv(oid::ID_RSASSA_PSS), params].concat())
+    }
+
+    /// RFC 4055 §3.1: the digest of an `id-RSASSA-PSS` certificate signature
+    /// is the one its `RSASSA-PSS-params` name. A CA certified as plain
+    /// `rsaEncryption` issuing with PSS-SHA-384 / SHA-512 verifies (this
+    /// used to be verified as SHA-256 and fail), the dispatch entry is the
+    /// one for the signature's digest, the PSS forms of the issuer key apply
+    /// their restriction to the same parameters, and two-phase issuance
+    /// writes the identical identifier.
+    #[test]
+    fn pss_signature_params_select_the_verifier() {
+        use crate::hash::{Sha384, Sha512};
+        use crate::rng::HmacDrbg;
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::signature_registry::SignaturePolicy;
+        use crate::x509::{
+            AnyPublicKey, CertSigner, PssHash, PssParams, PssRestriction, SignatureAlgId,
+            SignatureAlgorithmIdentifier,
+        };
+        let ca_key = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let leaf_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_b().to_pkcs1_der()).unwrap();
+        let ca_name = DistinguishedName::common_name("pss issuer");
+        let leaf_name = DistinguishedName::common_name("pss leaf");
+        let leaf_pub = AnyPublicKey::Rsa(leaf_key.public_key());
+        let ca_rsa = AnyPublicKey::Rsa(ca_key.public_key());
+        let policy = SignaturePolicy::modern();
+        for (hash, id, alg_id) in [
+            (
+                PssHash::Sha256,
+                "rsa-pss-pss-sha256",
+                SignatureAlgId::RsaPssSha256,
+            ),
+            (
+                PssHash::Sha384,
+                "rsa-pss-pss-sha384",
+                SignatureAlgId::RsaPssSha384,
+            ),
+            (
+                PssHash::Sha512,
+                "rsa-pss-pss-sha512",
+                SignatureAlgId::RsaPssSha512,
+            ),
+        ] {
+            let leaf = Certificate::issue_general(
+                &CertSigner::RsaPss(&ca_key, hash),
+                &ca_name,
+                &leaf_name,
+                &leaf_pub,
+                &validity(),
+                1,
+                false,
+                &["pss.example"],
+            )
+            .unwrap();
+            let alg = leaf.signature_algorithm().unwrap();
+            assert_eq!(
+                alg,
+                SignatureAlgorithmIdentifier::rsa_pss(PssParams::for_hash(hash))
+            );
+            assert_eq!(leaf.signature_algorithm_oid().unwrap(), oid::ID_RSASSA_PSS);
+            leaf.check_signature_algid_consistent().unwrap();
+            leaf.verify_signature_with(&ca_rsa).unwrap();
+            let algo = ca_rsa.signature_algorithm(&alg).unwrap();
+            assert_eq!(algo.id(), id);
+            assert!(policy.permits(algo, &ca_rsa.to_spki_der()));
+            // The PSS forms of the issuer key: unrestricted and pinned to
+            // the signature's parameter set accept, pinned elsewhere refuses.
+            leaf.verify_signature_with(&AnyPublicKey::RsaPss(
+                ca_key.public_key(),
+                PssRestriction::Unrestricted,
+            ))
+            .unwrap();
+            leaf.verify_signature_with(&AnyPublicKey::RsaPss(
+                ca_key.public_key(),
+                PssRestriction::for_hash(hash),
+            ))
+            .unwrap();
+            let other = if hash == PssHash::Sha256 {
+                PssHash::Sha384
+            } else {
+                PssHash::Sha256
+            };
+            assert_eq!(
+                leaf.verify_signature_with(&AnyPublicKey::RsaPss(
+                    ca_key.public_key(),
+                    PssRestriction::for_hash(other),
+                ))
+                .err(),
+                Some(Error::UnsupportedAlgorithm)
+            );
+            // Tampering is caught through the same path.
+            let mut der = leaf.to_der().to_vec();
+            let i = der.len() / 3;
+            der[i] ^= 0x01;
+            if let Ok(bad) = Certificate::from_der(der) {
+                assert!(bad.verify_signature_with(&ca_rsa).is_err());
+            }
+            // Two-phase issuance: the same identifier, an external PSS
+            // signature over the named digest.
+            let prepared =
+                Certificate::prepare(alg_id, &ca_name, &leaf_name, &leaf_pub, &validity(), 2, &[]);
+            let mut rng = HmacDrbg::<Sha256>::new(b"cert-pss-external", b"n", &[]);
+            let sig = match hash {
+                PssHash::Sha256 => ca_key.sign_pss::<Sha256, _>(prepared.tbs(), &mut rng),
+                PssHash::Sha384 => ca_key.sign_pss::<Sha384, _>(prepared.tbs(), &mut rng),
+                PssHash::Sha512 => ca_key.sign_pss::<Sha512, _>(prepared.tbs(), &mut rng),
+            }
+            .unwrap();
+            let external = prepared.finish(&sig);
+            assert_eq!(external.signature_algorithm().unwrap(), alg);
+            external.verify_signature_with(&ca_rsa).unwrap();
+        }
+    }
+
+    /// RFC 5280 §4.1.1.2 covers the parameters too: the same
+    /// `id-RSASSA-PSS` OID inside and out, with the outer parameters
+    /// naming the digest the signature was really made with and the inner
+    /// ones another, is malformed — an outer-only verifier would accept it.
+    #[test]
+    fn pss_params_must_match_between_tbs_and_outer_algid() {
+        use crate::hash::Sha384;
+        use crate::rng::HmacDrbg;
+        use crate::x509::{PssHash, PssParams};
+        let key = rsa_test_key_a();
+        let mut rng = HmacDrbg::<Sha256>::new(b"cert-pss-mismatch", b"n", &[]);
+        let inner = pss_algid(PssParams::for_hash(PssHash::Sha256));
+        let outer = pss_algid(PssParams::for_hash(PssHash::Sha384));
+        let cert = assemble_rsa_cert(&inner, &outer, |tbs| {
+            key.sign_pss::<Sha384, _>(tbs, &mut rng).unwrap()
+        });
+        let pub_key = cert.subject_public_key().unwrap();
+        assert_eq!(cert.signature_algorithm_oid().unwrap(), oid::ID_RSASSA_PSS);
+        assert_eq!(
+            cert.signature_algorithm()
+                .unwrap()
+                .pss_params()
+                .unwrap()
+                .hash,
+            PssHash::Sha384
+        );
+        assert!(matches!(
+            cert.check_signature_algid_consistent(),
+            Err(Error::Malformed)
+        ));
+        assert!(matches!(
+            cert.verify_signature_with(&pub_key),
+            Err(Error::Malformed)
+        ));
+        // Consistent parameters: the same signature verifies.
+        let cert = assemble_rsa_cert(&outer, &outer, |tbs| {
+            key.sign_pss::<Sha384, _>(tbs, &mut rng).unwrap()
+        });
+        cert.verify_signature_with(&pub_key).unwrap();
+    }
+
+    /// The signature's `saltLength` is honoured rather than assumed equal to
+    /// the digest length, and RFC 4055 §3.3 bounds it from below by a
+    /// PSS-restricted issuer key's own `saltLength`: a salt-20 signature
+    /// verifies under an `rsaEncryption` key or a key restricted to a salt
+    /// of at most 20, and is refused under one restricted to 32.
+    #[test]
+    fn pss_salt_shorter_than_restricted_key_salt_is_refused() {
+        use crate::rng::HmacDrbg;
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::{AnyPublicKey, PssHash, PssParams, PssRestriction};
+        let key = rsa_test_key_a();
+        let pk = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der())
+            .unwrap()
+            .public_key();
+        let mut rng = HmacDrbg::<Sha256>::new(b"cert-pss-salt", b"n", &[]);
+        let salt = |salt_len| PssParams {
+            hash: PssHash::Sha256,
+            mgf1_hash: PssHash::Sha256,
+            salt_len,
+            trailer_field: 1,
+        };
+        let algid20 = pss_algid(salt(20));
+        let cert = assemble_rsa_cert(&algid20, &algid20, |tbs| {
+            key.sign_pss_with_salt_len::<Sha256, _>(tbs, 20, &mut rng)
+                .unwrap()
+        });
+        assert_eq!(
+            cert.signature_algorithm().unwrap().pss_params(),
+            Some(&salt(20))
+        );
+        cert.verify_signature_with(&AnyPublicKey::Rsa(pk.clone()))
+            .unwrap();
+        for restriction in [
+            PssRestriction::Unrestricted,
+            PssRestriction::Restricted(salt(20)),
+            PssRestriction::Restricted(salt(16)),
+            PssRestriction::Restricted(salt(0)),
+        ] {
+            cert.verify_signature_with(&AnyPublicKey::RsaPss(pk.clone(), restriction))
+                .unwrap();
+        }
+        for restriction in [
+            PssRestriction::for_hash(PssHash::Sha256),
+            PssRestriction::Restricted(salt(21)),
+        ] {
+            assert_eq!(
+                cert.verify_signature_with(&AnyPublicKey::RsaPss(pk.clone(), restriction))
+                    .err(),
+                Some(Error::UnsupportedAlgorithm)
+            );
+        }
+        // The parameters are what is verified with: the same salt-20
+        // signature labelled as salt 32 fails the RSA check (it is not
+        // silently re-verified with the recovered salt).
+        let algid32 = pss_algid(salt(32));
+        let mislabelled = assemble_rsa_cert(&algid32, &algid32, |tbs| {
+            key.sign_pss_with_salt_len::<Sha256, _>(tbs, 20, &mut rng)
+                .unwrap()
+        });
+        assert!(matches!(
+            mislabelled.verify_signature_with(&AnyPublicKey::Rsa(pk.clone())),
+            Err(Error::Rsa(_))
+        ));
+    }
+
+    /// An `id-RSASSA-PSS` signature `AlgorithmIdentifier` without
+    /// parameters (or with an empty SEQUENCE) means the DER defaults —
+    /// SHA-1 / MGF1-SHA-1 / salt 20 — which the crate does not implement:
+    /// `UnsupportedAlgorithm`, never a silent SHA-256 assumption. The bare
+    /// OID accessor still works for inspection.
+    #[test]
+    fn pss_signature_without_params_is_unsupported() {
+        use crate::rng::HmacDrbg;
+        let key = rsa_test_key_a();
+        let mut rng = HmacDrbg::<Sha256>::new(b"cert-pss-noparams", b"n", &[]);
+        let bare = encode_sequence(&oid_tlv(oid::ID_RSASSA_PSS));
+        let empty = encode_sequence(&[oid_tlv(oid::ID_RSASSA_PSS), encode_sequence(&[])].concat());
+        for algid in [bare, empty] {
+            let cert = assemble_rsa_cert(&algid, &algid, |tbs| {
+                key.sign_pss::<Sha256, _>(tbs, &mut rng).unwrap()
+            });
+            assert_eq!(cert.signature_algorithm_oid().unwrap(), oid::ID_RSASSA_PSS);
+            assert_eq!(
+                cert.signature_algorithm().err(),
+                Some(Error::UnsupportedAlgorithm)
+            );
+            let pub_key = cert.subject_public_key().unwrap();
+            assert_eq!(
+                cert.verify_signature_with(&pub_key).err(),
+                Some(Error::UnsupportedAlgorithm)
+            );
+            // The rest of the certificate remains inspectable.
+            assert_eq!(
+                cert.subject().unwrap(),
+                DistinguishedName::common_name("pss params")
+            );
+        }
+    }
+
+    /// OpenSSL 3 fixtures (`openssl req -x509 -sha384 -sigopt
+    /// rsa_padding_mode:pss -sigopt rsa_pss_saltlen:48`): a self-signed
+    /// certificate whose signature is `id-RSASSA-PSS` with SHA-384 /
+    /// MGF1-SHA-384 / salt 48 over an `rsaEncryption` key, and one over an
+    /// `RSA-PSS` key (`openssl genpkey -algorithm RSA-PSS -pkeyopt
+    /// rsa_pss_keygen_md:sha384 ...`) whose SPKI restricts the key to the
+    /// same parameters.
+    #[test]
+    fn openssl_pss_sha384_fixtures_verify() {
+        use crate::x509::{
+            AnyPublicKey, PssHash, PssParams, PssRestriction, SignatureAlgorithmIdentifier,
+        };
+        let want = SignatureAlgorithmIdentifier::rsa_pss(PssParams::for_hash(PssHash::Sha384));
+        let rsae = Certificate::from_pem(include_str!("../../testdata/rsa_pss_sha384_openssl.pem"))
+            .unwrap();
+        let pss = Certificate::from_pem(include_str!(
+            "../../testdata/rsa_pss_pss_sha384_openssl.pem"
+        ))
+        .unwrap();
+        let rsae_key = rsae.subject_public_key().unwrap();
+        assert!(matches!(rsae_key, AnyPublicKey::Rsa(_)));
+        let pss_key = pss.subject_public_key().unwrap();
+        assert!(matches!(
+            &pss_key,
+            AnyPublicKey::RsaPss(_, r) if *r == PssRestriction::for_hash(PssHash::Sha384)
+        ));
+        for (cert, key) in [(&rsae, &rsae_key), (&pss, &pss_key)] {
+            assert_eq!(cert.signature_algorithm().unwrap(), want);
+            cert.check_signature_algid_consistent().unwrap();
+            cert.verify_signature_with(key).unwrap();
+            assert_eq!(
+                key.signature_algorithm(&want).unwrap().id(),
+                "rsa-pss-pss-sha384"
+            );
+            let mut der = cert.to_der().to_vec();
+            let i = der.len() / 2;
+            der[i] ^= 0x01;
+            if let Ok(bad) = Certificate::from_der(der) {
+                assert!(bad.verify_signature_with(key).is_err());
+            }
+        }
+        // The two keys differ; neither verifies the other's certificate.
+        assert!(rsae.verify_signature_with(&pss_key).is_err());
+        assert!(pss.verify_signature_with(&rsae_key).is_err());
     }
 
     #[test]

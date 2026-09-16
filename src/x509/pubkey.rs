@@ -104,7 +104,8 @@ impl PssHash {
 
     /// The id of the `rsa-pss-pss-*` entry of [`crate::signature_registry`]
     /// that verifies PSS signatures over this digest (MGF1 with the same
-    /// digest, salt length equal to the digest length).
+    /// digest; the salt length is the signature's, defaulting to the digest
+    /// length).
     pub fn registry_id(self) -> &'static str {
         match self {
             PssHash::Sha256 => "rsa-pss-pss-sha256",
@@ -140,11 +141,18 @@ impl PssHash {
 ///
 /// The parser only produces values the registry could verify under:
 /// `trailer_field` is always 1 (RFC 4055 requires it), and `hash` /
-/// `mgf1_hash` are one of the [`PssHash`] digests. `mgf1_hash != hash` and
-/// `salt_len != hash.output_len()` are representable — the restriction is
-/// preserved faithfully — but no registry entry implements those
-/// combinations, so such a key verifies nothing
-/// ([`Error::UnsupportedAlgorithm`]) rather than something else.
+/// `mgf1_hash` are one of the [`PssHash`] digests. `mgf1_hash != hash` is
+/// representable — the restriction is preserved faithfully — but no
+/// registry entry implements MGF1 over a digest other than the message
+/// digest, so such a key verifies nothing ([`Error::UnsupportedAlgorithm`])
+/// rather than something else. Any `salt_len` is representable and
+/// honoured: a signature's own `RSASSA-PSS-params` name the salt length the
+/// registry verifies with, and a key's restriction only bounds it from
+/// below (RFC 4055 §3.3).
+///
+/// The same structure describes the parameters of an `id-RSASSA-PSS`
+/// *signature* `AlgorithmIdentifier`
+/// ([`SignatureAlgorithmIdentifier::rsa_pss`](super::SignatureAlgorithmIdentifier::rsa_pss)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PssParams {
@@ -173,7 +181,9 @@ impl PssParams {
 
 /// The RFC 4055 §1.2 use restriction an `id-RSASSA-PSS` SPKI places on its
 /// RSA key: "the key MUST only be used with RSASSA-PSS", and — when
-/// `RSASSA-PSS-params` are present — only with exactly those parameters.
+/// `RSASSA-PSS-params` are present — only with parameters compatible with
+/// them (§3.3: same digest, MGF1 digest and trailer field, a salt at least
+/// as long).
 ///
 /// Carried by [`AnyPublicKey::RsaPss`] so the restriction survives the
 /// round trip through [`AnyPublicKey::to_spki_der`]: a PSS-restricted key
@@ -184,7 +194,8 @@ impl PssParams {
 pub enum PssRestriction {
     /// Parameters absent: any RSASSA-PSS parameter set, never PKCS#1 v1.5.
     Unrestricted,
-    /// Exactly these parameters.
+    /// These parameters: the digest, MGF1 digest and trailer field exactly,
+    /// and at least this salt length ([`permits_params`](Self::permits_params)).
     Restricted(PssParams),
 }
 
@@ -197,11 +208,26 @@ impl PssRestriction {
 
     /// Whether a signature made with the registry profile for `hash` (MGF1
     /// over `hash`, salt = digest length) is permitted under this
-    /// restriction.
+    /// restriction — [`permits_params`](Self::permits_params) of
+    /// [`PssParams::for_hash`].
     pub fn permits(&self, hash: PssHash) -> bool {
+        self.permits_params(&PssParams::for_hash(hash))
+    }
+
+    /// Whether a signature made with `params` is compatible with this
+    /// restriction, per RFC 4055 §3.3: always for an unrestricted key;
+    /// for a restricted one the digest, the MGF1 digest and the trailer
+    /// field must be the key's and the signature's salt must be at least as
+    /// long as the key's.
+    pub fn permits_params(&self, params: &PssParams) -> bool {
         match self {
             PssRestriction::Unrestricted => true,
-            PssRestriction::Restricted(p) => *p == PssParams::for_hash(hash),
+            PssRestriction::Restricted(k) => {
+                k.hash == params.hash
+                    && k.mgf1_hash == params.mgf1_hash
+                    && k.trailer_field == params.trailer_field
+                    && params.salt_len >= k.salt_len
+            }
         }
     }
 
@@ -571,21 +597,25 @@ impl AnyPublicKey {
         Self::from_spki_der(&pem_decode(pem, SPKI_LABEL)?)
     }
 
-    /// Verifies `sig` over `msg` under the signature algorithm identified by
-    /// `sig_alg` OID arcs.
+    /// Verifies `sig` over `msg` under the signature `AlgorithmIdentifier`
+    /// `sig_alg` (OID plus parameters).
     ///
-    /// Dispatch goes through [`crate::signature_registry`]: the OID picks an
-    /// entry in [`ALGORITHMS`](crate::signature_registry::ALGORITHMS) (see
-    /// [`signature_algorithm`](Self::signature_algorithm)), which then
-    /// re-parses the SPKI to recover the key and verifies. RSA signatures
-    /// are PKCS#1 v1.5 or RSA-PSS (the OID fixes which); ECDSA signatures
-    /// are DER `Ecdsa-Sig-Value`; Ed25519 is raw 64-byte R‖S.
+    /// Dispatch goes through [`crate::signature_registry`]: the identifier
+    /// picks an entry in [`ALGORITHMS`](crate::signature_registry::ALGORITHMS)
+    /// (see [`signature_algorithm`](Self::signature_algorithm)), which then
+    /// re-parses the SPKI to recover the key and verifies with the
+    /// identifier's parameters
+    /// ([`SignatureAlgorithm::verify_with_params`](crate::signature_registry::SignatureAlgorithm::verify_with_params)).
+    /// RSA signatures are PKCS#1 v1.5 or RSA-PSS (the OID fixes which; the
+    /// `RSASSA-PSS-params` fix the digest and salt length); ECDSA
+    /// signatures are DER `Ecdsa-Sig-Value`; Ed25519 is raw 64-byte R‖S.
     ///
     /// An [`RsaPss`](Self::RsaPss) key honours its RFC 4055 restriction:
-    /// only `id-RSASSA-PSS` signatures are accepted, and only the
-    /// `rsa-pss-pss-*` entry whose digest the restriction names (SHA-256 for
-    /// an unrestricted key) is consulted; a PKCS#1 v1.5 OID, or a digest the
-    /// restriction forbids, is [`Error::UnsupportedAlgorithm`].
+    /// only `id-RSASSA-PSS` signatures are accepted, and only with
+    /// parameters the restriction permits
+    /// ([`PssRestriction::permits_params`]); a PKCS#1 v1.5 OID, or
+    /// parameters the restriction forbids, is
+    /// [`Error::UnsupportedAlgorithm`].
     ///
     /// SECURITY: this performs **no** signature-algorithm-strength or key-size
     /// policy. A SHA-1- or MD5-based RSA signature, or an undersized RSA key,
@@ -597,47 +627,67 @@ impl AnyPublicKey {
     /// through `SignaturePolicy::permits` in `tls::pki::verify` before
     /// trusting it. Do not treat a successful return as evidence the algorithm
     /// is acceptable.
-    pub fn verify(&self, sig_alg: &[u64], msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+    pub fn verify(
+        &self,
+        sig_alg: &super::SignatureAlgorithmIdentifier,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
         let algo = self
             .signature_algorithm(sig_alg)
             .ok_or(Error::UnsupportedAlgorithm)?;
         // The registry entry's `verify` parses an SPKI; round-trip ours.
         let spki = self.to_spki_der();
-        algo.verify(&spki, msg, sig)
+        algo.verify_with_params(&spki, msg, sig, sig_alg.params())
     }
 
     /// The [`crate::signature_registry`] entry [`verify`](Self::verify)
-    /// dispatches to for a signature whose X.509 `AlgorithmIdentifier` OID is
+    /// dispatches to for a signature whose X.509 `AlgorithmIdentifier` is
     /// `sig_alg`, or `None` when no entry would ever accept the pair.
     ///
-    /// For every variant but [`RsaPss`](Self::RsaPss) this is
-    /// [`find_by_oid`](crate::signature_registry::find_by_oid). A PSS-key
-    /// restricted key maps `id-RSASSA-PSS` to the `rsa-pss-pss-*` entry for
-    /// the digest its [`PssRestriction`] names (SHA-256 when unrestricted)
-    /// and every other OID — the PKCS#1 v1.5 family in particular — to
-    /// `None`, per RFC 4055 §1.2. Policy gates (`SignaturePolicy::permits`)
-    /// should consult this rather than the bare OID lookup so the entry they
-    /// whitelist is the one that verifies.
+    /// For every OID but `id-RSASSA-PSS` this is
+    /// [`find_by_oid`](crate::signature_registry::find_by_oid) — except
+    /// under an [`RsaPss`](Self::RsaPss) key, which maps every other OID
+    /// (the PKCS#1 v1.5 family in particular) to `None` per RFC 4055 §1.2.
+    ///
+    /// `id-RSASSA-PSS` is resolved from the identifier's
+    /// `RSASSA-PSS-params` (RFC 4055 §3.1), never from the OID alone: the
+    /// `rsa-pss-pss-<digest>` entry for the *signature's* digest, provided
+    /// MGF1 uses the same digest and the trailer field is 1 (the only
+    /// profile the registry implements), and — for a restricted
+    /// [`RsaPss`](Self::RsaPss) key — provided the parameters are
+    /// compatible with the key's ([`PssRestriction::permits_params`]).
+    /// An identifier without parameters ([`SignatureAlgorithmIdentifier::from_oid`])
+    /// names the unsupported SHA-1 defaults and resolves to `None`.
+    ///
+    /// Policy gates (`SignaturePolicy::permits`) should consult this rather
+    /// than the bare OID lookup so the entry they whitelist is the one that
+    /// verifies.
+    ///
+    /// [`SignatureAlgorithmIdentifier::from_oid`]: super::SignatureAlgorithmIdentifier::from_oid
     pub fn signature_algorithm(
         &self,
-        sig_alg: &[u64],
+        sig_alg: &super::SignatureAlgorithmIdentifier,
     ) -> Option<&'static dyn crate::signature_registry::SignatureAlgorithm> {
         use crate::signature_registry::{find_by_id, find_by_oid};
-        match self {
-            AnyPublicKey::RsaPss(_, restriction) => {
-                if sig_alg != oid::ID_RSASSA_PSS {
-                    return None;
-                }
-                let hash = restriction.hash().unwrap_or(PssHash::Sha256);
-                if !restriction.permits(hash) {
-                    // Restricted to a MGF1-digest / salt-length combination
-                    // no registry entry implements.
-                    return None;
-                }
-                find_by_id(hash.registry_id())
+        if sig_alg.oid() == oid::ID_RSASSA_PSS {
+            let p = sig_alg.pss_params()?;
+            if p.mgf1_hash != p.hash || p.trailer_field != 1 {
+                // A MGF1-digest / trailer combination no entry implements.
+                return None;
             }
-            _ => find_by_oid(sig_alg),
+            if let AnyPublicKey::RsaPss(_, restriction) = self
+                && !restriction.permits_params(p)
+            {
+                return None;
+            }
+            return find_by_id(p.hash.registry_id());
         }
+        if matches!(self, AnyPublicKey::RsaPss(..)) {
+            // RFC 4055 §1.2: the key MUST only be used with RSASSA-PSS.
+            return None;
+        }
+        find_by_oid(sig_alg.oid())
     }
 }
 
@@ -746,9 +796,10 @@ impl crate::key::PublicKey for AnyPublicKey {
 }
 
 /// Rejects facade verify parameters an RFC 4055 PSS key restriction forbids:
-/// any padding but PSS, and — for a restricted key — a digest or salt length
-/// other than the restriction's. Only inspects the parameters; the RSA key's
-/// own `verify` consumes (and re-validates) them afterwards.
+/// any padding but PSS, and — for a restricted key — a digest other than
+/// the restriction's or a salt shorter than the restriction's (RFC 4055
+/// §3.3). Only inspects the parameters; the RSA key's own `verify` consumes
+/// (and re-validates) them afterwards.
 #[cfg(feature = "key")]
 fn pss_restriction_check(
     restriction: &PssRestriction,
@@ -767,8 +818,8 @@ fn pss_restriction_check(
         return Err(Error::InvalidParams);
     }
     let salt_ok = match salt_len {
-        SaltLen::DigestLength => want.salt_len == want.hash.output_len(),
-        SaltLen::Fixed(n) => n as u64 == u64::from(want.salt_len),
+        SaltLen::DigestLength => want.hash.output_len() >= want.salt_len,
+        SaltLen::Fixed(n) => n as u64 >= u64::from(want.salt_len),
         _ => false,
     };
     if !salt_ok {
@@ -784,6 +835,7 @@ mod tests {
     use crate::hash::{Sha256, Sha384, Sha512};
     use crate::rng::HmacDrbg;
     use crate::test_util::rsa_test_key_a;
+    use crate::x509::SignatureAlgorithmIdentifier;
 
     #[test]
     fn rsa_spki_roundtrip() {
@@ -830,12 +882,13 @@ mod tests {
                 CurveId::P384 => sk.sign::<Sha384>(b"hello").unwrap(),
                 _ => sk.sign::<Sha512>(b"hello").unwrap(),
             };
+            let sig_alg = SignatureAlgorithmIdentifier::from_oid(sig_alg);
             parsed
-                .verify(sig_alg, b"hello", &sig.to_der(curve))
+                .verify(&sig_alg, b"hello", &sig.to_der(curve))
                 .unwrap();
             assert!(
                 parsed
-                    .verify(sig_alg, b"other", &sig.to_der(curve))
+                    .verify(&sig_alg, b"other", &sig.to_der(curve))
                     .is_err()
             );
         }
@@ -854,8 +907,9 @@ mod tests {
 
         // Ed25519 signatures are raw 64-byte R‖S, verified under id-Ed25519.
         let sig = sk.sign(b"hello").to_bytes();
-        parsed.verify(oid::ID_ED25519, b"hello", &sig).unwrap();
-        assert!(parsed.verify(oid::ID_ED25519, b"other", &sig).is_err());
+        let alg = SignatureAlgorithmIdentifier::from_oid(oid::ID_ED25519);
+        parsed.verify(&alg, b"hello", &sig).unwrap();
+        assert!(parsed.verify(&alg, b"other", &sig).is_err());
     }
 
     #[test]
@@ -872,8 +926,9 @@ mod tests {
         // Ed448 signatures are raw 114-byte R‖S (empty context), verified
         // under id-Ed448.
         let sig = sk.sign(b"hello").to_bytes();
-        parsed.verify(oid::ID_ED448, b"hello", &sig).unwrap();
-        assert!(parsed.verify(oid::ID_ED448, b"other", &sig).is_err());
+        let alg = SignatureAlgorithmIdentifier::from_oid(oid::ID_ED448);
+        parsed.verify(&alg, b"hello", &sig).unwrap();
+        assert!(parsed.verify(&alg, b"other", &sig).is_err());
     }
 
     // H-7: RFC 3279 §2.3.1 — rsaEncryption REQUIRES explicit NULL
@@ -1054,59 +1109,108 @@ mod tests {
         assert!(AnyPublicKey::from_spki_der(&spki_with(junk)).is_err());
     }
 
-    /// RFC 4055 §1.2 at the `AnyPublicKey` level: a PSS-restricted key
-    /// dispatches an `id-RSASSA-PSS` signature to the `rsa-pss-pss-*` entry
-    /// for its digest, refuses every PKCS#1 v1.5 OID, and refuses a PSS
-    /// signature over a digest the restriction forbids — while the same
-    /// modulus as `AnyPublicKey::Rsa` still verifies PKCS#1 v1.5.
+    /// RFC 4055 at the `AnyPublicKey` level: an `id-RSASSA-PSS` signature
+    /// dispatches to the `rsa-pss-pss-*` entry for the digest *its
+    /// parameters* name, a PSS-restricted key refuses every PKCS#1 v1.5 OID
+    /// and any PSS parameters incompatible with its restriction (§3.3:
+    /// digest equal, salt at least the key's), an identifier without
+    /// parameters (the SHA-1 defaults) resolves to nothing — while the same
+    /// modulus as `AnyPublicKey::Rsa` still verifies PKCS#1 v1.5 and PSS
+    /// over any digest.
     #[test]
     fn rsa_pss_key_dispatches_only_to_matching_pss_entries() {
         let sk = rsa_test_key_a();
         let mut rng = HmacDrbg::<Sha256>::new(b"spki-pss-dispatch", b"n", &[]);
         let pss256 = sk.sign_pss::<Sha256, _>(b"hi", &mut rng).unwrap();
         let pss384 = sk.sign_pss::<Sha384, _>(b"hi", &mut rng).unwrap();
+        let pss256_salt20 = sk
+            .sign_pss_with_salt_len::<Sha256, _>(b"hi", 20, &mut rng)
+            .unwrap();
         let pkcs1 = sk.sign_pkcs1v15::<Sha256>(b"hi").unwrap();
         let key = boxed_rsa_a();
+        let alg256 = SignatureAlgorithmIdentifier::rsa_pss(PssParams::for_hash(PssHash::Sha256));
+        let alg384 = SignatureAlgorithmIdentifier::rsa_pss(PssParams::for_hash(PssHash::Sha384));
+        let alg256_salt20 = SignatureAlgorithmIdentifier::rsa_pss(PssParams {
+            hash: PssHash::Sha256,
+            mgf1_hash: PssHash::Sha256,
+            salt_len: 20,
+            trailer_field: 1,
+        });
+        let bare = SignatureAlgorithmIdentifier::from_oid(oid::ID_RSASSA_PSS);
 
         let unrestricted = AnyPublicKey::RsaPss(key.clone(), PssRestriction::Unrestricted);
         let r256 = AnyPublicKey::RsaPss(key.clone(), PssRestriction::for_hash(PssHash::Sha256));
         let r384 = AnyPublicKey::RsaPss(key.clone(), PssRestriction::for_hash(PssHash::Sha384));
         let plain = AnyPublicKey::Rsa(key.clone());
 
-        // Dispatch follows the restriction (SHA-256 when unrestricted).
-        for (k, id) in [
-            (&unrestricted, "rsa-pss-pss-sha256"),
-            (&r256, "rsa-pss-pss-sha256"),
-            (&r384, "rsa-pss-pss-sha384"),
+        // Dispatch follows the signature's parameters, gated by the key's
+        // restriction.
+        for (k, alg, id) in [
+            (&unrestricted, &alg256, Some("rsa-pss-pss-sha256")),
+            (&unrestricted, &alg384, Some("rsa-pss-pss-sha384")),
+            (&unrestricted, &alg256_salt20, Some("rsa-pss-pss-sha256")),
+            (&r256, &alg256, Some("rsa-pss-pss-sha256")),
+            (&r256, &alg384, None),
+            (&r256, &alg256_salt20, None),
+            (&r384, &alg384, Some("rsa-pss-pss-sha384")),
+            (&r384, &alg256, None),
+            (&plain, &alg256, Some("rsa-pss-pss-sha256")),
+            (&plain, &alg384, Some("rsa-pss-pss-sha384")),
+            (&plain, &alg256_salt20, Some("rsa-pss-pss-sha256")),
+            // No parameters = SHA-1 defaults: nothing implements them.
+            (&unrestricted, &bare, None),
+            (&r256, &bare, None),
+            (&plain, &bare, None),
         ] {
-            assert_eq!(k.signature_algorithm(oid::ID_RSASSA_PSS).unwrap().id(), id);
+            assert_eq!(
+                k.signature_algorithm(alg).map(|a| a.id()),
+                id,
+                "{k:?} / {alg:?}"
+            );
+        }
+        for k in [&unrestricted, &r256, &r384] {
             for pkcs1_oid in [
                 oid::SHA256_WITH_RSA,
                 oid::SHA384_WITH_RSA,
                 oid::SHA1_WITH_RSA,
             ] {
-                assert!(k.signature_algorithm(pkcs1_oid).is_none());
+                let alg = SignatureAlgorithmIdentifier::from_oid(pkcs1_oid);
+                assert!(k.signature_algorithm(&alg).is_none());
                 assert_eq!(
-                    k.verify(pkcs1_oid, b"hi", &pkcs1).err(),
+                    k.verify(&alg, b"hi", &pkcs1).err(),
                     Some(Error::UnsupportedAlgorithm)
                 );
             }
         }
+        unrestricted.verify(&alg256, b"hi", &pss256).unwrap();
+        unrestricted.verify(&alg384, b"hi", &pss384).unwrap();
+        // The signature's salt length is honoured, not assumed.
         unrestricted
-            .verify(oid::ID_RSASSA_PSS, b"hi", &pss256)
+            .verify(&alg256_salt20, b"hi", &pss256_salt20)
             .unwrap();
-        r256.verify(oid::ID_RSASSA_PSS, b"hi", &pss256).unwrap();
-        r384.verify(oid::ID_RSASSA_PSS, b"hi", &pss384).unwrap();
-        // Digest the restriction forbids: refused before any RSA math.
-        assert!(r256.verify(oid::ID_RSASSA_PSS, b"hi", &pss384).is_err());
-        assert!(r384.verify(oid::ID_RSASSA_PSS, b"hi", &pss256).is_err());
-        assert!(
-            unrestricted
-                .verify(oid::ID_RSASSA_PSS, b"other", &pss256)
-                .is_err()
+        assert!(unrestricted.verify(&alg256, b"hi", &pss256_salt20).is_err());
+        assert!(unrestricted.verify(&alg256_salt20, b"hi", &pss256).is_err());
+        r256.verify(&alg256, b"hi", &pss256).unwrap();
+        r384.verify(&alg384, b"hi", &pss384).unwrap();
+        // Digest the restriction forbids, or a salt shorter than the key's:
+        // refused before any RSA math.
+        assert_eq!(
+            r256.verify(&alg384, b"hi", &pss384).err(),
+            Some(Error::UnsupportedAlgorithm)
         );
-        // A restriction no registry entry implements verifies nothing.
-        let odd = AnyPublicKey::RsaPss(
+        assert_eq!(
+            r256.verify(&alg256_salt20, b"hi", &pss256_salt20).err(),
+            Some(Error::UnsupportedAlgorithm)
+        );
+        assert!(r384.verify(&alg256, b"hi", &pss256).is_err());
+        assert!(unrestricted.verify(&alg256, b"other", &pss256).is_err());
+        assert_eq!(
+            unrestricted.verify(&bare, b"hi", &pss256).err(),
+            Some(Error::UnsupportedAlgorithm)
+        );
+        // A key restricted to a *shorter* salt accepts the longer one
+        // (RFC 4055 §3.3) but not a shorter-still one.
+        let salt20_key = AnyPublicKey::RsaPss(
             key.clone(),
             PssRestriction::Restricted(PssParams {
                 hash: PssHash::Sha256,
@@ -1115,16 +1219,39 @@ mod tests {
                 trailer_field: 1,
             }),
         );
-        assert!(odd.signature_algorithm(oid::ID_RSASSA_PSS).is_none());
-        assert!(odd.verify(oid::ID_RSASSA_PSS, b"hi", &pss256).is_err());
+        salt20_key.verify(&alg256, b"hi", &pss256).unwrap();
+        salt20_key
+            .verify(&alg256_salt20, b"hi", &pss256_salt20)
+            .unwrap();
+        let alg256_salt16 = SignatureAlgorithmIdentifier::rsa_pss(PssParams {
+            hash: PssHash::Sha256,
+            mgf1_hash: PssHash::Sha256,
+            salt_len: 16,
+            trailer_field: 1,
+        });
+        assert!(salt20_key.signature_algorithm(&alg256_salt16).is_none());
+        // A restriction no registry entry implements (MGF1 over another
+        // digest) verifies nothing, and neither does a signature with such
+        // parameters.
+        let odd_params = PssParams {
+            hash: PssHash::Sha256,
+            mgf1_hash: PssHash::Sha384,
+            salt_len: 32,
+            trailer_field: 1,
+        };
+        let odd = AnyPublicKey::RsaPss(key.clone(), PssRestriction::Restricted(odd_params));
+        assert!(odd.signature_algorithm(&alg256).is_none());
+        assert!(odd.verify(&alg256, b"hi", &pss256).is_err());
+        let odd_alg = SignatureAlgorithmIdentifier::rsa_pss(odd_params);
+        assert!(plain.signature_algorithm(&odd_alg).is_none());
+        assert!(unrestricted.signature_algorithm(&odd_alg).is_none());
         // The unrestricted `rsaEncryption` form of the same key is not bound.
-        plain.verify(oid::SHA256_WITH_RSA, b"hi", &pkcs1).unwrap();
-        plain.verify(oid::ID_RSASSA_PSS, b"hi", &pss256).unwrap();
+        let pkcs1_alg = SignatureAlgorithmIdentifier::from_oid(oid::SHA256_WITH_RSA);
+        plain.verify(&pkcs1_alg, b"hi", &pkcs1).unwrap();
+        plain.verify(&alg256, b"hi", &pss256).unwrap();
+        plain.verify(&alg384, b"hi", &pss384).unwrap();
         assert_eq!(
-            plain
-                .signature_algorithm(oid::SHA256_WITH_RSA)
-                .unwrap()
-                .id(),
+            plain.signature_algorithm(&pkcs1_alg).unwrap().id(),
             "rsa-pkcs1-sha256"
         );
     }

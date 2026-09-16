@@ -18,8 +18,9 @@ the caller has to name the id explicitly.
 | `rsa-pss-rsae-sha256`       | (TLS only, `rsaEncryption` key) | `0x0804`       | yes |
 | `rsa-pss-rsae-sha384`       | (TLS only, `rsaEncryption` key) | `0x0805`       | yes |
 | `rsa-pss-rsae-sha512`       | (TLS only, `rsaEncryption` key) | `0x0806`       | yes |
-| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (`id-RSASSA-PSS`; SHA-256 / MGF1-SHA-256 / salt 32) | (none) | yes |
-| `rsa-pss-pss-sha384`, `rsa-pss-pss-sha512` | `id-RSASSA-PSS` via the key's restriction (SHA-384 / salt 48, SHA-512 / salt 64) | (none) | yes |
+| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (`id-RSASSA-PSS`) when its `RSASSA-PSS-params` name SHA-256 / MGF1-SHA-256 | (none) | yes |
+| `rsa-pss-pss-sha384`        | `id-RSASSA-PSS` when its params name SHA-384 / MGF1-SHA-384 | (none) | yes |
+| `rsa-pss-pss-sha512`        | `id-RSASSA-PSS` when its params name SHA-512 / MGF1-SHA-512 | (none) | yes |
 | `ecdsa-with-sha256`         | `1.2.840.10045.4.3.2` (any curve) | (none)       | yes |
 | `ecdsa-with-sha384`         | `1.2.840.10045.4.3.3` (any curve) | (none)       | yes |
 | `ecdsa-with-sha512`         | `1.2.840.10045.4.3.4` (any curve) | (none)       | yes |
@@ -49,17 +50,49 @@ for opt-in.
 The three `rsa-pss-rsae-*` entries carry **no** X.509 OID: in X.509 the
 `sha*WithRSAEncryption` OIDs mean PKCS#1 v1.5 and belong to the
 `rsa-pkcs1-*` entries, while an RSA-PSS certificate signature is
-`id-RSASSA-PSS`. Its OID lookup reaches `rsa-pss-pss-sha256`, which accepts
-both an `rsaEncryption` SPKI and a PSS-restricted `id-RSASSA-PSS` SPKI
-(parameters absent, or exactly the SHA-256 / MGF1-SHA-256 / salt-32 set).
+`id-RSASSA-PSS`.
 
-A PSS-restricted key parses to `x509::AnyPublicKey::RsaPss` with its RFC
-4055 `PssRestriction` preserved, and `AnyPublicKey::signature_algorithm`
-routes an `id-RSASSA-PSS` signature under it to the `rsa-pss-pss-*` entry for
-the digest the restriction names (SHA-256 when unrestricted) — the chain
-verifier, CRL and OCSP gates whitelist that entry, not the bare OID lookup.
-Every PSS entry refuses a key restricted to another digest, and the
-`rsa-pkcs1-*` entries refuse a PSS-restricted key outright (RFC 4055 §1.2).
+## RSA-PSS in X.509: the parameters select the entry
+
+`id-RSASSA-PSS` names no digest by itself. RFC 4055 §3.1 puts the digest,
+the MGF1 digest, the salt length and the trailer field in the
+`RSASSA-PSS-params` of the *signature's* `AlgorithmIdentifier`, so
+`find_by_oid` deliberately does not resolve that OID (none of the
+`rsa-pss-pss-*` entries lists it). Instead the X.509 parsers expose the whole
+identifier — `Certificate::signature_algorithm`,
+`CertificateRevocationList::signature_algorithm`,
+`OcspResponse::signature_algorithm`,
+`CertificationRequest::signature_algorithm` — as an
+`x509::SignatureAlgorithmIdentifier` (OID plus `x509::SignatureParams`), and
+`AnyPublicKey::signature_algorithm` resolves it:
+
+* `id-RSASSA-PSS` maps to the `rsa-pss-pss-<digest>` entry for the digest the
+  parameters name, provided MGF1 uses the same digest and the trailer field
+  is 1 (the only profile the registry implements). The entry then verifies
+  through `SignatureAlgorithm::verify_with_params` with the signature's own
+  salt length — it is not assumed to equal the digest length.
+* An `id-RSASSA-PSS` identifier without parameters (or with an empty
+  SEQUENCE) means the DER defaults — SHA-1 / MGF1-SHA-1 / salt 20 — and is
+  `UnsupportedAlgorithm`, never a silent SHA-256 assumption.
+* The issuer key may be certified as `rsaEncryption` or as `id-RSASSA-PSS`.
+  A PSS-restricted key parses to `x509::AnyPublicKey::RsaPss` with its RFC
+  4055 `PssRestriction` preserved, and the signature's parameters must be
+  compatible with it per RFC 4055 §3.3 (`PssRestriction::permits_params`):
+  same digest, same MGF1 digest, same trailer field, and a salt at least as
+  long as the key's. Anything else resolves to no entry. Such a key also
+  refuses every PKCS#1 v1.5 OID, and the `rsa-pkcs1-*` entries refuse a
+  PSS-restricted SPKI outright (RFC 4055 §1.2).
+* Certificates and CRLs compare the inner (`TBSCertificate.signature` /
+  `TBSCertList.signature`) and outer `signatureAlgorithm` byte for byte
+  (RFC 5280 §4.1.1.2 / §5.1.1.2), parameters included, so an outer
+  identifier that names a different PSS parameter set than the signed one
+  is `Malformed`.
+
+The chain verifier, the CRL and OCSP gates whitelist the entry this dispatch
+returns, not a bare OID lookup. On the issuing side `CertSigner::RsaPss(key,
+PssHash)` and `SignatureAlgId::RsaPssSha256 / Sha384 / Sha512` write the
+matching `RSASSA-PSS-params` (MGF1 with the same digest, salt = digest
+length) into both identifiers.
 
 ML-DSA is on the default whitelist. SLH-DSA's twelve parameter sets are
 registered but never on the default whitelist: signatures are 7 to 50 KB and

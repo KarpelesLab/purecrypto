@@ -526,7 +526,7 @@ fn check_revocation(
         // accept under `policy` — the same whitelist that gates cert-chain
         // signatures. A CRL signed with e.g. SHA-1-RSA is silently ignored
         // (treated as "not consulted") under `SignaturePolicy::modern()`.
-        let Ok(crl_sig_alg) = crl.signature_algorithm_oid() else {
+        let Ok(crl_sig_alg) = crl.signature_algorithm() else {
             continue;
         };
         let Some(crl_algo) = issuer_key.signature_algorithm(&crl_sig_alg) else {
@@ -584,7 +584,7 @@ fn verify_cert_against_issuer(
     policy: &SignaturePolicy,
 ) -> Result<(), Error> {
     let sig_alg = cert
-        .signature_algorithm_oid()
+        .signature_algorithm()
         .map_err(|_| Error::BadCertificate)?;
     let algo = issuer_key
         .signature_algorithm(&sig_alg)
@@ -3762,6 +3762,84 @@ mod tests {
         ));
     }
 
+    /// A CA certified as plain `rsaEncryption` issues an intermediate and a
+    /// leaf with `id-RSASSA-PSS` signatures over SHA-384 and SHA-512: the
+    /// signature's own `RSASSA-PSS-params` select the registry entry, so
+    /// the chain validates under `modern()` (it used to be verified as
+    /// SHA-256 and fail), and a policy without those entries refuses it.
+    #[test]
+    fn rsa_encryption_ca_issuing_pss_sha384_chain_validates() {
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::{AnyPublicKey, CertSigner, PssHash};
+
+        let ca_key = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let int_key = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_b().to_pkcs1_der()).unwrap();
+        let mut rng =
+            crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"pss-rsae-chain", b"n", &[]);
+        let leaf_key =
+            crate::ec::BoxedEcdsaPrivateKey::generate(crate::ec::CurveId::P256, &mut rng);
+        let ca_name = DistinguishedName::common_name("rsae-root");
+        let int_name = DistinguishedName::common_name("rsae-int");
+        let leaf_name = DistinguishedName::common_name("rsae-leaf");
+        // The root certifies its key as `rsaEncryption` (PKCS#1 v1.5
+        // self-signature) but signs what it issues with PSS-SHA-384.
+        let root = Certificate::self_signed_general(
+            &CertSigner::Rsa(&ca_key),
+            &ca_name,
+            &validity(),
+            1,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            root.subject_public_key().unwrap(),
+            AnyPublicKey::Rsa(_)
+        ));
+        let int = Certificate::issue_general(
+            &CertSigner::RsaPss(&ca_key, PssHash::Sha384),
+            &ca_name,
+            &int_name,
+            &AnyPublicKey::Rsa(int_key.public_key()),
+            &validity(),
+            2,
+            true,
+            &[],
+        )
+        .unwrap();
+        let leaf = Certificate::issue_general(
+            &CertSigner::RsaPss(&int_key, PssHash::Sha512),
+            &int_name,
+            &leaf_name,
+            &AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity(),
+            3,
+            false,
+            &["pss.example"],
+        )
+        .unwrap();
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let chain = alloc::vec![leaf.to_der().to_vec(), int.to_der().to_vec()];
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let leaf_pub = verify_chain(&store, &chain, Some(&now), &policy()).unwrap();
+        assert!(matches!(leaf_pub, AnyPublicKey::Ecdsa(_)));
+        // Gated as `rsa-pss-pss-sha384` / `-sha512`: a policy with only the
+        // SHA-256 entry refuses the chain.
+        let sha256_only = SignaturePolicy::empty()
+            .permit("ecdsa-with-sha256")
+            .permit("rsa-pkcs1-sha256")
+            .permit("rsa-pss-pss-sha256");
+        assert!(matches!(
+            verify_chain(&store, &chain, Some(&now), &sha256_only),
+            Err(Error::BadCertificate)
+        ));
+        let with_both = sha256_only
+            .permit("rsa-pss-pss-sha384")
+            .permit("rsa-pss-pss-sha512");
+        verify_chain(&store, &chain, Some(&now), &with_both).unwrap();
+    }
+
     /// A CA whose SPKI is `id-RSASSA-PSS` (RFC 4055, SHA-256-restricted)
     /// issues an intermediate and a leaf with `id-RSASSA-PSS` signatures; the
     /// chain validates under the default `modern()` policy through the
@@ -3778,8 +3856,8 @@ mod tests {
         let mut rng = crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"pss-ca-chain", b"n", &[]);
         let leaf_key =
             crate::ec::BoxedEcdsaPrivateKey::generate(crate::ec::CurveId::P256, &mut rng);
-        let ca_signer = CertSigner::RsaPss(&ca_key);
-        let int_signer = CertSigner::RsaPss(&int_key);
+        let ca_signer = CertSigner::RsaPss(&ca_key, PssHash::Sha256);
+        let int_signer = CertSigner::RsaPss(&int_key, PssHash::Sha256);
         let ca_name = DistinguishedName::common_name("pss-root");
         let int_name = DistinguishedName::common_name("pss-int");
         let leaf_name = DistinguishedName::common_name("pss-leaf");

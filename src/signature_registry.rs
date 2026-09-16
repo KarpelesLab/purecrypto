@@ -61,8 +61,34 @@ pub trait SignatureAlgorithm: Sync + 'static {
 
     /// Verifies `signature` over `message` under `spki` (the full
     /// `SubjectPublicKeyInfo` DER, so curve / key parameters travel with the
-    /// key).
+    /// key), with the entry's default parameters — for the RSA-PSS entries,
+    /// the TLS 1.3 profile (MGF1 over the entry's digest, salt as long as
+    /// the digest).
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error>;
+
+    /// Like [`verify`](Self::verify), but with the parameters an X.509
+    /// signature `AlgorithmIdentifier` carried
+    /// ([`SignatureParams`](crate::x509::SignatureParams)).
+    ///
+    /// Only RSASSA-PSS has parameters that matter (RFC 4055 §3.1): the
+    /// `rsa-pss-*` entries verify with the signature's salt length, after
+    /// checking that its digest and MGF1 digest are the entry's and its
+    /// trailer field is 1. Every other entry accepts
+    /// [`SignatureParams::None`](crate::x509::SignatureParams::None) only
+    /// (the default implementation), and every entry refuses parameters
+    /// meant for another algorithm with [`Error::UnsupportedAlgorithm`].
+    fn verify_with_params(
+        &self,
+        spki: &[u8],
+        message: &[u8],
+        signature: &[u8],
+        params: crate::x509::SignatureParams,
+    ) -> Result<(), Error> {
+        match params {
+            crate::x509::SignatureParams::None => self.verify(spki, message, signature),
+            _ => Err(Error::UnsupportedAlgorithm),
+        }
+    }
 
     /// For policy decisions: RSA modulus length in bits. `None` for non-RSA
     /// algorithms.
@@ -90,9 +116,10 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     #[cfg(all(feature = "rsa", feature = "alloc"))]
     &crate::rsa::registry::PssRsaeSha512,
     // RSA-PSS with a PSS-key-restricted SPKI (`id-RSASSA-PSS`), one entry
-    // per SHA-2 digest. Only the SHA-256 entry carries the X.509 OID;
-    // `AnyPublicKey::signature_algorithm` routes a PSS-restricted key to the
-    // entry for the digest its restriction names.
+    // per SHA-2 digest. None carries an X.509 OID: `id-RSASSA-PSS` does not
+    // name a digest by itself, so `AnyPublicKey::signature_algorithm` routes
+    // an `id-RSASSA-PSS` signature to the entry for the digest its
+    // `RSASSA-PSS-params` name.
     #[cfg(all(feature = "rsa", feature = "alloc"))]
     &crate::rsa::registry::PssPssSha256,
     #[cfg(all(feature = "rsa", feature = "alloc"))]
@@ -531,8 +558,10 @@ mod tests {
 
     /// Every `x509::CertSigner` variant issues a self-signed certificate
     /// whose `signatureAlgorithm` OID resolves to a registry entry that
-    /// verifies the certificate under its own subject key, and the default
-    /// `modern()` policy's verdict on that entry is the documented one:
+    /// verifies the certificate under its own subject key (for
+    /// `id-RSASSA-PSS`, the entry the signature's parameters select), and
+    /// the default `modern()` policy's verdict on that entry is the
+    /// documented one:
     /// every NIST/Ed/ML-DSA signer is permitted, secp256k1 and Brainpool
     /// chain signatures ride the OID-keyed `ecdsa-with-sha*` entries (so
     /// they are permitted too), and SLH-DSA is opt-in only.
@@ -543,7 +572,7 @@ mod tests {
         use crate::hash::Sha256;
         use crate::rng::HmacDrbg;
         use crate::rsa::BoxedRsaPrivateKey;
-        use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+        use crate::x509::{CertSigner, Certificate, DistinguishedName, PssHash, Time, Validity};
 
         let mut rng = HmacDrbg::<Sha256>::new(b"registry-all-signers", b"nonce", &[]);
         let name = DistinguishedName::common_name("registry.example");
@@ -579,12 +608,27 @@ mod tests {
         let (slh, _) =
             crate::slhdsa::PrivateKey::generate(crate::slhdsa::ParamSet::Sha2_128f, &mut rng);
 
-        // (signer, registry id the OID must resolve to, permitted by modern()).
+        // (signer, registry id the signature AlgorithmIdentifier must resolve
+        // to under the subject key, permitted by modern()).
         // Only pushed to under `mldsa` / `slhdsa`.
         #[allow(unused_mut)]
         let mut cases: alloc::vec::Vec<(CertSigner<'_>, &str, bool)> = alloc::vec![
             (CertSigner::Rsa(&rsa), "rsa-pkcs1-sha256", true),
-            (CertSigner::RsaPss(&rsa), "rsa-pss-pss-sha256", true),
+            (
+                CertSigner::RsaPss(&rsa, PssHash::Sha256),
+                "rsa-pss-pss-sha256",
+                true
+            ),
+            (
+                CertSigner::RsaPss(&rsa, PssHash::Sha384),
+                "rsa-pss-pss-sha384",
+                true
+            ),
+            (
+                CertSigner::RsaPss(&rsa, PssHash::Sha512),
+                "rsa-pss-pss-sha512",
+                true
+            ),
             (CertSigner::Ecdsa(&ec[0]), "ecdsa-with-sha256", true),
             (CertSigner::Ecdsa(&ec[1]), "ecdsa-with-sha384", true),
             (CertSigner::Ecdsa(&ec[2]), "ecdsa-with-sha512", true),
@@ -616,9 +660,18 @@ mod tests {
             );
             cert.verify_signature_with(&subject)
                 .unwrap_or_else(|e| panic!("{id}: {e:?}"));
-            let oid = cert.signature_algorithm_oid().unwrap();
-            let algo = find_by_oid(&oid).unwrap_or_else(|| panic!("{id}: OID not in registry"));
+            let alg = cert.signature_algorithm().unwrap();
+            let algo = subject
+                .signature_algorithm(&alg)
+                .unwrap_or_else(|| panic!("{id}: signature algorithm not in registry"));
             assert_eq!(algo.id(), *id);
+            // Every OID but `id-RSASSA-PSS` (whose digest lives in the
+            // parameters) also resolves by bare OID lookup.
+            if alg.oid() != crate::x509::oid::ID_RSASSA_PSS {
+                assert_eq!(find_by_oid(alg.oid()).unwrap().id(), *id);
+            } else {
+                assert!(find_by_oid(alg.oid()).is_none());
+            }
             assert_eq!(
                 policy.permits(algo, &subject.to_spki_der()),
                 *permitted,
