@@ -145,11 +145,18 @@ impl CertificationRequest {
     }
 
     /// A sub-reader over the `CertificationRequestInfo`, positioned at `subject`.
+    ///
+    /// RFC 2986 §4.1 defines `version INTEGER { v1(0) } (v1,...)` and no
+    /// later revision has added a value, so anything but the single octet
+    /// `0` is rejected as [`Error::Malformed`] — the same stance the
+    /// certificate and CRL parsers take on their version fields.
     fn cri_after_version(&self) -> Result<Reader<'_>, Error> {
         let cri = self.parts()?.cri;
         let mut outer = Reader::new(cri);
         let mut seq = outer.read_sequence()?;
-        seq.read_integer_bytes()?; // version
+        if seq.read_integer_bytes()? != [0x00] {
+            return Err(Error::Malformed);
+        }
         Ok(seq)
     }
 
@@ -313,6 +320,48 @@ mod tests {
         assert!(CertificationRequest::from_der(der.clone()).is_err());
         assert!(CertificationRequest::from_pem(&pem_encode(PEM_LABEL, &der)).is_err());
         CertificationRequest::from_pem(&csr.to_pem()).unwrap();
+    }
+
+    /// RFC 2986 §4.1: `version` is `v1(0)` and nothing else. A request whose
+    /// version octet is anything but 0 is Malformed from every field accessor.
+    #[test]
+    fn csr_version_must_be_zero() {
+        let key = ec_signer_key();
+        let csr = CertificationRequest::create(
+            &CertSigner::Ecdsa(&key),
+            &DistinguishedName::common_name("v"),
+            &[],
+        )
+        .unwrap();
+        // Locate the version INTEGER: it is the first element inside the
+        // CertificationRequestInfo SEQUENCE, i.e. `02 01 00` right after the
+        // two nested SEQUENCE headers.
+        let der = csr.to_der().to_vec();
+        let outer_hdr = hdr_len(&der);
+        let off = outer_hdr + hdr_len(&der[outer_hdr..]);
+        assert_eq!(&der[off..off + 3], &[0x02, 0x01, 0x00]);
+        let mut bad = der.clone();
+        bad[off + 2] = 0x01;
+        let bad = CertificationRequest::from_der(bad).unwrap();
+        assert!(matches!(bad.subject(), Err(Error::Malformed)));
+        assert!(matches!(bad.public_key(), Err(Error::Malformed)));
+        assert!(matches!(bad.subject_alt_names(), Err(Error::Malformed)));
+        assert!(bad.verify_self_signed().is_err());
+        // The untouched request still parses.
+        CertificationRequest::from_der(der)
+            .unwrap()
+            .subject()
+            .unwrap();
+    }
+
+    /// Length of a DER element's tag + length header, for a short- or
+    /// long-form length (the CRI is well over 127 bytes here).
+    fn hdr_len(tlv: &[u8]) -> usize {
+        if tlv[1] < 0x80 {
+            2
+        } else {
+            2 + (tlv[1] & 0x7f) as usize
+        }
     }
 
     #[test]

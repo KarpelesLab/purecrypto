@@ -162,7 +162,15 @@ impl AnyPrivateKey {
         // PKCS#8 to the matching per-type parser.
         let mut reader = Reader::new(plain);
         let mut seq = reader.read_sequence()?;
-        seq.read_integer_bytes()?; // version
+        // RFC 5958 §2: `version INTEGER { v1(0), v2(1) }` — v1 is the
+        // PKCS#8 form, v2 the OneAsymmetricKey form that may add a
+        // `publicKey [1]`. Anything else is not a PrivateKeyInfo this crate
+        // knows how to read; reject it here rather than let the per-type
+        // parsers each decide.
+        match seq.read_integer_bytes()? {
+            [0x00] | [0x01] => {}
+            _ => return Err(Error::Malformed),
+        }
         let mut algid = seq.read_sequence()?;
         let arcs = parse_oid(algid.read_oid()?)?;
         let alg = arcs.as_slice();
@@ -493,5 +501,32 @@ x2dqVh/sT12MnE=\n\
             AnyPrivateKey::from_pkcs8_der(der, Pkcs8ReadOptions::new()),
             Err(Error::UnsupportedAlgorithm)
         ));
+    }
+
+    /// RFC 5958 §2: only v1 (0) and v2 (1) exist. Any other version is
+    /// Malformed before the algorithm is even looked at; the two defined
+    /// values get past the version gate (and then trip on the bogus OID).
+    #[test]
+    fn pkcs8_version_must_be_v1_or_v2() {
+        let with_version = |v: u8| -> alloc::vec::Vec<u8> {
+            alloc::vec![
+                0x30, 0x0b, // SEQUENCE (11 content bytes)
+                0x02, 0x01, v, // version
+                0x30, 0x04, 0x06, 0x02, 0x2a, 0x03, // SEQUENCE { OID 1.2.3 }
+                0x04, 0x00, // privateKey OCTET STRING (empty)
+            ]
+        };
+        for v in [0u8, 1] {
+            assert!(matches!(
+                AnyPrivateKey::from_pkcs8_der(&with_version(v), Pkcs8ReadOptions::new()),
+                Err(Error::UnsupportedAlgorithm)
+            ));
+        }
+        for v in [2u8, 3, 0x7f] {
+            assert!(matches!(
+                AnyPrivateKey::from_pkcs8_der(&with_version(v), Pkcs8ReadOptions::new()),
+                Err(Error::Malformed)
+            ));
+        }
     }
 }
