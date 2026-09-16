@@ -1,10 +1,10 @@
 //! `purecrypto req` — create or inspect a PKCS#10 certificate request.
 
-use crate::pki::{describe_key, format_dn, load_key, parse_sans, parse_subject};
+use crate::pki::{describe_key, dns_general_names, format_dn, load_key, parse_sans, parse_subject};
 use crate::template::CertTemplate;
 use crate::util::{Args, die, read_input, write_output};
 use purecrypto::x509::CertificationRequest;
-use purecrypto::x509::extension::{Extension, GeneralName};
+use purecrypto::x509::extension::{Extension, GeneralName, subject_alt_name};
 
 fn sans_from_args(args: &Args) -> Vec<String> {
     if let Some(ext) = args.value("-addext").or_else(|| args.value("--addext")) {
@@ -72,7 +72,7 @@ pub(crate) fn run(args: Args) {
         // is right here even though no built-in profile copies SANs off a
         // submitted CSR at signing time (see `CertTemplate::allowing_csr_sans`).
         let tmpl = tmpl.allowing_csr_sans();
-        let csr_sans: Vec<GeneralName> = sans.iter().map(|s| GeneralName::Dns(s.clone())).collect();
+        let csr_sans: Vec<GeneralName> = dns_general_names(&sans);
         // For a CSR there's no issuer SKI / subject SPKI binding needed yet:
         // the template's extensions() builder will skip SKI/AKI when those
         // inputs are empty.
@@ -80,8 +80,14 @@ pub(crate) fn run(args: Args) {
         CertificationRequest::create_with_extensions(&key.signer(), &subject, &exts)
             .unwrap_or_else(|e| die(format!("cannot create CSR: {e}")))
     } else {
-        let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
-        CertificationRequest::create(&key.signer(), &subject, &san_refs)
+        // Route IP literals to iPAddress (`CertificationRequest::create`
+        // would wrap every entry as a dNSName).
+        let exts: Vec<Extension> = if sans.is_empty() {
+            Vec::new()
+        } else {
+            vec![subject_alt_name(&dns_general_names(&sans))]
+        };
+        CertificationRequest::create_with_extensions(&key.signer(), &subject, &exts)
             .unwrap_or_else(|e| die(format!("cannot create CSR: {e}")))
     };
     write_output(args.value("-out"), csr.to_pem().as_bytes());

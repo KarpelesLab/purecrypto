@@ -2081,6 +2081,163 @@ fn s_client_s_server_roundtrip_alpn_keylog() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `-san 127.0.0.1` / `-san ::1` entry must be emitted as an `iPAddress`
+/// GeneralName, not a `dNSName` holding the literal: RFC 5280 §4.2.1.6 puts
+/// IPs in the binary form, and this crate's own TLS clients reject a leaf
+/// whose dNSName looks like an IP before the trust check runs (even with
+/// `-insecure`). The CLI used to wrap every SAN as a dNSName, so the
+/// documented `x509 -req … -san 127.0.0.1` → `s_server` → `s_client -CAfile`
+/// cookbook flow could never complete a handshake.
+#[test]
+fn cli_ip_san_cert_is_well_formed_and_verifies_over_tls() {
+    use purecrypto::x509::{Certificate, CertificationRequest, SanIp};
+
+    let dir = std::env::temp_dir().join(format!("pc_ipsan_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "ED25519", "-out", &p("ca.key")],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "x509",
+                "-new",
+                "-ca",
+                "-key",
+                &p("ca.key"),
+                "-subj",
+                "/CN=IP SAN test CA",
+                "-out",
+                &p("ca.crt"),
+            ],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "ED25519", "-out", &p("srv.key")],
+            b""
+        )
+        .1
+    );
+    // The CSR path (both the plain and the `-addext` spelling) routes IPs too.
+    assert!(
+        run(
+            &[
+                "req",
+                "-key",
+                &p("srv.key"),
+                "-subj",
+                "/CN=127.0.0.1",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1,DNS:localhost,IP:::1",
+                "-out",
+                &p("srv.csr"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let csr =
+        CertificationRequest::from_pem(&std::fs::read_to_string(p("srv.csr")).unwrap()).unwrap();
+    let csr_der = csr.to_der().to_vec();
+    // [7] iPAddress (4-byte and 16-byte forms) must be present, and no [2]
+    // dNSName may carry the literal (the subject CN legitimately does).
+    assert!(csr_der.windows(6).any(|w| w == [0x87, 4, 127, 0, 0, 1]));
+    let v6 = [&[0x87u8, 16][..], &std::net::Ipv6Addr::LOCALHOST.octets()].concat();
+    assert!(csr_der.windows(v6.len()).any(|w| w == v6));
+    let dns_literal = [&[0x82u8, 9][..], b"127.0.0.1"].concat();
+    assert!(!csr_der.windows(dns_literal.len()).any(|w| w == dns_literal));
+    assert_eq!(
+        csr.subject_alt_names().unwrap(),
+        vec!["localhost".to_string()]
+    );
+
+    assert!(
+        run(
+            &[
+                "x509",
+                "-req",
+                "-in",
+                &p("srv.csr"),
+                "-CA",
+                &p("ca.crt"),
+                "-CAkey",
+                &p("ca.key"),
+                "-san",
+                "127.0.0.1,::1",
+                "-out",
+                &p("srv.crt"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let leaf = Certificate::from_pem(&std::fs::read_to_string(p("srv.crt")).unwrap()).unwrap();
+    leaf.check_well_formed()
+        .expect("an IP SAN must be an iPAddress, not a dNSName");
+    assert_eq!(
+        leaf.subject_alt_ips().unwrap(),
+        vec![
+            SanIp::V4([127, 0, 0, 1]),
+            SanIp::V6(std::net::Ipv6Addr::LOCALHOST.octets())
+        ]
+    );
+    assert!(leaf.subject_alt_names().unwrap().is_empty());
+
+    // End to end, on the verified path (no `-insecure`): the cookbook flow.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args([
+            "s_server",
+            "-cert",
+            &p("srv.crt"),
+            "-key",
+            &p("srv.key"),
+            "-accept",
+            &port.to_string(),
+            "-www",
+            "-quiet",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn s_server");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-CAfile",
+            &p("ca.crt"),
+            "-quiet",
+        ],
+        b"GET / HTTP/1.0\r\n\r\n",
+    );
+    let _ = server_proc.wait_with_output();
+    assert!(
+        ok,
+        "verified s_client against a CLI-minted IP-SAN cert failed: {err}"
+    );
+    assert!(
+        out.contains("hello from purecrypto s_server"),
+        "expected -www body, got: {out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `s_server -cert X -key Y` where Y is a (valid) key from a different pair
 /// than X's leaf must exit up front with a message naming the mismatch,
 /// rather than start serving and fail every client's handshake.

@@ -417,9 +417,24 @@ pub(crate) fn default_extensions(profile: Profile, sans: &[GeneralName]) -> Vec<
     out
 }
 
-/// Wraps plain dNSName strings as [`GeneralName`]s for [`default_extensions`].
+/// Maps `-san` / `-addext` entries to [`GeneralName`]s for
+/// [`default_extensions`]: an IPv4 or IPv6 literal becomes an `iPAddress`
+/// (RFC 5280 §4.2.1.6 requires the binary form there — a dotted-quad inside
+/// a dNSName is malformed, and this crate's own TLS clients reject such a
+/// leaf as `BadCertificate` before the trust check even runs); anything else
+/// is a dNSName. An explicit `IP:` prefix is accepted as well.
 pub(crate) fn dns_general_names(names: &[String]) -> Vec<GeneralName> {
-    names.iter().map(|s| GeneralName::Dns(s.clone())).collect()
+    names
+        .iter()
+        .map(|s| {
+            let literal = s.strip_prefix("IP:").unwrap_or(s);
+            match literal.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(v4)) => GeneralName::IpV4(v4.octets()),
+                Ok(std::net::IpAddr::V6(v6)) => GeneralName::IpV6(v6.octets()),
+                Err(_) => GeneralName::Dns(s.clone()),
+            }
+        })
+        .collect()
 }
 
 /// Extracts the `BIT STRING` *contents* of an `AnyPublicKey`'s SPKI — the
@@ -456,8 +471,10 @@ pub(crate) fn issuer_ski_bytes(cert: &Certificate) -> Vec<u8> {
     Vec::new()
 }
 
-/// Parses dNSName entries from `-addext "subjectAltName=DNS:a,DNS:b"` or a plain
-/// comma list (`a,b`).
+/// Parses subjectAltName entries from `-addext "subjectAltName=DNS:a,IP:b"`
+/// or a plain comma list (`a,b`). `DNS:` prefixes are stripped; `IP:`
+/// prefixes are kept so [`dns_general_names`] routes the entry to an
+/// `iPAddress` (a bare IP literal is routed the same way by shape).
 pub(crate) fn parse_sans(spec: &str) -> Vec<String> {
     let list = spec.strip_prefix("subjectAltName=").unwrap_or(spec);
     list.split(',')
