@@ -455,3 +455,87 @@ fn pbmac1_oversized_key_length_rejected() {
     let mac = pbmac1_mac_data(content, "pw", Some(64), true, 64);
     assert_eq!(pbmac1_verify(&mac, content, "pw"), Ok(()));
 }
+
+// ---------------------------------------------------------------------------
+// Empty-password encodings (RFC 7292 §B.1)
+// ---------------------------------------------------------------------------
+
+/// A legacy `pkcs8ShroudedKeyBag` bagValue — `pbeWithSHAAnd3-KeyTripleDES-CBC`
+/// over the fixture key — keyed on an explicit BMP password encoding, so a
+/// test can pick the zero-length form that `password_to_bmp` never produces.
+fn legacy_3des_shrouded_key(pw_bmp: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+    use crate::cipher::{Cbc64, TdesEde3};
+    let mut key = [0u8; 24];
+    let mut iv = [0u8; 8];
+    derive(PkcsHash::Sha1, pw_bmp, salt, iterations, ID_KEY, &mut key);
+    derive(PkcsHash::Sha1, pw_bmp, salt, iterations, ID_IV, &mut iv);
+    let mut buf = KEY_PK8.to_vec();
+    let pad = 8 - (buf.len() % 8);
+    buf.extend(core::iter::repeat_n(pad as u8, pad));
+    Cbc64::new(TdesEde3::new(&key), &iv)
+        .encrypt(&mut buf)
+        .unwrap();
+    let params = encode_sequence(
+        &[
+            encode_octet_string(salt),
+            encode_integer(&iterations.to_be_bytes()),
+        ]
+        .concat(),
+    );
+    let alg = encode_sequence(&[oid_tlv(OID_PBE_SHA1_3DES), params].concat());
+    encode_sequence(&[alg, encode_octet_string(&buf)].concat())
+}
+
+/// A complete PFX — one legacy-shrouded key bag plus one x509 certBag —
+/// MAC-sealed under the given BMP password encoding.
+fn pfx_under_bmp(pw_bmp: &[u8]) -> Vec<u8> {
+    let key_bag = encode_safe_bag(
+        OID_PKCS8_SHROUDED_KEY_BAG,
+        &legacy_3des_shrouded_key(pw_bmp, &[0x5a; 8], 2048),
+        None,
+        None,
+    );
+    let cert_bag_body = encode_sequence(
+        &[
+            oid_tlv(OID_CERT_TYPE_X509),
+            encode_context(0, &encode_octet_string(CERT_DER)),
+        ]
+        .concat(),
+    );
+    let cert_bag = encode_safe_bag(OID_CERT_BAG, &cert_bag_body, None, None);
+    let content_infos = [
+        encode_data_content_info(&encode_sequence(&key_bag)),
+        encode_data_content_info(&encode_sequence(&cert_bag)),
+    ]
+    .concat();
+    let auth_safe = encode_sequence(&content_infos);
+    let auth_safe_ci = encode_data_content_info(&auth_safe);
+    let mac_data = build_mac_data(&auth_safe, pw_bmp, &[0x77; 8], 2048);
+    encode_sequence(&[encode_integer(&[0x03]), auth_safe_ci, mac_data].concat())
+}
+
+/// RFC 7292 §B.1 gives an empty password two wire forms — the lone two-byte
+/// NUL terminator and a genuinely zero-length string — and they derive
+/// different MAC and content keys. OpenSSL emits the first for `pass:` and
+/// the second for a NULL password, and its parser accepts both; so must
+/// ours. The retry must carry the winning encoding through to the legacy
+/// PBE bags, and a non-empty password must never be retried.
+#[test]
+fn empty_password_accepts_both_bmp_encodings() {
+    // `password_to_bmp("")` is the terminated form; the parser's first try.
+    assert_eq!(password_to_bmp(""), [0x00, 0x00]);
+
+    for pw_bmp in [&[0x00u8, 0x00][..], &[][..]] {
+        let pfx = pfx_under_bmp(pw_bmp);
+        let parsed = Pfx::parse(&pfx, "").unwrap_or_else(|e| panic!("{pw_bmp:?}: {e}"));
+        assert_eq!(parsed.keys, [KEY_PK8.to_vec()], "{pw_bmp:?}");
+        assert_eq!(parsed.certs, [CERT_DER.to_vec()], "{pw_bmp:?}");
+        // A wrong (non-empty) password is a plain MAC mismatch either way.
+        assert_eq!(Pfx::parse(&pfx, "x").unwrap_err(), Error::MacMismatch);
+    }
+
+    // A non-empty password has a single encoding: an archive sealed under
+    // the zero-length form is NOT reachable by retrying it.
+    let pfx = pfx_under_bmp(&[]);
+    assert_eq!(Pfx::parse(&pfx, PASSWORD).unwrap_err(), Error::MacMismatch);
+}

@@ -262,11 +262,27 @@ impl Pfx {
     /// The integrity MAC is checked first; a wrong password (or a tampered
     /// file) yields [`Error::MacMismatch`] before any content is decrypted.
     /// An archive without a MAC is rejected as [`Error::MissingMac`].
+    ///
+    /// # Empty passwords
+    ///
+    /// RFC 7292 §B.1 leaves an empty password with two wire encodings: the
+    /// two-byte NUL terminator alone (`00 00`, what OpenSSL's `-passout
+    /// pass:` and this crate's [`Pfx::build`] produce) or a genuinely
+    /// zero-length BMPString (no terminator at all — what OpenSSL emits for a
+    /// NULL password, and what some Java and Windows exporters write). The
+    /// two derive different MAC keys, so an empty `password` is tried under
+    /// both: the terminated form first, then — only if the MAC did not
+    /// verify — the zero-length form, which is then also used for any legacy
+    /// PBE-encrypted bags. OpenSSL's `PKCS12_parse` does the same. A
+    /// non-empty password has one encoding and is never retried.
     pub fn parse(der: &[u8], password: &str) -> Result<Parsed, Error> {
         let mut pw_bmp = password_to_bmp(password);
-        let result = Self::parse_inner(der, password, &pw_bmp);
+        let mut result = Self::parse_inner(der, password, &pw_bmp);
         // Wipe the BMP password copy regardless of outcome.
         crate::zeroize::Zeroize::zeroize(&mut pw_bmp);
+        if password.is_empty() && matches!(result, Err(Error::MacMismatch)) {
+            result = Self::parse_inner(der, password, &[]);
+        }
         result
     }
 
