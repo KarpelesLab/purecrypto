@@ -1002,7 +1002,8 @@ impl ClientConnection12 {
         let mut extensions: Vec<(crate::tls::codec::ExtensionType, Vec<u8>)> = Vec::new();
         extensions.push(ext::supported_groups_list(groups));
         if !pure_legacy {
-            extensions.push(ext::signature_algorithms());
+            // The TLS 1.2 list: no RFC 8734 Brainpool code points.
+            extensions.push(ext::signature_algorithms_tls12());
         }
         // RFC 4492 §5.1.2: TLS 1.0+ ECDHE peers REQUIRE ec_point_formats.
         extensions.push(ext::ec_point_formats());
@@ -2504,7 +2505,12 @@ impl ClientConnection12 {
         // The signer takes the un-hashed transcript bytes; PSS / ECDSA /
         // Ed25519 impls each apply their own hash internally.
         let to_sign = self.transcript.buffered_bytes().to_vec();
-        let scheme = ClientCertConfig::signature_scheme_for(cc.key());
+        // No scheme at all (secp256k1 / SM2), or a TLS 1.3-only one (the RFC
+        // 8734 Brainpool code points): the key cannot sign a TLS 1.2
+        // CertificateVerify any conformant server accepts.
+        let scheme = ClientCertConfig::signature_scheme_for(cc.key())
+            .filter(|s| !s.is_brainpool_tls13())
+            .ok_or(Error::UnsupportedKeyType)?;
         let signature: Vec<u8> = match cc.key() {
             ClientKey::Rsa(_) => {
                 // The Rsa signer needs an RNG; the TLS 1.3 client side

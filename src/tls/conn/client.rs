@@ -202,51 +202,35 @@ impl ClientCertConfig {
         }
     }
 
-    fn signature_scheme(&self) -> SignatureScheme {
-        Self::signature_scheme_for(&self.key)
-    }
-
     /// The scheme this client cert may sign a TLS 1.3 `CertificateVerify`
     /// with, or `None` when the key cannot produce one.
     ///
-    /// Two constraints narrow [`Self::signature_scheme`], which also serves
-    /// the TLS 1.2 path: RFC 8446 §4.4.3 forbids `rsa_pkcs1_*` in a 1.3
-    /// `CertificateVerify` (an external signer must not be asked for one),
-    /// and the `ecdsa_secp*` code points each name a specific NIST curve, so
-    /// a key on secp256k1 / SM2 / Brainpool has no scheme to sign under —
-    /// the P-curve code point [`Self::signature_scheme`] returns for them is
-    /// a TLS 1.2-era approximation no conformant peer would verify.
+    /// Narrows [`Self::signature_scheme_for`]: RFC 8446 §4.4.3 forbids
+    /// `rsa_pkcs1_*` in a 1.3 `CertificateVerify` (an external signer must
+    /// not be asked for one), and a key with no IANA scheme at all (ECDSA on
+    /// secp256k1 / SM2) has nothing to sign under.
     fn tls13_signature_scheme(&self) -> Option<SignatureScheme> {
-        if let ClientKey::Ecdsa(k) = &self.key
-            && !matches!(k.curve(), CurveId::P256 | CurveId::P384 | CurveId::P521)
-        {
-            return None;
-        }
         match &self.key {
             ClientKey::External { schemes } => schemes.iter().copied().find(|s| !s.is_rsa_pkcs1()),
-            _ => {
-                let s = self.signature_scheme();
+            key => {
+                let s = Self::signature_scheme_for(key)?;
                 (!s.is_rsa_pkcs1()).then_some(s)
             }
         }
     }
 
-    /// Internal helper exposed to the TLS 1.2 client: the IANA-blessed
-    /// signature scheme for a given [`ClientKey`]. Same code points as TLS
-    /// 1.3 (the registry is shared).
-    pub(super) fn signature_scheme_for(key: &ClientKey) -> SignatureScheme {
-        match key {
+    /// Internal helper shared with the TLS 1.2 client: the IANA-blessed
+    /// signature scheme for a given [`ClientKey`], or `None` for a key that
+    /// has none (ECDSA on secp256k1 / SM2). Same code points as the server
+    /// side (the registry is shared); the RFC 8734 Brainpool code points are
+    /// TLS 1.3 only, which the 1.2 client checks with
+    /// `SignatureScheme::is_brainpool_tls13`.
+    pub(super) fn signature_scheme_for(key: &ClientKey) -> Option<SignatureScheme> {
+        Some(match key {
             ClientKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
-            ClientKey::Ecdsa(k) => match k.curve() {
-                CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
-                CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-                CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-                CurveId::Secp256k1 | CurveId::Sm2p256v1 | CurveId::BrainpoolP256r1 => {
-                    SignatureScheme::ECDSA_SECP256R1_SHA256
-                }
-                CurveId::BrainpoolP384r1 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-                CurveId::BrainpoolP512r1 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-            },
+            ClientKey::Ecdsa(k) => {
+                return crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve());
+            }
             ClientKey::Ed25519(_) => SignatureScheme::ED25519,
             ClientKey::Ed448(_) => SignatureScheme::ED448,
             #[cfg(feature = "mldsa")]
@@ -261,7 +245,7 @@ impl ClientCertConfig {
                 .first()
                 .copied()
                 .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
-        }
+        })
     }
 
     /// Access for the TLS 1.2 client (uses the same struct for mTLS).

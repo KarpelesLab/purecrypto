@@ -119,6 +119,13 @@ u16_id!(
         RSA_PSS_RSAE_SHA256 = 0x0804,
         /// rsa_pss_rsae_sha384.
         RSA_PSS_RSAE_SHA384 = 0x0805,
+        /// ecdsa_brainpoolP256r1tls13_sha256 (RFC 8734). TLS 1.3 only: RFC
+        /// 8734 §2 forbids these code points in TLS 1.2 `signature_algorithms`.
+        ECDSA_BRAINPOOLP256R1TLS13_SHA256 = 0x081A,
+        /// ecdsa_brainpoolP384r1tls13_sha384 (RFC 8734). TLS 1.3 only.
+        ECDSA_BRAINPOOLP384R1TLS13_SHA384 = 0x081B,
+        /// ecdsa_brainpoolP512r1tls13_sha512 (RFC 8734). TLS 1.3 only.
+        ECDSA_BRAINPOOLP512R1TLS13_SHA512 = 0x081C,
         /// ml-dsa-44 (draft-ietf-tls-mldsa). The TLS 1.3 wire format for
         /// these schemes carries the raw ML-DSA signature bytes in the
         /// `CertificateVerify` body (no DER wrapping).
@@ -142,6 +149,20 @@ impl SignatureScheme {
         matches!(
             self,
             Self::RSA_PKCS1_SHA256 | Self::RSA_PKCS1_SHA384 | Self::RSA_PKCS1_SHA512
+        )
+    }
+
+    /// Whether this scheme is one of the RFC 8734 Brainpool code points,
+    /// which are defined for TLS 1.3 only: RFC 8734 §2 says they "MUST NOT be
+    /// used in TLS 1.2" (whose `signature_algorithms` are (hash, signature)
+    /// pairs with no Brainpool assignment), so the TLS 1.2 / DTLS 1.2 engines
+    /// refuse to sign or negotiate under them.
+    pub(crate) fn is_brainpool_tls13(self) -> bool {
+        matches!(
+            self,
+            Self::ECDSA_BRAINPOOLP256R1TLS13_SHA256
+                | Self::ECDSA_BRAINPOOLP384R1TLS13_SHA384
+                | Self::ECDSA_BRAINPOOLP512R1TLS13_SHA512
         )
     }
 }

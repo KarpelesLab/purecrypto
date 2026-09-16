@@ -1713,7 +1713,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         ) {
             let th = self.transcript.current_hash();
             let content = certificate_verify_content(true, th.as_slice());
-            let scheme = signature_scheme_for(&self.config.key);
+            let scheme = signature_scheme_for(&self.config.key).ok_or(Error::UnsupportedKeyType)?;
             self.pending_flight = Some(PendingFlight { scheme, content });
             self.state = State::AwaitingCertVerifySignature;
             return Ok(());

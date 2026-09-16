@@ -40,24 +40,34 @@ pub(crate) fn certificate_verify_content(server: bool, transcript_hash: &[u8]) -
     out
 }
 
-/// The IANA-blessed [`SignatureScheme`] code for the given [`ServerKey`].
-pub(crate) fn signature_scheme_for(key: &ServerKey) -> SignatureScheme {
-    match key {
+/// The IANA [`SignatureScheme`] an ECDSA key on `curve` signs a TLS 1.3
+/// `CertificateVerify` under, or `None` when no code point exists.
+///
+/// The `ecdsa_secp*` schemes (RFC 8446 §4.2.3) each name one NIST curve, and
+/// RFC 8734 allocates `ecdsa_brainpoolP*r1tls13_sha*` for the three
+/// Brainpool curves. secp256k1 and SM2 have no IANA assignment: a key on
+/// either cannot produce a signature any conformant peer verifies, so the
+/// engines refuse such an identity (`Error::UnsupportedKeyType`) instead of
+/// signing under a NIST code point the peer is required to reject.
+pub(crate) fn tls_signature_scheme_for_curve(curve: CurveId) -> Option<SignatureScheme> {
+    match curve {
+        CurveId::P256 => Some(SignatureScheme::ECDSA_SECP256R1_SHA256),
+        CurveId::P384 => Some(SignatureScheme::ECDSA_SECP384R1_SHA384),
+        CurveId::P521 => Some(SignatureScheme::ECDSA_SECP521R1_SHA512),
+        CurveId::BrainpoolP256r1 => Some(SignatureScheme::ECDSA_BRAINPOOLP256R1TLS13_SHA256),
+        CurveId::BrainpoolP384r1 => Some(SignatureScheme::ECDSA_BRAINPOOLP384R1TLS13_SHA384),
+        CurveId::BrainpoolP512r1 => Some(SignatureScheme::ECDSA_BRAINPOOLP512R1TLS13_SHA512),
+        CurveId::Secp256k1 | CurveId::Sm2p256v1 => None,
+    }
+}
+
+/// The IANA-blessed [`SignatureScheme`] code for the given [`ServerKey`], or
+/// `None` for a key that has none (ECDSA on secp256k1 / SM2, see
+/// [`tls_signature_scheme_for_curve`]).
+pub(crate) fn signature_scheme_for(key: &ServerKey) -> Option<SignatureScheme> {
+    Some(match key {
         ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
-        ServerKey::Ecdsa(k) => match k.curve() {
-            CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
-            CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-            CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-            // secp256k1 / SM2 / Brainpool have no IANA TLS signature scheme;
-            // fall back to the matched-hash NIST code point (they are never
-            // negotiated over TLS). Brainpool maps by hash width so the
-            // reported scheme's hash matches the signing hash below.
-            CurveId::Secp256k1 | CurveId::Sm2p256v1 | CurveId::BrainpoolP256r1 => {
-                SignatureScheme::ECDSA_SECP256R1_SHA256
-            }
-            CurveId::BrainpoolP384r1 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-            CurveId::BrainpoolP512r1 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-        },
+        ServerKey::Ecdsa(k) => return tls_signature_scheme_for_curve(k.curve()),
         ServerKey::Ed25519(_) => SignatureScheme::ED25519,
         ServerKey::Ed448(_) => SignatureScheme::ED448,
         #[cfg(feature = "mldsa")]
@@ -74,19 +84,20 @@ pub(crate) fn signature_scheme_for(key: &ServerKey) -> SignatureScheme {
             .first()
             .copied()
             .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
-    }
+    })
 }
 
 /// Signs `content` for a TLS 1.3 / DTLS 1.3 `CertificateVerify` using
 /// `key`, returning the (scheme, signature_bytes) tuple. Dispatches over
-/// every supported key type — RSA-PSS, ECDSA (any curve), Ed25519, Ed448,
-/// ML-DSA-44/65/87.
+/// every supported key type — RSA-PSS, ECDSA (NIST and Brainpool curves),
+/// Ed25519, Ed448, ML-DSA-44/65/87. A key with no IANA scheme (ECDSA on
+/// secp256k1 / SM2) is [`Error::UnsupportedKeyType`].
 pub(crate) fn sign_certificate_verify<R: RngCore>(
     key: &ServerKey,
     content: &[u8],
     rng: &mut R,
 ) -> Result<(SignatureScheme, Vec<u8>), Error> {
-    let scheme = signature_scheme_for(key);
+    let scheme = signature_scheme_for(key).ok_or(Error::UnsupportedKeyType)?;
     let signature = match key {
         ServerKey::Rsa(k) => k
             .sign_pss::<Sha256, _>(content, rng)
@@ -194,8 +205,22 @@ mod tests {
         let p256 = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
         let p384 = BoxedEcdsaPrivateKey::generate(CurveId::P384, &mut rng);
         let p521 = BoxedEcdsaPrivateKey::generate(CurveId::P521, &mut rng);
+        let bp256 = BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP256r1, &mut rng);
+        let bp384 = BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP384r1, &mut rng);
+        let bp512 = BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP512r1, &mut rng);
         let ed25519 = Ed25519PrivateKey::generate(&mut rng);
         let ed448 = Ed448PrivateKey::generate(&mut rng);
+
+        // secp256k1 and SM2 have no IANA scheme: refused, never signed under
+        // a NIST code point.
+        for curve in [CurveId::Secp256k1, CurveId::Sm2p256v1] {
+            let key = ServerKey::Ecdsa(BoxedEcdsaPrivateKey::generate(curve, &mut rng));
+            assert_eq!(signature_scheme_for(&key), None, "{curve:?}");
+            assert!(matches!(
+                sign_certificate_verify(&key, &content, &mut rng),
+                Err(Error::UnsupportedKeyType)
+            ));
+        }
 
         // Only pushed to under `mldsa`.
         #[allow(unused_mut)]
@@ -219,6 +244,21 @@ mod tests {
                 ServerKey::Ecdsa(p521.clone()),
                 AnyPublicKey::Ecdsa(p521.public_key()),
                 SignatureScheme::ECDSA_SECP521R1_SHA512,
+            ),
+            (
+                ServerKey::Ecdsa(bp256.clone()),
+                AnyPublicKey::Ecdsa(bp256.public_key()),
+                SignatureScheme::ECDSA_BRAINPOOLP256R1TLS13_SHA256,
+            ),
+            (
+                ServerKey::Ecdsa(bp384.clone()),
+                AnyPublicKey::Ecdsa(bp384.public_key()),
+                SignatureScheme::ECDSA_BRAINPOOLP384R1TLS13_SHA384,
+            ),
+            (
+                ServerKey::Ecdsa(bp512.clone()),
+                AnyPublicKey::Ecdsa(bp512.public_key()),
+                SignatureScheme::ECDSA_BRAINPOOLP512R1TLS13_SHA512,
             ),
             (
                 ServerKey::Ed25519(ed25519.clone()),
@@ -257,7 +297,7 @@ mod tests {
         for (key, pk, want_scheme) in &cases {
             let (scheme, sig) = sign_certificate_verify(key, &content, &mut rng).unwrap();
             assert_eq!(scheme, *want_scheme, "scheme for {want_scheme:?}");
-            assert_eq!(signature_scheme_for(key), scheme);
+            assert_eq!(signature_scheme_for(key), Some(scheme));
             let algo = find_by_tls_scheme(scheme.0).expect("scheme in registry");
             assert!(
                 policy.permits(algo, &pk.to_spki_der()),

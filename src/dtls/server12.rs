@@ -1267,7 +1267,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // `src/tls/conn/server12.rs::send_server_key_exchange`.
         let cr = self.client_random.expect("set above");
         let to_sign = signed_message(&cr, &sr, group, &our_point);
-        let scheme = signature_scheme(&self.config.key);
+        let scheme = signature_scheme(&self.config.key).ok_or(Error::UnsupportedKeyType)?;
         let signature: Vec<u8> = match &self.config.key {
             ServerKey::Rsa(k) => k
                 .sign_pss::<Sha256, _>(&to_sign, &mut self.rng)
@@ -1725,24 +1725,27 @@ fn build_certificate_msg(chain: &[Vec<u8>]) -> Vec<u8> {
 /// suite. For ECDSA the scheme tracks the curve (RFC 8446 §4.2.3 / RFC 8447
 /// IANA registry); for RSA we use `rsa_pss_rsae_sha256`, the modern default
 /// for TLS 1.2 + 1.3 interop.
-fn signature_scheme(key: &ServerKey) -> SignatureScheme {
+///
+/// `None` when the key has no DTLS 1.2 scheme: the RFC 8734 Brainpool code
+/// points are TLS 1.3 only (§2: "MUST NOT be used in TLS 1.2") and
+/// secp256k1 / SM2 have none at all. The caller turns that into
+/// `Error::UnsupportedKeyType` rather than signing under a NIST code point
+/// the client would reject.
+fn signature_scheme(key: &ServerKey) -> Option<SignatureScheme> {
     match key {
-        ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
-        ServerKey::Ecdsa(k) => match k.curve() {
-            CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 | CurveId::BrainpoolP256r1 => {
-                SignatureScheme::ECDSA_SECP256R1_SHA256
-            }
-            CurveId::P384 | CurveId::BrainpoolP384r1 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-            CurveId::P521 | CurveId::BrainpoolP512r1 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-        },
+        ServerKey::Rsa(_) => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
+        ServerKey::Ecdsa(k) => crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve())
+            .filter(|s| !s.is_brainpool_tls13()),
         // External key: the caller advertises the scheme(s); use the preferred.
-        ServerKey::External { schemes } => schemes
-            .first()
-            .copied()
-            .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
+        ServerKey::External { schemes } => Some(
+            schemes
+                .first()
+                .copied()
+                .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
+        ),
         // Unreachable through the public constructors but the compiler
         // requires the match to be total.
-        _ => SignatureScheme::RSA_PSS_RSAE_SHA256,
+        _ => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
     }
 }
 

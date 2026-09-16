@@ -1243,7 +1243,8 @@ impl DtlsClientConnection12 {
 
         let mut extensions = alloc::vec![
             ext::supported_groups_list(&groups),
-            ext::signature_algorithms(),
+            // The (D)TLS 1.2 list: no RFC 8734 Brainpool code points.
+            ext::signature_algorithms_tls12(),
             ext::ec_point_formats(),
             // RFC 7627 §5.1: DTLS 1.2 inherits the EMS rules from TLS 1.2.
             // Always offer; the server echoes only when it also supports EMS.

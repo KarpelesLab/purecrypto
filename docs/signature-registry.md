@@ -28,7 +28,7 @@ the caller has to name the id explicitly.
 | `ecdsa-secp521r1-sha512`    | (TLS only, strict curve)        | `0x0603`       | yes |
 | `ecdsa-secp256r1-sha384/512`, `ecdsa-secp384r1-sha256/512`, `ecdsa-secp521r1-sha256/384` | cross-hash, policy only | (none) | opt-in |
 | `ecdsa-secp256k1-sha256/384/512` | secp256k1, policy only      | (none)         | opt-in |
-| `ecdsa-brainpoolP256r1-sha256`, `ecdsa-brainpoolP384r1-sha384`, `ecdsa-brainpoolP512r1-sha512` | Brainpool (RFC 5639), policy only | (none) | opt-in |
+| `ecdsa-brainpoolP256r1-sha256`, `ecdsa-brainpoolP384r1-sha384`, `ecdsa-brainpoolP512r1-sha512` | (TLS only, strict curve; Brainpool, RFC 5639) | `0x081A/1B/1C` (RFC 8734, TLS 1.3 only) | yes |
 | `sm2-with-sm3`              | `1.2.156.10197.1.501`           | (none)         | opt-in |
 | `ed25519`                   | `1.3.101.112`                   | `0x0807`       | yes |
 | `ed448`                     | `1.3.101.113`                   | `0x0808`       | yes |
@@ -36,10 +36,15 @@ the caller has to name the id explicitly.
 | `slh-dsa-sha2-128s/128f/192s/192f/256s/256f`, `slh-dsa-shake-128s/128f/192s/192f/256s/256f` | `2.16.840.1.101.3.4.3.20..31` | (none) | opt-in (FIPS 205) |
 
 The matched-curve, matched-hash ECDSA pairs (P-256 with SHA-256, and so on)
-have IANA TLS scheme codes. Cross-hash pairs and every secp256k1 and
-Brainpool entry are reachable for chain dispatch through the OID-keyed
-`ecdsa-with-shaN` entries, which accept any supported curve, and as
-fine-grained policy-keyed entries for TLS opt-in.
+have IANA TLS scheme codes: RFC 8446 for the NIST curves, RFC 8734 for the
+Brainpool curves (TLS 1.3 only — the TLS 1.2 / DTLS 1.2 engines refuse a
+Brainpool identity with `Error::UnsupportedKeyType`, and the 1.2 clients do
+not offer those code points). secp256k1 and SM2 have no TLS signature scheme
+at all, so `ConfigBuilder::try_identity` refuses such a key up front. Every
+ECDSA entry is reachable for chain dispatch through the OID-keyed
+`ecdsa-with-shaN` entries, which accept any supported curve; the cross-hash
+pairs and the secp256k1 entries exist as fine-grained policy-keyed entries
+for opt-in.
 
 The three `rsa-pss-rsae-*` entries carry **no** X.509 OID: in X.509 the
 `sha*WithRSAEncryption` OIDs mean PKCS#1 v1.5 and belong to the

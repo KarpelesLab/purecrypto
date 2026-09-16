@@ -610,36 +610,6 @@ impl ServerConfig {
         self
     }
 
-    fn signature_scheme(&self) -> SignatureScheme {
-        match &self.key {
-            ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
-            ServerKey::Ecdsa(k) => match k.curve() {
-                CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
-                CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-                CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-                CurveId::Secp256k1 | CurveId::Sm2p256v1 | CurveId::BrainpoolP256r1 => {
-                    SignatureScheme::ECDSA_SECP256R1_SHA256
-                }
-                CurveId::BrainpoolP384r1 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-                CurveId::BrainpoolP512r1 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-            },
-            ServerKey::Ed25519(_) => SignatureScheme::ED25519,
-            ServerKey::Ed448(_) => SignatureScheme::ED448,
-            #[cfg(feature = "mldsa")]
-            ServerKey::MlDsa44(_) => SignatureScheme::MLDSA44,
-            #[cfg(feature = "mldsa")]
-            ServerKey::MlDsa65(_) => SignatureScheme::MLDSA65,
-            #[cfg(feature = "mldsa")]
-            ServerKey::MlDsa87(_) => SignatureScheme::MLDSA87,
-            // Representative only; the concrete scheme is negotiated against the
-            // client's offer (see `negotiate_sig_scheme`).
-            ServerKey::External { schemes } => schemes
-                .first()
-                .copied()
-                .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
-        }
-    }
-
     /// Selects the signature scheme to use against a client that offered
     /// `offered`. For an in-process key this is the key's fixed scheme (if the
     /// client accepts it); for an [`ServerKey::External`] key it is the first
@@ -652,22 +622,16 @@ impl ServerConfig {
         // must not be taken up on it: an external signer would be asked for a
         // PKCS#1 v1.5 signature the peer is required to reject.
         //
-        // RFC 8446 §4.2.3: the `ecdsa_secp*` schemes each name one NIST
-        // curve. A key on secp256k1 / SM2 / Brainpool cannot produce a
-        // signature any conformant peer verifies under them, so refuse
-        // rather than advertise a scheme we cannot honour.
-        if let ServerKey::Ecdsa(k) = &self.key
-            && !matches!(k.curve(), CurveId::P256 | CurveId::P384 | CurveId::P521)
-        {
-            return None;
-        }
+        // A key with no IANA scheme at all (ECDSA on secp256k1 / SM2 —
+        // `signature_scheme_for` is `None`) cannot produce a signature any
+        // conformant peer verifies, so there is nothing to negotiate.
         match &self.key {
             ServerKey::External { schemes } => schemes
                 .iter()
                 .copied()
                 .find(|s| offered.contains(s) && !s.is_rsa_pkcs1()),
-            _ => {
-                let s = self.signature_scheme();
+            key => {
+                let s = super::super::crypto::signature_scheme_for(key)?;
                 (offered.contains(&s) && !s.is_rsa_pkcs1()).then_some(s)
             }
         }
@@ -1324,6 +1288,15 @@ impl<R: RngCore> ServerConnection<R> {
     /// once `ServerHello` has been emitted (i.e. `self.suite` is set).
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
         self.suite.map(|s| s.suite.0)
+    }
+
+    /// The `SignatureScheme` this server signs (or signed) its
+    /// `CertificateVerify` under, chosen against the client's
+    /// `signature_algorithms` when the ClientHello was processed. `None`
+    /// before that point and on a PSK handshake, which signs nothing.
+    #[cfg(test)]
+    pub(crate) fn negotiated_signature_scheme(&self) -> Option<SignatureScheme> {
+        self.negotiated_sig_scheme
     }
 
     /// `client_application_traffic_secret_0`, exposed for keylogfile output

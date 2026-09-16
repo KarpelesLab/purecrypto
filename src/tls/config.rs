@@ -727,7 +727,19 @@ impl ConfigBuilder {
     /// chain is empty or the leaf does not parse. A [`SigningKey::External`]
     /// holds no key material and is installed unchecked. See
     /// [`Identity::check_key_matches_leaf`].
+    ///
+    /// Also fails with [`Error::UnsupportedKeyType`](super::Error::UnsupportedKeyType)
+    /// for an ECDSA key on secp256k1 or SM2: neither curve has an IANA TLS
+    /// `SignatureScheme`, so the identity could never sign a handshake any
+    /// conformant peer verifies. Brainpool keys are accepted — RFC 8734
+    /// assigns them TLS 1.3 code points — and refused only by a TLS 1.2 /
+    /// DTLS 1.2 handshake, with the same error.
     pub fn try_identity(self, chain: Vec<Vec<u8>>, key: SigningKey) -> Result<Self, super::Error> {
+        if let SigningKey::Ecdsa(k) = &key
+            && super::crypto::sign::tls_signature_scheme_for_curve(k.curve()).is_none()
+        {
+            return Err(super::Error::UnsupportedKeyType);
+        }
         let identity = Identity::new(chain, key);
         identity.check_key_matches_leaf()?;
         Ok(self.identity(identity.cert_chain, identity.key))
@@ -1239,6 +1251,58 @@ mod tests {
             .check_key_matches_leaf()
             .is_ok()
         );
+    }
+
+    /// `try_identity` refuses an ECDSA key on a curve with no IANA TLS
+    /// signature scheme (secp256k1, SM2) at configuration time — signing
+    /// under a NIST code point would only fail on the peer — and accepts
+    /// the NIST and Brainpool curves (RFC 8446 / RFC 8734 code points).
+    #[test]
+    fn try_identity_refuses_curves_without_a_tls_signature_scheme() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"try-identity-curves", b"n", &[]);
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let identity_for = |curve: CurveId, rng: &mut HmacDrbg<crate::hash::Sha256>| {
+            let key = BoxedEcdsaPrivateKey::generate(curve, rng);
+            let cert = Certificate::self_signed_general(
+                &CertSigner::Ecdsa(&key),
+                &DistinguishedName::common_name("id.example"),
+                &validity,
+                1,
+                false,
+                &["id.example"],
+            )
+            .unwrap();
+            (vec![cert.to_der().to_vec()], SigningKey::Ecdsa(key))
+        };
+        for curve in [CurveId::Secp256k1, CurveId::Sm2p256v1] {
+            let (chain, key) = identity_for(curve, &mut rng);
+            assert!(
+                matches!(
+                    Config::builder().try_identity(chain, key),
+                    Err(super::super::Error::UnsupportedKeyType)
+                ),
+                "{curve:?} must be refused"
+            );
+        }
+        for curve in [
+            CurveId::P256,
+            CurveId::P384,
+            CurveId::P521,
+            CurveId::BrainpoolP256r1,
+            CurveId::BrainpoolP384r1,
+            CurveId::BrainpoolP512r1,
+        ] {
+            let (chain, key) = identity_for(curve, &mut rng);
+            assert!(
+                Config::builder().try_identity(chain, key).is_ok(),
+                "{curve:?} must be accepted"
+            );
+        }
     }
 
     /// `try_private_key` checks the SPKI a `HandshakeSigner` declares

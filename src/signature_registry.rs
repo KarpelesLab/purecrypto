@@ -264,9 +264,11 @@ mod policy {
         ///     **any supported curve** (P-256, P-384, P-521, or secp256k1)
         ///     with the OID's hash.
         ///   * `ecdsa-secp256r1-sha256`, `ecdsa-secp384r1-sha384`,
-        ///     `ecdsa-secp521r1-sha512` — the TLS 1.3 `CertificateVerify`
-        ///     scheme-dispatch entries; this is where the matched-curve /
-        ///     matched-hash restriction applies.
+        ///     `ecdsa-secp521r1-sha512`, and the RFC 8734 Brainpool pairs
+        ///     `ecdsa-brainpoolP256r1-sha256`, `ecdsa-brainpoolP384r1-sha384`,
+        ///     `ecdsa-brainpoolP512r1-sha512` — the TLS 1.3
+        ///     `CertificateVerify` scheme-dispatch entries; this is where the
+        ///     matched-curve / matched-hash restriction applies.
         ///   * `ed25519`, `ed448`
         ///   * `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87` (NIST FIPS 204)
         ///
@@ -298,6 +300,13 @@ mod policy {
                 "ecdsa-secp256r1-sha256",
                 "ecdsa-secp384r1-sha384",
                 "ecdsa-secp521r1-sha512",
+                // RFC 8734: the Brainpool matched pairs have TLS 1.3 code
+                // points of their own, so they are permitted like the NIST
+                // pairs (chain signatures over Brainpool already were, via
+                // the OID-keyed entries).
+                "ecdsa-brainpoolP256r1-sha256",
+                "ecdsa-brainpoolP384r1-sha384",
+                "ecdsa-brainpoolP512r1-sha512",
                 "ed25519",
                 "ed448",
                 "ml-dsa-44",

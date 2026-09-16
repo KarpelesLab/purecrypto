@@ -341,25 +341,24 @@ impl ServerConfig12 {
         }
     }
 
-    /// The signature scheme this server's key will use in `ServerKeyExchange`.
-    /// For ECDSA the choice tracks the curve; for RSA we use RSA-PSS, the
-    /// modern default for TLS 1.2 + 1.3 interop.
-    fn signature_scheme(&self) -> SignatureScheme {
+    /// The signature scheme this server's key will use in `ServerKeyExchange`,
+    /// or `None` when the key has none for TLS 1.2. For ECDSA the choice
+    /// tracks the curve: the NIST curves have RFC 8446 code points; the RFC
+    /// 8734 Brainpool code points are TLS 1.3 only (§2: "MUST NOT be used in
+    /// TLS 1.2"), and secp256k1 / SM2 have none at all — the ClientHello
+    /// handler turns `None` into `Error::UnsupportedKeyType` rather than
+    /// signing under a NIST code point the client would reject. For RSA we
+    /// use RSA-PSS, the modern default for TLS 1.2 + 1.3 interop.
+    fn signature_scheme(&self) -> Option<SignatureScheme> {
         match &self.key {
-            ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
-            ServerKey::Ecdsa(k) => match k.curve() {
-                CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
-                CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-                CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-                CurveId::Secp256k1 | CurveId::Sm2p256v1 | CurveId::BrainpoolP256r1 => {
-                    SignatureScheme::ECDSA_SECP256R1_SHA256
-                }
-                CurveId::BrainpoolP384r1 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-                CurveId::BrainpoolP512r1 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-            },
+            ServerKey::Rsa(_) => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
+            ServerKey::Ecdsa(k) => {
+                crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve())
+                    .filter(|s| !s.is_brainpool_tls13())
+            }
             // Unreachable through the public constructors but the compiler
             // requires the match to be total.
-            _ => SignatureScheme::RSA_PSS_RSAE_SHA256,
+            _ => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
         }
     }
 }
@@ -1160,7 +1159,13 @@ impl<R: RngCore> ServerConnection12<R> {
         let sig_algs = ext::find(&ch.extensions, ExtensionType::SIGNATURE_ALGORITHMS)
             .ok_or(Error::HandshakeFailure)?;
         let offered = ext::parse_signature_algorithms(sig_algs)?;
-        let our_scheme = self.config.signature_scheme();
+        // A key with no TLS 1.2 scheme (secp256k1 / SM2 / Brainpool) is a
+        // configuration error, distinct from a client that merely does not
+        // accept ours.
+        let our_scheme = self
+            .config
+            .signature_scheme()
+            .ok_or(Error::UnsupportedKeyType)?;
         if !offered.contains(&our_scheme) {
             return Err(Error::HandshakeFailure);
         }
@@ -2308,7 +2313,10 @@ impl<R: RngCore> ServerConnection12<R> {
         };
 
         let to_sign = signed_message(&cr, &sr, group, &point);
-        let scheme = self.config.signature_scheme();
+        let scheme = self
+            .config
+            .signature_scheme()
+            .ok_or(Error::UnsupportedKeyType)?;
         let signature: Vec<u8> = match &self.config.key {
             ServerKey::Rsa(k) => k
                 .sign_pss::<Sha256, _>(&to_sign, &mut self.rng)

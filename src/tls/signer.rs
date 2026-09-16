@@ -292,7 +292,12 @@ impl LocalSigner {
 impl HandshakeSigner for LocalSigner {
     fn schemes(&self) -> Vec<u16> {
         let server_key = self.key.to_server_key_13();
-        alloc::vec![super::crypto::signature_scheme_for(&server_key).0]
+        // A key with no IANA scheme (ECDSA on secp256k1 / SM2) advertises
+        // nothing, so the handshake fails at negotiation rather than
+        // producing a signature the peer must reject.
+        super::crypto::signature_scheme_for(&server_key)
+            .map(|s| alloc::vec![s.0])
+            .unwrap_or_default()
     }
 
     fn start_sign(&self, _scheme: u16, message: &[u8]) -> Result<Box<dyn SignOp>, Error> {

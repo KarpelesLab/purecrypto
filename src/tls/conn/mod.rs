@@ -766,6 +766,72 @@ mod loopback_tests {
         }
     }
 
+    /// One TLS 1.3 handshake per Brainpool curve (RFC 8734): the server's
+    /// `CertificateVerify` is signed under the
+    /// `ecdsa_brainpoolP*r1tls13_sha*` code point — which the client offers
+    /// by default and verifies through the matched-pair registry entry —
+    /// and the chain signature rides `ecdsa-with-SHA*`. The negotiated
+    /// scheme is asserted to be the RFC 8734 one, not a NIST stand-in.
+    #[test]
+    fn ecdsa_server_certificates_brainpool_curves_use_rfc8734_schemes() {
+        use crate::tls::codec::SignatureScheme;
+        for (curve, want) in [
+            (
+                crate::ec::CurveId::BrainpoolP256r1,
+                SignatureScheme::ECDSA_BRAINPOOLP256R1TLS13_SHA256,
+            ),
+            (
+                crate::ec::CurveId::BrainpoolP384r1,
+                SignatureScheme::ECDSA_BRAINPOOLP384R1TLS13_SHA384,
+            ),
+            (
+                crate::ec::CurveId::BrainpoolP512r1,
+                SignatureScheme::ECDSA_BRAINPOOLP512R1TLS13_SHA512,
+            ),
+        ] {
+            let (server_config, cert_der) = ecdsa_server(curve);
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert_der).unwrap();
+            let mut crng = HmacDrbg::<Sha256>::new(b"loopback-bp-client", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"loopback-bp-server", b"nonce", &[]);
+            let mut client = ClientConnection::new_with_offer(
+                ClientConfig::new(roots),
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+            let mut server = ServerConnection::new(server_config, srng);
+            for _ in 0..16 {
+                let c = client.write_tls();
+                if !c.is_empty() {
+                    server.read_tls(&c);
+                    server.process_new_packets().unwrap();
+                }
+                let s = server.write_tls();
+                if !s.is_empty() {
+                    client.read_tls(&s);
+                    client.process_new_packets().unwrap();
+                }
+                if c.is_empty() && s.is_empty() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking(), "{curve:?}: client did not finish");
+            assert!(!server.is_handshaking(), "{curve:?}: server did not finish");
+            assert_eq!(
+                server.negotiated_signature_scheme(),
+                Some(want),
+                "{curve:?}: CertificateVerify scheme"
+            );
+            client.send_application_data(b"ping").unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets().unwrap();
+            assert_eq!(server.take_received_plaintext(), b"ping");
+        }
+    }
+
     /// ML-DSA-44 and ML-DSA-87 server certificates complete a handshake
     /// (ML-DSA-65 is covered by `tls_mldsa_server_cert`), so all three
     /// `id-ml-dsa-*` OIDs and `mldsa*` scheme code points are exercised.
@@ -5057,6 +5123,66 @@ mod tls12_loopback_tests {
             ServerConfig12::with_ecdsa(alloc::vec![der.clone()], key),
             der,
         )
+    }
+
+    /// RFC 8734 §2: the Brainpool signature schemes are TLS 1.3 only, and
+    /// secp256k1 / SM2 have no scheme at all, so a TLS 1.2 server configured
+    /// with such a key refuses the ClientHello with a clear
+    /// `UnsupportedKeyType` instead of signing `ServerKeyExchange` under a
+    /// NIST code point the client would reject. The 1.2 client also never
+    /// offers the Brainpool code points.
+    #[test]
+    fn server12_refuses_keys_without_a_tls12_signature_scheme() {
+        use crate::tls::Error;
+        use crate::tls::codec::extension as ext;
+        let tls12 = ext::parse_signature_algorithms(&ext::signature_algorithms_tls12().1).unwrap();
+        let tls13 = ext::parse_signature_algorithms(&ext::signature_algorithms().1).unwrap();
+        assert!(!tls12.iter().any(|s| s.is_brainpool_tls13()));
+        assert!(tls13.iter().any(|s| s.is_brainpool_tls13()));
+        assert!(tls12.iter().all(|s| tls13.contains(s)));
+        for curve in [
+            CurveId::BrainpoolP256r1,
+            CurveId::BrainpoolP384r1,
+            CurveId::BrainpoolP512r1,
+            CurveId::Secp256k1,
+        ] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"loopback-ec12-nokey", b"nonce", &[]);
+            let key = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            let name = DistinguishedName::common_name("loopback.example");
+            let validity = Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            );
+            let cert = Certificate::self_signed_general(
+                &CertSigner::Ecdsa(&key),
+                &name,
+                &validity,
+                1,
+                false,
+                &["loopback.example"],
+            )
+            .unwrap();
+            let der = cert.to_der().to_vec();
+            let server_config = ServerConfig12::with_ecdsa(alloc::vec![der.clone()], key);
+            let mut roots = RootCertStore::new();
+            roots.add_der(der).unwrap();
+            let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-client", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"loopback12-server", b"nonce", &[]);
+            let mut client = ClientConnection12::new_with_offer(
+                ClientConfig12::new(roots),
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+            let mut server = ServerConnection12::new(server_config, srng);
+            let ch = client.write_tls();
+            server.read_tls(&ch);
+            assert!(
+                matches!(server.process_new_packets(), Err(Error::UnsupportedKeyType)),
+                "{curve:?}"
+            );
+        }
     }
 
     /// Runs a full in-process TLS 1.2 handshake against `(server_config, cert)`

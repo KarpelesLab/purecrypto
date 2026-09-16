@@ -272,33 +272,38 @@ strict_ecdsa_entry!(
     EcdsaSecp256k1Sha512, "ecdsa-secp256k1-sha512", CurveId::Secp256k1, Sha512, &[]
 );
 
-// Brainpool (RFC 5639) — matched curve/hash pairs. No IANA TLS scheme is
-// allocated here (RFC 7027 assigns TLS *groups* for ECDHE, not signature
-// schemes), so these are X.509 / policy-only entries, keyed off the
-// `ecdsa-with-SHA*` OID for chain dispatch via the any-curve entries above.
+// Brainpool (RFC 5639) — matched curve/hash pairs. RFC 8734 allocates TLS
+// 1.3 `SignatureScheme` code points for exactly these pairs
+// (`ecdsa_brainpoolP{256,384,512}r1tls13_sha{256,384,512}`), so like the
+// NIST pairs they serve TLS 1.3 `CertificateVerify` dispatch; X.509 chain
+// signatures still reach them through the any-curve `ecdsa-with-SHA*`
+// entries above. The code points are TLS 1.3 only (RFC 8734 §2).
 strict_ecdsa_entry!(
-    /// brainpoolP256r1 with SHA-256. Policy-only.
+    /// `ecdsa_brainpoolP256r1tls13_sha256` — brainpoolP256r1 + SHA-256.
+    /// TLS 1.3 scheme `0x081A` (RFC 8734).
     EcdsaBrainpoolP256r1Sha256,
     "ecdsa-brainpoolP256r1-sha256",
     CurveId::BrainpoolP256r1,
     Sha256,
-    &[]
+    &[0x081A]
 );
 strict_ecdsa_entry!(
-    /// brainpoolP384r1 with SHA-384. Policy-only.
+    /// `ecdsa_brainpoolP384r1tls13_sha384` — brainpoolP384r1 + SHA-384.
+    /// TLS 1.3 scheme `0x081B` (RFC 8734).
     EcdsaBrainpoolP384r1Sha384,
     "ecdsa-brainpoolP384r1-sha384",
     CurveId::BrainpoolP384r1,
     Sha384,
-    &[]
+    &[0x081B]
 );
 strict_ecdsa_entry!(
-    /// brainpoolP512r1 with SHA-512. Policy-only.
+    /// `ecdsa_brainpoolP512r1tls13_sha512` — brainpoolP512r1 + SHA-512.
+    /// TLS 1.3 scheme `0x081C` (RFC 8734).
     EcdsaBrainpoolP512r1Sha512,
     "ecdsa-brainpoolP512r1-sha512",
     CurveId::BrainpoolP512r1,
     Sha512,
-    &[]
+    &[0x081C]
 );
 
 /// Parses an SM2 SPKI (`id-ecPublicKey` + the `sm2p256v1` named curve) and

@@ -280,6 +280,15 @@ pub enum Error {
     /// mismatch only surfaces as an opaque signature failure on the *peer*
     /// after the handshake has been running for a round trip.
     IdentityKeyMismatch,
+    /// The configured signing key has no IANA `SignatureScheme` it could
+    /// sign a handshake signature under for the negotiated protocol version:
+    /// an ECDSA key on secp256k1 or SM2 (no code point exists at all —
+    /// refused by [`ConfigBuilder::try_identity`](crate::tls::ConfigBuilder::try_identity)),
+    /// or a Brainpool key in a TLS 1.2 / DTLS 1.2 handshake (RFC 8734's code
+    /// points are TLS 1.3 only). Signing under a NIST code point instead
+    /// would produce a `CertificateVerify` / `ServerKeyExchange` every
+    /// conformant peer rejects.
+    UnsupportedKeyType,
 }
 
 impl core::fmt::Display for Error {
@@ -331,6 +340,10 @@ impl core::fmt::Display for Error {
             Error::IdentityKeyMismatch => {
                 f.write_str("signing key does not match the leaf certificate's public key")
             }
+            Error::UnsupportedKeyType => f.write_str(
+                "signing key has no TLS signature scheme for this protocol version \
+                 (secp256k1 / SM2 have none; Brainpool is TLS 1.3 only)",
+            ),
         }
     }
 }

@@ -79,10 +79,33 @@ pub(crate) fn signature_algorithms() -> RawExtension {
     (ExtensionType::SIGNATURE_ALGORITHMS, body)
 }
 
+/// [`signature_algorithms`] for a ClientHello that offers TLS 1.2 (or DTLS
+/// 1.2) at most: the same list minus the RFC 8734 Brainpool code points,
+/// which are defined for TLS 1.3 only and MUST NOT be used in TLS 1.2. A
+/// version-flexible TLS 1.3 ClientHello keeps them (one list serves both
+/// versions; a 1.2 server ignores code points it does not use).
+pub(crate) fn signature_algorithms_tls12() -> RawExtension {
+    let mut body = Vec::new();
+    with_len_u16(&mut body, |b| {
+        for s in offered_signature_schemes() {
+            if !s.is_brainpool_tls13() {
+                put_u16(b, s.0);
+            }
+        }
+    });
+    (ExtensionType::SIGNATURE_ALGORITHMS, body)
+}
+
 /// The `SignatureScheme`s [`signature_algorithms`] advertises, in wire
 /// order. Peers may only sign a `CertificateVerify` with one of these
 /// (RFC 8446 §4.4.3), so the receiving side checks against this list.
 pub(crate) fn offered_signature_schemes() -> Vec<SignatureScheme> {
+    // Offered by default, like every other scheme the registry can verify
+    // and `SignaturePolicy::modern()` permits: the RFC 8734 Brainpool code
+    // points are IANA-registered TLS 1.3 schemes, and a Brainpool server
+    // identity can only be authenticated if the client offers them (RFC 8446
+    // §4.4.3 forbids the server signing under a scheme the client did not
+    // list). They sit after the NIST curves and RSA-PSS in preference order.
     let base = [
         SignatureScheme::ED25519,
         SignatureScheme::ED448,
@@ -91,6 +114,9 @@ pub(crate) fn offered_signature_schemes() -> Vec<SignatureScheme> {
         SignatureScheme::ECDSA_SECP521R1_SHA512,
         SignatureScheme::RSA_PSS_RSAE_SHA256,
         SignatureScheme::RSA_PSS_RSAE_SHA384,
+        SignatureScheme::ECDSA_BRAINPOOLP256R1TLS13_SHA256,
+        SignatureScheme::ECDSA_BRAINPOOLP384R1TLS13_SHA384,
+        SignatureScheme::ECDSA_BRAINPOOLP512R1TLS13_SHA512,
     ];
     // ML-DSA (draft-ietf-tls-mldsa). The TLS 1.3 wire format carries the raw
     // FIPS 204 signature in the CertificateVerify body, no DER wrapping. Only
