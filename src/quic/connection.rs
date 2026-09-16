@@ -2198,7 +2198,7 @@ impl QuicConnection {
                 // `loss_time`, so this cannot spin.
                 continue;
             }
-            self.handle_lost_packets(&lost, now);
+            self.handle_lost_packets(space, &lost, now);
         }
     }
 
@@ -2336,16 +2336,17 @@ impl QuicConnection {
     }
 
     /// RFC 9002 §B.8 `OnPacketsLost` — hands a batch `detect_lost` just
-    /// declared lost to the congestion controller: the in-flight packets
-    /// leave `bytes_in_flight` and open a recovery period, then the §7.6
-    /// persistent-congestion test collapses the window to `kMinimumWindow`
-    /// if the batch establishes it.
-    fn feed_lost_to_cc(&mut self, lost: &[SentPacket], now: Duration) {
+    /// declared lost in `space` to the congestion controller: the in-flight
+    /// packets leave `bytes_in_flight` and open a recovery period, then the
+    /// §7.6 persistent-congestion test collapses the window to
+    /// `kMinimumWindow` if the batch, with the losses declared before it,
+    /// establishes it.
+    fn feed_lost_to_cc(&mut self, space: PnSpaceId, lost: &[SentPacket], now: Duration) {
         let in_flight: Vec<SentPacket> = lost.iter().filter(|p| p.in_flight).cloned().collect();
         if !in_flight.is_empty() {
             self.endpoint.cc.on_packets_lost(&in_flight, now);
         }
-        if self.endpoint.loss.in_persistent_congestion(lost) {
+        if self.endpoint.loss.record_lost_batch(space, lost, now) {
             self.endpoint.cc.on_persistent_congestion();
         }
     }
@@ -2353,8 +2354,8 @@ impl QuicConnection {
     /// Feeds a batch of newly-declared-lost packets to congestion control and
     /// re-queues the bytes they carried. Mirrors steps 5, 6 and 6b of the ACK
     /// handler, for the timer-driven path which has no `Result` to propagate.
-    fn handle_lost_packets(&mut self, lost: &[SentPacket], now: Duration) {
-        self.feed_lost_to_cc(lost, now);
+    fn handle_lost_packets(&mut self, space: PnSpaceId, lost: &[SentPacket], now: Duration) {
+        self.feed_lost_to_cc(space, lost, now);
         for pkt in lost {
             if !pkt.retransmit_hint.is_empty() {
                 // A malformed hint can only come from our own encoder; drop it
@@ -5333,7 +5334,7 @@ impl QuicConnection {
                     //    control, persistent-congestion check included
                     //    (RFC 9002 §B.8).
                     let lost = self.endpoint.loss.detect_lost(space_id, now);
-                    self.feed_lost_to_cc(&lost, now);
+                    self.feed_lost_to_cc(space_id, &lost, now);
                     // 6. Re-queue CRYPTO bytes for each lost packet via
                     //    its retransmit_hint blob.
                     for pkt in &lost {
