@@ -249,9 +249,12 @@ impl Zeroize for String {
 // Callers wipe a `Box<Z>` through `DerefMut` (`(**b).zeroize()`).
 #[cfg(feature = "alloc")]
 impl<Z: Zeroize> Zeroize for Box<[Z]> {
+    /// Wipes the boxed slice through the `[Z]` impl, so plain-data element
+    /// types get the word-at-a-time, single-fence path rather than one
+    /// volatile store and fence per element.
     #[inline]
     fn zeroize(&mut self) {
-        self.iter_mut().for_each(Zeroize::zeroize);
+        Zeroize::zeroize(&mut **self);
     }
 }
 
