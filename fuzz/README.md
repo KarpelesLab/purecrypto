@@ -64,8 +64,11 @@ cargo +nightly fuzz run x509_certificate fuzz/artifacts/x509_certificate/crash-X
 - **Raw-bytes key constructors** (`X25519StaticSecret::from_bytes`,
   `Ed25519PublicKey::from_bytes`, …) — length-checked at the boundary.
 - **Signature verification math** — differential testing against known
-  vectors is the right tool. The *parsing* layer (DER ECDSA via
-  `ecdsa_sig_der`) is covered.
+  vectors is the right tool. The *decoding* layers are covered: DER ECDSA
+  via `ecdsa_sig_der`, the LMS / XMSS signature parsers via `lms_parse` /
+  `xmss_parse`, ML-DSA's `z` / hint unpacking via `mldsa_verify`, Falcon's
+  key and Golomb-Rice `s2` decoders via `falcon_verify`, and SLH-DSA's
+  fixed-layout verifier via `slhdsa_verify`.
 - **Pure crypto primitives** (cipher cores, hash cores, bignum ops) —
   handle any input by design.
 

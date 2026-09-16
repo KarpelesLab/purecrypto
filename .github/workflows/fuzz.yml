@@ -6,7 +6,7 @@ name: Fuzz
 # workflow artifacts so they can be added to the per-target seed corpus
 # as regression fixtures.
 #
-# The 29 targets and the `fuzz/` workspace they live in are intentionally
+# The targets and the `fuzz/` workspace they live in are intentionally
 # excluded from the main Cargo workspace, so nothing here affects the
 # day-to-day stable build.
 
@@ -64,6 +64,10 @@ jobs:
           - ech_retry_configs
           - ech_extension
           - cert_decompress
+          - pkcs12_parse
+          - falcon_verify
+          - mldsa_verify
+          - slhdsa_verify
     steps:
       - uses: actions/checkout@v6
 

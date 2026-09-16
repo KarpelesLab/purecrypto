@@ -49,13 +49,13 @@ hand-derived correctness tests.
 | `dh` | RFC 3526, RFC 4419, SP 800-56A checks | unit | — (SSH/legacy-TLS groups) | `dh_share` | modexp on CT bignum |
 | `key` | — (facade over the above) | unit (incl. OpenSSL X25519 PKCS#8) | inherits | `spki_pubkey`, `pkcs8_*` | inherits |
 | `mlkem` | FIPS 203 | unit + OpenSSL 3.5 | OpenSSL (SPKI, ct/ss) | `mlkem_pkcs8` | CT decaps + implicit rejection |
-| `mldsa` | FIPS 204 | **ACVP** (keygen/siggen/sigver, all levels) | OpenSSL (SPKI) | `pkcs8_mldsa` | hedged; CT compare + wipe |
-| `slhdsa` | FIPS 205 | **ACVP** (keygen/siggen/sigver) | — | `pkcs8_slhdsa` | hedged; wipe-on-drop |
-| `falcon` | FN-DSA / FIPS 206 draft | ref (samplerz KAT) + unit | — | — | signing CT (FPEMU); keygen best-effort |
+| `mldsa` | FIPS 204 | **ACVP** (keygen/siggen/sigver, all levels) | OpenSSL (SPKI) | `pkcs8_mldsa`, `mldsa_verify` | hedged; CT compare + wipe |
+| `slhdsa` | FIPS 205 | **ACVP** (keygen/siggen/sigver) | — | `pkcs8_slhdsa`, `slhdsa_verify` | hedged; wipe-on-drop |
+| `falcon` | FN-DSA / FIPS 206 draft | ref (samplerz KAT) + unit | — | `falcon_verify` | signing CT (FPEMU); keygen best-effort |
 | `lms` | RFC 8554, SP 800-208 | **RFC 8554 App. F** | ref vectors | `lms_parse` | n/a (hash-based, **stateful**) |
 | `xmss` | RFC 8391, SP 800-208 | ref-impl KAT | ref vectors | `xmss_parse` | n/a (hash-based, **stateful**) |
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
-| `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pbes2_decrypt` | MAC CT, wrong-pw gate, wipe |
+| `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
 | `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces | loopback; legacy vs OpenSSL 1.1.1; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
 | `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 server vs OpenSSL 3.5** (`s_client`) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 server vs OpenSSL 3.5** (`s_client -quic`) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
@@ -106,13 +106,15 @@ hand-derived correctness tests.
 
 ## Fuzzing
 
-29 `cargo-fuzz` (libFuzzer) targets under `fuzz/fuzz_targets/`, run in CI
+33 `cargo-fuzz` (libFuzzer) targets under `fuzz/fuzz_targets/`, run in CI
 (`.github/workflows/fuzz.yml`). They concentrate on the untrusted-input
 attack surface — parsers and protocol feeders:
 
 - **Encoding/parsers**: `der_reader`, `pem_decode`, `spki_pubkey`,
   `pkcs8_{rsa,ed25519,mldsa,slhdsa}`, `mlkem_pkcs8`, `ecdsa_sig_der`,
-  `lms_parse`, `xmss_parse`, `dh_share`, `pbes2_decrypt`.
+  `lms_parse`, `xmss_parse`, `dh_share`, `pbes2_decrypt`, `pkcs12_parse`.
+- **Signature decoders (through verify)**: `falcon_verify` (key + Golomb-Rice
+  `s2` decoders), `mldsa_verify` (`z` / hint unpacking), `slhdsa_verify`.
 - **X.509 / PKI**: `x509_certificate`, `x509_crl`, `x509_csr`,
   `ocsp_response`, `cert_decompress`.
 - **Protocol feeders** (arbitrary bytes → state machine, must reject

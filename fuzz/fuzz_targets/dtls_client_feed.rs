@@ -6,7 +6,7 @@
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
+use purecrypto::rsa::RsaPrivateKey;
 use purecrypto::tls::{Config, Connection, RootCertStore};
 use purecrypto::x509::{Certificate, DistinguishedName, Time, Validity};
 use std::sync::OnceLock;
@@ -25,7 +25,6 @@ fn client_cfg() -> &'static Config {
         );
         let cert = Certificate::self_signed(&signing_key, &name, &validity, 1, false).unwrap();
         let cert_der = cert.to_der().to_vec();
-        let _ = BoxedRsaPrivateKey::from_pkcs1_pem(SERVER_KEY_PEM);
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
         Config::builder()

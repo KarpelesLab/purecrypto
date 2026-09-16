@@ -29,14 +29,14 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-# Pull in every gated module the targets exercise. Matches the all-features
-# CI configuration so a feature gate added upstream can't silently bitrot
-# a target here.
+# Pull in every gated module the targets exercise (a feature a target
+# needs but that is missing here fails the build, so a gate added upstream
+# can't silently bitrot a target).
 purecrypto = { path = "..", features = [
     "std", "alloc", "hash", "cipher", "kdf", "mac", "bignum", "rng",
     "rsa", "dh", "der", "x509", "ec", "tls", "dtls", "quic",
     "mlkem", "mldsa", "slhdsa", "hpke", "ech", "cert-compression",
-    "lms", "xmss", "tls-legacy",
+    "lms", "xmss", "tls-legacy", "pkcs12", "falcon",
 ] }
 
 # Optimised debug info so libFuzzer's stack traces and `cargo fuzz fmt`
@@ -264,6 +264,36 @@ bench = false
 [[bin]]
 name = "cert_decompress"
 path = "fuzz_targets/cert_decompress.rs"
+test = false
+doc = false
+bench = false
+
+# --- Signature / archive decoders reached from untrusted bytes.
+
+[[bin]]
+name = "pkcs12_parse"
+path = "fuzz_targets/pkcs12_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "falcon_verify"
+path = "fuzz_targets/falcon_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mldsa_verify"
+path = "fuzz_targets/mldsa_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slhdsa_verify"
+path = "fuzz_targets/slhdsa_verify.rs"
 test = false
 doc = false
 bench = false

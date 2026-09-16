@@ -25,7 +25,8 @@ The implementations are built to withstand:
   Fujisaki–Okamoto + implicit rejection).
 - **Malformed / hostile input** to parsers and protocol state machines
   (DER/PEM/PKCS#8/SPKI/X.509/TLS/DTLS/QUIC): the goal is graceful rejection, no
-  panics, no memory unsafety — exercised by 29 fuzz targets.
+  panics, no memory unsafety — exercised by the `cargo-fuzz` targets listed
+  in `docs/validation.md`.
 - **Timing side channels from secret-dependent code paths**, to the extent
   achievable at the Rust source level: branchless `ct` primitives,
   all-limbs-unconditional `bignum`, blinded RSA, constant-time curve scalar
