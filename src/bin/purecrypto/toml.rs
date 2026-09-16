@@ -77,10 +77,14 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(src: &'a str) -> Self {
+        // A leading UTF-8 byte-order mark is not part of the document
+        // (editors on Windows add one); skip it rather than reporting
+        // "unexpected character" on the first key.
+        let pos = if src.starts_with('\u{feff}') { 3 } else { 0 };
         Parser {
             src,
             bytes: src.as_bytes(),
-            pos: 0,
+            pos,
             line: 1,
             depth: 0,
         }
@@ -174,7 +178,7 @@ impl<'a> Parser<'a> {
                 }
                 seen_headers.push(current_path.clone());
                 // Pre-create the table.
-                ensure_table_path(&mut root, &current_path)?;
+                ensure_table_path(&mut root, &current_path, self.line)?;
                 self.expect_eol()?;
                 continue;
             }
@@ -187,7 +191,7 @@ impl<'a> Parser<'a> {
             self.pos += 1; // '='
             self.skip_ws();
             let value = self.parse_value()?;
-            let target = get_or_create_table(&mut root, &current_path)?;
+            let target = get_or_create_table(&mut root, &current_path, self.line)?;
             insert_dotted(target, &key, value, self.line)?;
             self.expect_eol()?;
         }
@@ -312,24 +316,33 @@ impl<'a> Parser<'a> {
                             // \xHH — two hex digits, one Unicode scalar in
                             // U+0000..=U+00FF (re-encoded as UTF-8 on push).
                             self.pos += 1;
-                            let h1 = self.expect_hex_digit()? as u32;
-                            let h2 = self.expect_hex_digit()? as u32;
+                            let h1 = self.expect_hex_digit("\\x")? as u32;
+                            let h2 = self.expect_hex_digit("\\x")? as u32;
                             out.push(char::from_u32((h1 << 4) | h2).expect("U+0000..=U+00FF"));
                         }
                         Some(b'u') => {
                             self.pos += 1;
-                            let c = self.read_unicode_escape(4)?;
+                            let c = self.read_unicode_escape(4, "\\u")?;
                             out.push(c);
                         }
                         Some(b'U') => {
                             self.pos += 1;
-                            let c = self.read_unicode_escape(8)?;
+                            let c = self.read_unicode_escape(8, "\\U")?;
                             out.push(c);
                         }
                         Some(other) => {
                             return self.err(format!("unknown escape '\\{}'", other as char));
                         }
                     }
+                }
+                // TOML 1.0 §String: a basic string may not contain a raw
+                // control character other than tab (U+0000..=U+0008,
+                // U+000A..=U+001F, U+007F); they must be escaped. Letting
+                // one through would bake it into a certificate name.
+                Some(b) if (b < 0x20 && b != b'\t') || b == 0x7f => {
+                    return self.err(format!(
+                        "control character U+{b:04X} must be escaped inside a basic string"
+                    ));
                 }
                 Some(_) => {
                     // Decode one whole UTF-8 scalar. `self.src` is a `&str`,
@@ -349,27 +362,33 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Reads the `n` hex digits of a `\uXXXX` / `\UXXXXXXXX` escape and turns
-    /// them into one Unicode scalar (rejecting surrogates and out-of-range
-    /// code points, which `char::from_u32` screens for us). The result is
-    /// pushed as a `char`, i.e. re-encoded as UTF-8 — never as a raw byte.
-    fn read_unicode_escape(&mut self, n: usize) -> Result<char, TomlError> {
+    /// Reads the `n` hex digits of a `\uXXXX` / `\UXXXXXXXX` escape (named
+    /// `escape` in diagnostics) and turns them into one Unicode scalar
+    /// (rejecting surrogates and out-of-range code points, which
+    /// `char::from_u32` screens for us). The result is pushed as a `char`,
+    /// i.e. re-encoded as UTF-8 — never as a raw byte.
+    fn read_unicode_escape(&mut self, n: usize, escape: &str) -> Result<char, TomlError> {
         let mut v: u32 = 0;
         for _ in 0..n {
-            v = (v << 4) | self.expect_hex_digit()? as u32;
+            v = (v << 4) | self.expect_hex_digit(escape)? as u32;
         }
         match char::from_u32(v) {
             Some(c) => Ok(c),
-            None => self.err(format!("\\u escape is not a Unicode scalar value: {v:#x}")),
+            None => self.err(format!(
+                "{escape} escape is not a Unicode scalar value: {v:#x}"
+            )),
         }
     }
 
-    fn expect_hex_digit(&mut self) -> Result<u8, TomlError> {
+    /// One hex digit of the `escape` (`\x`, `\u` or `\U`) being decoded —
+    /// named in the error so a bad `\u12G4` is not reported as a `\x`
+    /// problem.
+    fn expect_hex_digit(&mut self, escape: &str) -> Result<u8, TomlError> {
         let v = match self.peek() {
             Some(b @ b'0'..=b'9') => b - b'0',
             Some(b @ b'a'..=b'f') => b - b'a' + 10,
             Some(b @ b'A'..=b'F') => b - b'A' + 10,
-            _ => return self.err("expected hex digit in \\x escape"),
+            _ => return self.err(format!("expected hex digit in {escape} escape")),
         };
         self.pos += 1;
         Ok(v)
@@ -427,6 +446,13 @@ impl<'a> Parser<'a> {
         // Reject obvious mis-flavors of TOML integers we don't support.
         let raw_digits = &self.src[digits_start..self.pos];
         let cleaned: String = raw_digits.chars().filter(|c| *c != '_').collect();
+        // TOML 1.0 §Integer: leading zeros are not allowed (`007`, `+01`);
+        // a bare `0` / `-0` / `+0` is fine.
+        if cleaned.len() > 1 && cleaned.starts_with('0') {
+            return self.err(format!(
+                "leading zeros are not allowed in integers: {raw_digits}"
+            ));
+        }
         let sign = &self.src[start..digits_start];
         let combined = format!("{sign}{cleaned}");
         let n: i64 = combined.parse().map_err(|_| TomlError {
@@ -521,7 +547,10 @@ fn is_bare_key_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
-fn ensure_table_path(root: &mut TomlTable, path: &[String]) -> Result<(), TomlError> {
+/// Creates every table along `path` (for a `[a.b.c]` header on `line`).
+/// A component that already holds a non-table value is an error reported
+/// at that header's line — it used to say `line 0`, which pointed nowhere.
+fn ensure_table_path(root: &mut TomlTable, path: &[String], line: usize) -> Result<(), TomlError> {
     let mut cur = root;
     for (i, k) in path.iter().enumerate() {
         let entry = cur
@@ -537,7 +566,7 @@ fn ensure_table_path(root: &mut TomlTable, path: &[String]) -> Result<(), TomlEr
                         "key `{}` is not a table (collides with another value)",
                         path[..=i].join(".")
                     ),
-                    line: 0,
+                    line,
                 });
             }
         }
@@ -545,9 +574,11 @@ fn ensure_table_path(root: &mut TomlTable, path: &[String]) -> Result<(), TomlEr
     Ok(())
 }
 
+/// Resolves the table a `key = value` pair on `line` belongs to.
 fn get_or_create_table<'r>(
     root: &'r mut TomlTable,
     path: &[String],
+    line: usize,
 ) -> Result<&'r mut TomlTable, TomlError> {
     let mut cur = root;
     for k in path {
@@ -559,7 +590,7 @@ fn get_or_create_table<'r>(
             _ => {
                 return Err(TomlError {
                     message: format!("key `{k}` is not a table"),
-                    line: 0,
+                    line,
                 });
             }
         };
@@ -873,5 +904,78 @@ x = 1
         assert_eq!(r["b"].as_str().unwrap(), "🔐");
         // Surrogates are not scalar values and must be rejected.
         assert!(parse("a = \"\\ud800\"").is_err());
+    }
+
+    /// A bad digit in a `\u` / `\U` escape used to be reported as a `\x`
+    /// problem; each escape is now named in its own diagnostic.
+    #[test]
+    fn hex_digit_errors_name_the_escape() {
+        let e = parse("a = \"\\u12G4\"").unwrap_err();
+        assert!(e.message.contains("\\u escape"), "{e}");
+        assert!(!e.message.contains("\\x"), "{e}");
+        let e = parse("a = \"\\U0001F5ZZ\"").unwrap_err();
+        assert!(e.message.contains("\\U escape"), "{e}");
+        let e = parse("a = \"\\xZ1\"").unwrap_err();
+        assert!(e.message.contains("\\x escape"), "{e}");
+        let e = parse("a = \"\\ud800\"").unwrap_err();
+        assert!(e.message.starts_with("\\u escape"), "{e}");
+    }
+
+    /// TOML 1.0 §Integer: leading zeros are not allowed. `007` used to parse
+    /// as 7 (and `08` as 8), so a typo'd `default_days = 0365` went through.
+    #[test]
+    fn rejects_leading_zeros_in_integers() {
+        for src in ["a = 007", "a = 08", "a = +01", "a = -00", "a = 0_1"] {
+            let e = parse(src).unwrap_err();
+            assert!(e.message.contains("leading zeros"), "{src:?}: {e}");
+        }
+        for (src, want) in [("a = 0", 0), ("a = -0", 0), ("a = +0", 0), ("a = 10", 10)] {
+            assert_eq!(t(src)["a"].as_int(), Some(want), "{src:?}");
+        }
+    }
+
+    /// TOML 1.0 §String: raw control characters other than tab must be
+    /// escaped inside a basic string. One used to pass straight through into
+    /// the certificate names a template supplies.
+    #[test]
+    fn rejects_raw_control_characters_in_basic_strings() {
+        for c in [
+            '\u{0}', '\u{1}', '\u{8}', '\u{b}', '\u{c}', '\r', '\u{1f}', '\u{7f}',
+        ] {
+            let src = format!("a = \"x{c}y\"");
+            let e = parse(&src).unwrap_err();
+            assert!(
+                e.message.contains("control character"),
+                "{:?}: {e}",
+                c as u32
+            );
+        }
+        // Tab is the one control character allowed raw; the escaped forms
+        // of the others still decode.
+        assert_eq!(t("a = \"x\ty\"")["a"].as_str(), Some("x\ty"));
+        assert_eq!(t("a = \"x\\u0001y\"")["a"].as_str(), Some("x\u{1}y"));
+    }
+
+    /// A UTF-8 byte-order mark at the start of the document is skipped.
+    #[test]
+    fn accepts_a_leading_utf8_bom() {
+        let r = t("\u{feff}name = \"x\"\n[a]\nb = 1\n");
+        assert_eq!(r["name"].as_str(), Some("x"));
+        assert_eq!(r["a"].as_table().unwrap()["b"].as_int(), Some(1));
+        // Only at the very start: elsewhere it is an ordinary (bad) character.
+        assert!(parse("name = \"x\"\n\u{feff}b = 1\n").is_err());
+    }
+
+    /// A `[header]` colliding with an existing non-table value is reported
+    /// at the header's line, not `line 0`; likewise a dotted key under one.
+    #[test]
+    fn table_collision_errors_report_the_real_line() {
+        let e = parse("a = 1\n\n[a]\nb = 2\n").unwrap_err();
+        assert!(e.message.contains("is not a table"), "{e}");
+        assert_eq!(e.line, 3);
+        let e = parse("a = 1\n[a.b]\nc = 2\n").unwrap_err();
+        assert!(e.message.contains("is not a table"), "{e}");
+        assert_eq!(e.line, 2);
+        assert!(!format!("{e}").contains("line 0"));
     }
 }
