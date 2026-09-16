@@ -820,6 +820,55 @@ mod tests {
         assert_eq!(buf, plaintext);
     }
 
+    /// McGrew–Viega GCM spec Test Cases 15 and 16: AES-256 (the 14-round
+    /// schedule) with a 96-bit IV, without and with AAD. Until now the
+    /// AES-256 instantiation was only pinned differentially (fused vs.
+    /// generic path), never against a published answer.
+    #[test]
+    fn tc15_tc16_aes256() {
+        let g = Gcm::new(crate::cipher::Aes256::new(&from_hex::<32>(
+            "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308",
+        )));
+        let nonce = from_hex::<12>("cafebabefacedbaddecaf888");
+
+        // TC15: 64-byte plaintext, no AAD.
+        let plaintext = from_hex::<64>(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72\
+             1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255",
+        );
+        let mut buf = plaintext;
+        let tag = g.encrypt(&nonce, &[], &mut buf);
+        assert_eq!(
+            buf,
+            from_hex::<64>(
+                "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa\
+                 8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015ad"
+            )
+        );
+        assert_eq!(tag, from_hex::<16>("b094dac5d93471bdec1a502270e3cc6c"));
+        g.decrypt(&nonce, &[], &mut buf, &tag).unwrap();
+        assert_eq!(buf, plaintext);
+
+        // TC16: 60-byte plaintext with 20 bytes of AAD.
+        let aad = from_hex::<20>("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+        let plaintext = from_hex::<60>(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72\
+             1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39",
+        );
+        let mut buf = plaintext;
+        let tag = g.encrypt(&nonce, &aad, &mut buf);
+        assert_eq!(
+            buf,
+            from_hex::<60>(
+                "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa\
+                 8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662"
+            )
+        );
+        assert_eq!(tag, from_hex::<16>("76fc6ece0f4e1768cddf8853bb2d551b"));
+        g.decrypt(&nonce, &aad, &mut buf, &tag).unwrap();
+        assert_eq!(buf, plaintext);
+    }
+
     #[test]
     fn decrypt_roundtrip_and_reject() {
         let g = gcm128("feffe9928665731c6d6a8f9467308308");
