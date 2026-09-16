@@ -813,3 +813,377 @@ fn export_length_is_bound_into_the_derivation() {
     assert_eq!(sender.export(b"ctx", 16).unwrap()[..], short[..]);
     assert_eq!(sender.export(b"ctx", 32).unwrap()[..], long[..]);
 }
+
+// -------------------------------------------------------------------
+// RFC 9180 Appendix A: the full "Encryptions" and "Exported Values" tables.
+//
+// The KATs above pin `Encryption[0]` (and sometimes `[1]`); the RFC's tables
+// also carry sequence numbers 2, 4, 255 and 256, and 256 is the one that
+// exercises a carry into the second-lowest nonce byte in `ComputeNonce`.
+// -------------------------------------------------------------------
+
+/// One RFC 9180 Appendix A test-vector block, as hex. Empty `psk` / `psk_id`
+/// select a non-PSK mode; an empty `sk_sm` selects a non-Auth mode.
+struct Kat<'a> {
+    suite: CipherSuite,
+    ikm_e: &'a str,
+    pk_em: &'a str,
+    /// `skEm`, checked through `DeriveKeyPair` when given.
+    sk_em: &'a str,
+    pk_rm: &'a str,
+    sk_rm: &'a str,
+    psk: &'a str,
+    psk_id: &'a str,
+    pk_sm: &'a str,
+    sk_sm: &'a str,
+    /// Ciphertexts for sequence numbers 0, 1, 2, 4, 255 and 256.
+    cts: [&'a str; 6],
+    /// Exported values for the contexts `""`, `00` and `"TestContext"`, L = 32.
+    exports: [&'a str; 3],
+}
+
+/// Drives `kat` through the matching `setup_*` pair, then checks every row of
+/// the RFC's "Encryptions" and "Exported Values" tables. Sequence numbers the
+/// table skips are advanced with throwaway seals, opened on the receiver so
+/// both sides stay in step.
+fn run_kat(kat: &Kat<'_>) {
+    let info = hex("4f6465206f6e2061204772656369616e2055726e");
+    let ikm_e = hex(kat.ikm_e);
+    let pk_rm = hex(kat.pk_rm);
+    let sk_rm = hex(kat.sk_rm);
+    let psk = hex(kat.psk);
+    let psk_id = hex(kat.psk_id);
+    let pk_sm = hex(kat.pk_sm);
+    let sk_sm = hex(kat.sk_sm);
+
+    if !kat.sk_em.is_empty() {
+        let (sk, pk) = kat.suite.kem.derive_key_pair(&ikm_e).unwrap();
+        assert_eq!(sk, hex(kat.sk_em), "DeriveKeyPair(ikmE) skEm");
+        assert_eq!(pk, hex(kat.pk_em), "DeriveKeyPair(ikmE) pkEm");
+    }
+
+    let mut rng = ScriptRng::new(&ikm_e);
+    let suite = kat.suite;
+    let (enc, mut sender, mut receiver) = match (psk.is_empty(), sk_sm.is_empty()) {
+        (true, true) => {
+            let (enc, s) = setup_sender(&mut rng, suite, &pk_rm, &info).unwrap();
+            let r = setup_receiver(suite, &enc, &sk_rm, &info).unwrap();
+            (enc, s, r)
+        }
+        (false, true) => {
+            let (enc, s) = setup_sender_psk(&mut rng, suite, &pk_rm, &info, &psk, &psk_id).unwrap();
+            let r = setup_receiver_psk(suite, &enc, &sk_rm, &info, &psk, &psk_id).unwrap();
+            (enc, s, r)
+        }
+        (true, false) => {
+            let (enc, s) = setup_sender_auth(&mut rng, suite, &pk_rm, &info, &sk_sm).unwrap();
+            let r = setup_receiver_auth(suite, &enc, &sk_rm, &info, &pk_sm).unwrap();
+            (enc, s, r)
+        }
+        (false, false) => {
+            let (enc, s) =
+                setup_sender_auth_psk(&mut rng, suite, &pk_rm, &info, &psk, &psk_id, &sk_sm)
+                    .unwrap();
+            let r =
+                setup_receiver_auth_psk(suite, &enc, &sk_rm, &info, &psk, &psk_id, &pk_sm).unwrap();
+            (enc, s, r)
+        }
+    };
+    assert_eq!(enc, hex(kat.pk_em), "enc matches pkEm");
+
+    // "Beauty is truth, truth beauty"; aad = "Count-<seq>".
+    let pt = hex("4265617574792069732074727574682c20747275746820626561757479");
+    let rows: [(u64, &str); 6] = [
+        (0, "436f756e742d30"),
+        (1, "436f756e742d31"),
+        (2, "436f756e742d32"),
+        (4, "436f756e742d34"),
+        (255, "436f756e742d323535"),
+        (256, "436f756e742d323536"),
+    ];
+    let mut seq = 0u64;
+    for ((want_seq, aad), ct_hex) in rows.iter().zip(kat.cts.iter()) {
+        while seq < *want_seq {
+            let ct = sender.seal(b"skip", &pt).unwrap();
+            assert_eq!(receiver.open(b"skip", &ct).unwrap(), pt);
+            seq += 1;
+        }
+        let aad = hex(aad);
+        let ct = sender.seal(&aad, &pt).unwrap();
+        assert_eq!(ct, hex(ct_hex), "Encryption[seq = {want_seq}] ciphertext");
+        assert_eq!(
+            receiver.open(&aad, &ct).unwrap(),
+            pt,
+            "Encryption[seq = {want_seq}] plaintext"
+        );
+        seq += 1;
+    }
+
+    let contexts = [
+        alloc::vec::Vec::new(),
+        hex("00"),
+        hex("54657374436f6e74657874"),
+    ];
+    for (ctx, want) in contexts.iter().zip(kat.exports.iter()) {
+        assert_eq!(sender.export(ctx, 32).unwrap(), hex(want), "sender export");
+        assert_eq!(
+            receiver.export(ctx, 32).unwrap(),
+            hex(want),
+            "receiver export"
+        );
+    }
+}
+
+/// RFC 9180 Appendix A.1.1, the full Encryptions / Exported Values tables.
+#[test]
+fn rfc9180_appendix_a1_base_x25519_aes128_all_rows() {
+    run_kat(&Kat {
+        suite: CipherSuite::new(
+            HpkeKem::DhkemX25519HkdfSha256,
+            HpkeKdf::HkdfSha256,
+            HpkeAead::Aes128Gcm,
+        ),
+        ikm_e: "7268600d403fce431561aef583ee1613527cff655c1343f29812e66706df3234",
+        pk_em: "37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431",
+        sk_em: "52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736",
+        pk_rm: "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
+        sk_rm: "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
+        psk: "",
+        psk_id: "",
+        pk_sm: "",
+        sk_sm: "",
+        cts: [
+            "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a9\
+             6d8770ac83d07bea87e13c512a",
+            "af2d7e9ac9ae7e270f46ba1f975be53c09f8d875bdc8535458c2494e8a6eab25\
+             1c03d0c22a56b8ca42c2063b84",
+            "498dfcabd92e8acedc281e85af1cb4e3e31c7dc394a1ca20e173cb7251649158\
+             8d96a19ad4a683518973dcc180",
+            "583bd32bc67a5994bb8ceaca813d369bca7b2a42408cddef5e22f880b631215a\
+             09fc0012bc69fccaa251c0246d",
+            "7175db9717964058640a3a11fb9007941a5d1757fda1a6935c805c21af32505b\
+             f106deefec4a49ac38d71c9e0a",
+            "957f9800542b0b8891badb026d79cc54597cb2d225b54c00c5238c25d05c30e3\
+             fbeda97d2e0e1aba483a2df9f2",
+        ],
+        exports: [
+            "3853fe2b4035195a573ffc53856e77058e15d9ea064de3e59f4961d0095250ee",
+            "2e8f0b54673c7029649d4eb9d5e33bf1872cf76d623ff164ac185da9e88c21a5",
+            "e9e43065102c3836401bed8c3c3c75ae46be1639869391d62c61f1ec7af54931",
+        ],
+    });
+}
+
+/// RFC 9180 Appendix A.1.2: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+/// AES-128-GCM, mode_psk. The only KAT that pins the PSK key schedule
+/// (`psk_id_hash` and the `secret = LabeledExtract(shared_secret, "secret",
+/// psk)` step with a non-empty `psk`).
+#[test]
+fn rfc9180_appendix_a1_psk_x25519_aes128() {
+    run_kat(&Kat {
+        suite: CipherSuite::new(
+            HpkeKem::DhkemX25519HkdfSha256,
+            HpkeKdf::HkdfSha256,
+            HpkeAead::Aes128Gcm,
+        ),
+        ikm_e: "78628c354e46f3e169bd231be7b2ff1c77aa302460a26dbfa15515684c00130b",
+        pk_em: "0ad0950d9fb9588e59690b74f1237ecdf1d775cd60be2eca57af5a4b0471c91b",
+        sk_em: "463426a9ffb42bb17dbe6044b9abd1d4e4d95f9041cef0e99d7824eef2b6f588",
+        pk_rm: "9fed7e8c17387560e92cc6462a68049657246a09bfa8ade7aefe589672016366",
+        sk_rm: "c5eb01eb457fe6c6f57577c5413b931550a162c71a03ac8d196babbd4e5ce0fd",
+        psk: "0247fd33b913760fa1fa51e1892d9f307fbe65eb171e8132c2af18555a738b82",
+        psk_id: "456e6e796e20447572696e206172616e204d6f726961",
+        pk_sm: "",
+        sk_sm: "",
+        cts: [
+            "e52c6fed7f758d0cf7145689f21bc1be6ec9ea097fef4e959440012f4feb73fb\
+             611b946199e681f4cfc34db8ea",
+            "49f3b19b28a9ea9f43e8c71204c00d4a490ee7f61387b6719db765e948123b45\
+             b61633ef059ba22cd62437c8ba",
+            "257ca6a08473dc851fde45afd598cc83e326ddd0abe1ef23baa3baa4dd8cde99\
+             fce2c1e8ce687b0b47ead1adc9",
+            "a71d73a2cd8128fcccbd328b9684d70096e073b59b40b55e6419c9c68ae21069\
+             c847e2a70f5d8fb821ce3dfb1c",
+            "55f84b030b7f7197f7d7d552365b6b932df5ec1abacd30241cb4bc4ccea27bd2\
+             b518766adfa0fb1b71170e9392",
+            "c5bf246d4a790a12dcc9eed5eae525081e6fb541d5849e9ce8abd92a3bc15517\
+             76bea16b4a518f23e237c14b59",
+        ],
+        exports: [
+            "dff17af354c8b41673567db6259fd6029967b4e1aad13023c2ae5df8f4f43bf6",
+            "6a847261d8207fe596befb52928463881ab493da345b10e1dcc645e3b94e2d95",
+            "8aff52b45a1be3a734bc7a41e20b4e055ad4c4d22104b0c20285a7c4302401cd",
+        ],
+    });
+}
+
+/// RFC 9180 Appendix A.1.4: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+/// AES-128-GCM, mode_auth_psk — `AuthEncap` on X25519 plus the PSK schedule.
+#[test]
+fn rfc9180_appendix_a1_auth_psk_x25519_aes128() {
+    run_kat(&Kat {
+        suite: CipherSuite::new(
+            HpkeKem::DhkemX25519HkdfSha256,
+            HpkeKdf::HkdfSha256,
+            HpkeAead::Aes128Gcm,
+        ),
+        ikm_e: "4303619085a20ebcf18edd22782952b8a7161e1dbae6e46e143a52a96127cf84",
+        pk_em: "820818d3c23993492cc5623ab437a48a0a7ca3e9639c140fe1e33811eb844b7c",
+        sk_em: "14de82a5897b613616a00c39b87429df35bc2b426bcfd73febcb45e903490768",
+        pk_rm: "1d11a3cd247ae48e901939659bd4d79b6b959e1f3e7d66663fbc9412dd4e0976",
+        sk_rm: "cb29a95649dc5656c2d054c1aa0d3df0493155e9d5da6d7e344ed8b6a64a9423",
+        psk: "0247fd33b913760fa1fa51e1892d9f307fbe65eb171e8132c2af18555a738b82",
+        psk_id: "456e6e796e20447572696e206172616e204d6f726961",
+        pk_sm: "2bfb2eb18fcad1af0e4f99142a1c474ae74e21b9425fc5c589382c69b50cc57e",
+        sk_sm: "fc1c87d2f3832adb178b431fce2ac77c7ca2fd680f3406c77b5ecdf818b119f4",
+        cts: [
+            "a84c64df1e11d8fd11450039d4fe64ff0c8a99fca0bd72c2d4c3e0400bc14a40\
+             f27e45e141a24001697737533e",
+            "4d19303b848f424fc3c3beca249b2c6de0a34083b8e909b6aa4c3688505c05ff\
+             e0c8f57a0a4c5ab9da127435d9",
+            "0c085a365fbfa63409943b00a3127abce6e45991bc653f182a80120868fc507e\
+             9e4d5e37bcc384fc8f14153b24",
+            "000a3cd3a3523bf7d9796830b1cd987e841a8bae6561ebb6791a3f0e34e89a4f\
+             b539faeee3428b8bbc082d2c1a",
+            "576d39dd2d4cc77d1a14a51d5c5f9d5e77586c3d8d2ab33bdec6379e28ce5c50\
+             2f0b1cbd09047cf9eb9269bb52",
+            "13239bab72e25e9fd5bb09695d23c90a24595158b99127505c8a9ff9f127e0d6\
+             57f71af59d67d4f4971da028f9",
+        ],
+        exports: [
+            "08f7e20644bb9b8af54ad66d2067457c5f9fcb2a23d9f6cb4445c0797b330067",
+            "52e51ff7d436557ced5265ff8b94ce69cf7583f49cdb374e6aad801fc063b010",
+            "a30c20370c026bbea4dca51cb63761695132d342bae33a6a11527d3e7679436d",
+        ],
+    });
+}
+
+/// RFC 9180 Appendix A.2.1: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+/// ChaCha20-Poly1305, mode_base — the only KAT for the ChaCha20-Poly1305
+/// AEAD dispatch (32-byte key).
+#[test]
+fn rfc9180_appendix_a2_base_x25519_chacha20() {
+    run_kat(&Kat {
+        suite: CipherSuite::new(
+            HpkeKem::DhkemX25519HkdfSha256,
+            HpkeKdf::HkdfSha256,
+            HpkeAead::ChaCha20Poly1305,
+        ),
+        ikm_e: "909a9b35d3dc4713a5e72a4da274b55d3d3821a37e5d099e74a647db583a904b",
+        pk_em: "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a",
+        sk_em: "f4ec9b33b792c372c1d2c2063507b684ef925b8c75a42dbcbf57d63ccd381600",
+        pk_rm: "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a",
+        sk_rm: "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
+        psk: "",
+        psk_id: "",
+        pk_sm: "",
+        sk_sm: "",
+        cts: [
+            "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db\
+             21993c62ce81883d2dd1b51a28",
+            "6b53c051e4199c518de79594e1c4ab18b96f081549d45ce015be002090bb119e\
+             85285337cc95ba5f59992dc98c",
+            "71146bd6795ccc9c49ce25dda112a48f202ad220559502cef1f34271e0cb4b02\
+             b4f10ecac6f48c32f878fae86b",
+            "63357a2aa291f5a4e5f27db6baa2af8cf77427c7c1a909e0b37214dd47db122b\
+             b153495ff0b02e9e54a50dbe16",
+            "18ab939d63ddec9f6ac2b60d61d36a7375d2070c9b683861110757062c52b888\
+             0a5f6b3936da9cd6c23ef2a95c",
+            "7a4a13e9ef23978e2c520fd4d2e757514ae160cd0cd05e556ef692370ca53076\
+             214c0c40d4c728d6ed9e727a5b",
+        ],
+        exports: [
+            "4bbd6243b8bb54cec311fac9df81841b6fd61f56538a775e7c80a9f40160606e",
+            "8c1df14732580e5501b00f82b10a1647b40713191b7c1240ac80e2b68808ba69",
+            "5acb09211139c43b3090489a9da433e8a30ee7188ba8b0a9a1ccf0c229283e53",
+        ],
+    });
+}
+
+/// RFC 9180 Appendix A.4.1: DHKEM(P-256, HKDF-SHA256), HKDF-SHA512,
+/// AES-128-GCM, mode_base. The suite KDF (SHA-512, `Nh` = 64) differs from
+/// the KEM's internal KDF (SHA-256), which is the one case that catches a
+/// key schedule reading the KEM's hash instead of the suite's.
+#[test]
+fn rfc9180_appendix_a4_base_p256_sha512_aes128() {
+    run_kat(&Kat {
+        suite: CipherSuite::new(
+            HpkeKem::DhkemP256HkdfSha256,
+            HpkeKdf::HkdfSha512,
+            HpkeAead::Aes128Gcm,
+        ),
+        ikm_e: "4ab11a9dd78c39668f7038f921ffc0993b368171d3ddde8031501ee1e08c4c9a",
+        pk_em: "0493ed86735bdfb978cc055c98b45695ad7ce61ce748f4dd63c525a3b8d53a\
+                15565c6897888070070c1579db1f86aaa56deb8297e64db7e8924e72866f9a472580",
+        sk_em: "2292bf14bb6e15b8c81a0f45b7a6e93e32d830e48cca702e0affcfb4d07e1b5c",
+        pk_rm: "04085aa5b665dc3826f9650ccbcc471be268c8ada866422f739e2d531d4a88\
+                18a9466bc6b449357096232919ec4fe9070ccbac4aac30f4a1a53efcf7af90610edd",
+        sk_rm: "3ac8530ad1b01885960fab38cf3cdc4f7aef121eaa239f222623614b4079fb38",
+        psk: "",
+        psk_id: "",
+        pk_sm: "",
+        sk_sm: "",
+        cts: [
+            "d3cf4984931484a080f74c1bb2a6782700dc1fef9abe8442e44a6f09044c8890\
+             7200b332003543754eb51917ba",
+            "d14414555a47269dfead9fbf26abb303365e40709a4ed16eaefe1f2070f1ddeb\
+             1bdd94d9e41186f124e0acc62d",
+            "9bba136cade5c4069707ba91a61932e2cbedda2d9c7bdc33515aa01dd0e0f7e9\
+             d3579bf4016dec37da4aafa800",
+            "a531c0655342be013bf32112951f8df1da643602f1866749519f5dcb09cc6843\
+             2579de305a77e6864e862a7600",
+            "be5da649469efbad0fb950366a82a73fefeda5f652ec7d3731fac6c4ffa21a70\
+             04d2ab8a04e13621bd3629547d",
+            "62092672f5328a0dde095e57435edf7457ace60b26ee44c9291110ec135cb0e1\
+             4b85594e4fea11247d937deb62",
+        ],
+        exports: [
+            "a32186b8946f61aeead1c093fe614945f85833b165b28c46bf271abf16b57208",
+            "84998b304a0ea2f11809398755f0abd5f9d2c141d1822def79dd15c194803c2a",
+            "93fb9411430b2cfa2cf0bed448c46922a5be9beff20e2e621df7e4655852edbc",
+        ],
+    });
+}
+
+/// RFC 9180 Appendix A.5.1: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256,
+/// ChaCha20-Poly1305, mode_base.
+#[test]
+fn rfc9180_appendix_a5_base_p256_chacha20() {
+    run_kat(&Kat {
+        suite: CipherSuite::new(
+            HpkeKem::DhkemP256HkdfSha256,
+            HpkeKdf::HkdfSha256,
+            HpkeAead::ChaCha20Poly1305,
+        ),
+        ikm_e: "f1f1a3bc95416871539ecb51c3a8f0cf608afb40fbbe305c0a72819d35c33f1f",
+        pk_em: "04c07836a0206e04e31d8ae99bfd549380b072a1b1b82e563c935c09582782\
+                4fc1559eac6fb9e3c70cd3193968994e7fe9781aa103f5b50e934b5b2f387e381291",
+        sk_em: "7550253e1147aae48839c1f8af80d2770fb7a4c763afe7d0afa7e0f42a5b3689",
+        pk_rm: "04a697bffde9405c992883c5c439d6cc358170b51af72812333b015621dc0f\
+                40bad9bb726f68a5c013806a790ec716ab8669f84f6b694596c2987cf35baba2a006",
+        sk_rm: "a4d1c55836aa30f9b3fbb6ac98d338c877c2867dd3a77396d13f68d3ab150d3b",
+        psk: "",
+        psk_id: "",
+        pk_sm: "",
+        sk_sm: "",
+        cts: [
+            "6469c41c5c81d3aa85432531ecf6460ec945bde1eb428cb2fedf7a29f5a685b4\
+             ccb0d057f03ea2952a27bb458b",
+            "f1564199f7e0e110ec9c1bcdde332177fc35c1adf6e57f8d1df24022227ffa87\
+             16862dbda2b1dc546c9d114374",
+            "39de89728bcb774269f882af8dc5369e4f3d6322d986e872b3a8d074c7c18e85\
+             49ff3f85b6d6592ff87c3f310c",
+            "bc104a14fbede0cc79eeb826ea0476ce87b9c928c36e5e34dc9b6905d91473ec\
+             369a08b1a25d305dd45c6c5f80",
+            "8f2814a2c548b3be50259713c6724009e092d37789f6856553d61df23ebc0792\
+             35f710e6af3c3ca6eaba7c7c6c",
+            "b45b69d419a9be7219d8c94365b89ad6951caf4576ea4774ea40e9b7047a09d6\
+             537d1aa2f7c12d6ae4b729b4d0",
+        ],
+        exports: [
+            "9b13c510416ac977b553bf1741018809c246a695f45eff6d3b0356dbefe1e660",
+            "6c8b7be3a20a5684edecb4253619d9051ce8583baf850e0cb53c402bdcaf8ebb",
+            "477a50d804c7c51941f69b8e32fe8288386ee1a84905fe4938d58972f24ac938",
+        ],
+    });
+}
