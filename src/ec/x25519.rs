@@ -12,9 +12,9 @@ use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// An X25519 Diffie-Hellman failure mode. Currently only one: the peer
 /// supplied a low-order public key whose product with our scalar is the
-/// identity (encoded as the all-zero 32-byte u-coordinate). RFC 8446 §7.4.2
-/// requires aborting the handshake with `illegal_parameter` in this case;
-/// RFC 7748 §6.1 calls it a "contributory" failure.
+/// identity (encoded as the all-zero 32-byte u-coordinate). RFC 7748 §6.1
+/// says implementations MAY check for this and abort; RFC 8446 §7.4.2 makes
+/// it a MUST, aborting the handshake with `illegal_parameter`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum X25519Error {
     /// The shared secret is the canonical zero point (peer sent a small-order
@@ -42,9 +42,10 @@ const A24: Fe = Fe([121665, 0, 0, 0, 0]);
 ///
 /// **This is the unchecked primitive.** When `point` is a small-order or
 /// otherwise degenerate u-coordinate the return value is the all-zero buffer
-/// — RFC 7748 §6.1 and RFC 8446 §7.4.2 require rejecting this case in DH
-/// contexts, so callers exposed to network peer input should use
-/// [`X25519PrivateKey::diffie_hellman`] (which returns `Result`) instead.
+/// — RFC 7748 §6.1 permits (MAY) and RFC 8446 §7.4.2 requires (MUST)
+/// rejecting this case in DH contexts, so callers exposed to network peer
+/// input should use [`X25519PrivateKey::diffie_hellman`] (which returns
+/// `Result`) instead.
 pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     // Clamp the scalar (RFC 7748 §5).
     let mut k = *scalar;
@@ -177,7 +178,7 @@ impl X25519PrivateKey {
     /// The shared secret with `peer`'s public key. Returns
     /// `Err(X25519Error::SmallOrderPeer)` when the peer's input lies in the
     /// small subgroup and the resulting u-coordinate is the canonical zero —
-    /// RFC 7748 §6.1 and RFC 8446 §7.4.2 require this rejection.
+    /// the check RFC 7748 §6.1 permits and RFC 8446 §7.4.2 requires.
     ///
     /// The zero-check is constant time: the candidate output is materialised
     /// regardless and compared with [`ConstantTimeEq`].

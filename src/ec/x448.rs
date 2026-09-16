@@ -6,12 +6,12 @@
 //! conditional swaps on the Montgomery curve `v² = u³ + A·u² + u` with
 //! `A = 156326`.
 //!
-//! Unlike X25519, RFC 7748 §6.2 does **not** mandate rejecting low-order /
-//! contributory-failure peer public keys for X448 (the curve's small subgroup
-//! is trivial enough that the cofactor handling differs). For parity with the
-//! X25519 surface — and because TLS 1.3 (RFC 8446 §7.4.2) still requires
-//! aborting on an all-zero shared secret — [`X448PrivateKey::diffie_hellman`]
-//! returns a `Result` and surfaces the all-zero output as an error; the raw
+//! RFC 7748 §6.2 says of X448 exactly what §6.1 says of X25519: both parties
+//! MAY check, without leaking information about the scalar, whether the
+//! shared secret is the all-zero value (the output for every low-order /
+//! contributory-failure peer key) and abort if so. TLS 1.3 (RFC 8446 §7.4.2)
+//! turns that MAY into a MUST-abort. [`X448PrivateKey::diffie_hellman`]
+//! performs the check and surfaces the all-zero output as an error; the raw
 //! [`x448`] primitive performs no such check.
 
 use crate::bignum::{MontModulus, Uint};
@@ -208,7 +208,8 @@ impl X448PrivateKey {
 
     /// The shared secret with `peer`'s public key. Returns
     /// `Err(X448Error::SmallOrderPeer)` when the resulting u-coordinate is the
-    /// canonical zero (RFC 8446 §7.4.2 requires this rejection in TLS).
+    /// canonical zero — the check RFC 7748 §6.2 permits and RFC 8446 §7.4.2
+    /// requires in TLS.
     ///
     /// The zero-check is constant time: the candidate output is materialised
     /// regardless and compared with [`ConstantTimeEq`].
