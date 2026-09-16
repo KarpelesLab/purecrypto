@@ -1782,10 +1782,13 @@ mod tests {
         // Cross-check against the X.509 layer: an SPKI built by AnyPublicKey
         // for the same key bytes must be byte-identical, so SPKI bytes
         // produced by either route are interchangeable.
-        let any_spki =
-            crate::x509::AnyPublicKey::Rsa(BoxedRsaPublicKey::new(pk.n.clone(), pk.e.clone()))
-                .to_spki_der();
-        assert_eq!(der, any_spki);
+        #[cfg(feature = "x509")]
+        {
+            let any_spki =
+                crate::x509::AnyPublicKey::Rsa(BoxedRsaPublicKey::new(pk.n.clone(), pk.e.clone()))
+                    .to_spki_der();
+            assert_eq!(der, any_spki);
+        }
     }
 
     #[test]
