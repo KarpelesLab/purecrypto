@@ -485,6 +485,13 @@ pub struct ServerConnection12<R: RngCore> {
     /// from a valid ticket presented in the client's CH). Skips Certificate /
     /// SKE / CertReq / SHDone and changes the post-CH state path.
     resumed: bool,
+    /// The `session_id` the client sent in its CH. RFC 5077 §3.4: when we
+    /// accept the client's ticket and this is non-empty, the ServerHello MUST
+    /// echo it — that echo is how the client tells the abbreviated flight
+    /// (our Finished comes next) from a full one (Certificate comes next).
+    /// Never echoed on a full handshake: we keep no session-id cache, so an
+    /// echoed id would falsely promise resumability.
+    client_session_id: Vec<u8>,
 
     /// RFC 7627 §5.1 — set when the client offered
     /// `extended_master_secret` and we elected to echo it. Drives the
@@ -557,6 +564,7 @@ impl<R: RngCore> ServerConnection12<R> {
             peer_offered_session_ticket: false,
             peer_offered_ocsp_staple: false,
             resumed: false,
+            client_session_id: Vec::new(),
             ems_negotiated: false,
             ems_session_hash: None,
             #[cfg(test)]
@@ -1040,6 +1048,13 @@ impl<R: RngCore> ServerConnection12<R> {
             return Err(Error::UnexpectedMessage);
         }
         let ch = ClientHello::decode(body)?;
+        // RFC 5246 §7.4.1.2: `SessionID<0..32>`. Reject a longer one before
+        // anything could echo it back (RFC 5077 §3.4 makes us echo it on
+        // resumption, and an oversized echo is itself a protocol violation).
+        if ch.session_id.len() > 32 {
+            return Err(Error::IllegalParameter);
+        }
+        self.client_session_id = ch.session_id.clone();
 
         // Version negotiation. Our engine tops out at TLS 1.2; a TLS 1.3
         // client keeps `legacy_version = 0x0303` and advertises 1.3 via
@@ -1918,9 +1933,18 @@ impl<R: RngCore> ServerConnection12<R> {
             extensions.push(ext::status_request_sh_ack());
         }
 
+        // RFC 5077 §3.4: echo the client's `session_id` iff we resumed its
+        // ticket (the client distinguishes the abbreviated flight by this
+        // echo). A full handshake never echoes: there is no session-id cache
+        // behind it, so an echo would promise a resumption we cannot honour.
+        let session_id = if self.resumed {
+            self.client_session_id.clone()
+        } else {
+            Vec::new()
+        };
         let sh = ServerHello {
             random: sr,
-            session_id: Vec::new(),
+            session_id,
             cipher_suite: suite.suite,
             extensions,
         }
@@ -3424,5 +3448,43 @@ mod tests {
         // mint) is refused outright rather than living forever.
         let timeless = seal_test_ticket(&mut engine, None, 0);
         assert!(engine.try_resume(&timeless, &[TICKET_SUITE]).is_none());
+    }
+
+    /// RFC 5246 §7.4.1.2: `SessionID<0..32>`. A longer one is rejected with
+    /// `illegal_parameter` before it could be echoed (RFC 5077 §3.4).
+    #[test]
+    fn server12_rejects_oversized_session_id() {
+        let cfg = test_rsa_server_config();
+        let rng = HmacDrbg::<Sha256>::new(b"s12-sid", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, rng);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"s12-sid-c", b"nonce", &[]);
+        let mut random = [0u8; 32];
+        crng.fill_bytes(&mut random);
+        let ch = ClientHello {
+            legacy_version: 0x0303,
+            random,
+            session_id: alloc::vec![0x5a; 33],
+            cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            extensions: alloc::vec![
+                ext::signature_algorithms(),
+                ext::supported_groups_list(&[NamedGroup::X25519]),
+                ext::ec_point_formats(),
+                ext::extended_master_secret_empty(),
+            ],
+        }
+        .encode();
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &ch,
+        );
+        s.read_tls(&rec);
+        assert!(matches!(
+            s.process_new_packets(),
+            Err(Error::IllegalParameter)
+        ));
     }
 }

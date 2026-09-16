@@ -20,10 +20,11 @@
 //! [`ClientCertConfig`] type as the TLS 1.3 client) and RFC 5077 session
 //! tickets via [`ClientConfig12::with_session`]. The abbreviated resumed
 //! handshake (RFC 5077 §3.4) skips Certificate / SKE / SHDone on both sides.
-//! Session resumption via the legacy `session_id` path is not implemented:
-//! we send an empty session_id and ignore whatever the server echoes (a
-//! server-assigned session_id can never resume here, since only a
-//! `session_ticket` carries resumable state).
+//! Session resumption via the legacy `session_id` cache is not implemented:
+//! only a `session_ticket` carries resumable state. When we present a ticket
+//! we also send a random `session_id` purely as the RFC 5077 §3.4 resumption
+//! signal — the server echoes it iff it accepted the ticket; without a ticket
+//! the `session_id` is empty and the server's echo is ignored.
 //!
 //! # Record-layer note
 //!
@@ -612,9 +613,17 @@ pub struct ClientConnection12 {
     nst_received: bool,
     /// RFC 5077: `true` when this handshake is being resumed (we presented
     /// a non-empty `session_ticket` extension and the server accepted it —
-    /// detected by the server's `session_ticket` extension being absent in
-    /// the SH).
+    /// detected by the server echoing our `session_id`, see
+    /// [`resume_session_id`](Self::resume_session_id)).
     resumed: bool,
+    /// RFC 5077 §3.4: the `session_id` we sent alongside a `session_ticket`.
+    /// A server that accepts the ticket MUST echo it in `ServerHello`; a
+    /// server that runs a full handshake instead does not. This echo — not
+    /// the presence or absence of the SH `session_ticket` extension, which a
+    /// resuming server may also send to renew the ticket (§3.3) — is the
+    /// only signal that tells the two post-SH flights apart. `None` when no
+    /// ticket was offered (the CH `session_id` is then empty).
+    resume_session_id: Option<Vec<u8>>,
 
     /// RFC 7627 §3 — we always offer `extended_master_secret` in our
     /// ClientHello; this flag stays `true` for the connection lifetime
@@ -738,6 +747,20 @@ impl ClientConnection12 {
             crate::rng::HmacDrbg::<crate::hash::Sha256>::new(&seed, b"tls12-legacy-client", &[])
         };
 
+        // RFC 5077 §3.4: when presenting a ticket, also send a fresh random
+        // `session_id` so the server's echo (or lack of one) tells us whether
+        // it resumed. Unpredictable so a third party cannot pre-compute it;
+        // it carries no secret.
+        let resume_session_id = config
+            .session
+            .as_ref()
+            .filter(|s| !s.ticket.is_empty())
+            .map(|_| {
+                let mut sid = alloc::vec![0u8; 32];
+                rng.fill_bytes(&mut sid);
+                sid
+            });
+
         // Without the legacy opt-in this engine always tops out at TLS 1.2,
         // so the ClientHello always carries `extended_master_secret`.
         #[cfg(feature = "tls-legacy")]
@@ -784,6 +807,7 @@ impl ClientConnection12 {
             received_ticket_lifetime: 0,
             nst_received: false,
             resumed: false,
+            resume_session_id,
             // We offer EMS (RFC 7627 §3) on every non-legacy ClientHello;
             // the flag captures that on both the fresh and resumed paths so
             // resumption-gating can compare it against the stored session's
@@ -834,6 +858,13 @@ impl ClientConnection12 {
         }
         let ch = ClientHello::decode(&sent_ch[4..4 + body_len])?;
         let client_random = ch.random;
+        // RFC 5077 §3.4: the sent hello resumes only if it carried BOTH a
+        // ticket and a non-empty `session_id` for the server to echo. A 1.3
+        // compat-mode `legacy_session_id` without a ticket never resumes.
+        let carried_ticket =
+            ext::find(&ch.extensions, ExtensionType::SESSION_TICKET).is_some_and(|t| !t.is_empty());
+        let resume_session_id =
+            (carried_ticket && !ch.session_id.is_empty()).then(|| ch.session_id.clone());
         // Keep the offered suites the (hybrid) ClientHello actually carried,
         // filtered to those this 1.2 engine recognises — so the server's pick
         // validates against the real advertisement.
@@ -911,6 +942,7 @@ impl ClientConnection12 {
             received_ticket_lifetime: 0,
             nst_received: false,
             resumed: false,
+            resume_session_id,
             ems_offered: true,
             ems_negotiated: false,
             ems_session_hash: None,
@@ -1002,7 +1034,9 @@ impl ClientConnection12 {
         ClientHello {
             legacy_version,
             random: self.client_random,
-            session_id: Vec::new(),
+            // RFC 5077 §3.4: non-empty only when a ticket is presented, so
+            // the server's echo signals resumption (see `resume_session_id`).
+            session_id: self.resume_session_id.clone().unwrap_or_default(),
             cipher_suites: cipher_suites_wire,
             extensions,
         }
@@ -1613,13 +1647,19 @@ impl ClientConnection12 {
             self.server_echoed_ocsp_staple = true;
         }
 
-        // RFC 5077 §3.2 + §3.4: a server that intends to issue a NEW ticket
-        // includes an empty `session_ticket` extension in SH; a server that
-        // is RESUMING our offered ticket omits the extension entirely. We use
-        // this signal to choose the resumed vs fresh post-SH path before any
-        // post-SH bytes arrive.
-        let server_will_issue_ticket =
-            ext::find(&sh.extensions, ExtensionType::SESSION_TICKET).is_some();
+        // RFC 5077 §3.4: a server that accepts our ticket MUST echo the
+        // `session_id` we sent alongside it; one that falls back to a full
+        // handshake does not. This is the only reliable discriminator: the SH
+        // `session_ticket` extension is absent both when the server resumes
+        // (without renewing) and when it simply does not do tickets, and
+        // present both when it issues a first ticket and when it renews one
+        // on resumption (§3.3). Comparing against what we generated (never
+        // against an empty id) keeps a server from claiming resumption we
+        // never offered.
+        let server_resumed = self
+            .resume_session_id
+            .as_deref()
+            .is_some_and(|sid| !sh.session_id.is_empty() && sh.session_id == sid);
 
         // RFC 7627 §5.1: server echoes `extended_master_secret` iff it
         // supports EMS. A server that echoes it MUST also have seen our
@@ -1653,18 +1693,18 @@ impl ClientConnection12 {
         self.suite = Some(suite);
         self.server_random = Some(sh.random);
 
-        // Try to resume: stored session present, suite matches, AND server
-        // is NOT signalling a fresh-issue ticket. If the server's
-        // session_ticket extension is present (empty) it's telling us "I'm
-        // doing a fresh handshake and will issue a new ticket" — fall back.
-        let resume = self
-            .config
-            .session
-            .as_ref()
-            .filter(|s| s.cipher_suite == sh.cipher_suite.0)
-            .filter(|_| !server_will_issue_ticket)
-            .cloned();
-        if let Some(stored) = resume {
+        if server_resumed {
+            // The echo is only ever generated for a stored session, so this
+            // lookup cannot fail; treat a miss as a server-side protocol error
+            // rather than silently running a full handshake against a peer
+            // that will send Finished next.
+            let stored = self.config.session.clone().ok_or(Error::IllegalParameter)?;
+            // RFC 5246 §7.4.1.3 / RFC 5077 §3.4: a resumed session keeps the
+            // original cipher suite. A server that echoes our id under a
+            // different suite is resuming something else.
+            if stored.cipher_suite != sh.cipher_suite.0 {
+                return Err(Error::IllegalParameter);
+            }
             // RFC 7627 §5.3: a session that used EMS MUST resume with EMS,
             // and a session that did NOT use EMS MUST NOT resume with EMS.
             // Cross-EMS resumption is forbidden — abort the handshake with
@@ -1806,6 +1846,18 @@ impl ClientConnection12 {
         }
         if !self.offered_suites.contains(&sh.cipher_suite) {
             return Err(Error::HandshakeFailure);
+        }
+        // RFC 5077 §3.4 / RFC 5246 §E.1: every stored session is a TLS 1.2
+        // one, and a resumed session keeps its protocol version. A pre-1.2
+        // ServerHello that echoes our resumption `session_id` is resuming it
+        // at the wrong version; abort rather than wait for a Certificate that
+        // will never come.
+        if self
+            .resume_session_id
+            .as_deref()
+            .is_some_and(|sid| !sh.session_id.is_empty() && sh.session_id == sid)
+        {
+            return Err(Error::IllegalParameter);
         }
         // RFC 5746 §3.4: our ClientHello always carries `renegotiation_info`,
         // so the ServerHello MUST echo it with an empty body — exactly as the
@@ -3228,5 +3280,123 @@ mod tests {
             c.process_new_packets(),
             Err(Error::UnsupportedVersion)
         ));
+    }
+
+    /// RFC 5077 §3.4 — a stored session for the client unit tests below.
+    fn stored_session(suite: CipherSuite) -> StoredSession12 {
+        StoredSession12 {
+            ticket: alloc::vec![0xab; 40],
+            master_secret: [0x42; 48],
+            cipher_suite: suite.0,
+            alpn: None,
+            received_at: None,
+            ems_used: true,
+        }
+    }
+
+    /// Parses the `session_id` out of the ClientHello record `out`.
+    fn client_hello_session_id(out: &[u8]) -> Vec<u8> {
+        let rec = read_record(out).unwrap().unwrap();
+        let mut cur = ReadCursor::new(rec.fragment);
+        assert_eq!(cur.u8().unwrap(), hs_type::CLIENT_HELLO);
+        ClientHello::decode(cur.vec_u24().unwrap())
+            .unwrap()
+            .session_id
+    }
+
+    /// A ServerHello record echoing `session_id` under `suite`, with the
+    /// extensions a resuming server sends (reneg info + EMS, no ticket).
+    fn synth_sh_record_with_id(suite: CipherSuite, session_id: Vec<u8>) -> Vec<u8> {
+        use crate::tls::codec::write_record;
+        let sh = crate::tls::codec::ServerHello {
+            random: [0x11u8; 32],
+            session_id,
+            cipher_suite: suite,
+            extensions: alloc::vec![
+                ext::renegotiation_info_empty(),
+                ext::extended_master_secret_empty(),
+            ],
+        };
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &sh.encode(),
+        );
+        rec
+    }
+
+    /// RFC 5077 §3.4: a ClientHello that presents a ticket also carries a
+    /// non-empty `session_id` for the server to echo on resumption; one
+    /// without a ticket carries none (there is no session-id cache to hit).
+    #[test]
+    fn client12_ticket_hello_carries_a_random_session_id() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-sid", b"nonce", &[]);
+        let cfg = ClientConfig12::new(RootCertStore::new()).with_session(stored_session(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        ));
+        let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
+        let sid = client_hello_session_id(&c.write_tls());
+        assert_eq!(sid.len(), 32, "ticket hello must carry a session_id");
+        assert!(sid.iter().any(|&b| b != 0), "session_id must be random");
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-nosid", b"nonce", &[]);
+        let cfg = ClientConfig12::new(RootCertStore::new());
+        let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
+        assert!(client_hello_session_id(&c.write_tls()).is_empty());
+    }
+
+    /// RFC 5077 §3.4: only the echo of OUR `session_id` means "resumed". A
+    /// ServerHello that omits the `session_ticket` extension but does not
+    /// echo the id is a full handshake (e.g. a server without ticket
+    /// support), so the client must wait for `Certificate`, not `Finished`.
+    #[test]
+    fn client12_no_session_id_echo_means_full_handshake() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-noecho", b"nonce", &[]);
+        let suite = CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256;
+        let cfg = ClientConfig12::new(RootCertStore::new()).with_session(stored_session(suite));
+        let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
+        let _ = c.write_tls();
+        c.read_tls(&synth_sh_record_with_id(suite, Vec::new()));
+        c.process_new_packets().unwrap();
+        assert!(!c.did_resume());
+        assert_eq!(c.state, State::WaitCertificate);
+    }
+
+    /// RFC 5246 §7.4.1.3 / RFC 5077 §3.4: a resumed session keeps its cipher
+    /// suite. A server that echoes our resumption `session_id` under another
+    /// (offered) suite is resuming something else — `illegal_parameter`.
+    #[test]
+    fn client12_rejects_resumption_echo_under_a_different_suite() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-badsuite-echo", b"nonce", &[]);
+        let cfg = ClientConfig12::new(RootCertStore::new()).with_session(stored_session(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        ));
+        let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
+        let sid = client_hello_session_id(&c.write_tls());
+        c.read_tls(&synth_sh_record_with_id(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            sid,
+        ));
+        assert!(matches!(
+            c.process_new_packets(),
+            Err(Error::IllegalParameter)
+        ));
+    }
+
+    /// The echo of our id under the stored suite IS a resumption: the client
+    /// takes the abbreviated path and waits for the server's Finished.
+    #[test]
+    fn client12_session_id_echo_selects_the_resumed_path() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-echo", b"nonce", &[]);
+        let suite = CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256;
+        let cfg = ClientConfig12::new(RootCertStore::new()).with_session(stored_session(suite));
+        let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
+        let sid = client_hello_session_id(&c.write_tls());
+        c.read_tls(&synth_sh_record_with_id(suite, sid));
+        c.process_new_packets().unwrap();
+        assert!(c.did_resume());
+        assert_eq!(c.state, State::WaitResumedServerFinished);
     }
 }

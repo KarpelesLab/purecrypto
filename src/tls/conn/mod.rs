@@ -5818,6 +5818,200 @@ mod tls12_loopback_tests {
         assert!(!client2.did_resume(), "client must see a fresh handshake");
     }
 
+    /// RFC 5077 §3.4: a client holding a session must not assume the server
+    /// resumed just because the ServerHello lacks the `session_ticket`
+    /// extension — a server without ticket support omits it too. Resumption
+    /// is signalled by the server echoing the `session_id` the client sent
+    /// with the ticket; without that echo the client runs the full handshake.
+    // Session tickets need a wall clock: without `std` no ticket is issued.
+    #[cfg(feature = "std")]
+    #[test]
+    fn tls12_stale_session_falls_back_when_server_has_no_tickets() {
+        let (server_config, server_cert_der) = rsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der.clone()).unwrap();
+        let server_config = server_config.with_ticket_key([0x77u8; 32]);
+
+        // Phase 1: obtain a ticket from a ticket-enabled server.
+        let mut crng = HmacDrbg::<Sha256>::new(b"tls12-notk-1c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"tls12-notk-1s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        let session = client.take_session().expect("ticket issued");
+
+        // Phase 2: the same session against a server with NO ticket key. It
+        // neither resumes nor echoes `session_ticket` in its ServerHello.
+        let (server_config2, _) = rsa_server12();
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(server_cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"tls12-notk-2c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"tls12-notk-2s", b"nonce", &[]);
+        let mut client2 = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots2).with_session(session),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection12::new(server_config2, srng);
+        for _ in 0..16 {
+            let c = client2.write_tls();
+            if !c.is_empty() {
+                server2.read_tls(&c);
+                server2.process_new_packets().unwrap();
+            }
+            let s = server2.write_tls();
+            if !s.is_empty() {
+                client2.read_tls(&s);
+                client2.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !client2.is_handshaking() && !server2.is_handshaking(),
+            "client must complete a full handshake against a ticket-less server"
+        );
+        assert!(!client2.did_resume());
+        assert!(!server2.did_resume());
+        client2.send_application_data(b"full-ping").unwrap();
+        let c = client2.write_tls();
+        server2.read_tls(&c);
+        server2.process_new_packets().unwrap();
+        assert_eq!(server2.take_received_plaintext(), b"full-ping");
+    }
+
+    /// RFC 5077 §3.4: the client sends a non-empty `session_id` with its
+    /// ticket and a resuming server MUST echo it in the ServerHello (a full
+    /// handshake echoes nothing — the server keeps no session-id cache).
+    // Session tickets need a wall clock: without `std` no ticket is issued.
+    #[cfg(feature = "std")]
+    #[test]
+    fn tls12_resumption_echoes_the_client_session_id() {
+        use crate::tls::codec::{ClientHello, ReadCursor, ServerHello, hs_type, read_record};
+        fn hello_session_id(record: &[u8], expect_type: u8) -> Vec<u8> {
+            let rec = read_record(record).unwrap().unwrap();
+            let mut cur = ReadCursor::new(rec.fragment);
+            assert_eq!(cur.u8().unwrap(), expect_type);
+            let body = cur.vec_u24().unwrap();
+            if expect_type == hs_type::CLIENT_HELLO {
+                ClientHello::decode(body).unwrap().session_id
+            } else {
+                ServerHello::decode(body).unwrap().session_id
+            }
+        }
+
+        let (server_config, server_cert_der) = rsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der.clone()).unwrap();
+        let ticket_key = [0x77u8; 32];
+        let server_config = server_config.with_ticket_key(ticket_key);
+
+        // Phase 1: fresh handshake. No ticket offered → empty id, no echo.
+        let mut crng = HmacDrbg::<Sha256>::new(b"tls12-sid-1c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"tls12-sid-1s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        let ch = client.write_tls();
+        assert!(hello_session_id(&ch, hs_type::CLIENT_HELLO).is_empty());
+        server.read_tls(&ch);
+        server.process_new_packets().unwrap();
+        let flight = server.write_tls();
+        assert!(hello_session_id(&flight, hs_type::SERVER_HELLO).is_empty());
+        client.read_tls(&flight);
+        client.process_new_packets().unwrap();
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        let session = client.take_session().expect("ticket issued");
+
+        // Phase 2: ticket presented → random 32-byte id, echoed verbatim.
+        let (server_config2, _) = rsa_server12();
+        let server_config2 = server_config2.with_ticket_key(ticket_key);
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(server_cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"tls12-sid-2c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"tls12-sid-2s", b"nonce", &[]);
+        let mut client2 = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots2).with_session(session),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection12::new(server_config2, srng);
+        let ch = client2.write_tls();
+        let sid = hello_session_id(&ch, hs_type::CLIENT_HELLO);
+        assert_eq!(sid.len(), 32);
+        server2.read_tls(&ch);
+        server2.process_new_packets().unwrap();
+        let flight = server2.write_tls();
+        assert_eq!(
+            hello_session_id(&flight, hs_type::SERVER_HELLO),
+            sid,
+            "a resuming server must echo the client's session_id"
+        );
+        client2.read_tls(&flight);
+        client2.process_new_packets().unwrap();
+        for _ in 0..16 {
+            let c = client2.write_tls();
+            if !c.is_empty() {
+                server2.read_tls(&c);
+                server2.process_new_packets().unwrap();
+            }
+            let s = server2.write_tls();
+            if !s.is_empty() {
+                client2.read_tls(&s);
+                client2.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client2.is_handshaking() && !server2.is_handshaking());
+        assert!(client2.did_resume() && server2.did_resume());
+    }
+
     // -------- Commit 6: hostile-peer hardening --------
 
     use crate::rng::RngCore;
