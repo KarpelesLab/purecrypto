@@ -337,9 +337,9 @@ jobs:
         # Keep in sync with Cargo.toml's [features] when adding a feature.
         include:
           - shard: primitives
-            features: hash cipher kdf mac bignum rng der ec rsa dh ascon aez hpke ristretto255 bip340 key linux-getrandom hazmat-secp256k1 hazmat-edwards25519
+            features: std alloc hash cipher kdf mac bignum rng der ec rsa dh ascon aez hpke ristretto255 bip340 key linux-getrandom wasi-getrandom hazmat-secp256k1 hazmat-edwards25519
           - shard: pqc-and-protocols
-            features: mlkem mldsa hazmat-mldsa slhdsa lms xmss falcon x509 pkcs12 tls dtls quic tls-legacy ech cli
+            features: mlkem mldsa hazmat-mldsa slhdsa lms xmss falcon x509 pkcs12 tls dtls quic tls-legacy ech cert-compression embedded-roots tokio mio ffi cli
           - shard: zkp
             features: zkp-rangeproof zkp-halfagg zkp-surjection zkp-whitelist zkp-adaptor zkp-pedersen zkp-sign-to-contract zkp
     steps:
