@@ -666,6 +666,100 @@ mod tests {
         "../../testdata/mlkem1024_decap.kat"
     );
 
+    // ACVP FIPS 203 `encapsulationKeyCheck` / `decapsulationKeyCheck` vectors
+    // (gen-val/json-files/ML-KEM-encapDecap-FIPS203/internalProjection.json):
+    // the §7.2 modulus check on `ek` ("noisy linear system values too large",
+    // i.e. a 12-bit coefficient ≥ q) and the §7.3 hash check on `dk`
+    // ("modified H"). Lines are `<key-hex> <1|0>` for pass / fail. Every ek
+    // vector of the group is kept; the dk vectors are a 2 + 2 subset.
+    macro_rules! acvp_mlkem_keycheck_tests {
+        ($name:ident, $dk_ty:ty, $ek_ty:ty, $ekf:expr, $dkf:expr) => {
+            #[test]
+            fn $name() {
+                let mut seen = (0usize, 0usize);
+                for line in include_str!($ekf).lines() {
+                    let mut it = line.split_whitespace();
+                    let ek: [u8; <$ek_ty>::BYTES] = unhex(it.next().unwrap()).try_into().unwrap();
+                    let want = it.next().unwrap() == "1";
+                    assert_eq!(<$ek_ty>::from_bytes_validated(ek).is_ok(), want, "ek check");
+                    seen.0 += 1;
+                }
+                for line in include_str!($dkf).lines() {
+                    let mut it = line.split_whitespace();
+                    let dk: [u8; <$dk_ty>::DECAPS_KEY_BYTES] =
+                        unhex(it.next().unwrap()).try_into().unwrap();
+                    let want = it.next().unwrap() == "1";
+                    assert_eq!(<$dk_ty>::from_bytes_validated(dk).is_ok(), want, "dk check");
+                    seen.1 += 1;
+                }
+                assert_eq!(seen, (10, 4), "every fixture line must run");
+            }
+        };
+    }
+
+    acvp_mlkem_keycheck_tests!(
+        acvp_mlkem512_keycheck,
+        MlKem512DecapsKey,
+        MlKem512EncapsKey,
+        "../../testdata/mlkem512_ekcheck.kat",
+        "../../testdata/mlkem512_dkcheck.kat"
+    );
+    acvp_mlkem_keycheck_tests!(
+        acvp_mlkem768_keycheck,
+        MlKem768DecapsKey,
+        MlKem768EncapsKey,
+        "../../testdata/mlkem768_ekcheck.kat",
+        "../../testdata/mlkem768_dkcheck.kat"
+    );
+    acvp_mlkem_keycheck_tests!(
+        acvp_mlkem1024_keycheck,
+        MlKem1024DecapsKey,
+        MlKem1024EncapsKey,
+        "../../testdata/mlkem1024_ekcheck.kat",
+        "../../testdata/mlkem1024_dkcheck.kat"
+    );
+
+    /// The implicit-rejection secret `K̄ = J(z ‖ c)` against an independent
+    /// implementation: OpenSSL 3.6 decapsulating three tampered copies of the
+    /// fixture ciphertext under the `d = z = 0³²` key. The ACVP decap vectors
+    /// above are a trimmed slice, so this pins the reject path (the `z`
+    /// offset in `dk`, the SHAKE-256 framing of `z ‖ c`, and the constant-time
+    /// select) to a value nothing in this crate produced.
+    #[test]
+    fn implicit_rejection_matches_openssl_768() {
+        use crate::test_util::{from_hex, from_hex_vec};
+        let (dk, _ek) = MlKem768DecapsKey::from_seeds(&[0u8; 32], &[0u8; 32]);
+        let ct: [u8; CIPHERTEXT_BYTES] =
+            from_hex_vec(include_str!("../../testdata/mlkem768_openssl_ct.hex"))
+                .try_into()
+                .unwrap();
+        for (idx, mask, want) in [
+            (
+                0usize,
+                0x01u8,
+                "6cc6dea2d438a0bfcaeae72be6dab56b7ea30be846851e26b1ee0fb97010e931",
+            ),
+            (
+                CIPHERTEXT_BYTES - 1,
+                0x80,
+                "fd02d401994e30e2b1ddabc4c411c4172ed8aec33bf9c1f379bcfec2b36659eb",
+            ),
+            (
+                500,
+                0x10,
+                "69e1e5f2a24594b1bb55e13cbb6d787a062f8c5532cf0f69f5c0a6d060e947d3",
+            ),
+        ] {
+            let mut bad = ct;
+            bad[idx] ^= mask;
+            assert_eq!(
+                dk.decapsulate(&MlKem768Ciphertext::from_bytes(bad)),
+                from_hex::<32>(want),
+                "tampered byte {idx}"
+            );
+        }
+    }
+
     #[test]
     fn fips203_sizes() {
         // FIPS 203 §8.
