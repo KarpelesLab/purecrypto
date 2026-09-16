@@ -284,7 +284,9 @@ mod policy {
         ///   * `rsa-pss-pss-sha256`, `rsa-pss-pss-sha384`, `rsa-pss-pss-sha512`
         ///     — `id-RSASSA-PSS` chain signatures (RFC 4055), including
         ///     under a PSS-key-restricted issuer key
-        ///     ([`AnyPublicKey::RsaPss`](crate::x509::AnyPublicKey::RsaPss))
+        ///     ([`AnyPublicKey::RsaPss`](crate::x509::AnyPublicKey::RsaPss)),
+        ///     and the TLS 1.3 `rsa_pss_pss_*` `CertificateVerify` schemes
+        ///     (RFC 8446 §4.2.3; only under an `id-RSASSA-PSS` SPKI)
         ///   * `ecdsa-with-sha256`, `ecdsa-with-sha384`, `ecdsa-with-sha512`
         ///     — the OID-keyed X.509 chain-dispatch entries. The
         ///     `ecdsa-with-SHA-N` OID does not pin a curve, so these accept
@@ -494,6 +496,9 @@ mod tests {
         // TLS scheme for rsa_pss_rsae_sha256.
         let algo = find_by_tls_scheme(0x0804).expect("rsa_pss_rsae_sha256");
         assert_eq!(algo.id(), "rsa-pss-rsae-sha256");
+        // TLS scheme for rsa_pss_pss_sha384.
+        let algo = find_by_tls_scheme(0x080A).expect("rsa_pss_pss_sha384");
+        assert_eq!(algo.id(), "rsa-pss-pss-sha384");
     }
 
     #[cfg(all(feature = "rsa", feature = "ec", feature = "alloc"))]

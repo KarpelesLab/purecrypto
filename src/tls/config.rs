@@ -40,7 +40,11 @@ use super::conn::ReplayWindow;
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum SigningKey {
-    /// RSA key; signs with `rsa_pss_rsae_sha256`.
+    /// RSA key; signs RSASSA-PSS under the scheme family the leaf
+    /// certificate's SPKI calls for (RFC 8446 §4.2.3): `rsa_pss_rsae_sha256`
+    /// when the leaf carries the key as `rsaEncryption`, `rsa_pss_pss_*`
+    /// when as `id-RSASSA-PSS` (RFC 4055) — over the digest the SPKI's
+    /// restriction names, SHA-256 when unrestricted.
     Rsa(BoxedRsaPrivateKey),
     /// ECDSA key; the scheme is chosen from the curve at sign time.
     Ecdsa(BoxedEcdsaPrivateKey),
@@ -74,10 +78,14 @@ pub enum SigningKey {
     ///
     /// `schemes` lists the IANA `SignatureScheme` code points the external key
     /// can produce (RFC 8446 §4.2.3 — e.g. `0x0804` rsa_pss_rsae_sha256,
-    /// `0x0403` ecdsa_secp256r1_sha256, `0x0807` ed25519), most-preferred first.
-    /// The endpoint signs with the first one the peer also offered; the
-    /// handshake fails if none overlap. Supported for TLS 1.3 and DTLS 1.2/1.3
-    /// (classic TLS 1.2 server auth is not).
+    /// `0x0809` rsa_pss_pss_sha256, `0x0403` ecdsa_secp256r1_sha256, `0x0807`
+    /// ed25519), most-preferred first. The endpoint signs with the first one
+    /// the peer also offered; the handshake fails if none overlap. The RSA-PSS
+    /// entries are narrowed to the family the leaf's SPKI form permits
+    /// (`rsa_pss_rsae_*` for `rsaEncryption`, `rsa_pss_pss_*` of the
+    /// restricted digest for `id-RSASSA-PSS`), so an RSA signer may list
+    /// both. Supported for TLS 1.3 and DTLS 1.2/1.3 (classic TLS 1.2 server
+    /// auth is not).
     External {
         /// IANA `SignatureScheme` code points the key can produce, preferred
         /// first.

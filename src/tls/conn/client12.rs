@@ -2512,11 +2512,11 @@ impl ClientConnection12 {
             .filter(|s| !s.is_brainpool_tls13())
             .ok_or(Error::UnsupportedKeyType)?;
         let signature: Vec<u8> = match cc.key() {
-            ClientKey::Rsa(_) => {
-                // The Rsa signer needs an RNG; the TLS 1.3 client side
-                // doesn't have one threaded through state either — defer to
-                // a clear error rather than silently fail.
-                return Err(Error::HandshakeFailure);
+            // No RNG in the client state machine: the PSS salt is derived
+            // from the key and the signed bytes (see
+            // `sign_rsa_pss_deterministic`).
+            ClientKey::Rsa(k) | ClientKey::RsaPss(k, _) => {
+                crate::tls::crypto::sign::sign_rsa_pss_deterministic(k, scheme, &to_sign)?
             }
             ClientKey::Ecdsa(k) => {
                 let sig = match k.curve() {

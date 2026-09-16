@@ -675,6 +675,46 @@ mod loopback_tests {
         (ServerConfig::with_rsa(alloc::vec![der.clone()], boxed), der)
     }
 
+    /// An RSA server config whose leaf certifies the key as `id-RSASSA-PSS`
+    /// (RFC 4055): pinned to `hash` when `Some`, unrestricted when `None`.
+    /// Plus the certificate DER.
+    fn rsa_pss_server(hash: Option<crate::x509::PssHash>) -> (ServerConfig, Vec<u8>) {
+        use crate::x509::{AnyPublicKey, PssRestriction};
+        let key = rsa_test_key_a();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = match hash {
+            Some(hash) => Certificate::self_signed_general(
+                &CertSigner::RsaPss(&boxed, hash),
+                &name,
+                &validity,
+                1,
+                false,
+                &["loopback.example"],
+            ),
+            // Absent RSASSA-PSS-params: self-issued (PSS-SHA-256, since a
+            // PSS-form anchor key refuses PKCS#1 v1.5) over the unrestricted
+            // PSS form of the key.
+            None => Certificate::issue_general(
+                &CertSigner::RsaPss(&boxed, crate::x509::PssHash::Sha256),
+                &name,
+                &name,
+                &AnyPublicKey::RsaPss(boxed.public_key(), PssRestriction::Unrestricted),
+                &validity,
+                1,
+                false,
+                &["loopback.example"],
+            ),
+        }
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (ServerConfig::with_rsa(alloc::vec![der.clone()], boxed), der)
+    }
+
     /// An Ed25519 self-signed server config plus its certificate DER.
     fn ed25519_server() -> (ServerConfig, Vec<u8>) {
         let mut rng = HmacDrbg::<Sha256>::new(b"loopback-ed-key", b"nonce", &[]);
@@ -763,6 +803,150 @@ mod loopback_tests {
                 &[CipherSuite::AES_128_GCM_SHA256],
                 &[NamedGroup::X25519],
             );
+        }
+    }
+
+    /// RFC 8446 §4.2.3: a server whose leaf carries an `id-RSASSA-PSS` SPKI
+    /// signs its `CertificateVerify` under `rsa_pss_pss_*` — the digest the
+    /// SPKI's RSASSA-PSS-params pin, SHA-256 when unrestricted — which the
+    /// client offers by default and verifies only under a PSS-form key;
+    /// the same RSA key certified as `rsaEncryption` keeps signing
+    /// `rsa_pss_rsae_sha256`. The chain signature (`id-RSASSA-PSS` with
+    /// explicit parameters, or `sha256WithRSAEncryption`) rides the
+    /// registry too.
+    #[test]
+    fn rsa_pss_spki_server_negotiates_rsa_pss_pss_schemes() {
+        use crate::tls::codec::SignatureScheme;
+        use crate::x509::PssHash;
+        let cases = [
+            (rsa_server(), SignatureScheme::RSA_PSS_RSAE_SHA256),
+            (rsa_pss_server(None), SignatureScheme::RSA_PSS_PSS_SHA256),
+            (
+                rsa_pss_server(Some(PssHash::Sha256)),
+                SignatureScheme::RSA_PSS_PSS_SHA256,
+            ),
+            (
+                rsa_pss_server(Some(PssHash::Sha384)),
+                SignatureScheme::RSA_PSS_PSS_SHA384,
+            ),
+            (
+                rsa_pss_server(Some(PssHash::Sha512)),
+                SignatureScheme::RSA_PSS_PSS_SHA512,
+            ),
+        ];
+        for ((server_config, cert_der), want) in cases {
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert_der).unwrap();
+            let mut crng = HmacDrbg::<Sha256>::new(b"loopback-pss-client", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"loopback-pss-server", b"nonce", &[]);
+            let mut client = ClientConnection::new_with_offer(
+                ClientConfig::new(roots),
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+            let mut server = ServerConnection::new(server_config, srng);
+            for _ in 0..16 {
+                let c = client.write_tls();
+                if !c.is_empty() {
+                    server.read_tls(&c);
+                    server.process_new_packets().unwrap();
+                }
+                let s = server.write_tls();
+                if !s.is_empty() {
+                    client.read_tls(&s);
+                    client.process_new_packets().unwrap();
+                }
+                if c.is_empty() && s.is_empty() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking(), "{want:?}: client did not finish");
+            assert!(!server.is_handshaking(), "{want:?}: server did not finish");
+            assert_eq!(
+                server.negotiated_signature_scheme(),
+                Some(want),
+                "CertificateVerify scheme"
+            );
+            client.send_application_data(b"ping").unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets().unwrap();
+            assert_eq!(server.take_received_plaintext(), b"ping");
+        }
+    }
+
+    /// mTLS with RSA client certificates: the client signs its
+    /// `CertificateVerify` with `rsa_pss_rsae_sha256` when its leaf carries
+    /// an `rsaEncryption` SPKI and with `rsa_pss_pss_*` (over the pinned
+    /// digest) when it carries `id-RSASSA-PSS`, using a salt derived from
+    /// the key and the transcript (the client engine has no RNG); the
+    /// server verifies each under the matching key form.
+    #[test]
+    fn rsa_client_certificates_under_mtls() {
+        use super::ClientCertConfig;
+        use crate::test_util::rsa_test_key_b;
+        use crate::x509::PssHash;
+
+        let client_key = rsa_test_key_b();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&client_key.to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("mtls-rsa-client");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let rsae_cert = Certificate::self_signed(&client_key, &name, &validity, 1, false).unwrap();
+        let pss384_cert = Certificate::self_signed_general(
+            &CertSigner::RsaPss(&boxed, PssHash::Sha384),
+            &name,
+            &validity,
+            2,
+            false,
+            &["mtls-rsa-client"],
+        )
+        .unwrap();
+        for client_cert in [rsae_cert, pss384_cert] {
+            let (server_config, server_cert_der) = rsa_server();
+            let client_cert_der = client_cert.to_der().to_vec();
+            let mut server_roots = RootCertStore::new();
+            server_roots.add_der(client_cert_der.clone()).unwrap();
+            let server_config = server_config.with_client_auth(server_roots, true);
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert_der).unwrap();
+            let cc = ClientCertConfig::with_rsa(alloc::vec![client_cert_der], boxed.clone());
+            let mut crng = HmacDrbg::<Sha256>::new(b"mtls-rsa-client-rng", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"mtls-rsa-server-rng", b"nonce", &[]);
+            let mut client = ClientConnection::new_with_offer(
+                ClientConfig::new(roots).with_client_cert(cc),
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+            let mut server = ServerConnection::new(server_config, srng);
+            for _ in 0..16 {
+                let c = client.write_tls();
+                if !c.is_empty() {
+                    server.read_tls(&c);
+                    server.process_new_packets().unwrap();
+                }
+                let s = server.write_tls();
+                if !s.is_empty() {
+                    client.read_tls(&s);
+                    client.process_new_packets().unwrap();
+                }
+                if c.is_empty() && s.is_empty() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            assert_eq!(server.peer_certificates().len(), 1);
+            client.send_application_data(b"mtls-rsa-ping").unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets().unwrap();
+            assert_eq!(server.take_received_plaintext(), b"mtls-rsa-ping");
         }
     }
 
@@ -5185,6 +5369,41 @@ mod tls12_loopback_tests {
         }
     }
 
+    /// RFC 8446 §4.2.3 defines the `rsa_pss_pss_*` code points for TLS 1.2
+    /// as well: a TLS 1.2 server whose leaf carries an `id-RSASSA-PSS` SPKI
+    /// (pinned to SHA-384 here) signs its `ServerKeyExchange` under
+    /// `rsa_pss_pss_sha384`, which the client offers and verifies under the
+    /// PSS-form key — an `rsa_pss_rsae_*` signature would be refused there.
+    #[test]
+    fn rsa_pss_spki_server12_signs_rsa_pss_pss() {
+        use crate::x509::PssHash;
+        let key = rsa_test_key_a();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::RsaPss(&boxed, PssHash::Sha384),
+            &name,
+            &validity,
+            1,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        run_with(
+            (
+                ServerConfig12::with_rsa(alloc::vec![der.clone()], boxed),
+                der,
+            ),
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
     /// Runs a full in-process TLS 1.2 handshake against `(server_config, cert)`
     /// using the given offered suites/groups, then exchanges application data
     /// in both directions.
@@ -8160,6 +8379,103 @@ mod audit_regression_tests {
             matches!(err, Error::IllegalParameter),
             "an unoffered CertificateVerify scheme must be illegal_parameter, got {err:?}"
         );
+    }
+
+    /// RFC 8446 §4.2.3 ties `rsa_pss_rsae_*` to an `rsaEncryption` SPKI and
+    /// `rsa_pss_pss_*` to an `id-RSASSA-PSS` one. Both families are offered
+    /// in the CertificateRequest, so a client `CertificateVerify` under the
+    /// wrong family for its leaf passes the offered-scheme gate and must be
+    /// refused as a key/scheme mismatch (`PeerMisbehaved`) before any
+    /// signature is checked — in both directions. (The client engine never
+    /// produces such a message, so it is forged at the server.)
+    #[cfg(feature = "std")]
+    #[test]
+    fn server_rejects_client_cert_verify_under_the_wrong_rsa_pss_family() {
+        use crate::tls::ClientCertConfig;
+        use crate::tls::codec::SignatureScheme;
+        use crate::x509::{CertSigner, PssHash};
+
+        let client_key = crate::test_util::rsa_test_key_b();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&client_key.to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("pss-family-client");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let rsae_cert = Certificate::self_signed(&client_key, &name, &validity, 1, false)
+            .unwrap()
+            .to_der()
+            .to_vec();
+        let pss_cert = Certificate::self_signed_general(
+            &CertSigner::RsaPss(&boxed, PssHash::Sha256),
+            &name,
+            &validity,
+            2,
+            false,
+            &[],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        // (client leaf, scheme the external key advertises, forged scheme).
+        let cases = [
+            (
+                rsae_cert,
+                SignatureScheme::RSA_PSS_RSAE_SHA256,
+                SignatureScheme::RSA_PSS_PSS_SHA256,
+            ),
+            (
+                pss_cert,
+                SignatureScheme::RSA_PSS_PSS_SHA256,
+                SignatureScheme::RSA_PSS_RSAE_SHA256,
+            ),
+        ];
+        for (client_cert_der, honest, forged_scheme) in cases {
+            let (server_config, server_cert_der) = rsa_server();
+            let mut server_roots = RootCertStore::new();
+            server_roots.add_der(client_cert_der.clone()).unwrap();
+            let server_config = server_config.with_client_auth(server_roots, true);
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert_der).unwrap();
+            // An external client key: the client emits its Certificate and
+            // suspends for the signature, leaving the server at
+            // `WaitClientCertVerify`.
+            let cc = ClientCertConfig::with_external(
+                alloc::vec![client_cert_der],
+                alloc::vec![honest.0],
+            );
+            let mut crng = HmacDrbg::<Sha256>::new(b"pss-family-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"pss-family-s", b"nonce", &[]);
+            let mut client = ClientConnection::new_with_offer(
+                ClientConfig::new(roots).with_client_cert(cc),
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+            let mut server = ServerConnection::new(server_config, srng);
+            let ch = client.write_tls();
+            server.read_tls(&ch);
+            server.process_new_packets().unwrap();
+            client.read_tls(&server.write_tls());
+            client.process_new_packets().unwrap();
+            assert!(client.pending_signature().is_some());
+            let cert_flight = client.write_tls();
+            server.read_tls(&cert_flight);
+            server.process_new_packets().unwrap();
+
+            // The wrong family for the leaf: refused as a mismatch, not as a
+            // bad signature (the garbage signature is never examined).
+            let mut forged = alloc::vec![crate::tls::codec::hs_type::CERTIFICATE_VERIFY, 0, 1, 4];
+            forged.extend_from_slice(&forged_scheme.0.to_be_bytes());
+            forged.extend_from_slice(&256u16.to_be_bytes());
+            forged.extend_from_slice(&[0x5au8; 256]);
+            let err = server.handle_handshake_for_test(forged).unwrap_err();
+            assert!(
+                matches!(err, Error::PeerMisbehaved),
+                "{forged_scheme:?} under this leaf must be PeerMisbehaved, got {err:?}"
+            );
+        }
     }
 
     /// RFC 8446 §4.4.4: "Recipients of Finished messages MUST verify that

@@ -179,6 +179,7 @@ impl ServerConfig12 {
     /// `cert_chain` and signing with `key`. The `with_*` helpers differ only
     /// in which [`ServerKey`] they wrap.
     fn from_key(cert_chain: Vec<Vec<u8>>, key: ServerKey) -> Self {
+        let key = key.bound_to_leaf(&cert_chain);
         ServerConfig12 {
             cert_chain,
             key,
@@ -332,7 +333,7 @@ impl ServerConfig12 {
     /// can only sign ECDSA suites.
     fn sig_kind(&self) -> SigKind {
         match &self.key {
-            ServerKey::Rsa(_) => SigKind::Rsa,
+            ServerKey::Rsa(_) | ServerKey::RsaPss(..) => SigKind::Rsa,
             ServerKey::Ecdsa(_) => SigKind::Ecdsa,
             // Other variants are inhabited by the shared `ServerKey` enum but
             // are unreachable through the public TLS-1.2 constructors. Default
@@ -348,10 +349,13 @@ impl ServerConfig12 {
     /// TLS 1.2"), and secp256k1 / SM2 have none at all — the ClientHello
     /// handler turns `None` into `Error::UnsupportedKeyType` rather than
     /// signing under a NIST code point the client would reject. For RSA we
-    /// use RSA-PSS, the modern default for TLS 1.2 + 1.3 interop.
+    /// use RSA-PSS, the modern default for TLS 1.2 + 1.3 interop — RFC 8446
+    /// §4.2.3 defines both PSS families for TLS 1.2 too, so a leaf
+    /// certified as `id-RSASSA-PSS` signs `rsa_pss_pss_*`.
     fn signature_scheme(&self) -> Option<SignatureScheme> {
         match &self.key {
             ServerKey::Rsa(_) => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
+            ServerKey::RsaPss(_, hash) => Some(crate::tls::crypto::sign::rsa_pss_pss_scheme(*hash)),
             ServerKey::Ecdsa(k) => {
                 crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve())
                     .filter(|s| !s.is_brainpool_tls13())
@@ -2318,9 +2322,9 @@ impl<R: RngCore> ServerConnection12<R> {
             .signature_scheme()
             .ok_or(Error::UnsupportedKeyType)?;
         let signature: Vec<u8> = match &self.config.key {
-            ServerKey::Rsa(k) => k
-                .sign_pss::<Sha256, _>(&to_sign, &mut self.rng)
-                .map_err(|_| Error::HandshakeFailure)?,
+            ServerKey::Rsa(k) | ServerKey::RsaPss(k, _) => {
+                crate::tls::crypto::sign::sign_rsa_pss(k, scheme, &to_sign, &mut self.rng)?
+            }
             ServerKey::Ecdsa(k) => {
                 let sig = match k.curve() {
                     CurveId::P384 => k.sign::<Sha384>(&to_sign),

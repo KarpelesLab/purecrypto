@@ -1,9 +1,11 @@
 //! RSA entries in the signature registry.
 //!
 //! Zero-sized types — four PKCS#1 v1.5 (SHA-1 legacy + SHA-256/384/512),
-//! three RSA-PSS-RSAE (TLS-scheme-keyed) and three RSA-PSS-PSS (X.509
-//! `id-RSASSA-PSS` signatures, dispatched by their `RSASSA-PSS-params`)
-//! entries, one per SHA-2 digest — each implementing [`SignatureAlgorithm`].
+//! three RSA-PSS-RSAE (the TLS `rsa_pss_rsae_*` schemes, `rsaEncryption`
+//! SPKI only) and three RSA-PSS-PSS (X.509 `id-RSASSA-PSS` signatures,
+//! dispatched by their `RSASSA-PSS-params`, and the TLS `rsa_pss_pss_*`
+//! schemes) entries, one per SHA-2 digest — each implementing
+//! [`SignatureAlgorithm`].
 //! Each `verify` parses the SPKI to recover the RSA public key, then
 //! delegates to the existing `BoxedRsaPublicKey::verify_pkcs1v15` /
 //! `verify_pss*`.
@@ -25,12 +27,16 @@ enum SpkiUse {
     Pkcs1,
     /// RSASSA-PSS over `hash` (MGF1 over the same digest, trailer 1) with a
     /// salt of `salt_len` octets — or of any length when `None`: an
-    /// `rsaEncryption` SPKI, or an `id-RSASSA-PSS` SPKI whose
-    /// `RSASSA-PSS-params`, when present, permit that signature (RFC 4055
-    /// §3.3: digest equal, salt at least the key's).
+    /// `rsaEncryption` SPKI, or — unless `rsa_encryption_only` — an
+    /// `id-RSASSA-PSS` SPKI whose `RSASSA-PSS-params`, when present, permit
+    /// that signature (RFC 4055 §3.3: digest equal, salt at least the
+    /// key's). The `rsa_pss_rsae_*` entries set `rsa_encryption_only`: RFC
+    /// 8446 §4.2.3 defines those schemes for a key certified as
+    /// `rsaEncryption`, and a PSS-restricted key signs under `rsa_pss_pss_*`.
     Pss {
         hash: PssHash,
         salt_len: Option<u32>,
+        rsa_encryption_only: bool,
     },
 }
 
@@ -54,7 +60,12 @@ fn parse_rsa_spki(spki: &[u8], use_: SpkiUse) -> Result<BoxedRsaPublicKey, Error
         algid.read_null()?;
         algid.finish()?;
     } else if alg.as_slice() == oid::ID_RSASSA_PSS {
-        let SpkiUse::Pss { hash, salt_len } = use_ else {
+        let SpkiUse::Pss {
+            hash,
+            salt_len,
+            rsa_encryption_only: false,
+        } = use_
+        else {
             return Err(Error::UnsupportedAlgorithm);
         };
         let restriction = PssRestriction::decode(&mut algid)?;
@@ -108,15 +119,20 @@ macro_rules! rsa_pkcs1_entry {
 }
 
 /// The RSA-PSS entries: MGF1 over `$digest`, salt = digest length under
-/// `verify`, the signature's salt under `verify_with_params`.
+/// `verify`, the signature's salt under `verify_with_params`; `$rsae`
+/// restricts the entry to `rsaEncryption` SPKIs.
 macro_rules! rsa_pss_entry {
-    ($(#[$m:meta])* $name:ident, $id:expr, $tls:expr, $digest:ty, $pss_hash:expr) => {
+    ($(#[$m:meta])* $name:ident, $id:expr, $tls:expr, $digest:ty, $pss_hash:expr, $rsae:expr) => {
         $(#[$m])*
         pub(crate) struct $name;
 
         impl $name {
             fn spki_use(salt_len: Option<u32>) -> SpkiUse {
-                SpkiUse::Pss { hash: $pss_hash, salt_len }
+                SpkiUse::Pss {
+                    hash: $pss_hash,
+                    salt_len,
+                    rsa_encryption_only: $rsae,
+                }
             }
         }
 
@@ -205,6 +221,9 @@ rsa_pkcs1_entry!(
 // `sha*WithRSAEncryption` OIDs identify PKCS#1 v1.5 signatures and belong
 // to the `Pkcs1Sha*` entries above. Listing the PKCS#1 OIDs here too (as an
 // earlier revision did) made `find_by_oid` correct only by slice ordering.
+// RFC 8446 §4.2.3 defines the RSAE code points for a key certified as
+// `rsaEncryption`; a PSS-restricted `id-RSASSA-PSS` key is refused here and
+// signs under the `rsa_pss_pss_*` code points (the `PssPss*` entries).
 rsa_pss_entry!(
     /// `rsa_pss_rsae_sha256` — RSASSA-PSS (MGF1 = SHA-256, salt = 32) on an
     /// `rsaEncryption` SPKI key. TLS scheme `0x0804`; no X.509 OID.
@@ -212,7 +231,8 @@ rsa_pss_entry!(
     "rsa-pss-rsae-sha256",
     &[0x0804],
     Sha256,
-    PssHash::Sha256
+    PssHash::Sha256,
+    true
 );
 rsa_pss_entry!(
     /// `rsa_pss_rsae_sha384`. TLS scheme `0x0805`; no X.509 OID.
@@ -220,7 +240,8 @@ rsa_pss_entry!(
     "rsa-pss-rsae-sha384",
     &[0x0805],
     Sha384,
-    PssHash::Sha384
+    PssHash::Sha384,
+    true
 );
 rsa_pss_entry!(
     /// `rsa_pss_rsae_sha512`. TLS scheme `0x0806`; no X.509 OID.
@@ -228,48 +249,62 @@ rsa_pss_entry!(
     "rsa-pss-rsae-sha512",
     &[0x0806],
     Sha512,
-    PssHash::Sha512
+    PssHash::Sha512,
+    true
 );
 
-// The X.509 RSA-PSS entries (`id-RSASSA-PSS` as the signature OID; the key
-// may be certified as `rsaEncryption` or, PSS-restricted, as
-// `id-RSASSA-PSS`), one entry per SHA-2 digest, each implementing MGF1 over
-// the same digest with trailer field 1. The digest, MGF and salt length
-// live inside the `RSASSA-PSS-params` of the signature's
+// The `id-RSASSA-PSS` entries, one per SHA-2 digest, each implementing MGF1
+// over the same digest with trailer field 1.
+//
+// In X.509 they verify `id-RSASSA-PSS` signatures, whose digest, MGF and
+// salt length live inside the `RSASSA-PSS-params` of the signature's
 // AlgorithmIdentifier (RFC 4055 §3.1) — so no entry carries the OID:
 // `AnyPublicKey::signature_algorithm` resolves the params to the entry for
 // their digest and passes them to `verify_with_params`, which verifies with
-// the signature's salt length. An SPKI whose own RSASSA-PSS-params restrict
-// the key to another digest, or to a longer salt, is rejected by
-// `parse_rsa_spki` rather than mis-verified (RFC 4055 §3.3).
+// the signature's salt length. The signing key may be certified as
+// `rsaEncryption` or, PSS-restricted, as `id-RSASSA-PSS`; an SPKI whose own
+// RSASSA-PSS-params restrict the key to another digest, or to a longer
+// salt, is rejected by `parse_rsa_spki` rather than mis-verified (RFC 4055
+// §3.3).
+//
+// In TLS they are the `rsa_pss_pss_*` schemes (RFC 8446 §4.2.3; salt =
+// digest length). The RFC ties those code points to an `id-RSASSA-PSS`
+// SPKI; the entries accept both forms because the X.509 path needs the
+// `rsaEncryption` one, and `tls::crypto::sign::verify_signature` enforces
+// the SPKI form per scheme.
 rsa_pss_entry!(
     /// RSA-PSS with SHA-256 (MGF1-SHA-256) under `id-RSASSA-PSS`: X.509
     /// signatures whose parameters name SHA-256, reached through
-    /// `AnyPublicKey::signature_algorithm` (no OID of its own, no TLS
-    /// scheme).
+    /// `AnyPublicKey::signature_algorithm` (no OID of its own), and the
+    /// TLS scheme `rsa_pss_pss_sha256` (`0x0809`).
     PssPssSha256,
     "rsa-pss-pss-sha256",
-    &[],
+    &[0x0809],
     Sha256,
-    PssHash::Sha256
+    PssHash::Sha256,
+    false
 );
 rsa_pss_entry!(
     /// RSA-PSS with SHA-384 (MGF1-SHA-384) under `id-RSASSA-PSS`: X.509
-    /// signatures whose parameters name SHA-384.
+    /// signatures whose parameters name SHA-384, and the TLS scheme
+    /// `rsa_pss_pss_sha384` (`0x080A`).
     PssPssSha384,
     "rsa-pss-pss-sha384",
-    &[],
+    &[0x080A],
     Sha384,
-    PssHash::Sha384
+    PssHash::Sha384,
+    false
 );
 rsa_pss_entry!(
     /// RSA-PSS with SHA-512 (MGF1-SHA-512) under `id-RSASSA-PSS`: X.509
-    /// signatures whose parameters name SHA-512.
+    /// signatures whose parameters name SHA-512, and the TLS scheme
+    /// `rsa_pss_pss_sha512` (`0x080B`).
     PssPssSha512,
     "rsa-pss-pss-sha512",
-    &[],
+    &[0x080B],
     Sha512,
-    PssHash::Sha512
+    PssHash::Sha512,
+    false
 );
 
 #[cfg(test)]
@@ -287,6 +322,9 @@ mod tests {
             ("rsa-pss-rsae-sha256", 0x0804),
             ("rsa-pss-rsae-sha384", 0x0805),
             ("rsa-pss-rsae-sha512", 0x0806),
+            ("rsa-pss-pss-sha256", 0x0809),
+            ("rsa-pss-pss-sha384", 0x080A),
+            ("rsa-pss-pss-sha512", 0x080B),
         ] {
             let by_id = find_by_id(id).expect(id);
             assert_eq!(by_id.id(), id);
@@ -354,6 +392,35 @@ mod tests {
         assert!(algo.verify(&spki, b"other", &sig).is_err());
         // No TLS scheme.
         assert!(algo.tls_schemes().is_empty());
+    }
+
+    /// RFC 8446 §4.2.3 defines the `rsa_pss_rsae_*` schemes for a key
+    /// certified as `rsaEncryption`: the RSAE entries refuse an
+    /// `id-RSASSA-PSS` SPKI (restricted or not), and the key-size hook
+    /// agrees. The `rsa-pss-pss-*` entries keep accepting both forms — the
+    /// X.509 path needs the `rsaEncryption` one — and the TLS layer
+    /// enforces the form per scheme.
+    #[test]
+    fn pss_rsae_entries_require_rsa_encryption_spki() {
+        let key = rsa_test_key_a();
+        let mut rng = crate::rng::HmacDrbg::<Sha256>::new(b"reg-rsae-form", b"n", &[]);
+        let sig = key.sign_pss::<Sha256, _>(b"hi", &mut rng).unwrap();
+        let rsae_spki = AnyPublicKey::Rsa(boxed_pk_from_rsa_test_key()).to_spki_der();
+        let unrestricted = pss_spki(None);
+        let restricted = pss_spki(Some(pss_params(oid::ID_SHA256, oid::ID_SHA256, 32)));
+        let rsae = find_by_id("rsa-pss-rsae-sha256").unwrap();
+        let pss = find_by_id("rsa-pss-pss-sha256").unwrap();
+        rsae.verify(&rsae_spki, b"hi", &sig).unwrap();
+        assert_eq!(rsae.rsa_modulus_bits(&rsae_spki), Some(2048));
+        for spki in [&unrestricted, &restricted] {
+            assert_eq!(
+                rsae.verify(spki, b"hi", &sig).err(),
+                Some(Error::UnsupportedAlgorithm)
+            );
+            assert_eq!(rsae.rsa_modulus_bits(spki), None);
+            pss.verify(spki, b"hi", &sig).unwrap();
+        }
+        pss.verify(&rsae_spki, b"hi", &sig).unwrap();
     }
 
     #[test]
@@ -576,7 +643,8 @@ mod tests {
         let a384 = find_by_id("rsa-pss-pss-sha384").unwrap();
         let a512 = find_by_id("rsa-pss-pss-sha512").unwrap();
         assert!(a384.x509_oids().is_empty() && a512.x509_oids().is_empty());
-        assert!(a384.tls_schemes().is_empty() && a512.tls_schemes().is_empty());
+        assert_eq!(a384.tls_schemes(), &[0x080A]);
+        assert_eq!(a512.tls_schemes(), &[0x080B]);
 
         let r384 = pss_spki(Some(pss_params(oid::ID_SHA384, oid::ID_SHA384, 48)));
         let r512 = pss_spki(Some(pss_params(oid::ID_SHA512, oid::ID_SHA512, 64)));
@@ -592,15 +660,10 @@ mod tests {
         assert!(a512.verify(&r256, b"hi", &sig512).is_err());
         assert_eq!(a384.rsa_modulus_bits(&r384), Some(2048));
         assert_eq!(a384.rsa_modulus_bits(&r256), None);
-        // The RSAE entries apply the same per-digest restriction check (a
-        // key pinned to SHA-384 verifies `rsa_pss_rsae_sha384`, not
-        // `rsa_pss_rsae_sha256`).
-        find_by_id("rsa-pss-rsae-sha384")
-            .unwrap()
-            .verify(&r384, b"hi", &sig384)
-            .unwrap();
+        // The RSAE entries never accept a PSS-restricted key, whatever its
+        // digest (RFC 8446 §4.2.3).
         assert!(
-            find_by_id("rsa-pss-rsae-sha256")
+            find_by_id("rsa-pss-rsae-sha384")
                 .unwrap()
                 .verify(&r384, b"hi", &sig384)
                 .is_err()

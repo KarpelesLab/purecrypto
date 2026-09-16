@@ -106,6 +106,10 @@ pub(crate) fn offered_signature_schemes() -> Vec<SignatureScheme> {
     // identity can only be authenticated if the client offers them (RFC 8446
     // §4.4.3 forbids the server signing under a scheme the client did not
     // list). They sit after the NIST curves and RSA-PSS in preference order.
+    // The `rsa_pss_pss_*` schemes (RFC 8446 §4.2.3) are offered for the
+    // same reason: an identity whose leaf carries an `id-RSASSA-PSS` SPKI
+    // can only sign under them, and all three digests are listed because a
+    // PSS-restricted key pins the digest the peer must use.
     let base = [
         SignatureScheme::ED25519,
         SignatureScheme::ED448,
@@ -114,6 +118,9 @@ pub(crate) fn offered_signature_schemes() -> Vec<SignatureScheme> {
         SignatureScheme::ECDSA_SECP521R1_SHA512,
         SignatureScheme::RSA_PSS_RSAE_SHA256,
         SignatureScheme::RSA_PSS_RSAE_SHA384,
+        SignatureScheme::RSA_PSS_PSS_SHA256,
+        SignatureScheme::RSA_PSS_PSS_SHA384,
+        SignatureScheme::RSA_PSS_PSS_SHA512,
         SignatureScheme::ECDSA_BRAINPOOLP256R1TLS13_SHA256,
         SignatureScheme::ECDSA_BRAINPOOLP384R1TLS13_SHA384,
         SignatureScheme::ECDSA_BRAINPOOLP512R1TLS13_SHA512,

@@ -138,8 +138,14 @@ impl ReplayWindow {
 /// indirection on every signing call without meaningful savings.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ServerKey {
-    /// An RSA key; signs with `rsa_pss_rsae_sha256`.
+    /// An RSA key certified as `rsaEncryption`; signs with
+    /// `rsa_pss_rsae_sha256`.
     Rsa(BoxedRsaPrivateKey),
+    /// An RSA key certified as `id-RSASSA-PSS` (RFC 4055); signs with the
+    /// `rsa_pss_pss_*` scheme for the digest — the SPKI restriction's, or
+    /// SHA-256 when unrestricted (RFC 8446 §4.2.3). Produced from
+    /// [`Rsa`](Self::Rsa) by [`bound_to_leaf`](Self::bound_to_leaf).
+    RsaPss(BoxedRsaPrivateKey, crate::x509::PssHash),
     /// An ECDSA key; signs with the scheme matching its curve.
     Ecdsa(BoxedEcdsaPrivateKey),
     /// An Ed25519 key; signs with `ed25519`.
@@ -164,6 +170,34 @@ pub(crate) enum ServerKey {
         schemes: Vec<SignatureScheme>,
     },
 }
+impl ServerKey {
+    /// Binds an RSA key to the SPKI form of `chain[0]` (RFC 8446 §4.2.3):
+    /// an in-process [`Rsa`](Self::Rsa) key whose leaf certifies it as
+    /// `id-RSASSA-PSS` becomes [`RsaPss`](Self::RsaPss) and signs
+    /// `rsa_pss_pss_*` over the restriction's digest, and an
+    /// [`External`](Self::External) key's advertised schemes are narrowed to
+    /// those the leaf permits (`rsa_pss_rsae_*` for an `rsaEncryption` leaf,
+    /// `rsa_pss_pss_*` of the restricted digest for an `id-RSASSA-PSS` one).
+    /// Every other key, and a chain whose leaf does not parse, is returned
+    /// unchanged.
+    pub(crate) fn bound_to_leaf(self, chain: &[Vec<u8>]) -> Self {
+        use crate::tls::crypto::sign::{LeafRsaForm, leaf_permits_scheme, leaf_rsa_form};
+        let form = leaf_rsa_form(chain);
+        match (self, form) {
+            (ServerKey::Rsa(k), LeafRsaForm::RsaPss(hash)) => {
+                ServerKey::RsaPss(k, hash.unwrap_or(crate::x509::PssHash::Sha256))
+            }
+            (ServerKey::External { schemes }, form) => ServerKey::External {
+                schemes: schemes
+                    .into_iter()
+                    .filter(|s| leaf_permits_scheme(form, *s))
+                    .collect(),
+            },
+            (key, _) => key,
+        }
+    }
+}
+
 /// validate the presented client chain against, and whether a client cert
 /// is required (`certificate_required` alert on absence).
 pub(crate) struct ClientAuthPolicy {
@@ -294,9 +328,11 @@ impl Drop for ServerConfig {
 
 impl ServerConfig {
     /// Shared constructor: a default configuration presenting `cert_chain`
-    /// (leaf first) and signing with `key`. The `with_*` helpers differ only
-    /// in which [`ServerKey`] they wrap, so they all funnel through here.
+    /// (leaf first) and signing with `key`, bound to the leaf's SPKI form
+    /// ([`ServerKey::bound_to_leaf`]). The `with_*` helpers differ only in
+    /// which [`ServerKey`] they wrap, so they all funnel through here.
     fn from_key(cert_chain: Vec<Vec<u8>>, key: ServerKey) -> Self {
+        let key = key.bound_to_leaf(&cert_chain);
         ServerConfig {
             cert_chain,
             key,
@@ -327,7 +363,9 @@ impl ServerConfig {
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with an
-    /// RSA private `key` (RSA-PSS).
+    /// RSA private `key` (RSA-PSS: `rsa_pss_rsae_sha256` when the leaf
+    /// certifies the key as `rsaEncryption`, `rsa_pss_pss_*` when as
+    /// `id-RSASSA-PSS`).
     pub fn with_rsa(cert_chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
         Self::from_key(cert_chain, ServerKey::Rsa(key))
     }

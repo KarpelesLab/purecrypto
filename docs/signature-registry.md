@@ -18,9 +18,9 @@ the caller has to name the id explicitly.
 | `rsa-pss-rsae-sha256`       | (TLS only, `rsaEncryption` key) | `0x0804`       | yes |
 | `rsa-pss-rsae-sha384`       | (TLS only, `rsaEncryption` key) | `0x0805`       | yes |
 | `rsa-pss-rsae-sha512`       | (TLS only, `rsaEncryption` key) | `0x0806`       | yes |
-| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (`id-RSASSA-PSS`) when its `RSASSA-PSS-params` name SHA-256 / MGF1-SHA-256 | (none) | yes |
-| `rsa-pss-pss-sha384`        | `id-RSASSA-PSS` when its params name SHA-384 / MGF1-SHA-384 | (none) | yes |
-| `rsa-pss-pss-sha512`        | `id-RSASSA-PSS` when its params name SHA-512 / MGF1-SHA-512 | (none) | yes |
+| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (`id-RSASSA-PSS`) when its `RSASSA-PSS-params` name SHA-256 / MGF1-SHA-256 | `0x0809` (`id-RSASSA-PSS` key) | yes |
+| `rsa-pss-pss-sha384`        | `id-RSASSA-PSS` when its params name SHA-384 / MGF1-SHA-384 | `0x080A` (`id-RSASSA-PSS` key) | yes |
+| `rsa-pss-pss-sha512`        | `id-RSASSA-PSS` when its params name SHA-512 / MGF1-SHA-512 | `0x080B` (`id-RSASSA-PSS` key) | yes |
 | `ecdsa-with-sha256`         | `1.2.840.10045.4.3.2` (any curve) | (none)       | yes |
 | `ecdsa-with-sha384`         | `1.2.840.10045.4.3.3` (any curve) | (none)       | yes |
 | `ecdsa-with-sha512`         | `1.2.840.10045.4.3.4` (any curve) | (none)       | yes |
@@ -51,6 +51,41 @@ The three `rsa-pss-rsae-*` entries carry **no** X.509 OID: in X.509 the
 `sha*WithRSAEncryption` OIDs mean PKCS#1 v1.5 and belong to the
 `rsa-pkcs1-*` entries, while an RSA-PSS certificate signature is
 `id-RSASSA-PSS`.
+
+## RSA-PSS in TLS: two scheme families, one per SPKI form
+
+RFC 8446 §4.2.3 defines two RSASSA-PSS scheme families that differ only in
+the key the certificate carries: `rsa_pss_rsae_*` (`0x0804..06`) for a key
+certified as `rsaEncryption`, `rsa_pss_pss_*` (`0x0809..0B`) for one
+certified as `id-RSASSA-PSS`. The signatures themselves are identical PSS
+signatures (MGF1 over the scheme's digest, salt as long as the digest), so
+the crate ties the families to the key form rather than to the math:
+
+* Verifying: `tls::crypto::sign::verify_signature` accepts an
+  `rsa_pss_rsae_*` `CertificateVerify` (or TLS 1.2 `ServerKeyExchange` /
+  `CertificateVerify`) only under an `AnyPublicKey::Rsa` peer key and an
+  `rsa_pss_pss_*` one only under an `AnyPublicKey::RsaPss` key — whose RFC
+  4055 restriction, if any, must name the scheme's digest — and reports
+  anything else as `PeerMisbehaved`. The `rsa-pss-rsae-*` registry entries
+  refuse an `id-RSASSA-PSS` SPKI outright; the `rsa-pss-pss-*` entries accept
+  both forms because the X.509 path needs the `rsaEncryption` one.
+* Signing: the engines bind an RSA identity to its leaf's SPKI form when the
+  identity is installed (`ServerKey::bound_to_leaf` /
+  `ClientKey::bound_to_leaf`). An in-process `SigningKey::Rsa` whose leaf is
+  `id-RSASSA-PSS` signs `rsa_pss_pss_<digest>` — the digest the SPKI's
+  restriction pins, SHA-256 when unrestricted — and otherwise
+  `rsa_pss_rsae_sha256`. An external signer's advertised list is narrowed to
+  the family the leaf permits; `LocalSigner` around an RSA key advertises
+  `0x0804, 0x0809, 0x080A, 0x080B` and signs whichever the engine
+  negotiates. The client engines, which thread no RNG through the handshake,
+  derive the PSS salt from the key and the signed content (public, so the
+  signature is no weaker; two signatures of the same content are identical).
+* Offering: the client's `signature_algorithms` and the server's
+  `CertificateRequest` list all three `rsa_pss_pss_*` code points after the
+  RSAE ones — the crate offers every scheme the registry verifies and
+  `modern()` permits, and a PSS-restricted peer leaf can only be
+  authenticated under its own digest. The TLS 1.2 / DTLS 1.2 engines also
+  sign and verify both families (RFC 8446 defines them for TLS 1.2 as well).
 
 ## RSA-PSS in X.509: the parameters select the entry
 

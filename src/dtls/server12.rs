@@ -105,9 +105,18 @@ impl ServerConfig12Internal {
     /// New configuration presenting `cert_chain` and signing with the
     /// ECDSA `key`. Cookie exchange is required by default.
     pub fn with_ecdsa(cert_chain: Vec<Vec<u8>>, key: BoxedEcdsaPrivateKey) -> Self {
+        Self::with_signing_key(cert_chain, ServerKey::Ecdsa(key))
+    }
+
+    /// Shared constructor: `key` is bound to the leaf's SPKI form
+    /// ([`ServerKey::bound_to_leaf`]) — an RSA key certified as
+    /// `id-RSASSA-PSS` signs `rsa_pss_pss_*`, an external key's schemes are
+    /// narrowed to those the leaf permits.
+    fn with_signing_key(cert_chain: Vec<Vec<u8>>, key: ServerKey) -> Self {
+        let key = key.bound_to_leaf(&cert_chain);
         Self {
             cert_chain,
-            key: ServerKey::Ecdsa(key),
+            key,
             cookie_secret: None,
             previous_cookie_secret: None,
             require_cookie_exchange: true,
@@ -120,20 +129,11 @@ impl ServerConfig12Internal {
 
     /// New configuration presenting `cert_chain` and signing with the RSA
     /// `key`. Drives the three `ECDHE-RSA-*` entries of `SUITES_12`; the
-    /// signature scheme is `rsa_pss_rsae_sha256`. Mirrors the TLS 1.2
-    /// server's `ServerConfig12::with_rsa`.
+    /// signature scheme is `rsa_pss_rsae_sha256` (`rsa_pss_pss_*` for a
+    /// leaf certified as `id-RSASSA-PSS`). Mirrors the TLS 1.2 server's
+    /// `ServerConfig12::with_rsa`.
     pub fn with_rsa(cert_chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
-        Self {
-            cert_chain,
-            key: ServerKey::Rsa(key),
-            cookie_secret: None,
-            previous_cookie_secret: None,
-            require_cookie_exchange: true,
-            require_ems: true,
-            alpn_protocols: Vec::new(),
-            signature_policy: SignaturePolicy::modern(),
-            key_log: None,
-        }
+        Self::with_signing_key(cert_chain, ServerKey::Rsa(key))
     }
 
     /// New configuration whose `ServerKeyExchange` signature is produced
@@ -142,17 +142,7 @@ impl ServerConfig12Internal {
     /// drives suite selection (ECDSA vs RSA `ECDHE-*`).
     pub fn with_external(cert_chain: Vec<Vec<u8>>, schemes: Vec<u16>) -> Self {
         let schemes = schemes.into_iter().map(SignatureScheme).collect();
-        Self {
-            cert_chain,
-            key: ServerKey::External { schemes },
-            cookie_secret: None,
-            previous_cookie_secret: None,
-            require_cookie_exchange: true,
-            require_ems: true,
-            alpn_protocols: Vec::new(),
-            signature_policy: SignaturePolicy::modern(),
-            key_log: None,
-        }
+        Self::with_signing_key(cert_chain, ServerKey::External { schemes })
     }
 
     /// Sets the cookie secret used for HelloVerifyRequest. Callers
@@ -1269,9 +1259,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let to_sign = signed_message(&cr, &sr, group, &our_point);
         let scheme = signature_scheme(&self.config.key).ok_or(Error::UnsupportedKeyType)?;
         let signature: Vec<u8> = match &self.config.key {
-            ServerKey::Rsa(k) => k
-                .sign_pss::<Sha256, _>(&to_sign, &mut self.rng)
-                .map_err(|_| Error::HandshakeFailure)?,
+            ServerKey::Rsa(k) | ServerKey::RsaPss(k, _) => {
+                crate::tls::crypto::sign::sign_rsa_pss(k, scheme, &to_sign, &mut self.rng)?
+            }
             ServerKey::Ecdsa(k) => {
                 let sig = match k.curve() {
                     CurveId::P384 => k.sign::<Sha384>(&to_sign),
@@ -1734,6 +1724,7 @@ fn build_certificate_msg(chain: &[Vec<u8>]) -> Vec<u8> {
 fn signature_scheme(key: &ServerKey) -> Option<SignatureScheme> {
     match key {
         ServerKey::Rsa(_) => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
+        ServerKey::RsaPss(_, hash) => Some(crate::tls::crypto::sign::rsa_pss_pss_scheme(*hash)),
         ServerKey::Ecdsa(k) => crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve())
             .filter(|s| !s.is_brainpool_tls13()),
         // External key: the caller advertises the scheme(s); use the preferred.
@@ -1767,7 +1758,7 @@ fn sig_kind_from_scheme(scheme: SignatureScheme) -> SigKind {
 /// Mirrors `src/tls/conn/server12.rs::sig_kind`.
 fn sig_kind_for_key(key: &ServerKey) -> SigKind {
     match key {
-        ServerKey::Rsa(_) => SigKind::Rsa,
+        ServerKey::Rsa(_) | ServerKey::RsaPss(..) => SigKind::Rsa,
         ServerKey::Ecdsa(_) => SigKind::Ecdsa,
         // External key: infer the family from the preferred advertised scheme
         // so the matching `ECDHE-RSA-*` / `ECDHE-ECDSA-*` suites are offered.

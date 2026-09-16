@@ -8,13 +8,14 @@
 //! to the underlying primitive.
 
 use crate::ec::CurveId;
-use crate::hash::{Sha256, Sha384, Sha512};
+use crate::hash::{Digest, Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
+use crate::rsa::BoxedRsaPrivateKey;
 use crate::signature_registry::{SignaturePolicy, find_by_tls_scheme};
 use crate::tls::Error;
 use crate::tls::codec::SignatureScheme;
 use crate::tls::conn::ServerKey;
-use crate::x509::{AnyPublicKey, Error as X509Error};
+use crate::x509::{AnyPublicKey, Certificate, Error as X509Error, PssHash};
 use alloc::vec::Vec;
 
 /// The 64 `0x20` (space) octets that prefix the signed content (RFC 8446
@@ -61,12 +62,131 @@ pub(crate) fn tls_signature_scheme_for_curve(curve: CurveId) -> Option<Signature
     }
 }
 
+/// The digest one of the six RSA-PSS schemes (`rsa_pss_rsae_*` /
+/// `rsa_pss_pss_*`, RFC 8446 §4.2.3) signs with — MGF1 over the same
+/// digest, salt as long as the digest — or `None` for any other scheme.
+pub(crate) fn rsa_pss_digest(scheme: SignatureScheme) -> Option<PssHash> {
+    match scheme {
+        SignatureScheme::RSA_PSS_RSAE_SHA256 | SignatureScheme::RSA_PSS_PSS_SHA256 => {
+            Some(PssHash::Sha256)
+        }
+        SignatureScheme::RSA_PSS_RSAE_SHA384 | SignatureScheme::RSA_PSS_PSS_SHA384 => {
+            Some(PssHash::Sha384)
+        }
+        SignatureScheme::RSA_PSS_RSAE_SHA512 | SignatureScheme::RSA_PSS_PSS_SHA512 => {
+            Some(PssHash::Sha512)
+        }
+        _ => None,
+    }
+}
+
+/// The `rsa_pss_pss_*` scheme for `hash` — what a key certified as
+/// `id-RSASSA-PSS` signs a `CertificateVerify` under.
+pub(crate) fn rsa_pss_pss_scheme(hash: PssHash) -> SignatureScheme {
+    match hash {
+        PssHash::Sha256 => SignatureScheme::RSA_PSS_PSS_SHA256,
+        PssHash::Sha384 => SignatureScheme::RSA_PSS_PSS_SHA384,
+        PssHash::Sha512 => SignatureScheme::RSA_PSS_PSS_SHA512,
+    }
+}
+
+/// Signs `content` with RSASSA-PSS under `scheme`'s digest (any of the six
+/// RSA-PSS schemes; the RSAE and PSS families differ only in the SPKI form
+/// the peer requires, not in the signature). [`Error::UnsupportedKeyType`]
+/// for a non-RSA-PSS scheme.
+pub(crate) fn sign_rsa_pss<R: RngCore>(
+    key: &BoxedRsaPrivateKey,
+    scheme: SignatureScheme,
+    content: &[u8],
+    rng: &mut R,
+) -> Result<Vec<u8>, Error> {
+    let hash = rsa_pss_digest(scheme).ok_or(Error::UnsupportedKeyType)?;
+    match hash {
+        PssHash::Sha256 => key.sign_pss::<Sha256, _>(content, rng),
+        PssHash::Sha384 => key.sign_pss::<Sha384, _>(content, rng),
+        PssHash::Sha512 => key.sign_pss::<Sha512, _>(content, rng),
+    }
+    .map_err(|_| Error::HandshakeFailure)
+}
+
+/// [`sign_rsa_pss`] with a salt derived deterministically (HMAC-DRBG) from
+/// the key's public modulus and `content`, for the client engines, which
+/// thread no RNG through the handshake state machine. The salt is public —
+/// a verifier recovers it from the signature — so PSS's security does not
+/// rest on it being unpredictable; a message-bound derivation only makes two
+/// signatures of the same content identical, exactly as
+/// `x509::CertSigner::RsaPss` issues certificates.
+pub(crate) fn sign_rsa_pss_deterministic(
+    key: &BoxedRsaPrivateKey,
+    scheme: SignatureScheme,
+    content: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let modulus = key.public_key().to_pkcs1_der();
+    let seed = Sha256::digest(&modulus);
+    let nonce = Sha256::digest(content);
+    let mut drbg = crate::rng::HmacDrbg::<Sha256>::new(
+        seed.as_ref(),
+        nonce.as_ref(),
+        b"purecrypto tls RSASSA-PSS salt",
+    );
+    sign_rsa_pss(key, scheme, content, &mut drbg)
+}
+
+/// What a leaf certificate's SPKI says about the RSA-PSS scheme family an
+/// identity may sign under. RFC 8446 §4.2.3 defines `rsa_pss_rsae_*` for a
+/// key certified as `rsaEncryption` and `rsa_pss_pss_*` for one certified
+/// as `id-RSASSA-PSS`, whose RFC 4055 restriction (if any) also pins the
+/// digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeafRsaForm {
+    /// `rsaEncryption`.
+    RsaEncryption,
+    /// `id-RSASSA-PSS`, restricted to the named digest when `Some`.
+    RsaPss(Option<PssHash>),
+    /// Not an RSA key, or no parseable leaf: nothing to bind (a chain that
+    /// does not parse fails the handshake for its own reasons).
+    Other,
+}
+
+/// The [`LeafRsaForm`] of `chain[0]`.
+pub(crate) fn leaf_rsa_form(chain: &[Vec<u8>]) -> LeafRsaForm {
+    let Some(leaf) = chain.first() else {
+        return LeafRsaForm::Other;
+    };
+    let Ok(cert) = Certificate::from_der(leaf.clone()) else {
+        return LeafRsaForm::Other;
+    };
+    match cert.subject_public_key() {
+        Ok(AnyPublicKey::Rsa(_)) => LeafRsaForm::RsaEncryption,
+        Ok(AnyPublicKey::RsaPss(_, restriction)) => LeafRsaForm::RsaPss(restriction.hash()),
+        _ => LeafRsaForm::Other,
+    }
+}
+
+/// Whether a leaf of `form` permits signing under `scheme` (RFC 8446
+/// §4.2.3): an `rsaEncryption` leaf excludes `rsa_pss_pss_*`, an
+/// `id-RSASSA-PSS` leaf excludes `rsa_pss_rsae_*` and, when restricted,
+/// every `rsa_pss_pss_*` digest but its own. Non-RSA schemes are left to the
+/// key/certificate consistency check.
+pub(crate) fn leaf_permits_scheme(form: LeafRsaForm, scheme: SignatureScheme) -> bool {
+    match form {
+        LeafRsaForm::Other => true,
+        LeafRsaForm::RsaEncryption => !scheme.is_rsa_pss_pss(),
+        LeafRsaForm::RsaPss(restricted) => {
+            !scheme.is_rsa_pss_rsae()
+                && (!scheme.is_rsa_pss_pss()
+                    || restricted.is_none_or(|hash| rsa_pss_digest(scheme) == Some(hash)))
+        }
+    }
+}
+
 /// The IANA-blessed [`SignatureScheme`] code for the given [`ServerKey`], or
 /// `None` for a key that has none (ECDSA on secp256k1 / SM2, see
 /// [`tls_signature_scheme_for_curve`]).
 pub(crate) fn signature_scheme_for(key: &ServerKey) -> Option<SignatureScheme> {
     Some(match key {
         ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
+        ServerKey::RsaPss(_, hash) => rsa_pss_pss_scheme(*hash),
         ServerKey::Ecdsa(k) => return tls_signature_scheme_for_curve(k.curve()),
         ServerKey::Ed25519(_) => SignatureScheme::ED25519,
         ServerKey::Ed448(_) => SignatureScheme::ED448,
@@ -89,9 +209,11 @@ pub(crate) fn signature_scheme_for(key: &ServerKey) -> Option<SignatureScheme> {
 
 /// Signs `content` for a TLS 1.3 / DTLS 1.3 `CertificateVerify` using
 /// `key`, returning the (scheme, signature_bytes) tuple. Dispatches over
-/// every supported key type — RSA-PSS, ECDSA (NIST and Brainpool curves),
-/// Ed25519, Ed448, ML-DSA-44/65/87. A key with no IANA scheme (ECDSA on
-/// secp256k1 / SM2) is [`Error::UnsupportedKeyType`].
+/// every supported key type — RSA-PSS (`rsa_pss_rsae_sha256` for an
+/// `rsaEncryption` leaf, `rsa_pss_pss_*` for an `id-RSASSA-PSS` one), ECDSA
+/// (NIST and Brainpool curves), Ed25519, Ed448, ML-DSA-44/65/87. A key with
+/// no IANA scheme (ECDSA on secp256k1 / SM2) is
+/// [`Error::UnsupportedKeyType`].
 pub(crate) fn sign_certificate_verify<R: RngCore>(
     key: &ServerKey,
     content: &[u8],
@@ -99,9 +221,7 @@ pub(crate) fn sign_certificate_verify<R: RngCore>(
 ) -> Result<(SignatureScheme, Vec<u8>), Error> {
     let scheme = signature_scheme_for(key).ok_or(Error::UnsupportedKeyType)?;
     let signature = match key {
-        ServerKey::Rsa(k) => k
-            .sign_pss::<Sha256, _>(content, rng)
-            .map_err(|_| Error::HandshakeFailure)?,
+        ServerKey::Rsa(k) | ServerKey::RsaPss(k, _) => sign_rsa_pss(k, scheme, content, rng)?,
         ServerKey::Ecdsa(k) => {
             let curve = k.curve();
             let sig = match curve {
@@ -147,9 +267,12 @@ pub(crate) fn sign_certificate_verify<R: RngCore>(
 /// registry) is rejected with [`Error::BadCertificate`].
 ///
 /// Returns [`Error::PeerMisbehaved`] if the scheme is unsupported by the
-/// registry or does not match the key type, [`Error::Decode`] if the
-/// signature wire format is malformed, and [`Error::BadCertificate`] if the
-/// signature is otherwise invalid (or policy-rejected).
+/// registry or does not match the key type — including the RFC 8446 §4.2.3
+/// SPKI-form rule: `rsa_pss_rsae_*` only under a key certified as
+/// `rsaEncryption`, `rsa_pss_pss_*` only under one certified as
+/// `id-RSASSA-PSS` — [`Error::Decode`] if the signature wire format is
+/// malformed, and [`Error::BadCertificate`] if the signature is otherwise
+/// invalid (or policy-rejected).
 pub(crate) fn verify_signature(
     scheme: SignatureScheme,
     key: &AnyPublicKey,
@@ -158,6 +281,19 @@ pub(crate) fn verify_signature(
     policy: &SignaturePolicy,
 ) -> Result<(), Error> {
     let algo = find_by_tls_scheme(scheme.0).ok_or(Error::PeerMisbehaved)?;
+    // The `rsa-pss-pss-*` registry entries accept both RSA SPKI forms (the
+    // X.509 path needs the `rsaEncryption` one), so the TLS rule is applied
+    // here, where the parsed key is at hand.
+    let form_ok = if scheme.is_rsa_pss_rsae() {
+        matches!(key, AnyPublicKey::Rsa(_))
+    } else if scheme.is_rsa_pss_pss() {
+        matches!(key, AnyPublicKey::RsaPss(..))
+    } else {
+        true
+    };
+    if !form_ok {
+        return Err(Error::PeerMisbehaved);
+    }
     // The registry verifier needs an SPKI; round-trip the parsed key. (A few
     // hundred bytes of allocation per CertificateVerify is negligible next to
     // the asymmetric verify itself.)
@@ -229,6 +365,30 @@ mod tests {
                 ServerKey::Rsa(rsa.clone()),
                 AnyPublicKey::Rsa(rsa.public_key()),
                 SignatureScheme::RSA_PSS_RSAE_SHA256,
+            ),
+            // The same RSA key certified as `id-RSASSA-PSS` signs the
+            // `rsa_pss_pss_*` family: unrestricted (SHA-256) and pinned to
+            // SHA-384 / SHA-512 by the SPKI's RSASSA-PSS-params.
+            (
+                ServerKey::RsaPss(rsa.clone(), PssHash::Sha256),
+                AnyPublicKey::RsaPss(rsa.public_key(), crate::x509::PssRestriction::Unrestricted),
+                SignatureScheme::RSA_PSS_PSS_SHA256,
+            ),
+            (
+                ServerKey::RsaPss(rsa.clone(), PssHash::Sha384),
+                AnyPublicKey::RsaPss(
+                    rsa.public_key(),
+                    crate::x509::PssRestriction::for_hash(PssHash::Sha384),
+                ),
+                SignatureScheme::RSA_PSS_PSS_SHA384,
+            ),
+            (
+                ServerKey::RsaPss(rsa.clone(), PssHash::Sha512),
+                AnyPublicKey::RsaPss(
+                    rsa.public_key(),
+                    crate::x509::PssRestriction::for_hash(PssHash::Sha512),
+                ),
+                SignatureScheme::RSA_PSS_PSS_SHA512,
             ),
             (
                 ServerKey::Ecdsa(p256.clone()),
@@ -313,9 +473,15 @@ mod tests {
                 Err(Error::BadCertificate)
             ));
             // Every other case's key must be rejected as a key/scheme
-            // mismatch, not verified.
+            // mismatch, not verified. The one legitimate cross-match: the
+            // RSA-PSS cases share one modulus, and an *unrestricted*
+            // `id-RSASSA-PSS` key verifies any `rsa_pss_pss_*` digest.
             for (_, other_pk, other_scheme) in &cases {
-                if other_scheme != want_scheme {
+                let unrestricted_pss = matches!(
+                    other_pk,
+                    AnyPublicKey::RsaPss(_, crate::x509::PssRestriction::Unrestricted)
+                );
+                if other_scheme != want_scheme && !(unrestricted_pss && scheme.is_rsa_pss_pss()) {
                     assert!(
                         verify_signature(scheme, other_pk, &content, &sig, &policy).is_err(),
                         "{} accepted a signature under a {other_scheme:?} key",
@@ -324,6 +490,287 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// RFC 8446 §4.2.3 ties each RSA-PSS scheme family to one SPKI form:
+    /// `rsa_pss_rsae_*` verify only under a key certified as
+    /// `rsaEncryption`, `rsa_pss_pss_*` only under one certified as
+    /// `id-RSASSA-PSS` — and a restricted PSS key only under its digest.
+    /// The signatures themselves are identical PSS signatures (the same
+    /// bytes verify under both families' matching key form), so the family
+    /// check is what separates them, as `PeerMisbehaved`.
+    #[test]
+    fn rsa_pss_scheme_families_are_tied_to_the_spki_form() {
+        use crate::rng::HmacDrbg;
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::PssRestriction;
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"cv-pss-forms", b"nonce", &[]);
+        let content = certificate_verify_content(true, &[0x5a; 32]);
+        let rsa = crate::test_util::rsa_test_key_a();
+        let rsa = BoxedRsaPrivateKey::from_pkcs1_der(&rsa.to_pkcs1_der()).unwrap();
+        let policy = SignaturePolicy::modern();
+        let rsae_key = AnyPublicKey::Rsa(rsa.public_key());
+        let pss_any = AnyPublicKey::RsaPss(rsa.public_key(), PssRestriction::Unrestricted);
+        let pss_for = |hash| AnyPublicKey::RsaPss(rsa.public_key(), PssRestriction::for_hash(hash));
+
+        for (rsae, pss, hash) in [
+            (
+                SignatureScheme::RSA_PSS_RSAE_SHA256,
+                SignatureScheme::RSA_PSS_PSS_SHA256,
+                PssHash::Sha256,
+            ),
+            (
+                SignatureScheme::RSA_PSS_RSAE_SHA384,
+                SignatureScheme::RSA_PSS_PSS_SHA384,
+                PssHash::Sha384,
+            ),
+            (
+                SignatureScheme::RSA_PSS_RSAE_SHA512,
+                SignatureScheme::RSA_PSS_PSS_SHA512,
+                PssHash::Sha512,
+            ),
+        ] {
+            assert_eq!(rsa_pss_digest(rsae), Some(hash));
+            assert_eq!(rsa_pss_digest(pss), Some(hash));
+            assert_eq!(rsa_pss_pss_scheme(hash), pss);
+            assert!(rsae.is_rsa_pss_rsae() && !rsae.is_rsa_pss_pss());
+            assert!(pss.is_rsa_pss_pss() && !pss.is_rsa_pss_rsae());
+            for s in [rsae, pss] {
+                let algo = find_by_tls_scheme(s.0).unwrap();
+                assert!(
+                    policy.permits(algo, &rsae_key.to_spki_der()),
+                    "{}",
+                    algo.id()
+                );
+                assert!(
+                    policy.permits(algo, &pss_any.to_spki_der()),
+                    "{}",
+                    algo.id()
+                );
+            }
+            // One PSS signature serves both code points; the key form decides.
+            let sig = sign_rsa_pss(&rsa, rsae, &content, &mut rng).unwrap();
+            verify_signature(rsae, &rsae_key, &content, &sig, &policy).unwrap();
+            verify_signature(pss, &pss_any, &content, &sig, &policy).unwrap();
+            verify_signature(pss, &pss_for(hash), &content, &sig, &policy).unwrap();
+            assert!(matches!(
+                verify_signature(rsae, &pss_any, &content, &sig, &policy),
+                Err(Error::PeerMisbehaved)
+            ));
+            assert!(matches!(
+                verify_signature(rsae, &pss_for(hash), &content, &sig, &policy),
+                Err(Error::PeerMisbehaved)
+            ));
+            assert!(matches!(
+                verify_signature(pss, &rsae_key, &content, &sig, &policy),
+                Err(Error::PeerMisbehaved)
+            ));
+            // A PSS key restricted to another digest refuses the scheme.
+            let other = if hash == PssHash::Sha256 {
+                PssHash::Sha384
+            } else {
+                PssHash::Sha256
+            };
+            assert!(matches!(
+                verify_signature(pss, &pss_for(other), &content, &sig, &policy),
+                Err(Error::PeerMisbehaved)
+            ));
+            // The deterministic (client-side) signer produces a valid,
+            // repeatable signature under the same scheme.
+            let d1 = sign_rsa_pss_deterministic(&rsa, pss, &content).unwrap();
+            let d2 = sign_rsa_pss_deterministic(&rsa, pss, &content).unwrap();
+            assert_eq!(d1, d2);
+            assert_ne!(d1, sign_rsa_pss_deterministic(&rsa, pss, b"other").unwrap());
+            verify_signature(pss, &pss_any, &content, &d1, &policy).unwrap();
+            verify_signature(rsae, &rsae_key, &content, &d1, &policy).unwrap();
+        }
+        assert_eq!(rsa_pss_digest(SignatureScheme::ED25519), None);
+        assert!(matches!(
+            sign_rsa_pss(&rsa, SignatureScheme::ED25519, &content, &mut rng),
+            Err(Error::UnsupportedKeyType)
+        ));
+    }
+
+    /// The leaf certificate's SPKI form decides which RSA-PSS family an
+    /// identity signs under (RFC 8446 §4.2.3): `leaf_rsa_form` reads it,
+    /// `leaf_permits_scheme` filters an external key's schemes by it, and
+    /// `ServerKey::bound_to_leaf` turns an in-process RSA key certified as
+    /// `id-RSASSA-PSS` into one that signs `rsa_pss_pss_*` over the
+    /// restriction's digest.
+    #[test]
+    fn leaf_spki_form_binds_the_rsa_pss_family() {
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::{CertSigner, DistinguishedName, PssRestriction, Time, Validity};
+
+        let rsa = crate::test_util::rsa_test_key_a();
+        let rsa = BoxedRsaPrivateKey::from_pkcs1_der(&rsa.to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("leaf.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let rsae_leaf = Certificate::self_signed_general(
+            &CertSigner::Rsa(&rsa),
+            &name,
+            &validity,
+            1,
+            false,
+            &[],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        let pss384_leaf = Certificate::self_signed_general(
+            &CertSigner::RsaPss(&rsa, PssHash::Sha384),
+            &name,
+            &validity,
+            2,
+            false,
+            &[],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        // An unrestricted `id-RSASSA-PSS` SPKI: self-issued (PSS-SHA-256)
+        // over the PSS form of the key with absent parameters.
+        let pss_any_leaf = Certificate::issue_general(
+            &CertSigner::RsaPss(&rsa, PssHash::Sha256),
+            &name,
+            &name,
+            &AnyPublicKey::RsaPss(rsa.public_key(), PssRestriction::Unrestricted),
+            &validity,
+            3,
+            false,
+            &[],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        let mut rng = crate::rng::HmacDrbg::<Sha256>::new(b"leaf-form-ec", b"nonce", &[]);
+        let ec = crate::ec::BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let ec_leaf = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&ec),
+            &name,
+            &validity,
+            4,
+            false,
+            &[],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+
+        assert_eq!(
+            leaf_rsa_form(core::slice::from_ref(&rsae_leaf)),
+            LeafRsaForm::RsaEncryption
+        );
+        assert_eq!(
+            leaf_rsa_form(core::slice::from_ref(&pss384_leaf)),
+            LeafRsaForm::RsaPss(Some(PssHash::Sha384))
+        );
+        assert_eq!(
+            leaf_rsa_form(core::slice::from_ref(&pss_any_leaf)),
+            LeafRsaForm::RsaPss(None)
+        );
+        assert_eq!(
+            leaf_rsa_form(core::slice::from_ref(&ec_leaf)),
+            LeafRsaForm::Other
+        );
+        assert_eq!(leaf_rsa_form(&[]), LeafRsaForm::Other);
+        assert_eq!(
+            leaf_rsa_form(&[alloc::vec![0x30, 0x00]]),
+            LeafRsaForm::Other
+        );
+
+        let all = [
+            SignatureScheme::RSA_PSS_RSAE_SHA256,
+            SignatureScheme::RSA_PSS_RSAE_SHA384,
+            SignatureScheme::RSA_PSS_PSS_SHA256,
+            SignatureScheme::RSA_PSS_PSS_SHA384,
+            SignatureScheme::RSA_PSS_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ];
+        let permitted = |form| -> Vec<SignatureScheme> {
+            all.iter()
+                .copied()
+                .filter(|s| leaf_permits_scheme(form, *s))
+                .collect()
+        };
+        assert_eq!(
+            permitted(LeafRsaForm::RsaEncryption),
+            [
+                SignatureScheme::RSA_PSS_RSAE_SHA256,
+                SignatureScheme::RSA_PSS_RSAE_SHA384,
+                SignatureScheme::ED25519,
+            ]
+        );
+        assert_eq!(
+            permitted(LeafRsaForm::RsaPss(None)),
+            [
+                SignatureScheme::RSA_PSS_PSS_SHA256,
+                SignatureScheme::RSA_PSS_PSS_SHA384,
+                SignatureScheme::RSA_PSS_PSS_SHA512,
+                SignatureScheme::ED25519,
+            ]
+        );
+        assert_eq!(
+            permitted(LeafRsaForm::RsaPss(Some(PssHash::Sha384))),
+            [
+                SignatureScheme::RSA_PSS_PSS_SHA384,
+                SignatureScheme::ED25519
+            ]
+        );
+        assert_eq!(permitted(LeafRsaForm::Other), all);
+
+        // Binding an in-process key.
+        let scheme_of =
+            |key: ServerKey, chain: &[Vec<u8>]| signature_scheme_for(&key.bound_to_leaf(chain));
+        assert_eq!(
+            scheme_of(
+                ServerKey::Rsa(rsa.clone()),
+                core::slice::from_ref(&rsae_leaf)
+            ),
+            Some(SignatureScheme::RSA_PSS_RSAE_SHA256)
+        );
+        assert_eq!(
+            scheme_of(
+                ServerKey::Rsa(rsa.clone()),
+                core::slice::from_ref(&pss384_leaf)
+            ),
+            Some(SignatureScheme::RSA_PSS_PSS_SHA384)
+        );
+        assert_eq!(
+            scheme_of(
+                ServerKey::Rsa(rsa.clone()),
+                core::slice::from_ref(&pss_any_leaf)
+            ),
+            Some(SignatureScheme::RSA_PSS_PSS_SHA256)
+        );
+        assert_eq!(
+            scheme_of(ServerKey::Rsa(rsa.clone()), &[]),
+            Some(SignatureScheme::RSA_PSS_RSAE_SHA256)
+        );
+        // Binding an external key narrows its advertised schemes.
+        let external = || ServerKey::External {
+            schemes: all.to_vec(),
+        };
+        let schemes_of = |chain: &[Vec<u8>]| match external().bound_to_leaf(chain) {
+            ServerKey::External { schemes } => schemes,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            schemes_of(core::slice::from_ref(&pss384_leaf)),
+            [
+                SignatureScheme::RSA_PSS_PSS_SHA384,
+                SignatureScheme::ED25519
+            ]
+        );
+        assert_eq!(
+            schemes_of(core::slice::from_ref(&rsae_leaf)),
+            permitted(LeafRsaForm::RsaEncryption)
+        );
+        assert_eq!(schemes_of(core::slice::from_ref(&ec_leaf)), all);
     }
 
     // RFC 8448 §3: verify the server's CertificateVerify (rsa_pss_rsae_sha256,

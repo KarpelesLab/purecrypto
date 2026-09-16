@@ -291,22 +291,51 @@ impl LocalSigner {
 #[cfg(feature = "std")]
 impl HandshakeSigner for LocalSigner {
     fn schemes(&self) -> Vec<u16> {
-        let server_key = self.key.to_server_key_13();
-        // A key with no IANA scheme (ECDSA on secp256k1 / SM2) advertises
-        // nothing, so the handshake fails at negotiation rather than
-        // producing a signature the peer must reject.
-        super::crypto::signature_scheme_for(&server_key)
-            .map(|s| alloc::vec![s.0])
-            .unwrap_or_default()
+        use super::codec::SignatureScheme;
+        match &self.key {
+            // The signer does not see the leaf certificate, so an RSA key
+            // advertises both PSS families; the engine keeps the ones the
+            // leaf's SPKI form permits (RFC 8446 §4.2.3 — `rsa_pss_rsae_*`
+            // for `rsaEncryption`, `rsa_pss_pss_*` of the restricted digest
+            // for `id-RSASSA-PSS`) when the identity is installed.
+            SigningKey::Rsa(_) => alloc::vec![
+                SignatureScheme::RSA_PSS_RSAE_SHA256.0,
+                SignatureScheme::RSA_PSS_PSS_SHA256.0,
+                SignatureScheme::RSA_PSS_PSS_SHA384.0,
+                SignatureScheme::RSA_PSS_PSS_SHA512.0,
+            ],
+            // A key with no IANA scheme (ECDSA on secp256k1 / SM2)
+            // advertises nothing, so the handshake fails at negotiation
+            // rather than producing a signature the peer must reject.
+            _ => super::crypto::signature_scheme_for(&self.key.to_server_key_13())
+                .map(|s| alloc::vec![s.0])
+                .unwrap_or_default(),
+        }
     }
 
-    fn start_sign(&self, _scheme: u16, message: &[u8]) -> Result<Box<dyn SignOp>, Error> {
-        // The key fixes its own scheme (already what `schemes()` advertised and
-        // what the engine negotiated), so `_scheme` is informational here. Sign
-        // eagerly; the op is immediately Done.
-        let server_key = self.key.to_server_key_13();
-        let (_scheme, sig) =
-            super::crypto::sign_certificate_verify(&server_key, message, &mut crate::rng::OsRng)?;
+    fn start_sign(&self, scheme: u16, message: &[u8]) -> Result<Box<dyn SignOp>, Error> {
+        // Sign eagerly; the op is immediately Done.
+        let sig = match &self.key {
+            // The negotiated scheme picks the PSS digest.
+            SigningKey::Rsa(k) => super::crypto::sign::sign_rsa_pss(
+                k,
+                super::codec::SignatureScheme(scheme),
+                message,
+                &mut crate::rng::OsRng,
+            )?,
+            // Every other key fixes its own scheme (already what `schemes()`
+            // advertised and what the engine negotiated), so `scheme` is
+            // informational.
+            _ => {
+                let server_key = self.key.to_server_key_13();
+                super::crypto::sign_certificate_verify(
+                    &server_key,
+                    message,
+                    &mut crate::rng::OsRng,
+                )?
+                .1
+            }
+        };
         Ok(Box::new(ReadySignOp { sig: Some(sig) }))
     }
 

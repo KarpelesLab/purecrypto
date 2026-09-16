@@ -177,6 +177,9 @@ impl ServerConfig13Internal {
     /// required by default; call [`Self::with_no_cookie`] to disable it for
     /// tests.
     pub fn with_signing_key(cert_chain: Vec<Vec<u8>>, key: crate::tls::conn::ServerKey) -> Self {
+        // RFC 8446 §4.2.3: an RSA key signs the PSS family its leaf's SPKI
+        // form calls for (see `ServerKey::bound_to_leaf`).
+        let key = key.bound_to_leaf(&cert_chain);
         Self {
             cert_chain,
             key,

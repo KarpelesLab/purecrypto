@@ -119,6 +119,18 @@ u16_id!(
         RSA_PSS_RSAE_SHA256 = 0x0804,
         /// rsa_pss_rsae_sha384.
         RSA_PSS_RSAE_SHA384 = 0x0805,
+        /// rsa_pss_rsae_sha512. In the registry (`rsa-pss-rsae-sha512`) but
+        /// not offered by default, so a peer's `CertificateVerify` under it
+        /// is refused as unoffered.
+        RSA_PSS_RSAE_SHA512 = 0x0806,
+        /// rsa_pss_pss_sha256 (RFC 8446 §4.2.3): RSASSA-PSS under a key the
+        /// certificate carries as `id-RSASSA-PSS` (RFC 4055), where the
+        /// `rsa_pss_rsae_*` schemes require an `rsaEncryption` SPKI.
+        RSA_PSS_PSS_SHA256 = 0x0809,
+        /// rsa_pss_pss_sha384.
+        RSA_PSS_PSS_SHA384 = 0x080A,
+        /// rsa_pss_pss_sha512.
+        RSA_PSS_PSS_SHA512 = 0x080B,
         /// ecdsa_brainpoolP256r1tls13_sha256 (RFC 8734). TLS 1.3 only: RFC
         /// 8734 §2 forbids these code points in TLS 1.2 `signature_algorithms`.
         ECDSA_BRAINPOOLP256R1TLS13_SHA256 = 0x081A,
@@ -149,6 +161,24 @@ impl SignatureScheme {
         matches!(
             self,
             Self::RSA_PKCS1_SHA256 | Self::RSA_PKCS1_SHA384 | Self::RSA_PKCS1_SHA512
+        )
+    }
+
+    /// Whether this scheme is one of the `rsa_pss_rsae_*` family (RFC 8446
+    /// §4.2.3): RSASSA-PSS under a key certified as `rsaEncryption`.
+    pub(crate) fn is_rsa_pss_rsae(self) -> bool {
+        matches!(
+            self,
+            Self::RSA_PSS_RSAE_SHA256 | Self::RSA_PSS_RSAE_SHA384 | Self::RSA_PSS_RSAE_SHA512
+        )
+    }
+
+    /// Whether this scheme is one of the `rsa_pss_pss_*` family (RFC 8446
+    /// §4.2.3): RSASSA-PSS under a key certified as `id-RSASSA-PSS`.
+    pub(crate) fn is_rsa_pss_pss(self) -> bool {
+        matches!(
+            self,
+            Self::RSA_PSS_PSS_SHA256 | Self::RSA_PSS_PSS_SHA384 | Self::RSA_PSS_PSS_SHA512
         )
     }
 

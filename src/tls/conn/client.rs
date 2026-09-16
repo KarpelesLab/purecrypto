@@ -102,10 +102,15 @@ pub struct ClientCertConfig {
 /// shape, so boxing would add indirection without savings.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ClientKey {
-    /// RSA-PSS. Not yet wired (requires an RNG for the PSS salt); accepted
-    /// to keep the public API parallel to the server-side configuration.
-    #[allow(dead_code)]
+    /// An RSA key certified as `rsaEncryption`; signs `rsa_pss_rsae_sha256`
+    /// with a salt derived from the key and the signed content (the client
+    /// engine threads no RNG through the handshake — see
+    /// `tls::crypto::sign::sign_rsa_pss_deterministic`).
     Rsa(BoxedRsaPrivateKey),
+    /// An RSA key certified as `id-RSASSA-PSS` (RFC 4055); signs the
+    /// `rsa_pss_pss_*` scheme for the digest (RFC 8446 §4.2.3). Produced
+    /// from [`Rsa`](Self::Rsa) by [`bound_to_leaf`](Self::bound_to_leaf).
+    RsaPss(BoxedRsaPrivateKey, crate::x509::PssHash),
     Ecdsa(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
     /// An Ed448 client key (TLS 1.3 only).
@@ -130,13 +135,38 @@ pub(crate) enum ClientKey {
     },
 }
 
-impl ClientCertConfig {
-    /// A client cert + RSA-PSS signing key.
-    pub fn with_rsa(chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
-        ClientCertConfig {
-            chain,
-            key: ClientKey::Rsa(key),
+impl ClientKey {
+    /// Binds an RSA key to the SPKI form of `chain[0]` (RFC 8446 §4.2.3),
+    /// exactly as [`ServerKey::bound_to_leaf`](super::ServerKey::bound_to_leaf):
+    /// an in-process [`Rsa`](Self::Rsa) key certified as `id-RSASSA-PSS`
+    /// becomes [`RsaPss`](Self::RsaPss), an [`External`](Self::External)
+    /// key's schemes are narrowed to those the leaf permits, everything
+    /// else is unchanged.
+    pub(crate) fn bound_to_leaf(self, chain: &[Vec<u8>]) -> Self {
+        use crate::tls::crypto::sign::{LeafRsaForm, leaf_permits_scheme, leaf_rsa_form};
+        let form = leaf_rsa_form(chain);
+        match (self, form) {
+            (ClientKey::Rsa(k), LeafRsaForm::RsaPss(hash)) => {
+                ClientKey::RsaPss(k, hash.unwrap_or(crate::x509::PssHash::Sha256))
+            }
+            (ClientKey::External { schemes }, form) => ClientKey::External {
+                schemes: schemes
+                    .into_iter()
+                    .filter(|s| leaf_permits_scheme(form, *s))
+                    .collect(),
+            },
+            (key, _) => key,
         }
+    }
+}
+
+impl ClientCertConfig {
+    /// A client cert + RSA-PSS signing key (`rsa_pss_rsae_sha256` when the
+    /// leaf certifies the key as `rsaEncryption`, `rsa_pss_pss_*` when as
+    /// `id-RSASSA-PSS`).
+    pub fn with_rsa(chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
+        let key = ClientKey::Rsa(key).bound_to_leaf(&chain);
+        ClientCertConfig { chain, key }
     }
 
     /// A client cert + ECDSA signing key.
@@ -194,12 +224,11 @@ impl ClientCertConfig {
     /// caller. `schemes` are the IANA `SignatureScheme` code points the
     /// external key can produce, most-preferred first. See [`ClientKey::External`].
     pub fn with_external(chain: Vec<Vec<u8>>, schemes: Vec<u16>) -> Self {
-        ClientCertConfig {
-            chain,
-            key: ClientKey::External {
-                schemes: schemes.into_iter().map(SignatureScheme).collect(),
-            },
+        let key = ClientKey::External {
+            schemes: schemes.into_iter().map(SignatureScheme).collect(),
         }
+        .bound_to_leaf(&chain);
+        ClientCertConfig { chain, key }
     }
 
     /// The scheme this client cert may sign a TLS 1.3 `CertificateVerify`
@@ -228,6 +257,7 @@ impl ClientCertConfig {
     pub(super) fn signature_scheme_for(key: &ClientKey) -> Option<SignatureScheme> {
         Some(match key {
             ClientKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
+            ClientKey::RsaPss(_, hash) => crate::tls::crypto::sign::rsa_pss_pss_scheme(*hash),
             ClientKey::Ecdsa(k) => {
                 return crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve());
             }
@@ -3853,12 +3883,10 @@ impl ClientConnection {
         let th = self.core.transcript.current_hash();
         let content = certificate_verify_content(false, th.as_slice());
         let signature = match &cc.key {
-            ClientKey::Rsa(_) => {
-                // The CertificateVerify needs an RNG; reuse our handshake one
-                // is impractical here, so derive a deterministic one keyed on
-                // the transcript. For now, return an error if the test ever
-                // uses RSA; ECDSA and Ed25519 are deterministic.
-                return Err(Error::HandshakeFailure);
+            // No RNG is threaded through the client state machine: the PSS
+            // salt is derived from the key and the content instead.
+            ClientKey::Rsa(k) | ClientKey::RsaPss(k, _) => {
+                crate::tls::crypto::sign::sign_rsa_pss_deterministic(k, scheme, &content)?
             }
             ClientKey::Ecdsa(k) => {
                 let sig = match k.curve() {

@@ -4048,6 +4048,100 @@ mod tests {
         assert!(client.is_handshake_complete() && server.is_handshake_complete());
     }
 
+    /// A `LocalSigner` around an RSA key advertises both RSA-PSS families,
+    /// and the server engine narrows them to the one the leaf's SPKI form
+    /// permits (RFC 8446 §4.2.3): installed with an `id-RSASSA-PSS` leaf
+    /// pinned to SHA-384 the server signs `rsa_pss_pss_sha384`, with an
+    /// `rsaEncryption` leaf `rsa_pss_rsae_sha256`. The client verifies the
+    /// CertificateVerify under the leaf key — which refuses the other
+    /// family — so a completed handshake pins the choice.
+    #[test]
+    fn local_signer_rsa_follows_the_leaf_spki_form() {
+        use super::super::signer::{HandshakeSigner, LocalSigner};
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::x509::{CertSigner, Certificate, DistinguishedName, PssHash, Time, Validity};
+        use alloc::sync::Arc;
+
+        let key = crate::test_util::rsa_test_key_a();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("ext.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let pss_leaf = Certificate::self_signed_general(
+            &CertSigner::RsaPss(&boxed, PssHash::Sha384),
+            &name,
+            &validity,
+            1,
+            false,
+            &["ext.example"],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        let rsae_leaf = Certificate::self_signed_general(
+            &CertSigner::Rsa(&boxed),
+            &name,
+            &validity,
+            2,
+            false,
+            &["ext.example"],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        let signer: Arc<dyn HandshakeSigner> = Arc::new(LocalSigner::new(
+            super::super::config::SigningKey::Rsa(boxed),
+        ));
+        assert_eq!(signer.schemes(), [0x0804, 0x0809, 0x080A, 0x080B]);
+
+        for leaf in [pss_leaf, rsae_leaf] {
+            let server_cfg = Config::builder()
+                .rng(Arc::new(crate::rng::OsRng))
+                .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+                .try_private_key(alloc::vec![leaf], signer.clone())
+                .unwrap()
+                .build();
+            let client_cfg = Config::builder()
+                .rng(Arc::new(crate::rng::OsRng))
+                .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+                .verify_certificates(false)
+                .server_name("ext.example")
+                .build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            // The server side goes through `drive()`, which brokers the
+            // signer; the client through the plain loop.
+            for _ in 0..32 {
+                loop {
+                    let out = client.pop().unwrap();
+                    if out.is_empty() {
+                        break;
+                    }
+                    server.feed(&out).unwrap();
+                }
+                loop {
+                    match server.drive().unwrap() {
+                        Step::WantWrite => {
+                            let out = server.pop().unwrap();
+                            if out.is_empty() {
+                                break;
+                            }
+                            client.feed(&out).unwrap();
+                        }
+                        Step::WantSigner(_) => panic!("LocalSigner never yields WantSigner"),
+                        Step::WantRead | Step::Complete => break,
+                    }
+                }
+                if client.is_handshake_complete() && server.is_handshake_complete() {
+                    break;
+                }
+            }
+            assert!(client.is_handshake_complete() && server.is_handshake_complete());
+        }
+    }
+
     /// A device-backed `HandshakeSigner` whose `SignOp` returns `Pending` once
     /// (exposing a real, readable fd) before producing the signature drives a
     /// full handshake through `drive()` — exercising the `WantSigner` path and
