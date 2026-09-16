@@ -84,10 +84,21 @@ pub struct DhPublicKey {
 
 /// The byte-encoded shared secret `g^(x·y) mod p`.
 ///
-/// Encoded big-endian, left-padded to `(p.bit_len() + 7) / 8` bytes — the
-/// width SSH and TLS feed into the key-derivation step. Most consumers will
-/// run this through a hash (SHA-256 for `diffie-hellman-group14-sha256`,
-/// SHA-512 for `…-group16-sha512`) rather than use the raw value directly.
+/// Encoded big-endian, left-padded with zeros to `(p.bit_len() + 7) / 8`
+/// bytes — the fixed-width form TLS 1.3 FFDHE (RFC 8446 §7.4.1) and IKEv2
+/// (RFC 7296 §2.14) feed into their key schedules. Two widely used protocols
+/// want a *different* encoding of the same integer, and the caller is
+/// responsible for converting:
+///
+/// * **SSH** (RFC 4253 §8, RFC 4419 §3) hashes `K` as an `mpint`: minimal
+///   two's-complement, so leading zero bytes must be stripped and a `0x00`
+///   prepended when the top bit of the first remaining byte is set.
+/// * **TLS 1.2 and earlier** (RFC 5246 §8.1.2) use the value with all
+///   leading zero bytes stripped as the pre-master secret.
+///
+/// Feeding the padded form into either yields a different key from a
+/// conforming peer whenever `Z` happens to start with a zero byte (≈ 1 in
+/// 256 handshakes), a classic intermittent interop failure.
 pub struct SharedSecret {
     bytes: Vec<u8>,
 }
