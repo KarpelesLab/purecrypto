@@ -331,7 +331,12 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence()?;
-        let _version = seq.read_integer_bytes()?;
+        // RFC 8017 A.1.2: `version` is 0 for the two-prime structure parsed
+        // here; 1 denotes the multi-prime form (`otherPrimeInfos`), which is
+        // not supported. Mirrors the boxed parser.
+        if seq.read_integer_bytes()? != [0] {
+            return Err(Error::Malformed);
+        }
         let n = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
         let e = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
         let d = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
@@ -596,6 +601,32 @@ mod tests {
             .concat(),
         );
         assert!(RsaPrivateKey::<32>::from_pkcs8_der(&der).is_err());
+    }
+
+    /// RFC 8017 A.1.2: `version` must be 0 for the two-prime `RSAPrivateKey`.
+    /// The parser used to read and discard the field, accepting `version = 1`
+    /// (the multi-prime marker) or any other value. Mirrors the boxed test.
+    #[test]
+    fn const_generic_from_pkcs1_der_rejects_nonzero_version() {
+        let key = rsa_test_key_a();
+        let der = key.to_pkcs1_der();
+        // The outer SEQUENCE body starts with the canonical `INTEGER 0`.
+        let body = Reader::new(&der)
+            .read_tlv(crate::der::tag::SEQUENCE)
+            .unwrap();
+        assert_eq!(&body[..3], &[0x02, 0x01, 0x00], "version = 0 leads");
+        assert!(RsaPrivateKey::<32>::from_pkcs1_der(&der).is_ok());
+        for bad_version in [
+            &[0x02u8, 0x01, 0x01][..], // version = 1 (multi-prime marker)
+            &[0x02, 0x01, 0x02],       // undefined
+            &[0x02, 0x02, 0x00, 0x00], // non-canonical encoding of 0
+        ] {
+            let patched = encode_sequence(&[bad_version, &body[3..]].concat());
+            assert!(
+                RsaPrivateKey::<32>::from_pkcs1_der(&patched).is_err(),
+                "version {bad_version:02x?} must be rejected"
+            );
+        }
     }
 
     #[test]

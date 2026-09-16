@@ -1123,7 +1123,13 @@ impl BoxedRsaPrivateKey {
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut seq = reader.read_sequence()?;
-        let _version = seq.read_integer_bytes()?;
+        // RFC 8017 A.1.2: `version` is 0 for the two-prime structure parsed
+        // here; 1 denotes the multi-prime form, whose `otherPrimeInfos` this
+        // parser does not understand. Anything but a canonical 0 is rejected
+        // rather than silently read as a two-prime key.
+        if seq.read_integer_bytes()? != [0] {
+            return Err(crate::der::Error::Malformed);
+        }
         let n = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
         let e = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
         let d = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
@@ -1936,6 +1942,34 @@ mod tests {
             .concat(),
         );
         assert!(BoxedRsaPrivateKey::from_pkcs8_der(&der).is_err());
+    }
+
+    /// RFC 8017 A.1.2: a PKCS#1 `RSAPrivateKey` whose `version` is not 0 is
+    /// not a two-prime key. The parser used to read and discard the field, so
+    /// a blob tagged `version = 1` (multi-prime) — or any other value — was
+    /// accepted as long as the remaining fields parsed. Both a wrong value
+    /// and a non-canonical encoding of 0 must be rejected.
+    #[test]
+    fn from_pkcs1_der_rejects_nonzero_version() {
+        use crate::der::{Reader, encode_sequence, tag};
+        let sk = gen_small_key(b"rsa-pkcs1-version");
+        let der = sk.to_pkcs1_der();
+        // The outer SEQUENCE body starts with the canonical `INTEGER 0`.
+        let body = Reader::new(&der).read_tlv(tag::SEQUENCE).unwrap();
+        assert_eq!(&body[..3], &[0x02, 0x01, 0x00], "version = 0 leads");
+        // Sanity: the untouched blob still parses.
+        assert!(BoxedRsaPrivateKey::from_pkcs1_der(&der).is_ok());
+        for bad_version in [
+            &[0x02u8, 0x01, 0x01][..], // version = 1 (multi-prime marker)
+            &[0x02, 0x01, 0x02],       // undefined
+            &[0x02, 0x02, 0x00, 0x00], // non-canonical encoding of 0
+        ] {
+            let patched = encode_sequence(&[bad_version, &body[3..]].concat());
+            assert!(
+                BoxedRsaPrivateKey::from_pkcs1_der(&patched).is_err(),
+                "version {bad_version:02x?} must be rejected"
+            );
+        }
     }
 
     /// PKCS#8 carrying a non-RSA private-key algorithm OID is rejected.
