@@ -7325,6 +7325,151 @@ mod tls12_loopback_tests {
         assert_eq!(client.peer_ocsp_response().map(|v| v.to_vec()), Some(der));
     }
 
+    /// An RSA CA (`rsa_test_key_a`) signing an RSA leaf (`rsa_test_key_b`)
+    /// for `loopback.example`, plus the root and leaf DER. The legacy CBC
+    /// suites are all RSA-authenticated, so the ECDSA stapling fixture above
+    /// cannot drive them.
+    #[cfg(feature = "tls-legacy")]
+    fn ca_signed_rsa_leaf_12() -> (ServerConfig12, Vec<u8>, Vec<u8>) {
+        let ca_key = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let ca_name = DistinguishedName::common_name("Legacy Stapling Test CA");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let root = Certificate::self_signed_general(
+            &CertSigner::Rsa(&ca_key),
+            &ca_name,
+            &validity,
+            1,
+            true,
+            &[],
+        )
+        .unwrap();
+        let leaf_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&crate::test_util::rsa_test_key_b().to_pkcs1_der())
+                .unwrap();
+        let leaf = Certificate::issue_general(
+            &CertSigner::Rsa(&ca_key),
+            &ca_name,
+            &DistinguishedName::common_name("loopback.example"),
+            &crate::x509::AnyPublicKey::Rsa(leaf_key.public_key()),
+            &validity,
+            9,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let chain = alloc::vec![leaf.to_der().to_vec(), root.to_der().to_vec()];
+        let cfg = ServerConfig12::with_rsa(chain, leaf_key);
+        (cfg, root.to_der().to_vec(), leaf.to_der().to_vec())
+    }
+
+    /// TLS 1.0/1.1 (`tls-legacy`): the server staples a `good` OCSP response
+    /// on the legacy path — the client accepts the `CertificateStatus`
+    /// between `Certificate` and `ServerKeyExchange` / `ServerHelloDone`
+    /// (RFC 6066 §8) and surfaces the response. Before this the legacy
+    /// client aborted with `unexpected_message`.
+    #[cfg(feature = "tls-legacy")]
+    fn run_legacy_stapled(suite: CipherSuite, version: crate::tls::ProtocolVersion) {
+        use crate::x509::OcspResponseBuilder;
+        let (mut server_config, root_der, leaf_der) = ca_signed_rsa_leaf_12();
+        let ca_key = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let leaf = Certificate::from_der(leaf_der).unwrap();
+        let root = Certificate::from_der(root_der.clone()).unwrap();
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &root,
+            Time::utc(2026, 4, 1, 0, 0, 0),
+            Some(Time::utc(2026, 6, 1, 0, 0, 0)),
+        )
+        .unwrap()
+        .sign(&CertSigner::Rsa(&ca_key))
+        .unwrap();
+        let der = resp.to_der().to_vec();
+        server_config = server_config
+            .with_stapled_ocsp_response(der.clone())
+            .with_min_version(crate::tls::ProtocolVersion::TLSv1_0);
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+        let mut cfg = ClientConfig12::new(roots)
+            .with_min_version(version)
+            .with_max_version(version);
+        cfg.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"legacy-ocsp-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"legacy-ocsp-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            cfg,
+            "loopback.example",
+            &mut crng,
+            &[suite],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "client did not finish");
+        assert!(!server.is_handshaking(), "server did not finish");
+        assert_eq!(client.negotiated_protocol_version(), Some(version));
+        assert_eq!(client.peer_ocsp_response().map(|v| v.to_vec()), Some(der));
+
+        client.send_application_data(b"stapled ping").unwrap();
+        server.read_tls(&client.write_tls());
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"stapled ping");
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls10_stapled_ocsp_ecdhe_rsa() {
+        run_legacy_stapled(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_0,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls10_stapled_ocsp_static_rsa() {
+        run_legacy_stapled(
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_0,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls11_stapled_ocsp_ecdhe_rsa() {
+        run_legacy_stapled(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_1,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls11_stapled_ocsp_static_rsa() {
+        run_legacy_stapled(
+            CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_1,
+        );
+    }
+
     /// TLS 1.2: server staples a `revoked` OCSP response → client rejects
     /// with `CertificateRevoked`.
     #[test]

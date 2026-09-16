@@ -1848,11 +1848,15 @@ impl ClientConnection12 {
             self.cert_chain = chain;
             self.leaf_key = Some(leaf_key);
             self.transcript.update(raw);
-            self.state = if ls.kx == LegacyKx::EcdheRsa {
-                State::WaitServerKeyExchange
+            // RFC 6066 §8: a `status_request` echo in the ServerHello means
+            // a `CertificateStatus` comes next; otherwise ServerKeyExchange
+            // (ECDHE) or ServerHelloDone (static RSA, no SKE).
+            self.state = if self.server_echoed_ocsp_staple {
+                State::WaitCertificateStatus
             } else {
-                State::WaitServerHelloDone
+                self.state_after_certificate_status()
             };
+            let _ = ls;
             return Ok(());
         }
 
@@ -1926,6 +1930,13 @@ impl ClientConnection12 {
             .ok_or(Error::HandshakeFailure)?;
         if !ext::parse_renegotiation_info(reneg)?.is_empty() {
             return Err(Error::HandshakeFailure);
+        }
+        // RFC 6066 §8 predates TLS 1.2: a TLS 1.0/1.1 server that echoes an
+        // empty `status_request` will send a `CertificateStatus` right after
+        // its `Certificate`, exactly as on the 1.2 path.
+        if let Some(sr_body) = ext::find(&sh.extensions, ExtensionType::STATUS_REQUEST) {
+            ext::parse_status_request_sh_ack(sr_body)?;
+            self.server_echoed_ocsp_staple = true;
         }
         // RFC 7627: the legacy derivation cannot produce an extended master
         // secret. A server echoing the extension on a pre-1.2 ServerHello is
@@ -2166,7 +2177,16 @@ impl ClientConnection12 {
         raw: &[u8],
     ) -> Result<(), Error> {
         if msg_type != hs_type::CERTIFICATE_STATUS {
-            return Err(Error::UnexpectedMessage);
+            // RFC 6066 §8: a server "MAY also choose not to send a
+            // CertificateStatus message, even if [it] has sent a
+            // status_request extension in the server hello message". The
+            // flight then simply continues with the message that would have
+            // followed the staple.
+            self.state = self.state_after_certificate_status();
+            return match self.state {
+                State::WaitServerHelloDone => self.on_server_hello_done(msg_type, body, raw),
+                _ => self.on_server_key_exchange(msg_type, body, raw),
+            };
         }
         let ocsp = ext::parse_certificate_status(body)?;
         // Validate the staple against the chain (already verified by
@@ -2192,8 +2212,20 @@ impl ClientConnection12 {
         }
         self.peer_ocsp_response = Some(ocsp);
         self.transcript.update(raw);
-        self.state = State::WaitServerKeyExchange;
+        self.state = self.state_after_certificate_status();
         Ok(())
+    }
+
+    /// The message expected once the server's `Certificate` (and optional
+    /// `CertificateStatus`) is in: `ServerKeyExchange` for every ECDHE suite,
+    /// `ServerHelloDone` for legacy static-RSA key transport, which has no
+    /// SKE.
+    fn state_after_certificate_status(&self) -> State {
+        #[cfg(feature = "tls-legacy")]
+        if self.legacy_suite.is_some_and(|ls| ls.kx == LegacyKx::Rsa) {
+            return State::WaitServerHelloDone;
+        }
+        State::WaitServerKeyExchange
     }
 
     fn on_server_key_exchange(

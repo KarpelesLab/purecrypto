@@ -1414,9 +1414,10 @@ impl<R: RngCore> ServerConnection12<R> {
 
     /// Opt-in TLS 1.0/1.1 ClientHello handler. Selects a legacy CBC suite,
     /// emits the server flight (`ServerHello` carrying the negotiated version,
-    /// `Certificate`, `ServerKeyExchange` for ECDHE, `ServerHelloDone`), and
-    /// transitions to `WaitClientKeyExchange`. The legacy path deliberately
-    /// omits every TLS 1.2-era extension (EMS, tickets, OCSP, mTLS).
+    /// `Certificate`, optional `CertificateStatus` (RFC 6066 OCSP stapling),
+    /// `ServerKeyExchange` for ECDHE, optional `CertificateRequest`,
+    /// `ServerHelloDone`), and transitions to `WaitClientKeyExchange`. The
+    /// legacy path deliberately omits session tickets.
     #[cfg(feature = "tls-legacy")]
     fn on_client_hello_legacy(
         &mut self,
@@ -1444,6 +1445,14 @@ impl<R: RngCore> ServerConnection12<R> {
 
         if let Some(sni_body) = ext::find(&ch.extensions, ExtensionType::SERVER_NAME) {
             self.peer_server_name = ext::parse_server_name(sni_body)?;
+        }
+
+        // RFC 6066 §8 (OCSP stapling) predates TLS 1.2: remember the offer so
+        // the legacy ServerHello echoes it and a `CertificateStatus` follows
+        // `Certificate` whenever a staple is configured.
+        if let Some(sr_body) = ext::find(&ch.extensions, ExtensionType::STATUS_REQUEST) {
+            ext::parse_status_request(sr_body)?;
+            self.peer_offered_ocsp_staple = true;
         }
 
         // RFC 5746: the client signals secure renegotiation support either via
@@ -1503,6 +1512,11 @@ impl<R: RngCore> ServerConnection12<R> {
 
         self.send_server_hello_legacy(ls)?;
         self.send_certificate();
+        // RFC 6066 §8: `CertificateStatus` sits right after `Certificate`;
+        // emitted iff the ServerHello echoed `status_request`.
+        if self.peer_offered_ocsp_staple && self.config.stapled_ocsp_response.is_some() {
+            self.send_certificate_status();
+        }
         if ls.kx == LegacyKx::EcdheRsa {
             self.send_server_key_exchange_legacy(group.expect("ecdhe group set"))?;
         }
@@ -1554,6 +1568,12 @@ impl<R: RngCore> ServerConnection12<R> {
         }
         if ls.kx == LegacyKx::EcdheRsa {
             extensions.push(ext::ec_point_formats());
+        }
+        // RFC 6066 §8: echo an empty `status_request` iff the client offered
+        // it AND a staple is configured — the echo commits us to sending a
+        // `CertificateStatus`.
+        if self.peer_offered_ocsp_staple && self.config.stapled_ocsp_response.is_some() {
+            extensions.push(ext::status_request_sh_ack());
         }
         let sh = ServerHello {
             random: sr,
