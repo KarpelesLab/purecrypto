@@ -1264,16 +1264,17 @@ impl XmssPrivateKey {
         if idx >= (1u64 << p.full_height) {
             return Err(Error::KeyExhausted);
         }
-        let sig = {
-            let view = SkView {
-                p: &p,
-                bytes: &self.bytes,
-            };
-            core_sign(&p, &view, idx, msg, &mut self.cache)
-        };
-        // Advance the stored index only after the signature is produced.
+        // Reserve `idx` BEFORE any signature byte exists (SP 800-208 §8.1):
+        // the stored index moves on first, so an abort part-way through
+        // `core_sign` can never be followed by a second signature on the same
+        // one-time key. `core_sign` takes the leaf explicitly and only reads
+        // the seeds/root through `SkView`, never the stored index.
         idx_to_bytes(idx + 1, &mut self.bytes[..p.index_bytes]);
-        Ok(sig)
+        let view = SkView {
+            p: &p,
+            bytes: &self.bytes,
+        };
+        Ok(core_sign(&p, &view, idx, msg, &mut self.cache))
     }
 
     /// The serialized signing key: `magic ‖ oid ‖ raw_sk`, where `raw_sk` is
@@ -1463,15 +1464,13 @@ impl XmssMtPrivateKey {
         if p.exhausted_index().is_some_and(|max| idx >= max) {
             return Err(Error::KeyExhausted);
         }
-        let sig = {
-            let view = SkView {
-                p: &p,
-                bytes: &self.bytes,
-            };
-            core_sign(&p, &view, idx, msg, &mut self.cache)
-        };
+        // Reserve `idx` before signing — see `XmssPrivateKey::sign`.
         idx_to_bytes(idx + 1, &mut self.bytes[..p.index_bytes]);
-        Ok(sig)
+        let view = SkView {
+            p: &p,
+            bytes: &self.bytes,
+        };
+        Ok(core_sign(&p, &view, idx, msg, &mut self.cache))
     }
 
     /// The serialized signing key: `magic ‖ oid ‖ raw_sk`. Persist after every

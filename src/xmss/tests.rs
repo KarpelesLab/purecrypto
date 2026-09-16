@@ -483,3 +483,85 @@ fn from_bytes_tall_tree_loads_without_recompute() {
         start.elapsed()
     );
 }
+
+/// The stored index moves past `idx` BEFORE the signature is produced, and
+/// the signature carries that reserved (pre-advance) index — for XMSS and
+/// XMSS^MT alike.
+#[test]
+fn signature_carries_reserved_index() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"xmss", b"reserve", &[]);
+    let mut sk = XmssPrivateKey::generate(XmssParamSet::Sha2_10_256, &mut rng);
+    let pk = sk.public_key();
+    for expected in 0..3u64 {
+        let sig = sk.sign(b"m").unwrap();
+        assert_eq!(bytes_to_idx(&sig[..4]), expected);
+        assert_eq!(sk.index(), expected + 1);
+        assert!(pk.verify(b"m", &sig));
+    }
+
+    let mut rng = HmacDrbg::<Sha256>::new(b"xmssmt", b"reserve", &[]);
+    let set = XmssMtParamSet::Sha2_20_4_256;
+    let p = set.params();
+    let mut sk = XmssMtPrivateKey::generate(set, &mut rng);
+    let pk = sk.public_key();
+    for expected in 0..3u64 {
+        let sig = sk.sign(b"m").unwrap();
+        assert_eq!(bytes_to_idx(&sig[..p.index_bytes]), expected);
+        assert_eq!(sk.index(), expected + 1);
+        assert!(pk.verify(b"m", &sig));
+    }
+}
+
+/// The signer-side subtree cache must be invisible: a key that has signed its
+/// way across several bottom-subtree boundaries (building, evicting, and
+/// rebuilding cached subtrees along the way) must emit, at every index, the
+/// exact bytes a cold key — fresh from the seed, fast-forwarded to that index,
+/// with only the keygen-seeded top subtree cached — emits. XMSS^MT with
+/// `tree_height = 5` (`Sha2_20_4_256`, four layers of 32 leaves) keeps the
+/// walk cheap while crossing the layer-0 boundary at 32 and 64 and the
+/// layer-1 boundary at 1024.
+#[test]
+fn subtree_cache_matches_cold_recomputation() {
+    let set = XmssMtParamSet::Sha2_20_4_256;
+    let p = set.params();
+    assert_eq!(p.tree_height, 5);
+    let seed: Vec<u8> = (0..3 * p.n).map(|i| (i * 7 + 13) as u8).collect();
+
+    // Warm signer: walks leaves 0..=66 sequentially, then jumps to 1023..=1025
+    // (a layer-1 subtree boundary) — each hop evicts and rebuilds a subtree.
+    let mut warm = XmssMtPrivateKey::from_seed(set, &seed);
+    let pk = warm.public_key();
+    let mut walk: Vec<u64> = (0..=66).collect();
+    walk.extend([1023u64, 1024, 1025]);
+
+    let mut checked = 0;
+    for idx in walk {
+        idx_to_bytes(idx, &mut warm.bytes[..p.index_bytes]);
+        let from_cache = warm.sign(b"cache-vs-cold").unwrap();
+        assert!(pk.verify(b"cache-vs-cold", &from_cache), "idx {idx}");
+
+        // Only compare against a cold key at the boundaries and a few
+        // interior points; each cold key rebuilds d - 1 subtrees.
+        if matches!(
+            idx,
+            0 | 1 | 31 | 32 | 33 | 63 | 64 | 66 | 1023 | 1024 | 1025
+        ) {
+            let mut cold = XmssMtPrivateKey::from_seed(set, &seed);
+            idx_to_bytes(idx, &mut cold.bytes[..p.index_bytes]);
+            let recomputed = cold.sign(b"cache-vs-cold").unwrap();
+            assert_eq!(
+                from_cache, recomputed,
+                "cached auth path differs from cold recomputation at idx {idx}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 11);
+
+    // The cache never holds more than one subtree per layer.
+    assert!(warm.cache.entries.len() <= p.d as usize);
+    let mut layers: Vec<u32> = warm.cache.entries.iter().map(|e| e.0).collect();
+    layers.sort_unstable();
+    layers.dedup();
+    assert_eq!(layers.len(), warm.cache.entries.len());
+}
