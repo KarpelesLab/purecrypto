@@ -35,7 +35,7 @@ mod unix {
     use purecrypto::hash::Sha256;
     use purecrypto::rng::HmacDrbg;
     use purecrypto::tls::{
-        Config, Connection, HandshakeSigner, Readiness, SignOp, SignProgress, Step,
+        Config, Connection, HandshakeSigner, Readiness, RootCertStore, SignOp, SignProgress, Step,
     };
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
@@ -148,14 +148,19 @@ mod unix {
         let server_cfg = Config::builder()
             .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
             .tls_only()
-            .private_key(vec![cert_der], Arc::new(DeviceKey { key }))
+            .private_key(vec![cert_der.clone()], Arc::new(DeviceKey { key }))
             .build();
         let mut server = Connection::server(&server_cfg).expect("server config");
 
+        // The client pins the self-signed certificate as its trust anchor,
+        // so the handshake below is fully verified (like `tls_external_signing`)
+        // rather than run with verification switched off.
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).expect("self-signed cert as root");
         let client_cfg = Config::builder()
             .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
             .tls_only()
-            .verify_certificates(false)
+            .roots(roots)
             .server_name("device.example")
             .build();
         let mut client = Connection::client(&client_cfg).expect("client config");

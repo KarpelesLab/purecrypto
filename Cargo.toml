@@ -299,7 +299,7 @@ required-features = ["bignum", "rng", "rsa", "x509", "std"]
 # Minimal blocking HTTPS client over `std::net::TcpStream`.
 [[example]]
 name = "tls_get"
-required-features = ["tls", "rng", "std"]
+required-features = ["tls", "rng", "std", "embedded-roots"]
 
 # In-process client/server TLS handshake over a memory pipe.
 [[example]]
@@ -328,7 +328,7 @@ required-features = ["tls-legacy", "std"]
 # (no_std) builds don't try to compile it.
 [[example]]
 name = "bench"
-required-features = ["std", "cipher", "hash", "ec", "rsa", "mlkem", "aez"]
+required-features = ["std", "cipher", "hash", "ec", "rsa", "mlkem", "mldsa", "slhdsa", "aez"]
 
 [lints.rust]
 # `fullrust` is a custom, out-of-tree `target_os` (a libc-free Linux

@@ -1,13 +1,9 @@
 //! An HTTPS GET over a real TCP connection, using the `purecrypto` TLS 1.3
-//! client. By default the server certificate is verified against the system
-//! trust store; pass `--insecure` to skip certificate verification.
+//! client. By default the server certificate is verified against the root
+//! bundle embedded in the crate (the `embedded-roots` feature, on by
+//! default); pass `--insecure` to skip certificate verification.
 //!
 //! Run with: `cargo run --example tls_get [-- --insecure]`
-//!
-//! Note: chain verification requires every certificate's key (and its issuer's
-//! signing key) to be RSA or ECDSA P-256 — the algorithms this library
-//! implements. Hosts anchored through a P-384 CA (example.org via Cloudflare,
-//! at the time of writing) cannot be verified yet and need `--insecure`.
 
 use purecrypto::tls::{Config, Connection, HandshakeStatus, RootCertStore};
 use std::io::{Read, Write};
@@ -22,7 +18,11 @@ fn main() {
     let roots = if insecure {
         RootCertStore::new()
     } else {
-        load_system_roots()
+        // Portable: the crate ships its own root bundle, so this works the
+        // same on Linux, macOS and Windows (a hard-coded
+        // `/etc/ssl/certs/ca-certificates.crt` path only exists on some
+        // Linux distributions).
+        RootCertStore::with_embedded_roots()
     };
     let cfg = Config::builder()
         .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
@@ -109,35 +109,4 @@ fn main() {
     for line in text.lines().take(15) {
         println!("{line}");
     }
-}
-
-/// Loads the system CA bundle into a trust store, skipping any certificate
-/// whose key type this library does not parse (e.g. Ed25519/P-384 roots).
-fn load_system_roots() -> RootCertStore {
-    const BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
-    let data = std::fs::read_to_string(BUNDLE).expect("read system CA bundle");
-
-    let mut store = RootCertStore::new();
-    let (mut loaded, mut skipped) = (0u32, 0u32);
-    let mut block = String::new();
-    let mut in_cert = false;
-    for line in data.lines() {
-        if line.starts_with("-----BEGIN CERTIFICATE-----") {
-            in_cert = true;
-            block.clear();
-        }
-        if in_cert {
-            block.push_str(line);
-            block.push('\n');
-        }
-        if line.starts_with("-----END CERTIFICATE-----") {
-            in_cert = false;
-            match store.add_pem(&block) {
-                Ok(()) => loaded += 1,
-                Err(_) => skipped += 1,
-            }
-        }
-    }
-    eprintln!("loaded {loaded} trusted roots ({skipped} skipped)");
-    store
 }
