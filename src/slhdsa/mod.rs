@@ -2218,6 +2218,43 @@ mod tests {
         check_siggen(true);
     }
 
+    /// Hedged signing against the ACVP `additionalRandomness` vectors: the
+    /// `n` bytes the RNG hands `sign_into` are `opt_rand` verbatim, so a
+    /// fixed-output RNG reproduces the published signature. Covers the path
+    /// `sign_deterministic` never takes (`opt_rand != PK.seed`).
+    #[test]
+    fn acvp_siggen_hedged() {
+        /// Serves exactly the vector's entropy, once.
+        struct FixedRng(Vec<u8>);
+        impl RngCore for FixedRng {
+            fn fill_bytes(&mut self, dest: &mut [u8]) {
+                assert_eq!(dest.len(), self.0.len(), "opt_rand must be n bytes");
+                dest.copy_from_slice(&self.0);
+                self.0.clear();
+            }
+        }
+
+        let mut count = 0;
+        for line in include_str!("../../testdata/slhdsa_siggen_hedged.kat").lines() {
+            let mut it = line.split_whitespace();
+            let idx: usize = it.next().unwrap().parse().unwrap();
+            let set = pset(idx);
+            let sk = unhex(it.next().unwrap());
+            let context = ctx(it.next().unwrap());
+            let entropy = unhex(it.next().unwrap());
+            let msg = unhex(it.next().unwrap());
+            let sig_exp = unhex(it.next().unwrap());
+            let key = PrivateKey::from_bytes(set, &sk).unwrap();
+            let mut rng = FixedRng(entropy);
+            let sig = key.sign(&mut rng, &msg, &context).unwrap();
+            assert!(rng.0.is_empty(), "sign must draw the randomizer");
+            assert_eq!(sig, sig_exp, "hedged signature set {idx}");
+            assert!(key.public_key().verify(&sig, &msg, &context));
+            count += 1;
+        }
+        assert!(count >= 2, "expected hedged KAT lines, got {count}");
+    }
+
     #[test]
     fn acvp_sigver() {
         for line in include_str!("../../testdata/slhdsa_sigver.kat").lines() {
