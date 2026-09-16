@@ -10,12 +10,13 @@
 //!   from `libSystem`. Always seeded by the kernel before userspace runs;
 //!   no early-boot caveat.
 //! * **Windows**: `ProcessPrng` from `bcryptprimitives.dll`.
-//! * **Linux** (default): `/dev/urandom` (per-thread cached fd).
-//! * **Linux with `linux-getrandom` feature**: `getrandom(2)` via raw
-//!   syscalls (no `libc` dep). Blocks until the kernel CSPRNG is seeded —
-//!   recommended for processes that may start very early in boot.
-//!   Supported arches: x86_64, aarch64, armv7, riscv64; other Linux arches
+//! * **Linux with the `linux-getrandom` feature** (part of the crate's
+//!   default feature set): `getrandom(2)` via raw syscalls (no `libc` dep).
+//!   Blocks until the kernel CSPRNG is seeded — recommended for processes
+//!   that may start very early in boot. Supported arches: x86_64, aarch64,
+//!   armv7, riscv64; other Linux arches, and kernels without the syscall,
 //!   transparently fall through to `/dev/urandom`.
+//! * **Linux without that feature**: `/dev/urandom` (per-thread cached fd).
 //! * **Other Unix** (FreeBSD, OpenBSD, NetBSD, etc.): `/dev/urandom`.
 #![cfg_attr(not(feature = "std"), doc = "", doc = "[`OsRng`]: crate#no_std")]
 
