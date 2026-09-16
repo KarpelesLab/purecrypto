@@ -651,3 +651,87 @@ fn brainpool_spki_does_not_report_p256() {
         ));
     }
 }
+
+/// Brainpool ECDSA keys sign and verify through the facade, on both wire
+/// encodings, and the DER form is the same `Ecdsa-Sig-Value` the X.509
+/// signature registry verifies. Before this the facade rejected every
+/// Brainpool key with `InvalidParams` while `x509::CertSigner` happily
+/// issued certificates with the same key, so a key loaded through
+/// `private_key_from_pkcs8_der` could sign a certificate but not a message.
+#[test]
+fn brainpool_ecdsa_sign_verify_via_facade() {
+    use crate::ec::boxed::BoxedEcdsaPrivateKey;
+    use crate::ec::curves::CurveId;
+    use crate::key::SigEncoding;
+
+    let mut r = rng();
+    for (curve, hash, want) in [
+        (
+            CurveId::BrainpoolP256r1,
+            Hash::Sha256,
+            Algorithm::BrainpoolP256r1,
+        ),
+        (
+            CurveId::BrainpoolP384r1,
+            Hash::Sha384,
+            Algorithm::BrainpoolP384r1,
+        ),
+        (
+            CurveId::BrainpoolP512r1,
+            Hash::Sha512,
+            Algorithm::BrainpoolP512r1,
+        ),
+    ] {
+        let sk = BoxedEcdsaPrivateKey::generate(curve, &mut r);
+        let priv_dyn: Box<dyn PrivateKey> = Box::new(sk.clone());
+        let pub_dyn = priv_dyn.public_key().unwrap();
+        assert_eq!(priv_dyn.algorithm(), want);
+        assert_eq!(pub_dyn.algorithm(), want);
+
+        for enc in [SigEncoding::Raw, SigEncoding::Der] {
+            let params = SignParams::new().hash(hash).sig_encoding(enc);
+            let sig = priv_dyn.sign(b"brainpool", &params, &mut r).expect("sign");
+            pub_dyn.verify(b"brainpool", &sig, &params).expect("verify");
+            assert!(pub_dyn.verify(b"other", &sig, &params).is_err());
+        }
+
+        // Cross-layer: the DER signature the facade emits is what the X.509
+        // registry entry for this curve/hash pair verifies.
+        #[cfg(feature = "x509")]
+        {
+            use crate::x509::AnyPublicKey;
+            let params = SignParams::new().hash(hash).sig_encoding(SigEncoding::Der);
+            let sig = priv_dyn.sign(b"brainpool", &params, &mut r).unwrap();
+            let spki = AnyPublicKey::Ecdsa(sk.public_key()).to_spki_der();
+            let id = match curve {
+                CurveId::BrainpoolP256r1 => "ecdsa-brainpoolP256r1-sha256",
+                CurveId::BrainpoolP384r1 => "ecdsa-brainpoolP384r1-sha384",
+                _ => "ecdsa-brainpoolP512r1-sha512",
+            };
+            crate::signature_registry::find_by_id(id)
+                .unwrap()
+                .verify(&spki, b"brainpool", &sig)
+                .expect("registry verifies the facade's DER signature");
+        }
+    }
+
+    // ECDH over a Brainpool curve agrees on both sides.
+    use crate::ec::boxed::BoxedEcdhPrivateKey;
+    let a = BoxedEcdhPrivateKey::generate(CurveId::BrainpoolP256r1, &mut r);
+    let b = BoxedEcdhPrivateKey::generate(CurveId::BrainpoolP256r1, &mut r);
+    let a_pub = a.public_key();
+    let b_pub = b.public_key();
+    let a_dyn: Box<dyn PrivateKey> = Box::new(a);
+    let b_dyn: Box<dyn PrivateKey> = Box::new(b);
+    let s1 = a_dyn.agree(&b_pub).expect("agree");
+    let s2 = b_dyn.agree(&a_pub).expect("agree");
+    assert_eq!(s1.as_bytes(), s2.as_bytes());
+
+    // The SM2 curve carried as plain ECDSA is still refused up front.
+    let sm2 = BoxedEcdsaPrivateKey::generate(CurveId::Sm2p256v1, &mut r);
+    let sm2_dyn: Box<dyn PrivateKey> = Box::new(sm2);
+    assert!(matches!(
+        sm2_dyn.sign(b"m", &SignParams::new(), &mut r),
+        Err(Error::InvalidParams)
+    ));
+}

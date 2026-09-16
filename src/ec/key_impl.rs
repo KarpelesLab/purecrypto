@@ -401,10 +401,13 @@ impl PublicKey for Sm2PublicKey {
 //
 // `curve_alg` is total: every `CurveId` maps to a distinct `Algorithm`, so
 // `algorithm()` never mislabels a curve (a caller gating on "NIST curves only"
-// must be able to trust it). `ecdsa_alg` is the narrower capability gate: only
-// the four curves whose ECDSA/ECDH ops are wired up here return `Some`, so the
-// Brainpool curves and the SM2 curve carried as plain ECDSA are rejected up
-// front by `sign` / `verify` / `agree`.
+// must be able to trust it). `ecdsa_alg` is the narrower capability gate: it
+// returns `Some` for every curve the boxed ECDSA/ECDH ops support — the NIST
+// curves, secp256k1 and the three Brainpool curves, i.e. exactly the set
+// `x509::CertSigner` signs with and the signature registry verifies — and
+// `None` for the SM2 curve carried as plain ECDSA (SM2 keys go through
+// `Sm2PrivateKey`, whose signature scheme is not ECDSA), so `sign` / `verify`
+// / `agree` reject that one up front.
 // ----------------------------------------------------------------------------
 
 use super::boxed::{
@@ -432,10 +435,14 @@ fn curve_alg(curve: CurveId) -> Algorithm {
 /// The curves whose boxed ECDSA / ECDH operations are supported here.
 fn ecdsa_alg(curve: CurveId) -> Option<Algorithm> {
     match curve {
-        CurveId::P256 | CurveId::P384 | CurveId::P521 | CurveId::Secp256k1 => {
-            Some(curve_alg(curve))
-        }
-        _ => None,
+        CurveId::P256
+        | CurveId::P384
+        | CurveId::P521
+        | CurveId::Secp256k1
+        | CurveId::BrainpoolP256r1
+        | CurveId::BrainpoolP384r1
+        | CurveId::BrainpoolP512r1 => Some(curve_alg(curve)),
+        CurveId::Sm2p256v1 => None,
     }
 }
 
