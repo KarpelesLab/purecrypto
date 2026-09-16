@@ -49,8 +49,9 @@ Algorithms: `sha224`, `sha256`, `sha384`, `sha512`, `sha512-224`,
 `blake2b256`, `blake2b384`, `blake2b512`, `blake2s256`, `blake3`, `m14`,
 `sm3`, `whirlpool`, `streebog256`, `streebog512`, `ascon-hash256`, `sha1`,
 `md2`, `md4`, `md5`, `ripemd160`. Common spellings such as `sha-256` or
-`sha512/256` are accepted. The XOFs (`shake128`, `shake256`, BLAKE2X,
-cSHAKE, KMAC) are exposed through the Rust library, not the CLI.
+`sha512/256` are accepted. Of the XOFs only `ascon-xof128` and
+`ascon-cxof128` (`-len N [-custom HEX]`) are exposed by the CLI; `shake128`,
+`shake256`, BLAKE2X, cSHAKE and KMAC are available through the Rust library.
 
 ## `mac`
 
@@ -120,10 +121,10 @@ purecrypto genpkey -algorithm SLH-DSA-SHA2-128f       -out slh128f.pem   # all 1
 purecrypto genpkey -algorithm ML-KEM-768              -out mlkem768.pem  # 512, 768, 1024
 
 # Stateful hash-based signatures (SP 800-208)
-purecrypto genpkey -algorithm LMS-SHA256-H10-W4       -out lms.pem
-purecrypto genpkey -algorithm HSS-L2-SHA256-H10-W4    -out hss.pem
-purecrypto genpkey -algorithm XMSS-SHA2_10_256        -out xmss.pem
-purecrypto genpkey -algorithm XMSSMT-SHA2_20/2_256    -out xmssmt.pem
+purecrypto genpkey -algorithm LMS-SHA256-H10-W4       -out lms.key
+purecrypto genpkey -algorithm HSS-L2-SHA256-H10-W4    -out hss.key
+purecrypto genpkey -algorithm XMSS-SHA2_10_256        -out xmss.key
+purecrypto genpkey -algorithm XMSSMT-SHA2_20/2_256    -out xmssmt.key
 ```
 
 The full SLH-DSA matrix is `SLH-DSA-{SHA2,SHAKE}-{128,192,256}{s,f}`.
@@ -132,6 +133,9 @@ Output format:
 
 - RSA: `-----BEGIN RSA PRIVATE KEY-----` (PKCS#1)
 - EC / SM2: `-----BEGIN EC PRIVATE KEY-----` (SEC1)
+- LMS / HSS / XMSS / XMSS^MT: the raw binary state serialization (not
+  PEM — it carries the live one-time-key index and is rewritten by
+  `pkeyutl sign`; `pkey -in` does not read it)
 - Everything else: `-----BEGIN PRIVATE KEY-----` (PKCS#8, algorithm
   identified by the embedded OID)
 
@@ -191,9 +195,14 @@ cmp ss_a.bin ss_b.bin
 ## `kex`
 
 ```sh
-purecrypto kex -alg X25519      -key my.pem -peer their.pub.pem -out ss.bin
-purecrypto kex -alg ECDH-P256   -key my.pem -peer their.pub.pem -out ss.bin   # or P384, P521, X448
+purecrypto kex -alg X25519      -key my.x25519 -peer their.x25519.pub -out ss.bin   # or X448
+purecrypto kex -alg ECDH-P256   -key my.pem -peer their.pub.pem -out ss.bin       # or P384, P521
 ```
+
+`ECDH-*` takes a SEC1 private-key PEM and the peer's SPKI PEM. `X25519` /
+`X448` have no PEM plumbing in the CLI: `-key` is the raw 32- / 56-byte
+scalar (or its hex), `-peer` the raw public key (or hex) — e.g. `purecrypto
+rand 32 -binary -out my.x25519`.
 
 ## `req`
 
@@ -323,7 +332,8 @@ Behaviour worth knowing:
   all three TLS 1.3 suites; and Ed25519, Ed448, ECDSA and RSA peer
   signatures.
 - `s_server` is a one-shot test server: it accepts one connection, exchanges
-  data, and exits. It binds `127.0.0.1` unless you give an explicit address.
+  data, and exits. Over TCP `-accept` takes a port and always binds
+  `127.0.0.1`; the DTLS and QUIC servers accept `host:port` as well.
 - A TCP close without a TLS `close_notify` is reported as a possible
   truncation on stderr and the client exits non-zero.
 - `-key` must match `-cert`; a mismatch is refused before listening.
@@ -421,7 +431,7 @@ purecrypto genpkey -algorithm ED25519 -out ca.pem
 purecrypto x509 -new -ca -key ca.pem -subj "/CN=Local CA" -out ca.crt
 purecrypto genpkey -algorithm ED25519 -out server.pem
 purecrypto req -key server.pem -subj "/CN=127.0.0.1" \
-               -addext "subjectAltName=DNS:127.0.0.1" -out server.csr
+               -addext "subjectAltName=IP:127.0.0.1" -out server.csr
 purecrypto x509 -req -in server.csr -CA ca.crt -CAkey ca.pem \
                 -san 127.0.0.1 -out server.crt
 purecrypto genpkey -algorithm ED25519 -out client.pem
