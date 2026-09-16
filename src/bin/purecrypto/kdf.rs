@@ -189,6 +189,13 @@ fn run_pbkdf2(args: Args) {
         .value("-iter")
         .map(|s| parse_u32_flag(s, "-iter"))
         .unwrap_or_else(|| die("missing -iter N"));
+    // `pbkdf2::<D>` asserts on a zero iteration count rather than returning
+    // an error; screen it here so the CLI dies cleanly (and scrubs the
+    // password) instead of panicking.
+    if iter == 0 {
+        zero_buf(&mut pw);
+        die("-iter must be at least 1");
+    }
     if iter < work_factor::PBKDF2_MIN_ITER {
         eprintln!(
             "purecrypto: warning: -iter {iter} is below the recommended minimum of {} \

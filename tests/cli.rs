@@ -157,6 +157,30 @@ fn trailing_value_flag_without_value_is_an_error() {
     assert!(err.contains("missing value for --out"), "got: {err}");
 }
 
+/// `-iter 0` reached `pbkdf2::<D>`, whose `assert!` on a zero iteration
+/// count turned it into a panic (exit 101, password left unscrubbed).
+#[test]
+fn kdf_pbkdf2_zero_iterations_dies_cleanly() {
+    let (_o, err, ok) = run_capture(
+        &[
+            "kdf",
+            "pbkdf2",
+            "-password",
+            "x",
+            "-salt",
+            "00",
+            "-iter",
+            "0",
+            "-len",
+            "16",
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(err.contains("-iter must be at least 1"), "got: {err}");
+    assert!(!err.contains("panicked"), "got: {err}");
+}
+
 #[test]
 fn rand_emits_hex() {
     let (out, ok) = run(&["rand", "16"], b"");
