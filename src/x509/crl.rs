@@ -368,14 +368,12 @@ impl CertificateRevocationList {
         Ok(crl)
     }
 
-    /// Parses a PEM `X509 CRL` document (RFC 7468 label). Applies the same
-    /// `crlExtensions` validation as [`from_der`](Self::from_der).
+    /// Parses a PEM `X509 CRL` document (RFC 7468 label). The decoded body
+    /// goes through exactly the checks of [`from_der`](Self::from_der): a
+    /// single SEQUENCE with no trailing bytes, plus the `crlExtensions`
+    /// validation.
     pub fn from_pem(pem: &str) -> Result<Self, Error> {
-        let crl = CertificateRevocationList {
-            der: pem_decode(pem, PEM_LABEL)?,
-        };
-        crl.validate_extensions()?;
-        Ok(crl)
+        Self::from_der(pem_decode(pem, PEM_LABEL)?)
     }
 
     /// The DER encoding.
@@ -808,6 +806,24 @@ mod tests {
 
     fn issuer_dn() -> DistinguishedName {
         DistinguishedName::common_name("purecrypto CRL test")
+    }
+
+    /// `from_pem` must apply the same trailing-bytes check as `from_der`:
+    /// a PEM body carrying junk after the CertificateList SEQUENCE is
+    /// rejected, so `to_der()` of a parsed CRL is always exactly one DER
+    /// object regardless of which constructor produced it.
+    #[test]
+    fn from_pem_rejects_trailing_bytes() {
+        let key = rsa_a();
+        let crl = CrlBuilder::new(&issuer_dn(), Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .sign(&CertSigner::Rsa(&key))
+            .unwrap();
+        let mut der = crl.to_der().to_vec();
+        der.push(0x00);
+        assert!(CertificateRevocationList::from_der(der.clone()).is_err());
+        assert!(CertificateRevocationList::from_pem(&pem_encode(PEM_LABEL, &der)).is_err());
+        // The clean encoding still parses through PEM.
+        CertificateRevocationList::from_pem(&crl.to_pem()).unwrap();
     }
 
     #[test]

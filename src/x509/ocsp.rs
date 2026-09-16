@@ -293,11 +293,11 @@ impl OcspResponse {
         Ok(OcspResponse { der })
     }
 
-    /// Parses a PEM `OCSP RESPONSE` document.
+    /// Parses a PEM `OCSP RESPONSE` document. The decoded body goes through
+    /// the same structural check as [`from_der`](Self::from_der): a single
+    /// SEQUENCE with no trailing bytes.
     pub fn from_pem(pem: &str) -> Result<Self, Error> {
-        Ok(OcspResponse {
-            der: pem_decode(pem, PEM_LABEL)?,
-        })
+        Self::from_der(pem_decode(pem, PEM_LABEL)?)
     }
 
     /// The DER encoding.
@@ -1621,6 +1621,21 @@ mod tests {
         .expect("issue leaf");
 
         (issuer, leaf, issuer_key)
+    }
+
+    /// `from_pem` must apply the same trailing-bytes check as `from_der`.
+    #[test]
+    fn from_pem_rejects_trailing_bytes() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .sign(&CertSigner::Rsa(&issuer_key))
+            .unwrap();
+        let mut der = resp.to_der().to_vec();
+        der.push(0x00);
+        assert!(OcspResponse::from_der(der.clone()).is_err());
+        assert!(OcspResponse::from_pem(&pem_encode(PEM_LABEL, &der)).is_err());
+        OcspResponse::from_pem(&resp.to_pem()).unwrap();
     }
 
     #[test]

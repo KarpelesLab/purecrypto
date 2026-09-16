@@ -109,11 +109,11 @@ impl CertificationRequest {
         Ok(CertificationRequest { der })
     }
 
-    /// Parses a PEM `CERTIFICATE REQUEST` document.
+    /// Parses a PEM `CERTIFICATE REQUEST` document. The decoded body goes
+    /// through the same structural check as [`from_der`](Self::from_der): a
+    /// single SEQUENCE with no trailing bytes.
     pub fn from_pem(pem: &str) -> Result<Self, Error> {
-        Ok(CertificationRequest {
-            der: pem_decode(pem, PEM_LABEL)?,
-        })
+        Self::from_der(pem_decode(pem, PEM_LABEL)?)
     }
 
     /// The DER encoding.
@@ -296,6 +296,23 @@ mod tests {
         );
         assert!(matches!(csr.public_key().unwrap(), AnyPublicKey::Ecdsa(_)));
         csr.verify_self_signed().unwrap();
+    }
+
+    /// `from_pem` must apply the same trailing-bytes check as `from_der`.
+    #[test]
+    fn from_pem_rejects_trailing_bytes() {
+        let key = ec_signer_key();
+        let csr = CertificationRequest::create(
+            &CertSigner::Ecdsa(&key),
+            &DistinguishedName::common_name("x"),
+            &[],
+        )
+        .unwrap();
+        let mut der = csr.to_der().to_vec();
+        der.push(0x00);
+        assert!(CertificationRequest::from_der(der.clone()).is_err());
+        assert!(CertificationRequest::from_pem(&pem_encode(PEM_LABEL, &der)).is_err());
+        CertificationRequest::from_pem(&csr.to_pem()).unwrap();
     }
 
     #[test]
