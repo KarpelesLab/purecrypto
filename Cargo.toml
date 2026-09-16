@@ -111,6 +111,15 @@ tls-legacy = ["tls"]
 # Requires `std` for `std::sync::Mutex` used in the TLS-engine ⇄ QuicConnection
 # hook bridge (the trait `QuicHooks: Send` forbids `Rc<RefCell<…>>`).
 quic = ["tls", "std"]
+# INTERNAL — not part of the public API, no semver guarantee, may vanish at
+# any time. Enables `tls::fuzz`, a `#[doc(hidden)]` module of thin `pub fn`
+# wrappers around the crate-private TLS handshake / extension / record
+# decoders (EncryptedExtensions, Certificate, CertificateVerify,
+# CertificateRequest, NewSessionTicket, KeyUpdate, the TLS 1.2 flight, ECH)
+# so the `fuzz/` crate's `tls_handshake_messages` target can drive each one
+# directly, without a completed key exchange in front of it. Only `fuzz/`
+# should enable this.
+__fuzz = ["tls"]
 # hazmat: low-level arithmetic exposures with NO semver-stability guarantee;
 # the caller owns correctness and constant-time discipline. Off by default.
 # `edwards25519::hazmat` exposes the order-L `Scalar` and the `EdwardsPoint`

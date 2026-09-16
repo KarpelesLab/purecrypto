@@ -3288,7 +3288,7 @@ impl<R: RngCore> ServerConnection<R> {
 
 /// Parses a TLS 1.3 `Certificate` message body into a list of DER
 /// certificates (end-entity first). Mirrors the client-side helper.
-fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+pub(crate) fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let mut c = ReadCursor::new(body);
     // RFC 8446 §4.4.2: the context echoes the `CertificateRequest`'s, which
     // is always empty for handshake authentication (see

@@ -37,6 +37,9 @@ purecrypto = { path = "..", features = [
     "rsa", "dh", "der", "x509", "ec", "tls", "dtls", "quic",
     "mlkem", "mldsa", "slhdsa", "hpke", "ech", "cert-compression",
     "lms", "xmss", "tls-legacy", "pkcs12", "falcon",
+    # Internal: exposes the crate-private TLS decoders to
+    # `tls_handshake_messages`. Only this crate should ever enable it.
+    "__fuzz",
 ] }
 
 # Optimised debug info so libFuzzer's stack traces and `cargo fuzz fmt`
@@ -230,6 +233,20 @@ bench = false
 [[bin]]
 name = "tls_legacy_feed"
 path = "fuzz_targets/tls_legacy_feed.rs"
+test = false
+doc = false
+bench = false
+
+# --- Direct decoder target (via the hidden `__fuzz` feature). The feed
+# targets above never get a fuzzer past the key exchange, so the
+# encrypted-flight decoders (EncryptedExtensions, Certificate,
+# CertificateRequest, CertificateVerify, NewSessionTicket, KeyUpdate,
+# EndOfEarlyData), the TLS 1.2 flight, the ECH parsers and every
+# extension-body parser are fed raw here, selected by the first byte.
+
+[[bin]]
+name = "tls_handshake_messages"
+path = "fuzz_targets/tls_handshake_messages.rs"
 test = false
 doc = false
 bench = false

@@ -113,7 +113,7 @@ pub(crate) fn extensions_fit(extensions: &[RawExtension]) -> bool {
 /// would otherwise force ~10^8 comparisons per ClientHello).
 pub(crate) const MAX_EXTENSIONS: usize = 64;
 
-fn parse_extensions(bytes: &[u8]) -> Result<Vec<RawExtension>, Error> {
+pub(crate) fn parse_extensions(bytes: &[u8]) -> Result<Vec<RawExtension>, Error> {
     let mut c = ReadCursor::new(bytes);
     let mut out: Vec<RawExtension> = Vec::new();
     while !c.is_empty() {

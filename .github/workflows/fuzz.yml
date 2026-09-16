@@ -60,6 +60,7 @@ jobs:
           - quic_server_feed
           - quic_client_feed
           - tls_legacy_feed
+          - tls_handshake_messages
           - ech_config_list
           - ech_retry_configs
           - ech_extension

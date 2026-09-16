@@ -686,7 +686,7 @@ pub(super) fn check_raw_public_key(
 }
 
 /// Parses a 2-byte alert body.
-fn parse_alert(body: &[u8]) -> Result<Incoming, Error> {
+pub(crate) fn parse_alert(body: &[u8]) -> Result<Incoming, Error> {
     if body.len() != 2 {
         return Err(Error::Decode);
     }

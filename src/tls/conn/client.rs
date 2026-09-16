@@ -2236,7 +2236,7 @@ impl ClientConnection {
     /// previous `server_application_traffic_secret_N`. If the peer asked us
     /// to update too (`update_requested == 1`), emit our own `KeyUpdate`
     /// (`update_not_requested`) and step the write side as well.
-    fn handle_key_update(&mut self, body: &[u8]) -> Result<(), Error> {
+    pub(crate) fn handle_key_update(&mut self, body: &[u8]) -> Result<(), Error> {
         // RFC 9001 §6: QUIC carries no TLS `KeyUpdate` — key updates happen
         // in the QUIC layer via the Key Phase bit. A peer sending one over a
         // QUIC handshake stream is misbehaving; reject it with
@@ -3088,7 +3088,11 @@ impl ClientConnection {
         }
     }
 
-    fn on_encrypted_extensions(&mut self, msg_type: u8, raw: &[u8]) -> Result<(), Error> {
+    pub(crate) fn on_encrypted_extensions(
+        &mut self,
+        msg_type: u8,
+        raw: &[u8],
+    ) -> Result<(), Error> {
         if msg_type != hs_type::ENCRYPTED_EXTENSIONS {
             return Err(Error::UnexpectedMessage);
         }
@@ -3346,7 +3350,12 @@ impl ClientConnection {
         Ok(())
     }
 
-    fn on_certificate(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+    pub(crate) fn on_certificate(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
         // mTLS: the server's `CertificateRequest` may precede `Certificate`.
         if msg_type == hs_type::CERTIFICATE_REQUEST {
             // RFC 8446 §4.3.2: certificate_request_context is empty in
@@ -3488,7 +3497,7 @@ impl ClientConnection {
         Ok(())
     }
 
-    fn on_certificate_verify(
+    pub(crate) fn on_certificate_verify(
         &mut self,
         msg_type: u8,
         body: &[u8],
@@ -4266,7 +4275,7 @@ type CertificateEntry = (Vec<u8>, Vec<crate::tls::codec::RawExtension>);
 
 /// Parses a TLS 1.3 `Certificate` message body into the per-entry
 /// `(cert_der, extensions)` tuples (end-entity first).
-fn parse_certificate_list(body: &[u8]) -> Result<Vec<CertificateEntry>, Error> {
+pub(crate) fn parse_certificate_list(body: &[u8]) -> Result<Vec<CertificateEntry>, Error> {
     let mut c = ReadCursor::new(body);
     // RFC 8446 §4.4.2: `certificate_request_context` SHALL be zero length
     // when the Certificate authenticates the server.

@@ -31,6 +31,14 @@ pub(crate) use server::{ServerConfig, ServerKey};
 pub(crate) use server12::ServerConfig12;
 pub(crate) use server12::ServerConnection12;
 
+// Fuzz-only re-exports of crate-private decoders; see `tls::fuzz`.
+#[cfg(feature = "__fuzz")]
+pub(crate) use client::parse_certificate_list as parse_certificate_list_client;
+#[cfg(feature = "__fuzz")]
+pub(crate) use common::parse_alert;
+#[cfg(feature = "__fuzz")]
+pub(crate) use server::parse_certificate_list as parse_certificate_list_server;
+
 use crate::tls::codec::CipherSuite;
 use alloc::vec::Vec;
 

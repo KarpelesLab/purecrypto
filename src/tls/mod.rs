@@ -77,6 +77,12 @@ pub(crate) mod crypto;
 #[cfg(feature = "ech")]
 pub mod ech;
 mod error;
+/// Fuzz-only entry points for the crate-private decoders. Internal: enabled
+/// solely by the hidden `__fuzz` feature for the `fuzz/` crate, with no
+/// API-stability guarantee whatsoever.
+#[cfg(feature = "__fuzz")]
+#[doc(hidden)]
+pub mod fuzz;
 mod groups;
 pub(crate) mod keylog;
 #[cfg(feature = "mio")]
