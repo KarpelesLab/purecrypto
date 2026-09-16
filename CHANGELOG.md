@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7](https://github.com/KarpelesLab/purecrypto/compare/v0.8.6...v0.8.7) - 2026-09-16
+
+### Fixed
+
+- *(dtls)* bound the DTLS 1.2 hello session_id to 32 bytes
+- *(cli)* drive the DTLS retransmit timer from elapsed time, not the deadline
+- *(dtls)* keep growing handshake partials across our own retransmits
+- *(dtls)* re-issue a lost group HelloRetryRequest on the retransmitted ClientHello
+- *(quic)* arm the PTO on the earliest per-space deadline
+- *(quic)* keep the Initial packet number sequence across a Retry
+- *(quic)* close with AEAD_LIMIT_REACHED instead of going silent
+- *(quic)* send HANDSHAKE_DONE from the server and confirm the handshake on it
+- *(quic)* pad every Initial-bearing datagram to 1200 bytes, not just the first
+- *(quic)* scale the ACK Delay we send by our own ack_delay_exponent
+- *(quic)* skip an unreadable coalesced packet, not the rest of the datagram
+- *(quic)* never re-adopt a "first Initial" after Initial keys are discarded
+- *(dtls)* refuse to build a DTLS connection from a Config that asks for ECH
+- *(quic)* honour the tls::Config options the QUIC adapters dropped
+- *(key)* let the boxed EC facade sign, verify and agree on Brainpool curves
+- *(registry)* reject trailing junk in ML-DSA and SLH-DSA SPKIs
+- *(falcon)* return an error from the key facade instead of panicking
+- *(falcon)* bound compressed signatures by the reference maxsize, not sig_len
+- *(tls)* apply the BEAST 1/n-1 record split to SSL 3.0 as well
+- *(tls)* bound the SSL 3.0 CBC padding length by the block size
+- *(tls)* signal RFC 5077 resumption through the session_id echo
+- *(bignum)* make Uint repr(transparent) as its zeroize SAFETY argument assumes
+- *(mac)* reduce the UMAC L3 key words without a secret-dependent division
+- *(rng)* pad short wasm host entropy requests to the sentinel window
+- *(x509)* enforce the PKCS#8 and PKCS#10 version fields
+- *(pkcs12)* treat an absent PBES2 aes-ICVlen as the RFC 5084 default of 12
+- *(pkcs12)* accept both wire encodings of an empty password
+- *(x509)* make from_pem apply the same structural check as from_der
+- *(x509)* reject empty SIZE (1..MAX) extension bodies
+- *(x509)* cap the number of extensions per certificate
+- *(xmss)* reserve the leaf index before producing a signature
+- *(lms)* reserve the leaf index before producing a signature
+- *(sm2)* make the SEC1 / SPKI key parsers strict
+- *(rsa)* reject PKCS#1 RSAPrivateKey blobs whose version is not 0
+- *(kdf)* implement core::error::Error for HkdfError and KbkdfError under no_std
+- *(kdf)* treat an absent PBES2 aes-ICVlen as the RFC 5084 default of 12
+
+### Other
+
+- lint and document every opt-in feature on its own
+- pin the signature-algorithm plumbing end to end for every key type
+- match the x509, key and registry docs to what the code does
+- *(falcon)* compile the test modules under alloc without std
+- *(mldsa)* ACVP hedged external-interface sigGen vectors
+- *(mlkem)* ACVP key-check vectors and an OpenSSL implicit-rejection pin
+- *(falcon)* mutation smoke test over the whole verification surface
+- *(mldsa)* pin the external interface against OpenSSL signatures
+- *(zkp)* say which side accepts the degenerate whitelist case
+- *(hpke)* pin the DHKEM public-key validation paths
+- *(hpke)* pin the remaining RFC 9180 Appendix A vectors
+- *(bignum)* cover the LE byte codec, shr1, divrem and boxed add/sub_mod
+- *(hash)* add KMACXOF and long-message KMAC known-answer vectors
+- *(rng)* describe which Linux entropy source the default build uses
+- *(bignum)* state BoxedMontModulus::pow's actual loop bound
+- *(zeroize)* wipe Box<[Z]> through the slice impl
+- *(bignum)* keep inv_mod_boxed's Bézout coefficient at the modulus width
+- *(slhdsa)* add ACVP signing vectors for the 192/256 sets and hedged mode
+- *(ec)* pin more RFC 7748 / 8032 / 6979 vectors on untested paths
+- *(ec)* state the RFC 7748 all-zero check as MAY, RFC 8446 as MUST
+- *(dh)* state which protocols want the padded shared secret
+- *(signature_registry)* assert ids, OIDs, and TLS schemes are unique
+- *(der)* cover length-form, canonical-value, and OID-arc edge cases
+- *(rsa)* pin strict full-EM comparison in PKCS#1 v1.5 verification
+- *(cipher)* correct the AEZ and GCM hardware-acceleration notes
+- *(cipher)* add the McGrew–Viega AES-256-GCM test cases 15 and 16
+- *(cipher)* pin Poly1305's final reduction with the RFC 8439 A.3 edge cases
+
 ## [0.8.6](https://github.com/KarpelesLab/purecrypto/compare/v0.8.5...v0.8.6) - 2026-09-13
 
 ### Added
