@@ -841,6 +841,11 @@ pub struct ServerConnection<R: RngCore> {
     /// Surfaced via [`peer_server_name`](Self::peer_server_name) so the
     /// caller can route on the requested hostname.
     peer_server_name: Option<alloc::string::String>,
+    /// RFC 8449: the client sent `record_size_limit`. Gates our own echo in
+    /// EncryptedExtensions (RFC 8446 §4.2 forbids unsolicited responses)
+    /// and, once echoed, receive-side enforcement of the value we
+    /// advertised.
+    peer_offered_record_size_limit: bool,
     /// `true` if the handshake was a PSK resumption.
     psk_used: bool,
     /// Set once after the handshake completes to drive one-shot
@@ -1042,6 +1047,7 @@ impl<R: RngCore> ServerConnection<R> {
             exporter_secret: None,
             alpn_negotiated: None,
             peer_server_name: None,
+            peer_offered_record_size_limit: false,
             psk_used: false,
             pending_nst: false,
             rms: None,
@@ -1370,9 +1376,16 @@ impl<R: RngCore> ServerConnection<R> {
         self.core.check_write_error()
     }
 
-    /// Test hook: fast-forward the write-side record sequence counter so the
-    /// automatic-`KeyUpdate` threshold and the per-key cap can be exercised
-    /// without protecting 2²³ records first.
+    /// Test hook: emits one protected `application_data` record carrying all
+    /// of `data`, bypassing the peer-limit fragmentation of
+    /// `send_application_data`, to exercise the peer's RFC 8449 receive-side
+    /// enforcement.
+    #[cfg(test)]
+    pub(crate) fn emit_unfragmented_application_data_for_test(&mut self, data: &[u8]) {
+        self.core.emit_unfragmented_application_data_for_test(data);
+    }
+
+    /// Test hook: fast-forward the write-side record sequence counter.
     #[cfg(test)]
     pub(crate) fn set_write_seq_for_test(&mut self, seq: u64) {
         self.core.set_write_seq_for_test(seq);
@@ -2111,6 +2124,7 @@ impl<R: RngCore> ServerConnection<R> {
         if let Some(rsl_body) = ext::find(&ch.extensions, ExtensionType::RECORD_SIZE_LIMIT) {
             let limit = ext::parse_record_size_limit_server(rsl_body)?;
             self.core.set_peer_record_size_limit(limit);
+            self.peer_offered_record_size_limit = true;
         }
 
         // RFC 6066 §8: detect OCSP-stapling opt-in. We accept the body
@@ -2731,8 +2745,12 @@ impl<R: RngCore> ServerConnection<R> {
                     crate::tls::codec::put_u16(exts, ty.0);
                     crate::tls::codec::with_len_u16(exts, |b| b.extend_from_slice(&body));
                 }
-                // record_size_limit, when configured.
-                if let Some(limit) = self.config.record_size_limit {
+                // record_size_limit, when configured and offered by the
+                // client (RFC 8446 §4.2: never an unsolicited response).
+                if let (Some(limit), true) = (
+                    self.config.record_size_limit,
+                    self.peer_offered_record_size_limit,
+                ) {
                     let (ty, body) = ext::record_size_limit(limit);
                     crate::tls::codec::put_u16(exts, ty.0);
                     crate::tls::codec::with_len_u16(exts, |b| b.extend_from_slice(&body));
@@ -3067,6 +3085,13 @@ impl<R: RngCore> ServerConnection<R> {
         if !self.skip_record_keys() {
             let cats = self.client_app_secret.as_ref().expect("client app secret");
             self.core.set_read(suite.crypter(cats))?;
+            // RFC 8449 §4: the limit we echoed in EncryptedExtensions binds
+            // the client's records from the application-traffic keys onward.
+            if self.peer_offered_record_size_limit
+                && let Some(limit) = self.config.record_size_limit
+            {
+                self.core.set_inbound_record_size_limit(limit);
+            }
         }
         // RFC 8446 §5: ChangeCipherSpec is no longer permitted after this point.
         self.core.close_ccs_window();

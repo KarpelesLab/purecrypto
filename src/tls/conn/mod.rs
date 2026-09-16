@@ -1720,6 +1720,105 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), big);
     }
 
+    /// Drives a TLS 1.3 loopback where the client advertises
+    /// `record_size_limit = client_limit` and the server
+    /// `record_size_limit = server_limit`.
+    fn rsl_loopback(
+        client_limit: Option<u16>,
+        server_limit: Option<u16>,
+        tag: &[u8],
+    ) -> (ClientConnection, ServerConnection<HmacDrbg<Sha256>>) {
+        let (mut server_config, cert_der) = rsa_server();
+        if let Some(l) = server_limit {
+            server_config = server_config.with_record_size_limit(l);
+        }
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut client_config = ClientConfig::new(roots);
+        if let Some(l) = client_limit {
+            client_config = client_config.with_record_size_limit(l);
+        }
+        let mut crng = HmacDrbg::<Sha256>::new(tag, b"client", &[]);
+        let srng = HmacDrbg::<Sha256>::new(tag, b"server", &[]);
+        let mut client =
+            ClientConnection::new(client_config, "loopback.example", &mut crng).unwrap();
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        (client, server)
+    }
+
+    /// RFC 8449 §4: the client advertised `record_size_limit = 256`, so a
+    /// server record whose TLSInnerPlaintext (content + type byte) exceeds
+    /// 256 bytes MUST be rejected with `record_overflow`. 255 bytes of
+    /// content (+1 type byte = 256) is exactly at the limit and passes;
+    /// 300 bytes is refused.
+    #[test]
+    fn client_enforces_own_record_size_limit_on_receive() {
+        let (mut client, mut server) = rsl_loopback(Some(256), Some(256), b"rsl-rx-client");
+
+        let ok: alloc::vec::Vec<u8> = (0..255u16).map(|i| i as u8).collect();
+        server.emit_unfragmented_application_data_for_test(&ok);
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), ok);
+
+        let too_big = alloc::vec![0x5au8; 300];
+        server.emit_unfragmented_application_data_for_test(&too_big);
+        client.read_tls(&server.write_tls());
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::RecordOverflow), "{err:?}");
+        assert!(client.take_received_plaintext().is_empty());
+        // The abort goes on the wire as a (protected) alert record.
+        assert!(!client.write_tls().is_empty());
+    }
+
+    /// The mirror image: the server echoed `record_size_limit = 256`, so an
+    /// over-limit client record is a `record_overflow` at the server.
+    #[test]
+    fn server_enforces_own_record_size_limit_on_receive() {
+        let (mut client, mut server) = rsl_loopback(Some(256), Some(256), b"rsl-rx-server");
+
+        let ok = alloc::vec![0x11u8; 255];
+        client.emit_unfragmented_application_data_for_test(&ok);
+        server.read_tls(&client.write_tls());
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), ok);
+
+        let too_big = alloc::vec![0x22u8; 256];
+        client.emit_unfragmented_application_data_for_test(&too_big);
+        server.read_tls(&client.write_tls());
+        let err = server.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::RecordOverflow), "{err:?}");
+    }
+
+    /// Without the extension negotiated (the server never sent its own
+    /// value) nothing below the protocol maximum is refused — the client's
+    /// advertisement alone imposes no limit on what it accepts.
+    #[test]
+    fn record_size_limit_not_enforced_unless_negotiated() {
+        let (mut client, mut server) = rsl_loopback(Some(256), None, b"rsl-rx-unneg");
+        let big = alloc::vec![0x33u8; 4000];
+        server.emit_unfragmented_application_data_for_test(&big);
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), big);
+    }
+
     #[test]
     fn alpn_negotiates_h2() {
         let (server_config, cert_der) = rsa_server();
@@ -6701,6 +6800,110 @@ mod tls12_loopback_tests {
         s.read_tls(&out);
         s.process_new_packets().unwrap();
         assert_eq!(s.take_received_plaintext(), b"ems-ping");
+    }
+
+    /// Drives a TLS 1.2 loopback with `record_size_limit` advertised by the
+    /// client (`client_limit`) and configured on the server (`server_limit`).
+    fn rsl_loopback_12(
+        client_limit: Option<u16>,
+        server_limit: Option<u16>,
+        tag: &[u8],
+    ) -> (ClientConnection12, ServerConnection12<HmacDrbg<Sha256>>) {
+        let (mut server_config, cert_der) = rsa_server12();
+        if let Some(l) = server_limit {
+            server_config = server_config.with_record_size_limit(l);
+        }
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut cfg = ClientConfig12::new(roots);
+        if let Some(l) = client_limit {
+            cfg = cfg.with_record_size_limit(l);
+        }
+        let mut crng = HmacDrbg::<Sha256>::new(tag, b"client", &[]);
+        let srng = HmacDrbg::<Sha256>::new(tag, b"server", &[]);
+        let mut client = ClientConnection12::new(cfg, "loopback.example", &mut crng).unwrap();
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        (client, server)
+    }
+
+    /// RFC 8449 §4 on TLS 1.2: the limit is the plaintext fragment length.
+    /// With `record_size_limit = 256` negotiated, a 256-byte server record
+    /// passes and a 300-byte one is refused with `record_overflow`; the
+    /// server's own writes are fragmented to the client's limit.
+    #[test]
+    fn tls12_record_size_limit_enforced_on_receive_and_honoured_on_send() {
+        use crate::tls::codec::read_record;
+        let (mut client, mut server) = rsl_loopback_12(Some(256), Some(256), b"rsl12-rx");
+
+        let ok = alloc::vec![0x44u8; 256];
+        server
+            .emit_unfragmented_application_data_for_test(&ok)
+            .unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), ok);
+
+        // A regular write of 700 bytes is split into ⌈700/256⌉ = 3 records.
+        let payload = alloc::vec![0x55u8; 700];
+        server.send_application_data(&payload).unwrap();
+        let s = server.write_tls();
+        let (mut off, mut records) = (0, 0);
+        while let Some(rec) = read_record(&s[off..]).unwrap() {
+            records += 1;
+            off += rec.len;
+        }
+        assert_eq!(records, 3);
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), payload);
+
+        let too_big = alloc::vec![0x66u8; 300];
+        server
+            .emit_unfragmented_application_data_for_test(&too_big)
+            .unwrap();
+        client.read_tls(&server.write_tls());
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::RecordOverflow), "{err:?}");
+
+        // And the server enforces the limit it echoed on the client's records.
+        let (mut client, mut server) = rsl_loopback_12(Some(256), Some(256), b"rsl12-rx-s");
+        client
+            .emit_unfragmented_application_data_for_test(&too_big)
+            .unwrap();
+        server.read_tls(&client.write_tls());
+        let err = server.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::RecordOverflow), "{err:?}");
+    }
+
+    /// TLS 1.2: a server without a configured limit never echoes the
+    /// extension, so the client's advertisement imposes no receive-side
+    /// limit.
+    #[test]
+    fn tls12_record_size_limit_not_enforced_unless_negotiated() {
+        let (mut client, mut server) = rsl_loopback_12(Some(256), None, b"rsl12-unneg");
+        let big = alloc::vec![0x77u8; 4000];
+        server
+            .emit_unfragmented_application_data_for_test(&big)
+            .unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), big);
     }
 
     /// Legacy fallback: the server is pinned NOT to echo EMS. The client

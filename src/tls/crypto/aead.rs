@@ -107,6 +107,10 @@ const MAX_READ_SEQ: u64 = u64::MAX;
 /// process our `KeyUpdate` while we keep transmitting under the old key.
 pub(crate) const KEY_UPDATE_SOFT_LIMIT: u64 = MAX_RECORDS_PER_KEY - (1 << 16);
 
+/// Authentication-tag length of every TLS 1.3 AEAD this crate negotiates
+/// (AES-GCM and ChaCha20-Poly1305 both use 16-byte tags).
+pub(crate) const AEAD_TAG_LEN: usize = 16;
+
 /// One direction's record protection: an AEAD keyed from a traffic secret,
 /// plus the static IV and a record sequence counter.
 pub(crate) struct RecordCrypter {
@@ -193,7 +197,7 @@ impl RecordCrypter {
         if content.len() > (1usize << 14) {
             return Err(Error::RecordOverflow);
         }
-        let fragment_len = content.len() + 1 + 16; // inner + type byte + tag
+        let fragment_len = content.len() + 1 + AEAD_TAG_LEN; // inner + type byte + tag
         let mut header = [0u8; 5];
         header[0] = ContentType::ApplicationData.as_u8();
         header[1] = 0x03;
@@ -273,10 +277,10 @@ impl RecordCrypter {
         header: &[u8; 5],
         fragment: &[u8],
     ) -> Result<(ContentType, Vec<u8>), Error> {
-        if fragment.len() < 16 {
+        if fragment.len() < AEAD_TAG_LEN {
             return Err(Error::Decode);
         }
-        let (ct, tag_bytes) = fragment.split_at(fragment.len() - 16);
+        let (ct, tag_bytes) = fragment.split_at(fragment.len() - AEAD_TAG_LEN);
         let mut tag = [0u8; 16];
         tag.copy_from_slice(tag_bytes);
 

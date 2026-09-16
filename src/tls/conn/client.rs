@@ -711,6 +711,10 @@ pub struct ClientConnection {
     /// The ALPN protocol the server picked from our advertised list, if any.
     /// Populated from the server's `EncryptedExtensions`.
     alpn_negotiated: Option<Vec<u8>>,
+    /// RFC 8449: the server answered our `record_size_limit` in
+    /// EncryptedExtensions, so the value we advertised is enforced on the
+    /// records the server sends under the application-traffic keys.
+    record_size_limit_negotiated: bool,
 
     /// PSK we offered in CH (if `config.session` was set). When the server
     /// echoes `pre_shared_key` in SH with `selected_identity = 0`, we
@@ -1432,6 +1436,7 @@ impl ClientConnection {
             leaf_key: None,
             last_ticket: None,
             alpn_negotiated: None,
+            record_size_limit_negotiated: false,
             psk_offered: None,
             psk_accepted: false,
             handshake_start: system_now(),
@@ -1959,9 +1964,16 @@ impl ClientConnection {
         self.core.check_write_error()
     }
 
-    /// Test hook: fast-forward the write-side record sequence counter so the
-    /// automatic-`KeyUpdate` threshold and the per-key cap can be exercised
-    /// without protecting 2²³ records first.
+    /// Test hook: emits one protected `application_data` record carrying all
+    /// of `data`, bypassing the peer-limit fragmentation of
+    /// `send_application_data`, to exercise the peer's RFC 8449 receive-side
+    /// enforcement.
+    #[cfg(test)]
+    pub(crate) fn emit_unfragmented_application_data_for_test(&mut self, data: &[u8]) {
+        self.core.emit_unfragmented_application_data_for_test(data);
+    }
+
+    /// Test hook: fast-forward the write-side record sequence counter.
     #[cfg(test)]
     pub(crate) fn set_write_seq_for_test(&mut self, seq: u64) {
         self.core.set_write_seq_for_test(seq);
@@ -3144,6 +3156,7 @@ impl ClientConnection {
                 } else if ty == crate::tls::codec::ExtensionType::RECORD_SIZE_LIMIT.0 {
                     let limit = ext::parse_record_size_limit(ext_body)?;
                     self.core.set_peer_record_size_limit(limit);
+                    self.record_size_limit_negotiated = true;
                 } else if ty == crate::tls::codec::ExtensionType::EARLY_DATA.0 {
                     // In EE, early_data is empty and signals acceptance of
                     // the client's 0-RTT offer.
@@ -3746,6 +3759,13 @@ impl ClientConnection {
         if !self.skip_record_keys() {
             self.core.set_write(suite.crypter(&cats));
             self.core.set_read(suite.crypter(&sats))?;
+            // RFC 8449 §4: our advertised limit binds the server's records
+            // from the application-traffic keys onward.
+            if self.record_size_limit_negotiated
+                && let Some(limit) = self.config.record_size_limit
+            {
+                self.core.set_inbound_record_size_limit(limit);
+            }
         }
         // Retain both directions' app secrets so we can step them on KeyUpdate.
         self.client_app_secret = Some(cats);

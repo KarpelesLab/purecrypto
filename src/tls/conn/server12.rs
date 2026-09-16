@@ -450,6 +450,14 @@ pub struct ServerConnection12<R: RngCore> {
     /// Whether the peer sent a `record_size_limit` — drives whether we echo
     /// our own configured value.
     peer_offered_record_size_limit: bool,
+    /// The client's `record_size_limit` (RFC 8449), bounding the plaintext
+    /// fragment of every protected record we send it.
+    peer_record_size_limit: Option<u16>,
+    /// Our own `record_size_limit`, once negotiated (offered by the client
+    /// and echoed by us): enforced on every record the client sends under
+    /// the negotiated keys (RFC 8449 §4 — a larger record is a fatal
+    /// `record_overflow`).
+    inbound_record_size_limit: Option<u16>,
 
     /// 48-byte master secret derived once CKE is processed (or recovered
     /// from a valid ticket on resumed handshakes).
@@ -554,6 +562,8 @@ impl<R: RngCore> ServerConnection12<R> {
             peer_server_name: None,
             peer_offered_reneg_info: false,
             peer_offered_record_size_limit: false,
+            peer_record_size_limit: None,
+            inbound_record_size_limit: None,
             master: None,
             server_crypter: None,
             client_crypter: None,
@@ -714,8 +724,10 @@ impl<R: RngCore> ServerConnection12<R> {
         if self.state != State::Connected {
             return Err(Error::InappropriateState);
         }
-        // Fragment to at most 2^14 bytes per record (RFC 5246 §6.2.1).
-        const CAP: usize = 1 << 14;
+        // Fragment to at most 2^14 bytes per record (RFC 5246 §6.2.1), or
+        // to the client's `record_size_limit` when it sent one (RFC 8449 §4:
+        // in TLS 1.2 the limit is the plaintext fragment length itself).
+        let cap = super::client12::record_fragment_cap(self.peer_record_size_limit);
         // BEAST (TLS 1.0 CBC) mitigation: 1/n-1 record split of the first byte.
         // Applies to every chained-IV version — SSL 3.0 chains exactly like
         // TLS 1.0 — on the opt-in legacy path; TLS 1.1+ uses fresh explicit
@@ -727,19 +739,40 @@ impl<R: RngCore> ServerConnection12<R> {
         ) && data.len() > 1
         {
             self.emit_encrypted(ContentType::ApplicationData, &data[..1])?;
-            for chunk in data[1..].chunks(CAP) {
+            for chunk in data[1..].chunks(cap) {
                 self.emit_encrypted(ContentType::ApplicationData, chunk)?;
             }
             return Ok(());
         }
-        if data.len() <= CAP {
+        if data.len() <= cap {
             self.emit_encrypted(ContentType::ApplicationData, data)?;
         } else {
-            for chunk in data.chunks(CAP) {
+            for chunk in data.chunks(cap) {
                 self.emit_encrypted(ContentType::ApplicationData, chunk)?;
             }
         }
         Ok(())
+    }
+
+    /// Test hook: emits one protected `application_data` record carrying all
+    /// of `data`, bypassing the peer-limit fragmentation of
+    /// `send_application_data`, to exercise the peer's RFC 8449 receive-side
+    /// enforcement.
+    #[cfg(test)]
+    pub(crate) fn emit_unfragmented_application_data_for_test(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        self.emit_encrypted(ContentType::ApplicationData, data)
+    }
+
+    /// RFC 8449 §4: a protected record whose plaintext exceeds the
+    /// `record_size_limit` we echoed is a fatal `record_overflow`.
+    fn check_inbound_record_size_limit(&self, plaintext_len: usize) -> Result<(), Error> {
+        match self.inbound_record_size_limit {
+            Some(limit) if plaintext_len > usize::from(limit) => Err(Error::RecordOverflow),
+            _ => Ok(()),
+        }
     }
 
     /// Removes and returns any received application plaintext.
@@ -947,6 +980,7 @@ impl<R: RngCore> ServerConnection12<R> {
                 ContentType::Handshake => {
                     if let Some(c) = self.client_crypter.as_mut() {
                         let (_ct, plain) = c.decrypt(&header, &fragment)?;
+                        self.check_inbound_record_size_limit(plain.len())?;
                         if plain.is_empty() {
                             return Err(Error::UnexpectedMessage);
                         }
@@ -968,6 +1002,7 @@ impl<R: RngCore> ServerConnection12<R> {
                         .as_mut()
                         .ok_or(Error::UnexpectedMessage)?;
                     let (_ct, plain) = c.decrypt(&header, &fragment)?;
+                    self.check_inbound_record_size_limit(plain.len())?;
                     // Only buffer application data once the handshake has
                     // completed (the client's Finished has verified). Before
                     // that the peer — under mTLS, its certificate — is not
@@ -983,6 +1018,7 @@ impl<R: RngCore> ServerConnection12<R> {
                 ContentType::Alert => {
                     let payload: Vec<u8> = if let Some(c) = self.client_crypter.as_mut() {
                         let (_ct, plain) = c.decrypt(&header, &fragment)?;
+                        self.check_inbound_record_size_limit(plain.len())?;
                         plain
                     } else {
                         fragment
@@ -1165,14 +1201,18 @@ impl<R: RngCore> ServerConnection12<R> {
             }
         }
 
-        // record_size_limit echo (currently advisory on the write side).
-        // RFC 8449 §4: a server MUST NOT enforce the protocol maximum on the
-        // client's value (it may be enabled by an extension or version we
-        // do not understand), so it is clamped rather than rejected; only a
-        // value below 64 is `illegal_parameter`.
+        // record_size_limit (RFC 8449): the client's value bounds what we
+        // send; when we echo our own (configured) value it binds what the
+        // client sends under the keys this handshake establishes. §4: a
+        // server MUST NOT enforce the protocol maximum on the client's value
+        // (it may be enabled by an extension or version we do not
+        // understand), so it is clamped rather than rejected; only a value
+        // below 64 is `illegal_parameter`.
         if let Some(rsl_body) = ext::find(&ch.extensions, ExtensionType::RECORD_SIZE_LIMIT) {
-            let _limit = ext::parse_record_size_limit_server(rsl_body)?;
+            let limit = ext::parse_record_size_limit_server(rsl_body)?;
             self.peer_offered_record_size_limit = true;
+            self.peer_record_size_limit = Some(limit);
+            self.inbound_record_size_limit = self.config.record_size_limit;
         }
 
         // RFC 6066 §8: detect OCSP-stapling opt-in. We accept the body

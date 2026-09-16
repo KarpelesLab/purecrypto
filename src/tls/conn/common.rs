@@ -9,7 +9,7 @@
 //! messages and emitting handshake messages.
 
 use super::super::codec::{ParsedRecord, is_legal_record_version, read_record, write_record};
-use super::super::crypto::{RecordCrypter, Transcript};
+use super::super::crypto::{AEAD_TAG_LEN, RecordCrypter, Transcript};
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
 use alloc::vec::Vec;
 
@@ -71,6 +71,15 @@ pub(crate) struct ConnectionCore {
     /// plaintext fragment we may send them. `None` means "unbounded" (default
     /// TLS 1.3 cap of 2¹⁴).
     peer_record_size_limit: Option<u16>,
+    /// The `record_size_limit` (RFC 8449 §4) we advertised and the peer
+    /// acknowledged, once it is in force on the read side: the largest
+    /// `TLSInnerPlaintext` (content + type byte + padding) a protected
+    /// inbound record may carry. The engines arm it when they install the
+    /// application-traffic read key — the limit only governs records
+    /// protected under keys derived from the handshake that negotiated it —
+    /// and it survives `KeyUpdate` rotations. `None` means the extension
+    /// was not negotiated (the protocol's own 2¹⁴ cap still applies).
+    inbound_record_size_limit: Option<u16>,
     /// Gates buffering of decrypted inner `ApplicationData` into `app_in`.
     /// Set by the state machines when the handshake completes. Before that
     /// the peer is not authenticated (under mTLS it may not have sent
@@ -107,6 +116,7 @@ impl ConnectionCore {
             sent_close_notify: false,
             ccs_window_open: true,
             peer_record_size_limit: None,
+            inbound_record_size_limit: None,
             app_data_allowed: false,
             write_error: None,
             skip_early_data: None,
@@ -169,6 +179,16 @@ impl ConnectionCore {
     /// `limit - 1` plaintext bytes (the extra byte is the inner content type).
     pub(crate) fn set_peer_record_size_limit(&mut self, limit: u16) {
         self.peer_record_size_limit = Some(limit);
+    }
+
+    /// Arms enforcement of our own advertised `record_size_limit` (RFC 8449
+    /// §4) on inbound protected records: from now on a record whose
+    /// `TLSInnerPlaintext` exceeds `limit` bytes fails with
+    /// [`Error::RecordOverflow`] (the engines answer with a
+    /// `record_overflow` alert). Call it when installing the first read key
+    /// derived from the handshake that negotiated the extension.
+    pub(crate) fn set_inbound_record_size_limit(&mut self, limit: u16) {
+        self.inbound_record_size_limit = Some(limit);
     }
 
     /// Called by the role-specific state machine when the handshake completes.
@@ -350,6 +370,15 @@ impl ConnectionCore {
         }
     }
 
+    /// Test hook: emits `data` as a single protected `application_data`
+    /// record without the `record_size_limit` fragmentation of
+    /// [`Self::send_application_data`], to exercise the peer's receive-side
+    /// enforcement.
+    #[cfg(test)]
+    pub(crate) fn emit_unfragmented_application_data_for_test(&mut self, data: &[u8]) {
+        self.emit_record(ContentType::ApplicationData, data);
+    }
+
     /// Sends a fatal alert.
     pub(crate) fn send_alert(&mut self, description: AlertDescription) {
         let body = [2, description.as_u8()]; // level = fatal
@@ -441,6 +470,17 @@ impl ConnectionCore {
                             // §4.2.10 skip window: we have reached the
                             // client's real flight under the handshake key.
                             self.skip_early_data = None;
+                            // RFC 8449 §4: the negotiated limit counts the
+                            // whole TLSInnerPlaintext — content, the type
+                            // byte and any padding — i.e. the ciphertext
+                            // minus the AEAD tag. Receipt of a larger record
+                            // "MUST be treated as a fatal error" with
+                            // `record_overflow`.
+                            if let Some(limit) = self.inbound_record_size_limit
+                                && fragment.len().saturating_sub(AEAD_TAG_LEN) > usize::from(limit)
+                            {
+                                return Err(Error::RecordOverflow);
+                            }
                             if let Some(msg) = self.dispatch_inner(inner_ct, content)? {
                                 return Ok(Some(msg));
                             }
