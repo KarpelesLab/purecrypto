@@ -1104,16 +1104,11 @@ fn read_iterations(r: &mut Reader<'_>) -> Result<u32, Error> {
     Ok(acc)
 }
 
-/// Constant-time slice equality (length-aware).
+/// Constant-time slice equality (length-aware): the (public) length check
+/// first, then the crate's barriered `ct_eq` over every byte.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use crate::ct::ConstantTimeEq;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 #[cfg(test)]

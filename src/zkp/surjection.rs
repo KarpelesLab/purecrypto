@@ -381,6 +381,14 @@ impl SurjectionProof {
     /// always made: `0` and `1` behave identically, again matching the
     /// reference.
     ///
+    /// # Side channels
+    /// Within an attempt the scan for the matching input is masked over
+    /// every position. The *number* of attempts is observable, though (the
+    /// reference returns it outright): an observer who also knows `seed`
+    /// can replay the rejected subsets and rule their members out as the
+    /// matching input. Keep `seed` secret, or accept that the attempt count
+    /// leaks which inputs the first subsets did not contain.
+    ///
     /// # Errors
     /// [`Error::InvalidInput`] if `input_tags` is empty or longer than
     /// [`MAX_N_INPUTS`], if `n_used` is zero, greater than

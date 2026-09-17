@@ -103,11 +103,10 @@ pub fn hello_retry_request_signal(
 /// avoids a sequence-of-bytes timing side channel against an
 /// adversary that can repeatedly stuff CHs.
 pub fn signals_eq_ct(a: &[u8; 8], b: &[u8; 8]) -> bool {
-    let mut acc = 0u8;
-    for i in 0..8 {
-        acc |= a[i] ^ b[i];
-    }
-    acc == 0
+    // The crate's `ct_eq` carries the `black_box` barrier a hand-rolled
+    // OR-fold lacks.
+    use crate::ct::ConstantTimeEq;
+    bool::from(a.ct_eq(b))
 }
 
 /// Helper: rebuild a wire `ServerHello.random` with the last 8 bytes
