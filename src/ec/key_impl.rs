@@ -403,7 +403,8 @@ impl PublicKey for Sm2PublicKey {
 // `algorithm()` never mislabels a curve (a caller gating on "NIST curves only"
 // must be able to trust it). `ecdsa_alg` is the narrower capability gate: it
 // returns `Some` for every curve the boxed ECDSA/ECDH ops support — the NIST
-// curves, secp256k1 and the three Brainpool curves, i.e. exactly the set
+// curves (P-192 through P-521), the SEC 2 secp160/192/224 k1/r1/r2 curves,
+// secp256k1 and the Brainpool curves, i.e. exactly the set
 // `x509::CertSigner` signs with and the signature registry verifies — and
 // `None` for the SM2 curve carried as plain ECDSA (SM2 keys go through
 // `Sm2PrivateKey`, whose signature scheme is not ECDSA), so `sign` / `verify`
@@ -429,6 +430,15 @@ fn curve_alg(curve: CurveId) -> Algorithm {
         CurveId::BrainpoolP256r1 => Algorithm::BrainpoolP256r1,
         CurveId::BrainpoolP384r1 => Algorithm::BrainpoolP384r1,
         CurveId::BrainpoolP512r1 => Algorithm::BrainpoolP512r1,
+        CurveId::Secp160k1 => Algorithm::Secp160k1,
+        CurveId::Secp160r1 => Algorithm::Secp160r1,
+        CurveId::Secp160r2 => Algorithm::Secp160r2,
+        CurveId::Secp192k1 => Algorithm::Secp192k1,
+        CurveId::P192 => Algorithm::P192,
+        CurveId::Secp224k1 => Algorithm::Secp224k1,
+        CurveId::P224 => Algorithm::P224,
+        CurveId::BrainpoolP224r1 => Algorithm::BrainpoolP224r1,
+        CurveId::BrainpoolP320r1 => Algorithm::BrainpoolP320r1,
     }
 }
 
@@ -441,7 +451,16 @@ fn ecdsa_alg(curve: CurveId) -> Option<Algorithm> {
         | CurveId::Secp256k1
         | CurveId::BrainpoolP256r1
         | CurveId::BrainpoolP384r1
-        | CurveId::BrainpoolP512r1 => Some(curve_alg(curve)),
+        | CurveId::BrainpoolP512r1
+        | CurveId::Secp160k1
+        | CurveId::Secp160r1
+        | CurveId::Secp160r2
+        | CurveId::Secp192k1
+        | CurveId::P192
+        | CurveId::Secp224k1
+        | CurveId::P224
+        | CurveId::BrainpoolP224r1
+        | CurveId::BrainpoolP320r1 => Some(curve_alg(curve)),
         CurveId::Sm2p256v1 => None,
     }
 }
@@ -498,14 +517,16 @@ impl PublicKey for BoxedEcdsaPublicKey {
         p.finish()?;
         let signature = match enc {
             // No `from_bytes` on BoxedEcdsaSignature: split raw `r||s` halves of
-            // `field_len()` -> BoxedUint -> from_components.
+            // `order_len()` -> BoxedUint -> from_components. The halves are
+            // scalar-width, which is what `to_bytes` emits; on secp160k1/r1/r2
+            // and secp224k1 that is one byte more than a coordinate.
             SigEncoding::Raw => {
-                let flen = curve.field_len();
-                if sig.len() != 2 * flen {
+                let olen = curve.order_len();
+                if sig.len() != 2 * olen {
                     return Err(Error::Signature);
                 }
-                let r = BoxedUint::from_be_bytes(&sig[..flen]);
-                let s = BoxedUint::from_be_bytes(&sig[flen..]);
+                let r = BoxedUint::from_be_bytes(&sig[..olen]);
+                let s = BoxedUint::from_be_bytes(&sig[olen..]);
                 BoxedEcdsaSignature::from_components(r, s)
             }
             SigEncoding::Der => BoxedEcdsaSignature::from_der(sig).map_err(|_| Error::Signature)?,

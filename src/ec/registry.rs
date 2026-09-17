@@ -44,23 +44,11 @@ fn parse_ecdsa_spki(spki: &[u8]) -> Result<(CurveId, BoxedEcdsaPublicKey), Error
         return Err(Error::UnsupportedAlgorithm);
     }
     let curve_arcs = parse_oid(algid.read_oid()?)?;
-    let curve = if curve_arcs.as_slice() == oid::PRIME256V1 {
-        CurveId::P256
-    } else if curve_arcs.as_slice() == oid::SECP384R1 {
-        CurveId::P384
-    } else if curve_arcs.as_slice() == oid::SECP521R1 {
-        CurveId::P521
-    } else if curve_arcs.as_slice() == oid::SECP256K1 {
-        CurveId::Secp256k1
-    } else if curve_arcs.as_slice() == oid::BRAINPOOL_P256R1 {
-        CurveId::BrainpoolP256r1
-    } else if curve_arcs.as_slice() == oid::BRAINPOOL_P384R1 {
-        CurveId::BrainpoolP384r1
-    } else if curve_arcs.as_slice() == oid::BRAINPOOL_P512R1 {
-        CurveId::BrainpoolP512r1
-    } else {
-        return Err(Error::UnsupportedAlgorithm);
-    };
+    // Every named curve the boxed ECDSA verifier supports, except SM2: an
+    // `sm2p256v1` key signs SM2 (its own scheme, `Sm2WithSm3`), not ECDSA.
+    let curve = CurveId::from_named_curve_oid(&curve_arcs)
+        .filter(|c| *c != CurveId::Sm2p256v1)
+        .ok_or(Error::UnsupportedAlgorithm)?;
     // RFC 5480 §2.1.1: nothing may follow the namedCurve OID; and nothing
     // may follow the subjectPublicKey BIT STRING (mirrors
     // `x509::pubkey::from_spki_der`).

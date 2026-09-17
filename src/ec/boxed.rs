@@ -938,6 +938,17 @@ impl BoxedEcdsaPrivateKey {
     }
 }
 
+/// The same scalar on the same curve, for key agreement. The ECDSA key is
+/// dropped (and wiped) after its scalar is copied.
+impl From<BoxedEcdsaPrivateKey> for BoxedEcdhPrivateKey {
+    fn from(key: BoxedEcdsaPrivateKey) -> Self {
+        BoxedEcdhPrivateKey {
+            curve: key.curve,
+            d: key.d.clone(),
+        }
+    }
+}
+
 impl BoxedEcdhPrivateKey {
     /// Generates a new ECDH private key on `curve` from `rng`.
     ///
@@ -963,6 +974,24 @@ impl BoxedEcdhPrivateKey {
         } else {
             Err(Error::InvalidInput)
         }
+    }
+
+    /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` carrying an
+    /// `id-ecPublicKey` key — the same document
+    /// [`BoxedEcdsaPrivateKey::from_pkcs8_der`] reads. An EC private key is
+    /// a scalar on a named curve, usable for ECDH as much as for ECDSA; this
+    /// is how a PKCS#8 / PEM key is loaded for key agreement.
+    #[cfg(feature = "der")]
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
+        BoxedEcdsaPrivateKey::from_pkcs8_der(der).map(Self::from)
+    }
+
+    /// Parses an unencrypted PKCS#8 PEM private key
+    /// (`-----BEGIN PRIVATE KEY-----`) for ECDH. See
+    /// [`from_pkcs8_der`](Self::from_pkcs8_der).
+    #[cfg(feature = "der")]
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
+        BoxedEcdsaPrivateKey::from_pkcs8_pem(pem).map(Self::from)
     }
 
     /// The curve this key lives on.
@@ -1219,6 +1248,328 @@ mod tests {
         ))
         .unwrap();
         pk.verify::<Sha512>(&msg, &sig).unwrap();
+    }
+
+    /// The SEC 2 / FIPS 186-4 / RFC 5639 small curves: every curve signs and
+    /// verifies with each of SHA-224/256/384/512 (digests both narrower and
+    /// wider than the order), a tampered message fails, the raw `r ‖ s`
+    /// encoding is `2·order_len` bytes (one byte per half more than the
+    /// coordinates on the 161/225-bit-order curves), and the DER form
+    /// round-trips through the curve-bounded parser. Compressed SEC1 keys
+    /// decode to the same point — this is what exercises Tonelli–Shanks on
+    /// P-224 (`p ≡ 1 mod 4`) and secp224k1 (`p ≡ 5 mod 8`).
+    #[test]
+    fn small_curves_sign_verify_roundtrip() {
+        use crate::hash::Sha224;
+        let mut rng = HmacDrbg::<Sha256>::new(b"small-curves", b"nonce", &[]);
+        for curve in [
+            CurveId::Secp160k1,
+            CurveId::Secp160r1,
+            CurveId::Secp160r2,
+            CurveId::Secp192k1,
+            CurveId::P192,
+            CurveId::Secp224k1,
+            CurveId::P224,
+            CurveId::BrainpoolP224r1,
+            CurveId::BrainpoolP320r1,
+        ] {
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            let pk = sk.public_key();
+            let msg = b"hello small curve";
+            let sigs = [
+                sk.sign::<Sha224>(msg).unwrap(),
+                sk.sign::<Sha256>(msg).unwrap(),
+                sk.sign::<Sha384>(msg).unwrap(),
+                sk.sign::<Sha512>(msg).unwrap(),
+            ];
+            pk.verify::<Sha224>(msg, &sigs[0]).unwrap();
+            pk.verify::<Sha256>(msg, &sigs[1]).unwrap();
+            pk.verify::<Sha384>(msg, &sigs[2]).unwrap();
+            pk.verify::<Sha512>(msg, &sigs[3]).unwrap();
+            assert!(
+                pk.verify::<Sha256>(b"tampered", &sigs[1]).is_err(),
+                "{curve:?}"
+            );
+            assert!(
+                pk.verify::<Sha384>(msg, &sigs[1]).is_err(),
+                "{curve:?} hash"
+            );
+            for sig in &sigs {
+                assert_eq!(
+                    sig.to_bytes(curve).len(),
+                    2 * curve.order_len(),
+                    "{curve:?}"
+                );
+                #[cfg(feature = "der")]
+                {
+                    let der = sig.to_der(curve);
+                    let back = BoxedEcdsaSignature::from_der_for_curve(&der, curve).unwrap();
+                    assert_eq!(&back, sig, "{curve:?} DER round-trip");
+                }
+            }
+
+            // Uncompressed and compressed SEC1 round-trips.
+            let sec1 = pk.to_sec1();
+            assert_eq!(sec1.len(), 1 + 2 * curve.field_len());
+            assert_eq!(
+                BoxedEcdsaPublicKey::from_sec1(curve, &sec1)
+                    .unwrap()
+                    .to_sec1(),
+                sec1
+            );
+            let flen = curve.field_len();
+            let mut compressed = alloc::vec![0x02 | (sec1[2 * flen] & 1)];
+            compressed.extend_from_slice(&sec1[1..1 + flen]);
+            assert_eq!(
+                BoxedEcdsaPublicKey::from_sec1(curve, &compressed)
+                    .unwrap()
+                    .to_sec1(),
+                sec1,
+                "{curve:?} compressed"
+            );
+            // The other parity is the negated point (x, p − y).
+            compressed[0] ^= 1;
+            let other = BoxedEcdsaPublicKey::from_sec1(curve, &compressed).unwrap();
+            assert_ne!(other.to_sec1(), sec1);
+            assert_eq!(other.add(&pk).map(|_| ()), Err(Error::InvalidInput));
+
+            // ECDH agrees both ways and is field-width.
+            let a = BoxedEcdhPrivateKey::generate(curve, &mut rng);
+            let b = BoxedEcdhPrivateKey::generate(curve, &mut rng);
+            let ab = a.diffie_hellman(&b.public_key()).unwrap();
+            assert_eq!(ab, b.diffie_hellman(&a.public_key()).unwrap());
+            assert_eq!(ab.len(), curve.field_len());
+        }
+    }
+
+    /// On the curves whose order is a bit wider than the field, a private
+    /// scalar with the 161st / 225th bit set is in range and signs, while
+    /// `n` itself and `0` are refused; the SEC1 private-key encoding is
+    /// `order_len` bytes.
+    #[test]
+    fn order_wider_than_field_private_key_range() {
+        for curve in [
+            CurveId::Secp160k1,
+            CurveId::Secp160r1,
+            CurveId::Secp160r2,
+            CurveId::Secp224k1,
+        ] {
+            let n = curve.curve().order().clone();
+            let olen = curve.order_len();
+            assert_eq!(n.bit_len(), 8 * curve.field_len() + 1);
+            // 2^(8·field_len): one more than any field element fits.
+            let mut big = vec![0u8; olen];
+            big[0] = 0x01;
+            let sk = BoxedEcdsaPrivateKey::from_bytes(curve, &big).unwrap();
+            let sig = sk.sign::<Sha256>(b"wide scalar").unwrap();
+            sk.public_key()
+                .verify::<Sha256>(b"wide scalar", &sig)
+                .unwrap();
+            // n − 1 is the largest valid scalar; n and 0 are not.
+            let n_minus_1 = n.sub(&BoxedUint::from_u64(1)).to_be_bytes(olen);
+            BoxedEcdsaPrivateKey::from_bytes(curve, &n_minus_1).unwrap();
+            assert!(BoxedEcdsaPrivateKey::from_bytes(curve, &n.to_be_bytes(olen)).is_err());
+            assert!(BoxedEcdhPrivateKey::from_bytes(curve, &[0u8; 21]).is_err());
+            #[cfg(feature = "der")]
+            {
+                let parsed = BoxedEcdsaPrivateKey::from_sec1_der(&sk.to_sec1_der()).unwrap();
+                assert_eq!(parsed.public_key().to_sec1(), sk.public_key().to_sec1());
+                let parsed = BoxedEcdsaPrivateKey::from_pkcs8_der(&sk.to_pkcs8_der()).unwrap();
+                assert_eq!(parsed.curve(), curve);
+            }
+        }
+    }
+
+    /// RFC 6979 A.2.3 (P-192) and A.2.4 (P-224): deterministic signatures
+    /// over "sample" with SHA-1/224/256/384/512, plus the P-192 "test"
+    /// vector with SHA-256. These pin the nonce derivation with an
+    /// `order_len`-byte octet string and the truncation of a digest wider
+    /// than the order (SHA-384/512 on a 192/224-bit `n`).
+    #[test]
+    fn rfc6979_p192_p224_vectors() {
+        use crate::hash::{Sha1, Sha224};
+        let p192 = BoxedEcdsaPrivateKey::from_bytes(
+            CurveId::P192,
+            &from_hex("6fab034934e4c0fc9ae67f5b5659a9d7d1fefd187ee09fd4"),
+        )
+        .unwrap();
+        assert_eq!(
+            p192.public_key().to_sec1(),
+            from_hex(
+                "04ac2c77f529f91689fea0ea5efec7f210d8eea0b9e047ed56\
+                 3bc723e57670bd4887ebc732c523063d0a7c957bc97c1c43"
+            )
+        );
+        let p224 = BoxedEcdsaPrivateKey::from_bytes(
+            CurveId::P224,
+            &from_hex("f220266e1105bfe3083e03ec7a3a654651f45e37167e88600bf257c1"),
+        )
+        .unwrap();
+        assert_eq!(
+            p224.public_key().to_sec1(),
+            from_hex(
+                "0400cf08da5ad719e42707fa431292dea11244d64fc51610d94b130d6c\
+                 eeab6f3debe455e3dbf85416f7030cbd94f34f2d6f232c69f3c1385a"
+            )
+        );
+        // (curve key, message, r ‖ s, hash tag)
+        let check = |sk: &BoxedEcdsaPrivateKey, sig: BoxedEcdsaSignature, rs: &str| {
+            let curve = sk.curve();
+            assert_eq!(sig.to_bytes(curve), from_hex(rs), "{curve:?} {rs}");
+        };
+        // P-192, "sample".
+        check(
+            &p192,
+            p192.sign::<Sha1>(b"sample").unwrap(),
+            "98c6bd12b23eaf5e2a2045132086be3eb8ebd62abf6698ff\
+             57a22b07dea9530f8de9471b1dc6624472e8e2844bc25b64",
+        );
+        check(
+            &p192,
+            p192.sign::<Sha224>(b"sample").unwrap(),
+            "a1f00dad97aeec91c95585f36200c65f3c01812aa60378f5\
+             e07ec1304c7c6c9debbe980b9692668f81d4de7922a0f97a",
+        );
+        check(
+            &p192,
+            p192.sign::<Sha256>(b"sample").unwrap(),
+            "4b0b8ce98a92866a2820e20aa6b75b56382e0f9bfd5ecb55\
+             ccdb006926ea9565cbadc840829d8c384e06de1f1e381b85",
+        );
+        check(
+            &p192,
+            p192.sign::<Sha384>(b"sample").unwrap(),
+            "da63bf0b9abcf948fbb1e9167f136145f7a20426dcc287d5\
+             c3aa2c960972bd7a2003a57e1c4c77f0578f8ae95e31ec5e",
+        );
+        check(
+            &p192,
+            p192.sign::<Sha512>(b"sample").unwrap(),
+            "4d60c5ab1996bd848343b31c00850205e2ea6922dac2e4b8\
+             3f6e837448f027a1bf4b34e796e32a811cbb4050908d8f67",
+        );
+        // P-192, "test".
+        check(
+            &p192,
+            p192.sign::<Sha256>(b"test").unwrap(),
+            "3a718bd8b4926c3b52ee6bbe67ef79b18cb6eb62b1ad97ae\
+             5662e6848a4a19b1f1ae2f72acd4b8bbe50f1eac65d9124f",
+        );
+        // P-224, "sample".
+        check(
+            &p224,
+            p224.sign::<Sha1>(b"sample").unwrap(),
+            "22226f9d40a96e19c4a301ce5b74b115303c0f3a4fd30fc257fb57ac\
+             66d1cdd83e3af75605dd6e2feff196d30aa7ed7a2edf7af475403d69",
+        );
+        check(
+            &p224,
+            p224.sign::<Sha224>(b"sample").unwrap(),
+            "1cdfe6662dde1e4a1ec4cdedf6a1f5a2fb7fbd9145c12113e6abfd3e\
+             a6694fd7718a21053f225d3f46197ca699d45006c06f871808f43ebc",
+        );
+        check(
+            &p224,
+            p224.sign::<Sha256>(b"sample").unwrap(),
+            "61aa3da010e8e8406c656bc477a7a7189895e7e840cdfe8ff42307ba\
+             bc814050dab5d23770879494f9e0a680dc1af7161991bde692b10101",
+        );
+        check(
+            &p224,
+            p224.sign::<Sha384>(b"sample").unwrap(),
+            "0b115e5e36f0f9ec81f1325a5952878d745e19d7bb3eabfaba77e953\
+             830f34ccdfe826ccfdc81eb4129772e20e122348a2bbd889a1b1af1d",
+        );
+        check(
+            &p224,
+            p224.sign::<Sha512>(b"sample").unwrap(),
+            "074bd1d979d5f32bf958ddc61e4fb4872adcafeb2256497cdac30397\
+             a4ceca196c3d5a1ff31027b33185dc8ee43f288b21ab342e5d8eb084",
+        );
+        // And they verify.
+        let sig = p224.sign::<Sha256>(b"sample").unwrap();
+        p224.public_key().verify::<Sha256>(b"sample", &sig).unwrap();
+        let sig = p192.sign::<Sha512>(b"sample").unwrap();
+        p192.public_key().verify::<Sha512>(b"sample", &sig).unwrap();
+    }
+
+    /// One published verify KAT per new curve, from Wycheproof
+    /// (`ecdsa_<curve>_<sha>_test.json`, testvectors_v1, tcId 2: msg "Msg",
+    /// result valid). RFC 6979 has no vectors for the secp160/192k1/224k1
+    /// or the 224/320-bit Brainpool curves, so an external verify pin is
+    /// the strongest available; on the 161/225-bit-order curves it also
+    /// pins the 21/29-byte DER INTEGER widths.
+    #[cfg(feature = "der")]
+    #[test]
+    fn small_curves_wycheproof_kat() {
+        use crate::hash::Sha224;
+        type Verify = fn(&BoxedEcdsaPublicKey, &[u8], &BoxedEcdsaSignature) -> Result<(), Error>;
+        let msg = from_hex("4d7367");
+        let cases: [(CurveId, &str, &str, Verify); 9] = [
+            (
+                CurveId::Secp160k1,
+                "048c8b7f800bc9c5588b4970e7559eca926fa38e7b6c5d8223426e1cf8d2a2791ab710a14305048ad3",
+                "302d021469b9f46ded69a35ac00a053ef9dbb47d073d6729021500d059cb77081101578272ca48bf5980c5019febd5",
+                |pk, m, s| pk.verify::<Sha256>(m, s),
+            ),
+            (
+                CurveId::Secp160r1,
+                "04b0046a56f874d30ea2ba7ac1a935fd9d754ee6417b9a54d275806819ec30b15618f5625115241f46",
+                "302d02140f5720c6bd95624b603b2be5a75e487b34268d5f021500bfd6d370b516687113b12a4fc95eebb874a646fa",
+                |pk, m, s| pk.verify::<Sha256>(m, s),
+            ),
+            (
+                CurveId::Secp160r2,
+                "0446f1a7493b131f3c6032e9612b8e1bd3d1a3104ce3cef3c8020c277ba45bc93a9a364f07eba8302c",
+                "302c02146d8624bff7719b53dab811bdc0e434a5e9f02e8d02140b50e6dce0f5c1a757290eed8df0aa8092b2ff90",
+                |pk, m, s| pk.verify::<Sha256>(m, s),
+            ),
+            (
+                CurveId::Secp192k1,
+                "0404a4e7bedc7d8137aade86c1a4d223ad704e63dad4717c493efc196def1cad9823c91f6b8be2611164b93cca4bb2c559",
+                "30350218546e7cfe5f660f10a02cefdcb4bb4e0cc7a9fd43cc9e443f02190086d3a935dd62d5db7101e128f3f6048c490072a49a5ef047",
+                |pk, m, s| pk.verify::<Sha256>(m, s),
+            ),
+            (
+                CurveId::P192,
+                "042a551b5a39771e436de636d6259ba6afb1afa5d4d897ccf8bca9a6ea5d92d656c4ba4f2dd85c9d86d0e2445fd5db8692",
+                "303402181c5298437de413483c777e1133e62d5b81848747b89480bb021803b56152e323216bd9d9e403c8cd229a68014f6e2b69015d",
+                |pk, m, s| pk.verify::<Sha256>(m, s),
+            ),
+            (
+                CurveId::Secp224k1,
+                "042ef983fa542b64472e2bc405d9eedd861acc9a7f814fad8275ce6b9a3459ba4ab52164883bd29eb6ac7e6d22ac7d302c053dc39684928ef9",
+                "303e021d009868b57ff5572fd854ce7eb8b8513a1c54501e8fef97540291059a55021d008ece23bafe5a9456b59d1a17a03da1dbf825cbab651ec7d143d9b70c",
+                |pk, m, s| pk.verify::<Sha256>(m, s),
+            ),
+            (
+                CurveId::P224,
+                "044c246670658a1d41f5d77bce246cbe386ac22848e269b9d4cd67c466ddd947153d39b2d42533a460def26880408caf2dd3dd48fe888cd176",
+                "303d021d00f4b68df62b9238363ccc1bbee00deb3fb2693f7894178e14eeac596a021c7f51c9451adacd2bcbc721f7df0643d7cd18a6b52064b507e1912f23",
+                |pk, m, s| pk.verify::<Sha256>(m, s),
+            ),
+            (
+                CurveId::BrainpoolP224r1,
+                "04b554fc25e9f098eaf1466c35328c97305d0d4aa0e4462e8baf7a8e7ed08fc40eb01dc855577baea9e3070770616f57b17ea9854cad93881a",
+                "303c021c4dabc5fe962b5f8a6681e94a2165d9b6be1940f20e27ceb73fc4ea7d021c746e9bba7efb90fcecc263c229a16d809d3547c28a26cd71a52abdc5",
+                |pk, m, s| pk.verify::<Sha224>(m, s),
+            ),
+            (
+                CurveId::BrainpoolP320r1,
+                "0444ab2320c2297b66114428df33fe641956f82033893398af3b49b0023179201c27d26dd65121c06e0c59524c938f19daffc2a9a4679dba7cf1991ced4700592bb75e98cf77dbf6c584c2f72735152921",
+                "3055022826fd695ee1cc50c2661c2434f8699577af181304bceb7690c538b03463df24334395e791f6750ff6022900b322618cd50c6a7cffcb419ec05b67ec6a117088c78d57cecdd224902d391892ca03e4bc1bd0467b",
+                |pk, m, s| pk.verify::<Sha384>(m, s),
+            ),
+        ];
+        for (curve, key, sig, verify) in cases {
+            let pk = BoxedEcdsaPublicKey::from_sec1(curve, &from_hex(key)).unwrap();
+            let sig = BoxedEcdsaSignature::from_der_for_curve(&from_hex(sig), curve).unwrap();
+            verify(&pk, &msg, &sig).unwrap_or_else(|e| panic!("{curve:?}: {e:?}"));
+            assert!(
+                verify(&pk, b"msg", &sig).is_err(),
+                "{curve:?} tweaked message"
+            );
+        }
     }
 
     #[test]

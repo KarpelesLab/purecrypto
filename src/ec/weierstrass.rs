@@ -85,6 +85,11 @@ impl Curve {
         &self.n
     }
 
+    /// The field modulus `p`.
+    pub(crate) fn field_modulus(&self) -> BoxedUint {
+        self.fp.modulus()
+    }
+
     /// The curve coefficients `(a, b)` in plain (non-Montgomery) form. Used by
     /// SM2's `ZA` computation, which hashes the 32-byte big-endian `a`/`b`.
     pub(crate) fn coefficients(&self) -> (BoxedUint, BoxedUint) {
@@ -134,11 +139,13 @@ impl Curve {
     /// Recovers the affine point `(x, y)` with the requested Y parity from a
     /// compressed x-coordinate, or `None` if `x` is not on the curve.
     ///
-    /// Every supported curve has `p ≡ 3 (mod 4)`, so the square root is
-    /// `y = (x³ + a·x + b)^((p+1)/4)`; the result is verified (`y² == rhs`,
-    /// which also rejects an `x` that is not a valid abscissa) and the root of
-    /// the requested parity is returned (`p − y` flips it). The x-coordinate of
-    /// a public key is not secret, so a variable-time exponentiation is fine.
+    /// The square root of `rhs = x³ + a·x + b` is `rhs^((p+1)/4)` when
+    /// `p ≡ 3 (mod 4)` (every curve but P-224 and secp224k1) and a
+    /// Tonelli–Shanks root otherwise; either way the result is verified
+    /// (`y² == rhs`, which also rejects an `x` that is not a valid abscissa)
+    /// and the root of the requested parity is returned (`p − y` flips it).
+    /// The x-coordinate of a public key is not secret, so variable-time
+    /// exponentiation is fine.
     pub(crate) fn decompress(&self, x: &BoxedUint, y_odd: bool) -> Option<(BoxedUint, BoxedUint)> {
         if !self.in_field(x) {
             return None;
@@ -148,16 +155,76 @@ impl Curve {
         let x3 = self.fp.mul_mod(&x2, x);
         let ax = self.fp.mul_mod(&self.a_plain, x);
         let rhs = self.fp.add_mod(&self.fp.add_mod(&x3, &ax), &self.b_plain);
-        // p = (p − 2) + 2;  exp = (p + 1) / 4.
-        let p = self.p_minus_2.add(&BoxedUint::from_u64(2));
-        let exp = p.add(&BoxedUint::from_u64(1)).shr_bits(2);
-        let y = self.fp.pow(&rhs, &exp);
+        let p = self.field_modulus();
+        let y = if (p.as_limbs()[0] & 3) == 3 {
+            // exp = (p + 1) / 4.
+            let exp = p.add(&BoxedUint::from_u64(1)).shr_bits(2);
+            self.fp.pow_public(&rhs, &exp)
+        } else {
+            self.sqrt_tonelli_shanks(&rhs, &p)?
+        };
         // Reject non-residues / off-curve abscissae.
         if self.fp.mul_mod(&y, &y) != rhs {
             return None;
         }
         let y = if y.is_odd() == y_odd { y } else { p.sub(&y) };
         Some((x.clone(), y))
+    }
+
+    /// Tonelli–Shanks square root of `a` modulo the field prime `p`, for any
+    /// odd `p` (needed for `p ≡ 1 (mod 4)`: P-224 has `p − 1 = 2⁹⁶·q`,
+    /// secp224k1 `p ≡ 5 (mod 8)`). Returns `None` when `a` is a
+    /// non-residue. Variable-time: the input is a public abscissa.
+    fn sqrt_tonelli_shanks(&self, a: &BoxedUint, p: &BoxedUint) -> Option<BoxedUint> {
+        let one = BoxedUint::from_u64(1);
+        let p_minus_1 = p.sub(&one);
+        if a.is_zero() {
+            return Some(BoxedUint::zero(self.fp.limbs()));
+        }
+        // p − 1 = q · 2^s with q odd.
+        let mut q = p_minus_1.clone();
+        let mut s = 0usize;
+        while !q.is_odd() {
+            q = q.shr_bits(1);
+            s += 1;
+        }
+        // Euler's criterion on `a` first: a^((p−1)/2) must be 1.
+        let half = p_minus_1.shr_bits(1);
+        if self.fp.pow_public(a, &half) != one {
+            return None;
+        }
+        // A quadratic non-residue z (the smallest integer works; there is
+        // one below 2·ln²p, so the scan is short and depends only on p).
+        let mut z = BoxedUint::from_u64(2);
+        while self.fp.pow_public(&z, &half) == one {
+            z = z.add(&one);
+        }
+        let mut c = self.fp.pow_public(&z, &q);
+        let mut t = self.fp.pow_public(a, &q);
+        let mut r = self.fp.pow_public(a, &q.add(&one).shr_bits(1));
+        let mut m = s;
+        while t != one {
+            // Least i in (0, m) with t^(2^i) == 1.
+            let mut i = 0usize;
+            let mut t2 = t.clone();
+            while t2 != one {
+                t2 = self.fp.mul_mod(&t2, &t2);
+                i += 1;
+                if i >= m {
+                    return None;
+                }
+            }
+            // b = c^(2^(m − i − 1)).
+            let mut b = c;
+            for _ in 0..(m - i - 1) {
+                b = self.fp.mul_mod(&b, &b);
+            }
+            m = i;
+            c = self.fp.mul_mod(&b, &b);
+            t = self.fp.mul_mod(&t, &c);
+            r = self.fp.mul_mod(&r, &b);
+        }
+        Some(r)
     }
 
     /// Complete projective addition (Renes–Costello–Batina, Algorithm 1).

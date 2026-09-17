@@ -15,7 +15,9 @@ use purecrypto::ec::{
     BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId, Secp256k1EcdsaPublicKey,
     Secp256k1EcdsaSignature,
 };
-use purecrypto::hash::{Sha3_256, Sha3_384, Sha3_512, Sha256, Sha384, Sha512, shake128, shake256};
+use purecrypto::hash::{
+    Sha3_224, Sha3_256, Sha3_384, Sha3_512, Sha224, Sha256, Sha384, Sha512, shake128, shake256,
+};
 
 /// How the `sig` field is encoded.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,15 @@ fn curve_of(name: &str) -> CurveId {
         "brainpoolP256r1" => CurveId::BrainpoolP256r1,
         "brainpoolP384r1" => CurveId::BrainpoolP384r1,
         "brainpoolP512r1" => CurveId::BrainpoolP512r1,
+        "secp160k1" => CurveId::Secp160k1,
+        "secp160r1" => CurveId::Secp160r1,
+        "secp160r2" => CurveId::Secp160r2,
+        "secp192k1" => CurveId::Secp192k1,
+        "secp192r1" => CurveId::P192,
+        "secp224k1" => CurveId::Secp224k1,
+        "secp224r1" => CurveId::P224,
+        "brainpoolP224r1" => CurveId::BrainpoolP224r1,
+        "brainpoolP320r1" => CurveId::BrainpoolP320r1,
         other => panic!("unsupported curve {other}"),
     }
 }
@@ -79,9 +90,11 @@ fn public_key(group: &Fields) -> BoxedEcdsaPublicKey {
 /// Wycheproof fixes: 256 bits for SHAKE128, 512 for SHAKE256.
 fn verify(pk: &BoxedEcdsaPublicKey, sha: &str, msg: &[u8], sig: &BoxedEcdsaSignature) -> Outcome {
     outcome_of(match sha {
+        "SHA-224" => pk.verify::<Sha224>(msg, sig),
         "SHA-256" => pk.verify::<Sha256>(msg, sig),
         "SHA-384" => pk.verify::<Sha384>(msg, sig),
         "SHA-512" => pk.verify::<Sha512>(msg, sig),
+        "SHA3-224" => pk.verify::<Sha3_224>(msg, sig),
         "SHA3-256" => pk.verify::<Sha3_256>(msg, sig),
         "SHA3-384" => pk.verify::<Sha3_384>(msg, sig),
         "SHA3-512" => pk.verify::<Sha3_512>(msg, sig),
@@ -164,8 +177,12 @@ fn ecdsa_file(file: &str) {
         let bytes = case.hex("sig");
         let sig = match enc {
             Enc::Der | Enc::Bitcoin => BoxedEcdsaSignature::from_der_for_curve(&bytes, curve).ok(),
+            // Each half is the width of the group order — not of the field:
+            // on secp160k1/r1/r2 and secp224k1 the order is a bit wider
+            // than `publicKey.keySize`, and the vectors carry 21/29-byte
+            // halves.
             Enc::P1363 => {
-                let n = usize::try_from(group.int("publicKey.keySize").div_ceil(8)).unwrap();
+                let n = curve.order_len();
                 (bytes.len() == 2 * n).then(|| {
                     let (r, s) = bytes.split_at(n);
                     BoxedEcdsaSignature::from_components(
@@ -206,15 +223,46 @@ macro_rules! ecdsa_files {
 }
 
 ecdsa_files! {
+    ecdsa_brainpoolP224r1_sha224,
+    ecdsa_brainpoolP224r1_sha224_p1363,
+    ecdsa_brainpoolP224r1_sha3_224,
     ecdsa_brainpoolP256r1_sha256,
     ecdsa_brainpoolP256r1_sha256_p1363,
     ecdsa_brainpoolP256r1_sha3_256,
     ecdsa_brainpoolP384r1_sha384,
     ecdsa_brainpoolP384r1_sha384_p1363,
     ecdsa_brainpoolP384r1_sha3_384,
+    ecdsa_brainpoolP320r1_sha384,
+    ecdsa_brainpoolP320r1_sha384_p1363,
+    ecdsa_brainpoolP320r1_sha3_384,
     ecdsa_brainpoolP512r1_sha3_512,
     ecdsa_brainpoolP512r1_sha512,
     ecdsa_brainpoolP512r1_sha512_p1363,
+    ecdsa_secp160k1_sha256,
+    ecdsa_secp160k1_sha256_p1363,
+    ecdsa_secp160r1_sha256,
+    ecdsa_secp160r1_sha256_p1363,
+    ecdsa_secp160r2_sha256,
+    ecdsa_secp160r2_sha256_p1363,
+    ecdsa_secp192k1_sha256,
+    ecdsa_secp192k1_sha256_p1363,
+    ecdsa_secp192r1_sha256,
+    ecdsa_secp192r1_sha256_p1363,
+    ecdsa_secp224k1_sha224,
+    ecdsa_secp224k1_sha224_p1363,
+    ecdsa_secp224k1_sha256,
+    ecdsa_secp224k1_sha256_p1363,
+    ecdsa_secp224r1_sha224,
+    ecdsa_secp224r1_sha224_p1363,
+    ecdsa_secp224r1_sha256,
+    ecdsa_secp224r1_sha256_p1363,
+    ecdsa_secp224r1_sha3_224,
+    ecdsa_secp224r1_sha3_256,
+    ecdsa_secp224r1_sha3_512,
+    ecdsa_secp224r1_sha512,
+    ecdsa_secp224r1_sha512_p1363,
+    ecdsa_secp224r1_shake128,
+    ecdsa_secp224r1_shake128_p1363,
     ecdsa_secp256k1_sha256,
     ecdsa_secp256k1_sha256_bitcoin,
     ecdsa_secp256k1_sha256_p1363,

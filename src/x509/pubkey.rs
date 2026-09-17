@@ -39,30 +39,21 @@ fn curve_oid(curve: CurveId) -> &'static [u64] {
         CurveId::BrainpoolP256r1 => oid::BRAINPOOL_P256R1,
         CurveId::BrainpoolP384r1 => oid::BRAINPOOL_P384R1,
         CurveId::BrainpoolP512r1 => oid::BRAINPOOL_P512R1,
+        CurveId::Secp160k1 => oid::SECP160K1,
+        CurveId::Secp160r1 => oid::SECP160R1,
+        CurveId::Secp160r2 => oid::SECP160R2,
+        CurveId::Secp192k1 => oid::SECP192K1,
+        CurveId::P192 => oid::PRIME192V1,
+        CurveId::Secp224k1 => oid::SECP224K1,
+        CurveId::P224 => oid::SECP224R1,
+        CurveId::BrainpoolP224r1 => oid::BRAINPOOL_P224R1,
+        CurveId::BrainpoolP320r1 => oid::BRAINPOOL_P320R1,
     }
 }
 
 /// Maps a named-curve OID to a [`CurveId`].
 fn curve_from_oid(arcs: &[u64]) -> Option<CurveId> {
-    if arcs == oid::PRIME256V1 {
-        Some(CurveId::P256)
-    } else if arcs == oid::SECP384R1 {
-        Some(CurveId::P384)
-    } else if arcs == oid::SECP521R1 {
-        Some(CurveId::P521)
-    } else if arcs == oid::SECP256K1 {
-        Some(CurveId::Secp256k1)
-    } else if arcs == oid::SM2_P256V1 {
-        Some(CurveId::Sm2p256v1)
-    } else if arcs == oid::BRAINPOOL_P256R1 {
-        Some(CurveId::BrainpoolP256r1)
-    } else if arcs == oid::BRAINPOOL_P384R1 {
-        Some(CurveId::BrainpoolP384r1)
-    } else if arcs == oid::BRAINPOOL_P512R1 {
-        Some(CurveId::BrainpoolP512r1)
-    } else {
-        None
-    }
+    CurveId::ALL.into_iter().find(|c| curve_oid(*c) == arcs)
 }
 
 /// The digest an RSA-PSS key restriction names (RFC 4055 §3.1

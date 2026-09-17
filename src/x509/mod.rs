@@ -89,6 +89,24 @@ pub mod oid {
     pub const BRAINPOOL_P384R1: &[u64] = &[1, 3, 36, 3, 3, 2, 8, 1, 1, 11];
     /// `brainpoolP512r1` (1.3.36.3.3.2.8.1.1.13) — RFC 5639 named curve.
     pub const BRAINPOOL_P512R1: &[u64] = &[1, 3, 36, 3, 3, 2, 8, 1, 1, 13];
+    /// `brainpoolP224r1` (1.3.36.3.3.2.8.1.1.5) — RFC 5639 named curve.
+    pub const BRAINPOOL_P224R1: &[u64] = &[1, 3, 36, 3, 3, 2, 8, 1, 1, 5];
+    /// `brainpoolP320r1` (1.3.36.3.3.2.8.1.1.9) — RFC 5639 named curve.
+    pub const BRAINPOOL_P320R1: &[u64] = &[1, 3, 36, 3, 3, 2, 8, 1, 1, 9];
+    /// `secp160k1` (1.3.132.0.9) — SEC 2 named curve.
+    pub const SECP160K1: &[u64] = &[1, 3, 132, 0, 9];
+    /// `secp160r1` (1.3.132.0.8) — SEC 2 named curve.
+    pub const SECP160R1: &[u64] = &[1, 3, 132, 0, 8];
+    /// `secp160r2` (1.3.132.0.30) — SEC 2 named curve.
+    pub const SECP160R2: &[u64] = &[1, 3, 132, 0, 30];
+    /// `secp192k1` (1.3.132.0.31) — SEC 2 named curve.
+    pub const SECP192K1: &[u64] = &[1, 3, 132, 0, 31];
+    /// `prime192v1` / `secp192r1` / NIST P-192 (1.2.840.10045.3.1.1).
+    pub const PRIME192V1: &[u64] = &[1, 2, 840, 10045, 3, 1, 1];
+    /// `secp224k1` (1.3.132.0.32) — SEC 2 named curve.
+    pub const SECP224K1: &[u64] = &[1, 3, 132, 0, 32];
+    /// `secp224r1` / NIST P-224 (1.3.132.0.33).
+    pub const SECP224R1: &[u64] = &[1, 3, 132, 0, 33];
     /// `SM2-with-SM3` (1.2.156.10197.1.501) — the SM2 signature algorithm
     /// over SM3 (GB/T 32918.2, RFC 8998).
     pub const SM2_WITH_SM3: &[u64] = &[1, 2, 156, 10197, 1, 501];

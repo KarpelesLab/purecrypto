@@ -228,8 +228,18 @@ impl CertSigner<'_> {
                 CurveId::P256
                 | CurveId::Secp256k1
                 | CurveId::Sm2p256v1
-                | CurveId::BrainpoolP256r1 => oid::ECDSA_WITH_SHA256,
-                CurveId::P384 | CurveId::BrainpoolP384r1 => oid::ECDSA_WITH_SHA384,
+                | CurveId::BrainpoolP256r1
+                | CurveId::Secp160k1
+                | CurveId::Secp160r1
+                | CurveId::Secp160r2
+                | CurveId::Secp192k1
+                | CurveId::P192
+                | CurveId::Secp224k1
+                | CurveId::P224
+                | CurveId::BrainpoolP224r1 => oid::ECDSA_WITH_SHA256,
+                CurveId::P384 | CurveId::BrainpoolP384r1 | CurveId::BrainpoolP320r1 => {
+                    oid::ECDSA_WITH_SHA384
+                }
                 CurveId::P521 | CurveId::BrainpoolP512r1 => oid::ECDSA_WITH_SHA512,
             },
             CertSigner::Ed25519(_) => oid::ID_ED25519,
@@ -274,12 +284,23 @@ impl CertSigner<'_> {
             },
             CertSigner::Ecdsa(k) => {
                 let curve = k.curve();
+                // Must agree with `sig_alg_oid` above.
                 let sig = match curve {
                     CurveId::P256
                     | CurveId::Secp256k1
                     | CurveId::Sm2p256v1
-                    | CurveId::BrainpoolP256r1 => k.sign::<Sha256>(tbs),
-                    CurveId::P384 | CurveId::BrainpoolP384r1 => k.sign::<Sha384>(tbs),
+                    | CurveId::BrainpoolP256r1
+                    | CurveId::Secp160k1
+                    | CurveId::Secp160r1
+                    | CurveId::Secp160r2
+                    | CurveId::Secp192k1
+                    | CurveId::P192
+                    | CurveId::Secp224k1
+                    | CurveId::P224
+                    | CurveId::BrainpoolP224r1 => k.sign::<Sha256>(tbs),
+                    CurveId::P384 | CurveId::BrainpoolP384r1 | CurveId::BrainpoolP320r1 => {
+                        k.sign::<Sha384>(tbs)
+                    }
                     CurveId::P521 | CurveId::BrainpoolP512r1 => k.sign::<Sha512>(tbs),
                 }
                 .map_err(|_| Error::Verification)?;

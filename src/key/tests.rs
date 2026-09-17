@@ -615,6 +615,15 @@ fn boxed_ec_curves_report_their_own_algorithm() {
         (CurveId::BrainpoolP256r1, Algorithm::BrainpoolP256r1),
         (CurveId::BrainpoolP384r1, Algorithm::BrainpoolP384r1),
         (CurveId::BrainpoolP512r1, Algorithm::BrainpoolP512r1),
+        (CurveId::Secp160k1, Algorithm::Secp160k1),
+        (CurveId::Secp160r1, Algorithm::Secp160r1),
+        (CurveId::Secp160r2, Algorithm::Secp160r2),
+        (CurveId::Secp192k1, Algorithm::Secp192k1),
+        (CurveId::P192, Algorithm::P192),
+        (CurveId::Secp224k1, Algorithm::Secp224k1),
+        (CurveId::P224, Algorithm::P224),
+        (CurveId::BrainpoolP224r1, Algorithm::BrainpoolP224r1),
+        (CurveId::BrainpoolP320r1, Algorithm::BrainpoolP320r1),
     ] {
         let sk = BoxedEcdsaPrivateKey::generate(curve, &mut r);
         let pk = sk.public_key();
@@ -622,6 +631,42 @@ fn boxed_ec_curves_report_their_own_algorithm() {
         let pk_dyn: Box<dyn PublicKey> = Box::new(pk);
         assert_eq!(sk_dyn.algorithm(), want, "{curve:?} private");
         assert_eq!(pk_dyn.algorithm(), want, "{curve:?} public");
+    }
+}
+
+/// Through the facade, a raw (`r ‖ s`) ECDSA signature on a curve whose
+/// order is a bit wider than the field is `2·order_len` bytes — 42 on the
+/// secp160 curves, 58 on secp224k1 — and verifies; the same bytes are what
+/// `sign` emits. Before the split used `field_len`, so the facade's own
+/// output was rejected as the wrong length.
+#[test]
+fn raw_ecdsa_signature_width_is_order_len_on_wide_order_curves() {
+    use crate::ec::boxed::BoxedEcdsaPrivateKey;
+    use crate::ec::curves::CurveId;
+    use crate::key::SigEncoding;
+
+    let mut r = rng();
+    for curve in [
+        CurveId::Secp160k1,
+        CurveId::Secp160r1,
+        CurveId::Secp160r2,
+        CurveId::Secp224k1,
+        CurveId::P224,
+        CurveId::BrainpoolP320r1,
+    ] {
+        let sk: Box<dyn PrivateKey> = Box::new(BoxedEcdsaPrivateKey::generate(curve, &mut r));
+        let pk = sk.public_key().unwrap();
+        let params = SignParams::new()
+            .hash(Hash::Sha256)
+            .sig_encoding(SigEncoding::Raw);
+        let sig = sk.sign(b"wide", &params, &mut r).expect("sign");
+        assert_eq!(sig.len(), 2 * curve.order_len(), "{curve:?}");
+        pk.verify(b"wide", &sig, &params).expect("verify");
+        assert!(pk.verify(b"other", &sig, &params).is_err());
+        // A coordinate-width signature is the wrong length on the wide curves.
+        if curve.order_len() != curve.field_len() {
+            assert!(pk.verify(b"wide", &sig[1..sig.len() - 1], &params).is_err());
+        }
     }
 }
 

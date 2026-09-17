@@ -15,8 +15,10 @@ use purecrypto::ec::{
 #[cfg(feature = "x509")]
 use purecrypto::x509::AnyPublicKey;
 
-/// The Wycheproof curve name -> the crate's identifier (`None` = unsupported).
-fn curve_id(name: &str) -> Option<CurveId> {
+/// The Wycheproof curve name -> the crate's identifier (`None` = unsupported:
+/// the twisted Brainpool curves, FRP256v1, and the 160/192-bit Brainpool
+/// curves). Shared with `ec_formats`.
+pub fn curve_id(name: &str) -> Option<CurveId> {
     Some(match name {
         "secp256r1" => CurveId::P256,
         "secp384r1" => CurveId::P384,
@@ -25,17 +27,29 @@ fn curve_id(name: &str) -> Option<CurveId> {
         "brainpoolP256r1" => CurveId::BrainpoolP256r1,
         "brainpoolP384r1" => CurveId::BrainpoolP384r1,
         "brainpoolP512r1" => CurveId::BrainpoolP512r1,
+        "secp160k1" => CurveId::Secp160k1,
+        "secp160r1" => CurveId::Secp160r1,
+        "secp160r2" => CurveId::Secp160r2,
+        "secp192k1" => CurveId::Secp192k1,
+        "secp192r1" => CurveId::P192,
+        "secp224k1" => CurveId::Secp224k1,
+        "secp224r1" => CurveId::P224,
+        "brainpoolP224r1" => CurveId::BrainpoolP224r1,
+        "brainpoolP320r1" => CurveId::BrainpoolP320r1,
         _ => return None,
     })
 }
 
 /// Every curve with an `ecdh_<curve>.txt` file; all are implemented.
-const ECDH_CURVES: [&str; 7] = [
+const ECDH_CURVES: [&str; 10] = [
+    "secp224r1",
     "secp256r1",
     "secp384r1",
     "secp521r1",
     "secp256k1",
+    "brainpoolP224r1",
     "brainpoolP256r1",
+    "brainpoolP320r1",
     "brainpoolP384r1",
     "brainpoolP512r1",
 ];
@@ -103,10 +117,11 @@ fn ecdh_spki() {
     }
 }
 
-/// Raw SEC1 peer points (uncompressed and compressed).
+/// Raw SEC1 peer points (uncompressed and compressed). The secp224r1 file's
+/// compressed point is the `p ≡ 1 (mod 4)` Tonelli–Shanks decompression.
 #[test]
 fn ecdh_ecpoint() {
-    for name in ["secp256r1", "secp384r1", "secp521r1"] {
+    for name in ["secp224r1", "secp256r1", "secp384r1", "secp521r1"] {
         run_with(
             &load(&format!("ecdh_{name}_ecpoint")),
             ecdh_strict,
@@ -182,8 +197,8 @@ fn sec1(x: &[u8], y: &[u8]) -> Vec<u8> {
 #[test]
 fn ec_prime_order_curves() {
     check("ec_prime_order_curves", |_, case| {
-        // Curves the crate does not implement (secp224r1, the 160/192-bit
-        // and twisted Brainpool curves, FRP256v1, ...) are counted as skipped.
+        // Curves the crate does not implement (the twisted Brainpool curves,
+        // brainpoolP160r1/P192r1, FRP256v1) are counted as skipped.
         let Some(curve) = curve_id(case.str("name")) else {
             return Outcome::Skipped;
         };
@@ -191,6 +206,12 @@ fn ec_prime_order_curves() {
         let flen = p.len();
         let (gx, gy) = (pad(&case.hex("gx"), flen), pad(&case.hex("gy"), flen));
         let n = BoxedUint::from_be_bytes(&case.hex("n"));
+        // Scalars are order-width: one byte more than a coordinate on
+        // secp160k1/r1/r2 and secp224k1, whose `n` is a bit wider than `p`.
+        let nlen = flen.max(n.bit_len().div_ceil(8));
+        if nlen != curve.order_len() || flen != curve.field_len() {
+            return Outcome::Wrong("field_len / order_len");
+        }
         let g = sec1(&gx, &gy);
         // Every supported curve has prime order; the API cannot express `h`.
         if case.int("h") != 1 {
@@ -207,11 +228,11 @@ fn ec_prime_order_curves() {
         if mul(&[1]) != Ok(g.clone()) {
             return Outcome::Wrong("1*G");
         }
-        if mul(&n.to_be_bytes(flen)).is_ok() {
+        if mul(&n.to_be_bytes(nlen)).is_ok() {
             return Outcome::Wrong("n accepted as a scalar");
         }
         let neg_gy = BoxedUint::from_be_bytes(&p).sub(&BoxedUint::from_be_bytes(&gy));
-        if mul(&n.sub(&BoxedUint::from_u64(1)).to_be_bytes(flen))
+        if mul(&n.sub(&BoxedUint::from_u64(1)).to_be_bytes(nlen))
             != Ok(sec1(&gx, &neg_gy.to_be_bytes(flen)))
         {
             return Outcome::Wrong("(n-1)*G != -G");
