@@ -486,6 +486,9 @@ impl AnyPublicKey {
     pub fn from_spki_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut spki = reader.read_sequence()?;
+        // Nothing may follow the outer SEQUENCE: a trailing byte after a
+        // well-formed SPKI is not DER (Wycheproof `InvalidAsn`).
+        reader.finish()?;
         let mut algid = spki.read_sequence()?;
         let alg = parse_oid(algid.read_oid()?)?;
 
@@ -984,6 +987,11 @@ mod tests {
         );
         let spki_trailing = encode_sequence(&[algid_trailing, key_bits].concat());
         assert!(AnyPublicKey::from_spki_der(&spki_trailing).is_err());
+
+        // (e) A byte after the outer SEQUENCE (Wycheproof ECDH tcId 421,
+        //     "appending unused 0's to sequence"). Must be rejected.
+        let spki_padded = [spki_ok.as_slice(), &[0x00]].concat();
+        assert!(AnyPublicKey::from_spki_der(&spki_padded).is_err());
     }
 
     fn boxed_rsa_a() -> BoxedRsaPublicKey {
