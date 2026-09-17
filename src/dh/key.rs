@@ -172,7 +172,7 @@ impl DhPrivateKey {
     /// for interop with peers that demand a fixed exponent.
     pub fn from_bytes(group: DhGroup, bytes: &[u8]) -> Result<Self, Error> {
         let x = BoxedUint::from_be_bytes(bytes);
-        if x.is_zero() || !x.lt(group.p()) {
+        if bool::from(x.ct_is_zero()) || !x.lt(group.p()) {
             return Err(Error::InvalidScalar);
         }
         Ok(DhPrivateKey { group, x })

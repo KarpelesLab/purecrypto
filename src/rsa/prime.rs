@@ -1,6 +1,7 @@
 //! Probabilistic primality testing (Miller-Rabin) and random prime generation.
 
 use crate::bignum::{MontModulus, Uint};
+use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
 
 /// Odd primes used to cheaply reject composites before the expensive
@@ -9,16 +10,36 @@ const SMALL_PRIMES: [u64; 24] = [
     3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
 ];
 
-/// Returns `n mod p` for a small (64-bit) `p`, via Horner over the limbs.
+/// Returns `n mod p` for a small public `p < 2^32`, without a division
+/// instruction on the (secret) candidate.
 fn mod_small<const LIMBS: usize>(n: &Uint<LIMBS>, p: u64) -> u64 {
-    let limbs = n.as_limbs();
-    let mut rem: u128 = 0;
-    let mut i = LIMBS;
-    while i > 0 {
-        i -= 1;
-        rem = ((rem << 64) | limbs[i] as u128) % p as u128;
+    crate::bignum::mod_small_limbs(n.as_limbs(), p)
+}
+
+/// Squarings a Miller-Rabin round always performs after `a^d`, whatever
+/// `s = v₂(n − 1)` is, so the round's shape does not reveal `s` (a few bits
+/// of the candidate) or how many squarings a base needed to hit `−1`.
+/// `s > 64` happens with probability `2⁻⁶⁴` for a random candidate; only
+/// then does a variable-length tail run.
+const MR_FIXED_SQUARINGS: u32 = 64;
+
+/// `(d, s)` with `x = d · 2^s` and `d` odd, computed without branching on
+/// `x`: `s` by a branch-free trailing-zero count over every limb, `d` by a
+/// barrel shift selected on the bits of `s`.
+fn split_pow2<const LIMBS: usize>(x: &Uint<LIMBS>) -> (Uint<LIMBS>, u32) {
+    let mut s = 0u32;
+    let mut still_zero = 1u64;
+    for &limb in x.as_limbs() {
+        crate::bignum::trailing_zeros_step(limb, &mut s, &mut still_zero);
     }
-    rem as u64
+    let mut d = *x;
+    let mut k = 0;
+    while (1usize << k) < LIMBS * 64 {
+        let shifted = d.shr_bits(1 << k);
+        d = Uint::conditional_select(&shifted, &d, Choice::from(((s >> k) & 1) as u8));
+        k += 1;
+    }
+    (d, s)
 }
 
 /// Draws a uniformly random `Uint<LIMBS>` from `rng`.
@@ -35,7 +56,16 @@ fn random_uint<const LIMBS: usize, R: RngCore>(rng: &mut R) -> Uint<LIMBS> {
 ///
 /// A composite passes a single round with probability at most 1/4, so the
 /// false-positive probability is at most `4^-rounds`. Deterministic for small
-/// factors via trial division. Not constant time.
+/// factors via trial division.
+///
+/// The verdict is public (a rejected candidate is discarded, an accepted one
+/// becomes a key), but the work done on a candidate that *passes* is
+/// shaped independently of its value: trial division uses no division
+/// instruction, `n − 1 = d·2^s` is split without branching, and every
+/// Miller-Rabin round runs the same number of squarings (see
+/// [`MR_FIXED_SQUARINGS`]). Only the early exits on a *composite* depend on
+/// the value, and those candidates are fresh random draws that leak nothing
+/// about the prime eventually chosen.
 pub fn is_prime<const LIMBS: usize, R: RngCore>(
     n: &Uint<LIMBS>,
     rng: &mut R,
@@ -63,32 +93,31 @@ pub fn is_prime<const LIMBS: usize, R: RngCore>(
 
     // Write n - 1 = d * 2^s with d odd.
     let n_minus_1 = n.wrapping_sub(&one);
-    let mut d = n_minus_1;
-    let mut s = 0u32;
-    while !bool::from(d.is_odd()) {
-        d = d.shr1();
-        s += 1;
-    }
+    let (d, s) = split_pow2(&n_minus_1);
 
     let modulus = MontModulus::new(*n);
-    'rounds: for _ in 0..rounds {
-        // Random base a, reduced into [2, n-2].
-        let mut a = random_uint::<LIMBS, R>(rng).reduce(n);
-        if a == Uint::ZERO || a == one || a == n_minus_1 {
-            a = two;
-        }
+    for _ in 0..rounds {
+        // Random base a, reduced into [2, n-2]; the three useless values
+        // 0, 1, n − 1 map to 2 by a masked select.
+        let a = random_uint::<LIMBS, R>(rng).reduce(n);
+        let useless = a.is_zero() | a.ct_eq(&one) | a.ct_eq(&n_minus_1);
+        let a = Uint::conditional_select(&two, &a, useless);
 
         let mut x = modulus.pow(&a, &d);
-        if x == one || x == n_minus_1 {
-            continue 'rounds;
-        }
-        for _ in 0..s.saturating_sub(1) {
+        let mut pass = x.ct_eq(&one) | x.ct_eq(&n_minus_1);
+        // x^(2^j) for j in 1..s must hit n − 1: a fixed number of squarings,
+        // each result masked by `j < s`.
+        for j in 1..MR_FIXED_SQUARINGS {
             x = modulus.mul_mod(&x, &x);
-            if x == n_minus_1 {
-                continue 'rounds;
-            }
+            pass |= j.ct_lt(&s) & x.ct_eq(&n_minus_1);
         }
-        return false; // witnessed composite
+        for _ in MR_FIXED_SQUARINGS..s {
+            x = modulus.mul_mod(&x, &x);
+            pass |= x.ct_eq(&n_minus_1);
+        }
+        if !bool::from(pass) {
+            return false; // witnessed composite
+        }
     }
     true
 }

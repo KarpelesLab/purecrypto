@@ -5,7 +5,8 @@
 //! so the shared core lives here in `bignum` — which both depend on — rather
 //! than one feature depending on the other.
 
-use super::{BoxedMontModulus, BoxedUint};
+use super::{BoxedMontModulus, BoxedUint, mod_small_limbs, mod_u32_ct, trailing_zeros_step};
+use crate::ct::{Choice, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
 use alloc::vec::Vec;
 
@@ -46,44 +47,55 @@ fn small_odd_primes() -> Vec<u64> {
     primes
 }
 
-/// `n mod p` for a runtime-sized `n` and a small (64-bit) `p`, via Horner
-/// over the limbs.
+/// `n mod p` for a runtime-sized `n` and a small public `p < 2^32`, without
+/// a division instruction on the (possibly secret) `n`.
 fn mod_small_boxed(n: &BoxedUint, p: u64) -> u64 {
-    let limbs = n.as_limbs();
-    let mut rem: u128 = 0;
-    for i in (0..limbs.len()).rev() {
-        rem = ((rem << 64) | limbs[i] as u128) % p as u128;
+    mod_small_limbs(n.as_limbs(), p)
+}
+
+/// Squarings a Miller-Rabin round always performs after `a^d`; see
+/// `rsa::prime::MR_FIXED_SQUARINGS` for the rationale.
+const MR_FIXED_SQUARINGS: u32 = 64;
+
+/// `(d, s)` with `x = d · 2^s` and `d` odd, without branching on `x`.
+fn split_pow2_boxed(x: &BoxedUint) -> (BoxedUint, u32) {
+    let mut s = 0u32;
+    let mut still_zero = 1u64;
+    for &limb in x.as_limbs() {
+        trailing_zeros_step(limb, &mut s, &mut still_zero);
     }
-    rem as u64
+    let width = x.limbs() * super::LIMB_BITS;
+    let mut d = x.clone();
+    let mut k = 0;
+    while (1usize << k) < width {
+        let shifted = d.shr_bits(1 << k);
+        d = BoxedUint::conditional_select(&shifted, &d, Choice::from(((s >> k) & 1) as u8));
+        k += 1;
+    }
+    (d, s)
 }
 
 /// Trial division of `n` by every odd prime below [`TRIAL_DIVISION_BOUND`].
 /// Returns the smallest such prime dividing `n`, or `None`.
 ///
-/// The primes are packed into `u64` products (as many consecutive primes as
-/// fit without overflow) so each product costs one Horner pass over the
-/// limbs; the residue is then reduced modulo each prime of the batch with
-/// native `u64` arithmetic. That is ~4–5x fewer `u128` divisions than one
-/// pass per prime.
+/// The primes are packed into products below `2^32` (as many consecutive
+/// primes as fit) so each product costs one Horner pass over the limbs; the
+/// residue is then reduced modulo each prime of the batch. Both reductions
+/// are multiply-by-reciprocal, so no division instruction sees `n`.
 fn small_factor_boxed(n: &BoxedUint) -> Option<u64> {
     let primes = small_odd_primes();
     let mut i = 0;
     while i < primes.len() {
-        // Greedily extend the batch while the product still fits in a u64.
+        // Greedily extend the batch while the product stays below 2^32.
         let mut product: u64 = 1;
         let start = i;
-        while i < primes.len() {
-            match product.checked_mul(primes[i]) {
-                Some(next) => {
-                    product = next;
-                    i += 1;
-                }
-                None => break,
-            }
+        while i < primes.len() && product * primes[i] < (1 << 32) {
+            product *= primes[i];
+            i += 1;
         }
         let rem = mod_small_boxed(n, product);
         for &p in &primes[start..i] {
-            if rem.is_multiple_of(p) {
+            if mod_u32_ct(rem, p) == 0 {
                 return Some(p);
             }
         }
@@ -99,8 +111,13 @@ fn small_factor_boxed(n: &BoxedUint) -> Option<u64> {
 /// the adversary in advance — so the false-positive probability is at most
 /// `4^-rounds`. Trial division by every prime below 2^14 runs first, so a
 /// composite with a small factor is rejected without any exponentiation, and
-/// a candidate below 2^28 is decided exactly. Not constant time: only feed it
-/// public candidates.
+/// a candidate below 2^28 is decided exactly.
+///
+/// The verdict is public, but the work done on a candidate that *passes* is
+/// shaped independently of its value (no division instruction, branch-free
+/// `n − 1 = d·2^s` split, a fixed number of squarings per round); see
+/// `rsa::prime::is_prime` for the reasoning. The early exits fire only on
+/// composites, which are discarded.
 pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usize) -> bool {
     let one = BoxedUint::from_u64(1);
     let two = BoxedUint::from_u64(2);
@@ -122,27 +139,24 @@ pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usi
     }
 
     let n_minus_1 = n.sub(&one);
-    let mut d = n_minus_1.clone();
-    let mut s = 0u32;
-    while !d.is_odd() {
-        d = d.shr_bits(1);
-        s += 1;
-    }
+    let (d, s) = split_pow2_boxed(&n_minus_1);
 
     let modulus = BoxedMontModulus::new(n);
-    'rounds: for _ in 0..rounds {
+    for _ in 0..rounds {
         let a = random_base(n, &n_minus_1, rng);
         let mut x = modulus.pow(&a, &d);
-        if x == one || x == n_minus_1 {
-            continue 'rounds;
-        }
-        for _ in 0..s.saturating_sub(1) {
+        let mut pass = x.ct_eq(&one) | x.ct_eq(&n_minus_1);
+        for j in 1..MR_FIXED_SQUARINGS {
             x = modulus.mul_mod(&x, &x);
-            if x == n_minus_1 {
-                continue 'rounds;
-            }
+            pass |= j.ct_lt(&s) & x.ct_eq(&n_minus_1);
         }
-        return false;
+        for _ in MR_FIXED_SQUARINGS..s {
+            x = modulus.mul_mod(&x, &x);
+            pass |= x.ct_eq(&n_minus_1);
+        }
+        if !bool::from(pass) {
+            return false;
+        }
     }
     true
 }
@@ -156,11 +170,8 @@ fn random_base<R: RngCore>(n: &BoxedUint, n_minus_1: &BoxedUint, rng: &mut R) ->
         *limb = rng.next_u64();
     }
     let a = BoxedUint::from_limbs(limbs).reduce(n);
-    if a.is_zero() || a == BoxedUint::from_u64(1) || a == *n_minus_1 {
-        BoxedUint::from_u64(2)
-    } else {
-        a
-    }
+    let useless = a.ct_is_zero() | a.ct_eq(&BoxedUint::from_u64(1)) | a.ct_eq(n_minus_1);
+    BoxedUint::conditional_select(&BoxedUint::from_u64(2), &a, useless)
 }
 
 /// Safe-prime test: is `p` a (probable) prime with `q = (p − 1) / 2` also

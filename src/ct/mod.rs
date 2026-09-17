@@ -70,8 +70,12 @@ impl From<u8> for Choice {
     fn from(value: u8) -> Self {
         debug_assert!(value == 0 || value == 1, "Choice must be 0 or 1");
         // Branchless byte-nonzero: `(x | -x) >> 7` is 1 for any nonzero `x`
-        // and 0 for `x == 0`, with no data-dependent branch on `value`.
-        Choice(((value | value.wrapping_neg()) >> 7) & 1)
+        // and 0 for `x == 0`, with no data-dependent branch on `value`. The
+        // barrier keeps LLVM from folding the bit back into whatever
+        // comparison produced it and lowering the consumer to a branch.
+        Choice(core::hint::black_box(
+            ((value | value.wrapping_neg()) >> 7) & 1,
+        ))
     }
 }
 

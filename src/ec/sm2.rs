@@ -133,6 +133,13 @@ fn enc32(v: &BoxedUint) -> Vec<u8> {
     v.to_be_bytes(super::boxed::enc_len(v, 32))
 }
 
+/// Fixed-width 32-byte encoding for **secret** field elements and scalars
+/// (the ECDH point `(x2, y2)`, the private key): unlike [`enc32`] it never
+/// consults `bit_len()`, whose top-down limb scan depends on the value.
+fn enc32_secret(v: &BoxedUint) -> Vec<u8> {
+    v.to_be_bytes(32)
+}
+
 /// An SM2 public key: an affine point `PA = (xA, yA)` on `sm2p256v1`.
 #[derive(Clone, Debug)]
 pub struct Sm2PublicKey {
@@ -310,8 +317,8 @@ impl Sm2PublicKey {
             k.zeroize();
 
             // t = KDF(x2 ‖ y2, mlen); retry if all-zero.
-            let mut z = enc32(&x2);
-            z.extend_from_slice(&enc32(&y2));
+            let mut z = enc32_secret(&x2);
+            z.extend_from_slice(&enc32_secret(&y2));
             let mut t = kdf(&z, msg.len());
             // GB/T 32918.4 requires retrying when the whole key stream is zero.
             // `t` is derived from the shared secret, so fold every byte into one
@@ -389,7 +396,7 @@ impl Sm2PrivateKey {
 
     /// The secret scalar as a big-endian 32-byte string.
     pub fn to_bytes(&self) -> Vec<u8> {
-        enc32(&self.d)
+        enc32_secret(&self.d)
     }
 
     /// Derives the public key `PA = [dA]G`.
@@ -469,7 +476,9 @@ impl Sm2PrivateKey {
         let (x1, _) = c.to_affine(&c.mul_generator(k)).ok_or(SignFailure::Retry)?;
         // r = (e + x1) mod n; reject r == 0 or r + k == n.
         let r = fq.add_mod(&e, &x1.reduce(&n));
-        if r.is_zero() || fq.add_mod(&r, k).is_zero() {
+        // `r` is public, but `r + k` involves the nonce: no early-exit zero
+        // test on it.
+        if r.is_zero() || bool::from(fq.add_mod(&r, k).ct_is_zero()) {
             return Err(SignFailure::Retry);
         }
         // s = ((1 + dA)^-1 · (k − r·dA)) mod n.
@@ -521,8 +530,8 @@ impl Sm2PrivateKey {
             .ok_or(Error::InvalidInput)?;
 
         // t = KDF(x2 ‖ y2, |C2|); M = C2 ⊕ t.
-        let mut z = enc32(&x2);
-        z.extend_from_slice(&enc32(&y2));
+        let mut z = enc32_secret(&x2);
+        z.extend_from_slice(&enc32_secret(&y2));
         x2.zeroize();
         y2.zeroize();
         let mut t = kdf(&z, c2.len());

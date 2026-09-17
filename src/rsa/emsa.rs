@@ -223,12 +223,37 @@ pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(
     if bad != 0 {
         return Err(Error::Decryption);
     }
-    let msg = &scratch[(sep_idx as usize) + 1..];
-    if out.len() < msg.len() {
+    // The message starts at the secret offset `sep_idx + 1`; move it to the
+    // front with fixed-address loads rather than a secret-offset slice.
+    let n = k - (sep_idx as usize) - 1;
+    if out.len() < n {
         return Err(Error::InvalidLength);
     }
-    out[..msg.len()].copy_from_slice(msg);
-    Ok(msg.len())
+    ct_shift_left(scratch, sep_idx + 1);
+    out[..n].copy_from_slice(&scratch[..n]);
+    Ok(n)
+}
+
+/// Shifts `buf` left by the **secret** `shift` bytes (zero-filling the tail)
+/// with a branch-free barrel shifter: `O(k log k)` loads at public addresses,
+/// so the position of a decrypted message inside its padding block never
+/// becomes a data-dependent memory access (a cache side channel that would
+/// re-open the padding oracle).
+pub(crate) fn ct_shift_left(buf: &mut [u8], shift: u32) {
+    let k = buf.len();
+    let mut step = 1usize;
+    let mut bit_idx = 0u32;
+    while step <= k {
+        let m = 0u8.wrapping_sub(((shift >> bit_idx) & 1) as u8);
+        for i in 0..k {
+            // Ascending `i`: `buf[i + step]` is always read before it is
+            // itself overwritten, so the in-place shift is correct.
+            let src = if i + step < k { buf[i + step] } else { 0 };
+            buf[i] = (src & m) | (buf[i] & !m);
+        }
+        step <<= 1;
+        bit_idx += 1;
+    }
 }
 
 /// Constant-time PKCS#1 v1.5 decryption with implicit rejection (RFC 8017
@@ -502,24 +527,9 @@ pub(crate) fn decrypt_pkcs1v15_implicit<K: RawPrivate>(
     }
 
     // The message occupies the last `final_len` octets of the block, i.e. it
-    // starts at the secret offset `k - final_len`. Reading it with that offset
-    // would be a secret-dependent load (a cache side channel that re-opens the
-    // oracle), so shift the whole block left by `k - final_len` with a
-    // branch-free barrel shifter: O(k log k) fixed loads at public addresses.
-    let shift = (k as u32).wrapping_sub(final_len);
-    let mut step = 1usize;
-    let mut bit_idx = 0u32;
-    while step <= k {
-        let m = 0u8.wrapping_sub(((shift >> bit_idx) & 1) as u8);
-        for i in 0..k {
-            // Ascending `i`: `scratch[i + step]` is always read before it is
-            // itself overwritten, so the in-place shift is correct.
-            let src = if i + step < k { scratch[i + step] } else { 0 };
-            scratch[i] = (src & m) | (scratch[i] & !m);
-        }
-        step <<= 1;
-        bit_idx += 1;
-    }
+    // starts at the secret offset `k - final_len`; bring it to the front with
+    // the barrel shifter (see `ct_shift_left`).
+    ct_shift_left(scratch, (k as u32).wrapping_sub(final_len));
 
     let n = final_len as usize;
     out[..n].copy_from_slice(&scratch[..n]);
@@ -889,7 +899,7 @@ pub(crate) fn decrypt_oaep<D: Digest, K: RawPrivate>(
     // `found = 0` until we hit the first 0x01; once set, any subsequent
     // non-{0,1} byte is irrelevant. Before the separator, any non-zero byte
     // is bad.
-    let ps_region = &db[h_len..];
+    let ps_region = &mut db[h_len..];
     let mut found: u8 = 0;
     let mut sep_idx: usize = 0;
     let mut pre_bad: u8 = 0;
@@ -912,12 +922,16 @@ pub(crate) fn decrypt_oaep<D: Digest, K: RawPrivate>(
         return Err(Error::Decryption);
     }
 
-    let msg = &ps_region[sep_idx + 1..];
-    if out.len() < msg.len() {
+    // Same secret-offset concern as PKCS#1 v1.5: `sep_idx` is derived from
+    // the decrypted block, so move the message to the front branch-free
+    // instead of slicing at it.
+    let n = ps_region.len() - sep_idx - 1;
+    if out.len() < n {
         return Err(Error::InvalidLength);
     }
-    out[..msg.len()].copy_from_slice(msg);
-    Ok(msg.len())
+    ct_shift_left(ps_region, (sep_idx + 1) as u32);
+    out[..n].copy_from_slice(&ps_region[..n]);
+    Ok(n)
 }
 
 /// Returns `0xff` if `a == b`, else `0x00`. Wraps the crate's constant-time

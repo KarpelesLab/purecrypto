@@ -25,6 +25,59 @@ pub struct Uint<const LIMBS: usize> {
     limbs: [Limb; LIMBS],
 }
 
+/// Constant-time `n mod p` over little-endian limbs for a **public**
+/// `0 < p < 2^32`: Horner over 32-bit chunks, each step reduced by a
+/// multiply-by-reciprocal (Lemire, Kaser & Kurz, "Faster remainder by direct
+/// computation", 2019 — exact for 64-bit dividends with a 128-bit
+/// reciprocal). No division instruction touches `n`, so a secret candidate
+/// (an RSA prime under test) never reaches a data-dependent-latency divider.
+pub(crate) fn mod_small_limbs(limbs: &[Limb], p: u64) -> u64 {
+    debug_assert!(p > 0 && p < (1 << 32), "mod_small_limbs: p must be < 2^32");
+    // ceil(2^128 / p): public.
+    let c: u128 = u128::MAX / (p as u128) + 1;
+    let mut rem: u64 = 0;
+    for &limb in limbs.iter().rev() {
+        for chunk in [limb >> 32, limb & 0xffff_ffff] {
+            // rem < p < 2^32, so the dividend stays below 2^64.
+            let v = (rem << 32) | chunk;
+            let low = c.wrapping_mul(v as u128);
+            rem = mulhi_128_by_64(low, p);
+        }
+    }
+    rem
+}
+
+/// `(a · b) >> 128` for a 128-bit `a` and a `b < 2^32` — the high part of the
+/// 192-bit product, without a 256-bit type.
+#[inline]
+fn mulhi_128_by_64(a: u128, b: u64) -> u64 {
+    let lo = (a as u64) as u128 * b as u128;
+    let hi = (a >> 64) * b as u128;
+    ((hi + (lo >> 64)) >> 64) as u64
+}
+
+/// Constant-time `v mod p` for `v, p < 2^32` (`p` public, nonzero), by the
+/// same reciprocal trick with a 64-bit reciprocal.
+pub(crate) fn mod_u32_ct(v: u64, p: u64) -> u64 {
+    debug_assert!(p > 0 && p < (1 << 32) && v < (1 << 32));
+    let c = u64::MAX / p + 1;
+    ((c.wrapping_mul(v) as u128 * p as u128) >> 64) as u64
+}
+
+/// Branch-free fold step for counting the trailing zero bits of a
+/// multi-limb value, low limb first: `popcount(x | −x)` is `64 − tz(x)` for
+/// a nonzero limb and `0` for zero, so no `trailing_zeros` intrinsic (a loop
+/// on targets without a hardware count) is needed. `tz_acc` accumulates
+/// while `still_zero` (1 while every lower limb was zero) is set.
+#[inline]
+pub(crate) fn trailing_zeros_step(limb: Limb, tz_acc: &mut u32, still_zero: &mut Limb) {
+    let spread = limb | limb.wrapping_neg();
+    let tz = LIMB_BITS as u64 - spread.count_ones() as u64;
+    *tz_acc += (tz & (0 as Limb).wrapping_sub(*still_zero)) as u32;
+    // `spread >> 63` is 1 iff the limb is nonzero.
+    *still_zero &= (spread >> (LIMB_BITS - 1)) ^ 1;
+}
+
 /// Adds `a + b + carry`, returning `(sum, carry_out)`.
 #[inline]
 pub(crate) const fn adc(a: Limb, b: Limb, carry: Limb) -> (Limb, Limb) {
@@ -200,6 +253,28 @@ impl<const LIMBS: usize> Uint<LIMBS> {
             }
         }
         0
+    }
+
+    /// Returns `self >> shift` (logical right shift by a **public** bit
+    /// count; the limb schedule depends only on `shift`). Shifting by the
+    /// full width or more yields zero.
+    pub fn shr_bits(&self, shift: usize) -> Self {
+        let limb_shift = shift / LIMB_BITS;
+        let bit_shift = shift % LIMB_BITS;
+        let mut out = [0 as Limb; LIMBS];
+        let mut i = 0;
+        while i < LIMBS {
+            let src = i + limb_shift;
+            if src < LIMBS {
+                let mut val = self.limbs[src] >> bit_shift;
+                if bit_shift > 0 && src + 1 < LIMBS {
+                    val |= self.limbs[src + 1] << (LIMB_BITS - bit_shift);
+                }
+                out[i] = val;
+            }
+            i += 1;
+        }
+        Uint { limbs: out }
     }
 
     /// Returns `self >> 1` (one-bit logical right shift).

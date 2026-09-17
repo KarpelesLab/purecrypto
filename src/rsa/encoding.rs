@@ -39,11 +39,14 @@ fn uint_be<const LIMBS: usize>(u: &Uint<LIMBS>) -> Vec<u8> {
 /// Parses a DER `INTEGER`'s content bytes into a `Uint`, rejecting values that
 /// don't fit.
 fn int_to_uint<const LIMBS: usize>(content: &[u8]) -> Result<Uint<LIMBS>, Error> {
-    let start = content
-        .iter()
-        .position(|&b| b != 0)
-        .unwrap_or(content.len());
-    let trimmed = &content[start..];
+    // DER's minimal encoding allows at most one leading 0x00 (the sign
+    // octet). Strip that one by length alone instead of scanning for the
+    // first nonzero byte, which would branch on the value (these integers
+    // include `d`, `p` and `q`); `from_be_bytes` zero-extends the rest.
+    let trimmed = match content {
+        [0, rest @ ..] => rest,
+        _ => content,
+    };
     if trimmed.len() > LIMBS * 8 {
         return Err(Error::Malformed);
     }

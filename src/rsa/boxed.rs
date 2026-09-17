@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use super::emsa::{self, RawPrivate, RawPublic};
 use super::{Error, Pkcs1Digest};
 use crate::bignum::{BoxedMontModulus, BoxedUint};
+use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, HmacSha256, Sha256};
 use crate::rng::{CryptoRng, RngCore};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -153,8 +154,10 @@ fn derive_blinding_boxed(
 
     let mut h = Sha256::new();
     h.update(b"purecrypto-rsa-blinding-seed-v1");
-    // `d` is variable-width; serialize big-endian byte-for-byte.
-    let mut d_bytes = d.to_be_bytes(d.bit_len().div_ceil(8).max(1));
+    // Serialize `d` at the fixed width of its limb storage: sizing it by
+    // `bit_len()` would make the hashed length (and the top-down limb scan)
+    // depend on the leading zero bits of the private exponent.
+    let mut d_bytes = d.to_be_bytes(d.limbs() * 8);
     h.update(&d_bytes);
     // `d_bytes` is the private exponent in the clear: wipe it before the
     // `Vec` is freed.
@@ -219,7 +222,7 @@ fn derive_crt_boxed(
     q: &BoxedUint,
     d: &BoxedUint,
 ) -> Option<alloc::boxed::Box<BoxedRsaCrt>> {
-    if p.bit_len() < 3 || q.bit_len() < 3 || !p.is_odd() || !q.is_odd() || p == q {
+    if p.bit_len() < 3 || q.bit_len() < 3 || !p.is_odd() || !q.is_odd() || bool::from(p.ct_eq(q)) {
         return None;
     }
     let one = BoxedUint::from_u64(1);
@@ -279,11 +282,10 @@ fn derive_blinder_boxed(
     // itself on drop).
     super::wipe(&mut blinder_bytes);
     let r = r_raw.reduce(&mont.modulus());
-    if r.is_zero() || r == BoxedUint::from_u64(1) {
-        BoxedUint::from_u64(2)
-    } else {
-        r
-    }
+    // The blinder is secret: replace the two degenerate values by a masked
+    // select rather than an early-exit compare.
+    let degenerate = r.ct_is_zero() | r.ct_eq(&BoxedUint::from_u64(1));
+    BoxedUint::conditional_select(&BoxedUint::from_u64(2), &r, degenerate)
 }
 
 /// Base-blinded raw RSA private op via the CRT: two half-width
@@ -482,10 +484,12 @@ fn validate_private_components(n: &BoxedUint, p: &BoxedUint, q: &BoxedUint) -> R
     if !p.is_odd() || !q.is_odd() {
         return Err(Error::InvalidKey);
     }
-    if p == q {
+    // `p`, `q` are secret: compare without an early exit at the first
+    // differing limb (the branch on the single verdict bit is fine).
+    if bool::from(p.ct_eq(q)) {
         return Err(Error::InvalidKey);
     }
-    if &p.mul(q) != n {
+    if !bool::from(p.mul(q).ct_eq(n)) {
         return Err(Error::InvalidKey);
     }
     Ok(())
@@ -508,7 +512,7 @@ fn validate_crt_consistency(
     for prime in [p, q] {
         let pm1 = prime.sub(&one);
         let dx = d.reduce(&pm1);
-        if e.mul(&dx).reduce(&pm1) != one {
+        if !bool::from(e.mul(&dx).reduce(&pm1).ct_eq(&one)) {
             return Err(Error::InvalidKey);
         }
     }
@@ -730,16 +734,17 @@ impl BoxedRsaPrivateKey {
     ///   below `2^256`.
     ///
     /// # Side channels
-    /// Key generation deliberately uses the **variable-time** extended-Euclid
-    /// modular inverse [`inv_mod_boxed`](crate::bignum::inv_mod_boxed) for
-    /// `d = e⁻¹ mod φ(n)`, whose loop count depends on its operands, and
-    /// variable-time primality testing. This is a one-time operation on
-    /// freshly generated material, not a per-message secret path, and with the
-    /// usual public `e = 65537` the schedule is short and near
-    /// data-independent — but generate keys somewhere an attacker cannot take
-    /// timing or power measurements. Every *use* of the key stays on the
+    /// Key generation is shaped independently of the secret material it
+    /// produces: `d = e⁻¹ mod φ(n)` comes from the fixed-trip-count
+    /// [`inv_mod_ct_boxed`](crate::bignum::inv_mod_ct_boxed), and the
+    /// primality test of the candidate that becomes `p` or `q` uses no
+    /// division instruction and a fixed number of squarings per Miller-Rabin
+    /// round. What remains observable is public by nature: how many
+    /// candidates were rejected, and whether the `|p − q|` / coprimality
+    /// checks forced a redraw. Still generate keys somewhere an attacker
+    /// cannot take power measurements. Every *use* of the key stays on the
     /// constant-time ladders; `qInv` for the PKCS#1 export comes from the
-    /// constant-time CRT precomputation, not from `inv_mod_boxed`.
+    /// constant-time CRT precomputation.
     ///
     /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]).
     pub fn generate<R: RngCore + CryptoRng>(
@@ -748,7 +753,7 @@ impl BoxedRsaPrivateKey {
         rng: &mut R,
         rounds: usize,
     ) -> Self {
-        use crate::bignum::inv_mod_boxed;
+        use crate::bignum::inv_mod_ct_boxed;
         assert!(
             bits >= 512 && bits.is_multiple_of(2),
             "RsaPrivateKey::generate: bits must be even and >= 512 (got {bits})"
@@ -762,7 +767,7 @@ impl BoxedRsaPrivateKey {
         loop {
             let p = super::prime::random_prime_boxed(rng, half, rounds);
             let q = super::prime::random_prime_boxed(rng, half, rounds);
-            if p == q {
+            if bool::from(p.ct_eq(&q)) {
                 continue;
             }
             // FIPS 186-5 B.3.1: redraw if |p − q| < 2^(bits/2 − 100), which would
@@ -777,8 +782,10 @@ impl BoxedRsaPrivateKey {
             }
             let n = p.mul(&q);
             let phi = p.sub(&one).mul(&q.sub(&one));
-            // d = e^-1 mod φ(n); retry if e is not coprime to φ.
-            if let Some(d) = inv_mod_boxed(&e, &phi) {
+            // d = e^-1 mod φ(n), computed without a data-dependent trip
+            // count (`inv_mod_ct_boxed`); retry if e is not coprime to φ —
+            // that outcome is public by nature.
+            if let Some(d) = inv_mod_ct_boxed(&e, &phi).into_option() {
                 let k = n.bit_len().div_ceil(8);
                 let mont = BoxedMontModulus::new(&n);
                 let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
@@ -1193,17 +1200,13 @@ impl BoxedRsaPrivateKey {
         let dp = self.d.reduce(&self.p.sub(&one));
         let dq = self.d.reduce(&self.q.sub(&one));
         // Reuse the CRT precomputation's `qInv`, which is `q^(p−2) mod p`
-        // through the constant-time Montgomery ladder. The variable-time
-        // extended-Euclid `inv_mod_boxed` would run its binary GCD on the
-        // secret primes here — and would need an `expect` for the
-        // non-coprime case. Fall back to it only for a key whose primes are
-        // degenerate enough that `derive_crt_boxed` refused them (in which
-        // case `qInv` is meaningless anyway and any value round-trips).
+        // through the constant-time Montgomery ladder. A key whose primes
+        // are degenerate enough that `derive_crt_boxed` refused them (even,
+        // tiny or equal) has no meaningful `qInv`; emit zero rather than run
+        // a variable-time Euclid on the secret primes.
         let qinv = match self.crt.as_deref() {
             Some(crt) => crt.qinv.clone(),
-            None => {
-                crate::bignum::inv_mod_boxed(&self.q, &self.p).unwrap_or_else(|| BoxedUint::zero(1))
-            }
+            None => BoxedUint::zero(1),
         };
         let be = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8).max(1));
         encode_sequence(

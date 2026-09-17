@@ -379,7 +379,9 @@ impl BoxedMontModulus {
         // would silently truncate the high limbs of an over-wide exponent,
         // turning the computation into `base^(exp mod 2^(64·self.limbs))` —
         // the precise foot-gun called out in the foundations audit.
-        let exp_width = exp.significant_limbs().max(self.limbs);
+        // `exp.limbs()` (the storage width) is public; `significant_limbs()`
+        // would scan the secret exponent's leading zero limbs.
+        let exp_width = exp.limbs().max(self.limbs);
         let exp_limbs = exp.limbs_resized(exp_width);
         let mut i = exp_limbs.len();
         while i > 0 {

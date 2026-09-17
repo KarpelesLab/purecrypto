@@ -14,6 +14,7 @@
 mod boxed;
 #[cfg(feature = "alloc")]
 mod boxed_montgomery;
+mod ct_inverse;
 mod inverse;
 mod modpow;
 mod montgomery;
@@ -33,8 +34,12 @@ mod uint;
 pub use boxed::BoxedUint;
 #[cfg(feature = "alloc")]
 pub use boxed_montgomery::BoxedMontModulus;
+pub use ct_inverse::{inv_mod_ct, inv_mod_odd_ct};
+#[cfg(feature = "alloc")]
+pub use ct_inverse::{inv_mod_ct_boxed, inv_mod_odd_ct_boxed};
 pub use inverse::inv_mod;
 #[cfg(feature = "alloc")]
 pub use inverse::inv_mod_boxed;
 pub use montgomery::MontModulus;
 pub use uint::{LIMB_BITS, Limb, Uint};
+pub(crate) use uint::{mod_small_limbs, mod_u32_ct, trailing_zeros_step};

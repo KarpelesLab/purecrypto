@@ -7,7 +7,7 @@
 //! `Uint<LIMBS>`.
 
 use super::random_prime;
-use crate::bignum::{MontModulus, Uint, inv_mod};
+use crate::bignum::{MontModulus, Uint, inv_mod_ct};
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::{Digest, Sha256};
 use crate::rng::{CryptoRng, RngCore};
@@ -433,15 +433,16 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// `e` below `2^256`.
     ///
     /// # Side channels
-    /// Key generation deliberately uses the **variable-time** extended-Euclid
-    /// modular inverse [`inv_mod`](crate::bignum::inv_mod) for
-    /// `d = e⁻¹ mod φ(n)`, whose loop count depends on its operands. This is a
-    /// one-time operation on freshly generated material, not a per-message
-    /// path, and with the usual public `e = 65537` the schedule is short and
-    /// near data-independent. Generate keys somewhere an attacker cannot take
-    /// timing or power measurements; every *use* of the key (sign, decrypt)
-    /// stays on the constant-time ladders. Primality testing is likewise
-    /// variable-time.
+    /// Key generation is shaped independently of the secret material it
+    /// produces: `d = e⁻¹ mod φ(n)` comes from the fixed-trip-count
+    /// [`inv_mod_ct`](crate::bignum::inv_mod_ct), and the primality test of
+    /// the candidate that becomes `p` or `q` uses no division instruction
+    /// and a fixed number of squarings per Miller-Rabin round (see
+    /// [`is_prime`](super::prime::is_prime)). What remains observable is
+    /// public by nature: how many candidates were rejected, and whether the
+    /// `|p − q|` / coprimality checks forced a redraw. Still generate keys
+    /// somewhere an attacker cannot take power measurements; every *use* of
+    /// the key (sign, decrypt) stays on the constant-time ladders.
     ///
     /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]).
     pub fn generate<R: RngCore + CryptoRng>(e: Uint<LIMBS>, rng: &mut R, rounds: usize) -> Self {
@@ -455,7 +456,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         loop {
             let p = random_prime::<LIMBS, R>(rng, half_bits, rounds);
             let q = random_prime::<LIMBS, R>(rng, half_bits, rounds);
-            if p == q {
+            if bool::from(p.ct_eq(&q)) {
                 continue;
             }
 
@@ -480,8 +481,10 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
                 .mul_wide(&q.wrapping_sub(&Uint::ONE))
                 .0;
 
-            // d = e^-1 mod φ(n); retry if e is not coprime to φ.
-            if let Some(d) = inv_mod(&e, &phi) {
+            // d = e^-1 mod φ(n), computed without a data-dependent trip
+            // count (`inv_mod_ct`); retry if e is not coprime to φ — that
+            // outcome is public by nature.
+            if let Some(d) = inv_mod_ct(&e, &phi).into_option() {
                 let (phi_n_minus_1, blinding_seed) = derive_blinding(&p, &q, &d);
                 return RsaPrivateKey {
                     n,

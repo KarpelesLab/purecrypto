@@ -1072,7 +1072,14 @@ pub fn sign_into(
     // the top digit it cannot derive from the digit commitments.
     let mut prep_buf = [0u8; 32 * MAX_NPUB];
     let prep = &mut prep_buf[..32 * layout.npub];
-    prep[..message.len()].copy_from_slice(message);
+    // The embedded message is secret, and so is its length (the proof is
+    // fixed-size): fill the whole slot with a masked select rather than a
+    // `message.len()`-byte copy.
+    for (i, slot) in prep.iter_mut().enumerate() {
+        let in_range =
+            0u8.wrapping_sub(((i.wrapping_sub(message.len())) >> (usize::BITS - 1)) as u8);
+        *slot = message.get(i).copied().unwrap_or(0) & in_range;
+    }
     let last_ring = layout.rings - 1;
     let mut digits = [0u64; MAX_RINGS];
     for (i, digit) in digits.iter_mut().enumerate().take(layout.rings) {

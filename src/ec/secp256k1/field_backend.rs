@@ -266,17 +266,21 @@ fn sub_p_mask(r: &[u64; 4], hi: u64) -> ([u64; 4], u64) {
         i += 1;
     }
     // The value is >= P iff there is a high carry bit, or no final borrow.
-    let ge = (hi != 0) | (borrow == 0);
-    (out, mask_from_bool(ge))
+    // Both conditions are formed arithmetically (no `!=`/`==` bools for
+    // LLVM to lower to a branch): `hi | -hi` has its top bit set iff `hi != 0`.
+    let hi_nonzero = (hi | hi.wrapping_neg()) >> 63;
+    let ge = hi_nonzero | ((borrow as u64) ^ 1);
+    (out, mask_from_bit(ge))
 }
 
-/// Expands a secret-derived condition into an all-ones / all-zeros limb mask
-/// without a branch: `wrapping_neg` of the 0/1 value, behind a `black_box`
-/// barrier so LLVM cannot turn the mask back into a conditional jump (the
-/// same idiom `ct::select` uses).
-#[inline(always)]
-fn mask_from_bool(cond: bool) -> u64 {
-    core::hint::black_box((cond as u64).wrapping_neg())
+/// Expands a secret-derived `0`/`1` limb into an all-ones / all-zeros mask
+/// without a branch: `wrapping_neg`, behind a `black_box` barrier so LLVM
+/// cannot turn the mask back into a conditional jump. Takes the bit as a
+/// limb rather than a `bool` so no comparison exists for the compiler to
+/// re-materialise as a jump.
+#[inline]
+fn mask_from_bit(bit: u64) -> u64 {
+    core::hint::black_box(bit.wrapping_neg())
 }
 
 /// Selects `a` when `mask == 0` and `b` when `mask == 0xFFFF…FF`, per limb.
@@ -411,7 +415,7 @@ impl FieldBackend for Secp256k1Field {
             i += 1;
         }
         // On underflow, add p back (constant-time, mask-driven).
-        let mask = mask_from_bool(borrow != 0);
+        let mask = mask_from_bit(borrow as u64);
         let mut out = [0u64; 4];
         let mut carry: u128 = 0;
         let mut j = 0;
@@ -440,7 +444,9 @@ impl FieldBackend for Secp256k1Field {
             borrow = (tmp >> 64) & 1;
             i += 1;
         }
-        let zero_mask = mask_from_bool((a[0] | a[1] | a[2] | a[3]) == 0);
+        let acc = a[0] | a[1] | a[2] | a[3];
+        // Top bit of `acc | -acc` is 1 iff `acc != 0`; invert for "is zero".
+        let zero_mask = mask_from_bit(((acc | acc.wrapping_neg()) >> 63) ^ 1);
         let out = select(&r, &[0u64; 4], zero_mask);
         Fe::from_limbs(out)
     }
