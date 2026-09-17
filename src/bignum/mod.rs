@@ -20,12 +20,13 @@ mod modpow;
 mod montgomery;
 mod mul;
 // Probable-prime testing needs `BoxedUint` (alloc) and random bases (rng);
-// only the `rsa` (keygen) and `dh` (custom-group validation) features use it,
-// so gate on those too to keep other feature combos free of dead code.
+// only the `rsa` (keygen), `dh` (custom-group validation) and `dsa`
+// (subgroup-order validation) features use it, so gate on those too to keep
+// other feature combos free of dead code.
 #[cfg(all(
     feature = "alloc",
     feature = "rng",
-    any(feature = "rsa", feature = "dh")
+    any(feature = "rsa", feature = "dh", feature = "dsa")
 ))]
 pub(crate) mod prime;
 mod uint;
