@@ -295,6 +295,9 @@ mio = { version = "1", default-features = false, features = ["os-ext", "net"], o
 # tests. Not shipped to consumers.
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
+# zlib inflate for the Wycheproof chunked-encryption vectors, whose `ct`
+# field is zlib-compressed (tests/wycheproof/chunked.rs).
+compcol = { version = "0.6", default-features = false, features = ["zlib"] }
 
 [[bin]]
 name = "purecrypto"
