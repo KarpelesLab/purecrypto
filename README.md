@@ -133,19 +133,22 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `ct` (always on) | Branchless equality, selection, ordering, and `Choice` |
 | `zeroize` (always on) | `Zeroize` / `ZeroizeOnDrop` traits and the `Zeroizing<T>` guard: volatile-store secret wiping, a drop-in for the `zeroize` crate |
 | `hash` | SHA-2, SHA-3 / Keccak, SHAKE, cSHAKE, KMAC, TupleHash, ParallelHash, TurboSHAKE, KangarooTwelve, BLAKE2b/2s/2X, BLAKE3, SM3, Whirlpool, Streebog, MD2/4/5, SHA-1, RIPEMD-160; HMAC and the `Mac` trait |
-| `cipher` | AES (constant-time, table-free), SM4, Camellia, ARIA, SEED (table-free); CBC/CFB/OFB/CTR; AES-GCM, CCM, EAX, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV, AEGIS-128/128L/256, MORUS-640/1280, AES-CBC-HMAC-SHA2; XTS; AES-KW/KWP; DES/3DES for legacy interop |
-| `mac` | AES-CMAC, GMAC, UMAC-64/128, SipHash-c-d / SipHashX, VMAC-64/128 |
+| `cipher` | AES (constant-time, table-free), SM4, Camellia, ARIA; CBC/CFB/OFB/CTR; AES-GCM, CCM, EAX, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV, AEGIS-128L/256, AES-CBC-HMAC-SHA2; XTS; AES-KW/KWP; DES/3DES for legacy interop |
+| `legacy-ciphers` | SEED (table-free), MORUS-640/1280, AEGIS-128 and the v1.2 Ascon-128/128a/80pq AEADs (with `ascon`): interop and test-vector coverage only (opt-in) |
+| `mac` | AES-CMAC, GMAC, UMAC-64/128, SipHash-c-d / SipHashX |
+| `vmac` | VMAC-64/128 (draft-krovetz-vmac-01) (opt-in) |
 | `kdf` | HKDF, PBKDF2, scrypt, Argon2id/2d/2i, SP 800-108 KBKDF, PBES2 |
 | `rng` | `RngCore`/`CryptoRng`, HMAC-DRBG, `OsRng` (Unix, Linux `getrandom(2)`, Windows, Apple, WASI, browser wasm) |
 | `bignum` | Const-generic `Uint` and runtime `BoxedUint`, Montgomery arithmetic, constant-time modexp |
 | `rsa` | Key generation (512 to 65536 bits), PKCS#1 v1.5, OAEP, PSS, blinded CRT with fault check, PKCS#1 DER/PEM |
 | `dh` | Finite-field DH over RFC 3526 groups 14 to 18 plus RFC 4419 group exchange |
-| `dsa` | FIPS 186-4 DSA (2048/224, 2048/256, 3072/256) with RFC 6979 nonces, for legacy interop |
-| `bls` | BLS12-381 pairing, RFC 9380 hash-to-curve, BLS signatures (Basic, message augmentation, proof of possession, aggregation) |
-| `fpe` | NIST SP 800-38G FF1 format-preserving encryption over AES, any radix up to 65536 |
-| `chunked` | C2SP chunked encryption (Cobblestone-128/256): streaming, seekable, key-committing AES-GCM |
+| `dsa` | FIPS 186-4 DSA (2048/224, 2048/256, 3072/256) with RFC 6979 nonces, for legacy interop (opt-in) |
+| `bls` | BLS12-381 pairing, RFC 9380 hash-to-curve, BLS signatures (Basic, message augmentation, proof of possession, aggregation) (opt-in) |
+| `fpe` | NIST SP 800-38G FF1 format-preserving encryption over AES, any radix up to 65536 (opt-in) |
+| `chunked` | C2SP chunked encryption (Cobblestone-128/256): streaming, seekable, key-committing AES-GCM (opt-in) |
 | `jose` | JWK / JWK Sets, JWS and JWE (RFC 7515-7518, 8037) with a strict self-contained JSON parser |
 | `ec` | ECDSA/ECDH on P-192, P-224, P-256, P-384, P-521, secp160/192/224 (k1/r1/r2), secp256k1, Brainpool (224–512), ECDH on the binary curves sect283/409/571 (k1/r1); X25519, X448, Ed25519, Ed448; SM2 signature and encryption (P-256 and secp256k1 ECDSA — with Bitcoin/Ethereum key recovery — need no `alloc`) |
+| `legacy-ec` | Curves below the 112-bit level or deprecated by SP 800-186: secp160k1/r1/r2, secp192k1, P-192, secp224k1 and the binary curves sect283/409/571 k1/r1 (ECDH only); interop with old certificates only (opt-in) |
 | `bip340` | BIP340 Schnorr signatures over secp256k1 |
 | `zkp-*` | Experimental secp256k1 extensions mirroring `secp256k1-zkp`: sign-to-contract, ECDSA adaptor signatures, Pedersen commitments, Borromean range proofs, asset surjection proofs, half-aggregation, ring-signature whitelisting (`zkp` enables all; no semver guarantee) |
 | `ristretto255` | The RFC 9496 prime-order group (stable API) |
@@ -155,7 +158,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `slhdsa` | SLH-DSA, all 12 parameter sets (FIPS 205) |
 | `falcon` | Falcon-512/1024 (FN-DSA, FIPS 206 draft) with a constant-time emulated-float sampler |
 | `lms`, `xmss` | LMS/HSS and XMSS/XMSS^MT stateful hash-based signatures (SP 800-208) |
-| `ascon` | Ascon-AEAD128, Ascon-Hash256, XOF128, CXOF128 (SP 800-232), plus the v1.2 Ascon-128/128a/80pq AEADs |
+| `ascon` | Ascon-AEAD128, Ascon-Hash256, XOF128, CXOF128 (SP 800-232) |
 | `aez` | AEZ v5 robust authenticated encryption |
 | `hpke` | RFC 9180: 4 KEMs, 3 KDFs, 3 AEADs, all four modes |
 | `key` | An `EVP_PKEY`-style `PrivateKey`/`PublicKey` facade over every asymmetric key, with generic PKCS#8/SPKI decoding |

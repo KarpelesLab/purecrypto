@@ -1,3 +1,5 @@
+//! Opt-in: enable the `dsa` feature (legacy interop only; off by default).
+//!
 //! FIPS 186-4 DSA: signatures in a prime-order subgroup of `Z_p^*`.
 //!
 //! DSA is the finite-field ancestor of ECDSA. A parameter set

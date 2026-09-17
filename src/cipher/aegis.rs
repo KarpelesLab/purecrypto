@@ -2,9 +2,10 @@
 //! (`draft-irtf-cfrg-aegis-aead`, the CFRG AEGIS family).
 //!
 //! Implements [`Aegis128L`] (128-bit key and nonce, eight-block state) and
-//! [`Aegis256`] (256-bit key and nonce, six-block state), plus the original
-//! CAESAR-portfolio [`Aegis128`] (128-bit key and nonce, five-block state,
-//! not interoperable with 128L). All are AEAD schemes whose state transition
+//! [`Aegis256`] (256-bit key and nonce, six-block state), plus — behind the
+//! opt-in `legacy-ciphers` feature — the original CAESAR-portfolio `Aegis128`
+//! (128-bit key and nonce, five-block state, not interoperable with 128L).
+//! All are AEAD schemes whose state transition
 //! is built entirely from the bare AES round
 //! ([`aes_round`](super::aes::aes_round)), so on a constant-time AES core the
 //! whole construction is constant time and table-free.
@@ -109,16 +110,19 @@ fn len_block(ad_len: usize, msg_len: usize) -> [u8; 16] {
 ///
 /// Construct with [`Aegis128::new`], then call [`encrypt`](Aegis128::encrypt)
 /// / [`decrypt`](Aegis128::decrypt). Only the 128-bit tag is defined.
+#[cfg(feature = "legacy-ciphers")]
 #[derive(Clone)]
 pub struct Aegis128 {
     key: [u8; 16],
 }
 
 /// The mutable 640-bit AEGIS-128 state: five 128-bit blocks.
+#[cfg(feature = "legacy-ciphers")]
 struct State128 {
     s: [[u8; 16]; 5],
 }
 
+#[cfg(feature = "legacy-ciphers")]
 impl State128 {
     /// `StateUpdate128(S, m)` — the AEGIS-128 round, injecting one 128-bit
     /// block at state word 0.
@@ -188,12 +192,14 @@ impl State128 {
     }
 }
 
+#[cfg(feature = "legacy-ciphers")]
 impl Drop for State128 {
     fn drop(&mut self) {
         self.s.zeroize();
     }
 }
 
+#[cfg(feature = "legacy-ciphers")]
 impl Aegis128 {
     /// AEGIS-128 key size in bytes.
     pub const KEY_SIZE: usize = 16;
@@ -290,12 +296,14 @@ impl Aegis128 {
     }
 }
 
+#[cfg(feature = "legacy-ciphers")]
 impl Drop for Aegis128 {
     fn drop(&mut self) {
         self.key.zeroize();
     }
 }
 
+#[cfg(feature = "legacy-ciphers")]
 impl ZeroizeOnDrop for Aegis128 {}
 
 // ===========================================================================
@@ -847,7 +855,7 @@ impl Drop for Aegis256 {
 
 impl ZeroizeOnDrop for Aegis256 {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-ciphers"))]
 mod aegis128_tests {
     use super::*;
 

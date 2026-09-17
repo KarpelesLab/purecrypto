@@ -5,9 +5,11 @@
 use crate::common::{Fields, Outcome, check, check_eq};
 #[cfg(feature = "alloc")]
 use purecrypto::cipher::AesSiv;
+#[cfg(feature = "legacy-ciphers")]
+use purecrypto::cipher::Seed;
 use purecrypto::cipher::{
     Aes128, Aes192, Aes256, AesKw, AesKwp, Aria128, Aria192, Aria256, BlockCipher, Camellia128,
-    Camellia192, Camellia256, Cbc, Cmac, Seed, Xts, kw_ciphertext_len, kwp_ciphertext_len,
+    Camellia192, Camellia256, Cbc, Cmac, Xts, kw_ciphertext_len, kwp_ciphertext_len,
 };
 
 /// Keys the 128/192/256-bit member of a cipher family from `key` and applies
@@ -22,7 +24,9 @@ macro_rules! keyed {
     (camellia, $key:expr, $f:ident($($arg:expr),*)) => {
         keyed!(@ $key, $f($($arg),*); Camellia128, Camellia192, Camellia256)
     };
-    // SEED has a single 128-bit key size; anything else is `Rejected`.
+    // SEED has a single 128-bit key size; anything else is `Rejected`. The
+    // arm only expands under `legacy-ciphers` (see the gated `family_tests!`
+    // below), which is where `Seed` is imported.
     (seed, $key:expr, $f:ident($($arg:expr),*)) => {{
         let key: Vec<u8> = $key;
         match key.len() {
@@ -66,6 +70,10 @@ family_tests! {
     camellia_wrap = camellia / kw_case;
     aes_kwp = aes / kwp_case;
     aria_kwp = aria / kwp_case;
+}
+
+#[cfg(feature = "legacy-ciphers")]
+family_tests! {
     seed_wrap = seed / kw_case;
 }
 

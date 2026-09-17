@@ -12,6 +12,11 @@
 //! combined as the [`ChaCha20Poly1305`] AEAD (RFC 8439) — both inherently
 //! constant time, built from 32-bit ARX and 130-bit limb arithmetic.
 //!
+//! SEED ([`Seed`]), MORUS ([`Morus640`] / [`Morus1280`]) and the original
+//! CAESAR AEGIS-128 ([`Aegis128`], superseded by [`Aegis128L`]) are kept for
+//! interop and test-vector coverage only, behind the opt-in `legacy-ciphers`
+//! feature.
+//!
 //! # AEAD buffer contract on tag failure
 //!
 //! Every in-place AEAD `decrypt` in this crate returns
@@ -46,6 +51,14 @@
 //! * Releasing even a *verified* plaintext is the caller's decision to make
 //!   once; never process a buffer twice "to see" whether the tag matches.
 #![cfg_attr(not(feature = "aez"), doc = "", doc = "[`Aez`]: crate")]
+#![cfg_attr(
+    not(feature = "legacy-ciphers"),
+    doc = "",
+    doc = "[`Seed`]: crate",
+    doc = "[`Morus640`]: crate",
+    doc = "[`Morus1280`]: crate",
+    doc = "[`Aegis128`]: crate"
+)]
 #![cfg_attr(not(feature = "alloc"), doc = "", doc = "[`AesSiv`]: crate#no_std")]
 
 mod aegis;
@@ -77,6 +90,7 @@ mod gcm;
 mod gcm_siv;
 mod gmac;
 mod kw;
+#[cfg(feature = "legacy-ciphers")]
 mod morus;
 mod ofb;
 mod poly1305;
@@ -84,6 +98,7 @@ mod poly1305;
 // permutation.
 #[cfg(all(feature = "kdf", feature = "alloc"))]
 pub(crate) mod salsa20;
+#[cfg(feature = "legacy-ciphers")]
 mod seed;
 mod sm4;
 // AES-SIV returns variable-length `Vec` output (RFC 5297), so it needs `alloc`.
@@ -92,7 +107,9 @@ mod siv;
 mod xchacha20poly1305;
 mod xts;
 
-pub use aegis::{Aegis128, Aegis128L, Aegis256};
+#[cfg(feature = "legacy-ciphers")]
+pub use aegis::Aegis128;
+pub use aegis::{Aegis128L, Aegis256};
 pub use aes::{Aes128, Aes192, Aes256};
 #[cfg(feature = "aez")]
 pub use aez::Aez;
@@ -116,9 +133,11 @@ pub use kw::{
     Aes128Kw, Aes128Kwp, Aes192Kw, Aes192Kwp, Aes256Kw, Aes256Kwp, AesKw, AesKwp, KwError,
     kw_ciphertext_len, kwp_ciphertext_len,
 };
+#[cfg(feature = "legacy-ciphers")]
 pub use morus::{Morus640, Morus1280};
 pub use ofb::Ofb;
 pub use poly1305::Poly1305;
+#[cfg(feature = "legacy-ciphers")]
 pub use seed::Seed;
 #[cfg(feature = "alloc")]
 pub use siv::AesSiv;

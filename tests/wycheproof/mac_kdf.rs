@@ -9,7 +9,9 @@ use purecrypto::hash::{
 };
 use purecrypto::kdf::{try_hkdf, try_pbkdf2};
 #[cfg(feature = "mac")]
-use purecrypto::mac::{SipHash13, SipHash24, SipHash48, SipHashX24, SipHashX48, Vmac64, Vmac128};
+use purecrypto::mac::{SipHash13, SipHash24, SipHash48, SipHashX24, SipHashX48};
+#[cfg(feature = "vmac")]
+use purecrypto::mac::{Vmac64, Vmac128};
 
 // ---- HMAC --------------------------------------------------------------
 
@@ -198,7 +200,7 @@ siphash_tests! {
 /// Runs one `MacWithIvTest` case on a freshly keyed VMAC `state` (either
 /// width): recompute the tag under `iv` (which `finalize` refuses when it is
 /// longer than 127 bits) and cross-check the length-strict `verify`.
-#[cfg(feature = "mac")]
+#[cfg(feature = "vmac")]
 macro_rules! vmac_run {
     ($state:expr, $case:expr) => {{
         let case: &Fields = $case;
@@ -241,7 +243,7 @@ macro_rules! vmac_run {
 /// One `MacWithIvTest` case for `$ty` (`Vmac64` / `Vmac128`, `$n`-byte
 /// tags): keys the state for the case's AES key size, or rejects the
 /// `invalid key size` groups whose length no AES accepts.
-#[cfg(feature = "mac")]
+#[cfg(feature = "vmac")]
 macro_rules! vmac_case {
     ($ty:ident, $n:literal, $group:expr, $case:expr) => {{
         let group: &Fields = $group;
@@ -271,13 +273,13 @@ macro_rules! vmac_case {
     }};
 }
 
-#[cfg(feature = "mac")]
+#[cfg(feature = "vmac")]
 #[test]
 fn vmac_64() {
     check("vmac_64", |group, case| vmac_case!(Vmac64, 8, group, case));
 }
 
-#[cfg(feature = "mac")]
+#[cfg(feature = "vmac")]
 #[test]
 fn vmac_128() {
     check("vmac_128", |group, case| {

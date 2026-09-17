@@ -1,3 +1,5 @@
+//! Opt-in: enable the `fpe` feature (niche; off by default).
+//!
 //! Format-preserving encryption: NIST SP 800-38G **FF1**.
 //!
 //! FF1 enciphers a *numeral string* — a sequence of digits in a chosen

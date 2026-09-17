@@ -55,6 +55,7 @@ impl State {
     /// Applies the 6-round permutation `Ascon-p[6]` (`pb` of the v1.2
     /// Ascon-128 / Ascon-80pq data phases).
     #[inline]
+    #[cfg(feature = "legacy-ciphers")]
     pub(super) fn permute6(&mut self) {
         self.permute(6);
     }

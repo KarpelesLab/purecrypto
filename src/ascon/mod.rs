@@ -20,19 +20,28 @@
 //! the v1.2 spec will **not** match [`AsconAead128`].
 //!
 //! For interoperability with pre-standard deployments the v1.2 AEAD variants
-//! are provided separately as [`Ascon128`], [`Ascon128a`] and [`Ascon80pq`]
-//! (their docs list how the parameters differ); they share the permutation
-//! but nothing else.
+//! are provided separately, behind the opt-in `legacy-ciphers` feature, as
+//! [`Ascon128`], [`Ascon128a`] and [`Ascon80pq`] (their docs list how the
+//! parameters differ); they share the permutation but nothing else.
 //!
 //! Correctness is checked against the official NIST SP 800-232 known-answer
 //! tests (from the Ascon reference repository) for every function, and the
 //! LWC / Wycheproof vectors for the v1.2 variants.
+#![cfg_attr(
+    not(feature = "legacy-ciphers"),
+    doc = "",
+    doc = "[`Ascon128`]: crate",
+    doc = "[`Ascon128a`]: crate",
+    doc = "[`Ascon80pq`]: crate"
+)]
 
 mod aead;
 mod hash;
 mod permutation;
+#[cfg(feature = "legacy-ciphers")]
 mod v12;
 
 pub use aead::AsconAead128;
 pub use hash::{AsconCxof128, AsconHash256, AsconXof128, AsconXofReader};
+#[cfg(feature = "legacy-ciphers")]
 pub use v12::{Ascon80pq, Ascon128, Ascon128a};

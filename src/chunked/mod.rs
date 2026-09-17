@@ -1,3 +1,5 @@
+//! Opt-in: enable the `chunked` feature (niche; off by default).
+//!
 //! C2SP chunked encryption, "Cobblestone"
 //! (<https://c2sp.org/chunked-encryption>).
 //!

@@ -1,3 +1,5 @@
+//! Opt-in: enable the `bls` feature (a large, niche surface; off by default).
+//!
 //! BLS12-381 and the BLS signature scheme.
 //!
 //! This module implements the pairing-friendly curve BLS12-381 from the
