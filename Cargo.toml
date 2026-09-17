@@ -36,7 +36,7 @@ name = "purecrypto"
 # The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "dsa", "bls", "fpe", "jose", "chunked"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "jose"]
 std = ["alloc"]
 alloc = []
 
@@ -197,9 +197,22 @@ slhdsa = ["hash", "rng"]
 # Ascon-Hash256 / Ascon-XOF128 / Ascon-CXOF128, all from one 320-bit
 # permutation.
 ascon = ["hash", "cipher"]
+# --- opt-in (off by default): niche, legacy or large surfaces ---
 # FIPS 186-4 DSA (verify + RFC 6979 signing) over the boxed bignum layer;
-# legacy interop only (Wycheproof `dsa_*`).
+# legacy interop only.
 dsa = ["bignum", "rng", "hash", "alloc", "der"]
+# Curves below the 112-bit security level or deprecated by SP 800-186:
+# secp160k1/r1/r2, secp192k1, P-192, secp224k1, and the binary-field curves
+# sect283/409/571 k1/r1 (`ec::binary`, ECDH only). Interop with old
+# certificates and test corpora; never pick these for new designs.
+legacy-ec = ["ec", "alloc"]
+# Ciphers kept for interop and test-vector coverage rather than recommended
+# use: SEED (RFC 4269), MORUS-640/1280, AEGIS-128 (superseded by AEGIS-128L)
+# and the Ascon v1.2 AEADs (superseded by SP 800-232's Ascon-AEAD128, which
+# stays in `ascon`).
+legacy-ciphers = ["cipher"]
+# VMAC-64/128 (draft-krovetz-vmac-01), a niche AES-based MAC.
+vmac = ["mac"]
 # BLS12-381 pairing-friendly curve, RFC 9380 hash-to-curve and the
 # draft-irtf-cfrg-bls-signature schemes (min-pubkey-size, signatures in G2).
 bls = ["hash", "rng", "alloc"]
