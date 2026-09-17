@@ -44,15 +44,19 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `ct` | — (foundation) | unit (exhaustive u8/i8) | — | — | foundation |
 | `bignum` | — (foundation) | unit | — | — | yes (unconditional) |
 | `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2) | RFC / NIST samples; **Wycheproof** (HMAC ×12, KMAC); M14 oracle-derived (K12-validated), cross-checked vs noble-hashes | OpenSSL (Whirlpool, SM3, SHAKE, BLAKE2), PyCryptodome (MD2), gostcrypto (Streebog), noble-hashes (M14, 14-round) | — | MAC verify CT |
-| `mac` | RFC 4418 (UMAC) | RFC | — | — | built on CT AES |
+| `mac` | RFC 4418 (UMAC), SipHash (Aumasson–Bernstein), draft-krovetz-vmac-01 (VMAC) | RFC / paper vectors; **Wycheproof** (SipHash ×5, VMAC ×2) | — | — | built on CT AES; SipHash ARX; VMAC mask-based arithmetic |
 | `rng` | SP 800-90A (HMAC-DRBG) | CAVP | — | — | n/a (public output) |
-| `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713 | RFC / NIST; **Wycheproof** (GCM, GCM-SIV, CCM, ChaCha20/XChaCha20-Poly1305, AEGIS, GMAC, CBC, CMAC, SIV, KW/KWP, XTS; ARIA/Camellia/SM4 modes) | — | — | AES table-free; ARX |
+| `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713, RFC 4269 (SEED), EAX, MORUS v2, AEGIS, RFC 7518 §5.2 | RFC / NIST; **Wycheproof** (GCM, GCM-SIV, CCM, EAX, ChaCha20/XChaCha20-Poly1305, AEGIS, MORUS, GMAC, CBC, CMAC, SIV, KW/KWP, XTS, CBC-HS; ARIA/Camellia/SEED/SM4 modes) | — | — | AES table-free; ARX |
 | `kdf` | RFC 8018/5869/7914, SP 800-108 | RFC / CAVP; **Wycheproof** (HKDF, PBKDF2, PBES2) | — | `pbes2_decrypt` | built on CT HMAC |
 | `ascon` | NIST SP 800-232 (final) | ref KAT; **Wycheproof** | — | — | permutation (no tables) |
 | `fpe` | NIST SP 800-38G FF1 (Rev. 1 `radix^n >= 10^6` floor; 2016 floor via `new_legacy`) | NIST FF1 samples (AES-128/192/256, radix 10 and 36); **Wycheproof** (22 files: 13 radices as digit lists, 9 as alphabets) | — | — | AES CT; the digit arithmetic is data-dependent by the nature of FPE |
+| `dsa` | FIPS 186-4 (2048/224, 2048/256, 3072/256), RFC 6979 nonces | RFC 6979 A.2.1/A.2.2; **Wycheproof** (8 files) | — | — | CT ladder + CT inverse of `k`; legacy interop only |
+| `bls` | BLS12-381, RFC 9380 (`BLS12381G2_XMD:SHA-256_SSWU_RO_`, G1 too), draft-irtf-cfrg-bls-signature (min-pubkey-size; Basic / Aug / PoP) | RFC 9380 J.9.1 / J.10.1 / K; Ethereum bls12-381-tests; **Wycheproof** (4 files) | — | — | fixed-limb Montgomery fields; masked-window scalar mult; complete addition |
+| `chunked` | c2sp.org/chunked-encryption (Cobblestone-128/256) | **Wycheproof** (2 files) | — | — | delegates to AES-GCM / HKDF; commitment checked in CT before any chunk |
+| `jose` | RFC 7515/7516/7517/7518/7638/8037 (JWS, JWE, JWK, thumbprints, OKP) | RFC appendix examples (bit-exact); **Wycheproof** (4 JOSE files + 6 JWK key-agreement files) | — | — | single collapsed error for every verification/decryption failure; RSA1_5 via implicit rejection |
 | `der` | ITU-T X.690 | unit | — | `der_reader`, `pem_decode` | n/a (public) |
 | `rsa` | RFC 8017 (PKCS#1 v1.5, PSS, OAEP) | unit; **Wycheproof** (v1.5 verify/sign/decrypt, PSS, OAEP, primality) | X.509 SPKI path | `pkcs8_rsa` | base-blinded; CT-shaped keygen |
-| `ec` | FIPS 186, RFC 8032 (EdDSA), RFC 7748 (X25519/X448) | RFC / unit; **Wycheproof** (ECDSA DER + P1363 on 16 curves × SHA-2/SHA-3/SHAKE, ECDH SPKI + raw + PEM, X25519/X448 + SPKI/PEM, Ed25519/Ed448, curve parameters) | OpenSSL (X25519 PKCS#8, ECDSA via dgst) | `ecdsa_sig_der`, `pkcs8_ed25519`, `spki_pubkey` | complete formulas / ladder |
+| `ec` | FIPS 186, SEC 2 (incl. the binary curves), RFC 5639, RFC 8032 (EdDSA), RFC 7748 (X25519/X448) | RFC / unit; **Wycheproof** (ECDSA DER + P1363 on 16 curves × SHA-2/SHA-3/SHAKE, ECDH SPKI + raw + PEM + JWK on 16 curves, X25519/X448 + SPKI/PEM/JWK, Ed25519/Ed448, curve parameters) | OpenSSL (X25519 PKCS#8, ECDSA via dgst) | `ecdsa_sig_der`, `pkcs8_ed25519`, `spki_pubkey` | complete formulas / ladder |
 | `dh` | RFC 3526, RFC 4419, SP 800-56A checks | unit | — (SSH/legacy-TLS groups) | `dh_share` | modexp on CT bignum |
 | `key` | — (facade over the above) | unit (incl. OpenSSL X25519 PKCS#8) | inherits | `spki_pubkey`, `pkcs8_*` | inherits |
 | `mlkem` | FIPS 203 | **ACVP** + OpenSSL 3.5; **Wycheproof** (keygen, encaps, decaps, malformed keys) | OpenSSL (SPKI, ct/ss) | `mlkem_pkcs8` | CT decaps + implicit rejection |
@@ -108,26 +112,39 @@ file whose cases were all skipped fails. Coverage at the time of writing:
 
 | Family | Files | Cases (valid / invalid / acceptable) | Notes |
 |---|---|---|---|
-| AEADs (AES/ARIA/SM4-GCM, GCM-SIV, AES/ARIA/Camellia/SM4-CCM, ChaCha20-/XChaCha20-Poly1305, AEGIS-128L/256, Ascon-AEAD128, GMAC) | 14 | 3461 / 1569 / 0 | all tag lengths CCM defines; wrong-length nonces/keys rejected via the `try_*` APIs |
-| Block-cipher modes (CBC/PKCS#7, CMAC, AES-SIV incl. AES-192, KW/KWP, XTS over AES/ARIA/Camellia) | 14 | 1146 / 2880 / 9 | `Cbc` is unpadded by design; the harness pads |
-| HMAC (SHA-1/2/3, SHA-512/t, SM3), KMAC | 14 | 957 / 1558 / 0 | truncated tags prefix-compared; `verify` is length-strict |
+| AEADs (AES/ARIA/SM4/SEED-GCM, GCM-SIV, AES/ARIA/Camellia/SM4/SEED-CCM, AES-EAX, ChaCha20-/XChaCha20-Poly1305, AEGIS-128/128L/256, MORUS-640/1280, Ascon-128/128a/80pq and Ascon-AEAD128, GMAC, A128/192/256CBC-HS) | 26 | 5700 / 2565 / 0 | all tag lengths CCM defines; wrong-length nonces/keys rejected via the `try_*` APIs |
+| Block-cipher modes (CBC/PKCS#7, CMAC, AES-SIV incl. AES-192, KW/KWP, XTS over AES/ARIA/Camellia/SEED) | 15 | 1150 / 2910 / 10 | `Cbc` is unpadded by design; the harness pads |
+| HMAC (SHA-1/2/3, SHA-512/t, SM3), KMAC, SipHash-1-3/2-4/4-8, SipHashX, VMAC-64/128 | 21 | 2089 / 2154 / 0 | truncated tags prefix-compared; `verify` is length-strict; VMAC nonces with the top bit set rejected |
 | HKDF, PBKDF2, PBES2 | 24 | 1884 / 12 / 0 | one PBKDF2 case skipped (16M iterations); PBES2 vectors are the bare RFC 8018 primitive, checked through PBKDF2 + CBC and — where in the wrapper's algorithm set — asserted to hit the 10 000-iteration floor |
-| ECDSA (P-192/224/256/384/521, secp160k1/r1/r2, secp192k1, secp224k1, secp256k1, brainpoolP224/256/320/384/512r1 × SHA-2, SHA-3, SHAKE; DER and P1363; Bitcoin low-s) | 74 | 13736 / 16167 / 0 | SPKI keys cross-checked against SEC1; P-256 and secp256k1 also through the fixed-size types; P1363 halves are order-width (21 / 29 bytes on the 161- / 225-bit-order curves) |
-| ECDH (SPKI and raw points, 10 curves), curve parameters | 15 | 7820 / 647 / 2301 | all wrong-curve / twist / explicit-parameter keys rejected; compressed peers (Tonelli–Shanks on P-224) must agree; 10 unsupported curves skipped in `ec_prime_order_curves` |
-| ECDH PEM (SPKI + PKCS#8 PEM on P-224/256/384/521), X25519 / X448 PEM | 6 | 2689 / 211 / 1417 | `InvalidPem` (mangled DER behind the armour) rejected like `InvalidAsn`; the PKCS#8 side is `BoxedEcdhPrivateKey::from_pkcs8_pem` |
+| ECDSA (P-192/224/256/384/521, secp160k1/r1/r2, secp192k1, secp224k1, secp256k1, brainpoolP224/256/320/384/512r1 × SHA-2, SHA-3, SHAKE; DER and P1363; Bitcoin low-s) | 73 | 13736 / 16167 / 0 | SPKI keys cross-checked against SEC1; P-256 and secp256k1 also through the fixed-size types; P1363 halves are order-width (21 / 29 bytes on the 161- / 225-bit-order curves) |
+| ECDH (SPKI and raw points, 10 prime curves), curve parameters | 15 | 7820 / 647 / 2301 | all wrong-curve / twist / explicit-parameter keys rejected; compressed peers (Tonelli–Shanks on P-224) must agree; 10 curves absent from the crate (twisted Brainpool, FRP256v1, brainpoolP160/192) skipped in `ec_prime_order_curves` |
+| ECDH on the binary curves sect283/409/571 k1/r1 | 6 | 93 / 126 / 1355 | López–Dahab ladder; low-order peers rejected by the `n·Q = ∞` check |
+| ECDH PEM (SPKI + PKCS#8 PEM on P-224/256/384/521), X25519 / X448 PEM | 6 | 2689 / 211 / 1417 | `InvalidPem` (mangled DER behind the armour) rejected like `InvalidAsn` |
+| ECDH / XDH through JWK (`_webcrypto`, `x25519_jwk`, `x448_jwk`) | 6 | 2723 / 130 / 499 | JWK coordinates exact-width and on-curve; `P-256K` accepted as an input alias |
 | X25519, X448 (raw and SPKI/PKCS#8), Ed25519, Ed448 | 6 | 1140 / 195 / 997 | zero-shared-secret peers are an error (`SmallOrderPeer`) |
+| DSA 2048/224, 2048/256, 3072/256 (DER and P1363) | 8 | 588 / 1364 / 4 | key parsed from components and SPKI and required to agree; `MissingZero` legacy encodings rejected |
 | RSA PKCS#1 v1.5 verify (SHA-2, SHA-512/t, SHA-3), deterministic signing, decryption | 32 | 377 / 6082 / 102 | `MissingNull` DigestInfo rejected; implicit-rejection decrypt cross-checked |
-| RSA-PSS (MGF1 and the RFC 8702 SHAKE128/SHAKE256 forms), RSA-OAEP (incl. an MGF1 hash distinct from the message hash, via the `_mgf` APIs; two-prime and three-prime keys), primality | 52 | 3234 / 1777 / 11 | three-prime OAEP decrypted both from the multi-prime PKCS#8 and from a key built from the components incl. `otherPrimeInfos`; SHAKE-PSS through `verify_pss_shake*` |
+| RSA-PSS (MGF1 and the RFC 8702 SHAKE128/SHAKE256 forms), RSA-OAEP (incl. an MGF1 hash distinct from the message hash, via the `_mgf` APIs; two-prime and three-prime keys), primality | 52 | 3234 / 1777 / 11 | three-prime OAEP decrypted both from the multi-prime PKCS#8 and from a key built from the components incl. `otherPrimeInfos` |
+| BLS12-381: hash-to-G2, Basic / PoP signature verify, aggregate verify | 4 | 82 / 85 / 0 | `NotInSubgroup`, `InvalidFlags`, `NotOnCurve`, `IdentityPoint`, `EmptyAggregate`, `MismatchedCount` must fail with the matching error variant |
 | ML-KEM (keygen, encaps, decaps, malformed keys), ML-DSA (verify, sign from seed and expanded key, contexts) | 21 | 1829 / 965 / 0 | 69 ML-DSA "external mu" cases skipped (no `Sign_internal(mu)` entry point) |
 | FF1 (radix 10/16/26/32/36/45/62/64/85/255/256/65535/65536 as digit lists, and the nine text alphabets through `Alphabet`) | 22 | 49240 / 8006 / 0 | messages up to 260 digits; `SmallMessageSize` cases (valid under the 2016 floor only) are refused by `Ff1::new` and then checked through `Ff1::new_legacy` |
+| C2SP chunked encryption (Cobblestone-128/256) | 2 | 20 / 50 / 0 | one-shot, streaming (partial-prefix + sticky error) and raw-mode paths, plus byte-exact re-encryption with the vectors' salt |
+| JOSE: JWS, JWK sets, JWE, mixed | 4 | 116 / 525 / 0 | 8 `json_web_signature` cases skipped as upstream defects (byte-identical to valid cases or keys whose `alg` contradicts the header); JSON-serialization cases verified through the JSON API |
 
-The corpus found one crate bug (the SPKI parser accepted trailing bytes
-after a well-formed key) and one coverage gap (no AES-192-SIV), both fixed;
-the SHA-3 / SHA-512/t PKCS#1 DigestInfo prefixes and the separate-MGF-hash
-PSS/OAEP forms, multi-prime RSA private keys and RSASSA-PSS with SHAKE
-(RFC 8702) were added so those files could run. (Totals are recomputed at the end of the
-coverage work.) Regenerate after an upstream update with the
-commands in `tools/wycheproof/README.md`.
+**Every one of the 343 upstream files runs: 145 265 cases, 88 skipped**
+(the ML-DSA external-mu cases, the ten curves the parameter file lists that
+the crate does not implement, the eight upstream-defective JWS cases and the
+16M-iteration PBKDF2 case). The corpus found two crate bugs (the SPKI parser
+accepted trailing bytes after a well-formed key; the `key` facade split raw
+`r ‖ s` signatures at the field width, wrong on the curves whose order is a
+bit longer than the field), both fixed. The following were implemented so
+the corpus could be covered in full: AES-192-SIV, SHA-3 / SHA-512/t PKCS#1
+DigestInfo prefixes, separate-MGF-hash PSS/OAEP, multi-prime RSA, SHAKE-PSS
+(RFC 8702), AES-EAX, SEED, MORUS, AEGIS-128, Ascon v1.2,
+AES-CBC-HMAC-SHA2, SipHash/SipHashX, VMAC, FF1, DSA, secp160/192/224 and
+brainpoolP224/320r1, the sect283/409/571 binary curves, BLS12-381 with BLS
+signatures, C2SP chunked encryption and JOSE. Regenerate after an upstream
+update with the commands in `tools/wycheproof/README.md`.
 
 ## Cross-implementation interop
 
