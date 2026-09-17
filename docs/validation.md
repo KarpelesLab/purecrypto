@@ -49,6 +49,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713 | RFC / NIST; **Wycheproof** (GCM, GCM-SIV, CCM, ChaCha20/XChaCha20-Poly1305, AEGIS, GMAC, CBC, CMAC, SIV, KW/KWP, XTS; ARIA/Camellia/SM4 modes) | — | — | AES table-free; ARX |
 | `kdf` | RFC 8018/5869/7914, SP 800-108 | RFC / CAVP; **Wycheproof** (HKDF, PBKDF2, PBES2) | — | `pbes2_decrypt` | built on CT HMAC |
 | `ascon` | NIST SP 800-232 (final) | ref KAT; **Wycheproof** | — | — | permutation (no tables) |
+| `fpe` | NIST SP 800-38G FF1 (Rev. 1 `radix^n >= 10^6` floor; 2016 floor via `new_legacy`) | NIST FF1 samples (AES-128/192/256, radix 10 and 36); **Wycheproof** (22 files: 13 radices as digit lists, 9 as alphabets) | — | — | AES CT; the digit arithmetic is data-dependent by the nature of FPE |
 | `der` | ITU-T X.690 | unit | — | `der_reader`, `pem_decode` | n/a (public) |
 | `rsa` | RFC 8017 (PKCS#1 v1.5, PSS, OAEP) | unit; **Wycheproof** (v1.5 verify/sign/decrypt, PSS, OAEP, primality) | X.509 SPKI path | `pkcs8_rsa` | base-blinded; CT-shaped keygen |
 | `ec` | FIPS 186, RFC 8032 (EdDSA), RFC 7748 (X25519/X448) | RFC / unit; **Wycheproof** (ECDSA DER + P1363 on 7 curves × SHA-2/SHA-3/SHAKE, ECDH SPKI + raw, X25519/X448 + SPKI, Ed25519/Ed448, curve parameters) | OpenSSL (X25519 PKCS#8, ECDSA via dgst) | `ecdsa_sig_der`, `pkcs8_ed25519`, `spki_pubkey` | complete formulas / ladder |
@@ -117,12 +118,13 @@ file whose cases were all skipped fails. Coverage at the time of writing:
 | RSA PKCS#1 v1.5 verify (SHA-2, SHA-512/t, SHA-3), deterministic signing, decryption | 32 | 377 / 6082 / 102 | `MissingNull` DigestInfo rejected; implicit-rejection decrypt cross-checked |
 | RSA-PSS, RSA-OAEP (incl. an MGF1 hash distinct from the message hash, via the `_mgf` APIs), primality | 44 | 2628 / 1493 / 11 | SHAKE-PSS (RFC 8702) is not implemented and its files are excluded |
 | ML-KEM (keygen, encaps, decaps, malformed keys), ML-DSA (verify, sign from seed and expanded key, contexts) | 21 | 1829 / 965 / 0 | 69 ML-DSA "external mu" cases skipped (no `Sign_internal(mu)` entry point) |
+| FF1 (radix 10/16/26/32/36/45/62/64/85/255/256/65535/65536 as digit lists, and the nine text alphabets through `Alphabet`) | 22 | 49240 / 8006 / 0 | messages up to 260 digits; `SmallMessageSize` cases (valid under the 2016 floor only) are refused by `Ff1::new` and then checked through `Ff1::new_legacy` |
 
 The corpus found one crate bug (the SPKI parser accepted trailing bytes
 after a well-formed key) and one coverage gap (no AES-192-SIV), both fixed;
 the SHA-3 / SHA-512/t PKCS#1 DigestInfo prefixes and the separate-MGF-hash
-PSS/OAEP forms were added so those files could run. In total 222 files,
-55 631 cases, 89 skipped. Regenerate after an upstream update with the
+PSS/OAEP forms were added so those files could run. In total 244 files,
+112 877 cases, 89 skipped. Regenerate after an upstream update with the
 commands in `tools/wycheproof/README.md`.
 
 ## Cross-implementation interop
