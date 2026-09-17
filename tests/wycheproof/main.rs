@@ -17,13 +17,13 @@ mod common;
 mod aead;
 #[cfg(feature = "cipher")]
 mod cipher_modes;
-#[cfg(feature = "kdf")]
-mod mac_kdf;
-#[cfg(feature = "ec")]
-mod ecdsa;
 #[cfg(feature = "ec")]
 mod ec_agree;
-#[cfg(feature = "rsa")]
-mod rsa;
+#[cfg(feature = "ec")]
+mod ecdsa;
+#[cfg(feature = "kdf")]
+mod mac_kdf;
 #[cfg(any(feature = "mlkem", feature = "mldsa"))]
 mod pq;
+#[cfg(feature = "rsa")]
+mod rsa;

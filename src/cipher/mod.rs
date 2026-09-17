@@ -229,7 +229,7 @@ impl core::error::Error for TagMismatch {}
 #[non_exhaustive]
 pub enum AeadError {
     /// The key length does not select any variant of the mode (e.g. AES-SIV
-    /// needs 32 or 64 bytes, AES-GCM-SIV 16 or 32).
+    /// needs 32, 48 or 64 bytes, AES-GCM-SIV 16 or 32).
     InvalidKeyLength,
     /// The nonce length is outside the mode's permitted range (e.g. empty
     /// for AES-GCM, outside `7..=13` bytes for AES-CCM).

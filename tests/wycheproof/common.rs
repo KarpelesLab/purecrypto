@@ -221,10 +221,10 @@ where
         for case in &group.tests {
             let outcome = f(&group.fields, case);
             let mut expected = case.expected();
-            if expected == Expected::Acceptable {
-                if let Some(e) = strict(&group.fields, case) {
-                    expected = e;
-                }
+            if expected == Expected::Acceptable
+                && let Some(e) = strict(&group.fields, case)
+            {
+                expected = e;
             }
             let ok = match (outcome, expected) {
                 (Outcome::Skipped, _) => {
@@ -297,7 +297,7 @@ where
 
 /// Hex decoding (upper or lower case, even length).
 pub fn from_hex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "odd-length hex {s:?}");
+    assert!(s.len().is_multiple_of(2), "odd-length hex {s:?}");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or_else(|_| panic!("bad hex {s:?}")))
@@ -312,12 +312,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 3 <= b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 3 <= b.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;

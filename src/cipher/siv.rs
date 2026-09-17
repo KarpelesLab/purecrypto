@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use super::cmac::Cmac;
 use super::ctr::Ctr;
-use super::{AeadError, Aes128, Aes256, TagMismatch};
+use super::{AeadError, Aes128, Aes192, Aes256, TagMismatch};
 use crate::ct::ConstantTimeEq;
 use crate::zeroize::{Zeroize, Zeroizing};
 
@@ -42,10 +42,11 @@ fn xorend(a: &mut [u8], b: &[u8]) {
     }
 }
 
-/// The two block-cipher choices SIV is instantiated over, sharing the same
+/// The three block-cipher choices SIV is instantiated over, sharing the same
 /// S2V / CTR logic via dynamic dispatch on the (already public) key length.
 enum Cipher {
     Aes128 { mac: Aes128, ctr: Aes128 },
+    Aes192 { mac: Aes192, ctr: Aes192 },
     Aes256 { mac: Aes256, ctr: Aes256 },
 }
 
@@ -59,19 +60,20 @@ pub struct AesSiv {
 impl AesSiv {
     /// Creates an AES-SIV context from a `2n`-byte key: the leftmost `n` bytes
     /// key the S2V/CMAC half and the rightmost `n` bytes key CTR. A 32-byte key
-    /// selects AES-128-SIV; a 64-byte key selects AES-256-SIV.
+    /// selects AES-128-SIV, a 48-byte key AES-192-SIV and a 64-byte key
+    /// AES-256-SIV (RFC 5297 §2.2: AEAD_AES_SIV_CMAC_256 / _384 / _512).
     ///
     /// # Panics
-    /// Panics if `key.len()` is not 32 or 64. See [`try_new`](Self::try_new)
+    /// Panics if `key.len()` is not 32, 48 or 64. See [`try_new`](Self::try_new)
     /// for the fallible form.
     pub fn new(key: &[u8]) -> Self {
         Self::try_new(key).unwrap_or_else(|_| {
-            panic!("AES-SIV key must be 32 bytes (AES-128) or 64 bytes (AES-256)")
+            panic!("AES-SIV key must be 32 (AES-128), 48 (AES-192) or 64 (AES-256) bytes")
         })
     }
 
     /// Fallible [`new`](Self::new): returns [`AeadError::InvalidKeyLength`]
-    /// instead of panicking when `key.len()` is neither 32 nor 64.
+    /// instead of panicking when `key.len()` is not 32, 48 or 64.
     pub fn try_new(key: &[u8]) -> Result<Self, AeadError> {
         let cipher = match key.len() {
             32 => {
@@ -79,6 +81,13 @@ impl AesSiv {
                 Cipher::Aes128 {
                     mac: Aes128::new(k1.try_into().unwrap()),
                     ctr: Aes128::new(k2.try_into().unwrap()),
+                }
+            }
+            48 => {
+                let (k1, k2) = key.split_at(24);
+                Cipher::Aes192 {
+                    mac: Aes192::new(k1.try_into().unwrap()),
+                    ctr: Aes192::new(k2.try_into().unwrap()),
                 }
             }
             64 => {
@@ -97,6 +106,11 @@ impl AesSiv {
     fn cmac(&self, data: &[u8]) -> [u8; 16] {
         match &self.cipher {
             Cipher::Aes128 { mac, .. } => {
+                let mut c = Cmac::new(mac.clone());
+                c.update(data);
+                c.finalize()
+            }
+            Cipher::Aes192 { mac, .. } => {
                 let mut c = Cmac::new(mac.clone());
                 c.update(data);
                 c.finalize()
@@ -174,6 +188,7 @@ impl AesSiv {
     fn ctr_xor(&self, iv: &[u8; 16], buf: &mut [u8]) {
         match &self.cipher {
             Cipher::Aes128 { ctr, .. } => Ctr::new(ctr.clone(), iv).apply_keystream(buf),
+            Cipher::Aes192 { ctr, .. } => Ctr::new(ctr.clone(), iv).apply_keystream(buf),
             Cipher::Aes256 { ctr, .. } => Ctr::new(ctr.clone(), iv).apply_keystream(buf),
         }
     }
@@ -422,7 +437,7 @@ mod tests {
     /// bad synthetic IV, and otherwise match the panicking forms.
     #[test]
     fn try_forms_report_errors_and_match_infallible() {
-        for bad in [0usize, 16, 31, 33, 48, 65] {
+        for bad in [0usize, 16, 31, 33, 47, 49, 65] {
             assert!(
                 matches!(
                     AesSiv::try_new(&alloc::vec![0u8; bad]),
@@ -463,7 +478,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "AES-SIV key must be 32 bytes")]
+    #[should_panic(
+        expected = "AES-SIV key must be 32 (AES-128), 48 (AES-192) or 64 (AES-256) bytes"
+    )]
     fn new_bad_key_length_still_panics() {
         let _ = AesSiv::new(&[0u8; 16]);
     }

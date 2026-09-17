@@ -173,13 +173,9 @@ fn kwp_case<C: BlockCipher>(cipher: C, _: &Fields, case: &Fields) -> Outcome {
 /// Runs one SIV case: `blob` is the `V ‖ C` form the crate speaks, `ad` the
 /// S2V header components.
 #[cfg(feature = "alloc")]
-fn siv_case(group: &Fields, case: &Fields, ad: &[&[u8]], blob: &[u8]) -> Outcome {
-    // `AesSiv` only has the AES-128 (32-byte key) and AES-256 (64-byte key)
-    // instantiations; there is no AES-192-SIV variant to run the 384-bit
-    // groups through.
-    if group.int("keySize") == 384 {
-        return Outcome::Skipped;
-    }
+fn siv_case(_: &Fields, case: &Fields, ad: &[&[u8]], blob: &[u8]) -> Outcome {
+    // `AesSiv::try_new` selects AES-128/192/256-SIV from the 32/48/64-byte
+    // key; any other length is a rejection.
     let Ok(siv) = AesSiv::try_new(&case.hex("key")) else {
         return Outcome::Rejected;
     };
