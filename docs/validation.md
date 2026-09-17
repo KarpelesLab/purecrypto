@@ -115,13 +115,14 @@ file whose cases were all skipped fails. Coverage at the time of writing:
 | ECDH (SPKI and raw points, 7 curves), curve parameters | 11 | 5945 / 474 / 1610 | all wrong-curve / twist / explicit-parameter keys rejected; 19 unsupported curves skipped in `ec_prime_order_curves` |
 | X25519, X448 (raw and SPKI/PKCS#8), Ed25519, Ed448 | 6 | 1140 / 195 / 997 | zero-shared-secret peers are an error (`SmallOrderPeer`) |
 | RSA PKCS#1 v1.5 verify (SHA-2, SHA-512/t, SHA-3), deterministic signing, decryption | 32 | 377 / 6082 / 102 | `MissingNull` DigestInfo rejected; implicit-rejection decrypt cross-checked |
-| RSA-PSS, RSA-OAEP, primality | 32 | 1763 / 1219 / 11 | groups whose MGF1 hash differs from the message hash need the `_mgf` APIs; SHAKE-PSS (RFC 8702) is not implemented and its files are excluded |
+| RSA-PSS, RSA-OAEP (incl. an MGF1 hash distinct from the message hash, via the `_mgf` APIs), primality | 44 | 2628 / 1493 / 11 | SHAKE-PSS (RFC 8702) is not implemented and its files are excluded |
 | ML-KEM (keygen, encaps, decaps, malformed keys), ML-DSA (verify, sign from seed and expanded key, contexts) | 21 | 1829 / 965 / 0 | 69 ML-DSA "external mu" cases skipped (no `Sign_internal(mu)` entry point) |
 
 The corpus found one crate bug (the SPKI parser accepted trailing bytes
 after a well-formed key) and one coverage gap (no AES-192-SIV), both fixed;
-the SHA-3 / SHA-512/t PKCS#1 DigestInfo prefixes were added so those
-signature files could run. Regenerate after an upstream update with the
+the SHA-3 / SHA-512/t PKCS#1 DigestInfo prefixes and the separate-MGF-hash
+PSS/OAEP forms were added so those files could run. In total 222 files,
+55 631 cases, 89 skipped. Regenerate after an upstream update with the
 commands in `tools/wycheproof/README.md`.
 
 ## Cross-implementation interop
