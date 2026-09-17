@@ -63,7 +63,7 @@ fn random_uint<const LIMBS: usize, R: RngCore>(rng: &mut R) -> Uint<LIMBS> {
 /// shaped independently of its value: trial division uses no division
 /// instruction, `n − 1 = d·2^s` is split without branching, and every
 /// Miller-Rabin round runs the same number of squarings (see
-/// [`MR_FIXED_SQUARINGS`]). Only the early exits on a *composite* depend on
+/// `MR_FIXED_SQUARINGS`). Only the early exits on a *composite* depend on
 /// the value, and those candidates are fresh random draws that leak nothing
 /// about the prime eventually chosen.
 pub fn is_prime<const LIMBS: usize, R: RngCore>(
