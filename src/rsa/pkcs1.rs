@@ -48,8 +48,28 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         label: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
+        self.encrypt_oaep_mgf::<D, D, R>(msg, label, rng)
+    }
+
+    /// [`encrypt_oaep`](Self::encrypt_oaep) with a distinct MGF1 hash: `D`
+    /// hashes the label (and sets the seed length and message capacity), `M`
+    /// is the digest MGF1 masks the seed and data block with. RFC 8017 §7.1
+    /// allows `M` to differ from `D` (`RSAES-OAEP-params` names
+    /// `maskGenAlgorithm` separately); the common case is `M == D`, which is
+    /// [`encrypt_oaep`](Self::encrypt_oaep). The decryptor must use the same
+    /// pair ([`decrypt_oaep_mgf`](RsaPrivateKey::decrypt_oaep_mgf)).
+    ///
+    /// # Errors
+    /// [`Error::MessageTooLong`] if `msg.len() > k - 2·hLen - 2`, with `hLen`
+    /// the output length of `D`.
+    pub fn encrypt_oaep_mgf<D: Digest, M: Digest, R: RngCore + CryptoRng>(
+        &self,
+        msg: &[u8],
+        label: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; LIMBS * 8];
-        emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng, &mut out)?;
+        emsa::encrypt_oaep::<D, M, _, _>(self, msg, label, rng, &mut out)?;
         Ok(out)
     }
 
@@ -175,9 +195,23 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// decrypted EM so that a bad ciphertext is not distinguishable in timing
     /// from a bad label.
     pub fn decrypt_oaep<D: Digest>(&self, ct: &[u8], label: &[u8]) -> Result<Vec<u8>, Error> {
+        self.decrypt_oaep_mgf::<D, D>(ct, label)
+    }
+
+    /// [`decrypt_oaep`](Self::decrypt_oaep) with a distinct MGF1 hash: `D`
+    /// is the label hash, `M` the digest MGF1 unmasks with. RFC 8017 §7.1
+    /// allows `M` to differ from `D`; the common case is `M == D`, which is
+    /// [`decrypt_oaep`](Self::decrypt_oaep). Both must match the encryptor's
+    /// ([`encrypt_oaep_mgf`](RsaPublicKey::encrypt_oaep_mgf)) — a wrong `M`
+    /// is reported as [`Error::Decryption`] exactly like a wrong label.
+    pub fn decrypt_oaep_mgf<D: Digest, M: Digest>(
+        &self,
+        ct: &[u8],
+        label: &[u8],
+    ) -> Result<Vec<u8>, Error> {
         let mut scratch = vec![0u8; LIMBS * 8];
         let mut out = vec![0u8; LIMBS * 8];
-        let res = emsa::decrypt_oaep::<D, _>(self, ct, label, &mut scratch, &mut out);
+        let res = emsa::decrypt_oaep::<D, M, _>(self, ct, label, &mut scratch, &mut out);
         super::wipe(&mut scratch);
         let n = res?;
         out.truncate(n);
@@ -199,9 +233,78 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{Sha224, Sha256};
+    use crate::hash::{Sha1, Sha224, Sha256};
     use crate::rng::HmacDrbg;
     use crate::test_util::rsa_test_key_a;
+
+    /// `encrypt_oaep_mgf::<D, D>` is the single-digest method: identically
+    /// seeded DRBGs must yield byte-identical ciphertexts, and either
+    /// decryptor recovers them.
+    #[test]
+    fn oaep_mgf_with_equal_digests_matches_single_digest_api() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let drbg = || HmacDrbg::<Sha256>::new(b"rsa-oaep-mgf-eq", b"nonce", &[]);
+        let a = pk
+            .encrypt_oaep::<Sha256, _>(b"secret", b"label", &mut drbg())
+            .unwrap();
+        let b = pk
+            .encrypt_oaep_mgf::<Sha256, Sha256, _>(b"secret", b"label", &mut drbg())
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(key.decrypt_oaep::<Sha256>(&a, b"label").unwrap(), b"secret");
+        assert_eq!(
+            key.decrypt_oaep_mgf::<Sha256, Sha256>(&a, b"label")
+                .unwrap(),
+            b"secret"
+        );
+    }
+
+    /// OAEP with `<SHA-256, MGF1-SHA-1>` (the OpenSSL / Wycheproof
+    /// `sha256_mgf1sha1` profile) round-trips, and only under that pair:
+    /// the single-digest decryptor and every other pairing must fail.
+    #[test]
+    fn oaep_distinct_mgf_hash_roundtrips_and_binds() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-oaep-mgf-sha1", b"nonce", &[]);
+        let ct = pk
+            .encrypt_oaep_mgf::<Sha256, Sha1, _>(b"secret", b"label", &mut r)
+            .unwrap();
+        assert_eq!(
+            key.decrypt_oaep_mgf::<Sha256, Sha1>(&ct, b"label").unwrap(),
+            b"secret"
+        );
+        assert_eq!(
+            key.decrypt_oaep_mgf::<Sha256, Sha1>(&ct, b"other"),
+            Err(Error::Decryption)
+        );
+        assert_eq!(
+            key.decrypt_oaep::<Sha256>(&ct, b"label"),
+            Err(Error::Decryption)
+        );
+        assert_eq!(
+            key.decrypt_oaep::<Sha1>(&ct, b"label"),
+            Err(Error::Decryption)
+        );
+        assert_eq!(
+            key.decrypt_oaep_mgf::<Sha256, Sha224>(&ct, b"label"),
+            Err(Error::Decryption)
+        );
+        assert_eq!(
+            key.decrypt_oaep_mgf::<Sha1, Sha256>(&ct, b"label"),
+            Err(Error::Decryption)
+        );
+        // The message capacity follows the label hash `D` (k - 2·32 - 2 =
+        // 190 octets), not the MGF1 hash (SHA-1 would allow 214): 190
+        // octets fit, 191 do not.
+        pk.encrypt_oaep_mgf::<Sha256, Sha1, _>(&[0u8; 190], b"", &mut r)
+            .unwrap();
+        assert_eq!(
+            pk.encrypt_oaep_mgf::<Sha256, Sha1, _>(&[0u8; 191], b"", &mut r),
+            Err(Error::MessageTooLong)
+        );
+    }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {

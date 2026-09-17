@@ -36,7 +36,9 @@
 //! OAEP honours the `mgf1` hash only when it equals the label hash (the
 //! profile PKCS#1 v2.2 and every real deployment use); any other combination
 //! is rejected with [`Error::UnsupportedParam`] rather than silently
-//! decrypting with the wrong mask generator.
+//! decrypting with the wrong mask generator. (The RSA keys themselves can do
+//! it — `encrypt_oaep_mgf` / `decrypt_oaep_mgf` — but the facade keeps the
+//! single-profile policy.)
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -54,9 +56,11 @@ use super::keys::{RsaPrivateKey, RsaPublicKey};
 // policy, live once in `key::params`.
 use crate::key::dispatch_key_hash as dispatch_hash;
 
-/// The RSA OAEP implementations use one digest for both the label hash and
-/// MGF1. A caller asking for a different MGF1 digest must be told so rather
-/// than silently getting an incompatible ciphertext / a decryption failure.
+/// The facade drives OAEP with one digest for both the label hash and MGF1
+/// (the `encrypt_oaep` / `decrypt_oaep` methods; the `_mgf` twins exist but
+/// are deliberately not dispatched here). A caller asking for a different
+/// MGF1 digest must be told so rather than silently getting an incompatible
+/// ciphertext / a decryption failure.
 fn check_oaep_mgf1(hash: Hash, mgf1: Hash) -> Result<(), Error> {
     if hash == mgf1 {
         Ok(())

@@ -71,9 +71,10 @@ pub trait SignatureAlgorithm: Sync + 'static {
     /// ([`SignatureParams`](crate::x509::SignatureParams)).
     ///
     /// Only RSASSA-PSS has parameters that matter (RFC 4055 §3.1): the
-    /// `rsa-pss-*` entries verify with the signature's salt length, after
-    /// checking that its digest and MGF1 digest are the entry's and its
-    /// trailer field is 1. Every other entry accepts
+    /// `rsa-pss-*` entries verify with the signature's MGF1 digest (any
+    /// SHA-2, equal to the message digest or not — RFC 8017 §8.1) and salt
+    /// length, after checking that its message digest is the entry's and
+    /// its trailer field is 1. Every other entry accepts
     /// [`SignatureParams::None`](crate::x509::SignatureParams::None) only
     /// (the default implementation), and every entry refuses parameters
     /// meant for another algorithm with [`Error::UnsupportedAlgorithm`].

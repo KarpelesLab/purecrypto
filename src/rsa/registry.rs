@@ -8,10 +8,12 @@
 //! [`SignatureAlgorithm`].
 //! Each `verify` parses the SPKI to recover the RSA public key, then
 //! delegates to the existing `BoxedRsaPublicKey::verify_pkcs1v15` /
-//! `verify_pss*`.
+//! `verify_pss*`. A PSS entry's digest is the *message* digest; under
+//! `verify_with_params` the MGF1 digest is whichever SHA-2 the signature's
+//! parameters name (RFC 8017 §8.1 lets it differ), via `verify_pss*_mgf`.
 
 use crate::der::{Reader, parse_oid};
-use crate::hash::{Sha1, Sha256, Sha384, Sha512};
+use crate::hash::{Digest, Sha1, Sha256, Sha384, Sha512};
 use crate::rsa::BoxedRsaPublicKey;
 use crate::signature_registry::SignatureAlgorithm;
 use crate::x509::{Error, PssHash, PssParams, PssRestriction, SignatureParams, oid};
@@ -25,16 +27,19 @@ enum SpkiUse {
     /// RSASSA-PSS"), so verifying a v1.5 signature under such a key would
     /// ignore the very restriction the issuer encoded.
     Pkcs1,
-    /// RSASSA-PSS over `hash` (MGF1 over the same digest, trailer 1) with a
-    /// salt of `salt_len` octets — or of any length when `None`: an
+    /// RSASSA-PSS over `hash` with MGF1 over `mgf1_hash` (trailer 1) and a
+    /// salt of `salt_len` octets — either being "whatever the key's own
+    /// restriction says" when `None` (the key-size policy probe, which must
+    /// accept every SPKI some parameter set would verify under): an
     /// `rsaEncryption` SPKI, or — unless `rsa_encryption_only` — an
     /// `id-RSASSA-PSS` SPKI whose `RSASSA-PSS-params`, when present, permit
-    /// that signature (RFC 4055 §3.3: digest equal, salt at least the
+    /// that signature (RFC 4055 §3.3: digests equal, salt at least the
     /// key's). The `rsa_pss_rsae_*` entries set `rsa_encryption_only`: RFC
     /// 8446 §4.2.3 defines those schemes for a key certified as
     /// `rsaEncryption`, and a PSS-restricted key signs under `rsa_pss_pss_*`.
     Pss {
         hash: PssHash,
+        mgf1_hash: Option<PssHash>,
         salt_len: Option<u32>,
         rsa_encryption_only: bool,
     },
@@ -62,6 +67,7 @@ fn parse_rsa_spki(spki: &[u8], use_: SpkiUse) -> Result<BoxedRsaPublicKey, Error
     } else if alg.as_slice() == oid::ID_RSASSA_PSS {
         let SpkiUse::Pss {
             hash,
+            mgf1_hash,
             salt_len,
             rsa_encryption_only: false,
         } = use_
@@ -70,12 +76,18 @@ fn parse_rsa_spki(spki: &[u8], use_: SpkiUse) -> Result<BoxedRsaPublicKey, Error
         };
         let restriction = PssRestriction::decode(&mut algid)?;
         algid.finish()?;
-        // "Any salt" (the key-size policy probe): the key is usable by this
-        // entry iff its digest profile matches; the salt bound is checked
-        // per signature.
+        // The key-size policy probe leaves the MGF1 digest and the salt
+        // open: the key is usable by this entry iff its message digest
+        // matches; the MGF1 digest and the salt bound are checked per
+        // signature (`verify_with_params` names both).
+        let mgf1_hash = match (mgf1_hash, &restriction) {
+            (Some(m), _) => m,
+            (None, PssRestriction::Restricted(k)) => k.mgf1_hash,
+            (None, PssRestriction::Unrestricted) => hash,
+        };
         let permitted = restriction.permits_params(&PssParams {
             hash,
-            mgf1_hash: hash,
+            mgf1_hash,
             salt_len: salt_len.unwrap_or(u32::MAX),
             trailer_field: 1,
         });
@@ -100,6 +112,38 @@ fn rsa_bits(spki: &[u8], use_: SpkiUse) -> Option<u32> {
         .map(|k| k.modulus().bit_len() as u32)
 }
 
+/// RSASSA-PSS verification with the signature's `RSASSA-PSS-params`: `D`
+/// (the entry's digest, already checked to be `p.hash`) hashes the message,
+/// MGF1 runs over `p.mgf1_hash` and the salt is `p.salt_len` octets. The
+/// equal-digest case takes the single-digest method, so the TLS 1.3 / X.509
+/// profile runs through exactly the path it always did.
+fn verify_pss_with_params<D: Digest>(
+    key: &BoxedRsaPublicKey,
+    entry_hash: PssHash,
+    message: &[u8],
+    signature: &[u8],
+    p: &PssParams,
+) -> Result<(), Error> {
+    let salt_len = usize::try_from(p.salt_len).map_err(|_| Error::Malformed)?;
+    if p.mgf1_hash == entry_hash {
+        return key
+            .verify_pss_with_salt_len::<D>(message, signature, salt_len)
+            .map_err(Error::Rsa);
+    }
+    match p.mgf1_hash {
+        PssHash::Sha256 => {
+            key.verify_pss_with_salt_len_mgf::<D, Sha256>(message, signature, salt_len)
+        }
+        PssHash::Sha384 => {
+            key.verify_pss_with_salt_len_mgf::<D, Sha384>(message, signature, salt_len)
+        }
+        PssHash::Sha512 => {
+            key.verify_pss_with_salt_len_mgf::<D, Sha512>(message, signature, salt_len)
+        }
+    }
+    .map_err(Error::Rsa)
+}
+
 macro_rules! rsa_pkcs1_entry {
     ($(#[$m:meta])* $name:ident, $id:expr, $oid:expr, $tls:expr, $digest:ty) => {
         $(#[$m])*
@@ -118,18 +162,20 @@ macro_rules! rsa_pkcs1_entry {
     };
 }
 
-/// The RSA-PSS entries: MGF1 over `$digest`, salt = digest length under
-/// `verify`, the signature's salt under `verify_with_params`; `$rsae`
-/// restricts the entry to `rsaEncryption` SPKIs.
+/// The RSA-PSS entries: message digest `$digest`; MGF1 over the same digest
+/// and salt = digest length under `verify`, the signature's MGF1 digest and
+/// salt under `verify_with_params`; `$rsae` restricts the entry to
+/// `rsaEncryption` SPKIs.
 macro_rules! rsa_pss_entry {
     ($(#[$m:meta])* $name:ident, $id:expr, $tls:expr, $digest:ty, $pss_hash:expr, $rsae:expr) => {
         $(#[$m])*
         pub(crate) struct $name;
 
         impl $name {
-            fn spki_use(salt_len: Option<u32>) -> SpkiUse {
+            fn spki_use(mgf1_hash: Option<PssHash>, salt_len: Option<u32>) -> SpkiUse {
                 SpkiUse::Pss {
                     hash: $pss_hash,
+                    mgf1_hash,
                     salt_len,
                     rsa_encryption_only: $rsae,
                 }
@@ -142,7 +188,7 @@ macro_rules! rsa_pss_entry {
             fn tls_schemes(&self) -> &'static [u16] { $tls }
             fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
                 let salt_len = $pss_hash.output_len();
-                let key = parse_rsa_spki(spki, Self::spki_use(Some(salt_len)))?;
+                let key = parse_rsa_spki(spki, Self::spki_use(Some($pss_hash), Some(salt_len)))?;
                 key.verify_pss::<$digest>(message, signature).map_err(Error::Rsa)
             }
             fn verify_with_params(
@@ -156,19 +202,18 @@ macro_rules! rsa_pss_entry {
                     SignatureParams::None => return self.verify(spki, message, signature),
                     SignatureParams::RsaPss(p) => p,
                 };
-                // The only profile this entry implements: MGF1 over the
-                // entry's own digest, trailer field 1; the salt length is
-                // the signature's.
-                if p.hash != $pss_hash || p.mgf1_hash != $pss_hash || p.trailer_field != 1 {
+                // The message digest must be the entry's and the trailer
+                // field 1 (RFC 4055 §3.1); the MGF1 digest and the salt
+                // length are the signature's.
+                if p.hash != $pss_hash || p.trailer_field != 1 {
                     return Err(Error::UnsupportedAlgorithm);
                 }
-                let key = parse_rsa_spki(spki, Self::spki_use(Some(p.salt_len)))?;
-                let salt_len = usize::try_from(p.salt_len).map_err(|_| Error::Malformed)?;
-                key.verify_pss_with_salt_len::<$digest>(message, signature, salt_len)
-                    .map_err(Error::Rsa)
+                let key =
+                    parse_rsa_spki(spki, Self::spki_use(Some(p.mgf1_hash), Some(p.salt_len)))?;
+                verify_pss_with_params::<$digest>(&key, $pss_hash, message, signature, &p)
             }
             fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> {
-                rsa_bits(spki, Self::spki_use(None))
+                rsa_bits(spki, Self::spki_use(None, None))
             }
         }
     };
@@ -253,19 +298,20 @@ rsa_pss_entry!(
     true
 );
 
-// The `id-RSASSA-PSS` entries, one per SHA-2 digest, each implementing MGF1
-// over the same digest with trailer field 1.
+// The `id-RSASSA-PSS` entries, one per SHA-2 message digest, with trailer
+// field 1.
 //
 // In X.509 they verify `id-RSASSA-PSS` signatures, whose digest, MGF and
 // salt length live inside the `RSASSA-PSS-params` of the signature's
 // AlgorithmIdentifier (RFC 4055 §3.1) — so no entry carries the OID:
 // `AnyPublicKey::signature_algorithm` resolves the params to the entry for
-// their digest and passes them to `verify_with_params`, which verifies with
-// the signature's salt length. The signing key may be certified as
-// `rsaEncryption` or, PSS-restricted, as `id-RSASSA-PSS`; an SPKI whose own
-// RSASSA-PSS-params restrict the key to another digest, or to a longer
-// salt, is rejected by `parse_rsa_spki` rather than mis-verified (RFC 4055
-// §3.3).
+// their message digest and passes them to `verify_with_params`, which
+// verifies with the signature's MGF1 digest (any SHA-2, equal to the
+// message digest or not) and salt length. The signing key may be certified
+// as `rsaEncryption` or, PSS-restricted, as `id-RSASSA-PSS`; an SPKI whose
+// own RSASSA-PSS-params restrict the key to another digest or MGF1 digest,
+// or to a longer salt, is rejected by `parse_rsa_spki` rather than
+// mis-verified (RFC 4055 §3.3).
 //
 // In TLS they are the `rsa_pss_pss_*` schemes (RFC 8446 §4.2.3; salt =
 // digest length). The RFC ties those code points to an `id-RSASSA-PSS`
@@ -517,8 +563,10 @@ mod tests {
 
     /// `verify_with_params` honours the signature's `RSASSA-PSS-params`:
     /// the salt length is the signature's (not assumed equal to the
-    /// digest), parameters naming another digest / MGF1 digest / trailer
-    /// are refused, and a restricted key bounds the salt from below.
+    /// digest), parameters naming another digest or trailer are refused,
+    /// parameters naming another MGF1 digest verify under that digest (and
+    /// so fail for a plain-profile signature), and a restricted key bounds
+    /// the salt from below.
     #[test]
     fn pss_verify_with_params_uses_the_signature_salt_length() {
         let key = rsa_test_key_a();
@@ -588,7 +636,7 @@ mod tests {
                 })
             )
             .err(),
-            Some(Error::UnsupportedAlgorithm)
+            Some(Error::Rsa(crate::rsa::Error::Verification))
         );
         assert_eq!(
             algo.verify_with_params(
@@ -626,6 +674,141 @@ mod tests {
                 .err(),
             Some(Error::UnsupportedAlgorithm)
         );
+    }
+
+    /// RFC 8017 §8.1 / RFC 4055 §3.1: the MGF1 digest is a parameter of its
+    /// own. A signature made with `<SHA-256, MGF1-SHA-384>` (and the
+    /// Wycheproof `sha512_mgf1sha256_32` profile) verifies through the
+    /// entry for its *message* digest under parameters naming that MGF1
+    /// digest — for an unrestricted key and for a key restricted to exactly
+    /// that pair — and under no other parameters; a key restricted to the
+    /// plain profile refuses the pair, and the key-size probe accepts every
+    /// SPKI `verify_with_params` would.
+    #[test]
+    fn pss_verify_with_params_honours_the_mgf1_digest() {
+        let key = rsa_test_key_a();
+        let mut rng = crate::rng::HmacDrbg::<Sha256>::new(b"reg-pss-mgf", b"n", &[]);
+        let plain = key.sign_pss::<Sha256, _>(b"hi", &mut rng).unwrap();
+        let mixed = key
+            .sign_pss_mgf::<Sha256, Sha384, _>(b"hi", &mut rng)
+            .unwrap();
+        let algo = find_by_id("rsa-pss-pss-sha256").unwrap();
+        let params = |mgf1_hash| {
+            SignatureParams::RsaPss(PssParams {
+                hash: PssHash::Sha256,
+                mgf1_hash,
+                salt_len: 32,
+                trailer_field: 1,
+            })
+        };
+        let unrestricted = pss_spki(None);
+        let r_mixed = pss_spki(Some(pss_params(oid::ID_SHA256, oid::ID_SHA384, 32)));
+        let r_plain = pss_spki(Some(pss_params(oid::ID_SHA256, oid::ID_SHA256, 32)));
+        let rsa_spki = AnyPublicKey::Rsa(boxed_pk_from_rsa_test_key()).to_spki_der();
+
+        for spki in [&unrestricted, &r_mixed, &rsa_spki] {
+            algo.verify_with_params(spki, b"hi", &mixed, params(PssHash::Sha384))
+                .unwrap();
+            assert!(
+                algo.verify_with_params(spki, b"other", &mixed, params(PssHash::Sha384))
+                    .is_err()
+            );
+            // Another MGF1 digest: a verification failure for the keys
+            // that permit it, a refused parameter set for the restricted one.
+            assert!(
+                algo.verify_with_params(spki, b"hi", &mixed, params(PssHash::Sha512))
+                    .is_err()
+            );
+            assert_eq!(algo.rsa_modulus_bits(spki), Some(2048));
+        }
+        assert_eq!(
+            algo.verify_with_params(&unrestricted, b"hi", &mixed, params(PssHash::Sha512))
+                .err(),
+            Some(Error::Rsa(crate::rsa::Error::Verification))
+        );
+        // The plain-profile signature does not verify under the mixed
+        // parameters, nor the mixed one under the plain parameters or the
+        // parameterless default profile.
+        assert_eq!(
+            algo.verify_with_params(&unrestricted, b"hi", &plain, params(PssHash::Sha384))
+                .err(),
+            Some(Error::Rsa(crate::rsa::Error::Verification))
+        );
+        assert_eq!(
+            algo.verify_with_params(&unrestricted, b"hi", &mixed, params(PssHash::Sha256))
+                .err(),
+            Some(Error::Rsa(crate::rsa::Error::Verification))
+        );
+        assert!(
+            algo.verify_with_params(&unrestricted, b"hi", &mixed, SignatureParams::None)
+                .is_err()
+        );
+        // Restrictions are honoured in both directions (RFC 4055 §3.3).
+        assert_eq!(
+            algo.verify_with_params(&r_plain, b"hi", &mixed, params(PssHash::Sha384))
+                .err(),
+            Some(Error::UnsupportedAlgorithm)
+        );
+        assert_eq!(
+            algo.verify_with_params(&r_mixed, b"hi", &plain, params(PssHash::Sha256))
+                .err(),
+            Some(Error::UnsupportedAlgorithm)
+        );
+        assert_eq!(
+            algo.verify(&r_mixed, b"hi", &plain).err(),
+            Some(Error::UnsupportedAlgorithm)
+        );
+        // Another entry never verifies these parameters: the message digest
+        // is the entry's.
+        assert_eq!(
+            find_by_id("rsa-pss-pss-sha384")
+                .unwrap()
+                .verify_with_params(&unrestricted, b"hi", &mixed, params(PssHash::Sha384))
+                .err(),
+            Some(Error::UnsupportedAlgorithm)
+        );
+
+        // SHA-512 message digest with MGF1-SHA-256 and a 32-octet salt: the
+        // `rsa_pss_2048_sha512_mgf1sha256_32_params` Wycheproof profile.
+        let sig = key
+            .sign_pss_with_salt_len_mgf::<Sha512, Sha256, _>(b"hi", 32, &mut rng)
+            .unwrap();
+        let p = SignatureParams::RsaPss(PssParams {
+            hash: PssHash::Sha512,
+            mgf1_hash: PssHash::Sha256,
+            salt_len: 32,
+            trailer_field: 1,
+        });
+        let a512 = find_by_id("rsa-pss-pss-sha512").unwrap();
+        a512.verify_with_params(&unrestricted, b"hi", &sig, p)
+            .unwrap();
+        let r = pss_spki(Some(pss_params(oid::ID_SHA512, oid::ID_SHA256, 32)));
+        a512.verify_with_params(&r, b"hi", &sig, p).unwrap();
+        assert_eq!(a512.rsa_modulus_bits(&r), Some(2048));
+        assert!(a512.verify_with_params(&r, b"other", &sig, p).is_err());
+        assert!(
+            a512.verify_with_params(
+                &unrestricted,
+                b"hi",
+                &sig,
+                SignatureParams::RsaPss(PssParams::for_hash(PssHash::Sha512))
+            )
+            .is_err()
+        );
+        // The parameter set round-trips through `AnyPublicKey`.
+        let any = AnyPublicKey::from_spki_der(&r).unwrap();
+        let alg = SignatureAlgorithmIdentifier::rsa_pss(PssParams {
+            hash: PssHash::Sha512,
+            mgf1_hash: PssHash::Sha256,
+            salt_len: 32,
+            trailer_field: 1,
+        });
+        assert_eq!(
+            any.signature_algorithm(&alg).unwrap().id(),
+            "rsa-pss-pss-sha512"
+        );
+        any.verify(&alg, b"hi", &sig).unwrap();
+        assert!(any.verify(&alg, b"hi", &plain).is_err());
     }
 
     /// The SHA-384 / SHA-512 PSS-PSS entries mirror the SHA-256 one: an

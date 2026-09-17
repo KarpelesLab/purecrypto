@@ -689,18 +689,23 @@ fn fill_nonzero<R: RngCore>(dst: &mut [u8], rng: &mut R) {
 // PSS (RFC 8017 §8.1). The default salt length is the digest length (the
 // profile used by TLS 1.3 and the X.509 PSS parameter set); the
 // `*_with_salt_len` / `*_any_salt` variants relax that for general interop.
+//
+// Two digest parameters throughout: `D` hashes the message (and `M'`), `M`
+// drives MGF1. RFC 8017 §8.1 lets them differ (`RSASSA-PSS-params` carries a
+// separate `maskGenAlgorithm`); the public single-digest methods pass
+// `<D, D>`.
 // --------------------------------------------------------------------------
 
-pub(crate) fn sign_pss<D: Digest, K: RawPrivate, R: RngCore>(
+pub(crate) fn sign_pss<D: Digest, M: Digest, K: RawPrivate, R: RngCore>(
     key: &K,
     msg: &[u8],
     rng: &mut R,
     out: &mut [u8],
 ) -> Result<(), Error> {
-    sign_pss_with_salt_len::<D, K, R>(key, msg, D::OUTPUT_LEN, rng, out)
+    sign_pss_with_salt_len::<D, M, K, R>(key, msg, D::OUTPUT_LEN, rng, out)
 }
 
-pub(crate) fn sign_pss_with_salt_len<D: Digest, K: RawPrivate, R: RngCore>(
+pub(crate) fn sign_pss_with_salt_len<D: Digest, M: Digest, K: RawPrivate, R: RngCore>(
     key: &K,
     msg: &[u8],
     salt_len: usize,
@@ -716,24 +721,24 @@ pub(crate) fn sign_pss_with_salt_len<D: Digest, K: RawPrivate, R: RngCore>(
     // EM is right-aligned in the k-octet block: when the modulus top byte is
     // < 0x80, em_len == k - 1 and the leading octet stays zero.
     out.fill(0);
-    emsa_pss_encode::<D, R>(msg, em_bits, salt_len, rng, &mut out[k - em_len..])?;
+    emsa_pss_encode::<D, M, R>(msg, em_bits, salt_len, rng, &mut out[k - em_len..])?;
     key.raw_private_in_place(out);
     Ok(())
 }
 
-pub(crate) fn verify_pss<D: Digest, K: RawPublic + PublicModulus>(
+pub(crate) fn verify_pss<D: Digest, M: Digest, K: RawPublic + PublicModulus>(
     key: &K,
     msg: &[u8],
     sig: &[u8],
     em: &mut [u8],
     db: &mut [u8],
 ) -> Result<(), Error> {
-    verify_pss_inner::<D, K>(key, msg, sig, Some(D::OUTPUT_LEN), em, db)
+    verify_pss_inner::<D, M, K>(key, msg, sig, Some(D::OUTPUT_LEN), em, db)
 }
 
 /// Verifies an RSA-PSS signature requiring the salt to be exactly `salt_len`
 /// octets.
-pub(crate) fn verify_pss_with_salt_len<D: Digest, K: RawPublic + PublicModulus>(
+pub(crate) fn verify_pss_with_salt_len<D: Digest, M: Digest, K: RawPublic + PublicModulus>(
     key: &K,
     msg: &[u8],
     sig: &[u8],
@@ -741,26 +746,26 @@ pub(crate) fn verify_pss_with_salt_len<D: Digest, K: RawPublic + PublicModulus>(
     em: &mut [u8],
     db: &mut [u8],
 ) -> Result<(), Error> {
-    verify_pss_inner::<D, K>(key, msg, sig, Some(salt_len), em, db)
+    verify_pss_inner::<D, M, K>(key, msg, sig, Some(salt_len), em, db)
 }
 
 /// Verifies an RSA-PSS signature, recovering the salt length from the encoded
 /// message (accepts any valid salt length).
-pub(crate) fn verify_pss_any_salt<D: Digest, K: RawPublic + PublicModulus>(
+pub(crate) fn verify_pss_any_salt<D: Digest, M: Digest, K: RawPublic + PublicModulus>(
     key: &K,
     msg: &[u8],
     sig: &[u8],
     em: &mut [u8],
     db: &mut [u8],
 ) -> Result<(), Error> {
-    verify_pss_inner::<D, K>(key, msg, sig, None, em, db)
+    verify_pss_inner::<D, M, K>(key, msg, sig, None, em, db)
 }
 
 /// `em` and `db` are both `key_size()`-octet scratch buffers: `em` holds the
 /// modulus for the RSAVP1 range check and then the recovered encoded message,
 /// `db` the unmasked data block (which is shorter than `k`, so only a prefix is
 /// used).
-fn verify_pss_inner<D: Digest, K: RawPublic + PublicModulus>(
+fn verify_pss_inner<D: Digest, M: Digest, K: RawPublic + PublicModulus>(
     key: &K,
     msg: &[u8],
     sig: &[u8],
@@ -793,11 +798,14 @@ fn verify_pss_inner<D: Digest, K: RawPublic + PublicModulus>(
     if m[..k - em_len].iter().any(|&b| b != 0) {
         return Err(Error::Verification);
     }
-    emsa_pss_verify::<D>(msg, &m[k - em_len..], em_bits, salt_len, db)
+    emsa_pss_verify::<D, M>(msg, &m[k - em_len..], em_bits, salt_len, db)
 }
 
 // --------------------------------------------------------------------------
-// OAEP (RFC 8017 §7.1)
+// OAEP (RFC 8017 §7.1). `D` is the label hash (it also sets `hLen`, and so
+// the seed length and the message capacity); `M` drives MGF1. RFC 8017 §7.1
+// lets them differ (`RSAES-OAEP-params` carries a separate
+// `maskGenAlgorithm`); the public single-digest methods pass `<D, D>`.
 // --------------------------------------------------------------------------
 
 /// Encrypts into `out`, which must be exactly `key_size()` octets.
@@ -805,7 +813,7 @@ fn verify_pss_inner<D: Digest, K: RawPublic + PublicModulus>(
 /// EM = `0x00 ‖ maskedSeed ‖ maskedDB` is assembled directly in `out`: the seed
 /// and DB are built at their final offsets and masked through disjoint
 /// `split_at_mut` borrows, so no separate seed/DB/mask buffers are needed.
-pub(crate) fn encrypt_oaep<D: Digest, K: RawPublic, R: RngCore>(
+pub(crate) fn encrypt_oaep<D: Digest, M: Digest, K: RawPublic, R: RngCore>(
     key: &K,
     msg: &[u8],
     label: &[u8],
@@ -836,8 +844,8 @@ pub(crate) fn encrypt_oaep<D: Digest, K: RawPublic, R: RngCore>(
 
     // maskedDB = DB ⊕ MGF1(seed), then maskedSeed = seed ⊕ MGF1(maskedDB).
     // Order matters: the second mask is derived from the *masked* DB.
-    mgf1_xor::<D>(seed, db);
-    mgf1_xor::<D>(db, seed);
+    mgf1_xor::<M>(seed, db);
+    mgf1_xor::<M>(db, seed);
 
     key.raw_public_in_place(out);
     Ok(())
@@ -845,7 +853,7 @@ pub(crate) fn encrypt_oaep<D: Digest, K: RawPublic, R: RngCore>(
 
 /// `scratch` must be exactly `key_size()` octets; the recovered message is
 /// written to `out` and its length returned.
-pub(crate) fn decrypt_oaep<D: Digest, K: RawPrivate>(
+pub(crate) fn decrypt_oaep<D: Digest, M: Digest, K: RawPrivate>(
     key: &K,
     ciphertext: &[u8],
     label: &[u8],
@@ -875,8 +883,8 @@ pub(crate) fn decrypt_oaep<D: Digest, K: RawPrivate>(
     // `encrypt_oaep`, run backwards.
     let y = scratch[0];
     let (seed, db) = scratch[1..].split_at_mut(h_len);
-    mgf1_xor::<D>(db, seed);
-    mgf1_xor::<D>(seed, db);
+    mgf1_xor::<M>(db, seed);
+    mgf1_xor::<M>(seed, db);
 
     // Constant-time padding validation. Accumulate a single u8 that is 0 iff
     // every check passed; only branch on it at the very end.
@@ -964,13 +972,13 @@ fn mgf1_xor<D: Digest>(seed: &[u8], dst: &mut [u8]) {
 }
 
 /// Writes the PSS encoded message into `em`, which must be exactly `em_len`
-/// (`em_bits.div_ceil(8)`) octets.
+/// (`em_bits.div_ceil(8)`) octets. `D` is the message hash, `M` the MGF1 hash.
 ///
 /// Everything is built in place. The salt is drawn straight into its final
 /// position inside DB, so `m' = 0x00⁸ ‖ mHash ‖ salt` can be streamed into the
 /// digest instead of assembled in a buffer, and the DB masking reads `H` out of
 /// `em` through a `split_at_mut` so no copy of it is needed either.
-fn emsa_pss_encode<D: Digest, R: RngCore>(
+fn emsa_pss_encode<D: Digest, M: Digest, R: RngCore>(
     msg: &[u8],
     em_bits: usize,
     salt_len: usize,
@@ -1017,7 +1025,7 @@ fn emsa_pss_encode<D: Digest, R: RngCore>(
     // maskedDB = DB ⊕ MGF1(H, db_len). `split_at_mut` hands out disjoint
     // borrows of the DB region and the H region, both of which live in `em`.
     let (db_part, tail) = em.split_at_mut(db_len);
-    mgf1_xor::<D>(&tail[..h_len], db_part);
+    mgf1_xor::<M>(&tail[..h_len], db_part);
 
     let clear = 8 * em_len - em_bits;
     if clear > 0 {
@@ -1026,7 +1034,8 @@ fn emsa_pss_encode<D: Digest, R: RngCore>(
     Ok(())
 }
 
-/// EMSA-PSS-VERIFY (RFC 8017 §9.1.2).
+/// EMSA-PSS-VERIFY (RFC 8017 §9.1.2). `D` is the message hash, `M` the MGF1
+/// hash.
 ///
 /// `salt_len` selects how the salt length is determined:
 /// * `Some(n)` — require the salt to be exactly `n` octets (the `0x01`
@@ -1036,7 +1045,7 @@ fn emsa_pss_encode<D: Digest, R: RngCore>(
 ///   variable-salt verify): DB is zero padding, then a single `0x01` octet,
 ///   then the salt. More interoperable; salt length does not affect PSS
 ///   security.
-fn emsa_pss_verify<D: Digest>(
+fn emsa_pss_verify<D: Digest, M: Digest>(
     msg: &[u8],
     em: &[u8],
     em_bits: usize,
@@ -1064,7 +1073,7 @@ fn emsa_pss_verify<D: Digest>(
     }
     let db = &mut db_buf[..db_len];
     db.copy_from_slice(masked_db);
-    mgf1_xor::<D>(h, db);
+    mgf1_xor::<M>(h, db);
     if clear > 0 {
         db[0] &= 0xff >> clear;
     }

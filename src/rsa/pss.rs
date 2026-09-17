@@ -5,6 +5,14 @@
 //! `*_any_salt` variants relax that for general interop. Gated on `alloc`. The
 //! encoding logic lives in [`super::emsa`]; these are thin wrappers over the
 //! const-generic keys.
+//!
+//! Every method comes in two forms: the single-digest one (`D` for both the
+//! message hash and MGF1 — the TLS 1.3 / X.509 profile and by far the common
+//! case) and a `_mgf` twin taking a separate MGF1 digest `M`, which RFC 8017
+//! §8.1 permits and which OpenSSL and the Wycheproof vectors exercise
+//! (`RSASSA-PSS-params` names `maskGenAlgorithm` independently of
+//! `hashAlgorithm`). The single-digest form is exactly the `_mgf` form with
+//! `M == D`.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -22,8 +30,20 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         msg: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
+        self.sign_pss_mgf::<D, D, R>(msg, rng)
+    }
+
+    /// [`sign_pss`](Self::sign_pss) with a distinct MGF1 hash: `D` hashes
+    /// the message and sets the salt length, `M` is the digest MGF1 masks
+    /// the data block with. RFC 8017 §8.1 allows `M` to differ from `D`; the
+    /// common case is `M == D`, which is [`sign_pss`](Self::sign_pss).
+    pub fn sign_pss_mgf<D: Digest, M: Digest, R: RngCore>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; LIMBS * 8];
-        emsa::sign_pss::<D, _, R>(self, msg, rng, &mut out)?;
+        emsa::sign_pss::<D, M, _, R>(self, msg, rng, &mut out)?;
         Ok(out)
     }
 
@@ -36,8 +56,21 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         salt_len: usize,
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
+        self.sign_pss_with_salt_len_mgf::<D, D, R>(msg, salt_len, rng)
+    }
+
+    /// [`sign_pss_with_salt_len`](Self::sign_pss_with_salt_len) with a
+    /// distinct MGF1 hash `M` (RFC 8017 §8.1 allows it to differ from the
+    /// message hash `D`). The common case is `M == D`, which is
+    /// [`sign_pss_with_salt_len`](Self::sign_pss_with_salt_len).
+    pub fn sign_pss_with_salt_len_mgf<D: Digest, M: Digest, R: RngCore>(
+        &self,
+        msg: &[u8],
+        salt_len: usize,
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; LIMBS * 8];
-        emsa::sign_pss_with_salt_len::<D, _, R>(self, msg, salt_len, rng, &mut out)?;
+        emsa::sign_pss_with_salt_len::<D, M, _, R>(self, msg, salt_len, rng, &mut out)?;
         Ok(out)
     }
 }
@@ -47,8 +80,21 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// requiring the salt length to equal `D`'s output length (the strict
     /// TLS 1.3 / X.509 profile).
     pub fn verify_pss<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+        self.verify_pss_mgf::<D, D>(msg, sig)
+    }
+
+    /// [`verify_pss`](Self::verify_pss) with a distinct MGF1 hash: `D`
+    /// hashes the message and fixes the expected salt length, `M` is the
+    /// digest MGF1 unmasks the data block with. RFC 8017 §8.1 allows `M` to
+    /// differ from `D`; the common case is `M == D`, which is
+    /// [`verify_pss`](Self::verify_pss).
+    pub fn verify_pss_mgf<D: Digest, M: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
         let (mut em, mut db) = (vec![0u8; LIMBS * 8], vec![0u8; LIMBS * 8]);
-        emsa::verify_pss::<D, _>(self, msg, sig, &mut em, &mut db)
+        emsa::verify_pss::<D, M, _>(self, msg, sig, &mut em, &mut db)
     }
 
     /// Verifies an RSA-PSS signature over `msg`, requiring the salt to be
@@ -59,8 +105,21 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         sig: &[u8],
         salt_len: usize,
     ) -> Result<(), Error> {
+        self.verify_pss_with_salt_len_mgf::<D, D>(msg, sig, salt_len)
+    }
+
+    /// [`verify_pss_with_salt_len`](Self::verify_pss_with_salt_len) with a
+    /// distinct MGF1 hash `M` (RFC 8017 §8.1 allows it to differ from the
+    /// message hash `D`). The common case is `M == D`, which is
+    /// [`verify_pss_with_salt_len`](Self::verify_pss_with_salt_len).
+    pub fn verify_pss_with_salt_len_mgf<D: Digest, M: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+        salt_len: usize,
+    ) -> Result<(), Error> {
         let (mut em, mut db) = (vec![0u8; LIMBS * 8], vec![0u8; LIMBS * 8]);
-        emsa::verify_pss_with_salt_len::<D, _>(self, msg, sig, salt_len, &mut em, &mut db)
+        emsa::verify_pss_with_salt_len::<D, M, _>(self, msg, sig, salt_len, &mut em, &mut db)
     }
 
     /// Verifies an RSA-PSS signature over `msg`, recovering the salt length
@@ -68,17 +127,102 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// interop with signers that do not use the salt-length == digest-length
     /// profile.
     pub fn verify_pss_any_salt<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+        self.verify_pss_any_salt_mgf::<D, D>(msg, sig)
+    }
+
+    /// [`verify_pss_any_salt`](Self::verify_pss_any_salt) with a distinct
+    /// MGF1 hash `M` (RFC 8017 §8.1 allows it to differ from the message
+    /// hash `D`). The common case is `M == D`, which is
+    /// [`verify_pss_any_salt`](Self::verify_pss_any_salt).
+    pub fn verify_pss_any_salt_mgf<D: Digest, M: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
         let (mut em, mut db) = (vec![0u8; LIMBS * 8], vec![0u8; LIMBS * 8]);
-        emsa::verify_pss_any_salt::<D, _>(self, msg, sig, &mut em, &mut db)
+        emsa::verify_pss_any_salt::<D, M, _>(self, msg, sig, &mut em, &mut db)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::Sha256;
+    use crate::hash::{Sha1, Sha224, Sha256};
     use crate::rng::HmacDrbg;
     use crate::test_util::rsa_test_key_a;
+
+    /// `sign_pss_mgf::<D, D>` is the single-digest method: identically
+    /// seeded DRBGs must yield byte-identical signatures, and the two verify
+    /// forms must agree on them.
+    #[test]
+    fn mgf_with_equal_digests_matches_single_digest_api() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let drbg = || HmacDrbg::<Sha256>::new(b"rsa-pss-mgf-eq", b"nonce", &[]);
+        let a = key.sign_pss::<Sha256, _>(b"m", &mut drbg()).unwrap();
+        let b = key
+            .sign_pss_mgf::<Sha256, Sha256, _>(b"m", &mut drbg())
+            .unwrap();
+        assert_eq!(a, b);
+        let a = key
+            .sign_pss_with_salt_len::<Sha256, _>(b"m", 20, &mut drbg())
+            .unwrap();
+        let b = key
+            .sign_pss_with_salt_len_mgf::<Sha256, Sha256, _>(b"m", 20, &mut drbg())
+            .unwrap();
+        assert_eq!(a, b);
+        pk.verify_pss_with_salt_len::<Sha256>(b"m", &a, 20).unwrap();
+        pk.verify_pss_with_salt_len_mgf::<Sha256, Sha256>(b"m", &a, 20)
+            .unwrap();
+        pk.verify_pss_any_salt::<Sha256>(b"m", &a).unwrap();
+        pk.verify_pss_any_salt_mgf::<Sha256, Sha256>(b"m", &a)
+            .unwrap();
+        let std = key.sign_pss::<Sha256, _>(b"m", &mut drbg()).unwrap();
+        pk.verify_pss::<Sha256>(b"m", &std).unwrap();
+        pk.verify_pss_mgf::<Sha256, Sha256>(b"m", &std).unwrap();
+    }
+
+    /// A `<SHA-256, MGF1-SHA-1>` signature (the OpenSSL / Wycheproof
+    /// `sha256_mgf1sha1` profile) verifies under exactly that pair: the
+    /// single-digest verifier and every other pairing must reject it.
+    #[test]
+    fn distinct_mgf_hash_binds_both_digests() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-pss-mgf-sha1", b"nonce", &[]);
+        let sig = key.sign_pss_mgf::<Sha256, Sha1, _>(b"m", &mut r).unwrap();
+        pk.verify_pss_mgf::<Sha256, Sha1>(b"m", &sig).unwrap();
+        pk.verify_pss_with_salt_len_mgf::<Sha256, Sha1>(b"m", &sig, 32)
+            .unwrap();
+        pk.verify_pss_any_salt_mgf::<Sha256, Sha1>(b"m", &sig)
+            .unwrap();
+        assert_eq!(
+            pk.verify_pss_mgf::<Sha256, Sha1>(b"other", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(
+            pk.verify_pss::<Sha256>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(pk.verify_pss::<Sha1>(b"m", &sig), Err(Error::Verification));
+        assert_eq!(
+            pk.verify_pss_mgf::<Sha256, Sha224>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(
+            pk.verify_pss_mgf::<Sha1, Sha256>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(
+            pk.verify_pss_any_salt_mgf::<Sha256, Sha256>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        // The salt length still follows the message hash `D`, not `M`.
+        assert_eq!(
+            pk.verify_pss_with_salt_len_mgf::<Sha256, Sha1>(b"m", &sig, 20),
+            Err(Error::Verification)
+        );
+    }
 
     #[test]
     fn sign_verify_roundtrip() {

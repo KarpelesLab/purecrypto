@@ -583,8 +583,21 @@ impl BoxedRsaPublicKey {
     /// requiring the salt length to equal `D`'s output length (the strict
     /// TLS 1.3 / X.509 profile).
     pub fn verify_pss<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+        self.verify_pss_mgf::<D, D>(msg, sig)
+    }
+
+    /// [`verify_pss`](Self::verify_pss) with a distinct MGF1 hash: `D`
+    /// hashes the message and fixes the expected salt length, `M` is the
+    /// digest MGF1 unmasks the data block with. RFC 8017 §8.1 allows `M` to
+    /// differ from `D`; the common case is `M == D`, which is
+    /// [`verify_pss`](Self::verify_pss).
+    pub fn verify_pss_mgf<D: Digest, M: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
         let (mut em, mut db) = (vec![0u8; self.k], vec![0u8; self.k]);
-        emsa::verify_pss::<D, _>(self, msg, sig, &mut em, &mut db)
+        emsa::verify_pss::<D, M, _>(self, msg, sig, &mut em, &mut db)
     }
 
     /// Verifies an RSA-PSS signature over `msg`, requiring the salt to be
@@ -595,8 +608,21 @@ impl BoxedRsaPublicKey {
         sig: &[u8],
         salt_len: usize,
     ) -> Result<(), Error> {
+        self.verify_pss_with_salt_len_mgf::<D, D>(msg, sig, salt_len)
+    }
+
+    /// [`verify_pss_with_salt_len`](Self::verify_pss_with_salt_len) with a
+    /// distinct MGF1 hash `M` (RFC 8017 §8.1 allows it to differ from the
+    /// message hash `D`). The common case is `M == D`, which is
+    /// [`verify_pss_with_salt_len`](Self::verify_pss_with_salt_len).
+    pub fn verify_pss_with_salt_len_mgf<D: Digest, M: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+        salt_len: usize,
+    ) -> Result<(), Error> {
         let (mut em, mut db) = (vec![0u8; self.k], vec![0u8; self.k]);
-        emsa::verify_pss_with_salt_len::<D, _>(self, msg, sig, salt_len, &mut em, &mut db)
+        emsa::verify_pss_with_salt_len::<D, M, _>(self, msg, sig, salt_len, &mut em, &mut db)
     }
 
     /// Verifies an RSA-PSS signature over `msg`, recovering the salt length
@@ -604,8 +630,20 @@ impl BoxedRsaPublicKey {
     /// interop with signers that do not use the salt-length == digest-length
     /// profile.
     pub fn verify_pss_any_salt<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+        self.verify_pss_any_salt_mgf::<D, D>(msg, sig)
+    }
+
+    /// [`verify_pss_any_salt`](Self::verify_pss_any_salt) with a distinct
+    /// MGF1 hash `M` (RFC 8017 §8.1 allows it to differ from the message
+    /// hash `D`). The common case is `M == D`, which is
+    /// [`verify_pss_any_salt`](Self::verify_pss_any_salt).
+    pub fn verify_pss_any_salt_mgf<D: Digest, M: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
         let (mut em, mut db) = (vec![0u8; self.k], vec![0u8; self.k]);
-        emsa::verify_pss_any_salt::<D, _>(self, msg, sig, &mut em, &mut db)
+        emsa::verify_pss_any_salt::<D, M, _>(self, msg, sig, &mut em, &mut db)
     }
 
     /// Encrypts `msg` with PKCS#1 v1.5.
@@ -633,8 +671,24 @@ impl BoxedRsaPublicKey {
         label: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
+        self.encrypt_oaep_mgf::<D, D, R>(msg, label, rng)
+    }
+
+    /// [`encrypt_oaep`](Self::encrypt_oaep) with a distinct MGF1 hash: `D`
+    /// hashes the label (and sets the seed length and message capacity), `M`
+    /// is the digest MGF1 masks the seed and data block with. RFC 8017 §7.1
+    /// allows `M` to differ from `D` (`RSAES-OAEP-params` names
+    /// `maskGenAlgorithm` separately); the common case is `M == D`, which is
+    /// [`encrypt_oaep`](Self::encrypt_oaep). The decryptor must use the same
+    /// pair ([`decrypt_oaep_mgf`](BoxedRsaPrivateKey::decrypt_oaep_mgf)).
+    pub fn encrypt_oaep_mgf<D: Digest, M: Digest, R: RngCore + CryptoRng>(
+        &self,
+        msg: &[u8],
+        label: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; self.k];
-        emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng, &mut out)?;
+        emsa::encrypt_oaep::<D, M, _, _>(self, msg, label, rng, &mut out)?;
         Ok(out)
     }
 }
@@ -842,8 +896,20 @@ impl BoxedRsaPrivateKey {
         msg: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
+        self.sign_pss_mgf::<D, D, R>(msg, rng)
+    }
+
+    /// [`sign_pss`](Self::sign_pss) with a distinct MGF1 hash: `D` hashes
+    /// the message and sets the salt length, `M` is the digest MGF1 masks
+    /// the data block with. RFC 8017 §8.1 allows `M` to differ from `D`; the
+    /// common case is `M == D`, which is [`sign_pss`](Self::sign_pss).
+    pub fn sign_pss_mgf<D: Digest, M: Digest, R: RngCore>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; self.k];
-        emsa::sign_pss::<D, _, R>(self, msg, rng, &mut out)?;
+        emsa::sign_pss::<D, M, _, R>(self, msg, rng, &mut out)?;
         Ok(out)
     }
 
@@ -856,8 +922,21 @@ impl BoxedRsaPrivateKey {
         salt_len: usize,
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
+        self.sign_pss_with_salt_len_mgf::<D, D, R>(msg, salt_len, rng)
+    }
+
+    /// [`sign_pss_with_salt_len`](Self::sign_pss_with_salt_len) with a
+    /// distinct MGF1 hash `M` (RFC 8017 §8.1 allows it to differ from the
+    /// message hash `D`). The common case is `M == D`, which is
+    /// [`sign_pss_with_salt_len`](Self::sign_pss_with_salt_len).
+    pub fn sign_pss_with_salt_len_mgf<D: Digest, M: Digest, R: RngCore>(
+        &self,
+        msg: &[u8],
+        salt_len: usize,
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; self.k];
-        emsa::sign_pss_with_salt_len::<D, _, R>(self, msg, salt_len, rng, &mut out)?;
+        emsa::sign_pss_with_salt_len::<D, M, _, R>(self, msg, salt_len, rng, &mut out)?;
         Ok(out)
     }
 
@@ -962,9 +1041,23 @@ impl BoxedRsaPrivateKey {
     /// Decrypts an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). Hash `D` and
     /// `label` must match those used at encryption.
     pub fn decrypt_oaep<D: Digest>(&self, ct: &[u8], label: &[u8]) -> Result<Vec<u8>, Error> {
+        self.decrypt_oaep_mgf::<D, D>(ct, label)
+    }
+
+    /// [`decrypt_oaep`](Self::decrypt_oaep) with a distinct MGF1 hash: `D`
+    /// is the label hash, `M` the digest MGF1 unmasks with. RFC 8017 §7.1
+    /// allows `M` to differ from `D`; the common case is `M == D`, which is
+    /// [`decrypt_oaep`](Self::decrypt_oaep). Both must match the encryptor's
+    /// ([`encrypt_oaep_mgf`](BoxedRsaPublicKey::encrypt_oaep_mgf)) — a wrong
+    /// `M` is reported as [`Error::Decryption`] exactly like a wrong label.
+    pub fn decrypt_oaep_mgf<D: Digest, M: Digest>(
+        &self,
+        ct: &[u8],
+        label: &[u8],
+    ) -> Result<Vec<u8>, Error> {
         let mut scratch = vec![0u8; self.k];
         let mut out = vec![0u8; self.k];
-        let res = emsa::decrypt_oaep::<D, _>(self, ct, label, &mut scratch, &mut out);
+        let res = emsa::decrypt_oaep::<D, M, _>(self, ct, label, &mut scratch, &mut out);
         super::wipe(&mut scratch);
         let n = res?;
         out.truncate(n);
@@ -1361,9 +1454,107 @@ impl BoxedRsaPrivateKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::Sha256;
+    use crate::hash::{Sha1, Sha256};
     use crate::rng::HmacDrbg;
     use crate::test_util::rsa_test_key_a;
+
+    /// Builds a boxed private key from the const-generic test key's parts.
+    fn boxed_priv() -> BoxedRsaPrivateKey {
+        let key = rsa_test_key_a();
+        let mut nb = [0u8; 256];
+        key.modulus().write_be_bytes(&mut nb);
+        let mut eb = [0u8; 256];
+        key.exponent().write_be_bytes(&mut eb);
+        let mut db = [0u8; 256];
+        key.private_exponent().write_be_bytes(&mut db);
+        BoxedRsaPrivateKey::from_components(
+            BoxedUint::from_be_bytes(&nb),
+            BoxedUint::from_be_bytes(&eb),
+            BoxedUint::from_be_bytes(&db),
+        )
+    }
+
+    /// The boxed `_mgf` twins: `<D, D>` is byte-identical to the
+    /// single-digest form (PSS and OAEP, identically seeded DRBGs), a
+    /// `<SHA-256, MGF1-SHA-1>` PSS signature verifies only under that pair,
+    /// and a `<SHA-256, MGF1-SHA-1>` OAEP ciphertext decrypts only under it.
+    #[test]
+    fn boxed_mgf_twins() {
+        let (_, pk) = boxed_pub();
+        let sk = boxed_priv();
+        let drbg = || HmacDrbg::<Sha256>::new(b"boxed-mgf", b"nonce", &[]);
+
+        let a = sk.sign_pss::<Sha256, _>(b"m", &mut drbg()).unwrap();
+        let b = sk
+            .sign_pss_mgf::<Sha256, Sha256, _>(b"m", &mut drbg())
+            .unwrap();
+        assert_eq!(a, b);
+        let a = sk
+            .sign_pss_with_salt_len::<Sha256, _>(b"m", 20, &mut drbg())
+            .unwrap();
+        let b = sk
+            .sign_pss_with_salt_len_mgf::<Sha256, Sha256, _>(b"m", 20, &mut drbg())
+            .unwrap();
+        assert_eq!(a, b);
+        pk.verify_pss_with_salt_len_mgf::<Sha256, Sha256>(b"m", &a, 20)
+            .unwrap();
+        pk.verify_pss_any_salt_mgf::<Sha256, Sha256>(b"m", &a)
+            .unwrap();
+
+        let sig = sk
+            .sign_pss_mgf::<Sha256, Sha1, _>(b"m", &mut drbg())
+            .unwrap();
+        pk.verify_pss_mgf::<Sha256, Sha1>(b"m", &sig).unwrap();
+        pk.verify_pss_with_salt_len_mgf::<Sha256, Sha1>(b"m", &sig, 32)
+            .unwrap();
+        pk.verify_pss_any_salt_mgf::<Sha256, Sha1>(b"m", &sig)
+            .unwrap();
+        assert_eq!(
+            pk.verify_pss::<Sha256>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(pk.verify_pss::<Sha1>(b"m", &sig), Err(Error::Verification));
+        assert_eq!(
+            pk.verify_pss_mgf::<Sha1, Sha256>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(
+            pk.verify_pss_mgf::<Sha256, Sha1>(b"other", &sig),
+            Err(Error::Verification)
+        );
+
+        let a = pk
+            .encrypt_oaep::<Sha256, _>(b"secret", b"label", &mut drbg())
+            .unwrap();
+        let b = pk
+            .encrypt_oaep_mgf::<Sha256, Sha256, _>(b"secret", b"label", &mut drbg())
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            sk.decrypt_oaep_mgf::<Sha256, Sha256>(&a, b"label").unwrap(),
+            b"secret"
+        );
+
+        let ct = pk
+            .encrypt_oaep_mgf::<Sha256, Sha1, _>(b"secret", b"label", &mut drbg())
+            .unwrap();
+        assert_eq!(
+            sk.decrypt_oaep_mgf::<Sha256, Sha1>(&ct, b"label").unwrap(),
+            b"secret"
+        );
+        assert_eq!(
+            sk.decrypt_oaep::<Sha256>(&ct, b"label"),
+            Err(Error::Decryption)
+        );
+        assert_eq!(
+            sk.decrypt_oaep_mgf::<Sha1, Sha256>(&ct, b"label"),
+            Err(Error::Decryption)
+        );
+        assert_eq!(
+            sk.decrypt_oaep_mgf::<Sha256, Sha1>(&ct, b"other"),
+            Err(Error::Decryption)
+        );
+    }
 
     /// Builds a boxed public key from the const-generic test key.
     fn boxed_pub() -> (crate::rsa::RsaPrivateKey<32>, BoxedRsaPublicKey) {

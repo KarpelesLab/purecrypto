@@ -13,6 +13,10 @@
 //! Output length: signatures and ciphertexts are always exactly `k` octets, so
 //! those methods take a `k`-octet `out` and return `()`. Decryption recovers a
 //! variable-length plaintext, so it returns the number of octets written.
+//!
+//! As in the allocating API, every PSS and OAEP method has a `_mgf` twin
+//! taking a separate MGF1 digest `M` (RFC 8017 §8.1 / §7.1); the
+//! single-digest form is the twin with `M == D`.
 
 use super::keys::KeyScratch;
 use super::{Error, Pkcs1Digest, RsaPrivateKey, RsaPublicKey};
@@ -50,7 +54,20 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         rng: &mut R,
         out: &mut [u8],
     ) -> Result<(), Error> {
-        super::emsa::sign_pss::<D, _, R>(self, msg, rng, out)
+        self.sign_pss_into_mgf::<D, D, R>(msg, rng, out)
+    }
+
+    /// [`sign_pss_into`](Self::sign_pss_into) with a distinct MGF1 hash `M`
+    /// (`D` hashes the message and sets the salt length). RFC 8017 §8.1
+    /// allows `M` to differ from `D`; the common case is `M == D`, which is
+    /// [`sign_pss_into`](Self::sign_pss_into).
+    pub fn sign_pss_into_mgf<D: Digest, M: Digest, R: RngCore>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        super::emsa::sign_pss::<D, M, _, R>(self, msg, rng, out)
     }
 
     /// Signs `msg` with RSA-PSS into `out` using an explicit salt length.
@@ -61,7 +78,21 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         rng: &mut R,
         out: &mut [u8],
     ) -> Result<(), Error> {
-        super::emsa::sign_pss_with_salt_len::<D, _, R>(self, msg, salt_len, rng, out)
+        self.sign_pss_with_salt_len_into_mgf::<D, D, R>(msg, salt_len, rng, out)
+    }
+
+    /// [`sign_pss_with_salt_len_into`](Self::sign_pss_with_salt_len_into)
+    /// with a distinct MGF1 hash `M` (RFC 8017 §8.1 allows it to differ from
+    /// the message hash `D`). The common case is `M == D`, which is
+    /// [`sign_pss_with_salt_len_into`](Self::sign_pss_with_salt_len_into).
+    pub fn sign_pss_with_salt_len_into_mgf<D: Digest, M: Digest, R: RngCore>(
+        &self,
+        msg: &[u8],
+        salt_len: usize,
+        rng: &mut R,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        super::emsa::sign_pss_with_salt_len::<D, M, _, R>(self, msg, salt_len, rng, out)
     }
 
     /// Decrypts a PKCS#1 v1.5 ciphertext into `out`, returning the plaintext
@@ -122,9 +153,23 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         label: &[u8],
         out: &mut [u8],
     ) -> Result<usize, Error> {
+        self.decrypt_oaep_into_mgf::<D, D>(ct, label, out)
+    }
+
+    /// [`decrypt_oaep_into`](Self::decrypt_oaep_into) with a distinct MGF1
+    /// hash `M` (`D` is the label hash). RFC 8017 §7.1 allows `M` to differ
+    /// from `D`; the common case is `M == D`, which is
+    /// [`decrypt_oaep_into`](Self::decrypt_oaep_into). Both must match the
+    /// encryptor's pair.
+    pub fn decrypt_oaep_into_mgf<D: Digest, M: Digest>(
+        &self,
+        ct: &[u8],
+        label: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
         let mut scratch = KeyScratch::<LIMBS>::ZEROED;
         let res =
-            super::emsa::decrypt_oaep::<D, _>(self, ct, label, scratch.as_flattened_mut(), out);
+            super::emsa::decrypt_oaep::<D, M, _>(self, ct, label, scratch.as_flattened_mut(), out);
         super::wipe(scratch.as_flattened_mut());
         res
     }
@@ -160,8 +205,20 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// Verifies an RSA-PSS signature over `msg`, requiring a salt of `D`'s
     /// output length. Stack-allocated scratch, no allocator.
     pub fn verify_pss_noalloc<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+        self.verify_pss_noalloc_mgf::<D, D>(msg, sig)
+    }
+
+    /// [`verify_pss_noalloc`](Self::verify_pss_noalloc) with a distinct MGF1
+    /// hash `M` (`D` hashes the message and fixes the salt length). RFC 8017
+    /// §8.1 allows `M` to differ from `D`; the common case is `M == D`, which
+    /// is [`verify_pss_noalloc`](Self::verify_pss_noalloc).
+    pub fn verify_pss_noalloc_mgf<D: Digest, M: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
         let (mut em, mut db) = (KeyScratch::<LIMBS>::ZEROED, KeyScratch::<LIMBS>::ZEROED);
-        super::emsa::verify_pss::<D, _>(
+        super::emsa::verify_pss::<D, M, _>(
             self,
             msg,
             sig,
@@ -178,8 +235,21 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         sig: &[u8],
         salt_len: usize,
     ) -> Result<(), Error> {
+        self.verify_pss_with_salt_len_noalloc_mgf::<D, D>(msg, sig, salt_len)
+    }
+
+    /// [`verify_pss_with_salt_len_noalloc`](Self::verify_pss_with_salt_len_noalloc)
+    /// with a distinct MGF1 hash `M` (RFC 8017 §8.1 allows it to differ from
+    /// the message hash `D`). The common case is `M == D`, which is
+    /// [`verify_pss_with_salt_len_noalloc`](Self::verify_pss_with_salt_len_noalloc).
+    pub fn verify_pss_with_salt_len_noalloc_mgf<D: Digest, M: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+        salt_len: usize,
+    ) -> Result<(), Error> {
         let (mut em, mut db) = (KeyScratch::<LIMBS>::ZEROED, KeyScratch::<LIMBS>::ZEROED);
-        super::emsa::verify_pss_with_salt_len::<D, _>(
+        super::emsa::verify_pss_with_salt_len::<D, M, _>(
             self,
             msg,
             sig,
@@ -196,8 +266,20 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         msg: &[u8],
         sig: &[u8],
     ) -> Result<(), Error> {
+        self.verify_pss_any_salt_noalloc_mgf::<D, D>(msg, sig)
+    }
+
+    /// [`verify_pss_any_salt_noalloc`](Self::verify_pss_any_salt_noalloc)
+    /// with a distinct MGF1 hash `M` (RFC 8017 §8.1 allows it to differ from
+    /// the message hash `D`). The common case is `M == D`, which is
+    /// [`verify_pss_any_salt_noalloc`](Self::verify_pss_any_salt_noalloc).
+    pub fn verify_pss_any_salt_noalloc_mgf<D: Digest, M: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
         let (mut em, mut db) = (KeyScratch::<LIMBS>::ZEROED, KeyScratch::<LIMBS>::ZEROED);
-        super::emsa::verify_pss_any_salt::<D, _>(
+        super::emsa::verify_pss_any_salt::<D, M, _>(
             self,
             msg,
             sig,
@@ -227,7 +309,21 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         rng: &mut R,
         out: &mut [u8],
     ) -> Result<(), Error> {
-        super::emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng, out)
+        self.encrypt_oaep_into_mgf::<D, D, R>(msg, label, rng, out)
+    }
+
+    /// [`encrypt_oaep_into`](Self::encrypt_oaep_into) with a distinct MGF1
+    /// hash `M` (`D` hashes the label and sets the message capacity). RFC
+    /// 8017 §7.1 allows `M` to differ from `D`; the common case is `M == D`,
+    /// which is [`encrypt_oaep_into`](Self::encrypt_oaep_into).
+    pub fn encrypt_oaep_into_mgf<D: Digest, M: Digest, R: RngCore + CryptoRng>(
+        &self,
+        msg: &[u8],
+        label: &[u8],
+        rng: &mut R,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        super::emsa::encrypt_oaep::<D, M, _, _>(self, msg, label, rng, out)
     }
 }
 
@@ -235,7 +331,7 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
 mod tests {
     use super::*;
     use crate::bignum::Uint;
-    use crate::hash::Sha256;
+    use crate::hash::{Sha1, Sha256};
     use crate::rng::HmacDrbg;
 
     /// A 1024-bit key: quick to generate, yet large enough for PSS and OAEP
@@ -273,6 +369,72 @@ mod tests {
         pk.verify_pss_any_salt_noalloc::<Sha256>(b"embedded", &sig)
             .unwrap();
         assert!(pk.verify_pss_noalloc::<Sha256>(b"other", &sig).is_err());
+    }
+
+    /// The `_mgf` twins: `<D, D>` is byte-identical to the single-digest
+    /// form, and a `<SHA-256, MGF1-SHA-1>` signature / ciphertext is bound
+    /// to that pair.
+    #[test]
+    fn mgf_twins_no_alloc() {
+        let sk = key();
+        let pk = sk.public_key();
+        let drbg = || HmacDrbg::<Sha256>::new(b"nobuf-mgf", b"nonce", &[]);
+
+        let (mut a, mut b) = ([0u8; 128], [0u8; 128]);
+        sk.sign_pss_into::<Sha256, _>(b"m", &mut drbg(), &mut a)
+            .unwrap();
+        sk.sign_pss_into_mgf::<Sha256, Sha256, _>(b"m", &mut drbg(), &mut b)
+            .unwrap();
+        assert_eq!(a, b);
+        sk.sign_pss_with_salt_len_into::<Sha256, _>(b"m", 16, &mut drbg(), &mut a)
+            .unwrap();
+        sk.sign_pss_with_salt_len_into_mgf::<Sha256, Sha256, _>(b"m", 16, &mut drbg(), &mut b)
+            .unwrap();
+        assert_eq!(a, b);
+        pk.verify_pss_with_salt_len_noalloc_mgf::<Sha256, Sha256>(b"m", &a, 16)
+            .unwrap();
+        pk.verify_pss_any_salt_noalloc_mgf::<Sha256, Sha256>(b"m", &a)
+            .unwrap();
+
+        let mut sig = [0u8; 128];
+        sk.sign_pss_into_mgf::<Sha256, Sha1, _>(b"m", &mut drbg(), &mut sig)
+            .unwrap();
+        pk.verify_pss_noalloc_mgf::<Sha256, Sha1>(b"m", &sig)
+            .unwrap();
+        pk.verify_pss_with_salt_len_noalloc_mgf::<Sha256, Sha1>(b"m", &sig, 32)
+            .unwrap();
+        pk.verify_pss_any_salt_noalloc_mgf::<Sha256, Sha1>(b"m", &sig)
+            .unwrap();
+        assert!(pk.verify_pss_noalloc::<Sha256>(b"m", &sig).is_err());
+        assert!(
+            pk.verify_pss_any_salt_noalloc_mgf::<Sha1, Sha256>(b"m", &sig)
+                .is_err()
+        );
+
+        let (mut ca, mut cb) = ([0u8; 128], [0u8; 128]);
+        pk.encrypt_oaep_into::<Sha256, _>(b"secret", b"l", &mut drbg(), &mut ca)
+            .unwrap();
+        pk.encrypt_oaep_into_mgf::<Sha256, Sha256, _>(b"secret", b"l", &mut drbg(), &mut cb)
+            .unwrap();
+        assert_eq!(ca, cb);
+        let mut pt = [0u8; 128];
+        let n = sk
+            .decrypt_oaep_into_mgf::<Sha256, Sha256>(&ca, b"l", &mut pt)
+            .unwrap();
+        assert_eq!(&pt[..n], b"secret");
+
+        let mut ct = [0u8; 128];
+        pk.encrypt_oaep_into_mgf::<Sha256, Sha1, _>(b"secret", b"l", &mut drbg(), &mut ct)
+            .unwrap();
+        let n = sk
+            .decrypt_oaep_into_mgf::<Sha256, Sha1>(&ct, b"l", &mut pt)
+            .unwrap();
+        assert_eq!(&pt[..n], b"secret");
+        assert!(sk.decrypt_oaep_into::<Sha256>(&ct, b"l", &mut pt).is_err());
+        assert!(
+            sk.decrypt_oaep_into_mgf::<Sha256, Sha1>(&ct, b"x", &mut pt)
+                .is_err()
+        );
     }
 
     #[test]

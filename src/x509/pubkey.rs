@@ -104,8 +104,8 @@ impl PssHash {
 
     /// The id of the `rsa-pss-pss-*` entry of [`crate::signature_registry`]
     /// that verifies PSS signatures over this digest (MGF1 with the same
-    /// digest; the salt length is the signature's, defaulting to the digest
-    /// length).
+    /// digest by default; under `verify_with_params` the MGF1 digest and
+    /// the salt length are the signature's).
     pub fn registry_id(self) -> &'static str {
         match self {
             PssHash::Sha256 => "rsa-pss-pss-sha256",
@@ -656,10 +656,12 @@ impl AnyPublicKey {
     /// `id-RSASSA-PSS` is resolved from the identifier's
     /// `RSASSA-PSS-params` (RFC 4055 §3.1), never from the OID alone: the
     /// `rsa-pss-pss-<digest>` entry for the *signature's* digest, provided
-    /// MGF1 uses the same digest and the trailer field is 1 (the only
-    /// profile the registry implements), and — for a restricted
-    /// [`RsaPss`](Self::RsaPss) key — provided the parameters are
-    /// compatible with the key's ([`PssRestriction::permits_params`]).
+    /// the trailer field is 1 (the only one RFC 4055 allows), and — for a
+    /// restricted [`RsaPss`](Self::RsaPss) key — provided the parameters
+    /// are compatible with the key's ([`PssRestriction::permits_params`]).
+    /// The MGF1 digest may be any [`PssHash`], equal to the message digest
+    /// or not (RFC 8017 §8.1); the entry verifies with whichever the
+    /// parameters name.
     /// An identifier without parameters ([`SignatureAlgorithmIdentifier::from_oid`])
     /// names the unsupported SHA-1 defaults and resolves to `None`.
     ///
@@ -675,8 +677,8 @@ impl AnyPublicKey {
         use crate::signature_registry::{find_by_id, find_by_oid};
         if sig_alg.oid() == oid::ID_RSASSA_PSS {
             let p = sig_alg.pss_params()?;
-            if p.mgf1_hash != p.hash || p.trailer_field != 1 {
-                // A MGF1-digest / trailer combination no entry implements.
+            if p.trailer_field != 1 {
+                // RFC 4055 §3.1: trailerField MUST be 1.
                 return None;
             }
             if let AnyPublicKey::RsaPss(_, restriction) = self
@@ -1238,9 +1240,13 @@ mod tests {
             trailer_field: 1,
         });
         assert!(salt20_key.signature_algorithm(&alg256_salt16).is_none());
-        // A restriction no registry entry implements (MGF1 over another
-        // digest) verifies nothing, and neither does a signature with such
-        // parameters.
+        // MGF1 over another digest (RFC 8017 §8.1 allows it): a key
+        // restricted to SHA-256 / MGF1-SHA-384 refuses the SHA-256 /
+        // MGF1-SHA-256 profile, and a signature carrying those parameters
+        // resolves to the SHA-256 entry, which verifies with MGF1-SHA-384 —
+        // so the plain-profile signature fails under it and a signature
+        // made with that pair succeeds, under the plain, the unrestricted
+        // and the matching restricted key alike.
         let odd_params = PssParams {
             hash: PssHash::Sha256,
             mgf1_hash: PssHash::Sha384,
@@ -1251,8 +1257,22 @@ mod tests {
         assert!(odd.signature_algorithm(&alg256).is_none());
         assert!(odd.verify(&alg256, b"hi", &pss256).is_err());
         let odd_alg = SignatureAlgorithmIdentifier::rsa_pss(odd_params);
-        assert!(plain.signature_algorithm(&odd_alg).is_none());
-        assert!(unrestricted.signature_algorithm(&odd_alg).is_none());
+        let pss256_mgf384 = sk
+            .sign_pss_mgf::<Sha256, Sha384, _>(b"hi", &mut rng)
+            .unwrap();
+        for k in [&plain, &unrestricted, &odd] {
+            assert_eq!(
+                k.signature_algorithm(&odd_alg).unwrap().id(),
+                "rsa-pss-pss-sha256"
+            );
+            k.verify(&odd_alg, b"hi", &pss256_mgf384).unwrap();
+            assert!(k.verify(&odd_alg, b"hi", &pss256).is_err());
+            assert!(k.verify(&odd_alg, b"other", &pss256_mgf384).is_err());
+        }
+        assert!(plain.verify(&alg256, b"hi", &pss256_mgf384).is_err());
+        // The key pinned to the plain profile refuses the odd parameters.
+        assert!(r256.signature_algorithm(&odd_alg).is_none());
+        assert!(r256.verify(&odd_alg, b"hi", &pss256_mgf384).is_err());
         // The unrestricted `rsaEncryption` form of the same key is not bound.
         let pkcs1_alg = SignatureAlgorithmIdentifier::from_oid(oid::SHA256_WITH_RSA);
         plain.verify(&pkcs1_alg, b"hi", &pkcs1).unwrap();

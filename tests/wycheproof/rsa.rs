@@ -4,12 +4,12 @@
 //! Files not listed below and why:
 //! * `rsa_pss_*_shake*`: PSS with SHAKE as the hash *and* MGF (RFC 8702);
 //!   the crate's PSS is MGF1-over-a-`Digest` only.
-//! * `rsa_pss_2048_sha256_mgf1sha1_20`, `rsa_pss_2048_sha512_mgf1sha256_32_params`
-//!   and the `rsa_oaep_*_sha<x>_mgf1sha<y>` files with `x != y`: the
-//!   `verify_pss*` / `decrypt_oaep` APIs take a single digest type that is
-//!   used both for the message hash and for MGF1, so a distinct MGF hash
-//!   cannot be expressed. (The mixed groups of `rsa_pss_misc*` and
-//!   `rsa_oaep_misc` are skipped case by case for the same reason.)
+//!
+//! Groups whose MGF1 hash differs from the message hash (`mgfSha != sha`:
+//! the `*_mgf1sha1` / `*_mgf1sha256` files and the mixed groups of
+//! `rsa_pss_misc*` and `rsa_oaep_misc`) go through the `*_mgf::<D, M>`
+//! forms of the API; the equal-hash groups keep using the single-digest
+//! forms, so both surfaces are exercised.
 
 use crate::common::{Expected, Fields, Outcome, check_eq, load, outcome_of, run_with};
 use purecrypto::bignum::Uint;
@@ -22,6 +22,11 @@ use purecrypto::rsa::{BoxedRsaPrivateKey, BoxedRsaPublicKey, is_prime};
 
 /// Runs `$body` with `$D` bound to the digest type named by a Wycheproof
 /// `sha` field; an unknown name yields [`Outcome::Skipped`].
+///
+/// [`with_mgf_digest`] is the same dispatch over the `mgfSha` field, kept
+/// to the digests the PSS / OAEP files actually pair with MGF1 (the SHA-1
+/// and SHA-2 families) so the nested `sha` x `mgfSha` dispatch stays a
+/// manageable number of monomorphisations.
 macro_rules! with_digest {
     ($name:expr, $D:ident => $body:expr) => {
         match $name {
@@ -67,6 +72,42 @@ macro_rules! with_digest {
             }
             "SHA3-512" => {
                 type $D = Sha3_512;
+                $body
+            }
+            _ => Outcome::Skipped,
+        }
+    };
+}
+
+macro_rules! with_mgf_digest {
+    ($name:expr, $M:ident => $body:expr) => {
+        match $name {
+            "SHA-1" => {
+                type $M = Sha1;
+                $body
+            }
+            "SHA-224" => {
+                type $M = Sha224;
+                $body
+            }
+            "SHA-256" => {
+                type $M = Sha256;
+                $body
+            }
+            "SHA-384" => {
+                type $M = Sha384;
+                $body
+            }
+            "SHA-512" => {
+                type $M = Sha512;
+                $body
+            }
+            "SHA-512/224" => {
+                type $M = Sha512_224;
+                $body
+            }
+            "SHA-512/256" => {
+                type $M = Sha512_256;
                 $body
             }
             _ => Outcome::Skipped,
@@ -190,9 +231,9 @@ fn pkcs1v15_sign() {
     }
 }
 
-/// RSASSA-PSS verification with the group's hash and salt length. Groups
-/// whose MGF1 hash differs from the message hash are skipped (see the
-/// module docs). A signature accepted at the exact salt length must also be
+/// RSASSA-PSS verification with the group's hash, MGF1 hash and salt
+/// length: the single-digest verifier when `mgfSha == sha`, the `_mgf` one
+/// otherwise. A signature accepted at the exact salt length must also be
 /// accepted by the salt-recovering verifier.
 #[test]
 fn pss_verify() {
@@ -203,9 +244,11 @@ fn pss_verify() {
         ("rsa_pss_2048_sha256_mgf1_0_params", true),
         ("rsa_pss_2048_sha256_mgf1_32", false),
         ("rsa_pss_2048_sha256_mgf1_32_params", true),
+        ("rsa_pss_2048_sha256_mgf1sha1_20", false),
         ("rsa_pss_2048_sha384_mgf1_48", false),
         ("rsa_pss_2048_sha512_224_mgf1_28", false),
         ("rsa_pss_2048_sha512_256_mgf1_32", false),
+        ("rsa_pss_2048_sha512_mgf1sha256_32_params", true),
         ("rsa_pss_3072_sha256_mgf1_32", false),
         ("rsa_pss_3072_sha256_mgf1_32_params", true),
         ("rsa_pss_4096_sha256_mgf1_32", false),
@@ -219,53 +262,87 @@ fn pss_verify() {
     ] {
         let mut keys = Cached::new();
         run_with(&load(name), policy, |group, case| {
-            if group.str("mgf") != "MGF1" || group.str("mgfSha") != group.str("sha") {
-                return Outcome::Skipped; // distinct MGF hash: not expressible
+            if group.str("mgf") != "MGF1" {
+                return Outcome::Skipped; // SHAKE-PSS (RFC 8702): unsupported
             }
             let pk = keys.get(group.str("publicKeyDer"), || public_key(group, pss_spki));
             let (msg, sig) = (case.hex("msg"), case.hex("sig"));
             let slen = group.int("sLen") as usize;
-            with_digest!(group.str("sha"), D => {
-                match pk.verify_pss_with_salt_len::<D>(&msg, &sig, slen) {
-                    Err(_) => Outcome::Rejected,
-                    Ok(()) if pk.verify_pss_any_salt::<D>(&msg, &sig).is_err() => {
-                        Outcome::Wrong("any-salt verify disagrees")
+            let (sha, mgf_sha) = (group.str("sha"), group.str("mgfSha"));
+            if sha == mgf_sha {
+                with_digest!(sha, D => {
+                    match pk.verify_pss_with_salt_len::<D>(&msg, &sig, slen) {
+                        Err(_) => Outcome::Rejected,
+                        Ok(()) if pk.verify_pss_any_salt::<D>(&msg, &sig).is_err() => {
+                            Outcome::Wrong("any-salt verify disagrees")
+                        }
+                        Ok(()) => Outcome::Accepted,
                     }
-                    Ok(()) => Outcome::Accepted,
-                }
-            })
+                })
+            } else {
+                with_digest!(sha, D => with_mgf_digest!(mgf_sha, M => {
+                    match pk.verify_pss_with_salt_len_mgf::<D, M>(&msg, &sig, slen) {
+                        Err(_) => Outcome::Rejected,
+                        Ok(()) if pk.verify_pss_any_salt_mgf::<D, M>(&msg, &sig).is_err() => {
+                            Outcome::Wrong("any-salt verify disagrees")
+                        }
+                        Ok(()) => Outcome::Accepted,
+                    }
+                }))
+            }
         });
     }
 }
 
-/// RSAES-OAEP decryption with label; `sha == mgfSha` groups only.
+/// RSAES-OAEP decryption with label: the single-digest decryptor when
+/// `mgfSha == sha`, the `_mgf` one otherwise.
 #[test]
 fn oaep_decrypt() {
     for name in [
         "rsa_oaep_2048_sha1_mgf1sha1",
+        "rsa_oaep_2048_sha224_mgf1sha1",
         "rsa_oaep_2048_sha224_mgf1sha224",
+        "rsa_oaep_2048_sha256_mgf1sha1",
         "rsa_oaep_2048_sha256_mgf1sha256",
+        "rsa_oaep_2048_sha384_mgf1sha1",
         "rsa_oaep_2048_sha384_mgf1sha384",
+        "rsa_oaep_2048_sha512_224_mgf1sha1",
         "rsa_oaep_2048_sha512_224_mgf1sha512_224",
+        "rsa_oaep_2048_sha512_mgf1sha1",
         "rsa_oaep_2048_sha512_mgf1sha512",
+        "rsa_oaep_3072_sha256_mgf1sha1",
         "rsa_oaep_3072_sha256_mgf1sha256",
+        "rsa_oaep_3072_sha512_256_mgf1sha1",
         "rsa_oaep_3072_sha512_256_mgf1sha512_256",
+        "rsa_oaep_3072_sha512_mgf1sha1",
         "rsa_oaep_3072_sha512_mgf1sha512",
+        "rsa_oaep_4096_sha256_mgf1sha1",
         "rsa_oaep_4096_sha256_mgf1sha256",
+        "rsa_oaep_4096_sha512_mgf1sha1",
         "rsa_oaep_4096_sha512_mgf1sha512",
         "rsa_oaep_misc",
     ] {
         let mut keys = Cached::new();
         run_with(&load(name), policy, |group, case| {
-            if group.str("mgf") != "MGF1" || group.str("mgfSha") != group.str("sha") {
-                return Outcome::Skipped; // distinct MGF hash: not expressible
+            if group.str("mgf") != "MGF1" {
+                return Outcome::Skipped;
             }
             let sk = keys.get(group.str("privateKeyPkcs8"), || private_key(group));
             let (ct, label) = (case.hex("ct"), case.hex("label"));
-            with_digest!(group.str("sha"), D => match sk.decrypt_oaep::<D>(&ct, &label) {
-                Ok(msg) => check_eq(&msg, &case.hex("msg"), "plaintext"),
-                Err(_) => Outcome::Rejected,
-            })
+            let (sha, mgf_sha) = (group.str("sha"), group.str("mgfSha"));
+            if sha == mgf_sha {
+                with_digest!(sha, D => match sk.decrypt_oaep::<D>(&ct, &label) {
+                    Ok(msg) => check_eq(&msg, &case.hex("msg"), "plaintext"),
+                    Err(_) => Outcome::Rejected,
+                })
+            } else {
+                with_digest!(sha, D => with_mgf_digest!(mgf_sha, M => {
+                    match sk.decrypt_oaep_mgf::<D, M>(&ct, &label) {
+                        Ok(msg) => check_eq(&msg, &case.hex("msg"), "plaintext"),
+                        Err(_) => Outcome::Rejected,
+                    }
+                }))
+            }
         });
     }
 }
