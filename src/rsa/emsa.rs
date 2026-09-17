@@ -13,13 +13,24 @@
 //!
 //! The buffers a caller must supply are all `k = key_size()` octets. Two
 //! techniques keep it to that: `m'` in PSS is streamed into the digest rather
-//! than assembled, and MGF1 XORs its mask directly into the destination
-//! ([`mgf1_xor`]) rather than materializing it.
+//! than assembled, and the mask generation function XORs its mask directly
+//! into the destination ([`mgf1_xor`], [`PssHasher::mask_xor`]) rather than
+//! materializing it.
+//!
+//! # PSS hash / MGF pairs
+//!
+//! EMSA-PSS is written once over [`PssHasher`], which bundles the message
+//! hash with the mask generation function. Two instantiations exist: the
+//! RFC 8017 form ([`Mgf1Scheme`]: a [`Digest`] `D` for the hash, MGF1 over a
+//! possibly different digest `M`) and the RFC 8702 form ([`ShakeScheme`]:
+//! SHAKE128 or SHAKE256 as the hash *and* — squeezed directly, no MGF1
+//! counter — as the mask generation function).
 
 use super::{Error, Pkcs1Digest};
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
-use crate::hash::Digest;
+use crate::hash::{Digest, ExtendableOutput, Shake128, Shake256, XofReader};
 use crate::rng::RngCore;
+use core::marker::PhantomData;
 
 /// The raw RSA public operation (`m^e mod n`) plus modulus metadata.
 pub(crate) trait RawPublic {
@@ -690,11 +701,129 @@ fn fill_nonzero<R: RngCore>(dst: &mut [u8], rng: &mut R) {
 // profile used by TLS 1.3 and the X.509 PSS parameter set); the
 // `*_with_salt_len` / `*_any_salt` variants relax that for general interop.
 //
-// Two digest parameters throughout: `D` hashes the message (and `M'`), `M`
-// drives MGF1. RFC 8017 §8.1 lets them differ (`RSASSA-PSS-params` carries a
-// separate `maskGenAlgorithm`); the public single-digest methods pass
-// `<D, D>`.
+// Two digest parameters throughout the RFC 8017 form: `D` hashes the message
+// (and `M'`), `M` drives MGF1. RFC 8017 §8.1 lets them differ
+// (`RSASSA-PSS-params` carries a separate `maskGenAlgorithm`); the public
+// single-digest methods pass `<D, D>`. The RFC 8702 form takes a SHAKE `X`
+// and uses it for both roles (`*_shake`).
 // --------------------------------------------------------------------------
+
+/// A SHAKE usable as the RSASSA-PSS hash and mask generation function
+/// (RFC 8702 §3.1): SHAKE128 with a 32-octet output or SHAKE256 with a
+/// 64-octet output. Sealed — the RFC defines exactly these two pairings and
+/// registers an OID for each (`id-RSASSA-PSS-SHAKE128` / `-SHAKE256`).
+pub trait PssShake: ExtendableOutput + sealed::Sealed {
+    /// The hash output length `hLen` the RFC fixes for this SHAKE (32 or 64
+    /// octets); also the salt length of the RFC 8702 §3.1 profile.
+    const OUTPUT_LEN: usize;
+    /// `[u8; OUTPUT_LEN]`, named as a type so generic code can hold one on
+    /// the stack.
+    type Output: AsRef<[u8]> + AsMut<[u8]> + Copy;
+    /// A zeroed [`Output`](Self::Output).
+    fn zeroed_output() -> Self::Output;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for crate::hash::Shake128 {}
+    impl Sealed for crate::hash::Shake256 {}
+}
+
+impl PssShake for Shake128 {
+    const OUTPUT_LEN: usize = 32;
+    type Output = [u8; 32];
+    fn zeroed_output() -> Self::Output {
+        [0u8; 32]
+    }
+}
+
+impl PssShake for Shake256 {
+    const OUTPUT_LEN: usize = 64;
+    type Output = [u8; 64];
+    fn zeroed_output() -> Self::Output {
+        [0u8; 64]
+    }
+}
+
+/// The hash / mask-generation pair EMSA-PSS is parameterized over: a
+/// streaming hash of `H_LEN` octets (for `mHash` and `H = Hash(M')`) and a
+/// mask generation function XOR-ed into its destination.
+pub(crate) trait PssHasher: Sized {
+    /// `hLen`.
+    const H_LEN: usize;
+    /// A fixed-size buffer holding one hash output (exactly `H_LEN` octets).
+    type Output: AsRef<[u8]> + AsMut<[u8]> + Copy;
+    /// A fresh hasher.
+    fn new() -> Self;
+    /// Feeds `data`.
+    fn update(&mut self, data: &[u8]);
+    /// The `H_LEN`-octet hash of everything fed so far.
+    fn finalize(self) -> Self::Output;
+    /// One-shot hash.
+    fn digest(data: &[u8]) -> Self::Output {
+        let mut h = Self::new();
+        h.update(data);
+        h.finalize()
+    }
+    /// XORs `MGF(seed, dst.len())` into `dst`.
+    fn mask_xor(seed: &[u8], dst: &mut [u8]);
+}
+
+/// RFC 8017 EMSA-PSS: digest `D` for the message hash, MGF1 over digest `M`.
+pub(crate) struct Mgf1Scheme<D: Digest, M: Digest>(D, PhantomData<M>);
+
+impl<D: Digest, M: Digest> PssHasher for Mgf1Scheme<D, M> {
+    const H_LEN: usize = D::OUTPUT_LEN;
+    type Output = D::Output;
+    fn new() -> Self {
+        Mgf1Scheme(D::new(), PhantomData)
+    }
+    fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+    fn finalize(self) -> D::Output {
+        self.0.finalize()
+    }
+    fn mask_xor(seed: &[u8], dst: &mut [u8]) {
+        mgf1_xor::<M>(seed, dst);
+    }
+}
+
+/// RFC 8702 EMSA-PSS: SHAKE `X` (output `X::OUTPUT_LEN`) as the message hash
+/// and, squeezed to the mask length directly, as the mask generation function
+/// — `MGF(seed, len) = SHAKE(seed, len)`, no MGF1 counter.
+pub(crate) struct ShakeScheme<X: PssShake>(X);
+
+impl<X: PssShake> PssHasher for ShakeScheme<X> {
+    const H_LEN: usize = X::OUTPUT_LEN;
+    type Output = X::Output;
+    fn new() -> Self {
+        ShakeScheme(X::new())
+    }
+    fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+    fn finalize(self) -> X::Output {
+        let mut out = X::zeroed_output();
+        self.0.finalize_into(out.as_mut());
+        out
+    }
+    fn mask_xor(seed: &[u8], dst: &mut [u8]) {
+        let mut x = X::new();
+        x.update(seed);
+        let mut reader = x.finalize_xof();
+        // Squeezed in fixed-size chunks straight into the XOR so the mask is
+        // never materialized (the SHAKE analogue of `mgf1_xor`).
+        let mut chunk = [0u8; 64];
+        for part in dst.chunks_mut(chunk.len()) {
+            let chunk = &mut chunk[..part.len()];
+            reader.read(chunk);
+            for (d, m) in part.iter_mut().zip(chunk.iter()) {
+                *d ^= *m;
+            }
+        }
+    }
+}
 
 pub(crate) fn sign_pss<D: Digest, M: Digest, K: RawPrivate, R: RngCore>(
     key: &K,
@@ -702,10 +831,32 @@ pub(crate) fn sign_pss<D: Digest, M: Digest, K: RawPrivate, R: RngCore>(
     rng: &mut R,
     out: &mut [u8],
 ) -> Result<(), Error> {
-    sign_pss_with_salt_len::<D, M, K, R>(key, msg, D::OUTPUT_LEN, rng, out)
+    sign_pss_scheme::<Mgf1Scheme<D, M>, K, R>(key, msg, D::OUTPUT_LEN, rng, out)
 }
 
 pub(crate) fn sign_pss_with_salt_len<D: Digest, M: Digest, K: RawPrivate, R: RngCore>(
+    key: &K,
+    msg: &[u8],
+    salt_len: usize,
+    rng: &mut R,
+    out: &mut [u8],
+) -> Result<(), Error> {
+    sign_pss_scheme::<Mgf1Scheme<D, M>, K, R>(key, msg, salt_len, rng, out)
+}
+
+/// RFC 8702 RSASSA-PSS with SHAKE `X` as hash and MGF, salt of `salt_len`
+/// octets (the RFC's profile is `X::OUTPUT_LEN`).
+pub(crate) fn sign_pss_shake<X: PssShake, K: RawPrivate, R: RngCore>(
+    key: &K,
+    msg: &[u8],
+    salt_len: usize,
+    rng: &mut R,
+    out: &mut [u8],
+) -> Result<(), Error> {
+    sign_pss_scheme::<ShakeScheme<X>, K, R>(key, msg, salt_len, rng, out)
+}
+
+fn sign_pss_scheme<S: PssHasher, K: RawPrivate, R: RngCore>(
     key: &K,
     msg: &[u8],
     salt_len: usize,
@@ -721,7 +872,7 @@ pub(crate) fn sign_pss_with_salt_len<D: Digest, M: Digest, K: RawPrivate, R: Rng
     // EM is right-aligned in the k-octet block: when the modulus top byte is
     // < 0x80, em_len == k - 1 and the leading octet stays zero.
     out.fill(0);
-    emsa_pss_encode::<D, M, R>(msg, em_bits, salt_len, rng, &mut out[k - em_len..])?;
+    emsa_pss_encode::<S, R>(msg, em_bits, salt_len, rng, &mut out[k - em_len..])?;
     key.raw_private_in_place(out);
     Ok(())
 }
@@ -733,7 +884,7 @@ pub(crate) fn verify_pss<D: Digest, M: Digest, K: RawPublic + PublicModulus>(
     em: &mut [u8],
     db: &mut [u8],
 ) -> Result<(), Error> {
-    verify_pss_inner::<D, M, K>(key, msg, sig, Some(D::OUTPUT_LEN), em, db)
+    verify_pss_scheme::<Mgf1Scheme<D, M>, K>(key, msg, sig, Some(D::OUTPUT_LEN), em, db)
 }
 
 /// Verifies an RSA-PSS signature requiring the salt to be exactly `salt_len`
@@ -746,7 +897,7 @@ pub(crate) fn verify_pss_with_salt_len<D: Digest, M: Digest, K: RawPublic + Publ
     em: &mut [u8],
     db: &mut [u8],
 ) -> Result<(), Error> {
-    verify_pss_inner::<D, M, K>(key, msg, sig, Some(salt_len), em, db)
+    verify_pss_scheme::<Mgf1Scheme<D, M>, K>(key, msg, sig, Some(salt_len), em, db)
 }
 
 /// Verifies an RSA-PSS signature, recovering the salt length from the encoded
@@ -758,14 +909,28 @@ pub(crate) fn verify_pss_any_salt<D: Digest, M: Digest, K: RawPublic + PublicMod
     em: &mut [u8],
     db: &mut [u8],
 ) -> Result<(), Error> {
-    verify_pss_inner::<D, M, K>(key, msg, sig, None, em, db)
+    verify_pss_scheme::<Mgf1Scheme<D, M>, K>(key, msg, sig, None, em, db)
+}
+
+/// Verifies an RFC 8702 RSASSA-PSS signature (SHAKE `X` as hash and MGF):
+/// `salt_len` as in [`verify_pss_scheme`].
+pub(crate) fn verify_pss_shake<X: PssShake, K: RawPublic + PublicModulus>(
+    key: &K,
+    msg: &[u8],
+    sig: &[u8],
+    salt_len: Option<usize>,
+    em: &mut [u8],
+    db: &mut [u8],
+) -> Result<(), Error> {
+    verify_pss_scheme::<ShakeScheme<X>, K>(key, msg, sig, salt_len, em, db)
 }
 
 /// `em` and `db` are both `key_size()`-octet scratch buffers: `em` holds the
 /// modulus for the RSAVP1 range check and then the recovered encoded message,
 /// `db` the unmasked data block (which is shorter than `k`, so only a prefix is
-/// used).
-fn verify_pss_inner<D: Digest, M: Digest, K: RawPublic + PublicModulus>(
+/// used). `salt_len` is `Some(n)` to require an `n`-octet salt, `None` to
+/// recover the length from the encoding.
+fn verify_pss_scheme<S: PssHasher, K: RawPublic + PublicModulus>(
     key: &K,
     msg: &[u8],
     sig: &[u8],
@@ -798,7 +963,7 @@ fn verify_pss_inner<D: Digest, M: Digest, K: RawPublic + PublicModulus>(
     if m[..k - em_len].iter().any(|&b| b != 0) {
         return Err(Error::Verification);
     }
-    emsa_pss_verify::<D, M>(msg, &m[k - em_len..], em_bits, salt_len, db)
+    emsa_pss_verify::<S>(msg, &m[k - em_len..], em_bits, salt_len, db)
 }
 
 // --------------------------------------------------------------------------
@@ -972,20 +1137,20 @@ fn mgf1_xor<D: Digest>(seed: &[u8], dst: &mut [u8]) {
 }
 
 /// Writes the PSS encoded message into `em`, which must be exactly `em_len`
-/// (`em_bits.div_ceil(8)`) octets. `D` is the message hash, `M` the MGF1 hash.
+/// (`em_bits.div_ceil(8)`) octets. `S` supplies the message hash and the MGF.
 ///
 /// Everything is built in place. The salt is drawn straight into its final
 /// position inside DB, so `m' = 0x00⁸ ‖ mHash ‖ salt` can be streamed into the
 /// digest instead of assembled in a buffer, and the DB masking reads `H` out of
 /// `em` through a `split_at_mut` so no copy of it is needed either.
-fn emsa_pss_encode<D: Digest, M: Digest, R: RngCore>(
+fn emsa_pss_encode<S: PssHasher, R: RngCore>(
     msg: &[u8],
     em_bits: usize,
     salt_len: usize,
     rng: &mut R,
     em: &mut [u8],
 ) -> Result<(), Error> {
-    let h_len = D::OUTPUT_LEN;
+    let h_len = S::H_LEN;
     let s_len = salt_len;
     let em_len = em_bits.div_ceil(8);
     // Checked arithmetic: `salt_len` is caller-supplied and a huge value
@@ -1003,7 +1168,7 @@ fn emsa_pss_encode<D: Digest, M: Digest, R: RngCore>(
         return Err(Error::InvalidLength);
     }
 
-    let m_hash = D::digest(msg);
+    let m_hash = S::digest(msg);
     let db_len = em_len - h_len - 1;
 
     // DB = PS(0x00…) ‖ 0x01 ‖ salt, with the salt drawn in place.
@@ -1012,7 +1177,7 @@ fn emsa_pss_encode<D: Digest, M: Digest, R: RngCore>(
 
     // H = Hash(0x00⁸ ‖ mHash ‖ salt), streamed rather than buffered.
     let h = {
-        let mut d = D::new();
+        let mut d = S::new();
         d.update(&[0u8; 8]);
         d.update(m_hash.as_ref());
         d.update(&em[db_len - s_len..db_len]);
@@ -1022,10 +1187,10 @@ fn emsa_pss_encode<D: Digest, M: Digest, R: RngCore>(
     em[db_len..db_len + h_len].copy_from_slice(h.as_ref());
     em[em_len - 1] = 0xbc;
 
-    // maskedDB = DB ⊕ MGF1(H, db_len). `split_at_mut` hands out disjoint
+    // maskedDB = DB ⊕ MGF(H, db_len). `split_at_mut` hands out disjoint
     // borrows of the DB region and the H region, both of which live in `em`.
     let (db_part, tail) = em.split_at_mut(db_len);
-    mgf1_xor::<M>(&tail[..h_len], db_part);
+    S::mask_xor(&tail[..h_len], db_part);
 
     let clear = 8 * em_len - em_bits;
     if clear > 0 {
@@ -1034,25 +1199,25 @@ fn emsa_pss_encode<D: Digest, M: Digest, R: RngCore>(
     Ok(())
 }
 
-/// EMSA-PSS-VERIFY (RFC 8017 §9.1.2). `D` is the message hash, `M` the MGF1
-/// hash.
+/// EMSA-PSS-VERIFY (RFC 8017 §9.1.2). `S` supplies the message hash and the
+/// MGF.
 ///
 /// `salt_len` selects how the salt length is determined:
 /// * `Some(n)` — require the salt to be exactly `n` octets (the `0x01`
 ///   separator sits at a fixed offset). This is the strict profile mandated
-///   by TLS 1.3 / the X.509 PSS parameter set, where `n == D::OUTPUT_LEN`.
+///   by TLS 1.3 / the X.509 PSS parameter set, where `n == S::H_LEN`.
 /// * `None` — recover the salt length from the encoded message (the standard
 ///   variable-salt verify): DB is zero padding, then a single `0x01` octet,
 ///   then the salt. More interoperable; salt length does not affect PSS
 ///   security.
-fn emsa_pss_verify<D: Digest, M: Digest>(
+fn emsa_pss_verify<S: PssHasher>(
     msg: &[u8],
     em: &[u8],
     em_bits: usize,
     salt_len: Option<usize>,
     db_buf: &mut [u8],
 ) -> Result<(), Error> {
-    let h_len = D::OUTPUT_LEN;
+    let h_len = S::H_LEN;
     let em_len = em.len();
     // Absolute minimum: maskedDB (>= 1 octet) ‖ H ‖ 0xBC.
     if em_len < h_len + 2 || em[em_len - 1] != 0xbc {
@@ -1073,7 +1238,7 @@ fn emsa_pss_verify<D: Digest, M: Digest>(
     }
     let db = &mut db_buf[..db_len];
     db.copy_from_slice(masked_db);
-    mgf1_xor::<M>(h, db);
+    S::mask_xor(h, db);
     if clear > 0 {
         db[0] &= 0xff >> clear;
     }
@@ -1104,10 +1269,10 @@ fn emsa_pss_verify<D: Digest, M: Digest>(
         }
     };
 
-    let m_hash = D::digest(msg);
+    let m_hash = S::digest(msg);
     // m' = 0x00⁸ ‖ mHash ‖ salt, streamed into the digest (see emsa_pss_encode).
     let h_prime = {
-        let mut d = D::new();
+        let mut d = S::new();
         d.update(&[0u8; 8]);
         d.update(m_hash.as_ref());
         d.update(salt);
@@ -1380,5 +1545,126 @@ mod tests {
         for (a, b, want) in cases {
             assert_eq!(super::ct_lt_be(a, b), *want, "ct_lt_be({a:?}, {b:?})");
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // RFC 8702: SHAKE as the PSS hash and mask generation function.
+    // ----------------------------------------------------------------------
+
+    use super::{Mgf1Scheme, PssHasher, PssShake, ShakeScheme};
+    use crate::hash::{Shake128, Shake256};
+    use crate::rng::RngCore;
+
+    /// The RFC 8702 §3.1 mask is the XOF itself: `MGF(seed, len) = SHAKE(seed)`
+    /// squeezed to `len` octets, with no MGF1 counter. Checked at the
+    /// `emLen − hLen − 1` lengths a 2048-bit key produces, plus a length that
+    /// crosses several SHAKE rate boundaries, against the one-shot `xof`.
+    #[test]
+    fn shake_mask_is_the_xof_output() {
+        fn check<X: PssShake>(seed: &[u8], len: usize) {
+            let mut expect = alloc::vec![0u8; len];
+            X::xof(seed, &mut expect);
+            let mut got = alloc::vec![0u8; len];
+            <ShakeScheme<X>>::mask_xor(seed, &mut got);
+            assert_eq!(got, expect, "hLen={} len={len}", X::OUTPUT_LEN);
+            // XOR semantics: masking a nonzero buffer flips it by the mask.
+            let mut buf = alloc::vec![0xa5u8; len];
+            <ShakeScheme<X>>::mask_xor(seed, &mut buf);
+            for (b, e) in buf.iter().zip(expect.iter()) {
+                assert_eq!(*b ^ 0xa5, *e);
+            }
+        }
+        let seed = [0x42u8; 32];
+        check::<Shake128>(&seed, 256 - 32 - 1);
+        check::<Shake256>(&seed, 256 - 64 - 1);
+        check::<Shake128>(&seed, 1000);
+        check::<Shake256>(&seed, 1000);
+        check::<Shake128>(b"", 0);
+        // And the MGF1 scheme is still MGF1, not the SHAKE squeeze: the two
+        // differ on the same seed.
+        let mut mgf1 = alloc::vec![0u8; 64];
+        <Mgf1Scheme<crate::hash::Sha3_256, crate::hash::Sha3_256>>::mask_xor(&seed, &mut mgf1);
+        let mut shake = alloc::vec![0u8; 64];
+        <ShakeScheme<Shake128>>::mask_xor(&seed, &mut shake);
+        assert_ne!(mgf1, shake);
+    }
+
+    /// Pins the RFC 8702 encoding structure by building it by hand — `mHash
+    /// = SHAKE(M, hLen)`, `H = SHAKE(0⁸ ‖ mHash ‖ salt, hLen)`, `maskedDB =
+    /// DB ⊕ SHAKE(H, emLen − hLen − 1)`, trailer `0xbc` — with a DRBG salt,
+    /// and comparing against `emsa_pss_encode` driven by an identically
+    /// seeded DRBG. Then `emsa_pss_verify` accepts it at exactly `hLen`
+    /// (strict and recovered) and rejects a wrong salt length.
+    #[test]
+    fn shake_pss_encoding_structure() {
+        fn check<X: PssShake>(msg: &[u8], em_bits: usize) {
+            let h_len = X::OUTPUT_LEN;
+            let s_len = h_len;
+            let em_len = em_bits.div_ceil(8);
+            let db_len = em_len - h_len - 1;
+            let drbg = || HmacDrbg::<Sha256>::new(b"emsa-shake-pss", b"nonce", &[]);
+
+            // By hand.
+            let mut salt = alloc::vec![0u8; s_len];
+            drbg().fill_bytes(&mut salt);
+            let mut m_hash = alloc::vec![0u8; h_len];
+            X::xof(msg, &mut m_hash);
+            let mut h = alloc::vec![0u8; h_len];
+            {
+                let mut x = X::new();
+                x.update(&[0u8; 8]);
+                x.update(&m_hash);
+                x.update(&salt);
+                x.finalize_into(&mut h);
+            }
+            let mut db = alloc::vec![0u8; db_len];
+            db[db_len - s_len - 1] = 0x01;
+            db[db_len - s_len..].copy_from_slice(&salt);
+            let mut mask = alloc::vec![0u8; db_len];
+            X::xof(&h, &mut mask);
+            for (d, m) in db.iter_mut().zip(mask.iter()) {
+                *d ^= *m;
+            }
+            db[0] &= 0xff >> (8 * em_len - em_bits);
+            let mut expect = db;
+            expect.extend_from_slice(&h);
+            expect.push(0xbc);
+
+            // Through the encoder.
+            let mut em = alloc::vec![0u8; em_len];
+            super::emsa_pss_encode::<ShakeScheme<X>, _>(msg, em_bits, s_len, &mut drbg(), &mut em)
+                .unwrap();
+            assert_eq!(em, expect, "hLen={h_len} emBits={em_bits}");
+
+            let mut scratch = alloc::vec![0u8; em_len];
+            super::emsa_pss_verify::<ShakeScheme<X>>(msg, &em, em_bits, Some(s_len), &mut scratch)
+                .unwrap();
+            super::emsa_pss_verify::<ShakeScheme<X>>(msg, &em, em_bits, None, &mut scratch)
+                .unwrap();
+            assert_eq!(
+                super::emsa_pss_verify::<ShakeScheme<X>>(
+                    msg,
+                    &em,
+                    em_bits,
+                    Some(s_len - 1),
+                    &mut scratch
+                ),
+                Err(Error::Verification)
+            );
+            assert_eq!(
+                super::emsa_pss_verify::<ShakeScheme<X>>(
+                    b"other",
+                    &em,
+                    em_bits,
+                    Some(s_len),
+                    &mut scratch
+                ),
+                Err(Error::Verification)
+            );
+        }
+        check::<Shake128>(b"rfc 8702", 2047);
+        check::<Shake256>(b"rfc 8702", 2047);
+        check::<Shake128>(b"", 1023);
+        check::<Shake256>(b"", 3071);
     }
 }

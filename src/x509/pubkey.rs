@@ -651,7 +651,10 @@ impl AnyPublicKey {
     /// For every OID but `id-RSASSA-PSS` this is
     /// [`find_by_oid`](crate::signature_registry::find_by_oid) — except
     /// under an [`RsaPss`](Self::RsaPss) key, which maps every other OID
-    /// (the PKCS#1 v1.5 family in particular) to `None` per RFC 4055 §1.2.
+    /// (the PKCS#1 v1.5 family in particular) to `None` per RFC 4055 §1.2,
+    /// save the RFC 8702 `id-RSASSA-PSS-SHAKE128` / `-SHAKE256` signatures,
+    /// which an *unrestricted* PSS key may verify (a restriction names a
+    /// SHA-2 and MGF1, which a SHAKE signature never matches).
     ///
     /// `id-RSASSA-PSS` is resolved from the identifier's
     /// `RSASSA-PSS-params` (RFC 4055 §3.1), never from the OID alone: the
@@ -688,9 +691,17 @@ impl AnyPublicKey {
             }
             return find_by_id(p.hash.registry_id());
         }
-        if matches!(self, AnyPublicKey::RsaPss(..)) {
-            // RFC 4055 §1.2: the key MUST only be used with RSASSA-PSS.
-            return None;
+        if let AnyPublicKey::RsaPss(_, restriction) = self {
+            // RFC 4055 §1.2: the key MUST only be used with RSASSA-PSS. The
+            // RFC 8702 SHAKE forms are RSASSA-PSS too, but their parameters
+            // (SHAKE as hash and MGF) can never match an `RSASSA-PSS-params`
+            // restriction (which names a SHA-2 and MGF1), so only an
+            // unrestricted key may verify them.
+            let shake = sig_alg.oid() == oid::ID_RSASSA_PSS_SHAKE128
+                || sig_alg.oid() == oid::ID_RSASSA_PSS_SHAKE256;
+            if !(shake && *restriction == PssRestriction::Unrestricted) {
+                return None;
+            }
         }
         find_by_oid(sig_alg.oid())
     }

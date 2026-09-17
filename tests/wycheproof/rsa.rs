@@ -1,21 +1,23 @@
-//! RSA: PKCS#1 v1.5 signatures (verify + deterministic sign), RSASSA-PSS,
-//! RSAES-OAEP and RSAES-PKCS1-v1_5 decryption, and the primality vectors.
-//!
-//! Files not listed below and why:
-//! * `rsa_pss_*_shake*`: PSS with SHAKE as the hash *and* MGF (RFC 8702);
-//!   the crate's PSS is MGF1-over-a-`Digest` only.
+//! RSA: PKCS#1 v1.5 signatures (verify + deterministic sign), RSASSA-PSS
+//! (MGF1 and the RFC 8702 SHAKE forms), RSAES-OAEP (two-prime and
+//! multi-prime keys) and RSAES-PKCS1-v1_5 decryption, and the primality
+//! vectors.
 //!
 //! Groups whose MGF1 hash differs from the message hash (`mgfSha != sha`:
 //! the `*_mgf1sha1` / `*_mgf1sha256` files and the mixed groups of
 //! `rsa_pss_misc*` and `rsa_oaep_misc`) go through the `*_mgf::<D, M>`
 //! forms of the API; the equal-hash groups keep using the single-digest
-//! forms, so both surfaces are exercised.
+//! forms, so both surfaces are exercised. The `rsa_pss_*_shake*` groups
+//! (`sha = mgf = SHAKE128/256`) go through `verify_pss_shake*::<X>`, and
+//! the `rsa_three_primes_oaep_*` groups through a key parsed from the
+//! multi-prime PKCS#8 blob and, separately, one built from the
+//! `privateKey` components including `otherPrimeInfos`.
 
 use crate::common::{Expected, Fields, Outcome, check_eq, load, outcome_of, run_with};
-use purecrypto::bignum::Uint;
+use purecrypto::bignum::{BoxedUint, Uint};
 use purecrypto::hash::{
     Sha1, Sha3_224, Sha3_256, Sha3_384, Sha3_512, Sha224, Sha256, Sha384, Sha512, Sha512_224,
-    Sha512_256,
+    Sha512_256, Shake128, Shake256,
 };
 use purecrypto::rng::HmacDrbg;
 use purecrypto::rsa::{BoxedRsaPrivateKey, BoxedRsaPublicKey, is_prime};
@@ -169,6 +171,86 @@ fn private_key(group: &Fields) -> BoxedRsaPrivateKey {
     BoxedRsaPrivateKey::from_pkcs8_der(&group.hex("privateKeyPkcs8")).expect("PKCS#8")
 }
 
+/// The hex value of `"key":"…"` in the compact JSON object `json` (the
+/// group's `privateKey` field), decoded.
+fn json_hex(json: &str, key: &str) -> Vec<u8> {
+    let needle = format!("\"{key}\":\"");
+    let start = json
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no {key:?} in {json}"))
+        + needle.len();
+    let end = start + json[start..].find('"').expect("unterminated string");
+    crate::common::from_hex(&json[start..end])
+}
+
+/// The `"otherPrimeInfos":[["r","d","t"],…]` triples of the group's
+/// `privateKey` JSON, each decoded from hex.
+fn json_other_prime_infos(json: &str) -> Vec<[Vec<u8>; 3]> {
+    let needle = "\"otherPrimeInfos\":[";
+    let start = json.find(needle).expect("no otherPrimeInfos") + needle.len();
+    let mut out = Vec::new();
+    let mut rest = &json[start..];
+    while let Some(open) = rest.find('[') {
+        let close = open + rest[open..].find(']').expect("unterminated triple");
+        let triple: Vec<Vec<u8>> = rest[open + 1..close]
+            .split(',')
+            .map(|s| crate::common::from_hex(s.trim_matches('"')))
+            .collect();
+        out.push(triple.try_into().expect("prime, exponent, coefficient"));
+        rest = &rest[close + 1..];
+        if rest.starts_with(']') {
+            break;
+        }
+    }
+    assert!(!out.is_empty(), "empty otherPrimeInfos");
+    out
+}
+
+/// A multi-prime private key assembled from the group's `privateKey`
+/// components — `n`, `e`, `d`, `prime1`, `prime2` and the primes of
+/// `otherPrimeInfos` (the blob's `exponent` / `coefficient` values are
+/// recomputed by the crate and only sanity-checked here against the
+/// PKCS#8-parsed key's serialization).
+fn multi_prime_key_from_components(group: &Fields) -> BoxedRsaPrivateKey {
+    let json = group.str("privateKey");
+    let be = |key: &str| BoxedUint::from_be_bytes(&json_hex(json, key));
+    let others = json_other_prime_infos(json);
+    let key = BoxedRsaPrivateKey::from_components_with_other_primes(
+        be("modulus"),
+        be("publicExponent"),
+        be("privateExponent"),
+        be("prime1"),
+        be("prime2"),
+        others
+            .iter()
+            .map(|[r, _, _]| BoxedUint::from_be_bytes(r))
+            .collect(),
+    );
+    assert_eq!(key.num_primes(), 2 + others.len());
+    // The two constructions agree byte for byte on the PKCS#1 encoding —
+    // which also pins the crate's derived `d_i` / `t_i` to the file's.
+    let parsed = private_key(group);
+    assert_eq!(parsed.num_primes(), key.num_primes());
+    let der = key.to_pkcs1_der();
+    assert_eq!(parsed.to_pkcs1_der(), der);
+    let mut infos = purecrypto::der::Reader::new(&der);
+    let mut seq = infos.read_sequence().unwrap();
+    assert_eq!(seq.read_integer_bytes().unwrap(), [1], "version = 1");
+    for _ in 0..8 {
+        seq.read_unsigned_integer_bytes().unwrap();
+    }
+    let mut list = seq.read_sequence().unwrap();
+    for [r, d_i, t_i] in &others {
+        let mut info = list.read_sequence().unwrap();
+        assert_eq!(info.read_unsigned_integer_bytes().unwrap(), r);
+        assert_eq!(info.read_unsigned_integer_bytes().unwrap(), d_i);
+        assert_eq!(info.read_unsigned_integer_bytes().unwrap(), t_i);
+        info.finish().unwrap();
+    }
+    list.finish().unwrap();
+    key
+}
+
 /// PKCS#1 v1.5 verification. `MissingNull` cases (`acceptable`) are
 /// rejected: the DigestInfo prefix is compared byte for byte and always
 /// carries the NULL parameters (RFC 8017 §9.2 Note 1).
@@ -290,6 +372,98 @@ fn pss_verify() {
                     }
                 }))
             }
+        });
+    }
+}
+
+/// RSASSA-PSS with SHAKE (RFC 8702): `sha = mgf = SHAKE128` (hLen 32) or
+/// `SHAKE256` (hLen 64), verified at the group's `sLen` — which is the
+/// RFC 8702 profile's hash length, so the strict `verify_pss_shake` (no
+/// explicit salt length) must agree, as must the salt-recovering verifier.
+#[test]
+fn pss_verify_shake() {
+    for name in [
+        "rsa_pss_2048_shake128",
+        "rsa_pss_2048_shake256",
+        "rsa_pss_3072_shake128",
+        "rsa_pss_3072_shake256",
+        "rsa_pss_4096_shake256",
+    ] {
+        let mut keys = Cached::new();
+        run_with(&load(name), policy, |group, case| {
+            let pk = keys.get(group.str("publicKeyDer"), || public_key(group, false));
+            let (msg, sig) = (case.hex("msg"), case.hex("sig"));
+            let slen = group.int("sLen") as usize;
+            assert_eq!(group.str("sha"), group.str("mgf"), "SHAKE is hash and MGF");
+            macro_rules! verify {
+                ($X:ty) => {{
+                    assert_eq!(slen, <$X as purecrypto::rsa::PssShake>::OUTPUT_LEN);
+                    match pk.verify_pss_shake_with_salt_len::<$X>(&msg, &sig, slen) {
+                        Err(_) => {
+                            if pk.verify_pss_shake::<$X>(&msg, &sig).is_ok() {
+                                Outcome::Wrong("profile verify disagrees")
+                            } else {
+                                Outcome::Rejected
+                            }
+                        }
+                        Ok(()) if pk.verify_pss_shake::<$X>(&msg, &sig).is_err() => {
+                            Outcome::Wrong("profile verify disagrees")
+                        }
+                        Ok(()) if pk.verify_pss_shake_any_salt::<$X>(&msg, &sig).is_err() => {
+                            Outcome::Wrong("any-salt verify disagrees")
+                        }
+                        Ok(()) => Outcome::Accepted,
+                    }
+                }};
+            }
+            match group.str("sha") {
+                "SHAKE128" => verify!(Shake128),
+                "SHAKE256" => verify!(Shake256),
+                _ => Outcome::Skipped,
+            }
+        });
+    }
+}
+
+/// RSAES-OAEP decryption under a three-prime key (RFC 8017 §3.2), twice:
+/// with the key parsed from the multi-prime PKCS#8 blob and with one built
+/// from the `privateKey` components (`prime1`, `prime2`, `otherPrimeInfos`).
+/// Both must produce the same outcome on every case.
+#[test]
+fn three_primes_oaep_decrypt() {
+    for name in [
+        "rsa_three_primes_oaep_2048_sha1_mgf1sha1",
+        "rsa_three_primes_oaep_3072_sha224_mgf1sha224",
+        "rsa_three_primes_oaep_4096_sha256_mgf1sha256",
+    ] {
+        let mut keys = Cached::new();
+        run_with(&load(name), policy, |group, case| {
+            let (sk, sk2) = keys.get(group.str("privateKeyPkcs8"), || {
+                (private_key(group), multi_prime_key_from_components(group))
+            });
+            assert_eq!(sk.num_primes(), 3);
+            let (ct, label) = (case.hex("ct"), case.hex("label"));
+            let (sha, mgf_sha) = (group.str("sha"), group.str("mgfSha"));
+            let decrypt = |k: &BoxedRsaPrivateKey| {
+                if sha == mgf_sha {
+                    with_digest!(sha, D => match k.decrypt_oaep::<D>(&ct, &label) {
+                        Ok(msg) => check_eq(&msg, &case.hex("msg"), "plaintext"),
+                        Err(_) => Outcome::Rejected,
+                    })
+                } else {
+                    with_digest!(sha, D => with_mgf_digest!(mgf_sha, M => {
+                        match k.decrypt_oaep_mgf::<D, M>(&ct, &label) {
+                            Ok(msg) => check_eq(&msg, &case.hex("msg"), "plaintext"),
+                            Err(_) => Outcome::Rejected,
+                        }
+                    }))
+                }
+            };
+            let (a, b) = (decrypt(sk), decrypt(sk2));
+            if a != b {
+                return Outcome::Wrong("PKCS#8 and component keys disagree");
+            }
+            a
         });
     }
 }

@@ -56,6 +56,13 @@ pub mod oid {
     /// RSA-PSS-key-restricted SPKI) and the signature OID (with PSS
     /// parameters living in the AlgorithmIdentifier).
     pub const ID_RSASSA_PSS: &[u64] = &[1, 2, 840, 113549, 1, 1, 10];
+    /// `id-RSASSA-PSS-SHAKE128` (1.3.6.1.5.5.7.6.30) — RSASSA-PSS with
+    /// SHAKE128 as hash and MGF, salt 32 (RFC 8702 §3.1). A signature
+    /// algorithm only; its parameters are absent.
+    pub const ID_RSASSA_PSS_SHAKE128: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 6, 30];
+    /// `id-RSASSA-PSS-SHAKE256` (1.3.6.1.5.5.7.6.31) — RSASSA-PSS with
+    /// SHAKE256 as hash and MGF, salt 64 (RFC 8702 §3.1).
+    pub const ID_RSASSA_PSS_SHAKE256: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 6, 31];
     /// `sha256WithRSAEncryption` (1.2.840.113549.1.1.11).
     pub const SHA256_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
     /// `sha384WithRSAEncryption` (1.2.840.113549.1.1.12).

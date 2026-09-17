@@ -86,8 +86,10 @@ impl SignatureAlgorithmIdentifier {
     /// (or an empty SEQUENCE, whose DER defaults are SHA-1 / MGF1-SHA-1 /
     /// salt 20), any digest other than SHA-256/384/512, or a MGF other than
     /// MGF1 is [`Error::UnsupportedAlgorithm`]; a `trailerField` other than
-    /// 1 is [`Error::Malformed`] and trailing junk a DER error. Parameters
-    /// after any other OID are not interpreted.
+    /// 1 is [`Error::Malformed`] and trailing junk a DER error. The RFC 8702
+    /// `id-RSASSA-PSS-SHAKE128` / `-SHAKE256` identifiers must carry no
+    /// parameters at all (§3.1). Parameters after any other OID are not
+    /// interpreted.
     ///
     /// [`AnyPublicKey::from_spki_der`]: super::AnyPublicKey::from_spki_der
     pub fn from_der(der: &[u8]) -> Result<Self, Error> {
@@ -105,7 +107,10 @@ impl SignatureAlgorithmIdentifier {
         } else {
             SignatureParams::None
         };
-        if oid.as_slice() == oid::ID_RSASSA_PSS {
+        if oid.as_slice() == oid::ID_RSASSA_PSS
+            || oid.as_slice() == oid::ID_RSASSA_PSS_SHAKE128
+            || oid.as_slice() == oid::ID_RSASSA_PSS_SHAKE256
+        {
             algid.finish()?;
         }
         r.finish()?;

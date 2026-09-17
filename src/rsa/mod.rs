@@ -32,6 +32,7 @@ pub use keys::{RsaPrivateKey, RsaPublicKey};
 pub use prime::{is_prime, random_prime};
 
 pub use digest_info::Pkcs1Digest;
+pub use emsa::PssShake;
 
 /// Upper bound on the public exponent accepted by the parse paths (and by
 /// key generation): `e < 2^256`, the FIPS 186-5 §A.1.1 limit. The public

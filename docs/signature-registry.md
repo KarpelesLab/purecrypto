@@ -21,6 +21,8 @@ the caller has to name the id explicitly.
 | `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (`id-RSASSA-PSS`) when its `RSASSA-PSS-params` name SHA-256 / MGF1-SHA-256 | `0x0809` (`id-RSASSA-PSS` key) | yes |
 | `rsa-pss-pss-sha384`        | `id-RSASSA-PSS` when its params name SHA-384 / MGF1-SHA-384 | `0x080A` (`id-RSASSA-PSS` key) | yes |
 | `rsa-pss-pss-sha512`        | `id-RSASSA-PSS` when its params name SHA-512 / MGF1-SHA-512 | `0x080B` (`id-RSASSA-PSS` key) | yes |
+| `rsa-pss-shake128`          | `1.3.6.1.5.5.7.6.30` (`id-RSASSA-PSS-SHAKE128`, RFC 8702: SHAKE128 as hash and MGF, salt 32; `rsaEncryption` or unrestricted `id-RSASSA-PSS` key) | (none) | opt-in |
+| `rsa-pss-shake256`          | `1.3.6.1.5.5.7.6.31` (`id-RSASSA-PSS-SHAKE256`, SHAKE256 as hash and MGF, salt 64) | (none) | opt-in |
 | `ecdsa-with-sha256`         | `1.2.840.10045.4.3.2` (any curve) | (none)       | yes |
 | `ecdsa-with-sha384`         | `1.2.840.10045.4.3.3` (any curve) | (none)       | yes |
 | `ecdsa-with-sha512`         | `1.2.840.10045.4.3.4` (any curve) | (none)       | yes |

@@ -13,12 +13,18 @@
 //! (`RSASSA-PSS-params` names `maskGenAlgorithm` independently of
 //! `hashAlgorithm`). The single-digest form is exactly the `_mgf` form with
 //! `M == D`.
+//!
+//! The `_shake` methods are RSASSA-PSS with SHAKE (RFC 8702,
+//! `id-RSASSA-PSS-SHAKE128` / `-SHAKE256`): the [`PssShake`] XOF is both
+//! the message hash (32 / 64 octets) and the mask generation function
+//! (squeezed directly, not through MGF1), and the profile salt length is
+//! the hash length.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use super::emsa;
-use super::{Error, RsaPrivateKey, RsaPublicKey};
+use super::{Error, PssShake, RsaPrivateKey, RsaPublicKey};
 use crate::hash::Digest;
 use crate::rng::RngCore;
 
@@ -73,9 +79,65 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         emsa::sign_pss_with_salt_len::<D, M, _, R>(self, msg, salt_len, rng, &mut out)?;
         Ok(out)
     }
+
+    /// Signs `msg` with RSASSA-PSS-SHAKE (RFC 8702): `X` (SHAKE128 or
+    /// SHAKE256) is the hash and the mask generation function, the salt is
+    /// `X::OUTPUT_LEN` octets (the RFC 8702 §3.1 profile).
+    pub fn sign_pss_shake<X: PssShake, R: RngCore>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
+        self.sign_pss_shake_with_salt_len::<X, R>(msg, X::OUTPUT_LEN, rng)
+    }
+
+    /// [`sign_pss_shake`](Self::sign_pss_shake) with an explicit salt length
+    /// (in octets; `0` is permitted, the maximum is bounded by the modulus
+    /// size — `Error::MessageTooLong` otherwise).
+    pub fn sign_pss_shake_with_salt_len<X: PssShake, R: RngCore>(
+        &self,
+        msg: &[u8],
+        salt_len: usize,
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
+        let mut out = vec![0u8; LIMBS * 8];
+        emsa::sign_pss_shake::<X, _, R>(self, msg, salt_len, rng, &mut out)?;
+        Ok(out)
+    }
 }
 
 impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
+    /// Verifies an RSASSA-PSS-SHAKE signature (RFC 8702) over `msg`: `X`
+    /// (SHAKE128 or SHAKE256) is the hash and the mask generation function,
+    /// and the salt must be `X::OUTPUT_LEN` octets (the RFC 8702 §3.1
+    /// profile).
+    pub fn verify_pss_shake<X: PssShake>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+        self.verify_pss_shake_with_salt_len::<X>(msg, sig, X::OUTPUT_LEN)
+    }
+
+    /// [`verify_pss_shake`](Self::verify_pss_shake) requiring the salt to be
+    /// exactly `salt_len` octets.
+    pub fn verify_pss_shake_with_salt_len<X: PssShake>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+        salt_len: usize,
+    ) -> Result<(), Error> {
+        let (mut em, mut db) = (vec![0u8; LIMBS * 8], vec![0u8; LIMBS * 8]);
+        emsa::verify_pss_shake::<X, _>(self, msg, sig, Some(salt_len), &mut em, &mut db)
+    }
+
+    /// [`verify_pss_shake`](Self::verify_pss_shake) recovering the salt
+    /// length from the encoded message (accepts any valid salt length).
+    pub fn verify_pss_shake_any_salt<X: PssShake>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
+        let (mut em, mut db) = (vec![0u8; LIMBS * 8], vec![0u8; LIMBS * 8]);
+        emsa::verify_pss_shake::<X, _>(self, msg, sig, None, &mut em, &mut db)
+    }
+
     /// Verifies an RSA-PSS signature over `msg`, hashing with `D` and
     /// requiring the salt length to equal `D`'s output length (the strict
     /// TLS 1.3 / X.509 profile).
@@ -147,9 +209,98 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{Sha1, Sha224, Sha256};
+    use crate::hash::{Sha1, Sha224, Sha256, Shake128, Shake256};
     use crate::rng::HmacDrbg;
     use crate::test_util::rsa_test_key_a;
+
+    /// RFC 8702 round trip on the const-generic keys, for both SHAKEs: the
+    /// profile signature verifies strictly, at its explicit salt length and
+    /// with salt recovery; a wrong message, the other SHAKE, a wrong salt
+    /// length and the MGF1 verifiers over the SHA-3 digests all reject it.
+    /// Explicit salt lengths round-trip too.
+    #[test]
+    fn shake_pss_roundtrip() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-pss-shake", b"nonce", &[]);
+
+        let sig = key.sign_pss_shake::<Shake128, _>(b"m", &mut r).unwrap();
+        assert_eq!(sig.len(), 256);
+        pk.verify_pss_shake::<Shake128>(b"m", &sig).unwrap();
+        pk.verify_pss_shake_with_salt_len::<Shake128>(b"m", &sig, 32)
+            .unwrap();
+        pk.verify_pss_shake_any_salt::<Shake128>(b"m", &sig)
+            .unwrap();
+        assert_eq!(
+            pk.verify_pss_shake::<Shake128>(b"other", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(
+            pk.verify_pss_shake::<Shake256>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(
+            pk.verify_pss_shake_any_salt::<Shake256>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(
+            pk.verify_pss_shake_with_salt_len::<Shake128>(b"m", &sig, 20),
+            Err(Error::Verification)
+        );
+        // SHAKE128-as-XOF is not SHA3-256 + MGF1-SHA3-256.
+        assert_eq!(
+            pk.verify_pss::<crate::hash::Sha3_256>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(
+            pk.verify_pss_any_salt::<crate::hash::Sha3_256>(b"m", &sig),
+            Err(Error::Verification)
+        );
+
+        let sig = key.sign_pss_shake::<Shake256, _>(b"m", &mut r).unwrap();
+        pk.verify_pss_shake::<Shake256>(b"m", &sig).unwrap();
+        pk.verify_pss_shake_with_salt_len::<Shake256>(b"m", &sig, 64)
+            .unwrap();
+        pk.verify_pss_shake_any_salt::<Shake256>(b"m", &sig)
+            .unwrap();
+        assert_eq!(
+            pk.verify_pss_shake::<Shake128>(b"m", &sig),
+            Err(Error::Verification)
+        );
+        assert_eq!(
+            pk.verify_pss::<crate::hash::Sha3_512>(b"m", &sig),
+            Err(Error::Verification)
+        );
+
+        for &slen in &[0usize, 20, 64] {
+            let sig = key
+                .sign_pss_shake_with_salt_len::<Shake128, _>(b"m", slen, &mut r)
+                .unwrap();
+            pk.verify_pss_shake_with_salt_len::<Shake128>(b"m", &sig, slen)
+                .unwrap();
+            pk.verify_pss_shake_any_salt::<Shake128>(b"m", &sig)
+                .unwrap();
+            assert_eq!(
+                pk.verify_pss_shake_with_salt_len::<Shake128>(b"m", &sig, slen + 1),
+                Err(Error::Verification)
+            );
+            if slen != 32 {
+                assert_eq!(
+                    pk.verify_pss_shake::<Shake128>(b"m", &sig),
+                    Err(Error::Verification)
+                );
+            }
+        }
+        // Oversized salt lengths are errors, never panics (as for MGF1).
+        assert_eq!(
+            key.sign_pss_shake_with_salt_len::<Shake256, _>(b"m", usize::MAX, &mut r),
+            Err(Error::MessageTooLong)
+        );
+        assert_eq!(
+            pk.verify_pss_shake_with_salt_len::<Shake256>(b"m", &sig, usize::MAX),
+            Err(Error::Verification)
+        );
+    }
 
     /// `sign_pss_mgf::<D, D>` is the single-digest method: identically
     /// seeded DRBGs must yield byte-identical signatures, and the two verify

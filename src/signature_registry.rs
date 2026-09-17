@@ -127,6 +127,12 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     &crate::rsa::registry::PssPssSha384,
     #[cfg(all(feature = "rsa", feature = "alloc"))]
     &crate::rsa::registry::PssPssSha512,
+    // RSA-PSS with SHAKE as hash and MGF (RFC 8702), OID-keyed. Not on
+    // `modern()`; explicit opt-in.
+    #[cfg(all(feature = "rsa", feature = "alloc"))]
+    &crate::rsa::registry::PssShake128,
+    #[cfg(all(feature = "rsa", feature = "alloc"))]
+    &crate::rsa::registry::PssShake256,
     // OID-keyed ECDSA entries (X.509 chain dispatch).
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::EcdsaSha256AnyCurve,

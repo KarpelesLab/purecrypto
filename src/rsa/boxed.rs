@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::emsa::{self, RawPrivate, RawPublic};
-use super::{Error, Pkcs1Digest};
+use super::{Error, Pkcs1Digest, PssShake};
 use crate::bignum::{BoxedMontModulus, BoxedUint};
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, HmacSha256, Sha256};
@@ -30,6 +30,18 @@ pub struct BoxedRsaPublicKey {
 /// A runtime-sized RSA private key (signing uses `c^d mod n`; the prime factors
 /// `p`, `q` are kept when the key was generated here, enabling PKCS#1 export
 /// with CRT parameters, and are zero for keys imported without them).
+///
+/// # Multi-prime keys
+///
+/// RFC 8017 §3.2 multi-prime keys (`RSAPrivateKey` `version = 1` with
+/// `otherPrimeInfos`, `n = p · q · r₃ ⋯ rᵤ`) are accepted by the PKCS#1 /
+/// PKCS#8 parsers and by
+/// [`from_components_with_other_primes`](Self::from_components_with_other_primes);
+/// the extra primes are kept, the private operation runs the `u`-prime CRT
+/// (RFC 8017 §5.1.2 step 2.b, Garner) under the same blinding and fault
+/// check as the two-prime path, and the key re-serializes as `version = 1`.
+/// Generating multi-prime keys is not supported. The public key is `(n, e)`
+/// as always.
 ///
 /// # Side-channel protection
 ///
@@ -56,14 +68,18 @@ pub struct BoxedRsaPrivateKey {
     d: BoxedUint,
     p: BoxedUint,
     q: BoxedUint,
+    /// The primes beyond `p` and `q` of a multi-prime key (RFC 8017 §3.2
+    /// `r_3 … r_u`, in `otherPrimeInfos` order); empty for a two-prime key.
+    other_primes: Vec<BoxedUint>,
     mont: BoxedMontModulus,
     k: usize,
-    /// `(p−1)·(q−1) − 1` when both primes are known; `None` when the key was
-    /// imported without them (then blinding is disabled).
+    /// `φ(n) − 1 = ∏(rᵢ − 1) − 1` when the primes are known; `None` when
+    /// the key was imported without them (then blinding is disabled).
     phi_n_minus_1: Option<BoxedUint>,
-    /// CRT parameters (`dP`, `dQ`, `qInv`, Fermat exponents) when both primes
-    /// are known and usable; `None` disables the CRT fast path. Boxed so the
-    /// five extra `BoxedUint`s don't bloat every `AnyPrivateKey`.
+    /// CRT parameters (`dP`, `dQ`, `qInv`, Fermat exponents, and the
+    /// per-extra-prime `(dᵢ, tᵢ)` of a multi-prime key) when the primes are
+    /// known and usable; `None` disables the CRT fast path. Boxed so the
+    /// extra `BoxedUint`s don't bloat every `AnyPrivateKey`.
     crt: Option<alloc::boxed::Box<BoxedRsaCrt>>,
     /// HMAC-SHA256 key (derived from `d`) for per-call blinding values.
     blinding_seed: [u8; 32],
@@ -88,6 +104,7 @@ impl Clone for BoxedRsaPrivateKey {
             d: self.d.clone(),
             p: self.p.clone(),
             q: self.q.clone(),
+            other_primes: self.other_primes.clone(),
             mont: self.mont.clone(),
             k: self.k,
             phi_n_minus_1: self.phi_n_minus_1.clone(),
@@ -126,6 +143,9 @@ impl Drop for BoxedRsaPrivateKey {
         self.d.zeroize();
         self.p.zeroize();
         self.q.zeroize();
+        for r in &mut self.other_primes {
+            r.zeroize();
+        }
         if let Some(phi) = self.phi_n_minus_1.as_mut() {
             phi.zeroize();
         }
@@ -136,20 +156,19 @@ impl Drop for BoxedRsaPrivateKey {
 
 impl crate::zeroize::ZeroizeOnDrop for BoxedRsaPrivateKey {}
 
-/// Computes `phi(n) − 1` from the primes (if both are nonzero) and the
-/// blinding HMAC key (always).
-fn derive_blinding_boxed(
-    p: &BoxedUint,
-    q: &BoxedUint,
-    d: &BoxedUint,
-) -> (Option<BoxedUint>, [u8; 32]) {
-    let phi_n_minus_1 = if p.is_zero() || q.is_zero() {
+/// Computes `φ(n) − 1 = ∏(rᵢ − 1) − 1` from the primes (if all are nonzero)
+/// and the blinding HMAC key (always). `primes` is `p`, `q`, then any extra
+/// primes of a multi-prime key.
+fn derive_blinding_boxed(primes: &[&BoxedUint], d: &BoxedUint) -> (Option<BoxedUint>, [u8; 32]) {
+    let phi_n_minus_1 = if primes.iter().any(|r| r.is_zero()) {
         None
     } else {
         let one = BoxedUint::from_u64(1);
-        let pm1 = p.sub(&one);
-        let qm1 = q.sub(&one);
-        Some(pm1.mul(&qm1).sub(&one))
+        let mut phi = one.clone();
+        for r in primes {
+            phi = phi.mul(&r.sub(&one));
+        }
+        Some(phi.sub(&one))
     };
 
     let mut h = Sha256::new();
@@ -187,6 +206,31 @@ pub(crate) struct BoxedRsaCrt {
     /// two, which was ~9% of an RSA-2048 signature.
     mont_p: BoxedMontModulus,
     mont_q: BoxedMontModulus,
+    /// The `(dᵢ, tᵢ)` of each extra prime of a multi-prime key (RFC 8017
+    /// §3.2, in `otherPrimeInfos` order); empty for a two-prime key.
+    others: Vec<BoxedRsaOtherPrime>,
+}
+
+/// CRT parameters of one extra prime `rᵢ` (`i ≥ 3`) of a multi-prime key:
+/// the exponent `dᵢ = d mod (rᵢ − 1)`, the coefficient
+/// `tᵢ = (r₁ ⋯ rᵢ₋₁)⁻¹ mod rᵢ`, the Fermat exponent `rᵢ − 2` for the
+/// blinder inverse, and the Montgomery context for `rᵢ`. As secret as the
+/// prime itself.
+#[derive(Clone)]
+pub(crate) struct BoxedRsaOtherPrime {
+    d: BoxedUint,
+    t: BoxedUint,
+    rm2: BoxedUint,
+    mont: BoxedMontModulus,
+}
+
+impl Drop for BoxedRsaOtherPrime {
+    fn drop(&mut self) {
+        self.d.zeroize();
+        self.t.zeroize();
+        self.rm2.zeroize();
+        // `mont` holds `rᵢ` and is wiped by its own `Drop`.
+    }
 }
 
 impl Drop for BoxedRsaCrt {
@@ -198,7 +242,7 @@ impl Drop for BoxedRsaCrt {
         self.qm2.zeroize();
         // `mont_p` / `mont_q` hold `p` and `q` (plus their R² values) and are
         // wiped by `BoxedMontModulus`'s own `Drop`, which runs right after
-        // this one.
+        // this one; each `others` entry wipes itself.
     }
 }
 
@@ -213,17 +257,33 @@ impl core::fmt::Debug for BoxedRsaCrt {
 /// has no (usable) primes. `qInv` is computed as `q^(p−2) mod p` through the
 /// constant-time Montgomery ladder rather than `inv_mod_boxed` (whose binary
 /// GCD is variable-time in its operands — fine for the one-time DER export,
-/// not for something derived on every key parse). Degenerate primes (even,
+/// not for something derived on every key parse); likewise each multi-prime
+/// coefficient `tᵢ = (r₁ ⋯ rᵢ₋₁)^(rᵢ−2) mod rᵢ`. Degenerate primes (even,
 /// tiny, or equal) yield `None`; a key whose primes merely *lie* (wrong
 /// factors for `n`) still gets parameters, and the fault check in
 /// [`raw_private_blinded_boxed`] routes it to the non-CRT path at runtime.
 fn derive_crt_boxed(
     p: &BoxedUint,
     q: &BoxedUint,
+    other_primes: &[BoxedUint],
     d: &BoxedUint,
 ) -> Option<alloc::boxed::Box<BoxedRsaCrt>> {
-    if p.bit_len() < 3 || q.bit_len() < 3 || !p.is_odd() || !q.is_odd() || bool::from(p.ct_eq(q)) {
+    let usable = |r: &BoxedUint| r.bit_len() >= 3 && r.is_odd();
+    if !usable(p) || !usable(q) || !other_primes.iter().all(usable) {
         return None;
+    }
+    // Pairwise distinct: `p, q, r₃ … rᵤ` are secret, so each comparison is
+    // the constant-time limb compare (the branch on the verdict is fine).
+    let mut all: Vec<&BoxedUint> = Vec::with_capacity(2 + other_primes.len());
+    all.push(p);
+    all.push(q);
+    all.extend(other_primes.iter());
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            if bool::from(a.ct_eq(b)) {
+                return None;
+            }
+        }
     }
     let one = BoxedUint::from_u64(1);
     let two = BoxedUint::from_u64(2);
@@ -234,6 +294,24 @@ fn derive_crt_boxed(
     let mont_p = BoxedMontModulus::new(p);
     let mont_q = BoxedMontModulus::new(q);
     let qinv = mont_p.pow(&q.reduce(p), &pm2);
+    // RFC 8017 §3.2: tᵢ = (r₁ · r₂ ⋯ rᵢ₋₁)⁻¹ mod rᵢ, with r₁ = p, r₂ = q.
+    // `prod` is the running product of the preceding primes — secret
+    // (it factors `n`), so it is wiped once the last coefficient is out.
+    let mut prod = p.mul(q);
+    let mut others = Vec::with_capacity(other_primes.len());
+    for r in other_primes {
+        let rm2 = r.sub(&two);
+        let mont = BoxedMontModulus::new(r);
+        let t = mont.pow(&prod.reduce(r), &rm2);
+        others.push(BoxedRsaOtherPrime {
+            d: d.reduce(&r.sub(&one)),
+            t,
+            rm2,
+            mont,
+        });
+        prod = prod.mul(r);
+    }
+    prod.zeroize();
     Some(alloc::boxed::Box::new(BoxedRsaCrt {
         dp,
         dq,
@@ -242,6 +320,7 @@ fn derive_crt_boxed(
         qm2,
         mont_p,
         mont_q,
+        others,
     }))
 }
 
@@ -299,12 +378,25 @@ fn derive_blinder_boxed(
 ///   m       = m_q + q · (qInv·(m_p − m_q) mod p)    (Garner)
 /// ```
 ///
-/// All four exponentiations run the constant-time windowed ladder with
-/// secret exponents of public width; the reductions mod `p`/`q` are
-/// constant-time long division. The caller MUST fault-check the result
-/// (`m^e ≡ c mod n`) before releasing it: a fault in one CRT half — or a key
-/// imported with inconsistent primes — otherwise yields output that factors
-/// `n` (Boneh–DeMillo–Lipton).
+/// A multi-prime key (RFC 8017 §5.1.2 step 2.b) continues the Garner
+/// recombination over its extra primes, each with the same blinded
+/// exponentiation and Fermat blinder inverse:
+///
+/// ```text
+///   R = p · q
+///   for i = 3 … u:
+///     m_i = (c_blind mod rᵢ)^dᵢ · r^(rᵢ−2) mod rᵢ
+///     h   = tᵢ · (m_i − (m mod rᵢ)) mod rᵢ
+///     m   = m + R · h;  R = R · rᵢ
+/// ```
+///
+/// Every exponentiation runs the constant-time windowed ladder with secret
+/// exponents of public width; the reductions mod each prime are
+/// constant-time long division, and `sub_mod` / `mul_mod` / the widening
+/// `add` and `mul` have operand-independent schedules. The caller MUST
+/// fault-check the result (`m^e ≡ c mod n`) before releasing it: a fault in
+/// one CRT half — or a key imported with inconsistent primes — otherwise
+/// yields output that factors `n` (Boneh–DeMillo–Lipton).
 fn raw_private_crt_blinded(
     key: &BoxedRsaPrivateKey,
     crt: &BoxedRsaCrt,
@@ -339,16 +431,41 @@ fn raw_private_crt_blinded(
     let mut m_q_mod_p = m_q.reduce(&key.p);
     let mut diff = mont_p.sub_mod(&m_p, &m_q_mod_p);
     let mut h = mont_p.mul_mod(&diff, &crt.qinv);
-    let m = m_q.add(&key.q.mul(&h));
+    let mut m = m_q.add(&key.q.mul(&h));
 
-    r.zeroize();
     r_e.zeroize();
-    c_blind.zeroize();
     m_p.zeroize();
     m_q.zeroize();
     m_q_mod_p.zeroize();
     diff.zeroize();
     h.zeroize();
+
+    // Multi-prime continuation (RFC 8017 §5.1.2 step 2.b.v): `m` is so far
+    // the residue mod `R = p·q`; each extra prime lifts it to mod `R·rᵢ`.
+    // `big_r` is a partial product of the primes — secret past `p·q`.
+    if !crt.others.is_empty() {
+        let mut big_r = key.p.mul(&key.q);
+        for (op, r_i) in crt.others.iter().zip(key.other_primes.iter()) {
+            let mut m_i = half(&op.mont, &op.d, &op.rm2);
+            let mut m_mod_r = m.reduce(r_i);
+            let mut diff = op.mont.sub_mod(&m_i, &m_mod_r);
+            let mut h = op.mont.mul_mod(&diff, &op.t);
+            let mut lifted = m.add(&big_r.mul(&h));
+            core::mem::swap(&mut m, &mut lifted);
+            lifted.zeroize();
+            let mut next_r = big_r.mul(r_i);
+            core::mem::swap(&mut big_r, &mut next_r);
+            next_r.zeroize();
+            m_i.zeroize();
+            m_mod_r.zeroize();
+            diff.zeroize();
+            h.zeroize();
+        }
+        big_r.zeroize();
+    }
+
+    r.zeroize();
+    c_blind.zeroize();
     m
 }
 
@@ -458,6 +575,7 @@ fn validate_public_exponent(n: &BoxedUint, e: &BoxedUint) -> Result<(), Error> {
 /// integer below `n`), and an oversized `d` widens the constant-time
 /// exponentiation past the modulus width — leaking, via timing, that the key
 /// is malformed and costing proportionally more per operation.
+#[cfg(feature = "der")]
 fn validate_private_exponent(n: &BoxedUint, d: &BoxedUint) -> Result<(), Error> {
     if d.is_zero() || !d.lt(n) {
         return Err(Error::InvalidKey);
@@ -466,50 +584,59 @@ fn validate_private_exponent(n: &BoxedUint, d: &BoxedUint) -> Result<(), Error> 
 }
 
 /// Validates that the parsed PKCS#1 / PKCS#8 private-key components are
-/// internally consistent: each prime is `> 1`, `p ≠ q`, and `p · q = n`
-/// (RFC 8017 §3.2). Without this check a corrupted (or maliciously crafted)
-/// key file with mismatched primes silently slips through and produces wrong
-/// signatures, leaks information through the CRT recombination path, and
-/// in the worst case enables a Bleichenbacher-style fault on the secret
-/// exponent. We reject before the key is constructed.
-fn validate_private_components(n: &BoxedUint, p: &BoxedUint, q: &BoxedUint) -> Result<(), Error> {
+/// internally consistent: each prime is `> 1` and odd, the primes are
+/// pairwise distinct, and their product is `n` (RFC 8017 §3.2; `primes` is
+/// `p`, `q`, then the extra primes of a multi-prime key). Without this check
+/// a corrupted (or maliciously crafted) key file with mismatched primes
+/// silently slips through and produces wrong signatures, leaks information
+/// through the CRT recombination path, and in the worst case enables a
+/// Bleichenbacher-style fault on the secret exponent. We reject before the
+/// key is constructed.
+#[cfg(feature = "der")]
+fn validate_private_components(n: &BoxedUint, primes: &[&BoxedUint]) -> Result<(), Error> {
     let one = BoxedUint::from_u64(1);
-    if !one.lt(p) || !one.lt(q) {
-        return Err(Error::InvalidKey);
+    let mut prod = one.clone();
+    for (i, r) in primes.iter().enumerate() {
+        if !one.lt(r) {
+            return Err(Error::InvalidKey);
+        }
+        // An even prime is invalid for RSA (the only even prime is 2, far
+        // below the size of any legitimate factor). Reject even primes
+        // explicitly: an even factor cannot be a real prime and never reaches
+        // the assert-odd Montgomery path that an even `n` would.
+        if !r.is_odd() {
+            return Err(Error::InvalidKey);
+        }
+        // The primes are secret: compare without an early exit at the first
+        // differing limb (the branch on the single verdict bit is fine).
+        for other in &primes[i + 1..] {
+            if bool::from(r.ct_eq(other)) {
+                return Err(Error::InvalidKey);
+            }
+        }
+        prod = prod.mul(r);
     }
-    // An even prime is invalid for RSA (the only even prime is 2, far below the
-    // size of any legitimate factor). Reject even `p`/`q` explicitly: an even
-    // factor cannot be a real prime and never reaches the assert-odd Montgomery
-    // path that an even `n` would.
-    if !p.is_odd() || !q.is_odd() {
-        return Err(Error::InvalidKey);
-    }
-    // `p`, `q` are secret: compare without an early exit at the first
-    // differing limb (the branch on the single verdict bit is fine).
-    if bool::from(p.ct_eq(q)) {
-        return Err(Error::InvalidKey);
-    }
-    if !bool::from(p.mul(q).ct_eq(n)) {
+    if !bool::from(prod.ct_eq(n)) {
         return Err(Error::InvalidKey);
     }
     Ok(())
 }
 
-/// Validates that the private exponent really inverts `e` in both prime
-/// fields: `e·(d mod (p−1)) ≡ 1 (mod p−1)` and likewise for `q`
-/// (RFC 8017 §3.2). This is exactly the relation the CRT half-exponentiations
-/// rely on, and a `d` that violates it — a corrupted key file, a
-/// fault-injected blob, or a deliberately inconsistent one — otherwise
-/// silently produces wrong signatures whose CRT halves can reveal a factor of
-/// `n`. Cheap: two reductions and two multiplications, once per parse.
+/// Validates that the private exponent really inverts `e` in every prime
+/// field: `e·(d mod (rᵢ−1)) ≡ 1 (mod rᵢ−1)` for each prime (RFC 8017 §3.2).
+/// This is exactly the relation the CRT exponentiations rely on, and a `d`
+/// that violates it — a corrupted key file, a fault-injected blob, or a
+/// deliberately inconsistent one — otherwise silently produces wrong
+/// signatures whose CRT halves can reveal a factor of `n`. Cheap: one
+/// reduction and one multiplication per prime, once per parse.
+#[cfg(feature = "der")]
 fn validate_crt_consistency(
     e: &BoxedUint,
     d: &BoxedUint,
-    p: &BoxedUint,
-    q: &BoxedUint,
+    primes: &[&BoxedUint],
 ) -> Result<(), Error> {
     let one = BoxedUint::from_u64(1);
-    for prime in [p, q] {
+    for prime in primes {
         let pm1 = prime.sub(&one);
         let dx = d.reduce(&pm1);
         if !bool::from(e.mul(&dx).reduce(&pm1).ct_eq(&one)) {
@@ -518,6 +645,15 @@ fn validate_crt_consistency(
     }
     Ok(())
 }
+
+/// Upper bound on the number of primes of a multi-prime key accepted by the
+/// parsers (`u` in RFC 8017 §3.2, counting `p` and `q`). The RFC sets no
+/// limit; in practice multi-prime keys have three or four primes (each
+/// must stay large enough that ECM cannot find it), and OpenSSL refuses to
+/// generate more than five. The cap keeps a hostile blob from making a
+/// parse build an unbounded number of Montgomery contexts.
+#[cfg(feature = "der")]
+pub(crate) const MAX_RSA_PRIMES: usize = 8;
 
 impl BoxedRsaPublicKey {
     /// Builds a public key from modulus `n` and exponent `e`.
@@ -646,6 +782,37 @@ impl BoxedRsaPublicKey {
         emsa::verify_pss_any_salt::<D, M, _>(self, msg, sig, &mut em, &mut db)
     }
 
+    /// Verifies an RSASSA-PSS-SHAKE signature (RFC 8702) over `msg`: `X`
+    /// (SHAKE128 or SHAKE256) is the hash and the mask generation function
+    /// (squeezed directly, not through MGF1), and the salt must be
+    /// `X::OUTPUT_LEN` octets (the RFC 8702 §3.1 profile).
+    pub fn verify_pss_shake<X: PssShake>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+        self.verify_pss_shake_with_salt_len::<X>(msg, sig, X::OUTPUT_LEN)
+    }
+
+    /// [`verify_pss_shake`](Self::verify_pss_shake) requiring the salt to be
+    /// exactly `salt_len` octets.
+    pub fn verify_pss_shake_with_salt_len<X: PssShake>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+        salt_len: usize,
+    ) -> Result<(), Error> {
+        let (mut em, mut db) = (vec![0u8; self.k], vec![0u8; self.k]);
+        emsa::verify_pss_shake::<X, _>(self, msg, sig, Some(salt_len), &mut em, &mut db)
+    }
+
+    /// [`verify_pss_shake`](Self::verify_pss_shake) recovering the salt
+    /// length from the encoded message (accepts any valid salt length).
+    pub fn verify_pss_shake_any_salt<X: PssShake>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
+        let (mut em, mut db) = (vec![0u8; self.k], vec![0u8; self.k]);
+        emsa::verify_pss_shake::<X, _>(self, msg, sig, None, &mut em, &mut db)
+    }
+
     /// Encrypts `msg` with PKCS#1 v1.5.
     ///
     /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]) —
@@ -712,13 +879,14 @@ impl BoxedRsaPrivateKey {
         let mont = BoxedMontModulus::new(&n);
         let p = BoxedUint::zero(1);
         let q = BoxedUint::zero(1);
-        let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
+        let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&[&p, &q], &d);
         BoxedRsaPrivateKey {
             n,
             e,
             d,
             p,
             q,
+            other_primes: Vec::new(),
             mont,
             k,
             phi_n_minus_1,
@@ -748,16 +916,55 @@ impl BoxedRsaPrivateKey {
         p: BoxedUint,
         q: BoxedUint,
     ) -> Self {
+        Self::from_components_with_other_primes(n, e, d, p, q, Vec::new())
+    }
+
+    /// Builds a multi-prime private key (RFC 8017 §3.2) from `n`, `e`, `d`,
+    /// the first two primes `p`/`q` and the extra primes `r₃ … rᵤ`
+    /// (`other_primes`, in `otherPrimeInfos` order, so that
+    /// `n = p · q · r₃ ⋯ rᵤ`). The CRT exponents and coefficients
+    /// (`dP`, `dQ`, `qInv`, `dᵢ`, `tᵢ`) are derived here on the
+    /// constant-time ladder; the private operation runs the `u`-prime CRT
+    /// with the same blinding and fault check as the two-prime path. An
+    /// empty `other_primes` is exactly
+    /// [`from_components_with_primes`](Self::from_components_with_primes).
+    ///
+    /// Like the other component constructors this performs **no validation**;
+    /// the components must already be a consistent, trusted key (untrusted
+    /// blobs go through [`from_pkcs1_der`](Self::from_pkcs1_der) /
+    /// [`from_pkcs8_der`](Self::from_pkcs8_der), which check the primes
+    /// against `n` and `d` against `e` in every prime field). Degenerate
+    /// primes (even, below 3 bits, or repeated) disable the CRT fast path
+    /// rather than panic; a key whose primes do not actually factor `n` is
+    /// caught by the per-operation fault check and served by the full-width
+    /// `c^d mod n` path instead.
+    ///
+    /// # Panics
+    /// Panics if `n` is even or zero (the Montgomery precomputation requires an
+    /// odd modulus).
+    pub fn from_components_with_other_primes(
+        n: BoxedUint,
+        e: BoxedUint,
+        d: BoxedUint,
+        p: BoxedUint,
+        q: BoxedUint,
+        other_primes: Vec<BoxedUint>,
+    ) -> Self {
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
-        let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
-        let crt = derive_crt_boxed(&p, &q, &d);
+        let (phi_n_minus_1, blinding_seed) = {
+            let mut all: Vec<&BoxedUint> = alloc::vec![&p, &q];
+            all.extend(other_primes.iter());
+            derive_blinding_boxed(&all, &d)
+        };
+        let crt = derive_crt_boxed(&p, &q, &other_primes, &d);
         BoxedRsaPrivateKey {
             n,
             e,
             d,
             p,
             q,
+            other_primes,
             mont,
             k,
             phi_n_minus_1,
@@ -766,6 +973,13 @@ impl BoxedRsaPrivateKey {
             blind_counter: AtomicU32::new(0),
             blind_salt: super::keys::fresh_blind_salt(),
         }
+    }
+
+    /// The number of prime factors the key carries: `2` for a two-prime key
+    /// (including one imported without its primes), `u ≥ 3` for a
+    /// multi-prime key (RFC 8017 §3.2).
+    pub fn num_primes(&self) -> usize {
+        2 + self.other_primes.len()
     }
 
     /// Generates a runtime-sized RSA key pair with a `bits`-bit modulus and
@@ -840,24 +1054,7 @@ impl BoxedRsaPrivateKey {
             // count (`inv_mod_ct_boxed`); retry if e is not coprime to φ —
             // that outcome is public by nature.
             if let Some(d) = inv_mod_ct_boxed(&e, &phi).into_option() {
-                let k = n.bit_len().div_ceil(8);
-                let mont = BoxedMontModulus::new(&n);
-                let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
-                let crt = derive_crt_boxed(&p, &q, &d);
-                return BoxedRsaPrivateKey {
-                    n,
-                    e,
-                    d,
-                    p,
-                    q,
-                    mont,
-                    k,
-                    phi_n_minus_1,
-                    crt,
-                    blinding_seed,
-                    blind_counter: AtomicU32::new(0),
-                    blind_salt: super::keys::fresh_blind_salt(),
-                };
+                return Self::from_components_with_primes(n, e, d, p, q);
             }
         }
     }
@@ -937,6 +1134,31 @@ impl BoxedRsaPrivateKey {
     ) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; self.k];
         emsa::sign_pss_with_salt_len::<D, M, _, R>(self, msg, salt_len, rng, &mut out)?;
+        Ok(out)
+    }
+
+    /// Signs `msg` with RSASSA-PSS-SHAKE (RFC 8702): `X` (SHAKE128 or
+    /// SHAKE256) is the hash and the mask generation function, the salt is
+    /// `X::OUTPUT_LEN` octets (the RFC 8702 §3.1 profile).
+    pub fn sign_pss_shake<X: PssShake, R: RngCore>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
+        self.sign_pss_shake_with_salt_len::<X, R>(msg, X::OUTPUT_LEN, rng)
+    }
+
+    /// [`sign_pss_shake`](Self::sign_pss_shake) with an explicit salt length
+    /// (in octets; `0` is permitted, the maximum is bounded by the modulus
+    /// size — `Error::MessageTooLong` otherwise).
+    pub fn sign_pss_shake_with_salt_len<X: PssShake, R: RngCore>(
+        &self,
+        msg: &[u8],
+        salt_len: usize,
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
+        let mut out = vec![0u8; self.k];
+        emsa::sign_pss_shake::<X, _, R>(self, msg, salt_len, rng, &mut out)?;
         Ok(out)
     }
 
@@ -1211,25 +1433,35 @@ use super::encoding::RSA_ENCRYPTION_OID;
 impl BoxedRsaPrivateKey {
     /// Parses a PKCS#1 `RSAPrivateKey` DER structure, retaining the modulus,
     /// public exponent, private exponent, and the prime factors (the CRT
-    /// parameters `dP`/`dQ`/`qInv` are recomputed on export, so they need not
-    /// round-trip). The primes enable base-blinding on the secret-side path.
+    /// parameters `dP`/`dQ`/`qInv` — and a multi-prime key's `dᵢ`/`tᵢ` —
+    /// are recomputed on the constant-time ladder, so the blob's copies are
+    /// not used and need not round-trip). The primes enable base-blinding
+    /// on the secret-side path.
+    ///
+    /// Both RFC 8017 A.1.2 forms are accepted: `version = 0` (two-prime, no
+    /// `otherPrimeInfos`) and `version = 1` (multi-prime, with a non-empty
+    /// `otherPrimeInfos SEQUENCE OF { prime, exponent, coefficient }`, at
+    /// most eight primes in total). A version that does not
+    /// match the presence of `otherPrimeInfos`, or any other version, is
+    /// rejected.
     ///
     /// Rejects moduli outside `[MIN_RSA_BITS, MAX_RSA_BITS]`, degenerate
     /// public exponents (`e < 3`, even, `≥ n`, or `≥ 2^256`), a private
-    /// exponent outside `[1, n)`, primes `≤ 1` or even, `p = q`,
-    /// `p · q ≠ n`, and a `d` that does not invert `e` in both prime fields
-    /// (`e·dP ≢ 1 mod p−1`, `e·dQ ≢ 1 mod q−1`) — the relation the CRT path
-    /// depends on.
+    /// exponent outside `[1, n)`, primes `≤ 1` or even, repeated primes,
+    /// a product of primes `≠ n`, and a `d` that does not invert `e` in
+    /// every prime field (`e·dP ≢ 1 mod p−1`, `e·dQ ≢ 1 mod q−1`, and
+    /// likewise `dᵢ`) — the relation the CRT path depends on.
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut seq = reader.read_sequence()?;
-        // RFC 8017 A.1.2: `version` is 0 for the two-prime structure parsed
-        // here; 1 denotes the multi-prime form, whose `otherPrimeInfos` this
-        // parser does not understand. Anything but a canonical 0 is rejected
-        // rather than silently read as a two-prime key.
-        if seq.read_integer_bytes()? != [0] {
-            return Err(crate::der::Error::Malformed);
-        }
+        // RFC 8017 A.1.2: `version` is 0 for the two-prime structure, 1 for
+        // the multi-prime form with `otherPrimeInfos`. Anything but a
+        // canonical 0 or 1 is rejected.
+        let multi = match seq.read_integer_bytes()? {
+            [0] => false,
+            [1] => true,
+            _ => return Err(crate::der::Error::Malformed),
+        };
         let n = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
         let e = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
         let d = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
@@ -1238,6 +1470,26 @@ impl BoxedRsaPrivateKey {
         let _dp = seq.read_unsigned_integer_bytes()?;
         let _dq = seq.read_unsigned_integer_bytes()?;
         let _qinv = seq.read_unsigned_integer_bytes()?;
+        // otherPrimeInfos: "shall be omitted if version is 0 and shall
+        // contain at least one instance of OtherPrimeInfo if version is 1".
+        let mut other_primes = Vec::new();
+        if multi {
+            let mut infos = seq.read_sequence()?;
+            while !infos.is_empty() {
+                if other_primes.len() + 2 >= MAX_RSA_PRIMES {
+                    return Err(crate::der::Error::Malformed);
+                }
+                let mut info = infos.read_sequence()?;
+                let r = BoxedUint::from_be_bytes(info.read_unsigned_integer_bytes()?);
+                let _d_i = info.read_unsigned_integer_bytes()?;
+                let _t_i = info.read_unsigned_integer_bytes()?;
+                info.finish()?;
+                other_primes.push(r);
+            }
+            if other_primes.is_empty() {
+                return Err(crate::der::Error::Malformed);
+            }
+        }
         seq.finish()?;
         reader.finish()?;
         let bits = n.bit_len();
@@ -1246,26 +1498,20 @@ impl BoxedRsaPrivateKey {
         }
         validate_public_exponent(&n, &e).map_err(|_| crate::der::Error::Malformed)?;
         validate_private_exponent(&n, &d).map_err(|_| crate::der::Error::Malformed)?;
-        validate_private_components(&n, &p, &q).map_err(|_| crate::der::Error::Malformed)?;
-        validate_crt_consistency(&e, &d, &p, &q).map_err(|_| crate::der::Error::Malformed)?;
-        let k = n.bit_len().div_ceil(8);
-        let mont = BoxedMontModulus::new(&n);
-        let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
-        let crt = derive_crt_boxed(&p, &q, &d);
-        Ok(BoxedRsaPrivateKey {
+        {
+            let mut all: Vec<&BoxedUint> = alloc::vec![&p, &q];
+            all.extend(other_primes.iter());
+            validate_private_components(&n, &all).map_err(|_| crate::der::Error::Malformed)?;
+            validate_crt_consistency(&e, &d, &all).map_err(|_| crate::der::Error::Malformed)?;
+        }
+        Ok(Self::from_components_with_other_primes(
             n,
             e,
             d,
             p,
             q,
-            mont,
-            k,
-            phi_n_minus_1,
-            crt,
-            blinding_seed,
-            blind_counter: AtomicU32::new(0),
-            blind_salt: super::keys::fresh_blind_salt(),
-        })
+            other_primes,
+        ))
     }
 
     /// Decodes a PKCS#1 PEM private key (`-----BEGIN RSA PRIVATE KEY-----`).
@@ -1273,8 +1519,10 @@ impl BoxedRsaPrivateKey {
         Self::from_pkcs1_der(&crate::der::pem_decode(pem, "RSA PRIVATE KEY")?)
     }
 
-    /// Encodes the key as a PKCS#1 `RSAPrivateKey` DER structure (two-prime,
-    /// with the CRT parameters `dP`, `dQ`, `qInv`).
+    /// Encodes the key as a PKCS#1 `RSAPrivateKey` DER structure with the CRT
+    /// parameters `dP`, `dQ`, `qInv`: `version = 0` for a two-prime key,
+    /// `version = 1` with `otherPrimeInfos` (`prime`, `exponent`,
+    /// `coefficient` per extra prime) for a multi-prime one.
     ///
     /// # Panics
     /// Panics if the prime factors are not retained (i.e. the key was built via
@@ -1292,30 +1540,50 @@ impl BoxedRsaPrivateKey {
         let one = BoxedUint::from_u64(1);
         let dp = self.d.reduce(&self.p.sub(&one));
         let dq = self.d.reduce(&self.q.sub(&one));
-        // Reuse the CRT precomputation's `qInv`, which is `q^(p−2) mod p`
-        // through the constant-time Montgomery ladder. A key whose primes
-        // are degenerate enough that `derive_crt_boxed` refused them (even,
-        // tiny or equal) has no meaningful `qInv`; emit zero rather than run
-        // a variable-time Euclid on the secret primes.
+        // Reuse the CRT precomputation's `qInv` (and the multi-prime `tᵢ`),
+        // which are `q^(p−2) mod p` etc. through the constant-time
+        // Montgomery ladder. A key whose primes are degenerate enough that
+        // `derive_crt_boxed` refused them (even, tiny or equal) has no
+        // meaningful coefficients; emit zero rather than run a
+        // variable-time Euclid on the secret primes.
         let qinv = match self.crt.as_deref() {
             Some(crt) => crt.qinv.clone(),
             None => BoxedUint::zero(1),
         };
         let be = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8).max(1));
-        encode_sequence(
-            &[
-                encode_integer(&[0]),
-                encode_integer(&be(&self.n)),
-                encode_integer(&be(&self.e)),
-                encode_integer(&be(&self.d)),
-                encode_integer(&be(&self.p)),
-                encode_integer(&be(&self.q)),
-                encode_integer(&be(&dp)),
-                encode_integer(&be(&dq)),
-                encode_integer(&be(&qinv)),
-            ]
-            .concat(),
-        )
+        let multi = !self.other_primes.is_empty();
+        let mut body = [
+            encode_integer(&[u8::from(multi)]),
+            encode_integer(&be(&self.n)),
+            encode_integer(&be(&self.e)),
+            encode_integer(&be(&self.d)),
+            encode_integer(&be(&self.p)),
+            encode_integer(&be(&self.q)),
+            encode_integer(&be(&dp)),
+            encode_integer(&be(&dq)),
+            encode_integer(&be(&qinv)),
+        ]
+        .concat();
+        if multi {
+            let mut infos = Vec::new();
+            for (i, r) in self.other_primes.iter().enumerate() {
+                let d_i = self.d.reduce(&r.sub(&one));
+                let t_i = match self.crt.as_deref() {
+                    Some(crt) => crt.others[i].t.clone(),
+                    None => BoxedUint::zero(1),
+                };
+                infos.extend_from_slice(&encode_sequence(
+                    &[
+                        encode_integer(&be(r)),
+                        encode_integer(&be(&d_i)),
+                        encode_integer(&be(&t_i)),
+                    ]
+                    .concat(),
+                ));
+            }
+            body.extend_from_slice(&encode_sequence(&infos));
+        }
+        encode_sequence(&body)
     }
 
     /// Encodes the key as a PKCS#1 PEM document.
@@ -1367,7 +1635,8 @@ impl BoxedRsaPrivateKey {
     /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` DER structure for an
     /// RSA private key. Validates `version = 0`, `privateKeyAlgorithm` is
     /// `rsaEncryption` with explicit `NULL` parameters, and the inner OCTET
-    /// STRING decodes as a valid PKCS#1 `RSAPrivateKey`.
+    /// STRING decodes as a valid PKCS#1 `RSAPrivateKey` (two-prime or
+    /// multi-prime, see [`from_pkcs1_der`](Self::from_pkcs1_der)).
     ///
     /// Encrypted PKCS#8 (`EncryptedPrivateKeyInfo`, RFC 5958 §3) is rejected
     /// at the outer SEQUENCE — its first field is an `AlgorithmIdentifier`,
@@ -2451,5 +2720,312 @@ mod tests {
         );
         // The counter advanced across those operations.
         assert!(sk.blind_counter.load(Ordering::Relaxed) >= 2);
+    }
+
+    // ---- Multi-prime (RFC 8017 §3.2) ----
+
+    /// The components of a three-prime key: `n = p · q · r`, `e = 65537`,
+    /// `d = e⁻¹ mod φ(n)`.
+    struct ThreePrime {
+        n: BoxedUint,
+        e: BoxedUint,
+        d: BoxedUint,
+        p: BoxedUint,
+        q: BoxedUint,
+        r: BoxedUint,
+    }
+
+    /// Draws three 384-bit primes from a seeded DRBG (a 1152-bit modulus,
+    /// above `MIN_RSA_BITS` so the DER parsers accept it) and derives `d`.
+    fn three_prime_components(seed: &[u8]) -> ThreePrime {
+        let mut rng = HmacDrbg::<Sha256>::new(seed, b"three-prime", &[]);
+        let e = BoxedUint::from_u64(65537);
+        let one = BoxedUint::from_u64(1);
+        loop {
+            let p = super::super::prime::random_prime_boxed(&mut rng, 384, 8);
+            let q = super::super::prime::random_prime_boxed(&mut rng, 384, 8);
+            let r = super::super::prime::random_prime_boxed(&mut rng, 384, 8);
+            let n = p.mul(&q).mul(&r);
+            let phi = p.sub(&one).mul(&q.sub(&one)).mul(&r.sub(&one));
+            if let Some(d) = crate::bignum::inv_mod_boxed(&e, &phi) {
+                return ThreePrime { n, e, d, p, q, r };
+            }
+        }
+    }
+
+    fn three_prime_key(c: &ThreePrime) -> BoxedRsaPrivateKey {
+        BoxedRsaPrivateKey::from_components_with_other_primes(
+            c.n.clone(),
+            c.e.clone(),
+            c.d.clone(),
+            c.p.clone(),
+            c.q.clone(),
+            vec![c.r.clone()],
+        )
+    }
+
+    /// Big-endian minimal encoding, as the DER encoder wants it.
+    fn be_min(v: &BoxedUint) -> Vec<u8> {
+        v.to_be_bytes(v.bit_len().div_ceil(8).max(1))
+    }
+
+    /// A hand-built PKCS#1 `RSAPrivateKey` blob: `version`, the two-prime
+    /// fields (with the CRT parameters as given), and — when `others` is
+    /// non-empty — an `otherPrimeInfos` SEQUENCE of `(r, d_i, t_i)` triples.
+    fn pkcs1_blob(
+        version: u8,
+        c: &ThreePrime,
+        d: &BoxedUint,
+        others: &[(&BoxedUint, &BoxedUint, &BoxedUint)],
+        empty_infos: bool,
+    ) -> Vec<u8> {
+        use crate::der::{encode_integer, encode_sequence};
+        let one = BoxedUint::from_u64(1);
+        let dp = d.reduce(&c.p.sub(&one));
+        let dq = d.reduce(&c.q.sub(&one));
+        let qinv = crate::bignum::inv_mod_boxed(&c.q, &c.p).unwrap();
+        let mut body = [
+            encode_integer(&[version]),
+            encode_integer(&be_min(&c.n)),
+            encode_integer(&be_min(&c.e)),
+            encode_integer(&be_min(d)),
+            encode_integer(&be_min(&c.p)),
+            encode_integer(&be_min(&c.q)),
+            encode_integer(&be_min(&dp)),
+            encode_integer(&be_min(&dq)),
+            encode_integer(&be_min(&qinv)),
+        ]
+        .concat();
+        if !others.is_empty() || empty_infos {
+            let mut infos = Vec::new();
+            for (r, d_i, t_i) in others {
+                infos.extend_from_slice(&encode_sequence(
+                    &[
+                        encode_integer(&be_min(r)),
+                        encode_integer(&be_min(d_i)),
+                        encode_integer(&be_min(t_i)),
+                    ]
+                    .concat(),
+                ));
+            }
+            body.extend_from_slice(&encode_sequence(&infos));
+        }
+        encode_sequence(&body)
+    }
+
+    /// A three-prime key takes the multi-prime CRT path and its result is
+    /// bit-identical to the plain `c^d mod n` — on the raw operation, on
+    /// deterministic PKCS#1 v1.5 signatures against a primes-less
+    /// `from_components` key, and through OAEP / PKCS#1 v1.5 / PSS round
+    /// trips with the public key.
+    #[test]
+    fn three_prime_crt_matches_full_width_and_roundtrips() {
+        let c = three_prime_components(b"rsa-three-prime-a");
+        let key = three_prime_key(&c);
+        assert_eq!(key.num_primes(), 3);
+        let crt = key.crt.as_deref().expect("multi-prime CRT parameters");
+        assert_eq!(crt.others.len(), 1);
+        // The derived coefficient is the RFC 8017 §3.2 `t₃ = (p·q)⁻¹ mod r`
+        // and the exponent `d₃ = d mod (r − 1)`.
+        let pq_inv = crate::bignum::inv_mod_boxed(&c.p.mul(&c.q), &c.r).unwrap();
+        assert_eq!(crt.others[0].t, pq_inv);
+        assert_eq!(
+            crt.others[0].d,
+            c.d.reduce(&c.r.sub(&BoxedUint::from_u64(1)))
+        );
+
+        // Raw private op: blinded multi-prime CRT == direct c^d mod n.
+        for &v in &[2u64, 0x1234_5678_9abc_def0, u64::MAX] {
+            let x = BoxedUint::from_u64(v);
+            assert_eq!(
+                raw_private_blinded_boxed(&key, &x),
+                key.mont.pow(&x, &c.d),
+                "c = {v:#x}"
+            );
+        }
+        let big = c.n.sub(&BoxedUint::from_u64(12345));
+        assert_eq!(
+            raw_private_blinded_boxed(&key, &big),
+            key.mont.pow(&big, &c.d)
+        );
+
+        let plain = BoxedRsaPrivateKey::from_components(c.n.clone(), c.e.clone(), c.d.clone());
+        assert!(plain.crt.is_none());
+        for msg in [&b"three primes"[..], b"", b"garner"] {
+            assert_eq!(
+                key.sign_pkcs1v15::<Sha256>(msg).unwrap(),
+                plain.sign_pkcs1v15::<Sha256>(msg).unwrap(),
+                "multi-prime CRT and full-width paths diverged"
+            );
+        }
+
+        let pk = key.public_key();
+        let mut rng = HmacDrbg::<Sha256>::new(b"rsa-three-prime-ops", b"n", &[]);
+        let ct = pk
+            .encrypt_oaep::<Sha256, _>(b"oaep over three primes", b"label", &mut rng)
+            .unwrap();
+        assert_eq!(
+            key.decrypt_oaep::<Sha256>(&ct, b"label").unwrap(),
+            b"oaep over three primes"
+        );
+        let ct = pk.encrypt_pkcs1v15(b"v1.5", &mut rng).unwrap();
+        assert_eq!(key.decrypt_pkcs1v15(&ct).unwrap(), b"v1.5");
+        let sig = key.sign_pss::<Sha256, _>(b"pss", &mut rng).unwrap();
+        pk.verify_pss::<Sha256>(b"pss", &sig).unwrap();
+        let sig = key
+            .sign_pss_shake::<crate::hash::Shake128, _>(b"pss", &mut rng)
+            .unwrap();
+        pk.verify_pss_shake::<crate::hash::Shake128>(b"pss", &sig)
+            .unwrap();
+
+        // The blinded operation stays correct across repeated calls (fresh
+        // blinder each time) and a clone.
+        let sig = key.sign_pkcs1v15::<Sha256>(b"again").unwrap();
+        assert_eq!(key.sign_pkcs1v15::<Sha256>(b"again").unwrap(), sig);
+        assert_eq!(key.clone().sign_pkcs1v15::<Sha256>(b"again").unwrap(), sig);
+    }
+
+    /// A three-prime key serializes as `version = 1` with `otherPrimeInfos`
+    /// and parses back — through PKCS#1 and PKCS#8 — to a key that carries
+    /// the extra prime, re-encodes byte-identically and signs identically.
+    #[test]
+    fn three_prime_pkcs1_and_pkcs8_roundtrip() {
+        use crate::der::{Reader, tag};
+        let c = three_prime_components(b"rsa-three-prime-der");
+        let key = three_prime_key(&c);
+        let der = key.to_pkcs1_der();
+        let body = Reader::new(&der).read_tlv(tag::SEQUENCE).unwrap();
+        assert_eq!(&body[..3], &[0x02, 0x01, 0x01], "version = 1 leads");
+        // The emitted blob is the hand-built one with the RFC's `t₃`.
+        let one = BoxedUint::from_u64(1);
+        let d3 = c.d.reduce(&c.r.sub(&one));
+        let t3 = crate::bignum::inv_mod_boxed(&c.p.mul(&c.q), &c.r).unwrap();
+        assert_eq!(der, pkcs1_blob(1, &c, &c.d, &[(&c.r, &d3, &t3)], false));
+
+        let parsed = BoxedRsaPrivateKey::from_pkcs1_der(&der).unwrap();
+        assert_eq!(parsed.num_primes(), 3);
+        assert!(
+            parsed
+                .crt
+                .as_deref()
+                .is_some_and(|crt| crt.others.len() == 1)
+        );
+        assert_eq!(parsed.other_primes, vec![c.r.clone()]);
+        assert_eq!(parsed.to_pkcs1_der(), der);
+        assert_eq!(
+            parsed.sign_pkcs1v15::<Sha256>(b"via der").unwrap(),
+            key.sign_pkcs1v15::<Sha256>(b"via der").unwrap()
+        );
+
+        let pkcs8 = key.to_pkcs8_der();
+        let parsed = BoxedRsaPrivateKey::from_pkcs8_der(&pkcs8).unwrap();
+        assert_eq!(parsed.num_primes(), 3);
+        assert_eq!(parsed.to_pkcs8_der(), pkcs8);
+        let parsed = BoxedRsaPrivateKey::from_pkcs8_pem(&key.to_pkcs8_pem()).unwrap();
+        assert_eq!(parsed.to_pkcs1_der(), der);
+        let parsed = BoxedRsaPrivateKey::from_pkcs1_pem(&key.to_pkcs1_pem()).unwrap();
+        assert_eq!(parsed.to_pkcs1_der(), der);
+
+        // A two-prime key still serializes as version 0 without the field.
+        let two = gen_small_key(b"rsa-two-prime-still-v0");
+        let der = two.to_pkcs1_der();
+        let body = Reader::new(&der).read_tlv(tag::SEQUENCE).unwrap();
+        assert_eq!(&body[..3], &[0x02, 0x01, 0x00]);
+        assert_eq!(two.num_primes(), 2);
+    }
+
+    /// The multi-prime parser rejects: a version that disagrees with the
+    /// presence of `otherPrimeInfos`, an empty `otherPrimeInfos`, an extra
+    /// prime that does not divide `n`, a repeated prime, a `d` that does not
+    /// invert `e` mod `r − 1`, and more primes than the cap allows.
+    #[test]
+    fn three_prime_pkcs1_der_rejections() {
+        let c = three_prime_components(b"rsa-three-prime-bad");
+        let one = BoxedUint::from_u64(1);
+        let two = BoxedUint::from_u64(2);
+        let d3 = c.d.reduce(&c.r.sub(&one));
+        let t3 = crate::bignum::inv_mod_boxed(&c.p.mul(&c.q), &c.r).unwrap();
+        let good = pkcs1_blob(1, &c, &c.d, &[(&c.r, &d3, &t3)], false);
+        BoxedRsaPrivateKey::from_pkcs1_der(&good).expect("the honest blob parses");
+        // The blob's own d₃ / t₃ are recomputed, not trusted: garbage there
+        // still parses to a correct key.
+        let garbage = pkcs1_blob(1, &c, &c.d, &[(&c.r, &two, &two)], false);
+        let k = BoxedRsaPrivateKey::from_pkcs1_der(&garbage).unwrap();
+        assert_eq!(k.to_pkcs1_der(), good);
+
+        let cases: [(&str, Vec<u8>); 6] = [
+            (
+                "version 0 with otherPrimeInfos",
+                pkcs1_blob(0, &c, &c.d, &[(&c.r, &d3, &t3)], false),
+            ),
+            (
+                "version 1 without otherPrimeInfos",
+                pkcs1_blob(1, &c, &c.d, &[], false),
+            ),
+            (
+                "version 1 with empty otherPrimeInfos",
+                pkcs1_blob(1, &c, &c.d, &[], true),
+            ),
+            (
+                "r does not divide n",
+                pkcs1_blob(1, &c, &c.d, &[(&c.r.add(&two), &d3, &t3)], false),
+            ),
+            (
+                "d inconsistent mod r − 1",
+                pkcs1_blob(1, &c, &c.d.sub(&two), &[(&c.r, &d3, &t3)], false),
+            ),
+            (
+                "nine primes",
+                pkcs1_blob(1, &c, &c.d, &[(&c.r, &d3, &t3); 7], false),
+            ),
+        ];
+        for (why, blob) in &cases {
+            // The version / `otherPrimeInfos` disagreements surface as DER
+            // structure errors, the semantic checks as `Malformed`.
+            assert!(
+                BoxedRsaPrivateKey::from_pkcs1_der(blob).is_err(),
+                "{why} must be rejected"
+            );
+        }
+        // A repeated prime: n = p·q·p presented with primes (p, q, p). The
+        // product matches, so this is the pairwise-distinct check firing.
+        let dup = ThreePrime {
+            n: c.p.mul(&c.q).mul(&c.p),
+            e: c.e.clone(),
+            d: c.d.clone(),
+            p: c.p.clone(),
+            q: c.q.clone(),
+            r: c.p.clone(),
+        };
+        let blob = pkcs1_blob(1, &dup, &dup.d, &[(&dup.r, &d3, &t3)], false);
+        assert!(BoxedRsaPrivateKey::from_pkcs1_der(&blob).is_err());
+        // `d` out of range against the bogus modulus is not what fires: the
+        // component check runs on any blob whose `d < n`.
+        assert!(dup.d.lt(&dup.n));
+    }
+
+    /// Boneh–DeMillo–Lipton on the multi-prime path: corrupt the third
+    /// prime's CRT exponent and the `m^e ≡ c` fault check must reject the
+    /// Garner result and fall back to the full-width path — the emitted
+    /// signature is still correct, and the factorable faulty value never
+    /// escapes.
+    #[test]
+    fn corrupted_third_prime_exponent_falls_back_to_correct_signature() {
+        let c = three_prime_components(b"rsa-three-prime-fault");
+        let mut key = three_prime_key(&c);
+        let sig_good = key.sign_pkcs1v15::<Sha256>(b"fault me").unwrap();
+        let crt = key.crt.as_deref_mut().expect("CRT params present");
+        crt.others[0].d = BoxedUint::from_u64(0x1337);
+        let sig = key.sign_pkcs1v15::<Sha256>(b"fault me").unwrap();
+        assert_eq!(sig, sig_good);
+        key.public_key()
+            .verify_pkcs1v15::<Sha256>(b"fault me", &sig)
+            .unwrap();
+        // The raw faulty CRT output really is wrong (so the check did work).
+        let x = BoxedUint::from_u64(0xabcdef);
+        let salt = [0u8; 16];
+        let faulty = raw_private_crt_blinded(&key, key.crt.as_deref().unwrap(), 0, &salt, &x);
+        assert_ne!(faulty, key.mont.pow(&x, &c.d));
+        assert_eq!(raw_private_blinded_boxed(&key, &x), key.mont.pow(&x, &c.d));
     }
 }

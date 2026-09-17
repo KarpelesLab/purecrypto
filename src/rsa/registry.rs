@@ -2,10 +2,11 @@
 //!
 //! Zero-sized types — four PKCS#1 v1.5 (SHA-1 legacy + SHA-256/384/512),
 //! three RSA-PSS-RSAE (the TLS `rsa_pss_rsae_*` schemes, `rsaEncryption`
-//! SPKI only) and three RSA-PSS-PSS (X.509 `id-RSASSA-PSS` signatures,
+//! SPKI only), three RSA-PSS-PSS (X.509 `id-RSASSA-PSS` signatures,
 //! dispatched by their `RSASSA-PSS-params`, and the TLS `rsa_pss_pss_*`
-//! schemes) entries, one per SHA-2 digest — each implementing
-//! [`SignatureAlgorithm`].
+//! schemes) entries, one per SHA-2 digest, and two RSA-PSS-SHAKE (RFC 8702
+//! `id-RSASSA-PSS-SHAKE128` / `-SHAKE256`, X.509 only) entries — each
+//! implementing [`SignatureAlgorithm`].
 //! Each `verify` parses the SPKI to recover the RSA public key, then
 //! delegates to the existing `BoxedRsaPublicKey::verify_pkcs1v15` /
 //! `verify_pss*`. A PSS entry's digest is the *message* digest; under
@@ -13,8 +14,8 @@
 //! parameters name (RFC 8017 §8.1 lets it differ), via `verify_pss*_mgf`.
 
 use crate::der::{Reader, parse_oid};
-use crate::hash::{Digest, Sha1, Sha256, Sha384, Sha512};
-use crate::rsa::BoxedRsaPublicKey;
+use crate::hash::{Digest, Sha1, Sha256, Sha384, Sha512, Shake128, Shake256};
+use crate::rsa::{BoxedRsaPublicKey, PssShake};
 use crate::signature_registry::SignatureAlgorithm;
 use crate::x509::{Error, PssHash, PssParams, PssRestriction, SignatureParams, oid};
 
@@ -43,6 +44,12 @@ enum SpkiUse {
         salt_len: Option<u32>,
         rsa_encryption_only: bool,
     },
+    /// RSASSA-PSS with SHAKE (RFC 8702): an `rsaEncryption` SPKI, or an
+    /// `id-RSASSA-PSS` one with *absent* parameters. `RSASSA-PSS-params`
+    /// name a SHA-2 hash and MGF1, which a SHAKE signature can never
+    /// satisfy (RFC 4055 §3.3 requires equal hash and MGF), so a restricted
+    /// key is refused.
+    PssShake,
 }
 
 /// Parses the SPKI to extract an RSA public key, accepting the SPKI forms
@@ -65,17 +72,23 @@ fn parse_rsa_spki(spki: &[u8], use_: SpkiUse) -> Result<BoxedRsaPublicKey, Error
         algid.read_null()?;
         algid.finish()?;
     } else if alg.as_slice() == oid::ID_RSASSA_PSS {
-        let SpkiUse::Pss {
-            hash,
-            mgf1_hash,
-            salt_len,
-            rsa_encryption_only: false,
-        } = use_
-        else {
-            return Err(Error::UnsupportedAlgorithm);
-        };
         let restriction = PssRestriction::decode(&mut algid)?;
         algid.finish()?;
+        let (hash, mgf1_hash, salt_len) = match use_ {
+            SpkiUse::Pss {
+                hash,
+                mgf1_hash,
+                salt_len,
+                rsa_encryption_only: false,
+            } => (hash, mgf1_hash, salt_len),
+            SpkiUse::PssShake if restriction == PssRestriction::Unrestricted => {
+                let key_bits = outer.read_bit_string()?;
+                outer.finish()?;
+                reader.finish()?;
+                return Ok(BoxedRsaPublicKey::from_pkcs1_der(key_bits)?);
+            }
+            _ => return Err(Error::UnsupportedAlgorithm),
+        };
         // The key-size policy probe leaves the MGF1 digest and the salt
         // open: the key is usable by this entry iff its message digest
         // matches; the MGF1 digest and the salt bound are checked per
@@ -353,6 +366,55 @@ rsa_pss_entry!(
     false
 );
 
+/// The RFC 8702 entries: RSASSA-PSS with SHAKE `$xof` as hash and mask
+/// generation function and a salt of the hash length, identified in X.509
+/// by their own parameterless OID (`id-RSASSA-PSS-SHAKE128` / `-SHAKE256`,
+/// §3.1). The key may be certified as `rsaEncryption` or as an unrestricted
+/// `id-RSASSA-PSS` key (RFC 8702 §3.3). No TLS scheme exists for them.
+macro_rules! rsa_pss_shake_entry {
+    ($(#[$m:meta])* $name:ident, $id:expr, $oid:expr, $xof:ty) => {
+        $(#[$m])*
+        pub(crate) struct $name;
+
+        impl SignatureAlgorithm for $name {
+            fn id(&self) -> &'static str { $id }
+            fn x509_oids(&self) -> &'static [&'static [u64]] { &[$oid] }
+            fn tls_schemes(&self) -> &'static [u16] { &[] }
+            fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
+                let key = parse_rsa_spki(spki, SpkiUse::PssShake)?;
+                key.verify_pss_shake::<$xof>(message, signature).map_err(Error::Rsa)
+            }
+            fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> {
+                rsa_bits(spki, SpkiUse::PssShake)
+            }
+        }
+    };
+}
+
+rsa_pss_shake_entry!(
+    /// `id-RSASSA-PSS-SHAKE128` (`1.3.6.1.5.5.7.6.30`): RSASSA-PSS with
+    /// SHAKE128 as hash (32 octets) and MGF, salt 32 (RFC 8702 §3.1).
+    PssShake128,
+    "rsa-pss-shake128",
+    oid::ID_RSASSA_PSS_SHAKE128,
+    Shake128
+);
+rsa_pss_shake_entry!(
+    /// `id-RSASSA-PSS-SHAKE256` (`1.3.6.1.5.5.7.6.31`): RSASSA-PSS with
+    /// SHAKE256 as hash (64 octets) and MGF, salt 64 (RFC 8702 §3.1).
+    PssShake256,
+    "rsa-pss-shake256",
+    oid::ID_RSASSA_PSS_SHAKE256,
+    Shake256
+);
+
+/// Keeps the `PssShake` bound in use where the entries name a concrete
+/// SHAKE, so the trait is what ties the two OIDs to their `hLen`.
+const _: () = {
+    assert!(<Shake128 as PssShake>::OUTPUT_LEN == 32);
+    assert!(<Shake256 as PssShake>::OUTPUT_LEN == 64);
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +529,91 @@ mod tests {
             pss.verify(spki, b"hi", &sig).unwrap();
         }
         pss.verify(&rsae_spki, b"hi", &sig).unwrap();
+    }
+
+    /// The RFC 8702 entries resolve by id and by their own OID (no TLS
+    /// scheme), verify a SHAKE-PSS signature under an `rsaEncryption` SPKI
+    /// and under an unrestricted `id-RSASSA-PSS` SPKI, refuse a restricted
+    /// `id-RSASSA-PSS` key (whose params name SHA-2 / MGF1), reject the
+    /// other SHAKE's signature, and take only parameterless identifiers.
+    #[test]
+    fn pss_shake_entries_verify_via_registry() {
+        use crate::hash::{Shake128, Shake256};
+        let key = rsa_test_key_a();
+        let mut rng = crate::rng::HmacDrbg::<Sha256>::new(b"reg-pss-shake", b"n", &[]);
+        let sig128 = key.sign_pss_shake::<Shake128, _>(b"hi", &mut rng).unwrap();
+        let sig256 = key.sign_pss_shake::<Shake256, _>(b"hi", &mut rng).unwrap();
+        let rsae_spki = AnyPublicKey::Rsa(boxed_pk_from_rsa_test_key()).to_spki_der();
+        let unrestricted = pss_spki(None);
+        let restricted = pss_spki(Some(pss_params(oid::ID_SHA256, oid::ID_SHA256, 32)));
+
+        for (id, o, sig, other) in [
+            (
+                "rsa-pss-shake128",
+                oid::ID_RSASSA_PSS_SHAKE128,
+                &sig128,
+                &sig256,
+            ),
+            (
+                "rsa-pss-shake256",
+                oid::ID_RSASSA_PSS_SHAKE256,
+                &sig256,
+                &sig128,
+            ),
+        ] {
+            let algo = find_by_id(id).expect(id);
+            assert_eq!(find_by_oid(o).expect(id).id(), id);
+            assert!(algo.tls_schemes().is_empty());
+            for spki in [&rsae_spki, &unrestricted] {
+                algo.verify(spki, b"hi", sig).unwrap();
+                assert!(algo.verify(spki, b"other", sig).is_err());
+                assert!(algo.verify(spki, b"hi", other).is_err());
+                assert_eq!(algo.rsa_modulus_bits(spki), Some(2048));
+            }
+            assert_eq!(
+                algo.verify(&restricted, b"hi", sig).err(),
+                Some(Error::UnsupportedAlgorithm)
+            );
+            assert_eq!(algo.rsa_modulus_bits(&restricted), None);
+            // Parameters belonging to `id-RSASSA-PSS` are refused.
+            let params = PssParams::for_hash(PssHash::Sha256);
+            assert_eq!(
+                algo.verify_with_params(&rsae_spki, b"hi", sig, SignatureParams::RsaPss(params))
+                    .err(),
+                Some(Error::UnsupportedAlgorithm)
+            );
+            algo.verify_with_params(&rsae_spki, b"hi", sig, SignatureParams::None)
+                .unwrap();
+
+            // Through the X.509 dispatch: the identifier must be the bare
+            // OID (RFC 8702 §3.1), and an `AnyPublicKey` routes it to this
+            // entry — for an `rsaEncryption` key and an unrestricted PSS
+            // key, never for a restricted one.
+            use crate::der::{encode_null, encode_sequence, oid_tlv};
+            let algid =
+                SignatureAlgorithmIdentifier::from_der(&encode_sequence(&oid_tlv(o))).unwrap();
+            assert_eq!(algid.oid(), o);
+            assert!(algid.pss_params().is_none());
+            assert_eq!(
+                SignatureAlgorithmIdentifier::from_der(&encode_sequence(
+                    &[oid_tlv(o), encode_null()].concat()
+                ))
+                .err(),
+                Some(Error::Der(crate::der::Error::TrailingData))
+            );
+            for spki in [&rsae_spki, &unrestricted] {
+                let pk = AnyPublicKey::from_spki_der(spki).unwrap();
+                assert_eq!(pk.signature_algorithm(&algid).map(|a| a.id()), Some(id));
+                pk.verify(&algid, b"hi", sig).unwrap();
+                assert!(pk.verify(&algid, b"hi", other).is_err());
+            }
+            let pk = AnyPublicKey::from_spki_der(&restricted).unwrap();
+            assert!(pk.signature_algorithm(&algid).is_none());
+            assert_eq!(
+                pk.verify(&algid, b"hi", sig).err(),
+                Some(Error::UnsupportedAlgorithm)
+            );
+        }
     }
 
     #[test]

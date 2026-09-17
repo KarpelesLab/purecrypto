@@ -16,10 +16,11 @@
 //!
 //! As in the allocating API, every PSS and OAEP method has a `_mgf` twin
 //! taking a separate MGF1 digest `M` (RFC 8017 §8.1 / §7.1); the
-//! single-digest form is the twin with `M == D`.
+//! single-digest form is the twin with `M == D`. The `_shake` methods are
+//! RSASSA-PSS with SHAKE as hash and MGF (RFC 8702, [`PssShake`]).
 
 use super::keys::KeyScratch;
-use super::{Error, Pkcs1Digest, RsaPrivateKey, RsaPublicKey};
+use super::{Error, Pkcs1Digest, PssShake, RsaPrivateKey, RsaPublicKey};
 use crate::hash::Digest;
 use crate::rng::{CryptoRng, RngCore};
 
@@ -93,6 +94,30 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         out: &mut [u8],
     ) -> Result<(), Error> {
         super::emsa::sign_pss_with_salt_len::<D, M, _, R>(self, msg, salt_len, rng, out)
+    }
+
+    /// Signs `msg` with RSASSA-PSS-SHAKE (RFC 8702) into `out` (exactly
+    /// `LIMBS * 8` octets): `X` is the hash and the mask generation function,
+    /// the salt is `X::OUTPUT_LEN` octets.
+    pub fn sign_pss_shake_into<X: PssShake, R: RngCore>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        self.sign_pss_shake_with_salt_len_into::<X, R>(msg, X::OUTPUT_LEN, rng, out)
+    }
+
+    /// [`sign_pss_shake_into`](Self::sign_pss_shake_into) with an explicit
+    /// salt length.
+    pub fn sign_pss_shake_with_salt_len_into<X: PssShake, R: RngCore>(
+        &self,
+        msg: &[u8],
+        salt_len: usize,
+        rng: &mut R,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        super::emsa::sign_pss_shake::<X, _, R>(self, msg, salt_len, rng, out)
     }
 
     /// Decrypts a PKCS#1 v1.5 ciphertext into `out`, returning the plaintext
@@ -288,6 +313,54 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         )
     }
 
+    /// Verifies an RSASSA-PSS-SHAKE signature (RFC 8702; `X` is the hash
+    /// and the mask generation function) with a salt of `X::OUTPUT_LEN`
+    /// octets. Stack-allocated scratch, no allocator.
+    pub fn verify_pss_shake_noalloc<X: PssShake>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
+        self.verify_pss_shake_with_salt_len_noalloc::<X>(msg, sig, X::OUTPUT_LEN)
+    }
+
+    /// [`verify_pss_shake_noalloc`](Self::verify_pss_shake_noalloc)
+    /// requiring the salt to be exactly `salt_len` octets.
+    pub fn verify_pss_shake_with_salt_len_noalloc<X: PssShake>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+        salt_len: usize,
+    ) -> Result<(), Error> {
+        let (mut em, mut db) = (KeyScratch::<LIMBS>::ZEROED, KeyScratch::<LIMBS>::ZEROED);
+        super::emsa::verify_pss_shake::<X, _>(
+            self,
+            msg,
+            sig,
+            Some(salt_len),
+            em.as_flattened_mut(),
+            db.as_flattened_mut(),
+        )
+    }
+
+    /// [`verify_pss_shake_noalloc`](Self::verify_pss_shake_noalloc)
+    /// recovering the salt length from the encoded message.
+    pub fn verify_pss_shake_any_salt_noalloc<X: PssShake>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), Error> {
+        let (mut em, mut db) = (KeyScratch::<LIMBS>::ZEROED, KeyScratch::<LIMBS>::ZEROED);
+        super::emsa::verify_pss_shake::<X, _>(
+            self,
+            msg,
+            sig,
+            None,
+            em.as_flattened_mut(),
+            db.as_flattened_mut(),
+        )
+    }
+
     /// Encrypts `msg` with PKCS#1 v1.5 into `out` (exactly `LIMBS * 8` octets).
     ///
     /// `rng` must be a CSPRNG — the random padding is part of the security
@@ -435,6 +508,44 @@ mod tests {
             sk.decrypt_oaep_into_mgf::<Sha256, Sha1>(&ct, b"x", &mut pt)
                 .is_err()
         );
+    }
+
+    /// RFC 8702 SHAKE-PSS through the buffer-passing API, both SHAKEs.
+    #[test]
+    fn shake_pss_roundtrip_no_alloc() {
+        use crate::hash::{Shake128, Shake256};
+        let sk = key();
+        let pk = sk.public_key();
+        let mut rng = HmacDrbg::<Sha256>::new(b"nobuf-shake", b"nonce", &[]);
+        let mut sig = [0u8; 128];
+        sk.sign_pss_shake_into::<Shake128, _>(b"m", &mut rng, &mut sig)
+            .unwrap();
+        pk.verify_pss_shake_noalloc::<Shake128>(b"m", &sig).unwrap();
+        pk.verify_pss_shake_with_salt_len_noalloc::<Shake128>(b"m", &sig, 32)
+            .unwrap();
+        pk.verify_pss_shake_any_salt_noalloc::<Shake128>(b"m", &sig)
+            .unwrap();
+        assert!(
+            pk.verify_pss_shake_noalloc::<Shake128>(b"other", &sig)
+                .is_err()
+        );
+        assert!(pk.verify_pss_shake_noalloc::<Shake256>(b"m", &sig).is_err());
+        assert!(
+            pk.verify_pss_noalloc::<crate::hash::Sha3_256>(b"m", &sig)
+                .is_err()
+        );
+
+        // SHAKE256 (hLen = 64) still fits a 1024-bit modulus: 64 + 64 + 2 < 128.
+        sk.sign_pss_shake_with_salt_len_into::<Shake256, _>(b"m", 16, &mut rng, &mut sig)
+            .unwrap();
+        pk.verify_pss_shake_with_salt_len_noalloc::<Shake256>(b"m", &sig, 16)
+            .unwrap();
+        pk.verify_pss_shake_any_salt_noalloc::<Shake256>(b"m", &sig)
+            .unwrap();
+        assert!(pk.verify_pss_shake_noalloc::<Shake256>(b"m", &sig).is_err());
+        #[cfg(feature = "alloc")]
+        pk.verify_pss_shake_with_salt_len::<Shake256>(b"m", &sig, 16)
+            .unwrap();
     }
 
     #[test]
