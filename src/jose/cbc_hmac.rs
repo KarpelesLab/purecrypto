@@ -1,101 +1,22 @@
-//! `AES_CBC_HMAC_SHA2` authenticated encryption (RFC 7518 §5.2), the JWE
-//! `A128CBC-HS256` / `A192CBC-HS384` / `A256CBC-HS512` content encryption
-//! algorithms.
+//! `AES_CBC_HMAC_SHA2` content encryption (RFC 7518 §5.2) for JWE — the
+//! `A128CBC-HS256` / `A192CBC-HS384` / `A256CBC-HS512` algorithms.
 //!
-//! The composite key `K = MAC_KEY ‖ ENC_KEY` is split in halves; the
-//! plaintext is PKCS#7-padded and AES-CBC encrypted under `ENC_KEY`; the tag
-//! is the first half of `HMAC(MAC_KEY, A ‖ IV ‖ E ‖ AL)` where `AL` is the
-//! bit length of the AAD as a 64-bit big-endian integer. Decryption checks
-//! the tag in constant time *before* touching the ciphertext, so a padding
-//! error is never observable separately from a MAC error.
-//!
-//! This is a self-contained implementation local to the JOSE module. A
-//! reusable `AesCbcHmacSha2` type is being added to `crate::cipher`
-//! separately; once it lands, this file should be reduced to a thin adapter
-//! over it (the JWE-facing interface here is [`encrypt`] / [`decrypt`]).
+//! A thin adapter over [`crate::cipher::CbcHmacSha2`], which owns the
+//! construction (composite key split, PKCS#7, MAC-then-decrypt with a
+//! constant-time tag check and padding check). The JWE code works with an
+//! [`Enc`] value and a composite key slice, so this module just dispatches
+//! to the right alias.
 
 use super::Enc;
-use crate::cipher::{Aes128, Aes192, Aes256, BlockCipher, Cbc};
-use crate::ct::ConstantTimeEq;
-use crate::hash::{Digest, Hmac, Sha256, Sha384, Sha512};
-use crate::zeroize::Zeroize;
+use crate::cipher::{A128CbcHs256, A192CbcHs384, A256CbcHs512, AeadError};
 use alloc::vec::Vec;
-
-fn tag<D: Digest>(mac_key: &[u8], aad: &[u8], iv: &[u8], ct: &[u8], tag_len: usize) -> Vec<u8> {
-    let mut h = Hmac::<D>::new(mac_key);
-    h.update(aad);
-    h.update(iv);
-    h.update(ct);
-    let al = (aad.len() as u64).wrapping_mul(8).to_be_bytes();
-    h.update(&al);
-    let mut full = h.finalize();
-    let t = full.as_ref()[..tag_len].to_vec();
-    full.as_mut().zeroize();
-    t
-}
-
-fn encrypt_with<C: BlockCipher, D: Digest>(
-    key: &[u8],
-    iv: &[u8; 16],
-    aad: &[u8],
-    plaintext: &[u8],
-    cipher: C,
-) -> (Vec<u8>, Vec<u8>) {
-    let half = key.len() / 2;
-    let pad = 16 - plaintext.len() % 16;
-    let mut buf = Vec::with_capacity(plaintext.len() + pad);
-    buf.extend_from_slice(plaintext);
-    buf.extend(core::iter::repeat_n(pad as u8, pad));
-    let mut cbc = Cbc::new(cipher, iv);
-    cbc.encrypt(&mut buf)
-        .expect("padded buffer is a whole number of blocks");
-    let t = tag::<D>(&key[..half], aad, iv, &buf, half);
-    (buf, t)
-}
-
-fn decrypt_with<C: BlockCipher, D: Digest>(
-    key: &[u8],
-    iv: &[u8; 16],
-    aad: &[u8],
-    ciphertext: &[u8],
-    tag_in: &[u8],
-    cipher: C,
-) -> Result<Vec<u8>, ()> {
-    let half = key.len() / 2;
-    // Structural checks first: nothing here depends on the key.
-    if tag_in.len() != half || ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
-        return Err(());
-    }
-    let mut expected = tag::<D>(&key[..half], aad, iv, ciphertext, half);
-    let ok = bool::from(expected.ct_eq(tag_in));
-    expected.zeroize();
-    if !ok {
-        return Err(());
-    }
-    let mut buf = ciphertext.to_vec();
-    let mut cbc = Cbc::new(cipher, iv);
-    cbc.decrypt(&mut buf)
-        .expect("length checked to be whole blocks");
-    // PKCS#7 unpadding. The MAC already authenticated the ciphertext, so a
-    // padding failure here is not an oracle against an attacker-chosen
-    // message; it still runs without data-dependent early exits.
-    let last = *buf.last().expect("non-empty") as usize;
-    let mut bad = (last == 0) as u8 | (last > 16) as u8;
-    let pad = last.clamp(1, 16);
-    let start = buf.len() - pad;
-    for &b in &buf[start..] {
-        bad |= (b as usize != last) as u8;
-    }
-    if bad != 0 {
-        buf.zeroize();
-        return Err(());
-    }
-    buf.truncate(start);
-    Ok(buf)
-}
 
 /// Encrypts `plaintext` under composite key `key` (whose length must match
 /// `enc`), returning `(ciphertext, tag)`.
+///
+/// # Panics
+/// If `key.len() != enc.key_len()` (the caller derives `key` from `enc`), or
+/// on an associated-data length beyond `2^61` bytes.
 pub(crate) fn encrypt(
     enc: Enc,
     key: &[u8],
@@ -103,34 +24,17 @@ pub(crate) fn encrypt(
     aad: &[u8],
     plaintext: &[u8],
 ) -> (Vec<u8>, Vec<u8>) {
-    debug_assert_eq!(key.len(), enc.key_len());
-    match enc {
-        Enc::A128CbcHs256 => encrypt_with::<_, Sha256>(
-            key,
-            iv,
-            aad,
-            plaintext,
-            Aes128::new(key[16..].try_into().expect("16-byte half")),
-        ),
-        Enc::A192CbcHs384 => encrypt_with::<_, Sha384>(
-            key,
-            iv,
-            aad,
-            plaintext,
-            Aes192::new(key[24..].try_into().expect("24-byte half")),
-        ),
-        Enc::A256CbcHs512 => encrypt_with::<_, Sha512>(
-            key,
-            iv,
-            aad,
-            plaintext,
-            Aes256::new(key[32..].try_into().expect("32-byte half")),
-        ),
+    let r = match enc {
+        Enc::A128CbcHs256 => A128CbcHs256::try_new(key).and_then(|c| c.encrypt(iv, aad, plaintext)),
+        Enc::A192CbcHs384 => A192CbcHs384::try_new(key).and_then(|c| c.encrypt(iv, aad, plaintext)),
+        Enc::A256CbcHs512 => A256CbcHs512::try_new(key).and_then(|c| c.encrypt(iv, aad, plaintext)),
         _ => unreachable!("not a CBC-HMAC variant"),
-    }
+    };
+    r.expect("CEK length matches enc and AAD is below the AL bound")
 }
 
-/// Verifies `tag` and decrypts `ciphertext`; `Err(())` on any failure.
+/// Verifies `tag` and decrypts `ciphertext`; `Err(())` on any failure
+/// (wrong key length, tag mismatch, bad length or padding — all collapsed).
 pub(crate) fn decrypt(
     enc: Enc,
     key: &[u8],
@@ -139,34 +43,19 @@ pub(crate) fn decrypt(
     ciphertext: &[u8],
     tag: &[u8],
 ) -> Result<Vec<u8>, ()> {
-    debug_assert_eq!(key.len(), enc.key_len());
-    match enc {
-        Enc::A128CbcHs256 => decrypt_with::<_, Sha256>(
-            key,
-            iv,
-            aad,
-            ciphertext,
-            tag,
-            Aes128::new(key[16..].try_into().expect("16-byte half")),
-        ),
-        Enc::A192CbcHs384 => decrypt_with::<_, Sha384>(
-            key,
-            iv,
-            aad,
-            ciphertext,
-            tag,
-            Aes192::new(key[24..].try_into().expect("24-byte half")),
-        ),
-        Enc::A256CbcHs512 => decrypt_with::<_, Sha512>(
-            key,
-            iv,
-            aad,
-            ciphertext,
-            tag,
-            Aes256::new(key[32..].try_into().expect("32-byte half")),
-        ),
+    let r: Result<Vec<u8>, AeadError> = match enc {
+        Enc::A128CbcHs256 => {
+            A128CbcHs256::try_new(key).and_then(|c| c.decrypt(iv, aad, ciphertext, tag))
+        }
+        Enc::A192CbcHs384 => {
+            A192CbcHs384::try_new(key).and_then(|c| c.decrypt(iv, aad, ciphertext, tag))
+        }
+        Enc::A256CbcHs512 => {
+            A256CbcHs512::try_new(key).and_then(|c| c.decrypt(iv, aad, ciphertext, tag))
+        }
         _ => unreachable!("not a CBC-HMAC variant"),
-    }
+    };
+    r.map_err(|_| ())
 }
 
 #[cfg(test)]
