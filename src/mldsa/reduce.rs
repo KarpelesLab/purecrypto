@@ -63,7 +63,11 @@ pub(crate) fn decompose(r: u32, gamma2: u32) -> (u32, i32) {
 /// MakeHint (Algorithm 39): 1 iff adding `z` changes the high bits of `r`.
 pub(crate) fn make_hint(z: u32, r: u32, gamma2: u32) -> u32 {
     let r0 = add(r, z);
-    u32::from(high_bits(r0, gamma2) != high_bits(r, gamma2))
+    // Branch-free "not equal": `d | -d` has its top bit set iff `d != 0`.
+    // A source-level `!=` would be a bool the compiler is free to lower to a
+    // branch, and the hint bits of a rejected candidate are secret.
+    let d = high_bits(r0, gamma2) ^ high_bits(r, gamma2);
+    (d | d.wrapping_neg()) >> 31
 }
 
 /// UseHint (Algorithm 40): recovers the corrected high bits.

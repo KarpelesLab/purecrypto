@@ -141,7 +141,13 @@ fn ber_exp<R: SamplerRng>(x: Fpr, ccs: Fpr, rng: &mut R) -> bool {
     // shift against a negative `x` from a pathological out-of-range σ.
     let s_full = x.mul(ILN2).trunc();
     let r = x.sub(Fpr::of_i64(s_full).mul(LN2));
-    let s = s_full.clamp(0, 63) as u32;
+    // Mask-based clamp to `[0, 63]` (the reference's `sw ^= (sw ^ 63) &
+    // -((63 - sw) >> 31)`): `i64::clamp` is a pair of source-level branches
+    // on a value derived from the secret centre.
+    let s = {
+        let s = s_full & !(s_full >> 63); // max(s, 0)
+        s ^ ((s ^ 63) & ((63 - s) >> 63)) // min(s, 63)
+    } as u32;
     // z ≈ 2⁶³ · ccs · exp(−x), scaled down to a 64-bit acceptance threshold.
     let z = approx_exp(r, ccs).wrapping_sub(1) >> s;
     let mut i: i32 = 56;

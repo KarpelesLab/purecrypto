@@ -396,10 +396,8 @@ pub fn pack_hint(hints: &[Poly], omega: usize) -> Option<Vec<u8>> {
     if omega > 255 {
         return None;
     }
-    let total: usize = hints
-        .iter()
-        .map(|h| h.c.iter().filter(|&&c| c != 0).count())
-        .sum();
+    // Same unconditional count the signer uses: no per-coefficient branch.
+    let total = super::count_ones(hints);
     if total > omega {
         return None;
     }

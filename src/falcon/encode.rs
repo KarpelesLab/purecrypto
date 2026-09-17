@@ -17,12 +17,18 @@ use alloc::vec::Vec;
 /// also let one wild coefficient balloon the bit buffer. Returning `None` makes
 /// the signer resample, which is exactly what the reference does.
 pub(crate) fn compress(s: &[i16], slen: usize) -> Option<Vec<u8>> {
+    // Range check over every coefficient before any early exit, so the
+    // position of an oversized coefficient (of a candidate the signer then
+    // discards) is not exposed through the loop count.
+    let overflow = s
+        .iter()
+        .fold(0u32, |acc, &c| acc | (c as i32).unsigned_abs());
+    if overflow >= 2048 {
+        return None;
+    }
     let mut bits: Vec<u8> = Vec::with_capacity(s.len() * 9);
     for &coef in s {
         let c = coef as i32;
-        if c.unsigned_abs() >= 2048 {
-            return None;
-        }
         bits.push((c < 0) as u8);
         let a = c.unsigned_abs();
         // 7 low bits, most-significant first.
@@ -53,7 +59,17 @@ pub(crate) fn compress(s: &[i16], slen: usize) -> Option<Vec<u8>> {
 pub(crate) fn fits_signed(coeffs: &[i64], w: u32) -> bool {
     let hi = (1i64 << (w - 1)) - 1;
     let lo = -(1i64 << (w - 1));
-    coeffs.iter().all(|&c| c >= lo && c <= hi)
+    in_range_all(coeffs, lo, hi)
+}
+
+/// Branch-free "every coefficient in `[lo, hi]`": ORs the sign bits of
+/// `c - lo` and `hi - c` over the whole slice instead of `all()`, which would
+/// stop at the first out-of-range secret coefficient.
+fn in_range_all(coeffs: &[i64], lo: i64, hi: i64) -> bool {
+    let bad = coeffs
+        .iter()
+        .fold(0i64, |acc, &c| acc | (c - lo) | (hi - c));
+    bad >= 0
 }
 
 /// The stricter *symmetric* range the Falcon reference implementation demands
@@ -63,7 +79,7 @@ pub(crate) fn fits_signed(coeffs: &[i64], w: u32) -> bool {
 /// compatible with the reference encoder.
 pub(crate) fn fits_reference_signed(coeffs: &[i64], w: u32) -> bool {
     let hi = (1i64 << (w - 1)) - 1;
-    coeffs.iter().all(|&c| c >= -hi && c <= hi)
+    in_range_all(coeffs, -hi, hi)
 }
 
 /// Pack `n` signed coefficients at `w` bits each (two's complement, MSB first).
@@ -113,10 +129,9 @@ fn unpack_signed(bytes: &[u8], n: usize, w: u32) -> Option<Vec<i64>> {
             v = (v << 1) | bit as i64;
             pos += 1;
         }
-        // Sign-extend from w bits.
-        if v & (1 << (w - 1)) != 0 {
-            v -= 1 << w;
-        }
+        // Sign-extend from w bits without branching on the (secret) sign bit.
+        let sign = 1i64 << (w - 1);
+        v = (v ^ sign) - sign;
         out.push(v);
     }
     Some(out)
