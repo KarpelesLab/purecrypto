@@ -1,5 +1,5 @@
-//! MACs and KDFs: HMAC (12 hash functions), KMAC128/256, HKDF, PBKDF2 and
-//! PBES2 (PBKDF2 + AES-CBC-PKCS#7).
+//! MACs and KDFs: HMAC (12 hash functions), KMAC128/256, SipHash / SipHashX,
+//! VMAC-64/128, HKDF, PBKDF2 and PBES2 (PBKDF2 + AES-CBC-PKCS#7).
 
 use crate::common::{Fields, Outcome, check, check_eq};
 use purecrypto::cipher::{Aes128, Aes192, Aes256, BlockCipher, Cbc};
@@ -8,6 +8,8 @@ use purecrypto::hash::{
     Sha256, Sha384, Sha512, Sha512_224, Sha512_256, Sm3,
 };
 use purecrypto::kdf::{try_hkdf, try_pbkdf2};
+#[cfg(feature = "mac")]
+use purecrypto::mac::{SipHash13, SipHash24, SipHash48, SipHashX24, SipHashX48, Vmac64, Vmac128};
 
 // ---- HMAC --------------------------------------------------------------
 
@@ -115,6 +117,171 @@ fn kmac128_no_customization() {
 fn kmac256_no_customization() {
     check("kmac256_no_customization", |g, c| {
         kmac_case(Kmac256::new, g, c)
+    });
+}
+
+// ---- SipHash -----------------------------------------------------------
+
+/// One `MacTest` case for a fixed-output SipHash variant. `compute` and
+/// `verify` are the crate's one-shot and streaming-verify entry points; the
+/// tag length is fixed by the variant (`N` bytes) and must match the group's
+/// `tagSize`. Every case is also fed through `verify`, which is
+/// length-strict, so it must agree with the byte compare.
+#[cfg(feature = "mac")]
+fn siphash_case<const N: usize>(
+    compute: fn(&[u8; 16], &[u8]) -> [u8; N],
+    verify: fn(&[u8; 16], &[u8], &[u8]) -> bool,
+    group: &Fields,
+    case: &Fields,
+) -> Outcome {
+    let tag_len = group.int("tagSize") as usize / 8;
+    assert_eq!(tag_len, N, "tcId {}: unexpected tagSize", case.tc_id());
+    let Some(key) = case.hex_array::<16>("key") else {
+        return Outcome::Rejected;
+    };
+    let msg = case.hex("msg");
+    let tag = case.hex("tag");
+    let computed = compute(&key, &msg);
+    let verified = verify(&key, &msg, &tag);
+    let matches = computed[..] == tag[..];
+    assert_eq!(
+        verified,
+        matches,
+        "tcId {}: verify disagrees with the recomputed tag",
+        case.tc_id()
+    );
+    if matches {
+        Outcome::Accepted
+    } else {
+        Outcome::Rejected
+    }
+}
+
+#[cfg(feature = "mac")]
+macro_rules! siphash_tests {
+    ($($test:ident => $ty:ty, $n:literal),* $(,)?) => {$(
+        #[test]
+        fn $test() {
+            check(stringify!($test), |group, case| {
+                siphash_case::<$n>(
+                    <$ty>::compute,
+                    |key, msg, tag| <$ty>::new(key).chain(msg).verify(tag),
+                    group,
+                    case,
+                )
+            });
+        }
+    )*};
+}
+
+#[cfg(feature = "mac")]
+siphash_tests! {
+    siphash_1_3 => SipHash13, 8,
+    siphash_2_4 => SipHash24, 8,
+    siphash_4_8 => SipHash48, 8,
+    siphashx_2_4 => SipHashX24, 16,
+    siphashx_4_8 => SipHashX48, 16,
+}
+
+// ---- VMAC --------------------------------------------------------------
+//
+// `MacWithIvTest` vectors for VMAC-AES. Groups cover AES-128/192/256 keys
+// with 64- and 96-bit nonces (`Ktv` cases from the draft's appendix,
+// `Pseudorandom` and `EdgeCase` "special case for l1_hash" inputs, and
+// `TagCollision` chosen messages for VMAC-64, all `valid`), `invalid key
+// size` groups (0/8/64/160/320-bit keys, which no AES accepts), `ModifiedTag`
+// cases, and `InvalidNonce` cases (128-bit nonces with the top bit set,
+// which the crate refuses since the pad block would collide with the KDF's
+// `index >= 128` blocks). `EdgeCase` and `TagCollision` are ordinary
+// `valid` cases: the tag must be reproduced exactly.
+
+/// Runs one `MacWithIvTest` case on a freshly keyed VMAC `state` (either
+/// width): recompute the tag under `iv` (which `finalize` refuses when it is
+/// longer than 127 bits) and cross-check the length-strict `verify`.
+#[cfg(feature = "mac")]
+macro_rules! vmac_run {
+    ($state:expr, $case:expr) => {{
+        let case: &Fields = $case;
+        let iv = case.hex("iv");
+        let tag = case.hex("tag");
+        let state = $state.chain(&case.hex("msg"));
+        let verified = state.clone().verify(&iv, &tag);
+        match state.finalize(&iv) {
+            Err(_) => {
+                assert!(
+                    case.has_flag("InvalidNonce"),
+                    "tcId {}: nonce rejected without the InvalidNonce flag",
+                    case.tc_id()
+                );
+                assert!(
+                    !verified,
+                    "tcId {}: verify accepted a bad nonce",
+                    case.tc_id()
+                );
+                Outcome::Rejected
+            }
+            Ok(computed) => {
+                let matches = computed[..] == tag[..];
+                assert_eq!(
+                    verified,
+                    matches,
+                    "tcId {}: verify disagrees with the recomputed tag",
+                    case.tc_id()
+                );
+                if matches {
+                    Outcome::Accepted
+                } else {
+                    Outcome::Rejected
+                }
+            }
+        }
+    }};
+}
+
+/// One `MacWithIvTest` case for `$ty` (`Vmac64` / `Vmac128`, `$n`-byte
+/// tags): keys the state for the case's AES key size, or rejects the
+/// `invalid key size` groups whose length no AES accepts.
+#[cfg(feature = "mac")]
+macro_rules! vmac_case {
+    ($ty:ident, $n:literal, $group:expr, $case:expr) => {{
+        let group: &Fields = $group;
+        let case: &Fields = $case;
+        assert_eq!(
+            group.int("tagSize") as usize / 8,
+            $n,
+            "tcId {}",
+            case.tc_id()
+        );
+        let key = case.hex("key");
+        match key.len() {
+            16 => vmac_run!(
+                $ty::with_cipher(Aes128::new(&key.try_into().unwrap())),
+                case
+            ),
+            24 => vmac_run!(
+                $ty::with_cipher(Aes192::new(&key.try_into().unwrap())),
+                case
+            ),
+            32 => vmac_run!(
+                $ty::with_cipher(Aes256::new(&key.try_into().unwrap())),
+                case
+            ),
+            _ => Outcome::Rejected,
+        }
+    }};
+}
+
+#[cfg(feature = "mac")]
+#[test]
+fn vmac_64() {
+    check("vmac_64", |group, case| vmac_case!(Vmac64, 8, group, case));
+}
+
+#[cfg(feature = "mac")]
+#[test]
+fn vmac_128() {
+    check("vmac_128", |group, case| {
+        vmac_case!(Vmac128, 16, group, case)
     });
 }
 
