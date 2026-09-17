@@ -205,7 +205,7 @@ dsa = ["bignum", "rng", "hash", "alloc", "der"]
 # secp160k1/r1/r2, secp192k1, P-192, secp224k1, and the binary-field curves
 # sect283/409/571 k1/r1 (`ec::binary`, ECDH only). Interop with old
 # certificates and test corpora; never pick these for new designs.
-legacy-ec = ["ec", "alloc"]
+legacy-ec = ["ec", "alloc", "der"]
 # Ciphers kept for interop and test-vector coverage rather than recommended
 # use: SEED (RFC 4269), MORUS-640/1280, AEGIS-128 (superseded by AEGIS-128L)
 # and the Ascon v1.2 AEADs (superseded by SP 800-232's Ascon-AEAD128, which

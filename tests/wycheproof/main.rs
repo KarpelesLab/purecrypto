@@ -23,13 +23,13 @@ mod chunked;
 mod cipher_modes;
 #[cfg(feature = "dsa")]
 mod dsa;
-#[cfg(feature = "ec")]
+#[cfg(all(feature = "ec", feature = "alloc", feature = "der"))]
 mod ec_agree;
 #[cfg(feature = "legacy-ec")]
 mod ec_binary;
-#[cfg(feature = "ec")]
+#[cfg(feature = "x509")]
 mod ec_formats;
-#[cfg(feature = "ec")]
+#[cfg(all(feature = "ec", feature = "alloc", feature = "der"))]
 mod ecdsa;
 #[cfg(feature = "fpe")]
 mod fpe;
@@ -39,5 +39,5 @@ mod jose;
 mod mac_kdf;
 #[cfg(any(feature = "mlkem", feature = "mldsa"))]
 mod pq;
-#[cfg(feature = "rsa")]
+#[cfg(all(feature = "rsa", feature = "alloc", feature = "der"))]
 mod rsa;

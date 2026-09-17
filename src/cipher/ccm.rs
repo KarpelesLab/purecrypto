@@ -526,6 +526,7 @@ mod tests {
     /// past the per-nonce cap without touching the buffer, map a bad tag to
     /// `AeadError::TagMismatch` (wiping the buffer, as `decrypt` does), and
     /// otherwise agree byte for byte with the panicking forms.
+    #[cfg(feature = "alloc")]
     #[test]
     fn try_forms_reject_bad_nonce_lengths_and_match_infallible() {
         let ccm = Aes128Ccm::new(Aes128::new(&[0x42u8; 16]));

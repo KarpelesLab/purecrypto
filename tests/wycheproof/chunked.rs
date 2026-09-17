@@ -23,8 +23,9 @@ use purecrypto::chunked::{
     Cobblestone128, Cobblestone256, Decryptor, Encryptor, Error, HEADER_LEN, Instantiation,
     RawCipher, SALT_LEN, decrypt, encrypt,
 };
+use purecrypto::hash::Sha256;
 use purecrypto::hash::sha512;
-use purecrypto::rng::OsRng;
+use purecrypto::rng::HmacDrbg;
 
 fn inflate(zlib: &[u8]) -> Vec<u8> {
     compcol::vec::decompress_to_vec::<compcol::zlib::Zlib>(zlib).expect("ct is a zlib stream")
@@ -203,7 +204,8 @@ fn case<I: Instantiation>(case: &Fields) -> Outcome {
             if resealed != ct {
                 return Outcome::Wrong("salt-injected streaming re-encryption");
             }
-            let fresh = encrypt::<I>(&key, &ctx, msg, &mut OsRng).unwrap();
+            let mut rng = HmacDrbg::<Sha256>::new(b"chunked-fresh-salt", &key, &ctx);
+            let fresh = encrypt::<I>(&key, &ctx, msg, &mut rng).unwrap();
             if fresh.len() != ct.len() || fresh[..SALT_LEN] == ct[..SALT_LEN] {
                 return Outcome::Wrong("random-salt encryption shape");
             }

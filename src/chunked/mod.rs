@@ -48,7 +48,7 @@
 //! use purecrypto::rng::OsRng;
 //!
 //! let key = [0x42u8; 16];
-//! let ct = encrypt::<Cobblestone128>(&key, b"app context", b"hello", &mut OsRng).unwrap();
+//! let ct = encrypt::<Cobblestone128>(&key, b"app context", b"hello", &mut rng()).unwrap();
 //! assert_eq!(ct.len(), 56 + 5 + 16);
 //! assert_eq!(decrypt::<Cobblestone128>(&key, b"app context", &ct).unwrap(), b"hello");
 //! assert!(decrypt::<Cobblestone128>(&key, b"other context", &ct).is_err());
@@ -665,9 +665,15 @@ impl<I: Instantiation> Decryptor<I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::Sha256;
     use crate::hash::sha512;
-    use crate::rng::OsRng;
+    use crate::rng::HmacDrbg;
     use alloc::vec;
+
+    /// A deterministic CSPRNG stand-in for the tests (`OsRng` needs `std`).
+    fn rng() -> HmacDrbg<Sha256> {
+        HmacDrbg::new(b"chunked-tests", b"nonce", &[])
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -795,7 +801,7 @@ mod tests {
             2 * CHUNK_SIZE + 5,
         ] {
             let msg: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
-            let ct = encrypt::<Cobblestone256>(&key, b"ctx", &msg, &mut OsRng).unwrap();
+            let ct = encrypt::<Cobblestone256>(&key, b"ctx", &msg, &mut rng()).unwrap();
             let chunks = len / CHUNK_SIZE + 1;
             assert_eq!(ct.len(), HEADER_LEN + len + chunks * TAG_LEN, "{len}");
             assert_eq!(
@@ -871,7 +877,7 @@ mod tests {
     fn streaming_errors_are_sticky_and_release_nothing_bad() {
         let key = [3u8; 16];
         let msg = vec![0xAB; 2 * CHUNK_SIZE + 10];
-        let mut ct = encrypt::<Cobblestone128>(&key, b"", &msg, &mut OsRng).unwrap();
+        let mut ct = encrypt::<Cobblestone128>(&key, b"", &msg, &mut rng()).unwrap();
         // Corrupt the second chunk: the first still comes out, the rest never.
         ct[HEADER_LEN + ENCRYPTED_CHUNK_LEN + 5] ^= 1;
         let mut dec =
@@ -889,7 +895,7 @@ mod tests {
         assert_eq!(out.len(), CHUNK_SIZE);
 
         // Reordering chunks 0 and 1 fails at chunk 0.
-        let good = encrypt::<Cobblestone128>(&key, b"", &msg, &mut OsRng).unwrap();
+        let good = encrypt::<Cobblestone128>(&key, b"", &msg, &mut rng()).unwrap();
         let mut swapped = good.clone();
         let (a, b) = (HEADER_LEN, HEADER_LEN + ENCRYPTED_CHUNK_LEN);
         swapped[a..a + ENCRYPTED_CHUNK_LEN].copy_from_slice(&good[b..b + ENCRYPTED_CHUNK_LEN]);
@@ -963,7 +969,7 @@ mod tests {
     fn random_access_by_chunk() {
         let key = [5u8; 16];
         let msg: Vec<u8> = (0..2 * CHUNK_SIZE + 77).map(|i| (i % 199) as u8).collect();
-        let ct = encrypt::<Cobblestone128>(&key, b"ra", &msg, &mut OsRng).unwrap();
+        let ct = encrypt::<Cobblestone128>(&key, b"ra", &msg, &mut rng()).unwrap();
         let cipher =
             open_header::<Cobblestone128>(&key, b"ra", ct[..HEADER_LEN].try_into().unwrap())
                 .unwrap();

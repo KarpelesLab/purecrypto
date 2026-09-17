@@ -6,7 +6,7 @@
 use crate::common::{Fields, Outcome, check, check_eq};
 #[cfg(feature = "hash")]
 use purecrypto::cipher::{A128CbcHs256, A192CbcHs384, A256CbcHs512};
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 use purecrypto::cipher::{Aegis128, Morus640, Morus1280, Seed};
 use purecrypto::cipher::{
     Aegis128L, Aegis256, Aes128, Aes192, Aes256, AesGcmSiv, Aria128, Aria192, Aria256, BlockCipher,
@@ -294,6 +294,7 @@ fn aegis256() {
     });
 }
 
+#[cfg(feature = "ascon")]
 #[test]
 fn ascon_aead128() {
     check("ascon_sp800_232_aead128", |_, case| {
@@ -375,7 +376,7 @@ fn aes_eax() {
 
 // ---- SEED ------------------------------------------------------------------
 
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 #[test]
 fn seed_gcm() {
     check("seed_gcm", |group, case| {
@@ -386,7 +387,7 @@ fn seed_gcm() {
     });
 }
 
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 #[test]
 fn seed_ccm() {
     check(
@@ -397,7 +398,7 @@ fn seed_ccm() {
 
 // ---- MORUS -----------------------------------------------------------------
 
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 #[test]
 fn morus640() {
     check("morus640", |_, case| {
@@ -413,7 +414,7 @@ fn morus640() {
     });
 }
 
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 #[test]
 fn morus1280() {
     check("morus1280", |_, case| {
@@ -431,7 +432,7 @@ fn morus1280() {
 
 // ---- AEGIS-128 (the original CAESAR variant) -------------------------------
 
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 #[test]
 fn aegis128() {
     check("aegis128", |group, case| {
@@ -456,7 +457,7 @@ fn aegis128() {
 /// The three v1.2 variants share the 128-bit nonce / tag shape and differ
 /// only in key length (`K` bytes) and type. They live behind the opt-in
 /// `legacy-ciphers` feature.
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 macro_rules! ascon_v12_test {
     ($name:ident, $file:literal, $ty:ident, $klen:literal) => {
         #[test]
@@ -476,11 +477,11 @@ macro_rules! ascon_v12_test {
     };
 }
 
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 ascon_v12_test!(ascon128, "ascon128", Ascon128, 16);
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 ascon_v12_test!(ascon128a, "ascon128a", Ascon128a, 16);
-#[cfg(feature = "legacy-ciphers")]
+#[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 ascon_v12_test!(ascon80pq, "ascon80pq", Ascon80pq, 20);
 
 // ---- AES-CBC-HMAC-SHA2 (RFC 7518 §5.2) -------------------------------------

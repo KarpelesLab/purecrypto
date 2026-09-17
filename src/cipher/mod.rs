@@ -273,7 +273,7 @@ pub enum AeadError {
     /// `2^39 − 256` bits).
     InputTooLong,
     /// More associated-data components than the mode can bind (AES-SIV:
-    /// [`AesSiv::MAX_ASSOCIATED_DATA`]).
+    /// `AesSiv::MAX_ASSOCIATED_DATA`).
     TooManyAssociatedData,
     /// The authentication tag did not verify; the ciphertext is inauthentic.
     TagMismatch,

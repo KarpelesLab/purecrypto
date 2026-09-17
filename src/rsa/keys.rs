@@ -548,7 +548,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
 
     /// Converts this fixed-size key into a runtime-sized
     /// [`BoxedRsaPrivateKey`](super::BoxedRsaPrivateKey) — e.g. to wrap in an
-    /// [`AnyPrivateKey`](crate::x509::AnyPrivateKey) for certificate issuance —
+    /// `x509::AnyPrivateKey` for certificate issuance —
     /// directly, without a PKCS#1 DER round-trip. The prime factors are carried
     /// over, so base-blinding stays enabled (a naive `n,e,d`-only copy would
     /// silently disable it). The component limbs are copied via their

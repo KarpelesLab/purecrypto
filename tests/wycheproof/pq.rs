@@ -10,6 +10,7 @@ use crate::common::from_hex;
 use crate::common::{Fields, Outcome, check, check_eq};
 
 /// Optional hex field, empty when absent (the `ctx` string).
+#[cfg(feature = "mldsa")]
 fn opt_hex(f: &Fields, key: &str) -> Vec<u8> {
     f.get(key).map(crate::common::from_hex).unwrap_or_default()
 }

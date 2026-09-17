@@ -161,31 +161,41 @@ mod tests {
         },
     ];
 
+    /// Hex into a fixed scratch buffer (the paper's messages are at most 21
+    /// bytes), so the KAT runs without an allocator.
+    fn hex_into<'a>(buf: &'a mut [u8; 32], s: &str) -> &'a [u8] {
+        let n = s.len() / 2;
+        for (i, slot) in buf[..n].iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        &buf[..n]
+    }
+
     #[test]
     fn eax_paper_vectors() {
         for kat in &KATS {
             let eax = Aes128Eax::new(Aes128::new(&from_hex::<16>(kat.key)));
             let nonce = from_hex::<16>(kat.nonce);
             let header = from_hex::<8>(kat.header);
-            let msg = crate::test_util::from_hex_vec(kat.msg);
-            let ct = crate::test_util::from_hex_vec(kat.ct);
+            let (mut msg_buf, mut ct_buf) = ([0u8; 32], [0u8; 32]);
+            let msg = hex_into(&mut msg_buf, kat.msg);
+            let ct = hex_into(&mut ct_buf, kat.ct);
             let tag = from_hex::<16>(kat.tag);
 
-            let mut buf = msg.clone();
-            let t = eax.encrypt(&nonce, &header, &mut buf);
+            let mut buf = [0u8; 32];
+            let buf = &mut buf[..msg.len()];
+            buf.copy_from_slice(msg);
+            let t = eax.encrypt(&nonce, &header, buf);
             assert_eq!(buf, ct, "ciphertext for {}", kat.key);
             assert_eq!(t, tag, "tag for {}", kat.key);
 
-            eax.decrypt(&nonce, &header, &mut buf, &tag).unwrap();
+            eax.decrypt(&nonce, &header, buf, &tag).unwrap();
             assert_eq!(buf, msg);
 
             let mut bad = tag;
             bad[3] ^= 0x80;
-            let mut buf = ct.clone();
-            assert_eq!(
-                eax.decrypt(&nonce, &header, &mut buf, &bad),
-                Err(TagMismatch)
-            );
+            buf.copy_from_slice(ct);
+            assert_eq!(eax.decrypt(&nonce, &header, buf, &bad), Err(TagMismatch));
             assert_eq!(buf, ct, "buffer must be untouched on failure");
         }
     }

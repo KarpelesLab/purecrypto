@@ -48,6 +48,7 @@ pub fn curve_id(name: &str) -> Option<CurveId> {
 }
 
 /// Every curve with an `ecdh_<curve>.txt` file; all are implemented.
+#[cfg(feature = "x509")]
 const ECDH_CURVES: [&str; 10] = [
     "secp224r1",
     "secp256r1",
