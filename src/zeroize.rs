@@ -268,6 +268,34 @@ impl Zeroize for Box<str> {
     }
 }
 
+/// Wipes a large, plain-byte buffer with ordinary (vectorizable) stores
+/// instead of the volatile ones behind [`Zeroize`].
+///
+/// [`Zeroize`] issues one volatile store per machine word, which is right for
+/// keys and hasher states but not for the working memory of a memory-hard KDF
+/// (scrypt's `V` array, Argon2's block matrix): those run to gigabytes, and
+/// volatile stores can neither be merged into wider ones nor vectorized, so
+/// the wipe would cost a noticeable fraction of the derivation itself.
+///
+/// This helper zeroes with a plain loop (which the compiler lowers to a
+/// `memset` / vector stores) and then makes that loop observable so it cannot
+/// be dropped as a dead store when the buffer is freed straight afterwards: a
+/// [`compiler_fence`](core::sync::atomic::compiler_fence) pins the stores in
+/// place, a single volatile read of the first byte forces the wiped contents
+/// to be materialized in memory, and a [`black_box`](core::hint::black_box)
+/// on the slice reference marks the whole buffer as escaped. None of this is
+/// a stronger guarantee than [`Zeroize`] gives — the same caveats about
+/// copies the compiler or OS made elsewhere apply — it is the same
+/// best-effort wipe at `memset` speed.
+///
+/// Empty buffers are a no-op.
+pub fn zero_bulk(buf: &mut [u8]) {
+    buf.iter_mut().for_each(|b| *b = 0);
+    let _ = core::hint::black_box(&*buf);
+    volatile::fence();
+    volatile::read_first(buf);
+}
+
 /// A guard that wipes the wrapped value when dropped.
 ///
 /// `Zeroizing<Z>` dereferences to `Z`, so it can be used wherever the plain
@@ -372,7 +400,8 @@ impl<Z: Zeroize> core::fmt::Debug for Zeroizing<Z> {
 /// The volatile stores behind every [`Zeroize`] impl.
 ///
 /// This is the module's only `unsafe`; it is kept to the bare minimum needed to
-/// issue [`core::ptr::write_volatile`] through references that safe Rust has
+/// issue [`core::ptr::write_volatile`] (and, for [`zero_bulk`], one
+/// [`core::ptr::read_volatile`]) through references that safe Rust has
 /// already proven valid. The `#![allow(unsafe_code)]` scope is local, matching
 /// the crate's `unsafe_code = "deny"` policy of scoped opt-ins.
 mod volatile {
@@ -397,6 +426,21 @@ mod volatile {
         // destructor is skipped by not dropping the old value.
         unsafe { core::ptr::write_volatile(dst, value) };
         fence();
+    }
+
+    /// Volatile-reads the first byte of `buf` (if any) and discards it.
+    ///
+    /// For [`zero_bulk`](super::zero_bulk): a volatile load the compiler must
+    /// perform, of memory it just zeroed with plain stores, forces those
+    /// stores to have actually happened before the buffer is released.
+    #[inline]
+    pub(super) fn read_first(buf: &[u8]) {
+        if let Some(first) = buf.first() {
+            // SAFETY: `first` is a live `&u8`, hence non-null, aligned and
+            // pointing at an initialised byte; a volatile read through it has
+            // no side effect beyond the load itself.
+            let _ = unsafe { core::ptr::read_volatile(first) };
+        }
     }
 
     /// Volatile-stores `value` into `dst` **without** a trailing fence.
@@ -608,6 +652,20 @@ mod tests {
             assert!(buf[1..1 + len].iter().all(|&w| w == 0));
             assert!(buf[1 + len..].iter().all(|&w| w == 0xDEAD_BEEF));
         }
+    }
+
+    #[test]
+    fn bulk_wipe() {
+        let mut buf = [0xA5u8; 1000];
+        zero_bulk(&mut buf);
+        assert!(buf.iter().all(|&b| b == 0));
+
+        let mut part = [0x5Au8; 8];
+        zero_bulk(&mut part[2..5]);
+        assert_eq!(part, [0x5A, 0x5A, 0, 0, 0, 0x5A, 0x5A, 0x5A]);
+
+        let mut empty: [u8; 0] = [];
+        zero_bulk(&mut empty);
     }
 
     #[test]

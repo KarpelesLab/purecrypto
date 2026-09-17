@@ -38,6 +38,7 @@
 //! ```
 
 use crate::cipher::{Aes128, BlockCipher};
+use crate::ct::ConstantTimeEq;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 // ---------------------------------------------------------------------------
@@ -149,15 +150,17 @@ fn l1_chunk(key: &[u8; L1_KEY_LEN], data: &[u8], bit_length: u64) -> u64 {
 
 /// All-ones iff `flag` is true, zero otherwise — the usual branchless mask.
 /// `flag` comes from `overflowing_*`/comparison results that depend on secret
-/// intermediates, so it must never steer a branch.
+/// intermediates, so it must never steer a branch. The mask goes through
+/// [`core::hint::black_box`] so the optimizer cannot see the `0`/`!0` shape
+/// and turn the masked selects below back into branches.
 #[inline]
 fn mask64(flag: bool) -> u64 {
-    (flag as u64).wrapping_neg()
+    core::hint::black_box((flag as u64).wrapping_neg())
 }
 
 #[inline]
 fn mask128(flag: bool) -> u128 {
-    (flag as u128).wrapping_neg()
+    core::hint::black_box((flag as u128).wrapping_neg())
 }
 
 /// Constant-time `x mod p` for `x < 2·p`: subtracts `p` iff that does not
@@ -717,6 +720,27 @@ impl Umac64 {
         tag
     }
 
+    /// Consumes the MAC and checks the tag for `nonce` against `expected` in
+    /// constant time.
+    ///
+    /// Returns `true` iff `expected` is a full 8-byte tag equal to the
+    /// recomputed tag. Truncated tags (including the empty slice) are rejected
+    /// unconditionally: accepting a short `n`-byte prefix would drop forgery
+    /// resistance to `2^(8n)`, and an empty tag would be an unconditional
+    /// accept. The comparison time of the full-length path depends only on the
+    /// (public) tag length, not on where any mismatch occurs, and the
+    /// recomputed tag is wiped before returning. `nonce` follows the same
+    /// rules as in [`finalize`](Self::finalize).
+    pub fn verify(self, nonce: &[u8], expected: &[u8]) -> bool {
+        if expected.len() != 8 {
+            return false;
+        }
+        let mut tag = self.finalize(nonce);
+        let ok = bool::from(tag[..].ct_eq(expected));
+        tag.zeroize();
+        ok
+    }
+
     /// One-shot: compute the 8-byte UMAC of `data` with `nonce` under `key`.
     pub fn compute(key: &[u8; 16], data: &[u8], nonce: &[u8]) -> [u8; 8] {
         let mut s = Self::new(key);
@@ -761,6 +785,22 @@ impl Umac128 {
             tag[i] ^= pad[i];
         }
         tag
+    }
+
+    /// Consumes the MAC and checks the tag for `nonce` against `expected` in
+    /// constant time.
+    ///
+    /// Returns `true` iff `expected` is a full 16-byte tag equal to the
+    /// recomputed tag; see [`Umac64::verify`] for why truncated tags are
+    /// rejected unconditionally and what the timing depends on.
+    pub fn verify(self, nonce: &[u8], expected: &[u8]) -> bool {
+        if expected.len() != 16 {
+            return false;
+        }
+        let mut tag = self.finalize(nonce);
+        let ok = bool::from(tag[..].ct_eq(expected));
+        tag.zeroize();
+        ok
     }
 
     /// One-shot: compute the 16-byte UMAC of `data` with `nonce` under `key`.
@@ -972,6 +1012,42 @@ mod tests {
     // entire UHASH pipeline (NH / POLY-64 / POLY-128 / L3-HASH) against the
     // spec; UMAC-128 reuses that same machinery with one extra iteration
     // and the no-mask PDF, both of which are independently exercised below.
+
+    #[test]
+    fn verify_is_constant_time_and_length_strict() {
+        let key = b"abcdefghijklmnop";
+        let nonce = b"bcdefghi";
+        let msg = b"abc";
+
+        let mut state = Umac64::new(key);
+        state.update(msg);
+        let tag = Umac64::compute(key, msg, nonce);
+        assert!(state.clone().verify(nonce, &tag));
+        // A single flipped bit, a truncated prefix, an over-long tag and the
+        // empty slice must all be rejected; so must the right tag under the
+        // wrong nonce.
+        let mut bad = tag;
+        bad[0] ^= 1;
+        assert!(!state.clone().verify(nonce, &bad));
+        assert!(!state.clone().verify(nonce, &tag[..7]));
+        assert!(!state.clone().verify(nonce, &[]));
+        let mut long = [0u8; 9];
+        long[..8].copy_from_slice(&tag);
+        assert!(!state.clone().verify(nonce, &long));
+        assert!(!state.verify(b"bcdefghj", &tag));
+
+        let mut state = Umac128::new(key);
+        state.update(msg);
+        let tag = Umac128::compute(key, msg, nonce);
+        assert!(state.clone().verify(nonce, &tag));
+        let mut bad = tag;
+        bad[15] ^= 0x80;
+        assert!(!state.clone().verify(nonce, &bad));
+        assert!(!state.clone().verify(nonce, &tag[..15]));
+        assert!(!state.clone().verify(nonce, &[]));
+        // A UMAC-64 tag is not a valid (truncated) UMAC-128 tag.
+        assert!(!state.verify(nonce, &Umac64::compute(key, msg, nonce)));
+    }
 
     #[test]
     fn streaming_matches_one_shot() {

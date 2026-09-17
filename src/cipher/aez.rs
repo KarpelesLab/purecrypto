@@ -79,7 +79,9 @@ fn double_block(p: &mut Block) {
     for i in 0..15 {
         p[i] = (p[i] << 1) | (p[i + 1] >> 7);
     }
-    // 0x00 or 0x87, branchlessly on the (public) top bit.
+    // 0x00 or 0x87, branchlessly: the top bit is key-derived (every doubled
+    // block descends from `E_K(...)`), i.e. secret, so this must stay a mask
+    // and never become a branch.
     p[15] = (p[15] << 1) ^ (0u8.wrapping_sub(top) & 0x87);
 }
 

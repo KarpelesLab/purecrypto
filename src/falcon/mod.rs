@@ -696,6 +696,15 @@ impl<R: crate::rng::RngCore> sampler::SamplerRng for RngBytes<'_, R> {
 #[cfg(feature = "alloc")]
 impl FalconPrivateKey {
     /// Generate a fresh Falcon key of the given degree from a CSPRNG.
+    ///
+    /// **Not constant-time.** `NTRUGen`/`NTRUSolve` run over variable-length
+    /// big-integer arithmetic (`Zint` in `src/falcon/zint.rs`, driven from
+    /// `keygen.rs`) whose operation count and memory traffic depend on the
+    /// secret polynomials being solved for, and the whole procedure loops
+    /// until a suitable `f, g` pair is found. Generate keys where timing
+    /// cannot be observed by an adversary (not, say, on demand inside a
+    /// request handler). Signing and verification are unaffected: they use
+    /// the constant-time sampler and fixed-shape FFT/NTT paths.
     pub fn generate<R: crate::rng::RngCore + crate::rng::CryptoRng>(
         degree: Degree,
         rng: &mut R,
@@ -807,6 +816,13 @@ impl FalconPrivateKey {
     /// norm bound would admit degenerate bases — `f = 1, g = 0, F = 0, G = q`
     /// passes the NTRU equation — for which the sampler can never reach the
     /// signature norm bound, so signing would loop indefinitely.
+    ///
+    /// **Not constant-time.** Recomputing `G` and `h` and checking the NTRU
+    /// equation run over the same variable-time big-integer arithmetic as
+    /// [`generate`](Self::generate) (`Zint` in `src/falcon/zint.rs`,
+    /// `keygen.rs`), on the secret coefficients. Import keys where timing
+    /// cannot be observed; signing and verification with the imported key
+    /// are unaffected.
     pub fn from_bytes(sk: &[u8]) -> Result<FalconPrivateKey, Error> {
         let header = *sk.first().ok_or(Error::InvalidLength)?;
         if header & 0xF0 != 0x50 {

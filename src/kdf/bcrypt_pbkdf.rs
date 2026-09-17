@@ -12,6 +12,14 @@
 //! - OpenBSD `lib/libutil/bcrypt_pbkdf.c` (canonical).
 //! - `golang.org/x/crypto/ssh/internal/bcrypt_pbkdf`.
 //!
+//! **Not constant-time.** The Blowfish core underneath is table-based —
+//! its Feistel function indexes the four S-boxes with key-dependent bytes,
+//! exactly as OpenBSD's bcrypt does — so cache-timing side channels on the
+//! (password-derived) key schedule are possible in principle; see the note in
+//! [`crate::cipher::blowfish`]. OpenSSH accepts the same trade-off for the
+//! same reason: the function is run once, locally, over a key that is
+//! itself a SHA-512 output.
+//!
 //! Tuning: `rounds` is the iteration count of the inner PRF; OpenSSH's
 //! current default is 16, older default was 6 — at 16 rounds the
 //! function takes roughly 100 ms on modern hardware, which is the design

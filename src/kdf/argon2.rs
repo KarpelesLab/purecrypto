@@ -25,6 +25,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::hash::Blake2bMac;
+use crate::zeroize::{Zeroize, zero_bulk};
 
 /// Argon2 variant: which addressing scheme to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,14 +230,12 @@ pub fn argon2(
 
     // Wipe the password-derived working buffers before they drop. There are no
     // early returns past the `mem` allocation above, so this single pass covers
-    // every non-panic exit; `black_box` keeps the writes from being elided.
-    // (A plain store loop rather than `wipe`/`crate::zeroize::Zeroize`: the
-    // matrix is up to gigabytes and the volatile per-byte stores would not
-    // vectorize.)
-    c.iter_mut().for_each(|b| *b = 0);
-    mem.iter_mut().for_each(|b| *b = 0);
-    let _ = core::hint::black_box(&c);
-    let _ = core::hint::black_box(&mem);
+    // every non-panic exit. (`zero_bulk` rather than `wipe`/`Zeroize`: the
+    // matrix is up to gigabytes and volatile per-word stores would not
+    // vectorize; see its docs for how the plain stores are kept from being
+    // elided.)
+    zero_bulk(&mut c);
+    zero_bulk(&mut mem);
     Ok(())
 }
 
@@ -537,7 +536,6 @@ impl GScratch {
     }
 
     fn wipe(&mut self) {
-        use crate::zeroize::Zeroize;
         self.r.zeroize();
         self.z.zeroize();
     }
@@ -556,9 +554,13 @@ fn g_compress(x: &[u8; 1024], y: &[u8; 1024], out: &mut [u8], xor_into: bool, s:
         z[i] = r[i];
     }
 
+    // One P-round working row, shared by both passes and wiped once at the
+    // end: it holds password-derived state and would otherwise drop in the
+    // clear on the stack (every use below overwrites all 16 words first).
+    let mut tmp = [0u64; 16];
+
     // Apply P to each row (16 consecutive u64s).
     for row in 0..8 {
-        let mut tmp = [0u64; 16];
         tmp.copy_from_slice(&z[row * 16..row * 16 + 16]);
         p_round(&mut tmp);
         z[row * 16..row * 16 + 16].copy_from_slice(&tmp);
@@ -566,7 +568,6 @@ fn g_compress(x: &[u8; 1024], y: &[u8; 1024], out: &mut [u8], xor_into: bool, s:
 
     // Apply P to each "column" (2 consecutive u64s per row, 8 rows → 16 u64s).
     for col in 0..8 {
-        let mut tmp = [0u64; 16];
         for i in 0..8 {
             tmp[2 * i] = z[16 * i + 2 * col];
             tmp[2 * i + 1] = z[16 * i + 2 * col + 1];
@@ -577,6 +578,7 @@ fn g_compress(x: &[u8; 1024], y: &[u8; 1024], out: &mut [u8], xor_into: bool, s:
             z[16 * i + 2 * col + 1] = tmp[2 * i + 1];
         }
     }
+    tmp.zeroize();
 
     // Output = R ⊕ Z (optionally XORed into existing `out`).
     for i in 0..128 {

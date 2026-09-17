@@ -192,7 +192,9 @@ impl Poly1305 {
         let g4 = (h4 + c).wrapping_sub(1 << 26);
 
         // mask = 0 when h < p (g4 borrowed, high bit set), else all-ones.
-        let mask = (g4 >> 31).wrapping_sub(1);
+        // `black_box` keeps the optimizer from turning the masked selects
+        // below into a branch on the secret comparison result.
+        let mask = core::hint::black_box((g4 >> 31).wrapping_sub(1));
         g0 &= mask;
         g1 &= mask;
         g2 &= mask;

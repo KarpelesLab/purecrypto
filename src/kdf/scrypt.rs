@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 use crate::cipher::salsa20::salsa20_8;
 use crate::hash::Sha256;
 use crate::kdf::pbkdf2;
+use crate::zeroize::zero_bulk;
 
 /// scrypt parameter-validation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,18 +150,14 @@ pub fn scrypt(
 
     // Wipe the password-derived ROMix scratch before it drops. No early returns
     // follow the allocations above, so this single pass covers every non-panic
-    // exit; `black_box` keeps the writes from being elided. (A plain store
-    // loop rather than `crate::zeroize::Zeroize`: `v` alone is `N·128·r`
-    // bytes — up to hundreds of megabytes — and volatile per-byte stores
-    // would not vectorize.)
-    b.iter_mut().for_each(|byte| *byte = 0);
-    v.iter_mut().for_each(|byte| *byte = 0);
-    x.iter_mut().for_each(|byte| *byte = 0);
-    y.iter_mut().for_each(|byte| *byte = 0);
-    let _ = core::hint::black_box(&b);
-    let _ = core::hint::black_box(&v);
-    let _ = core::hint::black_box(&x);
-    let _ = core::hint::black_box(&y);
+    // exit. (`zero_bulk` rather than `crate::zeroize::Zeroize`: `v` alone is
+    // `N·128·r` bytes — up to hundreds of megabytes — and volatile per-word
+    // stores would not vectorize; see its docs for how the plain stores are
+    // kept from being elided.)
+    zero_bulk(&mut b);
+    zero_bulk(&mut v);
+    zero_bulk(&mut x);
+    zero_bulk(&mut y);
     Ok(())
 }
 

@@ -14,12 +14,24 @@
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+use crate::zeroize::Zeroize;
+
 /// A sign-magnitude big integer. `mag` is little-endian base-2³², trimmed of
 /// trailing zero limbs; the empty vector is zero and `neg` is then `false`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Zint {
     neg: bool,
     mag: Vec<u32>,
+}
+
+impl Drop for Zint {
+    /// Every `Zint` that key generation and import build is a limb of the
+    /// secret `f/g/F/G` tower (or an intermediate derived from them), so the
+    /// limb storage is wiped before it is freed rather than left in the
+    /// allocator's free list in the clear.
+    fn drop(&mut self) {
+        self.mag.zeroize();
+    }
 }
 
 fn trim(v: &mut Vec<u32>) {

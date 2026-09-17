@@ -114,8 +114,12 @@ impl<D: Digest> Hmac<D> {
     /// `==`.
     #[inline]
     pub fn verify(self, expected: &[u8]) -> Choice {
-        let tag = self.finalize();
-        tag.as_ref().ct_eq(expected)
+        let mut tag = self.finalize();
+        let ok = tag.as_ref().ct_eq(expected);
+        // The recomputed tag is exactly what a forger wants; don't let it
+        // drop in the clear.
+        super::zeroize::zero_bytes(tag.as_mut());
+        ok
     }
 
     /// Computes the tag for `data` under `key` in one call.
@@ -149,10 +153,13 @@ impl<D: Digest> Mac for Hmac<D> {
     /// the digest length.
     #[inline]
     fn finalize_into(self, out: &mut [u8]) {
-        let tag = self.finalize();
+        let mut tag = self.finalize();
         let t = tag.as_ref();
         let n = out.len().min(t.len());
         out[..n].copy_from_slice(&t[..n]);
+        // Wipe the untruncated tag: the bytes a shorter `out` did not receive
+        // must not linger on the stack.
+        super::zeroize::zero_bytes(tag.as_mut());
     }
     #[inline]
     fn verify(self, expected: &[u8]) -> Choice {

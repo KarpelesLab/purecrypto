@@ -16,6 +16,21 @@
 //! See the module-level encrypt/decrypt entry points; the per-key-type
 //! helpers (`to_pkcs8_*_encrypted` / `from_pkcs8_*_encrypted`) layered on
 //! top live next to each key.
+//!
+//! # CBC envelopes and padding oracles
+//!
+//! The RFC 8018 `aes256-CBC-PAD` scheme carries no integrity tag, so
+//! [`decrypt`] of an attacker-supplied envelope under a fixed password is
+//! inherently a padding-oracle surface: the PKCS#7 padding check itself is
+//! constant-time and every failure maps to the one [`Error::Decryption`]
+//! variant, but "valid padding → `Ok`" versus "invalid padding → `Err`" is
+//! still observable, and that single bit per query is all a
+//! Vaudenay-style attack needs. Wrapping your own private keys, where the
+//! only envelopes you ever open are ones you produced, is unaffected. A
+//! service that decrypts envelopes it did not create should require the
+//! AEAD form — [`CipherChoice::Aes256Gcm`] — via [`decrypt_authenticated`]
+//! / [`decrypt_pem_authenticated`], which reject CBC envelopes before any
+//! key derivation.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -91,7 +106,8 @@ pub enum Error {
     /// label / Base64 body was malformed.
     BadEncoding,
     /// Algorithm OID we don't recognize (e.g. PBES1, scrypt, AES-128-CBC,
-    /// HMAC-SHA-1).
+    /// HMAC-SHA-1). Also returned by [`decrypt_authenticated`] for an
+    /// (otherwise supported) `aes256-CBC-PAD` envelope.
     UnsupportedAlgorithm,
     /// AEAD authentication failed OR CBC padding was invalid OR the
     /// derived key was somehow wrong. Returned as one variant to avoid a
@@ -204,7 +220,8 @@ pub fn try_encrypt(
     rng.fill_bytes(&mut salt);
 
     // 2. Derive a 32-byte AES-256 key.
-    let mut key = derive_key(password, &salt, &params.kdf);
+    let mut key = [0u8; 32];
+    derive_key(password, &salt, &params.kdf, &mut key);
 
     // 3. Encrypt.
     let (cipher_algid, ciphertext) = match params.cipher {
@@ -258,6 +275,32 @@ pub fn try_encrypt(
 /// also be present: an empty one is rejected as
 /// [`Error::WeakKdfParameters`].
 pub fn decrypt(encrypted_pkcs8_der: &[u8], password: &[u8]) -> Result<Vec<u8>, Error> {
+    decrypt_inner(encrypted_pkcs8_der, password, false)
+}
+
+/// [`decrypt`], restricted to the authenticated AES-256-GCM envelope.
+///
+/// An `aes256-CBC-PAD` envelope is rejected as
+/// [`Error::UnsupportedAlgorithm`] before the password is run through the
+/// KDF, so no CBC padding check ever happens. Use this wherever the envelope
+/// comes from an untrusted party: as the
+/// [module docs](self#cbc-envelopes-and-padding-oracles) explain, the
+/// unauthenticated CBC form is a padding-oracle surface. All other checks and
+/// errors are as for [`decrypt`].
+pub fn decrypt_authenticated(
+    encrypted_pkcs8_der: &[u8],
+    password: &[u8],
+) -> Result<Vec<u8>, Error> {
+    decrypt_inner(encrypted_pkcs8_der, password, true)
+}
+
+/// Shared body of [`decrypt`] and [`decrypt_authenticated`]: `require_aead`
+/// turns a CBC envelope into [`Error::UnsupportedAlgorithm`].
+fn decrypt_inner(
+    encrypted_pkcs8_der: &[u8],
+    password: &[u8],
+    require_aead: bool,
+) -> Result<Vec<u8>, Error> {
     // ---- Outer SEQUENCE ----
     let mut reader = Reader::new(encrypted_pkcs8_der);
     let mut outer = reader.read_sequence().map_err(|_| Error::BadEncoding)?;
@@ -283,6 +326,10 @@ pub fn decrypt(encrypted_pkcs8_der: &[u8], password: &[u8]) -> Result<Vec<u8>, E
     outer.finish().map_err(|_| Error::BadEncoding)?;
     reader.finish().map_err(|_| Error::BadEncoding)?;
 
+    if require_aead && cipher_kind != CipherChoice::Aes256Gcm {
+        return Err(Error::UnsupportedAlgorithm);
+    }
+
     // ---- Cipher: decrypt ----
     // The 32-byte AES key is derived inside each arm only after the cheap
     // structural checks, so no early return sits between derivation and
@@ -302,7 +349,8 @@ pub fn decrypt(encrypted_pkcs8_der: &[u8], password: &[u8]) -> Result<Vec<u8>, E
             tag_arr.copy_from_slice(tag);
             let mut iv_arr = [0u8; 12];
             iv_arr.copy_from_slice(&iv_bytes);
-            let mut key = derive_key(password, &salt, &kdf);
+            let mut key = [0u8; 32];
+            derive_key(password, &salt, &kdf, &mut key);
             let gcm = Aes256Gcm::new(Aes256::new(&key));
             wipe(&mut key);
             gcm.decrypt(&iv_arr, &[], &mut buf, &tag_arr)
@@ -319,7 +367,8 @@ pub fn decrypt(encrypted_pkcs8_der: &[u8], password: &[u8]) -> Result<Vec<u8>, E
             let mut iv_arr = [0u8; 16];
             iv_arr.copy_from_slice(&iv_bytes);
             let mut buf = ciphertext.to_vec();
-            let mut key = derive_key(password, &salt, &kdf);
+            let mut key = [0u8; 32];
+            derive_key(password, &salt, &kdf, &mut key);
             let mut cbc = Cbc::new(Aes256::new(&key), &iv_arr);
             wipe(&mut key);
             cbc.decrypt(&mut buf).map_err(|_| Error::Decryption)?;
@@ -367,6 +416,12 @@ pub fn try_encrypt_pem(
 pub fn decrypt_pem(pem: &str, password: &[u8]) -> Result<Vec<u8>, Error> {
     let der = pem_decode(pem, PEM_LABEL).map_err(|_| Error::BadEncoding)?;
     decrypt(&der, password)
+}
+
+/// PEM-wrapped variant of [`decrypt_authenticated`].
+pub fn decrypt_pem_authenticated(pem: &str, password: &[u8]) -> Result<Vec<u8>, Error> {
+    let der = pem_decode(pem, PEM_LABEL).map_err(|_| Error::BadEncoding)?;
+    decrypt_authenticated(&der, password)
 }
 
 // ---- Internals ----------------------------------------------------------
@@ -548,19 +603,21 @@ fn integer_to_u32_or(bytes: &[u8], too_big: Error) -> Result<u32, Error> {
     Ok(acc)
 }
 
-/// Derives a 32-byte AES-256 key from the password + salt using the
-/// requested PBKDF2 variant.
-fn derive_key(password: &[u8], salt: &[u8], kdf: &KdfChoice) -> [u8; 32] {
-    let mut out = [0u8; 32];
+/// Derives the 32-byte AES-256 key from the password + salt using the
+/// requested PBKDF2 variant, writing it into `out`.
+///
+/// An out-parameter rather than a returned array so the caller's buffer is
+/// the only copy: returning `[u8; 32]` by value would leave a second,
+/// unwiped copy of the key wherever the compiler spilled the return slot.
+fn derive_key(password: &[u8], salt: &[u8], kdf: &KdfChoice, out: &mut [u8; 32]) {
     match *kdf {
         KdfChoice::Pbkdf2HmacSha256 { iterations } => {
-            pbkdf2::<Sha256>(password, salt, iterations, &mut out);
+            pbkdf2::<Sha256>(password, salt, iterations, out);
         }
         KdfChoice::Pbkdf2HmacSha512 { iterations } => {
-            pbkdf2::<Sha512>(password, salt, iterations, &mut out);
+            pbkdf2::<Sha512>(password, salt, iterations, out);
         }
     }
-    out
 }
 
 /// Encodes the PBKDF2 `AlgorithmIdentifier` over the chosen PRF + salt.
@@ -652,6 +709,10 @@ fn strip_pkcs7_padding(mut buf: Vec<u8>) -> Result<Vec<u8>, Error> {
 
 /// Constant-time `(x <= y)` over `u8`, returning `0xFF` for true and
 /// `0x00` for false.
+///
+/// The mask is passed through [`core::hint::black_box`] (as the crate's
+/// [`ct`](crate::ct) primitives do) so the optimizer cannot recognise the
+/// `0`/`0xFF` shape and rewrite the masked padding checks as branches.
 #[inline]
 fn ct_le_u8(x: u8, y: u8) -> u8 {
     // (y - x) borrow: if x > y the high bit of (y - x) as i16 is set.
@@ -659,10 +720,11 @@ fn ct_le_u8(x: u8, y: u8) -> u8 {
     // diff >= 0  ->  high bit of diff cleared  ->  want 0xFF.
     // diff < 0   ->  high bit set              ->  want 0x00.
     let sign = ((diff as u16) >> 15) as u8; // 1 if negative, 0 otherwise.
-    sign.wrapping_sub(1) // 0 -> 0xFF; 1 -> 0x00
+    core::hint::black_box(sign.wrapping_sub(1)) // 0 -> 0xFF; 1 -> 0x00
 }
 
-/// Constant-time "x != 0", returning `0xFF` if nonzero else `0x00`.
+/// Constant-time "x != 0", returning `0xFF` if nonzero else `0x00`. Barrier
+/// as in [`ct_le_u8`].
 #[inline]
 fn ct_nonzero_u8(x: u8) -> u8 {
     // Spread the OR of all bits into bit 0, then mask-extend.
@@ -671,7 +733,7 @@ fn ct_nonzero_u8(x: u8) -> u8 {
     v |= v >> 2;
     v |= v >> 1;
     let bit = v & 1;
-    0u8.wrapping_sub(bit)
+    core::hint::black_box(0u8.wrapping_sub(bit))
 }
 
 /// Constant-time "1 <= x <= 16".
@@ -780,6 +842,45 @@ mod tests {
         let blob = encrypt(&inner, b"swordfish", &params, &mut rng);
         let out = decrypt(&blob, b"swordfish").unwrap();
         assert_eq!(out, inner);
+    }
+
+    /// `decrypt_authenticated` opens a GCM envelope exactly as `decrypt`
+    /// does, but refuses the unauthenticated CBC form outright (with
+    /// `UnsupportedAlgorithm`, not `Decryption`: the rejection is structural
+    /// and happens before the password is touched).
+    #[test]
+    fn decrypt_authenticated_requires_gcm() {
+        let inner = synthetic_pkcs8();
+        let gcm = Pbes2Params {
+            kdf: KdfChoice::Pbkdf2HmacSha256 { iterations: 10_000 },
+            cipher: CipherChoice::Aes256Gcm,
+            salt_len: 16,
+        };
+        let blob = encrypt(&inner, b"pw", &gcm, &mut test_rng(b"auth-gcm"));
+        assert_eq!(decrypt_authenticated(&blob, b"pw"), Ok(inner.clone()));
+        assert_eq!(
+            decrypt_authenticated(&blob, b"wrong"),
+            Err(Error::Decryption)
+        );
+        let pem = encrypt_pem(&inner, b"pw", &gcm, &mut test_rng(b"auth-gcm-pem"));
+        assert_eq!(decrypt_pem_authenticated(&pem, b"pw"), Ok(inner.clone()));
+
+        let cbc = Pbes2Params {
+            kdf: KdfChoice::Pbkdf2HmacSha256 { iterations: 10_000 },
+            cipher: CipherChoice::Aes256Cbc,
+            salt_len: 16,
+        };
+        let blob = encrypt(&inner, b"pw", &cbc, &mut test_rng(b"auth-cbc"));
+        assert_eq!(decrypt(&blob, b"pw"), Ok(inner.clone()));
+        assert_eq!(
+            decrypt_authenticated(&blob, b"pw"),
+            Err(Error::UnsupportedAlgorithm)
+        );
+        let pem = encrypt_pem(&inner, b"pw", &cbc, &mut test_rng(b"auth-cbc-pem"));
+        assert_eq!(
+            decrypt_pem_authenticated(&pem, b"pw"),
+            Err(Error::UnsupportedAlgorithm)
+        );
     }
 
     #[test]

@@ -41,6 +41,7 @@
 
 use crate::cipher::{Aes128, Aes256, BlockCipher, Cmac};
 use crate::hash::{Digest, Hmac};
+use crate::zeroize::Zeroize;
 
 /// Error returned by the KBKDF entry points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,10 +149,13 @@ impl<D: Digest> Prf for HmacPrf<D> {
         // Swap in a freshly keyed MAC for the next block, finalizing the old one.
         let next = self.template.clone();
         let done = core::mem::replace(&mut self.mac, next);
-        let tag = done.finalize();
+        let mut tag = done.finalize();
         let t = tag.as_ref();
         debug_assert_eq!(t.len(), Self::OUTPUT_LEN);
         out.copy_from_slice(t);
+        // The PRF block is derived key material; wipe our copy after handing
+        // it to the caller.
+        tag.as_mut().zeroize();
     }
 }
 
@@ -184,8 +188,10 @@ impl<C: BlockCipher + Clone> CmacPrf<C> {
     fn finalize(&mut self, out: &mut [u8]) {
         let next = Cmac::new(self.cipher.clone());
         let done = core::mem::replace(&mut self.mac, next);
-        let tag = done.finalize();
+        let mut tag = done.finalize();
         out.copy_from_slice(&tag);
+        // As in `HmacPrf::finalize`: the block is key material.
+        tag.zeroize();
     }
 }
 
