@@ -160,11 +160,17 @@ fn curve_label(c: CurveId) -> &'static str {
         CurveId::BrainpoolP256r1 => "brainpoolP256r1",
         CurveId::BrainpoolP384r1 => "brainpoolP384r1",
         CurveId::BrainpoolP512r1 => "brainpoolP512r1",
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160k1 => "secp160k1",
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r1 => "secp160r1",
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r2 => "secp160r2",
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp192k1 => "secp192k1",
+        #[cfg(feature = "legacy-ec")]
         CurveId::P192 => "P-192",
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp224k1 => "secp224k1",
         CurveId::P224 => "P-224",
         CurveId::BrainpoolP224r1 => "brainpoolP224r1",

@@ -60,14 +60,15 @@ pub(crate) fn tls_signature_scheme_for_curve(curve: CurveId) -> Option<Signature
         CurveId::BrainpoolP512r1 => Some(SignatureScheme::ECDSA_BRAINPOOLP512R1TLS13_SHA512),
         // No TLS 1.3 signature scheme exists for secp256k1, SM2, the SEC 2
         // 160/192/224-bit curves or the 224/320-bit Brainpool curves.
-        CurveId::Secp256k1
-        | CurveId::Sm2p256v1
-        | CurveId::Secp160k1
+        #[cfg(feature = "legacy-ec")]
+        CurveId::Secp160k1
         | CurveId::Secp160r1
         | CurveId::Secp160r2
         | CurveId::Secp192k1
         | CurveId::P192
-        | CurveId::Secp224k1
+        | CurveId::Secp224k1 => None,
+        CurveId::Secp256k1
+        | CurveId::Sm2p256v1
         | CurveId::P224
         | CurveId::BrainpoolP224r1
         | CurveId::BrainpoolP320r1 => None,

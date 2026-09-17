@@ -16,8 +16,9 @@ use purecrypto::ec::{
 use purecrypto::x509::AnyPublicKey;
 
 /// The Wycheproof curve name -> the crate's identifier (`None` = unsupported:
-/// the twisted Brainpool curves, FRP256v1, and the 160/192-bit Brainpool
-/// curves). Shared with `ec_formats`.
+/// the twisted Brainpool curves, FRP256v1, the 160/192-bit Brainpool curves,
+/// and without `legacy-ec` the secp160/192/224k1 curves and P-192). Shared
+/// with `ec_formats`.
 pub fn curve_id(name: &str) -> Option<CurveId> {
     Some(match name {
         "secp256r1" => CurveId::P256,
@@ -27,11 +28,17 @@ pub fn curve_id(name: &str) -> Option<CurveId> {
         "brainpoolP256r1" => CurveId::BrainpoolP256r1,
         "brainpoolP384r1" => CurveId::BrainpoolP384r1,
         "brainpoolP512r1" => CurveId::BrainpoolP512r1,
+        #[cfg(feature = "legacy-ec")]
         "secp160k1" => CurveId::Secp160k1,
+        #[cfg(feature = "legacy-ec")]
         "secp160r1" => CurveId::Secp160r1,
+        #[cfg(feature = "legacy-ec")]
         "secp160r2" => CurveId::Secp160r2,
+        #[cfg(feature = "legacy-ec")]
         "secp192k1" => CurveId::Secp192k1,
+        #[cfg(feature = "legacy-ec")]
         "secp192r1" => CurveId::P192,
+        #[cfg(feature = "legacy-ec")]
         "secp224k1" => CurveId::Secp224k1,
         "secp224r1" => CurveId::P224,
         "brainpoolP224r1" => CurveId::BrainpoolP224r1,
@@ -198,7 +205,8 @@ fn sec1(x: &[u8], y: &[u8]) -> Vec<u8> {
 fn ec_prime_order_curves() {
     check("ec_prime_order_curves", |_, case| {
         // Curves the crate does not implement (the twisted Brainpool curves,
-        // brainpoolP160r1/P192r1, FRP256v1) are counted as skipped.
+        // brainpoolP160r1/P192r1, FRP256v1) — and, without `legacy-ec`, the
+        // sub-112-bit SEC 2 curves — are counted as skipped.
         let Some(curve) = curve_id(case.str("name")) else {
             return Outcome::Skipped;
         };

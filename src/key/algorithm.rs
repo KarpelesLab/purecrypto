@@ -68,17 +68,24 @@ pub enum Algorithm {
     BrainpoolP384r1,
     /// ECDSA / ECDH over brainpoolP512r1 (RFC 5639).
     BrainpoolP512r1,
-    /// ECDSA / ECDH over secp160k1 (SEC 2).
+    /// ECDSA / ECDH over secp160k1 (SEC 2). Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp160k1,
-    /// ECDSA / ECDH over secp160r1 (SEC 2).
+    /// ECDSA / ECDH over secp160r1 (SEC 2). Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp160r1,
-    /// ECDSA / ECDH over secp160r2 (SEC 2).
+    /// ECDSA / ECDH over secp160r2 (SEC 2). Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp160r2,
-    /// ECDSA / ECDH over secp192k1 (SEC 2).
+    /// ECDSA / ECDH over secp192k1 (SEC 2). Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp192k1,
-    /// ECDSA / ECDH over NIST P-192 (secp192r1 / prime192v1).
+    /// ECDSA / ECDH over NIST P-192 (secp192r1 / prime192v1). Requires the
+    /// `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     P192,
-    /// ECDSA / ECDH over secp224k1 (SEC 2).
+    /// ECDSA / ECDH over secp224k1 (SEC 2). Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp224k1,
     /// ECDSA / ECDH over NIST P-224 (secp224r1).
     P224,

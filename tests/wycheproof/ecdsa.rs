@@ -51,11 +51,17 @@ fn curve_of(name: &str) -> CurveId {
         "brainpoolP256r1" => CurveId::BrainpoolP256r1,
         "brainpoolP384r1" => CurveId::BrainpoolP384r1,
         "brainpoolP512r1" => CurveId::BrainpoolP512r1,
+        #[cfg(feature = "legacy-ec")]
         "secp160k1" => CurveId::Secp160k1,
+        #[cfg(feature = "legacy-ec")]
         "secp160r1" => CurveId::Secp160r1,
+        #[cfg(feature = "legacy-ec")]
         "secp160r2" => CurveId::Secp160r2,
+        #[cfg(feature = "legacy-ec")]
         "secp192k1" => CurveId::Secp192k1,
+        #[cfg(feature = "legacy-ec")]
         "secp192r1" => CurveId::P192,
+        #[cfg(feature = "legacy-ec")]
         "secp224k1" => CurveId::Secp224k1,
         "secp224r1" => CurveId::P224,
         "brainpoolP224r1" => CurveId::BrainpoolP224r1,
@@ -238,20 +244,6 @@ ecdsa_files! {
     ecdsa_brainpoolP512r1_sha3_512,
     ecdsa_brainpoolP512r1_sha512,
     ecdsa_brainpoolP512r1_sha512_p1363,
-    ecdsa_secp160k1_sha256,
-    ecdsa_secp160k1_sha256_p1363,
-    ecdsa_secp160r1_sha256,
-    ecdsa_secp160r1_sha256_p1363,
-    ecdsa_secp160r2_sha256,
-    ecdsa_secp160r2_sha256_p1363,
-    ecdsa_secp192k1_sha256,
-    ecdsa_secp192k1_sha256_p1363,
-    ecdsa_secp192r1_sha256,
-    ecdsa_secp192r1_sha256_p1363,
-    ecdsa_secp224k1_sha224,
-    ecdsa_secp224k1_sha224_p1363,
-    ecdsa_secp224k1_sha256,
-    ecdsa_secp224k1_sha256_p1363,
     ecdsa_secp224r1_sha224,
     ecdsa_secp224r1_sha224_p1363,
     ecdsa_secp224r1_sha256,
@@ -296,4 +288,23 @@ ecdsa_files! {
     ecdsa_secp521r1_sha512_p1363,
     ecdsa_secp521r1_shake256,
     ecdsa_secp521r1_shake256_p1363,
+}
+
+// The sub-112-bit SEC 2 curves need the `legacy-ec` feature.
+#[cfg(feature = "legacy-ec")]
+ecdsa_files! {
+    ecdsa_secp160k1_sha256,
+    ecdsa_secp160k1_sha256_p1363,
+    ecdsa_secp160r1_sha256,
+    ecdsa_secp160r1_sha256_p1363,
+    ecdsa_secp160r2_sha256,
+    ecdsa_secp160r2_sha256_p1363,
+    ecdsa_secp192k1_sha256,
+    ecdsa_secp192k1_sha256_p1363,
+    ecdsa_secp192r1_sha256,
+    ecdsa_secp192r1_sha256_p1363,
+    ecdsa_secp224k1_sha224,
+    ecdsa_secp224k1_sha224_p1363,
+    ecdsa_secp224k1_sha256,
+    ecdsa_secp224k1_sha256_p1363,
 }

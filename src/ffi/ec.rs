@@ -139,15 +139,16 @@ pub unsafe extern "C" fn pc_ec_sign(
         let sk = &unsafe { &*key }.0;
         let curve = sk.curve();
         let sig = match curve {
-            CurveId::P256
-            | CurveId::Secp256k1
-            | CurveId::BrainpoolP256r1
-            | CurveId::Secp160k1
+            #[cfg(feature = "legacy-ec")]
+            CurveId::Secp160k1
             | CurveId::Secp160r1
             | CurveId::Secp160r2
             | CurveId::Secp192k1
             | CurveId::P192
-            | CurveId::Secp224k1
+            | CurveId::Secp224k1 => sk.sign::<Sha256>(m),
+            CurveId::P256
+            | CurveId::Secp256k1
+            | CurveId::BrainpoolP256r1
             | CurveId::P224
             | CurveId::BrainpoolP224r1 => sk.sign::<Sha256>(m),
             CurveId::P384 | CurveId::BrainpoolP384r1 | CurveId::BrainpoolP320r1 => {
@@ -197,15 +198,16 @@ pub unsafe extern "C" fn pc_ec_verify(
             Err(_) => return PcStatus::BadEncoding,
         };
         let ok = match key.curve() {
-            CurveId::P256
-            | CurveId::Secp256k1
-            | CurveId::BrainpoolP256r1
-            | CurveId::Secp160k1
+            #[cfg(feature = "legacy-ec")]
+            CurveId::Secp160k1
             | CurveId::Secp160r1
             | CurveId::Secp160r2
             | CurveId::Secp192k1
             | CurveId::P192
-            | CurveId::Secp224k1
+            | CurveId::Secp224k1 => key.verify::<Sha256>(m, &parsed),
+            CurveId::P256
+            | CurveId::Secp256k1
+            | CurveId::BrainpoolP256r1
             | CurveId::P224
             | CurveId::BrainpoolP224r1 => key.verify::<Sha256>(m, &parsed),
             CurveId::P384 | CurveId::BrainpoolP384r1 | CurveId::BrainpoolP320r1 => {

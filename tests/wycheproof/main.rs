@@ -25,7 +25,7 @@ mod cipher_modes;
 mod dsa;
 #[cfg(feature = "ec")]
 mod ec_agree;
-#[cfg(feature = "ec")]
+#[cfg(feature = "legacy-ec")]
 mod ec_binary;
 #[cfg(feature = "ec")]
 mod ec_formats;

@@ -39,11 +39,17 @@ fn curve_oid(curve: CurveId) -> &'static [u64] {
         CurveId::BrainpoolP256r1 => oid::BRAINPOOL_P256R1,
         CurveId::BrainpoolP384r1 => oid::BRAINPOOL_P384R1,
         CurveId::BrainpoolP512r1 => oid::BRAINPOOL_P512R1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160k1 => oid::SECP160K1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r1 => oid::SECP160R1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r2 => oid::SECP160R2,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp192k1 => oid::SECP192K1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::P192 => oid::PRIME192V1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp224k1 => oid::SECP224K1,
         CurveId::P224 => oid::SECP224R1,
         CurveId::BrainpoolP224r1 => oid::BRAINPOOL_P224R1,
@@ -53,7 +59,7 @@ fn curve_oid(curve: CurveId) -> &'static [u64] {
 
 /// Maps a named-curve OID to a [`CurveId`].
 fn curve_from_oid(arcs: &[u64]) -> Option<CurveId> {
-    CurveId::ALL.into_iter().find(|c| curve_oid(*c) == arcs)
+    CurveId::ALL.iter().copied().find(|c| curve_oid(*c) == arcs)
 }
 
 /// The digest an RSA-PSS key restriction names (RFC 4055 §3.1

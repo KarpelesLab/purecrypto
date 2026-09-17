@@ -430,11 +430,17 @@ fn curve_alg(curve: CurveId) -> Algorithm {
         CurveId::BrainpoolP256r1 => Algorithm::BrainpoolP256r1,
         CurveId::BrainpoolP384r1 => Algorithm::BrainpoolP384r1,
         CurveId::BrainpoolP512r1 => Algorithm::BrainpoolP512r1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160k1 => Algorithm::Secp160k1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r1 => Algorithm::Secp160r1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r2 => Algorithm::Secp160r2,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp192k1 => Algorithm::Secp192k1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::P192 => Algorithm::P192,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp224k1 => Algorithm::Secp224k1,
         CurveId::P224 => Algorithm::P224,
         CurveId::BrainpoolP224r1 => Algorithm::BrainpoolP224r1,
@@ -445,6 +451,13 @@ fn curve_alg(curve: CurveId) -> Algorithm {
 /// The curves whose boxed ECDSA / ECDH operations are supported here.
 fn ecdsa_alg(curve: CurveId) -> Option<Algorithm> {
     match curve {
+        #[cfg(feature = "legacy-ec")]
+        CurveId::Secp160k1
+        | CurveId::Secp160r1
+        | CurveId::Secp160r2
+        | CurveId::Secp192k1
+        | CurveId::P192
+        | CurveId::Secp224k1 => Some(curve_alg(curve)),
         CurveId::P256
         | CurveId::P384
         | CurveId::P521
@@ -452,12 +465,6 @@ fn ecdsa_alg(curve: CurveId) -> Option<Algorithm> {
         | CurveId::BrainpoolP256r1
         | CurveId::BrainpoolP384r1
         | CurveId::BrainpoolP512r1
-        | CurveId::Secp160k1
-        | CurveId::Secp160r1
-        | CurveId::Secp160r2
-        | CurveId::Secp192k1
-        | CurveId::P192
-        | CurveId::Secp224k1
         | CurveId::P224
         | CurveId::BrainpoolP224r1
         | CurveId::BrainpoolP320r1 => Some(curve_alg(curve)),

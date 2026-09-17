@@ -1263,11 +1263,17 @@ mod tests {
         use crate::hash::Sha224;
         let mut rng = HmacDrbg::<Sha256>::new(b"small-curves", b"nonce", &[]);
         for curve in [
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp160k1,
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp160r1,
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp160r2,
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp192k1,
+            #[cfg(feature = "legacy-ec")]
             CurveId::P192,
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp224k1,
             CurveId::P224,
             CurveId::BrainpoolP224r1,
@@ -1346,6 +1352,7 @@ mod tests {
     /// scalar with the 161st / 225th bit set is in range and signs, while
     /// `n` itself and `0` are refused; the SEC1 private-key encoding is
     /// `order_len` bytes.
+    #[cfg(feature = "legacy-ec")]
     #[test]
     fn order_wider_than_field_private_key_range() {
         for curve in [
@@ -1388,18 +1395,6 @@ mod tests {
     #[test]
     fn rfc6979_p192_p224_vectors() {
         use crate::hash::{Sha1, Sha224};
-        let p192 = BoxedEcdsaPrivateKey::from_bytes(
-            CurveId::P192,
-            &from_hex("6fab034934e4c0fc9ae67f5b5659a9d7d1fefd187ee09fd4"),
-        )
-        .unwrap();
-        assert_eq!(
-            p192.public_key().to_sec1(),
-            from_hex(
-                "04ac2c77f529f91689fea0ea5efec7f210d8eea0b9e047ed56\
-                 3bc723e57670bd4887ebc732c523063d0a7c957bc97c1c43"
-            )
-        );
         let p224 = BoxedEcdsaPrivateKey::from_bytes(
             CurveId::P224,
             &from_hex("f220266e1105bfe3083e03ec7a3a654651f45e37167e88600bf257c1"),
@@ -1417,31 +1412,51 @@ mod tests {
             let curve = sk.curve();
             assert_eq!(sig.to_bytes(curve), from_hex(rs), "{curve:?} {rs}");
         };
+        // P-192 (with `legacy-ec`).
+        #[cfg(feature = "legacy-ec")]
+        let p192 = BoxedEcdsaPrivateKey::from_bytes(
+            CurveId::P192,
+            &from_hex("6fab034934e4c0fc9ae67f5b5659a9d7d1fefd187ee09fd4"),
+        )
+        .unwrap();
+        #[cfg(feature = "legacy-ec")]
+        assert_eq!(
+            p192.public_key().to_sec1(),
+            from_hex(
+                "04ac2c77f529f91689fea0ea5efec7f210d8eea0b9e047ed56\
+                 3bc723e57670bd4887ebc732c523063d0a7c957bc97c1c43"
+            )
+        );
         // P-192, "sample".
+        #[cfg(feature = "legacy-ec")]
         check(
             &p192,
             p192.sign::<Sha1>(b"sample").unwrap(),
             "98c6bd12b23eaf5e2a2045132086be3eb8ebd62abf6698ff\
              57a22b07dea9530f8de9471b1dc6624472e8e2844bc25b64",
         );
+        #[cfg(feature = "legacy-ec")]
         check(
             &p192,
             p192.sign::<Sha224>(b"sample").unwrap(),
             "a1f00dad97aeec91c95585f36200c65f3c01812aa60378f5\
              e07ec1304c7c6c9debbe980b9692668f81d4de7922a0f97a",
         );
+        #[cfg(feature = "legacy-ec")]
         check(
             &p192,
             p192.sign::<Sha256>(b"sample").unwrap(),
             "4b0b8ce98a92866a2820e20aa6b75b56382e0f9bfd5ecb55\
              ccdb006926ea9565cbadc840829d8c384e06de1f1e381b85",
         );
+        #[cfg(feature = "legacy-ec")]
         check(
             &p192,
             p192.sign::<Sha384>(b"sample").unwrap(),
             "da63bf0b9abcf948fbb1e9167f136145f7a20426dcc287d5\
              c3aa2c960972bd7a2003a57e1c4c77f0578f8ae95e31ec5e",
         );
+        #[cfg(feature = "legacy-ec")]
         check(
             &p192,
             p192.sign::<Sha512>(b"sample").unwrap(),
@@ -1449,6 +1464,7 @@ mod tests {
              3f6e837448f027a1bf4b34e796e32a811cbb4050908d8f67",
         );
         // P-192, "test".
+        #[cfg(feature = "legacy-ec")]
         check(
             &p192,
             p192.sign::<Sha256>(b"test").unwrap(),
@@ -1489,8 +1505,11 @@ mod tests {
         // And they verify.
         let sig = p224.sign::<Sha256>(b"sample").unwrap();
         p224.public_key().verify::<Sha256>(b"sample", &sig).unwrap();
-        let sig = p192.sign::<Sha512>(b"sample").unwrap();
-        p192.public_key().verify::<Sha512>(b"sample", &sig).unwrap();
+        #[cfg(feature = "legacy-ec")]
+        {
+            let sig = p192.sign::<Sha512>(b"sample").unwrap();
+            p192.public_key().verify::<Sha512>(b"sample", &sig).unwrap();
+        }
     }
 
     /// One published verify KAT per new curve, from Wycheproof
@@ -1505,37 +1524,43 @@ mod tests {
         use crate::hash::Sha224;
         type Verify = fn(&BoxedEcdsaPublicKey, &[u8], &BoxedEcdsaSignature) -> Result<(), Error>;
         let msg = from_hex("4d7367");
-        let cases: [(CurveId, &str, &str, Verify); 9] = [
+        let cases: &[(CurveId, &str, &str, Verify)] = &[
+            #[cfg(feature = "legacy-ec")]
             (
                 CurveId::Secp160k1,
                 "048c8b7f800bc9c5588b4970e7559eca926fa38e7b6c5d8223426e1cf8d2a2791ab710a14305048ad3",
                 "302d021469b9f46ded69a35ac00a053ef9dbb47d073d6729021500d059cb77081101578272ca48bf5980c5019febd5",
                 |pk, m, s| pk.verify::<Sha256>(m, s),
             ),
+            #[cfg(feature = "legacy-ec")]
             (
                 CurveId::Secp160r1,
                 "04b0046a56f874d30ea2ba7ac1a935fd9d754ee6417b9a54d275806819ec30b15618f5625115241f46",
                 "302d02140f5720c6bd95624b603b2be5a75e487b34268d5f021500bfd6d370b516687113b12a4fc95eebb874a646fa",
                 |pk, m, s| pk.verify::<Sha256>(m, s),
             ),
+            #[cfg(feature = "legacy-ec")]
             (
                 CurveId::Secp160r2,
                 "0446f1a7493b131f3c6032e9612b8e1bd3d1a3104ce3cef3c8020c277ba45bc93a9a364f07eba8302c",
                 "302c02146d8624bff7719b53dab811bdc0e434a5e9f02e8d02140b50e6dce0f5c1a757290eed8df0aa8092b2ff90",
                 |pk, m, s| pk.verify::<Sha256>(m, s),
             ),
+            #[cfg(feature = "legacy-ec")]
             (
                 CurveId::Secp192k1,
                 "0404a4e7bedc7d8137aade86c1a4d223ad704e63dad4717c493efc196def1cad9823c91f6b8be2611164b93cca4bb2c559",
                 "30350218546e7cfe5f660f10a02cefdcb4bb4e0cc7a9fd43cc9e443f02190086d3a935dd62d5db7101e128f3f6048c490072a49a5ef047",
                 |pk, m, s| pk.verify::<Sha256>(m, s),
             ),
+            #[cfg(feature = "legacy-ec")]
             (
                 CurveId::P192,
                 "042a551b5a39771e436de636d6259ba6afb1afa5d4d897ccf8bca9a6ea5d92d656c4ba4f2dd85c9d86d0e2445fd5db8692",
                 "303402181c5298437de413483c777e1133e62d5b81848747b89480bb021803b56152e323216bd9d9e403c8cd229a68014f6e2b69015d",
                 |pk, m, s| pk.verify::<Sha256>(m, s),
             ),
+            #[cfg(feature = "legacy-ec")]
             (
                 CurveId::Secp224k1,
                 "042ef983fa542b64472e2bc405d9eedd861acc9a7f814fad8275ce6b9a3459ba4ab52164883bd29eb6ac7e6d22ac7d302c053dc39684928ef9",
@@ -1561,7 +1586,7 @@ mod tests {
                 |pk, m, s| pk.verify::<Sha384>(m, s),
             ),
         ];
-        for (curve, key, sig, verify) in cases {
+        for &(curve, key, sig, verify) in cases {
             let pk = BoxedEcdsaPublicKey::from_sec1(curve, &from_hex(key)).unwrap();
             let sig = BoxedEcdsaSignature::from_der_for_curve(&from_hex(sig), curve).unwrap();
             verify(&pk, &msg, &sig).unwrap_or_else(|e| panic!("{curve:?}: {e:?}"));

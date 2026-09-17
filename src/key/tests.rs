@@ -615,11 +615,17 @@ fn boxed_ec_curves_report_their_own_algorithm() {
         (CurveId::BrainpoolP256r1, Algorithm::BrainpoolP256r1),
         (CurveId::BrainpoolP384r1, Algorithm::BrainpoolP384r1),
         (CurveId::BrainpoolP512r1, Algorithm::BrainpoolP512r1),
+        #[cfg(feature = "legacy-ec")]
         (CurveId::Secp160k1, Algorithm::Secp160k1),
+        #[cfg(feature = "legacy-ec")]
         (CurveId::Secp160r1, Algorithm::Secp160r1),
+        #[cfg(feature = "legacy-ec")]
         (CurveId::Secp160r2, Algorithm::Secp160r2),
+        #[cfg(feature = "legacy-ec")]
         (CurveId::Secp192k1, Algorithm::Secp192k1),
+        #[cfg(feature = "legacy-ec")]
         (CurveId::P192, Algorithm::P192),
+        #[cfg(feature = "legacy-ec")]
         (CurveId::Secp224k1, Algorithm::Secp224k1),
         (CurveId::P224, Algorithm::P224),
         (CurveId::BrainpoolP224r1, Algorithm::BrainpoolP224r1),
@@ -647,9 +653,13 @@ fn raw_ecdsa_signature_width_is_order_len_on_wide_order_curves() {
 
     let mut r = rng();
     for curve in [
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160k1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r2,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp224k1,
         CurveId::P224,
         CurveId::BrainpoolP320r1,

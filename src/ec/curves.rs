@@ -27,19 +27,30 @@ pub enum CurveId {
     BrainpoolP512r1,
     /// secp160k1 (SEC 2 v1 §2.4.1, `a = 0`). Koblitz curve over a 160-bit
     /// field whose group order is **161 bits** — the scalar width exceeds the
-    /// coordinate width by a byte.
+    /// coordinate width by a byte. Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp160k1,
     /// secp160r1 (SEC 2 v1 §2.4.2, `a = -3`). 160-bit field, 161-bit order.
+    /// Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp160r1,
     /// secp160r2 (SEC 2 v1 §2.4.3, `a = -3`). 160-bit field, 161-bit order.
+    /// Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp160r2,
-    /// secp192k1 (SEC 2 v2 §2.2.1, `a = 0`). 192-bit Koblitz curve.
+    /// secp192k1 (SEC 2 v2 §2.2.1, `a = 0`). 192-bit Koblitz curve. Requires
+    /// the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp192k1,
     /// NIST P-192 / secp192r1 / prime192v1 (`a = -3`; FIPS 186-4 D.1.2.1).
+    /// Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     P192,
     /// secp224k1 (SEC 2 v2 §2.3.1, `a = 0`). 224-bit Koblitz curve with a
     /// **225-bit** group order; `p ≡ 5 (mod 8)`, so point decompression goes
-    /// through the general Tonelli–Shanks square root.
+    /// through the general Tonelli–Shanks square root. Requires the
+    /// `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
     Secp224k1,
     /// NIST P-224 / secp224r1 (`a = -3`; FIPS 186-4 D.1.2.2). `p ≡ 1 (mod 4)`,
     /// so point decompression goes through Tonelli–Shanks.
@@ -184,6 +195,7 @@ impl CurveId {
             // bit wider than the field: `order_len` is 21 while `field_len`
             // is 20, so scalars, `r`/`s` and RFC 6979 octet strings are one
             // byte longer than coordinates.
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp160k1 => Params {
                 p: "fffffffffffffffffffffffffffffffeffffac73",
                 a: "00",
@@ -195,6 +207,7 @@ impl CurveId {
                 order_len: 21,
             },
             // SEC 2 v1 §2.4.2 — secp160r1 (161-bit order).
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp160r1 => Params {
                 p: "ffffffffffffffffffffffffffffffff7fffffff",
                 a: "ffffffffffffffffffffffffffffffff7ffffffc",
@@ -207,6 +220,7 @@ impl CurveId {
             },
             // SEC 2 v1 §2.4.3 — secp160r2 (same field as secp160k1, 161-bit
             // order).
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp160r2 => Params {
                 p: "fffffffffffffffffffffffffffffffeffffac73",
                 a: "fffffffffffffffffffffffffffffffeffffac70",
@@ -218,6 +232,7 @@ impl CurveId {
                 order_len: 21,
             },
             // SEC 2 v2 §2.2.1 — secp192k1.
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp192k1 => Params {
                 p: "fffffffffffffffffffffffffffffffffffffffeffffee37",
                 a: "00",
@@ -229,6 +244,7 @@ impl CurveId {
                 order_len: 24,
             },
             // FIPS 186-4 D.1.2.1 / SEC 2 v2 §2.2.2 — P-192 (secp192r1).
+            #[cfg(feature = "legacy-ec")]
             CurveId::P192 => Params {
                 p: "fffffffffffffffffffffffffffffffeffffffffffffffff",
                 a: "fffffffffffffffffffffffffffffffefffffffffffffffc",
@@ -240,6 +256,7 @@ impl CurveId {
                 order_len: 24,
             },
             // SEC 2 v2 §2.3.1 — secp224k1 (225-bit order).
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp224k1 => Params {
                 p: "fffffffffffffffffffffffffffffffffffffffffffffffeffffe56d",
                 a: "00",
@@ -313,8 +330,10 @@ impl CurveId {
         self.params().order_len
     }
 
-    /// Every supported curve, in declaration order.
-    pub const ALL: [CurveId; 17] = [
+    /// Every curve compiled into this build, in declaration order. The
+    /// sub-112-bit SEC 2 curves (secp160k1/r1/r2, secp192k1, P-192,
+    /// secp224k1) are present only with the `legacy-ec` feature.
+    pub const ALL: &'static [CurveId] = &[
         CurveId::P256,
         CurveId::P384,
         CurveId::P521,
@@ -323,11 +342,17 @@ impl CurveId {
         CurveId::BrainpoolP256r1,
         CurveId::BrainpoolP384r1,
         CurveId::BrainpoolP512r1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160k1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp160r2,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp192k1,
+        #[cfg(feature = "legacy-ec")]
         CurveId::P192,
+        #[cfg(feature = "legacy-ec")]
         CurveId::Secp224k1,
         CurveId::P224,
         CurveId::BrainpoolP224r1,
@@ -351,12 +376,18 @@ impl CurveId {
             CurveId::BrainpoolP224r1 => &[1, 3, 36, 3, 3, 2, 8, 1, 1, 5],
             CurveId::BrainpoolP320r1 => &[1, 3, 36, 3, 3, 2, 8, 1, 1, 9],
             // certicom-arc / SEC 2 named curves.
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp160k1 => &[1, 3, 132, 0, 9],
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp160r1 => &[1, 3, 132, 0, 8],
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp160r2 => &[1, 3, 132, 0, 30],
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp192k1 => &[1, 3, 132, 0, 31],
             // prime192v1 (ANSI X9.62), the same curve as secp192r1.
+            #[cfg(feature = "legacy-ec")]
             CurveId::P192 => &[1, 2, 840, 10045, 3, 1, 1],
+            #[cfg(feature = "legacy-ec")]
             CurveId::Secp224k1 => &[1, 3, 132, 0, 32],
             CurveId::P224 => &[1, 3, 132, 0, 33],
         }
@@ -366,7 +397,8 @@ impl CurveId {
     #[cfg(feature = "der")]
     pub(crate) fn from_named_curve_oid(arcs: &[u64]) -> Option<CurveId> {
         Self::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .find(|id| id.named_curve_oid() == arcs)
     }
 }
@@ -436,7 +468,7 @@ mod tests {
 
     #[test]
     fn all_curves_consistent() {
-        for id in CurveId::ALL {
+        for &id in CurveId::ALL {
             check(id);
         }
     }
@@ -447,15 +479,24 @@ mod tests {
     #[test]
     fn small_curves_consistent() {
         for id in [
+            CurveId::P224,
+            CurveId::BrainpoolP224r1,
+            CurveId::BrainpoolP320r1,
+        ] {
+            check(id);
+        }
+    }
+
+    #[cfg(feature = "legacy-ec")]
+    #[test]
+    fn legacy_curves_consistent() {
+        for id in [
             CurveId::Secp160k1,
             CurveId::Secp160r1,
             CurveId::Secp160r2,
             CurveId::Secp192k1,
             CurveId::P192,
             CurveId::Secp224k1,
-            CurveId::P224,
-            CurveId::BrainpoolP224r1,
-            CurveId::BrainpoolP320r1,
         ] {
             check(id);
         }
@@ -477,18 +518,24 @@ mod tests {
     #[cfg(feature = "der")]
     #[test]
     fn named_curve_oids_round_trip_and_are_distinct() {
-        for id in CurveId::ALL {
+        for &id in CurveId::ALL {
             assert_eq!(
                 CurveId::from_named_curve_oid(id.named_curve_oid()),
                 Some(id)
             );
-            for other in CurveId::ALL {
+            for &other in CurveId::ALL {
                 assert!(other == id || other.named_curve_oid() != id.named_curve_oid());
             }
         }
+        #[cfg(feature = "legacy-ec")]
         assert_eq!(
             CurveId::from_named_curve_oid(&[1, 2, 840, 10045, 3, 1, 1]),
             Some(CurveId::P192)
+        );
+        #[cfg(not(feature = "legacy-ec"))]
+        assert_eq!(
+            CurveId::from_named_curve_oid(&[1, 2, 840, 10045, 3, 1, 1]),
+            None
         );
         assert_eq!(
             CurveId::from_named_curve_oid(&[1, 3, 132, 0, 33]),

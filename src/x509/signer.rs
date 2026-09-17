@@ -225,16 +225,17 @@ impl CertSigner<'_> {
             CertSigner::Rsa(_) => oid::SHA256_WITH_RSA,
             CertSigner::RsaPss(..) => oid::ID_RSASSA_PSS,
             CertSigner::Ecdsa(k) => match k.curve() {
-                CurveId::P256
-                | CurveId::Secp256k1
-                | CurveId::Sm2p256v1
-                | CurveId::BrainpoolP256r1
-                | CurveId::Secp160k1
+                #[cfg(feature = "legacy-ec")]
+                CurveId::Secp160k1
                 | CurveId::Secp160r1
                 | CurveId::Secp160r2
                 | CurveId::Secp192k1
                 | CurveId::P192
-                | CurveId::Secp224k1
+                | CurveId::Secp224k1 => oid::ECDSA_WITH_SHA256,
+                CurveId::P256
+                | CurveId::Secp256k1
+                | CurveId::Sm2p256v1
+                | CurveId::BrainpoolP256r1
                 | CurveId::P224
                 | CurveId::BrainpoolP224r1 => oid::ECDSA_WITH_SHA256,
                 CurveId::P384 | CurveId::BrainpoolP384r1 | CurveId::BrainpoolP320r1 => {
@@ -286,16 +287,17 @@ impl CertSigner<'_> {
                 let curve = k.curve();
                 // Must agree with `sig_alg_oid` above.
                 let sig = match curve {
-                    CurveId::P256
-                    | CurveId::Secp256k1
-                    | CurveId::Sm2p256v1
-                    | CurveId::BrainpoolP256r1
-                    | CurveId::Secp160k1
+                    #[cfg(feature = "legacy-ec")]
+                    CurveId::Secp160k1
                     | CurveId::Secp160r1
                     | CurveId::Secp160r2
                     | CurveId::Secp192k1
                     | CurveId::P192
-                    | CurveId::Secp224k1
+                    | CurveId::Secp224k1 => k.sign::<Sha256>(tbs),
+                    CurveId::P256
+                    | CurveId::Secp256k1
+                    | CurveId::Sm2p256v1
+                    | CurveId::BrainpoolP256r1
                     | CurveId::P224
                     | CurveId::BrainpoolP224r1 => k.sign::<Sha256>(tbs),
                     CurveId::P384 | CurveId::BrainpoolP384r1 | CurveId::BrainpoolP320r1 => {

@@ -36,6 +36,15 @@
 //!   …). These are gated on `alloc` in *both* directions: the `der` encoders and
 //!   its OID parser allocate, so `from_pkcs8_der` needs `alloc` as much as
 //!   `to_pkcs8_der` does.
+//!
+//! # With `legacy-ec`
+//!
+//! The opt-in `legacy-ec` feature (which implies `alloc`) adds the curves
+//! below the 112-bit security level or deprecated by SP 800-186: the SEC 2
+//! curves secp160k1/r1/r2, secp192k1, P-192 and secp224k1 as further
+//! [`CurveId`] variants, and ECDH on the binary-field curves sect283/409/571
+//! k1/r1 in [`binary`]. They exist for interop with old certificates and
+//! test corpora; never pick them for new designs.
 #![cfg_attr(
     not(feature = "alloc"),
     doc = "",
@@ -43,8 +52,13 @@
     doc = "[`CurveId`]: crate::ec#without-alloc",
     doc = "[`sm2`]: crate::ec#without-alloc"
 )]
+#![cfg_attr(
+    not(feature = "legacy-ec"),
+    doc = "",
+    doc = "[`binary`]: crate::ec#with-legacy-ec"
+)]
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "legacy-ec")]
 pub mod binary;
 #[cfg(feature = "alloc")]
 pub mod boxed;

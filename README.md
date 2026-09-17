@@ -147,7 +147,8 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `fpe` | NIST SP 800-38G FF1 format-preserving encryption over AES, any radix up to 65536 (opt-in) |
 | `chunked` | C2SP chunked encryption (Cobblestone-128/256): streaming, seekable, key-committing AES-GCM (opt-in) |
 | `jose` | JWK / JWK Sets, JWS and JWE (RFC 7515-7518, 8037) with a strict self-contained JSON parser |
-| `ec` | ECDSA/ECDH on P-192, P-224, P-256, P-384, P-521, secp160/192/224 (k1/r1/r2), secp256k1, Brainpool (224–512), ECDH on the binary curves sect283/409/571 (k1/r1); X25519, X448, Ed25519, Ed448; SM2 signature and encryption (P-256 and secp256k1 ECDSA — with Bitcoin/Ethereum key recovery — need no `alloc`) |
+| `ec` | ECDSA/ECDH on P-224, P-256, P-384, P-521, secp256k1, Brainpool (224–512); X25519, X448, Ed25519, Ed448; SM2 signature and encryption (P-256 and secp256k1 ECDSA — with Bitcoin/Ethereum key recovery — need no `alloc`); with `legacy-ec`: P-192, secp160/192/224 (k1/r1/r2) and ECDH on the binary curves sect283/409/571 (k1/r1) |
+>>>>>>> 9e7440c (build(ec): legacy-ec feature for the sub-112-bit and binary curves)
 | `legacy-ec` | Curves below the 112-bit level or deprecated by SP 800-186: secp160k1/r1/r2, secp192k1, P-192, secp224k1 and the binary curves sect283/409/571 k1/r1 (ECDH only); interop with old certificates only (opt-in) |
 | `bip340` | BIP340 Schnorr signatures over secp256k1 |
 | `zkp-*` | Experimental secp256k1 extensions mirroring `secp256k1-zkp`: sign-to-contract, ECDSA adaptor signatures, Pedersen commitments, Borromean range proofs, asset surjection proofs, half-aggregation, ring-signature whitelisting (`zkp` enables all; no semver guarantee) |
@@ -180,8 +181,9 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 
 The default feature set is `std` plus most modules and the CLI. Opt-in
 features are `quic`, `hpke`, `ech`, `falcon`, `ristretto255`, `bip340`, the
-`zkp-*` set, the `hazmat-*` set, `tls-legacy`, `wasi-getrandom`, `ffi`,
-`tokio` and `mio`. Disable the defaults for a `no_std` build and re-enable
+`zkp-*` set, the `hazmat-*` set, `dsa`, `bls`, `fpe`, `chunked`,
+`legacy-ec`, `legacy-ciphers`, `vmac`, `tls-legacy`, `wasi-getrandom`,
+`ffi`, `tokio` and `mio`. Disable the defaults for a `no_std` build and re-enable
 only what you need:
 
 ```toml

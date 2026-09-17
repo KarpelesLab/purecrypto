@@ -1,6 +1,9 @@
 //! ECDH on the SEC 2 binary curves sect283k1/r1, sect409k1/r1 and
 //! sect571k1/r1 (`ecdh_sect*`): the peer key is an SPKI, the private key a
 //! raw scalar, the shared secret the x-coordinate of `d·Q`.
+//!
+//! The binary curves need the crate's `legacy-ec` feature.
+#![cfg(feature = "legacy-ec")]
 
 use crate::common::{Expected, Fields, Outcome, check_eq, load, run_with};
 use purecrypto::ec::binary::{BinaryCurveId, BinaryPrivateKey, BinaryPublicKey};
