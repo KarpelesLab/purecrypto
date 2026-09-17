@@ -58,6 +58,7 @@ fn mulhi_128_by_64(a: u128, b: u64) -> u64 {
 
 /// Constant-time `v mod p` for `v, p < 2^32` (`p` public, nonzero), by the
 /// same reciprocal trick with a 64-bit reciprocal.
+#[cfg(feature = "alloc")]
 pub(crate) fn mod_u32_ct(v: u64, p: u64) -> u64 {
     debug_assert!(p > 0 && p < (1 << 32) && v < (1 << 32));
     let c = u64::MAX / p + 1;

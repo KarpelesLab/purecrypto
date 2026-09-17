@@ -42,4 +42,6 @@ pub use inverse::inv_mod;
 pub use inverse::inv_mod_boxed;
 pub use montgomery::MontModulus;
 pub use uint::{LIMB_BITS, Limb, Uint};
-pub(crate) use uint::{mod_small_limbs, mod_u32_ct, trailing_zeros_step};
+#[cfg(feature = "alloc")]
+pub(crate) use uint::mod_u32_ct;
+pub(crate) use uint::{mod_small_limbs, trailing_zeros_step};
