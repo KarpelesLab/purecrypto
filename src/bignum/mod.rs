@@ -42,7 +42,15 @@ pub use inverse::inv_mod;
 #[cfg(feature = "alloc")]
 pub use inverse::inv_mod_boxed;
 pub use montgomery::MontModulus;
-#[cfg(feature = "alloc")]
+// The prime-testing helpers are only reached from `prime` (above) and
+// `rsa::prime`; gate them the same way so other feature sets stay free of
+// dead code.
+#[cfg(all(
+    feature = "alloc",
+    feature = "rng",
+    any(feature = "rsa", feature = "dh", feature = "dsa")
+))]
 pub(crate) use uint::mod_u32_ct;
 pub use uint::{LIMB_BITS, Limb, Uint};
+#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
 pub(crate) use uint::{mod_small_limbs, trailing_zeros_step};
