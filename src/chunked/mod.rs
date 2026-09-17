@@ -48,7 +48,7 @@
 //! use purecrypto::rng::OsRng;
 //!
 //! let key = [0x42u8; 16];
-//! let ct = encrypt::<Cobblestone128>(&key, b"app context", b"hello", &mut rng()).unwrap();
+//! let ct = encrypt::<Cobblestone128>(&key, b"app context", b"hello", &mut OsRng).unwrap();
 //! assert_eq!(ct.len(), 56 + 5 + 16);
 //! assert_eq!(decrypt::<Cobblestone128>(&key, b"app context", &ct).unwrap(), b"hello");
 //! assert!(decrypt::<Cobblestone128>(&key, b"other context", &ct).is_err());
