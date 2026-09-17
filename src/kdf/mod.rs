@@ -7,6 +7,8 @@
 //!  - [`scrypt`] — RFC 7914, memory-hard PBKDF (requires `alloc`).
 //!  - [`bcrypt_pbkdf`] — OpenSSH's PBKDF over Blowfish, used to protect
 //!    new-format SSH private keys (requires `alloc`).
+//!  - [`concat_kdf`] — NIST SP 800-56A §5.8.1 single-step (Concatenation)
+//!    KDF, used by JOSE `ECDH-ES`.
 #![cfg_attr(
     not(feature = "alloc"),
     doc = "",
@@ -22,6 +24,7 @@ pub mod argon2;
 // BcryptPbkdfError.
 #[cfg(feature = "alloc")]
 mod bcrypt_pbkdf;
+mod concat;
 mod hkdf;
 mod kbkdf;
 #[cfg(all(feature = "alloc", feature = "der", feature = "rng"))]
@@ -32,6 +35,7 @@ pub mod scrypt;
 
 #[cfg(feature = "alloc")]
 pub use bcrypt_pbkdf::{Error as BcryptPbkdfError, bcrypt_pbkdf};
+pub use concat::{Error as ConcatKdfError, concat_kdf};
 pub use hkdf::{
     Error as HkdfError, hkdf, hkdf_expand, hkdf_extract, hkdf_extract_parts, try_hkdf,
     try_hkdf_expand, try_hkdf_expand_parts,

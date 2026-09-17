@@ -1069,6 +1069,21 @@ impl BoxedRsaPrivateKey {
         &self.n
     }
 
+    /// The private exponent `d`.
+    pub fn private_exponent(&self) -> &BoxedUint {
+        &self.d
+    }
+
+    /// The prime factors `(p, q)`, or `None` for a key built with
+    /// [`from_components`](Self::from_components) (which carries none).
+    pub fn primes(&self) -> Option<(&BoxedUint, &BoxedUint)> {
+        if self.p.is_zero() || self.q.is_zero() {
+            None
+        } else {
+            Some((&self.p, &self.q))
+        }
+    }
+
     /// Signs `msg` with PKCS#1 v1.5, hashing with `D`.
     pub fn sign_pkcs1v15<D: Pkcs1Digest>(&self, msg: &[u8]) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; self.k];
