@@ -118,7 +118,10 @@ cc app.c -I include target/release/libpurecrypto.a -lpthread -ldl -lm -o app
   primitives, and the fixed-curve half of `ec`, need no allocator at all.
 - **Validated.** Where a standard publishes test vectors they run in CI
   (RFC 8439, RFC 8032, RFC 8448, FIPS 203/204/205 ACVP, BIP340, and more),
-  and the X.509, TLS and PQC stacks are cross-checked against OpenSSL 3.5.
+  the applicable [Wycheproof](https://github.com/C2SP/wycheproof) corpus
+  (222 files: AEADs, cipher modes, MACs, KDFs, ECDSA/ECDH/EdDSA/XDH, RSA,
+  ML-KEM, ML-DSA) runs through the public API, and the X.509, TLS and PQC
+  stacks are cross-checked against OpenSSL 3.5.
   See [docs/validation.md](docs/validation.md).
 
 ## What is inside

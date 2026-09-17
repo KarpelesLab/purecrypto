@@ -56,7 +56,8 @@ INCLUDE = [
     # RSA
     r"^rsa_signature_\d+_sha.*$",
     r"^rsa_pkcs1_\d+(_sig_gen)?$",
-    r"^rsa_pss_.*$",
+    # RFC 8702 SHAKE-based PSS is not implemented; every other PSS file is.
+    r"^rsa_pss_(?!.*shake).*$",
     r"^rsa_oaep_\d+_.*$",
     r"^rsa_oaep_misc$",
     r"^primality$",

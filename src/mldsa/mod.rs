@@ -561,10 +561,12 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             z[i] = y[i].add(&cs1);
             wipe_polys(core::slice::from_mut(&mut cs1));
         }
-        if vec_inf_norm(&z) >= p.gamma1 - p.beta {
-            kappa += L as u16;
-            continue;
-        }
+        // FIPS 204 Algorithm 7 tests ‖z‖∞ and ‖r0‖∞ *jointly* (line 23), and
+        // ‖ct0‖∞ with the hint count jointly (line 30). Keep that grouping:
+        // computing r0 before branching on z (and the hints before branching
+        // on ct0) means a rejected attempt's duration does not say which of
+        // the two bounds it failed. The attempt count itself is public.
+        let z_bad = vec_inf_norm(&z) >= p.gamma1 - p.beta;
 
         // r0 = LowBits(w − c·s2).
         for i in 0..K {
@@ -576,7 +578,8 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             }
             wipe_polys(core::slice::from_mut(&mut cs2));
         }
-        if vec_inf_norm_signed(&r0) >= (p.gamma2 - p.beta) as i32 {
+        let r0_bad = vec_inf_norm_signed(&r0) >= (p.gamma2 - p.beta) as i32;
+        if z_bad | r0_bad {
             kappa += L as u16;
             continue;
         }
@@ -586,10 +589,7 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             ct0[i] = ntt_mul(&c_ntt, &t0_ntt[i]);
             ct0[i].inv_ntt();
         }
-        if vec_inf_norm(&ct0) >= p.gamma2 {
-            kappa += L as u16;
-            continue;
-        }
+        let ct0_bad = vec_inf_norm(&ct0) >= p.gamma2;
 
         // Hints.
         let mut hints = [Poly::zero(); K];
@@ -602,7 +602,8 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             }
             wipe_polys(core::slice::from_mut(&mut cs2));
         }
-        if count_ones(&hints) > p.omega {
+        let hint_bad = count_ones(&hints) > p.omega;
+        if ct0_bad | hint_bad {
             kappa += L as u16;
             continue;
         }

@@ -21,35 +21,41 @@ recommended *safe* subset of the API, see
   fail-closed parsing, padding-oracle hardening, bounds tightening).
 - **Constant-time posture is "by construction,"** resting on the [`ct`](../src/ct)
   primitives and the unconditional [`bignum`](../src/bignum) layer (see the
-  [Constant-time posture](#constant-time-posture) section). It has **not** been
-  validated with a timing-analysis tool (dudect/ctgrind/etc.) or a formal CT
-  audit; the `ct` module documents this explicitly as best-effort at the source
-  level.
+  [Constant-time posture](#constant-time-posture) section). A source-level
+  constant-time review of every module was performed by Claude Fable 5.1 on
+  2026-09-17 (secret inputs enumerated per operation, then every branch,
+  memory index and variable-latency instruction on their data paths
+  checked); its findings are fixed or listed under
+  [Known residuals](#known-constant-time-residuals). It has **not** been
+  validated with a timing-analysis tool (dudect/ctgrind/etc.) or a formal
+  third-party CT audit; the `ct` module documents this explicitly as
+  best-effort at the source level.
 
 ## At-a-glance matrix
 
 KAT source legend: **ACVP** = NIST ACVP test vectors · **RFC** = the RFC's own
 vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
-**ref** = upstream reference-implementation vectors · **unit** = inline /
-hand-derived correctness tests.
+**ref** = upstream reference-implementation vectors · **Wycheproof** = the
+[C2SP/Wycheproof](https://github.com/C2SP/wycheproof) edge-case corpus (see
+[below](#wycheproof)) · **unit** = inline / hand-derived correctness tests.
 
 | Module | Standards | KAT source | Cross-impl interop | Fuzzed | Const-time |
 |---|---|---|---|---|---|
 | `ct` | — (foundation) | unit (exhaustive u8/i8) | — | — | foundation |
 | `bignum` | — (foundation) | unit | — | — | yes (unconditional) |
-| `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2) | RFC / NIST samples; M14 oracle-derived (K12-validated), cross-checked vs noble-hashes | OpenSSL (Whirlpool, SM3, SHAKE, BLAKE2), PyCryptodome (MD2), gostcrypto (Streebog), noble-hashes (M14, 14-round) | — | MAC verify CT |
+| `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2) | RFC / NIST samples; **Wycheproof** (HMAC ×12, KMAC); M14 oracle-derived (K12-validated), cross-checked vs noble-hashes | OpenSSL (Whirlpool, SM3, SHAKE, BLAKE2), PyCryptodome (MD2), gostcrypto (Streebog), noble-hashes (M14, 14-round) | — | MAC verify CT |
 | `mac` | RFC 4418 (UMAC) | RFC | — | — | built on CT AES |
 | `rng` | SP 800-90A (HMAC-DRBG) | CAVP | — | — | n/a (public output) |
-| `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713 | RFC / NIST | — | — | AES table-free; ARX |
-| `kdf` | RFC 8018/5869/7914, SP 800-108 | RFC / CAVP | — | `pbes2_decrypt` | built on CT HMAC |
-| `ascon` | NIST SP 800-232 (final) | ref KAT | — | — | permutation (no tables) |
+| `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713 | RFC / NIST; **Wycheproof** (GCM, GCM-SIV, CCM, ChaCha20/XChaCha20-Poly1305, AEGIS, GMAC, CBC, CMAC, SIV, KW/KWP, XTS; ARIA/Camellia/SM4 modes) | — | — | AES table-free; ARX |
+| `kdf` | RFC 8018/5869/7914, SP 800-108 | RFC / CAVP; **Wycheproof** (HKDF, PBKDF2, PBES2) | — | `pbes2_decrypt` | built on CT HMAC |
+| `ascon` | NIST SP 800-232 (final) | ref KAT; **Wycheproof** | — | — | permutation (no tables) |
 | `der` | ITU-T X.690 | unit | — | `der_reader`, `pem_decode` | n/a (public) |
-| `rsa` | RFC 8017 (PKCS#1 v1.5, PSS, OAEP) | unit | X.509 SPKI path | `pkcs8_rsa` | base-blinded |
-| `ec` | FIPS 186, RFC 8032 (EdDSA), RFC 7748 (X25519/X448) | RFC / unit | OpenSSL (X25519 PKCS#8, ECDSA via dgst) | `ecdsa_sig_der`, `pkcs8_ed25519`, `spki_pubkey` | complete formulas / ladder |
+| `rsa` | RFC 8017 (PKCS#1 v1.5, PSS, OAEP) | unit; **Wycheproof** (v1.5 verify/sign/decrypt, PSS, OAEP, primality) | X.509 SPKI path | `pkcs8_rsa` | base-blinded; CT-shaped keygen |
+| `ec` | FIPS 186, RFC 8032 (EdDSA), RFC 7748 (X25519/X448) | RFC / unit; **Wycheproof** (ECDSA DER + P1363 on 7 curves × SHA-2/SHA-3/SHAKE, ECDH SPKI + raw, X25519/X448 + SPKI, Ed25519/Ed448, curve parameters) | OpenSSL (X25519 PKCS#8, ECDSA via dgst) | `ecdsa_sig_der`, `pkcs8_ed25519`, `spki_pubkey` | complete formulas / ladder |
 | `dh` | RFC 3526, RFC 4419, SP 800-56A checks | unit | — (SSH/legacy-TLS groups) | `dh_share` | modexp on CT bignum |
 | `key` | — (facade over the above) | unit (incl. OpenSSL X25519 PKCS#8) | inherits | `spki_pubkey`, `pkcs8_*` | inherits |
-| `mlkem` | FIPS 203 | unit + OpenSSL 3.5 | OpenSSL (SPKI, ct/ss) | `mlkem_pkcs8` | CT decaps + implicit rejection |
-| `mldsa` | FIPS 204 | **ACVP** (keygen/siggen/sigver, all levels) | OpenSSL (SPKI) | `pkcs8_mldsa`, `mldsa_verify` | hedged; CT compare + wipe |
+| `mlkem` | FIPS 203 | **ACVP** + OpenSSL 3.5; **Wycheproof** (keygen, encaps, decaps, malformed keys) | OpenSSL (SPKI, ct/ss) | `mlkem_pkcs8` | CT decaps + implicit rejection |
+| `mldsa` | FIPS 204 | **ACVP** (keygen/siggen/sigver, all levels); **Wycheproof** (verify, sign from seed / expanded key, contexts) | OpenSSL (SPKI) | `pkcs8_mldsa`, `mldsa_verify` | hedged; CT compare + wipe |
 | `slhdsa` | FIPS 205 | **ACVP** (keygen/siggen/sigver) | — | `pkcs8_slhdsa`, `slhdsa_verify` | hedged; wipe-on-drop |
 | `falcon` | FN-DSA / FIPS 206 draft | ref (samplerz KAT) + unit | — | `falcon_verify` | signing CT (FPEMU); keygen best-effort |
 | `lms` | RFC 8554, SP 800-208 | **RFC 8554 App. F** | ref vectors | `lms_parse` | n/a (hash-based, **stateful**) |
@@ -87,6 +93,36 @@ hand-derived correctness tests.
   (NIST SP 800-38C/D, RFC 8439/8452, RFC 3713), HMAC-DRBG and KBKDF (NIST
   **CAVP**), PBKDF2/HKDF (RFC 8018 / RFC 5869), UMAC (RFC 4418), Ascon (NIST SP
   800-232 reference KATs).
+
+### Wycheproof
+
+The applicable part of the Wycheproof corpus (upstream `testvectors_v1`,
+commit `3fa63dd`) is checked in as `testdata/wycheproof/*.txt` — a flat
+`key=value` re-encoding produced by `tools/wycheproof/convert.py`, so the
+vectors need no JSON parser — and runs in `tests/wycheproof/` through the
+**public API only**. Policy (`tests/wycheproof/common.rs`): every `valid`
+case must be accepted with the expected output, every `invalid` case must
+be rejected, `acceptable` cases are pinned per flag by each module, and a
+file whose cases were all skipped fails. Coverage at the time of writing:
+
+| Family | Files | Cases (valid / invalid / acceptable) | Notes |
+|---|---|---|---|
+| AEADs (AES/ARIA/SM4-GCM, GCM-SIV, AES/ARIA/Camellia/SM4-CCM, ChaCha20-/XChaCha20-Poly1305, AEGIS-128L/256, Ascon-AEAD128, GMAC) | 14 | 3461 / 1569 / 0 | all tag lengths CCM defines; wrong-length nonces/keys rejected via the `try_*` APIs |
+| Block-cipher modes (CBC/PKCS#7, CMAC, AES-SIV incl. AES-192, KW/KWP, XTS over AES/ARIA/Camellia) | 14 | 1146 / 2880 / 9 | `Cbc` is unpadded by design; the harness pads |
+| HMAC (SHA-1/2/3, SHA-512/t, SM3), KMAC | 14 | 957 / 1558 / 0 | truncated tags prefix-compared; `verify` is length-strict |
+| HKDF, PBKDF2, PBES2 | 24 | 1884 / 12 / 0 | one PBKDF2 case skipped (16M iterations); PBES2 vectors are the bare RFC 8018 primitive, checked through PBKDF2 + CBC and — where in the wrapper's algorithm set — asserted to hit the 10 000-iteration floor |
+| ECDSA (P-256/384/521, secp256k1, brainpoolP256/384/512r1 × SHA-2, SHA-3, SHAKE; DER and P1363; Bitcoin low-s) | 42 | 8780 / 9527 / 0 | SPKI keys cross-checked against SEC1; P-256 and secp256k1 also through the fixed-size types |
+| ECDH (SPKI and raw points, 7 curves), curve parameters | 11 | 5945 / 474 / 1610 | all wrong-curve / twist / explicit-parameter keys rejected; 19 unsupported curves skipped in `ec_prime_order_curves` |
+| X25519, X448 (raw and SPKI/PKCS#8), Ed25519, Ed448 | 6 | 1140 / 195 / 997 | zero-shared-secret peers are an error (`SmallOrderPeer`) |
+| RSA PKCS#1 v1.5 verify (SHA-2, SHA-512/t, SHA-3), deterministic signing, decryption | 32 | 377 / 6082 / 102 | `MissingNull` DigestInfo rejected; implicit-rejection decrypt cross-checked |
+| RSA-PSS, RSA-OAEP, primality | 32 | 1763 / 1219 / 11 | groups whose MGF1 hash differs from the message hash need the `_mgf` APIs; SHAKE-PSS (RFC 8702) is not implemented and its files are excluded |
+| ML-KEM (keygen, encaps, decaps, malformed keys), ML-DSA (verify, sign from seed and expanded key, contexts) | 21 | 1829 / 965 / 0 | 69 ML-DSA "external mu" cases skipped (no `Sign_internal(mu)` entry point) |
+
+The corpus found one crate bug (the SPKI parser accepted trailing bytes
+after a well-formed key) and one coverage gap (no AES-192-SIV), both fixed;
+the SHA-3 / SHA-512/t PKCS#1 DigestInfo prefixes were added so those
+signature files could run. Regenerate after an upstream update with the
+commands in `tools/wycheproof/README.md`.
 
 ## Cross-implementation interop
 
@@ -160,7 +196,14 @@ Reported as **what the code is built to do** — not as an audited guarantee.
   ChaCha20/Poly1305 are ARX/limb arithmetic; GHASH is a branchless table-free
   field multiply.
 - **RSA**: private-key operations are **base-blinded** (Coron) with a per-call
-  blinder; prime generation is variable-time (one-time keygen, documented).
+  blinder; PKCS#1 v1.5 / OAEP decoding fuses every padding check into one
+  verdict and moves the recovered message with a barrel shifter rather than a
+  secret-offset slice. Key generation is shaped independently of the primes
+  it produces: `d = e⁻¹ mod φ(n)` comes from a fixed-trip-count binary
+  extended GCD (`bignum::inv_mod_ct`), trial division uses a
+  multiply-by-reciprocal instead of a division instruction, and each
+  Miller-Rabin round runs a fixed number of squarings. Only the *number* of
+  rejected candidates is observable.
 - **EC**: complete (Renes–Costello–Batina) addition for the Weierstrass curves,
   Montgomery ladder with constant-time swaps for X25519/X448, constant-time
   selection for Ed25519/Ed448.
@@ -179,6 +222,32 @@ Reported as **what the code is built to do** — not as an audited guarantee.
 - **Not timing-sensitive / public**: `der`, `rng` output, hashing of public
   data, the hash-based stateful signers (LMS/XMSS, whose chain lengths depend on
   the public message hash).
+
+### Known constant-time residuals
+
+What the 2026-09 review left in place, each deliberate and documented at the
+code site:
+
+- **Legacy CBC (`tls-legacy`)**: the Lucky13 mitigation equalises the
+  compression-block count but not the per-call overhead of the padding
+  hashes, and SSL 3.0 skips the equaliser entirely (POODLE makes SSL 3.0
+  unfixable regardless). Off by default.
+- **DES/3DES and Blowfish (bcrypt)** use S-box tables indexed by key-derived
+  data — inherent to those designs, kept for legacy interop and
+  `bcrypt_pbkdf` compatibility (the AES/ARIA/Camellia/SM4 cores are
+  table-free).
+- **Falcon key generation and secret-key import** run the NTRU solver on
+  variable-time big integers, as the module documents; signing and
+  verification are data-oblivious.
+- **Argon2d/id data-dependent addressing and scrypt's `Integerify`** are the
+  algorithms' design.
+- **PBES2 CBC-PAD envelopes** carry no integrity tag, so "padding valid"
+  is observable by construction; `decrypt_authenticated` refuses them.
+- **Rejection-sampling loop counts** (ML-DSA signing, ECDSA nonce, ML-DSA
+  challenge, surjection-proof subset draws) are public per specification;
+  the work inside each attempt is constant-shaped.
+- **`debug_assert!`s on secret-derived bits** (e.g. in `Choice::from`) exist
+  only in debug builds.
 
 ## Known limitations & non-goals
 
