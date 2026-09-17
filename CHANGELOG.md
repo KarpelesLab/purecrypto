@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/KarpelesLab/purecrypto/compare/v0.9.0...v0.9.1) - 2026-09-17
+
+### Added
+
+- *(jose)* JWK, JWS and JWE (RFC 7515-7518, 8037)
+- *(bls)* BLS12-381, RFC 9380 hash-to-curve and BLS signatures
+- *(cipher)* AES-EAX, SEED, MORUS, AEGIS-128, Ascon v1.2 and AES-CBC-HMAC-SHA2
+- *(ec)* secp160/192/224 (k1/r1/r2), brainpoolP224r1 and P320r1
+- *(rsa)* multi-prime private keys and RFC 8702 SHAKE-PSS
+- *(ec)* binary-field curves sect283/409/571 k1/r1 for ECDH
+- *(dsa)* FIPS 186-4 DSA with RFC 6979 signing
+- *(mac)* SipHash-c-d / SipHashX and VMAC-64/128
+- *(chunked)* C2SP chunked encryption (Cobblestone-128/256)
+- *(fpe)* NIST SP 800-38G FF1
+- *(rsa)* PSS and OAEP with an MGF1 hash distinct from the message hash
+- *(cipher)* AES-192-SIV (48-byte key) alongside the 128/256 forms
+
+### Fixed
+
+- *(ct)* route the ECH accept-signal and PKCS#12 MAC compares through ct_eq
+- *(ct)* barrier symmetric-layer masks, wipe MAC/KDF scratch, UMAC verify, Falcon keygen docs
+- *(ct)* constant-time RSA key generation and secret-offset copies
+- *(ct)* branch-free ML-DSA hint bit and Falcon encode/sampler helpers
+
+### Other
+
+- *(chunked)* restore OsRng in the module example
+- keep every single-feature build clippy- and rustdoc-clean; cover the new features in CI
+- *(ec)* legacy-ec feature for the sub-112-bit and binary curves
+- *(cipher,mac)* legacy-ciphers and vmac opt-in features; opt-in docs
+- dsa, bls, fpe and chunked off by default; declare legacy-ec, legacy-ciphers and vmac
+- full Wycheproof coverage (343 files) and the new modules in the validation matrix
+- *(bignum)* gate the prime-testing helpers on the features that use them
+- *(jose)* use cipher::CbcHmacSha2 for the CBC-HMAC content encryption
+- scaffold dsa, bls, fpe, jose, chunked and binary-curve modules; convert the whole Wycheproof corpus
+- Wycheproof coverage after the MGF-hash PSS/OAEP forms
+- *(rsa)* drop the private-item link from the is_prime docs
+- rustfmt the bignum re-exports
+- *(bignum)* gate the alloc-only reciprocal helper so lean builds stay warning-free
+- Wycheproof coverage and the 2026-09 constant-time review in validation.md
+- *(wycheproof)* ECDH, X25519/X448 and EdDSA coverage
+- *(wycheproof)* RSA PKCS#1 v1.5, PSS, OAEP and primality coverage
+- *(wycheproof)* ML-KEM and ML-DSA coverage
+- *(wycheproof)* ECDSA coverage for every supported curve and hash
+- *(wycheproof)* HMAC, KMAC, HKDF, PBKDF2 and PBES2 coverage
+- *(wycheproof)* AEAD family coverage
+- *(wycheproof)* CBC, CMAC, SIV, key-wrap and XTS coverage
+- *(wycheproof)* describe the vector format, policy and update procedure
+- *(wycheproof)* register the per-family harness modules
+- Wycheproof vector harness, converter and AES-GCM coverage
+
 ## [0.9.0](https://github.com/KarpelesLab/purecrypto/compare/v0.8.7...v0.9.0) - 2026-09-16
 
 ### Added
