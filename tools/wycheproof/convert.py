@@ -16,7 +16,10 @@ with `.` (`publicKey.wx=...`); string arrays (flags) are `,`-joined. A
 whose value is PEM / JWK (multi-line or structured) are dropped, as are
 top-level `notes`/`header`. Everything else (hex, ints, identifiers, booleans)
 is written verbatim, except that `%` and whitespace inside a value are
-percent-encoded (`%20`).
+percent-encoded (`%20`). PEM values keep their newlines as `%0A` (a PEM/JWK
+key that duplicates a sibling DER field is dropped); a value
+that is a JSON object with nested objects/arrays (a JWK set) or an array of
+objects is kept as compact JSON, percent-encoded.
 
 Usage:
     convert.py <wycheproof-checkout> <out-dir>
@@ -31,56 +34,32 @@ import subprocess
 import sys
 
 INCLUDE = [
-    # AEAD / cipher modes / MACs on block ciphers
-    r"^aes_(gcm|gcm_siv|ccm|cbc_pkcs5|cmac|gmac|siv_cmac|wrap|kwp|xts)$",
-    r"^aead_aes_siv_cmac$",
-    r"^aegis(128L|256)$",
-    r"^aria_(gcm|ccm|cbc_pkcs5|cmac|wrap|kwp)$",
-    r"^camellia_(ccm|cbc_pkcs5|cmac|wrap)$",
-    r"^sm4_(gcm|ccm)$",
-    r"^ascon_sp800_232_aead128$",
-    r"^x?chacha20_poly1305$",
-    # MACs / KDFs
-    r"^hmac_(sha1|sha224|sha256|sha384|sha512|sha512_224|sha512_256|sha3_224|sha3_256|sha3_384|sha3_512|sm3)$",
-    r"^kmac(128|256)_no_customization$",
-    r"^hkdf_sha(1|256|384|512)$",
-    r"^pbkdf2_hmacsha(1|224|256|384|512)$",
-    r"^pbes2_hmacsha(1|224|256|384|512)_aes_(128|192|256)$",
-    # Elliptic curves
-    r"^ecdsa_(secp256r1|secp384r1|secp521r1|secp256k1|brainpoolP256r1|brainpoolP384r1|brainpoolP512r1)_(sha256|sha384|sha512|sha3_256|sha3_384|sha3_512|shake128|shake256)(_p1363)?$",
-    r"^ecdsa_secp256k1_sha256_bitcoin$",
-    r"^ecdh_(secp256r1|secp384r1|secp521r1|secp256k1|brainpoolP256r1|brainpoolP384r1|brainpoolP512r1)(_ecpoint)?$",
-    r"^ec_prime_order_curves$",
-    r"^x(25519|448)(_asn)?$",
-    r"^ed(25519|448)$",
-    # RSA
-    r"^rsa_signature_\d+_sha.*$",
-    r"^rsa_pkcs1_\d+(_sig_gen)?$",
-    # RFC 8702 SHAKE-based PSS is not implemented; every other PSS file is.
-    r"^rsa_pss_(?!.*shake).*$",
-    r"^rsa_oaep_\d+_.*$",
-    r"^rsa_oaep_misc$",
-    r"^primality$",
-    # Post-quantum
-    r"^mlkem_.*$",
-    r"^mldsa_.*$",
+    # Every upstream file: purecrypto implements a primitive for each of them
+    # (see docs/validation.md for the coverage table).
+    r"^.*$",
 ]
-
-DROP_KEY = re.compile(r"(Pem|Jwk|pem|jwk)$")
-
 
 def flatten(obj, prefix, out):
     for k, v in obj.items():
-        if DROP_KEY.search(k):
+        # A PEM or JWK rendering of a key that is also given as DER is
+        # redundant (the DER is what the harness parses); keep PEM/JWK only
+        # where it is the sole form (the `*_pem` / `*_webcrypto` files).
+        if (k.endswith("Pem") and k[:-3] + "Der" in obj) or (
+            k.endswith("Jwk") and k[:-3] + "Der" in obj
+        ):
             continue
         key = f"{prefix}{k}"
         if isinstance(v, dict):
-            flatten(v, key + ".", out)
+            if any(isinstance(x, (dict, list)) for x in v.values()):
+                # Structured value (a JWK set, ...): keep it as compact JSON.
+                out.append((key, json.dumps(v, separators=(",", ":"))))
+            else:
+                flatten(v, key + ".", out)
         elif isinstance(v, list):
             if all(isinstance(x, (str, int, bool)) for x in v):
                 out.append((key, ",".join(str(x) for x in v)))
             else:
-                raise ValueError(f"unsupported array under {key}")
+                out.append((key, json.dumps(v, separators=(",", ":"))))
         elif isinstance(v, bool):
             out.append((key, "true" if v else "false"))
         elif v is None:

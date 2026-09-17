@@ -36,7 +36,7 @@ name = "purecrypto"
 # The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "dsa", "bls", "fpe", "jose", "chunked"]
 std = ["alloc"]
 alloc = []
 
@@ -197,6 +197,20 @@ slhdsa = ["hash", "rng"]
 # Ascon-Hash256 / Ascon-XOF128 / Ascon-CXOF128, all from one 320-bit
 # permutation.
 ascon = ["hash", "cipher"]
+# FIPS 186-4 DSA (verify + RFC 6979 signing) over the boxed bignum layer;
+# legacy interop only (Wycheproof `dsa_*`).
+dsa = ["bignum", "rng", "hash", "alloc", "der"]
+# BLS12-381 pairing-friendly curve, RFC 9380 hash-to-curve and the
+# draft-irtf-cfrg-bls-signature schemes (min-pubkey-size, signatures in G2).
+bls = ["hash", "rng", "alloc"]
+# Format-preserving encryption: NIST SP 800-38G FF1 over AES.
+fpe = ["cipher", "bignum", "alloc"]
+# JOSE: JSON Web Key / Signature / Encryption (RFC 7515-7518) with a small
+# self-contained JSON parser.
+jose = ["alloc", "der", "hash", "cipher", "kdf", "rsa", "ec", "key"]
+# C2SP chunked encryption (Cobblestone, c2sp.org/chunked-encryption) over
+# AES-GCM with HKDF-SHA-512 key derivation.
+chunked = ["cipher", "kdf", "hash", "rng", "alloc"]
 # AEZ v5 (Hoang-Krovetz-Rogaway): robust authenticated-encryption by enciphering,
 # built from the AES round. Nonce-misuse-resistant, arbitrary expansion, vector
 # AD. Needs `alloc` for the variable-length enciphered output and `hash` for the

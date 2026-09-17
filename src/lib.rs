@@ -97,6 +97,21 @@ pub mod slhdsa;
 #[cfg(feature = "ascon")]
 pub mod ascon;
 
+#[cfg(feature = "dsa")]
+pub mod dsa;
+
+#[cfg(feature = "bls")]
+pub mod bls;
+
+#[cfg(feature = "fpe")]
+pub mod fpe;
+
+#[cfg(feature = "jose")]
+pub mod jose;
+
+#[cfg(feature = "chunked")]
+pub mod chunked;
+
 #[cfg(feature = "lms")]
 pub mod lms;
 

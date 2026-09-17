@@ -15,12 +15,26 @@ mod common;
 
 #[cfg(feature = "cipher")]
 mod aead;
+#[cfg(feature = "bls")]
+mod bls;
+#[cfg(feature = "chunked")]
+mod chunked;
 #[cfg(feature = "cipher")]
 mod cipher_modes;
+#[cfg(feature = "dsa")]
+mod dsa;
 #[cfg(feature = "ec")]
 mod ec_agree;
 #[cfg(feature = "ec")]
+mod ec_binary;
+#[cfg(feature = "ec")]
+mod ec_formats;
+#[cfg(feature = "ec")]
 mod ecdsa;
+#[cfg(feature = "fpe")]
+mod fpe;
+#[cfg(feature = "jose")]
+mod jose;
 #[cfg(feature = "kdf")]
 mod mac_kdf;
 #[cfg(any(feature = "mlkem", feature = "mldsa"))]

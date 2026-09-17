@@ -45,6 +45,8 @@
 )]
 
 #[cfg(feature = "alloc")]
+pub mod binary;
+#[cfg(feature = "alloc")]
 pub mod boxed;
 mod curve25519;
 mod curve448;
