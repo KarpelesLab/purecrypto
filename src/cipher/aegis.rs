@@ -2,8 +2,10 @@
 //! (`draft-irtf-cfrg-aegis-aead`, the CFRG AEGIS family).
 //!
 //! Implements [`Aegis128L`] (128-bit key and nonce, eight-block state) and
-//! [`Aegis256`] (256-bit key and nonce, six-block state). Both are AEAD schemes
-//! whose state transition is built entirely from the bare AES round
+//! [`Aegis256`] (256-bit key and nonce, six-block state), plus the original
+//! CAESAR-portfolio [`Aegis128`] (128-bit key and nonce, five-block state,
+//! not interoperable with 128L). All are AEAD schemes whose state transition
+//! is built entirely from the bare AES round
 //! ([`aes_round`](super::aes::aes_round)), so on a constant-time AES core the
 //! whole construction is constant time and table-free.
 //!
@@ -90,6 +92,211 @@ fn len_block(ad_len: usize, msg_len: usize) -> [u8; 16] {
     b[8..].copy_from_slice(&msg_bits.to_le_bytes());
     b
 }
+
+// ===========================================================================
+// AEGIS-128
+// ===========================================================================
+
+/// AEGIS-128: the original single-rate member of the family (Wu & Preneel,
+/// SAC 2013; CAESAR final portfolio) — 128-bit key, 128-bit nonce, 128-bit
+/// tag, 640-bit (five-block) state.
+///
+/// This is **not** [`Aegis128L`]: AEGIS-128 processes one 128-bit block per
+/// state update (AEGIS-128L does two over eight blocks), so the two are not
+/// interoperable. `draft-irtf-cfrg-aegis-aead` standardizes only 128L and
+/// 256; this variant exists for interoperability with CAESAR-era
+/// deployments and is validated against the Wycheproof `aegis128` vectors.
+///
+/// Construct with [`Aegis128::new`], then call [`encrypt`](Aegis128::encrypt)
+/// / [`decrypt`](Aegis128::decrypt). Only the 128-bit tag is defined.
+#[derive(Clone)]
+pub struct Aegis128 {
+    key: [u8; 16],
+}
+
+/// The mutable 640-bit AEGIS-128 state: five 128-bit blocks.
+struct State128 {
+    s: [[u8; 16]; 5],
+}
+
+impl State128 {
+    /// `StateUpdate128(S, m)` — the AEGIS-128 round, injecting one 128-bit
+    /// block at state word 0.
+    #[inline]
+    fn update(&mut self, m: [u8; 16]) {
+        let s = &self.s;
+        let n0 = aes_round(s[4], xor(s[0], m));
+        let n1 = aes_round(s[0], s[1]);
+        let n2 = aes_round(s[1], s[2]);
+        let n3 = aes_round(s[2], s[3]);
+        let n4 = aes_round(s[3], s[4]);
+        self.s = [n0, n1, n2, n3, n4];
+    }
+
+    /// `Init(key, nonce)`: `S = (K ⊕ IV, C1, C0, K ⊕ C0, K ⊕ C1)`, then ten
+    /// updates with the alternating message blocks `K, K ⊕ IV, K, …`.
+    fn init(key: [u8; 16], nonce: [u8; 16]) -> Self {
+        let kn = xor(key, nonce);
+        let mut st = State128 {
+            s: [kn, C1, C0, xor(key, C0), xor(key, C1)],
+        };
+        for _ in 0..5 {
+            st.update(key);
+            st.update(kn);
+        }
+        st
+    }
+
+    /// Keystream block `S1 ⊕ S4 ⊕ (S2 & S3)`.
+    #[inline]
+    fn keystream(&self) -> [u8; 16] {
+        let s = &self.s;
+        xor(xor(s[1], s[4]), and(s[2], s[3]))
+    }
+
+    /// `Enc(xi)` for a full 128-bit plaintext block, returning ciphertext.
+    #[inline]
+    fn enc(&mut self, t: [u8; 16]) -> [u8; 16] {
+        let c = xor(t, self.keystream());
+        self.update(t);
+        c
+    }
+
+    /// `Dec(ci)` for a full 128-bit ciphertext block, returning plaintext.
+    #[inline]
+    fn dec(&mut self, c: [u8; 16]) -> [u8; 16] {
+        let t = xor(c, self.keystream());
+        self.update(t);
+        t
+    }
+
+    /// `Finalize`: seven updates with `S3 ⊕ (LE64(ad_bits) ‖ LE64(msg_bits))`.
+    fn finalize(&mut self, ad_len: usize, msg_len: usize) {
+        let t = xor(self.s[3], len_block(ad_len, msg_len));
+        for _ in 0..7 {
+            self.update(t);
+        }
+    }
+
+    /// 128-bit tag: `S0 ^ S1 ^ S2 ^ S3 ^ S4`.
+    fn tag128(&self) -> [u8; 16] {
+        let mut t = self.s[0];
+        for i in 1..5 {
+            t = xor(t, self.s[i]);
+        }
+        t
+    }
+}
+
+impl Drop for State128 {
+    fn drop(&mut self) {
+        self.s.zeroize();
+    }
+}
+
+impl Aegis128 {
+    /// AEGIS-128 key size in bytes.
+    pub const KEY_SIZE: usize = 16;
+    /// AEGIS-128 nonce size in bytes.
+    pub const NONCE_SIZE: usize = 16;
+    /// AEGIS-128 tag size in bytes.
+    pub const TAG_SIZE: usize = 16;
+
+    /// Creates an AEGIS-128 instance from a 128-bit key.
+    pub fn new(key: &[u8; 16]) -> Self {
+        Aegis128 { key: *key }
+    }
+
+    /// Absorbs the associated data in 16-byte blocks, zero-padding the tail.
+    fn absorb_ad(st: &mut State128, ad: &[u8]) {
+        let mut chunks = ad.chunks_exact(16);
+        for c in &mut chunks {
+            st.update(zero_pad16(c));
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            st.update(zero_pad16(rem));
+        }
+    }
+
+    /// Encrypts `buffer` in place, binding `aad`, and returns the 128-bit tag.
+    pub fn encrypt(&self, nonce: &[u8; 16], aad: &[u8], buffer: &mut [u8]) -> [u8; 16] {
+        let mut st = State128::init(self.key, *nonce);
+        Self::absorb_ad(&mut st, aad);
+        let msg_len = buffer.len();
+        let mut chunks = buffer.chunks_exact_mut(16);
+        for c in &mut chunks {
+            let ct = st.enc(zero_pad16(c));
+            c.copy_from_slice(&ct);
+        }
+        let rem = chunks.into_remainder();
+        if !rem.is_empty() {
+            let ct = st.enc(zero_pad16(rem));
+            rem.copy_from_slice(&ct[..rem.len()]);
+        }
+        st.finalize(aad.len(), msg_len);
+        st.tag128()
+    }
+
+    /// Decrypts `buffer` (ciphertext on entry, plaintext on return) and
+    /// returns the final state, from which the caller takes the tag.
+    fn decrypt_inner(&self, nonce: &[u8; 16], aad: &[u8], buffer: &mut [u8]) -> State128 {
+        let mut st = State128::init(self.key, *nonce);
+        Self::absorb_ad(&mut st, aad);
+        let msg_len = buffer.len();
+        let mut chunks = buffer.chunks_exact_mut(16);
+        for c in &mut chunks {
+            let mut ci = [0u8; 16];
+            ci.copy_from_slice(c);
+            let t = st.dec(ci);
+            c.copy_from_slice(&t);
+        }
+        let rem = chunks.into_remainder();
+        if !rem.is_empty() {
+            // DecPartial: keystream-XOR the zero-padded ciphertext, truncate
+            // to the real length, then absorb the re-zero-padded plaintext.
+            let mut xn = xor(zero_pad16(rem), st.keystream());
+            for b in xn.iter_mut().skip(rem.len()) {
+                *b = 0;
+            }
+            st.update(xn);
+            rem.copy_from_slice(&xn[..rem.len()]);
+        }
+        st.finalize(aad.len(), msg_len);
+        st
+    }
+
+    /// Verifies `tag` and, only if it matches, decrypts `buffer` in place. On
+    /// mismatch the buffer is left as ciphertext and [`TagMismatch`] is
+    /// returned. The tag check is constant time.
+    ///
+    /// Without the `alloc` feature a `buffer` longer than 4 KiB also returns
+    /// [`TagMismatch`]; see the module docs.
+    pub fn decrypt(
+        &self,
+        nonce: &[u8; 16],
+        aad: &[u8],
+        buffer: &mut [u8],
+        tag: &[u8; 16],
+    ) -> Result<(), TagMismatch> {
+        let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
+        let st = self.decrypt_inner(nonce, aad, scratch.as_mut());
+        let expected = st.tag128();
+        if !bool::from(expected.ct_eq(tag)) {
+            return Err(TagMismatch);
+        }
+        buffer.copy_from_slice(scratch.as_mut());
+        Ok(())
+    }
+}
+
+impl Drop for Aegis128 {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Aegis128 {}
 
 // ===========================================================================
 // AEGIS-128L
@@ -640,11 +847,54 @@ impl Drop for Aegis256 {
 
 impl ZeroizeOnDrop for Aegis256 {}
 
+#[cfg(test)]
+mod aegis128_tests {
+    use super::*;
+
+    // Wycheproof `aegis128_test.json` tcId 1 (also the all-zero vector of
+    // the AEGIS paper, Wu & Preneel 2013 §B): K = IV = P = 0¹²⁸.
+    #[test]
+    fn all_zero_vector() {
+        let aead = Aegis128::new(&[0u8; 16]);
+        let mut buf = [0u8; 16];
+        let tag = aead.encrypt(&[0u8; 16], &[], &mut buf);
+        assert_eq!(
+            buf,
+            crate::test_util::from_hex::<16>("951b050fa72b1a2fc16d2e1f01b07d7e")
+        );
+        assert_eq!(
+            tag,
+            crate::test_util::from_hex::<16>("a7d2a99773249542f422217ee888d5f1")
+        );
+        aead.decrypt(&[0u8; 16], &[], &mut buf, &tag).unwrap();
+        assert_eq!(buf, [0u8; 16]);
+    }
+
+    #[test]
+    fn partial_block_round_trip_and_rejection() {
+        let aead = Aegis128::new(&[9u8; 16]);
+        let nonce = [3u8; 16];
+        let msg = b"twenty-three byte input";
+        let mut buf = *msg;
+        let tag = aead.encrypt(&nonce, b"ad", &mut buf);
+        let ct = buf;
+        let mut bad = tag;
+        bad[0] ^= 1;
+        assert_eq!(
+            aead.decrypt(&nonce, b"ad", &mut buf, &bad),
+            Err(TagMismatch)
+        );
+        assert_eq!(buf, ct);
+        aead.decrypt(&nonce, b"ad", &mut buf, &tag).unwrap();
+        assert_eq!(&buf, msg);
+    }
+}
+
 /// A small heap-free scratch buffer for trial decryption, so a tag mismatch
 /// never overwrites the caller's ciphertext. Uses `alloc` when available, and
 /// a fixed-size inline buffer otherwise (decryption inputs above
 /// [`NO_ALLOC_SCRATCH`] require `alloc`).
-struct ScratchVec {
+pub(super) struct ScratchVec {
     #[cfg(feature = "alloc")]
     data: alloc::vec::Vec<u8>,
     #[cfg(not(feature = "alloc"))]
@@ -661,12 +911,12 @@ impl ScratchVec {
     /// Returns `None` when the input does not fit — never panics, because the
     /// length is attacker-controlled on a decryption path.
     #[cfg(feature = "alloc")]
-    fn from_slice(s: &[u8]) -> Option<Self> {
+    pub(super) fn from_slice(s: &[u8]) -> Option<Self> {
         Some(ScratchVec { data: s.to_vec() })
     }
 
     #[cfg(not(feature = "alloc"))]
-    fn from_slice(s: &[u8]) -> Option<Self> {
+    pub(super) fn from_slice(s: &[u8]) -> Option<Self> {
         if s.len() > NO_ALLOC_SCRATCH {
             return None;
         }
@@ -676,12 +926,12 @@ impl ScratchVec {
     }
 
     #[cfg(feature = "alloc")]
-    fn as_mut(&mut self) -> &mut [u8] {
+    pub(super) fn as_mut(&mut self) -> &mut [u8] {
         &mut self.data
     }
 
     #[cfg(not(feature = "alloc"))]
-    fn as_mut(&mut self) -> &mut [u8] {
+    pub(super) fn as_mut(&mut self) -> &mut [u8] {
         &mut self.data[..self.len]
     }
 }

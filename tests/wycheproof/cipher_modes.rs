@@ -1,12 +1,13 @@
 //! Block-cipher modes: CBC with PKCS#7 padding, CMAC, AES-SIV (RFC 5297),
-//! key wrap (RFC 3394 / RFC 5649) and XTS, over AES, ARIA and Camellia.
+//! key wrap (RFC 3394 / RFC 5649) and XTS, over AES, ARIA, Camellia and
+//! SEED.
 
 use crate::common::{Fields, Outcome, check, check_eq};
 #[cfg(feature = "alloc")]
 use purecrypto::cipher::AesSiv;
 use purecrypto::cipher::{
     Aes128, Aes192, Aes256, AesKw, AesKwp, Aria128, Aria192, Aria256, BlockCipher, Camellia128,
-    Camellia192, Camellia256, Cbc, Cmac, Xts, kw_ciphertext_len, kwp_ciphertext_len,
+    Camellia192, Camellia256, Cbc, Cmac, Seed, Xts, kw_ciphertext_len, kwp_ciphertext_len,
 };
 
 /// Keys the 128/192/256-bit member of a cipher family from `key` and applies
@@ -21,6 +22,14 @@ macro_rules! keyed {
     (camellia, $key:expr, $f:ident($($arg:expr),*)) => {
         keyed!(@ $key, $f($($arg),*); Camellia128, Camellia192, Camellia256)
     };
+    // SEED has a single 128-bit key size; anything else is `Rejected`.
+    (seed, $key:expr, $f:ident($($arg:expr),*)) => {{
+        let key: Vec<u8> = $key;
+        match key.len() {
+            16 => $f(Seed::new(&key.try_into().unwrap()), $($arg),*),
+            _ => Outcome::Rejected,
+        }
+    }};
     (@ $key:expr, $f:ident($($arg:expr),*); $c16:ident, $c24:ident, $c32:ident) => {{
         let key: Vec<u8> = $key;
         match key.len() {
@@ -57,6 +66,7 @@ family_tests! {
     camellia_wrap = camellia / kw_case;
     aes_kwp = aes / kwp_case;
     aria_kwp = aria / kwp_case;
+    seed_wrap = seed / kw_case;
 }
 
 // ---- CBC / PKCS#7 -------------------------------------------------------

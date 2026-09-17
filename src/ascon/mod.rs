@@ -17,14 +17,22 @@
 //! Ascon v1.2 / NIST-LWC submission: the initialization values were changed,
 //! the byte order is little-endian, Ascon-AEAD128 uses a 128-bit rate, and
 //! Ascon-CXOF128 was added. Implementations and test vectors validated against
-//! the v1.2 spec will **not** match this module.
+//! the v1.2 spec will **not** match [`AsconAead128`].
+//!
+//! For interoperability with pre-standard deployments the v1.2 AEAD variants
+//! are provided separately as [`Ascon128`], [`Ascon128a`] and [`Ascon80pq`]
+//! (their docs list how the parameters differ); they share the permutation
+//! but nothing else.
 //!
 //! Correctness is checked against the official NIST SP 800-232 known-answer
-//! tests (from the Ascon reference repository) for every function.
+//! tests (from the Ascon reference repository) for every function, and the
+//! LWC / Wycheproof vectors for the v1.2 variants.
 
 mod aead;
 mod hash;
 mod permutation;
+mod v12;
 
 pub use aead::AsconAead128;
 pub use hash::{AsconCxof128, AsconHash256, AsconXof128, AsconXofReader};
+pub use v12::{Ascon80pq, Ascon128, Ascon128a};

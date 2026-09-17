@@ -21,10 +21,11 @@
 //!
 //! | mode | buffer after `Err(TagMismatch)` |
 //! | --- | --- |
-//! | [`Gcm`], [`ChaCha20Poly1305`], [`XChaCha20Poly1305`], [`Aegis128L`] / [`Aegis256`], `AsconAead128` | unchanged — still the ciphertext |
+//! | [`Gcm`], [`ChaCha20Poly1305`], [`XChaCha20Poly1305`], [`Eax`], [`Aegis128`] / [`Aegis128L`] / [`Aegis256`], [`Morus640`] / [`Morus1280`], `AsconAead128` and the Ascon v1.2 variants | unchanged — still the ciphertext |
 //! | [`Ccm`], [`AesGcmSiv`] | zeroed |
 //! | [`Aez`] (`decrypt_into`) | the `out` region it wrote is zeroed; the input `c` is a separate slice and is untouched |
 //! | [`AesSiv`] (`open`) | no buffer: the plaintext `Vec` is wiped and dropped |
+//! | `CbcHmacSha2` (`decrypt_into`) | the input `ct` is a separate slice and is untouched; the `out` region is zeroed |
 //!
 //! The only guarantee to code against is the negative one: after an error the
 //! buffer holds **no plaintext**. Treat its contents as unspecified, and if
@@ -59,6 +60,9 @@ mod aria;
 pub(crate) mod blowfish;
 mod camellia;
 mod cbc;
+// The JOSE composite needs HMAC, which lives behind the `hash` feature.
+#[cfg(feature = "hash")]
+mod cbc_hmac;
 mod ccm;
 mod cfb;
 mod chacha20;
@@ -68,16 +72,19 @@ mod clmul;
 mod cmac;
 mod ctr;
 mod des;
+mod eax;
 mod gcm;
 mod gcm_siv;
 mod gmac;
 mod kw;
+mod morus;
 mod ofb;
 mod poly1305;
 // Likewise Salsa20/8: only `kdf::scrypt` (also `alloc`-gated) uses its core
 // permutation.
 #[cfg(all(feature = "kdf", feature = "alloc"))]
 pub(crate) mod salsa20;
+mod seed;
 mod sm4;
 // AES-SIV returns variable-length `Vec` output (RFC 5297), so it needs `alloc`.
 #[cfg(feature = "alloc")]
@@ -85,13 +92,15 @@ mod siv;
 mod xchacha20poly1305;
 mod xts;
 
-pub use aegis::{Aegis128L, Aegis256};
+pub use aegis::{Aegis128, Aegis128L, Aegis256};
 pub use aes::{Aes128, Aes192, Aes256};
 #[cfg(feature = "aez")]
 pub use aez::Aez;
 pub use aria::{Aria128, Aria192, Aria256};
 pub use camellia::{Camellia128, Camellia192, Camellia256};
 pub use cbc::Cbc;
+#[cfg(feature = "hash")]
+pub use cbc_hmac::{A128CbcHs256, A192CbcHs384, A256CbcHs512, CbcHmacSha2};
 pub use ccm::{Aes128Ccm, Aes128Ccm8, Aes192Ccm, Aes256Ccm, Aes256Ccm8, Ccm};
 pub use cfb::Cfb;
 pub use chacha20::ChaCha20;
@@ -99,6 +108,7 @@ pub use chacha20poly1305::ChaCha20Poly1305;
 pub use cmac::{AesCmac128, AesCmac256, Cmac};
 pub use ctr::Ctr;
 pub use des::{Cbc64, Des, TdesEde2, TdesEde3};
+pub use eax::{Aes128Eax, Aes192Eax, Aes256Eax, Eax};
 pub use gcm::{Aes128Gcm, Aes256Gcm, Gcm};
 pub use gcm_siv::{Aes128GcmSiv, Aes256GcmSiv, AesGcmSiv};
 pub use gmac::{AesGmac128, AesGmac256, Gmac};
@@ -106,8 +116,10 @@ pub use kw::{
     Aes128Kw, Aes128Kwp, Aes192Kw, Aes192Kwp, Aes256Kw, Aes256Kwp, AesKw, AesKwp, KwError,
     kw_ciphertext_len, kwp_ciphertext_len,
 };
+pub use morus::{Morus640, Morus1280};
 pub use ofb::Ofb;
 pub use poly1305::Poly1305;
+pub use seed::Seed;
 #[cfg(feature = "alloc")]
 pub use siv::AesSiv;
 pub use sm4::Sm4;

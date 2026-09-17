@@ -52,6 +52,13 @@ impl State {
         self.permute(8);
     }
 
+    /// Applies the 6-round permutation `Ascon-p[6]` (`pb` of the v1.2
+    /// Ascon-128 / Ascon-80pq data phases).
+    #[inline]
+    pub(super) fn permute6(&mut self) {
+        self.permute(6);
+    }
+
     /// Applies `Ascon-p[rnd]` for `1 <= rnd <= 16`.
     #[inline]
     fn permute(&mut self, rnd: usize) {

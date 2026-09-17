@@ -1,12 +1,15 @@
-//! AEAD modes: AES-GCM, AES-GCM-SIV, AES-CCM, ChaCha20-Poly1305,
-//! XChaCha20-Poly1305, AEGIS, Ascon-AEAD128, the ARIA / Camellia / SM4
-//! GCM and CCM instantiations, plus AES-GMAC.
+//! AEAD modes: AES-GCM, AES-GCM-SIV, AES-CCM, AES-EAX, ChaCha20-Poly1305,
+//! XChaCha20-Poly1305, AEGIS (128 / 128L / 256), MORUS, Ascon-AEAD128 and
+//! the Ascon v1.2 variants, the ARIA / Camellia / SM4 / SEED GCM and CCM
+//! instantiations, the RFC 7518 AES-CBC-HMAC-SHA2 composites, plus AES-GMAC.
 
 use crate::common::{Fields, Outcome, check, check_eq};
+#[cfg(feature = "hash")]
+use purecrypto::cipher::{A128CbcHs256, A192CbcHs384, A256CbcHs512};
 use purecrypto::cipher::{
-    Aegis128L, Aegis256, Aes128, Aes192, Aes256, AesGcmSiv, Aria128, Aria192, Aria256, BlockCipher,
-    Camellia128, Camellia192, Camellia256, Ccm, ChaCha20Poly1305, Gcm, Gmac, Sm4,
-    XChaCha20Poly1305,
+    Aegis128, Aegis128L, Aegis256, Aes128, Aes192, Aes256, AesGcmSiv, Aria128, Aria192, Aria256,
+    BlockCipher, Camellia128, Camellia192, Camellia256, Ccm, ChaCha20Poly1305, Eax, Gcm, Gmac,
+    Morus640, Morus1280, Seed, Sm4, XChaCha20Poly1305,
 };
 
 /// Runs one `AeadTest` case through an AEAD given closures for encrypt /
@@ -342,3 +345,191 @@ fn aes_gmac() {
         |group, case| keyed!(group, case, gmac_with; 16 => Aes128, 24 => Aes192, 32 => Aes256),
     );
 }
+
+// ---- AES-EAX ---------------------------------------------------------------
+
+/// EAX takes a nonce of any length (the vectors go from 0 to 2056 bits) and
+/// always a 128-bit tag; the file only carries `tagSize=128` groups, so any
+/// other tag length is a rejection rather than a skip.
+fn eax_with<C: BlockCipher + Clone>(cipher: C, _group: &Fields, case: &Fields) -> Outcome {
+    let eax = Eax::new(cipher);
+    aead_case(
+        case,
+        |iv, aad, buf| Some(eax.encrypt(iv, aad, buf).to_vec()),
+        |iv, aad, buf, tag| {
+            let tag: [u8; 16] = tag.try_into().ok()?;
+            Some(eax.decrypt(iv, aad, buf, &tag).is_ok())
+        },
+    )
+}
+
+#[test]
+fn aes_eax() {
+    check(
+        "aes_eax",
+        |group, case| keyed!(group, case, eax_with; 16 => Aes128, 24 => Aes192, 32 => Aes256),
+    );
+}
+
+// ---- SEED ------------------------------------------------------------------
+
+#[test]
+fn seed_gcm() {
+    check("seed_gcm", |group, case| {
+        if !gcm_group_ok(group) {
+            return Outcome::Skipped;
+        }
+        keyed!(group, case, gcm_with; 16 => Seed)
+    });
+}
+
+#[test]
+fn seed_ccm() {
+    check(
+        "seed_ccm",
+        |group, case| keyed!(group, case, ccm_tagged; 16 => Seed),
+    );
+}
+
+// ---- MORUS -----------------------------------------------------------------
+
+#[test]
+fn morus640() {
+    check("morus640", |_, case| {
+        let Some(key) = case.hex_array::<16>("key") else {
+            return Outcome::Rejected;
+        };
+        let aead = Morus640::new(&key);
+        fixed_aead::<16, 16, _, _>(
+            case,
+            |n, aad, buf| aead.encrypt(n, aad, buf),
+            |n, aad, buf, tag| aead.decrypt(n, aad, buf, tag).is_ok(),
+        )
+    });
+}
+
+#[test]
+fn morus1280() {
+    check("morus1280", |_, case| {
+        // `try_new` takes 16- or 32-byte keys and reports anything else.
+        let Ok(aead) = Morus1280::try_new(&case.hex("key")) else {
+            return Outcome::Rejected;
+        };
+        fixed_aead::<16, 16, _, _>(
+            case,
+            |n, aad, buf| aead.encrypt(n, aad, buf),
+            |n, aad, buf, tag| aead.decrypt(n, aad, buf, tag).is_ok(),
+        )
+    });
+}
+
+// ---- AEGIS-128 (the original CAESAR variant) -------------------------------
+
+#[test]
+fn aegis128() {
+    check("aegis128", |group, case| {
+        let Some(key) = case.hex_array::<16>("key") else {
+            return Outcome::Rejected;
+        };
+        // Only the 128-bit tag is defined for AEGIS-128.
+        if group.int("tagSize") != 128 {
+            return Outcome::Rejected;
+        }
+        let aead = Aegis128::new(&key);
+        fixed_aead::<16, 16, _, _>(
+            case,
+            |n, aad, buf| aead.encrypt(n, aad, buf),
+            |n, aad, buf, tag| aead.decrypt(n, aad, buf, tag).is_ok(),
+        )
+    });
+}
+
+// ---- Ascon v1.2 ------------------------------------------------------------
+
+/// The three v1.2 variants share the 128-bit nonce / tag shape and differ
+/// only in key length (`K` bytes) and type.
+macro_rules! ascon_v12_test {
+    ($name:ident, $file:literal, $ty:ident, $klen:literal) => {
+        #[test]
+        fn $name() {
+            check($file, |_, case| {
+                let Some(key) = case.hex_array::<$klen>("key") else {
+                    return Outcome::Rejected;
+                };
+                let aead = purecrypto::ascon::$ty::new(&key);
+                fixed_aead::<16, 16, _, _>(
+                    case,
+                    |n, aad, buf| aead.encrypt(n, aad, buf),
+                    |n, aad, buf, tag| aead.decrypt(n, aad, buf, tag).is_ok(),
+                )
+            });
+        }
+    };
+}
+
+ascon_v12_test!(ascon128, "ascon128", Ascon128, 16);
+ascon_v12_test!(ascon128a, "ascon128a", Ascon128a, 16);
+ascon_v12_test!(ascon80pq, "ascon80pq", Ascon80pq, 20);
+
+// ---- AES-CBC-HMAC-SHA2 (RFC 7518 §5.2) -------------------------------------
+
+/// One `AeadTest` case through the composite's slice API. The tag length is
+/// fixed by the variant, so a case whose `tag` has another length (none in
+/// the current files) is rejected by `decrypt_into`. Decryption goes first,
+/// as in [`aead_case`], so every `invalid` case fails there.
+#[cfg(feature = "hash")]
+fn cbc_hmac_case<C, D>(aead: &purecrypto::cipher::CbcHmacSha2<C, D>, case: &Fields) -> Outcome
+where
+    C: BlockCipher + Clone,
+    D: purecrypto::hash::Digest,
+{
+    let Some(iv) = case.hex_array::<16>("iv") else {
+        return Outcome::Rejected;
+    };
+    let aad = case.hex("aad");
+    let msg = case.hex("msg");
+    let ct = case.hex("ct");
+    let tag = case.hex("tag");
+
+    let mut out = vec![0u8; ct.len()];
+    match aead.decrypt_into(&iv, &aad, &ct, &tag, &mut out) {
+        Err(_) => return Outcome::Rejected,
+        Ok(n) if out[..n] != msg[..] => return Outcome::Wrong("decrypted plaintext"),
+        Ok(_) => {}
+    }
+    let mut ct_out = vec![0u8; purecrypto::cipher::CbcHmacSha2::<C, D>::ciphertext_len(msg.len())];
+    let mut tag_out = vec![0u8; purecrypto::cipher::CbcHmacSha2::<C, D>::TAG_LEN];
+    match aead.encrypt_into(&iv, &aad, &msg, &mut ct_out, &mut tag_out) {
+        Err(_) => Outcome::Wrong("encrypt refused a decryptable input"),
+        Ok(()) => {
+            if ct_out != ct {
+                Outcome::Wrong("ciphertext")
+            } else {
+                check_eq(&tag_out, &tag, "tag")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "hash")]
+macro_rules! cbc_hmac_test {
+    ($name:ident, $ty:ident) => {
+        #[test]
+        fn $name() {
+            check(stringify!($name), |_, case| {
+                // `try_new` reports every key length but the variant's own.
+                let Ok(aead) = $ty::try_new(&case.hex("key")) else {
+                    return Outcome::Rejected;
+                };
+                cbc_hmac_case(&aead, case)
+            });
+        }
+    };
+}
+
+#[cfg(feature = "hash")]
+cbc_hmac_test!(a128cbc_hs256, A128CbcHs256);
+#[cfg(feature = "hash")]
+cbc_hmac_test!(a192cbc_hs384, A192CbcHs384);
+#[cfg(feature = "hash")]
+cbc_hmac_test!(a256cbc_hs512, A256CbcHs512);
