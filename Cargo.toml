@@ -16,6 +16,25 @@ repository = "https://github.com/KarpelesLab/purecrypto"
 license = "MIT"
 keywords = ["crypto", "cryptography", "no-std", "constant-time"]
 categories = ["cryptography", "no-std::no-alloc"]
+# What ships in the published .crate. NOTE: the `exclude` above is
+# `[workspace].exclude`, an unrelated key that only keeps those directories out
+# of the implicit workspace — it has never affected packaging. Without this list
+# every git-tracked file is published, which is how v0.9.1 hit crates.io's
+# 10 MiB limit: `testdata/wycheproof/` alone is ~79 MiB.
+#
+# The rest of `testdata/` (~3 MiB) stays in, because `tests/cli.rs` and
+# `examples/tls_loopback.rs` pull its PEMs in with `include_str!` and would not
+# compile without them. The Wycheproof harness loads its vectors by path at run
+# time, so it degrades to a failing test rather than a broken build; run it from
+# a git checkout.
+exclude = [
+    "testdata/wycheproof",
+    "tools",
+    "web",
+    "fuzz",
+    ".github",
+    "SECURITY.md",
+]
 
 [package.metadata.docs.rs]
 # Document every opt-in module (quic, hpke, ech, falcon, zkp, hazmat, ffi, ...)
