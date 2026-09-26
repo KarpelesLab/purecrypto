@@ -217,7 +217,8 @@ impl EdwardsPoint {
     }
 
     /// `[scalar]·B` (scalar times the basepoint), constant-time (precomputed
-    /// fixed-base comb).
+    /// fixed-base comb with the `ed25519-table` feature, a windowed ladder
+    /// without it).
     pub fn mul_base(scalar: &Scalar) -> EdwardsPoint {
         let f = Field::new();
         let mut bytes = scalar_bytes(&scalar.0);

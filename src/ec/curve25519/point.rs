@@ -4,7 +4,8 @@
 //! GF(2²⁵⁵−19), in extended coordinates `(X:Y:Z:T)` with the complete
 //! Hisil–Wong–Carter–Dawson 2008 addition formulas. Scalar multiplication is a
 //! constant-time fixed 4-bit window ladder; base-point multiplication uses a
-//! precomputed comb table ([`super::base_table`]) with no doublings. This is
+//! precomputed comb table (`super::base_table`, feature `ed25519-table`) with
+//! no doublings, or the same ladder over the base point without it. This is
 //! the shared point backend behind Ed25519, the edwards25519 hazmat surface,
 //! and ristretto255.
 //!
@@ -13,6 +14,7 @@
 //! branches and perform table lookups indexed by the scalar, so they must
 //! never see secret scalars or secret points.
 
+#[cfg(feature = "ed25519-table")]
 use super::base_table::ED25519_BASE_TABLE;
 use super::field::{Fe, Field, ScalarInt};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
@@ -25,6 +27,34 @@ pub(crate) struct Point {
     pub(crate) z: Fe,
     pub(crate) t: Fe,
 }
+
+/// The base point `B` as a table entry: affine `x‖y‖t` (`t = x·y`), 5
+/// little-endian 51-bit limbs each, canonical residues — the same value as
+/// the comb table's first entry. Checked against the RFC 8032 encoding by
+/// `tests::base_affine_matches_encoding`.
+#[cfg(any(
+    test,
+    feature = "hazmat-edwards25519",
+    feature = "ristretto255",
+    not(feature = "ed25519-table")
+))]
+const BASE_AFFINE: [u64; 15] = [
+    0x62d608f25d51a,
+    0x412a4b4f6592a,
+    0x75b7171a4b31d,
+    0x1ff60527118fe,
+    0x216936d3cd6e5,
+    0x6666666666658,
+    0x4cccccccccccc,
+    0x1999999999999,
+    0x3333333333333,
+    0x6666666666666,
+    0x68ab3a5b7dda3,
+    0x00eea2a5eadbb,
+    0x2af8df483c27e,
+    0x332b375274732,
+    0x67875f0fd78b7,
+];
 
 /// Lifts a stored affine table entry (`x‖y‖t`, 5 little-endian 51-bit limbs
 /// each, canonical residues) to extended coordinates with `Z = 1`.
@@ -39,15 +69,18 @@ fn table_point(entry: &[u64; 15], one: Fe) -> Point {
 }
 
 impl Field {
-    /// The base point `B`, decompressed from its standard encoding.
-    // Library-path base multiplications go through [`Self::mul_base`] and its
-    // precomputed comb table; only the ristretto255 group API (and tests)
-    // still need the point itself. Gate to avoid dead_code on the default
-    // (Ed25519-only) build.
-    #[cfg(any(test, feature = "hazmat-edwards25519", feature = "ristretto255"))]
+    /// The base point `B`.
+    // With the comb table, library-path base multiplications never touch the
+    // point itself; only the group APIs (and tests) do. Gate to avoid
+    // dead_code on the default (Ed25519-only) build.
+    #[cfg(any(
+        test,
+        feature = "hazmat-edwards25519",
+        feature = "ristretto255",
+        not(feature = "ed25519-table")
+    ))]
     pub(crate) fn base(&self) -> Point {
-        self.decode(&super::field::BASE_ENC)
-            .expect("valid base point")
+        table_point(&BASE_AFFINE, self.one)
     }
 
     /// Decompresses a 32-byte point encoding (RFC 8032 §5.1.3), or `None` if the
@@ -188,9 +221,14 @@ impl Field {
     // Ed25519 verification moved to the vartime path (its inputs are public),
     // so on the default build this constant-time generic multiplication only
     // backs the test-side differential oracles; the hazmat/ristretto group
-    // APIs (secret scalars) are its library users. Gate accordingly to keep
-    // the default build free of dead code.
-    #[cfg(any(test, feature = "hazmat-edwards25519", feature = "ristretto255"))]
+    // APIs (secret scalars) and the table-free `mul_base` are its library
+    // users. Gate accordingly to keep the default build free of dead code.
+    #[cfg(any(
+        test,
+        feature = "hazmat-edwards25519",
+        feature = "ristretto255",
+        not(feature = "ed25519-table")
+    ))]
     pub(crate) fn scalar_mult(&self, scalar: &[u8; 32], p: &Point) -> Point {
         // table[j] = [j]P; table[0] is the identity.
         let mut table = [self.identity(); 16];
@@ -232,6 +270,7 @@ impl Field {
     /// identity, a uniform no-op under the complete HWCD formulas, so the
     /// schedule depends only on the (public) scalar width. The scalar bytes
     /// are treated as secret.
+    #[cfg(feature = "ed25519-table")]
     pub(crate) fn mul_base(&self, scalar: &[u8; 32]) -> Point {
         let id = self.identity();
         let mut acc = id;
@@ -253,6 +292,15 @@ impl Field {
         acc
     }
 
+    /// Constant-time fixed-base multiplication `[scalar]·B` without the comb
+    /// table (feature `ed25519-table` off): the generic windowed ladder
+    /// [`Self::scalar_mult`] over `B`. Same result and the same secret-scalar
+    /// discipline, at the cost of ~252 doublings the table would avoid.
+    #[cfg(not(feature = "ed25519-table"))]
+    pub(crate) fn mul_base(&self, scalar: &[u8; 32]) -> Point {
+        self.scalar_mult(scalar, &self.base())
+    }
+
     /// **Variable-time** fixed-base multiplication `[scalar]·B` over the same
     /// comb table as [`Self::mul_base`], but indexing each window entry
     /// directly and skipping zero digits.
@@ -263,6 +311,7 @@ impl Field {
     /// and memory access. This must ONLY ever be called with **public**
     /// scalars (e.g. the signature scalar `S` during Ed25519 verification) —
     /// never with signing nonces or secret keys.
+    #[cfg(feature = "ed25519-table")]
     pub(crate) fn mul_base_vartime(&self, scalar: &[u8; 32]) -> Point {
         let mut acc = self.identity();
         for (i, window) in ED25519_BASE_TABLE.iter().enumerate() {
@@ -285,38 +334,89 @@ impl Field {
     /// Both the branch pattern and the table indices leak the scalar. This
     /// must ONLY ever be called with **public** scalars and points (e.g. the
     /// challenge scalar `k` and public key `A` during Ed25519 verification).
+    // With the comb table off, Ed25519 verification goes through the
+    // interleaved `double_scalar_mult_base_vartime` instead.
+    #[cfg(any(test, feature = "ed25519-table"))]
     pub(crate) fn scalar_mult_vartime(&self, scalar: &[u8; 32], p: &Point) -> Point {
-        // Odd multiples: odd[i] = [2i+1]P.
-        let p2 = self.point_double(p);
-        let mut odd = [*p; 8];
-        for i in 1..8 {
-            odd[i] = self.point_add(&odd[i - 1], &p2);
-        }
-
+        let odd = self.odd_multiples(p);
         let naf = wnaf5(scalar);
-        // Find the highest nonzero digit (vartime by design).
-        let mut top = None;
-        for i in (0..naf.len()).rev() {
-            if naf[i] != 0 {
-                top = Some(i);
-                break;
-            }
-        }
-        let Some(top) = top else {
+        let Some(top) = naf.iter().rposition(|&d| d != 0) else {
             return self.identity();
         };
 
         let mut acc = self.identity();
         for i in (0..=top).rev() {
             acc = self.point_double(&acc);
-            let d = naf[i];
-            if d > 0 {
-                acc = self.point_add(&acc, &odd[(d as usize) / 2]);
-            } else if d < 0 {
-                acc = self.point_add(&acc, &self.point_negate(&odd[(-d as usize) / 2]));
-            }
+            acc = self.add_naf_digit(&acc, naf[i], &odd);
         }
         acc
+    }
+
+    /// **Variable-time** `[a]·p + [b]·B`, the Ed25519 verification
+    /// combination. With the comb table this is [`Self::scalar_mult_vartime`]
+    /// plus [`Self::mul_base_vartime`]; without it, both width-5 wNAF ladders
+    /// are interleaved (Straus) so they share one run of ~254 doublings.
+    ///
+    /// # Warning: public inputs only
+    ///
+    /// Both the branch pattern and the table indices leak the scalars. This
+    /// must ONLY ever be called with **public** scalars and points.
+    pub(crate) fn double_scalar_mult_base_vartime(
+        &self,
+        a: &[u8; 32],
+        p: &Point,
+        b: &[u8; 32],
+    ) -> Point {
+        #[cfg(feature = "ed25519-table")]
+        {
+            self.point_add(&self.scalar_mult_vartime(a, p), &self.mul_base_vartime(b))
+        }
+        #[cfg(not(feature = "ed25519-table"))]
+        {
+            let odd_p = self.odd_multiples(p);
+            let odd_b = self.odd_multiples(&self.base());
+            let naf_a = wnaf5(a);
+            let naf_b = wnaf5(b);
+            let Some(top) = naf_a
+                .iter()
+                .zip(naf_b.iter())
+                .rposition(|(&x, &y)| x != 0 || y != 0)
+            else {
+                return self.identity();
+            };
+
+            let mut acc = self.identity();
+            for i in (0..=top).rev() {
+                acc = self.point_double(&acc);
+                acc = self.add_naf_digit(&acc, naf_a[i], &odd_p);
+                acc = self.add_naf_digit(&acc, naf_b[i], &odd_b);
+            }
+            acc
+        }
+    }
+
+    /// The odd multiples `odd[i] = [2i+1]P` for `i in 0..8`, the lookup table
+    /// of the width-5 wNAF ladders.
+    fn odd_multiples(&self, p: &Point) -> [Point; 8] {
+        let p2 = self.point_double(p);
+        let mut odd = [*p; 8];
+        for i in 1..8 {
+            odd[i] = self.point_add(&odd[i - 1], &p2);
+        }
+        odd
+    }
+
+    /// Adds the wNAF digit `d` (odd, `|d| <= 15`, or zero for a no-op) times
+    /// the point whose odd multiples are `odd`. **Variable-time.**
+    #[inline]
+    fn add_naf_digit(&self, acc: &Point, d: i8, odd: &[Point; 8]) -> Point {
+        if d > 0 {
+            self.point_add(acc, &odd[(d as usize) / 2])
+        } else if d < 0 {
+            self.point_add(acc, &self.point_negate(&odd[(-d as usize) / 2]))
+        } else {
+            *acc
+        }
     }
 
     /// Constant-time equality of two points, comparing the affine
@@ -406,6 +506,7 @@ mod tests {
     /// inversion-free: the stored affine `(x, y, t)` matches the computed
     /// extended `(X : Y : Z : T)` iff `x·Z == X`, `y·Z == Y` and `t·Z == T`.
     #[test]
+    #[cfg(feature = "ed25519-table")]
     fn base_table_matches_computed() {
         let f = Field::new();
         let mut base = f.base();
@@ -424,9 +525,22 @@ mod tests {
         }
     }
 
+    /// The hard-coded affine base point is the RFC 8032 `B`, with `t = x·y`.
+    #[test]
+    fn base_affine_matches_encoding() {
+        let f = Field::new();
+        let b = f.base();
+        let dec = f
+            .decode(&super::super::field::BASE_ENC)
+            .expect("valid base");
+        assert!(bool::from(f.point_ct_eq(&b, &dec)));
+        assert!(bool::from(f.ct_eq(f.mul(b.x, b.y), b.t)));
+        assert_eq!(f.encode(&b), super::super::field::BASE_ENC);
+    }
+
     /// Differential test: the fixed-base comb agrees with the generic
     /// windowed ladder for edge scalars (0, 1, 2, L−1, L, L+1, 2²⁵⁵-ish,
-    /// all-ones) and a batch of random ones — and the two vartime paths agree
+    /// all-ones) and a batch of random ones — and the vartime paths agree
     /// with their constant-time counterparts on every one of them.
     #[test]
     fn mul_base_matches_generic_scalar_mult() {
@@ -434,6 +548,8 @@ mod tests {
         use crate::rng::{HmacDrbg, RngCore};
         let f = Field::new();
         let b = f.base();
+        // An independent point for the double-scalar check.
+        let p = f.scalar_mult(&[7u8; 32], &b);
 
         let check = |s: &[u8; 32]| {
             let comb = f.encode(&f.mul_base(s));
@@ -442,6 +558,7 @@ mod tests {
                 f.encode(&f.scalar_mult(s, &b)),
                 "comb/ladder mismatch"
             );
+            #[cfg(feature = "ed25519-table")]
             assert_eq!(
                 comb,
                 f.encode(&f.mul_base_vartime(s)),
@@ -451,6 +568,21 @@ mod tests {
                 comb,
                 f.encode(&f.scalar_mult_vartime(s, &b)),
                 "vartime wNAF mismatch"
+            );
+            assert_eq!(
+                comb,
+                f.encode(&f.double_scalar_mult_base_vartime(&[0u8; 32], &p, s)),
+                "vartime double-scalar [0]P + [s]B mismatch"
+            );
+            // [s]P + [s']B against the constant-time ladders, with s' = s
+            // byte-reversed so the two digit streams differ.
+            let mut s2 = *s;
+            s2.reverse();
+            let want = f.point_add(&f.scalar_mult(s, &p), &f.mul_base(&s2));
+            assert_eq!(
+                f.encode(&want),
+                f.encode(&f.double_scalar_mult_base_vartime(s, &p, &s2)),
+                "vartime double-scalar mismatch"
             );
         };
 

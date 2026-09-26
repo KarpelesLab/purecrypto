@@ -148,7 +148,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `chunked` | C2SP chunked encryption (Cobblestone-128/256): streaming, seekable, key-committing AES-GCM (opt-in) |
 | `jose` | JWK / JWK Sets, JWS and JWE (RFC 7515-7518, 8037) with a strict self-contained JSON parser |
 | `ec` | ECDSA/ECDH on P-224, P-256, P-384, P-521, secp256k1, Brainpool (224–512); X25519, X448, Ed25519, Ed448; SM2 signature and encryption (P-256 and secp256k1 ECDSA — with Bitcoin/Ethereum key recovery — need no `alloc`); with `legacy-ec`: P-192, secp160/192/224 (k1/r1/r2) and ECDH on the binary curves sect283/409/571 (k1/r1) |
->>>>>>> 9e7440c (build(ec): legacy-ec feature for the sub-112-bit and binary curves)
+| `ed25519-table` | The ~115 KB precomputed edwards25519 base-point table (default). Without it Ed25519 signing, key generation and ristretto255 / edwards25519 `mul_base` fall back to a windowed ladder: same results, ~2x slower signing, verification unaffected |
 | `legacy-ec` | Curves below the 112-bit level or deprecated by SP 800-186: secp160k1/r1/r2, secp192k1, P-192, secp224k1 and the binary curves sect283/409/571 k1/r1 (ECDH only); interop with old certificates only (opt-in) |
 | `bip340` | BIP340 Schnorr signatures over secp256k1 |
 | `zkp-*` | Experimental secp256k1 extensions mirroring `secp256k1-zkp`: sign-to-contract, ECDSA adaptor signatures, Pedersen commitments, Borromean range proofs, asset surjection proofs, half-aggregation, ring-signature whitelisting (`zkp` enables all; no semver guarantee) |
@@ -195,7 +195,8 @@ purecrypto = { version = "0.8", default-features = false, features = ["mlkem"] }
 
 # no_std elliptic curves without an allocator: P-256 ECDSA/ECDH, X25519,
 # X448, Ed25519, Ed448. Add `alloc` for the runtime multi-curve path
-# (P-384/P-521/secp256k1/Brainpool), SM2, and the DER/PEM codecs.
+# (P-384/P-521/secp256k1/Brainpool), SM2, and the DER/PEM codecs, and
+# `ed25519-table` for 2x faster Ed25519 signing at ~115 KB of flash.
 purecrypto = { version = "0.8", default-features = false, features = ["ec"] }
 
 # Post-quantum signing only:

@@ -147,7 +147,8 @@ impl RistrettoPoint {
     }
 
     /// Scalar multiplication of the generator `[scalar]·B`, constant-time
-    /// (precomputed fixed-base comb).
+    /// (precomputed fixed-base comb with the `ed25519-table` feature, a
+    /// windowed ladder without it).
     pub fn mul_base(scalar: &Scalar) -> RistrettoPoint {
         let f = Field::new();
         let mut bytes = scalar.to_bytes();

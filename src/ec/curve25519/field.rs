@@ -65,10 +65,9 @@ pub(crate) const L_INT: ScalarInt = ScalarInt::from_limbs([
 
 /// The standard base point `B`, as its 32-byte RFC 8032 encoding (`y = 4/5`,
 /// with an even `x`).
-// Library-path base multiplications go through the precomputed comb table;
-// only the ristretto255 group API (and tests) still decompress `B` itself, so
-// gate to match usage and avoid dead_code on the default build.
-#[cfg(any(test, feature = "hazmat-edwards25519", feature = "ristretto255"))]
+// The library takes `B` from `point::BASE_AFFINE`; the encoding only
+// cross-checks it in tests.
+#[cfg(test)]
 pub(crate) const BASE_ENC: [u8; 32] = {
     let mut b = [0x66u8; 32];
     b[0] = 0x58;

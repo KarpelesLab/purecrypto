@@ -13,6 +13,7 @@
 //! The field/point/scalar internals were extracted verbatim from the original
 //! private `ed25519.rs` implementation; Ed25519 signing output is unchanged.
 
+#[cfg(feature = "ed25519-table")]
 pub(crate) mod base_table;
 pub(crate) mod field;
 pub(crate) mod point;

@@ -342,11 +342,11 @@ impl Ed25519PublicKey {
         // multiplications are safe — and much faster than the constant-time
         // gathers. They are differentially tested against the constant-time
         // paths in `curve25519::point`.
-        let lhs = f.mul_base_vartime(&s_bytes);
-        let ka = f.scalar_mult_vartime(&k_bytes, &a_point);
-        let rhs = f.point_add(&r_point, &ka);
+        // Rearranged as [8]([S]B + [k](−A)) == [8]R so both multiplications
+        // fold into one double-scalar call.
+        let lhs = f.double_scalar_mult_base_vartime(&k_bytes, &f.point_negate(&a_point), &s_bytes);
         let lhs8 = f.point_double(&f.point_double(&f.point_double(&lhs)));
-        let rhs8 = f.point_double(&f.point_double(&f.point_double(&rhs)));
+        let rhs8 = f.point_double(&f.point_double(&f.point_double(&r_point)));
         // Projective cross-multiply comparison (X₁Z₂ == X₂Z₁, Y₁Z₂ == Y₂Z₁):
         // no field inversions, unlike encoding both sides.
         if bool::from(f.point_ct_eq(&lhs8, &rhs8)) {
