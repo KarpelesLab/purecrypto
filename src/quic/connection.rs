@@ -413,6 +413,55 @@ fn first_packet_is_initial(datagram: &[u8]) -> bool {
     matches!(LongHeader::parse(datagram), Ok(h) if h.typ == LongType::Initial)
 }
 
+/// Returns the header of the first QUIC v1 Initial packet that the packet
+/// loop in [`QuicConnection::feed_datagram`] would reach in `datagram`,
+/// walking the packets coalesced in front of it (RFC 9000 §12.2).
+///
+/// The server's Retry decision (`maybe_emit_retry`) used to look only at the
+/// first packet of the datagram. A client that coalesced a junk long-header
+/// packet — say a Handshake-shaped one with a small Length field — in front
+/// of its token-less Initial therefore never triggered a Retry: the junk was
+/// dropped by the packet loop for lack of Handshake keys and the Initial
+/// behind it went straight into the first-Initial path, where the server
+/// runs its key exchange and signs a CertificateVerify for an address it has
+/// not validated. That is precisely the work `require_retry` exists to gate.
+///
+/// The walk mirrors the packet loop's own advancement rules so the Retry
+/// decision is made on the packet the loop would actually process:
+///
+/// * a short-header packet extends to the end of the datagram, so nothing
+///   behind it is ever reached;
+/// * a Version Negotiation packet (version 0) is discarded whole by a server
+///   and a Retry (§12.2: "cannot be coalesced") or a non-v1 long header
+///   consumes the rest of the datagram;
+/// * an Initial / 0-RTT / Handshake packet is `payload_off + Length` bytes
+///   long; a Length that overruns the datagram is a decode error that
+///   discards the remainder.
+fn first_initial_in_datagram(datagram: &[u8]) -> Option<LongHeader<'_>> {
+    let mut off = 0usize;
+    while off < datagram.len() {
+        let rest = &datagram[off..];
+        if rest[0] & 0x80 == 0 {
+            return None;
+        }
+        let hdr = LongHeader::parse(rest).ok()?;
+        if hdr.version != QUIC_V1 || hdr.typ == LongType::Retry {
+            return None;
+        }
+        let pkt_total_len = usize::try_from(hdr.length)
+            .ok()
+            .and_then(|len| hdr.payload_off.checked_add(len))?;
+        if rest.len() < pkt_total_len || pkt_total_len == 0 {
+            return None;
+        }
+        if hdr.typ == LongType::Initial {
+            return Some(hdr);
+        }
+        off += pkt_total_len;
+    }
+    None
+}
+
 /// What a packet may currently carry when [`QuicConnection::assemble_payload`]
 /// builds it.
 ///
@@ -1500,18 +1549,26 @@ impl QuicConnection {
     /// * If the inbound Initial has a token, validate it; on success,
     ///   mark address validated and let normal processing continue. On
     ///   failure, drop the datagram silently.
-    /// * If the inbound packet is not an Initial → continue normally
-    ///   (Retry only applies to fresh Initials).
+    /// * If the datagram carries no Initial → continue normally (Retry only
+    ///   applies to fresh Initials).
+    ///
+    /// "The inbound Initial" is the first Initial the packet loop would
+    /// reach, not merely the first packet of the datagram: the decision has
+    /// to be made on the same packet the first-Initial path would otherwise
+    /// process, or coalescing junk in front of it bypasses Retry altogether
+    /// (see [`first_initial_in_datagram`]).
     fn maybe_emit_retry(&mut self, datagram: &[u8]) -> Result<Option<usize>, Error> {
-        // Quick header check.
-        if datagram.is_empty() || datagram[0] & 0x80 == 0 {
-            return Ok(None);
-        }
-        let hdr = match LongHeader::parse(datagram) {
-            Ok(h) => h,
-            Err(_) => return Ok(None),
+        let hdr = match first_initial_in_datagram(datagram) {
+            Some(h) => h,
+            None => return Ok(None),
         };
-        if hdr.typ != LongType::Initial {
+
+        // RFC 9000 §14.1 — an Initial in an undersized datagram is discarded
+        // by the packet loop, so it must not draw a Retry either (H-1): the
+        // early check in `feed_datagram` only looks at the *first* packet of
+        // the datagram, and a junk prefix would otherwise turn a small spoofed
+        // datagram back into a Retry reflector.
+        if datagram.len() < MIN_INITIAL_DATAGRAM {
             return Ok(None);
         }
 
@@ -4741,6 +4798,20 @@ impl QuicConnection {
             && level == Level::Initial
             && !self.initial_keys_installed
             && self.endpoint.crypto.at(Level::Initial).rx.is_none();
+        // Once a Retry has been sent, the only Initial this connection may
+        // key itself from is the one whose token `maybe_emit_retry` verified
+        // — which is the call that marks the path validated. Any other
+        // Initial reaching this point did not go through that check (it was
+        // not the packet the Retry decision looked at), and processing it
+        // would hand an unvalidated address the full handshake the Retry was
+        // meant to gate. RFC 9000 §8.1.2: drop it silently.
+        if tentative_first_initial && self.retry_sent && !self.active_path.validated {
+            let pkt_total_len = usize::try_from(hdr.length)
+                .ok()
+                .and_then(|len| hdr.payload_off.checked_add(len))
+                .ok_or(Error::Decode)?;
+            return Ok(pkt_total_len.min(datagram.len()));
+        }
         let tentative_rx_keys = if tentative_first_initial {
             // Reject a malformed SCID now, before spending an AEAD open on it.
             ConnectionId::from_slice(hdr.scid).ok_or(Error::Decode)?;
@@ -10290,6 +10361,81 @@ mod tests {
         assert!(
             s.active_path.bytes_sent <= s.active_path.bytes_recv * 3,
             "AMP budget must not be exceeded"
+        );
+    }
+
+    /// Builds a junk Handshake-shaped long-header packet with a small Length
+    /// field, the kind an attacker coalesces in front of an Initial: the
+    /// packet loop drops it for lack of Handshake keys and moves on to the
+    /// packet behind it.
+    fn junk_handshake_prefix() -> Vec<u8> {
+        use crate::quic::pkt::QUIC_V1;
+        let mut junk = alloc::vec![0xe0u8]; // long header, fixed bit, type 2 (Handshake)
+        junk.extend_from_slice(&QUIC_V1.to_be_bytes());
+        junk.extend_from_slice(&[4, 0xaa, 0xaa, 0xaa, 0xaa]); // DCID
+        junk.extend_from_slice(&[4, 0xbb, 0xbb, 0xbb, 0xbb]); // SCID
+        // Length = 24: enough for the header-protection sample so the loop
+        // reaches the "no keys" drop rather than a decode error.
+        crate::quic::varint::encode(24, &mut junk);
+        junk.extend_from_slice(&[0x11u8; 24]);
+        junk
+    }
+
+    /// `require_retry` must gate the first Initial the packet loop reaches,
+    /// not just the first packet of the datagram. Before the fix,
+    /// `[junk Handshake][token-less Initial]` skipped the Retry decision
+    /// (which parsed only the first packet), the junk was dropped for lack
+    /// of keys and the Initial then went through the full first-Initial path
+    /// — key exchange, CertificateVerify signature and all — for an address
+    /// that was never validated.
+    #[test]
+    fn retry_bypass_via_coalesced_prefix() {
+        let (mut c, mut s) = retry_loopback_pair([9u8; 32]);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        s.set_peer_addr(peer);
+        s.set_now_secs(1_700_000_000);
+        c.set_peer_addr(peer);
+        let initial = c.pop_datagram();
+        assert!(initial.len() >= MIN_INITIAL_DATAGRAM);
+        let mut dg = junk_handshake_prefix();
+        dg.extend_from_slice(&initial);
+        assert!(
+            !super::first_packet_is_initial(&dg),
+            "the prefix must hide the Initial from a first-packet-only check"
+        );
+
+        s.feed_datagram(&dg).expect("server feed");
+        assert!(
+            !s.initial_keys_installed,
+            "no handshake may start for an unvalidated address"
+        );
+        assert!(s.retry_sent, "the coalesced Initial must draw a Retry");
+        let retry = s.pop_datagram();
+        assert!(
+            (retry[0] & 0x80) != 0 && ((retry[0] >> 4) & 0x03) == 0x03,
+            "server answers with a Retry, not a ServerHello"
+        );
+        assert!(s.pop_datagram().is_empty(), "nothing but the Retry is sent");
+
+        // A token-less Initial behind a junk prefix is dropped after the
+        // Retry too (RFC 9000 §8.1.2), rather than starting the handshake.
+        s.feed_datagram(&dg).expect("server feed");
+        assert!(!s.initial_keys_installed);
+        assert!(s.pop_datagram().is_empty());
+
+        // The legitimate retried Initial (with token) still works with a junk
+        // prefix in front of it: the Retry decision validates the token on
+        // the Initial the loop reaches, and the handshake proceeds.
+        c.feed_datagram(&retry).expect("client feed");
+        assert!(c.retry_processed);
+        let mut retried = junk_handshake_prefix();
+        retried.extend_from_slice(&c.pop_datagram());
+        s.feed_datagram(&retried).expect("server feed");
+        assert!(s.active_path.validated, "the token validates the address");
+        assert!(s.initial_keys_installed, "the retried Initial is processed");
+        assert!(
+            super::first_packet_is_initial(&s.pop_datagram()),
+            "the server answers the retried Initial with its ServerHello"
         );
     }
 
