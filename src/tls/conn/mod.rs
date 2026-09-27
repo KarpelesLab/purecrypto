@@ -656,8 +656,45 @@ mod quic_mode_tests {
     }
 }
 
+/// Client-config fixtures shared by the loopback and audit-regression tests.
+///
+/// The test certificates are valid 2024-01-01 .. 2034-01-01. Without the
+/// `std` feature there is no clock, and a verifying client with no
+/// `verification_time` fails closed (`BadCertificate`), so the fixtures pin
+/// a time inside that window. Under `std` this matches what the system
+/// clock would give, and keeps the runs reproducible. Tests exercising a
+/// different time (expired chains, CRL windows) still override the field.
+/// mTLS servers fail closed the same way, so the tests that verify a client
+/// certificate pin the server with `.with_verification_time(fixture_time())`.
+#[cfg(test)]
+mod test_fixtures {
+    use super::{ClientConfig, ClientConfig12};
+    use crate::tls::RootCertStore;
+    use crate::x509::Time;
+
+    /// A verification time inside the test certificates' validity.
+    pub(super) fn fixture_time() -> Time {
+        Time::utc(2026, 5, 1, 0, 0, 0)
+    }
+
+    /// [`ClientConfig::new`] with `verification_time` pinned to
+    /// [`fixture_time`].
+    pub(super) fn client_config(roots: RootCertStore) -> ClientConfig {
+        let mut config = ClientConfig::new(roots);
+        config.verification_time = Some(fixture_time());
+        config
+    }
+
+    /// [`ClientConfig12::new`] with `verification_time` pinned to
+    /// [`fixture_time`].
+    pub(super) fn client_config12(roots: RootCertStore) -> ClientConfig12 {
+        ClientConfig12::new(roots).with_verification_time(fixture_time())
+    }
+}
+
 #[cfg(test)]
 mod loopback_tests {
+    use super::test_fixtures::{client_config, fixture_time};
     use super::{ClientConnection, ServerConfig, ServerConnection};
     use crate::ec::{Ed448PrivateKey, Ed25519PrivateKey};
     use crate::hash::Sha256;
@@ -666,7 +703,6 @@ mod loopback_tests {
     use crate::test_util::rsa_test_key_a;
     use crate::tls::RootCertStore;
     use crate::tls::codec::{CipherSuite, NamedGroup};
-    use crate::tls::conn::ClientConfig;
     use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
     use alloc::vec::Vec;
 
@@ -850,7 +886,7 @@ mod loopback_tests {
             let mut crng = HmacDrbg::<Sha256>::new(b"loopback-pss-client", b"nonce", &[]);
             let srng = HmacDrbg::<Sha256>::new(b"loopback-pss-server", b"nonce", &[]);
             let mut client = ClientConnection::new_with_offer(
-                ClientConfig::new(roots),
+                client_config(roots),
                 "loopback.example",
                 &mut crng,
                 &[CipherSuite::AES_128_GCM_SHA256],
@@ -921,14 +957,16 @@ mod loopback_tests {
             let client_cert_der = client_cert.to_der().to_vec();
             let mut server_roots = RootCertStore::new();
             server_roots.add_der(client_cert_der.clone()).unwrap();
-            let server_config = server_config.with_client_auth(server_roots, true);
+            let server_config = server_config
+                .with_client_auth(server_roots, true)
+                .with_verification_time(fixture_time());
             let mut roots = RootCertStore::new();
             roots.add_der(server_cert_der).unwrap();
             let cc = ClientCertConfig::with_rsa(alloc::vec![client_cert_der], boxed.clone());
             let mut crng = HmacDrbg::<Sha256>::new(b"mtls-rsa-client-rng", b"nonce", &[]);
             let srng = HmacDrbg::<Sha256>::new(b"mtls-rsa-server-rng", b"nonce", &[]);
             let mut client = ClientConnection::new_with_offer(
-                ClientConfig::new(roots).with_client_cert(cc),
+                client_config(roots).with_client_cert(cc),
                 "loopback.example",
                 &mut crng,
                 &[CipherSuite::AES_128_GCM_SHA256],
@@ -989,7 +1027,7 @@ mod loopback_tests {
             let mut crng = HmacDrbg::<Sha256>::new(b"loopback-bp-client", b"nonce", &[]);
             let srng = HmacDrbg::<Sha256>::new(b"loopback-bp-server", b"nonce", &[]);
             let mut client = ClientConnection::new_with_offer(
-                ClientConfig::new(roots),
+                client_config(roots),
                 "loopback.example",
                 &mut crng,
                 &[CipherSuite::AES_128_GCM_SHA256],
@@ -1191,7 +1229,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"rsl-hs-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"rsl-hs-server", b"nonce", &[]);
         let mut client = ClientConnection::new(
-            ClientConfig::new(roots).with_record_size_limit(64),
+            client_config(roots).with_record_size_limit(64),
             "loopback.example",
             &mut crng,
         )
@@ -1272,7 +1310,7 @@ mod loopback_tests {
         let srng = HmacDrbg::<Sha256>::new(b"loopback-server", b"nonce", &[]);
 
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             suites,
@@ -1326,7 +1364,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"loopback-cn-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"loopback-cn-server", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -1499,7 +1537,7 @@ mod loopback_tests {
         // The client offers RawPublicKey ahead of X.509 and pins the
         // server's SPKI on an allowlist. `RootCertStore` stays empty —
         // there's no PKI to consult when RPK is in use.
-        let client_cfg = ClientConfig::new(RootCertStore::new())
+        let client_cfg = client_config(RootCertStore::new())
             .with_server_cert_type_preference(alloc::vec![
                 cert_type::RAW_PUBLIC_KEY,
                 cert_type::X509,
@@ -1583,7 +1621,7 @@ mod loopback_tests {
         let mut roots = RootCertStore::new();
         roots.add_der(server_cert_der).unwrap();
         let cc = ClientCertConfig::with_ed25519(alloc::vec::Vec::new(), client_key);
-        let client_cfg = ClientConfig::new(roots)
+        let client_cfg = client_config(roots)
             .with_client_cert(cc)
             .with_client_cert_type_preference(alloc::vec![
                 cert_type::RAW_PUBLIC_KEY,
@@ -1659,7 +1697,7 @@ mod loopback_tests {
             let mut roots = RootCertStore::new();
             roots.add_der(server_cert_der).unwrap();
             let cc = ClientCertConfig::with_ed25519(alloc::vec::Vec::new(), client_key);
-            let client_cfg = ClientConfig::new(roots)
+            let client_cfg = client_config(roots)
                 .with_client_cert(cc)
                 .with_client_cert_type_preference(alloc::vec![
                     cert_type::RAW_PUBLIC_KEY,
@@ -1738,7 +1776,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"rpk-mismatch-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"rpk-mismatch-server", b"nonce", &[]);
 
-        let client_cfg = ClientConfig::new(RootCertStore::new())
+        let client_cfg = client_config(RootCertStore::new())
             .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY])
             .add_expected_raw_public_key(pinned_spki);
         let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng).unwrap();
@@ -1769,7 +1807,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"rpk-empty-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"rpk-empty-server", b"nonce", &[]);
 
-        let client_cfg = ClientConfig::new(RootCertStore::new())
+        let client_cfg = client_config(RootCertStore::new())
             .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
         // No add_expected_raw_public_key — allowlist intentionally empty.
         let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng).unwrap();
@@ -1805,7 +1843,7 @@ mod loopback_tests {
 
         let mut crng = HmacDrbg::<Sha256>::new(b"rpk-silent-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"rpk-silent-server", b"nonce", &[]);
-        let client_cfg = ClientConfig::new(RootCertStore::new())
+        let client_cfg = client_config(RootCertStore::new())
             .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY])
             .add_expected_raw_public_key(spki);
         let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng).unwrap();
@@ -1861,7 +1899,7 @@ mod loopback_tests {
 
         // Client offers RPK only, so no overlap with the server's
         // accept-set.
-        let client_cfg = ClientConfig::new(RootCertStore::new())
+        let client_cfg = client_config(RootCertStore::new())
             .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
         let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
@@ -1901,7 +1939,7 @@ mod loopback_tests {
         let srng = HmacDrbg::<Sha256>::new(b"hostname-server", b"nonce", &[]);
         // The server cert is for "loopback.example"; connect to a different name.
         let mut client =
-            ClientConnection::new(ClientConfig::new(roots), "attacker.example", &mut crng).unwrap();
+            ClientConnection::new(client_config(roots), "attacker.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
 
         assert_eq!(
@@ -1926,7 +1964,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"nst-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"nst-server", b"nonce", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng).unwrap();
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
 
         // Complete the handshake.
@@ -1989,7 +2027,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"ku-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ku-server", b"nonce", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng).unwrap();
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
 
         for _ in 0..16 {
@@ -2049,7 +2087,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(label, b"client", &[]);
         let srng = HmacDrbg::<Sha256>::new(label, b"server", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng).unwrap();
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
         for _ in 0..16 {
             let c = client.write_tls();
@@ -2174,7 +2212,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"exp-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"exp-server", b"nonce", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng).unwrap();
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
 
         for _ in 0..16 {
@@ -2226,7 +2264,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"rsl-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"rsl-server", b"nonce", &[]);
         let mut client = ClientConnection::new(
-            ClientConfig::new(roots).with_record_size_limit(64),
+            client_config(roots).with_record_size_limit(64),
             "loopback.example",
             &mut crng,
         )
@@ -2296,7 +2334,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"rsl-clamp-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"rsl-clamp-server", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_record_size_limit(0xFFFF),
+            client_config(roots).with_record_size_limit(0xFFFF),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -2355,7 +2393,7 @@ mod loopback_tests {
         }
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
-        let mut client_config = ClientConfig::new(roots);
+        let mut client_config = client_config(roots);
         if let Some(l) = client_limit {
             client_config = client_config.with_record_size_limit(l);
         }
@@ -2451,7 +2489,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"alpn-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"alpn-server", b"nonce", &[]);
         let mut client = ClientConnection::new(
-            ClientConfig::new(roots).with_alpn(alloc::vec![b"http/1.1".to_vec(), b"h2".to_vec()]),
+            client_config(roots).with_alpn(alloc::vec![b"http/1.1".to_vec(), b"h2".to_vec()]),
             "loopback.example",
             &mut crng,
         )
@@ -2500,7 +2538,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"psk-client-1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"psk-server-1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -2542,7 +2580,7 @@ mod loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"psk-client-2", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"psk-server-2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots2).with_session(session),
+            client_config(roots2).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -2618,7 +2656,9 @@ mod loopback_tests {
         // Server trusts the client's root (self-signed: leaf == root).
         let mut server_roots = RootCertStore::new();
         server_roots.add_der(client_cert_der.clone()).unwrap();
-        let server_config = server_config.with_client_auth(server_roots, true);
+        let server_config = server_config
+            .with_client_auth(server_roots, true)
+            .with_verification_time(fixture_time());
 
         // Client trusts the server's cert.
         let mut roots = RootCertStore::new();
@@ -2628,7 +2668,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"mtls-client-rng", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"mtls-server-rng", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_client_cert(cc),
+            client_config(roots).with_client_cert(cc),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -2701,7 +2741,9 @@ mod loopback_tests {
 
         let mut server_roots = RootCertStore::new();
         server_roots.add_der(client_cert_der.clone()).unwrap();
-        let server_config = server_config.with_client_auth(server_roots, true);
+        let server_config = server_config
+            .with_client_auth(server_roots, true)
+            .with_verification_time(fixture_time());
 
         let mut roots = RootCertStore::new();
         roots.add_der(server_cert_der).unwrap();
@@ -2710,7 +2752,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"mtls-ed448-client-rng", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"mtls-ed448-server-rng", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_client_cert(cc),
+            client_config(roots).with_client_cert(cc),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -2787,7 +2829,9 @@ mod loopback_tests {
 
         let mut server_roots = RootCertStore::new();
         server_roots.add_der(trusted_der).unwrap();
-        let server_config = server_config.with_client_auth(server_roots, true);
+        let server_config = server_config
+            .with_client_auth(server_roots, true)
+            .with_verification_time(fixture_time());
 
         let mut roots = RootCertStore::new();
         roots.add_der(server_cert_der).unwrap();
@@ -2796,7 +2840,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"mtls-bad-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"mtls-bad-server", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_client_cert(cc),
+            client_config(roots).with_client_cert(cc),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -2847,7 +2891,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"mtls-opt-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"mtls-opt-server", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -2937,7 +2981,9 @@ mod loopback_tests {
         // Server trusts the client's self-signed root (leaf == anchor).
         let mut server_roots = RootCertStore::new();
         server_roots.add_der(client_cert_der.clone()).unwrap();
-        let server_config = server_config.with_client_auth(server_roots, true);
+        let server_config = server_config
+            .with_client_auth(server_roots, true)
+            .with_verification_time(fixture_time());
 
         // Client trusts the server's cert.
         let mut roots = RootCertStore::new();
@@ -2947,7 +2993,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"tls-mtls-mldsa-client-rng", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"tls-mtls-mldsa-server-rng", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_client_cert(cc),
+            client_config(roots).with_client_cert(cc),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3006,7 +3052,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"0rtt-client-1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"0rtt-server-1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3043,7 +3089,7 @@ mod loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"0rtt-client-2", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"0rtt-server-2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots2).with_session(session),
+            client_config(roots2).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3117,7 +3163,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"alpn0rtt-client-1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"alpn0rtt-server-1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_alpn(alloc::vec![b"h2".to_vec()]),
+            client_config(roots).with_alpn(alloc::vec![b"h2".to_vec()]),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3160,7 +3206,7 @@ mod loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"alpn0rtt-client-2", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"alpn0rtt-server-2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots2)
+            client_config(roots2)
                 .with_alpn(alloc::vec![b"http/1.1".to_vec()])
                 .with_session(session),
             "loopback.example",
@@ -3226,7 +3272,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"age0rtt-client-1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"age0rtt-server-1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3265,7 +3311,7 @@ mod loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"age0rtt-client-2", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"age0rtt-server-2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots2).with_session(session),
+            client_config(roots2).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3327,7 +3373,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"rep-client-1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"rep-server-1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3367,7 +3413,7 @@ mod loopback_tests {
         };
         let mut crng_a = HmacDrbg::<Sha256>::new(b"rep-client-2a", b"nonce", &[]);
         let mut client_a = ClientConnection::new_with_offer(
-            ClientConfig::new(RootCertStore::new()).with_session(session.clone()),
+            client_config(RootCertStore::new()).with_session(session.clone()),
             "loopback.example",
             &mut crng_a,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3429,7 +3475,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"0rtt-budget-c1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"0rtt-budget-s1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3468,7 +3514,7 @@ mod loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"0rtt-budget-c2", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"0rtt-budget-s2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots2).with_session(session),
+            client_config(roots2).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3513,7 +3559,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"0rtt-exact-c1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"0rtt-exact-s1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3546,7 +3592,7 @@ mod loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"0rtt-exact-c2", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"0rtt-exact-s2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(RootCertStore::new()).with_session(session),
+            client_config(RootCertStore::new()).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3605,7 +3651,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"eoed-gap-c1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"eoed-gap-s1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3639,7 +3685,7 @@ mod loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"eoed-gap-c2", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"eoed-gap-s2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(RootCertStore::new()).with_session(session),
+            client_config(RootCertStore::new()).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3726,7 +3772,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"badpsk-client-1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"badpsk-server-1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3759,7 +3805,7 @@ mod loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"badpsk-client-2", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"badpsk-server-2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots2).with_session(session),
+            client_config(roots2).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3792,7 +3838,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"alpn-bad-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"alpn-bad-server", b"nonce", &[]);
         let mut client = ClientConnection::new(
-            ClientConfig::new(roots).with_alpn(alloc::vec![b"http/1.1".to_vec()]),
+            client_config(roots).with_alpn(alloc::vec![b"http/1.1".to_vec()]),
             "loopback.example",
             &mut crng,
         )
@@ -3879,7 +3925,7 @@ mod loopback_tests {
         // Offer X25519 and SECP256R1 but ship a share only for X25519; the
         // server will "demand" SECP256R1.
         let mut client = ClientConnection::new_with_offer_partial_shares(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3926,7 +3972,7 @@ mod loopback_tests {
 
         let mut crng = HmacDrbg::<Sha256>::new(b"hrr2-client", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer_partial_shares(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -3962,7 +4008,7 @@ mod loopback_tests {
 
         let mut crng = HmacDrbg::<Sha256>::new(b"hrr-sid-client", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -4014,7 +4060,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"hrr-bad-client", b"nonce", &[]);
         // Offer only X25519. The HRR will ask for SECP256R1.
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -4066,7 +4112,7 @@ mod loopback_tests {
             roots.add_der(cert_der).unwrap();
             let mut crng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
             ClientConnection::new_with_offer_partial_shares(
-                ClientConfig::new(roots),
+                client_config(roots),
                 "loopback.example",
                 &mut crng,
                 &[
@@ -4122,7 +4168,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"ku-bad-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ku-bad-server", b"nonce", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng).unwrap();
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
 
         for _ in 0..16 {
@@ -4165,7 +4211,7 @@ mod loopback_tests {
 
         let mut crng = HmacDrbg::<Sha256>::new(b"dup-ext-client", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -4217,7 +4263,7 @@ mod loopback_tests {
 
         let mut crng = HmacDrbg::<Sha256>::new(b"unoffered-suite-client", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -4267,7 +4313,7 @@ mod loopback_tests {
 
         let mut crng = HmacDrbg::<Sha256>::new(b"unoffered-group-client", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -4315,7 +4361,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"ccs-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ccs-server", b"nonce", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng).unwrap();
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
 
         for _ in 0..16 {
@@ -4359,7 +4405,7 @@ mod loopback_tests {
 
         let mut crng = HmacDrbg::<Sha256>::new(b"badccs-client", b"nonce", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng).unwrap();
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
         let _ch1 = client.write_tls();
 
         let mut bad = Vec::new();
@@ -4389,7 +4435,7 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"badnst-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"badnst-server", b"nonce", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng).unwrap();
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
 
         for _ in 0..16 {
@@ -4441,7 +4487,7 @@ mod loopback_tests {
         roots.add_der(cert_der).unwrap();
 
         // The cert is valid 2024–2034; verify as if it were 2020.
-        let mut config = ClientConfig::new(roots);
+        let mut config = client_config(roots);
         config.verification_time = Some(Time::utc(2020, 1, 1, 0, 0, 0));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"expiry-client", b"nonce", &[]);
@@ -4516,7 +4562,7 @@ mod loopback_tests {
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
 
-        let mut config = ClientConfig::new(roots);
+        let mut config = client_config(roots);
         config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"staple-ok-client", b"nonce", &[]);
@@ -4562,7 +4608,7 @@ mod loopback_tests {
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
 
-        let mut config = ClientConfig::new(roots);
+        let mut config = client_config(roots);
         config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"staple-rev-client", b"nonce", &[]);
@@ -4582,7 +4628,7 @@ mod loopback_tests {
         let (server_config, root_der, _leaf, _seed) = ca_signed_ed25519_leaf();
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
-        let mut config = ClientConfig::new(roots);
+        let mut config = client_config(roots);
         config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
         let mut crng = HmacDrbg::<Sha256>::new(b"staple-none-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"staple-none-s", b"nonce", &[]);
@@ -4622,7 +4668,7 @@ mod loopback_tests {
             server_config.with_cert_compression_algorithms(cert_compression::default_algorithms());
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
-        let mut config = ClientConfig::new(roots)
+        let mut config = client_config(roots)
             .with_cert_compression_algorithms(cert_compression::default_algorithms());
         config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
         let mut crng = HmacDrbg::<Sha256>::new(b"cc-zlib-c", b"nonce", &[]);
@@ -4678,7 +4724,7 @@ mod loopback_tests {
             .with_cert_compression_algorithms(alloc::vec![cert_compression::algorithm::BROTLI]);
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
-        let mut config = ClientConfig::new(roots)
+        let mut config = client_config(roots)
             .with_cert_compression_algorithms(cert_compression::default_algorithms());
         config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
         let mut crng = HmacDrbg::<Sha256>::new(b"cc-fb-c", b"nonce", &[]);
@@ -4720,7 +4766,7 @@ mod loopback_tests {
         let crl = b.sign(&signer).unwrap();
         server_config = server_config.with_stapled_crl(crl.to_der().to_vec());
 
-        let mut config = ClientConfig::new(RootCertStore::new());
+        let mut config = client_config(RootCertStore::new());
         config.verify_certificates = false;
         let mut crng = HmacDrbg::<Sha256>::new(b"staple-noverify-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"staple-noverify-s", b"nonce", &[]);
@@ -4771,7 +4817,7 @@ mod loopback_tests {
 
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
-        let mut config = ClientConfig::new(roots);
+        let mut config = client_config(roots);
         config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"ocsp-good-c", b"nonce", &[]);
@@ -4825,7 +4871,7 @@ mod loopback_tests {
 
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
-        let mut config = ClientConfig::new(roots);
+        let mut config = client_config(roots);
         config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"ocsp-rev-c", b"nonce", &[]);
@@ -4864,7 +4910,7 @@ mod loopback_tests {
 
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
-        let mut config = ClientConfig::new(roots);
+        let mut config = client_config(roots);
         config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"ocsp-exp-c", b"nonce", &[]);
@@ -4944,7 +4990,7 @@ mod loopback_tests {
         // against the same `ECHConfigList`.
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
-        let mut client_cfg = ClientConfig::new(roots);
+        let mut client_cfg = client_config(roots);
         client_cfg.ech = Some(EchClient::from_config_list(list));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"ech-3b3-client", b"nonce", &[]);
@@ -5070,7 +5116,7 @@ mod loopback_tests {
         // STALE client-side `ECHConfigList` (config_id 0x33).
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
-        let mut client_cfg = ClientConfig::new(roots);
+        let mut client_cfg = client_config(roots);
         client_cfg.ech = Some(EchClient::from_config_list(client_list));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"ech-3b4-client", b"nonce", &[]);
@@ -5210,7 +5256,7 @@ mod loopback_tests {
 
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
-        let mut client_cfg = ClientConfig::new(roots);
+        let mut client_cfg = client_config(roots);
         client_cfg.ech = Some(EchClient::from_config_list(client_list));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"ech-noauth-client", b"nonce", &[]);
@@ -5322,7 +5368,7 @@ mod loopback_tests {
         // shape the preferred-group HRR pre-check exists for.
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
-        let mut client_cfg = ClientConfig::new(roots);
+        let mut client_cfg = client_config(roots);
         client_cfg.ech = Some(EchClient::from_config_list(list));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"ech-hrr-client", b"nonce", &[]);
@@ -5437,7 +5483,7 @@ mod loopback_tests {
 
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
-        let mut client_cfg = ClientConfig::new(roots);
+        let mut client_cfg = client_config(roots);
         client_cfg.ech = Some(EchClient::from_config_list(list));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"ech-hrr-tamper-c", b"nonce", &[]);
@@ -5550,7 +5596,7 @@ mod loopback_tests {
 
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
-        let mut client_cfg = ClientConfig::new(roots);
+        let mut client_cfg = client_config(roots);
         client_cfg.ech = Some(EchClient::from_config_list(list));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"ech-hrr-len-c", b"nonce", &[]);
@@ -5652,7 +5698,7 @@ mod loopback_tests {
 
         // Advertise X25519 and SECP384R1, ship a key_share only for X25519.
         let mut client = ClientConnection::new_with_offer_partial_shares(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -5713,7 +5759,7 @@ mod loopback_tests {
         let mut roots = RootCertStore::new();
         roots.add_der(_cert_der).unwrap();
         let mut client = ClientConnection::new_with_offer_partial_shares(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -5769,7 +5815,8 @@ mod tls12_loopback_tests {
     //! handshake in-process across every AEAD-ECDHE suite × cert combination
     //! and confirm application data flows in both directions.
 
-    use super::{ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12};
+    use super::test_fixtures::{client_config12, fixture_time};
+    use super::{ClientConnection12, ServerConfig12, ServerConnection12};
     use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
@@ -5964,7 +6011,7 @@ mod tls12_loopback_tests {
             let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-client", b"nonce", &[]);
             let srng = HmacDrbg::<Sha256>::new(b"loopback12-server", b"nonce", &[]);
             let mut client = ClientConnection12::new_with_offer(
-                ClientConfig12::new(roots),
+                client_config12(roots),
                 "loopback.example",
                 &mut crng,
                 &[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
@@ -6027,7 +6074,7 @@ mod tls12_loopback_tests {
         let srng = HmacDrbg::<Sha256>::new(b"loopback12-server", b"nonce", &[]);
 
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             suites,
@@ -6144,7 +6191,7 @@ mod tls12_loopback_tests {
         use crate::tls::codec::cert_type;
         let (server_config, spki) =
             rpk_server12(alloc::vec![cert_type::RAW_PUBLIC_KEY, cert_type::X509]);
-        let client_cfg = ClientConfig12::new(RootCertStore::new())
+        let client_cfg = client_config12(RootCertStore::new())
             .with_server_cert_type_preference(alloc::vec![
                 cert_type::RAW_PUBLIC_KEY,
                 cert_type::X509,
@@ -6182,7 +6229,7 @@ mod tls12_loopback_tests {
         fn attempt(verify: bool, pin: Option<Vec<u8>>) -> Result<(), Error> {
             let (server_config, _spki) =
                 rpk_server12(alloc::vec![cert_type::RAW_PUBLIC_KEY, cert_type::X509]);
-            let mut client_cfg = ClientConfig12::new(RootCertStore::new())
+            let mut client_cfg = client_config12(RootCertStore::new())
                 .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
             if let Some(pin) = pin {
                 client_cfg = client_cfg.add_expected_raw_public_key(pin);
@@ -6259,7 +6306,7 @@ mod tls12_loopback_tests {
             }
             let mut roots = RootCertStore::new();
             roots.add_der(server_der).unwrap();
-            let client_cfg = ClientConfig12::new(roots)
+            let client_cfg = client_config12(roots)
                 .with_client_cert(ClientCertConfig::with_ecdsa(Vec::new(), client_key))
                 .with_client_cert_type_preference(alloc::vec![
                     cert_type::RAW_PUBLIC_KEY,
@@ -6306,7 +6353,7 @@ mod tls12_loopback_tests {
             let server_config = server_config.with_server_cert_type_preference(server_prefs);
             let mut roots = RootCertStore::new();
             roots.add_der(der.clone()).unwrap();
-            let client_cfg = ClientConfig12::new(roots)
+            let client_cfg = client_config12(roots)
                 .with_server_cert_type_preference(client_prefs)
                 .add_expected_raw_public_key(alloc::vec![0x30, 0x00]);
             let mut crng = HmacDrbg::<Sha256>::new(b"rpk12-x509-c", b"nonce", &[]);
@@ -6348,7 +6395,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-cn-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"loopback12-cn-server", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
@@ -6410,7 +6457,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-legacy-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"loopback12-legacy-s", b"nonce", &[]);
 
-        let cfg = ClientConfig12::new(roots)
+        let cfg = client_config12(roots)
             .with_min_version(version)
             .with_max_version(version)
             .with_require_ems(!ssl3);
@@ -6472,7 +6519,7 @@ mod tls12_loopback_tests {
         roots.add_der(cert_der).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(seed, b"cbc-client", &[]);
         let srng = HmacDrbg::<Sha256>::new(seed, b"cbc-server", &[]);
-        let cfg = ClientConfig12::new(roots)
+        let cfg = client_config12(roots)
             .with_min_version(ProtocolVersion::TLSv1_1)
             .with_max_version(ProtocolVersion::TLSv1_1);
         let mut client = ClientConnection12::new_with_offer(
@@ -6601,7 +6648,7 @@ mod tls12_loopback_tests {
             let mut crng = HmacDrbg::<Sha256>::new(seed, b"aead-client", &[]);
             let srng = HmacDrbg::<Sha256>::new(seed, b"aead-server", &[]);
             let mut client = ClientConnection12::new_with_offer(
-                ClientConfig12::new(roots),
+                client_config12(roots),
                 "loopback.example",
                 &mut crng,
                 &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -6728,10 +6775,12 @@ mod tls12_loopback_tests {
 
         let mut server_roots = RootCertStore::new();
         server_roots.add_der(client_cert_der.clone()).unwrap();
-        let server_config = server_config.with_client_auth(server_roots, true);
+        let server_config = server_config
+            .with_client_auth(server_roots, true)
+            .with_verification_time(fixture_time());
 
         let cc = ClientCertConfig::with_rsa(alloc::vec![client_cert_der], boxed_client);
-        let client_cfg = ClientConfig12::new(roots)
+        let client_cfg = client_config12(roots)
             .with_min_version(crate::tls::ProtocolVersion::TLSv1_0)
             .with_max_version(crate::tls::ProtocolVersion::TLSv1_0)
             .with_client_cert(cc);
@@ -6807,7 +6856,7 @@ mod tls12_loopback_tests {
         roots.add_der(cert_der).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(b"ssl3-beast-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ssl3-beast-s", b"nonce", &[]);
-        let cfg = ClientConfig12::new(roots)
+        let cfg = client_config12(roots)
             .with_min_version(crate::tls::ProtocolVersion::SSLv3)
             .with_max_version(crate::tls::ProtocolVersion::SSLv3)
             .with_require_ems(false);
@@ -6867,7 +6916,7 @@ mod tls12_loopback_tests {
         roots.add_der(cert_der).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(b"legacy-ems-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"legacy-ems-s", b"nonce", &[]);
-        let cfg = ClientConfig12::new(roots)
+        let cfg = client_config12(roots)
             .with_min_version(version)
             .with_max_version(version)
             .with_require_ems(ems);
@@ -6969,7 +7018,7 @@ mod tls12_loopback_tests {
         roots.add_der(cert_der).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(b"legacy-reqems-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"legacy-reqems-s", b"nonce", &[]);
-        let cfg = ClientConfig12::new(roots)
+        let cfg = client_config12(roots)
             .with_min_version(crate::tls::ProtocolVersion::TLSv1_0)
             .with_max_version(crate::tls::ProtocolVersion::TLSv1_0);
         let mut client = ClientConnection12::new_with_offer(
@@ -7029,7 +7078,7 @@ mod tls12_loopback_tests {
 
         // Restrict to AES-256-GCM only; the server's default top pick would be
         // AES-128-GCM, so seeing 0xC030 proves the restriction took effect.
-        let mut cfg = ClientConfig12::new(roots);
+        let mut cfg = client_config12(roots);
         cfg.cipher_suites = Some(alloc::vec![
             CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384.0
         ]);
@@ -7134,7 +7183,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-app-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"loopback12-app-s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7188,7 +7237,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-exp-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"loopback12-exp-s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7255,7 +7304,7 @@ mod tls12_loopback_tests {
         // (no RSA match for an RSA-keyed server). The server picks none →
         // HandshakeFailure.
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(RootCertStore::new()),
+            client_config12(RootCertStore::new()),
             "loopback.example",
             &mut crng,
             &[
@@ -7311,10 +7360,12 @@ mod tls12_loopback_tests {
 
         let mut server_roots = RootCertStore::new();
         server_roots.add_der(client_cert_der.clone()).unwrap();
-        let server_config = server_config.with_client_auth(server_roots, true);
+        let server_config = server_config
+            .with_client_auth(server_roots, true)
+            .with_verification_time(fixture_time());
 
         let cc = ClientCertConfig::with_ed25519(alloc::vec![client_cert_der], client_key);
-        let client_cfg = ClientConfig12::new(roots).with_client_cert(cc);
+        let client_cfg = client_config12(roots).with_client_cert(cc);
 
         let mut crng = HmacDrbg::<Sha256>::new(b"mtls12-client-rng", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"mtls12-server-rng", b"nonce", &[]);
@@ -7391,13 +7442,15 @@ mod tls12_loopback_tests {
 
         let mut server_roots = RootCertStore::new();
         server_roots.add_der(client_cert_der.clone()).unwrap();
-        let server_config = server_config.with_client_auth(server_roots, false);
+        let server_config = server_config
+            .with_client_auth(server_roots, false)
+            .with_verification_time(fixture_time());
 
         let cc = ClientCertConfig::with_ed25519(alloc::vec![client_cert_der], client_key);
         let mut crng = HmacDrbg::<Sha256>::new(b"mtls12-opt-c-rng", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"mtls12-opt-s-rng", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots).with_client_cert(cc),
+            client_config12(roots).with_client_cert(cc),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7439,7 +7492,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"mtls12-empty-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"mtls12-empty-s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots), // no client_cert
+            client_config12(roots), // no client_cert
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7480,7 +7533,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"mtls12-req-no-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"mtls12-req-no-s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7533,7 +7586,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-resume-1c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"tls12-resume-1s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7572,7 +7625,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-resume-2c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"tls12-resume-2s", b"nonce", &[]);
         let mut client2 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots2).with_session(session),
+            client_config12(roots2).with_session(session),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7624,7 +7677,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-bad-1c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"tls12-bad-1s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7659,7 +7712,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-bad-2c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"tls12-bad-2s", b"nonce", &[]);
         let mut client2 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots2).with_session(session),
+            client_config12(roots2).with_session(session),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7710,7 +7763,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-notk-1c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"tls12-notk-1s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7742,7 +7795,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-notk-2c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"tls12-notk-2s", b"nonce", &[]);
         let mut client2 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots2).with_session(session),
+            client_config12(roots2).with_session(session),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7807,7 +7860,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-sid-1c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"tls12-sid-1s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7847,7 +7900,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-sid-2c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"tls12-sid-2s", b"nonce", &[]);
         let mut client2 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots2).with_session(session),
+            client_config12(roots2).with_session(session),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -7969,7 +8022,7 @@ mod tls12_loopback_tests {
         roots.add_der(server_cert_der).unwrap();
 
         let mut crng = HmacDrbg::<Sha256>::new(b"sentinel-rej-c", b"nonce", &[]);
-        let cfg = ClientConfig12::new(roots).with_accept_downgrade_sentinel(false);
+        let cfg = client_config12(roots).with_accept_downgrade_sentinel(false);
         let mut client = ClientConnection12::new(cfg, "loopback.example", &mut crng).unwrap();
         // Drain the CH so the client is in `WaitServerHello`.
         let _ch_bytes = client.write_tls();
@@ -8016,7 +8069,7 @@ mod tls12_loopback_tests {
         roots1.add_der(server_cert_der1).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(b"hr-mid-c", b"nonce", &[]);
         let mut client1 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots1),
+            client_config12(roots1),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8046,7 +8099,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"hr-post-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"hr-post-s", b"nonce", &[]);
         let mut client2 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots2),
+            client_config12(roots2),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8141,7 +8194,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"close12-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"close12-s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8228,8 +8281,7 @@ mod tls12_loopback_tests {
         roots.add_der(der).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(b"badver-c", b"nonce", &[]);
         let mut client =
-            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng)
-                .unwrap();
+            ClientConnection12::new(client_config12(roots), "loopback.example", &mut crng).unwrap();
         let _ = client.write_tls(); // drain CH
         let mut rec: Vec<u8> = Vec::new();
         rec.push(ContentType::Handshake.as_u8());
@@ -8255,7 +8307,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"dupccs-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"dupccs-s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8313,7 +8365,7 @@ mod tls12_loopback_tests {
         let (_cfg, der) = rsa_server12();
         roots.add_der(der).unwrap();
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8350,7 +8402,7 @@ mod tls12_loopback_tests {
     fn tls12_fallback_scsv_default_off_and_opt_in() {
         // Default: SCSV is absent from the CH suite list.
         let mut crng = HmacDrbg::<Sha256>::new(b"scsv-off", b"nonce", &[]);
-        let cfg = ClientConfig12::new(RootCertStore::new());
+        let cfg = client_config12(RootCertStore::new());
         let mut client = ClientConnection12::new(cfg, "example.com", &mut crng).unwrap();
         let bytes = client.write_tls();
         let rec = read_record(&bytes).unwrap().unwrap();
@@ -8364,7 +8416,7 @@ mod tls12_loopback_tests {
 
         // Opted in: 0x5600 is the FIRST suite on the wire.
         let mut crng = HmacDrbg::<Sha256>::new(b"scsv-on", b"nonce", &[]);
-        let cfg = ClientConfig12::new(RootCertStore::new()).with_fallback_scsv(true);
+        let cfg = client_config12(RootCertStore::new()).with_fallback_scsv(true);
         let mut client = ClientConnection12::new(cfg, "example.com", &mut crng).unwrap();
         let bytes = client.write_tls();
         let rec = read_record(&bytes).unwrap().unwrap();
@@ -8384,7 +8436,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"scsv-full-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"scsv-full-s", b"nonce", &[]);
         let mut client = ClientConnection12::new(
-            ClientConfig12::new(roots).with_fallback_scsv(true),
+            client_config12(roots).with_fallback_scsv(true),
             "loopback.example",
             &mut crng,
         )
@@ -8420,7 +8472,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"ems-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ems-s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8491,7 +8543,7 @@ mod tls12_loopback_tests {
         }
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
-        let mut cfg = ClientConfig12::new(roots);
+        let mut cfg = client_config12(roots);
         if let Some(l) = client_limit {
             cfg = cfg.with_record_size_limit(l);
         }
@@ -8596,7 +8648,7 @@ mod tls12_loopback_tests {
         // Both peers opt out of the EMS requirement so the legacy
         // randoms-only PRF path can complete (test documents that path).
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots).with_require_ems(false),
+            client_config12(roots).with_require_ems(false),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8646,7 +8698,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"ems-rt-1c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ems-rt-1s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8681,7 +8733,7 @@ mod tls12_loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"ems-rt-2c", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"ems-rt-2s", b"nonce", &[]);
         let mut client2 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots2).with_session(session),
+            client_config12(roots2).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8726,7 +8778,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"cross-ems-1c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"cross-ems-1s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8761,7 +8813,7 @@ mod tls12_loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"cross-ems-2c", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"cross-ems-2s", b"nonce", &[]);
         let mut client2 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots2).with_session(session),
+            client_config12(roots2).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8824,7 +8876,7 @@ mod tls12_loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"legacy-rt-1c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"legacy-rt-1s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots).with_require_ems(false),
+            client_config12(roots).with_require_ems(false),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -8862,7 +8914,7 @@ mod tls12_loopback_tests {
         let mut crng2 = HmacDrbg::<Sha256>::new(b"legacy-rt-2c", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"legacy-rt-2s", b"nonce", &[]);
         let mut client2 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots2)
+            client_config12(roots2)
                 .with_session(session)
                 .with_require_ems(false),
             "loopback.example",
@@ -8974,7 +9026,7 @@ mod tls12_loopback_tests {
 
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
-        let mut cfg = ClientConfig12::new(roots);
+        let mut cfg = client_config12(roots);
         cfg.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-ocsp-good-c", b"nonce", &[]);
@@ -9069,7 +9121,7 @@ mod tls12_loopback_tests {
 
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
-        let mut cfg = ClientConfig12::new(roots)
+        let mut cfg = client_config12(roots)
             .with_min_version(version)
             .with_max_version(version);
         cfg.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
@@ -9172,7 +9224,7 @@ mod tls12_loopback_tests {
 
         let mut roots = RootCertStore::new();
         roots.add_der(root_der).unwrap();
-        let mut cfg = ClientConfig12::new(roots);
+        let mut cfg = client_config12(roots);
         cfg.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
 
         let mut crng = HmacDrbg::<Sha256>::new(b"tls12-ocsp-rev-c", b"nonce", &[]);
@@ -9436,13 +9488,13 @@ fn synthetic_hrr_record_for_audit(selected_group: crate::tls::codec::NamedGroup)
 /// Regression tests for the TLS-engine security audit findings.
 #[cfg(test)]
 mod audit_regression_tests {
+    use super::test_fixtures::{client_config, client_config12};
     use super::{ClientConnection, ServerConfig, ServerConnection};
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
     use crate::rsa::BoxedRsaPrivateKey;
     use crate::test_util::rsa_test_key_a;
     use crate::tls::codec::{CipherSuite, NamedGroup};
-    use crate::tls::conn::ClientConfig;
     use crate::tls::{Error, RootCertStore};
     use crate::x509::{Certificate, DistinguishedName, Time, Validity};
     use alloc::vec::Vec;
@@ -9489,7 +9541,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(tag, b"c", &[]);
         let srng = HmacDrbg::<Sha256>::new(tag, b"s", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -9534,7 +9586,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"cv-scheme-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"cv-scheme-s", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_client_cert(cc),
+            client_config(roots).with_client_cert(cc),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -9633,7 +9685,7 @@ mod audit_regression_tests {
             let mut crng = HmacDrbg::<Sha256>::new(b"pss-family-c", b"nonce", &[]);
             let srng = HmacDrbg::<Sha256>::new(b"pss-family-s", b"nonce", &[]);
             let mut client = ClientConnection::new_with_offer(
-                ClientConfig::new(roots).with_client_cert(cc),
+                client_config(roots).with_client_cert(cc),
                 "loopback.example",
                 &mut crng,
                 &[CipherSuite::AES_128_GCM_SHA256],
@@ -9677,7 +9729,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"fin-mismatch-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"fin-mismatch-s", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -10038,7 +10090,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"skip-ed-c1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"skip-ed-s1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots.clone()),
+            client_config(roots.clone()),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -10057,7 +10109,7 @@ mod audit_regression_tests {
         let mut server2 = ServerConnection::new(server_config2, srng2);
         let mut crng2 = HmacDrbg::<Sha256>::new(b"skip-ed-c2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_session(session),
+            client_config(roots).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -10110,7 +10162,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"eoed-req-c1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"eoed-req-s1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots.clone()),
+            client_config(roots.clone()),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -10130,7 +10182,7 @@ mod audit_regression_tests {
         let mut server2 = ServerConnection::new(server_config2, srng2);
         let mut crng2 = HmacDrbg::<Sha256>::new(b"eoed-req-c2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_session(session),
+            client_config(roots).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -10164,9 +10216,7 @@ mod audit_regression_tests {
     #[test]
     fn tls12_client_refuses_a_second_certificate_request() {
         use crate::tls::codec::{CertificateRequest12, SignatureScheme, write_record};
-        use crate::tls::conn::{
-            ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12,
-        };
+        use crate::tls::conn::{ClientConnection12, ServerConfig12, ServerConnection12};
         use crate::tls::{ContentType, ProtocolVersion};
 
         let key = rsa_test_key_a();
@@ -10185,8 +10235,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"cr12-dup-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"cr12-dup-s", b"nonce", &[]);
         let mut client =
-            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng)
-                .unwrap();
+            ClientConnection12::new(client_config12(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection12::new(server_config, srng);
 
         // Server flight: SH, Certificate, ServerKeyExchange, ServerHelloDone,
@@ -10243,9 +10292,7 @@ mod audit_regression_tests {
     #[test]
     fn tls12_client_refuses_a_second_new_session_ticket() {
         use crate::tls::codec::{NewSessionTicket12, write_record};
-        use crate::tls::conn::{
-            ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12,
-        };
+        use crate::tls::conn::{ClientConnection12, ServerConfig12, ServerConnection12};
         use crate::tls::{ContentType, ProtocolVersion};
 
         let key = rsa_test_key_a();
@@ -10264,8 +10311,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"nst12-dup-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"nst12-dup-s", b"nonce", &[]);
         let mut client =
-            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng)
-                .unwrap();
+            ClientConnection12::new(client_config12(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection12::new(server_config, srng);
 
         // Full server flight; the client answers with CKE+CCS+Finished and
@@ -10314,12 +10360,12 @@ mod audit_regression_tests {
     #[test]
     fn tls12_client_closes_on_fatal_alert() {
         use crate::tls::codec::write_record;
-        use crate::tls::conn::{ClientConfig12, ClientConnection12};
+        use crate::tls::conn::ClientConnection12;
         use crate::tls::{AlertDescription, ContentType, ProtocolVersion};
 
         let mut crng = HmacDrbg::<Sha256>::new(b"alert12-c", b"nonce", &[]);
         let mut client = ClientConnection12::new(
-            ClientConfig12::new(RootCertStore::new()),
+            client_config12(RootCertStore::new()),
             "loopback.example",
             &mut crng,
         )
@@ -10451,7 +10497,7 @@ mod audit_regression_tests {
         roots.add_der(cert_der).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(tag, b"nonce", &[]);
         ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -10580,7 +10626,7 @@ mod audit_regression_tests {
             let mut crng = HmacDrbg::<Sha256>::new(tag, b"c", &[]);
             let srng = HmacDrbg::<Sha256>::new(tag, b"s", &[]);
             let mut client = ClientConnection::new_with_offer(
-                ClientConfig::new(roots),
+                client_config(roots),
                 "loopback.example",
                 &mut crng,
                 &[CipherSuite::AES_128_GCM_SHA256],
@@ -10642,9 +10688,7 @@ mod audit_regression_tests {
     #[test]
     fn tls12_client_rejects_handshake_fragment_spanning_ccs() {
         use crate::tls::codec::write_record;
-        use crate::tls::conn::{
-            ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12,
-        };
+        use crate::tls::conn::{ClientConnection12, ServerConfig12, ServerConnection12};
         use crate::tls::{ContentType, ProtocolVersion};
 
         let key = rsa_test_key_a();
@@ -10663,8 +10707,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"ccs-span-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ccs-span-s", b"nonce", &[]);
         let mut client =
-            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng)
-                .unwrap();
+            ClientConnection12::new(client_config12(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection12::new(server_config, srng);
         server.read_tls(&client.write_tls());
         server.process_new_packets().unwrap();
@@ -10754,7 +10797,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"hrr-shared-c", b"nonce", &[]);
         // Shares for BOTH offered groups.
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -10864,7 +10907,7 @@ mod audit_regression_tests {
     fn tls12_client_drops_application_data_received_before_finished() {
         use crate::tls::codec::{read_record, write_record};
         use crate::tls::conn::{
-            ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12, lookup_suite_12,
+            ClientConnection12, ServerConfig12, ServerConnection12, lookup_suite_12,
         };
         use crate::tls::crypto::aead12::RecordCrypter12;
         use crate::tls::crypto::prf::key_block;
@@ -10903,8 +10946,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"appdata12-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"appdata12-s", b"nonce", &[]);
         let mut client =
-            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng)
-                .unwrap();
+            ClientConnection12::new(client_config12(roots), "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection12::new(server_config, srng);
 
         let ch = client.write_tls();
@@ -11091,7 +11133,7 @@ mod audit_regression_tests {
         let client_with = |tag: &[u8], cc: Option<ClientCertConfig>| {
             let mut roots = RootCertStore::new();
             roots.add_der(cert_der.clone()).unwrap();
-            let mut cfg = ClientConfig::new(roots).with_session(session.clone());
+            let mut cfg = client_config(roots).with_session(session.clone());
             if let Some(cc) = cc {
                 cfg = cfg.with_client_cert(cc);
             }
@@ -11159,7 +11201,7 @@ mod audit_regression_tests {
         // Phase 1: mTLS handshake, ticket issued.
         let mut crng = HmacDrbg::<Sha256>::new(b"c4-13m-1", b"c", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_client_cert(cc()),
+            client_config(roots).with_client_cert(cc()),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -11179,7 +11221,7 @@ mod audit_regression_tests {
         roots2.add_der(cert_der).unwrap();
         let mut crng2 = HmacDrbg::<Sha256>::new(b"c4-13m-2", b"c", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots2)
+            client_config(roots2)
                 .with_client_cert(cc())
                 .with_session(session),
             "loopback.example",
@@ -11235,9 +11277,7 @@ mod audit_regression_tests {
     #[cfg(feature = "std")]
     #[test]
     fn tls12_no_auth_ticket_does_not_resume_on_mtls_required_listener() {
-        use crate::tls::conn::{
-            ClientCertConfig, ClientConfig12, ClientConnection12, ServerConnection12,
-        };
+        use crate::tls::conn::{ClientCertConfig, ClientConnection12, ServerConnection12};
 
         let ticket_key = [0x4cu8; 32];
         let (client_cert_der, client_key) = ed25519_client_cert(b"core4-12");
@@ -11248,7 +11288,7 @@ mod audit_regression_tests {
         roots.add_der(server_der.clone()).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(b"c4-12-1", b"c", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            client_config12(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -11262,7 +11302,7 @@ mod audit_regression_tests {
         let client_with = |tag: &[u8], cc: Option<ClientCertConfig>| {
             let mut roots = RootCertStore::new();
             roots.add_der(server_der.clone()).unwrap();
-            let mut cfg = ClientConfig12::new(roots).with_session(session.clone());
+            let mut cfg = client_config12(roots).with_session(session.clone());
             if let Some(cc) = cc {
                 cfg = cfg.with_client_cert(cc);
             }
@@ -11306,9 +11346,7 @@ mod audit_regression_tests {
     #[cfg(feature = "std")]
     #[test]
     fn tls12_mtls_ticket_resumes_and_restores_peer_certificates() {
-        use crate::tls::conn::{
-            ClientCertConfig, ClientConfig12, ClientConnection12, ServerConnection12,
-        };
+        use crate::tls::conn::{ClientCertConfig, ClientConnection12, ServerConnection12};
 
         let ticket_key = [0x4du8; 32];
         let (client_cert_der, _) = ed25519_client_cert(b"core4-12m");
@@ -11320,7 +11358,7 @@ mod audit_regression_tests {
             // Deterministic: same seed → same cert + key as `client_cert_der`.
             let (der, key) = ed25519_client_cert(b"core4-12m");
             let cc = ClientCertConfig::with_ed25519(alloc::vec![der], key);
-            let mut ccfg = ClientConfig12::new(roots).with_client_cert(cc);
+            let mut ccfg = client_config12(roots).with_client_cert(cc);
             if let Some(s) = session {
                 ccfg = ccfg.with_session(s);
             }
@@ -11370,7 +11408,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"eoed-c1", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"eoed-s1", b"nonce", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots.clone()),
+            client_config(roots.clone()),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -11388,7 +11426,7 @@ mod audit_regression_tests {
         let mut server2 = ServerConnection::new(server_config2, srng2);
         let mut crng2 = HmacDrbg::<Sha256>::new(b"eoed-c2", b"nonce", &[]);
         let mut client2 = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_session(session),
+            client_config(roots).with_session(session),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -11427,7 +11465,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(seed, b"c1", &[]);
         let srng = HmacDrbg::<Sha256>::new(seed, b"s1", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots),
+            client_config(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -11461,7 +11499,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(seed, b"c2", &[]);
         let srng = HmacDrbg::<Sha256>::new(seed, b"s2", &[]);
         let client = ClientConnection::new_with_offer_partial_shares(
-            ClientConfig::new(roots).with_session(session),
+            client_config(roots).with_session(session),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
@@ -11632,7 +11670,7 @@ mod audit_regression_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"psk-idx", b"c2", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"psk-idx", b"s2", &[]);
         let mut client = ClientConnection::new_with_offer(
-            ClientConfig::new(roots).with_session(session),
+            client_config(roots).with_session(session),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
