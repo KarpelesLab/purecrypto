@@ -565,13 +565,12 @@ pub(crate) struct RecvStream {
     pub(crate) read_off: u64,
     /// Out-of-order fragments keyed by start offset.
     pub(crate) pending: BTreeMap<u64, Vec<u8>>,
-    /// Sum of `pending`'s value lengths. Overlapping fragments are each
-    /// stored in full, so the byte volume held here is NOT bounded by the
-    /// per-stream flow-control ceiling (which constrains each fragment's
-    /// END OFFSET, not the sum of fragment lengths): a peer replaying the
-    /// same range at descending offsets can hold `MAX_PENDING_FRAGMENTS`
-    /// near-window-sized copies while charging the window only once. This
-    /// running total lets [`RecvStream::on_data`] enforce a real byte cap.
+    /// Sum of `pending`'s value lengths. The fragments are kept disjoint
+    /// (an overlapping frame only contributes the bytes no fragment holds
+    /// yet), so this never exceeds `max end seen - next_offset` — the
+    /// extent the peer has been charged at the connection level. This
+    /// running total also lets [`RecvStream::on_data`] enforce a byte cap
+    /// against the per-stream window as a backstop.
     pub(crate) pending_bytes: usize,
     /// Total stream length once the FIN bit is observed.
     pub(crate) fin_offset: Option<u64>,
@@ -760,75 +759,108 @@ impl RecvStream {
                 self.next_offset = p_end;
             }
         } else {
-            // Out-of-order. Coalesce: if pending already has a covering
-            // entry at or before this offset, drop. Otherwise insert.
+            // Out-of-order. Store only the bytes of `[offset, new_end)` that
+            // no pending fragment already holds, so `pending` stays a set of
+            // DISJOINT ranges.
+            //
+            // It used to store each fragment whole unless a single
+            // predecessor covered it, so overlapping fragments were each
+            // kept in full: descending-offset replays `[k, H)`, `[k-1, H)`,
+            // … defeated the predecessor test and stored every copy. The
+            // QUIC-A3 byte budget below capped that at the per-stream
+            // window, but the connection-level charge is only
+            // `max(end) - prev_high` (see `Streams::on_stream`), so a peer
+            // could hold close to a full stream window per stream — Σ of
+            // the stream windows in all — while being charged a small
+            // fraction of `initial_max_data`. With disjoint storage every
+            // buffered byte lies in `[next_offset, max end seen)`, i.e.
+            // inside the extent the peer has actually been charged for at
+            // the connection level, so the total across streams is bounded
+            // by the connection window.
+            //
+            // Only the new bytes are copied: an uncovered piece that starts
+            // exactly where a pending fragment ends is appended to it (so an
+            // in-order run behind a gap stays one fragment), anything else
+            // becomes a fragment of its own. Existing fragments are never
+            // re-copied, so a small overlapping frame cannot make us move a
+            // window's worth of buffered bytes.
             let new_end = offset + data.len() as u64;
-            let mut should_insert = true;
-            if let Some((&prev_off, prev_data)) = self.pending.range(..=offset).next_back() {
-                let prev_end = prev_off + prev_data.len() as u64;
-                if prev_end >= new_end {
-                    should_insert = false;
+            // Uncovered sub-ranges, ascending. The walk starts at the last
+            // fragment beginning at or before `offset` (the only one that
+            // can cover the head of the new range) and visits the at most
+            // `MAX_PENDING_FRAGMENTS` fragments that start inside it.
+            let mut pieces: Vec<(u64, u64)> = Vec::new();
+            let mut cursor = offset;
+            let walk_from = self
+                .pending
+                .range(..=offset)
+                .next_back()
+                .map_or(offset, |(&k, _)| k);
+            for (&p_off, p_data) in self.pending.range(walk_from..new_end) {
+                let p_end = p_off + p_data.len() as u64;
+                if p_end <= cursor {
+                    continue;
+                }
+                if p_off > cursor {
+                    pieces.push((cursor, p_off));
+                }
+                cursor = p_end;
+                if cursor >= new_end {
+                    break;
                 }
             }
-            if should_insert {
-                // If an existing entry at the same offset is shorter,
-                // replace it.
-                let existing = self.pending.get(&offset).map(|v| v.len()).unwrap_or(0);
-                if data.len() > existing {
-                    // QUIC-4: bound the per-stream fragment count.
-                    // A replacement at the same offset doesn't grow
-                    // the map, so it's always allowed; a new key
-                    // would only be allowed if we're below the cap.
-                    if !self.pending.contains_key(&offset)
-                        && self.pending.len() >= MAX_PENDING_FRAGMENTS
-                    {
-                        // The out-of-order reassembly buffer is full. This is
-                        // NOT a protocol violation: it happens legitimately
-                        // under heavy loss/reordering when a low-offset gap
-                        // stays unfilled while the peer keeps sending (and
-                        // PTO-retransmitting) higher-offset fragments — e.g. a
-                        // bulk transfer over a link that drops every Nth packet.
-                        //
-                        // Per-stream flow control (`end <= max_data`, enforced
-                        // above) already bounds how far ahead of the contiguous
-                        // point the peer can be, so the buffered byte volume is
-                        // bounded; this fragment *count* cap is only a secondary
-                        // guard against a flood of tiny fragments. The correct,
-                        // loss-tolerant response is to drop this fragment rather
-                        // than tear the connection down with FLOW_CONTROL_ERROR
-                        // (the previous `Err(Decode)`): the sender still holds it
-                        // as unacked and will retransmit once the contiguity gap
-                        // fills and frees a buffer slot. RFC 9000 §2.2 permits a
-                        // receiver to discard out-of-order data it cannot buffer.
-                        // `newly_contig` is 0 on this out-of-order path.
-                        return Ok(newly_contig);
-                    }
-                    // QUIC-A3: bound the per-stream out-of-order BYTE
-                    // volume, not just the fragment count. `end <= max_data`
-                    // (checked above) bounds each fragment's end offset, not
-                    // the sum of their lengths — fragments that overlap are
-                    // each stored in full, so descending-offset replays of a
-                    // window-sized range would otherwise buffer
-                    // `MAX_PENDING_FRAGMENTS` copies of it. The peer is only
-                    // ever entitled to `max_data - next_offset` bytes beyond
-                    // the contiguous point, so that is the budget; a
-                    // conformant sender never exceeds it, because its
-                    // non-overlapping fragments all live inside that span.
-                    // As with the fragment cap we DROP rather than error:
-                    // the excess is by construction redundant with data we
-                    // already hold, and the sender still owns it as unacked.
-                    let budget = self.max_data.saturating_sub(self.next_offset);
-                    let budget = usize::try_from(budget).unwrap_or(usize::MAX);
-                    let projected = self
-                        .pending_bytes
-                        .saturating_sub(existing)
-                        .saturating_add(data.len());
-                    if projected > budget {
-                        return Ok(newly_contig);
-                    }
-                    self.pending_bytes = projected;
-                    self.pending.insert(offset, data.to_vec());
+            if cursor < new_end {
+                pieces.push((cursor, new_end));
+            }
+            for (p_start, p_end) in pieces {
+                let bytes = &data[(p_start - offset) as usize..(p_end - offset) as usize];
+                // QUIC-A3: bound the per-stream out-of-order BYTE volume.
+                // The peer is only ever entitled to `max_data - next_offset`
+                // bytes beyond the contiguous point; with disjoint storage
+                // this can no longer be exceeded (every piece lies below
+                // `max_data`, checked above), so it is a backstop. As with
+                // the fragment cap we DROP rather than error: the sender
+                // still owns the bytes as unacked.
+                let budget = self.max_data.saturating_sub(self.next_offset);
+                let budget = usize::try_from(budget).unwrap_or(usize::MAX);
+                let projected = self.pending_bytes.saturating_add(bytes.len());
+                if projected > budget {
+                    break;
                 }
+                // Extend the fragment that ends exactly where this piece
+                // starts, if any.
+                let adjacent = self
+                    .pending
+                    .range_mut(..p_start)
+                    .next_back()
+                    .filter(|(k, v)| **k + v.len() as u64 == p_start);
+                if let Some((_, frag)) = adjacent {
+                    frag.extend_from_slice(bytes);
+                    self.pending_bytes = projected;
+                    continue;
+                }
+                // QUIC-4: bound the per-stream fragment count.
+                if self.pending.len() >= MAX_PENDING_FRAGMENTS {
+                    // The out-of-order reassembly buffer is full. This is
+                    // NOT a protocol violation: it happens legitimately
+                    // under heavy loss/reordering when a low-offset gap
+                    // stays unfilled while the peer keeps sending (and
+                    // PTO-retransmitting) higher-offset fragments — e.g. a
+                    // bulk transfer over a link that drops every Nth packet.
+                    //
+                    // The byte volume is bounded separately (above); this
+                    // fragment *count* cap guards against a flood of tiny
+                    // fragments. The correct, loss-tolerant response is to
+                    // drop the rest of this frame rather than tear the
+                    // connection down with FLOW_CONTROL_ERROR: the sender
+                    // still holds it as unacked and will retransmit once the
+                    // contiguity gap fills and frees a buffer slot. RFC 9000
+                    // §2.2 permits a receiver to discard out-of-order data it
+                    // cannot buffer.
+                    break;
+                }
+                self.pending_bytes = projected;
+                self.pending.insert(p_start, bytes.to_vec());
             }
         }
         // FIN sets state. SizeKnown if FIN observed but bytes still pending.
@@ -1373,7 +1405,71 @@ mod tests {
             "buffered {} bytes for a {WINDOW}-byte window",
             r.pending_bytes
         );
-        assert!(r.pending.len() < MAX_PENDING_FRAGMENTS);
+        assert!(r.pending.len() <= MAX_PENDING_FRAGMENTS);
+    }
+
+    /// Out-of-order fragments are stored disjointly, so the buffered volume
+    /// is bounded by the extent the peer has been charged for at the
+    /// connection level (`max end - next_offset`), not merely by the
+    /// per-stream window. Descending-offset overlapping replays `[k, H)`,
+    /// `[k-1, H)`, … used to defeat the predecessor-coverage test and store
+    /// every copy in full: ~`(H - next_offset)^2 / 2` bytes held (up to the
+    /// stream window) against a connection-level charge of `H`, which
+    /// across many streams summed to Σ stream windows instead of
+    /// `initial_max_data`.
+    #[test]
+    fn overlapping_replays_are_bounded_by_the_charged_extent() {
+        const WINDOW: u64 = 1 << 20;
+        const H: u64 = 1024;
+        let mut r = RecvStream::new(WINDOW);
+        let payload = alloc::vec![0x5au8; H as usize];
+        for k in (1..H).rev() {
+            r.on_data(k, &payload[k as usize..], false)
+                .expect("no protocol violation");
+        }
+        let summed: usize = r.pending.values().map(|v| v.len()).sum();
+        assert_eq!(summed, r.pending_bytes, "pending_bytes accounting drifted");
+        assert!(
+            r.pending_bytes as u64 <= H - r.next_offset,
+            "buffered {} bytes for a charged extent of {H}",
+            r.pending_bytes
+        );
+        // Disjoint ranges.
+        let mut prev_end = 0;
+        for (&off, v) in &r.pending {
+            assert!(off >= prev_end, "overlapping fragments stored");
+            prev_end = off + v.len() as u64;
+        }
+        // Filling the gap delivers exactly the stream's bytes once.
+        let got = r.on_data(0, &payload, false).expect("fill");
+        assert_eq!(got, H);
+        assert_eq!(r.delivered.len() as u64, H);
+        assert!(r.pending.is_empty());
+        assert_eq!(r.pending_bytes, 0);
+    }
+
+    /// A frame overlapping several buffered fragments stores only the gaps
+    /// between them, and the data delivered is the union, byte for byte.
+    #[test]
+    fn overlapping_fragment_fills_only_the_gaps() {
+        let mut r = RecvStream::new(4096);
+        let stream: Vec<u8> = (0..64u8).collect();
+        r.on_data(10, &stream[10..20], false).unwrap();
+        r.on_data(30, &stream[30..40], false).unwrap();
+        assert_eq!(r.pending_bytes, 20);
+        // [5, 50) overlaps both: only [5,10), [20,30) and [40,50) are new.
+        r.on_data(5, &stream[5..50], false).unwrap();
+        assert_eq!(r.pending_bytes, 45);
+        // A same-offset longer resend extends in place (no new key).
+        let keys = r.pending.len();
+        r.on_data(5, &stream[5..60], false).unwrap();
+        assert_eq!(r.pending_bytes, 55);
+        assert_eq!(r.pending.len(), keys);
+        let got = r.on_data(0, &stream[..5], false).unwrap();
+        assert_eq!(got, 60);
+        let mut out = [0u8; 64];
+        let (n, _) = r.read(&mut out);
+        assert_eq!(&out[..n], &stream[..60]);
     }
 
     /// The byte cap must not reject a conformant sender: non-overlapping
