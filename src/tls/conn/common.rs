@@ -113,6 +113,17 @@ pub(crate) struct ConnectionCore {
     /// ciphertext bytes. Armed by the server when it declines a 0-RTT offer
     /// the client made; cleared by the first record that deprotects.
     skip_early_data: Option<usize>,
+    /// RFC 8446 §4.6.3: the peer sent `KeyUpdate(update_requested)` and we
+    /// owe it a `KeyUpdate` of our own "prior to sending [our] next
+    /// Application Data record". The engines record the obligation here
+    /// instead of replying on the spot and discharge it once — however many
+    /// requests arrived — at the end of the processing drain or before the
+    /// next application write. Replying per request let a peer interleaving
+    /// `[empty application_data, KeyUpdate(update_requested)]` (which keeps
+    /// resetting the back-to-back flood guard) make us rotate our write key
+    /// and queue one outbound record per inbound request, growing the
+    /// output buffer without bound while it never reads.
+    key_update_reply_pending: bool,
 }
 
 impl ConnectionCore {
@@ -134,6 +145,7 @@ impl ConnectionCore {
             app_data_allowed: false,
             write_error: None,
             skip_early_data: None,
+            key_update_reply_pending: false,
         }
     }
 
@@ -171,6 +183,20 @@ impl ConnectionCore {
     /// every intended 1-RTT fallback.
     pub(crate) fn begin_skip_early_data(&mut self, budget: usize) {
         self.skip_early_data = Some(budget);
+    }
+
+    /// Notes that the peer requested a `KeyUpdate` (see
+    /// `key_update_reply_pending`). Idempotent: any number of requests
+    /// before the reply goes out are answered by that one reply.
+    pub(crate) fn defer_key_update_reply(&mut self) {
+        self.key_update_reply_pending = true;
+    }
+
+    /// Takes the pending `KeyUpdate` reply obligation, if any. The engine
+    /// that gets `true` must emit its `KeyUpdate(update_not_requested)` and
+    /// step its write key now.
+    pub(crate) fn take_key_update_reply(&mut self) -> bool {
+        core::mem::take(&mut self.key_update_reply_pending)
     }
 
     /// Whether the "skip rejected early data" window is still open (test and

@@ -1535,6 +1535,12 @@ impl<R: RngCore> ServerConnection<R> {
         {
             return Ok(());
         }
+        // A reply owed to the peer's KeyUpdate(update_requested) precedes
+        // this application record (RFC 8446 §4.6.3); it rotates the write
+        // key, so the soft-limit check is moot.
+        if self.core.take_key_update_reply() {
+            return self.send_key_update(false);
+        }
         if self
             .core
             .write_seq()
@@ -1682,7 +1688,17 @@ impl<R: RngCore> ServerConnection<R> {
                 // `ConnectionCore::check_write_error`) means a record we
                 // believed we sent is not on the wire; surface it rather
                 // than reporting a clean drain.
-                Ok(None) => return self.core.check_write_error(),
+                Ok(None) => {
+                    // One KeyUpdate answers every request of this drain.
+                    if self.core.take_key_update_reply()
+                        && let Err(e) = self.send_key_update(false)
+                    {
+                        self.core.send_alert(alert_for(&e));
+                        self.state = State::Closed;
+                        return Err(e);
+                    }
+                    return self.core.check_write_error();
+                }
                 Err(e) => {
                     self.core.send_alert(alert_for(&e));
                     self.close();
@@ -1806,7 +1822,10 @@ impl<R: RngCore> ServerConnection<R> {
         self.core.set_read(suite.crypter(&next))?;
         self.client_app_secret = Some(next);
         if ku.request_update {
-            self.send_key_update(false)?;
+            // Replied to once per drain / before our next application
+            // record, however many requests arrived (RFC 8446 §4.6.3; see
+            // `ConnectionCore`'s `key_update_reply_pending`).
+            self.core.defer_key_update_reply();
         }
         Ok(())
     }

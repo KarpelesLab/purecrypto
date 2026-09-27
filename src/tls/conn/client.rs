@@ -2100,6 +2100,12 @@ impl ClientConnection {
         {
             return Ok(());
         }
+        // A reply owed to the peer's KeyUpdate(update_requested) precedes
+        // this application record (RFC 8446 §4.6.3); it rotates the write
+        // key, so the soft-limit check is moot.
+        if self.core.take_key_update_reply() {
+            return self.send_key_update(false);
+        }
         if self
             .core
             .write_seq()
@@ -2202,7 +2208,16 @@ impl ClientConnection {
                 // `ConnectionCore::check_write_error`) means a record we
                 // believed we sent is not on the wire; surface it rather
                 // than reporting a clean drain.
-                Ok(None) => return self.core.check_write_error(),
+                Ok(None) => {
+                    // One KeyUpdate answers every request of this drain.
+                    if self.core.take_key_update_reply()
+                        && let Err(e) = self.send_key_update(false)
+                    {
+                        self.fail(&e);
+                        return Err(e);
+                    }
+                    return self.core.check_write_error();
+                }
                 Err(e) => {
                     self.fail(&e);
                     return Err(e);
@@ -2329,10 +2344,12 @@ impl ClientConnection {
         self.server_app_secret = Some(next);
 
         if ku.request_update {
-            // Send our own KeyUpdate (not_requested) and step the write side.
-            // RFC 8446 §4.6.3: only one round of request is permitted, so we
-            // reply with `update_not_requested` to avoid an infinite loop.
-            self.send_key_update(false)?;
+            // Owe the peer our own KeyUpdate (not_requested — RFC 8446
+            // §4.6.3 permits only one round of request). It goes out once
+            // per drain / before our next application record, so a burst
+            // of requests costs one reply (see `ConnectionCore`'s
+            // `key_update_reply_pending`).
+            self.core.defer_key_update_reply();
         }
         Ok(())
     }

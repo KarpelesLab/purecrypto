@@ -2039,6 +2039,128 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"after-server");
     }
 
+    /// An RSA-server loopback pair driven to `Connected`.
+    fn connected_pair(label: &[u8]) -> (ClientConnection, ServerConnection<HmacDrbg<Sha256>>) {
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(label, b"client", &[]);
+        let srng = HmacDrbg::<Sha256>::new(label, b"server", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng).unwrap();
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        (client, server)
+    }
+
+    /// Number of records in `wire`.
+    fn record_count(wire: &[u8]) -> usize {
+        let mut off = 0;
+        let mut n = 0;
+        while let Some(rec) = crate::tls::codec::read_record(&wire[off..]).unwrap() {
+            off += rec.len;
+            n += 1;
+        }
+        assert_eq!(off, wire.len(), "trailing partial record");
+        n
+    }
+
+    /// Finding: every `KeyUpdate(update_requested)` got its own reply.
+    /// RFC 8446 §4.6.3 only obliges one KeyUpdate before our next
+    /// application record, and a peer interleaving an empty
+    /// `application_data` record before each request (which resets the
+    /// back-to-back flood guard) could make us rotate our write key and
+    /// queue an outbound record per request, without bound. A drain of any
+    /// number of requests now yields exactly one reply.
+    #[test]
+    fn key_update_requests_in_one_drain_get_one_reply() {
+        for interleave_empty_records in [false, true] {
+            let (mut client, mut server) = connected_pair(b"ku-coalesce");
+            // Past the 64-in-a-row flood guard when the empty records reset
+            // it; five back-to-back requests otherwise.
+            let requests = if interleave_empty_records { 200 } else { 5 };
+            for _ in 0..requests {
+                if interleave_empty_records {
+                    client.emit_unfragmented_application_data_for_test(b"");
+                }
+                client.request_key_update().unwrap();
+            }
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets().unwrap();
+
+            let s = server.write_tls();
+            assert_eq!(
+                record_count(&s),
+                1,
+                "{requests} requests must be answered by a single KeyUpdate"
+            );
+            client.read_tls(&s);
+            client.process_new_packets().unwrap();
+
+            // Both directions stay in step on the new keys.
+            client.send_application_data(b"after-client").unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets().unwrap();
+            assert_eq!(server.take_received_plaintext(), b"after-client");
+            server.send_application_data(b"after-server").unwrap();
+            let s = server.write_tls();
+            assert_eq!(record_count(&s), 1, "no stray KeyUpdate after the reply");
+            client.read_tls(&s);
+            client.process_new_packets().unwrap();
+            assert_eq!(client.take_received_plaintext(), b"after-server");
+        }
+    }
+
+    /// The deferred reply still goes out before our next application
+    /// record even when no drain end intervenes (RFC 8446 §4.6.3: "prior to
+    /// sending its next Application Data record"), and only once.
+    #[test]
+    fn deferred_key_update_reply_precedes_next_application_record() {
+        use crate::tls::codec::KeyUpdate;
+        let (mut client, mut server) = connected_pair(b"ku-before-data");
+        // Hand the client two requests straight to the state machine, so no
+        // processing drain flushes the reply. (Its read key rotates twice;
+        // this test only reads in the other direction.)
+        for _ in 0..2 {
+            client
+                .handle_handshake_for_test(
+                    KeyUpdate {
+                        request_update: true,
+                    }
+                    .encode(),
+                )
+                .unwrap();
+        }
+        assert!(client.write_tls().is_empty(), "the reply is deferred");
+        client.send_application_data(b"data").unwrap();
+        let c = client.write_tls();
+        assert_eq!(record_count(&c), 2, "one KeyUpdate, then the data record");
+        // The server steps its read key on the KeyUpdate and decrypts the
+        // data under the new one.
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"data");
+        client.send_application_data(b"more").unwrap();
+        assert_eq!(record_count(&client.write_tls()), 1);
+    }
+
     /// After a successful handshake, both sides derive identical
     /// application-layer keying material for the same `(label, context)`.
     #[test]
