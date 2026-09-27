@@ -40,10 +40,13 @@ fn cmov<T: ConditionallySelectable>(a: &T, b: &T, c: Choice) -> T {
 /// # Panics
 ///
 /// If `out.len()` exceeds `255 · 32` bytes (the `ell ≤ 255` bound) or
-/// `65535`, or is zero.
+/// `65535`, or is zero; or if `dst` is empty (§3.1: tags MUST be non-empty,
+/// as an empty one collapses the domain separation this function exists
+/// to provide).
 pub fn expand_message_xmd(msg: &[u8], dst: &[u8], out: &mut [u8]) {
     const B_IN_BYTES: usize = 32;
     const S_IN_BYTES: usize = 64;
+    assert!(!dst.is_empty(), "expand_message_xmd: empty DST");
     let len_in_bytes = out.len();
     assert!(
         len_in_bytes > 0 && len_in_bytes <= 65535,
@@ -262,7 +265,8 @@ fn map_to_curve_g2(u: &Fp2) -> Projective<Fp2> {
 }
 
 /// `hash_to_curve` for the suite `BLS12381G1_XMD:SHA-256_SSWU_RO_`
-/// (RFC 9380 §8.8.1) with the given domain separation tag.
+/// (RFC 9380 §8.8.1) with the given domain separation tag, which must
+/// be non-empty (panics otherwise, see [`expand_message_xmd`]).
 pub fn hash_to_g1(msg: &[u8], dst: &[u8]) -> G1 {
     let [u0, u1] = hash_to_field_fp(msg, dst);
     let q0 = map_to_curve_g1(&u0);
@@ -271,7 +275,8 @@ pub fn hash_to_g1(msg: &[u8], dst: &[u8]) -> G1 {
 }
 
 /// `hash_to_curve` for the suite `BLS12381G2_XMD:SHA-256_SSWU_RO_`
-/// (RFC 9380 §8.8.2) with the given domain separation tag.
+/// (RFC 9380 §8.8.2) with the given domain separation tag, which must
+/// be non-empty (panics otherwise, see [`expand_message_xmd`]).
 pub fn hash_to_g2(msg: &[u8], dst: &[u8]) -> G2 {
     let [u0, u1] = hash_to_field_fp2(msg, dst);
     let q0 = map_to_curve_g2(&u0);
@@ -281,6 +286,8 @@ pub fn hash_to_g2(msg: &[u8], dst: &[u8]) -> G2 {
 
 impl G1 {
     /// Hashes a message to `G1` (RFC 9380 `BLS12381G1_XMD:SHA-256_SSWU_RO_`).
+    ///
+    /// Panics if `dst` is empty (see [`hash_to_g1`]).
     pub fn hash_to_curve(msg: &[u8], dst: &[u8]) -> G1 {
         hash_to_g1(msg, dst)
     }
@@ -288,6 +295,8 @@ impl G1 {
 
 impl G2 {
     /// Hashes a message to `G2` (RFC 9380 `BLS12381G2_XMD:SHA-256_SSWU_RO_`).
+    ///
+    /// Panics if `dst` is empty (see [`hash_to_g2`]).
     pub fn hash_to_curve(msg: &[u8], dst: &[u8]) -> G2 {
         hash_to_g2(msg, dst)
     }
@@ -319,6 +328,13 @@ mod tests {
         let mut v = prefix.as_bytes().to_vec();
         v.extend(core::iter::repeat_n(c, n));
         v
+    }
+
+    #[test]
+    #[should_panic(expected = "empty DST")]
+    fn expand_message_xmd_rejects_empty_dst() {
+        let mut out = [0u8; 32];
+        expand_message_xmd(b"abc", b"", &mut out);
     }
 
     #[test]
