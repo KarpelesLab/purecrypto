@@ -89,14 +89,7 @@ impl<W: std::io::Write + Send> WriterKeyLog<W> {
 #[cfg(feature = "std")]
 impl<W: std::io::Write + Send> KeyLog for WriterKeyLog<W> {
     fn log(&self, label: &str, client_random: &[u8; 32], secret: &[u8]) {
-        let mut line =
-            alloc::string::String::with_capacity(label.len() + 1 + 64 + 1 + secret.len() * 2 + 1);
-        line.push_str(label);
-        line.push(' ');
-        append_hex(&mut line, client_random);
-        line.push(' ');
-        append_hex(&mut line, secret);
-        line.push('\n');
+        let line = keylog_line(label, client_random, secret);
         // Errors here are intentionally swallowed: the handshake must not
         // fail because the keylog file went away.
         if let Ok(mut w) = self.writer.lock() {
@@ -121,6 +114,29 @@ pub fn file_keylog(path: &std::path::Path) -> std::io::Result<Arc<WriterKeyLog<s
     }
     let f = opts.open(path)?;
     Ok(Arc::new(WriterKeyLog::new(f)))
+}
+
+/// Formats one `SSLKEYLOGFILE` line: `<label> <hex client_random> <hex
+/// secret>\n`. The line carries the secret in hex, so it is built in a
+/// [`Zeroizing`](crate::zeroize::Zeroizing) buffer reserved at its exact
+/// final length up front — no reallocation leaves an unwiped partial copy
+/// behind — and wiped once the writer has it.
+#[cfg(feature = "std")]
+fn keylog_line(
+    label: &str,
+    client_random: &[u8; 32],
+    secret: &[u8],
+) -> crate::zeroize::Zeroizing<alloc::string::String> {
+    let mut line = crate::zeroize::Zeroizing::new(alloc::string::String::with_capacity(
+        label.len() + 1 + 64 + 1 + secret.len() * 2 + 1,
+    ));
+    line.push_str(label);
+    line.push(' ');
+    append_hex(&mut line, client_random);
+    line.push(' ');
+    append_hex(&mut line, secret);
+    line.push('\n');
+    line
 }
 
 /// Appends `bytes` as lowercase hex to `out`. Only the `std` `WriterKeyLog`
@@ -156,5 +172,21 @@ mod tests {
         let expected_secret = "cd".repeat(48);
         let expected = alloc::format!("CLIENT_RANDOM {expected_cr} {expected_secret}\n");
         assert_eq!(line, expected.as_str());
+    }
+
+    /// Finding: the hex secret line was built in a plain `String` and freed
+    /// unwiped. It is now a wipe-on-drop buffer whose up-front reservation
+    /// is exact, so no reallocation copied the secret elsewhere first.
+    #[test]
+    fn keylog_line_is_wiped_and_never_reallocated() {
+        fn wipes_on_drop<T: crate::zeroize::ZeroizeOnDrop>(_: &T) {}
+        let line = keylog_line("CLIENT_TRAFFIC_SECRET_0", &[0x01; 32], &[0xfe; 48]);
+        wipes_on_drop(&line);
+        assert_eq!(line.len(), line.capacity(), "reservation must be exact");
+        assert!(line.ends_with(&alloc::format!(" {}\n", "fe".repeat(48))));
+
+        let mut line = line;
+        crate::zeroize::Zeroize::zeroize(&mut line);
+        assert!(line.is_empty());
     }
 }
