@@ -2168,12 +2168,14 @@ impl<R: RngCore> ServerConnection12<R> {
         {
             return None;
         }
-        // ALPN match: keep the recovered ALPN if it's in our config.
-        if let Some(ref alpn) = parsed.alpn
-            && self.config.alpn_protocols.iter().any(|p| p == alpn)
-        {
-            self.alpn_negotiated = Some(alpn.clone());
-        }
+        // RFC 7301 §3.2: ALPN is negotiated afresh on every connection,
+        // resumed or not, and the server may only ever answer with a
+        // protocol the *current* ClientHello offered. `alpn_negotiated` was
+        // already settled from this CH before we got here, so the protocol
+        // the ticket recorded (`parsed.alpn`) is deliberately not consulted:
+        // installing it would send an unsolicited ALPN when this CH offered
+        // none, or one outside its list. (Only TLS 1.3 0-RTT needs the
+        // issuing connection's protocol; TLS 1.2 has no early data.)
         Some(ResumedState {
             suite,
             master_secret: parsed.master_secret,
@@ -3958,6 +3960,47 @@ mod tests {
         // mint) is refused outright rather than living forever.
         let timeless = seal_test_ticket(&mut engine, None, 0);
         assert!(engine.try_resume(&timeless, &[TICKET_SUITE]).is_none());
+    }
+
+    /// RFC 7301 §3.2: ALPN is negotiated on every connection. The protocol
+    /// recorded in the ticket must not override what the current ClientHello
+    /// negotiated — a CH offering no ALPN gets none back (never an
+    /// unsolicited extension), and a CH offering a different protocol keeps
+    /// its own selection.
+    #[test]
+    fn tls12_resumption_keeps_the_alpn_negotiated_from_the_current_hello() {
+        use crate::x509::Time;
+        let key = [0x77u8; 32];
+        let cfg = || {
+            test_rsa_server_config()
+                .with_ticket_key(key)
+                .with_alpn(alloc::vec![b"h2".to_vec(), b"http/1.1".to_vec()])
+                .with_verification_time(Time::utc(2026, 1, 1, 12, 0, 0))
+        };
+        let mut issuer = ticket_engine(cfg());
+        let now = issuer.ticket_now().unwrap();
+        // The issuing connection negotiated `h2`.
+        let seal = issuer.ticket_seal_key().unwrap();
+        let plain = Ticket12Plaintext {
+            cipher_suite: TICKET_SUITE.0,
+            master_secret: [0x5au8; 48],
+            creation_time: now,
+            ems_used: false,
+            alpn: Some(b"h2".to_vec()),
+            client_leaf: None,
+        };
+        let ticket = seal_ticket(&mut issuer.rng, &seal, &plain.encode());
+
+        // This ClientHello offered no ALPN: nothing may be sent back.
+        let mut silent = ticket_engine(cfg());
+        assert!(silent.try_resume(&ticket, &[TICKET_SUITE]).is_some());
+        assert_eq!(silent.alpn_protocol(), None);
+
+        // This ClientHello negotiated `http/1.1`: that selection stands.
+        let mut other = ticket_engine(cfg());
+        other.alpn_negotiated = Some(b"http/1.1".to_vec());
+        assert!(other.try_resume(&ticket, &[TICKET_SUITE]).is_some());
+        assert_eq!(other.alpn_protocol(), Some(&b"http/1.1"[..]));
     }
 
     /// RFC 5246 §7.4.1.2: `SessionID<0..32>`. A longer one is rejected with
