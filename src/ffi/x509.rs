@@ -362,7 +362,7 @@ pub unsafe extern "C" fn pc_ec_self_signed_pem(
     out_len: *mut usize,
 ) -> PcStatus {
     use crate::x509::{CertSigner, DistinguishedName, Time, Validity};
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() || cn.is_null() {
             return PcStatus::NullPointer;
         }
@@ -395,5 +395,6 @@ pub unsafe extern "C" fn pc_ec_self_signed_pem(
             };
         let pem = crate::der::pem_encode("CERTIFICATE", cert.to_der());
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }

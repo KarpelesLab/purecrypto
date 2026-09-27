@@ -2329,6 +2329,39 @@ fn out_len_is_zeroed_on_error_paths() {
     );
     assert_eq!((s, ns, has), (0, 0, 0));
     unsafe { tls::pc_tls_free(client) };
+
+    // `pc_ec_self_signed_pem` on every non-OK exit: NULL key, undecodable
+    // CN, unencodable validity. It used to return the guarded status as-is,
+    // leaving the caller's capacity in `*out_len`.
+    let cn = b"zeroed.example\0";
+    let cn_ptr = cn.as_ptr() as *const core::ffi::c_char;
+    let mut len = out.len();
+    let st = unsafe {
+        x509::pc_ec_self_signed_pem(core::ptr::null(), cn_ptr, 30, out.as_mut_ptr(), &mut len)
+    };
+    assert_eq!(st, PcStatus::NullPointer);
+    assert_eq!(len, 0);
+    let key = ec::pc_ec_generate(1 /* P-256 */);
+    assert!(!key.is_null());
+    let bad_cn = b"\xff\0";
+    let mut len = out.len();
+    let st = unsafe {
+        x509::pc_ec_self_signed_pem(
+            key,
+            bad_cn.as_ptr() as *const core::ffi::c_char,
+            30,
+            out.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    assert_eq!(st, PcStatus::BadEncoding);
+    assert_eq!(len, 0);
+    let mut len = out.len();
+    let st =
+        unsafe { x509::pc_ec_self_signed_pem(key, cn_ptr, u32::MAX, out.as_mut_ptr(), &mut len) };
+    assert_eq!(st, PcStatus::Unsupported);
+    assert_eq!(len, 0);
+    unsafe { ec::pc_ec_free(key) };
 }
 
 // ---- TLS and QUIC accept the same private-key forms -----------------------
