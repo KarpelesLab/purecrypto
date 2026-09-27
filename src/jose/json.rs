@@ -15,8 +15,15 @@
 //! Numbers are kept as their validated source text ([`Number`]); the only
 //! numeric header parameter JOSE defines (`p2c`) is a non-negative integer,
 //! and keeping the text avoids any float rounding question.
+//!
+//! A parsed text may hold secrets (the private members of a JWK), so
+//! [`Value`] and [`Object`] implement [`Zeroize`], the parser's scratch
+//! buffers are wiped when parsing fails part-way, and every string is
+//! decoded into a buffer of its final size so no copy is left behind by
+//! reallocation.
 
 use super::Error;
+use crate::zeroize::{Zeroize, Zeroizing};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -122,16 +129,23 @@ impl Object {
     }
 
     /// Builds an object from `members` in the given order, returning
-    /// `Err(Malformed)` when a name repeats. The check sorts a list of the
-    /// names, so it is `O(n log n)` rather than the `O(n²)` of repeated
-    /// [`insert`](Self::insert).
+    /// `Err(Malformed)` when a name repeats (the members are wiped in that
+    /// case). The check sorts a list of the names, so it is `O(n log n)`
+    /// rather than the `O(n²)` of repeated [`insert`](Self::insert).
     pub(crate) fn from_members(members: Vec<(String, Value)>) -> Result<Self, Error> {
-        let mut names: Vec<&str> = members.iter().map(|(k, _)| k.as_str()).collect();
+        let mut obj = Zeroizing::new(Object(members));
+        obj.check_unique()?;
+        Ok(core::mem::take(&mut *obj))
+    }
+
+    /// `Err(Malformed)` when a member name repeats.
+    fn check_unique(&self) -> Result<(), Error> {
+        let mut names: Vec<&str> = self.0.iter().map(|(k, _)| k.as_str()).collect();
         names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
             return Err(Error::Malformed);
         }
-        Ok(Object(members))
+        Ok(())
     }
 
     /// Appends a string member (see [`insert`](Self::insert)).
@@ -204,6 +218,35 @@ impl Value {
     }
 }
 
+impl Zeroize for Value {
+    /// Wipes every string (and number text) the value holds, recursively,
+    /// and leaves `Null`.
+    fn zeroize(&mut self) {
+        match self {
+            Value::Null | Value::Bool(_) => {}
+            Value::Number(n) => n.0.zeroize(),
+            Value::String(s) => s.zeroize(),
+            Value::Array(a) => a.zeroize(),
+            Value::Object(o) => o.zeroize(),
+        }
+        *self = Value::Null;
+    }
+}
+
+impl Zeroize for Object {
+    /// Wipes every member name and value, recursively, and empties the
+    /// object.
+    fn zeroize(&mut self) {
+        for (name, value) in &mut self.0 {
+            name.zeroize();
+            value.zeroize();
+        }
+        // What the buffer still holds is empty strings and `Null`s, no
+        // secret, so clearing is enough.
+        self.0.clear();
+    }
+}
+
 /// Parses a complete JSON text (any value, surrounded by optional
 /// whitespace).
 pub fn parse(text: &str) -> Result<Value, Error> {
@@ -212,9 +255,10 @@ pub fn parse(text: &str) -> Result<Value, Error> {
         pos: 0,
     };
     p.skip_ws();
-    let v = p.value(0)?;
+    let mut v = p.value(0)?;
     p.skip_ws();
     if p.pos != p.s.len() {
+        v.zeroize();
         return Err(Error::Json);
     }
     Ok(v)
@@ -287,8 +331,12 @@ impl Parser<'_> {
         }
     }
 
+    /// Parses the members of an object; the opening brace has been
+    /// consumed. The members are collected unchecked and wiped if the
+    /// object fails part-way through (a JWK's private members may already
+    /// be among them).
     fn object(&mut self, depth: usize) -> Result<Object, Error> {
-        let mut members: Vec<(String, Value)> = Vec::new();
+        let mut obj = Zeroizing::new(Object::new());
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
@@ -305,10 +353,10 @@ impl Parser<'_> {
             self.expect(b":")?;
             self.skip_ws();
             let value = self.value(depth)?;
-            if members.len() >= MAX_MEMBERS {
+            if obj.len() >= MAX_MEMBERS {
                 return Err(Error::Json);
             }
-            members.push((name, value));
+            obj.0.push((name, value));
             self.skip_ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
@@ -318,19 +366,22 @@ impl Parser<'_> {
                     // Malformed: the text is not an acceptable JSON text
                     // for us). Checked once for the whole object so that a
                     // large one costs `n log n`, not `n²`.
-                    return Object::from_members(members).map_err(|_| Error::Json);
+                    obj.check_unique().map_err(|_| Error::Json)?;
+                    return Ok(core::mem::take(&mut *obj));
                 }
                 _ => return Err(Error::Json),
             }
         }
     }
 
+    /// Parses the items of an array; the opening bracket has been
+    /// consumed. Wiped on failure, like [`object`](Self::object).
     fn array(&mut self, depth: usize) -> Result<Vec<Value>, Error> {
-        let mut items = Vec::new();
+        let mut items = Zeroizing::new(Vec::new());
         self.skip_ws();
         if self.peek() == Some(b']') {
             self.pos += 1;
-            return Ok(items);
+            return Ok(Vec::new());
         }
         loop {
             self.skip_ws();
@@ -340,7 +391,7 @@ impl Parser<'_> {
                 Some(b',') => self.pos += 1,
                 Some(b']') => {
                     self.pos += 1;
-                    return Ok(items);
+                    return Ok(core::mem::take(&mut *items));
                 }
                 _ => return Err(Error::Json),
             }
@@ -359,8 +410,12 @@ impl Parser<'_> {
     }
 
     /// Parses the body of a string; the opening quote has been consumed.
+    /// The text is decoded into a buffer sized to the raw span (no escape
+    /// decodes to more bytes than it spans), so the buffer is never
+    /// reallocated and no unwiped partial copy of a secret is left behind;
+    /// it is wiped if the string turns out malformed.
     fn string(&mut self) -> Result<String, Error> {
-        let mut out: Vec<u8> = Vec::new();
+        let mut out = Zeroizing::new(Vec::with_capacity(self.raw_string_len()));
         loop {
             let c = self.peek().ok_or(Error::Json)?;
             self.pos += 1;
@@ -404,8 +459,25 @@ impl Parser<'_> {
         }
         // The input was `&str`, escapes produce valid UTF-8, and we copied
         // raw bytes only between quote/backslash boundaries which are ASCII,
-        // so the buffer is valid UTF-8.
-        String::from_utf8(out).map_err(|_| Error::Json)
+        // so the buffer is valid UTF-8. `from_utf8` takes the buffer over
+        // without copying it.
+        String::from_utf8(core::mem::take(&mut *out)).map_err(|_| Error::Json)
+    }
+
+    /// The number of raw bytes from `pos` up to the closing quote of the
+    /// string being parsed (the whole remainder when it is unterminated,
+    /// which [`string`](Self::string) then rejects).
+    fn raw_string_len(&self) -> usize {
+        let rest = &self.s[self.pos..];
+        let mut i = 0;
+        while i < rest.len() {
+            match rest[i] {
+                b'"' => return i,
+                b'\\' => i += 2,
+                _ => i += 1,
+            }
+        }
+        rest.len()
     }
 
     fn digits(&mut self) -> usize {
@@ -624,6 +696,32 @@ mod tests {
             Error::Malformed
         );
         assert!(Object::from_members(Vec::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn zeroize_wipes_recursively() {
+        let mut o = parse_object(r#"{"d":"c2VjcmV0","n":[1,{"k":"AAAA"}],"b":true}"#).unwrap();
+        o.zeroize();
+        assert!(o.is_empty());
+        let mut v = parse(r#"[{"k":"AAAA"},"x",2]"#).unwrap();
+        v.zeroize();
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn strings_are_decoded_without_reallocation() {
+        // The decode buffer is sized to the raw span (104 bytes here: two
+        // escapes decode to one byte each) up front; growing it push by
+        // push would have ended at 128.
+        let raw = alloc::format!(r#""{}\/\n""#, "x".repeat(100));
+        let Value::String(s) = parse(&raw).unwrap() else {
+            panic!("string");
+        };
+        assert_eq!(s.len(), 102);
+        assert_eq!(s.capacity(), 104);
+        // The pre-scan copes with a dangling escape at the end of input.
+        assert!(parse("\"ab\\").is_err());
+        assert!(parse("\"ab\\\"").is_err());
     }
 
     #[test]

@@ -282,9 +282,11 @@ fn roca_fingerprint(n: &[u8]) -> bool {
 }
 
 impl Jwk {
-    /// Parses a JWK from its JSON text.
+    /// Parses a JWK from its JSON text. The parsed JSON, which holds the
+    /// base64url text of any private members, is wiped once the key is
+    /// built (or refused).
     pub fn parse(text: &str) -> Result<Self, Error> {
-        Self::from_object(&json::parse_object(text)?)
+        Self::from_object(&Zeroizing::new(json::parse_object(text)?))
     }
 
     /// Builds a JWK from a parsed JSON object, validating the key.
@@ -350,7 +352,8 @@ impl Jwk {
         if obj.contains("oth") {
             return Err(Error::Unsupported("oth"));
         }
-        let d = b64_member(obj, "d")?;
+        // Wrapped at once so a key refused below does not leave it behind.
+        let d = b64_member(obj, "d")?.map(Zeroizing::new);
         let crt_names = ["p", "q", "dp", "dq", "qi"];
         let present = crt_names.iter().filter(|m| obj.contains(m)).count();
         let private = match d {
@@ -395,10 +398,7 @@ impl Jwk {
                     }
                     _ => return Err(Error::Malformed),
                 };
-                Some(RsaPrivateParts {
-                    d: Zeroizing::new(d),
-                    crt,
-                })
+                Some(RsaPrivateParts { d, crt })
             }
         };
         Ok(JwkKey::Rsa { n, e, private })
@@ -417,7 +417,7 @@ impl Jwk {
         sec1.extend_from_slice(&x);
         sec1.extend_from_slice(&y);
         BoxedEcdsaPublicKey::from_sec1(crv.curve_id(), &sec1).map_err(|_| Error::InvalidKey)?;
-        let d = match b64_member(obj, "d")? {
+        let d = match b64_member(obj, "d")?.map(Zeroizing::new) {
             None => None,
             Some(d) => {
                 if d.len() != crv.order_len() {
@@ -428,7 +428,7 @@ impl Jwk {
                 if sk.public_key().to_sec1() != sec1 {
                     return Err(Error::InvalidKey);
                 }
-                Some(Zeroizing::new(d))
+                Some(d)
             }
         };
         Ok(JwkKey::Ec { crv, x, y, d })
@@ -441,7 +441,7 @@ impl Jwk {
         if x.len() != crv.public_len() {
             return Err(Error::InvalidKey);
         }
-        let d = match b64_member(obj, "d")? {
+        let d = match b64_member(obj, "d")?.map(Zeroizing::new) {
             None => None,
             Some(d) => {
                 if d.len() != crv.private_len() {
@@ -464,7 +464,7 @@ impl Jwk {
                 if derived != x {
                     return Err(Error::InvalidKey);
                 }
-                Some(Zeroizing::new(d))
+                Some(d)
             }
         };
         Ok(JwkKey::Okp { crv, x, d })
@@ -1116,9 +1116,10 @@ impl JwkSet {
         JwkSet { keys: Vec::new() }
     }
 
-    /// Parses a JWK Set from its JSON text.
+    /// Parses a JWK Set from its JSON text, wiping the parsed JSON
+    /// afterwards like [`Jwk::parse`].
     pub fn parse(text: &str) -> Result<Self, Error> {
-        Self::from_object(&json::parse_object(text)?)
+        Self::from_object(&Zeroizing::new(json::parse_object(text)?))
     }
 
     /// Builds a set from a parsed JSON object with a `keys` array.
