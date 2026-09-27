@@ -19,6 +19,7 @@ use super::g1::G1;
 use super::g2::G2;
 use super::{constants::B2_3, curve::Projective};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::zeroize::Zeroize;
 
 /// `|x|`, `|x - 1|` and `|(x - 1)/3|` for the hard part.
 const X_ABS: u64 = 0xd201000000010000;
@@ -54,7 +55,11 @@ impl Gt {
 
     /// `self^k`, fixed schedule in `k`.
     pub fn pow(&self, k: &Fr) -> Gt {
-        Gt(self.0.pow(&k.to_canonical()))
+        // As in `G1::mul`: the canonical limbs are the exponent in the clear.
+        let mut limbs = k.to_canonical();
+        let r = Gt(self.0.pow(&limbs));
+        limbs.zeroize();
+        r
     }
 
     /// The underlying `Fp12` element.

@@ -6,6 +6,7 @@ use super::fp2::Fp2;
 use super::fr::Fr;
 use super::{Error, ops_for_group};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::zeroize::Zeroize;
 use core::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
 
 /// A point of `G2`, the prime-order subgroup of the twist `E'(Fp2)`, in
@@ -101,7 +102,12 @@ impl G2 {
     /// `k·P`, constant time in `k`.
     #[inline]
     pub fn mul(&self, k: &Fr) -> G2 {
-        G2(self.0.mul_limbs(&k.to_canonical()))
+        // The canonical limbs are the scalar in the clear; bind them so they
+        // can be wiped, rather than leaving them as an unnamed temporary.
+        let mut limbs = k.to_canonical();
+        let r = G2(self.0.mul_limbs(&limbs));
+        limbs.zeroize();
+        r
     }
 
     /// Maps any point of `E'(Fp2)` into `G2` by multiplying by the effective

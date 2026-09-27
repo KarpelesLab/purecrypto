@@ -220,13 +220,18 @@ impl<F: CurveField> Projective<F> {
         let windows = k.len() * 16;
         for w in (0..windows).rev() {
             acc = acc.double().double().double().double();
-            let digit = (k[w / 16] >> (4 * (w % 16))) & 0xf;
+            let mut digit = (k[w / 16] >> (4 * (w % 16))) & 0xf;
             let mut entry = Self::IDENTITY;
             for (i, t) in table.iter().enumerate() {
                 let take = (i as u64).ct_eq(&digit);
                 entry = Self::conditional_select(t, &entry, take);
             }
             acc = acc.add(&entry);
+            // The selected entry and the digit that picked it are the scalar
+            // window in the clear; wipe them rather than leave them in the
+            // frame for the next iteration to overwrite (or not).
+            entry.zeroize();
+            digit.zeroize();
         }
         for t in table.iter_mut() {
             t.zeroize();

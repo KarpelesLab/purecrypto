@@ -6,6 +6,7 @@ use super::fp::Fp;
 use super::fr::Fr;
 use super::{Error, ops_for_group};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::zeroize::Zeroize;
 use core::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
 
 /// A point of `G1`, the prime-order subgroup of `E(Fp)`, in projective
@@ -95,7 +96,12 @@ impl G1 {
     /// `k·P`, constant time in `k`.
     #[inline]
     pub fn mul(&self, k: &Fr) -> G1 {
-        G1(self.0.mul_limbs(&k.to_canonical()))
+        // The canonical limbs are the scalar in the clear; bind them so they
+        // can be wiped, rather than leaving them as an unnamed temporary.
+        let mut limbs = k.to_canonical();
+        let r = G1(self.0.mul_limbs(&limbs));
+        limbs.zeroize();
+        r
     }
 
     /// Multiplies by the effective cofactor `h_eff = 1 - x` (RFC 9380
