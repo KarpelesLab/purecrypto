@@ -245,7 +245,8 @@ pub(crate) struct ServerConfig {
     /// Clock used to enforce the `notBefore`/`notAfter` validity period of
     /// client certificates under mTLS. `None` (the default) falls back to the
     /// system clock under the `std` feature; under `no_std` with no configured
-    /// time the validity period is not checked. Set explicitly via
+    /// time every client certificate is rejected (`bad_certificate`) rather
+    /// than accepted with its validity period unchecked. Set explicitly via
     /// [`ServerConfig::with_verification_time`].
     verification_time: Option<crate::x509::Time>,
     /// Optional DER-encoded CRL to staple as a per-certificate extension
@@ -3073,6 +3074,15 @@ impl<R: RngCore> ServerConnection<R> {
         // under `std` (F1). mTLS: leaf is a client cert, so require
         // `id-kp-clientAuth` EKU.
         let now = self.config.verification_time.clone().or_else(system_now);
+        // No clock at all (a `no_std` build with no configured verification
+        // time): the validity period could not be checked, and a client
+        // certificate whose `notBefore`/`notAfter` were never enforced must
+        // not authenticate anyone — fail closed. Under `std` the system
+        // clock always supplies a time, so this is unreachable there.
+        #[cfg(not(feature = "std"))]
+        if now.is_none() {
+            return Err(Error::BadCertificate);
+        }
         let leaf_key = crate::tls::pki::verify_chain_with_crls_for_purpose(
             &policy.roots,
             &self.config.crls,
@@ -4703,6 +4713,49 @@ mod tests {
         assert_eq!(s.client_cert_chain.len(), 1);
         assert!(s.client_leaf_key.is_some());
         assert!(s.state == State::WaitClientCertVerify);
+    }
+
+    /// `no_std` fail-closed: with no configured verification time and no
+    /// system clock there is nothing to check a client certificate's
+    /// validity period against, so the (otherwise valid) certificate is
+    /// refused rather than accepted unchecked.
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn tls13_mtls_without_a_clock_rejects_client_cert() {
+        use crate::ec::Ed25519PrivateKey;
+        use crate::rng::HmacDrbg;
+        use crate::tls::pki::RootCertStore;
+        use crate::x509::CertSigner;
+
+        let mut seed = HmacDrbg::<crate::hash::Sha256>::new(b"no-clock-13", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut seed);
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &DistinguishedName::common_name("no-clock-client"),
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            1,
+            false,
+            &["no-clock-client"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der.clone()).unwrap();
+
+        let cfg = test_server_config().with_client_auth(roots, true);
+        let rng = HmacDrbg::<crate::hash::Sha256>::new(b"no-clock-13-s", b"nonce", &[]);
+        let mut s = ServerConnection::new(cfg, rng);
+        s.state = State::WaitClientCertificate;
+
+        let (body, raw) = encode_client_certificate_13(&cert_der);
+        assert!(matches!(
+            s.on_client_certificate(hs_type::CERTIFICATE, &body, &raw),
+            Err(Error::BadCertificate)
+        ));
+        assert!(s.client_leaf_key.is_none());
     }
 
     /// Builds a single-identity `pre_shared_key` ClientHello carrying
