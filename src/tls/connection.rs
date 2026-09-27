@@ -1484,8 +1484,20 @@ pub(crate) fn tls13_client_config(
             // Offer TLS 1.2 alongside 1.3 when the configured range spans down
             // to 1.2 and we are not resuming a (1.3-only) session — so a
             // 1.2-only server can negotiate and the engine can downgrade.
-            // Pinned `min == 1.3` keeps a pure 1.3 ClientHello.
-            cc.offer_tls12 = min_version != ProtocolVersion::TLSv1_3 && resumption.is_none();
+            // Pinned `min == 1.3` keeps a pure 1.3 ClientHello. A stored 1.2
+            // session keeps the 1.2 offer and presents its ticket; the
+            // downgraded engine picks the rest of the session up through
+            // `tls12_client_config`.
+            cc.offer_tls12 = min_version != ProtocolVersion::TLSv1_3
+                && !matches!(
+                    resumption,
+                    Some(ResumptionSession(ResumptionSessionKind::Tls13(_)))
+                );
+            if cc.offer_tls12
+                && let Some(ResumptionSession(ResumptionSessionKind::Tls12(s))) = resumption
+            {
+                cc.tls12_session_ticket = Some(s.ticket.clone());
+            }
             if let Some(rsl) = record_size_limit {
                 cc = cc.with_record_size_limit(rsl);
             }
@@ -2985,6 +2997,55 @@ mod tests {
             .take_session()
             .expect("a 1.2 server with tickets on must issue one");
         assert!(matches!(session.0, ResumptionSessionKind::Tls12(_)));
+    }
+
+    /// RFC 5077 §3.4 through the version-spanning client: a stored TLS 1.2
+    /// session keeps the 1.2 offer, presents its ticket with a fresh
+    /// `session_id`, and the downgraded engine completes an abbreviated
+    /// handshake. A 1.3 server handed the same hello ignores the ticket and
+    /// runs a full 1.3 handshake.
+    #[test]
+    fn auto_client_resumes_a_tls12_session() {
+        fn resumed(c: &Connection) -> bool {
+            match &c.inner {
+                Engine::ClientTlsAuto(a) => match &a.inner {
+                    ClientInner::Tls12(c12) => c12.did_resume(),
+                    ClientInner::Tls13(_) => false,
+                },
+                _ => panic!("expected the version-spanning client engine"),
+            }
+        }
+        let mut server_cfg = tls12_server_cfg();
+        server_cfg.ticket_key = Some([0x5a; 32].into());
+        let mut client = Connection::client(&auto_client_cfg()).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert!(!resumed(&client));
+        let session = client.take_session().expect("1.2 ticket");
+
+        let resumed_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3)
+            .server_name("tls.example")
+            .verify_certificates(false)
+            .resumption_session(session)
+            .build();
+        let mut client2 = Connection::client(&resumed_cfg).unwrap();
+        let mut server2 = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client2, &mut server2);
+        assert_eq!(client2.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
+        assert!(resumed(&client2), "the 1.2 ticket must be resumed");
+        let mut ce = [0u8; 16];
+        let mut se = [0u8; 16];
+        client2.tls_exporter(b"EXPORTER-r", b"", &mut ce).unwrap();
+        server2.tls_exporter(b"EXPORTER-r", b"", &mut se).unwrap();
+        assert_eq!(ce, se);
+
+        // The same stored session against a 1.3 server: full 1.3 handshake.
+        let mut client3 = Connection::client(&resumed_cfg).unwrap();
+        let mut server3 = Connection::server(&tls13_server_cfg(false)).unwrap();
+        drive_pair(&mut client3, &mut server3);
+        assert_eq!(client3.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
     }
 
     /// Auto client ↔ auto server: both default configs interoperate, and 1.3 is

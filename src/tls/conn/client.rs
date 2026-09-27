@@ -376,6 +376,13 @@ pub(crate) struct ClientConfig {
     /// than erroring. Set by the version-spanning client front-end; `false`
     /// keeps a pure-1.3 ClientHello (pinned 1.3 or 1.3 resumption).
     pub offer_tls12: bool,
+    /// RFC 5077 ticket from a stored TLS 1.2 session. When [`Self::offer_tls12`]
+    /// is set, the ClientHello presents it in `session_ticket` together with a
+    /// fresh random `legacy_session_id`, so a 1.2 server can resume it
+    /// (§3.4) and the downgraded engine recognises the echo. A 1.3 server
+    /// ignores both. Dropped when it cannot fit a ClientHello or when real ECH
+    /// seals the hello.
+    pub tls12_session_ticket: Option<Vec<u8>>,
     /// ECH client configuration (draft-ietf-tls-esni-22). `None` (the
     /// default) emits no `encrypted_client_hello` extension. `Some` —
     /// either GREASE or a real `ECHConfigList` — emits a bit-shape-identical
@@ -414,6 +421,7 @@ impl ClientConfig {
             raw_public_key_spki: None,
             key_log: None,
             offer_tls12: false,
+            tls12_session_ticket: None,
             #[cfg(feature = "ech")]
             ech: None,
             #[cfg(feature = "cert-compression")]
@@ -789,6 +797,10 @@ pub struct ClientConnection {
     /// ServerHello triggers a downgrade (see `downgrade_to_tls12`) rather than
     /// `UnsupportedVersion`.
     offer_tls12: bool,
+    /// The `legacy_session_id` our ClientHello carries: empty, except when a
+    /// TLS 1.2 ticket is offered (RFC 5077 §3.4) — then 32 random bytes the
+    /// ServerHello / HRR must echo (RFC 8446 §4.1.3) and the same in CH2.
+    legacy_session_id: Vec<u8>,
     /// Set in `on_server_hello` when the server selected TLS 1.2 and we had
     /// offered it: the version-spanning client front-end then hands the
     /// already-sent ClientHello to a TLS 1.2 engine. No alert is emitted and no
@@ -1403,6 +1415,37 @@ impl ClientConnection {
             config.session = None;
         }
 
+        // RFC 5077 §3.4: a TLS 1.2 ticket rides only on a hello that offers
+        // 1.2, and goes with a fresh random `session_id` whose echo tells the
+        // downgraded engine the server resumed. Real ECH keeps the offer off
+        // for the same reason as the 1.3 session above: its inner hello never
+        // offers 1.2, and the sealed hello must not be traded for a ticket.
+        #[cfg(feature = "ech")]
+        let real_ech = matches!(
+            config.ech,
+            Some(crate::tls::ech::EchClient {
+                mode: crate::tls::ech::EchClientMode::Real(_)
+            })
+        );
+        #[cfg(not(feature = "ech"))]
+        let real_ech = false;
+        if !offer_tls12
+            || real_ech
+            || config
+                .tls12_session_ticket
+                .as_ref()
+                .is_some_and(|t| t.is_empty() || t.len() > MAX_SESSION_TICKET_LEN)
+        {
+            config.tls12_session_ticket = None;
+        }
+        let legacy_session_id = if config.tls12_session_ticket.is_some() {
+            let mut sid = alloc::vec![0u8; 32];
+            rng.fill_bytes(&mut sid);
+            sid
+        } else {
+            Vec::new()
+        };
+
         // If resuming, restrict the cipher-suite offer to suites whose hash
         // matches the session's. The PSK binder and handshake key schedule
         // are tied to that hash.
@@ -1477,6 +1520,7 @@ impl ClientConnection {
             cert_request_received: false,
             cr_signature_algorithms: Vec::new(),
             offer_tls12,
+            legacy_session_id,
             downgrade_to_tls12: false,
             consecutive_key_updates: 0,
             sent_client_hello: Vec::new(),
@@ -1730,10 +1774,13 @@ impl ClientConnection {
             extensions.push(ext::ec_point_formats());
             extensions.push(ext::extended_master_secret_empty());
             extensions.push(ext::renegotiation_info_empty());
-            // RFC 5077 §3.1: an empty `session_ticket` asks a 1.2 server to
-            // issue a ticket, so a 1.2 fallback can resume later through
-            // `ClientConnection12`. A 1.3 server ignores it (RFC 8446 §4.1.2).
-            extensions.push(ext::session_ticket(&[]));
+            // RFC 5077 §3.1: present a stored 1.2 ticket, or an empty
+            // `session_ticket` asking a 1.2 server to issue one, so a 1.2
+            // fallback can resume through `ClientConnection12`. A 1.3 server
+            // ignores the extension.
+            extensions.push(ext::session_ticket(
+                self.config.tls12_session_ticket.as_deref().unwrap_or(&[]),
+            ));
         }
         // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
         // server name or the name is an IP literal (still verified against
@@ -1879,7 +1926,7 @@ impl ClientConnection {
             // signals the real version via `supported_versions`.
             legacy_version: 0x0303,
             random,
-            session_id: Vec::new(),
+            session_id: self.legacy_session_id.clone(),
             cipher_suites: suites.to_vec(),
             extensions,
         }
@@ -2389,13 +2436,11 @@ impl ClientConnection {
         }
 
         // RFC 8446 §4.1.3: the ServerHello MUST echo `legacy_session_id` from
-        // the ClientHello verbatim. This TLS 1.3 client never uses the
-        // middlebox-compatibility session id — it always offers an empty
-        // `legacy_session_id` — so the echo must be empty. Any non-empty echo
-        // means the server did not faithfully reflect what we offered; abort
-        // with illegal_parameter (the same check the RFC mandates the client
-        // perform, also applied on the HRR path below).
-        if !sh.session_id.is_empty() {
+        // the ClientHello verbatim. This client offers an empty one unless it
+        // presents a TLS 1.2 ticket (RFC 5077 §3.4); any other echo means the
+        // server did not faithfully reflect what we offered — abort with
+        // illegal_parameter (also applied on the HRR path below).
+        if sh.session_id != self.legacy_session_id {
             return Err(Error::IllegalParameter);
         }
 
@@ -2636,12 +2681,11 @@ impl ClientConnection {
         }
 
         // RFC 8446 §4.1.4: like the real ServerHello, the HRR MUST echo
-        // `legacy_session_id` from the ClientHello verbatim. This client
-        // always offers an empty `legacy_session_id`, so any non-empty echo
-        // means the server did not faithfully reflect what we offered;
+        // `legacy_session_id` from the ClientHello verbatim; anything else
+        // means the server did not faithfully reflect what we offered —
         // abort with illegal_parameter (mirrors the §4.1.3 check on the
         // real-ServerHello path).
-        if !hrr.session_id.is_empty() {
+        if hrr.session_id != self.legacy_session_id {
             return Err(Error::IllegalParameter);
         }
 
@@ -4929,6 +4973,55 @@ mod tests {
         }
     }
 
+    /// RFC 5077 §3.4: a stored 1.2 ticket rides in `session_ticket` with a
+    /// fresh 32-byte `legacy_session_id` — only on a hello that offers 1.2,
+    /// and only when it fits. The ServerHello must echo that id exactly
+    /// (RFC 8446 §4.1.3).
+    #[test]
+    fn tls12_ticket_offer_and_session_id_echo() {
+        use crate::tls::codec::{CipherSuite, ServerHello};
+
+        let hello = |offer_tls12: bool, ticket: Vec<u8>| {
+            let mut cfg = ClientConfig::new(RootCertStore::new());
+            cfg.offer_tls12 = offer_tls12;
+            cfg.tls12_session_ticket = Some(ticket);
+            let mut rng = HmacDrbg::<Sha256>::new(b"ch-ticket12", b"nonce", &[]);
+            let mut client = ClientConnection::new(cfg, "example.com", &mut rng).unwrap();
+            let out = client.write_tls();
+            let msg = read_record(&out).unwrap().unwrap().fragment.to_vec();
+            (client, ClientHello::decode(&msg[4..]).unwrap())
+        };
+        let (mut client, ch) = hello(true, alloc::vec![0xAB; 100]);
+        assert_eq!(
+            ext::find(&ch.extensions, ExtensionType::SESSION_TICKET),
+            Some(&[0xAB; 100][..])
+        );
+        assert_eq!(ch.session_id.len(), 32);
+
+        // Pure-1.3 hello, or a ticket too large to carry: no offer, empty id.
+        for (offer_tls12, len) in [(false, 100), (true, MAX_SESSION_TICKET_LEN + 1)] {
+            let (_, ch) = hello(offer_tls12, alloc::vec![0xAB; len]);
+            assert!(
+                ext::find(&ch.extensions, ExtensionType::SESSION_TICKET)
+                    .is_none_or(|t| t.is_empty())
+            );
+            assert!(ch.session_id.is_empty());
+        }
+
+        // A 1.3 ServerHello that does not echo our id is refused.
+        let sh = ServerHello {
+            random: [0x11; 32],
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![(ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04])],
+        };
+        let raw = sh.encode();
+        assert!(matches!(
+            client.on_server_hello(hs_type::SERVER_HELLO, &raw[4..], &raw),
+            Err(Error::IllegalParameter)
+        ));
+    }
+
     /// RFC 8879 §3: a `CompressedCertificate` may only use an algorithm the
     /// client advertised. A client advertising brotli alone used to accept a
     /// zlib-compressed Certificate because the decoder only asked whether
@@ -5140,6 +5233,8 @@ mod tests {
         let mut cfg = ClientConfig::new(RootCertStore::new());
         cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
         cfg.offer_tls12 = true;
+        // A stored 1.2 ticket yields to real ECH, like a 1.3 session does.
+        cfg.tls12_session_ticket = Some(alloc::vec![0xAB; 16]);
         let mut rng = HmacDrbg::<Sha256>::new(b"ech-inner-ver-client", b"nonce", &[]);
         let mut client = ClientConnection::new(cfg, "secret.example", &mut rng).unwrap();
         let out = client.write_tls();
@@ -5161,6 +5256,11 @@ mod tests {
             alloc::vec![0x04, 0x03, 0x04, 0x03, 0x03]
         );
         assert_eq!(versions(&inner_ch), alloc::vec![0x02, 0x03, 0x04]);
+        assert!(outer_ch.session_id.is_empty());
+        assert_eq!(
+            ext::find(&outer_ch.extensions, ExtensionType::SESSION_TICKET),
+            Some(&[][..])
+        );
     }
 
     /// Real ECH and PSK resumption are not combined yet; when both are
