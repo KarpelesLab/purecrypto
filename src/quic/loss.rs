@@ -202,6 +202,10 @@ pub(crate) struct LossState {
 
     /// Connection facts RFC 9002 §A.8 consults when arming the timer.
     pub(crate) ctx: LossContext,
+    /// Test-only: sent-packet entries [`Self::detect_lost`] has examined,
+    /// so tests can pin down the cost of loss detection per ACK.
+    #[cfg(test)]
+    pub(crate) detect_lost_visits: u64,
 }
 
 /// The connection-level facts RFC 9002 Appendix A reads while arming the
@@ -264,6 +268,8 @@ impl LossState {
             lost_history: Vec::new(),
             persistent_congestion_declared: None,
             ctx: LossContext::default(),
+            #[cfg(test)]
+            detect_lost_visits: 0,
         }
     }
 
@@ -543,16 +549,29 @@ impl LossState {
 
         let mut lost: Vec<SentPacket> = Vec::new();
         ps.loss_time = None;
-        // Iterate in ascending PN order; remove matching keys after the
-        // walk to avoid borrowing both an iterator and a mutable map.
-        let candidate_pns: Vec<u64> = ps.sent_packets.keys().copied().collect();
+        // Per §6.1 only packets sent before the largest acknowledged one are
+        // eligible, so walk just `..=largest_acked`, in ascending PN order.
+        //
+        // This used to collect EVERY key of `sent_packets` — including the
+        // whole in-flight window above `largest_acked` — into a fresh Vec on
+        // each call, and the ACK handler calls this once per ACK frame: a
+        // single packet carrying ~240 minimal ACK frames cost 240 full walks
+        // of the sent-packet table. Bounded to the eligible prefix, the walk
+        // is proportional to what it removes plus at most
+        // `K_PACKET_THRESHOLD` survivors (anything further below
+        // `largest_acked` is packet-threshold lost), so every packet is
+        // visited O(1) times amortized. Keys are collected first so the
+        // matching ones can be removed without holding the iterator.
+        let candidate_pns: Vec<u64> = ps
+            .sent_packets
+            .range(..=largest_acked)
+            .map(|(&pn, _)| pn)
+            .collect();
+        #[cfg(test)]
+        {
+            self.detect_lost_visits += candidate_pns.len() as u64;
+        }
         for pn in candidate_pns {
-            if pn > largest_acked {
-                // Per §6.1: only packets sent before the largest-acked
-                // are eligible. The map is BTreeMap-sorted so we could
-                // break early, but explicit is clearer.
-                continue;
-            }
             let p = ps.sent_packets.get(&pn).expect("just-listed key");
             // Packet-threshold (§6.1.1): `largest_acked − pn ≥
             // kPacketThreshold`.
@@ -1083,6 +1102,40 @@ mod tests {
             stream_hints: Vec::new(),
             handshake_done: false,
         }
+    }
+
+    /// Loss detection only looks at packets at or below `largest_acked`
+    /// (RFC 9002 §6.1). It used to copy every key of `sent_packets` — the
+    /// whole in-flight window above `largest_acked` included — on each call,
+    /// and it runs once per ACK frame. Now each call examines at most what it
+    /// removes plus `K_PACKET_THRESHOLD` survivors, and the packets above
+    /// `largest_acked` are left untouched.
+    #[test]
+    fn detect_lost_walks_only_the_eligible_prefix() {
+        let mut s = LossState::new();
+        let app = PnSpaceId::Application;
+        let t = Duration::from_millis(100);
+        for pn in 0..10_000u64 {
+            s.on_packet_sent(app, mk_packet(pn, true, true, t));
+        }
+        // ACK pn 10: 0..=7 are packet-threshold lost, 8 and 9 survive.
+        let _ = s.on_ack_received(app, &[10..=10], Duration::ZERO, ms(110));
+        let lost = s.detect_lost(app, ms(110));
+        assert_eq!(
+            lost.iter().map(|p| p.pn).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        assert_eq!(s.detect_lost_visits, 10, "8 removed + 2 survivors");
+        // Repeated passes see only the (at most K_PACKET_THRESHOLD)
+        // survivors, not the 9 989 packets in flight above pn 10.
+        for _ in 0..1000 {
+            assert!(s.detect_lost(app, ms(110)).is_empty());
+        }
+        assert_eq!(s.detect_lost_visits, 10 + 1000 * 2);
+        let ps = &s.per_space[app as usize];
+        assert_eq!(ps.sent_packets.len(), 2 + (11..10_000).count());
+        assert!(ps.sent_packets.contains_key(&8) && ps.sent_packets.contains_key(&9));
+        assert!(ps.loss_time.is_some(), "the survivors still arm loss_time");
     }
 
     /// Test 1 — RFC 9002 §6.2.2: `pto = smoothed_rtt + max(4 × rttvar,

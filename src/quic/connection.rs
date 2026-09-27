@@ -5405,6 +5405,8 @@ impl QuicConnection {
 
                     let now = self.now_since_start();
                     let space_id = pn_space_of_level(level);
+                    let prev_largest_acked =
+                        self.endpoint.loss.per_space[space_id as usize].largest_acked_packet;
                     // 3. Feed to loss state.
                     let acked = self.endpoint.loss.on_ack_received(
                         space_id,
@@ -5429,8 +5431,27 @@ impl QuicConnection {
                     //    time-threshold) and feed them to congestion
                     //    control, persistent-congestion check included
                     //    (RFC 9002 §B.8).
-                    let lost = self.endpoint.loss.detect_lost(space_id, now);
-                    self.feed_lost_to_cc(space_id, &lost, now);
+                    //
+                    //    RFC 9002 §A.7 returns before loss detection when an
+                    //    ACK acknowledges nothing new. We run it whenever
+                    //    anything was newly acked OR `largest_acked` moved
+                    //    (the packet-threshold rule keys off it), and skip it
+                    //    otherwise: nothing it reads has changed, so it would
+                    //    find nothing a previous pass (or the loss timer,
+                    //    which `on_ack_received` just re-armed) did not.
+                    //    A packet can carry ~240 minimal duplicate ACK
+                    //    frames; each used to cost a full loss-detection
+                    //    pass and a persistent-congestion evaluation.
+                    let largest_advanced = self.endpoint.loss.per_space[space_id as usize]
+                        .largest_acked_packet
+                        != prev_largest_acked;
+                    let lost = if acked.is_empty() && !largest_advanced {
+                        Vec::new()
+                    } else {
+                        let lost = self.endpoint.loss.detect_lost(space_id, now);
+                        self.feed_lost_to_cc(space_id, &lost, now);
+                        lost
+                    };
                     // 6. Re-queue CRYPTO bytes for each lost packet via
                     //    its retransmit_hint blob.
                     for pkt in &lost {
@@ -9065,6 +9086,81 @@ mod tests {
             "a discarded space's bytes must leave bytes_in_flight"
         );
         assert!(s.endpoint.cc.can_send());
+    }
+
+    /// An ACK frame that acknowledges nothing new and does not move
+    /// `largest_acked` skips loss detection (RFC 9002 §A.7 returns before it
+    /// in that case). A packet can carry ~240 minimal ACK frames, and each
+    /// used to cost a loss-detection pass over the sent-packet table.
+    #[test]
+    fn duplicate_ack_frames_skip_loss_detection() {
+        let (server_cfg_tls, _) = ed25519_server();
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        let app = PnSpaceId::Application;
+        // Stamp the packets well past the connection clock so none of them
+        // is ever time-threshold lost while the test runs: the packets just
+        // below `largest_acked` then survive every pass, and a pass that
+        // does run visits them.
+        let sent_at = s.now_since_start() + Duration::from_secs(3600);
+        for pn in 0..1000u64 {
+            s.endpoint.loss.on_packet_sent(
+                app,
+                SentPacket {
+                    pn,
+                    sent_bytes: 1200,
+                    ack_eliciting: true,
+                    in_flight: true,
+                    time_sent: sent_at,
+                    retransmit_hint: Vec::new(),
+                    stream_hints: Vec::new(),
+                    handshake_done: false,
+                },
+            );
+            s.endpoint.cc.on_packet_sent(1200);
+        }
+        s.endpoint.pn.application.next_tx = 1000;
+        let ack_of = |largest: u64| {
+            let mut f = alloc::vec![0x02u8];
+            crate::quic::varint::encode(largest, &mut f); // Largest Acknowledged
+            crate::quic::varint::encode(0, &mut f); // ACK Delay
+            crate::quic::varint::encode(0, &mut f); // ACK Range Count
+            crate::quic::varint::encode(0, &mut f); // First ACK Range
+            f
+        };
+        s.dispatch_frames(Level::OneRtt, 1, &ack_of(500))
+            .expect("first ACK");
+        let after_first = s.endpoint.loss.detect_lost_visits;
+        assert!(after_first > 0, "the first ACK runs loss detection");
+        assert!(
+            !s.endpoint.loss.per_space[app as usize]
+                .sent_packets
+                .contains_key(&0),
+            "and declares the packet-threshold losses"
+        );
+        let mut payload = Vec::new();
+        for _ in 0..240 {
+            payload.extend_from_slice(&ack_of(500));
+        }
+        s.dispatch_frames(Level::OneRtt, 2, &payload)
+            .expect("duplicate ACKs");
+        assert_eq!(
+            s.endpoint.loss.detect_lost_visits, after_first,
+            "duplicate ACK frames must not rerun loss detection"
+        );
+        // An ACK that does advance `largest_acked` still runs it.
+        s.dispatch_frames(Level::OneRtt, 3, &ack_of(900))
+            .expect("new ACK");
+        assert!(s.endpoint.loss.detect_lost_visits > after_first);
+        assert!(
+            !s.endpoint.loss.per_space[app as usize]
+                .sent_packets
+                .contains_key(&800)
+        );
     }
 
     /// H-6(b) — time-threshold loss detection has to run on a timer. It used
