@@ -1114,9 +1114,10 @@ impl ClientConnection12 {
         // the extension is defined for TLS 1.0 through 1.2.
         extensions.push(ext::extended_master_secret_empty());
         // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
-        // server name (e.g. connecting by IP with certificate verification off).
-        if !self.server_name.is_empty() {
-            extensions.insert(0, ext::server_name(&self.server_name));
+        // server name or the name is an IP literal (still verified against
+        // the certificate's iPAddress SAN entries).
+        if let Some(host) = super::common::sni_host_name(&self.server_name) {
+            extensions.insert(0, ext::server_name(host));
         }
         if !self.config.alpn_protocols.is_empty() {
             let protos: Vec<&[u8]> = self
@@ -3162,6 +3163,30 @@ mod tests {
         // `renegotiated_connection` vector).
         let r = ext::find(&ch.extensions, ExtensionType::RENEGOTIATION_INFO).unwrap();
         assert_eq!(r, &[0u8]);
+    }
+
+    /// RFC 6066 §3: an IP-literal server name is not sent as SNI (and is
+    /// still the identity the certificate is checked against).
+    #[test]
+    fn client12_omits_sni_for_ip_literals() {
+        for (name, sni) in [
+            ("example.com", true),
+            ("192.0.2.1", false),
+            ("2001:db8::1", false),
+        ] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"c12-sni-ip", b"nonce", &[]);
+            let cfg = ClientConfig12::new(RootCertStore::new());
+            let mut c = ClientConnection12::new(cfg, name, &mut rng).unwrap();
+            let out = c.write_tls();
+            let rec = read_record(&out).unwrap().unwrap();
+            let ch = ClientHello::decode(&rec.fragment[4..]).unwrap();
+            assert_eq!(
+                ext::find(&ch.extensions, ExtensionType::SERVER_NAME).is_some(),
+                sni,
+                "{name}"
+            );
+            assert_eq!(c.server_name, name);
+        }
     }
 
     /// Build a synthetic ServerHello record (handshake type, plaintext) with

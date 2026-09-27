@@ -26,6 +26,17 @@ use alloc::vec::Vec;
 /// handshake message could justify.
 pub(crate) const MAX_HANDSHAKE_REASSEMBLY: usize = 128 * 1024;
 
+/// The `server_name` extension's host name for a connection to
+/// `server_name`, or `None` when the ClientHello must omit the extension.
+///
+/// RFC 6066 §3: "Literal IPv4 and IPv6 addresses are not permitted in
+/// HostName", so an IP-literal reference identity — still verified against
+/// the certificate's iPAddress SAN entries — is never sent. An empty name
+/// (no identity, verification off) is omitted as well.
+pub(crate) fn sni_host_name(server_name: &str) -> Option<&str> {
+    (!server_name.is_empty() && !crate::tls::pki::is_ip_literal(server_name)).then_some(server_name)
+}
+
 /// A decoded inbound message handed to the state machine.
 pub(crate) enum Incoming {
     /// A complete handshake message, including its 4-byte header.

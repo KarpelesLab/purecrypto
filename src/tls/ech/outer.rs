@@ -60,15 +60,22 @@ pub(crate) const HPKE_TAG_LEN: usize = 16;
 ///
 /// where `L_sni` is the byte length of the inner SNI host name. If
 /// `L_sni >= maximum_name_length` the second term collapses to
-/// `L_in`. We then round `L_pad` up to the next multiple of 32 with a
-/// minimum of 32 to keep tiny CHs from leaking through the floor.
+/// `L_in`. An inner CH with no `server_name` extension at all
+/// (`inner_sni_len == None`, e.g. an IP-literal reference identity)
+/// is topped up by `maximum_name_length + 9` instead — the size of the
+/// whole extension it lacks (§6.1.3). We then round `L_pad` up to the
+/// next multiple of 32 with a minimum of 32 to keep tiny CHs from
+/// leaking through the floor.
 pub(crate) fn pad_inner(
     encoded_inner: &[u8],
-    inner_sni_len: usize,
+    inner_sni_len: Option<usize>,
     maximum_name_length: u8,
 ) -> Vec<u8> {
     let max_len = maximum_name_length as usize;
-    let extra = max_len.saturating_sub(inner_sni_len);
+    let extra = match inner_sni_len {
+        Some(len) => max_len.saturating_sub(len),
+        None => max_len + 9,
+    };
     let target = encoded_inner.len() + extra;
     let target = target.next_multiple_of(32).max(32);
     let mut out = encoded_inner.to_vec();
@@ -278,7 +285,7 @@ pub(crate) fn seal_with<R, F>(
     config: &EchConfig,
     sym: HpkeSymCipherSuite,
     encoded_inner: &[u8],
-    inner_sni_len: usize,
+    inner_sni_len: Option<usize>,
     rng: &mut R,
     caller_build_outer_skeleton: F,
 ) -> Result<SealedOuter, Error>

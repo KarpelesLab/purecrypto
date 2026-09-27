@@ -16,6 +16,6 @@ pub use policy::PolicyOptions;
 pub use store::RootCertStore;
 #[allow(unused_imports)]
 pub(crate) use verify::{
-    ChainPurpose, verify_chain, verify_chain_for_purpose, verify_chain_with_crls,
+    ChainPurpose, is_ip_literal, verify_chain, verify_chain_for_purpose, verify_chain_with_crls,
     verify_chain_with_crls_for_purpose, verify_chain_with_policy, verify_hostname,
 };

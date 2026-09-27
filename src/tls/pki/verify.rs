@@ -1304,6 +1304,13 @@ pub(crate) fn verify_hostname(cert: &Certificate, host: &str) -> Result<(), Erro
     }
 }
 
+/// Whether `host` is an IPv4 or IPv6 literal — the reference identities
+/// [`verify_hostname`] matches against iPAddress SAN entries rather than
+/// dNSName ones.
+pub(crate) fn is_ip_literal(host: &str) -> bool {
+    parse_host_ip(host).is_some()
+}
+
 /// Parsed IP-literal host. `None` means the host is not an IP literal
 /// (so dNSName matching is the right path).
 enum HostIp {

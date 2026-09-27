@@ -1121,7 +1121,7 @@ fn build_inner_ch_marker() -> Vec<u8> {
 #[test]
 fn pad_inner_rounds_up_to_multiple_of_32_with_min_32() {
     // Tiny CH → bumped to 32.
-    let p = pad_inner(&[0x11u8; 5], 0, 0);
+    let p = pad_inner(&[0x11u8; 5], Some(0), 0);
     assert_eq!(p.len(), 32);
     assert_eq!(&p[..5], &[0x11; 5]);
     assert!(p[5..].iter().all(|b| *b == 0));
@@ -1132,7 +1132,7 @@ fn pad_inner_extra_for_sni_shorter_than_maximum_name_length() {
     const L_IN: usize = 40;
     let l_sni = 5usize;
     let l_max = 64u8;
-    let p = pad_inner(&[0xAAu8; L_IN], l_sni, l_max);
+    let p = pad_inner(&[0xAAu8; L_IN], Some(l_sni), l_max);
     // extra = 64 - 5 = 59; target = 40 + 59 = 99; rounded up to 128.
     assert_eq!(p.len(), 128);
     assert!(p[L_IN..].iter().all(|b| *b == 0));
@@ -1140,9 +1140,17 @@ fn pad_inner_extra_for_sni_shorter_than_maximum_name_length() {
 
 #[test]
 fn pad_inner_no_extra_when_sni_at_least_max() {
-    let p = pad_inner(&[0xBBu8; 50], 200, 64);
+    let p = pad_inner(&[0xBBu8; 50], Some(200), 64);
     // extra collapses to 0; target = 50 rounded up to 64.
     assert_eq!(p.len(), 64);
+}
+
+#[test]
+fn pad_inner_without_sni_covers_the_whole_missing_extension() {
+    // No inner `server_name`: extra = 64 + 9 = 73; target = 40 + 73 = 113,
+    // rounded up to 128.
+    let p = pad_inner(&[0xCCu8; 40], None, 64);
+    assert_eq!(p.len(), 128);
 }
 
 #[test]
@@ -1242,10 +1250,17 @@ fn seal_and_decap_round_trip_x25519_aes128gcm() {
         kdf_id: HpkeKdf::HkdfSha256.id(),
         aead_id: HpkeAead::Aes128Gcm.id(),
     };
-    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
-        let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
-        build_outer_ch_with_ech(&body)
-    })
+    let sealed = seal_with(
+        &config,
+        sym,
+        &inner,
+        Some(5),
+        &mut rng,
+        |enc, padded_len| {
+            let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
+            build_outer_ch_with_ech(&body)
+        },
+    )
     .expect("seal");
 
     // Decap on the server side and recover the inner CH.
@@ -1303,10 +1318,17 @@ fn seal_and_decap_matches_second_key_sharing_config_id() {
         kdf_id: HpkeKdf::HkdfSha256.id(),
         aead_id: HpkeAead::Aes128Gcm.id(),
     };
-    let sealed = seal_with(&new_config, sym, &inner, 5, &mut rng, |enc, padded_len| {
-        let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
-        build_outer_ch_with_ech(&body)
-    })
+    let sealed = seal_with(
+        &new_config,
+        sym,
+        &inner,
+        Some(5),
+        &mut rng,
+        |enc, padded_len| {
+            let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
+            build_outer_ch_with_ech(&body)
+        },
+    )
     .expect("seal");
 
     // Must succeed by sweeping past the colliding older key to the one
@@ -1350,10 +1372,17 @@ fn decap_rejects_inner_ch_without_marker() {
         kdf_id: HpkeKdf::HkdfSha256.id(),
         aead_id: HpkeAead::Aes128Gcm.id(),
     };
-    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
-        let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
-        build_outer_ch_with_ech(&body)
-    })
+    let sealed = seal_with(
+        &config,
+        sym,
+        &inner,
+        Some(5),
+        &mut rng,
+        |enc, padded_len| {
+            let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
+            build_outer_ch_with_ech(&body)
+        },
+    )
     .expect("seal");
 
     // The HPKE `open` succeeded (the client used our real config), so a
@@ -1421,10 +1450,17 @@ fn decap_rejects_unknown_config_id() {
         aead_id: HpkeAead::Aes128Gcm.id(),
     };
     // Seal under config_id = 0x99 (not in ring).
-    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
-        let body = build_outer_ext_body(sym, 0x99, enc, padded_len);
-        build_outer_ch_with_ech(&body)
-    })
+    let sealed = seal_with(
+        &config,
+        sym,
+        &inner,
+        Some(5),
+        &mut rng,
+        |enc, padded_len| {
+            let body = build_outer_ext_body(sym, 0x99, enc, padded_len);
+            build_outer_ch_with_ech(&body)
+        },
+    )
     .expect("seal");
     assert!(matches!(
         try_decap_inner(&sealed.outer_ch, &ring),
@@ -1473,7 +1509,7 @@ fn decap_rejects_unpublished_hpke_suite() {
         &config,
         unpublished,
         &inner,
-        5,
+        Some(5),
         &mut rng,
         |enc, padded_len| {
             let body = build_outer_ext_body(unpublished, 0x42, enc, padded_len);
@@ -1495,7 +1531,7 @@ fn decap_rejects_unpublished_hpke_suite() {
         &config,
         published,
         &inner,
-        5,
+        Some(5),
         &mut rng,
         |enc, padded_len| {
             let body = build_outer_ext_body(published, 0x42, enc, padded_len);
@@ -1530,10 +1566,17 @@ fn decap_rejects_aead_corruption() {
         kdf_id: HpkeKdf::HkdfSha256.id(),
         aead_id: HpkeAead::Aes128Gcm.id(),
     };
-    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
-        let body = build_outer_ext_body(sym, 0x07, enc, padded_len);
-        build_outer_ch_with_ech(&body)
-    })
+    let sealed = seal_with(
+        &config,
+        sym,
+        &inner,
+        Some(5),
+        &mut rng,
+        |enc, padded_len| {
+            let body = build_outer_ext_body(sym, 0x07, enc, padded_len);
+            build_outer_ch_with_ech(&body)
+        },
+    )
     .expect("seal");
 
     // Flip a byte in the ciphertext.
@@ -1572,10 +1615,17 @@ fn decap_rejects_aad_mutation_outside_payload() {
         kdf_id: HpkeKdf::HkdfSha256.id(),
         aead_id: HpkeAead::Aes128Gcm.id(),
     };
-    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
-        let body = build_outer_ext_body(sym, 0x11, enc, padded_len);
-        build_outer_ch_with_ech(&body)
-    })
+    let sealed = seal_with(
+        &config,
+        sym,
+        &inner,
+        Some(5),
+        &mut rng,
+        |enc, padded_len| {
+            let body = build_outer_ext_body(sym, 0x11, enc, padded_len);
+            build_outer_ch_with_ech(&body)
+        },
+    )
     .expect("seal");
 
     // Tamper with a random byte (well outside the payload).
@@ -1621,10 +1671,17 @@ fn full_ech_round_trip_seal_decap_and_accept_signal() {
         kdf_id: HpkeKdf::HkdfSha256.id(),
         aead_id: HpkeAead::Aes128Gcm.id(),
     };
-    let sealed = seal_with(&config, sym, &inner_ch, 5, &mut rng, |enc, padded_len| {
-        let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
-        build_outer_ch_with_ech(&body)
-    })
+    let sealed = seal_with(
+        &config,
+        sym,
+        &inner_ch,
+        Some(5),
+        &mut rng,
+        |enc, padded_len| {
+            let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
+            build_outer_ch_with_ech(&body)
+        },
+    )
     .expect("seal");
 
     // === Server side: decap to recover the inner CH ===

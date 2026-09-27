@@ -4385,7 +4385,7 @@ mod tests {
             &config,
             sym,
             &inner_ch,
-            5,
+            Some(5),
             &mut seal_rng,
             |enc, padded_len| {
                 let body = build_outer_ext_body(sym, 0x11, enc, padded_len);

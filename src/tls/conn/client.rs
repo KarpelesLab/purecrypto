@@ -1732,9 +1732,11 @@ impl ClientConnection {
             extensions.push(ext::renegotiation_info_empty());
         }
         // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
-        // server name (e.g. connecting by IP with certificate verification off).
-        if !server_name.is_empty() {
-            extensions.insert(0, ext::server_name(&server_name));
+        // server name or the name is an IP literal (still verified against
+        // the certificate's iPAddress SAN entries). This covers the ECH inner
+        // hello too, whose padding then accounts for the missing extension.
+        if let Some(host) = super::common::sni_host_name(&server_name) {
+            extensions.insert(0, ext::server_name(host));
         }
         if !self.config.alpn_protocols.is_empty() {
             let protos: alloc::vec::Vec<&[u8]> = self
@@ -2975,7 +2977,7 @@ impl ClientConnection {
             Some(&inner_marker),
             Some(self.core.transcript.buffered_bytes()),
         )?;
-        let inner_sni_len = server_name.len();
+        let inner_sni_len = super::common::sni_host_name(&server_name).map(str::len);
         let padded =
             crate::tls::ech::outer::pad_inner(&inner_ch2, inner_sni_len, maximum_name_length);
         // CH2-outer's encrypted_client_hello extension carries an empty
@@ -3116,7 +3118,7 @@ impl ClientConnection {
         let ech_offered = self.config.ech.is_some();
         #[cfg(not(feature = "ech"))]
         let ech_offered = false;
-        let sni_offered = !self.server_name.is_empty() || ech_offered;
+        let sni_offered = super::common::sni_host_name(&self.server_name).is_some() || ech_offered;
         let alpn_offered = !self.config.alpn_protocols.is_empty();
         let rsl_offered = self.config.record_size_limit.is_some();
         let sct_offered = self
@@ -4070,7 +4072,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
             None,
         )
         .ok()?;
-    let inner_sni_len = server_name.len();
+    let inner_sni_len = super::common::sni_host_name(server_name).map(str::len);
     let suites_owned = effective_suites.to_vec();
     let groups_owned = groups.to_vec();
     let share_groups_owned = share_groups.to_vec();
@@ -4846,6 +4848,61 @@ mod tests {
             .unwrap();
     }
 
+    /// RFC 6066 §3: an IP-literal reference identity never goes out as SNI,
+    /// so a server acknowledging `server_name` in EncryptedExtensions is
+    /// answering an extension the client did not send.
+    #[test]
+    fn client_rejects_sni_ack_when_connecting_by_ip() {
+        let mut raw = alloc::vec![hs_type::ENCRYPTED_EXTENSIONS, 0, 0, 6, 0, 4];
+        raw.extend_from_slice(&ExtensionType::SERVER_NAME.0.to_be_bytes());
+        raw.extend_from_slice(&[0, 0]);
+        for (name, expect_ok) in [
+            ("example.com", true),
+            ("192.0.2.1", false),
+            ("2001:db8::1", false),
+        ] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"sni-ack-ip", b"nonce", &[]);
+            let mut client =
+                ClientConnection::new(ClientConfig::new(RootCertStore::new()), name, &mut rng)
+                    .unwrap();
+            let _ = client.write_tls();
+            let res = client.on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw);
+            if expect_ok {
+                res.unwrap();
+            } else {
+                assert!(matches!(res, Err(Error::UnsupportedExtension)), "{name}");
+            }
+        }
+    }
+
+    /// RFC 6066 §3: "Literal IPv4 and IPv6 addresses are not permitted in
+    /// HostName." Connecting by IP omits `server_name`, on the pure-1.3 and
+    /// the version-spanning hello alike; a DNS name still sends it.
+    #[test]
+    fn client_hello_omits_sni_for_ip_literals() {
+        for offer_tls12 in [false, true] {
+            for (name, sni) in [
+                ("example.com", true),
+                ("192.0.2.1", false),
+                ("2001:db8::1", false),
+                ("::ffff:192.0.2.1", false),
+            ] {
+                let mut cfg = ClientConfig::new(RootCertStore::new());
+                cfg.offer_tls12 = offer_tls12;
+                let mut rng = HmacDrbg::<Sha256>::new(b"ch-sni-ip", b"nonce", &[]);
+                let mut client = ClientConnection::new(cfg, name, &mut rng).unwrap();
+                let out = client.write_tls();
+                let msg = read_record(&out).unwrap().unwrap().fragment.to_vec();
+                let ch = ClientHello::decode(&msg[4..]).unwrap();
+                assert_eq!(
+                    ext::find(&ch.extensions, ExtensionType::SERVER_NAME).is_some(),
+                    sni,
+                    "{name} (offer_tls12 = {offer_tls12})"
+                );
+            }
+        }
+    }
+
     /// RFC 8879 §3: a `CompressedCertificate` may only use an algorithm the
     /// client advertised. A client advertising brotli alone used to accept a
     /// zlib-compressed Certificate because the decoder only asked whether
@@ -4974,6 +5031,55 @@ mod tests {
             "ClientHelloOuter.random must be independent of ClientHelloInner.random"
         );
         assert_eq!(inner_ch.random, client.client_random());
+    }
+
+    /// RFC 6066 §3 applies inside ECH too: an IP-literal reference identity
+    /// leaves the inner hello without `server_name` (padded by the whole
+    /// missing extension, draft-ietf-tls-esni-22 §6.1.3), while the outer
+    /// hello still names the `public_name`.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_inner_hello_omits_sni_for_ip_literal() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::outer::try_decap_inner;
+
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-inner-ip-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x22,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let list = crate::tls::ech::EchConfigList::new(alloc::vec![pair.config().clone()]);
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+        let mut cfg = ClientConfig::new(RootCertStore::new());
+        cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
+        let mut rng = HmacDrbg::<Sha256>::new(b"ech-inner-ip-client", b"nonce", &[]);
+        let mut client = ClientConnection::new(cfg, "192.0.2.1", &mut rng).unwrap();
+        let out = client.write_tls();
+        let outer_msg = read_record(&out).unwrap().unwrap().fragment.to_vec();
+        let outer_ch = ClientHello::decode(&outer_msg[4..]).unwrap();
+        let outer_sni = crate::tls::codec::extension::parse_server_name(
+            ext::find(&outer_ch.extensions, ExtensionType::SERVER_NAME).expect("outer SNI"),
+        )
+        .unwrap()
+        .expect("outer SNI present");
+        assert_eq!(outer_sni, "public.example");
+        let inner_msg = try_decap_inner(&outer_msg, &ring)
+            .expect("server-side decap")
+            .inner_ch_bytes;
+        let inner_ch = ClientHello::decode(&inner_msg[4..]).unwrap();
+        assert!(ext::find(&inner_ch.extensions, ExtensionType::SERVER_NAME).is_none());
     }
 
     /// draft-ietf-tls-esni-22 §6.1: ClientHelloInner "MUST NOT offer to
