@@ -1316,9 +1316,22 @@ impl ClientConnection12 {
     }
 
     /// Returns the latest stored session suitable for RFC 5077 resumption
-    /// on the next connection. `None` if the server never sent a NST. Combine
-    /// with [`ClientConfig12::with_session`].
+    /// on the next connection. `None` if the server never sent a NST, or
+    /// until the handshake has completed. Combine with
+    /// [`ClientConfig12::with_session`].
+    ///
+    /// RFC 5077 §3.3: the `NewSessionTicket` is a plaintext handshake message
+    /// that arrives *before* the server's Finished, and only that Finished
+    /// (covering the transcript the ticket is part of) authenticates it.
+    /// Handing the ticket out as soon as it was parsed let an on-path
+    /// attacker plant a ticket of its choosing in the caller's session cache
+    /// by injecting a NST into a handshake it then let fail. Like the TLS 1.3
+    /// engine, which only stores a session after the handshake, nothing is
+    /// returned before `handshake_completed`.
     pub fn take_session(&mut self) -> Option<StoredSession12> {
+        if !self.handshake_completed {
+            return None;
+        }
         let ticket = self.received_ticket.take()?;
         let suite = self.suite?;
         let master = self.master?;
@@ -3715,6 +3728,55 @@ mod tests {
             Err(Error::UnexpectedMessage)
         ));
         assert!(!c.is_handshake_complete());
+    }
+
+    /// RFC 5077 §3.3: the NewSessionTicket arrives in plaintext before the
+    /// server's Finished, which is what authenticates it. `take_session`
+    /// used to hand the ticket out as soon as it was parsed, so an on-path
+    /// attacker could inject a NST into a handshake and have its ticket
+    /// cached even though the handshake never completed.
+    #[test]
+    fn client12_take_session_waits_for_handshake_completion() {
+        use crate::tls::codec::write_record;
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-nst-unauth", b"nonce", &[]);
+        let mut c = ClientConnection12::new(
+            ClientConfig12::new(RootCertStore::new()),
+            "example.com",
+            &mut rng,
+        )
+        .unwrap();
+        let _ = c.write_tls();
+        c.state = State::WaitServerFinished;
+        c.suite = lookup_suite_12(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+        c.master = Some([0u8; 48]);
+        c.transcript.set_alg(c.suite.expect("suite set").hash);
+
+        // NewSessionTicket { lifetime_hint = 3600, ticket = 0xEE * 16 }.
+        let mut body = 3600u32.to_be_bytes().to_vec();
+        body.extend_from_slice(&16u16.to_be_bytes());
+        body.extend_from_slice(&[0xEE; 16]);
+        let mut msg = alloc::vec![hs_type::NEW_SESSION_TICKET, 0, 0, body.len() as u8];
+        msg.extend_from_slice(&body);
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &msg,
+        );
+        c.read_tls(&rec);
+        c.process_new_packets().unwrap();
+        assert!(!c.is_handshake_complete());
+        assert!(
+            c.take_session().is_none(),
+            "an unauthenticated ticket must not be handed out"
+        );
+
+        // Once the server's Finished has verified, the ticket is released.
+        c.handshake_completed = true;
+        let s = c.take_session().expect("session after completion");
+        assert_eq!(s.ticket, alloc::vec![0xEE; 16]);
+        assert_eq!(s.lifetime_seconds, 3600);
     }
 
     // ---- opt-in legacy (TLS 1.0/1.1) ServerHello hardening ---------------
