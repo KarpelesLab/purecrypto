@@ -1214,8 +1214,9 @@ impl ClientConnection {
         // A version-spanning client (`offer_tls12`) advertises the TLS 1.2
         // ECDHE-AEAD suites after the 1.3 trio, so a 1.2-only server can pick
         // one. A 1.3 server ignores them. Both pass through the same
-        // `cipher_suites` restriction filter.
-        let suites = if config.offer_tls12 {
+        // `cipher_suites` restriction filter. Real ECH never offers 1.2 (see
+        // `new_with_offer_inner`), so it keeps the 1.3-only suite list.
+        let suites = if config.offer_tls12 && !config_wants_real_ech(&config) {
             let mut available: Vec<CipherSuite> = DEFAULT_SUITES.to_vec();
             available.extend(super::SUITES_12.iter().map(|p| p.suite));
             super::select_offered_suites(&config.cipher_suites, &available)?
@@ -1416,41 +1417,33 @@ impl ClientConnection {
         }
 
         // Real ECH and PSK resumption are not wired together yet
-        // (`seal_real_ech_on_ch1` declines to seal when a PSK is offered).
+        // (`seal_real_ech_on_ch1` refuses to seal when a PSK is offered).
         // ECH must win that conflict: it exists to keep `server_name` off the
-        // wire, whereas the ticket only saves a certificate round trip.
-        // Falling back to the plain (GREASE-shaped) hello would put the real
-        // SNI in cleartext on every resumed connection — so drop the session
-        // and run a full, sealed handshake instead.
-        #[cfg(feature = "ech")]
-        if config.session.is_some()
-            && matches!(
-                config.ech,
-                Some(crate::tls::ech::EchClient {
-                    mode: crate::tls::ech::EchClientMode::Real(_)
-                })
-            )
-        {
+        // wire, whereas the ticket only saves a certificate round trip — so
+        // drop the session and run a full, sealed handshake instead.
+        if config.session.is_some() && config_wants_real_ech(&config) {
             config.session = None;
         }
+
+        // draft-ietf-tls-esni-22 §6.1 / §6.1.7: a real-ECH client never
+        // offers TLS 1.2, not even in the outer hello. The inner hello cannot
+        // offer it (§6.1), so a 1.2 ServerHello can only answer the outer
+        // one — and the downgraded `ClientConnection12` knows nothing about
+        // ECH: it would authenticate the server as the *inner* name and hand
+        // back a usable connection with ECH silently dropped, where the draft
+        // requires authenticating as `public_name` and aborting with
+        // `ech_required`. With 1.2 off the table a conformant server answers
+        // in 1.3, and `on_server_hello` refuses a 1.2 selection outright.
+        let real_ech = config_wants_real_ech(&config);
+        let offer_tls12 = offer_tls12 && !real_ech;
 
         // RFC 5077 §3.4: a TLS 1.2 ticket rides only on a hello that offers
         // 1.2, and goes with a fresh random `session_id` whose echo tells the
         // downgraded engine the server resumed. Real ECH keeps the offer off
-        // for the same reason as the 1.3 session above: its inner hello never
-        // offers 1.2, and the sealed hello must not be traded for a ticket.
-        #[cfg(feature = "ech")]
-        let real_ech = matches!(
-            config.ech,
-            Some(crate::tls::ech::EchClient {
-                mode: crate::tls::ech::EchClientMode::Real(_)
-            })
-        );
-        #[cfg(not(feature = "ech"))]
-        let real_ech = false;
+        // (above) for the same reason as the 1.3 session: the sealed hello
+        // must not be traded for a ticket.
         let now = config.verification_time.clone().or_else(system_now);
         if !offer_tls12
-            || real_ech
             || config.tls12_session.as_ref().is_some_and(|s| {
                 s.ticket.len() > MAX_SESSION_TICKET_LEN
                     || !s.usable_for(server_name, config.verify_certificates, now)
@@ -2456,6 +2449,15 @@ impl ClientConnection {
             None => false,
         };
         if !selected_tls13 {
+            // draft-ietf-tls-esni-22 §6.1.7: a real-ECH hello never offers
+            // TLS 1.2 (see the constructor), and the 1.2 engine could not
+            // honour ECH's rules anyway — it would verify the certificate
+            // against the inner name and never raise `ech_required`. Refuse
+            // the downgrade even if `offer_tls12` somehow survived.
+            #[cfg(feature = "ech")]
+            if self.ech_state.is_some() {
+                return Err(Error::UnsupportedVersion);
+            }
             // RFC 8446 §4.2.10: "A client that attempts to send 0-RTT data
             // MUST fail a connection if it receives a ServerHello with TLS
             // 1.2 or older."
@@ -4087,6 +4089,24 @@ pub(crate) struct EchSealOutput {
     pub outer_random: [u8; 32],
 }
 
+/// Whether `config` asks for real (not GREASE) ECH.
+fn config_wants_real_ech(config: &ClientConfig) -> bool {
+    #[cfg(feature = "ech")]
+    {
+        matches!(
+            config.ech,
+            Some(crate::tls::ech::EchClient {
+                mode: crate::tls::ech::EchClientMode::Real(_)
+            })
+        )
+    }
+    #[cfg(not(feature = "ech"))]
+    {
+        let _ = config;
+        false
+    }
+}
+
 /// draft-ietf-tls-esni-22 §6. Returns `Ok(Some(EchSealOutput))` when a
 /// sealed pair was produced, `Ok(None)` when the client is not
 /// configured for real ECH (`config.ech` is `None` or `Grease`, so the
@@ -5284,7 +5304,9 @@ mod tests {
     /// draft-ietf-tls-esni-22 §6.1: ClientHelloInner "MUST NOT offer to
     /// negotiate TLS 1.2 or below". A version-spanning client (the default
     /// `min 1.2 / max 1.3` range) used to put its hybrid `supported_versions`
-    /// in the inner hello as well; only the outer may offer TLS 1.2.
+    /// in the inner hello as well. The outer hello no longer offers 1.2
+    /// either (§6.1.7, see `ech_real_config_refuses_tls12_server_hello`):
+    /// neither hello carries the 1.2 version, suites or ticket extension.
     #[cfg(feature = "ech")]
     #[test]
     fn ech_inner_hello_offers_tls13_only() {
@@ -5325,22 +5347,70 @@ mod tests {
             .inner_ch_bytes;
         let inner_ch = ClientHello::decode(&inner_msg[4..]).unwrap();
 
-        let versions = |ch: &ClientHello| {
-            ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
-                .expect("supported_versions")
-                .to_vec()
+        for (name, ch) in [("outer", &outer_ch), ("inner", &inner_ch)] {
+            assert_eq!(
+                ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS),
+                Some(&[0x02, 0x03, 0x04][..]),
+                "{name} hello must offer TLS 1.3 only"
+            );
+            assert!(
+                ch.cipher_suites.iter().all(|s| suite_hash(*s).is_some()),
+                "{name} hello must not list TLS 1.2 suites"
+            );
+            assert!(ext::find(&ch.extensions, ExtensionType::SESSION_TICKET).is_none());
+            assert!(ch.session_id.is_empty());
+        }
+    }
+
+    /// draft-ietf-tls-esni-22 §6.1.6 / §6.1.7: a TLS 1.2 answer to a real-ECH
+    /// hello used to flip the engine into a downgrade to `ClientConnection12`,
+    /// which verified the certificate against the *inner* name, never raised
+    /// `ech_required`, and produced a usable connection with ECH silently
+    /// dropped. The hello no longer offers 1.2, and a 1.2 ServerHello is
+    /// refused even if the offer were somehow still set.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_real_config_refuses_tls12_server_hello() {
+        use crate::hpke::{HpkeAead, HpkeKdf};
+        use crate::tls::codec::{CipherSuite, ServerHello};
+        use crate::tls::ech::HpkeSymCipherSuite;
+
+        let pair = ech_pair(
+            b"ech-tls12-keygen",
+            0x31,
+            alloc::vec![HpkeSymCipherSuite {
+                kdf_id: HpkeKdf::HkdfSha256.id(),
+                aead_id: HpkeAead::Aes128Gcm.id(),
+            }],
+        );
+        let list = crate::tls::ech::EchConfigList::new(alloc::vec![pair.config().clone()]);
+        // A genuine TLS 1.2 ServerHello: no `supported_versions`, no
+        // downgrade sentinel, ECDHE-RSA-AES128-GCM-SHA256.
+        let sh = ServerHello {
+            random: [0x11; 32],
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite(0xc02f),
+            extensions: alloc::vec![],
         };
-        // Outer: [1.3, 1.2]; inner: [1.3] only.
-        assert_eq!(
-            versions(&outer_ch),
-            alloc::vec![0x04, 0x03, 0x04, 0x03, 0x03]
-        );
-        assert_eq!(versions(&inner_ch), alloc::vec![0x02, 0x03, 0x04]);
-        assert!(outer_ch.session_id.is_empty());
-        assert_eq!(
-            ext::find(&outer_ch.extensions, ExtensionType::SESSION_TICKET),
-            Some(&[][..])
-        );
+        let raw = sh.encode();
+
+        for force_offer in [false, true] {
+            let mut cfg = ClientConfig::new(RootCertStore::new());
+            cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list.clone()));
+            cfg.offer_tls12 = true;
+            let mut rng = HmacDrbg::<Sha256>::new(b"ech-tls12-client", b"nonce", &[]);
+            let mut client = ClientConnection::new(cfg, "secret.example", &mut rng).unwrap();
+            let _ = client.write_tls();
+            assert!(client.ech_state.is_some());
+            assert!(!client.offer_tls12, "real ECH must not offer TLS 1.2");
+            // Belt and braces: the ServerHello guard holds on its own.
+            client.offer_tls12 = force_offer;
+            assert!(matches!(
+                client.on_server_hello(hs_type::SERVER_HELLO, &raw[4..], &raw),
+                Err(Error::UnsupportedVersion)
+            ));
+            assert!(!client.downgrade_requested());
+        }
     }
 
     /// Real ECH and PSK resumption are not combined yet; when both are
