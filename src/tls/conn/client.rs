@@ -2203,17 +2203,17 @@ impl ClientConnection {
                         // injectable): a close_notify there is a handshake
                         // failure, never a graceful shutdown.
                         if !self.handshake_completed {
-                            self.state = State::Closed;
+                            self.close();
                             return Err(Error::AlertReceived(AlertDescription::CloseNotify));
                         }
                         self.received_close_notify = true;
-                        self.state = State::Closed;
+                        self.close();
                         // RFC 8446 §6.1: whatever follows the closure alert
                         // is ignored, including bytes already buffered.
                         self.core.discard_input();
                         return Ok(());
                     }
-                    self.state = State::Closed;
+                    self.close();
                     return Err(Error::AlertReceived(alert.description));
                 }
                 // A latched write-side failure (see
@@ -2240,7 +2240,18 @@ impl ClientConnection {
 
     fn fail(&mut self, error: &Error) {
         self.core.send_alert(alert_for(error));
+        self.close();
+    }
+
+    /// Parks the engine in [`State::Closed`] for good. A suspended mTLS
+    /// flight (`pending_flight`, holding the 1-RTT application secrets) is
+    /// dropped with it: left in place, a later
+    /// [`provide_signature`](Self::provide_signature) would emit
+    /// CertificateVerify + Finished, install the application keys and mark
+    /// the handshake complete on a connection that had already failed.
+    fn close(&mut self) {
         self.state = State::Closed;
+        self.pending_flight = None;
     }
 
     fn handle_handshake(&mut self, msg: Vec<u8>) -> Result<(), Error> {
@@ -3931,7 +3942,15 @@ impl ClientConnection {
 
     /// mTLS external signing: emits the client `CertificateVerify` with the
     /// caller-supplied `signature`, then finishes the flight.
+    ///
+    /// Only valid while the flight is actually suspended
+    /// ([`State::AwaitingCertVerifySignature`]); in any other state —
+    /// notably after a fatal error or alert closed the connection — it is
+    /// [`Error::InappropriateState`] and emits nothing.
     pub(crate) fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
+        if self.state != State::AwaitingCertVerifySignature {
+            return Err(Error::InappropriateState);
+        }
         let pf = self
             .pending_flight
             .take()
@@ -5156,6 +5175,82 @@ mod tests {
             client.handle_handshake_for_test(msg),
             Err(Error::BadCertificate)
         ));
+    }
+
+    /// A client parked in `AwaitingCertVerifySignature` (external mTLS
+    /// signer) keeps the 1-RTT secrets in `pending_flight`. A fatal error or
+    /// alert used to close the connection but leave that flight in place, so
+    /// a later `provide_signature` emitted CertificateVerify + Finished,
+    /// installed application keys and reported the handshake complete on a
+    /// dead connection. It must now refuse and emit nothing.
+    #[test]
+    fn provide_signature_after_failure_does_not_resurrect_connection() {
+        let suspended = |seed: &[u8]| {
+            let mut rng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+            let mut client =
+                ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng)
+                    .unwrap();
+            let _ = client.write_tls();
+            // Just enough handshake state for `finish_client_flight` to run.
+            client.core.transcript.set_alg(HashAlg::Sha256);
+            client.ks = Some(KeySchedule::new(HashAlg::Sha256));
+            client.client_hs_secret = Some(Secret::new(&[0x44; 32]));
+            client.state = State::AwaitingCertVerifySignature;
+            client.pending_flight = Some(PendingClientFlight {
+                scheme: SignatureScheme(0x0403),
+                content: alloc::vec![0x20; 64],
+                suite: lookup_suite(CipherSuite::AES_128_GCM_SHA256).unwrap(),
+                cats: Secret::new(&[0x11; 32]),
+                sats: Secret::new(&[0x22; 32]),
+            });
+            assert!(client.pending_signature().is_some());
+            client
+        };
+        let check_dead = |client: &mut ClientConnection| {
+            assert!(client.pending_signature().is_none());
+            assert!(matches!(
+                client.provide_signature(alloc::vec![0x33; 64]),
+                Err(Error::InappropriateState)
+            ));
+            assert!(!client.is_handshake_complete());
+            assert!(client.state == State::Closed);
+            assert!(client.send_application_data(b"x").is_err());
+        };
+
+        // Fatal alert from the peer (handshake_failure).
+        let mut client = suspended(b"sig-after-alert");
+        client.read_tls(&[21, 3, 3, 0, 2, 2, 40]);
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::AlertReceived(AlertDescription::HandshakeFailure))
+        ));
+        let _ = client.write_tls();
+        check_dead(&mut client);
+        assert!(client.write_tls().is_empty(), "nothing may be emitted");
+
+        // Pre-completion close_notify.
+        let mut client = suspended(b"sig-after-close");
+        client.read_tls(&[21, 3, 3, 0, 2, 1, 0]);
+        assert!(client.process_new_packets().is_err());
+        let _ = client.write_tls();
+        check_dead(&mut client);
+
+        // A local protocol error (`fail()`): the peer sends a handshake
+        // message while our flight is suspended.
+        let mut client = suspended(b"sig-after-fail");
+        client.read_tls(&[22, 3, 3, 0, 4, 20, 0, 0, 0]);
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
+        let _ = client.write_tls(); // the fatal alert
+        check_dead(&mut client);
+        assert!(client.write_tls().is_empty(), "nothing may be emitted");
+
+        // Control: while genuinely suspended, the signature is accepted.
+        let mut client = suspended(b"sig-live");
+        assert!(client.provide_signature(alloc::vec![0x33; 64]).is_ok());
+        assert!(client.is_handshake_complete());
     }
 
     /// Wave 3b.2: when [`ClientConfig::ech`] is set to a Real
