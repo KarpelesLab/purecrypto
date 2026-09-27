@@ -260,6 +260,11 @@ pub(crate) fn ct_shift_left(buf: &mut [u8], shift: u32) {
             // Ascending `i`: `buf[i + step]` is always read before it is
             // itself overwritten, so the in-place shift is correct.
             let src = if i + step < k { buf[i + step] } else { 0 };
+            // The barrier is load-bearing, and per byte on purpose: with a
+            // plain loop-invariant `m`, LLVM sees that `m == 0` makes the
+            // whole pass the identity and unswitches the loop into a branch
+            // on the secret shift bit (caught by tests/ct_valgrind.rs).
+            let m = core::hint::black_box(m);
             buf[i] = (src & m) | (buf[i] & !m);
         }
         step <<= 1;
@@ -508,7 +513,12 @@ pub(crate) fn decrypt_pkcs1v15_implicit<K: RawPrivate>(
     }
 
     let (bad, sep_idx) = pkcs1v15_padding_check(scratch);
-    let bad_mask = bad_to_mask(bad);
+    // The barrier is load-bearing: LLVM otherwise knows `bad_mask` is 0 or
+    // 0xff, sees that the merge loop below is the identity when it is 0, and
+    // unswitches it into a branch on the padding verdict — precisely the
+    // Bleichenbacher oracle this function exists to close (caught by
+    // tests/ct_valgrind.rs). Re-applied per byte below for the same reason.
+    let bad_mask = core::hint::black_box(bad_to_mask(bad));
     let bad_mask32 = 0u32.wrapping_sub((bad_mask & 1) as u32);
 
     let key_secret = key.secret_seed();
@@ -531,7 +541,8 @@ pub(crate) fn decrypt_pkcs1v15_implicit<K: RawPrivate>(
         let tag = h.finalize();
         let take = core::cmp::min(tag.as_ref().len(), k - off);
         for (slot, &b) in scratch[off..off + take].iter_mut().zip(tag.as_ref()) {
-            *slot = (b & bad_mask) | (*slot & !bad_mask);
+            let m = core::hint::black_box(bad_mask);
+            *slot = (b & m) | (*slot & !m);
         }
         off += take;
         counter += 1;
