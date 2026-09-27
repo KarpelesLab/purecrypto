@@ -89,8 +89,9 @@ pub(crate) fn client_offers_dtls13(body: &[u8]) -> Result<bool, Error> {
 /// The DTLS client state machines fall back to this when
 /// `verification_time` is unset, so that certificate validity periods and
 /// CRL freshness are actually checked in the default configuration. On
-/// `no_std` there is no clock, so date checks remain disabled — exactly as
-/// in the TLS layer.
+/// `no_std` there is no clock, and a client that verifies chains without
+/// a pinned `verification_time` fails closed (`BadCertificate`) rather
+/// than silently skipping the date checks.
 #[cfg(feature = "std")]
 pub(crate) fn system_now() -> Option<Time> {
     use std::time::{SystemTime, UNIX_EPOCH};

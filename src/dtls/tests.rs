@@ -3019,8 +3019,6 @@ mod security_regressions {
     /// a rejection is a silent drop (never a fatal error, which a spoofed
     /// datagram could then trigger at will): the refusal shows up as the
     /// client never answering and the handshake never completing.
-    // Only the `std`-gated expired-certificate cases use this.
-    #[cfg(feature = "std")]
     fn client_refuses_server_flight<R: crate::rng::RngCore>(
         client: &mut DtlsClientConnection12,
         server: &mut DtlsServerConnection12<R>,
@@ -3147,6 +3145,105 @@ mod security_regressions {
             "a default-configured DTLS 1.3 client must reject an expired chain"
         );
         assert!(!client.is_handshake_complete());
+    }
+
+    // ---------------------------------------------------------------
+    // `no_std` has no wall clock. A client that verifies chains but pins
+    // no `verification_time` would otherwise run the chain verification
+    // with the date checks silently disabled — it must fail closed, even
+    // for a certificate that IS inside its validity period, because
+    // nothing can establish that. A pinned clock (the documented `no_std`
+    // configuration) accepts the very same chain.
+    // ---------------------------------------------------------------
+
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn missing_clock_fails_closed_12() {
+        let (der, key) = cert_with_validity(
+            b"dtls12-noclock",
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let server_cfg = Arc::new(
+            PcServerConfig12::with_ecdsa(alloc::vec![der.clone()], key)
+                .require_cookie_exchange(false),
+        );
+        let client = |cfg: PcClientConfig12| {
+            let mut crng = HmacDrbg::<Sha256>::new(b"dtls12-noclock-client", b"nonce", &[]);
+            DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng)
+        };
+        let roots = || {
+            let mut roots = RootCertStore::new();
+            roots.add_der(der.clone()).unwrap();
+            roots
+        };
+
+        // No `with_verification_time`: refused.
+        let mut client_a = client(PcClientConfig12::new(roots(), "dtls.example"));
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-noclock-server", b"nonce", &[]);
+        let mut server = DtlsServerConnection12::new(server_cfg.clone(), b"peer-a".to_vec(), srng);
+        assert!(
+            client_refuses_server_flight(&mut client_a, &mut server),
+            "a no_std DTLS 1.2 client without a clock must not verify a chain"
+        );
+
+        // Control: the same chain with a pinned clock completes.
+        let mut client_b = client(
+            PcClientConfig12::new(roots(), "dtls.example")
+                .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0)),
+        );
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-noclock-server-2", b"nonce", &[]);
+        let mut server = DtlsServerConnection12::new(server_cfg, b"peer-a".to_vec(), srng);
+        assert!(pump_handshake(&mut client_b, &mut server));
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn missing_clock_fails_closed_13() {
+        let (der, key) = cert_with_validity(
+            b"dtls13-noclock",
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let server_cfg =
+            Arc::new(PcServerConfig13::with_ecdsa(alloc::vec![der.clone()], key).with_no_cookie());
+        let client = |cfg: PcClientConfig13| {
+            let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-noclock-client", b"nonce", &[]);
+            DtlsClientConnection13::new(cfg, b"client-addr".to_vec(), &mut crng)
+        };
+        let roots = || {
+            let mut roots = RootCertStore::new();
+            roots.add_der(der.clone()).unwrap();
+            roots
+        };
+
+        // No `with_verification_time`: the (encrypted, authenticated)
+        // Certificate is refused with `BadCertificate`.
+        let mut client_a = client(PcClientConfig13::new(roots(), "dtls.example"));
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-noclock-server", b"nonce", &[]);
+        let mut server = DtlsServerConnection13::new(server_cfg.clone(), b"peer-a".to_vec(), srng);
+        for dg in &client_a.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        let results: Vec<_> = server
+            .pop_outbound_datagrams()
+            .iter()
+            .map(|dg| client_a.feed_datagram(dg))
+            .collect();
+        assert!(
+            results.contains(&Err(Error::BadCertificate)),
+            "a no_std DTLS 1.3 client without a clock must not verify a chain: {results:?}"
+        );
+        assert!(!client_a.is_handshake_complete());
+
+        // Control: the same chain with a pinned clock completes.
+        let mut client_b = client(
+            PcClientConfig13::new(roots(), "dtls.example")
+                .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0)),
+        );
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-noclock-server-2", b"nonce", &[]);
+        let mut server = DtlsServerConnection13::new(server_cfg, b"peer-a".to_vec(), srng);
+        assert!(pump_handshake_13_local(&mut client_b, &mut server));
     }
 
     // ---------------------------------------------------------------

@@ -1423,6 +1423,15 @@ impl DtlsClientConnection13 {
             .map_err(|_| Error::BadCertificate)?;
         let leaf_key = if self.config.verify_certificates {
             let now = self.config.verification_time.clone().or_else(system_now);
+            // `no_std` has no clock: without a pinned `verification_time`
+            // the chain would be verified with the validity-period and
+            // CRL-freshness checks silently skipped, although the caller
+            // asked for verification. Fail closed instead — the caller
+            // either pins a time or opts out of verification explicitly.
+            #[cfg(not(feature = "std"))]
+            if now.is_none() {
+                return Err(Error::BadCertificate);
+            }
             let key = verify_chain_with_crls(
                 &self.config.roots,
                 &self.config.crls,
