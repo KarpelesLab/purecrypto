@@ -3780,7 +3780,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &msg,
-        );
+        )
+        .unwrap();
         c.read_tls(&rec);
         c.process_new_packets().unwrap();
         assert!(!c.is_handshake_complete());
