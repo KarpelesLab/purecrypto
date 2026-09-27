@@ -4663,6 +4663,25 @@ impl QuicConnection {
             if self.peer_packet_seen {
                 return Ok(datagram.len());
             }
+            // RFC 9000 §17.2.1: the server echoes our CIDs — "The value for
+            // Destination Connection ID MUST be the value from the Source
+            // Connection ID field of the packet the server received", and
+            // its Source Connection ID is the DCID we sent. §5.2.1: a client
+            // discards packets that do not match an existing connection by
+            // Destination Connection ID. Nothing else authenticates a VN
+            // packet, so without this check a blind off-path attacker who
+            // knows the 4-tuple kills the connection attempt with a 7-byte
+            // datagram.
+            // The two CIDs we sent are unpredictable (§7.2), which is what
+            // makes the echo a proof of on-path observation. `cids.local` is
+            // the SCID we wrote on our Initial; `cids.peer` is the DCID we
+            // sent (a Retry would have changed it, but a processed Retry
+            // sets `peer_packet_seen`, so we never get here after one).
+            if hdr.dcid != self.endpoint.cids.local.as_slice()
+                || hdr.scid != self.endpoint.cids.peer.as_slice()
+            {
+                return Ok(datagram.len());
+            }
             // Parse the trailing supported-versions list (4-byte big-
             // endian u32s starting at `payload_off`).
             let body = &datagram[hdr.payload_off..];
@@ -13063,6 +13082,61 @@ mod tests {
     // G-4: Version Negotiation packet handling. RFC 9000 §6.2.
     // ========================================================================
 
+    /// The CIDs a genuine Version Negotiation packet for `c` carries (RFC
+    /// 9000 §17.2.1): DCID = the SCID the client wrote on its Initial, SCID =
+    /// the DCID the client sent.
+    fn vn_cids_for(c: &QuicConnection) -> (Vec<u8>, Vec<u8>) {
+        (
+            c.endpoint.cids.local.as_slice().to_vec(),
+            c.endpoint.cids.peer.as_slice().to_vec(),
+        )
+    }
+
+    /// A Version Negotiation packet is unauthenticated; the only thing tying
+    /// it to our connection attempt is the echo of the two unpredictable CIDs
+    /// we sent (RFC 9000 §17.2.1, §5.2.1). Before the fix the client acted on
+    /// any VN before its first server packet, so a blind off-path attacker
+    /// who knew the 4-tuple could kill the attempt with a 7-byte datagram.
+    #[test]
+    fn vn_with_mismatched_cids_is_discarded() {
+        use crate::quic::pkt::build_version_negotiation;
+        let (mut c, _) = loopback_pair();
+        let _ = c.pop_datagram();
+        let (dcid, scid) = vn_cids_for(&c);
+        assert!(!dcid.is_empty() && !scid.is_empty());
+        let mut wrong_dcid = dcid.clone();
+        wrong_dcid[0] ^= 0xff;
+        let mut wrong_scid = scid.clone();
+        wrong_scid[0] ^= 0xff;
+        // Empty CIDs (the blind attacker's 7-byte datagram), a wrong DCID
+        // with the right SCID, and vice versa: all discarded without effect.
+        for (d, s) in [
+            (Vec::new(), Vec::new()),
+            (wrong_dcid, scid.clone()),
+            (dcid.clone(), wrong_scid),
+            (scid.clone(), dcid.clone()), // swapped
+        ] {
+            let vn = build_version_negotiation(&d, &s, &[0x0000_FF00]);
+            let r = c.feed_datagram(&vn);
+            assert!(r.is_ok(), "mismatched-CID VN must be dropped, got {:?}", r);
+            assert!(
+                !c.is_closed(),
+                "mismatched-CID VN must not close the client"
+            );
+            assert!(
+                !c.peer_packet_seen,
+                "and must not count as a processed packet"
+            );
+        }
+        // The genuine echo is still honoured.
+        let vn = build_version_negotiation(&dcid, &scid, &[0x0000_FF00]);
+        assert!(matches!(
+            c.feed_datagram(&vn),
+            Err(Error::UnsupportedVersion)
+        ));
+        assert!(c.is_closed());
+    }
+
     /// G-4: a client that receives a VN packet listing only unknown
     /// versions (no v1) before processing any other server packet MUST
     /// close with UnsupportedVersion.
@@ -13073,9 +13147,10 @@ mod tests {
         // Drain the client's first Initial so the wire is plausible.
         let _ = c.pop_datagram();
         // Build a VN packet with versions [0x0000FF00, 0xDEADBEEF].
-        // DCID = client's SCID, SCID = server's chosen ID — we use
-        // empty CIDs since the client doesn't validate VN DCID/SCID.
-        let vn = build_version_negotiation(&[], &[], &[0x0000_FF00, 0xDEAD_BEEF]);
+        // DCID = client's SCID, SCID = the DCID the client sent (RFC 9000
+        // §17.2.1) — the client discards a VN that echoes anything else.
+        let (dcid, scid) = vn_cids_for(&c);
+        let vn = build_version_negotiation(&dcid, &scid, &[0x0000_FF00, 0xDEAD_BEEF]);
         let r = c.feed_datagram(&vn);
         assert!(
             matches!(r, Err(Error::UnsupportedVersion)),
@@ -13093,7 +13168,8 @@ mod tests {
         use crate::quic::pkt::{QUIC_V1, build_version_negotiation};
         let (mut c, _) = loopback_pair();
         let _ = c.pop_datagram();
-        let vn = build_version_negotiation(&[], &[], &[QUIC_V1, 0xDEAD_BEEF]);
+        let (dcid, scid) = vn_cids_for(&c);
+        let vn = build_version_negotiation(&dcid, &scid, &[QUIC_V1, 0xDEAD_BEEF]);
         let r = c.feed_datagram(&vn);
         assert!(
             matches!(r, Err(Error::IllegalParameter)),
@@ -13119,7 +13195,8 @@ mod tests {
             .expect("client feeds server response");
         assert!(c.peer_packet_seen, "client must have processed a packet");
         // Now feed a malicious VN that would otherwise close the client.
-        let vn = build_version_negotiation(&[], &[], &[0x0000_FF00]);
+        let (dcid, scid) = vn_cids_for(&c);
+        let vn = build_version_negotiation(&dcid, &scid, &[0x0000_FF00]);
         let r = c.feed_datagram(&vn);
         // MUST silently drop — no error, no close.
         assert!(
