@@ -12,6 +12,7 @@ use crate::ec::{
 use crate::hash::{Digest, Sha256};
 use crate::rsa::{BoxedRsaPrivateKey, BoxedRsaPublicKey};
 use crate::zeroize::Zeroizing;
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -309,9 +310,13 @@ impl Jwk {
             None => None,
             Some(items) => {
                 let mut ops = Vec::with_capacity(items.len());
+                // A repeated operation is Malformed (RFC 7517 §4.3);
+                // the set keeps the check linear-logarithmic in the
+                // array length.
+                let mut seen = BTreeSet::new();
                 for item in items {
                     let op = item.as_str().ok_or(Error::Malformed)?;
-                    if ops.iter().any(|o: &String| o == op) {
+                    if !seen.insert(op) {
                         return Err(Error::Malformed);
                     }
                     ops.push(String::from(op));
@@ -1384,6 +1389,16 @@ mod tests {
         // Empty oct key, padding in k.
         assert!(Jwk::parse(r#"{"kty":"oct","k":""}"#).is_err());
         assert!(Jwk::parse(r#"{"kty":"oct","k":"AAA="}"#).is_err());
+        // Repeated or non-string key operations.
+        assert_eq!(
+            Jwk::parse(r#"{"kty":"oct","k":"AAAA","key_ops":["sign","verify","sign"]}"#)
+                .unwrap_err(),
+            Error::Malformed
+        );
+        assert_eq!(
+            Jwk::parse(r#"{"kty":"oct","k":"AAAA","key_ops":["sign",1]}"#).unwrap_err(),
+            Error::Malformed
+        );
         // Unknown kty; missing members.
         assert!(Jwk::parse(r#"{"kty":"DSA"}"#).is_err());
         assert!(Jwk::parse(r#"{"kty":"RSA","n":"AQAB"}"#).is_err());

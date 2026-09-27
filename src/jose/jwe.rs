@@ -212,16 +212,21 @@ impl Jwe {
     /// The union of the protected, shared unprotected and per-recipient
     /// headers, which must be disjoint.
     fn merged_header(&self, r: &JweRecipient) -> Result<Object, Error> {
-        let mut merged = self.protected.clone();
-        for extra in [self.unprotected.as_ref(), r.header.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            for (name, value) in extra.iter() {
-                merged.insert(name, value.clone())?;
-            }
-        }
-        Ok(merged)
+        let members: Vec<(String, Value)> = [
+            Some(&self.protected),
+            self.unprotected.as_ref(),
+            r.header.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|o| {
+            o.iter()
+                .map(|(name, value)| (String::from(name), value.clone()))
+        })
+        .collect();
+        // Overlap between the three is a duplicate name, which
+        // `from_members` rejects in one pass over the union.
+        Object::from_members(members)
     }
 
     /// The protected header.
@@ -1082,6 +1087,10 @@ mod tests {
         // The unprotected header is not authenticated, but it may not
         // override protected parameters or carry `enc`.
         let bad = general.replace(r#"{"jku":"#, r#"{"enc":"A256GCM","jku":"#);
+        assert_eq!(Jwe::parse(&bad).unwrap_err(), Error::Malformed);
+        // Nor may the header locations overlap at all: `kid` is already in
+        // each per-recipient header.
+        let bad = general.replace(r#"{"jku":"#, r#"{"kid":"7","jku":"#);
         assert_eq!(Jwe::parse(&bad).unwrap_err(), Error::Malformed);
 
         let flattened = r#"{

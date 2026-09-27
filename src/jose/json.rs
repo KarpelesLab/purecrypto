@@ -7,9 +7,10 @@
 //! whitespace characters. It rejects duplicate object member names (RFC 7515
 //! §5.2 step 2 / RFC 7516 §5.2 step 4 require it for headers; a duplicate is
 //! also an obvious vector for parser-differential attacks), unescaped control
-//! characters, lone surrogates, trailing data and nesting deeper than
-//! [`MAX_DEPTH`]. The parser is recursive, so the depth cap is what bounds
-//! stack use on hostile input.
+//! characters, lone surrogates, trailing data, nesting deeper than
+//! [`MAX_DEPTH`] and objects with more than [`MAX_MEMBERS`] members. The
+//! parser is recursive, so the depth cap is what bounds stack use on
+//! hostile input; the member cap keeps every per-object check linear-ish.
 //!
 //! Numbers are kept as their validated source text ([`Number`]); the only
 //! numeric header parameter JOSE defines (`p2c`) is a non-negative integer,
@@ -21,6 +22,11 @@ use alloc::vec::Vec;
 
 /// Maximum nesting depth of arrays/objects the parser accepts.
 pub const MAX_DEPTH: usize = 32;
+
+/// Maximum number of members the parser accepts in one object. JOSE
+/// headers and JWKs have a few dozen at most; the bound keeps the
+/// duplicate-name check and header merging cheap on hostile input.
+pub const MAX_MEMBERS: usize = 4096;
 
 /// A JSON number, kept as its validated source text.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,12 +110,28 @@ impl Object {
     }
 
     /// Appends a member. Returns `Err(Malformed)` if `name` already exists.
+    /// Each call scans the existing members, which suits the small objects
+    /// of JOSE headers; building a large object this way is quadratic (the
+    /// parser checks a whole object's names at once instead).
     pub fn insert(&mut self, name: &str, value: Value) -> Result<(), Error> {
         if self.contains(name) {
             return Err(Error::Malformed);
         }
         self.0.push((String::from(name), value));
         Ok(())
+    }
+
+    /// Builds an object from `members` in the given order, returning
+    /// `Err(Malformed)` when a name repeats. The check sorts a list of the
+    /// names, so it is `O(n log n)` rather than the `O(n²)` of repeated
+    /// [`insert`](Self::insert).
+    pub(crate) fn from_members(members: Vec<(String, Value)>) -> Result<Self, Error> {
+        let mut names: Vec<&str> = members.iter().map(|(k, _)| k.as_str()).collect();
+        names.sort_unstable();
+        if names.windows(2).any(|w| w[0] == w[1]) {
+            return Err(Error::Malformed);
+        }
+        Ok(Object(members))
     }
 
     /// Appends a string member (see [`insert`](Self::insert)).
@@ -266,11 +288,11 @@ impl Parser<'_> {
     }
 
     fn object(&mut self, depth: usize) -> Result<Object, Error> {
-        let mut obj = Object::new();
+        let mut members: Vec<(String, Value)> = Vec::new();
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
-            return Ok(obj);
+            return Ok(Object::new());
         }
         loop {
             self.skip_ws();
@@ -283,15 +305,20 @@ impl Parser<'_> {
             self.expect(b":")?;
             self.skip_ws();
             let value = self.value(depth)?;
-            // Duplicate member names are rejected (Error::Json, not
-            // Malformed: the text is not an acceptable JSON text for us).
-            obj.insert(&name, value).map_err(|_| Error::Json)?;
+            if members.len() >= MAX_MEMBERS {
+                return Err(Error::Json);
+            }
+            members.push((name, value));
             self.skip_ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
                 Some(b'}') => {
                     self.pos += 1;
-                    return Ok(obj);
+                    // Duplicate member names are rejected (Error::Json, not
+                    // Malformed: the text is not an acceptable JSON text
+                    // for us). Checked once for the whole object so that a
+                    // large one costs `n log n`, not `n²`.
+                    return Object::from_members(members).map_err(|_| Error::Json);
                 }
                 _ => return Err(Error::Json),
             }
@@ -545,6 +572,58 @@ mod tests {
             .chain(core::iter::repeat_n(']', MAX_DEPTH))
             .collect();
         assert!(parse(&ok).is_ok());
+    }
+
+    /// A flat object of `n` members `"k0":0, "k1":1, …`, with member
+    /// `dup` (if any) renamed to repeat `"k0"`.
+    fn flat_object(n: usize, dup: Option<usize>) -> String {
+        let mut text = String::from("{");
+        for i in 0..n {
+            if i > 0 {
+                text.push(',');
+            }
+            let k = if Some(i) == dup { 0 } else { i };
+            text.push_str(&alloc::format!(r#""k{k}":{i}"#));
+        }
+        text.push('}');
+        text
+    }
+
+    #[test]
+    fn member_limit_and_large_objects() {
+        // The largest accepted object parses (in `n log n`), keeps its
+        // order, and a duplicate anywhere in it is still caught.
+        let o = parse_object(&flat_object(MAX_MEMBERS, None)).unwrap();
+        assert_eq!(o.len(), MAX_MEMBERS);
+        assert_eq!(o.iter().nth(17).map(|(k, _)| k), Some("k17"));
+        assert_eq!(
+            parse_object(&flat_object(MAX_MEMBERS, Some(MAX_MEMBERS - 1))).unwrap_err(),
+            Error::Json
+        );
+        // One member more is refused, even without a duplicate.
+        assert_eq!(
+            parse_object(&flat_object(MAX_MEMBERS + 1, None)).unwrap_err(),
+            Error::Json
+        );
+        // The cap is per object, not per document.
+        let nested = alloc::format!(
+            r#"{{"a":{},"b":{}}}"#,
+            flat_object(MAX_MEMBERS, None),
+            flat_object(MAX_MEMBERS, None)
+        );
+        assert!(parse_object(&nested).is_ok());
+    }
+
+    #[test]
+    fn from_members_rejects_duplicates() {
+        let member = |k: &str| (String::from(k), Value::Null);
+        let o = Object::from_members(alloc::vec![member("a"), member("b")]).unwrap();
+        assert_eq!(o.len(), 2);
+        assert_eq!(
+            Object::from_members(alloc::vec![member("a"), member("b"), member("a")]).unwrap_err(),
+            Error::Malformed
+        );
+        assert!(Object::from_members(Vec::new()).unwrap().is_empty());
     }
 
     #[test]
