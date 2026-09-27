@@ -28,6 +28,12 @@ use crate::tls::quic_hooks::Level;
 /// [`crate::quic::client::DEFAULT_CID_LEN`] (8 bytes).
 pub(crate) const DEFAULT_SCID_LEN: usize = 8;
 
+/// RFC 9000 §7.2 — the shortest Destination Connection ID a client may put on
+/// an Initial it sends before hearing from the server ("MUST be at least 8
+/// bytes in length"). An unrecognised Initial with a shorter DCID is
+/// malformed and never accepted as a new connection.
+const MIN_INITIAL_DCID_LEN: usize = 8;
+
 /// Constructs the TLS engine in QUIC server mode and returns the engine
 /// alongside the driver-side hook handle. The engine is *not* fed any
 /// bytes yet — the first call to
@@ -392,6 +398,30 @@ impl QuicServer {
             } else if let Some(&id) = self.by_initial.get(&(from, dcid)) {
                 self.feed(id, from, ecn, datagram);
             } else if hdr.typ == LongType::Initial {
+                // RFC 9000 §14.1: "A server MUST discard an Initial packet
+                // that is carried in a UDP datagram with a payload that is
+                // smaller than the smallest allowed maximum datagram size of
+                // 1200 bytes." The connection would discard it too — but only
+                // *after* `accept` has rebuilt the TLS config, allocated a
+                // `QuicConnection` and taken a half-open slot (evicting a
+                // legitimate half-open handshake once over the M-4 budget).
+                // A 40-byte forged Initial must cost nothing, so the check
+                // runs here, before any state exists (mirrors the M-3 check
+                // on the Version Negotiation path above).
+                if datagram.len() < MIN_INITIAL_DATAGRAM {
+                    return Ok(());
+                }
+                // RFC 9000 §7.2: "When an Initial packet is sent by a client
+                // that has not previously received an Initial or Retry
+                // packet from the server, the client populates the
+                // Destination Connection ID field with an unpredictable
+                // value. This Destination Connection ID MUST be at least 8
+                // bytes in length." Ours are `DEFAULT_SCID_LEN` bytes too, so
+                // nothing shorter can be a retried Initial for one of our
+                // Retries either; it is malformed and cannot be accepted.
+                if hdr.dcid.len() < MIN_INITIAL_DCID_LEN {
+                    return Ok(());
+                }
                 self.accept(from, ecn, datagram)?;
             } else {
                 // A Handshake/0-RTT packet for a connection we have no state
@@ -856,6 +886,72 @@ mod server_tests {
             srv.poll_transmit().is_none(),
             "no reflected Version Negotiation for a tiny datagram"
         );
+    }
+
+    /// RFC 9000 §14.1 — an Initial in an undersized datagram is discarded
+    /// *before* `accept` builds a connection for it. The connection used to
+    /// discard it too, but only after the server had rebuilt the TLS config,
+    /// allocated a `QuicConnection` and taken a half-open slot — so a 40-byte
+    /// forged Initial cost a full allocation and, over the half-open budget,
+    /// evicted a legitimate half-open handshake.
+    #[test]
+    fn undersized_initial_allocates_no_connection() {
+        let mut srv = server([0x34; 32]);
+        // 40-byte long-header Initial: v1, 8-byte DCID + SCID, empty token,
+        // Length covering the remainder.
+        let mut pkt = alloc::vec![0xC0u8];
+        pkt.extend_from_slice(&QUIC_V1.to_be_bytes());
+        pkt.push(8);
+        pkt.extend_from_slice(&[0x11; 8]);
+        pkt.push(8);
+        pkt.extend_from_slice(&[0x22; 8]);
+        pkt.push(0); // token length
+        pkt.push(40 - 24);
+        pkt.resize(40, 0x33);
+        assert!(matches!(
+            LongHeader::parse(&pkt),
+            Ok(h) if h.typ == LongType::Initial && h.length == 16
+        ));
+        for i in 0..10u16 {
+            pkt[6] = i as u8; // a fresh DCID per datagram
+            srv.recv(addr(50100 + i), EcnCodepoint::NotEct, &pkt)
+                .unwrap();
+        }
+        assert_eq!(
+            srv.connection_count(),
+            0,
+            "a sub-1200-byte Initial must not allocate a connection"
+        );
+        assert!(srv.by_addr.is_empty() && srv.by_cid.is_empty());
+        assert!(srv.poll_transmit().is_none(), "and draws no response");
+    }
+
+    /// RFC 9000 §7.2 — a client's first Initial carries a DCID of at least 8
+    /// bytes; an unrecognised Initial with a shorter one is malformed and is
+    /// dropped before any connection state is allocated for it.
+    #[test]
+    fn short_dcid_initial_allocates_no_connection() {
+        let mut srv = server([0x35; 32]);
+        let mut pkt = alloc::vec![0xC0u8];
+        pkt.extend_from_slice(&QUIC_V1.to_be_bytes());
+        pkt.push(4);
+        pkt.extend_from_slice(&[0x11; 4]);
+        pkt.push(8);
+        pkt.extend_from_slice(&[0x22; 8]);
+        pkt.push(0); // token length
+        pkt.extend_from_slice(&[0x44, 0x00]); // Length = 1024 (2-byte varint)
+        pkt.resize(MIN_INITIAL_DATAGRAM, 0x33);
+        assert!(matches!(
+            LongHeader::parse(&pkt),
+            Ok(h) if h.typ == LongType::Initial && h.dcid.len() == 4
+        ));
+        srv.recv(addr(50200), EcnCodepoint::NotEct, &pkt).unwrap();
+        assert_eq!(
+            srv.connection_count(),
+            0,
+            "a <8-byte DCID Initial is dropped"
+        );
+        assert!(srv.poll_transmit().is_none());
     }
 
     /// M-4 — a spoofed-source Initial flood must not fill the connection
