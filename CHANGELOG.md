@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4](https://github.com/KarpelesLab/purecrypto/compare/v0.9.3...v0.9.4) - 2026-09-27
+
+### Fixed
+
+- *(tls)* fail closed on certificate validity without a clock under no_std
+- *(tls)* send early_data only when the client actually offers 0-RTT
+- *(tls)* release a TLS 1.2 session ticket only after the handshake completes
+- *(tls)* do not let provide_signature revive a failed TLS 1.3 client
+- *(ech)* never offer or accept TLS 1.2 on a real-ECH connection
+- *(ech)* fail closed instead of sending cleartext SNI when no ECHConfig is usable
+- *(x509)* accept only canonical dotted-quad IPv4 literals
+- *(x509)* parse TBSCertificate and TBSCertList to the end
+- *(signature)* floor EC curve strength in SignaturePolicy
+- *(tls)* refuse certificates issued by a non-CA trust anchor
+- *(tls)* wipe the formatted SSLKEYLOGFILE line
+- *(tls)* wipe legacy CBC key material
+- *(tls)* answer a burst of KeyUpdate requests with one KeyUpdate
+- *(tls)* refuse records interleaved into a partial handshake message
+- *(tls)* fragment handshake messages across records
+- *(quic)* bound loss-detection work per ACK frame
+- *(quic)* keep out-of-order stream fragments disjoint
+- *(quic)* bound the retired-stream bookkeeping
+- *(quic)* discard Version Negotiation that does not echo our CIDs
+- *(quic)* drop undersized and short-DCID Initials before accepting
+- *(quic)* apply the Retry decision to the first coalesced Initial
+- *(tls)* resume raw-public-key client identities on TLS 1.2
+- *(tls)* re-validate the carried client identity on TLS 1.3 resumption
+- *(tls)* never evict a live binder from the 0-RTT replay window
+- *(tls)* negotiate ALPN from the current ClientHello on TLS 1.2 resumption
+- *(tls)* fail closed on client-cert verification without a clock
+- *(tls)* refuse an external signature once the server connection is closed
+- *(tls)* let the retry ClientHello re-present quic_transport_parameters
+- *(jose)* document that a non-CRT RSA JWK runs without base blinding
+- *(jose)* wipe private JWK text left in JSON parser intermediates
+- *(jose)* make JSON duplicate-name checks n log n and cap object size
+- *(jose)* bound JWE recipients and give PBES2 one budget per message
+- *(dtls)* cap the pre-cookie ClientHello claim at 8 KiB
+- *(dtls)* fail closed when verifying a chain with no clock on no_std
+- *(dtls)* ignore post-handshake traffic under the retired handshake epoch
+- *(dtls)* reject a second ClientKeyExchange once the master secret exists
+- *(kdf)* return an error for a KBKDF PRF wider than the block buffer
+- *(ffi)* refuse QUIC transport parameters outside the varint range
+- *(ffi)* reject outputs that overlap inputs in the plain-length family
+- *(ffi)* zero *out_len when pc_ec_self_signed_pem fails
+- *(bls)* reject an empty DST in expand_message_xmd
+- *(bls)* wipe scalar material left behind by scalar multiplication
+- *(bls)* wipe PRK and the HKDF-Expand blocks in SecretKey::generate
+- *(chunked)* wipe the decrypted prefix when one-shot decrypt fails
+- *(cipher)* make the CTR counter increment branchless
+- *(tls)* keep the TLS 1.2 offer when resuming a TLS 1.3 session
+- *(tls)* scope stored TLS 1.2 sessions like TLS 1.3 ones
+- *(tls)* resume a stored TLS 1.2 session from the version-spanning client
+- *(tls)* request a session ticket when offering TLS 1.2
+- *(tls)* never send an IP literal as SNI
+
+### Other
+
+- *(tls)* pin verification_time in fixtures so no_std test runs pass
+- *(tls)* handle write_record's Result in the take_session regression test
+- *(pki)* state that a missing verification time skips validity checks
+- *(ffi)* document the scrypt/Argon2 zero-fill and the panic=abort caveat
+
 ## [0.9.3](https://github.com/KarpelesLab/purecrypto/compare/v0.9.2...v0.9.3) - 2026-09-27
 
 ### Added
