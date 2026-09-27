@@ -794,9 +794,26 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             });
         }
 
+        // Once connected, the handshake epoch (2) is only still readable as
+        // the retired epoch so a retransmitted client Finished flight —
+        // whose ACK we lost — can be re-ACKed, and that ACK was queued
+        // above. RFC 9147 §4.2.1 / RFC 8446 §4.6 put every post-handshake
+        // message (KeyUpdate) and every alert of an established connection
+        // under the application keys, so nothing else under epoch 2 may
+        // act on the connection: a handshake fragment with a fresh
+        // `message_seq` would otherwise reach `on_post_handshake` through
+        // the reassembler (and advance its `expected_msg_seq` past the
+        // genuine epoch-3 stream), and a close_notify would tear the
+        // connection down under keys the peer has retired. The genuine
+        // client only ever retransmits under epoch 2, so the whole payload
+        // is dropped here; application data under epoch 2 stays fatal
+        // below, as before.
+        let retired_handshake_epoch = self.state == State::Connected && read_epoch == 2;
+
         // Past this point the record is authenticated: protocol violations
         // below come from the genuine peer and remain fatal.
         match inner_type {
+            ContentType::Handshake if retired_handshake_epoch => {}
             ContentType::Handshake => self.process_handshake_record(&plain, true)?,
             ContentType::ApplicationData => {
                 if self.state != State::Connected {
@@ -813,6 +830,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 }
                 self.app_in.extend_from_slice(&plain);
             }
+            ContentType::Alert if retired_handshake_epoch => {}
             ContentType::Alert => self.process_peer_alert(&plain)?,
             ContentType::Unknown(t) if t == ACK_CONTENT_TYPE => {
                 let acks = decode_ack(&plain)?;
@@ -2176,6 +2194,23 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     pub(crate) fn send_handshake_for_test(&mut self, msg_type: u8, body: &[u8]) {
         self.emit_encrypted_handshake(msg_type, body)
             .expect("protected write keys installed");
+    }
+
+    /// Test-only: like `send_handshake_for_test` but the message is framed
+    /// at the NEXT `message_seq` without consuming it, and is not tracked
+    /// for retransmission. A later genuine message then reuses the same
+    /// sequence number, which lets a test confirm the peer never fed this
+    /// copy to its reassembler (e.g. one sent under the handshake epoch
+    /// after the peer connected).
+    #[cfg(test)]
+    pub(crate) fn send_handshake_untracked_for_test(&mut self, msg_type: u8, body: &[u8]) {
+        let mut frags = write_fragments(msg_type, self.out_msg_seq, body, self.max_fragment());
+        assert_eq!(frags.len(), 1, "test message must fit one fragment");
+        let frag = frags.remove(0);
+        let dg = self
+            .encrypt_protected_record(ContentType::Handshake, &frag)
+            .expect("protected write keys installed");
+        self.out_dgrams.push(dg);
     }
 
     /// Generates the server-side ephemeral share and derives the

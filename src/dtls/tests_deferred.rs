@@ -892,6 +892,152 @@ fn client_reacks_retransmitted_server_flight_13() {
     app_data_round_trip(&mut client, &mut server);
 }
 
+/// RFC 9147 §4.2.1 / RFC 8446 §4.6: post-handshake messages and alerts of
+/// an established connection travel under the application keys. The
+/// handshake epoch (2) stays readable after the handshake only so a
+/// retransmitted client Finished can be re-ACKed, so a KeyUpdate or a
+/// close_notify a peer sends under the retired keys must neither rotate
+/// the server's read epoch, nor advance its reassembler, nor close the
+/// connection — while the record is still ACKed like any handshake
+/// record.
+#[test]
+fn server_ignores_post_handshake_traffic_under_handshake_epoch_13() {
+    let (server_cfg, cert) = server13_cfg();
+    let mut client = client13(small_client13_cfg(&cert), b"ep2s-client");
+    let mut server = server13(server_cfg.with_no_cookie(), b"ep2s-server");
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(server.is_handshake_complete());
+    // Hold the server's ACK back: the client keeps its epoch-2 write keys
+    // (its Finished is still in flight), as a peer that lost the ACK would.
+    let held_ack = server.pop_outbound_datagrams();
+    assert_eq!(server.read_epoch(), Some(3));
+
+    // KeyUpdate under epoch 2: decrypts, is ACKed, but is never dispatched.
+    client.send_handshake_under_retired_keys_for_test(hs_type::KEY_UPDATE, &[0]);
+    let ku = client.pop_outbound_datagrams();
+    assert_eq!(ku.len(), 1);
+    assert_eq!(ku[0][0] & 0b11, 2, "sent under the handshake epoch");
+    assert_eq!(server.feed_datagram(&ku[0]), Ok(()));
+    assert_eq!(
+        server.read_epoch(),
+        Some(3),
+        "a KeyUpdate under the handshake keys must not rotate the read epoch"
+    );
+    assert!(server.is_handshake_complete());
+    let acks = server.pop_outbound_datagrams();
+    assert!(!acks.is_empty(), "still ACKed like a retransmitted flight");
+
+    // close_notify under epoch 2: ignored, the connection stays up.
+    client.send_under_retired_keys_for_test(ContentType::Alert, &[1, 0]);
+    let alert = client.pop_outbound_datagrams();
+    assert_eq!(alert.len(), 1);
+    assert_eq!(server.feed_datagram(&alert[0]), Ok(()));
+    assert!(
+        server.is_handshake_complete(),
+        "an alert under the retired handshake epoch must not close the connection"
+    );
+
+    // Release the Finished so the client drops its epoch-2 keys.
+    for dg in held_ack.iter().chain(acks.iter()) {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(client.next_timeout().is_none());
+
+    // The genuine KeyUpdate, under epoch 3, carries the SAME message_seq
+    // as the epoch-2 copy: it is accepted only if that copy never reached
+    // the reassembler.
+    client.request_key_update(false).unwrap();
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(server.read_epoch(), Some(4));
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(client.write_epoch(), 4);
+    app_data_round_trip(&mut client, &mut server);
+}
+
+/// Mirror image for the client: the server still writes under epoch 2
+/// until the client's Finished reaches it, so a KeyUpdate or close_notify
+/// it emits then must be ignored by the already-connected client (which
+/// may only act on such messages under the application keys) — without
+/// derailing the message sequence the genuine post-handshake stream will
+/// use.
+#[test]
+fn client_ignores_post_handshake_traffic_under_handshake_epoch_13() {
+    let (server_cfg, cert) = server13_cfg();
+    let mut client = client13(small_client13_cfg(&cert), b"ep2c-client");
+    let mut server = server13(server_cfg.with_no_cookie(), b"ep2c-server");
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(client.is_handshake_complete());
+    assert_eq!(client.read_epoch(), Some(3));
+    // The client's Finished + ACKs, held back for now.
+    let client_flight = client.pop_outbound_datagrams();
+    assert_eq!(server.write_epoch(), 2);
+
+    // KeyUpdate under epoch 2: ACKed, never dispatched.
+    server.send_handshake_untracked_for_test(hs_type::KEY_UPDATE, &[0]);
+    let ku = server.pop_outbound_datagrams();
+    assert_eq!(ku.len(), 1);
+    assert_eq!(ku[0][0] & 0b11, 2, "sent under the handshake epoch");
+    assert_eq!(client.feed_datagram(&ku[0]), Ok(()));
+    assert_eq!(
+        client.read_epoch(),
+        Some(3),
+        "a KeyUpdate under the handshake keys must not rotate the read epoch"
+    );
+    assert!(client.is_handshake_complete());
+    assert!(
+        !client.pop_outbound_datagrams().is_empty(),
+        "still ACKed like a retransmitted flight"
+    );
+
+    // close_notify under epoch 2: ignored, the connection stays up.
+    server.send_alert_record_for_test(1, 0);
+    let alert = server.pop_outbound_datagrams();
+    assert_eq!(alert.len(), 1);
+    assert_eq!(alert[0][0] & 0b11, 2);
+    assert_eq!(client.feed_datagram(&alert[0]), Ok(()));
+    assert!(
+        client.is_handshake_complete(),
+        "an alert under the retired handshake epoch must not close the connection"
+    );
+
+    // Complete the server, then its genuine KeyUpdate under epoch 3 reuses
+    // the message_seq of the epoch-2 copy and must be accepted.
+    for dg in &client_flight {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(server.is_handshake_complete());
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    server.request_key_update(false).unwrap();
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(client.read_epoch(), Some(4));
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(server.write_epoch(), 4);
+    app_data_round_trip(&mut client, &mut server);
+}
+
 // ---------------------------------------------------------------------
 // DTLS-I5: MTU-bounded handshake fragmentation (RFC 9147 §4.4 /
 // RFC 6347 §4.1.1).

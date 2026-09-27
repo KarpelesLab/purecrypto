@@ -732,9 +732,27 @@ impl DtlsClientConnection13 {
             });
         }
 
+        // Once connected, the handshake epoch (2) is only still readable as
+        // the retired epoch so a retransmitted server flight — whose ACKs
+        // we lost — can be re-ACKed, and that ACK was queued above. RFC
+        // 9147 §4.2.1 / RFC 8446 §4.6 put every post-handshake message
+        // (NewSessionTicket, KeyUpdate) and every alert of an established
+        // connection under the application keys, so nothing else under
+        // epoch 2 may act on the connection: a handshake fragment with a
+        // fresh `message_seq` would otherwise reach `on_post_handshake`
+        // through the reassembler (a KeyUpdate under the retired handshake
+        // keys would rotate our read epoch, and any message would advance
+        // `expected_msg_seq` past the genuine epoch-3 stream), and a
+        // close_notify would tear the connection down under keys the peer
+        // has retired. The genuine server only ever retransmits under
+        // epoch 2, so the whole payload is dropped here; application data
+        // under epoch 2 stays fatal below, as before.
+        let retired_handshake_epoch = self.state == State::Connected && read_epoch == 2;
+
         // Past this point the record is authenticated: protocol violations
         // below come from the genuine peer and remain fatal.
         match inner_type {
+            ContentType::Handshake if retired_handshake_epoch => {}
             ContentType::Handshake => self.process_handshake_record(&plain, true)?,
             ContentType::ApplicationData => {
                 if self.state != State::Connected {
@@ -751,6 +769,7 @@ impl DtlsClientConnection13 {
                 }
                 self.app_in.extend_from_slice(&plain);
             }
+            ContentType::Alert if retired_handshake_epoch => {}
             ContentType::Alert => self.process_peer_alert(&plain)?,
             ContentType::Unknown(t) if t == ACK_CONTENT_TYPE => {
                 let acks = decode_ack(&plain)?;
@@ -1838,6 +1857,47 @@ impl DtlsClientConnection13 {
             self.emit_protected_handshake(frag)
                 .expect("protected write keys installed");
         }
+    }
+
+    /// Test-only: queues one record of `ct` / `payload` under the RETIRED
+    /// handshake write keys (epoch 2), which a conforming client only ever
+    /// uses to retransmit its Finished. Lets tests exercise the server's
+    /// handling of post-handshake traffic under the handshake epoch. Only
+    /// available while our Finished is unacknowledged (the retired context
+    /// is dropped once nothing is left to retransmit under it).
+    #[cfg(test)]
+    pub(crate) fn send_under_retired_keys_for_test(&mut self, ct: ContentType, payload: &[u8]) {
+        let suite = self.suite.expect("suite negotiated");
+        let ctx = self
+            .hs_write
+            .as_mut()
+            .expect("handshake write keys retired");
+        let seq = ctx.seq;
+        ctx.seq += 1;
+        let dg = encrypt_protected_record_with(
+            suite,
+            &mut ctx.crypter,
+            &ctx.sn_key,
+            ctx.epoch,
+            seq,
+            ct,
+            payload,
+        )
+        .expect("retired write keys usable");
+        self.out_dgrams.push(dg);
+    }
+
+    /// Test-only: `send_under_retired_keys_for_test` for one unfragmented
+    /// handshake message at the NEXT `message_seq`. The sequence number is
+    /// neither consumed nor the record tracked for retransmission, so a
+    /// later genuine message reuses it — which lets a test confirm the
+    /// peer never fed the epoch-2 copy to its reassembler.
+    #[cfg(test)]
+    pub(crate) fn send_handshake_under_retired_keys_for_test(&mut self, msg_type: u8, body: &[u8]) {
+        let mut frags = write_fragments(msg_type, self.out_msg_seq, body, self.max_fragment());
+        assert_eq!(frags.len(), 1, "test message must fit one fragment");
+        let frag = frags.remove(0);
+        self.send_under_retired_keys_for_test(ContentType::Handshake, &frag);
     }
 }
 
