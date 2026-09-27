@@ -684,6 +684,66 @@ fn ech_config_list_supports_first_supported_when_first_is_unknown() {
     assert_eq!(first.version, ECH_VERSION_DRAFT_22);
 }
 
+/// draft §6.1: a "compatible ECHConfig" needs more than the right
+/// version. `first_usable` skips draft-22 entries whose KEM or every
+/// symmetric suite is unimplemented (and non-UTF-8 public names), and
+/// returns the first implemented suite of the entry it lands on — not
+/// blindly the entry's first suite.
+#[test]
+fn ech_config_list_first_usable_skips_unimplemented_algorithms() {
+    let good = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::ChaCha20Poly1305.id(),
+    };
+    let exotic = HpkeSymCipherSuite {
+        kdf_id: 0x7f01,
+        aead_id: 0x7f02,
+    };
+    let entry = |config_id: u8, kem_id: u16, suites: Vec<HpkeSymCipherSuite>, name: &[u8]| {
+        EchConfig::new(EchConfigContents {
+            key_config: HpkeKeyConfig {
+                config_id,
+                kem_id,
+                public_key: alloc::vec![0x11u8; 32],
+                cipher_suites: suites,
+            },
+            maximum_name_length: 64,
+            public_name: name.to_vec(),
+            extensions: Vec::new(),
+        })
+    };
+    let x25519 = HpkeKem::DhkemX25519HkdfSha256.id();
+    let unknown_kem = entry(1, 0x0021, alloc::vec![good], b"public.example");
+    let exotic_only = entry(2, x25519, alloc::vec![exotic], b"public.example");
+    let bad_name = entry(3, x25519, alloc::vec![good], b"\xff\xfe");
+    let usable = entry(4, x25519, alloc::vec![exotic, good], b"public.example");
+    for c in [&unknown_kem, &exotic_only, &bad_name] {
+        assert!(c.is_supported(), "draft-22 entries all parse as supported");
+        assert_eq!(c.usable_cipher_suite(), None);
+    }
+    assert_eq!(usable.usable_cipher_suite(), Some(good));
+
+    let list = EchConfigList::new(alloc::vec![
+        unknown_kem.clone(),
+        exotic_only.clone(),
+        bad_name.clone(),
+        usable
+    ]);
+    // `first_supported` would have picked the unknown-KEM entry.
+    assert_eq!(
+        list.first_supported()
+            .and_then(|c| c.contents.as_ref())
+            .map(|c| c.key_config.config_id),
+        Some(1)
+    );
+    let (picked, suite) = list.first_usable().expect("a usable entry");
+    assert_eq!(picked.contents.as_ref().unwrap().key_config.config_id, 4);
+    assert_eq!(suite, good);
+
+    let none = EchConfigList::new(alloc::vec![unknown_kem, exotic_only, bad_name]);
+    assert!(none.first_usable().is_none());
+}
+
 // ---------------------------------------------------------------------
 // ech_outer_extensions codec (inner.rs) — compression / decompression
 // round-trips plus the draft §5.1 fatal-decompression-error matrix.

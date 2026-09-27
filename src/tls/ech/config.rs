@@ -216,6 +216,36 @@ impl EchConfig {
         self.version == ECH_VERSION_DRAFT_22 && self.contents.is_some()
     }
 
+    /// The HPKE symmetric suite a client would seal against this entry
+    /// with, or `None` when the entry cannot be used at all.
+    ///
+    /// draft-ietf-tls-esni-22 §6.1: the client picks "a compatible
+    /// ECHConfig" — one whose version it implements, whose KEM it
+    /// implements, and whose `cipher_suites` list holds at least one
+    /// (KDF, AEAD) pair it implements — and seals under the first such
+    /// pair. [`is_supported`](Self::is_supported) only answers the
+    /// version half; a config with an unknown KEM or only exotic
+    /// suites parses fine but can never be sealed against, and a
+    /// client that picks it anyway has no ECH to offer. `public_name`
+    /// must also be UTF-8, since it becomes the outer hello's SNI.
+    pub fn usable_cipher_suite(&self) -> Option<HpkeSymCipherSuite> {
+        if !self.is_supported() {
+            return None;
+        }
+        let contents = self.contents.as_ref()?;
+        if super::hpke_setup::map_kem(contents.key_config.kem_id).is_err()
+            || core::str::from_utf8(&contents.public_name).is_err()
+        {
+            return None;
+        }
+        contents
+            .key_config
+            .cipher_suites
+            .iter()
+            .copied()
+            .find(|sc| super::hpke_setup::map_sym_suite(*sc).is_ok())
+    }
+
     /// Encode this entry (version || u16 length || contents).
     fn encode_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.version.to_be_bytes());
@@ -247,8 +277,8 @@ impl EchConfig {
 }
 
 /// A list of `ECHConfig` entries wrapped with a leading `u16` byte
-/// length. The first supported entry is what a client SHOULD seal
-/// against (draft §6.1).
+/// length. The first *usable* entry ([`first_usable`](Self::first_usable))
+/// is what a sealing client uses (draft §6.1).
 #[derive(Clone, Debug)]
 pub struct EchConfigList {
     /// The ordered list of configs as they appear on the wire.
@@ -261,10 +291,25 @@ impl EchConfigList {
         Self { configs }
     }
 
-    /// First supported (i.e. draft-22) config, the one a sealing
-    /// client will use.
+    /// First supported (i.e. draft-22) config. Servers and diagnostics
+    /// read the list through this; a sealing client goes through
+    /// [`first_usable`](Self::first_usable), which also checks the
+    /// entry's HPKE algorithms.
     pub fn first_supported(&self) -> Option<&EchConfig> {
         self.configs.iter().find(|c| c.is_supported())
+    }
+
+    /// First config a client can actually seal against, with the HPKE
+    /// symmetric suite to use (draft §6.1: "a compatible ECHConfig").
+    /// Skips entries [`first_supported`](Self::first_supported) would
+    /// return but whose KEM or cipher suites this crate does not
+    /// implement — see [`EchConfig::usable_cipher_suite`]. `None`
+    /// means the list offers no ECH the client can perform; the
+    /// caller must not fall back to a cleartext SNI on its own.
+    pub fn first_usable(&self) -> Option<(&EchConfig, HpkeSymCipherSuite)> {
+        self.configs
+            .iter()
+            .find_map(|c| c.usable_cipher_suite().map(|sc| (c, sc)))
     }
 
     /// Encode to the wire form: `u16 byte_len || (ECHConfig entries)*`.

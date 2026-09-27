@@ -1222,7 +1222,7 @@ impl ClientConnection {
         } else {
             super::select_offered_suites(&config.cipher_suites, &DEFAULT_SUITES)?
         };
-        Ok(Self::new_with_offer(
+        Self::new_with_offer_inner(
             config,
             server_name,
             rng,
@@ -1233,12 +1233,20 @@ impl ClientConnection {
                 NamedGroup::SECP256R1,
                 NamedGroup::SECP384R1,
             ],
-        ))
+            &[],
+            super::super::quic_hooks::EngineMode::Tls,
+            None,
+        )
     }
 
     /// Like [`new`](Self::new) but with an explicit cipher-suite and
     /// key-exchange-group offer, letting callers (and tests) drive a specific
     /// negotiation outcome.
+    ///
+    /// Test / fuzz driver only: it panics where [`new`](Self::new) errors —
+    /// a real-ECH config the client cannot seal against
+    /// ([`Error::EchConfigUnusable`]). Production paths construct through
+    /// `new` / [`new_for_quic`](Self::new_for_quic), which surface it.
     pub(crate) fn new_with_offer<R: RngCore>(
         config: ClientConfig,
         server_name: &str,
@@ -1256,6 +1264,7 @@ impl ClientConnection {
             super::super::quic_hooks::EngineMode::Tls,
             None,
         )
+        .expect("ClientConnection::new_with_offer: real ECH configured but unusable")
     }
 
     /// Like [`new_with_offer`] but only includes `key_share` entries for the
@@ -1283,6 +1292,7 @@ impl ClientConnection {
             super::super::quic_hooks::EngineMode::Tls,
             None,
         )
+        .expect("ClientConnection::new_with_offer_partial_shares: real ECH configured but unusable")
     }
 
     /// QUIC-mode constructor (RFC 9001). The engine runs the same TLS 1.3
@@ -1301,6 +1311,10 @@ impl ClientConnection {
     ///
     /// Phase 4+ wires this into [`crate::quic::QuicConnection`]; the engine
     /// itself never holds onto network state.
+    ///
+    /// Errors like [`new`](Self::new) does: a real-ECH config the client
+    /// cannot seal against is [`Error::EchConfigUnusable`], raised before
+    /// any Initial-level bytes exist.
     // Used by the QUIC engine path (lands in Phase 4); silent otherwise.
     #[allow(dead_code)]
     pub(crate) fn new_for_quic<R: RngCore>(
@@ -1310,7 +1324,7 @@ impl ClientConnection {
         suites: &[CipherSuite],
         groups: &[NamedGroup],
         hooks: super::super::quic_hooks::BoxedHooks,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         Self::new_with_offer_inner(
             config,
             server_name,
@@ -1330,6 +1344,9 @@ impl ClientConnection {
     /// * the seeded `engine_mode` and `hooks` fields, and
     /// * a `quic_transport_parameters` extension is appended to the
     ///   outgoing ClientHello whenever `engine_mode == Quic`.
+    ///
+    /// Fails closed (nothing is emitted) when the config asks for real ECH
+    /// that cannot be sealed — see [`seal_real_ech_on_ch1`].
     #[allow(clippy::too_many_arguments)] // 8 small args, splitting the seam adds no clarity
     fn new_with_offer_inner<R: RngCore>(
         config: ClientConfig,
@@ -1340,7 +1357,7 @@ impl ClientConnection {
         share_groups: &[NamedGroup],
         engine_mode: super::super::quic_hooks::EngineMode,
         hooks: Option<super::super::quic_hooks::BoxedHooks>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
@@ -1552,11 +1569,13 @@ impl ClientConnection {
             }
         }
         // draft-ietf-tls-esni-22 §6: if the client is configured for
-        // Real ECH (Some(EchClient { mode: Real(list) })) and there's
-        // no PSK in play (real ECH + PSK is a wave-later combo), try
-        // to seal an inner CH under HPKE and emit the outer CH as the
-        // wire ClientHello. Otherwise build the plain (possibly GREASE)
-        // ClientHello via build_client_hello with `ech_override = None`.
+        // Real ECH (Some(EchClient { mode: Real(list) })), seal an inner
+        // CH under HPKE and emit the outer CH as the wire ClientHello —
+        // or fail the construction if that is impossible (an unusable
+        // config list, a seal failure): the real `server_name` never
+        // goes out in the clear from a client configured to hide it.
+        // Otherwise build the plain (possibly GREASE) ClientHello via
+        // build_client_hello with `ech_override = None`.
         #[cfg(feature = "ech")]
         let ech_sealed: Option<EchSealOutput> = seal_real_ech_on_ch1(
             &conn,
@@ -1566,7 +1585,7 @@ impl ClientConnection {
             share_groups,
             server_name,
             rng,
-        );
+        )?;
 
         #[cfg(feature = "ech")]
         let hello = match ech_sealed {
@@ -1683,7 +1702,7 @@ impl ClientConnection {
             conn.cets = Some(cets);
             conn.early_data_suite = Some(suite.suite);
         }
-        conn
+        Ok(conn)
     }
 
     /// Builds a ClientHello. If `share_only` is non-empty, only those groups
@@ -3006,26 +3025,19 @@ impl ClientConnection {
         share_only: &[NamedGroup],
         extras: &[crate::tls::codec::RawExtension],
     ) -> Result<(Vec<u8>, Vec<u8>), Error> {
-        // Look up the same ECHConfig CH1 picked. `first_supported` is
-        // deterministic on the configured list so we land on the same
-        // entry CH1 sealed under (and we cross-check via `config_id`).
-        let ech_client = self.config.ech.as_ref().ok_or(Error::EchDecryptionFailed)?;
-        let list = match &ech_client.mode {
-            crate::tls::ech::EchClientMode::Real(l) => l,
-            _ => return Err(Error::EchDecryptionFailed),
-        };
-        let echcfg = list
-            .first_supported()
-            .ok_or(Error::EchDecryptionFailed)?
-            .clone();
-        let contents = echcfg.contents.as_ref().ok_or(Error::EchDecryptionFailed)?;
-        let public_name_str = String::from(
-            core::str::from_utf8(&contents.public_name).map_err(|_| Error::EchDecodeError)?,
-        );
-
-        // Snapshot the per-CH1 ECH state without holding a borrow of
-        // `self` across `build_client_hello`/`seal_into_skeleton`.
-        let (sym, config_id, maximum_name_length, outer_random) = {
+        if !matches!(
+            self.config.ech.as_ref().map(|c| &c.mode),
+            Some(crate::tls::ech::EchClientMode::Real(_))
+        ) {
+            return Err(Error::EchDecryptionFailed);
+        }
+        // Everything CH2 needs from the ECHConfig CH1 sealed under —
+        // the symmetric suite, `config_id`, `maximum_name_length` and the
+        // outer `public_name` — was pinned into `ech_state` at CH1 time,
+        // so CH2 cannot drift onto a different list entry. Snapshot it
+        // without holding a borrow of `self` across
+        // `build_client_hello`/`seal_into_skeleton`.
+        let (sym, config_id, maximum_name_length, outer_random, public_name_str) = {
             let state = self.ech_state.as_ref().ok_or(Error::EchDecryptionFailed)?;
             (
                 state.sym.ok_or(Error::EchDecryptionFailed)?,
@@ -3034,6 +3046,7 @@ impl ClientConnection {
                     .maximum_name_length
                     .ok_or(Error::EchDecryptionFailed)?,
                 state.outer_random,
+                state.outer_public_name.clone(),
             )
         };
 
@@ -4074,21 +4087,27 @@ pub(crate) struct EchSealOutput {
     pub outer_random: [u8; 32],
 }
 
-/// draft-ietf-tls-esni-22 §6. Returns `Some(EchSealOutput)` if a
-/// sealed pair was successfully produced; returns `None` otherwise
-/// (the caller falls back to the GREASE-path CH built without
-/// `ech_override`).
+/// draft-ietf-tls-esni-22 §6. Returns `Ok(Some(EchSealOutput))` when a
+/// sealed pair was produced, `Ok(None)` when the client is not
+/// configured for real ECH (`config.ech` is `None` or `Grease`, so the
+/// caller builds the plain / GREASE-shaped CH without `ech_override`),
+/// and `Err` when real ECH is configured but cannot be offered:
 ///
-/// `None` covers every "no real-ECH today" condition uniformly so the
-/// caller doesn't fork:
+/// - the `ECHConfigList` has no usable entry — none with a supported
+///   version, an implemented HPKE KEM and symmetric suite, and a UTF-8
+///   `public_name` (`EchConfigList::first_usable`, draft §6.1: the client
+///   selects "a compatible ECHConfig", not merely the first one);
+/// - PSK resumption is offered (the constructor drops a stored session
+///   when real ECH is configured, so this is an internal invariant);
+/// - encoding the inner / outer hello, HPKE `SetupBaseS` or the AEAD
+///   seal failed.
 ///
-/// - `config.ech` is `None` or `Grease`
-/// - the configured `ECHConfigList` has no supported (draft-22) entry
-/// - the first supported entry has no usable HPKE symmetric suite
-/// - `public_name` isn't valid UTF-8 (we need a `String` for the outer SNI)
-/// - PSK resumption is offered (Real ECH + PSK lands in a wave-later)
-/// - HPKE setup_sender or AEAD seal fail (unlikely; treated as falling
-///   back to GREASE rather than aborting the handshake)
+/// Every failure is fatal for the connection: a client configured to
+/// hide `server_name` used to fall back to a cleartext-SNI hello with a
+/// GREASE ECH extension, silently defeating the one property it was
+/// configured for. The caller (the constructor) surfaces the error
+/// before any byte is emitted; whether to reconnect without ECH is the
+/// application's decision, never this engine's.
 ///
 /// On success the caller pins the `EchSealOutput` into
 /// [`ClientConnection::ech_state`] so the SH processing can verify the
@@ -4104,25 +4123,35 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     share_groups: &[NamedGroup],
     server_name: &str,
     rng: &mut R,
-) -> Option<EchSealOutput> {
-    // Real ECH + PSK is a separate wave: defer.
-    if conn.psk_offered.is_some() {
-        return None;
-    }
-    let ech_client = conn.config.ech.as_ref()?;
+) -> Result<Option<EchSealOutput>, Error> {
+    let Some(ech_client) = conn.config.ech.as_ref() else {
+        return Ok(None);
+    };
     let list = match &ech_client.mode {
         crate::tls::ech::EchClientMode::Real(l) => l,
-        crate::tls::ech::EchClientMode::Grease(_) => return None,
+        crate::tls::ech::EchClientMode::Grease(_) => return Ok(None),
     };
-    // Clone the first supported ECHConfig so we don't hold a long
-    // borrow of `conn.config` across the seal closure (which itself
-    // calls back into `conn.build_client_hello`).
-    let echcfg = list.first_supported()?.clone();
-    let contents = echcfg.contents.as_ref()?;
-    let sym = *contents.key_config.cipher_suites.first()?;
+    // Real ECH + PSK is not wired together; the constructor already
+    // dropped any stored session, so a PSK here is a bug — refuse rather
+    // than send the plain hello.
+    if conn.psk_offered.is_some() {
+        return Err(Error::EchConfigUnusable);
+    }
+    // Clone the selected ECHConfig so we don't hold a long borrow of
+    // `conn.config` across the seal closure (which itself calls back
+    // into `conn.build_client_hello`). `first_usable` also picks the
+    // symmetric suite: the first (KDF, AEAD) pair of that entry this
+    // crate implements, not blindly the entry's first pair.
+    let (echcfg, sym) = list
+        .first_usable()
+        .map(|(c, sym)| (c.clone(), sym))
+        .ok_or(Error::EchConfigUnusable)?;
+    let contents = echcfg.contents.as_ref().ok_or(Error::EchConfigUnusable)?;
     let config_id = contents.key_config.config_id;
     let maximum_name_length = contents.maximum_name_length;
-    let public_name_str = String::from(core::str::from_utf8(&contents.public_name).ok()?);
+    let public_name_str = String::from(
+        core::str::from_utf8(&contents.public_name).map_err(|_| Error::EchConfigUnusable)?,
+    );
     let inner_marker = crate::tls::ech::inner::inner_extension_body();
     // draft-ietf-tls-esni-22 §6.1: "It MUST generate a fresh
     // ClientHelloOuter.random using a secure random number generator." The
@@ -4135,18 +4164,16 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     // outer-extensions that gets compressed across the seam, so the
     // inner and outer CHs MUST present the same `key_share` bytes —
     // route `share_groups` into both build calls.
-    let inner_ch = conn
-        .build_client_hello(
-            random,
-            String::from(server_name),
-            effective_suites,
-            groups,
-            share_groups,
-            &[],
-            Some(&inner_marker),
-            None,
-        )
-        .ok()?;
+    let inner_ch = conn.build_client_hello(
+        random,
+        String::from(server_name),
+        effective_suites,
+        groups,
+        share_groups,
+        &[],
+        Some(&inner_marker),
+        None,
+    )?;
     let inner_sni_len = super::common::sni_host_name(server_name).map(str::len);
     let suites_owned = effective_suites.to_vec();
     let groups_owned = groups.to_vec();
@@ -4163,23 +4190,21 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     // extensions are byte-identical to the real outer (same suites/groups —
     // only SNI and the ECH extension itself differ). On any parse hiccup we
     // fall back to sealing the inner CH verbatim (correct, just larger).
-    let reference_outer = conn
-        .build_client_hello(
-            outer_random,
-            public_name_str.clone(),
-            effective_suites,
-            groups,
-            share_groups,
-            &[],
-            Some(&crate::tls::ech::outer::build_outer_ext_body(
-                sym, config_id, &[0u8; 32], 100,
-            )),
-            None,
-        )
-        .ok()?;
+    let reference_outer = conn.build_client_hello(
+        outer_random,
+        public_name_str.clone(),
+        effective_suites,
+        groups,
+        share_groups,
+        &[],
+        Some(&crate::tls::ech::outer::build_outer_ext_body(
+            sym, config_id, &[0u8; 32], 100,
+        )),
+        None,
+    )?;
     let (canonical_inner, inner_to_seal) = match (
-        ClientHello::decode(inner_ch.get(4..)?),
-        ClientHello::decode(reference_outer.get(4..)?),
+        ClientHello::decode(inner_ch.get(4..).ok_or(Error::Decode)?),
+        ClientHello::decode(reference_outer.get(4..).ok_or(Error::Decode)?),
     ) {
         (Ok(inner_struct), Ok(outer_struct)) => {
             let canonical = inner_struct.encode();
@@ -4216,8 +4241,8 @@ fn seal_real_ech_on_ch1<R: RngCore>(
             let outer_body =
                 crate::tls::ech::outer::build_outer_ext_body(sym, config_id, enc, padded_len);
             // An un-encodable skeleton yields empty bytes, which
-            // `seal_into_skeleton` rejects — the caller then falls back to a
-            // plain (non-ECH) CH1 rather than panicking.
+            // `seal_into_skeleton` rejects — the error then fails the
+            // connection closed rather than panicking.
             conn_for_closure
                 .build_client_hello(
                     outer_random,
@@ -4231,18 +4256,17 @@ fn seal_real_ech_on_ch1<R: RngCore>(
                 )
                 .unwrap_or_default()
         },
-    )
-    .ok()?;
+    )?;
     // Extract CH1-inner's `random` from the canonical inner CH. The
     // ClientHello body opens with version(2) + random(32); the
     // handshake header (type=1 + 24-bit length) precedes it, so the
     // random sits at offset 4 + 2 = 6.
     if canonical_inner.len() < 38 {
-        return None;
+        return Err(Error::Decode);
     }
     let mut inner_ch1_random = [0u8; 32];
     inner_ch1_random.copy_from_slice(&canonical_inner[6..38]);
-    Some(EchSealOutput {
+    Ok(Some(EchSealOutput {
         outer_ch: sealed.outer_ch,
         inner_ch_bytes: canonical_inner,
         sender: sealed.sender,
@@ -4252,7 +4276,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
         maximum_name_length,
         public_name: public_name_str,
         outer_random,
-    })
+    }))
 }
 
 /// Maps an internal error to the alert to send the peer.
@@ -5484,6 +5508,203 @@ mod tests {
         let outer_random = client.ech_state.as_ref().unwrap().outer_random;
         assert_eq!(ch2.random, outer_random);
         assert_ne!(ch2.random, client.client_random());
+    }
+
+    /// Builds a real-ECH client config from `list` and a server key ring
+    /// holding `pairs`, for the config-selection tests below.
+    #[cfg(feature = "ech")]
+    fn ech_pair(
+        seed: &[u8],
+        config_id: u8,
+        suites: alloc::vec::Vec<crate::tls::ech::HpkeSymCipherSuite>,
+    ) -> crate::tls::ech::keys::EchKeyPair {
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+        crate::tls::ech::keys::EchKeyPair::generate(
+            &mut keygen_rng,
+            crate::hpke::HpkeKem::DhkemX25519HkdfSha256,
+            config_id,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen")
+    }
+
+    /// The `encrypted_client_hello` extension of the ClientHello in `out`
+    /// (the first record), decoded to its outer form.
+    #[cfg(feature = "ech")]
+    fn outer_ech_ext(out: &[u8]) -> (ClientHello, crate::tls::ech::extension::EchExtension) {
+        let msg = read_record(out).unwrap().unwrap().fragment.to_vec();
+        let ch = ClientHello::decode(&msg[4..]).unwrap();
+        let body = ext::find(&ch.extensions, ExtensionType::ENCRYPTED_CLIENT_HELLO)
+            .expect("encrypted_client_hello")
+            .to_vec();
+        let parsed = crate::tls::ech::extension::EchExtension::decode(&body).unwrap();
+        (ch, parsed)
+    }
+
+    /// draft-ietf-tls-esni-22 §6.1: the client seals under "a compatible
+    /// ECHConfig". A list whose first draft-22 entry names a KEM this
+    /// crate does not implement (0x0021), and whose second entry leads
+    /// with an unknown (KDF, AEAD) pair before a supported one, used to
+    /// make the client give up on ECH altogether and send the real
+    /// `server_name` in cleartext under a GREASE extension. It must skip
+    /// to the usable entry and pick the usable suite within it.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_client_selects_first_usable_config_and_suite() {
+        use crate::hpke::{HpkeAead, HpkeKdf};
+        use crate::tls::ech::extension::EchExtension;
+        use crate::tls::ech::keys::EchKeyRing;
+        use crate::tls::ech::outer::try_decap_inner;
+        use crate::tls::ech::{EchConfig, EchConfigContents, HpkeKeyConfig, HpkeSymCipherSuite};
+
+        let good = HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        };
+        let exotic = HpkeSymCipherSuite {
+            kdf_id: 0x7f01,
+            aead_id: 0x7f02,
+        };
+        // Entry 0: draft-22 version, unknown KEM 0x0021 — parses, cannot be
+        // sealed against.
+        let unknown_kem = EchConfig::new(EchConfigContents {
+            key_config: HpkeKeyConfig {
+                config_id: 0x10,
+                kem_id: 0x0021,
+                public_key: alloc::vec![0xAA; 32],
+                cipher_suites: alloc::vec![good],
+            },
+            maximum_name_length: 64,
+            public_name: b"public.example".to_vec(),
+            extensions: alloc::vec![],
+        });
+        // Entry 1: usable KEM, exotic suite listed first, usable one second.
+        let pair = ech_pair(b"ech-select-keygen", 0x11, alloc::vec![exotic, good]);
+        let list =
+            crate::tls::ech::EchConfigList::new(alloc::vec![unknown_kem, pair.config().clone()]);
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+        let mut cfg = ClientConfig::new(RootCertStore::new());
+        cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
+        let mut rng = HmacDrbg::<Sha256>::new(b"ech-select-client", b"nonce", &[]);
+        let mut client = ClientConnection::new(cfg, "secret.example", &mut rng).unwrap();
+        let out = client.write_tls();
+
+        let (outer_ch, parsed) = outer_ech_ext(&out);
+        let EchExtension::Outer {
+            cipher_suite,
+            config_id,
+            ..
+        } = parsed
+        else {
+            panic!("outer hello must carry an outer-form ECH extension");
+        };
+        assert_eq!(config_id, 0x11, "must skip the unknown-KEM entry");
+        assert_eq!(cipher_suite, good, "must skip the exotic suite");
+        let sni = crate::tls::codec::extension::parse_server_name(
+            ext::find(&outer_ch.extensions, ExtensionType::SERVER_NAME).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sni, "public.example");
+        assert!(!out.windows(14).any(|w| w == b"secret.example"));
+        // And it is real ECH, not GREASE: the server key decrypts it.
+        let inner = try_decap_inner(read_record(&out).unwrap().unwrap().fragment, &ring)
+            .expect("server-side decap")
+            .inner_ch_bytes;
+        let inner_ch = ClientHello::decode(&inner[4..]).unwrap();
+        let inner_sni = crate::tls::codec::extension::parse_server_name(
+            ext::find(&inner_ch.extensions, ExtensionType::SERVER_NAME).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(inner_sni, "secret.example");
+    }
+
+    /// A real-ECH client whose `ECHConfigList` has no entry it can seal
+    /// against must fail closed at construction — never emit a hello with
+    /// the real `server_name` in the clear (that is what it used to do,
+    /// with a GREASE extension and no signal to the caller).
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_client_refuses_cleartext_fallback_when_no_config_is_usable() {
+        use crate::hpke::{HpkeAead, HpkeKdf};
+        use crate::tls::ech::{EchConfig, EchConfigContents, HpkeKeyConfig, HpkeSymCipherSuite};
+
+        let good = HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        };
+        let entry = |config_id: u8, kem_id: u16, suites: alloc::vec::Vec<HpkeSymCipherSuite>| {
+            EchConfig::new(EchConfigContents {
+                key_config: HpkeKeyConfig {
+                    config_id,
+                    kem_id,
+                    public_key: alloc::vec![0xAA; 32],
+                    cipher_suites: suites,
+                },
+                maximum_name_length: 64,
+                public_name: b"public.example".to_vec(),
+                extensions: alloc::vec![],
+            })
+        };
+        let unknown_version = EchConfig {
+            version: 0xfe0c,
+            contents: None,
+            raw_contents: alloc::vec![0u8; 8],
+        };
+        let lists = [
+            // Unknown KEM only.
+            alloc::vec![entry(0x20, 0x0021, alloc::vec![good])],
+            // Known KEM, no implemented symmetric suite.
+            alloc::vec![entry(
+                0x21,
+                0x0020,
+                alloc::vec![HpkeSymCipherSuite {
+                    kdf_id: 0x7f01,
+                    aead_id: 0x7f02,
+                }]
+            )],
+            // Unknown version only.
+            alloc::vec![unknown_version],
+            // Empty list.
+            alloc::vec![],
+        ];
+        for (i, configs) in lists.into_iter().enumerate() {
+            let list = crate::tls::ech::EchConfigList::new(configs);
+            let mut cfg = ClientConfig::new(RootCertStore::new());
+            cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
+            let mut rng = HmacDrbg::<Sha256>::new(b"ech-unusable-client", b"nonce", &[]);
+            match ClientConnection::new(cfg, "secret.example", &mut rng) {
+                Err(Error::EchConfigUnusable) => {}
+                Ok(_) => panic!("list {i}: constructed a client without usable ECH"),
+                Err(e) => panic!("list {i}: unexpected error {e:?}"),
+            }
+        }
+
+        // A well-formed but garbage public key passes the selection filter
+        // and fails at HPKE setup; that must also fail closed.
+        let list =
+            crate::tls::ech::EchConfigList::new(alloc::vec![EchConfig::new(EchConfigContents {
+                key_config: HpkeKeyConfig {
+                    config_id: 0x22,
+                    kem_id: 0x0010,
+                    public_key: alloc::vec![0x00; 3],
+                    cipher_suites: alloc::vec![good],
+                },
+                maximum_name_length: 64,
+                public_name: b"public.example".to_vec(),
+                extensions: alloc::vec![],
+            })]);
+        let mut cfg = ClientConfig::new(RootCertStore::new());
+        cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
+        let mut rng = HmacDrbg::<Sha256>::new(b"ech-badkey-client", b"nonce", &[]);
+        assert!(
+            ClientConnection::new(cfg, "secret.example", &mut rng).is_err(),
+            "a config whose key HPKE rejects must not yield a cleartext hello"
+        );
     }
 
     /// A HelloRetryRequest cookie is echoed verbatim in CH2, so an

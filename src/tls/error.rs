@@ -239,6 +239,17 @@ pub enum Error {
     /// to refresh. Maps to `illegal_parameter`.
     #[cfg(feature = "ech")]
     EchInnerMalformed,
+    /// The client is configured for real ECH but cannot offer it: no entry
+    /// of its `ECHConfigList` has a supported version, an HPKE KEM and a
+    /// symmetric cipher suite this crate implements, and a well-formed
+    /// `public_name` (draft-ietf-tls-esni-22 §6.1, "a compatible
+    /// ECHConfig") — or sealing the inner ClientHello under the chosen entry
+    /// failed. Raised at construction, before any byte reaches the wire: a
+    /// client asked to hide `server_name` must not quietly send it in the
+    /// clear because the published configs were unusable. The caller decides
+    /// whether to reconnect without ECH.
+    #[cfg(feature = "ech")]
+    EchConfigUnusable,
     /// A `CompressedCertificate` handshake message (RFC 8879 §4) could not
     /// be expanded: the declared `algorithm` is one the receiver does not
     /// support, the compressed body is malformed, decompression aborted
@@ -324,6 +335,10 @@ impl core::fmt::Display for Error {
             Error::EchDecryptionFailed => f.write_str("ECH HPKE seal/open failed"),
             #[cfg(feature = "ech")]
             Error::EchInnerMalformed => f.write_str("ECH inner ClientHello malformed"),
+            #[cfg(feature = "ech")]
+            Error::EchConfigUnusable => {
+                f.write_str("ECH configured but no usable ECHConfig (refusing cleartext SNI)")
+            }
             #[cfg(feature = "cert-compression")]
             Error::CertDecompressionFailed => {
                 f.write_str("RFC 8879 CompressedCertificate could not be decompressed")

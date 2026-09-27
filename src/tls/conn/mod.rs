@@ -297,7 +297,8 @@ mod quic_mode_tests {
             &[suite],
             &[group],
             client_box,
-        );
+        )
+        .unwrap();
         let mut server = ServerConnection::new_for_quic(server_config, srng, server_box);
 
         // Accumulate the full emit history for assertions, since the
@@ -488,7 +489,8 @@ mod quic_mode_tests {
             &[CipherSuite::AES_128_GCM_SHA256],
             &[NamedGroup::X25519],
             client_box,
-        );
+        )
+        .unwrap();
         let mut q_server = ServerConnection::new_for_quic(server_config_q, srng_q, server_box);
 
         for _ in 0..8 {

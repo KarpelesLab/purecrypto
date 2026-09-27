@@ -117,7 +117,7 @@ pub(crate) fn build_tls_engine(
         &suites,
         &QUIC_CLIENT_GROUPS,
         hooks as Box<_>,
-    );
+    )?;
     Ok((engine, handle))
 }
 
