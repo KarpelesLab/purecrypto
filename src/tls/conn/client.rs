@@ -315,7 +315,10 @@ pub(crate) struct ClientConfig {
     pub verify_certificates: bool,
     /// The time used for validity-period checks. Defaults (`None`) to the
     /// system clock under the `std` feature; set it explicitly for `no_std`
-    /// targets or for reproducible verification.
+    /// targets or for reproducible verification. A `no_std` build has no
+    /// clock: with [`Self::verify_certificates`] on and this left `None`,
+    /// server certificate verification fails with `BadCertificate` rather
+    /// than skipping the validity checks.
     pub verification_time: Option<Time>,
     /// ALPN protocols to offer (RFC 7301), in preference order. Empty
     /// suppresses the extension. Example: `[b"h2".to_vec(), b"http/1.1".to_vec()]`.
@@ -3678,6 +3681,14 @@ impl ClientConnection {
         // signature policy applies to every chain signature.
         let leaf_key = if self.config.verify_certificates {
             let now = self.config.verification_time.clone().or_else(system_now);
+            // no_std has no clock (`system_now` is `None`): without a
+            // configured `verification_time`, chain validation would run with
+            // no reference time and silently skip every notBefore / notAfter
+            // (and OCSP freshness) check. Fail closed instead.
+            #[cfg(not(feature = "std"))]
+            if now.is_none() {
+                return Err(Error::BadCertificate);
+            }
             let crls = self.config.crls.merged_with(&self.stapled_crls);
             let key = verify_chain_with_crls(
                 &self.config.roots,
@@ -4795,6 +4806,64 @@ mod tests {
                 "suite {suite:#06x}: early_data without a 0-RTT offer"
             );
         }
+    }
+
+    /// Without `std` there is no clock, and a client with no configured
+    /// `verification_time` used to validate the server chain with no
+    /// reference time at all — every notBefore / notAfter check skipped.
+    /// Under no_std that must now be `bad_certificate`; with a configured
+    /// time (or a std clock) the chain passes and the handshake fails only
+    /// later, on the mismatched CertificateVerify scheme.
+    #[test]
+    fn chain_verification_without_a_clock_fails_closed() {
+        let key = crate::test_util::rsa_test_key_a();
+        let validity = crate::x509::Validity::new(
+            crate::x509::Time::utc(2024, 1, 1, 0, 0, 0),
+            crate::x509::Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let der = crate::x509::Certificate::self_signed(
+            &key,
+            &crate::x509::DistinguishedName::common_name("loopback.example"),
+            &validity,
+            1,
+            false,
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        let roots = || {
+            let mut r = RootCertStore::new();
+            r.add_der(der.clone()).unwrap();
+            r
+        };
+        let verify = |time: Option<crate::x509::Time>| {
+            let mut config = ClientConfig::new(roots());
+            config.verification_time = time;
+            let mut rng = HmacDrbg::<Sha256>::new(b"no-clock-13", b"nonce", &[]);
+            let mut client = ClientConnection::new(config, "loopback.example", &mut rng).unwrap();
+            client.core.transcript.set_alg(HashAlg::Sha256);
+            client.cert_chain = alloc::vec![der.clone()];
+            client.state = State::WaitCertificateVerify;
+            // CertificateVerify { ecdsa_secp256r1_sha256, 256 zero bytes }:
+            // a scheme that cannot match the RSA leaf, so a chain that
+            // passes surfaces as `PeerMisbehaved` (a merely wrong RSA
+            // signature would itself be `BadCertificate`).
+            let mut body = 0x0403u16.to_be_bytes().to_vec();
+            body.extend_from_slice(&256u16.to_be_bytes());
+            body.extend_from_slice(&[0u8; 256]);
+            let mut raw = alloc::vec![hs_type::CERTIFICATE_VERIFY, 0];
+            raw.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            raw.extend_from_slice(&body);
+            client.on_certificate_verify(hs_type::CERTIFICATE_VERIFY, &body, &raw)
+        };
+        let with_time = verify(Some(crate::x509::Time::utc(2025, 6, 1, 0, 0, 0)));
+        assert!(matches!(with_time, Err(Error::PeerMisbehaved)));
+
+        let no_time = verify(None);
+        #[cfg(not(feature = "std"))]
+        assert!(matches!(no_time, Err(Error::BadCertificate)));
+        #[cfg(feature = "std")]
+        assert!(matches!(no_time, Err(Error::PeerMisbehaved)));
     }
 
     /// The manual EncryptedExtensions walk caps the extension count at

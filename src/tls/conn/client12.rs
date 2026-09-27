@@ -108,7 +108,10 @@ pub(crate) struct ClientConfig12 {
     pub verify_certificates: bool,
     /// The time used for validity-period checks. Defaults (`None`) to the
     /// system clock under the `std` feature; set it explicitly for `no_std`
-    /// targets or for reproducible verification.
+    /// targets or for reproducible verification. A `no_std` build has no
+    /// clock: with [`Self::verify_certificates`] on and this left `None`,
+    /// server certificate verification fails with `BadCertificate` rather
+    /// than skipping the validity checks.
     pub verification_time: Option<Time>,
     /// ALPN protocols to offer (RFC 7301), in preference order. Empty
     /// suppresses the extension.
@@ -2169,6 +2172,14 @@ impl ClientConnection12 {
 
             let key = if self.config.verify_certificates {
                 let now = self.config.verification_time.clone().or_else(system_now);
+                // no_std has no clock (`system_now` is `None`): without a
+                // configured `verification_time`, chain validation would run
+                // with no reference time and silently skip every notBefore /
+                // notAfter check. Fail closed instead.
+                #[cfg(not(feature = "std"))]
+                if now.is_none() {
+                    return Err(Error::BadCertificate);
+                }
                 let key = verify_chain_with_crls(
                     &self.config.roots,
                     &self.config.crls,
@@ -2587,6 +2598,12 @@ impl ClientConnection12 {
             let leaf = crate::x509::Certificate::from_der(leaf_der.clone())
                 .map_err(|_| Error::BadCertificate)?;
             let now = self.config.verification_time.clone().or_else(system_now);
+            // Same no_std guard as the chain check: a staple checked with no
+            // reference time has no thisUpdate / nextUpdate window at all.
+            #[cfg(not(feature = "std"))]
+            if now.is_none() {
+                return Err(Error::BadCertificate);
+            }
             crate::tls::pki::check_stapled_ocsp(
                 &self.config.roots,
                 &self.cert_chain,
@@ -3777,6 +3794,60 @@ mod tests {
         let s = c.take_session().expect("session after completion");
         assert_eq!(s.ticket, alloc::vec![0xEE; 16]);
         assert_eq!(s.lifetime_seconds, 3600);
+    }
+
+    /// no_std counterpart of the TLS 1.3 check: with no clock and no
+    /// configured `verification_time`, the server chain used to be validated
+    /// with no reference time (validity never checked). It must be refused
+    /// as `bad_certificate`; a configured time (or a std clock) admits it.
+    #[test]
+    fn client12_chain_verification_without_a_clock_fails_closed() {
+        let key = crate::test_util::rsa_test_key_a();
+        let validity = crate::x509::Validity::new(
+            crate::x509::Time::utc(2024, 1, 1, 0, 0, 0),
+            crate::x509::Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let der = crate::x509::Certificate::self_signed(
+            &key,
+            &crate::x509::DistinguishedName::common_name("loopback.example"),
+            &validity,
+            1,
+            false,
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        let roots = || {
+            let mut r = RootCertStore::new();
+            r.add_der(der.clone()).unwrap();
+            r
+        };
+        let verify = |time: Option<crate::x509::Time>| {
+            let mut config = ClientConfig12::new(roots());
+            config.verification_time = time;
+            let mut rng = HmacDrbg::<Sha256>::new(b"no-clock-12", b"nonce", &[]);
+            let mut c = ClientConnection12::new(config, "loopback.example", &mut rng).unwrap();
+            let _ = c.write_tls();
+            c.state = State::WaitCertificate;
+            c.suite = lookup_suite_12(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+            c.transcript.set_alg(c.suite.expect("suite set").hash);
+            let entry_len = der.len() as u32;
+            let list_len = entry_len + 3;
+            let mut body = list_len.to_be_bytes()[1..].to_vec();
+            body.extend_from_slice(&entry_len.to_be_bytes()[1..]);
+            body.extend_from_slice(&der);
+            let mut raw = alloc::vec![hs_type::CERTIFICATE];
+            raw.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+            raw.extend_from_slice(&body);
+            c.on_certificate(hs_type::CERTIFICATE, &body, &raw)
+        };
+        verify(Some(crate::x509::Time::utc(2025, 6, 1, 0, 0, 0))).unwrap();
+
+        let no_time = verify(None);
+        #[cfg(not(feature = "std"))]
+        assert!(matches!(no_time, Err(Error::BadCertificate)));
+        #[cfg(feature = "std")]
+        no_time.unwrap();
     }
 
     // ---- opt-in legacy (TLS 1.0/1.1) ServerHello hardening ---------------
