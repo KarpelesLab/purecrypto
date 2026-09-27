@@ -40,7 +40,9 @@
  *    to query the size first.
  *  - Opaque handles are created and freed by the library; pair every
  *    new/generate/from_* with the matching *_free.
- *  - Every entry point catches panics (returned as PC_INTERNAL).
+ *  - Every entry point catches panics (returned as PC_INTERNAL). That barrier
+ *    is the Rust unwinder: a build with panic=abort (or any host that opts out
+ *    of unwinding) turns a would-be PC_INTERNAL into a process abort instead.
  *
  * Threading:
  *   The opaque handles minted by this library (PcHash, PcRsaKey, PcEcKey,
@@ -103,7 +105,10 @@ typedef enum {
  *   - The one exception is the out-parameter that is itself NULL: the call
  *     returns PC_NULL_POINTER and, having nowhere to write, writes nothing.
  *
- * Output *buffers* (`uint8_t *out`) are only written on PC_OK.
+ * Output *buffers* (`uint8_t *out`) are only written on PC_OK, with one
+ * exception: when the scrypt / Argon2 core itself rejects a parameter,
+ * pc_scrypt and pc_argon2 may already have filled part of `out`, and zero
+ * the whole buffer before returning PC_UNSUPPORTED (see PC_KDF_MAX_MEM_KIB).
  *
  * Output buffers must not overlap input buffers. The entry points that take
  * inputs and a plain-length output at once (pc_hkdf, pc_pbkdf2, pc_scrypt,
@@ -359,7 +364,11 @@ pc_status pc_pbkdf2(int32_t hash,
  * rather than unwinding, which no status code could report — and the normal way
  * to VERIFY a password hash is to re-derive using the cost parameters stored in
  * the hash string, which an attacker who controls that record controls too.
- * scrypt's working set is 128 * r * n bytes; Argon2's is m_cost kibibytes. */
+ * scrypt's working set is 128 * r * n bytes; Argon2's is m_cost kibibytes.
+ * Pointer, overlap and cost-cap rejections happen before dispatch and write
+ * nothing; but a parameter the KDF core itself rejects may be reported after
+ * partial output was written, so on that path both zero the whole of out
+ * (the one exception to the "written only on PC_OK" rule above). */
 #define PC_KDF_MAX_MEM_KIB (4u * 1024u * 1024u)
 pc_status pc_scrypt(const uint8_t *pw, size_t pw_len,
                     const uint8_t *salt, size_t salt_len,

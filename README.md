@@ -418,7 +418,8 @@ a `PcStatus` (`PC_OK` or a negative code, for example `PC_CLOSED` once the
 peer's `close_notify` has been processed, or `PC_KEY_MISMATCH` when a
 certificate is configured with the wrong key). Variable-length output uses
 an in/out length buffer; stateful objects are opaque handles freed by the
-library; panics never cross the boundary.
+library; panics never cross the boundary (they are caught by the unwinder and
+reported as `PC_INTERNAL`, so a `panic=abort` build aborts the process instead).
 
 The TLS surface mirrors OpenSSL's memory BIO: the caller pumps wire bytes
 through `pc_tls_feed` / `pc_tls_pop` and application bytes through
