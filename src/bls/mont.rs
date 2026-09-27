@@ -32,9 +32,15 @@ pub(crate) const fn sbb(a: u64, b: u64, borrow: u64) -> (u64, u64) {
 }
 
 /// All-ones when `bit == 1`, all-zeros when `bit == 0`.
+///
+/// The barrier is load-bearing: without it LLVM knows the mask is 0 or
+/// all-ones and lowers the masked limb selects in [`reduce_once`] and
+/// [`neg`] to a branch on the (secret) carry/borrow — every field add, sub
+/// and Montgomery reduction then branched on secret data (caught by
+/// tests/ct_valgrind.rs).
 #[inline(always)]
-const fn mask_from_bit(bit: u64) -> u64 {
-    0u64.wrapping_sub(bit & 1)
+fn mask_from_bit(bit: u64) -> u64 {
+    core::hint::black_box(0u64.wrapping_sub(bit & 1))
 }
 
 /// Reduces `hi·2^(64N) + r` (with `hi ∈ {0, 1}` and the whole value `< 2m`)
