@@ -70,6 +70,7 @@ use crate::tls::ContentType;
 use crate::tls::Error;
 use crate::tls::codec::CipherSuite;
 use crate::tls::version::ProtocolVersion;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -175,6 +176,33 @@ pub(crate) struct CbcKeyMaterial {
     pub(crate) server_iv: Vec<u8>,
 }
 
+/// Every field is `key_block` output — MAC keys, cipher keys and (TLS 1.0)
+/// the secret initial IVs. The crypters copy what they need, so these
+/// slices die at the end of `build_legacy_crypters`; wipe them rather than
+/// leave them in freed heap.
+impl Zeroize for CbcKeyMaterial {
+    fn zeroize(&mut self) {
+        for v in [
+            &mut self.client_mac,
+            &mut self.server_mac,
+            &mut self.client_key,
+            &mut self.server_key,
+            &mut self.client_iv,
+            &mut self.server_iv,
+        ] {
+            v.zeroize();
+        }
+    }
+}
+
+impl Drop for CbcKeyMaterial {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for CbcKeyMaterial {}
+
 /// `key_block` length for a CBC suite (RFC 5246 §6.3):
 /// `2·mac_key + 2·enc_key + 2·fixed_iv`, where `fixed_iv = block_size` for
 /// TLS 1.0 and `0` for TLS 1.1+ (explicit per-record IV).
@@ -238,7 +266,8 @@ pub(crate) fn build_legacy_crypters(
     // SSL 3.0: chained IV, SSLv3 key derivation + record MAC.
     if version == ProtocolVersion::SSLv3 {
         let kb_len = cbc_key_block_len(ls.cipher, ls.mac, false);
-        let mut kb = vec![0u8; kb_len];
+        // The whole key block is secret: wiped on drop.
+        let mut kb = Zeroizing::new(vec![0u8; kb_len]);
         super::ssl3::ssl3_key_block(master, server_random, client_random, &mut kb);
         let km = split_cbc_key_block(&kb, ls.cipher, ls.mac, false);
         let client = CbcRecordCrypter::new_ssl3(
@@ -259,7 +288,9 @@ pub(crate) fn build_legacy_crypters(
     }
     let explicit_iv = version.as_u16() >= ProtocolVersion::TLSv1_1.as_u16();
     let kb_len = cbc_key_block_len(ls.cipher, ls.mac, explicit_iv);
-    let mut kb = vec![0u8; kb_len + 64];
+    // The whole key block is secret — keys, MAC keys, IVs and the explicit-IV
+    // DRBG seeds past them: wiped on drop.
+    let mut kb = Zeroizing::new(vec![0u8; kb_len + 64]);
     crate::tls::crypto::prf::key_block_legacy(master, server_random, client_random, &mut kb);
     let km = split_cbc_key_block(&kb[..kb_len], ls.cipher, ls.mac, explicit_iv);
     let client_iv_seed = &kb[kb_len..kb_len + 32];
@@ -486,6 +517,25 @@ pub(crate) struct CbcRecordCrypter {
     ssl3: bool,
     seq: u64,
 }
+
+/// The cipher key schedule and the explicit-IV DRBG wipe themselves on drop;
+/// the MAC key and the IV chain (which starts as the secret TLS 1.0 / SSL 3.0
+/// `key_block` IV) are plain `Vec`s that live as long as the connection, so
+/// they are wiped here. A wiped crypter is unusable (empty MAC key).
+impl Zeroize for CbcRecordCrypter {
+    fn zeroize(&mut self) {
+        self.mac_key.zeroize();
+        self.chain.zeroize();
+    }
+}
+
+impl Drop for CbcRecordCrypter {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for CbcRecordCrypter {}
 
 impl CbcRecordCrypter {
     /// Builds a record crypter for one direction. `enc_key`/`mac_key` come from
@@ -714,7 +764,8 @@ impl CbcRecordCrypter {
             out.extend_from_slice(&buf);
             out
         } else {
-            let iv = core::mem::take(&mut self.chain);
+            // The first record's IV is the secret `key_block` IV: wiped.
+            let iv = Zeroizing::new(core::mem::take(&mut self.chain));
             self.cipher.cbc_encrypt(&iv, &mut buf);
             self.chain = buf[buf.len() - self.block_size..].to_vec();
             buf
@@ -737,13 +788,15 @@ impl CbcRecordCrypter {
         let mac_len = self.mac.mac_len();
 
         // Split off the explicit IV (TLS 1.1) or use the running chain (TLS 1.0).
-        let (iv, ciphertext): (Vec<u8>, &[u8]) = if self.explicit_iv {
+        // (The first TLS 1.0 record's IV is the secret `key_block` IV, so
+        // the copy is wiped on drop.)
+        let (iv, ciphertext): (Zeroizing<Vec<u8>>, &[u8]) = if self.explicit_iv {
             if fragment.len() < bs {
                 return Err(Error::BadRecordMac);
             }
-            (fragment[..bs].to_vec(), &fragment[bs..])
+            (Zeroizing::new(fragment[..bs].to_vec()), &fragment[bs..])
         } else {
-            (self.chain.clone(), fragment)
+            (Zeroizing::new(self.chain.clone()), fragment)
         };
 
         // The ciphertext must be a non-empty whole number of blocks, with room
@@ -763,6 +816,7 @@ impl CbcRecordCrypter {
         let mut buf = ciphertext.to_vec();
         self.cipher.cbc_decrypt(&iv, &mut buf);
         if !self.explicit_iv {
+            self.chain.zeroize();
             self.chain = next_chain;
         }
 
@@ -1101,6 +1155,45 @@ mod tests {
             make().decrypt(ContentType::ApplicationData, ProtocolVersion::SSLv3, &rec),
             Err(Error::BadRecordMac)
         ));
+    }
+
+    /// Finding: legacy CBC key material was never wiped — the `key_block`
+    /// and its sliced `CbcKeyMaterial` were freed as-is, and each
+    /// crypter's MAC key (plus the TLS 1.0 chained IV, which starts as
+    /// secret `key_block` output) lived unwiped for the connection. Both
+    /// types now wipe on drop through the crate's `Zeroize`.
+    #[test]
+    fn cbc_key_material_and_crypters_wipe() {
+        fn wipes_on_drop<T: ZeroizeOnDrop>() {}
+        wipes_on_drop::<CbcKeyMaterial>();
+        wipes_on_drop::<CbcRecordCrypter>();
+        assert!(core::mem::needs_drop::<CbcKeyMaterial>());
+
+        let kb: Vec<u8> = (1..=136u8).collect();
+        let mut km = split_cbc_key_block(&kb, CbcCipherAlg::Aes256, CbcMacAlg::Sha1, false);
+        assert!(!km.client_mac.is_empty() && !km.server_iv.is_empty());
+        km.zeroize();
+        for v in [
+            &km.client_mac,
+            &km.server_mac,
+            &km.client_key,
+            &km.server_key,
+            &km.client_iv,
+            &km.server_iv,
+        ] {
+            assert!(v.is_empty());
+        }
+
+        // TLS 1.0 (chained IV) and TLS 1.1 (explicit IV) crypters alike.
+        let ls = lookup_legacy_cbc(CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA).unwrap();
+        for version in [ProtocolVersion::TLSv1_0, ProtocolVersion::TLSv1_1] {
+            let LegacyCrypters { mut client, .. } =
+                build_legacy_crypters(ls, version, &[7u8; 48], &[1u8; 32], &[2u8; 32]);
+            assert_eq!(client.mac_key.len(), 20);
+            assert!(client.mac_key.iter().any(|&b| b != 0));
+            client.zeroize();
+            assert!(client.mac_key.is_empty() && client.chain.is_empty());
+        }
     }
 
     #[test]
