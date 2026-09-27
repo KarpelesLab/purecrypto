@@ -1585,7 +1585,18 @@ pub(crate) fn looks_like_ip_literal(s: &str) -> bool {
 }
 
 /// Parses an IPv4 dotted-quad string into 4 bytes. Returns `None` for
-/// anything that is not exactly four decimal labels in `0..=255`.
+/// anything that is not exactly four canonical decimal labels in `0..=255`:
+/// each label is 1–3 ASCII digits, with no sign and no leading zero (`"0"`
+/// itself excepted).
+///
+/// The strictness is the point. `str::parse::<u32>` (used here before)
+/// accepts `"+10"` and `"010"`, so `"010.0.0.1"` parsed as 10.0.0.1 — while
+/// libc's `inet_aton` reads a leading-zero label as *octal* (`010` = 8) and
+/// connects to 8.0.0.1. A reference identifier that means one address to
+/// the resolver must not be matched against an iPAddress SAN as another.
+/// Such ambiguous forms now parse as nothing, so they authenticate nothing:
+/// they are not IP literals, and the dNSName matcher refuses IP-shaped
+/// hosts.
 pub(crate) fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     let mut count = 0usize;
@@ -1593,7 +1604,17 @@ pub(crate) fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
         if count >= 4 {
             return None;
         }
-        let n: u32 = label.parse().ok()?;
+        let digits = label.as_bytes();
+        if digits.is_empty()
+            || digits.len() > 3
+            || !digits.iter().all(u8::is_ascii_digit)
+            || (digits.len() > 1 && digits[0] == b'0')
+        {
+            return None;
+        }
+        let n = digits
+            .iter()
+            .fold(0u32, |acc, d| acc * 10 + u32::from(d - b'0'));
         if n > 255 {
             return None;
         }

@@ -1341,9 +1341,15 @@ pub(crate) fn verify_hostname(cert: &Certificate, host: &str) -> Result<(), Erro
 
 /// Whether `host` is an IPv4 or IPv6 literal — the reference identities
 /// [`verify_hostname`] matches against iPAddress SAN entries rather than
-/// dNSName ones.
+/// dNSName ones — or merely IP-shaped (e.g. `"010.0.0.1"`, which the strict
+/// [`parse_ipv4`](crate::x509::cert::parse_ipv4) refuses because its
+/// leading zero reads as octal to `inet_aton`). Used to keep IP literals out
+/// of SNI (RFC 6066 §3); an IP-shaped string is no DNS hostname either, so
+/// it stays out too, exactly as before the IPv4 parser was tightened. Such
+/// a host authenticates nothing: it matches no iPAddress SAN (it does not
+/// parse) and no dNSName (the matcher refuses IP-shaped hosts).
 pub(crate) fn is_ip_literal(host: &str) -> bool {
-    parse_host_ip(host).is_some()
+    parse_host_ip(host).is_some() || (!host.contains(':') && looks_like_ip(host))
 }
 
 /// Parsed IP-literal host. `None` means the host is not an IP literal
@@ -1974,6 +1980,74 @@ mod tests {
         )
         .unwrap();
         assert!(verify_hostname(&email_cert, "login.bank.example").is_err());
+    }
+
+    /// Regression: `parse_ipv4` used `str::parse::<u32>`, which accepts a
+    /// leading zero and a `+` sign, so the reference identifier
+    /// `"010.0.0.1"` matched an iPAddress SAN of 10.0.0.1 — while
+    /// `inet_aton` reads `010` as octal and resolves it to 8.0.0.1. Such
+    /// non-canonical forms must match no SAN at all, yet still be kept out
+    /// of SNI like any IP literal.
+    #[test]
+    fn non_canonical_ipv4_host_matches_nothing() {
+        use crate::x509::cert::parse_ipv4;
+        use crate::x509::{
+            CertSigner, GeneralName, KeyUsageBits,
+            extension::{basic_constraints, key_usage, subject_alt_name},
+        };
+
+        assert_eq!(parse_ipv4("10.0.0.1"), Some([10, 0, 0, 1]));
+        assert_eq!(parse_ipv4("0.0.0.0"), Some([0, 0, 0, 0]));
+        assert_eq!(parse_ipv4("255.255.255.255"), Some([255; 4]));
+        assert_eq!(parse_ipv4("192.0.2.100"), Some([192, 0, 2, 100]));
+        for bad in [
+            "010.0.0.1",
+            "10.0.0.01",
+            "00.0.0.0",
+            "+10.0.0.1",
+            "10.+0.0.1",
+            "-1.0.0.1",
+            "256.0.0.1",
+            "1000.0.0.1",
+            "0010.0.0.1",
+            "10.0.0",
+            "10.0.0.1.1",
+            "10..0.1",
+            "10.0.0.1.",
+            " 10.0.0.1",
+            "0x0a.0.0.1",
+            "",
+        ] {
+            assert_eq!(parse_ipv4(bad), None, "{bad:?}");
+        }
+
+        let rsa_key = rsa_test_key_a().to_boxed();
+        let signer = CertSigner::Rsa(&rsa_key);
+        let cert = Certificate::self_signed_with_extensions(
+            &signer,
+            &DistinguishedName::common_name("ip.example"),
+            &validity(),
+            1,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                subject_alt_name(&[
+                    GeneralName::IpV4([10, 0, 0, 1]),
+                    GeneralName::IpV4([8, 0, 0, 1]),
+                ]),
+            ],
+        )
+        .unwrap();
+        verify_hostname(&cert, "10.0.0.1").unwrap();
+        verify_hostname(&cert, "8.0.0.1").unwrap();
+        for bad in ["010.0.0.1", "+10.0.0.1", "10.0.0.01", "::ffff:010.0.0.1"] {
+            assert!(verify_hostname(&cert, bad).is_err(), "{bad:?}");
+        }
+        // Still IP-shaped, so still never sent as SNI.
+        assert!(is_ip_literal("10.0.0.1"));
+        assert!(is_ip_literal("010.0.0.1"));
+        assert!(is_ip_literal("::1"));
+        assert!(!is_ip_literal("ip.example"));
     }
 
     /// MEDIUM: an excluded dNSName subtree must not be escapable with a
