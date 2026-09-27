@@ -952,6 +952,13 @@ impl Jwk {
 
     /// The RSA private key (with CRT / blinding when the JWK carries `p`
     /// and `q`).
+    ///
+    /// An RSA JWK that has `d` but none of the CRT parameters (`p`, `q`,
+    /// `dp`, `dq`, `qi`) yields a key that runs the private operation as a
+    /// plain `c^d mod n` **without base blinding** (see
+    /// [`BoxedRsaPrivateKey::from_components`]): the exponentiation is
+    /// still constant-time, but nothing randomizes its input across calls.
+    /// Prefer JWKs in CRT form for decryption and signing keys.
     pub fn rsa_private_key(&self) -> Result<BoxedRsaPrivateKey, Error> {
         match &self.key {
             JwkKey::Rsa {
