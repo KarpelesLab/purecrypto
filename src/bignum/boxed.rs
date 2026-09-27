@@ -106,16 +106,26 @@ impl BoxedUint {
         // in O(limbs) and is unconditional on input size (no secret-dependent
         // branch), matching the rest of this module's panic style for
         // misuse (see `from_be_bytes` width assertion in `Uint`).
+        //
+        // The value may be secret (a private-operation result), so the bytes
+        // past `len` are OR-ed together and only that verdict is tested: a
+        // per-byte `pos < len || byte == 0` was compiled into a branch on
+        // every byte (caught by tests/ct_valgrind.rs). The verdict is public
+        // — it is a panic on misuse.
+        let mut overflow = 0u8;
         for (i, &limb) in self.limbs.iter().enumerate() {
             let le = limb.to_le_bytes();
             for (b, &byte) in le.iter().enumerate() {
                 let pos = i * 8 + b;
-                assert!(
-                    pos < len || byte == 0,
-                    "BoxedUint::to_be_bytes: value does not fit in {len} bytes"
-                );
+                if pos >= len {
+                    overflow |= byte;
+                }
             }
         }
+        assert!(
+            overflow == 0,
+            "BoxedUint::to_be_bytes: value does not fit in {len} bytes"
+        );
         let mut out = vec![0u8; len];
         for (i, &limb) in self.limbs.iter().enumerate() {
             let le = limb.to_le_bytes();
