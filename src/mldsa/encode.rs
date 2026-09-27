@@ -108,18 +108,25 @@ pub(crate) fn pack_eta2(f: &Poly, out: &mut [u8]) {
 }
 
 /// Unpacks an `η = 2` vector, validating each 3-bit group is ≤ 4.
+///
+/// The input is secret (`s1` / `s2`), so every group is decoded and the
+/// range violations are OR-ed into one flag: an early return would reveal
+/// where the first out-of-range group sits. Only the final valid/invalid
+/// verdict — the function's public result — is branched on.
 pub(crate) fn unpack_eta2(b: &[u8]) -> Result<Poly, ()> {
     let mut f = Poly::zero();
+    let mut bad = 0u32;
     for i in (0..N).step_by(8) {
         let o = i / 8 * 3;
         let x = b[o] as u32 | (b[o + 1] as u32) << 8 | (b[o + 2] as u32) << 16;
         let msbs = x & 0o44444444;
-        if ((msbs >> 1) | (msbs >> 2)) & x != 0 {
-            return Err(());
-        }
+        bad |= ((msbs >> 1) | (msbs >> 2)) & x;
         for j in 0..8 {
             f.c[i + j] = sub(2, (x >> (3 * j)) & 0x7);
         }
+    }
+    if bad != 0 {
+        return Err(());
     }
     Ok(f)
 }
@@ -133,9 +140,12 @@ pub(crate) fn pack_eta4(f: &Poly, out: &mut [u8]) {
     }
 }
 
-/// Unpacks an `η = 4` vector, validating each nibble is ≤ 8.
+/// Unpacks an `η = 4` vector, validating each nibble is ≤ 8. Like
+/// [`unpack_eta2`], it decodes every group and branches only on the final
+/// verdict.
 pub(crate) fn unpack_eta4(b: &[u8]) -> Result<Poly, ()> {
     let mut f = Poly::zero();
+    let mut bad = 0u32;
     for i in (0..N).step_by(8) {
         let o = i / 8 * 4;
         let x = b[o] as u32
@@ -143,12 +153,13 @@ pub(crate) fn unpack_eta4(b: &[u8]) -> Result<Poly, ()> {
             | (b[o + 2] as u32) << 16
             | (b[o + 3] as u32) << 24;
         let msbs = x & 0x8888_8888;
-        if ((msbs >> 1) | (msbs >> 2) | (msbs >> 3)) & x != 0 {
-            return Err(());
-        }
+        bad |= ((msbs >> 1) | (msbs >> 2) | (msbs >> 3)) & x;
         for j in 0..8 {
             f.c[i + j] = sub(4, (x >> (4 * j)) & 0xf);
         }
+    }
+    if bad != 0 {
+        return Err(());
     }
     Ok(f)
 }
