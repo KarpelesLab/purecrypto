@@ -67,7 +67,7 @@ const PI: [u8; 256] = [
 /// The 64 row vectors of the linear transform `l` (RFC 6986 §5.3), as the
 /// published big-endian `A` constants in MSB-first order (`A[0]` is the row for
 /// the most-significant bit). The compression function works on little-endian
-/// `u64` lanes, so the fast `SHUFFLED_LIN_TABLE` indexes a reversed copy.
+/// `u64` lanes, so `lin_entry` indexes a reversed copy.
 #[rustfmt::skip]
 const A: [u64; 64] = [
     0x8e20faa72ba0b470, 0x47107ddd9b505a38, 0xad08b0e0c3282d1c, 0xd8045870ef14980e,
@@ -116,25 +116,32 @@ const A_REV: [u64; 64] = {
     r
 };
 
-/// Precomputed `L ∘ P ∘ S` table: `SHUFFLED_LIN_TABLE[j][b]` is the contribution
-/// of byte value `b` occupying lane `j` to the transformed state. Built at
-/// compile time from `PI` (the S-box) and `A_REV` (the linear rows); the byte
-/// permutation `P` is realized by the lane/byte transposition in `lps`.
-const SHUFFLED_LIN_TABLE: [[u64; 256]; 8] = {
+/// The `L ∘ P ∘ S` contribution of byte value `b` occupying lane `lane` to the
+/// transformed state: the XOR of the `A_REV` rows selected by the bits of
+/// `PI[b]`. Branch-free in the bits of `PI[b]`.
+#[inline]
+const fn lin_entry(lane: usize, b: usize) -> u64 {
+    let s = PI[b];
+    let mut acc = 0u64;
+    let mut k = 0;
+    while k < 8 {
+        acc ^= A_REV[8 * lane + k] & 0u64.wrapping_sub(((s >> k) & 1) as u64);
+        k += 1;
+    }
+    acc
+}
+
+/// Precomputed `L ∘ P ∘ S` table (16 KB, feature `streebog-table`):
+/// `SHUFFLED_LIN_TABLE[j][b] = lin_entry(j, b)`, built at compile time. The
+/// byte permutation `P` is realized by the lane/byte transposition in `lps`.
+#[cfg(feature = "streebog-table")]
+static SHUFFLED_LIN_TABLE: [[u64; 256]; 8] = {
     let mut table = [[0u64; 256]; 8];
     let mut i = 0;
     while i < 8 {
         let mut b = 0;
         while b < 256 {
-            let mut acc = 0u64;
-            let mut k = 0;
-            while k < 8 {
-                if PI[b] & (1u8 << k) != 0 {
-                    acc ^= A_REV[8 * i + k];
-                }
-                k += 1;
-            }
-            table[i][b] = acc;
+            table[i][b] = lin_entry(i, b);
             b += 1;
         }
         i += 1;
@@ -214,9 +221,16 @@ fn lps(h: &mut [u64; 8], n: &[u64; 8]) {
     }
     let mut buf = [0u64; 8];
     for (i, slot) in buf.iter_mut().enumerate() {
-        for j in 0..8 {
-            let idx = ((h[j] >> (8 * i)) & 0xff) as usize;
-            *slot ^= SHUFFLED_LIN_TABLE[j][idx];
+        for (j, lane) in h.iter().enumerate() {
+            let idx = ((lane >> (8 * i)) & 0xff) as usize;
+            #[cfg(feature = "streebog-table")]
+            {
+                *slot ^= SHUFFLED_LIN_TABLE[j][idx];
+            }
+            #[cfg(not(feature = "streebog-table"))]
+            {
+                *slot ^= lin_entry(j, idx);
+            }
         }
     }
     *h = buf;

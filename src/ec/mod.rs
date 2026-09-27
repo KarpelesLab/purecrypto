@@ -73,6 +73,7 @@ pub mod ed448;
 pub mod edwards25519;
 mod p256;
 mod p256_field;
+#[cfg(feature = "p256-table")]
 mod p256_gtable;
 #[cfg(feature = "x509")]
 pub(crate) mod registry;

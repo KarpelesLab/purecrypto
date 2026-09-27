@@ -8,7 +8,8 @@
 //! Implemented in the standard table-driven form: a single 256-entry round
 //! table `C0` (the S-box composed with the MDS column), with the other seven
 //! tables obtained by byte rotation. The table is built at compile time from
-//! the S-box, so the module stays `no_std` and allocation-free. Lookups are not
+//! the S-box, so the module stays `no_std` and allocation-free; without the
+//! `whirlpool-table` feature each entry is recomputed from the S-box instead. Lookups are not
 //! constant time: they are indexed by the state, so with an unkeyed digest they
 //! leak only the (public) message bytes.
 //!
@@ -45,31 +46,31 @@ const SBOX: [u8; 256] = [
 ];
 
 /// Multiplies a byte by 2 in GF(2⁸) with reduction polynomial `0x11d`.
+/// Branch-free, as the table-free build evaluates it at run time.
+#[inline]
 const fn xtime(x: u64) -> u64 {
-    let r = (x << 1) & 0xff;
-    if x & 0x80 != 0 { r ^ 0x1d } else { r }
+    ((x << 1) & 0xff) ^ (0x1d & 0u64.wrapping_sub((x >> 7) & 1))
 }
 
-/// Builds the primary round table `C0`: `S(x)` spread across a 64-bit lane by
-/// the MDS row `[1, 1, 4, 1, 8, 5, 2, 9]`.
+/// Entry `x` of the primary round table `C0`: `S(x)` spread across a 64-bit
+/// lane by the MDS row `[1, 1, 4, 1, 8, 5, 2, 9]`.
+#[inline]
+const fn c0_entry(x: usize) -> u64 {
+    let v1 = SBOX[x] as u64;
+    let v2 = xtime(v1);
+    let v4 = xtime(v2);
+    let v5 = v4 ^ v1;
+    let v8 = xtime(v4);
+    let v9 = v8 ^ v1;
+    (v1 << 56) | (v1 << 48) | (v4 << 40) | (v1 << 32) | (v8 << 24) | (v5 << 16) | (v2 << 8) | v9
+}
+
+/// Builds the primary round table `C0`.
 const fn build_c0() -> [u64; 256] {
     let mut c = [0u64; 256];
     let mut x = 0;
     while x < 256 {
-        let v1 = SBOX[x] as u64;
-        let v2 = xtime(v1);
-        let v4 = xtime(v2);
-        let v5 = v4 ^ v1;
-        let v8 = xtime(v4);
-        let v9 = v8 ^ v1;
-        c[x] = (v1 << 56)
-            | (v1 << 48)
-            | (v4 << 40)
-            | (v1 << 32)
-            | (v8 << 24)
-            | (v5 << 16)
-            | (v2 << 8)
-            | v9;
+        c[x] = c0_entry(x);
         x += 1;
     }
     c
@@ -94,8 +95,11 @@ const fn build_rc(c0: &[u64; 256]) -> [u64; 10] {
     rc
 }
 
-const C0: [u64; 256] = build_c0();
-const RC: [u64; 10] = build_rc(&C0);
+/// The round table (2 KB, feature `whirlpool-table`). Without the feature the
+/// entries are recomputed from `SBOX` on every lookup.
+#[cfg(feature = "whirlpool-table")]
+static C0: [u64; 256] = build_c0();
+const RC: [u64; 10] = build_rc(&build_c0());
 
 /// One application of the W round's linear layer (the eight table lookups), used
 /// both for the key schedule and the state transformation.
@@ -109,7 +113,11 @@ fn w_theta(inp: &[u64; 8]) -> [u64; 8] {
         while t < 8 {
             let word = inp[(i + 8 - t) & 7];
             let byte = ((word >> (56 - 8 * t)) & 0xff) as usize;
-            acc ^= C0[byte].rotate_right(8 * t as u32);
+            #[cfg(feature = "whirlpool-table")]
+            let c = C0[byte];
+            #[cfg(not(feature = "whirlpool-table"))]
+            let c = c0_entry(byte);
+            acc ^= c.rotate_right(8 * t as u32);
             t += 1;
         }
         out[i] = acc;

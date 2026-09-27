@@ -6,6 +6,7 @@
 //! share one representation with no conversions.
 
 use super::p256_field as field;
+#[cfg(feature = "p256-table")]
 use super::p256_gtable::P256_GEN_TABLE;
 use crate::bignum::Uint;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
@@ -42,14 +43,25 @@ pub(crate) fn random_scalar<R: RngCore>(rng: &mut R) -> Fe {
 // Curve parameters (hex, big-endian).
 const P_HEX: &str = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
 const B_HEX: &str = "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b";
-// The generator's affine coordinates. Only the tests need `G` itself these
-// days: the library-path fixed-base multiplications go through the
-// precomputed `P256_GEN_TABLE` (whose window 0, entry 0 *is* `G`, verified
-// against these coordinates by `tests::gen_table_matches_computed`).
+// The generator's affine coordinates, test-only: the library takes `G` from
+// `G_AFFINE`, checked against these by `tests::generator_matches_hex`.
 #[cfg(test)]
 const GX_HEX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
 #[cfg(test)]
 const GY_HEX: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+/// The generator `G` as a comb-table entry: affine `x‖y`, little-endian
+/// 64-bit limbs, plain residues — the same value as `P256_GEN_TABLE[0][0]`.
+#[cfg(any(test, not(feature = "p256-table")))]
+const G_AFFINE: [u64; 8] = [
+    0xf4a13945d898c296,
+    0x77037d812deb33a0,
+    0xf8bce6e563a440f2,
+    0x6b17d1f2e12c4247,
+    0xcbb6406837bf51f5,
+    0x2bce33576b315ece,
+    0x8ee7eb4a7c0f9e16,
+    0x4fe342e2fe1a7f9b,
+];
 const N_HEX: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
 
 /// Decodes a 64-character hex string into a [`Fe`].
@@ -120,12 +132,13 @@ impl P256 {
         }
     }
 
-    /// The base point `G`. Test-only: library code multiplies by `G` through
-    /// the precomputed comb ([`Self::mul_generator`]) and never needs the
-    /// point itself.
-    #[cfg(test)]
+    /// The base point `G`. With the comb table, library code multiplies by
+    /// `G` through [`Self::mul_generator`] and never needs the point itself.
+    #[cfg(any(test, not(feature = "p256-table")))]
     pub(crate) fn generator(&self) -> Point {
-        self.lift_affine(&fe_from_hex(GX_HEX), &fe_from_hex(GY_HEX))
+        let x = Fe::from_limbs([G_AFFINE[0], G_AFFINE[1], G_AFFINE[2], G_AFFINE[3]]);
+        let y = Fe::from_limbs([G_AFFINE[4], G_AFFINE[5], G_AFFINE[6], G_AFFINE[7]]);
+        self.lift_affine(&x, &y)
     }
 
     /// Lifts an affine point `(x, y)` to projective form.
@@ -330,6 +343,7 @@ impl P256 {
     /// memory access, same gather discipline as [`Self::scalar_mul`]). A zero
     /// digit adds the identity, a uniform no-op under the complete RCB
     /// formulas, so the schedule depends only on the (public) scalar width.
+    #[cfg(feature = "p256-table")]
     pub(crate) fn mul_generator(&self, scalar: &Fe) -> Point {
         let id = self.identity();
         let mut acc = id;
@@ -352,6 +366,15 @@ impl P256 {
             sel.zeroize();
         }
         acc
+    }
+
+    /// Constant-time fixed-base multiplication `scalar * G` without the comb
+    /// table (feature `p256-table` off): the generic windowed ladder
+    /// [`Self::scalar_mul`] over `G`. Same result and the same secret-scalar
+    /// discipline, at the cost of ~252 doublings the table would avoid.
+    #[cfg(not(feature = "p256-table"))]
+    pub(crate) fn mul_generator(&self, scalar: &Fe) -> Point {
+        self.scalar_mul(scalar, &self.generator())
     }
 
     /// Point negation `(X : -Y : Z)` (the negation itself is constant time;
@@ -377,17 +400,67 @@ impl P256 {
     /// Strategy: `u1·G` through the fixed-base comb with direct (public)
     /// indexing and zero-digit skipping — no doublings at all — plus `u2·Q`
     /// via width-5 wNAF (8 precomputed odd multiples, ~256 doublings and
-    /// ~43 additions on average), joined by one final addition.
+    /// ~43 additions on average), joined by one final addition. Without the
+    /// comb table (feature `p256-table` off), both wNAF ladders are
+    /// interleaved (Straus) so they share one run of doublings.
     pub(crate) fn mul_double_vartime(&self, u1: &Fe, u2: &Fe, q: &Point) -> Point {
-        self.point_add(
-            &self.mul_generator_vartime(u1),
-            &self.scalar_mul_vartime(u2, q),
-        )
+        #[cfg(feature = "p256-table")]
+        {
+            self.point_add(
+                &self.mul_generator_vartime(u1),
+                &self.scalar_mul_vartime(u2, q),
+            )
+        }
+        #[cfg(not(feature = "p256-table"))]
+        {
+            let odd_g = self.odd_multiples(&self.generator());
+            let odd_q = self.odd_multiples(q);
+            let naf1 = wnaf5(u1);
+            let naf2 = wnaf5(u2);
+            let Some(top) = naf1
+                .iter()
+                .zip(naf2.iter())
+                .rposition(|(&a, &b)| a != 0 || b != 0)
+            else {
+                return self.identity();
+            };
+            let mut acc = self.identity();
+            for i in (0..=top).rev() {
+                acc = self.double(&acc);
+                acc = self.add_naf_digit(&acc, naf1[i], &odd_g);
+                acc = self.add_naf_digit(&acc, naf2[i], &odd_q);
+            }
+            acc
+        }
+    }
+
+    /// The odd multiples `[1]P, [3]P, …, [15]P` for the width-5 wNAF ladders.
+    fn odd_multiples(&self, point: &Point) -> [Point; 8] {
+        let two_p = self.double(point);
+        let mut table = [*point; 8];
+        for i in 1..8 {
+            table[i] = self.point_add(&table[i - 1], &two_p);
+        }
+        table
+    }
+
+    /// Adds the wNAF digit `d` (odd, `|d| <= 15`, or zero for a no-op) times
+    /// the point whose odd multiples are `odd`. **Variable-time.**
+    #[inline]
+    fn add_naf_digit(&self, acc: &Point, d: i8, odd: &[Point; 8]) -> Point {
+        if d > 0 {
+            self.point_add(acc, &odd[(d as usize - 1) / 2])
+        } else if d < 0 {
+            self.point_add(acc, &self.negate_point(&odd[((-d) as usize - 1) / 2]))
+        } else {
+            *acc
+        }
     }
 
     /// **VARIABLE-TIME** fixed-base multiplication `k·G` (comb table with
     /// direct indexing, zero digits skipped). Public scalars only — see
     /// [`Self::mul_double_vartime`].
+    #[cfg(feature = "p256-table")]
     fn mul_generator_vartime(&self, k: &Fe) -> Point {
         let mut acc = self.identity();
         let limbs = k.as_limbs();
@@ -408,13 +481,9 @@ impl P256 {
 
     /// **VARIABLE-TIME** scalar multiplication `k·point` via width-5 wNAF.
     /// Public scalars only — see [`Self::mul_double_vartime`].
+    #[cfg(feature = "p256-table")]
     fn scalar_mul_vartime(&self, k: &Fe, point: &Point) -> Point {
-        // Odd multiples [1]P, [3]P, ..., [15]P.
-        let two_p = self.double(point);
-        let mut table = [*point; 8];
-        for i in 1..8 {
-            table[i] = self.point_add(&table[i - 1], &two_p);
-        }
+        let table = self.odd_multiples(point);
 
         let naf = wnaf5(k);
         // Skip leading zero digits (public scalar, so this leak is fine).
@@ -426,13 +495,7 @@ impl P256 {
         while i > 0 {
             i -= 1;
             acc = self.double(&acc);
-            let d = naf[i];
-            if d > 0 {
-                acc = self.point_add(&acc, &table[(d as usize - 1) / 2]);
-            } else if d < 0 {
-                let neg = self.negate_point(&table[((-d) as usize - 1) / 2]);
-                acc = self.point_add(&acc, &neg);
-            }
+            acc = self.add_naf_digit(&acc, naf[i], &table);
         }
         acc
     }
@@ -539,12 +602,23 @@ mod tests {
         );
     }
 
+    /// The hard-coded generator limbs are the FIPS 186 `G`.
+    #[test]
+    fn generator_matches_hex() {
+        let curve = P256::new();
+        let g = curve.generator();
+        assert_eq!(g.x, fe_from_hex(GX_HEX));
+        assert_eq!(g.y, fe_from_hex(GY_HEX));
+        assert!(curve.is_on_curve(&g.x, &g.y));
+    }
+
     /// Re-derives every entry of the embedded fixed-base table from the
     /// group law and cross-checks the constants, so `P256_GEN_TABLE` is
     /// verified on every test run rather than trusted. The check is
     /// inversion-free: the stored affine `(x, y)` matches the computed
     /// projective `(X : Y : Z)` iff `x·Z == X` and `y·Z == Y`.
     #[test]
+    #[cfg(feature = "p256-table")]
     fn gen_table_matches_computed() {
         let curve = P256::new();
         let mut base = curve.generator();
