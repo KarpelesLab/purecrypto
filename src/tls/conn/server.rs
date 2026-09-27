@@ -1516,6 +1516,17 @@ impl<R: RngCore> ServerConnection<R> {
         self.core.emit_handshake(message);
     }
 
+    /// Parks the connection in [`State::Closed`]: every failure, fatal
+    /// alert and `close_notify` path funnels through here. A server flight
+    /// suspended for an external `CertificateVerify` signature is dropped
+    /// with it — once the connection is dead, a late `provide_signature`
+    /// must not be able to emit CertificateVerify + Finished and revive
+    /// the state machine (see [`Self::provide_signature`]).
+    fn close(&mut self) {
+        self.state = State::Closed;
+        self.pending_flight = None;
+    }
+
     /// Processes all buffered records, advancing the handshake.
     pub fn process_new_packets(&mut self) -> Result<(), Error> {
         // RFC 8446 §6.1: "Any data received after a closure alert has been
@@ -1529,7 +1540,7 @@ impl<R: RngCore> ServerConnection<R> {
                 Ok(Some(Incoming::Handshake(msg))) => {
                     if let Err(e) = self.handle_handshake(msg) {
                         self.core.send_alert(alert_for(&e));
-                        self.state = State::Closed;
+                        self.close();
                         return Err(e);
                     }
                 }
@@ -1545,7 +1556,7 @@ impl<R: RngCore> ServerConnection<R> {
                     // `app_in` before the client Finished is verified.
                     if self.state != State::Connected && self.early_data_remaining.is_none() {
                         self.core.send_alert(AlertDescription::UnexpectedMessage);
-                        self.state = State::Closed;
+                        self.close();
                         // `ConnectionCore` never buffered the plaintext (the
                         // handshake is incomplete, so the peer is not
                         // authenticated), but drop anything already queued so
@@ -1565,7 +1576,7 @@ impl<R: RngCore> ServerConnection<R> {
                         let consumed = plaintext_len as u64;
                         if consumed > *remaining as u64 {
                             self.core.send_alert(AlertDescription::UnexpectedMessage);
-                            self.state = State::Closed;
+                            self.close();
                             return Err(Error::UnexpectedMessage);
                         }
                         *remaining -= consumed as u32;
@@ -1578,17 +1589,17 @@ impl<R: RngCore> ServerConnection<R> {
                         // injectable): a close_notify there is a handshake
                         // failure, never a graceful shutdown.
                         if !self.handshake_completed {
-                            self.state = State::Closed;
+                            self.close();
                             return Err(Error::AlertReceived(AlertDescription::CloseNotify));
                         }
                         self.received_close_notify = true;
-                        self.state = State::Closed;
+                        self.close();
                         // RFC 8446 §6.1: whatever follows the closure alert
                         // is ignored, including bytes already buffered.
                         self.core.discard_input();
                         return Ok(());
                     }
-                    self.state = State::Closed;
+                    self.close();
                     return Err(Error::AlertReceived(alert.description));
                 }
                 // A latched write-side failure (see
@@ -1598,7 +1609,7 @@ impl<R: RngCore> ServerConnection<R> {
                 Ok(None) => return self.core.check_write_error(),
                 Err(e) => {
                     self.core.send_alert(alert_for(&e));
-                    self.state = State::Closed;
+                    self.close();
                     return Err(e);
                 }
             }
@@ -2674,7 +2685,18 @@ impl<R: RngCore> ServerConnection<R> {
     /// signature: emits the CertificateVerify with the caller-supplied
     /// `signature`, then finishes the flight. Returns the signature input +
     /// negotiated scheme via [`Self::pending_signature`].
+    ///
+    /// Only valid while the engine is actually parked in
+    /// [`State::AwaitingCertVerifySignature`] and has not queued its own
+    /// `close_notify`: anything else — including a connection that failed
+    /// or received a fatal alert while the signature was being computed —
+    /// is `InappropriateState`. `pending_flight` is dropped on those paths
+    /// too ([`Self::close`]), but the state is what is checked so the flight
+    /// can never be replayed into a dead connection.
     pub(crate) fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
+        if self.state != State::AwaitingCertVerifySignature || self.core.sent_close_notify() {
+            return Err(Error::InappropriateState);
+        }
         let pf = self
             .pending_flight
             .take()
@@ -3859,6 +3881,53 @@ mod tests {
             server.server_hs_secret_bytes(),
             from_hex_vec("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
         );
+    }
+
+    /// A server flight suspended for an external `CertificateVerify`
+    /// signature must not outlive the connection: once a fatal error has
+    /// parked the engine in `Closed`, `provide_signature` is refused instead
+    /// of emitting CertificateVerify + Finished and reviving the handshake.
+    #[test]
+    fn provide_signature_cannot_revive_a_closed_connection() {
+        let client_hello = from_hex_vec(include_str!("../../../testdata/rfc8448_client_hello.hex"));
+        let chain = test_server_config().cert_chain.clone();
+        // rsa_pss_rsae_sha256, which the RFC 8448 ClientHello offers.
+        let cfg = ServerConfig::with_external(chain, alloc::vec![0x0804]);
+        let mut server = ServerConnection::new(
+            cfg,
+            ScriptedRng {
+                data: alloc::vec![0u8; 64],
+                pos: 0,
+            },
+        );
+
+        let mut record = alloc::vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(client_hello.len() as u16).to_be_bytes());
+        record.extend_from_slice(&client_hello);
+        server.read_tls(&record);
+        server.process_new_packets().unwrap();
+        assert!(server.state == State::AwaitingCertVerifySignature);
+        assert!(server.pending_signature().is_some());
+        let _ = server.write_tls();
+
+        // A stray plaintext handshake message while suspended is fatal and
+        // closes the connection, taking the parked flight with it.
+        server.read_tls(&[0x16, 0x03, 0x03, 0, 4, hs_type::FINISHED, 0, 0, 0]);
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
+        assert!(server.state == State::Closed);
+        assert!(server.pending_signature().is_none());
+        let _ = server.write_tls();
+
+        // The late signature is refused and emits nothing.
+        assert!(matches!(
+            server.provide_signature(alloc::vec![0u8; 256]),
+            Err(Error::InappropriateState)
+        ));
+        assert!(server.state == State::Closed);
+        assert!(!server.wants_write());
     }
 
     /// RFC 8446 §5: "If an implementation detects a change_cipher_spec
