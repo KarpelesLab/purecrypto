@@ -524,6 +524,24 @@ impl ConnectionCore {
             let fragment = fragment.to_vec();
             self.inbuf.drain(..len);
 
+            // RFC 8446 §5.1: "Handshake messages MUST NOT be interleaved
+            // with other record types. That is, if a handshake message is
+            // split over two or more records, there MUST NOT be any other
+            // records between them." `pop_handshake` above drains every
+            // complete message first, so anything left in `hs_pending` is
+            // an unfinished one; a plaintext record of another type here
+            // (an alert, a middlebox CCS) is a protocol violation.
+            // Protected records are checked on their inner type in
+            // `dispatch_inner`.
+            if !self.hs_pending.is_empty()
+                && !matches!(
+                    content_type,
+                    ContentType::Handshake | ContentType::ApplicationData
+                )
+            {
+                return Err(Error::UnexpectedMessage);
+            }
+
             match content_type {
                 ContentType::ChangeCipherSpec => {
                     // RFC 8446 §5: must be exactly `[0x01]`, and only inside
@@ -641,6 +659,14 @@ impl ConnectionCore {
         inner_ct: ContentType,
         content: Vec<u8>,
     ) -> Result<Option<Incoming>, Error> {
+        // RFC 8446 §5.1 interleaving rule, for protected records (see the
+        // plaintext check in `next_message`): while a handshake message is
+        // only partly received, the next record must continue it. Without
+        // this an application-data or alert record slipped between the
+        // fragments was delivered as if the message boundary were intact.
+        if !self.hs_pending.is_empty() && inner_ct != ContentType::Handshake {
+            return Err(Error::UnexpectedMessage);
+        }
         match inner_ct {
             ContentType::Handshake => {
                 if content.is_empty() {
@@ -857,6 +883,94 @@ mod tests {
         // still one record, not zero.
         core.send_application_data(&[]);
         assert_eq!(records(&core.write_tls()).len(), 1);
+    }
+
+    /// Finding: RFC 8446 §5.1's interleaving rule was not enforced — while a
+    /// handshake message was only partly received, an alert or
+    /// application-data record was dispatched normally. Any record other
+    /// than the message's continuation is now `unexpected_message`, on the
+    /// plaintext and the protected path alike; the continuation itself
+    /// still reassembles.
+    #[test]
+    fn records_interleaved_into_a_partial_handshake_message_are_refused() {
+        use crate::tls::crypto::{AeadAlg, HashAlg, RecordCrypter, Secret};
+
+        // A handshake header claiming a 32-byte body, split 4 + 10 | 22.
+        let mut msg = alloc::vec![0x08, 0x00, 0x00, 32];
+        msg.extend_from_slice(&[0xabu8; 32]);
+        let (first, rest) = msg.split_at(14);
+
+        fn plain(ct: ContentType, body: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            write_record(&mut out, ct, ProtocolVersion::TLSv1_2, body).unwrap();
+            out
+        }
+
+        // Positive control: the continuation completes the message.
+        let mut core = ConnectionCore::new();
+        core.read_tls(&plain(ContentType::Handshake, first));
+        core.read_tls(&plain(ContentType::Handshake, rest));
+        assert!(matches!(core.next_message(), Ok(Some(Incoming::Handshake(m))) if m == msg));
+
+        // Plaintext alert, or a middlebox CCS, between the fragments.
+        for (ct, body) in [
+            (ContentType::Alert, &[2u8, 40][..]),
+            (ContentType::ChangeCipherSpec, &[1u8][..]),
+        ] {
+            let mut core = ConnectionCore::new();
+            core.read_tls(&plain(ContentType::Handshake, first));
+            core.read_tls(&plain(ct, body));
+            core.read_tls(&plain(ContentType::Handshake, rest));
+            assert!(
+                matches!(core.next_message(), Err(Error::UnexpectedMessage)),
+                "{ct:?} interleaved into a handshake message must be refused"
+            );
+        }
+
+        // Protected: inner application data or an alert between the
+        // fragments, with and without the application-data gate open.
+        let secret = Secret::new(&[0x44u8; 32]);
+        for (ct, body) in [
+            (ContentType::ApplicationData, &b"sneaky"[..]),
+            (ContentType::ApplicationData, &b""[..]),
+            (ContentType::Alert, &[1u8, 0][..]),
+        ] {
+            let mut peer = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &secret);
+            let mut core = ConnectionCore::new();
+            core.set_read(RecordCrypter::new(
+                HashAlg::Sha256,
+                AeadAlg::Aes128Gcm,
+                16,
+                &secret,
+            ))
+            .unwrap();
+            core.set_app_data_allowed(true);
+            core.read_tls(&peer.encrypt(ContentType::Handshake, first).unwrap());
+            core.read_tls(&peer.encrypt(ct, body).unwrap());
+            core.read_tls(&peer.encrypt(ContentType::Handshake, rest).unwrap());
+            assert!(
+                matches!(core.next_message(), Err(Error::UnexpectedMessage)),
+                "protected {ct:?} interleaved into a handshake message must be refused"
+            );
+            assert!(
+                core.take_received().is_empty(),
+                "interleaved application data must not be delivered"
+            );
+        }
+
+        // Protected positive control.
+        let mut peer = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &secret);
+        let mut core = ConnectionCore::new();
+        core.set_read(RecordCrypter::new(
+            HashAlg::Sha256,
+            AeadAlg::Aes128Gcm,
+            16,
+            &secret,
+        ))
+        .unwrap();
+        core.read_tls(&peer.encrypt(ContentType::Handshake, first).unwrap());
+        core.read_tls(&peer.encrypt(ContentType::Handshake, rest).unwrap());
+        assert!(matches!(core.next_message(), Ok(Some(Incoming::Handshake(m))) if m == msg));
     }
 
     /// Finding: the write side silently dropped records once the per-key
