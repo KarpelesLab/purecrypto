@@ -573,11 +573,24 @@ impl CertificateRevocationList {
     ///   certificate parser's CVE-2014-1568-shaped guard).
     fn validate_extensions(&self) -> Result<(), Error> {
         let mut seq = self.tbs_at_crl_extensions()?;
-        // crlExtensions [0] EXPLICIT — absent is fine.
-        if seq.peek_tag() != Some(tag::context(0)) {
-            return Ok(());
+        // crlExtensions [0] EXPLICIT — absent is fine, but it is the last
+        // TBSCertList field (RFC 5280 §5.1), so the only things that may
+        // remain here are that wrapper or nothing. Any other element is
+        // malformed: treating an unexpected tag as "no extensions" (as this
+        // once did) let a stray element spliced in before `[0]` hide every
+        // CRL extension — an unrecognized critical one, a deltaCRLIndicator,
+        // an issuingDistributionPoint — from the fail-closed checks below,
+        // and trailing junk after `[0]` was accepted outright.
+        match seq.peek_tag() {
+            None => {
+                seq.finish()?;
+                return Ok(());
+            }
+            Some(t) if t == tag::context(0) => {}
+            Some(_) => return Err(Error::Malformed),
         }
         let wrapper = seq.read_tlv(tag::context(0))?;
+        seq.finish()?;
         let mut outer = Reader::new(wrapper);
         let mut exts = outer.read_sequence()?;
         outer.finish()?;
@@ -1199,6 +1212,13 @@ mod tests {
     /// Signs a `TBSCertList` carrying a top-level `crlExtensions [0]` built from
     /// the concatenated `exts`, returning the full CRL DER (unparsed).
     fn crl_der_with_extensions(exts: &[u8]) -> Vec<u8> {
+        crl_der_with_splices(&[], exts, &[])
+    }
+
+    /// [`crl_der_with_extensions`] with `before` spliced in after
+    /// `thisUpdate` (ahead of `crlExtensions`) and `after` appended at the
+    /// end of the `TBSCertList`. An empty `exts` omits `crlExtensions`.
+    fn crl_der_with_splices(before: &[u8], exts: &[u8], after: &[u8]) -> Vec<u8> {
         let key = rsa_a();
         let signer = CertSigner::Rsa(&key);
         let dn = issuer_dn();
@@ -1208,12 +1228,61 @@ mod tests {
         tbs_body.extend_from_slice(&algid);
         tbs_body.extend_from_slice(&dn.to_der());
         tbs_body.extend_from_slice(&Time::utc(2026, 1, 1, 0, 0, 0).to_der_choice());
-        // crlExtensions [0] EXPLICIT Extensions.
-        let extensions = encode_sequence(exts);
-        tbs_body.extend_from_slice(&encode_tlv(tag::context(0), &extensions));
+        tbs_body.extend_from_slice(before);
+        if !exts.is_empty() {
+            // crlExtensions [0] EXPLICIT Extensions.
+            let extensions = encode_sequence(exts);
+            tbs_body.extend_from_slice(&encode_tlv(tag::context(0), &extensions));
+        }
+        tbs_body.extend_from_slice(after);
         let tbs = encode_sequence(&tbs_body);
         let sig = signer.sign(&tbs).unwrap();
         encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat())
+    }
+
+    /// Regression: `validate_extensions` treated any tag other than `[0]`
+    /// after the revoked list as "no extensions" and never checked that
+    /// TBSCertList ended. A `[4] NULL` spliced in before `[0]` hid every CRL
+    /// extension — here an unrecognized *critical* one, which must fail
+    /// closed — and junk after `[0]` was accepted. Both must be rejected.
+    #[test]
+    fn tbs_cert_list_is_parsed_to_the_end() {
+        let critical_unknown = ext(&[2, 5, 29, 99], true, &[0x05, 0x00]);
+        let benign = ext(&[2, 5, 29, 98], false, &[0x05, 0x00]);
+        let stray = [0xA4u8, 0x02, 0x05, 0x00];
+        let junk = [0x05u8, 0x00];
+
+        // Baselines: the splice helper itself produces acceptable CRLs.
+        CertificateRevocationList::from_der(crl_der_with_splices(&[], &benign, &[])).unwrap();
+        CertificateRevocationList::from_der(crl_der_with_splices(&[], &[], &[])).unwrap();
+        assert!(matches!(
+            CertificateRevocationList::from_der(crl_der_with_splices(&[], &critical_unknown, &[])),
+            Err(Error::UnsupportedAlgorithm)
+        ));
+
+        for (before, exts, after, what) in [
+            (
+                &stray[..],
+                &critical_unknown[..],
+                &[][..],
+                "[4] hiding a critical ext",
+            ),
+            (&stray[..], &benign[..], &[][..], "[4] before [0]"),
+            (&[][..], &benign[..], &junk[..], "junk after [0]"),
+            (&[][..], &benign[..], &stray[..], "[4] after [0]"),
+            (&stray[..], &[][..], &[][..], "[4] with no [0]"),
+            (&junk[..], &[][..], &[][..], "junk with no [0]"),
+        ] {
+            // `Malformed` for an unexpected element where `[0]` belongs, the
+            // DER layer's `TrailingData` for bytes after it.
+            assert!(
+                matches!(
+                    CertificateRevocationList::from_der(crl_der_with_splices(before, exts, after)),
+                    Err(Error::Malformed | Error::Der(crate::der::Error::TrailingData))
+                ),
+                "{what}"
+            );
+        }
     }
 
     #[test]

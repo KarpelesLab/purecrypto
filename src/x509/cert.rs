@@ -1341,16 +1341,32 @@ impl Certificate {
         seq.read_element()?; // subjectPublicKeyInfo
 
         // Skip the optional issuerUniqueID [1] and subjectUniqueID [2]
-        // (IMPLICIT primitive context tags 0x81 / 0x82). RFC 5280 §4.1.2.8
-        // permits these in v2 / v3 only — a v1 cert carrying them is
-        // malformed, and we will reject any v1/v2 cert that exposes an
-        // extensions block below anyway.
-        while matches!(seq.peek_tag(), Some(0x81) | Some(0x82)) {
+        // (IMPLICIT primitive context tags 0x81 / 0x82), each at most once
+        // and in that order. RFC 5280 §4.1.2.8 permits these in v2 / v3 only
+        // — a v1 cert carrying them is malformed, and we will reject any
+        // v1/v2 cert that exposes an extensions block below anyway.
+        if seq.peek_tag() == Some(0x81) {
             seq.read_element()?;
         }
-        // The [3] EXPLICIT extensions wrapper (constructed context tag 0xA3).
-        if seq.peek_tag() != Some(tag::context(3)) {
-            return Ok(());
+        if seq.peek_tag() == Some(0x82) {
+            seq.read_element()?;
+        }
+        // What remains is the optional [3] EXPLICIT extensions wrapper
+        // (constructed context tag 0xA3) and nothing else. Any other element
+        // here — a stray `[4]`, a repeated unique ID, junk — is malformed.
+        // Returning "no extensions" on an unexpected tag (as this once did)
+        // silently dropped every extension of a certificate with a stray
+        // element spliced in before `[3]`: basicConstraints, keyUsage and the
+        // SAN all vanished while `check_well_formed` still passed, a parser
+        // differential against every verifier that parses TBSCertificate to
+        // the end.
+        match seq.peek_tag() {
+            None => {
+                seq.finish()?;
+                return Ok(());
+            }
+            Some(t) if t == tag::context(3) => {}
+            Some(_) => return Err(Error::Malformed),
         }
         // RFC 5280 §4.1.2.1: extensions MUST only appear in v3 certificates.
         // Reject any v1 / v2 certificate that carries an `[3] extensions`
@@ -1362,6 +1378,9 @@ impl Certificate {
             return Err(Error::Malformed);
         }
         let wrapper = seq.read_tlv(tag::context(3))?;
+        // `extensions` is the last TBSCertificate field (RFC 5280 §4.1):
+        // nothing may follow it.
+        seq.finish()?;
         let mut outer = Reader::new(wrapper);
         let mut exts = outer.read_sequence()?;
         // No trailing bytes between the extensions SEQUENCE and the end of
@@ -3208,6 +3227,106 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         cert.check_well_formed().unwrap();
         let bc = cert.basic_constraints().unwrap().unwrap();
         assert_eq!(bc, (true, None));
+    }
+
+    /// Forges a signed v3 certificate whose TBSCertificate carries `before`
+    /// spliced in after the SPKI (where the optional unique IDs live), then
+    /// the `[3] extensions` block (omitted when `exts` is empty), then
+    /// `after`.
+    fn forge_v3_cert_with_splices(before: &[u8], exts: &[Extension], after: &[u8]) -> Certificate {
+        use crate::der::{encode_bit_string, encode_context, encode_integer, encode_sequence};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("spliced");
+        let algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+        let spki = rsa_spki(&key.public_key());
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&encode_context(0, &encode_integer(&[2])));
+        body.extend_from_slice(&encode_integer(&1u64.to_be_bytes()));
+        body.extend_from_slice(&algid);
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&validity().to_der());
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&spki);
+        body.extend_from_slice(before);
+        if !exts.is_empty() {
+            body.extend_from_slice(&extension::encode_extensions_field(exts));
+        }
+        body.extend_from_slice(after);
+        let tbs = encode_sequence(&body);
+        let sig = key.sign_pkcs1v15::<Sha256>(&tbs).unwrap();
+        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
+        Certificate { der }
+    }
+
+    /// Regression: `walk_extensions` treated any tag other than `[3]` after
+    /// the SPKI as "no extensions" and never checked that TBSCertificate
+    /// ended after them. A `[4] NULL` spliced in before `[3]` silently
+    /// dropped basicConstraints and the SAN while `check_well_formed`
+    /// passed, and junk after `[3]` was accepted. Both must be rejected as
+    /// structurally invalid: `Malformed` for an unexpected element where
+    /// `[3]` belongs, the DER layer's `TrailingData` for bytes after it.
+    #[test]
+    fn tbs_certificate_is_parsed_to_the_end() {
+        let exts = [
+            extension::basic_constraints(true, None),
+            extension::subject_alt_name(&[GeneralName::Dns("spliced.example".into())]),
+        ];
+        // `[4] { NULL }` — a constructed context tag no TBSCertificate
+        // field uses — and a bare NULL as trailing junk.
+        let stray = [0xA4u8, 0x02, 0x05, 0x00];
+        let junk = [0x05u8, 0x00];
+        fn structural<T>(r: Result<T, Error>) -> bool {
+            matches!(
+                r,
+                Err(Error::Malformed | Error::Der(crate::der::Error::TrailingData))
+            )
+        }
+        let assert_malformed = |cert: &Certificate, what: &str| {
+            assert!(structural(cert.basic_constraints()), "{what}");
+            assert!(structural(cert.subject_alt_names()), "{what}");
+            assert!(structural(cert.critical_extension_oids()), "{what}");
+            assert!(structural(cert.check_well_formed()), "{what}");
+        };
+
+        // Baseline: the same forge path without splices parses.
+        let ok = forge_v3_cert_with_splices(&[], &exts, &[]);
+        ok.check_well_formed().unwrap();
+        assert_eq!(ok.basic_constraints().unwrap(), Some((true, None)));
+        assert_eq!(ok.subject_alt_names().unwrap(), ["spliced.example"]);
+        // Both unique IDs, once each and in order, are still legal in v3.
+        let uids = [0x81u8, 0x02, 0x00, 0xAA, 0x82, 0x02, 0x00, 0xBB];
+        let with_uids = forge_v3_cert_with_splices(&uids, &exts, &[]);
+        assert_eq!(with_uids.basic_constraints().unwrap(), Some((true, None)));
+
+        assert_malformed(
+            &forge_v3_cert_with_splices(&stray, &exts, &[]),
+            "[4] before [3]",
+        );
+        assert_malformed(
+            &forge_v3_cert_with_splices(&[], &exts, &junk),
+            "junk after [3]",
+        );
+        assert_malformed(
+            &forge_v3_cert_with_splices(&[], &exts, &stray),
+            "[4] after [3]",
+        );
+        // With no extensions at all the trailing element is just as stray.
+        assert_malformed(
+            &forge_v3_cert_with_splices(&stray, &[], &[]),
+            "[4] with no [3]",
+        );
+        // A repeated or out-of-order unique ID is a stray element too.
+        let repeated = [0x81u8, 0x02, 0x00, 0xAA, 0x81, 0x02, 0x00, 0xAA];
+        assert_malformed(
+            &forge_v3_cert_with_splices(&repeated, &exts, &[]),
+            "repeated issuerUniqueID",
+        );
+        let swapped = [0x82u8, 0x02, 0x00, 0xBB, 0x81, 0x02, 0x00, 0xAA];
+        assert_malformed(
+            &forge_v3_cert_with_splices(&swapped, &exts, &[]),
+            "subjectUniqueID before issuerUniqueID",
+        );
     }
 
     // X509-2: RFC 5280 §4.1.2.2 — serial magnitude must fit in 20 octets.
