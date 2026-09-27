@@ -716,6 +716,12 @@ struct Ch1Immutable {
     alpn: Option<Vec<u8>>,
     psk_key_exchange_modes: Option<Vec<u8>>,
     cert_compression: Option<Vec<u8>>,
+    /// RFC 9001 §8.2 `quic_transport_parameters`. Not in the §4.1.4 list
+    /// (it post-dates RFC 8446), but a client rebuilds CH2 from the same
+    /// inputs as CH1 and re-carries it; the QUIC layer was already handed
+    /// CH1's copy, so CH2's must be the same bytes or the two halves of
+    /// the connection disagree on the parameters in force.
+    quic_transport_parameters: Option<Vec<u8>>,
 }
 
 impl Ch1Immutable {
@@ -734,6 +740,7 @@ impl Ch1Immutable {
             alpn: dup_owned(ExtensionType::ALPN),
             psk_key_exchange_modes: dup_owned(ExtensionType::PSK_KEY_EXCHANGE_MODES),
             cert_compression: dup_owned(ExtensionType::COMPRESS_CERTIFICATE),
+            quic_transport_parameters: dup_owned(ExtensionType::QUIC_TRANSPORT_PARAMETERS),
         }
     }
 
@@ -772,6 +779,10 @@ impl Ch1Immutable {
                 &self.psk_key_exchange_modes,
             )
             || !opt_ext_eq(ExtensionType::COMPRESS_CERTIFICATE, &self.cert_compression)
+            || !opt_ext_eq(
+                ExtensionType::QUIC_TRANSPORT_PARAMETERS,
+                &self.quic_transport_parameters,
+            )
         {
             return Err(Error::IllegalParameter);
         }
@@ -2234,16 +2245,28 @@ impl<R: RngCore> ServerConnection<R> {
         // ride in the ClientHello as extension 0x0039. Hand the opaque
         // body to the QUIC layer verbatim; reject duplicates per the
         // "at most once" rule.
+        //
+        // The retry ClientHello after a HelloRetryRequest legitimately
+        // re-carries the extension (the client rebuilds CH2 from the same
+        // inputs as CH1). That is not a second set of parameters: CH2's
+        // copy was already checked byte-equal to CH1's by
+        // `verify_ch2_matches`, and the QUIC layer received CH1's, so it is
+        // neither re-dispatched nor rejected here. Only a *different* body
+        // — or one that appears in CH2 without having been in CH1 — fails
+        // the handshake (`illegal_parameter`, from the CH1/CH2 comparison).
         if self.engine_mode == super::super::quic_hooks::EngineMode::Quic
             && let Some(qtp_body) =
                 ext::find(&ch.extensions, ExtensionType::QUIC_TRANSPORT_PARAMETERS)
         {
             if self.peer_quic_params_seen {
-                return Err(Error::IllegalParameter);
-            }
-            self.peer_quic_params_seen = true;
-            if let Some(h) = self.hooks.as_mut() {
-                h.on_peer_transport_params(qtp_body);
+                if !is_retry {
+                    return Err(Error::IllegalParameter);
+                }
+            } else {
+                self.peer_quic_params_seen = true;
+                if let Some(h) = self.hooks.as_mut() {
+                    h.on_peer_transport_params(qtp_body);
+                }
             }
         }
 
@@ -4831,5 +4854,82 @@ mod tests {
             clockless.try_accept_psk(&ch, &raw, &[]).unwrap().is_none(),
             "a clock-less listener must not accept resumption tickets"
         );
+    }
+
+    /// Builds a QUIC-mode server that prefers X25519 and a CH1 offering
+    /// X25519 in `supported_groups` but sharing only secp256r1, so the
+    /// server answers with a HelloRetryRequest. Returns the server (parked
+    /// in `WaitClientHelloRetry`) and a CH2 builder taking the
+    /// `quic_transport_parameters` body to carry.
+    fn quic_hrr_fixture(
+        qtp1: &[u8],
+    ) -> (
+        ServerConnection<crate::rng::HmacDrbg<Sha256>>,
+        impl Fn(&[u8]) -> Vec<u8>,
+    ) {
+        use crate::rng::HmacDrbg;
+        use crate::tls::quic_hooks::tests::CapturingHooks;
+        let cfg =
+            test_server_config().with_preferred_key_exchange_group(crate::tls::NamedGroup::X25519);
+        let hooks = alloc::boxed::Box::new(CapturingHooks::new(alloc::vec![0x51u8, 0x52]));
+        let mut server = ServerConnection::new_for_quic(
+            cfg,
+            HmacDrbg::<Sha256>::new(b"quic-hrr-s", b"nonce", &[]),
+            hooks,
+        );
+        let mut crng = HmacDrbg::<Sha256>::new(b"quic-hrr-c", b"nonce", &[]);
+        let x25519_share = X25519PrivateKey::generate(&mut crng).public_key().to_vec();
+        let hello = move |share: (NamedGroup, Vec<u8>), qtp: &[u8]| -> Vec<u8> {
+            ClientHello {
+                legacy_version: 0x0303,
+                random: [0x33; 32],
+                session_id: Vec::new(),
+                cipher_suites: alloc::vec![CipherSuite::AES_128_GCM_SHA256],
+                extensions: alloc::vec![
+                    ext::client_supported_versions(),
+                    ext::supported_groups_list(&[NamedGroup::SECP256R1, NamedGroup::X25519]),
+                    ext::signature_algorithms(),
+                    ext::quic_transport_parameters(qtp),
+                    ext::client_key_shares(&[share]),
+                ],
+            }
+            .encode()
+        };
+        let ch1 = hello((NamedGroup::SECP256R1, alloc::vec![0x04u8; 65]), qtp1);
+        server
+            .on_client_hello(hs_type::CLIENT_HELLO, &ch1[4..], &ch1)
+            .expect("CH1 should trigger a HelloRetryRequest");
+        assert!(server.state == State::WaitClientHelloRetry);
+        assert!(server.peer_quic_params_seen);
+        let ch2 = move |qtp: &[u8]| hello((NamedGroup::X25519, x25519_share.clone()), qtp);
+        (server, ch2)
+    }
+
+    /// RFC 9001 §8.2 + RFC 8446 §4.1.4: the retry ClientHello re-carries
+    /// `quic_transport_parameters` (the client rebuilds CH2 from the same
+    /// inputs as CH1). That is one set of parameters presented twice, not a
+    /// duplicate — the server must complete the handshake rather than
+    /// reject CH2 under the "at most once" rule.
+    #[test]
+    fn quic_hello_retry_accepts_re_presented_transport_parameters() {
+        let qtp = [0xc1u8, 0xc2, 0xc3];
+        let (mut server, ch2) = quic_hrr_fixture(&qtp);
+        let ch2 = ch2(&qtp);
+        server
+            .on_client_hello_retry(hs_type::CLIENT_HELLO, &ch2[4..], &ch2)
+            .expect("CH2 carrying CH1's transport parameters must be accepted");
+        assert!(server.state == State::WaitClientFinished);
+    }
+
+    /// The re-presented parameters must be CH1's bytes: the QUIC layer was
+    /// handed CH1's copy, so a CH2 that changes them is refused.
+    #[test]
+    fn quic_hello_retry_rejects_changed_transport_parameters() {
+        let (mut server, ch2) = quic_hrr_fixture(&[0xc1u8, 0xc2, 0xc3]);
+        let ch2 = ch2(&[0xc1u8, 0xc2, 0xc4]);
+        assert!(matches!(
+            server.on_client_hello_retry(hs_type::CLIENT_HELLO, &ch2[4..], &ch2),
+            Err(Error::IllegalParameter)
+        ));
     }
 }
