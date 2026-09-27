@@ -698,6 +698,14 @@ impl ServerConfig {
     /// authenticate the client — e.g. by another listener sharing the
     /// ticket key — is ignored and the client is put through a full
     /// handshake with `CertificateRequest`.
+    ///
+    /// A recorded identity is re-checked on every resumption: an X.509 leaf
+    /// must still be inside its validity period, and a raw public key must
+    /// still be on the [`Self::add_expected_client_raw_public_key`]
+    /// allowlist; otherwise the ticket is ignored (full handshake). Tickets
+    /// issued by a resumed handshake carry the identity forward together
+    /// with the time it was originally verified, so a chain of resumptions
+    /// expires one ticket lifetime after that verification — never later.
     pub fn with_client_auth(mut self, roots: crate::tls::RootCertStore, required: bool) -> Self {
         self.client_auth = Some(ClientAuthPolicy { roots, required });
         self
@@ -967,6 +975,11 @@ pub struct ServerConnection<R: RngCore> {
     client_cert_chain: Vec<Vec<u8>>,
     /// mTLS: the client's leaf public key, recovered from the chain.
     client_leaf_key: Option<crate::x509::AnyPublicKey>,
+    /// On a PSK-resumed handshake whose ticket carried a client leaf: the
+    /// unix time that leaf was verified by the original full handshake
+    /// (see [`TicketPlaintext::client_auth_secs`]). Re-embedded, unchanged,
+    /// in the ticket this connection issues.
+    resumed_client_auth_secs: Option<u64>,
     #[cfg(test)]
     server_hs_secret: Option<Secret>,
 
@@ -1136,6 +1149,7 @@ impl<R: RngCore> ServerConnection<R> {
             deferred_chts: None,
             client_cert_chain: Vec::new(),
             client_leaf_key: None,
+            resumed_client_auth_secs: None,
             #[cfg(test)]
             server_hs_secret: None,
             engine_mode,
@@ -2623,8 +2637,11 @@ impl<R: RngCore> ServerConnection<R> {
         self.psk_used = psk_state.is_some();
         // Resumption carries the issuing handshake's client identity
         // forward: restore the leaf so `peer_certificates()` reflects it.
-        if let Some(leaf) = psk_state.as_ref().and_then(|s| s.client_leaf.as_ref()) {
+        if let Some(s) = psk_state.as_ref()
+            && let Some(leaf) = s.client_leaf.as_ref()
+        {
             self.client_cert_chain = alloc::vec![leaf.clone()];
+            self.resumed_client_auth_secs = Some(s.client_auth_secs);
         }
         if psk_state.is_none() {
             if self.config.client_auth.is_some() {
@@ -3325,6 +3342,18 @@ impl<R: RngCore> ServerConnection<R> {
         let alpn = self.alpn_negotiated.as_ref();
         let alpn_len = alpn.map(|a| a.len()).unwrap_or(0) as u8;
         let client_leaf = self.client_cert_chain.first();
+        // When the client was authenticated, when was its leaf actually
+        // verified? On a full handshake: now. On a PSK-resumed handshake the
+        // leaf was restored from the presented ticket, which recorded the
+        // original verification time — carry *that* forward rather than
+        // re-stamping the identity with this ticket's `creation`, so a chain
+        // of resumptions expires `ticket_lifetime` after the one real
+        // verification (enforced in `decrypt_ticket`).
+        let client_auth_secs = if self.psk_used {
+            self.resumed_client_auth_secs.unwrap_or(creation)
+        } else {
+            creation
+        };
         let mut plain = Vec::with_capacity(
             1 + 8
                 + 4
@@ -3335,9 +3364,10 @@ impl<R: RngCore> ServerConnection<R> {
                 + alpn_len as usize
                 + 1
                 + 2
-                + client_leaf.map(|c| c.len()).unwrap_or(0),
+                + client_leaf.map(|c| c.len()).unwrap_or(0)
+                + 8,
         );
-        plain.push(TICKET13_FORMAT_SUITE);
+        plain.push(TICKET13_FORMAT_AUTH);
         plain.extend_from_slice(&creation.to_be_bytes());
         plain.extend_from_slice(&age_add_bytes);
         // RFC 8446 §4.6.1: 0-RTT runs under the suite the ticket was issued
@@ -3355,6 +3385,7 @@ impl<R: RngCore> ServerConnection<R> {
                 plain.push(1);
                 plain.extend_from_slice(&(leaf.len() as u16).to_be_bytes());
                 plain.extend_from_slice(leaf);
+                plain.extend_from_slice(&client_auth_secs.to_be_bytes());
             }
             _ => plain.push(0),
         }
@@ -3493,6 +3524,9 @@ struct AcceptedPsk {
     /// The client leaf certificate (DER) the issuing handshake
     /// authenticated, when it did; restored into `peer_certificates()`.
     client_leaf: Option<Vec<u8>>,
+    /// When the leaf was verified by the original full handshake (see
+    /// [`TicketPlaintext::client_auth_secs`]).
+    client_auth_secs: u64,
 }
 
 /// RFC 8446 §8.2: maximum allowed deviation, in milliseconds, between the
@@ -3556,6 +3590,35 @@ impl<R: RngCore> ServerConnection<R> {
         let mut bound = [0u8; 32];
         bound.copy_from_slice(out.as_ref());
         Some(bound)
+    }
+
+    /// Whether a client leaf recorded in a ticket may still stand in for
+    /// client authentication at unix time `now`. An X.509 leaf must be
+    /// inside its validity period. A leaf with no parsable validity period
+    /// can only be an RFC 7250 raw public key (a bare SPKI); it remains
+    /// acceptable exactly while it is on this listener's allowlist — the
+    /// whole trust root for that path — so removing a key from the
+    /// allowlist also revokes its tickets. Mirrors the TLS 1.2 engine's
+    /// `try_resume`.
+    ///
+    /// The discriminator is the validity period, not whether the bytes
+    /// "parse as a certificate": `Certificate::from_der` only checks the
+    /// outer SEQUENCE, which a bare SPKI also satisfies. Either way the
+    /// check fails closed — bytes that are neither an in-window
+    /// certificate nor an allowlisted key are refused.
+    fn resumable_client_leaf(&self, leaf: &[u8], now: u64) -> bool {
+        let validity = crate::x509::Certificate::from_der(leaf.to_vec())
+            .ok()
+            .and_then(|cert| cert.validity().ok());
+        match validity {
+            Some(v) => v.accepts(&crate::x509::Time::from_unix(now)),
+            None => super::common::check_raw_public_key(
+                true,
+                &self.config.expected_client_raw_public_keys,
+                leaf,
+            )
+            .is_ok(),
+        }
     }
 
     /// Tries to accept a `pre_shared_key` offer from the ClientHello.
@@ -3628,6 +3691,17 @@ impl<R: RngCore> ServerConnection<R> {
             {
                 continue;
             }
+            // The recorded client identity must still be acceptable *now*,
+            // exactly as the TLS 1.2 engine's `try_resume` demands: a
+            // resumed handshake re-uses the issuing handshake's
+            // authentication, and an expired (or not-yet-valid) certificate
+            // must not be carried across it. Skip the ticket — ending in a
+            // full handshake, which re-verifies the chain from scratch.
+            if let Some(leaf) = decrypted.client_leaf.as_ref()
+                && !self.resumable_client_leaf(leaf, now)
+            {
+                continue;
+            }
             let TicketPlaintext {
                 psk,
                 alpn,
@@ -3635,6 +3709,7 @@ impl<R: RngCore> ServerConnection<R> {
                 age_add,
                 suite,
                 client_leaf,
+                client_auth_secs,
             } = decrypted;
             let hash = match psk.len() {
                 32 => HashAlg::Sha256,
@@ -3700,6 +3775,7 @@ impl<R: RngCore> ServerConnection<R> {
                 selected_identity,
                 selected_binder: presented.to_vec(),
                 client_leaf,
+                client_auth_secs,
             }));
         }
         Ok(None)
@@ -3718,24 +3794,31 @@ pub(crate) const TICKET13_AAD: &[u8] = b"purecrypto tls13 ticket v1";
 /// suite the ticket was issued with, so a ticket that does not name one
 /// cannot be used for early data).
 const TICKET13_FORMAT: u8 = 0x13;
-/// Current ticket format: like [`TICKET13_FORMAT`] plus `cipher_suite u16`.
+/// Like [`TICKET13_FORMAT`] plus `cipher_suite u16`.
 const TICKET13_FORMAT_SUITE: u8 = 0x14;
+/// Current ticket format: like [`TICKET13_FORMAT_SUITE`] plus, after the
+/// client leaf, the time that leaf was actually authenticated
+/// (`client_auth_time u64`). A ticket issued after a PSK-resumed handshake
+/// re-embeds the leaf the *previous* ticket carried; without this field the
+/// leaf would be re-stamped with each ticket's fresh `creation_time` and the
+/// chain of resumptions would never re-check the identity again.
+const TICKET13_FORMAT_AUTH: u8 = 0x15;
 
 /// Decoded ticket payload: the original PSK plus the ALPN protocol that was
 /// negotiated on the connection that issued the ticket (empty when none was),
 /// the issuance timestamp, the `ticket_age_add` obfuscator — the latter two
 /// feed the RFC 8446 §8.2 ticket-age freshness check on 0-RTT — and the
 /// client leaf certificate when the issuing handshake authenticated the
-/// client.
+/// client, with the time of that authentication.
 ///
 /// Plaintext layout (v1):
 ///
 /// ```text
-/// format          u8      // TICKET13_FORMAT_SUITE (0x13 = the older
-///                         // layout, which omits `cipher_suite`)
+/// format          u8      // TICKET13_FORMAT_AUTH (0x13 / 0x14 = the older
+///                         // layouts, see the constants)
 /// creation_time   u64     // unix seconds (server clock at issuance)
 /// ticket_age_add  u32
-/// cipher_suite    u16     // present iff format == TICKET13_FORMAT_SUITE
+/// cipher_suite    u16     // present iff format >= TICKET13_FORMAT_SUITE
 /// psk_len         u8
 /// psk             psk_len bytes
 /// alpn_len        u8
@@ -3743,6 +3826,9 @@ const TICKET13_FORMAT_SUITE: u8 = 0x14;
 /// client_auth     u8      // 1 if the issuing handshake authenticated the client
 /// leaf_len        u16     // present iff client_auth == 1
 /// leaf            leaf_len bytes (DER)
+/// client_auth_time u64    // present iff client_auth == 1 and
+///                         // format == TICKET13_FORMAT_AUTH; unix seconds of
+///                         // the full handshake that verified `leaf`
 /// ```
 struct TicketPlaintext {
     /// The resumption PSK the ticket carries, wiped on drop.
@@ -3756,6 +3842,13 @@ struct TicketPlaintext {
     /// we cannot tell what it was.
     suite: Option<CipherSuite>,
     client_leaf: Option<Vec<u8>>,
+    /// When `client_leaf` is `Some`: the unix time of the full handshake that
+    /// verified it — carried unchanged across every ticket issued down a
+    /// chain of resumptions, so the whole chain expires `ticket_lifetime`
+    /// after that one verification. Older formats did not record it and are
+    /// treated as authenticated at `creation_secs`. Meaningless (and equal
+    /// to `creation_secs`) without a leaf.
+    client_auth_secs: u64,
 }
 
 /// Decrypts a ticket bound to `key`. The wire layout is `nonce(12) ‖
@@ -3768,9 +3861,13 @@ struct TicketPlaintext {
 /// ticket older than `ticket_lifetime_secs + 60`, one minted more than 60 s
 /// in the future, or one carrying no timestamp at all (`creation_time == 0`)
 /// is rejected — silent fallback to a fresh 1-RTT handshake, matching the
-/// TLS 1.2 `try_resume` policy. Only `ticket_lifetime_secs == 0` (lifetime
-/// enforcement explicitly disabled) skips the age comparison; the caller is
-/// responsible for supplying a real `now_secs` (see
+/// TLS 1.2 `try_resume` policy. A recorded client authentication is bounded
+/// the same way: a ticket whose `client_auth_time` is more than
+/// `ticket_lifetime_secs + 60` in the past is rejected however fresh the
+/// ticket itself is, so re-issuing tickets across resumed handshakes cannot
+/// extend an identity indefinitely. Only `ticket_lifetime_secs == 0`
+/// (lifetime enforcement explicitly disabled) skips both comparisons; the
+/// caller is responsible for supplying a real `now_secs` (see
 /// `ServerConnection::ticket_now`).
 fn decrypt_ticket(
     key: &[u8; 32],
@@ -3796,12 +3893,15 @@ fn decrypt_ticket(
     // Parse the plaintext (layout on `TicketPlaintext`).
     let mut c = crate::tls::codec::ReadCursor::new(&buf);
     let format = c.u8().ok()?;
-    if format != TICKET13_FORMAT && format != TICKET13_FORMAT_SUITE {
+    if format != TICKET13_FORMAT
+        && format != TICKET13_FORMAT_SUITE
+        && format != TICKET13_FORMAT_AUTH
+    {
         return None;
     }
     let creation_secs = c.u64().ok()?;
     let age_add = c.u32().ok()?;
-    let suite = if format == TICKET13_FORMAT_SUITE {
+    let suite = if format != TICKET13_FORMAT {
         Some(CipherSuite(c.u16().ok()?))
     } else {
         None
@@ -3816,8 +3916,8 @@ fn decrypt_ticket(
     // RFC 8446 §4.6.1 + §8.1: enforce ticket age. The caller always supplies
     // a real clock (`try_accept_psk` bails out without one); the check is
     // skipped only when the lifetime is explicitly zeroed.
+    const SKEW_SECS: u64 = 60;
     if ticket_lifetime_secs != 0 {
-        const SKEW_SECS: u64 = 60;
         // Past: now - creation must not exceed lifetime + skew.
         if now_secs.saturating_sub(creation_secs) > ticket_lifetime_secs as u64 + SKEW_SECS {
             return None;
@@ -3836,7 +3936,30 @@ fn decrypt_ticket(
         1 => Some(c.vec_u16().ok()?.to_vec()),
         _ => return None,
     };
+    let client_auth_secs = match (&client_leaf, format) {
+        (Some(_), TICKET13_FORMAT_AUTH) => c.u64().ok()?,
+        // Older formats stamped no authentication time: they were only
+        // ever issued by a full handshake at `creation_secs`.
+        _ => creation_secs,
+    };
     c.expect_empty().ok()?;
+    if client_leaf.is_some() {
+        // A recorded identity is only as old as the handshake that verified
+        // it. A chain of PSK-resumed handshakes re-issues tickets that carry
+        // the leaf forward, each with a fresh `creation_secs`; the
+        // authentication time is what keeps that chain from outliving the
+        // lifetime a single ticket would have had. Zero (never stamped) and
+        // "authenticated after issuance" are both impossible for a ticket
+        // this engine minted.
+        if client_auth_secs == 0 || client_auth_secs > creation_secs {
+            return None;
+        }
+        if ticket_lifetime_secs != 0
+            && now_secs.saturating_sub(client_auth_secs) > ticket_lifetime_secs as u64 + SKEW_SECS
+        {
+            return None;
+        }
+    }
     Some(TicketPlaintext {
         psk,
         alpn,
@@ -3844,6 +3967,7 @@ fn decrypt_ticket(
         age_add,
         suite,
         client_leaf,
+        client_auth_secs,
     })
 }
 
@@ -5078,6 +5202,206 @@ mod tests {
             clockless.try_accept_psk(&ch, &raw, &[]).unwrap().is_none(),
             "a clock-less listener must not accept resumption tickets"
         );
+    }
+
+    /// Seals a current-format (`TICKET13_FORMAT_AUTH`) ticket carrying the
+    /// fixed `[0xAB; 32]` PSK, a client `leaf`, and the time that leaf was
+    /// verified — the layout `emit_session_ticket` writes.
+    fn synth_authenticated_ticket(
+        key: &[u8; 32],
+        creation_secs: u64,
+        leaf: &[u8],
+        client_auth_secs: u64,
+    ) -> Vec<u8> {
+        let mut plain = Vec::new();
+        plain.push(super::TICKET13_FORMAT_AUTH);
+        plain.extend_from_slice(&creation_secs.to_be_bytes());
+        plain.extend_from_slice(&0u32.to_be_bytes()); // ticket_age_add
+        plain.extend_from_slice(&CipherSuite::AES_128_GCM_SHA256.0.to_be_bytes());
+        plain.push(32);
+        plain.extend_from_slice(&[0xABu8; 32]);
+        plain.push(0); // no alpn
+        plain.push(1); // client-authenticated
+        plain.extend_from_slice(&(leaf.len() as u16).to_be_bytes());
+        plain.extend_from_slice(leaf);
+        plain.extend_from_slice(&client_auth_secs.to_be_bytes());
+        let nonce = [0x42u8; 12];
+        let gcm = Gcm::new(Aes256::new(key));
+        let mut buf = plain;
+        let tag = gcm.encrypt(&nonce, super::TICKET13_AAD, &mut buf);
+        let mut wire = Vec::with_capacity(12 + buf.len() + 16);
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(&buf);
+        wire.extend_from_slice(&tag);
+        wire
+    }
+
+    /// A self-signed Ed25519 client leaf valid over `[from, to]`.
+    fn ticket_test_client_leaf(label: &[u8], from: Time, to: Time) -> Vec<u8> {
+        use crate::ec::Ed25519PrivateKey;
+        use crate::rng::HmacDrbg;
+        use crate::x509::CertSigner;
+        let mut seed = HmacDrbg::<crate::hash::Sha256>::new(label, b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut seed);
+        Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &DistinguishedName::common_name("ticket-client"),
+            &Validity::new(from, to),
+            1,
+            false,
+            &["ticket-client"],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec()
+    }
+
+    /// The recorded client leaf must still be inside its validity period at
+    /// resumption, as the TLS 1.2 engine already demands: an expired
+    /// certificate cannot be carried across a resumed handshake. The ticket
+    /// is skipped (`Ok(None)`, full handshake), never a hard failure.
+    #[test]
+    fn tls13_ticket_rechecks_client_leaf_validity() {
+        use crate::tls::pki::RootCertStore;
+        let leaf = ticket_test_client_leaf(
+            b"tls13-ticket-expiring",
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2026, 6, 1, 0, 0, 0),
+        );
+        let key = [0x44u8; 32];
+        let cfg = |at: Time| {
+            let mut roots = RootCertStore::new();
+            roots.add_der(leaf.clone()).unwrap();
+            test_server_config()
+                .with_ticket_key(key)
+                .with_client_auth(roots, true)
+                .with_verification_time(at)
+        };
+
+        // In-window: resumption is allowed and the identity restored.
+        let ok = ticket_engine(cfg(Time::utc(2026, 1, 1, 0, 0, 0)));
+        let now = ok.ticket_now().unwrap();
+        let seal = ok.ticket_seal_key().unwrap();
+        let ticket = synth_authenticated_ticket(&seal, now, &leaf, now);
+        let (raw, ch) = psk_client_hello(&ticket, &[0xABu8; 32], 0);
+        let accepted = ok.try_accept_psk(&ch, &raw, &[]).unwrap();
+        assert_eq!(accepted.and_then(|a| a.client_leaf), Some(leaf.clone()));
+
+        // After the leaf expired: refused, even though the ticket itself
+        // is fresh.
+        let late = ticket_engine(cfg(Time::utc(2026, 7, 1, 0, 0, 0)));
+        let now = late.ticket_now().unwrap();
+        let ticket = synth_authenticated_ticket(&seal, now, &leaf, now);
+        let (raw, ch) = psk_client_hello(&ticket, &[0xABu8; 32], 0);
+        assert!(
+            late.try_accept_psk(&ch, &raw, &[]).unwrap().is_none(),
+            "an expired client leaf must not be resumed"
+        );
+    }
+
+    /// An RFC 7250 raw-public-key identity has no validity period; it stays
+    /// resumable exactly while it is on the listener's allowlist, so
+    /// removing a key from the allowlist also revokes its tickets.
+    #[test]
+    fn tls13_ticket_rechecks_raw_public_key_allowlist() {
+        use crate::tls::pki::RootCertStore;
+        let anchor = ticket_test_anchor(b"tls13-rpk-anchor");
+        let spki = Certificate::from_der(ticket_test_anchor(b"tls13-rpk-client"))
+            .unwrap()
+            .spki_der()
+            .unwrap()
+            .to_vec();
+        let key = [0x45u8; 32];
+        let base = || {
+            let mut roots = RootCertStore::new();
+            roots.add_der(anchor.clone()).unwrap();
+            test_server_config()
+                .with_ticket_key(key)
+                .with_client_auth(roots, true)
+                .with_verification_time(Time::from_unix(TEST_TICKET_NOW))
+        };
+
+        let listed = ticket_engine(base().add_expected_client_raw_public_key(spki.clone()));
+        let seal = listed.ticket_seal_key().unwrap();
+        let ticket = synth_authenticated_ticket(&seal, TEST_TICKET_NOW, &spki, TEST_TICKET_NOW);
+        let (raw, ch) = psk_client_hello(&ticket, &[0xABu8; 32], 0);
+        assert!(listed.try_accept_psk(&ch, &raw, &[]).unwrap().is_some());
+
+        // Same trust roots (so the same sealing key), key no longer listed.
+        let delisted = ticket_engine(base());
+        assert_eq!(delisted.ticket_seal_key(), Some(seal));
+        assert!(
+            delisted.try_accept_psk(&ch, &raw, &[]).unwrap().is_none(),
+            "a raw key removed from the allowlist must not be resumed"
+        );
+        let other = ticket_engine(base().add_expected_client_raw_public_key(alloc::vec![0x30; 44]));
+        assert!(other.try_accept_psk(&ch, &raw, &[]).unwrap().is_none());
+    }
+
+    /// Ticket chaining: a ticket issued after a PSK-resumed handshake
+    /// re-embeds the restored leaf, but with the time of the *original*
+    /// verification, not the new ticket's creation time — and a ticket
+    /// whose recorded authentication is older than the ticket lifetime is
+    /// refused however fresh the ticket is. Without both, every resumption
+    /// would roll the identity forward and it would never be re-verified.
+    #[test]
+    fn tls13_ticket_chain_is_bounded_by_the_original_authentication() {
+        let leaf = ticket_test_client_leaf(
+            b"tls13-ticket-chain",
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let lifetime = 3600u32;
+        let key = [0x46u8; 32];
+        let issue = |psk_used: bool, resumed_auth: Option<u64>| -> super::TicketPlaintext {
+            let mut server = ticket_engine(
+                test_server_config()
+                    .with_ticket_key(key)
+                    .with_ticket_lifetime(lifetime)
+                    .with_verification_time(Time::from_unix(TEST_TICKET_NOW)),
+            );
+            server.suite = crate::tls::crypto::lookup_suite(CipherSuite::AES_128_GCM_SHA256);
+            server.rms = Some(Secret::new(&[0x11u8; 32]));
+            server.client_cert_chain = alloc::vec![leaf.clone()];
+            server.psk_used = psk_used;
+            server.resumed_client_auth_secs = resumed_auth;
+            server.pending_nst = true;
+            server.emit_session_ticket().unwrap();
+            // No write key is installed, so the NewSessionTicket goes out as
+            // a plaintext handshake record.
+            let out = server.write_tls();
+            let rec = read_record(&out).unwrap().unwrap();
+            let nst = NewSessionTicket::decode(&rec.fragment[4..]).unwrap();
+            let seal = server.ticket_seal_key().unwrap();
+            super::decrypt_ticket(&seal, &nst.ticket, TEST_TICKET_NOW, 0).unwrap()
+        };
+
+        // A full handshake stamps the leaf with the issuance time.
+        let fresh = issue(false, None);
+        assert_eq!(fresh.client_leaf.as_deref(), Some(&leaf[..]));
+        assert_eq!(fresh.client_auth_secs, TEST_TICKET_NOW);
+
+        // A resumed handshake carries the original verification time forward.
+        let original = TEST_TICKET_NOW - 3000;
+        let chained = issue(true, Some(original));
+        assert_eq!(chained.client_leaf.as_deref(), Some(&leaf[..]));
+        assert_eq!(chained.creation_secs, TEST_TICKET_NOW);
+        assert_eq!(chained.client_auth_secs, original);
+
+        // Enforcement: a brand-new ticket whose identity was verified more
+        // than one lifetime (+ skew) ago is refused; within it, accepted.
+        let seal = [0x47u8; 32];
+        let stale_auth = TEST_TICKET_NOW - lifetime as u64 - 61;
+        let t = synth_authenticated_ticket(&seal, TEST_TICKET_NOW, &leaf, stale_auth);
+        assert!(super::decrypt_ticket(&seal, &t, TEST_TICKET_NOW, lifetime).is_none());
+        let t = synth_authenticated_ticket(&seal, TEST_TICKET_NOW, &leaf, original);
+        assert!(super::decrypt_ticket(&seal, &t, TEST_TICKET_NOW, lifetime).is_some());
+        // An authentication time after issuance, or never stamped, is not
+        // something this engine mints.
+        let t = synth_authenticated_ticket(&seal, TEST_TICKET_NOW, &leaf, TEST_TICKET_NOW + 1);
+        assert!(super::decrypt_ticket(&seal, &t, TEST_TICKET_NOW, lifetime).is_none());
+        let t = synth_authenticated_ticket(&seal, TEST_TICKET_NOW, &leaf, 0);
+        assert!(super::decrypt_ticket(&seal, &t, TEST_TICKET_NOW, lifetime).is_none());
     }
 
     /// Builds a QUIC-mode server that prefers X25519 and a CH1 offering
