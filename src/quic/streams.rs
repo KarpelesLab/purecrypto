@@ -61,6 +61,16 @@ const REPLENISH_RATIO_DEN: u64 = 2;
 /// never refused a stream it was authorized to open.
 const MIN_LIVE_STREAMS: usize = 4096;
 
+/// How many retired peer streams keep their final size around
+/// ([`Streams::retired_final_size`]) so a late frame past it can still be
+/// reported as a FINAL_SIZE_ERROR (RFC 9000 §4.5). Beyond this the final
+/// size is forgotten and late frames on the stream are silently discarded,
+/// which §3.2 / §4.5 permit (an endpoint "SHOULD", not MUST, report the
+/// violation). Retirement bookkeeping used to keep one map entry per peer
+/// stream for the life of the connection, so a peer churning streams grew
+/// our memory without bound; every retirement structure is now bounded.
+const RETIRED_FINAL_SIZES: usize = 256;
+
 /// Frame produced by [`Streams::pop_frame`]. Owned so the packet packer
 /// can serialize it without juggling lifetimes against the borrow on
 /// the [`Streams`] map.
@@ -246,6 +256,29 @@ pub(crate) struct Streams {
     pub(crate) peer_bidi_closed: u64,
     /// Peer-initiated uni streams that have been retired.
     pub(crate) peer_uni_closed: u64,
+    /// Ordinals (`id / 4`) of peer-initiated bidi streams below
+    /// `peer_bidi_used` that were opened *implicitly* — RFC 9000 §3.2 /
+    /// §2.1: using a stream ID opens every lower-numbered stream of the
+    /// same type — but have not yet been materialized in [`Self::map`] and
+    /// have not been retired.
+    ///
+    /// This is what tells a late frame on a RETIRED stream apart from the
+    /// first frame of an implicitly-opened one: a peer-initiated ordinal
+    /// below `peer_*_used` that is neither live in `map` nor listed here is
+    /// retired. Tracking the *non*-retired set instead of the retired one
+    /// keeps the bookkeeping bounded: `peer_*_used - peer_*_closed` never
+    /// exceeds the stream window we advertised (the limit only advances as
+    /// streams retire — [`Self::maybe_replenish_streams`]), and every
+    /// non-retired ordinal is either in `map` or in here.
+    pub(crate) implicit_open_bidi: BTreeSet<u64>,
+    /// Same for peer-initiated uni streams.
+    pub(crate) implicit_open_uni: BTreeSet<u64>,
+    /// Final size of the most recently retired peer streams, so a frame
+    /// claiming bytes past it can still be rejected as FINAL_SIZE_ERROR
+    /// (RFC 9000 §4.5). Bounded to [`RETIRED_FINAL_SIZES`] entries, oldest
+    /// (lowest id) evicted first; a late frame on an evicted stream is
+    /// silently discarded.
+    pub(crate) retired_final_size: BTreeMap<u64, u64>,
     /// Size of the bidi stream-credit window: the `initial_max_streams_bidi`
     /// WE advertised. Fresh credit is granted as `peer_bidi_closed + window`,
     /// so this stays FIXED for the connection's lifetime (unlike
@@ -298,8 +331,11 @@ pub(crate) struct Streams {
     /// independently of whether the bytes have become contiguous (which
     /// is what `RecvStream::on_data` tracks).
     ///
-    /// Persists across stream close so a late retransmit of an
-    /// already-closed stream's tail never re-charges conn-level credit.
+    /// Holds an entry only while the stream is live in [`Self::map`]: on
+    /// retirement the entry moves to [`Self::retired_final_size`], and a
+    /// late retransmit on a retired stream is never charged at all
+    /// (`on_stream` returns before the charge). Keeping the entries forever
+    /// let a peer grow this map by one entry per stream it ever opened.
     pub(crate) stream_high_offset: BTreeMap<u64, u64>,
 
     /// True if a DATA_BLOCKED frame at level `conn_send_max` is queued.
@@ -373,6 +409,9 @@ impl Streams {
             peer_uni_used: 0,
             peer_bidi_closed: 0,
             peer_uni_closed: 0,
+            implicit_open_bidi: BTreeSet::new(),
+            implicit_open_uni: BTreeSet::new(),
+            retired_final_size: BTreeMap::new(),
             self_max_bidi_window: our_params.initial_max_streams_bidi.unwrap_or(0),
             self_max_uni_window: our_params.initial_max_streams_uni.unwrap_or(0),
             next_local_bidi: next_bidi,
@@ -710,15 +749,17 @@ impl Streams {
         // progress) but runs it strictly after stream admission.
         if !self.ensure_remote_stream_exists(id)? {
             // QUIC-A2: the stream reached a terminal state and was
-            // retired. Its final size is still recorded in
-            // `stream_high_offset`, so a late retransmit is discarded
-            // while a frame claiming bytes PAST the final size is still
-            // FINAL_SIZE_ERROR (RFC 9000 §4.5). No connection-level
-            // credit is charged: those bytes were charged (and returned)
-            // while the stream was live.
+            // retired. While its final size is still recorded in
+            // `retired_final_size`, a late retransmit is discarded and a
+            // frame claiming bytes PAST the final size is still
+            // FINAL_SIZE_ERROR (RFC 9000 §4.5); once that bounded record
+            // has forgotten the stream, any late frame is discarded. No
+            // connection-level credit is charged either way: those bytes
+            // were charged (and returned) while the stream was live.
             let end = offset.saturating_add(data.len() as u64);
-            let high = self.stream_high_offset.get(&id).copied().unwrap_or(0);
-            if end > high {
+            if let Some(&high) = self.retired_final_size.get(&id)
+                && end > high
+            {
                 return Err(StreamError::FinalSize);
             }
             return Ok(());
@@ -1511,12 +1552,15 @@ impl Streams {
     ///
     /// Peer-opened streams used to live in [`Self::map`] forever, so a peer
     /// could turn ~3 wire bytes into a permanent per-stream allocation. A
-    /// retired stream is dropped from `map`, `readable` and the ready
-    /// queue; its entry in [`Self::stream_high_offset`] is KEPT (and
-    /// force-created if absent) because that map is what tells a late frame
-    /// on a CLOSED stream apart from the first frame of a NEVER-OPENED one
-    /// — without it, retiring would let a peer resurrect a finished
-    /// stream and replay its bytes.
+    /// retired stream is dropped from `map`, `readable`, the ready queue
+    /// and [`Self::stream_high_offset`]; its final size moves to the
+    /// bounded [`Self::retired_final_size`]. Retirement itself needs no
+    /// per-stream record: a peer ordinal below `peer_*_used` that is
+    /// neither live nor in [`Self::implicit_open_bidi`] /
+    /// [`Self::implicit_open_uni`] is retired, so a late frame cannot
+    /// resurrect a finished stream and replay its bytes — and, unlike the
+    /// per-stream map this replaced, nothing here grows with the number
+    /// of streams the peer has ever opened.
     ///
     /// Only peer-initiated streams are retired: a locally-opened id missing
     /// from `map` is a STREAM_STATE_ERROR, and we must not turn a late
@@ -1545,8 +1589,11 @@ impl Streams {
             .as_ref()
             .map(|r| r.fin_offset.unwrap_or(r.next_offset))
             .unwrap_or(0);
-        let entry = self.stream_high_offset.entry(id).or_insert(0);
-        *entry = (*entry).max(high);
+        let high = high.max(self.stream_high_offset.remove(&id).unwrap_or(0));
+        self.retired_final_size.insert(id, high);
+        while self.retired_final_size.len() > RETIRED_FINAL_SIZES {
+            self.retired_final_size.pop_first();
+        }
         self.map.remove(&id);
         self.readable.remove(&id);
         if self.ready_set.remove(&id) {
@@ -1579,8 +1626,18 @@ impl Streams {
             // didn't. Per RFC 9000 §19.8 this is STREAM_STATE_ERROR.
             return Err(StreamError::StreamState);
         }
-        if self.stream_high_offset.contains_key(&id) {
-            // Retired by `reap_if_terminal`, not new.
+        // Stream number (ordinal) within its type: id / 4.
+        let ordinal = id / 4;
+        let (used, implicit) = if sid.is_bidi() {
+            (self.peer_bidi_used, &self.implicit_open_bidi)
+        } else {
+            (self.peer_uni_used, &self.implicit_open_uni)
+        };
+        // Below the high-water mark of streams the peer has opened, an
+        // ordinal that is not live and was not implicitly opened has been
+        // retired by `reap_if_terminal` — not new. Its frame is ignored.
+        let implicitly_opened = ordinal < used;
+        if implicitly_opened && !implicit.contains(&ordinal) {
             return Ok(false);
         }
         // QUIC-A2 — hard ceiling on live stream state, independent of the
@@ -1588,25 +1645,34 @@ impl Streams {
         if self.map.len() >= self.live_stream_cap() {
             return Err(StreamError::StreamLimit);
         }
-        // Stream-limit check (RFC 9000 §4.6).
+        // Stream-limit check (RFC 9000 §4.6): the count of streams the peer
+        // has opened, which this id may raise to `ordinal + 1`. An
+        // implicitly-opened ordinal is already counted.
         if sid.is_bidi() {
-            // Stream number = (id - 1) / 4 + 1 for server-initiated bidi,
-            // or id/4 + 1 for client-initiated bidi. We just compare the
-            // count of streams the peer has opened.
-            let used = self.peer_bidi_used.max((id / 4) + 1);
+            let used = self.peer_bidi_used.max(ordinal + 1);
             if used > self.self_max_bidi {
                 return Err(StreamError::StreamLimit);
             }
+            // RFC 9000 §3.2 — the ordinals skipped over are now open too.
+            // Bounded: `used - peer_bidi_closed` never exceeds the window
+            // we advertised, and every such ordinal is either live in
+            // `map` or listed here.
+            self.implicit_open_bidi
+                .extend(self.peer_bidi_used.min(ordinal)..ordinal);
+            self.implicit_open_bidi.remove(&ordinal);
             self.peer_bidi_used = used;
             let peer_max_data = self.peer_initial_max_stream_data_bidi_local;
             let self_max_data = self.self_initial_max_stream_data_bidi_remote;
             self.map
                 .insert(id, Stream::new_bidi(sid, peer_max_data, self_max_data));
         } else {
-            let used = self.peer_uni_used.max((id / 4) + 1);
+            let used = self.peer_uni_used.max(ordinal + 1);
             if used > self.self_max_uni {
                 return Err(StreamError::StreamLimit);
             }
+            self.implicit_open_uni
+                .extend(self.peer_uni_used.min(ordinal)..ordinal);
+            self.implicit_open_uni.remove(&ordinal);
             self.peer_uni_used = used;
             let self_max_data = self.self_initial_max_stream_data_uni;
             self.map.insert(id, Stream::new_recv(sid, self_max_data));
@@ -1789,6 +1855,122 @@ mod tests {
         // A late RESET_STREAM / STOP_SENDING / MAX_STREAM_DATA is ignored.
         s.on_reset(2, 1, 2).expect("late reset ignored");
         assert!(s.map.is_empty());
+    }
+
+    /// Retirement bookkeeping must not grow with the number of peer streams
+    /// ever opened. `stream_high_offset` used to keep one entry per retired
+    /// stream for the life of the connection, so a peer churning streams
+    /// grew our memory without bound. Every structure involved is now
+    /// bounded — by the live-stream population, the advertised stream
+    /// window or a fixed cap — while the retired/implicitly-open
+    /// distinction stays exact.
+    #[test]
+    fn retired_peer_stream_bookkeeping_stays_bounded() {
+        let our = params_with(1 << 16, 1 << 30, 8);
+        let peer = params_with(1 << 16, 1 << 30, 8);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        let mut buf = [0u8; 8];
+        let churn = 20_000u64;
+        // Client-initiated uni ids 2, 6, 10, ...: open with data + FIN, read
+        // to completion (which retires the stream).
+        for i in 0..churn {
+            let id = i * 4 + 2;
+            s.on_stream(id, 0, true, b"x").expect("open");
+            let (n, fin) = s.read(StreamId(id), &mut buf).expect("read");
+            assert_eq!((n, fin), (1, true));
+            // Feed it a while after: the stream is on record as retired.
+            if i >= 3 {
+                let old = (i - 3) * 4 + 2;
+                s.on_stream(old, 0, true, b"x")
+                    .expect("late retransmit ignored");
+            }
+        }
+        assert!(s.map.is_empty());
+        assert_eq!(s.peer_uni_closed, churn);
+        assert!(
+            s.stream_high_offset.is_empty(),
+            "no high-water entry survives retirement"
+        );
+        assert!(
+            s.retired_final_size.len() <= RETIRED_FINAL_SIZES,
+            "the final-size record is capped, got {}",
+            s.retired_final_size.len()
+        );
+        assert!(s.implicit_open_uni.is_empty());
+        // A late frame on a long-forgotten stream is silently discarded
+        // (RFC 9000 §4.5 only says SHOULD for the final-size check) and
+        // does not resurrect it; a recently retired one still gets the
+        // FINAL_SIZE_ERROR.
+        s.on_stream(2, 0, false, b"xyz")
+            .expect("forgotten stream: ignored");
+        assert!(s.map.is_empty(), "retired stream was resurrected");
+        assert_eq!(
+            s.on_stream((churn - 1) * 4 + 2, 0, false, b"xyz"),
+            Err(StreamError::FinalSize)
+        );
+
+        // Same churn with the lowest stream held open the whole time, so a
+        // "retired floor" alone would not help: still bounded.
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        s.on_stream(2, 0, false, b"x").expect("pinned open");
+        for i in 1..churn {
+            let id = i * 4 + 2;
+            s.on_stream(id, 0, true, b"x").expect("open");
+            let _ = s.read(StreamId(id), &mut buf).expect("read");
+        }
+        assert_eq!(s.map.len(), 1);
+        assert_eq!(s.stream_high_offset.len(), 1);
+        assert!(s.retired_final_size.len() <= RETIRED_FINAL_SIZES);
+        assert!(s.implicit_open_uni.is_empty());
+    }
+
+    /// RFC 9000 §3.2 / §2.1 — using a stream ID opens every lower-numbered
+    /// stream of the same type. With retirement no longer recorded per
+    /// stream, the streams the peer skipped over must still be told apart
+    /// from retired ones: they stay openable (bounded by the stream window),
+    /// while a retired ordinal below them is ignored.
+    #[test]
+    fn implicitly_opened_streams_are_not_mistaken_for_retired_ones() {
+        let our = params_with(1 << 16, 1 << 20, 8);
+        let peer = params_with(1 << 16, 1 << 20, 8);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        let mut buf = [0u8; 8];
+        // Open ordinal 3 (uni id 14) first: ordinals 0..3 are implicitly
+        // open and remembered as such.
+        s.on_stream(14, 0, true, b"x").expect("open 14");
+        assert_eq!(s.peer_uni_used, 4);
+        assert_eq!(
+            s.implicit_open_uni.iter().copied().collect::<Vec<_>>(),
+            alloc::vec![0, 1, 2]
+        );
+        // Retire ordinal 3.
+        let _ = s.read(StreamId(14), &mut buf).expect("read");
+        assert!(s.map.is_empty());
+        // A late frame on the retired ordinal is ignored ...
+        s.on_stream(14, 0, true, b"x").expect("ignored");
+        assert!(s.map.is_empty());
+        // ... while the implicitly-opened ordinal 1 (id 6) is a real stream
+        // the first time it carries data, and is then no longer "implicit".
+        s.on_stream(6, 0, false, b"hi")
+            .expect("implicitly-open stream");
+        assert_eq!(s.map.len(), 1);
+        assert_eq!(
+            s.implicit_open_uni.iter().copied().collect::<Vec<_>>(),
+            alloc::vec![0, 2]
+        );
+        assert_eq!(s.peer_uni_used, 4, "materializing it opens nothing new");
+        // The implicit set never exceeds the advertised window: ordinals
+        // 4..8 fit, ordinal 8 (id 34) is over the limit and leaves the
+        // bookkeeping untouched.
+        s.on_stream(30, 0, false, b"x").expect("ordinal 7");
+        assert_eq!(s.implicit_open_uni.len(), 5);
+        assert_eq!(
+            s.on_stream(34, 0, false, b"x"),
+            Err(StreamError::StreamLimit)
+        );
+        assert_eq!(s.implicit_open_uni.len(), 5);
+        assert_eq!(s.peer_uni_used, 8);
+        assert!(s.implicit_open_uni.len() as u64 + s.map.len() as u64 <= 8);
     }
 
     /// QUIC-A2: RESET_STREAM must not pin a stream slot forever. Reading
