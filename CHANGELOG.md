@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5](https://github.com/KarpelesLab/purecrypto/compare/v0.9.4...v0.9.5) - 2026-09-27
+
+### Added
+
+- *(ct)* Valgrind memcheck constant-time harness for x86_64 and aarch64
+
+### Fixed
+
+- *(bls)* keep the field arithmetic's masked reductions branch-free
+- *(rsa)* compute |p - q| in key generation without branching on p < q
+- *(mldsa)* decode a secret vector fully before rejecting a bad encoding
+- *(bignum)* test the to_be_bytes width without branching on secret bytes
+- *(rsa)* keep the barrel shifter and implicit-rejection merge branch-free
+
 ## [0.9.4](https://github.com/KarpelesLab/purecrypto/compare/v0.9.3...v0.9.4) - 2026-09-27
 
 ### Fixed
