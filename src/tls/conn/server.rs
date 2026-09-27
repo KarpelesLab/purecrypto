@@ -70,19 +70,49 @@ const SKIP_EARLY_DATA_OVERHEAD: usize = 4 * 1024;
 /// accepts a PSK binder records it here; a binder already in the set is
 /// refused for 0-RTT (the handshake proceeds with 1-RTT instead).
 ///
-/// The set is bounded; oldest entries are evicted in insertion order to keep
-/// memory bounded. This is a best-effort defense: the spec acknowledges that
-/// 0-RTT is inherently replayable across servers that do not share state.
+/// Entries live for [`REPLAY_WINDOW_RETENTION_MS`] — the longest a captured
+/// flight can still pass the §8.2 ticket-age freshness check — and only
+/// *expired* entries are ever evicted. When the set is full of live
+/// entries, 0-RTT is refused (1-RTT fallback) rather than making room:
+/// evicting a live binder to admit a new one would let an attacker with a
+/// single valid ticket flood the window with fresh binders, flush a
+/// victim's binder, and replay the victim's captured early data. This is
+/// still a best-effort defense: the spec acknowledges that 0-RTT is
+/// inherently replayable across servers that do not share state.
 #[cfg(feature = "std")]
 #[derive(Clone, Default)]
 pub struct ReplayWindow {
     inner: Arc<Mutex<ReplayWindowInner>>,
 }
 
+/// How long a binder stays in the [`ReplayWindow`]. RFC 8446 §8.2 admits a
+/// ClientHello whose reported ticket age is within
+/// [`MAX_TICKET_AGE_DEVIATION_MS`] of the server's expected age; the
+/// reported age is fixed in the captured flight while the expected age
+/// grows with time, so a flight first accepted with its age a full
+/// deviation *ahead* of expectation stays acceptable until it is a full
+/// deviation *behind* — `2 × MAX_TICKET_AGE_DEVIATION_MS` after first sight.
+/// The extra second covers the one-second granularity of the ticket's
+/// creation timestamp. Past that, the freshness check alone rejects the
+/// replay and the entry is dead weight.
+#[cfg(feature = "std")]
+const REPLAY_WINDOW_RETENTION_MS: u64 = 2 * MAX_TICKET_AGE_DEVIATION_MS + 1_000;
+
+/// Default [`ReplayWindow`] capacity: live binders it holds before 0-RTT is
+/// refused for lack of room. Sized so that saturating it costs an attacker
+/// this many handshakes per [`REPLAY_WINDOW_RETENTION_MS`] (each one a full
+/// binder verification on the server) while keeping the worst-case footprint
+/// at a few megabytes.
+#[cfg(feature = "std")]
+const REPLAY_WINDOW_DEFAULT_CAPACITY: usize = 16 * 1024;
+
 #[cfg(feature = "std")]
 struct ReplayWindowInner {
     seen: std::collections::HashSet<Vec<u8>>,
-    order: std::collections::VecDeque<Vec<u8>>,
+    /// Insertion order, each with the instant its entry expires. Insertions
+    /// are timestamped monotonically, so the front is always the oldest and
+    /// expiry sweeps stop at the first live entry.
+    order: std::collections::VecDeque<(Vec<u8>, std::time::Instant)>,
     cap: usize,
 }
 
@@ -92,32 +122,61 @@ impl Default for ReplayWindowInner {
         ReplayWindowInner {
             seen: Default::default(),
             order: Default::default(),
-            cap: 1024,
+            cap: REPLAY_WINDOW_DEFAULT_CAPACITY,
         }
     }
 }
 
 #[cfg(feature = "std")]
 impl ReplayWindow {
-    /// A fresh anti-replay set with a default capacity of 1024 entries.
+    /// A fresh anti-replay set with the default capacity
+    /// ([`REPLAY_WINDOW_DEFAULT_CAPACITY`] live binders).
     pub fn new() -> Self {
         ReplayWindow::default()
     }
 
+    /// A fresh anti-replay set holding at most `cap` live binders. Once full,
+    /// 0-RTT is refused until entries expire — size it for the expected
+    /// 0-RTT handshake rate over [`REPLAY_WINDOW_RETENTION_MS`].
+    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
+    pub fn with_capacity(cap: usize) -> Self {
+        ReplayWindow {
+            inner: Arc::new(Mutex::new(ReplayWindowInner {
+                cap: cap.max(1),
+                ..Default::default()
+            })),
+        }
+    }
+
     /// Records `binder` and returns whether it was a new entry. `true` means
-    /// the connection may accept 0-RTT; `false` indicates a replay.
+    /// the connection may accept 0-RTT; `false` indicates a replay — or a
+    /// window full of live binders, in which case 0-RTT is refused (fail
+    /// closed) rather than a live binder evicted.
     fn check_and_insert(&self, binder: &[u8]) -> bool {
+        self.check_and_insert_at(binder, std::time::Instant::now())
+    }
+
+    /// [`check_and_insert`](Self::check_and_insert) against an explicit
+    /// clock, so tests can drive expiry deterministically.
+    fn check_and_insert_at(&self, binder: &[u8], now: std::time::Instant) -> bool {
         let mut inner = self.inner.lock().expect("replay window poisoned");
+        // Sweep expired entries first: they can no longer pass the
+        // freshness check, so they are only occupying capacity.
+        while let Some((_, expiry)) = inner.order.front()
+            && *expiry <= now
+        {
+            let (old, _) = inner.order.pop_front().expect("front just observed");
+            inner.seen.remove(&old);
+        }
         if inner.seen.contains(binder) {
             return false;
         }
-        if inner.order.len() >= inner.cap
-            && let Some(old) = inner.order.pop_front()
-        {
-            inner.seen.remove(&old);
+        if inner.order.len() >= inner.cap {
+            return false;
         }
+        let expiry = now + std::time::Duration::from_millis(REPLAY_WINDOW_RETENTION_MS);
         inner.seen.insert(binder.to_vec());
-        inner.order.push_back(binder.to_vec());
+        inner.order.push_back((binder.to_vec(), expiry));
         true
     }
 }
@@ -227,9 +286,11 @@ pub(crate) struct ServerConfig {
     /// not advertise it in NewSessionTickets and does not accept early
     /// data even if offered.
     max_early_data_size: u32,
-    /// Optional anti-replay set: a binder presented twice (within this
-    /// process's lifetime) is refused for 0-RTT. The same `ReplayWindow`
-    /// should be shared across all `ServerConfig`s in the same process.
+    /// Optional anti-replay set: a binder presented twice within the
+    /// [`REPLAY_WINDOW_RETENTION_MS`] freshness horizon is refused for
+    /// 0-RTT, as is any binder while the set is full of live entries. The
+    /// same `ReplayWindow` should be shared across all `ServerConfig`s in
+    /// the same process.
     #[cfg(feature = "std")]
     replay_window: Option<ReplayWindow>,
     /// Client-certificate authentication policy. `None` (default) skips
@@ -3891,6 +3952,47 @@ mod tests {
             server.server_hs_secret_bytes(),
             from_hex_vec("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
         );
+    }
+
+    /// The 0-RTT anti-replay window must never make room for a new binder by
+    /// dropping a live one: an attacker holding one valid ticket could
+    /// otherwise flood it with fresh binders inside the §8.2 freshness
+    /// window, flush a victim's binder, and replay the victim's early data.
+    /// A full window refuses 0-RTT instead, and only expiry frees a slot.
+    #[cfg(feature = "std")]
+    #[test]
+    fn replay_window_does_not_evict_live_binders_when_full() {
+        use std::time::{Duration, Instant};
+        let window = ReplayWindow::with_capacity(4);
+        let t0 = Instant::now();
+        let victim = [0xEEu8; 32];
+        assert!(window.check_and_insert_at(&victim, t0));
+
+        // The attacker's flood fills the remaining capacity ...
+        for i in 0u8..3 {
+            assert!(window.check_and_insert_at(&[i; 32], t0 + Duration::from_millis(1)));
+        }
+        // ... and every further binder is refused while the window is full
+        // of live entries — the victim's binder is NOT pushed out.
+        for i in 3u8..40 {
+            assert!(
+                !window.check_and_insert_at(&[i; 32], t0 + Duration::from_millis(2)),
+                "a full window must refuse 0-RTT rather than evict"
+            );
+        }
+        assert!(
+            !window.check_and_insert_at(&victim, t0 + Duration::from_millis(3)),
+            "the victim's binder must still be remembered after the flood"
+        );
+
+        // Entries expire only once a captured flight can no longer pass the
+        // freshness check; then capacity is reclaimed and the (now
+        // unreplayable) victim binder is a fresh entry again.
+        let just_before = t0 + Duration::from_millis(REPLAY_WINDOW_RETENTION_MS - 1);
+        assert!(!window.check_and_insert_at(&[0x99u8; 32], just_before));
+        let after = t0 + Duration::from_millis(REPLAY_WINDOW_RETENTION_MS + 2);
+        assert!(window.check_and_insert_at(&[0x99u8; 32], after));
+        assert!(window.check_and_insert_at(&victim, after));
     }
 
     /// A server flight suspended for an external `CertificateVerify`
