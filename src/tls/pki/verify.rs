@@ -370,8 +370,11 @@ fn verify_chain_inner(
             // Path closes here: certs[0..=i] is the validated path. certs[i]
             // may still be revoked by a CRL signed by the anchor.
             // The anchor's full certificate is not retained by the store, so
-            // its keyUsage cannot be consulted here (RFC 5280 excludes the
-            // trust anchor from constraint processing anyway, §6.1).
+            // no `issuer_cert` is passed and its keyUsage does not gate CRL
+            // signing here (RFC 5280 excludes the trust anchor from
+            // constraint processing anyway, §6.1). Whether the anchor may
+            // *issue* certs[i] at all is checked by
+            // `enforce_anchor_constraints` once the path is closed.
             check_revocation(&certs[i], &anchor.key, None, crls, now, policy)?;
             anchor_at = Some(i + 1);
             matched_anchor = Some(anchor);
@@ -705,10 +708,23 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
 /// `basicConstraints: CA:TRUE, pathlen:0` or `extKeyUsage: codeSigning` was
 /// previously unconstrained in practice. RFC 5937 lets a relying party apply
 /// such constraints, and OpenSSL — which keeps the root in the chain — does.
-/// Both checks fire **only when the anchor actually carries the extension**,
+/// Every check fires **only when the anchor actually carries the extension**,
 /// so an ordinary root (the overwhelming majority: of the 117 embedded roots,
 /// two carry a pathLen and none carries an EKU) validates exactly as before.
 ///
+/// * an anchor that *issues* a certificate other than itself must be
+///   allowed to issue certificates at all: `basicConstraints`, when present,
+///   must say `CA:TRUE`, and `keyUsage`, when present, must include
+///   `keyCertSign` — the same two rules [`enforce_constraints`] applies to
+///   in-chain CAs (RFC 5280 §4.2.1.9 / §4.2.1.3; OpenSSL
+///   `X509_V_ERR_INVALID_CA` / `X509_V_ERR_KEYUSAGE_NO_CERTSIGN`). The case
+///   this closes is the pinning pattern: a server's own self-signed
+///   end-entity certificate (`CA:FALSE`, `digitalSignature`) added to the
+///   store as its own anchor. That must keep validating the pinned
+///   certificate itself — the path is just the leaf, and its subject and
+///   SPKI are the anchor's — but the pinned key must NOT be able to sign a
+///   certificate for some other name and have it accepted, which is exactly
+///   what a `CA:FALSE` anchor without this check could do.
 /// * `pathLenConstraint = N` bounds the number of non-self-issued
 ///   intermediates between the anchor and the leaf — here, everything in
 ///   `path` above the leaf (RFC 5280 §4.2.1.9 / §6.1.4(h)).
@@ -719,6 +735,25 @@ fn enforce_anchor_constraints(
     anchor: &super::store::TrustAnchor,
     purpose: ChainPurpose,
 ) -> Result<(), Error> {
+    // The topmost certificate of the validated path is the one the anchor
+    // signed. It is the anchor "itself" — the pin case — only when it is the
+    // whole path and carries the anchor's own subject and SPKI; a certificate
+    // the anchor's key signed for a different name or a different key is an
+    // issuance, whatever its serial or extensions say.
+    let top = path.last().ok_or(Error::BadCertificate)?;
+    let is_self = path.len() == 1
+        && top.subject_der().map_err(|_| Error::BadCertificate)? == anchor.subject_der.as_slice()
+        && top.spki_der().map_err(|_| Error::BadCertificate)? == anchor.spki_der.as_slice();
+    if !is_self {
+        if anchor.is_ca == Some(false) {
+            return Err(Error::BadCertificate);
+        }
+        if let Some(mask) = anchor.key_usage
+            && (mask & KU_KEY_CERT_SIGN) == 0
+        {
+            return Err(Error::BadCertificate);
+        }
+    }
     if let Some(plc) = anchor.path_len_constraint {
         let intermediates_below = path[1..]
             .iter()
@@ -2974,6 +3009,191 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    /// Regression: a `CA:FALSE` (or `keyUsage`-without-`keyCertSign`)
+    /// certificate added to the store as a trust anchor — the pinning
+    /// pattern — must anchor *itself* and nothing else. Before the store
+    /// retained the anchor's `basicConstraints.cA` / `keyUsage`, the pinned
+    /// key could sign a certificate for any other name and it validated.
+    #[test]
+    fn non_ca_anchor_cannot_issue_other_certificates() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::{
+            CertSigner, DistinguishedName, Extension, GeneralName, KeyUsageBits,
+            extension::{basic_constraints, extended_key_usage, key_usage, subject_alt_name},
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"non-ca-anchor", b"n", &[]);
+        let pinned_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let other_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let pinned_signer = CertSigner::Ecdsa(&pinned_key);
+        let pinned_name = DistinguishedName::common_name("pinned.example");
+        let pinned_pub = crate::x509::AnyPublicKey::Ecdsa(pinned_key.public_key());
+        let other_pub = crate::x509::AnyPublicKey::Ecdsa(other_key.public_key());
+        let leaf_exts = |host: &str| {
+            [
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+                subject_alt_name(&[GeneralName::Dns(host.into())]),
+            ]
+        };
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let check = |anchor: &Certificate, chain: alloc::vec::Vec<alloc::vec::Vec<u8>>| {
+            let mut store = RootCertStore::new();
+            store.add_der(anchor.to_der().to_vec()).unwrap();
+            verify_chain(&store, &chain, Some(&now), &policy()).map(|_| ())
+        };
+        // Certificates the pinned key signs for someone else: a different
+        // name with a different key (the attack), the pinned name re-keyed,
+        // and a CA:TRUE "intermediate" that then issues a leaf.
+        let issue = |subject: &str, key: &crate::x509::AnyPublicKey, exts: &[Extension]| {
+            Certificate::issue_with_extensions(
+                &pinned_signer,
+                &pinned_name,
+                &DistinguishedName::common_name(subject),
+                key,
+                &validity(),
+                7,
+                exts,
+            )
+            .unwrap()
+        };
+        let victim = issue("victim.example", &other_pub, &leaf_exts("victim.example"));
+        let rekeyed = issue("pinned.example", &other_pub, &leaf_exts("pinned.example"));
+        let sub_ca = issue(
+            "sub-ca",
+            &other_pub,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            ],
+        );
+        let deep = Certificate::issue_with_extensions(
+            &CertSigner::Ecdsa(&other_key),
+            &DistinguishedName::common_name("sub-ca"),
+            &DistinguishedName::common_name("deep.example"),
+            &pinned_pub,
+            &validity(),
+            8,
+            &leaf_exts("deep.example"),
+        )
+        .unwrap();
+        // The pinned certificate re-issued to itself (same subject, same
+        // key, new serial): still the pin, not an issuance.
+        let renewed = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            9,
+            &leaf_exts("pinned.example"),
+        )
+        .unwrap();
+
+        // Case 1: CA:FALSE + digitalSignature — the pinned end-entity cert.
+        let pinned = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            1,
+            &leaf_exts("pinned.example"),
+        )
+        .unwrap();
+        assert_eq!(
+            check(&pinned, alloc::vec![pinned.to_der().to_vec()]),
+            Ok(())
+        );
+        assert_eq!(
+            check(&pinned, alloc::vec![renewed.to_der().to_vec()]),
+            Ok(())
+        );
+        assert_eq!(
+            check(&pinned, alloc::vec![victim.to_der().to_vec()]),
+            Err(Error::BadCertificate),
+            "a CA:FALSE anchor must not vouch for another name"
+        );
+        // Supplying the anchor's own certificate below the leaf changes
+        // nothing: the path closes at the leaf.
+        assert_eq!(
+            check(
+                &pinned,
+                alloc::vec![victim.to_der().to_vec(), pinned.to_der().to_vec()]
+            ),
+            Err(Error::BadCertificate)
+        );
+        assert_eq!(
+            check(&pinned, alloc::vec![rekeyed.to_der().to_vec()]),
+            Err(Error::BadCertificate),
+            "a CA:FALSE anchor must not vouch for another key under its own name"
+        );
+        assert_eq!(
+            check(
+                &pinned,
+                alloc::vec![deep.to_der().to_vec(), sub_ca.to_der().to_vec()]
+            ),
+            Err(Error::BadCertificate),
+            "a CA:FALSE anchor must not issue an intermediate"
+        );
+
+        // Case 2: CA:TRUE but keyUsage without keyCertSign — may not issue.
+        let ca_no_certsign = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            2,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE | KeyUsageBits::CRL_SIGN),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            check(
+                &ca_no_certsign,
+                alloc::vec![ca_no_certsign.to_der().to_vec()]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check(&ca_no_certsign, alloc::vec![victim.to_der().to_vec()]),
+            Err(Error::BadCertificate),
+            "keyUsage without keyCertSign must not issue"
+        );
+
+        // Case 3: neither extension present — unconstrained, exactly as
+        // before (v1-style roots must keep working).
+        let bare = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            3,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(check(&bare, alloc::vec![victim.to_der().to_vec()]), Ok(()));
+        assert_eq!(
+            check(
+                &bare,
+                alloc::vec![deep.to_der().to_vec(), sub_ca.to_der().to_vec()]
+            ),
+            Ok(())
+        );
+
+        // Case 4: a proper CA anchor is unaffected.
+        let ca = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            4,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            ],
+        )
+        .unwrap();
+        assert_eq!(check(&ca, alloc::vec![victim.to_der().to_vec()]), Ok(()));
     }
 
     /// Regression: a SAN dNSName with a trailing dot used to slip past an

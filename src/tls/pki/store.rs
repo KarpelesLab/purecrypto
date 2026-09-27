@@ -32,6 +32,24 @@ pub(crate) struct TrustAnchor {
     /// carries — and OpenSSL does. Enforced only when actually present, so
     /// anchors without the field behave exactly as before.
     pub(crate) path_len_constraint: Option<u32>,
+    /// The anchor's own `basicConstraints.cA` flag, `None` when the
+    /// certificate carries no `basicConstraints` extension (v1 roots, and a
+    /// few old v3 ones). A trust anchor is normally "a name and a key" (RFC
+    /// 5280 §6.1), but the pinning pattern — adding a server's own
+    /// *end-entity* certificate to the store so it anchors itself — puts
+    /// `CA:FALSE` certificates in here too. Such an anchor must be able to
+    /// vouch for itself and nothing else: without this flag the pinned
+    /// key could sign a certificate for any name and the result would
+    /// validate (OpenSSL: `X509_V_ERR_INVALID_CA`). Only consulted when the
+    /// anchor issues a certificate *other than itself*.
+    pub(crate) is_ca: Option<bool>,
+    /// The anchor's own `keyUsage` bit mask (wire order, bit 0 = MSB), `None`
+    /// when the extension is absent. Like `is_ca`, consulted only when the
+    /// anchor issues a certificate other than itself: an anchor that carries
+    /// `keyUsage` without `keyCertSign` — again the pinned end-entity case,
+    /// typically `digitalSignature` only — may not issue certificates (RFC
+    /// 5280 §4.2.1.3; OpenSSL: `X509_V_ERR_KEYUSAGE_NO_CERTSIGN`).
+    pub(crate) key_usage: Option<u16>,
     /// The anchor's own `extKeyUsage` OIDs, empty when it declared none. Like
     /// `path_len_constraint`, enforced only when non-empty (RFC 5937): an
     /// EKU-scoped root must permit the purpose the chain is being validated
@@ -89,10 +107,16 @@ impl RootCertStore {
         // validator can honour them (see [`TrustAnchor`]). Both are optional
         // fields; an anchor that carries neither is unconstrained exactly as
         // before. A malformed extension is fail-closed like nameConstraints.
-        let path_len_constraint = cert
+        let basic_constraints = cert
             .basic_constraints()
-            .map_err(|_| Error::BadCertificate)?
-            .and_then(|(is_ca, plc)| if is_ca { plc } else { None });
+            .map_err(|_| Error::BadCertificate)?;
+        let path_len_constraint =
+            basic_constraints.and_then(|(is_ca, plc)| if is_ca { plc } else { None });
+        // Whether the anchor may issue certificates at all (see
+        // [`TrustAnchor::is_ca`] / [`TrustAnchor::key_usage`]): a pinned
+        // end-entity certificate anchors itself and nothing else.
+        let is_ca = basic_constraints.map(|(is_ca, _)| is_ca);
+        let key_usage = cert.key_usage().map_err(|_| Error::BadCertificate)?;
         let extended_key_usages = cert
             .extended_key_usages()
             .map_err(|_| Error::BadCertificate)?;
@@ -102,6 +126,8 @@ impl RootCertStore {
             spki_der,
             name_constraints,
             path_len_constraint,
+            is_ca,
+            key_usage,
             extended_key_usages,
         });
         Ok(())
@@ -211,8 +237,10 @@ mod embedded_roots_tests {
 
     /// RFC 5937 anchor constraints are enforced only when the anchor declares
     /// them, so they must not disturb the embedded bundle: no embedded root
-    /// carries an `extKeyUsage`, and the handful that carry a
-    /// `pathLenConstraint` all leave room for at least one intermediate.
+    /// carries an `extKeyUsage`, the handful that carry a
+    /// `pathLenConstraint` all leave room for at least one intermediate, and
+    /// none says `CA:FALSE` or carries a `keyUsage` without `keyCertSign`
+    /// (either would stop the root issuing anything).
     #[test]
     fn embedded_roots_carry_no_blocking_self_constraints() {
         let store = RootCertStore::with_embedded_roots();
@@ -223,6 +251,19 @@ mod embedded_roots_tests {
             );
             if let Some(plc) = anchor.path_len_constraint {
                 assert!(plc >= 1, "an embedded root declares pathlen:0");
+            }
+            assert_ne!(
+                anchor.is_ca,
+                Some(false),
+                "an embedded root declares CA:FALSE"
+            );
+            if let Some(ku) = anchor.key_usage {
+                // keyCertSign is bit 5, i.e. `0x04` in the MSB-first mask
+                // `Certificate::key_usage` returns.
+                assert!(
+                    ku & 0x04 != 0,
+                    "an embedded root declares keyUsage without keyCertSign"
+                );
             }
         }
     }
