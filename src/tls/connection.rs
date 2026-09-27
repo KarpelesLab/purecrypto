@@ -1482,17 +1482,13 @@ pub(crate) fn tls13_client_config(
         Tls13Transport::Tls => {
             cc.cipher_suites = cipher_suites.map(<[u16]>::to_vec);
             // Offer TLS 1.2 alongside 1.3 when the configured range spans down
-            // to 1.2 and we are not resuming a (1.3-only) session — so a
-            // 1.2-only server can negotiate and the engine can downgrade.
-            // Pinned `min == 1.3` keeps a pure 1.3 ClientHello. A stored 1.2
-            // session keeps the 1.2 offer and presents its ticket; the
-            // downgraded engine picks the rest of the session up through
-            // `tls12_client_config`.
-            cc.offer_tls12 = min_version != ProtocolVersion::TLSv1_3
-                && !matches!(
-                    resumption,
-                    Some(ResumptionSession(ResumptionSessionKind::Tls13(_)))
-                );
+            // to 1.2 — so a 1.2-only server can negotiate and the engine can
+            // downgrade, whatever session is stored. Pinned `min == 1.3` keeps
+            // a pure 1.3 ClientHello. A stored 1.3 session rides as a PSK
+            // offer next to the 1.2 suites; a stored 1.2 session presents its
+            // ticket, and the downgraded engine picks the rest of it up
+            // through `tls12_client_config`.
+            cc.offer_tls12 = min_version != ProtocolVersion::TLSv1_3;
             if cc.offer_tls12
                 && let Some(ResumptionSession(ResumptionSessionKind::Tls12(s))) = resumption
             {
@@ -3046,6 +3042,67 @@ mod tests {
         let mut server3 = Connection::server(&tls13_server_cfg(false)).unwrap();
         drive_pair(&mut client3, &mut server3);
         assert_eq!(client3.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+    }
+
+    /// A stored TLS 1.3 session no longer pins the version-spanning client to
+    /// a pure-1.3 hello: it resumes against a 1.3 server and still reaches a
+    /// 1.2-only one (full 1.2 handshake). A session that makes the client
+    /// offer 0-RTT fails against 1.2 instead, per RFC 8446 §4.2.10.
+    #[test]
+    fn auto_client_with_tls13_session_still_offers_tls12() {
+        fn psk_accepted(c: &Connection) -> bool {
+            match &c.inner {
+                Engine::ClientTlsAuto(a) => match &a.inner {
+                    ClientInner::Tls13(c13) => c13.psk_accepted(),
+                    ClientInner::Tls12(_) => false,
+                },
+                _ => panic!("expected the version-spanning client engine"),
+            }
+        }
+        let session_from = |server_cfg: &Config| {
+            let mut client = Connection::client(&auto_client_cfg()).unwrap();
+            let mut server = Connection::server(server_cfg).unwrap();
+            drive_pair(&mut client, &mut server);
+            assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+            client.take_session().expect("1.3 ticket")
+        };
+        let resuming = |session: ResumptionSession| {
+            Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3)
+                .server_name("tls.example")
+                .verify_certificates(false)
+                .resumption_session(session)
+                .build()
+        };
+
+        let server13 = tls13_server_cfg(true);
+        let cfg = resuming(session_from(&server13));
+        let mut client = Connection::client(&cfg).unwrap();
+        let mut server = Connection::server(&server13).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+        assert!(psk_accepted(&client), "the 1.3 session must resume");
+
+        let mut client = Connection::client(&cfg).unwrap();
+        let mut server = Connection::server(&tls12_server_cfg()).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
+
+        // 0-RTT-capable session: the hello offers early data, so a 1.2
+        // ServerHello must fail the connection.
+        let mut server13_0rtt = tls13_server_cfg(true);
+        server13_0rtt.max_early_data_size = 1024;
+        let cfg = resuming(session_from(&server13_0rtt));
+        let mut client = Connection::client(&cfg).unwrap();
+        let mut server = Connection::server(&tls12_server_cfg()).unwrap();
+        let _ = client.handshake();
+        server.feed(&client.pop().unwrap()).unwrap();
+        let _ = server.handshake();
+        assert!(matches!(
+            client.feed(&server.pop().unwrap()),
+            Err(Error::UnsupportedVersion)
+        ));
     }
 
     /// Auto client ↔ auto server: both default configs interoperate, and 1.3 is

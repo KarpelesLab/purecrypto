@@ -373,8 +373,9 @@ pub(crate) struct ClientConfig {
     /// ECDHE-AEAD suites, `supported_versions = [1.3, 1.2]`, plus
     /// `ec_point_formats` / `extended_master_secret`) so a 1.2-only server can
     /// negotiate; on a 1.2 ServerHello the engine signals a downgrade rather
-    /// than erroring. Set by the version-spanning client front-end; `false`
-    /// keeps a pure-1.3 ClientHello (pinned 1.3 or 1.3 resumption).
+    /// than erroring (unless 0-RTT was offered, RFC 8446 §4.2.10). Set by the
+    /// version-spanning client front-end; `false` keeps a pure-1.3
+    /// ClientHello (pinned 1.3). A TLS 1.3 PSK offer rides alongside.
     pub offer_tls12: bool,
     /// A stored TLS 1.2 session. When [`Self::offer_tls12`] is set, the
     /// ClientHello presents its RFC 5077 ticket in `session_ticket` together
@@ -1448,15 +1449,16 @@ impl ClientConnection {
             Vec::new()
         };
 
-        // If resuming, restrict the cipher-suite offer to suites whose hash
-        // matches the session's. The PSK binder and handshake key schedule
-        // are tied to that hash.
+        // If resuming, restrict the TLS 1.3 cipher-suite offer to suites whose
+        // hash matches the session's. The PSK binder and handshake key
+        // schedule are tied to that hash. TLS 1.2 suites (no 1.3 hash) stay:
+        // a version-spanning hello still lets a 1.2-only server negotiate.
         let session_hash = config.session.as_ref().map(|s| s.cipher_suite_hash);
         let effective_suites: Vec<CipherSuite> = match session_hash {
             Some(h) => suites
                 .iter()
                 .copied()
-                .filter(|s| suite_hash(*s) == Some(h))
+                .filter(|s| suite_hash(*s).is_none_or(|sh| sh == h))
                 .collect(),
             None => suites.to_vec(),
         };
@@ -2418,7 +2420,10 @@ impl ClientConnection {
             None => false,
         };
         if !selected_tls13 {
-            if self.offer_tls12 {
+            // RFC 8446 §4.2.10: "A client that attempts to send 0-RTT data
+            // MUST fail a connection if it receives a ServerHello with TLS
+            // 1.2 or older."
+            if self.offer_tls12 && !self.early_data_offered {
                 self.downgrade_to_tls12 = true;
                 return Ok(());
             }
