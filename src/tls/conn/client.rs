@@ -1730,6 +1730,10 @@ impl ClientConnection {
             extensions.push(ext::ec_point_formats());
             extensions.push(ext::extended_master_secret_empty());
             extensions.push(ext::renegotiation_info_empty());
+            // RFC 5077 §3.1: an empty `session_ticket` asks a 1.2 server to
+            // issue a ticket, so a 1.2 fallback can resume later through
+            // `ClientConnection12`. A 1.3 server ignores it (RFC 8446 §4.1.2).
+            extensions.push(ext::session_ticket(&[]));
         }
         // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
         // server name or the name is an IP literal (still verified against
@@ -4899,6 +4903,28 @@ mod tests {
                     sni,
                     "{name} (offer_tls12 = {offer_tls12})"
                 );
+            }
+        }
+    }
+
+    /// RFC 5077 §3.1: a hello that offers TLS 1.2 carries an empty
+    /// `session_ticket` so a 1.2 server issues a ticket; a pure-1.3 hello
+    /// has no use for the extension and omits it.
+    #[test]
+    fn version_spanning_hello_requests_a_session_ticket() {
+        for offer_tls12 in [false, true] {
+            let mut cfg = ClientConfig::new(RootCertStore::new());
+            cfg.offer_tls12 = offer_tls12;
+            let mut rng = HmacDrbg::<Sha256>::new(b"ch-ticket", b"nonce", &[]);
+            let mut client = ClientConnection::new(cfg, "example.com", &mut rng).unwrap();
+            let out = client.write_tls();
+            let msg = read_record(&out).unwrap().unwrap().fragment.to_vec();
+            let ch = ClientHello::decode(&msg[4..]).unwrap();
+            let ticket = ext::find(&ch.extensions, ExtensionType::SESSION_TICKET);
+            if offer_tls12 {
+                assert_eq!(ticket, Some(&[][..]));
+            } else {
+                assert!(ticket.is_none());
             }
         }
     }

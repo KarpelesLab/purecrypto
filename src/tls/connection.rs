@@ -2970,6 +2970,23 @@ mod tests {
         );
     }
 
+    /// RFC 5077 §3.1: the auto client's hybrid ClientHello requests a ticket,
+    /// so a 1.2 server with tickets enabled issues one and the downgraded
+    /// engine hands it back through `take_session`.
+    #[test]
+    fn auto_client_receives_a_tls12_session_ticket() {
+        let mut server_cfg = tls12_server_cfg();
+        server_cfg.ticket_key = Some([0x5a; 32].into());
+        let mut client = Connection::client(&auto_client_cfg()).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
+        let session = client
+            .take_session()
+            .expect("a 1.2 server with tickets on must issue one");
+        assert!(matches!(session.0, ResumptionSessionKind::Tls12(_)));
+    }
+
     /// Auto client ↔ auto server: both default configs interoperate, and 1.3 is
     /// preferred (the server picks the 1.3 engine for the hybrid ClientHello).
     #[test]
