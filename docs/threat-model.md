@@ -69,6 +69,14 @@ The implementations are built to withstand:
   runtime dependency is `compcol` (RFC 8879 cert compression, sibling project,
   outside the crypto trust boundary).
 - Callers persist stateful-signer key state correctly and do not reuse it.
+- Certificate validity is only as good as the clock the verifier is given.
+  The chain verifier takes the validation time as an `Option`: `None` skips
+  every validity check — certificate `notBefore` / `notAfter` and CRL
+  `thisUpdate` / `nextUpdate` — so an expired or not-yet-valid certificate
+  verifies. That form is only for callers that have already checked time
+  themselves or knowingly accept the risk. Under `std` the TLS engines supply
+  the system clock; without `std` there is no clock, and expiry can only be
+  enforced if the caller sets `Config::verification_time`.
 
 ## Residual risk
 

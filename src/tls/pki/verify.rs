@@ -177,7 +177,16 @@ pub(crate) fn leaf_issuer(
 /// the peer proves in its `CertificateVerify`.
 ///
 /// When `now` is `Some`, every certificate in the chain must be within its
-/// validity period at that time; pass `None` to skip the expiry check.
+/// validity period at that time (and a CRL outside its
+/// `thisUpdate..=nextUpdate` window is disregarded).
+///
+/// SECURITY: `now = None` **skips every validity check** — `notBefore`,
+/// `notAfter`, and CRL freshness — so an expired, or not-yet-valid,
+/// certificate verifies. It exists only for callers that have already
+/// checked time themselves or that knowingly accept that risk (e.g. a
+/// `no_std` target with no clock); it is never a safe default. The same
+/// holds for the `now` parameter of every other `verify_chain*` entry point
+/// in this module.
 ///
 /// `policy` is consulted for every signature in the chain (including the
 /// anchor signature on the topmost certificate). A chain whose certificate
@@ -206,6 +215,10 @@ pub(crate) fn verify_chain(
 /// chain issuer's key contains the cert's serial. CRLs signed by an unknown
 /// key, or whose issuer name does not appear in the chain, are silently
 /// ignored.
+///
+/// `now` is as for [`verify_chain`]: `None` skips all validity checks
+/// (certificate and CRL windows alike) and is only for callers that have
+/// already checked time or accept the risk.
 pub(crate) fn verify_chain_with_crls(
     store: &RootCertStore,
     crls: &CrlStore,
@@ -220,6 +233,9 @@ pub(crate) fn verify_chain_with_crls(
 /// the leaf key *and* the leaf's actual issuer within the validated path —
 /// for callers that go on to evaluate revocation data (a stapled OCSP
 /// response) keyed on the issuer.
+///
+/// `now` is as for [`verify_chain`]: `None` skips all validity checks and is
+/// only for callers that have already checked time or accept the risk.
 #[allow(dead_code)] // useful for tests / future internal callers
 pub(crate) fn verify_chain_with_crls_verified(
     store: &RootCertStore,
@@ -254,6 +270,11 @@ pub(crate) enum ChainPurpose {
     Client,
 }
 
+/// [`verify_chain`] for an explicit [`ChainPurpose`] (server or mTLS client
+/// leaf).
+///
+/// `now` is as for [`verify_chain`]: `None` skips all validity checks and is
+/// only for callers that have already checked time or accept the risk.
 #[allow(dead_code)] // useful for tests / future internal callers
 pub(crate) fn verify_chain_for_purpose(
     store: &RootCertStore,
@@ -276,6 +297,9 @@ pub(crate) fn verify_chain_for_purpose(
 /// is unchanged. When the caller supplies an initial policy set / requires an
 /// explicit policy, a path whose computed policy tree cannot satisfy the
 /// requirement is rejected with [`Error::BadCertificate`].
+///
+/// `now` is as for [`verify_chain`]: `None` skips all validity checks and is
+/// only for callers that have already checked time or accept the risk.
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn verify_chain_with_policy(
     store: &RootCertStore,
@@ -289,6 +313,11 @@ pub(crate) fn verify_chain_with_policy(
     verify_chain_inner(store, crls, chain, now, policy, purpose, policy_opts).map(|v| v.leaf_key)
 }
 
+/// [`verify_chain_with_crls`] for an explicit [`ChainPurpose`] — the entry
+/// point the TLS servers use for mTLS client chains.
+///
+/// `now` is as for [`verify_chain`]: `None` skips all validity checks and is
+/// only for callers that have already checked time or accept the risk.
 pub(crate) fn verify_chain_with_crls_for_purpose(
     store: &RootCertStore,
     crls: &CrlStore,
