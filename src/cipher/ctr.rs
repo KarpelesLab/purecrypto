@@ -108,13 +108,18 @@ impl<C: BlockCipher> Drop for Ctr<C> {
 impl<C: BlockCipher> ZeroizeOnDrop for Ctr<C> {}
 
 /// Increments a 16-byte big-endian counter in place, wrapping at 2¹²⁸.
+///
+/// Branchless: the carry is propagated through every byte rather than
+/// stopping at the first one that does not roll over. The initial counter
+/// is secret in some modes (EAX uses `OMAC⁰(nonce)`), and an early exit would
+/// let the per-block timing reveal how many low bytes of it are `0xff`.
 #[inline]
 fn increment(counter: &mut [u8; 16]) {
+    let mut carry = 1u16;
     for byte in counter.iter_mut().rev() {
-        *byte = byte.wrapping_add(1);
-        if *byte != 0 {
-            break;
-        }
+        let sum = u16::from(*byte) + carry;
+        *byte = sum as u8;
+        carry = sum >> 8;
     }
 }
 
@@ -250,5 +255,17 @@ mod tests {
         let mut all_ones = [0xffu8; 16];
         increment(&mut all_ones);
         assert_eq!(all_ones, [0u8; 16]);
+
+        // Carry chains of every length, against a u128 reference: the
+        // branchless propagation must neither stop early nor carry past a
+        // byte that did not roll over.
+        for k in 0..=16 {
+            let mut c = [0u8; 16];
+            c[16 - k..].fill(0xff);
+            c[..16 - k].fill(0x5a);
+            let expected = u128::from_be_bytes(c).wrapping_add(1).to_be_bytes();
+            increment(&mut c);
+            assert_eq!(c, expected, "carry through {k} bytes");
+        }
     }
 }
