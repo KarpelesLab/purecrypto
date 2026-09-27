@@ -447,9 +447,13 @@ pub fn decrypt<I: Instantiation>(key: &[u8], ctx: &[u8], ct: &[u8]) -> Result<Ve
         return Err(Error::Truncated);
     };
     let cipher = open_header::<I>(key, ctx, hdr.try_into().expect("56-byte header"))?;
-    let mut out = Vec::new();
+    // A chunk failing mid-stream leaves the authenticated prefix already
+    // decrypted in `out`; the wrapper wipes it (whole capacity) on the error
+    // path instead of freeing the plaintext as-is. `open` reserves the final
+    // size up front, so no earlier, unwiped reallocation is left behind.
+    let mut out = Zeroizing::new(Vec::new());
     cipher.open(body, &mut out)?;
-    Ok(out)
+    Ok(core::mem::take(&mut *out))
 }
 
 /// Streaming encryption: buffers up to 16 KiB of plaintext and emits each
