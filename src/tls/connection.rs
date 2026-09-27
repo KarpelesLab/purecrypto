@@ -1496,7 +1496,7 @@ pub(crate) fn tls13_client_config(
             if cc.offer_tls12
                 && let Some(ResumptionSession(ResumptionSessionKind::Tls12(s))) = resumption
             {
-                cc.tls12_session_ticket = Some(s.ticket.clone());
+                cc.tls12_session = Some(s.clone());
             }
             if let Some(rsl) = record_size_limit {
                 cc = cc.with_record_size_limit(rsl);

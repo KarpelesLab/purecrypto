@@ -376,13 +376,14 @@ pub(crate) struct ClientConfig {
     /// than erroring. Set by the version-spanning client front-end; `false`
     /// keeps a pure-1.3 ClientHello (pinned 1.3 or 1.3 resumption).
     pub offer_tls12: bool,
-    /// RFC 5077 ticket from a stored TLS 1.2 session. When [`Self::offer_tls12`]
-    /// is set, the ClientHello presents it in `session_ticket` together with a
-    /// fresh random `legacy_session_id`, so a 1.2 server can resume it
+    /// A stored TLS 1.2 session. When [`Self::offer_tls12`] is set, the
+    /// ClientHello presents its RFC 5077 ticket in `session_ticket` together
+    /// with a fresh random `legacy_session_id`, so a 1.2 server can resume it
     /// (§3.4) and the downgraded engine recognises the echo. A 1.3 server
-    /// ignores both. Dropped when it cannot fit a ClientHello or when real ECH
-    /// seals the hello.
-    pub tls12_session_ticket: Option<Vec<u8>>,
+    /// ignores both. Dropped when [`super::StoredSession12`]'s scoping rules
+    /// refuse it (other server name, weaker verification, expired), when the
+    /// ticket cannot fit a ClientHello, or when real ECH seals the hello.
+    pub tls12_session: Option<super::StoredSession12>,
     /// ECH client configuration (draft-ietf-tls-esni-22). `None` (the
     /// default) emits no `encrypted_client_hello` extension. `Some` —
     /// either GREASE or a real `ECHConfigList` — emits a bit-shape-identical
@@ -421,7 +422,7 @@ impl ClientConfig {
             raw_public_key_spki: None,
             key_log: None,
             offer_tls12: false,
-            tls12_session_ticket: None,
+            tls12_session: None,
             #[cfg(feature = "ech")]
             ech: None,
             #[cfg(feature = "cert-compression")]
@@ -1429,16 +1430,17 @@ impl ClientConnection {
         );
         #[cfg(not(feature = "ech"))]
         let real_ech = false;
+        let now = config.verification_time.clone().or_else(system_now);
         if !offer_tls12
             || real_ech
-            || config
-                .tls12_session_ticket
-                .as_ref()
-                .is_some_and(|t| t.is_empty() || t.len() > MAX_SESSION_TICKET_LEN)
+            || config.tls12_session.as_ref().is_some_and(|s| {
+                s.ticket.len() > MAX_SESSION_TICKET_LEN
+                    || !s.usable_for(server_name, config.verify_certificates, now)
+            })
         {
-            config.tls12_session_ticket = None;
+            config.tls12_session = None;
         }
-        let legacy_session_id = if config.tls12_session_ticket.is_some() {
+        let legacy_session_id = if config.tls12_session.is_some() {
             let mut sid = alloc::vec![0u8; 32];
             rng.fill_bytes(&mut sid);
             sid
@@ -1779,7 +1781,10 @@ impl ClientConnection {
             // fallback can resume through `ClientConnection12`. A 1.3 server
             // ignores the extension.
             extensions.push(ext::session_ticket(
-                self.config.tls12_session_ticket.as_deref().unwrap_or(&[]),
+                self.config
+                    .tls12_session
+                    .as_ref()
+                    .map_or(&[][..], |s| s.ticket.as_slice()),
             ));
         }
         // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
@@ -4973,6 +4978,21 @@ mod tests {
         }
     }
 
+    /// A stored TLS 1.2 session for `name`, minted with verification on.
+    fn session12(ticket: Vec<u8>, name: &str) -> super::super::StoredSession12 {
+        super::super::StoredSession12 {
+            ticket,
+            master_secret: [0x42; 48],
+            cipher_suite: 0xC02F,
+            alpn: None,
+            received_at: None,
+            ems_used: true,
+            server_name: String::from(name),
+            verify_certificates: true,
+            lifetime_seconds: 0,
+        }
+    }
+
     /// RFC 5077 §3.4: a stored 1.2 ticket rides in `session_ticket` with a
     /// fresh 32-byte `legacy_session_id` — only on a hello that offers 1.2,
     /// and only when it fits. The ServerHello must echo that id exactly
@@ -4984,7 +5004,7 @@ mod tests {
         let hello = |offer_tls12: bool, ticket: Vec<u8>| {
             let mut cfg = ClientConfig::new(RootCertStore::new());
             cfg.offer_tls12 = offer_tls12;
-            cfg.tls12_session_ticket = Some(ticket);
+            cfg.tls12_session = Some(session12(ticket, "example.com"));
             let mut rng = HmacDrbg::<Sha256>::new(b"ch-ticket12", b"nonce", &[]);
             let mut client = ClientConnection::new(cfg, "example.com", &mut rng).unwrap();
             let out = client.write_tls();
@@ -5007,6 +5027,20 @@ mod tests {
             );
             assert!(ch.session_id.is_empty());
         }
+
+        // A session scoped to another server name is not offered either.
+        let mut cfg = ClientConfig::new(RootCertStore::new());
+        cfg.offer_tls12 = true;
+        cfg.tls12_session = Some(session12(alloc::vec![0xAB; 100], "other.example"));
+        let mut rng = HmacDrbg::<Sha256>::new(b"ch-ticket12-name", b"nonce", &[]);
+        let mut other = ClientConnection::new(cfg, "example.com", &mut rng).unwrap();
+        let out = other.write_tls();
+        let ch = ClientHello::decode(&read_record(&out).unwrap().unwrap().fragment[4..]).unwrap();
+        assert!(ch.session_id.is_empty());
+        assert_eq!(
+            ext::find(&ch.extensions, ExtensionType::SESSION_TICKET),
+            Some(&[][..])
+        );
 
         // A 1.3 ServerHello that does not echo our id is refused.
         let sh = ServerHello {
@@ -5234,7 +5268,7 @@ mod tests {
         cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
         cfg.offer_tls12 = true;
         // A stored 1.2 ticket yields to real ECH, like a 1.3 session does.
-        cfg.tls12_session_ticket = Some(alloc::vec![0xAB; 16]);
+        cfg.tls12_session = Some(session12(alloc::vec![0xAB; 16], "secret.example"));
         let mut rng = HmacDrbg::<Sha256>::new(b"ech-inner-ver-client", b"nonce", &[]);
         let mut client = ClientConnection::new(cfg, "secret.example", &mut rng).unwrap();
         let out = client.write_tls();

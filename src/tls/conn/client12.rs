@@ -415,6 +415,43 @@ pub struct StoredSession12 {
     /// it MUST NOT. Cross-EMS resumption is rejected with
     /// `IllegalParameter`.
     pub ems_used: bool,
+    /// The server name the originating handshake authenticated. An
+    /// abbreviated handshake carries no certificate, so the session is only
+    /// offered to this same name (ASCII case-insensitive).
+    pub server_name: String,
+    /// Whether the originating handshake verified the server certificate. A
+    /// session minted with verification off is never resumed under a config
+    /// that verifies — it would inherit an unauthenticated peer.
+    pub verify_certificates: bool,
+    /// The `ticket_lifetime_hint` from `NewSessionTicket` (RFC 5077 §3.3).
+    /// `0` means the server gave no hint and the ticket has no client-side
+    /// expiry.
+    pub lifetime_seconds: u32,
+}
+
+impl StoredSession12 {
+    /// Whether this session may be offered on a connection to `server_name`
+    /// with the given verification setting at time `now` (`None`: no clock,
+    /// so no expiry check). Mirrors the TLS 1.3 [`super::StoredSession`]
+    /// scoping: same name, no weaker verification context, not expired.
+    pub(crate) fn usable_for(
+        &self,
+        server_name: &str,
+        verify_certificates: bool,
+        now: Option<Time>,
+    ) -> bool {
+        let expired = self.lifetime_seconds != 0
+            && match (now, self.received_at.as_ref()) {
+                (Some(now), Some(at)) => {
+                    now.to_unix().saturating_sub(at.to_unix()) > u64::from(self.lifetime_seconds)
+                }
+                _ => false,
+            };
+        !self.ticket.is_empty()
+            && self.server_name.eq_ignore_ascii_case(server_name)
+            && (self.verify_certificates || !verify_certificates)
+            && !expired
+    }
 }
 
 impl core::fmt::Debug for StoredSession12 {
@@ -429,6 +466,9 @@ impl core::fmt::Debug for StoredSession12 {
             .field("alpn", &self.alpn)
             .field("received_at", &self.received_at)
             .field("ems_used", &self.ems_used)
+            .field("server_name", &self.server_name)
+            .field("verify_certificates", &self.verify_certificates)
+            .field("lifetime_seconds", &self.lifetime_seconds)
             .finish_non_exhaustive()
     }
 }
@@ -440,6 +480,20 @@ impl core::fmt::Debug for StoredSession12 {
 impl Drop for StoredSession12 {
     fn drop(&mut self) {
         super::wipe(&mut self.master_secret);
+    }
+}
+
+/// Drops `config.session` unless [`StoredSession12::usable_for`] allows
+/// offering it to `server_name` under this config — the check the TLS 1.3
+/// client applies to its own sessions.
+fn drop_unusable_session(config: &mut ClientConfig12, server_name: &str) {
+    let now = config.verification_time.clone().or_else(system_now);
+    if config
+        .session
+        .as_ref()
+        .is_some_and(|s| !s.usable_for(server_name, config.verify_certificates, now))
+    {
+        config.session = None;
     }
 }
 
@@ -842,6 +896,8 @@ impl ClientConnection12 {
         suites: &[CipherSuite],
         groups: &[NamedGroup],
     ) -> Self {
+        let mut config = config;
+        drop_unusable_session(&mut config, server_name);
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
@@ -986,11 +1042,15 @@ impl ClientConnection12 {
         }
         let ch = ClientHello::decode(&sent_ch[4..4 + body_len])?;
         let client_random = ch.random;
+        let mut config = config;
+        drop_unusable_session(&mut config, server_name);
         // RFC 5077 §3.4: the sent hello resumes only if it carried BOTH a
         // ticket and a non-empty `session_id` for the server to echo. A 1.3
         // compat-mode `legacy_session_id` without a ticket never resumes.
         let carried_ticket =
-            ext::find(&ch.extensions, ExtensionType::SESSION_TICKET).is_some_and(|t| !t.is_empty());
+            ext::find(&ch.extensions, ExtensionType::SESSION_TICKET).is_some_and(|t| {
+                !t.is_empty() && config.session.as_ref().is_some_and(|s| s.ticket == t)
+            });
         let resume_session_id =
             (carried_ticket && !ch.session_id.is_empty()).then(|| ch.session_id.clone());
         // Keep the offered suites the (hybrid) ClientHello actually carried,
@@ -1268,6 +1328,9 @@ impl ClientConnection12 {
             alpn: self.alpn_negotiated.clone(),
             received_at: self.config.verification_time.clone().or_else(system_now),
             ems_used: self.ems_negotiated,
+            server_name: self.server_name.clone(),
+            verify_certificates: self.config.verify_certificates,
+            lifetime_seconds: self.received_ticket_lifetime,
         })
     }
 
@@ -3886,6 +3949,9 @@ mod tests {
             alpn: None,
             received_at: None,
             ems_used: true,
+            server_name: String::from("example.com"),
+            verify_certificates: true,
+            lifetime_seconds: 0,
         }
     }
 
@@ -3940,6 +4006,56 @@ mod tests {
         let cfg = ClientConfig12::new(RootCertStore::new());
         let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
         assert!(client_hello_session_id(&c.write_tls()).is_empty());
+    }
+
+    /// A stored session is scoped like a TLS 1.3 one: it is not offered to
+    /// another server name, under a config that verifies when the session
+    /// was minted without verification, or past its lifetime hint. The
+    /// hello then carries no ticket and no `session_id`.
+    #[test]
+    fn client12_session_scoping() {
+        let suite = CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256;
+        let issued = Time::utc(2030, 1, 1, 0, 0, 0);
+        let offered = |session: StoredSession12, name: &str, now: Time| {
+            let mut rng = HmacDrbg::<Sha256>::new(b"c12-scope", b"nonce", &[]);
+            let cfg = ClientConfig12::new(RootCertStore::new())
+                .with_verification_time(now)
+                .with_session(session);
+            let mut c = ClientConnection12::new(cfg, name, &mut rng).unwrap();
+            !client_hello_session_id(&c.write_tls()).is_empty()
+        };
+        let session = |verified: bool, lifetime: u32| {
+            let mut s = stored_session(suite);
+            s.received_at = Some(issued.clone());
+            s.verify_certificates = verified;
+            s.lifetime_seconds = lifetime;
+            s
+        };
+        let hour_later = Time::utc(2030, 1, 1, 1, 0, 0);
+
+        assert!(offered(
+            session(true, 7200),
+            "example.com",
+            hour_later.clone()
+        ));
+        assert!(offered(
+            session(true, 7200),
+            "EXAMPLE.com",
+            hour_later.clone()
+        ));
+        // No lifetime hint: no client-side expiry.
+        assert!(offered(session(true, 0), "example.com", hour_later.clone()));
+        assert!(!offered(
+            session(true, 7200),
+            "other.example",
+            hour_later.clone()
+        ));
+        assert!(!offered(
+            session(false, 7200),
+            "example.com",
+            hour_later.clone()
+        ));
+        assert!(!offered(session(true, 1800), "example.com", hour_later));
     }
 
     /// RFC 5077 §3.4: only the echo of OUR `session_id` means "resumed". A

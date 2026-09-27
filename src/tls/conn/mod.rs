@@ -10454,6 +10454,9 @@ mod audit_regression_tests {
             alpn: None,
             received_at: None,
             ems_used: true,
+            server_name: alloc::string::String::from("example.com"),
+            verify_certificates: true,
+            lifetime_seconds: 0,
         };
         let d = alloc::format!("{s12:?}");
         assert!(d.contains("redacted"), "{d}");
