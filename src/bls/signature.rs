@@ -95,22 +95,28 @@ impl SecretKey {
             let mut h = Hmac::<Sha256>::new(&salt);
             h.update(ikm);
             h.update(&[0u8]);
-            let prk = h.finalize();
+            let mut prk = h.finalize();
             // HKDF-Expand(PRK, key_info || I2OSP(L, 2), L): two blocks.
+            // Every intermediate here (PRK, T(1), T(2)) determines the key
+            // outright, so each is wiped once copied into place rather than
+            // left as a dead temporary in the frame.
             let mut okm = [0u8; KEYGEN_L];
             let mut t1 = Hmac::<Sha256>::new(&prk);
             t1.update(key_info);
             t1.update(&[0u8, KEYGEN_L as u8]);
             t1.update(&[1u8]);
-            let t1 = t1.finalize();
+            let mut t1 = t1.finalize();
             let mut t2 = Hmac::<Sha256>::new(&prk);
+            prk.zeroize();
             t2.update(&t1);
             t2.update(key_info);
             t2.update(&[0u8, KEYGEN_L as u8]);
             t2.update(&[2u8]);
-            let t2 = t2.finalize();
+            let mut t2 = t2.finalize();
             okm[..32].copy_from_slice(&t1);
             okm[32..].copy_from_slice(&t2[..16]);
+            t1.zeroize();
+            t2.zeroize();
             let sk = Fr::from_bytes_wide(&okm);
             okm.zeroize();
             if !bool::from(sk.is_zero()) {
