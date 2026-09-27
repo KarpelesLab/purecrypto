@@ -2128,9 +2128,16 @@ impl<R: RngCore> ServerConnection12<R> {
         // carried across it. Fall back to a full handshake, which re-verifies
         // the chain from scratch.
         if let Some(leaf) = parsed.client_leaf.as_ref() {
-            match crate::x509::Certificate::from_der(leaf.clone()) {
-                Ok(cert) => {
-                    let validity = cert.validity().ok()?;
+            // Discriminate on the validity period, not on whether the bytes
+            // "parse as a certificate": `Certificate::from_der` only checks
+            // the outer SEQUENCE, which a bare SPKI also satisfies, so a
+            // raw-key identity used to land in the X.509 arm, fail
+            // `validity()`, and never resume.
+            let validity = crate::x509::Certificate::from_der(leaf.clone())
+                .ok()
+                .and_then(|cert| cert.validity().ok());
+            match validity {
+                Some(validity) => {
                     if !validity.accepts(&crate::x509::Time::from_unix(now)) {
                         return None;
                     }
@@ -2138,8 +2145,9 @@ impl<R: RngCore> ServerConnection12<R> {
                 // RFC 7250: a raw-key client identity is a bare SPKI with no
                 // validity period; it remains acceptable exactly while it
                 // is on this listener's allowlist (the whole trust root for
-                // that path). Anything else is unparsable — full handshake.
-                Err(_) => {
+                // that path). Anything else fails that check too — full
+                // handshake.
+                None => {
                     super::common::check_raw_public_key(
                         true,
                         &self.config.expected_client_raw_public_keys,
@@ -3932,6 +3940,48 @@ mod tests {
         let created_late = late.ticket_now().unwrap();
         let ticket_late = seal_test_ticket(&mut late, Some(leaf), created_late);
         assert!(late.try_resume(&ticket_late, &[TICKET_SUITE]).is_none());
+    }
+
+    /// An RFC 7250 raw-public-key client identity has no validity period: it
+    /// resumes exactly while the key is on the listener's allowlist. (A bare
+    /// SPKI passes `Certificate::from_der`'s outer-SEQUENCE check, so it must
+    /// not be routed to the X.509 validity check, where it never resumed.)
+    #[test]
+    fn tls12_ticket_rechecks_raw_public_key_allowlist() {
+        use crate::x509::{Certificate, Time};
+        let anchor = ticket_test_client_leaf(
+            b"ticket-rpk-anchor",
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let spki = Certificate::from_der(ticket_test_client_leaf(
+            b"ticket-rpk-client",
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        ))
+        .unwrap()
+        .spki_der()
+        .unwrap()
+        .to_vec();
+        let key = [0x48u8; 32];
+        let base = || {
+            let mut roots = RootCertStore::new();
+            roots.add_der(anchor.clone()).unwrap();
+            test_rsa_server_config()
+                .with_ticket_key(key)
+                .with_client_auth(roots, true)
+                .with_verification_time(Time::utc(2026, 1, 1, 0, 0, 0))
+        };
+
+        let mut listed = ticket_engine(base().add_expected_client_raw_public_key(spki.clone()));
+        let created = listed.ticket_now().unwrap();
+        let ticket = seal_test_ticket(&mut listed, Some(spki.clone()), created);
+        let resumed = listed.try_resume(&ticket, &[TICKET_SUITE]);
+        assert_eq!(resumed.and_then(|r| r.client_leaf.clone()), Some(spki));
+
+        // Same trust roots (same sealing key), key no longer allowlisted.
+        let mut delisted = ticket_engine(base());
+        assert!(delisted.try_resume(&ticket, &[TICKET_SUITE]).is_none());
     }
 
     /// Expiry is enforced against the configured verification time, so a
