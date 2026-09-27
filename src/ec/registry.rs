@@ -16,7 +16,10 @@
 //!    entries (which carry no TLS scheme) require explicit opt-in. X.509
 //!    chain signatures instead go through the OID-keyed entries above —
 //!    which the modern default also permits — so a chain signature verifies
-//!    over any supported curve (including secp256k1) with the OID's hash.
+//!    over any supported curve (including secp256k1) with the OID's hash,
+//!    provided the curve meets the policy's `min_ec_bits` floor (256-bit
+//!    group order by default). Every EC entry reports its SPKI's curve size
+//!    through `SignatureAlgorithm::ec_curve_bits` for that check.
 //!
 //! Ed25519 has a single entry (the OID and the TLS scheme both fully pin
 //! the algorithm).
@@ -57,6 +60,42 @@ fn parse_ecdsa_spki(spki: &[u8]) -> Result<(CurveId, BoxedEcdsaPublicKey), Error
     outer.finish()?;
     let key = BoxedEcdsaPublicKey::from_sec1(curve, key_bits).map_err(|_| Error::Malformed)?;
     Ok((curve, key))
+}
+
+/// The bit length of `curve`'s group order — the quantity
+/// [`SignaturePolicy::min_ec_bits`](crate::signature_registry::SignaturePolicy::min_ec_bits)
+/// floors (OpenSSL's `EC_GROUP_order_bits`, the input to its security-bits
+/// estimate). Static rather than computed so a policy check never builds a
+/// [`Curve`](super::weierstrass::Curve); the `curve_order_bits_match_params`
+/// test cross-checks every value against the real parameters. Exhaustive on
+/// purpose: a new curve must declare its size here before it can pass the
+/// policy.
+pub(crate) fn curve_order_bits(curve: CurveId) -> u32 {
+    match curve {
+        CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 | CurveId::BrainpoolP256r1 => 256,
+        CurveId::P384 | CurveId::BrainpoolP384r1 => 384,
+        CurveId::P521 => 521,
+        CurveId::BrainpoolP512r1 => 512,
+        CurveId::BrainpoolP320r1 => 320,
+        CurveId::P224 | CurveId::BrainpoolP224r1 => 224,
+        // The SEC 2 Koblitz/random 160-bit curves have a 161-bit order and
+        // secp224k1 a 225-bit one (see `CurveId::order_len`).
+        #[cfg(feature = "legacy-ec")]
+        CurveId::Secp160k1 | CurveId::Secp160r1 | CurveId::Secp160r2 => 161,
+        #[cfg(feature = "legacy-ec")]
+        CurveId::Secp192k1 | CurveId::P192 => 192,
+        #[cfg(feature = "legacy-ec")]
+        CurveId::Secp224k1 => 225,
+    }
+}
+
+/// [`SignatureAlgorithm::ec_curve_bits`] for every ECDSA entry: the order
+/// bits of the curve `spki` names, or `None` when the SPKI is not a usable
+/// ECDSA key (which the entry's `verify` refuses anyway).
+fn ecdsa_spki_curve_bits(spki: &[u8]) -> Option<u32> {
+    parse_ecdsa_spki(spki)
+        .ok()
+        .map(|(curve, _)| curve_order_bits(curve))
 }
 
 /// Parses an Ed25519 SPKI and returns the 32-byte key.
@@ -142,6 +181,9 @@ impl SignatureAlgorithm for EcdsaSha256AnyCurve {
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
         verify_ecdsa_any_curve::<Sha256>(spki, message, signature)
     }
+    fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
+        ecdsa_spki_curve_bits(spki)
+    }
 }
 
 /// X.509 `ecdsa-with-SHA384` — OID-keyed dispatch entry.
@@ -160,6 +202,9 @@ impl SignatureAlgorithm for EcdsaSha384AnyCurve {
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
         verify_ecdsa_any_curve::<Sha384>(spki, message, signature)
     }
+    fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
+        ecdsa_spki_curve_bits(spki)
+    }
 }
 
 /// X.509 `ecdsa-with-SHA512` — OID-keyed dispatch entry.
@@ -177,6 +222,9 @@ impl SignatureAlgorithm for EcdsaSha512AnyCurve {
     }
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
         verify_ecdsa_any_curve::<Sha512>(spki, message, signature)
+    }
+    fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
+        ecdsa_spki_curve_bits(spki)
     }
 }
 
@@ -201,6 +249,16 @@ macro_rules! strict_ecdsa_entry {
             fn tls_schemes(&self) -> &'static [u16] { $tls_schemes }
             fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
                 verify_ecdsa_strict::<$digest>(spki, message, signature, $curve)
+            }
+            // The entry pins its curve, so the size is a constant; but a
+            // SPKI naming some other curve is reported as `None` (it fails
+            // in `verify`), keeping the semantics identical to the
+            // any-curve entries.
+            fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
+                match parse_ecdsa_spki(spki) {
+                    Ok((curve, _)) if curve == $curve => Some(curve_order_bits(curve)),
+                    _ => None,
+                }
             }
         }
     };
@@ -341,6 +399,11 @@ impl SignatureAlgorithm for Sm2WithSm3 {
         key.verify(message, &sig, crate::ec::sm2::DEFAULT_ID)
             .map_err(|_| Error::Verification)
     }
+    fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
+        parse_sm2_spki(spki)
+            .ok()
+            .map(|_| curve_order_bits(CurveId::Sm2p256v1))
+    }
 }
 
 /// `ed25519` — pure Ed25519 (RFC 8032 / RFC 8410).
@@ -415,6 +478,126 @@ mod tests {
         assert_eq!(by_oid.id(), "ecdsa-with-sha256");
         let by_scheme = find_by_tls_scheme(0x0403).unwrap();
         assert_eq!(by_scheme.id(), "ecdsa-secp256r1-sha256");
+    }
+
+    /// The static `curve_order_bits` table must agree with the real group
+    /// order of every curve compiled into this build.
+    #[test]
+    fn curve_order_bits_match_params() {
+        for &curve in CurveId::ALL {
+            assert_eq!(
+                curve_order_bits(curve) as usize,
+                curve.curve().order().bit_len(),
+                "{curve:?}"
+            );
+        }
+    }
+
+    /// `ec_curve_bits` reports the curve of an EC SPKI on every ECDSA entry
+    /// (and the SM2 entry), `None` on a non-EC SPKI, on an unparseable one,
+    /// and — for a strict-pair entry — on a SPKI naming another curve.
+    #[test]
+    fn ec_curve_bits_reports_spki_curve() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"reg-ec-bits", b"n", &[]);
+        let p256 = AnyPublicKey::Ecdsa(
+            BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng).public_key(),
+        )
+        .to_spki_der();
+        let p224 = AnyPublicKey::Ecdsa(
+            BoxedEcdsaPrivateKey::generate(CurveId::P224, &mut rng).public_key(),
+        )
+        .to_spki_der();
+        let bp320 = AnyPublicKey::Ecdsa(
+            BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP320r1, &mut rng).public_key(),
+        )
+        .to_spki_der();
+        let ed =
+            AnyPublicKey::Ed25519(crate::ec::Ed25519PrivateKey::generate(&mut rng).public_key())
+                .to_spki_der();
+
+        for id in [
+            "ecdsa-with-sha256",
+            "ecdsa-with-sha384",
+            "ecdsa-with-sha512",
+        ] {
+            let algo = find_by_id(id).unwrap();
+            assert_eq!(algo.ec_curve_bits(&p256), Some(256), "{id}");
+            assert_eq!(algo.ec_curve_bits(&p224), Some(224), "{id}");
+            assert_eq!(algo.ec_curve_bits(&bp320), Some(320), "{id}");
+            assert_eq!(algo.ec_curve_bits(&ed), None, "{id}");
+            assert_eq!(algo.ec_curve_bits(&[]), None, "{id}");
+        }
+        let strict = find_by_id("ecdsa-secp256r1-sha256").unwrap();
+        assert_eq!(strict.ec_curve_bits(&p256), Some(256));
+        assert_eq!(strict.ec_curve_bits(&p224), None);
+        assert_eq!(find_by_id("ed25519").unwrap().ec_curve_bits(&ed), None);
+        let sm2 = AnyPublicKey::Ecdsa(
+            BoxedEcdsaPrivateKey::generate(CurveId::Sm2p256v1, &mut rng).public_key(),
+        )
+        .to_spki_der();
+        assert_eq!(
+            find_by_id("sm2-with-sm3").unwrap().ec_curve_bits(&sm2),
+            Some(256)
+        );
+        assert_eq!(
+            find_by_id("sm2-with-sm3").unwrap().ec_curve_bits(&p256),
+            None
+        );
+    }
+
+    /// Regression: `SignaturePolicy::modern()` floored RSA at 2048 bits but
+    /// had no EC floor, so a P-224 (or, under `legacy-ec`, a 160-bit) chain
+    /// signature verified through the any-curve `ecdsa-with-sha*` entries.
+    /// The default `min_ec_bits = 256` must refuse every sub-256-bit curve
+    /// and keep every 256-bit-or-wider one; lowering the floor re-admits.
+    #[test]
+    fn modern_policy_floors_ec_curve_size() {
+        use crate::signature_registry::SignaturePolicy;
+        let mut rng = HmacDrbg::<Sha256>::new(b"reg-ec-floor", b"n", &[]);
+        let modern = SignaturePolicy::modern();
+        let algo = find_by_id("ecdsa-with-sha256").unwrap();
+        for &curve in CurveId::ALL {
+            if curve == CurveId::Sm2p256v1 {
+                continue;
+            }
+            let spki =
+                AnyPublicKey::Ecdsa(BoxedEcdsaPrivateKey::generate(curve, &mut rng).public_key())
+                    .to_spki_der();
+            let expected = curve_order_bits(curve) >= 256;
+            assert_eq!(modern.permits(algo, &spki), expected, "{curve:?}");
+            // The floor is the only thing standing in the way.
+            assert!(
+                modern.clone().with_min_ec_bits(160).permits(algo, &spki),
+                "{curve:?}"
+            );
+            // Raising it above the curve refuses.
+            assert!(
+                !modern.clone().with_min_ec_bits(600).permits(algo, &spki),
+                "{curve:?}"
+            );
+        }
+        // Spot checks on the documented boundary.
+        let p224 = AnyPublicKey::Ecdsa(
+            BoxedEcdsaPrivateKey::generate(CurveId::P224, &mut rng).public_key(),
+        )
+        .to_spki_der();
+        assert!(!modern.permits(algo, &p224));
+        assert!(modern.clone().with_min_ec_bits(224).permits(algo, &p224));
+        let bp224 = AnyPublicKey::Ecdsa(
+            BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP224r1, &mut rng).public_key(),
+        )
+        .to_spki_der();
+        assert!(!modern.permits(algo, &bp224));
+        // The floor never touches non-EC entries.
+        let ed =
+            AnyPublicKey::Ed25519(crate::ec::Ed25519PrivateKey::generate(&mut rng).public_key())
+                .to_spki_der();
+        assert!(
+            modern
+                .clone()
+                .with_min_ec_bits(4096)
+                .permits(find_by_id("ed25519").unwrap(), &ed)
+        );
     }
 
     #[test]

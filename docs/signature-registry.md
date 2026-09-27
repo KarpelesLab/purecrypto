@@ -49,6 +49,14 @@ ECDSA entry is reachable for chain dispatch through the OID-keyed
 pairs and the secp256k1 entries exist as fine-grained policy-keyed entries
 for opt-in.
 
+Because those OID-keyed entries do not pin a curve, curve strength is a
+property of the issuer key, and the policy floors it the way it floors the
+RSA modulus: `SignaturePolicy::min_ec_bits` (default 256) is the minimum
+bit length of the curve's group order. P-256, P-384, P-521, secp256k1, SM2
+and brainpoolP256/320/384/512r1 pass; P-224, brainpoolP224r1 and every
+`legacy-ec` curve (secp160k1/r1/r2, secp192k1, P-192, secp224k1) are refused
+unless the caller lowers the floor with `with_min_ec_bits`.
+
 The three `rsa-pss-rsae-*` entries carry **no** X.509 OID: in X.509 the
 `sha*WithRSAEncryption` OIDs mean PKCS#1 v1.5 and belong to the
 `rsa-pkcs1-*` entries, while an RSA-PSS certificate signature is
@@ -141,16 +149,19 @@ rarely the right default for X.509 leaves.
 use purecrypto::signature_registry::SignaturePolicy;
 use purecrypto::tls::{Config, RootCertStore};
 
-// Default: the modern IANA-blessed set above, RSA >= 2048 bits.
+// Default: the modern IANA-blessed set above, RSA >= 2048 bits, EC curves
+// of >= 256-bit order.
 let cfg = Config::builder().roots(RootCertStore::new()).build();
 
-// Legacy interop: accept SHA-1 RSA and lower the RSA-bit floor to 1024.
+// Legacy interop: accept SHA-1 RSA, lower the RSA-bit floor to 1024 and
+// admit P-224 / brainpoolP224r1 chain signatures.
 let cfg = Config::builder()
     .roots(RootCertStore::new())
     .signature_policy(
         SignaturePolicy::modern()
             .permit("rsa-pkcs1-sha1")
-            .with_min_rsa_bits(1024),
+            .with_min_rsa_bits(1024)
+            .with_min_ec_bits(224),
     )
     .build();
 

@@ -28,11 +28,14 @@
 //! has to add the id explicitly. The shipped default
 //! `SignaturePolicy::modern` permits the modern IANA-blessed set —
 //! RSA-PSS-RSAE / RSA-PSS-PSS / RSA-PKCS1 with SHA-256/384, ECDSA,
-//! Ed25519/Ed448, and ML-DSA — with RSA keys ≥ 2048 bits. For ECDSA the two dispatch paths
-//! differ: X.509 chain signatures are keyed by the signature OID
+//! Ed25519/Ed448, and ML-DSA — with RSA keys ≥ 2048 bits and ECDSA curves
+//! of ≥ 256-bit group order. For ECDSA the two dispatch paths differ: X.509
+//! chain signatures are keyed by the signature OID
 //! (`ecdsa-with-sha256/384/512`), which does not pin a curve, so any
-//! supported curve (P-256 / P-384 / P-521 / secp256k1) is accepted with the
-//! OID's hash; the matched-curve / matched-hash restriction over
+//! supported curve at or above the `min_ec_bits` floor (P-256 / P-384 /
+//! P-521, secp256k1, brainpoolP256/320/384/512r1) is accepted with the
+//! OID's hash — P-224, brainpoolP224r1 and the `legacy-ec` curves are
+//! refused by default; the matched-curve / matched-hash restriction over
 //! P-256/P-384/P-521 applies to TLS 1.3 `CertificateVerify` scheme dispatch.
 
 use crate::x509::Error;
@@ -94,6 +97,20 @@ pub trait SignatureAlgorithm: Sync + 'static {
     /// For policy decisions: RSA modulus length in bits. `None` for non-RSA
     /// algorithms.
     fn rsa_modulus_bits(&self, _spki: &[u8]) -> Option<u32> {
+        None
+    }
+
+    /// For policy decisions: the bit length of the group order of the curve
+    /// an ECDSA (or SM2) `spki` names. `None` for non-EC algorithms, and for
+    /// an EC entry whose SPKI does not parse or names a curve the entry
+    /// cannot use (that SPKI fails at verify time regardless).
+    ///
+    /// The OID-keyed `ecdsa-with-sha*` entries accept every curve the crate
+    /// compiles in, down to the 160-bit SEC 2 curves under `legacy-ec`, so
+    /// the curve's strength is a property of the key, not of the entry —
+    /// exactly like the RSA modulus size. [`SignaturePolicy::min_ec_bits`]
+    /// floors it.
+    fn ec_curve_bits(&self, _spki: &[u8]) -> Option<u32> {
         None
     }
 }
@@ -270,20 +287,28 @@ mod policy {
     ///
     /// The shipped default — [`SignaturePolicy::modern`] — accepts exactly the
     /// modern IANA-blessed set: RSA-PKCS1 / RSA-PSS-RSAE with SHA-256/384/512,
-    /// ECDSA (any supported curve for X.509 chain signatures; matched
-    /// curve/hash pairs over P-256/P-384/P-521 for TLS 1.3
-    /// `CertificateVerify`), Ed25519, and Ed448. RSA keys must be at least
-    /// 2048 bits.
+    /// ECDSA (any supported curve of at least 256-bit group order for X.509
+    /// chain signatures; matched curve/hash pairs over P-256/P-384/P-521 for
+    /// TLS 1.3 `CertificateVerify`), Ed25519, and Ed448. RSA keys must be at
+    /// least 2048 bits.
     #[derive(Clone)]
     pub struct SignaturePolicy {
         permitted: Vec<&'static dyn SignatureAlgorithm>,
         /// Minimum acceptable RSA modulus length, in bits.
         pub min_rsa_bits: u32,
+        /// Minimum acceptable ECDSA / SM2 curve strength: the bit length of
+        /// the curve's group order (256 for P-256, secp256k1 and
+        /// brainpoolP256r1; 224 for P-224; 161 for secp160k1). The
+        /// OID-keyed `ecdsa-with-sha*` entries accept every curve the
+        /// crate compiles in, so without this floor a chain signed over
+        /// P-224 — or, under `legacy-ec`, secp160r1 — verified under the
+        /// "modern" whitelist. Mirrors `min_rsa_bits`.
+        pub min_ec_bits: u32,
     }
 
     impl SignaturePolicy {
         /// The shipped default whitelist: modern IANA-blessed signature
-        /// algorithms, RSA ≥ 2048 bits.
+        /// algorithms, RSA ≥ 2048 bits, ECDSA curves ≥ 256-bit order.
         ///
         /// Permitted ids:
         ///   * `rsa-pkcs1-sha256`, `rsa-pkcs1-sha384`
@@ -297,8 +322,11 @@ mod policy {
         ///   * `ecdsa-with-sha256`, `ecdsa-with-sha384`, `ecdsa-with-sha512`
         ///     — the OID-keyed X.509 chain-dispatch entries. The
         ///     `ecdsa-with-SHA-N` OID does not pin a curve, so these accept
-        ///     **any supported curve** (P-256, P-384, P-521, or secp256k1)
-        ///     with the OID's hash.
+        ///     **any supported curve at or above the `min_ec_bits` floor**
+        ///     (256 by default: P-256, P-384, P-521, secp256k1,
+        ///     brainpoolP256r1/P320r1/P384r1/P512r1) with the OID's hash.
+        ///     P-224, brainpoolP224r1 and the `legacy-ec` curves fall below
+        ///     the floor and need [`Self::with_min_ec_bits`].
         ///   * `ecdsa-secp256r1-sha256`, `ecdsa-secp384r1-sha384`,
         ///     `ecdsa-secp521r1-sha512`, and the RFC 8734 Brainpool pairs
         ///     `ecdsa-brainpoolP256r1-sha256`, `ecdsa-brainpoolP384r1-sha384`,
@@ -309,10 +337,10 @@ mod policy {
         ///   * `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87` (NIST FIPS 204)
         ///
         /// Note the asymmetry for ECDSA: an X.509 chain signature over
-        /// secp256k1 (or any supported-curve / SHA-256-384-512 combination)
-        /// verifies under this policy via the OID-keyed entries; only the
-        /// TLS 1.3 `CertificateVerify` path is limited to the matched pairs
-        /// above.
+        /// secp256k1 (or any supported-curve / SHA-256-384-512 combination
+        /// that meets the curve floor) verifies under this policy via the
+        /// OID-keyed entries; only the TLS 1.3 `CertificateVerify` path is
+        /// limited to the matched pairs above.
         ///
         /// Everything else in [`super::ALGORITHMS`] (SHA-1 RSA, the
         /// scheme-less secp256k1 / cross-hash ECDSA pair entries, SLH-DSA,
@@ -358,15 +386,18 @@ mod policy {
             SignaturePolicy {
                 permitted,
                 min_rsa_bits: 2048,
+                min_ec_bits: 256,
             }
         }
 
         /// An empty policy — accepts nothing. Build it up by chaining
-        /// [`SignaturePolicy::permit`].
+        /// [`SignaturePolicy::permit`]. The key-size floors are the
+        /// `modern()` ones (RSA ≥ 2048 bits, EC ≥ 256-bit order).
         pub fn empty() -> Self {
             SignaturePolicy {
                 permitted: Vec::new(),
                 min_rsa_bits: 2048,
+                min_ec_bits: 256,
             }
         }
 
@@ -405,14 +436,31 @@ mod policy {
             self
         }
 
+        /// Overrides the EC curve-strength floor (bit length of the curve's
+        /// group order; see [`Self::min_ec_bits`]). `with_min_ec_bits(224)`
+        /// admits P-224 and brainpoolP224r1 chain signatures; 160 admits
+        /// every `legacy-ec` curve.
+        pub fn with_min_ec_bits(mut self, bits: u32) -> Self {
+            self.min_ec_bits = bits;
+            self
+        }
+
         /// `true` if `algo` is on the whitelist and `spki`'s parameters meet
-        /// any extra constraints (today only the `min_rsa_bits` check).
+        /// the key-size floors: `min_rsa_bits` for an RSA entry,
+        /// `min_ec_bits` for an ECDSA / SM2 one. An EC entry whose SPKI it
+        /// cannot read reports no curve size and is not floored here — it
+        /// fails at verify time instead.
         pub fn permits(&self, algo: &dyn SignatureAlgorithm, spki: &[u8]) -> bool {
             if !self.permitted.iter().any(|a| algo_eq(*a, algo)) {
                 return false;
             }
             if let Some(bits) = algo.rsa_modulus_bits(spki)
                 && bits < self.min_rsa_bits
+            {
+                return false;
+            }
+            if let Some(bits) = algo.ec_curve_bits(spki)
+                && bits < self.min_ec_bits
             {
                 return false;
             }

@@ -2123,6 +2123,60 @@ mod tests {
         ));
     }
 
+    /// Regression: the any-curve `ecdsa-with-sha*` entries accept every
+    /// compiled-in curve, and `modern()` had no curve-size floor, so a
+    /// P-224 chain validated under the default policy. It must now need an
+    /// explicit `with_min_ec_bits(224)`, while a 320-bit Brainpool chain —
+    /// above the 256-bit floor — keeps validating unchanged.
+    #[test]
+    fn sub_256_bit_ec_chain_only_under_lowered_floor() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        use crate::x509::CertSigner;
+        let mut rng = HmacDrbg::<Sha256>::new(b"verify-ec-floor", b"n", &[]);
+        let mut build = |curve: CurveId| {
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            let signer = CertSigner::Ecdsa(&sk);
+            let name = DistinguishedName::common_name("floor.example");
+            let cert = Certificate::self_signed_general(&signer, &name, &validity(), 1, true, &[])
+                .unwrap();
+            let mut store = RootCertStore::new();
+            store.add_der(cert.to_der().to_vec()).unwrap();
+            (store, alloc::vec![cert.to_der().to_vec()])
+        };
+
+        let (store, chain) = build(CurveId::P224);
+        assert!(matches!(
+            verify_chain(&store, &chain, None, &policy()),
+            Err(Error::BadCertificate)
+        ));
+        verify_chain(&store, &chain, None, &policy().with_min_ec_bits(224)).unwrap();
+
+        let (store, chain) = build(CurveId::BrainpoolP224r1);
+        assert!(matches!(
+            verify_chain(&store, &chain, None, &policy()),
+            Err(Error::BadCertificate)
+        ));
+
+        let (store, chain) = build(CurveId::BrainpoolP320r1);
+        verify_chain(&store, &chain, None, &policy()).unwrap();
+
+        #[cfg(feature = "legacy-ec")]
+        {
+            let (store, chain) = build(CurveId::Secp160r1);
+            assert!(matches!(
+                verify_chain(&store, &chain, None, &policy()),
+                Err(Error::BadCertificate)
+            ));
+            assert!(matches!(
+                verify_chain(&store, &chain, None, &policy().with_min_ec_bits(224)),
+                Err(Error::BadCertificate)
+            ));
+            verify_chain(&store, &chain, None, &policy().with_min_ec_bits(160)).unwrap();
+        }
+    }
+
     /// A self-signed SLH-DSA-SHA2-128f cert validates only under a policy
     /// that explicitly permits SLH-DSA (the default `modern()` does not).
     #[cfg(feature = "slhdsa")]
