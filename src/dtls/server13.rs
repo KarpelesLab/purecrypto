@@ -85,10 +85,18 @@ const EXT_COOKIE: u16 = 0x002C;
 /// reassembler limits (256 KiB × 8 messages) eight spoofed one-byte
 /// fragments with distinct `message_seq` values, each claiming the maximum
 /// `total_length`, would pin ~2 MiB of eagerly allocated buffers before
-/// any return-routability check. A legitimate CH — even multi-share with
-/// ML-KEM-768 — is well under 16 KiB, and the post-HRR CH2 is a single
+/// any return-routability check. The post-HRR CH2 is a single
 /// `message_seq`.
-const PRE_COOKIE_MAX_CH_LEN: u32 = 32 * 1024;
+///
+/// A candidate's buffer is allocated to the claimed length on its first
+/// fragment, so this ceiling is what one ~60-byte spoofed datagram costs.
+/// Growing the buffer lazily would not change that: the spoofer simply
+/// sends its one fragment at the tail of the claimed length. The ceiling
+/// itself is therefore kept tight. A legitimate CH is 2–3 KiB even with an
+/// ML-KEM-768 hybrid share next to classical ones (this crate's default
+/// offer is under 2 KiB); 8 KiB leaves room for a few more hybrid shares,
+/// PSK identities or padding.
+const PRE_COOKIE_MAX_CH_LEN: u32 = 8 * 1024;
 
 /// Number of concurrent reassembly candidates allowed on the pre-cookie
 /// path.
@@ -98,7 +106,7 @@ const PRE_COOKIE_MAX_CH_LEN: u32 = 32 * 1024;
 /// the genuine ClientHello can coexist — but with a budget of one, the
 /// spoofed candidate simply occupies the only slot and the genuine CH is
 /// still refused, which is the wedge we are closing. Four keeps the
-/// worst-case pinned memory at `4 × PRE_COOKIE_MAX_CH_LEN` = 128 KiB per
+/// worst-case pinned memory at `4 × PRE_COOKIE_MAX_CH_LEN` = 32 KiB per
 /// connection object (the application allocates one per 4-tuple it chooses
 /// to answer), while giving the genuine CH room alongside a few bogus
 /// claims.

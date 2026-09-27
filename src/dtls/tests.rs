@@ -3547,8 +3547,10 @@ mod security_regressions {
         let mut server =
             DtlsServerConnection13::new(Arc::new(server_cfg), b"peer-a".to_vec(), srng);
 
-        // The poison datagram: message_seq 0, total_length 32 KiB, one byte.
-        let poison_frag = raw_fragment(hs_type::CLIENT_HELLO, 32 * 1024, 0, 0, &[0xAA]);
+        // The poison datagram: message_seq 0, one byte of a claimed CH at
+        // the pre-cookie length ceiling (8 KiB), so it IS admitted to the
+        // fragment buffer and can never complete.
+        let poison_frag = raw_fragment(hs_type::CLIENT_HELLO, 8 * 1024, 0, 0, &[0xAA]);
         let mut poison_dg = Vec::new();
         record::write_record(
             &mut poison_dg,
@@ -3825,6 +3827,95 @@ mod audit_2026_09 {
             );
             app_data_round_trip(&mut client, &mut server);
         }
+    }
+
+    /// Reassembles the client's epoch-0 ClientHello body from its
+    /// datagrams (a multi-share CH spans several fragments).
+    fn client_hello_body(dgs: &[Vec<u8>]) -> Vec<u8> {
+        use crate::dtls::reassembly::read_fragment;
+        let mut body = Vec::new();
+        for dg in dgs {
+            let mut rec_off = 0;
+            while rec_off < dg.len() {
+                let rec = record::read_record(&dg[rec_off..]).unwrap().unwrap();
+                rec_off += rec.len;
+                let mut off = 0;
+                while off < rec.fragment.len() {
+                    let f = read_fragment(&rec.fragment[off..]).unwrap();
+                    assert_eq!(f.msg_type, hs_type::CLIENT_HELLO);
+                    body.resize(f.total_length as usize, 0);
+                    let at = f.fragment_offset as usize;
+                    body[at..at + f.fragment.len()].copy_from_slice(f.fragment);
+                    off += f.len;
+                }
+            }
+        }
+        body
+    }
+
+    /// Grows a DTLS ClientHello body to exactly `target` bytes with a
+    /// trailing `padding` extension (RFC 7685).
+    fn pad_client_hello(body: &[u8], target: usize) -> Vec<u8> {
+        let mut p = 2 + 32; // legacy_version, random
+        p += 1 + body[p] as usize; // legacy_session_id
+        p += 1 + body[p] as usize; // legacy_cookie
+        p += 2 + u16::from_be_bytes([body[p], body[p + 1]]) as usize; // cipher_suites
+        p += 1 + body[p] as usize; // legacy_compression_methods
+        let pad = target - body.len() - 4;
+        let mut out = body.to_vec();
+        let ext_len = u16::from_be_bytes([out[p], out[p + 1]]) as usize + 4 + pad;
+        out[p..p + 2].copy_from_slice(&(ext_len as u16).to_be_bytes());
+        out.extend_from_slice(&[0x00, 0x15]);
+        out.extend_from_slice(&(pad as u16).to_be_bytes());
+        out.resize(target, 0);
+        out
+    }
+
+    /// Pre-cookie memory: every candidate in the pre-cookie fragment
+    /// buffer is allocated to its CLAIMED length on its first fragment, so
+    /// `PRE_COOKIE_MAX_CH_LEN` is what one tiny spoofed datagram can pin
+    /// (times `PRE_COOKIE_MAX_IN_PROGRESS`). The ceiling is 8 KiB: a
+    /// genuine ClientHello padded to exactly that size is still served,
+    /// one byte more is dropped before anything is buffered — and the
+    /// crate's own default multi-share offer stays far below it.
+    #[test]
+    fn pre_cookie_client_hello_length_ceiling_13() {
+        let (_, cert) = make_server13_local();
+        let mut client = client13(client13_cfg(&cert), b"ch-ceiling-client");
+        let body = client_hello_body(&client.pop_outbound_datagrams());
+        assert!(
+            body.len() < 2 * 1024,
+            "the default ML-KEM offer is well below the ceiling ({} bytes)",
+            body.len()
+        );
+
+        let served = |target: usize, seed: &[u8]| -> bool {
+            let (server_cfg, _) = make_server13_local();
+            let mut server = server13(server_cfg.with_cookie_secret([0xa5; 32]), seed);
+            let padded = pad_client_hello(&body, target);
+            for (i, chunk) in padded.chunks(1000).enumerate() {
+                let frag = raw_fragment(
+                    hs_type::CLIENT_HELLO,
+                    target as u32,
+                    0,
+                    (i * 1000) as u32,
+                    chunk,
+                );
+                server
+                    .feed_datagram(&plain_record(i as u64, &frag))
+                    .unwrap();
+            }
+            // With a cookie secret, an accepted CH1 is answered with an HRR.
+            !server.pop_outbound_datagrams().is_empty()
+        };
+        assert!(
+            served(8 * 1024, b"ch-ceiling-at"),
+            "a fragmented ClientHello at the ceiling must be served"
+        );
+        assert!(
+            !served(8 * 1024 + 1, b"ch-ceiling-over"),
+            "a ClientHello claim above the ceiling must be dropped"
+        );
     }
 
     /// Slot exhaustion: `PRE_COOKIE_MAX_IN_PROGRESS` spoofed partial
