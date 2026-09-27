@@ -33,7 +33,8 @@
 //! [`super::common::ConnectionCore`].
 
 use super::super::codec::{
-    ParsedRecord, is_legal_record_version, read_record_with_max, write_record,
+    MAX_PLAINTEXT_FRAGMENT, ParsedRecord, fragments, is_legal_record_version, read_record_with_max,
+    write_record,
 };
 use super::client12::{
     SUITES_12, SigKind, SuiteParams12, lookup_suite_12, parse_certificate_list_12,
@@ -981,9 +982,16 @@ impl<R: RngCore> ServerConnection12<R> {
         self.state = State::Closed;
     }
 
-    /// Writes a plaintext record straight to the outbound buffer.
+    /// Writes a plaintext record straight to the outbound buffer. A
+    /// handshake message longer than 2^14 bytes (a certificate chain of a
+    /// few post-quantum certificates) spans several records, as RFC 5246
+    /// §6.2.1 requires; unprotected records are not subject to the peer's
+    /// `record_size_limit` (RFC 8449 §4). Each fragment is within the bound
+    /// `write_record` enforces, so it cannot fail.
     fn write_plain_record(&mut self, ct: ContentType, payload: &[u8]) {
-        write_record(&mut self.outbuf, ct, self.negotiated_version, payload);
+        for chunk in fragments(payload, MAX_PLAINTEXT_FRAGMENT) {
+            let _ = write_record(&mut self.outbuf, ct, self.negotiated_version, chunk);
+        }
     }
 
     /// Encrypts `payload` under the installed `server_crypter` and frames it.
@@ -994,8 +1002,7 @@ impl<R: RngCore> ServerConnection12<R> {
             .as_mut()
             .ok_or(Error::InappropriateState)?;
         let fragment = crypter.encrypt(ct, version, payload)?;
-        write_record(&mut self.outbuf, ct, version, &fragment);
-        Ok(())
+        write_record(&mut self.outbuf, ct, version, &fragment)
     }
 
     /// Test-only: like [`Self::emit_encrypted`], but a CBC record is padded
@@ -1014,8 +1021,7 @@ impl<R: RngCore> ServerConnection12<R> {
             .as_mut()
             .ok_or(Error::InappropriateState)?;
         let fragment = crypter.encrypt_max_padding(ct, version, payload)?;
-        write_record(&mut self.outbuf, ct, version, &fragment);
-        Ok(())
+        write_record(&mut self.outbuf, ct, version, &fragment)
     }
 
     /// Test-only: encrypt and emit an attacker-shaped record (any content
@@ -3084,7 +3090,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &first,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         // The first record alone is under the cap; draining it yields no
         // complete message yet (Ok(None) — buffer just grows).
@@ -3102,7 +3109,8 @@ mod tests {
                 ContentType::Handshake,
                 ProtocolVersion::TLSv1_2,
                 &chunk,
-            );
+            )
+            .unwrap();
             s.read_tls(&rec);
             if matches!(s.process_new_packets(), Err(Error::RecordOverflow)) {
                 hit_overflow = true;
@@ -3146,7 +3154,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &ch,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         assert!(matches!(
             s.process_new_packets(),
@@ -3182,7 +3191,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &ch,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         assert!(matches!(
             s.process_new_packets(),
@@ -3225,7 +3235,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &ch,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         assert!(matches!(
             s.process_new_packets(),
@@ -3263,7 +3274,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &ch,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         // The CH is now accepted; the handshake reached the SH-emit
         // step without erroring out.
@@ -3304,7 +3316,8 @@ mod tests {
                 ContentType::Handshake,
                 ProtocolVersion::TLSv1_2,
                 &ch,
-            );
+            )
+            .unwrap();
             rec
         };
 
@@ -3358,7 +3371,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &ch,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         s.process_new_packets().unwrap();
         assert_eq!(
@@ -3402,7 +3416,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &[],
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         assert!(matches!(
             s.process_new_packets(),
@@ -3590,7 +3605,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_0,
             &ch,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         let r = s.process_new_packets();
         (s, r)
@@ -3663,7 +3679,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_0,
             &ch,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         s.process_new_packets().unwrap();
         let sr = s.server_random.expect("server_random set");
@@ -3714,7 +3731,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_0,
             &ch,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         s.process_new_packets().unwrap();
         // Drain the server flight (SH || Certificate || ServerHelloDone).
@@ -3738,7 +3756,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_0,
             &cke,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         // RFC 5246 §7.4.7.1 implicit rejection: a version mismatch MUST NOT
         // produce an error, alert, or state divergence — only a different
@@ -4083,7 +4102,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &ch,
-        );
+        )
+        .unwrap();
         s.read_tls(&rec);
         assert!(matches!(s.process_new_packets(), Err(Error::Decode)));
     }
@@ -4117,7 +4137,8 @@ mod tests {
                 ContentType::Handshake,
                 ProtocolVersion::TLSv1_2,
                 &ch,
-            );
+            )
+            .unwrap();
             rec
         }
 

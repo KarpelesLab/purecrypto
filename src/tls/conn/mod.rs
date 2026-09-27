@@ -1077,6 +1077,182 @@ mod loopback_tests {
         );
     }
 
+    /// An ML-DSA-87 server chain — leaf, two intermediates — plus the
+    /// self-signed ML-DSA-87 root that anchors it. Each certificate carries
+    /// a 2592-byte key and a 4627-byte signature, so the three the server
+    /// sends run past 16 KiB: `Certificate` cannot fit one record.
+    #[cfg(feature = "mldsa")]
+    fn mldsa87_chain_server() -> (ServerConfig, Vec<u8>) {
+        use crate::mldsa::MlDsa87PrivateKey;
+        use crate::x509::AnyPublicKey;
+        let mut rng = HmacDrbg::<Sha256>::new(b"loopback-mldsa87-chain", b"nonce", &[]);
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let root_name = DistinguishedName::common_name("ML-DSA-87 Root");
+        let int1_name = DistinguishedName::common_name("ML-DSA-87 Intermediate 1");
+        let int2_name = DistinguishedName::common_name("ML-DSA-87 Intermediate 2");
+        let leaf_name = DistinguishedName::common_name("loopback.example");
+
+        let (root_sk, _) = MlDsa87PrivateKey::generate(&mut rng);
+        let (int1_sk, int1_pk) = MlDsa87PrivateKey::generate(&mut rng);
+        let (int2_sk, int2_pk) = MlDsa87PrivateKey::generate(&mut rng);
+        let (leaf_sk, leaf_pk) = MlDsa87PrivateKey::generate(&mut rng);
+
+        let root = Certificate::self_signed_general(
+            &CertSigner::MlDsa87(&root_sk),
+            &root_name,
+            &validity,
+            1,
+            true,
+            &[],
+        )
+        .unwrap();
+        let int1 = Certificate::issue_general(
+            &CertSigner::MlDsa87(&root_sk),
+            &root_name,
+            &int1_name,
+            &AnyPublicKey::MlDsa87(int1_pk),
+            &validity,
+            2,
+            true,
+            &[],
+        )
+        .unwrap();
+        let int2 = Certificate::issue_general(
+            &CertSigner::MlDsa87(&int1_sk),
+            &int1_name,
+            &int2_name,
+            &AnyPublicKey::MlDsa87(int2_pk),
+            &validity,
+            3,
+            true,
+            &[],
+        )
+        .unwrap();
+        let leaf = Certificate::issue_general(
+            &CertSigner::MlDsa87(&int2_sk),
+            &int2_name,
+            &leaf_name,
+            &AnyPublicKey::MlDsa87(leaf_pk),
+            &validity,
+            4,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let chain = alloc::vec![
+            leaf.to_der().to_vec(),
+            int2.to_der().to_vec(),
+            int1.to_der().to_vec(),
+        ];
+        let total: usize = chain.iter().map(Vec::len).sum();
+        assert!(
+            total > (1 << 14),
+            "the chain must exceed one record's plaintext ({total} bytes)"
+        );
+        (
+            ServerConfig::with_mldsa87(chain, leaf_sk),
+            root.to_der().to_vec(),
+        )
+    }
+
+    /// Finding: handshake messages were never fragmented across records, so
+    /// a `Certificate` past 2^14 bytes — three ML-DSA-87 certificates — hit
+    /// the record crypter's `RecordOverflow`, latched as a write error, and
+    /// the server's first flight never left. RFC 8446 §5.1 requires the
+    /// sender to split it; the client reassembles.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn certificate_chain_past_one_record_spans_records() {
+        run_with(
+            mldsa87_chain_server(),
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
+    /// RFC 8449 §4: the peer's `record_size_limit` bounds every protected
+    /// record we send, handshake records included — not only application
+    /// data. With the client at the minimum limit of 64, each protected
+    /// record of the server's flight (EncryptedExtensions through Finished,
+    /// then NewSessionTicket) carries at most 63 bytes of content.
+    #[test]
+    fn record_size_limit_bounds_handshake_records() {
+        use crate::tls::codec::{ParsedRecord, read_record};
+
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"rsl-hs-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rsl-hs-server", b"nonce", &[]);
+        let mut client = ClientConnection::new(
+            ClientConfig::new(roots).with_record_size_limit(64),
+            "loopback.example",
+            &mut crng,
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(server_config, srng);
+
+        let mut protected_records = 0;
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            let mut off = 0;
+            while off < s.len() {
+                let ParsedRecord {
+                    content_type,
+                    fragment,
+                    len,
+                    ..
+                } = read_record(&s[off..]).unwrap().expect("whole records");
+                // Only protected records are subject to the limit: the
+                // ServerHello and the middlebox CCS go out in the clear.
+                if content_type == crate::tls::ContentType::ApplicationData {
+                    assert!(
+                        fragment.len() <= 64 + 16,
+                        "protected handshake record carries {} bytes",
+                        fragment.len()
+                    );
+                    protected_records += 1;
+                }
+                off += len;
+            }
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        // An RSA certificate alone is several hundred bytes, so the flight
+        // had to split many times over.
+        assert!(
+            protected_records > 10,
+            "expected a fragmented server flight, saw {protected_records} records"
+        );
+
+        // The reassembled handshake authenticated: data flows both ways.
+        client.send_application_data(b"ping").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ping");
+        server.send_application_data(b"pong").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"pong");
+    }
+
     /// Runs a full in-process handshake with an RSA server, then exchanges
     /// application data in both directions.
     fn run(suites: &[CipherSuite], groups: &[NamedGroup]) {
@@ -3559,7 +3735,8 @@ mod loopback_tests {
             crate::tls::ContentType::Handshake,
             crate::tls::ProtocolVersion::TLSv1_2,
             &body,
-        );
+        )
+        .unwrap();
         out
     }
 
@@ -3694,7 +3871,8 @@ mod loopback_tests {
             crate::tls::ContentType::Handshake,
             crate::tls::ProtocolVersion::TLSv1_2,
             &body,
-        );
+        )
+        .unwrap();
 
         client.read_tls(&hrr);
         let err = client.process_new_packets().unwrap_err();
@@ -3753,7 +3931,8 @@ mod loopback_tests {
                 crate::tls::ContentType::Handshake,
                 crate::tls::ProtocolVersion::TLSv1_2,
                 &body,
-            );
+            )
+            .unwrap();
             out
         }
 
@@ -3892,7 +4071,8 @@ mod loopback_tests {
             crate::tls::ContentType::Handshake,
             crate::tls::ProtocolVersion::TLSv1_2,
             &sh.encode(),
-        );
+        )
+        .unwrap();
         client.read_tls(&out);
         let err = client.process_new_packets().unwrap_err();
         assert!(matches!(err, crate::tls::Error::IllegalParameter));
@@ -3942,7 +4122,8 @@ mod loopback_tests {
             crate::tls::ContentType::Handshake,
             crate::tls::ProtocolVersion::TLSv1_2,
             &sh.encode(),
-        );
+        )
+        .unwrap();
         client.read_tls(&out);
         let err = client.process_new_packets().unwrap_err();
         assert!(matches!(err, crate::tls::Error::IllegalParameter));
@@ -3992,7 +4173,8 @@ mod loopback_tests {
             crate::tls::ContentType::Handshake,
             crate::tls::ProtocolVersion::TLSv1_2,
             &sh.encode(),
-        );
+        )
+        .unwrap();
         client.read_tls(&out);
         let err = client.process_new_packets().unwrap_err();
         assert!(matches!(err, crate::tls::Error::IllegalParameter));
@@ -4036,7 +4218,8 @@ mod loopback_tests {
             crate::tls::ContentType::ChangeCipherSpec,
             crate::tls::ProtocolVersion::TLSv1_2,
             &[0x01],
-        );
+        )
+        .unwrap();
         client.read_tls(&bad);
         let err = client.process_new_packets().unwrap_err();
         assert!(matches!(err, crate::tls::Error::UnexpectedMessage));
@@ -4061,7 +4244,8 @@ mod loopback_tests {
             crate::tls::ContentType::ChangeCipherSpec,
             crate::tls::ProtocolVersion::TLSv1_2,
             &[0x01, 0x02],
-        );
+        )
+        .unwrap();
         client.read_tls(&bad);
         let err = client.process_new_packets().unwrap_err();
         assert!(matches!(err, crate::tls::Error::UnexpectedMessage));
@@ -5446,7 +5630,8 @@ mod loopback_tests {
             crate::tls::ContentType::Handshake,
             crate::tls::ProtocolVersion::TLSv1_2,
             &new_body,
-        );
+        )
+        .unwrap();
 
         server.read_tls(&new_record);
         let err = server.process_new_packets().unwrap_err();
@@ -5490,6 +5675,67 @@ mod tls12_loopback_tests {
             ServerConfig12::with_rsa(alloc::vec![der.clone()], boxed),
             der,
         )
+    }
+
+    /// An RSA self-signed server config whose certificate is padded past
+    /// 2^14 bytes with a large non-critical private extension (RFC 5280
+    /// §4.2: unrecognised non-critical extensions are ignored), so the
+    /// server's `Certificate` cannot fit one record. Plus the DER.
+    fn oversized_rsa_server12() -> (ServerConfig12, Vec<u8>) {
+        use crate::x509::{Extension, GeneralName, extension};
+        let key = rsa_test_key_a();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        // 20 000 bytes of padding as a DER OCTET STRING under a private
+        // enterprise arc.
+        let padding = alloc::vec![0x5au8; 20_000];
+        let mut value = alloc::vec![0x04, 0x82];
+        value.extend_from_slice(&(padding.len() as u16).to_be_bytes());
+        value.extend_from_slice(&padding);
+        let exts = [
+            extension::basic_constraints(false, None),
+            extension::subject_alt_name(&[GeneralName::Dns("loopback.example".into())]),
+            Extension {
+                oid: alloc::vec![1, 3, 6, 1, 4, 1, 99999, 1],
+                critical: false,
+                value,
+            },
+        ];
+        let cert = Certificate::self_signed_with_extensions(
+            &CertSigner::Rsa(&boxed),
+            &name,
+            &validity,
+            1,
+            &exts,
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        assert!(
+            der.len() > (1 << 14),
+            "the certificate must exceed one record"
+        );
+        (
+            ServerConfig12::with_rsa(alloc::vec![der.clone()], boxed),
+            der,
+        )
+    }
+
+    /// Finding: the TLS 1.2 server framed each handshake message as one
+    /// plaintext record with the length cast to `u16`, so a `Certificate`
+    /// past 2^14 bytes was either refused by the peer as `record_overflow`
+    /// or, past 65535 bytes, framed with a truncated length. RFC 5246
+    /// §6.2.1 requires the sender to fragment; the client reassembles.
+    #[test]
+    fn certificate_past_one_record_spans_records_12() {
+        run_with(
+            oversized_rsa_server12(),
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
     }
 
     /// A P-256 ECDSA self-signed server config plus its certificate DER.
@@ -7566,7 +7812,8 @@ mod tls12_loopback_tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &ch,
-        );
+        )
+        .unwrap();
         server.read_tls(&rec);
         server.process_new_packets().unwrap();
 
@@ -7623,7 +7870,8 @@ mod tls12_loopback_tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &sh,
-        );
+        )
+        .unwrap();
         client.read_tls(&rec);
         assert!(matches!(
             client.process_new_packets(),
@@ -7659,7 +7907,8 @@ mod tls12_loopback_tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &hr,
-        );
+        )
+        .unwrap();
         client1.read_tls(&rec);
         assert!(matches!(
             client1.process_new_packets(),
@@ -7915,7 +8164,8 @@ mod tls12_loopback_tests {
             ContentType::ChangeCipherSpec,
             ProtocolVersion::TLSv1_2,
             &[0x01],
-        );
+        )
+        .unwrap();
         client.read_tls(&rec);
         assert!(matches!(
             client.process_new_packets(),
@@ -7959,7 +8209,8 @@ mod tls12_loopback_tests {
             ContentType::ChangeCipherSpec,
             ProtocolVersion::TLSv1_2,
             &[0x01],
-        );
+        )
+        .unwrap();
         server.read_tls(&rec);
         assert!(matches!(
             server.process_new_packets(),
@@ -9053,7 +9304,8 @@ fn synthetic_hrr_record_for_audit(selected_group: crate::tls::codec::NamedGroup)
         crate::tls::ContentType::Handshake,
         crate::tls::ProtocolVersion::TLSv1_2,
         &body,
-    );
+    )
+    .unwrap();
     out
 }
 
@@ -9846,7 +10098,8 @@ mod audit_regression_tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &cr,
-        );
+        )
+        .unwrap();
         client.read_tls(&rec);
         client.process_new_packets().unwrap();
 
@@ -9914,7 +10167,8 @@ mod audit_regression_tests {
                 ContentType::Handshake,
                 ProtocolVersion::TLSv1_2,
                 chunk,
-            );
+            )
+            .unwrap();
         }
         client.read_tls(&rec);
         client.process_new_packets().unwrap();
@@ -9954,7 +10208,8 @@ mod audit_regression_tests {
             ContentType::Alert,
             ProtocolVersion::TLSv1_2,
             &[2, AlertDescription::HandshakeFailure.as_u8()],
-        );
+        )
+        .unwrap();
         client.read_tls(&rec);
         assert!(matches!(
             client.process_new_packets(),
@@ -9974,7 +10229,8 @@ mod audit_regression_tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &[0u8, 0, 0, 0], // HelloRequest
-        );
+        )
+        .unwrap();
         client.read_tls(&hs);
         assert!(client.process_new_packets().is_err());
     }
@@ -10005,7 +10261,8 @@ mod audit_regression_tests {
             ContentType::Alert,
             ProtocolVersion::TLSv1_2,
             &[2, AlertDescription::InternalError.as_u8()],
-        );
+        )
+        .unwrap();
         server.read_tls(&rec);
         assert!(matches!(
             server.process_new_packets(),
@@ -10059,7 +10316,8 @@ mod audit_regression_tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &payload,
-        );
+        )
+        .unwrap();
         rec
     }
 
@@ -10128,7 +10386,8 @@ mod audit_regression_tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &payload,
-        );
+        )
+        .unwrap();
 
         let srng = HmacDrbg::<Sha256>::new(b"ch-coalesce-s", b"nonce", &[]);
         let mut server = ServerConnection::new(server_config, srng);
@@ -10296,13 +10555,15 @@ mod audit_regression_tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &[0x04, 0x00],
-        );
+        )
+        .unwrap();
         write_record(
             &mut wire,
             ContentType::ChangeCipherSpec,
             ProtocolVersion::TLSv1_2,
             &[0x01],
-        );
+        )
+        .unwrap();
         client.read_tls(&wire);
         assert!(matches!(
             client.process_new_packets(),
@@ -10345,7 +10606,8 @@ mod audit_regression_tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &msg,
-        );
+        )
+        .unwrap();
 
         let srng = HmacDrbg::<Sha256>::new(b"compress-s", b"nonce", &[]);
         let mut server = ServerConnection::new(server_config, srng);
@@ -10573,13 +10835,15 @@ mod audit_regression_tests {
             ContentType::ChangeCipherSpec,
             ProtocolVersion::TLSv1_2,
             &[0x01],
-        );
+        )
+        .unwrap();
         write_record(
             &mut wire,
             ContentType::ApplicationData,
             ProtocolVersion::TLSv1_2,
             &app,
-        );
+        )
+        .unwrap();
         client.read_tls(&wire);
         let r = client.process_new_packets();
         assert!(matches!(r, Err(Error::UnexpectedMessage)), "got {r:?}");

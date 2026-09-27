@@ -8,7 +8,10 @@
 //! role-specific state machines (client/server) drive it by pulling decoded
 //! messages and emitting handshake messages.
 
-use super::super::codec::{ParsedRecord, is_legal_record_version, read_record, write_record};
+use super::super::codec::{
+    MAX_PLAINTEXT_FRAGMENT, ParsedRecord, fragments, is_legal_record_version, read_record,
+    write_record,
+};
 use super::super::crypto::{AEAD_TAG_LEN, RecordCrypter, Transcript};
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
 use alloc::vec::Vec;
@@ -186,8 +189,9 @@ impl ConnectionCore {
     }
 
     /// Sets the peer-advertised record-size limit (RFC 8449); subsequent
-    /// `send_application_data` calls split into records of at most
-    /// `limit - 1` plaintext bytes (the extra byte is the inner content type).
+    /// protected records — application data and handshake messages alike —
+    /// carry at most `limit - 1` plaintext bytes (the extra byte is the
+    /// inner content type); see [`Self::outbound_fragment_cap`].
     pub(crate) fn set_peer_record_size_limit(&mut self, limit: u16) {
         self.peer_record_size_limit = Some(limit);
     }
@@ -301,6 +305,9 @@ impl ConnectionCore {
 
     /// Updates the transcript with a handshake message and frames it for
     /// sending (encrypted if write keys are installed, else as plaintext).
+    /// A message longer than one record's plaintext cap — a certificate
+    /// chain of a few ML-DSA certificates runs past 2¹⁴ bytes — spans as
+    /// many records as it takes (RFC 8446 §5.1); the peer reassembles.
     ///
     /// Once the transcript is sealed (see `Transcript::seal`, called at the
     /// `Connected` transition) the update is a no-op: post-handshake messages
@@ -352,33 +359,18 @@ impl ConnectionCore {
     }
 
     /// Sends a (plaintext) ChangeCipherSpec for middlebox compatibility.
+    /// Deliberately bypasses the write crypter: the engines emit it right
+    /// after installing the handshake write key, and RFC 8446 §5 wants it
+    /// unprotected.
     pub(crate) fn emit_ccs(&mut self) {
-        write_record(
-            &mut self.outbuf,
-            ContentType::ChangeCipherSpec,
-            ProtocolVersion::TLSv1_2,
-            &[1],
-        );
+        self.emit_plaintext_record(ContentType::ChangeCipherSpec, &[1]);
     }
 
-    /// Sends application data (requires write keys to be installed). If the
-    /// peer has advertised a `record_size_limit` smaller than `data.len()`
-    /// (or the default 2¹⁴), the data is fragmented into multiple records.
+    /// Sends application data (requires write keys to be installed). Data
+    /// longer than one record's plaintext cap — the peer's
+    /// `record_size_limit` or the protocol's 2¹⁴ — spans several records.
     pub(crate) fn send_application_data(&mut self, data: &[u8]) {
-        // Cap = min(peer_limit - 1, 2^14). The `-1` reserves room for the
-        // inner content-type byte per RFC 8449 §4.
-        let cap = self
-            .peer_record_size_limit
-            .map(|l| (l - 1) as usize)
-            .unwrap_or(1 << 14);
-        let cap = cap.min(1 << 14);
-        if data.len() <= cap {
-            self.emit_record(ContentType::ApplicationData, data);
-        } else {
-            for chunk in data.chunks(cap) {
-                self.emit_record(ContentType::ApplicationData, chunk);
-            }
-        }
+        self.emit_record(ContentType::ApplicationData, data);
     }
 
     /// Test hook: emits `data` as a single protected `application_data`
@@ -387,7 +379,26 @@ impl ConnectionCore {
     /// enforcement.
     #[cfg(test)]
     pub(crate) fn emit_unfragmented_application_data_for_test(&mut self, data: &[u8]) {
-        self.emit_record(ContentType::ApplicationData, data);
+        self.emit_one_record(ContentType::ApplicationData, data);
+    }
+
+    /// The most plaintext one outbound record may carry right now.
+    ///
+    /// The protocol caps a record's plaintext at 2¹⁴ bytes (RFC 8446 §5.1).
+    /// A peer that advertised `record_size_limit` (RFC 8449 §4) lowers that
+    /// for *protected* records: its limit counts the whole
+    /// `TLSInnerPlaintext`, so one byte is reserved for the inner content
+    /// type. Unprotected records are not subject to the limit (§4:
+    /// "Unprotected messages are not subject to this limit"), and a limit
+    /// above the protocol maximum is clamped. The parser rejects limits
+    /// below 64, so the cap is never zero.
+    fn outbound_fragment_cap(&self) -> usize {
+        match (&self.write, self.peer_record_size_limit) {
+            (Some(_), Some(limit)) => usize::from(limit)
+                .saturating_sub(1)
+                .clamp(1, MAX_PLAINTEXT_FRAGMENT),
+            _ => MAX_PLAINTEXT_FRAGMENT,
+        }
     }
 
     /// Sends a fatal alert.
@@ -422,7 +433,28 @@ impl ConnectionCore {
         self.sent_close_notify
     }
 
+    /// Frames `payload` as one or more records of content type `ct`
+    /// (protected once write keys are installed, plaintext before), each
+    /// carrying at most [`Self::outbound_fragment_cap`] bytes. Every sender
+    /// path funnels through here, so a handshake message or application
+    /// write of any length is fragmented as RFC 8446 §5.1 requires — the
+    /// crypter would otherwise refuse anything past 2¹⁴ as `RecordOverflow`
+    /// and the message would never reach the wire. Alerts are two bytes and
+    /// never split.
     pub(crate) fn emit_record(&mut self, ct: ContentType, payload: &[u8]) {
+        let cap = self.outbound_fragment_cap();
+        if payload.len() <= cap {
+            self.emit_one_record(ct, payload);
+        } else {
+            for chunk in fragments(payload, cap) {
+                self.emit_one_record(ct, chunk);
+            }
+        }
+    }
+
+    /// Frames exactly one record carrying all of `payload`; the caller has
+    /// already bounded it (see [`Self::emit_record`]).
+    fn emit_one_record(&mut self, ct: ContentType, payload: &[u8]) {
         match &mut self.write {
             Some(crypter) => match crypter.encrypt(ct, payload) {
                 Ok(rec) => self.outbuf.extend_from_slice(&rec),
@@ -431,15 +463,26 @@ impl ConnectionCore {
                     // per-key sequence cap — the engines pre-empt it with an
                     // automatic `KeyUpdate`, but a peer that never lets us
                     // rekey can still get here) and `RecordOverflow` (a
-                    // caller failed to fragment). The record is NOT on the
-                    // wire, so silently returning would leave
-                    // `send_application_data` / `send_close_notify` as
-                    // no-ops that still report success. Latch the error so
-                    // the engines can surface it.
+                    // caller bypassed `emit_record`'s fragmentation). The
+                    // record is NOT on the wire, so silently returning
+                    // would leave `send_application_data` /
+                    // `send_close_notify` as no-ops that still report
+                    // success. Latch the error so the engines can surface
+                    // it.
                     self.write_error.get_or_insert(e);
                 }
             },
-            None => write_record(&mut self.outbuf, ct, ProtocolVersion::TLSv1_2, payload),
+            None => self.emit_plaintext_record(ct, payload),
+        }
+    }
+
+    /// Frames one unprotected record. `write_record` only refuses a
+    /// fragment past the largest legal record, which a payload bounded by
+    /// [`Self::outbound_fragment_cap`] never is; should it ever happen the
+    /// failure latches like a protection failure rather than vanishing.
+    fn emit_plaintext_record(&mut self, ct: ContentType, payload: &[u8]) {
+        if let Err(e) = write_record(&mut self.outbuf, ct, ProtocolVersion::TLSv1_2, payload) {
+            self.write_error.get_or_insert(e);
         }
     }
 
@@ -729,6 +772,91 @@ mod tests {
             core.quic_feed_handshake(&chunk),
             Err(Error::RecordOverflow)
         ));
+    }
+
+    /// Finding: `emit_handshake` handed the whole message to the record
+    /// crypter, which refuses anything past 2¹⁴ bytes, so a long
+    /// `Certificate` latched `RecordOverflow` and never went out. Every
+    /// emit path now splits at the record cap — the protocol's 2¹⁴, or the
+    /// peer's `record_size_limit` (minus the inner type byte) for protected
+    /// records — while unprotected records honour only the protocol cap
+    /// (RFC 8449 §4: "Unprotected messages are not subject to this limit").
+    #[test]
+    fn emit_paths_fragment_at_the_record_cap() {
+        use crate::tls::codec::{ParsedRecord, read_record};
+        use crate::tls::crypto::{AeadAlg, HashAlg, RecordCrypter, Secret};
+
+        fn records(wire: &[u8]) -> Vec<(ContentType, usize)> {
+            let mut out = Vec::new();
+            let mut off = 0;
+            while off < wire.len() {
+                let ParsedRecord {
+                    content_type,
+                    fragment,
+                    len,
+                    ..
+                } = read_record(&wire[off..]).unwrap().expect("whole records");
+                out.push((content_type, fragment.len()));
+                off += len;
+            }
+            out
+        }
+
+        // Plaintext: a 40 000-byte handshake message spans three records of
+        // at most 2^14 bytes, and the peer's limit does not apply.
+        let mut core = ConnectionCore::new();
+        core.set_peer_record_size_limit(64);
+        core.emit_handshake(alloc::vec![0u8; 40_000]);
+        assert!(core.check_write_error().is_ok());
+        let recs = records(&core.write_tls());
+        assert_eq!(
+            recs,
+            [
+                (ContentType::Handshake, 1 << 14),
+                (ContentType::Handshake, 1 << 14),
+                (ContentType::Handshake, 40_000 - 2 * (1 << 14)),
+            ]
+        );
+
+        // Protected: the same message under a peer limit of 100 goes out in
+        // records whose content is at most 99 bytes (+ type byte + tag).
+        let secret = Secret::new(&[0x77u8; 32]);
+        core.set_write(RecordCrypter::new(
+            HashAlg::Sha256,
+            AeadAlg::Aes128Gcm,
+            16,
+            &secret,
+        ));
+        core.set_peer_record_size_limit(100);
+        core.emit_handshake(alloc::vec![0u8; 1000]);
+        assert!(core.check_write_error().is_ok());
+        let recs = records(&core.write_tls());
+        assert_eq!(recs.len(), 1000_usize.div_ceil(99));
+        assert!(
+            recs.iter()
+                .all(|(ct, len)| *ct == ContentType::ApplicationData && *len <= 100 + AEAD_TAG_LEN)
+        );
+
+        // And without a peer limit the protocol cap applies to protected
+        // records too: 2^14 + 1 bytes is two records, not a latched
+        // `RecordOverflow`.
+        let mut core = ConnectionCore::new();
+        core.set_write(RecordCrypter::new(
+            HashAlg::Sha256,
+            AeadAlg::Aes128Gcm,
+            16,
+            &secret,
+        ));
+        core.send_application_data(&alloc::vec![0u8; (1 << 14) + 1]);
+        assert!(core.check_write_error().is_ok());
+        let recs = records(&core.write_tls());
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].1, (1 << 14) + 1 + AEAD_TAG_LEN);
+        assert_eq!(recs[1].1, 1 + 1 + AEAD_TAG_LEN);
+        // An empty application-data record (traffic-analysis padding) is
+        // still one record, not zero.
+        core.send_application_data(&[]);
+        assert_eq!(records(&core.write_tls()).len(), 1);
     }
 
     /// Finding: the write side silently dropped records once the per-key

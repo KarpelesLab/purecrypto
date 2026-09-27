@@ -2809,7 +2809,8 @@ mod tests {
                 crate::tls::ContentType::Handshake,
                 ProtocolVersion::TLSv1_2,
                 frag,
-            );
+            )
+            .unwrap();
         }
         out
     }

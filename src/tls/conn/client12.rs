@@ -41,7 +41,8 @@
 //! the two protocol paths cleanly.
 
 use super::super::codec::{
-    ParsedRecord, is_legal_record_version, read_record_with_max, write_record,
+    MAX_PLAINTEXT_FRAGMENT, ParsedRecord, fragments, is_legal_record_version, read_record_with_max,
+    write_record,
 };
 use super::client::{ClientCertConfig, ClientKey};
 use super::common::MAX_HANDSHAKE_REASSEMBLY;
@@ -1593,9 +1594,16 @@ impl ClientConnection12 {
         self.state = State::Closed;
     }
 
-    /// Writes a plaintext record straight to the outbound buffer.
+    /// Writes a plaintext record straight to the outbound buffer. A
+    /// handshake message longer than 2^14 bytes (a certificate chain of a
+    /// few post-quantum certificates) spans several records, as RFC 5246
+    /// §6.2.1 requires; unprotected records are not subject to the peer's
+    /// `record_size_limit` (RFC 8449 §4). Each fragment is within the bound
+    /// `write_record` enforces, so it cannot fail.
     fn write_plain_record(&mut self, ct: ContentType, payload: &[u8]) {
-        write_record(&mut self.outbuf, ct, self.negotiated_version, payload);
+        for chunk in fragments(payload, MAX_PLAINTEXT_FRAGMENT) {
+            let _ = write_record(&mut self.outbuf, ct, self.negotiated_version, chunk);
+        }
     }
 
     /// Encrypts `payload` under the installed `client_crypter` and frames it.
@@ -1607,8 +1615,7 @@ impl ClientConnection12 {
             .as_mut()
             .ok_or(Error::InappropriateState)?;
         let fragment = crypter.encrypt(ct, version, payload)?;
-        write_record(&mut self.outbuf, ct, version, &fragment);
-        Ok(())
+        write_record(&mut self.outbuf, ct, version, &fragment)
     }
 
     /// Queues an alert (plaintext if keys aren't installed yet, encrypted
@@ -3270,7 +3277,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &body,
-        );
+        )
+        .unwrap();
         rec
     }
 
@@ -3301,7 +3309,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &first,
-        );
+        )
+        .unwrap();
         c.read_tls(&rec);
         let _ = c.process_new_packets();
 
@@ -3315,7 +3324,8 @@ mod tests {
                 ContentType::Handshake,
                 ProtocolVersion::TLSv1_2,
                 &chunk,
-            );
+            )
+            .unwrap();
             c.read_tls(&rec);
             if matches!(c.process_new_packets(), Err(Error::RecordOverflow)) {
                 hit_overflow = true;
@@ -3577,7 +3587,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &[],
-        );
+        )
+        .unwrap();
         c.read_tls(&rec);
         assert!(matches!(
             c.process_new_packets(),
@@ -3610,7 +3621,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &[hs_type::SERVER_HELLO, 0, 0, 16],
-        );
+        )
+        .unwrap();
         partial.truncate(7);
         let mut wire = sh.clone();
         wire.extend_from_slice(&partial);
@@ -3647,7 +3659,8 @@ mod tests {
                 ContentType::Alert,
                 ProtocolVersion::TLSv1_2,
                 &[level, AlertDescription::UserCanceled.as_u8()],
-            );
+            )
+            .unwrap();
             c.read_tls(&rec);
             let r = c.process_new_packets();
             if fatal {
@@ -3694,7 +3707,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &msg,
-        );
+        )
+        .unwrap();
         c.read_tls(&rec);
         assert!(matches!(
             c.process_new_packets(),
@@ -3727,7 +3741,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_0,
             &body,
-        );
+        )
+        .unwrap();
         rec
     }
 
@@ -3984,7 +3999,8 @@ mod tests {
             ContentType::Handshake,
             ProtocolVersion::TLSv1_2,
             &sh.encode(),
-        );
+        )
+        .unwrap();
         rec
     }
 
