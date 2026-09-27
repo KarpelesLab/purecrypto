@@ -138,6 +138,137 @@ fn kdf_parameter_misuse_is_unsupported_not_internal() {
     assert_eq!(st, PcStatus::Ok);
 }
 
+/// The plain-length entry points (KDFs, XOFs) borrow their inputs and their
+/// output over caller memory at once, so an `out` that overlaps an input is
+/// refused with `PC_NULL_POINTER` before either borrow exists — every
+/// overlap shape (identical, straddling either end, nested), against every
+/// input, with nothing written; disjoint adjacent ranges still work.
+#[test]
+fn plain_length_outputs_must_not_overlap_inputs() {
+    // One arena; inputs and output are windows into it, all reached through
+    // `base` so no safe reference to the arena is ever live across a call.
+    let mut arena = vec![0xAAu8; 96];
+    let base = arena.as_mut_ptr();
+    let untouched = || {
+        unsafe { core::slice::from_raw_parts(base, 96) }
+            .iter()
+            .all(|&x| x == 0xAA)
+    };
+    let call = |ep: &dyn Fn(*const u8, usize, *const u8, usize, *mut u8, usize) -> PcStatus,
+                a: (usize, usize),
+                b: (usize, usize),
+                out: (usize, usize)| unsafe {
+        ep(
+            base.add(a.0),
+            a.1,
+            base.add(b.0),
+            b.1,
+            base.add(out.0),
+            out.1,
+        )
+    };
+    type Ep = dyn Fn(*const u8, usize, *const u8, usize, *mut u8, usize) -> PcStatus;
+    let hkdf: &Ep = &|a, al, b, bl, o, ol| unsafe {
+        kdf::pc_hkdf(hash::id::SHA256, a, al, b, bl, core::ptr::null(), 0, o, ol)
+    };
+    let hkdf_info: &Ep = &|a, al, b, bl, o, ol| unsafe {
+        kdf::pc_hkdf(hash::id::SHA256, core::ptr::null(), 0, a, al, b, bl, o, ol)
+    };
+    let pbkdf2: &Ep =
+        &|a, al, b, bl, o, ol| unsafe { kdf::pc_pbkdf2(hash::id::SHA256, a, al, b, bl, 1, o, ol) };
+    let scrypt: &Ep =
+        &|a, al, b, bl, o, ol| unsafe { kdf::pc_scrypt(a, al, b, bl, 2, 1, 1, o, ol) };
+    let argon2: &Ep = &|a, al, b, bl, o, ol| unsafe {
+        kdf::pc_argon2(kdf::argon2_id::ARGON2ID, a, al, b, bl, 1, 8, 1, o, ol)
+    };
+    let kbkdf_counter: &Ep = &|a, al, b, bl, o, ol| unsafe {
+        kdf::pc_kbkdf_counter(kdf::kbkdf_prf::HMAC_SHA256, a, al, b, bl, b, bl, o, ol)
+    };
+    let kbkdf_feedback: &Ep = &|a, al, b, bl, o, ol| unsafe {
+        kdf::pc_kbkdf_feedback(
+            kdf::kbkdf_prf::HMAC_SHA256,
+            a,
+            al,
+            b,
+            bl,
+            a,
+            al,
+            b,
+            bl,
+            o,
+            ol,
+        )
+    };
+    let kbkdf_feedback_iv: &Ep = &|a, al, b, bl, o, ol| unsafe {
+        kdf::pc_kbkdf_feedback(
+            kdf::kbkdf_prf::HMAC_SHA256,
+            a,
+            al,
+            a,
+            al,
+            b,
+            bl,
+            b,
+            bl,
+            o,
+            ol,
+        )
+    };
+    let xof: &Ep = &|a, al, _b, _bl, o, ol| unsafe { hash::pc_ascon_xof(a, al, o, ol) };
+    let cxof: &Ep = &|a, al, b, bl, o, ol| unsafe { hash::pc_ascon_cxof(a, al, b, bl, o, ol) };
+    // `pc_ascon_xof` has a single input, so the second range is unused there.
+    let entry_points: [(&str, &Ep, bool); 10] = [
+        ("pc_hkdf", hkdf, true),
+        ("pc_hkdf(info)", hkdf_info, true),
+        ("pc_pbkdf2", pbkdf2, true),
+        ("pc_scrypt", scrypt, true),
+        ("pc_argon2", argon2, true),
+        ("pc_kbkdf_counter", kbkdf_counter, true),
+        ("pc_kbkdf_feedback", kbkdf_feedback, true),
+        ("pc_kbkdf_feedback(iv)", kbkdf_feedback_iv, true),
+        ("pc_ascon_xof", xof, false),
+        ("pc_ascon_cxof", cxof, true),
+    ];
+
+    // Inputs at [0, 16) and [32, 48); overlapping outputs of each shape.
+    let a = (0, 16);
+    let b = (32, 16);
+    let overlapping = [
+        ((0, 16), false), // identical to `a`
+        ((8, 16), false), // straddles the end of `a`
+        ((24, 16), true), // straddles the start of `b` only
+        ((36, 4), true),  // nested inside `b` only
+        ((40, 16), true), // straddles the end of `b` only
+        ((0, 48), false), // covers both
+    ];
+    for (name, ep, uses_b) in &entry_points {
+        for (out, only_b) in overlapping {
+            let st = call(ep, a, b, out);
+            if only_b && !uses_b {
+                assert_eq!(st, PcStatus::Ok, "{name} out={out:?}");
+                unsafe { core::slice::from_raw_parts_mut(base.add(out.0), out.1) }.fill(0xAA);
+                continue;
+            }
+            assert_eq!(st, PcStatus::NullPointer, "{name} out={out:?}");
+            assert!(untouched(), "{name}: nothing may be written");
+        }
+        // Adjacent but disjoint: [16, 32) and [48, 64) are fine.
+        for out in [(16, 16), (48, 16)] {
+            let st = call(ep, a, b, out);
+            assert_eq!(st, PcStatus::Ok, "{name} out={out:?}");
+            unsafe { core::slice::from_raw_parts_mut(base.add(out.0), out.1) }.fill(0xAA);
+        }
+        // An empty output never overlaps, wherever its pointer points (the
+        // KDF may still refuse a zero-length key, but not as a pointer error).
+        assert_ne!(
+            call(ep, a, b, (4, 0)),
+            PcStatus::NullPointer,
+            "{name} empty out"
+        );
+    }
+    drop(arena);
+}
+
 /// Sets a single ALPN protocol ("test") on a QUIC config. ALPN is
 /// mandatory for QUIC (RFC 9001 §8.1) — `pc_quic_new` rejects a config
 /// without it.

@@ -3,7 +3,9 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, settle_out_len, slice, slice_mut};
+use super::common::{
+    PcStatus, guard, out_overlaps_inputs, out_write, settle_out_len, slice, slice_mut,
+};
 use crate::ascon::{AsconCxof128, AsconHash256, AsconXof128};
 use crate::hash::{
     Digest, ExtendableOutput, HashAlgorithm, Hasher, Hmac, HmacSha224, HmacSha256, HmacSha384,
@@ -254,6 +256,11 @@ pub unsafe extern "C" fn pc_ascon_xof(
     out_len: usize,
 ) -> PcStatus {
     guard(|| {
+        // The XOFs borrow `data` and `out` at once (like the KDFs): an
+        // overlapping output is screened out before either borrow exists.
+        if out_overlaps_inputs(out, out_len, &[(data, data_len)]) {
+            return PcStatus::NullPointer;
+        }
         let Some(input) = (unsafe { slice(data, data_len) }) else {
             return PcStatus::NullPointer;
         };
@@ -283,6 +290,11 @@ pub unsafe extern "C" fn pc_ascon_cxof(
     out_len: usize,
 ) -> PcStatus {
     guard(|| {
+        // The XOFs borrow `data` and `out` at once (like the KDFs): an
+        // overlapping output is screened out before either borrow exists.
+        if out_overlaps_inputs(out, out_len, &[(custom, custom_len), (data, data_len)]) {
+            return PcStatus::NullPointer;
+        }
         let (Some(z), Some(input)) = (unsafe { slice(custom, custom_len) }, unsafe {
             slice(data, data_len)
         }) else {

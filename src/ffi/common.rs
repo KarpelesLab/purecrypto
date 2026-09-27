@@ -122,6 +122,40 @@ pub(super) unsafe fn slice_mut<'a>(ptr: *mut u8, len: usize) -> Option<&'a mut [
     Some(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
 }
 
+/// Whether the byte ranges `[a, a + len_a)` and `[b, b + len_b)` share any
+/// address. An empty range overlaps nothing (its pointer is never
+/// dereferenced, and may be NULL).
+///
+/// The "plain length" entry points (KDFs, XOFs) borrow every input as `&[u8]`
+/// and the output as `&mut [u8]` at the same time; a caller handing the same
+/// memory as both would make those borrows alias, which is undefined
+/// behaviour however the body then reads and writes. They screen with this
+/// and answer [`PcStatus::NullPointer`], as for any other unusable pointer
+/// argument. Ranges are compared as addresses, so the check is sound even for
+/// ranges that were already screened by [`slice`] / [`slice_mut`] only.
+pub(super) fn ranges_overlap(a: *const u8, len_a: usize, b: *const u8, len_b: usize) -> bool {
+    if len_a == 0 || len_b == 0 {
+        return false;
+    }
+    let (a, b) = (a as usize, b as usize);
+    // `saturating_add`: a range that wraps the address space is rejected by
+    // `slice` / `slice_mut` anyway, and saturating keeps the comparison
+    // meaningful rather than wrapping to a small end.
+    a < b.saturating_add(len_b) && b < a.saturating_add(len_a)
+}
+
+/// [`ranges_overlap`] of the output range against each input range: the
+/// screen the plain-length entry points run before borrowing `out` mutably.
+pub(super) fn out_overlaps_inputs(
+    out: *mut u8,
+    out_len: usize,
+    inputs: &[(*const u8, usize)],
+) -> bool {
+    inputs
+        .iter()
+        .any(|&(ptr, len)| ranges_overlap(out, out_len, ptr, len))
+}
+
 /// Copies `data` into the caller's `out` buffer using the in/out length
 /// convention: `*out_len` holds the buffer capacity on entry and is always set
 /// to the required length on return. Returns [`PcStatus::BufferTooSmall`] (with
@@ -218,6 +252,38 @@ mod tests {
     fn guard_i32_passes_value_through() {
         let v = super::guard_i32(-1, || 5);
         assert_eq!(v, 5);
+    }
+
+    /// Every relative position of two ranges, both ways round, plus the
+    /// empty-range and address-space-end cases.
+    #[test]
+    fn ranges_overlap_covers_every_relative_position() {
+        let buf = [0u8; 64];
+        let p = buf.as_ptr();
+        let at = |off: usize| unsafe { p.add(off) };
+        let overlap = |a: (usize, usize), b: (usize, usize)| {
+            let ab = super::ranges_overlap(at(a.0), a.1, at(b.0), b.1);
+            let ba = super::ranges_overlap(at(b.0), b.1, at(a.0), a.1);
+            assert_eq!(ab, ba, "symmetric: {a:?} vs {b:?}");
+            ab
+        };
+        assert!(overlap((16, 16), (16, 16))); // identical
+        assert!(overlap((16, 16), (8, 16))); // straddles the start
+        assert!(overlap((16, 16), (24, 16))); // straddles the end
+        assert!(overlap((16, 16), (20, 4))); // nested
+        assert!(overlap((16, 16), (0, 64))); // enclosing
+        assert!(overlap((16, 16), (31, 1))); // shares the last byte
+        assert!(!overlap((16, 16), (0, 16))); // adjacent before
+        assert!(!overlap((16, 16), (32, 16))); // adjacent after
+        assert!(!overlap((16, 16), (48, 16))); // disjoint
+        // Empty ranges overlap nothing, wherever they point.
+        assert!(!overlap((16, 16), (20, 0)));
+        assert!(!overlap((0, 0), (0, 0)));
+        assert!(!super::ranges_overlap(core::ptr::null(), 0, p, 64));
+        // A length reaching the end of the address space saturates rather
+        // than wrapping to a small end that would miss the overlap.
+        assert!(super::ranges_overlap(at(16), usize::MAX, at(40), 8));
+        assert!(!super::ranges_overlap(at(16), usize::MAX, at(8), 8));
     }
 
     /// `slice` must refuse the two lengths `from_raw_parts` calls UB, both of

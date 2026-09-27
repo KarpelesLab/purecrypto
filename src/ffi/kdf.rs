@@ -1,6 +1,11 @@
 //! C ABI for HKDF, PBKDF2, scrypt, and Argon2.
+//!
+//! Every entry point here takes its inputs as `&[u8]` and its output as
+//! `&mut [u8]` over caller memory at the same time, so an `out` that overlaps
+//! any input is rejected (`NullPointer`) before either borrow is created;
+//! see [`out_overlaps_inputs`].
 
-use super::common::{PcStatus, guard, slice, slice_mut, wipe_array};
+use super::common::{PcStatus, guard, out_overlaps_inputs, slice, slice_mut, wipe_array};
 use super::hash::id;
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::kdf::argon2::{Argon2Params, Argon2Type, argon2};
@@ -56,6 +61,14 @@ pub unsafe extern "C" fn pc_kbkdf_counter(
     out_len: usize,
 ) -> PcStatus {
     guard(|| {
+        // Screened before the inputs are borrowed: see the module docs.
+        if out_overlaps_inputs(
+            out,
+            out_len,
+            &[(ki, ki_len), (label, label_len), (context, context_len)],
+        ) {
+            return PcStatus::NullPointer;
+        }
         let (Some(ki), Some(label), Some(context)) = (
             unsafe { slice(ki, ki_len) },
             unsafe { slice(label, label_len) },
@@ -109,6 +122,19 @@ pub unsafe extern "C" fn pc_kbkdf_feedback(
     out_len: usize,
 ) -> PcStatus {
     guard(|| {
+        // Screened before the inputs are borrowed: see the module docs.
+        if out_overlaps_inputs(
+            out,
+            out_len,
+            &[
+                (ki, ki_len),
+                (iv, iv_len),
+                (label, label_len),
+                (context, context_len),
+            ],
+        ) {
+            return PcStatus::NullPointer;
+        }
         let (Some(ki), Some(iv), Some(label), Some(context)) = (
             unsafe { slice(ki, ki_len) },
             unsafe { slice(iv, iv_len) },
@@ -167,6 +193,14 @@ pub unsafe extern "C" fn pc_hkdf(
     out_len: usize,
 ) -> PcStatus {
     guard(|| {
+        // Screened before the inputs are borrowed: see the module docs.
+        if out_overlaps_inputs(
+            out,
+            out_len,
+            &[(salt, salt_len), (ikm, ikm_len), (info, info_len)],
+        ) {
+            return PcStatus::NullPointer;
+        }
         let (Some(s), Some(k), Some(i)) = (
             unsafe { slice(salt, salt_len) },
             unsafe { slice(ikm, ikm_len) },
@@ -206,6 +240,10 @@ pub unsafe extern "C" fn pc_pbkdf2(
     out_len: usize,
 ) -> PcStatus {
     guard(|| {
+        // Screened before the inputs are borrowed: see the module docs.
+        if out_overlaps_inputs(out, out_len, &[(pw, pw_len), (salt, salt_len)]) {
+            return PcStatus::NullPointer;
+        }
         let (Some(p), Some(s)) = (unsafe { slice(pw, pw_len) }, unsafe {
             slice(salt, salt_len)
         }) else {
@@ -268,6 +306,10 @@ pub unsafe extern "C" fn pc_scrypt(
     out_len: usize,
 ) -> PcStatus {
     guard(|| {
+        // Screened before the inputs are borrowed: see the module docs.
+        if out_overlaps_inputs(out, out_len, &[(pw, pw_len), (salt, salt_len)]) {
+            return PcStatus::NullPointer;
+        }
         let (Some(pw), Some(s)) = (unsafe { slice(pw, pw_len) }, unsafe {
             slice(salt, salt_len)
         }) else {
@@ -332,6 +374,10 @@ pub unsafe extern "C" fn pc_argon2(
     out_len: usize,
 ) -> PcStatus {
     guard(|| {
+        // Screened before the inputs are borrowed: see the module docs.
+        if out_overlaps_inputs(out, out_len, &[(pw, pw_len), (salt, salt_len)]) {
+            return PcStatus::NullPointer;
+        }
         let (Some(pw), Some(s)) = (unsafe { slice(pw, pw_len) }, unsafe {
             slice(salt, salt_len)
         }) else {

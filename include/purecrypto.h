@@ -103,7 +103,14 @@ typedef enum {
  *   - The one exception is the out-parameter that is itself NULL: the call
  *     returns PC_NULL_POINTER and, having nowhere to write, writes nothing.
  *
- * Output *buffers* (`uint8_t *out`) are only written on PC_OK. */
+ * Output *buffers* (`uint8_t *out`) are only written on PC_OK.
+ *
+ * Output buffers must not overlap input buffers. The entry points that take
+ * inputs and a plain-length output at once (pc_hkdf, pc_pbkdf2, pc_scrypt,
+ * pc_argon2, pc_kbkdf_counter, pc_kbkdf_feedback, pc_ascon_xof,
+ * pc_ascon_cxof) detect an `out` range that overlaps any input range and
+ * return PC_NULL_POINTER without writing; for every other function overlap
+ * is a caller error with unspecified results. */
 
 /* AEAD algorithm identifiers (for pc_aead_encrypt / pc_aead_decrypt). */
 typedef enum {
@@ -320,6 +327,7 @@ pc_status pc_gmac(const uint8_t *key, size_t key_len,
 /* ---- Ascon XOFs (NIST SP 800-232) ----
  * Squeeze exactly out_len bytes (out_len is the requested length, not an in/out
  * capacity). pc_ascon_cxof takes a customization string (at most 256 bytes).
+ * out must not overlap data / custom (PC_NULL_POINTER otherwise).
  */
 pc_status pc_ascon_xof(const uint8_t *data, size_t data_len,
                        uint8_t *out, size_t out_len);
@@ -328,6 +336,9 @@ pc_status pc_ascon_cxof(const uint8_t *custom, size_t custom_len,
                         uint8_t *out, size_t out_len);
 
 /* ---- KDFs ----
+ * out_len is the requested output length for every KDF, and out must not
+ * overlap any input (salt, ikm, info, pw, ki, iv, label, context): an
+ * overlapping out is refused with PC_NULL_POINTER and nothing is written.
  * pc_hkdf returns PC_UNSUPPORTED when out_len exceeds the RFC 5869 ceiling of
  * 255 * HashLen bytes; pc_pbkdf2 returns PC_UNSUPPORTED when iterations is 0
  * (RFC 8018 requires at least one PRF round). Neither writes to out in that
