@@ -95,7 +95,8 @@ fn small_factor_boxed(n: &BoxedUint) -> Option<u64> {
         }
         let rem = mod_small_boxed(n, product);
         for &p in &primes[start..i] {
-            if mod_u32_ct(rem, p) == 0 {
+            // A small factor rejects the candidate: a public verdict.
+            if crate::ct::declassify_value(mod_u32_ct(rem, p) == 0) {
                 return Some(p);
             }
         }
@@ -118,22 +119,31 @@ fn small_factor_boxed(n: &BoxedUint) -> Option<u64> {
 /// `n − 1 = d·2^s` split, a fixed number of squarings per round); see
 /// `rsa::prime::is_prime` for the reasoning. The early exits fire only on
 /// composites, which are discarded.
+///
+/// Every branch below is on such a verdict (declassified for the Valgrind
+/// harness, `tests/ct_valgrind.rs`): the candidate is rejected, or is
+/// decided prime. The tests themselves are the branch-free ones, so a
+/// candidate that is kept has run exactly the same code as any other.
 pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usize) -> bool {
     let one = BoxedUint::from_u64(1);
     let two = BoxedUint::from_u64(2);
-    if n.is_zero() || *n == one {
+    if (n.ct_is_zero() | n.ct_eq(&one)).declassify() {
         return false;
     }
-    if *n == two {
+    if n.ct_eq(&two).declassify() {
         return true;
     }
-    if !n.is_odd() {
+    if !crate::ct::declassify_value(n.is_odd()) {
         return false;
     }
     if let Some(p) = small_factor_boxed(n) {
-        return *n == BoxedUint::from_u64(p);
+        return n.ct_eq(&BoxedUint::from_u64(p)).declassify();
     }
-    if n.bit_len() <= TRIAL_DIVISION_EXACT_BITS {
+    // `n < 2^TRIAL_DIVISION_EXACT_BITS`, without scanning `n` for its length.
+    if n.shr_bits(TRIAL_DIVISION_EXACT_BITS)
+        .ct_is_zero()
+        .declassify()
+    {
         // No prime factor below sqrt(n): n is prime, no need for Miller-Rabin.
         return true;
     }
@@ -150,11 +160,18 @@ pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usi
             x = modulus.mul_mod(&x, &x);
             pass |= j.ct_lt(&s) & x.ct_eq(&n_minus_1);
         }
-        for _ in MR_FIXED_SQUARINGS..s {
-            x = modulus.mul_mod(&x, &x);
-            pass |= x.ct_eq(&n_minus_1);
+        // The rare tail (`2^64 | n − 1`, probability 2^-64 for a random
+        // candidate): whether it runs is the one bit this test reveals about
+        // a kept candidate, declassified here. Its length does not depend on
+        // `s`: it squares up to the full width, masked by `j < s`.
+        if crate::ct::declassify_value(s > MR_FIXED_SQUARINGS) {
+            for j in MR_FIXED_SQUARINGS..(n.limbs() * super::LIMB_BITS) as u32 {
+                x = modulus.mul_mod(&x, &x);
+                pass |= j.ct_lt(&s) & x.ct_eq(&n_minus_1);
+            }
         }
-        if !bool::from(pass) {
+        // A witness rejects the candidate: a public verdict.
+        if !pass.declassify() {
             return false;
         }
     }

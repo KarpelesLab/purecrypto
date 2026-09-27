@@ -263,6 +263,9 @@ pub(crate) fn keygen<const K: usize, const ETA1: usize>(
     let mut g = crate::hash::sha3_512(&g_in);
     let mut rho = [0u8; 32];
     rho.copy_from_slice(&g[..32]);
+    // ρ is public: it is serialized into `ek` (FIPS 203 Algorithm 13), so
+    // the rejection sampling of Â from it may branch on it.
+    crate::ct::declassify(&rho);
     let mut sigma32 = [0u8; 32];
     sigma32.copy_from_slice(&g[32..]);
 

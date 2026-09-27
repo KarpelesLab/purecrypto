@@ -118,7 +118,8 @@ impl ChaCha20Poly1305 {
         let mut otk = self.poly_key(nonce);
         let expected = self.tag(&otk, aad, buffer);
         crate::zeroize::Zeroize::zeroize(&mut otk);
-        if !bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !expected.ct_eq(tag).declassify() {
             return Err(TagMismatch);
         }
         self.cipher.apply_keystream(nonce, 1, buffer);

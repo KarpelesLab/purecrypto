@@ -152,7 +152,8 @@ impl Core {
         ks.zeroize();
 
         let expected = self.finalize(p, &mut s);
-        if bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if expected.ct_eq(tag).declassify() {
             return Ok(());
         }
         // Inauthentic: the buffer now holds unauthenticated plaintext. Run

@@ -184,7 +184,9 @@ impl X25519PrivateKey {
     /// regardless and compared with [`ConstantTimeEq`].
     pub fn diffie_hellman(&self, peer: &[u8; 32]) -> Result<[u8; 32], X25519Error> {
         let out = x25519(&self.scalar, peer);
-        if bool::from(out.ct_eq(&[0u8; 32])) {
+        // Public: with a clamped scalar the output is zero iff the (public)
+        // peer point has small order, and the verdict is returned anyway.
+        if out.ct_eq(&[0u8; 32]).declassify() {
             Err(X25519Error::SmallOrderPeer)
         } else {
             Ok(out)

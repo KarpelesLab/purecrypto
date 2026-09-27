@@ -172,7 +172,10 @@ impl DhPrivateKey {
     /// for interop with peers that demand a fixed exponent.
     pub fn from_bytes(group: DhGroup, bytes: &[u8]) -> Result<Self, Error> {
         let x = BoxedUint::from_be_bytes(bytes);
-        if bool::from(x.ct_is_zero()) || !x.lt(group.p()) {
+        // One non-short-circuiting range verdict; it is public (the caller
+        // sees it as `Ok`/`Err`).
+        let too_big = crate::ct::Choice::from(!x.lt(group.p()) as u8);
+        if (x.ct_is_zero() | too_big).declassify() {
             return Err(Error::InvalidScalar);
         }
         Ok(DhPrivateKey { group, x })
@@ -262,7 +265,8 @@ impl DhPrivateKey {
         // longer secret-input by the time it gets here.
         let zero_eq = z.ct_eq(&BoxedUint::from_u64(0));
         let one_eq = z.ct_eq(&one);
-        if bool::from(zero_eq | one_eq) {
+        // Public: `z ∈ {0, 1}` iff the (public) peer value is degenerate.
+        if (zero_eq | one_eq).declassify() {
             return Err(Error::ContributoryFailure);
         }
 

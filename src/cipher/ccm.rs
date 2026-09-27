@@ -211,7 +211,8 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
             expected[i] = t[i] ^ s0[i];
         }
 
-        if bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if expected.ct_eq(tag).declassify() {
             Ok(())
         } else {
             // Wipe the (now-decrypted) buffer so a caller can't accidentally

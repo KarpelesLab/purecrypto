@@ -21,7 +21,7 @@
 use super::Error;
 use super::curves::CurveId;
 use crate::bignum::{BoxedMontModulus, BoxedUint};
-use crate::ct::ConstantTimeEq;
+use crate::ct::{Choice, ConstantTimeEq};
 use crate::hash::{Digest, Sm3};
 use crate::rng::{CryptoRng, RngCore};
 use alloc::vec;
@@ -46,7 +46,10 @@ pub const DEFAULT_ID: &[u8] = b"1234567812345678";
 /// scalar — private-key import, nonce rejection sampling — so the zero test
 /// must not leak which limb first differed).
 fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
-    bool::from(!v.ct_is_zero()) & v.lt(n)
+    // The verdict is public in every caller: a key-import result, or a
+    // rejection-sampling decision whose only observable is the retry count.
+    let lt = Choice::from(v.lt(n) as u8);
+    (!v.ct_is_zero() & lt).declassify()
 }
 
 /// `1 <= d <= n-2` — the GB/T 32918.1 §6.1 private-key range. `d = n-1`
@@ -405,6 +408,9 @@ impl Sm2PrivateKey {
         let (x, y) = c
             .to_affine(&c.mul_generator(&self.d))
             .expect("d in [1,n-2] so d*G is not the identity");
+        // The public key is public (its encoders scan it for its width).
+        crate::ct::declassify_val(x.as_limbs());
+        crate::ct::declassify_val(y.as_limbs());
         Sm2PublicKey { x, y }
     }
 
@@ -476,9 +482,9 @@ impl Sm2PrivateKey {
         let (x1, _) = c.to_affine(&c.mul_generator(k)).ok_or(SignFailure::Retry)?;
         // r = (e + x1) mod n; reject r == 0 or r + k == n.
         let r = fq.add_mod(&e, &x1.reduce(&n));
-        // `r` is public, but `r + k` involves the nonce: no early-exit zero
-        // test on it.
-        if r.is_zero() || bool::from(fq.add_mod(&r, k).ct_is_zero()) {
+        // `r + k` involves the nonce: no early-exit zero test on it, and one
+        // combined retry verdict (public: only the retry count is observable).
+        if (r.ct_is_zero() | fq.add_mod(&r, k).ct_is_zero()).declassify() {
             return Err(SignFailure::Retry);
         }
         // s = ((1 + dA)^-1 · (k − r·dA)) mod n.
@@ -491,9 +497,13 @@ impl Sm2PrivateKey {
         d_plus_1_inv.zeroize();
         rd.zeroize();
         k_minus_rd.zeroize();
-        if s.is_zero() {
+        if s.ct_is_zero().declassify() {
             return Err(SignFailure::Retry);
         }
+        // The signature is public from here (its encoders size it by
+        // `bit_len`, which scans the limbs).
+        crate::ct::declassify_val(r.as_limbs());
+        crate::ct::declassify_val(s.as_limbs());
         Ok(Sm2Signature { r, s })
     }
 

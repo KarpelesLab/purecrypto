@@ -123,7 +123,7 @@ impl BoxedUint {
             }
         }
         assert!(
-            overflow == 0,
+            !crate::ct::declassify_value(overflow != 0),
             "BoxedUint::to_be_bytes: value does not fit in {len} bytes"
         );
         let mut out = vec![0u8; len];
@@ -197,9 +197,16 @@ impl BoxedUint {
     }
 
     /// The number of significant (non-leading-zero) limbs, at least one.
+    ///
+    /// Only ever applied to a modulus or divisor (and to a public exponent),
+    /// whose width is public: an RSA prime's size is fixed by the modulus
+    /// size (FIPS 186-5 generates exactly `nlen/2`-bit primes), the same
+    /// "widths are public" convention BoringSSL's constant-time bignum uses.
+    /// The per-limb zero tests are therefore declassified; the limb values
+    /// themselves never steer anything else here.
     pub(super) fn significant_limbs(&self) -> usize {
         let mut n = self.limbs.len();
-        while n > 1 && self.limbs[n - 1] == 0 {
+        while n > 1 && crate::ct::declassify_value(self.limbs[n - 1] == 0) {
             n -= 1;
         }
         n
@@ -250,8 +257,10 @@ impl BoxedUint {
     /// the borrow never fires — so the precondition is checked rather than
     /// returning garbage.)
     pub fn reduce(&self, modulus: &BoxedUint) -> BoxedUint {
+        // The modulus may be secret (an RSA prime): test it without an early
+        // exit. The verdict is public — it is a panic.
         assert!(
-            !modulus.is_zero(),
+            !modulus.ct_is_zero().declassify(),
             "BoxedUint::reduce: modulus must be nonzero"
         );
         let m = modulus.significant_limbs();

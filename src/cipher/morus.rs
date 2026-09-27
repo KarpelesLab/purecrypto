@@ -280,7 +280,8 @@ fn open<W: Word>(
     st.absorb_ad(aad);
     st.decrypt(scratch.as_mut());
     let expected = st.finalize(aad.len(), buffer.len());
-    if !bool::from(expected.ct_eq(tag)) {
+    // The accept/reject verdict is the public outcome of decryption.
+    if !expected.ct_eq(tag).declassify() {
         return Err(TagMismatch);
     }
     buffer.copy_from_slice(scratch.as_mut());

@@ -202,7 +202,9 @@ impl Secp256k1EcdsaPrivateKey {
         // only ever subtracts n once, since p < 2n.
         let full_x = r_point.x;
         let r = full_x.reduce(&n);
-        if bool::from(r.is_zero()) {
+        // `r` is published in the signature; the degenerate `r = 0` is a
+        // public error return (probability ~2^-256).
+        if r.is_zero().declassify() {
             return Err(Error::InvalidInput);
         }
         let x_overflow = !bool::from(full_x.ct_lt(&n));
@@ -215,7 +217,8 @@ impl Secp256k1EcdsaPrivateKey {
         let k_inv = k.invert();
         let z_rd = z.add(&Scalar(r).mul(&self.d));
         let s = k_inv.mul(&z_rd);
-        if bool::from(s.is_zero()) {
+        // Likewise `s`: published, or the public `s = 0` error.
+        if s.is_zero().declassify() {
             return Err(Error::InvalidInput);
         }
         Ok((r, s.0, x_overflow, y_is_odd))

@@ -277,7 +277,8 @@ impl AesSiv {
         self.ctr_xor(&q, &mut plaintext);
 
         let expected = self.s2v(associated_data, &plaintext);
-        if bool::from(expected.ct_eq(&v)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if expected.ct_eq(&v).declassify() {
             Ok(plaintext)
         } else {
             // Discard the unauthenticated plaintext (volatile wipe, so the

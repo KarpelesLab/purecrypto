@@ -474,7 +474,8 @@ impl<C: BlockCipher> Gcm<C> {
         let j0 = self.j0(nonce);
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
         if let Some(expected) = self.crypt_fused(j0, aad, buffer, false) {
-            if bool::from(expected.ct_eq(tag)) {
+            // The accept/reject verdict is the public outcome of decryption.
+            if expected.ct_eq(tag).declassify() {
                 return Ok(());
             }
             // The stitched pass decrypts while it hashes, so `buffer` already
@@ -486,7 +487,8 @@ impl<C: BlockCipher> Gcm<C> {
         }
         // GHASH is computed over the ciphertext, which is still in `buffer`.
         let expected = self.tag(j0, aad, buffer);
-        if !bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !expected.ct_eq(tag).declassify() {
             return Err(AeadError::TagMismatch);
         }
         self.gctr(inc32(j0), buffer);

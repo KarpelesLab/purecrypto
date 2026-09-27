@@ -171,7 +171,8 @@ impl<C: BlockCipher + Clone, D: Digest> CbcHmacSha2<C, D> {
         // A wrong-length `tag` compares unequal (never as a prefix match).
         let ok = full.as_ref()[..Self::TAG_LEN].ct_eq(tag);
         full.as_mut().zeroize();
-        if !bool::from(ok) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !ok.declassify() {
             return Err(AeadError::TagMismatch);
         }
         let n = ct.len();
@@ -185,7 +186,8 @@ impl<C: BlockCipher + Clone, D: Digest> CbcHmacSha2<C, D> {
             .expect("length checked to be whole blocks");
         let last: &[u8; 16] = out[n - 16..].try_into().unwrap();
         let (valid, pad) = pkcs7_check(last);
-        if !bool::from(valid) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !valid.declassify() {
             out.zeroize();
             return Err(AeadError::TagMismatch);
         }

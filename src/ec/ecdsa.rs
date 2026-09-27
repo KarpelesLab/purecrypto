@@ -56,7 +56,10 @@ pub(super) fn bits2int(hash: &[u8]) -> Fe {
 /// non-short-circuiting `&` so a secret `v` (private-key import) does not
 /// shape the timing of a rejection.
 pub(super) fn in_range(v: &Fe, n: &Fe) -> bool {
-    bool::from(!v.is_zero() & v.ct_lt(n))
+    // Public in every caller: a key-import verdict the caller sees as
+    // `Ok`/`Err`, or an RFC 6979 / FIPS 186-5 A.4.2 rejection-sampling
+    // decision whose only observable is the (public) retry count.
+    (!v.is_zero() & v.ct_lt(n)).declassify()
 }
 
 impl EcdsaPrivateKey {
@@ -125,7 +128,9 @@ impl EcdsaPrivateKey {
             Some((x, _)) => {
                 // r = (k*G).x mod n
                 let r = x.reduce(&n);
-                if bool::from(r.is_zero()) {
+                // `r` is published in the signature; the degenerate `r = 0`
+                // is a public error return (probability ~2^-256).
+                if r.is_zero().declassify() {
                     Err(Error::InvalidInput)
                 } else {
                     // s = k^-1 (z + r*d) mod n.
@@ -144,7 +149,8 @@ impl EcdsaPrivateKey {
                     let s = fq.mul_mod(&k_inv, &z_rd);
                     k_inv.zeroize();
                     z_rd.zeroize();
-                    if bool::from(s.is_zero()) {
+                    // Likewise `s`: published, or the public `s = 0` error.
+                    if s.is_zero().declassify() {
                         Err(Error::InvalidInput)
                     } else {
                         Ok(Signature { r, s })

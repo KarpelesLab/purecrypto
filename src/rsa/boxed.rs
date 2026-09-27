@@ -160,7 +160,13 @@ impl crate::zeroize::ZeroizeOnDrop for BoxedRsaPrivateKey {}
 /// and the blinding HMAC key (always). `primes` is `p`, `q`, then any extra
 /// primes of a multi-prime key.
 fn derive_blinding_boxed(primes: &[&BoxedUint], d: &BoxedUint) -> (Option<BoxedUint>, [u8; 32]) {
-    let phi_n_minus_1 = if primes.iter().any(|r| r.is_zero()) {
+    // "Does the key carry its primes" is a public property of the key (it
+    // selects the blinded or the plain private path); the zero test itself
+    // scans every limb of every prime.
+    let missing = primes
+        .iter()
+        .fold(crate::ct::Choice::from(0), |acc, r| acc | r.ct_is_zero());
+    let phi_n_minus_1 = if missing.declassify() {
         None
     } else {
         let one = BoxedUint::from_u64(1);
@@ -268,19 +274,25 @@ fn derive_crt_boxed(
     other_primes: &[BoxedUint],
     d: &BoxedUint,
 ) -> Option<alloc::boxed::Box<BoxedRsaCrt>> {
-    let usable = |r: &BoxedUint| r.bit_len() >= 3 && r.is_odd();
+    // `r ≥ 4` (bit length ≥ 3) and odd, evaluated without scanning the
+    // secret prime's limbs; the verdict ("this key has usable primes") is a
+    // public property of the key — it selects the CRT or full-width path.
+    let usable = |r: &BoxedUint| {
+        let odd = crate::ct::Choice::from((r.as_limbs().first().copied().unwrap_or(0) & 1) as u8);
+        (odd & !r.shr_bits(2).ct_is_zero()).declassify()
+    };
     if !usable(p) || !usable(q) || !other_primes.iter().all(usable) {
         return None;
     }
     // Pairwise distinct: `p, q, r₃ … rᵤ` are secret, so each comparison is
-    // the constant-time limb compare (the branch on the verdict is fine).
+    // the constant-time limb compare; the verdict is public, like `usable`.
     let mut all: Vec<&BoxedUint> = Vec::with_capacity(2 + other_primes.len());
     all.push(p);
     all.push(q);
     all.extend(other_primes.iter());
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
-            if bool::from(a.ct_eq(b)) {
+            if a.ct_eq(b).declassify() {
                 return None;
             }
         }
@@ -520,11 +532,14 @@ fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUi
     // digest), so the variable-time `lt` shortcut leaks nothing.
     let n = mont.modulus();
     let c_mod_n = if c.lt(&n) { c.clone() } else { c.reduce(&n) };
-    if mont.pow_public(&m, &key.e) == c_mod_n {
+    // `m^e` is compared with the constant-time limb compare (the variable-
+    // time `==` would scan a value derived from the secret `m`); the
+    // verdict is public — it is `true` for every fault-free operation.
+    if mont.pow_public(&m, &key.e).ct_eq(&c_mod_n).declassify() {
         return m;
     }
     let mut m2 = raw_private_full_width(key, nonce, &salt, c);
-    if mont.pow_public(&m2, &key.e) == c_mod_n {
+    if mont.pow_public(&m2, &key.e).ct_eq(&c_mod_n).declassify() {
         return m2;
     }
     m2.zeroize();
@@ -1035,7 +1050,8 @@ impl BoxedRsaPrivateKey {
         loop {
             let p = super::prime::random_prime_boxed(rng, half, rounds);
             let q = super::prime::random_prime_boxed(rng, half, rounds);
-            if bool::from(p.ct_eq(&q)) {
+            // Redraw decisions are public (only their count is observable).
+            if p.ct_eq(&q).declassify() {
                 continue;
             }
             // FIPS 186-5 B.3.1: redraw if |p − q| < 2^(bits/2 − 100), which would
@@ -1051,15 +1067,21 @@ impl BoxedRsaPrivateKey {
             // secret difference for its length.
             let p_lt_q = crate::ct::Choice::from(p.lt(&q) as u8);
             let diff = BoxedUint::conditional_select(&q.sub(&p), &p.sub(&q), p_lt_q);
-            if bool::from(diff.shr_bits(half.saturating_sub(100)).ct_is_zero()) {
+            if diff
+                .shr_bits(half.saturating_sub(100))
+                .ct_is_zero()
+                .declassify()
+            {
                 continue;
             }
             let n = p.mul(&q);
+            // `n` is the public modulus.
+            crate::ct::declassify_val(n.as_limbs());
             let phi = p.sub(&one).mul(&q.sub(&one));
             // d = e^-1 mod φ(n), computed without a data-dependent trip
             // count (`inv_mod_ct_boxed`); retry if e is not coprime to φ —
             // that outcome is public by nature.
-            if let Some(d) = inv_mod_ct_boxed(&e, &phi).into_option() {
+            if let Some(d) = inv_mod_ct_boxed(&e, &phi).into_public_option() {
                 return Self::from_components_with_primes(n, e, d, p, q);
             }
         }

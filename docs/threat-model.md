@@ -40,9 +40,14 @@ The implementations are built to withstand:
 - **Physical / microarchitectural side channels beyond data-independence**:
   power analysis, EM, fault injection, Spectre/Meltdown-class speculation,
   cache/port contention from a co-resident attacker. Constant-time here means
-  "no secret-dependent branches/table indices at the source level"; it has **not
-  been validated with a timing-analysis tool** and depends on the compiler and
-  CPU.
+  "no secret-dependent branches or memory addresses". That property is
+  checked on the *compiled* release binary with Valgrind memcheck as a taint
+  tracker, on x86_64 and aarch64 Linux, for the primitives listed in
+  [`validation.md`](validation.md#machine-code-validation-valgrind-memcheck)
+  — not for every path, not on other compilers or targets, and not for
+  variable-latency instructions (division, some multipliers) or anything the
+  CPU does with data-oblivious code. No statistical timing measurement has
+  been made.
 - **A compromised or weak RNG.** Security assumes `OsRng` (or a properly seeded
   CSPRNG) actually provides unpredictable bytes. Bad entropy breaks key
   generation, signing nonces, and KEM/ECDH.
@@ -80,7 +85,9 @@ The implementations are built to withstand:
 
 ## Residual risk
 
-No third-party human audit, no timing-tool validation, no CMVP. The DTLS 1.2 and
+No third-party human audit and no CMVP. Constant-time behaviour of the main
+secret-handling paths is machine-checked (Valgrind taint tracking on two
+architectures) but not measured on hardware. The DTLS 1.2 and
 QUIC v1 **server** directions interop with OpenSSL 3.5, but the client directions
 and DTLS 1.3 are loopback-validated only. See [`validation.md`](validation.md)
 for the concrete coverage map and [`recommended-usage.md`](recommended-usage.md)

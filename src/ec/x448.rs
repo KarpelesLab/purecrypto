@@ -215,7 +215,10 @@ impl X448PrivateKey {
     /// regardless and compared with [`ConstantTimeEq`].
     pub fn diffie_hellman(&self, peer: &[u8; 56]) -> Result<[u8; 56], X448Error> {
         let out = x448(&self.scalar, peer);
-        if bool::from(out.ct_eq(&[0u8; 56])) {
+        // Public: with a clamped scalar the output is zero iff the (public)
+        // peer point has small order (bar a ~2^-440 scalar), and the verdict
+        // is returned anyway.
+        if out.ct_eq(&[0u8; 56]).declassify() {
             Err(X448Error::SmallOrderPeer)
         } else {
             Ok(out)

@@ -26,10 +26,13 @@ recommended *safe* subset of the API, see
   2026-09-17 (secret inputs enumerated per operation, then every branch,
   memory index and variable-latency instruction on their data paths
   checked); its findings are fixed or listed under
-  [Known residuals](#known-constant-time-residuals). It has **not** been
-  validated with a timing-analysis tool (dudect/ctgrind/etc.) or a formal
-  third-party CT audit; the `ct` module documents this explicitly as
-  best-effort at the source level.
+  [Known residuals](#known-constant-time-residuals). The compiled code of
+  the main secret-handling paths is additionally checked in CI with
+  **Valgrind memcheck used as a taint tracker** (the ctgrind / TIMECOP
+  technique) on x86_64 and aarch64 Linux — see
+  [Machine-code validation](#machine-code-validation-valgrind-memcheck) for
+  exactly what that covers and what it cannot. There has been no formal
+  third-party CT audit and no statistical timing measurement (dudect-style).
 
 ## At-a-glance matrix
 
@@ -245,6 +248,113 @@ Reported as **what the code is built to do** — not as an audited guarantee.
   data, the hash-based stateful signers (LMS/XMSS, whose chain lengths depend on
   the public message hash).
 
+### Machine-code validation (Valgrind memcheck)
+
+Source-level discipline is necessary but not sufficient: LLVM is free to turn
+a mask into a branch, unswitch a loop on a secret-derived invariant, or lower
+a `||` into a jump on the second operand. `tests/ct_valgrind.rs`, run by
+`.github/workflows/ct-valgrind.yml` on every push to `master` and every pull
+request, checks
+the **optimized release binary** (opt-level 3, thin LTO, the profile users
+ship) on **x86_64 (`ubuntu-latest`) and aarch64 (`ubuntu-24.04-arm`)**:
+
+- Every secret input is marked *undefined* through a Valgrind client
+  request — an inline-asm magic sequence behind the hidden `__ct-check`
+  feature (`src/ct/valgrind.rs`; no C header, no dependency) — and memcheck
+  then reports any **conditional branch** or **memory address** computed
+  from it, bit-precisely, anywhere in the call tree. Secrets enter as
+  classified key/seed/plaintext bytes, through a `TaintRng` whose every
+  output byte is secret (so key generation, nonces, blinding and hedging
+  are checked as they run on `OsRng`), or as the classified limbs of an
+  imported RSA key. Public results (ciphertexts, tags, signatures, public
+  keys, shared secrets) are marked *defined* again before the harness
+  compares them; the library-side counterparts are the
+  [declassification points](#declassification-points) below.
+- A **positive control** (a deliberate secret branch and a secret table
+  index) must be flagged in the same run, so a green result cannot come
+  from broken instrumentation; the harness also refuses to run outside
+  Valgrind when `CT_REQUIRE_VALGRIND=1`. Under `cargo test --all-features`
+  the client requests are no-ops and the same binary is a plain smoke test.
+- **Covered** (one fixed-seed instance each): the `ct` primitives;
+  AES-128/192/256, Camellia, ARIA and SM4 block encryption; AES-GCM,
+  AES-GCM-SIV, AES-CCM, AES-EAX, ChaCha20-Poly1305, XChaCha20-Poly1305,
+  AEGIS-128L, Ascon-AEAD128 (seal, open, and open with a forged tag);
+  AES-CMAC, Poly1305, KMAC128, SipHash-2-4, HMAC-SHA-256/512 (`mac` and
+  `verify`, good and bad); HKDF, PBKDF2, Argon2i; SHA-2, SHA-3, SHAKE,
+  BLAKE2b, BLAKE3, SM3 over secret input; X25519, X448, Ed25519, Ed448,
+  P-256 ECDSA sign / ECDH / keygen, P-384 ECDSA sign / ECDH (boxed path),
+  secp256k1 ECDSA sign, SM2 sign, FFDH group14, HPKE (X25519 and P-256
+  KEMs, seal + open + forged ciphertext), BLS12-381 signing, LMS (H5)
+  keygen + sign; RSA-2048 key generation, PSS sign, OAEP decrypt, PKCS#1
+  v1.5 decrypt in its explicit-error, fixed-length (`_session`) and
+  implicit-rejection forms — each with a valid and a tampered ciphertext;
+  ML-KEM-512/768/1024 keygen and decapsulation (768 also encapsulation and
+  a tampered ciphertext); ML-DSA-44/65/87 keygen and deterministic
+  signing (65 also hedged); SLH-DSA-SHA2-128f and SHAKE-128f keygen +
+  sign.
+- **Not covered**: everything not in that list (notably TLS/DTLS/QUIC record
+  and handshake processing, PKCS#12, XMSS, the `zkp` and `falcon` modules
+  and the hazmat surfaces); code paths a single fixed input does
+  not reach; the *portable fallbacks* of runtime-dispatched SIMD code
+  (AES, GHASH, ChaCha20, SHA-2, Keccak — each runner tests whichever
+  backend its Valgrind-emulated CPU selects, and Valgrind hides AVX-512 and
+  SHA-NI); **variable-latency instructions** (memcheck flags branches and
+  addresses, not a division or multiply whose timing depends on its
+  operands); other compilers, LLVM versions, targets and optimization
+  levels than the CI's; and every microarchitectural channel (cache, port
+  contention, speculation, power) — the harness shows the *machine code* is
+  data-oblivious, not that the *CPU* is.
+- The documented variable-time residuals below are deliberately not in the
+  harness (they would be flagged, correctly); nothing is suppressed.
+
+The first run found and fixed four cases where LLVM had undone
+source-level constant-time code: the barrel shifter that moves a decrypted
+RSA message to the front of its block (`ct_shift_left`) was loop-unswitched
+into a branch on each secret shift bit; the masked merge of the synthetic
+plaintext in `decrypt_pkcs1v15_implicit` was unswitched into a branch on the
+padding verdict — the Bleichenbacher oracle it exists to remove; the
+`pos < len || byte == 0` width assertion in `BoxedUint::to_be_bytes` was
+lowered to a branch on every byte of a private-operation result; and the
+masked conditional subtraction in the BLS12-381 field arithmetic
+(`bls::mont::reduce_once` / `neg`) was lowered to a branch on the secret
+carry. Each is now pinned by an optimization barrier and by this harness. Two source-level
+issues went with them: the early-exit range check of a decoded ML-DSA
+secret vector, and RSA key generation branching (and selecting a pointer)
+on which prime is larger.
+
+#### Declassification points
+
+memcheck cannot know that a value computed from a secret is public by
+specification, so the library marks such values *defined* at the point they
+become public (`ct::declassify`; a no-op outside the harness). Every site
+says why, and this is the complete list — anything outside it that branches
+on a secret is a bug:
+
+- **Verification verdicts**: an AEAD / MAC / key-wrap tag comparison, an
+  RSA OAEP or PKCS#1 v1.5 padding verdict (the explicit-error API, whose
+  Bleichenbacher caveat is documented), the RSA fault-check result, the
+  X25519 / X448 all-zero output check, ECDSA's degenerate `r = 0` / `s = 0`,
+  the DH contributory-failure check, and the ML-DSA secret-vector range
+  check — all returned to the caller as `Ok`/`Err`.
+- **Rejection-sampling and retry decisions**: RFC 6979 / FIPS 186-5 scalar
+  and nonce candidates, SM2 nonce retries, the ML-DSA signing loop, ML-DSA
+  `RejBoundedPoly` (ExpandS), and every RSA key-generation decision (a
+  composite candidate, `p = q`, `|p − q|` too small, `e` not invertible,
+  the rare `2^64 | p − 1` Miller-Rabin tail). Only the count is observable.
+- **Public outputs the library itself branches on before returning them**:
+  the ML-KEM and ML-DSA matrix seed `ρ`; the ML-DSA challenge `c̃`
+  (SampleInBall) and, once accepted, `z` and the hint; every SLH-DSA
+  signature component as it is written (the tree, leaf, FORS and WOTS+
+  indices are functions of the signature and public key); the RSA
+  plaintext *length*; the boxed-curve public keys and signatures (their
+  encoders size them by bit length); the modulus of a generated RSA key.
+- **Structural facts about a secret modulus**: whether it is zero or even
+  (a panic), its limb width (`significant_limbs`, as in BoringSSL: an RSA
+  prime's size is fixed by the modulus size), whether an imported key's
+  primes are present, distinct and usable (it selects the CRT or
+  full-width path), and the identity check of an affine conversion on a
+  prime-order curve (`[k]P` is the identity iff `k ≡ 0 mod n` or `P` is).
+
 ### Known constant-time residuals
 
 What the 2026-09 review left in place, each deliberate and documented at the
@@ -267,7 +377,15 @@ code site:
   is observable by construction; `decrypt_authenticated` refuses them.
 - **Rejection-sampling loop counts** (ML-DSA signing, ECDSA nonce, ML-DSA
   challenge, surjection-proof subset draws) are public per specification;
-  the work inside each attempt is constant-shaped.
+  the work inside each attempt is constant-shaped. The ML-DSA challenge
+  `c̃` of a *rejected* attempt drives SampleInBall's data-dependent loop and
+  is therefore exposed (declassified) too; `y` and `z` of that attempt are
+  not.
+- **RSA key generation** reveals the rejected-candidate count and, with
+  probability 2⁻⁶⁴ per candidate, that `2⁶⁴` divides `p − 1` (the
+  Miller-Rabin tail past the fixed 64 squarings).
+- **Public-exponent RSA / secp256k1 field exponentiation** select on a
+  public exponent bit; the secret base never drives a branch.
 - **`debug_assert!`s on secret-derived bits** (e.g. in `Choice::from`) exist
   only in debug builds.
 

@@ -95,7 +95,8 @@ impl<C: BlockCipher + Clone> Eax<C> {
         let n = self.omac(0, nonce);
         let h = self.omac(1, aad);
         let expected = self.tag(&n, &h, buffer);
-        if !bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !expected.ct_eq(tag).declassify() {
             return Err(TagMismatch);
         }
         Ctr::new(self.cipher.clone(), &n).apply_keystream(buffer);

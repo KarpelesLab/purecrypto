@@ -490,10 +490,13 @@ impl Secp256k1Field {
                 bit -= 1;
                 acc = self.square(&acc);
                 let prod = self.mul(&acc, base);
-                // The exponent is public, so this branch is not secret-dependent.
-                if (limb >> bit) & 1 == 1 {
-                    acc = prod;
-                }
+                // The exponent is public, so a branch here would leak
+                // nothing; the mask select is used anyway because LLVM
+                // lowered the branch to `bt`+`jcc`, whose stale flag state
+                // memcheck (tests/ct_valgrind.rs) conflates with the
+                // secret base.
+                let take = mask_from_bit((limb >> bit) & 1);
+                acc = Fe::from_limbs(select(acc.as_limbs(), prod.as_limbs(), take));
             }
         }
         acc

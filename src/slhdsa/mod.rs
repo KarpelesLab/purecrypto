@@ -899,6 +899,9 @@ fn ht_sign(
             &mut addr,
             &mut sig[off..],
         );
+        // This layer's XMSS signature is published; the root recomputed from
+        // it (the next layer's WOTS+ message) is public.
+        crate::ct::declassify(&sig[off..off + per_layer]);
         if j < p.d - 1 {
             let mut new_root = [0u8; MAX_N];
             xmss_pk_from_sig(
@@ -1667,6 +1670,12 @@ fn sign_internal(
 
     // Randomizer R = PRF_msg(opt_rand, m_prefix, msg) into sig[..n].
     hash::prf_msg(p, sk_prf, opt_rand, m_prefix, msg, sig);
+    // Every signature component is declassified as it is written: it is
+    // published, and SLH-DSA's control flow and memory indices (tree and
+    // leaf index, FORS indices, WOTS+ chain lengths) are functions of the
+    // signature and the public key alone (FIPS 205 Algorithms 19-20). R is
+    // the first; H_msg(R, PK.seed, PK.root, M) is then public.
+    crate::ct::declassify(&sig[..n]);
     let mut r = [0u8; MAX_N];
     r[..n].copy_from_slice(&sig[..n]);
 
@@ -1682,6 +1691,10 @@ fn sign_internal(
     addr.set_type_and_clear(AdrsType::ForsTree);
     addr.set_key_pair(leaf_idx);
     fors_sign(p, pk_seed, sk_seed, md, &mut addr, &mut sig[n..]);
+    // The FORS signature (the rest of `sig` is still zero): published, so
+    // the FORS public key recomputed from it — the message the hypertree
+    // signs — is public too.
+    crate::ct::declassify(&sig[n..]);
 
     // FORS public key, then hypertree signature over it.
     let mut pk_fors = [0u8; MAX_N];

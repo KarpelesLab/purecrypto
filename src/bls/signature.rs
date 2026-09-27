@@ -141,7 +141,8 @@ impl SecretKey {
     /// canonical (`< r`) and nonzero.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<SecretKey, Error> {
         let sk = Fr::from_bytes(bytes).ok_or(Error::InvalidScalar)?;
-        if bool::from(sk.is_zero()) {
+        // Public: the caller sees the verdict as `Err`.
+        if sk.is_zero().declassify() {
             return Err(Error::InvalidScalar);
         }
         Ok(SecretKey(sk))

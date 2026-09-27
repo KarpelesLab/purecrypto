@@ -98,6 +98,13 @@ pub(crate) fn sample_bounded_poly(seed: &[u8], eta: u32, nonce: u16) -> Poly {
     // Squeeze full SHAKE256 rate blocks (136 bytes) rather than a byte at a
     // time; the byte stream (and thus the sampled polynomial) is unchanged,
     // any unused tail of the final block is simply discarded.
+    //
+    // The seed is secret (ρ′ in key generation), so the nibbles are too; the
+    // accept/reject bits are declassified. Which candidates were rejected is
+    // independent of the accepted coefficients (each accepted nibble is
+    // uniform on its range whatever was rejected before it), so only the
+    // public-by-analysis sample count is exposed — the same residual as the
+    // reference implementation's `rej_eta`.
     let mut block = [0u8; 136];
     'outer: while j < N {
         reader.read(&mut block);
@@ -105,20 +112,20 @@ pub(crate) fn sample_bounded_poly(seed: &[u8], eta: u32, nonce: u16) -> Poly {
             let z0 = byte & 0x0f;
             let z1 = byte >> 4;
             if eta == 2 {
-                if z0 < 15 {
+                if crate::ct::declassify_value(z0 < 15) {
                     a.c[j] = sub(2, (z0 % 5) as u32);
                     j += 1;
                 }
-                if j < N && z1 < 15 {
+                if j < N && crate::ct::declassify_value(z1 < 15) {
                     a.c[j] = sub(2, (z1 % 5) as u32);
                     j += 1;
                 }
             } else {
-                if z0 <= 8 {
+                if crate::ct::declassify_value(z0 <= 8) {
                     a.c[j] = sub(4, z0 as u32);
                     j += 1;
                 }
-                if j < N && z1 <= 8 {
+                if j < N && crate::ct::declassify_value(z1 <= 8) {
                     a.c[j] = sub(4, z1 as u32);
                     j += 1;
                 }

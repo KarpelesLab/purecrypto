@@ -125,8 +125,11 @@ impl Curve {
     pub(crate) fn to_affine(&self, point: &Point) -> Option<(BoxedUint, BoxedUint)> {
         // `z` is secret-derived (it is the tail of a scalar multiplication),
         // so the identity test must not short-circuit on the first non-zero
-        // limb the way `BoxedUint::is_zero` does: fold every limb first.
-        if bool::from(point.z.ct_is_zero()) {
+        // limb the way `BoxedUint::is_zero` does: fold every limb first. The
+        // verdict is public in every caller: on these prime-order curves
+        // `[k]P` is the identity iff `k ≡ 0 (mod n)` or `P` is — a
+        // degenerate scalar or peer the caller rejects as an error.
+        if point.z.ct_is_zero().declassify() {
             return None;
         }
         let z = self.fp.from_mont(&point.z);

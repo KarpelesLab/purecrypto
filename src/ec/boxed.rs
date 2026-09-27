@@ -75,7 +75,10 @@ pub struct BoxedEcdhPrivateKey {
 /// scalar — private-key import, nonce rejection sampling — so the zero test
 /// and the comparison must not leak which limb first differed).
 fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
-    (!v.ct_is_zero() & v.reduce(n).ct_eq(v)).into()
+    // Public in every caller: a key-import verdict the caller sees as
+    // `Ok`/`Err`, or an RFC 6979 / rejection-sampling decision whose only
+    // observable is the (public) retry count.
+    (!v.ct_is_zero() & v.reduce(n).ct_eq(v)).declassify()
 }
 
 /// Modular inverse `a^-1 mod m` for prime `m`, via Fermat (`a^(m-2) mod m`).
@@ -339,6 +342,9 @@ impl BoxedEcdsaPrivateKey {
         let (x, y) = c
             .to_affine(&c.mul_generator(&self.d))
             .expect("d in [1,n-1] so d*G is not the identity");
+        // The public key is public (its encoders scan it for its width).
+        crate::ct::declassify_val(x.as_limbs());
+        crate::ct::declassify_val(y.as_limbs());
         BoxedEcdsaPublicKey {
             curve: self.curve,
             x,
@@ -398,7 +404,9 @@ impl BoxedEcdsaPrivateKey {
             return Err(Error::InvalidInput);
         };
         let r = full_x.reduce(&n);
-        if r.is_zero() {
+        // `r` is published in the signature; the degenerate `r = 0` is a
+        // public error return.
+        if r.ct_is_zero().declassify() {
             k.zeroize();
             return Err(Error::InvalidInput);
         }
@@ -416,9 +424,14 @@ impl BoxedEcdsaPrivateKey {
         k.zeroize();
         k_inv.zeroize();
         z_rd.zeroize();
-        if s.is_zero() {
+        // Likewise `s`: published, or the public `s = 0` error.
+        if s.ct_is_zero().declassify() {
             return Err(Error::InvalidInput);
         }
+        // The signature is public from here (its encoders size it by
+        // `bit_len`, which scans the limbs).
+        crate::ct::declassify_val(r.as_limbs());
+        crate::ct::declassify_val(s.as_limbs());
         Ok((r, s, x_overflow, y_is_odd))
     }
 
@@ -1005,6 +1018,9 @@ impl BoxedEcdhPrivateKey {
         let (x, y) = c
             .to_affine(&c.mul_generator(&self.d))
             .expect("d in [1,n-1] so d*G is not the identity");
+        // The public key is public (its encoders scan it for its width).
+        crate::ct::declassify_val(x.as_limbs());
+        crate::ct::declassify_val(y.as_limbs());
         BoxedEcdsaPublicKey {
             curve: self.curve,
             x,

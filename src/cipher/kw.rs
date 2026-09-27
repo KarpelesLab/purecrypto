@@ -116,7 +116,12 @@ impl<C: BlockCipher> AesKw<C> {
             return Err(KwError::InvalidLength);
         }
         let recovered = unwrap_w(&self.cipher, ciphertext, out)?;
-        if bool::from(recovered.to_be_bytes().ct_eq(&RFC3394_IV.to_be_bytes())) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if recovered
+            .to_be_bytes()
+            .ct_eq(&RFC3394_IV.to_be_bytes())
+            .declassify()
+        {
             Ok(())
         } else {
             // Wipe the candidate plaintext on failure so a caller can't leak
@@ -335,7 +340,8 @@ impl<C: BlockCipher> AesKwp<C> {
 
         let ok: Choice = tag_ok & mli_nonzero & mli_in_range & pad_short & pad_ok;
 
-        if !bool::from(ok) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !ok.declassify() {
             // Wipe scratch before returning the error. Returning a single
             // generic error variant deliberately does not distinguish prefix /
             // length / padding failure to the caller.

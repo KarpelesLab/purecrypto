@@ -1,0 +1,131 @@
+name: Constant-time (Valgrind)
+
+# Checks that the constant-time code paths compile to constant-time machine
+# code, using Valgrind memcheck as a taint tracker (the ctgrind / TIMECOP
+# technique of libsodium, BoringSSL and PQClean). `tests/ct_valgrind.rs`
+# marks every secret input *undefined* through Valgrind client requests
+# (compiled in by the hidden `__ct-check` feature); memcheck then reports any
+# conditional branch or memory address computed from a secret in the
+# optimized release binary, and `--error-exitcode=1` fails the job. See the
+# harness header for what is and is not covered.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  memcheck:
+    name: memcheck (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    env:
+      # Debug info, so memcheck's stack traces name source lines and inlined
+      # frames. It changes no optimization setting: the binary under test is
+      # the opt-level 3, thin-LTO release build users get (asserted below).
+      CARGO_PROFILE_RELEASE_DEBUG: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ct-valgrind-${{ matrix.os }}
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          valgrind --version
+          lscpu
+          rustc -vV
+
+      - name: Build the harness (release)
+        id: build
+        run: |
+          set -euo pipefail
+          cargo test --release --features __ct-check,hpke,bls --test ct_valgrind --no-run \
+                --message-format=json > build.jsonl
+          sel='select(.reason == "compiler-artifact" and .target.name == "ct_valgrind" and .profile.test)'
+          jq -r "$sel"' | "opt-level=\(.profile.opt_level) debuginfo=\(.profile.debuginfo) \(.executable)"' build.jsonl
+          bin=$(jq -r "$sel | .executable" build.jsonl | grep -v null | head -n1)
+          opt=$(jq -r "$sel | .profile.opt_level" build.jsonl | head -n1)
+          lib_opt=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "purecrypto" and (.target.kind | index("lib"))) | .profile.opt_level' build.jsonl | head -n1)
+          echo "harness opt-level=$opt, library opt-level=$lib_opt"
+          # `cargo test --release` must test the optimized code users ship.
+          test "$opt" = "3" || { echo "::error::harness built at opt-level $opt, expected 3"; exit 1; }
+          test "$lib_opt" = "3" || { echo "::error::library built at opt-level $lib_opt, expected 3"; exit 1; }
+          echo "CT_BIN=$bin" >> "$GITHUB_ENV"
+
+      - name: Native smoke run
+        run: '"$CT_BIN"'
+
+      # The positive control is a deliberately variable-time function (a branch
+      # and a table index on a secret byte). memcheck MUST flag it; if it does
+      # not, the client requests are broken and a clean run below would be
+      # meaningless.
+      - name: Positive control (must be flagged)
+        run: |
+          set +e -uo pipefail
+          CT_REQUIRE_VALGRIND=1 valgrind --tool=memcheck --error-exitcode=1 \
+            --track-origins=yes --leak-check=no --errors-for-leak-kinds=none \
+            "$CT_BIN" --positive-control 2>&1 | tee control.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 1 ]; then
+            echo "::error::positive control exited $status under memcheck (expected 1)"
+            exit 1
+          fi
+          grep -q "Conditional jump or move depends on uninitialised value" control.log \
+            || { echo "::error::memcheck did not flag the secret branch"; exit 1; }
+          grep -q "Use of uninitialised value of size" control.log \
+            || { echo "::error::memcheck did not flag the secret table index"; exit 1; }
+          echo "positive control correctly flagged"
+
+      # Runs even when the control step failed, so one CI run reports both.
+      - name: Constant-time check under memcheck
+        id: check
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set +e -uo pipefail
+          CT_REQUIRE_VALGRIND=1 valgrind --tool=memcheck --error-exitcode=1 \
+            --track-origins=yes --leak-check=no --errors-for-leak-kinds=none \
+            --num-callers=40 \
+            "$CT_BIN" 2>&1 | tee memcheck.log
+          exit "${PIPESTATUS[0]}"
+
+      # On failure, disassemble around every reported instruction so a
+      # finding can be read off the actual machine code.
+      - name: Disassemble the flagged instructions
+        if: ${{ !cancelled() && steps.check.outcome == 'failure' }}
+        run: |
+          set -uo pipefail
+          grep -E '^==[0-9]+==\s+at 0x[0-9A-Fa-f]+:' memcheck.log \
+            | sed -E 's/^==[0-9]+==\s+at 0x([0-9A-Fa-f]+):.*/\1/' | sort -u \
+            | while read -r addr; do
+                echo "::group::0x$addr"
+                # The binary is PIE; Valgrind maps it at 0x108000, so the
+                # reported addresses are the link-time ones plus that bias.
+                for bias in 0x108000 0; do
+                  a=$(printf '%x' $((0x$addr - bias)))
+                  start=$(printf '0x%x' $((0x$a - 0x40)))
+                  stop=$(printf '0x%x' $((0x$a + 0x30)))
+                  out=$(objdump -d -l --no-show-raw-insn --start-address="$start" --stop-address="$stop" "$CT_BIN" \
+                    | sed -n '/^Disassembly/,$p' | tail -n +2 | sed -E "s/^ *$a:/>>> &/")
+                  if [ -n "$out" ]; then echo "$out"; break; fi
+                done
+                echo "::endgroup::"
+              done

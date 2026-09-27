@@ -288,7 +288,8 @@ impl Aegis128 {
         let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
         let st = self.decrypt_inner(nonce, aad, scratch.as_mut());
         let expected = st.tag128();
-        if !bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !expected.ct_eq(tag).declassify() {
             return Err(TagMismatch);
         }
         buffer.copy_from_slice(scratch.as_mut());
@@ -559,7 +560,8 @@ impl Aegis128L {
         let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
         let st = self.decrypt_inner_tag(nonce, aad, scratch.as_mut());
         let expected = st.tag128();
-        if !bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !expected.ct_eq(tag).declassify() {
             return Err(TagMismatch);
         }
         buffer.copy_from_slice(scratch.as_mut());
@@ -583,7 +585,8 @@ impl Aegis128L {
         let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
         let st = self.decrypt_inner_tag(nonce, aad, scratch.as_mut());
         let expected = st.tag256();
-        if !bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !expected.ct_eq(tag).declassify() {
             return Err(TagMismatch);
         }
         buffer.copy_from_slice(scratch.as_mut());
@@ -815,7 +818,8 @@ impl Aegis256 {
         let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
         let st = self.decrypt_inner_tag(nonce, aad, scratch.as_mut());
         let expected = st.tag128();
-        if !bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !expected.ct_eq(tag).declassify() {
             return Err(TagMismatch);
         }
         buffer.copy_from_slice(scratch.as_mut());
@@ -839,7 +843,8 @@ impl Aegis256 {
         let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
         let st = self.decrypt_inner_tag(nonce, aad, scratch.as_mut());
         let expected = st.tag256();
-        if !bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if !expected.ct_eq(tag).declassify() {
             return Err(TagMismatch);
         }
         buffer.copy_from_slice(scratch.as_mut());

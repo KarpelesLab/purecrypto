@@ -366,6 +366,9 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
 ) {
     let mut expanded = [0u8; 128];
     shake256(&[seed, &[K as u8, L as u8]], &mut expanded);
+    // ρ is public: it is the first field of the public key (FIPS 204
+    // Algorithm 6), so ExpandA's rejection sampling may branch on it.
+    crate::ct::declassify(&expanded[..32]);
     let rho = &expanded[..32];
     let rho1 = &expanded[32..96];
     let key = &expanded[96..128];
@@ -550,6 +553,12 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             }
             h.finalize_into(ctilde);
         }
+        // Documented residual (docs/validation.md): SampleInBall's rejection
+        // loop and the positions it writes are driven by c̃, which is
+        // declassified here. For the accepted attempt c̃ is the first field
+        // of the published signature; for a rejected attempt only the
+        // challenge (not z, not y) is exposed.
+        crate::ct::declassify(ctilde);
         let c = sample_challenge(ctilde, p.tau);
         let mut c_ntt = c;
         c_ntt.ntt();
@@ -579,7 +588,9 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             wipe_polys(core::slice::from_mut(&mut cs2));
         }
         let r0_bad = vec_inf_norm_signed(&r0) >= (p.gamma2 - p.beta) as i32;
-        if z_bad | r0_bad {
+        // The reject decision is public (only the attempt count is
+        // observable; docs/validation.md).
+        if crate::ct::declassify_value(z_bad | r0_bad) {
             kappa += L as u16;
             continue;
         }
@@ -603,10 +614,16 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             wipe_polys(core::slice::from_mut(&mut cs2));
         }
         let hint_bad = count_ones(&hints) > p.omega;
-        if ct0_bad | hint_bad {
+        // As above: the reject decision is public.
+        if crate::ct::declassify_value(ct0_bad | hint_bad) {
             kappa += L as u16;
             continue;
         }
+
+        // Accepted: z and the hint h are now the published signature, and
+        // HintBitPack's output layout depends on where the hint bits are.
+        crate::ct::declassify_val(&z);
+        crate::ct::declassify_val(&hints);
 
         // Encode the signature into the caller's buffer.
         let mut sc = Cursor::new(sig_out);

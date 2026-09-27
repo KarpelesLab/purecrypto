@@ -323,7 +323,8 @@ impl AesGcmSiv {
         Self::ctr(&enc_cipher, tag, buffer);
         let expected = Self::make_tag(&auth_key, &enc_cipher, nonce, aad, buffer);
         auth_key.zeroize();
-        if bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        if expected.ct_eq(tag).declassify() {
             Ok(())
         } else {
             // Unauthenticated plaintext must not reach the caller.

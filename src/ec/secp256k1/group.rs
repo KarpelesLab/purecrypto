@@ -213,8 +213,13 @@ impl Point {
     /// inversion uses the constant-time Fermat inverse from the field backend.
     // Takes `&self` for consistency with the other by-reference point ops.
     #[allow(clippy::wrong_self_convention)]
+    ///
+    /// Whether the point is the identity is public in every in-crate caller:
+    /// the group has prime order, so `[k]P` is the identity iff
+    /// `k ≡ 0 (mod n)` or `P` is — a degenerate scalar or point the caller
+    /// rejects as an error.
     pub(crate) fn to_affine<F: FieldBackend>(&self, f: &F) -> Option<(Fe, Fe)> {
-        if bool::from(self.is_identity()) {
+        if self.is_identity().declassify() {
             return None;
         }
         let z_inv = f.invert(&self.z);

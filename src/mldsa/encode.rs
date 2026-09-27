@@ -125,7 +125,7 @@ pub(crate) fn unpack_eta2(b: &[u8]) -> Result<Poly, ()> {
             f.c[i + j] = sub(2, (x >> (3 * j)) & 0x7);
         }
     }
-    if bad != 0 {
+    if crate::ct::declassify_value(bad != 0) {
         return Err(());
     }
     Ok(f)
@@ -158,7 +158,7 @@ pub(crate) fn unpack_eta4(b: &[u8]) -> Result<Poly, ()> {
             f.c[i + j] = sub(4, (x >> (4 * j)) & 0xf);
         }
     }
-    if bad != 0 {
+    if crate::ct::declassify_value(bad != 0) {
         return Err(());
     }
     Ok(f)

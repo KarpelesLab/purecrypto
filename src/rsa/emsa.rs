@@ -231,16 +231,21 @@ pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(
     // that hides even that, see [`decrypt_pkcs1v15_session`].
     let (bad, sep_idx) = pkcs1v15_padding_check(scratch);
 
-    if bad != 0 {
+    // The verdict is this function's (public) result — the documented
+    // Bleichenbacher caveat of the explicit-error API.
+    if crate::ct::declassify_value(bad != 0) {
         return Err(Error::Decryption);
     }
     // The message starts at the secret offset `sep_idx + 1`; move it to the
     // front with fixed-address loads rather than a secret-offset slice.
     let n = k - (sep_idx as usize) - 1;
+    ct_shift_left(scratch, sep_idx + 1);
+    // The plaintext length is returned to the caller, so it is public from
+    // here on (the shift above still ran on the secret offset).
+    let n = crate::ct::declassify_value(n);
     if out.len() < n {
         return Err(Error::InvalidLength);
     }
-    ct_shift_left(scratch, sep_idx + 1);
     out[..n].copy_from_slice(&scratch[..n]);
     Ok(n)
 }
@@ -553,7 +558,9 @@ pub(crate) fn decrypt_pkcs1v15_implicit<K: RawPrivate>(
     // the barrel shifter (see `ct_shift_left`).
     ct_shift_left(scratch, (k as u32).wrapping_sub(final_len));
 
-    let n = final_len as usize;
+    // The (real or synthetic) length is returned to the caller: public from
+    // here on. Which of the two it is stays secret.
+    let n = crate::ct::declassify_value(final_len) as usize;
     out[..n].copy_from_slice(&scratch[..n]);
     Ok(n)
 }
@@ -1102,7 +1109,9 @@ pub(crate) fn decrypt_oaep<D: Digest, M: Digest, K: RawPrivate>(
     bad |= !found;
     bad |= pre_bad;
 
-    if bad != 0 {
+    // The verdict is this function's (public) result; RFC 8017 §7.1.2 makes
+    // every failure the same single error.
+    if crate::ct::declassify_value(bad != 0) {
         return Err(Error::Decryption);
     }
 
@@ -1110,10 +1119,12 @@ pub(crate) fn decrypt_oaep<D: Digest, M: Digest, K: RawPrivate>(
     // the decrypted block, so move the message to the front branch-free
     // instead of slicing at it.
     let n = ps_region.len() - sep_idx - 1;
+    ct_shift_left(ps_region, (sep_idx + 1) as u32);
+    // The message length is returned to the caller: public from here on.
+    let n = crate::ct::declassify_value(n);
     if out.len() < n {
         return Err(Error::InvalidLength);
     }
-    ct_shift_left(ps_region, (sep_idx + 1) as u32);
     out[..n].copy_from_slice(&ps_region[..n]);
     Ok(n)
 }

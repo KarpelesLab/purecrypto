@@ -43,8 +43,9 @@ impl EcdhPrivateKey {
         let d = Fe::from_be_bytes(bytes);
         let n = P256::order();
         // Non-short-circuiting `&` on the two `Choice`s: `d` is secret, so the
-        // zero test must not decide whether the range check runs.
-        if bool::from(!d.is_zero() & d.ct_lt(&n)) {
+        // zero test must not decide whether the range check runs. The
+        // combined verdict is public: the caller sees it as `Ok`/`Err`.
+        if (!d.is_zero() & d.ct_lt(&n)).declassify() {
             Ok(EcdhPrivateKey { d })
         } else {
             Err(Error::InvalidInput)

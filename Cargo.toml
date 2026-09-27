@@ -157,6 +157,14 @@ quic = ["tls", "std"]
 # directly, without a completed key exchange in front of it. Only `fuzz/`
 # should enable this.
 __fuzz = ["tls"]
+# INTERNAL — not part of the public API, no semver guarantee, may vanish at
+# any time. Turns the `ct` module's Valgrind memcheck client requests
+# (`ct::classify` / `ct::declassify`, `#[doc(hidden)]`) from no-ops into the
+# real instruction sequences on x86_64 / aarch64, so `tests/ct_valgrind.rs`
+# can mark secrets undefined and have memcheck report every branch or memory
+# index computed from them in the optimized binary. Only the constant-time
+# harness and `.github/workflows/ct-valgrind.yml` should enable this.
+__ct-check = []
 # hazmat: low-level arithmetic exposures with NO semver-stability guarantee;
 # the caller owns correctness and constant-time discipline. Off by default.
 # `edwards25519::hazmat` exposes the order-L `Scalar` and the `EdwardsPoint`
@@ -405,6 +413,15 @@ required-features = ["tls-legacy", "std"]
 [[example]]
 name = "bench"
 required-features = ["std", "cipher", "hash", "ec", "rsa", "mlkem", "mldsa", "slhdsa", "aez"]
+
+# Valgrind constant-time harness (ctgrind / TIMECOP technique): see the
+# header of `tests/ct_valgrind.rs` and `.github/workflows/ct-valgrind.yml`.
+# Without Valgrind (e.g. `cargo test --all-features`) it runs natively as a
+# smoke test, the client requests being no-ops.
+[[test]]
+name = "ct_valgrind"
+harness = false
+required-features = ["__ct-check", "std", "hash", "cipher", "kdf", "rng", "rsa", "ec", "mlkem", "mldsa", "slhdsa", "der", "dh", "ascon", "alloc", "mac", "hpke", "bls", "lms"]
 
 [lints.rust]
 # `fullrust` is a custom, out-of-tree `target_os` (a libc-free Linux

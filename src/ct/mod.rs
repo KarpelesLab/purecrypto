@@ -17,10 +17,13 @@
 //!
 //! These routines avoid secret-dependent branches and table indexing at the
 //! source level, and apply [`core::hint::black_box`] as an optimization
-//! barrier to discourage the compiler from reintroducing them. This is
-//! best-effort: genuine constant-time behavior also depends on the target CPU
-//! and the emitted machine code, and should be validated with timing-analysis
-//! tooling (e.g. dudect-style measurements) for security-critical use.
+//! barrier to discourage the compiler from reintroducing them. The emitted
+//! machine code of these primitives and of the crate's main secret-handling
+//! operations is checked in CI with Valgrind memcheck used as a taint
+//! tracker (`tests/ct_valgrind.rs`, x86_64 and aarch64 release builds; see
+//! `docs/validation.md`). That shows the code is data-oblivious, not that a
+//! given CPU is: variable-latency instructions and microarchitectural
+//! channels remain outside what any such tool can see.
 //!
 //! Converting a [`Choice`] into a plain [`bool`] is the one deliberately
 //! *variable-time* operation — do it only once a value is no longer secret.
@@ -29,6 +32,23 @@ mod eq;
 mod negate;
 mod ord;
 mod select;
+// Always compiled so the library's declassification points build (to
+// nothing) without the feature; only the hidden `__ct-check` feature exposes
+// the entry points to the Valgrind harness.
+#[cfg_attr(not(feature = "__ct-check"), allow(dead_code, unreachable_pub))]
+mod valgrind;
+
+/// Valgrind memcheck client requests for the constant-time harness
+/// (`tests/ct_valgrind.rs`). Internal: enabled solely by the hidden
+/// `__ct-check` feature, with no API-stability guarantee whatsoever.
+#[cfg(feature = "__ct-check")]
+#[doc(hidden)]
+pub use valgrind::{
+    classify, classify_val, declassify, declassify_val, declassify_value, running_on_valgrind,
+};
+#[cfg(not(feature = "__ct-check"))]
+#[allow(unused_imports)] // which ones are used depends on the feature set
+pub(crate) use valgrind::{declassify, declassify_val, declassify_value};
 
 pub use eq::ConstantTimeEq;
 pub use negate::ConditionallyNegatable;
@@ -52,6 +72,20 @@ impl Choice {
     #[inline]
     pub fn unwrap_u8(self) -> u8 {
         self.0
+    }
+
+    /// Converts to a [`bool`] that is **public by specification** although it
+    /// is computed from secrets — a verification verdict, a
+    /// rejection-sampling accept bit — telling the Valgrind constant-time
+    /// harness (hidden `__ct-check` feature) not to report the branch taken
+    /// on it. Identical to `bool::from` in every other build.
+    ///
+    /// Every call site must say why the bit is public; never use this to
+    /// silence a finding. The list is mirrored in `docs/validation.md`.
+    #[inline(always)]
+    #[allow(dead_code)] // unused in the leanest feature sets
+    pub(crate) fn declassify(self) -> bool {
+        bool::from(declassify_value(self))
     }
 }
 
@@ -253,6 +287,24 @@ impl<T> CtOption<T> {
     #[inline]
     pub fn into_option(self) -> Option<T> {
         if bool::from(self.is_some) {
+            Some(self.value)
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> CtOption<T> {
+    /// [`into_option`](Self::into_option) for a presence flag that is
+    /// **public by specification** (e.g. "`e` is invertible mod `φ(n)`",
+    /// whose only observable is a key-generation redraw): the flag is
+    /// declassified for the Valgrind constant-time harness (hidden
+    /// `__ct-check` feature). Identical to `into_option` in every other
+    /// build. The call site must say why the flag is public.
+    #[inline]
+    #[allow(dead_code)] // unused in the leanest feature sets
+    pub(crate) fn into_public_option(self) -> Option<T> {
+        if self.is_some.declassify() {
             Some(self.value)
         } else {
             None

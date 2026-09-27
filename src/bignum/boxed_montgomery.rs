@@ -87,13 +87,20 @@ impl BoxedMontModulus {
         // we check explicitly first to give a precise diagnostic and to
         // document that a zero modulus is rejected rather than silently
         // producing a meaningless parameter set.
+        //
+        // The modulus may be secret (an RSA prime, a Miller-Rabin
+        // candidate): both checks are branch-free until their verdict, which
+        // is public — it is a panic.
         assert!(
-            !modulus.is_zero(),
+            !modulus.ct_is_zero().declassify(),
             "BoxedMontModulus::new: modulus must be nonzero"
         );
         let limbs = modulus.significant_limbs();
         let n = modulus.limbs_resized(limbs);
-        assert!(n[0] & 1 == 1, "Montgomery modulus must be odd");
+        assert!(
+            crate::ct::declassify_value(n[0] & 1 == 1),
+            "Montgomery modulus must be odd"
+        );
         let n_prime = inv_mod_2_64(n[0]).wrapping_neg();
 
         // r2 = 2^(2*64*limbs) mod n, by doubling 1 that many times.

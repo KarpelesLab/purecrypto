@@ -33,8 +33,10 @@ pub(crate) fn random_scalar<R: RngCore>(rng: &mut R) -> Fe {
             *limb = rng.next_u64();
         }
         let d = Uint::from_limbs(limbs);
-        // Accept iff 1 ≤ d < n.
-        if !bool::from(d.is_zero()) && bool::from(d.ct_lt(&n)) {
+        // Accept iff 1 ≤ d < n: one non-short-circuiting verdict, public
+        // (FIPS 186-5 A.4.2 rejection sampling; only the retry count, which
+        // is independent of the accepted scalar, is observable).
+        if (!d.is_zero() & d.ct_lt(&n)).declassify() {
             return d;
         }
     }
@@ -158,8 +160,12 @@ impl P256 {
     /// variable-time extended-Euclidean `inv_mod` — `z` is derived from the
     /// secret scalar on every ECDH / ECDSA hot path and a timing leak here
     /// would be exploitable.
+    ///
+    /// Whether the point is the identity is public in every caller: P-256
+    /// has prime order, so `[k]P` is the identity iff `k ≡ 0 (mod n)` or `P`
+    /// is — a degenerate scalar or peer the caller rejects as an error.
     pub(crate) fn to_affine(&self, point: &Point) -> Option<(Fe, Fe)> {
-        if bool::from(point.z.is_zero()) {
+        if point.z.is_zero().declassify() {
             return None;
         }
         let z_inv = field::invert(&point.z);

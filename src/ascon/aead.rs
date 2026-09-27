@@ -188,7 +188,8 @@ impl AsconAead128 {
         s.0[1] = u64::from_le_bytes(rate_bytes[8..16].try_into().unwrap());
 
         let expected = self.finalize(&mut s);
-        let result = if bool::from(expected.ct_eq(tag)) {
+        // The accept/reject verdict is the public outcome of decryption.
+        let result = if expected.ct_eq(tag).declassify() {
             // Authentic: commit the recovered plaintext tail.
             buffer[full..full + rem_len].copy_from_slice(&plain[..rem_len]);
             Ok(())

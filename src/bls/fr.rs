@@ -116,7 +116,8 @@ impl Fr {
     #[inline]
     pub fn from_bytes(bytes: &[u8; 32]) -> Option<Fr> {
         let limbs = mont::from_be_bytes::<4>(bytes);
-        let ok = mont::lt_bit(&limbs, &MODULUS) == 1;
+        // The canonicity verdict is public: the caller sees it as `None`.
+        let ok = crate::ct::declassify_value(mont::lt_bit(&limbs, &MODULUS) == 1);
         ok.then(|| Fr(mont::mul(&limbs, &R2, &MODULUS, INV)))
     }
 
