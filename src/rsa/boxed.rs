@@ -1044,8 +1044,14 @@ impl BoxedRsaPrivateKey {
             // power. `saturating_sub` keeps the bound total for sub-200-bit toy
             // sizes (where the threshold collapses to 0 and the check is a no-op
             // since `p ≠ q`).
-            let diff = if p.lt(&q) { q.sub(&p) } else { p.sub(&q) };
-            if diff.bit_len() <= half.saturating_sub(100) {
+            //
+            // Both differences are computed and one is selected, so which
+            // prime is larger never steers a branch or a load, and the bound
+            // is tested as `|p − q| >> k == 0` rather than by scanning the
+            // secret difference for its length.
+            let p_lt_q = crate::ct::Choice::from(p.lt(&q) as u8);
+            let diff = BoxedUint::conditional_select(&q.sub(&p), &p.sub(&q), p_lt_q);
+            if bool::from(diff.shr_bits(half.saturating_sub(100)).ct_is_zero()) {
                 continue;
             }
             let n = p.mul(&q);
