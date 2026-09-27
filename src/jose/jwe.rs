@@ -14,8 +14,19 @@ use alloc::vec::Vec;
 
 /// Upper bound accepted for the PBES2 `p2c` iteration count when
 /// decrypting (a header-controlled work factor is a denial-of-service
-/// lever).
+/// lever). The bound applies to the message as a whole, not to each
+/// recipient: decryption of a general-JSON JWE debits the `p2c` of every
+/// PBES2 recipient it tries from one budget of this size, and a recipient
+/// that would overdraw it is refused without running PBKDF2. A single
+/// recipient may therefore use the full count, but several recipients
+/// cannot multiply it.
 pub const MAX_PBES2_ITERATIONS: u64 = 1_000_000;
+
+/// Upper bound on the number of recipients accepted in a general-JSON
+/// JWE. Every recipient is tried in turn on decryption (RSA private
+/// operations, ECDH, PBKDF2), so the count is a work factor the message
+/// controls; real multi-recipient messages have a handful.
+pub const MAX_RECIPIENTS: usize = 32;
 
 /// PBES2 iteration count used when encrypting (unless the caller sets
 /// `p2c` in the extra header parameters).
@@ -129,7 +140,7 @@ impl Jwe {
                 if obj.contains("header") || obj.contains("encrypted_key") {
                     return Err(Error::Malformed);
                 }
-                if list.is_empty() {
+                if list.is_empty() || list.len() > MAX_RECIPIENTS {
                     return Err(Error::Malformed);
                 }
                 let mut rs = Vec::with_capacity(list.len());
@@ -249,11 +260,13 @@ impl Jwe {
 
     /// Decrypts with `key` and returns the plaintext. Every recipient is
     /// tried in turn; the key's `alg`, `use` and `key_ops` must permit the
-    /// recipient's algorithm.
+    /// recipient's algorithm. PBES2 recipients share one
+    /// [`MAX_PBES2_ITERATIONS`] budget for the whole message.
     pub fn decrypt(&self, key: &Jwk) -> Result<Vec<u8>, Error> {
         let mut last = Error::Decryption;
+        let mut pbes2_budget = MAX_PBES2_ITERATIONS;
         for r in &self.recipients {
-            match self.decrypt_recipient(r, key) {
+            match self.decrypt_recipient(r, key, &mut pbes2_budget) {
                 Ok(pt) => return Ok(pt),
                 Err(e) => last = e,
             }
@@ -265,6 +278,7 @@ impl Jwe {
     /// `kid` (or, without one, the single key fitting the algorithm).
     pub fn decrypt_with_set(&self, keys: &JwkSet) -> Result<Vec<u8>, Error> {
         let mut last = Error::Decryption;
+        let mut pbes2_budget = MAX_PBES2_ITERATIONS;
         for r in &self.recipients {
             let attempt = (|| {
                 let header = self.merged_header(r)?;
@@ -274,7 +288,7 @@ impl Jwe {
                 let key = keys.select(header.get_str("kid")?, |k| {
                     check_key(k, alg, enc, &DECRYPT_OPS).is_ok()
                 })?;
-                self.decrypt_recipient(r, key)
+                self.decrypt_recipient(r, key, &mut pbes2_budget)
             })();
             match attempt {
                 Ok(pt) => return Ok(pt),
@@ -284,7 +298,14 @@ impl Jwe {
         Err(last)
     }
 
-    fn decrypt_recipient(&self, r: &JweRecipient, key: &Jwk) -> Result<Vec<u8>, Error> {
+    /// Decrypts one recipient. `pbes2_budget` is the message's remaining
+    /// PBKDF2 iteration allowance (see [`MAX_PBES2_ITERATIONS`]).
+    fn decrypt_recipient(
+        &self,
+        r: &JweRecipient,
+        key: &Jwk,
+        pbes2_budget: &mut u64,
+    ) -> Result<Vec<u8>, Error> {
         let header = self.merged_header(r)?;
         let enc = self.enc()?;
         let alg =
@@ -295,7 +316,7 @@ impl Jwe {
         if zip {
             return Err(Error::Unsupported("zip"));
         }
-        let cek = unwrap_cek(alg, enc, key, &header, &r.encrypted_key)?;
+        let cek = unwrap_cek(alg, enc, key, &header, &r.encrypted_key, pbes2_budget)?;
         let aad = self.aad();
         let pt = content_decrypt(enc, &cek, &self.iv, &aad, &self.ciphertext, &self.tag)?;
         if zip {
@@ -550,13 +571,16 @@ fn header_epk(header: &Object) -> Result<Jwk, Error> {
 /// Recovers the content encryption key for one recipient. Failures that
 /// depend on secret material are all [`Error::Decryption`]; for `RSA1_5`
 /// a padding failure yields a pseudo-random CEK instead, so that the
-/// content authentication tag is what fails.
+/// content authentication tag is what fails. A PBES2 recipient debits its
+/// `p2c` from `pbes2_budget` before anything runs and is refused
+/// ([`Error::Malformed`]) when the message's allowance is spent.
 fn unwrap_cek(
     alg: KeyAlg,
     enc: Enc,
     key: &Jwk,
     header: &Object,
     encrypted_key: &[u8],
+    pbes2_budget: &mut u64,
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
     let klen = enc.key_len();
     let cek = match alg {
@@ -619,6 +643,11 @@ fn unwrap_cek(
                 Some(Value::Number(n)) => n.as_u64().ok_or(Error::Malformed)?,
                 _ => return Err(Error::Malformed),
             };
+            // The count is charged to the message's budget as claimed,
+            // whether or not the derivation then runs: a general JWE
+            // listing many PBES2 recipients gets one `MAX_PBES2_ITERATIONS`
+            // in total, not one per recipient.
+            *pbes2_budget = pbes2_budget.checked_sub(p2c).ok_or(Error::Malformed)?;
             let kek = pbes2_kek(alg, key.oct_bytes()?, &p2s, p2c)?;
             aes_kw_unwrap(&kek, encrypted_key)?
         }
@@ -1296,6 +1325,112 @@ mod tests {
         );
         assert_eq!(
             Jwe::parse(&text).unwrap().decrypt(&key).unwrap_err(),
+            Error::Malformed
+        );
+    }
+
+    /// A general-JSON JWE (`enc: A128GCM`, plaintext `pt`) with one
+    /// `PBES2-HS256+A128KW` recipient per `(p2c, salt, password)`. A
+    /// recipient whose parameters PBES2 refuses (short salt) gets a dummy
+    /// encrypted key: it is rejected before that is looked at.
+    fn pbes2_general(recipients: &[(u64, &[u8], &[u8])], pt: &[u8]) -> String {
+        let alg = KeyAlg::Pbes2Hs256A128KW;
+        let protected_b64 = base64url::encode(br#"{"enc":"A128GCM"}"#);
+        let cek = [7u8; 16];
+        let iv = [3u8; 12];
+        let (ct, tag) = content_encrypt(Enc::A128Gcm, &cek, &iv, protected_b64.as_bytes(), pt);
+        let list: Vec<String> = recipients
+            .iter()
+            .map(|(p2c, salt, password)| {
+                let ek = match pbes2_kek(alg, password, salt, *p2c) {
+                    Ok(kek) => aes_kw_wrap(&kek, &cek).unwrap(),
+                    Err(_) => alloc::vec![0u8; 24],
+                };
+                alloc::format!(
+                    r#"{{"header":{{"alg":"{}","p2s":"{}","p2c":{p2c}}},"encrypted_key":"{}"}}"#,
+                    alg.name(),
+                    base64url::encode(salt),
+                    base64url::encode(&ek)
+                )
+            })
+            .collect();
+        alloc::format!(
+            r#"{{"protected":"{protected_b64}","recipients":[{}],"iv":"{}","ciphertext":"{}","tag":"{}"}}"#,
+            list.join(","),
+            base64url::encode(&iv),
+            base64url::encode(&ct),
+            base64url::encode(&tag)
+        )
+    }
+
+    /// The PBES2 iteration cap is a per-message budget: recipients cannot
+    /// each claim `MAX_PBES2_ITERATIONS`.
+    #[test]
+    fn pbes2_budget_is_per_message() {
+        let key = Jwk::oct(b"password");
+        let mut set = JwkSet::new();
+        set.push(key.clone()).unwrap();
+        let good = (1000u64, &[1u8; 16][..], &b"password"[..]);
+        let wrong = (1000u64, &[2u8; 16][..], &b"wrong"[..]);
+        // Two affordable recipients: the wrong one fails, the right one
+        // decrypts.
+        let text = pbes2_general(&[wrong, good], b"hi");
+        assert_eq!(Jwe::parse(&text).unwrap().decrypt(&key).unwrap(), b"hi");
+        assert_eq!(
+            Jwe::parse(&text).unwrap().decrypt_with_set(&set).unwrap(),
+            b"hi"
+        );
+        // A first recipient claiming the whole budget (refused for its
+        // short salt, so no PBKDF2 runs) leaves nothing for the second,
+        // which on its own would succeed.
+        let greedy = (MAX_PBES2_ITERATIONS, &[0u8; 4][..], &b"password"[..]);
+        let text = pbes2_general(&[greedy, good], b"hi");
+        assert_eq!(
+            Jwe::parse(&text).unwrap().decrypt(&key).unwrap_err(),
+            Error::Malformed
+        );
+        assert_eq!(
+            Jwe::parse(&text)
+                .unwrap()
+                .decrypt_with_set(&set)
+                .unwrap_err(),
+            Error::Malformed
+        );
+        // Tried first, the good recipient is within budget.
+        let text = pbes2_general(&[good, greedy], b"hi");
+        assert_eq!(Jwe::parse(&text).unwrap().decrypt(&key).unwrap(), b"hi");
+        // The accounting is exact: the sum may reach the cap but not
+        // exceed it.
+        let fits = (MAX_PBES2_ITERATIONS - 1000, &[0u8; 4][..], &b"x"[..]);
+        let text = pbes2_general(&[fits, good], b"hi");
+        assert_eq!(Jwe::parse(&text).unwrap().decrypt(&key).unwrap(), b"hi");
+        let overdraws = (MAX_PBES2_ITERATIONS - 999, &[0u8; 4][..], &b"x"[..]);
+        let text = pbes2_general(&[overdraws, good], b"hi");
+        assert_eq!(
+            Jwe::parse(&text).unwrap().decrypt(&key).unwrap_err(),
+            Error::Malformed
+        );
+    }
+
+    #[test]
+    fn recipient_count_limit() {
+        let one = r#"{"header":{"alg":"A128KW"},"encrypted_key":"AA"}"#;
+        let build = |n: usize| {
+            alloc::format!(
+                r#"{{"protected":"{}","recipients":[{}],"iv":"AA","ciphertext":"AA","tag":"AA"}}"#,
+                base64url::encode(br#"{"enc":"A128GCM"}"#),
+                alloc::vec![one; n].join(",")
+            )
+        };
+        assert_eq!(
+            Jwe::parse(&build(MAX_RECIPIENTS))
+                .unwrap()
+                .recipients()
+                .len(),
+            MAX_RECIPIENTS
+        );
+        assert_eq!(
+            Jwe::parse(&build(MAX_RECIPIENTS + 1)).unwrap_err(),
             Error::Malformed
         );
     }

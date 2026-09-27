@@ -61,7 +61,7 @@ mod jwe;
 mod jwk;
 mod jws;
 
-pub use jwe::{Jwe, JweRecipient, MAX_PBES2_ITERATIONS};
+pub use jwe::{Jwe, JweRecipient, MAX_PBES2_ITERATIONS, MAX_RECIPIENTS};
 pub use jwk::{EcCurve, Jwk, JwkKey, JwkSet, OkpCurve, RsaPrivateParts};
 pub use jws::{Jws, JwsSignature};
 
