@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3](https://github.com/KarpelesLab/purecrypto/compare/v0.9.2...v0.9.3) - 2026-09-27
+
+### Added
+
+- *(ec,hash)* make the P-256, Streebog and Whirlpool tables optional
+
 ## [0.9.2](https://github.com/KarpelesLab/purecrypto/compare/v0.9.1...v0.9.2) - 2026-09-26
 
 ### Added
