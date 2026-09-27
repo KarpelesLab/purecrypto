@@ -632,6 +632,53 @@ fn quic_set_peer_addr_rejects_wrong_length() {
     unsafe { quic::pc_quic_cfg_free(cfg) };
 }
 
+/// The transport-parameter setters take a `uint64_t` but the parameters
+/// are QUIC varints: a value above `2^62 − 1` used to trip a debug assert
+/// (a caught panic, `PC_INTERNAL`) or be silently clamped at encoding time
+/// in release. They now refuse it with `PC_UNSUPPORTED`; the stream-count
+/// limit is tighter still (`2^60`, RFC 9000 §18.2).
+#[test]
+fn quic_cfg_setters_reject_values_past_the_varint_range() {
+    let cfg = quic::pc_quic_cfg_new(0);
+    assert!(!cfg.is_null());
+    const VARINT_MAX: u64 = (1 << 62) - 1;
+    const STREAMS_MAX: u64 = 1 << 60;
+    type Setter = unsafe extern "C" fn(*mut quic::PcQuicCfg, u64) -> PcStatus;
+    let varint_setters: [(&str, Setter); 3] = [
+        (
+            "max_idle_timeout_ms",
+            quic::pc_quic_cfg_set_max_idle_timeout_ms,
+        ),
+        ("initial_max_data", quic::pc_quic_cfg_set_initial_max_data),
+        (
+            "max_datagram_frame_size",
+            quic::pc_quic_cfg_set_max_datagram_frame_size,
+        ),
+    ];
+    for (name, set) in varint_setters {
+        assert_eq!(
+            unsafe { set(cfg, VARINT_MAX) },
+            PcStatus::Ok,
+            "{name} at the limit"
+        );
+        assert_eq!(
+            unsafe { set(cfg, VARINT_MAX + 1) },
+            PcStatus::Unsupported,
+            "{name} past the limit"
+        );
+        assert_eq!(
+            unsafe { set(cfg, u64::MAX) },
+            PcStatus::Unsupported,
+            "{name} u64::MAX"
+        );
+    }
+    let set = quic::pc_quic_cfg_set_initial_max_streams_bidi;
+    assert_eq!(unsafe { set(cfg, STREAMS_MAX) }, PcStatus::Ok);
+    assert_eq!(unsafe { set(cfg, STREAMS_MAX + 1) }, PcStatus::Unsupported);
+    assert_eq!(unsafe { set(cfg, VARINT_MAX) }, PcStatus::Unsupported);
+    unsafe { quic::pc_quic_cfg_free(cfg) };
+}
+
 /// `pc_mldsa_verify` must honour the caller-pinned parameter set: a key of a
 /// different set must be rejected with `Unsupported`, never verified under
 /// the set the SPKI happens to declare.

@@ -331,6 +331,8 @@ pub unsafe extern "C" fn pc_quic_cfg_set_verify_certificates(
 }
 
 /// `max_idle_timeout` transport parameter (milliseconds). 0 disables.
+/// Above `2^62 − 1` (the varint range) is refused with
+/// [`PcStatus::Unsupported`].
 ///
 /// # Safety
 /// `cfg` valid.
@@ -343,13 +345,18 @@ pub unsafe extern "C" fn pc_quic_cfg_set_max_idle_timeout_ms(
         if cfg.is_null() {
             return PcStatus::NullPointer;
         }
+        if ms > crate::quic::varint::MAX {
+            return PcStatus::Unsupported;
+        }
         unsafe { &mut *cfg }.tp.max_idle_timeout_ms = Some(ms);
         PcStatus::Ok
     })
 }
 
 /// `initial_max_data` transport parameter (connection-level flow
-/// control, bytes).
+/// control, bytes). Transport parameters are QUIC varints, so a value
+/// above `2^62 − 1` is refused with [`PcStatus::Unsupported`] rather than
+/// clamped at encoding time.
 ///
 /// # Safety
 /// `cfg` valid.
@@ -362,13 +369,17 @@ pub unsafe extern "C" fn pc_quic_cfg_set_initial_max_data(
         if cfg.is_null() {
             return PcStatus::NullPointer;
         }
+        if bytes > crate::quic::varint::MAX {
+            return PcStatus::Unsupported;
+        }
         unsafe { &mut *cfg }.tp.initial_max_data = Some(bytes);
         PcStatus::Ok
     })
 }
 
 /// `initial_max_streams_bidi` transport parameter (peer-initiable
-/// bidirectional stream count).
+/// bidirectional stream count). Values above `2^60` are refused with
+/// [`PcStatus::Unsupported`] (RFC 9000 §18.2).
 ///
 /// # Safety
 /// `cfg` valid.
@@ -381,6 +392,11 @@ pub unsafe extern "C" fn pc_quic_cfg_set_initial_max_streams_bidi(
         if cfg.is_null() {
             return PcStatus::NullPointer;
         }
+        // RFC 9000 §18.2: a stream limit above 2^60 cannot be encoded as a
+        // stream ID and is a TRANSPORT_PARAMETER_ERROR for the peer.
+        if streams > crate::quic::frame::MAX_STREAMS_LIMIT {
+            return PcStatus::Unsupported;
+        }
         unsafe { &mut *cfg }.tp.initial_max_streams_bidi = Some(streams);
         PcStatus::Ok
     })
@@ -388,7 +404,8 @@ pub unsafe extern "C" fn pc_quic_cfg_set_initial_max_streams_bidi(
 
 /// `max_datagram_frame_size` transport parameter (RFC 9221 §3). 0
 /// disables unreliable DATAGRAM. Any other value enables DATAGRAM with
-/// the given per-frame ceiling.
+/// the given per-frame ceiling; above `2^62 − 1` (the varint range) is
+/// refused with [`PcStatus::Unsupported`].
 ///
 /// # Safety
 /// `cfg` valid.
@@ -400,6 +417,9 @@ pub unsafe extern "C" fn pc_quic_cfg_set_max_datagram_frame_size(
     guard(|| {
         if cfg.is_null() {
             return PcStatus::NullPointer;
+        }
+        if bytes > crate::quic::varint::MAX {
+            return PcStatus::Unsupported;
         }
         unsafe { &mut *cfg }.tp.max_datagram_frame_size = Some(bytes);
         PcStatus::Ok

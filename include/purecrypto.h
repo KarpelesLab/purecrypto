@@ -893,6 +893,9 @@ pc_status pc_quic_cfg_set_certificate(PcQuicCfg *cfg,
 pc_status pc_quic_cfg_set_alpn(PcQuicCfg *cfg, const char *const *protocols, size_t n);
 pc_status pc_quic_cfg_set_verify_certificates(PcQuicCfg *cfg, int32_t verify);
 
+/* Transport parameters are QUIC varints: a value above 2^62 - 1 is refused
+ * with PC_UNSUPPORTED (the stream-count limit is capped at 2^60, RFC 9000
+ * §18.2) rather than clamped when the parameters are encoded. */
 pc_status pc_quic_cfg_set_max_idle_timeout_ms(PcQuicCfg *cfg, uint64_t ms);
 pc_status pc_quic_cfg_set_initial_max_data(PcQuicCfg *cfg, uint64_t bytes);
 pc_status pc_quic_cfg_set_initial_max_streams_bidi(PcQuicCfg *cfg, uint64_t streams);
