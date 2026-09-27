@@ -57,6 +57,11 @@ pub enum Error {
     /// PRFs can return this: AES-CMAC needs exactly 16 (`CmacAes128Prf`) or 32
     /// (`CmacAes256Prf`) bytes, while HMAC accepts any key length.
     InvalidKeyLength,
+    /// The PRF's [`OUTPUT_LEN`](Prf::OUTPUT_LEN) is zero or larger than the
+    /// 64-byte block buffer the derivation loops use (HMAC-SHA-512 is the
+    /// widest built-in PRF). Only a downstream `Prf` implementation can
+    /// trigger this; every PRF this crate ships fits.
+    UnsupportedPrfOutput,
 }
 
 impl core::fmt::Display for Error {
@@ -65,6 +70,7 @@ impl core::fmt::Display for Error {
             Error::ZeroLength => f.write_str("KBKDF output length must be non-zero"),
             Error::OutputTooLong => f.write_str("KBKDF output length exceeds 2^32-1 PRF blocks"),
             Error::InvalidKeyLength => f.write_str("KBKDF key length invalid for this PRF"),
+            Error::UnsupportedPrfOutput => f.write_str("KBKDF PRF output length unsupported"),
         }
     }
 }
@@ -234,11 +240,21 @@ impl Prf for CmacAes256Prf {
     }
 }
 
-/// The largest PRF output among the supported instantiations (HMAC-SHA-512).
+/// The largest PRF output among the supported instantiations (HMAC-SHA-512),
+/// and the size of the stack block buffers below.
 const MAX_PRF_OUTPUT: usize = 64;
 
-/// Validates the requested output length and returns the number of PRF blocks.
+/// Validates the PRF output length and the requested output length, and
+/// returns the number of PRF blocks.
+///
+/// `Prf` is a public trait, so `prf_out` is not under this module's control:
+/// a zero would divide by zero and anything wider than [`MAX_PRF_OUTPUT`]
+/// would overrun the block buffers, so both are reported as
+/// [`Error::UnsupportedPrfOutput`] here, before any block is derived.
 fn block_count(out_len: usize, prf_out: usize) -> Result<u32, Error> {
+    if prf_out == 0 || prf_out > MAX_PRF_OUTPUT {
+        return Err(Error::UnsupportedPrfOutput);
+    }
     if out_len == 0 {
         return Err(Error::ZeroLength);
     }
@@ -671,6 +687,45 @@ mod tests {
             kbkdf_feedback::<HmacSha256Prf>(b"k", b"iv", b"l", b"c", &mut empty),
             Err(Error::ZeroLength)
         );
+    }
+
+    // `Prf` is public: a downstream implementation whose output is wider than
+    // the 64-byte block buffers (or zero-width) must be an error, not an
+    // out-of-range slice (or a division by zero) inside the derivation loop.
+    #[test]
+    fn unsupported_prf_output_length_is_an_error() {
+        struct Wide<const N: usize>;
+        impl<const N: usize> Prf for Wide<N> {
+            const OUTPUT_LEN: usize = N;
+            fn init(_ki: &[u8]) -> Self {
+                Wide
+            }
+            fn update(&mut self, _data: &[u8]) {}
+            fn finalize(&mut self, out: &mut [u8]) {
+                out.fill(0xEE);
+            }
+        }
+        let mut out = [0u8; 100];
+        assert_eq!(
+            kbkdf_counter::<Wide<65>>(b"k", b"l", b"c", &mut out),
+            Err(Error::UnsupportedPrfOutput)
+        );
+        assert_eq!(
+            kbkdf_counter_fixed::<Wide<65>>(b"k", b"fixed", &mut out),
+            Err(Error::UnsupportedPrfOutput)
+        );
+        assert_eq!(
+            kbkdf_feedback::<Wide<128>>(b"k", b"iv", b"l", b"c", &mut out),
+            Err(Error::UnsupportedPrfOutput)
+        );
+        assert_eq!(
+            kbkdf_feedback_fixed::<Wide<0>>(b"k", b"iv", b"fixed", &mut out),
+            Err(Error::UnsupportedPrfOutput)
+        );
+        assert!(out.iter().all(|&b| b == 0), "nothing derived");
+        // Exactly the buffer width still works.
+        assert!(kbkdf_counter::<Wide<64>>(b"k", b"l", b"c", &mut out).is_ok());
+        assert!(out.iter().all(|&b| b == 0xEE));
     }
 
     // An over-long HMAC key (> one hash block, 128B for SHA-256's 64B block via
