@@ -4518,4 +4518,62 @@ mod audit_2026_09 {
         }
         assert!(server.take_received().is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // DTLS 1.2 server: exactly one ClientKeyExchange per handshake.
+    // -----------------------------------------------------------------
+
+    /// The client's CKE travels at epoch 0, unauthenticated. Once the
+    /// server has derived the master secret from the genuine one, a second
+    /// CKE at the next `message_seq` — an off-path spoofer's replayed copy
+    /// — must be ignored: re-running the key exchange would overwrite the
+    /// master secret and extend the transcript, so the genuine Finished
+    /// (encrypted, already in flight) would fail to verify and the
+    /// handshake would stall.
+    #[test]
+    fn second_client_key_exchange_is_ignored_12() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"double-cke-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        let flight = client.pop_outbound_datagrams();
+        assert_eq!(flight.len(), 3, "CKE + CCS + Finished");
+        let cke = &flight[0];
+        assert_eq!(cke[13], hs_type::CLIENT_KEY_EXCHANGE);
+        assert_eq!(&cke[17..19], &[0, 1], "CKE is the client's message_seq 1");
+
+        // The genuine CKE, then a copy re-numbered as message_seq 2 (the
+        // slot the genuine Finished will occupy) under a fresh record
+        // sequence number — exactly what an off-path spoofer can produce.
+        server.feed_datagram(cke).unwrap();
+        let mut forged = cke.clone();
+        forged[17..19].copy_from_slice(&[0, 2]);
+        forged[5..11].copy_from_slice(&[0, 0, 0, 0, 0, 99]);
+        assert_eq!(server.feed_datagram(&forged), Ok(()));
+
+        // CCS + Finished still complete the handshake: the forged CKE
+        // touched neither the master secret nor the transcript, and the
+        // reassembler still expects message_seq 2.
+        for dg in &flight[1..] {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(server.is_handshake_complete());
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(client.is_handshake_complete());
+        client.send(b"ping").unwrap();
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping");
+    }
 }

@@ -1461,6 +1461,20 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     }
 
     fn on_client_key_exchange(&mut self, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        // Exactly one ClientKeyExchange per handshake. `WaitClientFlight`
+        // covers both the CKE and the Finished, and the CKE travels at
+        // epoch 0, unauthenticated: an off-path spoofer who guesses the
+        // next `message_seq` could otherwise re-run ECDH here, overwrite
+        // `master` and the pending crypters and append a second CKE to the
+        // transcript, so the genuine (already in-flight) Finished would
+        // never verify and the handshake would stall. Once the master
+        // secret exists the key exchange is over; on the unauthenticated
+        // path `process_handshake_record` turns this into a silent drop and
+        // rewinds the reassembler so the genuine Finished (same
+        // `message_seq`) is still accepted.
+        if self.master.is_some() {
+            return Err(Error::UnexpectedMessage);
+        }
         let cke = ClientKeyExchange::decode(body)?;
         let group = self.group.ok_or(Error::InappropriateState)?;
         // Complete ECDHE on the negotiated group and derive the premaster.
