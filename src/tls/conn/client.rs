@@ -1924,7 +1924,13 @@ impl ClientConnection {
             extensions.push(ext::psk_key_exchange_modes(&[1])); // psk_dhe_ke
             // RFC 8446 §4.1.4 / §4.2.10: `early_data` MUST NOT appear in
             // the retry ClientHello — 0-RTT is over once an HRR arrives.
-            if hrr_transcript.is_none() && matches!(session.max_early_data_size, Some(n) if n > 0) {
+            // And only when 0-RTT is actually offered (`early_data_offered`:
+            // the ticket allows early data AND its suite is in this offer).
+            // Announcing `early_data` without it made an accepting server
+            // return `early_data` in EncryptedExtensions, which this client
+            // then rejected as illegal_parameter — aborting a resumption the
+            // server had done nothing wrong in.
+            if hrr_transcript.is_none() && self.early_data_offered {
                 extensions.push(ext::early_data_empty());
             }
             let hash = session.cipher_suite_hash;
@@ -4729,6 +4735,66 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::IllegalParameter));
         assert!(!client.early_data_accepted());
+    }
+
+    /// RFC 8446 §4.2.10: the `early_data` extension is a promise of 0-RTT.
+    /// It used to be emitted whenever the ticket allowed early data, even
+    /// when the client had decided not to offer it (`early_data_offered`
+    /// false: the session's suite is unknown or not in this offer) — an
+    /// accepting server then echoed `early_data` in EE and the client
+    /// aborted its own resumption with illegal_parameter.
+    #[test]
+    fn early_data_extension_only_when_early_data_is_offered() {
+        let hello = |suite: u16, restrict: Option<alloc::vec::Vec<u16>>| {
+            let session = StoredSession {
+                server_name: "h".into(),
+                ticket: alloc::vec![0x41; 16],
+                psk: crate::zeroize::Zeroizing::new(alloc::vec![0x5a; 32]),
+                age_add: 0,
+                lifetime_seconds: 7200,
+                received_at: system_now().unwrap_or_else(|| Time::from_unix(0)),
+                max_early_data_size: Some(1024),
+                negotiated_alpn: None,
+                verify_certificates: true,
+                cipher_suite_hash: HashAlg::Sha256,
+                cipher_suite: suite,
+            };
+            let mut config = ClientConfig::new(RootCertStore::new()).with_session(session);
+            config.cipher_suites = restrict;
+            let mut rng = HmacDrbg::<Sha256>::new(b"ed-ext-offer", b"nonce", &[]);
+            let mut client = ClientConnection::new(config, "h", &mut rng).unwrap();
+            let out = client.write_tls();
+            let msg = read_record(&out).unwrap().unwrap().fragment.to_vec();
+            let ch = ClientHello::decode(&msg[4..]).unwrap();
+            (client.early_data_offered, ch)
+        };
+        let has = |ch: &ClientHello, ty: ExtensionType| ext::find(&ch.extensions, ty).is_some();
+
+        // Control: a ticket for an offered suite offers 0-RTT.
+        let (offered, ch) = hello(CipherSuite::AES_128_GCM_SHA256.0, None);
+        assert!(offered);
+        assert!(has(&ch, ExtensionType::EARLY_DATA));
+        assert!(has(&ch, ExtensionType::PRE_SHARED_KEY));
+
+        // Unknown session suite, or one this offer excludes: PSK only.
+        for (suite, restrict) in [
+            (0, None),
+            (
+                CipherSuite::CHACHA20_POLY1305_SHA256.0,
+                Some(alloc::vec![CipherSuite::AES_128_GCM_SHA256.0]),
+            ),
+        ] {
+            let (offered, ch) = hello(suite, restrict);
+            assert!(!offered, "suite {suite:#06x}");
+            assert!(
+                has(&ch, ExtensionType::PRE_SHARED_KEY),
+                "suite {suite:#06x}"
+            );
+            assert!(
+                !has(&ch, ExtensionType::EARLY_DATA),
+                "suite {suite:#06x}: early_data without a 0-RTT offer"
+            );
+        }
     }
 
     /// The manual EncryptedExtensions walk caps the extension count at
