@@ -1,0 +1,73 @@
+name: ECH interop (BoringSSL)
+
+# Interop-tests Encrypted Client Hello (RFC 9849) against BoringSSL — the ECH
+# implementation behind Chrome and Cloudflare — in BOTH roles, over real TCP
+# sockets: accept, HelloRetryRequest, rejection + retry_configs, and GREASE.
+# Loopback (purecrypto<->purecrypto) cannot catch a symmetric wire-format bug
+# (it once hid a handshake-header-framed EncodedClientHelloInner that no other
+# stack could decrypt); this gate does.
+#
+# BoringSSL's `bssl` tool is built once per pinned commit and cached. The
+# matrix itself lives in tools/ech-interop/run.sh, which runs every process
+# under `timeout` so a hang fails its case in seconds.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # google/boringssl master of 2026-09-27. Bump deliberately: the cache key
+  # follows it.
+  BORINGSSL_COMMIT: 5112448a24999caecfb6f04281379016ac79dc9a
+
+jobs:
+  interop:
+    name: ECH vs BoringSSL bssl
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache bssl
+        id: cache-bssl
+        uses: actions/cache@v5
+        with:
+          path: ~/bssl
+          key: bssl-${{ env.BORINGSSL_COMMIT }}-${{ runner.os }}-v1
+
+      - name: Build bssl
+        if: steps.cache-bssl.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          git init boringssl
+          cd boringssl
+          git fetch --depth 1 https://github.com/google/boringssl.git "$BORINGSSL_COMMIT"
+          git checkout --detach FETCH_HEAD
+          cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release
+          ninja -C build bssl
+          mkdir -p ~/bssl
+          cp build/bssl ~/bssl/bssl
+
+      - name: Build the purecrypto CLI (with ECH)
+        run: cargo build --release --features ech --bin purecrypto
+
+      - name: ECH interop matrix (both roles)
+        timeout-minutes: 10
+        run: |
+          BSSL="$HOME/bssl/bssl" \
+          PURECRYPTO="$GITHUB_WORKSPACE/target/release/purecrypto" \
+          tools/ech-interop/run.sh
