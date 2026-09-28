@@ -388,7 +388,8 @@ purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_pro
 purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2 | -dtls1_2 | -dtls1_3]
                     [-min_protocol TLSv1.2] [-Verify ca.pem] [-alpn h2,http/1.1] [-www]
                     [-naccept N] [-mtu N] [-no_cookie] [-groups x25519:secp256r1]
-                    [-prefer-group NAME] [-no_ticket] [-early_data [-max_early_data N]]
+                    [-prefer-group NAME] [-ciphersuites TLS_AES_128_GCM_SHA256:...]
+                    [-no_ticket] [-early_data [-max_early_data N]]
                     [-key_update] [-status_file resp.der] [-enable_server_rpk]
                     [-enable_client_rpk -rpk_peer_key pub.pem] [-record_size_limit N]
                     [-no_cert_comp] [-keylogfile keys.log] [-quiet]
@@ -449,7 +450,9 @@ Behaviour worth knowing:
   the accept-set in *server* preference: the first listed group the client
   shared wins, and a client that shared none of them but offered one is
   sent a HelloRetryRequest for it. `-ciphersuites TLS_AES_128_GCM_SHA256:…`
-  restricts and orders the client's TLS 1.3 suites the same way.
+  restricts and orders the TLS 1.3 suites the same way: the client's offer,
+  or the server's accept-set in *server* preference (the first listed suite
+  the client offered wins; a client offering none of them is refused).
 - `s_server -prefer-group NAME` (`x25519`, `secp256r1`, `secp384r1`,
   `X25519MLKEM768`) makes the server ask, by HelloRetryRequest, for that group
   whenever the client offers it without a key share. After the handshake the

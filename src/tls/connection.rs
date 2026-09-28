@@ -1724,6 +1724,7 @@ pub(crate) fn tls13_client_config(
         verification_time,
         alpn_protocols,
         record_size_limit,
+        cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
@@ -1738,7 +1739,6 @@ pub(crate) fn tls13_client_config(
     let ClientOpts {
         server_name,
         verify_certificates,
-        cipher_suites,
         key_shares,
         expected_raw_public_keys,
         #[cfg(feature = "ech")]
@@ -1873,6 +1873,7 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         verification_time,
         alpn_protocols,
         record_size_limit,
+        cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
@@ -1887,7 +1888,6 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
     let ClientOpts {
         server_name,
         verify_certificates,
-        cipher_suites,
         key_shares,
         expected_raw_public_keys,
         #[cfg(feature = "ech")]
@@ -2032,6 +2032,7 @@ pub(crate) fn tls13_server_config(
         verification_time,
         alpn_protocols,
         record_size_limit,
+        cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
@@ -2149,6 +2150,19 @@ pub(crate) fn tls13_server_config(
         }
         sc = sc.with_groups(groups.iter().map(|g| g.to_wire()).collect());
     }
+    if let Some(list) = cipher_suites {
+        // The server's accept-set and preference order (see
+        // `Config::cipher_suites`); fail closed like the client when nothing
+        // usable is left, rather than widening back to the full set.
+        let supported: Vec<super::codec::CipherSuite> = super::crypto::supported_suites()
+            .iter()
+            .map(|s| s.suite)
+            .collect();
+        sc = sc.with_cipher_suites(super::conn::select_offered_suites(
+            &Some(list.to_vec()),
+            &supported,
+        )?);
+    }
     if let Some(t) = verification_time {
         sc = sc.with_verification_time(t.clone());
     }
@@ -2173,6 +2187,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
         verification_time,
         alpn_protocols,
         record_size_limit,
+        cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
@@ -2201,14 +2216,16 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     // trust anchors for mTLS come from `client_auth`; there is no per-cert
     // extension slot for a stapled CRL, no 0-RTT, no RFC 8879 compression,
     // no ECH and no HelloRetryRequest group preference (the 1.2 engine
-    // negotiates from its own fixed group list). `rng` is drawn through
-    // `config_rng`, `signer` through `Connection::drive`.
+    // negotiates from its own fixed group list and picks its suite from its
+    // own fixed order). `rng` is drawn through `config_rng`, `signer`
+    // through `Connection::drive`.
     let _ = (
         roots,
         stapled_crl,
         max_early_data_size,
         preferred_key_exchange_group,
         key_exchange_groups,
+        cipher_suites,
         rng,
         signer,
     );
@@ -2310,6 +2327,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         verification_time,
         alpn_protocols,
         record_size_limit,
+        cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
@@ -2324,7 +2342,6 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     let ClientOpts {
         server_name,
         verify_certificates,
-        cipher_suites,
         key_shares,
         expected_raw_public_keys,
         #[cfg(feature = "ech")]
@@ -2548,6 +2565,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         verification_time,
         alpn_protocols,
         record_size_limit,
+        cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
@@ -2584,12 +2602,14 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     // which is refused below; the DTLS servers issue no session tickets,
     // accept no 0-RTT (so `max_early_data_size` and the replay window have
     // nothing to guard), staple nothing, do not compress certificates and do
-    // not bias or restrict the key-exchange group. `rng` is drawn through
+    // not bias or restrict the key-exchange group or the cipher suite (they
+    // pick from their own fixed orders). `rng` is drawn through
     // `config_rng` and `signer` through `Connection::drive`.
     let _ = (
         min_version,
         max_version,
         key_exchange_groups,
+        cipher_suites,
         roots,
         crls,
         verification_time,
@@ -2863,6 +2883,95 @@ mod tests {
             b = b.resumption_session(s);
         }
         b.build()
+    }
+
+    /// `Config::cipher_suites` used to be inert on the server, which then
+    /// took the first suite of ITS built-in order the client offered — so a
+    /// client that cannot narrow its offer (Apple's Network.framework sends
+    /// both AES-GCM suites for either) could never be steered to
+    /// AES-256-GCM. It is now the server's accept-set in server preference
+    /// order (RFC 8446 §4.1.3: the suite is the server's choice among the
+    /// client's), and fails closed like the client's.
+    #[test]
+    fn tls13_server_honours_cipher_suites_preference() {
+        const AES_128: u16 = 0x1301;
+        const AES_256: u16 = 0x1302;
+        const CHACHA20: u16 = 0x1303;
+        for (server_list, client_list, expect) in [
+            // Server preference wins among what the client offered.
+            (&[AES_256, AES_128][..], &[AES_128, AES_256][..], AES_256),
+            (&[CHACHA20][..], &[AES_128, AES_256, CHACHA20][..], CHACHA20),
+            // A suite the engine lacks is skipped, not a fallback to all.
+            (&[0x1304, AES_256][..], &[AES_128, AES_256][..], AES_256),
+        ] {
+            let server_cfg = tls13_server_builder().cipher_suites(server_list).build();
+            let client_cfg = tls13_client_builder().cipher_suites(client_list).build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_pair(&mut client, &mut server);
+            assert_eq!(
+                server.negotiated_cipher_suite(),
+                Some(expect),
+                "{server_list:?}"
+            );
+            assert_eq!(client.negotiated_cipher_suite(), Some(expect));
+        }
+
+        // No overlap between the server's accept-set and the client's offer:
+        // the handshake is refused, not widened.
+        let server_cfg = tls13_server_builder().cipher_suites(&[AES_256]).build();
+        let client_cfg = tls13_client_builder().cipher_suites(&[AES_128]).build();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+        let _ = client.handshake();
+        let ch = client.pop().unwrap();
+        assert!(matches!(server.feed(&ch), Err(Error::HandshakeFailure)));
+
+        // A list naming nothing the engine implements fails at construction.
+        let server_cfg = tls13_server_builder()
+            .cipher_suites(&[0x1304, 0x0000])
+            .build();
+        assert!(matches!(
+            Connection::server(&server_cfg),
+            Err(Error::NoUsableCipherSuites)
+        ));
+    }
+
+    /// The builder behind [`tls13_server_cfg`] (no ticket key), for tests
+    /// that add options of their own.
+    fn tls13_server_builder() -> super::super::ConfigBuilder {
+        let mut rng = HmacDrbg::<Sha256>::new(b"tls13-conn-test", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("tls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["tls.example"],
+        )
+        .unwrap();
+        Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .identity(
+                alloc::vec![cert.to_der().to_vec()],
+                super::super::config::SigningKey::Ecdsa(key),
+            )
+    }
+
+    /// The builder behind [`tls13_client_cfg`] (no session).
+    fn tls13_client_builder() -> super::super::ConfigBuilder {
+        Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .server_name("tls.example")
+            .verify_certificates(false)
     }
 
     /// Drive two public [`Connection`]s to a completed handshake and then pump

@@ -377,6 +377,10 @@ pub(crate) struct ServerConfig {
     /// for it with a HelloRetryRequest (RFC 8446 §4.1.4); otherwise the
     /// handshake fails. See [`crate::tls::Config::key_exchange_groups`].
     pub(crate) groups: Vec<NamedGroup>,
+    /// Cipher suites this server accepts, in ITS preference order. Empty
+    /// (the default) is the engine's full set in its built-in order. See
+    /// [`crate::tls::Config::cipher_suites`].
+    pub(crate) cipher_suites: Vec<CipherSuite>,
 }
 
 // The ticket key seals (and unseals) every resumption ticket this server
@@ -424,6 +428,7 @@ impl ServerConfig {
             key_log: None,
             preferred_key_exchange_group: None,
             groups: Vec::new(),
+            cipher_suites: Vec::new(),
         }
     }
 
@@ -624,6 +629,25 @@ impl ServerConfig {
     pub fn with_groups(mut self, groups: Vec<NamedGroup>) -> Self {
         self.groups = groups;
         self
+    }
+
+    /// Restricts the accepted cipher suites to `suites`, in server preference
+    /// order (see [`ServerConfig::cipher_suites`]). Entries the engine does
+    /// not implement are ignored; an empty list is the default order.
+    pub fn with_cipher_suites(mut self, suites: Vec<CipherSuite>) -> Self {
+        self.cipher_suites = suites;
+        self
+    }
+
+    /// The suites this server negotiates from, in its preference order.
+    pub(crate) fn suite_preference(&self) -> Vec<SuiteParams> {
+        if self.cipher_suites.is_empty() {
+            return supported_suites().to_vec();
+        }
+        self.cipher_suites
+            .iter()
+            .filter_map(|s| supported_suites().iter().copied().find(|sp| sp.suite == *s))
+            .collect()
     }
 
     /// Advertises `record_size_limit = limit` (RFC 8449).
@@ -2232,7 +2256,8 @@ impl<R: RngCore> ServerConnection<R> {
             // but 0-RTT keys are derived under the issuing suite, so picking
             // a hash-compatible *different* suite would needlessly refuse
             // early data below.
-            supported_suites()
+            let preference = self.config.suite_preference();
+            preference
                 .iter()
                 .copied()
                 .find(|sp| {
@@ -2241,16 +2266,16 @@ impl<R: RngCore> ServerConnection<R> {
                         && sp.hash == s.hash
                 })
                 .or_else(|| {
-                    supported_suites()
+                    preference
                         .iter()
                         .copied()
                         .find(|sp| ch.cipher_suites.contains(&sp.suite) && sp.hash == s.hash)
                 })
                 .ok_or(Error::HandshakeFailure)?
         } else {
-            supported_suites()
-                .iter()
-                .copied()
+            self.config
+                .suite_preference()
+                .into_iter()
                 .find(|s| ch.cipher_suites.contains(&s.suite))
                 .ok_or(Error::HandshakeFailure)?
         };

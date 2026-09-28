@@ -126,7 +126,8 @@ pub(crate) fn run(args: Args) {
             "usage: purecrypto s_server -cert cert.pem -key key.pem -accept PORT \
              [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-Verify ca.pem] \
              [-alpn h2,http/1.1] [-www] [-naccept N] [-mtu N] [-no_cookie] \
-             [-groups x25519:secp256r1] [-prefer-group NAME] [-no_ticket] \
+             [-groups x25519:secp256r1] [-prefer-group NAME] \
+             [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-no_ticket] \
              [-early_data [-max_early_data N]] [-key_update] [-status_file resp.der] \
              [-enable_server_rpk] [-enable_client_rpk -rpk_peer_key pub.pem] \
              [-record_size_limit N] [-no_cert_comp] [-keylogfile keys.log] \
@@ -247,6 +248,10 @@ pub(crate) fn run(args: Args) {
     // shared none of them but offered one is sent a HelloRetryRequest.
     if let Some(list) = args.value("-groups") {
         builder = builder.key_exchange_groups(&tlsinfo::parse_groups(list, "-groups"));
+    }
+    // `-ciphersuites`: the TLS 1.3 accept-set, in server preference order.
+    if let Some(list) = args.value("-ciphersuites") {
+        builder = builder.cipher_suites(&tlsinfo::parse_ciphersuites(list, "-ciphersuites"));
     }
     if let Some(n) = tlsinfo::parse_record_size_limit(&args) {
         builder = builder.record_size_limit(n);

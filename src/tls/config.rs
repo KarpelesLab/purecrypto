@@ -293,7 +293,16 @@ pub struct Config {
     /// typo'd suite ID re-enable everything). A list matching only some of
     /// the enabled versions is fine — versions with no matching suite simply
     /// cannot be negotiated. TLS 1.3 and 1.2 are both covered (mix 0x13xx
-    /// and classic codepoints in one list); the value is inert on the server.
+    /// and classic codepoints in one list).
+    ///
+    /// On a TLS 1.3 server it is the accept-set in *server* preference
+    /// order: the first listed suite the client offered wins, and a client
+    /// offering none of them is refused (`handshake_failure`). The default
+    /// is the engine's full set in its built-in order. A list naming no
+    /// TLS 1.3 suite the engine implements fails
+    /// [`Connection::server`](crate::tls::Connection::server) the same way.
+    /// The TLS 1.2 and DTLS servers pick from their own fixed orders (the
+    /// value is inert there).
     pub cipher_suites: Option<Vec<u16>>,
     /// Client (TLS 1.3 / QUIC): the groups the first ClientHello carries a
     /// `key_share` entry for (RFC 8446 §4.2.8). Every supported group is

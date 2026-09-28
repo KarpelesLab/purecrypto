@@ -61,6 +61,7 @@ pub(crate) struct CommonOpts<'a> {
     pub verification_time: Option<&'a Time>,
     pub alpn_protocols: &'a [Vec<u8>],
     pub record_size_limit: Option<u16>,
+    pub cipher_suites: Option<&'a [u16]>,
     pub key_exchange_groups: Option<&'a [NamedGroup]>,
     pub require_extended_master_secret: bool,
     pub server_cert_type_preference: &'a [u8],
@@ -77,7 +78,6 @@ pub(crate) struct CommonOpts<'a> {
 pub(crate) struct ClientOpts<'a> {
     pub server_name: Option<&'a str>,
     pub verify_certificates: bool,
-    pub cipher_suites: Option<&'a [u16]>,
     pub key_shares: Option<&'a [NamedGroup]>,
     pub expected_raw_public_keys: &'a [Vec<u8>],
     #[cfg(feature = "ech")]
@@ -173,6 +173,7 @@ impl Config {
                 verification_time: verification_time.as_ref(),
                 alpn_protocols,
                 record_size_limit: *record_size_limit,
+                cipher_suites: cipher_suites.as_deref(),
                 key_exchange_groups: key_exchange_groups.as_deref(),
                 require_extended_master_secret: *require_extended_master_secret,
                 server_cert_type_preference,
@@ -187,7 +188,6 @@ impl Config {
             client: ClientOpts {
                 server_name: server_name.as_deref(),
                 verify_certificates: *verify_certificates,
-                cipher_suites: cipher_suites.as_deref(),
                 key_shares: key_shares.as_deref(),
                 expected_raw_public_keys,
                 #[cfg(feature = "ech")]
