@@ -356,7 +356,16 @@ update with the commands in `tools/wycheproof/README.md`.
   (`pkcs12 -export`) imported into a throwaway keychain; groups, 0-RTT,
   resumption and compression facts, and raw public keys go through SPI
   from Apple's open-source `SecProtocolPriv.h`, resolved at run time and
-  SKIPped with a reason when absent. `C` / `S` as above:
+  SKIPped with a reason when absent. The tool reads the negotiated
+  parameters when the exchange is over, not when the connection becomes
+  ready: the stack keeps rewriting its metadata object, unlocked, while it
+  processes the NewSessionTickets that follow the handshake, and a read in
+  that window came back without the group (or the peer's chain) on a
+  loaded runner. The group is compared as a whole value for every session;
+  `group: unavailable` (the SPI answered nothing) fails the case, and only
+  `group: unknown (no SPI)` — a macOS without the symbol — leaves the
+  group to the purecrypto side's `key exchange:` line, which the runner
+  checks in every case. `C` / `S` as above:
 
   | Case | Apple (C / S) |
   |---|---|
