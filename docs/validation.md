@@ -72,7 +72,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `xmss` | RFC 8391, SP 800-208 | ref-impl KAT | ref vectors | `xmss_parse` | n/a (hash-based, **stateful**) |
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
-| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL and Apple's Network.framework, both roles** (CI: certs × groups × suites, resumption, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
+| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8 and Apple's Network.framework, both roles** (CI: certs × groups × suites, resumption, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
 | `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
@@ -440,6 +440,72 @@ update with the commands in `tools/wycheproof/README.md`.
   signs with SHA-1 (no `-rmd`), which purecrypto's client refuses with
   `bad_certificate`, so the responder the OCSP case runs is the runner's
   OpenSSL 3, signing with SHA-256.
+- **TLS 1.3 matrix, both roles, against GnuTLS 3.8.3 and 3.8.13** (the
+  same workflow, peers `gnutls` and `gnutls-src`, adapter
+  `tools/interop/peers/gnutls.sh`): the purecrypto CLI against `gnutls-cli`
+  / `gnutls-serv` from the runner's `gnutls-bin` (GnuTLS 3.8.3 on
+  ubuntu-24.04, a build without zlib; the job prints the exact version)
+  and from GnuTLS 3.8.13 built from the release tarball with leancrypto
+  1.9.1 (cached by version: ML-KEM hybrids and ML-DSA are only in a
+  3.8.10+ build with leancrypto, which no distribution package has).
+  Everything is pinned through a priority string
+  (`-VERS-ALL:+VERS-TLS1.3:-GROUP-ALL:+GROUP-…:-CIPHER-ALL:+…`,
+  `CTYPE-*-RAWPK` for raw public keys) and verified from the tools'
+  `- Description:` line, verbose ECDH block and `-d 5` debug log
+  (handshake messages, extensions, alerts). `gnutls-serv` never exits on
+  its own, so the adapter runs it under a small supervisor that stops it
+  once its log shows the case's `close_notify` from the client. 107 of
+  the 226 cases run against 3.8.3 and 160 against 3.8.13:
+
+  | Case | GnuTLS 3.8.3 (C / S) | GnuTLS 3.8.13 + leancrypto (C / S) |
+  |---|---|---|
+  | Plain: `{RSA-2048, P-256, P-384, Ed25519}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ | ✅ / ✅ |
+  | Plain, `X25519MLKEM768` | ⏭ no ML-KEM in this build | ✅ / ✅ |
+  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | ⏭ |
+  | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA in this build | ✅ / ✅ |
+  | Resumption (PSK + DHE) | ✅ / ✅ | ✅ / ✅ |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only | ⏭ |
+  | 0-RTT accepted | ✅ / ✅ (C: `gnutls-serv` < 3.8.10 drops the early data it read, so the record-layer log stands in for the echo) | ✅ / ✅ |
+  | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ⏭ GnuTLS issue #1429, both roles (below) | ⏭ |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ | ✅ / ✅ |
+  | HelloRetryRequest to `X25519MLKEM768` | ⏭ | ✅ / ⏭ `gnutls-cli` always lists and shares the hybrid first |
+  | mTLS, client certificate `{RSA-2048, P-256, P-384, Ed25519}` | ✅ / ✅ | ✅ / ✅ |
+  | mTLS, ML-DSA-65 client certificate | ⏭ | ✅ / ✅ |
+  | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ |
+  | KeyUpdate (`update_requested`) from the peer, purecrypto replies | ✅ (`gnutls-cli` `^rekey^`) / ⏭ `gnutls-serv` has no trigger | same |
+  | RFC 8879 zlib certificate compression (server certificate) | ⏭ the Ubuntu package is built without zlib | ✅ / ✅ |
+  | RFC 7250 raw public key, server identity | ✅ / ✅ | ✅ / ✅ |
+  | RFC 7250 raw public key, client identity | ✅ / ✅ (`gnutls-serv` requires but cannot pin a raw client key) | same |
+  | OCSP stapling (`openssl ocsp` response, validated) | ✅ / ✅ | ✅ / ✅ |
+  | ALPN | ✅ / ✅ | ✅ / ✅ |
+  | RFC 8449 `record_size_limit` (512; both sides' records checked) | ✅ / ✅ | ✅ / ✅ |
+  | Chain > 16 KiB (Certificate spans records) | ✅ / ✅ | ✅ / ✅ |
+  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ | ✅ / ✅ |
+  | `close_notify` from the peer | ✅ / ✅ | ✅ / ✅ |
+
+  The one GnuTLS limitation that is a protocol bug rather than a missing
+  knob: 0-RTT across a HelloRetryRequest (GnuTLS issue #1429, open since
+  2022 and still in 3.8.13). Its client, retried after offering early data,
+  sends the second ClientHello *encrypted under the early traffic keys* with
+  the `early_data` extension still present — RFC 8446 §4.1.2 requires a
+  plaintext second ClientHello without it — so the purecrypto server skips
+  it as rejected early data (§4.2.10) and the client waits forever. Its
+  server decides to accept early data while parsing the first ClientHello,
+  before it chooses to retry, and then treats the purecrypto client's
+  plaintext second ClientHello as an early-data record it cannot decrypt
+  (`bad_record_mac`). Both directions are SKIPped with that reason; the
+  purecrypto side of the same case passes against OpenSSL. Two GnuTLS
+  conventions are worth knowing when reading its logs: `record_size_limit`
+  is advertised and enforced counting the inner content-type byte
+  (`--recordsize 512` sends 513, and a received 512 caps records at 511
+  bytes of data — both consistent with RFC 8449 §4 and with purecrypto's
+  512 + 1), and a resumed session's description line names no group
+  (`(TLS1.3-X.509)--(AES-128-GCM)`), so the adapter reads the verbose
+  `Using curve:` line for it. One tool bug is worked around by version:
+  `gnutls-serv` before 3.8.10 reads accepted early data and then discards
+  it (`if (r == 0)` where the read returned the length; `>= 0` since
+  3.8.10), so on 3.8.3 the 0-RTT case is verified from the record layer's
+  log of the decrypted early-data record rather than from the echo.
 - **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server
