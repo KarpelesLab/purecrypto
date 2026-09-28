@@ -74,7 +74,7 @@ use crate::tls::crypto::cbc_rec::{
     lookup_legacy_cbc,
 };
 use crate::tls::crypto::prf::{
-    extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
+    extended_master_secret, finished_verify_data, master_secret, tls12_exporter,
 };
 #[cfg(feature = "tls-legacy")]
 use crate::tls::crypto::prf::{
@@ -2114,21 +2114,18 @@ impl ClientConnection12 {
                 kl.log("CLIENT_RANDOM", &cr, &stored.master_secret);
             }
 
-            let kb_len = 2 * suite.key_len + 8;
-            let mut kb = alloc::vec![0u8; kb_len];
-            key_block(suite.hash, &stored.master_secret, &sr, &cr, &mut kb);
-            // Only the server (read) crypter is built up-front; the client
+            // Only the server (read) crypter is kept up-front; the client
             // (write) crypter is re-derived in `on_server_finished` from the
             // same master_secret + randoms once we send our CCS.
-            let (_c_key, rest) = kb.split_at(suite.key_len);
-            let (s_key, ivs) = rest.split_at(suite.key_len);
-            let mut s_salt = [0u8; 4];
-            s_salt.copy_from_slice(&ivs[4..8]);
-            self.pending_server_crypter =
-                Some(RecordCrypter12::new(suite.aead, s_key, s_salt).into());
-            // The key_block holds the live AEAD keys; the crypter owns its own
-            // copy now, so scrub the derivation buffer.
-            super::wipe(&mut kb);
+            let (_client_crypter, server_crypter) = RecordCrypter12::derive_pair(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &stored.master_secret,
+                &sr,
+                &cr,
+            );
+            self.pending_server_crypter = Some(server_crypter.into());
             self.state = State::WaitResumedServerFinished;
         } else {
             self.state = State::WaitCertificate;
@@ -2780,22 +2777,11 @@ impl ClientConnection12 {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
 
-        // key_block layout (RFC 5246 §6.3 / RFC 5288 §3): client_key,
-        // server_key, client_iv (4-byte salt), server_iv (4-byte salt).
-        let kb_len = 2 * suite.key_len + 8;
-        let mut kb = alloc::vec![0u8; kb_len];
-        key_block(suite.hash, &master, &sr, &cr, &mut kb);
-        let (c_key, rest) = kb.split_at(suite.key_len);
-        let (s_key, rest) = rest.split_at(suite.key_len);
-        let mut c_salt = [0u8; 4];
-        c_salt.copy_from_slice(&rest[..4]);
-        let mut s_salt = [0u8; 4];
-        s_salt.copy_from_slice(&rest[4..8]);
-        let client_crypter = RecordCrypter12::new(suite.aead, c_key, c_salt);
-        let server_crypter = RecordCrypter12::new(suite.aead, s_key, s_salt);
-        // The key_block holds the live AEAD keys; the crypters own their own
-        // copies now, so scrub the derivation buffer.
-        super::wipe(&mut kb);
+        // key_block (RFC 5246 §6.3): the two write keys and the two write
+        // IVs, laid out per the suite's AEAD (RFC 5288 §3 / RFC 7905 §2) by
+        // `derive_pair`, which also scrubs the expansion buffer.
+        let (client_crypter, server_crypter) =
+            RecordCrypter12::derive_pair(suite.hash, suite.aead, suite.key_len, &master, &sr, &cr);
 
         // The client Certificate (under mTLS) and ClientKeyExchange were
         // emitted ABOVE so the EMS session_hash snapshot covers them
@@ -3028,17 +3014,15 @@ impl ClientConnection12 {
             // randoms we computed in `on_server_hello`.
             let cr = self.client_random;
             let sr = self.server_random.expect("server_random set");
-            let kb_len = 2 * suite.key_len + 8;
-            let mut kb = alloc::vec![0u8; kb_len];
-            key_block(suite.hash, &master, &sr, &cr, &mut kb);
-            let (c_key, rest) = kb.split_at(suite.key_len);
-            let (_s_key, ivs) = rest.split_at(suite.key_len);
-            let mut c_salt = [0u8; 4];
-            c_salt.copy_from_slice(&ivs[..4]);
-            self.client_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt).into());
-            // The key_block holds the live AEAD keys; the crypter owns its own
-            // copy now, so scrub the derivation buffer.
-            super::wipe(&mut kb);
+            let (client_crypter, _server_crypter) = RecordCrypter12::derive_pair(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &master,
+                &sr,
+                &cr,
+            );
+            self.client_crypter = Some(client_crypter.into());
 
             // Our Finished, signed over Hash(CH..server_Finished).
             let th_cf = self.transcript.current_hash();

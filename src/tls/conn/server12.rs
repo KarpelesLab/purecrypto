@@ -72,7 +72,7 @@ use crate::tls::crypto::cbc_rec::{
     CbcMacAlg, LEGACY_CBC_SUITES, LegacyCbcSuite, LegacyKx, build_legacy_crypters,
 };
 use crate::tls::crypto::prf::{
-    extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
+    extended_master_secret, finished_verify_data, master_secret, tls12_exporter,
 };
 #[cfg(feature = "tls-legacy")]
 use crate::tls::crypto::prf::{
@@ -1478,22 +1478,16 @@ impl<R: RngCore> ServerConnection12<R> {
             // the new randoms.
             let cr = ch.random;
             let sr = server_random;
-            let kb_len = 2 * rs.suite.key_len + 8;
-            let mut kb = alloc::vec![0u8; kb_len];
-            key_block(rs.suite.hash, &rs.master_secret, &sr, &cr, &mut kb);
-            let (c_key, rest) = kb.split_at(rs.suite.key_len);
-            let (s_key, ivs) = rest.split_at(rs.suite.key_len);
-            let mut c_salt = [0u8; 4];
-            c_salt.copy_from_slice(&ivs[..4]);
-            let mut s_salt = [0u8; 4];
-            s_salt.copy_from_slice(&ivs[4..8]);
-            self.pending_client_crypter =
-                Some(RecordCrypter12::new(rs.suite.aead, c_key, c_salt).into());
-            self.pending_server_crypter =
-                Some(RecordCrypter12::new(rs.suite.aead, s_key, s_salt).into());
-            // The key_block holds the live AEAD keys; the crypters own their
-            // own copies now, so scrub the derivation buffer.
-            super::wipe(&mut kb);
+            let (client_crypter, server_crypter) = RecordCrypter12::derive_pair(
+                rs.suite.hash,
+                rs.suite.aead,
+                rs.suite.key_len,
+                &rs.master_secret,
+                &sr,
+                &cr,
+            );
+            self.pending_client_crypter = Some(client_crypter.into());
+            self.pending_server_crypter = Some(server_crypter.into());
 
             // SH (without echoing session_ticket — signals resumption to client).
             self.send_server_hello()?;
@@ -2699,22 +2693,14 @@ impl<R: RngCore> ServerConnection12<R> {
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
-        let kb_len = 2 * suite.key_len + 8;
-        let mut kb = alloc::vec![0u8; kb_len];
-        key_block(suite.hash, &master, &sr, &cr, &mut kb);
-        let (c_key, rest) = kb.split_at(suite.key_len);
-        let (s_key, rest) = rest.split_at(suite.key_len);
-        let mut c_salt = [0u8; 4];
-        c_salt.copy_from_slice(&rest[..4]);
-        let mut s_salt = [0u8; 4];
-        s_salt.copy_from_slice(&rest[4..8]);
-        // Stash the crypters; we install the read side on the peer's CCS and
-        // the write side after we emit our own CCS.
-        self.pending_client_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt).into());
-        self.pending_server_crypter = Some(RecordCrypter12::new(suite.aead, s_key, s_salt).into());
-        // The key_block holds the live AEAD keys; the crypters own their own
-        // copies now, so scrub the derivation buffer.
-        super::wipe(&mut kb);
+        // key_block (RFC 5246 §6.3), laid out per the suite's AEAD (RFC 5288
+        // §3 / RFC 7905 §2) by `derive_pair`. Stash the crypters; we install
+        // the read side on the peer's CCS and the write side after we emit
+        // our own CCS.
+        let (client_crypter, server_crypter) =
+            RecordCrypter12::derive_pair(suite.hash, suite.aead, suite.key_len, &master, &sr, &cr);
+        self.pending_client_crypter = Some(client_crypter.into());
+        self.pending_server_crypter = Some(server_crypter.into());
         self.master = Some(master);
 
         // CKE was already added to the transcript above for the EMS path.

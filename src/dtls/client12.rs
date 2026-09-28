@@ -42,7 +42,7 @@ use crate::tls::codec::{
 use crate::tls::conn::{SUITES_12, SuiteParams12, lookup_suite_12};
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
-    extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
+    extended_master_secret, finished_verify_data, master_secret, tls12_exporter,
 };
 use crate::tls::crypto::{Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
@@ -1120,24 +1120,11 @@ impl DtlsClientConnection12 {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
 
-        // key_block: c_key || s_key || c_iv(4) || s_iv(4). Total size
-        // depends on the negotiated AEAD's key length: 40 bytes for AES-128,
-        // 72 bytes for AES-256 / ChaCha20-Poly1305 (the +8 stays — two
-        // 4-byte salts for the GCM/ChaCha IV).
-        let mut kb = alloc::vec![0u8; 2 * suite.key_len + 8];
-        key_block(suite.hash, &master, &sr, &cr, &mut kb);
-        let (c_key, rest) = kb.split_at(suite.key_len);
-        let (s_key, rest) = rest.split_at(suite.key_len);
-        let mut c_salt = [0u8; 4];
-        c_salt.copy_from_slice(&rest[..4]);
-        let mut s_salt = [0u8; 4];
-        s_salt.copy_from_slice(&rest[4..8]);
-        let write_crypter = RecordCrypter12::new(suite.aead, c_key, c_salt);
-        let read_crypter = RecordCrypter12::new(suite.aead, s_key, s_salt);
-        // The crypters own the keys now; scrub the key block and salts.
-        crate::tls::conn::wipe(&mut kb);
-        crate::tls::conn::wipe(&mut c_salt);
-        crate::tls::conn::wipe(&mut s_salt);
+        // key_block (RFC 5246 §6.3): c_key || s_key || c_iv || s_iv, the
+        // IVs 4 bytes each for GCM (RFC 5288 §3) and 12 for ChaCha20-Poly1305
+        // (RFC 7905 §2); `derive_pair` lays it out and scrubs the buffer.
+        let (write_crypter, read_crypter) =
+            RecordCrypter12::derive_pair(suite.hash, suite.aead, suite.key_len, &master, &sr, &cr);
         self.master = Some(master);
         self.write_crypter = Some(write_crypter);
         self.read_crypter = Some(read_crypter);

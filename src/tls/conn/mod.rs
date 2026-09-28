@@ -10910,7 +10910,6 @@ mod audit_regression_tests {
             ClientConnection12, ServerConfig12, ServerConnection12, lookup_suite_12,
         };
         use crate::tls::crypto::aead12::RecordCrypter12;
-        use crate::tls::crypto::prf::key_block;
         use crate::tls::keylog::KeyLog;
         use crate::tls::{ContentType, ProtocolVersion};
         use std::sync::Mutex;
@@ -10981,16 +10980,12 @@ mod audit_regression_tests {
         let suite = lookup_suite_12(suite).expect("negotiated suite");
         let master = capture.0.lock().unwrap().expect("master secret logged");
 
-        // Server write key + salt, then an application record at seq 0 —
-        // the position the server's Finished would normally occupy.
-        let mut kb = alloc::vec![0u8; 2 * suite.key_len + 8];
-        key_block(suite.hash, &master, &sr, &cr, &mut kb);
-        let s_key = &kb[suite.key_len..2 * suite.key_len];
-        let mut s_salt = [0u8; 4];
-        s_salt.copy_from_slice(&kb[2 * suite.key_len + 4..2 * suite.key_len + 8]);
-        let mut server_writer = RecordCrypter12::new(suite.aead, s_key, s_salt);
-        // `encrypt` yields the fragment (`explicit_nonce ‖ ct ‖ tag`); the
-        // record header is framed here, as the engine would.
+        // Server write crypter, then an application record at seq 0 — the
+        // position the server's Finished would normally occupy.
+        let (_client_writer, mut server_writer) =
+            RecordCrypter12::derive_pair(suite.hash, suite.aead, suite.key_len, &master, &sr, &cr);
+        // `encrypt` yields the fragment; the record header is framed here,
+        // as the engine would.
         let app = server_writer
             .encrypt(ContentType::ApplicationData, b"unauthenticated bytes")
             .unwrap();

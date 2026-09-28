@@ -59,7 +59,7 @@ mod suite {
 pub mod tls {
     use super::Suite;
     use crate::ct::{Choice, ConstantTimeEq};
-    use crate::tls::crypto::aead12::RecordCrypter12;
+    use crate::tls::crypto::aead12::{self, RecordCrypter12};
     use crate::tls::crypto::{
         Aead, KeySchedule, Secret, binder_finished_key, finished_verify_data, next_traffic_secret,
         prf, psk_from_resumption, tls_exporter, traffic_key_iv,
@@ -200,10 +200,26 @@ pub mod tls {
         Ok((ct.as_u8(), content))
     }
 
+    /// `SecurityParameters.fixed_iv_length` for `suite`'s AEAD in TLS 1.2:
+    /// the per-direction write IV the key block yields — 4 bytes (the GCM
+    /// salt, RFC 5288 §3) or 12 (the ChaCha20-Poly1305 write IV, RFC 7905
+    /// §2).
+    pub fn tls12_fixed_iv_len(suite: Suite) -> usize {
+        aead12::fixed_iv_len(suite.params().aead)
+    }
+
+    /// `SecurityParameters.record_iv_length` for `suite`'s AEAD in TLS 1.2:
+    /// the explicit nonce at the front of each record fragment — 8 bytes for
+    /// GCM, none for ChaCha20-Poly1305.
+    pub fn tls12_record_iv_len(suite: Suite) -> usize {
+        aead12::record_iv_len(suite.params().aead)
+    }
+
     /// The TLS 1.2 key derivation (RFC 5246 §8.1 / §6.3, RFC 7627): the
     /// master secret from `premaster` — the extended master secret over
     /// `session_hash` when given — and the key block for `suite`'s AEAD
-    /// (two keys, two 4-byte implicit nonces). Returns `master ‖ key_block`.
+    /// (two keys, then two write IVs of [`tls12_fixed_iv_len`] bytes).
+    /// Returns `master ‖ key_block`.
     pub fn tls12_key_block(
         suite: Suite,
         premaster: &[u8],
@@ -216,7 +232,7 @@ pub mod tls {
             Some(h) => prf::extended_master_secret(p.hash, premaster, h),
             None => prf::master_secret(p.hash, premaster, client_random, server_random),
         };
-        let mut kb = alloc::vec![0u8; 2 * p.key_len + 8];
+        let mut kb = alloc::vec![0u8; 2 * p.key_len + 2 * aead12::fixed_iv_len(p.aead)];
         prf::key_block(p.hash, &master, server_random, client_random, &mut kb);
         let mut out = master.to_vec();
         out.extend_from_slice(&kb);
@@ -239,16 +255,18 @@ pub mod tls {
         (expected, ok)
     }
 
-    /// Protects one TLS 1.2 AEAD record (sequence number 0), returning the
-    /// fragment `explicit_nonce ‖ ciphertext ‖ tag` (`RecordCrypter12`).
+    /// Protects one TLS 1.2 AEAD record (sequence number 0) under `key` and
+    /// the direction's `write_iv` ([`tls12_fixed_iv_len`] bytes), returning
+    /// the fragment — `explicit_nonce ‖ ciphertext ‖ tag` for GCM,
+    /// `ciphertext ‖ tag` for ChaCha20-Poly1305 (`RecordCrypter12`).
     pub fn tls12_seal(
         suite: Suite,
         key: &[u8],
-        salt: [u8; 4],
+        write_iv: &[u8],
         content_type: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        RecordCrypter12::new(suite.params().aead, key, salt)
+        RecordCrypter12::new(suite.params().aead, key, write_iv)
             .encrypt(ContentType::from_u8(content_type), payload)
     }
 
@@ -257,11 +275,11 @@ pub mod tls {
     pub fn tls12_open(
         suite: Suite,
         key: &[u8],
-        salt: [u8; 4],
+        write_iv: &[u8],
         header: &[u8; 5],
         fragment: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        RecordCrypter12::new(suite.params().aead, key, salt)
+        RecordCrypter12::new(suite.params().aead, key, write_iv)
             .decrypt(header, fragment)
             .map(|(_, plain)| plain)
     }
@@ -280,16 +298,17 @@ pub mod dtls {
     use alloc::vec::Vec;
 
     /// Protects one DTLS 1.2 AEAD record payload at `epoch_seq`
-    /// (`epoch:16 ‖ seq:48`), returning the fragment.
+    /// (`epoch:16 ‖ seq:48`) under `key` and the direction's `write_iv`
+    /// ([`super::tls::tls12_fixed_iv_len`] bytes), returning the fragment.
     pub fn dtls12_seal(
         suite: Suite,
         key: &[u8],
-        salt: [u8; 4],
+        write_iv: &[u8],
         epoch_seq: u64,
         content_type: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        RecordCrypter12::new(suite.params().aead, key, salt).encrypt_dtls(
+        RecordCrypter12::new(suite.params().aead, key, write_iv).encrypt_dtls(
             epoch_seq,
             ContentType::from_u8(content_type),
             payload,
@@ -300,12 +319,12 @@ pub mod dtls {
     pub fn dtls12_open(
         suite: Suite,
         key: &[u8],
-        salt: [u8; 4],
+        write_iv: &[u8],
         epoch_seq: u64,
         content_type: u8,
         fragment: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        RecordCrypter12::new(suite.params().aead, key, salt).decrypt_dtls(
+        RecordCrypter12::new(suite.params().aead, key, write_iv).decrypt_dtls(
             epoch_seq,
             ContentType::from_u8(content_type),
             fragment,

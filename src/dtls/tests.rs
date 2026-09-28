@@ -2750,6 +2750,44 @@ mod dtls12 {
         assert_eq!(client.take_received(), b"pong-chacha");
     }
 
+    /// The RSA-keyed twin of [`negotiates_chacha20`]:
+    /// `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` (0xCCA8) end to end,
+    /// with the RFC 7905 record protection (12-byte write IVs from the key
+    /// block, no explicit nonce on the wire) carrying data both ways.
+    #[test]
+    fn negotiates_chacha20_rsa() {
+        let (server_cfg, cert) = make_server_rsa();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = client_with_suites(
+            &cert,
+            alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256],
+        );
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-chacha-rsa", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump(&mut client, &mut server));
+        assert_eq!(
+            client.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256.0)
+        );
+        assert_eq!(
+            server.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256.0)
+        );
+
+        client.send(b"ping-chacha-rsa").unwrap();
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-chacha-rsa");
+
+        server.send(b"pong-chacha-rsa").unwrap();
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong-chacha-rsa");
+    }
+
     /// Multi-suite negotiation: when the client advertises only
     /// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, the server must pick that
     /// suite — exercising the SHA-384 transcript / PRF path along with

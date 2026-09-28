@@ -1247,21 +1247,26 @@ fn tls12_records() -> String {
         let tag = 270 + 10 * i as u64;
         let key = secret_bytes::<32>(tag);
         let key = &key[..key_len(suite)];
-        // The implicit nonce comes from the key block: secret.
-        let salt = secret_bytes::<4>(tag + 1);
+        // The write IV comes from the key block: secret. A 4-byte GCM salt
+        // or the 12-byte ChaCha20-Poly1305 IV (RFC 7905 §2).
+        let iv = secret_bytes::<12>(tag + 1);
+        let iv = &iv[..hooks::tls::tls12_fixed_iv_len(suite)];
         let payload = secret_bytes::<200>(tag + 2);
         let expected = public_copy(&payload);
-        let frag = hooks::tls::tls12_seal(suite, key, salt, 23, &payload).expect("seal");
+        let frag = hooks::tls::tls12_seal(suite, key, iv, 23, &payload).expect("seal");
         declassify(&frag);
+        // GCM fragments carry the 8-byte explicit nonce; ChaCha20's do not.
+        let explicit = hooks::tls::tls12_record_iv_len(suite);
+        assert_eq!(frag.len(), explicit + payload.len() + 16);
         let len = (frag.len() as u16).to_be_bytes();
         let header = [23, 3, 3, len[0], len[1]];
-        let got = hooks::tls::tls12_open(suite, key, salt, &header, &frag).expect("authentic");
+        let got = hooks::tls::tls12_open(suite, key, iv, &header, &frag).expect("authentic");
         declassify(&got);
         assert_eq!(got, expected);
         let mut bad = frag.clone();
         bad[30] ^= 1;
-        assert!(hooks::tls::tls12_open(suite, key, salt, &header, &bad).is_err());
-        out.push(hex8(&frag[8..]));
+        assert!(hooks::tls::tls12_open(suite, key, iv, &header, &bad).is_err());
+        out.push(hex8(&frag[explicit..]));
     }
     out.join(" ")
 }
@@ -1272,21 +1277,23 @@ fn dtls12_records() -> String {
         let tag = 300 + 10 * i as u64;
         let key = secret_bytes::<32>(tag);
         let key = &key[..key_len(suite)];
-        let salt = secret_bytes::<4>(tag + 1);
+        let iv = secret_bytes::<12>(tag + 1);
+        let iv = &iv[..hooks::tls::tls12_fixed_iv_len(suite)];
         let payload = secret_bytes::<150>(tag + 2);
         let expected = public_copy(&payload);
         let epoch_seq = (1u64 << 48) | 0x2a;
-        let frag =
-            hooks::dtls::dtls12_seal(suite, key, salt, epoch_seq, 23, &payload).expect("seal");
+        let frag = hooks::dtls::dtls12_seal(suite, key, iv, epoch_seq, 23, &payload).expect("seal");
         declassify(&frag);
+        let explicit = hooks::tls::tls12_record_iv_len(suite);
+        assert_eq!(frag.len(), explicit + payload.len() + 16);
         let got =
-            hooks::dtls::dtls12_open(suite, key, salt, epoch_seq, 23, &frag).expect("authentic");
+            hooks::dtls::dtls12_open(suite, key, iv, epoch_seq, 23, &frag).expect("authentic");
         declassify(&got);
         assert_eq!(got, expected);
         let mut bad = frag.clone();
         bad[frag.len() - 1] ^= 1;
-        assert!(hooks::dtls::dtls12_open(suite, key, salt, epoch_seq, 23, &bad).is_err());
-        out.push(hex8(&frag[8..]));
+        assert!(hooks::dtls::dtls12_open(suite, key, iv, epoch_seq, 23, &bad).is_err());
+        out.push(hex8(&frag[explicit..]));
     }
     out.join(" ")
 }
