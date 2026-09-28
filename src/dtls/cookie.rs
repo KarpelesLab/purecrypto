@@ -7,9 +7,10 @@
 //! the server computes it from a long-lived secret and the salient parts of
 //! the client's first ClientHello.
 //!
-//! Construction here:
-//! `HMAC-SHA256(secret, client_addr ‖ client_random ‖ ch_fingerprint ‖ TS)`,
-//! truncated to 32 bytes.
+//! Construction here (the aux-carrying DTLS 1.3 form; the DTLS 1.2 form
+//! below is the same MAC without an aux payload, truncated to fit the
+//! HelloVerifyRequest):
+//! `HMAC-SHA256(secret, client_addr ‖ client_random ‖ ch_fingerprint ‖ TS)`.
 //!
 //! Including the `client_random` binds the cookie to the specific handshake
 //! attempt; including `client_addr` binds it to the source; the
@@ -27,13 +28,28 @@
 //! fingerprint, or replay from a different source all collapse to `false`
 //! without leaking which byte differed.
 //!
-//! ## Cookie format
+//! ## Cookie formats
+//!
+//! DTLS 1.3 (the HelloRetryRequest `cookie` extension, `opaque<1..2^16-1>`):
 //!
 //! `cookie := TS(4) ‖ aux_len(2) ‖ aux(aux_len) ‖ HMAC[..32]`
 //!
 //! where
 //!
 //! `HMAC := HMAC-SHA256(secret, client_addr ‖ client_random ‖ ch_fingerprint ‖ TS ‖ aux_len ‖ aux)`.
+//!
+//! DTLS 1.2 (the HelloVerifyRequest cookie, `opaque<0..2^8-1>`):
+//!
+//! `cookie := TS(4) ‖ HMAC-SHA256(secret, 0x12 ‖ client_addr ‖ client_random ‖ ch_fingerprint ‖ TS)[..28]`
+//!
+//! — 32 bytes, the bound RFC 4347 §4.2.1 set for DTLS 1.0 (`opaque
+//! cookie<0..32>`). RFC 6347 widened the field to 255 bytes, but a widely
+//! deployed client (wolfSSL, `WOLFSSL_COOKIE_LEN`) kept the old bound and
+//! silently drops a longer cookie, so it never completes the exchange
+//! against a server issuing one. A 224-bit truncation of the tag is still
+//! far beyond what a return-routability check needs (OpenSSL's cookie is a
+//! 160-bit HMAC-SHA1). The leading `0x12` and the lengths keep the two
+//! forms from validating as each other.
 //!
 //! `TS` is the issuing server's timestamp in minutes, big-endian (32-bit).
 //! Validation rejects cookies whose `now - TS > max_age_minutes`; this
@@ -53,9 +69,11 @@ extern crate alloc;
 use crate::ct::{Choice, ConstantTimeEq};
 use crate::hash::{HmacSha256, Sha256};
 
-/// Length of an issued cookie when no auxiliary state is embedded:
-/// 4-byte timestamp || 2-byte aux length (0) || 32-byte HMAC.
-pub(crate) const COOKIE_LEN: usize = 38;
+/// Length of a DTLS 1.2 (aux-less) cookie: 4-byte timestamp || 28-byte
+/// HMAC tag, within the 32-byte bound DTLS 1.0 clients still enforce.
+pub(crate) const COOKIE_LEN: usize = 32;
+/// Domain-separation prefix of the DTLS 1.2 cookie MAC.
+const COOKIE12_DOMAIN: u8 = 0x12;
 /// Fixed overhead of an aux-carrying cookie: 4-byte TS || 2-byte aux_len
 /// || 32-byte HMAC.
 pub(crate) const COOKIE_OVERHEAD: usize = 4 + 2 + 32;
@@ -98,10 +116,10 @@ impl CookieGenerator {
         self
     }
 
-    /// Computes a cookie carrying no auxiliary state. Convenience wrapper
-    /// over [`Self::generate_with_aux`] for the DTLS 1.2 path where the
-    /// transcript starts fresh at CH2 and no inter-CH state needs to be
-    /// stashed.
+    /// Computes the compact DTLS 1.2 HelloVerifyRequest cookie (no
+    /// auxiliary state: the DTLS 1.2 transcript starts fresh at CH2, so
+    /// nothing needs to ride the round trip). 32 bytes — see the module
+    /// docs for why that bound matters.
     pub(crate) fn generate(
         &self,
         client_addr: &[u8],
@@ -109,11 +127,17 @@ impl CookieGenerator {
         ch_fingerprint: &[u8],
         now_minutes: u32,
     ) -> [u8; COOKIE_LEN] {
-        let v =
-            self.generate_with_aux(client_addr, client_random, ch_fingerprint, &[], now_minutes);
+        let ts = now_minutes.to_be_bytes();
+        let tag = HmacSha256::new(&self.secret)
+            .chain(&[COOKIE12_DOMAIN])
+            .chain(client_addr)
+            .chain(client_random)
+            .chain(ch_fingerprint)
+            .chain(&ts)
+            .finalize();
         let mut out = [0u8; COOKIE_LEN];
-        debug_assert_eq!(v.len(), COOKIE_LEN);
-        out.copy_from_slice(&v);
+        out[..4].copy_from_slice(&ts);
+        out[4..].copy_from_slice(&tag.as_ref()[..COOKIE_LEN - 4]);
         out
     }
 
@@ -159,9 +183,9 @@ impl CookieGenerator {
         out
     }
 
-    /// Constant-time validation of an aux-less `cookie` (DTLS 1.2 path).
-    /// Returns `true` only if the HMAC matches AND the embedded timestamp
-    /// is within `max_age_minutes` of `now_minutes`.
+    /// Constant-time validation of a compact DTLS 1.2 `cookie` (see
+    /// [`Self::generate`]). Returns `true` only if the HMAC matches AND the
+    /// embedded timestamp is within `max_age_minutes` of `now_minutes`.
     pub(crate) fn validate(
         &self,
         client_addr: &[u8],
@@ -170,15 +194,28 @@ impl CookieGenerator {
         now_minutes: u32,
         cookie: &[u8],
     ) -> bool {
-        self.validate_with_aux(
-            client_addr,
-            client_random,
-            ch_fingerprint,
-            now_minutes,
-            cookie,
-        )
-        .map(|aux| aux.is_empty())
-        .unwrap_or(false)
+        if cookie.len() != COOKIE_LEN {
+            return false;
+        }
+        let mut ts_bytes = [0u8; 4];
+        ts_bytes.copy_from_slice(&cookie[..4]);
+        let ts = u32::from_be_bytes(ts_bytes);
+        if !self.timestamp_fresh(ts, now_minutes) {
+            return false;
+        }
+        let expected = self.generate(client_addr, client_random, ch_fingerprint, ts);
+        // Constant-time over the full cookie image so a forgery is rejected
+        // without leaking which byte differed.
+        bool::from(expected.as_slice().ct_eq(cookie))
+    }
+
+    /// Rejects cookies from the future (one-minute clock-skew tolerance)
+    /// and those older than `max_age_minutes`. Saturating, so a wrapped
+    /// clock cannot make an old cookie look fresh.
+    fn timestamp_fresh(&self, ts: u32, now_minutes: u32) -> bool {
+        let age = now_minutes.saturating_sub(ts);
+        let future_skew = ts.saturating_sub(now_minutes);
+        age <= self.max_age_minutes && future_skew <= 1
     }
 
     /// Constant-time validation of an aux-carrying `cookie`. On success
@@ -205,11 +242,7 @@ impl CookieGenerator {
         if cookie.len() != COOKIE_OVERHEAD + aux_len {
             return None;
         }
-        // Reject cookies from the future (one-minute clock-skew tolerance) and
-        // those older than max_age_minutes. Saturating to avoid wraparound.
-        let age = now_minutes.saturating_sub(ts);
-        let future_skew = ts.saturating_sub(now_minutes);
-        if age > self.max_age_minutes || future_skew > 1 {
+        if !self.timestamp_fresh(ts, now_minutes) {
             return None;
         }
         let aux = &cookie[6..6 + aux_len];
@@ -364,6 +397,25 @@ mod tests {
         assert!(!cg.validate(addr, &rand, fp_b, TS, &cookie));
         // Empty fingerprint must also disagree with a real one.
         assert!(!cg.validate(addr, &rand, b"", TS, &cookie));
+    }
+
+    /// The DTLS 1.2 cookie stays within the 32-byte bound of RFC 4347
+    /// §4.2.1 (`opaque cookie<0..32>`): clients that kept the DTLS 1.0 limit
+    /// (wolfSSL) silently drop anything longer and never complete the
+    /// HelloVerifyRequest exchange.
+    #[test]
+    fn dtls12_cookie_fits_the_dtls10_bound() {
+        let cg = CookieGenerator::new(fixed_secret());
+        let cookie = cg.generate(b"203.0.113.5:50000", &fixed_random(), FP, TS);
+        assert!(cookie.len() <= 32);
+        assert_eq!(cookie.len(), COOKIE_LEN);
+        // And the two formats never validate as each other.
+        let aux = cg.generate_with_aux(b"203.0.113.5:50000", &fixed_random(), FP, &[], TS);
+        assert!(!cg.validate(b"203.0.113.5:50000", &fixed_random(), FP, TS, &aux));
+        assert!(
+            cg.validate_with_aux(b"203.0.113.5:50000", &fixed_random(), FP, TS, &cookie)
+                .is_none()
+        );
     }
 
     #[test]
