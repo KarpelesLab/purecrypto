@@ -75,6 +75,10 @@ jobs:
           # peers/schannel/, built on the runner with its dotnet SDK.
           - peer: schannel
             runs-on: windows-latest
+          # Apple's TLS stack (Network.framework) of the macOS runner, through
+          # the Swift tool in tools/interop/peers/apple (built by the adapter).
+          - peer: apple
+            runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -86,6 +90,22 @@ jobs:
 
       - name: System OpenSSL version
         run: openssl version -a
+
+      # ---- apple -------------------------------------------------------
+      # Homebrew's openssl@3 generates the OCSP response (the image's own
+      # `openssl` may be LibreSSL), coreutils provides `timeout`.
+      - name: macOS tooling
+        if: matrix.peer == 'apple'
+        run: |
+          set -euxo pipefail
+          sw_vers
+          swift --version
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          "$(brew --prefix openssl@3)/bin/openssl" version
+          echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >>"$GITHUB_ENV"
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >>"$GITHUB_PATH"
+          tools/interop/peers/apple/build.sh
 
       # ---- openssl-src -------------------------------------------------
       - name: Cache OpenSSL (source build)
