@@ -2039,15 +2039,24 @@ impl ClientConnection {
             }
         }
 
-        // PSK resumption: psk_key_exchange_modes, optional early_data,
-        // pre_shared_key (must be LAST per RFC 8446 §4.2.11). The binder is
-        // patched after we know the truncated CH bytes.
+        // RFC 8446 §4.2.9: `psk_key_exchange_modes` names the resumption
+        // modes this client can use for the tickets it is about to be
+        // issued — not only for a PSK it is offering now. It goes out on
+        // every ClientHello: a server "SHOULD NOT send NewSessionTicket with
+        // tickets that are not compatible with the advertised modes", and
+        // BoringSSL reads no advertisement as no compatible mode and issues
+        // no ticket at all, so a fresh handshake that left it out could
+        // never be resumed against such a server.
+        extensions.push(ext::psk_key_exchange_modes(&[1])); // psk_dhe_ke
+
+        // PSK resumption: optional early_data, then pre_shared_key (which
+        // must be LAST per RFC 8446 §4.2.11). The binder is patched after
+        // we know the truncated CH bytes.
         // The binder PSK copy is `Zeroizing`: it is a clone of the stored
         // session's long-lived resumption secret and must not outlive this
         // function on the stack.
         let mut psk_binder_info: Option<(HashAlg, Zeroizing<Vec<u8>>, usize)> = None;
         if let Some(session) = &self.config.session {
-            extensions.push(ext::psk_key_exchange_modes(&[1])); // psk_dhe_ke
             // RFC 8446 §4.1.4 / §4.2.10: `early_data` MUST NOT appear in
             // the retry ClientHello — 0-RTT is over once an HRR arrives.
             // And only when 0-RTT is actually offered (`early_data_offered`:
@@ -4661,6 +4670,29 @@ mod tests {
         // The key_share offers x25519mlkem768, x25519, secp256r1 and secp384r1.
         let ks = ext::find(&ch.extensions, ExtensionType::KEY_SHARE).unwrap();
         assert_eq!(ext::parse_client_key_shares(ks).unwrap().len(), 4);
+    }
+
+    /// RFC 8446 §4.2.9: `psk_key_exchange_modes` is advertised on a fresh
+    /// ClientHello too (no session offered), naming `psk_dhe_ke`. Without it
+    /// BoringSSL issues no NewSessionTicket, so nothing could ever be
+    /// resumed against it — found by the interop matrix.
+    #[test]
+    fn fresh_client_hello_advertises_psk_key_exchange_modes() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"p8-client-modes", b"nonce", &[]);
+        let config = ClientConfig::new(RootCertStore::new());
+        assert!(config.session.is_none());
+        let mut client = ClientConnection::new(config, "example.com", &mut rng).unwrap();
+        let out = client.write_tls();
+        let rec = read_record(&out).unwrap().unwrap();
+        let mut c = ReadCursor::new(rec.fragment);
+        assert_eq!(c.u8().unwrap(), hs_type::CLIENT_HELLO);
+        let ch = ClientHello::decode(c.vec_u24().unwrap()).unwrap();
+        let modes = ext::find(&ch.extensions, ExtensionType::PSK_KEY_EXCHANGE_MODES)
+            .expect("psk_key_exchange_modes on a fresh ClientHello");
+        assert_eq!(ext::parse_psk_key_exchange_modes(modes).unwrap(), [1]);
+        // No PSK is offered, so no `pre_shared_key` (§4.2.11 pairs the two
+        // only in that direction).
+        assert!(ext::find(&ch.extensions, ExtensionType::PRE_SHARED_KEY).is_none());
     }
 
     #[test]
