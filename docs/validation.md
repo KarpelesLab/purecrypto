@@ -244,6 +244,51 @@ update with the commands in `tools/wycheproof/README.md`.
   pre-compressed (`-cert_comp`). Compression of the *client* certificate
   (RFC 8879 in the mTLS direction) is not implemented by purecrypto and is
   not in the matrix.
+- **TLS 1.3 matrix, both roles, against Mbed TLS 4.2.0** (the same
+  workflow, peer `mbedtls`, adapter `tools/interop/peers/mbedtls.sh`): the
+  purecrypto CLI against `ssl_client2` / `ssl_server2` from a source build
+  of the pinned release tag (`MBEDTLS_TAG` in the workflow; the default
+  configuration plus `MBEDTLS_SSL_EARLY_DATA` and
+  `MBEDTLS_SSL_RECORD_SIZE_LIMIT`, which are off by default), cached by tag.
+  The two programs are HTTP-shaped rather than stdin-driven, so the payload
+  travels as the request page; neither prints the negotiated group or the
+  PSK / early-data outcome, so the adapter reads the library's debug log
+  (`write selected_group:`, `key exchange mode: psk_ephemeral`, `DHE group
+  name:`, `ServerHello: pre_shared_key(41) extension exists.`,
+  `EncryptedExtensions: early_data(42) extension exists.`). 78 of the 226
+  cases run, 148 SKIP; the peer pins group and suite in both roles
+  (`groups=`, `force_ciphersuite=`), so every run is checked on both sides:
+
+  | Case | Mbed TLS 4.2.0 (C / S) |
+  |---|---|
+  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ |
+  | Plain, `X25519MLKEM768` | ⏭ no ML-KEM hybrids |
+  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them |
+  | Plain, Ed25519 certificate | ⏭ no EdDSA |
+  | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA |
+  | Resumption (PSK + DHE) | ✅ / ✅ |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only |
+  | 0-RTT accepted | ✅ / ✅ |
+  | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ✅ / ✅ |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ |
+  | HelloRetryRequest to `X25519MLKEM768` | ⏭ |
+  | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ |
+  | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ / ⏭ |
+  | KeyUpdate from either side | ⏭ Mbed TLS does not implement TLS 1.3 KeyUpdate at all: a received one is a fatal `unexpected_message` |
+  | RFC 8879 zlib certificate compression | ⏭ not implemented |
+  | RFC 7250 raw public key, either identity | ⏭ not implemented |
+  | OCSP stapling | ⏭ no `status_request` in Mbed TLS's TLS 1.3 |
+  | ALPN | ✅ / ✅ |
+  | RFC 8449 `record_size_limit` | ✅ / ✅ — the Mbed TLS server splits its 3000-byte response into six 511-byte records for the purecrypto client's limit of 512; the Mbed TLS client advertises 16384 on every TLS 1.3 connection, which the purecrypto server accepts |
+  | Chain > 16 KiB (Certificate spans records) | ⏭ a handshake message must fit Mbed TLS's fixed 16 KiB I/O buffer (`MBEDTLS_SSL_{IN,OUT}_CONTENT_LEN` cannot be larger): its server cannot write the Certificate, its client cannot reassemble it |
+  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ |
+  | `close_notify` from the peer | ✅ / ✅ |
+
+  No purecrypto defect surfaced against Mbed TLS. One tool behaviour is
+  worked around on the peer side: `ssl_server2` answers one request per
+  connection, and a client whose 0-RTT was rejected sends the early data
+  again as ordinary data before the payload, so that case runs the server
+  with `exchanges=2`.
 - **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server
