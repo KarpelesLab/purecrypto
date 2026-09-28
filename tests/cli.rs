@@ -55,9 +55,10 @@ fn run_capture(args: &[&str], stdin: &[u8]) -> (String, String, bool) {
 struct ServerProc {
     child: std::process::Child,
     port: u16,
-    /// Everything the server wrote to stderr after the banner, for the
-    /// failure message when it does not exit in time.
-    stderr: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The thread draining the server's stderr after the banner. It returns
+    /// everything it read once the pipe reaches EOF, which happens exactly
+    /// when the server process (the only holder of the write end) exits.
+    stderr: std::thread::JoinHandle<String>,
 }
 
 impl ServerProc {
@@ -77,31 +78,41 @@ impl ServerProc {
 
     /// Like [`finish`](Self::finish), returning everything the server wrote
     /// to stderr after its banner.
-    fn finish_with_stderr(mut self) -> String {
+    ///
+    /// The text comes from joining the drain thread, never from a snapshot
+    /// taken some fixed time after the exit was observed: the thread only
+    /// has the full text once `read_to_string` returns at EOF, and on a
+    /// loaded runner it can be descheduled for longer than any grace sleep
+    /// between the process exit and that return. An earlier version slept
+    /// 50 ms and read a shared buffer, and once handed back an empty string
+    /// on CI although the server had written every line before exiting.
+    fn finish_with_stderr(self) -> String {
+        let ServerProc {
+            mut child, stderr, ..
+        } = self;
         let start = std::time::Instant::now();
-        loop {
-            match self.child.try_wait().expect("poll server") {
-                Some(_) => {
-                    // The drain thread finishes once the pipe closes; give
-                    // it a moment to store the tail.
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    let stderr = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
-                    return stderr.clone();
-                }
+        let timed_out = loop {
+            match child.try_wait().expect("poll server") {
+                Some(_) => break false,
                 None if start.elapsed() > Self::EXIT_DEADLINE => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    let stderr = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
-                    panic!(
-                        "server still running {:?} after the client finished; killed it. \
-                         Server stderr:\n{}",
-                        Self::EXIT_DEADLINE,
-                        *stderr
-                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break true;
                 }
                 None => std::thread::sleep(std::time::Duration::from_millis(20)),
             }
-        }
+        };
+        // The process is gone either way, so the pipe's write end is closed
+        // and the drain thread is at (or about to reach) EOF: joining it
+        // cannot block indefinitely and yields the complete text.
+        let stderr = stderr.join().expect("server stderr drain thread panicked");
+        assert!(
+            !timed_out,
+            "server still running {:?} after the client finished; killed it. \
+             Server stderr:\n{stderr}",
+            Self::EXIT_DEADLINE,
+        );
+        stderr
     }
 }
 
@@ -116,8 +127,9 @@ impl ServerProc {
 /// from the returned [`ServerProc::port`]. The server must NOT be given
 /// `-quiet` (that suppresses the banner). Its stderr is drained on a helper
 /// thread for the process's lifetime so a later `eprintln!` in the server can
-/// never block or hit a closed pipe; the drained text is kept for
-/// [`ServerProc::finish`]'s failure report.
+/// never block or hit a closed pipe; the drained text is returned by
+/// [`ServerProc::finish_with_stderr`] and shown in [`ServerProc::finish`]'s
+/// failure report.
 fn spawn_server_wait_listening(args: &[&str]) -> ServerProc {
     use std::io::BufRead;
     let mut child = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
@@ -151,19 +163,15 @@ fn spawn_server_wait_listening(args: &[&str]) -> ServerProc {
         }
         before_banner.push_str(&line);
     };
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let sink = std::sync::Arc::clone(&captured);
-    std::thread::spawn(move || {
+    let stderr = std::thread::spawn(move || {
         let mut rest = String::new();
         let _ = stderr.read_to_string(&mut rest);
-        if let Ok(mut s) = sink.lock() {
-            s.push_str(&rest);
-        }
+        rest
     });
     ServerProc {
         child,
         port,
-        stderr: captured,
+        stderr,
     }
 }
 
@@ -7121,10 +7129,11 @@ fn s_client_s_server_ech_accept_and_reject() {
         &ech_cfg,
     ];
 
-    // Accepted.
+    // Accepted. The server is single-shot: it serves this one connection,
+    // exits on its own, and `finish_with_stderr` hands back everything it
+    // logged only once the process is gone and its stderr has hit EOF.
     let server = spawn_server_wait_listening(&server_args);
     let port = server.port;
-    let stderr = std::sync::Arc::clone(&server.stderr);
     let (out, err, ok) = run_capture(
         &[
             "s_client",
@@ -7139,8 +7148,7 @@ fn s_client_s_server_ech_accept_and_reject() {
         ],
         b"GET / HTTP/1.0\r\n\r\n",
     );
-    server.finish();
-    let server_err = stderr.lock().unwrap().clone();
+    let server_err = server.finish_with_stderr();
     assert!(ok, "s_client failed: {err}");
     assert!(err.contains("ECH: accepted"), "client stderr: {err}");
     assert!(
@@ -7159,7 +7167,6 @@ fn s_client_s_server_ech_accept_and_reject() {
     // Rejected: same public_name and config_id, a key the server lacks.
     let server = spawn_server_wait_listening(&server_args);
     let port = server.port;
-    let stderr = std::sync::Arc::clone(&server.stderr);
     let (out, err, ok) = run_capture(
         &[
             "s_client",
@@ -7176,8 +7183,7 @@ fn s_client_s_server_ech_accept_and_reject() {
         ],
         b"GET / HTTP/1.0\r\n\r\n",
     );
-    server.finish();
-    let server_err = stderr.lock().unwrap().clone();
+    let server_err = server.finish_with_stderr();
     assert!(!ok, "a rejected ECH connection must fail");
     assert!(err.contains("ECH: rejected"), "client stderr: {err}");
     assert!(
