@@ -2742,8 +2742,16 @@ impl QuicConnection {
     /// * `Some(false)` — early data was rejected. Nothing is lost: the engine
     ///   has requeued every unacknowledged byte for retransmission at the
     ///   1-RTT level, so the application need not resend anything.
+    ///
+    /// On a **server**, `Some(true)` once it has accepted a client's 0-RTT
+    /// (the data read before the handshake completed arrived in 0-RTT
+    /// packets and is replayable), `None` otherwise — a server does not
+    /// distinguish "not offered" from "offered and declined".
     pub fn early_data_accepted(&self) -> Option<bool> {
-        self.early_data_accepted
+        match &self.engine {
+            EngineSide::Client(_) => self.early_data_accepted,
+            EngineSide::Server(s) => s.early_data_accepted().then_some(true),
+        }
     }
 
     /// Whether this connection offered 0-RTT in its ClientHello. Streams may
@@ -2751,6 +2759,54 @@ impl QuicConnection {
     /// is `true`.
     pub fn early_data_offered(&self) -> bool {
         self.early_data_offered
+    }
+
+    /// Whether the TLS handshake resumed an earlier session via a PSK
+    /// (RFC 8446 §2.2): on a client, the server accepted the ticket carried
+    /// in [`QuicConfig::resumption`]; on a server, a ticket it issued was
+    /// presented and accepted. `false` until the handshake settles and on
+    /// every full handshake.
+    pub fn is_resumed(&self) -> bool {
+        match &self.engine {
+            EngineSide::Client(c) => c.psk_accepted(),
+            EngineSide::Server(s) => s.psk_used(),
+        }
+    }
+
+    /// Whether a Retry packet was exchanged on this connection (RFC 9000
+    /// §8.1.2): the client received one and replayed its Initial with the
+    /// token, or the server validated such a token. `false` on a connection
+    /// that was accepted on its first Initial.
+    pub fn retry_used(&self) -> bool {
+        self.retry_scid.is_some()
+    }
+
+    /// The 1-RTT key phase this endpoint currently sends with (RFC 9001
+    /// §6): `0` until the first key update, then alternating. Together with
+    /// [`Self::key_update_pending`] this lets a host confirm that a
+    /// [`Self::initiate_key_update`] — or a peer-initiated update — really
+    /// moved both sides to fresh keys.
+    pub fn key_phase(&self) -> u8 {
+        self.endpoint.crypto.one_rtt_phase
+    }
+
+    /// True while a key update this endpoint initiated is unconfirmed: no
+    /// packet protected with the new keys has been acknowledged yet (RFC
+    /// 9001 §6.2). Becomes `false` once the peer's ACK arrives, after which
+    /// another update may be initiated.
+    pub fn key_update_pending(&self) -> bool {
+        self.endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .tx_phase_pending_confirm
+    }
+
+    /// Whether the peer's ACK frames have validated that the path preserves
+    /// ECN marks (RFC 9000 §13.4.2): `true` once this endpoint's ECT(0)
+    /// marks have been reported back at least once, `false` while
+    /// validation is still in progress or after it failed.
+    pub fn ecn_validated(&self) -> bool {
+        self.ecn_tx == EcnValidation::Capable
     }
 
     // ============================================================
@@ -3320,11 +3376,14 @@ impl QuicConnection {
         self.role
     }
 
-    /// Server-side: the original Destination CID the client used on its
-    /// very first Initial (RFC 9000 §7.3). `None` if no Initial has been
-    /// processed yet.
-    #[cfg(test)]
-    pub(crate) fn original_dcid(&self) -> Option<&[u8]> {
+    /// The Destination Connection ID the client chose for its very first
+    /// Initial packet (RFC 9000 §7.3 `original_destination_connection_id`).
+    /// Both sides know it — the client picked it, the server read it — and
+    /// it never changes, unlike the connection IDs in use, so it is the
+    /// natural stable handle for per-connection host state and logs (qlog
+    /// names its traces by it). `None` on a server before the first Initial
+    /// has been processed.
+    pub fn original_dcid(&self) -> Option<&[u8]> {
         self.original_dcid.as_ref().map(|c| c.as_slice())
     }
 
@@ -3417,6 +3476,59 @@ impl QuicConnection {
         // 3×PTO timing is a Phase-8 concern.
         let data = self.path.issue(&mut rng, Duration::ZERO);
         Ok(data)
+    }
+
+    /// RFC 9000 §5.1.2 — stops addressing the peer by the connection ID in
+    /// use and switches to an unused one it issued via NEW_CONNECTION_ID,
+    /// retiring the old one with a RETIRE_CONNECTION_ID frame on the next
+    /// [`Self::pop_datagram`]. An endpoint may do this at any time after the
+    /// handshake, e.g. to limit how long one connection ID stays visible on
+    /// a path; §9.5 makes it mandatory across a migration, which the engine
+    /// performs on its own.
+    ///
+    /// Returns [`Error::InappropriateState`] before the handshake completes,
+    /// once the connection is closing, while a migration is still being
+    /// validated (the old CID is that path's fallback), or when the peer has
+    /// issued no spare connection ID — §5.1.2 lets an endpoint keep using
+    /// its only one, and a peer that uses zero-length connection IDs never
+    /// issues any.
+    pub fn switch_connection_id(&mut self) -> Result<(), Error> {
+        if !self.handshake_complete || self.closed || self.draining || self.pending_close.is_some()
+        {
+            return Err(Error::InappropriateState);
+        }
+        if self.migration.is_some() {
+            return Err(Error::InappropriateState);
+        }
+        let pool = self.cid_remote.as_mut().ok_or(Error::InappropriateState)?;
+        let current = self.endpoint.cids.peer;
+        let Some((next_seq, next)) = pool
+            .entries
+            .iter()
+            .filter(|(_, e)| e.cid != current)
+            .map(|(&seq, e)| (seq, e.cid))
+            .min_by_key(|(seq, _)| *seq)
+        else {
+            return Err(Error::InappropriateState);
+        };
+        let old_seq = pool
+            .entries
+            .iter()
+            .find(|(_, e)| e.cid == current)
+            .map(|(&seq, _)| seq);
+        self.endpoint.cids.peer = next;
+        pool.active_seq = next_seq;
+        // §19.16: the peer learns which sequence we stopped using; keep the
+        // queue bounded the same way `retire_prior_to` handling does.
+        if let Some(seq) = old_seq {
+            pool.entries.remove(&seq);
+            if !pool.pending_retire.contains(&seq)
+                && pool.pending_retire.len() < pool.pending_retire_cap()
+            {
+                pool.pending_retire.push(seq);
+            }
+        }
+        Ok(())
     }
 
     // ============================================================

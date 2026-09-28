@@ -240,8 +240,32 @@ pub struct QuicServer {
     by_initial: HashMap<(SocketAddr, ConnectionId), u64>,
     /// Connection-less datagrams (resets, Version Negotiation) awaiting send.
     pending: VecDeque<(SocketAddr, EcnCodepoint, Vec<u8>)>,
+    /// Connections dropped from the table after they closed, for
+    /// [`Self::drain_closed`]; bounded by `MAX_RECENTLY_CLOSED`.
+    recently_closed: VecDeque<ClosedConnection>,
+    /// Version Negotiation packets queued so far (RFC 9000 §6.1).
+    version_negotiations: u64,
     next_id: u64,
     now_secs: u64,
+}
+
+/// Bound on the closed-connection reports kept for [`QuicServer::drain_closed`].
+const MAX_RECENTLY_CLOSED: usize = 64;
+
+/// A connection the [`QuicServer`] removed from its table after it closed,
+/// reported through [`QuicServer::drain_closed`]. The connection itself is
+/// gone: an idle timeout (RFC 9000 §10.1) or a stateless reset drops the
+/// state in the same tick, so this is the only place its fate is recorded.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ClosedConnection {
+    /// [`QuicConnection::original_dcid`] — the stable handle the host keyed
+    /// its per-connection state by.
+    pub original_dcid: Vec<u8>,
+    /// The peer address the connection was last using.
+    pub peer: SocketAddr,
+    /// Why it ended, when the engine recorded a reason.
+    pub close: Option<crate::quic::CloseInfo>,
 }
 
 impl QuicServer {
@@ -279,6 +303,8 @@ impl QuicServer {
             by_addr: HashMap::new(),
             by_initial: HashMap::new(),
             pending: VecDeque::new(),
+            recently_closed: VecDeque::new(),
+            version_negotiations: 0,
             next_id: 0,
             now_secs: 0,
         })
@@ -382,6 +408,7 @@ impl QuicServer {
                 }
                 let vn = build_version_negotiation(inv_scid, inv_dcid, &[QUIC_V1]);
                 self.push_pending(from, EcnCodepoint::NotEct, vn);
+                self.version_negotiations = self.version_negotiations.saturating_add(1);
                 return Ok(());
             }
             // v1 — now the full type-aware parse is valid.
@@ -660,8 +687,35 @@ impl QuicServer {
             .map(|(&id, _)| id)
             .collect();
         for id in dead {
+            if let Some(h) = self.conns.get(&id) {
+                if self.recently_closed.len() >= MAX_RECENTLY_CLOSED {
+                    self.recently_closed.pop_front();
+                }
+                self.recently_closed.push_back(ClosedConnection {
+                    original_dcid: h.conn.original_dcid().unwrap_or_default().to_vec(),
+                    peer: h.addr,
+                    close: h.conn.close_info().cloned(),
+                });
+            }
             self.remove_conn(id);
         }
+    }
+
+    /// Reports of the connections dropped since the last call, oldest first
+    /// — the host's only view of a connection that ended without its
+    /// involvement (idle timeout, stateless reset, a peer's CONNECTION_CLOSE
+    /// whose draining period elapsed between two of its polls). At most the
+    /// last 64 are kept.
+    pub fn drain_closed(&mut self) -> Vec<ClosedConnection> {
+        self.recently_closed.drain(..).collect()
+    }
+
+    /// How many Version Negotiation packets this server has queued (RFC 9000
+    /// §6.1): one per long-header datagram of at least 1200 bytes that named
+    /// a version other than 1. Lets a host log or meter them; the packets
+    /// themselves leave through [`Self::poll_transmit`].
+    pub fn version_negotiations_sent(&self) -> u64 {
+        self.version_negotiations
     }
 
     /// M-4: drops every connection that has been half-open for longer than
@@ -865,6 +919,7 @@ mod server_tests {
         for h in srv.conns.values_mut() {
             h.conn.set_start_for_test(past);
         }
+        assert!(srv.drain_closed().is_empty());
         srv.on_timeout();
         assert_eq!(
             srv.connection_count(),
@@ -872,6 +927,19 @@ mod server_tests {
             "a half-open connection must expire on the idle timer"
         );
         assert!(srv.by_cid.is_empty(), "its routing entries must go too");
+        // The host learns of the reaped connection exactly once.
+        let gone = srv.drain_closed();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].peer, addr(41100));
+        assert!(
+            !gone[0].original_dcid.is_empty(),
+            "reported under the client's original DCID"
+        );
+        assert_eq!(
+            gone[0].close.as_ref().map(|c| c.initiator),
+            Some(crate::quic::CloseInitiator::IdleTimeout)
+        );
+        assert!(srv.drain_closed().is_empty());
     }
 
     /// M-3 — RFC 9000 §14.1: a server MUST drop packets specifying an
@@ -1323,7 +1391,9 @@ mod server_tests {
         // bytes, so pad the filler out to a realistic size.
         pkt.extend_from_slice(&[0u8; 1200]);
 
+        assert_eq!(srv.version_negotiations_sent(), 0);
         srv.recv(addr(50001), EcnCodepoint::NotEct, &pkt).unwrap();
+        assert_eq!(srv.version_negotiations_sent(), 1);
         let (to, _ecn, vn) = srv.poll_transmit().expect("a Version Negotiation reply");
         assert_eq!(to, addr(50001));
         // VN: long header, version field == 0.

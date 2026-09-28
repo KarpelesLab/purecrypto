@@ -23,8 +23,8 @@
 //! advertise a §9.6 [`PreferredAddress`] and a client migrate to it. Out of
 //! scope: HTTP/3.
 
-// QUIC v1 is shipped; the server direction interops with OpenSSL 3.5's QUIC
-// client, with several follow-ups still open (see the project notes). A
+// QUIC v1 is shipped and interops with quic-go in both roles and with
+// OpenSSL's QUIC client (`tools/quic-interop/`, CI). A
 // number of parsed-but-not-yet-consumed packet/header
 // fields, ACK/version-negotiation codec helpers, ECN counters, PnSet query
 // methods, and reserved RFC 9000 stream-state variants are intentionally
@@ -66,6 +66,6 @@ pub use ecn::EcnCodepoint;
 pub use peek::{peek_initial_sni, peek_initial_sni_datagrams};
 // Re-export so callers can name the peek's return type from `quic` directly.
 pub use crate::tls::ClientHelloInfo;
-pub use server::{DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_HALF_OPEN, QuicServer};
+pub use server::{ClosedConnection, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_HALF_OPEN, QuicServer};
 pub use stream::StreamId;
 pub use transport_params::{PreferredAddress, TransportParameters};
