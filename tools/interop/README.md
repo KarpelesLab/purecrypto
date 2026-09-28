@@ -17,8 +17,9 @@ tools/interop/run.sh --peer openssl-src --list
 Output is one `PASS|FAIL|SKIP <case> [reason]` line per case and a summary;
 the exit status is non-zero on any FAIL, and a failed case dumps every log
 from its work directory. Every process runs under `timeout`
-(`INTEROP_TIMEOUT` seconds per client step, default 30), so a hang fails
-its case rather than the CI job. `--keep` preserves the scratch directory.
+(`INTEROP_TIMEOUT` seconds per client step, default 30; three times that in
+the `loss` cases, where every lost flight costs a retransmission backoff),
+so a hang fails its case rather than the CI job. `--keep` preserves the scratch directory.
 
 The peers in CI: `.github/workflows/interop.yml` runs one job per adapter.
 
@@ -93,7 +94,8 @@ and `secp256r1mlkem768` are left out, and the DTLS 1.2 suite is the
 | `alpn` | ALPN selects `h2` |
 | `large-chain` | the > 16 KiB chain: dozens of handshake fragments across datagrams |
 | `mtu` | the same chain with the purecrypto side at `-mtu 512` |
-| `loss` | a handshake through `lossy-udp.py`, a relay dropping 20% of the datagrams each way (seeded, so it reproduces): ACK-driven retransmission (RFC 9147 §7) on DTLS 1.3 with the large chain, whole-flight retransmission (RFC 6347 §4.2.4) on DTLS 1.2 with a plain one; only the handshake and its parameters are checked, since the datagram carrying the data or the close_notify may be the dropped one |
+| `loss` | a handshake through `lossy-udp.py`, a relay dropping 20% of the datagrams each way (seeded, so it reproduces): ACK-driven retransmission (RFC 9147 §7) on DTLS 1.3 with the large chain, whole-flight retransmission (RFC 6347 §4.2.4) on DTLS 1.2 with a plain one; only the handshake and its parameters are checked, since the datagram carrying the data or the close_notify may be the dropped one (the purecrypto client asks again, `-resend 3`, as the peers' tools do; a peer client's exit status is not demanded). `LOSSY_SEED=N` picks another pattern than the default, `LOSSY_PERCENT` another rate; `LOSSY_TRACE=1` logs every datagram with the headers of its records to `relay.err`, `LOSSY_DROP` drops named datagrams (see `lossy-udp.py`) |
+| `loss-final` | the same relay dropping named datagrams only: the **last flight** of the handshake — the DTLS 1.3 client's Finished, the DTLS 1.3 server's ACK for it, the DTLS 1.2 final flights — lost when the other side's retransmission backoff has grown to several seconds (`final_flight_drops` in `run.sh` has the pattern per version and role). The side that finished first must keep retransmitting / answering retransmissions until the other has finished too (RFC 9147 §5.8.1, RFC 6347 §4.2.4) and must not say goodbye before; data and close_notify are checked as in any other case |
 | `resume`, `0rtt`, `mtls`, `cid` | *SKIP: purecrypto's DTLS engines have no resumption, 0-RTT, client certificates or RFC 9146 connection IDs* |
 
 Adapters without `protos` are TLS-only and see no DTLS case. The peer

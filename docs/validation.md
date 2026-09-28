@@ -551,6 +551,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | Chain > 16 KiB | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
   | Chain > 16 KiB at a 512-byte MTU | — | ✅ / ✅ | ✅ / ✅ |
   | Handshake over a path dropping 20 % of datagrams | — | ✅ / ✅ (large chain) | ✅ / ✅ |
+  | The last flight of the handshake lost (`loss-final`) | — | ✅ / ✅ (large chain) | ✅ / ✅ |
   | RFC 9146 connection IDs | — | ⏭ purecrypto does not implement them | ⏭ |
   | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ | — | — |
   | `close_notify` from the peer | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
@@ -574,6 +575,39 @@ update with the commands in `tools/wycheproof/README.md`.
   HelloRetryRequest / KeyUpdate accessors through `Connection`, and
   `key_exchange_groups` / `key_shares` (the DTLS 1.3 client used to share
   every group, the servers to select from a fixed order).
+
+  A fifth showed up as a flake of the lossy case (5 of 30 relay seeds against
+  the wolfSSL server: `SSL_accept error 6, peer sent close notify
+  alert`), and was the driver's, not the engines': **the side that
+  finishes the handshake first stopped caring whether the other side
+  finished at all**. The relay's packet trace (`LOSSY_TRACE=1`; times in
+  ms, `e2` the handshake epoch, `e3` the application one):
+
+  ```text
+   9328 drop c->s #25 (66 bytes) enc/e2/61     the client's Finished: lost
+   9328 pass c->s #27 (39 bytes) enc/e3/34     its application data (discarded: the server is in its handshake)
+  11344 pass c->s #28 (24 bytes) enc/e3/19     close_notify, 2 s of silence later -> SSL_accept fails
+  12352 pass c->s #29 (66 bytes) enc/e2/61     the Finished again: 3 s late, and too late
+  ```
+
+  The DTLS 1.3 client engine did keep its Finished in the retransmission
+  set until the server's ACK (RFC 9147 §5.8.1, §7), but `s_client`
+  restarted the clock it drives the engine with at the end of the
+  handshake, so a timer armed at "3 s" on the handshake's clock fired 3 s
+  into the data phase instead of 1 s after the Finished; and nothing told
+  it that a flight was still unacknowledged, so after `-read_timeout` of
+  silence it sent its close_notify. The mirror image failed the wolfSSL
+  client (`wolfSSL_connect error 6, peer sent close notify alert`):
+  `s_server`'s ACK for the client's Finished was lost, and its idle
+  close_notify went out between two retransmissions of that Finished.
+  `Connection::handshake_flight_pending` now says that the peer may still
+  be in its handshake and `Connection::set_now` gives the engine the time
+  its timers are armed from; a DTLS 1.3 client holds a close_notify back
+  until its Finished is acknowledged, the servers send their final flight
+  (DTLS 1.2) or final ACK (DTLS 1.3) once more ahead of an early
+  close_notify, and the two commands drive the connection until the
+  handshake is over on both sides. The `loss-final` cases lose exactly
+  those datagrams, deterministically.
 - **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server

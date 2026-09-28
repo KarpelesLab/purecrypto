@@ -72,9 +72,17 @@ if [ "$LIST" = 0 ]; then
     esac
     export PURECRYPTO
 fi
-STEP_TIMEOUT=${INTEROP_TIMEOUT:-30}
-SERVER_TIMEOUT=$((STEP_TIMEOUT * 4))
-export STEP_TIMEOUT SERVER_TIMEOUT PEER
+BASE_TIMEOUT=${INTEROP_TIMEOUT:-30}
+# set_timeouts N: a step may take N times the base timeout. 1 everywhere
+# but in the `loss` cases, where every lost flight costs a retransmission
+# backoff of 1, 2, 4, 8 ... seconds.
+set_timeouts() {
+    STEP_TIMEOUT=$((BASE_TIMEOUT * $1))
+    SERVER_TIMEOUT=$((STEP_TIMEOUT * 4))
+    export STEP_TIMEOUT SERVER_TIMEOUT
+}
+set_timeouts 1
+export PEER
 
 if command -v timeout >/dev/null 2>&1; then
     TO=timeout
@@ -106,9 +114,12 @@ FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp rpk
 # only what was lost, a plain one on DTLS 1.2, which retransmits whole
 # flights; only the handshake and its parameters are checked, since a
 # datagram carrying application data or the close_notify may be the one
-# dropped), `cid` (RFC 9146 connection IDs).
+# dropped), `loss-final` (the same relay dropping named datagrams instead
+# of random ones: the LAST flight of the handshake — see `final_flight_drops`
+# — which leaves one side finished and the other still in its handshake;
+# the whole exchange is checked), `cid` (RFC 9146 connection IDs).
 DTLS_GROUPS="x25519 p256 p384 x25519mlkem768"
-DTLS_FEATS="resume 0rtt hrr keyupdate keyupdate-peer alpn large-chain mtu loss mtls cid"
+DTLS_FEATS="resume 0rtt hrr keyupdate keyupdate-peer alpn large-chain mtu loss loss-final mtls cid"
 
 # The protocols the adapter speaks (`protos`, optional): TLS only unless it
 # says otherwise.
@@ -173,11 +184,11 @@ matrix() {
                         done ;;
                     large-chain|mtu)
                         echo "proto=$proto role=$role cert=large group=x25519 suite=aes128gcm feat=$feat" ;;
-                    loss)
+                    loss|loss-final)
                         if [ $proto = dtls13 ]; then
-                            echo "proto=$proto role=$role cert=large group=x25519 suite=aes128gcm feat=loss"
+                            echo "proto=$proto role=$role cert=large group=x25519 suite=aes128gcm feat=$feat"
                         else
-                            echo "proto=$proto role=$role cert=p256 group=x25519 suite=aes128gcm feat=loss"
+                            echo "proto=$proto role=$role cert=p256 group=x25519 suite=aes128gcm feat=$feat"
                         fi ;;
                     *)
                         echo "proto=$proto role=$role cert=p256 group=x25519 suite=aes128gcm feat=$feat" ;;
@@ -380,7 +391,7 @@ pc_supports() {
             resume|0rtt) skip "purecrypto's DTLS engines have no session resumption (nor 0-RTT)" ;;
             mtls) skip "purecrypto's DTLS servers do not support client certificates" ;;
             cid) skip "purecrypto does not implement RFC 9146 connection IDs" ;;
-            loss) command -v python3 >/dev/null 2>&1 || skip "no python3 for the lossy relay" ;;
+            loss|loss-final) command -v python3 >/dev/null 2>&1 || skip "no python3 for the lossy relay" ;;
         esac
         if [ "$CASE_PROTO" = dtls12 ]; then
             case $CASE_FEAT in
@@ -417,6 +428,9 @@ pc_client_args() {
             keyupdate) a="$a -key_update" ;;
             alpn) a="$a -alpn h2,http/1.1" ;;
             mtu) a="$a -mtu 512" ;;
+            # Application data is not retransmitted by DTLS: the client
+            # asks again when no answer comes, as the peers' tools do.
+            loss) a="$a -resend 3" ;;
         esac
         echo "$a"
         return
@@ -635,13 +649,58 @@ stop_servers() {
     fi
 }
 
+# final_flight_drops: what the relay drops in a `loss-final` case (its
+# LOSSY_DROP syntax), so that the last flight of the handshake is lost
+# while its sender already counts the handshake as complete — on DTLS 1.3
+# at a moment when the retransmission backoff has grown past the idle time
+# after which the purecrypto tools used to say goodbye: the close_notify
+# then reached a peer still inside its handshake, which failed it (the
+# wolfSSL server: "SSL_accept error, peer sent close notify alert").
+#
+#   DTLS 1.3, purecrypto client: the server's flight is lost for 3 s (two
+#     transmissions: the client retransmits its ClientHello meanwhile, and
+#     the server's backoff reaches 4 s), then the client's Finished is lost
+#     once. The client must retransmit it one second later (RFC 9147
+#     §5.8.1, §5.8.2) and say nothing until the server has acknowledged it.
+#   DTLS 1.3, purecrypto server: its ACK for the client's Finished is lost
+#     twice, and so is the client's second retransmission of the Finished:
+#     the next comes 4 s later. The server must still be there to
+#     acknowledge it (RFC 9147 §5.8.1: "the server MUST respond to
+#     retransmission of the client's final flight with a retransmit of its
+#     ACK").
+#   DTLS 1.2, purecrypto client: the client's Finished is lost once, after
+#     the server's flight was lost for 3 s; the whole flight is
+#     retransmitted on the timer (RFC 6347 §4.2.4).
+#   DTLS 1.2, purecrypto server: its Finished is lost twice, and so is the
+#     client's second retransmission of its own; the server must still be
+#     there for the third, and answer it with its final flight again.
+final_flight_drops() {
+    case $CASE_PROTO:$CASE_ROLE in
+        dtls13:peer-server) echo 's->c@e2~3000,c->s@e2>=60#1' ;;
+        dtls13:peer-client) echo 's->c@e3#1-2,c->s@e2>=60#3' ;;
+        dtls12:peer-server) echo 's->c@e0>=100~3000,c->s@e1#1' ;;
+        dtls12:peer-client) echo 's->c@e1#1-2,c->s@e1#3' ;;
+    esac
+}
+
 # start_lossy_relay: for the `loss` cases, a relay in front of the server
 # on PORT that drops 20% of the datagrams each way; PORT then points at it.
+# LOSSY_SEED picks another pseudo-random pattern than the default (1),
+# LOSSY_PERCENT another rate; LOSSY_DROP and LOSSY_TRACE are the relay's
+# own (see lossy-udp.py): named datagrams to drop, and a packet trace in
+# relay.err.
+#
+# `loss-final` drops no datagram at random, only those of
+# `final_flight_drops`.
 start_lossy_relay() {
-    local rport attempt
+    local rport attempt percent=${LOSSY_PERCENT:-20} drops=${LOSSY_DROP:-}
+    if [ "$CASE_FEAT" = loss-final ]; then
+        percent=0
+        drops=$(final_flight_drops)
+    fi
     for attempt in 1 2 3 4 5; do
         rport=$(random_port)
-        python3 "$HERE/lossy-udp.py" "$rport" "$PORT" 20 >"$WORK/relay.out" 2>"$WORK/relay.err" &
+        LOSSY_DROP=$drops python3 "$HERE/lossy-udp.py" "$rport" "$PORT" "$percent" "${LOSSY_SEED:-1}" >"$WORK/relay.out" 2>"$WORK/relay.err" &
         echo $! >"$WORK/relay.pid"
         sleep 0.3
         if kill -0 "$(cat "$WORK/relay.pid")" 2>/dev/null; then
@@ -723,6 +782,7 @@ run_case() {
         esac
     done
     export CASE_PROTO CASE_ROLE CASE_CERT CASE_GROUP CASE_SUITE CASE_FEAT
+    case $CASE_FEAT in loss|loss-final) set_timeouts 3 ;; *) set_timeouts 1 ;; esac
     mkdir -p "$WORK"
     # What the client (whichever side) sends, and what a peer server sends
     # back from its stdin. The record_size_limit case sends more than one
@@ -761,9 +821,9 @@ run_case() {
         fi
         PORT=$(cat "$WORK/server.port")
         export PORT
-        if [ "$CASE_FEAT" = loss ]; then
-            start_lossy_relay || { REASON="lossy relay did not start"; return 1; }
-        fi
+        case $CASE_FEAT in loss|loss-final)
+            start_lossy_relay || { REASON="lossy relay did not start"; return 1; } ;;
+        esac
         rc=0
         # shellcheck disable=SC2046
         "$TO" "$STEP_TIMEOUT" "$PURECRYPTO" s_client $(pc_client_args) \
@@ -777,13 +837,17 @@ run_case() {
         REASON=$("${ADAPTER[@]}" verify) || { REASON="$PEER: $REASON"; return 1; }
     else
         start_pc_server || { REASON="purecrypto s_server did not start"; return 1; }
-        if [ "$CASE_FEAT" = loss ]; then
-            start_lossy_relay || { REASON="lossy relay did not start"; return 1; }
-        fi
+        case $CASE_FEAT in loss|loss-final)
+            start_lossy_relay || { REASON="lossy relay did not start"; return 1; } ;;
+        esac
         rc=0
         "${ADAPTER[@]}" client >"$WORK/adapter-client.log" 2>&1 || rc=$?
         wait_pc_server
-        if [ "$rc" -ne 0 ]; then
+        # Under `loss` only the handshake is checked (by `verify`, from the
+        # summary the peer printed after it): its client's exit status is
+        # about the data exchange, which fails when the message or its
+        # echo was dropped once too often. A timeout stays a failure.
+        if [ "$rc" -ne 0 ] && { [ "$CASE_FEAT" != loss ] || [ "$rc" = 124 ]; }; then
             REASON="peer client exited $rc"
             return 1
         fi
