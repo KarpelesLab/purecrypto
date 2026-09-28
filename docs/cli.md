@@ -488,12 +488,23 @@ default record size is 1200 bytes; override with `-mtu`.
 ## QUIC: `q_client` / `q_server`
 
 QUIC v1 (RFC 9000) over UDP, secured by TLS 1.3 keys. Use the dedicated
-commands or pass `-quic` to `s_client` / `s_server`. The client drives one
-bidirectional stream (stdin to server, reply to stdout).
+commands or pass `-quic` to `s_client` / `s_server`. The two commands speak
+a small echo protocol that the interop matrix in `tools/quic-interop/` also
+implements on the quic-go side: the server echoes every client-initiated
+bidirectional stream, answers every client-initiated unidirectional stream
+on a unidirectional stream of its own, and echoes every DATAGRAM frame (RFC
+9221); the client sends stdin on one stream (or as DATAGRAMs) and writes the
+reply to stdout. ALPN is mandatory (RFC 9001 §8.1).
 
 ```text
-purecrypto q_client -connect host:port [-alpn h3] [-insecure] [-servername name] [-CAfile bundle.pem] [-keylogfile keys.log] [-quiet]
-purecrypto q_server -cert cert.pem -key key.pem -accept host:port [-alpn h3] [-www] [-retry] [-keylogfile keys.log] [-quiet]
+purecrypto q_client -connect host:port -alpn proto [-insecure] [-servername name] [-CAfile bundle.pem]
+                    [-uni | -datagram] [-exchanges N] [-pause ms] [-migrate] [-switch-cid]
+                    [-reconnect [-early-data]] [-key-update] [-ciphersuites list] [-key-shares groups]
+                    [-close-code N] [-close-reason text] [-idle-timeout ms] [-linger ms]
+                    [-timeout secs] [-keylogfile keys.log] [-quiet]
+purecrypto q_server -cert cert.pem -key key.pem -accept host:port -alpn proto [-www] [-retry]
+                    [-early-data] [-key-update] [-switch-cid] [-ciphersuites list] [-idle-timeout ms]
+                    [-reset-key hex32] [-naccept N] [-timeout secs] [-keylogfile keys.log] [-quiet]
 ```
 
 ```sh
@@ -501,8 +512,57 @@ purecrypto q_server -accept 0.0.0.0:4434 -cert cert.pem -key key.pem -alpn h3
 purecrypto q_client -connect localhost:4434 -alpn h3
 ```
 
-`-retry` makes the server validate client addresses with a Retry packet
-before committing state.
+Both print what the handshake negotiated on stderr (`negotiated: alpn=…
+suite=… resumed=… early_data=… retry=… ecn=…`), one line per stream with
+the byte count and SHA-256 of what arrived, and how the connection ended
+(`closed: application error 0x0 () by peer`, `closed: idle timeout`,
+`closed: stateless reset`).
+
+Client options:
+
+- `-uni` sends stdin on a unidirectional stream and prints the server's
+  unidirectional reply; `-datagram` sends each line of stdin as one DATAGRAM
+  frame and prints the echoes (unreliable: it stops waiting after 2 s).
+- `-exchanges N` repeats the exchange on fresh streams, `-pause ms` apart.
+  `-migrate` rebinds to a new UDP socket between exchanges (a client
+  migration, RFC 9000 §9, probed with a PATH_CHALLENGE); `-switch-cid`
+  moves to a spare server-issued connection ID and retires the old one
+  (§5.1.2).
+- `-reconnect` connects a second time with the first connection's session
+  ticket; with `-early-data` the second connection's data goes out as 0-RTT
+  when the ticket permits it. The log reports `resumed=yes` and
+  `early_data=accepted|rejected|offered|none`.
+- `-key-update` initiates a 1-RTT key update once the handshake is
+  confirmed and reports when the peer's reply in the new phase confirms it.
+- `-ciphersuites` restricts the offered TLS 1.3 suites (OpenSSL names,
+  `:`-separated); `-key-shares` restricts the groups a `key_share` is sent
+  for (`x25519`, `secp256r1`, `secp384r1`, `X25519MLKEM768`).
+- `-close-code N` / `-close-reason text` set the application error the
+  final CONNECTION_CLOSE carries (default `0`). `-idle-timeout ms` sets the
+  advertised `max_idle_timeout` (default 60 000). `-linger ms` keeps the
+  connection open and idle after the exchanges until the peer closes it or
+  the time elapses, so an idle timeout or a stateless reset can be observed.
+
+Server options:
+
+- `-retry` validates client addresses with a Retry packet before committing
+  state (§8.1.2). `-early-data` accepts 0-RTT on resumed connections (the
+  echo has nothing to lose to a replay; do not copy this into a server whose
+  early requests are not idempotent). Session tickets are always issued
+  (a fresh ticket key per process).
+- `-key-update` initiates a key update on every connection once the client
+  has acknowledged HANDSHAKE_DONE; `-switch-cid` switches to a spare
+  client-issued connection ID.
+- `-reset-key hex32` fixes the stateless-reset key (§10.3.1) so a restarted
+  server still resets the connections its predecessor held; random
+  otherwise.
+- `-naccept N` exits after N connections have ended (default 1; `0` keeps
+  serving until `-timeout secs`, default 30, elapses). `-www` answers the
+  first bidirectional stream with a canned body instead of echoing.
+
+Only the `s_client -quic` direction is available from OpenSSL; both roles
+are exercised against quic-go by `tools/quic-interop/run.sh` (see
+[`validation.md`](validation.md)).
 
 ## Cookbook
 

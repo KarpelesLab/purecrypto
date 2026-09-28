@@ -71,11 +71,23 @@ impl ServerProc {
     /// test with its captured stderr if it has not within
     /// [`EXIT_DEADLINE`](Self::EXIT_DEADLINE) — so a client failure can never
     /// leave the test blocked forever in `wait()`.
-    fn finish(mut self) {
+    fn finish(self) {
+        let _ = self.finish_with_stderr();
+    }
+
+    /// Like [`finish`](Self::finish), returning everything the server wrote
+    /// to stderr after its banner.
+    fn finish_with_stderr(mut self) -> String {
         let start = std::time::Instant::now();
         loop {
             match self.child.try_wait().expect("poll server") {
-                Some(_) => return,
+                Some(_) => {
+                    // The drain thread finishes once the pipe closes; give
+                    // it a moment to store the tail.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let stderr = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+                    return stderr.clone();
+                }
                 None if start.elapsed() > Self::EXIT_DEADLINE => {
                     let _ = self.child.kill();
                     let _ = self.child.wait();
@@ -5253,6 +5265,123 @@ fn q_client_q_server_roundtrip() {
     assert!(
         out.contains("hello from purecrypto q_server"),
         "expected -www body in q_client stdout, got: {out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The QUIC demo protocol beyond the single bidi echo, over a real UDP
+/// loopback: unidirectional streams, DATAGRAM frames, a client-initiated key
+/// update and connection-ID switch, and a second connection resuming the
+/// first one's ticket with 0-RTT — the same flags the interop matrix
+/// (`tools/quic-interop/run.sh`) drives against quic-go and OpenSSL.
+#[test]
+fn q_client_q_server_streams_datagrams_and_resumption() {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let dir = std::env::temp_dir().join(format!("pc_quic_features_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    let mut rng = OsRng;
+    let key = Ed25519PrivateKey::generate(&mut rng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ed25519(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
+
+    // Five connections: bidi, uni, datagram, and the two of `-reconnect`.
+    let server_proc = spawn_server_wait_listening(&[
+        "q_server",
+        "-accept",
+        "127.0.0.1:0",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-alpn",
+        "pc-echo",
+        "-early-data",
+        "-naccept",
+        "5",
+        "-timeout",
+        "80",
+    ]);
+    let connect = format!("127.0.0.1:{}", server_proc.port);
+    let base = [
+        "q_client",
+        "-connect",
+        &connect,
+        "-insecure",
+        "-alpn",
+        "pc-echo",
+    ];
+    let client = |extra: &[&str], stdin: &[u8]| {
+        let mut args: Vec<&str> = base.to_vec();
+        args.extend_from_slice(extra);
+        run_capture(&args, stdin)
+    };
+
+    let (out, err, ok) = client(&["-key-update", "-switch-cid"], b"bidi echo\n");
+    assert!(ok, "bidi: {err}");
+    assert_eq!(out, "bidi echo\n");
+    assert!(err.contains("negotiated: alpn=pc-echo suite="), "{err}");
+    assert!(err.contains("key update confirmed: phase 1"), "{err}");
+    assert!(
+        err.contains("switched to a new destination connection id"),
+        "{err}"
+    );
+
+    let (out, err, ok) = client(&["-uni"], b"uni echo\n");
+    assert!(ok, "uni: {err}");
+    assert_eq!(out, "uni echo\n");
+    assert!(err.contains("exchange 1: uni 9 bytes sent"), "{err}");
+
+    let (out, err, ok) = client(&["-datagram"], b"one\ntwo\n");
+    assert!(ok, "datagram: {err}");
+    let mut lines: Vec<&str> = out.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["one", "two"], "{err}");
+
+    let (out, err, ok) = client(&["-reconnect", "-early-data"], b"resumed\n");
+    assert!(ok, "reconnect: {err}");
+    assert_eq!(out, "resumed\nresumed\n");
+    assert!(
+        err.contains("session ticket received (0-RTT permitted)"),
+        "{err}"
+    );
+    assert!(err.contains("resumed=yes early_data=accepted"), "{err}");
+
+    let server_err = server_proc.finish_with_stderr();
+    assert!(
+        server_err.contains("resumed=yes early_data=accepted"),
+        "server must report the accepted 0-RTT: {server_err}"
+    );
+    assert!(
+        server_err.contains("answering on uni"),
+        "server must answer the uni stream: {server_err}"
+    );
+    assert_eq!(
+        server_err.matches("echoed datagram").count(),
+        2,
+        "{server_err}"
+    );
+    assert!(
+        server_err.contains("served 5 connection(s)"),
+        "{server_err}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
