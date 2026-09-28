@@ -51,6 +51,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$PEER" ] || { echo "--peer NAME is required" >&2; exit 2; }
+# An adapter is an executable file; a directory of that name (a peer tool's
+# sources, e.g. peers/apple/) goes with the peers/NAME.sh next to it.
 if [ -f "$HERE/peers/$PEER" ] && [ -x "$HERE/peers/$PEER" ]; then
     ADAPTER=("$HERE/peers/$PEER")
 elif [ -f "$HERE/peers/$PEER.sh" ]; then
@@ -331,7 +333,10 @@ pc_server_args() {
     if [ "$CASE_PROTO" = tls12 ]; then
         a="$a -min_protocol TLSv1.2"
     else
-        a="$a -groups $(pc_group "$CASE_GROUP")"
+        # The group and the suite are both pinned from this side too: a
+        # peer client that cannot narrow its offer still lands on the
+        # case's pair, or fails the handshake.
+        a="$a -groups $(pc_group "$CASE_GROUP") -ciphersuites $(pc_suite "$CASE_SUITE")"
     fi
     case $CASE_FEAT in
         resume) a="$a -naccept 2" ;;
