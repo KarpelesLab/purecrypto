@@ -932,6 +932,11 @@ pub struct QuicConnection {
     /// Server-only — some packet carrying HANDSHAKE_DONE was acknowledged;
     /// later losses of other copies need no retransmission.
     handshake_done_acked: bool,
+    /// A PING is owed in the next 1-RTT packet: set by
+    /// [`Self::initiate_key_update`] so the new key phase reaches the peer
+    /// (and its acknowledgment confirms the update, RFC 9001 §6.2) even on
+    /// an otherwise idle connection.
+    ping_pending: bool,
 }
 
 enum EngineSide {
@@ -1149,6 +1154,7 @@ impl QuicConnection {
             handshake_confirmed: false,
             handshake_done_pending: false,
             handshake_done_acked: false,
+            ping_pending: false,
         };
 
         // RFC 9001 §4.6.1 — with 0-RTT in play the client must apply the
@@ -1286,6 +1292,7 @@ impl QuicConnection {
             handshake_confirmed: false,
             handshake_done_pending: false,
             handshake_done_acked: false,
+            ping_pending: false,
         })
     }
 
@@ -3646,9 +3653,16 @@ impl QuicConnection {
     /// Initiates a 1-RTT key update (RFC 9001 §6.1).
     ///
     /// On success the next outbound short-header packet carries the
-    /// flipped Key Phase bit (RFC 9001 §6.1). Returns
+    /// flipped Key Phase bit (RFC 9001 §6.1) — and there will be one: an
+    /// ack-eliciting PING is queued if nothing else is pending, so the peer
+    /// learns of the update at once and its acknowledgment confirms it
+    /// ([`Self::key_update_pending`] turns `false`) even on an idle
+    /// connection. Returns
     /// [`Error::InappropriateState`] if:
-    /// * the handshake hasn't completed yet,
+    /// * the handshake hasn't been confirmed yet — on a client, HANDSHAKE_DONE
+    ///   has not arrived; on a server, the packet carrying HANDSHAKE_DONE has
+    ///   not been acknowledged, so the client may not have confirmed it either
+    ///   (see below),
     /// * a previously-initiated update is still unconfirmed (RFC 9001
     ///   §6.1 forbids back-to-back updates), or
     /// * the connection has been closed.
@@ -3694,6 +3708,11 @@ impl QuicConnection {
             .crypto
             .at_mut(Level::OneRtt)
             .tx_phase_pending_confirm = true;
+        // RFC 9001 §6.1 flips the phase on the *next* packet; on an idle
+        // connection there is none, so the peer never learns of the update
+        // and it is never confirmed. Owe an ack-eliciting PING so the new
+        // phase goes out now and the peer's acknowledgment completes it.
+        self.ping_pending = true;
         Ok(())
     }
 
@@ -4722,6 +4741,9 @@ impl QuicConnection {
         }
         // RFC 9002 §6.2.4 — a PTO probe still owed (PING if need be).
         if self.probe_ping_owed() {
+            return true;
+        }
+        if self.ping_pending {
             return true;
         }
         false
@@ -6190,12 +6212,14 @@ impl QuicConnection {
                 .endpoint
                 .loss
                 .probe_needs_ping(pn_space_of_level(level));
+        let has_ping = matches!(level, Level::OneRtt) && self.ping_pending;
         if !has_crypto
             && !has_pending_ack
             && !has_streams
             && !has_path_or_cid
             && !has_datagrams
             && !has_probe_ping
+            && !has_ping
         {
             return None;
         }
@@ -6841,6 +6865,16 @@ impl QuicConnection {
             Frame::Ping.encode(&mut out);
             meta.ack_eliciting = true;
             meta.in_flight = true;
+        }
+        // A key update just initiated wants an ack-eliciting packet in the
+        // new phase; anything ack-eliciting already here serves.
+        if matches!(level, Level::OneRtt) && full && self.ping_pending {
+            if !meta.ack_eliciting {
+                Frame::Ping.encode(&mut out);
+                meta.ack_eliciting = true;
+                meta.in_flight = true;
+            }
+            self.ping_pending = false;
         }
 
         if out.is_empty() {
@@ -11856,6 +11890,35 @@ mod tests {
         let (n3, _fin) = c.read(cid, &mut buf3).expect("client read 2");
         assert!(n3 > 0, "client must see phase-0 reply");
         assert_eq!(&buf3[..n3], b"phase-0-again");
+    }
+
+    /// RFC 9001 §6.1 / §6.2 — on an idle connection the flipped phase would
+    /// never reach the peer (no packet to carry it) and the update would
+    /// never be confirmed. `initiate_key_update` therefore owes a PING: the
+    /// next datagram exists, carries the new phase, and the peer's ACK in
+    /// its own new phase confirms the update within one round trip.
+    #[test]
+    fn key_update_on_idle_connection_sends_a_ping_and_confirms() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..6 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert!(c.pop_datagram().is_empty(), "quiescent before the update");
+        c.initiate_key_update()
+            .expect("confirmed client may update");
+        assert!(c.key_update_pending());
+        assert_eq!(c.key_phase(), 1);
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty(), "the update goes out on its own");
+        assert_eq!(dg[0] & 0x80, 0, "a short-header packet");
+        s.feed_datagram(&dg).expect("server feed");
+        assert_eq!(s.key_phase(), 1, "the peer followed the update");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert!(!c.key_update_pending(), "acknowledged in the new phase");
+        assert!(c.pop_datagram().is_empty(), "exactly one PING was owed");
     }
 
     /// Test — calling `initiate_key_update` twice without a peer
