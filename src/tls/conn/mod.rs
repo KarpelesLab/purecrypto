@@ -8009,6 +8009,63 @@ mod tls12_loopback_tests {
         );
     }
 
+    /// RFC 5746 §3.6: a client that signals secure renegotiation with the
+    /// `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` pseudo-suite alone — no
+    /// `renegotiation_info` extension, as OpenSSL clients before 3.2 do on
+    /// an initial handshake — must still get an empty `renegotiation_info`
+    /// back in the ServerHello; such a client otherwise aborts with "unsafe
+    /// legacy renegotiation disabled".
+    #[test]
+    fn tls12_server_echoes_renegotiation_info_for_the_scsv() {
+        let (server_config, _cert_der) = rsa_server12();
+        let srng = HmacDrbg::<Sha256>::new(b"scsv-echo-s", b"nonce", &[]);
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"scsv-echo-c", b"nonce", &[]);
+        let mut random = [0u8; 32];
+        crng.fill_bytes(&mut random);
+        let ch = ClientHello {
+            legacy_version: 0x0303,
+            random,
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                CipherSuite(0x00ff),
+            ],
+            extensions: alloc::vec![
+                ext::server_name("loopback.example"),
+                ext::signature_algorithms(),
+                ext::supported_groups_list(&[NamedGroup::X25519]),
+                ext::ec_point_formats(),
+                ext::extended_master_secret_empty(),
+            ],
+        }
+        .encode();
+        let mut rec: Vec<u8> = Vec::new();
+        super::super::codec::write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &ch,
+        )
+        .unwrap();
+        server.read_tls(&rec);
+        server.process_new_packets().unwrap();
+
+        let out = server.write_tls();
+        let parsed = read_record(&out).unwrap().unwrap();
+        let mut cur = ReadCursor::new(parsed.fragment);
+        let (ty, body) = read_handshake(&mut cur).unwrap();
+        assert_eq!(ty, hs_type::SERVER_HELLO);
+        let sh = ServerHello::decode(body).unwrap();
+        let reneg = ext::find(
+            &sh.extensions,
+            crate::tls::codec::ExtensionType::RENEGOTIATION_INFO,
+        )
+        .expect("renegotiation_info echoed for the SCSV");
+        assert_eq!(reneg, &[0u8], "empty renegotiated_connection");
+    }
+
     /// A TLS 1.2 client opted into the strict policy (via
     /// `with_accept_downgrade_sentinel(false)`) MUST abort with
     /// `IllegalParameter` when the `server_random` tail is the RFC 8446

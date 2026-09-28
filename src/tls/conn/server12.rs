@@ -1383,12 +1383,24 @@ impl<R: RngCore> ServerConnection12<R> {
             self.peer_offered_ocsp_staple = true;
         }
 
-        // RFC 5746 §3.6: echo `renegotiation_info` iff the peer sent it.
+        // RFC 5746 §3.6: echo `renegotiation_info` iff the peer signalled
+        // secure renegotiation — through the extension, or through the
+        // `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` pseudo-suite (0x00FF), which
+        // is what OpenSSL clients before 3.2 send on an initial handshake
+        // instead of the extension. A strict client that signalled either
+        // way and gets no echo aborts with "unsafe legacy renegotiation
+        // disabled".
         if let Some(reneg) = ext::find(&ch.extensions, ExtensionType::RENEGOTIATION_INFO) {
             let inner = ext::parse_renegotiation_info(reneg)?;
             if !inner.is_empty() {
                 return Err(Error::HandshakeFailure);
             }
+            self.peer_offered_reneg_info = true;
+        }
+        if ch
+            .cipher_suites
+            .contains(&crate::tls::codec::CipherSuite(0x00ff))
+        {
             self.peer_offered_reneg_info = true;
         }
 
