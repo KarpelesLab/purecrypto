@@ -93,6 +93,11 @@ pub(crate) struct ServerConfig12Internal {
     /// Empty (the default) ignores the client's offer. Forwarded from
     /// [`crate::tls::Config::alpn_protocols`].
     alpn_protocols: Vec<Vec<u8>>,
+    /// ECDHE groups this server accepts, in ITS preference order: the first
+    /// listed group the client offered is used for `ServerKeyExchange`.
+    /// Defaults to `[X25519, SECP256R1, SECP384R1]`. Forwarded from
+    /// [`crate::tls::Config::key_exchange_groups`].
+    pub(crate) groups: Vec<NamedGroup>,
     /// Allowed signature algorithms (reserved for client-auth in a future
     /// commit; currently unused on the server side because we don't accept
     /// client certificates yet).
@@ -123,9 +128,20 @@ impl ServerConfig12Internal {
             require_cookie_exchange: true,
             require_ems: true,
             alpn_protocols: Vec::new(),
+            groups: alloc::vec![
+                NamedGroup::X25519,
+                NamedGroup::SECP256R1,
+                NamedGroup::SECP384R1,
+            ],
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
         }
+    }
+
+    /// Restricts and orders the ECDHE groups (see [`Self::groups`]).
+    pub fn with_groups(mut self, groups: Vec<NamedGroup>) -> Self {
+        self.groups = groups;
+        self
     }
 
     /// New configuration presenting `cert_chain` and signing with the RSA
@@ -336,6 +352,13 @@ pub struct DtlsServerConnection12<R: RngCore> {
     /// ALPN protocol selected from the ClientHello and echoed in the
     /// ServerHello (RFC 7301), if any.
     alpn_negotiated: Option<Vec<u8>>,
+    /// The ECDHE group selected for `ServerKeyExchange`, once the
+    /// ClientHello is committed.
+    negotiated_group: Option<NamedGroup>,
+    /// The peer's `close_notify` was authenticated.
+    close_notify_received: bool,
+    /// Our `close_notify` went out; no more application data may follow.
+    close_notify_sent: bool,
 }
 
 // The DTLS 1.2 master secret lives for the whole connection (exporters,
@@ -410,6 +433,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             clock_driven: false,
             ems_negotiated: false,
             alpn_negotiated: None,
+            negotiated_group: None,
+            close_notify_received: false,
+            close_notify_sent: false,
         }
     }
 
@@ -430,6 +456,44 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// The ALPN protocol selected from the client's offer, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
+    }
+
+    /// The ECDHE group selected for the `ServerKeyExchange`, once the
+    /// ClientHello is committed.
+    pub(crate) fn negotiated_group(&self) -> Option<NamedGroup> {
+        self.negotiated_group
+    }
+
+    /// `true` once the peer's `close_notify` has been authenticated
+    /// (RFC 5246 §7.2.1).
+    pub fn received_close_notify(&self) -> bool {
+        self.close_notify_received
+    }
+
+    /// Ends the session: queues a `close_notify` alert under the current
+    /// write keys (RFC 6347 §4.1 / RFC 5246 §7.2.1). No application data
+    /// can be sent afterwards, but records from the peer — its own
+    /// `close_notify` in particular — are still read. Idempotent; an error
+    /// before the handshake completes.
+    pub fn send_close_notify(&mut self) -> Result<(), Error> {
+        // Allowed while connected and, since the peer's close_notify must be
+        // answered in kind (RFC 8446 §6.1), after one has closed the session.
+        if !(self.state == State::Connected || self.close_notify_received)
+            || self.write_crypter.is_none()
+        {
+            return Err(Error::InappropriateState);
+        }
+        if self.close_notify_sent {
+            return Ok(());
+        }
+        // RFC 5246 §7.2: `close_notify` is a warning-level (1) alert.
+        let dg = self.encrypt_record_dtls(
+            ContentType::Alert,
+            &[1, AlertDescription::CloseNotify.as_u8()],
+        )?;
+        self.out_dgrams.push(dg);
+        self.close_notify_sent = true;
+        Ok(())
     }
 
     /// RFC 5705 §4 — DTLS 1.2 application-layer Exporter. Computes
@@ -466,7 +530,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// Encrypts application plaintext as a DTLS record. Must be called only
     /// after the handshake completes.
     pub fn send(&mut self, plaintext: &[u8]) -> Result<(), Error> {
-        if self.state != State::Connected {
+        if self.state != State::Connected || self.close_notify_sent {
             return Err(Error::InappropriateState);
         }
         let dg = self.encrypt_record_dtls(ContentType::ApplicationData, plaintext)?;
@@ -728,6 +792,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 let desc = AlertDescription::from_u8(plain[1]);
                 self.state = State::Closed;
                 if desc == AlertDescription::CloseNotify {
+                    self.close_notify_received = true;
                     Ok(())
                 } else {
                     Err(Error::AlertReceived(desc))
@@ -1107,20 +1172,20 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             .copied()
             .find(|p| parsed.cipher_suites.contains(&p.suite) && p.sig_kind == sig_kind)
             .ok_or(Error::HandshakeFailure)?;
-        // Pick the negotiated ECDHE group. Preference is X25519 > P-256,
-        // mirroring `src/tls/conn/server12.rs::on_client_hello_initial`.
+        // Pick the negotiated ECDHE group: the first of this server's
+        // groups (its preference order, default X25519 > P-256 > P-384,
+        // mirroring `src/tls/conn/server12.rs::on_client_hello_initial`)
+        // that the client offered.
         let groups_body = ext::find(&parsed.extensions, ExtensionType::SUPPORTED_GROUPS)
             .ok_or(Error::HandshakeFailure)?;
         let groups = parse_supported_groups(groups_body)?;
-        let group = if groups.contains(&NamedGroup::X25519) {
-            NamedGroup::X25519
-        } else if groups.contains(&NamedGroup::SECP256R1) {
-            NamedGroup::SECP256R1
-        } else if groups.contains(&NamedGroup::SECP384R1) {
-            NamedGroup::SECP384R1
-        } else {
-            return Err(Error::HandshakeFailure);
-        };
+        let group = self
+            .config
+            .groups
+            .iter()
+            .copied()
+            .find(|g| groups.contains(g))
+            .ok_or(Error::HandshakeFailure)?;
 
         // RFC 7627 §5.1: detect the client's EMS offer (DTLS 1.2 inherits
         // the rules from TLS 1.2). Body MUST be empty.
@@ -1178,6 +1243,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // Pin the transcript hash now that the suite is known.
         self.transcript.set_alg(suite.hash);
         self.suite = Some(suite);
+        self.negotiated_group = Some(group);
         self.group = Some(group);
         self.ems_negotiated = ems_negotiated;
         self.alpn_negotiated = alpn_pick;

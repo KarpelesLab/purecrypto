@@ -126,6 +126,13 @@ pub(crate) struct ServerConfig13Internal {
     /// Empty (the default) ignores the client's offer. Forwarded from
     /// [`crate::tls::Config::alpn_protocols`].
     pub alpn_protocols: Vec<Vec<u8>>,
+    /// Key-exchange groups this server accepts, in ITS preference order:
+    /// the first listed group the client offered is selected, and a client
+    /// that offered it without a `key_share` is sent a HelloRetryRequest
+    /// for it (RFC 8446 §4.1.4). Defaults to every implemented group
+    /// (X25519MLKEM768, X25519, P-256, P-384). Forwarded from
+    /// [`crate::tls::Config::key_exchange_groups`].
+    pub groups: Vec<NamedGroup>,
 }
 
 impl ServerConfig13Internal {
@@ -146,6 +153,7 @@ impl ServerConfig13Internal {
             key_log: None,
             max_record_size: record::DEFAULT_MAX_RECORD_SIZE,
             alpn_protocols: Vec::new(),
+            groups: supported_server_groups().to_vec(),
         }
     }
 
@@ -318,6 +326,20 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// Group selected for HelloRetryRequest, if any. When set, CH2 must
     /// carry a `key_share` for this group (RFC 8446 §4.1.4 / §4.2.8).
     hrr_selected_group: Option<NamedGroup>,
+    /// The committed ClientHello followed a HelloRetryRequest (cookie or
+    /// group change) this server sent.
+    hrr_sent: bool,
+    /// The group of the ServerHello `key_share`, once known.
+    negotiated_group: Option<NamedGroup>,
+    /// `KeyUpdate`s sent (see [`Self::sent_key_updates`]).
+    key_updates_sent: u32,
+    /// `KeyUpdate`s received over the life of the connection (the windowed
+    /// `key_updates_received` above is the rate limiter's).
+    key_updates_received_total: u32,
+    /// The peer's `close_notify` was authenticated.
+    close_notify_received: bool,
+    /// Our `close_notify` went out; no more application data may follow.
+    close_notify_sent: bool,
 
     /// Pending ACKs to emit.
     pending_acks: Vec<RecordNumber>,
@@ -393,6 +415,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             alpn_negotiated: None,
             exporter_secret: None,
             hrr_selected_group: None,
+            hrr_sent: false,
+            negotiated_group: None,
+            key_updates_sent: 0,
+            key_updates_received_total: 0,
+            close_notify_received: false,
+            close_notify_sent: false,
             pending_acks: Vec::new(),
             retransmit: Retransmit13::new(),
             last_now: Duration::from_secs(0),
@@ -424,6 +452,63 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// The ALPN protocol selected from the client's offer, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
+    }
+
+    /// `true` when the handshake went through a HelloRetryRequest this
+    /// server sent — the stateless cookie exchange (RFC 9147 §5.1) or a
+    /// key-share group change (RFC 8446 §4.1.4).
+    pub fn hello_retry_request_sent(&self) -> bool {
+        self.hrr_sent
+    }
+
+    /// The key-exchange group the handshake used (the `key_share` the
+    /// ServerHello carried), or `None` before the ServerHello.
+    pub(crate) fn negotiated_group(&self) -> Option<NamedGroup> {
+        self.negotiated_group
+    }
+
+    /// Number of `KeyUpdate` messages this side has sent: explicit
+    /// [`request_key_update`](Self::request_key_update) calls and answers to
+    /// the peer's `update_requested` alike.
+    pub fn sent_key_updates(&self) -> u32 {
+        self.key_updates_sent
+    }
+
+    /// Number of `KeyUpdate` messages received from the peer.
+    pub fn peer_key_updates(&self) -> u32 {
+        self.key_updates_received_total
+    }
+
+    /// `true` once the peer's `close_notify` has been authenticated
+    /// (RFC 8446 §6.1, carried in a protected record on DTLS 1.3).
+    pub fn received_close_notify(&self) -> bool {
+        self.close_notify_received
+    }
+
+    /// Ends the session: queues a `close_notify` alert under the current
+    /// write keys (RFC 9147 §4 / RFC 8446 §6.1). No application data can be
+    /// sent afterwards, but records from the peer — its own `close_notify`
+    /// in particular — are still read. Idempotent; an error before the
+    /// handshake completes.
+    pub fn send_close_notify(&mut self) -> Result<(), Error> {
+        // Allowed while connected and, since the peer's close_notify must be
+        // answered in kind (RFC 8446 §6.1), after one has closed the session.
+        if !(self.state == State::Connected || self.close_notify_received)
+            || self.write_crypter.is_none()
+        {
+            return Err(Error::InappropriateState);
+        }
+        if self.close_notify_sent {
+            return Ok(());
+        }
+        let dg = self.encrypt_protected_record(
+            ContentType::Alert,
+            // RFC 8446 §6: `close_notify` is a warning-level (1) alert.
+            &[1, AlertDescription::CloseNotify.as_u8()],
+        )?;
+        self.out_dgrams.push(dg);
+        self.close_notify_sent = true;
+        Ok(())
     }
 
     /// RFC 8446 §7.5 / RFC 5705 — DTLS 1.3 application-layer Exporter.
@@ -468,7 +553,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// datagram protocol: a record above the path MTU will be fragmented
     /// or dropped by IP, so practical payloads are far smaller.
     pub fn send(&mut self, plaintext: &[u8]) -> Result<(), Error> {
-        if self.state != State::Connected {
+        if self.state != State::Connected || self.close_notify_sent {
             return Err(Error::InappropriateState);
         }
         if plaintext.len() > MAX_PLAINTEXT_LEN {
@@ -825,6 +910,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         .encode();
         self.emit_encrypted_handshake(hs_type::KEY_UPDATE, &body[4..])?;
         self.key_update_pending = true;
+        self.key_updates_sent += 1;
         Ok(())
     }
 
@@ -963,6 +1049,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// flight, which will rotate our keys just the same.
     fn on_key_update_received(&mut self, ku: KeyUpdate) -> Result<(), Error> {
         self.note_key_update_received()?;
+        self.key_updates_received_total += 1;
         let suite = self.suite.ok_or(Error::InappropriateState)?;
         let cur_epoch = self.read.as_ref().map(|r| r.epoch).unwrap_or(0);
         if cur_epoch == u16::MAX {
@@ -999,6 +1086,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let desc = AlertDescription::from_u8(plain[1]);
         self.state = State::Closed;
         if desc == AlertDescription::CloseNotify {
+            self.close_notify_received = true;
             Ok(())
         } else {
             Err(Error::AlertReceived(desc))
@@ -1224,7 +1312,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // (RFC 8446 §4.2.7 — server picks the first mutually-acceptable
         // entry). Mirrors the TLS layer's preference at
         // `src/tls/conn/server.rs:1106-1118`.
-        let preferred_group = supported_server_groups()
+        let preferred_group = self
+            .config
+            .groups
             .iter()
             .copied()
             .find(|g| offered_groups.contains(g));
@@ -1529,6 +1619,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // state in one go.
         self.suite = Some(suite);
         self.hrr_selected_group = hrr_group;
+        self.negotiated_group = Some(selected_group);
+        self.hrr_sent = !matches!(plan, TranscriptPlan::Fresh);
         self.out_msg_seq = next_out_msg_seq;
         match plan {
             TranscriptPlan::Replace(t) => self.transcript = t,

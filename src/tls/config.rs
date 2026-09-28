@@ -312,8 +312,8 @@ pub struct Config {
     /// every offered group — no round trip, at the cost of a larger hello.
     /// Groups the client does not offer are ignored; a list that names none
     /// of them sends no shares at all, which is legal and makes any TLS 1.3
-    /// server ask for one. Inert on the server, on TLS 1.2 (no key shares)
-    /// and on DTLS 1.3, whose client always shares every offered group.
+    /// server ask for one. Honoured by the DTLS 1.3 client the same way;
+    /// inert on the server and on (D)TLS 1.2 (no key shares).
     pub key_shares: Option<Vec<NamedGroup>>,
     /// The (EC)DHE / hybrid key-exchange groups this endpoint uses, in
     /// preference order. `None` (the default) is every implemented group.
@@ -327,8 +327,11 @@ pub struct Config {
     /// empty list, or one naming no implemented group, makes
     /// [`Connection::client`](crate::tls::Connection::client) /
     /// [`Connection::server`](crate::tls::Connection::server) error instead
-    /// of widening back to the defaults. Inert on TLS 1.2 (whose engines
-    /// negotiate from their own fixed list) and on DTLS.
+    /// of widening back to the defaults. DTLS 1.3 behaves as TLS 1.3; the
+    /// DTLS 1.2 client offers the listed groups it implements (X25519,
+    /// P-256, P-384 — no ML-KEM hybrid) and the DTLS 1.2 server selects
+    /// among them in this order. Inert on TLS 1.2, whose engines negotiate
+    /// from their own fixed list.
     pub key_exchange_groups: Option<Vec<NamedGroup>>,
     /// `record_size_limit` extension (RFC 8449). `None` = library default.
     pub record_size_limit: Option<u16>,
@@ -692,7 +695,8 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `client_auth` | yes | yes | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes |
 /// | `alpn` | yes | yes | yes | yes | yes (required) |
 /// | `cipher_suites` (client) | yes | yes | yes | yes | yes (GCM / ChaCha20 only: RFC 9001 §5.3) |
-/// | `key_shares` (client) | yes | inert | inert | inert | yes |
+/// | `key_shares` (client) | yes | inert | yes | inert | yes |
+/// | `key_exchange_groups` | yes | inert | yes | yes (X25519, P-256, P-384) | yes |
 /// | `record_size_limit` | yes | yes | **refused** | **refused** | inert (no records) |
 /// | `require_extended_master_secret` | inert | yes | inert | yes | inert |
 /// | `stapled_ocsp_response` | yes | yes | inert | inert | yes |

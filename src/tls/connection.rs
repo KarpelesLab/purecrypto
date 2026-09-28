@@ -1087,8 +1087,11 @@ impl Connection {
         }
     }
 
-    /// Close the connection, emitting a close_notify alert if the engine
-    /// supports it.
+    /// Close the connection, emitting a close_notify alert (RFC 8446 §6.1 /
+    /// RFC 5246 §7.2.1; a protected record on DTLS). The alert is queued
+    /// for [`pop`](Self::pop); nothing more can be sent afterwards, but the
+    /// peer's records — its answering close_notify above all — are still
+    /// read.
     pub fn close(&mut self) -> Result<(), Error> {
         match &mut self.inner {
             Engine::ClientTls13(c) => c.send_close_notify(),
@@ -1097,10 +1100,17 @@ impl Connection {
             Engine::ServerTls12(c) => c.send_close_notify(),
             Engine::ServerTlsAuto(c) => c.close(),
             Engine::ClientTlsAuto(c) => c.close(),
-            // DTLS in this library does not emit an explicit close_notify
-            // through its public API; the connection is closed when freed.
+            // The DTLS engines queue the alert as one protected record (an
+            // error before the handshake completes: there are no keys to
+            // protect it with, and a plaintext alert is spoofable).
             #[cfg(feature = "dtls")]
-            _ => {}
+            Engine::ClientDtls12(c) => c.send_close_notify()?,
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.send_close_notify()?,
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls12(c) => c.send_close_notify()?,
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.send_close_notify()?,
         }
         Ok(())
     }
@@ -1159,9 +1169,9 @@ impl Connection {
     /// EOF-delimited application framing should treat that as a
     /// truncation attack and reject the data.
     ///
-    /// Always `false` for DTLS engines — purecrypto's DTLS does not
-    /// exchange close_notify (datagram transports have no stream EOF to
-    /// authenticate; an application protocol signals its own end).
+    /// On DTLS the alert arrives in a protected record, so `true` here is
+    /// an authenticated end of session; a datagram transport has no EOF,
+    /// so `false` only means no closure alert has been seen (yet).
     pub fn received_close_notify(&self) -> bool {
         match &self.inner {
             Engine::ClientTls13(c) => c.received_close_notify(),
@@ -1171,10 +1181,13 @@ impl Connection {
             Engine::ServerTlsAuto(c) => c.received_close_notify(),
             Engine::ClientTlsAuto(c) => c.received_close_notify(),
             #[cfg(feature = "dtls")]
-            Engine::ClientDtls12(_)
-            | Engine::ClientDtls13(_)
-            | Engine::ServerDtls12(_)
-            | Engine::ServerDtls13(_) => false,
+            Engine::ClientDtls12(c) => c.received_close_notify(),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.received_close_notify(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls12(c) => c.received_close_notify(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.received_close_notify(),
         }
     }
 
@@ -1303,6 +1316,8 @@ impl Connection {
             Engine::ClientTlsAuto(c) => c.peer_certificates(),
             #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.peer_certificates(),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(c) => c.peer_certificates(),
             // Reachable only when `dtls` is enabled (catches the DTLS variants
             // not handled above); exhaustive over the TLS variants otherwise.
             #[cfg_attr(not(feature = "dtls"), allow(unreachable_patterns))]
@@ -1379,9 +1394,9 @@ impl Connection {
     }
 
     /// The key-exchange group the handshake used: the group of the
-    /// ServerHello `key_share` on TLS 1.3, the `ServerKeyExchange` curve on
-    /// TLS 1.2. `None` until the handshake has fixed it, on a resumed TLS
-    /// 1.2 session (no key exchange), and on the DTLS engines.
+    /// ServerHello `key_share` on (D)TLS 1.3, the `ServerKeyExchange` curve
+    /// on (D)TLS 1.2. `None` until the handshake has fixed it and on a
+    /// resumed TLS 1.2 session (no key exchange).
     pub fn negotiated_group(&self) -> Option<NamedGroup> {
         let wire = if let Some(c) = self.tls13_client() {
             c.negotiated_group()
@@ -1392,20 +1407,38 @@ impl Connection {
         } else if let Some(c) = self.tls12_server() {
             c.negotiated_group()
         } else {
-            None
+            match &self.inner {
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls12(c) => c.negotiated_group(),
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls13(c) => c.negotiated_group(),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls12(c) => c.negotiated_group(),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls13(c) => c.negotiated_group(),
+                _ => None,
+            }
         };
         wire.and_then(NamedGroup::from_wire)
     }
 
-    /// `true` when a TLS 1.3 HelloRetryRequest was part of this handshake
-    /// (received, on a client; sent, on a server) — RFC 8446 §4.1.4.
+    /// `true` when a (D)TLS 1.3 HelloRetryRequest was part of this
+    /// handshake (received, on a client; sent, on a server) — RFC 8446
+    /// §4.1.4. On DTLS 1.3 that is the usual case: the server's stateless
+    /// cookie exchange rides on one (RFC 9147 §5.1).
     pub fn hello_retry_request_used(&self) -> bool {
         if let Some(c) = self.tls13_client() {
             c.hello_retry_request_seen()
         } else if let Some(c) = self.tls13_server() {
             c.hello_retry_request_sent()
         } else {
-            false
+            match &self.inner {
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls13(c) => c.hello_retry_request_seen(),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls13(c) => c.hello_retry_request_sent(),
+                _ => false,
+            }
         }
     }
 
@@ -1459,25 +1492,40 @@ impl Connection {
     /// `KeyUpdate` rolls the read key. Errors with
     /// [`Error::InappropriateState`] before the handshake completes, on a
     /// TLS 1.2 connection (no such mechanism) and on QUIC (which rekeys
-    /// through its Key Phase bit, RFC 9001 §6).
+    /// through its Key Phase bit, RFC 9001 §6). On DTLS 1.3 (RFC 9147 §8)
+    /// the write keys advance only once the peer has acknowledged the
+    /// `KeyUpdate`, and a second request while one is in flight is refused.
     pub fn request_key_update(&mut self) -> Result<(), Error> {
         if let Some(c) = self.tls13_client_mut() {
             c.request_key_update()
         } else if let Some(c) = self.tls13_server_mut() {
             c.request_key_update()
         } else {
-            Err(Error::InappropriateState)
+            match &mut self.inner {
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls13(c) => c.request_key_update(true),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls13(c) => c.request_key_update(true),
+                _ => Err(Error::InappropriateState),
+            }
         }
     }
 
-    /// Number of TLS 1.3 `KeyUpdate` messages received from the peer so far.
+    /// Number of (D)TLS 1.3 `KeyUpdate` messages received from the peer so
+    /// far.
     pub fn peer_key_updates(&self) -> u32 {
         if let Some(c) = self.tls13_client() {
             c.peer_key_updates()
         } else if let Some(c) = self.tls13_server() {
             c.peer_key_updates()
         } else {
-            0
+            match &self.inner {
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls13(c) => c.peer_key_updates(),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls13(c) => c.peer_key_updates(),
+                _ => 0,
+            }
         }
     }
 
@@ -1491,7 +1539,13 @@ impl Connection {
         } else if let Some(c) = self.tls13_server() {
             c.sent_key_updates()
         } else {
-            0
+            match &self.inner {
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls13(c) => c.sent_key_updates(),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls13(c) => c.sent_key_updates(),
+                _ => 0,
+            }
         }
     }
 
@@ -2303,6 +2357,8 @@ struct DtlsClientOpts<'a> {
     alpn_protocols: &'a [Vec<u8>],
     require_extended_master_secret: bool,
     max_record_size: usize,
+    key_exchange_groups: Option<&'a [NamedGroup]>,
+    key_shares: Option<&'a [NamedGroup]>,
 }
 
 /// Takes `cfg` apart for a DTLS client and refuses, with
@@ -2363,13 +2419,10 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     // (the DTLS servers issue no tickets), so `resumption` never matches —
     // the documented "wrong version is ignored" rule. RFC 8879 certificate
     // compression is not implemented over DTLS: the advertisement is not
-    // sent, and the peer's certificate arrives uncompressed. `key_shares`
-    // and `key_exchange_groups` are not wired either: the DTLS 1.3 client
-    // offers, and shares, every group (and DTLS 1.2 has no key shares).
+    // sent, and the peer's certificate arrives uncompressed.
     let _ = (
         min_version,
         max_version,
-        key_exchange_groups,
         cookie_secret,
         previous_cookie_secret,
         require_cookie,
@@ -2377,7 +2430,6 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         rng,
         signer,
         resumption,
-        key_shares,
     );
     #[cfg(feature = "cert-compression")]
     let _ = cert_compression_algorithms;
@@ -2410,7 +2462,36 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         alpn_protocols,
         require_extended_master_secret,
         max_record_size,
+        key_exchange_groups,
+        key_shares,
     })
+}
+
+/// Applies a [`Config::key_exchange_groups`] restriction to a DTLS
+/// engine's group list: keeps the groups the engine implements that the
+/// caller listed, in the caller's order, and fails closed with
+/// [`Error::HandshakeFailure`] when nothing is left (an empty list, or one
+/// naming only groups this engine lacks — the DTLS 1.2 engines have no
+/// ML-KEM hybrid), exactly as the TLS engines do.
+#[cfg(feature = "dtls")]
+fn restrict_dtls_groups(
+    supported: &[super::codec::NamedGroup],
+    wanted: Option<&[NamedGroup]>,
+) -> Result<Vec<super::codec::NamedGroup>, Error> {
+    let Some(wanted) = wanted else {
+        return Ok(supported.to_vec());
+    };
+    let mut picked: Vec<super::codec::NamedGroup> = Vec::new();
+    for g in wanted {
+        let w = g.to_wire();
+        if supported.contains(&w) && !picked.contains(&w) {
+            picked.push(w);
+        }
+    }
+    if picked.is_empty() {
+        return Err(Error::HandshakeFailure);
+    }
+    Ok(picked)
 }
 
 /// Applies a [`Config::cipher_suites`] restriction to a DTLS engine's
@@ -2454,10 +2535,12 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         alpn_protocols,
         require_extended_master_secret,
         max_record_size,
+        key_exchange_groups,
+        key_shares,
     } = dtls_client_opts(cfg)?;
     // DTLS 1.2 fragments handshake records at a fixed 1100 bytes (see
-    // `Config::max_record_size`).
-    let _ = max_record_size;
+    // `Config::max_record_size`) and has no key shares.
+    let _ = (max_record_size, key_shares);
 
     let mut dc = crate::dtls::ClientConfig12Internal::new(roots.clone_store(), server_name)
         .with_require_ems(require_extended_master_secret)
@@ -2473,6 +2556,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     }
     dc = dc.with_signature_policy(signature_policy.clone());
     dc.cipher_suites = restrict_dtls_cipher_suites(dc.cipher_suites, cipher_suites)?;
+    dc.groups = restrict_dtls_groups(&dc.groups, key_exchange_groups)?;
     dc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsClientConnection12::new(
         dc,
@@ -2495,6 +2579,8 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         alpn_protocols,
         require_extended_master_secret,
         max_record_size,
+        key_exchange_groups,
+        key_shares,
     } = dtls_client_opts(cfg)?;
     // EMS is a TLS 1.2 mechanism (DTLS 1.3 binds every secret to the
     // transcript).
@@ -2512,6 +2598,13 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     }
     dc = dc.with_signature_policy(alloc::sync::Arc::new(signature_policy.clone()));
     dc.cipher_suites = restrict_dtls_cipher_suites(dc.cipher_suites, cipher_suites)?;
+    dc.groups = restrict_dtls_groups(&dc.groups, key_exchange_groups)?;
+    // `key_shares` narrows the shares, never the offer: a group listed here
+    // but not offered is simply ignored, and a list naming none of the
+    // offered groups sends no share at all (the server then asks for one).
+    if let Some(shares) = key_shares {
+        dc.key_share_groups = Some(shares.iter().map(|g| g.to_wire()).collect());
+    }
     dc.alpn_protocols = alpn_protocols.to_vec();
     dc.max_record_size = max_record_size;
     dc.key_log = key_log.clone();
@@ -2536,6 +2629,7 @@ struct DtlsServerOpts<'a> {
     alpn_protocols: &'a [Vec<u8>],
     require_extended_master_secret: bool,
     max_record_size: usize,
+    key_exchange_groups: Option<&'a [NamedGroup]>,
 }
 
 /// Takes `cfg` apart for a DTLS server, failing closed on what the DTLS
@@ -2601,14 +2695,14 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     // the engine; `roots` / `crls` / `verification_time` only serve mTLS,
     // which is refused below; the DTLS servers issue no session tickets,
     // accept no 0-RTT (so `max_early_data_size` and the replay window have
-    // nothing to guard), staple nothing, do not compress certificates and do
-    // not bias or restrict the key-exchange group or the cipher suite (they
-    // pick from their own fixed orders). `rng` is drawn through
-    // `config_rng` and `signer` through `Connection::drive`.
+    // nothing to guard), staple nothing, do not compress certificates, take
+    // no `preferred_key_exchange_group` (`key_exchange_groups` orders the
+    // accept-set instead) and pick the cipher suite from their own fixed
+    // order. `rng` is drawn through `config_rng` and `signer` through
+    // `Connection::drive`.
     let _ = (
         min_version,
         max_version,
-        key_exchange_groups,
         cipher_suites,
         roots,
         crls,
@@ -2656,6 +2750,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         alpn_protocols,
         require_extended_master_secret,
         max_record_size,
+        key_exchange_groups,
     })
 }
 
@@ -2674,6 +2769,7 @@ fn build_dtls12_server(
         alpn_protocols,
         require_extended_master_secret,
         max_record_size,
+        key_exchange_groups,
     } = dtls_server_opts(cfg)?;
     // The DTLS 1.2 server verifies no client certificate (so the signature
     // policy has nothing to govern) and fragments at a fixed 1100 bytes; see
@@ -2706,6 +2802,8 @@ fn build_dtls12_server(
     }
     sc = sc.with_require_ems(require_extended_master_secret);
     sc = sc.with_alpn(alpn_protocols.to_vec());
+    let groups = restrict_dtls_groups(&sc.groups, key_exchange_groups)?;
+    sc = sc.with_groups(groups);
     sc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
@@ -2729,6 +2827,7 @@ fn build_dtls13_server(
         alpn_protocols,
         require_extended_master_secret,
         max_record_size,
+        key_exchange_groups,
     } = dtls_server_opts(cfg)?;
     // The DTLS 1.3 server verifies no client certificate (so the signature
     // policy has nothing to govern) and EMS is a TLS 1.2 mechanism; see the
@@ -2749,6 +2848,7 @@ fn build_dtls13_server(
     }
     sc.max_record_size = max_record_size;
     sc.alpn_protocols = alpn_protocols.to_vec();
+    sc.groups = restrict_dtls_groups(&sc.groups, key_exchange_groups)?;
     sc.key_log = key_log.clone();
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
@@ -4205,6 +4305,203 @@ mod tests {
                 );
             }
             assert!(!server.is_handshake_complete() && !client.is_handshake_complete());
+        }
+    }
+
+    /// `Config::key_exchange_groups` and `key_shares` reach the DTLS engines
+    /// as they do the TLS ones: the client offers (and shares) only what it
+    /// listed, the server selects in its own order and steers a client that
+    /// offered its choice without a share through a HelloRetryRequest
+    /// (RFC 8446 §4.1.4, DTLS 1.3 only), and both report the group the
+    /// handshake used. An empty restriction fails closed.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_honours_key_exchange_groups() {
+        use super::super::NamedGroup;
+        for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
+            // The client pins P-384; the server's default order (X25519
+            // first) does not matter — it can only pick what was offered.
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            let client_cfg = dtls_client_builder(version)
+                .key_exchange_groups(&[NamedGroup::Secp384r1])
+                .build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert_eq!(
+                client.negotiated_group(),
+                Some(NamedGroup::Secp384r1),
+                "{version:?}"
+            );
+            assert_eq!(
+                server.negotiated_group(),
+                Some(NamedGroup::Secp384r1),
+                "{version:?}"
+            );
+
+            // The server's list is its preference order, not the client's.
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            server_cfg.key_exchange_groups =
+                Some(alloc::vec![NamedGroup::Secp256r1, NamedGroup::X25519]);
+            let client_cfg = dtls_client_builder(version)
+                .key_exchange_groups(&[NamedGroup::X25519, NamedGroup::Secp256r1])
+                .build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert_eq!(
+                server.negotiated_group(),
+                Some(NamedGroup::Secp256r1),
+                "{version:?}"
+            );
+            assert_eq!(
+                client.negotiated_group(),
+                Some(NamedGroup::Secp256r1),
+                "{version:?}"
+            );
+
+            // Fail closed: nothing left to offer / accept.
+            let client_cfg = dtls_client_builder(version)
+                .key_exchange_groups(&[])
+                .build();
+            assert!(matches!(
+                Connection::client(&client_cfg),
+                Err(Error::HandshakeFailure)
+            ));
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            server_cfg.key_exchange_groups = Some(Vec::new());
+            assert!(matches!(
+                Connection::server(&server_cfg),
+                Err(Error::HandshakeFailure)
+            ));
+        }
+
+        // DTLS 1.2 has no ML-KEM hybrid: a list naming only that group
+        // leaves the engine nothing, and is refused rather than widened.
+        let client_cfg = dtls_client_builder(ProtocolVersion::DTLSv1_2)
+            .key_exchange_groups(&[NamedGroup::X25519MlKem768])
+            .build();
+        assert!(matches!(
+            Connection::client(&client_cfg),
+            Err(Error::HandshakeFailure)
+        ));
+
+        // DTLS 1.3: a client sharing only X25519 against a server pinned
+        // to P-256 goes through a HelloRetryRequest and ends on P-256 —
+        // and the HRR shows in both reports.
+        let version = ProtocolVersion::DTLSv1_3;
+        let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+        server_cfg.require_cookie = false;
+        server_cfg.key_exchange_groups = Some(alloc::vec![NamedGroup::Secp256r1]);
+        let client_cfg = dtls_client_builder(version)
+            .key_exchange_groups(&[NamedGroup::X25519, NamedGroup::Secp256r1])
+            .key_shares(&[NamedGroup::X25519])
+            .build();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+        drive_dtls_pair(&mut client, &mut server);
+        assert_eq!(client.negotiated_group(), Some(NamedGroup::Secp256r1));
+        assert_eq!(server.negotiated_group(), Some(NamedGroup::Secp256r1));
+        assert!(client.hello_retry_request_used());
+        assert!(server.hello_retry_request_used());
+
+        // Without a group change and without a cookie there is no HRR.
+        let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+        server_cfg.require_cookie = false;
+        let client_cfg = dtls_client_builder(version).build();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+        drive_dtls_pair(&mut client, &mut server);
+        assert!(!client.hello_retry_request_used());
+        assert!(!server.hello_retry_request_used());
+    }
+
+    /// `Connection::request_key_update` and the `KeyUpdate` tallies work
+    /// over DTLS 1.3 (RFC 9147 §8): the requester's write epoch advances
+    /// once the peer ACKs, the peer answers `update_requested` with its own
+    /// `KeyUpdate`, and data still flows both ways afterwards. DTLS 1.2 has
+    /// no such mechanism and refuses.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls13_key_update_through_connection() {
+        let version = ProtocolVersion::DTLSv1_3;
+        let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+        server_cfg.require_cookie = false;
+        let client_cfg = dtls_client_builder(version).build();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+        drive_dtls_pair(&mut client, &mut server);
+
+        client.request_key_update().unwrap();
+        // A few exchanges: KeyUpdate → ACK + the server's own KeyUpdate →
+        // ACK.
+        for _ in 0..4 {
+            drive_dtls_pair(&mut client, &mut server);
+        }
+        assert_eq!(client.sent_key_updates(), 1);
+        assert_eq!(server.peer_key_updates(), 1);
+        assert_eq!(server.sent_key_updates(), 1, "update_requested is answered");
+        assert_eq!(client.peer_key_updates(), 1);
+
+        client.send(b"after rekey").unwrap();
+        server.send(b"and back").unwrap();
+        drive_dtls_pair(&mut client, &mut server);
+        assert_eq!(server.recv().unwrap(), b"after rekey");
+        assert_eq!(client.recv().unwrap(), b"and back");
+
+        let version = ProtocolVersion::DTLSv1_2;
+        let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+        server_cfg.require_cookie = false;
+        let client_cfg = dtls_client_builder(version).build();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+        drive_dtls_pair(&mut client, &mut server);
+        assert!(matches!(
+            client.request_key_update(),
+            Err(Error::InappropriateState)
+        ));
+    }
+
+    /// `Connection::close` sends a protected `close_notify` over DTLS and
+    /// `received_close_notify` reports the peer's (RFC 8446 §6.1 / RFC 5246
+    /// §7.2.1): the peer can still answer in kind after receiving one, no
+    /// application data can follow a sent one, and closing before the
+    /// handshake completes (no keys to protect the alert with) is refused.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_close_notify_through_connection() {
+        for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            let client_cfg = dtls_client_builder(version).build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            assert!(
+                matches!(client.close(), Err(Error::InappropriateState)),
+                "{version:?}: no keys before the handshake"
+            );
+            drive_dtls_pair(&mut client, &mut server);
+
+            client.close().unwrap();
+            assert!(matches!(
+                client.send(b"late"),
+                Err(Error::InappropriateState)
+            ));
+            let alert = client.pop().unwrap();
+            assert!(!alert.is_empty(), "{version:?}: the alert is queued");
+            assert!(!server.received_close_notify());
+            server.feed(&alert).unwrap();
+            assert!(server.received_close_notify(), "{version:?}");
+            // The answer, after the peer's close_notify.
+            server.close().unwrap();
+            let reply = server.pop().unwrap();
+            assert!(!reply.is_empty());
+            assert!(!client.received_close_notify());
+            client.feed(&reply).unwrap();
+            assert!(client.received_close_notify(), "{version:?}");
         }
     }
 

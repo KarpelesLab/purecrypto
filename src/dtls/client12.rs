@@ -269,6 +269,10 @@ pub struct DtlsClientConnection12 {
     peer_group: Option<NamedGroup>,
     /// Peer's ECDHE public share.
     peer_point: Option<Vec<u8>>,
+    /// The peer's `close_notify` was authenticated.
+    close_notify_received: bool,
+    /// Our `close_notify` went out; no more application data may follow.
+    close_notify_sent: bool,
 
     /// 48-byte master secret.
     master: Option<[u8; 48]>,
@@ -349,6 +353,8 @@ impl DtlsClientConnection12 {
             leaf_key: None,
             peer_group: None,
             peer_point: None,
+            close_notify_received: false,
+            close_notify_sent: false,
             master: None,
             read_crypter: None,
             write_crypter: None,
@@ -388,6 +394,11 @@ impl DtlsClientConnection12 {
     /// The ALPN protocol the server selected, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
+    }
+
+    /// The server's certificate chain (leaf first), once received.
+    pub fn peer_certificates(&self) -> &[Vec<u8>] {
+        &self.cert_chain
     }
 
     /// RFC 5705 §4 — DTLS 1.2 application-layer Exporter. Computes
@@ -476,10 +487,47 @@ impl DtlsClientConnection12 {
         core::mem::take(&mut self.app_in)
     }
 
+    /// The ECDHE group of the server's `ServerKeyExchange`, once received.
+    pub(crate) fn negotiated_group(&self) -> Option<NamedGroup> {
+        self.peer_group
+    }
+
+    /// `true` once the peer's `close_notify` has been authenticated
+    /// (RFC 5246 §7.2.1).
+    pub fn received_close_notify(&self) -> bool {
+        self.close_notify_received
+    }
+
+    /// Ends the session: queues a `close_notify` alert under the current
+    /// write keys (RFC 6347 §4.1 / RFC 5246 §7.2.1). No application data
+    /// can be sent afterwards, but records from the peer — its own
+    /// `close_notify` in particular — are still read. Idempotent; an error
+    /// before the handshake completes.
+    pub fn send_close_notify(&mut self) -> Result<(), Error> {
+        // Allowed while connected and, since the peer's close_notify must be
+        // answered in kind (RFC 8446 §6.1), after one has closed the session.
+        if !(self.state == State::Connected || self.close_notify_received)
+            || self.write_crypter.is_none()
+        {
+            return Err(Error::InappropriateState);
+        }
+        if self.close_notify_sent {
+            return Ok(());
+        }
+        // RFC 5246 §7.2: `close_notify` is a warning-level (1) alert.
+        let dg = self.encrypt_record_dtls(
+            ContentType::Alert,
+            &[1, AlertDescription::CloseNotify.as_u8()],
+        )?;
+        self.out_dgrams.push(dg);
+        self.close_notify_sent = true;
+        Ok(())
+    }
+
     /// Queues application plaintext for transmission (must be after the
     /// handshake completes).
     pub fn send(&mut self, plaintext: &[u8]) -> Result<(), Error> {
-        if self.state != State::Connected {
+        if self.state != State::Connected || self.close_notify_sent {
             return Err(Error::InappropriateState);
         }
         let dg = self.encrypt_record_dtls(ContentType::ApplicationData, plaintext)?;
@@ -650,6 +698,7 @@ impl DtlsClientConnection12 {
                 let desc = AlertDescription::from_u8(plain[1]);
                 self.state = State::Closed;
                 if desc == AlertDescription::CloseNotify {
+                    self.close_notify_received = true;
                     Ok(())
                 } else {
                     Err(Error::AlertReceived(desc))
