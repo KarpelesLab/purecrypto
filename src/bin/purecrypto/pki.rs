@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::util::die;
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
+use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use purecrypto::rng::{OsRng, RngCore};
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::x509::extension::{
@@ -23,13 +24,25 @@ pub(crate) enum PrivateKey {
     Ec(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
     Ed448(Ed448PrivateKey),
+    MlDsa44(MlDsa44PrivateKey),
+    MlDsa65(MlDsa65PrivateKey),
+    MlDsa87(MlDsa87PrivateKey),
 }
 
 impl PrivateKey {
-    /// Loads an RSA (PKCS#1 or PKCS#8), EC (SEC1 or PKCS#8), Ed25519 or
-    /// Ed448 (PKCS#8) private-key PEM — every key `genpkey` can produce
+    /// Loads an RSA (PKCS#1 or PKCS#8), EC (SEC1 or PKCS#8), Ed25519, Ed448
+    /// or ML-DSA (PKCS#8) private-key PEM — every key `genpkey` can produce
     /// that `CertSigner` can sign with.
     pub(crate) fn from_pem(pem: &str) -> Option<Self> {
+        if let Ok(k) = MlDsa44PrivateKey::from_pkcs8_pem(pem) {
+            return Some(PrivateKey::MlDsa44(k));
+        }
+        if let Ok(k) = MlDsa65PrivateKey::from_pkcs8_pem(pem) {
+            return Some(PrivateKey::MlDsa65(k));
+        }
+        if let Ok(k) = MlDsa87PrivateKey::from_pkcs8_pem(pem) {
+            return Some(PrivateKey::MlDsa87(k));
+        }
         if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
             return Some(PrivateKey::Rsa(k));
         }
@@ -57,6 +70,9 @@ impl PrivateKey {
             PrivateKey::Ec(k) => CertSigner::Ecdsa(k),
             PrivateKey::Ed25519(k) => CertSigner::Ed25519(k),
             PrivateKey::Ed448(k) => CertSigner::Ed448(k),
+            PrivateKey::MlDsa44(k) => CertSigner::MlDsa44(k),
+            PrivateKey::MlDsa65(k) => CertSigner::MlDsa65(k),
+            PrivateKey::MlDsa87(k) => CertSigner::MlDsa87(k),
         }
     }
 
@@ -67,6 +83,9 @@ impl PrivateKey {
             PrivateKey::Ec(k) => AnyPublicKey::Ecdsa(k.public_key()),
             PrivateKey::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()),
             PrivateKey::Ed448(k) => AnyPublicKey::Ed448(k.public_key()),
+            PrivateKey::MlDsa44(k) => AnyPublicKey::MlDsa44(k.public_key()),
+            PrivateKey::MlDsa65(k) => AnyPublicKey::MlDsa65(k.public_key()),
+            PrivateKey::MlDsa87(k) => AnyPublicKey::MlDsa87(k.public_key()),
         }
     }
 }

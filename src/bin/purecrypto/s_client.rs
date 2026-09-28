@@ -20,11 +20,30 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::pki::format_dn;
+use crate::tlsinfo::{self, Role};
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn};
 use purecrypto::tls::{
     Config, Connection, HandshakeStatus, ProtocolVersion as PcVersion, RootCertStore, SigningKey,
 };
 use purecrypto::x509::Certificate;
+
+/// Everything the TCP driver needs besides the connection and the socket.
+struct TcpOpts<'a> {
+    insecure: bool,
+    showcerts: bool,
+    quiet: bool,
+    /// `-key_update`: send `KeyUpdate(update_requested)` right after the
+    /// handshake, before any application data.
+    key_update: bool,
+    /// The 0-RTT payload written before the handshake (`-early_data` on the
+    /// resumed connection), re-sent as ordinary data if the server rejected
+    /// it (RFC 8446 §4.2.10).
+    early_data: Option<&'a [u8]>,
+    /// `-read_timeout`: how long to wait for more data from the server
+    /// after the last byte before ending the session with close_notify.
+    read_timeout: Duration,
+    ech: &'a crate::ech::ClientEch,
+}
 
 /// Which protocol/transport combination the CLI should drive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -172,6 +191,13 @@ pub(crate) fn run(args: Args) {
         "-key",
         "-mtu",
         "-key-shares",
+        "-groups",
+        "-ciphersuites",
+        "-early_data",
+        "-rpk_peer_key",
+        "-record_size_limit",
+        "-min_protocol",
+        "-read_timeout",
     ];
     value_flags.extend(crate::ech::CLIENT_VALUE_FLAGS);
     let connect = args
@@ -179,7 +205,7 @@ pub(crate) fn run(args: Args) {
         .or_else(|| args.positionals(&value_flags).first().copied())
         .unwrap_or_else(|| {
             die(
-                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease]",
+                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-groups x25519:secp256r1] [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]] [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk] [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease]",
             )
         });
     let (host, port) = match connect.rsplit_once(':') {
@@ -206,6 +232,38 @@ pub(crate) fn run(args: Args) {
         _ => None,
     };
     let keylog = args.value("-keylogfile").map(open_keylog);
+    let reconnect = args.flag("-reconnect") || args.flag("--reconnect");
+    let key_update = args.flag("-key_update") || args.flag("--key_update");
+    let enable_server_rpk = args.flag("-enable_server_rpk") || args.flag("--enable_server_rpk");
+    let enable_client_rpk = args.flag("-enable_client_rpk") || args.flag("--enable_client_rpk");
+    let no_cert_comp = args.flag("-no_cert_comp") || args.flag("--no_cert_comp");
+    let early_data: Option<Vec<u8>> = args.value("-early_data").map(|path| {
+        if !reconnect {
+            die("-early_data needs -reconnect: 0-RTT rides on the resumed (second) connection");
+        }
+        std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read -early_data {path}: {e}")))
+    });
+    let read_timeout = Duration::from_secs(
+        args.value("-read_timeout")
+            .unwrap_or("5")
+            .parse()
+            .unwrap_or_else(|_| die("-read_timeout expects a number of seconds")),
+    );
+    let is_tcp = matches!(version, ProtocolVersion::Tls12 | ProtocolVersion::Tls13);
+    if (reconnect || key_update || enable_server_rpk || enable_client_rpk) && !is_tcp {
+        die("-reconnect / -key_update / -enable_*_rpk are TLS-over-TCP options");
+    }
+    // `-min_protocol TLSv1.2` widens the pinned TLS 1.3 client into a
+    // version-spanning one (1.2..=1.3), so a 1.2-only server can be
+    // negotiated with — the fallback `openssl s_client` performs by default.
+    let min_version = match args.value("-min_protocol") {
+        None => version.to_pc_version(),
+        Some("TLSv1.2") | Some("tls1_2") if version == ProtocolVersion::Tls13 => PcVersion::TLSv1_2,
+        Some("TLSv1.3") | Some("tls1_3") if version == ProtocolVersion::Tls13 => PcVersion::TLSv1_3,
+        Some(v) => die(format!(
+            "-min_protocol: '{v}' is not TLSv1.2 or TLSv1.3 (the flag applies to TLS over TCP)"
+        )),
+    };
 
     // Build the unified config. Across TLS and DTLS, `-insecure` skips
     // verification; otherwise trust comes from `-CAfile` if supplied, else the
@@ -218,13 +276,44 @@ pub(crate) fn run(args: Args) {
 
     let mut builder = Config::builder()
         .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
-        .versions(version.to_pc_version(), version.to_pc_version())
+        .versions(min_version, version.to_pc_version())
         .roots(roots)
         .server_name(server_name)
         .verify_certificates(!insecure)
         .max_record_size(mtu);
     if let Some(a) = alpn {
         builder = builder.alpn(a);
+    }
+    // `-groups x25519:secp256r1`: the `supported_groups` offer, in this
+    // order, with a key share for each (see `-key-shares` to narrow those).
+    if let Some(list) = args.value("-groups") {
+        builder = builder.key_exchange_groups(&tlsinfo::parse_groups(list, "-groups"));
+    }
+    // `-ciphersuites`: the TLS 1.3 suites offered, in this order.
+    if let Some(list) = args.value("-ciphersuites") {
+        builder = builder.cipher_suites(&tlsinfo::parse_ciphersuites(list, "-ciphersuites"));
+    }
+    if let Some(n) = tlsinfo::parse_record_size_limit(&args) {
+        builder = builder.record_size_limit(n);
+    }
+    #[cfg(feature = "cert-compression")]
+    if no_cert_comp {
+        builder = builder.cert_compression_algorithms(Vec::new());
+    }
+    #[cfg(not(feature = "cert-compression"))]
+    let _ = no_cert_comp;
+    // RFC 7250 raw public keys. `-enable_server_rpk` offers
+    // `server_certificate_type = RawPublicKey` (X.509 still accepted); the
+    // server's bare key must then match one of the `-rpk_peer_key` pins,
+    // since there is no chain to validate.
+    if enable_server_rpk {
+        let pins = args.value("-rpk_peer_key").unwrap_or_else(|| {
+            die("-enable_server_rpk needs -rpk_peer_key FILE (the server's public key, PEM) to pin")
+        });
+        builder = builder.server_cert_type_preference(vec![2, 0]);
+        for spki in tlsinfo::load_spki_pems(pins, "-rpk_peer_key") {
+            builder = builder.add_expected_raw_public_key(spki);
+        }
     }
     // `-key-shares x25519,secp256r1`: pre-share keys for these groups only;
     // a server preferring another offered group answers with a
@@ -238,9 +327,23 @@ pub(crate) fn run(args: Args) {
         builder = builder.key_shares(&groups);
     }
     if let Some((cert_path, key_path, (chain, key))) = client_id {
+        // `-enable_client_rpk`: offer to present this identity as a raw
+        // public key (`client_certificate_type = RawPublicKey`, X.509 still
+        // offered) when the server asks for a certificate.
+        if enable_client_rpk {
+            let spki = key
+                .public_key()
+                .unwrap_or_else(|| die("-enable_client_rpk: the client key has no public half"))
+                .to_spki_der();
+            builder = builder
+                .client_cert_type_preference(vec![2, 0])
+                .raw_public_key_spki(spki);
+        }
         builder = builder
             .try_identity(chain, key)
             .unwrap_or_else(|e| die(crate::util::identity_error(cert_path, key_path, e)));
+    } else if enable_client_rpk {
+        die("-enable_client_rpk needs -cert and -key (the identity to present as a raw key)");
     }
     if let Some(sink) = keylog {
         builder = builder.key_log(sink);
@@ -252,18 +355,62 @@ pub(crate) fn run(args: Args) {
         die("ECH options require TLS 1.3 over TCP (drop -tls1_2 / -dtls1_2 / -dtls1_3)");
     }
     let cfg = builder.build();
-    let mut conn = Connection::client(&cfg)
-        .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
+    let opts = TcpOpts {
+        insecure,
+        showcerts,
+        quiet,
+        key_update,
+        early_data: None,
+        read_timeout,
+        ech: &ech,
+    };
 
     match version {
-        ProtocolVersion::Tls12 | ProtocolVersion::Tls13 => {
+        ProtocolVersion::Tls12 | ProtocolVersion::Tls13 if reconnect => {
+            // `-reconnect`: a first connection whose only purpose is to be
+            // issued a session ticket, then a second one that resumes it —
+            // carrying `-early_data` as 0-RTT when the ticket allows it.
+            let mut conn = Connection::client(&cfg)
+                .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
             let mut sock = TcpStream::connect((host, port))
                 .unwrap_or_else(|e| die(format!("TCP connect to {host}:{port} failed: {e}")));
-            run_tcp(
-                &mut conn, &mut sock, version, insecure, showcerts, quiet, &ech,
-            );
+            if !quiet {
+                eprintln!("=== connection 1 (full handshake)");
+            }
+            let session = run_tcp_for_ticket(&mut conn, &mut sock, &opts);
+            drop(sock);
+            let mut cfg2 = cfg.clone();
+            cfg2.resumption = Some(session);
+            let mut conn = Connection::client(&cfg2)
+                .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
+            if let Some(data) = early_data.as_deref() {
+                conn.write_early_data(data).unwrap_or_else(|e| {
+                    die(format!(
+                        "cannot send early data: {e:?} (the ticket did not permit 0-RTT?)"
+                    ))
+                });
+            }
+            let mut sock = TcpStream::connect((host, port))
+                .unwrap_or_else(|e| die(format!("TCP connect to {host}:{port} failed: {e}")));
+            if !quiet {
+                eprintln!("=== connection 2 (resumption offered)");
+            }
+            let opts = TcpOpts {
+                early_data: early_data.as_deref(),
+                ..opts
+            };
+            run_tcp(&mut conn, &mut sock, &opts);
+        }
+        ProtocolVersion::Tls12 | ProtocolVersion::Tls13 => {
+            let mut conn = Connection::client(&cfg)
+                .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
+            let mut sock = TcpStream::connect((host, port))
+                .unwrap_or_else(|e| die(format!("TCP connect to {host}:{port} failed: {e}")));
+            run_tcp(&mut conn, &mut sock, &opts);
         }
         ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13 => {
+            let mut conn = Connection::client(&cfg)
+                .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
             let socket = UdpSocket::bind("0.0.0.0:0")
                 .unwrap_or_else(|e| die(format!("cannot bind local UDP socket: {e}")));
             socket
@@ -274,16 +421,15 @@ pub(crate) fn run(args: Args) {
     }
 }
 
-fn run_tcp(
-    conn: &mut Connection,
-    sock: &mut TcpStream,
-    version: ProtocolVersion,
-    insecure: bool,
-    showcerts: bool,
-    quiet: bool,
-    ech: &crate::ech::ClientEch,
-) {
-    drive_tcp_handshake(conn, sock, ech);
+/// Handshake + report, shared by the plain and the `-reconnect` flows.
+fn tcp_handshake_and_report(conn: &mut Connection, sock: &mut TcpStream, opts: &TcpOpts<'_>) {
+    drive_tcp_handshake(conn, sock, opts.ech);
+    // The handshake loop stops at `Complete` without draining what that
+    // last step queued — our Finished. Put it on the wire now rather than
+    // with the first application data: a server that has nothing to read
+    // from us (the `-reconnect` ticket wait) would otherwise never see the
+    // handshake end.
+    flush_out(conn, sock);
 
     // The "certificate NOT verified" warning is security-relevant: it
     // tells the operator that this connection's peer identity was not
@@ -291,19 +437,23 @@ fn run_tcp(
     // unattended pipeline using `-quiet -insecure` cannot accidentally
     // hide the fact. Match the DTLS path so the two transports speak
     // the same warning string.
-    if insecure {
+    if opts.insecure {
         eprintln!("WARNING: certificate NOT verified (-insecure)");
     }
 
-    if !quiet {
-        let v_str = match version {
-            ProtocolVersion::Tls12 => "TLSv1.2",
-            ProtocolVersion::Tls13 => "TLSv1.3",
+    if !opts.quiet {
+        let v_str = match conn.negotiated_version() {
+            Some(PcVersion::TLSv1_2) => "TLSv1.2",
+            Some(PcVersion::TLSv1_3) => "TLSv1.3",
+            #[cfg(feature = "tls-legacy")]
+            Some(PcVersion::TLSv1_1) => "TLSv1.1",
+            #[cfg(feature = "tls-legacy")]
+            Some(PcVersion::TLSv1_0) => "TLSv1.0",
             _ => "?",
         };
         eprintln!(
             "connected: {v_str}{}",
-            if insecure {
+            if opts.insecure {
                 "  (certificate NOT verified)"
             } else {
                 "  (certificate verified)"
@@ -312,12 +462,71 @@ fn run_tcp(
         if let Some(p) = conn.alpn_selected() {
             eprintln!("ALPN: {}", String::from_utf8_lossy(p));
         }
-        crate::ech::report_client(conn, ech);
-        print_chain(conn.peer_certificates(), showcerts);
+        crate::ech::report_client(conn, opts.ech);
+        tlsinfo::report_handshake(conn, Role::Client);
+        print_chain(conn.peer_certificates(), opts.showcerts);
     }
+}
 
-    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    drive_tcp_data(conn, sock);
+fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, opts: &TcpOpts<'_>) {
+    tcp_handshake_and_report(conn, sock, opts);
+    sock.set_read_timeout(Some(opts.read_timeout)).ok();
+    drive_tcp_data(conn, sock, opts);
+}
+
+/// The `-reconnect` first connection: handshake, wait for the server's
+/// `NewSessionTicket`, say goodbye, and hand the session back. Nothing
+/// from stdin is sent on this connection.
+fn run_tcp_for_ticket(
+    conn: &mut Connection,
+    sock: &mut TcpStream,
+    opts: &TcpOpts<'_>,
+) -> purecrypto::tls::ResumptionSession {
+    tcp_handshake_and_report(conn, sock, opts);
+    sock.set_read_timeout(Some(Duration::from_millis(250))).ok();
+    let start = Instant::now();
+    let mut buf = [0u8; 4096];
+    let session = loop {
+        if let Some(s) = conn.take_session() {
+            break s;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            die("no session ticket arrived within 5 s; cannot -reconnect");
+        }
+        match sock.read(&mut buf) {
+            Ok(0) => die("peer closed before issuing a session ticket"),
+            Ok(n) => {
+                if let Err(e) = conn.feed(&buf[..n]) {
+                    die(format!("TLS error while waiting for a ticket: {e:?}"));
+                }
+                // Anything the server volunteered (a `-www` page, a banner)
+                // is not this connection's business.
+                let _ = conn.recv();
+                flush_out(conn, sock);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => die(format!("socket read: {e}")),
+        }
+    };
+    if !opts.quiet {
+        eprintln!("session ticket received");
+    }
+    let _ = conn.close();
+    flush_out(conn, sock);
+    let _ = sock.shutdown(std::net::Shutdown::Write);
+    session
+}
+
+/// Writes whatever the engine has queued (a KeyUpdate reply, an alert).
+fn flush_out(conn: &mut Connection, sock: &mut TcpStream) {
+    if let Ok(out) = conn.pop()
+        && !out.is_empty()
+    {
+        let _ = sock.write_all(&out);
+        let _ = sock.flush();
+    }
 }
 
 fn run_udp(
@@ -408,7 +617,7 @@ fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream, ech: &crate:
     }
 }
 
-fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream) {
+fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream, opts: &TcpOpts<'_>) {
     let mut stdout = std::io::stdout();
 
     // Drain any plaintext the engine already decoded during the
@@ -420,6 +629,22 @@ fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream) {
     let pre = conn.recv().unwrap_or_default();
     if !pre.is_empty() {
         let _ = stdout.write_all(&pre);
+    }
+
+    // `-key_update`: rekey before the first byte of application data
+    // (RFC 8446 §4.6.3); the request asks the server to rekey too.
+    if opts.key_update {
+        conn.request_key_update()
+            .unwrap_or_else(|e| die(format!("KeyUpdate refused: {e:?}")));
+        flush_out(conn, sock);
+    }
+    // RFC 8446 §4.2.10: early data the server rejected was never
+    // delivered; send it again under the 1-RTT keys.
+    if let Some(early) = opts.early_data
+        && !conn.early_data_accepted()
+    {
+        let _ = conn.send(early);
+        flush_out(conn, sock);
     }
 
     if !std::io::stdin().is_terminal() {
@@ -459,6 +684,10 @@ fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream) {
                     let _ = stdout.flush();
                     die(format!("TLS error after handshake: {e:?}"));
                 }
+                // The engine answers a `KeyUpdate(update_requested)` with its
+                // own KeyUpdate: put it on the wire before anything else
+                // goes out under the new key.
+                flush_out(conn, sock);
                 let plain = conn.recv().unwrap_or_default();
                 if !plain.is_empty() && stdout.write_all(&plain).is_err() {
                     break;
@@ -480,14 +709,32 @@ fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream) {
     // ignored (the peer may already be gone).
     if !conn.received_close_notify() {
         let _ = conn.close();
-        if let Ok(out) = conn.pop()
-            && !out.is_empty()
-        {
-            let _ = sock.write_all(&out);
-            let _ = sock.flush();
+        flush_out(conn, sock);
+        let _ = sock.shutdown(std::net::Shutdown::Write);
+        // RFC 8446 §6.1: the peer answers our close_notify with its own
+        // before closing. Wait (bounded by the read timeout) so a peer that
+        // just drops the connection is told apart from one that shuts down
+        // cleanly; late application data is still printed.
+        while !conn.received_close_notify() {
+            match sock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if conn.feed(&buf[..n]).is_err() {
+                        break;
+                    }
+                    let plain = conn.recv().unwrap_or_default();
+                    if !plain.is_empty() {
+                        let _ = stdout.write_all(&plain);
+                    }
+                }
+                Err(_) => break,
+            }
         }
     }
     let _ = stdout.flush();
+    if !opts.quiet {
+        tlsinfo::report_session_end(conn);
+    }
 }
 
 fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, mtu: usize, deadline: Duration) {

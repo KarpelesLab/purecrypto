@@ -2833,6 +2833,128 @@ fn s_client_s_server_tls12_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The interop harness drives `-reconnect` / `-early_data` / `-key_update` /
+/// `-groups` / `-naccept` and reads both sides' negotiated-parameter report
+/// (one `key: value` line per fact). A full handshake, then a resumed one
+/// carrying 0-RTT, with a KeyUpdate from each side, pinned to P-256.
+#[test]
+fn s_client_s_server_reconnect_early_data_key_update_report() {
+    use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let dir = std::env::temp_dir().join(format!("pc_s_reconnect_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+    let early_path = dir.join("early.txt");
+    std::fs::write(&early_path, b"0-rtt line\n").unwrap();
+
+    let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut OsRng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
+
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-accept",
+        "0",
+        "-naccept",
+        "2",
+        "-early_data",
+        "-groups",
+        "secp256r1",
+        "-key_update",
+    ]);
+    let port = server_proc.port;
+
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-groups",
+            "secp256r1:x25519",
+            "-ciphersuites",
+            "TLS_CHACHA20_POLY1305_SHA256",
+            "-reconnect",
+            "-early_data",
+            early_path.to_str().unwrap(),
+            "-key_update",
+            "-read_timeout",
+            "2",
+        ],
+        b"1-rtt line\n",
+    );
+    let server_err = server_proc.finish_with_stderr();
+
+    assert!(ok, "s_client failed: {err}");
+    // Both the 0-RTT line and the ordinary one came back from the echo.
+    assert!(out.contains("0-rtt line"), "no early-data echo: {out:?}");
+    assert!(out.contains("1-rtt line"), "no 1-RTT echo: {out:?}");
+    // The client's report, second connection.
+    let second = err
+        .split("=== connection 2")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no second connection in {err}"));
+    for line in [
+        "connected: TLSv1.3",
+        "cipher suite: TLS_CHACHA20_POLY1305_SHA256",
+        "key exchange: secp256r1",
+        "HelloRetryRequest: no",
+        "resumed: yes",
+        "early data: accepted",
+        "peer certificate: none",
+        "KeyUpdate: sent 2, received 2",
+        "close_notify: received",
+    ] {
+        assert!(
+            second.contains(line),
+            "missing {line:?} in client report:\n{second}"
+        );
+    }
+    assert!(err.contains("session ticket received"), "{err}");
+    // The server's report, second connection.
+    let second = server_err
+        .split("=== connection 2")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no second connection in {server_err}"));
+    for line in [
+        "handshake complete: TLSv1.3",
+        "cipher suite: TLS_CHACHA20_POLY1305_SHA256",
+        "key exchange: secp256r1",
+        "resumed: yes",
+        "early data: accepted",
+        "own certificate: X.509",
+        "KeyUpdate: sent 2, received 2",
+        "close_notify: received",
+    ] {
+        assert!(
+            second.contains(line),
+            "missing {line:?} in server report:\n{second}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 #[ignore = "requires network access"]
 fn s_client_live_cloudflare_tls12() {

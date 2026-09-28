@@ -26,6 +26,7 @@ mod s_dtls_client;
 mod s_dtls_server;
 mod s_server;
 mod template;
+mod tlsinfo;
 mod toml;
 mod util;
 mod x509;

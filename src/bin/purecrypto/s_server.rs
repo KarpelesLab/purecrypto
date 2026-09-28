@@ -15,6 +15,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
+use crate::tlsinfo::{self, Role};
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, zero_buf};
 use purecrypto::rng::OsRng;
 use purecrypto::tls::{
@@ -123,9 +124,13 @@ pub(crate) fn run(args: Args) {
     let cert_path = args.value("-cert").unwrap_or_else(|| {
         die(
             "usage: purecrypto s_server -cert cert.pem -key key.pem -accept PORT \
-             [-tls1_2 | -dtls1_2 | -dtls1_3] [-Verify ca.pem] [-alpn h2,http/1.1] [-www] \
-             [-mtu N] [-no_cookie] [-keylogfile keys.log] \
-             [-ech-key key.bin -ech-config config.bin] [-prefer-group NAME]",
+             [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-Verify ca.pem] \
+             [-alpn h2,http/1.1] [-www] [-naccept N] [-mtu N] [-no_cookie] \
+             [-groups x25519:secp256r1] [-prefer-group NAME] [-no_ticket] \
+             [-early_data [-max_early_data N]] [-key_update] [-status_file resp.der] \
+             [-enable_server_rpk] [-enable_client_rpk -rpk_peer_key pub.pem] \
+             [-record_size_limit N] [-no_cert_comp] [-keylogfile keys.log] \
+             [-ech-key key.bin -ech-config config.bin]",
         )
     });
     let key_path = args
@@ -152,6 +157,36 @@ pub(crate) fn run(args: Args) {
         .parse()
         .unwrap_or_else(|_| die("-mtu expects a number"));
     let keylog = args.value("-keylogfile").map(open_keylog);
+    let naccept: usize = args
+        .value("-naccept")
+        .unwrap_or("1")
+        .parse()
+        .ok()
+        .filter(|n| *n >= 1)
+        .unwrap_or_else(|| die("-naccept expects a positive number"));
+    let no_ticket = args.flag("-no_ticket") || args.flag("--no_ticket");
+    let early_data = args.flag("-early_data") || args.flag("--early_data");
+    let key_update = args.flag("-key_update") || args.flag("--key_update");
+    let enable_server_rpk = args.flag("-enable_server_rpk") || args.flag("--enable_server_rpk");
+    let enable_client_rpk = args.flag("-enable_client_rpk") || args.flag("--enable_client_rpk");
+    let no_cert_comp = args.flag("-no_cert_comp") || args.flag("--no_cert_comp");
+    let is_tcp = matches!(version, ProtocolVersion::Tls12 | ProtocolVersion::Tls13);
+    if (naccept > 1 || early_data || key_update || enable_server_rpk || enable_client_rpk)
+        && !is_tcp
+    {
+        die("-naccept / -early_data / -key_update / -enable_*_rpk are TLS-over-TCP options");
+    }
+    // `-min_protocol TLSv1.2` widens the pinned TLS 1.3 server into one
+    // that also accepts TLS 1.2 clients (the engine is picked from the
+    // ClientHello).
+    let min_version = match args.value("-min_protocol") {
+        None => version.to_pc_version(),
+        Some("TLSv1.2") | Some("tls1_2") if version == ProtocolVersion::Tls13 => PcVersion::TLSv1_2,
+        Some("TLSv1.3") | Some("tls1_3") if version == ProtocolVersion::Tls13 => PcVersion::TLSv1_3,
+        Some(v) => die(format!(
+            "-min_protocol: '{v}' is not TLSv1.2 or TLSv1.3 (the flag applies to TLS over TCP)"
+        )),
+    };
 
     let chain = load_cert_chain(cert_path);
     let key = load_signing_key(key_path);
@@ -167,9 +202,21 @@ pub(crate) fn run(args: Args) {
         ));
     }
 
+    // RFC 7250: `-enable_server_rpk` lets a client that offers
+    // `server_certificate_type = RawPublicKey` receive this key's bare
+    // SubjectPublicKeyInfo instead of the chain (X.509 stays available).
+    let own_spki = if enable_server_rpk {
+        Some(
+            key.public_key()
+                .unwrap_or_else(|| die("-enable_server_rpk: the server key has no public half"))
+                .to_spki_der(),
+        )
+    } else {
+        None
+    };
     let mut builder = Config::builder()
         .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
-        .versions(version.to_pc_version(), version.to_pc_version())
+        .versions(min_version, version.to_pc_version())
         .try_identity(chain, key)
         .unwrap_or_else(|e| die(crate::util::identity_error(cert_path, key_path, e)))
         .max_record_size(mtu);
@@ -178,6 +225,66 @@ pub(crate) fn run(args: Args) {
     }
     if let Some(sink) = keylog {
         builder = builder.key_log(sink);
+    }
+    if let Some(spki) = own_spki {
+        builder = builder
+            .server_cert_type_preference(vec![2, 0])
+            .raw_public_key_spki(spki);
+    }
+    // `-enable_client_rpk`: accept a client identity presented as a raw
+    // public key, authenticated against the `-rpk_peer_key` allowlist (a
+    // raw key has no chain, so the list is the whole trust root).
+    if enable_client_rpk {
+        let pins = args.value("-rpk_peer_key").unwrap_or_else(|| {
+            die("-enable_client_rpk needs -rpk_peer_key FILE (accepted client public keys, PEM)")
+        });
+        builder = builder.client_cert_type_preference(vec![2, 0]);
+        for spki in tlsinfo::load_spki_pems(pins, "-rpk_peer_key") {
+            builder = builder.add_expected_client_raw_public_key(spki);
+        }
+    }
+    // `-groups`: the accept-set, in server preference order; a client that
+    // shared none of them but offered one is sent a HelloRetryRequest.
+    if let Some(list) = args.value("-groups") {
+        builder = builder.key_exchange_groups(&tlsinfo::parse_groups(list, "-groups"));
+    }
+    if let Some(n) = tlsinfo::parse_record_size_limit(&args) {
+        builder = builder.record_size_limit(n);
+    }
+    #[cfg(feature = "cert-compression")]
+    if no_cert_comp {
+        builder = builder.cert_compression_algorithms(Vec::new());
+    }
+    #[cfg(not(feature = "cert-compression"))]
+    let _ = no_cert_comp;
+    // `-status_file`: a DER OCSPResponse stapled for clients that ask
+    // (RFC 6066 §8; the TLS 1.3 leaf `status_request` entry, RFC 8446
+    // §4.4.2.1, or the TLS 1.2 CertificateStatus message).
+    if let Some(path) = args.value("-status_file") {
+        let der = std::fs::read(path)
+            .unwrap_or_else(|e| die(format!("cannot read -status_file {path}: {e}")));
+        builder = builder.stapled_ocsp_response(der);
+    }
+    // Session tickets are issued by default, as `openssl s_server` does,
+    // under a per-process random key: a client that reconnects to this
+    // same process can resume. `-no_ticket` turns them off; `-early_data`
+    // additionally accepts 0-RTT on a resumed connection (echoed back like
+    // any other data — this is a test server; early data is replayable).
+    if is_tcp && !no_ticket {
+        let mut ticket_key = [0u8; 32];
+        purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut ticket_key);
+        builder = builder.ticket_key(ticket_key);
+        zero_buf(&mut ticket_key);
+        if early_data {
+            let max: u32 = args
+                .value("-max_early_data")
+                .unwrap_or("16384")
+                .parse()
+                .unwrap_or_else(|_| die("-max_early_data expects a number"));
+            builder = builder.max_early_data(max);
+        }
+    } else if early_data {
+        die("-early_data needs session tickets (drop -no_ticket)");
     }
     // `-prefer-group` makes the server answer a ClientHello that did not
     // pre-share a key for NAME with a HelloRetryRequest (RFC 8446 §4.1.4).
@@ -228,13 +335,20 @@ pub(crate) fn run(args: Args) {
             if !quiet {
                 eprintln!("listening on {bound}");
             }
-            let (mut sock, peer) = accept_with_deadline(&listener, ACCEPT_DEADLINE);
-            if !quiet {
-                eprintln!("accepted connection from {peer}");
+            // `-naccept N`: N sequential connections, sharing the ticket key
+            // so the later ones can resume the earlier ones.
+            for i in 0..naccept {
+                let (mut sock, peer) = accept_with_deadline(&listener, ACCEPT_DEADLINE);
+                if !quiet {
+                    if naccept > 1 {
+                        eprintln!("=== connection {}", i + 1);
+                    }
+                    eprintln!("accepted connection from {peer}");
+                }
+                let mut conn = Connection::server(&cfg)
+                    .unwrap_or_else(|e| die(format!("server config rejected: {e:?}")));
+                run_tcp(&mut conn, &mut sock, www, quiet, ech, key_update);
             }
-            let mut conn = Connection::server(&cfg)
-                .unwrap_or_else(|e| die(format!("server config rejected: {e:?}")));
-            run_tcp(&mut conn, &mut sock, www, quiet, ech);
         }
         ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13 => {
             // `-Verify` was already rejected above, before the config was built.
@@ -285,11 +399,31 @@ fn accept_with_deadline(listener: &TcpListener, deadline: Duration) -> (TcpStrea
     }
 }
 
-fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool, ech: bool) {
+fn run_tcp(
+    conn: &mut Connection,
+    sock: &mut TcpStream,
+    www: bool,
+    quiet: bool,
+    ech: bool,
+    key_update: bool,
+) {
     drive_tcp_handshake(conn, sock, ech);
+    // The handshake loop stops at `Complete` without draining what that
+    // last step queued (the NewSessionTicket): put it on the wire now, so a
+    // client that only came for a ticket is not left waiting for data.
+    flush_out(conn, sock);
 
     if !quiet {
-        eprintln!("handshake complete");
+        let v_str = match conn.negotiated_version() {
+            Some(PcVersion::TLSv1_2) => "TLSv1.2",
+            Some(PcVersion::TLSv1_3) => "TLSv1.3",
+            #[cfg(feature = "tls-legacy")]
+            Some(PcVersion::TLSv1_1) => "TLSv1.1",
+            #[cfg(feature = "tls-legacy")]
+            Some(PcVersion::TLSv1_0) => "TLSv1.0",
+            _ => "?",
+        };
+        eprintln!("handshake complete: {v_str}");
         if let Some(name) = conn.peer_server_name() {
             eprintln!("SNI: {name}");
         }
@@ -303,6 +437,25 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool, 
                 conn.peer_certificates().len()
             );
         }
+        tlsinfo::report_handshake(conn, Role::Server);
+    }
+
+    // 0-RTT the handshake accepted is replayable (RFC 8446 §8); this test
+    // server echoes it like any other input, so a client can see it landed.
+    let early = conn.take_early_data().unwrap_or_default();
+    if !early.is_empty() {
+        if !quiet {
+            eprintln!("early data: {} bytes", early.len());
+        }
+        let _ = conn.send(&early);
+        flush_out(conn, sock);
+    }
+    // `-key_update`: rekey before the first byte of application data
+    // (RFC 8446 §4.6.3) and ask the client to rekey too.
+    if key_update {
+        conn.request_key_update()
+            .unwrap_or_else(|e| die(format!("KeyUpdate refused: {e:?}")));
+        flush_out(conn, sock);
     }
 
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -357,6 +510,9 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool, 
                     if conn.feed(&buf[..n]).is_err() {
                         break;
                     }
+                    // A KeyUpdate reply the engine owes the client goes out
+                    // before any echo under the new key.
+                    flush_out(conn, sock);
                     let plain = conn.recv().unwrap_or_default();
                     if !plain.is_empty() {
                         if conn.send(&plain).is_err() {
@@ -386,6 +542,19 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool, 
             let _ = sock.flush();
         }
         let _ = sock.shutdown(std::net::Shutdown::Write);
+    }
+    if !quiet {
+        tlsinfo::report_session_end(conn);
+    }
+}
+
+/// Writes whatever the engine has queued (a KeyUpdate, an echo, an alert).
+fn flush_out(conn: &mut Connection, sock: &mut TcpStream) {
+    if let Ok(out) = conn.pop()
+        && !out.is_empty()
+    {
+        let _ = sock.write_all(&out);
+        let _ = sock.flush();
     }
 }
 

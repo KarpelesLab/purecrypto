@@ -181,6 +181,8 @@ purecrypto pkey < key.pem             # re-emit the private key (round-trip)
 ```
 
 `pkey` auto-detects RSA PKCS#1, EC SEC1, and every PKCS#8 type above.
+`req`, `x509`, `ca`, `s_server` and `s_client -key` load ML-DSA-44/65/87
+PKCS#8 keys as well as RSA, EC, Ed25519 and Ed448 ones.
 
 ## `pkeyutl`
 
@@ -350,14 +352,22 @@ RFC 5077 tickets supported). The same two commands drive DTLS and QUIC
 through version flags, described below.
 
 ```text
-purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name]
-                    [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1]
-                    [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...]
+purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2]
+                    [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts]
+                    [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N]
+                    [-groups x25519:secp256r1] [-key-shares x25519,...]
+                    [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]]
+                    [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk]
+                    [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS]
                     [-keylogfile keys.log] [-quiet]
                     [-ech-config-list list [-ech-retry-configs-out FILE] | -ech-grease]
 purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2 | -dtls1_2 | -dtls1_3]
-                    [-Verify ca.pem] [-alpn h2,http/1.1] [-www] [-mtu N] [-no_cookie]
-                    [-prefer-group NAME] [-keylogfile keys.log] [-quiet]
+                    [-min_protocol TLSv1.2] [-Verify ca.pem] [-alpn h2,http/1.1] [-www]
+                    [-naccept N] [-mtu N] [-no_cookie] [-groups x25519:secp256r1]
+                    [-prefer-group NAME] [-no_ticket] [-early_data [-max_early_data N]]
+                    [-key_update] [-status_file resp.der] [-enable_server_rpk]
+                    [-enable_client_rpk -rpk_peer_key pub.pem] [-record_size_limit N]
+                    [-no_cert_comp] [-keylogfile keys.log] [-quiet]
                     [-ech-key key.bin -ech-config config.bin]
 ```
 
@@ -372,6 +382,32 @@ purecrypto s_client -connect server:443 -cert client.pem -key client.key   # mTL
 purecrypto s_server -cert server.pem -key server.key -accept 4433        # echo
 purecrypto s_server -cert server.pem -key server.key -accept 4433 -www   # one fixed HTTP response
 purecrypto s_server -cert server.pem -key server.key -accept 8443 -Verify client-ca.pem   # require + verify client certs
+
+# Resume: two connections, the second offering the first one's ticket and
+# 0-RTT data; the server accepts two connections and 0-RTT.
+purecrypto s_server -cert server.pem -key server.key -accept 4433 -naccept 2 -early_data
+purecrypto s_client -connect 127.0.0.1:4433 -CAfile ca.crt -reconnect -early_data first.txt
+```
+
+After the handshake both commands print the negotiated parameters to
+stderr, one `key: value` line per fact, so a harness can grep each one
+(this is what `tools/interop/run.sh` checks against the peer's own log):
+
+```text
+cipher suite: TLS_AES_128_GCM_SHA256
+key exchange: X25519MLKEM768
+HelloRetryRequest: no
+resumed: no
+early data: none                     # accepted | rejected | none
+peer certificate: X.509 (2)          # raw public key | none
+peer certificate compression: none   # client: zlib when the server compressed
+own certificate: X.509               # server (and an RPK client): raw public key
+own certificate compression: zlib    # server
+OCSP staple: no                      # client
+record_size_limit: not negotiated
+…
+KeyUpdate: sent 1, received 1        # once the data phase is over
+close_notify: received               # the peer ended the session properly
 ```
 
 Behaviour worth knowing:
@@ -382,10 +418,56 @@ Behaviour worth knowing:
   comma-separated list) pre-shares keys for those groups only: every group is
   still offered, and a server preferring another answers with a
   HelloRetryRequest.
+- `-groups x25519:secp256r1` (colon- or comma-separated, `openssl -groups`
+  spelling; `p256` / `P-256` are accepted too) restricts and orders the
+  groups. On the client it is the `supported_groups` offer, with a share
+  for each (narrow those further with `-key-shares`). On the server it is
+  the accept-set in *server* preference: the first listed group the client
+  shared wins, and a client that shared none of them but offered one is
+  sent a HelloRetryRequest for it. `-ciphersuites TLS_AES_128_GCM_SHA256:…`
+  restricts and orders the client's TLS 1.3 suites the same way.
 - `s_server -prefer-group NAME` (`x25519`, `secp256r1`, `secp384r1`,
   `X25519MLKEM768`) makes the server ask, by HelloRetryRequest, for that group
   whenever the client offers it without a key share. After the handshake the
   server prints the SNI it was sent (`SNI: …`).
+- `-min_protocol TLSv1.2` widens the pinned TLS 1.3 client or server into a
+  version-spanning one (1.2..=1.3), the fallback `openssl` performs by
+  default; the `connected:` / `handshake complete:` line says which was
+  negotiated.
+- `s_server` issues a session ticket after every TLS 1.3 handshake (under a
+  per-process random key; `-no_ticket` turns it off) and, with `-naccept N`,
+  serves N connections in a row, so a client can come back and resume.
+  `-early_data` accepts 0-RTT on a resumed connection (`-max_early_data`
+  caps it, default 16384) and echoes it like any other input: early data is
+  replayable (RFC 8446 §8), this is a test server. `s_client -reconnect`
+  connects twice — the first time only to be issued a ticket — and offers
+  it on the second connection; `-early_data FILE` sends the file as 0-RTT
+  with that offer, and re-sends it as ordinary data if the server rejected
+  it (as one does after a HelloRetryRequest).
+- `-key_update` (either side) sends `KeyUpdate(update_requested)` right after
+  the handshake, before any application data; the tally line at the end
+  shows the peer's reply. A peer's own `KeyUpdate(update_requested)` is
+  answered in kind.
+- RFC 7250 raw public keys: `s_server -enable_server_rpk` sends the bare
+  public key of `-key` (no chain) to a client that offers
+  `server_certificate_type = RawPublicKey`; `s_client -enable_server_rpk`
+  offers it (X.509 still accepted) and must pin the server's key with
+  `-rpk_peer_key FILE` (a `PUBLIC KEY` PEM, as `pkey -pubout` writes; several
+  blocks form an allowlist), since there is no chain to validate. The other
+  direction is `s_client -cert … -key … -enable_client_rpk` (present the
+  identity as a raw key when the server asks for a certificate) against
+  `s_server -Verify ca.pem -enable_client_rpk -rpk_peer_key FILE` (accept
+  raw client keys from that allowlist; `-Verify` still makes the request).
+- `s_server -status_file resp.der` staples a DER OCSP response (RFC 6066 §8;
+  on TLS 1.3 in the leaf's `status_request` entry); the client always asks,
+  validates a staple against the chain, and reports `OCSP staple: yes`.
+- `-record_size_limit N` (64..=16385) advertises RFC 8449; `-no_cert_comp`
+  turns off the RFC 8879 `compress_certificate` advertisement (zlib is
+  advertised by default in a build with `cert-compression`).
+- `s_client -read_timeout SECS` (default 5) is how long the client waits for
+  more data after the last byte before ending the session with
+  `close_notify`; it then waits, bounded by the same timeout, for the
+  peer's `close_notify` and reports whether it came.
 - `s_server` is a one-shot test server: it accepts one connection, exchanges
   data, and exits (over TCP it also gives up after 60 s without a client).
   `-accept` takes a bare port, which binds `127.0.0.1`; the DTLS and QUIC

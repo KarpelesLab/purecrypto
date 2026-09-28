@@ -41,16 +41,26 @@ pub(crate) fn die(msg: impl AsRef<str>) -> ! {
 }
 
 /// Parses a TLS identity private key from PEM in every form the stack can
-/// sign with: PKCS#1 RSA, SEC1 EC, and PKCS#8 (RSA, EC, Ed25519, Ed448).
-/// The PKCS#8 parsers each check the algorithm OID, so the shared
-/// `-----BEGIN PRIVATE KEY-----` label is unambiguous. Shared by
+/// sign with: PKCS#1 RSA, SEC1 EC, and PKCS#8 (RSA, EC, Ed25519, Ed448,
+/// ML-DSA-44/65/87). The PKCS#8 parsers each check the algorithm OID, so
+/// the shared `-----BEGIN PRIVATE KEY-----` label is unambiguous. Shared by
 /// `s_server`, `s_client -cert/-key` and `q_server`, which used to know
 /// only the legacy PKCS#1 / SEC1 forms for RSA / EC — refusing the PKCS#8
 /// keys `openssl genpkey` emits by default.
 pub(crate) fn signing_key_from_pem(pem: &str) -> Option<purecrypto::tls::SigningKey> {
     use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
+    use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
     use purecrypto::rsa::BoxedRsaPrivateKey;
     use purecrypto::tls::SigningKey;
+    if let Ok(k) = MlDsa44PrivateKey::from_pkcs8_pem(pem) {
+        return Some(SigningKey::MlDsa44(k));
+    }
+    if let Ok(k) = MlDsa65PrivateKey::from_pkcs8_pem(pem) {
+        return Some(SigningKey::MlDsa65(k));
+    }
+    if let Ok(k) = MlDsa87PrivateKey::from_pkcs8_pem(pem) {
+        return Some(SigningKey::MlDsa87(k));
+    }
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
         return Some(SigningKey::Rsa(k));
     }
