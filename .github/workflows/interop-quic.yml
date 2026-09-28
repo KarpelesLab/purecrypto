@@ -1,0 +1,116 @@
+name: QUIC interop
+
+# Interop-tests the QUIC v1 engine (RFC 9000/9001/9002/9221) against two
+# independent stacks over real loopback UDP sockets:
+#
+# * quic-go (pinned in tools/quic-interop/quicgo/go.mod), in BOTH roles:
+#   handshake and bidirectional / unidirectional stream echo, an 8 MiB
+#   transfer (flow control, quic-go's own key update and connection-ID
+#   rotation), the same transfer with 1-in-50 datagram loss (RFC 9002
+#   recovery both ways), Retry, session resumption, 0-RTT, a
+#   purecrypto-initiated key update, ChaCha20-Poly1305 and AES-256-GCM,
+#   CONNECTION_CLOSE with an application error, the idle timeout, DATAGRAM
+#   frames, client migration to a new socket (path validation), a
+#   connection-ID switch, version negotiation, stateless reset, ECN
+#   validation and the X25519MLKEM768 key exchange.
+# * OpenSSL (built from source at a pinned tag and cached), `s_client -quic`
+#   against the purecrypto server: s_server has no QUIC mode, so this is the
+#   client direction only — handshake, all three suites, Retry, an 8 MiB
+#   upload, resumption, X25519MLKEM768 and a server-initiated key update.
+#
+# Loopback (purecrypto<->purecrypto) cannot catch a symmetric bug; this
+# gate found two on its first run: a server could not answer a PATH_CHALLENGE
+# from an address the peer was only probing (so a quic-go client never
+# migrated), and a server-initiated key update in the HANDSHAKE_DONE flight
+# made OpenSSL close with KEY_UPDATE_ERROR. The matrix lives in
+# tools/quic-interop/run.sh, which runs every process under `timeout` so a
+# hang fails its case in seconds and checks every outcome from both sides'
+# logs (plus quic-go's qlog traces).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Bump deliberately: the cache key follows it.
+  OPENSSL_TAG: openssl-3.6.4
+
+jobs:
+  interop:
+    name: QUIC v1 vs quic-go and OpenSSL
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: tools/quic-interop/quicgo/go.mod
+          cache-dependency-path: tools/quic-interop/quicgo/go.sum
+
+      - name: Cache OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v5
+        with:
+          path: ~/openssl
+          key: openssl-${{ env.OPENSSL_TAG }}-${{ runner.os }}-v1
+
+      - name: Build OpenSSL
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "$OPENSSL_TAG" https://github.com/openssl/openssl.git openssl-src
+          cd openssl-src
+          ./Configure --prefix="$HOME/openssl" --libdir=lib no-shared no-docs no-tests
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Build the quic-go peer
+        working-directory: tools/quic-interop/quicgo
+        run: go build -o "$HOME/quicgo-peer" .
+
+      - name: Build the purecrypto CLI
+        run: cargo build --release --bin purecrypto
+
+      - name: Versions
+        run: |
+          "$HOME/openssl/bin/openssl" version
+          go version
+          grep quic-go tools/quic-interop/quicgo/go.mod
+
+      - name: QUIC interop matrix (both roles)
+        timeout-minutes: 20
+        run: |
+          mkdir -p "$RUNNER_TEMP/quic-interop"
+          TMPDIR="$RUNNER_TEMP/quic-interop" \
+          QUIC_INTEROP_KEEP=1 \
+          OPENSSL="$HOME/openssl/bin/openssl" \
+          QUICGO="$HOME/quicgo-peer" \
+          PURECRYPTO="$GITHUB_WORKSPACE/target/release/purecrypto" \
+          tools/quic-interop/run.sh
+
+      - name: Upload logs and qlog traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-interop-logs
+          path: |
+            ${{ runner.temp }}/quic-interop
+            !${{ runner.temp }}/quic-interop/**/big.bin
+            !${{ runner.temp }}/quic-interop/**/*large*/client.out
+            !${{ runner.temp }}/quic-interop/**/*loss*/client.out
+            !${{ runner.temp }}/quic-interop/**/*ecn*/client.out
+          if-no-files-found: ignore
