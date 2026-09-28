@@ -4,6 +4,7 @@
 
 mod ca;
 mod crl;
+mod dtls_io;
 mod ech;
 mod ecn_socket;
 mod enc;

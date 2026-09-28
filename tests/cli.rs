@@ -7542,3 +7542,250 @@ fn pkcs12_export_and_unpack_round_trip() {
         "the PKCS#8 key must round-trip byte for byte"
     );
 }
+
+/// A UDP relay in front of the server on `target` that forwards everything
+/// between it and the one client that talks to the relay, except the
+/// datagrams `drop` claims: it is called with the direction (`true` =
+/// client to server) and the datagram. Returns the relay's port; the
+/// thread ends with the test process.
+fn spawn_udp_relay(target: u16, mut drop: impl FnMut(bool, &[u8]) -> bool + Send + 'static) -> u16 {
+    use std::net::UdpSocket;
+    let front = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = front.local_addr().unwrap().port();
+    let back = UdpSocket::bind("127.0.0.1:0").unwrap();
+    back.connect(("127.0.0.1", target)).unwrap();
+    let poll = Some(std::time::Duration::from_millis(5));
+    front.set_read_timeout(poll).unwrap();
+    back.set_read_timeout(poll).unwrap();
+    std::thread::spawn(move || {
+        let mut client = None;
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Ok((n, from)) = front.recv_from(&mut buf) {
+                client = Some(from);
+                if !drop(true, &buf[..n]) {
+                    let _ = back.send(&buf[..n]);
+                }
+            }
+            if let Ok(n) = back.recv(&mut buf)
+                && let Some(to) = client
+                && !drop(false, &buf[..n])
+            {
+                let _ = front.send_to(&buf[..n], to);
+            }
+        }
+    });
+    port
+}
+
+/// Writes a self-signed P-256 identity for 127.0.0.1 into `dir`; returns
+/// the certificate and key paths.
+fn write_dtls_identity(dir: &std::path::Path) -> (String, String) {
+    use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+    std::fs::create_dir_all(dir).unwrap();
+    let mut rng = OsRng;
+    let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
+    (
+        cert_path.to_str().unwrap().to_string(),
+        key_path.to_str().unwrap().to_string(),
+    )
+}
+
+/// True for a datagram whose first record is a DTLS 1.3 protected record
+/// (unified header, RFC 9147 §4) of `epoch` (its two low bits).
+fn is_dtls13_record(datagram: &[u8], epoch: u8) -> bool {
+    datagram
+        .first()
+        .is_some_and(|b| b & 0xE0 == 0x20 && b & 0x03 == epoch)
+}
+
+/// The DTLS 1.3 client's final flight — its Finished — is lost. The client
+/// has completed the handshake by then and the server has not: `s_client`
+/// must keep retransmitting the Finished until the server acknowledges it
+/// (RFC 9147 §5.8.1, §7) and only then send its input and its
+/// close_notify. It used to send both at once and leave (here with
+/// `-read_timeout 0`, before its retransmission timer ever fired): the
+/// server discarded the data, never completed the handshake, and — a peer
+/// that reads the application epoch early — failed it on the close_notify.
+#[test]
+fn dtls13_client_retransmits_a_lost_finished_before_it_speaks_or_closes() {
+    let dir = std::env::temp_dir().join(format!("pc_dtls13_lost_fin_{}", std::process::id()));
+    let (cert, key) = write_dtls_identity(&dir);
+    let server = spawn_server_wait_listening(&[
+        "s_server",
+        "-dtls1_3",
+        "-cert",
+        &cert,
+        "-key",
+        &key,
+        "-accept",
+        "0",
+        "-no_cookie",
+    ]);
+    // The client's epoch-2 datagrams are ACKs (40-odd bytes for the few
+    // records of this flight) and the Finished (a 12-byte handshake header
+    // and a 32-byte MAC under the AEAD: 66 bytes). Drop the first
+    // Finished.
+    let mut dropped = false;
+    let relay = spawn_udp_relay(server.port, move |to_server, dg| {
+        if to_server && !dropped && is_dtls13_record(dg, 2) && dg.len() >= 60 {
+            dropped = true;
+            return true;
+        }
+        false
+    });
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-dtls1_3",
+            "-connect",
+            &format!("127.0.0.1:{relay}"),
+            "-insecure",
+            "-read_timeout",
+            "0",
+        ],
+        b"hello\n",
+    );
+    let server_err = server.finish_with_stderr();
+    assert!(ok, "s_client failed: {err}");
+    assert!(
+        server_err.contains("handshake complete: DTLSv1.3"),
+        "the server never completed its handshake:\n{server_err}"
+    );
+    assert!(out.contains("hello"), "no echo: {out:?}\n{err}");
+    assert!(
+        server_err.contains("close_notify: received"),
+        "the client's close_notify did not reach the server:\n{server_err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The mirror image: the DTLS 1.3 server's ACK for the client's Finished
+/// is lost, twice, and so is the client's second retransmission of its
+/// Finished — the third comes seven seconds into the connection, past
+/// `s_server`'s five-second idle limit. The server must still be there to
+/// acknowledge it (RFC 9147 §5.8.1) instead of sending its idle
+/// close_notify to a client that is waiting for that ACK.
+#[test]
+fn dtls13_server_outlasts_the_retransmissions_of_a_client_finished() {
+    let dir = std::env::temp_dir().join(format!("pc_dtls13_lost_ack_{}", std::process::id()));
+    let (cert, key) = write_dtls_identity(&dir);
+    let server = spawn_server_wait_listening(&[
+        "s_server",
+        "-dtls1_3",
+        "-cert",
+        &cert,
+        "-key",
+        &key,
+        "-accept",
+        "0",
+        "-no_cookie",
+    ]);
+    let (mut acks, mut finisheds) = (0, 0);
+    let relay = spawn_udp_relay(server.port, move |to_server, dg| {
+        if to_server {
+            if is_dtls13_record(dg, 2) && dg.len() >= 60 {
+                finisheds += 1;
+                // The original and the first retransmission arrive.
+                return finisheds == 3;
+            }
+        } else if is_dtls13_record(dg, 3) {
+            acks += 1;
+            return acks <= 2;
+        }
+        false
+    });
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-dtls1_3",
+            "-connect",
+            &format!("127.0.0.1:{relay}"),
+            "-insecure",
+            "-read_timeout",
+            "1",
+        ],
+        b"hello\n",
+    );
+    let server_err = server.finish_with_stderr();
+    assert!(ok, "s_client failed: {err}");
+    assert!(out.contains("hello"), "no echo: {out:?}\n{err}");
+    assert!(
+        err.contains("close_notify: received"),
+        "the session did not end in an exchange of close_notify:\n{err}"
+    );
+    assert!(
+        server_err.contains("close_notify: received"),
+        "server:\n{server_err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DTLS 1.2: the server's final flight (ChangeCipherSpec + Finished) is
+/// lost twice. The client retransmits its own final flight on the timer
+/// and the server answers each copy with the flight again (RFC 6347
+/// §4.2.4); the exchange then runs as usual.
+#[test]
+fn dtls12_server_resends_a_lost_final_flight() {
+    let dir = std::env::temp_dir().join(format!("pc_dtls12_lost_fin_{}", std::process::id()));
+    let (cert, key) = write_dtls_identity(&dir);
+    let server = spawn_server_wait_listening(&[
+        "s_server",
+        "-dtls1_2",
+        "-cert",
+        &cert,
+        "-key",
+        &key,
+        "-accept",
+        "0",
+        "-no_cookie",
+    ]);
+    // Record header: type (22 = handshake), version, epoch (2 bytes).
+    let mut finisheds = 0;
+    let relay = spawn_udp_relay(server.port, move |to_server, dg| {
+        if !to_server && dg.len() > 4 && dg[0] == 22 && dg[3..5] == [0, 1] {
+            finisheds += 1;
+            return finisheds <= 2;
+        }
+        false
+    });
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-dtls1_2",
+            "-connect",
+            &format!("127.0.0.1:{relay}"),
+            "-insecure",
+            "-read_timeout",
+            "1",
+        ],
+        b"hello\n",
+    );
+    let server_err = server.finish_with_stderr();
+    assert!(ok, "s_client failed: {err}");
+    assert!(out.contains("hello"), "no echo: {out:?}\n{err}");
+    assert!(
+        server_err.contains("close_notify: received"),
+        "server:\n{server_err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

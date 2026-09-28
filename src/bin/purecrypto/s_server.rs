@@ -15,6 +15,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
+use crate::dtls_io::{self, Clock, Step};
 use crate::tlsinfo::{self, Role};
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, zero_buf};
 use purecrypto::rng::OsRng;
@@ -655,9 +656,13 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool
     };
     let mut conn =
         Connection::server(&cfg).unwrap_or_else(|e| die(format!("server config rejected: {e:?}")));
+    // One clock for the connection's whole life: the engine's timers are
+    // expressed in it (see `dtls_io`).
+    let clock = Clock::start();
+    conn.set_now(clock.now());
     let _ = conn.feed(&buf);
 
-    drive_udp_handshake(&mut conn, &socket, mtu, Duration::from_secs(15));
+    drive_udp_handshake(&mut conn, &socket, &clock, mtu);
 
     if !quiet {
         let v_str = match conn.negotiated_version() {
@@ -674,11 +679,12 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool
     // `-key_update`: rekey before the first byte of application data
     // (RFC 9147 §8) and ask the client to rekey too.
     if key_update {
+        conn.set_now(clock.now());
         conn.request_key_update()
             .unwrap_or_else(|e| die(format!("KeyUpdate refused: {e:?}")));
-        flush_udp(&mut conn, &socket);
+        dtls_io::flush(&mut conn, &socket);
     }
-    drive_udp_echo(&mut conn, &socket, mtu, Duration::from_secs(5));
+    drive_udp_echo(&mut conn, &socket, &clock, mtu, Duration::from_secs(5));
     if !quiet {
         tlsinfo::report_session_end(&conn);
     }
@@ -686,115 +692,84 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool
     let _: Option<SocketAddr> = bound;
 }
 
-/// Sends every datagram the engine has queued (retransmits, ACKs, a
-/// KeyUpdate or its reply, an echo, an alert).
-fn flush_udp(conn: &mut Connection, socket: &UdpSocket) {
-    loop {
-        let dg = conn.pop().unwrap_or_default();
-        if dg.is_empty() {
-            break;
-        }
-        let _ = socket.send(&dg);
-    }
-}
-
-fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, mtu: usize, deadline: Duration) {
-    let start = Instant::now();
+fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, clock: &Clock, mtu: usize) {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
-    socket
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .ok();
     while !conn.is_handshake_complete() {
-        if start.elapsed() > deadline {
+        if clock.now() > dtls_io::HANDSHAKE_DEADLINE {
             die("DTLS handshake deadline exceeded");
         }
-        loop {
-            let dg = conn.pop().unwrap_or_default();
-            if dg.is_empty() {
-                break;
-            }
-            let _ = socket.send(&dg);
-        }
-        match socket.recv(&mut buf) {
-            Ok(n) => {
-                let _ = conn.feed(&buf[..n]);
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                // Fire the retransmit timer only once its deadline has
-                // actually passed on the engine's clock (elapsed since we
-                // started driving it); see the matching note in
-                // `s_client`. Passing the deadline itself as `now` fired
-                // the timer on every 500 ms socket timeout, collapsing
-                // the RFC 6347 §4.2.4.1 backoff and giving up after ~3 s.
-                let now = start.elapsed();
-                if let Some(t) = conn.next_timeout()
-                    && now >= t
-                {
-                    conn.on_timeout(now);
-                }
-            }
-            Err(e) => die(format!("UDP recv failed: {e}")),
+        // The retransmit timer fires on the engine's own schedule (1 s,
+        // doubling: RFC 6347 §4.2.4.1 / RFC 9147 §5.8.2), on the
+        // connection's clock; see the matching note in `s_client`.
+        match dtls_io::step(conn, socket, clock, &mut buf) {
+            Ok(Step::Datagram | Step::Quiet) => {}
+            Ok(Step::Gone) => die("UDP recv failed: the client is unreachable"),
+            Err(e) => die(format!("DTLS handshake failed: {e:?}")),
         }
     }
-    // Drain any pending ACK datagrams.
-    loop {
-        let dg = conn.pop().unwrap_or_default();
-        if dg.is_empty() {
-            break;
-        }
-        let _ = socket.send(&dg);
-    }
+    // The flight that completed the handshake (the final flight, ACKs).
+    dtls_io::flush(conn, socket);
+}
+
+/// Echoes the application data in `plain`; `false` when the engine
+/// refuses to send.
+fn echo(conn: &mut Connection, plain: &[u8]) -> bool {
+    plain.is_empty() || conn.send(plain).is_ok()
 }
 
 /// Echoes application data until the client says goodbye (its close_notify
 /// is answered in kind) or `idle_limit` passes without a datagram; the
 /// session then ends with this side's close_notify (RFC 8446 §6.1 / RFC
-/// 5246 §7.2.1). The engine's retransmit timer (a KeyUpdate in flight, a
-/// Finished the client may not have seen) is fired on the way.
-fn drive_udp_echo(conn: &mut Connection, socket: &UdpSocket, mtu: usize, idle_limit: Duration) {
+/// 5246 §7.2.1). The engine's retransmit timer (a KeyUpdate in flight) is
+/// fired on the way.
+///
+/// A client that has not been heard from since the handshake is given
+/// longer than `idle_limit`: it may still be inside its handshake — the
+/// last thing this side sent (the ACK for its Finished on DTLS 1.3, the
+/// ChangeCipherSpec + Finished flight on DTLS 1.2) was lost — and then it
+/// retransmits its Finished on a backoff that outgrows the idle limit. A
+/// close_notify sent into that gap fails its handshake.
+fn drive_udp_echo(
+    conn: &mut Connection,
+    socket: &UdpSocket,
+    clock: &Clock,
+    mtu: usize,
+    idle_limit: Duration,
+) {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
-    socket
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .ok();
-    let start = Instant::now();
     let mut last_activity = Instant::now();
     loop {
-        if last_activity.elapsed() > idle_limit || conn.received_close_notify() {
+        if conn.received_close_notify() {
             break;
         }
-        match socket.recv(&mut buf) {
-            Ok(n) => {
+        if last_activity.elapsed() > idle_limit {
+            if conn.handshake_flight_pending() {
+                dtls_io::settle(conn, socket, clock, &mut buf, |conn, plain| {
+                    echo(conn, &plain);
+                });
+                if !conn.handshake_flight_pending() && !conn.received_close_notify() {
+                    // The client has just shown up: back to echoing.
+                    last_activity = Instant::now();
+                    continue;
+                }
+            }
+            break;
+        }
+        match dtls_io::step(conn, socket, clock, &mut buf) {
+            Ok(Step::Datagram) => {
                 last_activity = Instant::now();
-                if conn.feed(&buf[..n]).is_err() {
-                    break;
-                }
-                // A KeyUpdate reply the engine owes the client goes out
-                // before any echo under the new key.
-                flush_udp(conn, socket);
+                // (A KeyUpdate reply the engine owed the client went out
+                // in `step`, before any echo under the new key.)
                 let plain = conn.recv().unwrap_or_default();
-                if !plain.is_empty() && conn.send(&plain).is_err() {
+                if !echo(conn, &plain) {
                     break;
                 }
-                flush_udp(conn, socket);
+                dtls_io::flush(conn, socket);
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                let now = start.elapsed();
-                if let Some(t) = conn.next_timeout()
-                    && now >= t
-                {
-                    conn.on_timeout(now);
-                    flush_udp(conn, socket);
-                }
-            }
-            Err(_) => break,
+            Ok(Step::Quiet) => {}
+            Ok(Step::Gone) | Err(_) => break,
         }
     }
     let _ = conn.close();
-    flush_udp(conn, socket);
+    dtls_io::flush(conn, socket);
 }

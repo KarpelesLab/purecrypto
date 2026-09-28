@@ -383,7 +383,7 @@ purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_pro
                     [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]]
                     [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk]
                     [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS]
-                    [-keylogfile keys.log] [-quiet]
+                    [-resend N] [-keylogfile keys.log] [-quiet]
                     [-ech-config-list list [-ech-retry-configs-out FILE] | -ech-grease]
 purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2 | -dtls1_2 | -dtls1_3]
                     [-min_protocol TLSv1.2] [-Verify ca.pem] [-alpn h2,http/1.1] [-www]
@@ -608,8 +608,23 @@ DTLS cases the way it checks TLS ones. `-groups`, `-key-shares` and
 set as over TCP; `-key_update` (DTLS 1.3 only, RFC 9147 §8) rekeys right
 after the handshake and asks the peer to. The session ends with a
 `close_notify` in a protected record, answered in kind, and the client
-waits `-read_timeout` seconds for the peer's before reporting. Not
-implemented over DTLS, and refused up front: client certificates
+waits `-read_timeout` seconds for the peer's before reporting.
+
+Over a lossy path both commands keep a connection going for as long as the
+*other* side may still be inside its handshake. A flight is retransmitted
+on the engine's timer (1 s, doubling; the handshake may take 45 s in all),
+and the side that finishes first does not stop there: the DTLS 1.3 client
+retransmits its Finished until the server has acknowledged it (RFC 9147
+§5.8.1, §7) and only then sends its input and, later, its `close_notify`;
+the servers keep answering a retransmitted client Finished — with the ACK
+on DTLS 1.3, with their final flight on DTLS 1.2 (RFC 6347 §4.2.4) — and,
+while the client has not been heard from since the handshake, put off
+their idle `close_notify` by up to 20 s. (A `close_notify` that reaches a
+peer still in its handshake fails that handshake.) Application data is
+not retransmitted by DTLS: `s_client -resend N` sends the input again, up
+to N more times, each time `-read_timeout` passes without an answer.
+
+Not implemented over DTLS, and refused up front: client certificates
 (`-Verify`, `-cert`), resumption and 0-RTT (`-reconnect`, `-early_data`,
 `-naccept`), raw public keys, `-record_size_limit`, ECH.
 
