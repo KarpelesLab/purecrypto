@@ -138,8 +138,9 @@ pub struct EchConfigContents {
     /// the public_name certificate must cover. Length 1..=255.
     pub public_name: Vec<u8>,
     /// `extensions`: an `Extension extensions<0..2^16-1>` of ECHConfig
-    /// extensions. Unrecognised extensions whose high bit is set
-    /// (mandatory) MUST cause clients to reject the config (draft §4.2).
+    /// extensions. An entry carrying an unrecognised extension whose high
+    /// bit is set (mandatory) is ignored (RFC 9849 §4.2): it decodes with
+    /// [`EchConfig::contents`] `None`, like an unknown version.
     pub extensions: Vec<u8>,
 }
 
@@ -168,9 +169,11 @@ impl EchConfigContents {
         let ext_len = rd.read_u16()? as usize;
         let extensions = rd.read(ext_len)?.to_vec();
 
-        // draft §4.2: reject mandatory unknown extensions (high bit set).
-        // The extensions field carries a list of `Extension { type<u16>, data<0..2^16-1> }`.
-        validate_config_extensions(&extensions)?;
+        // The extensions field carries a list of `Extension { type<u16>,
+        // data<0..2^16-1> }`; a malformed list is a decode error. A
+        // well-formed one naming a mandatory extension makes the entry
+        // unusable, not the list undecodable — see `decode_entry`.
+        has_mandatory_extension(&extensions)?;
 
         Ok(Self {
             key_config,
@@ -189,9 +192,11 @@ impl EchConfigContents {
 pub struct EchConfig {
     /// The wire version (`0xfe0d` for the draft we implement).
     pub version: u16,
-    /// The parsed contents (only present for known versions; the
-    /// raw bytes are kept in `raw_contents` for round-tripping
-    /// unknown configs in a `ECHConfigList`).
+    /// The parsed contents — present only for the version this crate
+    /// implements, and only when the entry carries no mandatory extension
+    /// it does not understand (RFC 9849 §4.2: "clients MUST ignore the
+    /// ECHConfig"). The raw bytes are kept in `raw_contents` so every entry
+    /// round-trips through `ECHConfigList::encode` losslessly.
     pub contents: Option<EchConfigContents>,
     /// The raw `contents` bytes — kept so unknown-version configs
     /// round-trip through `ECHConfigList::encode` losslessly.
@@ -227,14 +232,18 @@ impl EchConfig {
     /// version half; a config with an unknown KEM or only exotic
     /// suites parses fine but can never be sealed against, and a
     /// client that picks it anyway has no ECH to offer. `public_name`
-    /// must also be UTF-8, since it becomes the outer hello's SNI.
+    /// must also be a valid DNS host name that cannot be read as an IPv4
+    /// literal, since it becomes the outer hello's SNI and the name a
+    /// rejected handshake is authenticated as (RFC 9849 §6.1.7: clients
+    /// "SHOULD ignore any ECHConfig structure with a public_name that is
+    /// not a valid host name in preferred name syntax").
     pub fn usable_cipher_suite(&self) -> Option<HpkeSymCipherSuite> {
         if !self.is_supported() {
             return None;
         }
         let contents = self.contents.as_ref()?;
         if super::hpke_setup::map_kem(contents.key_config.kem_id).is_err()
-            || core::str::from_utf8(&contents.public_name).is_err()
+            || !valid_public_name(&contents.public_name)
         {
             return None;
         }
@@ -264,7 +273,14 @@ impl EchConfig {
             if !inner.is_empty() {
                 return Err(Error::EchDecodeError);
             }
-            Some(c)
+            // RFC 9849 §4.2: an unsupported mandatory extension makes the
+            // client ignore this ECHConfig — not the whole list, which
+            // §6.2.2 even encourages servers to salt with such entries.
+            if has_mandatory_extension(&c.extensions)? {
+                None
+            } else {
+                Some(c)
+            }
         } else {
             None
         };
@@ -395,21 +411,48 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// `validate_config_extensions(bytes)` — walks `Extension extensions<0..2^16-1>`
-/// from `ECHConfigContents.extensions` and ensures any "mandatory"
-/// (high-bit-set type) extension is recognised. We currently recognise
-/// no ECH-config-level extensions, so any mandatory extension is an
-/// error per draft §4.2.
-fn validate_config_extensions(buf: &[u8]) -> Result<(), Error> {
+/// Walks `Extension extensions<0..2^16-1>` from
+/// `ECHConfigContents.extensions` and reports whether any is "mandatory"
+/// (high-bit-set type, RFC 9849 §4.2). This crate recognises no ECHConfig
+/// extension, so every mandatory one is unsupported. A structurally
+/// malformed list is [`Error::EchDecodeError`].
+fn has_mandatory_extension(buf: &[u8]) -> Result<bool, Error> {
     let mut rd = Reader::new(buf);
+    let mut mandatory = false;
     while !rd.is_empty() {
         let ty = rd.read_u16()?;
         let len = rd.read_u16()? as usize;
         let _data = rd.read(len)?;
-        // High bit set ⇒ mandatory.
-        if ty & 0x8000 != 0 {
-            return Err(Error::EchDecodeError);
-        }
+        mandatory |= ty & 0x8000 != 0;
     }
-    Ok(())
+    Ok(mandatory)
+}
+
+/// RFC 9849 §6.1.7: a usable `public_name` is a dot-separated sequence of
+/// LDH labels (RFC 5890 §2.3.1: letters, digits and hyphens, not starting
+/// or ending with a hyphen) of at most 63 octets each, with no leading or
+/// trailing dot, whose final label is neither all digits nor `0x`/`0X`
+/// followed by hex digits — either would read as an IPv4 literal.
+fn valid_public_name(name: &[u8]) -> bool {
+    if name.is_empty() || name.first() == Some(&b'.') || name.last() == Some(&b'.') {
+        return false;
+    }
+    let ldh = |label: &[u8]| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+            && label.first() != Some(&b'-')
+            && label.last() != Some(&b'-')
+    };
+    if !name.split(|&b| b == b'.').all(ldh) {
+        return false;
+    }
+    let last = name.rsplit(|&b| b == b'.').next().unwrap_or(name);
+    let all_digits = last.iter().all(u8::is_ascii_digit);
+    let hex = last.len() >= 2
+        && (last[..2] == *b"0x" || last[..2] == *b"0X")
+        && last[2..].iter().all(u8::is_ascii_hexdigit);
+    !(all_digits || hex)
 }

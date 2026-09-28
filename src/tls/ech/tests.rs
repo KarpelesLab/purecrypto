@@ -189,9 +189,11 @@ fn ech_config_public_name_must_be_non_empty() {
 }
 
 #[test]
-fn mandatory_unknown_extension_rejected() {
-    // Build ECHConfigContents.extensions with one mandatory (high
-    // bit set) unknown extension type. Decode must reject.
+fn mandatory_unknown_extension_makes_the_entry_unusable() {
+    // Build ECHConfigContents.extensions with one mandatory (high bit
+    // set) unknown extension type. RFC 9849 §4.2: "clients MUST ignore
+    // the ECHConfig" — the entry decodes as unsupported, the list stays
+    // usable through its other entries, and the bytes round-trip.
     let key_config = HpkeKeyConfig {
         config_id: 1,
         kem_id: HpkeKem::DhkemX25519HkdfSha256.id(),
@@ -214,12 +216,70 @@ fn mandatory_unknown_extension_rejected() {
         contents: None,
         raw_contents: raw,
     };
-    let list = EchConfigList::new(alloc::vec![cfg]);
+    let list = EchConfigList::new(alloc::vec![cfg, sample_config()]);
     let bytes = list.encode();
+    let decoded = EchConfigList::decode(&bytes).expect("list still decodes");
+    assert!(decoded.configs[0].contents.is_none());
+    assert!(!decoded.configs[0].is_supported());
+    assert!(decoded.configs[0].usable_cipher_suite().is_none());
+    assert!(decoded.configs[1].is_supported());
+    assert_eq!(decoded.encode(), bytes);
+    // An extension list that does not parse is still a decode error: cut
+    // its declared length to 3, splitting the 4-byte extension header.
+    let mut broken = decoded.configs[0].raw_contents.clone();
+    let n = broken.len();
+    broken[n - 5] = 0x03;
+    broken.pop();
+    let bad = EchConfigList::new(alloc::vec![EchConfig {
+        version: ECH_VERSION_DRAFT_22,
+        contents: None,
+        raw_contents: broken,
+    }]);
     assert!(matches!(
-        EchConfigList::decode(&bytes),
+        EchConfigList::decode(&bad.encode()),
         Err(Error::EchDecodeError)
     ));
+}
+
+/// RFC 9849 §6.1.7: a client SHOULD ignore an ECHConfig whose public_name
+/// is not a valid host name, or whose last label reads as an IPv4 literal.
+#[test]
+fn unusable_public_names_are_skipped() {
+    let with_name = |name: &[u8]| {
+        let mut cfg = sample_config();
+        let mut contents = cfg.contents.take().expect("contents");
+        contents.public_name = name.to_vec();
+        EchConfig::new(contents)
+    };
+    for good in [
+        &b"public.example"[..],
+        b"a",
+        b"xn--bcher-kva.example",
+        b"ech-1.example.com",
+        b"1.2.3.example",
+    ] {
+        assert!(
+            with_name(good).usable_cipher_suite().is_some(),
+            "{}",
+            core::str::from_utf8(good).unwrap()
+        );
+    }
+    for bad in [
+        &b"192.0.2.1"[..],
+        b"example.123",
+        b"example.0x1F",
+        b"example.0X",
+        b".example",
+        b"example.",
+        b"exa mple",
+        b"-example.com",
+        b"example-.com",
+        b"a..b",
+        b"caf\xc3\xa9.example",
+        &[b'a'; 64],
+    ] {
+        assert!(with_name(bad).usable_cipher_suite().is_none(), "{:?}", bad);
+    }
 }
 
 #[test]
