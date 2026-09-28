@@ -20,14 +20,26 @@
 #   OPENSSL=/path/to/openssl tools/quic-interop/run.sh
 #
 # Optional: QUIC_INTEROP_TIMEOUT (seconds per client step, default 30),
-# QUIC_INTEROP_KEEP=1 (keep the scratch directory), QUIC_INTEROP_ONLY=<case>
-# (run a single case by name, e.g. `go_pc_to_go_retry`), QUIC_INTEROP_ECN=1
-# (require ECN validation to succeed — on by default on Linux, where the
-# CLI's raw-syscall ECN path exists; elsewhere the case is skipped),
-# OPENSSL unset or empty skips the OpenSSL cases.
+# QUIC_INTEROP_LOSS_TIMEOUT (seconds for the lossy 8 MiB cases, default
+# 120 — see below), QUIC_INTEROP_KEEP=1 (keep the scratch directory),
+# QUIC_INTEROP_ONLY=<case> (run a single case by name, e.g.
+# `go_pc_to_go_retry`), QUIC_INTEROP_ECN=1 (require ECN validation to
+# succeed — on by default on Linux, where the CLI's raw-syscall ECN path
+# exists; elsewhere the case is skipped), OPENSSL unset or empty skips the
+# OpenSSL cases.
 #
 # Every process runs under `timeout`, so a hang fails its case fast instead of
 # burning the CI job. Both servers bind port 0 and report the port they got.
+# Each PASS/FAIL line carries the case's wall time.
+#
+# The loss cases get their own, generous deadline on every timer along the
+# path (the `timeout` wrappers and both peers' internal `-timeout`s): 8 MiB
+# through 2 % loss completes in a second or two on loopback, but RFC 9002
+# NewReno keeps the window small under loss and a loaded runner stretches
+# every PTO, so a short deadline could fail a correct implementation. The
+# first master run did exactly that with `q_server`'s default 30 s: a real
+# deadlock (a lost MAX_STREAM_DATA that was never sent again) hid behind
+# what looked like a slow transfer.
 #
 # Written for bash 3.2 (the macOS /bin/bash) as well as Linux bash 5.
 
@@ -37,6 +49,12 @@ set -euo pipefail
 : "${QUICGO:?set QUICGO to the quicgo-peer binary (go build in tools/quic-interop/quicgo)}"
 OPENSSL=${OPENSSL:-}
 STEP_TIMEOUT=${QUIC_INTEROP_TIMEOUT:-30}
+LOSS_TIMEOUT=${QUIC_INTEROP_LOSS_TIMEOUT:-120}
+# The deadline the current case's client step runs under; the loss cases
+# raise it (each case runs in its own subshell, so the change is local).
+CLIENT_TIMEOUT=$STEP_TIMEOUT
+# The `timeout` wrapper on servers: they outlive the client step by a margin.
+SERVER_TIMEOUT=$((LOSS_TIMEOUT + 30))
 ONLY=${QUIC_INTEROP_ONLY:-}
 case $(uname -s) in
     Linux) ECN_EXPECTED=${QUIC_INTEROP_ECN:-1} ;;
@@ -65,6 +83,23 @@ cleanup() {
 trap cleanup EXIT
 
 log() { printf '%s\n' "$*" >&2; }
+
+# Milliseconds since the epoch: GNU `date` gives nanoseconds; macOS `date`
+# prints `%N` literally, so fall back to whole seconds there.
+now_ms() {
+    local ns
+    ns=$(date +%s%N 2>/dev/null)
+    case $ns in
+        '' | *[!0-9]*) echo $(($(date +%s) * 1000)) ;;
+        *) echo $((ns / 1000000)) ;;
+    esac
+}
+
+# elapsed_s START_MS: seconds since START_MS, with millisecond precision.
+elapsed_s() {
+    local ms=$(($(now_ms) - $1))
+    printf '%d.%03ds' $((ms / 1000)) $((ms % 1000))
+}
 
 # ---------------------------------------------------------------- material
 
@@ -156,7 +191,7 @@ wait_for() {
 start_go_server() {
     local dir=$1 i
     shift
-    QLOGDIR="$dir/qlog-server" "$TO" 120 "$QUICGO" server -addr 127.0.0.1:0 \
+    QLOGDIR="$dir/qlog-server" "$TO" "$SERVER_TIMEOUT" "$QUICGO" server -addr 127.0.0.1:0 \
         -cert "$PKI/leaf.crt" -key "$PKI/leaf.key" -alpn pc-echo "$@" \
         </dev/null >"$dir/server.out" 2>"$dir/server.err" &
     SERVER_PID=$!
@@ -176,7 +211,7 @@ start_go_server() {
 start_pc_server() {
     local dir=$1 i accept=127.0.0.1:0
     shift
-    "$TO" 120 "$PURECRYPTO" q_server -accept "$accept" -alpn pc-echo \
+    "$TO" "$SERVER_TIMEOUT" "$PURECRYPTO" q_server -accept "$accept" -alpn pc-echo \
         -cert "$PKI/leaf.crt" -key "$PKI/leaf.key" "$@" \
         </dev/null >"$dir/server.out" 2>>"$dir/server.err" &
     SERVER_PID=$!
@@ -206,8 +241,8 @@ pc_client() {
     local dir=$1 input=$2
     shift 2
     RC=0
-    "$TO" "$STEP_TIMEOUT" "$PURECRYPTO" q_client -connect "127.0.0.1:$PORT" -alpn pc-echo \
-        -CAfile "$PKI/ca.crt" -servername localhost "$@" \
+    "$TO" "$CLIENT_TIMEOUT" "$PURECRYPTO" q_client -connect "127.0.0.1:$PORT" -alpn pc-echo \
+        -CAfile "$PKI/ca.crt" -servername localhost -timeout "$CLIENT_TIMEOUT" "$@" \
         <"$input" >"$dir/client.out" 2>"$dir/client.err" || RC=$?
 }
 
@@ -216,8 +251,9 @@ go_client() {
     local dir=$1 input=$2
     shift 2
     RC=0
-    QLOGDIR="$dir/qlog-client" "$TO" "$STEP_TIMEOUT" "$QUICGO" client -addr "127.0.0.1:$PORT" \
-        -alpn pc-echo -cafile "$PKI/ca.crt" -sni localhost -in "$input" "$@" \
+    QLOGDIR="$dir/qlog-client" "$TO" "$CLIENT_TIMEOUT" "$QUICGO" client -addr "127.0.0.1:$PORT" \
+        -alpn pc-echo -cafile "$PKI/ca.crt" -sni localhost -in "$input" \
+        -timeout "${CLIENT_TIMEOUT}s" "$@" \
         </dev/null >"$dir/client.out" 2>"$dir/client.err" || RC=$?
 }
 
@@ -295,9 +331,11 @@ case_go_pc_to_go_large() {
 
 # Loss: the quic-go side drops 1 in 50 datagrams each way; RFC 9002
 # recovery on both sides has to fill the holes and the checksums still match.
+# Every deadline on the path is the generous LOSS_TIMEOUT (see the header).
 case_go_pc_to_go_loss() {
     local d=$1
-    start_go_server "$d" -loss 50
+    CLIENT_TIMEOUT=$LOSS_TIMEOUT
+    start_go_server "$d" -loss 50 -timeout "${LOSS_TIMEOUT}s"
     pc_client "$d" "$WORK/big.bin"
     stop_server
     rc_is 0
@@ -515,7 +553,8 @@ case_go_go_to_pc_large() {
 
 case_go_go_to_pc_loss() {
     local d=$1
-    start_pc_server "$d"
+    CLIENT_TIMEOUT=$LOSS_TIMEOUT
+    start_pc_server "$d" -timeout "$LOSS_TIMEOUT"
     go_client "$d" "$WORK/big.bin" -loss 50
     stop_server
     rc_is 0
@@ -751,16 +790,17 @@ CLIENT_PID=""
 pc_client_bg() {
     local dir=$1 input=$2
     shift 2
-    "$TO" "$STEP_TIMEOUT" "$PURECRYPTO" q_client -connect "127.0.0.1:$PORT" -alpn pc-echo \
-        -CAfile "$PKI/ca.crt" -servername localhost "$@" \
+    "$TO" "$CLIENT_TIMEOUT" "$PURECRYPTO" q_client -connect "127.0.0.1:$PORT" -alpn pc-echo \
+        -CAfile "$PKI/ca.crt" -servername localhost -timeout "$CLIENT_TIMEOUT" "$@" \
         <"$input" >"$dir/client.out" 2>"$dir/client.err" &
     CLIENT_PID=$!
 }
 go_client_bg() {
     local dir=$1 input=$2
     shift 2
-    QLOGDIR="$dir/qlog-client" "$TO" "$STEP_TIMEOUT" "$QUICGO" client -addr "127.0.0.1:$PORT" \
-        -alpn pc-echo -cafile "$PKI/ca.crt" -sni localhost -in "$input" "$@" \
+    QLOGDIR="$dir/qlog-client" "$TO" "$CLIENT_TIMEOUT" "$QUICGO" client -addr "127.0.0.1:$PORT" \
+        -alpn pc-echo -cafile "$PKI/ca.crt" -sni localhost -in "$input" \
+        -timeout "${CLIENT_TIMEOUT}s" "$@" \
         </dev/null >"$dir/client.out" 2>"$dir/client.err" &
     CLIENT_PID=$!
 }
@@ -783,7 +823,7 @@ ossl_client() {
     shift 2
     RC=0
     (cat "$input"; sleep "${OSSL_LINGER:-1}") |
-        "$TO" "$STEP_TIMEOUT" "$OPENSSL" s_client -quic -connect "127.0.0.1:$PORT" -alpn pc-echo \
+        "$TO" "$CLIENT_TIMEOUT" "$OPENSSL" s_client -quic -connect "127.0.0.1:$PORT" -alpn pc-echo \
             -CAfile "$PKI/ca.crt" -servername localhost -verify_return_error "$@" \
             >"$dir/client.out" 2>"$dir/client.err" || RC=$?
 }
@@ -910,6 +950,7 @@ for c in $CASES; do
     cdir=$WORK/$c
     mkdir -p "$cdir"
     log "=== $c"
+    started=$(now_ms)
     # Run each case in a subshell with `set -e`, so the first failed check
     # ends the case (and only the case), and any server or background client
     # it left running is stopped with it.
@@ -921,16 +962,17 @@ for c in $CASES; do
     )
     status=$?
     set -e
+    took=$(elapsed_s "$started")
     if [ "$status" -eq 0 ]; then
         PASS=$((PASS + 1))
-        log "--- PASS $c"
+        log "--- PASS $c ($took)"
     elif [ "$status" -eq 77 ]; then
         SKIP=$((SKIP + 1))
         log "--- SKIP $c"
     else
         FAIL=$((FAIL + 1))
         FAILED="$FAILED $c"
-        log "--- FAIL $c"
+        log "--- FAIL $c ($took)"
         for f in "$cdir"/*.err "$cdir"/*.out; do
             [ -f "$f" ] || continue
             log "  ----- $(basename "$f") ($(wc -c <"$f" | tr -d ' ') bytes)"
