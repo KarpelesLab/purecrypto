@@ -15,7 +15,12 @@
 //! Run natively (`cargo test --all-features --test ct_valgrind`) the client
 //! requests are no-ops and this is a plain smoke test of the same code paths.
 //! CI (`.github/workflows/ct-valgrind.yml`) builds it in release mode and
-//! runs it under memcheck on x86_64 and aarch64 Linux.
+//! runs it under memcheck on x86_64, aarch64, i686 and armv7 Linux — the
+//! 64-bit targets both with the CPU dispatch they detect (AES-NI / PMULL /
+//! AVX2 / SHA extensions) and with every dispatch site forced onto its
+//! portable kernel (`PURECRYPTO_CT_FORCE_PORTABLE=1`, see
+//! `ct::force_portable`), and once more built without the precomputed
+//! Ed25519 / P-256 base-point tables.
 //!
 //! Usage: `ct_valgrind [--positive-control] [--list] [FILTER...]`. With
 //! filters, only cases whose name contains one of them run. With
@@ -26,29 +31,35 @@
 //! CI invocation cannot pass vacuously.
 //!
 //! Secrets enter a case in one of three ways: as classified byte arrays
-//! (keys, seeds, plaintexts), through [`TaintRng`] — an HMAC-DRBG whose every
-//! output byte is classified, so key generation and hedged signing see
-//! secret randomness exactly as they would from `OsRng` — or by classifying
-//! the secret limbs of an imported RSA key. Public halves of a key (an
-//! ML-DSA `rho`/`tr`, an SLH-DSA `PK.root`) are declassified by the harness,
-//! because they *are* the public key, and randomness that is published (a
-//! PSS salt, an LM-OTS randomizer) comes from a public RNG. The
-//! declassification points inside the library are listed in
-//! `docs/validation.md` ("Declassification points").
+//! (keys, seeds, plaintexts, traffic secrets), through [`TaintRng`] — an
+//! HMAC-DRBG whose every output byte is classified, so key generation and
+//! hedged signing see secret randomness exactly as they would from `OsRng` —
+//! or by classifying the secret parts of an imported key (RSA limbs, a JWK's
+//! private fields, a Falcon key's expanded buffers through
+//! `ct::hooks::falcon_classify_private_key`). Public halves of a key (an
+//! ML-DSA `rho`/`tr`, an SLH-DSA `PK.root`, an XMSS `PUB_SEED`) are
+//! declassified by the harness, because they *are* the public key, and
+//! randomness that is published (a PSS salt, an LM-OTS randomizer, a Falcon
+//! salt) comes from a public RNG. The declassification points inside the
+//! library are listed in `docs/validation.md` ("Declassification points").
+//!
+//! The protocol record layers and key schedules (TLS 1.2/1.3, DTLS 1.2/1.3,
+//! QUIC) are reached through `purecrypto::ct::hooks`, thin `__ct-check`-only
+//! entry points into the crate-private code (a handshake would drag public
+//! values through the same paths).
 //!
 //! Deliberately NOT covered — accepted variable-time residuals documented in
 //! `docs/validation.md`, which this harness would (correctly) flag:
 //!
 //! * legacy CBC / MAC-then-encrypt record protection (`tls-legacy`, Lucky13
-//!   residue) and PBES2 CBC-PAD;
-//! * DES/3DES and Blowfish / `bcrypt_pbkdf` (key-dependent S-box tables);
+//!   residue), PBES2 CBC-PAD and the PKCS#12 archives built on it;
+//! * DES/3DES and Blowfish / `bcrypt_pbkdf` (key-dependent S-box tables), and
+//!   the table-driven hashes (Streebog, Whirlpool, MD2, ...);
 //! * Falcon key generation and secret-key import (variable-time NTRU solve);
-//! * Argon2d/Argon2id data-dependent addressing and scrypt's `Integerify`.
+//! * Argon2d/Argon2id data-dependent addressing and scrypt's `Integerify`;
+//! * FF1's radix arithmetic on the digits (data-dependent by construction).
 //!
-//! Also not covered: the portable fallbacks of runtime-dispatched SIMD code
-//! (AES, GHASH, ChaCha20, SHA-2, Keccak). Each runner tests whichever backend
-//! its (Valgrind-emulated) CPU selects; the crate has no switch to force the
-//! portable path.
+//! Also not covered: the `halfagg` module (no secret inputs).
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -59,39 +70,56 @@ use purecrypto::ct::{
 };
 use purecrypto::rng::{CryptoRng, HmacDrbg, RngCore};
 
-use purecrypto::ascon::AsconAead128;
+use purecrypto::ct::hooks::{self, Suite};
+
+use purecrypto::ascon::{Ascon128, Ascon128a, AsconAead128};
 use purecrypto::bignum::BoxedUint;
 use purecrypto::bls;
+use purecrypto::chunked::{self, Cobblestone128};
 use purecrypto::cipher::{
-    Aegis128L, Aes128, Aes128Ccm, Aes128Eax, Aes192, Aes256, Aes256GcmSiv, AesCmac128, Aria128,
-    BlockCipher, Camellia128, ChaCha20Poly1305, Gcm, Poly1305, Sm4, XChaCha20Poly1305,
+    Aegis128, Aegis128L, Aes128, Aes128Ccm, Aes128Eax, Aes128Kw, Aes128Kwp, Aes128Xts, Aes192,
+    Aes256, Aes256GcmSiv, AesCmac128, AesSiv, Aez, Aria128, BlockCipher, Camellia128, Cbc, Cfb,
+    ChaCha20Poly1305, Ctr, Gcm, Gmac, Morus640, Morus1280, Ofb, Poly1305, Seed, Sm4,
+    XChaCha20Poly1305, kwp_ciphertext_len,
 };
 use purecrypto::dh::{DhPrivateKey, group14};
+use purecrypto::dsa::{self, DsaPrivateKey};
 use purecrypto::ec::CurveId;
 use purecrypto::ec::boxed::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey};
 use purecrypto::ec::ecdh::EcdhPrivateKey;
 use purecrypto::ec::ecdsa::EcdsaPrivateKey;
 use purecrypto::ec::ed448::Ed448PrivateKey;
 use purecrypto::ec::ed25519::Ed25519PrivateKey;
+use purecrypto::ec::ristretto255::{RistrettoPoint, Scalar as RistrettoScalar};
+use purecrypto::ec::secp256k1::Scalar as Secp256k1Scalar;
+use purecrypto::ec::secp256k1::schnorr;
 use purecrypto::ec::secp256k1_ecdsa::Secp256k1EcdsaPrivateKey;
 use purecrypto::ec::sm2::Sm2PrivateKey;
 use purecrypto::ec::x448::X448PrivateKey;
 use purecrypto::ec::x25519::X25519PrivateKey;
+use purecrypto::falcon::{Degree as FalconDegree, FalconPrivateKey};
 use purecrypto::hash::{
     Blake2b512, Blake3, Digest, HmacSha256, HmacSha512, Kmac128, Sha3_256, Sha256, Sha384, Sha512,
-    Sm3, shake256,
+    Shake128, Sm3, shake256,
 };
 use purecrypto::hpke::{self, CipherSuite, HpkeAead, HpkeKdf, HpkeKem};
+use purecrypto::jose::{Enc, Jwe, Jwk, JwkKey, Jws, KeyAlg, SigAlg};
 use purecrypto::kdf::argon2::{Argon2Params, Argon2Type, argon2};
-use purecrypto::kdf::{hkdf, pbkdf2};
-use purecrypto::lms::{LmotsType, LmsPrivateKey, LmsType};
-use purecrypto::mac::SipHash24;
+use purecrypto::kdf::pbes2::{self, CipherChoice, KdfChoice, Pbes2Params};
+use purecrypto::kdf::{HmacSha256Prf, hkdf, kbkdf_counter, pbkdf2};
+use purecrypto::lms::{HssPrivateKey, LmotsType, LmsPrivateKey, LmsType};
+use purecrypto::mac::{SipHash24, Umac64, Umac128, Vmac64, Vmac128};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use purecrypto::mlkem::{
     MlKem512DecapsKey, MlKem768Ciphertext, MlKem768DecapsKey, MlKem1024DecapsKey,
 };
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::slhdsa::{self, ParamSet};
+use purecrypto::xmss::{XmssMtParamSet, XmssMtPrivateKey, XmssParamSet, XmssPrivateKey};
+use purecrypto::zkp::pedersen::{Commitment, Generator};
+use purecrypto::zkp::sign_to_contract as s2c;
+use purecrypto::zkp::surjection::SurjectionProof;
+use purecrypto::zkp::{adaptor, rangeproof, whitelist};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -951,6 +979,1029 @@ fn slhdsa_shake_128f() -> String {
     slhdsa_case(ParamSet::Shake_128f, 90)
 }
 
+fn slhdsa_sha2_128s() -> String {
+    slhdsa_case(ParamSet::Sha2_128s, 150)
+}
+
+/// Falcon-512 signing with the expanded key's buffers classified.
+/// Key generation (the variable-time NTRU solve) runs on public randomness
+/// first: it is the documented residual, not what this case checks.
+fn falcon512_sign() -> String {
+    let sk = FalconPrivateKey::generate(FalconDegree::Falcon512, &mut public_rng(160));
+    let pk = sk.public_key();
+    hooks::falcon_classify_private_key(&sk);
+    let sig = sk.sign(b"ct_valgrind message", &mut SaltPublicRng::new(161));
+    declassify(&sig);
+    assert!(
+        pk.verify(b"ct_valgrind message", &sig)
+            .expect("well-formed")
+    );
+    format!("sig={}", hex8(&sig))
+}
+
+/// An RNG whose first `fill_bytes` call (Falcon's 40-byte salt `r`, which
+/// is published in the signature and hashed with the message into the public
+/// target point) is public and every later byte (the Gaussian sampler's
+/// randomness) secret.
+struct SaltPublicRng {
+    rng: TaintRng,
+    salt_drawn: bool,
+}
+
+impl SaltPublicRng {
+    fn new(tag: u64) -> Self {
+        SaltPublicRng {
+            rng: TaintRng::new(tag),
+            salt_drawn: false,
+        }
+    }
+}
+
+impl RngCore for SaltPublicRng {
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.rng.fill_bytes(dest);
+        if !self.salt_drawn {
+            self.salt_drawn = true;
+            declassify(dest);
+        }
+    }
+}
+
+impl CryptoRng for SaltPublicRng {}
+
+fn xmss_sign() -> String {
+    // SK_SEED ‖ SK_PRF ‖ PUB_SEED: the last third is public-key material.
+    let seed = secret_bytes::<96>(170);
+    declassify(&seed[64..]);
+    let mut sk = XmssPrivateKey::from_seed(XmssParamSet::Sha2_10_256, &seed);
+    let pk = sk.public_key();
+    declassify(pk.to_bytes());
+    let sig = sk.sign(b"ct_valgrind message").expect("fresh key");
+    declassify(&sig);
+    assert!(pk.verify(b"ct_valgrind message", &sig));
+    format!("pk={} sig={}", hex8(pk.to_bytes()), hex8(&sig))
+}
+
+fn xmssmt_sign() -> String {
+    let seed = secret_bytes::<96>(171);
+    declassify(&seed[64..]);
+    let mut sk = XmssMtPrivateKey::from_seed(XmssMtParamSet::Sha2_20_2_256, &seed);
+    let pk = sk.public_key();
+    declassify(pk.to_bytes());
+    let sig = sk.sign(b"ct_valgrind message").expect("fresh key");
+    declassify(&sig);
+    assert!(pk.verify(b"ct_valgrind message", &sig));
+    format!("pk={} sig={}", hex8(pk.to_bytes()), hex8(&sig))
+}
+
+fn hss_l2_sign() -> String {
+    let levels = [
+        (
+            LmsType::Sha256M32H5,
+            LmotsType::Sha256N32W4,
+            fixed_bytes::<16>(172),
+            secret_bytes::<32>(173),
+        ),
+        (
+            LmsType::Sha256M32H5,
+            LmotsType::Sha256N32W4,
+            fixed_bytes::<16>(174),
+            secret_bytes::<32>(175),
+        ),
+    ];
+    let mut sk = HssPrivateKey::from_levels(&levels).expect("valid levels");
+    let pk = sk.public_key();
+    declassify(pk.to_bytes());
+    // The LM-OTS randomizers are published in the signature (see lms_h5).
+    let sig = sk
+        .sign(&mut public_rng(176), b"ct_valgrind message")
+        .expect("fresh key");
+    declassify(&sig);
+    assert!(pk.verify(b"ct_valgrind message", &sig));
+    format!("pk={} sig={}", hex8(pk.to_bytes()), hex8(&sig))
+}
+
+// ---------------------------------------------------------------------------
+// Protocol record layers and key schedules (through `ct::hooks`)
+// ---------------------------------------------------------------------------
+
+const SUITES: [Suite; 3] = [
+    Suite::Aes128GcmSha256,
+    Suite::Aes256GcmSha384,
+    Suite::ChaCha20Poly1305Sha256,
+];
+
+/// The suite's hash length: the length of its traffic secrets.
+fn hash_len(suite: Suite) -> usize {
+    if suite == Suite::Aes256GcmSha384 {
+        48
+    } else {
+        32
+    }
+}
+
+/// The suite's AEAD key length.
+fn key_len(suite: Suite) -> usize {
+    if suite == Suite::Aes128GcmSha256 {
+        16
+    } else {
+        32
+    }
+}
+
+/// A copy of `v`, marked public, for comparing a secret against a result.
+fn public_copy<const N: usize>(v: &[u8; N]) -> [u8; N] {
+    let out = *v;
+    declassify(&out);
+    out
+}
+
+fn tls13_key_schedule() -> String {
+    let mut out = Vec::new();
+    for (i, suite) in SUITES.into_iter().enumerate() {
+        let n = hash_len(suite);
+        let tag = 200 + 10 * i as u64;
+        let ecdhe = secret_bytes::<32>(tag);
+        let psk = secret_bytes::<48>(tag + 1);
+        // Transcript hashes are public.
+        let th = fixed_bytes::<144>(tag + 2);
+        let ks = hooks::tls::tls13_key_schedule(
+            suite,
+            (i != 0).then_some(&psk[..n]),
+            &ecdhe,
+            &th[..n],
+            &th[48..48 + n],
+            &th[96..96 + n],
+        );
+        out.push(hex8(public(&ks[..])));
+        let next = hooks::tls::tls13_next_traffic_secret(suite, &ks[..n]);
+        out.push(hex8(public(&next[..])));
+    }
+    out.join(" ")
+}
+
+fn tls13_finished() -> String {
+    let mut out = Vec::new();
+    for (i, suite) in SUITES.into_iter().enumerate() {
+        let n = hash_len(suite);
+        let key = secret_bytes::<48>(230 + i as u64);
+        let th = fixed_bytes::<48>(235 + i as u64);
+        let (vd, _) = hooks::tls::tls13_finished(suite, &key[..n], &th[..n], &[]);
+        declassify(&vd);
+        let (_, ok) = hooks::tls::tls13_finished(suite, &key[..n], &th[..n], &vd);
+        let mut bad = vd.clone();
+        bad[n - 1] ^= 1;
+        let (_, rejected) = hooks::tls::tls13_finished(suite, &key[..n], &th[..n], &bad);
+        // The verdicts are the public outcome the engines branch on.
+        assert!(bool::from(ct::declassify_value(ok)));
+        assert!(!bool::from(ct::declassify_value(rejected)));
+        out.push(hex8(&vd));
+    }
+    out.join(" ")
+}
+
+fn tls13_record_case(suite: Suite, tag: u64) -> String {
+    let secret = secret_bytes::<48>(tag);
+    let secret = &secret[..hash_len(suite)];
+    let content = secret_bytes::<300>(tag + 1);
+    let expected = public_copy(&content);
+
+    let rec = hooks::tls::tls13_seal(suite, secret, 23, &content, 0).expect("seal");
+    declassify(&rec);
+    let (ty, got) = hooks::tls::tls13_open(suite, secret, &rec).expect("authentic record");
+    declassify(&got);
+    assert_eq!((ty, &got[..]), (23, &expected[..]));
+
+    // RFC 8446 §5.4 padding: the receiver must find the type byte under it
+    // without its position showing in the timing.
+    let padded = hooks::tls::tls13_seal(suite, secret, 22, &content[..100], 157).expect("seal");
+    declassify(&padded);
+    let (ty2, got2) = hooks::tls::tls13_open(suite, secret, &padded).expect("authentic record");
+    declassify(&got2);
+    assert_eq!((ty2, &got2[..]), (22, &expected[..100]));
+
+    let mut bad = rec.clone();
+    bad[40] ^= 0x04;
+    assert!(hooks::tls::tls13_open(suite, secret, &bad).is_err());
+    format!("rec={} padded={}", hex8(&rec[5..]), hex8(&padded[5..]))
+}
+
+fn tls13_record_aes128() -> String {
+    tls13_record_case(Suite::Aes128GcmSha256, 240)
+}
+
+fn tls13_record_aes256() -> String {
+    tls13_record_case(Suite::Aes256GcmSha384, 243)
+}
+
+fn tls13_record_chacha() -> String {
+    tls13_record_case(Suite::ChaCha20Poly1305Sha256, 246)
+}
+
+fn tls12_prf_finished() -> String {
+    let mut out = Vec::new();
+    for (i, suite) in [Suite::Aes128GcmSha256, Suite::Aes256GcmSha384]
+        .into_iter()
+        .enumerate()
+    {
+        let tag = 250 + 10 * i as u64;
+        let premaster = secret_bytes::<48>(tag);
+        let cr = fixed_bytes::<32>(tag + 1);
+        let sr = fixed_bytes::<32>(tag + 2);
+        let session_hash = fixed_bytes::<48>(tag + 3);
+        let n = hash_len(suite);
+        let classic = hooks::tls::tls12_key_block(suite, &premaster, &cr, &sr, None);
+        let ems =
+            hooks::tls::tls12_key_block(suite, &premaster, &cr, &sr, Some(&session_hash[..n]));
+        let mut master = [0u8; 48];
+        master.copy_from_slice(&ems[..48]);
+        let (vd, _) =
+            hooks::tls::tls12_finished(suite, &master, b"client finished", &session_hash[..n], &[]);
+        declassify(&vd);
+        let (_, ok) =
+            hooks::tls::tls12_finished(suite, &master, b"client finished", &session_hash[..n], &vd);
+        let mut bad = vd;
+        bad[0] ^= 0x20;
+        let (_, rejected) = hooks::tls::tls12_finished(
+            suite,
+            &master,
+            b"client finished",
+            &session_hash[..n],
+            &bad,
+        );
+        assert!(bool::from(ct::declassify_value(ok)));
+        assert!(!bool::from(ct::declassify_value(rejected)));
+        out.push(format!(
+            "kb={} ems-kb={} fin={}",
+            hex8(public(&classic[48..])),
+            hex8(public(&ems[48..])),
+            hex8(&vd)
+        ));
+    }
+    out.join(" ")
+}
+
+fn tls12_records() -> String {
+    let mut out = Vec::new();
+    for (i, suite) in SUITES.into_iter().enumerate() {
+        let tag = 270 + 10 * i as u64;
+        let key = secret_bytes::<32>(tag);
+        let key = &key[..key_len(suite)];
+        // The implicit nonce comes from the key block: secret.
+        let salt = secret_bytes::<4>(tag + 1);
+        let payload = secret_bytes::<200>(tag + 2);
+        let expected = public_copy(&payload);
+        let frag = hooks::tls::tls12_seal(suite, key, salt, 23, &payload).expect("seal");
+        declassify(&frag);
+        let len = (frag.len() as u16).to_be_bytes();
+        let header = [23, 3, 3, len[0], len[1]];
+        let got = hooks::tls::tls12_open(suite, key, salt, &header, &frag).expect("authentic");
+        declassify(&got);
+        assert_eq!(got, expected);
+        let mut bad = frag.clone();
+        bad[30] ^= 1;
+        assert!(hooks::tls::tls12_open(suite, key, salt, &header, &bad).is_err());
+        out.push(hex8(&frag[8..]));
+    }
+    out.join(" ")
+}
+
+fn dtls12_records() -> String {
+    let mut out = Vec::new();
+    for (i, suite) in SUITES.into_iter().enumerate() {
+        let tag = 300 + 10 * i as u64;
+        let key = secret_bytes::<32>(tag);
+        let key = &key[..key_len(suite)];
+        let salt = secret_bytes::<4>(tag + 1);
+        let payload = secret_bytes::<150>(tag + 2);
+        let expected = public_copy(&payload);
+        let epoch_seq = (1u64 << 48) | 0x2a;
+        let frag =
+            hooks::dtls::dtls12_seal(suite, key, salt, epoch_seq, 23, &payload).expect("seal");
+        declassify(&frag);
+        let got =
+            hooks::dtls::dtls12_open(suite, key, salt, epoch_seq, 23, &frag).expect("authentic");
+        declassify(&got);
+        assert_eq!(got, expected);
+        let mut bad = frag.clone();
+        bad[frag.len() - 1] ^= 1;
+        assert!(hooks::dtls::dtls12_open(suite, key, salt, epoch_seq, 23, &bad).is_err());
+        out.push(hex8(&frag[8..]));
+    }
+    out.join(" ")
+}
+
+fn dtls13_records() -> String {
+    let mut out = Vec::new();
+    for (i, suite) in SUITES.into_iter().enumerate() {
+        let tag = 330 + 10 * i as u64;
+        let secret = secret_bytes::<48>(tag);
+        let secret = &secret[..hash_len(suite)];
+        let payload = secret_bytes::<150>(tag + 1);
+        let expected = public_copy(&payload);
+        let (epoch, seq) = (3u16, 0x1234u64);
+        let wire = hooks::dtls::dtls13_seal(suite, secret, epoch, seq, 23, &payload).expect("seal");
+        declassify(&wire);
+        let (got_seq, ty, got) =
+            hooks::dtls::dtls13_open(suite, secret, epoch, seq - 1, &wire).expect("authentic");
+        declassify(&got);
+        assert_eq!((got_seq, ty, &got[..]), (seq, 23, &expected[..]));
+        let mut bad = wire.clone();
+        bad[20] ^= 1;
+        assert!(hooks::dtls::dtls13_open(suite, secret, epoch, seq - 1, &bad).is_err());
+        out.push(hex8(&wire));
+    }
+    out.join(" ")
+}
+
+fn quic_packets() -> String {
+    let mut out = Vec::new();
+    for (i, suite) in SUITES.into_iter().enumerate() {
+        let tag = 360 + 10 * i as u64;
+        let secret = secret_bytes::<48>(tag);
+        let secret = &secret[..hash_len(suite)];
+        let payload = secret_bytes::<120>(tag + 1);
+        let expected = public_copy(&payload);
+        let dcid = fixed_bytes::<8>(tag + 2);
+        let pn = 0x1a_2b3c;
+        let pkt = hooks::quic::protect(suite, secret, &dcid, pn, 3, true, &payload).expect("seal");
+        declassify(&pkt);
+        let (got_pn, first, got) =
+            hooks::quic::unprotect(suite, secret, dcid.len(), pn - 5, &pkt).expect("authentic");
+        declassify(&got);
+        assert_eq!((got_pn, first & 0x04, &got[..]), (pn, 0x04, &expected[..]));
+        let mut bad = pkt.clone();
+        bad[40] ^= 1;
+        assert!(hooks::quic::unprotect(suite, secret, dcid.len(), pn - 5, &bad).is_err());
+        let next = hooks::quic::key_update(suite, secret);
+        out.push(format!("pkt={} ku={}", hex8(&pkt), hex8(public(&next[..]))));
+    }
+    out.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// secp256k1 extensions, ristretto255, more curves, DSA, RSA variants
+// ---------------------------------------------------------------------------
+
+/// A secp256k1 secret key (below the group order: top byte cleared).
+fn secp256k1_secret(tag: u64) -> [u8; 32] {
+    let mut sk = secret_bytes::<32>(tag);
+    sk[0] &= 0x7f;
+    sk[31] |= 1;
+    sk
+}
+
+/// The compressed public key of a public secp256k1 scalar.
+fn secp256k1_pub(sk: &[u8; 32]) -> [u8; 33] {
+    let pk = s2c::public_key(sk).expect("valid scalar");
+    *public(&pk)
+}
+
+fn bip340_sign() -> String {
+    let sk = secp256k1_secret(400);
+    let aux = secret_bytes::<32>(401);
+    let pk = schnorr::public_key(&sk).expect("valid scalar");
+    declassify(&pk);
+    let sig = schnorr::sign(&sk, b"ct_valgrind message", &aux).expect("sign");
+    declassify(&sig);
+    schnorr::verify(&pk, b"ct_valgrind message", &sig).expect("verifies");
+    format!("pk={} sig={}", hex8(&pk), hex8(&sig))
+}
+
+fn zkp_sign_to_contract() -> String {
+    let sk = secp256k1_secret(402);
+    let msg = fixed_bytes::<32>(403);
+    let data = fixed_bytes::<32>(404);
+    let (sig, opening) = s2c::sign_with_commitment(&sk, &msg, &data).expect("sign");
+    declassify(&sig);
+    let opening = opening.to_bytes();
+    declassify(&opening);
+    let opening = s2c::Opening::from_bytes(&opening).expect("valid opening");
+    s2c::verify_commitment(&sig, &data, &opening).expect("commitment opens");
+    format!("sig={}", hex8(&sig))
+}
+
+fn zkp_adaptor() -> String {
+    let sk = secp256k1_secret(405);
+    let y = secp256k1_secret(406);
+    let pk = s2c::public_key(&sk).expect("valid scalar");
+    declassify(&pk);
+    let enckey = s2c::public_key(&y).expect("valid scalar");
+    declassify(&enckey);
+    let msg = fixed_bytes::<32>(407);
+    let asig = adaptor::encrypt(&sk, &enckey, &msg).expect("encrypt");
+    declassify(&asig);
+    adaptor::verify(&asig, &pk, &enckey, &msg).expect("adaptor verifies");
+    let sig = adaptor::decrypt(&asig, &y).expect("decrypt");
+    declassify(&sig);
+    let recovered = adaptor::recover(&enckey, &asig, &sig).expect("recover");
+    declassify(&recovered);
+    assert_eq!(recovered, public_copy(&y));
+    format!("asig={} sig={}", hex8(&asig), hex8(&sig))
+}
+
+fn zkp_pedersen_rangeproof() -> String {
+    let blind = secp256k1_secret(408);
+    let nonce = secret_bytes::<32>(409);
+    let value = u64::from_le_bytes(secret_bytes::<8>(410)) & 0xff;
+    let commit = Commitment::new(value, &blind).expect("commit");
+    let c = commit.serialize();
+    declassify(&c);
+    let commit = Commitment::parse(&c).expect("valid commitment");
+    // An 8-bit range proof hides `value` in [0, 256).
+    let proof = rangeproof::sign(
+        &commit,
+        &blind,
+        &nonce,
+        value,
+        0,
+        0,
+        8,
+        &[],
+        &[],
+        &Generator::h(),
+    )
+    .expect("prove");
+    declassify(&proof);
+    let (min, max) = rangeproof::verify(&commit, &proof, &[], &Generator::h()).expect("verifies");
+    format!(
+        "commit={} proof={} range=[{min},{max}]",
+        hex8(&c),
+        hex8(&proof)
+    )
+}
+
+fn zkp_surjection() -> String {
+    let tags: Vec<[u8; 32]> = (0..3).map(|i| fixed_bytes::<32>(411 + i)).collect();
+    let blinds: Vec<[u8; 32]> = (0..3).map(|i| secp256k1_secret(420 + i)).collect();
+    let out_blind = secp256k1_secret(425);
+    // The generators are published; the blinds that made them are secret.
+    let gens: Vec<Generator> = (0..3)
+        .map(|i| {
+            let g = Generator::from_asset_tag_blinded(&tags[i], &blinds[i]).expect("gen");
+            Generator::parse(public(&g.serialize())).expect("valid generator")
+        })
+        .collect();
+    let out = Generator::from_asset_tag_blinded(&tags[1], &out_blind).expect("gen");
+    let out = Generator::parse(public(&out.serialize())).expect("valid generator");
+    let seed = fixed_bytes::<32>(426);
+    let (mut proof, idx) =
+        SurjectionProof::initialize(&tags, 2, &tags[1], 100, &seed).expect("initialize");
+    // Which input the output spends is what the proof hides: the ring
+    // position must not drive a branch or an address.
+    let secret_idx = idx;
+    ct::classify_val(&secret_idx);
+    proof
+        .generate(&gens, &out, secret_idx, &blinds[idx], &out_blind)
+        .expect("generate");
+    let bytes = proof.serialize();
+    declassify(&bytes);
+    let proof = SurjectionProof::parse(&bytes).expect("parse");
+    proof.verify(&gens, &out).expect("verifies");
+    format!("proof={}", hex8(&bytes))
+}
+
+fn zkp_whitelist() -> String {
+    let n = 3;
+    let index = 1;
+    let online: Vec<[u8; 32]> = (0..n).map(|i| fixed_bytes::<32>(430 + i)).collect();
+    let offline: Vec<[u8; 32]> = (0..n).map(|i| fixed_bytes::<32>(440 + i)).collect();
+    let sub = fixed_bytes::<32>(450);
+    let scalar = |b: &[u8; 32]| Secp256k1Scalar::from_bytes_be_reduce(b);
+    let on_pk: Vec<[u8; 33]> = online
+        .iter()
+        .map(|k| secp256k1_pub(&scalar(k).to_bytes_be()))
+        .collect();
+    let off_pk: Vec<[u8; 33]> = offline
+        .iter()
+        .map(|k| secp256k1_pub(&scalar(k).to_bytes_be()))
+        .collect();
+    let sub_pk = secp256k1_pub(&scalar(&sub).to_bytes_be());
+    let online_sk = scalar(&online[index]).to_bytes_be();
+    let summed_sk = scalar(&offline[index]).add(&scalar(&sub)).to_bytes_be();
+    classify(&online_sk);
+    classify(&summed_sk);
+    // The signer's ring position is what the proof hides.
+    let secret_index = index;
+    ct::classify_val(&secret_index);
+    let proof = whitelist::sign(
+        &online_sk,
+        &summed_sk,
+        &on_pk,
+        &off_pk,
+        &sub_pk,
+        secret_index,
+        &mut TaintRng::new(451),
+    )
+    .expect("sign");
+    let bytes = proof.to_bytes();
+    declassify(&bytes);
+    let proof = whitelist::Whitelist::from_bytes(&bytes).expect("parse");
+    whitelist::verify(&proof, &on_pk, &off_pk, &sub_pk).expect("verifies");
+    format!("proof={}", hex8(&bytes))
+}
+
+fn ristretto255_mul() -> String {
+    let wide = secret_bytes::<64>(460);
+    let s = RistrettoScalar::from_bytes_mod_order(&wide);
+    let p = RistrettoPoint::mul_base(&s).compress().to_bytes();
+    declassify(&p);
+    let q = RistrettoPoint::from_uniform_bytes(&fixed_bytes::<64>(461));
+    let shared = q.mul(&s).compress().to_bytes();
+    format!("pk={} ss={}", hex8(&p), hex8(public(&shared)))
+}
+
+fn boxed_curve_case(curve: CurveId, tag: u64) -> String {
+    let n = curve.order_len();
+    let mut d = vec![0u8; n];
+    d.copy_from_slice(&secret_bytes::<66>(tag)[..n]);
+    // Keep the scalar below the group order.
+    d[0] &= if curve == CurveId::P521 { 0x01 } else { 0x7f };
+    let sk = BoxedEcdsaPrivateKey::from_bytes(curve, &d).expect("scalar in range");
+    let sig = sk.sign::<Sha512>(b"ct_valgrind message").expect("sign");
+    let sig = sig.to_bytes(curve);
+    let dh = BoxedEcdhPrivateKey::from_bytes(curve, &d).expect("scalar in range");
+    let mut peer = fixed_bytes::<66>(tag + 1)[..n].to_vec();
+    peer[0] &= 0x01;
+    let peer = BoxedEcdhPrivateKey::from_bytes(curve, &peer)
+        .expect("scalar in range")
+        .public_key();
+    let shared = dh.diffie_hellman(&peer).expect("valid peer");
+    format!(
+        "sig={} ss={}",
+        hex8(public(&sig[..])),
+        hex8(public(&shared[..]))
+    )
+}
+
+fn p521_ecdsa_ecdh() -> String {
+    boxed_curve_case(CurveId::P521, 470)
+}
+
+fn brainpoolp256r1_ecdsa_ecdh() -> String {
+    boxed_curve_case(CurveId::BrainpoolP256r1, 472)
+}
+
+fn secp256k1_ecdh() -> String {
+    let d = secp256k1_secret(474);
+    let sk = BoxedEcdhPrivateKey::from_bytes(CurveId::Secp256k1, &d).expect("scalar in range");
+    let mut peer = fixed_bytes::<32>(475);
+    peer[0] &= 0x7f;
+    let peer = BoxedEcdhPrivateKey::from_bytes(CurveId::Secp256k1, &peer)
+        .expect("scalar in range")
+        .public_key();
+    let shared = sk.diffie_hellman(&peer).expect("valid peer");
+    format!("ss={}", hex8(public(&shared[..])))
+}
+
+fn dsa2048_sign() -> String {
+    let mut x = secret_bytes::<32>(480);
+    x[0] &= 0x3f;
+    x[31] |= 1;
+    let sk = DsaPrivateKey::from_be_bytes(dsa::test_params_2048_256(), &x).expect("x in range");
+    let sig = sk.sign::<Sha256>(b"ct_valgrind message").expect("sign");
+    let der = sig.to_der();
+    declassify(&der);
+    format!("sig={}", hex8(&der))
+}
+
+fn sm2_encrypt_decrypt() -> String {
+    let sk = Sm2PrivateKey::from_bytes(&secret_bytes::<32>(481)).expect("scalar in range");
+    let pk = sk.public_key();
+    let msg = secret_bytes::<48>(482);
+    let expected = public_copy(&msg);
+    // The ephemeral key is secret randomness.
+    let ct = pk.encrypt(&msg, &mut TaintRng::new(483)).expect("encrypt");
+    declassify(&ct);
+    let pt = sk.decrypt(&ct).expect("decrypt");
+    declassify(&pt);
+    assert_eq!(pt, expected);
+    let mut bad = ct.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    assert!(sk.decrypt(&bad).is_err());
+    format!("ct={}", hex8(&ct))
+}
+
+const RSA3_TXT: &str =
+    include_str!("../testdata/wycheproof/rsa_three_primes_oaep_2048_sha1_mgf1sha1.txt");
+
+/// The hex string following `key` in the Wycheproof three-prime key JSON.
+fn json_hex(key: &str) -> BoxedUint {
+    let start = RSA3_TXT.find(key).expect("key present") + key.len();
+    let end = start + RSA3_TXT[start..].find('"').expect("closing quote");
+    let hex = &RSA3_TXT[start..end];
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+        .collect();
+    BoxedUint::from_be_bytes(&bytes)
+}
+
+fn rsa2048_three_prime() -> String {
+    let key = BoxedRsaPrivateKey::from_components_with_other_primes(
+        json_hex("\"modulus\":\""),
+        json_hex("\"publicExponent\":\""),
+        secret_uint(&json_hex("\"privateExponent\":\"")),
+        secret_uint(&json_hex("\"prime1\":\"")),
+        secret_uint(&json_hex("\"prime2\":\"")),
+        vec![secret_uint(&json_hex("\"otherPrimeInfos\":[[\""))],
+    );
+    assert_eq!(key.num_primes(), 3);
+    let sig = key
+        .sign_pss::<Sha256, _>(b"ct_valgrind message", &mut public_rng(484))
+        .expect("sign");
+    declassify(&sig);
+    key.public_key()
+        .verify_pss::<Sha256>(b"ct_valgrind message", &sig)
+        .expect("signature verifies");
+    let msg = fixed_bytes::<32>(485);
+    let ct = key
+        .public_key()
+        .encrypt_oaep::<Sha256, _>(&msg, b"", &mut public_rng(486))
+        .expect("encrypt");
+    let pt = key.decrypt_oaep::<Sha256>(&ct, b"").expect("decrypt");
+    declassify(&pt);
+    assert_eq!(pt, msg);
+    format!("sig={} pt={}", hex8(&sig), hex8(&pt))
+}
+
+fn rsa2048_pss_shake() -> String {
+    let key = rsa_key();
+    let sig = key
+        .sign_pss_shake::<Shake128, _>(b"ct_valgrind message", &mut public_rng(487))
+        .expect("sign");
+    declassify(&sig);
+    key.public_key()
+        .verify_pss_shake::<Shake128>(b"ct_valgrind message", &sig)
+        .expect("signature verifies");
+    hex8(&sig)
+}
+
+// ---------------------------------------------------------------------------
+// More symmetric modes, MACs, KDFs and envelopes
+// ---------------------------------------------------------------------------
+
+fn aes_stream_modes() -> String {
+    let key = secret_bytes::<16>(500);
+    let iv = fixed_bytes::<16>(501);
+    let pt = secret_bytes::<96>(502);
+    let expected = public_copy(&pt);
+    let mut out = Vec::new();
+
+    let mut buf = pt;
+    Cbc::new(Aes128::new(&key), &iv)
+        .encrypt(&mut buf)
+        .expect("block multiple");
+    declassify(&buf);
+    out.push(hex8(&buf));
+    Cbc::new(Aes128::new(&key), &iv)
+        .decrypt(&mut buf)
+        .expect("block multiple");
+    assert!(bool::from(ct::declassify_value(buf.ct_eq(&pt))));
+
+    let mut buf = pt;
+    Ctr::new(Aes128::new(&key), &iv).apply_keystream(&mut buf);
+    declassify(&buf);
+    out.push(hex8(&buf));
+    Ctr::new(Aes128::new(&key), &iv).apply_keystream(&mut buf);
+    declassify(&buf);
+    assert_eq!(buf, expected);
+
+    let mut buf = pt;
+    Cfb::new(Aes128::new(&key), &iv).encrypt(&mut buf);
+    declassify(&buf);
+    out.push(hex8(&buf));
+    Cfb::new(Aes128::new(&key), &iv).decrypt(&mut buf);
+    declassify(&buf);
+    assert_eq!(buf, expected);
+
+    let mut buf = pt;
+    Ofb::new(Aes128::new(&key), &iv).apply_keystream(&mut buf);
+    declassify(&buf);
+    out.push(hex8(&buf));
+    Ofb::new(Aes128::new(&key), &iv).apply_keystream(&mut buf);
+    declassify(&buf);
+    assert_eq!(buf, expected);
+    out.join(" ")
+}
+
+fn aes128_xts() -> String {
+    let xts = Aes128Xts::new_from_key_bytes(&secret_bytes::<32>(503)).expect("distinct halves");
+    let pt = secret_bytes::<100>(504);
+    let expected = public_copy(&pt);
+    let mut buf = pt;
+    // A partial final block, so ciphertext stealing runs.
+    xts.encrypt_sector(7, &mut buf).expect("valid length");
+    declassify(&buf);
+    let out = hex8(&buf);
+    xts.decrypt_sector(7, &mut buf).expect("valid length");
+    declassify(&buf);
+    assert_eq!(buf, expected);
+    out
+}
+
+fn aes_key_wrap() -> String {
+    let kek = secret_bytes::<16>(505);
+    let cek = secret_bytes::<32>(506);
+    let expected = public_copy(&cek);
+    let kw = Aes128Kw::new(Aes128::new(&kek));
+    let mut wrapped = [0u8; 40];
+    kw.wrap(&cek, &mut wrapped).expect("wrap");
+    declassify(&wrapped);
+    let mut unwrapped = [0u8; 32];
+    kw.unwrap(&wrapped, &mut unwrapped).expect("authentic");
+    declassify(&unwrapped);
+    assert_eq!(unwrapped, expected);
+    let mut bad = wrapped;
+    bad[20] ^= 1;
+    assert!(kw.unwrap(&bad, &mut unwrapped).is_err());
+
+    let kwp = Aes128Kwp::new(Aes128::new(&kek));
+    let mut wrapped_p = [0u8; 40];
+    kwp.wrap(&cek[..27], &mut wrapped_p[..kwp_ciphertext_len(27)])
+        .expect("wrap");
+    let wrapped_p = &wrapped_p[..kwp_ciphertext_len(27)];
+    declassify(wrapped_p);
+    let mut out = [0u8; 40];
+    let n = kwp.unwrap(wrapped_p, &mut out).expect("authentic");
+    declassify(&out);
+    assert_eq!(&out[..n], &expected[..27]);
+    let mut bad = wrapped_p.to_vec();
+    bad[3] ^= 1;
+    assert!(kwp.unwrap(&bad, &mut out).is_err());
+    format!("kw={} kwp={}", hex8(&wrapped), hex8(wrapped_p))
+}
+
+fn aes_siv() -> String {
+    let siv = AesSiv::new(&secret_bytes::<32>(507));
+    let pt = secret_bytes::<70>(508);
+    let expected = public_copy(&pt);
+    let ct = siv.seal(&[b"ad1", b"ad2"], &pt);
+    declassify(&ct);
+    let got = siv.open(&[b"ad1", b"ad2"], &ct).expect("authentic");
+    declassify(&got);
+    assert_eq!(got, expected);
+    let mut bad = ct.clone();
+    bad[2] ^= 1;
+    assert!(siv.open(&[b"ad1", b"ad2"], &bad).is_err());
+    hex8(&ct)
+}
+
+fn gmac_umac_vmac() -> String {
+    let key = secret_bytes::<16>(509);
+    let msg = secret_bytes::<300>(510);
+    let mut g = Gmac::new(Aes128::new(&key), &fixed_bytes::<12>(511));
+    g.update(&msg);
+    let gtag = g.finalize();
+    let nonce = fixed_bytes::<8>(512);
+    let utag = Umac64::compute(&key, &msg, &nonce);
+    let mut u = Umac128::new(&key);
+    u.update(&msg);
+    let utag2 = public_copy(&u.finalize(&nonce));
+    let mut u = Umac128::new(&key);
+    u.update(&msg);
+    assert!(u.verify(&nonce, &utag2));
+    let vtag = Vmac64::compute(&key, &msg, &nonce).expect("valid nonce");
+    let vtag2 = public_copy(
+        &Vmac128::new(&key)
+            .chain(&msg)
+            .finalize(&nonce)
+            .expect("valid nonce"),
+    );
+    assert!(Vmac128::new(&key).chain(&msg).verify(&nonce, &vtag2));
+    format!(
+        "gmac={} umac={} vmac={}",
+        hex8(public(&gtag)),
+        hex8(public(&utag)),
+        hex8(public(&vtag))
+    )
+}
+
+fn aez() -> String {
+    let aez = Aez::new(&secret_bytes::<48>(513));
+    let pt = secret_bytes::<60>(514);
+    let expected = public_copy(&pt);
+    let nonce = fixed_bytes::<12>(515);
+    let ct = aez.encrypt(&nonce, &[b"ad"], 16, &pt);
+    declassify(&ct);
+    let got = aez.decrypt(&nonce, &[b"ad"], 16, &ct).expect("authentic");
+    declassify(&got);
+    assert_eq!(got, expected);
+    let mut bad = ct.clone();
+    bad[5] ^= 1;
+    assert!(aez.decrypt(&nonce, &[b"ad"], 16, &bad).is_err());
+    hex8(&ct)
+}
+
+fn c2sp_chunked() -> String {
+    let key = secret_bytes::<16>(518);
+    let msg = secret_bytes::<200>(519);
+    let expected = public_copy(&msg);
+    // The salt is published at the front of the ciphertext.
+    let ct = chunked::encrypt::<Cobblestone128>(&key, b"ctx", &msg, &mut public_rng(520))
+        .expect("encrypt");
+    declassify(&ct);
+    let pt = chunked::decrypt::<Cobblestone128>(&key, b"ctx", &ct).expect("authentic");
+    declassify(&pt);
+    assert_eq!(pt, expected);
+    let mut bad = ct.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    assert!(chunked::decrypt::<Cobblestone128>(&key, b"ctx", &bad).is_err());
+    hex8(&ct[24..])
+}
+
+fn legacy_aeads() -> String {
+    let mut out = Vec::new();
+    let key = secret_bytes::<32>(521);
+    let k16: [u8; 16] = key[..16].try_into().unwrap();
+    let nonce = fixed_bytes::<16>(522);
+    let run = |seal: &dyn Fn(&mut [u8]) -> [u8; 16],
+               open: &dyn Fn(&mut [u8], &[u8; 16]) -> bool| {
+        aead_roundtrip(seal, open)
+    };
+    out.push(run(
+        &|b| Morus640::new(&k16).encrypt(&nonce, b"aad", b),
+        &|b, t| Morus640::new(&k16).decrypt(&nonce, b"aad", b, t).is_ok(),
+    ));
+    out.push(run(
+        &|b| Morus1280::new(&key).encrypt(&nonce, b"aad", b),
+        &|b, t| Morus1280::new(&key).decrypt(&nonce, b"aad", b, t).is_ok(),
+    ));
+    out.push(run(
+        &|b| Aegis128::new(&k16).encrypt(&nonce, b"aad", b),
+        &|b, t| Aegis128::new(&k16).decrypt(&nonce, b"aad", b, t).is_ok(),
+    ));
+    out.push(run(
+        &|b| Ascon128::new(&k16).encrypt(&nonce, b"aad", b),
+        &|b, t| Ascon128::new(&k16).decrypt(&nonce, b"aad", b, t).is_ok(),
+    ));
+    out.push(run(
+        &|b| Ascon128a::new(&k16).encrypt(&nonce, b"aad", b),
+        &|b, t| Ascon128a::new(&k16).decrypt(&nonce, b"aad", b, t).is_ok(),
+    ));
+    let n12 = fixed_bytes::<12>(523);
+    out.push(run(
+        &|b| Gcm::new(Seed::new(&k16)).encrypt(&n12, b"aad", b),
+        &|b, t| {
+            Gcm::new(Seed::new(&k16))
+                .decrypt(&n12, b"aad", b, t)
+                .is_ok()
+        },
+    ));
+    out.push(aes_block(&Seed::new(&k16)));
+    out.join(" ")
+}
+
+fn kbkdf_hmac_drbg() -> String {
+    let ki = secret_bytes::<32>(524);
+    let mut okm = [0u8; 48];
+    kbkdf_counter::<HmacSha256Prf>(&ki, b"label", b"context", &mut okm).expect("kbkdf");
+    // HMAC-DRBG seeded with secret entropy: its state and output are secret.
+    let mut drbg = HmacDrbg::<Sha256>::new(&secret_bytes::<32>(525), b"nonce", b"pers");
+    let mut a = [0u8; 64];
+    drbg.generate(&mut a, b"");
+    drbg.reseed(&secret_bytes::<32>(526), b"more");
+    let mut b = [0u8; 40];
+    drbg.generate(&mut b, b"additional");
+    format!(
+        "kbkdf={} drbg={}{}",
+        hex8(public(&okm)),
+        hex8(public(&a)),
+        hex8(public(&b))
+    )
+}
+
+fn pbes2_gcm() -> String {
+    let inner = secret_bytes::<64>(527);
+    let expected = public_copy(&inner);
+    let params = Pbes2Params {
+        kdf: KdfChoice::Pbkdf2HmacSha256 { iterations: 10_000 },
+        cipher: CipherChoice::Aes256Gcm,
+        salt_len: 16,
+    };
+    let password = secret_bytes::<16>(528);
+    // Salt and nonce are published in the envelope.
+    let blob = pbes2::encrypt(&inner, &password, &params, &mut public_rng(529));
+    declassify(&blob);
+    let got = pbes2::decrypt_authenticated(&blob, &password).expect("authentic");
+    declassify(&got);
+    assert_eq!(got, expected);
+    let mut wrong = password;
+    wrong[0] ^= 1;
+    assert!(pbes2::decrypt_authenticated(&blob, &wrong).is_err());
+    hex8(&blob[blob.len() - 16..])
+}
+
+/// Marks a JWK's private material secret. A JWK is a serialization format:
+/// it holds its key in the minimal big-endian encoding the format
+/// prescribes, so a key is built here from public bytes and its private
+/// fields are classified afterwards (the encoding's length — the bit
+/// length of `d`, `p`, `q` — is public in JWK by construction).
+fn classify_jwk(jwk: &Jwk) {
+    match jwk.key() {
+        JwkKey::Oct(k) => classify(k),
+        JwkKey::Rsa {
+            private: Some(parts),
+            ..
+        } => {
+            classify(parts.d());
+            classify(parts.p().expect("CRT key"));
+            classify(parts.q().expect("CRT key"));
+        }
+        JwkKey::Ec { d: Some(d), .. } | JwkKey::Okp { d: Some(d), .. } => classify(d),
+        _ => panic!("not a private JWK"),
+    }
+}
+
+fn jose_jwe_decrypt() -> String {
+    let mut out = Vec::new();
+    let pt = b"ct_valgrind JWE payload";
+    // Symmetric keys: the token is made with a public copy of the key (the
+    // encryption side is not what this case checks) and opened with the
+    // secret one.
+    let raw = fixed_bytes::<32>(530);
+    for (alg, key_alg) in [(KeyAlg::Dir, "A256GCM"), (KeyAlg::A256KW, "A256KW")] {
+        let enc_key = Jwk::oct(&raw).with_alg(key_alg).expect("alg");
+        let token = Jwe::encrypt_compact(&enc_key, alg, Enc::A256Gcm, pt, &mut public_rng(531))
+            .expect("encrypt");
+        let dec_key = Jwk::oct(&raw).with_alg(key_alg).expect("alg");
+        classify_jwk(&dec_key);
+        let got = Jwe::parse(&token)
+            .expect("parse")
+            .decrypt(&dec_key)
+            .expect("decrypt");
+        declassify(&got);
+        assert_eq!(got, pt);
+        out.push(token[token.len() - 12..].to_string());
+    }
+    // ECDH-ES+A256KW to a P-256 key, RSA-OAEP-256 to the RSA test key.
+    let mut d = fixed_bytes::<32>(532);
+    d[0] &= 0x7f;
+    let ec = BoxedEcdsaPrivateKey::from_bytes(CurveId::P256, &d).expect("scalar in range");
+    let rsa = BoxedRsaPrivateKey::from_pkcs1_pem(RSA_PEM).expect("test key parses");
+    for (jwk, alg, tag) in [
+        (
+            Jwk::from_ec_private(&ec).expect("jwk"),
+            KeyAlg::EcdhEsA256KW,
+            533,
+        ),
+        (Jwk::from_rsa_private(&rsa), KeyAlg::RsaOaep256, 534),
+    ] {
+        let token = Jwe::encrypt_compact(
+            &jwk.to_public().expect("public half"),
+            alg,
+            Enc::A256Gcm,
+            pt,
+            &mut public_rng(tag),
+        )
+        .expect("encrypt");
+        classify_jwk(&jwk);
+        let got = Jwe::parse(&token)
+            .expect("parse")
+            .decrypt(&jwk)
+            .expect("decrypt");
+        declassify(&got);
+        assert_eq!(got, pt);
+        out.push(token[token.len() - 12..].to_string());
+    }
+    out.join(" ")
+}
+
+fn jose_jws_sign() -> String {
+    let mut out = Vec::new();
+    let hs = Jwk::oct(&fixed_bytes::<32>(535));
+    let mut d = fixed_bytes::<32>(536);
+    d[0] &= 0x7f;
+    let es = Jwk::from_ec_private(
+        &BoxedEcdsaPrivateKey::from_bytes(CurveId::P256, &d).expect("scalar in range"),
+    )
+    .expect("jwk");
+    let ed = Jwk::from_ed25519_private(&Ed25519PrivateKey::from_bytes(fixed_bytes::<32>(537)));
+    for (key, alg) in [
+        (&hs, SigAlg::HS256),
+        (&es, SigAlg::ES256),
+        (&ed, SigAlg::EdDSA),
+    ] {
+        let verify_key = if alg == SigAlg::HS256 {
+            key.clone()
+        } else {
+            key.to_public().expect("public half")
+        };
+        classify_jwk(key);
+        let token = Jws::sign_compact(key, alg, b"ct_valgrind payload", &mut public_rng(538))
+            .expect("sign");
+        let parsed = Jws::parse(&token).expect("parse");
+        // HS256 verification recomputes the MAC under the secret key; the
+        // verdict is its public result.
+        let ok = parsed.verify(&verify_key).is_ok();
+        assert!(ok);
+        out.push(token[token.len() - 12..].to_string());
+    }
+    out.join(" ")
+}
+
 // ---------------------------------------------------------------------------
 // Positive control
 // ---------------------------------------------------------------------------
@@ -1049,6 +2100,50 @@ const CASES: &[Case] = &[
     ("mldsa65_sign_hedged", mldsa65_sign_hedged),
     ("slhdsa_sha2_128f", slhdsa_sha2_128f),
     ("slhdsa_shake_128f", slhdsa_shake_128f),
+    ("slhdsa_sha2_128s", slhdsa_sha2_128s),
+    ("falcon512_sign", falcon512_sign),
+    ("xmss_sign", xmss_sign),
+    ("xmssmt_sign", xmssmt_sign),
+    ("hss_l2_sign", hss_l2_sign),
+    // Protocols
+    ("tls13_key_schedule", tls13_key_schedule),
+    ("tls13_finished", tls13_finished),
+    ("tls13_record_aes128", tls13_record_aes128),
+    ("tls13_record_aes256", tls13_record_aes256),
+    ("tls13_record_chacha", tls13_record_chacha),
+    ("tls12_prf_finished", tls12_prf_finished),
+    ("tls12_records", tls12_records),
+    ("dtls12_records", dtls12_records),
+    ("dtls13_records", dtls13_records),
+    ("quic_packets", quic_packets),
+    // secp256k1 extensions, more curves and RSA variants
+    ("bip340_sign", bip340_sign),
+    ("zkp_sign_to_contract", zkp_sign_to_contract),
+    ("zkp_adaptor", zkp_adaptor),
+    ("zkp_pedersen_rangeproof", zkp_pedersen_rangeproof),
+    ("zkp_surjection", zkp_surjection),
+    ("zkp_whitelist", zkp_whitelist),
+    ("ristretto255_mul", ristretto255_mul),
+    ("p521_ecdsa_ecdh", p521_ecdsa_ecdh),
+    ("brainpoolp256r1_ecdsa_ecdh", brainpoolp256r1_ecdsa_ecdh),
+    ("secp256k1_ecdh", secp256k1_ecdh),
+    ("dsa2048_sign", dsa2048_sign),
+    ("sm2_encrypt_decrypt", sm2_encrypt_decrypt),
+    ("rsa2048_three_prime", rsa2048_three_prime),
+    ("rsa2048_pss_shake", rsa2048_pss_shake),
+    // More symmetric
+    ("aes_stream_modes", aes_stream_modes),
+    ("aes128_xts", aes128_xts),
+    ("aes_key_wrap", aes_key_wrap),
+    ("aes_siv", aes_siv),
+    ("gmac_umac_vmac", gmac_umac_vmac),
+    ("aez", aez),
+    ("c2sp_chunked", c2sp_chunked),
+    ("legacy_aeads", legacy_aeads),
+    ("kbkdf_hmac_drbg", kbkdf_hmac_drbg),
+    ("pbes2_gcm", pbes2_gcm),
+    ("jose_jwe_decrypt", jose_jwe_decrypt),
+    ("jose_jws_sign", jose_jws_sign),
 ];
 
 fn main() {
@@ -1062,6 +2157,31 @@ fn main() {
             "running natively (client requests are no-ops)"
         },
         std::env::consts::ARCH
+    );
+    // The code-generation variant under test; CI checks these lines.
+    println!(
+        "ct_valgrind: cpu dispatch: {}",
+        if ct::force_portable() {
+            "forced portable"
+        } else {
+            "detected"
+        }
+    );
+    let tables: Vec<&str> = [
+        ("ed25519", cfg!(feature = "ed25519-table")),
+        ("p256", cfg!(feature = "p256-table")),
+    ]
+    .iter()
+    .filter(|(_, on)| *on)
+    .map(|(name, _)| *name)
+    .collect();
+    println!(
+        "ct_valgrind: tables: {}",
+        if tables.is_empty() {
+            "none".to_string()
+        } else {
+            tables.join(",")
+        }
     );
     if std::env::var_os("CT_REQUIRE_VALGRIND").is_some_and(|v| v == "1") && on_valgrind == 0 {
         eprintln!("ct_valgrind: CT_REQUIRE_VALGRIND=1 but not running under Valgrind");

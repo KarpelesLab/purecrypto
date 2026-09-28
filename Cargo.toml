@@ -160,10 +160,13 @@ __fuzz = ["tls"]
 # INTERNAL — not part of the public API, no semver guarantee, may vanish at
 # any time. Turns the `ct` module's Valgrind memcheck client requests
 # (`ct::classify` / `ct::declassify`, `#[doc(hidden)]`) from no-ops into the
-# real instruction sequences on x86_64 / aarch64, so `tests/ct_valgrind.rs`
-# can mark secrets undefined and have memcheck report every branch or memory
-# index computed from them in the optimized binary. Only the constant-time
-# harness and `.github/workflows/ct-valgrind.yml` should enable this.
+# real instruction sequences on x86_64 / x86 / aarch64 / arm, so
+# `tests/ct_valgrind.rs` can mark secrets undefined and have memcheck report
+# every branch or memory index computed from them in the optimized binary.
+# Also exposes `ct::hooks` (entry points into the crate-private record
+# layers) and the `PURECRYPTO_CT_FORCE_PORTABLE` switch that makes runtime
+# CPU dispatch take the portable kernels. Only the constant-time harness and
+# `.github/workflows/ct-valgrind.yml` should enable this.
 __ct-check = []
 # hazmat: low-level arithmetic exposures with NO semver-stability guarantee;
 # the caller owns correctness and constant-time discipline. Off by default.
@@ -421,7 +424,7 @@ required-features = ["std", "cipher", "hash", "ec", "rsa", "mlkem", "mldsa", "sl
 [[test]]
 name = "ct_valgrind"
 harness = false
-required-features = ["__ct-check", "std", "hash", "cipher", "kdf", "rng", "rsa", "ec", "mlkem", "mldsa", "slhdsa", "der", "dh", "ascon", "alloc", "mac", "hpke", "bls", "lms"]
+required-features = ["__ct-check", "std", "hash", "cipher", "kdf", "rng", "rsa", "ec", "mlkem", "mldsa", "slhdsa", "der", "dh", "ascon", "alloc", "mac", "hpke", "bls", "lms", "xmss", "falcon", "tls", "dtls", "quic", "bip340", "zkp", "ristretto255", "dsa", "chunked", "jose", "aez", "legacy-ciphers", "vmac"]
 
 [lints.rust]
 # `fullrust` is a custom, out-of-tree `target_os` (a libc-free Linux

@@ -8,6 +8,14 @@ name: Constant-time (Valgrind)
 # conditional branch or memory address computed from a secret in the
 # optimized release binary, and `--error-exitcode=1` fails the job. See the
 # harness header for what is and is not covered.
+#
+# The matrix covers the code-generation variants where different machine
+# code hides: each 64-bit architecture with the CPU dispatch it detects
+# (AES-NI / PMULL / AVX2 / SHA extensions) and with every dispatch site forced
+# onto its portable kernel; builds without the precomputed Ed25519 / P-256
+# base-point tables (the windowed-ladder and interleaved-verification
+# fallbacks); and the 32-bit targets, where LLVM lowers 64-bit arithmetic
+# into multi-instruction sequences or library calls.
 
 on:
   push:
@@ -20,37 +28,98 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Opt-in features the harness needs on top of the default set.
+  CT_FEATURES: __ct-check,hpke,bls,falcon,quic,bip340,zkp,ristretto255,dsa,chunked,legacy-ciphers,vmac
+  # The default set minus the Ed25519 / P-256 base-point tables (and the
+  # parts the harness does not need), for the table-free variant.
+  CT_TABLE_FREE_BASE: std,alloc,hash,cipher,kdf,bignum,rng,rsa,der,dh,x509,ec,tls,dtls,mlkem,mldsa,slhdsa,ascon,aez,lms,xmss,mac,key,jose
 
 jobs:
   memcheck:
-    name: memcheck (${{ matrix.os }})
+    name: memcheck (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - name: x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: x86_64, portable
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            portable: true
+          - name: x86_64, table-free
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            table_free: true
+          - name: aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: aarch64, portable
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            portable: true
+          - name: aarch64, table-free
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            table_free: true
+          # 32-bit x86: no hardware backends are compiled for it, so this is
+          # the portable code with 32-bit `usize` and multi-word arithmetic.
+          - name: i686
+            os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+          # 32-bit Arm, run in AArch32 compatibility mode on the arm64 runner
+          # (its Neoverse-N2 cores execute AArch32 at EL0).
+          - name: armv7
+            os: ubuntu-24.04-arm
+            target: armv7-unknown-linux-gnueabihf
     env:
       # Debug info, so memcheck's stack traces name source lines and inlined
       # frames. It changes no optimization setting: the binary under test is
       # the opt-level 3, thin-LTO release build users get (asserted below).
       CARGO_PROFILE_RELEASE_DEBUG: "true"
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ct-valgrind-${{ matrix.os }}
+          key: ct-valgrind-${{ matrix.target }}-${{ matrix.table_free && 'table-free' || 'default' }}
 
       - name: Install Valgrind
         run: |
-          sudo apt-get update
-          sudo apt-get install -y valgrind
+          set -euxo pipefail
+          case "${{ matrix.target }}" in
+            i686-unknown-linux-gnu)
+              # The amd64 Valgrind package ships the x86 tools; the guest
+              # needs a 32-bit libc, and memcheck's mandatory ld.so
+              # redirections need its symbols.
+              sudo dpkg --add-architecture i386
+              sudo apt-get update
+              sudo apt-get install -y valgrind gcc-multilib libc6-dbg:i386
+              ;;
+            armv7-unknown-linux-gnueabihf)
+              # A 32-bit Valgrind (and libc) for the AArch32 guest, from the
+              # armhf multiarch archive, plus a cross linker.
+              sudo dpkg --add-architecture armhf
+              sudo apt-get update
+              sudo apt-get install -y gcc-arm-linux-gnueabihf libc6:armhf libc6-dbg:armhf valgrind:armhf
+              ;;
+            *)
+              sudo apt-get update
+              sudo apt-get install -y valgrind
+              ;;
+          esac
           valgrind --version
+          ls /usr/libexec/valgrind/ | grep -E '^memcheck-' || true
           lscpu
           rustc -vV
 
@@ -58,8 +127,13 @@ jobs:
         id: build
         run: |
           set -euo pipefail
-          cargo test --release --features __ct-check,hpke,bls --test ct_valgrind --no-run \
-                --message-format=json > build.jsonl
+          if [ "${{ matrix.table_free }}" = "true" ]; then
+            feat=(--no-default-features --features "$CT_TABLE_FREE_BASE,$CT_FEATURES")
+          else
+            feat=(--features "$CT_FEATURES")
+          fi
+          cargo test --release --target "${{ matrix.target }}" "${feat[@]}" \
+                --test ct_valgrind --no-run --message-format=json > build.jsonl
           sel='select(.reason == "compiler-artifact" and .target.name == "ct_valgrind" and .profile.test)'
           jq -r "$sel"' | "opt-level=\(.profile.opt_level) debuginfo=\(.profile.debuginfo) \(.executable)"' build.jsonl
           bin=$(jq -r "$sel | .executable" build.jsonl | grep -v null | head -n1)
@@ -69,10 +143,27 @@ jobs:
           # `cargo test --release` must test the optimized code users ship.
           test "$opt" = "3" || { echo "::error::harness built at opt-level $opt, expected 3"; exit 1; }
           test "$lib_opt" = "3" || { echo "::error::library built at opt-level $lib_opt, expected 3"; exit 1; }
+          file "$bin"
           echo "CT_BIN=$bin" >> "$GITHUB_ENV"
+          if [ "${{ matrix.portable }}" = "true" ]; then
+            echo "PURECRYPTO_CT_FORCE_PORTABLE=1" >> "$GITHUB_ENV"
+          fi
 
       - name: Native smoke run
-        run: '"$CT_BIN"'
+        run: '"$CT_BIN" | tee native.log'
+
+      - name: Check the variant under test
+        run: |
+          set -euo pipefail
+          grep -E '^ct_valgrind: (cpu dispatch|tables):' native.log
+          if [ "${{ matrix.portable }}" = "true" ]; then
+            grep -q '^ct_valgrind: cpu dispatch: forced portable' native.log \
+              || { echo "::error::portable dispatch was not forced"; exit 1; }
+          fi
+          if [ "${{ matrix.table_free }}" = "true" ]; then
+            grep -q '^ct_valgrind: tables: none' native.log \
+              || { echo "::error::built with base-point tables"; exit 1; }
+          fi
 
       # The positive control is a deliberately variable-time function (a branch
       # and a table index on a secret byte). memcheck MUST flag it; if it does
@@ -103,7 +194,7 @@ jobs:
           set +e -uo pipefail
           CT_REQUIRE_VALGRIND=1 valgrind --tool=memcheck --error-exitcode=1 \
             --track-origins=yes --leak-check=no --errors-for-leak-kinds=none \
-            --num-callers=40 \
+            --num-callers=40 --error-limit=no --expensive-definedness-checks=yes \
             "$CT_BIN" 2>&1 | tee memcheck.log
           exit "${PIPESTATUS[0]}"
 
@@ -113,19 +204,25 @@ jobs:
         if: ${{ !cancelled() && steps.check.outcome == 'failure' }}
         run: |
           set -uo pipefail
+          case "${{ matrix.target }}" in
+            armv7-*) objdump=arm-linux-gnueabihf-objdump ;;
+            *) objdump=objdump ;;
+          esac
           grep -E '^==[0-9]+==\s+at 0x[0-9A-Fa-f]+:' memcheck.log \
-            | sed -E 's/^==[0-9]+==\s+at 0x([0-9A-Fa-f]+):.*/\1/' | sort -u \
+            | sed -E 's/^==[0-9]+==\s+at 0x([0-9A-Fa-f]+):.*/\1/' | sort -u | head -n 60 \
             | while read -r addr; do
                 echo "::group::0x$addr"
-                # The binary is PIE; Valgrind maps it at 0x108000, so the
-                # reported addresses are the link-time ones plus that bias.
-                for bias in 0x108000 0; do
+                # The binary is PIE; Valgrind maps it at a fixed bias (0x108000
+                # for 64-bit guests, 0x4000000-ish for 32-bit ones), so try the
+                # link-time address under each candidate bias.
+                for bias in 0x108000 0x4000000 0x400000 0; do
                   a=$(printf '%x' $((0x$addr - bias)))
+                  [ $((0x$a)) -gt 0 ] || continue
                   start=$(printf '0x%x' $((0x$a - 0x40)))
                   stop=$(printf '0x%x' $((0x$a + 0x30)))
-                  out=$(objdump -d -l --no-show-raw-insn --start-address="$start" --stop-address="$stop" "$CT_BIN" \
+                  out=$($objdump -d -l --no-show-raw-insn --start-address="$start" --stop-address="$stop" "$CT_BIN" 2>/dev/null \
                     | sed -n '/^Disassembly/,$p' | tail -n +2 | sed -E "s/^ *$a:/>>> &/")
-                  if [ -n "$out" ]; then echo "$out"; break; fi
+                  if [ -n "$out" ]; then echo "bias $bias"; echo "$out"; break; fi
                 done
                 echo "::endgroup::"
               done

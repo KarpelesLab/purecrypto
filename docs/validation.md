@@ -29,7 +29,9 @@ recommended *safe* subset of the API, see
   [Known residuals](#known-constant-time-residuals). The compiled code of
   the main secret-handling paths is additionally checked in CI with
   **Valgrind memcheck used as a taint tracker** (the ctgrind / TIMECOP
-  technique) on x86_64 and aarch64 Linux — see
+  technique) on x86_64, aarch64, i686 and armv7 Linux, with detected and
+  forced-portable CPU dispatch and with and without the precomputed curve
+  tables — see
   [Machine-code validation](#machine-code-validation-valgrind-memcheck) for
   exactly what that covers and what it cannot. There has been no formal
   third-party CT audit and no statistical timing measurement (dudect-style).
@@ -271,58 +273,105 @@ Source-level discipline is necessary but not sufficient: LLVM is free to turn
 a mask into a branch, unswitch a loop on a secret-derived invariant, or lower
 a `||` into a jump on the second operand. `tests/ct_valgrind.rs`, run by
 `.github/workflows/ct-valgrind.yml` on every push to `master` and every pull
-request, checks
-the **optimized release binary** (opt-level 3, thin LTO, the profile users
-ship) on **x86_64 (`ubuntu-latest`) and aarch64 (`ubuntu-24.04-arm`)**:
+request, checks the **optimized release binary** (opt-level 3, thin LTO, the
+profile users ship) across the code-generation variants where different
+machine code hides:
+
+| Matrix entry | Target | What differs |
+|---|---|---|
+| `x86_64` | `x86_64-unknown-linux-gnu` on `ubuntu-latest` | the CPU dispatch memcheck's emulated CPU allows: AES-NI, PCLMULQDQ, AVX2 (Valgrind hides AVX-512 and SHA-NI) |
+| `x86_64, portable` | same | every dispatch site forced onto its portable kernel (`PURECRYPTO_CT_FORCE_PORTABLE=1`): table-free AES, the branchless GHASH multiply, scalar ChaCha20 / Poly1305 / BLAKE3 / Keccak / SHA |
+| `x86_64, table-free` | same, `--no-default-features` minus `ed25519-table` / `p256-table` | the constant-time windowed ladders for `[k]B` / `[k]G` and interleaved double-scalar verification instead of the precomputed comb tables |
+| `aarch64`, `aarch64, portable`, `aarch64, table-free` | `aarch64-unknown-linux-gnu` on `ubuntu-24.04-arm` | as above with the Arm extensions (AES, PMULL, SHA-2, SHA-512) |
+| `i686` | `i686-unknown-linux-gnu` under the amd64 Valgrind's x86 tool | 32-bit `usize` and limbs: 64-bit multiplies and shifts become multi-instruction sequences, 64-bit divisions library calls; no hardware backends are compiled for it, so this is the portable code throughout |
+| `armv7` | `armv7-unknown-linux-gnueabihf` under `valgrind:armhf`, in AArch32 mode on the Neoverse-N2 runner | the 32-bit Arm lowering of the same |
+
+Every entry runs the positive control, then the full case list.
 
 - Every secret input is marked *undefined* through a Valgrind client
   request — an inline-asm magic sequence behind the hidden `__ct-check`
-  feature (`src/ct/valgrind.rs`; no C header, no dependency) — and memcheck
-  then reports any **conditional branch** or **memory address** computed
-  from it, bit-precisely, anywhere in the call tree. Secrets enter as
-  classified key/seed/plaintext bytes, through a `TaintRng` whose every
+  feature (`src/ct/valgrind.rs`, transcribed from `valgrind.h` for the four
+  platforms; no C header, no dependency) — and memcheck then reports any
+  **conditional branch** or **memory address** computed from it,
+  bit-precisely, anywhere in the call tree. Secrets enter as classified
+  key/seed/plaintext/traffic-secret bytes, through a `TaintRng` whose every
   output byte is secret (so key generation, nonces, blinding and hedging
-  are checked as they run on `OsRng`), or as the classified limbs of an
-  imported RSA key. Public results (ciphertexts, tags, signatures, public
+  are checked as they run on `OsRng`), or as the classified secret parts of
+  an imported key (RSA limbs, a JWK's private fields, a Falcon key's
+  expanded buffers). Public results (ciphertexts, tags, signatures, public
   keys, shared secrets) are marked *defined* again before the harness
   compares them; the library-side counterparts are the
   [declassification points](#declassification-points) below.
+- The protocol record layers and key schedules are reached through
+  `ct::hooks`, `__ct-check`-only entry points into the crate-private code
+  (`src/ct/hooks.rs`): a full handshake would drag public values (randoms,
+  transcript, certificates) through the same paths as the secrets. The
+  hooks call the same functions the engines call; the receive-side glue
+  they add (sequence-number / header-protection removal, AAD
+  reconstruction, packet-number decoding) mirrors the engines' receive
+  paths step for step.
 - A **positive control** (a deliberate secret branch and a secret table
   index) must be flagged in the same run, so a green result cannot come
   from broken instrumentation; the harness also refuses to run outside
-  Valgrind when `CT_REQUIRE_VALGRIND=1`. Under `cargo test --all-features`
-  the client requests are no-ops and the same binary is a plain smoke test.
-- **Covered** (one fixed-seed instance each): the `ct` primitives;
-  AES-128/192/256, Camellia, ARIA and SM4 block encryption; AES-GCM,
-  AES-GCM-SIV, AES-CCM, AES-EAX, ChaCha20-Poly1305, XChaCha20-Poly1305,
-  AEGIS-128L, Ascon-AEAD128 (seal, open, and open with a forged tag);
-  AES-CMAC, Poly1305, KMAC128, SipHash-2-4, HMAC-SHA-256/512 (`mac` and
-  `verify`, good and bad); HKDF, PBKDF2, Argon2i; SHA-2, SHA-3, SHAKE,
-  BLAKE2b, BLAKE3, SM3 over secret input; X25519, X448, Ed25519, Ed448,
-  P-256 ECDSA sign / ECDH / keygen, P-384 ECDSA sign / ECDH (boxed path),
-  secp256k1 ECDSA sign, SM2 sign, FFDH group14, HPKE (X25519 and P-256
-  KEMs, seal + open + forged ciphertext), BLS12-381 signing, LMS (H5)
-  keygen + sign; RSA-2048 key generation, PSS sign, OAEP decrypt, PKCS#1
-  v1.5 decrypt in its explicit-error, fixed-length (`_session`) and
-  implicit-rejection forms — each with a valid and a tampered ciphertext;
-  ML-KEM-512/768/1024 keygen and decapsulation (768 also encapsulation and
-  a tampered ciphertext); ML-DSA-44/65/87 keygen and deterministic
-  signing (65 also hedged); SLH-DSA-SHA2-128f and SHAKE-128f keygen +
-  sign.
-- **Not covered**: everything not in that list (notably TLS/DTLS/QUIC record
-  and handshake processing, PKCS#12, XMSS, the `zkp` and `falcon` modules
-  and the hazmat surfaces); code paths a single fixed input does
-  not reach; the *portable fallbacks* of runtime-dispatched SIMD code
-  (AES, GHASH, ChaCha20, SHA-2, Keccak — each runner tests whichever
-  backend its Valgrind-emulated CPU selects, and Valgrind hides AVX-512 and
-  SHA-NI); **variable-latency instructions** (memcheck flags branches and
-  addresses, not a division or multiply whose timing depends on its
-  operands); other compilers, LLVM versions, targets and optimization
-  levels than the CI's; and every microarchitectural channel (cache, port
-  contention, speculation, power) — the harness shows the *machine code* is
-  data-oblivious, not that the *CPU* is.
+  Valgrind when `CT_REQUIRE_VALGRIND=1`, and CI checks that each variant
+  really is the one under test (`cpu dispatch: forced portable`, `tables:
+  none`). Under `cargo test --all-features` the client requests are no-ops
+  and the same binary is a plain smoke test.
+- **Covered** (one fixed-seed instance each, 103 cases): the `ct`
+  primitives; AES-128/192/256, Camellia, ARIA, SM4 and SEED block
+  encryption; AES-GCM, AES-GCM-SIV, AES-CCM, AES-EAX, ChaCha20-Poly1305,
+  XChaCha20-Poly1305, AEGIS-128L, AEGIS-128, MORUS-640/1280, Ascon-AEAD128,
+  Ascon-128/128a, SEED-GCM (seal, open, and open with a forged tag);
+  AES-CBC/CTR/CFB/OFB, AES-XTS (with ciphertext stealing), AES-KW and KWP
+  (wrap, unwrap, corrupted unwrap), AES-SIV, AEZ, C2SP chunked encryption;
+  AES-CMAC, GMAC, UMAC-64/128, VMAC-64/128, Poly1305, KMAC128, SipHash-2-4,
+  HMAC-SHA-256/512 (`mac` and `verify`, good and bad); HKDF, PBKDF2,
+  KBKDF, Argon2i, HMAC-DRBG (generate, reseed), PBES2 AES-256-GCM
+  `decrypt_authenticated` (right and wrong password); SHA-2, SHA-3, SHAKE,
+  BLAKE2b, BLAKE3, SM3 over secret input; **TLS 1.3** key schedule (with
+  and without PSK, exporter, resumption), Finished MAC + verify (good and
+  bad), record protection for all three suites (seal, open, open of a
+  padded record, forged record), `KeyUpdate` derivation; **TLS 1.2** PRF
+  (master secret, extended master secret, key block), Finished verify and
+  AEAD records; **DTLS 1.2** records; **DTLS 1.3** records with
+  sequence-number encryption (all three suites, forged record); **QUIC**
+  1-RTT packet protection with header protection (all three suites, forged
+  packet) and the key-update derivation; X25519, X448, Ed25519, Ed448,
+  P-256 ECDSA sign / ECDH / keygen, P-384, P-521 and brainpoolP256r1 ECDSA
+  sign / ECDH (boxed path), secp256k1 ECDSA sign and ECDH, BIP340 Schnorr
+  sign, ristretto255 scalar multiplication, SM2 sign and encrypt / decrypt
+  (tampered ciphertext), DSA-2048 sign, FFDH group14, HPKE (X25519 and
+  P-256 KEMs, seal + open + forged ciphertext), BLS12-381 signing; the
+  `zkp` modules — sign-to-contract, adaptor encrypt / decrypt / recover,
+  Pedersen commit + an 8-bit range proof, a 3-input surjection proof and a
+  3-key whitelist proof, the ring position classified as secret in the last
+  two; RSA-2048 key generation, PSS and SHAKE-PSS sign, OAEP decrypt,
+  PKCS#1 v1.5 decrypt in its explicit-error, fixed-length (`_session`) and
+  implicit-rejection forms — each with a valid and a tampered ciphertext —
+  and a three-prime key (PSS sign, OAEP decrypt); JOSE JWE decrypt
+  (`dir`, `A256KW`, `ECDH-ES+A256KW`, `RSA-OAEP-256`) and JWS sign
+  (`HS256`, `ES256`, `EdDSA`); ML-KEM-512/768/1024 keygen and
+  decapsulation (768 also encapsulation and a tampered ciphertext);
+  ML-DSA-44/65/87 keygen and deterministic signing (65 also hedged);
+  SLH-DSA-SHA2-128f, SHAKE-128f and SHA2-128s keygen + sign; Falcon-512
+  signing (the key generated on public randomness, then its expanded
+  buffers classified); LMS (H5) keygen + sign, HSS (two H5 levels), XMSS
+  (SHA2_10_256) and XMSS^MT (SHA2_20/2_256) keygen + sign.
+- **Not covered**: everything not in that list (notably the TLS/DTLS/QUIC
+  handshake state machines above the record layer, the `halfagg` module,
+  which has no secret input, and the hazmat surfaces); code paths a single
+  fixed input does not reach; **variable-latency instructions** (memcheck
+  flags branches and addresses, not a division or multiply whose timing
+  depends on its operands); other compilers, LLVM versions, targets and
+  optimization levels than the CI's; and every microarchitectural channel
+  (cache, port contention, speculation, power) — the harness shows the
+  *machine code* is data-oblivious, not that the *CPU* is.
 - The documented variable-time residuals below are deliberately not in the
   harness (they would be flagged, correctly); nothing is suppressed.
+  Beyond the list below that also excludes FF1 (its radix arithmetic on the
+  digits is data-dependent by construction), the table-driven hashes
+  (Streebog, Whirlpool, MD2 — documented at the code site) and PKCS#12
+  (its archives are PBES2 CBC-PAD envelopes).
 
 The first run found and fixed four cases where LLVM had undone
 source-level constant-time code: the barrel shifter that moves a decrypted
@@ -334,10 +383,15 @@ padding verdict — the Bleichenbacher oracle it exists to remove; the
 lowered to a branch on every byte of a private-operation result; and the
 masked conditional subtraction in the BLS12-381 field arithmetic
 (`bls::mont::reduce_once` / `neg`) was lowered to a branch on the secret
-carry. Each is now pinned by an optimization barrier and by this harness. Two source-level
-issues went with them: the early-exit range check of a decoded ML-DSA
-secret vector, and RSA key generation branching (and selecting a pointer)
-on which prime is larger.
+carry. Each is now pinned by an optimization barrier and by this harness.
+Two source-level issues went with them: the early-exit range check of a
+decoded ML-DSA secret vector, and RSA key generation branching (and
+selecting a pointer) on which prime is larger. The second pass (protocol
+record layers, the remaining signature schemes and symmetric modes, the
+code-generation variants) found one more: the DTLS 1.3 record layer
+stripped the inner-plaintext padding with a backward `rposition` scan —
+time proportional to the padding, the very leak the TLS 1.3 record layer's
+constant-time scan exists to prevent — and now shares that scan.
 
 #### Declassification points
 
@@ -347,30 +401,61 @@ become public (`ct::declassify`; a no-op outside the harness). Every site
 says why, and this is the complete list — anything outside it that branches
 on a secret is a bug:
 
-- **Verification verdicts**: an AEAD / MAC / key-wrap tag comparison, an
-  RSA OAEP or PKCS#1 v1.5 padding verdict (the explicit-error API, whose
+- **Verification verdicts**: an AEAD / MAC / key-wrap / AEZ / UMAC / VMAC
+  tag comparison, the C2SP chunked-encryption commitment, an RSA OAEP or
+  PKCS#1 v1.5 padding verdict (the explicit-error API, whose
   Bleichenbacher caveat is documented), the RSA fault-check result, the
-  X25519 / X448 all-zero output check, ECDSA's degenerate `r = 0` / `s = 0`,
-  the DH contributory-failure check, and the ML-DSA secret-vector range
-  check — all returned to the caller as `Ok`/`Err`.
+  X25519 / X448 all-zero output check, ECDSA's degenerate `r = 0` /
+  `s = 0`, the DH contributory-failure check, the ML-DSA secret-vector
+  range check, the SM2 `C3` hash and all-zero key-stream checks, the
+  AES-XTS `k1 == k2` check, the JOSE HS-family MAC verdict, a
+  secp256k1 scalar's range and zero checks (`Scalar::from_bytes_be`, the
+  BIP340 / sign-to-contract / adaptor / whitelist key checks), the DSA
+  `x` / `k` range check, the `zkp` consistency checks (an opening matches
+  its commitment, a ring key matches its secret, an index is in range) —
+  all returned to the caller as `Ok`/`Err`. The TLS 1.3 / DTLS 1.3
+  "inner plaintext is all zero" verdict (a protocol violation answered with
+  an alert) belongs here too.
 - **Rejection-sampling and retry decisions**: RFC 6979 / FIPS 186-5 scalar
-  and nonce candidates, SM2 nonce retries, the ML-DSA signing loop, ML-DSA
-  `RejBoundedPoly` (ExpandS), and every RSA key-generation decision (a
-  composite candidate, `p = q`, `|p − q|` too small, `e` not invertible,
-  the rare `2^64 | p − 1` Miller-Rabin tail). Only the count is observable.
+  and nonce candidates (ECDSA, DSA, sign-to-contract), SM2 nonce retries,
+  the ML-DSA signing loop, ML-DSA `RejBoundedPoly` (ExpandS), every RSA
+  key-generation decision (a composite candidate, `p = q`, `|p − q|` too
+  small, `e` not invertible, the rare `2^64 | p − 1` Miller-Rabin tail),
+  the Falcon signature norm bound, the Falcon sampler's loop controls (see
+  the residual below), the VMAC L3 key-derivation window (a candidate is
+  rejected with probability 2⁻⁵⁶, whatever the key), and the range-proof
+  exponent search (the accepted parameters are the proof header). Only the
+  count is observable.
 - **Public outputs the library itself branches on before returning them**:
   the ML-KEM and ML-DSA matrix seed `ρ`; the ML-DSA challenge `c̃`
   (SampleInBall) and, once accepted, `z` and the hint; every SLH-DSA
   signature component as it is written (the tree, leaf, FORS and WOTS+
-  indices are functions of the signature and public key); the RSA
-  plaintext *length*; the boxed-curve public keys and signatures (their
-  encoders size them by bit length); the modulus of a generated RSA key.
+  indices are functions of the signature and public key); the XMSS
+  randomizer `R`, the message digest it seeds and each subtree root (the
+  base-w digits of these set the public WOTS+ chain lengths); the HSS child
+  public key and deterministic LM-OTS randomizer `C` (both published in the
+  signature); an accepted Falcon `s₂` before compression; the DSA `r` and
+  `s`; the BIP340 public key and signature before the signer's own
+  fault-check verification; the sign-to-contract low-S flag (published in
+  the opening); the RSA plaintext *length*; the AES-KWP plaintext length
+  once the wrap has authenticated; the boxed-curve public keys and
+  signatures (their encoders size them by bit length); the modulus of a
+  generated RSA key; a JWS signature or MAC before base64url encoding; the
+  TLS 1.3 / DTLS 1.3 true content type and content length recovered from a
+  record (the engine dispatches on the type and every later step is shaped
+  by the length — what the constant-time scan protects is the time taken to
+  *find* them under the padding); the DTLS 1.3 ciphertext before its
+  sequence-number mask is computed from it, and the unmasked sequence
+  number; the QUIC first byte and packet number after header-protection
+  removal (RFC 9001 hides them from on-path observers only; the receiver
+  needs them to parse the packet and pick its keys and nonce).
 - **Structural facts about a secret modulus**: whether it is zero or even
   (a panic), its limb width (`significant_limbs`, as in BoringSSL: an RSA
   prime's size is fixed by the modulus size), whether an imported key's
   primes are present, distinct and usable (it selects the CRT or
-  full-width path), and the identity check of an affine conversion on a
-  prime-order curve (`[k]P` is the identity iff `k ≡ 0 mod n` or `P` is).
+  full-width path), the identity check of an affine conversion on a
+  prime-order curve (`[k]P` is the identity iff `k ≡ 0 mod n` or `P` is),
+  and whether a DSA `k` has an inverse mod the (prime) `q`.
 
 ### Known constant-time residuals
 
@@ -387,7 +472,18 @@ code site:
   table-free).
 - **Falcon key generation and secret-key import** run the NTRU solver on
   variable-time big integers, as the module documents; signing and
-  verification are data-oblivious.
+  verification are data-oblivious. Signing's Gaussian sampler follows the
+  reference: the number of SamplerZ iterations is independent of the
+  centre and standard deviation (the isochronous design of Howe, Prest,
+  Ricosset and Rossi, which is what the `σ_min / σ'` scaling is for) and
+  BerExp reads one more random byte exactly when a fresh uniform byte
+  equals the threshold byte (probability 1/256 whatever the threshold), so
+  the harness declassifies those two loop controls; the sampled values
+  themselves stay secret.
+- **Key serialization formats** (PKCS#8 / PKCS#1 DER, JWK) encode private
+  integers minimally, so an encoding's length is the component's bit
+  length; the harness classifies a JWK's private fields after
+  construction and checks the operations run on them.
 - **Argon2d/id data-dependent addressing and scrypt's `Integerify`** are the
   algorithms' design.
 - **PBES2 CBC-PAD envelopes** carry no integrity tag, so "padding valid"
