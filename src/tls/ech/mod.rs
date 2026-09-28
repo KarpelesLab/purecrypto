@@ -30,7 +30,9 @@
 //! On the wire the sealed payload is an `EncodedClientHelloInner` — the
 //! inner `ClientHello` *structure*, without the handshake header and with
 //! an empty `legacy_session_id` — authenticated under the outer
-//! `ClientHello` structure as AAD (§5.1, §5.2); see [`outer`].
+//! `ClientHello` structure as AAD (§5.1, §5.2); see [`outer`]. The format
+//! is interop-tested against BoringSSL in both roles
+//! (`tools/ech-interop/run.sh`).
 //!
 //! ## Implementation status
 //!

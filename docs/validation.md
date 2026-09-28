@@ -162,6 +162,23 @@ update with the commands in `tools/wycheproof/README.md`.
   **QUIC v1 server** with `openssl s_client -quic` (TLS 1.3, ALPN, app data).
   The client directions and DTLS 1.3 remain loopback-only: OpenSSL is
   QUIC-client-only and its `s_client` here lacks `-dtls1_3`.
+- **BoringSSL, TLS 1.3 Encrypted Client Hello** (RFC 9849, CI job
+  `interop-boringssl.yml`, script `tools/ech-interop/run.sh`): the purecrypto
+  CLI against `bssl` at a pinned commit, over TCP, in **both roles**, each
+  side running on keys the other tool generated:
+
+  | Case | purecrypto client → bssl server | bssl client → purecrypto server |
+  |---|---|---|
+  | ECH accepted, inner SNI at the server, data both ways | ✅ | ✅ |
+  | HelloRetryRequest (key-share mismatch) + ECH HRR confirmation | ✅ | ✅ |
+  | Stale config → rejected, outer `public_name` authenticated, `retry_configs` | ✅ (configs byte-equal the server's; a retry with them is accepted) | ✅ (bssl reports `ECH_REJECTED`) |
+  | Rejection across a HelloRetryRequest | ✅ | ✅ |
+  | GREASE ECH (server with and without ECH keys) | ✅ | ✅ |
+
+  A one-off check against Cloudflare's production deployment
+  (`crypto.cloudflare.com`, config from its DNS HTTPS record) is accepted
+  (`sni=encrypted`), and a corrupted config is rejected with `retry_configs`
+  equal to the published list. That check needs the network and is not in CI.
 - **Loopback** (own client ↔ own server, all platforms): TLS 1.2/1.3, DTLS
   1.2/1.3, QUIC v1.
 
