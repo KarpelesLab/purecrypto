@@ -470,11 +470,43 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.close_notify_received
     }
 
+    /// `true` while the handshake is not known to be over on both sides:
+    /// a flight this side sent awaits the client's answer, or — once
+    /// [`Self::is_handshake_complete`] — the client has not yet been seen
+    /// to hold our final flight (ChangeCipherSpec + Finished).
+    ///
+    /// Nothing answers the final flight of a DTLS 1.2 handshake, so it is
+    /// not retransmitted on a timer: a client that did not receive it
+    /// retransmits *its* Finished, and the engine re-sends the flight in
+    /// reply (RFC 6347 §4.2.4, the FINISHED state). While this returns
+    /// `true` the caller keeps reading datagrams and sending what
+    /// [`Self::pop_outbound_datagrams`] returns. It turns `false` when the
+    /// client's first application data or alert arrives — it sends neither
+    /// before it has verified our Finished. A client with nothing to say
+    /// never provides that evidence, so callers bound the wait.
+    pub fn handshake_flight_pending(&self) -> bool {
+        // (A closed connection waits for nothing.)
+        self.state != State::Closed
+            && (self.retransmit.next_timeout().is_some() || self.final_flight_unconfirmed())
+    }
+
+    /// Connected, with the final flight still kept for a re-send.
+    fn final_flight_unconfirmed(&self) -> bool {
+        self.state == State::Connected && self.final_flight.is_some()
+    }
+
     /// Ends the session: queues a `close_notify` alert under the current
     /// write keys (RFC 6347 §4.1 / RFC 5246 §7.2.1). No application data
     /// can be sent afterwards, but records from the peer — its own
     /// `close_notify` in particular — are still read. Idempotent; an error
     /// before the handshake completes.
+    ///
+    /// While [`Self::handshake_flight_pending`] the client may still be
+    /// waiting for our final flight, and a `close_notify` reaching it
+    /// there fails its handshake. The alert is therefore preceded by one
+    /// more copy of that flight; callers that can afford to should wait
+    /// (bounded) for `handshake_flight_pending` to turn `false` before
+    /// closing.
     pub fn send_close_notify(&mut self) -> Result<(), Error> {
         // Allowed while connected and, since the peer's close_notify must be
         // answered in kind (RFC 8446 §6.1), after one has closed the session.
@@ -485,6 +517,17 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         }
         if self.close_notify_sent {
             return Ok(());
+        }
+        if self.final_flight_unconfirmed()
+            && let Some(flight) = self.final_flight.take()
+        {
+            // Fresh sequence numbers (see `encode_flight_record`). The
+            // flight is not kept: the session ends here.
+            for rec in &flight.records {
+                if let Ok(dg) = self.encode_flight_record(rec) {
+                    self.out_dgrams.push(dg);
+                }
+            }
         }
         // RFC 5246 §7.2: `close_notify` is a warning-level (1) alert.
         let dg = self.encrypt_record_dtls(
@@ -791,6 +834,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 }
                 let desc = AlertDescription::from_u8(plain[1]);
                 self.state = State::Closed;
+                // Whatever the alert, the client is past waiting for our
+                // final flight.
+                self.final_flight = None;
                 if desc == AlertDescription::CloseNotify {
                     self.close_notify_received = true;
                     Ok(())

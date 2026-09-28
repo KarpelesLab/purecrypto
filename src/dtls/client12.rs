@@ -435,6 +435,28 @@ impl DtlsClientConnection12 {
         core::mem::take(&mut self.out_dgrams)
     }
 
+    /// `true` while a flight this side sent awaits the server's answer
+    /// (RFC 6347 §4.2.4). A DTLS 1.2 client completes its handshake on the
+    /// server's Finished, which answers its own final flight, so this is
+    /// `false` from [`Self::is_handshake_complete`] on: nothing is left to
+    /// retransmit, and the connection may be closed at once.
+    pub fn handshake_flight_pending(&self) -> bool {
+        // (A closed connection waits for nothing.)
+        self.state != State::Closed && self.retransmit.next_timeout().is_some()
+    }
+
+    /// Advances the connection's monotonic clock to `now` (the same clock
+    /// [`Self::on_timeout`] is driven with). A flight queued by
+    /// [`Self::feed_datagram`] arms its retransmission timer relative to
+    /// the engine's notion of the current time, which otherwise only moves
+    /// when a timer fires: call this before feeding a datagram so that
+    /// timer starts from the real time. Older times are ignored.
+    pub fn set_now(&mut self, now: Duration) {
+        if now > self.last_now {
+            self.last_now = now;
+        }
+    }
+
     /// Returns the next absolute monotonic time at which the caller should
     /// invoke `on_timeout`. None when the handshake is complete or no
     /// retransmit is armed.

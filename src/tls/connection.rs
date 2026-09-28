@@ -1092,6 +1092,19 @@ impl Connection {
     /// for [`pop`](Self::pop); nothing more can be sent afterwards, but the
     /// peer's records — its answering close_notify above all — are still
     /// read.
+    ///
+    /// DTLS, while [`handshake_flight_pending`](Self::handshake_flight_pending):
+    /// the peer may not have completed the handshake yet, and a
+    /// close_notify reaching it there makes that handshake fail. A DTLS
+    /// 1.3 client therefore *holds* the alert while its Finished is
+    /// unacknowledged, keeps retransmitting the Finished (RFC 9147 §5.8.1)
+    /// and queues the alert by itself once the server's ACK arrives (or
+    /// the retransmission budget is spent) — keep driving the connection
+    /// until `handshake_flight_pending` is `false`, then send what `pop`
+    /// returns. The servers, which have no such event to wait for, queue
+    /// one more copy of their final flight (DTLS 1.2: ChangeCipherSpec +
+    /// Finished, RFC 6347 §4.2.4; DTLS 1.3: the ACK of the client's
+    /// Finished, RFC 9147 §7.1) ahead of the alert.
     pub fn close(&mut self) -> Result<(), Error> {
         match &mut self.inner {
             Engine::ClientTls13(c) => c.send_close_notify(),
@@ -1612,6 +1625,78 @@ impl Connection {
             c.record_size_limit_negotiated()
         } else {
             false
+        }
+    }
+
+    /// DTLS: `true` while the handshake is not known to be over on *both*
+    /// sides, i.e. while the connection must still be driven — datagrams
+    /// read and [`feed`](Self::feed), [`on_timeout`](Self::on_timeout)
+    /// called at [`next_timeout`](Self::next_timeout), [`pop`](Self::pop)
+    /// sent — for the peer's handshake to complete. Always `false` on TLS.
+    ///
+    /// [`is_handshake_complete`](Self::is_handshake_complete) says that
+    /// *this* side is done, which on an unreliable transport does not
+    /// imply the other is:
+    ///
+    /// - a DTLS 1.3 client is complete once it has sent its Finished; the
+    ///   record may be lost, and is retransmitted until the server
+    ///   acknowledges it (RFC 9147 §5.8.1, §7). `true` until that ACK;
+    /// - a DTLS 1.3 server is complete on the client's Finished and
+    ///   acknowledges it; the ACK may be lost, the client then retransmits
+    ///   its Finished and must be acknowledged again (§5.8.1);
+    /// - a DTLS 1.2 server is complete on the client's Finished and
+    ///   answers with its final flight, which it re-sends when the client
+    ///   retransmits (RFC 6347 §4.2.4). Both servers report `true` until
+    ///   the client shows it has moved on — its first application data or
+    ///   alert — which a client with nothing to say never does, so a
+    ///   server bounds the wait;
+    /// - a DTLS 1.2 client is complete on the server's Finished: `false`.
+    ///
+    /// It is also `true` during the handshake while a flight is in the
+    /// air, and while a DTLS 1.3 `KeyUpdate` is unacknowledged.
+    ///
+    /// Application data may be sent while this is `true`, but a DTLS 1.3
+    /// peer that has not completed the handshake discards or buffers it
+    /// (RFC 9147 §5.8.1). See [`close`](Self::close) for what closing
+    /// does.
+    pub fn handshake_flight_pending(&self) -> bool {
+        match &self.inner {
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(c) => c.handshake_flight_pending(),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.handshake_flight_pending(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls12(c) => c.handshake_flight_pending(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.handshake_flight_pending(),
+            _ => false,
+        }
+    }
+
+    /// DTLS: advances the engine's clock to `now`, a time on the same
+    /// monotonic clock as [`next_timeout`](Self::next_timeout) and
+    /// [`on_timeout`](Self::on_timeout) (any epoch, e.g. the time since the
+    /// connection was created — but one epoch for the connection's whole
+    /// life). No-op on TLS variants; older times are ignored.
+    ///
+    /// The engine never reads a clock by itself. A flight queued while a
+    /// datagram is processed arms its retransmission timer at "now + 1 s"
+    /// (RFC 9147 §5.8.2 / RFC 6347 §4.2.4.1), and "now" is the last time
+    /// the engine was told: call this before [`feed`](Self::feed) (and
+    /// before [`request_key_update`](Self::request_key_update)), or those
+    /// timers start from the time of the last `on_timeout` instead.
+    #[cfg_attr(not(feature = "dtls"), allow(unused_variables))]
+    pub fn set_now(&mut self, now: Duration) {
+        match &mut self.inner {
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(c) => c.set_now(now),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.set_now(now),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls12(c) => c.set_now(now),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.set_now(now),
+            _ => {}
         }
     }
 

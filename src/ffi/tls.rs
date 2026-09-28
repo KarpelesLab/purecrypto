@@ -1318,6 +1318,77 @@ pub unsafe extern "C" fn pc_dtls_on_timeout(
     })
 }
 
+/// DTLS: advances the engine's clock to `now_seconds` + `now_nanos`, a time
+/// on the same monotonic clock as [`pc_dtls_next_timeout`] and
+/// [`pc_dtls_on_timeout`]. Call it before [`pc_tls_feed`]: a flight queued
+/// while a datagram is processed arms its retransmission timer relative to
+/// the last time the engine was told. Older times are ignored. Returns
+/// [`PcStatus::Unsupported`] for TLS connections.
+///
+/// # Safety
+/// `tls` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_set_now(
+    tls: *mut PcTls,
+    now_seconds: u64,
+    now_nanos: u32,
+) -> PcStatus {
+    guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let conn = unsafe { &mut *tls };
+        let v = conn.inner.negotiated_version();
+        if !matches!(
+            v,
+            Some(ProtocolVersion::DTLSv1_2) | Some(ProtocolVersion::DTLSv1_3)
+        ) {
+            return PcStatus::Unsupported;
+        }
+        conn.inner
+            .set_now(core::time::Duration::new(now_seconds, now_nanos));
+        PcStatus::Ok
+    })
+}
+
+/// DTLS: sets `pending` to 1 while the handshake is not known to be over on
+/// both sides — a DTLS 1.3 client's Finished is unacknowledged, a server's
+/// client has not been seen to move on, a flight or `KeyUpdate` is in the
+/// air — and to 0 otherwise. While it is 1 the connection must still be
+/// driven (datagrams fed, [`pc_dtls_on_timeout`] called, output sent) for
+/// the peer's handshake to complete, and [`pc_tls_close`] on a DTLS 1.3
+/// client holds its close_notify back until it turns 0. Returns
+/// [`PcStatus::Unsupported`] for TLS connections (`pending` is then 0).
+///
+/// # Safety
+/// All pointers valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_handshake_flight_pending(
+    tls: *const PcTls,
+    pending: *mut i32,
+) -> PcStatus {
+    guard(|| {
+        if tls.is_null() || pending.is_null() {
+            return PcStatus::NullPointer;
+        }
+        unsafe {
+            *pending = 0;
+        }
+        let conn = unsafe { &*tls };
+        let v = conn.inner.negotiated_version();
+        if !matches!(
+            v,
+            Some(ProtocolVersion::DTLSv1_2) | Some(ProtocolVersion::DTLSv1_3)
+        ) {
+            return PcStatus::Unsupported;
+        }
+        unsafe {
+            *pending = i32::from(conn.inner.handshake_flight_pending());
+        }
+        PcStatus::Ok
+    })
+}
+
 // ---- Helpers --------------------------------------------------------------
 
 /// Distinct PEM-parsing failure modes the FFI callers want to surface as

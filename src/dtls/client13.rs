@@ -273,8 +273,14 @@ pub struct DtlsClientConnection13 {
     key_updates_received_total: u32,
     /// The peer's `close_notify` was authenticated.
     close_notify_received: bool,
-    /// Our `close_notify` went out; no more application data may follow.
+    /// Our `close_notify` went out (or is held, below); no more
+    /// application data may follow.
     close_notify_sent: bool,
+    /// [`Self::send_close_notify`] was called while our Finished was still
+    /// unacknowledged: the alert is withheld until the flight is
+    /// acknowledged (or its retransmission budget is spent), so it can
+    /// never reach a server that has not completed the handshake.
+    close_notify_held: bool,
 
     /// Random + key material. All four keypairs are pre-generated so the
     /// matching `key_share` is ready regardless of which group the server
@@ -398,6 +404,7 @@ impl DtlsClientConnection13 {
             key_updates_received_total: 0,
             close_notify_received: false,
             close_notify_sent: false,
+            close_notify_held: false,
             offered_share_groups: Vec::new(),
             transcript: Transcript::new(),
             ks: None,
@@ -527,11 +534,49 @@ impl DtlsClientConnection13 {
         self.close_notify_received
     }
 
-    /// Ends the session: queues a `close_notify` alert under the current
+    /// `true` while handshake records this side sent are still waiting for
+    /// the server's acknowledgement (RFC 9147 §7): the flight in progress
+    /// during the handshake and, once [`Self::is_handshake_complete`], the
+    /// final flight — our `Finished` — or a `KeyUpdate`.
+    ///
+    /// The client completes the handshake the moment it has *sent* its
+    /// Finished; the server completes it only when that record arrives.
+    /// While this returns `true` the caller must keep driving the
+    /// connection — [`Self::feed_datagram`], [`Self::on_timeout`] at
+    /// [`Self::next_timeout`], [`Self::pop_outbound_datagrams`] — or a
+    /// lost Finished is never retransmitted and the server is left waiting
+    /// in its handshake (RFC 9147 §5.8.1: the flight is retransmitted
+    /// until the ACK for it arrives). Application data may be sent in the
+    /// meantime, but a server that has not yet received the Finished
+    /// discards or buffers it (§5.8.1), so a request that must not be lost
+    /// waits for `false`.
+    pub fn handshake_flight_pending(&self) -> bool {
+        // (A closed connection waits for nothing.)
+        self.state != State::Closed && !self.retransmit.is_empty()
+    }
+
+    /// True while our Finished (the only flight sent under the retired
+    /// epoch-2 write keys) is unacknowledged.
+    fn final_flight_unacked(&self) -> bool {
+        self.state == State::Connected && self.hs_write.is_some() && !self.retransmit.is_empty()
+    }
+
+    /// Ends the session with a `close_notify` alert under the current
     /// write keys (RFC 9147 §4 / RFC 8446 §6.1). No application data can be
     /// sent afterwards, but records from the peer — its own `close_notify`
     /// in particular — are still read. Idempotent; an error before the
     /// handshake completes.
+    ///
+    /// While our Finished is unacknowledged
+    /// ([`Self::handshake_flight_pending`]) the alert is **held back**, not
+    /// queued: a server that has not received the Finished is still in its
+    /// handshake, and a `close_notify` reaching it there ends that
+    /// handshake in failure. The engine keeps retransmitting the Finished
+    /// (RFC 9147 §5.8.1) and queues the alert by itself as soon as the
+    /// server's ACK arrives, or when the retransmission budget is spent.
+    /// The caller keeps driving the connection until
+    /// [`Self::handshake_flight_pending`] is `false`, then sends what
+    /// [`Self::pop_outbound_datagrams`] returns.
     pub fn send_close_notify(&mut self) -> Result<(), Error> {
         // Allowed while connected and, since the peer's close_notify must be
         // answered in kind (RFC 8446 §6.1), after one has closed the session.
@@ -543,14 +588,36 @@ impl DtlsClientConnection13 {
         if self.close_notify_sent {
             return Ok(());
         }
+        self.close_notify_sent = true;
+        if self.final_flight_unacked() {
+            self.close_notify_held = true;
+            return Ok(());
+        }
+        self.queue_close_notify()
+    }
+
+    /// Encrypts and queues the `close_notify` record.
+    fn queue_close_notify(&mut self) -> Result<(), Error> {
         let dg = self.encrypt_protected_record(
             ContentType::Alert,
             // RFC 8446 §6: `close_notify` is a warning-level (1) alert.
             &[1, AlertDescription::CloseNotify.as_u8()],
         )?;
         self.out_dgrams.push(dg);
-        self.close_notify_sent = true;
         Ok(())
+    }
+
+    /// Queues a held `close_notify` once nothing of the final flight is
+    /// left to wait for: it was acknowledged, its retransmission budget is
+    /// spent, or the peer closed the session.
+    fn release_held_close_notify(&mut self, force: bool) {
+        if self.close_notify_held && (force || !self.final_flight_unacked()) {
+            self.close_notify_held = false;
+            // The write keys exist (checked when the close was requested);
+            // a sequence-number cap is the only possible failure, and then
+            // there is nothing left to send the alert with.
+            let _ = self.queue_close_notify();
+        }
     }
 
     /// Queues application plaintext for transmission as a single DTLS
@@ -572,6 +639,20 @@ impl DtlsClientConnection13 {
         let dg = self.encrypt_protected_record(ContentType::ApplicationData, plaintext)?;
         self.out_dgrams.push(dg);
         Ok(())
+    }
+
+    /// Advances the connection's monotonic clock to `now` (the same clock
+    /// [`Self::on_timeout`] is driven with). A flight queued by
+    /// [`Self::feed_datagram`] arms its retransmission timer relative to
+    /// the engine's notion of the current time, which otherwise only moves
+    /// when a timer fires: call this before feeding a datagram so that
+    /// timer starts from the real time. Older times are ignored.
+    pub fn set_now(&mut self, now: Duration) {
+        self.clock_driven = true;
+        if now > self.last_now {
+            self.last_now = now;
+        }
+        self.expire_prev_read();
     }
 
     /// Returns the next absolute monotonic time at which the caller should
@@ -610,6 +691,9 @@ impl DtlsClientConnection13 {
                     // Connected; only an in-progress handshake times out.
                     self.retransmit = Retransmit13::new();
                     self.hs_write = None;
+                    // A close requested meanwhile has nothing left to
+                    // wait for.
+                    self.release_held_close_notify(false);
                 } else {
                     // An unacknowledged KeyUpdate is different: RFC 9147
                     // §8 forbids moving to the new epoch without the ACK,
@@ -859,6 +943,9 @@ impl DtlsClientConnection13 {
                     // Nothing left to retransmit under the retired keys.
                     self.hs_write = None;
                 }
+                // The server holds our Finished: a close requested
+                // meanwhile can go out now.
+                self.release_held_close_notify(false);
                 self.complete_key_update_if_acked()?;
             }
             _ => return Err(Error::UnexpectedMessage),
@@ -1088,6 +1175,9 @@ impl DtlsClientConnection13 {
         self.state = State::Closed;
         if desc == AlertDescription::CloseNotify {
             self.close_notify_received = true;
+            // The session is over on the peer's side: a held close_notify
+            // (RFC 8446 §6.1: answered in kind) goes out now.
+            self.release_held_close_notify(true);
             Ok(())
         } else {
             Err(Error::AlertReceived(desc))

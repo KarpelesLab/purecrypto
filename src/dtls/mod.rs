@@ -159,3 +159,5 @@ pub(crate) fn select_alpn(
 mod tests;
 #[cfg(test)]
 mod tests_deferred;
+#[cfg(test)]
+mod tests_final_flight;

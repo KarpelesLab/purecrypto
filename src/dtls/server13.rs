@@ -80,6 +80,10 @@ const HRR_RANDOM: [u8; 32] = [
 
 /// `cookie` extension type (RFC 8446 §4.2.2).
 const EXT_COOKIE: u16 = 0x002C;
+/// Record numbers of the client's final flight kept for the ACK that
+/// precedes an early `close_notify`: its Finished is one record, and a
+/// client gives up after a handful of retransmissions.
+const MAX_FINAL_FLIGHT_RECORDS: usize = 8;
 
 /// Configuration for a DTLS 1.3 server.
 ///
@@ -340,6 +344,16 @@ pub struct DtlsServerConnection13<R: RngCore> {
     close_notify_received: bool,
     /// Our `close_notify` went out; no more application data may follow.
     close_notify_sent: bool,
+    /// The client is known to be past its handshake: a record other than
+    /// an ACK arrived under the application keys. Until then it may still
+    /// be retransmitting its Finished, waiting for our ACK (see
+    /// [`Self::handshake_flight_pending`]).
+    client_confirmed: bool,
+    /// Record numbers of the client's final flight (its Finished, every
+    /// copy received), newest last and bounded by
+    /// [`MAX_FINAL_FLIGHT_RECORDS`]: acknowledged once more ahead of a
+    /// `close_notify` sent while the client is unconfirmed.
+    final_flight_records: Vec<RecordNumber>,
 
     /// Pending ACKs to emit.
     pending_acks: Vec<RecordNumber>,
@@ -421,6 +435,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             key_updates_received_total: 0,
             close_notify_received: false,
             close_notify_sent: false,
+            client_confirmed: false,
+            final_flight_records: Vec::new(),
             pending_acks: Vec::new(),
             retransmit: Retransmit13::new(),
             last_now: Duration::from_secs(0),
@@ -485,11 +501,48 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.close_notify_received
     }
 
+    /// `true` while the handshake is not known to be over on both sides:
+    /// handshake records this side sent are unacknowledged (the flight in
+    /// progress, or a `KeyUpdate`), or — once
+    /// [`Self::is_handshake_complete`] — the client has not yet been seen
+    /// to move past its handshake.
+    ///
+    /// The server's last act in the handshake is the ACK of the client's
+    /// Finished (RFC 9147 §7.1), which is itself never acknowledged: if it
+    /// is lost the client retransmits the Finished and must be ACKed again
+    /// (§5.8.1: "the server MUST respond to retransmission of the client's
+    /// final flight with a retransmit of its ACK"). The engine does that
+    /// whenever such a copy is fed to it, so while this returns `true` the
+    /// caller keeps reading datagrams and sending what
+    /// [`Self::pop_outbound_datagrams`] returns. It turns `false` when a
+    /// record other than an ACK arrives under the application keys
+    /// (application data, an alert, a `KeyUpdate`): a client that is still
+    /// inside its handshake sends none. A client with nothing to say never
+    /// provides that evidence, so callers bound the wait.
+    pub fn handshake_flight_pending(&self) -> bool {
+        // (A closed connection waits for nothing.)
+        self.state != State::Closed && (!self.retransmit.is_empty() || self.client_unconfirmed())
+    }
+
+    /// Connected, but the client may still be waiting for the ACK of its
+    /// Finished.
+    fn client_unconfirmed(&self) -> bool {
+        self.state == State::Connected && !self.client_confirmed
+    }
+
     /// Ends the session: queues a `close_notify` alert under the current
     /// write keys (RFC 9147 §4 / RFC 8446 §6.1). No application data can be
     /// sent afterwards, but records from the peer — its own `close_notify`
     /// in particular — are still read. Idempotent; an error before the
     /// handshake completes.
+    ///
+    /// While [`Self::handshake_flight_pending`] the client may be
+    /// retransmitting its Finished because our ACK was lost, and a
+    /// `close_notify` reaching it there fails its handshake. The alert is
+    /// therefore preceded by one more ACK of the client's Finished, so
+    /// that the two arrive together; callers that can afford to should
+    /// wait (bounded) for `handshake_flight_pending` to turn `false`
+    /// before closing.
     pub fn send_close_notify(&mut self) -> Result<(), Error> {
         // Allowed while connected and, since the peer's close_notify must be
         // answered in kind (RFC 8446 §6.1), after one has closed the session.
@@ -500,6 +553,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         if self.close_notify_sent {
             return Ok(());
+        }
+        if self.client_unconfirmed() && !self.final_flight_records.is_empty() {
+            // Anything already queued for acknowledgement goes out first,
+            // then the final flight's ACK (RFC 9147 §5.8.1).
+            self.flush_pending_acks();
+            self.pending_acks = self.final_flight_records.clone();
+            self.flush_pending_acks();
         }
         let dg = self.encrypt_protected_record(
             ContentType::Alert,
@@ -831,6 +891,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 epoch: read_epoch as u64,
                 seq,
             });
+            // Every handshake record under epoch 2 belongs to the
+            // client's final flight (it sends nothing else there).
+            if read_epoch == 2 {
+                if self.final_flight_records.len() >= MAX_FINAL_FLIGHT_RECORDS {
+                    self.final_flight_records.remove(0);
+                }
+                self.final_flight_records.push(RecordNumber {
+                    epoch: read_epoch as u64,
+                    seq,
+                });
+            }
         }
 
         // Once connected, the handshake epoch (2) is only still readable as
@@ -848,6 +919,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // is dropped here; application data under epoch 2 stays fatal
         // below, as before.
         let retired_handshake_epoch = self.state == State::Connected && read_epoch == 2;
+        // Anything but an ACK under the application keys shows a client
+        // that is past its handshake (see `handshake_flight_pending`).
+        if self.state == State::Connected
+            && read_epoch >= 3
+            && !matches!(inner_type, ContentType::Unknown(t) if t == ACK_CONTENT_TYPE)
+        {
+            self.client_confirmed = true;
+            self.final_flight_records = Vec::new();
+        }
 
         // Past this point the record is authenticated: protocol violations
         // below come from the genuine peer and remain fatal.

@@ -859,6 +859,18 @@ pc_status pc_dtls_next_timeout(const PcTls *tls,
                                uint64_t *seconds_out, uint32_t *nanos_out,
                                int32_t *has_timeout);
 pc_status pc_dtls_on_timeout(PcTls *tls, uint64_t now_seconds, uint32_t now_nanos);
+/* Advances the engine's clock (the one pc_dtls_next_timeout / on_timeout
+ * use). Call it before pc_tls_feed: a flight queued while a datagram is
+ * processed arms its retransmission timer relative to the last time the
+ * engine was told. Older times are ignored. */
+pc_status pc_dtls_set_now(PcTls *tls, uint64_t now_seconds, uint32_t now_nanos);
+/* *pending = 1 while the handshake is not known to be over on BOTH sides
+ * (a DTLS 1.3 client's Finished is unacknowledged, a server's client has not
+ * been seen to move on, a flight or KeyUpdate is in the air), 0 otherwise.
+ * While it is 1 the connection must still be driven for the peer's handshake
+ * to complete; pc_tls_close on a DTLS 1.3 client holds its close_notify back
+ * until it turns 0 (keep feeding / timing / popping until then). */
+pc_status pc_dtls_handshake_flight_pending(const PcTls *tls, int32_t *pending);
 
 /* ============================================================================
  * QUIC v1 (RFC 9000 / 9001 / 9002 / 9221) — memory-BIO style. The underlying

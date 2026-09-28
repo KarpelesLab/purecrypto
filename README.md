@@ -362,6 +362,15 @@ After a handshake completes, both sides expose:
   resumed mTLS session).
 - `received_close_notify()`: whether the peer closed cleanly. A transport
   EOF without it is a truncation.
+- DTLS: `handshake_flight_pending()`: whether the *peer* may still be
+  inside its handshake. `is_handshake_complete()` speaks for this side
+  only, and the last flight of a handshake can be lost like any other: keep
+  reading datagrams, calling `on_timeout(now)` at `next_timeout()` and
+  sending what `pop()` returns until it is `false` (bound the wait on a
+  server). Tell the engine the time with `set_now(now)` before each
+  `feed`, so that retransmission timers are armed from it. `close()` on a
+  DTLS 1.3 client holds the close_notify back until the server has
+  acknowledged the client's Finished.
 - Client only: `take_session()` returns a `ResumptionSession` derived from
   the server's NewSessionTicket; pass it to `resumption_session(...)` next
   time (TLS 1.3 PSK or TLS 1.2 RFC 5077 ticket). `write_early_data(&[u8])`
