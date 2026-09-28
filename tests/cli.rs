@@ -7353,3 +7353,192 @@ fn ech_flags_are_refused_without_the_feature() {
         assert!(err.contains("--features ech"), "{args:?}: {err}");
     }
 }
+
+/// `pkcs12 -export` bundles a key with its chain into an archive that
+/// `pkcs12 -in` unpacks again (MAC-checked: a wrong password is refused),
+/// and refuses a key that does not belong to the leaf.
+#[test]
+fn pkcs12_export_and_unpack_round_trip() {
+    let dir = std::env::temp_dir().join(format!("pc_cli_p12_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    let ok = |args: &[&str]| run(args, b"").1;
+    assert!(ok(&[
+        "genpkey",
+        "-algorithm",
+        "EC",
+        "-curve",
+        "P-256",
+        "-out",
+        &p("ca.key")
+    ]));
+    assert!(ok(&[
+        "x509",
+        "-new",
+        "-ca",
+        "-key",
+        &p("ca.key"),
+        "-subj",
+        "/CN=p12 CA",
+        "-out",
+        &p("ca.crt")
+    ]));
+    // The leaf key in PKCS#8 form (as `openssl genpkey` writes) and an RSA
+    // PKCS#1 key that does not match the leaf.
+    assert!(ok(&[
+        "genpkey",
+        "-algorithm",
+        "ED25519",
+        "-out",
+        &p("leaf.key")
+    ]));
+    assert!(ok(&[
+        "genpkey",
+        "-algorithm",
+        "RSA",
+        "-bits",
+        "2048",
+        "-out",
+        &p("other.key")
+    ]));
+    assert!(ok(&[
+        "req",
+        "-key",
+        &p("leaf.key"),
+        "-subj",
+        "/CN=localhost",
+        "-out",
+        &p("leaf.csr")
+    ]));
+    assert!(ok(&[
+        "x509",
+        "-req",
+        "-in",
+        &p("leaf.csr"),
+        "-CA",
+        &p("ca.crt"),
+        "-CAkey",
+        &p("ca.key"),
+        "-san",
+        "localhost",
+        "-out",
+        &p("leaf.crt")
+    ]));
+
+    let export = |key: &str, out: &str| {
+        run(
+            &[
+                "pkcs12",
+                "-export",
+                "-inkey",
+                &p(key),
+                "-in",
+                &p("leaf.crt"),
+                "-certfile",
+                &p("ca.crt"),
+                "-name",
+                "round trip",
+                "-passout",
+                "pass:secret",
+                "-out",
+                &p(out),
+            ],
+            b"",
+        )
+    };
+    let (_, _, ok_mismatch) = run_capture(
+        &[
+            "pkcs12",
+            "-export",
+            "-inkey",
+            &p("other.key"),
+            "-in",
+            &p("leaf.crt"),
+            "-passout",
+            "pass:secret",
+            "-out",
+            &p("bad.p12"),
+        ],
+        b"",
+    );
+    assert!(
+        !ok_mismatch,
+        "a key that does not match the leaf must be refused"
+    );
+    assert!(!dir.join("bad.p12").exists());
+    assert!(export("leaf.key", "id.p12").1);
+    let (_, ok_twice) = export("leaf.key", "id.p12");
+    assert!(!ok_twice, "an existing archive must not be overwritten");
+
+    let (info, ok_info) = run(
+        &[
+            "pkcs12",
+            "-in",
+            &p("id.p12"),
+            "-passin",
+            "pass:secret",
+            "-info",
+        ],
+        b"",
+    );
+    assert!(ok_info, "{info}");
+    assert!(
+        info.contains("1 private key(s), 2 certificate(s)"),
+        "{info}"
+    );
+    assert!(
+        info.contains("certificate 0: subject CN=localhost"),
+        "{info}"
+    );
+    assert!(info.contains("certificate 1: subject CN=p12 CA"), "{info}");
+    assert!(info.contains("friendly name: round trip"), "{info}");
+
+    let (_, _, ok_wrong) = run_capture(
+        &[
+            "pkcs12",
+            "-in",
+            &p("id.p12"),
+            "-passin",
+            "pass:wrong",
+            "-info",
+        ],
+        b"",
+    );
+    assert!(!ok_wrong, "a wrong password must fail the MAC check");
+
+    // The unpacked PEM: the key first, then the chain, and the key still
+    // signs (it is the same key the CSR was made with).
+    let (certs, ok_certs) = run(
+        &[
+            "pkcs12",
+            "-in",
+            &p("id.p12"),
+            "-passin",
+            "pass:secret",
+            "-nokeys",
+        ],
+        b"",
+    );
+    assert!(ok_certs);
+    assert_eq!(certs.matches("-----BEGIN CERTIFICATE-----").count(), 2);
+    assert!(!certs.contains("PRIVATE KEY"));
+    assert!(ok(&[
+        "pkcs12",
+        "-in",
+        &p("id.p12"),
+        "-passin",
+        "pass:secret",
+        "-nocerts",
+        "-out",
+        &p("back.key")
+    ]));
+    let back = std::fs::read_to_string(p("back.key")).unwrap();
+    assert!(back.starts_with("-----BEGIN PRIVATE KEY-----"), "{back}");
+    let orig = std::fs::read_to_string(p("leaf.key")).unwrap();
+    assert_eq!(
+        back.trim(),
+        orig.trim(),
+        "the PKCS#8 key must round-trip byte for byte"
+    );
+}

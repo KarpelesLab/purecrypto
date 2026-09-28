@@ -35,6 +35,7 @@ Two conventions apply across the tool:
 - [`rand`](#rand)
 - [`genpkey`](#genpkey)
 - [`pkey`](#pkey)
+- [`pkcs12`](#pkcs12)
 - [`pkeyutl`](#pkeyutl)
 - [`kem`](#kem)
 - [`kex`](#kex)
@@ -183,6 +184,29 @@ purecrypto pkey < key.pem             # re-emit the private key (round-trip)
 `pkey` auto-detects RSA PKCS#1, EC SEC1, and every PKCS#8 type above.
 `req`, `x509`, `ca`, `s_server` and `s_client -key` load ML-DSA-44/65/87
 PKCS#8 keys as well as RSA, EC, Ed25519 and Ed448 ones.
+
+## `pkcs12`
+
+```sh
+# Bundle a key with its certificate chain (PKCS#12 / PFX, RFC 7292): what the
+# platform TLS stacks import an identity from.
+purecrypto pkcs12 -export -inkey server.key -in server.crt -certfile ca.crt \
+                  -name "my server" -passout pass:secret -out server.p12
+purecrypto pkcs12 -in server.p12 -passin pass:secret -info     # what is inside
+purecrypto pkcs12 -in server.p12 -passin pass:secret -nokeys   # the certificates, PEM
+purecrypto pkcs12 -in server.p12 -passin pass:secret -out id.pem   # key + certs, PEM
+```
+
+`-export` takes the key in any form the other subcommands read (PKCS#8,
+PKCS#1 or SEC1 PEM) and every `CERTIFICATE` block of `-in` (the leaf first)
+and `-certfile`; it refuses a key that does not match the leaf. The archive
+is the same shape `openssl pkcs12 -export` writes by default — PBES2 with
+PBKDF2-SHA256 and AES-256-CBC around the key, a SHA-256 MAC over the whole —
+and imports into macOS's Security framework and OpenSSL 3. Passwords come
+from `pass:STRING`, `env:VARIABLE` or `file:PATH` (first line); the
+`-passin` side also reads the legacy 3DES/SHA-1 archives `openssl pkcs12
+-legacy` writes. Output holding a private key is written `0600`, never over
+an existing file.
 
 ## `pkeyutl`
 

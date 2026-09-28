@@ -13,6 +13,7 @@ mod kdf;
 mod kem;
 mod kex;
 mod mac;
+mod pkcs12;
 mod pkey;
 mod pkeyutl;
 mod pki;
@@ -50,6 +51,7 @@ COMMANDS:
     rand <nbytes>        Emit cryptographically secure random bytes
     genpkey              Generate an RSA or EC private key
     pkey                 Inspect or convert a private key
+    pkcs12               Build or unpack a PKCS#12 (.p12) key + certificate archive
     req                  Create or inspect a PKCS#10 certificate request
     x509                 Inspect, self-sign, or CA-sign a certificate
     ca                   Manage a development CA on disk (init, issue, crl, ...)
@@ -82,6 +84,7 @@ fn main() {
         Some("rand") => rand::run(rest),
         Some("genpkey") => genpkey::run(rest),
         Some("pkey") => pkey::run(rest),
+        Some("pkcs12") => pkcs12::run(rest),
         Some("req") => req::run(rest),
         Some("x509") => x509::run(rest),
         Some("ca") => ca::run(rest),
