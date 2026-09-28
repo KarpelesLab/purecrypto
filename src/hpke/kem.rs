@@ -224,7 +224,11 @@ impl HpkeKem {
 
     /// `SerializePublicKey(pk(sk))`, with an out-of-range scalar reported as
     /// [`Error::InvalidKey`].
-    fn pk_from_sk(self, sk: &[u8], out: &mut [u8; Self::MAX_N_ENC]) -> Result<usize, Error> {
+    pub(crate) fn pk_from_sk(
+        self,
+        sk: &[u8],
+        out: &mut [u8; Self::MAX_N_ENC],
+    ) -> Result<usize, Error> {
         self.try_pk_from_sk(sk, out).ok_or(Error::InvalidKey)
     }
 

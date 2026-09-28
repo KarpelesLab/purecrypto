@@ -255,6 +255,27 @@ impl EchConfig {
             .find(|sc| super::hpke_setup::map_sym_suite(*sc).is_ok())
     }
 
+    /// Encode this single entry to its wire form (`version || u16 length
+    /// || contents`) — the `ECHConfig` structure an HPKE `info` string
+    /// and a one-entry `ECHConfigList` are built from.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.raw_contents.len());
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Decode exactly one wire-form `ECHConfig` (no list length prefix);
+    /// trailing bytes are an error. An entry at an unknown version decodes
+    /// with `contents == None`.
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut rd = Reader::new(buf);
+        let cfg = Self::decode_entry(&mut rd)?;
+        if !rd.is_empty() {
+            return Err(Error::EchDecodeError);
+        }
+        Ok(cfg)
+    }
+
     /// Encode this entry (version || u16 length || contents).
     fn encode_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.version.to_be_bytes());

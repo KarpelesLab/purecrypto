@@ -1264,6 +1264,33 @@ impl Connection {
         }
     }
 
+    /// Encrypted Client Hello (RFC 9849): `true` when ECH was accepted.
+    ///
+    /// On a client this means the server's accept confirmation matched
+    /// (RFC 9849 §6.1.4) and the handshake runs on the inner ClientHello —
+    /// the configured `server_name` was never sent in cleartext. On a
+    /// server it means the outer ClientHello decrypted under one of the
+    /// configured keys. `false` for GREASE, for a rejected ECH offer (a
+    /// client then fails the handshake with [`Error::EchRejected`]), for
+    /// connections without ECH, before the ServerHello, and for DTLS.
+    #[cfg(feature = "ech")]
+    pub fn ech_accepted(&self) -> bool {
+        use super::conn::EchOutcome;
+        match &self.inner {
+            Engine::ClientTls13(c) => c.ech_outcome() == Some(EchOutcome::Accepted),
+            Engine::ClientTlsAuto(c) => match &c.inner {
+                ClientInner::Tls13(c) => c.ech_outcome() == Some(EchOutcome::Accepted),
+                ClientInner::Tls12(_) => false,
+            },
+            Engine::ServerTls13(c) => c.ech_accepted(),
+            Engine::ServerTlsAuto(c) => match &c.resolved {
+                Some(ResolvedServer::Tls13(c)) => c.ech_accepted(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// The peer's certificate chain (leaf first, DER).
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         match &self.inner {
@@ -2615,6 +2642,43 @@ mod tests {
             .server_name("tls.example")
             .verify_certificates(false)
             .build()
+    }
+
+    /// `Connection::ech_accepted` reports real ECH on both ends, and stays
+    /// `false` for GREASE.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_accepted_reports_both_sides() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::{EchClient, EchKeyPair, EchKeyRing, EchServer, HpkeSymCipherSuite};
+        let pair = EchKeyPair::generate(
+            &mut crate::rng::OsRng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            3,
+            b"tls.example",
+            32,
+            alloc::vec![HpkeSymCipherSuite {
+                kdf_id: HpkeKdf::HkdfSha256.id(),
+                aead_id: HpkeAead::Aes128Gcm.id(),
+            }],
+        )
+        .unwrap();
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+        let list = ring.to_config_list();
+        let mut server_cfg = tls13_server_cfg(false);
+        server_cfg.ech_server = Some(EchServer::new(ring, list.clone()));
+        for (ech, accepted) in [
+            (EchClient::from_config_list(list), true),
+            (EchClient::default_grease(), false),
+        ] {
+            let mut client_cfg = tls13_client_cfg(None);
+            client_cfg.ech = Some(ech);
+            let mut client = Connection::client(&client_cfg).unwrap();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            drive_pair(&mut client, &mut server);
+            assert_eq!(client.ech_accepted(), accepted);
+            assert_eq!(server.ech_accepted(), accepted);
+        }
     }
 
     /// A version-spanning (auto) server negotiates TLS 1.3 with a 1.3 client.

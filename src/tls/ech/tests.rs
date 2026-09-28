@@ -2134,3 +2134,33 @@ fn second_client_hello_outer_checks() {
     let recovered = try_decap_inner_retry(&ch2, &mut decap()).expect("CH2 decap");
     assert_eq!(recovered, inner);
 }
+
+/// `EchKeyPair::from_private_key` rebuilds a pair from a serialized
+/// `ECHConfig` and its raw private key (the `bssl generate-ech` output
+/// shape), and refuses a key that is not the config's.
+#[test]
+fn key_pair_from_private_key_round_trips_and_checks_the_public_key() {
+    let pair = EchKeyPair::generate(
+        &mut drbg(b"from-private-key"),
+        HpkeKem::DhkemX25519HkdfSha256,
+        9,
+        b"public.example",
+        32,
+        sample_sym_suites(),
+    )
+    .expect("generate");
+    let config = EchConfig::decode(&pair.config().encode()).expect("decode ECHConfig");
+    let rebuilt =
+        EchKeyPair::from_private_key(config.clone(), pair.private_key_bytes()).expect("rebuild");
+    assert_eq!(rebuilt.config().encode(), pair.config().encode());
+    assert_eq!(rebuilt.config_id(), 9);
+
+    let mut wrong = pair.private_key_bytes().to_vec();
+    wrong[0] ^= 0x40;
+    assert!(EchKeyPair::from_private_key(config.clone(), &wrong).is_err());
+    assert!(EchKeyPair::from_private_key(config, &[0u8; 31]).is_err());
+    // Trailing bytes after the single ECHConfig are refused.
+    let mut long = pair.config().encode();
+    long.push(0);
+    assert!(EchConfig::decode(&long).is_err());
+}

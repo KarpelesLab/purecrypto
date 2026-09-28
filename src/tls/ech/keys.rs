@@ -98,6 +98,42 @@ impl EchKeyPair {
         })
     }
 
+    /// Rebuild a key pair from an existing `ECHConfig` and its HPKE
+    /// private key — e.g. key material produced by another stack
+    /// (`bssl generate-ech` writes exactly these two files: the
+    /// serialized `ECHConfig` and the raw `Nsk`-byte private key).
+    ///
+    /// The config must be a supported-version entry whose KEM this crate
+    /// implements, and `private_key` must be the scalar whose public key
+    /// the config publishes: a mismatched pair would make every ECH
+    /// attempt fail HPKE decap and silently fall back to the
+    /// `public_name` handshake, so it is refused up front with
+    /// [`Error::EchDecodeError`].
+    pub fn from_private_key(config: EchConfig, private_key: &[u8]) -> Result<Self, Error> {
+        let contents = config
+            .contents
+            .as_ref()
+            .filter(|_| config.is_supported())
+            .ok_or(Error::EchDecodeError)?;
+        let kem = super::hpke_setup::map_kem(contents.key_config.kem_id)?;
+        if contents.key_config.cipher_suites.is_empty() || contents.public_name.is_empty() {
+            return Err(Error::EchDecodeError);
+        }
+        let mut pk = [0u8; HpkeKem::MAX_N_ENC];
+        let n = kem
+            .pk_from_sk(private_key, &mut pk)
+            .map_err(|_| Error::EchDecodeError)?;
+        // The public key is public: a plain comparison leaks nothing.
+        if pk[..n] != contents.key_config.public_key[..] {
+            return Err(Error::EchDecodeError);
+        }
+        Ok(Self {
+            kem,
+            private_key: private_key.to_vec(),
+            config,
+        })
+    }
+
     /// The `config_id` byte clients echo to select this key.
     pub fn config_id(&self) -> u8 {
         // Safe by construction: only built via `generate` and only at

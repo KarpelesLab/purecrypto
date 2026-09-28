@@ -1412,6 +1412,19 @@ impl<R: RngCore> ServerConnection<R> {
         self.peer_server_name.as_deref()
     }
 
+    /// `true` once this server has decrypted the client's
+    /// `ClientHelloOuter` and is handshaking on the `ClientHelloInner`
+    /// (RFC 9849 §7.1). `false` before the ClientHello is processed, when
+    /// the client offered no ECH (or only GREASE), and when decryption
+    /// failed and the handshake continues on the outer hello.
+    #[cfg(feature = "ech")]
+    pub fn ech_accepted(&self) -> bool {
+        matches!(
+            self.ech_state,
+            Some(EchServerHandshakeState::Accepted { .. })
+        )
+    }
+
     /// IANA cipher-suite identifier of the negotiated suite, available
     /// once `ServerHello` has been emitted (i.e. `self.suite` is set).
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
