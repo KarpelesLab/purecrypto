@@ -289,6 +289,62 @@ update with the commands in `tools/wycheproof/README.md`.
   connection, and a client whose 0-RTT was rejected sends the early data
   again as ordinary data before the payload, so that case runs the server
   with `exchanges=2`.
+- **Windows SChannel, TLS 1.3 matrix, both roles** (the `schannel` job of
+  `interop.yml`, on GitHub's `windows-latest` image — Windows Server 2025,
+  build 10.0.26100 — through .NET's `System.Net.Security.SslStream`, which
+  is SChannel on Windows; adapter `tools/interop/peers/schannel.sh`, peer
+  program `tools/interop/peers/schannel/` in C#, built on the runner with
+  the image's .NET SDK and run on its newest runtime, .NET 10). Same
+  runner and cases as the table above; the peer reports what `SslStream`
+  exposes (`SslProtocol`, `NegotiatedCipherSuite`, `KeyExchangeStrength` —
+  the curve size, which tells x25519 (255), P-256 and P-384 apart, since
+  the group itself is not named on TLS 1.3 — ALPN, the peer certificate
+  and mutual authentication), and the purecrypto side is pinned and
+  verified as before. Two things about the peer's environment: the image
+  pins SChannel's TLS policy (the group-policy cipher-suite and ECC-curve
+  lists under `HKLM\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002`)
+  to a list without curve25519 and ChaCha20, both of which the OS supports
+  and has in its local defaults, so the job appends them to the policy
+  lists before the matrix (SChannel picks that up at once); and
+  `SslStream` has no knob for cipher suites or groups on Windows
+  (`CipherSuitesPolicy` is Linux/macOS only), so the SChannel *client*
+  offers everything the policy enables, and the purecrypto server's own
+  preference (AES-128-GCM) is the only suite that can be checked in that
+  direction. 52 cases pass, 174 are SKIPs:
+
+  | Case | SChannel (C / S) |
+  |---|---|
+  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ (S: AES-128-GCM only — the client cannot restrict suites) |
+  | Plain, Ed25519 certificate | ⏭ SChannel has no Ed25519 (and .NET cannot load the key) |
+  | Plain, ML-DSA-65 certificate | ⏭ SChannel has no ML-DSA |
+  | Plain, `X25519MLKEM768` | ⏭ no ML-KEM hybrid group in Server 2025's SChannel |
+  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them |
+  | Resumption (PSK + DHE) | ✅ / ✅ (`SslStream` does not report resumption; the purecrypto side's `resumed: yes` on the second connection of one peer process does) |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only |
+  | 0-RTT (accepted, and rejected across an HRR) | ⏭ `SslStream` has no 0-RTT API and SChannel accepts no early data |
+  | HelloRetryRequest | ⏭ the SChannel client sends a key share for every group it offers, and the server's group preference follows system policy: neither side can be steered into one |
+  | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ (client certificates verified by the .NET chain engine, rooted in the run's CA) |
+  | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ as above |
+  | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ (SChannel replies with the next application-data record it sends, not on its own — RFC 8446 §4.6.3 asks for no more — so the peer is made to send after the update: the server answers after the client's first record, the client sends a second round) |
+  | KeyUpdate from the peer, purecrypto replies | ⏭ `SslStream` has no KeyUpdate API |
+  | RFC 8879 certificate compression | ⏭ not implemented by SChannel |
+  | RFC 7250 raw public keys (either direction) | ⏭ not implemented by SChannel |
+  | OCSP stapling | ✅ (the client runs with revocation checking on: the leaf has no AIA URL, so the platform chain engine can only pass on the stapled response — and rejects the certificate with `RevocationStatusUnknown` when purecrypto does not staple) / ⏭ the SChannel server staples only a response it fetched itself (AIA); no API to supply one |
+  | ALPN | ✅ / ✅ |
+  | RFC 8449 `record_size_limit` | ⏭ not implemented by SChannel |
+  | Chain > 16 KiB (Certificate spans records) | ✅ / ⏭ SChannel cannot send a Certificate message over 16 KiB: the server credential is refused up front (`AcquireCredentialsHandle`: `SEC_E_INVALID_PARAMETER`; the same 9 KiB leaf under a small issuer, or the same 9 KiB intermediate under a small leaf, is fine). Receiving such a chain works (C) |
+  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ |
+  | `close_notify` from the peer | ✅ / ✅ (`SslStream.ShutdownAsync`) |
+
+  Nothing on the purecrypto side needed changing. Two Windows behaviours
+  shape the adapter: a socket closed with unread data resets the
+  connection, and Windows discards the receive queue on a reset, so the
+  peer server only answers after the client's first record (the
+  purecrypto `-reconnect` ticket-only connection says goodbye at once; an
+  answer written into its closing socket cost the server that
+  connection's `close_notify`); and SChannel answers a
+  `KeyUpdate(update_requested)` only with the next application-data
+  record it sends.
 - **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server

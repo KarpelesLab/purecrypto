@@ -110,7 +110,12 @@ in the runner needs to change.
 helpers. `peers/openssl.sh` and `peers/boringssl.sh` are the reference
 adapters; `peers/openssl-system.sh` / `peers/openssl-src.sh` only set
 `OPENSSL` and source the shared one, so one adapter covers OpenSSL 3.0
-through 3.6 by version detection.
+through 3.6 by version detection. `peers/schannel.sh` is the shape for a
+platform stack without a command-line tool: a wrapper that builds and
+drives a small program of its own (`peers/schannel/`, C# on .NET's
+`SslStream`, which is SChannel on Windows). The runner itself works under
+Git Bash on Windows (MSYS path conversion is switched off and every path
+it hands out is in Windows form).
 
 Skip rather than weaken: when a peer's tool cannot express a case, `supports`
 says so with the reason, and the reason lands in the run output and in

@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The Windows SChannel peer for tools/interop: a console program driving
+       System.Net.Security.SslStream (SChannel on Windows) in both roles.
+       Built once by peers/schannel.sh with `dotnet build -c Release`.
+       net8.0 is what the GitHub Windows images carry; RollForward lets a
+       newer runtime on the machine run it. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
+    <AssemblyName>schannel-peer</AssemblyName>
+    <RootNamespace>SchannelPeer</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- SYSLIB0057: the X509Certificate2(byte[]) constructor is the one
+         net8.0 has; X509CertificateLoader only arrived in .NET 9. -->
+    <NoWarn>$(NoWarn);SYSLIB0057</NoWarn>
+  </PropertyGroup>
+
+</Project>
