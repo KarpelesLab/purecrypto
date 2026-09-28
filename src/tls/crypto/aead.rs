@@ -344,7 +344,7 @@ fn wipe(buf: &mut [u8]) {
 /// such records are protocol violations (RFC 8446 §5.4: every inner
 /// plaintext carries at least the content-type byte). Surfacing the
 /// error is itself a public signal, so the early `if` here is fine.
-fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
+pub(crate) fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
     if buf.is_empty() {
         return Err(Error::PeerMisbehaved);
     }

@@ -47,8 +47,8 @@ use crate::tls::codec::{
 };
 use crate::tls::crypto::{
     AeadAlg, HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, Transcript,
-    certificate_verify_content, expand_label_dyn, finished_verify_data, lookup_suite,
-    next_traffic_secret, supported_suites, verify_signature,
+    certificate_verify_content, ct_find_last_nonzero, expand_label_dyn, finished_verify_data,
+    lookup_suite, next_traffic_secret, supported_suites, verify_signature,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -2060,12 +2060,12 @@ pub(crate) fn decrypt_dtls13_record(
     tag.copy_from_slice(tag_bytes);
     let mut buf = ct.to_vec();
     crypter.decrypt_raw(seq, aad, &mut buf, &tag)?;
-    // TLSInnerPlaintext: content || true_type || zeros*.
-    let end = match buf.iter().rposition(|&b| b != 0) {
-        Some(p) => p,
-        None => return Err(Error::PeerMisbehaved),
-    };
-    let true_type = buf[end];
+    // TLSInnerPlaintext: content || true_type || zeros*. A backward search
+    // for the last non-zero byte would take time proportional to the
+    // padding, handing an on-path observer the true content length the
+    // padding exists to hide (RFC 9147 §4 inherits RFC 8446 §5.4); use the
+    // TLS 1.3 record layer's single front-to-back constant-time scan.
+    let (true_type, end) = ct_find_last_nonzero(&buf)?;
     buf.truncate(end);
     let ct = ContentType::from_u8(true_type);
     Ok((ct, buf))
