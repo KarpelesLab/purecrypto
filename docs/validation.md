@@ -74,7 +74,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
 | `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
 | `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
-| `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 server vs OpenSSL 3.5** (`s_client -quic`) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
+| `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
 | `signature_registry` | — (X.509/TLS dispatch) | via primitives | via X.509/TLS | — | delegates |
 | `ffi` | — (C ABI) | unit (C-boundary) | — | — | delegates; panic-catching |
@@ -179,10 +179,48 @@ update with the commands in `tools/wycheproof/README.md`.
   TLS-shaped handshake headers instead of the 12-byte DTLS ones (RFC 6347
   §4.2.6). A record capture from that OpenSSL exchange is pinned as a unit
   test of the RFC 7905 nonce and key-block layout.
-- **OpenSSL 3.5, QUIC handshake**: the **QUIC v1 server** completes a
-  handshake (ALPN, app data) with `openssl s_client -quic`. The QUIC client
-  direction and DTLS 1.3 remain loopback-only: OpenSSL is QUIC-client-only
-  and its `s_client` here lacks `-dtls1_3`.
+- **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
+  `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
+  `q_server`) against a small quic-go client and server
+  (`tools/quic-interop/quicgo`, quic-go pinned in its `go.mod`) in **both
+  roles**, and against `openssl s_client -quic` (OpenSSL built from source
+  at a pinned tag). Every case checks the outcome from both sides' logs —
+  negotiated ALPN and suite, resumption / 0-RTT / Retry flags, key phase,
+  byte counts and SHA-256 of the data each side received, close reason —
+  and, for what the quic-go application cannot see, its qlog trace.
+
+  | Case | purecrypto client → quic-go server | quic-go client → purecrypto server | OpenSSL client → purecrypto server |
+  |---|---|---|---|
+  | Handshake + bidirectional stream echo (ALPN, suite checked both sides) | ✅ | ✅ | ✅ |
+  | Unidirectional streams (client uni → server uni reply) | ✅ | ✅ | — (no s_client mode) |
+  | 8 MiB echo (flow control; quic-go's own key update and CID rotation followed) | ✅ | ✅ | ✅ (8 MiB upload) |
+  | 8 MiB echo with 1-in-50 datagram loss each way (RFC 9002 recovery) | ✅ | ✅ | — |
+  | Retry / address validation (RFC 9000 §8.1.2) | ✅ (`retry=yes`, quic-go `addr_verified=true`) | ✅ (quic-go qlog shows the Retry) | ✅ |
+  | Session resumption (PSK) | ✅ | ✅ | ✅ (`-sess_in`, `Reused`) |
+  | 0-RTT accepted (RFC 9001 §4.6) | ✅ (`early_data=accepted`, quic-go `used0rtt=true`) | ✅ | — (OpenSSL's QUIC client has no 0-RTT) |
+  | purecrypto-initiated key update (RFC 9001 §6) | ✅ (quic-go qlog `remote_update`, phase 1) | ✅ | ✅ |
+  | TLS_CHACHA20_POLY1305_SHA256 / TLS_AES_256_GCM_SHA384 | ✅ / ✅ | skipped: neither side can pin the suite (Go's crypto/tls does not restrict TLS 1.3 suites; `cipher_suites` is a client knob) | ✅ / ✅ |
+  | CONNECTION_CLOSE with application error code + reason | ✅ | ✅ | — |
+  | Idle timeout (RFC 9000 §10.1), both sides report it | ✅ | ✅ | — |
+  | DATAGRAM frames (RFC 9221), four each way | ✅ | ✅ | — |
+  | Client migration to a new socket (§9; path validation both ways) | ✅ | ✅ | — |
+  | Connection-ID switch + RETIRE_CONNECTION_ID (§5.1.2) | ✅ | ✅ | — |
+  | Version negotiation (client offers v2 first) | — (the client speaks v1 only and cannot offer another version; VN handling is unit-tested) | ✅ | — |
+  | Stateless reset (§10.3; server restarted with the same reset key) | ✅ | ✅ | — |
+  | ECN validation (§13.4; both sides report the path capable) | ✅ (Linux) | ✅ (Linux) | — |
+  | X25519MLKEM768 key exchange | ✅ | ✅ | ✅ |
+
+  Two engine bugs that loopback had hidden fell to this matrix on its first
+  run, both in the server: a PATH_CHALLENGE arriving from an address the
+  peer was only *probing* (RFC 9000 §9.1 — what quic-go always does before
+  migrating) was dropped as unanswerable instead of being answered on that
+  path (§8.2.2), so the client never migrated; and a key update initiated
+  in the same flight as HANDSHAKE_DONE reached the client before it had
+  confirmed the handshake, which OpenSSL treats as KEY_UPDATE_ERROR — the
+  server now waits for the HANDSHAKE_DONE packet to be acknowledged. Both
+  have unit tests. OpenSSL covers the client direction only: `s_server`
+  has no QUIC mode and the server-side API has no command-line front end.
+  DTLS 1.3 remains loopback-only (`s_client` here lacks `-dtls1_3`).
 - **BoringSSL, TLS 1.3 Encrypted Client Hello** (RFC 9849, CI job
   `interop-boringssl.yml`, script `tools/ech-interop/run.sh`): the purecrypto
   CLI against `bssl` at a pinned commit, over TCP, in **both roles**, each
@@ -533,19 +571,18 @@ code site:
   signature; **reuse is catastrophic** and the caller must persist state after
   every `sign`.
 - **Phased interop**: TLS 1.2 and DTLS 1.2 are validated against OpenSSL in
-  both roles, and the QUIC v1 **server** direction against OpenSSL 3.5, but
-  the QUIC client direction and DTLS 1.3 are still loopback-only (OpenSSL is
-  QUIC-client-only and exposes no `-dtls1_3` client here). QUIC ships v1
-  with streams / full RFC 9002 recovery / Retry / key update / DATAGRAM
-  partially deferred (see module docs).
+  both roles, QUIC v1 against quic-go in both roles and against OpenSSL's
+  QUIC client, but DTLS 1.3 is still loopback-only (OpenSSL exposes no
+  `-dtls1_3` client here). QUIC v1 ships without QUIC v2 (RFC 9369) and
+  without HTTP/3.
 - **Hazmat**: the `hazmat-*` features expose low-level arithmetic with **no
   semver and no constant-time guarantee** — the caller owns correctness and CT.
 - **Scope**: the crate is primitives + TLS/PKI plumbing (OpenSSL-like). Threshold
   / multi-party / message-envelope layers are out of scope.
 - **Coverage gaps**: ML-KEM ACVP is a trimmed slice (not the full corpus);
-  external QUIC interop covers the server direction only (the QUIC client
-  direction + DTLS 1.3 pending a suitable reference peer); no NIST FIPS
-  validation (CMVP) and no third-party audit.
+  DTLS 1.3 has no external peer yet; the QUIC client cannot offer a
+  non-v1 version, so its Version Negotiation handling is unit-tested only;
+  no NIST FIPS validation (CMVP) and no third-party audit.
 
 ---
 

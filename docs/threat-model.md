@@ -87,9 +87,11 @@ The implementations are built to withstand:
 
 No third-party human audit and no CMVP. Constant-time behaviour of the main
 secret-handling paths is machine-checked (Valgrind taint tracking on two
-architectures) but not measured on hardware. The DTLS 1.2 and
-QUIC v1 **server** directions interop with OpenSSL 3.5, but the client directions
-and DTLS 1.3 are loopback-validated only. TLS 1.3 Encrypted Client Hello
+architectures) but not measured on hardware. TLS 1.2 and DTLS
+1.2 interop with OpenSSL in both roles, and QUIC v1 with quic-go in both roles
+(streams, Retry, resumption, 0-RTT, key update, migration, stateless reset,
+DATAGRAM, ECN) and with OpenSSL's QUIC client; DTLS 1.3 is loopback-validated
+only. TLS 1.3 Encrypted Client Hello
 (RFC 9849) interops with BoringSSL in both roles, including HelloRetryRequest,
 rejection with `retry_configs`, and GREASE (CI); ECH over QUIC has no external
 peer yet. See [`validation.md`](validation.md)
