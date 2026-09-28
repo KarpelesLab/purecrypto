@@ -21,6 +21,11 @@
 # Apple side and leaves the close_notify verdict to the purecrypto side's
 # report (which the runner checks anyway).
 #
+# The tool logs the negotiated parameters at the end of the exchange (the
+# stack rewrites its metadata, unlocked, while the tickets behind the
+# handshake come in; see apple/README.md), so the facts follow the `data:`
+# lines in its log.
+#
 # Subcommands and environment: see ../README.md.
 
 set -euo pipefail
@@ -232,8 +237,26 @@ verify_session() {
     fi
     expect "$f" "protocol version: TLSv1.3" || ok=1
     expect "$f" "cipher suite: $(apple_suite "$CASE_SUITE")" || ok=1
-    expect "$f" "group: $(apple_group "$CASE_GROUP")" || ok=1
+    verify_group "$f" || ok=1
     return $ok
+}
+
+# The group as the Apple side reports it, for every session in the log: the
+# case's group and nothing else, compared as a whole value (`X25519` is not
+# `X25519MLKEM768`). The tool has three answers (see its README): the name;
+# `unknown (no SPI)` on a macOS without the metadata SPI — the peer cannot
+# tell us, and the group is then the purecrypto side's `key exchange:` line
+# alone, which the runner checks for every case; and `unavailable`, a read
+# the stack did not answer, which is a failure and never a pass.
+verify_group() {
+    local f=$1 want got
+    want=$(apple_group "$CASE_GROUP")
+    got=$(sed -n 's/^\(\[[ 0-9.]*\] \)\{0,1\}group: //p' "$f" 2>/dev/null | sort -u)
+    case $got in
+        "$want"|"unknown (no SPI)") return 0 ;;
+    esac
+    printf "expected 'group: %s' in %s, got '%s'\n" "$want" "$(basename "$f")" "$(echo "$got" | paste -sd, -)"
+    return 1
 }
 
 cmd_verify() {

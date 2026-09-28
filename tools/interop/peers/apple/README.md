@@ -22,6 +22,11 @@ version`, `cipher suite`, `group`, `alpn`, `resumed`, `early data accepted`,
 response`, `verify`, `challenge`, the application data as `data:` lines,
 `close_notify: sent`), which the adapter's `verify` greps.
 
+The parameters are read once per session, **when the exchange is over**
+(the client has heard nothing for `--read-timeout`, the server has the
+client's close) and before our `close_notify` — not when the connection
+becomes ready; see [Reading the metadata](#reading-the-metadata).
+
 ## What is public API and what is SPI
 
 Public `sec_protocol_options_*` covers the TLS version range, the cipher
@@ -46,6 +51,39 @@ with the reason otherwise):
 | `sec_protocol_metadata_copy_tls_negotiated_group` (or the older `get_`) | the `group:` line |
 | `sec_protocol_metadata_get_tls_certificate_compression_used` / `_algorithm` | the `certificate compression:` line |
 | `sec_protocol_options_set_server_raw_public_key_certificates` / `..._client_...` | accepting RFC 7250 raw public keys from the peer |
+
+A fact that comes from SPI has three possible values, and `verify` keeps
+them apart:
+
+| logged | meaning | `verify` |
+|---|---|---|
+| `group: P-384`, `resumed: yes`, `certificate compression: zlib`, ... | what the stack reports | compared with the case; the group as a whole value, for every session in the log |
+| `group: unknown (no SPI)` (likewise `resumed:`, `certificate compression:`) | this macOS does not have the symbol | the Apple side cannot tell: the group is then checked on the purecrypto side alone (`key exchange:`, which the runner verifies for every case); cases that are *about* the fact (`resume`, `0rtt`, `certcomp`) are SKIPped by `supports` |
+| `group: unavailable` | the SPI is there and returned nothing, after up to 100 reads 10 ms apart (a `metadata:` line says how many it took) | a failure, never a pass |
+
+## Reading the metadata
+
+`sec_protocol_metadata_t` is only safe to read while the stack is idle.
+Its accessors take no lock, and the stack goes on writing to the object on
+its own thread (`com.apple.network.connections`) after the handshake: for
+every NewSessionTicket a client receives,
+`boringssl_context_new_session_handler` rebuilds the session's state
+(`boringssl_session_set_peer_verification_state_from_session`), and a
+server's tickets arrive right behind the handshake — just when `.ready`
+is delivered to the application's queue. A read from the `.ready` handler
+races with that. Observed under CPU load (about one handshake in a
+hundred on a busy 16-core machine; a case now and then on the 3-vCPU CI
+runner), such a read returned the scalars (version, suite, resumed,
+compression) but no group, or no peer chain, or no peer public key. Each
+was there a few hundred microseconds later and could be gone again while
+the next ticket was processed; one read crashed in `objc_retain` on an
+object the stack had just released. This is what made the matrix flaky
+while the tool logged from the `.ready` handler (and reported the missing
+group as `unknown (no SPI)`, which it was not).
+
+Hence the read at the end of the exchange. It is the stack's behaviour,
+not the peer's: nothing about the handshake differs (no HelloRetryRequest
+is involved, and the purecrypto side reported the right group every time).
 
 ## Observed on macOS 26 (what the SKIPs and workarounds are for)
 

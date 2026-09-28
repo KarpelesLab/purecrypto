@@ -1,47 +1,70 @@
-// One TLS session on an NWConnection, in either role: log the negotiated
-// parameters once ready, exchange the application data, end with
-// close_notify, wait for the peer's, and report.
+// One TLS session on an NWConnection, in either role: exchange the
+// application data, log the negotiated parameters once the connection has
+// gone quiet, end with close_notify, and report.
 
 import Foundation
 import Network
 import Security
 
-/// Logs everything `sec_protocol_metadata_t` (and the SPI) says about the
-/// session, as the `key: value` lines the adapter's `verify` checks.
-func logMetadata(_ connection: NWConnection, log: Log) {
+/// What `sec_protocol_metadata_t` (and the SPI) says about the session, as
+/// the `key: value` lines the adapter's `verify` checks.
+///
+/// The metadata is only safe to read while the stack is idle. Its accessors
+/// take no lock, and the stack rewrites the object on its own thread after
+/// the handshake: for every NewSessionTicket a client's stack rebuilds the
+/// session's state (`boringssl_context_new_session_handler`), and the
+/// tickets arrive right behind the handshake — just when `.ready` reaches
+/// our queue. A read that falls into that window gets the scalars
+/// (version, suite, resumed, ...) but no group, no peer chain or no public
+/// key, or crashes on an object the stack has just released. So `Session`
+/// reads when the exchange is over; `missing` names what a read did not
+/// get although the handshake must have produced it, so that the caller
+/// can tell "not there at the moment" from a value.
+struct Facts {
+    var lines: [String] = []
+    var missing: [String] = []
+}
+
+func readFacts(_ connection: NWConnection) -> Facts? {
     guard let tlsMeta = connection.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata else {
-        log.line("metadata: none")
-        return
+        return nil
     }
     let m = tlsMeta.securityProtocolMetadata
-    log.line("protocol version: \(versionName(sec_protocol_metadata_get_negotiated_tls_protocol_version(m)))")
-    log.line("cipher suite: \(suiteName(sec_protocol_metadata_get_negotiated_tls_ciphersuite(m)))")
+    var f = Facts()
+    let version = sec_protocol_metadata_get_negotiated_tls_protocol_version(m)
+    f.lines.append("protocol version: \(versionName(version))")
+    f.lines.append("cipher suite: \(suiteName(sec_protocol_metadata_get_negotiated_tls_ciphersuite(m)))")
     if let alpn = sec_protocol_metadata_get_negotiated_protocol(m) {
-        log.line("alpn: \(String(cString: alpn))")
+        f.lines.append("alpn: \(String(cString: alpn))")
     } else {
-        log.line("alpn: none")
+        f.lines.append("alpn: none")
     }
-    if let copyGroup = SPI.copyGroup, let g = copyGroup(m) {
-        log.line("group: \(String(cString: g))")
-        free(UnsafeMutablePointer(mutating: g))
-    } else if let getGroup = SPI.getGroup, let g = getGroup(m) {
-        log.line("group: \(String(cString: g))")
+    // Three answers, never to be confused: the group's name; `unavailable`
+    // (the SPI is there and returned nothing — every TLS 1.3 handshake has
+    // a group, so the read fell into a rewrite); no such SPI on this macOS.
+    if SPI.copyGroup == nil && SPI.getGroup == nil {
+        f.lines.append("group: unknown (no SPI)")
+    } else if let g = negotiatedGroup(m) {
+        f.lines.append("group: \(g)")
     } else {
-        log.line("group: unknown (no SPI)")
+        f.lines.append("group: unavailable")
+        if version == .TLSv13 { f.missing.append("group") }
     }
     if let resumed = SPI.sessionResumed {
-        log.line("resumed: \(resumed(m) ? "yes" : "no")")
+        f.lines.append("resumed: \(resumed(m) ? "yes" : "no")")
     } else {
-        log.line("resumed: unknown (no SPI)")
+        f.lines.append("resumed: unknown (no SPI)")
     }
-    log.line("early data accepted: \(sec_protocol_metadata_get_early_data_accepted(m) ? "yes" : "no")")
+    f.lines.append("early data accepted: \(sec_protocol_metadata_get_early_data_accepted(m) ? "yes" : "no")")
     if let used = SPI.certCompressionUsed, let alg = SPI.certCompressionAlg {
         if used(m) {
             let a = alg(m)
-            log.line("certificate compression: \(a == 1 ? "zlib" : a == 2 ? "brotli" : a == 3 ? "zstd" : String(a))")
+            f.lines.append("certificate compression: \(a == 1 ? "zlib" : a == 2 ? "brotli" : a == 3 ? "zstd" : String(a))")
         } else {
-            log.line("certificate compression: none")
+            f.lines.append("certificate compression: none")
         }
+    } else {
+        f.lines.append("certificate compression: unknown (no SPI)")
     }
     var peerCerts = 0
     var subjects: [String] = []
@@ -50,21 +73,37 @@ func logMetadata(_ connection: NWConnection, log: Log) {
         let ref = sec_certificate_copy_ref(c).takeRetainedValue()
         subjects.append((SecCertificateCopySubjectSummary(ref) as String?) ?? "?")
     }
-    log.line("peer certificates: \(peerCerts)")
-    for s in subjects { log.line("peer certificate subject: \(s)") }
+    f.lines.append("peer certificates: \(peerCerts)")
+    for s in subjects { f.lines.append("peer certificate subject: \(s)") }
     if let key = sec_protocol_metadata_copy_peer_public_key(m) {
-        log.line("peer public key: \((key as DispatchData).count) bytes")
+        f.lines.append("peer public key: \((key as DispatchData).count) bytes")
     } else {
-        log.line("peer public key: none")
+        f.lines.append("peer public key: none")
+        // A chain without its key is a read that fell between the two.
+        if peerCerts > 0 { f.missing.append("peer public key") }
     }
     var ocspBytes = 0
     _ = sec_protocol_metadata_access_ocsp_response(m) { d in
         ocspBytes += (d as DispatchData).count
     }
-    log.line("ocsp response: \(ocspBytes > 0 ? "yes (\(ocspBytes) bytes)" : "no")")
+    f.lines.append("ocsp response: \(ocspBytes > 0 ? "yes (\(ocspBytes) bytes)" : "no")")
     if let sn = sec_protocol_metadata_get_server_name(m) {
-        log.line("server name: \(String(cString: sn))")
+        f.lines.append("server name: \(String(cString: sn))")
     }
+    return f
+}
+
+/// The negotiated group's name through whichever SPI this macOS has.
+func negotiatedGroup(_ m: sec_protocol_metadata_t) -> String? {
+    if let copyGroup = SPI.copyGroup {
+        guard let g = copyGroup(m) else { return nil }
+        defer { free(UnsafeMutablePointer(mutating: g)) }
+        return String(cString: g)
+    }
+    if let getGroup = SPI.getGroup, let g = getGroup(m) {
+        return String(cString: g)
+    }
+    return nil
 }
 
 /// Drives one connection to completion; `finished` is signalled once.
@@ -87,6 +126,10 @@ final class Session {
     private var idleTimer: DispatchWorkItem?
     private var peerClosed = false
     private var closeSent = false
+    /// `.ready` was seen: the handshake is over.
+    private var ready = false
+    private var factsLogged = false
+    private var factsReads = 0
 
     init(_ connection: NWConnection, role: Role, payload: Data?, readTimeout: Double,
          log: Log, queue: DispatchQueue, onFinish: @escaping (Int32) -> Void) {
@@ -112,7 +155,7 @@ final class Session {
                 break
             case .ready:
                 self.log.line("state: ready")
-                logMetadata(self.connection, log: self.log)
+                self.ready = true
                 if self.role == .client {
                     self.sendPayload()
                     self.receiveLoop()
@@ -143,6 +186,40 @@ final class Session {
             if let e = e { self?.log.line("send error: \(e)") } else { self?.log.line("sent: \(payload.count) bytes") }
         })
         armIdleTimer()
+    }
+
+    /// Logs the negotiated parameters, once, then runs `then`.
+    ///
+    /// Called when the exchange is over — the client has heard nothing for
+    /// `readTimeout`, the server has the client's close — and so with the
+    /// stack idle: not from the `.ready` handler, which runs while the
+    /// stack is still working on the metadata (see `Facts`). Should a read
+    /// come back short all the same, it is repeated (10 ms apart, for a
+    /// second at most) and the log says so; what is missing after that is
+    /// logged as missing (`group: unavailable`), which `verify` does not
+    /// take for the group.
+    private func logFacts(then: @escaping () -> Void) {
+        guard ready, !factsLogged else {
+            then()
+            return
+        }
+        let facts = readFacts(connection)
+        factsReads += 1
+        if let f = facts, !f.missing.isEmpty, !finished, factsReads < 100 {
+            queue.asyncAfter(deadline: .now() + 0.01) { [weak self] in self?.logFacts(then: then) }
+            return
+        }
+        factsLogged = true
+        if let f = facts {
+            if factsReads > 1 {
+                let what = f.missing.isEmpty ? "complete" : "without \(f.missing.joined(separator: ", "))"
+                log.line("metadata: \(what) after \(factsReads) reads")
+            }
+            for l in f.lines { log.line(l) }
+        } else {
+            log.line("metadata: none")
+        }
+        then()
     }
 
     private func receiveLoop() {
@@ -190,32 +267,39 @@ final class Session {
         queue.asyncAfter(deadline: .now() + readTimeout, execute: item)
     }
 
-    /// Sends our close_notify (`.finalMessage` on a TLS connection is the
-    /// TLS close) and ends the connection once it is out. Nothing the peer
-    /// sends after that half-close is observable here (see above), so there
-    /// is nothing to wait for.
+    /// Logs the negotiated parameters (the exchange is over, the stack is
+    /// idle), then sends our close_notify (`.finalMessage` on a TLS
+    /// connection is the TLS close) and ends the connection once it is
+    /// out. Nothing the peer sends after that half-close is observable
+    /// here (see above), so there is nothing to wait for.
     private func closeOurSide() {
         guard !closing else { return }
         closing = true
         idleTimer?.cancel()
-        log.line("received: \(received.count) bytes")
-        connection.send(content: nil, contentContext: .finalMessage, isComplete: true,
-                        completion: .contentProcessed { [weak self] e in
-            guard let self = self else { return }
-            if let e = e {
-                self.log.line("close send error: \(e)")
-            } else {
-                self.log.line("close_notify: sent")
-                self.closeSent = true
-            }
-            self.connection.cancel()
-        })
+        logFacts { [weak self] in
+            guard let self = self, !self.finished else { return }
+            self.log.line("received: \(self.received.count) bytes")
+            self.connection.send(content: nil, contentContext: .finalMessage, isComplete: true,
+                                 completion: .contentProcessed { [weak self] e in
+                guard let self = self else { return }
+                if let e = e {
+                    self.log.line("close send error: \(e)")
+                } else {
+                    self.log.line("close_notify: sent")
+                    self.closeSent = true
+                }
+                self.connection.cancel()
+            })
+        }
     }
 
     private func finish(_ code: Int32) {
         guard !finished else { return }
         finished = true
         idleTimer?.cancel()
+        // The connection ended before its close (or while a read was being
+        // repeated): log what the stack says now rather than nothing.
+        logFacts {}
         onFinish(code)
     }
 }
