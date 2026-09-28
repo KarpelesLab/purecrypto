@@ -477,21 +477,36 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, opts: &TcpOpts<'_>) {
 /// The `-reconnect` first connection: handshake, wait for the server's
 /// `NewSessionTicket`, say goodbye, and hand the session back. Nothing
 /// from stdin is sent on this connection.
+///
+/// A server need not issue tickets right after the handshake: Apple's
+/// Network.framework bundles its NewSessionTickets with its first write —
+/// which, for a client that sends nothing, is its close_notify in reply to
+/// ours. So after `TICKET_WAIT` without a ticket we send close_notify and
+/// keep reading until the peer closes, taking a ticket that arrives with
+/// the goodbye.
 fn run_tcp_for_ticket(
     conn: &mut Connection,
     sock: &mut TcpStream,
     opts: &TcpOpts<'_>,
 ) -> purecrypto::tls::ResumptionSession {
+    const TICKET_WAIT: Duration = Duration::from_secs(2);
     tcp_handshake_and_report(conn, sock, opts);
     sock.set_read_timeout(Some(Duration::from_millis(250))).ok();
     let start = Instant::now();
     let mut buf = [0u8; 4096];
+    let mut closed = false;
     let session = loop {
         if let Some(s) = conn.take_session() {
             break s;
         }
-        if start.elapsed() > Duration::from_secs(5) {
-            die("no session ticket arrived within 5 s; cannot -reconnect");
+        if !closed && start.elapsed() > TICKET_WAIT {
+            let _ = conn.close();
+            flush_out(conn, sock);
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            closed = true;
+        }
+        if start.elapsed() > TICKET_WAIT * 2 {
+            die("no session ticket arrived within 4 s; cannot -reconnect");
         }
         match sock.read(&mut buf) {
             Ok(0) => die("peer closed before issuing a session ticket"),
@@ -513,9 +528,11 @@ fn run_tcp_for_ticket(
     if !opts.quiet {
         eprintln!("session ticket received");
     }
-    let _ = conn.close();
-    flush_out(conn, sock);
-    let _ = sock.shutdown(std::net::Shutdown::Write);
+    if !closed {
+        let _ = conn.close();
+        flush_out(conn, sock);
+        let _ = sock.shutdown(std::net::Shutdown::Write);
+    }
     session
 }
 

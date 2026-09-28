@@ -467,7 +467,11 @@ Behaviour worth knowing:
   connects twice — the first time only to be issued a ticket — and offers
   it on the second connection; `-early_data FILE` sends the file as 0-RTT
   with that offer, and re-sends it as ordinary data if the server rejected
-  it (as one does after a HelloRetryRequest).
+  it (as one does after a HelloRetryRequest). The first connection sends
+  nothing and waits 2 s for a ticket; a server that bundles its
+  NewSessionTickets with its first write instead (Apple's
+  Network.framework does) gets a `close_notify` then, and the tickets that
+  come back with its own goodbye are used.
 - `-key_update` (either side) sends `KeyUpdate(update_requested)` right after
   the handshake, before any application data; the tally line at the end
   shows the peer's reply. A peer's own `KeyUpdate(update_requested)` is
