@@ -44,10 +44,14 @@ env:
   # early data and record_size_limit enabled; 4.x carries the TF-PSA-Crypto
   # and framework submodules). Bump deliberately: the cache key follows it.
   MBEDTLS_TAG: mbedtls-4.2.0
+  # LibreSSL portable, the newest 4.x release tarball, built here and
+  # cached. Bump both together: the cache key follows the version.
+  LIBRESSL_VERSION: 4.3.2
+  LIBRESSL_SHA256: edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5
 
 jobs:
   interop:
-    name: TLS 1.3 vs ${{ matrix.peer }}
+    name: TLS 1.3 vs ${{ matrix.label || matrix.peer }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 45
     defaults:
@@ -78,6 +82,18 @@ jobs:
           # Apple's TLS stack (Network.framework) of the macOS runner, through
           # the Swift tool in tools/interop/peers/apple (built by the adapter).
           - peer: apple
+            runs-on: macos-latest
+          # LibreSSL $LIBRESSL_VERSION, built from the release tarball and
+          # cached (X25519MLKEM768; no resumption, no EMS).
+          - peer: libressl
+            label: libressl (source)
+            runs-on: ubuntu-latest
+          # The LibreSSL every Mac ships as /usr/bin/openssl (3.3.x): an
+          # older, widely deployed build. Its `ocsp` responder signs with
+          # SHA-1, so the OCSP responses come from Homebrew's OpenSSL 3.
+          - peer: libressl
+            label: libressl (macOS system)
+            libressl: system
             runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -226,6 +242,42 @@ jobs:
           Get-TlsEccCurve
           Write-Host "--- cipher suites"
           (Get-TlsCipherSuite).Name
+
+      # ---- libressl ----------------------------------------------------
+      - name: Cache LibreSSL
+        if: matrix.peer == 'libressl' && matrix.libressl != 'system'
+        id: cache-libressl
+        uses: actions/cache@v5
+        with:
+          path: ~/libressl
+          key: libressl-${{ env.LIBRESSL_VERSION }}-${{ runner.os }}-v1
+
+      - name: Build LibreSSL from the release tarball
+        if: matrix.peer == 'libressl' && matrix.libressl != 'system' && steps.cache-libressl.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          curl -sSfO "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-$LIBRESSL_VERSION.tar.gz"
+          echo "$LIBRESSL_SHA256  libressl-$LIBRESSL_VERSION.tar.gz" | sha256sum -c -
+          tar xzf "libressl-$LIBRESSL_VERSION.tar.gz"
+          cd "libressl-$LIBRESSL_VERSION"
+          # Static, so the cached binary needs no library path.
+          ./configure --prefix="$HOME/libressl" --disable-shared
+          make -j"$(nproc)"
+          make install
+          "$HOME/libressl/bin/openssl" version
+
+      # The macOS system LibreSSL: the adapter reads LIBRESSL; the OCSP
+      # responses (the runner's, and the responder the adapter stands up
+      # for `s_server -status_url`) need an OpenSSL 3 `ocsp`. GNU timeout
+      # comes from coreutils.
+      - name: Use the macOS system LibreSSL
+        if: matrix.libressl == 'system'
+        run: |
+          set -euxo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install coreutils openssl@3
+          /usr/bin/openssl version
+          echo "LIBRESSL=/usr/bin/openssl" >>"$GITHUB_ENV"
+          echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >>"$GITHUB_ENV"
 
       # ---- purecrypto --------------------------------------------------
       - name: Build the purecrypto CLI
