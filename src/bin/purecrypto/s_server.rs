@@ -172,10 +172,13 @@ pub(crate) fn run(args: Args) {
     let enable_client_rpk = args.flag("-enable_client_rpk") || args.flag("--enable_client_rpk");
     let no_cert_comp = args.flag("-no_cert_comp") || args.flag("--no_cert_comp");
     let is_tcp = matches!(version, ProtocolVersion::Tls12 | ProtocolVersion::Tls13);
-    if (naccept > 1 || early_data || key_update || enable_server_rpk || enable_client_rpk)
-        && !is_tcp
-    {
-        die("-naccept / -early_data / -key_update / -enable_*_rpk are TLS-over-TCP options");
+    if (naccept > 1 || early_data || enable_server_rpk || enable_client_rpk) && !is_tcp {
+        die("-naccept / -early_data / -enable_*_rpk are TLS-over-TCP options");
+    }
+    // DTLS 1.3 rekeys with KeyUpdate too (RFC 9147 §8); DTLS 1.2 has no
+    // such mechanism.
+    if key_update && !matches!(version, ProtocolVersion::Tls13 | ProtocolVersion::Dtls13) {
+        die("-key_update needs TLS 1.3 or DTLS 1.3");
     }
     // `-min_protocol TLSv1.2` widens the pinned TLS 1.3 server into one
     // that also accepts TLS 1.2 clients (the engine is picked from the
@@ -366,7 +369,7 @@ pub(crate) fn run(args: Args) {
             } else {
                 format!("127.0.0.1:{accept}")
             };
-            run_udp(&cfg, &accept, mtu, quiet);
+            run_udp(&cfg, &accept, mtu, quiet, key_update);
         }
     }
 }
@@ -613,7 +616,7 @@ fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream, ech: bool) {
     }
 }
 
-fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool) {
+fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool) {
     let socket =
         UdpSocket::bind(accept).unwrap_or_else(|e| die(format!("cannot bind UDP {accept}: {e}")));
     let bound = socket.local_addr().ok();
@@ -657,11 +660,42 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool) {
     drive_udp_handshake(&mut conn, &socket, mtu, Duration::from_secs(15));
 
     if !quiet {
-        eprintln!("DTLS handshake complete");
+        let v_str = match conn.negotiated_version() {
+            Some(PcVersion::DTLSv1_2) => "DTLSv1.2",
+            Some(PcVersion::DTLSv1_3) => "DTLSv1.3",
+            _ => "?",
+        };
+        eprintln!("handshake complete: {v_str}");
+        if let Some(p) = conn.alpn_selected() {
+            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
+        }
+        tlsinfo::report_handshake(&conn, Role::Server);
+    }
+    // `-key_update`: rekey before the first byte of application data
+    // (RFC 9147 §8) and ask the client to rekey too.
+    if key_update {
+        conn.request_key_update()
+            .unwrap_or_else(|e| die(format!("KeyUpdate refused: {e:?}")));
+        flush_udp(&mut conn, &socket);
     }
     drive_udp_echo(&mut conn, &socket, mtu, Duration::from_secs(5));
+    if !quiet {
+        tlsinfo::report_session_end(&conn);
+    }
     let _ = peer;
     let _: Option<SocketAddr> = bound;
+}
+
+/// Sends every datagram the engine has queued (retransmits, ACKs, a
+/// KeyUpdate or its reply, an echo, an alert).
+fn flush_udp(conn: &mut Connection, socket: &UdpSocket) {
+    loop {
+        let dg = conn.pop().unwrap_or_default();
+        if dg.is_empty() {
+            break;
+        }
+        let _ = socket.send(&dg);
+    }
 }
 
 fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, mtu: usize, deadline: Duration) {
@@ -715,14 +749,20 @@ fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, mtu: usize, de
     }
 }
 
+/// Echoes application data until the client says goodbye (its close_notify
+/// is answered in kind) or `idle_limit` passes without a datagram; the
+/// session then ends with this side's close_notify (RFC 8446 §6.1 / RFC
+/// 5246 §7.2.1). The engine's retransmit timer (a KeyUpdate in flight, a
+/// Finished the client may not have seen) is fired on the way.
 fn drive_udp_echo(conn: &mut Connection, socket: &UdpSocket, mtu: usize, idle_limit: Duration) {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
     socket
         .set_read_timeout(Some(Duration::from_millis(250)))
         .ok();
+    let start = Instant::now();
     let mut last_activity = Instant::now();
     loop {
-        if last_activity.elapsed() > idle_limit {
+        if last_activity.elapsed() > idle_limit || conn.received_close_notify() {
             break;
         }
         match socket.recv(&mut buf) {
@@ -731,23 +771,30 @@ fn drive_udp_echo(conn: &mut Connection, socket: &UdpSocket, mtu: usize, idle_li
                 if conn.feed(&buf[..n]).is_err() {
                     break;
                 }
+                // A KeyUpdate reply the engine owes the client goes out
+                // before any echo under the new key.
+                flush_udp(conn, socket);
                 let plain = conn.recv().unwrap_or_default();
                 if !plain.is_empty() && conn.send(&plain).is_err() {
                     break;
                 }
-                loop {
-                    let dg = conn.pop().unwrap_or_default();
-                    if dg.is_empty() {
-                        break;
-                    }
-                    let _ = socket.send(&dg);
-                }
+                flush_udp(conn, socket);
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
-            { /* idle tick */ }
+            {
+                let now = start.elapsed();
+                if let Some(t) = conn.next_timeout()
+                    && now >= t
+                {
+                    conn.on_timeout(now);
+                    flush_udp(conn, socket);
+                }
+            }
             Err(_) => break,
         }
     }
+    let _ = conn.close();
+    flush_udp(conn, socket);
 }

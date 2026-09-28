@@ -475,10 +475,10 @@ Behaviour worth knowing:
   NewSessionTickets with its first write instead (Apple's
   Network.framework does) gets a `close_notify` then, and the tickets that
   come back with its own goodbye are used.
-- `-key_update` (either side) sends `KeyUpdate(update_requested)` right after
-  the handshake, before any application data; the tally line at the end
-  shows the peer's reply. A peer's own `KeyUpdate(update_requested)` is
-  answered in kind.
+- `-key_update` (either side, TLS 1.3 and DTLS 1.3) sends
+  `KeyUpdate(update_requested)` right after the handshake, before any
+  application data; the tally line at the end shows the peer's reply. A
+  peer's own `KeyUpdate(update_requested)` is answered in kind.
 - RFC 7250 raw public keys: `s_server -enable_server_rpk` sends the bare
   public key of `-key` (no chain) to a client that offers
   `server_certificate_type = RawPublicKey`; `s_client -enable_server_rpk`
@@ -597,6 +597,21 @@ The server performs a HelloVerifyRequest (1.2) or HelloRetryRequest cookie
 it for tests only, since a cookie-less DTLS server is a UDP reflection
 amplifier. Both directions run a 64-bit sliding-window replay filter. The
 default record size is 1200 bytes; override with `-mtu`.
+
+Both commands print the same `key: value` negotiated-parameter report as
+their TCP counterparts (`connected: DTLSv1.3` / `handshake complete:
+DTLSv1.3`, `cipher suite:`, `key exchange:`, `HelloRetryRequest:` — `yes`
+whenever the server's cookie exchange ran — and, at the end, `KeyUpdate:
+sent N, received M` and `close_notify:`), so `tools/interop/run.sh` checks
+DTLS cases the way it checks TLS ones. `-groups`, `-key-shares` and
+`-ciphersuites` pin the client's offer and `-groups` the server's accept
+set as over TCP; `-key_update` (DTLS 1.3 only, RFC 9147 §8) rekeys right
+after the handshake and asks the peer to. The session ends with a
+`close_notify` in a protected record, answered in kind, and the client
+waits `-read_timeout` seconds for the peer's before reporting. Not
+implemented over DTLS, and refused up front: client certificates
+(`-Verify`, `-cert`), resumption and 0-RTT (`-reconnect`, `-early_data`,
+`-naccept`), raw public keys, `-record_size_limit`, ECH.
 
 ## QUIC: `q_client` / `q_server`
 

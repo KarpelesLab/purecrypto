@@ -33,6 +33,11 @@ pub(crate) enum Role {
 /// (always on a server; on a client only under mTLS).
 pub(crate) fn report_handshake(conn: &Connection, role: Role) {
     let version = conn.negotiated_version();
+    // DTLS 1.3 shares the TLS 1.3 handshake (HelloRetryRequest, 0-RTT slots).
+    let is13 = matches!(
+        version,
+        Some(ProtocolVersion::TLSv1_3) | Some(ProtocolVersion::DTLSv1_3)
+    );
     eprintln!(
         "cipher suite: {}",
         conn.negotiated_cipher_suite_name().unwrap_or("unknown")
@@ -43,14 +48,14 @@ pub(crate) fn report_handshake(conn: &Connection, role: Role) {
             .map(NamedGroup::name)
             .unwrap_or("none")
     );
-    if version == Some(ProtocolVersion::TLSv1_3) {
+    if is13 {
         eprintln!(
             "HelloRetryRequest: {}",
             yes_no(conn.hello_retry_request_used())
         );
     }
     eprintln!("resumed: {}", yes_no(conn.resumed()));
-    if version == Some(ProtocolVersion::TLSv1_3) {
+    if is13 {
         let early = if conn.early_data_accepted() {
             "accepted"
         } else if conn.early_data_offered() {
@@ -119,7 +124,10 @@ pub(crate) fn report_handshake(conn: &Connection, role: Role) {
 /// close_notify: received
 /// ```
 pub(crate) fn report_session_end(conn: &Connection) {
-    if conn.negotiated_version() == Some(ProtocolVersion::TLSv1_3) {
+    if matches!(
+        conn.negotiated_version(),
+        Some(ProtocolVersion::TLSv1_3) | Some(ProtocolVersion::DTLSv1_3)
+    ) {
         eprintln!(
             "KeyUpdate: sent {}, received {}",
             conn.sent_key_updates(),
