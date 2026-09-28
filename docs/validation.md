@@ -72,8 +72,8 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `xmss` | RFC 8391, SP 800-208 | ref-impl KAT | ref vectors | `xmss_parse` | n/a (hash-based, **stateful**) |
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
-| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8 and Apple's Network.framework, both roles** (CI: certs × groups × suites, resumption, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
-| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
+| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8, Apple's Network.framework and wolfSSL 5.9, both roles** (CI: certs × groups × suites, resumption, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
+| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, fragmentation at two MTUs, a lossy path) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
 | `signature_registry` | — (X.509/TLS dispatch) | via primitives | via X.509/TLS | — | delegates |
@@ -506,6 +506,65 @@ update with the commands in `tools/wycheproof/README.md`.
   it (`if (r == 0)` where the read returned the length; `>= 0` since
   3.8.10), so on 3.8.3 the 0-RTT case is verified from the record layer's
   log of the decrypted early-data record rather than from the echo.
+- **wolfSSL 5.9.4, TLS 1.3, DTLS 1.2 and DTLS 1.3, both roles** (the same
+  `interop.yml` job family; adapter `tools/interop/peers/wolfssl.sh`,
+  driving wolfSSL's example `client` / `server` built from the pinned
+  release tag with `--enable-dtls13` and the rest). The TLS 1.3 matrix is
+  the one above; wolfSSL is also the **first peer purecrypto's DTLS 1.3
+  has ever spoken to** — it had been loopback-only — and gets the DTLS
+  matrix (`proto=dtls13` / `dtls12` in `tools/interop/run.sh`, over
+  loopback UDP, `s_client -dtls1_3` / `s_server -dtls1_3`): the plain
+  product, HelloRetryRequest per group, RFC 9147 §8 KeyUpdate with the
+  epoch change from either side, ALPN, the > 16 KiB chain at the default
+  and at a 512-byte MTU (dozens of fragments each way), and a handshake
+  through a relay dropping 20 % of the datagrams in each direction (ACK-
+  driven retransmission on 1.3, whole flights on 1.2). 522 cases; `C` /
+  `S` as above, `⏭` a SKIP with the reason:
+
+  | Case | TLS 1.3 (C / S) | DTLS 1.3 (C / S) | DTLS 1.2 (C / S) |
+  |---|---|---|---|
+  | Plain: `{RSA-2048, P-256, P-384, Ed25519, ML-DSA-65}` × `{x25519, P-256}` × three suites | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (RSA, P-256 and P-384 certificates: the 1.2 engines sign with RSA or ECDSA only) |
+  | Plain, `P-384` key exchange | ✅ / ⏭ the example client can share X25519, P-256 or a hybrid first, not P-384 (the `hrr` case steers there) | ✅ / ⏭ same | ✅ (P-384 certificate; with another certificate ⏭ RFC 8422 §5.1.1: the wolfSSL 1.2 server uses its certificate's curve and requires it in `supported_groups`) / ✅ |
+  | Plain, `X25519MLKEM768` | ✅ / ✅ | ⏭ the stateless server validates the cookie on the first fragment, and a first ClientHello with the hybrid share does not fit in one datagram (the `hrr` case carries it in CH2) / ✅ | ⏭ the 1.2 engines have no hybrid |
+  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | — | — |
+  | Resumption (PSK + DHE); 0-RTT accepted | ✅ / ✅ | ⏭ purecrypto's DTLS engines have no resumption | ⏭ |
+  | Resumption, PSK-only | ⏭ purecrypto | — | — |
+  | 0-RTT rejected across a HelloRetryRequest | ⏭ the wolfSSL server deprotects the 0-RTT records it must skip under the early keys it derived, then refuses the plaintext second ClientHello / ⏭ the example client shares the resumed session's group, so no HRR can be forced | — | — |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384`, `X25519MLKEM768` | ✅ / ✅ | ✅ / ✅ (the hybrid arrives in a fragmented CH2 with the cookie first) | — (no HRR in 1.2) |
+  | mTLS, client certificate of every kind | ✅ / ✅ | ⏭ purecrypto's DTLS servers do not verify client certificates | ⏭ |
+  | KeyUpdate from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ | — |
+  | KeyUpdate from the peer, purecrypto replies | ✅ / ✅ | ✅ / ✅ (the example client's `-I` writes a message it never reads back, and `wolfSSL_shutdown` sends no close_notify while that echo is pending, so the peer's close_notify is not demanded in that one case) | — |
+  | RFC 8879 certificate compression; RFC 8449 `record_size_limit` | ⏭ not implemented by wolfSSL | — | — |
+  | RFC 7250 raw public key, server identity | ⏭ the example server has no RPK option / ✅ | — | — |
+  | RFC 7250 raw public key, client identity | ⏭ the client's `--rpk` offers raw keys for both directions with no X.509 fallback | — | — |
+  | OCSP stapling | ⏭ the example server staples only what it fetched from a responder; the client insists on the nonce it requested, which a pre-generated staple lacks | — | — |
+  | ALPN | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | Chain > 16 KiB | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | Chain > 16 KiB at a 512-byte MTU | — | ✅ / ✅ | ✅ / ✅ |
+  | Handshake over a path dropping 20 % of datagrams | — | ✅ / ✅ (large chain) | ✅ / ✅ |
+  | RFC 9146 connection IDs | — | ⏭ purecrypto does not implement them | ⏭ |
+  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ | — | — |
+  | `close_notify` from the peer | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+
+  Four bugs fell to this peer, all invisible to loopback because both
+  purecrypto ends made the same mistake: **every HKDF-Expand-Label in
+  DTLS 1.3 used the `"tls13 "` prefix where RFC 9147 §5.9 requires
+  `"dtls13"`** — the handshake keys of the two implementations never
+  matched (pinned by wolfSSL's records and exported secrets as a unit
+  test); the DTLS 1.2 HelloVerifyRequest cookie was 38 bytes, which
+  wolfSSL's client (still at the 32-byte bound of RFC 4347) silently
+  drops, so the exchange looped — it is now 32 bytes; the DTLS 1.3
+  client put the `cookie` extension last in its second ClientHello,
+  behind the multi-KB hybrid `key_share`, and wolfSSL's stateless server
+  only looks for it in the first fragment — it goes first now; and the
+  (D)TLS 1.2 engines verified ECDSA signatures through the TLS 1.3
+  curve-pinned schemes, refusing wolfSSL's `(sha256, ecdsa)` under a
+  P-384 key, which RFC 5246 §7.4.1.4.1 allows. On the way the DTLS
+  engines gained what the matrix needs to be verifiable at all:
+  `close_notify` in both directions, KeyUpdate and the negotiated group /
+  HelloRetryRequest / KeyUpdate accessors through `Connection`, and
+  `key_exchange_groups` / `key_shares` (the DTLS 1.3 client used to share
+  every group, the servers to select from a fixed order).
 - **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server
@@ -555,7 +614,7 @@ update with the commands in `tools/wycheproof/README.md`.
   sent again as §13.3 requires. All three have unit tests. OpenSSL covers
   the client direction only: `s_server`
   has no QUIC mode and the server-side API has no command-line front end.
-  DTLS 1.3 remains loopback-only (`s_client` here lacks `-dtls1_3`).
+  (DTLS 1.3 has its own peer above: wolfSSL.)
 - **BoringSSL, TLS 1.3 Encrypted Client Hello** (RFC 9849, CI job
   `interop-boringssl.yml`, script `tools/ech-interop/run.sh`): the purecrypto
   CLI against `bssl` at a pinned commit, over TCP, in **both roles**, each
@@ -905,17 +964,19 @@ code site:
 - **Stateful keys**: LMS and XMSS advance a one-time-key index on every
   signature; **reuse is catastrophic** and the caller must persist state after
   every `sign`.
-- **Phased interop**: TLS 1.2 and DTLS 1.2 are validated against OpenSSL in
-  both roles, QUIC v1 against quic-go in both roles and against OpenSSL's
-  QUIC client, but DTLS 1.3 is still loopback-only (OpenSSL exposes no
-  `-dtls1_3` client here). QUIC v1 ships without QUIC v2 (RFC 9369) and
-  without HTTP/3.
+- **Phased interop**: TLS 1.2 and DTLS 1.2 are validated against OpenSSL
+  and wolfSSL in both roles, DTLS 1.3 against wolfSSL in both roles (one
+  peer so far — OpenSSL exposes no `-dtls1_3` client), QUIC v1 against
+  quic-go in both roles and against OpenSSL's QUIC client. QUIC v1 ships
+  without QUIC v2 (RFC 9369) and without HTTP/3.
 - **Hazmat**: the `hazmat-*` features expose low-level arithmetic with **no
   semver and no constant-time guarantee** — the caller owns correctness and CT.
 - **Scope**: the crate is primitives + TLS/PKI plumbing (OpenSSL-like). Threshold
   / multi-party / message-envelope layers are out of scope.
 - **Coverage gaps**: ML-KEM ACVP is a trimmed slice (not the full corpus);
-  DTLS 1.3 has no external peer yet; the QUIC client cannot offer a
+  DTLS 1.3 has a single external peer (wolfSSL), and its resumption,
+  0-RTT, client authentication and connection IDs are not implemented at
+  all; the QUIC client cannot offer a
   non-v1 version, so its Version Negotiation handling is unit-tested only;
   no NIST FIPS validation (CMVP) and no third-party audit.
 
