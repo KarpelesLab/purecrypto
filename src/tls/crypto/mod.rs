@@ -37,6 +37,7 @@ pub(crate) use schedule::{
 #[allow(unused_imports)]
 pub(crate) use sign::{
     certificate_verify_content, sign_certificate_verify, signature_scheme_for, verify_signature,
+    verify_signature_tls12,
 };
 #[allow(unused_imports)]
 pub(crate) use suite::{

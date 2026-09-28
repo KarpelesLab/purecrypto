@@ -44,7 +44,7 @@ use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, master_secret, tls12_exporter,
 };
-use crate::tls::crypto::{Transcript, verify_signature};
+use crate::tls::crypto::{Transcript, verify_signature_tls12};
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
 use crate::tls::{AlertDescription, ContentType, Error, ProtocolVersion};
@@ -1091,7 +1091,7 @@ impl DtlsClientConnection12 {
             .as_ref()
             .ok_or(Error::InappropriateState)?
             .clone();
-        verify_signature(
+        verify_signature_tls12(
             ske.scheme,
             &key,
             &msg,

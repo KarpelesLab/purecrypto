@@ -82,7 +82,7 @@ use crate::tls::crypto::prf::{
 use crate::tls::crypto::record_prot::RecordProtection;
 #[cfg(feature = "tls-legacy")]
 use crate::tls::crypto::ssl3;
-use crate::tls::crypto::verify_signature;
+use crate::tls::crypto::verify_signature_tls12;
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::RootCertStore;
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
@@ -2521,7 +2521,7 @@ impl<R: RngCore> ServerConnection12<R> {
         // The signed bytes are exactly the transcript buffer at this point
         // (CH..CKE inclusive). The registry verifier hashes internally.
         let message = self.transcript.buffered_bytes().to_vec();
-        verify_signature(
+        verify_signature_tls12(
             scheme,
             leaf_key,
             &message,

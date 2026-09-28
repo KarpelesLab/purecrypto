@@ -11,7 +11,9 @@ use crate::ec::CurveId;
 use crate::hash::{Digest, Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
-use crate::signature_registry::{SignaturePolicy, find_by_tls_scheme};
+use crate::signature_registry::{
+    SignatureAlgorithm, SignaturePolicy, find_by_id, find_by_tls_scheme,
+};
 use crate::tls::Error;
 use crate::tls::codec::SignatureScheme;
 use crate::tls::conn::ServerKey;
@@ -294,6 +296,47 @@ pub(crate) fn verify_signature(
     policy: &SignaturePolicy,
 ) -> Result<(), Error> {
     let algo = find_by_tls_scheme(scheme.0).ok_or(Error::PeerMisbehaved)?;
+    verify_with(algo, scheme, key, message, signature, policy)
+}
+
+/// [`verify_signature`] under (D)TLS 1.2 rules (RFC 5246 §7.4.1.4.1): the
+/// two-byte scheme is a `SignatureAndHashAlgorithm` pair, and for ECDSA the
+/// pair names a hash only — `(sha256, ecdsa)` is valid under a P-384 key,
+/// which is what wolfSSL signs its `ServerKeyExchange` with. TLS 1.3 gave
+/// the same code points curve-pinned meanings (RFC 8446 §4.2.3, which also
+/// says a TLS 1.3 implementation negotiating 1.2 "MUST behave in accordance
+/// with the requirements of [RFC5246]"), so the 1.2 engines dispatch the
+/// ECDSA schemes to the OID-keyed any-curve registry entries instead; the
+/// policy's curve floor still applies. Everything else is as in TLS 1.3.
+pub(crate) fn verify_signature_tls12(
+    scheme: SignatureScheme,
+    key: &AnyPublicKey,
+    message: &[u8],
+    signature: &[u8],
+    policy: &SignaturePolicy,
+) -> Result<(), Error> {
+    let any_curve = match scheme {
+        SignatureScheme::ECDSA_SECP256R1_SHA256 => Some("ecdsa-with-sha256"),
+        SignatureScheme::ECDSA_SECP384R1_SHA384 => Some("ecdsa-with-sha384"),
+        SignatureScheme::ECDSA_SECP521R1_SHA512 => Some("ecdsa-with-sha512"),
+        _ => None,
+    };
+    let algo = match any_curve {
+        Some(id) => find_by_id(id),
+        None => find_by_tls_scheme(scheme.0),
+    }
+    .ok_or(Error::PeerMisbehaved)?;
+    verify_with(algo, scheme, key, message, signature, policy)
+}
+
+fn verify_with(
+    algo: &'static dyn SignatureAlgorithm,
+    scheme: SignatureScheme,
+    key: &AnyPublicKey,
+    message: &[u8],
+    signature: &[u8],
+    policy: &SignaturePolicy,
+) -> Result<(), Error> {
     // The `rsa-pss-pss-*` registry entries accept both RSA SPKI forms (the
     // X.509 path needs the `rsaEncryption` one), so the TLS rule is applied
     // here, where the parsed key is at hand.
@@ -354,6 +397,60 @@ mod tests {
         let p256 = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
         let p384 = BoxedEcdsaPrivateKey::generate(CurveId::P384, &mut rng);
         let p521 = BoxedEcdsaPrivateKey::generate(CurveId::P521, &mut rng);
+        // (D)TLS 1.2: `(sha256, ecdsa)` is a hash/signature pair, valid
+        // under any curve the policy admits; TLS 1.3 pins the curve.
+        {
+            let msg = b"ServerKeyExchange params";
+            let sig = p384.sign::<Sha256>(msg).unwrap().to_der(CurveId::P384);
+            let key = AnyPublicKey::Ecdsa(p384.public_key());
+            let policy = SignaturePolicy::modern();
+            assert!(
+                verify_signature_tls12(
+                    SignatureScheme::ECDSA_SECP256R1_SHA256,
+                    &key,
+                    msg,
+                    &sig,
+                    &policy
+                )
+                .is_ok()
+            );
+            assert!(matches!(
+                verify_signature(
+                    SignatureScheme::ECDSA_SECP256R1_SHA256,
+                    &key,
+                    msg,
+                    &sig,
+                    &policy
+                ),
+                Err(Error::PeerMisbehaved)
+            ));
+            // The hash is still the scheme's: SHA-384 over the same bytes
+            // does not verify as (sha256, ecdsa).
+            let sig384 = p384.sign::<Sha384>(msg).unwrap().to_der(CurveId::P384);
+            assert!(
+                verify_signature_tls12(
+                    SignatureScheme::ECDSA_SECP256R1_SHA256,
+                    &key,
+                    msg,
+                    &sig384,
+                    &policy
+                )
+                .is_err()
+            );
+            // And the curve floor holds: P-224 fails the modern policy.
+            let p224 = BoxedEcdsaPrivateKey::generate(CurveId::P224, &mut rng);
+            let sig224 = p224.sign::<Sha256>(msg).unwrap().to_der(CurveId::P224);
+            assert!(matches!(
+                verify_signature_tls12(
+                    SignatureScheme::ECDSA_SECP256R1_SHA256,
+                    &AnyPublicKey::Ecdsa(p224.public_key()),
+                    msg,
+                    &sig224,
+                    &policy
+                ),
+                Err(Error::BadCertificate)
+            ));
+        }
         let bp256 = BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP256r1, &mut rng);
         let bp384 = BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP384r1, &mut rng);
         let bp512 = BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP512r1, &mut rng);

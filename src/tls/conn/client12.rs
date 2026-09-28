@@ -84,7 +84,7 @@ use crate::tls::crypto::prf::{
 use crate::tls::crypto::record_prot::RecordProtection;
 #[cfg(feature = "tls-legacy")]
 use crate::tls::crypto::ssl3;
-use crate::tls::crypto::{AeadAlg, Transcript, verify_signature};
+use crate::tls::crypto::{AeadAlg, Transcript, verify_signature_tls12};
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
@@ -2664,7 +2664,7 @@ impl ClientConnection12 {
             .as_ref()
             .ok_or(Error::InappropriateState)?
             .clone();
-        verify_signature(
+        verify_signature_tls12(
             ske.scheme,
             &leaf_key,
             &msg,
