@@ -455,6 +455,11 @@ impl QuicServer {
             return Some(p);
         }
         for h in self.conns.values_mut() {
+            // RFC 9000 §8.2.2 — a PATH_RESPONSE for a path the peer is only
+            // probing goes to that address, not the connection's current one.
+            if let Some((to, dg)) = h.conn.pop_offpath_datagram() {
+                return Some((to, h.conn.egress_ecn(), dg));
+            }
             let dg = h.conn.pop_datagram();
             if !dg.is_empty() {
                 return Some((h.addr, h.conn.egress_ecn(), dg));

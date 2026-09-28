@@ -562,6 +562,11 @@ fn transport_error_code(err: &Error) -> u64 {
 /// and keeps our own close frame comfortably inside one packet.
 const MAX_REASON_LEN: usize = 1024;
 
+/// Bound on PATH_RESPONSEs queued for paths other than the current one
+/// (`QuicConnection::pop_offpath_datagram`). Mirrors the in-path challenge
+/// cap: a peer probing from many addresses at once is not a peer migrating.
+const OFFPATH_RESPONSE_CAP: usize = 8;
+
 /// Decodes a peer-supplied reason phrase. RFC 9000 §19.19 says it "SHOULD" be
 /// UTF-8 but does not require it, so invalid sequences become U+FFFD rather
 /// than failing the close.
@@ -754,6 +759,14 @@ pub struct QuicConnection {
     reset_key: crate::tls::Secret32,
     /// Path-validation state (RFC 9000 §8.2).
     path: PathChallengeState,
+    /// RFC 9000 §8.2.2 — PATH_RESPONSEs owed on a path other than the one in
+    /// use: `(address, challenge, bytes received in the datagram that carried
+    /// it)`. A peer probing a new path before migrating to it (§9.1) sends a
+    /// PATH_CHALLENGE from that address alone; the answer has to go back
+    /// there, which the current-path datagram stream cannot do, so the host
+    /// drains these with [`Self::pop_offpath_datagram`]. Bounded by
+    /// `OFFPATH_RESPONSE_CAP`.
+    offpath_responses: alloc::collections::VecDeque<(SocketAddr, [u8; 8], usize)>,
     /// Local CID pool — CIDs we issued to the peer. Initialized once we
     /// know our SCID (client: in [`client_with_fixed_dcid`]; server: when
     /// processing the first Initial or the retried Initial).
@@ -1096,6 +1109,7 @@ impl QuicConnection {
             pending_scid: None,
             reset_key,
             path: PathChallengeState::new(),
+            offpath_responses: alloc::collections::VecDeque::new(),
             cid_local: Some(cid_local),
             cid_remote: None,
             now_secs: 0,
@@ -1232,6 +1246,7 @@ impl QuicConnection {
             pending_scid: Some(pending_scid),
             reset_key,
             path: PathChallengeState::new(),
+            offpath_responses: alloc::collections::VecDeque::new(),
             cid_local: None,
             cid_remote: None,
             now_secs: 0,
@@ -3320,6 +3335,67 @@ impl QuicConnection {
         self.retry_scid.as_ref().map(|c| c.as_slice())
     }
 
+    /// Moves PATH_RESPONSE debts owed on paths other than the current one
+    /// into the off-path queue, remembering how much the peer sent on that
+    /// path so the reply stays within the RFC 9000 §8.1 anti-amplification
+    /// budget of an address that has proven nothing yet.
+    fn divert_offpath_responses(&mut self) {
+        let rx_len = self.current_rx_len;
+        for (data, from) in self.path.take_responses_off_path(self.peer_addr) {
+            if self.offpath_responses.len() >= OFFPATH_RESPONSE_CAP {
+                break;
+            }
+            self.offpath_responses.push_back((from, data, rx_len));
+        }
+    }
+
+    /// Drains one datagram that must be sent to an address *other than*
+    /// [`Self::peer_address`]: the PATH_RESPONSE(s) owed to a peer that
+    /// sent a PATH_CHALLENGE from a new address without (yet) migrating to
+    /// it — RFC 9000 §9.1 probing, which §8.2.2 requires to be answered "on
+    /// the network path where the PATH_CHALLENGE was received". Regular
+    /// output ([`Self::pop_datagram`]) only ever addresses the current path,
+    /// so a host that can send to arbitrary addresses (an unconnected
+    /// socket, as [`QuicServer`](crate::quic::QuicServer) does) drains this
+    /// alongside it; a host bound to one peer address may ignore it.
+    ///
+    /// The datagram is padded towards 1200 bytes (§8.2.2), but never beyond
+    /// three times what the challenge's datagram carried (§8.1: the new
+    /// address is unvalidated), and is addressed by a spare peer-issued
+    /// connection ID when one is available (§9.5). It is not tracked for
+    /// loss recovery: a lost response is re-elicited by the peer's next
+    /// challenge.
+    pub fn pop_offpath_datagram(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
+        if self.closed || self.draining || self.pending_close.is_some() {
+            self.offpath_responses.clear();
+            return None;
+        }
+        let (to, data, rx_len) = self.offpath_responses.pop_front()?;
+        let mut payload = Vec::new();
+        Frame::PathResponse(data).encode(&mut payload);
+        // Answer every challenge owed on this path in the same datagram.
+        while let Some(pos) = self.offpath_responses.iter().position(|(a, _, _)| *a == to) {
+            if let Some((_, d, _)) = self.offpath_responses.remove(pos) {
+                Frame::PathResponse(d).encode(&mut payload);
+            }
+        }
+        let in_use = self.endpoint.cids.peer;
+        let spare = self.cid_remote.as_ref().and_then(|pool| {
+            pool.entries
+                .values()
+                .filter(|e| e.cid != in_use)
+                .min_by_key(|e| e.sequence)
+                .map(|e| e.cid)
+        });
+        if let Some(cid) = spare {
+            self.endpoint.cids.peer = cid;
+        }
+        let target = MIN_INITIAL_DATAGRAM.min(rx_len.saturating_mul(3));
+        let pkt = self.seal_packet(Level::OneRtt, payload, Some((target, 0)), None);
+        self.endpoint.cids.peer = in_use;
+        pkt.map(|p| (to, p))
+    }
+
     /// Queues an outbound PATH_CHALLENGE (RFC 9000 §8.2). The peer will
     /// echo the 8-byte challenge in a PATH_RESPONSE; matching it via
     /// the `PathChallengeState` confirms path reachability.
@@ -5278,6 +5354,10 @@ impl QuicConnection {
         // now trustworthy enough to act on. `largest_rx` was read before
         // dispatch, so it is the high-water mark *excluding* this packet.
         self.maybe_migrate(pn, largest_rx);
+        // RFC 9000 §8.2.2 — a PATH_CHALLENGE that came from an address we did
+        // not migrate to (a §9.1 probe of a path the peer may move to) is
+        // answered on that path, not the current one.
+        self.divert_offpath_responses();
         // G-4: a non-VN packet from the peer has been successfully
         // processed — any future VN packet on this connection MUST be
         // discarded (RFC 9000 §6.2).
@@ -8498,6 +8578,70 @@ mod tests {
             "§9.3: only the highest-numbered non-probing packet migrates"
         );
         assert!(!s.is_migrating());
+    }
+
+    /// RFC 9000 §8.2.2 / §9.1: a peer that probes a new path before moving
+    /// to it sends a PATH_CHALLENGE from that address and nothing else. The
+    /// response "MUST be sent on the network path where the PATH_CHALLENGE
+    /// was received" — i.e. to the new address — while the connection keeps
+    /// sending everything else to the old one. Before the fix the debt was
+    /// dropped as unpayable, so a quic-go client (which always probes first)
+    /// could never validate the path and never migrated.
+    #[test]
+    fn probe_from_new_address_is_answered_on_that_path() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let new_addr = ip4(198, 51, 100, 9, 2222);
+        let (mut c, mut s) = migration_pair(old_addr);
+        quiesce(&mut c, &mut s, old_addr);
+        assert!(s.pop_offpath_datagram().is_none());
+
+        c.send_path_challenge().expect("issue challenge");
+        let probe = c.pop_datagram();
+        assert!(
+            probe.len() >= MIN_INITIAL_DATAGRAM,
+            "§8.2.1: probe is expanded"
+        );
+        s.feed_datagram_from(new_addr, &probe).expect("server feed");
+        assert_eq!(s.peer_address(), Some(old_addr), "§9.1: not a migration");
+
+        // The regular output stays on the old path and carries no response
+        // for the probe; the off-path queue holds one for the new address.
+        let (to, reply) = s
+            .pop_offpath_datagram()
+            .expect("§8.2.2: a response is owed on the probed path");
+        assert_eq!(to, new_addr);
+        assert_eq!(
+            reply.len(),
+            MIN_INITIAL_DATAGRAM,
+            "§8.2.2: expanded, within 3x of the 1200-byte probe"
+        );
+        assert!(
+            s.pop_offpath_datagram().is_none(),
+            "one response per challenge"
+        );
+        assert!(c.path.has_outstanding());
+        c.feed_datagram(&reply).expect("client feeds response");
+        assert!(
+            !c.path.has_outstanding(),
+            "the PATH_RESPONSE must match the challenge"
+        );
+        assert_eq!(s.peer_address(), Some(old_addr));
+        quiesce(&mut c, &mut s, old_addr);
+        assert!(!c.is_closed() && !s.is_closed());
+    }
+
+    /// A closing connection owes nothing on any path (RFC 9000 §10.2.1).
+    #[test]
+    fn offpath_response_is_dropped_once_closing() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let new_addr = ip4(198, 51, 100, 9, 2222);
+        let (mut c, mut s) = migration_pair(old_addr);
+        quiesce(&mut c, &mut s, old_addr);
+        c.send_path_challenge().expect("issue challenge");
+        let probe = c.pop_datagram();
+        s.feed_datagram_from(new_addr, &probe).expect("server feed");
+        s.close(0, b"").expect("close");
+        assert!(s.pop_offpath_datagram().is_none());
     }
 
     /// RFC 9000 §18.2 — a server that advertised `disable_active_migration`

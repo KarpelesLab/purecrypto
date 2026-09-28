@@ -218,6 +218,34 @@ impl PathChallengeState {
             .retain(|(_, from)| from.is_none() || *from == to);
     }
 
+    /// Removes and returns every PATH_RESPONSE debt owed on a path other
+    /// than the one addressed by `to` — challenges that arrived from an
+    /// address the connection is not currently sending to. RFC 9000 §8.2.2
+    /// requires each to be answered on the path it came from, so the caller
+    /// sends them there separately (a server answering a peer that probes a
+    /// new path before migrating to it, §9.1). Debts with no address stay
+    /// behind, as does everything owed on the current path.
+    pub(crate) fn take_responses_off_path(
+        &mut self,
+        to: Option<SocketAddr>,
+    ) -> alloc::vec::Vec<([u8; 8], SocketAddr)> {
+        let mut out = alloc::vec::Vec::new();
+        if to.is_none() {
+            return out;
+        }
+        let mut i = 0;
+        while i < self.pending_response.len() {
+            match self.pending_response[i].1 {
+                Some(from) if Some(from) != to => {
+                    let (data, _) = self.pending_response.remove(i);
+                    out.push((data, from));
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
     /// Pops the next PATH_RESPONSE bytes we owe *on the path addressed by
     /// `to`* (FIFO order), or `None` if none. The caller wires the returned
     /// bytes into a PATH_RESPONSE frame in a datagram bound for `to`.
