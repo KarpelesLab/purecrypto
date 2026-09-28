@@ -623,7 +623,9 @@ while read -r spec; do
                 [ -f "$f" ] || continue
                 [ -s "$f" ] || continue
                 log "  ----- $(basename "$f")"
-                grep -v '^[A-Za-z0-9+/=]\{60,\}$' "$f" | head -200 | sed 's/^/  | /' >&2
+                # (`|| true`: a log over 200 lines makes `head` close the
+                # pipe on grep, and pipefail + errexit would end the run.)
+                grep -v '^[A-Za-z0-9+/=]\{60,\}$' "$f" | head -200 | sed 's/^/  | /' >&2 || true
             done ;;
     esac
 done < <(matrix)
