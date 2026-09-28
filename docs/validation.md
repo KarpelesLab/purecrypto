@@ -395,6 +395,51 @@ update with the commands in `tools/wycheproof/README.md`.
   server preference order (`s_server -ciphersuites`). The Apple client
   resumes only with early data enabled through the SPI; the tool enables
   it for the resumption cases without queuing any 0-RTT.
+- **The same matrix against LibreSSL** (`interop.yml`, adapter
+  `tools/interop/peers/libressl.sh`; two jobs): LibreSSL 4.3.2 built from
+  the release tarball on Linux, and the LibreSSL 3.3.6 every Mac ships as
+  `/usr/bin/openssl` on the macOS runner. LibreSSL's `s_client` /
+  `s_server` are OpenSSL-1.0-shaped and its TLS 1.3 stack is its own, so
+  the adapter is separate from the OpenSSL one. Both roles, 226 cases each;
+  4.3.2 passes 94 and skips 132, 3.3.6 passes 73 and skips 153, none fail:
+
+  | Case | LibreSSL 4.3 (C / S) | LibreSSL 3.3, macOS (C / S) |
+  |---|---|---|
+  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ | ✅ / ✅ |
+  | Plain, `X25519MLKEM768` | ✅ / ✅ | ⏭ 4.3+ |
+  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | ⏭ |
+  | Plain, Ed25519 certificate | ⏭ no Ed25519 in TLS: the apps cannot load the key, `signature_algorithms` omits it | ⏭ |
+  | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA | ⏭ |
+  | Resumption (PSK + DHE), 0-RTT accepted, 0-RTT rejected across HRR | ⏭ LibreSSL's TLS 1.3 has no resumption: no `psk_key_exchange_modes`, no NewSessionTicket | ⏭ |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only | ⏭ |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ | ✅ / ✅ |
+  | HelloRetryRequest to `X25519MLKEM768` | ✅ / ✅ | ⏭ |
+  | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ | ✅ / ✅ |
+  | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ | ⏭ |
+  | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ | ⏭ 3.3's `s_server` answers with records neither side can decrypt (also against OpenSSL 3.6) / ✅ |
+  | KeyUpdate (`update_requested`) from the peer, purecrypto replies | ⏭ the apps have no trigger | ⏭ |
+  | RFC 8879 zlib certificate compression (server certificate) | ⏭ not implemented by LibreSSL | ⏭ |
+  | RFC 7250 raw public key, server or client identity | ⏭ not implemented by LibreSSL | ⏭ |
+  | OCSP stapling | ✅ / ✅ (`s_server -status` fetches from an `openssl ocsp` responder the adapter runs) | ✅ / ✅ |
+  | ALPN | ✅ / ✅ | ✅ / ✅ |
+  | RFC 8449 `record_size_limit` | ⏭ not implemented by LibreSSL | ⏭ |
+  | Chain > 16 KiB (Certificate spans records) | ✅ / ✅ | ✅ / ✅ |
+  | TLS 1.2 fallback (peer is 1.2-only) | ⏭ LibreSSL has no RFC 7627 `extended_master_secret`; purecrypto requires it on TLS 1.2 (both roles abort with `handshake_failure`, as RFC 7627 §5.3 describes) | ⏭ |
+  | `close_notify` from the peer | ✅ / ⏭ `s_server` sets the shutdown flags without sending the alert | ✅ / ⏭ |
+
+  LibreSSL peculiarities the adapter accommodates rather than skips: its
+  client sends key shares for the first *two* groups it lists (one, before
+  4.x), so the HRR cases list the pinned group third; `s_server` builds the
+  chain it sends from `-CAfile` alone (the oversized chain's intermediate
+  goes there — with the root too, it sends all three); 3.3's `s_server` has
+  no `-naccept`, block-buffers its summary and never exits on its own, so it
+  runs on a pty and is stopped after `CONNECTION CLOSED`. Two purecrypto
+  security checks surfaced as LibreSSL limitations and were kept: the TLS
+  1.2 extended-master-secret requirement above, and the signature policy
+  on stapled OCSP responses — LibreSSL's own `openssl ocsp` responder
+  signs with SHA-1 (no `-rmd`), which purecrypto's client refuses with
+  `bad_certificate`, so the responder the OCSP case runs is the runner's
+  OpenSSL 3, signing with SHA-256.
 - **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server
