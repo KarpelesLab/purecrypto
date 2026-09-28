@@ -28,7 +28,7 @@
 //! it instead of leaving the peer to retransmit until it gives up.
 
 use super::replay::AntiReplayWindow;
-use crate::tls::crypto::{RecordCrypter, Secret, SuiteParams};
+use crate::tls::crypto::{LabelPrefix, RecordCrypter, Secret, SuiteParams};
 
 use super::client13::{derive_sn_key, sn_key_len_for};
 
@@ -86,7 +86,13 @@ impl ReadEpoch {
         let sn_len = sn_key_len_for(suite.aead);
         Self {
             epoch,
-            crypter: RecordCrypter::new(suite.hash, suite.aead, suite.key_len, secret),
+            crypter: RecordCrypter::new_with(
+                LabelPrefix::Dtls13,
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                secret,
+            ),
             sn_key: derive_sn_key(suite.hash, secret, sn_len),
             seq: 0,
             replay: AntiReplayWindow::new(),

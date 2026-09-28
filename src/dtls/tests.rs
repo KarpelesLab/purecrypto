@@ -5300,3 +5300,92 @@ mod fragmented_client_hello_12 {
         finish_and_exchange(&mut client, &mut server);
     }
 }
+
+/// Records captured from wolfSSL 5.9.4 (`examples/client/client -u -v 4 -t`,
+/// with its `SSLKEYLOGFILE` export) talking to the purecrypto DTLS 1.3
+/// server. They pin what loopback cannot: RFC 9147 §5.9 makes every
+/// HKDF-Expand-Label in DTLS 1.3 use the `"dtls13"` prefix instead of TLS
+/// 1.3's `"tls13 "`. Both sides of a loopback that got the prefix wrong
+/// agree with each other and never notice; the wolfSSL client's records
+/// only decrypt under the right one.
+mod wolfssl_capture {
+    use crate::dtls::client13::decrypt_dtls13_record;
+    use crate::dtls::epoch13::ReadEpoch;
+    use crate::dtls::record13::{decode_record, reconstruct_seq, sn_mask_for};
+    use crate::test_util::from_hex_vec;
+    use crate::tls::ContentType;
+    use crate::tls::codec::CipherSuite;
+    use crate::tls::crypto::{LabelPrefix, RecordCrypter, Secret, expand_label_dyn, lookup_suite};
+    use alloc::vec::Vec;
+
+    /// wolfSSL's `CLIENT_HANDSHAKE_TRAFFIC_SECRET` for the capture (the
+    /// suite was `TLS_AES_128_GCM_SHA256`).
+    const CLIENT_HS_SECRET: &str =
+        "52b93a732d8bb4e2a08ced6c2ae7cf96392870fc3a823f84eb87af057bef56b5";
+    /// Its `CLIENT_TRAFFIC_SECRET_0`.
+    const CLIENT_APP_SECRET: &str =
+        "7522a7987c03aa7c3d42570a328e512026b98f7e80a60dc19697be0d7f005925";
+    /// The client's epoch-2 record carrying its `Finished` (unified header
+    /// `0x2e`: 16-bit masked sequence number, explicit length).
+    const FINISHED_RECORD: &str = "2e8a04003d729d46b5b0b355a2bdcd4f446e2b2aff9ab0b8cda0998fa0ce939d\
+         a46ed060d7c360524fbbb837288c2c4c912aed7f4f501a01a604b3522e5237f1ca12";
+    /// The client's first epoch-3 record: the example client's greeting.
+    const APP_RECORD: &str =
+        "2f512e001f3704a764c1f8bda8be64a3627f60a220693c770b4a1638937b50a785036d1c";
+
+    /// Unmasks, authenticates and decrypts one captured record under the
+    /// read keys `epoch` holds.
+    fn open(epoch: &mut ReadEpoch, wire: &[u8]) -> Option<(ContentType, Vec<u8>)> {
+        let suite = lookup_suite(CipherSuite(0x1301)).unwrap();
+        let body = &wire[5..];
+        let mask_full = sn_mask_for(suite, epoch.sn_key.as_slice(), body).ok()?;
+        let (hdr, ct) = decode_record(wire, &mask_full[..2]).ok()?;
+        let seq = reconstruct_seq(hdr.seq_low, hdr.seq_is_16bit, 0);
+        let mut aad = wire[..hdr.header_len].to_vec();
+        aad[1] ^= mask_full[0];
+        aad[2] ^= mask_full[1];
+        decrypt_dtls13_record(&mut epoch.crypter, seq, &aad, ct).ok()
+    }
+
+    #[test]
+    fn wolfssl_records_decrypt_under_the_dtls13_label_prefix() {
+        let suite = lookup_suite(CipherSuite(0x1301)).unwrap();
+        let mut hs = ReadEpoch::new(suite, 2, &Secret::new(&from_hex_vec(CLIENT_HS_SECRET)));
+        let (ct, plain) = open(&mut hs, &from_hex_vec(FINISHED_RECORD)).expect("Finished");
+        assert_eq!(ct, ContentType::Handshake);
+        // A DTLS handshake fragment: type 20 (finished), 32-byte verify_data,
+        // message_seq 1 (after the ClientHello), offset 0, length 32.
+        assert_eq!(&plain[..12], &[20, 0, 0, 32, 0, 1, 0, 0, 0, 0, 0, 32]);
+        assert_eq!(plain.len(), 12 + 32);
+
+        let mut app = ReadEpoch::new(suite, 3, &Secret::new(&from_hex_vec(CLIENT_APP_SECRET)));
+        let (ct, plain) = open(&mut app, &from_hex_vec(APP_RECORD)).expect("application data");
+        assert_eq!(ct, ContentType::ApplicationData);
+        assert_eq!(plain, b"hello wolfssl!");
+    }
+
+    /// The same records under the TLS 1.3 prefix — what the engines derived
+    /// before the fix — fail authentication: the prefix is the only input
+    /// that differs. Checked for the record keys and for the
+    /// sequence-number key separately.
+    #[test]
+    fn wolfssl_records_do_not_decrypt_under_the_tls13_label_prefix() {
+        let suite = lookup_suite(CipherSuite(0x1301)).unwrap();
+        let secret = Secret::new(&from_hex_vec(CLIENT_HS_SECRET));
+        let mut wrong_keys = ReadEpoch::new(suite, 2, &secret);
+        wrong_keys.crypter = RecordCrypter::new_with(
+            LabelPrefix::Tls13,
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &secret,
+        );
+        assert!(open(&mut wrong_keys, &from_hex_vec(FINISHED_RECORD)).is_none());
+
+        let mut wrong_sn = ReadEpoch::new(suite, 2, &secret);
+        let mut sn = [0u8; 16];
+        expand_label_dyn(suite.hash, secret.as_slice(), b"sn", &[], &mut sn);
+        wrong_sn.sn_key = Secret::new(&sn);
+        assert!(open(&mut wrong_sn, &from_hex_vec(FINISHED_RECORD)).is_none());
+    }
+}

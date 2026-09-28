@@ -46,9 +46,10 @@ use crate::tls::codec::{
     ReadCursor, ServerHello, SignatureScheme, hs_type,
 };
 use crate::tls::crypto::{
-    AeadAlg, HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, Transcript,
-    certificate_verify_content, ct_find_last_nonzero, expand_label_dyn, finished_verify_data,
-    lookup_suite, next_traffic_secret, supported_suites, verify_signature,
+    AeadAlg, HashAlg, KeySchedule, LabelPrefix, RecordCrypter, Secret, SuiteParams, Transcript,
+    certificate_verify_content, ct_find_last_nonzero, expand_label_dyn_with,
+    finished_verify_data_with, lookup_suite, next_traffic_secret_with, supported_suites,
+    verify_signature,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -447,7 +448,14 @@ impl DtlsClientConnection13 {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let suite = self.suite.ok_or(Error::InappropriateState)?;
-        crate::tls::crypto::tls_exporter(suite.hash, ems, label, context, out)
+        crate::tls::crypto::tls_exporter_with(
+            LabelPrefix::Dtls13,
+            suite.hash,
+            ems,
+            label,
+            context,
+            out,
+        )
     }
 
     /// Drains pending UDP datagrams to send. Also drains any pending ACKs
@@ -868,9 +876,10 @@ impl DtlsClientConnection13 {
             .client_app_secret
             .as_ref()
             .ok_or(Error::InappropriateState)?;
-        let next = next_traffic_secret(suite.hash, cur);
+        let next = next_traffic_secret_with(LabelPrefix::Dtls13, suite.hash, cur);
         let sn_len = sn_key_len_for(suite.aead);
-        self.write_crypter = Some(RecordCrypter::new(
+        self.write_crypter = Some(RecordCrypter::new_with(
+            LabelPrefix::Dtls13,
             suite.hash,
             suite.aead,
             suite.key_len,
@@ -976,7 +985,7 @@ impl DtlsClientConnection13 {
             .server_app_secret
             .as_ref()
             .ok_or(Error::InappropriateState)?;
-        let next = next_traffic_secret(suite.hash, prev_secret);
+        let next = next_traffic_secret_with(LabelPrefix::Dtls13, suite.hash, prev_secret);
         let new_read = ReadEpoch::new(suite, cur_epoch + 1, &next);
         self.server_app_secret = Some(next);
         // Only the immediately previous epoch stays readable (§4.2.2).
@@ -1174,7 +1183,7 @@ impl DtlsClientConnection13 {
         self.transcript.update(raw);
 
         // Derive handshake traffic secrets.
-        let mut ks = KeySchedule::new(suite.hash);
+        let mut ks = KeySchedule::new_with(LabelPrefix::Dtls13, suite.hash);
         ks.enter_handshake(&shared);
         // The (EC)DHE / KEM shared secret is absorbed into the key
         // schedule; scrub the heap copy (DTLS-L7).
@@ -1197,7 +1206,13 @@ impl DtlsClientConnection13 {
         }
 
         // Install protected crypters (epoch 2 for handshake).
-        let w_crypter = RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &chts);
+        let w_crypter = RecordCrypter::new_with(
+            LabelPrefix::Dtls13,
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &chts,
+        );
         self.write_crypter = Some(w_crypter);
         let sn_len = sn_key_len_for(suite.aead);
         self.write_sn_key = Some(derive_sn_key(suite.hash, &chts, sn_len));
@@ -1484,7 +1499,8 @@ impl DtlsClientConnection13 {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let th = self.transcript.current_hash();
-        let expected = finished_verify_data(suite.hash, shts, th.as_slice());
+        let expected =
+            finished_verify_data_with(LabelPrefix::Dtls13, suite.hash, shts, th.as_slice());
         if !bool::from(expected.as_slice().ct_eq(body)) {
             return Err(Error::HandshakeFailure);
         }
@@ -1515,7 +1531,8 @@ impl DtlsClientConnection13 {
         }
         self.exporter_secret = Some(ems);
         // Stash the app keys; they're installed atomically below.
-        self.pending_write_app_crypter = Some(RecordCrypter::new(
+        self.pending_write_app_crypter = Some(RecordCrypter::new_with(
+            LabelPrefix::Dtls13,
             suite.hash,
             suite.aead,
             suite.key_len,
@@ -1533,7 +1550,12 @@ impl DtlsClientConnection13 {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let th_for_cfin = self.transcript.current_hash();
-        let verify_data = finished_verify_data(suite.hash, chts, th_for_cfin.as_slice());
+        let verify_data = finished_verify_data_with(
+            LabelPrefix::Dtls13,
+            suite.hash,
+            chts,
+            th_for_cfin.as_slice(),
+        );
         let fin_body = verify_data.as_slice().to_vec();
         // Update transcript with Finished.
         let mut fin_tls = Vec::with_capacity(4 + fin_body.len());
@@ -1939,7 +1961,14 @@ fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
 /// ChaCha20-Poly1305).
 pub(crate) fn derive_sn_key(hash: HashAlg, secret: &Secret, len: usize) -> Secret {
     let mut out = alloc::vec![0u8; len];
-    expand_label_dyn(hash, secret.as_slice(), b"sn", &[], &mut out);
+    expand_label_dyn_with(
+        LabelPrefix::Dtls13,
+        hash,
+        secret.as_slice(),
+        b"sn",
+        &[],
+        &mut out,
+    );
     // `Secret` wipes itself on drop; scrub the scratch `Vec` too.
     let key = Secret::new(&out);
     crate::tls::conn::wipe(&mut out);

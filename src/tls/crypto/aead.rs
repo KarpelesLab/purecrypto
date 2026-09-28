@@ -15,7 +15,7 @@
 //! nonce is the static IV XORed with the big-endian record sequence number
 //! (RFC 8446 §5.3).
 
-use super::schedule::{HashAlg, Secret, traffic_key_iv};
+use super::schedule::{HashAlg, LabelPrefix, Secret, traffic_key_iv_with};
 use super::suite::AeadAlg;
 use crate::cipher::{Aes128, Aes256, ChaCha20Poly1305, Gcm};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
@@ -129,7 +129,19 @@ impl RecordCrypter {
     /// `KeyUpdate` does not strew successive record keys through freed heap;
     /// the static IV is wiped by [`RecordCrypter`]'s `Drop`.
     pub(crate) fn new(hash: HashAlg, alg: AeadAlg, key_len: usize, secret: &Secret) -> Self {
-        let (mut key, iv) = traffic_key_iv(hash, secret, key_len);
+        Self::new_with(LabelPrefix::Tls13, hash, alg, key_len, secret)
+    }
+
+    /// [`new`](Self::new) with an explicit `HkdfLabel` prefix: DTLS 1.3
+    /// derives its record keys under `"dtls13"` (RFC 9147 §5.9).
+    pub(crate) fn new_with(
+        prefix: LabelPrefix,
+        hash: HashAlg,
+        alg: AeadAlg,
+        key_len: usize,
+        secret: &Secret,
+    ) -> Self {
+        let (mut key, iv) = traffic_key_iv_with(prefix, hash, secret, key_len);
         let aead = Aead::from_key(alg, &key);
         wipe(&mut key);
         RecordCrypter { aead, iv, seq: 0 }
@@ -452,7 +464,7 @@ mod tests {
     #[test]
     fn read_side_accepts_records_past_the_write_side_cap() {
         let secret = Secret::new(&[0x77u8; 32]);
-        let (key, iv) = traffic_key_iv(HashAlg::Sha256, &secret, 16);
+        let (key, iv) = traffic_key_iv_with(LabelPrefix::Tls13, HashAlg::Sha256, &secret, 16);
         let aead = Aead::from_key(AeadAlg::Aes128Gcm, &key);
 
         // A peer that never rekeyed: its record at sequence number 2^23 + 5.

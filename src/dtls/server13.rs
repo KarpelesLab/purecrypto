@@ -45,8 +45,9 @@ use crate::tls::codec::{
 };
 use crate::tls::crypto::sign::{sign_certificate_verify, signature_scheme_for};
 use crate::tls::crypto::{
-    HashAlg, KeySchedule, RecordCrypter, SuiteParams, Transcript, certificate_verify_content,
-    finished_verify_data, next_traffic_secret, supported_suites,
+    HashAlg, KeySchedule, LabelPrefix, RecordCrypter, SuiteParams, Transcript,
+    certificate_verify_content, finished_verify_data_with, next_traffic_secret_with,
+    supported_suites,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::{AlertDescription, ContentType, Error, ProtocolVersion};
@@ -436,7 +437,14 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let suite = self.suite.ok_or(Error::InappropriateState)?;
-        crate::tls::crypto::tls_exporter(suite.hash, ems, label, context, out)
+        crate::tls::crypto::tls_exporter_with(
+            LabelPrefix::Dtls13,
+            suite.hash,
+            ems,
+            label,
+            context,
+            out,
+        )
     }
 
     /// Drains pending UDP datagrams. Also drains any pending ACKs.
@@ -862,9 +870,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .server_app_secret
             .as_ref()
             .ok_or(Error::InappropriateState)?;
-        let next = next_traffic_secret(suite.hash, cur);
+        let next = next_traffic_secret_with(LabelPrefix::Dtls13, suite.hash, cur);
         let sn_len = sn_key_len_for(suite.aead);
-        self.write_crypter = Some(RecordCrypter::new(
+        self.write_crypter = Some(RecordCrypter::new_with(
+            LabelPrefix::Dtls13,
             suite.hash,
             suite.aead,
             suite.key_len,
@@ -963,7 +972,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .client_app_secret
             .as_ref()
             .ok_or(Error::InappropriateState)?;
-        let next = next_traffic_secret(suite.hash, prev_secret);
+        let next = next_traffic_secret_with(LabelPrefix::Dtls13, suite.hash, prev_secret);
         let new_read = ReadEpoch::new(suite, cur_epoch + 1, &next);
         self.client_app_secret = Some(next);
         // Only the immediately previous epoch stays readable (§4.2.2).
@@ -1586,7 +1595,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
 
         // Derive handshake traffic secrets and install protected crypters.
-        let mut ks = KeySchedule::new(suite.hash);
+        let mut ks = KeySchedule::new_with(LabelPrefix::Dtls13, suite.hash);
         ks.enter_handshake(&shared);
         // The (EC)DHE / KEM shared secret is absorbed into the key
         // schedule; scrub the heap copy (DTLS-L7).
@@ -1606,7 +1615,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 shts.as_slice(),
             );
         }
-        let w_crypter = RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &shts);
+        let w_crypter = RecordCrypter::new_with(
+            LabelPrefix::Dtls13,
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &shts,
+        );
         self.write_crypter = Some(w_crypter);
         let sn_len = sn_key_len_for(suite.aead);
         self.write_sn_key = Some(derive_sn_key(suite.hash, &shts, sn_len));
@@ -1690,7 +1705,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             kl.log("EXPORTER_SECRET", cr, ems.as_slice());
         }
         self.exporter_secret = Some(ems);
-        self.pending_write_app_crypter = Some(RecordCrypter::new(
+        self.pending_write_app_crypter = Some(RecordCrypter::new_with(
+            LabelPrefix::Dtls13,
             suite.hash,
             suite.aead,
             suite.key_len,
@@ -1784,7 +1800,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let th = self.transcript.current_hash();
-        let verify_data = finished_verify_data(suite.hash, shts, th.as_slice());
+        let verify_data =
+            finished_verify_data_with(LabelPrefix::Dtls13, suite.hash, shts, th.as_slice());
         let body = verify_data.as_slice().to_vec();
         let mut tls_msg = Vec::with_capacity(4 + body.len());
         tls_msg.push(hs_type::FINISHED);
@@ -1808,7 +1825,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let th = self.transcript.current_hash();
-        let expected = finished_verify_data(suite.hash, chts, th.as_slice());
+        let expected =
+            finished_verify_data_with(LabelPrefix::Dtls13, suite.hash, chts, th.as_slice());
         if !bool::from(expected.as_slice().ct_eq(body)) {
             return Err(Error::HandshakeFailure);
         }

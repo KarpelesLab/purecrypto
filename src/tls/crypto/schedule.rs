@@ -102,16 +102,47 @@ impl HashAlg {
     }
 }
 
+/// The protocol prefix of every `HkdfLabel.label`: `"tls13 "` for TLS 1.3
+/// and QUIC (RFC 8446 §7.1, RFC 9001 §5.1), `"dtls13"` for DTLS 1.3 (RFC
+/// 9147 §5.9 — no trailing space, so both prefixes are six bytes and the
+/// label stays inside one hash block). The prefix separates the two
+/// protocols' key hierarchies: a DTLS 1.3 peer deriving from the same
+/// handshake secret under the TLS prefix ends up with different traffic
+/// keys, and the handshake fails at the first protected record.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum LabelPrefix {
+    /// `"tls13 "` — TLS 1.3 and QUIC.
+    Tls13,
+    /// `"dtls13"` — DTLS 1.3 (only constructed by the DTLS 1.3 engines).
+    #[cfg_attr(not(feature = "dtls"), allow(dead_code))]
+    Dtls13,
+}
+
+impl LabelPrefix {
+    fn bytes(self) -> &'static [u8; 6] {
+        match self {
+            LabelPrefix::Tls13 => b"tls13 ",
+            LabelPrefix::Dtls13 => b"dtls13",
+        }
+    }
+}
+
 /// HKDF-Expand-Label (RFC 8446 §7.1), generic over the hash.
 ///
 /// ```text
 /// struct {
 ///   uint16 length = out.len();
-///   opaque label<7..255> = "tls13 " + Label;
+///   opaque label<7..255> = "tls13 " + Label;   // "dtls13" + Label on DTLS 1.3
 ///   opaque context<0..255> = Context;
 /// } HkdfLabel;
 /// ```
-fn expand_label<D: Digest>(secret: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
+fn expand_label<D: Digest>(
+    prefix: LabelPrefix,
+    secret: &[u8],
+    label: &[u8],
+    context: &[u8],
+    out: &mut [u8],
+) {
     // RFC 8446 §7.1: HkdfLabel.length is a u16. Every in-tree caller of
     // `expand_label{,_dyn}` allocates `out` into a buffer bounded by a hash
     // output (≤ 48 bytes) or a fixed array (≤ MAX_SECRET = 64 bytes), so
@@ -125,7 +156,7 @@ fn expand_label<D: Digest>(secret: &[u8], label: &[u8], context: &[u8], out: &mu
     let mut info = Vec::with_capacity(4 + 6 + label.len() + context.len());
     info.extend_from_slice(&label_length.to_be_bytes());
     info.push((6 + label.len()) as u8);
-    info.extend_from_slice(b"tls13 ");
+    info.extend_from_slice(prefix.bytes());
     info.extend_from_slice(label);
     info.push(context.len() as u8);
     info.extend_from_slice(context);
@@ -148,7 +179,8 @@ fn expand_label<D: Digest>(secret: &[u8], label: &[u8], context: &[u8], out: &mu
     hkdf_expand::<D>(&prk, &info, out);
 }
 
-/// Runtime HKDF-Expand-Label dispatched on the negotiated hash.
+/// Runtime HKDF-Expand-Label dispatched on the negotiated hash, under the
+/// TLS 1.3 label prefix. DTLS 1.3 callers use [`expand_label_dyn_with`].
 pub(crate) fn expand_label_dyn(
     alg: HashAlg,
     secret: &[u8],
@@ -156,15 +188,28 @@ pub(crate) fn expand_label_dyn(
     context: &[u8],
     out: &mut [u8],
 ) {
+    expand_label_dyn_with(LabelPrefix::Tls13, alg, secret, label, context, out)
+}
+
+/// [`expand_label_dyn`] with an explicit label prefix.
+pub(crate) fn expand_label_dyn_with(
+    prefix: LabelPrefix,
+    alg: HashAlg,
+    secret: &[u8],
+    label: &[u8],
+    context: &[u8],
+    out: &mut [u8],
+) {
     match alg {
-        HashAlg::Sha256 => expand_label::<Sha256>(secret, label, context, out),
-        HashAlg::Sha384 => expand_label::<Sha384>(secret, label, context, out),
+        HashAlg::Sha256 => expand_label::<Sha256>(prefix, secret, label, context, out),
+        HashAlg::Sha384 => expand_label::<Sha384>(prefix, secret, label, context, out),
     }
 }
 
 /// `Derive-Secret(secret, label, transcript_hash)` — an HKDF-Expand-Label whose
 /// context is the transcript hash and whose output is one hash long.
-pub(crate) fn derive_secret(
+pub(crate) fn derive_secret_with(
+    prefix: LabelPrefix,
     alg: HashAlg,
     secret: &[u8],
     label: &[u8],
@@ -172,7 +217,7 @@ pub(crate) fn derive_secret(
 ) -> Secret {
     let mut out = [0u8; MAX_SECRET];
     let n = alg.output_len();
-    expand_label_dyn(alg, secret, label, transcript_hash, &mut out[..n]);
+    expand_label_dyn_with(prefix, alg, secret, label, transcript_hash, &mut out[..n]);
     Secret::new(&out[..n])
 }
 
@@ -190,6 +235,8 @@ pub(crate) fn extract(alg: HashAlg, salt: &[u8], ikm: &[u8]) -> Secret {
 /// advances the secret chain or derives a leaf secret.
 pub(crate) struct KeySchedule {
     alg: HashAlg,
+    /// The `HkdfLabel` prefix every derivation uses (RFC 9147 §5.9).
+    prefix: LabelPrefix,
     /// The current chaining secret (early → handshake → master).
     secret: Secret,
 }
@@ -198,17 +245,31 @@ impl KeySchedule {
     /// Starts the schedule at the Early Secret with no PSK
     /// (`HKDF-Extract(0, 0)`).
     pub(crate) fn new(alg: HashAlg) -> Self {
+        Self::new_with(LabelPrefix::Tls13, alg)
+    }
+
+    /// [`new`](Self::new) with an explicit label prefix (DTLS 1.3 derives
+    /// every secret under `"dtls13"`, RFC 9147 §5.9).
+    pub(crate) fn new_with(prefix: LabelPrefix, alg: HashAlg) -> Self {
         let zeros = [0u8; MAX_SECRET];
         let n = alg.output_len();
         let early = extract(alg, &[], &zeros[..n]);
-        KeySchedule { alg, secret: early }
+        KeySchedule {
+            alg,
+            prefix,
+            secret: early,
+        }
     }
 
     /// Starts the schedule with a pre-shared key (`HKDF-Extract(0, psk)`).
     /// Used by both PSK-only and PSK-with-ECDHE resumption flows.
     pub(crate) fn with_psk(alg: HashAlg, psk: &[u8]) -> Self {
         let early = extract(alg, &[], psk);
-        KeySchedule { alg, secret: early }
+        KeySchedule {
+            alg,
+            prefix: LabelPrefix::Tls13,
+            secret: early,
+        }
     }
 
     /// The current Early Secret (only meaningful right after `new`).
@@ -222,7 +283,8 @@ impl KeySchedule {
     /// `"ext binder"` for external PSKs.
     pub(crate) fn binder_key(&self, label: &[u8]) -> Secret {
         let empty_hash = self.alg.hash(&[]);
-        derive_secret(
+        derive_secret_with(
+            self.prefix,
             self.alg,
             self.secret.as_slice(),
             label,
@@ -233,7 +295,13 @@ impl KeySchedule {
     /// `client_early_traffic_secret` from `Hash(ClientHello)` — used by
     /// 0-RTT writes before ServerHello arrives.
     pub(crate) fn client_early_traffic_secret(&self, transcript: &[u8]) -> Secret {
-        derive_secret(self.alg, self.secret.as_slice(), b"c e traffic", transcript)
+        derive_secret_with(
+            self.prefix,
+            self.alg,
+            self.secret.as_slice(),
+            b"c e traffic",
+            transcript,
+        )
     }
 
     /// Advances Early → Handshake Secret with the (EC)DHE shared secret.
@@ -254,7 +322,8 @@ impl KeySchedule {
     /// extracts.
     fn derive_for_next(&self) -> Secret {
         let empty = self.alg.hash(&[]);
-        derive_secret(
+        derive_secret_with(
+            self.prefix,
             self.alg,
             self.secret.as_slice(),
             b"derived",
@@ -264,7 +333,8 @@ impl KeySchedule {
 
     /// `client_handshake_traffic_secret` from `Hash(CH..SH)`.
     pub(crate) fn client_handshake_traffic_secret(&self, transcript: &[u8]) -> Secret {
-        derive_secret(
+        derive_secret_with(
+            self.prefix,
             self.alg,
             self.secret.as_slice(),
             b"c hs traffic",
@@ -274,7 +344,8 @@ impl KeySchedule {
 
     /// `server_handshake_traffic_secret` from `Hash(CH..SH)`.
     pub(crate) fn server_handshake_traffic_secret(&self, transcript: &[u8]) -> Secret {
-        derive_secret(
+        derive_secret_with(
+            self.prefix,
             self.alg,
             self.secret.as_slice(),
             b"s hs traffic",
@@ -284,7 +355,8 @@ impl KeySchedule {
 
     /// `client_application_traffic_secret_0` from `Hash(CH..server Finished)`.
     pub(crate) fn client_application_traffic_secret(&self, transcript: &[u8]) -> Secret {
-        derive_secret(
+        derive_secret_with(
+            self.prefix,
             self.alg,
             self.secret.as_slice(),
             b"c ap traffic",
@@ -294,7 +366,8 @@ impl KeySchedule {
 
     /// `server_application_traffic_secret_0` from `Hash(CH..server Finished)`.
     pub(crate) fn server_application_traffic_secret(&self, transcript: &[u8]) -> Secret {
-        derive_secret(
+        derive_secret_with(
+            self.prefix,
             self.alg,
             self.secret.as_slice(),
             b"s ap traffic",
@@ -305,14 +378,26 @@ impl KeySchedule {
     /// `exporter_master_secret` from `Hash(CH..server Finished)` — the seed
     /// for the application-layer [`tls_exporter`] (RFC 8446 §7.5).
     pub(crate) fn exporter_master_secret(&self, transcript: &[u8]) -> Secret {
-        derive_secret(self.alg, self.secret.as_slice(), b"exp master", transcript)
+        derive_secret_with(
+            self.prefix,
+            self.alg,
+            self.secret.as_slice(),
+            b"exp master",
+            transcript,
+        )
     }
 
     /// `resumption_master_secret` from `Hash(CH..client Finished)` — the
     /// seed for future-session PSKs (RFC 8446 §7.1). The actual PSK is
     /// `HKDF-Expand-Label(rms, "resumption", ticket_nonce, Hash.length)`.
     pub(crate) fn resumption_master_secret(&self, transcript: &[u8]) -> Secret {
-        derive_secret(self.alg, self.secret.as_slice(), b"res master", transcript)
+        derive_secret_with(
+            self.prefix,
+            self.alg,
+            self.secret.as_slice(),
+            b"res master",
+            transcript,
+        )
     }
 }
 
@@ -354,11 +439,30 @@ pub(crate) fn tls_exporter(
     context: &[u8],
     out: &mut [u8],
 ) -> Result<(), Error> {
+    tls_exporter_with(
+        LabelPrefix::Tls13,
+        alg,
+        exporter_master_secret,
+        label,
+        context,
+        out,
+    )
+}
+
+/// [`tls_exporter`] with an explicit label prefix.
+pub(crate) fn tls_exporter_with(
+    prefix: LabelPrefix,
+    alg: HashAlg,
+    exporter_master_secret: &Secret,
+    label: &[u8],
+    context: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error> {
     if out.len() > 255 * alg.output_len() || out.len() > u16::MAX as usize {
         return Err(Error::IllegalParameter);
     }
     // `HkdfLabel.label` is `opaque label<7..255>` and always carries the
-    // 6-byte "tls13 " prefix.
+    // 6-byte protocol prefix.
     if label.len() > 255 - 6 {
         return Err(Error::IllegalParameter);
     }
@@ -366,7 +470,8 @@ pub(crate) fn tls_exporter(
     // Secret_export = HKDF-Expand-Label(EMS, label, Hash(""), Hash.length)
     let mut export = [0u8; MAX_SECRET];
     let n = alg.output_len();
-    expand_label_dyn(
+    expand_label_dyn_with(
+        prefix,
         alg,
         exporter_master_secret.as_slice(),
         label,
@@ -375,7 +480,14 @@ pub(crate) fn tls_exporter(
     );
     // Output = HKDF-Expand-Label(Secret_export, "exporter", Hash(context), L)
     let ctx_hash = alg.hash(context);
-    expand_label_dyn(alg, &export[..n], b"exporter", ctx_hash.as_slice(), out);
+    expand_label_dyn_with(
+        prefix,
+        alg,
+        &export[..n],
+        b"exporter",
+        ctx_hash.as_slice(),
+        out,
+    );
     Ok(())
 }
 
@@ -383,26 +495,58 @@ pub(crate) fn tls_exporter(
 /// traffic secret (RFC 8446 §7.2): `HKDF-Expand-Label(prev, "traffic upd",
 /// "", Hash.length)`. Used by `KeyUpdate` re-keying.
 pub(crate) fn next_traffic_secret(alg: HashAlg, prev: &Secret) -> Secret {
+    next_traffic_secret_with(LabelPrefix::Tls13, alg, prev)
+}
+
+/// [`next_traffic_secret`] with an explicit label prefix.
+pub(crate) fn next_traffic_secret_with(prefix: LabelPrefix, alg: HashAlg, prev: &Secret) -> Secret {
     let mut next = [0u8; MAX_SECRET];
     let n = alg.output_len();
-    expand_label_dyn(alg, prev.as_slice(), b"traffic upd", &[], &mut next[..n]);
+    expand_label_dyn_with(
+        prefix,
+        alg,
+        prev.as_slice(),
+        b"traffic upd",
+        &[],
+        &mut next[..n],
+    );
     Secret::new(&next[..n])
 }
 
 /// Derives the AEAD write key and IV from a traffic secret (RFC 8446 §7.3).
+/// (The engines derive through [`traffic_key_iv_with`]; this is the
+/// constant-time harness's and the tests' entry point.)
+#[cfg(any(test, feature = "__ct-check"))]
 pub(crate) fn traffic_key_iv(alg: HashAlg, secret: &Secret, key_len: usize) -> (Vec<u8>, [u8; 12]) {
+    traffic_key_iv_with(LabelPrefix::Tls13, alg, secret, key_len)
+}
+
+/// [`traffic_key_iv`] with an explicit label prefix.
+pub(crate) fn traffic_key_iv_with(
+    prefix: LabelPrefix,
+    alg: HashAlg,
+    secret: &Secret,
+    key_len: usize,
+) -> (Vec<u8>, [u8; 12]) {
     let mut key = alloc::vec![0u8; key_len];
-    expand_label_dyn(alg, secret.as_slice(), b"key", &[], &mut key);
+    expand_label_dyn_with(prefix, alg, secret.as_slice(), b"key", &[], &mut key);
     let mut iv = [0u8; 12];
-    expand_label_dyn(alg, secret.as_slice(), b"iv", &[], &mut iv);
+    expand_label_dyn_with(prefix, alg, secret.as_slice(), b"iv", &[], &mut iv);
     (key, iv)
 }
 
 /// The `finished_key` for a traffic secret (RFC 8446 §4.4.4).
-pub(crate) fn finished_key(alg: HashAlg, secret: &Secret) -> Secret {
+pub(crate) fn finished_key_with(prefix: LabelPrefix, alg: HashAlg, secret: &Secret) -> Secret {
     let mut out = [0u8; MAX_SECRET];
     let n = alg.output_len();
-    expand_label_dyn(alg, secret.as_slice(), b"finished", &[], &mut out[..n]);
+    expand_label_dyn_with(
+        prefix,
+        alg,
+        secret.as_slice(),
+        b"finished",
+        &[],
+        &mut out[..n],
+    );
     Secret::new(&out[..n])
 }
 
@@ -413,7 +557,17 @@ pub(crate) fn finished_verify_data(
     traffic_secret: &Secret,
     transcript_hash: &[u8],
 ) -> Secret {
-    let fk = finished_key(alg, traffic_secret);
+    finished_verify_data_with(LabelPrefix::Tls13, alg, traffic_secret, transcript_hash)
+}
+
+/// [`finished_verify_data`] with an explicit label prefix.
+pub(crate) fn finished_verify_data_with(
+    prefix: LabelPrefix,
+    alg: HashAlg,
+    traffic_secret: &Secret,
+    transcript_hash: &[u8],
+) -> Secret {
+    let fk = finished_key_with(prefix, alg, traffic_secret);
     match alg {
         HashAlg::Sha256 => {
             Secret::new(Hmac::<Sha256>::mac(fk.as_slice(), transcript_hash).as_ref())
@@ -477,7 +631,7 @@ mod tests {
         assert_eq!(civ, from_hex::<12>("5bd3c71b836e0b76bb73265f"));
 
         // Server finished_key.
-        let sfin = finished_key(alg, &shts);
+        let sfin = finished_key_with(LabelPrefix::Tls13, alg, &shts);
         assert_eq!(
             sfin.as_slice(),
             &from_hex::<32>("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8")[..]

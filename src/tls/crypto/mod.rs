@@ -25,11 +25,14 @@ pub(crate) use aead::{
 pub(crate) use hash::Transcript;
 // `HashAlg` is exposed publicly so callers can store it in resumption sessions.
 pub use schedule::HashAlg;
+#[cfg(feature = "__ct-check")]
+pub(crate) use schedule::traffic_key_iv;
 #[allow(unused_imports)]
 pub(crate) use schedule::{
-    KeySchedule, Secret, binder_finished_key, derive_secret, expand_label_dyn, extract,
-    finished_key, finished_verify_data, next_traffic_secret, psk_from_resumption, tls_exporter,
-    traffic_key_iv,
+    KeySchedule, LabelPrefix, Secret, binder_finished_key, derive_secret_with, expand_label_dyn,
+    expand_label_dyn_with, extract, finished_verify_data, finished_verify_data_with,
+    next_traffic_secret, next_traffic_secret_with, psk_from_resumption, tls_exporter,
+    tls_exporter_with,
 };
 #[allow(unused_imports)]
 pub(crate) use sign::{
