@@ -51,7 +51,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$PEER" ] || { echo "--peer NAME is required" >&2; exit 2; }
-if [ -x "$HERE/peers/$PEER" ]; then
+if [ -f "$HERE/peers/$PEER" ] && [ -x "$HERE/peers/$PEER" ]; then
     ADAPTER=("$HERE/peers/$PEER")
 elif [ -f "$HERE/peers/$PEER.sh" ]; then
     ADAPTER=(bash "$HERE/peers/$PEER.sh")
@@ -63,7 +63,7 @@ fi
 if [ "$LIST" = 0 ]; then
     : "${PURECRYPTO:?set PURECRYPTO to the purecrypto CLI binary}"
     case $PURECRYPTO in
-        /*) ;;
+        /*|[A-Za-z]:[/\\]*) ;;
         *) PURECRYPTO=$PWD/$PURECRYPTO ;;
     esac
     export PURECRYPTO
@@ -153,13 +153,23 @@ fi
 # ---------------------------------------------------------------- setup
 
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/interop-$PEER.XXXXXX")
+# MSYS bash on Windows rewrites arguments that look like POSIX paths for
+# native programs (`-subj /CN=x` would reach purecrypto.exe as
+# `C:/Program Files/.../CN=x`): turn that off and hand out Windows-form
+# paths instead, which bash and native programs both accept.
+case ${OSTYPE:-} in
+    msys*|cygwin*)
+        export MSYS_NO_PATHCONV=1
+        ROOT=$(cygpath -m "$ROOT")
+        ;;
+esac
 export ROOT
 cleanup() {
     stop_servers
     if [ "$KEEP" = 1 ]; then
         log "scratch directory kept: $ROOT"
     else
-        rm -rf "$ROOT"
+        rm -rf "$ROOT" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
