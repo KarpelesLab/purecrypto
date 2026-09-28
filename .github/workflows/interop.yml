@@ -1,0 +1,132 @@
+name: Interop
+
+# TLS 1.3 interop matrix: the purecrypto CLI against other TLS stacks, in
+# BOTH roles, over real loopback TCP sockets — certificate kinds × key
+# exchange groups × cipher suites for plain handshakes, then resumption,
+# 0-RTT (accepted, and rejected across a HelloRetryRequest), HRR per group,
+# mTLS per certificate kind, KeyUpdate from either side, RFC 8879
+# certificate compression, RFC 7250 raw public keys in either direction,
+# OCSP stapling, ALPN, record_size_limit, a > 16 KiB chain and the TLS 1.2
+# fallback. Both sides' logs are checked for the negotiated parameters.
+#
+# Loopback (purecrypto<->purecrypto) cannot catch a symmetric bug or a
+# missing advertisement: the client only sent `psk_key_exchange_modes` when
+# it already held a session, so a BoringSSL server never issued it a ticket
+# and nothing could ever be resumed against one — loopback resumed happily.
+# This matrix does not.
+#
+# One job per peer (`matrix.include`); add a peer by appending an entry and,
+# if it needs building, a conditional build step. The matrix itself lives in
+# tools/interop/run.sh (see tools/interop/README.md for the adapter
+# contract); every process runs under `timeout` so a hang fails its case in
+# seconds.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # OpenSSL built from source for the `openssl-src` peer: X25519MLKEM768,
+  # ML-DSA certificates, raw public keys and zlib certificate compression,
+  # none of which the runner's OpenSSL 3.0 has. Bump deliberately: the
+  # cache key follows it.
+  OPENSSL_SRC_TAG: openssl-3.6.4
+  # google/boringssl master of 2026-09-27 (the same pin as
+  # interop-boringssl.yml). Bump deliberately: the cache key follows it.
+  BORINGSSL_COMMIT: 5112448a24999caecfb6f04281379016ac79dc9a
+
+jobs:
+  interop:
+    name: TLS 1.3 vs ${{ matrix.peer }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The runner's OpenSSL 3.0.x: classical TLS 1.3 only.
+          - peer: openssl-system
+            runs-on: ubuntu-latest
+          # OpenSSL at $OPENSSL_SRC_TAG, built here and cached.
+          - peer: openssl-src
+            runs-on: ubuntu-latest
+          # BoringSSL's bssl tool at $BORINGSSL_COMMIT, built here and cached.
+          - peer: boringssl
+            runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: System OpenSSL version
+        run: openssl version -a
+
+      # ---- openssl-src -------------------------------------------------
+      - name: Cache OpenSSL (source build)
+        if: matrix.peer == 'openssl-src'
+        id: cache-openssl-src
+        uses: actions/cache@v5
+        with:
+          path: ~/openssl-src
+          key: openssl-src-${{ env.OPENSSL_SRC_TAG }}-${{ runner.os }}-v1
+
+      - name: Build OpenSSL from source
+        if: matrix.peer == 'openssl-src' && steps.cache-openssl-src.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zlib1g-dev
+          git clone --depth 1 --branch "$OPENSSL_SRC_TAG" https://github.com/openssl/openssl.git openssl-src
+          cd openssl-src
+          # zlib for RFC 8879 certificate compression; static, so the
+          # cached binary needs no library path.
+          ./Configure --prefix="$HOME/openssl-src" --openssldir="$HOME/openssl-src/ssl" \
+            --libdir=lib no-shared no-tests enable-zlib
+          make -j"$(nproc)" build_sw
+          make install_sw
+          "$HOME/openssl-src/bin/openssl" version -a
+
+      # ---- boringssl ---------------------------------------------------
+      - name: Cache bssl
+        if: matrix.peer == 'boringssl'
+        id: cache-bssl
+        uses: actions/cache@v5
+        with:
+          path: ~/bssl
+          key: bssl-${{ env.BORINGSSL_COMMIT }}-${{ runner.os }}-v1
+
+      - name: Build bssl
+        if: matrix.peer == 'boringssl' && steps.cache-bssl.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          git init boringssl
+          cd boringssl
+          git fetch --depth 1 https://github.com/google/boringssl.git "$BORINGSSL_COMMIT"
+          git checkout --detach FETCH_HEAD
+          cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release
+          ninja -C build bssl
+          mkdir -p ~/bssl
+          cp build/bssl ~/bssl/bssl
+
+      # ---- purecrypto --------------------------------------------------
+      - name: Build the purecrypto CLI
+        run: cargo build --release --features ech --bin purecrypto
+
+      - name: Interop matrix (both roles)
+        timeout-minutes: 30
+        run: |
+          PURECRYPTO="$GITHUB_WORKSPACE/target/release/purecrypto" \
+          BSSL="$HOME/bssl/bssl" \
+          tools/interop/run.sh --peer "${{ matrix.peer }}"
