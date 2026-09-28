@@ -195,7 +195,8 @@ fn challenge(r: &[u8; 32], p: &[u8; 32], msg: &[u8]) -> Scalar {
 /// [`Error::InvalidInput`] if `int(sk)` is `0` or `≥ n`.
 pub fn public_key(seckey: &[u8; 32]) -> Result<[u8; 32], Error> {
     let d = Scalar::from_bytes_be(seckey).map_err(|_| Error::InvalidInput)?;
-    if bool::from(d.is_zero()) {
+    // Declassified (Valgrind harness): the key-validity verdict is returned.
+    if d.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
     let p = ProjectivePoint::mul_generator(&d)
@@ -222,7 +223,8 @@ pub fn public_key(seckey: &[u8; 32]) -> Result<[u8; 32], Error> {
 pub fn sign(seckey: &[u8; 32], msg: &[u8], aux_rand: &[u8; 32]) -> Result<[u8; 64], Error> {
     // d' = int(sk); fail if d' = 0 or d' >= n.
     let d0 = Scalar::from_bytes_be(seckey).map_err(|_| Error::InvalidInput)?;
-    if bool::from(d0.is_zero()) {
+    // Declassified (Valgrind harness): the key-validity verdict is returned.
+    if d0.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
 
@@ -249,7 +251,9 @@ pub fn sign(seckey: &[u8; 32], msg: &[u8], aux_rand: &[u8; 32]) -> Result<[u8; 6
     wipe(&mut aux);
     let k0 = Scalar::from_bytes_be_reduce(&rand);
     wipe(&mut rand);
-    if bool::from(k0.is_zero()) {
+    // Declassified (Valgrind harness): a zero nonce is an (unreachable)
+    // error return.
+    if k0.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
 
@@ -266,6 +270,12 @@ pub fn sign(seckey: &[u8; 32], msg: &[u8], aux_rand: &[u8; 32]) -> Result<[u8; 6
     let mut sig = [0u8; 64];
     sig[..32].copy_from_slice(&rx);
     sig[32..].copy_from_slice(&s.to_bytes_be());
+
+    // Declassified (Valgrind harness): the public key and the signature are
+    // public. The self-check below is an ordinary verification of the value
+    // about to be returned; it only withholds it on a computation fault.
+    crate::ct::declassify(&px);
+    crate::ct::declassify(&sig);
 
     // BIP340: verify before leaving the signer.
     verify(&px, msg, &sig)?;

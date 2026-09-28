@@ -776,6 +776,17 @@ impl FalconPrivateKey {
         sign::sign_internal(&self.expanded, msg, &salt, &mut src).ok_or(Error::SamplingFailed)
     }
 
+    /// Marks the key's secret buffers secret for the Valgrind harness
+    /// (`ct::hooks::falcon_classify_private_key`): `f, g, F, G` and the
+    /// expanded signing key. `h` is the public key.
+    #[cfg(feature = "__ct-check")]
+    pub(crate) fn ct_classify_secrets(&self) {
+        for v in [&self.f, &self.g, &self.cap_f, &self.cap_g] {
+            crate::ct::classify_val(v.as_slice());
+        }
+        self.expanded.ct_classify();
+    }
+
     /// The matching public key.
     pub fn public_key(&self) -> FalconPublicKey {
         let mut h = [0u16; MAX_N];

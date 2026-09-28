@@ -674,7 +674,8 @@ impl Aez {
         for &b in &buf[m_len..] {
             acc |= b;
         }
-        if bool::from(acc.ct_eq(&0)) {
+        // Declassified (Valgrind harness): the verification verdict is returned.
+        if acc.ct_eq(&0).declassify() {
             Ok(m_len)
         } else {
             // Unauthenticated plaintext must not reach the caller.

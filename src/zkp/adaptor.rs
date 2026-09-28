@@ -252,7 +252,9 @@ fn dleq_prove(
     let a = Scalar::from_bytes_be(&a_bytes);
     a_bytes.zeroize();
     let a = a?;
-    if bool::from(a.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if a.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
 
@@ -294,7 +296,9 @@ fn dleq_verify(
     // An honest prover never produces a zero challenge or response
     // (probability ≈ 2⁻²⁵⁶ each); a zero `b` would also make the recomputed
     // commitments independent of the statement. Reject, as the docs promise.
-    if bool::from(b.is_zero() | c.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if (b.is_zero() | c.is_zero()).declassify() {
         return Err(Error::Verification);
     }
 
@@ -314,7 +318,9 @@ fn dleq_verify(
         .ok_or(Error::Verification)?;
 
     let implied = dleq_challenge(x, y, z, &a_g, &a_y);
-    if bool::from(implied.ct_eq(&b)) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if implied.ct_eq(&b).declassify() {
         Ok(())
     } else {
         Err(Error::Verification)
@@ -342,7 +348,9 @@ fn parse(sig: &[u8; ADAPTOR_SIGNATURE_LEN]) -> Result<Parsed, Error> {
     let mut s_raw = [0u8; 32];
     s_raw.copy_from_slice(&sig[66..98]);
     let s_a = Scalar::from_bytes_be(&s_raw)?;
-    if bool::from(s_a.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if s_a.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
     let mut proof = [0u8; 64];
@@ -439,7 +447,9 @@ fn encrypt_inner(
     aux: Option<&[u8; 32]>,
 ) -> Result<[u8; ADAPTOR_SIGNATURE_LEN], Error> {
     let x = Scalar::from_bytes_be(seckey)?;
-    if bool::from(x.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if x.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
     let y_point = AffinePoint::from_sec1(enckey)?;
@@ -454,7 +464,9 @@ fn encrypt_inner(
     // Single exit so `k_bytes` and `k` are wiped even on the error paths.
     let out = (|| {
         let k = k.as_ref().map_err(|e| *e)?;
-        if bool::from(k.is_zero()) {
+        // Declassified (Valgrind harness): a public verdict (an error return or
+        // a rejected candidate).
+        if k.is_zero().declassify() {
             return Err(Error::InvalidInput);
         }
         let r_a = ProjectivePoint::mul_generator(k)
@@ -470,13 +482,17 @@ fn encrypt_inner(
 
         let m = Scalar::from_bytes_be_reduce(msg32);
         let r = r_of(&r_point);
-        if bool::from(r.is_zero()) {
+        // Declassified (Valgrind harness): a public verdict (an error return or
+        // a rejected candidate).
+        if r.is_zero().declassify() {
             return Err(Error::InvalidInput);
         }
         // s_a = k⁻¹·(m + r·x). `invert` is a constant-time Fermat inversion —
         // a variable-time inversion here would leak the nonce and hence `x`.
         let s_a = k.invert().mul(&m.add(&r.mul(&x)));
-        if bool::from(s_a.is_zero()) {
+        // Declassified (Valgrind harness): a public verdict (an error return or
+        // a rejected candidate).
+        if s_a.is_zero().declassify() {
             return Err(Error::InvalidInput);
         }
 
@@ -532,7 +548,9 @@ pub fn verify(
     // `r = 0` the equation below degenerates to `s_a⁻¹·m·G == R_a`, which no
     // longer involves `pubkey` at all — an attacker could satisfy it for any
     // key. ECDSA requires `r ≠ 0`; enforce it here as `encrypt` does.
-    if bool::from(r.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if r.is_zero().declassify() {
         return Err(Error::Verification);
     }
     let s_inv = p.s_a.invert();
@@ -542,7 +560,9 @@ pub fn verify(
     // Everything here is public, but the hazmat API only offers the
     // constant-time ladder; using it costs a little speed and leaks nothing.
     let lhs = ProjectivePoint::mul_generator(&u1).add(&x_point.to_projective().mul(&u2));
-    if bool::from(lhs.ct_eq(&p.r_a.to_projective())) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if lhs.ct_eq(&p.r_a.to_projective()).declassify() {
         Ok(())
     } else {
         Err(Error::Verification)
@@ -568,13 +588,17 @@ pub fn decrypt(
 ) -> Result<[u8; 64], Error> {
     let p = parse(adaptor_sig)?;
     let y = Scalar::from_bytes_be(secret_y)?;
-    if bool::from(y.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if y.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
 
     // s = s_a·y⁻¹. `y` is secret, so this inversion must be constant time.
     let s = p.s_a.mul(&y.invert());
-    if bool::from(s.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if s.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
     // Low-S normalisation (BIP-62), branch-free. `s` is a public output, so
@@ -643,17 +667,23 @@ pub fn recover(
     s_raw.copy_from_slice(&sig[32..]);
     let r = Scalar::from_bytes_be(&r_raw)?;
     let s = Scalar::from_bytes_be(&s_raw)?;
-    if bool::from(s.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if s.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
     // `r = 0` is not a signature (and, because `x(R) = n` is encodable, it
     // could still match this adaptor signature's `R` below); reject it as
     // [`verify`] does.
-    if bool::from(r.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if r.is_zero().declassify() {
         return Err(Error::Verification);
     }
     // The signature must belong to this adaptor signature.
-    if !bool::from(r.ct_eq(&r_of(&p.r_point))) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if !r.ct_eq(&r_of(&p.r_point)).declassify() {
         return Err(Error::Verification);
     }
 
@@ -661,14 +691,20 @@ pub fn recover(
     // published), but `y'` is the secret being recovered, so it is treated as
     // secret from this point on.
     let y = s.invert().mul(&p.s_a);
-    if bool::from(y.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if y.is_zero().declassify() {
         return Err(Error::Verification);
     }
     let implied = ProjectivePoint::mul_generator(&y);
     let target = y_point.to_projective();
-    if bool::from(implied.ct_eq(&target)) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if implied.ct_eq(&target).declassify() {
         Ok(y.to_bytes_be())
-    } else if bool::from(implied.ct_eq(&target.negate())) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    } else if implied.ct_eq(&target.negate()).declassify() {
         // `decrypt` negated `s` for low-S, so the naive recovery gave −y.
         Ok(y.negate().to_bytes_be())
     } else {

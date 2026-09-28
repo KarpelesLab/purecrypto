@@ -196,7 +196,9 @@ impl Whitelist {
 /// Rejects a 32-byte value that is not a canonical nonzero scalar.
 fn check_scalar(b: &[u8; 32]) -> Result<(), Error> {
     let s = Scalar::from_bytes_be(b).map_err(|_| Error::Malformed)?;
-    if bool::from(s.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if s.is_zero().declassify() {
         return Err(Error::Malformed);
     }
     Ok(())
@@ -390,13 +392,16 @@ pub fn sign<R: RngCore + CryptoRng>(
 ) -> Result<Whitelist, Error> {
     let (keys, m) = ring_keys(online_pubkeys, offline_pubkeys, sub_pubkey)?;
     let n = keys.len();
-    if index >= n {
+    // Declassified (Valgrind harness): an argument-validation verdict.
+    if crate::ct::declassify_value(index >= n) {
         return Err(Error::InvalidInput);
     }
 
     let online = Scalar::from_bytes_be(online_seckey)?;
     let summed = Scalar::from_bytes_be(summed_seckey)?;
-    if bool::from(online.is_zero()) || bool::from(summed.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if online.is_zero().declassify() || summed.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
 
@@ -414,7 +419,12 @@ pub fn sign<R: RngCore + CryptoRng>(
     for (i, k) in keys.iter().enumerate() {
         selected = ProjectivePoint::conditional_select(k, &selected, i.ct_eq(&index));
     }
-    if !bool::from(ProjectivePoint::mul_generator(&secret).ct_eq(&selected)) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if !ProjectivePoint::mul_generator(&secret)
+        .ct_eq(&selected)
+        .declassify()
+    {
         return Err(Error::InvalidInput);
     }
 

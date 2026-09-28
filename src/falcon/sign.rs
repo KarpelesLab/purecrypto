@@ -43,6 +43,19 @@ pub(crate) struct ExpandedKey {
     sigmin: Fpr,
 }
 
+impl ExpandedKey {
+    /// Marks the secret basis in FFT form and the LDL tree secret for the
+    /// Valgrind harness. `fft` (public roots of unity), `degree` and
+    /// `sigmin` (a per-degree constant) stay public.
+    #[cfg(feature = "__ct-check")]
+    pub(crate) fn ct_classify(&self) {
+        for v in [&self.a, &self.b, &self.c, &self.d] {
+            crate::ct::classify_val(v.as_slice());
+        }
+        self.tree.ct_classify();
+    }
+}
+
 impl Drop for ExpandedKey {
     fn drop(&mut self) {
         // `b = FFT(−f)` (and `d = FFT(−F)`) is a *lossless* representation of
@@ -178,8 +191,14 @@ pub(crate) fn sign_internal<R: SamplerRng>(
         let mut s1: Vec<i64> = (0..n).map(|i| -v1[i].rint()).collect();
 
         let norm: u64 = s0.iter().chain(s1.iter()).map(|&x| (x * x) as u64).sum();
-        if norm <= sig_bound {
+        // Declassified (Valgrind harness): the norm-bound rejection decision
+        // is public (only the number of attempts is observable, as in the
+        // reference implementation).
+        if crate::ct::declassify_value(norm <= sig_bound) {
             let mut s1_i16: Vec<i16> = s1.iter().map(|&x| x as i16).collect();
+            // Declassified (Valgrind harness): an accepted `s₂` is the
+            // signature, about to be compressed into the output.
+            crate::ct::declassify_val(s1_i16.as_slice());
             let enc = compress(&s1_i16, slen);
             crate::zeroize::Zeroize::zeroize(s1_i16.as_mut_slice());
             if let Some(enc) = enc {

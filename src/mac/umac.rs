@@ -736,7 +736,8 @@ impl Umac64 {
             return false;
         }
         let mut tag = self.finalize(nonce);
-        let ok = bool::from(tag[..].ct_eq(expected));
+        // Declassified (Valgrind harness): the verdict is returned.
+        let ok = tag[..].ct_eq(expected).declassify();
         tag.zeroize();
         ok
     }
@@ -798,7 +799,8 @@ impl Umac128 {
             return false;
         }
         let mut tag = self.finalize(nonce);
-        let ok = bool::from(tag[..].ct_eq(expected));
+        // Declassified (Valgrind harness): the verdict is returned.
+        let ok = tag[..].ct_eq(expected).declassify();
         tag.zeroize();
         ok
     }

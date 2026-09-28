@@ -1023,9 +1023,16 @@ impl HssPrivateKey {
     /// using the deterministic randomizer, and returns the LMS signature.
     fn sign_child(parent: &mut LmsPrivateKey, child: &LmsPrivateKey) -> Result<Vec<u8>, Error> {
         let pk = child.public_key();
+        // Declassified (Valgrind harness): the child public key is published
+        // in every HSS signature (RFC 8554 §6.2), and its digest sets the
+        // parent's (public) LM-OTS chain lengths.
+        crate::ct::declassify(pk.to_bytes());
         parent.prepare_leaf(parent.q)?;
         let q = parent.reserve_leaf()?;
         let c = ots::derive_c(&parent.i_id, &parent.seed, q, pk.to_bytes());
+        // Declassified (Valgrind harness): the deterministic randomizer `C`
+        // is published in the LM-OTS signature (RFC 8554 §4.5).
+        crate::ct::declassify(&c);
         Ok(parent.sign_reserved(q, &c, pk.to_bytes()))
     }
 

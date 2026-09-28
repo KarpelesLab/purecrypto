@@ -352,7 +352,9 @@ impl<C: BlockCipher> AesKwp<C> {
         // Validation succeeded — `mli` is now public (it lives in the
         // authenticated AIV). Bounds (2a/2b/2c) guarantee mli ∈ (padded_len-8,
         // padded_len], so mli_clamped == mli_u32 and the indexing below is safe.
-        let mli = mli_clamped as usize;
+        // Declassified (Valgrind harness): the authenticated plaintext length
+        // is the (public) return value.
+        let mli = crate::ct::declassify_value(mli_clamped) as usize;
         out[..mli].copy_from_slice(&padded[..mli]);
         for b in &mut out[mli..] {
             *b = 0;

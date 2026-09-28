@@ -22,7 +22,7 @@ pub(crate) const LANES: usize = 4;
 /// Whether the multi-buffer SHA-512 backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn supported() -> bool {
-    std::is_x86_feature_detected!("avx2")
+    !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
 }
 
 /// Applies one SHA-512 block compression to each of the four `(state, block)`

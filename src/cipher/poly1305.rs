@@ -275,7 +275,7 @@ mod simd {
     const MASK26: u64 = 0x03ff_ffff;
 
     pub(super) fn supported() -> bool {
-        std::is_x86_feature_detected!("avx2")
+        !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
     }
 
     /// Absorbs `data` (a non-empty multiple of 128 bytes) into `st.h`.

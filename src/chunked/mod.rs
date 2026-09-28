@@ -392,7 +392,8 @@ fn open_header<I: Instantiation>(
 ) -> Result<RawCipher<I>, Error> {
     let salt: &[u8; SALT_LEN] = header[..SALT_LEN].try_into().expect("24-byte salt");
     let (cipher, commitment) = RawCipher::<I>::derive(key, ctx, salt)?;
-    if !bool::from(commitment[..].ct_eq(&header[SALT_LEN..])) {
+    // Declassified (Valgrind harness): the verification verdict is returned.
+    if !commitment[..].ct_eq(&header[SALT_LEN..]).declassify() {
         return Err(Error::CommitmentMismatch);
     }
     Ok(cipher)

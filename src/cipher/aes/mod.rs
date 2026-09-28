@@ -30,6 +30,11 @@ enum AesBackend {
 /// result internally, so this is cheap to call per `Aes*::new()`.
 #[inline]
 fn detect_backend() -> AesBackend {
+    // The constant-time harness can force the portable path (the constant
+    // `false` outside the hidden `__ct-check` feature).
+    if crate::ct::force_portable() {
+        return AesBackend::Software;
+    }
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("aes") {

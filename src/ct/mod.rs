@@ -20,8 +20,10 @@
 //! barrier to discourage the compiler from reintroducing them. The emitted
 //! machine code of these primitives and of the crate's main secret-handling
 //! operations is checked in CI with Valgrind memcheck used as a taint
-//! tracker (`tests/ct_valgrind.rs`, x86_64 and aarch64 release builds; see
-//! `docs/validation.md`). That shows the code is data-oblivious, not that a
+//! tracker (`tests/ct_valgrind.rs`: release builds for x86_64, aarch64, i686
+//! and armv7, with detected and forced-portable CPU dispatch and with and
+//! without the precomputed curve tables; see `docs/validation.md`). That
+//! shows the code is data-oblivious, not that a
 //! given CPU is: variable-latency instructions and microarchitectural
 //! channels remain outside what any such tool can see.
 //!
@@ -44,11 +46,22 @@ mod valgrind;
 #[cfg(feature = "__ct-check")]
 #[doc(hidden)]
 pub use valgrind::{
-    classify, classify_val, declassify, declassify_val, declassify_value, running_on_valgrind,
+    FORCE_PORTABLE_ENV, check_defined_val, classify, classify_val, declassify, declassify_val,
+    declassify_value, force_portable, running_on_valgrind,
 };
 #[cfg(not(feature = "__ct-check"))]
 #[allow(unused_imports)] // which ones are used depends on the feature set
-pub(crate) use valgrind::{declassify, declassify_val, declassify_value};
+pub(crate) use valgrind::{
+    check_defined_val, declassify, declassify_val, declassify_value, force_portable,
+};
+
+/// Test hooks that drive crate-private protocol code (record protection,
+/// key schedules) and classify the heap-held secrets of key types, for the
+/// Valgrind harness. Internal: enabled solely by the hidden `__ct-check`
+/// feature, with no API-stability guarantee whatsoever.
+#[cfg(feature = "__ct-check")]
+#[doc(hidden)]
+pub mod hooks;
 
 pub use eq::ConstantTimeEq;
 pub use negate::ConditionallyNegatable;

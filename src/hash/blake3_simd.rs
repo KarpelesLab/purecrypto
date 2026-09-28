@@ -28,7 +28,7 @@ pub(super) const DEGREE16: usize = 16;
 /// Whether the AVX-512 BLAKE3 backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn supported16() -> bool {
-    std::is_x86_feature_detected!("avx512f")
+    !crate::ct::force_portable() && std::is_x86_feature_detected!("avx512f")
 }
 
 /// Compresses `DEGREE16` consecutive full 1024-byte chunks in parallel.
@@ -57,7 +57,7 @@ pub(super) fn hash_chunks16(
 /// Whether the AVX2 BLAKE3 backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn supported() -> bool {
-    std::is_x86_feature_detected!("avx2")
+    !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
 }
 
 /// Compresses `DEGREE` consecutive full 1024-byte chunks in parallel.

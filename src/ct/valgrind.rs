@@ -35,17 +35,51 @@
 //! execute and change nothing, so the default result is returned. The
 //! sequences and register assignments below are transcribed from
 //! `VALGRIND_DO_CLIENT_REQUEST_EXPR` in Valgrind's `include/valgrind.h` for
-//! `PLAT_amd64_linux` and `PLAT_arm64_linux`; the request numbers from the
-//! `VG_USERREQ__*` enum in `memcheck/memcheck.h`. That keeps the crate free of
-//! foreign code: no C header, no build script, no dependency.
+//! `PLAT_amd64_linux`, `PLAT_x86_linux`, `PLAT_arm64_linux` and
+//! `PLAT_arm_linux`; the request numbers from the `VG_USERREQ__*` enum in
+//! `memcheck/memcheck.h`. That keeps the crate free of foreign code: no C
+//! header, no build script, no dependency.
 //!
 //! Without `__ct-check`, or on any other architecture, every function here is
 //! an empty `#[inline(always)]` body, so the library's declassification
 //! points compile to nothing.
+//!
+//! [`force_portable`] is the harness's other hook: a switch, read once from
+//! the environment, that makes every runtime CPU-dispatch site take its
+//! portable backend so those kernels are checked too. It is the constant
+//! `false` without the feature.
+
+/// Whether the client requests are live: the feature is on and the target is
+/// one whose client-request ABI is transcribed below.
+const ACTIVE: bool = cfg!(all(
+    feature = "__ct-check",
+    any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm"
+    )
+));
+
+/// `VG_USERREQ_TOOL_BASE('M', 'C')`: `('M' << 24) | ('C' << 16)`.
+const MC_BASE: usize = ((b'M' as usize) << 24) | ((b'C' as usize) << 16);
+/// `VG_USERREQ__MAKE_MEM_UNDEFINED` (memcheck.h: base + 1).
+const MAKE_MEM_UNDEFINED: usize = MC_BASE + 1;
+/// `VG_USERREQ__MAKE_MEM_DEFINED` (memcheck.h: base + 2).
+const MAKE_MEM_DEFINED: usize = MC_BASE + 2;
+/// `VG_USERREQ__CHECK_MEM_IS_DEFINED` (memcheck.h: base + 5).
+const CHECK_MEM_IS_DEFINED: usize = MC_BASE + 5;
+/// `VG_USERREQ__RUNNING_ON_VALGRIND` (valgrind.h core request).
+const RUNNING_ON_VALGRIND: usize = 0x1001;
 
 #[cfg(all(
     feature = "__ct-check",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm"
+    )
 ))]
 mod imp {
     //! The only `unsafe` in this module: the client-request instruction
@@ -53,23 +87,18 @@ mod imp {
     //! is given and nothing else; it never dereferences the addresses it
     //! forwards to Valgrind (Valgrind only updates its shadow memory for
     //! them). Outside Valgrind it is a sequence of no-op instructions. The
-    //! `#[allow(unsafe_code)]` is scoped to the two `asm!` blocks, matching
-    //! the crate's `unsafe_code = "deny"` policy of local opt-ins.
-
-    /// `VG_USERREQ_TOOL_BASE('M', 'C')`: `('M' << 24) | ('C' << 16)`.
-    const MC_BASE: u64 = ((b'M' as u64) << 24) | ((b'C' as u64) << 16);
-    /// `VG_USERREQ__MAKE_MEM_UNDEFINED` (memcheck.h: base + 1).
-    pub(super) const MAKE_MEM_UNDEFINED: u64 = MC_BASE + 1;
-    /// `VG_USERREQ__MAKE_MEM_DEFINED` (memcheck.h: base + 2).
-    pub(super) const MAKE_MEM_DEFINED: u64 = MC_BASE + 2;
-    /// `VG_USERREQ__RUNNING_ON_VALGRIND` (valgrind.h core request).
-    pub(super) const RUNNING_ON_VALGRIND: u64 = 0x1001;
+    //! `#[allow(unsafe_code)]` is scoped to the `asm!` blocks, matching the
+    //! crate's `unsafe_code = "deny"` policy of local opt-ins.
+    //!
+    //! The argument words are machine words: valgrind.h declares them
+    //! `unsigned long` on the 64-bit platforms and `unsigned int` on
+    //! `PLAT_x86_linux` / `PLAT_arm_linux`, i.e. `usize` on each.
 
     /// Issues one client request; returns `default` when not under Valgrind.
     #[inline(never)]
-    pub(super) fn client_request(default: u64, request: u64, a1: u64, a2: u64) -> u64 {
-        let args: [u64; 6] = [request, a1, a2, 0, 0, 0];
-        let result: u64;
+    pub(super) fn client_request(default: usize, request: usize, a1: usize, a2: usize) -> usize {
+        let args: [usize; 6] = [request, a1, a2, 0, 0, 0];
+        let result: usize;
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the rotations of `rdi` by 3+13+61+51 = 128 bits leave it
         // unchanged and `xchg rbx, rbx` is a no-op, so on hardware the block
@@ -88,6 +117,26 @@ mod imp {
                 in("rax") args.as_ptr(),
                 inout("rdx") default => result,
                 out("rdi") _,
+                options(nostack),
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        // SAFETY: `PLAT_x86_linux`: the rotations of `edi` by 3+13+29+19 = 64
+        // bits leave it unchanged and `xchg ebx, ebx` is a no-op, so on
+        // hardware the block only moves `default` through `edx`. Under
+        // Valgrind, the tool reads `args` through `eax` and writes the result
+        // to `edx`. `edi` is declared clobbered anyway.
+        #[allow(unsafe_code)]
+        unsafe {
+            core::arch::asm!(
+                "rol edi, 3",
+                "rol edi, 13",
+                "rol edi, 29",
+                "rol edi, 19",
+                "xchg ebx, ebx",
+                in("eax") args.as_ptr(),
+                inout("edx") default => result,
+                out("edi") _,
                 options(nostack),
             );
         }
@@ -111,47 +160,63 @@ mod imp {
                 options(nostack),
             );
         }
+        #[cfg(target_arch = "arm")]
+        // SAFETY: `PLAT_arm_linux`: the rotations of `r12` by 3+13+29+19 = 64
+        // bits leave it unchanged and `orr r10, r10, r10` is a no-op, so on
+        // hardware the block only moves `default` through `r3`. Under
+        // Valgrind, the tool reads `args` through `r4` and writes the result
+        // to `r3`. `r12` is declared clobbered anyway.
+        #[allow(unsafe_code)]
+        unsafe {
+            core::arch::asm!(
+                "mov r12, r12, ror #3",
+                "mov r12, r12, ror #13",
+                "mov r12, r12, ror #29",
+                "mov r12, r12, ror #19",
+                "orr r10, r10, r10",
+                in("r4") args.as_ptr(),
+                inout("r3") default => result,
+                out("r12") _,
+                options(nostack),
+            );
+        }
         // Keep `args` alive (and in memory) across the asm block.
         core::hint::black_box(&args);
         result
     }
 }
 
+#[cfg(not(all(
+    feature = "__ct-check",
+    any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm"
+    )
+)))]
+mod imp {
+    /// No client-request ABI (or the feature is off): every request returns
+    /// its default, exactly as it does natively.
+    #[inline(always)]
+    pub(super) fn client_request(default: usize, _req: usize, _a1: usize, _a2: usize) -> usize {
+        default
+    }
+}
+
 /// Marks `len` bytes at `ptr` as secret (memcheck "undefined").
 #[inline(always)]
 fn mark_undefined(ptr: *const u8, len: usize) {
-    #[cfg(all(
-        feature = "__ct-check",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    {
-        imp::client_request(0, imp::MAKE_MEM_UNDEFINED, ptr as u64, len as u64);
-    }
-    #[cfg(not(all(
-        feature = "__ct-check",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
-    {
-        let _ = (ptr, len);
+    if ACTIVE {
+        imp::client_request(0, MAKE_MEM_UNDEFINED, ptr as usize, len);
     }
 }
 
 /// Marks `len` bytes at `ptr` as public (memcheck "defined").
 #[inline(always)]
 fn mark_defined(ptr: *const u8, len: usize) {
-    #[cfg(all(
-        feature = "__ct-check",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    {
-        imp::client_request(0, imp::MAKE_MEM_DEFINED, ptr as u64, len as u64);
-    }
-    #[cfg(not(all(
-        feature = "__ct-check",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
-    {
-        let _ = (ptr, len);
+    if ACTIVE {
+        imp::client_request(0, MAKE_MEM_DEFINED, ptr as usize, len);
     }
 }
 
@@ -159,8 +224,8 @@ fn mark_defined(ptr: *const u8, len: usize) {
 /// or memory index later computed from them is reported as an error.
 ///
 /// A no-op outside Valgrind, without the `__ct-check` feature, and on
-/// architectures other than x86_64 and aarch64. Only the address is passed
-/// to Valgrind; the bytes themselves are never read or written.
+/// architectures other than x86_64, x86, aarch64 and arm. Only the address
+/// is passed to Valgrind; the bytes themselves are never read or written.
 #[inline(always)]
 pub fn classify(secret: &[u8]) {
     mark_undefined(secret.as_ptr(), secret.len());
@@ -195,6 +260,22 @@ pub fn declassify_val<T: ?Sized>(value: &T) {
     );
 }
 
+/// Asks memcheck to report (as an error, with the origin of the taint) any
+/// secret byte in the in-memory representation of `value`. A debugging aid
+/// for the harness: it pins *where* a value became tainted without waiting
+/// for the branch that consumes it. No-op outside Valgrind.
+#[inline(always)]
+pub fn check_defined_val<T: ?Sized>(value: &T) {
+    if ACTIVE {
+        imp::client_request(
+            0,
+            CHECK_MEM_IS_DEFINED,
+            (value as *const T).cast::<u8>() as usize,
+            core::mem::size_of_val(value),
+        );
+    }
+}
+
 /// Returns `value`, marked public.
 ///
 /// This is the library-side declassification point: wrap a value that is
@@ -205,23 +286,14 @@ pub fn declassify_val<T: ?Sized>(value: &T) {
 /// public; never use it to silence a real finding.
 #[inline(always)]
 pub fn declassify_value<T: Copy>(value: T) -> T {
-    #[cfg(all(
-        feature = "__ct-check",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    {
+    if ACTIVE {
         // Spill to memory so the request covers it, then reload: the asm
         // block may (as far as the compiler knows) have written the slot, so
         // the reload reads the now-defined bytes rather than a stale register.
         let slot = value;
         declassify_val(&slot);
         core::hint::black_box(slot)
-    }
-    #[cfg(not(all(
-        feature = "__ct-check",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
-    {
+    } else {
         value
     }
 }
@@ -230,19 +302,46 @@ pub fn declassify_value<T: Copy>(value: T) -> T {
 /// natively, the Valgrind nesting depth otherwise. Always `0` without
 /// `__ct-check` or on unsupported architectures.
 #[inline(always)]
-pub fn running_on_valgrind() -> u64 {
-    #[cfg(all(
-        feature = "__ct-check",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    {
-        imp::client_request(0, imp::RUNNING_ON_VALGRIND, 0, 0)
-    }
-    #[cfg(not(all(
-        feature = "__ct-check",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
-    {
+pub fn running_on_valgrind() -> usize {
+    if ACTIVE {
+        imp::client_request(0, RUNNING_ON_VALGRIND, 0, 0)
+    } else {
         0
+    }
+}
+
+/// The environment variable that, set to `1`, makes [`force_portable`]
+/// return `true`.
+pub const FORCE_PORTABLE_ENV: &str = "PURECRYPTO_CT_FORCE_PORTABLE";
+
+/// Whether runtime CPU dispatch must ignore the detected CPU features and
+/// run the portable (scalar, table-free) backend.
+///
+/// Only the constant-time harness uses this. The CI runners have AES-NI /
+/// PMULL / AVX2 / the SHA extensions, so without it the portable AES, GHASH,
+/// ChaCha20, Poly1305, SHA-1/2, BLAKE3 and Keccak kernels would never run
+/// under memcheck there. It reads [`FORCE_PORTABLE_ENV`] once and caches the
+/// answer. Without `__ct-check` (or without `std`) it is the constant
+/// `false`, so every dispatch site compiles exactly as before.
+#[inline]
+pub fn force_portable() -> bool {
+    #[cfg(all(feature = "__ct-check", feature = "std"))]
+    {
+        use core::sync::atomic::{AtomicU8, Ordering};
+        // 0 = not read yet, 1 = detected dispatch, 2 = forced portable.
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        match STATE.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let on = std::env::var_os(FORCE_PORTABLE_ENV).is_some_and(|v| v == "1");
+                STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+    #[cfg(not(all(feature = "__ct-check", feature = "std")))]
+    {
+        false
     }
 }

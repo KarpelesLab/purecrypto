@@ -366,7 +366,11 @@ impl<C: BlockCipher, const ITER: usize> VmacInner<C, ITER> {
             accepted += ok & 1;
         }
         buf.zeroize();
-        if accepted < ITER as u64 {
+        // Declassified (Valgrind harness): whether the masked window produced
+        // every L3 key is public by construction — a candidate is rejected
+        // with probability 2⁻⁵⁶ (draft-krovetz-vmac-01 §5.2's `k1, k2 < p64`
+        // rule), so the count says nothing about the key.
+        if crate::ct::declassify_value(accepted < ITER as u64) {
             Self::l3_keys_tail(cipher, &mut out, accepted as usize);
         }
         out
@@ -569,7 +573,8 @@ macro_rules! vmac_type {
                 let Ok(mut tag) = self.finalize(nonce) else {
                     return false;
                 };
-                let ok = bool::from(tag[..].ct_eq(expected));
+                // Declassified (Valgrind harness): the verdict is returned.
+                let ok = tag[..].ct_eq(expected).declassify();
                 tag.zeroize();
                 ok
             }

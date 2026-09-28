@@ -14,14 +14,15 @@
 /// Whether a hardware SHA-256 backend is available.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn sha256_supported() -> bool {
-    std::is_x86_feature_detected!("sha")
+    !crate::ct::force_portable()
+        && std::is_x86_feature_detected!("sha")
         && std::is_x86_feature_detected!("sse2")
         && std::is_x86_feature_detected!("ssse3")
         && std::is_x86_feature_detected!("sse4.1")
 }
 #[cfg(target_arch = "aarch64")]
 pub(super) fn sha256_supported() -> bool {
-    std::arch::is_aarch64_feature_detected!("sha2")
+    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha2")
 }
 
 /// SHA-256 compression of one 64-byte block, dispatched to the active backend.
@@ -66,7 +67,7 @@ pub(super) unsafe fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
 #[cfg(target_arch = "aarch64")]
 pub(super) fn sha512_supported() -> bool {
     // The SHA512 instructions are reported under the FEAT_SHA512 / "sha3" gate.
-    std::arch::is_aarch64_feature_detected!("sha3")
+    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha3")
 }
 
 /// SHA-512 compression of one 128-byte block (aarch64 hardware only; never
@@ -91,14 +92,15 @@ pub(super) unsafe fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
 /// SHA-1 dispatch is a different call site.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn sha1_supported() -> bool {
-    std::is_x86_feature_detected!("sha")
+    !crate::ct::force_portable()
+        && std::is_x86_feature_detected!("sha")
         && std::is_x86_feature_detected!("sse2")
         && std::is_x86_feature_detected!("ssse3")
         && std::is_x86_feature_detected!("sse4.1")
 }
 #[cfg(target_arch = "aarch64")]
 pub(super) fn sha1_supported() -> bool {
-    std::arch::is_aarch64_feature_detected!("sha2")
+    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha2")
 }
 
 /// SHA-1 compression of one 64-byte block, dispatched to the active backend.

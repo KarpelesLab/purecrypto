@@ -310,8 +310,10 @@ impl<const LIMBS: usize> Uint<LIMBS> {
     /// the borrow never fires — so the precondition is checked rather than
     /// returning garbage.)
     pub fn reduce(&self, modulus: &Self) -> Self {
+        // Declassified (Valgrind harness): whether the modulus is zero is a
+        // public structural fact (a panic), as for `BoxedUint`.
         assert!(
-            !bool::from(modulus.is_zero()),
+            !modulus.is_zero().declassify(),
             "Uint::reduce: modulus must be nonzero"
         );
         let mut r = Self::ZERO;

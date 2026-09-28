@@ -343,17 +343,23 @@ fn parse_tagged(f: &Field, bytes: &[u8; 33], tag: u8) -> Result<AffinePoint, Err
     let mut x_bytes = [0u8; 32];
     x_bytes.copy_from_slice(&bytes[1..]);
     let x = Fe::from_be_bytes(&x_bytes);
-    if !bool::from(x.ct_lt(f.p())) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if !x.ct_lt(f.p()).declassify() {
         return Err(Error::InvalidInput);
     }
     let rhs = f.curve_rhs(&x);
     // The principal root is the residue root; negate it when the prefix asks
     // for the non-residue one.
     let root = f.sqrt(&rhs);
-    if !bool::from(f.sqr(&root).ct_eq(&rhs)) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if !f.sqr(&root).ct_eq(&rhs).declassify() {
         return Err(Error::InvalidInput);
     }
-    if bool::from(root.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if root.is_zero().declassify() {
         // y = 0 would be a point of order two; secp256k1's group order is an
         // odd prime, so no such point exists. Defensive.
         return Err(Error::InvalidInput);
@@ -425,7 +431,9 @@ fn shallue_van_de_woestijne(f: &Field, t: &Fe) -> Result<(Fe, Fe), Error> {
     // The sign of y follows the parity of t.
     y = Fe::conditional_select(&f.neg(&y), &y, t.is_odd());
 
-    if bool::from(pick1 | pick2 | pick3) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if (pick1 | pick2 | pick3).declassify() {
         Ok((x, y))
     } else {
         Err(Error::InvalidInput)

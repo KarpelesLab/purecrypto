@@ -20,7 +20,8 @@ pub(super) use x86::{ctr_ghash_fused, gf_mul, ghash_blocks};
 /// Whether a hardware GHASH backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn supported() -> bool {
-    std::is_x86_feature_detected!("pclmulqdq")
+    !crate::ct::force_portable()
+        && std::is_x86_feature_detected!("pclmulqdq")
         && std::is_x86_feature_detected!("sse2")
         && std::is_x86_feature_detected!("ssse3")
 }
@@ -28,7 +29,8 @@ pub(super) fn supported() -> bool {
 #[cfg(target_arch = "aarch64")]
 pub(super) fn supported() -> bool {
     // FEAT_PMULL (the 64→128 polynomial multiply) is reported under "aes".
-    std::arch::is_aarch64_feature_detected!("aes")
+    !crate::ct::force_portable()
+        && std::arch::is_aarch64_feature_detected!("aes")
         && std::arch::is_aarch64_feature_detected!("neon")
 }
 

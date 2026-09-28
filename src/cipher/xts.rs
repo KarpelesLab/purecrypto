@@ -327,7 +327,8 @@ macro_rules! xts_byte_key_ctors {
             /// is constant time, so it reveals nothing about the keys beyond
             /// the verdict.
             pub fn from_keys(k1: &[u8; $half], k2: &[u8; $half]) -> Result<Self, XtsError> {
-                if bool::from(k1.ct_eq(k2)) {
+                // Declassified (Valgrind harness): the verdict is returned.
+                if k1.ct_eq(k2).declassify() {
                     return Err(XtsError::RepeatedKey);
                 }
                 Ok(Self::new(<$cipher>::new(k1), <$cipher>::new(k2)))

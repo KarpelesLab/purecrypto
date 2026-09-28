@@ -360,12 +360,23 @@ pub(crate) fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
         cur_end = usize::conditional_select(&(i + 1), &cur_end, nonzero);
         found_any |= nonzero;
     }
-    if !bool::from(found_any) {
+    // Declassified (Valgrind harness): an all-zero inner plaintext is a
+    // protocol violation answered with an alert, so whether one was found
+    // is public.
+    if !found_any.declassify() {
         return Err(Error::PeerMisbehaved);
     }
     // `cur_end` is the index immediately after the content-type byte;
     // truncating to `cur_end - 1` drops the type byte and the padding.
-    Ok((cur_byte, cur_end - 1))
+    // Declassified (Valgrind harness): the true content type and length are
+    // this function's outputs — the engine dispatches on the type and every
+    // later step (handshake parsing, delivery to the application) is shaped
+    // by the length. What must not leak is the time taken to *find* them,
+    // which the scan above keeps independent of the padding.
+    Ok((
+        crate::ct::declassify_value(cur_byte),
+        crate::ct::declassify_value(cur_end) - 1,
+    ))
 }
 
 #[cfg(test)]

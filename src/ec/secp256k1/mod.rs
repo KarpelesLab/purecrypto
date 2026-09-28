@@ -115,7 +115,8 @@ impl Scalar {
     /// Returns [`Error::InvalidInput`] if the encoded value is not `< n`.
     pub fn from_bytes_be(bytes: &[u8; 32]) -> Result<Scalar, Error> {
         let v = Fe::from_be_bytes(bytes);
-        if bool::from(v.ct_lt(&Self::order())) {
+        // Declassified (Valgrind harness): the range verdict is returned.
+        if v.ct_lt(&Self::order()).declassify() {
             Ok(Scalar(v))
         } else {
             Err(Error::InvalidInput)

@@ -155,7 +155,12 @@ fn ber_exp<R: SamplerRng>(x: Fpr, ccs: Fpr, rng: &mut R) -> bool {
         let mut b = [0u8; 1];
         rng.next_bytes(&mut b);
         let w = (b[0] as i32) - (((z >> i) & 0xFF) as i32);
-        if w != 0 {
+        // Declassified (Valgrind harness): the loop continues iff the fresh
+        // uniform byte equals the threshold byte, which has probability
+        // exactly 1/256 whatever that byte is, so the number of bytes read
+        // is independent of the secret (as in the reference BerExp). The
+        // outcome `w < 0` stays secret.
+        if crate::ct::declassify_value(w != 0) {
             return w < 0;
         }
         i -= 8;
@@ -183,7 +188,12 @@ pub(crate) fn sampler_z<R: SamplerRng>(mu: Fpr, sigma: Fpr, sigmin: Fpr, rng: &m
         // x = (z−r)²·dss − z0²·(1/(2σ_max²)).
         let zr = Fpr::of_i64(z).sub(r);
         let x = zr.mul(zr).mul(dss).sub(Fpr::of_i64(z0 * z0).mul(inv2s2));
-        if ber_exp(x, ccs, rng) {
+        // Declassified (Valgrind harness): the sampler is isochronous — the
+        // `ccs = σ_min / σ'` factor makes the acceptance probability
+        // independent of the centre and of σ' (Howe, Prest, Ricosset, Rossi,
+        // "Isochronous Gaussian sampling", PQCrypto 2020) — so the iteration
+        // count is public. The accepted `z` stays secret.
+        if crate::ct::declassify_value(ber_exp(x, ccs, rng)) {
             return z + s;
         }
     }

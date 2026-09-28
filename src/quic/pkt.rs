@@ -446,6 +446,12 @@ pub(crate) fn remove_header_protection(
 ) -> Result<u8, Error> {
     let first_byte_mask = if long_header { 0x0f } else { 0x1f };
     packet[0] ^= mask[0] & first_byte_mask;
+    // Declassified (Valgrind harness), here and for the packet-number bytes
+    // below: header protection hides the packet-number length, key phase
+    // and packet number from on-path observers only (RFC 9001 §5.4); the
+    // receiving endpoint recovers them by design to parse the packet and
+    // pick its keys and nonce.
+    crate::ct::declassify(&packet[..1]);
     let pn_len = (packet[0] & 0x03) + 1;
     if (pn_len as usize) > 4 || packet.len() < pn_offset + pn_len as usize {
         return Err(Error::Decode);
@@ -453,6 +459,7 @@ pub(crate) fn remove_header_protection(
     for i in 0..pn_len as usize {
         packet[pn_offset + i] ^= mask[1 + i];
     }
+    crate::ct::declassify(&packet[pn_offset..pn_offset + pn_len as usize]);
     Ok(pn_len)
 }
 

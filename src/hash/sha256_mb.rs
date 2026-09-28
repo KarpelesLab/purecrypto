@@ -31,7 +31,9 @@ pub(crate) const LANES16: usize = 16;
 /// zmm register, which is a BW instruction.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn supported16() -> bool {
-    std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+    !crate::ct::force_portable()
+        && std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512bw")
 }
 
 /// Applies one SHA-256 block compression to each of the sixteen
@@ -54,7 +56,7 @@ pub(crate) fn compress16(states: &mut [[u32; 8]; LANES16], blocks: &[[u8; 64]; L
 /// Whether the multi-buffer SHA-256 backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn supported() -> bool {
-    std::is_x86_feature_detected!("avx2")
+    !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
 }
 
 /// Applies one SHA-256 block compression to each of the eight `(state, block)`

@@ -297,6 +297,9 @@ impl Jws {
         input.push('.');
         input.push_str(&base64url::encode(payload));
         let signature = sign_raw(alg, key, input.as_bytes(), rng)?;
+        // Declassified (Valgrind harness): the signature (or MAC tag) is the
+        // JWS's public output, about to be base64url-encoded into it.
+        crate::ct::declassify(&signature);
         input.push('.');
         input.push_str(&base64url::encode(&signature));
         Ok(input)
@@ -309,7 +312,8 @@ fn hmac_verify<D: Digest>(key: &[u8], input: &[u8], sig: &[u8]) -> Result<(), Er
     }
     let mut h = Hmac::<D>::new(key);
     h.update(input);
-    if bool::from(h.verify(sig)) {
+    // Declassified (Valgrind harness): the verification verdict is returned.
+    if h.verify(sig).declassify() {
         Ok(())
     } else {
         Err(Error::Verification)

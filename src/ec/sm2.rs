@@ -335,7 +335,9 @@ impl Sm2PublicKey {
             // An empty plaintext has an empty key stream, so the accumulator is
             // trivially zero and the retry would never terminate; the zero-key
             // rule only makes sense for a stream that actually masks something.
-            if !msg.is_empty() && bool::from(acc.ct_eq(&0)) {
+            // Declassified (Valgrind harness): the all-zero key-stream retry is
+            // the standard's public rejection rule.
+            if !msg.is_empty() && acc.ct_eq(&0).declassify() {
                 wipe(&mut z);
                 wipe(&mut t);
                 x2.zeroize();
@@ -554,7 +556,9 @@ impl Sm2PrivateKey {
         for &b in &t {
             acc |= b;
         }
-        let result = if !c2.is_empty() && bool::from(acc.ct_eq(&0)) {
+        // Declassified (Valgrind harness), here and for `u == C3` below: the
+        // verdicts are returned as errors.
+        let result = if !c2.is_empty() && acc.ct_eq(&0).declassify() {
             Err(Error::InvalidInput)
         } else {
             let mut msg: Vec<u8> = c2.iter().zip(&t).map(|(c, k)| c ^ k).collect();
@@ -565,7 +569,7 @@ impl Sm2PrivateKey {
             h.update(&msg);
             h.update(&z[32..]);
             let u = h.finalize();
-            if bool::from(u.as_ref().ct_eq(c3)) {
+            if u.as_ref().ct_eq(c3).declassify() {
                 Ok(msg)
             } else {
                 // A rejected decryption must not leak the candidate plaintext.

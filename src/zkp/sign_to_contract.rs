@@ -255,7 +255,9 @@ fn rfc6979_nonce(seckey: &[u8; 32], msg32_reduced: &[u8; 32], aux: &[u8; 32]) ->
         // it into yet another buffer.
         let parsed = Scalar::from_bytes_be(&v);
         if let Ok(scalar) = parsed
-            && !bool::from(scalar.is_zero())
+            // Declassified (Valgrind harness): a public verdict (an error return or
+            // a rejected candidate).
+            && !scalar.is_zero().declassify()
         {
             break scalar;
         }
@@ -324,7 +326,9 @@ pub fn sign_with_commitment(
     // private key `d` and both nonces `k1` / `k2` are zeroized on every exit
     // path below, including the early `?` returns.
     let d = Scalar::from_bytes_be(seckey)?;
-    if bool::from(d.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if d.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
     let z = Scalar::from_bytes_be_reduce(msg32);
@@ -338,7 +342,9 @@ pub fn sign_with_commitment(
 
     // k2 = k1 + H(ser(R1) ‖ data); R2 = k2·G = R1 + H(ser(R1) ‖ data)·G.
     let k2 = k1.add(&nonce_tweak(&r1_ser, data32));
-    if bool::from(k2.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if k2.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
     let r2 = ProjectivePoint::mul_generator(&k2)
@@ -346,7 +352,9 @@ pub fn sign_with_commitment(
         .ok_or(Error::InvalidInput)?;
 
     let r = Scalar::from_bytes_be_reduce(&r2.x_bytes());
-    if bool::from(r.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if r.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
 
@@ -354,7 +362,9 @@ pub fn sign_with_commitment(
     // nonce — `Scalar::invert` is Fermat over the constant-time ladder, not a
     // variable-time extended Euclid (Brumley–Tuveri).
     let s = k2.invert().mul(&z.add(&r.mul(&d)));
-    if bool::from(s.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if s.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
 
@@ -363,7 +373,9 @@ pub fn sign_with_commitment(
     // signing path free of secret-dependent control flow by construction.
     let s_be = s.to_bytes_be();
     let neg_be = s.negate().to_bytes_be();
-    let high = ct_gt_mask(&s_be, &HALF_ORDER);
+    // Declassified (Valgrind harness): `s` and the negation flag are public
+    // outputs (the flag is published in the opening).
+    let high = crate::ct::declassify_value(ct_gt_mask(&s_be, &HALF_ORDER));
 
     let mut sig = [0u8; 64];
     sig[..32].copy_from_slice(&r.to_bytes_be());
@@ -404,7 +416,9 @@ pub fn verify_commitment(
     // Reject non-canonical (r, s) exactly as a compact-signature parser would.
     let r_scalar = Scalar::from_bytes_be(&r).map_err(|_| Error::Verification)?;
     let s_scalar = Scalar::from_bytes_be(&s).map_err(|_| Error::Verification)?;
-    if bool::from(r_scalar.is_zero()) || bool::from(s_scalar.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if r_scalar.is_zero().declassify() || s_scalar.is_zero().declassify() {
         return Err(Error::Verification);
     }
 
@@ -418,7 +432,9 @@ pub fn verify_commitment(
         .ok_or(Error::Verification)?;
 
     let computed = Scalar::from_bytes_be_reduce(&r2.x_bytes()).to_bytes_be();
-    if bool::from(computed.ct_eq(&r)) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if computed.ct_eq(&r).declassify() {
         Ok(())
     } else {
         Err(Error::Verification)
@@ -447,7 +463,9 @@ pub fn verify_signature(pubkey: &[u8; 33], msg32: &[u8; 32], sig: &[u8; 64]) -> 
 
     let r_scalar = Scalar::from_bytes_be(&r).map_err(|_| Error::Verification)?;
     let s_scalar = Scalar::from_bytes_be(&s).map_err(|_| Error::Verification)?;
-    if bool::from(r_scalar.is_zero()) || bool::from(s_scalar.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if r_scalar.is_zero().declassify() || s_scalar.is_zero().declassify() {
         return Err(Error::Verification);
     }
     let q = AffinePoint::from_sec1(pubkey).map_err(|_| Error::Verification)?;
@@ -460,7 +478,9 @@ pub fn verify_signature(pubkey: &[u8; 33], msg32: &[u8; 32], sig: &[u8; 64]) -> 
     let point = ProjectivePoint::mul_generator(&u1).add(&q.to_projective().mul(&u2));
     let affine = point.to_affine().ok_or(Error::Verification)?;
     let v = Scalar::from_bytes_be_reduce(&affine.x_bytes()).to_bytes_be();
-    if bool::from(v.ct_eq(&r)) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if v.ct_eq(&r).declassify() {
         Ok(())
     } else {
         Err(Error::Verification)
@@ -473,7 +493,9 @@ pub fn verify_signature(pubkey: &[u8; 33], msg32: &[u8; 32], sig: &[u8; 64]) -> 
 /// [`Error::InvalidInput`] if `seckey` is not a valid scalar in `[1, n)`.
 pub fn public_key(seckey: &[u8; 32]) -> Result<[u8; 33], Error> {
     let d = Scalar::from_bytes_be(seckey)?;
-    if bool::from(d.is_zero()) {
+    // Declassified (Valgrind harness): a public verdict (an error return or
+    // a rejected candidate).
+    if d.is_zero().declassify() {
         return Err(Error::InvalidInput);
     }
     Ok(ProjectivePoint::mul_generator(&d)

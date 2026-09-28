@@ -40,6 +40,21 @@ pub(crate) enum FftTree {
 }
 
 impl FftTree {
+    /// Marks every node's secret values (the `L₁₀` factors and the leaf
+    /// deviations) secret for the Valgrind harness; the tree's shape and
+    /// its pointers stay public.
+    #[cfg(feature = "__ct-check")]
+    pub(crate) fn ct_classify(&self) {
+        match self {
+            FftTree::Leaf(sigma) => crate::ct::classify_val(sigma),
+            FftTree::Node { l10, left, right } => {
+                crate::ct::classify_val(l10.as_slice());
+                left.ct_classify();
+                right.ct_classify();
+            }
+        }
+    }
+
     /// Overwrite the whole tree with zeros.
     ///
     /// Every node is a function of the secret basis `(f, g, F, G)` — the `L₁₀`

@@ -32,7 +32,7 @@ const MAX_STATE: usize = 25 * LANES8;
 
 /// Whether the 8-way Keccak backend is available on this CPU.
 pub(crate) fn supported8() -> bool {
-    std::is_x86_feature_detected!("avx512f")
+    !crate::ct::force_portable() && std::is_x86_feature_detected!("avx512f")
 }
 
 /// Keccak-p[1600, `rounds`] applied to eight interleaved states: lane `i` of
@@ -56,7 +56,7 @@ pub(crate) const MAX_RATE: usize = 168;
 
 /// Whether the 4-way Keccak backend is available on this CPU.
 pub(crate) fn supported() -> bool {
-    std::is_x86_feature_detected!("avx2")
+    !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
 }
 
 /// Keccak-p[1600, `rounds`] applied to four interleaved states: lane `i` of

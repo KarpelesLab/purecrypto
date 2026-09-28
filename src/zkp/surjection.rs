@@ -251,7 +251,9 @@ fn random_scalar<R: RngCore + CryptoRng>(rng: &mut R) -> Result<Scalar, Error> {
         let candidate = Scalar::from_bytes_be(&b);
         b.zeroize();
         if let Ok(s) = candidate
-            && !bool::from(s.is_zero())
+            // Declassified (Valgrind harness): a public verdict (an error return or
+            // a rejected candidate).
+            && !s.is_zero().declassify()
         {
             return Ok(s);
         }
@@ -414,7 +416,9 @@ impl SurjectionProof {
         // With no matching input no draw can ever succeed; fail now rather
         // than after `max_iterations` fruitless attempts.
         let any = matches.iter().fold(Choice::from(0), |acc, &hit| acc | hit);
-        if !bool::from(any) {
+        // Declassified (Valgrind harness): a public verdict (an error return or
+        // a rejected candidate).
+        if !any.declassify() {
             return Err(Error::InvalidInput);
         }
 
@@ -452,7 +456,9 @@ impl SurjectionProof {
                 index = usize::conditional_select(&i, &index, hit);
                 found |= hit;
             }
-            if bool::from(found) {
+            // Declassified (Valgrind harness): a public verdict (an error return or
+            // a rejected candidate).
+            if found.declassify() {
                 return Ok((
                     SurjectionProof {
                         n_inputs: n,
@@ -563,7 +569,11 @@ impl SurjectionProof {
     ) -> Result<(), Error> {
         let used = self.used_inputs();
         let ring = used.len();
-        if input_generators.len() != self.n_inputs || ring == 0 || input_index >= self.n_inputs {
+        // Declassified (Valgrind harness): an argument-validation verdict.
+        if input_generators.len() != self.n_inputs
+            || ring == 0
+            || crate::ct::declassify_value(input_index >= self.n_inputs)
+        {
             return Err(Error::InvalidInput);
         }
 
@@ -586,7 +596,9 @@ impl SurjectionProof {
             pos = usize::conditional_select(&j, &pos, hit);
             found |= hit;
         }
-        if !bool::from(found) {
+        // Declassified (Valgrind harness): a public verdict (an error return or
+        // a rejected candidate).
+        if !found.declassify() {
             return Err(Error::InvalidInput);
         }
 
@@ -596,7 +608,12 @@ impl SurjectionProof {
         for (j, k) in keys.iter().enumerate() {
             selected = ProjectivePoint::conditional_select(k, &selected, j.ct_eq(&pos));
         }
-        if !bool::from(ProjectivePoint::mul_generator(&secret).ct_eq(&selected)) {
+        // Declassified (Valgrind harness): a public verdict (an error return or
+        // a rejected candidate).
+        if !ProjectivePoint::mul_generator(&secret)
+            .ct_eq(&selected)
+            .declassify()
+        {
             return Err(Error::InvalidInput);
         }
 
@@ -744,7 +761,9 @@ impl SurjectionProof {
                 e = challenge(&r, &m, 0, (j + 1) as u32);
             }
         }
-        if bool::from(close(&r, &m).ct_eq(&self.e0)) {
+        // Declassified (Valgrind harness): a public verdict (an error return or
+        // a rejected candidate).
+        if close(&r, &m).ct_eq(&self.e0).declassify() {
             Ok(())
         } else {
             Err(Error::Verification)

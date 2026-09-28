@@ -900,12 +900,19 @@ fn core_sign(p: &Params, sk: &SkView, idx: u64, msg: &[u8], cache: &mut SubtreeC
         &mut sig[p.index_bytes..p.index_bytes + n],
     );
 
+    // Declassified (Valgrind harness): `R` is published in the signature.
+    crate::ct::declassify(&sig[p.index_bytes..p.index_bytes + n]);
+
     // mhash = H_msg(R, root, idx, msg).
     let mut mhash = [0u8; MAX_N];
     {
         let r = sig[p.index_bytes..p.index_bytes + n].to_vec();
         hash::h_msg(p, &r, sk.root(), idx, msg, &mut mhash);
     }
+    // Declassified (Valgrind harness): `mhash` is a function of `R`, the
+    // public root, `idx` and the message — every verifier recomputes it — and
+    // its base-w digits set the (public) WOTS+ chain lengths.
+    crate::ct::declassify(&mhash);
 
     let mut off = p.index_bytes + n;
     let leaf_mask = (1u64 << p.tree_height) - 1;
@@ -942,6 +949,10 @@ fn core_sign(p: &Params, sk: &SkView, idx: u64, msg: &[u8], cache: &mut SubtreeC
         auth_path_from_subtree(p, nodes, idx_leaf, &mut sig[off..off + th * n]);
         // The subtree root becomes the message signed at the next layer up.
         root[..n].copy_from_slice(&nodes[th][..n]);
+        // Declassified (Valgrind harness): a subtree root is public — the
+        // verifier recomputes it from the signature, and it is the message
+        // the next layer's WOTS+ signs (its digits set the chain lengths).
+        crate::ct::declassify(&root[..n]);
         off += th * n;
 
         cur_idx = tree;

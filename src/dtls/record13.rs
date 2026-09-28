@@ -261,6 +261,11 @@ pub(crate) fn decode_record<'a>(
     } else {
         (buf[1] ^ sn_mask[0]) as u16
     };
+    // Declassified (Valgrind harness): sequence-number encryption hides the
+    // number from on-path observers only (RFC 9147 §4.2.3); the receiving
+    // endpoint learns it by design and needs it for reconstruction and the
+    // replay window.
+    let seq_low = crate::ct::declassify_value(seq_low);
 
     let body_start = header_len;
     let body_end = if has_length {

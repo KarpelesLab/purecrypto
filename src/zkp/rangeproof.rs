@@ -448,7 +448,9 @@ fn choose_params(
     exp: i32,
     min_bits: u32,
 ) -> Result<(Params, u64), Error> {
-    if !(-1..=MAX_EXP).contains(&exp) || min_bits > 64 || bool::from(min_value.ct_gt(&value)) {
+    // Declassified (Valgrind harness), here and below: argument verdicts are
+    // returned as errors, and the chosen parameters are the public header.
+    if !(-1..=MAX_EXP).contains(&exp) || min_bits > 64 || min_value.ct_gt(&value).declassify() {
         return Err(Error::InvalidInput);
     }
     if exp == -1 {
@@ -467,7 +469,7 @@ fn choose_params(
     // proven interval cannot run past 2^64; with min_value == 0 it silently
     // falls back to exp = 0 rather than failing.
     let big = value.ct_gt(&(i64::MAX as u64));
-    if min_value != 0 && bool::from(big) {
+    if min_value != 0 && big.declassify() {
         return Err(Error::InvalidInput);
     }
     let mut exp = i32::conditional_select(&0, &exp, big);
@@ -478,9 +480,13 @@ fn choose_params(
     loop {
         let scale = pow10(exp);
         let (mantissa_value, rem) = ct_divrem(delta, scale);
-        let effective_min = min_value + rem;
+        let effective_min = crate::ct::declassify_value(min_value + rem);
         let width = bit_len(mantissa_value);
-        let mantissa = u32::conditional_select(&width, &floor, width.ct_gt(&floor));
+        let mantissa = crate::ct::declassify_value(u32::conditional_select(
+            &width,
+            &floor,
+            width.ct_gt(&floor),
+        ));
         if let Some(max_value) = span(effective_min, mantissa, scale) {
             return Ok((
                 Params {
@@ -1024,7 +1030,11 @@ pub fn sign_into(
     let blind_scalar = Scalar::from_bytes_be(blind)?;
     // Fail closed if the opening does not match the commitment: a proof made
     // from a mismatched opening can only ever fail verification.
-    if !bool::from(Commitment::with_generator(value, blind, generator)?.ct_eq(commit)) {
+    // Declassified (Valgrind harness): the verdict is returned as an error.
+    if !Commitment::with_generator(value, blind, generator)?
+        .ct_eq(commit)
+        .declassify()
+    {
         return Err(Error::InvalidInput);
     }
 

@@ -165,7 +165,9 @@ pub struct DsaSignature {
 /// `1 ≤ v < n`, evaluated without short-circuiting (`v` may be a secret:
 /// a private scalar on import, a nonce candidate in rejection sampling).
 fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
-    (!v.ct_is_zero() & v.reduce(n).ct_eq(v)).into()
+    // Declassified (Valgrind harness): the verdict is public — a key-import
+    // error, or an RFC 6979 candidate rejection (only the count is observable).
+    (!v.ct_is_zero() & v.reduce(n).ct_eq(v)).declassify()
 }
 
 /// FIPS 186-4 §4.6 / RFC 6979 `bits2int`: the integer formed by the leftmost
@@ -641,13 +643,17 @@ impl DsaPrivateKey {
         loop {
             let mut k = drbg.next_k();
             let r = fp.pow(g, &k).reduce(q);
+            // Declassified (Valgrind harness): `r` is the first half of the
+            // signature (its `r = 0` check is a public retry).
+            crate::ct::declassify_val(r.as_limbs());
             if r.is_zero() {
                 k.zeroize();
                 continue;
             }
             // `1 ≤ k < q` with `q` prime always has an inverse; `None` means
-            // `q` is composite after all, and no `k` will do better.
-            let Some(mut k_inv) = inv_mod_odd_ct_boxed(&k, q).into_option() else {
+            // `q` is composite after all, and no `k` will do better. The
+            // presence flag is public (an error return).
+            let Some(mut k_inv) = inv_mod_odd_ct_boxed(&k, q).into_public_option() else {
                 k.zeroize();
                 return Err(Error::InvalidParameters);
             };
@@ -662,6 +668,9 @@ impl DsaPrivateKey {
             k_inv.zeroize();
             xr.zeroize();
             z_xr.zeroize();
+            // Declassified (Valgrind harness): `s` is the signature's second
+            // half (its `s = 0` check is a public retry).
+            crate::ct::declassify_val(s.as_limbs());
             if s.is_zero() {
                 continue;
             }

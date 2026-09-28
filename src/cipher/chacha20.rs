@@ -215,7 +215,7 @@ mod simd512 {
     use core::arch::x86_64::*;
 
     pub(super) fn supported() -> bool {
-        std::is_x86_feature_detected!("avx512f")
+        !crate::ct::force_portable() && std::is_x86_feature_detected!("avx512f")
     }
 
     /// Rotate-left each 32-bit lane by `N` — a single `vprold`.
@@ -350,7 +350,7 @@ mod simd {
     use core::arch::x86_64::*;
 
     pub(super) fn supported() -> bool {
-        std::is_x86_feature_detected!("avx2")
+        !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
     }
 
     /// Rotate-left each 32-bit lane by `N` (with `M = 32 - N`).

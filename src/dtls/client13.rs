@@ -1996,6 +1996,10 @@ pub(crate) fn encrypt_protected_record_with(
     aad.truncate(hdr_len);
 
     encrypt_dtls13_record(crypter, seq, &aad, &mut inner)?;
+    // Declassified (Valgrind harness): the ciphertext and tag are the
+    // record's public wire bytes; the sequence-number mask is computed from
+    // them (RFC 9147 §4.2.3).
+    crate::ct::declassify(&inner);
 
     // Compute sn_mask over the first 16 bytes of ciphertext+tag and
     // emit the on-wire record with the masked seq.
