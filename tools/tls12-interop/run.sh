@@ -311,7 +311,7 @@ case_ossl_to_pc() {
         expect "$d/client.out" "Protocol  : TLSv1.2"
     else
         expect "$d/client.out" "Protocol  : DTLSv1.2"
-        expect "$d/server.err" "DTLS handshake complete"
+        expect "$d/server.err" "handshake complete: DTLSv1.2"
     fi
     if [ "$variant" = fragch ]; then
         expect "$d/client.out" "ALPN protocol: $FRAG_ALPN_PICK"
