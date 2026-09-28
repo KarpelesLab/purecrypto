@@ -37,8 +37,8 @@ use core::time::Duration;
 
 use super::cookie::{CookieGenerator, build_ch_fingerprint};
 use super::reassembly::{
-    HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, transcript_message,
-    write_fragments, write_message,
+    HandshakeFragment, MAX_HS_MSG_SEQ, PreCookieBuffer, Reassembler, read_fragment,
+    transcript_message, write_fragments, write_message,
 };
 use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, FlightRecord, Retransmit};
@@ -245,6 +245,14 @@ pub struct DtlsServerConnection12<R: RngCore> {
     /// Reassembler for inbound messages (created lazily so cookie-bounce
     /// CHs don't allocate state until the cookie is validated).
     reassembler: Option<Reassembler>,
+    /// Bounded fragment buffer for a first or cookie-bearing second
+    /// ClientHello that does not fit one record — a client on a small path
+    /// MTU splits even a plain CH (OpenSSL at its minimum link MTU leaves
+    /// ~200 bytes of handshake payload per record), and without this it
+    /// could never complete the HelloVerifyRequest round trip. See
+    /// [`PreCookieBuffer`] for the limits and why it is only a buffer,
+    /// never a sequencer.
+    pre_cookie: PreCookieBuffer,
 
     /// Outbound UDP datagrams.
     out_dgrams: Vec<Vec<u8>>,
@@ -371,6 +379,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             state: State::WaitFirstClientHello,
             out_msg_seq: 0,
             reassembler: None,
+            pre_cookie: PreCookieBuffer::new(),
             out_dgrams: Vec::new(),
             app_in: Vec::new(),
             write_epoch: 0,
@@ -531,10 +540,11 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 // Partials that grew since then are kept so a fragmented
                 // message can assemble across retransmissions under loss.
                 // Established connections keep their partials.
-                if self.state != State::Connected
-                    && let Some(r) = self.reassembler.as_mut()
-                {
-                    r.clear_if_stalled();
+                if self.state != State::Connected {
+                    self.pre_cookie.clear();
+                    if let Some(r) = self.reassembler.as_mut() {
+                        r.clear_if_stalled();
+                    }
                 }
             }
             super::reliability::Action::GiveUp => {
@@ -751,35 +761,62 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             let consumed = frag.len;
             // Pre-state-allocation cookie path: when we're still
             // awaiting the first or second CH and the reassembler hasn't
-            // been built, parse the fragment as a single CH directly.
+            // been built, the fragment can only be (part of) a ClientHello.
             // This path is plaintext, unauthenticated input — malformed
             // fragments are dropped silently rather than killing the
             // connection.
             if self.reassembler.is_none() {
-                // Require complete, unfragmented CH for the cookie dance.
-                if frag.msg_type != hs_type::CLIENT_HELLO {
+                // Only a ClientHello at `message_seq` 0 (the first CH) or
+                // 1 (the cookie-bearing second CH, RFC 6347 §4.2.2),
+                // within the pre-cookie length ceiling, can be legitimate
+                // here; anything else is dropped with the rest of the
+                // record (RFC 6347 §4.1.2.7), and a spoofed `message_seq`
+                // never influences which sequence numbers the buffer will
+                // accept.
+                if !PreCookieBuffer::admits(&frag) {
                     return Ok(());
                 }
-                if frag.fragment_offset != 0 || (frag.fragment.len() as u32) != frag.total_length {
-                    return Ok(());
-                }
-                let body = frag.fragment.to_vec();
                 let msg_seq = frag.message_seq;
                 off += consumed;
-                if let Err(e) = self.handle_pre_state_client_hello(msg_seq, &body) {
-                    // Everything on this path is unauthenticated, epoch-0,
-                    // attacker-spoofable input (a forged cookie being the
-                    // most reachable). Per RFC 6347 §4.1.2.7 these faults
-                    // are silently dropped so a single spoofed datagram on
-                    // the 4-tuple can never tear down a legitimate
-                    // in-flight handshake. The one exception is the local
-                    // fail-closed misconfiguration (cookie required but no
-                    // `cookie_secret`), which fires identically for the
-                    // genuine client and must stay loud.
-                    if matches!(e, Error::InappropriateState) {
-                        return Err(e);
+                // A whole-message fragment is handed straight through; a
+                // partial one — a client on a small path MTU splits its CH
+                // across datagrams (RFC 6347 §4.2.3) — is buffered, bounded
+                // on every axis (see `PreCookieBuffer`), until the CH at
+                // this `message_seq` completes. Either way the cookie check
+                // and the transcript (the reassembled body under its
+                // single-fragment DTLS header, §4.2.6) see the same bytes.
+                // The buffer never dispatches on its own, so a rejected
+                // spoofed CH cannot leave it refusing the genuine seq-0
+                // fragments.
+                let Some(body) = self.pre_cookie.feed(frag) else {
+                    continue;
+                };
+                match self.handle_pre_state_client_hello(msg_seq, &body) {
+                    Ok(()) => {
+                        // The CH was accepted (HVR emitted, or the real
+                        // handshake state bootstrapped): whatever the
+                        // fragment buffer still holds is stale.
+                        self.pre_cookie.clear();
                     }
-                    return Ok(());
+                    Err(e) => {
+                        // Everything on this path is unauthenticated,
+                        // epoch-0, attacker-spoofable input (a forged
+                        // cookie being the most reachable). Per RFC 6347
+                        // §4.1.2.7 these faults are silently dropped so a
+                        // single spoofed datagram on the 4-tuple can never
+                        // tear down a legitimate in-flight handshake — and
+                        // a rejected CH leaves the fragment buffer alone,
+                        // so a spoofed complete CH cannot flush a genuine
+                        // fragmented one mid-reassembly. The one exception
+                        // is the local fail-closed misconfiguration (cookie
+                        // required but no `cookie_secret`), which fires
+                        // identically for the genuine client and must stay
+                        // loud.
+                        if matches!(e, Error::InappropriateState) {
+                            return Err(e);
+                        }
+                        return Ok(());
+                    }
                 }
                 continue;
             }

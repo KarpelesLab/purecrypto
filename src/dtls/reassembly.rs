@@ -370,9 +370,10 @@ impl Reassembler {
     /// least-recently admitted one.
     ///
     /// For a pure fragment buffer with no meaningful head of queue — the
-    /// DTLS 1.3 server's pre-cookie ClientHello buffer, where `message_seq`
-    /// 0 and 1 are both legitimate and nothing else ever expires the
-    /// contents — this is what keeps a handful of spoofed partial claims
+    /// servers' pre-cookie ClientHello buffer ([`PreCookieBuffer`]), where
+    /// `message_seq` 0 and 1 are both legitimate and nothing else ever
+    /// expires the contents — this is what keeps a handful of spoofed
+    /// partial claims
     /// from blocking a genuine fragmented CH indefinitely: the genuine
     /// client's retransmits churn the junk out. The default head-of-queue
     /// rule is kept for the in-handshake reassemblers, where a competing
@@ -617,12 +618,12 @@ impl Reassembler {
     /// Removes and returns a fully assembled candidate at exactly `seq`,
     /// WITHOUT advancing `expected_msg_seq` or evicting anything.
     ///
-    /// Used by the DTLS 1.3 server's pre-cookie ClientHello path, where the
-    /// reassembler is only a fragment buffer: both `message_seq` 0 (a first
-    /// CH) and 1 (a post-HelloRetryRequest CH2) are legitimate heads there,
-    /// and neither may be gated on the other — the server is stateless
-    /// across the HRR round trip, so it cannot know which one it is
-    /// waiting for.
+    /// Used by the servers' pre-cookie ClientHello path
+    /// ([`PreCookieBuffer`]), where the reassembler is only a fragment
+    /// buffer: both `message_seq` 0 (a first CH) and 1 (the cookie-bearing
+    /// second CH) are legitimate heads there, and neither may be gated on
+    /// the other — the server is stateless across the cookie round trip,
+    /// so it cannot know which one it is waiting for.
     pub(crate) fn take_complete(&mut self, seq: u16) -> Option<(u8, Vec<u8>)> {
         let key = *self
             .in_progress
@@ -631,6 +632,159 @@ impl Reassembler {
             .map(|(k, _)| k)?;
         let done = self.in_progress.remove(&key)?;
         Some((done.msg_type, done.buf))
+    }
+}
+
+// --- pre-cookie ClientHello buffer ------------------------------------------
+
+/// Ceiling on the claimed `total_length` of a ClientHello fed through a
+/// [`PreCookieBuffer`]. This is the pre-cookie, pre-address-validation
+/// path: with the default reassembler limits (256 KiB × 8 messages) eight
+/// spoofed one-byte fragments with distinct `message_seq` values, each
+/// claiming the maximum `total_length`, would pin ~2 MiB of eagerly
+/// allocated buffers before any return-routability check. The
+/// cookie-bearing second ClientHello is a single `message_seq`.
+///
+/// A candidate's buffer is allocated to the claimed length on its first
+/// fragment, so this ceiling is what one ~60-byte spoofed datagram costs.
+/// Growing the buffer lazily would not change that: the spoofer simply
+/// sends its one fragment at the tail of the claimed length. The ceiling
+/// itself is therefore kept tight. A legitimate CH is 2–3 KiB even with an
+/// ML-KEM-768 hybrid share next to classical ones (this crate's default
+/// DTLS 1.3 offer is under 2 KiB, a DTLS 1.2 ClientHello a few hundred
+/// bytes); 8 KiB leaves room for a few more hybrid shares, PSK identities
+/// or padding.
+pub(crate) const PRE_COOKIE_MAX_CH_LEN: u32 = 8 * 1024;
+
+/// Number of concurrent reassembly candidates allowed on the pre-cookie
+/// path.
+///
+/// It cannot be 1. The reassembler keys candidates on
+/// `(message_seq, msg_type, total_length)` precisely so a spoofed claim and
+/// the genuine ClientHello can coexist — but with a budget of one, the
+/// spoofed candidate simply occupies the only slot and the genuine CH is
+/// still refused, which is the wedge we are closing. Four keeps the
+/// worst-case pinned memory at `4 × PRE_COOKIE_MAX_CH_LEN` = 32 KiB per
+/// connection object (the application allocates one per 4-tuple it chooses
+/// to answer), while giving the genuine CH room alongside a few bogus
+/// claims.
+pub(crate) const PRE_COOKIE_MAX_IN_PROGRESS: usize = 4;
+
+/// Number of fragments a [`PreCookieBuffer`] absorbs without completing a
+/// ClientHello before it is discarded wholesale.
+///
+/// The pre-cookie buffer has no other expiry: nothing is in flight on the
+/// server side while it waits for a ClientHello (a DTLS 1.2
+/// HelloVerifyRequest is never retransmitted by the server, RFC 6347
+/// §4.2.1), so the retransmit timer (which clears reassembly state on
+/// every other path) never fires. A spoofed partial claim would otherwise
+/// sit in the buffer for the life of the connection object. A legitimate
+/// fragmented CH is two or three fragments; a client retransmitting it a
+/// few times stays well within this budget, while a spoofer's junk is
+/// flushed after at most this many fragments and the genuine client's next
+/// retransmit lands in a clean buffer.
+pub(crate) const PRE_COOKIE_MAX_FRAGMENTS: u32 = 32;
+
+/// Highest `message_seq` a pre-cookie ClientHello fragment may carry. A
+/// first ClientHello is `message_seq = 0`; the second one — carrying the
+/// HelloVerifyRequest cookie in DTLS 1.2 (RFC 6347 §4.2.2) or answering a
+/// HelloRetryRequest in DTLS 1.3 (RFC 9147 §5.2) — is `message_seq = 1`.
+/// Nothing higher is legitimate before the handshake state exists, and a
+/// spoofed higher value must not be allowed to influence which sequence
+/// numbers the server will accept.
+pub(crate) const PRE_COOKIE_MAX_MSG_SEQ: u16 = 1;
+
+/// Bounded fragment buffer for a ClientHello that arrives before the
+/// server holds any handshake state: the first CH and the cookie-bearing
+/// second CH of the stateless cookie exchange (DTLS 1.2 HelloVerifyRequest,
+/// RFC 6347 §4.2.1; DTLS 1.3 HelloRetryRequest cookie, RFC 9147 §5.1).
+///
+/// A ClientHello may not fit one record: a multi-group DTLS 1.3 offer
+/// (X25519 + P-256 + ML-KEM-768) overflows the per-record fragment budget,
+/// and a DTLS 1.2 client on a small path MTU (OpenSSL's minimum link MTU
+/// leaves ~200 bytes of handshake payload per record) splits even a plain
+/// CH in two. Refusing anything but a whole-message fragment here would
+/// keep such clients from ever completing the cookie round trip, so the
+/// fragments are reassembled (RFC 6347 §4.2.3 / RFC 9147 §5.5) — inside a
+/// buffer bounded on every axis, because this is unauthenticated,
+/// attacker-spoofable input that no cookie has vouched for yet:
+///
+/// - the claimed message length ([`PRE_COOKIE_MAX_CH_LEN`]),
+/// - the number of concurrent candidates ([`PRE_COOKIE_MAX_IN_PROGRESS`]),
+/// - the number of fragments absorbed without a completion
+///   ([`PRE_COOKIE_MAX_FRAGMENTS`]), after which everything is flushed,
+/// - the `message_seq` values admitted ([`PRE_COOKIE_MAX_MSG_SEQ`]).
+///
+/// It is only a fragment buffer, never a sequencer: the underlying
+/// [`Reassembler`] runs FIFO ([`Reassembler::with_fifo_eviction`]), its
+/// `expected_msg_seq` stays at 0 and is never seeded from a peer-supplied
+/// `message_seq` (a spoofed `message_seq = 3` fragment used to pin the
+/// DTLS 1.3 buffer there, after which the genuine CH1/CH2 at 0/1 were
+/// dropped as stale for ever — DTLS-M1), nor advanced by a completed CH
+/// the caller then rejects: completions are collected with
+/// [`Reassembler::take_complete`], so neither sequence number gates the
+/// other. A complete, unfragmented CH never touches the buffer at all, so
+/// no amount of buffered junk can keep it from being processed.
+pub(crate) struct PreCookieBuffer {
+    reasm: Option<Reassembler>,
+    /// Fragments fed since `reasm` was created; see
+    /// [`PRE_COOKIE_MAX_FRAGMENTS`].
+    fed: u32,
+}
+
+impl PreCookieBuffer {
+    /// An empty buffer. Nothing is allocated until a fragment arrives.
+    pub(crate) const fn new() -> Self {
+        Self {
+            reasm: None,
+            fed: 0,
+        }
+    }
+
+    /// Whether `frag` may enter the pre-cookie path at all: a ClientHello
+    /// at `message_seq` 0 or 1 whose claimed length is within
+    /// [`PRE_COOKIE_MAX_CH_LEN`]. Anything else is spoofed or broken
+    /// unauthenticated input, which the caller drops silently (RFC 6347
+    /// §4.1.2.7 / RFC 9147 §4.5.2) — and, crucially, whose `message_seq`
+    /// never influences which sequence numbers the buffer will accept.
+    pub(crate) fn admits(frag: &HandshakeFragment<'_>) -> bool {
+        frag.msg_type == crate::tls::codec::hs_type::CLIENT_HELLO
+            && frag.message_seq <= PRE_COOKIE_MAX_MSG_SEQ
+            && frag.total_length <= PRE_COOKIE_MAX_CH_LEN
+    }
+
+    /// Feeds one fragment that passed [`Self::admits`]. Returns the
+    /// complete ClientHello body at `frag.message_seq` once every byte of
+    /// it is in hand — immediately, without touching the buffer, for a
+    /// whole-message fragment.
+    pub(crate) fn feed(&mut self, frag: HandshakeFragment<'_>) -> Option<Vec<u8>> {
+        // Fast path: a complete, unfragmented CH never enters the buffer.
+        if frag.fragment_offset == 0 && frag.fragment.len() as u32 == frag.total_length {
+            return Some(frag.fragment.to_vec());
+        }
+        // Flush a buffer that has absorbed too many fragments without ever
+        // completing a CH: nothing else expires it.
+        if self.fed >= PRE_COOKIE_MAX_FRAGMENTS {
+            self.reasm = None;
+        }
+        let fed = &mut self.fed;
+        let reasm = self.reasm.get_or_insert_with(|| {
+            *fed = 0;
+            Reassembler::with_limits(PRE_COOKIE_MAX_CH_LEN, PRE_COOKIE_MAX_IN_PROGRESS)
+                .with_fifo_eviction()
+        });
+        *fed += 1;
+        let seq = frag.message_seq;
+        let _ = reasm.feed(frag);
+        reasm.take_complete(seq).map(|(_, body)| body)
+    }
+
+    /// Discards every buffered fragment: the caller accepted a ClientHello
+    /// (so whatever is left is stale), or its retransmit timer decided the
+    /// peer's flight has stopped arriving.
+    pub(crate) fn clear(&mut self) {
+        self.reasm = None;
+        self.fed = 0;
     }
 }
 

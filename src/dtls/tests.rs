@@ -4803,3 +4803,500 @@ mod audit_2026_09 {
         assert_eq!(server.take_received(), b"ping");
     }
 }
+
+/// The DTLS 1.2 server's stateless cookie path (RFC 6347 §4.2.1) used to
+/// require every ClientHello to arrive as one whole fragment: a client on
+/// a small path MTU — `openssl s_client -dtls1_2` splits even a plain
+/// ClientHello at its 256-byte minimum link MTU — could never complete the
+/// HelloVerifyRequest round trip. The fragments are now reassembled inside
+/// the bounded [`super::reassembly::PreCookieBuffer`] the DTLS 1.3 server
+/// already used; these tests cover the reassembly and each of its bounds.
+mod fragmented_client_hello_12 {
+    use super::*;
+    use crate::dtls::reassembly::{
+        PRE_COOKIE_MAX_CH_LEN, PRE_COOKIE_MAX_FRAGMENTS, PRE_COOKIE_MAX_IN_PROGRESS, read_fragment,
+    };
+    use crate::dtls::record;
+    use crate::tls::codec::hs_type;
+    use crate::tls::{ContentType, ProtocolVersion};
+
+    /// A DTLS 1.2 server requiring the cookie exchange.
+    fn server12(seed: &[u8]) -> (DtlsServerConnection12<HmacDrbg<Sha256>>, Vec<u8>) {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let srng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+        let server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        (server, cert)
+    }
+
+    /// Raw DTLS handshake fragment: 12-byte header + body.
+    fn raw_fragment(
+        msg_type: u8,
+        total_length: u32,
+        message_seq: u16,
+        fragment_offset: u32,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(msg_type);
+        out.extend_from_slice(&total_length.to_be_bytes()[1..]);
+        out.extend_from_slice(&message_seq.to_be_bytes());
+        out.extend_from_slice(&fragment_offset.to_be_bytes()[1..]);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Wraps `fragment` in one plaintext (epoch 0) DTLS record.
+    fn plain_record(seq: u64, fragment: &[u8]) -> Vec<u8> {
+        let mut dg = Vec::new();
+        record::write_record(
+            &mut dg,
+            ContentType::Handshake,
+            ProtocolVersion::DTLSv1_2,
+            0,
+            seq,
+            fragment,
+        )
+        .unwrap();
+        dg
+    }
+
+    /// The `(message_seq, body)` of the single-record, single-fragment
+    /// ClientHello the DTLS 1.2 client emits.
+    fn client_hello(dgs: &[Vec<u8>]) -> (u16, Vec<u8>) {
+        assert_eq!(dgs.len(), 1, "the 1.2 client sends its CH in one datagram");
+        let rec = record::read_record(&dgs[0]).unwrap().unwrap();
+        assert_eq!(rec.len, dgs[0].len());
+        let f = read_fragment(rec.fragment).unwrap();
+        assert_eq!(f.msg_type, hs_type::CLIENT_HELLO);
+        assert_eq!(f.len, rec.fragment.len());
+        assert_eq!(f.fragment_offset, 0);
+        assert_eq!(f.fragment.len() as u32, f.total_length);
+        (f.message_seq, f.fragment.to_vec())
+    }
+
+    /// Splits a ClientHello body into `pieces` fragments, each in its own
+    /// plaintext record and datagram (RFC 6347 §4.2.3), as a client on a
+    /// small path MTU would send it.
+    fn fragmented(msg_seq: u16, body: &[u8], pieces: usize, first_rec_seq: u64) -> Vec<Vec<u8>> {
+        let chunk = body.len().div_ceil(pieces);
+        body.chunks(chunk)
+            .enumerate()
+            .map(|(i, c)| {
+                let frag = raw_fragment(
+                    hs_type::CLIENT_HELLO,
+                    body.len() as u32,
+                    msg_seq,
+                    (i * chunk) as u32,
+                    c,
+                );
+                plain_record(first_rec_seq + i as u64, &frag)
+            })
+            .collect()
+    }
+
+    /// Feeds `dgs` to the server and returns what it answered.
+    fn feed_all<R: crate::rng::RngCore>(
+        server: &mut DtlsServerConnection12<R>,
+        dgs: &[Vec<u8>],
+    ) -> Vec<Vec<u8>> {
+        for dg in dgs {
+            server.feed_datagram(dg).unwrap();
+        }
+        server.pop_outbound_datagrams()
+    }
+
+    /// Replays the client's CH, fragmented into `pieces` datagrams, at
+    /// the server; asserts the reply is exactly one HelloVerifyRequest and
+    /// hands it to the client.
+    fn fragmented_ch1_gets_hvr<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection12,
+        server: &mut DtlsServerConnection12<R>,
+        pieces: usize,
+        order: impl Fn(Vec<Vec<u8>>) -> Vec<Vec<u8>>,
+    ) {
+        let (seq, body) = client_hello(&client.pop_outbound_datagrams());
+        assert_eq!(seq, 0, "a first ClientHello is message_seq 0");
+        let frags = order(fragmented(0, &body, pieces, 0));
+        assert_eq!(frags.len(), pieces);
+        // No reply until the last fragment lands.
+        let head = feed_all(server, &frags[..pieces - 1]);
+        assert!(head.is_empty(), "no HVR before the CH is complete");
+        let hvr = feed_all(server, &frags[pieces - 1..]);
+        assert_eq!(hvr.len(), 1, "one HelloVerifyRequest");
+        assert_eq!(hvr[0][13], 3, "HelloVerifyRequest handshake type");
+        client.feed_datagram(&hvr[0]).unwrap();
+    }
+
+    /// Replays the client's cookie-bearing CH2, fragmented into `pieces`
+    /// datagrams, at the server and asserts the server flight came back.
+    fn fragmented_ch2_gets_server_flight<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection12,
+        server: &mut DtlsServerConnection12<R>,
+        pieces: usize,
+        order: impl Fn(Vec<Vec<u8>>) -> Vec<Vec<u8>>,
+    ) {
+        let (seq, body) = client_hello(&client.pop_outbound_datagrams());
+        assert_eq!(seq, 1, "the cookie-bearing CH is message_seq 1");
+        let frags = order(fragmented(1, &body, pieces, 10));
+        let flight = feed_all(server, &frags);
+        assert!(
+            flight.len() >= 4,
+            "ServerHello, Certificate, ServerKeyExchange, ServerHelloDone"
+        );
+        for dg in &flight {
+            client.feed_datagram(dg).unwrap();
+        }
+    }
+
+    /// Finishes the handshake from the client's second flight on and
+    /// exchanges application data both ways.
+    fn finish_and_exchange<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection12,
+        server: &mut DtlsServerConnection12<R>,
+    ) {
+        assert!(pump_handshake(client, server), "handshake must complete");
+        client.send(b"ping").unwrap();
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping");
+        server.send(b"pong").unwrap();
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong");
+    }
+
+    fn in_order(v: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        v
+    }
+
+    fn reversed(mut v: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        v.reverse();
+        v
+    }
+
+    /// A first ClientHello split into three datagrams is answered with a
+    /// HelloVerifyRequest once the last piece lands — the server used to
+    /// drop every piece and the client could never get a cookie.
+    #[test]
+    fn fragmented_first_client_hello_gets_hello_verify_request_12() {
+        let (mut server, cert) = server12(b"frag-ch1");
+        let mut client = make_client(&cert);
+        fragmented_ch1_gets_hvr(&mut client, &mut server, 3, in_order);
+    }
+
+    /// Both the first and the cookie-bearing ClientHello fragmented: the
+    /// cookie validates on the reassembled CH2, the handshake completes and
+    /// data flows. The client hashes its CH2 as one message under its
+    /// 12-byte DTLS header (RFC 6347 §4.2.6); the client's Finished
+    /// verifying at the server proves the server hashed the reassembled
+    /// body the same way rather than the fragments it received.
+    #[test]
+    fn fragmented_cookie_client_hello_completes_handshake_12() {
+        let (mut server, cert) = server12(b"frag-ch2");
+        let mut client = make_client(&cert);
+        fragmented_ch1_gets_hvr(&mut client, &mut server, 3, in_order);
+        fragmented_ch2_gets_server_flight(&mut client, &mut server, 3, in_order);
+        finish_and_exchange(&mut client, &mut server);
+    }
+
+    /// Fragments of both ClientHellos delivered last-first still reassemble
+    /// (RFC 6347 §4.2.3: any order).
+    #[test]
+    fn out_of_order_client_hello_fragments_12() {
+        let (mut server, cert) = server12(b"frag-ooo");
+        let mut client = make_client(&cert);
+        fragmented_ch1_gets_hvr(&mut client, &mut server, 3, reversed);
+        fragmented_ch2_gets_server_flight(&mut client, &mut server, 4, reversed);
+        finish_and_exchange(&mut client, &mut server);
+    }
+
+    /// A single-fragment ClientHello never enters the buffer: with junk
+    /// occupying every candidate slot at both legitimate sequence numbers,
+    /// a whole CH1 / CH2 still go straight through.
+    #[test]
+    fn whole_client_hello_bypasses_full_buffer_12() {
+        let (mut server, cert) = server12(b"frag-bypass");
+        let mut client = make_client(&cert);
+        let mut rec_seq = 0u64;
+        for msg_seq in [0u16, 1] {
+            for i in 0..PRE_COOKIE_MAX_IN_PROGRESS as u32 {
+                let junk = raw_fragment(hs_type::CLIENT_HELLO, 2000 + i, msg_seq, 0, &[0xAA]);
+                server.feed_datagram(&plain_record(rec_seq, &junk)).unwrap();
+                rec_seq += 1;
+            }
+        }
+        assert!(server.pop_outbound_datagrams().is_empty());
+        assert!(pump_handshake(&mut client, &mut server));
+    }
+
+    /// A spoofed fragment claiming the maximum admissible length at each
+    /// legitimate `message_seq`, sitting in the buffer next to the genuine
+    /// fragmented CH, does not stop the genuine one: candidates are keyed
+    /// on `(message_seq, msg_type, total_length)`, and the budget is more
+    /// than one slot precisely so a spoofed claim and the genuine CH can
+    /// coexist (`PRE_COOKIE_MAX_IN_PROGRESS`).
+    #[test]
+    fn spoofed_max_length_claim_beside_genuine_fragmented_ch_12() {
+        let (mut server, cert) = server12(b"frag-spoof-max");
+        let mut client = make_client(&cert);
+        let poison = |msg_seq: u16, rec_seq: u64| {
+            plain_record(
+                rec_seq,
+                &raw_fragment(
+                    hs_type::CLIENT_HELLO,
+                    PRE_COOKIE_MAX_CH_LEN,
+                    msg_seq,
+                    PRE_COOKIE_MAX_CH_LEN - 1,
+                    &[0xAA],
+                ),
+            )
+        };
+        // The poison lands first, then interleaves with the genuine pieces.
+        server.feed_datagram(&poison(0, 100)).unwrap();
+        server.feed_datagram(&poison(1, 101)).unwrap();
+        assert!(server.pop_outbound_datagrams().is_empty());
+        let interleave = |v: Vec<Vec<u8>>| {
+            let mut out = Vec::new();
+            for (i, dg) in v.into_iter().enumerate() {
+                out.push(dg);
+                if i == 0 {
+                    out.push(poison(0, 102));
+                    out.push(poison(1, 103));
+                }
+            }
+            out
+        };
+        let (seq, body) = client_hello(&client.pop_outbound_datagrams());
+        assert_eq!(seq, 0);
+        let hvr = feed_all(&mut server, &interleave(fragmented(0, &body, 3, 0)));
+        assert_eq!(
+            hvr.len(),
+            1,
+            "genuine CH1 completes beside the spoofed claim"
+        );
+        client.feed_datagram(&hvr[0]).unwrap();
+        let (seq, body) = client_hello(&client.pop_outbound_datagrams());
+        assert_eq!(seq, 1);
+        let flight = feed_all(&mut server, &interleave(fragmented(1, &body, 3, 10)));
+        assert!(
+            flight.len() >= 4,
+            "genuine CH2 completes beside the spoofed claim"
+        );
+        for dg in &flight {
+            client.feed_datagram(dg).unwrap();
+        }
+        finish_and_exchange(&mut client, &mut server);
+    }
+
+    /// `PRE_COOKIE_MAX_IN_PROGRESS` spoofed partial claims at BOTH
+    /// legitimate sequence numbers, each with a distinct claimed length so
+    /// they are distinct candidates, fill every slot before the genuine
+    /// fragmented CH arrives. FIFO eviction recycles the junk and the
+    /// genuine CH still completes.
+    #[test]
+    fn slot_exhaustion_does_not_wedge_fragmented_ch_12() {
+        let (mut server, cert) = server12(b"frag-slots");
+        let mut client = make_client(&cert);
+        let mut rec_seq = 100u64;
+        let mut fill = |server: &mut DtlsServerConnection12<_>| {
+            for msg_seq in [0u16, 1] {
+                for i in 0..PRE_COOKIE_MAX_IN_PROGRESS as u32 {
+                    let junk = raw_fragment(hs_type::CLIENT_HELLO, 2000 + i, msg_seq, 0, &[0xAA]);
+                    server.feed_datagram(&plain_record(rec_seq, &junk)).unwrap();
+                    rec_seq += 1;
+                }
+            }
+            assert!(server.pop_outbound_datagrams().is_empty());
+        };
+        fill(&mut server);
+        fragmented_ch1_gets_hvr(&mut client, &mut server, 2, in_order);
+        fill(&mut server);
+        fragmented_ch2_gets_server_flight(&mut client, &mut server, 2, in_order);
+        finish_and_exchange(&mut client, &mut server);
+    }
+
+    /// A spoofed *complete* CH that fails validation (undecodable body)
+    /// must not flush a genuine fragmented CH that is mid-reassembly.
+    #[test]
+    fn rejected_complete_ch_keeps_partial_genuine_ch_12() {
+        let (mut server, cert) = server12(b"frag-keep");
+        let mut client = make_client(&cert);
+        let (seq, body) = client_hello(&client.pop_outbound_datagrams());
+        assert_eq!(seq, 0);
+        let frags = fragmented(0, &body, 3, 0);
+        assert!(feed_all(&mut server, &frags[..2]).is_empty());
+        let bogus = raw_fragment(hs_type::CLIENT_HELLO, 8, 0, 0, &[0xFF; 8]);
+        assert_eq!(server.feed_datagram(&plain_record(99, &bogus)), Ok(()));
+        assert!(server.pop_outbound_datagrams().is_empty());
+        let hvr = feed_all(&mut server, &frags[2..]);
+        assert_eq!(hvr.len(), 1, "genuine CH must still complete reassembly");
+        client.feed_datagram(&hvr[0]).unwrap();
+        assert!(pump_handshake(&mut client, &mut server));
+    }
+
+    /// Grows a DTLS 1.2 ClientHello body to exactly `target` bytes with a
+    /// trailing `padding` extension (RFC 7685).
+    fn pad_client_hello(body: &[u8], target: usize) -> Vec<u8> {
+        let mut p = 2 + 32; // client_version, random
+        p += 1 + body[p] as usize; // session_id
+        p += 1 + body[p] as usize; // cookie
+        p += 2 + u16::from_be_bytes([body[p], body[p + 1]]) as usize; // cipher_suites
+        p += 1 + body[p] as usize; // compression_methods
+        let pad = target - body.len() - 4;
+        let mut out = body.to_vec();
+        let ext_len = u16::from_be_bytes([out[p], out[p + 1]]) as usize + 4 + pad;
+        out[p..p + 2].copy_from_slice(&(ext_len as u16).to_be_bytes());
+        out.extend_from_slice(&[0x00, 0x15]);
+        out.extend_from_slice(&(pad as u16).to_be_bytes());
+        out.resize(target, 0);
+        out
+    }
+
+    /// Every candidate in the pre-cookie buffer is allocated to its
+    /// CLAIMED length on its first fragment, so `PRE_COOKIE_MAX_CH_LEN`
+    /// (8 KiB) is what one tiny spoofed datagram can pin, times
+    /// `PRE_COOKIE_MAX_IN_PROGRESS`. A genuine ClientHello padded to
+    /// exactly the ceiling is still served; one byte more is dropped
+    /// before anything is buffered.
+    #[test]
+    fn client_hello_length_ceiling_12() {
+        let (_, cert) = make_server();
+        let mut client = make_client(&cert);
+        let (_, body) = client_hello(&client.pop_outbound_datagrams());
+        assert!(body.len() < 512, "a plain 1.2 CH is far below the ceiling");
+
+        let served = |target: usize, seed: &[u8]| -> bool {
+            let (mut server, _) = server12(seed);
+            let padded = pad_client_hello(&body, target);
+            let pieces = target.div_ceil(1000);
+            !feed_all(&mut server, &fragmented(0, &padded, pieces, 0)).is_empty()
+        };
+        let max = PRE_COOKIE_MAX_CH_LEN as usize;
+        assert!(
+            served(max, b"ceiling-at"),
+            "a fragmented ClientHello at the ceiling must be served"
+        );
+        assert!(
+            !served(max + 1, b"ceiling-over"),
+            "a ClientHello claim above the ceiling must be dropped"
+        );
+    }
+
+    /// The pre-cookie buffer has no other expiry than
+    /// `PRE_COOKIE_MAX_FRAGMENTS`: after that many fragments without a
+    /// completed ClientHello everything is flushed. A partially delivered
+    /// genuine CH is lost with the junk — the client retransmits it into a
+    /// clean buffer — and a whole CH afterwards goes straight through.
+    #[test]
+    fn junk_fragments_flush_buffer_and_ch_still_works_12() {
+        let (mut server, cert) = server12(b"frag-flush");
+        let mut client = make_client(&cert);
+        let (seq, body) = client_hello(&client.pop_outbound_datagrams());
+        assert_eq!(seq, 0);
+        let frags = fragmented(0, &body, 3, 0);
+
+        // Two genuine pieces, then more junk than the budget: every junk
+        // fragment is a distinct one-byte slice of the same 4 KiB claim, so
+        // none of them completes anything.
+        assert!(feed_all(&mut server, &frags[..2]).is_empty());
+        for i in 0..PRE_COOKIE_MAX_FRAGMENTS + 1 {
+            let junk = raw_fragment(hs_type::CLIENT_HELLO, 4096, 1, i, &[0xAA]);
+            server
+                .feed_datagram(&plain_record(100 + i as u64, &junk))
+                .unwrap();
+        }
+        assert!(server.pop_outbound_datagrams().is_empty());
+        // The buffer was flushed: the genuine tail alone no longer
+        // completes the CH ...
+        assert!(
+            feed_all(&mut server, &frags[2..]).is_empty(),
+            "the flushed buffer must not still hold the genuine head"
+        );
+        // ... the client's retransmit of the whole fragmented CH does ...
+        let hvr = feed_all(&mut server, &frags);
+        assert_eq!(hvr.len(), 1, "a retransmitted fragmented CH is served");
+        // ... and so does a whole CH2 after another burst of junk.
+        client.feed_datagram(&hvr[0]).unwrap();
+        let ch2 = client.pop_outbound_datagrams();
+        for i in 0..PRE_COOKIE_MAX_FRAGMENTS + 1 {
+            let junk = raw_fragment(hs_type::CLIENT_HELLO, 4096, 0, i, &[0xAA]);
+            server
+                .feed_datagram(&plain_record(200 + i as u64, &junk))
+                .unwrap();
+        }
+        assert!(server.pop_outbound_datagrams().is_empty());
+        let flight = feed_all(&mut server, &ch2);
+        assert!(flight.len() >= 4, "a whole CH2 after the flush is served");
+        for dg in &flight {
+            client.feed_datagram(dg).unwrap();
+        }
+        finish_and_exchange(&mut client, &mut server);
+    }
+
+    /// A spoofed ClientHello fragment with `message_seq` 2..=8 — a value no
+    /// pre-cookie CH can legitimately carry (RFC 6347 §4.2.2) — is dropped
+    /// before it can seed anything; the genuine CH1 (seq 0) / CH2 (seq 1)
+    /// still complete (DTLS-M1, mirrored from the 1.3 server).
+    #[test]
+    fn spoofed_msg_seq_fragment_does_not_wedge_pre_cookie_server_12() {
+        for poison_seq in 2..=8u16 {
+            let (mut server, cert) = server12(b"frag-m1");
+            let mut client = make_client(&cert);
+            let poison = raw_fragment(hs_type::CLIENT_HELLO, 64, poison_seq, 0, &[0xAA]);
+            server.feed_datagram(&plain_record(0, &poison)).unwrap();
+            assert!(server.pop_outbound_datagrams().is_empty());
+            fragmented_ch1_gets_hvr(&mut client, &mut server, 2, in_order);
+            fragmented_ch2_gets_server_flight(&mut client, &mut server, 2, in_order);
+            finish_and_exchange(&mut client, &mut server);
+        }
+    }
+
+    /// A ClientHello fragment carrying a `message_seq` above 1 is not a
+    /// legitimate pre-cookie CH even when it is whole: it is dropped, and
+    /// never reaches the cookie check.
+    #[test]
+    fn whole_client_hello_at_msg_seq_2_is_dropped_12() {
+        let (mut server, cert) = server12(b"frag-seq2");
+        let mut client = make_client(&cert);
+        let (_, body) = client_hello(&client.pop_outbound_datagrams());
+        let renumbered = raw_fragment(hs_type::CLIENT_HELLO, body.len() as u32, 2, 0, &body);
+        assert_eq!(server.feed_datagram(&plain_record(0, &renumbered)), Ok(()));
+        assert!(server.pop_outbound_datagrams().is_empty());
+        // The same bytes at message_seq 0 are served.
+        let genuine = raw_fragment(hs_type::CLIENT_HELLO, body.len() as u32, 0, 0, &body);
+        assert_eq!(feed_all(&mut server, &[plain_record(1, &genuine)]).len(), 1);
+    }
+
+    /// The fragmented path does not bypass the cookie check: a fragmented
+    /// CH2 carrying a forged cookie is dropped silently, and the genuine
+    /// fragmented CH2 afterwards is served.
+    #[test]
+    fn fragmented_ch2_with_forged_cookie_is_dropped_12() {
+        let (mut server, cert) = server12(b"frag-forged");
+        let mut client = make_client(&cert);
+        fragmented_ch1_gets_hvr(&mut client, &mut server, 2, in_order);
+        let (seq, body) = client_hello(&client.pop_outbound_datagrams());
+        assert_eq!(seq, 1);
+        // Flip a cookie byte: the cookie sits right after session_id.
+        let mut forged = body.clone();
+        let mut p = 2 + 32;
+        p += 1 + forged[p] as usize;
+        assert!(forged[p] > 0, "CH2 carries a cookie");
+        forged[p + 1] ^= 0x01;
+        assert!(
+            feed_all(&mut server, &fragmented(1, &forged, 3, 10)).is_empty(),
+            "a forged cookie must not be served, fragmented or not"
+        );
+        let flight = feed_all(&mut server, &fragmented(1, &body, 3, 20));
+        assert!(flight.len() >= 4, "the genuine CH2 is still served");
+        for dg in &flight {
+            client.feed_datagram(dg).unwrap();
+        }
+        finish_and_exchange(&mut client, &mut server);
+    }
+}
