@@ -1118,6 +1118,45 @@ mod dtls13 {
         assert!(pump_handshake_13(&mut client, &mut server));
     }
 
+    /// The cookie-bearing second ClientHello carries the `cookie` extension
+    /// FIRST. A stateless server validates the cookie before it keeps any
+    /// state, and one that only reassembles a fragmented CH2 once the
+    /// cookie has checked out (wolfSSL) needs it in the first fragment —
+    /// which a multi-KB hybrid `key_share` ahead of it would push out.
+    #[test]
+    fn second_client_hello_puts_the_cookie_extension_first() {
+        use crate::tls::codec::{ClientHello, ExtensionType};
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-cookie-first", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        for dg in server.pop_outbound_datagrams() {
+            client.feed_datagram(&dg).unwrap();
+        }
+        // CH2, reassembled from its fragments (13-byte record header, then
+        // a 12-byte handshake header per fragment).
+        let mut body = Vec::new();
+        for dg in client.pop_outbound_datagrams() {
+            let rec = &dg[13..];
+            assert_eq!(rec[0], 1, "ClientHello");
+            body.extend_from_slice(&rec[12..]);
+        }
+        let (ch, legacy_cookie) = ClientHello::decode_dtls(&body).unwrap();
+        assert!(
+            legacy_cookie.is_empty(),
+            "RFC 9147 §5.3: the legacy field stays empty"
+        );
+        assert_eq!(
+            ch.extensions.first().map(|e| e.0),
+            Some(ExtensionType(0x002C))
+        );
+    }
+
     #[test]
     fn loopback_with_cookie() {
         let (server_cfg, cert) = make_server13();

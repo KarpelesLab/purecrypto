@@ -1676,8 +1676,12 @@ impl DtlsClientConnection13 {
                 .collect();
             extensions.push(ext::alpn_protocols(&protos));
         }
+        // The cookie goes first: a stateless server validates it before it
+        // keeps anything, and one that reassembles a fragmented CH2 only
+        // after that check (wolfSSL) needs it inside the first fragment,
+        // ahead of a multi-KB hybrid `key_share`.
         if let Some(cookie) = self.cookie_extension.as_ref() {
-            extensions.push((ExtensionType(EXT_COOKIE), cookie.clone()));
+            extensions.insert(0, (ExtensionType(EXT_COOKIE), cookie.clone()));
         }
 
         // RFC 9147 §5.3: `legacy_version` is the DTLS 1.2 codepoint
