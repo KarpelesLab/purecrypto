@@ -295,6 +295,17 @@ pub struct Config {
     /// cannot be negotiated. TLS 1.3 and 1.2 are both covered (mix 0x13xx
     /// and classic codepoints in one list); the value is inert on the server.
     pub cipher_suites: Option<Vec<u16>>,
+    /// Client (TLS 1.3 / QUIC): the groups the first ClientHello carries a
+    /// `key_share` entry for (RFC 8446 §4.2.8). Every supported group is
+    /// still advertised in `supported_groups`; a server preferring one
+    /// without a share answers with a HelloRetryRequest and the client
+    /// retries with it (§4.1.4). `None` (the default) sends a share for
+    /// every offered group — no round trip, at the cost of a larger hello.
+    /// Groups the client does not offer are ignored; a list that names none
+    /// of them sends no shares at all, which is legal and makes any TLS 1.3
+    /// server ask for one. Inert on the server, on TLS 1.2 (no key shares)
+    /// and on DTLS 1.3, whose client always shares every offered group.
+    pub key_shares: Option<Vec<NamedGroup>>,
     /// `record_size_limit` extension (RFC 8449). `None` = library default.
     pub record_size_limit: Option<u16>,
     /// RFC 7627 §5.3 — when `true` (the default), a TLS 1.2 handshake
@@ -550,6 +561,7 @@ impl Default for Config {
             replay_window: None,
             alpn_protocols: Vec::new(),
             cipher_suites: None,
+            key_shares: None,
             record_size_limit: None,
             require_extended_master_secret: true,
             server_cert_type_preference: alloc::vec![0u8], // X.509 only.
@@ -655,6 +667,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `client_auth` | yes | yes | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes |
 /// | `alpn` | yes | yes | yes | yes | yes (required) |
 /// | `cipher_suites` (client) | yes | yes | yes | yes | yes (GCM / ChaCha20 only: RFC 9001 §5.3) |
+/// | `key_shares` (client) | yes | inert | inert | inert | yes |
 /// | `record_size_limit` | yes | yes | **refused** | **refused** | inert (no records) |
 /// | `require_extended_master_secret` | inert | yes | inert | yes | inert |
 /// | `stapled_ocsp_response` | yes | yes | inert | inert | yes |
@@ -837,6 +850,13 @@ impl ConfigBuilder {
     /// See [`Config::cipher_suites`].
     pub fn cipher_suites(mut self, suites: &[u16]) -> Self {
         self.inner.cipher_suites = Some(suites.to_vec());
+        self
+    }
+    /// Client: send `key_share` entries only for these groups in the first
+    /// ClientHello, leaving the rest of the offer to a HelloRetryRequest.
+    /// See [`Config::key_shares`].
+    pub fn key_shares(mut self, groups: &[NamedGroup]) -> Self {
+        self.inner.key_shares = Some(groups.to_vec());
         self
     }
     /// Enable or disable peer-certificate chain validation.

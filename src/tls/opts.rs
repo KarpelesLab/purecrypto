@@ -77,6 +77,7 @@ pub(crate) struct ClientOpts<'a> {
     pub server_name: Option<&'a str>,
     pub verify_certificates: bool,
     pub cipher_suites: Option<&'a [u16]>,
+    pub key_shares: Option<&'a [NamedGroup]>,
     pub expected_raw_public_keys: &'a [Vec<u8>],
     #[cfg(feature = "ech")]
     pub ech: &'a Option<super::ech::EchClient>,
@@ -134,6 +135,7 @@ impl Config {
             replay_window,
             alpn_protocols,
             cipher_suites,
+            key_shares,
             record_size_limit,
             require_extended_master_secret,
             server_cert_type_preference,
@@ -183,6 +185,7 @@ impl Config {
                 server_name: server_name.as_deref(),
                 verify_certificates: *verify_certificates,
                 cipher_suites: cipher_suites.as_deref(),
+                key_shares: key_shares.as_deref(),
                 expected_raw_public_keys,
                 #[cfg(feature = "ech")]
                 ech,

@@ -1486,6 +1486,7 @@ pub(crate) fn tls13_client_config(
         server_name,
         verify_certificates,
         cipher_suites,
+        key_shares,
         expected_raw_public_keys,
         #[cfg(feature = "ech")]
         ech,
@@ -1505,6 +1506,9 @@ pub(crate) fn tls13_client_config(
 
     let mut cc = super::conn::ClientConfig::new(roots.clone_store());
     cc.verify_certificates = verify_certificates;
+    if let Some(groups) = key_shares {
+        cc.key_share_groups = groups.iter().map(|g| g.to_wire()).collect();
+    }
     match transport {
         Tls13Transport::Tls => {
             cc.cipher_suites = cipher_suites.map(<[u16]>::to_vec);
@@ -1623,6 +1627,7 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         server_name,
         verify_certificates,
         cipher_suites,
+        key_shares,
         expected_raw_public_keys,
         #[cfg(feature = "ech")]
         ech,
@@ -1632,7 +1637,9 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
     // are TLS 1.3 features (see the `Config` field docs); `rng` is drawn
     // through `config_rng`, `signer` through `Connection::drive`, and the
     // caller resolves `server_name`.
-    let _ = (rng, signer, server_name);
+    // TLS 1.2 has no key shares (its ECDHE group is picked by the server
+    // from `supported_groups`).
+    let _ = (rng, signer, server_name, key_shares);
     #[cfg(feature = "cert-compression")]
     let _ = cert_compression_algorithms;
     #[cfg(feature = "ech")]
@@ -2043,6 +2050,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         server_name,
         verify_certificates,
         cipher_suites,
+        key_shares,
         expected_raw_public_keys,
         #[cfg(feature = "ech")]
         ech,
@@ -2063,7 +2071,9 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     // (the DTLS servers issue no tickets), so `resumption` never matches —
     // the documented "wrong version is ignored" rule. RFC 8879 certificate
     // compression is not implemented over DTLS: the advertisement is not
-    // sent, and the peer's certificate arrives uncompressed.
+    // sent, and the peer's certificate arrives uncompressed. `key_shares`
+    // is not wired either: the DTLS 1.3 client shares every offered group
+    // (and DTLS 1.2 has no key shares).
     let _ = (
         min_version,
         max_version,
@@ -2074,6 +2084,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         rng,
         signer,
         resumption,
+        key_shares,
     );
     #[cfg(feature = "cert-compression")]
     let _ = cert_compression_algorithms;
@@ -2642,6 +2653,50 @@ mod tests {
             .server_name("tls.example")
             .verify_certificates(false)
             .build()
+    }
+
+    /// `ConfigBuilder::key_shares` narrows the first ClientHello's
+    /// `key_share` list without narrowing `supported_groups`, so a server
+    /// preferring another offered group gets it through a HelloRetryRequest.
+    #[test]
+    fn key_shares_limits_the_first_hello_and_hrr_recovers() {
+        use crate::tls::NamedGroup;
+        use crate::tls::codec::extension as ext;
+        use crate::tls::codec::{ClientHello, ExtensionType};
+        let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .server_name("tls.example")
+            .verify_certificates(false)
+            .key_shares(&[NamedGroup::X25519])
+            .build();
+        let mut server_cfg = tls13_server_cfg(false);
+        server_cfg.preferred_key_exchange_group = Some(NamedGroup::Secp256r1);
+        let mut client = Connection::client(&client_cfg).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+
+        let _ = client.handshake();
+        let ch1 = client.pop().unwrap();
+        // One plaintext handshake record: 5-byte record header, then the
+        // 4-byte handshake header, then the ClientHello structure.
+        let hello = ClientHello::decode(&ch1[9..]).expect("ClientHello");
+        let shares = ext::parse_client_key_shares(
+            ext::find(&hello.extensions, ExtensionType::KEY_SHARE).expect("key_share"),
+        )
+        .expect("key shares");
+        let groups: Vec<_> = shares.iter().map(|(g, _)| *g).collect();
+        assert_eq!(groups, [NamedGroup::X25519.to_wire()]);
+        let supported = ext::find(&hello.extensions, ExtensionType::SUPPORTED_GROUPS)
+            .expect("supported_groups");
+        assert!(
+            supported
+                .windows(2)
+                .any(|w| w == NamedGroup::Secp256r1.to_wire().0.to_be_bytes())
+        );
+
+        server.feed(&ch1).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert!(client.is_handshake_complete() && server.is_handshake_complete());
     }
 
     /// `Connection::ech_accepted` reports real ECH on both ends, and stays

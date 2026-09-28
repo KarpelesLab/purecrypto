@@ -388,12 +388,14 @@ pub(crate) struct ClientConfig {
     /// refuse it (other server name, weaker verification, expired), when the
     /// ticket cannot fit a ClientHello, or when real ECH seals the hello.
     pub tls12_session: Option<super::StoredSession12>,
-    /// ECH client configuration (draft-ietf-tls-esni-22). `None` (the
-    /// default) emits no `encrypted_client_hello` extension. `Some` —
-    /// either GREASE or a real `ECHConfigList` — emits a bit-shape-identical
-    /// outer-form extension. The real-ECH inner/outer split + state
-    /// machine integration lands in a follow-up under the same Phase 5
-    /// banner; today the wire shape is GREASE in either case.
+    /// Groups the first ClientHello carries a `key_share` for (a subset of
+    /// the offered groups). Empty (the default) means every offered group.
+    /// See [`crate::tls::Config::key_shares`].
+    pub key_share_groups: Vec<NamedGroup>,
+    /// ECH client configuration (RFC 9849). `None` (the default) emits no
+    /// `encrypted_client_hello` extension. `Some` — either GREASE or a real
+    /// `ECHConfigList` — emits a bit-shape-identical outer-form extension;
+    /// a real list seals the inner ClientHello into it.
     #[cfg(feature = "ech")]
     pub ech: Option<crate::tls::ech::EchClient>,
     /// RFC 8879 `CertificateCompressionAlgorithm` IDs the client can
@@ -427,6 +429,7 @@ impl ClientConfig {
             key_log: None,
             offer_tls12: false,
             tls12_session: None,
+            key_share_groups: Vec::new(),
             #[cfg(feature = "ech")]
             ech: None,
             #[cfg(feature = "cert-compression")]
@@ -1362,6 +1365,14 @@ impl ClientConnection {
         engine_mode: super::super::quic_hooks::EngineMode,
         hooks: Option<super::super::quic_hooks::BoxedHooks>,
     ) -> Result<Self, Error> {
+        // An explicit `share_groups` (test drivers) wins; otherwise the
+        // configured `key_share_groups` (empty = a share for every group).
+        let configured_shares = config.key_share_groups.clone();
+        let share_groups = if share_groups.is_empty() {
+            configured_shares.as_slice()
+        } else {
+            share_groups
+        };
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
