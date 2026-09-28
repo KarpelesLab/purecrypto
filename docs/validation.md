@@ -231,8 +231,16 @@ update with the commands in `tools/wycheproof/README.md`.
   path (§8.2.2), so the client never migrated; and a key update initiated
   in the same flight as HANDSHAKE_DONE reached the client before it had
   confirmed the handshake, which OpenSSL treats as KEY_UPDATE_ERROR — the
-  server now waits for the HANDSHAKE_DONE packet to be acknowledged. Both
-  have unit tests. OpenSSL covers the client direction only: `s_server`
+  server now waits for the HANDSHAKE_DONE packet to be acknowledged. The
+  first master run then caught a third with the lossy upload: a packet
+  carrying MAX_STREAM_DATA was dropped and nothing ever sent the credit
+  again (loss recovery only knew about CRYPTO, STREAM and HANDSHAKE_DONE),
+  so the quic-go client — which had already reported STREAM_DATA_BLOCKED
+  once, as RFC 9000 §13.3 allows — waited forever. Every stream-layer
+  control frame a lost packet carried (MAX_DATA, MAX_STREAM_DATA,
+  MAX_STREAMS, the `*_BLOCKED` frames, RESET_STREAM, STOP_SENDING) is now
+  sent again as §13.3 requires. All three have unit tests. OpenSSL covers
+  the client direction only: `s_server`
   has no QUIC mode and the server-side API has no command-line front end.
   DTLS 1.3 remains loopback-only (`s_client` here lacks `-dtls1_3`).
 - **BoringSSL, TLS 1.3 Encrypted Client Hello** (RFC 9849, CI job

@@ -208,6 +208,7 @@ mod tests {
             time_sent,
             retransmit_hint: Vec::new(),
             stream_hints: Vec::new(),
+            control_hints: Vec::new(),
             handshake_done: false,
         }
     }

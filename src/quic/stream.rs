@@ -187,7 +187,9 @@ pub(crate) struct SendStream {
     /// True once we have queued a STREAM_DATA_BLOCKED frame at the
     /// current `peer_max_data`. Cleared when `peer_max_data` rises.
     pub(crate) blocked_at: Option<u64>,
-    /// True if a RESET_STREAM frame is queued and not yet emitted.
+    /// True if a RESET_STREAM frame is queued and not yet emitted. Set by
+    /// [`Self::enter_reset`], and again by [`Self::on_reset_lost`] when the
+    /// packet that carried the frame is declared lost (RFC 9000 §13.3).
     pub(crate) reset_pending: bool,
     /// Chunks that have been emitted on the wire and are not yet
     /// confirmed. Each entry is (offset, bytes, fin). Entries are
@@ -330,15 +332,37 @@ impl SendStream {
 
     /// True when the send half has no further work and never will: either
     /// every byte plus the FIN has been acknowledged (`Data Recvd`), or a
-    /// RESET_STREAM has been emitted and nothing remains in flight
-    /// (`Reset Sent`/`Reset Recvd`). RFC 9000 §3.1.
+    /// RESET_STREAM has been emitted *and acknowledged* (`Reset Recvd`).
+    /// RFC 9000 §3.1.
+    ///
+    /// `Reset Sent` is not finished: the RESET_STREAM may still be lost,
+    /// and §13.3 requires it to be retransmitted until acknowledged, which
+    /// needs the stream's state to survive until then.
     pub(crate) fn is_finished(&self) -> bool {
-        if matches!(self.state, SendState::ResetSent | SendState::ResetRecvd) {
-            return !self.reset_pending && !self.has_unacked();
+        match self.state {
+            SendState::ResetRecvd => !self.reset_pending,
+            SendState::DataRecvd => self.write_buf.is_empty() && !self.has_unacked(),
+            _ => false,
         }
-        matches!(self.state, SendState::DataRecvd)
-            && self.write_buf.is_empty()
-            && !self.has_unacked()
+    }
+
+    /// The packet that carried our RESET_STREAM was acknowledged: the send
+    /// half enters `Reset Recvd` (RFC 9000 §3.1), its terminal state.
+    pub(crate) fn on_reset_acked(&mut self) {
+        if matches!(self.state, SendState::ResetSent) {
+            self.state = SendState::ResetRecvd;
+        }
+    }
+
+    /// The packet that carried our RESET_STREAM was declared lost: queue
+    /// the frame again unless a later copy has been acknowledged since
+    /// (RFC 9000 §13.3). Returns whether it was re-queued.
+    pub(crate) fn on_reset_lost(&mut self) -> bool {
+        if matches!(self.state, SendState::ResetSent) && self.reset_code.is_some() {
+            self.reset_pending = true;
+            return true;
+        }
+        false
     }
 
     /// The carrying packet of `[offset, offset + len)` was declared
@@ -591,6 +615,12 @@ pub(crate) struct RecvStream {
     /// True if we have sent STOP_SENDING for this stream — subsequent
     /// inbound bytes are dropped.
     pub(crate) stop_sending_sent: bool,
+    /// The application error code of a STOP_SENDING frame queued and not
+    /// yet emitted: set by [`crate::quic::streams::Streams::stop_sending`],
+    /// cleared when the frame is packed, and set again when the packet that
+    /// carried it is declared lost while the peer is still sending (RFC
+    /// 9000 §13.3).
+    pub(crate) stop_sending_pending: Option<u64>,
     /// True if a MAX_STREAM_DATA frame is queued for this stream.
     pub(crate) max_data_pending: bool,
     /// L-3: cumulative count of this stream's bytes already credited to
@@ -618,6 +648,7 @@ impl RecvStream {
             window: max_data,
             reset_code: None,
             stop_sending_sent: false,
+            stop_sending_pending: None,
             max_data_pending: false,
             conn_fc_credited: 0,
         }

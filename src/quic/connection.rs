@@ -97,7 +97,7 @@ use crate::quic::server::{
     install_initial_keys, random_default_scid, set_cids_from_first_initial,
 };
 use crate::quic::stream::{StreamError, StreamId};
-use crate::quic::streams::Streams;
+use crate::quic::streams::{ControlHint, Streams};
 use crate::quic::tls_glue::HookHandle;
 use crate::quic::transport_params::{PreferredAddress, TransportParameters};
 use crate::quic::varint;
@@ -982,6 +982,10 @@ pub(crate) struct PacketMeta {
     /// True if this packet carries the server's HANDSHAKE_DONE frame
     /// (RFC 9000 §19.20), so loss recovery can re-queue it.
     pub(crate) handshake_done: bool,
+    /// Stream-layer control frames (MAX_DATA, MAX_STREAM_DATA,
+    /// RESET_STREAM, ...) packed into this packet, so loss recovery can
+    /// have them sent again (RFC 9000 §13.3).
+    pub(crate) control_hints: Vec<ControlHint>,
 }
 
 /// Rejects locally-advertised transport parameters that QUIC v1 forbids.
@@ -2388,7 +2392,8 @@ impl QuicConnection {
     }
 
     /// Queues the retransmittable contents of `pkt` — CRYPTO ranges, STREAM
-    /// chunks, HANDSHAKE_DONE — for the next packet build, as a PTO probe
+    /// chunks, stream-layer control frames, HANDSHAKE_DONE — for the next
+    /// packet build, as a PTO probe
     /// (RFC 9002 §6.2.4). Unlike [`Self::handle_lost_packets`] this is not
     /// a loss event: the packet stays in flight and congestion control is
     /// not told anything. DATAGRAM, PATH_* and CID frames are never
@@ -2401,6 +2406,9 @@ impl QuicConnection {
         if let Some(streams) = self.streams.as_mut() {
             for h in &pkt.stream_hints {
                 streams.on_chunk_lost(h.id, h.offset, h.length, h.fin);
+            }
+            for &h in &pkt.control_hints {
+                streams.on_control_lost(h);
             }
         }
         if pkt.handshake_done && !self.handshake_done_acked {
@@ -2453,6 +2461,9 @@ impl QuicConnection {
             for pkt in lost {
                 for h in &pkt.stream_hints {
                     streams.on_chunk_lost(h.id, h.offset, h.length, h.fin);
+                }
+                for &h in &pkt.control_hints {
+                    streams.on_control_lost(h);
                 }
             }
         }
@@ -5706,10 +5717,19 @@ impl QuicConnection {
                             for h in &pkt.stream_hints {
                                 streams.on_chunk_acked(h.id, h.offset, h.length, h.fin);
                             }
+                            for &h in &pkt.control_hints {
+                                streams.on_control_acked(h);
+                            }
                         }
                         for pkt in &lost {
                             for h in &pkt.stream_hints {
                                 streams.on_chunk_lost(h.id, h.offset, h.length, h.fin);
+                            }
+                            // 6c. Control frames the lost packets carried
+                            //     (MAX_DATA, MAX_STREAM_DATA, ...) are sent
+                            //     again if still needed (RFC 9000 §13.3).
+                            for &h in &pkt.control_hints {
+                                streams.on_control_lost(h);
                             }
                         }
                     }
@@ -6593,6 +6613,7 @@ impl QuicConnection {
             time_sent: now,
             retransmit_hint,
             stream_hints: meta.stream_hints.clone(),
+            control_hints: meta.control_hints.clone(),
             handshake_done: meta.handshake_done,
         };
         self.endpoint.loss.on_packet_sent(space_id, sent_pkt);
@@ -6807,6 +6828,11 @@ impl QuicConnection {
                         None => break,
                     };
                     popped.encode(&mut out);
+                    // Record control frames so a lost packet has them
+                    // sent again (RFC 9000 §13.3).
+                    if let Some(hint) = popped.control_hint() {
+                        meta.control_hints.push(hint);
+                    }
                     // Record STREAM chunks for ack/loss accounting.
                     if let crate::quic::streams::PoppedFrame::Stream {
                         id,
@@ -9385,6 +9411,7 @@ mod tests {
                     time_sent: Duration::ZERO,
                     retransmit_hint: Vec::new(),
                     stream_hints: Vec::new(),
+                    control_hints: Vec::new(),
                     handshake_done: false,
                 },
             );
@@ -9429,6 +9456,7 @@ mod tests {
                     time_sent: sent_at,
                     retransmit_hint: Vec::new(),
                     stream_hints: Vec::new(),
+                    control_hints: Vec::new(),
                     handshake_done: false,
                 },
             );
@@ -9498,6 +9526,7 @@ mod tests {
                     time_sent: Duration::from_millis(100),
                     retransmit_hint: Vec::new(),
                     stream_hints: Vec::new(),
+                    control_hints: Vec::new(),
                     handshake_done: false,
                 },
             );
@@ -10313,6 +10342,110 @@ mod tests {
         assert!(c.send_capacity(id).is_err());
         // An unknown stream id is an error, not a zero capacity.
         assert!(c.send_capacity(StreamId(4242)).is_err());
+    }
+
+    /// How a dropped server packet gets declared lost in
+    /// [`lost_credit_is_sent_again`].
+    #[derive(Clone, Copy)]
+    enum Recovery {
+        /// RFC 9002 §6.1.1 — three later packets are acknowledged.
+        PacketThreshold,
+        /// RFC 9002 §6.2.4 — the PTO fires and probes with the oldest
+        /// unacknowledged packet's contents.
+        Pto,
+    }
+
+    /// RFC 9000 §13.3 — the client fills its window (`stream_data` bytes
+    /// of stream credit, or `conn_data` of connection credit, whichever is
+    /// smaller); the server reads everything, which queues fresh credit,
+    /// and the datagram carrying the MAX_STREAM_DATA / MAX_DATA is dropped.
+    /// The credit must be sent again once the loss is detected, and the
+    /// client must be able to write again.
+    ///
+    /// Without that this is a deadlock: the client has no credit and has
+    /// already reported `*_BLOCKED` (a conformant peer sends that once per
+    /// limit; quic-go does), and the server's replenishment — anchored on
+    /// what the application read — fired once, in the lost packet. This is
+    /// exactly how the QUIC interop matrix's lossy 8 MiB upload stalled
+    /// for its full 30 s.
+    fn lost_credit_is_sent_again(stream_data: u64, conn_data: u64, recovery: Recovery) {
+        let window = stream_data.min(conn_data) as usize;
+        let (mut c, mut s) = streams_loopback_pair_with_limits(stream_data, conn_data);
+        drive_until_complete(&mut c, &mut s, 8);
+        let id = c.open_bidi().expect("open bidi");
+        let payload = alloc::vec![0x5au8; 2 * window];
+        let n = c.write(id, &payload).expect("write");
+        assert_eq!(n, window, "the first write fills the window exactly");
+        // Deliver it, and the server's ACKs back. The server has not read
+        // anything yet, so no credit has been queued.
+        for _ in 0..8 {
+            if !pump(&mut c, &mut s) {
+                break;
+            }
+        }
+        assert_eq!(c.write(id, &payload[n..]).expect("write"), 0, "blocked");
+        let sid = s.readable_streams().next().expect("stream delivered");
+        let mut got = 0usize;
+        let mut buf = [0u8; 4096];
+        loop {
+            let (k, _fin) = s.read(sid, &mut buf).expect("server read");
+            if k == 0 {
+                break;
+            }
+            got += k;
+        }
+        assert_eq!(got, window, "server consumed the whole window");
+        // The credit rides the server's next datagram: drop it.
+        let dropped = drain_datagrams(&mut s);
+        assert_eq!(dropped.len(), 1, "one datagram carries the fresh credit");
+        assert_eq!(
+            c.write(id, &payload[n..]).expect("write"),
+            0,
+            "still blocked"
+        );
+
+        match recovery {
+            Recovery::PacketThreshold => {
+                // Three ack-eliciting server packets after the lost one,
+                // each acknowledged by the client, put the lost one three
+                // behind `largest_acked`.
+                for i in 0..3u8 {
+                    s.write(sid, &[i; 600]).expect("server write");
+                    let flight = feed_flight(&mut s, &mut c);
+                    assert_eq!(flight.len(), 1, "one packet per echo chunk");
+                    feed_flight(&mut c, &mut s);
+                }
+            }
+            Recovery::Pto => {
+                let deadline = s.next_timeout().expect("PTO armed for the lost packet");
+                s.on_timeout(deadline);
+            }
+        }
+        // The credit goes out again and unblocks the client.
+        let flight = feed_flight(&mut s, &mut c);
+        assert!(!flight.is_empty(), "the credit is sent again");
+        let more = c.write(id, &payload[n..]).expect("write");
+        assert!(more > 0, "the client can write again");
+    }
+
+    #[test]
+    fn lost_max_stream_data_is_sent_again_on_packet_threshold() {
+        lost_credit_is_sent_again(16 * 1024, 1 << 20, Recovery::PacketThreshold);
+    }
+
+    #[test]
+    fn lost_max_stream_data_is_sent_again_on_pto() {
+        lost_credit_is_sent_again(16 * 1024, 1 << 20, Recovery::Pto);
+    }
+
+    #[test]
+    fn lost_max_data_is_sent_again_on_packet_threshold() {
+        lost_credit_is_sent_again(1 << 20, 16 * 1024, Recovery::PacketThreshold);
+    }
+
+    #[test]
+    fn lost_max_data_is_sent_again_on_pto() {
+        lost_credit_is_sent_again(1 << 20, 16 * 1024, Recovery::Pto);
     }
 
     /// Test 13 — 1 MiB single-stream echo with conservative credit
@@ -13341,6 +13474,7 @@ mod tests {
                     time_sent: Duration::from_millis(pn),
                     retransmit_hint: alloc::vec::Vec::new(),
                     stream_hints: alloc::vec::Vec::new(),
+                    control_hints: alloc::vec::Vec::new(),
                     handshake_done: false,
                 },
             );

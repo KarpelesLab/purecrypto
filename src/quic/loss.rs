@@ -29,6 +29,7 @@ use core::ops::RangeInclusive;
 use core::time::Duration;
 
 use crate::quic::pn::PnSpaceId;
+use crate::quic::streams::ControlHint;
 
 /// RFC 9002 §6.1.1 — `kPacketThreshold = 3`.
 pub(crate) const K_PACKET_THRESHOLD: u64 = 3;
@@ -78,6 +79,10 @@ pub(crate) struct SentPacket {
     /// confirms the ranges (pruning the sender's retransmission state);
     /// on loss, it queues them for retransmission.
     pub(crate) stream_hints: Vec<StreamHint>,
+    /// Stream-layer control frames this packet carried (MAX_DATA,
+    /// MAX_STREAM_DATA, RESET_STREAM, ...). On loss the connection asks
+    /// the stream layer to send them again (RFC 9000 §13.3).
+    pub(crate) control_hints: Vec<ControlHint>,
     /// True if this packet carried the server's HANDSHAKE_DONE frame
     /// (RFC 9000 §19.20). The connection re-queues the frame if the packet
     /// is declared lost before any copy of it is acknowledged.
@@ -1100,6 +1105,7 @@ mod tests {
             time_sent,
             retransmit_hint: Vec::new(),
             stream_hints: Vec::new(),
+            control_hints: Vec::new(),
             handshake_done: false,
         }
     }

@@ -224,6 +224,84 @@ impl PoppedFrame {
         self.encode(&mut buf);
         buf.len()
     }
+
+    /// What the packet carrying this frame must remember of it for RFC
+    /// 9000 §13.3 loss recovery ([`Streams::on_control_lost`]); `None` for
+    /// STREAM data, which the packet tracks by byte range instead.
+    pub(crate) fn control_hint(&self) -> Option<ControlHint> {
+        Some(match *self {
+            PoppedFrame::Stream { .. } => return None,
+            PoppedFrame::ResetStream { id, .. } => ControlHint::ResetStream { id },
+            PoppedFrame::StopSending { id, code } => ControlHint::StopSending { id, code },
+            PoppedFrame::MaxData(limit) => ControlHint::MaxData(limit),
+            PoppedFrame::MaxStreamData { id, limit } => ControlHint::MaxStreamData { id, limit },
+            PoppedFrame::DataBlocked(limit) => ControlHint::DataBlocked(limit),
+            PoppedFrame::StreamDataBlocked { id, limit } => {
+                ControlHint::StreamDataBlocked { id, limit }
+            }
+            PoppedFrame::MaxStreams { dir, limit } => ControlHint::MaxStreams { dir, limit },
+            PoppedFrame::StreamsBlocked { dir, limit } => {
+                ControlHint::StreamsBlocked { dir, limit }
+            }
+        })
+    }
+}
+
+/// A stream-layer control frame a sent packet carried, as the packet
+/// remembers it so the frame can be sent again if the packet is lost
+/// (RFC 9000 §13.3). The connection records one per non-STREAM frame
+/// [`Streams::pop_frame`] hands it, and feeds them back through
+/// [`Streams::on_control_lost`] / [`Streams::on_control_acked`].
+///
+/// Only the identity of the frame is kept, not its bytes: §13.3 wants the
+/// *current* value re-sent (the latest MAX_DATA, a `*_BLOCKED` limit only
+/// while still blocked), so each hint is judged against the live state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlHint {
+    /// RESET_STREAM for stream `id`.
+    ResetStream {
+        /// Stream identifier.
+        id: u64,
+    },
+    /// STOP_SENDING for stream `id` with application error `code`.
+    StopSending {
+        /// Stream identifier.
+        id: u64,
+        /// Application error code.
+        code: u64,
+    },
+    /// MAX_DATA announcing `limit`.
+    MaxData(u64),
+    /// MAX_STREAM_DATA announcing `limit` on stream `id`.
+    MaxStreamData {
+        /// Stream identifier.
+        id: u64,
+        /// The announced limit.
+        limit: u64,
+    },
+    /// DATA_BLOCKED at `limit`.
+    DataBlocked(u64),
+    /// STREAM_DATA_BLOCKED at `limit` on stream `id`.
+    StreamDataBlocked {
+        /// Stream identifier.
+        id: u64,
+        /// The limit we were blocked at.
+        limit: u64,
+    },
+    /// MAX_STREAMS announcing `limit` for `dir`.
+    MaxStreams {
+        /// Bidi or uni.
+        dir: StreamDir,
+        /// The announced count.
+        limit: u64,
+    },
+    /// STREAMS_BLOCKED at `limit` for `dir`.
+    StreamsBlocked {
+        /// Bidi or uni.
+        dir: StreamDir,
+        /// The count we were blocked at.
+        limit: u64,
+    },
 }
 
 /// Connection-wide stream state.
@@ -720,7 +798,7 @@ impl Streams {
         let stream = self.map.get_mut(&id.0).ok_or(Error::InappropriateState)?;
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
         recv.stop_sending_sent = true;
-        recv.reset_code = Some(app_error);
+        recv.stop_sending_pending = Some(app_error);
         self.enqueue_ready(id.0);
         Ok(())
     }
@@ -1230,14 +1308,12 @@ impl Streams {
             }
             // STOP_SENDING (recv side has been signaled).
             if let Some(recv) = stream.recv.as_mut()
-                && recv.stop_sending_sent
-                && recv.reset_code.is_some()
+                && let Some(code) = recv.stop_sending_pending
             {
-                let code = recv.reset_code.expect("just-checked");
                 let frame = PoppedFrame::StopSending { id, code };
                 if frame.encoded_len() <= budget {
                     // Clear the trigger so we don't re-emit.
-                    recv.reset_code = None;
+                    recv.stop_sending_pending = None;
                     self.map.insert(id, stream);
                     let need_requeue = stream_needs_to_send(self.map.get(&id).unwrap());
                     if need_requeue {
@@ -1440,6 +1516,118 @@ impl Streams {
         };
         if moved {
             self.enqueue_ready(id);
+        }
+    }
+
+    /// RFC 9000 §13.3 — a packet carrying the control frame `hint` was
+    /// declared lost: queue the frame again if it is still needed, with
+    /// its current value.
+    ///
+    /// * MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS: re-sent when the lost
+    ///   frame is still the most recent announcement for its scope (a newer
+    ///   one, sent or pending, supersedes it). Stream credit is only
+    ///   re-sent while the receive half is in `Recv`: once the final size
+    ///   is known the peer has all the credit it can use (§13.3, §4.5).
+    /// * DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED: re-sent only
+    ///   while this endpoint is still blocked at that limit.
+    /// * RESET_STREAM: re-sent until acknowledged ([`Self::on_control_acked`]).
+    /// * STOP_SENDING: re-sent until the peer's data or reset ends the
+    ///   receive half.
+    ///
+    /// The lost MAX_STREAM_DATA is what deadlocks a transfer otherwise: the
+    /// peer fills the announced window, sends STREAM_DATA_BLOCKED once, and
+    /// waits; our replenishment is anchored on what the application read
+    /// and fires only once — in the packet that was lost. Nothing on either
+    /// side would send again.
+    pub(crate) fn on_control_lost(&mut self, hint: ControlHint) {
+        match hint {
+            ControlHint::ResetStream { id } => {
+                if let Some(stream) = self.map.get_mut(&id)
+                    && let Some(send) = stream.send.as_mut()
+                    && send.on_reset_lost()
+                {
+                    self.enqueue_ready(id);
+                }
+            }
+            ControlHint::StopSending { id, code } => {
+                if let Some(stream) = self.map.get_mut(&id)
+                    && let Some(recv) = stream.recv.as_mut()
+                    && recv.stop_sending_sent
+                    && matches!(recv.state, RecvState::Recv | RecvState::SizeKnown)
+                {
+                    recv.stop_sending_pending = Some(code);
+                    self.enqueue_ready(id);
+                }
+            }
+            ControlHint::MaxData(limit) => {
+                if self.conn_recv_max_announced == limit {
+                    self.max_data_pending = true;
+                }
+            }
+            ControlHint::MaxStreamData { id, limit } => {
+                if let Some(stream) = self.map.get_mut(&id)
+                    && let Some(recv) = stream.recv.as_mut()
+                    && recv.max_data_announced == limit
+                    && matches!(recv.state, RecvState::Recv)
+                {
+                    recv.max_data_pending = true;
+                    self.enqueue_ready(id);
+                }
+            }
+            ControlHint::DataBlocked(limit) => {
+                if self.conn_send_max == limit && self.conn_send_used >= limit {
+                    self.data_blocked_at = Some(limit);
+                }
+            }
+            ControlHint::StreamDataBlocked { id, limit } => {
+                if let Some(stream) = self.map.get_mut(&id)
+                    && let Some(send) = stream.send.as_mut()
+                    && send.peer_max_data == limit
+                    && send.available_credit() == 0
+                    && matches!(send.state, SendState::Ready | SendState::Send)
+                {
+                    send.blocked_at = Some(limit);
+                    self.enqueue_ready(id);
+                }
+            }
+            ControlHint::MaxStreams { dir, limit } => match dir {
+                StreamDir::Bidi => {
+                    if self.self_max_bidi_announced == limit {
+                        self.max_streams_bidi_pending = true;
+                    }
+                }
+                StreamDir::Uni => {
+                    if self.self_max_uni_announced == limit {
+                        self.max_streams_uni_pending = true;
+                    }
+                }
+            },
+            ControlHint::StreamsBlocked { dir, limit } => match dir {
+                StreamDir::Bidi => {
+                    if self.peer_max_bidi == limit {
+                        self.streams_blocked_bidi_at = Some(limit);
+                    }
+                }
+                StreamDir::Uni => {
+                    if self.peer_max_uni == limit {
+                        self.streams_blocked_uni_at = Some(limit);
+                    }
+                }
+            },
+        }
+    }
+
+    /// A packet carrying the control frame `hint` was acknowledged. Only
+    /// RESET_STREAM has state that waits for this: the send half enters
+    /// `Reset Recvd` (RFC 9000 §3.1) and the stream can be retired.
+    pub(crate) fn on_control_acked(&mut self, hint: ControlHint) {
+        if let ControlHint::ResetStream { id } = hint {
+            if let Some(stream) = self.map.get_mut(&id)
+                && let Some(send) = stream.send.as_mut()
+            {
+                send.on_reset_acked();
+            }
+            self.reap_if_terminal(id);
         }
     }
 
@@ -1699,7 +1887,7 @@ fn stream_needs_to_send(stream: &Stream) -> bool {
         if recv.max_data_pending {
             return true;
         }
-        if recv.stop_sending_sent && recv.reset_code.is_some() {
+        if recv.stop_sending_pending.is_some() {
             return true;
         }
     }
@@ -2457,6 +2645,260 @@ mod tests {
         while s.pop_frame(256).is_some() {}
         s.on_data_blocked(s.conn_recv_max);
         assert!(!s.max_data_pending);
+    }
+
+    /// Pops every queued frame, returning them.
+    fn pop_all(s: &mut Streams) -> Vec<PoppedFrame> {
+        let mut out = Vec::new();
+        while let Some(f) = s.pop_frame(256) {
+            out.push(f);
+        }
+        out
+    }
+
+    /// RFC 9000 §13.3 — the packet carrying our latest MAX_STREAM_DATA /
+    /// MAX_DATA was lost: the credit is queued again, at its current value.
+    /// This is the receiver-side half of the deadlock the interop matrix
+    /// hit: the peer had filled the window and reported STREAM_DATA_BLOCKED
+    /// *before* fresh credit existed, so nothing would ever prompt a
+    /// resend once the one packet carrying the credit was dropped.
+    #[test]
+    fn lost_credit_frames_are_sent_again() {
+        let our = params_with(100, 100, 10);
+        let peer = params_with(1 << 20, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        s.on_stream(0, 0, false, &[0u8; 100]).expect("recv");
+        let mut buf = [0u8; 100];
+        let _ = s.read(StreamId(0), &mut buf).expect("read");
+        let sent = pop_all(&mut s);
+        let max_data = sent
+            .iter()
+            .find_map(|f| {
+                f.control_hint()
+                    .filter(|h| matches!(h, ControlHint::MaxData(_)))
+            })
+            .expect("MAX_DATA was queued");
+        let max_stream_data = sent
+            .iter()
+            .find_map(|f| {
+                f.control_hint()
+                    .filter(|h| matches!(h, ControlHint::MaxStreamData { .. }))
+            })
+            .expect("MAX_STREAM_DATA was queued");
+        assert!(pop_all(&mut s).is_empty(), "nothing else queued");
+
+        // The packet was lost: both frames come back with the same values.
+        s.on_control_lost(max_data);
+        s.on_control_lost(max_stream_data);
+        let again = pop_all(&mut s);
+        let hints: Vec<ControlHint> = again.iter().filter_map(|f| f.control_hint()).collect();
+        assert!(hints.contains(&max_data), "MAX_DATA re-sent: {hints:?}");
+        assert!(
+            hints.contains(&max_stream_data),
+            "MAX_STREAM_DATA re-sent: {hints:?}"
+        );
+        assert!(pop_all(&mut s).is_empty());
+
+        // A stale loss — a newer announcement has gone out since — re-sends
+        // nothing: the newer frame supersedes it.
+        let ControlHint::MaxData(old_limit) = max_data else {
+            unreachable!()
+        };
+        s.on_control_lost(ControlHint::MaxData(old_limit - 1));
+        s.on_control_lost(ControlHint::MaxStreamData {
+            id: 0,
+            limit: old_limit - 1,
+        });
+        assert!(
+            pop_all(&mut s).is_empty(),
+            "a superseded value is not re-sent"
+        );
+
+        // Nor is stream credit for a stream whose final size is known: the
+        // peer cannot send past it, so no more credit is ever needed.
+        s.on_stream(0, 100, true, b"").expect("fin");
+        let recv = s.map.get(&0).unwrap().recv.as_ref().unwrap();
+        let current = ControlHint::MaxStreamData {
+            id: 0,
+            limit: recv.max_data_announced,
+        };
+        s.on_control_lost(current);
+        assert!(
+            pop_all(&mut s).is_empty(),
+            "no credit for a size-known stream"
+        );
+    }
+
+    /// RFC 9000 §13.3 — MAX_STREAMS is re-sent on loss while it is still
+    /// the latest announcement; a `*_BLOCKED` frame only while we are still
+    /// blocked at that limit.
+    #[test]
+    fn lost_max_streams_and_blocked_frames_are_sent_again_while_relevant() {
+        let our = params_with(1 << 16, 1 << 20, 2);
+        let peer = params_with(1 << 16, 1 << 20, 1);
+        let mut s = Streams::new(Role::Client, &our, &peer);
+        // MAX_STREAMS: the peer's uni streams 3 and 7 complete, which grows
+        // the limit we announce.
+        let mut buf = [0u8; 8];
+        for id in [3, 7] {
+            s.on_stream(id, 0, true, b"x").expect("peer uni");
+            let _ = s.read(StreamId(id), &mut buf).expect("read");
+        }
+        let sent = pop_all(&mut s);
+        let max_streams = sent
+            .iter()
+            .find_map(|f| {
+                f.control_hint()
+                    .filter(|h| matches!(h, ControlHint::MaxStreams { .. }))
+            })
+            .expect("MAX_STREAMS was queued");
+        s.on_control_lost(max_streams);
+        let hints: Vec<ControlHint> = pop_all(&mut s)
+            .iter()
+            .filter_map(|f| f.control_hint())
+            .collect();
+        assert_eq!(hints, alloc::vec![max_streams], "MAX_STREAMS re-sent");
+
+        // STREAMS_BLOCKED: we may open one uni stream; the second is refused.
+        s.open_uni().expect("first uni");
+        assert!(s.open_uni().is_err(), "second uni is over the limit");
+        let sent = pop_all(&mut s);
+        let blocked = sent
+            .iter()
+            .find_map(|f| {
+                f.control_hint()
+                    .filter(|h| matches!(h, ControlHint::StreamsBlocked { .. }))
+            })
+            .expect("STREAMS_BLOCKED was queued");
+        s.on_control_lost(blocked);
+        let hints: Vec<ControlHint> = pop_all(&mut s)
+            .iter()
+            .filter_map(|f| f.control_hint())
+            .collect();
+        assert_eq!(
+            hints,
+            alloc::vec![blocked],
+            "STREAMS_BLOCKED re-sent while blocked"
+        );
+        // Once the peer raises the limit, the lost frame is moot.
+        s.on_max_streams(StreamDir::Uni, 8);
+        s.on_control_lost(blocked);
+        assert!(pop_all(&mut s).is_empty(), "not blocked any more");
+
+        // STREAM_DATA_BLOCKED, same rule: the peer's stream limit (100) is
+        // hit first.
+        let our = params_with(1 << 16, 1 << 20, 4);
+        let peer = params_with(100, 1000, 4);
+        let mut s = Streams::new(Role::Client, &our, &peer);
+        let id = s.open_bidi().expect("bidi");
+        assert_eq!(s.write(id, &[0u8; 200]).expect("write"), 100);
+        let sent = pop_all(&mut s);
+        let sdb = sent
+            .iter()
+            .find_map(|f| {
+                f.control_hint()
+                    .filter(|h| matches!(h, ControlHint::StreamDataBlocked { .. }))
+            })
+            .expect("STREAM_DATA_BLOCKED was queued");
+        s.on_control_lost(sdb);
+        let hints: Vec<ControlHint> = pop_all(&mut s)
+            .iter()
+            .filter_map(|f| f.control_hint())
+            .collect();
+        assert_eq!(hints, alloc::vec![sdb], "STREAM_DATA_BLOCKED re-sent");
+        s.on_max_stream_data(id.0, 1000).expect("credit");
+        s.on_control_lost(sdb);
+        assert!(pop_all(&mut s).is_empty(), "not blocked any more");
+
+        // DATA_BLOCKED: the peer's connection limit (100) is hit first.
+        let peer = params_with(1000, 100, 4);
+        let mut s = Streams::new(Role::Client, &our, &peer);
+        let id = s.open_bidi().expect("bidi");
+        assert_eq!(s.write(id, &[0u8; 200]).expect("write"), 100);
+        let sent = pop_all(&mut s);
+        let db = sent
+            .iter()
+            .find_map(|f| {
+                f.control_hint()
+                    .filter(|h| matches!(h, ControlHint::DataBlocked(_)))
+            })
+            .expect("DATA_BLOCKED was queued");
+        s.on_control_lost(db);
+        let hints: Vec<ControlHint> = pop_all(&mut s)
+            .iter()
+            .filter_map(|f| f.control_hint())
+            .collect();
+        assert_eq!(hints, alloc::vec![db], "DATA_BLOCKED re-sent");
+        s.on_max_data(1000);
+        s.on_control_lost(db);
+        assert!(pop_all(&mut s).is_empty(), "not blocked any more");
+    }
+
+    /// RFC 9000 §3.1 / §13.3 — a RESET_STREAM is retransmitted until it is
+    /// acknowledged, and the stream is only retired once it is (`Reset
+    /// Recvd`); STOP_SENDING is re-sent while the peer is still sending.
+    #[test]
+    fn lost_reset_stream_and_stop_sending_are_sent_again() {
+        let our = params_with(1 << 16, 1 << 20, 4);
+        let peer = params_with(1 << 16, 1 << 20, 4);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        // Peer bidi stream 0 arrives complete; we read it and reset our
+        // half — the stream then only awaits the RESET_STREAM's fate.
+        s.on_stream(0, 0, true, b"hi").expect("recv");
+        let mut buf = [0u8; 8];
+        let _ = s.read(StreamId(0), &mut buf).expect("read");
+        s.reset(StreamId(0), 9).expect("reset");
+        let sent = pop_all(&mut s);
+        let reset = sent
+            .iter()
+            .find_map(|f| {
+                f.control_hint()
+                    .filter(|h| matches!(h, ControlHint::ResetStream { .. }))
+            })
+            .expect("RESET_STREAM was queued");
+        assert!(
+            s.map.contains_key(&0),
+            "the stream waits for the RESET_STREAM to be acknowledged"
+        );
+        s.on_control_lost(reset);
+        let hints: Vec<ControlHint> = pop_all(&mut s)
+            .iter()
+            .filter_map(|f| f.control_hint())
+            .collect();
+        assert_eq!(hints, alloc::vec![reset], "RESET_STREAM re-sent");
+        s.on_control_acked(reset);
+        assert!(
+            !s.map.contains_key(&0),
+            "acknowledged: Reset Recvd, retired"
+        );
+        // A stale loss for a retired stream is ignored.
+        s.on_control_lost(reset);
+        assert!(pop_all(&mut s).is_empty());
+
+        // STOP_SENDING on a stream the peer is still sending on.
+        s.on_stream(4, 0, false, b"hi").expect("recv");
+        s.stop_sending(StreamId(4), 5).expect("stop");
+        let sent = pop_all(&mut s);
+        let stop = sent
+            .iter()
+            .find_map(|f| {
+                f.control_hint()
+                    .filter(|h| matches!(h, ControlHint::StopSending { .. }))
+            })
+            .expect("STOP_SENDING was queued");
+        s.on_control_lost(stop);
+        let hints: Vec<ControlHint> = pop_all(&mut s)
+            .iter()
+            .filter_map(|f| f.control_hint())
+            .collect();
+        assert_eq!(hints, alloc::vec![stop], "STOP_SENDING re-sent");
+        // Once the peer resets the stream, it is moot.
+        s.on_reset(4, 5, 2).expect("peer reset");
+        s.on_control_lost(stop);
+        assert!(
+            pop_all(&mut s).is_empty(),
+            "no STOP_SENDING after the peer's reset"
+        );
     }
 
     // QUIC-3 — RFC 9000 §4.1: conn-level FC must be charged on receipt
