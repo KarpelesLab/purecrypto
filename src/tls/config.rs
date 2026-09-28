@@ -306,6 +306,21 @@ pub struct Config {
     /// server ask for one. Inert on the server, on TLS 1.2 (no key shares)
     /// and on DTLS 1.3, whose client always shares every offered group.
     pub key_shares: Option<Vec<NamedGroup>>,
+    /// The (EC)DHE / hybrid key-exchange groups this endpoint uses, in
+    /// preference order. `None` (the default) is every implemented group.
+    ///
+    /// Client (TLS 1.3): the `supported_groups` offer, in this order, with a
+    /// `key_share` for each (narrowed further by [`key_shares`](Self::key_shares)).
+    /// Server (TLS 1.3): the accept-set, selected in THIS order rather than
+    /// the client's — the first listed group the client shared wins; when
+    /// the client shared none of them but advertised one, the server asks
+    /// for it with a HelloRetryRequest (RFC 8446 §4.1.4). Fail-closed: an
+    /// empty list, or one naming no implemented group, makes
+    /// [`Connection::client`](crate::tls::Connection::client) /
+    /// [`Connection::server`](crate::tls::Connection::server) error instead
+    /// of widening back to the defaults. Inert on TLS 1.2 (whose engines
+    /// negotiate from their own fixed list) and on DTLS.
+    pub key_exchange_groups: Option<Vec<NamedGroup>>,
     /// `record_size_limit` extension (RFC 8449). `None` = library default.
     pub record_size_limit: Option<u16>,
     /// RFC 7627 §5.3 — when `true` (the default), a TLS 1.2 handshake
@@ -562,6 +577,7 @@ impl Default for Config {
             alpn_protocols: Vec::new(),
             cipher_suites: None,
             key_shares: None,
+            key_exchange_groups: None,
             record_size_limit: None,
             require_extended_master_secret: true,
             server_cert_type_preference: alloc::vec![0u8], // X.509 only.
@@ -857,6 +873,12 @@ impl ConfigBuilder {
     /// See [`Config::key_shares`].
     pub fn key_shares(mut self, groups: &[NamedGroup]) -> Self {
         self.inner.key_shares = Some(groups.to_vec());
+        self
+    }
+    /// Restrict the key-exchange groups (client offer / server accept-set),
+    /// in preference order. See [`Config::key_exchange_groups`].
+    pub fn key_exchange_groups(mut self, groups: &[NamedGroup]) -> Self {
+        self.inner.key_exchange_groups = Some(groups.to_vec());
         self
     }
     /// Enable or disable peer-certificate chain validation.

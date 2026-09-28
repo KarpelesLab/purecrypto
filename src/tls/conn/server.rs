@@ -368,6 +368,15 @@ pub(crate) struct ServerConfig {
     /// asking the client to redo CH with a share for `g`. `None` (default)
     /// preserves the prior first-acceptable-share-wins behaviour.
     pub(crate) preferred_key_exchange_group: Option<crate::tls::NamedGroup>,
+    /// Key-exchange groups this server accepts, in ITS preference order.
+    /// Empty (the default) accepts every implemented group and takes the
+    /// first usable share in the client's order. Non-empty restricts the
+    /// server to these groups and selects by this order: the first listed
+    /// group the client sent a share for wins; when the client shared none
+    /// of them but advertised one in `supported_groups`, the server asks
+    /// for it with a HelloRetryRequest (RFC 8446 §4.1.4); otherwise the
+    /// handshake fails. See [`crate::tls::Config::key_exchange_groups`].
+    pub(crate) groups: Vec<NamedGroup>,
 }
 
 // The ticket key seals (and unseals) every resumption ticket this server
@@ -414,6 +423,7 @@ impl ServerConfig {
             ech_server: None,
             key_log: None,
             preferred_key_exchange_group: None,
+            groups: Vec::new(),
         }
     }
 
@@ -606,6 +616,13 @@ impl ServerConfig {
     /// client to redo CH with a share for this group.
     pub fn with_preferred_key_exchange_group(mut self, g: crate::tls::NamedGroup) -> Self {
         self.preferred_key_exchange_group = Some(g);
+        self
+    }
+
+    /// Restricts the accepted key-exchange groups to `groups`, in server
+    /// preference order (see [`ServerConfig::groups`]).
+    pub fn with_groups(mut self, groups: Vec<NamedGroup>) -> Self {
+        self.groups = groups;
         self
     }
 
@@ -1038,6 +1055,18 @@ pub struct ServerConnection<R: RngCore> {
     /// The (EC)DHE group asked for in the HRR `key_share` and required
     /// in CH2. `Some` only between HRR emission and CH2 acceptance.
     hrr_selected_group: Option<NamedGroup>,
+    /// The group of the key share the ServerHello answered, once fixed.
+    negotiated_group: Option<NamedGroup>,
+    /// The client offered 0-RTT (`early_data` in its ClientHello), whether
+    /// or not it was accepted.
+    early_data_offered: bool,
+    /// Post-handshake `KeyUpdate`s received from / sent to the client.
+    peer_key_updates: u32,
+    sent_key_updates: u32,
+    /// RFC 8879: the algorithm this server compressed its own `Certificate`
+    /// with, when it sent a `CompressedCertificate`.
+    #[cfg(feature = "cert-compression")]
+    own_cert_compression: Option<u16>,
 }
 
 /// Server-side per-handshake ECH state, populated during
@@ -1166,6 +1195,12 @@ impl<R: RngCore> ServerConnection<R> {
             ech_state: None,
             hrr_ch1_immutable: None,
             hrr_selected_group: None,
+            negotiated_group: None,
+            early_data_offered: false,
+            peer_key_updates: 0,
+            sent_key_updates: 0,
+            #[cfg(feature = "cert-compression")]
+            own_cert_compression: None,
         }
     }
 
@@ -1352,16 +1387,67 @@ impl<R: RngCore> ServerConnection<R> {
 
     /// Whether the just-completed handshake accepted 0-RTT data from the
     /// client. Always `false` on fresh handshakes.
-    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn early_data_accepted(&self) -> bool {
         self.early_data_accepted
     }
 
     /// Whether the just-completed handshake resumed a prior session via PSK
     /// (RFC 8446 §2.2). Always `false` for fresh handshakes.
-    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn psk_used(&self) -> bool {
         self.psk_used
+    }
+
+    /// The key-exchange group the ServerHello's `key_share` answered, once
+    /// the ClientHello has been processed.
+    pub fn negotiated_group(&self) -> Option<NamedGroup> {
+        self.negotiated_group
+    }
+
+    /// Whether the client offered 0-RTT data (RFC 8446 §4.2.10), accepted
+    /// or not.
+    pub fn early_data_offered(&self) -> bool {
+        self.early_data_offered
+    }
+
+    /// `true` when this server sent a HelloRetryRequest (RFC 8446 §4.1.4).
+    pub fn hello_retry_request_sent(&self) -> bool {
+        self.hrr_selected_group.is_some()
+    }
+
+    /// Number of post-handshake `KeyUpdate` messages received from the client.
+    pub fn peer_key_updates(&self) -> u32 {
+        self.peer_key_updates
+    }
+
+    /// Number of `KeyUpdate` messages this server has sent.
+    pub fn sent_key_updates(&self) -> u32 {
+        self.sent_key_updates
+    }
+
+    /// RFC 8879: the `CertificateCompressionAlgorithm` this server compressed
+    /// its own `Certificate` with, or `None` when it went out uncompressed.
+    #[cfg(feature = "cert-compression")]
+    pub fn own_cert_compression(&self) -> Option<u16> {
+        self.own_cert_compression
+    }
+
+    /// RFC 7250: the negotiated `server_certificate_type` for this server's
+    /// own identity (`0` = X.509, the default; `2` = RawPublicKey).
+    pub fn negotiated_server_cert_type(&self) -> u8 {
+        self.negotiated_server_cert_type
+    }
+
+    /// RFC 7250: the negotiated `client_certificate_type` (`0` = X.509, the
+    /// default; `2` = RawPublicKey). Meaningful once a client certificate
+    /// was received.
+    pub fn negotiated_client_cert_type(&self) -> u8 {
+        self.negotiated_client_cert_type
+    }
+
+    /// RFC 8449: `true` when the client offered `record_size_limit` and this
+    /// server echoed it.
+    pub fn record_size_limit_negotiated(&self) -> bool {
+        self.peer_offered_record_size_limit
     }
 
     /// Feeds received TLS bytes.
@@ -1826,6 +1912,7 @@ impl<R: RngCore> ServerConnection<R> {
         if self.consecutive_key_updates > MAX_CONSECUTIVE_KEY_UPDATES {
             return Err(Error::PeerMisbehaved);
         }
+        self.peer_key_updates = self.peer_key_updates.saturating_add(1);
         let suite = self.suite.ok_or(Error::IllegalParameter)?;
         let prev = self
             .client_app_secret
@@ -1862,6 +1949,7 @@ impl<R: RngCore> ServerConnection<R> {
         let next = next_traffic_secret(suite.hash, prev);
         self.core.set_write(suite.crypter(&next));
         self.server_app_secret = Some(next);
+        self.sent_key_updates = self.sent_key_updates.saturating_add(1);
         Ok(())
     }
 
@@ -2084,6 +2172,9 @@ impl<R: RngCore> ServerConnection<R> {
         // (proceed with 1-RTT, the spec-compliant fallback). RFC 8446
         // §4.2.10 forbids 0-RTT after HRR, so on retry we hard-disable it.
         let client_offered_early = ext::find(&ch.extensions, ExtensionType::EARLY_DATA).is_some();
+        if client_offered_early {
+            self.early_data_offered = true;
+        }
         let mut accept_early = !is_retry
             && psk_state.as_ref().is_some_and(|s| s.age_fresh)
             && client_offered_early
@@ -2441,6 +2532,48 @@ impl<R: RngCore> ServerConnection<R> {
                 return Ok(());
             }
         }
+        // RFC 8446 §4.1.4, restricted group set (`ServerConfig::groups`):
+        // when the client shared none of the configured groups but
+        // advertised one in `supported_groups`, ask for the first such group
+        // by HelloRetryRequest. A client that neither shared nor advertised
+        // any of them cannot be served (`handshake_failure`, §4.2.7).
+        if !is_retry && !self.config.groups.is_empty() {
+            let shared_groups: Vec<NamedGroup> =
+                match ext::find(&ch.extensions, ExtensionType::KEY_SHARE) {
+                    Some(ks_body) => ext::parse_client_key_shares(ks_body)?
+                        .into_iter()
+                        .map(|(g, _)| g)
+                        .collect(),
+                    None => Vec::new(),
+                };
+            let usable = |g: &NamedGroup| Self::implements_group(*g);
+            if !self
+                .config
+                .groups
+                .iter()
+                .any(|g| usable(g) && shared_groups.contains(g))
+            {
+                let supported = match ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS) {
+                    Some(sg_body) => ext::parse_supported_groups(sg_body)?,
+                    None => Vec::new(),
+                };
+                let want = self
+                    .config
+                    .groups
+                    .iter()
+                    .copied()
+                    .find(|g| usable(g) && supported.contains(g))
+                    .ok_or(Error::HandshakeFailure)?;
+                if client_offered_early && !self.skip_record_keys() {
+                    let budget = (self.config.max_early_data_size as usize)
+                        .max(MIN_SKIP_EARLY_DATA_BUDGET)
+                        .saturating_add(SKIP_EARLY_DATA_OVERHEAD);
+                    self.core.begin_skip_early_data(budget);
+                }
+                self.emit_hello_retry_request(&ch, suite, want)?;
+                return Ok(());
+            }
+        }
 
         // 0-RTT: if accepting, derive client_early_traffic_secret from
         // Hash(ClientHello) NOW (before SH lands in the transcript) and
@@ -2507,21 +2640,26 @@ impl<R: RngCore> ServerConnection<R> {
                 return Err(Error::IllegalParameter);
             }
             (&shares[0].0, shares[0].1.as_slice())
-        } else {
+        } else if self.config.groups.is_empty() {
             let (g, k) = shares
                 .iter()
-                .find(|(g, _)| {
-                    matches!(
-                        *g,
-                        NamedGroup::X25519MLKEM768
-                            | NamedGroup::X25519
-                            | NamedGroup::SECP256R1
-                            | NamedGroup::SECP384R1
-                    )
-                })
+                .find(|(g, _)| Self::implements_group(*g))
+                .ok_or(Error::HandshakeFailure)?;
+            (g, k.as_slice())
+        } else {
+            // Server preference order (`ServerConfig::groups`): the first
+            // configured group the client shared wins. The share-less case
+            // was turned into a HelloRetryRequest above.
+            let (g, k) = self
+                .config
+                .groups
+                .iter()
+                .filter(|g| Self::implements_group(**g))
+                .find_map(|g| shares.iter().find(|(sg, _)| sg == g))
                 .ok_or(Error::HandshakeFailure)?;
             (g, k.as_slice())
         };
+        self.negotiated_group = Some(*group);
 
         // Server random and ephemeral key share.
         let mut random: Random = [0u8; 32];
@@ -2825,6 +2963,17 @@ impl<R: RngCore> ServerConnection<R> {
             .map(|pf| (pf.scheme.0, pf.content.clone()))
     }
 
+    /// The key-exchange groups this server can complete.
+    fn implements_group(g: NamedGroup) -> bool {
+        matches!(
+            g,
+            NamedGroup::X25519MLKEM768
+                | NamedGroup::X25519
+                | NamedGroup::SECP256R1
+                | NamedGroup::SECP384R1
+        )
+    }
+
     fn key_agreement(
         &mut self,
         group: NamedGroup,
@@ -3080,6 +3229,7 @@ impl<R: RngCore> ServerConnection<R> {
             if let Ok(compressed) =
                 crate::tls::cert_compression::encode_compressed_certificate(alg, cert_body)
             {
+                self.own_cert_compression = Some(alg);
                 self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, compressed);
                 return;
             }

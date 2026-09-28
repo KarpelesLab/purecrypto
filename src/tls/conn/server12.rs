@@ -709,6 +709,12 @@ impl<R: RngCore> ServerConnection12<R> {
         self.suite.map(|s| s.suite.0)
     }
 
+    /// The ECDHE group of the key exchange, once `ServerKeyExchange` fixed
+    /// it (`None` for a resumed session, which performs no key exchange).
+    pub fn negotiated_group(&self) -> Option<NamedGroup> {
+        self.group
+    }
+
     /// Protocol version string (`"TLSv1.2"`, or `"TLSv1.1"`/`"TLSv1.0"` on the
     /// opt-in legacy path) once a CH has been processed.
     #[allow(dead_code)] // introspection not yet surfaced by the public connection wrapper

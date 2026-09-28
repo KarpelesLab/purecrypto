@@ -30,6 +30,29 @@ pub enum NamedGroup {
 }
 
 impl NamedGroup {
+    /// The IANA registry name (`x25519`, `secp256r1`, `secp384r1`,
+    /// `X25519MLKEM768`), as `openssl -groups` and log lines spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            NamedGroup::Secp256r1 => "secp256r1",
+            NamedGroup::Secp384r1 => "secp384r1",
+            NamedGroup::X25519 => "x25519",
+            NamedGroup::X25519MlKem768 => "X25519MLKEM768",
+        }
+    }
+
+    /// The group behind an internal wire codepoint, when it is one the
+    /// engines implement.
+    pub(crate) fn from_wire(g: super::codec::NamedGroup) -> Option<Self> {
+        match g {
+            super::codec::NamedGroup::SECP256R1 => Some(NamedGroup::Secp256r1),
+            super::codec::NamedGroup::SECP384R1 => Some(NamedGroup::Secp384r1),
+            super::codec::NamedGroup::X25519 => Some(NamedGroup::X25519),
+            super::codec::NamedGroup::X25519MLKEM768 => Some(NamedGroup::X25519MlKem768),
+            _ => None,
+        }
+    }
+
     /// Convert to the internal wire codepoint.
     pub(crate) fn to_wire(self) -> super::codec::NamedGroup {
         match self {

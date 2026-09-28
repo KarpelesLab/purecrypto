@@ -392,6 +392,13 @@ pub(crate) struct ClientConfig {
     /// the offered groups). Empty (the default) means every offered group.
     /// See [`crate::tls::Config::key_shares`].
     pub key_share_groups: Vec<NamedGroup>,
+    /// The key-exchange groups offered in `supported_groups`, in preference
+    /// order. Empty (the default) offers every group the engine implements
+    /// (`X25519MLKEM768`, `x25519`, `secp256r1`, `secp384r1`). Groups the
+    /// engine does not implement are dropped; a list that leaves nothing is
+    /// rejected at construction with [`Error::HandshakeFailure`]. See
+    /// [`crate::tls::Config::key_exchange_groups`].
+    pub groups: Vec<NamedGroup>,
     /// ECH client configuration (RFC 9849). `None` (the default) emits no
     /// `encrypted_client_hello` extension. `Some` — either GREASE or a real
     /// `ECHConfigList` — emits a bit-shape-identical outer-form extension;
@@ -430,6 +437,7 @@ impl ClientConfig {
             offer_tls12: false,
             tls12_session: None,
             key_share_groups: Vec::new(),
+            groups: Vec::new(),
             #[cfg(feature = "ech")]
             ech: None,
             #[cfg(feature = "cert-compression")]
@@ -661,6 +669,35 @@ struct PendingClientFlight {
     sats: Secret,
 }
 
+/// Every key-exchange group the TLS 1.3 client implements, in the order it
+/// offers them when [`ClientConfig::groups`] is empty.
+pub(crate) const DEFAULT_GROUPS: [NamedGroup; 4] = [
+    NamedGroup::X25519MLKEM768,
+    NamedGroup::X25519,
+    NamedGroup::SECP256R1,
+    NamedGroup::SECP384R1,
+];
+
+/// Resolves [`ClientConfig::groups`] against [`DEFAULT_GROUPS`]: an empty
+/// restriction offers everything; otherwise the restriction's order is kept
+/// and unimplemented groups are dropped. Fails closed when nothing is left,
+/// so a typo cannot silently widen the offer back to the defaults.
+pub(crate) fn select_offered_groups(restriction: &[NamedGroup]) -> Result<Vec<NamedGroup>, Error> {
+    if restriction.is_empty() {
+        return Ok(DEFAULT_GROUPS.to_vec());
+    }
+    let mut out = Vec::with_capacity(restriction.len());
+    for g in restriction {
+        if DEFAULT_GROUPS.contains(g) && !out.contains(g) {
+            out.push(*g);
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::HandshakeFailure);
+    }
+    Ok(out)
+}
+
 /// A TLS 1.3 client connection.
 pub struct ClientConnection {
     core: ConnectionCore,
@@ -699,6 +736,15 @@ pub struct ClientConnection {
     /// Set to `true` after a single HelloRetryRequest has been processed; a
     /// second one is rejected (RFC 8446 §4.1.4).
     hrr_processed: bool,
+    /// The group of the server's `key_share`, once the ServerHello fixed it.
+    negotiated_group: Option<NamedGroup>,
+    /// Post-handshake `KeyUpdate`s received from / sent to the server.
+    peer_key_updates: u32,
+    sent_key_updates: u32,
+    /// RFC 8879: the algorithm of the `CompressedCertificate` the server
+    /// sent, when it compressed its chain.
+    #[cfg(feature = "cert-compression")]
+    peer_cert_compression: Option<u16>,
     /// The `key_share` group the server selected in a HelloRetryRequest, if the
     /// HRR carried one. RFC 8446 §4.1.4: the real ServerHello that follows the
     /// HRR MUST select this same group; any other group is a protocol
@@ -776,8 +822,12 @@ pub struct ClientConnection {
     rms: Option<Secret>,
 
     /// True if we offered 0-RTT (`early_data` extension in CH); set when the
-    /// session ticket carried a non-zero `max_early_data_size`.
+    /// session ticket carried a non-zero `max_early_data_size`. Cleared by
+    /// a HelloRetryRequest, which ends the offer (§4.2.10).
     early_data_offered: bool,
+    /// Sticky record of `early_data_offered` for reporting: the offer was
+    /// made on CH1 even when an HRR later withdrew it.
+    early_data_was_offered: bool,
     /// True if the server's EncryptedExtensions confirmed 0-RTT acceptance.
     early_data_accepted: bool,
     /// `client_early_traffic_secret`, computed at CH emission. The write
@@ -1058,6 +1108,65 @@ impl ClientConnection {
         self.early_data_accepted
     }
 
+    /// The key-exchange group of the server's `key_share`, once the
+    /// ServerHello has been processed.
+    pub fn negotiated_group(&self) -> Option<NamedGroup> {
+        self.negotiated_group
+    }
+
+    /// Whether this client offered 0-RTT data in its first ClientHello
+    /// (RFC 8446 §4.2.10), accepted or not.
+    // Deliberately not the `early_data_offered` field: that one is live
+    // state a HelloRetryRequest clears; the sticky record is what a caller
+    // asking after the handshake wants.
+    #[allow(clippy::misnamed_getters)]
+    pub fn early_data_offered(&self) -> bool {
+        self.early_data_was_offered
+    }
+
+    /// `true` once a HelloRetryRequest has been processed (RFC 8446 §4.1.4).
+    pub fn hello_retry_request_seen(&self) -> bool {
+        self.hrr_processed
+    }
+
+    /// Number of post-handshake `KeyUpdate` messages received from the server.
+    pub fn peer_key_updates(&self) -> u32 {
+        self.peer_key_updates
+    }
+
+    /// Number of `KeyUpdate` messages this client has sent (explicit
+    /// [`request_key_update`](Self::request_key_update) calls and the
+    /// automatic pre-limit rekeys alike).
+    pub fn sent_key_updates(&self) -> u32 {
+        self.sent_key_updates
+    }
+
+    /// RFC 8879: the `CertificateCompressionAlgorithm` the server's
+    /// `CompressedCertificate` used, or `None` when it sent a plain
+    /// `Certificate` (or no certificate at all).
+    #[cfg(feature = "cert-compression")]
+    pub fn peer_cert_compression(&self) -> Option<u16> {
+        self.peer_cert_compression
+    }
+
+    /// RFC 7250: the negotiated `server_certificate_type` (`0` = X.509, the
+    /// default; `2` = RawPublicKey).
+    pub fn negotiated_server_cert_type(&self) -> u8 {
+        self.negotiated_server_cert_type
+    }
+
+    /// RFC 7250: the negotiated `client_certificate_type` for the client's
+    /// own mTLS identity (`0` = X.509, the default; `2` = RawPublicKey).
+    pub fn negotiated_client_cert_type(&self) -> u8 {
+        self.negotiated_client_cert_type
+    }
+
+    /// RFC 8449: `true` when the server echoed `record_size_limit`, so both
+    /// sides are bound to the negotiated limits.
+    pub fn record_size_limit_negotiated(&self) -> bool {
+        self.record_size_limit_negotiated
+    }
+
     /// The ALPN protocol the server selected, if any (e.g. `b"h2"`).
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
@@ -1229,17 +1338,13 @@ impl ClientConnection {
         } else {
             super::select_offered_suites(&config.cipher_suites, &DEFAULT_SUITES)?
         };
+        let groups = select_offered_groups(&config.groups)?;
         Self::new_with_offer_inner(
             config,
             server_name,
             rng,
             &suites,
-            &[
-                NamedGroup::X25519MLKEM768,
-                NamedGroup::X25519,
-                NamedGroup::SECP256R1,
-                NamedGroup::SECP384R1,
-            ],
+            &groups,
             &[],
             super::super::quic_hooks::EngineMode::Tls,
             None,
@@ -1517,6 +1622,11 @@ impl ClientConnection {
                 })
                 .collect(),
             hrr_processed: false,
+            negotiated_group: None,
+            peer_key_updates: 0,
+            sent_key_updates: 0,
+            #[cfg(feature = "cert-compression")]
+            peer_cert_compression: None,
             hrr_selected_group: None,
             hrr_selected_suite: None,
             suite: None,
@@ -1541,6 +1651,7 @@ impl ClientConnection {
             stored_session: None,
             rms: None,
             early_data_offered: false,
+            early_data_was_offered: false,
             early_data_accepted: false,
             cets: None,
             early_data_suite: None,
@@ -1573,6 +1684,7 @@ impl ClientConnection {
                 && effective_suites.contains(&CipherSuite(session.cipher_suite))
             {
                 conn.early_data_offered = true;
+                conn.early_data_was_offered = true;
             }
         }
         // draft-ietf-tls-esni-22 §6: if the client is configured for
@@ -2375,6 +2487,7 @@ impl ClientConnection {
         if self.consecutive_key_updates > MAX_CONSECUTIVE_KEY_UPDATES {
             return Err(Error::PeerMisbehaved);
         }
+        self.peer_key_updates = self.peer_key_updates.saturating_add(1);
         let suite = self.suite.ok_or(Error::IllegalParameter)?;
 
         // Read side: derive next server_app_secret and re-key.
@@ -2423,6 +2536,7 @@ impl ClientConnection {
         let next = next_traffic_secret(suite.hash, prev);
         self.core.set_write(suite.crypter(&next));
         self.client_app_secret = Some(next);
+        self.sent_key_updates = self.sent_key_updates.saturating_add(1);
         Ok(())
     }
 
@@ -2578,6 +2692,7 @@ impl ClientConnection {
             return Err(Error::IllegalParameter);
         }
         let shared = self.key_agreement(group, &server_pub)?;
+        self.negotiated_group = Some(group);
 
         // PSK acceptance: if the server echoes pre_shared_key in SH with
         // `selected_identity = 0`, seed the schedule from the offered PSK
@@ -3567,6 +3682,7 @@ impl ClientConnection {
                 return Err(Error::IllegalParameter);
             }
             _decompressed = crate::tls::cert_compression::decode_compressed_certificate(body)?;
+            self.peer_cert_compression = Some(algorithm);
             &_decompressed
         } else if msg_type == hs_type::CERTIFICATE {
             body

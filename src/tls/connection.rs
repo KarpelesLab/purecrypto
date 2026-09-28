@@ -14,6 +14,7 @@ use crate::rng::{CryptoRng, RngCore};
 
 use super::config::Config;
 use super::error::Error;
+use super::groups::NamedGroup;
 #[cfg(feature = "dtls")]
 use super::opts::DtlsOpts;
 use super::opts::{ClientOpts, CommonOpts, ServerOpts};
@@ -1309,6 +1310,257 @@ impl Connection {
         }
     }
 
+    /// The TLS 1.3 client engine, when this connection is (still) one.
+    fn tls13_client(&self) -> Option<&super::conn::ClientConnection> {
+        match &self.inner {
+            Engine::ClientTls13(c) => Some(c),
+            Engine::ClientTlsAuto(a) => match &a.inner {
+                ClientInner::Tls13(c) => Some(c),
+                ClientInner::Tls12(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn tls13_client_mut(&mut self) -> Option<&mut super::conn::ClientConnection> {
+        match &mut self.inner {
+            Engine::ClientTls13(c) => Some(c),
+            Engine::ClientTlsAuto(a) => match &mut a.inner {
+                ClientInner::Tls13(c) => Some(c),
+                ClientInner::Tls12(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The TLS 1.3 server engine, once resolved.
+    fn tls13_server(&self) -> Option<&super::conn::ServerConnection<ConfigRng>> {
+        match &self.inner {
+            Engine::ServerTls13(c) => Some(c),
+            Engine::ServerTlsAuto(a) => match &a.resolved {
+                Some(ResolvedServer::Tls13(c)) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn tls13_server_mut(&mut self) -> Option<&mut super::conn::ServerConnection<ConfigRng>> {
+        match &mut self.inner {
+            Engine::ServerTls13(c) => Some(c),
+            Engine::ServerTlsAuto(a) => match &mut a.resolved {
+                Some(ResolvedServer::Tls13(c)) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn tls12_client(&self) -> Option<&super::conn::ClientConnection12> {
+        match &self.inner {
+            Engine::ClientTls12(c) => Some(c),
+            Engine::ClientTlsAuto(a) => match &a.inner {
+                ClientInner::Tls12(c) => Some(c),
+                ClientInner::Tls13(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn tls12_server(&self) -> Option<&super::conn::ServerConnection12<ConfigRng>> {
+        match &self.inner {
+            Engine::ServerTls12(c) => Some(c),
+            Engine::ServerTlsAuto(a) => match &a.resolved {
+                Some(ResolvedServer::Tls12(c)) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The key-exchange group the handshake used: the group of the
+    /// ServerHello `key_share` on TLS 1.3, the `ServerKeyExchange` curve on
+    /// TLS 1.2. `None` until the handshake has fixed it, on a resumed TLS
+    /// 1.2 session (no key exchange), and on the DTLS engines.
+    pub fn negotiated_group(&self) -> Option<NamedGroup> {
+        let wire = if let Some(c) = self.tls13_client() {
+            c.negotiated_group()
+        } else if let Some(c) = self.tls13_server() {
+            c.negotiated_group()
+        } else if let Some(c) = self.tls12_client() {
+            c.negotiated_group()
+        } else if let Some(c) = self.tls12_server() {
+            c.negotiated_group()
+        } else {
+            None
+        };
+        wire.and_then(NamedGroup::from_wire)
+    }
+
+    /// `true` when a TLS 1.3 HelloRetryRequest was part of this handshake
+    /// (received, on a client; sent, on a server) — RFC 8446 §4.1.4.
+    pub fn hello_retry_request_used(&self) -> bool {
+        if let Some(c) = self.tls13_client() {
+            c.hello_retry_request_seen()
+        } else if let Some(c) = self.tls13_server() {
+            c.hello_retry_request_sent()
+        } else {
+            false
+        }
+    }
+
+    /// `true` when the handshake resumed an earlier session: a TLS 1.3
+    /// PSK (RFC 8446 §2.2) or a TLS 1.2 session ticket (RFC 5077).
+    pub fn resumed(&self) -> bool {
+        if let Some(c) = self.tls13_client() {
+            c.psk_accepted()
+        } else if let Some(c) = self.tls13_server() {
+            c.psk_used()
+        } else if let Some(c) = self.tls12_client() {
+            c.did_resume()
+        } else if let Some(c) = self.tls12_server() {
+            c.did_resume()
+        } else {
+            false
+        }
+    }
+
+    /// TLS 1.3 0-RTT: `true` when the server accepted the early data this
+    /// client offered, or (on a server) when this server accepted the
+    /// client's — RFC 8446 §4.2.10. Early data the server rejected was
+    /// never delivered; the client must resend it after the handshake.
+    pub fn early_data_accepted(&self) -> bool {
+        if let Some(c) = self.tls13_client() {
+            c.early_data_accepted()
+        } else if let Some(c) = self.tls13_server() {
+            c.early_data_accepted()
+        } else {
+            false
+        }
+    }
+
+    /// TLS 1.3 0-RTT: `true` when early data was offered on this
+    /// connection — by this client, or by the peer of this server — whether
+    /// or not it was then accepted (see
+    /// [`early_data_accepted`](Self::early_data_accepted)).
+    pub fn early_data_offered(&self) -> bool {
+        if let Some(c) = self.tls13_client() {
+            c.early_data_offered()
+        } else if let Some(c) = self.tls13_server() {
+            c.early_data_offered()
+        } else {
+            false
+        }
+    }
+
+    /// TLS 1.3 post-handshake rekey (RFC 8446 §4.6.3): sends
+    /// `KeyUpdate(update_requested)`, rolls this side's write key forward
+    /// at once, and asks the peer to do the same; the peer's answering
+    /// `KeyUpdate` rolls the read key. Errors with
+    /// [`Error::InappropriateState`] before the handshake completes, on a
+    /// TLS 1.2 connection (no such mechanism) and on QUIC (which rekeys
+    /// through its Key Phase bit, RFC 9001 §6).
+    pub fn request_key_update(&mut self) -> Result<(), Error> {
+        if let Some(c) = self.tls13_client_mut() {
+            c.request_key_update()
+        } else if let Some(c) = self.tls13_server_mut() {
+            c.request_key_update()
+        } else {
+            Err(Error::InappropriateState)
+        }
+    }
+
+    /// Number of TLS 1.3 `KeyUpdate` messages received from the peer so far.
+    pub fn peer_key_updates(&self) -> u32 {
+        if let Some(c) = self.tls13_client() {
+            c.peer_key_updates()
+        } else if let Some(c) = self.tls13_server() {
+            c.peer_key_updates()
+        } else {
+            0
+        }
+    }
+
+    /// Number of TLS 1.3 `KeyUpdate` messages this side has sent so far:
+    /// explicit [`request_key_update`](Self::request_key_update) calls,
+    /// replies to the peer's `update_requested`, and the engine's automatic
+    /// pre-limit rekeys alike.
+    pub fn sent_key_updates(&self) -> u32 {
+        if let Some(c) = self.tls13_client() {
+            c.sent_key_updates()
+        } else if let Some(c) = self.tls13_server() {
+            c.sent_key_updates()
+        } else {
+            0
+        }
+    }
+
+    /// RFC 7250: `true` when the peer authenticated with a raw public key
+    /// (a bare `SubjectPublicKeyInfo`) rather than an X.509 chain — the
+    /// negotiated `server_certificate_type` on a client, the negotiated
+    /// `client_certificate_type` on a server. `false` when the peer sent
+    /// X.509, sent nothing (a resumed handshake, an anonymous client) or
+    /// on TLS 1.2 / DTLS.
+    pub fn peer_raw_public_key(&self) -> bool {
+        const RAW_PUBLIC_KEY: u8 = super::codec::cert_type::RAW_PUBLIC_KEY;
+        if let Some(c) = self.tls13_client() {
+            c.negotiated_server_cert_type() == RAW_PUBLIC_KEY && !c.peer_certificates().is_empty()
+        } else if let Some(c) = self.tls13_server() {
+            c.negotiated_client_cert_type() == RAW_PUBLIC_KEY && !c.peer_certificates().is_empty()
+        } else {
+            false
+        }
+    }
+
+    /// RFC 7250: `true` when this side's own identity went out as a raw
+    /// public key (a client's mTLS identity, a server's identity) rather
+    /// than an X.509 chain.
+    pub fn own_raw_public_key(&self) -> bool {
+        const RAW_PUBLIC_KEY: u8 = super::codec::cert_type::RAW_PUBLIC_KEY;
+        if let Some(c) = self.tls13_client() {
+            c.negotiated_client_cert_type() == RAW_PUBLIC_KEY
+        } else if let Some(c) = self.tls13_server() {
+            c.negotiated_server_cert_type() == RAW_PUBLIC_KEY
+        } else {
+            false
+        }
+    }
+
+    /// RFC 8879: the `CertificateCompressionAlgorithm` codepoint the peer
+    /// compressed its `Certificate` with (`1` = zlib), or `None` when it
+    /// arrived uncompressed. Only a TLS 1.3 client receives compressed
+    /// certificates today.
+    #[cfg(feature = "cert-compression")]
+    pub fn peer_cert_compression(&self) -> Option<u16> {
+        self.tls13_client().and_then(|c| c.peer_cert_compression())
+    }
+
+    /// RFC 8879: the `CertificateCompressionAlgorithm` codepoint this side
+    /// compressed its own `Certificate` with, or `None` when it went out
+    /// uncompressed. Only a TLS 1.3 server compresses today.
+    #[cfg(feature = "cert-compression")]
+    pub fn own_cert_compression(&self) -> Option<u16> {
+        self.tls13_server().and_then(|c| c.own_cert_compression())
+    }
+
+    /// Client: the DER `OCSPResponse` the server stapled (RFC 6066 §8 /
+    /// RFC 6960), when it did. TLS 1.3 only.
+    pub fn peer_ocsp_response(&self) -> Option<&[u8]> {
+        self.tls13_client().and_then(|c| c.peer_ocsp_response())
+    }
+
+    /// RFC 8449: `true` when both sides sent `record_size_limit`, so the
+    /// negotiated limits bind this connection. TLS 1.3 only.
+    pub fn record_size_limit_negotiated(&self) -> bool {
+        if let Some(c) = self.tls13_client() {
+            c.record_size_limit_negotiated()
+        } else if let Some(c) = self.tls13_server() {
+            c.record_size_limit_negotiated()
+        } else {
+            false
+        }
+    }
+
     /// DTLS: next retransmit timeout. None on TLS variants.
     pub fn next_timeout(&self) -> Option<Duration> {
         match &self.inner {
@@ -1472,6 +1724,7 @@ pub(crate) fn tls13_client_config(
         verification_time,
         alpn_protocols,
         record_size_limit,
+        key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
         client_cert_type_preference,
@@ -1508,6 +1761,13 @@ pub(crate) fn tls13_client_config(
     cc.verify_certificates = verify_certificates;
     if let Some(groups) = key_shares {
         cc.key_share_groups = groups.iter().map(|g| g.to_wire()).collect();
+    }
+    if let Some(groups) = key_exchange_groups {
+        // Fail closed on an empty restriction (see `Config::key_exchange_groups`).
+        if groups.is_empty() {
+            return Err(Error::HandshakeFailure);
+        }
+        cc.groups = groups.iter().map(|g| g.to_wire()).collect();
     }
     match transport {
         Tls13Transport::Tls => {
@@ -1613,6 +1873,7 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         verification_time,
         alpn_protocols,
         record_size_limit,
+        key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
         client_cert_type_preference,
@@ -1639,7 +1900,7 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
     // caller resolves `server_name`.
     // TLS 1.2 has no key shares (its ECDHE group is picked by the server
     // from `supported_groups`).
-    let _ = (rng, signer, server_name, key_shares);
+    let _ = (rng, signer, server_name, key_shares, key_exchange_groups);
     #[cfg(feature = "cert-compression")]
     let _ = cert_compression_algorithms;
     #[cfg(feature = "ech")]
@@ -1771,6 +2032,7 @@ pub(crate) fn tls13_server_config(
         verification_time,
         alpn_protocols,
         record_size_limit,
+        key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
         client_cert_type_preference,
@@ -1878,6 +2140,15 @@ pub(crate) fn tls13_server_config(
     if let Some(g) = preferred_key_exchange_group {
         sc = sc.with_preferred_key_exchange_group(g);
     }
+    if let Some(groups) = key_exchange_groups {
+        // Fail closed on a restriction naming nothing the engine implements
+        // (see `Config::key_exchange_groups`); every public `NamedGroup` is
+        // implemented, so only the empty list can trip this.
+        if groups.is_empty() {
+            return Err(Error::HandshakeFailure);
+        }
+        sc = sc.with_groups(groups.iter().map(|g| g.to_wire()).collect());
+    }
     if let Some(t) = verification_time {
         sc = sc.with_verification_time(t.clone());
     }
@@ -1902,6 +2173,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
         verification_time,
         alpn_protocols,
         record_size_limit,
+        key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
         client_cert_type_preference,
@@ -1928,13 +2200,15 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     // Inert on the TLS 1.2 engine (see the `Config` field docs): a server's
     // trust anchors for mTLS come from `client_auth`; there is no per-cert
     // extension slot for a stapled CRL, no 0-RTT, no RFC 8879 compression,
-    // no ECH and no HelloRetryRequest group preference. `rng` is drawn
-    // through `config_rng`, `signer` through `Connection::drive`.
+    // no ECH and no HelloRetryRequest group preference (the 1.2 engine
+    // negotiates from its own fixed group list). `rng` is drawn through
+    // `config_rng`, `signer` through `Connection::drive`.
     let _ = (
         roots,
         stapled_crl,
         max_early_data_size,
         preferred_key_exchange_group,
+        key_exchange_groups,
         rng,
         signer,
     );
@@ -2036,6 +2310,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         verification_time,
         alpn_protocols,
         record_size_limit,
+        key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
         client_cert_type_preference,
@@ -2072,11 +2347,12 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     // the documented "wrong version is ignored" rule. RFC 8879 certificate
     // compression is not implemented over DTLS: the advertisement is not
     // sent, and the peer's certificate arrives uncompressed. `key_shares`
-    // is not wired either: the DTLS 1.3 client shares every offered group
-    // (and DTLS 1.2 has no key shares).
+    // and `key_exchange_groups` are not wired either: the DTLS 1.3 client
+    // offers, and shares, every group (and DTLS 1.2 has no key shares).
     let _ = (
         min_version,
         max_version,
+        key_exchange_groups,
         cookie_secret,
         previous_cookie_secret,
         require_cookie,
@@ -2272,6 +2548,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         verification_time,
         alpn_protocols,
         record_size_limit,
+        key_exchange_groups,
         require_extended_master_secret,
         server_cert_type_preference,
         client_cert_type_preference,
@@ -2307,11 +2584,12 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     // which is refused below; the DTLS servers issue no session tickets,
     // accept no 0-RTT (so `max_early_data_size` and the replay window have
     // nothing to guard), staple nothing, do not compress certificates and do
-    // not bias the key-exchange group. `rng` is drawn through `config_rng`
-    // and `signer` through `Connection::drive`.
+    // not bias or restrict the key-exchange group. `rng` is drawn through
+    // `config_rng` and `signer` through `Connection::drive`.
     let _ = (
         min_version,
         max_version,
+        key_exchange_groups,
         roots,
         crls,
         verification_time,
@@ -2697,6 +2975,203 @@ mod tests {
         server.feed(&ch1).unwrap();
         drive_pair(&mut client, &mut server);
         assert!(client.is_handshake_complete() && server.is_handshake_complete());
+    }
+
+    /// The negotiated-parameter accessors on a plain TLS 1.3 handshake, and
+    /// the client's `psk_key_exchange_modes` advertisement earning a ticket.
+    #[test]
+    fn negotiated_parameters_of_a_fresh_handshake() {
+        use crate::tls::NamedGroup;
+        let client_cfg = tls13_client_cfg(None);
+        let server_cfg = tls13_server_cfg(true);
+        let mut client = Connection::client(&client_cfg).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        for c in [&client, &server] {
+            assert_eq!(c.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+            // The client shares X25519MLKEM768 first and the server takes
+            // the first usable share.
+            assert_eq!(c.negotiated_group(), Some(NamedGroup::X25519MlKem768));
+            assert!(!c.hello_retry_request_used());
+            assert!(!c.resumed());
+            assert!(!c.early_data_offered());
+            assert!(!c.early_data_accepted());
+            assert!(!c.peer_raw_public_key());
+            assert!(!c.own_raw_public_key());
+            assert!(!c.record_size_limit_negotiated());
+            assert_eq!((c.sent_key_updates(), c.peer_key_updates()), (0, 0));
+        }
+        assert!(client.peer_ocsp_response().is_none());
+        // A session was issued (the ticket rides on drive_pair's extra round).
+        assert!(client.take_session().is_some());
+    }
+
+    /// `ConfigBuilder::key_exchange_groups` on the client narrows both the
+    /// `supported_groups` offer and the shares to the listed groups, in
+    /// order; an empty list fails closed.
+    #[test]
+    fn key_exchange_groups_restricts_the_client_offer() {
+        use crate::tls::NamedGroup;
+        use crate::tls::codec::extension as ext;
+        use crate::tls::codec::{ClientHello, ExtensionType};
+        let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .server_name("tls.example")
+            .verify_certificates(false)
+            .key_exchange_groups(&[NamedGroup::Secp384r1, NamedGroup::X25519])
+            .build();
+        let mut client = Connection::client(&client_cfg).unwrap();
+        let _ = client.handshake();
+        let ch1 = client.pop().unwrap();
+        let hello = ClientHello::decode(&ch1[9..]).expect("ClientHello");
+        let shares = ext::parse_client_key_shares(
+            ext::find(&hello.extensions, ExtensionType::KEY_SHARE).expect("key_share"),
+        )
+        .expect("key shares");
+        let share_groups: Vec<_> = shares.iter().map(|(g, _)| *g).collect();
+        assert_eq!(
+            share_groups,
+            [
+                NamedGroup::Secp384r1.to_wire(),
+                NamedGroup::X25519.to_wire()
+            ]
+        );
+        let supported = ext::parse_supported_groups(
+            ext::find(&hello.extensions, ExtensionType::SUPPORTED_GROUPS)
+                .expect("supported_groups"),
+        )
+        .expect("supported groups");
+        assert_eq!(
+            supported,
+            [
+                NamedGroup::Secp384r1.to_wire(),
+                NamedGroup::X25519.to_wire()
+            ]
+        );
+        // The server takes the client's first share, and both agree.
+        let mut server = Connection::server(&tls13_server_cfg(false)).unwrap();
+        server.feed(&ch1).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert_eq!(client.negotiated_group(), Some(NamedGroup::Secp384r1));
+        assert_eq!(server.negotiated_group(), Some(NamedGroup::Secp384r1));
+
+        let empty = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .server_name("tls.example")
+            .key_exchange_groups(&[])
+            .build();
+        assert!(Connection::client(&empty).is_err());
+    }
+
+    /// `ConfigBuilder::key_exchange_groups` on the server selects in the
+    /// server's order among the client's shares, and asks for a listed group
+    /// the client only advertised through a HelloRetryRequest.
+    #[test]
+    fn server_key_exchange_groups_selects_and_retries() {
+        use crate::tls::NamedGroup;
+        // The default client shares every group; a server preferring P-384
+        // takes it although the client listed it last.
+        let mut server_cfg = tls13_server_cfg(false);
+        server_cfg.key_exchange_groups =
+            Some(alloc::vec![NamedGroup::Secp384r1, NamedGroup::X25519]);
+        let mut client = Connection::client(&tls13_client_cfg(None)).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert_eq!(client.negotiated_group(), Some(NamedGroup::Secp384r1));
+        assert_eq!(server.negotiated_group(), Some(NamedGroup::Secp384r1));
+        assert!(!server.hello_retry_request_used());
+
+        // A client sharing only X25519 against a P-256-only server: HRR.
+        let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .server_name("tls.example")
+            .verify_certificates(false)
+            .key_shares(&[NamedGroup::X25519])
+            .build();
+        let mut server_cfg = tls13_server_cfg(false);
+        server_cfg.key_exchange_groups = Some(alloc::vec![NamedGroup::Secp256r1]);
+        let mut client = Connection::client(&client_cfg).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert!(client.hello_retry_request_used());
+        assert!(server.hello_retry_request_used());
+        assert_eq!(client.negotiated_group(), Some(NamedGroup::Secp256r1));
+        assert_eq!(server.negotiated_group(), Some(NamedGroup::Secp256r1));
+
+        // A client that neither shares nor advertises the server's group
+        // cannot be served.
+        let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .server_name("tls.example")
+            .verify_certificates(false)
+            .key_exchange_groups(&[NamedGroup::X25519])
+            .build();
+        let mut client = Connection::client(&client_cfg).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let _ = client.handshake();
+        let ch = client.pop().unwrap();
+        assert!(server.feed(&ch).is_err() || server.handshake().is_err());
+    }
+
+    /// `Connection::request_key_update` rolls both directions and the
+    /// counters see the request and the peer's reply.
+    #[test]
+    fn key_update_round_trips_and_is_counted() {
+        let mut client = Connection::client(&tls13_client_cfg(None)).unwrap();
+        let mut server = Connection::server(&tls13_server_cfg(false)).unwrap();
+        drive_pair(&mut client, &mut server);
+        client.request_key_update().unwrap();
+        client.send(b"after rekey").unwrap();
+        server.feed(&client.pop().unwrap()).unwrap();
+        assert_eq!(server.recv().unwrap(), b"after rekey");
+        assert_eq!(server.peer_key_updates(), 1);
+        // The server owes a reply, sent with its next write.
+        server.send(b"reply").unwrap();
+        client.feed(&server.pop().unwrap()).unwrap();
+        assert_eq!(client.recv().unwrap(), b"reply");
+        assert_eq!(
+            (client.sent_key_updates(), client.peer_key_updates()),
+            (1, 1)
+        );
+        assert_eq!(
+            (server.sent_key_updates(), server.peer_key_updates()),
+            (1, 1)
+        );
+        // TLS 1.2 has no KeyUpdate.
+        let mut c12 = Connection::client(&tls12_client_cfg()).unwrap();
+        assert!(matches!(
+            c12.request_key_update(),
+            Err(Error::InappropriateState)
+        ));
+    }
+
+    /// `resumed` / `early_data_*` follow a PSK resumption with 0-RTT.
+    #[test]
+    fn resumption_and_early_data_are_reported() {
+        let server_cfg = {
+            let mut c = tls13_server_cfg(true);
+            c.max_early_data_size = 4096;
+            c
+        };
+        let mut client = Connection::client(&tls13_client_cfg(None)).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        let session = client.take_session().expect("ticket");
+        let mut client = Connection::client(&tls13_client_cfg(Some(session))).unwrap();
+        client.write_early_data(b"0rtt").unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        for c in [&client, &server] {
+            assert!(c.resumed());
+            assert!(c.early_data_offered());
+            assert!(c.early_data_accepted());
+            assert!(!c.hello_retry_request_used());
+        }
+        assert_eq!(server.take_early_data().unwrap(), b"0rtt");
     }
 
     /// `Connection::ech_accepted` reports real ECH on both ends, and stays
