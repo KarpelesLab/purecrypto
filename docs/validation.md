@@ -72,7 +72,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `xmss` | RFC 8391, SP 800-208 | ref-impl KAT | ref vectors | `xmss_parse` | n/a (hash-based, **stateful**) |
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
-| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6 and BoringSSL, both roles** (CI: certs × groups × suites, resumption, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
+| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL and Apple's Network.framework, both roles** (CI: certs × groups × suites, resumption, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
 | `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
@@ -345,6 +345,56 @@ update with the commands in `tools/wycheproof/README.md`.
   connection's `close_notify`); and SChannel answers a
   `KeyUpdate(update_requested)` only with the next application-data
   record it sends.
+- **Apple's TLS stack (Network.framework), TLS 1.3 matrix, both roles** (the
+  `apple` job of `interop.yml` on `macos-latest`; adapter
+  `tools/interop/peers/apple.sh` driving the Swift tool in
+  `tools/interop/peers/apple/`, an `NWConnection` client and an `NWListener`
+  server configured through `sec_protocol_options_*`): the same 226-case
+  matrix against the OS's TLS stack — the peer version is the runner's
+  macOS (`macos-latest` was 26.6.2 / 25G83 when this landed; the job
+  prints `sw_vers`). Identities are PKCS#12 archives the purecrypto CLI exports
+  (`pkcs12 -export`) imported into a throwaway keychain; groups, 0-RTT,
+  resumption and compression facts, and raw public keys go through SPI
+  from Apple's open-source `SecProtocolPriv.h`, resolved at run time and
+  SKIPped with a reason when absent. `C` / `S` as above:
+
+  | Case | Apple (C / S) |
+  |---|---|
+  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384, X25519MLKEM768}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ (the client offers both AES-GCM suites whichever is asked for; the purecrypto server's `-ciphersuites` pins the case's) |
+  | Plain, Ed25519 certificate | ⏭ the stack offers no `ed25519` signature scheme (with or without the eddsa SPI) and its keychain has no Ed25519 keys |
+  | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA |
+  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them |
+  | Resumption (PSK + DHE) | ✅ / ✅ |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only |
+  | 0-RTT accepted | ✅ / ⏭ a listener that accepts 0-RTT never completes the connection (`errSSLClosedNoNotify`; OpenSSL's client sees the same) |
+  | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ✅ / ✅ |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ |
+  | HelloRetryRequest to `X25519MLKEM768` | ⏭ the client always shares it / ✅ |
+  | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ |
+  | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ as above |
+  | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ |
+  | KeyUpdate (`update_requested`) from the peer, purecrypto replies | ⏭ no API to send one |
+  | RFC 8879 zlib certificate compression (server certificate) | ✅ / ✅ (the stack compresses its own and accepts ours) |
+  | RFC 7250 raw public key, server identity | ✅ / ⏭ presenting one through the SPI fails with `errSSLInternal` |
+  | RFC 7250 raw public key, client identity | ⏭ same / ✅ (the allowlist is enforced: a key not on it draws `bad_certificate`) |
+  | OCSP stapling | ✅ / ⏭ no API to staple on a server |
+  | ALPN | ✅ / ✅ |
+  | RFC 8449 `record_size_limit` | ⏭ not implemented by Apple's stack |
+  | Chain > 16 KiB (Certificate spans records) | ✅ / ✅ |
+  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ |
+  | `close_notify` from the peer | ✅ / ✅ (checked on the purecrypto side; Network.framework reports a `close_notify` and a bare FIN alike) |
+
+  What this peer caught: a server may issue its NewSessionTickets with its
+  first write rather than right after the handshake (Apple's does), so a
+  client that sends nothing and waits for a ticket waits forever —
+  `s_client -reconnect` now closes after its wait and takes the tickets
+  that come back with the server's goodbye. And `Config::cipher_suites`
+  was inert on the server: a client that cannot narrow its offer (Apple's
+  sends both AES-GCM suites for either) could never be steered to
+  AES-256-GCM; the TLS 1.3 server now honours it as its accept-set in
+  server preference order (`s_server -ciphersuites`). The Apple client
+  resumes only with early data enabled through the SPI; the tool enables
+  it for the resumption cases without queuing any 0-RTT.
 - **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server

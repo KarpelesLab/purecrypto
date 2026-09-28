@@ -116,6 +116,10 @@ drives a small program of its own (`peers/schannel/`, C# on .NET's
 `SslStream`, which is SChannel on Windows). The runner itself works under
 Git Bash on Windows (MSYS path conversion is switched off and every path
 it hands out is in Windows form).
+`peers/apple.sh` drives a small Swift tool (`peers/apple/`, built on first
+use) on Apple's Network.framework — the shape to copy for a platform stack
+that has no command-line client or server of its own; its README lists
+what is public API, what is SPI, and what the stack was observed to do.
 
 Skip rather than weaken: when a peer's tool cannot express a case, `supports`
 says so with the reason, and the reason lands in the run output and in

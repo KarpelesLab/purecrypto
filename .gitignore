@@ -9,3 +9,7 @@
 # Claude Code session/worktree state
 .claude/
 tools/zkp-interop/oracle/
+# The Swift peer tool for the Apple interop adapter (tools/interop/peers/apple)
+tools/interop/peers/apple/.build/
+tools/interop/peers/apple/.build.log
+tools/interop/peers/apple/.swiftpm/
