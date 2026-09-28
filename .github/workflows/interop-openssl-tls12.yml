@@ -1,0 +1,54 @@
+name: TLS 1.2 interop (OpenSSL)
+
+# Interop-tests the TLS 1.2 and DTLS 1.2 engines against OpenSSL in BOTH
+# roles, over real loopback TCP/UDP sockets, for every AEAD suite they offer
+# (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305) under an ECDSA and an RSA
+# certificate — 24 handshakes, each exchanging application data.
+#
+# Loopback (purecrypto<->purecrypto) cannot catch a symmetric wire-format
+# bug: both ChaCha20-Poly1305 suites once used the AES-GCM explicit nonce
+# instead of the RFC 7905 construction, and the DTLS 1.2 transcript hashed
+# TLS-shaped handshake headers instead of the DTLS ones (RFC 6347 §4.2.6);
+# loopback passed throughout. This gate does not. The matrix itself lives in
+# tools/tls12-interop/run.sh, which runs every process under `timeout` so a
+# hang fails its case in seconds. The runner's system OpenSSL 3.x is the
+# peer; no build step.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    name: TLS 1.2 / DTLS 1.2 vs OpenSSL
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: OpenSSL version
+        run: openssl version
+
+      - name: Build the purecrypto CLI
+        run: cargo build --release --bin purecrypto
+
+      - name: TLS 1.2 / DTLS 1.2 interop matrix (both roles)
+        timeout-minutes: 10
+        run: |
+          OPENSSL=openssl \
+          PURECRYPTO="$GITHUB_WORKSPACE/target/release/purecrypto" \
+          tools/tls12-interop/run.sh

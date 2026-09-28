@@ -72,8 +72,8 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `xmss` | RFC 8391, SP 800-208 | ref-impl KAT | ref vectors | `xmss_parse` | n/a (hash-based, **stateful**) |
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
-| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces | loopback; legacy vs OpenSSL 1.1.1; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
-| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 server vs OpenSSL 3.5** (`s_client`) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
+| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
+| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 server vs OpenSSL 3.5** (`s_client -quic`) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
 | `signature_registry` | — (X.509/TLS dispatch) | via primitives | via X.509/TLS | — | delegates |
@@ -159,11 +159,30 @@ update with the commands in `tools/wycheproof/README.md`.
 - **OpenSSL, behavioural**: ECDSA sign↔verify via `openssl dgst`, TLS 1.0/1.1
   legacy interop against OpenSSL 1.1.1 (`examples/tls_legacy_interop`, the
   `tls-legacy` feature).
-- **OpenSSL 3.5, DTLS/QUIC handshake**: the **DTLS 1.2 server** completes a
-  handshake (and exchanges app data) with `openssl s_client -dtls1_2`, and the
-  **QUIC v1 server** with `openssl s_client -quic` (TLS 1.3, ALPN, app data).
-  The client directions and DTLS 1.3 remain loopback-only: OpenSSL is
-  QUIC-client-only and its `s_client` here lacks `-dtls1_3`.
+- **OpenSSL 3.x, TLS 1.2 and DTLS 1.2 cipher-suite matrix** (CI job
+  `interop-openssl-tls12.yml`, script `tools/tls12-interop/run.sh`): the
+  purecrypto CLI against the runner's `openssl s_client` / `s_server`, in
+  **both roles**, over TCP (TLS 1.2) and UDP (DTLS 1.2), with an ECDSA and
+  an RSA certificate, for every AEAD suite the 1.2 engines offer — the
+  OpenSSL side pins the suite and each handshake exchanges application
+  data:
+
+  | Suite | TLS 1.2 client / server | DTLS 1.2 client / server |
+  |---|---|---|
+  | `ECDHE-{ECDSA,RSA}-AES128-GCM-SHA256` | ✅ / ✅ | ✅ / ✅ |
+  | `ECDHE-{ECDSA,RSA}-AES256-GCM-SHA384` | ✅ / ✅ | ✅ / ✅ |
+  | `ECDHE-{ECDSA,RSA}-CHACHA20-POLY1305` (RFC 7905) | ✅ / ✅ | ✅ / ✅ |
+
+  Two symmetric bugs that loopback had hidden fell to this matrix: the
+  ChaCha20-Poly1305 suites used the AES-GCM explicit-nonce framing instead
+  of the RFC 7905 XOR construction, and the DTLS 1.2 transcript hashed
+  TLS-shaped handshake headers instead of the 12-byte DTLS ones (RFC 6347
+  §4.2.6). A record capture from that OpenSSL exchange is pinned as a unit
+  test of the RFC 7905 nonce and key-block layout.
+- **OpenSSL 3.5, QUIC handshake**: the **QUIC v1 server** completes a
+  handshake (ALPN, app data) with `openssl s_client -quic`. The QUIC client
+  direction and DTLS 1.3 remain loopback-only: OpenSSL is QUIC-client-only
+  and its `s_client` here lacks `-dtls1_3`.
 - **BoringSSL, TLS 1.3 Encrypted Client Hello** (RFC 9849, CI job
   `interop-boringssl.yml`, script `tools/ech-interop/run.sh`): the purecrypto
   CLI against `bssl` at a pinned commit, over TCP, in **both roles**, each
@@ -513,18 +532,19 @@ code site:
 - **Stateful keys**: LMS and XMSS advance a one-time-key index on every
   signature; **reuse is catastrophic** and the caller must persist state after
   every `sign`.
-- **Phased interop**: the DTLS 1.2 and QUIC v1 **server** directions are
-  validated against OpenSSL 3.5, but the client directions and DTLS 1.3 are
-  still loopback-only (OpenSSL is QUIC-client-only and exposes no `-dtls1_3`
-  client here). QUIC ships v1 with streams / full RFC 9002 recovery / Retry /
-  key update / DATAGRAM partially deferred (see module docs).
+- **Phased interop**: TLS 1.2 and DTLS 1.2 are validated against OpenSSL in
+  both roles, and the QUIC v1 **server** direction against OpenSSL 3.5, but
+  the QUIC client direction and DTLS 1.3 are still loopback-only (OpenSSL is
+  QUIC-client-only and exposes no `-dtls1_3` client here). QUIC ships v1
+  with streams / full RFC 9002 recovery / Retry / key update / DATAGRAM
+  partially deferred (see module docs).
 - **Hazmat**: the `hazmat-*` features expose low-level arithmetic with **no
   semver and no constant-time guarantee** — the caller owns correctness and CT.
 - **Scope**: the crate is primitives + TLS/PKI plumbing (OpenSSL-like). Threshold
   / multi-party / message-envelope layers are out of scope.
 - **Coverage gaps**: ML-KEM ACVP is a trimmed slice (not the full corpus);
-  external DTLS/QUIC interop covers the server directions only (client
-  directions + DTLS 1.3 pending a suitable reference peer); no NIST FIPS
+  external QUIC interop covers the server direction only (the QUIC client
+  direction + DTLS 1.3 pending a suitable reference peer); no NIST FIPS
   validation (CMVP) and no third-party audit.
 
 ---
