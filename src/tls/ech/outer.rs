@@ -41,7 +41,7 @@
 //! back out.
 
 use super::config::{EchConfig, HpkeSymCipherSuite};
-use super::extension::{EchExtension, TYPE_INNER, decode_outer_position};
+use super::extension::{EchExtension, TYPE_INNER, TYPE_OUTER, decode_outer_position};
 use super::hpke_setup::{map_sym_suite, setup_receiver, setup_sender};
 use crate::hpke::{ReceiverContext, SenderContext};
 use crate::rng::RngCore;
@@ -236,6 +236,12 @@ pub(crate) fn locate_payload_in_handshake(handshake_msg: &[u8]) -> Result<(usize
             // back to a plain non-ECH handshake.
             if ext_body.first() == Some(&TYPE_INNER) {
                 return Err(Error::EchInnerMalformed);
+            }
+            // RFC 9849 §7: "If ECHClientHello.type is not a valid
+            // ECHClientHelloType, then the server MUST abort with an
+            // illegal_parameter alert" — also not a plain-handshake case.
+            if ext_body.first() != Some(&TYPE_OUTER) {
+                return Err(Error::IllegalParameter);
             }
             let (pay_off_in_body, pay_len) = decode_outer_position(ext_body)?;
             // Convert to absolute offset into the handshake msg.
@@ -494,8 +500,9 @@ fn client_hello_structure_len(buf: &[u8]) -> Result<usize, Error> {
 /// 3. an `ech_outer_extensions` reference is expanded against the outer
 ///    ClientHello's extensions;
 /// 4. the result must carry exactly one `encrypted_client_hello`
-///    extension, of type `inner` (§7.1), and TLS 1.3's single null
-///    compression method (RFC 8446 §4.1.2).
+///    extension, of type `inner`, must not offer TLS 1.2 or below (both
+///    §7.1), and must carry TLS 1.3's single null compression method
+///    (RFC 8446 §4.1.2).
 ///
 /// The output is framed as a handshake message (`ClientHello` type +
 /// 24-bit length) through [`crate::tls::codec::ClientHello::try_encode`],
@@ -543,6 +550,25 @@ fn decode_client_hello_inner(
             return Err(Error::EchDecodeError);
         }
     }
+    // §7.1: the ClientHelloInner "does not offer TLS 1.2 or below" — its
+    // `supported_versions` must exist and list only TLS 1.3 (or GREASE /
+    // later) versions.
+    let versions = extensions
+        .iter()
+        .find(|(t, _)| *t == ExtensionType::SUPPORTED_VERSIONS)
+        .map(|(_, body)| body.as_slice())
+        .ok_or(Error::EchDecodeError)?;
+    match versions.split_first() {
+        Some((&len, list)) if usize::from(len) == list.len() && len >= 2 && len % 2 == 0 => {
+            if list
+                .chunks_exact(2)
+                .any(|v| matches!(u16::from_be_bytes([v[0], v[1]]), 0x0300..=0x0303))
+            {
+                return Err(Error::EchDecodeError);
+            }
+        }
+        _ => return Err(Error::EchDecodeError),
+    }
     ClientHello {
         session_id: outer.session_id,
         extensions,
@@ -552,23 +578,35 @@ fn decode_client_hello_inner(
     .map_err(|_| Error::EchDecodeError)
 }
 
-/// Server-side CH2-outer decap on the HRR retry path. Uses the
-/// `receiver` retained from CH1's [`try_decap_inner`] (its `seq` is
-/// already 1) so the AEAD nonces sit at the right HPKE schedule
-/// position per draft §7.2.2. The CH2 `ClientHelloOuterAAD` is built
-/// like CH1's (RFC 9849 §5.2).
+/// Server-side CH2-outer decap on the HRR retry path (RFC 9849 §7.1.1).
+/// Uses the `receiver` retained from CH1's [`try_decap_inner`] (its `seq`
+/// is already 1) so the AEAD nonces sit at the right HPKE schedule
+/// position. The CH2 `ClientHelloOuterAAD` is built like CH1's.
 ///
-/// CH2-outer's `enc` field MUST be empty per draft §6.1.5; the
-/// `sym`/`config_id` must equal CH1's. Both checks happen here.
+/// §7.1.1 fixes the failure alerts: a CH2 without the extension is
+/// `missing_extension` ([`Error::MissingExtension`]); a changed
+/// `cipher_suite` or `config_id`, or a non-empty `enc`, is
+/// `illegal_parameter` ([`Error::IllegalParameter`]); a payload that does
+/// not decrypt is `decrypt_error` ([`Error::EchDecryptionFailed`]).
 pub(crate) fn try_decap_inner_retry(
     handshake_msg: &[u8],
     state: &mut DecappedInner,
 ) -> Result<Vec<u8>, Error> {
+    let outer = crate::tls::codec::ClientHello::decode(
+        handshake_msg.get(4..).ok_or(Error::EchDecodeError)?,
+    )?;
+    if !outer
+        .extensions
+        .iter()
+        .any(|(t, _)| *t == crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO)
+    {
+        return Err(Error::MissingExtension);
+    }
     let (aad, ciphertext) = outer_aad_and_payload(handshake_msg)?;
 
     let (sym, config_id, enc) = extract_outer_meta(handshake_msg)?;
     if sym != state.sym || config_id != state.config_id || !enc.is_empty() {
-        return Err(Error::EchDecryptionFailed);
+        return Err(Error::IllegalParameter);
     }
 
     let plaintext = state

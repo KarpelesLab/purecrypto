@@ -1976,12 +1976,13 @@ impl<R: RngCore> ServerConnection<R> {
                     self.ech_state = Some(EchServerHandshakeState::Rejected);
                     None
                 }
-                Err(e @ Error::EchInnerMalformed) => {
-                    // The HPKE `open` SUCCEEDED — the peer holds the correct
-                    // config — and what came out of it is malformed. That is
-                    // a hard protocol error (draft-ietf-tls-esni-22 §7.1),
-                    // not a reason to fall back: silently continuing on the
-                    // outer CH here would hide a broken or hostile peer.
+                Err(e @ (Error::EchInnerMalformed | Error::IllegalParameter)) => {
+                    // Either the HPKE `open` SUCCEEDED — the peer holds the
+                    // correct config — and what came out of it is malformed,
+                    // or the extension names no valid ECHClientHelloType.
+                    // Both are hard protocol errors (RFC 9849 §7, §7.1), not
+                    // a reason to fall back: silently continuing on the outer
+                    // CH here would hide a broken or hostile peer.
                     return Err(e);
                 }
                 Err(_) => {

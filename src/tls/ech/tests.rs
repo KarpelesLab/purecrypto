@@ -1159,6 +1159,10 @@ fn build_inner_ch_marker() -> Vec<u8> {
     body.push(1);
     body.push(0);
     let mut exts: Vec<u8> = Vec::new();
+    // `supported_versions` = [TLS 1.3]: a ClientHelloInner must not offer
+    // anything older (RFC 9849 §7.1).
+    exts.extend_from_slice(&ExtensionType::SUPPORTED_VERSIONS.0.to_be_bytes());
+    exts.extend_from_slice(&[0x00, 0x03, 0x02, 0x03, 0x04]);
     let ech_inner = inner_extension_body();
     exts.extend_from_slice(&ExtensionType::ENCRYPTED_CLIENT_HELLO.0.to_be_bytes());
     let bl: u16 = u16::try_from(ech_inner.len()).unwrap();
@@ -1955,4 +1959,118 @@ fn decap_rejects_a_handshake_framed_inner() {
         try_decap_inner(&outer, &ring_of(&pair)),
         Err(Error::EchInnerMalformed)
     ));
+}
+
+// ---- RFC 9849 §7 / §7.1 / §7.1.1 server checks --------------------------
+
+/// §7.1: "the client-facing server checks that [the ClientHelloInner] …
+/// does not offer TLS 1.2 or below. If either of these checks fails, the
+/// client-facing server MUST abort with an illegal_parameter alert."
+#[test]
+fn decap_rejects_an_inner_offering_tls12() {
+    use crate::tls::codec::ClientHello;
+    let mut ch = ClientHello::decode(&build_inner_ch_marker()[4..]).expect("decode");
+    for (t, body) in &mut ch.extensions {
+        if *t == ExtensionType::SUPPORTED_VERSIONS {
+            *body = alloc::vec![0x04, 0x03, 0x04, 0x03, 0x03];
+        }
+    }
+    let (outer, pair) = seal_encoded(b"wire-tls12", &ch.encode()[4..], &[]);
+    assert!(matches!(
+        try_decap_inner(&outer, &ring_of(&pair)),
+        Err(Error::EchInnerMalformed)
+    ));
+    // …and one without `supported_versions` at all cannot be TLS 1.3.
+    ch.extensions
+        .retain(|(t, _)| *t != ExtensionType::SUPPORTED_VERSIONS);
+    let (outer, pair) = seal_encoded(b"wire-no-sv", &ch.encode()[4..], &[]);
+    assert!(matches!(
+        try_decap_inner(&outer, &ring_of(&pair)),
+        Err(Error::EchInnerMalformed)
+    ));
+}
+
+/// §7: an `encrypted_client_hello` whose type is neither `outer` nor
+/// `inner` is `illegal_parameter` — not a ClientHello without ECH.
+#[test]
+fn unknown_ech_client_hello_type_is_illegal_parameter() {
+    let (_, pair) = seal_encoded(b"wire-type", &build_inner_ch_marker()[4..], &[]);
+    let outer = build_outer_ch_with_ech(&[0x02, 0x00, 0x01, 0x00, 0x01, 0x42]);
+    assert!(matches!(
+        try_decap_inner(&outer, &ring_of(&pair)),
+        Err(Error::IllegalParameter)
+    ));
+}
+
+/// §7.1.1: after accepting ECH on the first ClientHello, the server
+/// decrypts the second under the same HPKE context and fixes the alerts:
+/// no extension → `missing_extension`; changed suite / config_id or a
+/// non-empty `enc` → `illegal_parameter`; the well-formed second hello
+/// decrypts at sequence number 1.
+#[test]
+fn second_client_hello_outer_checks() {
+    use super::outer::{DecappedInner, seal_into_skeleton, try_decap_inner_retry};
+    let inner = build_inner_ch_marker();
+    let pair = EchKeyPair::generate(
+        &mut drbg(b"wire-hrr"),
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        alloc::vec![WIRE_SYM],
+    )
+    .expect("generate");
+    let sealed = seal_with(
+        pair.config(),
+        WIRE_SYM,
+        &inner[4..],
+        Some(5),
+        &mut drbg(b"wire-hrr-seal"),
+        |enc, padded_len| {
+            build_outer_ch_with_ech(&build_outer_ext_body(WIRE_SYM, 0x42, enc, padded_len))
+        },
+    )
+    .expect("seal");
+    let mut sender = sealed.sender;
+    let decap = || -> DecappedInner {
+        try_decap_inner(&sealed.outer_ch, &ring_of(&pair)).expect("CH1 decap")
+    };
+    let padded = pad_inner(&inner[4..], Some(5), 64);
+
+    // No extension in CH2.
+    let no_ech = build_inner_ch_without_marker();
+    assert!(matches!(
+        try_decap_inner_retry(&no_ech, &mut decap()),
+        Err(Error::MissingExtension)
+    ));
+    // `enc` must be empty on CH2.
+    let with_enc = build_outer_ch_with_ech(&build_outer_ext_body(
+        WIRE_SYM,
+        0x42,
+        &[7u8; 32],
+        padded.len(),
+    ));
+    assert!(matches!(
+        try_decap_inner_retry(&with_enc, &mut decap()),
+        Err(Error::IllegalParameter)
+    ));
+    // `config_id` must not change.
+    let other_id =
+        build_outer_ch_with_ech(&build_outer_ext_body(WIRE_SYM, 0x43, &[], padded.len()));
+    assert!(matches!(
+        try_decap_inner_retry(&other_id, &mut decap()),
+        Err(Error::IllegalParameter)
+    ));
+    // A payload that does not decrypt is `decrypt_error`.
+    let garbage = build_outer_ch_with_ech(&build_outer_ext_body(WIRE_SYM, 0x42, &[], padded.len()));
+    assert!(matches!(
+        try_decap_inner_retry(&garbage, &mut decap()),
+        Err(Error::EchDecryptionFailed)
+    ));
+    // The real CH2: sealed under the retained sender (sequence 1).
+    let skeleton =
+        build_outer_ch_with_ech(&build_outer_ext_body(WIRE_SYM, 0x42, &[], padded.len()));
+    let ch2 = seal_into_skeleton(&mut sender, skeleton, &padded).expect("seal CH2");
+    let recovered = try_decap_inner_retry(&ch2, &mut decap()).expect("CH2 decap");
+    assert_eq!(recovered, inner);
 }
