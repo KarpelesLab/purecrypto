@@ -73,7 +73,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
 | `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
-| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
+| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
 | `signature_registry` | — (X.509/TLS dispatch) | via primitives | via X.509/TLS | — | delegates |
@@ -167,18 +167,32 @@ update with the commands in `tools/wycheproof/README.md`.
   OpenSSL side pins the suite and each handshake exchanges application
   data:
 
-  | Suite | TLS 1.2 client / server | DTLS 1.2 client / server |
-  |---|---|---|
-  | `ECDHE-{ECDSA,RSA}-AES128-GCM-SHA256` | ✅ / ✅ | ✅ / ✅ |
-  | `ECDHE-{ECDSA,RSA}-AES256-GCM-SHA384` | ✅ / ✅ | ✅ / ✅ |
-  | `ECDHE-{ECDSA,RSA}-CHACHA20-POLY1305` (RFC 7905) | ✅ / ✅ | ✅ / ✅ |
+  | Suite | TLS 1.2 client / server | DTLS 1.2 client / server | DTLS 1.2 server, fragmented ClientHello |
+  |---|---|---|---|
+  | `ECDHE-{ECDSA,RSA}-AES128-GCM-SHA256` | ✅ / ✅ | ✅ / ✅ | ✅ |
+  | `ECDHE-{ECDSA,RSA}-AES256-GCM-SHA384` | ✅ / ✅ | ✅ / ✅ | ✅ |
+  | `ECDHE-{ECDSA,RSA}-CHACHA20-POLY1305` (RFC 7905) | ✅ / ✅ | ✅ / ✅ | ✅ |
 
-  Two symmetric bugs that loopback had hidden fell to this matrix: the
+  The OpenSSL → purecrypto DTLS 1.2 cases run twice: as OpenSSL sends by
+  default, and with `s_client` at its minimum link MTU (256) and an ALPN
+  offer sized so that both the first and the cookie-bearing ClientHello
+  arrive in two datagrams. The server's stateless cookie path (RFC 6347
+  §4.2.1) used to refuse any ClientHello that was not one whole fragment,
+  so a client on a small path MTU could never complete the
+  HelloVerifyRequest round trip; the harness had hidden that behind
+  `-mtu 1500`. Such ClientHellos are now reassembled in the same bounded
+  pre-cookie buffer the DTLS 1.3 server uses (8 KiB claimed length, four
+  candidates, flushed after 32 fragments without a completion, `message_seq`
+  0 or 1 only) before the cookie is checked.
+
+  Three symmetric bugs that loopback had hidden fell to this matrix: the
   ChaCha20-Poly1305 suites used the AES-GCM explicit-nonce framing instead
-  of the RFC 7905 XOR construction, and the DTLS 1.2 transcript hashed
+  of the RFC 7905 XOR construction, the DTLS 1.2 transcript hashed
   TLS-shaped handshake headers instead of the 12-byte DTLS ones (RFC 6347
-  §4.2.6). A record capture from that OpenSSL exchange is pinned as a unit
-  test of the RFC 7905 nonce and key-block layout.
+  §4.2.6), and the fragmented pre-cookie ClientHello above (the purecrypto
+  client never fragments its own). A record capture from that OpenSSL
+  exchange is pinned as a unit test of the RFC 7905 nonce and key-block
+  layout.
 - **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server

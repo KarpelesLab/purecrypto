@@ -14,11 +14,18 @@
 # transcript hashed TLS-shaped handshake headers instead of the DTLS ones
 # (RFC 6347 §4.2.6). This matrix fails on either.
 #
+# The OpenSSL -> purecrypto DTLS 1.2 cases run twice: once as OpenSSL sends
+# by default, and once with the ClientHello forced across two datagrams
+# (`_fragch`), which the purecrypto server's stateless cookie path used to
+# refuse outright — a client on a small path MTU could never complete the
+# HelloVerifyRequest round trip, and this harness hid it behind `-mtu 1500`.
+#
 #   OPENSSL=/path/to/openssl PURECRYPTO=/path/to/purecrypto tools/tls12-interop/run.sh
 #
 # Optional: TLS12_INTEROP_TIMEOUT (seconds per client step, default 20),
 # TLS12_INTEROP_KEEP=1 (keep the scratch directory), TLS12_INTEROP_ONLY=<case>
-# (run a single case by name, e.g. `tls12_pc_to_ossl_ec_chacha20`).
+# (run a single case by name, e.g. `tls12_pc_to_ossl_ec_chacha20` or
+# `dtls12_ossl_to_pc_ec_aes128gcm_fragch`).
 #
 # Every process runs under `timeout`, so a hang fails its case fast instead of
 # burning the CI job. The purecrypto server binds port 0 and reports the port
@@ -200,16 +207,36 @@ pc_client() {
             >"$dir/client.out" 2>"$dir/client.err" || RC=$?
 }
 
-# ossl_client DIR PROTO CIPHER — openssl s_client pinned to CIPHER, sending
-# one line to the purecrypto echo server; the exit status lands in RC.
+# The fragmented-ClientHello variant of the OpenSSL -> purecrypto DTLS
+# cases. A ClientHello pinned to one suite is ~160 bytes (~200 with the
+# HelloVerifyRequest cookie), which fits one record even at OpenSSL's
+# minimum link MTU of 256 (`-mtu`, IPv4: 203 bytes of handshake payload per
+# record). An ALPN offer of one long name pushes both the first and the
+# cookie-bearing ClientHello past that, so each arrives in two records and
+# datagrams (RFC 6347 §4.2.3) and the server has to reassemble it before it
+# can run the cookie check. The server is told to select the short name, so
+# the ALPN negotiation is verified as well, and `-msg` lets the case check
+# that the ClientHello really went out in more than one record.
+FRAG_ALPN_OFFER=dtls12-interop-padding-so-that-both-the-first-and-the-cookie-bearing-client-hello-fragment,dtls12-interop
+FRAG_ALPN_PICK=dtls12-interop
+FRAG_MTU=256
+
+# ossl_client DIR PROTO CIPHER [fragch] — openssl s_client pinned to CIPHER,
+# sending one line to the purecrypto echo server; the exit status lands in
+# RC. With `fragch` (UDP only) the ClientHello is forced across two
+# datagrams, see above; without it OpenSSL sends as it does by default.
 ossl_client() {
-    local dir=$1 proto=$2 cipher=$3
-    local vers=-tls1_2
-    if [ "$proto" = udp ]; then vers="-dtls1_2 -mtu 1500"; fi
+    local dir=$1 proto=$2 cipher=$3 variant=${4:-plain}
+    local vers=-tls1_2 alpn=
+    if [ "$proto" = udp ]; then vers=-dtls1_2; fi
+    if [ "$variant" = fragch ]; then
+        vers="$vers -mtu $FRAG_MTU -msg"
+        alpn="-alpn $FRAG_ALPN_OFFER"
+    fi
     RC=0
     # shellcheck disable=SC2086
     (printf 'ping from openssl\n'; sleep 1) |
-        "$TO" "$STEP_TIMEOUT" "$OPENSSL" s_client -connect "127.0.0.1:$PORT" $vers \
+        "$TO" "$STEP_TIMEOUT" "$OPENSSL" s_client -connect "127.0.0.1:$PORT" $vers $alpn \
             -cipher "$cipher" -CAfile "$PKI/ca.crt" -servername localhost \
             >"$dir/client.out" 2>"$dir/client.err" || RC=$?
 }
@@ -221,13 +248,29 @@ rc_is() {
     fi
 }
 
+# expect_fragmented_client_hello FILE: the `-msg` transcript in FILE must
+# show the first ClientHello leaving in at least two records. `-msg` prints
+# one `>>>` line per record header written (labelled `RecordHeader` by
+# OpenSSL 3.2+, `content_type=256` by 3.0), and nothing else goes out
+# before the HelloVerifyRequest (the first `<<<` line) comes back.
+expect_fragmented_client_hello() {
+    local n
+    n=$(awk '/^<<</ { exit }
+             /^>>> / && (/RecordHeader/ || /content_type=256/) { n++ }
+             END { print n + 0 }' "$1")
+    if [ "$n" -lt 2 ]; then
+        log "  ClientHello went out in $n record(s); expected it fragmented"
+        return 1
+    fi
+}
+
 # ---------------------------------------------------------------- cases
 
 # purecrypto client -> openssl server pinned to one suite. Over TCP the
 # server runs `-rev` and the client must get its line back reversed; over
 # UDP s_server has no echo mode, so the line is checked at the server.
 case_pc_to_ossl() {
-    local d=$1 proto=$2 kind=$3 suite=$4
+    local d=$1 proto=$2 kind=$3 suite=$4 # $5 (variant) is always `plain`
     local cipher
     cipher=$(ossl_cipher "$kind" "$suite")
     local rev=-rev
@@ -250,13 +293,16 @@ case_pc_to_ossl() {
     fi
 }
 
-# openssl client pinned to one suite -> purecrypto echo server.
+# openssl client pinned to one suite -> purecrypto echo server. The
+# `fragch` variant (UDP only) sends the ClientHello in two datagrams.
 case_ossl_to_pc() {
-    local d=$1 proto=$2 kind=$3 suite=$4
-    local cipher
+    local d=$1 proto=$2 kind=$3 suite=$4 variant=${5:-plain}
+    local cipher alpn=
     cipher=$(ossl_cipher "$kind" "$suite")
-    start_pc_server "$d" "$proto" -cert "$PKI/$kind.crt" -key "$PKI/$kind.key"
-    ossl_client "$d" "$proto" "$cipher"
+    if [ "$variant" = fragch ]; then alpn="-alpn $FRAG_ALPN_PICK"; fi
+    # shellcheck disable=SC2086
+    start_pc_server "$d" "$proto" -cert "$PKI/$kind.crt" -key "$PKI/$kind.key" $alpn
+    ossl_client "$d" "$proto" "$cipher" "$variant"
     stop_server kill
     rc_is 0
     expect "$d/client.out" "ping from openssl"
@@ -266,6 +312,10 @@ case_ossl_to_pc() {
     else
         expect "$d/client.out" "Protocol  : DTLSv1.2"
         expect "$d/server.err" "DTLS handshake complete"
+    fi
+    if [ "$variant" = fragch ]; then
+        expect "$d/client.out" "ALPN protocol: $FRAG_ALPN_PICK"
+        expect_fragmented_client_hello "$d/client.out"
     fi
 }
 
@@ -279,37 +329,44 @@ for proto in tcp udp; do
     for dir in pc_to_ossl ossl_to_pc; do
         for kind in ec rsa; do
             for suite in aes128gcm aes256gcm chacha20; do
-                name=tls12
-                if [ "$proto" = udp ]; then name=dtls12; fi
-                c="${name}_${dir}_${kind}_${suite}"
-                if [ -n "$ONLY" ] && [ "$c" != "$ONLY" ]; then continue; fi
-                cdir=$WORK/$c
-                mkdir -p "$cdir"
-                log "=== $c"
-                # Run each case in a subshell with `set -e`, so the first
-                # failed check ends the case (and only the case), and any
-                # server it left running is stopped with it.
-                set +e
-                (
-                    set -e
-                    trap 'stop_server kill' EXIT
-                    "case_$dir" "$cdir" "$proto" "$kind" "$suite"
-                )
-                status=$?
-                set -e
-                if [ "$status" -eq 0 ]; then
-                    PASS=$((PASS + 1))
-                    log "--- PASS $c"
-                else
-                    FAIL=$((FAIL + 1))
-                    FAILED="$FAILED $c"
-                    log "--- FAIL $c"
-                    for f in "$cdir"/*.out "$cdir"/*.err; do
-                        [ -f "$f" ] || continue
-                        log "  ----- $(basename "$f")"
-                        sed 's/^/  | /' "$f" >&2
-                    done
+                variants=plain
+                if [ "$proto" = udp ] && [ "$dir" = ossl_to_pc ]; then
+                    variants="plain fragch"
                 fi
+                for variant in $variants; do
+                    name=tls12
+                    if [ "$proto" = udp ]; then name=dtls12; fi
+                    c="${name}_${dir}_${kind}_${suite}"
+                    if [ "$variant" != plain ]; then c="${c}_${variant}"; fi
+                    if [ -n "$ONLY" ] && [ "$c" != "$ONLY" ]; then continue; fi
+                    cdir=$WORK/$c
+                    mkdir -p "$cdir"
+                    log "=== $c"
+                    # Run each case in a subshell with `set -e`, so the
+                    # first failed check ends the case (and only the case),
+                    # and any server it left running is stopped with it.
+                    set +e
+                    (
+                        set -e
+                        trap 'stop_server kill' EXIT
+                        "case_$dir" "$cdir" "$proto" "$kind" "$suite" "$variant"
+                    )
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        PASS=$((PASS + 1))
+                        log "--- PASS $c"
+                    else
+                        FAIL=$((FAIL + 1))
+                        FAILED="$FAILED $c"
+                        log "--- FAIL $c"
+                        for f in "$cdir"/*.out "$cdir"/*.err; do
+                            [ -f "$f" ] || continue
+                            log "  ----- $(basename "$f")"
+                            sed 's/^/  | /' "$f" >&2
+                        done
+                    fi
+                done
             done
         done
     done

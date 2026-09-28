@@ -3,16 +3,22 @@ name: TLS 1.2 interop (OpenSSL)
 # Interop-tests the TLS 1.2 and DTLS 1.2 engines against OpenSSL in BOTH
 # roles, over real loopback TCP/UDP sockets, for every AEAD suite they offer
 # (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305) under an ECDSA and an RSA
-# certificate — 24 handshakes, each exchanging application data.
+# certificate — 30 handshakes, each exchanging application data: the 24 of
+# the matrix, plus the six OpenSSL -> purecrypto DTLS 1.2 cases repeated
+# with the ClientHello forced across two datagrams (`openssl s_client` at
+# its minimum link MTU), which the server's stateless cookie path has to
+# reassemble before it can check the cookie.
 #
 # Loopback (purecrypto<->purecrypto) cannot catch a symmetric wire-format
 # bug: both ChaCha20-Poly1305 suites once used the AES-GCM explicit nonce
 # instead of the RFC 7905 construction, and the DTLS 1.2 transcript hashed
 # TLS-shaped handshake headers instead of the DTLS ones (RFC 6347 §4.2.6);
-# loopback passed throughout. This gate does not. The matrix itself lives in
-# tools/tls12-interop/run.sh, which runs every process under `timeout` so a
-# hang fails its case in seconds. The runner's system OpenSSL 3.x is the
-# peer; no build step.
+# loopback passed throughout. Nor a peer-only behaviour: the purecrypto
+# client never fragments its ClientHello, so the server's refusal of a
+# fragmented one only ever showed against OpenSSL. This gate catches both.
+# The matrix itself lives in tools/tls12-interop/run.sh, which runs every
+# process under `timeout` so a hang fails its case in seconds. The runner's
+# system OpenSSL 3.x is the peer; no build step.
 
 on:
   push:
