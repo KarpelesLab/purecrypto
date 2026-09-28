@@ -3658,10 +3658,22 @@ impl QuicConnection {
     /// `Self::commit_rx_key_phase_flip` — no application call is
     /// needed for that direction.
     pub fn initiate_key_update(&mut self) -> Result<(), Error> {
-        // RFC 9001 §6.2: "An endpoint MUST NOT initiate a key update prior
+        // RFC 9001 §6.1: "An endpoint MUST NOT initiate a key update prior
         // to having confirmed the handshake" — for a client that means having
         // received HANDSHAKE_DONE, not merely having completed TLS.
         if self.closed || !self.handshake_confirmed {
+            return Err(Error::InappropriateState);
+        }
+        // A server confirms the handshake the moment it completes (RFC 9001
+        // §4.1.2), but its *peer* confirms only on receiving HANDSHAKE_DONE,
+        // and a key update it has not yet been permitted to accept is one it
+        // may reject (§6.3: receivers keep no next-phase keys "when key
+        // updates are not yet permitted"; OpenSSL closes with
+        // KEY_UPDATE_ERROR). Flipping the phase in the same flight as
+        // HANDSHAKE_DONE therefore breaks the connection with a strict peer.
+        // Wait until that packet is acknowledged: then the client has
+        // processed HANDSHAKE_DONE and can take the update.
+        if self.role == Role::Server && !self.handshake_done_acked {
             return Err(Error::InappropriateState);
         }
         let lk = self.endpoint.crypto.at(Level::OneRtt);
@@ -11903,6 +11915,14 @@ mod tests {
         let lost = s.pop_datagram();
         assert!(!lost.is_empty() && lost[0] & 0x80 == 0, "a 1-RTT datagram");
         assert!(!s.handshake_done_pending, "the frame went out");
+        // The server has confirmed the handshake, but the client cannot have:
+        // a key update flipped into this window is one the client may reject
+        // (RFC 9001 §6.3; OpenSSL closes with KEY_UPDATE_ERROR), so the
+        // server must hold it until the HANDSHAKE_DONE carrier is acked.
+        assert!(matches!(
+            s.initiate_key_update(),
+            Err(Error::InappropriateState)
+        ));
         let in_flight = s.endpoint.loss.per_space[PnSpaceId::Application as usize]
             .sent_packets
             .values()
@@ -11929,6 +11949,11 @@ mod tests {
         }
         assert!(s.handshake_done_acked);
         assert!(!s.handshake_done_pending);
+        // The client's own update above is confirmed by now (the server
+        // replied in the new phase); with HANDSHAKE_DONE acknowledged the
+        // server may initiate one of its own.
+        s.initiate_key_update()
+            .expect("a server may update keys once HANDSHAKE_DONE is acked");
     }
 
     /// Test — RFC 9221 round-trip via the public API. Both forms
