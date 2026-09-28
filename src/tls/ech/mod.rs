@@ -1,4 +1,7 @@
-//! Encrypted Client Hello (draft-ietf-tls-esni-22).
+//! Encrypted Client Hello ([RFC 9849], published from
+//! draft-ietf-tls-esni; wire codepoint and `ECHConfig` version `0xfe0d`).
+//!
+//! [RFC 9849]: https://www.rfc-editor.org/rfc/rfc9849
 //!
 //! ECH conceals the inner ClientHello — and therefore the SNI, ALPN,
 //! and other rendezvous bits — by encrypting it under HPKE
@@ -20,8 +23,14 @@
 //! [`EchClient::grease`] so the wire image is constant.
 //!
 //! The acceptance signal — last 8 bytes of `ServerHello.random` — is
-//! computed in [`accept_signal`] using `Derive-Secret(handshake_secret,
-//! "ech accept confirmation", transcript_hash(CH..SH'))` per draft §7.
+//! computed in [`accept_signal`] as `HKDF-Expand-Label(HKDF-Extract(0,
+//! ClientHelloInner.random), "ech accept confirmation",
+//! transcript_hash(ClientHelloInner..ServerHello'), 8)` (RFC 9849 §7.2).
+//!
+//! On the wire the sealed payload is an `EncodedClientHelloInner` — the
+//! inner `ClientHello` *structure*, without the handshake header and with
+//! an empty `legacy_session_id` — authenticated under the outer
+//! `ClientHello` structure as AAD (§5.1, §5.2); see [`outer`].
 //!
 //! ## Implementation status
 //!

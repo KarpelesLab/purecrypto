@@ -12,19 +12,28 @@
 //!
 //! The seal pipeline:
 //!
-//! 1. Build the inner CH bytes (caller).
-//! 2. Pad to a small constant length policy (`encoded_inner_padded`).
+//! 1. Build the inner CH and encode it as an `EncodedClientHelloInner`
+//!    (`encode_client_hello_inner`, RFC 9849 §5.1): the serialized
+//!    `ClientHello` *structure* — no 4-byte handshake header — with
+//!    `legacy_session_id` emptied and, optionally, extensions compressed
+//!    into `ech_outer_extensions`.
+//! 2. Pad it with trailing zeros (`pad_inner`, §6.1.3).
 //! 3. Compute `info = "tls ech\0" || ECHConfig` (caller-provided).
 //! 4. HPKE setup_sender → `enc` + `SenderContext`.
 //! 5. Build the outer CH containing an `encrypted_client_hello`
 //!    extension whose `payload` field is zeroes of the same length the
 //!    sealed ciphertext will occupy (= `len(padded_inner) +
 //!    aead_tag_len`).
-//! 6. The `ClientHelloOuterAAD` is exactly the outer CH bytes above —
-//!    the spec says the `payload` field is treated as zeroes for the
-//!    AAD computation, which is what we just built.
+//! 6. The `ClientHelloOuterAAD` is that outer CH's `ClientHello`
+//!    structure — again without the handshake header (§5.2) — whose
+//!    zeroed `payload` is exactly what the spec prescribes.
 //! 7. `sender_ctx.seal(aad, padded_inner)` → ciphertext.
 //! 8. Patch the ciphertext into the payload bytes in the outer CH.
+//!
+//! The server reverses this in `try_decap_inner`: open under the same
+//! AAD, strip the padding, restore `legacy_session_id` from the outer CH,
+//! expand `ech_outer_extensions`, and re-frame the result as the
+//! `ClientHelloInner` handshake message both transcripts are built over.
 //!
 //! The functions here implement steps 2 and 7–8 as pure operations on
 //! byte slices; the connection-state-machine wave hands the inner CH
@@ -50,7 +59,8 @@ pub(crate) const HPKE_TAG_LEN: usize = 16;
 /// `maximum_name_length` so the leaked length doesn't reveal whether
 /// the inner SNI is shorter than the public one.
 ///
-/// Given a fully-encoded ClientHelloInner of length `L_in` and a
+/// Given an `EncodedClientHelloInner` (see [`encode_client_hello_inner`])
+/// of length `L_in` and a
 /// published `maximum_name_length` (the cap the server advertises),
 /// the padded plaintext length is:
 ///
@@ -107,9 +117,11 @@ pub(crate) struct SealedOuter {
 /// [`Error::EchDecryptionFailed`].
 ///
 /// The seal proceeds with:
-/// - `aad = outer_ch_skeleton` (which already has the payload field
-///   zeroed and so equals `ClientHelloOuterAAD` per draft §6.1.2)
-/// - `plaintext = padded_inner`
+/// - `aad = outer_ch_skeleton[4..]` — the skeleton already has the
+///   payload field zeroed, and RFC 9849 §5.2 defines
+///   `ClientHelloOuterAAD` as the serialized `ClientHello` *structure*,
+///   which "does not include the Handshake structure's four-byte header"
+/// - `plaintext = padded_inner` (the padded `EncodedClientHelloInner`)
 pub(crate) fn seal_into_skeleton(
     sender: &mut SenderContext,
     outer_ch_skeleton: Vec<u8>,
@@ -119,12 +131,10 @@ pub(crate) fn seal_into_skeleton(
     if len != padded_inner.len() + HPKE_TAG_LEN {
         return Err(Error::EchDecodeError);
     }
-    // ClientHelloOuterAAD is the outer CH with the payload field
-    // zeroed — and the skeleton already has zeros there. So AAD = the
-    // skeleton bytes verbatim.
-    let aad = outer_ch_skeleton.clone();
+    // `locate_payload_in_handshake` validated the 4-byte handshake header,
+    // so the structure starts at offset 4.
     let ciphertext = sender
-        .seal(&aad, padded_inner)
+        .seal(&outer_ch_skeleton[4..], padded_inner)
         .map_err(|_| Error::EchDecryptionFailed)?;
     if ciphertext.len() != len {
         return Err(Error::EchDecryptionFailed);
@@ -269,7 +279,8 @@ pub(crate) fn build_outer_ext_body(
 }
 
 /// Combines [`pad_inner`], encoding the outer skeleton, and the HPKE
-/// seal into a single client-side operation.
+/// seal into a single client-side operation. `encoded_inner` is the
+/// unpadded `EncodedClientHelloInner` from [`encode_client_hello_inner`].
 ///
 /// `caller_build_outer_skeleton` produces the wire bytes of the outer
 /// CH including an `encrypted_client_hello` extension whose payload is
@@ -339,12 +350,7 @@ pub(crate) fn try_decap_inner(
     // Walk the outer CH to find the encrypted_client_hello body and
     // its payload byte range; the AAD computation needs the byte
     // image with the payload zeroed.
-    let (payload_off, payload_len) = locate_payload_in_handshake(handshake_msg)?;
-    let mut aad = handshake_msg.to_vec();
-    for b in aad[payload_off..payload_off + payload_len].iter_mut() {
-        *b = 0;
-    }
-    let ciphertext = handshake_msg[payload_off..payload_off + payload_len].to_vec();
+    let (aad, ciphertext) = outer_aad_and_payload(handshake_msg)?;
 
     // `locate_payload_in_handshake` succeeded, so an outer-form
     // `encrypted_client_hello` extension IS present: the client is speaking
@@ -404,18 +410,7 @@ pub(crate) fn try_decap_inner(
         // fall back to the public_name path — trying further keys after
         // an authenticated open could never succeed and would only blur
         // the failure mode.
-        //
-        // Strip trailing zero padding to recover the encoded inner CH.
-        // Padding consists of an arbitrary number of trailing zero
-        // bytes; since a ClientHello body is length-prefixed, anything
-        // past the declared length is padding.
-        let unpadded = strip_trailing_padding(&plaintext).map_err(|_| Error::EchInnerMalformed)?;
-        // Per draft §7.1, the recovered inner CH MUST carry an
-        // `encrypted_client_hello` extension with the inner-form body
-        // (`[0x01]`). Reject as malformed otherwise (maps to
-        // illegal_parameter at the alert layer).
-        require_inner_marker(&unpadded).map_err(|_| Error::EchInnerMalformed)?;
-        let inner_ch_bytes = decompress_inner_against_outer(&unpadded, handshake_msg)
+        let inner_ch_bytes = decode_client_hello_inner(&plaintext, handshake_msg)
             .map_err(|_| Error::EchInnerMalformed)?;
         return Ok(DecappedInner {
             inner_ch_bytes,
@@ -428,49 +423,140 @@ pub(crate) fn try_decap_inner(
     Err(Error::EchDecryptionFailed)
 }
 
-/// If the recovered inner CH carries an `ech_outer_extensions` reference,
-/// reconstructs the canonical inner CH by expanding it against the outer CH's
-/// extensions (draft-ietf-tls-esni §5.1), re-encoding through
-/// [`crate::tls::codec::ClientHello::encode`] so the bytes match what the
-/// client fed its transcript. An inner CH without the reference is returned
-/// byte-for-byte unchanged (the uncompressed path is untouched).
-fn decompress_inner_against_outer(
-    unpadded: &[u8],
+/// Encodes `inner` as an `EncodedClientHelloInner` minus its padding
+/// (RFC 9849 §5.1): the serialized `ClientHello` structure — without the
+/// Handshake structure's four-byte header — of a copy of `inner` whose
+/// `legacy_session_id` is set to the empty string. The server restores the
+/// session ID from the outer ClientHello, which carries the inner one
+/// (§6.1, rule 3). `inner.extensions` may already be compressed with
+/// `ech_outer_extensions`.
+pub(crate) fn encode_client_hello_inner(
+    inner: &crate::tls::codec::ClientHello,
+) -> Result<Vec<u8>, Error> {
+    let stripped = crate::tls::codec::ClientHello {
+        session_id: Vec::new(),
+        ..inner.clone()
+    };
+    let mut msg = stripped.try_encode()?;
+    msg.drain(..4);
+    Ok(msg)
+}
+
+/// `ClientHelloOuterAAD` and the sealed payload of an outer ClientHello
+/// handshake message: the `ClientHello` structure without the 4-byte
+/// handshake header (RFC 9849 §5.2), with the `encrypted_client_hello`
+/// payload replaced by zeros of the same length.
+fn outer_aad_and_payload(handshake_msg: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let (payload_off, payload_len) = locate_payload_in_handshake(handshake_msg)?;
+    let range = payload_off..payload_off + payload_len;
+    let ciphertext = handshake_msg[range.clone()].to_vec();
+    let mut aad = handshake_msg.to_vec();
+    aad[range].fill(0);
+    // `locate_payload_in_handshake` validated the header; drop it.
+    aad.drain(..4);
+    Ok((aad, ciphertext))
+}
+
+/// Length of the `ClientHello` structure at the start of `buf` (RFC 8446
+/// §4.1.2), which the `EncodedClientHelloInner` padding follows. The
+/// structure is self-delimiting: every field after the fixed-size version
+/// and random is length-prefixed, and a TLS 1.3 ClientHello always carries
+/// the extensions block.
+fn client_hello_structure_len(buf: &[u8]) -> Result<usize, Error> {
+    let mut idx = 2 + 32; // legacy_version, random
+    let mut skip = |len_bytes: usize| -> Result<(), Error> {
+        let prefix = buf.get(idx..idx + len_bytes).ok_or(Error::EchDecodeError)?;
+        let len = prefix
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
+        idx += len_bytes;
+        if buf.len() < idx + len {
+            return Err(Error::EchDecodeError);
+        }
+        idx += len;
+        Ok(())
+    };
+    skip(1)?; // legacy_session_id<0..32>
+    skip(2)?; // cipher_suites<2..2^16-2>
+    skip(1)?; // legacy_compression_methods<1..2^8-1>
+    skip(2)?; // extensions<8..2^16-1>
+    Ok(idx)
+}
+
+/// Reconstructs the `ClientHelloInner` handshake message from a decrypted
+/// `EncodedClientHelloInner` (RFC 9849 §5.1), against the outer
+/// ClientHello handshake message it arrived in:
+///
+/// 1. everything after the `ClientHello` structure is padding and MUST be
+///    all zeros;
+/// 2. the encoded `legacy_session_id` must be empty (§5.1 has the client
+///    empty it) and is replaced by the outer ClientHello's;
+/// 3. an `ech_outer_extensions` reference is expanded against the outer
+///    ClientHello's extensions;
+/// 4. the result must carry exactly one `encrypted_client_hello`
+///    extension, of type `inner` (§7.1), and TLS 1.3's single null
+///    compression method (RFC 8446 §4.1.2).
+///
+/// The output is framed as a handshake message (`ClientHello` type +
+/// 24-bit length) through [`crate::tls::codec::ClientHello::try_encode`],
+/// so the bytes match what the client fed its transcript. Every failure
+/// is [`Error::EchDecodeError`]; the callers map it to `illegal_parameter`.
+fn decode_client_hello_inner(
+    encoded_inner: &[u8],
     outer_handshake: &[u8],
 ) -> Result<Vec<u8>, Error> {
     use crate::tls::codec::{ClientHello, ExtensionType};
-    // The 4-byte handshake header (type + 24-bit length) precedes the body.
-    let inner_body = unpadded.get(4..).ok_or(Error::EchDecodeError)?;
-    let inner = match ClientHello::decode(inner_body) {
-        Ok(ch) => ch,
-        // Not a parseable ClientHello: leave it for the downstream parser to
-        // reject, exactly as before this hook existed.
-        Err(_) => return Ok(unpadded.to_vec()),
-    };
-    if !inner
+    let struct_len = client_hello_structure_len(encoded_inner)?;
+    let (structure, padding) = encoded_inner.split_at(struct_len);
+    if padding.iter().any(|&b| b != 0) {
+        return Err(Error::EchDecodeError);
+    }
+    let inner = ClientHello::decode(structure).map_err(|_| Error::EchDecodeError)?;
+    let compression =
+        ClientHello::legacy_compression_methods(structure).map_err(|_| Error::EchDecodeError)?;
+    if !inner.session_id.is_empty() || compression != [0] {
+        return Err(Error::EchDecodeError);
+    }
+    let outer_body = outer_handshake.get(4..).ok_or(Error::EchDecodeError)?;
+    let outer = ClientHello::decode(outer_body).map_err(|_| Error::EchDecodeError)?;
+    let extensions = if inner
         .extensions
         .iter()
         .any(|(t, _)| *t == ExtensionType::ECH_OUTER_EXTENSIONS)
     {
-        return Ok(unpadded.to_vec());
-    }
-    let outer_body = outer_handshake.get(4..).ok_or(Error::EchDecodeError)?;
-    let outer = ClientHello::decode(outer_body).map_err(|_| Error::EchDecodeError)?;
-    let canonical_exts =
-        crate::tls::ech::inner::decompress_extensions(&inner.extensions, &outer.extensions)?;
-    let canonical = ClientHello {
-        extensions: canonical_exts,
-        ..inner
+        crate::tls::ech::inner::decompress_extensions(&inner.extensions, &outer.extensions)?
+    } else {
+        inner.extensions.clone()
     };
-    Ok(canonical.encode())
+    let inner_marker = super::inner::inner_extension_body();
+    let mut ech_exts = extensions
+        .iter()
+        .filter(|(t, _)| *t == ExtensionType::ENCRYPTED_CLIENT_HELLO);
+    match (ech_exts.next(), ech_exts.next()) {
+        (Some((_, body)), None) if *body == inner_marker => {}
+        _ => return Err(Error::EchDecodeError),
+    }
+    // Expansion can reintroduce a type the compressed list already held;
+    // a ClientHello carries each extension at most once (RFC 8446 §4.2).
+    for (i, (t, _)) in extensions.iter().enumerate() {
+        if extensions[..i].iter().any(|(u, _)| u == t) {
+            return Err(Error::EchDecodeError);
+        }
+    }
+    ClientHello {
+        session_id: outer.session_id,
+        extensions,
+        ..inner
+    }
+    .try_encode()
+    .map_err(|_| Error::EchDecodeError)
 }
 
 /// Server-side CH2-outer decap on the HRR retry path. Uses the
 /// `receiver` retained from CH1's [`try_decap_inner`] (its `seq` is
 /// already 1) so the AEAD nonces sit at the right HPKE schedule
-/// position per draft §7.2.2. The CH2-outer-AAD is the same shape
-/// as CH1's: the full CH2-outer handshake bytes with the
-/// `encrypted_client_hello` payload field zeroed.
+/// position per draft §7.2.2. The CH2 `ClientHelloOuterAAD` is built
+/// like CH1's (RFC 9849 §5.2).
 ///
 /// CH2-outer's `enc` field MUST be empty per draft §6.1.5; the
 /// `sym`/`config_id` must equal CH1's. Both checks happen here.
@@ -478,12 +564,7 @@ pub(crate) fn try_decap_inner_retry(
     handshake_msg: &[u8],
     state: &mut DecappedInner,
 ) -> Result<Vec<u8>, Error> {
-    let (payload_off, payload_len) = locate_payload_in_handshake(handshake_msg)?;
-    let mut aad = handshake_msg.to_vec();
-    for b in aad[payload_off..payload_off + payload_len].iter_mut() {
-        *b = 0;
-    }
-    let ciphertext = handshake_msg[payload_off..payload_off + payload_len].to_vec();
+    let (aad, ciphertext) = outer_aad_and_payload(handshake_msg)?;
 
     let (sym, config_id, enc) = extract_outer_meta(handshake_msg)?;
     if sym != state.sym || config_id != state.config_id || !enc.is_empty() {
@@ -495,11 +576,10 @@ pub(crate) fn try_decap_inner_retry(
         .open(&aad, &ciphertext)
         .map_err(|_| Error::EchDecryptionFailed)?;
     // Post-`open`: the retained receiver authenticated this CH2, so every
-    // malformation below is a hard protocol error, not a rejection.
-    let unpadded = strip_trailing_padding(&plaintext).map_err(|_| Error::EchInnerMalformed)?;
-    // Same inner-marker requirement as on the CH1 path (draft §7.1).
-    require_inner_marker(&unpadded).map_err(|_| Error::EchInnerMalformed)?;
-    decompress_inner_against_outer(&unpadded, handshake_msg).map_err(|_| Error::EchInnerMalformed)
+    // malformation below is a hard protocol error, not a rejection. The
+    // second ClientHelloInner is reconstructed exactly like the first,
+    // against the second ClientHelloOuter (RFC 9849 §7.1.1).
+    decode_client_hello_inner(&plaintext, handshake_msg).map_err(|_| Error::EchInnerMalformed)
 }
 
 /// Walks the outer CH to find the `encrypted_client_hello` extension
@@ -567,106 +647,4 @@ fn extract_outer_meta(handshake_msg: &[u8]) -> Result<(HpkeSymCipherSuite, u8, V
         p = body_end;
     }
     Err(Error::EchDecodeError)
-}
-
-/// Walks the inner CH extensions and requires exactly one
-/// `encrypted_client_hello` extension carrying the inner-form body
-/// (`type = inner`). The inner-marker is mandatory per
-/// draft-ietf-tls-esni-22 §7.1 — without it the decrypted CH is
-/// indistinguishable from a non-ECH CH and a network attacker could
-/// have crafted the ciphertext from a plain CH the client never
-/// intended to be ECH-inner. Returns [`Error::EchDecodeError`] if the
-/// marker is missing, malformed, or duplicated; that error maps to
-/// the `illegal_parameter(47)` alert at the alert layer.
-fn require_inner_marker(inner_ch: &[u8]) -> Result<(), Error> {
-    // inner_ch = u8 msg_type ++ u24 length ++ body. We already
-    // verified the framing in strip_trailing_padding so the indices
-    // below are guaranteed in-bounds, but keep the bounds checks
-    // defensive in case the helper is called in isolation.
-    if inner_ch.len() < 4 || inner_ch[0] != crate::tls::codec::hs_type::CLIENT_HELLO {
-        return Err(Error::EchDecodeError);
-    }
-    let body_len =
-        ((inner_ch[1] as usize) << 16) | ((inner_ch[2] as usize) << 8) | (inner_ch[3] as usize);
-    if 4 + body_len != inner_ch.len() {
-        return Err(Error::EchDecodeError);
-    }
-    let body = &inner_ch[4..];
-    let mut idx = 0usize;
-    let need = |idx: usize, n: usize| -> Result<(), Error> {
-        if idx + n > body.len() {
-            Err(Error::EchDecodeError)
-        } else {
-            Ok(())
-        }
-    };
-    need(idx, 2 + 32 + 1)?;
-    idx += 2 + 32;
-    let sid_len = body[idx] as usize;
-    idx += 1;
-    need(idx, sid_len + 2)?;
-    idx += sid_len;
-    let cs_len = ((body[idx] as usize) << 8) | (body[idx + 1] as usize);
-    idx += 2;
-    need(idx, cs_len + 1)?;
-    idx += cs_len;
-    let cm_len = body[idx] as usize;
-    idx += 1;
-    need(idx, cm_len + 2)?;
-    idx += cm_len;
-    let ext_total = ((body[idx] as usize) << 8) | (body[idx + 1] as usize);
-    idx += 2;
-    need(idx, ext_total)?;
-    let ext_start = idx;
-    let ext_end = idx + ext_total;
-    let mut p = ext_start;
-    let mut found = false;
-    while p < ext_end {
-        if p + 4 > ext_end {
-            return Err(Error::EchDecodeError);
-        }
-        let ty = ((body[p] as u16) << 8) | (body[p + 1] as u16);
-        let bl = ((body[p + 2] as usize) << 8) | (body[p + 3] as usize);
-        let body_start = p + 4;
-        let body_end = body_start + bl;
-        if body_end > ext_end {
-            return Err(Error::EchDecodeError);
-        }
-        if ty == crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO.0 {
-            if found {
-                return Err(Error::EchDecodeError);
-            }
-            let ext_body = &body[body_start..body_end];
-            match EchExtension::decode(ext_body)? {
-                EchExtension::Inner => {}
-                EchExtension::Outer { .. } => return Err(Error::EchDecodeError),
-            }
-            found = true;
-        }
-        p = body_end;
-    }
-    if !found {
-        return Err(Error::EchDecodeError);
-    }
-    Ok(())
-}
-
-/// Strips trailing zero padding from a decrypted padded inner CH and
-/// returns the inner CH wire bytes. The inner CH is a complete
-/// handshake message with header + length, so anything past the
-/// declared length is padding (must all be zero).
-fn strip_trailing_padding(padded: &[u8]) -> Result<Vec<u8>, Error> {
-    if padded.len() < 4 || padded[0] != crate::tls::codec::hs_type::CLIENT_HELLO {
-        return Err(Error::EchDecodeError);
-    }
-    let body_len =
-        ((padded[1] as usize) << 16) | ((padded[2] as usize) << 8) | (padded[3] as usize);
-    let total = 4 + body_len;
-    if total > padded.len() {
-        return Err(Error::EchDecodeError);
-    }
-    if padded[total..].iter().any(|b| *b != 0) {
-        return Err(Error::EchDecodeError);
-    }
-    Ok(padded[..total].to_vec())
 }

@@ -4669,7 +4669,7 @@ mod tests {
 
         // Inner CH = RFC 8448's CH (a complete, server-acceptable handshake
         // message). Splice in the inner-form `encrypted_client_hello`
-        // marker — `require_inner_marker` (TLS-4 hardening) rejects any
+        // marker — the server (TLS-4 hardening, RFC 9849 §7.1) rejects any
         // decapped inner CH that lacks it.
         let raw_inner_ch = from_hex_vec(include_str!("../../../testdata/rfc8448_client_hello.hex"));
         let inner_ch = {
@@ -4731,7 +4731,7 @@ mod tests {
         let sealed = seal_with(
             &config,
             sym,
-            &inner_ch,
+            &inner_ch[4..],
             Some(5),
             &mut seal_rng,
             |enc, padded_len| {

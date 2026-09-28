@@ -1313,7 +1313,7 @@ fn seal_and_decap_round_trip_x25519_aes128gcm() {
     let sealed = seal_with(
         &config,
         sym,
-        &inner,
+        &inner[4..],
         Some(5),
         &mut rng,
         |enc, padded_len| {
@@ -1381,7 +1381,7 @@ fn seal_and_decap_matches_second_key_sharing_config_id() {
     let sealed = seal_with(
         &new_config,
         sym,
-        &inner,
+        &inner[4..],
         Some(5),
         &mut rng,
         |enc, padded_len| {
@@ -1435,7 +1435,7 @@ fn decap_rejects_inner_ch_without_marker() {
     let sealed = seal_with(
         &config,
         sym,
-        &inner,
+        &inner[4..],
         Some(5),
         &mut rng,
         |enc, padded_len| {
@@ -1513,7 +1513,7 @@ fn decap_rejects_unknown_config_id() {
     let sealed = seal_with(
         &config,
         sym,
-        &inner,
+        &inner[4..],
         Some(5),
         &mut rng,
         |enc, padded_len| {
@@ -1568,7 +1568,7 @@ fn decap_rejects_unpublished_hpke_suite() {
     let sealed = seal_with(
         &config,
         unpublished,
-        &inner,
+        &inner[4..],
         Some(5),
         &mut rng,
         |enc, padded_len| {
@@ -1590,7 +1590,7 @@ fn decap_rejects_unpublished_hpke_suite() {
     let ok = seal_with(
         &config,
         published,
-        &inner,
+        &inner[4..],
         Some(5),
         &mut rng,
         |enc, padded_len| {
@@ -1629,7 +1629,7 @@ fn decap_rejects_aead_corruption() {
     let sealed = seal_with(
         &config,
         sym,
-        &inner,
+        &inner[4..],
         Some(5),
         &mut rng,
         |enc, padded_len| {
@@ -1678,7 +1678,7 @@ fn decap_rejects_aad_mutation_outside_payload() {
     let sealed = seal_with(
         &config,
         sym,
-        &inner,
+        &inner[4..],
         Some(5),
         &mut rng,
         |enc, padded_len| {
@@ -1734,7 +1734,7 @@ fn full_ech_round_trip_seal_decap_and_accept_signal() {
     let sealed = seal_with(
         &config,
         sym,
-        &inner_ch,
+        &inner_ch[4..],
         Some(5),
         &mut rng,
         |enc, padded_len| {
@@ -1807,4 +1807,152 @@ fn ech_rejected_retry_configs_round_trip_in_ee_body() {
         }
         _ => panic!("wrong variant"),
     }
+}
+
+// ---- RFC 9849 §5.1 / §5.2 wire format ----------------------------------
+
+const WIRE_SYM: HpkeSymCipherSuite = HpkeSymCipherSuite {
+    kdf_id: 0x0001,  // HKDF-SHA256
+    aead_id: 0x0001, // AES-128-GCM
+};
+
+/// `build_outer_ch_with_ech` with a `legacy_session_id`: the one the client
+/// copied from its inner hello (RFC 9849 §6.1, rule 3).
+fn build_outer_ch_with_session_id(ech_ext_body: &[u8], session_id: &[u8]) -> Vec<u8> {
+    use crate::tls::codec::ClientHello;
+    let plain = build_outer_ch_with_ech(ech_ext_body);
+    let mut ch = ClientHello::decode(&plain[4..]).expect("decode outer");
+    ch.session_id = session_id.to_vec();
+    ch.encode()
+}
+
+/// Seals `encoded_inner` into an outer hello carrying `session_id`, under a
+/// fresh X25519 / HKDF-SHA256 / AES-128-GCM key; returns the outer hello
+/// and the key.
+fn seal_encoded(seed: &[u8], encoded_inner: &[u8], session_id: &[u8]) -> (Vec<u8>, EchKeyPair) {
+    let pair = EchKeyPair::generate(
+        &mut drbg(seed),
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        alloc::vec![WIRE_SYM],
+    )
+    .expect("generate");
+    let sealed = seal_with(
+        pair.config(),
+        WIRE_SYM,
+        encoded_inner,
+        Some(5),
+        &mut drbg(b"wire-format-seal"),
+        |enc, padded_len| {
+            let body = build_outer_ext_body(WIRE_SYM, 0x42, enc, padded_len);
+            build_outer_ch_with_session_id(&body, session_id)
+        },
+    )
+    .expect("seal");
+    (sealed.outer_ch, pair)
+}
+
+fn ring_of(pair: &EchKeyPair) -> EchKeyRing {
+    EchKeyRing::from_pairs(alloc::vec![pair.clone()])
+}
+
+/// Pins the RFC 9849 wire format independently of `try_decap_inner`: the
+/// payload opens under a `ClientHelloOuterAAD` that is the outer
+/// `ClientHello` *structure* (no 4-byte handshake header, §5.2), and the
+/// plaintext is an `EncodedClientHelloInner` that starts with the
+/// ClientHello structure (`legacy_version` 0x0303, §5.1) followed by zero
+/// padding. The code before the BoringSSL interop work sealed the handshake
+/// *message* under the handshake-message AAD, which no other
+/// implementation accepts.
+#[test]
+fn sealed_payload_is_an_encoded_client_hello_inner_under_structure_aad() {
+    let inner = build_inner_ch_marker();
+    let (outer, pair) = seal_encoded(b"wire-aad", &inner[4..], &[]);
+    let (off, len) = locate_payload_in_handshake(&outer).expect("payload");
+    let ciphertext = outer[off..off + len].to_vec();
+    let mut zeroed = outer.clone();
+    zeroed[off..off + len].fill(0);
+    // The extension body is `type(1) kdf(2) aead(2) config_id(1)
+    // enc<u16> payload<u16>`: the 32-byte X25519 `enc` ends right before
+    // the payload's length prefix.
+    let enc = outer[off - 2 - 32..off - 2].to_vec();
+
+    let open = |aad: &[u8]| {
+        let (mut rx, _) = super::hpke_setup::setup_receiver(
+            pair.config(),
+            pair.private_key_bytes(),
+            &enc,
+            WIRE_SYM,
+        )
+        .expect("setup_receiver");
+        rx.open(aad, &ciphertext)
+    };
+    // The handshake-message AAD (header included) must NOT authenticate…
+    assert!(open(&zeroed).is_err());
+    // …the ClientHello-structure AAD must.
+    let plaintext = open(&zeroed[4..]).expect("open under the structure AAD");
+    assert_eq!(&plaintext[..2], &[0x03, 0x03], "legacy_version, no header");
+    assert_eq!(&plaintext[..inner.len() - 4], &inner[4..]);
+    assert!(plaintext[inner.len() - 4..].iter().all(|&b| b == 0));
+    assert_eq!(plaintext.len() % 32, 0);
+}
+
+/// §5.1: the encoded inner hello carries an empty `legacy_session_id`; the
+/// server restores the outer hello's, so the reconstructed
+/// `ClientHelloInner` (the transcript input) has the session ID the client
+/// really sent — what a middlebox-compatibility-mode client (BoringSSL,
+/// the browsers) puts in both hellos.
+#[test]
+fn decap_restores_the_outer_session_id() {
+    use crate::tls::codec::ClientHello;
+    let inner = build_inner_ch_marker();
+    let sid = [0xABu8; 32];
+    let (outer, pair) = seal_encoded(b"wire-sid", &inner[4..], &sid);
+    let recovered = try_decap_inner(&outer, &ring_of(&pair)).expect("decap");
+    let mut expected = ClientHello::decode(&inner[4..]).expect("decode");
+    expected.session_id = sid.to_vec();
+    assert_eq!(recovered.inner_ch_bytes, expected.encode());
+}
+
+/// A non-empty `legacy_session_id` inside `EncodedClientHelloInner` is a
+/// client that did not follow §5.1; after an authenticated open that is a
+/// hard error (BoringSSL rejects it the same way).
+#[test]
+fn decap_rejects_a_session_id_inside_the_encoded_inner() {
+    use crate::tls::codec::ClientHello;
+    let mut ch = ClientHello::decode(&build_inner_ch_marker()[4..]).expect("decode");
+    ch.session_id = alloc::vec![0x11; 32];
+    let (outer, pair) = seal_encoded(b"wire-sid-inner", &ch.encode()[4..], &[0x11; 32]);
+    assert!(matches!(
+        try_decap_inner(&outer, &ring_of(&pair)),
+        Err(Error::EchInnerMalformed)
+    ));
+}
+
+/// §5.1: "If any padding byte is non-zero, the server MUST abort the
+/// connection with an illegal_parameter alert."
+#[test]
+fn decap_rejects_nonzero_padding() {
+    let mut encoded = build_inner_ch_marker()[4..].to_vec();
+    encoded.extend_from_slice(&[0, 0, 1]);
+    let (outer, pair) = seal_encoded(b"wire-padding", &encoded, &[]);
+    assert!(matches!(
+        try_decap_inner(&outer, &ring_of(&pair)),
+        Err(Error::EchInnerMalformed)
+    ));
+}
+
+/// A plaintext framed the old way — the handshake message, header included
+/// — is not an `EncodedClientHelloInner`: its first bytes read as
+/// `legacy_version` 0x0100 and mis-frame every field after them.
+#[test]
+fn decap_rejects_a_handshake_framed_inner() {
+    let inner = build_inner_ch_marker();
+    let (outer, pair) = seal_encoded(b"wire-framed", &inner, &[]);
+    assert!(matches!(
+        try_decap_inner(&outer, &ring_of(&pair)),
+        Err(Error::EchInnerMalformed)
+    ));
 }

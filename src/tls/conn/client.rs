@@ -3077,7 +3077,7 @@ impl ClientConnection {
         let suites = self.offered_suites.clone();
         let groups = self.offered_groups.clone();
         let random = self.client_random;
-        let inner_ch2 = self.build_client_hello(
+        let built_inner_ch2 = self.build_client_hello(
             random,
             server_name.clone(),
             &suites,
@@ -3087,9 +3087,19 @@ impl ClientConnection {
             Some(&inner_marker),
             Some(self.core.transcript.buffered_bytes()),
         )?;
+        // As on CH1: the transcript takes the canonical `ClientHelloInner`
+        // handshake message (the exact bytes the server reconstructs), the
+        // HPKE seal the `EncodedClientHelloInner` (RFC 9849 §5.1).
+        let inner_ch2_struct = ClientHello::decode(built_inner_ch2.get(4..).ok_or(Error::Decode)?)?;
+        let inner_ch2 = inner_ch2_struct.try_encode()?;
+        let encoded_inner_ch2 =
+            crate::tls::ech::outer::encode_client_hello_inner(&inner_ch2_struct)?;
         let inner_sni_len = super::common::sni_host_name(&server_name).map(str::len);
-        let padded =
-            crate::tls::ech::outer::pad_inner(&inner_ch2, inner_sni_len, maximum_name_length);
+        let padded = crate::tls::ech::outer::pad_inner(
+            &encoded_inner_ch2,
+            inner_sni_len,
+            maximum_name_length,
+        );
         // CH2-outer's encrypted_client_hello extension carries an empty
         // `enc` field per draft §6.1.5; the receiver pulls `enc` from
         // its own retained CH1 setup, not the wire.
@@ -4244,8 +4254,8 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     //
     // A reference outer CH reveals the shared extensions; its non-ECH
     // extensions are byte-identical to the real outer (same suites/groups —
-    // only SNI and the ECH extension itself differ). On any parse hiccup we
-    // fall back to sealing the inner CH verbatim (correct, just larger).
+    // only SNI and the ECH extension itself differ). If compression is not
+    // possible the inner CH is sealed uncompressed (correct, just larger).
     let reference_outer = conn.build_client_hello(
         outer_random,
         public_name_str.clone(),
@@ -4258,33 +4268,30 @@ fn seal_real_ech_on_ch1<R: RngCore>(
         )),
         None,
     )?;
-    let (canonical_inner, inner_to_seal) = match (
-        ClientHello::decode(inner_ch.get(4..).ok_or(Error::Decode)?),
-        ClientHello::decode(reference_outer.get(4..).ok_or(Error::Decode)?),
+    //
+    // What gets sealed is the `EncodedClientHelloInner` (RFC 9849 §5.1): the
+    // `ClientHello` structure without its handshake header, with
+    // `legacy_session_id` emptied — see `encode_client_hello_inner`. The
+    // transcript keeps the full `ClientHelloInner` handshake message.
+    let inner_struct = ClientHello::decode(inner_ch.get(4..).ok_or(Error::Decode)?)?;
+    let outer_struct = ClientHello::decode(reference_outer.get(4..).ok_or(Error::Decode)?)?;
+    let canonical_inner = inner_struct.try_encode()?;
+    let share = crate::tls::ech::inner::longest_shared_block(
+        &inner_struct.extensions,
+        &outer_struct.extensions,
+    );
+    let to_encode = match crate::tls::ech::inner::compress_extensions(
+        &inner_struct.extensions,
+        &outer_struct.extensions,
+        &share,
     ) {
-        (Ok(inner_struct), Ok(outer_struct)) => {
-            let canonical = inner_struct.encode();
-            let share = crate::tls::ech::inner::longest_shared_block(
-                &inner_struct.extensions,
-                &outer_struct.extensions,
-            );
-            match crate::tls::ech::inner::compress_extensions(
-                &inner_struct.extensions,
-                &outer_struct.extensions,
-                &share,
-            ) {
-                Ok(compressed_exts) if !share.is_empty() => {
-                    let compressed = ClientHello {
-                        extensions: compressed_exts,
-                        ..inner_struct
-                    };
-                    (canonical, compressed.encode())
-                }
-                _ => (canonical.clone(), canonical),
-            }
-        }
-        _ => (inner_ch.clone(), inner_ch.clone()),
+        Ok(compressed_exts) if !share.is_empty() => ClientHello {
+            extensions: compressed_exts,
+            ..inner_struct
+        },
+        _ => inner_struct,
     };
+    let inner_to_seal = crate::tls::ech::outer::encode_client_hello_inner(&to_encode)?;
 
     let conn_for_closure = conn;
     let sealed = crate::tls::ech::outer::seal_with(
