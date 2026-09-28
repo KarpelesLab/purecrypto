@@ -48,6 +48,13 @@ env:
   # cached. Bump both together: the cache key follows the version.
   LIBRESSL_VERSION: 4.3.2
   LIBRESSL_SHA256: edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5
+  # GnuTLS built from the release tarball for the `gnutls-src` peer, with
+  # leancrypto for X25519MLKEM768 and ML-DSA (3.8.10+; no distribution
+  # package ships them) and a nettle 3.10 (3.8.11+ needs it; ubuntu-24.04
+  # has 3.9). Bump deliberately: the cache key follows them.
+  GNUTLS_SRC_VERSION: 3.8.13
+  LEANCRYPTO_TAG: v1.9.1
+  NETTLE_SRC_VERSION: 3.10.2
 
 jobs:
   interop:
@@ -95,6 +102,14 @@ jobs:
             label: libressl (macOS system)
             libressl: system
             runs-on: macos-latest
+          # The runner's gnutls-bin (GnuTLS 3.8.x from apt: classical TLS
+          # 1.3, raw public keys, zlib compression, record_size_limit).
+          - peer: gnutls
+            runs-on: ubuntu-latest
+          # GnuTLS $GNUTLS_SRC_VERSION with leancrypto (X25519MLKEM768,
+          # ML-DSA), built here and cached.
+          - peer: gnutls-src
+            runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -278,6 +293,62 @@ jobs:
           /usr/bin/openssl version
           echo "LIBRESSL=/usr/bin/openssl" >>"$GITHUB_ENV"
           echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >>"$GITHUB_ENV"
+      # ---- gnutls ------------------------------------------------------
+      - name: Install GnuTLS
+        if: matrix.peer == 'gnutls'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnutls-bin
+          gnutls-cli --version | head -1
+          gnutls-cli --list-config
+
+      # ---- gnutls-src --------------------------------------------------
+      - name: Cache GnuTLS (source build)
+        if: matrix.peer == 'gnutls-src'
+        id: cache-gnutls-src
+        uses: actions/cache@v5
+        with:
+          path: ~/gnutls-src
+          key: gnutls-src-${{ env.GNUTLS_SRC_VERSION }}-${{ env.LEANCRYPTO_TAG }}-nettle${{ env.NETTLE_SRC_VERSION }}-${{ runner.os }}-v1
+
+      - name: Build GnuTLS from source
+        if: matrix.peer == 'gnutls-src' && steps.cache-gnutls-src.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build libgmp-dev libunistring-dev libidn2-dev zlib1g-dev
+          PREFIX=$HOME/gnutls-src
+          export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig
+          # Everything links into the prefix by rpath, so the cached tree
+          # needs no library path at run time.
+          export LDFLAGS="-Wl,-rpath,$PREFIX/lib"
+          curl -sSL "https://ftp.gnu.org/gnu/nettle/nettle-$NETTLE_SRC_VERSION.tar.gz" | tar xz
+          (cd "nettle-$NETTLE_SRC_VERSION" &&
+            ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" --disable-documentation &&
+            make -j"$(nproc)" && make install)
+          curl -sSL "https://github.com/smuellerDD/leancrypto/archive/refs/tags/$LEANCRYPTO_TAG.tar.gz" | tar xz
+          # Only ML-KEM and ML-DSA are needed; the other PQC families are
+          # left out of the build for time (disabling SLH-DSA breaks the
+          # ASN.1 module, so it stays).
+          (cd leancrypto-*/ &&
+            meson setup build --prefix="$PREFIX" --libdir=lib -Dbuildtype=release \
+              -Dtests=disabled -Dapps=disabled \
+              -Dbike_1=disabled -Dbike_3=disabled -Dbike_5=disabled \
+              -Dhqc_128=disabled -Dhqc_192=disabled -Dhqc_256=disabled \
+              -Dsntrup_761=disabled -Dsntrup_857=disabled -Dsntrup_953=disabled \
+              -Dsntrup_1013=disabled -Dsntrup_1277=disabled &&
+            meson compile -C build && meson install -C build)
+          curl -sSL "https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-$GNUTLS_SRC_VERSION.tar.xz" | tar xJ
+          (cd "gnutls-$GNUTLS_SRC_VERSION" &&
+            ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" --with-leancrypto \
+              --disable-doc --disable-tests --disable-full-test-suite --disable-guile \
+              --disable-cxx --disable-libdane --without-p11-kit --without-tpm --without-tpm2 \
+              --with-included-libtasn1 --with-included-unistring &&
+            make -j"$(nproc)" && make install)
+          "$PREFIX/bin/gnutls-cli" --version | head -1
+          "$PREFIX/bin/gnutls-cli" -l | grep -E '^(Groups|Public Key Systems|Compression)'
 
       # ---- purecrypto --------------------------------------------------
       - name: Build the purecrypto CLI
