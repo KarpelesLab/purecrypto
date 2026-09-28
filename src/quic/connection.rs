@@ -6000,7 +6000,16 @@ impl QuicConnection {
                         // the peer has never seen is a protocol error.
                         // Retiring an already-retired sequence is a soft
                         // ignore (returns Ok(None)).
-                        let _ = pool.retire(seq)?;
+                        if pool.retire(seq)?.is_some() {
+                            // RFC 9000 §5.1.1: "An endpoint SHOULD supply a
+                            // new connection ID when the peer retires a
+                            // connection ID." Re-arm issuance; the next
+                            // 1-RTT packet tops the pool back up to the
+                            // peer's `active_connection_id_limit` (one
+                            // replacement per retirement, so a peer cannot
+                            // make us mint faster than it retires).
+                            self.new_cids_issued = false;
+                        }
                     }
                 }
                 Frame::NewToken { .. } => {
@@ -11605,6 +11614,79 @@ mod tests {
             v
         };
         assert_eq!(pending, alloc::vec![0u64], "RETIRE_CID queued for seq 0");
+    }
+
+    /// RFC 9000 §5.1.2 — `switch_connection_id` moves the outbound DCID to
+    /// a spare the peer issued and retires the old one with a
+    /// RETIRE_CONNECTION_ID the peer acts on; traffic keeps flowing on the
+    /// new CID. Refused before the handshake and once no spare is left.
+    #[test]
+    fn switch_connection_id_rotates_and_retires() {
+        let (mut c, mut s) = loopback_pair();
+        assert!(matches!(
+            c.switch_connection_id(),
+            Err(Error::InappropriateState)
+        ));
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let before = c.endpoint.cids.peer;
+        let old_seq = c
+            .cid_remote
+            .as_ref()
+            .and_then(|p| {
+                p.entries
+                    .iter()
+                    .find(|(_, e)| e.cid == before)
+                    .map(|(&s, _)| s)
+            })
+            .expect("the CID in use is in the pool");
+        let spares = c
+            .cid_remote
+            .as_ref()
+            .map(|p| p.entries.len() - 1)
+            .expect("pool");
+        assert!(spares >= 1, "the server issued a spare after the handshake");
+        c.switch_connection_id().expect("a spare is available");
+        let after = c.endpoint.cids.peer;
+        assert_ne!(before, after, "§5.1.2: a different connection ID");
+        assert!(
+            c.cid_remote
+                .as_ref()
+                .is_some_and(|p| p.pending_retire.contains(&old_seq)),
+            "§19.16: the old sequence is queued for RETIRE_CONNECTION_ID"
+        );
+        assert!(
+            s.cid_local
+                .as_ref()
+                .is_some_and(|p| p.entries.contains_key(&old_seq)),
+            "the server still holds the old CID until told"
+        );
+        // Data on the new CID reaches the server, which retires the old one.
+        let id = c.open_bidi().expect("open");
+        c.write(id, b"on the new cid").expect("write");
+        for _ in 0..6 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let readable: Vec<StreamId> = s.readable_streams().collect();
+        assert_eq!(readable, alloc::vec![id]);
+        assert!(
+            s.cid_local
+                .as_ref()
+                .is_some_and(|p| !p.entries.contains_key(&old_seq)),
+            "the server processed RETIRE_CONNECTION_ID for the old sequence"
+        );
+        // RFC 9000 §5.1.1: the server supplies a replacement for the retired
+        // CID, so the client can switch again after a round trip.
+        assert_eq!(
+            c.cid_remote.as_ref().map(|p| p.entries.len()),
+            Some(spares + 1),
+            "the pool is back at the peer's active_connection_id_limit"
+        );
+        c.switch_connection_id().expect("a fresh spare was issued");
+        assert_ne!(c.endpoint.cids.peer, after);
+        assert!(!c.is_closed() && !s.is_closed());
     }
 
     /// F2 — RFC 9000 §19.15: a NEW_CONNECTION_ID frame whose
