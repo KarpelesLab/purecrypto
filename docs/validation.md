@@ -72,7 +72,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `xmss` | RFC 8391, SP 800-208 | ref-impl KAT | ref vectors | `xmss_parse` | n/a (hash-based, **stateful**) |
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
-| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
+| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6 and BoringSSL, both roles** (CI: certs × groups × suites, resumption, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
 | `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
@@ -193,6 +193,57 @@ update with the commands in `tools/wycheproof/README.md`.
   client never fragments its own). A record capture from that OpenSSL
   exchange is pinned as a unit test of the RFC 7905 nonce and key-block
   layout.
+- **TLS 1.3 matrix, both roles, against OpenSSL 3.0, OpenSSL 3.6 and
+  BoringSSL** (CI workflow `interop.yml`, one job per peer; runner
+  `tools/interop/run.sh`, adapters under `tools/interop/peers/`, contract in
+  `tools/interop/README.md`): the purecrypto CLI against the runner's
+  `openssl` 3.0.x, an `openssl` 3.6 built from source (ML-KEM hybrid,
+  ML-DSA, raw public keys, zlib compression) and `bssl` at a pinned commit,
+  over TCP, purecrypto as client (`C`) and as server (`S`). Every case
+  exchanges application data and is checked on **both** sides for the
+  negotiated version, suite and group (a handshake that completed with the
+  wrong group is a failure) and, where the tool sends one, for the peer's
+  `close_notify`. 226 cases per peer; `⏭` is a SKIP with the reason (a peer
+  or tool limitation, never a relaxed check):
+
+  | Case | OpenSSL 3.0 (C / S) | OpenSSL 3.6 (C / S) | BoringSSL (C / S) |
+  |---|---|---|---|
+  | Plain: `{RSA-2048, P-256, P-384, Ed25519}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (S: AES-128-GCM only — `bssl client` cannot pin a TLS 1.3 suite) |
+  | Plain, `X25519MLKEM768` | ⏭ 3.0 has none | ✅ / ✅ | ✅ / ✅ |
+  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | ⏭ | ⏭ |
+  | Plain, ML-DSA-65 certificate | ⏭ 3.0 has none | ✅ / ✅ | ⏭ no ML-DSA |
+  | Resumption (PSK + DHE) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only | ⏭ | ⏭ |
+  | 0-RTT accepted | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ✅ / ✅ | ✅ / ✅ | ✅ / ⏭ `bssl client` treats `EARLY_DATA_REJECTED` as fatal |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | HelloRetryRequest to `X25519MLKEM768` | ⏭ | ✅ / ✅ | ✅ / ⏭ `bssl client` always shares it |
+  | mTLS, client certificate `{RSA-2048, P-256, P-384, Ed25519}` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (C with Ed25519: ⏭ `bssl server` cannot be told to accept it) |
+  | mTLS, ML-DSA-65 client certificate | ⏭ | ✅ / ✅ | ⏭ |
+  | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | KeyUpdate (`update_requested`) from the peer, purecrypto replies | ✅ / ✅ | ✅ / ✅ | ⏭ `bssl` has no trigger |
+  | RFC 8879 zlib certificate compression (server certificate) | ⏭ 3.2+ | ✅ / ✅ | ⏭ the tool registers no algorithm |
+  | RFC 7250 raw public key, server identity | ⏭ 3.2+ | ✅ / ✅ | ✅ / ✅ |
+  | RFC 7250 raw public key, client identity | ⏭ 3.2+ | ✅ / ✅ | ✅ / ✅ |
+  | OCSP stapling (`openssl ocsp` response, validated) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | ALPN | ✅ / ✅ | ✅ / ✅ | ⏭ `bssl server` has no ALPN option / ✅ |
+  | RFC 8449 `record_size_limit` | ⏭ not implemented by OpenSSL | ⏭ | ⏭ not implemented by BoringSSL |
+  | Chain > 16 KiB (Certificate spans records) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | `close_notify` from the peer | ✅ / ✅ | ✅ / ✅ | ⏭ neither `bssl` role sends one |
+
+  What this matrix caught that loopback could not: the client only sent
+  `psk_key_exchange_modes` when it already held a session, so a BoringSSL
+  server — which issues no ticket to a client that advertised no mode (RFC
+  8446 §4.2.9) — could never be resumed; loopback resumed happily, since
+  the purecrypto server issues tickets regardless. Two OpenSSL behaviours
+  are worked around on the *peer* side, documented in the adapter: with
+  anti-replay on, OpenSSL's stateful 0-RTT tickets are single-use, so the
+  ticket a HelloRetryRequest makes the client re-present is already gone
+  (`-no_anti_replay`); and OpenSSL only sends compressed certificates it
+  pre-compressed (`-cert_comp`). Compression of the *client* certificate
+  (RFC 8879 in the mTLS direction) is not implemented by purecrypto and is
+  not in the matrix.
 - **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server
