@@ -819,3 +819,18 @@ pub(crate) fn open_keylog(path: &str) -> std::sync::Arc<dyn purecrypto::tls::Key
     }
     std::sync::Arc::new(purecrypto::tls::WriterKeyLog::new(f))
 }
+
+/// Parses a TLS named-group name as `-prefer-group` / `-key-shares` take
+/// it; `flag` names the option in the error message.
+pub(crate) fn parse_group(name: &str, flag: &str) -> purecrypto::tls::NamedGroup {
+    use purecrypto::tls::NamedGroup;
+    match name.to_ascii_lowercase().as_str() {
+        "x25519" => NamedGroup::X25519,
+        "secp256r1" | "p-256" | "p256" | "prime256v1" => NamedGroup::Secp256r1,
+        "secp384r1" | "p-384" | "p384" => NamedGroup::Secp384r1,
+        "x25519mlkem768" => NamedGroup::X25519MlKem768,
+        _ => die(format!(
+            "{flag}: unknown group '{name}' (x25519, secp256r1, secp384r1, X25519MLKEM768)"
+        )),
+    }
+}

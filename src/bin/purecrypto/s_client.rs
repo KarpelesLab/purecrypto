@@ -162,7 +162,7 @@ pub(crate) fn run(args: Args) {
         return;
     }
     let version = resolve_version(&args);
-    let value_flags = [
+    let mut value_flags = vec![
         "-connect",
         "-servername",
         "-CAfile",
@@ -171,13 +171,15 @@ pub(crate) fn run(args: Args) {
         "-cert",
         "-key",
         "-mtu",
+        "-key-shares",
     ];
+    value_flags.extend(crate::ech::CLIENT_VALUE_FLAGS);
     let connect = args
         .value("-connect")
         .or_else(|| args.positionals(&value_flags).first().copied())
         .unwrap_or_else(|| {
             die(
-                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-keylogfile keys.log]",
+                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease]",
             )
         });
     let (host, port) = match connect.rsplit_once(':') {
@@ -224,6 +226,17 @@ pub(crate) fn run(args: Args) {
     if let Some(a) = alpn {
         builder = builder.alpn(a);
     }
+    // `-key-shares x25519,secp256r1`: pre-share keys for these groups only;
+    // a server preferring another offered group answers with a
+    // HelloRetryRequest.
+    if let Some(list) = args.value("-key-shares") {
+        let groups: Vec<_> = list
+            .split(',')
+            .filter(|g| !g.is_empty())
+            .map(|g| crate::util::parse_group(g, "-key-shares"))
+            .collect();
+        builder = builder.key_shares(&groups);
+    }
     if let Some((cert_path, key_path, (chain, key))) = client_id {
         builder = builder
             .try_identity(chain, key)
@@ -231,6 +244,12 @@ pub(crate) fn run(args: Args) {
     }
     if let Some(sink) = keylog {
         builder = builder.key_log(sink);
+    }
+    let (builder, ech) = crate::ech::apply_client(&args, builder);
+    // RFC 9849 is a TLS 1.3 mechanism (§6.1: the inner hello MUST NOT offer
+    // 1.2), and this stack does not implement it for DTLS.
+    if ech.any() && version != ProtocolVersion::Tls13 {
+        die("ECH options require TLS 1.3 over TCP (drop -tls1_2 / -dtls1_2 / -dtls1_3)");
     }
     let cfg = builder.build();
     let mut conn = Connection::client(&cfg)
@@ -240,7 +259,9 @@ pub(crate) fn run(args: Args) {
         ProtocolVersion::Tls12 | ProtocolVersion::Tls13 => {
             let mut sock = TcpStream::connect((host, port))
                 .unwrap_or_else(|e| die(format!("TCP connect to {host}:{port} failed: {e}")));
-            run_tcp(&mut conn, &mut sock, version, insecure, showcerts, quiet);
+            run_tcp(
+                &mut conn, &mut sock, version, insecure, showcerts, quiet, &ech,
+            );
         }
         ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13 => {
             let socket = UdpSocket::bind("0.0.0.0:0")
@@ -260,8 +281,9 @@ fn run_tcp(
     insecure: bool,
     showcerts: bool,
     quiet: bool,
+    ech: &crate::ech::ClientEch,
 ) {
-    drive_tcp_handshake(conn, sock);
+    drive_tcp_handshake(conn, sock, ech);
 
     // The "certificate NOT verified" warning is security-relevant: it
     // tells the operator that this connection's peer identity was not
@@ -290,6 +312,7 @@ fn run_tcp(
         if let Some(p) = conn.alpn_selected() {
             eprintln!("ALPN: {}", String::from_utf8_lossy(p));
         }
+        crate::ech::report_client(conn, ech);
         print_chain(conn.peer_certificates(), showcerts);
     }
 
@@ -337,7 +360,27 @@ fn run_udp(
     drive_udp_data(conn, socket, mtu, Duration::from_secs(30));
 }
 
-fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream) {
+/// Fails the handshake: flushes any alert the engine queued (an ECH
+/// rejection ends with `ech_required`, RFC 9849 §6.1.6), reports an ECH
+/// rejection's `retry_configs`, and exits non-zero.
+fn handshake_failed(
+    conn: &mut Connection,
+    sock: &mut TcpStream,
+    ech: &crate::ech::ClientEch,
+    what: &str,
+    e: purecrypto::tls::Error,
+) -> ! {
+    if let Ok(out) = conn.pop()
+        && !out.is_empty()
+    {
+        let _ = sock.write_all(&out);
+        let _ = sock.flush();
+    }
+    crate::ech::report_client_error(&e, ech);
+    die(format!("{what}: {e:?}"))
+}
+
+fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream, ech: &crate::ech::ClientEch) {
     let mut read_buf = [0u8; 8192];
     loop {
         // Push outbound bytes first.
@@ -356,10 +399,11 @@ fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream) {
                 if n == 0 {
                     die("peer closed during handshake");
                 }
-                conn.feed(&read_buf[..n])
-                    .unwrap_or_else(|e| die(format!("TLS feed failed: {e:?}")));
+                if let Err(e) = conn.feed(&read_buf[..n]) {
+                    handshake_failed(conn, sock, ech, "TLS feed failed", e);
+                }
             }
-            Err(e) => die(format!("TLS handshake failed: {e:?}")),
+            Err(e) => handshake_failed(conn, sock, ech, "TLS handshake failed", e),
         }
     }
 }

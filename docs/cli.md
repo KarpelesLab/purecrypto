@@ -43,6 +43,7 @@ Two conventions apply across the tool:
 - [`ca`](#ca)
 - [`crl`](#crl)
 - [`s_client` / `s_server`](#s_client--s_server)
+- [Encrypted Client Hello: `generate-ech`, `-ech-*`](#encrypted-client-hello-generate-ech--ech-)
 - [DTLS: `s_dtls_client` / `s_dtls_server`](#dtls-s_dtls_client--s_dtls_server)
 - [QUIC: `q_client` / `q_server`](#quic-q_client--q_server)
 - [Cookbook](#cookbook)
@@ -351,10 +352,13 @@ through version flags, described below.
 ```text
 purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name]
                     [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1]
-                    [-cert client.pem -key client.key] [-mtu N] [-keylogfile keys.log] [-quiet]
+                    [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...]
+                    [-keylogfile keys.log] [-quiet]
+                    [-ech-config-list list [-ech-retry-configs-out FILE] | -ech-grease]
 purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2 | -dtls1_2 | -dtls1_3]
                     [-Verify ca.pem] [-alpn h2,http/1.1] [-www] [-mtu N] [-no_cookie]
-                    [-keylogfile keys.log] [-quiet]
+                    [-prefer-group NAME] [-keylogfile keys.log] [-quiet]
+                    [-ech-key key.bin -ech-config config.bin]
 ```
 
 ```sh
@@ -372,9 +376,16 @@ purecrypto s_server -cert server.pem -key server.key -accept 8443 -Verify client
 
 Behaviour worth knowing:
 
-- The client offers `X25519MLKEM768` first, then `x25519` and `secp256r1`;
-  all three TLS 1.3 suites; and Ed25519, Ed448, ECDSA and RSA peer
-  signatures.
+- The client offers `X25519MLKEM768` first, then `x25519`, `secp256r1` and
+  `secp384r1`, with a key share for each; all three TLS 1.3 suites; and
+  Ed25519, Ed448, ECDSA and RSA peer signatures. `-key-shares x25519` (a
+  comma-separated list) pre-shares keys for those groups only: every group is
+  still offered, and a server preferring another answers with a
+  HelloRetryRequest.
+- `s_server -prefer-group NAME` (`x25519`, `secp256r1`, `secp384r1`,
+  `X25519MLKEM768`) makes the server ask, by HelloRetryRequest, for that group
+  whenever the client offers it without a key share. After the handshake the
+  server prints the SNI it was sent (`SNI: …`).
 - `s_server` is a one-shot test server: it accepts one connection, exchanges
   data, and exits (over TCP it also gives up after 60 s without a client).
   `-accept` takes a bare port, which binds `127.0.0.1`; the DTLS and QUIC
@@ -392,6 +403,67 @@ Behaviour worth knowing:
   does not support client authentication.
 - `-keylogfile` is opened without following symlinks and refused if the
   file is readable by others.
+
+## Encrypted Client Hello: `generate-ech`, `-ech-*`
+
+Encrypted Client Hello (ECH, [RFC 9849](https://www.rfc-editor.org/rfc/rfc9849))
+hides the real server name, ALPN and the rest of the ClientHello from the
+network: the client encrypts that *inner* hello to a public key the server
+publishes (an `ECHConfigList`, normally in a DNS HTTPS record) and sends an
+*outer* hello naming only the configuration's `public_name`. It needs a
+binary built with the `ech` feature (`cargo build --features ech`, or
+`cargo install purecrypto --features ech`); without it the ECH flags are
+refused rather than ignored. TLS 1.3 over TCP only.
+
+```text
+purecrypto generate-ech -public-name NAME -out-ech-config-list list.bin
+                        -out-ech-config config.bin -out-private-key key.bin
+                        [-config-id N] [-max-name-length N]
+purecrypto s_client … -ech-config-list list.bin [-ech-retry-configs-out retry.bin]
+purecrypto s_client … -ech-grease
+purecrypto s_server … -ech-key key.bin -ech-config config.bin
+```
+
+The files use BoringSSL's formats, so keys move between `purecrypto` and
+`bssl generate-ech` / `bssl server -ech-key … -ech-config …` /
+`bssl client -ech-config-list …` unchanged:
+
+- **`ECHConfigList`** (`-out-ech-config-list`, `-ech-config-list`) — the wire
+  list a DNS HTTPS record's `ech=` parameter carries. `s_client` also takes it
+  base64-encoded, as DNS tooling prints it.
+- **`ECHConfig`** (`-out-ech-config`, `-ech-config`) — one wire config.
+- **private key** (`-out-private-key`, `-ech-key`) — the raw HPKE private key
+  (32 bytes: `generate-ech` makes DHKEM(X25519, HKDF-SHA256) keys offering
+  AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305). Written mode 0600 and never
+  over an existing file.
+
+`s_client -ech-config-list` seals the `-servername` hello and prints
+`ECH: accepted` once the server confirms it. If the server cannot decrypt it
+(a stale configuration), it completes the handshake as `public_name` instead;
+the client verifies the certificate for that name, prints `ECH: rejected` and
+the server's `retry_configs` (base64; `-ech-retry-configs-out` also saves them
+as an `ECHConfigList` to retry with), sends `ech_required` and exits non-zero
+— such a connection is never used for data. `-ech-grease` sends a
+look-alike extension without a configuration (and prints
+`ECH: GREASE (not negotiated)`). `s_server` reports `ECH: accepted` or
+`ECH: not accepted` next to the SNI it handshook on, and sends its own
+configuration as `retry_configs` whenever it rejects.
+
+```sh
+# A server with an ECH key, and a client that hides secret.example behind
+# public.example (the certificate should cover both names).
+purecrypto generate-ech -public-name public.example -out-ech-config-list ech.list \
+                        -out-ech-config ech.cfg -out-private-key ech.key
+purecrypto s_server -cert server.crt -key server.pem -accept 8443 -www \
+                    -ech-key ech.key -ech-config ech.cfg
+purecrypto s_client -connect 127.0.0.1:8443 -CAfile ca.crt -servername secret.example \
+                    -ech-config-list ech.list
+
+# A public ECH deployment: fetch the ECHConfigList from DNS (the `ech=` value
+# of the HTTPS record, base64) and look for `sni=encrypted`.
+purecrypto s_client -connect crypto.cloudflare.com:443 -ech-config-list cf-ech.b64 \
+                    < request.txt     # GET /cdn-cgi/trace
+```
 
 ## DTLS: `s_dtls_client` / `s_dtls_server`
 

@@ -6868,3 +6868,231 @@ excluded_dn = ["/OU=Contractors"]
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A CA plus a leaf for `public.example` + `secret.example` (the ECHConfig
+/// public_name and the hidden name), built with the CLI itself. Returns
+/// `(dir, path-joiner)`.
+#[cfg(feature = "ech")]
+fn ech_test_pki(tag: &str) -> (std::path::PathBuf, impl Fn(&str) -> String) {
+    let dir = std::env::temp_dir().join(format!("pc_ech_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.clone();
+    let p = move |f: &str| d.join(f).to_str().unwrap().to_string();
+    let steps: [Vec<String>; 5] = [
+        vec![
+            "genpkey",
+            "-algorithm",
+            "EC",
+            "-curve",
+            "P-256",
+            "-out",
+            &p("ca.key"),
+        ],
+        vec![
+            "x509",
+            "-new",
+            "-ca",
+            "-key",
+            &p("ca.key"),
+            "-subj",
+            "/CN=ECH test CA",
+            "-out",
+            &p("ca.crt"),
+        ],
+        vec![
+            "genpkey",
+            "-algorithm",
+            "EC",
+            "-curve",
+            "P-256",
+            "-out",
+            &p("leaf.key"),
+        ],
+        vec![
+            "req",
+            "-key",
+            &p("leaf.key"),
+            "-subj",
+            "/CN=public.example",
+            "-out",
+            &p("leaf.csr"),
+        ],
+        vec![
+            "x509",
+            "-req",
+            "-in",
+            &p("leaf.csr"),
+            "-CA",
+            &p("ca.crt"),
+            "-CAkey",
+            &p("ca.key"),
+            "-san",
+            "public.example,secret.example",
+            "-out",
+            &p("leaf.crt"),
+        ],
+    ]
+    .map(|v| v.into_iter().map(str::to_string).collect());
+    for args in &steps {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (_, err, ok) = run_capture(&args, b"");
+        assert!(ok, "{args:?} failed: {err}");
+    }
+    (dir, p)
+}
+
+#[cfg(feature = "ech")]
+fn ech_generate(p: &impl Fn(&str) -> String, prefix: &str, config_id: &str) {
+    let (_, err, ok) = run_capture(
+        &[
+            "generate-ech",
+            "-public-name",
+            "public.example",
+            "-config-id",
+            config_id,
+            "-out-ech-config-list",
+            &p(&format!("{prefix}.list")),
+            "-out-ech-config",
+            &p(&format!("{prefix}.cfg")),
+            "-out-private-key",
+            &p(&format!("{prefix}.key")),
+        ],
+        b"",
+    );
+    assert!(ok, "generate-ech failed: {err}");
+}
+
+/// `generate-ech` + `s_server -ech-key/-ech-config` + `s_client
+/// -ech-config-list`: the hidden name reaches the server and data flows;
+/// with a stale config the server rejects, the client authenticates
+/// `public.example`, reports ECH as rejected, saves `retry_configs` (the
+/// server's own list) and fails. External interop with BoringSSL is
+/// `tools/ech-interop/run.sh`; this is the CLI's own loopback.
+#[cfg(feature = "ech")]
+#[test]
+fn s_client_s_server_ech_accept_and_reject() {
+    let (dir, p) = ech_test_pki("accept_reject");
+    ech_generate(&p, "live", "7");
+    ech_generate(&p, "stale", "7");
+    let (cert, key, ech_key, ech_cfg) =
+        (p("leaf.crt"), p("leaf.key"), p("live.key"), p("live.cfg"));
+    let server_args = [
+        "s_server",
+        "-cert",
+        &cert,
+        "-key",
+        &key,
+        "-accept",
+        "0",
+        "-www",
+        "-ech-key",
+        &ech_key,
+        "-ech-config",
+        &ech_cfg,
+    ];
+
+    // Accepted.
+    let server = spawn_server_wait_listening(&server_args);
+    let port = server.port;
+    let stderr = std::sync::Arc::clone(&server.stderr);
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-CAfile",
+            &p("ca.crt"),
+            "-servername",
+            "secret.example",
+            "-ech-config-list",
+            &p("live.list"),
+        ],
+        b"GET / HTTP/1.0\r\n\r\n",
+    );
+    server.finish();
+    let server_err = stderr.lock().unwrap().clone();
+    assert!(ok, "s_client failed: {err}");
+    assert!(err.contains("ECH: accepted"), "client stderr: {err}");
+    assert!(
+        out.contains("hello from purecrypto s_server"),
+        "client stdout: {out}"
+    );
+    assert!(
+        server_err.contains("SNI: secret.example"),
+        "server stderr: {server_err}"
+    );
+    assert!(
+        server_err.contains("ECH: accepted"),
+        "server stderr: {server_err}"
+    );
+
+    // Rejected: same public_name and config_id, a key the server lacks.
+    let server = spawn_server_wait_listening(&server_args);
+    let port = server.port;
+    let stderr = std::sync::Arc::clone(&server.stderr);
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-CAfile",
+            &p("ca.crt"),
+            "-servername",
+            "secret.example",
+            "-ech-config-list",
+            &p("stale.list"),
+            "-ech-retry-configs-out",
+            &p("retry.bin"),
+        ],
+        b"GET / HTTP/1.0\r\n\r\n",
+    );
+    server.finish();
+    let server_err = stderr.lock().unwrap().clone();
+    assert!(!ok, "a rejected ECH connection must fail");
+    assert!(err.contains("ECH: rejected"), "client stderr: {err}");
+    assert!(
+        !out.contains("hello from purecrypto s_server"),
+        "client stdout: {out}"
+    );
+    assert_eq!(
+        std::fs::read(p("retry.bin")).unwrap(),
+        std::fs::read(p("live.list")).unwrap(),
+        "retry_configs must be the server's ECHConfigList"
+    );
+    assert!(
+        server_err.contains("SNI: public.example"),
+        "server stderr: {server_err}"
+    );
+    assert!(
+        server_err.contains("ECH: not accepted"),
+        "server stderr: {server_err}"
+    );
+    assert!(
+        !server_err.contains("secret.example"),
+        "server stderr: {server_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without the `ech` feature the ECH flags are refused — never ignored,
+/// which would send the hidden name in the clear.
+#[cfg(not(feature = "ech"))]
+#[test]
+fn ech_flags_are_refused_without_the_feature() {
+    for args in [
+        &["s_client", "-connect", "127.0.0.1:9", "-ech-grease"][..],
+        &[
+            "s_client",
+            "-connect",
+            "127.0.0.1:9",
+            "-ech-config-list",
+            "missing.bin",
+        ][..],
+    ] {
+        let (_, err, ok) = run_capture(args, b"");
+        assert!(!ok, "{args:?} must fail");
+        assert!(err.contains("--features ech"), "{args:?}: {err}");
+    }
+}

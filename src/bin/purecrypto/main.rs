@@ -4,6 +4,7 @@
 
 mod ca;
 mod crl;
+mod ech;
 mod ecn_socket;
 mod enc;
 mod genpkey;
@@ -52,6 +53,7 @@ COMMANDS:
     x509                 Inspect, self-sign, or CA-sign a certificate
     ca                   Manage a development CA on disk (init, issue, crl, ...)
     crl                  Inspect or verify a CRL (-text, -CAfile -verify, -is-revoked)
+    generate-ech         Generate an Encrypted Client Hello key and ECHConfig
     s_client             Open a TLS 1.3 connection and report the result
     s_server             Run a one-shot TLS 1.3 echo/-www server
     s_dtls_client        Open a DTLS 1.2 connection over UDP
@@ -82,6 +84,7 @@ fn main() {
         Some("req") => req::run(rest),
         Some("x509") => x509::run(rest),
         Some("ca") => ca::run(rest),
+        Some("generate-ech") => ech::run_generate(rest),
         Some("s_client") => s_client::run(rest),
         Some("s_server") => s_server::run(rest),
         Some("s_dtls_client") => s_dtls_client::run(rest),

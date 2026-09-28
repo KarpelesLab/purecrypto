@@ -124,7 +124,8 @@ pub(crate) fn run(args: Args) {
         die(
             "usage: purecrypto s_server -cert cert.pem -key key.pem -accept PORT \
              [-tls1_2 | -dtls1_2 | -dtls1_3] [-Verify ca.pem] [-alpn h2,http/1.1] [-www] \
-             [-mtu N] [-no_cookie] [-keylogfile keys.log]",
+             [-mtu N] [-no_cookie] [-keylogfile keys.log] \
+             [-ech-key key.bin -ech-config config.bin] [-prefer-group NAME]",
         )
     });
     let key_path = args
@@ -178,6 +179,16 @@ pub(crate) fn run(args: Args) {
     if let Some(sink) = keylog {
         builder = builder.key_log(sink);
     }
+    // `-prefer-group` makes the server answer a ClientHello that did not
+    // pre-share a key for NAME with a HelloRetryRequest (RFC 8446 §4.1.4).
+    if let Some(name) = args.value("-prefer-group") {
+        builder =
+            builder.preferred_key_exchange_group(crate::util::parse_group(name, "-prefer-group"));
+    }
+    let (mut builder, ech) = crate::ech::apply_server(&args, builder);
+    if ech && version != ProtocolVersion::Tls13 {
+        die("-ech-key / -ech-config require TLS 1.3 over TCP (drop -tls1_2 / -dtls1_2 / -dtls1_3)");
+    }
     if let Some(p) = verify_ca {
         let roots = load_roots_file(p);
         builder = builder.client_auth(ClientAuth::new(roots, true));
@@ -223,7 +234,7 @@ pub(crate) fn run(args: Args) {
             }
             let mut conn = Connection::server(&cfg)
                 .unwrap_or_else(|e| die(format!("server config rejected: {e:?}")));
-            run_tcp(&mut conn, &mut sock, www, quiet);
+            run_tcp(&mut conn, &mut sock, www, quiet, ech);
         }
         ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13 => {
             // `-Verify` was already rejected above, before the config was built.
@@ -274,11 +285,15 @@ fn accept_with_deadline(listener: &TcpListener, deadline: Duration) -> (TcpStrea
     }
 }
 
-fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool) {
-    drive_tcp_handshake(conn, sock);
+fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool, ech: bool) {
+    drive_tcp_handshake(conn, sock, ech);
 
     if !quiet {
         eprintln!("handshake complete");
+        if let Some(name) = conn.peer_server_name() {
+            eprintln!("SNI: {name}");
+        }
+        crate::ech::report_server(conn, ech);
         if let Some(p) = conn.alpn_selected() {
             eprintln!("ALPN: {}", String::from_utf8_lossy(p));
         }
@@ -374,7 +389,30 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool) 
     }
 }
 
-fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream) {
+/// Fails the handshake, first reporting what the server saw of the
+/// ClientHello (SNI, ECH) — the useful part when a client aborts after an
+/// ECH rejection — and flushing any alert the engine queued.
+fn handshake_failed(
+    conn: &mut Connection,
+    sock: &mut TcpStream,
+    ech: bool,
+    what: &str,
+    e: purecrypto::tls::Error,
+) -> ! {
+    if let Ok(out) = conn.pop()
+        && !out.is_empty()
+    {
+        let _ = sock.write_all(&out);
+        let _ = sock.flush();
+    }
+    if let Some(name) = conn.peer_server_name() {
+        eprintln!("SNI: {name}");
+    }
+    crate::ech::report_server(conn, ech);
+    die(format!("{what}: {e:?}"))
+}
+
+fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream, ech: bool) {
     let mut read_buf = [0u8; 8192];
     loop {
         let out = conn.pop().unwrap_or_default();
@@ -392,10 +430,11 @@ fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream) {
                 if n == 0 {
                     die("peer closed during handshake");
                 }
-                conn.feed(&read_buf[..n])
-                    .unwrap_or_else(|e| die(format!("TLS feed failed: {e:?}")));
+                if let Err(e) = conn.feed(&read_buf[..n]) {
+                    handshake_failed(conn, sock, ech, "TLS feed failed", e);
+                }
             }
-            Err(e) => die(format!("TLS handshake failed: {e:?}")),
+            Err(e) => handshake_failed(conn, sock, ech, "TLS handshake failed", e),
         }
     }
 }
