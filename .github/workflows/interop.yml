@@ -50,6 +50,10 @@ jobs:
     name: TLS 1.3 vs ${{ matrix.peer }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 45
+    defaults:
+      run:
+        # Git Bash on the Windows runner too (run.sh is bash).
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +71,10 @@ jobs:
           # and cached.
           - peer: mbedtls
             runs-on: ubuntu-latest
+          # Windows SChannel through .NET's SslStream: the C# peer in
+          # peers/schannel/, built on the runner with its dotnet SDK.
+          - peer: schannel
+            runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -157,6 +165,48 @@ jobs:
           cp build/programs/ssl/ssl_client2 build/programs/ssl/ssl_server2 ~/mbedtls/bin/
           ~/mbedtls/bin/ssl_client2 build_version=1
 
+      # ---- schannel ----------------------------------------------------
+      - name: Set up .NET
+        if: matrix.peer == 'schannel'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Windows and .NET versions
+        if: matrix.peer == 'schannel'
+        run: |
+          cmd //c ver
+          dotnet --info | head -20
+
+      # The GitHub Windows Server image pins SChannel's TLS policy (the
+      # group-policy cipher-suite and ECC-curve lists under
+      # HKLM\SOFTWARE\Policies\...\SSL\00010002) to a short list without
+      # curve25519 or ChaCha20, both of which the OS supports and has in
+      # its local defaults. Append them to the policy lists, the way an
+      # administrator would; SChannel picks the change up at once.
+      - name: SChannel TLS policy
+        if: matrix.peer == 'schannel'
+        shell: pwsh
+        run: |
+          $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002'
+          if (Test-Path $pol) {
+            $p = Get-ItemProperty $pol
+            if ($p.PSObject.Properties.Name -contains 'EccCurves') {
+              $curves = @($p.EccCurves)
+              if ($curves -notcontains 'curve25519') { $curves += 'curve25519' }
+              Set-ItemProperty $pol -Name EccCurves -Value ([string[]]$curves) -Type MultiString
+            }
+            if ($p.PSObject.Properties.Name -contains 'Functions') {
+              $f = $p.Functions
+              if ($f -notmatch 'TLS_CHACHA20_POLY1305_SHA256') { $f = "$f,TLS_CHACHA20_POLY1305_SHA256" }
+              Set-ItemProperty $pol -Name Functions -Value $f -Type String
+            }
+          }
+          Write-Host "--- ECC curves"
+          Get-TlsEccCurve
+          Write-Host "--- cipher suites"
+          (Get-TlsCipherSuite).Name
+
       # ---- purecrypto --------------------------------------------------
       - name: Build the purecrypto CLI
         run: cargo build --release --features ech --bin purecrypto
@@ -164,7 +214,9 @@ jobs:
       - name: Interop matrix (both roles)
         timeout-minutes: 30
         run: |
-          PURECRYPTO="$GITHUB_WORKSPACE/target/release/purecrypto" \
+          PC=$GITHUB_WORKSPACE/target/release/purecrypto
+          [ "$RUNNER_OS" != Windows ] || PC=$PC.exe
+          PURECRYPTO="$PC" \
           BSSL="$HOME/bssl/bssl" \
           MBEDTLS_BIN="$HOME/mbedtls/bin" \
           tools/interop/run.sh --peer "${{ matrix.peer }}"
