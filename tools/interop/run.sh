@@ -21,12 +21,14 @@
 # work directory.
 #
 # A case is a set of key=value words:
-#   proto=tls13|tls12  role=peer-server|peer-client  cert=<kind>
-#   group=<group>  suite=<suite>  feat=<feature>
+#   proto=tls13|tls12|dtls13|dtls12  role=peer-server|peer-client
+#   cert=<kind>  group=<group>  suite=<suite>  feat=<feature>
 # and is named <proto>_<ps|pc>_<feat>_<cert>_<group>_<suite>. The purecrypto
 # side is built here from the case; the peer side is the adapter's job. Both
 # sides' logs are checked for the negotiated parameters — a handshake that
-# completed with the wrong group or suite is a FAIL.
+# completed with the wrong group or suite is a FAIL. The DTLS cases (over
+# UDP, `s_client -dtls1_3` / `s_server -dtls1_3`) run only against a peer
+# whose adapter lists them in `protos`.
 #
 # Written for bash 3.2 (the macOS /bin/bash) as well as Linux bash 5.
 
@@ -94,9 +96,36 @@ SUITES="aes128gcm aes256gcm chacha20"
 # Features beyond the plain handshake, run with cert=p256 group=x25519
 # suite=aes128gcm unless the feature says otherwise.
 FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp rpk rpk-client ocsp alpn rsl large-chain tls12"
+# The DTLS matrix (per DTLS version the adapter's `protos` lists): the plain
+# product, then one case per feature. Features TLS has no counterpart for:
+# `mtu` (a > 16 KiB chain sent at a 512-byte path MTU: dozens of handshake
+# fragments each way), `loss` (a handshake through a relay that drops 20%
+# of the datagrams in each direction, pseudo-randomly from a fixed seed —
+# `lossy-udp.py` — so fragments of every flight are lost and
+# retransmitted: the > 16 KiB chain on DTLS 1.3, whose ACKs retransmit
+# only what was lost, a plain one on DTLS 1.2, which retransmits whole
+# flights; only the handshake and its parameters are checked, since a
+# datagram carrying application data or the close_notify may be the one
+# dropped), `cid` (RFC 9146 connection IDs).
+DTLS_GROUPS="x25519 p256 p384 x25519mlkem768"
+DTLS_FEATS="resume 0rtt hrr keyupdate keyupdate-peer alpn large-chain mtu loss mtls cid"
+
+# The protocols the adapter speaks (`protos`, optional): TLS only unless it
+# says otherwise.
+peer_protos() {
+    local p
+    p=$("${ADAPTER[@]}" protos 2>/dev/null || true)
+    echo "${p:-tls13 tls12}"
+}
+peer_speaks() {
+    case " $(peer_protos) " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
 
 matrix() {
-    local role cert group suite feat
+    local role cert group suite feat proto
     for role in peer-server peer-client; do
         for cert in $CERTS; do
             for group in $GROUPS_ALL; do
@@ -124,6 +153,36 @@ matrix() {
         # mTLS with every certificate kind as the CLIENT identity.
         for cert in $CERTS; do
             echo "proto=tls13 role=$role cert=$cert group=x25519 suite=aes128gcm feat=mtls"
+        done
+    done
+    for proto in dtls13 dtls12; do
+        peer_speaks $proto || continue
+        for role in peer-server peer-client; do
+            for cert in $CERTS; do
+                for group in $DTLS_GROUPS; do
+                    for suite in $SUITES; do
+                        echo "proto=$proto role=$role cert=$cert group=$group suite=$suite feat=plain"
+                    done
+                done
+            done
+            for feat in $DTLS_FEATS; do
+                case $feat in
+                    hrr)
+                        for group in $DTLS_GROUPS; do
+                            echo "proto=$proto role=$role cert=p256 group=$group suite=aes128gcm feat=hrr"
+                        done ;;
+                    large-chain|mtu)
+                        echo "proto=$proto role=$role cert=large group=x25519 suite=aes128gcm feat=$feat" ;;
+                    loss)
+                        if [ $proto = dtls13 ]; then
+                            echo "proto=$proto role=$role cert=large group=x25519 suite=aes128gcm feat=loss"
+                        else
+                            echo "proto=$proto role=$role cert=p256 group=x25519 suite=aes128gcm feat=loss"
+                        fi ;;
+                    *)
+                        echo "proto=$proto role=$role cert=p256 group=x25519 suite=aes128gcm feat=$feat" ;;
+                esac
+            done
         done
     done
 }
@@ -240,8 +299,12 @@ setup_pki() {
     [ -z "$QUIRKS" ] || log "peer quirks: $QUIRKS"
 }
 
+# has_quirk TOKEN: declared by the adapter for the peer as a whole (at
+# setup, without a case) or for the current case (`quirks` is asked again
+# with the CASE_* variables set; an adapter that ignores them answers the
+# same both times).
 has_quirk() {
-    case " $QUIRKS " in
+    case " $QUIRKS $CASE_QUIRKS " in
         *" $1 "*) return 0 ;;
     esac
     return 1
@@ -275,6 +338,25 @@ pc_suite() {
         chacha20) echo TLS_CHACHA20_POLY1305_SHA256 ;;
     esac
 }
+# The (D)TLS 1.2 suite the case's certificate kind and AEAD map to (the
+# peer pins it; purecrypto's 1.2 engines negotiate from their fixed list).
+pc_suite12() {
+    local kx
+    case $1 in rsa2048) kx=RSA ;; *) kx=ECDSA ;; esac
+    case $2 in
+        aes128gcm) echo "TLS_ECDHE_${kx}_WITH_AES_128_GCM_SHA256" ;;
+        aes256gcm) echo "TLS_ECDHE_${kx}_WITH_AES_256_GCM_SHA384" ;;
+        chacha20) echo "TLS_ECDHE_${kx}_WITH_CHACHA20_POLY1305_SHA256" ;;
+    esac
+}
+is_dtls() { case $CASE_PROTO in dtls*) return 0 ;; esac; return 1; }
+# The s_client / s_server version flag for a DTLS case.
+pc_dtls_flag() {
+    case $CASE_PROTO in
+        dtls13) echo -dtls1_3 ;;
+        dtls12) echo -dtls1_2 ;;
+    esac
+}
 # For the HRR cases: the group the purecrypto side shares first (the peer
 # pins another one, so a HelloRetryRequest follows).
 other_group() {
@@ -293,6 +375,26 @@ pc_supports() {
         resume-psk) skip "purecrypto resumes with psk_dhe_ke only (no PSK-only mode)" ;;
         ocsp) [ -n "$OCSP" ] || skip "no openssl to generate an OCSP response" ;;
     esac
+    if is_dtls; then
+        case $CASE_FEAT in
+            resume|0rtt) skip "purecrypto's DTLS engines have no session resumption (nor 0-RTT)" ;;
+            mtls) skip "purecrypto's DTLS servers do not support client certificates" ;;
+            cid) skip "purecrypto does not implement RFC 9146 connection IDs" ;;
+            loss) command -v python3 >/dev/null 2>&1 || skip "no python3 for the lossy relay" ;;
+        esac
+        if [ "$CASE_PROTO" = dtls12 ]; then
+            case $CASE_FEAT in
+                hrr) skip "DTLS 1.2 has no HelloRetryRequest" ;;
+                keyupdate|keyupdate-peer) skip "DTLS 1.2 has no KeyUpdate" ;;
+            esac
+            case $CASE_GROUP in
+                x25519mlkem768) skip "purecrypto's DTLS 1.2 engines have no ML-KEM hybrid" ;;
+            esac
+            case $CASE_CERT in
+                ed25519|mldsa65) skip "purecrypto's (D)TLS 1.2 engines sign with RSA or ECDSA only" ;;
+            esac
+        fi
+    fi
 }
 
 pc_ident() {
@@ -303,6 +405,22 @@ pc_ident() {
 # of a peer-server case).
 pc_client_args() {
     local a="-connect 127.0.0.1:$PORT -CAfile $PKI/ca.crt -servername localhost -read_timeout 2"
+    if is_dtls; then
+        # The 1.2 suite is the peer's to pin (`-ciphersuites` takes TLS
+        # 1.3 names); the group is pinned here in both versions.
+        a="$a $(pc_dtls_flag) -groups $(pc_group "$CASE_GROUP")"
+        if [ "$CASE_PROTO" = dtls13 ]; then
+            a="$a -ciphersuites $(pc_suite "$CASE_SUITE")"
+        fi
+        case $CASE_FEAT in
+            hrr) a="-connect 127.0.0.1:$PORT -CAfile $PKI/ca.crt -servername localhost -read_timeout 2 $(pc_dtls_flag) -groups $(other_group "$CASE_GROUP"):$(pc_group "$CASE_GROUP") -key-shares $(other_group "$CASE_GROUP") -ciphersuites $(pc_suite "$CASE_SUITE")" ;;
+            keyupdate) a="$a -key_update" ;;
+            alpn) a="$a -alpn h2,http/1.1" ;;
+            mtu) a="$a -mtu 512" ;;
+        esac
+        echo "$a"
+        return
+    fi
     if [ "$CASE_PROTO" = tls12 ]; then
         a="$a -min_protocol TLSv1.2"
     else
@@ -330,6 +448,16 @@ pc_client_args() {
 # of a peer-client case).
 pc_server_args() {
     local a="-accept 0 -cert $PKI/$CASE_CERT.crt -key $PKI/$CASE_CERT.key"
+    if is_dtls; then
+        a="$a $(pc_dtls_flag) -groups $(pc_group "$CASE_GROUP")"
+        case $CASE_FEAT in
+            keyupdate) a="$a -key_update" ;;
+            alpn) a="$a -alpn h2,http/1.1" ;;
+            mtu) a="$a -mtu 512" ;;
+        esac
+        echo "$a"
+        return
+    fi
     if [ "$CASE_PROTO" = tls12 ]; then
         a="$a -min_protocol TLSv1.2"
     else
@@ -360,6 +488,10 @@ pc_verify() {
     local f=$1 ok=0 group suite
     group=$(pc_group "$CASE_GROUP")
     suite=$(pc_suite "$CASE_SUITE")
+    if is_dtls; then
+        pc_verify_dtls "$f"
+        return $?
+    fi
     if [ "$CASE_PROTO" = tls12 ]; then
         if [ "$CASE_ROLE" = peer-server ]; then
             expect "$f" "connected: TLSv1.2" || ok=1
@@ -439,6 +571,48 @@ pc_verify() {
     return $ok
 }
 
+# pc_verify_dtls LOG: the DTLS counterpart of pc_verify. A DTLS 1.3
+# handshake normally goes through a HelloRetryRequest anyway — the server's
+# stateless cookie exchange rides on one (RFC 9147 §5.1) — so the line is
+# only demanded (not refuted) outside the `hrr` cases, whose group check
+# is what proves the steering.
+pc_verify_dtls() {
+    local f=$1 ok=0 version suite
+    case $CASE_PROTO in dtls13) version=DTLSv1.3 ;; *) version=DTLSv1.2 ;; esac
+    if [ "$CASE_ROLE" = peer-server ]; then
+        expect "$f" "connected: $version" || ok=1
+    else
+        expect "$f" "handshake complete: $version" || ok=1
+    fi
+    if [ "$CASE_PROTO" = dtls13 ]; then
+        suite=$(pc_suite "$CASE_SUITE")
+    else
+        suite=$(pc_suite12 "$CASE_CERT" "$CASE_SUITE")
+    fi
+    expect "$f" "cipher suite: $suite" || ok=1
+    expect "$f" "key exchange: $(pc_group "$CASE_GROUP")" || ok=1
+    case $CASE_FEAT in
+        hrr) expect "$f" "HelloRetryRequest: yes" || ok=1 ;;
+    esac
+    refute "$f" "resumed: yes" || ok=1
+    refute "$f" "early data: accepted" || ok=1
+    case $CASE_FEAT in
+        large-chain|mtu)
+            if [ "$CASE_ROLE" = peer-server ]; then
+                expect "$f" "peer certificate: X.509 (2)" || ok=1
+            fi ;;
+        keyupdate|keyupdate-peer)
+            expect_re "$f" "^KeyUpdate: sent [1-9][0-9]*, received [1-9][0-9]*" || ok=1 ;;
+        alpn) expect "$f" "ALPN: h2" || ok=1 ;;
+    esac
+    # (Under `loss` the close_notify may be the datagram that was dropped:
+    # alerts are not retransmitted.)
+    if ! has_quirk no-close-notify && [ "$CASE_FEAT" != loss ]; then
+        expect "$f" "close_notify: received" || ok=1
+    fi
+    return $ok
+}
+
 # ---------------------------------------------------------------- servers
 
 PC_SERVER_PID=""
@@ -455,7 +629,29 @@ stop_servers() {
         if [ -f "$WORK/feeder.pid" ]; then
             kill "$(cat "$WORK/feeder.pid")" 2>/dev/null || true
         fi
+        if [ -f "$WORK/relay.pid" ]; then
+            kill "$(cat "$WORK/relay.pid")" 2>/dev/null || true
+        fi
     fi
+}
+
+# start_lossy_relay: for the `loss` cases, a relay in front of the server
+# on PORT that drops 20% of the datagrams each way; PORT then points at it.
+start_lossy_relay() {
+    local rport attempt
+    for attempt in 1 2 3 4 5; do
+        rport=$(random_port)
+        python3 "$HERE/lossy-udp.py" "$rport" "$PORT" 20 >"$WORK/relay.out" 2>"$WORK/relay.err" &
+        echo $! >"$WORK/relay.pid"
+        sleep 0.3
+        if kill -0 "$(cat "$WORK/relay.pid")" 2>/dev/null; then
+            PORT=$rport
+            export PORT
+            return 0
+        fi
+    done
+    log "  lossy relay did not start"
+    return 1
 }
 
 # start_pc_server: `s_server -accept 0`; PORT from the banner.
@@ -466,7 +662,7 @@ start_pc_server() {
         </dev/null >"$WORK/server.out" 2>"$WORK/server.err" &
     PC_SERVER_PID=$!
     for i in $(seq 1 100); do
-        PORT=$(sed -n 's/^listening on [^ ]*:\([0-9][0-9]*\)$/\1/p' "$WORK/server.err")
+        PORT=$(sed -n 's/^listening on [^ ]*:\([0-9][0-9]*\)\( .*\)\{0,1\}$/\1/p' "$WORK/server.err")
         if [ -n "$PORT" ]; then export PORT; return 0; fi
         if ! kill -0 "$PC_SERVER_PID" 2>/dev/null; then break; fi
         sleep 0.1
@@ -556,6 +752,7 @@ run_case() {
         3) return 3 ;;
         *) REASON="adapter 'supports' failed ($rc): $REASON"; return 1 ;;
     esac
+    CASE_QUIRKS=$("${ADAPTER[@]}" quirks 2>/dev/null || true)
 
     if [ "$CASE_ROLE" = peer-server ]; then
         if ! "${ADAPTER[@]}" server >"$WORK/adapter-server.log" 2>&1; then
@@ -564,6 +761,9 @@ run_case() {
         fi
         PORT=$(cat "$WORK/server.port")
         export PORT
+        if [ "$CASE_FEAT" = loss ]; then
+            start_lossy_relay || { REASON="lossy relay did not start"; return 1; }
+        fi
         rc=0
         # shellcheck disable=SC2046
         "$TO" "$STEP_TIMEOUT" "$PURECRYPTO" s_client $(pc_client_args) \
@@ -577,6 +777,9 @@ run_case() {
         REASON=$("${ADAPTER[@]}" verify) || { REASON="$PEER: $REASON"; return 1; }
     else
         start_pc_server || { REASON="purecrypto s_server did not start"; return 1; }
+        if [ "$CASE_FEAT" = loss ]; then
+            start_lossy_relay || { REASON="lossy relay did not start"; return 1; }
+        fi
         rc=0
         "${ADAPTER[@]}" client >"$WORK/adapter-client.log" 2>&1 || rc=$?
         wait_pc_server

@@ -10,6 +10,7 @@ as is a session the peer ended without `close_notify`.
 cargo build --release --features ech --bin purecrypto
 PURECRYPTO=target/release/purecrypto tools/interop/run.sh --peer openssl-system
 PURECRYPTO=target/release/purecrypto tools/interop/run.sh --peer boringssl --filter 'ps_(resume|0rtt)'
+WOLFSSL_HOME=~/wolfssl PURECRYPTO=target/release/purecrypto tools/interop/run.sh --peer wolfssl --filter '^dtls13'
 tools/interop/run.sh --peer openssl-src --list
 ```
 
@@ -27,7 +28,7 @@ A case is a set of `key=value` words:
 
 | key     | values |
 |---------|--------|
-| `proto` | `tls13`, `tls12` (the TLS 1.2 fallback case) |
+| `proto` | `tls13`, `tls12` (the TLS 1.2 fallback case), `dtls13`, `dtls12` (see [DTLS](#dtls)) |
 | `role`  | `peer-server` (purecrypto is the client), `peer-client` (purecrypto is the server) |
 | `cert`  | `rsa2048`, `p256`, `p384`, `ed25519`, `mldsa65`, `large` (a > 16 KiB chain) |
 | `group` | `x25519`, `p256`, `p384`, `p521`, `x25519mlkem768`, `secp256r1mlkem768` |
@@ -72,6 +73,33 @@ leaf per key kind, the oversized chain, the raw public keys) and the OCSP
 response with `openssl ocsp` (`OPENSSL`, default `openssl` from PATH; the
 `ocsp` cases SKIP without one).
 
+## DTLS
+
+A peer whose adapter lists `dtls13` and/or `dtls12` in `protos` also gets
+the DTLS matrix, over loopback UDP, driving `s_client -dtls1_3` /
+`s_server -dtls1_3` (`-dtls1_2`) on the purecrypto side — the same
+negotiated-parameter report is checked, plus `HelloRetryRequest: yes` for
+the `hrr` cases (a DTLS 1.3 handshake goes through one anyway, for the
+server's stateless cookie exchange, so the line is not refuted elsewhere).
+Per DTLS version: the `cert × group × suite` product for `plain` (`p521`
+and `secp256r1mlkem768` are left out, and the DTLS 1.2 suite is the
+`ECDHE-{ECDSA,RSA}-…` one for the certificate — pinned by the peer, since
+`-ciphersuites` takes TLS 1.3 names), then:
+
+| `feat` | what is exercised |
+|---|---|
+| `hrr` | HelloRetryRequest to the pinned group, once per group (DTLS 1.3) |
+| `keyupdate`, `keyupdate-peer` | RFC 9147 §8 KeyUpdate with the epoch change, from either side (DTLS 1.3) |
+| `alpn` | ALPN selects `h2` |
+| `large-chain` | the > 16 KiB chain: dozens of handshake fragments across datagrams |
+| `mtu` | the same chain with the purecrypto side at `-mtu 512` |
+| `loss` | a handshake through `lossy-udp.py`, a relay dropping 20% of the datagrams each way (seeded, so it reproduces): ACK-driven retransmission (RFC 9147 §7) on DTLS 1.3 with the large chain, whole-flight retransmission (RFC 6347 §4.2.4) on DTLS 1.2 with a plain one; only the handshake and its parameters are checked, since the datagram carrying the data or the close_notify may be the dropped one |
+| `resume`, `0rtt`, `mtls`, `cid` | *SKIP: purecrypto's DTLS engines have no resumption, 0-RTT, client certificates or RFC 9146 connection IDs* |
+
+Adapters without `protos` are TLS-only and see no DTLS case. The peer
+server for a DTLS case is found by `lib.sh`'s `listening` on a bound UDP
+socket (`CASE_PROTO` says which family).
+
 ## Adding a peer
 
 Drop an adapter under `peers/`: either an executable `peers/<name>` (any
@@ -99,7 +127,8 @@ in the runner needs to change.
 | subcommand | contract |
 |---|---|
 | `info` | print the peer's version on stdout |
-| `quirks` | (optional) print space-separated tokens for documented tool limitations the runner should allow for: `no-close-notify` (the tool never sends `close_notify`, so its absence is not a failure) |
+| `protos` | (optional) print the space-separated protocols the peer speaks, from `tls13 tls12 dtls13 dtls12`; default `tls13 tls12`. Listing a DTLS version adds its matrix (see [DTLS](#dtls)) |
+| `quirks` | (optional) print space-separated tokens for documented tool limitations the runner should allow for: `no-close-notify` (the tool never sends `close_notify`, so its absence is not a failure). Asked once at setup for the peer as a whole and again for every case (with `CASE_*` set), so a limitation can be declared for one case only |
 | `supports` | exit 0 to run the case; exit 3 with the reason on stdout to SKIP it; anything else is an error |
 | `server` | start the peer server in the background, wait until it is listening, write the port to `$WORK/server.port` and the pid to `$WORK/server.pid`, then exit 0. Logs go to `$WORK/server.out` / `server.err`. The runner kills the pid (and `$WORK/feeder.pid`, if any) when the case is over. Shell adapters get this from `lib.sh`'s `start_bg_server`, which also picks a free port and retries collisions |
 | `client` | run the peer client against `127.0.0.1:$PORT` to completion, sending `$WORK/client.in`, twice when the feature resumes; exit with the client's status; logs in `$WORK/client.out` / `client.err` (`client2.*` for a second connection) |
@@ -120,6 +149,8 @@ it hands out is in Windows form).
 use) on Apple's Network.framework — the shape to copy for a platform stack
 that has no command-line client or server of its own; its README lists
 what is public API, what is SPI, and what the stack was observed to do.
+`peers/wolfssl.sh` (wolfSSL's example `client` / `server` from
+`WOLFSSL_HOME`) is the one that speaks DTLS.
 
 Skip rather than weaken: when a peer's tool cannot express a case, `supports`
 says so with the reason, and the reason lands in the run output and in

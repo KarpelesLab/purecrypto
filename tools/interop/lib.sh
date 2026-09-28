@@ -37,13 +37,23 @@ expect_re() {
     fi
 }
 
-# listening PORT: is a TCP socket listening on PORT?
+# listening PORT: is a socket listening on PORT — TCP, or UDP (bound) for a
+# DTLS case (`CASE_PROTO=dtls*`)?
 listening() {
-    if command -v ss >/dev/null 2>&1; then
-        ss -Hltn "sport = :$1" 2>/dev/null | grep -q .
-    else
-        lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
-    fi
+    case ${CASE_PROTO:-} in
+        dtls*)
+            if command -v ss >/dev/null 2>&1; then
+                ss -Hlun "sport = :$1" 2>/dev/null | grep -q .
+            else
+                lsof -nP -iUDP:"$1" >/dev/null 2>&1
+            fi ;;
+        *)
+            if command -v ss >/dev/null 2>&1; then
+                ss -Hltn "sport = :$1" 2>/dev/null | grep -q .
+            else
+                lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+            fi ;;
+    esac
 }
 
 # random_port: a port in the ephemeral-ish 30000..54999 range.
