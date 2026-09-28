@@ -142,6 +142,27 @@ pub(crate) fn write_message(
     }
 }
 
+/// A handshake message as the DTLS 1.2 transcript hashes it (RFC 6347
+/// §4.2.6): the 12-byte DTLS handshake header — `message_seq` included,
+/// `fragment_offset` 0 and `fragment_length` equal to the length, "as if
+/// each handshake message had been sent as a single fragment" — followed by
+/// the body. This is the input to the Finished `verify_data` and to the
+/// RFC 7627 `session_hash`. DTLS 1.3 differs (RFC 9147 §5.2 hashes the
+/// TLS-shaped 4-byte header); this helper is for the 1.2 engines only.
+pub(crate) fn transcript_message(msg_type: u8, message_seq: u16, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
+    write_fragment_header(
+        &mut out,
+        msg_type,
+        body.len() as u32,
+        message_seq,
+        0,
+        body.len() as u32,
+    );
+    out.extend_from_slice(body);
+    out
+}
+
 /// Like [`write_message`], but returns each fragment (12-byte header +
 /// chunk) as its own buffer so the caller can frame every fragment into
 /// its own record and datagram — a handshake message larger than the path
@@ -654,6 +675,35 @@ fn vec_bitmap_words(bits: usize) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 6347 §4.2.6: the transcript form of a message is its 12-byte
+    /// DTLS header with `fragment_offset` 0 and `fragment_length` equal to
+    /// the length — the same bytes an unfragmented message puts on the wire,
+    /// whichever fragments it was actually sent in.
+    #[test]
+    fn transcript_message_is_the_single_fragment_form() {
+        let body = [0xaa; 300];
+        let m = transcript_message(0x0b, 0x0102, &body);
+        assert_eq!(
+            &m[..HEADER_LEN],
+            &[0x0b, 0, 1, 0x2c, 0x01, 0x02, 0, 0, 0, 0, 1, 0x2c]
+        );
+        assert_eq!(&m[HEADER_LEN..], &body);
+        // The unfragmented wire encoding is identical ...
+        assert_eq!(
+            write_fragments(0x0b, 0x0102, &body, 0),
+            alloc::vec![m.clone()]
+        );
+        // ... and a fragmented send hashes the same, not the fragments.
+        let frags = write_fragments(0x0b, 0x0102, &body, 100);
+        assert_eq!(frags.len(), 3);
+        assert_ne!(frags[0], m);
+        // An empty message (ServerHelloDone) is header-only.
+        assert_eq!(
+            transcript_message(0x0e, 4, &[]),
+            alloc::vec![0x0e, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0]
+        );
+    }
 
     #[test]
     fn single_unfragmented_message_completes_immediately() {

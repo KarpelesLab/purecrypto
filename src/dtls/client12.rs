@@ -54,7 +54,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_fragments};
+use super::reassembly::{
+    HandshakeFragment, Reassembler, read_fragment, transcript_message, write_fragments,
+};
 use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, FlightRecord, Retransmit};
 use super::replay::AntiReplayWindow;
@@ -757,7 +759,7 @@ impl DtlsClientConnection12 {
             let spoofable = !authenticated && self.plaintext_flight_state();
             let snapshot = self.reassembler.expected_msg_seq();
             if let Some((msg_type, body)) = self.reassembler.feed(frag) {
-                match self.dispatch_one(msg_type, &body) {
+                match self.dispatch_one(msg_type, snapshot, &body) {
                     Ok(()) => {}
                     Err(e) if !spoofable || matches!(e, Error::InappropriateState) => {
                         return Err(e);
@@ -776,7 +778,7 @@ impl DtlsClientConnection12 {
                 let Some((msg_type, body)) = self.reassembler.pop_ready() else {
                     break;
                 };
-                match self.dispatch_one(msg_type, &body) {
+                match self.dispatch_one(msg_type, snapshot, &body) {
                     Ok(()) => {}
                     Err(e) if !spoofable || matches!(e, Error::InappropriateState) => {
                         return Err(e);
@@ -807,17 +809,11 @@ impl DtlsClientConnection12 {
         )
     }
 
-    fn dispatch_one(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
-        // Build the TLS-shaped raw bytes that the transcript expects:
-        // `Type(1) || Length(3) || Body`. The DTLS-specific header
-        // fields are excluded per RFC 6347 §4.2.2.
-        let mut raw = Vec::with_capacity(4 + body.len());
-        raw.push(msg_type);
-        let len = body.len() as u32;
-        raw.push(((len >> 16) & 0xff) as u8);
-        raw.push(((len >> 8) & 0xff) as u8);
-        raw.push((len & 0xff) as u8);
-        raw.extend_from_slice(body);
+    /// Dispatches one reassembled handshake message. `message_seq` is the
+    /// sequence number it arrived under, which the transcript covers (RFC
+    /// 6347 §4.2.6): `raw` is the message as hashed, DTLS header included.
+    fn dispatch_one(&mut self, msg_type: u8, message_seq: u16, body: &[u8]) -> Result<(), Error> {
+        let raw = transcript_message(msg_type, message_seq, body);
         self.dispatch_handshake(msg_type, body, &raw)
     }
 
@@ -1086,14 +1082,17 @@ impl DtlsClientConnection12 {
         // We must feed CKE into the transcript BEFORE deriving the master
         // secret so the EMS session_hash covers it (RFC 7627 §4).
         let cke = ClientKeyExchange { point: our_point }.encode();
-        // `cke` already has the 4-byte TLS handshake header; we strip it for
-        // transcript+DTLS fragmentation, then re-add for the transcript.
-        // Strip header: [type(1) | length(3) | body].
+        // `cke` carries the 4-byte TLS handshake header; DTLS fragments the
+        // body under its own 12-byte header, and the transcript covers the
+        // message in that shape (RFC 6347 §4.2.6).
         let cke_body = &cke[4..];
         let cke_msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        // Transcript: TLS-shaped (no DTLS headers).
-        self.transcript.update(&cke);
+        self.transcript.update(&transcript_message(
+            hs_type::CLIENT_KEY_EXCHANGE,
+            cke_msg_seq,
+            cke_body,
+        ));
         for frag in write_fragments(
             hs_type::CLIENT_KEY_EXCHANGE,
             cke_msg_seq,
@@ -1143,15 +1142,15 @@ impl DtlsClientConnection12 {
             finished_verify_data(suite.hash, &master, b"client finished", th.as_slice());
         // Build the Finished body (just 12 bytes — verify_data).
         let fin_body: Vec<u8> = verify_data.to_vec();
-        // Transcript: TLS-shaped finished.
-        let mut fin_tls = Vec::with_capacity(4 + 12);
-        fin_tls.push(hs_type::FINISHED);
-        fin_tls.extend_from_slice(&[0, 0, 12]);
-        fin_tls.extend_from_slice(&fin_body);
-        self.transcript.update(&fin_tls);
-        // DTLS handshake fragment.
+        // DTLS handshake fragment; the transcript covers the message under
+        // its header (RFC 6347 §4.2.6).
         let fin_msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
+        self.transcript.update(&transcript_message(
+            hs_type::FINISHED,
+            fin_msg_seq,
+            &fin_body,
+        ));
         for frag in write_fragments(
             hs_type::FINISHED,
             fin_msg_seq,
@@ -1294,25 +1293,22 @@ impl DtlsClientConnection12 {
         // (with cookie) IS, along with everything that follows. We can't
         // know yet whether the server will demand a cookie, so always feed
         // this CH into the transcript. On HVR we reset the transcript and
-        // feed the second CH instead. Per RFC 6347 §4.2.2, the
-        // DTLS-specific handshake-header fields (message_seq,
-        // fragment_offset, fragment_length) are excluded, but the CH body
-        // — including the cookie field — IS included.
-        let mut tls_ch = Vec::with_capacity(4 + body.len());
-        tls_ch.push(hs_type::CLIENT_HELLO);
-        let n = body.len() as u32;
-        tls_ch.push(((n >> 16) & 0xff) as u8);
-        tls_ch.push(((n >> 8) & 0xff) as u8);
-        tls_ch.push((n & 0xff) as u8);
-        tls_ch.extend_from_slice(&body);
-        self.transcript.update(&tls_ch);
-
-        // Wrap as a DTLS handshake fragment.
+        // feed the second CH instead. The CH is hashed under its 12-byte
+        // DTLS handshake header — `message_seq` (0, or 1 after a
+        // HelloVerifyRequest), `fragment_offset` 0 and `fragment_length`
+        // equal to the length — per RFC 6347 §4.2.6, cookie field included.
         let ch_msg_seq = self.out_msg_seq;
         // out_msg_seq is incremented after build (CH=0 first time, CH=1 after HVR)
         // by the caller flow — but here we have to do it explicitly since the
         // CH is a one-message flight.
         self.out_msg_seq += 1;
+        self.transcript.update(&transcript_message(
+            hs_type::CLIENT_HELLO,
+            ch_msg_seq,
+            &body,
+        ));
+
+        // Wrap as a DTLS handshake fragment.
         let mut flight = Flight::new();
         // One record per fragment (RFC 6347 §4.2.3): a hello that outgrows
         // the MTU is split across datagrams rather than IP-fragmented.

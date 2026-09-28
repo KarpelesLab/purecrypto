@@ -37,7 +37,8 @@ use core::time::Duration;
 
 use super::cookie::{CookieGenerator, build_ch_fingerprint};
 use super::reassembly::{
-    HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, write_fragments, write_message,
+    HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, transcript_message,
+    write_fragments, write_message,
 };
 use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, FlightRecord, Retransmit};
@@ -829,7 +830,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 .expect("reassembler built")
                 .feed(frag);
             if let Some((msg_type, body)) = feeding {
-                match self.dispatch_one(msg_type, &body) {
+                match self.dispatch_one(msg_type, snapshot, &body) {
                     Ok(()) => {}
                     Err(e) if authenticated || matches!(e, Error::InappropriateState) => {
                         return Err(e);
@@ -856,7 +857,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                     .expect("reassembler built")
                     .pop_ready();
                 match popped {
-                    Some((msg_type, body)) => match self.dispatch_one(msg_type, &body) {
+                    Some((msg_type, body)) => match self.dispatch_one(msg_type, snapshot, &body) {
                         Ok(()) => {}
                         Err(e) if authenticated || matches!(e, Error::InappropriateState) => {
                             return Err(e);
@@ -912,14 +913,11 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         true
     }
 
-    fn dispatch_one(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
-        let mut raw = Vec::with_capacity(4 + body.len());
-        raw.push(msg_type);
-        let len = body.len() as u32;
-        raw.push(((len >> 16) & 0xff) as u8);
-        raw.push(((len >> 8) & 0xff) as u8);
-        raw.push((len & 0xff) as u8);
-        raw.extend_from_slice(body);
+    /// Dispatches one reassembled handshake message. `message_seq` is the
+    /// sequence number it arrived under, which the transcript covers (RFC
+    /// 6347 §4.2.6): `raw` is the message as hashed, DTLS header included.
+    fn dispatch_one(&mut self, msg_type: u8, message_seq: u16, body: &[u8]) -> Result<(), Error> {
+        let raw = transcript_message(msg_type, message_seq, body);
         self.dispatch_handshake(msg_type, body, &raw)
     }
 
@@ -1131,20 +1129,15 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         //
         // The transcript starts with this CH per RFC 6347 §4.2.1 — from a
         // clean slate, so nothing a previously rejected (or replayed) CH
-        // could have left behind survives. `Transcript` accumulates raw
-        // bytes and applies the hash on demand once `set_alg` is called, so
-        // the order of update / set_alg is irrelevant as long as set_alg
-        // happens before `current_hash`.
+        // could have left behind survives — hashed with its 12-byte DTLS
+        // handshake header, `message_seq` included (§4.2.6). `Transcript`
+        // accumulates raw bytes and applies the hash on demand once
+        // `set_alg` is called, so the order of update / set_alg is
+        // irrelevant as long as set_alg happens before `current_hash`.
         self.client_random = Some(parsed.random);
-        let mut tls_ch = Vec::with_capacity(4 + body.len());
-        tls_ch.push(hs_type::CLIENT_HELLO);
-        let n = body.len() as u32;
-        tls_ch.push(((n >> 16) & 0xff) as u8);
-        tls_ch.push(((n >> 8) & 0xff) as u8);
-        tls_ch.push((n & 0xff) as u8);
-        tls_ch.extend_from_slice(body);
         self.transcript = Transcript::new();
-        self.transcript.update(&tls_ch);
+        self.transcript
+            .update(&transcript_message(hs_type::CLIENT_HELLO, msg_seq, body));
         // Pin the transcript hash now that the suite is known.
         self.transcript.set_alg(suite.hash);
         self.suite = Some(suite);
@@ -1236,19 +1229,14 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             extensions: sh_exts,
         }
         .encode_dtls();
-        // sh has leading 4-byte TLS header — strip for transcript not
-        // needed (transcript wants full TLS-shaped including header). Keep
-        // as-is for transcript.
-        self.transcript.update(&sh);
-        // Strip for DTLS fragment wrapping.
-        let sh_body = &sh[4..];
-        self.push_handshake(&mut flight, hs_type::SERVER_HELLO, sh_body);
+        // `encode_dtls` yields the TLS-shaped message (4-byte header);
+        // `push_handshake` hashes the body under its DTLS header and
+        // fragments it.
+        self.push_handshake(&mut flight, hs_type::SERVER_HELLO, &sh[4..]);
 
         // Certificate.
         let cert_msg = build_certificate_msg(&self.config.cert_chain);
-        self.transcript.update(&cert_msg);
-        let cert_body = &cert_msg[4..];
-        self.push_handshake(&mut flight, hs_type::CERTIFICATE, cert_body);
+        self.push_handshake(&mut flight, hs_type::CERTIFICATE, &cert_msg[4..]);
 
         // ServerKeyExchange. The SKE signature hash tracks the key's curve
         // for ECDSA (RFC 5246 §7.4.1.4.1 lets the server pick any acceptable
@@ -1309,15 +1297,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             signature,
         }
         .encode();
-        self.transcript.update(&ske);
-        let ske_body = &ske[4..];
-        self.push_handshake(&mut flight, hs_type::SERVER_KEY_EXCHANGE, ske_body);
+        self.push_handshake(&mut flight, hs_type::SERVER_KEY_EXCHANGE, &ske[4..]);
 
         // ServerHelloDone (empty body).
-        let mut shd = Vec::with_capacity(4);
-        shd.push(hs_type::SERVER_HELLO_DONE);
-        shd.extend_from_slice(&[0, 0, 0]);
-        self.transcript.update(&shd);
         self.push_handshake(&mut flight, hs_type::SERVER_HELLO_DONE, &[]);
 
         self.send_flight(flight)?;
@@ -1361,14 +1343,17 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         Ok(())
     }
 
-    /// Allocates the next outbound `message_seq`, fragments `msg_type` /
-    /// `body` to [`DEFAULT_MAX_FRAGMENT`], and appends every fragment to
-    /// `flight` as its own epoch-0 record — a Certificate larger than the
-    /// path MTU must be split across datagrams, not merely fragmented
-    /// inside one record (RFC 6347 §4.1.1 / §4.2.3).
+    /// Allocates the next outbound `message_seq`, adds the message to the
+    /// transcript under its DTLS header (RFC 6347 §4.2.6), fragments
+    /// `msg_type` / `body` to [`DEFAULT_MAX_FRAGMENT`], and appends every
+    /// fragment to `flight` as its own epoch-0 record — a Certificate
+    /// larger than the path MTU must be split across datagrams, not merely
+    /// fragmented inside one record (RFC 6347 §4.1.1 / §4.2.3).
     fn push_handshake(&mut self, flight: &mut Flight, msg_type: u8, body: &[u8]) {
         let msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
+        self.transcript
+            .update(&transcript_message(msg_type, msg_seq, body));
         for frag in write_fragments(msg_type, msg_seq, body, DEFAULT_MAX_FRAGMENT) {
             flight.push_record(ContentType::Handshake, 0, frag);
         }
@@ -1575,15 +1560,12 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let verify_data =
             finished_verify_data(suite.hash, &master, b"server finished", th2.as_slice());
         let fin_body: Vec<u8> = verify_data.to_vec();
-        // Transcript update with TLS-shaped Finished.
-        let mut fin_tls = Vec::with_capacity(16);
-        fin_tls.push(hs_type::FINISHED);
-        fin_tls.extend_from_slice(&[0, 0, 12]);
-        fin_tls.extend_from_slice(&fin_body);
-        self.transcript.update(&fin_tls);
-        // DTLS handshake fragment with the next out_msg_seq.
+        // DTLS handshake fragment with the next out_msg_seq; the transcript
+        // covers the message under that header (RFC 6347 §4.2.6).
         let msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
+        self.transcript
+            .update(&transcript_message(hs_type::FINISHED, msg_seq, &fin_body));
         for frag in write_fragments(hs_type::FINISHED, msg_seq, &fin_body, DEFAULT_MAX_FRAGMENT) {
             flight.push_record(ContentType::Handshake, 1, frag);
         }
