@@ -468,6 +468,7 @@ pub(crate) fn run(args: Args) {
                 rebind,
                 peer,
                 early_data: None,
+                reconnected: false,
             };
             let mut link = Link::connected(socket);
             if dtls13_reconnect {
@@ -497,6 +498,7 @@ pub(crate) fn run(args: Args) {
                 }
                 let udp2 = UdpOpts {
                     early_data: early_data.clone(),
+                    reconnected: true,
                     ..udp
                 };
                 run_udp(&mut conn, &mut link, &udp2);
@@ -537,6 +539,10 @@ struct UdpOpts {
     /// application data once the handshake completes. `None` when no 0-RTT
     /// was offered.
     early_data: Option<Vec<u8>>,
+    /// This is a `-reconnect` second connection: ICMP port-unreachable is
+    /// tolerated for [`RECONNECT_UNREACHABLE_GRACE`] while the server
+    /// rebinds between connections.
+    reconnected: bool,
 }
 
 /// Handshake + report, shared by the plain and the `-reconnect` flows.
@@ -676,7 +682,7 @@ fn run_udp_for_ticket(
     let mut conn = Connection::client(cfg)
         .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
     let clock = Clock::start();
-    drive_udp_handshake(&mut conn, link, &clock, opts.mtu);
+    drive_udp_handshake(&mut conn, link, &clock, opts.mtu, Duration::ZERO);
     if !opts.quiet {
         tlsinfo::report_handshake(&conn, Role::Client);
     }
@@ -708,7 +714,12 @@ fn run_udp(conn: &mut Connection, link: &mut Link, opts: &UdpOpts) {
     // One clock for the connection's whole life: the engine's timers are
     // expressed in it (see `dtls_io`).
     let clock = Clock::start();
-    drive_udp_handshake(conn, link, &clock, opts.mtu);
+    let grace = if opts.reconnected {
+        RECONNECT_UNREACHABLE_GRACE
+    } else {
+        Duration::ZERO
+    };
+    drive_udp_handshake(conn, link, &clock, opts.mtu, grace);
 
     // Unconditional security warning — see the TCP path for the rationale.
     if opts.insecure {
@@ -910,7 +921,20 @@ fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream, opts: &TcpOpts<'_
     }
 }
 
-fn drive_udp_handshake(conn: &mut Connection, link: &mut Link, clock: &Clock, mtu: usize) {
+/// How long a `-reconnect` second connection keeps retransmitting through
+/// ICMP port-unreachable errors: a server that serves connections one at a
+/// time (the wolfSSL example server) closes its socket after the first and
+/// rebinds the port for the next, and a ClientHello sent into that gap
+/// bounces.
+const RECONNECT_UNREACHABLE_GRACE: Duration = Duration::from_secs(5);
+
+fn drive_udp_handshake(
+    conn: &mut Connection,
+    link: &mut Link,
+    clock: &Clock,
+    mtu: usize,
+    unreachable_grace: Duration,
+) {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
     while !conn.is_handshake_complete() {
         if clock.now() > dtls_io::HANDSHAKE_DEADLINE {
@@ -922,6 +946,12 @@ fn drive_udp_handshake(conn: &mut Connection, link: &mut Link, clock: &Clock, mt
         match dtls_io::step(conn, link, clock, &mut buf) {
             // (Only an accepting server link hands off; a client never does.)
             Ok(Step::Datagram | Step::Quiet | Step::Handoff) => {}
+            // UDP has no connection: a port-unreachable bounce during the
+            // grace window is a server between sockets, not a dead one.
+            // Wait and let the retransmit timer try again.
+            Ok(Step::Gone) if clock.now() < unreachable_grace => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
             Ok(Step::Gone) => die("UDP recv failed: the server is unreachable"),
             Err(e) => die(format!("DTLS handshake failed: {e:?}")),
         }
