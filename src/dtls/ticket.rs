@@ -35,8 +35,9 @@
 use crate::hash::{Hmac, Sha256};
 use crate::tls::Error;
 use crate::tls::codec::{CipherSuite, ClientHello, ExtensionType, extension as ext};
-use crate::tls::conn::{ClientAuthPolicy, StoredSession, TicketPlaintext, open_ticket13};
+use crate::tls::conn::{StoredSession, TicketPlaintext, open_ticket13};
 use crate::tls::crypto::{HashAlg, LabelPrefix, psk_binder_with};
+use crate::tls::pki::RootCertStore;
 use crate::x509::Time;
 use crate::zeroize::Zeroizing;
 use alloc::vec::Vec;
@@ -72,21 +73,20 @@ pub(crate) const MAX_TICKET_AGE_DEVIATION_MS: u64 = 10_000;
 /// different client roots derive different sealing keys, so a ticket that
 /// records "the client was authenticated" is only honoured where that
 /// authentication would have been accepted (a cross-listener authentication
-/// bypass otherwise). The DTLS engines do not verify client certificates
-/// yet and pass `None`; the derivation is already in place for the day they
-/// do, so tickets minted before that never open at an mTLS listener.
+/// bypass otherwise). `client_auth` is the listener's `(roots, required)`
+/// client-certificate policy, `None` when it requests no certificate.
 pub(crate) fn seal_key(
     ticket_key: &[u8; 32],
     label: &[u8],
-    client_auth: Option<&ClientAuthPolicy>,
+    client_auth: Option<(&RootCertStore, bool)>,
 ) -> Zeroizing<[u8; 32]> {
     let mut mac = Hmac::<Sha256>::new(ticket_key);
     mac.update(label);
     match client_auth {
         None => mac.update(&[0u8]),
-        Some(policy) => {
-            mac.update(&[1u8, u8::from(policy.required)]);
-            for (subject, spki) in policy.roots.anchor_identities() {
+        Some((roots, required)) => {
+            mac.update(&[1u8, u8::from(required)]);
+            for (subject, spki) in roots.anchor_identities() {
                 mac.update(&(subject.len() as u32).to_be_bytes());
                 mac.update(subject);
                 mac.update(&(spki.len() as u32).to_be_bytes());

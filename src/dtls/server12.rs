@@ -64,7 +64,7 @@ use super::reassembly::{
 use super::record::{self, ParsedDtlsRecord, TLS12_CID_CONTENT_TYPE};
 use super::reliability::{Flight, FlightRecord, Retransmit};
 use super::replay::AntiReplayWindow;
-use super::ticket::{TICKET_DTLS12_AAD, seal_key, ticket_now};
+use super::ticket::{TICKET_DTLS12_AAD, resumable_client_leaf, seal_key, ticket_now};
 
 #[allow(unused_imports)]
 use crate::ct::ConstantTimeEq;
@@ -608,16 +608,19 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     }
 
     /// The effective sealing key: `ticket_key` bound to the DTLS 1.2 label
-    /// and to this listener's client-auth configuration (none: the DTLS
-    /// servers verify no client certificate yet), exactly as the TLS 1.2
-    /// server binds its own — a ticket from a listener with other client
-    /// roots, or from another protocol, never opens here.
+    /// and to this listener's client-auth configuration, exactly as the TLS
+    /// 1.2 server binds its own — a ticket from a listener with other client
+    /// roots or another `required` flag, or from another protocol, never
+    /// opens here.
     fn ticket_seal_key(&self) -> Option<crate::zeroize::Zeroizing<[u8; 32]>> {
         let key = self.config.ticket_key.as_ref()?;
         Some(seal_key(
             key,
             b"purecrypto dtls12 ticket client-auth binding v1",
-            None,
+            self.config
+                .client_auth
+                .as_ref()
+                .map(|p| (&p.roots, p.required)),
         ))
     }
 
@@ -633,9 +636,20 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let parsed = Ticket12Plaintext::decode(&plain);
         crate::tls::conn::wipe(&mut plain);
         let parsed = parsed?;
-        // The DTLS 1.2 server authenticates no client: a ticket recording
-        // a client identity was not minted here and cannot be honoured.
-        if parsed.client_leaf.is_some() {
+        // An abbreviated handshake authenticates no client, so it can only
+        // stand in for the identity the issuing handshake established: a
+        // listener that requires a client certificate ignores a ticket
+        // without one (the full handshake then demands it), and a recorded
+        // identity must still be acceptable now — an X.509 leaf inside its
+        // validity period — as the TLS 1.2 server checks.
+        if self.config.client_auth.as_ref().is_some_and(|p| p.required)
+            && parsed.client_leaf.is_none()
+        {
+            return None;
+        }
+        if let Some(leaf) = parsed.client_leaf.as_ref()
+            && !resumable_client_leaf(leaf, now, &[])
+        {
             return None;
         }
         let suite_code = CipherSuite(parsed.cipher_suite);
@@ -656,6 +670,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             suite,
             master_secret: parsed.master_secret,
             ems_used: parsed.ems_used,
+            client_leaf: parsed.client_leaf.clone(),
         })
     }
 
@@ -679,10 +694,11 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     }
 
     /// The client's certificate chain (leaf first, DER) once its
-    /// `CertificateVerify` has been checked; empty when no certificate was
-    /// requested or the client presented none.
+    /// `CertificateVerify` has been checked — or, on a resumed handshake,
+    /// the leaf its ticket carried; empty when no certificate was requested
+    /// or the client presented none.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
-        if self.client_cert_verified {
+        if self.client_cert_verified || self.resumed {
             &self.client_cert_chain
         } else {
             &[]
@@ -2360,6 +2376,8 @@ struct Resumption12 {
     /// RFC 7627 §5.3: whether the original session used Extended Master
     /// Secret; the resumed handshake must match.
     ems_used: bool,
+    /// The client leaf the issuing handshake authenticated, if any.
+    client_leaf: Option<Vec<u8>>,
 }
 
 impl Drop for Resumption12 {
@@ -2393,6 +2411,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.master = Some(master);
         self.resumed = true;
         self.pending_read_crypter = Some(read_crypter);
+        // Resumption carries the issuing handshake's client identity
+        // forward: restore the leaf so `peer_certificates()` reflects it.
+        self.client_cert_chain = r.client_leaf.iter().cloned().collect();
 
         let mut flight = Flight::new();
         let mut sh_exts: Vec<(ExtensionType, Vec<u8>)> = alloc::vec![ext::ec_point_formats()];
@@ -2485,7 +2506,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             creation_time,
             ems_used: self.ems_negotiated,
             alpn: self.alpn_negotiated.clone(),
-            client_leaf: None,
+            // The chain this handshake verified (RFC 5246 §7.4.6), for a
+            // resumption to stand in for; none for an anonymous client.
+            client_leaf: self.client_cert_chain.first().cloned(),
         };
         let mut plain_bytes = plain.encode();
         let ticket = seal_ticket_with_aad(&mut self.rng, &key, TICKET_DTLS12_AAD, &plain_bytes);

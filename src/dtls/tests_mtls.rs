@@ -684,3 +684,184 @@ fn untrusted_or_expired_client_chain_is_refused_12() {
     assert!(!server.is_handshake_complete());
     assert!(server.peer_certificates().is_empty());
 }
+
+/// Session resumption at an mTLS listener: the ticket carries the client
+/// identity the issuing handshake verified, the resumed handshake (which
+/// authenticates no client of its own) restores it into
+/// `peer_certificates()`, and the ticket-sealing key is bound to the
+/// listener's client-auth policy, so a ticket minted where no certificate
+/// was demanded never stands in for one at a listener that demands it.
+mod resumption {
+    use super::*;
+    use crate::tls::conn::{StoredSession, StoredSession12};
+
+    const TICKET_KEY: [u8; 32] = [0x3c; 32];
+
+    /// The server policy of a case: `None` requests no certificate.
+    type Policy = Option<(Vec<u8>, bool)>;
+
+    fn server13(policy: &Policy, seed: &[u8]) -> Server13 {
+        let (skey, scert) = server_identity();
+        let mut scfg = PcServerConfig13::with_ecdsa(alloc::vec![scert], skey)
+            .with_ticket_key(TICKET_KEY)
+            .with_no_cookie();
+        if let Some((anchor, required)) = policy {
+            scfg = scfg.with_client_auth(roots(anchor), *required);
+        }
+        scfg.verification_time = Some(now());
+        let srng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+        DtlsServerConnection13::new(Arc::new(scfg), b"peer".to_vec(), srng)
+    }
+
+    fn client13(with_identity: bool, session: Option<StoredSession>) -> DtlsClientConnection13 {
+        let (_, scert) = server_identity();
+        let mut ccfg =
+            PcClientConfig13::new(roots(&scert), "dtls.example").with_verification_time(now());
+        if with_identity {
+            let (ckey, ccert) = client_identity();
+            ccfg = ccfg.with_client_cert(ClientCertConfig::with_ecdsa(alloc::vec![ccert], ckey));
+        }
+        ccfg.session = session;
+        let mut crng = HmacDrbg::<Sha256>::new(b"mtls13-resume-c", b"nonce", &[]);
+        DtlsClientConnection13::new(ccfg, b"peer".to_vec(), &mut crng)
+    }
+
+    /// A full DTLS 1.3 handshake at `policy`, returning the session the
+    /// server's post-handshake NewSessionTicket built.
+    fn session13(policy: &Policy, with_identity: bool) -> StoredSession {
+        let mut c = client13(with_identity, None);
+        let mut s = server13(policy, b"mtls13-resume-s1");
+        pump13(&mut c, &mut s).unwrap();
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        c.take_session().expect("a ticket")
+    }
+
+    #[test]
+    fn resumed_dtls13_connection_carries_the_client_identity() {
+        let (_, ccert) = client_identity();
+        let policy: Policy = Some((ccert.clone(), true));
+        let session = session13(&policy, true);
+        let mut c = client13(true, Some(session));
+        let mut s = server13(&policy, b"mtls13-resume-s2");
+        pump13(&mut c, &mut s).unwrap();
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        assert!(c.psk_accepted() && s.psk_used(), "resumed");
+        assert_eq!(s.peer_certificates(), &[ccert.clone()][..]);
+        // The resumed connection's own ticket carries the identity on: a
+        // second resumption restores it again.
+        let again = c
+            .take_session()
+            .expect("a ticket on the resumed connection");
+        let mut c = client13(true, Some(again));
+        let mut s = server13(&policy, b"mtls13-resume-s3");
+        pump13(&mut c, &mut s).unwrap();
+        assert!(s.psk_used());
+        assert_eq!(s.peer_certificates(), &[ccert][..]);
+    }
+
+    #[test]
+    fn dtls13_ticket_from_a_listener_without_client_auth_does_not_resume_at_one_with_it() {
+        let (_, ccert) = client_identity();
+        let session = session13(&None, true);
+        let policy: Policy = Some((ccert.clone(), true));
+        let mut c = client13(true, Some(session));
+        let mut s = server13(&policy, b"mtls13-resume-s4");
+        pump13(&mut c, &mut s).unwrap();
+        assert!(s.is_handshake_complete());
+        assert!(!s.psk_used(), "the ticket must not open here");
+        // The full handshake authenticated the client itself.
+        assert_eq!(s.peer_certificates(), &[ccert][..]);
+    }
+
+    fn server12(policy: &Policy, seed: &[u8]) -> Server12 {
+        let (skey, scert) = server_identity();
+        let mut scfg = PcServerConfig12::with_ecdsa(alloc::vec![scert], skey)
+            .with_ticket_key(TICKET_KEY)
+            .require_cookie_exchange(false);
+        if let Some((anchor, required)) = policy {
+            scfg = scfg.with_client_auth(roots(anchor), *required);
+        }
+        scfg.verification_time = Some(now());
+        let srng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+        DtlsServerConnection12::new(Arc::new(scfg), b"peer".to_vec(), srng)
+    }
+
+    fn client12(with_identity: bool, session: Option<StoredSession12>) -> DtlsClientConnection12 {
+        let (_, scert) = server_identity();
+        let mut ccfg =
+            PcClientConfig12::new(roots(&scert), "dtls.example").with_verification_time(now());
+        if with_identity {
+            let (ckey, ccert) = client_identity();
+            ccfg = ccfg.with_client_cert(ClientCertConfig::with_ecdsa(alloc::vec![ccert], ckey));
+        }
+        ccfg.session = session;
+        let mut crng = HmacDrbg::<Sha256>::new(b"mtls12-resume-c", b"nonce", &[]);
+        DtlsClientConnection12::new(ccfg, b"peer".to_vec(), &mut crng)
+    }
+
+    fn session12(policy: &Policy, with_identity: bool) -> StoredSession12 {
+        let mut c = client12(with_identity, None);
+        let mut s = server12(policy, b"mtls12-resume-s1");
+        pump12(&mut c, &mut s).unwrap();
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        c.take_session().expect("a ticket")
+    }
+
+    #[test]
+    fn resumed_dtls12_connection_carries_the_client_identity() {
+        let (_, ccert) = client_identity();
+        let policy: Policy = Some((ccert.clone(), true));
+        let session = session12(&policy, true);
+        let mut c = client12(true, Some(session));
+        let mut s = server12(&policy, b"mtls12-resume-s2");
+        pump12(&mut c, &mut s).unwrap();
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        assert!(c.did_resume() && s.did_resume(), "abbreviated handshake");
+        assert_eq!(s.peer_certificates(), &[ccert][..]);
+    }
+
+    #[test]
+    fn dtls12_ticket_from_a_listener_without_client_auth_does_not_resume_at_one_with_it() {
+        let (_, ccert) = client_identity();
+        let session = session12(&None, true);
+        let policy: Policy = Some((ccert.clone(), true));
+        let mut c = client12(true, Some(session));
+        let mut s = server12(&policy, b"mtls12-resume-s3");
+        pump12(&mut c, &mut s).unwrap();
+        assert!(s.is_handshake_complete());
+        assert!(
+            !s.did_resume() && !c.did_resume(),
+            "the ticket must not open here"
+        );
+        assert_eq!(s.peer_certificates(), &[ccert][..]);
+    }
+
+    /// An anonymous client's session at an optional-auth listener resumes
+    /// as anonymous (no identity is invented), and never at a listener that
+    /// requires a certificate.
+    #[test]
+    fn anonymous_sessions_stay_anonymous() {
+        let (_, ccert) = client_identity();
+        let optional: Policy = Some((ccert.clone(), false));
+        let session = session12(&optional, false);
+        let mut c = client12(false, Some(session.clone()));
+        let mut s = server12(&optional, b"mtls12-resume-s4");
+        pump12(&mut c, &mut s).unwrap();
+        assert!(s.did_resume());
+        assert!(s.peer_certificates().is_empty());
+
+        let required: Policy = Some((ccert, true));
+        let mut c = client12(false, Some(session));
+        let mut s = server12(&required, b"mtls12-resume-s5");
+        let _ = pump12(&mut c, &mut s);
+        assert!(!s.did_resume());
+        assert!(!s.is_handshake_complete(), "an anonymous client is refused");
+
+        let session = session13(&optional, false);
+        let mut c = client13(false, Some(session));
+        let mut s = server13(&optional, b"mtls13-resume-s5");
+        pump13(&mut c, &mut s).unwrap();
+        assert!(s.psk_used());
+        assert!(s.peer_certificates().is_empty());
+    }
+}

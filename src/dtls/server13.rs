@@ -541,8 +541,7 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// The client identity a resumed ticket carried, with when it was
     /// verified (`TicketPlaintext::client_auth_secs`): re-embedded in the
     /// ticket this connection issues so a chain of resumptions keeps
-    /// expiring from the one real verification. (Populated by resumption
-    /// only until the DTLS servers verify client certificates.)
+    /// expiring from the one real verification.
     resumed_client_leaf: Option<Vec<u8>>,
     resumed_client_auth_secs: Option<u64>,
 }
@@ -680,14 +679,18 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     }
 
     /// The effective ticket-sealing key (see `ticket::seal_key`); `None`
-    /// without a ticket key. The DTLS servers verify no client
-    /// certificate yet, so the binding covers "no client auth".
+    /// without a ticket key. Bound to this listener's client-auth policy,
+    /// so a ticket from a listener trusting other client roots never
+    /// opens here.
     fn ticket_seal_key(&self) -> Option<crate::zeroize::Zeroizing<[u8; 32]>> {
         let key = self.config.ticket_key.as_ref()?;
         Some(seal_key(
             key,
             b"purecrypto dtls13 ticket client-auth binding v1",
-            None,
+            self.config
+                .client_auth
+                .as_ref()
+                .map(|p| (&p.roots, p.required)),
         ))
     }
 
@@ -716,8 +719,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             now,
             ticket_lifetime: self.config.ticket_lifetime,
             peer_addr: &self.peer_addr,
-            // The DTLS servers verify no client certificate yet.
-            client_auth_required: false,
+            // A listener that requires a client certificate resumes only
+            // a session whose issuing handshake authenticated one.
+            client_auth_required: self.config.client_auth.as_ref().is_some_and(|p| p.required),
             expected_client_raw_public_keys: &[],
         };
         try_accept_psk13(&ctx, ch, raw, transcript_prefix)
@@ -2285,12 +2289,16 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // transcript (TLS-shaped).
         self.transcript.update(&raw_ch);
 
-        // Carry the issuing handshake's client identity forward (for the
-        // ticket this connection may issue) — the DTLS servers do not yet
-        // authenticate clients, so this is only ever set by resumption.
+        // Resumption carries the issuing handshake's client identity
+        // forward (RFC 8446 §2.2: the resumed handshake authenticates no
+        // client of its own): restore the leaf so `peer_certificates()`
+        // reflects it, and keep it for the ticket this connection issues.
+        // `try_accept_psk13` has re-checked it (validity period now, and
+        // the listener's policy through the ticket's sealing key).
         if let Some(s) = psk_state.as_ref() {
             self.resumed_client_leaf = s.client_leaf.clone();
             self.resumed_client_auth_secs = Some(s.client_auth_secs);
+            self.client_cert_chain = s.client_leaf.iter().cloned().collect();
         }
 
         // Initialise the reassembler at msg_seq+1.
@@ -2512,8 +2520,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.server_app_secret = Some(sats);
 
         // With a CertificateRequest out, the client's flight opens with its
-        // Certificate (RFC 8446 §4.4.2); otherwise its Finished is next.
-        self.state = if self.config.client_auth.is_some() {
+        // Certificate (RFC 8446 §4.4.2); otherwise its Finished is next. A
+        // resumed handshake sends no request.
+        self.state = if self.config.client_auth.is_some() && !self.psk_used {
             State::WaitClientCertificate
         } else {
             State::WaitClientFinished
@@ -2746,9 +2755,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // is accepted. The state machine already guarantees it (an empty
         // Certificate is refused, a chain must be followed by a verified
         // CertificateVerify); re-check so no later change to it can let a
-        // required-certificate handshake reach `Connected` anonymously.
+        // required-certificate handshake reach `Connected` anonymously. A
+        // resumption stands in for the identity its ticket carried (the
+        // ticket was only accepted with one, `try_accept_psk13`).
+        let resumed_identity = self.psk_used && !self.client_cert_chain.is_empty();
         if self.config.client_auth.as_ref().is_some_and(|p| p.required)
             && self.client_leaf_key.is_none()
+            && !resumed_identity
         {
             return Err(Error::CertificateRequired);
         }
@@ -2844,14 +2857,24 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // A chain of resumptions keeps expiring `ticket_lifetime` after the
         // one real verification (the TLS 1.3 audit finding): carry the
         // recorded authentication time forward rather than re-stamping it.
-        let client_auth_secs = self.resumed_client_auth_secs.unwrap_or(creation);
+        // The client identity: the one a resumption carried, else the
+        // chain this handshake verified (RFC 8446 §4.4.2) — an anonymous
+        // client records none.
+        let (client_leaf, client_auth_secs) = if self.psk_used {
+            (
+                self.resumed_client_leaf.clone(),
+                self.resumed_client_auth_secs.unwrap_or(creation),
+            )
+        } else {
+            (self.client_cert_chain.first().cloned(), creation)
+        };
         let plain = TicketPlaintext {
             psk,
             alpn: self.alpn_negotiated.clone().unwrap_or_default(),
             creation_secs: creation,
             age_add: ticket_age_add,
             suite: Some(suite.suite),
-            client_leaf: self.resumed_client_leaf.clone(),
+            client_leaf,
             client_auth_secs,
             // RFC 9147 §5.1: bind the ticket to the address it was issued
             // to (empty means the server never learned it — no cookie skip).
