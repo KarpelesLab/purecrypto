@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6](https://github.com/KarpelesLab/purecrypto/compare/v0.9.5...v0.9.6) - 2026-09-29
+
+### Added
+
+- *(cli)* negotiated-parameter report, -key_update and close_notify for the DTLS s_client / s_server
+- *(dtls)* close_notify, KeyUpdate, group selection and negotiated-parameter accessors through Connection
+- *(tls)* honour cipher_suites on the TLS 1.3 server
+- *(cli)* pkcs12 subcommand to build and unpack PKCS#12 archives
+- *(cli)* interop knobs and a negotiated-parameter report for s_client / s_server
+- *(tls)* key-exchange group restriction and negotiated-parameter accessors
+- *(cli)* drive the QUIC echo protocol end to end from q_client / q_server
+- *(quic)* expose negotiation state, connection-ID switching and router events
+- *(ct)* 32-bit client requests, portable-dispatch switch, protocol hooks and declassification points
+- *(cli)* Encrypted Client Hello options and `generate-ech`
+- *(tls)* ConfigBuilder::key_shares to pick the groups the client pre-shares
+- *(ech)* load external key material and report ECH acceptance
+
+### Fixed
+
+- *(cli)* drive a DTLS connection until the handshake is over on both sides
+- *(dtls)* say when the peer may still be in its handshake, and close accordingly
+- *(tls)* verify (D)TLS 1.2 ECDSA signatures as hash/signature pairs, not curve-pinned schemes
+- *(dtls)* put the cookie extension first in the second ClientHello
+- *(dtls)* keep the DTLS 1.2 HelloVerifyRequest cookie within 32 bytes
+- *(dtls)* derive DTLS 1.3 secrets under the "dtls13" HKDF label prefix
+- *(cli)* s_client -reconnect takes tickets that arrive with the server's goodbye
+- *(tls)* advertise psk_key_exchange_modes on every ClientHello
+- *(quic)* send lost flow-control and stream control frames again
+- *(dtls)* reassemble a fragmented ClientHello on the DTLS 1.2 cookie path
+- *(quic)* reissue a connection ID when the peer retires one
+- *(quic)* send a PING when a key update is initiated on an idle connection
+- *(quic)* hold a server key update until HANDSHAKE_DONE is acknowledged
+- *(quic)* answer a PATH_CHALLENGE on the path it arrived from
+- *(tls)* honour TLS_EMPTY_RENEGOTIATION_INFO_SCSV in the TLS 1.2 server
+- *(dtls)* hash the DTLS 1.2 handshake transcript over the DTLS headers
+- *(tls)* derive the TLS 1.2 ChaCha20-Poly1305 nonce per RFC 7905
+- *(dtls)* strip DTLS 1.3 record padding in constant time
+- *(ech)* skip unusable ECHConfigs instead of rejecting the whole list
+- *(ech)* enforce the RFC 9849 §7 checks on the inner and second hellos
+- *(ech)* seal the ClientHello structure, not the handshake message
+
+### Other
+
+- *(interop)* lose the last flight of a DTLS handshake on purpose
+- *(validation)* when the Apple peer's negotiated parameters are read
+- *(interop)* read Apple's TLS metadata when the exchange is over
+- *(interop)* follow the DTLS server's handshake line in the OpenSSL 1.2 matrix
+- *(validation)* wolfSSL interop table — TLS 1.3, DTLS 1.2 and DTLS 1.3
+- wolfSSL 5.9.4 in the interop matrix (TLS 1.3, DTLS 1.2, DTLS 1.3)
+- *(interop)* wolfSSL adapter — TLS 1.3, DTLS 1.2 and DTLS 1.3, both roles
+- *(interop)* DTLS 1.2 / 1.3 cases for peers that list them in `protos`
+- GnuTLS interop jobs — apt 3.8.3 and 3.8.13 built with leancrypto
+- *(interop)* keep the run going when a failure dump exceeds 200 lines
+- *(interop)* GnuTLS adapter for the TLS 1.3 matrix, both roles
+- *(validation)* LibreSSL 4.3 / 3.3 interop table
+- LibreSSL interop jobs (4.3.2 from source, and the macOS system 3.3.6)
+- *(interop)* LibreSSL adapter for the TLS 1.3 matrix
+- TLS 1.3 interop matrix against Apple's Network.framework on macos-latest
+- *(interop)* apple adapter — Network.framework client and server on macOS
+- *(interop)* runner pins the server's suite too; adapters are files
+- TLS 1.3 interop matrix against Windows SChannel
+- *(interop)* Windows SChannel adapter via .NET SslStream
+- *(interop)* let run.sh work under Git Bash on Windows
+- TLS 1.3 interop job against Mbed TLS 4.2.0
+- *(interop)* Mbed TLS adapter for the TLS 1.3 matrix
+- TLS 1.3 interop matrix against OpenSSL 3.0, OpenSSL 3.6 and BoringSSL
+- *(interop)* TLS 1.3 matrix framework with OpenSSL and BoringSSL adapters
+- *(quic-interop)* generous deadlines for the loss cases, wall time per case
+- *(cli)* remove the stderr/shutdown race in the s_server round-trip tests
+- *(dtls)* exercise the fragmented ClientHello path against OpenSSL
+- QUIC interop matrix against quic-go and OpenSSL
+- *(interop)* QUIC v1 matrix against quic-go and OpenSSL in both roles
+- TLS 1.2 / DTLS 1.2 cipher-suite interop matrix against OpenSSL
+- *(ct)* cover the protocol record layers, the remaining schemes and the code-generation variants under Valgrind
+- run the ECH interop matrix against BoringSSL
+- *(ech)* interop matrix against BoringSSL's bssl tool
+
 ## [0.9.5](https://github.com/KarpelesLab/purecrypto/compare/v0.9.4...v0.9.5) - 2026-09-27
 
 ### Added
