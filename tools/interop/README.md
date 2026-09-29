@@ -96,7 +96,8 @@ and `secp256r1mlkem768` are left out, and the DTLS 1.2 suite is the
 | `mtu` | the same chain with the purecrypto side at `-mtu 512` |
 | `loss` | a handshake through `lossy-udp.py`, a relay dropping 20% of the datagrams each way (seeded, so it reproduces): ACK-driven retransmission (RFC 9147 §7) on DTLS 1.3 with the large chain, whole-flight retransmission (RFC 6347 §4.2.4) on DTLS 1.2 with a plain one; only the handshake and its parameters are checked, since the datagram carrying the data or the close_notify may be the dropped one (the purecrypto client asks again, `-resend 3`, as the peers' tools do; a peer client's exit status is not demanded). `LOSSY_SEED=N` picks another pattern than the default, `LOSSY_PERCENT` another rate; `LOSSY_TRACE=1` logs every datagram with the headers of its records to `relay.err`, `LOSSY_DROP` drops named datagrams (see `lossy-udp.py`) |
 | `loss-final` | the same relay dropping named datagrams only: the **last flight** of the handshake — the DTLS 1.3 client's Finished, the DTLS 1.3 server's ACK for it, the DTLS 1.2 final flights — lost when the other side's retransmission backoff has grown to several seconds (`final_flight_drops` in `run.sh` has the pattern per version and role). The side that finished first must keep retransmitting / answering retransmissions until the other has finished too (RFC 9147 §5.8.1, RFC 6347 §4.2.4) and must not say goodbye before; data and close_notify are checked as in any other case |
-| `resume`, `0rtt`, `mtls`, `cid` | *SKIP: purecrypto's DTLS engines have no resumption, 0-RTT, client certificates or RFC 9146 connection IDs* |
+| `cid` | RFC 9146 connection IDs (RFC 9147 §9 on DTLS 1.3): each side receives under the CID it named — purecrypto under `PC_CID`, the peer under `PEER_CID` (both exported by the runner, hex; the adapter configures its tool with the latter and checks its summary for the former) — and the purecrypto side's `connection id: rx=… tx=…` line is checked (`none` in every other DTLS case) |
+| `resume`, `0rtt`, `mtls` | *SKIP: purecrypto's DTLS engines have no resumption, 0-RTT or client certificates* |
 
 Adapters without `protos` are TLS-only and see no DTLS case. The peer
 server for a DTLS case is found by `lib.sh`'s `listening` on a bound UDP
@@ -120,6 +121,7 @@ in the runner needs to change.
 | `PKI` | certificates: `ca.crt`, `<cert>.crt` / `<cert>.key` / `<cert>.pub` (SPKI PEM) for `rsa2048 p256 p384 ed25519 mldsa65`, `large.crt` (leaf + intermediate) / `large-leaf.crt` / `large-int.crt` / `large.key`, `early.txt` (the 0-RTT payload) |
 | `OCSP` | the DER OCSP response for `p256.crt`, or empty |
 | `PORT` | (`client` only) the purecrypto server's port |
+| `PC_CID`, `PEER_CID` | (DTLS `cid` cases) the connection IDs, hex: the one the purecrypto side receives under, and the one the peer's tool must be told to receive under |
 | `PURECRYPTO`, `TO` (the `timeout` binary), `STEP_TIMEOUT`, `SERVER_TIMEOUT` | tooling |
 | `$WORK/client.in` | what the client of the case sends (whoever it is) |
 | `$WORK/server.in` | a payload for a peer server to send back, if its tool forwards stdin |
@@ -152,7 +154,7 @@ use) on Apple's Network.framework — the shape to copy for a platform stack
 that has no command-line client or server of its own; its README lists
 what is public API, what is SPI, and what the stack was observed to do.
 `peers/wolfssl.sh` (wolfSSL's example `client` / `server` from
-`WOLFSSL_HOME`) is the one that speaks DTLS.
+`WOLFSSL_HOME`) speaks DTLS 1.2 and 1.3; `peers/mbedtls.sh` DTLS 1.2.
 
 Skip rather than weaken: when a peer's tool cannot express a case, `supports`
 says so with the reason, and the reason lands in the run output and in

@@ -73,7 +73,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
 | `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8, Apple's Network.framework and wolfSSL 5.9, both roles** (CI: certs × groups × suites, resumption (incl. PSK-only), external PSK, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
-| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, fragmentation at two MTUs, a lossy path) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
+| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3), RFC 9146 (connection IDs) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, fragmentation at two MTUs, a lossy path, connection IDs); **DTLS 1.2 vs Mbed TLS 4.2, both roles** (CI: certs × groups × suites, ALPN, a lossy path, connection IDs) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
 | `signature_registry` | — (X.509/TLS dispatch) | via primitives | via X.509/TLS | — | delegates |
@@ -285,6 +285,26 @@ update with the commands in `tools/wycheproof/README.md`.
   | Chain > 16 KiB (Certificate spans records) | ⏭ a handshake message must fit Mbed TLS's fixed 16 KiB I/O buffer (`MBEDTLS_SSL_{IN,OUT}_CONTENT_LEN` cannot be larger): its server cannot write the Certificate, its client cannot reassemble it |
   | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ |
   | `close_notify` from the peer | ✅ / ✅ |
+
+  Mbed TLS also speaks DTLS 1.2 (no DTLS 1.3), and the adapter lists it
+  (`protos`), so the DTLS 1.2 matrix runs against it too — the second
+  external peer for purecrypto's DTLS 1.2 after OpenSSL and wolfSSL, and
+  the second for RFC 9146 connection IDs (`dtls=1 force_version=dtls12`,
+  `cid=1 cid_val=HEX` on both programs; the summary's `Peer CID (length N
+  Bytes): …` is the purecrypto side's CID). 44 of the 152 DTLS 1.2 cases
+  run:
+
+  | Case | Mbed TLS 4.2.0, DTLS 1.2 (C / S) |
+  |---|---|
+  | Plain: `{P-256, P-384}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ |
+  | Plain, RSA-2048 certificate | ✅ / ⏭ the Mbed TLS (D)TLS 1.2 server signs ServerKeyExchange with PKCS#1 v1.5 only, and purecrypto's 1.2 client offers RSA-PSS only ("got ciphersuites in common, but none of them usable"); the Mbed TLS client verifies the purecrypto server's `rsa_pss_rsae_sha256` signature |
+  | Plain, Ed25519 / ML-DSA-65 certificate; `X25519MLKEM768` | ⏭ purecrypto's 1.2 engines |
+  | ALPN | ✅ / ✅ |
+  | Handshake over a path dropping 20 % of datagrams; the last flight lost (`loss-final`) | ✅ / ✅ |
+  | RFC 9146 connection IDs | ✅ / ✅ |
+  | Chain > 16 KiB, at the default and at a 512-byte MTU | ⏭ the 16 KiB I/O buffer |
+  | HelloRetryRequest, KeyUpdate | — (none in DTLS 1.2) |
+  | Resumption, 0-RTT, mTLS | ⏭ purecrypto's DTLS engines |
 
   No purecrypto defect surfaced against Mbed TLS. One tool behaviour is
   worked around on the peer side: `ssl_server2` answers one request per
@@ -559,7 +579,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | Chain > 16 KiB at a 512-byte MTU | — | ✅ / ✅ | ✅ / ✅ |
   | Handshake over a path dropping 20 % of datagrams | — | ✅ / ✅ (large chain) | ✅ / ✅ |
   | The last flight of the handshake lost (`loss-final`) | — | ✅ / ✅ (large chain) | ✅ / ✅ |
-  | RFC 9146 connection IDs | — | ⏭ purecrypto does not implement them | ⏭ |
+  | RFC 9146 connection IDs (`--cid` on the example tools; each side receives under its own CID, both report the other's) | — | ✅ / ✅ (RFC 9147 §9 unified-header C bit) | ✅ / ✅ (`tls12_cid` records, the §5.3 additional data) |
   | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ | — | — |
   | `close_notify` from the peer | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 
@@ -834,8 +854,13 @@ Every entry runs the positive control, then the full case list.
   bad), record protection for all three suites (seal, open, open of a
   padded record, forged record), `KeyUpdate` derivation; **TLS 1.2** PRF
   (master secret, extended master secret, key block), Finished verify and
-  AEAD records; **DTLS 1.2** records; **DTLS 1.3** records with
-  sequence-number encryption (all three suites, forged record); **QUIC**
+  AEAD records; **DTLS 1.2** records, and records carrying a connection ID
+  (RFC 9146 §5.3 additional data, `DTLSInnerPlaintext` type and padding
+  stripped by the constant-time scan; all three suites, forged record,
+  wrong CID); **DTLS 1.3** records with sequence-number encryption (all
+  three suites, forged record), and with a connection ID in the unified
+  header (parsed with the receiver's CID length; the C bit refused when
+  none is negotiated); **QUIC**
   1-RTT packet protection with header protection (all three suites, forged
   packet) and the key-update derivation; X25519, X448, Ed25519, Ed448,
   P-256 ECDSA sign / ECDH / keygen, P-384, P-521 and brainpoolP256r1 ECDSA
@@ -1014,9 +1039,11 @@ code site:
 - **Stateful keys**: LMS and XMSS advance a one-time-key index on every
   signature; **reuse is catastrophic** and the caller must persist state after
   every `sign`.
-- **Phased interop**: TLS 1.2 and DTLS 1.2 are validated against OpenSSL
-  and wolfSSL in both roles, DTLS 1.3 against wolfSSL in both roles (one
-  peer so far — OpenSSL exposes no `-dtls1_3` client), QUIC v1 against
+- **Phased interop**: TLS 1.2 and DTLS 1.2 are validated against OpenSSL,
+  wolfSSL and Mbed TLS in both roles, DTLS 1.3 against wolfSSL in both
+  roles (one peer so far — OpenSSL exposes no `-dtls1_3` client), RFC 9146
+  connection IDs against wolfSSL (DTLS 1.2 and 1.3) and Mbed TLS (DTLS
+  1.2), QUIC v1 against
   quic-go in both roles and against OpenSSL's QUIC client. QUIC v1 ships
   without QUIC v2 (RFC 9369) and without HTTP/3.
 - **Hazmat**: the `hazmat-*` features expose low-level arithmetic with **no
@@ -1025,8 +1052,13 @@ code site:
   / multi-party / message-envelope layers are out of scope.
 - **Coverage gaps**: ML-KEM ACVP is a trimmed slice (not the full corpus);
   DTLS 1.3 has a single external peer (wolfSSL), and its resumption,
-  0-RTT, client authentication and connection IDs are not implemented at
-  all; the QUIC client cannot offer a
+  0-RTT and client authentication are not implemented at all; the
+  RFC 9146 §6 peer-address update is exercised end to end by the CLI's own
+  client and server only (no peer tool moves its socket mid-connection),
+  and the return-routability check of draft-ietf-tls-dtls-rrc is not
+  implemented (no peer in the matrix speaks it; the application's
+  obligation is documented on `Connection::datagram_allows_peer_address_update`);
+  the QUIC client cannot offer a
   non-v1 version, so its Version Negotiation handling is unit-tested only;
   no NIST FIPS validation (CMVP) and no third-party audit.
 

@@ -20,6 +20,14 @@
 # compression, no `status_request` (OCSP stapling), and no handshake message
 # over its fixed 16 KiB I/O buffer.
 #
+# Beyond TLS this peer speaks DTLS 1.2 (`protos`; Mbed TLS has no DTLS
+# 1.3), which makes it the second implementation purecrypto's RFC 9146
+# connection IDs are checked against (`cid=1 cid_val=HEX` on both
+# programs; the peer's CID is PEER_CID, and `Peer CID (length N Bytes): …`
+# in its summary is the purecrypto side's). Over DTLS the programs are
+# driven with `dtls=1 force_version=dtls12`; the server does its
+# HelloVerifyRequest cookie exchange by default.
+#
 # Subcommands and environment: see ../README.md.
 
 set -euo pipefail
@@ -46,6 +54,26 @@ mbed_suite() {
         chacha20) echo TLS1-3-CHACHA20-POLY1305-SHA256 ;;
     esac
 }
+# The (D)TLS 1.2 suite for the case's certificate kind and AEAD, as
+# `force_ciphersuite` takes it and the summary prints it (purecrypto's 1.2
+# engines cannot pin a suite from the command line, so this side does).
+mbed_suite12() {
+    local kx
+    case $1 in rsa2048) kx=RSA ;; *) kx=ECDSA ;; esac
+    case $2 in
+        aes128gcm) echo "TLS-ECDHE-${kx}-WITH-AES-128-GCM-SHA256" ;;
+        aes256gcm) echo "TLS-ECDHE-${kx}-WITH-AES-256-GCM-SHA384" ;;
+        chacha20) echo "TLS-ECDHE-${kx}-WITH-CHACHA20-POLY1305-SHA256" ;;
+    esac
+}
+is_dtls() { case $CASE_PROTO in dtls*) return 0 ;; esac; return 1; }
+# The CID options of both programs for a `cid` case (RFC 9146): the CID
+# this side receives under is PEER_CID.
+mbed_cid_args() {
+    case $CASE_FEAT in
+        cid) echo "cid=1 cid_val=$PEER_CID" ;;
+    esac
+}
 other_group() {
     case $1 in
         x25519) echo secp256r1 ;;
@@ -69,7 +97,7 @@ cmd_supports() {
         # A handshake message must fit the fixed 16 KiB I/O buffer
         # (MBEDTLS_SSL_{IN,OUT}_CONTENT_LEN cannot be set any larger): the
         # server cannot write the Certificate, the client cannot reassemble it.
-        large-chain) skip "Mbed TLS handles no handshake message over its 16 KiB I/O buffer" ;;
+        large-chain|mtu) skip "Mbed TLS handles no handshake message over its 16 KiB I/O buffer" ;;
         # RFC 8446 §4.2.9: the Mbed TLS server's built-in order prefers
         # psk_ephemeral, then ephemeral, and picks plain psk (psk_ke) only
         # when no (EC)DHE is available — but the purecrypto client still
@@ -79,6 +107,14 @@ cmd_supports() {
         resume-psk) [ "$CASE_ROLE" = peer-client ] ||
             skip "the Mbed TLS server prefers (psk_)ephemeral and never selects psk_ke while a key_share is offered" ;;
     esac
+    if is_dtls && [ "$CASE_ROLE" = peer-server ] && [ "$CASE_CERT" = rsa2048 ]; then
+        # The (D)TLS 1.2 server signs ServerKeyExchange with PKCS#1 v1.5
+        # only, and purecrypto's 1.2 client offers RSA-PSS only (RFC 8446
+        # §4.2.3 schemes, its modern policy): "got ciphersuites in common,
+        # but none of them usable". The other role works — the Mbed TLS
+        # client verifies the purecrypto server's rsa_pss_rsae signature.
+        skip "the Mbed TLS (D)TLS 1.2 server signs with PKCS#1 v1.5 only; purecrypto's client offers RSA-PSS only"
+    fi
     return 0
 }
 
@@ -90,7 +126,11 @@ ARGS=()
 server_args() {
     ARGS=(server_addr=127.0.0.1 server_port=@PORT@ debug_level=2 "ca_file=$PKI/ca.crt" buffer_size=8192
         "crt_file=$PKI/$CASE_CERT.crt" "key_file=$PKI/$CASE_CERT.key")
-    if [ "$CASE_PROTO" = tls12 ]; then
+    if is_dtls; then
+        # shellcheck disable=SC2046
+        ARGS+=(dtls=1 force_version=dtls12 "groups=$(mbed_group "$CASE_GROUP")"
+            "force_ciphersuite=$(mbed_suite12 "$CASE_CERT" "$CASE_SUITE")" $(mbed_cid_args))
+    elif [ "$CASE_PROTO" = tls12 ]; then
         ARGS+=(force_version=tls12)
     else
         ARGS+=(force_version=tls13 "groups=$(mbed_group "$CASE_GROUP")" "force_ciphersuite=$(mbed_suite "$CASE_SUITE")")
@@ -123,7 +163,11 @@ client_args() {
         0rtt-hrr) groups=secp256r1,x25519 ;;
         *) groups=$(mbed_group "$CASE_GROUP") ;;
     esac
-    if [ "$CASE_PROTO" = tls12 ]; then
+    if is_dtls; then
+        # shellcheck disable=SC2046
+        ARGS+=(dtls=1 force_version=dtls12 "groups=$groups"
+            "force_ciphersuite=$(mbed_suite12 "$CASE_CERT" "$CASE_SUITE")" $(mbed_cid_args))
+    elif [ "$CASE_PROTO" = tls12 ]; then
         ARGS+=(force_version=tls12)
     else
         ARGS+=(force_version=tls13 "groups=$groups" "force_ciphersuite=$(mbed_suite "$CASE_SUITE")")
@@ -152,10 +196,23 @@ cmd_client() {
     return $rc
 }
 
+# The CID summary of a `cid` case (RFC 9146): negotiated, and the CID this
+# program sends with is the purecrypto side's (PC_CID as spaced hex).
+verify_cid() {
+    local f=$1 ok=0
+    expect "$f" "(initial handshake) Use of Connection ID has been negotiated." || ok=1
+    expect "$f" "(initial handshake) Peer CID (length 4 Bytes): $(echo "$PC_CID" | sed 's/\(..\)/\1 /g')" || ok=1
+    return $ok
+}
+
 cmd_verify() {
     local ok=0 suite group
     suite=$(mbed_suite "$CASE_SUITE")
     group=$(mbed_group "$CASE_GROUP")
+    if is_dtls; then
+        verify_dtls
+        return $?
+    fi
     if [ "$CASE_ROLE" = peer-server ]; then
         local f=$WORK/server.out
         if [ "$CASE_PROTO" = tls12 ]; then
@@ -242,11 +299,37 @@ cmd_verify() {
     return $ok
 }
 
+# The DTLS 1.2 view: version and suite from the summary, the group from
+# the server's debug log (`ECDHE curve: x25519`; the client's log does not
+# name it — the purecrypto server pins it and reports it), the payload
+# both ways, and the CIDs.
+verify_dtls() {
+    local ok=0 f
+    if [ "$CASE_ROLE" = peer-server ]; then
+        f=$WORK/server.out
+        expect "$f" "ECDHE curve: $(mbed_group "$CASE_GROUP")" || ok=1
+        expect "$f" "ping from client" || ok=1
+    else
+        f=$WORK/client.out
+        expect "$f" "Verifying peer X.509 certificate... ok" || ok=1
+        expect "$f" "ping from client" || ok=1
+    fi
+    expect "$f" "[ Protocol is DTLSv1.2 ]" || ok=1
+    expect "$f" "[ Ciphersuite is $(mbed_suite12 "$CASE_CERT" "$CASE_SUITE") ]" || ok=1
+    case $CASE_FEAT in
+        alpn) expect "$f" "[ Application Layer Protocol is h2 ]" || ok=1 ;;
+        cid) verify_cid "$f" || ok=1 ;;
+        *) refute "$f" "Use of Connection ID has been negotiated" || ok=1 ;;
+    esac
+    return $ok
+}
+
 case ${1:-} in
     info) "$CLIENT" build_version=1 2>/dev/null | sed -n 's/^build version: //p' ;;
+    protos) echo "tls13 tls12 dtls12" ;;
     supports) cmd_supports ;;
     server) server_args; start_bg_server idle "$SERVER" "${ARGS[@]}" ;;
     client) cmd_client ;;
     verify) cmd_verify ;;
-    *) echo "usage: $0 info|supports|server|client|verify" >&2; exit 2 ;;
+    *) echo "usage: $0 info|protos|supports|server|client|verify" >&2; exit 2 ;;
 esac

@@ -223,8 +223,14 @@ server_args() {
         keyupdate-peer) a="$a -U" ;;
         rpk) a="$a --rpk" ;;
         alpn) a="$a -L C:h2,http/1.1" ;;
+        cid) a="$a --cid $(wolf_cid)" ;;
     esac
     echo "$a"
+}
+
+# `--cid STRING` takes the CID as the string's bytes: PEER_CID as ASCII.
+wolf_cid() {
+    printf '%b' "$(echo "$PEER_CID" | sed 's/\(..\)/\\x\1/g')"
 }
 
 # `-w` waits for the purecrypto server's close_notify — except over DTLS
@@ -291,6 +297,7 @@ client_args() {
         rpk) a="$a --rpk" ;;
         ocsp) a="$a -W 1" ;;
         alpn) a="$a -L C:h2,http/1.1" ;;
+        cid) a="$a --cid $(wolf_cid)" ;;
     esac
     echo "$a"
 }
@@ -302,6 +309,16 @@ cmd_client() {
     "$TO" "$STEP_TIMEOUT" "$CLIENT" $(client_args) \
         >"$WORK/client.out" 2>"$WORK/client.err" </dev/null || rc=$?
     return $rc
+}
+
+# The CID summary (`CID extension was negotiated`, then `Sending CID is
+# HEX` — the purecrypto side's CID, printed without zero padding, which
+# PC_CID's bytes do not need).
+verify_cid() {
+    local f=$1 ok=0
+    expect "$f" "CID extension was negotiated" || ok=1
+    expect "$f" "Sending CID is $PC_CID" || ok=1
+    return $ok
 }
 
 # The connection summary the examples print after each handshake (on
@@ -356,6 +373,7 @@ cmd_verify() {
             # The server logs that the peer sent no certificate (a PSK
             # handshake); the message wolfSSL prints to stderr.
             extpsk) expect "$WORK/server.err" "peer has no cert!" || ok=1 ;;
+            cid) verify_cid "$WORK/server.out" || ok=1 ;;
         esac
     else
         local f=$WORK/client.out
@@ -369,6 +387,7 @@ cmd_verify() {
         case $CASE_FEAT in
             alpn) expect "$f" "Received ALPN protocol : h2" || ok=1 ;;
             ocsp) refute "$WORK/client.err" "OCSP" || ok=1 ;;
+            cid) verify_cid "$f" || ok=1 ;;
         esac
         if [ -n "$(client_shutdown_opt)" ]; then
             expect "$f" "Bidirectional shutdown complete" || ok=1

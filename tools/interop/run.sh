@@ -117,8 +117,15 @@ FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp rpk
 # dropped), `loss-final` (the same relay dropping named datagrams instead
 # of random ones: the LAST flight of the handshake — see `final_flight_drops`
 # — which leaves one side finished and the other still in its handshake;
-# the whole exchange is checked), `cid` (RFC 9146 connection IDs).
+# the whole exchange is checked), `cid` (RFC 9146 connection IDs: each
+# side receives under the CID it named — purecrypto under PC_CID, the peer
+# under PEER_CID, which the adapter configures its tool with — and both
+# report the pair).
 DTLS_GROUPS="x25519 p256 p384 x25519mlkem768"
+# The connection IDs of the `cid` cases (hex; every byte >= 0x10 so a tool
+# that prints them without zero padding still prints these digits).
+export PC_CID=a1b2c3d4
+export PEER_CID=776f6c66
 DTLS_FEATS="resume 0rtt hrr keyupdate keyupdate-peer alpn large-chain mtu loss loss-final mtls cid"
 
 # The protocols the adapter speaks (`protos`, optional): TLS only unless it
@@ -398,7 +405,6 @@ pc_supports() {
         case $CASE_FEAT in
             resume|0rtt) skip "purecrypto's DTLS engines have no session resumption (nor 0-RTT)" ;;
             mtls) skip "purecrypto's DTLS servers do not support client certificates" ;;
-            cid) skip "purecrypto does not implement RFC 9146 connection IDs" ;;
             loss|loss-final) command -v python3 >/dev/null 2>&1 || skip "no python3 for the lossy relay" ;;
         esac
         if [ "$CASE_PROTO" = dtls12 ]; then
@@ -439,6 +445,7 @@ pc_client_args() {
             # Application data is not retransmitted by DTLS: the client
             # asks again when no answer comes, as the peers' tools do.
             loss) a="$a -resend 3" ;;
+            cid) a="$a -cid $PC_CID" ;;
         esac
         echo "$a"
         return
@@ -485,6 +492,7 @@ pc_server_args() {
             keyupdate) a="$a -key_update" ;;
             alpn) a="$a -alpn h2,http/1.1" ;;
             mtu) a="$a -mtu 512" ;;
+            cid) a="$a -cid $PC_CID" ;;
         esac
         echo "$a"
         return
@@ -661,6 +669,11 @@ pc_verify_dtls() {
         keyupdate|keyupdate-peer)
             expect_re "$f" "^KeyUpdate: sent [1-9][0-9]*, received [1-9][0-9]*" || ok=1 ;;
         alpn) expect "$f" "ALPN: h2" || ok=1 ;;
+    esac
+    # RFC 9146: the CID each side receives under is the other's `tx`.
+    case $CASE_FEAT in
+        cid) expect "$f" "connection id: rx=$PC_CID tx=$PEER_CID" || ok=1 ;;
+        *) expect "$f" "connection id: none" || ok=1 ;;
     esac
     # (Under `loss` the close_notify may be the datagram that was dropped:
     # alerts are not retransmitted.)

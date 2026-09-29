@@ -90,8 +90,15 @@ secret-handling paths is machine-checked (Valgrind taint tracking on two
 architectures) but not measured on hardware. TLS 1.2 and DTLS
 1.2 interop with OpenSSL in both roles, and QUIC v1 with quic-go in both roles
 (streams, Retry, resumption, 0-RTT, key update, migration, stateless reset,
-DATAGRAM, ECN) and with OpenSSL's QUIC client; DTLS 1.3 is loopback-validated
-only. TLS 1.3 Encrypted Client Hello
+DATAGRAM, ECN) and with OpenSSL's QUIC client; DTLS 1.3 with wolfSSL in both
+roles, and RFC 9146 connection IDs with wolfSSL (DTLS 1.2 and 1.3) and Mbed
+TLS (DTLS 1.2). A connection ID lets a peer be followed to a new address; the
+engines apply the RFC 9146 §6 record-layer conditions and leave the
+reachability test of the new address — without which a spoofed source turns
+an endpoint into a reflector — to the application (RFC 9147 §9), as the
+`Connection::datagram_allows_peer_address_update` docs spell out; the
+return-routability check of draft-ietf-tls-dtls-rrc is not implemented.
+TLS 1.3 Encrypted Client Hello
 (RFC 9849) interops with BoringSSL in both roles, including HelloRetryRequest,
 rejection with `retry_configs`, and GREASE (CI); ECH over QUIC has no external
 peer yet. See [`validation.md`](validation.md)
