@@ -6099,7 +6099,12 @@ mod tls12_loopback_tests {
         let tls13 = ext::parse_signature_algorithms(&ext::signature_algorithms().1).unwrap();
         assert!(!tls12.iter().any(|s| s.is_brainpool_tls13()));
         assert!(tls13.iter().any(|s| s.is_brainpool_tls13()));
-        assert!(tls12.iter().all(|s| tls13.contains(s)));
+        // The 1.2 list is the 1.3 one's 1.2-defined subset, plus the RFC
+        // 5246 PKCS#1 v1.5 pairs a 1.2 server may sign with (and which the
+        // 1.3 list must not carry: RFC 8446 §4.4.3).
+        assert!(tls12.iter().all(|s| tls13.contains(s) != s.is_rsa_pkcs1()));
+        assert!(tls12.contains(&SignatureScheme::RSA_PKCS1_SHA256));
+        assert!(!tls13.iter().any(|s| s.is_rsa_pkcs1()));
         // Both RSA-PSS families are offered with all three digests, on both
         // versions (RFC 8446 §4.2.3 defines them for TLS 1.2 as well), and
         // every offered scheme is one the registry can verify under the
@@ -7774,20 +7779,22 @@ mod tls12_loopback_tests {
 
     /// The client holds the server to RFC 5246 §7.4.3 and RFC 8422 §5.9:
     /// a `ServerKeyExchange` signed under a scheme the ClientHello did not
-    /// offer (`rsa_pkcs1_sha256`), one TLS 1.2 does not define (ML-DSA-65,
-    /// the RFC 8734 Brainpool code points), or one that does not fit the
-    /// key (an ECDSA pair over an Ed25519 key; `ed25519` over a P-256 key)
-    /// is refused with `illegal_parameter`, and a signature that does not
-    /// verify with `decrypt_error` — before any key exchange is done.
+    /// offer (`rsa_pkcs1_sha512`; ML-DSA-65 and the RFC 8734 Brainpool code
+    /// points, which the 1.2 list leaves out as TLS 1.2 does not define
+    /// them) or one that does not fit the key (an ECDSA pair over an
+    /// Ed25519 key; `ed25519` over a P-256 key) is refused with
+    /// `illegal_parameter`, and a signature that does not verify with
+    /// `decrypt_error` — before any key exchange is done.
     #[test]
     fn tls12_client_polices_the_server_key_exchange_scheme() {
         use crate::tls::Error;
 
         let cases: [(bool, u16, bool, Error); 7] = [
             // (server is Ed25519, scheme, tamper signature, expected)
-            (true, 0x0401, false, Error::IllegalParameter),
-            (true, 0x0905, false, Error::PeerMisbehaved),
-            (true, 0x081a, false, Error::PeerMisbehaved),
+            // rsa_pkcs1_sha512: a TLS 1.2 pair, but not one we offer.
+            (true, 0x0601, false, Error::IllegalParameter),
+            (true, 0x0905, false, Error::IllegalParameter),
+            (true, 0x081a, false, Error::IllegalParameter),
             (true, 0x0403, false, Error::PeerMisbehaved),
             (false, 0x0807, false, Error::PeerMisbehaved),
             (true, 0x0807, true, Error::DecryptError),
@@ -7994,6 +8001,106 @@ mod tls12_loopback_tests {
             let r = pump12_with(&mut client, &mut server, |_, _| {});
             assert!(matches!(r, Err((true, Error::UnsupportedKeyType))), "{r:?}");
         }
+    }
+
+    /// A TLS 1.2 client that offers no RSA-PSS scheme — Mbed TLS's lists
+    /// only ECDSA and `rsa_pkcs1_*` for 1.2 — is served by an RSA identity
+    /// under `rsa_pkcs1_sha256` (RFC 5246 §7.4.1.4.1; RFC 8446 forbids
+    /// PKCS#1 v1.5 only in TLS 1.3 handshake signatures), where the server
+    /// used to sign RSA-PSS regardless; one offering both gets RSA-PSS; one
+    /// offering no RSA scheme at all is refused with `handshake_failure`.
+    #[test]
+    fn tls12_rsa_server_falls_back_to_pkcs1() {
+        use crate::tls::Error;
+        use crate::tls::codec::SignatureScheme;
+        let cases: [(&[u16], Option<u16>); 3] = [
+            (&[0x0403, 0x0401, 0x0501], Some(0x0401)),
+            (&[0x0401, 0x0804], Some(0x0804)),
+            (&[0x0403, 0x0807], None),
+        ];
+        for (offer, expected) in cases {
+            let (server_config, server_cert_der) = rsa_server12();
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert_der).unwrap();
+            let mut client_cfg = client_config12(roots);
+            client_cfg.test_signature_algorithms =
+                Some(offer.iter().map(|&c| SignatureScheme(c)).collect());
+            let mut crng = HmacDrbg::<Sha256>::new(b"pkcs1-fallback-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"pkcs1-fallback-s", b"nonce", &[]);
+            let mut client =
+                ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection12::new(server_config, srng);
+            let r = pump12_with(&mut client, &mut server, |_, _| {});
+            match expected {
+                Some(scheme) => {
+                    r.unwrap();
+                    assert!(!client.is_handshaking() && !server.is_handshaking());
+                    assert_eq!(client.peer_signature_scheme(), Some(scheme));
+                    client.send_application_data(b"pkcs1-ping").unwrap();
+                    let c = client.write_tls();
+                    server.read_tls(&c);
+                    server.process_new_packets().unwrap();
+                    assert_eq!(server.take_received_plaintext(), b"pkcs1-ping");
+                }
+                None => {
+                    assert!(matches!(r, Err((false, Error::HandshakeFailure))), "{r:?}");
+                }
+            }
+        }
+    }
+
+    /// Under mTLS, a TLS 1.2 server whose `CertificateRequest` lists no
+    /// RSA-PSS scheme (its policy admits RSA only as PKCS#1 v1.5) gets the
+    /// RSA client's `CertificateVerify` under `rsa_pkcs1_sha256`, and
+    /// verifies it; the client used to answer with RSA-PSS, which such a
+    /// server does not accept.
+    #[test]
+    fn tls12_rsa_client_certificate_verify_falls_back_to_pkcs1() {
+        use super::ClientCertConfig;
+        use crate::signature_registry::SignaturePolicy;
+        use crate::test_util::rsa_test_key_b;
+
+        let (server_config, server_cert_der) = ecdsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let client_key = rsa_test_key_b();
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let client_cert_der = Certificate::self_signed(
+            &client_key,
+            &DistinguishedName::common_name("pkcs1-client"),
+            &validity,
+            1,
+            false,
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&client_key.to_pkcs1_der()).unwrap();
+        let mut server_roots = RootCertStore::new();
+        server_roots.add_der(client_cert_der.clone()).unwrap();
+        let no_pss = SignaturePolicy::empty()
+            .permit("rsa-pkcs1-sha256")
+            .permit("rsa-pkcs1-sha384")
+            .permit("ecdsa-with-sha256")
+            .permit("ecdsa-secp256r1-sha256");
+        let server_config = server_config
+            .with_client_auth(server_roots, true)
+            .with_signature_policy(no_pss)
+            .with_verification_time(fixture_time());
+        let cc = ClientCertConfig::with_rsa(alloc::vec![client_cert_der], boxed);
+        let client_cfg = client_config12(roots).with_client_cert(cc);
+        let mut crng = HmacDrbg::<Sha256>::new(b"pkcs1-cv-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"pkcs1-cv-s", b"nonce", &[]);
+        let mut client =
+            ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+        let mut server = ServerConnection12::new(server_config, srng);
+        pump12_with(&mut client, &mut server, |_, _| {}).unwrap();
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert_eq!(server.peer_signature_scheme(), Some(0x0401));
+        assert_eq!(server.peer_certificates().len(), 1);
     }
 
     /// `signature_algorithms` does not exist before TLS 1.2, and RFC 8422

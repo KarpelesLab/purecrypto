@@ -206,6 +206,11 @@ pub(crate) struct ClientConfig12 {
     /// the `client_cert` signing key; without it a raw-key `Certificate` is
     /// sent empty ("no certificate").
     pub raw_public_key_spki: Option<Vec<u8>>,
+    /// Test-only: the `signature_algorithms` the ClientHello carries in
+    /// place of `offered_signature_schemes_tls12()`, to model a peer whose
+    /// 1.2 offer differs from ours (Mbed TLS lists no RSA-PSS scheme).
+    #[cfg(test)]
+    pub(crate) test_signature_algorithms: Option<Vec<SignatureScheme>>,
 }
 
 impl ClientConfig12 {
@@ -235,7 +240,19 @@ impl ClientConfig12 {
             client_cert_type_preference: alloc::vec![cert_type::X509],
             expected_raw_public_keys: Vec::new(),
             raw_public_key_spki: None,
+            #[cfg(test)]
+            test_signature_algorithms: None,
         }
+    }
+
+    /// The `signature_algorithms` a 1.2 ClientHello built from this config
+    /// carries.
+    fn tls12_signature_schemes(&self) -> Vec<SignatureScheme> {
+        #[cfg(test)]
+        if let Some(list) = &self.test_signature_algorithms {
+            return list.clone();
+        }
+        ext::offered_signature_schemes_tls12()
     }
 
     /// Sets the RFC 7250 `server_certificate_type` preference list offered
@@ -752,6 +769,11 @@ pub struct ClientConnection12 {
     /// verified under, for the negotiated-parameter report. `None` until
     /// then.
     peer_signature_scheme: Option<SignatureScheme>,
+    /// The `signature_algorithms` our ClientHello actually carried — the
+    /// TLS 1.2 list, or the TLS 1.3 one of an adopted version-spanning
+    /// ClientHello — which the server's `ServerKeyExchange` scheme must be
+    /// one of (RFC 5246 §7.4.3).
+    offered_sig_schemes: Vec<SignatureScheme>,
     /// Negotiated ECDHE share from `ServerKeyExchange`: (group, peer point).
     peer_share: Option<(NamedGroup, Vec<u8>)>,
     /// Negotiated ALPN, if any.
@@ -962,6 +984,7 @@ impl ClientConnection12 {
         // opt-in legacy path too. (An SSL 3.0 peer ignores it: the extension
         // is undefined there and never negotiated.)
         let offers_ems = true;
+        let offered_sig_schemes = config.tls12_signature_schemes();
         let mut conn = ClientConnection12 {
             config,
             server_name: String::from(server_name),
@@ -995,6 +1018,7 @@ impl ClientConnection12 {
             cert_chain: Vec::new(),
             leaf_key: None,
             peer_signature_scheme: None,
+            offered_sig_schemes,
             peer_share: None,
             alpn_negotiated: None,
             peer_record_size_limit: None,
@@ -1062,6 +1086,10 @@ impl ClientConnection12 {
         }
         let ch = ClientHello::decode(&sent_ch[4..4 + body_len])?;
         let client_random = ch.random;
+        let offered_sig_schemes = ext::find(&ch.extensions, ExtensionType::SIGNATURE_ALGORITHMS)
+            .map(ext::parse_signature_algorithms)
+            .transpose()?
+            .unwrap_or_default();
         let mut config = config;
         drop_unusable_session(&mut config, server_name);
         // RFC 5077 §3.4: the sent hello resumes only if it carried BOTH a
@@ -1151,6 +1179,7 @@ impl ClientConnection12 {
             cert_chain: Vec::new(),
             leaf_key: None,
             peer_signature_scheme: None,
+            offered_sig_schemes,
             peer_share: None,
             alpn_negotiated: None,
             peer_record_size_limit: None,
@@ -1193,8 +1222,11 @@ impl ClientConnection12 {
         let mut extensions: Vec<(crate::tls::codec::ExtensionType, Vec<u8>)> = Vec::new();
         extensions.push(ext::supported_groups_list(groups));
         if !pure_legacy {
-            // The TLS 1.2 list: no RFC 8734 Brainpool code points.
-            extensions.push(ext::signature_algorithms_tls12());
+            // The TLS 1.2 list: no RFC 8734 Brainpool code points, no
+            // ML-DSA; the RFC 5246 PKCS#1 v1.5 pairs after RSA-PSS.
+            extensions.push(ext::signature_algorithms_list(
+                &self.config.tls12_signature_schemes(),
+            ));
         }
         // RFC 4492 §5.1.2: TLS 1.0+ ECDHE peers REQUIRE ec_point_formats.
         extensions.push(ext::ec_point_formats());
@@ -2688,13 +2720,13 @@ impl ClientConnection12 {
         }
         // RFC 5246 §7.4.3: the signature's (hash, signature) pair "MUST be
         // one of those present in the signature_algorithms extension" of our
-        // ClientHello — `signature_algorithms_tls12()` here, or the TLS 1.3
-        // list of an adopted version-spanning ClientHello, whose extra
-        // entries (Brainpool-TLS-1.3, ML-DSA) have no TLS 1.2 meaning and
-        // are refused by the verifier below. A server signing under a
+        // ClientHello — `signature_algorithms_tls12()`, or the TLS 1.3 list
+        // of an adopted version-spanning ClientHello, whose extra entries
+        // (Brainpool-TLS-1.3, ML-DSA) have no TLS 1.2 meaning and are
+        // refused by the verifier below. A server signing under a
         // scheme it was not offered is choosing our verifier for us:
         // `illegal_parameter`.
-        if !ext::offered_signature_schemes().contains(&ske.scheme) {
+        if !self.offered_sig_schemes.contains(&ske.scheme) {
             return Err(Error::IllegalParameter);
         }
 
@@ -2902,17 +2934,23 @@ impl ClientConnection12 {
         let Some(cc) = self.config.client_cert.as_ref() else {
             return Ok(None);
         };
-        let scheme = ClientCertConfig::signature_scheme_for(cc.key())
-            .filter(|s| is_tls12_signature_scheme(*s))
-            .ok_or(Error::UnsupportedKeyType)?;
         let cert_type = match cc.key() {
             ClientKey::Rsa(_) | ClientKey::RsaPss(..) => 1u8,
             _ => 64u8,
         };
-        Ok(
-            (cr.sig_schemes.contains(&scheme) && cr.cert_types.contains(&cert_type))
-                .then_some(scheme),
-        )
+        if !cr.cert_types.contains(&cert_type) {
+            return Ok(None);
+        }
+        // An `rsaEncryption` key signs the first of the 1.2 RSA preference
+        // (RSA-PSS, then PKCS#1 v1.5 — RFC 5246 §7.4.1.4.1; RFC 8446
+        // forbids the latter only in TLS 1.3) that the request lists.
+        if let ClientKey::Rsa(_) = cc.key() {
+            return Ok(crate::tls::crypto::sign::tls12_rsa_scheme(&cr.sig_schemes));
+        }
+        let scheme = ClientCertConfig::signature_scheme_for(cc.key())
+            .filter(|s| is_tls12_signature_scheme(*s))
+            .ok_or(Error::UnsupportedKeyType)?;
+        Ok(cr.sig_schemes.contains(&scheme).then_some(scheme))
     }
 
     /// mTLS: emit our `Certificate` (TLS 1.2 RFC 5246 §7.4.6). The chain is
@@ -2974,7 +3012,13 @@ impl ClientConnection12 {
             // No RNG in the client state machine: the PSS salt is derived
             // from the key and the signed bytes (see
             // `sign_rsa_pss_deterministic`).
-            ClientKey::Rsa(k) | ClientKey::RsaPss(k, _) => {
+            // An `rsaEncryption` key may have settled on PKCS#1 v1.5 (a
+            // server listing no RSA-PSS scheme); an `id-RSASSA-PSS` one
+            // never does.
+            ClientKey::Rsa(k) => {
+                crate::tls::crypto::sign::sign_rsa_tls12_deterministic(k, scheme, &to_sign)?
+            }
+            ClientKey::RsaPss(k, _) => {
                 crate::tls::crypto::sign::sign_rsa_pss_deterministic(k, scheme, &to_sign)?
             }
             ClientKey::Ecdsa(k) => {

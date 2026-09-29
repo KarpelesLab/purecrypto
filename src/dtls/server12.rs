@@ -1647,7 +1647,11 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let to_sign = signed_message(&cr, &sr, group, &our_point);
         let scheme = ske_scheme;
         let signature: Vec<u8> = match &self.config.key {
-            ServerKey::Rsa(k) | ServerKey::RsaPss(k, _) => {
+            // RSA-PSS or, for a client offering no PSS scheme, PKCS#1 v1.5.
+            ServerKey::Rsa(k) => {
+                crate::tls::crypto::sign::sign_rsa_tls12(k, scheme, &to_sign, &mut self.rng)?
+            }
+            ServerKey::RsaPss(k, _) => {
                 crate::tls::crypto::sign::sign_rsa_pss(k, scheme, &to_sign, &mut self.rng)?
             }
             ServerKey::Ecdsa(k) => {
@@ -2283,8 +2287,11 @@ fn build_certificate_msg(chain: &[Vec<u8>]) -> Vec<u8> {
 /// TLS 1.2 (RFC 5246 §7.4.1.4.1) allows an independent (hash, signature)
 /// pair on the SKE — separate from the PRF / transcript hash fixed by the
 /// suite. For ECDSA the scheme tracks the curve (RFC 8446 §4.2.3 / RFC 8447
-/// IANA registry); for RSA we use `rsa_pss_rsae_sha256`, the modern default
-/// for TLS 1.2 + 1.3 interop.
+/// IANA registry); an `rsaEncryption` RSA key takes the first of
+/// `TLS12_RSA_SCHEME_PREFERENCE` the client offered — RSA-PSS, else
+/// RSASSA-PKCS1-v1_5 (RFC 5246 §7.4.1.4.1; RFC 8446 forbids it only in TLS
+/// 1.3 handshake signatures) — and an `id-RSASSA-PSS` one its
+/// `rsa_pss_pss_*` scheme.
 ///
 /// `Error::UnsupportedKeyType` when the key has no DTLS 1.2 scheme: the RFC
 /// 8734 Brainpool code points are TLS 1.3 only (§2: "MUST NOT be used in
@@ -2301,7 +2308,10 @@ fn signature_scheme(
     offered: &[SignatureScheme],
 ) -> Result<SignatureScheme, Error> {
     let own = match key {
-        ServerKey::Rsa(_) => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
+        ServerKey::Rsa(_) => {
+            return crate::tls::crypto::sign::tls12_rsa_scheme(offered)
+                .ok_or(Error::HandshakeFailure);
+        }
         ServerKey::RsaPss(_, hash) => Some(crate::tls::crypto::sign::rsa_pss_pss_scheme(*hash)),
         ServerKey::Ecdsa(k) => crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve())
             .filter(|s| !s.is_brainpool_tls13()),
@@ -2395,6 +2405,45 @@ fn sig_kind_for_key(key: &ServerKey) -> SigKind {
         // any suite is used); the family is immaterial.
         #[cfg(feature = "mldsa")]
         ServerKey::MlDsa44(_) | ServerKey::MlDsa65(_) | ServerKey::MlDsa87(_) => SigKind::Rsa,
+    }
+}
+
+#[cfg(test)]
+mod rsa_scheme_tests {
+    use super::*;
+
+    /// The DTLS 1.2 server's `ServerKeyExchange` scheme for an RSA identity
+    /// against the client's offer, as on TLS 1.2: RSA-PSS when offered,
+    /// else PKCS#1 v1.5 (RFC 5246 §7.4.1.4.1; Mbed TLS's DTLS 1.2 client
+    /// lists no RSA-PSS), else `handshake_failure`; an `id-RSASSA-PSS` key
+    /// stays PSS-only. The key's family (for suite selection) is RSA
+    /// whatever the offer.
+    #[test]
+    fn rsa_scheme_follows_the_client_offer() {
+        let s = |v: &[u16]| v.iter().map(|&c| SignatureScheme(c)).collect::<Vec<_>>();
+        let key = crate::rsa::BoxedRsaPrivateKey::from_pkcs1_der(
+            &crate::test_util::rsa_test_key_a().to_pkcs1_der(),
+        )
+        .unwrap();
+        let rsa = ServerKey::Rsa(key.clone());
+        assert_eq!(
+            signature_scheme(&rsa, &s(&[0x0403, 0x0401, 0x0501])).unwrap(),
+            SignatureScheme::RSA_PKCS1_SHA256
+        );
+        assert_eq!(
+            signature_scheme(&rsa, &s(&[0x0501, 0x0805])).unwrap(),
+            SignatureScheme::RSA_PSS_RSAE_SHA384
+        );
+        assert!(matches!(
+            signature_scheme(&rsa, &s(&[0x0403, 0x0807])),
+            Err(Error::HandshakeFailure)
+        ));
+        assert!(sig_kind_for_key(&rsa) == SigKind::Rsa);
+        let pss = ServerKey::RsaPss(key, crate::x509::PssHash::Sha256);
+        assert!(matches!(
+            signature_scheme(&pss, &s(&[0x0401])),
+            Err(Error::HandshakeFailure)
+        ));
     }
 }
 

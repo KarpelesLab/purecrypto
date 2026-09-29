@@ -285,20 +285,27 @@ impl ClientCertConfig {
 
     /// [`Self::scheme_for_request`] for a DTLS 1.2 `CertificateVerify`
     /// (RFC 5246 §7.4.8: the algorithm "MUST be one of those present in the
-    /// supported_signature_algorithms field of the CertificateRequest"). The
-    /// RFC 8734 Brainpool code points are TLS 1.3 only and never selected.
+    /// supported_signature_algorithms field of the CertificateRequest"). Only
+    /// schemes TLS 1.2 defines are selected (not the RFC 8734 Brainpool code
+    /// points, not ML-DSA), and an `rsaEncryption` key takes RSA-PSS when
+    /// listed, else PKCS#1 v1.5 (`tls12_rsa_scheme`).
     #[cfg(feature = "dtls")]
     pub(crate) fn scheme_for_request_12(
         &self,
         offered: &[SignatureScheme],
     ) -> Option<SignatureScheme> {
+        use crate::tls::crypto::sign::{is_tls12_signature_scheme, tls12_rsa_scheme};
         match &self.key {
             ClientKey::External { schemes } => schemes
                 .iter()
                 .copied()
-                .find(|s| !s.is_brainpool_tls13() && offered.contains(s)),
+                .find(|s| is_tls12_signature_scheme(*s) && offered.contains(s)),
+            // RSA-PSS if the server lists it, else PKCS#1 v1.5 (RFC 5246
+            // §7.4.1.4.1; RFC 8446 forbids it only in TLS 1.3), as the TLS
+            // 1.2 client does.
+            ClientKey::Rsa(_) => tls12_rsa_scheme(offered),
             key => Self::signature_scheme_for(key)
-                .filter(|s| !s.is_brainpool_tls13() && offered.contains(s)),
+                .filter(|s| is_tls12_signature_scheme(*s) && offered.contains(s)),
         }
     }
 

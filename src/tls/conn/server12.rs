@@ -431,22 +431,31 @@ impl ServerConfig12 {
         }
     }
 
-    /// The signature scheme this server's key will use in `ServerKeyExchange`,
-    /// or `None` when the key has none for TLS 1.2. For ECDSA the choice
+    /// The signature scheme this server's key will use in `ServerKeyExchange`
+    /// given the client's `offered` `signature_algorithms`. For ECDSA the choice
     /// tracks the curve: the NIST curves have RFC 8446 code points; the RFC
     /// 8734 Brainpool code points are TLS 1.3 only (§2: "MUST NOT be used in
     /// TLS 1.2"), and secp256k1 / SM2 have none at all — the ClientHello
-    /// handler turns `None` into `Error::UnsupportedKeyType` rather than
-    /// signing under a NIST code point the client would reject. For RSA we
-    /// use RSA-PSS, the modern default for TLS 1.2 + 1.3 interop — RFC 8446
-    /// §4.2.3 defines both PSS families for TLS 1.2 too, so a leaf
-    /// certified as `id-RSASSA-PSS` signs `rsa_pss_pss_*`. An EdDSA key
+    /// handler reports a key with no scheme as `Error::UnsupportedKeyType`
+    /// rather than signing under a NIST code point the client would reject.
+    /// An `rsaEncryption` RSA key takes the first of
+    /// `TLS12_RSA_SCHEME_PREFERENCE` the client offered — RSA-PSS (RFC 8446
+    /// §4.2.3 defines it for TLS 1.2 too), else RSASSA-PKCS1-v1_5 (RFC 5246
+    /// §7.4.1.4.1; forbidden only in TLS 1.3 handshake signatures); a leaf
+    /// certified as `id-RSASSA-PSS` signs `rsa_pss_pss_*` only. An EdDSA key
     /// signs under its own scheme and no other (RFC 8422 §5.9: "EdDSA keys
     /// using the Ed25519 algorithm MUST use the ed25519 signature algorithm,
     /// and Ed448 keys MUST use the ed448 signature algorithm").
-    fn signature_scheme(&self) -> Option<SignatureScheme> {
-        match &self.key {
-            ServerKey::Rsa(_) => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
+    ///
+    /// `Error::HandshakeFailure` when the client offered none of the
+    /// schemes the key could use (RFC 5246 §7.4.3: the signature must use a
+    /// pair "present in the signature_algorithms extension").
+    fn signature_scheme(&self, offered: &[SignatureScheme]) -> Result<SignatureScheme, Error> {
+        let own = match &self.key {
+            ServerKey::Rsa(_) => {
+                return crate::tls::crypto::sign::tls12_rsa_scheme(offered)
+                    .ok_or(Error::HandshakeFailure);
+            }
             ServerKey::RsaPss(_, hash) => Some(crate::tls::crypto::sign::rsa_pss_pss_scheme(*hash)),
             ServerKey::Ecdsa(k) => {
                 crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve())
@@ -458,6 +467,12 @@ impl ServerConfig12 {
             // external-signer path. Neither is reachable through the
             // constructors above.
             _ => None,
+        };
+        let own = own.ok_or(Error::UnsupportedKeyType)?;
+        if offered.contains(&own) {
+            Ok(own)
+        } else {
+            Err(Error::HandshakeFailure)
         }
     }
 }
@@ -592,6 +607,9 @@ pub struct ServerConnection12<R: RngCore> {
     /// mTLS: the client's leaf public key, recovered from the chain. `None`
     /// when the chain is empty.
     client_leaf_key: Option<AnyPublicKey>,
+    /// The scheme our `ServerKeyExchange` is signed under, chosen against
+    /// the client's `signature_algorithms` on the ClientHello.
+    ske_scheme: Option<SignatureScheme>,
     /// mTLS: the `supported_signature_algorithms` our `CertificateRequest`
     /// carried, which the client's `CertificateVerify` scheme must be one of
     /// (RFC 5246 §7.4.8). Empty until the request is sent.
@@ -704,6 +722,7 @@ impl<R: RngCore> ServerConnection12<R> {
             pending_server_crypter: None,
             client_cert_chain: Vec::new(),
             client_leaf_key: None,
+            ske_scheme: None,
             cert_request_schemes: Vec::new(),
             peer_signature_scheme: None,
             peer_offered_session_ticket: false,
@@ -1354,15 +1373,9 @@ impl<R: RngCore> ServerConnection12<R> {
             .ok_or(Error::HandshakeFailure)?;
         let offered = ext::parse_signature_algorithms(sig_algs)?;
         // A key with no TLS 1.2 scheme (secp256k1 / SM2 / Brainpool) is a
-        // configuration error, distinct from a client that merely does not
-        // accept ours.
-        let our_scheme = self
-            .config
-            .signature_scheme()
-            .ok_or(Error::UnsupportedKeyType)?;
-        if !offered.contains(&our_scheme) {
-            return Err(Error::HandshakeFailure);
-        }
+        // configuration error (`UnsupportedKeyType`), distinct from a client
+        // that merely does not accept ours (`HandshakeFailure`).
+        self.ske_scheme = Some(self.config.signature_scheme(&offered)?);
 
         // `supported_groups` must include at least one group we can complete.
         let groups_body = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS)
@@ -2653,12 +2666,14 @@ impl<R: RngCore> ServerConnection12<R> {
         };
 
         let to_sign = signed_message(&cr, &sr, group, &point);
-        let scheme = self
-            .config
-            .signature_scheme()
-            .ok_or(Error::UnsupportedKeyType)?;
+        // Settled against the client's offer on the ClientHello.
+        let scheme = self.ske_scheme.ok_or(Error::InappropriateState)?;
         let signature: Vec<u8> = match &self.config.key {
-            ServerKey::Rsa(k) | ServerKey::RsaPss(k, _) => {
+            // RSA-PSS or, for a client offering no PSS scheme, PKCS#1 v1.5.
+            ServerKey::Rsa(k) => {
+                crate::tls::crypto::sign::sign_rsa_tls12(k, scheme, &to_sign, &mut self.rng)?
+            }
+            ServerKey::RsaPss(k, _) => {
                 crate::tls::crypto::sign::sign_rsa_pss(k, scheme, &to_sign, &mut self.rng)?
             }
             ServerKey::Ecdsa(k) => {
@@ -3132,6 +3147,44 @@ mod tests {
         let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
         let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
         ServerConfig12::with_rsa(alloc::vec![cert.to_der().to_vec()], boxed)
+    }
+
+    /// The TLS 1.2 server's `ServerKeyExchange` scheme for an RSA identity
+    /// against the client's offer: RSA-PSS when offered, else PKCS#1 v1.5
+    /// (RFC 5246 §7.4.1.4.1 — a client such as Mbed TLS's lists no RSA-PSS
+    /// for 1.2), else `handshake_failure`. A key certified as
+    /// `id-RSASSA-PSS` never falls back to PKCS#1 v1.5.
+    #[test]
+    fn server12_rsa_scheme_follows_the_client_offer() {
+        let s = |v: &[u16]| v.iter().map(|&c| SignatureScheme(c)).collect::<Vec<_>>();
+        let cfg = test_rsa_server_config();
+        assert_eq!(
+            cfg.signature_scheme(&s(&[0x0403, 0x0401, 0x0501])).unwrap(),
+            SignatureScheme::RSA_PKCS1_SHA256
+        );
+        assert_eq!(
+            cfg.signature_scheme(&s(&[0x0401, 0x0804])).unwrap(),
+            SignatureScheme::RSA_PSS_RSAE_SHA256
+        );
+        assert!(matches!(
+            cfg.signature_scheme(&s(&[0x0403, 0x0807])),
+            Err(Error::HandshakeFailure)
+        ));
+        let key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&crate::test_util::rsa_test_key_a().to_pkcs1_der())
+                .unwrap();
+        let pss = ServerConfig12::from_key(
+            Vec::new(),
+            ServerKey::RsaPss(key, crate::x509::PssHash::Sha256),
+        );
+        assert!(matches!(
+            pss.signature_scheme(&s(&[0x0401, 0x0804])),
+            Err(Error::HandshakeFailure)
+        ));
+        assert_eq!(
+            pss.signature_scheme(&s(&[0x0401, 0x0809])).unwrap(),
+            SignatureScheme::RSA_PSS_PSS_SHA256
+        );
     }
 
     /// A peer that claims a giant handshake-message length in the 3-byte

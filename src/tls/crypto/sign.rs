@@ -124,6 +124,57 @@ pub(crate) fn sign_rsa_pss<R: RngCore>(
     .map_err(|_| Error::HandshakeFailure)
 }
 
+/// A (D)TLS 1.2 server's (or client's) preference among the schemes an RSA
+/// key certified as `rsaEncryption` can sign a `ServerKeyExchange` /
+/// `CertificateVerify` under: RSASSA-PSS first (RFC 8446 §4.2.3 defines the
+/// `rsa_pss_rsae_*` schemes for TLS 1.2 too), then RSASSA-PKCS1-v1_5 — the
+/// RFC 5246 §7.4.1.4.1 `(sha*, rsa)` pairs, which RFC 8446 forbids only in
+/// TLS 1.3 handshake signatures. A peer that lists no RSA-PSS scheme (Mbed
+/// TLS's 1.2 client lists `rsa_pkcs1_*` and ECDSA only) could otherwise not
+/// be served by an RSA identity at all. An `id-RSASSA-PSS` key stays on its
+/// `rsa_pss_pss_*` scheme: PKCS#1 v1.5 under it is forbidden by its SPKI
+/// (RFC 4055 §1.2).
+pub(crate) const TLS12_RSA_SCHEME_PREFERENCE: [SignatureScheme; 6] = [
+    SignatureScheme::RSA_PSS_RSAE_SHA256,
+    SignatureScheme::RSA_PSS_RSAE_SHA384,
+    SignatureScheme::RSA_PSS_RSAE_SHA512,
+    SignatureScheme::RSA_PKCS1_SHA256,
+    SignatureScheme::RSA_PKCS1_SHA384,
+    SignatureScheme::RSA_PKCS1_SHA512,
+];
+
+/// The first scheme of [`TLS12_RSA_SCHEME_PREFERENCE`] the peer `offered`,
+/// or `None` when it offered none of them (the caller answers
+/// `handshake_failure`, or — for a client's certificate — withholds it).
+/// For (D)TLS 1.2 only; TLS 1.3 signs RSA-PSS and nothing else.
+pub(crate) fn tls12_rsa_scheme(offered: &[SignatureScheme]) -> Option<SignatureScheme> {
+    TLS12_RSA_SCHEME_PREFERENCE
+        .iter()
+        .copied()
+        .find(|s| offered.contains(s))
+}
+
+/// Signs `content` with an `rsaEncryption` RSA key for a (D)TLS 1.2
+/// handshake signature under `scheme` — one of the RSA-PSS schemes (see
+/// [`sign_rsa_pss`]) or `rsa_pkcs1_sha{256,384,512}` (RSASSA-PKCS1-v1_5
+/// with a DigestInfo over that hash, RFC 5246 §4.7). PKCS#1 v1.5 signing is
+/// deterministic; `rng` only salts PSS. [`Error::UnsupportedKeyType`] for a
+/// non-RSA scheme.
+pub(crate) fn sign_rsa_tls12<R: RngCore>(
+    key: &BoxedRsaPrivateKey,
+    scheme: SignatureScheme,
+    content: &[u8],
+    rng: &mut R,
+) -> Result<Vec<u8>, Error> {
+    match scheme {
+        SignatureScheme::RSA_PKCS1_SHA256 => key.sign_pkcs1v15::<Sha256>(content),
+        SignatureScheme::RSA_PKCS1_SHA384 => key.sign_pkcs1v15::<Sha384>(content),
+        SignatureScheme::RSA_PKCS1_SHA512 => key.sign_pkcs1v15::<Sha512>(content),
+        _ => return sign_rsa_pss(key, scheme, content, rng),
+    }
+    .map_err(|_| Error::HandshakeFailure)
+}
+
 /// [`sign_rsa_pss`] with a salt derived deterministically (HMAC-DRBG) from
 /// the key's public modulus and `content`, for the client engines, which
 /// thread no RNG through the handshake state machine. The salt is public —
@@ -145,6 +196,23 @@ pub(crate) fn sign_rsa_pss_deterministic(
         b"purecrypto tls RSASSA-PSS salt",
     );
     sign_rsa_pss(key, scheme, content, &mut drbg)
+}
+
+/// [`sign_rsa_tls12`] for the (D)TLS 1.2 client engines, which thread no
+/// RNG through the handshake state machine: an RSA-PSS scheme takes the
+/// message-bound salt of [`sign_rsa_pss_deterministic`], a PKCS#1 v1.5 one
+/// needs none.
+pub(crate) fn sign_rsa_tls12_deterministic(
+    key: &BoxedRsaPrivateKey,
+    scheme: SignatureScheme,
+    content: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if scheme.is_rsa_pkcs1() {
+        // Deterministic: the RNG argument is never drawn from.
+        let mut unused = crate::rng::HmacDrbg::<Sha256>::new(&[0; 32], &[], &[]);
+        return sign_rsa_tls12(key, scheme, content, &mut unused);
+    }
+    sign_rsa_pss_deterministic(key, scheme, content)
 }
 
 /// What a leaf certificate's SPKI says about the RSA-PSS scheme family an
@@ -326,9 +394,12 @@ pub(crate) fn sign_client_certificate_verify(
     content: &[u8],
 ) -> Result<Vec<u8>, Error> {
     Ok(match key {
-        ClientKey::Rsa(k) | ClientKey::RsaPss(k, _) => {
-            sign_rsa_pss_deterministic(k, scheme, content)?
-        }
+        // An `rsaEncryption` key may be asked for PKCS#1 v1.5 by a (D)TLS 1.2
+        // server that lists no RSA-PSS scheme (`tls12_rsa_scheme`); TLS 1.3
+        // never selects one, so there it is RSA-PSS as before. An
+        // `id-RSASSA-PSS` key is PSS-only (RFC 4055 §1.2).
+        ClientKey::Rsa(k) => sign_rsa_tls12_deterministic(k, scheme, content)?,
+        ClientKey::RsaPss(k, _) => sign_rsa_pss_deterministic(k, scheme, content)?,
         ClientKey::Ecdsa(k) => {
             let curve = k.curve();
             let sig = match curve {
@@ -441,6 +512,10 @@ fn tls12_registry_entry(scheme: SignatureScheme) -> Option<&'static dyn Signatur
         SignatureScheme::ECDSA_SECP256R1_SHA256 => find_by_id("ecdsa-with-sha256"),
         SignatureScheme::ECDSA_SECP384R1_SHA384 => find_by_id("ecdsa-with-sha384"),
         SignatureScheme::ECDSA_SECP521R1_SHA512 => find_by_id("ecdsa-with-sha512"),
+        // `(sha512, rsa)`: RFC 8446 left the TLS 1.3 registry entry without a
+        // code point, but the RFC 5246 pair is valid in 1.2 (the policy
+        // decides whether it is accepted).
+        SignatureScheme::RSA_PKCS1_SHA512 => find_by_id("rsa-pkcs1-sha512"),
         _ => find_by_tls_scheme(scheme.0),
     }
 }
@@ -1152,20 +1227,102 @@ mod tests {
             assert!(!is_tls12_signature_scheme(s), "{s:?}");
         }
         // What the 1.2 ClientHello offers is exactly the 1.3 offer's
-        // TLS-1.2-defined subset, with EdDSA in it.
+        // TLS-1.2-defined subset, with EdDSA in it, followed by the RFC 5246
+        // PKCS#1 v1.5 pairs the default policy admits.
         let tls12 = crate::tls::codec::extension::parse_signature_algorithms(
             &crate::tls::codec::extension::signature_algorithms_tls12().1,
         )
         .unwrap();
         let tls13 = crate::tls::codec::extension::offered_signature_schemes();
-        let expected: Vec<SignatureScheme> = tls13
+        let mut expected: Vec<SignatureScheme> = tls13
             .iter()
             .copied()
             .filter(|s| is_tls12_signature_scheme(*s))
             .collect();
+        expected.push(SignatureScheme::RSA_PKCS1_SHA256);
+        expected.push(SignatureScheme::RSA_PKCS1_SHA384);
         assert_eq!(tls12, expected);
         assert!(tls12.contains(&SignatureScheme::ED25519));
         assert!(tls12.contains(&SignatureScheme::ED448));
+    }
+
+    /// The (D)TLS 1.2 RSA scheme choice (RFC 5246 §7.4.1.4.1, RFC 8446
+    /// §4.2.3): RSA-PSS when the peer offers it, else PKCS#1 v1.5 in digest
+    /// order, else nothing; and a PKCS#1 v1.5 signature made for it
+    /// verifies under the 1.2 verifier and the default policy (which admits
+    /// `(sha256, rsa)` / `(sha384, rsa)`, not `(sha512, rsa)`).
+    #[test]
+    fn tls12_rsa_scheme_prefers_pss_then_pkcs1() {
+        use crate::rng::HmacDrbg;
+        use crate::x509::AnyPublicKey;
+        let s = |v: &[u16]| v.iter().map(|&c| SignatureScheme(c)).collect::<Vec<_>>();
+        // Only PKCS#1 v1.5 offered (Mbed TLS's 1.2 client): PKCS#1 v1.5.
+        assert_eq!(
+            tls12_rsa_scheme(&s(&[0x0403, 0x0401, 0x0501])),
+            Some(SignatureScheme::RSA_PKCS1_SHA256)
+        );
+        assert_eq!(
+            tls12_rsa_scheme(&s(&[0x0501, 0x0601])),
+            Some(SignatureScheme::RSA_PKCS1_SHA384)
+        );
+        // Both offered, in either order: RSA-PSS, the server's preference.
+        assert_eq!(
+            tls12_rsa_scheme(&s(&[0x0401, 0x0806, 0x0804])),
+            Some(SignatureScheme::RSA_PSS_RSAE_SHA256)
+        );
+        assert_eq!(
+            tls12_rsa_scheme(&s(&[0x0401, 0x0805])),
+            Some(SignatureScheme::RSA_PSS_RSAE_SHA384)
+        );
+        // Neither (ECDSA / EdDSA only; `rsa_pss_pss_*` is not for an
+        // `rsaEncryption` key): nothing.
+        assert_eq!(tls12_rsa_scheme(&s(&[0x0403, 0x0807, 0x0809])), None);
+        assert_eq!(tls12_rsa_scheme(&[]), None);
+
+        let rsa = crate::test_util::rsa_test_key_a();
+        let rsa = BoxedRsaPrivateKey::from_pkcs1_der(&rsa.to_pkcs1_der()).unwrap();
+        let key = AnyPublicKey::Rsa(rsa.public_key());
+        let mut rng = HmacDrbg::<Sha256>::new(b"tls12-pkcs1", b"nonce", &[]);
+        let msg = b"client_random || server_random || ServerECDHParams";
+        let policy = SignaturePolicy::modern();
+        for scheme in [
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PSS_RSAE_SHA256,
+        ] {
+            let sig = sign_rsa_tls12(&rsa, scheme, msg, &mut rng).unwrap();
+            verify_signature_tls12(scheme, &key, msg, &sig, &policy).unwrap();
+            // The deterministic client variant produces a signature that
+            // verifies too (and, for PKCS#1 v1.5, the very same one).
+            let det = sign_rsa_tls12_deterministic(&rsa, scheme, msg).unwrap();
+            verify_signature_tls12(scheme, &key, msg, &det, &policy).unwrap();
+            if scheme.is_rsa_pkcs1() {
+                assert_eq!(det, sig);
+            }
+        }
+        // `(sha512, rsa)` resolves in the 1.2 verifier, and the default
+        // policy refuses it; one that admits it accepts the signature.
+        let sig = sign_rsa_tls12(&rsa, SignatureScheme::RSA_PKCS1_SHA512, msg, &mut rng).unwrap();
+        assert!(matches!(
+            verify_signature_tls12(SignatureScheme::RSA_PKCS1_SHA512, &key, msg, &sig, &policy),
+            Err(Error::BadCertificate)
+        ));
+        let with512 = SignaturePolicy::empty().permit("rsa-pkcs1-sha512");
+        verify_signature_tls12(SignatureScheme::RSA_PKCS1_SHA512, &key, msg, &sig, &with512)
+            .unwrap();
+        // A PKCS#1 v1.5 signature presented under the PSS code point (and
+        // the reverse) does not verify.
+        let pkcs1 = sign_rsa_tls12(&rsa, SignatureScheme::RSA_PKCS1_SHA256, msg, &mut rng).unwrap();
+        assert!(
+            verify_signature_tls12(
+                SignatureScheme::RSA_PSS_RSAE_SHA256,
+                &key,
+                msg,
+                &pkcs1,
+                &policy
+            )
+            .is_err()
+        );
     }
 
     /// RFC 8422 §5.4 / §5.8 / §5.10 in the 1.2 verifier: `ed25519` /

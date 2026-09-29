@@ -80,24 +80,48 @@ pub(crate) fn signature_algorithms() -> RawExtension {
 }
 
 /// [`signature_algorithms`] for a ClientHello that offers TLS 1.2 (or DTLS
-/// 1.2) at most: the same list minus what that version does not define
-/// (`is_tls12_signature_scheme`) — the RFC 8734 Brainpool code points,
-/// which are TLS 1.3 only and MUST NOT be used in TLS 1.2, and ML-DSA,
-/// which no specification gives a TLS 1.2 meaning. `ed25519` / `ed448`
-/// stay: RFC 8422 §5.1.3 defines them for TLS 1.2 as the pairs (8, 7) and
-/// (8, 8). A version-flexible TLS 1.3 ClientHello keeps the whole list (one
-/// list serves both versions; a 1.2 server ignores code points it does not
-/// use, and the 1.2 client engine refuses a signature under one).
+/// 1.2) at most, listing [`offered_signature_schemes_tls12`]. A
+/// version-flexible TLS 1.3 ClientHello keeps the TLS 1.3 list (one list
+/// serves both versions; a 1.2 server ignores code points it does not use,
+/// and the 1.2 client engine refuses a signature under one). Only the
+/// DTLS 1.2 client sends it as-is; the TLS 1.2 client builds the same list
+/// through its config (which tests can override).
+#[cfg(any(feature = "dtls", test))]
 pub(crate) fn signature_algorithms_tls12() -> RawExtension {
+    signature_algorithms_list(&offered_signature_schemes_tls12())
+}
+
+/// `signature_algorithms` listing `schemes`, in order.
+pub(crate) fn signature_algorithms_list(schemes: &[SignatureScheme]) -> RawExtension {
     let mut body = Vec::new();
     with_len_u16(&mut body, |b| {
-        for s in offered_signature_schemes() {
-            if crate::tls::crypto::sign::is_tls12_signature_scheme(s) {
-                put_u16(b, s.0);
-            }
+        for s in schemes {
+            put_u16(b, s.0);
         }
     });
     (ExtensionType::SIGNATURE_ALGORITHMS, body)
+}
+
+/// The `SignatureScheme`s [`signature_algorithms_tls12`] advertises: the
+/// TLS 1.3 offer minus what TLS 1.2 does not define
+/// (`is_tls12_signature_scheme`) — the RFC 8734 Brainpool code points,
+/// which are TLS 1.3 only and MUST NOT be used in TLS 1.2, and ML-DSA,
+/// which no specification gives a TLS 1.2 meaning — plus, after RSA-PSS,
+/// the RFC 5246 §7.4.1.4.1 `(sha256, rsa)` / `(sha384, rsa)` PKCS#1 v1.5
+/// pairs, which RFC 8446 forbids only in TLS 1.3 handshake signatures:
+/// a 1.2 server whose RSA identity signs nothing else (Mbed TLS's) could
+/// otherwise not authenticate to us at all. `ed25519` / `ed448` stay: RFC
+/// 8422 §5.1.3 defines them for TLS 1.2 as the pairs (8, 7) and (8, 8).
+/// `(sha512, rsa)` is left out, as `SignaturePolicy::modern()` does not
+/// admit it.
+pub(crate) fn offered_signature_schemes_tls12() -> Vec<SignatureScheme> {
+    let mut out: Vec<SignatureScheme> = offered_signature_schemes()
+        .into_iter()
+        .filter(|s| crate::tls::crypto::sign::is_tls12_signature_scheme(*s))
+        .collect();
+    out.push(SignatureScheme::RSA_PKCS1_SHA256);
+    out.push(SignatureScheme::RSA_PKCS1_SHA384);
+    out
 }
 
 /// The `SignatureScheme`s [`signature_algorithms`] advertises, in wire

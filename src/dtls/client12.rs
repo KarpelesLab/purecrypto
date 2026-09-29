@@ -1280,7 +1280,7 @@ impl DtlsClientConnection12 {
         // sent (`signature_algorithms_tls12()`); a server signing under a
         // scheme it was not offered is `illegal_parameter` (mirrors the TLS
         // 1.2 client).
-        if !ext::offered_signature_schemes().contains(&ske.scheme) {
+        if !ext::offered_signature_schemes_tls12().contains(&ske.scheme) {
             return Err(Error::IllegalParameter);
         }
         // Verify the SKE signature under the leaf's key.
