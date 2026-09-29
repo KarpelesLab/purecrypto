@@ -63,6 +63,7 @@ pub struct GreaseParams {
 /// How GREASE picks its 8-bit `config_id`. Fresh random per CH is
 /// the default and what the draft recommends.
 #[derive(Copy, Clone, Debug)]
+#[non_exhaustive]
 pub enum GreaseConfigIdStrategy {
     /// Random byte per CH.
     Random,

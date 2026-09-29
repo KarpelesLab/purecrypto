@@ -15,6 +15,7 @@ use crate::zeroize::Zeroize;
 
 /// HPKE KDF identifiers (RFC 9180 §7.2).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum HpkeKdf {
     /// `0x0001` — HKDF-SHA-256.
     HkdfSha256,

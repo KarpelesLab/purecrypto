@@ -9,6 +9,7 @@
 
 /// A TLS protocol version, as carried on the wire (a `u16`).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum ProtocolVersion {
     /// SSL 3.0 (0x0300).
     SSLv3,
@@ -64,6 +65,7 @@ impl ProtocolVersion {
 
 /// A TLS record content type (the first byte of a record).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum ContentType {
     /// `change_cipher_spec` (20) — ignored in TLS 1.3 (middlebox compat).
     ChangeCipherSpec,

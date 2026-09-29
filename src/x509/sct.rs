@@ -38,6 +38,7 @@ use crate::hash::{Digest, Sha256};
 
 /// SCT protocol version. RFC 6962 defines only `v1` (0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SctVersion {
     /// `v1` (the only version RFC 6962 defines).
     V1,
@@ -94,6 +95,7 @@ impl CtLog {
 
 /// The result of verifying one SCT.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SctVerification {
     /// The SCT verified against a trusted log.
     Valid,

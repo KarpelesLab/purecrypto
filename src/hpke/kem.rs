@@ -27,6 +27,7 @@ use alloc::vec::Vec;
 
 /// HPKE KEM identifiers (RFC 9180 §7.1).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum HpkeKem {
     /// `0x0010` — DHKEM(P-256, HKDF-SHA-256).
     DhkemP256HkdfSha256,

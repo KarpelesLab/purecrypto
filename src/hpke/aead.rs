@@ -7,6 +7,7 @@ use crate::cipher::{Aes128, Aes128Gcm, Aes256, Aes256Gcm, ChaCha20Poly1305};
 
 /// HPKE AEAD identifiers (RFC 9180 §7.3).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum HpkeAead {
     /// `0x0001` — AES-128-GCM.
     Aes128Gcm,

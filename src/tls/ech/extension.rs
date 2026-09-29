@@ -33,6 +33,7 @@ pub(crate) const TYPE_INNER: u8 = 1;
 
 /// Decoded `encrypted_client_hello` extension body.
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum EchExtension {
     /// `outer` form — the body the client puts on the wire and the
     /// server attempts to decrypt.

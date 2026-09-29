@@ -103,6 +103,7 @@ pub trait SignOp: Send {
 }
 
 /// The outcome of one [`SignOp::resume`] step.
+#[non_exhaustive]
 pub enum SignProgress {
     /// The operation is waiting on its device. Wait on
     /// [`SignOp::readiness`] (if any), then call [`SignOp::resume`] again.
