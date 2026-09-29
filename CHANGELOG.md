@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/KarpelesLab/purecrypto/compare/v0.9.6...v0.10.0) - 2026-09-29
+
+### Added
+
+- [**breaking**] mark TransportParameters and the parsed protocol structs non_exhaustive
+- [**breaking**] mark the registry-backed public enums non_exhaustive
+- *(dtls)* carry the verified client identity through DTLS resumption
+- *(cli)* DTLS 1.2 resumption with -reconnect / -naccept
+- *(dtls)* DTLS 1.2 session resumption by RFC 5077 ticket
+- *(cli)* DTLS 1.3 -reconnect / -early_data / -naccept for s_client and s_server
+- *(dtls)* DTLS 1.3 session resumption and 0-RTT (RFC 9147 + RFC 8446)
+- *(cli)* certificate compression knobs and report for both directions
+- *(tls)* RFC 8879 for the client certificate, with brotli and zstd
+- *(ffi)* pc_tls_peer_signature_scheme
+- *(tls)* EdDSA certificates in TLS 1.2 and DTLS 1.2 (RFC 8422)
+- *(cli)* client certificates over DTLS
+- *(tls)* expose DTLS client certificates through Config, Connection and the FFI
+- *(dtls)* client certificates on DTLS 1.2
+- *(dtls)* client certificates on DTLS 1.3
+- *(cli)* -quic_versions flag and negotiated-version report for q_client/q_server
+- *(ffi)* expose QUIC v2 and the negotiated version
+- *(quic)* compatible and incompatible version negotiation (RFC 9368/9369)
+- *(quic)* QUIC version 2 packet protection (RFC 9369)
+- *(tls)* [**breaking**] make NamedGroup non_exhaustive
+- *(ffi)* pc_tls_cfg_set_groups, pc_tls_negotiated_group and the PC_GROUP_* codepoints
+- *(cli)* the new groups, -groups on q_client / q_server, group and HRR in the QUIC report
+- *(tls)* secp521r1 and the RFC 10024 NIST-curve ML-KEM hybrids
+- *(ffi)* DTLS connection-ID configuration and accessors
+- *(cli)* -cid / -cid_len / -rebind and a movable peer address for the DTLS s_client / s_server
+- *(dtls)* RFC 9146 connection IDs on DTLS 1.2 and 1.3, with the RFC 9147 §9 CID messages
+- *(cli)* -psk_modes / -psk_identity / -psk / -psk_import for s_client and s_server
+- *(tls)* PSK key-exchange modes and external PSKs (RFC 8446 §4.2.9/§4.2.11)
+
+### Fixed
+
+- *(cli)* ride out a server rebinding between -reconnect DTLS connections
+- *(dtls)* match a resumption's cookie skip on the IP address (RFC 9147 §5.1)
+- *(dtls)* never echo legacy_session_id in a DTLS 1.3 ServerHello
+- *(ec)* declassify the boxed curves' scalar-sampling verdict for the Valgrind harness
+- *(tls)* fall back to rsa_pkcs1 signatures in (D)TLS 1.2 when the peer offers no RSA-PSS scheme
+- *(dtls)* sign the DTLS 1.2 ServerKeyExchange only under a scheme the client offered
+- *(quic)* honour Config::key_exchange_groups, report the group and HRR
+
+### Other
+
+- *(validation)* the matrix counts after the rebase onto DTLS client certificates
+- *(validation)* DTLS resumption and 0-RTT across OpenSSL, wolfSSL, the wolfSSL driver and Mbed TLS
+- *(interop)* DTLS 1.2 resumption against Mbed TLS; drop by content type
+- *(interop)* DTLS 1.2 resumption vs OpenSSL and wolfSSL, and resume-loss
+- *(interop)* wolfssl-driver peer for DTLS resumption and 0-RTT, both roles
+- *(interop)* run DTLS 1.3 resumption and 0-RTT against the wolfSSL examples
+- DTLS 1.3 resumption and 0-RTT (validation, CLI, module notes)
+- *(interop)* DTLS 1.3 resume / 0-RTT cases against wolfSSL
+- *(interop)* stop the wolfSSL client spinning in its -w shutdown after -I
+- *(interop)* require the HelloRetryRequest SChannel's client needs to reach P-521
+- *(tls)* don't link DTLS connection-ID items from docs built without dtls
+- *(interop)* compressed client certificates, brotli and zstd
+- *(interop)* Mbed TLS DTLS 1.2 with an RSA identity in both roles
+- *(interop)* TLS 1.2 and DTLS 1.2 with Ed25519 identities
+- *(validation)* refresh the coverage-gap note after QUIC v2 and DTLS client certificates
+- *(interop)* client certificates over DTLS against OpenSSL and wolfSSL
+- *(tls)* share the client-certificate helpers with the DTLS engines
+- *(validation)* QUIC v2 and version negotiation interop
+- *(interop)* QUIC v2 and version negotiation vs quic-go
+- *(interop)* P-521 and the RFC 10024 NIST hybrids across the TLS, DTLS and QUIC matrices
+- *(ct)* the RFC 10024 hybrids and secp521r1 under Valgrind
+- *(interop)* connection-ID cases against wolfSSL and Mbed TLS, and the DTLS 1.2 matrix for Mbed TLS
+- *(interop)* un-SKIP resume-psk, add extpsk cases across the peer matrix
+- PSK key-exchange modes and external PSKs (CLI, safe path, interop matrix)
+
 ### Added
 
 - *(dtls)* RFC 9146 connection IDs on DTLS 1.2 and 1.3 (`Config::connection_id`, `ConfigBuilder::connection_id` / `connection_id_len`, `Connection::local_connection_id` / `peer_connection_id` / `datagram_allows_peer_address_update`, `dtls::peek_connection_id`), the RFC 9147 §9 `NewConnectionId` / `RequestConnectionId` messages (`Connection::request_connection_ids` / `spare_connection_ids` / `use_spare_connection_id`), the matching `pc_dtls_*` FFI, and `s_client` / `s_server -cid` / `-cid_len` with `s_client -rebind`
