@@ -129,6 +129,13 @@ cmd_supports() {
     return 0
 }
 
+# The external PSK of the extpsk cases, written to the pskpasswd file
+# gnutls-serv reads: `identity:hex-key`.
+psk_setup() {
+    printf '%s:%s
+' "$PSK_IDENTITY" "$PSK_HEX" >"$WORK/psk.passwd"
+}
+
 # The priority string for the case. NORMAL, then the version, group and
 # cipher pinned (TLS 1.2 keeps the defaults: the case only checks the
 # version), then the certificate types for the raw-public-key cases.
@@ -156,6 +163,18 @@ priority() {
         # question; the other side stays X.509.
         rpk) p="$p:-CTYPE-SRV-ALL:+CTYPE-SRV-RAWPK" ;;
         rpk-client) p="$p:-CTYPE-CLI-ALL:+CTYPE-CLI-RAWPK" ;;
+        # An external PSK (RFC 8446 §4.2.11) needs the PSK key exchanges
+        # enabled (NORMAL leaves them off): DHE-PSK for psk_dhe_ke, PSK for
+        # psk_ke.
+        extpsk) p="$p:+ECDHE-PSK:+DHE-PSK:+PSK" ;;
+        # PSK-only ticket resumption: gnutls-serv issues no psk_ke-usable
+        # ticket, and accepts none, unless plain PSK (psk_ke) is enabled
+        # (`+PSK`); NORMAL does ticket resumption with DHE-PSK only. Only
+        # the server needs it — gnutls-cli with +PSK but no key offers the
+        # external-PSK ciphersuites and sends a malformed hello, so the
+        # client (peer-client role) keeps the plain priority and simply
+        # advertises both modes, letting the purecrypto server pick psk_ke.
+        resume-psk) [ "$CASE_ROLE" = peer-server ] && p="$p:+PSK" ;;
     esac
     echo "$p"
 }
@@ -189,6 +208,9 @@ server_args() {
         ocsp) a="$a --ocsp-response $OCSP" ;;
         alpn) a="$a --alpn h2 --alpn http/1.1" ;;
         rsl) a="$a --recordsize 512" ;;
+        # A server that accepts the external PSK by identity (its X.509
+        # certificate stays available for a client that offers no PSK).
+        extpsk) a="$a --pskpasswd $WORK/psk.passwd" ;;
     esac
     echo "$a"
 }
@@ -210,6 +232,12 @@ client_args() {
         # session (waiting for the ticket first), then the payload goes
         # over the resumed connection.
         resume) a="$a --resume --waitresumption" ;;
+        # PSK-only resumption: gnutls-cli offers both modes; the purecrypto
+        # server prefers psk_ke and selects it (no (EC)DHE on the second
+        # connection).
+        resume-psk) a="$a --resume --waitresumption" ;;
+        # An external PSK offered by identity + key; no certificate needed.
+        extpsk) a="$a --pskusername $PSK_IDENTITY --pskkey $PSK_HEX" ;;
         0rtt) a="$a --resume --waitresumption --earlydata $PKI/early.txt" ;;
         mtls) a="$a --x509certfile $PKI/$CASE_CERT.crt --x509keyfile $PKI/$CASE_CERT.key" ;;
         rpk-client) a="$a --rawpkkeyfile $PKI/$CASE_CERT.key --rawpkfile $PKI/$CASE_CERT.pub" ;;
@@ -280,6 +308,14 @@ verify_tls13() {
         resume|0rtt)
             expect "$f" "*** This is a resumed session" || ok=1
             expect "$f" " - Using curve: $(gt_curve "$CASE_GROUP")" || ok=1 ;;
+        # PSK-only resumption: still a resumed session, but no (EC)DHE, so
+        # the description carries no group and there is no `Using curve`.
+        resume-psk)
+            expect "$f" "*** This is a resumed session" || ok=1 ;;
+        # An external PSK authenticates the peer (no certificate); the
+        # description names the PSK, not a group.
+        extpsk)
+            expect "$f" "- PSK authentication. Connected as '$PSK_IDENTITY'" || ok=1 ;;
         *)
             refute "$f" "*** This is a resumed session" || ok=1
             expect_re "$f" "^- Description: \(TLS1\.3[^)]*\)-\($(gt_group_desc "$CASE_GROUP")\)" || ok=1 ;;
@@ -369,7 +405,7 @@ cmd_verify() {
 # The connections the peer server sees in the case: two when resuming.
 connections() {
     case $CASE_FEAT in
-        resume|0rtt) echo 2 ;;
+        resume|0rtt|resume-psk) echo 2 ;;
         *) echo 1 ;;
     esac
 }
@@ -377,7 +413,9 @@ connections() {
 case ${1:-} in
     info) "$GNUTLS_CLI" --version | head -1 ;;
     supports) cmd_supports ;;
-    server) start_bg_server idle bash "$0" supervise "$(connections)" "$GNUTLS_SERV" $(server_args) ;;
+    server)
+        [ "$CASE_FEAT" = extpsk ] && psk_setup
+        start_bg_server idle bash "$0" supervise "$(connections)" "$GNUTLS_SERV" $(server_args) ;;
     supervise) shift; cmd_supervise "$@" ;;
     client) cmd_client ;;
     verify) cmd_verify ;;

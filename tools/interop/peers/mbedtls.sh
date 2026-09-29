@@ -70,6 +70,14 @@ cmd_supports() {
         # (MBEDTLS_SSL_{IN,OUT}_CONTENT_LEN cannot be set any larger): the
         # server cannot write the Certificate, the client cannot reassemble it.
         large-chain) skip "Mbed TLS handles no handshake message over its 16 KiB I/O buffer" ;;
+        # RFC 8446 §4.2.9: the Mbed TLS server's built-in order prefers
+        # psk_ephemeral, then ephemeral, and picks plain psk (psk_ke) only
+        # when no (EC)DHE is available — but the purecrypto client still
+        # offers a key_share, so the server always finds ephemeral and
+        # never selects psk_ke. Its client, though, accepts a psk_ke
+        # ServerHello, so the purecrypto-server role runs.
+        resume-psk) [ "$CASE_ROLE" = peer-client ] ||
+            skip "the Mbed TLS server prefers (psk_)ephemeral and never selects psk_ke while a key_share is offered" ;;
     esac
     return 0
 }
@@ -94,6 +102,9 @@ server_args() {
         0rtt-hrr) ARGS+=(early_data=1 exchanges=2) ;;
         mtls) ARGS+=(auth_mode=required) ;;
         alpn) ARGS+=(alpn=h2,http/1.1) ;;
+        # An external PSK by identity/key (RFC 8446 §4.2.11); the
+        # certificate stays for a client that offers no PSK.
+        extpsk) ARGS+=("psk=$PSK_HEX" "psk_identity=$PSK_IDENTITY") ;;
         # A response well over the 512-byte limit the purecrypto client
         # advertises, so the server has to split it (the purecrypto side
         # rejects an oversized record).
@@ -119,6 +130,12 @@ client_args() {
     fi
     case $CASE_FEAT in
         resume) ARGS+=(reconnect=1) ;;
+        # PSK-only ticket resumption: reconnect with the saved session; the
+        # client advertises both modes (default) and the purecrypto server
+        # selects psk_ke.
+        resume-psk) ARGS+=(reconnect=1) ;;
+        # An external PSK by identity/key; no certificate is verified.
+        extpsk) ARGS+=("psk=$PSK_HEX" "psk_identity=$PSK_IDENTITY" auth_mode=none) ;;
         # The request goes out as early data and, once the handshake is
         # done, again as ordinary data (rejected or not).
         0rtt|0rtt-hrr) ARGS+=(reconnect=1 early_data=1) ;;
@@ -154,7 +171,7 @@ cmd_verify() {
             *) refute "$f" "=> write hello retry request" || ok=1 ;;
         esac
         case $CASE_FEAT in
-            resume|0rtt|0rtt-hrr) expect "$f" "key exchange mode: psk_ephemeral" || ok=1 ;;
+            resume|0rtt|0rtt-hrr|extpsk) expect "$f" "key exchange mode: psk_ephemeral" || ok=1 ;;
             *) refute "$f" "key exchange mode: psk" || ok=1 ;;
         esac
         case $CASE_FEAT in
@@ -181,7 +198,10 @@ cmd_verify() {
             expect "$f" "[ Ciphersuite is $suite ]" || ok=1
             expect "$f" "DHE group name: $group" || ok=1
         fi
-        expect "$f" "Verifying peer X.509 certificate... ok" || ok=1
+        case $CASE_FEAT in
+            extpsk) : ;;  # a PSK handshake sends no certificate
+            *) expect "$f" "Verifying peer X.509 certificate... ok" || ok=1 ;;
+        esac
         expect "$f" "ping from client" || ok=1
         case $CASE_FEAT in
             hrr|0rtt-hrr) expect "$f" "received HelloRetryRequest message" || ok=1 ;;
@@ -193,6 +213,14 @@ cmd_verify() {
             resume|0rtt|0rtt-hrr)
                 expect "$f" "Reconnecting with saved session..." || ok=1
                 expect "$f" "ServerHello: pre_shared_key(41) extension exists." || ok=1 ;;
+            resume-psk)
+                expect "$f" "Reconnecting with saved session..." || ok=1
+                expect "$f" "ServerHello: pre_shared_key(41) extension exists." || ok=1
+                # psk_ke: the resumed ServerHello carries no key_share.
+                expect "$f" "Selected key exchange mode: psk" || ok=1 ;;
+            # An external PSK: pre_shared_key in the ServerHello, no ticket
+            # to reconnect with.
+            extpsk) expect "$f" "ServerHello: pre_shared_key(41) extension exists." || ok=1 ;;
             *) refute "$f" "ServerHello: pre_shared_key(41) extension exists." || ok=1 ;;
         esac
         case $CASE_FEAT in

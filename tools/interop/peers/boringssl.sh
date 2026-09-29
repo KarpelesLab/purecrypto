@@ -70,6 +70,10 @@ cmd_supports() {
         # the server has no flag to add it to its CertificateRequest.
         mtls) [ "$CASE_ROLE" = peer-client ] || [ "$CASE_CERT" != ed25519 ] ||
             skip "bssl server has no flag to accept Ed25519 client signatures" ;;
+        # RFC 8446 §4.2.9: BoringSSL only ever does psk_dhe_ke — it never
+        # offers or selects psk_ke (`SSL_OP_ALLOW_NO_DHE_KEX` is not exposed
+        # by the tool and BoringSSL implements no PSK-only key exchange).
+        resume-psk) skip "BoringSSL does not implement PSK-only (psk_ke) key exchange" ;;
     esac
     return 0
 }
@@ -95,6 +99,10 @@ server_args() {
         rpk) a="$a -rpk-key $PKI/$CASE_CERT.key" ;;
         rpk-client) a="$a -require-any-client-cert -accept-cert-types rpk,x509" ;;
         ocsp) a="$a -ocsp-response $OCSP" ;;
+        # An external PSK imported per RFC 9258 (`-psk-hex` runs the
+        # importer, empty context, SHA-256); the certificate stays for a
+        # client that offers no PSK.
+        extpsk) a="$a -psk-hex $PSK_HEX -psk-identity $PSK_IDENTITY" ;;
     esac
     echo "$a"
 }
@@ -124,6 +132,8 @@ client_args() {
         rpk-client) a="$a -rpk-key $PKI/$CASE_CERT.key" ;;
         ocsp) a="$a -ocsp-stapling" ;;
         alpn) a="$a -alpn-protos h2,http/1.1" ;;
+        # An external PSK imported per RFC 9258; no certificate to verify.
+        extpsk) a="client -connect 127.0.0.1:$PORT -server-name localhost -curves $(bssl_group "$CASE_GROUP") -psk-hex $PSK_HEX -psk-identity $PSK_IDENTITY" ;;
     esac
     echo "$a"
 }
@@ -199,7 +209,15 @@ cmd_verify() {
 
 case ${1:-} in
     info) echo "bssl ($BSSL)" ;;
-    quirks) echo no-close-notify ;;
+    quirks)
+        # Space-separated on one line: run.sh's has_quirk matches
+        # space-delimited tokens. BoringSSL's external PSK is the RFC 9258
+        # importer only, so the purecrypto side must import too.
+        if [ "${CASE_FEAT:-}" = extpsk ]; then
+            echo "no-close-notify extpsk-importer"
+        else
+            echo no-close-notify
+        fi ;;
     supports) cmd_supports ;;
     # The server forwards its stdin to the client; for the
     # purecrypto-initiated KeyUpdate the payload waits a second so the

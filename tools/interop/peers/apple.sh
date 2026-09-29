@@ -115,6 +115,11 @@ cmd_supports() {
     case $CASE_FEAT in
         keyupdate-peer) skip "Network.framework has no API to send a KeyUpdate" ;;
         rsl) skip "Apple's TLS stack does not implement RFC 8449 record_size_limit" ;;
+        # Network.framework offers no session resumption or external-PSK
+        # API (the listener issues no ticket a client could resume, and
+        # there is no interface to set a pre-shared key).
+        resume-psk) skip "Network.framework exposes no PSK-only resumption" ;;
+        extpsk) skip "Network.framework has no external-PSK API" ;;
         # With early data enabled through the SPI, the listener's connection
         # accepts the client's 0-RTT (EncryptedExtensions says so) but never
         # becomes ready and ends with errSSLClosedNoNotify — with OpenSSL's

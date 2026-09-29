@@ -150,6 +150,13 @@ cmd_supports() {
         rpk) [ "$CASE_ROLE" = peer-client ] ||
             skip "the wolfSSL example server has no raw-public-key option" ;;
         rpk-client) skip "the wolfSSL examples cannot present a raw client key to an X.509 server" ;;
+        # The example programs' built-in TLS 1.3 PSK (`-s`) is
+        # `Client_identity` with the key the extpsk cases use, so no key
+        # file is needed; `-K` forces psk_ke. The client sends its identity
+        # verbatim only with `--openssl-psk` (otherwise `my_psk_client_cs_cb`
+        # appends the cipher suite), and its `-s` turns certificate
+        # verification off, which is what an external-PSK client wants.
+        resume-psk|extpsk) : ;;
     esac
     if [ "$CASE_ROLE" = peer-client ]; then
         # The client shares X25519 (-t), P-256 (-Y) or a hybrid (--pqc);
@@ -207,6 +214,12 @@ server_args() {
         # Pinned to X25519 while the purecrypto client shares only P-256:
         # HelloRetryRequest on both connections, the early data refused.
         0rtt-hrr) a="$a -r -0" ;;
+        # PSK-only ticket resumption: `-r` for a second (resumed)
+        # connection, `-K` so the resumption uses psk_ke (no (EC)DHE).
+        resume-psk) a="$a -r -K" ;;
+        # An external PSK by the built-in identity/key; `-d` above is kept
+        # so the server does not demand a client certificate.
+        extpsk) a="$a -s" ;;
         keyupdate-peer) a="$a -U" ;;
         rpk) a="$a --rpk" ;;
         alpn) a="$a -L C:h2,http/1.1" ;;
@@ -256,12 +269,22 @@ client_args() {
     case $CASE_FEAT in
         mtls) a="$a $(cert_opts "$CASE_CERT")" ;;
         rpk-client) a="$a $(cert_opts "$CASE_CERT") --rpk" ;;
+        # `-s` (external PSK) turns off the peer-certificate check itself;
+        # `-x` would only add noise.
+        extpsk) ;;
         *) a="$a -x" ;;
     esac
     case $CASE_FEAT in
         resume) a="$a -r" ;;
         0rtt) a="$a -r -0" ;;
         0rtt-hrr) a="$a -r -0" ;;
+        # `-r` reconnects and resumes; `-K` makes the resumed handshake
+        # psk_ke.
+        resume-psk) a="$a -r -K" ;;
+        # `--openssl-psk` sends the identity (`Client_identity`) verbatim,
+        # as the interop key expects; without it the example appends the
+        # cipher suite to the identity.
+        extpsk) a="$a -s --openssl-psk" ;;
         keyupdate-peer) a="$a -I" ;;
         # The example client cannot pin a raw server key: `--rpk` turns its
         # peer check off, so only the purecrypto side (which pins) verifies.
@@ -324,12 +347,15 @@ cmd_verify() {
         # handshake is checked.)
         [ "$CASE_FEAT" = loss ] || expect "$WORK/client.out" "I hear you fa shizzle!" || ok=1
         case $CASE_FEAT in
-            resume|0rtt|0rtt-hrr) expect "$WORK/server.out" "SSL reused session" || ok=1 ;;
+            resume|0rtt|0rtt-hrr|resume-psk) expect "$WORK/server.out" "SSL reused session" || ok=1 ;;
             *) refute "$WORK/server.out" "SSL reused session" || ok=1 ;;
         esac
         case $CASE_FEAT in
             mtls) expect "$WORK/server.out" "subject: /CN=localhost" || ok=1 ;;
             alpn) expect "$WORK/server.out" "Sent ALPN protocol : h2" || ok=1 ;;
+            # The server logs that the peer sent no certificate (a PSK
+            # handshake); the message wolfSSL prints to stderr.
+            extpsk) expect "$WORK/server.err" "peer has no cert!" || ok=1 ;;
         esac
     else
         local f=$WORK/client.out
@@ -337,7 +363,7 @@ cmd_verify() {
         # The greeting came back from the purecrypto echo server.
         [ "$CASE_FEAT" = loss ] || expect "$f" "hello wolfssl!" || ok=1
         case $CASE_FEAT in
-            resume|0rtt|0rtt-hrr) expect "$f" "SSL reused session" || ok=1 ;;
+            resume|0rtt|0rtt-hrr|resume-psk) expect "$f" "SSL reused session" || ok=1 ;;
             *) refute "$f" "SSL reused session" || ok=1 ;;
         esac
         case $CASE_FEAT in

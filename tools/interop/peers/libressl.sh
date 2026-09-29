@@ -115,8 +115,9 @@ cmd_supports() {
         mldsa65) skip "LibreSSL has no ML-DSA" ;;
     esac
     case $CASE_FEAT in
-        resume|0rtt|0rtt-hrr)
+        resume|0rtt|0rtt-hrr|resume-psk)
             skip "LibreSSL's TLS 1.3 has no session resumption (no psk_key_exchange_modes, no NewSessionTicket)" ;;
+        extpsk) skip "LibreSSL's TLS 1.3 has no external PSK support" ;;
         keyupdate-peer) skip "LibreSSL's apps have no way to trigger a KeyUpdate" ;;
         # 3.3's server answers a client-initiated KeyUpdate with records
         # neither side can decrypt (bad_record_mac both ways — the same

@@ -85,6 +85,10 @@ cmd_supports() {
                 skip "SChannel server group preference follows system policy; no pin"
             fi ;;
         keyupdate-peer) skip "SslStream has no KeyUpdate API" ;;
+        # SslStream / SChannel expose no PSK-only resumption or external-PSK
+        # interface.
+        resume-psk) skip "SslStream exposes no PSK-only (psk_ke) resumption" ;;
+        extpsk) skip "SslStream has no external-PSK API" ;;
         certcomp) skip "SChannel does not implement RFC 8879 certificate compression" ;;
         rpk|rpk-client) skip "SChannel does not implement RFC 7250 raw public keys" ;;
         rsl) skip "SChannel does not implement RFC 8449 record_size_limit" ;;

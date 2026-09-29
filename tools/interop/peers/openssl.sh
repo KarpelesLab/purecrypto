@@ -114,6 +114,11 @@ server_args() {
     fi
     case $CASE_FEAT in
         resume) a="$a -naccept 2" ;;
+        # `-allow_no_dhe_kex` lets the server select psk_ke; it does so
+        # only when the client advertises nothing else (the purecrypto
+        # client advertises psk_ke alone in this case).
+        resume-psk) a="$a -naccept 2 -allow_no_dhe_kex" ;;
+        extpsk) a="$a -psk_identity $PSK_IDENTITY -psk $PSK_HEX" ;;
         0rtt) a="$a -naccept 2 -early_data -max_early_data 16384" ;;
         # Pinned to X25519 while the purecrypto client shares only P-256:
         # HelloRetryRequest on both connections, 0-RTT refused. With
@@ -151,11 +156,16 @@ client_args() {
         rpk-client) a="$a -enable_client_rpk -cert $PKI/$CASE_CERT.crt -key $PKI/$CASE_CERT.key" ;;
         ocsp) a="$a -status" ;;
         alpn) a="$a -alpn h2,http/1.1" ;;
+        # The client then advertises both modes; the purecrypto server
+        # prefers psk_ke.
+        resume-psk) a="$a -allow_no_dhe_kex" ;;
+        extpsk) a="$a -psk_identity $PSK_IDENTITY -psk $PSK_HEX" ;;
     esac
     # A raw public key has no chain to validate against -CAfile; OpenSSL
-    # reports the verify error and carries on unless told to abort.
+    # reports the verify error and carries on unless told to abort. A PSK
+    # handshake has no certificate to verify at all.
     case $CASE_FEAT in
-        rpk) ;;
+        rpk|extpsk) ;;
         *) a="$a -verify_return_error" ;;
     esac
     echo "$a"
@@ -187,7 +197,7 @@ run_client() {
 
 cmd_client() {
     case $CASE_FEAT in
-        resume)
+        resume|resume-psk)
             run_client client -sess_out "$WORK/sess.pem"
             run_client client2 -sess_in "$WORK/sess.pem" ;;
         0rtt|0rtt-hrr)
@@ -240,6 +250,9 @@ cmd_verify() {
             mtls)
                 expect_re "$f" "^Peer certificate: CN ?= ?localhost" || ok=1
                 expect "$f" "Verification: OK" || ok=1 ;;
+            # (The brief summary says nothing about the PSK; the client
+            # side shows the handshake was a PSK one.)
+            extpsk) expect "$f" "No peer certificate" || ok=1 ;;
         esac
     else
         local f=$WORK/client.out
@@ -248,10 +261,20 @@ cmd_verify() {
             expect_re "$f" "^New, TLSv1.2, Cipher is (ECDHE|DHE)-" || ok=1
         else
             case $CASE_FEAT in
-                resume|0rtt|0rtt-hrr) expect "$f" "Reused, TLSv1.3, Cipher is $suite" || ok=1 ;;
+                # (A handshake under an external PSK counts as "Reused"
+                # for OpenSSL: no certificate, PSK key schedule.)
+                resume|0rtt|0rtt-hrr|resume-psk|extpsk) expect "$f" "Reused, TLSv1.3, Cipher is $suite" || ok=1 ;;
                 *) expect "$f" "New, TLSv1.3, Cipher is $suite" || ok=1 ;;
             esac
-            expect_re "$f" "$(ossl_group_re "$CASE_GROUP")" || ok=1
+            case $CASE_FEAT in
+                # No key exchange on the resumed connection (its summary
+                # still names the group of the key share it did not use:
+                # `Negotiated TLS1.3 group` reports the client's share);
+                # the first connection's is in client.out, and the
+                # purecrypto side's report is what shows the mode.
+                resume-psk) expect_re "$WORK/client.out" "$(ossl_group_re "$CASE_GROUP")" || ok=1 ;;
+                *) expect_re "$f" "$(ossl_group_re "$CASE_GROUP")" || ok=1 ;;
+            esac
         fi
         expect "$f" "ping from client" || ok=1
         case $CASE_FEAT in
@@ -263,6 +286,7 @@ cmd_verify() {
             alpn) expect "$f" "ALPN protocol: h2" || ok=1 ;;
             ocsp) expect "$f" "OCSP Response Status: successful" || ok=1 ;;
             rpk) expect "$f" "Server raw public key" || ok=1 ;;
+            extpsk) expect "$f" "no peer certificate available" || ok=1 ;;
         esac
     fi
     return $ok

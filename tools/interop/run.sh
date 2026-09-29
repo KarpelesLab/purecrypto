@@ -103,7 +103,7 @@ GROUPS_ALL="x25519 p256 p384 p521 x25519mlkem768 secp256r1mlkem768"
 SUITES="aes128gcm aes256gcm chacha20"
 # Features beyond the plain handshake, run with cert=p256 group=x25519
 # suite=aes128gcm unless the feature says otherwise.
-FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp rpk rpk-client ocsp alpn rsl large-chain tls12"
+FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp rpk rpk-client ocsp alpn rsl large-chain tls12 extpsk"
 # The DTLS matrix (per DTLS version the adapter's `protos` lists): the plain
 # product, then one case per feature. Features TLS has no counterpart for:
 # `mtu` (a > 16 KiB chain sent at a 512-byte path MTU: dozens of handshake
@@ -246,6 +246,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The external PSK of the `extpsk` cases (RFC 8446 §4.2.11), the same on
+# both sides: the identity and key wolfSSL's example programs have built in
+# (`Client_identity`, the bytes 01 23 45 67 89 ab cd ef repeated), so the
+# one pair serves every peer. A test constant, of course — see
+# docs/recommended-usage.md for what a real one must be.
+PSK_IDENTITY=Client_identity
+PSK_HEX=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+export PSK_IDENTITY PSK_HEX
+
 # Certificates and keys, generated with the purecrypto CLI. One CA, one
 # leaf per key kind (all for `localhost`; the same files double as client
 # identities under mTLS), an oversized chain (> 16 KiB, so the Certificate
@@ -383,7 +392,6 @@ pc_supports() {
         skip "purecrypto does not implement group $CASE_GROUP"
     fi
     case $CASE_FEAT in
-        resume-psk) skip "purecrypto resumes with psk_dhe_ke only (no PSK-only mode)" ;;
         ocsp) [ -n "$OCSP" ] || skip "no openssl to generate an OCSP response" ;;
     esac
     if is_dtls; then
@@ -442,6 +450,15 @@ pc_client_args() {
     fi
     case $CASE_FEAT in
         resume) a="$a -reconnect" ;;
+        # PSK-only resumption: the client advertises `psk_ke` alone, so a
+        # peer that allows the mode selects it rather than psk_dhe_ke.
+        resume-psk) a="$a -reconnect -psk_modes psk_ke" ;;
+        extpsk)
+            a="$a -psk_identity $PSK_IDENTITY -psk $PSK_HEX"
+            # A peer that only speaks the RFC 9258 importer (BoringSSL)
+            # needs the derived key + `ImportedIdentity`; others take the
+            # PSK as provisioned.
+            has_quirk extpsk-importer && a="$a -psk_import" ;;
         0rtt) a="$a -reconnect -early_data $PKI/early.txt" ;;
         # Share only another group: the peer pins x25519, so both the full
         # and the resumed handshake take a HelloRetryRequest, which must
@@ -482,6 +499,11 @@ pc_server_args() {
     fi
     case $CASE_FEAT in
         resume) a="$a -naccept 2" ;;
+        # The server prefers `psk_ke` when the peer's client advertises it.
+        resume-psk) a="$a -naccept 2 -psk_modes psk_ke:psk_dhe_ke" ;;
+        extpsk)
+            a="$a -psk_identity $PSK_IDENTITY -psk $PSK_HEX"
+            has_quirk extpsk-importer && a="$a -psk_import" ;;
         0rtt) a="$a -naccept 2 -early_data" ;;
         # The peer shares only secp256r1; pinning x25519 forces the
         # HelloRetryRequest on both connections.
@@ -529,8 +551,29 @@ pc_verify() {
         *) refute "$f" "HelloRetryRequest: yes" || ok=1 ;;
     esac
     case $CASE_FEAT in
-        resume|0rtt|0rtt-hrr) expect "$f" "resumed: yes" || ok=1 ;;
+        resume|0rtt|0rtt-hrr|resume-psk) expect "$f" "resumed: yes" || ok=1 ;;
         *) refute "$f" "resumed: yes" || ok=1 ;;
+    esac
+    # The PSK key-exchange mode (RFC 8446 §4.2.9): the resumed connection
+    # of `resume-psk` did no (EC)DHE at all (the group line above is the
+    # first connection's), every other PSK handshake mixed one in.
+    case $CASE_FEAT in
+        resume-psk)
+            expect "$f" "PSK mode: psk_ke" || ok=1
+            expect "$f" "key exchange: none" || ok=1 ;;
+        resume|0rtt|0rtt-hrr|extpsk) expect "$f" "PSK mode: psk_dhe_ke" || ok=1 ;;
+        *) refute "$f" "PSK mode: psk_" || ok=1 ;;
+    esac
+    case $CASE_FEAT in
+        # A handshake under an external PSK carries no certificate and
+        # names the identity (the bare one, or — for the RFC 9258 importer
+        # BoringSSL uses — the `ImportedIdentity` structure that wraps it,
+        # so match the presence of an identity, not its exact bytes; the
+        # peer adapter checks the identity from its own side).
+        extpsk)
+            refute "$f" "external PSK: none" || ok=1
+            expect "$f" "peer certificate: none" || ok=1 ;;
+        *) refute "$f" "external PSK: $PSK_IDENTITY" || ok=1 ;;
     esac
     case $CASE_FEAT in
         0rtt) expect "$f" "early data: accepted" || ok=1 ;;
