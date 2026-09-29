@@ -2831,3 +2831,124 @@ fn cert_analyze_reports_dn_email_address() {
     );
     unsafe { x509::pc_cert_free(cert) };
 }
+
+/// Mutual authentication over both DTLS versions through the C ABI: the
+/// server's `pc_tls_cfg_set_client_auth` (refused on DTLS before the DTLS
+/// engines requested client certificates) and the client's
+/// `pc_tls_cfg_set_certificate` complete a handshake; the same server
+/// facing an anonymous client does not.
+#[test]
+fn dtls_mutual_authentication() {
+    use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+    // A self-signed client identity that is its own trust anchor (a CA).
+    let mut rng =
+        crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"ffi-dtls-mtls-client", b"nonce", &[]);
+    let ckey = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let ccert = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&ckey),
+        &DistinguishedName::common_name("client.example"),
+        &Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2044, 1, 1, 0, 0, 0),
+        ),
+        1,
+        true,
+        &["client.example"],
+    )
+    .unwrap();
+    let (ccert_pem, ckey_pem) = (ccert.to_pem(), ckey.to_sec1_pem());
+    let (server_pem, _) = loopback_identity();
+
+    for version in [0xFEFD_u32 as i32, 0xFEFC_u32 as i32] {
+        for present in [true, false] {
+            let scfg = dtls_server_cfg(version);
+            unsafe {
+                assert_eq!(tls::pc_dtls_cfg_set_no_cookie(scfg), PcStatus::Ok);
+                assert_eq!(
+                    tls::pc_tls_cfg_set_client_auth(scfg, 1, ccert_pem.as_ptr(), ccert_pem.len()),
+                    PcStatus::Ok
+                );
+                assert_eq!(tls::pc_tls_cfg_validate(scfg), PcStatus::Ok);
+            }
+            let server = unsafe { tls::pc_tls_new(scfg) };
+            unsafe { tls::pc_tls_cfg_free(scfg) };
+            assert!(!server.is_null());
+
+            let ccfg = tls::pc_tls_cfg_new(0 /* client */, version);
+            unsafe {
+                assert_eq!(
+                    tls::pc_tls_cfg_add_root_pem(ccfg, server_pem.as_ptr(), server_pem.len()),
+                    PcStatus::Ok
+                );
+                let sni = b"loopback.example\0";
+                assert_eq!(
+                    tls::pc_tls_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char),
+                    PcStatus::Ok
+                );
+                if present {
+                    assert_eq!(
+                        tls::pc_tls_cfg_set_certificate(
+                            ccfg,
+                            ccert_pem.as_ptr(),
+                            ccert_pem.len(),
+                            ckey_pem.as_ptr(),
+                            ckey_pem.len(),
+                        ),
+                        PcStatus::Ok
+                    );
+                }
+            }
+            let client = unsafe { tls::pc_tls_new(ccfg) };
+            unsafe { tls::pc_tls_cfg_free(ccfg) };
+            assert!(!client.is_null());
+
+            let mut server_status = PcStatus::WantRead;
+            for _ in 0..24 {
+                unsafe {
+                    let _ = tls::pc_tls_handshake(client);
+                    pump_wire_lenient(client, server);
+                    server_status = tls::pc_tls_handshake(server);
+                    pump_wire_lenient(server, client);
+                }
+                if server_status == PcStatus::Ok {
+                    break;
+                }
+            }
+            if present {
+                assert_eq!(server_status, PcStatus::Ok, "{version:#x}");
+            } else {
+                assert_ne!(
+                    server_status,
+                    PcStatus::Ok,
+                    "{version:#x}: anonymous client admitted"
+                );
+            }
+            unsafe {
+                tls::pc_tls_free(client);
+                tls::pc_tls_free(server);
+            }
+        }
+    }
+}
+
+/// [`pump_wire`] that tolerates a refused datagram (the receiving engine
+/// failing the handshake): the rest of the queue is dropped.
+unsafe fn pump_wire_lenient(from: *mut tls::PcTls, to: *mut tls::PcTls) {
+    loop {
+        let mut len = 0usize;
+        let st = unsafe { tls::pc_tls_pop(from, core::ptr::null_mut(), &mut len) };
+        if st != PcStatus::BufferTooSmall || len == 0 {
+            break;
+        }
+        let mut buf = vec![0u8; len];
+        let mut cap = len;
+        if unsafe { tls::pc_tls_pop(from, buf.as_mut_ptr(), &mut cap) } != PcStatus::Ok {
+            break;
+        }
+        let mut consumed = 0usize;
+        if unsafe { tls::pc_tls_feed(to, buf.as_ptr(), cap, &mut consumed) } != PcStatus::Ok {
+            break;
+        }
+    }
+}

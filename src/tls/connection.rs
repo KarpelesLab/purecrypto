@@ -871,6 +871,8 @@ impl Connection {
             Engine::ServerDtls13(c) => c.pending_signature(),
             #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.pending_signature(),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.pending_signature(),
             Engine::ServerTlsAuto(c) => c.pending_signature(),
             Engine::ClientTlsAuto(c) => c.pending_signature(),
             _ => None,
@@ -892,6 +894,8 @@ impl Connection {
             Engine::ServerDtls13(c) => c.provide_signature(signature),
             #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.provide_signature(signature),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.provide_signature(signature),
             Engine::ServerTlsAuto(c) => c.provide_signature(signature),
             Engine::ClientTlsAuto(c) => c.provide_signature(signature),
             _ => Err(Error::InappropriateState),
@@ -1338,10 +1342,10 @@ impl Connection {
             Engine::ClientDtls13(c) => c.peer_certificates(),
             #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.peer_certificates(),
-            // Reachable only when `dtls` is enabled (catches the DTLS variants
-            // not handled above); exhaustive over the TLS variants otherwise.
-            #[cfg_attr(not(feature = "dtls"), allow(unreachable_patterns))]
-            _ => &[],
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.peer_certificates(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls12(c) => c.peer_certificates(),
         }
     }
 
@@ -2624,6 +2628,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
 #[cfg(feature = "dtls")]
 struct DtlsClientOpts<'a> {
     roots: &'a super::pki::RootCertStore,
+    identity: Option<&'a super::config::Identity>,
     server_name: &'a str,
     verify_certificates: bool,
     crls: &'a super::pki::CrlStore,
@@ -2642,12 +2647,12 @@ struct DtlsClientOpts<'a> {
 /// Takes `cfg` apart for a DTLS client and refuses, with
 /// [`Error::InappropriateState`], any option the DTLS engines cannot honour
 /// where ignoring it would weaken what the caller asked for: ECH (the server
-/// name would go out in the clear), a client identity (the client would
-/// connect anonymously — the DTLS engines never send a `Certificate`), a
-/// `record_size_limit` (RFC 8449 is not implemented over DTLS), and RFC 7250
-/// raw public keys (a pinned raw key with `verify_certificates` off would
-/// leave the peer entirely unauthenticated). This mirrors the fail-closed
-/// posture of the cookie and client-auth checks in the server builders.
+/// name would go out in the clear), a `record_size_limit` (RFC 8449 is not
+/// implemented over DTLS), and RFC 7250 raw public keys (a pinned raw key
+/// with `verify_certificates` off would leave the peer entirely
+/// unauthenticated). This mirrors the fail-closed posture of the cookie
+/// check in the server builders. A client identity is presented when the
+/// server asks for one, as over TLS.
 #[cfg(feature = "dtls")]
 fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     let parts = cfg.parts();
@@ -2694,13 +2699,12 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     } = parts.dtls;
     // Inert on a DTLS client: the version pair chose the engine; the cookie
     // knobs and the peer address are server-side; `rng` is drawn through
-    // `config_rng` and `signer` through `Connection::drive` (a signer without
-    // an identity is impossible — `ConfigBuilder::private_key` sets both, and
-    // an identity is refused below); a stored session is always a TLS one
-    // (the DTLS servers issue no tickets), so `resumption` never matches —
-    // the documented "wrong version is ignored" rule. RFC 8879 certificate
-    // compression is not implemented over DTLS: the advertisement is not
-    // sent, and the peer's certificate arrives uncompressed.
+    // `config_rng` and `signer` through `Connection::drive`; a stored session
+    // is always a TLS one (the DTLS servers issue no tickets), so
+    // `resumption` never matches — the documented "wrong version is ignored"
+    // rule. RFC 8879 certificate compression is not implemented over DTLS:
+    // the advertisement is not sent, and the peer's certificate arrives
+    // uncompressed.
     // The DTLS engines offer no PSK, so there is no mode to restrict.
     let _ = (
         min_version,
@@ -2728,7 +2732,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     if !external_psks.is_empty() {
         return Err(Error::InappropriateState);
     }
-    if identity.is_some() || record_size_limit.is_some() {
+    if record_size_limit.is_some() {
         return Err(Error::InappropriateState);
     }
     if server_cert_type_preference != [0]
@@ -2742,6 +2746,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     let connection_id = resolve_connection_id(cfg, connection_id)?;
     Ok(DtlsClientOpts {
         roots,
+        identity,
         server_name,
         verify_certificates,
         crls,
@@ -2851,6 +2856,7 @@ fn restrict_dtls_cipher_suites(
 fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection12, Error> {
     let DtlsClientOpts {
         roots,
+        identity,
         server_name,
         verify_certificates,
         crls,
@@ -2872,6 +2878,18 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     let mut dc = crate::dtls::ClientConfig12Internal::new(roots.clone_store(), server_name)
         .with_require_ems(require_extended_master_secret)
         .with_alpn(alpn_protocols.to_vec());
+    if let Some(id) = identity {
+        // The DTLS 1.2 client signs its `CertificateVerify` in-process, like
+        // the TLS 1.2 client: an external signer is refused up front rather
+        // than left to fail the handshake when the server asks for the
+        // certificate.
+        if matches!(id.key, super::config::SigningKey::External { .. }) {
+            return Err(Error::InappropriateState);
+        }
+        if let Some(cc) = client_cert_from_signing(id) {
+            dc = dc.with_client_cert(cc);
+        }
+    }
     if !verify_certificates {
         dc = dc.without_certificate_verification();
     }
@@ -2897,6 +2915,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
 fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection13, Error> {
     let DtlsClientOpts {
         roots,
+        identity,
         server_name,
         verify_certificates,
         crls,
@@ -2916,6 +2935,9 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     let _ = require_extended_master_secret;
 
     let mut dc = crate::dtls::ClientConfig13Internal::new(roots.clone_store(), server_name);
+    if let Some(cc) = identity.and_then(client_cert_from_signing) {
+        dc = dc.with_client_cert(cc);
+    }
     if !verify_certificates {
         dc = dc.without_certificate_verification();
     }
@@ -2950,6 +2972,9 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
 #[cfg(feature = "dtls")]
 struct DtlsServerOpts<'a> {
     identity: &'a super::config::Identity,
+    client_auth: Option<&'a super::config::ClientAuth>,
+    crls: &'a super::pki::CrlStore,
+    verification_time: Option<&'a crate::x509::Time>,
     cookie_secret: Option<&'a super::secret::Secret32>,
     previous_cookie_secret: Option<&'a super::secret::Secret32>,
     require_cookie: bool,
@@ -2971,9 +2996,6 @@ struct DtlsServerOpts<'a> {
 ///   cookie exchange defeats blind amplification attacks; silently disabling
 ///   it under a misconfiguration is the 50-100x DoS amplification vector, so
 ///   the operator must make a deliberate choice (`ConfigBuilder::no_cookie`);
-/// * `client_auth` — [`Error::UnsupportedVersion`]. The DTLS servers never
-///   emit a `CertificateRequest`, so access control would fail OPEN,
-///   admitting every anonymous client;
 /// * ECH, a `record_size_limit`, or RFC 7250 raw public keys /
 ///   certificate-type preferences — [`Error::InappropriateState`], as in
 ///   [`dtls_client_opts`].
@@ -3026,11 +3048,11 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         connection_id,
     } = parts.dtls;
     // Inert on a DTLS server (see the `Config` docs): the version pair chose
-    // the engine; `roots` / `crls` / `verification_time` only serve mTLS,
-    // which is refused below; the DTLS servers issue no session tickets,
-    // accept no 0-RTT (so `max_early_data_size` and the replay window have
-    // nothing to guard), staple nothing, do not compress certificates, take
-    // no `preferred_key_exchange_group` (`key_exchange_groups` orders the
+    // the engine; a server's trust anchors for mTLS come from `client_auth`,
+    // not `roots`; the DTLS servers issue no session tickets, accept no
+    // 0-RTT (so `max_early_data_size` and the replay window have nothing to
+    // guard), staple nothing, do not compress certificates, take no
+    // `preferred_key_exchange_group` (`key_exchange_groups` orders the
     // accept-set instead) and pick the cipher suite from their own fixed
     // order. `rng` is drawn through `config_rng` and `signer` through
     // `Connection::drive`.
@@ -3039,8 +3061,6 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         max_version,
         cipher_suites,
         roots,
-        crls,
-        verification_time,
         stapled_crl,
         stapled_ocsp_response,
         ticket_key,
@@ -3069,9 +3089,6 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     if require_cookie && cookie_secret.is_none() {
         return Err(Error::InappropriateState);
     }
-    if client_auth.is_some() {
-        return Err(Error::UnsupportedVersion);
-    }
     if record_size_limit.is_some()
         || server_cert_type_preference != [0]
         || client_cert_type_preference != [0]
@@ -3083,6 +3100,9 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     let connection_id = resolve_connection_id(cfg, connection_id)?;
     Ok(DtlsServerOpts {
         identity,
+        client_auth,
+        crls,
+        verification_time,
         cookie_secret,
         previous_cookie_secret,
         require_cookie,
@@ -3103,6 +3123,9 @@ fn build_dtls12_server(
 ) -> Result<crate::dtls::DtlsServerConnection12<ConfigRng>, Error> {
     let DtlsServerOpts {
         identity,
+        client_auth,
+        crls,
+        verification_time,
         cookie_secret,
         previous_cookie_secret,
         require_cookie,
@@ -3115,10 +3138,8 @@ fn build_dtls12_server(
         key_exchange_groups,
         connection_id,
     } = dtls_server_opts(cfg)?;
-    // The DTLS 1.2 server verifies no client certificate (so the signature
-    // policy has nothing to govern) and fragments at a fixed 1100 bytes; see
-    // the `Config` docs.
-    let _ = (signature_policy, max_record_size);
+    // DTLS 1.2 fragments at a fixed 1100 bytes; see the `Config` docs.
+    let _ = max_record_size;
 
     let chain = identity.cert_chain.clone();
     let mut sc = match &identity.key {
@@ -3148,6 +3169,14 @@ fn build_dtls12_server(
     sc = sc.with_alpn(alpn_protocols.to_vec());
     let groups = restrict_dtls_groups(&sc.groups, key_exchange_groups)?;
     sc = sc.with_groups(groups);
+    sc = sc.with_signature_policy(signature_policy.clone());
+    if let Some(ca) = client_auth {
+        sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
+    }
+    if !crls.is_empty() {
+        sc.crls = crls.clone_store();
+    }
+    sc.verification_time = verification_time.cloned();
     sc.key_log = key_log.clone();
     sc = sc.with_connection_id(connection_id);
     Ok(crate::dtls::DtlsServerConnection12::new(
@@ -3163,6 +3192,9 @@ fn build_dtls13_server(
 ) -> Result<crate::dtls::DtlsServerConnection13<ConfigRng>, Error> {
     let DtlsServerOpts {
         identity,
+        client_auth,
+        crls,
+        verification_time,
         cookie_secret,
         previous_cookie_secret,
         require_cookie,
@@ -3175,10 +3207,8 @@ fn build_dtls13_server(
         key_exchange_groups,
         connection_id,
     } = dtls_server_opts(cfg)?;
-    // The DTLS 1.3 server verifies no client certificate (so the signature
-    // policy has nothing to govern) and EMS is a TLS 1.2 mechanism; see the
-    // `Config` docs.
-    let _ = (signature_policy, require_extended_master_secret);
+    // EMS is a TLS 1.2 mechanism; see the `Config` docs.
+    let _ = require_extended_master_secret;
 
     let chain = identity.cert_chain.clone();
     let server_key = identity.key.to_server_key_13();
@@ -3195,6 +3225,14 @@ fn build_dtls13_server(
     sc.max_record_size = max_record_size;
     sc.alpn_protocols = alpn_protocols.to_vec();
     sc.groups = restrict_dtls_groups(&sc.groups, key_exchange_groups)?;
+    sc.signature_policy = alloc::sync::Arc::new(signature_policy.clone());
+    if let Some(ca) = client_auth {
+        sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
+    }
+    if !crls.is_empty() {
+        sc.crls = crls.clone_store();
+    }
+    sc.verification_time = verification_time.cloned();
     sc.key_log = key_log.clone();
     sc.connection_id = connection_id;
     Ok(crate::dtls::DtlsServerConnection13::new(
@@ -4961,37 +4999,182 @@ mod tests {
         assert!(Connection::server(&cfg).is_ok());
     }
 
-    /// The DTLS engines never emit a `CertificateRequest`, so a `client_auth`
-    /// configuration on a DTLS server would be silently ignored — access
-    /// control failing open. Construction must fail closed instead.
+    /// Mutual authentication over both DTLS versions through the unified
+    /// `Config` / `Connection` API: `client_auth` on the server puts a
+    /// `CertificateRequest` in its flight, the client's `identity` answers
+    /// it, and both sides report the peer's chain. A client without an
+    /// identity is refused when the certificate is required (the server
+    /// fails its handshake with `certificate_required`) and admitted
+    /// anonymously when it is optional.
     // Exercises the DTLS engine paths.
     #[cfg(feature = "dtls")]
     #[test]
-    fn dtls_server_refuses_client_auth() {
+    fn dtls_mutual_authentication_through_connection() {
+        let (client_key, client_leaf) = ecdsa_identity(b"dtls-mtls-client", "client.example");
         for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
-            let mut cfg = dtls_server_cfg_without_cookie_secret(version);
-            cfg.require_cookie = false;
-            // Sanity: without client auth the same config builds.
-            assert!(Connection::server(&cfg).is_ok());
+            let mut roots = RootCertStore::new();
+            roots.add_der(client_leaf.clone()).unwrap();
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            server_cfg.verification_time = Some(Time::utc(2026, 6, 1, 0, 0, 0));
+            let server_leaf = server_cfg.identity.as_ref().unwrap().cert_chain[0].clone();
 
-            cfg.client_auth = Some(super::super::config::ClientAuth {
-                roots: RootCertStore::new(),
-                required: true,
-            });
-            match Connection::server(&cfg) {
-                Err(Error::UnsupportedVersion) => {}
-                Err(e) => panic!("expected UnsupportedVersion, got {e:?}"),
-                Ok(_) => panic!("{version:?} server must refuse a client_auth config"),
+            // Required, and presented.
+            server_cfg.client_auth = Some(super::super::config::ClientAuth::new(
+                roots.clone_store(),
+                true,
+            ));
+            let client_cfg = dtls_client_builder(version)
+                .identity(
+                    alloc::vec![client_leaf.clone()],
+                    super::super::config::SigningKey::Ecdsa(client_key.clone()),
+                )
+                .build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert_eq!(
+                server.peer_certificates(),
+                core::slice::from_ref(&client_leaf),
+                "{version:?}"
+            );
+            assert_eq!(
+                client.peer_certificates(),
+                core::slice::from_ref(&server_leaf),
+                "{version:?}"
+            );
+
+            // Required, and absent: the server refuses the empty
+            // Certificate. On DTLS 1.3 it arrives authenticated and the
+            // refusal is fatal (`certificate_required`); on DTLS 1.2 it is
+            // plaintext, spoofable input, so the refusal is a silent drop
+            // (a forged empty Certificate must not be a one-datagram kill)
+            // and the handshake simply never completes.
+            let anon_cfg = dtls_client_builder(version).build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&anon_cfg).unwrap();
+            let mut refused = false;
+            'outer: for _ in 0..16 {
+                loop {
+                    let out = client.pop().unwrap();
+                    if out.is_empty() {
+                        break;
+                    }
+                    match server.feed(&out) {
+                        Ok(_) => {}
+                        Err(Error::CertificateRequired) => {
+                            refused = true;
+                            break 'outer;
+                        }
+                        Err(e) => panic!("{version:?}: unexpected server error {e:?}"),
+                    }
+                }
+                loop {
+                    let out = server.pop().unwrap();
+                    if out.is_empty() {
+                        break;
+                    }
+                    let _ = client.feed(&out);
+                }
             }
+            assert_eq!(
+                refused,
+                version == ProtocolVersion::DTLSv1_3,
+                "{version:?}: an anonymous client must be refused"
+            );
+            assert!(!server.is_handshake_complete(), "{version:?}");
 
-            // Even the non-`required` (request-only) form is refused: we
-            // cannot request anything.
-            cfg.client_auth = Some(super::super::config::ClientAuth {
-                roots: RootCertStore::new(),
-                required: false,
-            });
-            assert!(Connection::server(&cfg).is_err());
+            // Optional, and absent: admitted, with no peer chain.
+            server_cfg.client_auth = Some(super::super::config::ClientAuth::new(
+                roots.clone_store(),
+                false,
+            ));
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&anon_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert!(server.peer_certificates().is_empty(), "{version:?}");
+
+            // Optional, and presented: verified all the same.
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert_eq!(
+                server.peer_certificates(),
+                core::slice::from_ref(&client_leaf),
+                "{version:?}"
+            );
         }
+    }
+
+    /// A client identity signed out of process ([`SigningKey::External`])
+    /// is served by the DTLS 1.3 client through the same
+    /// `signature_request` / `provide_signature` pair as over TLS 1.3, and
+    /// refused at construction by the DTLS 1.2 client, which — like the TLS
+    /// 1.2 client — signs its `CertificateVerify` in-process only.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_client_external_identity() {
+        let (client_key, client_leaf) = ecdsa_identity(b"dtls-mtls-ext", "client.example");
+        let mut roots = RootCertStore::new();
+        roots.add_der(client_leaf.clone()).unwrap();
+        let external = |version| {
+            dtls_client_builder(version)
+                .identity(
+                    alloc::vec![client_leaf.clone()],
+                    super::super::config::SigningKey::External {
+                        schemes: alloc::vec![
+                            super::super::codec::SignatureScheme::ECDSA_SECP256R1_SHA256.0
+                        ],
+                    },
+                )
+                .build()
+        };
+        assert!(matches!(
+            Connection::client(&external(ProtocolVersion::DTLSv1_2)),
+            Err(Error::InappropriateState)
+        ));
+
+        let mut server_cfg = dtls_server_cfg_without_cookie_secret(ProtocolVersion::DTLSv1_3);
+        server_cfg.require_cookie = false;
+        server_cfg.verification_time = Some(Time::utc(2026, 6, 1, 0, 0, 0));
+        server_cfg.client_auth = Some(super::super::config::ClientAuth::new(roots, true));
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&external(ProtocolVersion::DTLSv1_3)).unwrap();
+        let mut signed = false;
+        for _ in 0..64 {
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            loop {
+                let out = server.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                client.feed(&out).unwrap();
+            }
+            if let Some(req) = client.signature_request() {
+                assert_eq!(
+                    req.scheme,
+                    super::super::codec::SignatureScheme::ECDSA_SECP256R1_SHA256.0
+                );
+                let sig = client_key
+                    .sign::<Sha256>(&req.message)
+                    .unwrap()
+                    .to_der(CurveId::P256);
+                client.provide_signature(sig).unwrap();
+                signed = true;
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(signed, "the external signer must have been asked");
+        assert!(server.is_handshake_complete());
+        assert_eq!(server.peer_certificates(), &[client_leaf]);
     }
 
     /// Pump two DTLS [`Connection`]s (one datagram per `pop`) until both
@@ -5359,8 +5542,7 @@ mod tests {
 
     /// `Config` options the DTLS engines cannot honour, and whose silent
     /// loss would weaken what the caller asked for, are refused at
-    /// construction with `InappropriateState` instead of being dropped:
-    /// a client identity (the DTLS engines never send a `Certificate`), a
+    /// construction with `InappropriateState` instead of being dropped: a
     /// `record_size_limit` (RFC 8449 is not implemented over DTLS), and RFC
     /// 7250 raw public keys / certificate-type preferences on either side.
     #[cfg(feature = "dtls")]
@@ -5369,7 +5551,6 @@ mod tests {
         type ClientTweak<'a> =
             Box<dyn Fn(super::super::ConfigBuilder) -> super::super::ConfigBuilder + 'a>;
         type ServerTweak = Box<dyn Fn(&mut Config)>;
-        let (key, leaf) = ecdsa_identity(b"dtls-unsupported", "client.example");
         for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
             // Control: the plain client and server configs build.
             assert!(Connection::client(&dtls_client_builder(version).build()).is_ok());
@@ -5377,13 +5558,7 @@ mod tests {
             server_cfg.require_cookie = false;
             assert!(Connection::server(&server_cfg).is_ok());
 
-            let client_variants: [ClientTweak<'_>; 5] = [
-                Box::new(|b| {
-                    b.identity(
-                        alloc::vec![leaf.clone()],
-                        super::super::config::SigningKey::Ecdsa(key.clone()),
-                    )
-                }),
+            let client_variants: [ClientTweak<'_>; 4] = [
                 Box::new(|b| b.record_size_limit(1000)),
                 Box::new(|b| b.server_cert_type_preference(alloc::vec![2, 0])),
                 Box::new(|b| b.add_expected_raw_public_key(alloc::vec![0x30, 0x00])),

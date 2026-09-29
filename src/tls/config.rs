@@ -805,9 +805,9 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `rng`, `roots`, `crls`, `verification_time`, `signature_policy`, `key_log` | yes | yes | yes | yes | yes |
 /// | `server_name`, `verify_certificates` | yes | yes | yes | yes | yes |
 /// | `identity` / `try_identity` (server) | yes | RSA, ECDSA | yes | RSA, ECDSA, External | yes, not External |
-/// | `identity` (client, mTLS) | yes | yes | **refused** | **refused** | yes |
-/// | `private_key` / `try_private_key` ([`HandshakeSigner`](super::HandshakeSigner)) | yes | no ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes | yes | **refused** |
-/// | `client_auth` | yes | yes | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | **refused** ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes |
+/// | `identity` (client, mTLS) | yes | yes | yes | yes, not External | yes |
+/// | `private_key` / `try_private_key` ([`HandshakeSigner`](super::HandshakeSigner)) | yes | no ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes | server only (a client's is **refused**) | **refused** |
+/// | `client_auth` | yes | yes | yes | yes | yes |
 /// | `alpn` | yes | yes | yes | yes | yes (required) |
 /// | `cipher_suites` (client) | yes | yes | yes | yes | yes (GCM / ChaCha20 only: RFC 9001 §5.3) |
 /// | `key_shares` (client) | yes | inert | yes | inert | yes |

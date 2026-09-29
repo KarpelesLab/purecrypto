@@ -208,19 +208,7 @@ impl PcTlsCfg {
         {
             return PcStatus::BadConfig;
         }
-        // A DTLS server cannot request client certificates (no
-        // `CertificateRequest` is ever emitted), so a `client_auth` setting
-        // would be silently ignored and access control would fail OPEN.
-        // Refuse the configuration instead of admitting anonymous clients.
-        if self.role == Role::Server && self.version.is_dtls() && self.client_auth_configured() {
-            return PcStatus::Unsupported;
-        }
         PcStatus::Ok
-    }
-
-    /// Whether `pc_tls_cfg_set_client_auth` was applied to this config.
-    fn client_auth_configured(&self) -> bool {
-        !self.client_auth_roots_pem.is_empty() || self.client_auth_required
     }
 
     // The three `build_*` helpers re-parse PEM strings that were already
@@ -574,11 +562,8 @@ pub unsafe extern "C" fn pc_tls_cfg_set_verify_certificates(
 
 /// Server-side: require client authentication (mTLS) under the supplied root
 /// store (PEM). `required` mirrors the library's bool: when true a connecting
-/// client MUST present a chain we can verify.
-///
-/// Returns [`PcStatus::Unsupported`] on a DTLS server configuration: the DTLS
-/// engines never send a `CertificateRequest`, so accepting the setting would
-/// silently fail open.
+/// client MUST present a chain we can verify. Honoured by the TLS and the
+/// DTLS servers alike.
 ///
 /// # Safety
 /// All pointers valid.
@@ -592,13 +577,6 @@ pub unsafe extern "C" fn pc_tls_cfg_set_client_auth(
     guard(|| {
         if cfg.is_null() {
             return PcStatus::NullPointer;
-        }
-        {
-            let cfg_ref = unsafe { &*cfg };
-            // Fail closed up front: a DTLS server can never honour this.
-            if cfg_ref.role == Role::Server && cfg_ref.version.is_dtls() {
-                return PcStatus::Unsupported;
-            }
         }
         let Some(rp) = (unsafe { slice(roots_pem, roots_pem_len) }) else {
             return PcStatus::NullPointer;
@@ -2020,28 +1998,24 @@ BBBB
         assert_eq!(consumed, 0);
     }
 
-    /// DTLS servers never send a `CertificateRequest`: client auth on a DTLS
-    /// server config must be refused (fail closed), never silently ignored.
+    /// Client auth is honoured on DTLS servers as on TLS ones: the setter
+    /// no longer refuses a DTLS server configuration up front (it reaches
+    /// the PEM handling, which rejects the empty input for its own
+    /// reasons), and a configuration carrying client-auth state validates.
+    /// The end-to-end handshake is `ffi::tests::dtls_mutual_authentication`.
     #[test]
-    fn dtls_server_client_auth_is_refused() {
+    fn dtls_server_client_auth_is_accepted() {
         for version in [Version::Dtls12, Version::Dtls13] {
             let cfg = pc_tls_cfg_new(Role::Server as i32, version as i32);
             assert!(!cfg.is_null());
-            // Rejected at the setter, before the PEM is even looked at.
             let st = unsafe { pc_tls_cfg_set_client_auth(cfg, 1, core::ptr::null(), 0) };
-            assert_eq!(st, PcStatus::Unsupported);
-
-            // Defence in depth: a config that somehow carries client-auth
-            // state is rejected by validation and by `pc_tls_new`.
+            assert_ne!(st, PcStatus::Unsupported);
             {
                 let c = unsafe { &mut *cfg };
                 c.no_cookie = true;
-                assert_eq!(c.validate(), PcStatus::Ok);
                 c.client_auth_required = true;
-                assert_eq!(c.validate(), PcStatus::Unsupported);
+                assert_eq!(c.validate(), PcStatus::Ok);
             }
-            assert_eq!(unsafe { pc_tls_cfg_validate(cfg) }, PcStatus::Unsupported);
-            assert!(unsafe { pc_tls_new(cfg) }.is_null());
             unsafe { pc_tls_cfg_free(cfg) };
         }
 
