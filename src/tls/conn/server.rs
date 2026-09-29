@@ -3942,6 +3942,11 @@ impl<R: RngCore> ServerConnection<R> {
     /// whose CA signed that client — a cross-listener authentication bypass.
     /// Tickets in the pre-binding format likewise fail to open (never fail
     /// open) and fall back to a full handshake.
+    ///
+    /// In QUIC mode the key is further bound to the QUIC layer's
+    /// [`QuicHooks::session_context`] — the QUIC version of the connection
+    /// (RFC 9369 §5) — so a ticket from a connection of one version does
+    /// not open on one of another.
     fn ticket_seal_key(&self) -> Option<[u8; 32]> {
         let key = self.config.ticket_key.as_ref()?;
         let mut mac = Hmac::<Sha256>::new(key);
@@ -3957,6 +3962,11 @@ impl<R: RngCore> ServerConnection<R> {
                     mac.update(spki);
                 }
             }
+        }
+        if let Some(hooks) = self.hooks.as_ref() {
+            let ctx = hooks.session_context();
+            mac.update(&(ctx.len() as u32).to_be_bytes());
+            mac.update(&ctx);
         }
         let out = mac.finalize();
         let mut bound = [0u8; 32];

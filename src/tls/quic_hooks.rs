@@ -109,6 +109,19 @@ pub(crate) trait QuicHooks: Send {
     /// `ClientHello` (server side) or `EncryptedExtensions` (client side).
     /// The engine calls this at most once per handshake.
     fn on_peer_transport_params(&mut self, raw: &[u8]);
+
+    /// Bytes a server engine binds its session tickets to, read when a
+    /// ticket is sealed and again when one is opened. RFC 9369 §5: "TLS
+    /// session tickets ... are specific to the QUIC version of the
+    /// connection that provided them" and "Servers MUST validate the
+    /// originating version of any session ticket ... and not accept one
+    /// issued from a different version" — the QUIC layer returns the
+    /// version in use, so a ticket sealed under one version fails to open
+    /// (and the handshake falls back to a full one, without 0-RTT) under
+    /// another. The default binds nothing.
+    fn session_context(&self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// A no-op [`QuicHooks`] used internally so the engine can route through

@@ -1,5 +1,5 @@
 //! QUIC transport parameters — RFC 9000 §18.2 (with §22.3 codepoints) plus
-//! RFC 9221 §3 (DATAGRAM extension).
+//! RFC 9221 §3 (DATAGRAM extension) and RFC 9368 §3 (`version_information`).
 //!
 //! Transport parameters are exchanged inside the TLS handshake via the
 //! `quic_transport_parameters` extension (codepoint `0x39`). The extension
@@ -135,6 +135,68 @@ impl PreferredAddress {
     }
 }
 
+/// RFC 9368 §3 — the `version_information` transport parameter (0x11):
+/// the QUIC version the sender is using and the versions it could use.
+///
+/// A client lists in `available` every version its first flight is
+/// compatible with, in descending order of preference, `chosen` included;
+/// a server lists the versions its whole deployment supports (order
+/// carries no meaning) and `chosen` is the version it settled on for the
+/// connection. Either side may pad the list with reserved `0x?a?a?a?a`
+/// entries (RFC 9000 §15), which are never selected.
+///
+/// The engine fills this in itself from
+/// [`QuicConfig::versions`](crate::quic::QuicConfig::versions); it is
+/// exposed so the peer's copy can be read back with
+/// [`QuicConnection::peer_transport_params`](crate::quic::QuicConnection::peer_transport_params).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionInformation {
+    /// Chosen Version — the version in use for the connection.
+    pub chosen: u32,
+    /// Available Versions — see the type docs for the two roles' meanings.
+    pub available: Vec<u32>,
+}
+
+impl VersionInformation {
+    /// Encodes the RFC 9368 §3 wire form: `Chosen Version (32)` followed by
+    /// each `Available Version (32)`, all network byte order.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 4 * self.available.len());
+        out.extend_from_slice(&self.chosen.to_be_bytes());
+        for v in &self.available {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+
+    /// Decodes the RFC 9368 §3 wire form, applying the §4 parsing rules:
+    /// the body must hold at least the Chosen Version and be a whole number
+    /// of 32-bit words, and neither the Chosen Version nor any Available
+    /// Version may be zero. Any of those is a parsing failure the endpoint
+    /// MUST close the connection over (TRANSPORT_PARAMETER_ERROR).
+    ///
+    /// The role-dependent rule — a server must also see the Chosen Version
+    /// in the client's Available Versions — is applied by the connection,
+    /// which knows which side it is.
+    pub fn decode(body: &[u8]) -> Result<Self, Error> {
+        if body.len() < 4 || !body.len().is_multiple_of(4) {
+            return Err(Error::Decode);
+        }
+        let mut words = body
+            .chunks_exact(4)
+            .map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
+        let chosen = words.next().ok_or(Error::Decode)?;
+        if chosen == 0 {
+            return Err(Error::Decode);
+        }
+        let available: Vec<u32> = words.collect();
+        if available.contains(&0) {
+            return Err(Error::Decode);
+        }
+        Ok(Self { chosen, available })
+    }
+}
+
 /// QUIC transport parameters exchanged in the TLS handshake.
 ///
 /// All `Option<…>` fields are absent on the wire when set to `None`. The
@@ -180,6 +242,9 @@ pub struct TransportParameters {
     /// `retry_source_connection_id` (0x10) — server only, set when the
     /// server sent a Retry packet.
     pub retry_source_connection_id: Option<Vec<u8>>,
+    /// `version_information` (0x11) — RFC 9368 §3. Filled in by the engine
+    /// on its own parameters; on the peer's, what it sent.
+    pub version_information: Option<VersionInformation>,
     /// `max_datagram_frame_size` (0x20) — RFC 9221 §3.
     pub max_datagram_frame_size: Option<u64>,
 }
@@ -202,6 +267,8 @@ const ID_PREFERRED_ADDRESS: u64 = 0x0D;
 const ID_ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0E;
 const ID_INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0F;
 const ID_RETRY_SOURCE_CONNECTION_ID: u64 = 0x10;
+/// RFC 9368 §10.1.
+const ID_VERSION_INFORMATION: u64 = 0x11;
 const ID_MAX_DATAGRAM_FRAME_SIZE: u64 = 0x20;
 
 fn write_varint_param(out: &mut Vec<u8>, id: u64, value: u64) {
@@ -283,6 +350,9 @@ impl TransportParameters {
         }
         if let Some(v) = &self.retry_source_connection_id {
             write_opaque_param(out, ID_RETRY_SOURCE_CONNECTION_ID, v);
+        }
+        if let Some(v) = &self.version_information {
+            write_opaque_param(out, ID_VERSION_INFORMATION, &v.encode());
         }
         if let Some(v) = self.max_datagram_frame_size {
             write_varint_param(out, ID_MAX_DATAGRAM_FRAME_SIZE, v);
@@ -392,6 +462,12 @@ impl TransportParameters {
                     }
                     out.retry_source_connection_id = Some(value.to_vec());
                 }
+                ID_VERSION_INFORMATION => {
+                    // RFC 9368 §4: a body that does not parse is a
+                    // TRANSPORT_PARAMETER_ERROR, like any other malformed
+                    // parameter here.
+                    out.version_information = Some(VersionInformation::decode(value)?);
+                }
                 ID_MAX_DATAGRAM_FRAME_SIZE => {
                     out.max_datagram_frame_size = Some(read_varint_value(value)?);
                 }
@@ -453,6 +529,10 @@ mod tests {
             active_connection_id_limit: Some(4),
             initial_source_connection_id: Some(alloc::vec![9; 8]),
             retry_source_connection_id: Some(alloc::vec![7; 8]),
+            version_information: Some(VersionInformation {
+                chosen: 0x6b33_43cf,
+                available: alloc::vec![0x6b33_43cf, 1, 0x1a2a_3a4a],
+            }),
             max_datagram_frame_size: Some(1200),
             ..TransportParameters::default()
         };
@@ -460,6 +540,62 @@ mod tests {
         tp.encode(&mut buf);
         let decoded = TransportParameters::decode(&buf).expect("decode");
         assert_eq!(decoded, tp);
+    }
+
+    /// RFC 9368 §3 wire form: id 0x11, then `chosen ‖ available…` as
+    /// big-endian words; an empty Available Versions list is legal for a
+    /// server (§3).
+    #[test]
+    fn version_information_wire_form() {
+        let vi = VersionInformation {
+            chosen: 1,
+            available: alloc::vec![1, 0x6b33_43cf],
+        };
+        assert_eq!(
+            vi.encode(),
+            alloc::vec![0, 0, 0, 1, 0, 0, 0, 1, 0x6b, 0x33, 0x43, 0xcf]
+        );
+        let tp = TransportParameters {
+            version_information: Some(vi.clone()),
+            ..TransportParameters::default()
+        };
+        let mut buf = Vec::new();
+        tp.encode(&mut buf);
+        assert_eq!(
+            buf,
+            alloc::vec![0x11, 12, 0, 0, 0, 1, 0, 0, 0, 1, 0x6b, 0x33, 0x43, 0xcf]
+        );
+        assert_eq!(VersionInformation::decode(&vi.encode()).unwrap(), vi);
+        let empty = VersionInformation {
+            chosen: 1,
+            available: Vec::new(),
+        };
+        assert_eq!(VersionInformation::decode(&[0, 0, 0, 1]).unwrap(), empty);
+    }
+
+    /// RFC 9368 §4 parsing failures: too short, not a multiple of four, a
+    /// zero Chosen Version, a zero Available Version. Each is rejected both
+    /// on its own and as a transport parameter (TRANSPORT_PARAMETER_ERROR).
+    #[test]
+    fn version_information_rejects_malformed() {
+        for bad in [
+            &[][..],
+            &[0, 0, 0],
+            &[0, 0, 0, 1, 0],
+            &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
+            &[0, 0, 0, 0],
+            &[0, 0, 0, 0, 0, 0, 0, 1],
+            &[0, 0, 0, 1, 0, 0, 0, 0],
+            &[0, 0, 0, 1, 0x6b, 0x33, 0x43, 0xcf, 0, 0, 0, 0],
+        ] {
+            assert!(VersionInformation::decode(bad).is_err(), "accepted {bad:?}");
+            let mut buf = Vec::new();
+            write_opaque_param(&mut buf, ID_VERSION_INFORMATION, bad);
+            assert!(
+                TransportParameters::decode(&buf).is_err(),
+                "accepted TP with {bad:?}"
+            );
+        }
     }
 
     #[test]

@@ -70,7 +70,8 @@ use std::time::Instant;
 
 use crate::quic::cid::{CidEntry, CidPool, ConnectionId};
 use crate::quic::client::{
-    build_initial_endpoint, build_tls_engine as build_client_engine, random_default_cid,
+    build_initial_endpoint, build_tls_engine as build_client_engine, initial_keys_client,
+    random_default_cid,
 };
 use crate::quic::crypto::{
     AeadAlg, PnReplayWindow, aead_open, aead_seal, derive_dir_keys, derive_dir_keys_preserve_hp,
@@ -86,21 +87,24 @@ use crate::quic::loss::{
 };
 use crate::quic::path::{Path, PathChallengeState};
 use crate::quic::pkt::{
-    LongHeader, LongType, QUIC_V1, ShortHeader, apply_header_protection, build_long_header,
-    build_retry, build_short_header, check_reserved_bits, remove_header_protection,
-    retry_integrity_tag,
+    LongHeader, LongType, ShortHeader, apply_header_protection, build_long_header, build_retry,
+    build_short_header, check_reserved_bits, remove_header_protection, retry_integrity_tag,
 };
 use crate::quic::pn::{PnSpaceId, decode_packet_number, encode_packet_number_length};
 use crate::quic::retry::encode_addr as encode_retry_addr;
 use crate::quic::server::{
-    build_pending_endpoint, build_tls_engine as build_server_engine, initial_rx_keys,
+    build_pending_endpoint, build_tls_engine as build_server_engine, initial_keys, initial_rx_keys,
     install_initial_keys, random_default_scid, set_cids_from_first_initial,
 };
 use crate::quic::stream::{StreamError, StreamId};
 use crate::quic::streams::{ControlHint, Streams};
 use crate::quic::tls_glue::HookHandle;
-use crate::quic::transport_params::{PreferredAddress, TransportParameters};
+use crate::quic::transport_params::{PreferredAddress, TransportParameters, VersionInformation};
 use crate::quic::varint;
+use crate::quic::version::{
+    QuicVersion, SUPPORTED_VERSIONS, VersionError, check_server_version_information,
+    choose_version, select_server_version,
+};
 use crate::rng::{OsRng, RngCore};
 use crate::tls::conn::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 use crate::tls::quic_hooks::{Direction, Level};
@@ -176,11 +180,12 @@ pub enum Role {
 /// stateless-retry address validation (RFC 9000 §8.1.2). Clients ignore
 /// both fields.
 ///
-/// `#[non_exhaustive]` so future QUIC features (datagram extension,
-/// additional transport parameters, QUIC v2 negotiation) can be added
-/// as new fields without breaking downstream literal construction.
-/// Construct via `QuicConfig::default()` + field assignment.
+/// `#[non_exhaustive]` so future QUIC features (additional transport
+/// parameters, further versions) can be added as new fields without
+/// breaking downstream literal construction. Construct via
+/// `QuicConfig::default()` + field assignment.
 #[non_exhaustive]
+#[derive(Clone)]
 pub struct QuicConfig {
     /// The TLS 1.3 client / server config to drive. The QUIC layer adds
     /// QUIC-mode wrapping on top — `tls.max_version` is ignored (QUIC v1
@@ -256,6 +261,42 @@ pub struct QuicConfig {
     /// [`Self::resumption`] carries a ticket that supports it. Defaults to
     /// `false` on both sides, so 0-RTT is strictly opt-in.
     pub enable_early_data: bool,
+    /// The QUIC versions this endpoint speaks, in preference order:
+    /// [`SUPPORTED_VERSIONS`] (v1 then v2) by default.
+    ///
+    /// On a **client** this is the Available Versions list of its
+    /// `version_information` (RFC 9368 §3), which lets a server that would
+    /// rather use another version switch the connection to it without a
+    /// round trip (§2.3, "compatible" negotiation), and the list it picks
+    /// from when a server answers with a Version Negotiation packet (§2.1,
+    /// "incompatible" negotiation — the client then starts over with the
+    /// first entry here the server listed). On a **server** it is the set
+    /// of versions it accepts a first flight in, and the order in which it
+    /// picks the Negotiated Version from a client's offer (the client's
+    /// own order is advisory, §3); a first flight in any other version
+    /// draws a Version Negotiation packet listing these.
+    ///
+    /// The default prefers v1: the two versions differ in nothing but their
+    /// wire constants (RFC 9369 §8 — "no changes to the security or privacy
+    /// properties"), v1 is what every peer and middlebox speaks, and both
+    /// are offered, so an operator who wants v2 on the wire — to resist
+    /// ossification, the reason v2 exists (§6) — enables it by putting
+    /// [`QuicVersion::V2`] first on *either* side. Set a single version to
+    /// refuse the other altogether. Must not be empty or repeat an entry.
+    pub versions: Vec<QuicVersion>,
+    /// Client-only — the version of the first flight (the Original Version
+    /// of RFC 9368 §1.2), which must be one of [`Self::versions`]. `None`
+    /// (the default) picks the oldest supported version, v1 when listed:
+    /// RFC 9368 §2.5 has the client "select the oldest version that the
+    /// client supports while advertising newer compatible versions", which
+    /// is what avoids the round trip of a Version Negotiation packet from a
+    /// server that has not caught up. A [`Self::resumption`] session
+    /// overrides this with the version it was issued for (RFC 9369 §5:
+    /// tickets are version-specific), unless a version is set here — a
+    /// session for another version is then not offered.
+    ///
+    /// Ignored on the server side.
+    pub original_version: Option<QuicVersion>,
 }
 
 impl Default for QuicConfig {
@@ -277,6 +318,8 @@ impl Default for QuicConfig {
             reset_key: None,
             resumption: None,
             enable_early_data: false,
+            versions: SUPPORTED_VERSIONS.to_vec(),
+            original_version: None,
         }
     }
 }
@@ -300,9 +343,23 @@ pub struct QuicSession {
     tls: crate::tls::conn::StoredSession,
     /// The server's transport parameters from the original connection.
     peer_params: TransportParameters,
+    /// The QUIC version of the connection that issued the ticket — its
+    /// Negotiated Version (RFC 9369 §5: after compatible negotiation "any
+    /// resulting session ticket maps to the negotiated version rather than
+    /// the original one").
+    version: QuicVersion,
 }
 
 impl QuicSession {
+    /// The QUIC version this session is bound to. RFC 9369 §5: "Clients MUST
+    /// NOT use a session ticket or token from a QUIC version 1 connection to
+    /// initiate a QUIC version 2 connection, and vice versa" — a connection
+    /// resuming with this session starts in this version (see
+    /// [`QuicConfig::original_version`]).
+    pub fn version(&self) -> QuicVersion {
+        self.version
+    }
+
     /// The ALPN protocol negotiated on the originating connection. A client
     /// that would negotiate a different protocol MUST NOT offer 0-RTT
     /// (RFC 9001 §4.6.2).
@@ -323,6 +380,7 @@ impl core::fmt::Debug for QuicSession {
         f.debug_struct("QuicSession")
             .field("server_name", &self.tls.server_name)
             .field("supports_early_data", &self.supports_early_data())
+            .field("version", &self.version)
             .finish_non_exhaustive()
     }
 }
@@ -400,22 +458,25 @@ fn is_usable_migration_target(addr: &SocketAddr) -> bool {
 /// this size.
 pub(crate) const MIN_INITIAL_DATAGRAM: usize = 1200;
 
-/// True when the first packet in `datagram` is a QUIC v1 long-header Initial.
+/// True when the first packet in `datagram` is a long-header Initial of a
+/// version this stack speaks.
 ///
 /// Used to apply the RFC 9000 §14.1 datagram-size floor before any
 /// state-changing work (notably the Retry decision) happens. Deliberately
-/// conservative: anything that does not parse as a v1 Initial long header is
+/// conservative: anything that does not parse as an Initial long header is
 /// left to the normal packet loop.
 fn first_packet_is_initial(datagram: &[u8]) -> bool {
     if datagram.is_empty() || datagram[0] & 0x80 == 0 {
         return false;
     }
-    matches!(LongHeader::parse(datagram), Ok(h) if h.typ == LongType::Initial)
+    matches!(LongHeader::parse(datagram),
+        Ok(h) if h.typ == LongType::Initial && QuicVersion::from_wire(h.version).is_some())
 }
 
-/// Returns the header of the first QUIC v1 Initial packet that the packet
-/// loop in [`QuicConnection::feed_datagram`] would reach in `datagram`,
-/// walking the packets coalesced in front of it (RFC 9000 §12.2).
+/// Returns the header of the first Initial packet (in a version this stack
+/// speaks) that the packet loop in [`QuicConnection::feed_datagram`] would
+/// reach in `datagram`, walking the packets coalesced in front of it (RFC
+/// 9000 §12.2).
 ///
 /// The server's Retry decision (`maybe_emit_retry`) used to look only at the
 /// first packet of the datagram. A client that coalesced a junk long-header
@@ -432,8 +493,8 @@ fn first_packet_is_initial(datagram: &[u8]) -> bool {
 /// * a short-header packet extends to the end of the datagram, so nothing
 ///   behind it is ever reached;
 /// * a Version Negotiation packet (version 0) is discarded whole by a server
-///   and a Retry (§12.2: "cannot be coalesced") or a non-v1 long header
-///   consumes the rest of the datagram;
+///   and a Retry (§12.2: "cannot be coalesced") or a long header of an
+///   unknown version consumes the rest of the datagram;
 /// * an Initial / 0-RTT / Handshake packet is `payload_off + Length` bytes
 ///   long; a Length that overruns the datagram is a decode error that
 ///   discards the remainder.
@@ -445,7 +506,7 @@ fn first_initial_in_datagram(datagram: &[u8]) -> Option<LongHeader<'_>> {
             return None;
         }
         let hdr = LongHeader::parse(rest).ok()?;
-        if hdr.version != QUIC_V1 || hdr.typ == LongType::Retry {
+        if QuicVersion::from_wire(hdr.version).is_none() || hdr.typ == LongType::Retry {
             return None;
         }
         let pkt_total_len = usize::try_from(hdr.length)
@@ -508,6 +569,10 @@ const ERROR_TRANSPORT_PARAMETER: u64 = 0x08;
 const ERROR_PROTOCOL_VIOLATION: u64 = 0x0a;
 /// RFC 9000 §20.1 — `AEAD_LIMIT_REACHED` (RFC 9001 §6.6).
 const ERROR_AEAD_LIMIT_REACHED: u64 = 0x0e;
+/// RFC 9368 §10.2 — `VERSION_NEGOTIATION_ERROR`: the peer's Version
+/// Information failed the §4 checks (a version it could not have chosen, or
+/// a downgrade).
+const ERROR_VERSION_NEGOTIATION: u64 = 0x11;
 /// RFC 9000 §20.1 — the `CRYPTO_ERROR` range (`0x0100`-`0x01ff`): RFC 9001
 /// §4.8 maps a TLS alert of description `d` to `0x0100 | d`.
 const ERROR_CRYPTO_BASE: u64 = 0x0100;
@@ -937,6 +1002,53 @@ pub struct QuicConnection {
     /// (and its acknowledgment confirms the update, RFC 9001 §6.2) even on
     /// an otherwise idle connection.
     ping_pending: bool,
+
+    // -------- RFC 9368 / RFC 9369: versions --------
+    /// The versions this endpoint speaks, in preference order
+    /// ([`QuicConfig::versions`]).
+    versions: Vec<QuicVersion>,
+    /// The version of this connection attempt's first flight — the version
+    /// of the first Initial the client sent (server: received). Retry packets
+    /// and 0-RTT packets are always in this version (RFC 9369 §4.1), and so
+    /// are the keys that protect them. RFC 9368 §1.2 calls this the client's
+    /// Chosen Version; after a Version Negotiation packet the *new* attempt's
+    /// first flight sets it afresh.
+    original_version: QuicVersion,
+    /// The version currently written into long headers and keying the
+    /// Initial and Handshake levels: `original_version` until compatible
+    /// negotiation (RFC 9368 §2.3) moves the connection to the Negotiated
+    /// Version, then that.
+    version: QuicVersion,
+    /// The Negotiated Version (RFC 9368 §1.2) once known. Server: set when
+    /// the client's `version_information` is processed. Client: set when the
+    /// first server long header in another version authenticates, or when
+    /// the first CRYPTO frame arrives in the original version (RFC 9369
+    /// §4.1: that "indicates that the negotiated version is equal to the
+    /// original version").
+    negotiated_version: Option<QuicVersion>,
+    /// The original version's Initial *receive* keys, kept after a
+    /// compatible switch so a reordered Initial in that version still opens
+    /// (RFC 9369 §4.1: "the server MUST NOT discard its original version
+    /// Initial receive keys until it successfully processes a Handshake
+    /// packet with the negotiated version"; the client keeps them for the
+    /// same reason). Discarded with the Initial level.
+    original_initial_rx: Option<crate::quic::crypto::DirKeys>,
+    /// Client-only — this connection attempt was made in reaction to a
+    /// Version Negotiation packet (RFC 9368 §2.1). Further Version
+    /// Negotiation packets are ignored, the server's Version Information is
+    /// mandatory, and its Available Versions are checked for a downgrade
+    /// (§4).
+    reacted_to_vn: bool,
+    /// Client-only — the configuration to rebuild the connection from if a
+    /// Version Negotiation packet asks for a fresh attempt in another
+    /// version. Dropped once any server packet has been processed, after
+    /// which Version Negotiation packets are ignored (RFC 9000 §6.2).
+    restart_cfg: Option<Box<QuicConfig>>,
+    /// The Destination Connection ID the Initial keys are derived from
+    /// (RFC 9001 §5.2): the client's chosen DCID, or the Retry SCID after a
+    /// Retry. Kept so a compatible version switch (RFC 9369 §4.1) can
+    /// re-derive Initial keys for the new version from the same DCID.
+    initial_keying_dcid: ConnectionId,
 }
 
 enum EngineSide {
@@ -1004,6 +1116,36 @@ pub(crate) struct PacketMeta {
 /// to send, a protocol violation on our side).
 const MAX_LOCAL_ACTIVE_CID_LIMIT: u64 = 64;
 
+/// Rejects a [`QuicConfig::versions`] list the engine cannot honour: empty,
+/// with a repeated entry, or (client) not containing the configured
+/// [`QuicConfig::original_version`].
+fn validate_versions(cfg: &QuicConfig) -> Result<(), Error> {
+    let vs = &cfg.versions;
+    if vs.is_empty() || vs.iter().enumerate().any(|(i, v)| vs[..i].contains(v)) {
+        return Err(Error::IllegalParameter);
+    }
+    if cfg.original_version.is_some_and(|v| !vs.contains(&v)) {
+        return Err(Error::IllegalParameter);
+    }
+    Ok(())
+}
+
+/// The RFC 9368 §3 `version_information` this endpoint advertises: the
+/// version it is using and every version it speaks, in preference order
+/// ([`QuicConfig::versions`]), followed by one reserved `0x?a?a?a?a` entry
+/// (RFC 9000 §15) so peers keep handling — and never selecting — versions
+/// they do not know.
+fn our_version_information(chosen: QuicVersion, versions: &[QuicVersion]) -> VersionInformation {
+    let mut available: Vec<u32> = versions.iter().map(|v| v.wire()).collect();
+    let mut r = [0u8; 4];
+    OsRng.fill_bytes(&mut r);
+    available.push(u32::from_be_bytes(r) & 0xf0f0_f0f0 | 0x0a0a_0a0a);
+    VersionInformation {
+        chosen: chosen.wire(),
+        available,
+    }
+}
+
 fn validate_local_transport_params(tp: &TransportParameters) -> Result<(), Error> {
     if let Some(limit) = tp.active_connection_id_limit
         && !(2..=MAX_LOCAL_ACTIVE_CID_LIMIT).contains(&limit)
@@ -1050,9 +1192,50 @@ impl QuicConnection {
         server_name: &str,
         dcid: ConnectionId,
     ) -> Result<Self, Error> {
+        Self::client_inner(cfg, server_name, dcid, None)
+    }
+
+    /// The client constructor proper. `restart` is `Some(version)` for the
+    /// fresh connection attempt a client makes after a Version Negotiation
+    /// packet (RFC 9368 §2.1): the first flight goes out in `version`
+    /// instead of the configured original version, and the attempt is
+    /// marked as reacting to Version Negotiation (§4).
+    fn client_inner(
+        cfg: QuicConfig,
+        server_name: &str,
+        dcid: ConnectionId,
+        restart: Option<QuicVersion>,
+    ) -> Result<Self, Error> {
         // RFC 9000 §18.2 — reject locally-advertised TP values that are
         // protocol violations (e.g. `active_connection_id_limit < 2`).
         validate_local_transport_params(&cfg.transport_params)?;
+        validate_versions(&cfg)?;
+        // The version of this attempt's first flight. RFC 9369 §5 binds a
+        // session ticket to the version that issued it, so a resumption
+        // session picks the version (RFC 9369 §6: a server that issued a v2
+        // ticket "indicates an intent to maintain version 2 support"), an
+        // explicit `original_version` overrides that (and a session for
+        // another version is then not offered), and otherwise the oldest
+        // supported version goes first (RFC 9368 §2.5).
+        let session_version = cfg
+            .resumption
+            .as_ref()
+            .map(|s| s.version)
+            .filter(|v| cfg.versions.contains(v));
+        let original_version = restart
+            .or(cfg.original_version)
+            .or(session_version)
+            .unwrap_or_else(|| {
+                if cfg.versions.contains(&QuicVersion::V1) {
+                    QuicVersion::V1
+                } else {
+                    cfg.versions[0]
+                }
+            });
+        let session_usable = cfg
+            .resumption
+            .as_ref()
+            .is_some_and(|s| s.version == original_version);
         // Even a client issues NEW_CONNECTION_ID frames, each carrying a
         // stateless-reset token; derive them from a real key (random unless the
         // caller supplied one) so they are unpredictable (RFC 9000 §10.3.1).
@@ -1062,18 +1245,21 @@ impl QuicConnection {
             crate::tls::Secret32::from(k)
         });
         let scid = random_default_cid();
-        let endpoint = build_initial_endpoint(dcid, scid);
+        let endpoint = build_initial_endpoint(original_version, dcid, scid);
         // RFC 9000 §7.3 — both endpoints MUST include their
         // `initial_source_connection_id` (0x0F). For the client this is
         // the SCID we put on our first Initial packet (= `scid`).
         let mut tp_with_iscid = cfg.transport_params.clone();
         tp_with_iscid.initial_source_connection_id = Some(scid.as_slice().to_vec());
-        let mut tp_bytes = Vec::new();
-        tp_with_iscid.encode(&mut tp_bytes);
+        // RFC 9368 §3 / RFC 9369 §4 — the versions this first flight is
+        // compatible with, Chosen Version first.
+        tp_with_iscid.version_information =
+            Some(our_version_information(original_version, &cfg.versions));
         // RFC 9001 §4.6.1 / §4.6.2 — 0-RTT is offered only when the caller
         // opted in, the ticket advertises it, and the ALPN protocol we are
         // about to negotiate is the one the session was established with.
-        let offering_early_data = cfg.enable_early_data
+        let offering_early_data = session_usable
+            && cfg.enable_early_data
             && cfg.resumption.as_ref().is_some_and(|s| {
                 s.supports_early_data()
                     && s.alpn_protocol()
@@ -1084,8 +1270,8 @@ impl QuicConnection {
             .as_ref()
             .map(|s| s.peer_params.clone())
             .unwrap_or_default();
-        let tls_cfg = build_client_tls_config(&cfg, offering_early_data)?;
-        let (engine, hooks) = build_client_engine(tls_cfg, server_name, tp_bytes)?;
+        let tls_cfg = build_client_tls_config(&cfg, session_usable, offering_early_data)?;
+        let (engine, hooks) = build_client_engine(tls_cfg, server_name, tp_with_iscid.clone())?;
 
         // Local CID pool seeded with our SCID at sequence 0 (RFC 9000
         // §5.1.1: the handshake CID is implicitly sequence 0).
@@ -1159,7 +1345,21 @@ impl QuicConnection {
             handshake_done_pending: false,
             handshake_done_acked: false,
             ping_pending: false,
+            versions: cfg.versions.clone(),
+            original_version,
+            version: original_version,
+            negotiated_version: None,
+            original_initial_rx: None,
+            reacted_to_vn: restart.is_some(),
+            restart_cfg: None,
+            initial_keying_dcid: dcid,
         };
+        // Kept for the one fresh attempt a Version Negotiation packet may
+        // ask for; an attempt that already is one ignores further such
+        // packets (RFC 9368 §4), so it needs no copy.
+        if restart.is_none() {
+            conn.restart_cfg = Some(Box::new(cfg));
+        }
 
         // RFC 9001 §4.6.1 — with 0-RTT in play the client must apply the
         // server's *remembered* transport parameters until the real ones
@@ -1193,6 +1393,7 @@ impl QuicConnection {
         // RFC 9000 §18.2 — reject locally-advertised TP values that are
         // protocol violations (e.g. `active_connection_id_limit < 2`).
         validate_local_transport_params(&cfg.transport_params)?;
+        validate_versions(&cfg)?;
         let endpoint = build_pending_endpoint();
         let require_retry = cfg.require_retry && cfg.retry_secret.is_some();
         let retry_secret = cfg.retry_secret.clone();
@@ -1226,10 +1427,11 @@ impl QuicConnection {
                 &pending_scid,
             ));
         }
-        let mut tp_bytes = Vec::new();
-        params.encode(&mut tp_bytes);
+        // RFC 9368 §3 — the versions this deployment supports; the Chosen
+        // Version is that of the first Initial, filled in once it arrives.
+        params.version_information = Some(our_version_information(cfg.versions[0], &cfg.versions));
         let tls_cfg = build_server_tls_config(&cfg)?;
-        let (engine, hooks) = build_server_engine(tls_cfg, tp_bytes)?;
+        let (engine, hooks) = build_server_engine(tls_cfg, params.clone())?;
 
         let our_dg = cfg.transport_params.max_datagram_frame_size;
         Ok(QuicConnection {
@@ -1297,6 +1499,14 @@ impl QuicConnection {
             handshake_done_pending: false,
             handshake_done_acked: false,
             ping_pending: false,
+            versions: cfg.versions.clone(),
+            original_version: cfg.versions[0],
+            version: cfg.versions[0],
+            negotiated_version: None,
+            original_initial_rx: None,
+            reacted_to_vn: false,
+            restart_cfg: None,
+            initial_keying_dcid: ConnectionId::empty(),
         })
     }
 
@@ -1549,7 +1759,14 @@ impl QuicConnection {
             // Enter the closing state (so the peer learns why and nothing
             // else is sent) and propagate the error to the caller.
             if let Err(e) = self.drain_engine_outputs() {
-                self.close_with_transport_error(ERROR_TRANSPORT_PARAMETER);
+                // RFC 9368 §4 version-negotiation failures set a more
+                // specific code (VERSION_NEGOTIATION_ERROR); everything else
+                // here is a transport-parameter error (RFC 9000 §7.4).
+                let code = self
+                    .pending_error_code
+                    .take()
+                    .unwrap_or(ERROR_TRANSPORT_PARAMETER);
+                self.close_with_transport_error(code);
                 return Err(e);
             }
             rest = &rest[consumed..];
@@ -1657,6 +1874,12 @@ impl QuicConnection {
             // matching keys when processing the retried Initial).
             let mut rng = OsRng;
             let retry_scid = ConnectionId::random(&mut rng, crate::quic::server::DEFAULT_SCID_LEN);
+            // RFC 9369 §4.1: the Retry is sent in the version of the client's
+            // Initial (its Chosen Version), and the token records it so the
+            // retried Initial cannot switch versions (§5). `first_packet_is_initial`
+            // only reaches here for a version we speak.
+            let retry_version =
+                QuicVersion::from_wire(hdr.version).unwrap_or(self.original_version);
             // L-8: the token binds the Retry SCID, so the DCID of the retried
             // Initial — which the server adopts as its own SCID and echoes as
             // `retry_source_connection_id` — is a value *we* chose, not one
@@ -1666,13 +1889,14 @@ impl QuicConnection {
                 &addr_bytes,
                 &odcid_bytes,
                 retry_scid.as_slice(),
+                retry_version.wire(),
                 self.now_secs,
             );
 
             // Build the Retry packet. ODCID is the *original* DCID the
             // client wrote on this first Initial.
             let pkt = build_retry(
-                QUIC_V1,
+                retry_version,
                 hdr.scid, // Retry DCID = client's SCID
                 retry_scid.as_slice(),
                 &token,
@@ -1701,7 +1925,7 @@ impl QuicConnection {
         let addr_bytes = encode_retry_addr(&peer_addr);
         match crate::quic::retry::validate(secret.as_bytes(), &addr_bytes, hdr.token, self.now_secs)
         {
-            Ok((odcid, retry_scid)) => {
+            Ok((odcid, retry_scid, token_version)) => {
                 // L-8: the retried Initial MUST be addressed to the SCID we
                 // put in the Retry packet, which the token binds. Without the
                 // check the server took the client's DCID on trust — adopting
@@ -1710,6 +1934,13 @@ impl QuicConnection {
                 // could pick the server's connection ID (and desynchronise
                 // the seq-0 stateless-reset token, which is derived from it).
                 if hdr.dcid != retry_scid.as_slice() {
+                    return Ok(Some(datagram.len()));
+                }
+                // RFC 9369 §4.1 / §5: "The client MUST NOT use a different
+                // version in the subsequent Initial packet that contains the
+                // Retry token." The token records the version it was issued
+                // in; drop a retried Initial that switched versions.
+                if hdr.version != token_version {
                     return Ok(Some(datagram.len()));
                 }
                 // Address validated by the round-trip → exempt from AMP.
@@ -2772,7 +3003,14 @@ impl QuicConnection {
             },
         };
         let peer_params = self.peer_params.clone()?;
-        Some(QuicSession { tls, peer_params })
+        // RFC 9369 §5: the ticket "maps to the negotiated version rather than
+        // the original one" — bind the version in use so a resumption starts
+        // in it and is not offered to a connection of the other version.
+        Some(QuicSession {
+            tls,
+            peer_params,
+            version: self.version,
+        })
     }
 
     /// Whether the server accepted the 0-RTT this connection offered.
@@ -2820,6 +3058,29 @@ impl QuicConnection {
     /// that was accepted on its first Initial.
     pub fn retry_used(&self) -> bool {
         self.retry_scid.is_some()
+    }
+
+    /// The QUIC version in use on this connection — the Negotiated Version
+    /// (RFC 9368 §1.2) once version negotiation has settled, the version of
+    /// the first flight before then.
+    ///
+    /// On a **client** this is the original version until a server long
+    /// header (or a Version Negotiation packet followed by a fresh attempt)
+    /// moves the connection to another; on a **server** it is the version of
+    /// the client's first Initial, then the version it negotiated. It is
+    /// authenticated by the RFC 9368 §4 Version Information exchange, so once
+    /// [`Self::is_handshake_complete`] it reflects a downgrade-checked
+    /// outcome.
+    pub fn version(&self) -> QuicVersion {
+        self.version
+    }
+
+    /// The original version of this connection attempt — the version of the
+    /// client's first flight (RFC 9368 §1.2). Equal to [`Self::version`]
+    /// unless compatible version negotiation (RFC 9369 §4.1) moved the
+    /// connection to a different version mid-handshake.
+    pub fn original_version(&self) -> QuicVersion {
+        self.original_version
     }
 
     /// The 1-RTT key phase this endpoint currently sends with (RFC 9001
@@ -3776,32 +4037,36 @@ impl QuicConnection {
             let tx0_secret = tx.secret.clone();
             let rx0_secret = rx.secret.clone();
             // Cache the HP key bytes for the lifetime of the connection.
-            lk.tx_hp_key_bytes = derive_hp_key_bytes(alg, &tx0_secret);
-            lk.rx_hp_key_bytes = derive_hp_key_bytes(alg, &rx0_secret);
+            lk.tx_hp_key_bytes = derive_hp_key_bytes(self.version, alg, &tx0_secret);
+            lk.rx_hp_key_bytes = derive_hp_key_bytes(self.version, alg, &rx0_secret);
             // Seed phase 0 with the just-derived legacy keys. (The
             // hp slot in DirKeys was built from the same hp bytes;
             // it doesn't matter whether we cloned them here or not —
             // they're equivalent.)
             lk.tx_by_phase[0] = Some(derive_dir_keys_preserve_hp(
+                self.version,
                 alg,
                 &tx0_secret,
                 &lk.tx_hp_key_bytes,
             ));
             lk.rx_by_phase[0] = Some(derive_dir_keys_preserve_hp(
+                self.version,
                 alg,
                 &rx0_secret,
                 &lk.rx_hp_key_bytes,
             ));
             // Pre-derive phase-1 keys from the next-generation secrets
             // (RFC 9001 §6.1, label "quic ku"). HP key stays the same.
-            let tx1_secret = derive_next_application_secret(alg, &tx0_secret);
-            let rx1_secret = derive_next_application_secret(alg, &rx0_secret);
+            let tx1_secret = derive_next_application_secret(self.version, alg, &tx0_secret);
+            let rx1_secret = derive_next_application_secret(self.version, alg, &rx0_secret);
             lk.tx_by_phase[1] = Some(derive_dir_keys_preserve_hp(
+                self.version,
                 alg,
                 &tx1_secret,
                 &lk.tx_hp_key_bytes,
             ));
             lk.rx_by_phase[1] = Some(derive_dir_keys_preserve_hp(
+                self.version,
                 alg,
                 &rx1_secret,
                 &lk.rx_hp_key_bytes,
@@ -3840,12 +4105,12 @@ impl QuicConnection {
             .as_ref()
             .map(|k| k.secret.clone());
         if let Some(secret) = new_secret_opt {
-            let new_keys = derive_dir_keys_preserve_hp(alg, &secret, &hp_bytes);
+            let new_keys = derive_dir_keys_preserve_hp(self.version, alg, &secret, &hp_bytes);
             self.endpoint.crypto.at_mut(Level::OneRtt).tx = Some(new_keys);
             // Pre-derive the *next-next* tx (the one we'd flip to on
             // the next update) and store it in the now-vacated slot.
-            let next_secret = derive_next_application_secret(alg, &secret);
-            let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &hp_bytes);
+            let next_secret = derive_next_application_secret(self.version, alg, &secret);
+            let next_keys = derive_dir_keys_preserve_hp(self.version, alg, &next_secret, &hp_bytes);
             self.endpoint.crypto.at_mut(Level::OneRtt).tx_by_phase[(new_phase ^ 1) as usize] =
                 Some(next_keys);
             // RFC 9001 §6.6 — per-key tx usage limit is per *key*. The
@@ -3912,10 +4177,10 @@ impl QuicConnection {
             .as_ref()
             .map(|k| k.secret.clone());
         if let Some(secret) = new_rx_secret {
-            let new_rx = derive_dir_keys_preserve_hp(alg, &secret, &hp_bytes);
+            let new_rx = derive_dir_keys_preserve_hp(self.version, alg, &secret, &hp_bytes);
             self.endpoint.crypto.at_mut(Level::OneRtt).rx = Some(new_rx);
-            let next_secret = derive_next_application_secret(alg, &secret);
-            let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &hp_bytes);
+            let next_secret = derive_next_application_secret(self.version, alg, &secret);
+            let next_keys = derive_dir_keys_preserve_hp(self.version, alg, &next_secret, &hp_bytes);
             self.endpoint.crypto.at_mut(Level::OneRtt).rx_by_phase[old_phase as usize] =
                 Some(next_keys);
             // RFC 9001 §6.6 — per-key rx integrity counter is per
@@ -4004,8 +4269,8 @@ impl QuicConnection {
             .as_ref()
             .map(|k| k.secret.clone());
         if let Some(secret) = cur_rx_secret {
-            let next_secret = derive_next_application_secret(alg, &secret);
-            let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &rx_hp);
+            let next_secret = derive_next_application_secret(self.version, alg, &secret);
+            let next_keys = derive_dir_keys_preserve_hp(self.version, alg, &next_secret, &rx_hp);
             self.endpoint.crypto.at_mut(Level::OneRtt).rx_by_phase[(current_phase ^ 1) as usize] =
                 Some(next_keys);
         }
@@ -4015,8 +4280,8 @@ impl QuicConnection {
             .as_ref()
             .map(|k| k.secret.clone());
         if let Some(secret) = cur_tx_secret {
-            let next_secret = derive_next_application_secret(alg, &secret);
-            let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &tx_hp);
+            let next_secret = derive_next_application_secret(self.version, alg, &secret);
+            let next_keys = derive_dir_keys_preserve_hp(self.version, alg, &next_secret, &tx_hp);
             self.endpoint.crypto.at_mut(Level::OneRtt).tx_by_phase[(current_phase ^ 1) as usize] =
                 Some(next_keys);
         }
@@ -4131,7 +4396,12 @@ impl QuicConnection {
             Some(c) => *c,
             None => return Ok(()), // defensive — client always has one
         };
-        let computed = retry_integrity_tag(original_dcid.as_slice(), unauth);
+        // RFC 9369 §4.1: the client ignores a Retry in a version other than
+        // its Chosen Version, and authenticates it with that version's key.
+        if hdr.version != self.original_version.wire() {
+            return Ok(());
+        }
+        let computed = retry_integrity_tag(self.original_version, original_dcid.as_slice(), unauth);
         // Constant-time compare via `ConstantTimeEq`.
         use crate::ct::ConstantTimeEq;
         if !bool::from(computed.ct_eq(&provided_tag)) {
@@ -4180,15 +4450,24 @@ impl QuicConnection {
         // connection_id` transport parameter, which is still the very
         // first DCID. The two fields are deliberately separate.
         let (client_secret, server_secret) =
-            crate::quic::crypto::derive_initial_secrets(new_scid.as_slice());
-        self.endpoint.crypto.levels[Level::Initial as usize].tx = Some(
-            crate::quic::crypto::derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret),
-        );
-        self.endpoint.crypto.levels[Level::Initial as usize].rx = Some(
-            crate::quic::crypto::derive_dir_keys(AeadAlg::Aes128Gcm, &server_secret),
-        );
-        // Update the DCID we write into outbound long headers.
+            crate::quic::crypto::derive_initial_secrets(self.original_version, new_scid.as_slice());
+        self.endpoint.crypto.levels[Level::Initial as usize].tx =
+            Some(crate::quic::crypto::derive_dir_keys(
+                self.original_version,
+                AeadAlg::Aes128Gcm,
+                &client_secret,
+            ));
+        self.endpoint.crypto.levels[Level::Initial as usize].rx =
+            Some(crate::quic::crypto::derive_dir_keys(
+                self.original_version,
+                AeadAlg::Aes128Gcm,
+                &server_secret,
+            ));
+        // Update the DCID we write into outbound long headers, and the one
+        // the Initial keys derive from (a compatible switch after a Retry —
+        // RFC 9369 §4.1 — re-keys from here).
         self.endpoint.cids.peer = new_scid;
+        self.initial_keying_dcid = new_scid;
 
         // Stash the SCID + token for the next outbound Initial.
         self.retry_scid = Some(new_scid);
@@ -4280,11 +4559,16 @@ impl QuicConnection {
             self.our_params.initial_source_connection_id =
                 Some(self.endpoint.cids.local.as_slice().to_vec());
         }
-        // Re-encode and push to the engine's hook so the EE build picks
-        // up the new bytes. (Idempotent — calling repeatedly is safe.)
-        let mut tp_bytes = Vec::new();
-        self.our_params.encode(&mut tp_bytes);
-        self.hooks.set_our_params(tp_bytes);
+        // RFC 9368 §3 — the Chosen Version we advertise is the connection's
+        // version (the Negotiated Version once compatible negotiation runs;
+        // the hook sets it too, but keep our copy consistent for
+        // `peer_transport_params`-style symmetry).
+        if let Some(vi) = self.our_params.version_information.as_mut() {
+            vi.chosen = self.version.wire();
+        }
+        // Push to the engine's hook so the EE build picks up the new
+        // parameters. (Idempotent — calling repeatedly is safe.)
+        self.hooks.set_our_params(self.our_params.clone());
     }
 
     /// Drains the engine's outbound CRYPTO bytes into the per-level
@@ -4299,6 +4583,16 @@ impl QuicConnection {
     /// this in [`Self::feed_datagram`]) — by the time control returns
     /// here, the peer's params have NOT been stored.
     fn drain_engine_outputs(&mut self) -> Result<(), Error> {
+        // RFC 9368 §2.3 — server-side compatible version negotiation. The
+        // hook selected the Negotiated Version while the engine parsed the
+        // client's transport parameters (during the dispatch that preceded
+        // this drain); apply it BEFORE the secret events below install the
+        // Handshake / 1-RTT keys, so those land in the negotiated version.
+        if self.role == Role::Server
+            && let Some(neg) = self.hooks.take_negotiated_version()
+        {
+            self.apply_server_negotiated_version(neg);
+        }
         // Handshake bytes per level.
         for lvl in [
             Level::Initial,
@@ -4340,7 +4634,14 @@ impl QuicConnection {
                 return Err(Error::HandshakeFailure);
             };
             for (lvl, dir, secret) in events {
-                let keys = derive_dir_keys(alg, &secret);
+                // RFC 9369 §4.1 — Handshake and 1-RTT keys are the negotiated
+                // version's; 0-RTT keys stay the original version's (the
+                // client never sends 0-RTT in the negotiated version).
+                let key_version = match lvl {
+                    Level::EarlyData => self.original_version,
+                    _ => self.version,
+                };
+                let keys = derive_dir_keys(key_version, alg, &secret);
                 match dir {
                     Direction::Tx => {
                         self.endpoint.crypto.at_mut(lvl).tx = Some(keys);
@@ -4363,6 +4664,22 @@ impl QuicConnection {
         {
             let parsed = TransportParameters::decode(&raw)?;
             self.validate_peer_transport_params(&parsed)?;
+            // RFC 9368 §4 — validate the peer's Version Information (both
+            // roles). A parsing failure is TRANSPORT_PARAMETER_ERROR; a
+            // negotiation/downgrade failure is VERSION_NEGOTIATION_ERROR
+            // (0x11, §10.2). Servers already ran §2.3 selection in the hook;
+            // this re-checks the client's offer and, on the client, applies
+            // the §4 downgrade protection over the server's Available
+            // Versions. A missing Version Information is tolerated except
+            // where §4 makes it mandatory (a client reacting to VN).
+            self.validate_peer_version_information(parsed.version_information.as_ref())
+                .map_err(|e| {
+                    self.pending_error_code = Some(match e {
+                        VersionError::Malformed => ERROR_TRANSPORT_PARAMETER,
+                        VersionError::Negotiation => ERROR_VERSION_NEGOTIATION,
+                    });
+                    Error::IllegalParameter
+                })?;
             // RFC 9001 §4.6.1 — the 0-RTT flight went out under the values
             // remembered from the previous connection. The server is
             // forbidden from reducing them; if it did, streams we already
@@ -4582,6 +4899,44 @@ impl QuicConnection {
         Ok(())
     }
 
+    /// RFC 9368 §4 — validate the peer's `version_information`.
+    ///
+    /// On the **server** this re-runs the §2.3 selection the hook already
+    /// performed, so a client whose Chosen Version does not match the
+    /// version in use, or whose Available Versions omit it, is caught here
+    /// too (the hook silently declined to negotiate; the driver is where the
+    /// connection is closed). On the **client** it fixes the Negotiated
+    /// Version (the version the handshake packets carry — RFC 9369 §4.1) and
+    /// runs the §4 downgrade checks over the server's information, which is
+    /// what defeats a forged Version Negotiation packet.
+    fn validate_peer_version_information(
+        &mut self,
+        peer: Option<&VersionInformation>,
+    ) -> Result<(), VersionError> {
+        match self.role {
+            Role::Server => {
+                select_server_version(&self.versions, self.original_version, peer)?;
+                Ok(())
+            }
+            Role::Client => {
+                // The version in use for the connection *is* the Negotiated
+                // Version (RFC 9368 §4): the version of the long headers the
+                // server's handshake packets arrived in. If the server never
+                // switched, that is the original version (§4.1 — a CRYPTO
+                // frame in the original version signals no switch).
+                let negotiated = self.negotiated_version.unwrap_or(self.version);
+                self.negotiated_version = Some(negotiated);
+                check_server_version_information(
+                    &self.versions,
+                    self.original_version,
+                    negotiated,
+                    self.reacted_to_vn,
+                    peer,
+                )
+            }
+        }
+    }
+
     fn check_handshake_complete(&mut self) {
         let engine_done = match &self.engine {
             EngineSide::Client(c) => !c.is_handshaking(),
@@ -4690,6 +5045,11 @@ impl QuicConnection {
             let lk = self.endpoint.crypto.at_mut(lvl);
             lk.tx = None;
             lk.rx = None;
+            if lvl == Level::Initial {
+                // RFC 9369 §4.1 — the retained original-version Initial
+                // receive keys go when the Initial level does.
+                self.original_initial_rx = None;
+            }
             // Reset the per-level CRYPTO buffer so no outbound chunk remains to
             // be (re)transmitted and no inbound reassembly state lingers.
             *self.endpoint.bufs.at_mut(lvl) = crate::quic::crypto_buf::CryptoBuf::new();
@@ -4840,7 +5200,20 @@ impl QuicConnection {
     ///
     /// Called only after the packet's AEAD tag has verified, so an off-path
     /// forgery cannot pin any of it (M-3).
-    fn commit_first_initial(&mut self, dcid: &[u8], scid: &[u8]) -> Result<(), Error> {
+    fn commit_first_initial(
+        &mut self,
+        version: QuicVersion,
+        dcid: &[u8],
+        scid: &[u8],
+    ) -> Result<(), Error> {
+        // RFC 9368 §4 — the connection is in the version its first Initial
+        // was sent in (the client's Chosen Version). Record it, and hand the
+        // hook the policy for compatible version negotiation (§2.3): the
+        // versions we accept, in preference order, and the version in use.
+        self.original_version = version;
+        self.version = version;
+        self.hooks
+            .set_version_policy(self.versions.clone(), version);
         let peer_scid = ConnectionId::from_slice(scid).ok_or(Error::Decode)?;
         let our_scid = if let Some(retry_scid) = self.retry_scid.as_ref() {
             // Retry path: reuse the SCID we picked for the Retry packet. This
@@ -4872,7 +5245,10 @@ impl QuicConnection {
             self.pending_scid.unwrap_or_else(random_default_scid)
         };
         set_cids_from_first_initial(&mut self.endpoint, peer_scid, our_scid);
-        install_initial_keys(&mut self.endpoint, dcid);
+        install_initial_keys(&mut self.endpoint, version, dcid);
+        // The DCID a later compatible switch (RFC 9369 §4.1) re-keys from.
+        self.initial_keying_dcid =
+            ConnectionId::from_slice(dcid).unwrap_or_else(ConnectionId::empty);
         self.initial_keys_installed = true;
         // Seed the local CID pool with our SCID at sequence 0, carrying the
         // exact stateless-reset token we advertised in our transport
@@ -4897,6 +5273,48 @@ impl QuicConnection {
         // fields that the client cross-checks against what it observed.
         self.populate_server_only_tp();
         Ok(())
+    }
+
+    /// RFC 9368 §2.3 / RFC 9369 §4.1 — the client's compatible switch to the
+    /// Negotiated Version `to`, learned from a server long header. Re-derives
+    /// the Initial keys for `to` from the same keying DCID (RFC 9001 §5.2),
+    /// keeps the original-version Initial *receive* keys so a reordered
+    /// original-version Initial still opens (§4.1: "The server MUST NOT
+    /// discard its original version Initial receive keys until it
+    /// successfully processes a Handshake packet with the negotiated
+    /// version" — the client keeps them symmetrically), and records the
+    /// Negotiated Version.
+    fn switch_client_version(&mut self, to: QuicVersion) {
+        // Stash the current (original-version) Initial rx keys.
+        self.original_initial_rx = self.endpoint.crypto.at_mut(Level::Initial).rx.take();
+        let (tx, rx) = initial_keys_client(to, self.initial_keying_dcid.as_slice());
+        let lk = self.endpoint.crypto.at_mut(Level::Initial);
+        lk.tx = Some(tx);
+        lk.rx = Some(rx);
+        self.version = to;
+        self.negotiated_version = Some(to);
+    }
+
+    /// Server-side: apply the Negotiated Version the hook selected from the
+    /// client's `version_information` (RFC 9368 §2.3). If it differs from the
+    /// version in use, switch the connection's Initial keys to it (keeping
+    /// the original-version receive keys, RFC 9369 §4.1) and re-encode the
+    /// server-only transport parameters so the Chosen Version we echo is the
+    /// negotiated one.
+    fn apply_server_negotiated_version(&mut self, to: QuicVersion) {
+        if self.negotiated_version == Some(to) {
+            return;
+        }
+        self.negotiated_version = Some(to);
+        if to != self.version {
+            self.original_initial_rx = self.endpoint.crypto.at_mut(Level::Initial).rx.take();
+            let (tx, rx) = initial_keys(to, self.initial_keying_dcid.as_slice());
+            let lk = self.endpoint.crypto.at_mut(Level::Initial);
+            lk.tx = Some(tx);
+            lk.rx = Some(rx);
+            self.version = to;
+            self.populate_server_only_tp();
+        }
     }
 
     fn feed_long_header_packet(
@@ -4949,42 +5367,56 @@ impl QuicConnection {
                 // the same way (silent drop).
                 return Ok(datagram.len());
             }
-            let mut has_v1 = false;
-            let mut any_supported = false;
-            for chunk in body.chunks_exact(4) {
-                let v = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                if v == QUIC_V1 {
-                    has_v1 = true;
-                    any_supported = true;
-                }
-                // We only speak v1; nothing else counts as "supported".
+            // RFC 9368 §4: a client already reacting to a Version
+            // Negotiation packet "MUST ignore any Version Negotiation
+            // packets it receives in response to that connection attempt".
+            if self.reacted_to_vn {
+                return Ok(datagram.len());
             }
-            if has_v1 {
-                // RFC 9000 §6.2 — the server contradicting itself
-                // (sending VN that includes v1 in response to a v1
-                // Initial) is a protocol violation. Tear down.
+            let offered: Vec<u32> = body
+                .chunks_exact(4)
+                .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            // RFC 9368 §4 / RFC 9000 §6.2 downgrade protection: a Version
+            // Negotiation packet that lists the version we actually sent (the
+            // Original Version) is ignored — the genuine server would have
+            // parsed that flight, so this can only be an off-path forgery or
+            // the server contradicting itself.
+            if offered.contains(&self.original_version.wire()) {
                 self.closed = true;
                 return Err(Error::IllegalParameter);
             }
-            if !any_supported {
-                // No version we speak. RFC 9000 §6.2: the client
-                // SHOULD attempt a fresh connection with one of the
-                // listed versions; we don't speak any → close.
+            // RFC 9368 §2.1: pick a mutually supported version (our
+            // preference order) and start a NEW connection attempt with it.
+            let Some(chosen) = choose_version(&self.versions, &offered) else {
+                // §2.1: "If it doesn't find one, it SHALL abort the
+                // connection attempt."
                 self.closed = true;
                 return Err(Error::UnsupportedVersion);
-            }
-            // Unreachable in practice — we only support v1, so either
-            // has_v1 (above) or any_supported is false. Kept for
-            // exhaustiveness.
+            };
+            let Some(cfg) = self.restart_cfg.take() else {
+                // Defensive: we only get here on the first attempt, which
+                // always kept its config.
+                self.closed = true;
+                return Err(Error::UnsupportedVersion);
+            };
+            let server_name = self.server_name.clone().unwrap_or_default();
+            // A fresh connection attempt (RFC 9368 §2.4) uses a new random
+            // DCID, in the chosen version, and remembers it reacted to VN so
+            // it will validate the server's Version Information (§4).
+            let new = Self::client_inner(*cfg, &server_name, random_default_cid(), Some(chosen))?;
+            *self = new;
             return Ok(datagram.len());
         }
-        // G-4: Non-VN long-header packets MUST advertise QUIC v1. RFC
-        // 9000 §5.2.2: "an endpoint that receives ... an unsupported
-        // version MAY send a Version Negotiation packet"; we don't
-        // implement multi-version negotiation but we MUST not feed an
-        // unsupported version into the v1-specific keying paths.
-        if hdr.version != QUIC_V1 {
-            // Silent drop — RFC 9000 §5.2.2 allows discarding.
+        // RFC 9368 §4 / RFC 9369 §4.1 — a non-VN long header must be one of
+        // the versions we speak; anything else is silently dropped (RFC 9000
+        // §5.2.2). The client may switch to a compatible version the server
+        // chose (below); the server never sees an unsupported version here
+        // (the router answered it with a VN packet).
+        let Some(pkt_version) = QuicVersion::from_wire(hdr.version) else {
+            return Ok(datagram.len());
+        };
+        if !self.versions.contains(&pkt_version) {
             return Ok(datagram.len());
         }
         if hdr.typ == LongType::Retry {
@@ -5017,6 +5449,53 @@ impl QuicConnection {
             LongType::ZeroRtt => Level::EarlyData,
             LongType::Retry => unreachable!("handled above"),
         };
+
+        // RFC 9368 §2.3 / RFC 9369 §4.1 — compatible version negotiation on
+        // the client: the server answers the original-version first flight
+        // with Initial packets in the Negotiated Version. The client learns
+        // that version from the long header, but commits the switch only
+        // once such a packet AEAD-authenticates — an unauthenticated version
+        // in the header must not make us drop the keys the genuine server's
+        // packets need (Initial AEAD alone is forgeable, RFC 9001 §5.2). The
+        // switch keys are derived here and installed after the tag verifies,
+        // mirroring the server's first-Initial handling.
+        let client_switch = self.role == Role::Client
+            && pkt_version != self.version
+            && self.negotiated_version.is_none()
+            && self.original_version.is_compatible_with(pkt_version)
+            && level == Level::Initial;
+        let client_switch_rx = if client_switch {
+            Some(initial_keys_client(pkt_version, self.initial_keying_dcid.as_slice()).1)
+        } else {
+            None
+        };
+        // RFC 9369 §4.1 — after a compatible switch, keep opening a
+        // reordered *original-version* Initial with the receive keys we
+        // stashed at the switch, until the Initial level is discarded.
+        let use_original_rx = level == Level::Initial
+            && pkt_version == self.original_version
+            && pkt_version != self.version
+            && self.original_initial_rx.is_some();
+        // A server has no version until it reads one off the first Initial
+        // it accepts (RFC 9368 §4): that packet sets the connection's
+        // version in `commit_first_initial`, so it is never dropped for a
+        // `self.version` (still the placeholder) mismatch here. `pkt_version`
+        // is already known to be one we offer.
+        let server_first_initial = self.role == Role::Server
+            && level == Level::Initial
+            && !self.initial_keys_installed
+            && self.endpoint.crypto.at(Level::Initial).rx.is_none();
+        // A packet whose version is neither the one we are keyed for, nor a
+        // pending compatible switch, nor a retained original-version Initial,
+        // nor a server's first Initial is dropped: we hold no keys for it
+        // (RFC 9369 §4.1).
+        if pkt_version != self.version
+            && client_switch_rx.is_none()
+            && !use_original_rx
+            && !server_first_initial
+        {
+            return Ok(datagram.len());
+        }
 
         // RFC 9000 §14.1 — "A server MUST discard an Initial packet that
         // is carried in a UDP datagram with a payload that is smaller
@@ -5090,7 +5569,9 @@ impl QuicConnection {
         let tentative_rx_keys = if tentative_first_initial {
             // Reject a malformed SCID now, before spending an AEAD open on it.
             ConnectionId::from_slice(hdr.scid).ok_or(Error::Decode)?;
-            Some(initial_rx_keys(hdr.dcid))
+            // RFC 9369 §5.2 — the first Initial's version keys it. `pkt_version`
+            // is one of the versions we accept (checked above).
+            Some(initial_rx_keys(pkt_version, hdr.dcid))
         } else {
             None
         };
@@ -5122,23 +5603,31 @@ impl QuicConnection {
         // Borrow the rx keys for this level — the not-yet-installed ones
         // derived from this Initial's DCID when this is a server's first
         // Initial (see `tentative_rx_keys`).
-        let dir_keys_ref = match tentative_rx_keys.as_ref() {
-            Some(k) => k,
-            None => match self.endpoint.crypto.at(level).rx.as_ref() {
+        let dir_keys_ref =
+            match tentative_rx_keys
+                .as_ref()
+                .or(client_switch_rx.as_ref())
+                .or(if use_original_rx {
+                    self.original_initial_rx.as_ref()
+                } else {
+                    None
+                }) {
                 Some(k) => k,
-                None => {
-                    // Keys for this level aren't installed (not yet, or
-                    // already discarded). RFC 9001 §5.7 says we MAY buffer;
-                    // we drop the packet instead. Only *this* packet: its
-                    // Length field is authoritative (RFC 9000 §12.2), so the
-                    // packets coalesced behind it — which may well be
-                    // readable, e.g. a Handshake packet behind a 0-RTT one we
-                    // rejected, or behind an Initial we no longer hold keys
-                    // for — are processed on their own.
-                    return Ok(pkt_total_len);
-                }
-            },
-        };
+                None => match self.endpoint.crypto.at(level).rx.as_ref() {
+                    Some(k) => k,
+                    None => {
+                        // Keys for this level aren't installed (not yet, or
+                        // already discarded). RFC 9001 §5.7 says we MAY buffer;
+                        // we drop the packet instead. Only *this* packet: its
+                        // Length field is authoritative (RFC 9000 §12.2), so the
+                        // packets coalesced behind it — which may well be
+                        // readable, e.g. a Handshake packet behind a 0-RTT one we
+                        // rejected, or behind an Initial we no longer hold keys
+                        // for — are processed on their own.
+                        return Ok(pkt_total_len);
+                    }
+                },
+            };
         let sample_arr: [u8; 16] = pkt[sample_start..sample_end]
             .try_into()
             .expect("16-byte slice");
@@ -5203,11 +5692,19 @@ impl QuicConnection {
         // connection down (it is silently dropped above instead).
         check_reserved_bits(first_byte, true)?;
 
+        // RFC 9368 §2.3 / RFC 9369 §4.1 — the packet authenticated under the
+        // Negotiated Version's Initial keys, so the client's compatible
+        // switch is genuine: re-key Initial to it (keeping the original
+        // version's receive keys for a reordered original-version Initial).
+        if client_switch_rx.is_some() {
+            self.switch_client_version(pkt_version);
+        }
+
         // M-3: the packet is authentic, so the CID state it dictates may now
         // be committed — our Initial keys, the CID pair, the ODCID and the
         // server-only transport parameters that echo it (RFC 9000 §7.3).
         if tentative_rx_keys.is_some() {
-            self.commit_first_initial(hdr.dcid, hdr.scid)?;
+            self.commit_first_initial(pkt_version, hdr.dcid, hdr.scid)?;
         }
 
         // Client-side: the first long-header packet that AUTHENTICATES
@@ -6511,7 +7008,7 @@ impl QuicConnection {
                 };
                 build_long_header(
                     LongType::Initial,
-                    QUIC_V1,
+                    self.version,
                     self.endpoint.cids.peer.as_slice(),
                     self.endpoint.cids.local.as_slice(),
                     token,
@@ -6524,7 +7021,7 @@ impl QuicConnection {
                 let length_field = (pn_len as u64) + payload.len() as u64 + 16;
                 build_long_header(
                     LongType::Handshake,
-                    QUIC_V1,
+                    self.version,
                     self.endpoint.cids.peer.as_slice(),
                     self.endpoint.cids.local.as_slice(),
                     &[],
@@ -6552,8 +7049,9 @@ impl QuicConnection {
                 // packet-number space with 1-RTT (§12.3).
                 let length_field = (pn_len as u64) + payload.len() as u64 + 16;
                 build_long_header(
+                    // RFC 9369 §4.1 — 0-RTT is always the original version.
                     LongType::ZeroRtt,
-                    QUIC_V1,
+                    self.original_version,
                     self.endpoint.cids.peer.as_slice(),
                     self.endpoint.cids.local.as_slice(),
                     &[],
@@ -7025,6 +7523,7 @@ impl QuicConnection {
 
 fn build_client_tls_config(
     cfg: &QuicConfig,
+    session_usable: bool,
     offer_early_data: bool,
 ) -> Result<ClientConfig, Error> {
     // RFC 9001 §8.1 — "When using ALPN, endpoints MUST immediately close
@@ -7038,14 +7537,20 @@ fn build_client_tls_config(
     // Resumption. The TLS client offers `early_data` in its ClientHello
     // whenever the stored session carries a non-zero `max_early_data_size`,
     // so a caller who resumed without opting into 0-RTT gets the ticket with
-    // that field zeroed: PSK resumption without early data.
-    let session = cfg.resumption.as_ref().map(|session| {
-        let mut stored = session.tls.clone();
-        if !offer_early_data {
-            stored.max_early_data_size = None;
-        }
-        stored
-    });
+    // that field zeroed: PSK resumption without early data. A session bound
+    // to another QUIC version than this attempt's (RFC 9369 §5) is not
+    // offered at all.
+    let session = cfg
+        .resumption
+        .as_ref()
+        .filter(|_| session_usable)
+        .map(|session| {
+            let mut stored = session.tls.clone();
+            if !offer_early_data {
+                stored.max_early_data_size = None;
+            }
+            stored
+        });
     tls13_client_config(&cfg.tls, Tls13Transport::Quic, session)
 }
 
@@ -7093,6 +7598,7 @@ mod tests {
     use super::*;
     use crate::ec::Ed25519PrivateKey;
     use crate::hash::Sha256;
+    use crate::quic::pkt::QUIC_V1;
     use crate::rng::HmacDrbg;
     use crate::tls::{Config, Identity, RootCertStore, SigningKey};
     use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
@@ -10103,7 +10609,7 @@ mod tests {
         // SCID = the DCID we chose. The integrity tag is over our ODCID and
         // is computable by anyone.
         let forged = build_retry(
-            QUIC_V1,
+            QuicVersion::V1,
             c.endpoint.cids.local.as_slice(),
             odcid.as_slice(),
             b"forged-token",
@@ -10162,7 +10668,7 @@ mod tests {
         // Validly-tagged forged Retry addressed to us, steering the client
         // at the attacker's SCID.
         let forged = build_retry(
-            QUIC_V1,
+            QuicVersion::V1,
             c.endpoint.cids.local.as_slice(),
             &attacker_scid,
             b"forged-token",
@@ -12198,6 +12704,37 @@ mod tests {
         let (n3, _fin) = c.read(cid, &mut buf3).expect("client read 2");
         assert!(n3 > 0, "client must see phase-0 reply");
         assert_eq!(&buf3[..n3], b"phase-0-again");
+    }
+
+    /// RFC 9369 §3.3.2 — the same key-update round trip under QUIC v2, whose
+    /// `quicv2 ku` / `quicv2 key` / `quicv2 iv` labels must produce keys both
+    /// sides agree on: the peer commits the flipped phase and the initiator
+    /// confirms.
+    #[test]
+    fn key_update_bidirectional_integration_v2() {
+        let (mut c, mut s) = loopback_pair_versions(
+            alloc::vec![QuicVersion::V2],
+            None,
+            alloc::vec![QuicVersion::V2],
+        );
+        drive_until_complete(&mut c, &mut s, 8);
+        assert_eq!(c.version(), QuicVersion::V2);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        c.initiate_key_update().expect("client initiates");
+        assert_eq!(c.key_phase(), 1);
+        assert!(c.key_update_pending());
+        let cid = c.open_bidi().expect("open bidi");
+        c.write(cid, b"v2-after-update").expect("write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert_eq!(s.key_phase(), 1, "server commits phase 1 under v2");
+        assert!(!c.key_update_pending(), "client confirms under v2");
+        let mut buf = [0u8; 64];
+        let (n, _fin) = s.read(StreamId(cid.0), &mut buf).expect("server read");
+        assert_eq!(&buf[..n], b"v2-after-update");
     }
 
     /// RFC 9001 §6.1 / §6.2 — on an idle connection the flipped phase would
@@ -14624,13 +15161,13 @@ mod tests {
     fn seal_forged_initial(dcid: &[u8], scid: &[u8], plaintext: &mut [u8]) -> Vec<u8> {
         use crate::quic::crypto::{aead_seal, derive_dir_keys, derive_initial_secrets};
         use crate::quic::pkt::{apply_header_protection, build_long_header};
-        let (client_secret, _) = derive_initial_secrets(dcid);
-        let keys = derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret);
+        let (client_secret, _) = derive_initial_secrets(QuicVersion::V1, dcid);
+        let keys = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &client_secret);
         let (pn, pn_len) = (0u64, 1u8);
         let length_field = pn_len as u64 + plaintext.len() as u64 + 16;
         let (mut pkt, pn_offset) = build_long_header(
             LongType::Initial,
-            QUIC_V1,
+            QuicVersion::V1,
             dcid,
             scid,
             &[],
@@ -15402,5 +15939,240 @@ mod tests {
         let err = c.dispatch_frames(Level::OneRtt, 101, &payload).unwrap_err();
         assert!(matches!(err, Error::IllegalParameter), "{err:?}");
         assert_eq!(transport_error_code(&err), ERROR_PROTOCOL_VIOLATION);
+    }
+
+    // ================= RFC 9368 / RFC 9369 — version negotiation ==========
+
+    /// A (client, server) pair with explicit version lists (and an optional
+    /// client original version). Mirrors [`loopback_pair`] otherwise.
+    fn loopback_pair_versions(
+        client_versions: Vec<QuicVersion>,
+        client_original: Option<QuicVersion>,
+        server_versions: Vec<QuicVersion>,
+    ) -> (QuicConnection, QuicConnection) {
+        let (server_cfg_tls, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let client = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: loopback_params(),
+                versions: client_versions,
+                original_version: client_original,
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let server = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: loopback_params(),
+            versions: server_versions,
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        (client, server)
+    }
+
+    /// Both sides prefer v2 and offer both: the handshake runs entirely in
+    /// v2 (RFC 9369), first flight included.
+    #[test]
+    fn v2_only_handshake_completes() {
+        let (mut c, mut s) = loopback_pair_versions(
+            alloc::vec![QuicVersion::V2],
+            None,
+            alloc::vec![QuicVersion::V2, QuicVersion::V1],
+        );
+        // The client's very first datagram is a v2 Initial.
+        let first = c.pop_datagram();
+        assert_eq!(&first[1..5], &QuicVersion::V2.wire().to_be_bytes());
+        s.feed_datagram(&first).expect("server feed v2 initial");
+        drive_until_complete(&mut c, &mut s, 8);
+        assert_eq!(c.version(), QuicVersion::V2);
+        assert_eq!(s.version(), QuicVersion::V2);
+        assert_eq!(c.original_version(), QuicVersion::V2);
+    }
+
+    /// RFC 9368 §2.3 / RFC 9369 §4.1 compatible negotiation: the client's
+    /// first flight is v1 but it offers v2, and a v2-preferring server
+    /// upgrades the connection to v2 without a round trip. The client learns
+    /// v2 from the server's long header; both end on v2.
+    #[test]
+    fn compatible_v1_to_v2_upgrade() {
+        let (mut c, mut s) = loopback_pair_versions(
+            alloc::vec![QuicVersion::V1, QuicVersion::V2],
+            Some(QuicVersion::V1),
+            alloc::vec![QuicVersion::V2, QuicVersion::V1],
+        );
+        let first = c.pop_datagram();
+        // The Original Version on the wire is v1 (RFC 9368 §2.5).
+        assert_eq!(&first[1..5], &QuicVersion::V1.wire().to_be_bytes());
+        s.feed_datagram(&first).expect("server feed v1 initial");
+        drive_until_complete(&mut c, &mut s, 8);
+        assert_eq!(c.original_version(), QuicVersion::V1);
+        assert_eq!(c.version(), QuicVersion::V2, "client upgraded to v2");
+        assert_eq!(s.version(), QuicVersion::V2, "server chose v2");
+    }
+
+    /// A client offering only v1 and a server offering only v1 stay on v1
+    /// even though both understand the version_information TP.
+    #[test]
+    fn v1_only_stays_v1() {
+        let (mut c, mut s) = loopback_pair_versions(
+            alloc::vec![QuicVersion::V1],
+            None,
+            alloc::vec![QuicVersion::V1],
+        );
+        drive_until_complete(&mut c, &mut s, 8);
+        assert_eq!(c.version(), QuicVersion::V1);
+        assert_eq!(s.version(), QuicVersion::V1);
+    }
+
+    /// A client that offers only v1 must not be upgraded by a v2-preferring
+    /// server: RFC 9368 §2.3 has the server select a version it supports AND
+    /// the client offered; with no overlap beyond v1 it keeps v1.
+    #[test]
+    fn server_does_not_pick_a_version_the_client_did_not_offer() {
+        let (mut c, mut s) = loopback_pair_versions(
+            alloc::vec![QuicVersion::V1],
+            None,
+            alloc::vec![QuicVersion::V2, QuicVersion::V1],
+        );
+        drive_until_complete(&mut c, &mut s, 8);
+        assert_eq!(c.version(), QuicVersion::V1);
+        assert_eq!(s.version(), QuicVersion::V1);
+    }
+
+    /// RFC 9368 §4 downgrade detection at the connection layer: a client
+    /// whose handshake packets arrive in v2 but whose server advertises a
+    /// Chosen Version of v1 (a forged / inconsistent `version_information`)
+    /// is rejected with VERSION_NEGOTIATION_ERROR. Exercised directly on
+    /// the validation entry point, which is where `drain_engine_outputs`
+    /// funnels the peer's Version Information.
+    #[test]
+    fn client_rejects_chosen_version_mismatch() {
+        let (mut c, _s) = loopback_pair_versions(
+            alloc::vec![QuicVersion::V2, QuicVersion::V1],
+            Some(QuicVersion::V2),
+            alloc::vec![QuicVersion::V2, QuicVersion::V1],
+        );
+        // The connection is in v2 (the version its packets carry).
+        c.version = QuicVersion::V2;
+        // Server claims a v1 Chosen Version — inconsistent with the v2
+        // long headers the client saw. §4: a version negotiation error.
+        let bad = VersionInformation {
+            chosen: QuicVersion::V1.wire(),
+            available: alloc::vec![QuicVersion::V1.wire(), QuicVersion::V2.wire()],
+        };
+        assert_eq!(
+            c.validate_peer_version_information(Some(&bad)),
+            Err(VersionError::Negotiation)
+        );
+        // A consistent v2 Chosen Version is accepted.
+        let good = VersionInformation {
+            chosen: QuicVersion::V2.wire(),
+            available: alloc::vec![QuicVersion::V2.wire(), QuicVersion::V1.wire()],
+        };
+        c.negotiated_version = None;
+        assert_eq!(c.validate_peer_version_information(Some(&good)), Ok(()));
+    }
+
+    /// RFC 9368 §4 downgrade detection after an (incompatible) Version
+    /// Negotiation packet: a client that was pushed from its preferred v2
+    /// down to v1 by a VN packet, but whose server turns out to support v2
+    /// (its Available Versions include it), detects the forged VN and
+    /// rejects with a version negotiation error.
+    #[test]
+    fn client_detects_forged_vn_downgrade() {
+        let (mut c, _s) = loopback_pair_versions(
+            alloc::vec![QuicVersion::V2, QuicVersion::V1],
+            Some(QuicVersion::V1),
+            alloc::vec![QuicVersion::V1],
+        );
+        // Simulate the state after reacting to a VN packet that forced v1.
+        c.reacted_to_vn = true;
+        c.version = QuicVersion::V1;
+        c.negotiated_version = Some(QuicVersion::V1);
+        // The server actually supports v2 — so we would have preferred v2;
+        // the VN packet that pushed us to v1 was forged.
+        let srv = VersionInformation {
+            chosen: QuicVersion::V1.wire(),
+            available: alloc::vec![QuicVersion::V1.wire(), QuicVersion::V2.wire()],
+        };
+        assert_eq!(
+            c.validate_peer_version_information(Some(&srv)),
+            Err(VersionError::Negotiation)
+        );
+        // A server that genuinely only has v1 is accepted.
+        let only1 = VersionInformation {
+            chosen: QuicVersion::V1.wire(),
+            available: alloc::vec![QuicVersion::V1.wire()],
+        };
+        assert_eq!(c.validate_peer_version_information(Some(&only1)), Ok(()));
+    }
+
+    /// RFC 9369 §5 — a session ticket is bound to its QUIC version, so a v1
+    /// session is not applied to a v2-only attempt: the attempt stays v2.
+    #[test]
+    fn session_is_version_bound() {
+        let session = QuicSession {
+            tls: crate::tls::conn::StoredSession {
+                server_name: alloc::string::String::from("loopback.example"),
+                ticket: alloc::vec![1, 2, 3, 4],
+                psk: crate::zeroize::Zeroizing::new(alloc::vec![9u8; 32]),
+                age_add: 0,
+                lifetime_seconds: 600,
+                received_at: crate::x509::Time::from_unix(1),
+                max_early_data_size: None,
+                negotiated_alpn: Some(b"test".to_vec()),
+                cipher_suite_hash: crate::tls::crypto::HashAlg::Sha256,
+                verify_certificates: false,
+                cipher_suite: 0x1301,
+            },
+            peer_params: loopback_params(),
+            version: QuicVersion::V1,
+        };
+        assert_eq!(session.version(), QuicVersion::V1);
+        let (_server_cfg, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client = QuicConnection::client(
+            QuicConfig {
+                tls: Config {
+                    roots,
+                    alpn_protocols: alloc::vec![b"test".to_vec()],
+                    max_version: crate::tls::ProtocolVersion::TLSv1_3,
+                    min_version: crate::tls::ProtocolVersion::TLSv1_3,
+                    ..Config::default()
+                },
+                transport_params: loopback_params(),
+                versions: alloc::vec![QuicVersion::V2],
+                resumption: Some(session),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        assert_eq!(client.original_version(), QuicVersion::V2);
+    }
+
+    /// An empty version list is rejected at construction.
+    #[test]
+    fn empty_version_list_is_rejected() {
+        let (server_cfg, _cert) = ed25519_server();
+        let err = QuicConnection::server(QuicConfig {
+            tls: server_cfg,
+            transport_params: loopback_params(),
+            versions: alloc::vec![],
+            ..QuicConfig::default()
+        });
+        assert!(matches!(err, Err(Error::IllegalParameter)));
     }
 }
