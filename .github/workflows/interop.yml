@@ -122,6 +122,12 @@ jobs:
           # TLS 1.3 plus the DTLS 1.2 / 1.3 matrix.
           - peer: wolfssl
             runs-on: ubuntu-latest
+          # A small DTLS driver on the same libwolfssl
+          # (tools/interop/peers/wolfssl-driver/): the DTLS resumption and
+          # 0-RTT cases the example tools cannot express (0-RTT towards a
+          # wolfSSL server needs wolfSSL_dtls13_no_hrr_on_resume()).
+          - peer: wolfssl-driver
+            runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -276,15 +282,15 @@ jobs:
           (Get-TlsCipherSuite).Name
       # ---- wolfssl -----------------------------------------------------
       - name: Cache wolfSSL
-        if: matrix.peer == 'wolfssl'
+        if: matrix.peer == 'wolfssl' || matrix.peer == 'wolfssl-driver'
         id: cache-wolfssl
         uses: actions/cache@v5
         with:
           path: ~/wolfssl
-          key: wolfssl-${{ env.WOLFSSL_TAG }}-${{ runner.os }}-v1
+          key: wolfssl-${{ env.WOLFSSL_TAG }}-${{ runner.os }}-v2
 
       - name: Build wolfSSL
-        if: matrix.peer == 'wolfssl' && steps.cache-wolfssl.outputs.cache-hit != 'true'
+        if: (matrix.peer == 'wolfssl' || matrix.peer == 'wolfssl-driver') && steps.cache-wolfssl.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           sudo apt-get update
@@ -298,7 +304,12 @@ jobs:
           # stapling, X25519/Ed25519/X448/Ed448, ML-KEM and ML-DSA, raw
           # public keys, RSA-PSS (TLS 1.3 needs it), the HRR cookie, and
           # the OpenSSL-compat layer the examples' summaries use.
-          ./configure --enable-static --disable-shared \
+          # WOLFSSL_DTLS13_NO_HRR_ON_RESUME only makes
+          # wolfSSL_dtls13_no_hrr_on_resume() available (a runtime opt-in
+          # the examples never call, so their cases are unchanged); the
+          # wolfssl-driver peer uses it for DTLS 1.3 0-RTT. The library and
+          # headers are installed into ~/wolfssl for that driver.
+          ./configure --prefix="$HOME/wolfssl" --enable-static --disable-shared \
             --enable-tls13 --enable-dtls --enable-dtls13 --enable-dtlscid \
             --enable-dtls-mtu --enable-dtls-frag-ch --enable-hrrcookie \
             --enable-session-ticket --enable-earlydata --enable-alpn \
@@ -307,8 +318,10 @@ jobs:
             --enable-ed448 --enable-mlkem --enable-mldsa --enable-rpk \
             --enable-secure-renegotiation --enable-opensslextra \
             --enable-rsapss --enable-maxfragment --enable-psk \
-            --enable-postauth --enable-sp-math-all
+            --enable-postauth --enable-sp-math-all \
+            CPPFLAGS="-DWOLFSSL_DTLS13_NO_HRR_ON_RESUME"
           make -j"$(nproc)"
+          make install
           # The examples chdir to the nearest ancestor holding certs/; the
           # adapter runs them from ~/wolfssl.
           mkdir -p ~/wolfssl/examples/client ~/wolfssl/examples/server
