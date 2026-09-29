@@ -128,7 +128,7 @@ proto_opts() {
 
 cmd_supports() {
     case $CASE_FEAT in
-        certcomp) skip "wolfSSL does not implement RFC 8879 certificate compression" ;;
+        certcomp|certcomp-brotli|certcomp-zstd|certcomp-client) skip "wolfSSL does not implement RFC 8879 certificate compression" ;;
         0rtt-hrr)
             if [ "$CASE_ROLE" = peer-client ]; then
                 # The resumed connection shares the group the session

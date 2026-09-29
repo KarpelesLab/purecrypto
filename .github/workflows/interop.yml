@@ -37,9 +37,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # OpenSSL built from source for the `openssl-src` peer: X25519MLKEM768,
-  # ML-DSA certificates, raw public keys and zlib certificate compression,
-  # none of which the runner's OpenSSL 3.0 has. Bump deliberately: the
-  # cache key follows it.
+  # ML-DSA certificates, raw public keys and certificate compression with
+  # zlib, brotli and zstd, none of which the runner's OpenSSL 3.0 has. Bump
+  # deliberately: the cache key follows it.
   OPENSSL_SRC_TAG: openssl-3.6.4
   # google/boringssl master of 2026-09-27 (the same pin as
   # interop-boringssl.yml). Bump deliberately: the cache key follows it.
@@ -157,23 +157,27 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/openssl-src
-          key: openssl-src-${{ env.OPENSSL_SRC_TAG }}-${{ runner.os }}-v1
+          key: openssl-src-${{ env.OPENSSL_SRC_TAG }}-${{ runner.os }}-v2
 
       - name: Build OpenSSL from source
         if: matrix.peer == 'openssl-src' && steps.cache-openssl-src.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends zlib1g-dev
+          sudo apt-get install -y --no-install-recommends zlib1g-dev libbrotli-dev libzstd-dev
           git clone --depth 1 --branch "$OPENSSL_SRC_TAG" https://github.com/openssl/openssl.git openssl-src
           cd openssl-src
-          # zlib for RFC 8879 certificate compression; static, so the
-          # cached binary needs no library path.
+          # zlib, brotli and zstd for RFC 8879 certificate compression (one
+          # interop case pins each). OpenSSL itself is static, so the cached
+          # binary needs no library path; brotli and zstd are the runner
+          # image's shared libraries (libbrotli1, libzstd1 — present on
+          # every ubuntu image: curl and dpkg depend on them).
           ./Configure --prefix="$HOME/openssl-src" --openssldir="$HOME/openssl-src/ssl" \
-            --libdir=lib no-shared no-tests enable-zlib
+            --libdir=lib no-shared no-tests enable-zlib enable-brotli enable-zstd
           make -j"$(nproc)" build_sw
           make install_sw
           "$HOME/openssl-src/bin/openssl" version -a
+          "$HOME/openssl-src/bin/openssl" list -disabled
 
       # ---- boringssl ---------------------------------------------------
       - name: Cache bssl
@@ -365,7 +369,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/gnutls-src
-          key: gnutls-src-${{ env.GNUTLS_SRC_VERSION }}-${{ env.LEANCRYPTO_TAG }}-nettle${{ env.NETTLE_SRC_VERSION }}-${{ runner.os }}-v1
+          key: gnutls-src-${{ env.GNUTLS_SRC_VERSION }}-${{ env.LEANCRYPTO_TAG }}-nettle${{ env.NETTLE_SRC_VERSION }}-${{ runner.os }}-v2
 
       - name: Build GnuTLS from source
         if: matrix.peer == 'gnutls-src' && steps.cache-gnutls-src.outputs.cache-hit != 'true'
@@ -373,7 +377,7 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            meson ninja-build libgmp-dev libunistring-dev libidn2-dev zlib1g-dev
+            meson ninja-build libgmp-dev libunistring-dev libidn2-dev zlib1g-dev libbrotli-dev libzstd-dev
           PREFIX=$HOME/gnutls-src
           export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig
           # Everything links into the prefix by rpath, so the cached tree
@@ -398,6 +402,7 @@ jobs:
           curl -sSL "https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-$GNUTLS_SRC_VERSION.tar.xz" | tar xJ
           (cd "gnutls-$GNUTLS_SRC_VERSION" &&
             ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" --with-leancrypto \
+              --with-zlib --with-brotli --with-zstd \
               --disable-doc --disable-tests --disable-full-test-suite --disable-guile \
               --disable-cxx --disable-libdane --without-p11-kit --without-tpm --without-tpm2 \
               --with-included-libtasn1 --with-included-unistring &&

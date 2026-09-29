@@ -129,6 +129,14 @@ cmd_supports() {
         # client too. Rejected early data (the HRR case) completes fine.
         0rtt) [ "$CASE_ROLE" = peer-client ] || skip "a Network.framework server that accepts 0-RTT never completes the connection" ;;
         certcomp) spi_or_skip sec_protocol_metadata_get_tls_certificate_compression_used ;;
+        # Offered brotli or zstd alone, the Apple server sends its
+        # certificate plain: the stack registers zlib only.
+        certcomp-brotli|certcomp-zstd) skip "Network.framework registers zlib certificate compression only" ;;
+        # Checked with the mTLS wiring in place: the Apple server's
+        # CertificateRequest carries no compress_certificate, and its client
+        # sends a plain certificate when invited (BoringSSL implements RFC
+        # 8879 for the server certificate only).
+        certcomp-client) skip "Network.framework neither invites nor sends a compressed client certificate" ;;
         ocsp) [ "$CASE_ROLE" = peer-client ] || skip "Network.framework has no API to staple an OCSP response on a server" ;;
         # Accepting a peer's raw public key works through the SPI (the
         # allowlist is enforced: a key not on it draws bad_certificate);

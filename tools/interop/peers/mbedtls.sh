@@ -91,7 +91,7 @@ cmd_supports() {
     esac
     case $CASE_FEAT in
         keyupdate|keyupdate-peer) skip "Mbed TLS does not implement TLS 1.3 KeyUpdate (a received one is an unexpected message)" ;;
-        certcomp) skip "Mbed TLS has no RFC 8879 certificate compression" ;;
+        certcomp|certcomp-brotli|certcomp-zstd|certcomp-client) skip "Mbed TLS has no RFC 8879 certificate compression" ;;
         rpk|rpk-client) skip "Mbed TLS has no RFC 7250 raw public keys" ;;
         ocsp) skip "Mbed TLS has no status_request (OCSP stapling)" ;;
         # A handshake message must fit the fixed 16 KiB I/O buffer

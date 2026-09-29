@@ -89,7 +89,7 @@ cmd_supports() {
         # interface.
         resume-psk) skip "SslStream exposes no PSK-only (psk_ke) resumption" ;;
         extpsk) skip "SslStream has no external-PSK API" ;;
-        certcomp) skip "SChannel does not implement RFC 8879 certificate compression" ;;
+        certcomp|certcomp-brotli|certcomp-zstd|certcomp-client) skip "SChannel does not implement RFC 8879 certificate compression" ;;
         rpk|rpk-client) skip "SChannel does not implement RFC 7250 raw public keys" ;;
         rsl) skip "SChannel does not implement RFC 8449 record_size_limit" ;;
         ocsp) [ "$CASE_ROLE" = peer-client ] || skip "SChannel staples only a response it fetched itself (AIA); no API to supply one" ;;

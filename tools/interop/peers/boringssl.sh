@@ -60,7 +60,7 @@ cmd_supports() {
     fi
     case $CASE_FEAT in
         keyupdate-peer) skip "bssl has no way to trigger a KeyUpdate" ;;
-        certcomp) skip "the bssl tool registers no certificate compression algorithm" ;;
+        certcomp|certcomp-brotli|certcomp-zstd|certcomp-client) skip "the bssl tool registers no certificate compression algorithm" ;;
         alpn) [ "$CASE_ROLE" = peer-client ] || skip "bssl server has no ALPN option" ;;
         rsl) skip "BoringSSL does not implement RFC 8449 record_size_limit" ;;
         # The tool treats SSL_ERROR_EARLY_DATA_REJECTED as fatal instead of

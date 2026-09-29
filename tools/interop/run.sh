@@ -103,7 +103,7 @@ GROUPS_ALL="x25519 p256 p384 p521 x25519mlkem768 secp256r1mlkem768 secp384r1mlke
 SUITES="aes128gcm aes256gcm chacha20"
 # Features beyond the plain handshake, run with cert=p256 group=x25519
 # suite=aes128gcm unless the feature says otherwise.
-FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp rpk rpk-client ocsp alpn rsl large-chain tls12 extpsk"
+FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp certcomp-brotli certcomp-zstd certcomp-client rpk rpk-client ocsp alpn rsl large-chain tls12 extpsk"
 # The DTLS matrix (per DTLS version the adapter's `protos` lists): the plain
 # product, then one case per feature. Features TLS has no counterpart for:
 # `mtu` (a > 16 KiB chain sent at a 512-byte path MTU: dozens of handshake
@@ -503,12 +503,25 @@ pc_client_args() {
         hrr) a="-connect 127.0.0.1:$PORT -CAfile $PKI/ca.crt -servername localhost -read_timeout 2 -groups $(other_group "$CASE_GROUP"):$(pc_group "$CASE_GROUP") -key-shares $(other_group "$CASE_GROUP") -ciphersuites $(pc_suite "$CASE_SUITE")" ;;
         mtls) a="$a $(pc_ident "$CASE_CERT")" ;;
         keyupdate) a="$a -key_update" ;;
+        # RFC 8879: one algorithm advertised (and used for the client
+        # certificate), so the peer's own preference cannot pick another.
+        certcomp|certcomp-brotli|certcomp-zstd) a="$a -cert_comp $(certcomp_alg)" ;;
+        certcomp-client) a="$a $(pc_ident "$CASE_CERT") -cert_comp zlib" ;;
         rpk) a="$a -enable_server_rpk -rpk_peer_key $PKI/$CASE_CERT.pub" ;;
         rpk-client) a="$a $(pc_ident "$CASE_CERT") -enable_client_rpk" ;;
         alpn) a="$a -alpn h2,http/1.1" ;;
         rsl) a="$a -record_size_limit 512" ;;
     esac
     echo "$a"
+}
+
+# certcomp_alg: the RFC 8879 algorithm a `certcomp*` case pins.
+certcomp_alg() {
+    case $CASE_FEAT in
+        certcomp-brotli) echo brotli ;;
+        certcomp-zstd) echo zstd ;;
+        *) echo zlib ;;
+    esac
 }
 
 # pc_server_args: the s_server arguments for the case (the purecrypto side
@@ -548,6 +561,8 @@ pc_server_args() {
         0rtt-hrr) a="$a -naccept 2 -early_data" ;;
         mtls) a="$a -Verify $PKI/ca.crt" ;;
         keyupdate) a="$a -key_update" ;;
+        certcomp|certcomp-brotli|certcomp-zstd) a="$a -cert_comp $(certcomp_alg)" ;;
+        certcomp-client) a="$a -Verify $PKI/ca.crt -cert_comp zlib" ;;
         rpk) a="$a -enable_server_rpk" ;;
         rpk-client) a="$a -Verify $PKI/ca.crt -enable_client_rpk -rpk_peer_key $PKI/$CASE_CERT.pub" ;;
         ocsp) a="$a -status_file $OCSP" ;;
@@ -651,11 +666,21 @@ pc_verify() {
             if [ "$CASE_ROLE" = peer-server ]; then
                 expect "$f" "peer certificate: X.509 (2)" || ok=1
             fi ;;
-        certcomp)
+        # The server's certificate, compressed with the pinned algorithm...
+        certcomp|certcomp-brotli|certcomp-zstd)
             if [ "$CASE_ROLE" = peer-server ]; then
-                expect "$f" "peer certificate compression: zlib" || ok=1
+                expect "$f" "peer certificate compression: $(certcomp_alg)" || ok=1
             else
+                expect "$f" "own certificate compression: $(certcomp_alg)" || ok=1
+            fi ;;
+        # ... and the client's (mTLS), which the other side must have
+        # invited through its CertificateRequest.
+        certcomp-client)
+            if [ "$CASE_ROLE" = peer-server ]; then
                 expect "$f" "own certificate compression: zlib" || ok=1
+            else
+                expect "$f" "peer certificate: X.509" || ok=1
+                expect "$f" "peer certificate compression: zlib" || ok=1
             fi ;;
         keyupdate)
             expect_re "$f" "^KeyUpdate: sent [1-9][0-9]*, received [1-9][0-9]*" || ok=1 ;;

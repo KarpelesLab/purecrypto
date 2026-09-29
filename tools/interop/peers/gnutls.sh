@@ -118,10 +118,16 @@ cmd_supports() {
         # the plaintext second ClientHello as an early-data record it
         # cannot decrypt and aborts with bad_record_mac.
         0rtt-hrr) skip "GnuTLS mishandles 0-RTT across a HelloRetryRequest (issue #1429)" ;;
-        certcomp)
+        certcomp|certcomp-client)
             version_ge "$VERSION" 3.7.4 || skip "GnuTLS $VERSION has no certificate compression (3.7.4+)"
             # (Debian/Ubuntu build the library without zlib.)
             has_algo "COMP-ZLIB" || skip "GnuTLS $VERSION build has no zlib certificate compression" ;;
+        certcomp-brotli)
+            version_ge "$VERSION" 3.7.4 || skip "GnuTLS $VERSION has no certificate compression (3.7.4+)"
+            has_algo "COMP-BROTLI" || skip "GnuTLS $VERSION build has no brotli certificate compression" ;;
+        certcomp-zstd)
+            version_ge "$VERSION" 3.7.4 || skip "GnuTLS $VERSION has no certificate compression (3.7.4+)"
+            has_algo "COMP-ZSTD" || skip "GnuTLS $VERSION build has no zstd certificate compression" ;;
         # GnuTLS puts the KEM hybrids ahead of every other group whatever
         # the priority string says (`add_hybrid` in lib/priority.c), and
         # the key share goes with the first group: no HelloRetryRequest to
@@ -187,6 +193,16 @@ priority() {
     echo "$p"
 }
 
+# The RFC 8879 algorithm a `certcomp*` case pins, as `--compress-cert`
+# names it.
+gt_certcomp_alg() {
+    case $CASE_FEAT in
+        certcomp-brotli) echo brotli ;;
+        certcomp-zstd) echo zstd ;;
+        *) echo zlib ;;
+    esac
+}
+
 # The echo server: every line the client sends comes back and is logged.
 server_args() {
     local a="--echo -p @PORT@ -d 5 --priority $(priority) --x509cafile $PKI/ca.crt"
@@ -206,13 +222,14 @@ server_args() {
     # one with access_denied): required but unverified, as with every
     # other peer tool; the purecrypto side is what presents it.
     case $CASE_FEAT in
-        mtls) a="$a --require-client-cert --verify-client-cert" ;;
+        mtls|certcomp-client) a="$a --require-client-cert --verify-client-cert" ;;
         rpk-client) a="$a --require-client-cert" ;;
         *) a="$a --disable-client-cert" ;;
     esac
     case $CASE_FEAT in
         0rtt) a="$a --earlydata --maxearlydata 16384" ;;
-        certcomp) a="$a --compress-cert zlib" ;;
+        # `--compress-cert` is what the side accepts AND sends with.
+        certcomp|certcomp-brotli|certcomp-zstd|certcomp-client) a="$a --compress-cert $(gt_certcomp_alg)" ;;
         ocsp) a="$a --ocsp-response $OCSP" ;;
         alpn) a="$a --alpn h2 --alpn http/1.1" ;;
         rsl) a="$a --recordsize 512" ;;
@@ -248,10 +265,11 @@ client_args() {
         extpsk) a="$a --pskusername $PSK_IDENTITY --pskkey $PSK_HEX" ;;
         0rtt) a="$a --resume --waitresumption --earlydata $PKI/early.txt" ;;
         mtls) a="$a --x509certfile $PKI/$CASE_CERT.crt --x509keyfile $PKI/$CASE_CERT.key" ;;
+        certcomp-client) a="$a --x509certfile $PKI/$CASE_CERT.crt --x509keyfile $PKI/$CASE_CERT.key --compress-cert zlib" ;;
         rpk-client) a="$a --rawpkkeyfile $PKI/$CASE_CERT.key --rawpkfile $PKI/$CASE_CERT.pub" ;;
         # `^rekey^` on stdin sends KeyUpdate(update_requested).
         keyupdate-peer) a="$a --inline-commands" ;;
-        certcomp) a="$a --compress-cert zlib" ;;
+        certcomp|certcomp-brotli|certcomp-zstd) a="$a --compress-cert $(gt_certcomp_alg)" ;;
         ocsp) a="$a --ocsp" ;;
         alpn) a="$a --alpn h2 --alpn http/1.1" ;;
         rsl) a="$a --recordsize 512" ;;
@@ -371,13 +389,19 @@ cmd_verify() {
                 expect_re "$f" "^- Description: \(TLS1\.[23]-X\.509\)" || ok=1
                 expect "$f" "- Status: The certificate is trusted." || ok=1
                 expect "$f" "- Client Signature:" || ok=1 ;;
+            # The purecrypto client's compressed certificate came in
+            # (and the server's own went out compressed too).
+            certcomp-client)
+                expect_re "$f" "^- Description: \(TLS1\.3-X\.509\)" || ok=1
+                expect "$f" "- Status: The certificate is trusted." || ok=1
+                expect "$e" "COMPRESSED CERTIFICATE (25) was received" || ok=1 ;;
             rpk) expect_re "$f" "^- Description: \(TLS1\.3-X\.509-Raw Public Key\)" || ok=1 ;;
             rpk-client) expect_re "$f" "^- Description: \(TLS1\.3-Raw Public Key-X\.509\)" || ok=1 ;;
             keyupdate)
                 expect "$e" "received TLS 1.3 key update (1)" || ok=1
                 expect "$e" "sending key update (0)" || ok=1 ;;
             alpn) expect "$f" "- Application protocol: h2" || ok=1 ;;
-            certcomp) expect "$e" "COMPRESSED CERTIFICATE was queued" || ok=1 ;;
+            certcomp|certcomp-brotli|certcomp-zstd) expect "$e" "COMPRESSED CERTIFICATE was queued" || ok=1 ;;
             rsl) verify_rsl "$e" || ok=1 ;;
         esac
     else
@@ -393,6 +417,10 @@ cmd_verify() {
         case $CASE_FEAT in
             0rtt) expect "$f" "early data from purecrypto" || ok=1 ;;
             mtls) expect "$f" "- Client Signature:" || ok=1 ;;
+            # gnutls-cli sent its certificate compressed.
+            certcomp-client)
+                expect "$f" "- Client Signature:" || ok=1
+                expect "$e" "COMPRESSED CERTIFICATE was queued" || ok=1 ;;
             rpk) expect_re "$f" "^- Description: \(TLS1\.3-X\.509-Raw Public Key\)" || ok=1 ;;
             rpk-client) expect_re "$f" "^- Description: \(TLS1\.3-Raw Public Key-X\.509\)" || ok=1 ;;
             keyupdate)
@@ -403,7 +431,7 @@ cmd_verify() {
                 expect "$e" "received TLS 1.3 key update (0)" || ok=1 ;;
             alpn) expect "$f" "- Application protocol: h2" || ok=1 ;;
             ocsp) expect "$f" "OCSP status request," || ok=1 ;;
-            certcomp) expect "$e" "COMPRESSED CERTIFICATE (25) was received" || ok=1 ;;
+            certcomp|certcomp-brotli|certcomp-zstd) expect "$e" "COMPRESSED CERTIFICATE (25) was received" || ok=1 ;;
             rsl) verify_rsl "$e" || ok=1 ;;
         esac
     fi

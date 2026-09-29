@@ -211,7 +211,8 @@ update with the commands in `tools/wycheproof/README.md`.
   `tools/interop/run.sh`, adapters under `tools/interop/peers/`, contract in
   `tools/interop/README.md`): the purecrypto CLI against the runner's
   `openssl` 3.0.x, an `openssl` 3.6 built from source (ML-KEM hybrid,
-  ML-DSA, raw public keys, zlib compression) and `bssl` at a pinned commit,
+  ML-DSA, raw public keys, zlib / brotli / zstd certificate compression) and
+  `bssl` at a pinned commit,
   over TCP, purecrypto as client (`C`) and as server (`S`). Every case
   exchanges application data and is checked on **both** sides for the
   negotiated version, suite and group (a handshake that completed with the
@@ -237,7 +238,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | mTLS, ML-DSA-65 client certificate | ⏭ | ✅ / ✅ | ⏭ |
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
   | KeyUpdate (`update_requested`) from the peer, purecrypto replies | ✅ / ✅ | ✅ / ✅ | ⏭ `bssl` has no trigger |
-  | RFC 8879 zlib certificate compression (server certificate) | ⏭ 3.2+ | ✅ / ✅ | ⏭ the tool registers no algorithm |
+  | RFC 8879 certificate compression, server certificate, zlib / brotli / zstd (one case each, the algorithm pinned on the purecrypto side) | ⏭ 3.2+ | ✅ / ✅ | ⏭ the tool registers no algorithm |
+  | RFC 8879 certificate compression, client certificate (mTLS; invited by the server's `CertificateRequest`) | ⏭ 3.2+ | ✅ / ✅ | ⏭ |
   | RFC 7250 raw public key, server identity | ⏭ 3.2+ | ✅ / ✅ | ✅ / ✅ |
   | RFC 7250 raw public key, client identity | ⏭ 3.2+ | ✅ / ✅ | ✅ / ✅ |
   | OCSP stapling (`openssl ocsp` response, validated) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
@@ -256,10 +258,9 @@ update with the commands in `tools/wycheproof/README.md`.
   are worked around on the *peer* side, documented in the adapter: with
   anti-replay on, OpenSSL's stateful 0-RTT tickets are single-use, so the
   ticket a HelloRetryRequest makes the client re-present is already gone
-  (`-no_anti_replay`); and OpenSSL only sends compressed certificates it
-  pre-compressed (`-cert_comp`). Compression of the *client* certificate
-  (RFC 8879 in the mTLS direction) is not implemented by purecrypto and is
-  not in the matrix.
+  (`-no_anti_replay`); and OpenSSL's server only sends compressed
+  certificates it pre-compressed (`-cert_comp`) — its client compresses on
+  the fly, and, unlike purecrypto, never compresses a raw public key.
 - **TLS 1.3 matrix, both roles, against Mbed TLS 4.2.0** (the same
   workflow, peer `mbedtls`, adapter `tools/interop/peers/mbedtls.sh`): the
   purecrypto CLI against `ssl_client2` / `ssl_server2` from a source build
@@ -291,7 +292,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ |
   | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ / ⏭ |
   | KeyUpdate from either side | ⏭ Mbed TLS does not implement TLS 1.3 KeyUpdate at all: a received one is a fatal `unexpected_message` |
-  | RFC 8879 zlib certificate compression | ⏭ not implemented |
+  | RFC 8879 certificate compression, either certificate | ⏭ not implemented |
   | RFC 7250 raw public key, either identity | ⏭ not implemented |
   | OCSP stapling | ⏭ no `status_request` in Mbed TLS's TLS 1.3 |
   | ALPN | ✅ / ✅ |
@@ -365,7 +366,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ as above |
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ (SChannel replies with the next application-data record it sends, not on its own — RFC 8446 §4.6.3 asks for no more — so the peer is made to send after the update: the server answers after the client's first record, the client sends a second round) |
   | KeyUpdate from the peer, purecrypto replies | ⏭ `SslStream` has no KeyUpdate API |
-  | RFC 8879 certificate compression | ⏭ not implemented by SChannel |
+  | RFC 8879 certificate compression, either certificate | ⏭ not implemented by SChannel |
   | RFC 7250 raw public keys (either direction) | ⏭ not implemented by SChannel |
   | OCSP stapling | ✅ (the client runs with revocation checking on: the leaf has no AIA URL, so the platform chain engine can only pass on the stapled response — and rejects the certificate with `RevocationStatusUnknown` when purecrypto does not staple) / ⏭ the SChannel server staples only a response it fetched itself (AIA); no API to supply one |
   | ALPN | ✅ / ✅ |
@@ -424,6 +425,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ |
   | KeyUpdate (`update_requested`) from the peer, purecrypto replies | ⏭ no API to send one |
   | RFC 8879 zlib certificate compression (server certificate) | ✅ / ✅ (the stack compresses its own and accepts ours) |
+  | RFC 8879 brotli / zstd certificate compression | ⏭ offered either alone, the stack sends its certificate plain: it registers zlib only |
+  | RFC 8879 client certificate compression | ⏭ the stack's `CertificateRequest` carries no `compress_certificate`, and its client sends a plain certificate when invited (BoringSSL implements RFC 8879 for the server certificate only) |
   | RFC 7250 raw public key, server identity | ✅ / ⏭ presenting one through the SPI fails with `errSSLInternal` |
   | RFC 7250 raw public key, client identity | ⏭ same / ✅ (the allowlist is enforced: a key not on it draws `bad_certificate`) |
   | OCSP stapling | ✅ / ⏭ no API to staple on a server |
@@ -469,7 +472,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ | ⏭ |
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ | ⏭ 3.3's `s_server` answers with records neither side can decrypt (also against OpenSSL 3.6) / ✅ |
   | KeyUpdate (`update_requested`) from the peer, purecrypto replies | ⏭ the apps have no trigger | ⏭ |
-  | RFC 8879 zlib certificate compression (server certificate) | ⏭ not implemented by LibreSSL | ⏭ |
+  | RFC 8879 certificate compression, either certificate | ⏭ not implemented by LibreSSL | ⏭ |
   | RFC 7250 raw public key, server or client identity | ⏭ not implemented by LibreSSL | ⏭ |
   | OCSP stapling | ✅ / ✅ (`s_server -status` fetches from an `openssl ocsp` responder the adapter runs) | ✅ / ✅ |
   | ALPN | ✅ / ✅ | ✅ / ✅ |
@@ -524,7 +527,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | mTLS, ML-DSA-65 client certificate | ⏭ | ✅ / ✅ |
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ |
   | KeyUpdate (`update_requested`) from the peer, purecrypto replies | ✅ (`gnutls-cli` `^rekey^`) / ⏭ `gnutls-serv` has no trigger | same |
-  | RFC 8879 zlib certificate compression (server certificate) | ⏭ the Ubuntu package is built without zlib | ✅ / ✅ |
+  | RFC 8879 certificate compression, server certificate, zlib / brotli / zstd (one case each) | ⏭ the Ubuntu package is built without the compression libraries | ✅ / ✅ |
+  | RFC 8879 certificate compression, client certificate (mTLS) | ⏭ same | ✅ / ✅ (`--compress-cert` covers both certificates) |
   | RFC 7250 raw public key, server identity | ✅ / ✅ | ✅ / ✅ |
   | RFC 7250 raw public key, client identity | ✅ / ✅ (`gnutls-serv` requires but cannot pin a raw client key) | same |
   | OCSP stapling (`openssl ocsp` response, validated) | ✅ / ✅ | ✅ / ✅ |
@@ -590,7 +594,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | mTLS, client certificate of every kind | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (RSA, P-256, P-384: the 1.2 engines sign with RSA or ECDSA only; C with P-384 ⏭ RFC 8422 §5.1.1 as in the plain case) |
   | KeyUpdate from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ | — |
   | KeyUpdate from the peer, purecrypto replies | ✅ / ✅ | ✅ / ✅ (the example client's `-I` writes a message it never reads back, and `wolfSSL_shutdown` sends no close_notify while that echo is pending, so the peer's close_notify is not demanded in that one case) | — |
-  | RFC 8879 certificate compression; RFC 8449 `record_size_limit` | ⏭ not implemented by wolfSSL | — | — |
+  | RFC 8879 certificate compression (either certificate); RFC 8449 `record_size_limit` | ⏭ not implemented by wolfSSL | — | — |
   | RFC 7250 raw public key, server identity | ⏭ the example server has no RPK option / ✅ | — | — |
   | RFC 7250 raw public key, client identity | ⏭ the client's `--rpk` offers raw keys for both directions with no X.509 fallback | — | — |
   | OCSP stapling | ⏭ the example server staples only what it fetched from a responder; the client insists on the nonce it requested, which a pre-generated staple lacks | — | — |

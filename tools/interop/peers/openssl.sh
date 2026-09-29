@@ -70,10 +70,13 @@ other_group() {
     esac
 }
 
-# zlib-backed RFC 8879 compression needs OpenSSL >= 3.2 built with zlib.
-has_zlib() {
-    "$OPENSSL" version -a 2>/dev/null | grep -qi -- '-DZLIB\|zlib'
+# RFC 8879 compression needs OpenSSL >= 3.2 built with the library for the
+# algorithm (`enable-zlib`, `enable-brotli`, `enable-zstd`); the ones left
+# out are in `list -disabled`.
+has_comp() {
+    ! "$OPENSSL" list -disabled 2>/dev/null | grep -qix -- "$1"
 }
+has_zlib() { has_comp ZLIB; }
 
 cmd_supports() {
     case $CASE_GROUP in
@@ -85,9 +88,15 @@ cmd_supports() {
             version_ge "$VERSION" 3.5 || skip "OpenSSL $VERSION has no ML-DSA (3.5+)" ;;
     esac
     case $CASE_FEAT in
-        certcomp)
+        certcomp|certcomp-client)
             version_ge "$VERSION" 3.2 || skip "OpenSSL $VERSION has no certificate compression (3.2+)"
             has_zlib || skip "OpenSSL $VERSION was built without zlib" ;;
+        certcomp-brotli)
+            version_ge "$VERSION" 3.2 || skip "OpenSSL $VERSION has no certificate compression (3.2+)"
+            has_comp BROTLI || skip "OpenSSL $VERSION was built without brotli" ;;
+        certcomp-zstd)
+            version_ge "$VERSION" 3.2 || skip "OpenSSL $VERSION has no certificate compression (3.2+)"
+            has_comp ZSTD || skip "OpenSSL $VERSION was built without zstd" ;;
         rpk|rpk-client)
             version_ge "$VERSION" 3.2 || skip "OpenSSL $VERSION has no RFC 7250 raw public keys (3.2+)" ;;
         rsl)
@@ -136,8 +145,11 @@ server_args() {
         # what a deployment fronting HRR clients with 0-RTT needs anyway.
         0rtt-hrr) a="$a -naccept 2 -early_data -max_early_data 16384 -no_anti_replay" ;;
         mtls) a="$a -Verify 1 -verify_return_error" ;;
-        # OpenSSL only sends compressed certificates it pre-compressed.
-        certcomp) a="$a -cert_comp" ;;
+        # OpenSSL only sends compressed certificates it pre-compressed
+        # (`-cert_comp`); the client's are accepted regardless, and the
+        # purecrypto side pins the algorithm.
+        certcomp|certcomp-brotli|certcomp-zstd) a="$a -cert_comp" ;;
+        certcomp-client) a="$a -Verify 1 -verify_return_error" ;;
         rpk) a="$a -enable_server_rpk" ;;
         rpk-client) a="$a -enable_client_rpk -Verify 1" ;;
         ocsp) a="$a -status_file $OCSP" ;;
@@ -159,6 +171,9 @@ client_args() {
         hrr) a="s_client -connect 127.0.0.1:$PORT -CAfile $PKI/ca.crt -servername localhost -tls1_3 -groups $(other_group "$CASE_GROUP"):$(ossl_group "$CASE_GROUP") -ciphersuites $(ossl_suite "$CASE_SUITE")" ;;
         0rtt-hrr) a="s_client -connect 127.0.0.1:$PORT -CAfile $PKI/ca.crt -servername localhost -tls1_3 -groups P-256:X25519 -ciphersuites $(ossl_suite "$CASE_SUITE")" ;;
         mtls) a="$a -cert $PKI/$CASE_CERT.crt -key $PKI/$CASE_CERT.key" ;;
+        # (Unlike the server, s_client compresses its certificate on the
+        # fly whenever the CertificateRequest invites it: no option.)
+        certcomp-client) a="$a -cert $PKI/$CASE_CERT.crt -key $PKI/$CASE_CERT.key" ;;
         rpk) a="$a -enable_server_rpk" ;;
         rpk-client) a="$a -enable_client_rpk -cert $PKI/$CASE_CERT.crt -key $PKI/$CASE_CERT.key" ;;
         ocsp) a="$a -status" ;;
@@ -254,7 +269,7 @@ cmd_verify() {
                 expect "$WORK/client.out" "tneilc morf gnip" || ok=1 ;;
         esac
         case $CASE_FEAT in
-            mtls)
+            mtls|certcomp-client)
                 expect_re "$f" "^Peer certificate: CN ?= ?localhost" || ok=1
                 expect "$f" "Verification: OK" || ok=1 ;;
             # (The brief summary says nothing about the PSK; the client

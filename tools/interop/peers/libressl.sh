@@ -128,7 +128,7 @@ cmd_supports() {
         keyupdate)
             [ "$CASE_ROLE" = peer-client ] || version_ge "$VERSION" 3.4 ||
                 skip "LibreSSL $VERSION s_server mishandles a client-initiated KeyUpdate (bad_record_mac both ways, also vs OpenSSL)" ;;
-        certcomp) skip "LibreSSL does not implement RFC 8879 certificate compression" ;;
+        certcomp|certcomp-brotli|certcomp-zstd|certcomp-client) skip "LibreSSL does not implement RFC 8879 certificate compression" ;;
         rpk|rpk-client) skip "LibreSSL does not implement RFC 7250 raw public keys" ;;
         rsl) skip "LibreSSL does not implement RFC 8449 record_size_limit" ;;
         tls12)

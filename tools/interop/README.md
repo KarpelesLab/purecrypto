@@ -53,7 +53,9 @@ the *client* identity):
 | `mtls` | client certificate of each kind, verified by the server | `-cert`/`-key` and `-Verify` |
 | `keyupdate` | purecrypto sends `KeyUpdate(update_requested)`, the peer replies | `-key_update` |
 | `keyupdate-peer` | the peer sends `KeyUpdate(update_requested)`, purecrypto replies | (peer-driven) |
-| `certcomp` | RFC 8879 zlib-compressed server certificate | default (advertised) |
+| `certcomp` | RFC 8879 zlib-compressed server certificate | `-cert_comp zlib` (pinned, so the peer cannot prefer another algorithm) |
+| `certcomp-brotli`, `certcomp-zstd` | the same with brotli / zstd | `-cert_comp brotli` / `-cert_comp zstd` |
+| `certcomp-client` | mTLS with the *client* certificate zlib-compressed (the server invites it in its CertificateRequest) | `-cert`/`-key` / `-Verify`, plus `-cert_comp zlib` |
 | `rpk` | RFC 7250 raw public key as the *server* identity | `-enable_server_rpk` (+ `-rpk_peer_key` pin on the client) |
 | `rpk-client` | raw public key as the *client* identity | `-enable_client_rpk` (+ `-rpk_peer_key` allowlist on the server) |
 | `ocsp` | stapled OCSP response (RFC 6066 / 8446 §4.4.2.1) | `-status_file` |
