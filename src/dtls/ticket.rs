@@ -168,6 +168,29 @@ pub(crate) fn obfuscated_age(session: &StoredSession, now: Option<u64>) -> u32 {
     (elapsed_ms as u32).wrapping_add(session.age_add)
 }
 
+/// Whether two peer addresses name the same IP, the match RFC 9147 §5.1
+/// conditions a resumption's cookie skip on ("the IP address matches one
+/// associated with the PSK"). Addresses in the canonical form
+/// `ConfigBuilder::peer_socket_addr` produces — 16 bytes of IPv6 (IPv4
+/// v4-mapped) then a 2-byte port — are compared on the IP alone, so a
+/// client that reconnects from a fresh source port (the wolfSSL and OpenSSL
+/// clients open a new socket per connection) still qualifies; any other
+/// encoding is opaque and must match exactly. Empty means "unknown" and
+/// never matches.
+pub(crate) fn same_ip(ticket_addr: &[u8], peer_addr: &[u8]) -> bool {
+    if ticket_addr.is_empty() || ticket_addr.len() != peer_addr.len() {
+        return false;
+    }
+    let n = if ticket_addr.len() == 18 {
+        16
+    } else {
+        ticket_addr.len()
+    };
+    // Which address a resumption came from is not secret, but the
+    // comparison is cheap to keep uniform.
+    bool::from(ticket_addr[..n].ct_eq(&peer_addr[..n]))
+}
+
 /// Overwrites the (zero) binder at the tail of a DTLS 1.3 ClientHello with
 /// the real one (RFC 8446 §4.2.11.2), computed under the `"dtls13"` label
 /// prefix over `transcript_prefix ‖ ch[..ch.len() - binders_len]`. `ch` is
@@ -222,11 +245,12 @@ pub(crate) struct AcceptedPsk13 {
     /// when (see `TicketPlaintext::client_auth_secs`).
     pub(crate) client_leaf: Option<Vec<u8>>,
     pub(crate) client_auth_secs: u64,
-    /// RFC 9147 §5.1: the ticket was issued to this very transport address.
-    /// Only then may the server skip the cookie exchange on resumption —
-    /// the return-routability the cookie would prove was proven when the
-    /// ticket was issued, and a replayed hello from that address can only
-    /// cost the server what the genuine client already made it spend.
+    /// RFC 9147 §5.1: the resumption comes from the IP address the ticket
+    /// was issued to ("the IP address matches one associated with the
+    /// PSK" — see [`same_ip`]). Only then may the server skip the cookie
+    /// exchange on resumption: return-routability to that address was
+    /// proven when the ticket was issued, and a replayed hello from it can
+    /// only cost the server what the genuine client already made it spend.
     pub(crate) same_address: bool,
 }
 
@@ -348,11 +372,9 @@ pub(crate) fn try_accept_psk13(
             let expected_age_ms = ctx.now.saturating_sub(creation_secs).saturating_mul(1000);
             client_age_ms.abs_diff(expected_age_ms) <= MAX_TICKET_AGE_DEVIATION_MS
         };
-        // Constant-time: which of two addresses a resumption came from is
-        // not secret, but the comparison is cheap to keep uniform.
-        let same_address = peer_addr.as_deref().is_some_and(|a| {
-            !a.is_empty() && a.len() == ctx.peer_addr.len() && bool::from(a.ct_eq(ctx.peer_addr))
-        });
+        let same_address = peer_addr
+            .as_deref()
+            .is_some_and(|a| same_ip(a, ctx.peer_addr));
         let selected_identity = u16::try_from(idx).map_err(|_| Error::IllegalParameter)?;
         return Ok(Some(AcceptedPsk13 {
             psk,
@@ -367,4 +389,31 @@ pub(crate) fn try_accept_psk13(
         }));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_ip;
+
+    fn addr(ip: [u8; 16], port: u16) -> alloc::vec::Vec<u8> {
+        let mut a = ip.to_vec();
+        a.extend_from_slice(&port.to_be_bytes());
+        a
+    }
+
+    /// RFC 9147 §5.1 matches the IP: a fresh source port qualifies, another
+    /// IP does not, an unknown (empty) address never does, and a
+    /// non-canonical encoding must match byte for byte.
+    #[test]
+    fn same_ip_matches_on_the_address_not_the_port() {
+        let ip = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1];
+        let mut other = ip;
+        other[15] = 2;
+        assert!(same_ip(&addr(ip, 4433), &addr(ip, 50000)));
+        assert!(!same_ip(&addr(ip, 4433), &addr(other, 4433)));
+        assert!(!same_ip(&[], &addr(ip, 4433)));
+        assert!(!same_ip(&addr(ip, 1), &[]));
+        assert!(same_ip(b"opaque", b"opaque"));
+        assert!(!same_ip(b"opaque1", b"opaque2"));
+    }
 }
