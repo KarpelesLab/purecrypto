@@ -76,12 +76,25 @@ impl Clock {
 /// so it cannot be turned into an amplifier by a spoofed source address;
 /// an application whose replies are larger must test the new address
 /// first (RFC 9147 §9: a reachability check before sending to it).
+///
+/// An [`accepting`](Self::accepting) link is the addressed link of a
+/// `-naccept` server serving sequential connections on one socket: a
+/// ClientHello that opens the NEXT connection — from another source, or
+/// from the same one once the current handshake is complete (a
+/// `-reconnect` client may reuse its source port or take a fresh one) — is
+/// not fed to the current engine, which would drop it as a stray epoch-0
+/// record (RFC 9147 §4.5.2), but held for the caller ([`Step::Handoff`],
+/// [`take_handoff`](Self::take_handoff)).
 pub(crate) struct Link {
     socket: UdpSocket,
     /// The peer, for an unconnected socket; `None` for a connected one.
     peer: Option<SocketAddr>,
     /// The last address change adopted, for the caller to report.
     moved: Option<(SocketAddr, SocketAddr)>,
+    /// Hold back the next connection's ClientHello (see the type docs).
+    accepting: bool,
+    /// The next connection's ClientHello and its source, once seen.
+    handoff: Option<(Vec<u8>, SocketAddr)>,
 }
 
 impl Link {
@@ -91,6 +104,8 @@ impl Link {
             socket,
             peer: None,
             moved: None,
+            accepting: false,
+            handoff: None,
         }
     }
 
@@ -101,7 +116,35 @@ impl Link {
             socket,
             peer: Some(peer),
             moved: None,
+            accepting: false,
+            handoff: None,
         }
+    }
+
+    /// An addressed link that also holds back the next connection's
+    /// ClientHello (see the type docs).
+    pub(crate) fn accepting(socket: UdpSocket, peer: SocketAddr) -> Self {
+        Self {
+            accepting: true,
+            ..Self::addressed(socket, peer)
+        }
+    }
+
+    /// Points an addressed link at the peer of the next connection.
+    pub(crate) fn retarget(&mut self, peer: SocketAddr) {
+        self.peer = Some(peer);
+        self.moved = None;
+    }
+
+    /// The next connection's ClientHello and source, held back by an
+    /// accepting link.
+    pub(crate) fn take_handoff(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
+        self.handoff.take()
+    }
+
+    /// Whether the next connection's ClientHello is being held back.
+    pub(crate) fn has_handoff(&self) -> bool {
+        self.handoff.is_some()
     }
 
     /// Replaces the socket (a client re-binding to a new local port, as a
@@ -156,6 +199,9 @@ pub(crate) enum Step {
     /// The socket failed — for a connected UDP socket typically an ICMP
     /// port-unreachable: the peer is gone.
     Gone,
+    /// An accepting link received the next connection's ClientHello and
+    /// held it back, unfed ([`Link::take_handoff`]).
+    Handoff,
 }
 
 /// Sends every datagram the engine has queued (flights and their
@@ -168,6 +214,19 @@ pub(crate) fn flush(conn: &mut Connection, link: &Link) {
         }
         link.send(&dg);
     }
+}
+
+/// Whether `dg` is a plaintext ClientHello — the start of a new DTLS
+/// connection on a socket a `-naccept` server keeps across sequential
+/// clients. Wire shape (RFC 9147 §4.1 / §5.3): a 13-byte plaintext record
+/// header (`content_type = 22` handshake, `epoch = 0` at bytes 3..5)
+/// carrying a handshake fragment whose type byte (at offset 13) is
+/// `client_hello` (1). Once one connection is established, such a datagram
+/// is the next client's opening flight and must be handed to a fresh
+/// engine rather than fed to the current one (which would drop it as a
+/// spoofed epoch-0 record — RFC 9147 §4.5.2).
+pub(crate) fn is_new_client_hello(dg: &[u8]) -> bool {
+    dg.len() >= 14 && dg[0] == 22 && dg[3] == 0 && dg[4] == 0 && dg[13] == 1
 }
 
 /// Tells the engine the time and fires its retransmission timer if due.
@@ -203,6 +262,17 @@ pub(crate) fn step(
         .socket
         .set_read_timeout(Some(wait.max(Duration::from_millis(1))));
     let seen = match link.recv(buf) {
+        Ok((n, Some(src)))
+            if link.accepting
+                && is_new_client_hello(&buf[..n])
+                && (Some(src) != link.peer || conn.is_handshake_complete()) =>
+        {
+            // The next connection (see `Link`). A ClientHello from the
+            // current peer during its handshake is a retransmission and
+            // is fed below.
+            link.handoff = Some((buf[..n].to_vec(), src));
+            return Ok(Step::Handoff);
+        }
         Ok((n, src)) => {
             conn.set_now(clock.now());
             let fed = conn.feed(&buf[..n]);
@@ -245,7 +315,8 @@ pub(crate) fn settle(
                 }
             }
             Ok(Step::Quiet) => {}
-            Ok(Step::Gone) | Err(_) => break,
+            // (A handoff: the next connection has begun, this one is over.)
+            Ok(Step::Gone | Step::Handoff) | Err(_) => break,
         }
     }
 }

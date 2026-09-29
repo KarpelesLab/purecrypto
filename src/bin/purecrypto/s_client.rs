@@ -249,6 +249,9 @@ pub(crate) fn run(args: Args) {
         }
         std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read -early_data {path}: {e}")))
     });
+    // `-reconnect` resumes on a second connection: TLS, or DTLS 1.3 (RFC
+    // 9147 rides RFC 8446 §2.2). DTLS 1.2 has no resumption in this build.
+    let dtls13_reconnect = version == ProtocolVersion::Dtls13 && reconnect;
     let read_timeout = Duration::from_secs(
         args.value("-read_timeout")
             .unwrap_or("5")
@@ -278,8 +281,11 @@ pub(crate) fn run(args: Args) {
         );
     }
     let is_tcp = matches!(version, ProtocolVersion::Tls12 | ProtocolVersion::Tls13);
-    if (reconnect || enable_server_rpk || enable_client_rpk) && !is_tcp {
-        die("-reconnect / -enable_*_rpk are TLS-over-TCP options");
+    if (enable_server_rpk || enable_client_rpk) && !is_tcp {
+        die("-enable_*_rpk are TLS-over-TCP options");
+    }
+    if reconnect && !is_tcp && version != ProtocolVersion::Dtls13 {
+        die("-reconnect needs TLS or DTLS 1.3 (DTLS 1.2 has no resumption)");
     }
     // DTLS 1.3 rekeys with KeyUpdate too (RFC 9147 §8); DTLS 1.2 has no
     // such mechanism.
@@ -442,8 +448,6 @@ pub(crate) fn run(args: Args) {
             run_tcp(&mut conn, &mut sock, &opts);
         }
         ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13 => {
-            let mut conn = Connection::client(&cfg)
-                .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
             let socket = UdpSocket::bind("0.0.0.0:0")
                 .unwrap_or_else(|e| die(format!("cannot bind local UDP socket: {e}")));
             socket
@@ -463,9 +467,44 @@ pub(crate) fn run(args: Args) {
                 resend,
                 rebind,
                 peer,
+                early_data: None,
             };
             let mut link = Link::connected(socket);
-            run_udp(&mut conn, &mut link, &udp);
+            if dtls13_reconnect {
+                // `-reconnect` over DTLS 1.3: a first connection whose only
+                // purpose is to collect a NewSessionTicket, then a second
+                // that resumes it — carrying `-early_data` as 0-RTT when
+                // the ticket allows it (RFC 9147 rides RFC 8446 §2.2 /
+                // §4.2.10). The SAME local socket (source port) is reused,
+                // matching how OpenSSL reconnects.
+                if !quiet {
+                    eprintln!("=== connection 1 (full handshake)");
+                }
+                let session = run_udp_for_ticket(&cfg, &mut link, &udp);
+                let mut cfg2 = cfg.clone();
+                cfg2.resumption = Some(session);
+                let mut conn = Connection::client(&cfg2)
+                    .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
+                if let Some(data) = early_data.as_deref() {
+                    conn.write_early_data(data).unwrap_or_else(|e| {
+                        die(format!(
+                            "cannot send early data: {e:?} (the ticket did not permit 0-RTT?)"
+                        ))
+                    });
+                }
+                if !quiet {
+                    eprintln!("=== connection 2 (resumption offered)");
+                }
+                let udp2 = UdpOpts {
+                    early_data: early_data.clone(),
+                    ..udp
+                };
+                run_udp(&mut conn, &mut link, &udp2);
+            } else {
+                let mut conn = Connection::client(&cfg)
+                    .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
+                run_udp(&mut conn, &mut link, &udp);
+            }
         }
     }
 }
@@ -493,6 +532,11 @@ struct UdpOpts {
     rebind: bool,
     /// The server, for the socket `-rebind` opens.
     peer: std::net::SocketAddr,
+    /// The 0-RTT payload offered on a `-reconnect` second connection. If
+    /// the server rejected it (RFC 8446 §4.2.10), it is re-sent as ordinary
+    /// application data once the handshake completes. `None` when no 0-RTT
+    /// was offered.
+    early_data: Option<Vec<u8>>,
 }
 
 /// Handshake + report, shared by the plain and the `-reconnect` flows.
@@ -618,6 +662,46 @@ fn flush_out(conn: &mut Connection, sock: &mut TcpStream) {
         let _ = sock.write_all(&out);
         let _ = sock.flush();
     }
+}
+
+/// The `-reconnect` first DTLS connection: handshake, then drive the
+/// connection until the server's NewSessionTicket arrives (a post-handshake
+/// flight, RFC 9147 §5.8.4), say goodbye, and hand the session back. Nothing
+/// from stdin is sent on this connection.
+fn run_udp_for_ticket(
+    cfg: &purecrypto::tls::Config,
+    link: &mut Link,
+    opts: &UdpOpts,
+) -> purecrypto::tls::ResumptionSession {
+    let mut conn = Connection::client(cfg)
+        .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
+    let clock = Clock::start();
+    drive_udp_handshake(&mut conn, link, &clock, opts.mtu);
+    if !opts.quiet {
+        tlsinfo::report_handshake(&conn, Role::Client);
+    }
+    // Drive datagrams until the ticket lands (bounded). The server ACKs
+    // our Finished and then sends its NewSessionTicket; we ACK that.
+    let mut buf = vec![0u8; opts.mtu.max(1500) + 256];
+    let deadline = clock.now() + Duration::from_secs(10);
+    let mut session = conn.take_session();
+    while session.is_none() && clock.now() < deadline {
+        match dtls_io::step(&mut conn, link, &clock, &mut buf) {
+            Ok(Step::Datagram | Step::Quiet) => {}
+            Ok(Step::Gone | Step::Handoff) | Err(_) => break,
+        }
+        session = conn.take_session();
+    }
+    let session = session
+        .unwrap_or_else(|| die("no DTLS session ticket arrived within 10 s; cannot -reconnect"));
+    if !opts.quiet {
+        eprintln!("session ticket received");
+    }
+    // Say goodbye so the server does not keep the connection around.
+    if conn.close().is_ok() {
+        dtls_io::flush(&mut conn, link);
+    }
+    session
 }
 
 fn run_udp(conn: &mut Connection, link: &mut Link, opts: &UdpOpts) {
@@ -836,7 +920,8 @@ fn drive_udp_handshake(conn: &mut Connection, link: &mut Link, clock: &Clock, mt
         // doubling: RFC 6347 §4.2.4.1 / RFC 9147 §5.8.2), on the
         // connection's clock.
         match dtls_io::step(conn, link, clock, &mut buf) {
-            Ok(Step::Datagram | Step::Quiet) => {}
+            // (Only an accepting server link hands off; a client never does.)
+            Ok(Step::Datagram | Step::Quiet | Step::Handoff) => {}
             Ok(Step::Gone) => die("UDP recv failed: the server is unreachable"),
             Err(e) => die(format!("DTLS handshake failed: {e:?}")),
         }
@@ -886,7 +971,7 @@ fn pump_udp(
                 let _ = stdout.flush();
                 dtls_io::flush(conn, link);
             }
-            Ok(Step::Quiet) => {
+            Ok(Step::Quiet | Step::Handoff) => {
                 if last_inbound.elapsed() > idle {
                     break;
                 }
@@ -948,7 +1033,7 @@ fn rebind(conn: &mut Connection, link: &mut Link, clock: &Clock, buf: &mut [u8],
                     let plain = conn.recv().unwrap_or_default();
                     print_data(conn, plain);
                 }
-                Ok(Step::Quiet) => {}
+                Ok(Step::Quiet | Step::Handoff) => {}
                 Ok(Step::Gone) => die("UDP recv failed: the server is unreachable"),
                 Err(e) => die(format!("DTLS error after handshake: {e:?}")),
             }
@@ -993,6 +1078,13 @@ fn drive_udp_data(conn: &mut Connection, link: &mut Link, clock: &Clock, opts: &
         conn.request_key_update()
             .unwrap_or_else(|e| die(format!("KeyUpdate refused: {e:?}")));
         dtls_io::flush(conn, link);
+    }
+    // RFC 8446 §4.2.10: early data the server rejected was never delivered
+    // — re-send it under the 1-RTT keys so the exchange still carries it.
+    if let Some(ed) = opts.early_data.as_deref()
+        && !conn.early_data_accepted()
+    {
+        send_input(conn, link, ed, opts.mtu);
     }
     let mut input = Vec::new();
     if !std::io::stdin().is_terminal() {

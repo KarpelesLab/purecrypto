@@ -167,8 +167,15 @@ pub(crate) fn run(args: Args) {
     let enable_server_rpk = args.flag("-enable_server_rpk") || args.flag("--enable_server_rpk");
     let enable_client_rpk = args.flag("-enable_client_rpk") || args.flag("--enable_client_rpk");
     let is_tcp = matches!(version, ProtocolVersion::Tls12 | ProtocolVersion::Tls13);
-    if (naccept > 1 || early_data || enable_server_rpk || enable_client_rpk) && !is_tcp {
-        die("-naccept / -early_data / -enable_*_rpk are TLS-over-TCP options");
+    // Session tickets, 0-RTT and sequential accepts work over DTLS 1.3 too
+    // (RFC 9147); the RPK options remain TLS-over-TCP only, and DTLS 1.2
+    // has no resumption in this build.
+    let tickets_ok = is_tcp || version == ProtocolVersion::Dtls13;
+    if (enable_server_rpk || enable_client_rpk) && !is_tcp {
+        die("-enable_*_rpk are TLS-over-TCP options");
+    }
+    if (naccept > 1 || early_data) && !tickets_ok {
+        die("-naccept / -early_data need TLS or DTLS 1.3 (not DTLS 1.2)");
     }
     // DTLS 1.3 rekeys with KeyUpdate too (RFC 9147 §8); DTLS 1.2 has no
     // such mechanism.
@@ -288,10 +295,12 @@ pub(crate) fn run(args: Args) {
     }
     // Session tickets are issued by default, as `openssl s_server` does,
     // under a per-process random key: a client that reconnects to this
-    // same process can resume. `-no_ticket` turns them off; `-early_data`
-    // additionally accepts 0-RTT on a resumed connection (echoed back like
-    // any other data — this is a test server; early data is replayable).
-    if is_tcp && !no_ticket {
+    // same process can resume (TLS, or DTLS 1.3). `-no_ticket` turns them
+    // off; `-early_data` additionally accepts 0-RTT on a resumed
+    // connection (echoed back like any other data — this is a test server;
+    // early data is replayable). The DTLS 1.3 ticket clock falls back to
+    // the system clock under std, so no verification time need be pinned.
+    if tickets_ok && !no_ticket {
         let mut ticket_key = [0u8; 32];
         purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut ticket_key);
         builder = builder.ticket_key(ticket_key);
@@ -383,7 +392,15 @@ pub(crate) fn run(args: Args) {
             } else {
                 format!("127.0.0.1:{accept}")
             };
-            run_udp(&cfg, &accept, mtu, quiet, key_update, cid.is_some());
+            run_udp(
+                &cfg,
+                &accept,
+                mtu,
+                quiet,
+                key_update,
+                cid.is_some(),
+                naccept,
+            );
         }
     }
 }
@@ -630,61 +647,155 @@ fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream, ech: bool) {
     }
 }
 
-fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool, with_cid: bool) {
+/// Encodes a peer's transport address the way the DTLS engines expect it
+/// (RFC 9147 §5.1 return-routability / cookie binding, and the DTLS 1.3
+/// ticket's address slot): 16 bytes of IPv6 (an IPv4 peer as its v4-mapped
+/// form) followed by the 2-byte big-endian port.
+fn peer_addr_bytes(peer: SocketAddr) -> Vec<u8> {
+    let mut a = Vec::with_capacity(18);
+    match peer.ip() {
+        std::net::IpAddr::V4(v4) => a.extend_from_slice(&v4.to_ipv6_mapped().octets()),
+        std::net::IpAddr::V6(v6) => a.extend_from_slice(&v6.octets()),
+    }
+    a.extend_from_slice(&peer.port().to_be_bytes());
+    a
+}
+
+fn run_udp(
+    cfg: &Config,
+    accept: &str,
+    mtu: usize,
+    quiet: bool,
+    key_update: bool,
+    with_cid: bool,
+    naccept: usize,
+) {
     let socket =
         UdpSocket::bind(accept).unwrap_or_else(|e| die(format!("cannot bind UDP {accept}: {e}")));
-    let bound = socket.local_addr().ok();
     if !quiet {
-        match bound {
-            Some(addr) => eprintln!("listening on {addr} (DTLS / UDP)"),
-            None => eprintln!("listening on {accept} (DTLS / UDP)"),
+        match socket.local_addr() {
+            Ok(addr) => eprintln!("listening on {addr} (DTLS / UDP)"),
+            Err(_) => eprintln!("listening on {accept} (DTLS / UDP)"),
         }
     }
     let mut buf = vec![0u8; mtu.max(1500) + 256];
-    socket.set_read_timeout(Some(Duration::from_secs(60))).ok();
-    let (n, peer) = socket
-        .recv_from(&mut buf)
-        .unwrap_or_else(|e| die(format!("UDP recv (initial) failed: {e}")));
-    if !quiet {
-        eprintln!("accepted handshake start from {peer}");
-    }
-    buf.truncate(n);
+    let mut pending = recv_client_hello(&socket, &mut buf, Duration::from_secs(60))
+        .unwrap_or_else(|| die("UDP recv (initial) failed: no DTLS ClientHello arrived"));
     // With connection IDs the socket stays unconnected: the client may
     // move to another address mid-connection, and the link follows it
     // under the RFC 9146 §6 rules. Without them a moved client cannot be
     // recognised anyway, and a connected socket reports it gone (ICMP).
-    let mut link = if with_cid {
-        Link::addressed(socket, peer)
+    //
+    // `-naccept N` serves N sequential connections on this ONE socket, left
+    // unconnected too: a `-reconnect` client opens its resumed connection
+    // either from the same 4-tuple (OpenSSL, this CLI) or from a fresh
+    // source port (the wolfSSL example client), so each connection is
+    // served by address, and the next one's ClientHello is handed forward
+    // to a fresh engine (`Link::accepting`). The per-process ticket key is
+    // shared across them, so the later connections resume the earlier ones;
+    // DTLS 1.3 0-RTT is accepted only from the address the ticket was
+    // issued to (RFC 9147 §5.1).
+    let first_peer = pending.1;
+    let mut link = if naccept > 1 {
+        Link::accepting(socket, first_peer)
+    } else if with_cid {
+        Link::addressed(socket, first_peer)
     } else {
         socket
-            .connect(peer)
-            .unwrap_or_else(|e| die(format!("UDP connect to peer {peer}: {e}")));
+            .connect(first_peer)
+            .unwrap_or_else(|e| die(format!("UDP connect to peer {first_peer}: {e}")));
         Link::connected(socket)
     };
-
-    // Bind the DTLS cookie to the source address we just learned. Without
-    // it a cookie-requiring server refuses to handshake at all (an
-    // address-independent cookie is replayable from any spoofed source),
-    // and with it the cookie becomes a real return-routability proof.
-    let mut cfg = cfg.clone();
-    cfg.peer_address = {
-        let mut a = Vec::with_capacity(18);
-        match peer.ip() {
-            std::net::IpAddr::V4(v4) => a.extend_from_slice(&v4.to_ipv6_mapped().octets()),
-            std::net::IpAddr::V6(v6) => a.extend_from_slice(&v6.octets()),
+    for i in 0..naccept.max(1) {
+        if !quiet && naccept > 1 {
+            eprintln!("=== connection {}", i + 1);
         }
-        a.extend_from_slice(&peer.port().to_be_bytes());
-        a
-    };
+        let (first, peer) = pending;
+        if !quiet {
+            eprintln!("accepted handshake start from {peer}");
+        }
+        if i > 0 {
+            link.retarget(peer);
+        }
+        // Bind the DTLS cookie to the source address we just learned.
+        // Without it a cookie-requiring server refuses to handshake at all
+        // (an address-independent cookie is replayable from any spoofed
+        // source), and with it the cookie becomes a real return-routability
+        // proof.
+        let mut cfg = cfg.clone();
+        cfg.peer_address = peer_addr_bytes(peer);
+        let handoff = run_udp_one(&cfg, &mut link, mtu, quiet, key_update, &first);
+        // The next connection's opening flight: the one handed forward by
+        // this connection, or — if this connection ended cleanly — the next
+        // ClientHello to arrive (bounded), so `-naccept` completes even when
+        // the client pauses between connections.
+        pending = match handoff {
+            Some(next) => next,
+            None if i + 1 < naccept => {
+                match recv_client_hello(link.socket(), &mut buf, Duration::from_secs(30)) {
+                    Some(p) => p,
+                    None => break,
+                }
+            }
+            None => break,
+        };
+    }
+}
+
+/// Reads datagrams until one is a plaintext ClientHello (RFC 9147 §5.3),
+/// returning it with its source; `None` on timeout. Anything else (a
+/// late record from a finished connection, stray traffic) is skipped.
+fn recv_client_hello(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+    timeout: Duration,
+) -> Option<(Vec<u8>, SocketAddr)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        socket
+            .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+            .ok();
+        match socket.recv_from(buf) {
+            Ok((n, src)) if dtls_io::is_new_client_hello(&buf[..n]) => {
+                return Some((buf[..n].to_vec(), src));
+            }
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+/// One DTLS connection over `link`, its opening flight in `first_dgram`.
+/// Returns the next connection's ClientHello + source when a reconnecting
+/// client opens it while this one is still running (see `Link::accepting`).
+fn run_udp_one(
+    cfg: &Config,
+    link: &mut Link,
+    mtu: usize,
+    quiet: bool,
+    key_update: bool,
+    first_dgram: &[u8],
+) -> Option<(Vec<u8>, SocketAddr)> {
     let mut conn =
-        Connection::server(&cfg).unwrap_or_else(|e| die(format!("server config rejected: {e:?}")));
+        Connection::server(cfg).unwrap_or_else(|e| die(format!("server config rejected: {e:?}")));
     // One clock for the connection's whole life: the engine's timers are
     // expressed in it (see `dtls_io`).
     let clock = Clock::start();
     conn.set_now(clock.now());
-    let _ = conn.feed(&buf);
+    let _ = conn.feed(first_dgram);
 
-    drive_udp_handshake(&mut conn, &mut link, &clock, mtu);
+    if !drive_udp_handshake(&mut conn, link, &clock, mtu) {
+        // Another client opened a connection before this one finished
+        // handshaking: hand it on rather than lose it.
+        return link.take_handoff();
+    }
 
     if !quiet {
         let v_str = match conn.negotiated_version() {
@@ -698,30 +809,36 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool
         }
         tlsinfo::report_handshake(&conn, Role::Server);
     }
+    // Accepted 0-RTT is replayable (RFC 8446 §8); echo it like any other
+    // input so a client can see it landed.
+    let early = conn.take_early_data().unwrap_or_default();
+    if !early.is_empty() {
+        if !quiet {
+            eprintln!("early data: {} bytes", early.len());
+        }
+        let _ = conn.send(&early);
+        dtls_io::flush(&mut conn, link);
+    }
     // `-key_update`: rekey before the first byte of application data
     // (RFC 9147 §8) and ask the client to rekey too.
     if key_update {
         conn.set_now(clock.now());
         conn.request_key_update()
             .unwrap_or_else(|e| die(format!("KeyUpdate refused: {e:?}")));
-        dtls_io::flush(&mut conn, &link);
+        dtls_io::flush(&mut conn, link);
     }
-    drive_udp_echo(
-        &mut conn,
-        &mut link,
-        &clock,
-        mtu,
-        Duration::from_secs(5),
-        quiet,
-    );
+    drive_udp_echo(&mut conn, link, &clock, mtu, Duration::from_secs(5), quiet);
     if !quiet {
         tlsinfo::report_session_end(&conn);
     }
-    let _ = peer;
-    let _: Option<SocketAddr> = bound;
+    link.take_handoff()
 }
 
-fn drive_udp_handshake(conn: &mut Connection, link: &mut Link, clock: &Clock, mtu: usize) {
+/// Drives the server handshake, firing the retransmit timer on the
+/// connection's clock (1 s doubling — RFC 6347 §4.2.4.1 / RFC 9147
+/// §5.8.2). `false` when another client's ClientHello arrived meanwhile
+/// and was held back on an accepting link.
+fn drive_udp_handshake(conn: &mut Connection, link: &mut Link, clock: &Clock, mtu: usize) -> bool {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
     while !conn.is_handshake_complete() {
         if clock.now() > dtls_io::HANDSHAKE_DEADLINE {
@@ -732,12 +849,14 @@ fn drive_udp_handshake(conn: &mut Connection, link: &mut Link, clock: &Clock, mt
         // connection's clock; see the matching note in `s_client`.
         match dtls_io::step(conn, link, clock, &mut buf) {
             Ok(Step::Datagram | Step::Quiet) => {}
+            Ok(Step::Handoff) => return false,
             Ok(Step::Gone) => die("UDP recv failed: the client is unreachable"),
             Err(e) => die(format!("DTLS handshake failed: {e:?}")),
         }
     }
     // The flight that completed the handshake (the final flight, ACKs).
     dtls_io::flush(conn, link);
+    true
 }
 
 /// Echoes the application data in `plain`; `false` when the engine
@@ -758,6 +877,11 @@ fn echo(conn: &mut Connection, plain: &[u8]) -> bool {
 /// ChangeCipherSpec + Finished flight on DTLS 1.2) was lost — and then it
 /// retransmits its Finished on a backoff that outgrows the idle limit. A
 /// close_notify sent into that gap fails its handshake.
+///
+/// On an accepting link, the next connection's ClientHello ends this one
+/// without a close_notify: the client that opened it is done with this one
+/// (and a same-port reconnect would take the alert for the new
+/// connection's).
 fn drive_udp_echo(
     conn: &mut Connection,
     link: &mut Link,
@@ -768,6 +892,7 @@ fn drive_udp_echo(
 ) {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
     let mut last_activity = Instant::now();
+    let mut handed_off = false;
     loop {
         if conn.received_close_notify() {
             break;
@@ -777,7 +902,9 @@ fn drive_udp_echo(
                 dtls_io::settle(conn, link, clock, &mut buf, |conn, plain| {
                     echo(conn, &plain);
                 });
-                if !conn.handshake_flight_pending() && !conn.received_close_notify() {
+                handed_off = handed_off || link.has_handoff();
+                if !handed_off && !conn.handshake_flight_pending() && !conn.received_close_notify()
+                {
                     // The client has just shown up: back to echoing.
                     last_activity = Instant::now();
                     continue;
@@ -805,9 +932,15 @@ fn drive_udp_echo(
                 dtls_io::flush(conn, link);
             }
             Ok(Step::Quiet) => {}
+            Ok(Step::Handoff) => {
+                handed_off = true;
+                break;
+            }
             Ok(Step::Gone) | Err(_) => break,
         }
     }
-    let _ = conn.close();
-    dtls_io::flush(conn, link);
+    if !handed_off {
+        let _ = conn.close();
+        dtls_io::flush(conn, link);
+    }
 }
