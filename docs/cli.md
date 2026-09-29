@@ -474,20 +474,28 @@ Behaviour worth knowing:
   version-spanning one (1.2..=1.3), the fallback `openssl` performs by
   default; the `connected:` / `handshake complete:` line says which was
   negotiated.
-- `s_server` issues a session ticket after every TLS 1.3 handshake (under a
-  per-process random key; `-no_ticket` turns it off) and, with `-naccept N`,
-  serves N connections in a row, so a client can come back and resume.
-  `-early_data` accepts 0-RTT on a resumed connection (`-max_early_data`
-  caps it, default 16384) and echoes it like any other input: early data is
-  replayable (RFC 8446 §8), this is a test server. `s_client -reconnect`
-  connects twice — the first time only to be issued a ticket — and offers
-  it on the second connection; `-early_data FILE` sends the file as 0-RTT
-  with that offer, and re-sends it as ordinary data if the server rejected
-  it (as one does after a HelloRetryRequest). The first connection sends
-  nothing and waits 2 s for a ticket; a server that bundles its
-  NewSessionTickets with its first write instead (Apple's
+- `s_server` issues a session ticket after every TLS 1.3 **or DTLS 1.3**
+  handshake (under a per-process random key; `-no_ticket` turns it off) and,
+  with `-naccept N`, serves N connections in a row, so a client can come
+  back and resume. `-early_data` accepts 0-RTT on a resumed connection
+  (`-max_early_data` caps it, default 16384) and echoes it like any other
+  input: early data is replayable (RFC 8446 §8), this is a test server.
+  `s_client -reconnect` connects twice — the first time only to be issued a
+  ticket — and offers it on the second connection; `-early_data FILE` sends
+  the file as 0-RTT with that offer, and re-sends it as ordinary data if
+  the server rejected it (as one does after a HelloRetryRequest). The first
+  connection sends nothing and waits 2 s for a ticket; a server that bundles
+  its NewSessionTickets with its first write instead (Apple's
   Network.framework does) gets a `close_notify` then, and the tickets that
-  come back with its own goodbye are used.
+  come back with its own goodbye are used. These work over TLS 1.3 and over
+  DTLS 1.3 (RFC 9147 rides RFC 8446 §2.2 / §4.2.10); DTLS 1.2 has no
+  resumption. Over DTLS the reconnecting `s_client` reuses its UDP source
+  port, and `s_server -naccept` keeps one unconnected socket and services
+  each client by address, so a peer whose resumed connection comes from a
+  fresh port is handled too. DTLS 1.3 0-RTT is accepted only from the
+  address the ticket was issued to (RFC 9147 §5.1), so a resumption that
+  takes a cookie HelloRetryRequest (or comes from a new address) resumes
+  1-RTT with its early data rejected.
 - PSK key-exchange modes and external PSKs (TLS 1.3 over TCP; RFC 8446
   §4.2.9 / §4.2.11). `-psk_modes psk_dhe_ke:psk_ke` sets the modes a PSK —
   a resumption ticket or an external one — may be used with, in preference

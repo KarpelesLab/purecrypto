@@ -29,9 +29,15 @@
 //!   both directions (RFC 9147 §8): the sender keeps writing under the old
 //!   epoch until the peer ACKs the `KeyUpdate`, the receiver keeps the
 //!   previous read epoch for a bounded window, and the number of inbound
-//!   updates is capped. `NewSessionTicket` is accepted and acknowledged but
-//!   discarded — the DTLS engines have no resumption store. DTLS 1.2 has no
-//!   post-handshake handshake messages; anything after `Finished` is fatal.
+//!   updates is capped. `NewSessionTicket` (RFC 8446 §4.6.1) is accepted,
+//!   acknowledged and — on the client — stored for PSK resumption (RFC
+//!   8446 §2.2); the server issues one after the handshake as its own
+//!   post-handshake flight (retransmitted until ACKed, RFC 9147 §5.8.4).
+//!   Resumption may skip the cookie exchange for the address the ticket
+//!   was issued to (RFC 9147 §5.1), the only path that carries 0-RTT early
+//!   data (epoch 1, RFC 9147 §6.1; no `EndOfEarlyData`, §5.6). DTLS 1.2 has
+//!   no post-handshake handshake messages and no resumption in this build;
+//!   anything after `Finished` is fatal.
 //! - **Connection IDs (RFC 9146, RFC 9147 §9).** Negotiated through the
 //!   `connection_id` extension when [`crate::tls::Config::connection_id`]
 //!   is set; each side then sends every protected record under the CID
