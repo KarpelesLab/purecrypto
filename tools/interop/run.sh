@@ -431,7 +431,9 @@ pc_supports() {
     esac
     if is_dtls; then
         case $CASE_FEAT in
-            resume|0rtt) skip "purecrypto's DTLS engines have no session resumption (nor 0-RTT)" ;;
+            # DTLS 1.3 resumes (RFC 9147 + RFC 8446 §2.2) and accepts 0-RTT
+            # (§4.2.10). DTLS 1.2 has no resumption in this build.
+            resume|0rtt) [ "$CASE_PROTO" = dtls13 ] || skip "purecrypto's DTLS 1.2 engine has no session resumption" ;;
             loss|loss-final) command -v python3 >/dev/null 2>&1 || skip "no python3 for the lossy relay" ;;
         esac
         if [ "$CASE_PROTO" = dtls12 ]; then
@@ -467,6 +469,10 @@ pc_client_args() {
         fi
         case $CASE_FEAT in
             hrr) a="-connect 127.0.0.1:$PORT -CAfile $PKI/ca.crt -servername localhost -read_timeout 2 $(pc_dtls_flag) -groups $(other_group "$CASE_GROUP"):$(pc_group "$CASE_GROUP") -key-shares $(other_group "$CASE_GROUP") -ciphersuites $(pc_suite "$CASE_SUITE")" ;;
+            # DTLS 1.3 resumption / 0-RTT ride a second connection, as they
+            # do over TLS: RFC 9147 + RFC 8446 §2.2 / §4.2.10.
+            resume) a="$a -reconnect" ;;
+            0rtt) a="$a -reconnect -early_data $PKI/early.txt" ;;
             keyupdate) a="$a -key_update" ;;
             alpn) a="$a -alpn h2,http/1.1" ;;
             mtu) a="$a -mtu 512" ;;
@@ -531,6 +537,10 @@ pc_server_args() {
     if is_dtls; then
         a="$a $(pc_dtls_flag) -groups $(pc_group "$CASE_GROUP")"
         case $CASE_FEAT in
+            # Sequential DTLS 1.3 connections sharing the ticket key; the
+            # second resumes (and, with -early_data, accepts 0-RTT).
+            resume) a="$a -naccept 2" ;;
+            0rtt) a="$a -naccept 2 -early_data" ;;
             keyupdate) a="$a -key_update" ;;
             alpn) a="$a -alpn h2,http/1.1" ;;
             mtu) a="$a -mtu 512" ;;
@@ -735,8 +745,17 @@ pc_verify_dtls() {
     case $CASE_FEAT in
         hrr) expect "$f" "HelloRetryRequest: yes" || ok=1 ;;
     esac
-    refute "$f" "resumed: yes" || ok=1
-    refute "$f" "early data: accepted" || ok=1
+    # DTLS 1.3 resumption (RFC 9147 + RFC 8446 §2.2) reports on the second
+    # connection; 0-RTT additionally accepts early data (§4.2.10). Every
+    # other case must NOT resume or accept 0-RTT.
+    case $CASE_FEAT in
+        resume|0rtt) expect "$f" "resumed: yes" || ok=1 ;;
+        *) refute "$f" "resumed: yes" || ok=1 ;;
+    esac
+    case $CASE_FEAT in
+        0rtt) expect "$f" "early data: accepted" || ok=1 ;;
+        *) refute "$f" "early data: accepted" || ok=1 ;;
+    esac
     case $CASE_FEAT in
         large-chain|mtu)
             if [ "$CASE_ROLE" = peer-server ]; then
