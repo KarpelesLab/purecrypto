@@ -28,9 +28,11 @@ static size_t pump(PcTls *src, PcTls *dst) {
 }
 
 /* Runs one loopback: `version` is PC_DTLS_1_2 / PC_DTLS_1_3; `cookie` picks
- * the cookie exchange (secret + peer address) over pc_dtls_cfg_set_no_cookie.
+ * the cookie exchange (secret + peer address) over pc_dtls_cfg_set_no_cookie;
+ * `cid` negotiates RFC 9146 connection IDs (a fixed 4-byte one on the
+ * client, a random 6-byte one on the server) and checks them on both sides.
  * Returns 0 on success. */
-static int run_loopback(int32_t version, int cookie, uint16_t expect_ver) {
+static int run_loopback(int32_t version, int cookie, int cid, uint16_t expect_ver) {
   /* ECDSA P-256 server key + self-signed cert. */
   PcEcKey *sk = pc_ec_generate(PC_P256);
   if (!sk) return fail("pc_ec_generate");
@@ -75,6 +77,15 @@ static int run_loopback(int32_t version, int cookie, uint16_t expect_ver) {
     if (pc_dtls_cfg_set_no_cookie(scfg) != PC_OK)
       return fail("set_no_cookie");
   }
+  static const uint8_t client_cid[4] = { 0xc1, 0xc2, 0xc3, 0xc4 };
+  if (cid) {
+    if (pc_dtls_cfg_set_connection_id_len(scfg, 0) != PC_UNSUPPORTED)
+      return fail("cid_len 0 should be PC_UNSUPPORTED");
+    if (pc_dtls_cfg_set_connection_id_len(scfg, 21) != PC_UNSUPPORTED)
+      return fail("cid_len 21 should be PC_UNSUPPORTED");
+    if (pc_dtls_cfg_set_connection_id_len(scfg, 6) != PC_OK)
+      return fail("set_connection_id_len");
+  }
 
   /* Client config. */
   PcTlsCfg *ccfg = pc_tls_cfg_new(PC_TLS_CLIENT, version);
@@ -83,6 +94,8 @@ static int run_loopback(int32_t version, int cookie, uint16_t expect_ver) {
     return fail("add_root_pem");
   if (pc_tls_cfg_set_server_name(ccfg, "ffi-dtls.test") != PC_OK)
     return fail("set_server_name");
+  if (cid && pc_dtls_cfg_set_connection_id(ccfg, client_cid, sizeof(client_cid)) != PC_OK)
+    return fail("set_connection_id");
 
   PcTls *server = pc_tls_new(scfg);
   PcTls *client = pc_tls_new(ccfg);
@@ -125,6 +138,29 @@ static int run_loopback(int32_t version, int cookie, uint16_t expect_ver) {
   if (pc_tls_negotiated_version(client, &ver) != PC_OK || ver != expect_ver)
     return fail("dtls version");
 
+  /* Connection IDs: each side's local CID is the other's peer CID. */
+  uint8_t cid_a[32], cid_b[32]; size_t cid_a_len, cid_b_len;
+  cid_a_len = sizeof(cid_a);
+  if (cid) {
+    if (pc_dtls_local_connection_id(client, cid_a, &cid_a_len) != PC_OK ||
+        cid_a_len != sizeof(client_cid) || memcmp(cid_a, client_cid, cid_a_len) != 0)
+      return fail("client local cid");
+    cid_b_len = sizeof(cid_b);
+    if (pc_dtls_peer_connection_id(server, cid_b, &cid_b_len) != PC_OK ||
+        cid_b_len != cid_a_len || memcmp(cid_a, cid_b, cid_a_len) != 0)
+      return fail("server peer cid");
+    cid_a_len = sizeof(cid_a);
+    if (pc_dtls_local_connection_id(server, cid_a, &cid_a_len) != PC_OK || cid_a_len != 6)
+      return fail("server local cid");
+    cid_b_len = sizeof(cid_b);
+    if (pc_dtls_peer_connection_id(client, cid_b, &cid_b_len) != PC_OK ||
+        cid_b_len != 6 || memcmp(cid_a, cid_b, 6) != 0)
+      return fail("client peer cid");
+  } else {
+    if (pc_dtls_local_connection_id(client, cid_a, &cid_a_len) != PC_UNSUPPORTED)
+      return fail("no cid negotiated");
+  }
+
   /* Application data both directions. Drain all queued datagrams. */
   uint8_t buf[16384];
   uint8_t app[1024]; size_t app_len;
@@ -135,13 +171,55 @@ static int run_loopback(int32_t version, int cookie, uint16_t expect_ver) {
     size_t n = sizeof(buf);
     if (pc_tls_pop(client, buf, &n) != PC_OK) return fail("pop c->s");
     if (n == 0) break;
+    /* The datagram names the server's CID before any key is touched (a
+     * server routes by it), and the record it carries, once authenticated
+     * and newest, would let the server follow the client to a new
+     * address (RFC 9146 §6). */
+    cid_b_len = sizeof(cid_b);
+    if (pc_dtls_peek_connection_id(buf, n, 6, cid_b, &cid_b_len) != PC_OK)
+      return fail("peek cid");
+    if (cid && (cid_b_len != 6 || memcmp(cid_a, cid_b, 6) != 0))
+      return fail("peeked cid");
+    if (!cid && cid_b_len != 0)
+      return fail("peeked a cid without one negotiated");
     if (pc_tls_feed(server, buf, n, NULL) != PC_OK) return fail("feed c->s");
+    int32_t allowed = -1;
+    if (pc_dtls_datagram_allows_peer_address_update(server, &allowed) != PC_OK)
+      return fail("address update predicate");
+    if (allowed != (cid ? 1 : 0))
+      return fail("address update predicate value");
   }
   app_len = sizeof(app);
   if (pc_tls_recv(server, app, &app_len) != PC_OK)
     return fail("recv server");
   if (app_len != sizeof(hello) - 1 || memcmp(app, hello, app_len) != 0)
     return fail("server received");
+
+  /* DTLS 1.3: a spare CID for a new path (RequestConnectionId /
+   * NewConnectionId), taken up for every record from then on. */
+  if (cid && version == PC_DTLS_1_3) {
+    size_t spares = 99;
+    if (pc_dtls_request_connection_ids(client, 1) != PC_OK)
+      return fail("request_connection_ids");
+    for (int j = 0; j < 8; j++) {
+      size_t a = pump(client, server);
+      size_t b = pump(server, client);
+      if (a == (size_t)-1 || b == (size_t)-1) return fail("pump cid");
+      if (a == 0 && b == 0) break;
+    }
+    if (pc_dtls_spare_connection_ids(client, &spares) != PC_OK || spares != 1)
+      return fail("spare_connection_ids");
+    if (pc_dtls_use_spare_connection_id(client) != PC_OK)
+      return fail("use_spare_connection_id");
+    if (pc_dtls_use_spare_connection_id(client) != PC_UNSUPPORTED)
+      return fail("no second spare");
+    cid_b_len = sizeof(cid_b);
+    if (pc_dtls_peer_connection_id(client, cid_b, &cid_b_len) != PC_OK ||
+        cid_b_len != 6 || memcmp(cid_a, cid_b, 6) == 0)
+      return fail("switched cid");
+  } else if (pc_dtls_request_connection_ids(client, 1) != PC_UNSUPPORTED) {
+    return fail("request_connection_ids should be PC_UNSUPPORTED");
+  }
 
   const uint8_t back[] = "hi back";
   if (pc_tls_send(server, back, sizeof(back) - 1) != PC_OK)
@@ -170,9 +248,11 @@ static int run_loopback(int32_t version, int cookie, uint16_t expect_ver) {
 }
 
 int main(void) {
-  if (run_loopback(PC_DTLS_1_3, 0, 0xFEFC)) return fail("DTLS 1.3, no cookie");
-  if (run_loopback(PC_DTLS_1_2, 1, 0xFEFD)) return fail("DTLS 1.2, cookie");
-  if (run_loopback(PC_DTLS_1_3, 1, 0xFEFC)) return fail("DTLS 1.3, cookie");
+  if (run_loopback(PC_DTLS_1_3, 0, 0, 0xFEFC)) return fail("DTLS 1.3, no cookie");
+  if (run_loopback(PC_DTLS_1_2, 1, 0, 0xFEFD)) return fail("DTLS 1.2, cookie");
+  if (run_loopback(PC_DTLS_1_3, 1, 0, 0xFEFC)) return fail("DTLS 1.3, cookie");
+  if (run_loopback(PC_DTLS_1_2, 1, 1, 0xFEFD)) return fail("DTLS 1.2, cookie, CID");
+  if (run_loopback(PC_DTLS_1_3, 1, 1, 0xFEFC)) return fail("DTLS 1.3, cookie, CID");
 
   printf("ffi_dtls_smoke: OK\n");
   return 0;

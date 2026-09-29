@@ -110,6 +110,9 @@ pub struct PcTlsCfg {
     /// peer this connection will be fed from (see
     /// [`pc_dtls_cfg_set_peer_addr`]).
     peer_addr: Option<[u8; 18]>,
+    /// DTLS: the RFC 9146 connection ID to receive under (see
+    /// [`pc_dtls_cfg_set_connection_id`] / [`pc_dtls_cfg_set_connection_id_len`]).
+    connection_id: Option<crate::tls::ConnectionId>,
 }
 
 struct CertAndKey {
@@ -182,6 +185,7 @@ impl PcTlsCfg {
             cookie_secret: None,
             no_cookie: false,
             peer_addr: None,
+            connection_id: None,
         }
     }
 
@@ -277,6 +281,11 @@ impl PcTlsCfg {
         }
         if let Some(addr) = &self.peer_addr {
             b = b.peer_address(addr.to_vec());
+        }
+        match &self.connection_id {
+            Some(crate::tls::ConnectionId::Fixed(cid)) => b = b.connection_id(cid.clone()),
+            Some(crate::tls::ConnectionId::Random(len)) => b = b.connection_id_len(*len),
+            _ => {}
         }
         if let Some(ck) = &self.cert {
             b = b.identity(ck.chain_der.clone(), ck.key.to_signing_key());
@@ -687,6 +696,69 @@ pub unsafe extern "C" fn pc_dtls_cfg_set_peer_addr(
         }
         canon[16..18].copy_from_slice(&port.to_be_bytes());
         unsafe { &mut *cfg }.peer_addr = Some(canon);
+        PcStatus::Ok
+    })
+}
+
+/// DTLS: negotiate RFC 9146 connection IDs, receiving under exactly the
+/// `cid_len` bytes at `cid` (`ConfigBuilder::connection_id`). `cid_len` may
+/// be 0 (then `cid` may be NULL): this side sends with the peer's CID but
+/// asks for none in return. More than `dtls::MAX_LOCAL_CID_LEN` (20) bytes
+/// is [`PcStatus::Unsupported`]. A server routing datagrams by CID gives
+/// every connection a distinct value of one length; see
+/// [`pc_dtls_cfg_set_connection_id_len`] for the random form.
+///
+/// # Safety
+/// `cfg` valid; `cid` points to at least `cid_len` readable bytes when
+/// `cid_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_cfg_set_connection_id(
+    cfg: *mut PcTlsCfg,
+    cid: *const u8,
+    cid_len: usize,
+) -> PcStatus {
+    guard(|| {
+        if cfg.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let bytes: Vec<u8> = if cid_len == 0 {
+            Vec::new()
+        } else {
+            match unsafe { slice(cid, cid_len) } {
+                Some(b) => b.to_vec(),
+                None => return PcStatus::NullPointer,
+            }
+        };
+        if bytes.len() > crate::dtls::MAX_LOCAL_CID_LEN {
+            return PcStatus::Unsupported;
+        }
+        unsafe { &mut *cfg }.connection_id = Some(crate::tls::ConnectionId::Fixed(bytes));
+        PcStatus::Ok
+    })
+}
+
+/// DTLS: negotiate RFC 9146 connection IDs, receiving under a random
+/// `len`-byte one drawn per connection (`ConfigBuilder::connection_id_len`)
+/// — the recommended form: unguessable, and one length for every
+/// connection so a server can parse any datagram's CID with
+/// [`pc_dtls_peek_connection_id`]. `len` outside `1..=20` is
+/// [`PcStatus::Unsupported`].
+///
+/// # Safety
+/// `cfg` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_cfg_set_connection_id_len(
+    cfg: *mut PcTlsCfg,
+    len: usize,
+) -> PcStatus {
+    guard(|| {
+        if cfg.is_null() {
+            return PcStatus::NullPointer;
+        }
+        if len == 0 || len > crate::dtls::MAX_LOCAL_CID_LEN {
+            return PcStatus::Unsupported;
+        }
+        unsafe { &mut *cfg }.connection_id = Some(crate::tls::ConnectionId::Random(len));
         PcStatus::Ok
     })
 }
@@ -1386,6 +1458,196 @@ pub unsafe extern "C" fn pc_dtls_handshake_flight_pending(
             *pending = i32::from(conn.inner.handshake_flight_pending());
         }
         PcStatus::Ok
+    })
+}
+
+/// DTLS: the RFC 9146 connection ID the peer puts in the records it sends
+/// this endpoint (`Connection::local_connection_id`). `*out_len = 0` and
+/// `Ok` when CIDs were negotiated but this side receives none;
+/// [`PcStatus::Unsupported`] when they were not negotiated (or before the
+/// ServerHello, or on TLS). A server routing datagrams by CID keeps this
+/// value per connection and matches [`pc_dtls_peek_connection_id`] against
+/// it.
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_local_connection_id(
+    tls: *const PcTls,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    let st = guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        match unsafe { &*tls }.inner.local_connection_id() {
+            Some(cid) => unsafe { out_write(cid, out, out_len) },
+            None => PcStatus::Unsupported,
+        }
+    });
+    unsafe { settle_out_len(out_len, st) }
+}
+
+/// DTLS: the RFC 9146 connection ID this endpoint currently puts in the
+/// records it sends (`Connection::peer_connection_id`). `*out_len = 0` and
+/// `Ok` when the peer receives none; [`PcStatus::Unsupported`] when CIDs
+/// were not negotiated.
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_peer_connection_id(
+    tls: *const PcTls,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    let st = guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        match unsafe { &*tls }.inner.peer_connection_id() {
+            Some(cid) => unsafe { out_write(cid, out, out_len) },
+            None => PcStatus::Unsupported,
+        }
+    });
+    unsafe { settle_out_len(out_len, st) }
+}
+
+/// DTLS: `*allowed = 1` when the datagram most recently fed with
+/// [`pc_tls_feed`] carried a connection ID, authenticated, and was newer
+/// than every record received before it — the record-layer conditions
+/// RFC 9146 §6 sets before the peer's transport address may be moved to
+/// that datagram's source (`Connection::datagram_allows_peer_address_update`);
+/// 0 otherwise. The engine never sees addresses: the caller compares the
+/// datagram's source with the address it sends to and, when they differ and
+/// this is 1, decides — and does not send to the new address before
+/// testing that it is reachable, unless what it sends is no larger than
+/// what it received (RFC 9146 §6 / RFC 9147 §9: a spoofed source address
+/// must not turn this endpoint into a reflector). [`PcStatus::Unsupported`]
+/// for TLS connections (`*allowed` is then 0).
+///
+/// # Safety
+/// All pointers valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_datagram_allows_peer_address_update(
+    tls: *const PcTls,
+    allowed: *mut i32,
+) -> PcStatus {
+    guard(|| {
+        if tls.is_null() || allowed.is_null() {
+            return PcStatus::NullPointer;
+        }
+        unsafe {
+            *allowed = 0;
+        }
+        let conn = unsafe { &*tls };
+        if !matches!(
+            conn.inner.negotiated_version(),
+            Some(ProtocolVersion::DTLSv1_2) | Some(ProtocolVersion::DTLSv1_3)
+        ) {
+            return PcStatus::Unsupported;
+        }
+        unsafe {
+            *allowed = i32::from(conn.inner.datagram_allows_peer_address_update());
+        }
+        PcStatus::Ok
+    })
+}
+
+/// DTLS: reads the connection ID off the front of a datagram without any
+/// key (`dtls::peek_connection_id`), so a server can route it to the
+/// connection it belongs to by comparing against each connection's
+/// [`pc_dtls_local_connection_id`]. `cid_len` is the length this server
+/// issues (the record does not carry it; RFC 9146 §4). Writes the CID and
+/// returns `Ok`; `*out_len = 0` and `Ok` when the first record carries no
+/// CID (a plaintext handshake record, a CID-less protected record) or the
+/// datagram is too short. Nothing is authenticated here: the connection
+/// the CID names still has to verify the record.
+///
+/// # Safety
+/// `datagram` points to `datagram_len` readable bytes; `out` / `out_len`
+/// valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_peek_connection_id(
+    datagram: *const u8,
+    datagram_len: usize,
+    cid_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    let st = guard(|| {
+        let Some(dg) = (unsafe { slice(datagram, datagram_len) }) else {
+            return PcStatus::NullPointer;
+        };
+        let cid = crate::dtls::peek_connection_id(dg, cid_len).unwrap_or(&[]);
+        unsafe { out_write(cid, out, out_len) }
+    });
+    unsafe { settle_out_len(out_len, st) }
+}
+
+/// DTLS 1.3: asks the peer for `num` fresh connection IDs to send with
+/// (`RequestConnectionId`, RFC 9147 §9; `Connection::request_connection_ids`),
+/// ahead of an expected path change. The message is retransmitted until
+/// acknowledged like any handshake message; the peer's answer shows up in
+/// [`pc_dtls_spare_connection_ids`]. [`PcStatus::Unsupported`] before the
+/// handshake completes, on DTLS 1.2 / TLS, when CIDs were not negotiated or
+/// this side sends without one, and while an earlier request is unanswered.
+///
+/// # Safety
+/// `tls` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_request_connection_ids(tls: *mut PcTls, num: u8) -> PcStatus {
+    guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        match unsafe { &mut *tls }.inner.request_connection_ids(num) {
+            Ok(()) => PcStatus::Ok,
+            Err(_) => PcStatus::Unsupported,
+        }
+    })
+}
+
+/// DTLS 1.3: `*count` = the spare connection IDs the peer issued that this
+/// side has not switched to yet (`Connection::spare_connection_ids`); 0 on
+/// every other protocol.
+///
+/// # Safety
+/// All pointers valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_spare_connection_ids(
+    tls: *const PcTls,
+    count: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if tls.is_null() || count.is_null() {
+            return PcStatus::NullPointer;
+        }
+        unsafe {
+            *count = (*tls).inner.spare_connection_ids();
+        }
+        PcStatus::Ok
+    })
+}
+
+/// DTLS 1.3: switches the connection ID this side sends with to the next
+/// spare the peer issued (`Connection::use_spare_connection_id`; RFC 9147
+/// §9: a new CID for a new path). [`PcStatus::Unsupported`] when there is
+/// no spare, and on every other protocol.
+///
+/// # Safety
+/// `tls` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_use_spare_connection_id(tls: *mut PcTls) -> PcStatus {
+    guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        match unsafe { &mut *tls }.inner.use_spare_connection_id() {
+            Ok(()) => PcStatus::Ok,
+            Err(_) => PcStatus::Unsupported,
+        }
     })
 }
 

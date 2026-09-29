@@ -799,6 +799,17 @@ pc_status pc_dtls_cfg_set_no_cookie(PcTlsCfg *cfg);
 pc_status pc_dtls_cfg_set_peer_addr(PcTlsCfg *cfg,
                                     const uint8_t *addr, size_t addr_len,
                                     uint16_t port);
+/* DTLS, either role: negotiate RFC 9146 connection IDs, receiving under
+ * exactly the `cid_len` bytes at `cid` (0 bytes: this side sends with the
+ * peer's CID but asks for none; `cid` may then be NULL; more than 20 bytes
+ * is PC_UNSUPPORTED) — or under a random `len`-byte one (1..=20) drawn per
+ * connection, the recommended form: unguessable, and one length for every
+ * connection so a server can route any datagram by
+ * pc_dtls_peek_connection_id. Whether CIDs were negotiated is read back
+ * with pc_dtls_local_connection_id / pc_dtls_peer_connection_id. */
+pc_status pc_dtls_cfg_set_connection_id(PcTlsCfg *cfg,
+                                        const uint8_t *cid, size_t cid_len);
+pc_status pc_dtls_cfg_set_connection_id_len(PcTlsCfg *cfg, size_t len);
 /* PC_OK, or PC_BAD_CONFIG when a cookie-requiring DTLS server cfg lacks its
  * cookie secret or peer address (pc_tls_new returns NULL for the same). */
 pc_status pc_tls_cfg_validate(const PcTlsCfg *cfg);
@@ -871,6 +882,39 @@ pc_status pc_dtls_set_now(PcTls *tls, uint64_t now_seconds, uint32_t now_nanos);
  * to complete; pc_tls_close on a DTLS 1.3 client holds its close_notify back
  * until it turns 0 (keep feeding / timing / popping until then). */
 pc_status pc_dtls_handshake_flight_pending(const PcTls *tls, int32_t *pending);
+
+/* DTLS connection IDs (RFC 9146; RFC 9147 §9 on DTLS 1.3), once negotiated:
+ * the CID the peer puts in its records to us (`local`; what a server routes
+ * incoming datagrams by) and the one we put in ours (`peer`). Both write the
+ * bytes like pc_tls_alpn_selected; *out_len = 0 with PC_OK is a negotiated
+ * zero-length CID (that direction carries none), PC_UNSUPPORTED means CIDs
+ * were not negotiated (or not yet, or TLS). */
+pc_status pc_dtls_local_connection_id(const PcTls *tls, uint8_t *out, size_t *out_len);
+pc_status pc_dtls_peer_connection_id(const PcTls *tls, uint8_t *out, size_t *out_len);
+/* *allowed = 1 when the datagram most recently fed carried a connection ID,
+ * authenticated, and was newer than every record before it — the RFC 9146
+ * §6 record-layer conditions for moving the peer's address to that
+ * datagram's source (a reordered or replayed datagram must not move it).
+ * The engine never sees addresses: compare the source with the address you
+ * send to, and when they differ and this is 1 you may adopt it — but do not
+ * send more to the new address than you received from it before it has
+ * answered (a reachability test, RFC 9147 §9): a spoofed source must not
+ * turn this endpoint into a reflector. PC_UNSUPPORTED on TLS. */
+pc_status pc_dtls_datagram_allows_peer_address_update(const PcTls *tls, int32_t *allowed);
+/* Stateless: the connection ID at the front of `datagram`, for a server to
+ * find the connection it belongs to before any key is touched. `cid_len` is
+ * the length this server issues (the record does not carry it). *out_len =
+ * 0 with PC_OK when the first record carries no CID (a plaintext handshake
+ * record, a CID-less protected record) or the datagram is too short. */
+pc_status pc_dtls_peek_connection_id(const uint8_t *datagram, size_t datagram_len,
+                                     size_t cid_len, uint8_t *out, size_t *out_len);
+/* DTLS 1.3 only (PC_UNSUPPORTED otherwise): ask the peer for `num` fresh
+ * CIDs to send with (RequestConnectionId, ahead of a path change; one
+ * request at a time), count the spares it issued, and switch the CID this
+ * side sends with to the next spare (a new CID for a new path). */
+pc_status pc_dtls_request_connection_ids(PcTls *tls, uint8_t num);
+pc_status pc_dtls_spare_connection_ids(const PcTls *tls, size_t *count);
+pc_status pc_dtls_use_spare_connection_id(PcTls *tls);
 
 /* ============================================================================
  * QUIC v1 (RFC 9000 / 9001 / 9002 / 9221) — memory-BIO style. The underlying
