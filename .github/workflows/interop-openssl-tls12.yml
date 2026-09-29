@@ -3,11 +3,13 @@ name: TLS 1.2 interop (OpenSSL)
 # Interop-tests the TLS 1.2 and DTLS 1.2 engines against OpenSSL in BOTH
 # roles, over real loopback TCP/UDP sockets, for every AEAD suite they offer
 # (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305) under an ECDSA and an RSA
-# certificate — 30 handshakes, each exchanging application data: the 24 of
+# certificate — 48 handshakes, each exchanging application data: the 24 of
 # the matrix, plus the six OpenSSL -> purecrypto DTLS 1.2 cases repeated
 # with the ClientHello forced across two datagrams (`openssl s_client` at
 # its minimum link MTU), which the server's stateless cookie path has to
-# reassemble before it can check the cookie.
+# reassemble before it can check the cookie, plus every DTLS 1.2 case
+# (those six included) repeated with a client certificate that the server
+# demands and verifies.
 #
 # Loopback (purecrypto<->purecrypto) cannot catch a symmetric wire-format
 # bug: both ChaCha20-Poly1305 suites once used the AES-GCM explicit nonce

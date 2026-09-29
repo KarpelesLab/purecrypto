@@ -117,7 +117,11 @@ FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp rpk
 # dropped), `loss-final` (the same relay dropping named datagrams instead
 # of random ones: the LAST flight of the handshake — see `final_flight_drops`
 # — which leaves one side finished and the other still in its handshake;
-# the whole exchange is checked), `cid` (RFC 9146 connection IDs: each
+# the whole exchange is checked), `mtls` (a client certificate of each
+# kind, verified by the server: on DTLS 1.3 the client's Certificate +
+# CertificateVerify + Finished flight is multi-message and fragmented, on
+# DTLS 1.2 the Certificate / CertificateVerify wrap the ClientKeyExchange),
+# `cid` (RFC 9146 connection IDs: each
 # side receives under the CID it named — purecrypto under PC_CID, the peer
 # under PEER_CID, which the adapter configures its tool with — and both
 # report the pair).
@@ -197,6 +201,12 @@ matrix() {
                         else
                             echo "proto=$proto role=$role cert=p256 group=x25519 suite=aes128gcm feat=$feat"
                         fi ;;
+                    # mTLS with every certificate kind as the CLIENT
+                    # identity (and the server's), as over TLS.
+                    mtls)
+                        for cert in $CERTS; do
+                            echo "proto=$proto role=$role cert=$cert group=x25519 suite=aes128gcm feat=mtls"
+                        done ;;
                     *)
                         echo "proto=$proto role=$role cert=p256 group=x25519 suite=aes128gcm feat=$feat" ;;
                 esac
@@ -407,7 +417,6 @@ pc_supports() {
     if is_dtls; then
         case $CASE_FEAT in
             resume|0rtt) skip "purecrypto's DTLS engines have no session resumption (nor 0-RTT)" ;;
-            mtls) skip "purecrypto's DTLS servers do not support client certificates" ;;
             loss|loss-final) command -v python3 >/dev/null 2>&1 || skip "no python3 for the lossy relay" ;;
         esac
         if [ "$CASE_PROTO" = dtls12 ]; then
@@ -446,6 +455,7 @@ pc_client_args() {
             keyupdate) a="$a -key_update" ;;
             alpn) a="$a -alpn h2,http/1.1" ;;
             mtu) a="$a -mtu 512" ;;
+            mtls) a="$a $(pc_ident "$CASE_CERT")" ;;
             # Application data is not retransmitted by DTLS: the client
             # asks again when no answer comes, as the peers' tools do.
             loss) a="$a -resend 3" ;;
@@ -497,6 +507,7 @@ pc_server_args() {
             alpn) a="$a -alpn h2,http/1.1" ;;
             mtu) a="$a -mtu 512" ;;
             cid) a="$a -cid $PC_CID" ;;
+            mtls) a="$a -Verify $PKI/ca.crt" ;;
         esac
         echo "$a"
         return
@@ -669,6 +680,10 @@ pc_verify_dtls() {
         large-chain|mtu)
             if [ "$CASE_ROLE" = peer-server ]; then
                 expect "$f" "peer certificate: X.509 (2)" || ok=1
+            fi ;;
+        mtls)
+            if [ "$CASE_ROLE" = peer-client ]; then
+                expect "$f" "peer certificate: X.509" || ok=1
             fi ;;
         keyupdate|keyupdate-peer)
             expect_re "$f" "^KeyUpdate: sent [1-9][0-9]*, received [1-9][0-9]*" || ok=1 ;;

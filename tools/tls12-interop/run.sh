@@ -20,6 +20,14 @@
 # refuse outright — a client on a small path MTU could never complete the
 # HelloVerifyRequest round trip, and this harness hid it behind `-mtu 1500`.
 #
+# Every DTLS 1.2 case also runs with a client certificate (`_mtls`): the
+# server demands one (`-Verify 1` / `-Verify ca.crt`) and the client
+# presents the case's leaf, so the client's Certificate + CertificateVerify
+# (RFC 5246 §7.4.6 / §7.4.8, signed over the DTLS-shaped transcript of RFC
+# 6347 §4.2.6) are verified by the other implementation. Under `_fragch`
+# the OpenSSL client's small MTU splits its Certificate across datagrams
+# as well.
+#
 #   OPENSSL=/path/to/openssl PURECRYPTO=/path/to/purecrypto tools/tls12-interop/run.sh
 #
 # Optional: TLS12_INTEROP_TIMEOUT (seconds per client step, default 20),
@@ -99,6 +107,14 @@ setup() {
 expect() {
     if ! grep -q -F -- "$2" "$1"; then
         log "  expected '$2' in $(basename "$1")"
+        return 1
+    fi
+}
+
+# expect_re FILE REGEX: FILE must contain a line matching the extended REGEX.
+expect_re() {
+    if ! grep -q -E -- "$2" "$1"; then
+        log "  expected /$2/ in $(basename "$1")"
         return 1
     fi
 }
@@ -193,18 +209,35 @@ stop_server() {
     SERVER_PID=""
 }
 
-# pc_client DIR PROTO — purecrypto s_client sending one line; stdin stays
-# open a moment so the echo can come back before EOF ends the session. The
-# exit status lands in RC.
+# pc_client DIR PROTO [IDENT...] — purecrypto s_client sending one line;
+# stdin stays open a moment so the echo can come back before EOF ends the
+# session. IDENT (`-cert`/`-key`) presents a client certificate. The exit
+# status lands in RC.
 pc_client() {
     local dir=$1 proto=$2
+    shift 2
     local vers=-tls1_2
     if [ "$proto" = udp ]; then vers=-dtls1_2; fi
     RC=0
     (printf 'ping from purecrypto\n'; sleep 1) |
         "$TO" "$STEP_TIMEOUT" "$PURECRYPTO" s_client -connect "127.0.0.1:$PORT" "$vers" \
-            -CAfile "$PKI/ca.crt" -servername localhost \
+            -CAfile "$PKI/ca.crt" -servername localhost "$@" \
             >"$dir/client.out" 2>"$dir/client.err" || RC=$?
+}
+
+# Whether a variant name asks for a client certificate.
+is_mtls() {
+    case $1 in
+        *mtls*) return 0 ;;
+    esac
+    return 1
+}
+# Whether a variant name asks for the fragmented ClientHello.
+is_fragch() {
+    case $1 in
+        *fragch*) return 0 ;;
+    esac
+    return 1
 }
 
 # The fragmented-ClientHello variant of the OpenSSL -> purecrypto DTLS
@@ -221,15 +254,17 @@ FRAG_ALPN_OFFER=dtls12-interop-padding-so-that-both-the-first-and-the-cookie-bea
 FRAG_ALPN_PICK=dtls12-interop
 FRAG_MTU=256
 
-# ossl_client DIR PROTO CIPHER [fragch] — openssl s_client pinned to CIPHER,
-# sending one line to the purecrypto echo server; the exit status lands in
-# RC. With `fragch` (UDP only) the ClientHello is forced across two
-# datagrams, see above; without it OpenSSL sends as it does by default.
+# ossl_client DIR PROTO CIPHER VARIANT [IDENT...] — openssl s_client
+# pinned to CIPHER, sending one line to the purecrypto echo server; the exit
+# status lands in RC. A `fragch` VARIANT (UDP only) forces the ClientHello
+# across two datagrams, see above; otherwise OpenSSL sends as it does by
+# default. IDENT (`-cert`/`-key`) presents a client certificate.
 ossl_client() {
-    local dir=$1 proto=$2 cipher=$3 variant=${4:-plain}
+    local dir=$1 proto=$2 cipher=$3 variant=$4
+    shift 4
     local vers=-tls1_2 alpn=
     if [ "$proto" = udp ]; then vers=-dtls1_2; fi
-    if [ "$variant" = fragch ]; then
+    if is_fragch "$variant"; then
         vers="$vers -mtu $FRAG_MTU -msg"
         alpn="-alpn $FRAG_ALPN_OFFER"
     fi
@@ -237,7 +272,7 @@ ossl_client() {
     # shellcheck disable=SC2086
     (printf 'ping from openssl\n'; sleep 1) |
         "$TO" "$STEP_TIMEOUT" "$OPENSSL" s_client -connect "127.0.0.1:$PORT" $vers $alpn \
-            -cipher "$cipher" -CAfile "$PKI/ca.crt" -servername localhost \
+            -cipher "$cipher" -CAfile "$PKI/ca.crt" -servername localhost "$@" \
             >"$dir/client.out" 2>"$dir/client.err" || RC=$?
 }
 
@@ -268,17 +303,25 @@ expect_fragmented_client_hello() {
 
 # purecrypto client -> openssl server pinned to one suite. Over TCP the
 # server runs `-rev` and the client must get its line back reversed; over
-# UDP s_server has no echo mode, so the line is checked at the server.
+# UDP s_server has no echo mode, so the line is checked at the server. The
+# `mtls` variant (UDP only) has the server demand a client certificate
+# (`-Verify 1`, fatal when absent or invalid) and the client present the
+# case's leaf; the server names the verified subject.
 case_pc_to_ossl() {
-    local d=$1 proto=$2 kind=$3 suite=$4 # $5 (variant) is always `plain`
+    local d=$1 proto=$2 kind=$3 suite=$4 variant=${5:-plain}
     local cipher
     cipher=$(ossl_cipher "$kind" "$suite")
-    local rev=-rev
+    local rev=-rev verify= ident=
     if [ "$proto" = udp ]; then rev=; fi
+    if is_mtls "$variant"; then
+        verify="-Verify 1 -verify_return_error"
+        ident="-cert $PKI/$kind.crt -key $PKI/$kind.key"
+    fi
     # shellcheck disable=SC2086
     start_ossl_server "$d" "$proto" -cipher "$cipher" \
-        -cert "$PKI/$kind.crt" -key "$PKI/$kind.key" $rev
-    pc_client "$d" "$proto"
+        -cert "$PKI/$kind.crt" -key "$PKI/$kind.key" $rev $verify
+    # shellcheck disable=SC2086
+    pc_client "$d" "$proto" $ident
     stop_server kill
     rc_is 0
     if [ "$proto" = tcp ]; then
@@ -291,18 +334,32 @@ case_pc_to_ossl() {
         expect "$d/server.out" "ping from purecrypto"
         expect "$d/server.out" "CIPHER is $cipher"
     fi
+    if is_mtls "$variant"; then
+        expect "$d/server.out" "Client certificate"
+        # OpenSSL 3.0 prints `subject=CN = localhost`, 3.2+ `subject=CN=localhost`.
+        expect_re "$d/server.out" "^subject=CN ?= ?localhost"
+    fi
 }
 
 # openssl client pinned to one suite -> purecrypto echo server. The
-# `fragch` variant (UDP only) sends the ClientHello in two datagrams.
+# `fragch` variant (UDP only) sends the ClientHello in two datagrams; the
+# `mtls` variant has the server demand a client certificate (`-Verify`)
+# and the client present the case's leaf, which the server must report
+# (`peer certificate: X.509`); `fragch_mtls` combines the two, so the
+# client's Certificate is fragmented across datagrams as well.
 case_ossl_to_pc() {
     local d=$1 proto=$2 kind=$3 suite=$4 variant=${5:-plain}
-    local cipher alpn=
+    local cipher alpn= verify= ident=
     cipher=$(ossl_cipher "$kind" "$suite")
-    if [ "$variant" = fragch ]; then alpn="-alpn $FRAG_ALPN_PICK"; fi
+    if is_fragch "$variant"; then alpn="-alpn $FRAG_ALPN_PICK"; fi
+    if is_mtls "$variant"; then
+        verify="-Verify $PKI/ca.crt"
+        ident="-cert $PKI/$kind.crt -key $PKI/$kind.key"
+    fi
     # shellcheck disable=SC2086
-    start_pc_server "$d" "$proto" -cert "$PKI/$kind.crt" -key "$PKI/$kind.key" $alpn
-    ossl_client "$d" "$proto" "$cipher" "$variant"
+    start_pc_server "$d" "$proto" -cert "$PKI/$kind.crt" -key "$PKI/$kind.key" $alpn $verify
+    # shellcheck disable=SC2086
+    ossl_client "$d" "$proto" "$cipher" "$variant" $ident
     stop_server kill
     rc_is 0
     expect "$d/client.out" "ping from openssl"
@@ -313,9 +370,12 @@ case_ossl_to_pc() {
         expect "$d/client.out" "Protocol  : DTLSv1.2"
         expect "$d/server.err" "handshake complete: DTLSv1.2"
     fi
-    if [ "$variant" = fragch ]; then
+    if is_fragch "$variant"; then
         expect "$d/client.out" "ALPN protocol: $FRAG_ALPN_PICK"
         expect_fragmented_client_hello "$d/client.out"
+    fi
+    if is_mtls "$variant"; then
+        expect "$d/server.err" "peer certificate: X.509"
     fi
 }
 
@@ -331,7 +391,9 @@ for proto in tcp udp; do
             for suite in aes128gcm aes256gcm chacha20; do
                 variants=plain
                 if [ "$proto" = udp ] && [ "$dir" = ossl_to_pc ]; then
-                    variants="plain fragch"
+                    variants="plain fragch mtls fragch_mtls"
+                elif [ "$proto" = udp ]; then
+                    variants="plain mtls"
                 fi
                 for variant in $variants; do
                     name=tls12

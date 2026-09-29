@@ -73,7 +73,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
 | `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8, Apple's Network.framework and wolfSSL 5.9, both roles** (CI: certs × groups × suites, resumption (incl. PSK-only), external PSK, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
-| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3), RFC 9146 (connection IDs) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, fragmentation at two MTUs, a lossy path, connection IDs); **DTLS 1.2 vs Mbed TLS 4.2, both roles** (CI: certs × groups × suites, ALPN, a lossy path, connection IDs) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
+| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3), RFC 9146 (connection IDs) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello, client certificates** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, mTLS, fragmentation at two MTUs, a lossy path, connection IDs); **DTLS 1.2 vs Mbed TLS 4.2, both roles** (CI: certs × groups × suites, ALPN, a lossy path, connection IDs) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221/9368/9369 | loopback | loopback; **QUIC v1 + v2 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
@@ -168,11 +168,20 @@ update with the commands in `tools/wycheproof/README.md`.
   OpenSSL side pins the suite and each handshake exchanges application
   data:
 
-  | Suite | TLS 1.2 client / server | DTLS 1.2 client / server | DTLS 1.2 server, fragmented ClientHello |
-  |---|---|---|---|
-  | `ECDHE-{ECDSA,RSA}-AES128-GCM-SHA256` | ✅ / ✅ | ✅ / ✅ | ✅ |
-  | `ECDHE-{ECDSA,RSA}-AES256-GCM-SHA384` | ✅ / ✅ | ✅ / ✅ | ✅ |
-  | `ECDHE-{ECDSA,RSA}-CHACHA20-POLY1305` (RFC 7905) | ✅ / ✅ | ✅ / ✅ | ✅ |
+  | Suite | TLS 1.2 client / server | DTLS 1.2 client / server | DTLS 1.2 server, fragmented ClientHello | DTLS 1.2 mTLS client / server (+ fragmented) |
+  |---|---|---|---|---|
+  | `ECDHE-{ECDSA,RSA}-AES128-GCM-SHA256` | ✅ / ✅ | ✅ / ✅ | ✅ | ✅ / ✅ (✅) |
+  | `ECDHE-{ECDSA,RSA}-AES256-GCM-SHA384` | ✅ / ✅ | ✅ / ✅ | ✅ | ✅ / ✅ (✅) |
+  | `ECDHE-{ECDSA,RSA}-CHACHA20-POLY1305` (RFC 7905) | ✅ / ✅ | ✅ / ✅ | ✅ | ✅ / ✅ (✅) |
+
+  Every DTLS 1.2 case also runs with a client certificate: the server
+  demands one (`openssl s_server -Verify 1` / `purecrypto s_server
+  -Verify`) and the client presents the case's leaf, so the client's
+  Certificate and CertificateVerify — signed over the DTLS-shaped
+  transcript (RFC 6347 §4.2.6), after the ClientKeyExchange (RFC 5246
+  §7.4.8) — are verified by the other implementation; in the fragmented
+  variant the OpenSSL client's 256-byte MTU splits its Certificate across
+  datagrams too.
 
   The OpenSSL → purecrypto DTLS 1.2 cases run twice: as OpenSSL sends by
   default, and with `s_client` at its minimum link MTU (256) and an ALPN
@@ -554,10 +563,14 @@ update with the commands in `tools/wycheproof/README.md`.
   loopback UDP, `s_client -dtls1_3` / `s_server -dtls1_3`): the plain
   product, HelloRetryRequest per group, RFC 9147 §8 KeyUpdate with the
   epoch change from either side, ALPN, the > 16 KiB chain at the default
-  and at a 512-byte MTU (dozens of fragments each way), and a handshake
-  through a relay dropping 20 % of the datagrams in each direction (ACK-
-  driven retransmission on 1.3, whole flights on 1.2). 754 cases; `C` /
-  `S` as above, `⏭` a SKIP with the reason:
+  and at a 512-byte MTU (dozens of fragments each way), a client
+  certificate of every kind (on DTLS 1.3 the client's Certificate +
+  CertificateVerify + Finished flight is multi-message and, with the
+  ML-DSA-65 identity, several KiB across many records; on DTLS 1.2 the
+  Certificate / CertificateVerify wrap the ClientKeyExchange), and a
+  handshake through a relay dropping 20 % of the datagrams in each
+  direction (ACK-driven retransmission on 1.3, whole flights on 1.2). 772
+  cases; `C` / `S` as above, `⏭` a SKIP with the reason:
 
   | Case | TLS 1.3 (C / S) | DTLS 1.3 (C / S) | DTLS 1.2 (C / S) |
   |---|---|---|---|
@@ -569,7 +582,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`-s`) | — | — |
   | 0-RTT rejected across a HelloRetryRequest | ⏭ the wolfSSL server deprotects the 0-RTT records it must skip under the early keys it derived, then refuses the plaintext second ClientHello / ⏭ the example client shares the resumed session's group, so no HRR can be forced | — | — |
   | HelloRetryRequest to every group (`x25519`, `P-256`, `P-384`, `P-521`, the three hybrids) | ✅ / ✅ | ✅ / ✅ (a hybrid arrives in a fragmented CH2 with the cookie first) | — (no HRR in 1.2) |
-  | mTLS, client certificate of every kind | ✅ / ✅ | ⏭ purecrypto's DTLS servers do not verify client certificates | ⏭ |
+  | mTLS, client certificate of every kind | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (RSA, P-256, P-384: the 1.2 engines sign with RSA or ECDSA only; C with P-384 ⏭ RFC 8422 §5.1.1 as in the plain case) |
   | KeyUpdate from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ | — |
   | KeyUpdate from the peer, purecrypto replies | ✅ / ✅ | ✅ / ✅ (the example client's `-I` writes a message it never reads back, and `wolfSSL_shutdown` sends no close_notify while that echo is pending, so the peer's close_notify is not demanded in that one case) | — |
   | RFC 8879 certificate compression; RFC 8449 `record_size_limit` | ⏭ not implemented by wolfSSL | — | — |
@@ -1061,7 +1074,7 @@ code site:
   / multi-party / message-envelope layers are out of scope.
 - **Coverage gaps**: ML-KEM ACVP is a trimmed slice (not the full corpus);
   DTLS 1.3 has a single external peer (wolfSSL), and its resumption,
-  0-RTT and client authentication are not implemented at all; the
+  0-RTT are not implemented at all; the
   RFC 9146 §6 peer-address update is exercised end to end by the CLI's own
   client and server only (no peer tool moves its socket mid-connection),
   and the return-routability check of draft-ietf-tls-dtls-rrc is not
