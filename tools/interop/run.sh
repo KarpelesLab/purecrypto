@@ -611,7 +611,14 @@ pc_verify() {
     expect "$f" "key exchange: $group" || ok=1
     case $CASE_FEAT in
         hrr|0rtt-hrr) expect "$f" "HelloRetryRequest: yes" || ok=1 ;;
-        *) refute "$f" "HelloRetryRequest: yes" || ok=1 ;;
+        # `hrr-expected`: the peer client offers the case's group but shares
+        # no key for it up front, so reaching it takes a HelloRetryRequest —
+        # which must then have happened.
+        *) if has_quirk hrr-expected; then
+               expect "$f" "HelloRetryRequest: yes" || ok=1
+           else
+               refute "$f" "HelloRetryRequest: yes" || ok=1
+           fi ;;
     esac
     case $CASE_FEAT in
         resume|0rtt|0rtt-hrr|resume-psk) expect "$f" "resumed: yes" || ok=1 ;;

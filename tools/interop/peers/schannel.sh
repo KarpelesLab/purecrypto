@@ -75,9 +75,10 @@ cmd_supports() {
     fi
     case $CASE_FEAT in
         0rtt|0rtt-hrr) skip "SslStream has no 0-RTT API and SChannel accepts no early data" ;;
-        # The client sends a key share for every group it offers, the
-        # server takes the client's share; neither side can be steered
-        # into a HelloRetryRequest.
+        # The client pre-shares a key for every group it offers except
+        # P-521 (whose HelloRetryRequest the plain P-521 case already
+        # checks, see `quirks`), and the server takes the client's share;
+        # neither side can otherwise be steered into a HelloRetryRequest.
         hrr)
             if [ "$CASE_ROLE" = peer-client ]; then
                 skip "SChannel client shares a key for every group it offers; no HRR possible"
@@ -235,7 +236,13 @@ cmd_verify() {
 
 case ${1:-} in
     info) cmd_info ;;
-    quirks) ;;
+    # The SChannel client offers P-521 but pre-shares keys only for the
+    # groups ahead of it (x25519, P-256, P-384), so a purecrypto server
+    # pinned to P-521 gets there with a HelloRetryRequest.
+    quirks)
+        if [ "${CASE_ROLE:-}" = peer-client ] && [ "${CASE_GROUP:-}" = p521 ]; then
+            echo hrr-expected
+        fi ;;
     supports) cmd_supports ;;
     server) cmd_server ;;
     client) cmd_client ;;

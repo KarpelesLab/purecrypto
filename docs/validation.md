@@ -353,7 +353,7 @@ update with the commands in `tools/wycheproof/README.md`.
 
   | Case | SChannel (C / S) |
   |---|---|
-  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384, P-521}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ (S: AES-128-GCM only — the client cannot restrict suites) |
+  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384, P-521}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ (S: AES-128-GCM only — the client cannot restrict suites; S with P-521 through a HelloRetryRequest, which the case requires: the client offers P-521 but pre-shares no key for it) |
   | Plain, Ed25519 certificate | ⏭ SChannel has no Ed25519 (and .NET cannot load the key) |
   | Plain, ML-DSA-65 certificate | ⏭ SChannel has no ML-DSA |
   | Plain, `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ⏭ no ML-KEM hybrid group in Server 2025's SChannel |
@@ -361,7 +361,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | Resumption, PSK-only (`psk_ke`) | ⏭ `SslStream` exposes no PSK-only resumption |
   | External PSK (RFC 8446 §4.2.11) | ⏭ `SslStream` has no external-PSK API |
   | 0-RTT (accepted, and rejected across an HRR) | ⏭ `SslStream` has no 0-RTT API and SChannel accepts no early data |
-  | HelloRetryRequest | ⏭ the SChannel client sends a key share for every group it offers, and the server's group preference follows system policy: neither side can be steered into one |
+  | HelloRetryRequest | ⏭ the SChannel client pre-shares a key for every group it offers except P-521 (whose HelloRetryRequest the plain P-521 case checks), and the server's group preference follows system policy: neither side can otherwise be steered into one |
   | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ (client certificates verified by the .NET chain engine, rooted in the run's CA) |
   | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ as above |
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ (SChannel replies with the next application-data record it sends, not on its own — RFC 8446 §4.6.3 asks for no more — so the peer is made to send after the update: the server answers after the client's first record, the client sends a second round) |
