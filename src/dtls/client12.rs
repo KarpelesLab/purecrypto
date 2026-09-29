@@ -15,6 +15,10 @@
 //! - HelloVerifyRequest cookie handshake (RFC 6347 §4.2.1)
 //! - Anti-replay sliding window after CCS
 //! - Sans-I/O retransmit machine driven by `next_timeout`/`on_timeout`
+//! - Client certificates (mutual authentication): a `CertificateRequest`
+//!   is answered with the configured identity's `Certificate` and
+//!   `CertificateVerify` (RFC 5246 §7.4.6 / §7.4.8), signed in-process —
+//!   an external key is refused at construction, as on TLS 1.2
 //!
 //! Post-handshake handshake messages are fatal (`UnexpectedMessage`), as
 //! they are in the TLS 1.2 engine: DTLS 1.2 has no KeyUpdate, and this
@@ -35,11 +39,14 @@ use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
-use crate::tls::codec::handshake12::{ClientKeyExchange, ServerKeyExchange, signed_message};
-use crate::tls::codec::{
-    CipherSuite, NamedGroup, Random, ReadCursor, ServerHello, hs_type, with_len_u8, with_len_u16,
+use crate::tls::codec::handshake12::{
+    CertificateRequest12, ClientKeyExchange, ServerKeyExchange, signed_message,
 };
-use crate::tls::conn::{SUITES_12, SuiteParams12, lookup_suite_12};
+use crate::tls::codec::{
+    CipherSuite, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme, hs_type,
+    with_len_u8, with_len_u16, with_len_u24,
+};
+use crate::tls::conn::{ClientCertConfig, SUITES_12, SuiteParams12, lookup_suite_12};
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, master_secret, tls12_exporter,
@@ -125,6 +132,12 @@ pub(crate) struct ClientConfig12Internal {
     /// while this client will send with the server's. At most
     /// [`super::cid::MAX_LOCAL_CID_LEN`] bytes.
     pub connection_id: Option<Vec<u8>>,
+    /// Client certificate + signing key presented when the server sends a
+    /// `CertificateRequest` (RFC 5246 §7.4.4). `None` answers such a
+    /// request with an empty `Certificate`; a server that requires one
+    /// then aborts the handshake. Forwarded from
+    /// [`crate::tls::Config::identity`].
+    pub client_cert: Option<ClientCertConfig>,
 }
 
 impl ClientConfig12Internal {
@@ -144,7 +157,15 @@ impl ClientConfig12Internal {
             alpn_protocols: Vec::new(),
             groups: crate::tls::conn::GROUPS_12.to_vec(),
             connection_id: None,
+            client_cert: None,
         }
+    }
+
+    /// Sets the client identity presented under mutual authentication
+    /// (see [`Self::client_cert`]).
+    pub fn with_client_cert(mut self, cert: ClientCertConfig) -> Self {
+        self.client_cert = Some(cert);
+        self
     }
 
     /// Sets whether the server must echo Extended Master Secret (see
@@ -308,6 +329,11 @@ pub struct DtlsClientConnection12 {
     /// Connection-ID state once the extension is negotiated (RFC 9146 §3);
     /// `None` when no CIDs are in use.
     cid: Option<CidState>,
+    /// The `supported_signature_algorithms` of the server's
+    /// `CertificateRequest` (RFC 5246 §7.4.4), once received: our final
+    /// flight then opens with a `Certificate`, and our `CertificateVerify`
+    /// scheme is chosen from this list (§7.4.8).
+    cert_request: Option<Vec<SignatureScheme>>,
 }
 
 // The DTLS 1.2 master secret lives for the whole connection (exporters,
@@ -376,6 +402,7 @@ impl DtlsClientConnection12 {
             ems_negotiated: false,
             alpn_negotiated: None,
             cid: None,
+            cert_request: None,
         };
         // We don't include the first CH in the transcript: per RFC 6347 §4.2.1,
         // "the initial ClientHello and HelloVerifyRequest are not included in
@@ -1260,14 +1287,26 @@ impl DtlsClientConnection12 {
         Ok(())
     }
 
-    fn on_server_hello_done(
-        &mut self,
-        msg_type: u8,
-        _body: &[u8],
-        raw: &[u8],
-    ) -> Result<(), Error> {
+    fn on_server_hello_done(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        // mTLS: a `CertificateRequest` (RFC 5246 §7.4.4) MAY appear between
+        // ServerKeyExchange and ServerHelloDone — exactly one (§7.3). Its
+        // `supported_signature_algorithms` bound our CertificateVerify
+        // scheme; the certificate types and CA names are advisory (a chain
+        // the server cannot validate fails on its side).
+        if msg_type == hs_type::CERTIFICATE_REQUEST {
+            if self.cert_request.is_some() {
+                return Err(Error::UnexpectedMessage);
+            }
+            let cr = CertificateRequest12::decode(body)?;
+            self.cert_request = Some(cr.sig_schemes);
+            self.transcript.update(raw);
+            return Ok(());
+        }
         if msg_type != hs_type::SERVER_HELLO_DONE {
             return Err(Error::UnexpectedMessage);
+        }
+        if !body.is_empty() {
+            return Err(Error::Decode);
         }
         // Complete ECDHE + derive master + key block. Everything that can
         // fail happens BEFORE the transcript is touched: this message is
@@ -1279,8 +1318,26 @@ impl DtlsClientConnection12 {
         let (mut premaster, our_point) = self.ecdhe(group, &peer_point)?;
         self.transcript.update(raw);
 
-        // Build the client's final flight: CKE, CCS, Finished.
+        // Build the client's final flight: [Certificate], CKE,
+        // [CertificateVerify], CCS, Finished (RFC 5246 §7.3).
         let mut flight = Flight::new();
+
+        // mTLS: the CertificateRequest is answered first, with our chain or
+        // — with no identity, or one that signs under none of the offered
+        // schemes (§7.4.8) — an empty `certificate_list` (§7.4.6); a chain
+        // commits us to a CertificateVerify after the ClientKeyExchange.
+        let cert_verify_scheme = match self.cert_request.as_ref() {
+            Some(offered) => {
+                let scheme = self
+                    .config
+                    .client_cert
+                    .as_ref()
+                    .and_then(|cc| cc.scheme_for_request_12(offered));
+                self.push_client_certificate(&mut flight, scheme.is_some());
+                scheme
+            }
+            None => None,
+        };
 
         // ClientKeyExchange — DTLS handshake msg_seq advances; record at epoch 0.
         // We must feed CKE into the transcript BEFORE deriving the master
@@ -1331,6 +1388,27 @@ impl DtlsClientConnection12 {
         self.master = Some(master);
         self.write_crypter = Some(write_crypter);
         self.read_crypter = Some(read_crypter);
+
+        // mTLS: CertificateVerify (RFC 5246 §7.4.8) over the handshake
+        // messages so far — ClientHello through ClientKeyExchange, our
+        // Certificate included, in their DTLS form (RFC 6347 §4.2.6) —
+        // under the negotiated scheme. Signed in-process: an external key
+        // never reaches here (refused at construction).
+        if let Some(scheme) = cert_verify_scheme {
+            let cc = self
+                .config
+                .client_cert
+                .as_ref()
+                .ok_or(Error::InappropriateState)?;
+            let to_sign = self.transcript.buffered_bytes().to_vec();
+            let signature = crate::tls::crypto::sign::sign_client_certificate_verify(
+                &cc.key, scheme, &to_sign,
+            )?;
+            let mut cv_body = Vec::with_capacity(4 + signature.len());
+            cv_body.extend_from_slice(&scheme.0.to_be_bytes());
+            with_len_u16(&mut cv_body, |b| b.extend_from_slice(&signature));
+            self.push_plain_handshake(&mut flight, hs_type::CERTIFICATE_VERIFY, &cv_body);
+        }
 
         // ChangeCipherSpec — its own DTLS record, plaintext, epoch 0, content_type 20.
         flight.push_record(ContentType::ChangeCipherSpec, 0, alloc::vec![0x01]);
@@ -1392,6 +1470,34 @@ impl DtlsClientConnection12 {
         .expect("fragment fits a record");
         self.write_seq_in_epoch += 1;
         self.out_dgrams.push(out);
+    }
+
+    /// mTLS: appends our `Certificate` (RFC 5246 §7.4.6) to `flight` — the
+    /// configured chain, or an empty `certificate_list` for "no
+    /// certificate" when `present` is false.
+    fn push_client_certificate(&mut self, flight: &mut Flight, present: bool) {
+        let mut body = Vec::new();
+        with_len_u24(&mut body, |list| {
+            if let (true, Some(cc)) = (present, self.config.client_cert.as_ref()) {
+                for cert in &cc.chain {
+                    with_len_u24(list, |c| c.extend_from_slice(cert));
+                }
+            }
+        });
+        self.push_plain_handshake(flight, hs_type::CERTIFICATE, &body);
+    }
+
+    /// Allocates the next `message_seq`, adds `msg_type` / `body` to the
+    /// transcript under its DTLS header (RFC 6347 §4.2.6) and appends it to
+    /// `flight`, fragmented, as epoch-0 records.
+    fn push_plain_handshake(&mut self, flight: &mut Flight, msg_type: u8, body: &[u8]) {
+        let msg_seq = self.out_msg_seq;
+        self.out_msg_seq += 1;
+        self.transcript
+            .update(&transcript_message(msg_type, msg_seq, body));
+        for frag in write_fragments(msg_type, msg_seq, body, DEFAULT_MAX_FRAGMENT) {
+            flight.push_record(ContentType::Handshake, 0, frag);
+        }
     }
 
     /// Test-only: queues a raw 2-byte alert (`level ‖ description`) under
