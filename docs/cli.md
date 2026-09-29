@@ -539,9 +539,9 @@ Behaviour worth knowing:
 - A TCP close without a TLS `close_notify` is reported as a possible
   truncation on stderr and the client exits non-zero.
 - `-key` must match `-cert`; a mismatch is refused before listening.
-- `-Verify` (client certificate authentication) is TLS-only: combined with
-  `-dtls1_2` / `-dtls1_3` it is refused up front, because the DTLS server
-  does not support client authentication.
+- `-Verify` (client certificate authentication) works over DTLS as over
+  TCP: the DTLS server sends a `CertificateRequest`, verifies the client's
+  chain against the CA file and reports it as `peer certificate: X.509`.
 - `-keylogfile` is opened without following symlinks and refused if the
   file is readable by others.
 
@@ -678,9 +678,11 @@ purecrypto s_dtls_server -dtls1_3 -accept 0.0.0.0:5685 -cert cert.pem -key key.p
 printf 'ping' | purecrypto s_dtls_client -dtls1_3 -connect localhost:5685 -cid_len 4 -rebind
 ```
 
-Not implemented over DTLS, and refused up front: client certificates
-(`-Verify`, `-cert`), resumption and 0-RTT (`-reconnect`, `-early_data`,
-`-naccept`), raw public keys, `-record_size_limit`, ECH.
+Client certificates work over both DTLS versions: `s_server -Verify`
+requests and verifies one, `s_client -cert/-key` presents one (RFC 9147
+over the RFC 8446 handshake; RFC 6347 over RFC 5246). Not implemented over
+DTLS, and refused up front: resumption and 0-RTT (`-reconnect`,
+`-early_data`, `-naccept`), raw public keys, `-record_size_limit`, ECH.
 
 ## QUIC: `q_client` / `q_server`
 

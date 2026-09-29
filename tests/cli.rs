@@ -2695,62 +2695,80 @@ fn s_server_rejects_key_from_a_different_pair() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The DTLS engines fail closed on client authentication, so `-Verify` with a
-/// DTLS version used to surface as a bare `UnsupportedVersion` from
-/// `Connection::server`. It must be refused up front with a message naming
-/// the actual limitation.
+/// Client certificates over DTLS: `s_server -dtls1_2 / -dtls1_3 -Verify`
+/// requests and verifies one, `s_client -cert/-key` presents it, and the
+/// server's negotiated-parameter report names the verified chain. (`-Verify`
+/// used to be refused with DTLS, when the DTLS engines could not honour it.)
 #[test]
-fn s_server_rejects_client_auth_for_dtls() {
-    use purecrypto::ec::Ed25519PrivateKey;
+fn s_client_s_server_dtls_mutual_authentication() {
+    use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
-    let dir = std::env::temp_dir().join(format!("pc_s_server_dtls_verify_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pc_dtls_mtls_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let cert_path = dir.join("server.pem");
-    let key_path = dir.join("server.key");
-
-    let key = Ed25519PrivateKey::generate(&mut OsRng);
-    let cert = Certificate::self_signed_general(
-        &CertSigner::Ed25519(&key),
-        &DistinguishedName::common_name("127.0.0.1"),
-        &Validity::new(
-            Time::utc(2024, 1, 1, 0, 0, 0),
-            Time::utc(2034, 1, 1, 0, 0, 0),
-        ),
-        1,
-        false,
-        &["127.0.0.1"],
-    )
-    .unwrap();
-    std::fs::write(&cert_path, cert.to_pem()).unwrap();
-    std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    // Server and client identities, each self-signed; the client's is a CA
+    // so that it can be the server's `-Verify` trust anchor.
+    let mut paths = Vec::new();
+    for (name, is_ca) in [("server", false), ("client", true)] {
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut OsRng);
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &DistinguishedName::common_name("127.0.0.1"),
+            &validity,
+            1,
+            is_ca,
+            &["127.0.0.1"],
+        )
+        .unwrap();
+        let cert_path = dir.join(format!("{name}.pem"));
+        let key_path = dir.join(format!("{name}.key"));
+        std::fs::write(&cert_path, cert.to_pem()).unwrap();
+        std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
+        paths.push((cert_path, key_path));
+    }
+    let (server_cert, server_key) = &paths[0];
+    let (client_cert, client_key) = &paths[1];
 
     for version in ["-dtls1_2", "-dtls1_3"] {
-        let (_out, err, ok) = run_capture(
+        let server_proc = spawn_server_wait_listening(&[
+            "s_server",
+            version,
+            "-cert",
+            server_cert.to_str().unwrap(),
+            "-key",
+            server_key.to_str().unwrap(),
+            "-Verify",
+            client_cert.to_str().unwrap(),
+            "-accept",
+            "0",
+            "-no_cookie",
+        ]);
+        let port = server_proc.port;
+        let (out, _ok) = run(
             &[
-                "s_server",
-                "-cert",
-                cert_path.to_str().unwrap(),
-                "-key",
-                key_path.to_str().unwrap(),
+                "s_client",
                 version,
-                "-Verify",
-                cert_path.to_str().unwrap(),
-                "-accept",
-                "127.0.0.1:1",
+                "-connect",
+                &format!("127.0.0.1:{port}"),
+                "-insecure",
+                "-cert",
+                client_cert.to_str().unwrap(),
+                "-key",
+                client_key.to_str().unwrap(),
                 "-quiet",
             ],
-            b"",
+            b"hello\n",
         );
-        assert!(!ok, "{version}: -Verify must be refused for DTLS");
+        let err = server_proc.finish_with_stderr();
+        assert!(out.contains("hello"), "{version}: client stdout {out:?}");
         assert!(
-            err.contains("not supported for DTLS"),
-            "{version}: expected a DTLS client-auth diagnostic, got stderr: {err}"
-        );
-        assert!(
-            !err.contains("UnsupportedVersion"),
-            "{version}: the raw engine error leaked: {err}"
+            err.contains("peer certificate: X.509 (1)"),
+            "{version}: server stderr {err}"
         );
     }
 
