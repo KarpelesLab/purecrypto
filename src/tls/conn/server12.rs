@@ -37,7 +37,7 @@ use super::super::codec::{
     write_record,
 };
 use super::client12::{
-    SUITES_12, SigKind, SuiteParams12, lookup_suite_12, parse_certificate_list_12,
+    GROUPS_12, SUITES_12, SigKind, SuiteParams12, lookup_suite_12, parse_certificate_list_12,
 };
 use super::common::MAX_HANDSHAKE_REASSEMBLY;
 use super::server::ServerKey;
@@ -521,7 +521,9 @@ pub struct ServerConnection12<R: RngCore> {
     p256: Option<BoxedEcdhPrivateKey>,
     /// Ephemeral P-384 ECDH private key (used when we pick SECP384R1).
     p384: Option<BoxedEcdhPrivateKey>,
-    /// Negotiated group (X25519, SECP256R1 or SECP384R1).
+    /// Ephemeral P-521 ECDH private key (used when we pick SECP521R1).
+    p521: Option<BoxedEcdhPrivateKey>,
+    /// Negotiated group (one of [`GROUPS_12`]).
     group: Option<NamedGroup>,
 
     /// Handshake randoms.
@@ -654,6 +656,7 @@ impl<R: RngCore> ServerConnection12<R> {
             x25519: None,
             p256: None,
             p384: None,
+            p521: None,
             group: None,
             client_random: None,
             server_random: None,
@@ -1326,15 +1329,11 @@ impl<R: RngCore> ServerConnection12<R> {
         let groups_body = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS)
             .ok_or(Error::HandshakeFailure)?;
         let groups = parse_supported_groups(groups_body)?;
-        let group = if groups.contains(&NamedGroup::X25519) {
-            NamedGroup::X25519
-        } else if groups.contains(&NamedGroup::SECP256R1) {
-            NamedGroup::SECP256R1
-        } else if groups.contains(&NamedGroup::SECP384R1) {
-            NamedGroup::SECP384R1
-        } else {
-            return Err(Error::HandshakeFailure);
-        };
+        // Server preference: the engine's own order (`GROUPS_12`).
+        let group = GROUPS_12
+            .into_iter()
+            .find(|g| groups.contains(g))
+            .ok_or(Error::HandshakeFailure)?;
 
         // RFC 4492 §5.1.2: `ec_point_formats` must include `uncompressed` (0).
         let epf = ext::find(&ch.extensions, ExtensionType::EC_POINT_FORMATS)
@@ -1671,15 +1670,10 @@ impl<R: RngCore> ServerConnection12<R> {
             let groups_body = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS)
                 .ok_or(Error::HandshakeFailure)?;
             let groups = parse_supported_groups(groups_body)?;
-            let g = if groups.contains(&NamedGroup::X25519) {
-                NamedGroup::X25519
-            } else if groups.contains(&NamedGroup::SECP256R1) {
-                NamedGroup::SECP256R1
-            } else if groups.contains(&NamedGroup::SECP384R1) {
-                NamedGroup::SECP384R1
-            } else {
-                return Err(Error::HandshakeFailure);
-            };
+            let g = GROUPS_12
+                .into_iter()
+                .find(|g| groups.contains(g))
+                .ok_or(Error::HandshakeFailure)?;
             let epf = ext::find(&ch.extensions, ExtensionType::EC_POINT_FORMATS)
                 .ok_or(Error::HandshakeFailure)?;
             if !ext::parse_ec_point_formats(epf)?.contains(&0u8) {
@@ -1817,6 +1811,12 @@ impl<R: RngCore> ServerConnection12<R> {
                 self.p384 = Some(sk);
                 pk
             }
+            NamedGroup::SECP521R1 => {
+                let sk = BoxedEcdhPrivateKey::generate(CurveId::P521, &mut self.rng);
+                let pk = sk.public_key().to_sec1();
+                self.p521 = Some(sk);
+                pk
+            }
             _ => return Err(Error::HandshakeFailure),
         };
         let to_sign = signed_message(&cr, &sr, group, &point);
@@ -1878,6 +1878,13 @@ impl<R: RngCore> ServerConnection12<R> {
                     NamedGroup::SECP384R1 => {
                         let sk = self.p384.as_ref().ok_or(Error::InappropriateState)?;
                         let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, &cke.point)
+                            .map_err(|_| Error::Decode)?;
+                        sk.diffie_hellman(&peer)
+                            .map_err(|_| Error::PeerMisbehaved)?
+                    }
+                    NamedGroup::SECP521R1 => {
+                        let sk = self.p521.as_ref().ok_or(Error::InappropriateState)?;
+                        let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P521, &cke.point)
                             .map_err(|_| Error::Decode)?;
                         sk.diffie_hellman(&peer)
                             .map_err(|_| Error::PeerMisbehaved)?
@@ -2601,6 +2608,12 @@ impl<R: RngCore> ServerConnection12<R> {
                 self.p384 = Some(sk);
                 pk
             }
+            NamedGroup::SECP521R1 => {
+                let sk = BoxedEcdhPrivateKey::generate(CurveId::P521, &mut self.rng);
+                let pk = sk.public_key().to_sec1();
+                self.p521 = Some(sk);
+                pk
+            }
             _ => return Err(Error::HandshakeFailure),
         };
 
@@ -2682,6 +2695,13 @@ impl<R: RngCore> ServerConnection12<R> {
             NamedGroup::SECP384R1 => {
                 let sk = self.p384.as_ref().ok_or(Error::InappropriateState)?;
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, &cke.point)
+                    .map_err(|_| Error::Decode)?;
+                sk.diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?
+            }
+            NamedGroup::SECP521R1 => {
+                let sk = self.p521.as_ref().ok_or(Error::InappropriateState)?;
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P521, &cke.point)
                     .map_err(|_| Error::Decode)?;
                 sk.diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?

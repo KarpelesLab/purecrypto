@@ -19,7 +19,7 @@ use crate::ec::{
     Ed25519PrivateKey,
 };
 use crate::hash::{Hmac, Sha256, Sha384, Sha512};
-use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey};
+use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey, MlKem1024DecapsKey};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::signature_registry::SignaturePolicy;
@@ -31,8 +31,8 @@ use crate::tls::codec::{
 };
 use crate::tls::crypto::{
     HashAlg, KeySchedule, Secret, SuiteParams, binder_finished_key, certificate_verify_content,
-    finished_verify_data, lookup_suite, next_traffic_secret, psk_from_resumption, tls_exporter,
-    verify_signature,
+    finished_verify_data, kex, lookup_suite, next_traffic_secret, psk_from_resumption,
+    tls_exporter, verify_signature,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -390,12 +390,13 @@ pub(crate) struct ClientConfig {
     /// ticket cannot fit a ClientHello, or when real ECH seals the hello.
     pub tls12_session: Option<super::StoredSession12>,
     /// Groups the first ClientHello carries a `key_share` for (a subset of
-    /// the offered groups). Empty (the default) means every offered group.
-    /// See [`crate::tls::Config::key_shares`].
+    /// the offered groups). Empty (the default) means every offered group
+    /// when [`Self::groups`] is set, and [`DEFAULT_SHARE_GROUPS`] when it
+    /// is not. See [`crate::tls::Config::key_shares`].
     pub key_share_groups: Vec<NamedGroup>,
     /// The key-exchange groups offered in `supported_groups`, in preference
     /// order. Empty (the default) offers every group the engine implements
-    /// (`X25519MLKEM768`, `x25519`, `secp256r1`, `secp384r1`). Groups the
+    /// ([`DEFAULT_GROUPS`]). Groups the
     /// engine does not implement are dropped; a list that leaves nothing is
     /// rejected at construction with [`Error::HandshakeFailure`]. See
     /// [`crate::tls::Config::key_exchange_groups`].
@@ -681,8 +682,39 @@ struct PendingClientFlight {
 }
 
 /// Every key-exchange group the TLS 1.3 client implements, in the order it
-/// offers them when [`ClientConfig::groups`] is empty.
-pub(crate) const DEFAULT_GROUPS: [NamedGroup; 4] = [
+/// offers them when [`ClientConfig::groups`] is empty (the same order as
+/// [`crate::tls::NamedGroup::ALL`]).
+///
+/// The first four are the groups the first ClientHello carries a share for
+/// ([`DEFAULT_SHARE_GROUPS`]), so a server that follows the client's
+/// preference finds a share for whatever it picks among them. The groups
+/// after them are there for servers that accept nothing else — a policy
+/// that mandates NIST curves in the hybrid (SecP256r1MLKEM768,
+/// SecP384r1MLKEM1024; RFC 10024 marks both "Recommended: N") or P-521 —
+/// and cost such a server one HelloRetryRequest. They are listed last so
+/// that adding them changes no negotiation that worked without them; the
+/// hybrids come before secp521r1 because they are post-quantum and
+/// cheaper than a P-521 scalar multiplication.
+pub(crate) const DEFAULT_GROUPS: [NamedGroup; 7] = [
+    NamedGroup::X25519MLKEM768,
+    NamedGroup::X25519,
+    NamedGroup::SECP256R1,
+    NamedGroup::SECP384R1,
+    NamedGroup::SECP256R1MLKEM768,
+    NamedGroup::SECP384R1MLKEM1024,
+    NamedGroup::SECP521R1,
+];
+
+/// The groups the first ClientHello carries a `key_share` for when neither
+/// the offer ([`ClientConfig::groups`]) nor the shares
+/// ([`ClientConfig::key_share_groups`]) are configured.
+///
+/// A share for each of the other [`DEFAULT_GROUPS`] would add some 3 kB
+/// (1249, 1665 and 133 bytes, plus framing) to every ClientHello — three
+/// more TCP segments' worth, and a third and fourth QUIC Initial datagram —
+/// for groups few servers select. A server that wants one asks with a
+/// HelloRetryRequest (RFC 8446 §4.1.4).
+pub(crate) const DEFAULT_SHARE_GROUPS: [NamedGroup; 4] = [
     NamedGroup::X25519MLKEM768,
     NamedGroup::X25519,
     NamedGroup::SECP256R1,
@@ -731,7 +763,17 @@ pub struct ClientConnection {
     x25519: X25519PrivateKey,
     p256: BoxedEcdhPrivateKey,
     p384: BoxedEcdhPrivateKey,
+    /// Ephemeral P-521 key, for secp521r1.
+    p521: BoxedEcdhPrivateKey,
+    /// Ephemeral ML-KEM-768 key, shared by the X25519MLKEM768 and
+    /// SecP256r1MLKEM768 shares (as `x25519` and `p256` are shared with
+    /// the plain groups): RFC 9954 §3.2 lets the same `key_exchange` value
+    /// appear under several groups of one ClientHello, and the server
+    /// answers only one of them.
     mlkem: MlKem768DecapsKey,
+    /// Ephemeral ML-KEM-1024 key, for SecP384r1MLKEM1024 (boxed: the
+    /// decapsulation key is 3168 bytes).
+    mlkem1024: alloc::boxed::Box<MlKem1024DecapsKey>,
 
     /// CH1 state retained for HelloRetryRequest replay (RFC 8446 §4.1.2):
     /// CH2 must reuse the same client_random and offered_groups, narrowed to
@@ -1431,7 +1473,8 @@ impl ClientConnection {
     /// drive a deployment where the client advertises more groups in
     /// `supported_groups` than it ships shares for — the configuration HRR
     /// exists to fix. Empty `share_groups` is equivalent to
-    /// [`new_with_offer`] (share for every offered group).
+    /// [`new_with_offer`] (share for every offered group, or the default
+    /// shares for the default offer).
     #[cfg(test)]
     pub(crate) fn new_with_offer_partial_shares<R: RngCore>(
         config: ClientConfig,
@@ -1518,17 +1561,29 @@ impl ClientConnection {
         hooks: Option<super::super::quic_hooks::BoxedHooks>,
     ) -> Result<Self, Error> {
         // An explicit `share_groups` (test drivers) wins; otherwise the
-        // configured `key_share_groups` (empty = a share for every group).
+        // configured `key_share_groups`, then the default shares.
         let configured_shares = config.key_share_groups.clone();
-        let share_groups = if share_groups.is_empty() {
-            configured_shares.as_slice()
-        } else {
+        let share_groups = if !share_groups.is_empty() {
             share_groups
+        } else if !configured_shares.is_empty() {
+            configured_shares.as_slice()
+        } else if config.groups.is_empty() && groups == DEFAULT_GROUPS {
+            // The default offer: shares for the usual groups only (see
+            // `DEFAULT_SHARE_GROUPS`). An explicit offer gets a share for
+            // every group in it — the caller chose them.
+            &DEFAULT_SHARE_GROUPS[..]
+        } else {
+            &[][..]
         };
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
+        // Drawing a scalar is cheap (the public point is only computed when
+        // a share is built), so the keys of every group exist up front and
+        // a HelloRetryRequest needs no RNG.
+        let p521 = BoxedEcdhPrivateKey::generate(CurveId::P521, rng);
         let (mlkem, _) = MlKem768DecapsKey::generate(rng);
+        let mlkem1024 = alloc::boxed::Box::new(MlKem1024DecapsKey::generate(rng).0);
         // Whether this ClientHello also offers TLS 1.2 (set by the
         // version-spanning client front-end via `ClientConfig::offer_tls12`).
         // Captured before `config` is moved into the struct below.
@@ -1658,7 +1713,9 @@ impl ClientConnection {
             x25519,
             p256,
             p384,
+            p521,
             mlkem,
+            mlkem1024,
             client_random: random,
             offered_suites: effective_suites.clone(),
             offered_groups: groups.to_vec(),
@@ -1666,15 +1723,7 @@ impl ClientConnection {
                 .iter()
                 .copied()
                 .filter(|g| share_groups.is_empty() || share_groups.contains(g))
-                .filter(|g| {
-                    matches!(
-                        g,
-                        &NamedGroup::X25519
-                            | &NamedGroup::SECP256R1
-                            | &NamedGroup::SECP384R1
-                            | &NamedGroup::X25519MLKEM768
-                    )
-                })
+                .filter(|g| DEFAULT_GROUPS.contains(g))
                 .collect(),
             hrr_processed: false,
             negotiated_group: None,
@@ -1976,6 +2025,17 @@ impl ClientConnection {
                     share.extend_from_slice(&self.x25519.public_key());
                     key_shares.push((NamedGroup::X25519MLKEM768, share));
                 }
+                NamedGroup::SECP521R1 => {
+                    key_shares.push((NamedGroup::SECP521R1, self.p521.public_key().to_sec1()))
+                }
+                NamedGroup::SECP256R1MLKEM768 => key_shares.push((
+                    NamedGroup::SECP256R1MLKEM768,
+                    kex::p256_mlkem768_client_share(&self.p256, &self.mlkem),
+                )),
+                NamedGroup::SECP384R1MLKEM1024 => key_shares.push((
+                    NamedGroup::SECP384R1MLKEM1024,
+                    kex::p384_mlkem1024_client_share(&self.p384, &self.mlkem1024),
+                )),
                 _ => {}
             }
         }
@@ -3487,6 +3547,13 @@ impl ClientConnection {
                 super::wipe(&mut x_ss);
                 Ok(secret)
             }
+            NamedGroup::SECP521R1 => kex::ecdhe_client(&self.p521, server_pub),
+            NamedGroup::SECP256R1MLKEM768 => {
+                kex::p256_mlkem768_client(&self.p256, &self.mlkem, server_pub)
+            }
+            NamedGroup::SECP384R1MLKEM1024 => {
+                kex::p384_mlkem1024_client(&self.p384, &self.mlkem1024, server_pub)
+            }
             _ => Err(Error::HandshakeFailure),
         }
     }
@@ -4828,9 +4895,15 @@ mod tests {
         ] {
             assert!(ext::find(&ch.extensions, ty).is_some());
         }
-        // The key_share offers x25519mlkem768, x25519, secp256r1 and secp384r1.
+        // Every implemented group is offered; the key_share carries the
+        // `DEFAULT_SHARE_GROUPS` (x25519mlkem768, x25519, secp256r1,
+        // secp384r1) and leaves the rest to a HelloRetryRequest.
+        let sg = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS).unwrap();
+        assert_eq!(ext::parse_supported_groups(sg).unwrap(), DEFAULT_GROUPS);
         let ks = ext::find(&ch.extensions, ExtensionType::KEY_SHARE).unwrap();
-        assert_eq!(ext::parse_client_key_shares(ks).unwrap().len(), 4);
+        let shares = ext::parse_client_key_shares(ks).unwrap();
+        let share_groups: Vec<_> = shares.iter().map(|(g, _)| *g).collect();
+        assert_eq!(share_groups, DEFAULT_SHARE_GROUPS);
     }
 
     /// RFC 8446 §4.2.9: `psk_key_exchange_modes` is advertised on a fresh

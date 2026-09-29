@@ -714,6 +714,8 @@ pub struct ClientConnection12 {
     p256: BoxedEcdhPrivateKey,
     /// Ephemeral P-384 ECDH private key (used when the server picks SECP384R1).
     p384: BoxedEcdhPrivateKey,
+    /// Ephemeral P-521 ECDH private key (used when the server picks SECP521R1).
+    p521: BoxedEcdhPrivateKey,
 
     /// Our handshake randoms (sent in CH, echoed by SH).
     client_random: Random,
@@ -882,11 +884,7 @@ impl ClientConnection12 {
             server_name,
             rng,
             &suites,
-            &[
-                NamedGroup::X25519,
-                NamedGroup::SECP256R1,
-                NamedGroup::SECP384R1,
-            ],
+            &GROUPS_12,
         ))
     }
 
@@ -905,6 +903,7 @@ impl ClientConnection12 {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
+        let p521 = BoxedEcdhPrivateKey::generate(CurveId::P521, rng);
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
 
@@ -968,6 +967,7 @@ impl ClientConnection12 {
             x25519,
             p256,
             p384,
+            p521,
             client_random: random,
             server_random: None,
             offered_suites: offered_suites.clone(),
@@ -1075,17 +1075,25 @@ impl ClientConnection12 {
                 }
             })
             .collect();
-        // The classic ECDHE curves whose keys we generate here; the 1.2 server
-        // selects its group from these in ServerKeyExchange.
-        let groups = [
-            NamedGroup::X25519,
-            NamedGroup::SECP256R1,
-            NamedGroup::SECP384R1,
-        ];
+        // The ECDHE curves the sent hello advertised that this engine can
+        // complete: the 1.2 server selects its group from the hello's
+        // `supported_groups` in ServerKeyExchange, and the pick is validated
+        // against that real advertisement (as the suite is), not against a
+        // list of this engine's own — the hybrid hello offers every group
+        // the 1.3 engine implements, secp521r1 included.
+        let groups: Vec<NamedGroup> =
+            match ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS) {
+                Some(body) => ext::parse_supported_groups(body)?
+                    .into_iter()
+                    .filter(|g| GROUPS_12.contains(g))
+                    .collect(),
+                None => Vec::new(),
+            };
 
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
+        let p521 = BoxedEcdhPrivateKey::generate(CurveId::P521, rng);
 
         #[cfg(feature = "tls-legacy")]
         let legacy_rng = {
@@ -1113,10 +1121,11 @@ impl ClientConnection12 {
             x25519,
             p256,
             p384,
+            p521,
             client_random,
             server_random: None,
             offered_suites,
-            offered_groups: groups.to_vec(),
+            offered_groups: groups,
             negotiated_version: ProtocolVersion::TLSv1_2,
             suite: None,
             #[cfg(feature = "tls-legacy")]
@@ -3082,10 +3091,31 @@ impl ClientConnection12 {
                     .map_err(|_| Error::PeerMisbehaved)?;
                 Ok((ss, self.p384.public_key().to_sec1()))
             }
+            NamedGroup::SECP521R1 => {
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P521, peer_point)
+                    .map_err(|_| Error::Decode)?;
+                let ss = self
+                    .p521
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?;
+                Ok((ss, self.p521.public_key().to_sec1()))
+            }
             _ => Err(Error::HandshakeFailure),
         }
     }
 }
+
+/// The ECDHE curves the TLS 1.2 engines implement (RFC 8422 §5.1.1), in
+/// the order a client offers them and a server prefers them: X25519 first
+/// (fastest), then the NIST curves by size. secp521r1 is last — its scalar
+/// multiplication costs about three P-256 ones — and there for peers
+/// that accept nothing smaller.
+pub(crate) const GROUPS_12: [NamedGroup; 4] = [
+    NamedGroup::X25519,
+    NamedGroup::SECP256R1,
+    NamedGroup::SECP384R1,
+    NamedGroup::SECP521R1,
+];
 
 /// One decoded inbound message.
 enum Incoming {

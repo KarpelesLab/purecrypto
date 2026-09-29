@@ -3673,6 +3673,81 @@ mod tests {
         assert!(server.feed(&ch).is_err() || server.handshake().is_err());
     }
 
+    /// The default ClientHello advertises every implemented group but
+    /// carries shares only for the usual four (`DEFAULT_SHARE_GROUPS`): a
+    /// share for each RFC 10024 NIST-curve hybrid and for secp521r1 would
+    /// add some 3 kB to every handshake. A server that wants one of the
+    /// share-less groups gets it through a HelloRetryRequest.
+    #[test]
+    fn default_offer_advertises_all_groups_but_shares_four() {
+        use crate::tls::NamedGroup;
+        use crate::tls::codec::extension as ext;
+        use crate::tls::codec::{ClientHello, ExtensionType};
+        let mut client = Connection::client(&tls13_client_cfg(None)).unwrap();
+        let _ = client.handshake();
+        let ch1 = client.pop().unwrap();
+        let hello = ClientHello::decode(&ch1[9..]).expect("ClientHello");
+        let supported = ext::parse_supported_groups(
+            ext::find(&hello.extensions, ExtensionType::SUPPORTED_GROUPS).unwrap(),
+        )
+        .unwrap();
+        let all: Vec<_> = NamedGroup::ALL.iter().map(|g| g.to_wire()).collect();
+        assert_eq!(supported, all);
+        let shares = ext::parse_client_key_shares(
+            ext::find(&hello.extensions, ExtensionType::KEY_SHARE).unwrap(),
+        )
+        .unwrap();
+        let share_groups: Vec<_> = shares.iter().map(|(g, _)| *g).collect();
+        assert_eq!(share_groups, all[..4]);
+
+        // Each share-less group is reachable through one HRR, on both the
+        // server's preference knobs.
+        for g in [
+            NamedGroup::SecP256r1MlKem768,
+            NamedGroup::SecP384r1MlKem1024,
+            NamedGroup::Secp521r1,
+        ] {
+            let mut server_cfg = tls13_server_cfg(false);
+            server_cfg.key_exchange_groups = Some(alloc::vec![g]);
+            let mut client = Connection::client(&tls13_client_cfg(None)).unwrap();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            drive_pair(&mut client, &mut server);
+            assert!(client.hello_retry_request_used());
+            assert_eq!(client.negotiated_group(), Some(g));
+            assert_eq!(server.negotiated_group(), Some(g));
+
+            let mut server_cfg = tls13_server_cfg(false);
+            server_cfg.preferred_key_exchange_group = Some(g);
+            let mut client = Connection::client(&tls13_client_cfg(None)).unwrap();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            drive_pair(&mut client, &mut server);
+            assert!(client.hello_retry_request_used());
+            assert_eq!(client.negotiated_group(), Some(g));
+            assert_eq!(server.negotiated_group(), Some(g));
+        }
+
+        // Listed explicitly, a group gets a share and no HRR is needed.
+        for g in [
+            NamedGroup::SecP256r1MlKem768,
+            NamedGroup::SecP384r1MlKem1024,
+            NamedGroup::Secp521r1,
+        ] {
+            let client_cfg = Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+                .server_name("tls.example")
+                .verify_certificates(false)
+                .key_exchange_groups(&[g, NamedGroup::X25519])
+                .build();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            let mut server = Connection::server(&tls13_server_cfg(false)).unwrap();
+            drive_pair(&mut client, &mut server);
+            assert!(!client.hello_retry_request_used());
+            assert_eq!(client.negotiated_group(), Some(g));
+            assert_eq!(server.negotiated_group(), Some(g));
+        }
+    }
+
     /// `Connection::request_key_update` rolls both directions and the
     /// counters see the request and the peer's reply.
     #[test]
@@ -4493,6 +4568,47 @@ mod tests {
         );
     }
 
+    /// The downgraded engine validates the 1.2 server's curve against what
+    /// the hybrid ClientHello really advertised. That hello offers every
+    /// group the 1.3 engine implements — secp521r1 included — so a 1.2
+    /// server restricted to P-521 gets it, where a fixed list of the 1.2
+    /// engine's own curves used to reject the ServerKeyExchange as
+    /// `illegal_parameter`. The auto client's restriction narrows the offer
+    /// the same way.
+    #[test]
+    fn auto_client_downgraded_to_tls12_accepts_secp521r1() {
+        use crate::tls::NamedGroup;
+        let mut client = Connection::client(&auto_client_cfg()).unwrap();
+        // The TLS 1.2 server picks from its own fixed order among what the
+        // client advertised; a client offering only P-521 gets P-521.
+        let server_cfg = tls12_server_cfg();
+        let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3)
+            .server_name("tls.example")
+            .verify_certificates(false)
+            .key_exchange_groups(&[NamedGroup::Secp521r1, NamedGroup::X25519MlKem768])
+            .build();
+        let mut restricted = Connection::client(&client_cfg).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut restricted, &mut server);
+        assert!(restricted.is_handshake_complete() && server.is_handshake_complete());
+        assert_eq!(
+            restricted.negotiated_version(),
+            Some(ProtocolVersion::TLSv1_2)
+        );
+        // The 1.2 server prefers X25519, then the NIST curves in size order,
+        // among what was offered: P-521 is all this hello had.
+        assert_eq!(restricted.negotiated_group(), Some(NamedGroup::Secp521r1));
+        assert_eq!(server.negotiated_group(), Some(NamedGroup::Secp521r1));
+
+        // The default auto client against the same server lands on X25519.
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
+        assert_eq!(client.negotiated_group(), Some(NamedGroup::X25519));
+    }
+
     /// RFC 5077 §3.1: the auto client's hybrid ClientHello requests a ticket,
     /// so a 1.2 server with tickets enabled issues one and the downgraded
     /// engine hands it back through `take_session`.
@@ -5030,26 +5146,21 @@ mod tests {
     fn dtls_honours_key_exchange_groups() {
         use super::super::NamedGroup;
         for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
-            // The client pins P-384; the server's default order (X25519
-            // first) does not matter — it can only pick what was offered.
-            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
-            server_cfg.require_cookie = false;
-            let client_cfg = dtls_client_builder(version)
-                .key_exchange_groups(&[NamedGroup::Secp384r1])
-                .build();
-            let mut server = Connection::server(&server_cfg).unwrap();
-            let mut client = Connection::client(&client_cfg).unwrap();
-            drive_dtls_pair(&mut client, &mut server);
-            assert_eq!(
-                client.negotiated_group(),
-                Some(NamedGroup::Secp384r1),
-                "{version:?}"
-            );
-            assert_eq!(
-                server.negotiated_group(),
-                Some(NamedGroup::Secp384r1),
-                "{version:?}"
-            );
+            // The client pins P-384 (then P-521); the server's default order
+            // (X25519 first) does not matter — it can only pick what was
+            // offered.
+            for group in [NamedGroup::Secp384r1, NamedGroup::Secp521r1] {
+                let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+                server_cfg.require_cookie = false;
+                let client_cfg = dtls_client_builder(version)
+                    .key_exchange_groups(&[group])
+                    .build();
+                let mut server = Connection::server(&server_cfg).unwrap();
+                let mut client = Connection::client(&client_cfg).unwrap();
+                drive_dtls_pair(&mut client, &mut server);
+                assert_eq!(client.negotiated_group(), Some(group), "{version:?}");
+                assert_eq!(server.negotiated_group(), Some(group), "{version:?}");
+            }
 
             // The server's list is its preference order, not the client's.
             let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
@@ -5118,6 +5229,36 @@ mod tests {
         assert_eq!(server.negotiated_group(), Some(NamedGroup::Secp256r1));
         assert!(client.hello_retry_request_used());
         assert!(server.hello_retry_request_used());
+
+        // The RFC 10024 NIST-curve hybrids and secp521r1 over DTLS 1.3:
+        // share-less by default (so one HRR when the server insists), no
+        // HRR when the client lists them.
+        for g in [
+            NamedGroup::SecP256r1MlKem768,
+            NamedGroup::SecP384r1MlKem1024,
+            NamedGroup::Secp521r1,
+        ] {
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            server_cfg.key_exchange_groups = Some(alloc::vec![g]);
+            let client_cfg = dtls_client_builder(version).build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert_eq!(client.negotiated_group(), Some(g));
+            assert_eq!(server.negotiated_group(), Some(g));
+            assert!(client.hello_retry_request_used());
+
+            let client_cfg = dtls_client_builder(version)
+                .key_exchange_groups(&[g, NamedGroup::X25519])
+                .build();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert_eq!(client.negotiated_group(), Some(g));
+            assert_eq!(server.negotiated_group(), Some(g));
+            assert!(!client.hello_retry_request_used());
+        }
 
         // Without a group change and without a cookie there is no HRR.
         let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);

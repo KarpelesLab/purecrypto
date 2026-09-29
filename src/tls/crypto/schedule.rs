@@ -29,13 +29,15 @@ use crate::kdf::{hkdf_expand, hkdf_extract};
 use crate::tls::Error;
 use alloc::vec::Vec;
 
-/// The largest secret the schedule holds: the 64-byte concatenated shared
-/// secret of the X25519MLKEM768 hybrid (32 + 32). Hash outputs and traffic
-/// secrets are at most a SHA-384 (48-byte) value.
-const MAX_SECRET: usize = 64;
+/// The largest secret the schedule holds: the 80-byte concatenated shared
+/// secret of the SecP384r1MLKEM1024 hybrid (48 + 32, RFC 10024 §4.3). The
+/// other (EC)DHE outputs are shorter — 66 bytes for secp521r1, 64 for the
+/// ML-KEM-768 hybrids — and hash outputs and traffic secrets are at most a
+/// SHA-384 (48-byte) value.
+const MAX_SECRET: usize = 80;
 
 /// A short byte string held inline: a key-schedule secret, a transcript hash,
-/// or a (possibly hybrid) (EC)DHE shared secret (≤ 64 bytes). Avoids heap
+/// or a (possibly hybrid) (EC)DHE shared secret (≤ 80 bytes). Avoids heap
 /// allocation.
 ///
 /// Deliberately NOT `Copy`: the buffer is wiped on drop (the crate's
@@ -58,7 +60,8 @@ impl Drop for Secret {
 }
 
 impl Secret {
-    /// Builds a secret from `bytes` (which must be ≤ 48 bytes long).
+    /// Builds a secret from `bytes` (which must be ≤ [`MAX_SECRET`] bytes
+    /// long).
     pub(crate) fn new(bytes: &[u8]) -> Self {
         debug_assert!(bytes.len() <= MAX_SECRET);
         let mut buf = [0u8; MAX_SECRET];

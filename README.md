@@ -166,7 +166,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `der` | DER reader/writer, base64, PEM |
 | `x509` | Certificates, CSRs, CRLs, OCSP, SCTs, chain building with name constraints and policy processing, CA issuance |
 | `pkcs12` | PKCS#12 / PFX archives, both directions |
-| `tls` | TLS 1.2 and 1.3, client and server, sans-I/O; mTLS, ALPN, resumption, 0-RTT, KeyUpdate, exporters, raw public keys, X25519MLKEM768 |
+| `tls` | TLS 1.2 and 1.3, client and server, sans-I/O; mTLS, ALPN, resumption, 0-RTT, KeyUpdate, exporters, raw public keys, the RFC 10024 ML-KEM hybrids |
 | `dtls` | DTLS 1.2 and 1.3 (RFC 6347 / RFC 9147): cookies, fragmentation, replay windows, ACK-driven retransmission, KeyUpdate |
 | `quic` | QUIC v1 (RFC 9000/9001/9002) plus DATAGRAM (RFC 9221), sans-I/O |
 | `ech` | Encrypted Client Hello (draft-ietf-tls-esni-22), client and server |

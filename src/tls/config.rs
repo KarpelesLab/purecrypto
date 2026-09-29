@@ -343,17 +343,26 @@ pub struct Config {
     /// still advertised in `supported_groups`; a server preferring one
     /// without a share answers with a HelloRetryRequest and the client
     /// retries with it (§4.1.4). `None` (the default) sends a share for
-    /// every offered group — no round trip, at the cost of a larger hello.
-    /// Groups the client does not offer are ignored; a list that names none
-    /// of them sends no shares at all, which is legal and makes any TLS 1.3
-    /// server ask for one. Honoured by the DTLS 1.3 client the same way;
-    /// inert on the server and on (D)TLS 1.2 (no key shares).
+    /// every group of a [`key_exchange_groups`](Self::key_exchange_groups)
+    /// restriction — no round trip, at the cost of a larger hello — and,
+    /// without one, for the first four of the default offer
+    /// (`X25519MLKEM768`, `x25519`, `secp256r1`, `secp384r1`): a share for
+    /// each of the other three (`SecP256r1MLKEM768`, `SecP384r1MLKEM1024`,
+    /// `secp521r1`) would add some 3 kB to every ClientHello for groups
+    /// few servers select, so those cost one HelloRetryRequest when a
+    /// server insists on them. Groups the client does not offer are
+    /// ignored; a list that names none of them sends no shares at all,
+    /// which is legal and makes any TLS 1.3 server ask for one. Honoured
+    /// by the DTLS 1.3 client the same way; inert on the server and on
+    /// (D)TLS 1.2 (no key shares).
     pub key_shares: Option<Vec<NamedGroup>>,
     /// The (EC)DHE / hybrid key-exchange groups this endpoint uses, in
-    /// preference order. `None` (the default) is every implemented group.
+    /// preference order. `None` (the default) is every implemented group,
+    /// in the order of [`NamedGroup::ALL`].
     ///
-    /// Client (TLS 1.3): the `supported_groups` offer, in this order, with a
-    /// `key_share` for each (narrowed further by [`key_shares`](Self::key_shares)).
+    /// Client (TLS 1.3 / QUIC): the `supported_groups` offer, in this
+    /// order, with a `key_share` for each (narrowed further by
+    /// [`key_shares`](Self::key_shares)).
     /// Server (TLS 1.3): the accept-set, selected in THIS order rather than
     /// the client's — the first listed group the client shared wins; when
     /// the client shared none of them but advertised one, the server asks
@@ -363,9 +372,9 @@ pub struct Config {
     /// [`Connection::server`](crate::tls::Connection::server) error instead
     /// of widening back to the defaults. DTLS 1.3 behaves as TLS 1.3; the
     /// DTLS 1.2 client offers the listed groups it implements (X25519,
-    /// P-256, P-384 — no ML-KEM hybrid) and the DTLS 1.2 server selects
-    /// among them in this order. Inert on TLS 1.2, whose engines negotiate
-    /// from their own fixed list.
+    /// P-256, P-384, P-521 — no ML-KEM hybrid) and the DTLS 1.2 server
+    /// selects among them in this order. Inert on TLS 1.2, whose engines
+    /// negotiate from their own fixed list (the same four curves).
     pub key_exchange_groups: Option<Vec<NamedGroup>>,
     /// `record_size_limit` extension (RFC 8449). `None` = library default.
     pub record_size_limit: Option<u16>,

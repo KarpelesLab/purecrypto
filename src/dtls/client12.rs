@@ -142,11 +142,7 @@ impl ClientConfig12Internal {
             cipher_suites: SUITES_12.iter().map(|p| p.suite).collect(),
             require_ems: true,
             alpn_protocols: Vec::new(),
-            groups: alloc::vec![
-                NamedGroup::X25519,
-                NamedGroup::SECP256R1,
-                NamedGroup::SECP384R1,
-            ],
+            groups: crate::tls::conn::GROUPS_12.to_vec(),
             connection_id: None,
         }
     }
@@ -247,6 +243,8 @@ pub struct DtlsClientConnection12 {
     p256: BoxedEcdhPrivateKey,
     /// Ephemeral P-384 key, generated in advance for the same reason.
     p384: BoxedEcdhPrivateKey,
+    /// Ephemeral P-521 ECDH private key (used when the server picks SECP521R1).
+    p521: BoxedEcdhPrivateKey,
 
     client_random: Random,
     server_random: Option<Random>,
@@ -335,6 +333,7 @@ impl DtlsClientConnection12 {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
+        let p521 = BoxedEcdhPrivateKey::generate(CurveId::P521, rng);
         let mut client_random: Random = [0u8; 32];
         rng.fill_bytes(&mut client_random);
 
@@ -354,6 +353,7 @@ impl DtlsClientConnection12 {
             x25519,
             p256,
             p384,
+            p521,
             client_random,
             server_random: None,
             cookie: Vec::new(),
@@ -1452,6 +1452,15 @@ impl DtlsClientConnection12 {
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
                 Ok((ss, self.p384.public_key().to_sec1()))
+            }
+            NamedGroup::SECP521R1 => {
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P521, peer_point)
+                    .map_err(|_| Error::Decode)?;
+                let ss = self
+                    .p521
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?;
+                Ok((ss, self.p521.public_key().to_sec1()))
             }
             _ => Err(Error::HandshakeFailure),
         }

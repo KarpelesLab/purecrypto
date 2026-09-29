@@ -41,7 +41,7 @@
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
-use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey};
+use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey, MlKem1024DecapsKey};
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
@@ -52,7 +52,7 @@ use crate::tls::codec::{
 use crate::tls::crypto::{
     AeadAlg, HashAlg, KeySchedule, LabelPrefix, RecordCrypter, Secret, SuiteParams, Transcript,
     certificate_verify_content, ct_find_last_nonzero, expand_label_dyn_with,
-    finished_verify_data_with, lookup_suite, next_traffic_secret_with, supported_suites,
+    finished_verify_data_with, kex, lookup_suite, next_traffic_secret_with, supported_suites,
     verify_signature,
 };
 use crate::tls::keylog::KeyLog;
@@ -126,15 +126,18 @@ pub(crate) struct ClientConfig13Internal {
     pub cipher_suites: Vec<CipherSuite>,
     /// Key-exchange groups offered in ClientHello, in descending preference
     /// order. Defaults to the TLS layer's order
-    /// (X25519MLKEM768 > X25519 > SECP256R1). Each entry both populates
-    /// `supported_groups` and (subject to [`Self::key_share_groups`])
-    /// contributes a `key_share` entry.
+    /// (`crate::tls::conn::DEFAULT_GROUPS`). Each entry both
+    /// populates `supported_groups` and (subject to
+    /// [`Self::key_share_groups`]) contributes a `key_share` entry.
     pub groups: Vec<NamedGroup>,
     /// Subset of `groups` for which a `key_share` is included in CH1. The
-    /// default (`None`) emits a share for every entry in `groups`. Setting
-    /// this to a strict subset lets a caller drive a HelloRetryRequest
-    /// (RFC 8446 §4.1.4) — the server will request the preferred group it
-    /// can't find a share for.
+    /// default (`None`) emits a share for every entry in `groups` — except
+    /// when `groups` is itself the default, which shares only the TLS
+    /// layer's `DEFAULT_SHARE_GROUPS`: the secp521r1 and NIST-curve hybrid
+    /// shares would add some 3 kB, three more handshake fragments, to
+    /// every ClientHello. Setting this to a strict subset lets a caller
+    /// drive a HelloRetryRequest (RFC 8446 §4.1.4) — the server will
+    /// request the preferred group it can't find a share for.
     pub key_share_groups: Option<Vec<NamedGroup>>,
     /// The connection ID this client wants to receive (RFC 9146 §3),
     /// offered in the `connection_id` extension; `None` does not offer the
@@ -165,12 +168,7 @@ impl ClientConfig13Internal {
             crls: CrlStore::new(),
             key_log: None,
             cipher_suites: supported_suites().iter().map(|s| s.suite).collect(),
-            groups: alloc::vec![
-                NamedGroup::X25519MLKEM768,
-                NamedGroup::X25519,
-                NamedGroup::SECP256R1,
-                NamedGroup::SECP384R1,
-            ],
+            groups: crate::tls::conn::DEFAULT_GROUPS.to_vec(),
             key_share_groups: None,
             connection_id: None,
         }
@@ -305,7 +303,13 @@ pub struct DtlsClientConnection13 {
     x25519: X25519PrivateKey,
     p256: BoxedEcdhPrivateKey,
     p384: BoxedEcdhPrivateKey,
+    /// Ephemeral P-521 key, for secp521r1.
+    p521: BoxedEcdhPrivateKey,
+    /// Ephemeral ML-KEM-768 key, shared by the X25519MLKEM768 and
+    /// SecP256r1MLKEM768 shares (RFC 9954 §3.2 allows it).
     mlkem: MlKem768DecapsKey,
+    /// Ephemeral ML-KEM-1024 key, for SecP384r1MLKEM1024.
+    mlkem1024: alloc::boxed::Box<MlKem1024DecapsKey>,
     client_random: Random,
     server_random: Option<Random>,
 
@@ -395,7 +399,9 @@ impl DtlsClientConnection13 {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
+        let p521 = BoxedEcdhPrivateKey::generate(CurveId::P521, rng);
         let (mlkem, _) = MlKem768DecapsKey::generate(rng);
+        let mlkem1024 = alloc::boxed::Box::new(MlKem1024DecapsKey::generate(rng).0);
         let mut client_random: Random = [0u8; 32];
         rng.fill_bytes(&mut client_random);
         let cid_pool = draw_cid_pool(rng, config.connection_id.as_ref().map_or(0, |c| c.len()));
@@ -423,7 +429,9 @@ impl DtlsClientConnection13 {
             x25519,
             p256,
             p384,
+            p521,
             mlkem,
+            mlkem1024,
             client_random,
             server_random: None,
             cookie_extension: None,
@@ -1748,6 +1756,19 @@ impl DtlsClientConnection13 {
                 crate::tls::conn::wipe(&mut x_ss);
                 Ok(combined)
             }
+            // secp521r1 and the NIST-curve hybrids (RFC 10024) are shared
+            // with the TLS 1.3 engine; the caller wipes the copy it gets.
+            NamedGroup::SECP521R1 => {
+                kex::ecdhe_client(&self.p521, server_pub).map(|s| s.as_slice().to_vec())
+            }
+            NamedGroup::SECP256R1MLKEM768 => {
+                kex::p256_mlkem768_client(&self.p256, &self.mlkem, server_pub)
+                    .map(|s| s.as_slice().to_vec())
+            }
+            NamedGroup::SECP384R1MLKEM1024 => {
+                kex::p384_mlkem1024_client(&self.p384, &self.mlkem1024, server_pub)
+                    .map(|s| s.as_slice().to_vec())
+            }
             _ => Err(Error::HandshakeFailure),
         }
     }
@@ -1993,6 +2014,9 @@ impl DtlsClientConnection13 {
     /// §4.1.4.
     fn build_client_hello(&mut self) -> Vec<Vec<u8>> {
         let groups = self.config.groups.clone();
+        // The default offer shares only the usual groups (see
+        // `ClientConfig13Internal::key_share_groups`).
+        let default_offer = groups == crate::tls::conn::DEFAULT_GROUPS;
         let mut key_shares: Vec<(NamedGroup, Vec<u8>)> = Vec::new();
         for &g in &groups {
             if let Some(sel) = self.hrr_selected_group
@@ -2003,11 +2027,14 @@ impl DtlsClientConnection13 {
             // Skip groups not in `key_share_groups` (when set). HRR-selected
             // group always gets a share regardless of this filter — the
             // caller asked for one.
-            if self.hrr_selected_group.is_none()
-                && let Some(filter) = self.config.key_share_groups.as_ref()
-                && !filter.contains(&g)
-            {
-                continue;
+            if self.hrr_selected_group.is_none() {
+                let shared = match self.config.key_share_groups.as_ref() {
+                    Some(filter) => filter.contains(&g),
+                    None => !default_offer || crate::tls::conn::DEFAULT_SHARE_GROUPS.contains(&g),
+                };
+                if !shared {
+                    continue;
+                }
             }
             match g {
                 NamedGroup::X25519 => {
@@ -2026,6 +2053,17 @@ impl DtlsClientConnection13 {
                     share.extend_from_slice(&self.x25519.public_key());
                     key_shares.push((NamedGroup::X25519MLKEM768, share));
                 }
+                NamedGroup::SECP521R1 => {
+                    key_shares.push((NamedGroup::SECP521R1, self.p521.public_key().to_sec1()))
+                }
+                NamedGroup::SECP256R1MLKEM768 => key_shares.push((
+                    NamedGroup::SECP256R1MLKEM768,
+                    kex::p256_mlkem768_client_share(&self.p256, &self.mlkem),
+                )),
+                NamedGroup::SECP384R1MLKEM1024 => key_shares.push((
+                    NamedGroup::SECP384R1MLKEM1024,
+                    kex::p384_mlkem1024_client_share(&self.p384, &self.mlkem1024),
+                )),
                 _ => {}
             }
         }

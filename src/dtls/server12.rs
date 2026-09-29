@@ -96,7 +96,7 @@ pub(crate) struct ServerConfig12Internal {
     alpn_protocols: Vec<Vec<u8>>,
     /// ECDHE groups this server accepts, in ITS preference order: the first
     /// listed group the client offered is used for `ServerKeyExchange`.
-    /// Defaults to `[X25519, SECP256R1, SECP384R1]`. Forwarded from
+    /// Defaults to `[X25519, SECP256R1, SECP384R1, SECP521R1]`. Forwarded from
     /// [`crate::tls::Config::key_exchange_groups`].
     pub(crate) groups: Vec<NamedGroup>,
     /// Allowed signature algorithms (reserved for client-auth in a future
@@ -136,11 +136,7 @@ impl ServerConfig12Internal {
             require_cookie_exchange: true,
             require_ems: true,
             alpn_protocols: Vec::new(),
-            groups: alloc::vec![
-                NamedGroup::X25519,
-                NamedGroup::SECP256R1,
-                NamedGroup::SECP384R1,
-            ],
+            groups: crate::tls::conn::GROUPS_12.to_vec(),
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
             connection_id: None,
@@ -314,6 +310,8 @@ pub struct DtlsServerConnection12<R: RngCore> {
     /// Ephemeral P-384 ECDHE key, populated when [`Self::group`] is
     /// `SECP384R1`.
     p384: Option<BoxedEcdhPrivateKey>,
+    /// Ephemeral P-521 ECDH private key (used when we pick SECP521R1).
+    p521: Option<BoxedEcdhPrivateKey>,
 
     client_random: Option<Random>,
     server_random: Option<Random>,
@@ -432,6 +430,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             x25519: None,
             p256: None,
             p384: None,
+            p521: None,
             client_random: None,
             server_random: None,
             pending_ske: None,
@@ -1470,6 +1469,12 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 self.p384 = Some(sk);
                 pk
             }
+            NamedGroup::SECP521R1 => {
+                let sk = BoxedEcdhPrivateKey::generate(CurveId::P521, &mut self.rng);
+                let pk = sk.public_key().to_sec1();
+                self.p521 = Some(sk);
+                pk
+            }
             _ => return Err(Error::HandshakeFailure),
         };
 
@@ -1787,6 +1792,13 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             NamedGroup::SECP384R1 => {
                 let sk = self.p384.as_ref().ok_or(Error::InappropriateState)?;
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, &cke.point)
+                    .map_err(|_| Error::Decode)?;
+                sk.diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?
+            }
+            NamedGroup::SECP521R1 => {
+                let sk = self.p521.as_ref().ok_or(Error::InappropriateState)?;
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P521, &cke.point)
                     .map_err(|_| Error::Decode)?;
                 sk.diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?

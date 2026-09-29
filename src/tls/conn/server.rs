@@ -34,7 +34,8 @@ use crate::tls::codec::{
 };
 use crate::tls::crypto::{
     HashAlg, KeySchedule, Secret, SuiteParams, binder_finished_key, certificate_verify_content,
-    finished_verify_data, next_traffic_secret, psk_from_resumption, supported_suites, tls_exporter,
+    finished_verify_data, kex, next_traffic_secret, psk_from_resumption, supported_suites,
+    tls_exporter,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::psk::{ExternalPsk, PskKeyExchangeMode};
@@ -3090,6 +3091,9 @@ impl<R: RngCore> ServerConnection<R> {
                 | NamedGroup::X25519
                 | NamedGroup::SECP256R1
                 | NamedGroup::SECP384R1
+                | NamedGroup::SECP256R1MLKEM768
+                | NamedGroup::SECP384R1MLKEM1024
+                | NamedGroup::SECP521R1
         )
     }
 
@@ -3174,6 +3178,9 @@ impl<R: RngCore> ServerConnection<R> {
                 super::wipe(&mut x_ss);
                 Ok((share, secret))
             }
+            NamedGroup::SECP521R1 => kex::ecdhe_server(CurveId::P521, &mut self.rng, client_pub),
+            NamedGroup::SECP256R1MLKEM768 => kex::p256_mlkem768_server(&mut self.rng, client_pub),
+            NamedGroup::SECP384R1MLKEM1024 => kex::p384_mlkem1024_server(&mut self.rng, client_pub),
             _ => Err(Error::HandshakeFailure),
         }
     }

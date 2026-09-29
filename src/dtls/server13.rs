@@ -46,7 +46,7 @@ use crate::tls::codec::{
 use crate::tls::crypto::sign::{sign_certificate_verify, signature_scheme_for};
 use crate::tls::crypto::{
     HashAlg, KeySchedule, LabelPrefix, RecordCrypter, SuiteParams, Transcript,
-    certificate_verify_content, finished_verify_data_with, next_traffic_secret_with,
+    certificate_verify_content, finished_verify_data_with, kex, next_traffic_secret_with,
     supported_suites,
 };
 use crate::tls::keylog::KeyLog;
@@ -2574,6 +2574,14 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 crate::tls::conn::wipe(&mut x_ss);
                 Ok((share, combined))
             }
+            // secp521r1 and the NIST-curve hybrids (RFC 10024) are shared
+            // with the TLS 1.3 engine; the caller wipes the copy it gets.
+            NamedGroup::SECP521R1 => kex::ecdhe_server(CurveId::P521, &mut self.rng, client_pub)
+                .map(|(share, s)| (share, s.as_slice().to_vec())),
+            NamedGroup::SECP256R1MLKEM768 => kex::p256_mlkem768_server(&mut self.rng, client_pub)
+                .map(|(share, s)| (share, s.as_slice().to_vec())),
+            NamedGroup::SECP384R1MLKEM1024 => kex::p384_mlkem1024_server(&mut self.rng, client_pub)
+                .map(|(share, s)| (share, s.as_slice().to_vec())),
             _ => Err(Error::HandshakeFailure),
         }
     }
@@ -2624,13 +2632,8 @@ fn hash_alg_from_byte(b: u8) -> Option<HashAlg> {
 
 /// Server-side group preference order, in descending preference. Mirrors
 /// the TLS layer's preference at `src/tls/conn/server.rs:1106-1118`.
-fn supported_server_groups() -> [NamedGroup; 4] {
-    [
-        NamedGroup::X25519MLKEM768,
-        NamedGroup::X25519,
-        NamedGroup::SECP256R1,
-        NamedGroup::SECP384R1,
-    ]
+fn supported_server_groups() -> [NamedGroup; 7] {
+    crate::tls::conn::DEFAULT_GROUPS
 }
 
 fn parse_supported_groups(body: &[u8]) -> Result<Vec<NamedGroup>, Error> {

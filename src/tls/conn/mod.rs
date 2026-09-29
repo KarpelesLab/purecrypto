@@ -15,14 +15,17 @@ pub(crate) use client::ClientConfig;
 #[cfg(feature = "ech")]
 pub(crate) use client::EchOutcome;
 #[allow(unused_imports)]
-pub(crate) use client::{ClientCertConfig, ClientConnection, ReceivedSessionTicket, StoredSession};
+pub(crate) use client::{
+    ClientCertConfig, ClientConnection, DEFAULT_GROUPS, DEFAULT_SHARE_GROUPS,
+    ReceivedSessionTicket, StoredSession, select_offered_groups,
+};
 pub(crate) use client12::ClientConfig12;
 pub(crate) use client12::ClientConnection12;
 pub(crate) use client12::StoredSession12;
 // Re-exported for the DTLS 1.2 client / server, which drive suite negotiation
 // from the same 6-entry SUITES_12 table as the TLS 1.2 layer.
 #[allow(unused_imports)]
-pub(crate) use client12::{SUITES_12, SigKind, SuiteParams12, lookup_suite_12};
+pub(crate) use client12::{GROUPS_12, SUITES_12, SigKind, SuiteParams12, lookup_suite_12};
 #[cfg(feature = "std")]
 pub(crate) use server::ReplayWindow;
 #[allow(unused_imports)]
@@ -1441,6 +1444,30 @@ mod loopback_tests {
         run(
             &[CipherSuite::AES_128_GCM_SHA256],
             &[NamedGroup::X25519MLKEM768],
+        );
+    }
+
+    #[test]
+    fn secp521r1_aes256_sha384() {
+        run(&[CipherSuite::AES_256_GCM_SHA384], &[NamedGroup::SECP521R1]);
+    }
+
+    #[test]
+    fn secp256r1mlkem768_hybrid_kex() {
+        // RFC 10024 SecP256r1MLKEM768: ECDH-first shares and secret.
+        run(
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::SECP256R1MLKEM768],
+        );
+    }
+
+    #[test]
+    fn secp384r1mlkem1024_hybrid_kex() {
+        // RFC 10024 SecP384r1MLKEM1024: the 80-byte shared secret feeds the
+        // SHA-384 schedule.
+        run(
+            &[CipherSuite::AES_256_GCM_SHA384],
+            &[NamedGroup::SECP384R1MLKEM1024],
         );
     }
 
@@ -4351,6 +4378,114 @@ mod loopback_tests {
         assert!(matches!(err, crate::tls::Error::IllegalParameter));
     }
 
+    /// RFC 10024 §4.2 / RFC 8446 §4.2.8.2: a hostile `key_share` for one of
+    /// the RFC 10024 hybrids or secp521r1 aborts the handshake with
+    /// `illegal_parameter` on whichever side receives it — the server on a
+    /// tampered ClientHello share, the client on a tampered ServerHello
+    /// share — never with a panic or a `decode_error`. The tampering
+    /// flips one byte of the ECDH point (off the curve), truncates the
+    /// share, or zeroes it (no `0x04` tag, all-zero encapsulation key).
+    #[test]
+    fn hostile_shares_for_the_nist_groups_are_illegal_parameters() {
+        use crate::tls::codec::extension as ext;
+        use crate::tls::codec::{
+            ClientHello, ExtensionType, ServerHello, hs_type, put_u16, read_record, write_record,
+        };
+        use crate::tls::{ContentType, Error, ProtocolVersion};
+
+        let tamperings: [fn(&mut Vec<u8>); 3] = [
+            |share| share[40] ^= 1,
+            |share| share.truncate(share.len() - 1),
+            |share| share.fill(0),
+        ];
+        for group in [
+            NamedGroup::SECP256R1MLKEM768,
+            NamedGroup::SECP384R1MLKEM1024,
+            NamedGroup::SECP521R1,
+        ] {
+            for tamper in tamperings {
+                let (server_config, cert_der) = rsa_server();
+                let mut roots = RootCertStore::new();
+                roots.add_der(cert_der).unwrap();
+                let mut crng = HmacDrbg::<Sha256>::new(b"hostile-share-c", b"nonce", &[]);
+                let srng = HmacDrbg::<Sha256>::new(b"hostile-share-s", b"nonce", &[]);
+                let mut client = ClientConnection::new_with_offer(
+                    client_config(roots),
+                    "loopback.example",
+                    &mut crng,
+                    &[CipherSuite::AES_128_GCM_SHA256],
+                    &[group],
+                );
+                let mut server = ServerConnection::new(server_config, srng);
+
+                // Server side: rewrite the client's share in place.
+                let ch_rec = client.write_tls();
+                let rec = read_record(&ch_rec).unwrap().unwrap();
+                assert_eq!(rec.fragment[0], hs_type::CLIENT_HELLO);
+                let mut ch = ClientHello::decode(&rec.fragment[4..]).unwrap();
+                let ks = ext::find(&ch.extensions, ExtensionType::KEY_SHARE).unwrap();
+                let mut shares = ext::parse_client_key_shares(ks).unwrap();
+                assert_eq!(shares.len(), 1);
+                assert_eq!(shares[0].0, group);
+                let original = shares[0].1.clone();
+                tamper(&mut shares[0].1);
+                let hostile = ext::client_key_shares(&shares);
+                ch.extensions
+                    .retain(|(t, _)| *t != ExtensionType::KEY_SHARE);
+                ch.extensions.push(hostile);
+                let mut out = Vec::new();
+                write_record(
+                    &mut out,
+                    ContentType::Handshake,
+                    ProtocolVersion::TLSv1_2,
+                    &ch.encode(),
+                )
+                .unwrap();
+                server.read_tls(&out);
+                let r = server.process_new_packets();
+                assert!(
+                    matches!(r, Err(Error::IllegalParameter)),
+                    "{group:?}: server: {r:?}"
+                );
+
+                // Client side: a ServerHello whose share is a tampered copy
+                // of the client's own (right group, wrong contents). An
+                // untampered copy would pass the client's checks for
+                // SecP384r1MLKEM1024, whose shares are the same size both
+                // ways — a ciphertext cannot be validated, only decapsulated
+                // (RFC 10024 §4.2) — so the tampering is what fails it.
+                let mut share = original;
+                tamper(&mut share);
+                let mut ks_body = Vec::new();
+                put_u16(&mut ks_body, group.0);
+                crate::tls::codec::with_len_u16(&mut ks_body, |b| b.extend_from_slice(&share));
+                let sh = ServerHello {
+                    random: [0x33; 32],
+                    session_id: Vec::new(),
+                    cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+                    extensions: alloc::vec![
+                        (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                        (ExtensionType::KEY_SHARE, ks_body),
+                    ],
+                };
+                let mut out = Vec::new();
+                write_record(
+                    &mut out,
+                    ContentType::Handshake,
+                    ProtocolVersion::TLSv1_2,
+                    &sh.encode(),
+                )
+                .unwrap();
+                client.read_tls(&out);
+                let r = client.process_new_packets();
+                assert!(
+                    matches!(r, Err(Error::IllegalParameter)),
+                    "{group:?}: client: {r:?}"
+                );
+            }
+        }
+    }
+
     /// A `ChangeCipherSpec` record after the handshake completes is rejected
     /// with `unexpected_message` per RFC 8446 §5.
     #[test]
@@ -7170,6 +7305,17 @@ mod tls12_loopback_tests {
             rsa_server12(),
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
             &[NamedGroup::SECP384R1],
+        );
+    }
+
+    #[test]
+    fn tls12_secp521r1_with_rsa_cert() {
+        // RFC 8422 §5.1.1 secp521r1 (0x0019): the P-521 arm of `ecdhe` and
+        // `send_server_key_exchange`, 133-byte points both ways.
+        run_with(
+            rsa_server12(),
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384],
+            &[NamedGroup::SECP521R1],
         );
     }
 

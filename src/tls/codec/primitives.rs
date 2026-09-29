@@ -87,11 +87,19 @@ u16_id!(
         /// secp384r1 (NIST P-384). Slower than the other curves we
         /// support, so offered after X25519 and SECP256R1 by default.
         SECP384R1 = 0x0018,
+        /// secp521r1 (NIST P-521).
+        SECP521R1 = 0x0019,
         /// x25519.
         X25519 = 0x001d,
+        /// SecP256r1MLKEM768 hybrid (RFC 10024): secp256r1 ECDH combined
+        /// with ML-KEM-768, the ECDH part first.
+        SECP256R1MLKEM768 = 0x11eb,
         /// X25519MLKEM768 hybrid (draft-ietf-tls-ecdhe-mlkem): ML-KEM-768
         /// combined with X25519.
         X25519MLKEM768 = 0x11ec,
+        /// SecP384r1MLKEM1024 hybrid (RFC 10024): secp384r1 ECDH combined
+        /// with ML-KEM-1024, the ECDH part first.
+        SECP384R1MLKEM1024 = 0x11ed,
     }
 );
 

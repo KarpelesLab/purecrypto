@@ -9,6 +9,7 @@ pub(crate) mod aead12;
 #[cfg(feature = "tls-legacy")]
 pub(crate) mod cbc_rec;
 mod hash;
+pub(crate) mod kex;
 pub(crate) mod prf;
 pub(crate) mod record_prot;
 mod schedule;
