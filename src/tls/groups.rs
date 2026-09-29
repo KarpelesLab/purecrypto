@@ -17,7 +17,13 @@
 ///
 /// Used as a public configuration handle (e.g. for picking a server-side
 /// preferred group that triggers HelloRetryRequest, RFC 8446 §4.1.4).
+///
+/// `#[non_exhaustive]`: new groups (further PQ hybrids above all) keep
+/// arriving, and each one would otherwise break every downstream exhaustive
+/// `match`. Match with a wildcard arm, or use [`NamedGroup::name`] /
+/// [`NamedGroup::codepoint`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum NamedGroup {
     /// secp256r1 (NIST P-256).
     Secp256r1,
