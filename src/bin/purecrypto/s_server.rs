@@ -122,8 +122,13 @@ pub(crate) fn run(args: Args) {
         return;
     }
     let version = resolve_version(&args);
-    let cert_path = args.value("-cert").unwrap_or_else(|| {
-        die(
+    // A server that only serves an external PSK (RFC 8446 §2.2: a PSK
+    // handshake sends no certificate) needs no `-cert` / `-key`.
+    let psk_only = args.value("-psk").is_some() && args.value("-cert").is_none();
+    let identity = match (args.value("-cert"), args.value("-key")) {
+        (Some(c), Some(k)) => Some((c, k)),
+        (None, None) if psk_only => None,
+        _ => die(
             "usage: purecrypto s_server -cert cert.pem -key key.pem -accept PORT \
              [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-Verify ca.pem] \
              [-alpn h2,http/1.1] [-www] [-naccept N] [-mtu N] [-no_cookie] \
@@ -132,12 +137,11 @@ pub(crate) fn run(args: Args) {
              [-early_data [-max_early_data N]] [-key_update] [-status_file resp.der] \
              [-enable_server_rpk] [-enable_client_rpk -rpk_peer_key pub.pem] \
              [-record_size_limit N] [-no_cert_comp] [-keylogfile keys.log] \
-             [-ech-key key.bin -ech-config config.bin]",
-        )
-    });
-    let key_path = args
-        .value("-key")
-        .unwrap_or_else(|| die("-key is required"));
+             [-ech-key key.bin -ech-config config.bin] [-psk_modes psk_dhe_ke:psk_ke] \
+             [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]] (-cert/-key may be \
+             omitted with -psk: a PSK-only TLS 1.3 server)",
+        ),
+    };
     let verify_ca = args.value("-Verify");
     // The DTLS engines fail closed on client authentication: a config that
     // asks for it is rejected by `Connection::server` with a bare
@@ -193,38 +197,46 @@ pub(crate) fn run(args: Args) {
         )),
     };
 
-    let chain = load_cert_chain(cert_path);
-    let key = load_signing_key(key_path);
-    // The TLS 1.2 server engine signs with RSA or ECDSA only; any other key
-    // is rejected by `Connection::server` as a bare `UnsupportedVersion` —
-    // after `accept()`, so the first client just sees a reset. Say why, up
-    // front.
-    if version == ProtocolVersion::Tls12
-        && !matches!(key, SigningKey::Rsa(_) | SigningKey::Ecdsa(_))
-    {
-        die(format!(
-            "{key_path}: -tls1_2 requires an RSA or ECDSA server key (Ed25519 / Ed448 are TLS 1.3 only)"
-        ));
-    }
-
-    // RFC 7250: `-enable_server_rpk` lets a client that offers
-    // `server_certificate_type = RawPublicKey` receive this key's bare
-    // SubjectPublicKeyInfo instead of the chain (X.509 stays available).
-    let own_spki = if enable_server_rpk {
-        Some(
-            key.public_key()
-                .unwrap_or_else(|| die("-enable_server_rpk: the server key has no public half"))
-                .to_spki_der(),
-        )
-    } else {
-        None
-    };
     let mut builder = Config::builder()
         .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .versions(min_version, version.to_pc_version())
-        .try_identity(chain, key)
-        .unwrap_or_else(|e| die(crate::util::identity_error(cert_path, key_path, e)))
         .max_record_size(mtu);
+    let mut own_spki = None;
+    if let Some((cert_path, key_path)) = identity {
+        let chain = load_cert_chain(cert_path);
+        let key = load_signing_key(key_path);
+        // The TLS 1.2 server engine signs with RSA or ECDSA only; any other
+        // key is rejected by `Connection::server` as a bare
+        // `UnsupportedVersion` — after `accept()`, so the first client just
+        // sees a reset. Say why, up front.
+        if version == ProtocolVersion::Tls12
+            && !matches!(key, SigningKey::Rsa(_) | SigningKey::Ecdsa(_))
+        {
+            die(format!(
+                "{key_path}: -tls1_2 requires an RSA or ECDSA server key (Ed25519 / Ed448 are TLS 1.3 only)"
+            ));
+        }
+
+        // RFC 7250: `-enable_server_rpk` lets a client that offers
+        // `server_certificate_type = RawPublicKey` receive this key's bare
+        // SubjectPublicKeyInfo instead of the chain (X.509 stays available).
+        if enable_server_rpk {
+            own_spki = Some(
+                key.public_key()
+                    .unwrap_or_else(|| die("-enable_server_rpk: the server key has no public half"))
+                    .to_spki_der(),
+            );
+        }
+        builder = builder
+            .try_identity(chain, key)
+            .unwrap_or_else(|e| die(crate::util::identity_error(cert_path, key_path, e)));
+    } else if enable_server_rpk {
+        die("-enable_server_rpk needs -cert and -key");
+    } else if min_version != PcVersion::TLSv1_3 || version != ProtocolVersion::Tls13 {
+        die(
+            "a PSK-only server (no -cert / -key) must be TLS 1.3 over TCP: drop -tls1_2 / -min_protocol / -dtls1_*",
+        );
+    }
     if let Some(a) = alpn {
         builder = builder.alpn(a);
     }
@@ -301,6 +313,7 @@ pub(crate) fn run(args: Args) {
         builder =
             builder.preferred_key_exchange_group(crate::util::parse_group(name, "-prefer-group"));
     }
+    let builder = tlsinfo::apply_psk_flags(&args, builder, version == ProtocolVersion::Tls13);
     let (mut builder, ech) = crate::ech::apply_server(&args, builder);
     if ech && version != ProtocolVersion::Tls13 {
         die("-ech-key / -ech-config require TLS 1.3 over TCP (drop -tls1_2 / -dtls1_2 / -dtls1_3)");

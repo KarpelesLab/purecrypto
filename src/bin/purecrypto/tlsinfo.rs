@@ -1,10 +1,13 @@
 //! Shared `s_client` / `s_server` pieces: the negotiated-parameter report
 //! both print after a handshake (one `key: value` line per parameter, so a
 //! harness can grep a single line per fact), and the parsers for the flags
-//! both accept (`-groups`, `-ciphersuites`, `-rpk_peer_key`).
+//! both accept (`-groups`, `-ciphersuites`, `-rpk_peer_key`, `-psk*`).
 
-use crate::util::{Args, die};
-use purecrypto::tls::{Connection, NamedGroup, ProtocolVersion};
+use crate::util::{Args, die, zero_buf};
+use purecrypto::tls::{
+    ConfigBuilder, Connection, ExternalPsk, HashAlg, NamedGroup, ProtocolVersion,
+    PskKeyExchangeMode,
+};
 
 /// Which end of the connection is reporting; a few lines differ.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -20,6 +23,8 @@ pub(crate) enum Role {
 /// key exchange: X25519MLKEM768
 /// HelloRetryRequest: no
 /// resumed: no
+/// PSK mode: none
+/// external PSK: none
 /// early data: none
 /// peer certificate: X.509 (2)
 /// peer certificate compression: none
@@ -56,6 +61,21 @@ pub(crate) fn report_handshake(conn: &Connection, role: Role) {
     }
     eprintln!("resumed: {}", yes_no(conn.resumed()));
     if is13 {
+        // RFC 8446 §4.2.9 / §4.2.11: how the PSK (a ticket or an external
+        // key) was combined with the key exchange, and which external
+        // identity authenticated the handshake, if one did.
+        eprintln!(
+            "PSK mode: {}",
+            conn.psk_key_exchange_mode()
+                .map(PskKeyExchangeMode::name)
+                .unwrap_or("none")
+        );
+        eprintln!(
+            "external PSK: {}",
+            conn.external_psk_identity()
+                .map(|id| String::from_utf8_lossy(id).into_owned())
+                .unwrap_or_else(|| "none".to_string())
+        );
         let early = if conn.early_data_accepted() {
             "accepted"
         } else if conn.early_data_offered() {
@@ -219,6 +239,84 @@ pub(crate) fn load_spki_pems(path: &str, flag: &str) -> Vec<Vec<u8>> {
         die(format!("{flag}: no PUBLIC KEY PEM block in {path}"));
     }
     out
+}
+
+/// The `-psk*` flags both commands accept, with a value:
+pub(crate) const PSK_VALUE_FLAGS: [&str; 5] = [
+    "-psk_modes",
+    "-psk_identity",
+    "-psk",
+    "-psk_hash",
+    "-psk_context",
+];
+
+/// Applies the `-psk*` flags to `builder`:
+///
+/// * `-psk_modes psk_dhe_ke:psk_ke` — the RFC 8446 §4.2.9 modes allowed
+///   (advertised by the client; the server's preference order). The
+///   default is `psk_dhe_ke` only: `psk_ke` gives up forward secrecy.
+/// * `-psk_identity NAME -psk HEX` — an external PSK (RFC 8446 §4.2.11),
+///   as `openssl s_client` / `s_server` take them; `-psk_hash sha384`
+///   pairs it with the SHA-384 suite instead of SHA-256. `-psk_import`
+///   (optionally `-psk_context STR`) runs the pair through the RFC 9258
+///   importer instead of using the key as given, as `bssl` does.
+///
+/// `tls13` says whether the connection is TLS 1.3 over TCP, the only one
+/// these apply to.
+pub(crate) fn apply_psk_flags(
+    args: &Args,
+    mut builder: ConfigBuilder,
+    tls13: bool,
+) -> ConfigBuilder {
+    let import = args.flag("-psk_import") || args.flag("--psk_import");
+    let any = import || PSK_VALUE_FLAGS.iter().any(|f| args.value(f).is_some());
+    if any && !tls13 {
+        die("-psk_modes / -psk_identity / -psk are TLS 1.3 (over TCP) options");
+    }
+    if let Some(list) = args.value("-psk_modes") {
+        let modes: Vec<PskKeyExchangeMode> = list
+            .split([':', ','])
+            .filter(|m| !m.is_empty())
+            .map(|m| match m {
+                "psk_ke" => PskKeyExchangeMode::PskKe,
+                "psk_dhe_ke" => PskKeyExchangeMode::PskDheKe,
+                _ => die(format!(
+                    "-psk_modes: unknown mode '{m}' (psk_dhe_ke, psk_ke)"
+                )),
+            })
+            .collect();
+        builder = builder.psk_modes(&modes);
+    }
+    match (args.value("-psk_identity"), args.value("-psk")) {
+        (Some(identity), Some(hex)) => {
+            let mut secret = crate::util::parse_hex_flag(hex, "-psk");
+            let hash = match args.value("-psk_hash").unwrap_or("sha256") {
+                "sha256" | "SHA256" => HashAlg::Sha256,
+                "sha384" | "SHA384" => HashAlg::Sha384,
+                other => die(format!("-psk_hash: '{other}' is not sha256 or sha384")),
+            };
+            let psk = if import {
+                let context = args.value("-psk_context").unwrap_or("");
+                ExternalPsk::import(
+                    identity.as_bytes().to_vec(),
+                    context.as_bytes(),
+                    secret.clone(),
+                    hash,
+                )
+            } else {
+                ExternalPsk::new(identity.as_bytes().to_vec(), secret.clone())
+                    .map(|p| p.with_hash(hash))
+            }
+            .unwrap_or_else(|_| {
+                die("-psk: the key must be 16..=512 bytes (32+ hex digits) and -psk_identity / -psk_context 1..=1024 bytes")
+            });
+            zero_buf(&mut secret);
+            builder = builder.external_psk(psk);
+        }
+        (None, None) if !import && args.value("-psk_context").is_none() => {}
+        _ => die("-psk_identity and -psk go together (-psk_import / -psk_context need both)"),
+    }
+    builder
 }
 
 /// `-record_size_limit N` (RFC 8449: 64..=16385).

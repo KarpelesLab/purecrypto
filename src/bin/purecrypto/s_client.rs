@@ -202,12 +202,13 @@ pub(crate) fn run(args: Args) {
         "-resend",
     ];
     value_flags.extend(crate::ech::CLIENT_VALUE_FLAGS);
+    value_flags.extend(tlsinfo::PSK_VALUE_FLAGS);
     let connect = args
         .value("-connect")
         .or_else(|| args.positionals(&value_flags).first().copied())
         .unwrap_or_else(|| {
             die(
-                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-groups x25519:secp256r1] [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]] [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk] [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS] [-resend N] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease]",
+                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-groups x25519:secp256r1] [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]] [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk] [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS] [-resend N] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease] [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]",
             )
         });
     let (host, port) = match connect.rsplit_once(':') {
@@ -363,6 +364,7 @@ pub(crate) fn run(args: Args) {
     if let Some(sink) = keylog {
         builder = builder.key_log(sink);
     }
+    let builder = tlsinfo::apply_psk_flags(&args, builder, version == ProtocolVersion::Tls13);
     let (builder, ech) = crate::ech::apply_client(&args, builder);
     // RFC 9849 is a TLS 1.3 mechanism (§6.1: the inner hello MUST NOT offer
     // 1.2), and this stack does not implement it for DTLS.
