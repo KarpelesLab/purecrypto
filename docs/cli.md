@@ -384,7 +384,7 @@ purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_pro
                     [-groups x25519:secp256r1] [-key-shares x25519,...]
                     [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]]
                     [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk]
-                    [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS]
+                    [-record_size_limit N] [-no_cert_comp | -cert_comp LIST [-cert_comp_own LIST]] [-read_timeout SECS]
                     [-resend N] [-keylogfile keys.log] [-quiet]
                     [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]
                     [-ech-config-list list [-ech-retry-configs-out FILE] | -ech-grease]
@@ -395,7 +395,7 @@ purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2 | -dtls1_2
                     [-no_ticket] [-early_data [-max_early_data N]]
                     [-key_update] [-status_file resp.der] [-enable_server_rpk]
                     [-enable_client_rpk -rpk_peer_key pub.pem] [-record_size_limit N]
-                    [-no_cert_comp] [-keylogfile keys.log] [-quiet]
+                    [-no_cert_comp | -cert_comp LIST [-cert_comp_own LIST]] [-keylogfile keys.log] [-quiet]
                     [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]
                     [-ech-key key.bin -ech-config config.bin]
 ```
@@ -432,9 +432,9 @@ external PSK: none                   # the identity, when one authenticated the 
 early data: none                     # accepted | rejected | none
 peer certificate: X.509 (2)          # raw public key | none
 peer signature: ed25519              # IANA SignatureScheme name of the peer's handshake signature | none
-peer certificate compression: none   # client: zlib when the server compressed
+peer certificate compression: none   # zlib | brotli | zstd when the peer compressed its certificate
 own certificate: X.509               # server (and an RPK client): raw public key
-own certificate compression: zlib    # server
+own certificate compression: zlib    # likewise for the certificate this side sent
 OCSP staple: no                      # client
 record_size_limit: not negotiated
 …
@@ -523,9 +523,20 @@ Behaviour worth knowing:
 - `s_server -status_file resp.der` staples a DER OCSP response (RFC 6066 §8;
   on TLS 1.3 in the leaf's `status_request` entry); the client always asks,
   validates a staple against the chain, and reports `OCSP staple: yes`.
-- `-record_size_limit N` (64..=16385) advertises RFC 8449; `-no_cert_comp`
-  turns off the RFC 8879 `compress_certificate` advertisement (zlib is
-  advertised by default in a build with `cert-compression`).
+- `-record_size_limit N` (64..=16385) advertises RFC 8449.
+- RFC 8879 certificate compression (a build with `cert-compression`) is on
+  by default in both directions: the client advertises what it accepts for
+  the server's certificate in its ClientHello, the server what it accepts
+  for the client's certificate in its CertificateRequest (`-Verify`), and
+  each side compresses its own certificate with the first of its
+  algorithms the peer listed — zlib, brotli, zstd, in that order.
+  `-no_cert_comp` turns it off in both directions; `-cert_comp LIST` sets
+  the algorithms accepted for the peer's certificate (names or codepoints,
+  comma-separated, in preference order; `none` for an empty list) and,
+  unless `-cert_comp_own LIST` sets the send side separately, the ones
+  this side compresses its own certificate with — so `-cert_comp zstd`
+  pins both directions to zstd. The `… certificate compression:` report
+  lines say what happened on each certificate.
 - `s_client -read_timeout SECS` (default 5) is how long the client waits for
   more data after the last byte before ending the session with
   `close_notify`; it then waits, bounded by the same timeout, for the

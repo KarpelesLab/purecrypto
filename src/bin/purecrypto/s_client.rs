@@ -202,6 +202,8 @@ pub(crate) fn run(args: Args) {
         "-resend",
         "-cid",
         "-cid_len",
+        "-cert_comp",
+        "-cert_comp_own",
     ];
     value_flags.extend(crate::ech::CLIENT_VALUE_FLAGS);
     value_flags.extend(tlsinfo::PSK_VALUE_FLAGS);
@@ -210,7 +212,7 @@ pub(crate) fn run(args: Args) {
         .or_else(|| args.positionals(&value_flags).first().copied())
         .unwrap_or_else(|| {
             die(
-                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-groups x25519:secp256r1] [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]] [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk] [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS] [-resend N] [-cid HEX | -cid_len N] [-rebind] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease] [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]",
+                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-groups x25519:secp256r1] [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]] [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk] [-record_size_limit N] [-no_cert_comp | -cert_comp LIST [-cert_comp_own LIST]] [-read_timeout SECS] [-resend N] [-cid HEX | -cid_len N] [-rebind] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease] [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]",
             )
         });
     let (host, port) = match connect.rsplit_once(':') {
@@ -241,7 +243,6 @@ pub(crate) fn run(args: Args) {
     let key_update = args.flag("-key_update") || args.flag("--key_update");
     let enable_server_rpk = args.flag("-enable_server_rpk") || args.flag("--enable_server_rpk");
     let enable_client_rpk = args.flag("-enable_client_rpk") || args.flag("--enable_client_rpk");
-    let no_cert_comp = args.flag("-no_cert_comp") || args.flag("--no_cert_comp");
     let early_data: Option<Vec<u8>> = args.value("-early_data").map(|path| {
         if !reconnect {
             die("-early_data needs -reconnect: 0-RTT rides on the resumed (second) connection");
@@ -330,11 +331,9 @@ pub(crate) fn run(args: Args) {
         builder = builder.record_size_limit(n);
     }
     #[cfg(feature = "cert-compression")]
-    if no_cert_comp {
-        builder = builder.cert_compression_algorithms(Vec::new());
+    {
+        builder = tlsinfo::apply_cert_compression(&args, builder);
     }
-    #[cfg(not(feature = "cert-compression"))]
-    let _ = no_cert_comp;
     // RFC 7250 raw public keys. `-enable_server_rpk` offers
     // `server_certificate_type = RawPublicKey` (X.509 still accepted); the
     // server's bare key must then match one of the `-rpk_peer_key` pins,

@@ -7737,6 +7737,134 @@ fn write_dtls_identity(dir: &std::path::Path) -> (String, String) {
     )
 }
 
+/// RFC 8879 in both directions over the CLI: with mTLS (`-Verify`), the
+/// server compresses its certificate for the client and the client its
+/// certificate for the server, each with the first of its own algorithms
+/// the other side listed; `-cert_comp` pins the algorithm, `-cert_comp_own`
+/// sets the send side alone and `-no_cert_comp` turns both directions off.
+/// The `… certificate compression:` report lines on both sides are what
+/// the interop harness reads.
+#[cfg(feature = "cert-compression")]
+#[test]
+fn s_client_s_server_compress_both_certificates() {
+    let dir = std::env::temp_dir().join(format!("pc_certcomp_{}", std::process::id()));
+    let (server_cert, server_key) = write_dtls_identity(&dir.join("server"));
+    let (client_cert, client_key) = write_dtls_identity(&dir.join("client"));
+    // (server flags, client flags, server's own, client's own)
+    let cases: [(&[&str], &[&str], &str, &str); 5] = [
+        (&[], &[], "zlib", "zlib"),
+        (
+            &["-cert_comp", "zstd"],
+            &["-cert_comp", "zstd"],
+            "zstd",
+            "zstd",
+        ),
+        // The client accepts everything but sends plain; the server's
+        // send list is brotli alone.
+        (
+            &["-cert_comp", "brotli"],
+            &["-cert_comp_own", "none"],
+            "brotli",
+            "none",
+        ),
+        // The server accepts zlib only but sends with zstd; the client
+        // prefers zstd for its own and accepts the defaults.
+        (
+            &["-cert_comp", "zlib", "-cert_comp_own", "zstd"],
+            &["-cert_comp_own", "zstd,zlib"],
+            "zstd",
+            "zlib",
+        ),
+        (&["-no_cert_comp"], &[], "none", "none"),
+    ];
+    for (server_flags, client_flags, server_own, client_own) in cases {
+        let mut server_args = vec![
+            "s_server",
+            "-cert",
+            &server_cert,
+            "-key",
+            &server_key,
+            "-accept",
+            "0",
+            "-Verify",
+            &client_cert,
+        ];
+        server_args.extend_from_slice(server_flags);
+        let server = spawn_server_wait_listening(&server_args);
+        let connect = format!("127.0.0.1:{}", server.port);
+        let mut client_args = vec![
+            "s_client",
+            "-connect",
+            &connect,
+            "-CAfile",
+            &server_cert,
+            "-cert",
+            &client_cert,
+            "-key",
+            &client_key,
+            "-read_timeout",
+            "1",
+        ];
+        client_args.extend_from_slice(client_flags);
+        let (out, err, ok) = run_capture(&client_args, b"hello\n");
+        let server_err = server.finish_with_stderr();
+        assert!(
+            ok,
+            "{server_flags:?} / {client_flags:?}: s_client failed: {err}"
+        );
+        assert!(out.contains("hello"), "no echo: {out:?}\n{err}");
+        for (log, own, peer, side) in [
+            (&err, client_own, server_own, "client"),
+            (&server_err, server_own, client_own, "server"),
+        ] {
+            assert!(
+                log.contains(&format!("own certificate compression: {own}\n")),
+                "{server_flags:?} / {client_flags:?}: {side} should report own = {own}:\n{log}"
+            );
+            assert!(
+                log.contains(&format!("peer certificate compression: {peer}\n")),
+                "{server_flags:?} / {client_flags:?}: {side} should report peer = {peer}:\n{log}"
+            );
+        }
+        assert!(
+            server_err.contains("peer certificate: X.509 (1)"),
+            "the client certificate did not arrive:\n{server_err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `-cert_comp` takes names or codepoints and refuses the rest; it cannot
+/// be combined with `-no_cert_comp`.
+#[cfg(feature = "cert-compression")]
+#[test]
+fn s_client_cert_comp_flag_is_validated() {
+    for (flags, expected) in [
+        (
+            &["-cert_comp", "deflate"][..],
+            "-cert_comp: 'deflate' is not zlib, brotli, zstd or a number",
+        ),
+        (
+            &["-cert_comp", "4"][..],
+            "does not implement certificate compression algorithm 4",
+        ),
+        (&["-cert_comp", ","][..], "expects at least one algorithm"),
+        (
+            &["-no_cert_comp", "-cert_comp_own", "zlib"][..],
+            "-no_cert_comp cannot be combined with -cert_comp / -cert_comp_own",
+        ),
+    ] {
+        let mut args = vec!["s_client", "-connect", "127.0.0.1:1", "-insecure"];
+        args.extend_from_slice(flags);
+        let (_out, err, ok) = run_capture(&args, b"");
+        assert!(!ok, "{flags:?} must be refused");
+        assert!(
+            err.contains(expected),
+            "{flags:?}: expected {expected:?} in:\n{err}"
+        );
+    }
+}
+
 /// True for a datagram whose first record is a DTLS 1.3 protected record
 /// (unified header, RFC 9147 §4) of `epoch` (its two low bits).
 fn is_dtls13_record(datagram: &[u8], epoch: u8) -> bool {

@@ -136,8 +136,8 @@ pub(crate) fn run(args: Args) {
              [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-no_ticket] \
              [-early_data [-max_early_data N]] [-key_update] [-status_file resp.der] \
              [-enable_server_rpk] [-enable_client_rpk -rpk_peer_key pub.pem] \
-             [-record_size_limit N] [-no_cert_comp] [-cid HEX | -cid_len N] \
-             [-keylogfile keys.log] \
+             [-record_size_limit N] [-no_cert_comp | -cert_comp LIST [-cert_comp_own LIST]] \
+             [-cid HEX | -cid_len N] [-keylogfile keys.log] \
              [-ech-key key.bin -ech-config config.bin] [-psk_modes psk_dhe_ke:psk_ke] \
              [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]] (-cert/-key may be \
              omitted with -psk: a PSK-only TLS 1.3 server)",
@@ -166,7 +166,6 @@ pub(crate) fn run(args: Args) {
     let key_update = args.flag("-key_update") || args.flag("--key_update");
     let enable_server_rpk = args.flag("-enable_server_rpk") || args.flag("--enable_server_rpk");
     let enable_client_rpk = args.flag("-enable_client_rpk") || args.flag("--enable_client_rpk");
-    let no_cert_comp = args.flag("-no_cert_comp") || args.flag("--no_cert_comp");
     let is_tcp = matches!(version, ProtocolVersion::Tls12 | ProtocolVersion::Tls13);
     if (naccept > 1 || early_data || enable_server_rpk || enable_client_rpk) && !is_tcp {
         die("-naccept / -early_data / -enable_*_rpk are TLS-over-TCP options");
@@ -276,11 +275,9 @@ pub(crate) fn run(args: Args) {
         builder = builder.record_size_limit(n);
     }
     #[cfg(feature = "cert-compression")]
-    if no_cert_comp {
-        builder = builder.cert_compression_algorithms(Vec::new());
+    {
+        builder = tlsinfo::apply_cert_compression(&args, builder);
     }
-    #[cfg(not(feature = "cert-compression"))]
-    let _ = no_cert_comp;
     // `-status_file`: a DER OCSPResponse stapled for clients that ask
     // (RFC 6066 §8; the TLS 1.3 leaf `status_request` entry, RFC 8446
     // §4.4.2.1, or the TLS 1.2 CertificateStatus message).

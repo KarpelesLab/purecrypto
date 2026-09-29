@@ -104,13 +104,14 @@ pub(crate) fn report_handshake(conn: &Connection, role: Role) {
             .map(signature_scheme_name)
             .unwrap_or_else(|| "none".to_string())
     );
+    // RFC 8879, both directions: the server's certificate (client side:
+    // peer, server side: own) and the client's mTLS certificate (client
+    // side: own, server side: peer).
     #[cfg(feature = "cert-compression")]
-    if role == Role::Client {
-        eprintln!(
-            "peer certificate compression: {}",
-            compression_name(conn.peer_cert_compression())
-        );
-    }
+    eprintln!(
+        "peer certificate compression: {}",
+        compression_name(conn.peer_cert_compression())
+    );
     if role == Role::Server || conn.own_raw_public_key() {
         eprintln!(
             "own certificate: {}",
@@ -122,12 +123,10 @@ pub(crate) fn report_handshake(conn: &Connection, role: Role) {
         );
     }
     #[cfg(feature = "cert-compression")]
-    if role == Role::Server {
-        eprintln!(
-            "own certificate compression: {}",
-            compression_name(conn.own_cert_compression())
-        );
-    }
+    eprintln!(
+        "own certificate compression: {}",
+        compression_name(conn.own_cert_compression())
+    );
     if role == Role::Client && version == Some(ProtocolVersion::TLSv1_3) {
         eprintln!(
             "OCSP staple: {}",
@@ -235,11 +234,69 @@ fn cid_hex(cid: &[u8]) -> String {
 fn compression_name(alg: Option<u16>) -> &'static str {
     match alg {
         None => "none",
-        Some(1) => "zlib",
-        Some(2) => "brotli",
-        Some(3) => "zstd",
-        Some(_) => "unknown",
+        Some(a) => purecrypto::tls::cert_compression::algorithm_name(a).unwrap_or("unknown"),
     }
+}
+
+/// `-cert_comp zlib,zstd` / `-cert_comp_own brotli`: RFC 8879 algorithm
+/// lists by registry name (`zlib`, `brotli`, `zstd`) or codepoint,
+/// comma- or colon-separated, in preference order. `none` is the empty
+/// list.
+#[cfg(feature = "cert-compression")]
+pub(crate) fn parse_cert_compression(list: &str, flag: &str) -> Vec<u16> {
+    if list == "none" {
+        return Vec::new();
+    }
+    let algs: Vec<u16> = list
+        .split([':', ','])
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            purecrypto::tls::cert_compression::algorithm_from_name(a)
+                .or_else(|| a.parse().ok())
+                .unwrap_or_else(|| {
+                    die(format!(
+                        "{flag}: '{a}' is not zlib, brotli, zstd or a number"
+                    ))
+                })
+        })
+        .collect();
+    if algs.is_empty() {
+        die(format!("{flag}: expects at least one algorithm, or none"));
+    }
+    for a in &algs {
+        if !purecrypto::tls::cert_compression::supports(*a) {
+            die(format!(
+                "{flag}: this build does not implement certificate compression algorithm {a}"
+            ));
+        }
+    }
+    algs
+}
+
+/// The RFC 8879 knobs shared by `s_client` and `s_server`: `-no_cert_comp`
+/// turns the feature off in both directions; `-cert_comp LIST` sets the
+/// algorithms accepted for the peer's certificate (and, unless
+/// `-cert_comp_own LIST` says otherwise, the ones this side compresses
+/// its own certificate with).
+#[cfg(feature = "cert-compression")]
+pub(crate) fn apply_cert_compression(
+    args: &Args,
+    mut builder: purecrypto::tls::ConfigBuilder,
+) -> purecrypto::tls::ConfigBuilder {
+    if args.flag("-no_cert_comp") || args.flag("--no_cert_comp") {
+        if args.value("-cert_comp").is_some() || args.value("-cert_comp_own").is_some() {
+            die("-no_cert_comp cannot be combined with -cert_comp / -cert_comp_own");
+        }
+        return builder.cert_compression_algorithms(Vec::new());
+    }
+    if let Some(list) = args.value("-cert_comp") {
+        builder = builder.cert_compression_algorithms(parse_cert_compression(list, "-cert_comp"));
+    }
+    if let Some(list) = args.value("-cert_comp_own") {
+        builder =
+            builder.own_cert_compression_algorithms(parse_cert_compression(list, "-cert_comp_own"));
+    }
+    builder
 }
 
 /// `-groups x25519:secp256r1` (colon- or comma-separated, as `openssl
