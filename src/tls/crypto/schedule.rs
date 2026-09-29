@@ -267,10 +267,18 @@ impl KeySchedule {
     /// Starts the schedule with a pre-shared key (`HKDF-Extract(0, psk)`).
     /// Used by both PSK-only and PSK-with-ECDHE resumption flows.
     pub(crate) fn with_psk(alg: HashAlg, psk: &[u8]) -> Self {
+        Self::with_psk_prefixed(LabelPrefix::Tls13, alg, psk)
+    }
+
+    /// [`with_psk`](Self::with_psk) with an explicit label prefix: a DTLS
+    /// 1.3 resumption derives its binder key and every later secret under
+    /// `"dtls13"` (RFC 9147 §5.9), so the same PSK yields different keys
+    /// on the two protocols. (The extract itself carries no label.)
+    pub(crate) fn with_psk_prefixed(prefix: LabelPrefix, alg: HashAlg, psk: &[u8]) -> Self {
         let early = extract(alg, &[], psk);
         KeySchedule {
             alg,
-            prefix: LabelPrefix::Tls13,
+            prefix,
             secret: early,
         }
     }
@@ -421,13 +429,65 @@ pub(crate) fn psk_from_resumption(alg: HashAlg, rms: &Secret, ticket_nonce: &[u8
     expand_label_dyn(alg, rms.as_slice(), b"resumption", ticket_nonce, out);
 }
 
+/// [`psk_from_resumption`] with an explicit label prefix (RFC 9147 §5.9:
+/// a DTLS 1.3 ticket's PSK is expanded under `"dtls13"`). Only the DTLS 1.3
+/// engine needs the prefix override.
+#[cfg(feature = "dtls")]
+pub(crate) fn psk_from_resumption_with(
+    prefix: LabelPrefix,
+    alg: HashAlg,
+    rms: &Secret,
+    ticket_nonce: &[u8],
+    out: &mut [u8],
+) {
+    expand_label_dyn_with(
+        prefix,
+        alg,
+        rms.as_slice(),
+        b"resumption",
+        ticket_nonce,
+        out,
+    );
+}
+
 /// Derives the per-binder "finished" key used to MAC the truncated
 /// ClientHello: `HKDF-Expand-Label(binder_key, "finished", "", Hash.length)`.
 pub(crate) fn binder_finished_key(alg: HashAlg, binder_key: &Secret) -> Secret {
-    let mut out = [0u8; MAX_SECRET];
-    let n = alg.output_len();
-    expand_label_dyn(alg, binder_key.as_slice(), b"finished", &[], &mut out[..n]);
-    Secret::new(&out[..n])
+    finished_key_with(LabelPrefix::Tls13, alg, binder_key)
+}
+
+/// The PSK binder of a ClientHello (RFC 8446 §4.2.11.2):
+/// `HMAC(finished_key(binder_key("res binder")), Transcript-Hash(prefix ‖
+/// truncated_ch))`, where `prefix` is empty for a first ClientHello and
+/// `message_hash(CH1) ‖ HelloRetryRequest` for the retry hello, and
+/// `truncated_ch` is the hello up to (not including) the binders list. The
+/// label prefix selects the protocol's key hierarchy (RFC 9147 §5.9): the
+/// DTLS 1.3 engines compute binders under `"dtls13"`, so a TLS peer holding
+/// the same PSK could never produce (or verify) one. (The TLS engines patch
+/// their binders inline; only DTLS 1.3 uses this shared helper.)
+#[cfg(feature = "dtls")]
+pub(crate) fn psk_binder_with(
+    prefix: LabelPrefix,
+    alg: HashAlg,
+    psk: &[u8],
+    transcript_prefix: &[u8],
+    truncated_ch: &[u8],
+) -> Secret {
+    let ks = KeySchedule::with_psk_prefixed(prefix, alg, psk);
+    let res_bk = ks.binder_key(b"res binder");
+    let fk = finished_key_with(prefix, alg, &res_bk);
+    let th = if transcript_prefix.is_empty() {
+        alg.hash(truncated_ch)
+    } else {
+        let mut tbuf = Vec::with_capacity(transcript_prefix.len() + truncated_ch.len());
+        tbuf.extend_from_slice(transcript_prefix);
+        tbuf.extend_from_slice(truncated_ch);
+        alg.hash(&tbuf)
+    };
+    match alg {
+        HashAlg::Sha256 => Secret::new(Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice()).as_ref()),
+        HashAlg::Sha384 => Secret::new(Hmac::<Sha384>::mac(fk.as_slice(), th.as_slice()).as_ref()),
+    }
 }
 
 /// RFC 8446 §7.5 TLS-Exporter: derives application-layer keying material

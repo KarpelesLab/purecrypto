@@ -23,6 +23,17 @@
 //! - Server-initiated cookie exchange via HelloRetryRequest carrying a
 //!   `cookie` extension (RFC 9147 §5.1, extension type 44 per RFC 8446
 //!   §4.2.2). The client echoes the cookie in a new ClientHello.
+//! - PSK resumption (RFC 8446 §2.2 / §4.2.11, `psk_dhe_ke` only) from a
+//!   `StoredSession` captured off a previous connection's
+//!   `NewSessionTicket`, with the binder computed over the DTLS transcript
+//!   under the `"dtls13"` label prefix (RFC 9147 §5.2, §5.9) — and
+//!   recomputed over `message_hash(CH1) ‖ HelloRetryRequest ‖ CH2` when the
+//!   server's cookie exchange makes the hello go out twice (RFC 8446
+//!   §4.2.11.2).
+//! - 0-RTT early data (RFC 8446 §4.2.10) under epoch 1 (RFC 9147 §6.1),
+//!   written before the ServerHello arrives; no `EndOfEarlyData` is sent —
+//!   the epoch change marks the end (RFC 9147 §5.6). A HelloRetryRequest
+//!   rejects the early data and the retry hello offers none.
 //!
 //! Negotiation surface (matches the TLS 1.3 layer):
 //!
@@ -40,7 +51,7 @@
 //!   configured identity answers a `CertificateRequest`, an in-process key
 //!   signing inline and an external one through the suspend / resume
 //!   pair `pending_signature` / `provide_signature`, as on TLS 1.3.
-//! - Out of scope: PSK, 0-RTT.
+//! - Out of scope: external PSKs.
 
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
@@ -53,12 +64,13 @@ use crate::tls::codec::{
     CipherSuite, ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket, Random,
     ReadCursor, ServerHello, SignatureScheme, hs_type, with_len_u16, with_len_u24,
 };
+use crate::tls::conn::StoredSession;
 use crate::tls::conn::{ClientCertConfig, ClientKey};
 use crate::tls::crypto::{
     AeadAlg, HashAlg, KeySchedule, LabelPrefix, RecordCrypter, Secret, SuiteParams, Transcript,
     certificate_verify_content, ct_find_last_nonzero, expand_label_dyn_with,
-    finished_verify_data_with, kex, lookup_suite, next_traffic_secret_with, supported_suites,
-    verify_signature,
+    finished_verify_data_with, kex, lookup_suite, next_traffic_secret_with,
+    psk_from_resumption_with, supported_suites, verify_signature,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -85,6 +97,9 @@ use super::record13::{
 };
 use super::reliability13::{InFlightRecord, Retransmit13};
 use super::system_now;
+use super::ticket::{
+    MAX_DTLS_SESSION_TICKET_LEN, obfuscated_age, patch_binder13, ticket_now, usable_session13,
+};
 
 /// HelloRetryRequest sentinel `random` value (RFC 8446 §4.1.3).
 const HRR_RANDOM: [u8; 32] = [
@@ -156,6 +171,15 @@ pub(crate) struct ClientConfig13Internal {
     /// then aborts with `certificate_required`. Forwarded from
     /// [`crate::tls::Config::identity`].
     pub client_cert: Option<ClientCertConfig>,
+    /// A session captured off a previous DTLS 1.3 connection
+    /// ([`DtlsClientConnection13::take_session`]) to resume by PSK (RFC
+    /// 8446 §2.2). Dropped, and a full handshake run instead, unless it
+    /// was issued by this `server_name` under a verification context at
+    /// least as strict, is unexpired, and its ticket fits a ClientHello
+    /// (see `ticket::usable_session13`). A session captured off a TLS or
+    /// QUIC connection never reaches this field: the protocol is bound
+    /// into [`crate::tls::ResumptionSession`].
+    pub session: Option<StoredSession>,
 }
 
 impl ClientConfig13Internal {
@@ -183,6 +207,7 @@ impl ClientConfig13Internal {
             key_share_groups: None,
             connection_id: None,
             client_cert: None,
+            session: None,
         }
     }
 
@@ -244,6 +269,33 @@ struct PendingFlight {
     scheme: SignatureScheme,
     /// The signature input the caller signs.
     content: Vec<u8>,
+}
+
+/// The PSK offered in the ClientHello, kept until the ServerHello says
+/// whether the server took it.
+struct PskOffer {
+    /// The stored session's PSK, wiped on drop.
+    psk: crate::zeroize::Zeroizing<Vec<u8>>,
+    /// The hash of the session's cipher suite: the binder, and the key
+    /// schedule if accepted, are computed under it.
+    hash: HashAlg,
+}
+
+/// The epoch-1 write context for 0-RTT data (RFC 9147 §6.1), keyed from
+/// `client_early_traffic_secret` over `Hash(ClientHello1)` at construction
+/// and dropped at the first HelloRetryRequest or ServerHello: early data
+/// is only ever written before the server has answered.
+struct EarlyWrite {
+    /// The stored session's suite, which keys the early data (RFC 8446
+    /// §4.2.10); the ServerHello must select it again for the server to
+    /// have accepted.
+    suite: SuiteParams,
+    crypter: RecordCrypter,
+    sn_key: Secret,
+    seq: u64,
+    /// Plaintext bytes still allowed under the ticket's
+    /// `max_early_data_size` (RFC 8446 §4.6.1).
+    remaining: u32,
 }
 
 /// A write context retired by an epoch change but kept for retransmitting
@@ -434,6 +486,31 @@ pub struct DtlsClientConnection13 {
     /// `NewConnectionId` of ours was still unacknowledged — RFC 9147 §9
     /// allows only one outstanding, so the answer waits for the ACK.
     cid_reply_owed: u8,
+    /// The PSK the ClientHello offers, while a session is being resumed.
+    psk_offered: Option<PskOffer>,
+    /// The ServerHello selected our PSK (RFC 8446 §4.2.11).
+    psk_accepted: bool,
+    /// 0-RTT is being offered: `early_data` in the ClientHello and the
+    /// epoch-1 write key installed. Cleared by a HelloRetryRequest (§4.2.10)
+    /// and by a ServerHello that does not take the PSK.
+    early_data_offered: bool,
+    /// Sticky record of `early_data_offered` for reporting.
+    early_data_was_offered: bool,
+    /// The server's EncryptedExtensions carried `early_data` (§4.2.10).
+    early_data_accepted: bool,
+    /// The epoch-1 write context, while early data may still be written.
+    early_write: Option<EarlyWrite>,
+    /// `resumption_master_secret` (RFC 8446 §7.1), derived once our
+    /// Finished is in the transcript; seeds the PSK of every
+    /// NewSessionTicket the server sends.
+    rms: Option<Secret>,
+    /// The latest resumable session, built from the server's
+    /// NewSessionTicket (RFC 8446 §4.6.1) — see [`Self::take_session`].
+    stored_session: Option<StoredSession>,
+    /// Unix time the handshake started, for the reported ticket age
+    /// (§4.2.11.1) and the stored session's `received_at`. `None` without
+    /// a clock.
+    handshake_start: Option<u64>,
 }
 
 impl DtlsClientConnection13 {
@@ -453,6 +530,53 @@ impl DtlsClientConnection13 {
         let mut client_random: Random = [0u8; 32];
         rng.fill_bytes(&mut client_random);
         let cid_pool = draw_cid_pool(rng, config.connection_id.as_ref().map_or(0, |c| c.len()));
+
+        // RFC 8446 §4.6.1 / §2.2: a stored session is only offered to the
+        // server that issued it, under a verification context at least as
+        // strict, before it expires — a resumed handshake carries no
+        // certificate to re-establish any of that (`usable_session13`).
+        let mut config = config;
+        let handshake_start = ticket_now(config.verification_time.as_ref());
+        if let Some(session) = config.session.as_ref()
+            && !usable_session13(
+                session,
+                config.server_name.as_deref(),
+                config.verify_certificates,
+                handshake_start,
+            )
+        {
+            config.session = None;
+        }
+        // Resuming: the offer is narrowed to the suites of the session's
+        // hash (the binder and the PSK key schedule are computed under it,
+        // RFC 8446 §4.2.11). An offer left empty by that means the session
+        // cannot be resumed under this configuration: full handshake.
+        if let Some(session) = config.session.as_ref() {
+            let hash = session.cipher_suite_hash;
+            let narrowed: Vec<CipherSuite> = config
+                .cipher_suites
+                .iter()
+                .copied()
+                .filter(|s| lookup_suite(*s).is_some_and(|p| p.hash == hash))
+                .collect();
+            if narrowed.is_empty() {
+                config.session = None;
+            } else {
+                config.cipher_suites = narrowed;
+            }
+        }
+        let psk_offered = config.session.as_ref().map(|s| PskOffer {
+            psk: s.psk.clone(),
+            hash: s.cipher_suite_hash,
+        });
+        // 0-RTT is offered when the ticket allows early data and the suite
+        // it keys the early data under (RFC 8446 §4.2.10) is still offered.
+        let early_suite = config.session.as_ref().and_then(|s| {
+            let suite = lookup_suite(CipherSuite(s.cipher_suite))?;
+            (matches!(s.max_early_data_size, Some(n) if n > 0)
+                && config.cipher_suites.contains(&suite.suite))
+            .then_some((suite, s.max_early_data_size.unwrap_or(0)))
+        });
 
         let mut conn = Self {
             config,
@@ -519,6 +643,15 @@ impl DtlsClientConnection13 {
             cid: None,
             cid_pool,
             cid_reply_owed: 0,
+            psk_offered,
+            psk_accepted: false,
+            early_data_offered: early_suite.is_some(),
+            early_data_was_offered: early_suite.is_some(),
+            early_data_accepted: false,
+            early_write: None,
+            rms: None,
+            stored_session: None,
+            handshake_start,
         };
         // Transcript hash is pinned later once ServerHello arrives — TLS 1.3
         // (and DTLS 1.3) buffer the handshake bytes and only commit to a hash
@@ -528,6 +661,37 @@ impl DtlsClientConnection13 {
             // cannot overflow a record.
             conn.emit_plaintext(frag)
                 .expect("ClientHello fragments are bounded by max_fragment()");
+        }
+        // 0-RTT: `client_early_traffic_secret` over `Hash(ClientHello1)`
+        // (RFC 8446 §7.1), under the stored session's suite and the
+        // `"dtls13"` prefix, keys epoch 1 (RFC 9147 §6.1) so the caller can
+        // write early data right after this constructor returns.
+        if let (Some((suite, budget)), Some(offer)) = (early_suite, conn.psk_offered.as_ref()) {
+            let ks = KeySchedule::with_psk_prefixed(LabelPrefix::Dtls13, suite.hash, &offer.psk);
+            let mut t = Transcript::new();
+            t.set_alg(suite.hash);
+            t.update(conn.transcript.buffered_bytes());
+            let cets = ks.client_early_traffic_secret(t.current_hash().as_slice());
+            if let Some(kl) = conn.config.key_log.as_ref() {
+                kl.log(
+                    "CLIENT_EARLY_TRAFFIC_SECRET",
+                    &conn.client_random,
+                    cets.as_slice(),
+                );
+            }
+            conn.early_write = Some(EarlyWrite {
+                suite,
+                crypter: RecordCrypter::new_with(
+                    LabelPrefix::Dtls13,
+                    suite.hash,
+                    suite.aead,
+                    suite.key_len,
+                    &cets,
+                ),
+                sn_key: derive_sn_key(suite.hash, &cets, sn_key_len_for(suite.aead)),
+                seq: 0,
+                remaining: budget,
+            });
         }
         conn
     }
@@ -607,6 +771,81 @@ impl DtlsClientConnection13 {
     /// since the stateless cookie exchange rides on one (RFC 9147 §5.1).
     pub fn hello_retry_request_seen(&self) -> bool {
         self.hrr_processed
+    }
+
+    /// `true` when the ServerHello selected the offered PSK: the handshake
+    /// resumed the stored session (RFC 8446 §2.2).
+    pub fn psk_accepted(&self) -> bool {
+        self.psk_accepted
+    }
+
+    /// `true` when the server accepted the early data this client offered
+    /// (`early_data` in its EncryptedExtensions, RFC 8446 §4.2.10).
+    /// Rejected early data was never delivered: the caller re-sends it
+    /// with [`Self::send`] once the handshake completes.
+    pub fn early_data_accepted(&self) -> bool {
+        self.early_data_accepted
+    }
+
+    /// `true` when 0-RTT was offered on this connection, whether or not it
+    /// was then accepted.
+    // The sticky record, not the live `early_data_offered` flag a
+    // HelloRetryRequest clears — a caller asking after the handshake wants
+    // whether 0-RTT was ever offered.
+    #[allow(clippy::misnamed_getters)]
+    pub fn early_data_offered(&self) -> bool {
+        self.early_data_was_offered
+    }
+
+    /// Sends `data` as 0-RTT early data in an epoch-1 record (RFC 9147
+    /// §6.1) under `client_early_traffic_secret`. Valid only between
+    /// construction and the server's first answer, and only when the
+    /// stored session enabled early data (`max_early_data_size > 0`); the
+    /// total is bounded by that size (RFC 8446 §4.6.1). One record per
+    /// call, at most 2^14 bytes.
+    ///
+    /// Early data is not retransmitted (RFC 9147 §4.2.1 tracks handshake
+    /// messages only): a datagram lost on the way is lost, as any
+    /// application-data record is. **Replay risk**: the server-side
+    /// anti-replay window is best effort; only idempotent data belongs in
+    /// 0-RTT (RFC 8446 §8).
+    pub fn write_early_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.state != State::WaitServerHello || !self.early_data_offered {
+            return Err(Error::InappropriateState);
+        }
+        if data.len() > MAX_PLAINTEXT_LEN {
+            return Err(Error::RecordOverflow);
+        }
+        let ctx = self.early_write.as_mut().ok_or(Error::InappropriateState)?;
+        let len = u32::try_from(data.len()).map_err(|_| Error::RecordOverflow)?;
+        if len > ctx.remaining {
+            return Err(Error::RecordOverflow);
+        }
+        let seq = ctx.seq;
+        let wire = encrypt_protected_record_with(
+            ctx.suite,
+            &mut ctx.crypter,
+            &ctx.sn_key,
+            1,
+            seq,
+            // 0-RTT precedes the ServerHello that negotiates any CID (RFC
+            // 9146 §3): early records never carry one.
+            &[],
+            ContentType::ApplicationData,
+            data,
+        )?;
+        ctx.seq += 1;
+        ctx.remaining -= len;
+        self.out_dgrams.push(wire);
+        Ok(())
+    }
+
+    /// Moves out the latest session suitable for PSK resumption on the next
+    /// connection to the same server, built from the server's
+    /// NewSessionTicket (RFC 8446 §4.6.1). `None` until a ticket has
+    /// arrived — post-handshake, so never before the handshake completed.
+    pub fn take_session(&mut self) -> Option<StoredSession> {
+        self.stored_session.take()
     }
 
     /// The key-exchange group the handshake used (the `key_share` the
@@ -1258,12 +1497,8 @@ impl DtlsClientConnection13 {
                 self.on_key_update_received(ku)
             }
             hs_type::NEW_SESSION_TICKET => {
-                // Accepted and acknowledged, then discarded: the DTLS
-                // engines have no resumption store, and a well-formed
-                // ticket from an authenticated server is not a protocol
-                // violation (RFC 8446 §4.6.1).
-                let _ = NewSessionTicket::decode(body)?;
-                Ok(())
+                let nst = NewSessionTicket::decode(body)?;
+                self.on_new_session_ticket(nst)
             }
             hs_type::NEW_CONNECTION_ID => self.on_new_connection_id(body),
             hs_type::REQUEST_CONNECTION_ID => self.on_request_connection_id(body),
@@ -1338,6 +1573,67 @@ impl DtlsClientConnection13 {
         for frag in write_fragments(msg_type, msg_seq, body, self.max_fragment()) {
             self.emit_protected_handshake(frag)?;
         }
+        Ok(())
+    }
+
+    /// A NewSessionTicket from the (authenticated) server, RFC 8446 §4.6.1:
+    /// derives the ticket's PSK from `resumption_master_secret` under the
+    /// `"dtls13"` prefix (RFC 9147 §5.9) and keeps the newest session for
+    /// [`Self::take_session`]. The record was ACKed on the way in (the
+    /// server retransmits the ticket until it is, RFC 9147 §5.8.4).
+    fn on_new_session_ticket(&mut self, nst: NewSessionTicket) -> Result<(), Error> {
+        // RFC 8446 §4.6.1: the lifetime is capped at seven days; zero
+        // means the ticket must be discarded at once.
+        const MAX_LIFETIME: u32 = 7 * 24 * 60 * 60;
+        if nst.ticket_lifetime > MAX_LIFETIME {
+            return Err(Error::Decode);
+        }
+        let mut max_early_data_size = None;
+        for (ty, body) in &nst.extensions {
+            if *ty == ExtensionType::EARLY_DATA {
+                if body.len() != 4 {
+                    return Err(Error::Decode);
+                }
+                max_early_data_size =
+                    Some(u32::from_be_bytes([body[0], body[1], body[2], body[3]]));
+            }
+        }
+        // A ticket too large to fit a later ClientHello is useless for
+        // resumption (see `MAX_DTLS_SESSION_TICKET_LEN`).
+        if nst.ticket_lifetime == 0 || nst.ticket.len() > MAX_DTLS_SESSION_TICKET_LEN {
+            return Ok(());
+        }
+        let (Some(rms), Some(suite)) = (self.rms.as_ref(), self.suite) else {
+            return Ok(());
+        };
+        let hash_len = suite.hash.output_len();
+        let mut psk = crate::zeroize::Zeroizing::new(alloc::vec![0u8; hash_len]);
+        psk_from_resumption_with(
+            LabelPrefix::Dtls13,
+            suite.hash,
+            rms,
+            &nst.ticket_nonce,
+            &mut psk,
+        );
+        // The engine's own clock, else the handshake start, else 0: a
+        // clock-less client reports an age of 0 and is refused 0-RTT but
+        // still resumes (the server bounds the ticket's lifetime itself).
+        let received_at = ticket_now(self.config.verification_time.as_ref())
+            .or(self.handshake_start)
+            .unwrap_or(0);
+        self.stored_session = Some(StoredSession {
+            server_name: self.config.server_name.clone().unwrap_or_default(),
+            ticket: nst.ticket,
+            psk,
+            age_add: nst.ticket_age_add,
+            lifetime_seconds: nst.ticket_lifetime,
+            received_at: Time::from_unix(received_at),
+            max_early_data_size,
+            negotiated_alpn: self.alpn_negotiated.clone(),
+            verify_certificates: self.config.verify_certificates,
+            cipher_suite_hash: suite.hash,
+            cipher_suite: suite.suite.0,
+        });
         Ok(())
     }
 
@@ -1610,6 +1906,21 @@ impl DtlsClientConnection13 {
             self.config.connection_id.as_deref(),
             ext::find(&sh.extensions, ExtensionType::CONNECTION_ID),
         )?;
+        // PSK acceptance (RFC 8446 §4.2.11): the ServerHello echoes
+        // `pre_shared_key` with the index of the one identity we offered,
+        // and the selected suite must carry the PSK's hash. Decided before
+        // the key agreement so a rejected hello commits nothing.
+        let psk_selected = match ext::find(&sh.extensions, ExtensionType::PRE_SHARED_KEY) {
+            Some(psk_body) => {
+                let idx = ext::parse_server_pre_shared_key(psk_body)?;
+                let offered = self.psk_offered.as_ref().ok_or(Error::IllegalParameter)?;
+                if idx != 0 || suite.hash != offered.hash {
+                    return Err(Error::IllegalParameter);
+                }
+                true
+            }
+            None => false,
+        };
         let mut shared = self.key_agreement(group, &server_pub)?;
         // Only commit the ServerHello's choices once every check and the key
         // agreement have succeeded: this is unauthenticated epoch-0 input,
@@ -1622,14 +1933,32 @@ impl DtlsClientConnection13 {
         self.cid = cid.map(|(local, peer)| {
             CidState::negotiated(local, peer, core::mem::take(&mut self.cid_pool))
         });
+        self.psk_accepted = psk_selected;
+        // The early-data write key served its purpose: nothing may be
+        // written under epoch 1 once the server has answered (RFC 9147
+        // §5.6). A server that did not take the PSK, or picked another
+        // suite than the ticket's, has skipped those records (RFC 8446
+        // §4.2.10) and cannot accept them below.
+        let early_suite = self.early_write.take().map(|w| w.suite.suite);
+        if !psk_selected || early_suite != Some(suite.suite) {
+            self.early_data_offered = false;
+        }
 
         // Commit the transcript to the negotiated hash (suite hash is fixed
         // by the ServerHello, RFC 8446 §4.4.1) and append SH.
         self.transcript.set_alg(suite.hash);
         self.transcript.update(raw);
 
-        // Derive handshake traffic secrets.
-        let mut ks = KeySchedule::new_with(LabelPrefix::Dtls13, suite.hash);
+        // Derive handshake traffic secrets. A resumed handshake seeds the
+        // schedule with the PSK instead of zeros (RFC 8446 §7.1); the
+        // offered PSK is consumed either way.
+        let offer = self.psk_offered.take();
+        let mut ks = match (psk_selected, offer) {
+            (true, Some(offer)) => {
+                KeySchedule::with_psk_prefixed(LabelPrefix::Dtls13, suite.hash, &offer.psk)
+            }
+            _ => KeySchedule::new_with(LabelPrefix::Dtls13, suite.hash),
+        };
         ks.enter_handshake(&shared);
         // The (EC)DHE / KEM shared secret is absorbed into the key
         // schedule; scrub the heap copy (DTLS-L7).
@@ -1747,6 +2076,13 @@ impl DtlsClientConnection13 {
         self.transcript.update(raw);
 
         self.hrr_processed = true;
+        // RFC 8446 §4.2.10: a server that sends a HelloRetryRequest rejects
+        // the early data, and the retry hello MUST NOT offer any: drop the
+        // epoch-1 write key. The PSK is offered again, with its binder
+        // recomputed over the HRR-inclusive transcript (§4.2.11.2) by
+        // `build_client_hello`.
+        self.early_data_offered = false;
+        self.early_write = None;
         // Re-arm the retransmit cycle for the new flight (drop any leftover
         // in-flight state from the prior CH).
         self.retransmit = Retransmit13::new();
@@ -1838,7 +2174,8 @@ impl DtlsClientConnection13 {
         if msg_type != hs_type::ENCRYPTED_EXTENSIONS {
             return Err(Error::UnexpectedMessage);
         }
-        // Parse for ALPN; ignore the rest.
+        // Parse for ALPN and `early_data`; ignore the rest.
+        let mut early_data_in_ee = false;
         if raw.len() >= 4 {
             let body = &raw[4..];
             let mut c = ReadCursor::new(body);
@@ -1856,11 +2193,31 @@ impl DtlsClientConnection13 {
                         return Err(Error::IllegalParameter);
                     }
                     self.alpn_negotiated = Some(names.into_iter().next().unwrap());
+                } else if ty == ExtensionType::EARLY_DATA.0 {
+                    // RFC 8446 §4.2.10: an empty `early_data` here means the
+                    // server accepted our 0-RTT. Only meaningful when we
+                    // offered it and the server took the PSK under the
+                    // ticket's suite (`early_data_offered` is cleared
+                    // otherwise): anything else is a server claiming to
+                    // read data we never keyed that way.
+                    if !ext_body.is_empty() || !self.early_data_offered || !self.psk_accepted {
+                        return Err(Error::IllegalParameter);
+                    }
+                    early_data_in_ee = true;
                 }
             }
         }
+        self.early_data_accepted = early_data_in_ee;
+        // The 0-RTT offer is settled either way; no more early data.
+        self.early_data_offered = false;
         self.transcript.update(raw);
-        self.state = State::WaitCertificate;
+        // RFC 8446 §2.2: a resumed handshake carries no Certificate /
+        // CertificateVerify — the server's Finished comes next.
+        self.state = if self.psk_accepted {
+            State::WaitFinished
+        } else {
+            State::WaitCertificate
+        };
         Ok(())
     }
 
@@ -2157,6 +2514,15 @@ impl DtlsClientConnection13 {
         );
         let fin_body = verify_data.as_slice().to_vec();
         self.emit_final_flight_message(hs_type::FINISHED, &fin_body)?;
+        // `resumption_master_secret` over Hash(CH..client Finished) (RFC
+        // 8446 §7.1): the PSK of every ticket the server sends later is
+        // expanded from it. That is the last transcript hash needed; seal
+        // the transcript so post-handshake messages cannot grow it.
+        let th_rms = self.transcript.current_hash();
+        if let Some(ks) = self.ks.as_ref() {
+            self.rms = Some(ks.resumption_master_secret(th_rms.as_slice()));
+        }
+        self.transcript.seal();
 
         // Swap in application keys. The handshake write context is
         // retired, not dropped: our Finished is still in flight and a
@@ -2284,12 +2650,39 @@ impl DtlsClientConnection13 {
         if let Some(cookie) = self.cookie_extension.as_ref() {
             extensions.insert(0, (ExtensionType(EXT_COOKIE), cookie.clone()));
         }
+        // RFC 8446 §4.2.9: `psk_key_exchange_modes` names the resumption
+        // modes this client can use for the tickets it is about to be
+        // issued; a server MUST NOT issue tickets to a client that sent
+        // none, so it goes on every hello (`psk_dhe_ke` only).
+        extensions.push(ext::psk_key_exchange_modes(&[1]));
+        // Resuming: `early_data` (only on the first hello and only when
+        // 0-RTT is actually offered, §4.2.10), then `pre_shared_key`, which
+        // MUST be the last extension (§4.2.11) — its binder is computed over
+        // the hello up to itself and patched in below.
+        let mut binder: Option<(HashAlg, crate::zeroize::Zeroizing<Vec<u8>>, usize)> = None;
+        if let (Some(session), Some(offer)) =
+            (self.config.session.as_ref(), self.psk_offered.as_ref())
+        {
+            if self.early_data_offered && !self.hrr_processed {
+                extensions.push(ext::early_data_empty());
+            }
+            let age = obfuscated_age(session, self.handshake_start);
+            let hash_len = offer.hash.output_len();
+            // The ticket length was bounded when the session was adopted
+            // (`usable_session13`), so the placeholder cannot overflow.
+            if let Ok((psk_ext, binders_len)) =
+                ext::client_pre_shared_key_placeholder(&[(session.ticket.clone(), age, hash_len)])
+            {
+                extensions.push(psk_ext);
+                binder = Some((offer.hash, offer.psk.clone(), binders_len));
+            }
+        }
 
         // RFC 9147 §5.3: `legacy_version` is the DTLS 1.2 codepoint
         // `0xfefd`; the DTLS-shaped body carries an (always empty in DTLS
         // 1.3) `legacy_cookie` field — the HelloRetryRequest cookie rides in
         // the `cookie` extension pushed above, never here.
-        let ch = ClientHello {
+        let mut ch = ClientHello {
             legacy_version: ProtocolVersion::DTLSv1_2.as_u16(),
             random: self.client_random,
             session_id: Vec::new(),
@@ -2298,6 +2691,21 @@ impl DtlsClientConnection13 {
             extensions,
         }
         .encode_dtls(&[]);
+        // RFC 8446 §4.2.11.2: the binder is an HMAC over the transcript up
+        // to the truncated hello — on the retry hello that transcript
+        // starts with `message_hash(CH1) ‖ HelloRetryRequest`, which is
+        // exactly what the transcript buffer holds at this point; on the
+        // first hello it is empty. Computed under the `"dtls13"` prefix
+        // (RFC 9147 §5.9), over the DTLS-shaped hello (§5.2).
+        if let Some((hash, psk, binders_len)) = binder {
+            patch_binder13(
+                &mut ch,
+                binders_len,
+                hash,
+                &psk,
+                self.transcript.buffered_bytes(),
+            );
+        }
 
         // Transcript: the 4-byte TLS handshake header + the DTLS-shaped body
         // (RFC 9147 §5.2 — only the DTLS fragment fields are excluded).

@@ -132,6 +132,7 @@ pub(crate) mod reliability13;
 pub(crate) mod replay;
 pub mod server12;
 pub mod server13;
+pub(crate) mod ticket;
 
 pub use cid::{MAX_LOCAL_CID_LEN, peek_connection_id};
 pub(crate) use client12::ClientConfig12Internal;

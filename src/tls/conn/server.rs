@@ -154,7 +154,7 @@ impl ReplayWindow {
     /// the connection may accept 0-RTT; `false` indicates a replay — or a
     /// window full of live binders, in which case 0-RTT is refused (fail
     /// closed) rather than a live binder evicted.
-    fn check_and_insert(&self, binder: &[u8]) -> bool {
+    pub(crate) fn check_and_insert(&self, binder: &[u8]) -> bool {
         self.check_and_insert_at(binder, std::time::Instant::now())
     }
 
@@ -3734,7 +3734,6 @@ impl<R: RngCore> ServerConnection<R> {
         // authenticated to an mTLS-required listener and (b) restore
         // `peer_certificates()`.
         let alpn = self.alpn_negotiated.as_ref();
-        let alpn_len = alpn.map(|a| a.len()).unwrap_or(0) as u8;
         let client_leaf = self.client_cert_chain.first();
         // When the client was authenticated, when was its leaf actually
         // verified? On a full handshake: now. On a PSK-resumed handshake the
@@ -3748,57 +3747,24 @@ impl<R: RngCore> ServerConnection<R> {
         } else {
             creation
         };
-        let mut plain = Vec::with_capacity(
-            1 + 8
-                + 4
-                + 2
-                + 1
-                + hash_len
-                + 1
-                + alpn_len as usize
-                + 1
-                + 2
-                + client_leaf.map(|c| c.len()).unwrap_or(0)
-                + 8,
-        );
-        plain.push(TICKET13_FORMAT_AUTH);
-        plain.extend_from_slice(&creation.to_be_bytes());
-        plain.extend_from_slice(&age_add_bytes);
         // RFC 8446 §4.6.1: 0-RTT runs under the suite the ticket was issued
         // with; record it so a resumed handshake that lands on a different
         // suite can still resume but never accepts early data.
-        plain.extend_from_slice(&suite.suite.0.to_be_bytes());
-        plain.push(hash_len as u8);
-        plain.extend_from_slice(&psk);
-        plain.push(alpn_len);
-        if let Some(a) = alpn {
-            plain.extend_from_slice(a);
-        }
-        match client_leaf {
-            Some(leaf) if leaf.len() <= u16::MAX as usize => {
-                plain.push(1);
-                plain.extend_from_slice(&(leaf.len() as u16).to_be_bytes());
-                plain.extend_from_slice(leaf);
-                plain.extend_from_slice(&client_auth_secs.to_be_bytes());
-            }
-            _ => plain.push(0),
-        }
-
+        let plain = TicketPlaintext {
+            psk,
+            alpn: alpn.cloned().unwrap_or_default(),
+            creation_secs: creation,
+            age_add: ticket_age_add,
+            suite: Some(suite.suite),
+            client_leaf: client_leaf.cloned(),
+            client_auth_secs,
+            peer_addr: None,
+        };
         // Encrypt: 12-byte GCM nonce ‖ AES-256-GCM(plain) ‖ 16-byte tag,
-        // bound to the TLS 1.3 ticket AAD.
-        let mut nonce = [0u8; 12];
-        self.rng.fill_bytes(&mut nonce);
-        let gcm = Gcm::new(Aes256::new(&key));
-        let mut buf = plain;
-        let tag = gcm.encrypt(&nonce, TICKET13_AAD, &mut buf);
-        // `buf` is ciphertext now; the PSK copy lives on in `psk`, which is
-        // dropped at the end of this function — scrub it explicitly.
-        super::wipe(&mut psk);
-
-        let mut ticket = Vec::with_capacity(12 + buf.len() + 16);
-        ticket.extend_from_slice(&nonce);
-        ticket.extend_from_slice(&buf);
-        ticket.extend_from_slice(&tag);
+        // bound to the TLS 1.3 ticket AAD. (`plain` and its PSK are wiped
+        // on drop, and `seal_ticket13` scrubs the serialised copy.)
+        let ticket = seal_ticket13(&mut self.rng, &key, TICKET13_AAD, &plain);
+        drop(plain);
 
         let mut extensions = Vec::new();
         if self.config.max_early_data_size > 0 {
@@ -4265,6 +4231,7 @@ impl<R: RngCore> ServerConnection<R> {
                 suite,
                 client_leaf,
                 client_auth_secs,
+                peer_addr: _,
             } = decrypted;
             let hash = match psk.len() {
                 32 => HashAlg::Sha256,
@@ -4332,6 +4299,14 @@ const TICKET13_FORMAT_SUITE: u8 = 0x14;
 /// leaf would be re-stamped with each ticket's fresh `creation_time` and the
 /// chain of resumptions would never re-check the identity again.
 const TICKET13_FORMAT_AUTH: u8 = 0x15;
+/// Like [`TICKET13_FORMAT_AUTH`] plus, at the very end, the transport
+/// address the ticket was issued to (`peer_addr_len u8 ‖ peer_addr`). Only
+/// the DTLS 1.3 server mints this layout: RFC 9147 §5.1 lets a server skip
+/// the cookie exchange on resumption "when the IP address matches one
+/// associated with the PSK", and the address recorded here is what that
+/// match is made against. The TLS engines never record an address (a TLS
+/// ticket never opens at a DTLS server anyway — the AADs differ).
+pub(crate) const TICKET13_FORMAT_ADDR: u8 = 0x16;
 
 /// Decoded ticket payload: the original PSK plus the ALPN protocol that was
 /// negotiated on the connection that issued the ticket (empty when none was),
@@ -4356,28 +4331,134 @@ const TICKET13_FORMAT_AUTH: u8 = 0x15;
 /// leaf_len        u16     // present iff client_auth == 1
 /// leaf            leaf_len bytes (DER)
 /// client_auth_time u64    // present iff client_auth == 1 and
-///                         // format == TICKET13_FORMAT_AUTH; unix seconds of
+///                         // format >= TICKET13_FORMAT_AUTH; unix seconds of
 ///                         // the full handshake that verified `leaf`
+/// peer_addr_len   u8      // present iff format == TICKET13_FORMAT_ADDR
+/// peer_addr       peer_addr_len bytes (DTLS: the client's transport address)
 /// ```
-struct TicketPlaintext {
+///
+/// Shared with the DTLS 1.3 server, which seals the same layout under its
+/// own associated data (`dtls::ticket::TICKET_DTLS13_AAD`).
+pub(crate) struct TicketPlaintext {
     /// The resumption PSK the ticket carries, wiped on drop.
-    psk: crate::zeroize::Zeroizing<Vec<u8>>,
-    alpn: Vec<u8>,
-    creation_secs: u64,
-    age_add: u32,
+    pub(crate) psk: crate::zeroize::Zeroizing<Vec<u8>>,
+    pub(crate) alpn: Vec<u8>,
+    pub(crate) creation_secs: u64,
+    pub(crate) age_add: u32,
     /// The cipher suite of the handshake that issued this ticket. `None` for
     /// a legacy (`TICKET13_FORMAT`) ticket, which still resumes but is never
     /// eligible for 0-RTT — early data is keyed under the issuing suite and
     /// we cannot tell what it was.
-    suite: Option<CipherSuite>,
-    client_leaf: Option<Vec<u8>>,
+    pub(crate) suite: Option<CipherSuite>,
+    pub(crate) client_leaf: Option<Vec<u8>>,
     /// When `client_leaf` is `Some`: the unix time of the full handshake that
     /// verified it — carried unchanged across every ticket issued down a
     /// chain of resumptions, so the whole chain expires `ticket_lifetime`
     /// after that one verification. Older formats did not record it and are
     /// treated as authenticated at `creation_secs`. Meaningless (and equal
     /// to `creation_secs`) without a leaf.
-    client_auth_secs: u64,
+    pub(crate) client_auth_secs: u64,
+    /// The transport address the ticket was issued to, when the issuing
+    /// engine records one (see [`TICKET13_FORMAT_ADDR`]).
+    pub(crate) peer_addr: Option<Vec<u8>>,
+}
+
+impl TicketPlaintext {
+    /// Serialises the layout documented on the type, in the newest format
+    /// the fields call for: [`TICKET13_FORMAT_ADDR`] when an address is
+    /// recorded, [`TICKET13_FORMAT_AUTH`] otherwise. A leaf, an ALPN name
+    /// or an address too long for its length field is left out (the ticket
+    /// then records no identity / protocol / address, which only ever
+    /// narrows what it can be used for). The returned buffer holds the PSK
+    /// and wipes itself on drop.
+    pub(crate) fn encode(&self) -> crate::zeroize::Zeroizing<Vec<u8>> {
+        let leaf = self
+            .client_leaf
+            .as_deref()
+            .filter(|l| l.len() <= u16::MAX as usize);
+        let addr = self
+            .peer_addr
+            .as_deref()
+            .filter(|a| a.len() <= u8::MAX as usize);
+        let alpn: &[u8] = if self.alpn.len() <= u8::MAX as usize {
+            &self.alpn
+        } else {
+            &[]
+        };
+        // Every ticket this crate issues carries a hash-sized PSK (32 / 48).
+        let psk = &self.psk[..self.psk.len().min(u8::MAX as usize)];
+        let mut plain = crate::zeroize::Zeroizing::new(Vec::with_capacity(
+            1 + 8
+                + 4
+                + 2
+                + 1
+                + psk.len()
+                + 1
+                + alpn.len()
+                + 1
+                + 2
+                + leaf.map_or(0, |l| l.len())
+                + 8
+                + 1
+                + addr.map_or(0, |a| a.len()),
+        ));
+        plain.push(if addr.is_some() {
+            TICKET13_FORMAT_ADDR
+        } else {
+            TICKET13_FORMAT_AUTH
+        });
+        plain.extend_from_slice(&self.creation_secs.to_be_bytes());
+        plain.extend_from_slice(&self.age_add.to_be_bytes());
+        plain.extend_from_slice(&self.suite.map(|s| s.0).unwrap_or(0).to_be_bytes());
+        plain.push(psk.len() as u8);
+        plain.extend_from_slice(psk);
+        plain.push(alpn.len() as u8);
+        plain.extend_from_slice(alpn);
+        match leaf {
+            Some(leaf) => {
+                plain.push(1);
+                plain.extend_from_slice(&(leaf.len() as u16).to_be_bytes());
+                plain.extend_from_slice(leaf);
+                plain.extend_from_slice(&self.client_auth_secs.to_be_bytes());
+            }
+            None => plain.push(0),
+        }
+        if let Some(addr) = addr {
+            plain.push(addr.len() as u8);
+            plain.extend_from_slice(addr);
+        }
+        plain
+    }
+}
+
+/// Seals a ticket plaintext under `key`: `nonce(12) ‖ AES-256-GCM(key,
+/// nonce, plain) ‖ tag(16)`, bound to `aad` — the protocol's own associated
+/// data ([`TICKET13_AAD`] for TLS 1.3, the DTLS 1.3 server's for DTLS), so
+/// a ticket minted by one engine never opens at the other even though
+/// `Config::ticket_key` feeds both. The serialised plaintext (which holds
+/// the PSK) wipes itself on the way out.
+///
+/// Random 96-bit nonces bound the key's lifetime: the caller must rotate
+/// `key` well before 2^32 tickets have been sealed under it (NIST SP
+/// 800-38D §8.3).
+pub(crate) fn seal_ticket13<R: RngCore>(
+    rng: &mut R,
+    key: &[u8; 32],
+    aad: &[u8],
+    plain: &TicketPlaintext,
+) -> Vec<u8> {
+    let mut nonce = [0u8; 12];
+    rng.fill_bytes(&mut nonce);
+    let gcm = Gcm::new(Aes256::new(key));
+    // Plaintext until `encrypt` overwrites it in place; `Zeroizing` covers
+    // the copy that `Vec` growth may have left behind.
+    let mut buf = plain.encode();
+    let tag = gcm.encrypt(&nonce, aad, &mut buf);
+    let mut ticket = Vec::with_capacity(12 + buf.len() + 16);
+    ticket.extend_from_slice(&nonce);
+    ticket.extend_from_slice(&buf);
+    ticket.extend_from_slice(&tag);
+    ticket
 }
 
 /// Decrypts a ticket bound to `key`. The wire layout is `nonce(12) ‖
@@ -4404,6 +4485,19 @@ fn decrypt_ticket(
     now_secs: u64,
     ticket_lifetime_secs: u32,
 ) -> Option<TicketPlaintext> {
+    open_ticket13(key, TICKET13_AAD, ticket, now_secs, ticket_lifetime_secs)
+}
+
+/// [`decrypt_ticket`] under an explicit associated-data string: the DTLS
+/// 1.3 server opens its tickets with this, under its own AAD. Every check
+/// documented there applies unchanged.
+pub(crate) fn open_ticket13(
+    key: &[u8; 32],
+    aad: &[u8],
+    ticket: &[u8],
+    now_secs: u64,
+    ticket_lifetime_secs: u32,
+) -> Option<TicketPlaintext> {
     if ticket.len() < 12 + 16 {
         return None;
     }
@@ -4416,7 +4510,7 @@ fn decrypt_ticket(
     // decrypted PSK sitting in this buffer.
     let mut buf = crate::zeroize::Zeroizing::new(ct.to_vec());
     let gcm = Gcm::new(Aes256::new(key));
-    if gcm.decrypt(nonce, TICKET13_AAD, &mut buf, tag).is_err() {
+    if gcm.decrypt(nonce, aad, &mut buf, tag).is_err() {
         return None;
     }
     // Parse the plaintext (layout on `TicketPlaintext`).
@@ -4425,6 +4519,7 @@ fn decrypt_ticket(
     if format != TICKET13_FORMAT
         && format != TICKET13_FORMAT_SUITE
         && format != TICKET13_FORMAT_AUTH
+        && format != TICKET13_FORMAT_ADDR
     {
         return None;
     }
@@ -4466,10 +4561,15 @@ fn decrypt_ticket(
         _ => return None,
     };
     let client_auth_secs = match (&client_leaf, format) {
-        (Some(_), TICKET13_FORMAT_AUTH) => c.u64().ok()?,
+        (Some(_), TICKET13_FORMAT_AUTH | TICKET13_FORMAT_ADDR) => c.u64().ok()?,
         // Older formats stamped no authentication time: they were only
         // ever issued by a full handshake at `creation_secs`.
         _ => creation_secs,
+    };
+    let peer_addr = if format == TICKET13_FORMAT_ADDR {
+        Some(c.vec_u8().ok()?.to_vec())
+    } else {
+        None
     };
     c.expect_empty().ok()?;
     if client_leaf.is_some() {
@@ -4497,6 +4597,7 @@ fn decrypt_ticket(
         suite,
         client_leaf,
         client_auth_secs,
+        peer_addr,
     })
 }
 

@@ -830,7 +830,7 @@ pub(crate) fn parse_certificate_request_13(body: &[u8]) -> Result<CertificateReq
 ///   exactly as an X.509 leaf is accepted in that mode.
 ///
 /// Errors with [`Error::BadCertificate`].
-pub(super) fn check_raw_public_key(
+pub(crate) fn check_raw_public_key(
     verify_certificates: bool,
     allowlist: &[Vec<u8>],
     spki: &[u8],

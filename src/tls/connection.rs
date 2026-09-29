@@ -129,6 +129,12 @@ pub struct ResumptionSession(ResumptionSessionKind);
 enum ResumptionSessionKind {
     Tls13(super::conn::StoredSession),
     Tls12(super::conn::StoredSession12),
+    /// A DTLS 1.3 session. Its `StoredSession` shape is the TLS 1.3 one,
+    /// but the variant keeps it single-protocol: a DTLS session offered to
+    /// a TLS client (or the reverse) is ignored, not misused (RFC 9147
+    /// §5.9 — the keys would differ anyway).
+    #[cfg(feature = "dtls")]
+    Dtls13(super::conn::StoredSession),
 }
 
 /// A unified TLS or DTLS connection (client or server, any supported
@@ -1027,6 +1033,8 @@ impl Connection {
         Ok(match &mut self.inner {
             Engine::ServerTls13(c) => c.take_early_data(),
             Engine::ServerTlsAuto(c) => c.take_early_data(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.take_early_data(),
             // No other engine accepts 0-RTT early data today.
             _ => Vec::new(),
         })
@@ -1076,6 +1084,8 @@ impl Connection {
         match &mut self.inner {
             Engine::ClientTls13(c) => c.write_early_data(data),
             Engine::ClientTlsAuto(c) => c.write_early_data(data),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.write_early_data(data),
             _ => Err(Error::InappropriateState),
         }
     }
@@ -1094,6 +1104,10 @@ impl Connection {
                 .take_session()
                 .map(|s| ResumptionSession(ResumptionSessionKind::Tls12(s))),
             Engine::ClientTlsAuto(c) => c.take_session(),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c
+                .take_session()
+                .map(|s| ResumptionSession(ResumptionSessionKind::Dtls13(s))),
             _ => None,
         }
     }
@@ -1534,7 +1548,13 @@ impl Connection {
         } else if let Some(c) = self.tls12_server() {
             c.did_resume()
         } else {
-            false
+            match &self.inner {
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls13(c) => c.psk_accepted(),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls13(c) => c.psk_used(),
+                _ => false,
+            }
         }
     }
 
@@ -1548,7 +1568,13 @@ impl Connection {
         } else if let Some(c) = self.tls13_server() {
             c.early_data_accepted()
         } else {
-            false
+            match &self.inner {
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls13(c) => c.early_data_accepted(),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls13(c) => c.early_data_accepted(),
+                _ => false,
+            }
         }
     }
 
@@ -1562,7 +1588,13 @@ impl Connection {
         } else if let Some(c) = self.tls13_server() {
             c.early_data_offered()
         } else {
-            false
+            match &self.inner {
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls13(c) => c.early_data_offered(),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls13(c) => c.early_data_offered(),
+                _ => false,
+            }
         }
     }
 
@@ -2687,6 +2719,8 @@ struct DtlsClientOpts<'a> {
     key_exchange_groups: Option<&'a [NamedGroup]>,
     key_shares: Option<&'a [NamedGroup]>,
     connection_id: Option<Vec<u8>>,
+    resumption: &'a Option<ResumptionSession>,
+    psk_modes: &'a [super::psk::PskKeyExchangeMode],
 }
 
 /// Takes `cfg` apart for a DTLS client and refuses, with
@@ -2746,13 +2780,14 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     } = parts.dtls;
     // Inert on a DTLS client: the version pair chose the engine; the cookie
     // knobs and the peer address are server-side; `rng` is drawn through
-    // `config_rng` and `signer` through `Connection::drive`; a stored session
-    // is always a TLS one (the DTLS servers issue no tickets), so
-    // `resumption` never matches — the documented "wrong version is ignored"
-    // rule. RFC 8879 certificate compression is not implemented over DTLS:
-    // the advertisement is not sent, and the peer's certificate arrives
-    // uncompressed.
-    // The DTLS engines offer no PSK, so there is no mode to restrict.
+    // `config_rng` and `signer` through `Connection::drive` (a signer without
+    // an identity is impossible — `ConfigBuilder::private_key` sets both, and
+    // an identity is refused below); a DTLS 1.3 session resumes by PSK
+    // (`resumption`, forwarded below and matched to the `Dtls13` variant in
+    // `build_dtls13_client`, which also honours `psk_modes`: the DTLS 1.3
+    // engine resumes with `psk_dhe_ke` only). RFC 8879 certificate
+    // compression is not implemented over DTLS: the advertisement is not
+    // sent, and the peer's certificate arrives uncompressed.
     let _ = (
         min_version,
         max_version,
@@ -2762,8 +2797,6 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         peer_address,
         rng,
         signer,
-        resumption,
-        psk_modes,
     );
     #[cfg(feature = "cert-compression")]
     let _ = (cert_compression_algorithms, own_cert_compression_algorithms);
@@ -2807,6 +2840,8 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         key_exchange_groups,
         key_shares,
         connection_id,
+        resumption,
+        psk_modes,
     })
 }
 
@@ -2917,10 +2952,14 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         key_exchange_groups,
         key_shares,
         connection_id,
+        resumption,
+        psk_modes,
     } = dtls_client_opts(cfg)?;
     // DTLS 1.2 fragments handshake records at a fixed 1100 bytes (see
-    // `Config::max_record_size`) and has no key shares.
-    let _ = (max_record_size, key_shares);
+    // `Config::max_record_size`) and has no key shares. RFC 5077 ticket
+    // resumption over DTLS 1.2 lands in a later commit; a session offered
+    // meanwhile is ignored (the "wrong version is inert" rule).
+    let _ = (max_record_size, key_shares, resumption, psk_modes);
 
     let mut dc = crate::dtls::ClientConfig12Internal::new(roots.clone_store(), server_name)
         .with_require_ems(require_extended_master_secret)
@@ -2976,6 +3015,8 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         key_exchange_groups,
         key_shares,
         connection_id,
+        resumption,
+        psk_modes,
     } = dtls_client_opts(cfg)?;
     // EMS is a TLS 1.2 mechanism (DTLS 1.3 binds every secret to the
     // transcript).
@@ -3007,6 +3048,16 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     dc.max_record_size = max_record_size;
     dc.key_log = key_log.clone();
     dc.connection_id = connection_id;
+    // RFC 8446 §2.2 PSK resumption from a stored DTLS 1.3 session. The
+    // variant keeps sessions single-protocol: a TLS or DTLS 1.2 session
+    // offered here is ignored (its keys would not match — RFC 9147 §5.9).
+    // `psk_modes` (RFC 8446 §4.2.9): the DTLS 1.3 engine resumes with
+    // `psk_dhe_ke` only, so a configuration that excludes it offers none.
+    if let Some(ResumptionSession(ResumptionSessionKind::Dtls13(s))) = resumption
+        && psk_modes.contains(&super::psk::PskKeyExchangeMode::PskDheKe)
+    {
+        dc.session = Some(s.clone());
+    }
     Ok(crate::dtls::DtlsClientConnection13::new(
         dc,
         Vec::new(),
@@ -3033,6 +3084,12 @@ struct DtlsServerOpts<'a> {
     max_record_size: usize,
     key_exchange_groups: Option<&'a [NamedGroup]>,
     connection_id: Option<Vec<u8>>,
+    /// RFC 8446 §4.6.1 ticket key, forwarded to the DTLS 1.3 server (the
+    /// DTLS 1.2 server resumes by RFC 5077 ticket in a later commit).
+    ticket_key: Option<&'a super::secret::Secret32>,
+    max_early_data_size: u32,
+    #[cfg(feature = "std")]
+    replay_window: Option<&'a super::conn::ReplayWindow>,
 }
 
 /// Takes `cfg` apart for a DTLS server, failing closed on what the DTLS
@@ -3098,13 +3155,14 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     } = parts.dtls;
     // Inert on a DTLS server (see the `Config` docs): the version pair chose
     // the engine; a server's trust anchors for mTLS come from `client_auth`,
-    // not `roots`; the DTLS servers issue no session tickets, accept no
-    // 0-RTT (so `max_early_data_size` and the replay window have nothing to
-    // guard), staple nothing, do not compress certificates, take no
-    // `preferred_key_exchange_group` (`key_exchange_groups` orders the
-    // accept-set instead) and pick the cipher suite from their own fixed
-    // order. `rng` is drawn through `config_rng` and `signer` through
-    // `Connection::drive`.
+    // not `roots`; the DTLS 1.3 server issues RFC 8446 §4.6.1 tickets and
+    // accepts 0-RTT (so `ticket_key`, `max_early_data_size` and
+    // `replay_window` are forwarded — the DTLS 1.2 server picks the ticket
+    // key up in a later commit); the servers staple nothing, do not compress
+    // certificates, take no `preferred_key_exchange_group`
+    // (`key_exchange_groups` orders the accept-set instead) and pick the
+    // cipher suite from their own fixed order. `rng` is drawn through
+    // `config_rng` and `signer` through `Connection::drive`.
     let _ = (
         min_version,
         max_version,
@@ -3112,15 +3170,11 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         roots,
         stapled_crl,
         stapled_ocsp_response,
-        ticket_key,
-        max_early_data_size,
         preferred_key_exchange_group,
         rng,
         signer,
         psk_modes,
     );
-    #[cfg(feature = "std")]
-    let _ = replay_window;
     #[cfg(feature = "cert-compression")]
     let _ = (cert_compression_algorithms, own_cert_compression_algorithms);
 
@@ -3163,6 +3217,10 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         max_record_size,
         key_exchange_groups,
         connection_id,
+        ticket_key,
+        max_early_data_size,
+        #[cfg(feature = "std")]
+        replay_window,
     })
 }
 
@@ -3186,9 +3244,17 @@ fn build_dtls12_server(
         max_record_size,
         key_exchange_groups,
         connection_id,
+        ticket_key,
+        max_early_data_size,
+        #[cfg(feature = "std")]
+        replay_window,
     } = dtls_server_opts(cfg)?;
-    // DTLS 1.2 fragments at a fixed 1100 bytes; see the `Config` docs.
-    let _ = max_record_size;
+    // DTLS 1.2 fragments at a fixed 1100 bytes; see the `Config` docs. RFC
+    // 5077 ticket resumption lands in a later commit, so the ticket knobs
+    // are inert here for now.
+    let _ = (max_record_size, ticket_key, max_early_data_size);
+    #[cfg(feature = "std")]
+    let _ = replay_window;
 
     let chain = identity.cert_chain.clone();
     let mut sc = match &identity.key {
@@ -3264,6 +3330,10 @@ fn build_dtls13_server(
         max_record_size,
         key_exchange_groups,
         connection_id,
+        ticket_key,
+        max_early_data_size,
+        #[cfg(feature = "std")]
+        replay_window,
     } = dtls_server_opts(cfg)?;
     // EMS is a TLS 1.2 mechanism; see the `Config` docs.
     let _ = require_extended_master_secret;
@@ -3293,6 +3363,22 @@ fn build_dtls13_server(
     sc.verification_time = verification_time.cloned();
     sc.key_log = key_log.clone();
     sc.connection_id = connection_id;
+    // RFC 8446 §4.6.1 session tickets, RFC 8446 §4.2.10 0-RTT. The ticket
+    // clock is `verification_time` (else the system clock, inside the
+    // engine); without it, no ticket is issued or accepted.
+    if let Some(tk) = ticket_key {
+        sc = sc.with_ticket_key(*tk.as_bytes());
+        if max_early_data_size > 0 {
+            sc = sc.with_max_early_data(max_early_data_size);
+        }
+        #[cfg(feature = "std")]
+        if let Some(rw) = replay_window {
+            sc = sc.with_replay_window(rw.clone());
+        }
+    }
+    if let Some(t) = verification_time {
+        sc = sc.with_verification_time(t.clone());
+    }
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
         peer_address.to_vec(),

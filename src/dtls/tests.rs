@@ -2200,6 +2200,202 @@ mod dtls13 {
         assert_eq!(client.take_received(), b"pong-mlkem");
     }
 
+    /// A server configured with a ticket key, its clock pinned so tickets
+    /// can be issued and expired.
+    fn make_ticket_server13(cookie: bool, max_early: u32) -> (PcServerConfig13, Vec<u8>) {
+        let (mut cfg, cert) = make_server13();
+        cfg = cfg
+            .with_ticket_key([0x5a; 32])
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        cfg = if cookie {
+            cfg.with_cookie_secret([0xa5; 32])
+        } else {
+            cfg.with_no_cookie()
+        };
+        if max_early > 0 {
+            cfg = cfg.with_max_early_data(max_early);
+        }
+        (cfg, cert)
+    }
+
+    /// A first DTLS 1.3 handshake, driven to completion and one extra round
+    /// so the server's NewSessionTicket (a post-handshake flight) reaches
+    /// the client; returns the stored session.
+    fn first_handshake_for_session(
+        server_cfg: PcServerConfig13,
+        cert: &[u8],
+        client_seed: &[u8],
+    ) -> crate::tls::conn::StoredSession {
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.to_vec()).unwrap();
+        let client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        let mut crng = HmacDrbg::<Sha256>::new(client_seed, b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-ticket-srv", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+        // One more round after completion: the client's Finished / ACK
+        // reaches the server, which then emits its NewSessionTicket, and
+        // the client's ACK for that goes back.
+        let mut session = client.take_session();
+        for _ in 0..4 {
+            if session.is_some() {
+                break;
+            }
+            let c_out = client.pop_outbound_datagrams();
+            for dg in &c_out {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for dg in &s_out {
+                client.feed_datagram(dg).unwrap();
+            }
+            session = client.take_session();
+            if c_out.is_empty() && s_out.is_empty() {
+                break;
+            }
+        }
+        session.expect("a NewSessionTicket must arrive")
+    }
+
+    /// RFC 8446 §2.2 PSK resumption over DTLS 1.3 (with the cookie
+    /// exchange): a first handshake yields a ticket; a second offers it and
+    /// the server takes the PSK, skipping Certificate / CertificateVerify.
+    #[test]
+    fn resumption_round_trip() {
+        let (server_cfg, cert) = make_ticket_server13(true, 0);
+        let session = first_handshake_for_session(server_cfg, &cert, b"dtls13-resume-c1");
+
+        let (server_cfg, _) = make_ticket_server13(true, 0);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.session = Some(session);
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-resume-c2", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-resume-s2", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert!(client.psk_accepted(), "client resumed by PSK");
+        assert!(server.psk_used(), "server took the PSK");
+        // A resumed handshake sends no server certificate.
+        assert!(client.peer_certificates().is_empty());
+    }
+
+    /// A session offered to a server whose ticket key differs (a rotated or
+    /// foreign key) falls back to a full handshake: the ticket does not open.
+    #[test]
+    fn resumption_falls_back_on_unknown_ticket_key() {
+        let (server_cfg, cert) = make_ticket_server13(false, 0);
+        let session = first_handshake_for_session(server_cfg, &cert, b"dtls13-fb-c1");
+
+        let (mut server_cfg, _) = make_server13();
+        server_cfg = server_cfg
+            .with_no_cookie()
+            .with_ticket_key([0x11; 32]) // different key
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.session = Some(session);
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-fb-c2", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-fb-s2", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert!(!client.psk_accepted());
+        assert!(!server.psk_used());
+        assert!(!client.peer_certificates().is_empty(), "full handshake");
+    }
+
+    /// RFC 8446 §4.2.10 / RFC 9147 §5.6 0-RTT over DTLS 1.3: with the cookie
+    /// exchange skipped for a same-address resumption (RFC 9147 §5.1), the
+    /// client streams early data in epoch-1 records and the server accepts
+    /// it. `EndOfEarlyData` is never sent (§5.6): the epoch change ends it.
+    #[test]
+    fn zero_rtt_round_trip() {
+        let (server_cfg, cert) = make_ticket_server13(true, 4096);
+        let session = first_handshake_for_session(server_cfg, &cert, b"dtls13-0rtt-c1");
+        assert!(
+            matches!(session.max_early_data_size, Some(n) if n > 0),
+            "the ticket advertised early data"
+        );
+
+        let (server_cfg, _) = make_ticket_server13(true, 4096);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.session = Some(session);
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-0rtt-c2", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        assert!(client.early_data_offered(), "0-RTT offered");
+        client.write_early_data(b"early data over dtls").unwrap();
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-0rtt-s2", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert!(client.psk_accepted());
+        assert!(server.psk_used());
+        assert!(client.early_data_accepted(), "server accepted 0-RTT");
+        assert!(server.early_data_accepted());
+        assert_eq!(server.take_early_data(), b"early data over dtls");
+    }
+
+    /// A resumption that goes through a HelloRetryRequest (a group change)
+    /// still resumes but MUST reject 0-RTT (RFC 8446 §4.2.10): the early
+    /// data is skipped and the client resends it after the handshake.
+    #[test]
+    fn zero_rtt_rejected_after_hrr() {
+        use crate::tls::codec::NamedGroup;
+        let (server_cfg, cert) = make_ticket_server13(true, 4096);
+        let session = first_handshake_for_session(server_cfg, &cert, b"dtls13-0rtthrr-c1");
+
+        // Server prefers X25519MLKEM768; the client shares only P-256, so
+        // even a same-address resumption takes a group-change HRR.
+        let (mut server_cfg, _) = make_server13();
+        server_cfg = server_cfg
+            .with_cookie_secret([0xa5; 32])
+            .with_ticket_key([0x5a; 32])
+            .with_max_early_data(4096)
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.groups = alloc::vec![
+            NamedGroup::X25519MLKEM768,
+            NamedGroup::X25519,
+            NamedGroup::SECP256R1,
+        ];
+        client_cfg.key_share_groups = Some(alloc::vec![NamedGroup::SECP256R1]);
+        client_cfg.session = Some(session);
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-0rtthrr-c2", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let _ = client.write_early_data(b"data that will be rejected");
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-0rtthrr-s2", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert!(client.psk_accepted(), "still resumed");
+        assert!(server.psk_used());
+        assert!(client.hello_retry_request_seen());
+        assert!(!client.early_data_accepted(), "0-RTT refused after HRR");
+        assert!(!server.early_data_accepted());
+        assert!(server.take_early_data().is_empty());
+    }
+
     /// HRR-driven group upgrade (RFC 8446 §4.1.4): client offers all three
     /// groups in `supported_groups` but only sends a `key_share` for
     /// P-256. The server prefers X25519MLKEM768 and issues an HRR

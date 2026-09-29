@@ -48,11 +48,17 @@ pub(crate) use client12::parse_certificate_list_12;
 #[allow(unused_imports)]
 pub(crate) use common::parse_certificate_request_13;
 #[allow(unused_imports)]
-pub(crate) use server::ClientAuthPolicy;
-#[allow(unused_imports)]
 pub(crate) use server::parse_certificate_list as parse_certificate_list_server;
 #[allow(unused_imports)]
 pub(crate) use server12::ClientAuthPolicy12;
+// The ticket formats, shared with the DTLS engines: each seals the same
+// plaintext layout under its own associated data, so a ticket minted for one
+// protocol never opens at another.
+#[cfg(feature = "dtls")]
+pub(crate) use common::check_raw_public_key;
+#[cfg(feature = "dtls")]
+#[allow(unused_imports)]
+pub(crate) use server::{ClientAuthPolicy, TicketPlaintext, open_ticket13, seal_ticket13};
 
 // Fuzz-only re-exports of crate-private decoders; see `tls::fuzz`.
 #[cfg(feature = "__fuzz")]

@@ -21,7 +21,24 @@
 //!    CertificateVerify / Finished).
 //! 4. On the client's Finished — preceded, when a client certificate was
 //!    requested, by its Certificate and CertificateVerify (RFC 8446
-//!    §4.4.2 / §4.4.3) — transitions to the application epoch.
+//!    §4.4.2 / §4.4.3) — transitions to the application epoch,
+//!    and, with a ticket key configured, issues a `NewSessionTicket` (RFC
+//!    8446 §4.6.1) as a post-handshake flight of its own: retransmitted
+//!    until the client ACKs it (RFC 9147 §5.8.4, §7).
+//!
+//! A ClientHello presenting one of those tickets (`pre_shared_key`, RFC
+//! 8446 §4.2.11) resumes the session: the ticket is opened under the DTLS
+//! 1.3 associated data, the binder verified under the `"dtls13"` prefix
+//! over the DTLS transcript (RFC 9147 §5.2, §5.9) — on the cookie-bearing
+//! retry hello over `message_hash(CH1) ‖ HelloRetryRequest ‖ CH2` (RFC
+//! 8446 §4.2.11.2) — and the server flight omits Certificate /
+//! CertificateVerify. The cookie exchange is skipped for a resumption from
+//! the address the ticket was issued to (RFC 9147 §5.1), which is also the
+//! only way 0-RTT can be accepted: a HelloRetryRequest rejects early data
+//! (RFC 8446 §4.2.10). Accepted early data arrives in epoch-1 records (RFC
+//! 9147 §6.1) and is quarantined in its own buffer
+//! ([`DtlsServerConnection13::take_early_data`]); rejected early data is
+//! unreadable and dropped with every other record of an unknown epoch.
 //!
 //! Negotiation surface (matches the TLS 1.3 layer):
 //!
@@ -33,7 +50,7 @@
 //!   ML-DSA-44/65/87 (draft-ietf-tls-mldsa).
 //! - Client certificates (mutual authentication, RFC 8446 §4.3.2): the
 //!   same policy as the TLS 1.3 server (`ClientAuthPolicy`).
-//! - Out of scope: PSK, 0-RTT, Connection ID.
+//! - Out of scope: external PSKs.
 
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
@@ -44,15 +61,15 @@ use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::SignatureScheme;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    CipherSuite, ClientHello, ExtensionType, KeyUpdate, NamedGroup, Random, ReadCursor,
-    ServerHello, hs_type, put_u16, with_len_u16, with_len_u24,
+    CipherSuite, ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket, Random,
+    ReadCursor, ServerHello, hs_type, put_u16, with_len_u16, with_len_u24,
 };
-use crate::tls::conn::ClientAuthPolicy;
+use crate::tls::conn::{ClientAuthPolicy, TicketPlaintext, seal_ticket13};
 use crate::tls::crypto::sign::{sign_certificate_verify, signature_scheme_for};
 use crate::tls::crypto::{
-    HashAlg, KeySchedule, LabelPrefix, RecordCrypter, SuiteParams, Transcript,
+    HashAlg, KeySchedule, LabelPrefix, RecordCrypter, Secret, SuiteParams, Transcript,
     certificate_verify_content, finished_verify_data_with, kex, next_traffic_secret_with,
-    supported_suites, verify_signature,
+    psk_from_resumption_with, supported_suites, verify_signature,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::CrlStore;
@@ -84,6 +101,9 @@ use super::record13::{
     self, header_aad, header_cid, peek_header_layout, reconstruct_seq, sn_mask_for,
 };
 use super::reliability13::{InFlightRecord, Retransmit13};
+use super::ticket::{
+    AcceptedPsk13, PskAcceptContext, TICKET_DTLS13_AAD, seal_key, ticket_now, try_accept_psk13,
+};
 
 /// HelloRetryRequest sentinel `random` value (RFC 8446 §4.1.3).
 const HRR_RANDOM: [u8; 32] = [
@@ -137,10 +157,12 @@ pub(crate) struct ServerConfig13Internal {
     /// CRLs consulted while validating a client's chain. Forwarded from
     /// [`crate::tls::Config::crls`].
     pub crls: CrlStore,
-    /// Clock for the client chain's validity period. `None` uses the
-    /// system clock under `std` and fails closed on `no_std` (see
-    /// [`crate::tls::pki::verify_client_chain`]). Forwarded from
-    /// [`crate::tls::Config::verification_time`].
+    /// Clock for the client chain's validity period and for session
+    /// tickets. `None` uses the system clock under `std`; on `no_std` a
+    /// client chain is then refused (see
+    /// [`crate::tls::pki::verify_client_chain`]) and no ticket is issued or
+    /// accepted (a ticket that cannot expire is a permanent bearer token).
+    /// Forwarded from [`crate::tls::Config::verification_time`].
     pub verification_time: Option<Time>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub key_log: Option<Arc<dyn KeyLog>>,
@@ -170,6 +192,37 @@ pub(crate) struct ServerConfig13Internal {
     /// sends with the client's. At most [`super::cid::MAX_LOCAL_CID_LEN`]
     /// bytes; per connection, never shared across them.
     pub connection_id: Option<Vec<u8>>,
+    /// AES-256-GCM key sealing the RFC 8446 §4.6.1 session tickets this
+    /// server issues (bound to the listener's client-auth configuration
+    /// and the DTLS 1.3 associated data before use, see
+    /// `ticket::seal_key`). `None` (the default) issues no tickets and
+    /// resumes nothing. Forwarded from [`crate::tls::Config::ticket_key`];
+    /// wiped on drop. Rotate it well before 2^32 tickets have been issued
+    /// (NIST SP 800-38D §8.3).
+    pub ticket_key: Option<[u8; 32]>,
+    /// Ticket lifetime advertised to clients and enforced on decrypt, in
+    /// seconds (default 7200, at most 7 days — RFC 8446 §4.6.1).
+    pub ticket_lifetime: u32,
+    /// Largest 0-RTT payload accepted on a resumed connection, in bytes
+    /// (RFC 8446 §4.2.10). `0` (the default) refuses early data. Forwarded
+    /// from [`crate::tls::Config::max_early_data`].
+    pub max_early_data_size: u32,
+    /// Shared anti-replay set for 0-RTT binders (RFC 8446 §8), forwarded
+    /// from [`crate::tls::Config::replay_window`]. Without one, early data
+    /// is only defended by the ticket-age freshness window (§8.2).
+    #[cfg(feature = "std")]
+    pub replay_window: Option<crate::tls::conn::ReplayWindow>,
+}
+
+// The ticket key seals every resumption ticket this server issues: a leak
+// lets an attacker mint tickets and recover their PSKs, so it is scrubbed
+// when the configuration is dropped (as the TLS servers do).
+impl Drop for ServerConfig13Internal {
+    fn drop(&mut self) {
+        if let Some(key) = self.ticket_key.as_mut() {
+            crate::tls::conn::wipe(key);
+        }
+    }
 }
 
 impl ServerConfig13Internal {
@@ -195,6 +248,11 @@ impl ServerConfig13Internal {
             alpn_protocols: Vec::new(),
             groups: supported_server_groups().to_vec(),
             connection_id: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
+            max_early_data_size: 0,
+            #[cfg(feature = "std")]
+            replay_window: None,
         }
     }
 
@@ -207,6 +265,32 @@ impl ServerConfig13Internal {
     /// stays empty. Forwarded from [`crate::tls::Config::client_auth`].
     pub fn with_client_auth(mut self, roots: crate::tls::RootCertStore, required: bool) -> Self {
         self.client_auth = Some(ClientAuthPolicy { roots, required });
+        self
+    }
+
+    /// Enables RFC 8446 §4.6.1 session tickets (see [`Self::ticket_key`]).
+    pub fn with_ticket_key(mut self, key: [u8; 32]) -> Self {
+        self.ticket_key = Some(key);
+        self
+    }
+
+    /// Accepts up to `max` bytes of 0-RTT data on a resumed connection
+    /// (see [`Self::max_early_data_size`]).
+    pub fn with_max_early_data(mut self, max: u32) -> Self {
+        self.max_early_data_size = max;
+        self
+    }
+
+    /// Installs the 0-RTT anti-replay set (see [`Self::replay_window`]).
+    #[cfg(feature = "std")]
+    pub fn with_replay_window(mut self, window: crate::tls::conn::ReplayWindow) -> Self {
+        self.replay_window = Some(window);
+        self
+    }
+
+    /// Sets the ticket clock (see [`Self::verification_time`]).
+    pub fn with_verification_time(mut self, t: Time) -> Self {
+        self.verification_time = Some(t);
         self
     }
 
@@ -433,6 +517,34 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// `NewConnectionId` of ours was still unacknowledged — RFC 9147 §9
     /// allows only one outstanding, so the answer waits for the ACK.
     cid_reply_owed: u8,
+    /// The handshake resumed a session by PSK (RFC 8446 §2.2).
+    psk_used: bool,
+    /// The client offered 0-RTT (`early_data` in its hello), whether or
+    /// not it was accepted.
+    early_data_offered: bool,
+    /// This server accepted the client's 0-RTT (RFC 8446 §4.2.10).
+    early_data_accepted: bool,
+    /// The epoch-1 read keys (RFC 9147 §6.1) while accepted early data may
+    /// still arrive: dropped at the first record under the application
+    /// keys (§5.6). Rejected early data has no keys and is dropped as any
+    /// record of an unreadable epoch.
+    early_read: Option<ReadEpoch>,
+    /// Early-data plaintext bytes still admitted under
+    /// `max_early_data_size` (RFC 8446 §4.2.10).
+    early_data_remaining: u32,
+    /// Accepted early data, quarantined from the 1-RTT plaintext (it is
+    /// replayable, RFC 8446 §8) — see [`Self::take_early_data`].
+    early_in: Vec<u8>,
+    /// `resumption_master_secret` (RFC 8446 §7.1), from the client's
+    /// Finished; seeds every ticket this connection issues.
+    rms: Option<Secret>,
+    /// The client identity a resumed ticket carried, with when it was
+    /// verified (`TicketPlaintext::client_auth_secs`): re-embedded in the
+    /// ticket this connection issues so a chain of resumptions keeps
+    /// expiring from the one real verification. (Populated by resumption
+    /// only until the DTLS servers verify client certificates.)
+    resumed_client_leaf: Option<Vec<u8>>,
+    resumed_client_auth_secs: Option<u64>,
 }
 
 impl<R: RngCore> DtlsServerConnection13<R> {
@@ -514,6 +626,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             clock_driven: false,
             cid: None,
             cid_reply_owed: 0,
+            psk_used: false,
+            early_data_offered: false,
+            early_data_accepted: false,
+            early_read: None,
+            early_data_remaining: 0,
+            early_in: Vec::new(),
+            rms: None,
+            resumed_client_leaf: None,
+            resumed_client_auth_secs: None,
         }
     }
 
@@ -522,10 +643,84 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.state == State::Connected
     }
 
+    /// `true` when the handshake resumed a session by PSK (RFC 8446 §2.2).
+    pub fn psk_used(&self) -> bool {
+        self.psk_used
+    }
+
+    /// `true` when this server accepted the client's 0-RTT early data
+    /// (RFC 8446 §4.2.10); it is read with [`Self::take_early_data`].
+    pub fn early_data_accepted(&self) -> bool {
+        self.early_data_accepted
+    }
+
+    /// `true` when the client offered early data on this connection,
+    /// whether or not it was accepted.
+    pub fn early_data_offered(&self) -> bool {
+        self.early_data_offered
+    }
+
+    /// Drains the accepted 0-RTT plaintext. Early data never reaches
+    /// [`Self::take_received`]: it is replayable (RFC 8446 §8 — the
+    /// anti-replay defences are best effort), so an application decides
+    /// explicitly what to do with it.
+    pub fn take_early_data(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.early_in)
+    }
+
     /// Largest handshake fragment body that keeps every record we emit
     /// within the configured `max_record_size` (RFC 9147 §4.4).
     fn max_fragment(&self) -> usize {
         record::max_fragment_for(self.config.max_record_size)
+    }
+
+    /// The clock used for session tickets (see `ticket::ticket_now`).
+    fn ticket_now(&self) -> Option<u64> {
+        ticket_now(self.config.verification_time.as_ref())
+    }
+
+    /// The effective ticket-sealing key (see `ticket::seal_key`); `None`
+    /// without a ticket key. The DTLS servers verify no client
+    /// certificate yet, so the binding covers "no client auth".
+    fn ticket_seal_key(&self) -> Option<crate::zeroize::Zeroizing<[u8; 32]>> {
+        let key = self.config.ticket_key.as_ref()?;
+        Some(seal_key(
+            key,
+            b"purecrypto dtls13 ticket client-auth binding v1",
+            None,
+        ))
+    }
+
+    /// Whether tickets can be issued and accepted: a key and a clock.
+    fn tickets_available(&self) -> bool {
+        self.config.ticket_key.is_some() && self.ticket_now().is_some()
+    }
+
+    /// Tries to accept a `pre_shared_key` offer from `ch` (the DTLS 1.3
+    /// twin of the TLS server's `try_accept_psk`). `raw` is the TLS-shaped
+    /// ClientHello (the transcript form), `transcript_prefix` the handshake
+    /// transcript before it (empty on a first hello, `message_hash(CH1) ‖
+    /// HelloRetryRequest` on the cookie/HRR retry — RFC 8446 §4.2.11.2). A
+    /// binder mismatch is fatal; `Ok(None)` when nothing usable is offered.
+    fn accept_ticket_psk(
+        &self,
+        ch: &ClientHello,
+        raw: &[u8],
+        transcript_prefix: &[u8],
+    ) -> Result<Option<AcceptedPsk13>, Error> {
+        let (Some(seal), Some(now)) = (self.ticket_seal_key(), self.ticket_now()) else {
+            return Ok(None);
+        };
+        let ctx = PskAcceptContext {
+            seal_key: &seal,
+            now,
+            ticket_lifetime: self.config.ticket_lifetime,
+            peer_addr: &self.peer_addr,
+            // The DTLS servers verify no client certificate yet.
+            client_auth_required: false,
+            expected_client_raw_public_keys: &[],
+        };
+        try_accept_psk13(&ctx, ch, raw, transcript_prefix)
     }
 
     /// IANA cipher-suite identifier of the negotiated suite, or `None`
@@ -975,13 +1170,18 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         };
         // RFC 9147 §4.2.2: the unified header carries only the low two
         // epoch bits. Resolve them against the current read epoch first,
-        // then the retained previous one; anything else is unreadable and
-        // dropped silently.
-        let Some((ctx, is_prev)) =
-            select_read_epoch(&mut self.read, &mut self.prev_read, buf[0] & 0b11)
-        else {
-            return Ok(total);
-        };
+        // then the retained previous one, then the early-data epoch while
+        // accepted 0-RTT may still arrive (§6.1); anything else — a
+        // rejected 0-RTT flight above all (RFC 8446 §4.2.10) — is
+        // unreadable and dropped silently.
+        let (ctx, is_prev, is_early) =
+            match select_read_epoch(&mut self.read, &mut self.prev_read, buf[0] & 0b11) {
+                Some((ctx, is_prev)) => (ctx, is_prev, false),
+                None => match self.early_read.as_mut() {
+                    Some(early) if early.matches_low2(buf[0] & 0b11) => (early, false, true),
+                    _ => return Ok(total),
+                },
+            };
         let Ok(mask_full) = sn_mask_for(suite, ctx.sn_key.as_slice(), body) else {
             return Ok(total);
         };
@@ -1020,6 +1220,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             ctx.seq = seq;
         }
         let read_epoch = ctx.epoch;
+        if is_early {
+            self.on_early_data_record(inner_type, &plain)?;
+            return Ok(consumed);
+        }
+        // RFC 9147 §5.6: once records arrive under the application keys
+        // the client is past its early data; no more epoch-1 records are
+        // accepted (the reordering window a datagram path needs is the
+        // handshake round trip itself, which is over by now).
+        if read_epoch >= 3 && !is_prev {
+            self.early_read = None;
+        }
         // RFC 9146 §6: an authenticated record newer than any before it,
         // carrying a CID, may move the peer's address (the caller's
         // decision, see `datagram_allows_peer_address_update`).
@@ -1125,6 +1336,23 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             ContentType::Alert => self.process_peer_alert(&plain)?,
             ContentType::Unknown(t) if t == ACK_CONTENT_TYPE => {
                 let acks = decode_ack(&plain)?;
+                // An ACK naming a record we sent under the application
+                // keys (a NewSessionTicket) could only come from a client
+                // that installed them — one past its handshake (see
+                // `handshake_flight_pending`).
+                if self.state == State::Connected
+                    && acks.iter().any(|rn| {
+                        rn.epoch >= 3
+                            && self
+                                .retransmit
+                                .in_flight()
+                                .iter()
+                                .any(|r| r.record_numbers.contains(rn))
+                    })
+                {
+                    self.client_confirmed = true;
+                    self.final_flight_records = Vec::new();
+                }
                 self.retransmit.on_ack(&acks);
                 self.complete_key_update_if_acked()?;
                 self.flush_owed_new_connection_id()?;
@@ -1132,6 +1360,26 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             _ => return Err(Error::UnexpectedMessage),
         }
         Ok(consumed)
+    }
+
+    /// An authenticated epoch-1 record (RFC 9147 §6.1): accepted 0-RTT
+    /// application data, bounded by `max_early_data_size` (RFC 8446
+    /// §4.2.10 — a client sending more than the ticket allowed is at fault,
+    /// fatally), or an alert. Nothing else may travel under the early keys.
+    fn on_early_data_record(&mut self, inner_type: ContentType, plain: &[u8]) -> Result<(), Error> {
+        match inner_type {
+            ContentType::ApplicationData => {
+                let len = u32::try_from(plain.len()).map_err(|_| Error::UnexpectedMessage)?;
+                if len > self.early_data_remaining {
+                    return Err(Error::UnexpectedMessage);
+                }
+                self.early_data_remaining -= len;
+                self.early_in.extend_from_slice(plain);
+                Ok(())
+            }
+            ContentType::Alert => self.process_peer_alert(plain),
+            _ => Err(Error::UnexpectedMessage),
+        }
     }
 
     /// Initiates a key update (RFC 9147 §8 / RFC 8446 §4.6.3): sends a
@@ -1652,7 +1900,31 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // cookie HMAC mismatches (DTLS-5).
         let ch_fp = ch_fingerprint_dtls13(&ch);
 
-        if cookie_required && presented_cookie.is_none() {
+        // TLS-shaped ClientHello (the transcript / binder form, RFC 9147
+        // §5.2): the 4-byte handshake header + the DTLS-shaped body.
+        let raw_ch = tls_client_hello(body);
+
+        // RFC 9147 §5.1: the cookie exchange MAY be skipped when the
+        // handshake resumes a PSK and the source address matches the one
+        // the ticket was issued to — the return-routability the cookie
+        // proves was proven when the ticket was issued, and a replay from
+        // that address costs the server only what the genuine client
+        // already made it spend. This is also the only path on which 0-RTT
+        // can be accepted (a HelloRetryRequest rejects early data, RFC 8446
+        // §4.2.10). We skip only when no group-change HRR is needed either
+        // (the client shared our preferred group); otherwise the HRR would
+        // reject the early data anyway, so the ordinary cookie exchange —
+        // which the resumption then rides on — is just as good. The binder
+        // is over the first hello, so the transcript prefix is empty.
+        let resume_skip_cookie = cookie_required
+            && presented_cookie.is_none()
+            && preferred_share.is_some()
+            && self
+                .accept_ticket_psk(&ch, &raw_ch, &[])?
+                .is_some_and(|s| s.same_address);
+        let do_cookie = cookie_required && !resume_skip_cookie;
+
+        if do_cookie && presented_cookie.is_none() {
             // First CH (cookie required, no cookie yet): emit HRR with a
             // freshly-minted cookie. The cookie's `aux` payload carries the
             // (suite, selected_group, Hash(CH1)) tuple we'd otherwise have
@@ -1746,7 +2018,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let hrr_group: Option<NamedGroup>;
         let next_out_msg_seq: u16;
 
-        if cookie_required {
+        if do_cookie {
             let cookie_bytes = presented_cookie
                 .as_ref()
                 .ok_or(Error::IllegalParameter)?
@@ -1943,7 +2215,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.suite = Some(suite);
         self.hrr_selected_group = hrr_group;
         self.negotiated_group = Some(selected_group);
-        self.hrr_sent = !matches!(plan, TranscriptPlan::Fresh);
+        let plan_was_fresh = matches!(plan, TranscriptPlan::Fresh);
+        self.hrr_sent = !plan_was_fresh;
         self.out_msg_seq = next_out_msg_seq;
         match plan {
             TranscriptPlan::Replace(t) => self.transcript = t,
@@ -1958,16 +2231,67 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             }
         }
         self.client_random = Some(ch.random);
+
+        // PSK resumption (RFC 8446 §4.2.11): the binder is verified over the
+        // transcript preceding this ClientHello — empty on a first hello,
+        // `message_hash(CH1) ‖ HelloRetryRequest` after any HRR (§4.2.11.2),
+        // which the transcript now holds. A binder mismatch is fatal.
+        let binder_prefix = self.transcript.buffered_bytes().to_vec();
+        let psk_state = self.accept_ticket_psk(&ch, &raw_ch, &binder_prefix)?;
+        self.psk_used = psk_state.is_some();
+
+        // 0-RTT: accept only when a PSK was taken, the client offered early
+        // data, no HRR intervened (RFC 8446 §4.2.10), our policy is
+        // non-zero, the ticket is age-fresh (§8.2) and from this address
+        // (RFC 9147 §5.1 — the same condition that let us skip the cookie),
+        // and the negotiated suite is exactly the ticket's (the early keys
+        // are derived under it, §4.6.1).
+        let client_offered_early = ext::find(&ch.extensions, ExtensionType::EARLY_DATA).is_some();
+        self.early_data_offered = client_offered_early;
+        let mut accept_early = client_offered_early
+            && plan_was_fresh
+            && self.config.max_early_data_size > 0
+            && psk_state
+                .as_ref()
+                .is_some_and(|s| s.age_fresh && s.same_address && s.suite == Some(suite.suite));
+        // Anti-replay (RFC 8446 §8): key the window on the *selected*
+        // binder, not identity 0 — an attacker could otherwise park junk at
+        // index 0 and vary it to replay a victim's early data at a later
+        // index. A repeat refuses 0-RTT but still resumes (1-RTT).
+        #[cfg(feature = "std")]
+        if accept_early
+            && let Some(window) = self.config.replay_window.as_ref()
+            && let Some(s) = psk_state.as_ref()
+            && !window.check_and_insert(&s.selected_binder)
+        {
+            accept_early = false;
+        }
+        // Anti-replay floor: never accept undefended 0-RTT. The §8.2
+        // freshness window is real here (a clock is required to accept a
+        // ticket at all), so it always provides a bound; a `ReplayWindow`
+        // tightens it. (This mirrors the TLS 1.3 server, where the freshness
+        // check can be skipped on a clock-less build; the DTLS servers never
+        // reach this without a clock.)
+        if accept_early {
+            let ticket_alpn = psk_state.as_ref().expect("psk_state set").alpn.as_slice();
+            if ticket_alpn != alpn_pick.as_deref().unwrap_or(&[]) {
+                // RFC 8446 §4.2.10: 0-RTT needs the same ALPN as the issuing
+                // connection. A mismatch refuses early data, not resumption.
+                accept_early = false;
+            }
+        }
+
         // CH2 (or first-and-only CH when cookies are off) into the
         // transcript (TLS-shaped).
-        let mut tls_ch = Vec::with_capacity(4 + body.len());
-        tls_ch.push(hs_type::CLIENT_HELLO);
-        let n = body.len() as u32;
-        tls_ch.push(((n >> 16) & 0xff) as u8);
-        tls_ch.push(((n >> 8) & 0xff) as u8);
-        tls_ch.push((n & 0xff) as u8);
-        tls_ch.extend_from_slice(body);
-        self.transcript.update(&tls_ch);
+        self.transcript.update(&raw_ch);
+
+        // Carry the issuing handshake's client identity forward (for the
+        // ticket this connection may issue) — the DTLS servers do not yet
+        // authenticate clients, so this is only ever set by resumption.
+        if let Some(s) = psk_state.as_ref() {
+            self.resumed_client_leaf = s.client_leaf.clone();
+            self.resumed_client_auth_secs = Some(s.client_auth_secs);
+        }
 
         // Initialise the reassembler at msg_seq+1.
         let mut reasm = Reassembler::new();
@@ -1987,16 +2311,38 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             CidState::negotiated(local, peer, pool)
         });
 
+        // 0-RTT: derive `client_early_traffic_secret` over Hash(CH1) NOW,
+        // before ServerHello enters the transcript, and install the epoch-1
+        // read keys (RFC 9147 §6.1) so the early-data records that trail
+        // CH1 decrypt. The early secret is under the ticket's PSK and the
+        // `"dtls13"` prefix (RFC 9147 §5.9).
+        if accept_early {
+            let psk = &psk_state.as_ref().expect("psk_state set").psk;
+            let early_ks = KeySchedule::with_psk_prefixed(LabelPrefix::Dtls13, suite.hash, psk);
+            let th_ch = self.transcript.current_hash();
+            let cets = early_ks.client_early_traffic_secret(th_ch.as_slice());
+            if let Some(kl) = self.config.key_log.as_ref() {
+                kl.log("CLIENT_EARLY_TRAFFIC_SECRET", &ch.random, cets.as_slice());
+            }
+            self.early_read = Some(ReadEpoch::new(suite, 1, &cets));
+            self.early_data_remaining = self.config.max_early_data_size;
+            self.early_data_accepted = true;
+        }
+
         // ServerHello with the negotiated group's `key_share`; selects
-        // DTLS 1.3 (`0xfefc`, RFC 9147 §5.3), and answers the client's
+        // DTLS 1.3 (`0xfefc`, RFC 9147 §5.3), answers the client's
         // `connection_id` offer with the CID this server receives under
-        // (RFC 9146 §3).
+        // (RFC 9146 §3), and echoes `pre_shared_key` with the selected
+        // identity when resuming (RFC 8446 §4.2.11).
         let mut sh_extensions = alloc::vec![
             ext::server_key_share(selected_group, &server_pub),
             super::server_supported_versions_dtls13(),
         ];
         if let Some(cid) = self.cid.as_ref() {
             sh_extensions.push(connection_id_extension(cid.local()));
+        }
+        if let Some(s) = psk_state.as_ref() {
+            sh_extensions.push(ext::server_pre_shared_key(s.selected_identity));
         }
         let sh_bytes = ServerHello {
             random: sr,
@@ -2021,7 +2367,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
 
         // Derive handshake traffic secrets and install protected crypters.
-        let mut ks = KeySchedule::new_with(LabelPrefix::Dtls13, suite.hash);
+        // A resumed handshake seeds the schedule with the ticket's PSK
+        // instead of zeros (RFC 8446 §7.1).
+        let mut ks = match psk_state.as_ref() {
+            Some(s) => KeySchedule::with_psk_prefixed(LabelPrefix::Dtls13, suite.hash, &s.psk),
+            None => KeySchedule::new_with(LabelPrefix::Dtls13, suite.hash),
+        };
         ks.enter_handshake(&shared);
         // The (EC)DHE / KEM shared secret is absorbed into the key
         // schedule; scrub the heap copy (DTLS-L7).
@@ -2060,30 +2411,38 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.client_hs_secret = Some(chts);
         self.server_hs_secret = Some(shts);
 
-        // Build and emit the encrypted server flight: EE,
-        // [CertificateRequest], Certificate, CV, Finished (RFC 8446 §4.3.2:
-        // the request follows EncryptedExtensions and precedes Certificate).
-        self.send_encrypted_extensions()?;
-        if self.config.client_auth.is_some() {
-            self.send_certificate_request()?;
+        // Build and emit the encrypted server flight. Under PSK resumption
+        // (RFC 8446 §2.2) Certificate and CertificateVerify are omitted —
+        // the PSK authenticates the server — and EncryptedExtensions
+        // carries `early_data` when we accepted 0-RTT (§4.2.10).
+        self.send_encrypted_extensions(self.early_data_accepted)?;
+        if psk_state.is_none() {
+            // RFC 8446 §4.3.2: the request follows EncryptedExtensions and
+            // precedes Certificate. A resumed handshake requests no client
+            // certificate: the ticket carries the identity the issuing
+            // handshake authenticated.
+            if self.config.client_auth.is_some() {
+                self.send_certificate_request()?;
+            }
+            self.send_certificate()?;
+            // CertificateVerify. For an external key, stash the signature
+            // input and suspend; the caller signs and resumes via
+            // `provide_signature`, after which the rest of the flight runs.
+            // For an in-process key, sign inline and continue.
+            if matches!(
+                self.config.key,
+                crate::tls::conn::ServerKey::External { .. }
+            ) {
+                let th = self.transcript.current_hash();
+                let content = certificate_verify_content(true, th.as_slice());
+                let scheme =
+                    signature_scheme_for(&self.config.key).ok_or(Error::UnsupportedKeyType)?;
+                self.pending_flight = Some(PendingFlight { scheme, content });
+                self.state = State::AwaitingCertVerifySignature;
+                return Ok(());
+            }
+            self.send_certificate_verify()?;
         }
-        self.send_certificate()?;
-        // CertificateVerify. For an external key, stash the signature input and
-        // suspend; the caller signs and resumes via `provide_signature`, after
-        // which the rest of the flight (CertificateVerify + Finished + key
-        // install) runs. For an in-process key, sign inline and continue.
-        if matches!(
-            self.config.key,
-            crate::tls::conn::ServerKey::External { .. }
-        ) {
-            let th = self.transcript.current_hash();
-            let content = certificate_verify_content(true, th.as_slice());
-            let scheme = signature_scheme_for(&self.config.key).ok_or(Error::UnsupportedKeyType)?;
-            self.pending_flight = Some(PendingFlight { scheme, content });
-            self.state = State::AwaitingCertVerifySignature;
-            return Ok(());
-        }
-        self.send_certificate_verify()?;
         self.finish_server_flight()
     }
 
@@ -2177,9 +2536,11 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .map(|pf| (pf.scheme.0, pf.content.clone()))
     }
 
-    fn send_encrypted_extensions(&mut self) -> Result<(), Error> {
+    fn send_encrypted_extensions(&mut self, early_accepted: bool) -> Result<(), Error> {
         // EE body: extensions length (u16), carrying the selected ALPN
-        // protocol (RFC 7301 §3.1 / RFC 8446 §4.3.1) when one was negotiated.
+        // protocol (RFC 7301 §3.1 / RFC 8446 §4.3.1) when one was
+        // negotiated, and an empty `early_data` (§4.2.10) when we accepted
+        // the client's 0-RTT.
         let mut body = Vec::new();
         let alpn = self.alpn_negotiated.clone();
         with_len_u16(&mut body, |list| {
@@ -2187,6 +2548,11 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 let (ty, ext_body) = ext::alpn_protocols(&[proto.as_slice()]);
                 put_u16(list, ty.0);
                 with_len_u16(list, |b| b.extend_from_slice(&ext_body));
+            }
+            if early_accepted {
+                let (ty, _) = ext::early_data_empty();
+                put_u16(list, ty.0);
+                with_len_u16(list, |_| {});
             }
         });
         let mut tls_msg = Vec::with_capacity(4 + body.len());
@@ -2394,6 +2760,16 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         self.transcript.update(raw);
 
+        // `resumption_master_secret` over Hash(CH..client Finished) (RFC
+        // 8446 §7.1): seeds the PSK of every ticket this connection issues.
+        // Taken before the transcript is sealed below.
+        if let Some(ks) = self.ks.as_ref() {
+            let th_rms = self.transcript.current_hash();
+            self.rms = Some(ks.resumption_master_secret(th_rms.as_slice()));
+        }
+        // The 0-RTT window is over: no more epoch-1 records (RFC 9147 §5.6).
+        self.early_read = None;
+
         // Install application keys atomically. The epoch-2 read keys are
         // retired, not dropped (RFC 9147 §5.8.3 / §8): if our ACK for this
         // Finished is lost, the client retransmits it under epoch 2, and
@@ -2416,7 +2792,85 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // step and then GiveUp-close the established connection.
         self.retransmit = Retransmit13::new();
         self.state = State::Connected;
+
+        // RFC 8446 §4.6.1 / RFC 9147 §5.8.4: with a ticket key configured,
+        // issue one NewSessionTicket now, as a post-handshake flight under
+        // the application keys — tracked by the retransmit machine so it is
+        // resent until the client ACKs it (§7). It rides out in the same
+        // drain as our ACK of the client's Finished.
+        if self.tickets_available() {
+            self.emit_session_ticket()?;
+        }
         Ok(())
+    }
+
+    /// Emits one NewSessionTicket (RFC 8446 §4.6.1) under the application
+    /// keys: `nonce ‖ AES-256-GCM(seal_key, nonce, plaintext)`, the
+    /// plaintext carrying the resumption PSK, the negotiated suite, the
+    /// issuing ALPN, this connection's transport address (so the resumed
+    /// handshake may skip the cookie, RFC 9147 §5.1) and — once the DTLS
+    /// servers authenticate clients — the client identity. Sealed under the
+    /// DTLS 1.3 associated data, so a TLS listener sharing the key cannot
+    /// open it, and the PSK is expanded under the `"dtls13"` prefix.
+    fn emit_session_ticket(&mut self) -> Result<(), Error> {
+        let key = self.ticket_seal_key().ok_or(Error::InappropriateState)?;
+        let Some(creation) = self.ticket_now() else {
+            return Ok(());
+        };
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        let rms = self.rms.clone().ok_or(Error::InappropriateState)?;
+
+        let mut ticket_nonce = [0u8; 4];
+        self.rng.fill_bytes(&mut ticket_nonce);
+        let hash_len = suite.hash.output_len();
+        let mut psk = crate::zeroize::Zeroizing::new(alloc::vec![0u8; hash_len]);
+        psk_from_resumption_with(
+            LabelPrefix::Dtls13,
+            suite.hash,
+            &rms,
+            &ticket_nonce,
+            &mut psk,
+        );
+
+        let mut age_add_bytes = [0u8; 4];
+        self.rng.fill_bytes(&mut age_add_bytes);
+        let ticket_age_add = u32::from_be_bytes(age_add_bytes);
+
+        // A chain of resumptions keeps expiring `ticket_lifetime` after the
+        // one real verification (the TLS 1.3 audit finding): carry the
+        // recorded authentication time forward rather than re-stamping it.
+        let client_auth_secs = self.resumed_client_auth_secs.unwrap_or(creation);
+        let plain = TicketPlaintext {
+            psk,
+            alpn: self.alpn_negotiated.clone().unwrap_or_default(),
+            creation_secs: creation,
+            age_add: ticket_age_add,
+            suite: Some(suite.suite),
+            client_leaf: self.resumed_client_leaf.clone(),
+            client_auth_secs,
+            // RFC 9147 §5.1: bind the ticket to the address it was issued
+            // to (empty means the server never learned it — no cookie skip).
+            peer_addr: (!self.peer_addr.is_empty()).then(|| self.peer_addr.clone()),
+        };
+        let ticket = seal_ticket13(&mut self.rng, &key, TICKET_DTLS13_AAD, &plain);
+        drop(plain);
+
+        let mut extensions = Vec::new();
+        if self.config.max_early_data_size > 0 {
+            extensions.push(ext::early_data_with_size(self.config.max_early_data_size));
+        }
+        let nst = NewSessionTicket {
+            ticket_lifetime: self.config.ticket_lifetime,
+            ticket_age_add,
+            ticket_nonce: ticket_nonce.to_vec(),
+            ticket,
+            extensions,
+        };
+        // A post-handshake message is not part of any transcript hash (RFC
+        // 8446 §4.6.1); it is fragmented and tracked like any handshake
+        // record under the current (application) epoch.
+        let encoded = nst.encode();
+        self.emit_encrypted_handshake(hs_type::NEW_SESSION_TICKET, &encoded[4..])
     }
 
     /// Builds the on-wire HRR bytes (4-byte TLS handshake header + body).
@@ -2809,6 +3263,20 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 /// (DTLS-L5). Negotiation is still pinned: `supported_groups` is covered,
 /// and the group the HRR selected travels in the cookie's `aux` payload
 /// and is enforced on CH2.
+/// Wraps a DTLS-shaped ClientHello body in the 4-byte TLS handshake header
+/// the transcript and the PSK binder hash over (RFC 9147 §5.2: the DTLS
+/// fragment fields are excluded).
+fn tls_client_hello(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.push(hs_type::CLIENT_HELLO);
+    let n = body.len() as u32;
+    out.push(((n >> 16) & 0xff) as u8);
+    out.push(((n >> 8) & 0xff) as u8);
+    out.push((n & 0xff) as u8);
+    out.extend_from_slice(body);
+    out
+}
+
 fn ch_fingerprint_dtls13(ch: &ClientHello) -> Vec<u8> {
     let mut cs_be = Vec::with_capacity(ch.cipher_suites.len() * 2);
     for cs in &ch.cipher_suites {

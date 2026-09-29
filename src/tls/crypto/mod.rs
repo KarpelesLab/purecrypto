@@ -35,6 +35,9 @@ pub(crate) use schedule::{
     next_traffic_secret, next_traffic_secret_with, psk_from_resumption, tls_exporter,
     tls_exporter_with,
 };
+#[cfg(feature = "dtls")]
+#[allow(unused_imports)]
+pub(crate) use schedule::{psk_binder_with, psk_from_resumption_with};
 #[allow(unused_imports)]
 pub(crate) use sign::{
     certificate_verify_content, sign_certificate_verify, signature_scheme_for, verify_signature,
