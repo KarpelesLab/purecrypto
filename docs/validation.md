@@ -975,7 +975,9 @@ on a secret is a bug:
   "inner plaintext is all zero" verdict (a protocol violation answered with
   an alert) belongs here too.
 - **Rejection-sampling and retry decisions**: RFC 6979 / FIPS 186-5 scalar
-  and nonce candidates (ECDSA, DSA, sign-to-contract), SM2 nonce retries,
+  and nonce candidates (ECDSA, DSA, sign-to-contract, and the key-pair
+  draw of the multi-curve `ec::boxed` ECDH / ECDSA keys that the
+  NIST-curve ML-KEM hybrid key shares use), SM2 nonce retries,
   the ML-DSA signing loop, ML-DSA `RejBoundedPoly` (ExpandS), every RSA
   key-generation decision (a composite candidate, `p = q`, `|p − q|` too
   small, `e` not invertible, the rare `2^64 | p − 1` Miller-Rabin tail),

@@ -124,8 +124,10 @@ fn random_scalar<R: RngCore>(curve: CurveId, n: &BoxedUint, rng: &mut R) -> Boxe
         // The raw bytes are the secret scalar; don't leave them on the heap.
         buf.zeroize();
         // Accept iff 1 ≤ candidate < n; non-short-circuiting `&` so the
-        // candidate's low limbs don't shape the timing of a rejection.
-        if bool::from(!candidate.ct_is_zero()) & candidate.lt(n) {
+        // candidate's low limbs don't shape the timing of a rejection. The
+        // verdict is public (FIPS 186-5 A.4.2 rejection sampling: only the
+        // retry count, independent of the accepted scalar, is observable).
+        if crate::ct::declassify_value(bool::from(!candidate.ct_is_zero()) & candidate.lt(n)) {
             return candidate;
         }
     }
