@@ -384,6 +384,7 @@ purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_pro
                     [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk]
                     [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS]
                     [-resend N] [-keylogfile keys.log] [-quiet]
+                    [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]
                     [-ech-config-list list [-ech-retry-configs-out FILE] | -ech-grease]
 purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2 | -dtls1_2 | -dtls1_3]
                     [-min_protocol TLSv1.2] [-Verify ca.pem] [-alpn h2,http/1.1] [-www]
@@ -393,6 +394,7 @@ purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2 | -dtls1_2
                     [-key_update] [-status_file resp.der] [-enable_server_rpk]
                     [-enable_client_rpk -rpk_peer_key pub.pem] [-record_size_limit N]
                     [-no_cert_comp] [-keylogfile keys.log] [-quiet]
+                    [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]
                     [-ech-key key.bin -ech-config config.bin]
 ```
 
@@ -423,6 +425,8 @@ cipher suite: TLS_AES_128_GCM_SHA256
 key exchange: X25519MLKEM768
 HelloRetryRequest: no
 resumed: no
+PSK mode: none                       # psk_ke | psk_dhe_ke | none (TLS 1.3)
+external PSK: none                   # the identity, when one authenticated the handshake
 early data: none                     # accepted | rejected | none
 peer certificate: X.509 (2)          # raw public key | none
 peer certificate compression: none   # client: zlib when the server compressed
@@ -475,6 +479,24 @@ Behaviour worth knowing:
   NewSessionTickets with its first write instead (Apple's
   Network.framework does) gets a `close_notify` then, and the tickets that
   come back with its own goodbye are used.
+- PSK key-exchange modes and external PSKs (TLS 1.3 over TCP; RFC 8446
+  §4.2.9 / §4.2.11). `-psk_modes psk_dhe_ke:psk_ke` sets the modes a PSK —
+  a resumption ticket or an external one — may be used with, in preference
+  order (the client advertises them; the server selects among them). The
+  default is `psk_dhe_ke` only. **`psk_ke` gives up forward secrecy** (the
+  PSK becomes the only secret in the key schedule), so add it only for a
+  constrained peer; the report's `PSK mode:` line says which was used, and
+  `key exchange: none` on a `psk_ke` handshake confirms no (EC)DHE ran.
+  `-psk_identity NAME -psk HEX` provisions an external PSK (OpenSSL's flag
+  names), authenticating the handshake by the key with no certificate on
+  either side; the key must be high-entropy (see
+  [recommended-usage](recommended-usage.md)). `-psk_hash sha384` pairs it
+  with the SHA-384 suite instead of SHA-256. `-psk_import` (optionally
+  `-psk_context STR`) runs the pair through the RFC 9258 importer rather
+  than using the key as given, which is what a BoringSSL peer expects. On
+  `s_server`, `-cert` / `-key` may be omitted when `-psk` is given: a
+  TLS-1.3-only server that authenticates every client by an external PSK
+  needs no certificate.
 - `-key_update` (either side, TLS 1.3 and DTLS 1.3) sends
   `KeyUpdate(update_requested)` right after the handshake, before any
   application data; the tally line at the end shows the peer's reply. A

@@ -72,7 +72,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `xmss` | RFC 8391, SP 800-208 | ref-impl KAT | ref vectors | `xmss_parse` | n/a (hash-based, **stateful**) |
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
-| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8, Apple's Network.framework and wolfSSL 5.9, both roles** (CI: certs × groups × suites, resumption, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
+| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8, Apple's Network.framework and wolfSSL 5.9, both roles** (CI: certs × groups × suites, resumption (incl. PSK-only), external PSK, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
 | `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, fragmentation at two MTUs, a lossy path) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
@@ -203,7 +203,7 @@ update with the commands in `tools/wycheproof/README.md`.
   exchanges application data and is checked on **both** sides for the
   negotiated version, suite and group (a handshake that completed with the
   wrong group is a failure) and, where the tool sends one, for the peer's
-  `close_notify`. 226 cases per peer; `⏭` is a SKIP with the reason (a peer
+  `close_notify`. 228 cases per peer; `⏭` is a SKIP with the reason (a peer
   or tool limitation, never a relaxed check):
 
   | Case | OpenSSL 3.0 (C / S) | OpenSSL 3.6 (C / S) | BoringSSL (C / S) |
@@ -213,7 +213,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | ⏭ | ⏭ |
   | Plain, ML-DSA-65 certificate | ⏭ 3.0 has none | ✅ / ✅ | ⏭ no ML-DSA |
   | Resumption (PSK + DHE) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only | ⏭ | ⏭ |
+  | Resumption, PSK-only (`psk_ke`) | ✅ / ✅ (`-allow_no_dhe_kex`) | ✅ / ✅ | ⏭ BoringSSL has no `psk_ke` |
+  | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`-psk` / `-psk_identity`) | ✅ / ✅ | ✅ / ✅ (RFC 9258 importer, `-psk-hex`) |
   | 0-RTT accepted | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
   | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ✅ / ✅ | ✅ / ✅ | ✅ / ⏭ `bssl client` treats `EARLY_DATA_REJECTED` as fatal |
   | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
@@ -255,7 +256,7 @@ update with the commands in `tools/wycheproof/README.md`.
   PSK / early-data outcome, so the adapter reads the library's debug log
   (`write selected_group:`, `key exchange mode: psk_ephemeral`, `DHE group
   name:`, `ServerHello: pre_shared_key(41) extension exists.`,
-  `EncryptedExtensions: early_data(42) extension exists.`). 78 of the 226
+  `EncryptedExtensions: early_data(42) extension exists.`). 81 of the 228
   cases run, 148 SKIP; the peer pins group and suite in both roles
   (`groups=`, `force_ciphersuite=`), so every run is checked on both sides:
 
@@ -267,7 +268,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | Plain, Ed25519 certificate | ⏭ no EdDSA |
   | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA |
   | Resumption (PSK + DHE) | ✅ / ✅ |
-  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ the Mbed TLS server prefers (psk_)ephemeral while a key_share is offered / ✅ |
+  | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`psk=` / `psk_identity=`) |
   | 0-RTT accepted | ✅ / ✅ |
   | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ✅ / ✅ |
   | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ |
@@ -320,7 +322,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | Plain, `X25519MLKEM768` | ⏭ no ML-KEM hybrid group in Server 2025's SChannel |
   | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them |
   | Resumption (PSK + DHE) | ✅ / ✅ (`SslStream` does not report resumption; the purecrypto side's `resumed: yes` on the second connection of one peer process does) |
-  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ `SslStream` exposes no PSK-only resumption |
+  | External PSK (RFC 8446 §4.2.11) | ⏭ `SslStream` has no external-PSK API |
   | 0-RTT (accepted, and rejected across an HRR) | ⏭ `SslStream` has no 0-RTT API and SChannel accepts no early data |
   | HelloRetryRequest | ⏭ the SChannel client sends a key share for every group it offers, and the server's group preference follows system policy: neither side can be steered into one |
   | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ (client certificates verified by the .NET chain engine, rooted in the run's CA) |
@@ -349,7 +352,7 @@ update with the commands in `tools/wycheproof/README.md`.
   `apple` job of `interop.yml` on `macos-latest`; adapter
   `tools/interop/peers/apple.sh` driving the Swift tool in
   `tools/interop/peers/apple/`, an `NWConnection` client and an `NWListener`
-  server configured through `sec_protocol_options_*`): the same 226-case
+  server configured through `sec_protocol_options_*`): the same 228-case
   matrix against the OS's TLS stack — the peer version is the runner's
   macOS (`macos-latest` was 26.6.2 / 25G83 when this landed; the job
   prints `sw_vers`). Identities are PKCS#12 archives the purecrypto CLI exports
@@ -374,7 +377,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA |
   | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them |
   | Resumption (PSK + DHE) | ✅ / ✅ |
-  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ Network.framework exposes no PSK-only resumption |
+  | External PSK (RFC 8446 §4.2.11) | ⏭ Network.framework has no external-PSK API |
   | 0-RTT accepted | ✅ / ⏭ a listener that accepts 0-RTT never completes the connection (`errSSLClosedNoNotify`; OpenSSL's client sees the same) |
   | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ✅ / ✅ |
   | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ |
@@ -409,7 +413,7 @@ update with the commands in `tools/wycheproof/README.md`.
   the release tarball on Linux, and the LibreSSL 3.3.6 every Mac ships as
   `/usr/bin/openssl` on the macOS runner. LibreSSL's `s_client` /
   `s_server` are OpenSSL-1.0-shaped and its TLS 1.3 stack is its own, so
-  the adapter is separate from the OpenSSL one. Both roles, 226 cases each;
+  the adapter is separate from the OpenSSL one. Both roles, 228 cases each;
   4.3.2 passes 94 and skips 132, 3.3.6 passes 73 and skips 153, none fail:
 
   | Case | LibreSSL 4.3 (C / S) | LibreSSL 3.3, macOS (C / S) |
@@ -420,7 +424,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | Plain, Ed25519 certificate | ⏭ no Ed25519 in TLS: the apps cannot load the key, `signature_algorithms` omits it | ⏭ |
   | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA | ⏭ |
   | Resumption (PSK + DHE), 0-RTT accepted, 0-RTT rejected across HRR | ⏭ LibreSSL's TLS 1.3 has no resumption: no `psk_key_exchange_modes`, no NewSessionTicket | ⏭ |
-  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only | ⏭ |
+  | Resumption, PSK-only (`psk_ke`) | ⏭ LibreSSL's TLS 1.3 has no resumption | ⏭ |
+  | External PSK (RFC 8446 §4.2.11) | ⏭ LibreSSL's TLS 1.3 has no external PSK | ⏭ |
   | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ | ✅ / ✅ |
   | HelloRetryRequest to `X25519MLKEM768` | ✅ / ✅ | ⏭ |
   | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ | ✅ / ✅ |
@@ -463,8 +468,8 @@ update with the commands in `tools/wycheproof/README.md`.
   `- Description:` line, verbose ECDH block and `-d 5` debug log
   (handshake messages, extensions, alerts). `gnutls-serv` never exits on
   its own, so the adapter runs it under a small supervisor that stops it
-  once its log shows the case's `close_notify` from the client. 107 of
-  the 226 cases run against 3.8.3 and 160 against 3.8.13:
+  once its log shows the case's `close_notify` from the client. 111 of
+  the 228 cases run against 3.8.3 and 164 against 3.8.13:
 
   | Case | GnuTLS 3.8.3 (C / S) | GnuTLS 3.8.13 + leancrypto (C / S) |
   |---|---|---|
@@ -473,7 +478,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | ⏭ |
   | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA in this build | ✅ / ✅ |
   | Resumption (PSK + DHE) | ✅ / ✅ | ✅ / ✅ |
-  | Resumption, PSK-only (`psk_ke`) | ⏭ purecrypto implements `psk_dhe_ke` only | ⏭ |
+  | Resumption, PSK-only (`psk_ke`) | ✅ / ✅ (server priority `+PSK`) | ✅ / ✅ |
+  | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`--pskusername` / `--pskpasswd`) | ✅ / ✅ |
   | 0-RTT accepted | ✅ / ✅ (C: `gnutls-serv` < 3.8.10 drops the early data it read, so the record-layer log stands in for the echo) | ✅ / ✅ |
   | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ⏭ GnuTLS issue #1429, both roles (below) | ⏭ |
   | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ | ✅ / ✅ |
@@ -537,7 +543,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | Plain, `X25519MLKEM768` | ✅ / ✅ | ⏭ the stateless server validates the cookie on the first fragment, and a first ClientHello with the hybrid share does not fit in one datagram (the `hrr` case carries it in CH2) / ✅ | ⏭ the 1.2 engines have no hybrid |
   | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | — | — |
   | Resumption (PSK + DHE); 0-RTT accepted | ✅ / ✅ | ⏭ purecrypto's DTLS engines have no resumption | ⏭ |
-  | Resumption, PSK-only | ⏭ purecrypto | — | — |
+  | Resumption, PSK-only (`psk_ke`) | ✅ / ✅ (`-K`) | — | — |
+  | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`-s`) | — | — |
   | 0-RTT rejected across a HelloRetryRequest | ⏭ the wolfSSL server deprotects the 0-RTT records it must skip under the early keys it derived, then refuses the plaintext second ClientHello / ⏭ the example client shares the resumed session's group, so no HRR can be forced | — | — |
   | HelloRetryRequest to `x25519`, `P-256`, `P-384`, `X25519MLKEM768` | ✅ / ✅ | ✅ / ✅ (the hybrid arrives in a fragmented CH2 with the cookie first) | — (no HRR in 1.2) |
   | mTLS, client certificate of every kind | ✅ / ✅ | ⏭ purecrypto's DTLS servers do not verify client certificates | ⏭ |

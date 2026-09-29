@@ -64,6 +64,28 @@ The crate exposes a lot. Most of it you should not reach for. Three tiers:
   the DTLS 1.2 / QUIC v1 server directions interop with OpenSSL 3.5, but the
   client directions and DTLS 1.3 are loopback-validated only (see validation
   matrix) — pilot accordingly.
+- **TLS 1.3 session resumption.** Keep the default `psk_dhe_ke`-only
+  `Config::psk_modes`: every resumed connection then mixes in a fresh
+  (EC)DHE / ML-KEM secret, so a resumption ticket (or the server's
+  `ticket_key`) that leaks later does not decrypt earlier traffic. Add
+  `PskKeyExchangeMode::PskKe` **only** for a constrained device that cannot
+  afford the public-key operation, and understand what it costs: with
+  `psk_ke` the PSK is the only secret in the key schedule (RFC 8446 §7.1),
+  so **there is no forward secrecy** — whoever learns the PSK or the ticket
+  key can decrypt every recorded connection made under it — and the
+  post-quantum hybrid group drops out of the resumed handshake.
+- **External (out-of-band) PSKs** (`Config::external_psk`, RFC 8446
+  §4.2.11). Authenticate the handshake by a key alone, without
+  certificates. The key **must be high-entropy** — at least 128 bits from a
+  CSPRNG (RFC 9257 §4.1, §6): a binder derived from it rides on the wire in
+  every ClientHello, so a passive observer can test guesses offline, and a
+  password or short token is recovered at once (use a PAKE for those, not
+  TLS-PSK). Provision **one key per pair of peers** (any holder can
+  impersonate any other), treat the identity as public (it travels in the
+  clear and links a client's connections), and fix one hash per key. Prefer
+  `psk_dhe_ke` here too for forward secrecy. `ExternalPsk::import` (RFC 9258)
+  binds a key to a hash/protocol when it was not provisioned with one — use
+  it to interoperate with a peer that imports (e.g. BoringSSL).
 - **X.509 / signature policy.** Use the default modern signature policy
   (whitelist). Do **not** enable SHA-1 signature algorithms except for explicit,
   scoped legacy verification.
