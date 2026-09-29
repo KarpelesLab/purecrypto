@@ -202,7 +202,12 @@ impl VersionInformation {
 /// All `Option<…>` fields are absent on the wire when set to `None`. The
 /// `disable_active_migration` boolean encodes/decodes as a zero-length
 /// parameter when `true` and is omitted when `false`.
+///
+/// `#[non_exhaustive]`: the RFC 9000 §22.3 registry keeps growing (RFC 9221
+/// and RFC 9368 already added parameters). Build one from
+/// [`TransportParameters::default`] and set the fields you need.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TransportParameters {
     /// `original_destination_connection_id` (0x00) — server only. The
     /// destination CID from the client's first Initial packet.

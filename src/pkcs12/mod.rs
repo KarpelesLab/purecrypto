@@ -295,6 +295,7 @@ impl From<crate::der::Error> for Error {
 ///   [`Certificate::from_der`](crate::x509::Certificate::from_der).
 /// * `friendly_names` — any `friendlyName` bag attributes encountered, in
 ///   bag order (informational; not all bags carry one).
+#[non_exhaustive]
 pub struct Parsed {
     /// Recovered plaintext PKCS#8 private keys, as DER.
     pub keys: Vec<Vec<u8>>,

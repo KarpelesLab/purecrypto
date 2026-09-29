@@ -19,6 +19,7 @@ use crate::tls::{ContentType, Error};
 
 /// SNI and offered ALPN extracted from a ClientHello by [`peek_client_hello`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClientHelloInfo {
     /// The `server_name` (SNI host_name, RFC 6066 §3), if the client sent one.
     pub server_name: Option<String>,

@@ -81,20 +81,21 @@ fn load_signing_key(key_path: &str) -> SigningKey {
 /// server. See module-level doc for rationale. `idle_ms` overrides the
 /// `max_idle_timeout` (`-idle-timeout`).
 fn default_transport_params(idle_ms: Option<u64>) -> TransportParameters {
-    TransportParameters {
-        max_idle_timeout_ms: Some(idle_ms.unwrap_or(60_000)),
-        initial_max_data: Some(1 << 20),
-        initial_max_stream_data_bidi_local: Some(256 * 1024),
-        initial_max_stream_data_bidi_remote: Some(256 * 1024),
-        initial_max_stream_data_uni: Some(256 * 1024),
-        initial_max_streams_bidi: Some(16),
-        initial_max_streams_uni: Some(16),
-        ack_delay_exponent: Some(3),
-        max_ack_delay_ms: Some(25),
-        active_connection_id_limit: Some(4),
-        max_datagram_frame_size: Some(1200),
-        ..TransportParameters::default()
-    }
+    // `TransportParameters` is `#[non_exhaustive]` (new parameters keep
+    // being registered), so start from the defaults and set fields.
+    let mut tp = TransportParameters::default();
+    tp.max_idle_timeout_ms = Some(idle_ms.unwrap_or(60_000));
+    tp.initial_max_data = Some(1 << 20);
+    tp.initial_max_stream_data_bidi_local = Some(256 * 1024);
+    tp.initial_max_stream_data_bidi_remote = Some(256 * 1024);
+    tp.initial_max_stream_data_uni = Some(256 * 1024);
+    tp.initial_max_streams_bidi = Some(16);
+    tp.initial_max_streams_uni = Some(16);
+    tp.ack_delay_exponent = Some(3);
+    tp.max_ack_delay_ms = Some(25);
+    tp.active_connection_id_limit = Some(4);
+    tp.max_datagram_frame_size = Some(1200);
+    tp
 }
 
 /// `-quic_versions v1,v2` → [`QuicVersion`]s in preference order (the first

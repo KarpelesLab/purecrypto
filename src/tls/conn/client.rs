@@ -1159,6 +1159,7 @@ const MAX_OFFERED_EXTERNAL_PSKS: usize = 8;
 /// A `NewSessionTicket` received from the server, exposed for inspection and
 /// (eventually) PSK-based resumption.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ReceivedSessionTicket {
     /// Lifetime hint in seconds (RFC 8446 §4.6.1 caps at 7 days = 604800).
     pub lifetime_seconds: u32,

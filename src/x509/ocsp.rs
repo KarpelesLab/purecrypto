@@ -149,6 +149,7 @@ pub enum OcspCertStatus {
 
 /// One row of the BasicOCSPResponse `responses` list.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OcspSingleResponse {
     /// OID arcs of the `CertID.hashAlgorithm` (typically `id-sha1`).
     pub hash_alg_oid: Vec<u64>,

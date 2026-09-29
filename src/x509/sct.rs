@@ -48,6 +48,7 @@ pub enum SctVersion {
 /// `digitally-signed` blob is kept in its TLS-serialized parts so verification
 /// can reconstruct the exact bytes the log signed.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Sct {
     /// Protocol version.
     pub version: SctVersion,
