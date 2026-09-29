@@ -127,33 +127,13 @@ proto_opts() {
 }
 
 cmd_supports() {
-    # DTLS 1.3 resumption / 0-RTT: purecrypto does both (RFC 9147 + RFC 8446
-    # §2.2 / §4.2.10; loopback and the `s_client -reconnect` / `s_server
-    # -naccept` CLI self-interop cover both directions), but the wolfSSL
-    # 5.9.4 example tools cannot drive them over DTLS:
-    #  * resume, peer-server (purecrypto client -> wolfSSL server): the
-    #    example server only rebinds its UDP socket for a SECOND resume
-    #    (`resumeCount > 1` in server.c), so the single resume the harness
-    #    runs finds nothing listening after the first connection closes it.
-    #  * resume, peer-client (wolfSSL client -> purecrypto server): the
-    #    example client opens the resumed connection from a fresh source
-    #    port (a new `tcp_connect`), which the address-demultiplexing
-    #    s_server does service — but the resumed handshake rides the
-    #    server's cookie HelloRetryRequest (the ticket is not from that new
-    #    address, so no §5.1 skip) and the example client then fails it with
-    #    `-425 security parameter invalid`; the resume-across-HRR
-    #    interaction with wolfSSL needs more investigation.
-    #  * 0-RTT, either role: the example server always answers a resumed
-    #    ClientHello with the cookie HRR (not built with
-    #    WOLFSSL_DTLS13_NO_HRR_ON_RESUME), which rejects early data (RFC 8446
-    #    §4.2.10); the client's fresh-port reconnect is likewise not the
-    #    ticket's address, so 0-RTT cannot be granted (RFC 9147 §5.1).
-    # OpenSSL 3.6 has no `-dtls1_3` CLI, so wolfSSL is the only DTLS 1.3 peer.
-    if [ "$CASE_PROTO" = dtls13 ]; then
-        case $CASE_FEAT in
-            resume) skip "the wolfSSL 5.9.4 example DTLS tools cannot drive a single resume (server rebinds only for resumeCount>1; client's fresh-port resume across the cookie HRR fails with -425)" ;;
-            0rtt) skip "the wolfSSL 5.9.4 example DTLS tools cannot exercise DTLS 1.3 0-RTT (server always sends the cookie HRR without WOLFSSL_DTLS13_NO_HRR_ON_RESUME; client reconnects from a fresh port)" ;;
-        esac
+    # DTLS 1.3 0-RTT with the wolfSSL *server*: the example server always
+    # answers a resumed ClientHello with its cookie HelloRetryRequest, which
+    # rejects early data (RFC 8446 §4.2.10); skipping it needs
+    # wolfSSL_dtls13_no_hrr_on_resume(), which only the driver calls (the
+    # `wolfssl-driver` peer covers that case).
+    if [ "$CASE_PROTO" = dtls13 ] && [ "$CASE_FEAT" = 0rtt ] && [ "$CASE_ROLE" = peer-server ]; then
+        skip "the wolfSSL example DTLS server always sends the cookie HRR on resumption (no wolfSSL_dtls13_no_hrr_on_resume); covered by the wolfssl-driver peer"
     fi
     case $CASE_FEAT in
         certcomp|certcomp-brotli|certcomp-zstd|certcomp-client) skip "wolfSSL does not implement RFC 8879 certificate compression" ;;
