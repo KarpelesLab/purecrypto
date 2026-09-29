@@ -292,6 +292,10 @@ pub struct DtlsClientConnection12 {
     cert_chain: Vec<Vec<u8>>,
     /// Peer leaf public key (verified or extracted).
     leaf_key: Option<AnyPublicKey>,
+    /// The `SignatureScheme` the peer's handshake signature carried and
+    /// verified under, for the negotiated-parameter report. `None` until
+    /// then.
+    peer_signature_scheme: Option<SignatureScheme>,
     /// Negotiated group from SKE.
     peer_group: Option<NamedGroup>,
     /// Peer's ECDHE public share.
@@ -388,6 +392,7 @@ impl DtlsClientConnection12 {
             suite: None,
             cert_chain: Vec::new(),
             leaf_key: None,
+            peer_signature_scheme: None,
             peer_group: None,
             peer_point: None,
             close_notify_received: false,
@@ -438,6 +443,12 @@ impl DtlsClientConnection12 {
     /// The server's certificate chain (leaf first), once received.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.cert_chain
+    }
+
+    /// The IANA `SignatureScheme` code point of the peer's verified
+    /// handshake signature — its `ServerKeyExchange` — once verified.
+    pub fn peer_signature_scheme(&self) -> Option<u16> {
+        self.peer_signature_scheme.map(|s| s.0)
     }
 
     /// RFC 5705 §4 — DTLS 1.2 application-layer Exporter. Computes
@@ -1264,6 +1275,14 @@ impl DtlsClientConnection12 {
         if !self.config.groups.contains(&ske.group) {
             return Err(Error::IllegalParameter);
         }
+        // RFC 5246 §7.4.3: the signature's (hash, signature) pair "MUST be
+        // one of those present in the signature_algorithms extension" we
+        // sent (`signature_algorithms_tls12()`); a server signing under a
+        // scheme it was not offered is `illegal_parameter` (mirrors the TLS
+        // 1.2 client).
+        if !ext::offered_signature_schemes().contains(&ske.scheme) {
+            return Err(Error::IllegalParameter);
+        }
         // Verify the SKE signature under the leaf's key.
         let cr = self.client_random;
         let sr = self.server_random.ok_or(Error::InappropriateState)?;
@@ -1280,6 +1299,7 @@ impl DtlsClientConnection12 {
             &ske.signature,
             &self.config.signature_policy,
         )?;
+        self.peer_signature_scheme = Some(ske.scheme);
         self.peer_group = Some(ske.group);
         self.peer_point = Some(ske.point);
         self.transcript.update(raw);

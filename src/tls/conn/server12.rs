@@ -94,16 +94,17 @@ use alloc::vec::Vec;
 ///
 /// Parallels [`super::server::ServerConfig`], including mTLS via
 /// [`Self::with_client_auth`] and RFC 5077 session tickets via
-/// [`Self::with_ticket_key`]. Unlike the TLS 1.3 server, ML-DSA and Ed25519
-/// server keys are not accepted here: TLS 1.2 has no IANA-assigned
-/// `TLS_ECDHE_EDDSA_*` or `TLS_ECDHE_MLDSA_*` cipher suites, so a non-RSA /
-/// non-ECDSA key would have nothing to match.
+/// [`Self::with_ticket_key`]. The server key is RSA, ECDSA, Ed25519 or
+/// Ed448: RFC 8422 §2.2 puts EdDSA keys under the `ECDHE_ECDSA` suites
+/// ("Ephemeral ECDH with ECDSA or EdDSA signatures"). Unlike the TLS 1.3
+/// server, ML-DSA keys are not accepted here — no specification defines
+/// them for TLS 1.2 (draft-ietf-tls-mldsa is TLS 1.3 only).
 pub(crate) struct ServerConfig12 {
     /// Certificate chain (leaf first) presented to the peer.
     cert_chain: Vec<Vec<u8>>,
     /// The server's signing key. Reused from [`super::server::ServerKey`] but
-    /// only [`ServerKey::Rsa`] and [`ServerKey::Ecdsa`] variants are valid
-    /// here.
+    /// only the RSA, [`ServerKey::Ecdsa`], [`ServerKey::Ed25519`] and
+    /// [`ServerKey::Ed448`] variants are valid here.
     key: ServerKey,
     /// ALPN protocols this server accepts, in preference order.
     alpn_protocols: Vec<Vec<u8>>,
@@ -292,6 +293,20 @@ impl ServerConfig12 {
         Self::from_key(cert_chain, ServerKey::Ecdsa(key))
     }
 
+    /// A configuration presenting `cert_chain` and signing with an Ed25519
+    /// private `key`, for the `ECDHE_ECDSA` suites (RFC 8422 §2.2). The
+    /// `ServerKeyExchange` is signed with `ed25519` (0x0807): PureEdDSA over
+    /// the unhashed parameters (RFC 8422 §5.4, §5.10).
+    pub fn with_ed25519(cert_chain: Vec<Vec<u8>>, key: crate::ec::Ed25519PrivateKey) -> Self {
+        Self::from_key(cert_chain, ServerKey::Ed25519(key))
+    }
+
+    /// [`Self::with_ed25519`] for an Ed448 key, signing with `ed448`
+    /// (0x0808) under the empty context (RFC 8422 §5.10).
+    pub fn with_ed448(cert_chain: Vec<Vec<u8>>, key: crate::ec::Ed448PrivateKey) -> Self {
+        Self::from_key(cert_chain, ServerKey::Ed448(key))
+    }
+
     /// Sets the ALPN protocols the server is willing to negotiate.
     pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
         self.alpn_protocols = protocols;
@@ -402,12 +417,13 @@ impl ServerConfig12 {
     }
 
     /// Which signature family the configured server key belongs to. Drives
-    /// suite negotiation: an RSA key can only sign RSA suites; an ECDSA key
-    /// can only sign ECDSA suites.
+    /// suite negotiation: an RSA key can only sign RSA suites; an ECDSA or
+    /// EdDSA key can only sign ECDSA suites (RFC 8422 §2.2: `ECDHE_ECDSA`
+    /// is "Ephemeral ECDH with ECDSA or EdDSA signatures").
     fn sig_kind(&self) -> SigKind {
         match &self.key {
             ServerKey::Rsa(_) | ServerKey::RsaPss(..) => SigKind::Rsa,
-            ServerKey::Ecdsa(_) => SigKind::Ecdsa,
+            ServerKey::Ecdsa(_) | ServerKey::Ed25519(_) | ServerKey::Ed448(_) => SigKind::Ecdsa,
             // Other variants are inhabited by the shared `ServerKey` enum but
             // are unreachable through the public TLS-1.2 constructors. Default
             // to a kind that will fail to match any of our suites.
@@ -424,7 +440,10 @@ impl ServerConfig12 {
     /// signing under a NIST code point the client would reject. For RSA we
     /// use RSA-PSS, the modern default for TLS 1.2 + 1.3 interop — RFC 8446
     /// §4.2.3 defines both PSS families for TLS 1.2 too, so a leaf
-    /// certified as `id-RSASSA-PSS` signs `rsa_pss_pss_*`.
+    /// certified as `id-RSASSA-PSS` signs `rsa_pss_pss_*`. An EdDSA key
+    /// signs under its own scheme and no other (RFC 8422 §5.9: "EdDSA keys
+    /// using the Ed25519 algorithm MUST use the ed25519 signature algorithm,
+    /// and Ed448 keys MUST use the ed448 signature algorithm").
     fn signature_scheme(&self) -> Option<SignatureScheme> {
         match &self.key {
             ServerKey::Rsa(_) => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
@@ -433,9 +452,12 @@ impl ServerConfig12 {
                 crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve())
                     .filter(|s| !s.is_brainpool_tls13())
             }
-            // Unreachable through the public constructors but the compiler
-            // requires the match to be total.
-            _ => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
+            ServerKey::Ed25519(_) => Some(SignatureScheme::ED25519),
+            ServerKey::Ed448(_) => Some(SignatureScheme::ED448),
+            // ML-DSA has no TLS 1.2 definition, and this engine has no
+            // external-signer path. Neither is reachable through the
+            // constructors above.
+            _ => None,
         }
     }
 }
@@ -570,6 +592,15 @@ pub struct ServerConnection12<R: RngCore> {
     /// mTLS: the client's leaf public key, recovered from the chain. `None`
     /// when the chain is empty.
     client_leaf_key: Option<AnyPublicKey>,
+    /// mTLS: the `supported_signature_algorithms` our `CertificateRequest`
+    /// carried, which the client's `CertificateVerify` scheme must be one of
+    /// (RFC 5246 §7.4.8). Empty until the request is sent.
+    cert_request_schemes: Vec<SignatureScheme>,
+    /// The `SignatureScheme` the peer's handshake signature carried and
+    /// verified under (its `CertificateVerify`), for the negotiated-parameter
+    /// report. `None` until then, and on a connection without client
+    /// authentication.
+    peer_signature_scheme: Option<SignatureScheme>,
     /// RFC 5077: whether the peer advertised the `session_ticket` extension
     /// in its CH. Drives whether we echo the empty extension in SH and emit
     /// `NewSessionTicket` after our Finished.
@@ -673,6 +704,8 @@ impl<R: RngCore> ServerConnection12<R> {
             pending_server_crypter: None,
             client_cert_chain: Vec::new(),
             client_leaf_key: None,
+            cert_request_schemes: Vec::new(),
+            peer_signature_scheme: None,
             peer_offered_session_ticket: false,
             peer_offered_ocsp_staple: false,
             resumed: false,
@@ -693,6 +726,12 @@ impl<R: RngCore> ServerConnection12<R> {
     /// `Certificate`.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.client_cert_chain
+    }
+
+    /// The IANA `SignatureScheme` code point of the peer's verified
+    /// handshake signature, once verified (mTLS only).
+    pub fn peer_signature_scheme(&self) -> Option<u16> {
+        self.peer_signature_scheme.map(|s| s.0)
     }
 
     /// `true` if this handshake resumed a prior session via RFC 5077
@@ -2380,11 +2419,19 @@ impl<R: RngCore> ServerConnection12<R> {
     /// TLS 1.2 schemes filtered by the configured policy — see
     /// `tls12_certificate_request_schemes`), and an empty CA list (we
     /// accept any chain that validates against the configured `roots`).
+    ///
+    /// `ecdsa_sign` (64) is also what asks for an EdDSA certificate: RFC
+    /// 8422 §5.5 defines no type of its own ("client certificates with EdDSA
+    /// public keys also use this type", §3), the `ed25519` / `ed448` entries
+    /// of the signature list say whether one is welcome. Schemes with no
+    /// TLS 1.2 definition (RFC 8734 Brainpool, ML-DSA) are left out, and
+    /// `on_client_cert_verify` holds the client to the list sent here.
     fn send_certificate_request(&mut self) {
         let cert_types = alloc::vec![1u8, 64u8]; // rsa_sign, ecdsa_sign
         let sig_schemes = crate::tls::crypto::sign::tls12_certificate_request_schemes(
             &self.config.signature_policy,
         );
+        self.cert_request_schemes = sig_schemes.clone();
         let cr = CertificateRequest12 {
             cert_types,
             sig_schemes,
@@ -2497,6 +2544,14 @@ impl<R: RngCore> ServerConnection12<R> {
         let scheme = SignatureScheme(c.u16()?);
         let signature = c.vec_u16()?.to_vec();
         c.expect_empty()?;
+        // RFC 5246 §7.4.8: "The hash and signature algorithms used in the
+        // signature MUST be one of those present in the
+        // supported_signature_algorithms field of the CertificateRequest
+        // message." That list holds nothing TLS 1.2 does not define, so this
+        // is also what refuses an ML-DSA or Brainpool-TLS-1.3 code point.
+        if !self.cert_request_schemes.contains(&scheme) {
+            return Err(Error::IllegalParameter);
+        }
 
         let leaf_key = self
             .client_leaf_key
@@ -2513,11 +2568,14 @@ impl<R: RngCore> ServerConnection12<R> {
             &self.config.signature_policy,
         )
         .map_err(|e| match e {
-            // RFC 5246 §7.4.8 calls a bad signature `decrypt_error`. Map
-            // BadCertificate from the registry to that here.
+            // RFC 5246 §7.4.8 calls a bad signature `decrypt_error`, which
+            // is what the verifier reports; a key the policy refuses (its
+            // size, say) surfaces as BadCertificate and is folded into the
+            // same alert here.
             Error::BadCertificate => Error::DecryptError,
             other => other,
         })?;
+        self.peer_signature_scheme = Some(scheme);
 
         self.transcript.update(raw);
         self.state = State::WaitClientFinished;
@@ -2612,9 +2670,16 @@ impl<R: RngCore> ServerConnection12<R> {
                 .map_err(|_| Error::HandshakeFailure)?;
                 sig.to_der(k.curve())
             }
-            // The public ServerConfig12 constructors only build RSA / ECDSA
-            // server keys, so other variants are unreachable. Be explicit.
-            _ => return Err(Error::HandshakeFailure),
+            // RFC 8422 §5.4 / §5.10: PureEdDSA over the same bytes ECDSA
+            // would hash — `client_random || server_random || params`, fed
+            // to the signing algorithm as they are ("with no hashing") —
+            // Ed448 with the empty context. The signature is the raw octet
+            // string, 64 / 114 bytes.
+            ServerKey::Ed25519(k) => k.sign(&to_sign).to_bytes().to_vec(),
+            ServerKey::Ed448(k) => k.sign(&to_sign).to_bytes().to_vec(),
+            // ML-DSA / external keys: `signature_scheme` found no scheme
+            // above, so this is not reached.
+            _ => return Err(Error::UnsupportedKeyType),
         };
 
         let ske = ServerKeyExchange {

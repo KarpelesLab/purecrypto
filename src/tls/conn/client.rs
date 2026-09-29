@@ -884,6 +884,10 @@ pub struct ClientConnection {
     /// `X509 = 0`.
     negotiated_client_cert_type: u8,
     leaf_key: Option<AnyPublicKey>,
+    /// The `SignatureScheme` the peer's handshake signature carried and
+    /// verified under, for the negotiated-parameter report. `None` until
+    /// then.
+    peer_signature_scheme: Option<SignatureScheme>,
 
     /// Most recent `NewSessionTicket` from the peer (RFC 8446 §4.6.1). Real
     /// servers (Cloudflare, Google, …) commonly send one immediately after
@@ -1183,6 +1187,12 @@ impl ClientConnection {
     /// the server's `Certificate` message has been received.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.cert_chain
+    }
+
+    /// The IANA `SignatureScheme` code point of the peer's verified
+    /// handshake signature, — its `CertificateVerify` — once verified.
+    pub fn peer_signature_scheme(&self) -> Option<u16> {
+        self.peer_signature_scheme.map(|s| s.0)
     }
 
     /// DER bytes of the OCSP response stapled by the peer on the leaf
@@ -1787,6 +1797,7 @@ impl ClientConnection {
             negotiated_server_cert_type: 0, // X.509 default per RFC 7250.
             negotiated_client_cert_type: 0,
             leaf_key: None,
+            peer_signature_scheme: None,
             last_ticket: None,
             alpn_negotiated: None,
             record_size_limit_negotiated: false,
@@ -4035,6 +4046,7 @@ impl ClientConnection {
                 &signature,
                 &self.config.signature_policy,
             )?;
+            self.peer_signature_scheme = Some(scheme);
             self.leaf_key = Some(leaf_key);
             self.core.transcript.update(raw);
             self.state = State::WaitFinished;
@@ -4116,6 +4128,7 @@ impl ClientConnection {
             &signature,
             &self.config.signature_policy,
         )?;
+        self.peer_signature_scheme = Some(scheme);
 
         self.leaf_key = Some(leaf_key);
         self.core.transcript.update(raw);

@@ -200,15 +200,23 @@ pub(crate) fn run(args: Args) {
     if let Some((cert_path, key_path)) = identity {
         let chain = load_cert_chain(cert_path);
         let key = load_signing_key(key_path);
-        // The TLS 1.2 server engine signs with RSA or ECDSA only; any other
-        // key is rejected by `Connection::server` as a bare
-        // `UnsupportedVersion` — after `accept()`, so the first client just
-        // sees a reset. Say why, up front.
-        if version == ProtocolVersion::Tls12
-            && !matches!(key, SigningKey::Rsa(_) | SigningKey::Ecdsa(_))
+        // The (D)TLS 1.2 server engines sign with RSA, ECDSA, Ed25519 or Ed448
+        // (RFC 8422); nothing specifies ML-DSA for that version, and such a key
+        // is rejected by `Connection::server` as a bare `UnsupportedVersion` —
+        // after `accept()`, so the first client just sees a reset. Say why, up
+        // front.
+        if matches!(version, ProtocolVersion::Tls12 | ProtocolVersion::Dtls12)
+            && !matches!(
+                key,
+                SigningKey::Rsa(_)
+                    | SigningKey::Ecdsa(_)
+                    | SigningKey::Ed25519(_)
+                    | SigningKey::Ed448(_)
+            )
         {
             die(format!(
-                "{key_path}: -tls1_2 requires an RSA or ECDSA server key (Ed25519 / Ed448 are TLS 1.3 only)"
+                "{key_path}: -tls1_2 / -dtls1_2 require an RSA, ECDSA, Ed25519 or Ed448 server key \
+                 (ML-DSA is not specified for TLS 1.2)"
             ));
         }
 

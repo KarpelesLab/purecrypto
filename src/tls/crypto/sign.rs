@@ -277,10 +277,13 @@ pub(crate) fn sign_certificate_verify<R: RngCore>(
 
 /// The `supported_signature_algorithms` a (D)TLS 1.2 server lists in its
 /// `CertificateRequest` (RFC 5246 §7.4.4): every TLS scheme of every
-/// registry algorithm `policy` permits, in registry order, minus the RFC
-/// 8734 Brainpool code points, which are TLS 1.3 only (§2: "MUST NOT be
-/// used in TLS 1.2"). The client's `CertificateVerify` scheme is then
-/// checked against this list (§7.4.8).
+/// registry algorithm `policy` permits, in registry order, keeping only the
+/// schemes TLS 1.2 defines ([`is_tls12_signature_scheme`]): the RFC 8734
+/// Brainpool code points are TLS 1.3 only (§2: "MUST NOT be used in TLS
+/// 1.2") and ML-DSA has no TLS 1.2 definition, while `ed25519` /
+/// `ed448` are defined for both (RFC 8422 §5.1.3). The client's
+/// `CertificateVerify` scheme is then checked against this list
+/// (§7.4.8).
 ///
 /// The policy is probed with an empty SPKI: the RSA entries' minimum
 /// modulus size can only be judged against a concrete key, which happens
@@ -293,7 +296,7 @@ pub(crate) fn tls12_certificate_request_schemes(policy: &SignaturePolicy) -> Vec
         }
         for &scheme in algo.tls_schemes() {
             let s = SignatureScheme(scheme);
-            if !s.is_brainpool_tls13() && !out.contains(&s) {
+            if is_tls12_signature_scheme(s) && !out.contains(&s) {
                 out.push(s);
             }
         }
@@ -379,18 +382,84 @@ pub(crate) fn verify_signature(
     policy: &SignaturePolicy,
 ) -> Result<(), Error> {
     let algo = find_by_tls_scheme(scheme.0).ok_or(Error::PeerMisbehaved)?;
-    verify_with(algo, scheme, key, message, signature, policy)
+    verify_with(
+        algo,
+        scheme,
+        key,
+        message,
+        signature,
+        policy,
+        Error::BadCertificate,
+    )
 }
 
-/// [`verify_signature`] under (D)TLS 1.2 rules (RFC 5246 §7.4.1.4.1): the
-/// two-byte scheme is a `SignatureAndHashAlgorithm` pair, and for ECDSA the
-/// pair names a hash only — `(sha256, ecdsa)` is valid under a P-384 key,
-/// which is what wolfSSL signs its `ServerKeyExchange` with. TLS 1.3 gave
-/// the same code points curve-pinned meanings (RFC 8446 §4.2.3, which also
-/// says a TLS 1.3 implementation negotiating 1.2 "MUST behave in accordance
-/// with the requirements of [RFC5246]"), so the 1.2 engines dispatch the
-/// ECDSA schemes to the OID-keyed any-curve registry entries instead; the
-/// policy's curve floor still applies. Everything else is as in TLS 1.3.
+/// Whether `scheme` is defined as a (D)TLS 1.2 handshake signature, i.e. may
+/// appear in a `ServerKeyExchange` or a `CertificateVerify` of that version:
+///
+/// * the RFC 5246 §7.4.1.4.1 `SignatureAndHashAlgorithm` pairs over RSA
+///   PKCS#1 v1.5 (signature 1) and ECDSA (signature 3) with SHA-1 through
+///   SHA-512 (hash 2..=6) — which of them is *accepted* is the
+///   [`SignaturePolicy`]'s call;
+/// * the six RSASSA-PSS schemes, which RFC 8446 §4.2.3 defines for TLS 1.2
+///   as well;
+/// * `ed25519` (0x0807) and `ed448` (0x0808): RFC 8422 §5.1.3 writes them as
+///   the pairs (8, 7) and (8, 8), hash 8 being "Intrinsic".
+///
+/// Everything else is closed: the RFC 8734 Brainpool code points ("MUST NOT
+/// be used in TLS 1.2", §2), ML-DSA (draft-ietf-tls-mldsa: TLS 1.3 only; a
+/// peer that uses one in a TLS 1.2 `ServerKeyExchange` or
+/// `CertificateVerify` is answered with `illegal_parameter`), and any code
+/// point this crate does not know.
+pub(crate) fn is_tls12_signature_scheme(scheme: SignatureScheme) -> bool {
+    let [hash, signature] = scheme.0.to_be_bytes();
+    match hash {
+        2..=6 => matches!(signature, 1 | 3),
+        8 => matches!(signature, 0x04..=0x0b),
+        _ => false,
+    }
+}
+
+/// The registry entry a (D)TLS 1.2 handshake signature under `scheme` is
+/// verified with, or `None` for a scheme that version does not define or the
+/// registry cannot verify.
+///
+/// RFC 5246 §7.4.1.4.1: the two-byte scheme is a `SignatureAndHashAlgorithm`
+/// pair, and for ECDSA the pair names a hash only — `(sha256, ecdsa)` is
+/// valid under a P-384 key, which is what wolfSSL signs its
+/// `ServerKeyExchange` with. TLS 1.3 gave the same code points curve-pinned
+/// meanings (RFC 8446 §4.2.3, which also says a TLS 1.3 implementation
+/// negotiating 1.2 "MUST behave in accordance with the requirements of
+/// [RFC5246]"), so the ECDSA schemes go to the OID-keyed any-curve entries.
+/// The EdDSA schemes mean the same thing in both versions — PureEdDSA over
+/// the signed bytes, Ed448 with the empty context (RFC 8422 §5.10) — and so
+/// do the RSA ones.
+fn tls12_registry_entry(scheme: SignatureScheme) -> Option<&'static dyn SignatureAlgorithm> {
+    if !is_tls12_signature_scheme(scheme) {
+        return None;
+    }
+    match scheme {
+        SignatureScheme::ECDSA_SECP256R1_SHA256 => find_by_id("ecdsa-with-sha256"),
+        SignatureScheme::ECDSA_SECP384R1_SHA384 => find_by_id("ecdsa-with-sha384"),
+        SignatureScheme::ECDSA_SECP521R1_SHA512 => find_by_id("ecdsa-with-sha512"),
+        _ => find_by_tls_scheme(scheme.0),
+    }
+}
+
+/// [`verify_signature`] under (D)TLS 1.2 rules: `scheme` must be one that
+/// version defines ([`is_tls12_signature_scheme`]; anything else —
+/// Brainpool-TLS-1.3, ML-DSA, unknown — is [`Error::PeerMisbehaved`], i.e.
+/// `illegal_parameter`), the ECDSA schemes are hash/signature pairs valid
+/// under any curve the policy's floor admits (see [`tls12_registry_entry`]),
+/// and `ed25519` / `ed448` are PureEdDSA over `message` (RFC 8422 §5.4,
+/// §5.8, §5.10).
+///
+/// A scheme that does not fit the key — an ECDSA code point over an Ed25519
+/// key or the reverse (RFC 8422 §5.9: "Ed25519 ... keys MUST NOT be used
+/// with ECDSA") — is [`Error::PeerMisbehaved`]; a signature that does not
+/// verify is [`Error::DecryptError`] (RFC 5246 §7.2.2 `decrypt_error`:
+/// "unable to correctly verify a signature"); a malformed one (wrong length
+/// for EdDSA, bad DER for ECDSA) is [`Error::Decode`]; a scheme or key the
+/// policy refuses is [`Error::BadCertificate`].
 pub(crate) fn verify_signature_tls12(
     scheme: SignatureScheme,
     key: &AnyPublicKey,
@@ -398,18 +467,26 @@ pub(crate) fn verify_signature_tls12(
     signature: &[u8],
     policy: &SignaturePolicy,
 ) -> Result<(), Error> {
-    let any_curve = match scheme {
-        SignatureScheme::ECDSA_SECP256R1_SHA256 => Some("ecdsa-with-sha256"),
-        SignatureScheme::ECDSA_SECP384R1_SHA384 => Some("ecdsa-with-sha384"),
-        SignatureScheme::ECDSA_SECP521R1_SHA512 => Some("ecdsa-with-sha512"),
-        _ => None,
-    };
-    let algo = match any_curve {
-        Some(id) => find_by_id(id),
-        None => find_by_tls_scheme(scheme.0),
-    }
-    .ok_or(Error::PeerMisbehaved)?;
-    verify_with(algo, scheme, key, message, signature, policy)
+    let algo = tls12_registry_entry(scheme).ok_or(Error::PeerMisbehaved)?;
+    verify_with(
+        algo,
+        scheme,
+        key,
+        message,
+        signature,
+        policy,
+        Error::DecryptError,
+    )
+}
+
+/// Whether a leaf key of this type can authenticate a (D)TLS 1.2
+/// `ECDHE_ECDSA` cipher suite: RFC 8422 §2.2 / §5.3 — "the certificate MUST
+/// contain an ECDSA- or EdDSA-capable public key".
+pub(crate) fn key_fits_ecdhe_ecdsa(key: &AnyPublicKey) -> bool {
+    matches!(
+        key,
+        AnyPublicKey::Ecdsa(_) | AnyPublicKey::Ed25519(_) | AnyPublicKey::Ed448(_)
+    )
 }
 
 fn verify_with(
@@ -419,6 +496,9 @@ fn verify_with(
     message: &[u8],
     signature: &[u8],
     policy: &SignaturePolicy,
+    // What a signature that fails to verify is reported as: the versions
+    // differ (see the callers).
+    bad_signature: Error,
 ) -> Result<(), Error> {
     // The `rsa-pss-pss-*` registry entries accept both RSA SPKI forms (the
     // X.509 path needs the `rsaEncryption` one), so the TLS rule is applied
@@ -446,7 +526,7 @@ fn verify_with(
         // the scheme (e.g. an RSA key against `ecdsa_secp256r1_sha256`).
         Err(X509Error::UnsupportedAlgorithm) => Err(Error::PeerMisbehaved),
         Err(X509Error::Malformed) => Err(Error::Decode),
-        Err(_) => Err(Error::BadCertificate),
+        Err(_) => Err(bad_signature),
     }
 }
 
@@ -1020,5 +1100,203 @@ mod tests {
             ),
             Err(Error::PeerMisbehaved)
         ));
+    }
+
+    /// The (D)TLS 1.2 scheme set (`is_tls12_signature_scheme`): the RFC
+    /// 5246 §7.4.1.4.1 RSA / ECDSA pairs, the RFC 8446 §4.2.3 RSA-PSS
+    /// schemes, and RFC 8422 §5.1.3's `ed25519` / `ed448` — and nothing
+    /// else: no RFC 8734 Brainpool (TLS 1.3 only), no ML-DSA (unspecified
+    /// for 1.2), no DSA, no unknown code point.
+    #[test]
+    fn tls12_scheme_set_is_closed() {
+        for s in [
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_SECP256R1_SHA256,
+            SignatureScheme::ECDSA_SECP384R1_SHA384,
+            SignatureScheme::ECDSA_SECP521R1_SHA512,
+            SignatureScheme::RSA_PSS_RSAE_SHA256,
+            SignatureScheme::RSA_PSS_RSAE_SHA384,
+            SignatureScheme::RSA_PSS_RSAE_SHA512,
+            SignatureScheme::RSA_PSS_PSS_SHA256,
+            SignatureScheme::RSA_PSS_PSS_SHA384,
+            SignatureScheme::RSA_PSS_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+            // (sha1, rsa), (sha1, ecdsa), (sha224, ecdsa): defined, if not
+            // acceptable to the default policy.
+            SignatureScheme(0x0201),
+            SignatureScheme(0x0203),
+            SignatureScheme(0x0303),
+        ] {
+            assert!(is_tls12_signature_scheme(s), "{s:?}");
+        }
+        for s in [
+            SignatureScheme::ECDSA_BRAINPOOLP256R1TLS13_SHA256,
+            SignatureScheme::ECDSA_BRAINPOOLP384R1TLS13_SHA384,
+            SignatureScheme::ECDSA_BRAINPOOLP512R1TLS13_SHA512,
+            SignatureScheme::MLDSA44,
+            SignatureScheme::MLDSA65,
+            SignatureScheme::MLDSA87,
+            // dsa_sha256, (none, anonymous), (sha256, unassigned), hash 8
+            // with a signature outside 4..=11, reserved / private use.
+            SignatureScheme(0x0402),
+            SignatureScheme(0x0000),
+            SignatureScheme(0x0404),
+            SignatureScheme(0x0803),
+            SignatureScheme(0x080c),
+            SignatureScheme(0xfe00),
+            SignatureScheme(0xffff),
+        ] {
+            assert!(!is_tls12_signature_scheme(s), "{s:?}");
+        }
+        // What the 1.2 ClientHello offers is exactly the 1.3 offer's
+        // TLS-1.2-defined subset, with EdDSA in it.
+        let tls12 = crate::tls::codec::extension::parse_signature_algorithms(
+            &crate::tls::codec::extension::signature_algorithms_tls12().1,
+        )
+        .unwrap();
+        let tls13 = crate::tls::codec::extension::offered_signature_schemes();
+        let expected: Vec<SignatureScheme> = tls13
+            .iter()
+            .copied()
+            .filter(|s| is_tls12_signature_scheme(*s))
+            .collect();
+        assert_eq!(tls12, expected);
+        assert!(tls12.contains(&SignatureScheme::ED25519));
+        assert!(tls12.contains(&SignatureScheme::ED448));
+    }
+
+    /// RFC 8422 §5.4 / §5.8 / §5.10 in the 1.2 verifier: `ed25519` /
+    /// `ed448` are PureEdDSA over the signed bytes (Ed448 with the empty
+    /// context), the same signature TLS 1.3 verifies; a scheme that does
+    /// not fit the key (RFC 8422 §5.9: EdDSA keys "MUST NOT be used with
+    /// ECDSA", and the reverse) or that TLS 1.2 does not define (ML-DSA)
+    /// is `PeerMisbehaved` (`illegal_parameter`); a signature of the wrong
+    /// length is `Decode`; one that does not verify is `DecryptError` (RFC
+    /// 5246 §7.2.2), where TLS 1.3 reports `BadCertificate`.
+    #[test]
+    fn tls12_verifier_dispatches_eddsa_and_refuses_the_rest() {
+        use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
+        use crate::rng::HmacDrbg;
+        use crate::x509::AnyPublicKey;
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"tls12-eddsa", b"nonce", &[]);
+        let policy = SignaturePolicy::modern();
+        let msg = b"client_random || server_random || ServerECDHParams";
+        let ed25519 = Ed25519PrivateKey::generate(&mut rng);
+        let ed448 = Ed448PrivateKey::generate(&mut rng);
+        let p256 = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let k25519 = AnyPublicKey::Ed25519(ed25519.public_key());
+        let k448 = AnyPublicKey::Ed448(ed448.public_key());
+        let kp256 = AnyPublicKey::Ecdsa(p256.public_key());
+        let s25519 = ed25519.sign(msg).to_bytes().to_vec();
+        let s448 = ed448.sign(msg).to_bytes().to_vec();
+        let sp256 = p256.sign::<Sha256>(msg).unwrap().to_der(CurveId::P256);
+
+        // The happy paths, identical in both versions.
+        for (scheme, key, sig) in [
+            (SignatureScheme::ED25519, &k25519, &s25519),
+            (SignatureScheme::ED448, &k448, &s448),
+        ] {
+            verify_signature_tls12(scheme, key, msg, sig, &policy).unwrap();
+            verify_signature(scheme, key, msg, sig, &policy).unwrap();
+        }
+
+        // Scheme / key mismatches: an ECDSA code point over an EdDSA key
+        // and the reverse, ed25519 over an Ed448 key.
+        for (scheme, key, sig) in [
+            (SignatureScheme::ECDSA_SECP256R1_SHA256, &k25519, &s25519),
+            (SignatureScheme::ECDSA_SECP256R1_SHA256, &k448, &s448),
+            (SignatureScheme::ED25519, &kp256, &sp256),
+            (SignatureScheme::ED448, &kp256, &sp256),
+            (SignatureScheme::ED25519, &k448, &s448),
+            (SignatureScheme::RSA_PSS_RSAE_SHA256, &k25519, &s25519),
+        ] {
+            assert!(
+                matches!(
+                    verify_signature_tls12(scheme, key, msg, sig, &policy),
+                    Err(Error::PeerMisbehaved)
+                ),
+                "{scheme:?}"
+            );
+        }
+        // Schemes TLS 1.2 does not define, whatever the key.
+        for scheme in [
+            SignatureScheme::MLDSA44,
+            SignatureScheme::MLDSA65,
+            SignatureScheme::MLDSA87,
+            SignatureScheme::ECDSA_BRAINPOOLP256R1TLS13_SHA256,
+            SignatureScheme(0x0402),
+            SignatureScheme(0xfe00),
+        ] {
+            assert!(
+                matches!(
+                    verify_signature_tls12(scheme, &k25519, msg, &s25519, &policy),
+                    Err(Error::PeerMisbehaved)
+                ),
+                "{scheme:?}"
+            );
+        }
+        // Wrong length: `decode_error`.
+        assert!(matches!(
+            verify_signature_tls12(
+                SignatureScheme::ED25519,
+                &k25519,
+                msg,
+                &s25519[..63],
+                &policy
+            ),
+            Err(Error::Decode)
+        ));
+        assert!(matches!(
+            verify_signature_tls12(SignatureScheme::ED448, &k448, msg, &s25519, &policy),
+            Err(Error::Decode)
+        ));
+        // A signature that does not verify: `decrypt_error` on 1.2,
+        // `bad_certificate` on 1.3.
+        let mut bad = s25519.clone();
+        bad[40] ^= 1;
+        assert!(matches!(
+            verify_signature_tls12(SignatureScheme::ED25519, &k25519, msg, &bad, &policy),
+            Err(Error::DecryptError)
+        ));
+        assert!(matches!(
+            verify_signature(SignatureScheme::ED25519, &k25519, msg, &bad, &policy),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(
+            verify_signature_tls12(
+                SignatureScheme::ED25519,
+                &k25519,
+                b"other",
+                &s25519,
+                &policy
+            ),
+            Err(Error::DecryptError)
+        ));
+        let mut bad = s448.clone();
+        bad[60] ^= 1;
+        assert!(matches!(
+            verify_signature_tls12(SignatureScheme::ED448, &k448, msg, &bad, &policy),
+            Err(Error::DecryptError)
+        ));
+        // The policy still gates EdDSA: with `ed25519` struck off, the
+        // scheme is refused as `BadCertificate` (the registry never runs).
+        let no_ed = SignaturePolicy::empty().permit("ed448");
+        assert!(matches!(
+            verify_signature_tls12(SignatureScheme::ED25519, &k25519, msg, &s25519, &no_ed),
+            Err(Error::BadCertificate)
+        ));
+        verify_signature_tls12(SignatureScheme::ED448, &k448, msg, &s448, &no_ed).unwrap();
+        // RFC 8422 §2.2: EdDSA keys authenticate the `ECDHE_ECDSA` suites,
+        // as ECDSA ones do; RSA keys do not.
+        assert!(key_fits_ecdhe_ecdsa(&k25519));
+        assert!(key_fits_ecdhe_ecdsa(&k448));
+        assert!(key_fits_ecdhe_ecdsa(&kp256));
+        let rsa = crate::test_util::rsa_test_key_a();
+        let rsa = BoxedRsaPrivateKey::from_pkcs1_der(&rsa.to_pkcs1_der()).unwrap();
+        assert!(!key_fits_ecdhe_ecdsa(&AnyPublicKey::Rsa(rsa.public_key())));
     }
 }

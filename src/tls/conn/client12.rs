@@ -45,7 +45,6 @@ use super::super::codec::{
     write_record,
 };
 use super::client::ClientCertConfig;
-#[cfg(feature = "tls-legacy")]
 use super::client::ClientKey;
 use super::common::MAX_HANDSHAKE_REASSEMBLY;
 use crate::ct::ConstantTimeEq;
@@ -53,6 +52,7 @@ use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
 #[cfg(feature = "tls-legacy")]
 use crate::hash::{Digest, Md5, Sha1};
+use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
@@ -65,7 +65,7 @@ use crate::tls::codec::handshake12::{
 };
 use crate::tls::codec::{
     CipherSuite, ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello,
-    cert_type, hs_type, read_handshake, with_len_u16, with_len_u24,
+    SignatureScheme, cert_type, hs_type, read_handshake, with_len_u16, with_len_u24,
 };
 use crate::tls::crypto::HashAlg;
 use crate::tls::crypto::aead12::RecordCrypter12;
@@ -83,6 +83,7 @@ use crate::tls::crypto::prf::{
     master_secret_legacy,
 };
 use crate::tls::crypto::record_prot::RecordProtection;
+use crate::tls::crypto::sign::{is_tls12_signature_scheme, key_fits_ecdhe_ecdsa};
 #[cfg(feature = "tls-legacy")]
 use crate::tls::crypto::ssl3;
 use crate::tls::crypto::{AeadAlg, Transcript, verify_signature_tls12};
@@ -613,11 +614,13 @@ fn key_matches_sig_kind(key: &AnyPublicKey, kind: SigKind) -> bool {
         // under the scheme the server chose, and the `rsa_pss_*` entries
         // honour the restriction while `rsa_pkcs1_*` refuse the key.
         (AnyPublicKey::Rsa(_) | AnyPublicKey::RsaPss(..), SigKind::Rsa) => true,
-        (AnyPublicKey::Ecdsa(_), SigKind::Ecdsa) => true,
-        // Ed25519 / ML-DSA leaves don't fit either RSA or ECDSA TLS-1.2 ECDHE
-        // suites (there are no IANA-assigned `TLS_ECDHE_EDDSA_*` or
-        // `TLS_ECDHE_MLDSA_*` codepoints). Reject explicitly so the connection
-        // visibly fails rather than misinterpreting the leaf later.
+        // RFC 8422 §2.2 / §5.3: an `ECDHE_ECDSA` suite is authenticated by
+        // "an ECDSA- or EdDSA-capable public key".
+        (_, SigKind::Ecdsa) => key_fits_ecdhe_ecdsa(key),
+        // An ML-DSA leaf fits no TLS 1.2 suite: nothing specifies it for
+        // that version (draft-ietf-tls-mldsa is TLS 1.3 only). Reject
+        // explicitly so the connection visibly fails rather than
+        // misinterpreting the leaf later.
         _ => false,
     }
 }
@@ -745,6 +748,10 @@ pub struct ClientConnection12 {
     cert_chain: Vec<Vec<u8>>,
     /// Peer leaf public key, extracted from the leaf cert (verified or raw).
     leaf_key: Option<AnyPublicKey>,
+    /// The `SignatureScheme` the peer's handshake signature carried and
+    /// verified under, for the negotiated-parameter report. `None` until
+    /// then.
+    peer_signature_scheme: Option<SignatureScheme>,
     /// Negotiated ECDHE share from `ServerKeyExchange`: (group, peer point).
     peer_share: Option<(NamedGroup, Vec<u8>)>,
     /// Negotiated ALPN, if any.
@@ -776,6 +783,12 @@ pub struct ClientConnection12 {
     /// Drives whether we emit our own `Certificate` (+ CertificateVerify) in
     /// the client flight that follows ServerHelloDone.
     cert_request_received: bool,
+    /// mTLS: the scheme our `CertificateVerify` will carry, settled when the
+    /// `CertificateRequest` arrives — our key's own scheme, provided the
+    /// request lists it and the key's certificate type (RFC 5246 §7.4.4).
+    /// `None` when the configured identity is not "suitable" for the
+    /// request, in which case §7.4.6 has us send an empty `Certificate`.
+    client_cert_scheme: Option<SignatureScheme>,
     /// RFC 5077 resumption: the most recent ticket we received from the
     /// server (set when a `NewSessionTicket` arrives during the handshake).
     received_ticket: Option<Vec<u8>>,
@@ -981,6 +994,7 @@ impl ClientConnection12 {
             legacy_rng,
             cert_chain: Vec::new(),
             leaf_key: None,
+            peer_signature_scheme: None,
             peer_share: None,
             alpn_negotiated: None,
             peer_record_size_limit: None,
@@ -990,6 +1004,7 @@ impl ClientConnection12 {
             server_crypter: None,
             pending_server_crypter: None,
             cert_request_received: false,
+            client_cert_scheme: None,
             received_ticket: None,
             received_ticket_lifetime: 0,
             nst_received: false,
@@ -1135,6 +1150,7 @@ impl ClientConnection12 {
             legacy_rng,
             cert_chain: Vec::new(),
             leaf_key: None,
+            peer_signature_scheme: None,
             peer_share: None,
             alpn_negotiated: None,
             peer_record_size_limit: None,
@@ -1144,6 +1160,7 @@ impl ClientConnection12 {
             server_crypter: None,
             pending_server_crypter: None,
             cert_request_received: false,
+            client_cert_scheme: None,
             received_ticket: None,
             received_ticket_lifetime: 0,
             nst_received: false,
@@ -1311,6 +1328,12 @@ impl ClientConnection12 {
     /// The peer's certificate chain in wire order (DER), leaf first.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.cert_chain
+    }
+
+    /// The IANA `SignatureScheme` code point of the peer's verified
+    /// handshake signature — its `ServerKeyExchange` — once verified.
+    pub fn peer_signature_scheme(&self) -> Option<u16> {
+        self.peer_signature_scheme.map(|s| s.0)
     }
 
     /// The ALPN protocol the server selected, if any.
@@ -2663,6 +2686,17 @@ impl ClientConnection12 {
         if !self.offered_groups.contains(&ske.group) {
             return Err(Error::IllegalParameter);
         }
+        // RFC 5246 §7.4.3: the signature's (hash, signature) pair "MUST be
+        // one of those present in the signature_algorithms extension" of our
+        // ClientHello — `signature_algorithms_tls12()` here, or the TLS 1.3
+        // list of an adopted version-spanning ClientHello, whose extra
+        // entries (Brainpool-TLS-1.3, ML-DSA) have no TLS 1.2 meaning and
+        // are refused by the verifier below. A server signing under a
+        // scheme it was not offered is choosing our verifier for us:
+        // `illegal_parameter`.
+        if !ext::offered_signature_schemes().contains(&ske.scheme) {
+            return Err(Error::IllegalParameter);
+        }
 
         // Verify the SKE signature: `signed_message(cr, sr, group, point)`
         // signed under the leaf key per scheme `ske.scheme`.
@@ -2681,6 +2715,7 @@ impl ClientConnection12 {
             &ske.signature,
             &self.config.signature_policy,
         )?;
+        self.peer_signature_scheme = Some(ske.scheme);
 
         self.peer_share = Some((ske.group, ske.point.clone()));
         self.transcript.update(raw);
@@ -2709,6 +2744,18 @@ impl ClientConnection12 {
                     return Err(Error::UnexpectedMessage);
                 }
                 self.cert_request_received = true;
+                // No `SignatureAndHashAlgorithm` before TLS 1.2: the
+                // legacy CertificateVerify carries none, and the signer
+                // applies the version's fixed rule (`MD5 || SHA-1` for
+                // RSA, SHA-1 for ECDSA). An identity of any other key type
+                // has no legacy encoding, so it is not "suitable" (RFC
+                // 4346 §7.4.6) and an empty Certificate goes out.
+                self.client_cert_scheme = self.config.client_cert.as_ref().and_then(|cc| match cc
+                    .key()
+                {
+                    ClientKey::Rsa(_) | ClientKey::Ecdsa(_) => Some(SignatureScheme(0)),
+                    _ => None,
+                });
                 self.transcript.update(raw);
                 return Ok(());
             }
@@ -2732,8 +2779,9 @@ impl ClientConnection12 {
             if self.cert_request_received {
                 return Err(Error::UnexpectedMessage);
             }
-            let _cr = CertificateRequest12::decode(body)?;
+            let cr = CertificateRequest12::decode(body)?;
             self.cert_request_received = true;
+            self.client_cert_scheme = self.suitable_client_cert_scheme(&cr)?;
             self.transcript.update(raw);
             return Ok(());
         }
@@ -2834,34 +2882,71 @@ impl ClientConnection12 {
         Ok(())
     }
 
+    /// mTLS: the scheme our identity signs the `CertificateVerify` under, if
+    /// the server's `CertificateRequest` admits it (RFC 5246 §7.4.4 and
+    /// §7.4.8: the scheme "MUST be one of those present in the
+    /// supported_signature_algorithms field", and the key must be of a
+    /// listed `certificate_types` entry — `rsa_sign` (1) for RSA,
+    /// `ecdsa_sign` (64) for ECDSA and, per RFC 8422 §3 / §5.5, EdDSA).
+    /// `Ok(None)` when our identity is not "suitable" (§7.4.6): an empty
+    /// `Certificate` follows, and the server decides whether that is fatal.
+    ///
+    /// A key that has no TLS 1.2 scheme at all — ECDSA on secp256k1 / SM2
+    /// (no code point), Brainpool (RFC 8734: TLS 1.3 only), ML-DSA (not
+    /// specified for TLS 1.2) — is a configuration error rather than a
+    /// mismatch with this server: [`Error::UnsupportedKeyType`].
+    fn suitable_client_cert_scheme(
+        &self,
+        cr: &CertificateRequest12,
+    ) -> Result<Option<SignatureScheme>, Error> {
+        let Some(cc) = self.config.client_cert.as_ref() else {
+            return Ok(None);
+        };
+        let scheme = ClientCertConfig::signature_scheme_for(cc.key())
+            .filter(|s| is_tls12_signature_scheme(*s))
+            .ok_or(Error::UnsupportedKeyType)?;
+        let cert_type = match cc.key() {
+            ClientKey::Rsa(_) | ClientKey::RsaPss(..) => 1u8,
+            _ => 64u8,
+        };
+        Ok(
+            (cr.sig_schemes.contains(&scheme) && cr.cert_types.contains(&cert_type))
+                .then_some(scheme),
+        )
+    }
+
     /// mTLS: emit our `Certificate` (TLS 1.2 RFC 5246 §7.4.6). The chain is
-    /// our configured one, or empty when no client cert is configured (the
-    /// server then decides per its `required` flag). Under a negotiated
+    /// our configured one, or empty when no client cert is configured or
+    /// the server's request does not admit it (the server then decides per
+    /// its `required` flag). Under a negotiated
     /// `RawPublicKey` (RFC 7250 §4.4) the message carries the configured
     /// bare SPKI instead — or nothing, when no SPKI is configured. Returns
     /// whether a key was presented, i.e. whether a `CertificateVerify` must
     /// follow the `ClientKeyExchange`.
     fn send_client_certificate(&mut self) -> bool {
         let rpk = self.negotiated_client_cert_type == cert_type::RAW_PUBLIC_KEY;
+        // Nothing to present unless the request admits our key (see
+        // `suitable_client_cert_scheme`).
+        let client_cert = self
+            .config
+            .client_cert
+            .as_ref()
+            .filter(|_| self.client_cert_scheme.is_some());
         let (msg, presented) = if rpk {
-            let spki = self
-                .config
-                .client_cert
-                .as_ref()
-                .and(self.config.raw_public_key_spki.as_deref());
+            let spki = client_cert.and(self.config.raw_public_key_spki.as_deref());
             (encode_raw_public_key_certificate(spki), spki.is_some())
         } else {
             let mut msg = alloc::vec![hs_type::CERTIFICATE];
             with_len_u24(&mut msg, |b| {
                 with_len_u24(b, |list| {
-                    if let Some(cc) = self.config.client_cert.as_ref() {
+                    if let Some(cc) = client_cert {
                         for cert in cc.chain() {
                             with_len_u24(list, |c| c.extend_from_slice(cert));
                         }
                     }
                 });
             });
-            (msg, self.config.client_cert.is_some())
+            (msg, client_cert.is_some())
         };
         self.transcript.update(&msg);
         self.write_plain_record(ContentType::Handshake, &msg);
@@ -2878,20 +2963,41 @@ impl ClientConnection12 {
             .client_cert
             .as_ref()
             .ok_or(Error::InappropriateState)?;
-        // The signer takes the un-hashed transcript bytes; PSS / ECDSA /
-        // Ed25519 impls each apply their own hash internally.
+        // The signer takes the un-hashed transcript bytes; PSS / ECDSA
+        // impls each apply their own hash internally, and EdDSA signs them
+        // as they are (RFC 8422 §5.8 / §5.10: "with no hashing").
         let to_sign = self.transcript.buffered_bytes().to_vec();
-        // No scheme at all (secp256k1 / SM2), or a TLS 1.3-only one (the RFC
-        // 8734 Brainpool code points): the key cannot sign a TLS 1.2
-        // CertificateVerify any conformant server accepts.
-        let scheme = ClientCertConfig::signature_scheme_for(cc.key())
-            .filter(|s| !s.is_brainpool_tls13())
-            .ok_or(Error::UnsupportedKeyType)?;
-        // No RNG in the client state machine: the shared signer derives the
-        // PSS salt from the key and the signed bytes and signs ML-DSA
-        // deterministically. An external key is not supported on this path.
-        let signature =
-            crate::tls::crypto::sign::sign_client_certificate_verify(cc.key(), scheme, &to_sign)?;
+        // Settled on the CertificateRequest; a `Certificate` was only
+        // presented (and this called) when it is `Some`.
+        let scheme = self.client_cert_scheme.ok_or(Error::InappropriateState)?;
+        let signature: Vec<u8> = match cc.key() {
+            // No RNG in the client state machine: the PSS salt is derived
+            // from the key and the signed bytes (see
+            // `sign_rsa_pss_deterministic`).
+            ClientKey::Rsa(k) | ClientKey::RsaPss(k, _) => {
+                crate::tls::crypto::sign::sign_rsa_pss_deterministic(k, scheme, &to_sign)?
+            }
+            ClientKey::Ecdsa(k) => {
+                let sig = match k.curve() {
+                    CurveId::P384 => k.sign::<Sha384>(&to_sign),
+                    CurveId::P521 => k.sign::<Sha512>(&to_sign),
+                    _ => k.sign::<Sha256>(&to_sign),
+                }
+                .map_err(|_| Error::HandshakeFailure)?;
+                sig.to_der(k.curve())
+            }
+            // Raw R‖S (64 / 114 bytes); Ed448 under the empty context.
+            ClientKey::Ed25519(k) => k.sign(&to_sign).to_bytes().to_vec(),
+            ClientKey::Ed448(k) => k.sign(&to_sign).to_bytes().to_vec(),
+            // ML-DSA has no TLS 1.2 scheme (`suitable_client_cert_scheme`
+            // refused the identity); classic TLS 1.2 client-cert external
+            // signing is out of scope.
+            #[cfg(feature = "mldsa")]
+            ClientKey::MlDsa44(_) | ClientKey::MlDsa65(_) | ClientKey::MlDsa87(_) => {
+                return Err(Error::UnsupportedKeyType);
+            }
+            ClientKey::External { .. } => return Err(Error::HandshakeFailure),
+        };
         let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
         with_len_u24(&mut msg, |b| {
             b.extend_from_slice(&scheme.0.to_be_bytes());

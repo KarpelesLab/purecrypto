@@ -74,9 +74,10 @@ const DEFAULT_MAX_FRAGMENT: usize = 1100;
 pub(crate) struct ServerConfig12Internal {
     /// Certificate chain (leaf first).
     cert_chain: Vec<Vec<u8>>,
-    /// Signing key. Matches TLS 1.2's scope: RSA-PSS or ECDSA. Other
-    /// variants of [`ServerKey`] can be plumbed in but will fail at
-    /// handshake time because no suite in `SUITES_12` matches them.
+    /// Signing key. Matches TLS 1.2's scope: RSA-PSS, ECDSA, or EdDSA under
+    /// the `ECDHE_ECDSA` suites (RFC 8422 §2.2). An ML-DSA key can be
+    /// plumbed in but fails at handshake time: nothing specifies it for
+    /// (D)TLS 1.2, so it has no signature scheme there.
     key: ServerKey,
     /// Cookie generator secret. When `None`, the server skips
     /// HelloVerifyRequest entirely (useful for tests; a production
@@ -186,6 +187,21 @@ impl ServerConfig12Internal {
         self
     }
 
+    /// New configuration presenting `cert_chain` and signing with the
+    /// Ed25519 `key`: the `ECDHE-ECDSA-*` suites (RFC 8422 §2.2), the
+    /// `ServerKeyExchange` signed with `ed25519` (0x0807) — PureEdDSA over
+    /// the unhashed parameters (RFC 8422 §5.4, §5.10). Mirrors
+    /// `ServerConfig12::with_ed25519`.
+    pub fn with_ed25519(cert_chain: Vec<Vec<u8>>, key: crate::ec::Ed25519PrivateKey) -> Self {
+        Self::with_signing_key(cert_chain, ServerKey::Ed25519(key))
+    }
+
+    /// [`Self::with_ed25519`] for an Ed448 key, signing with `ed448`
+    /// (0x0808) under the empty context (RFC 8422 §5.10).
+    pub fn with_ed448(cert_chain: Vec<Vec<u8>>, key: crate::ec::Ed448PrivateKey) -> Self {
+        Self::with_signing_key(cert_chain, ServerKey::Ed448(key))
+    }
+
     /// Restricts and orders the ECDHE groups (see [`Self::groups`]).
     pub fn with_groups(mut self, groups: Vec<NamedGroup>) -> Self {
         self.groups = groups;
@@ -204,7 +220,8 @@ impl ServerConfig12Internal {
     /// New configuration whose `ServerKeyExchange` signature is produced
     /// out-of-band by the caller (suspend/resume). `schemes` are the IANA
     /// `SignatureScheme` code points the external key can produce; the first
-    /// drives suite selection (ECDSA vs RSA `ECDHE-*`).
+    /// one DTLS 1.2 defines is signed under and drives suite selection
+    /// (ECDSA / EdDSA vs RSA `ECDHE-*`).
     pub fn with_external(cert_chain: Vec<Vec<u8>>, schemes: Vec<u16>) -> Self {
         let schemes = schemes.into_iter().map(SignatureScheme).collect();
         Self::with_signing_key(cert_chain, ServerKey::External { schemes })
@@ -1413,8 +1430,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // Suite selection — mirror the TLS 1.2 server (`src/tls/conn/server12.rs`):
         // walk SUITES_12 in OUR preference order, picking the first entry the
         // client offered whose signature half matches the configured key's
-        // family. RSA and ECDSA keys are both supported; an Ed25519 / ML-DSA
-        // server key can be plumbed in but will not match any suite.
+        // family (EdDSA counts as ECDSA, RFC 8422 §2.2). An ML-DSA server
+        // key can be plumbed in but has no DTLS 1.2 scheme
+        // (`signature_scheme` below).
         let sig_kind = sig_kind_for_key(&self.config.key);
         let suite = SUITES_12
             .iter()
@@ -1630,6 +1648,11 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 .map_err(|_| Error::HandshakeFailure)?;
                 sig.to_der(k.curve())
             }
+            // RFC 8422 §5.4 / §5.10: PureEdDSA over the same bytes ECDSA
+            // would hash, "with no hashing"; Ed448 under the empty context.
+            // The signature is the raw octet string (64 / 114 bytes).
+            ServerKey::Ed25519(k) => k.sign(&to_sign).to_bytes().to_vec(),
+            ServerKey::Ed448(k) => k.sign(&to_sign).to_bytes().to_vec(),
             // External key: hold the half-built flight + ECDHE params and
             // suspend; the caller signs `to_sign` and resumes via
             // `provide_signature`, which assembles the SKE + ServerHelloDone.
@@ -1644,8 +1667,12 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 self.state = State::AwaitingSkeSignature;
                 return Ok(());
             }
-            // Other variants are unreachable through the public constructors.
-            _ => return Err(Error::HandshakeFailure),
+            // ML-DSA: `signature_scheme` found no scheme above, so this is
+            // not reached.
+            #[cfg(feature = "mldsa")]
+            ServerKey::MlDsa44(_) | ServerKey::MlDsa65(_) | ServerKey::MlDsa87(_) => {
+                return Err(Error::UnsupportedKeyType);
+            }
         };
         self.finish_ske_flight(flight, scheme, group, our_point, signature)
     }
@@ -2249,37 +2276,42 @@ fn build_certificate_msg(chain: &[Vec<u8>]) -> Vec<u8> {
 /// for TLS 1.2 + 1.3 interop.
 ///
 /// `None` when the key has no DTLS 1.2 scheme: the RFC 8734 Brainpool code
-/// points are TLS 1.3 only (§2: "MUST NOT be used in TLS 1.2") and
-/// secp256k1 / SM2 have none at all. The caller turns that into
-/// `Error::UnsupportedKeyType` rather than signing under a NIST code point
-/// the client would reject.
+/// points are TLS 1.3 only (§2: "MUST NOT be used in TLS 1.2"), secp256k1 /
+/// SM2 have none at all, and ML-DSA is not specified for the version. The
+/// caller turns that into `Error::UnsupportedKeyType` rather than signing
+/// under a code point the client would reject. An EdDSA key signs under its
+/// own scheme (RFC 8422 §5.9: an Ed25519 key "MUST use the ed25519
+/// signature algorithm", an Ed448 key `ed448`).
 fn signature_scheme(key: &ServerKey) -> Option<SignatureScheme> {
     match key {
         ServerKey::Rsa(_) => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
         ServerKey::RsaPss(_, hash) => Some(crate::tls::crypto::sign::rsa_pss_pss_scheme(*hash)),
         ServerKey::Ecdsa(k) => crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve())
             .filter(|s| !s.is_brainpool_tls13()),
-        // External key: the caller advertises the scheme(s); use the preferred.
-        ServerKey::External { schemes } => Some(
-            schemes
-                .first()
-                .copied()
-                .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
-        ),
-        // Unreachable through the public constructors but the compiler
-        // requires the match to be total.
-        _ => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
+        ServerKey::Ed25519(_) => Some(SignatureScheme::ED25519),
+        ServerKey::Ed448(_) => Some(SignatureScheme::ED448),
+        // External key: the caller advertises the scheme(s); use the
+        // preferred one that DTLS 1.2 defines.
+        ServerKey::External { schemes } => schemes
+            .iter()
+            .copied()
+            .find(|s| crate::tls::crypto::sign::is_tls12_signature_scheme(*s)),
+        // ML-DSA: nothing specifies it for (D)TLS 1.2.
+        #[cfg(feature = "mldsa")]
+        ServerKey::MlDsa44(_) | ServerKey::MlDsa65(_) | ServerKey::MlDsa87(_) => None,
     }
 }
 
 /// The signature family of an IANA `SignatureScheme` code point, for DTLS 1.2
-/// `ECDHE-*` suite selection: the ECDSA code points map to `Ecdsa`, everything
-/// else (RSA-PSS) to `Rsa`.
+/// `ECDHE-*` suite selection: the ECDSA and EdDSA code points map to
+/// `Ecdsa` (RFC 8422 §2.2), everything else (RSA-PSS) to `Rsa`.
 fn sig_kind_from_scheme(scheme: SignatureScheme) -> SigKind {
     match scheme {
         SignatureScheme::ECDSA_SECP256R1_SHA256
         | SignatureScheme::ECDSA_SECP384R1_SHA384
-        | SignatureScheme::ECDSA_SECP521R1_SHA512 => SigKind::Ecdsa,
+        | SignatureScheme::ECDSA_SECP521R1_SHA512
+        | SignatureScheme::ED25519
+        | SignatureScheme::ED448 => SigKind::Ecdsa,
         _ => SigKind::Rsa,
     }
 }
@@ -2291,17 +2323,17 @@ fn sig_kind_from_scheme(scheme: SignatureScheme) -> SigKind {
 fn sig_kind_for_key(key: &ServerKey) -> SigKind {
     match key {
         ServerKey::Rsa(_) | ServerKey::RsaPss(..) => SigKind::Rsa,
-        ServerKey::Ecdsa(_) => SigKind::Ecdsa,
-        // External key: infer the family from the preferred advertised scheme
-        // so the matching `ECDHE-RSA-*` / `ECDHE-ECDSA-*` suites are offered.
-        ServerKey::External { schemes } => schemes
-            .first()
-            .copied()
-            .map_or(SigKind::Rsa, sig_kind_from_scheme),
-        // Other variants are inhabited by the shared `ServerKey` enum but
-        // are unreachable through the public DTLS-1.2 constructors. Default
-        // to a kind that will fail to match any of our suites.
-        _ => SigKind::Rsa,
+        ServerKey::Ecdsa(_) | ServerKey::Ed25519(_) | ServerKey::Ed448(_) => SigKind::Ecdsa,
+        // External key: infer the family from the scheme `signature_scheme`
+        // will sign under, so the matching `ECDHE-RSA-*` / `ECDHE-ECDSA-*`
+        // suites are offered.
+        ServerKey::External { .. } => {
+            signature_scheme(key).map_or(SigKind::Rsa, sig_kind_from_scheme)
+        }
+        // ML-DSA has no DTLS 1.2 scheme (`signature_scheme` refuses it before
+        // any suite is used); the family is immaterial.
+        #[cfg(feature = "mldsa")]
+        ServerKey::MlDsa44(_) | ServerKey::MlDsa65(_) | ServerKey::MlDsa87(_) => SigKind::Rsa,
     }
 }
 

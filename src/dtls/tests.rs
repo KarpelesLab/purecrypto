@@ -3040,6 +3040,76 @@ mod dtls12 {
             Some(CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256.0)
         );
     }
+
+    /// DTLS 1.2 + an EdDSA server certificate (RFC 8422 §2.2): the server
+    /// takes an `ECDHE-ECDSA-*` suite and signs its `ServerKeyExchange`
+    /// PureEdDSA under `ed25519` / `ed448` (§5.4, §5.10), which the client
+    /// verifies and reports. Data flows both ways afterwards.
+    #[test]
+    fn loopback_eddsa_cert() {
+        use crate::ec::{Ed448PrivateKey, Ed25519PrivateKey};
+
+        for ed448 in [false, true] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"dtls12-eddsa-key", b"nonce", &[]);
+            let name = DistinguishedName::common_name("dtls.example");
+            let validity = Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            );
+            let issue = |signer: &CertSigner<'_>| {
+                Certificate::self_signed_general(
+                    signer,
+                    &name,
+                    &validity,
+                    1,
+                    false,
+                    &["dtls.example"],
+                )
+                .unwrap()
+                .to_der()
+                .to_vec()
+            };
+            let (server_cfg, cert, scheme) = if ed448 {
+                let key = Ed448PrivateKey::generate(&mut rng);
+                let der = issue(&CertSigner::Ed448(&key));
+                (
+                    PcServerConfig12::with_ed448(alloc::vec![der.clone()], key),
+                    der,
+                    0x0808u16,
+                )
+            } else {
+                let key = Ed25519PrivateKey::generate(&mut rng);
+                let der = issue(&CertSigner::Ed25519(&key));
+                (
+                    PcServerConfig12::with_ed25519(alloc::vec![der.clone()], key),
+                    der,
+                    0x0807u16,
+                )
+            };
+            let server_cfg = server_cfg.require_cookie_exchange(false);
+            let mut client = make_client(&cert);
+            let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-eddsa", b"nonce", &[]);
+            let mut server =
+                DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+            assert!(pump(&mut client, &mut server));
+            assert_eq!(
+                client.negotiated_cipher_suite(),
+                Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.0)
+            );
+            assert_eq!(client.peer_signature_scheme(), Some(scheme));
+
+            client.send(b"ping-eddsa").unwrap();
+            for dg in &client.pop_outbound_datagrams() {
+                server.feed_datagram(dg).unwrap();
+            }
+            assert_eq!(server.take_received(), b"ping-eddsa");
+            server.send(b"pong-eddsa").unwrap();
+            for dg in &server.pop_outbound_datagrams() {
+                client.feed_datagram(dg).unwrap();
+            }
+            assert_eq!(client.take_received(), b"pong-eddsa");
+        }
+    }
 }
 
 /// Regression tests for the DTLS security audit (2026-09).

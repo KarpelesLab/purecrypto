@@ -49,9 +49,10 @@ pub enum SigningKey {
     Rsa(BoxedRsaPrivateKey),
     /// ECDSA key; the scheme is chosen from the curve at sign time.
     Ecdsa(BoxedEcdsaPrivateKey),
-    /// Ed25519 key.
+    /// Ed25519 key; signs `ed25519`. In (D)TLS 1.2 it authenticates the
+    /// `ECDHE_ECDSA` suites (RFC 8422 §2.2, §5.1.3).
     Ed25519(Ed25519PrivateKey),
-    /// Ed448 key (TLS 1.3 only).
+    /// Ed448 key; signs `ed448` (the same versions as Ed25519).
     Ed448(Ed448PrivateKey),
     /// ML-DSA-44 (FIPS 204, draft-ietf-tls-mldsa).
     #[cfg(feature = "mldsa")]
@@ -804,7 +805,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `versions` / `min_version` / `max_version` | yes | yes | yes | yes | inert (TLS 1.3 only) |
 /// | `rng`, `roots`, `crls`, `verification_time`, `signature_policy`, `key_log` | yes | yes | yes | yes | yes |
 /// | `server_name`, `verify_certificates` | yes | yes | yes | yes | yes |
-/// | `identity` / `try_identity` (server) | yes | RSA, ECDSA | yes | RSA, ECDSA, External | yes, not External |
+/// | `identity` / `try_identity` (server) | yes | RSA, ECDSA, Ed25519, Ed448 | yes | RSA, ECDSA, Ed25519, Ed448, External | yes, not External |
 /// | `identity` (client, mTLS) | yes | yes | yes | yes, not External | yes |
 /// | `private_key` / `try_private_key` ([`HandshakeSigner`](super::HandshakeSigner)) | yes | no ([`UnsupportedVersion`](super::Error::UnsupportedVersion)) | yes | server only (a client's is **refused**) | **refused** |
 /// | `client_auth` | yes | yes | yes | yes | yes |
@@ -1385,7 +1386,10 @@ impl SigningKey {
     }
 
     /// Construct a TLS 1.2 server config from this key + chain.
-    /// Returns `None` for keys TLS 1.2 doesn't support (Ed25519, ML-DSA).
+    /// Returns `None` for keys TLS 1.2 doesn't support: ML-DSA (no
+    /// specification defines it for that version) and external signers
+    /// (the TLS 1.2 engine has no suspend/resume path). Ed25519 / Ed448
+    /// go with the `ECDHE_ECDSA` suites (RFC 8422 §2.2).
     pub(crate) fn try_into_server_config_12(
         &self,
         chain: Vec<Vec<u8>>,
@@ -1393,6 +1397,10 @@ impl SigningKey {
         match self {
             SigningKey::Rsa(k) => Some(super::conn::ServerConfig12::with_rsa(chain, k.clone())),
             SigningKey::Ecdsa(k) => Some(super::conn::ServerConfig12::with_ecdsa(chain, k.clone())),
+            SigningKey::Ed25519(k) => {
+                Some(super::conn::ServerConfig12::with_ed25519(chain, k.clone()))
+            }
+            SigningKey::Ed448(k) => Some(super::conn::ServerConfig12::with_ed448(chain, k.clone())),
             _ => None,
         }
     }

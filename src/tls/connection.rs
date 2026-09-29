@@ -258,8 +258,8 @@ impl ServerConnectionAuto {
             r
         } else {
             // Client offered no TLS 1.3: build the 1.2 (or legacy) engine. A key
-            // that cannot sign TLS 1.2 suites (Ed25519/Ed448/ML-DSA) makes the
-            // build fail; surface that as `handshake_failure`.
+            // that cannot sign TLS 1.2 suites (ML-DSA) makes the build fail;
+            // surface that as `handshake_failure`.
             let mut c = Box::new(build_tls12_server(&config).map_err(|_| Error::HandshakeFailure)?);
             c.read_tls(&buffered);
             let r = c.process_new_packets();
@@ -1444,6 +1444,34 @@ impl Connection {
             }
         };
         wire.and_then(NamedGroup::from_wire)
+    }
+
+    /// The IANA `SignatureScheme` code point (RFC 8446 §4.2.3; RFC 8422
+    /// §5.1.3 for `ed25519` / `ed448` on 1.2) the peer's handshake signature
+    /// was verified under: the server's `CertificateVerify` on a (D)TLS 1.3
+    /// client, its `ServerKeyExchange` on a (D)TLS 1.2 client, the client's
+    /// `CertificateVerify` on a server that requested and received client
+    /// authentication. `None` before that signature was verified, on a
+    /// resumed session (no signature), and on a server the client did not
+    /// authenticate to.
+    pub fn peer_signature_scheme(&self) -> Option<u16> {
+        if let Some(c) = self.tls13_client() {
+            c.peer_signature_scheme()
+        } else if let Some(c) = self.tls13_server() {
+            c.peer_signature_scheme()
+        } else if let Some(c) = self.tls12_client() {
+            c.peer_signature_scheme()
+        } else if let Some(c) = self.tls12_server() {
+            c.peer_signature_scheme()
+        } else {
+            match &self.inner {
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls12(c) => c.peer_signature_scheme(),
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls13(c) => c.peer_signature_scheme(),
+                _ => None,
+            }
+        }
     }
 
     /// `true` when a (D)TLS 1.3 HelloRetryRequest was part of this
@@ -3149,12 +3177,21 @@ fn build_dtls12_server(
         super::config::SigningKey::Rsa(k) => {
             crate::dtls::ServerConfig12Internal::with_rsa(chain, k.clone())
         }
+        super::config::SigningKey::Ed25519(k) => {
+            crate::dtls::ServerConfig12Internal::with_ed25519(chain, k.clone())
+        }
+        super::config::SigningKey::Ed448(k) => {
+            crate::dtls::ServerConfig12Internal::with_ed448(chain, k.clone())
+        }
         super::config::SigningKey::External { schemes } => {
             crate::dtls::ServerConfig12Internal::with_external(chain, schemes.clone())
         }
-        // DTLS 1.2 mirrors TLS 1.2's scope: RSA + ECDSA only. Ed25519 and
-        // ML-DSA are not common in TLS 1.2 practice.
-        _ => return Err(Error::UnsupportedVersion),
+        // DTLS 1.2 mirrors TLS 1.2's scope: RSA, ECDSA and EdDSA (RFC 8422).
+        // Nothing specifies ML-DSA for that version.
+        #[cfg(feature = "mldsa")]
+        super::config::SigningKey::MlDsa44(_)
+        | super::config::SigningKey::MlDsa65(_)
+        | super::config::SigningKey::MlDsa87(_) => return Err(Error::UnsupportedVersion),
     };
     if let Some(secret) = cookie_secret {
         sc = sc.with_cookie_secret(*secret.as_bytes());
@@ -4488,56 +4525,118 @@ mod tests {
         assert_eq!(server.negotiated_version(), None);
     }
 
-    /// Auto server with an **Ed25519** leaf (which cannot sign TLS 1.2 suites):
-    /// serves a TLS 1.3 client normally, but a 1.2-only client is refused with
-    /// `handshake_failure`. Proves the 1.2 engine is built *lazily* — its
-    /// unsupported-key failure surfaces at the (1.2) ClientHello, not at
-    /// `Connection::server` construction, and the 1.3 path never needs it.
-    #[test]
-    fn auto_server_ed25519_serves_tls13_refuses_tls12() {
-        let ed25519_cfg = || {
-            let mut rng = HmacDrbg::<Sha256>::new(b"tls-auto-ed25519", b"nonce", &[]);
-            let key = crate::ec::Ed25519PrivateKey::generate(&mut rng);
-            let name = DistinguishedName::common_name("tls.example");
-            let validity = Validity::new(
-                Time::utc(2024, 1, 1, 0, 0, 0),
-                Time::utc(2034, 1, 1, 0, 0, 0),
-            );
-            let cert = Certificate::self_signed_general(
-                &CertSigner::Ed25519(&key),
-                &name,
-                &validity,
-                1,
-                false,
-                &["tls.example"],
-            )
-            .unwrap();
-            Config::builder()
-                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
-                .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3)
-                .identity(
-                    alloc::vec![cert.to_der().to_vec()],
-                    super::super::config::SigningKey::Ed25519(key),
-                )
-                .build()
-        };
+    /// A version-spanning server `Config` (TLS 1.2..=1.3) with a
+    /// self-signed leaf for `tls.example` issued by `signer` over `key`.
+    fn auto_server_cfg_with_key(
+        signer: &CertSigner<'_>,
+        key: super::super::config::SigningKey,
+    ) -> Config {
+        let name = DistinguishedName::common_name("tls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert =
+            Certificate::self_signed_general(signer, &name, &validity, 1, false, &["tls.example"])
+                .unwrap();
+        Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3)
+            .identity(alloc::vec![cert.to_der().to_vec()], key)
+            .build()
+    }
 
-        // TLS 1.3 client: completes (Ed25519 is a valid 1.3 identity), and the
-        // server never builds a 1.2 engine.
+    /// Auto server with an **Ed25519** leaf serves a TLS 1.3 client and a
+    /// 1.2-only client alike: RFC 8422 §2.2 puts EdDSA under the
+    /// `ECDHE_ECDSA` suites, and the 1.2 engine signs the
+    /// `ServerKeyExchange` with `ed25519` (0x0807). Ed448 likewise.
+    #[test]
+    fn auto_server_eddsa_serves_tls13_and_tls12() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"tls-auto-eddsa", b"nonce", &[]);
+        let ed25519 = crate::ec::Ed25519PrivateKey::generate(&mut rng);
+        let ed448 = crate::ec::Ed448PrivateKey::generate(&mut rng);
+        let cfgs = [
+            (
+                auto_server_cfg_with_key(
+                    &CertSigner::Ed25519(&ed25519),
+                    super::super::config::SigningKey::Ed25519(ed25519.clone()),
+                ),
+                0x0807u16,
+            ),
+            (
+                auto_server_cfg_with_key(
+                    &CertSigner::Ed448(&ed448),
+                    super::super::config::SigningKey::Ed448(ed448.clone()),
+                ),
+                0x0808u16,
+            ),
+        ];
+        for (cfg, scheme) in &cfgs {
+            let mut c13 = Connection::client(&tls13_client_cfg(None)).unwrap();
+            let mut s13 = Connection::server(cfg).unwrap();
+            drive_pair(&mut c13, &mut s13);
+            assert!(c13.is_handshake_complete() && s13.is_handshake_complete());
+            assert_eq!(s13.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+            assert_eq!(c13.peer_signature_scheme(), Some(*scheme));
+
+            let mut c12 = Connection::client(&tls12_client_cfg()).unwrap();
+            let mut s12 = Connection::server(cfg).unwrap();
+            drive_pair(&mut c12, &mut s12);
+            assert!(c12.is_handshake_complete() && s12.is_handshake_complete());
+            assert_eq!(s12.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
+            // An ECDHE_ECDSA suite (RFC 8422 §2.2), signed under the key's
+            // own scheme.
+            assert_eq!(c12.negotiated_cipher_suite(), Some(0xc02b));
+            assert_eq!(c12.peer_signature_scheme(), Some(*scheme));
+        }
+    }
+
+    /// Auto server with an **ML-DSA-65** leaf (which no specification lets
+    /// sign a TLS 1.2 handshake): serves a TLS 1.3 client normally, but a
+    /// 1.2-only client is refused with `handshake_failure`. Proves the 1.2
+    /// engine is built *lazily* — its unsupported-key failure surfaces at
+    /// the (1.2) ClientHello, not at `Connection::server` construction, and
+    /// the 1.3 path never needs it.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn auto_server_mldsa_serves_tls13_refuses_tls12() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"tls-auto-mldsa", b"nonce", &[]);
+        let (key, _) = crate::mldsa::MlDsa65PrivateKey::generate(&mut rng);
+        let cfg = auto_server_cfg_with_key(
+            &CertSigner::MlDsa65(&key),
+            super::super::config::SigningKey::MlDsa65(key.clone()),
+        );
+
+        // TLS 1.3 client: completes (ML-DSA is a valid 1.3 identity), and
+        // the server never builds a 1.2 engine.
         let mut c13 = Connection::client(&tls13_client_cfg(None)).unwrap();
-        let mut s13 = Connection::server(&ed25519_cfg()).unwrap();
+        let mut s13 = Connection::server(&cfg).unwrap();
         drive_pair(&mut c13, &mut s13);
         assert!(c13.is_handshake_complete() && s13.is_handshake_complete());
         assert_eq!(s13.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
 
-        // TLS 1.2-only client: the lazy 1.2 build fails (no 1.2-capable key) and
-        // surfaces as handshake_failure on the ClientHello.
+        // TLS 1.2-only client: the lazy 1.2 build fails (no 1.2-capable key)
+        // and surfaces as handshake_failure on the ClientHello.
         let mut c12 = Connection::client(&tls12_client_cfg()).unwrap();
-        let mut s12 = Connection::server(&ed25519_cfg()).unwrap();
+        let mut s12 = Connection::server(&cfg).unwrap();
         let _ = c12.handshake();
         let ch = c12.pop().unwrap();
         assert!(!ch.is_empty());
         assert!(matches!(s12.feed(&ch), Err(Error::HandshakeFailure)));
+        // And a pinned 1.2 server refuses to be built at all, with the
+        // clear error.
+        let pinned = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+            .identity(
+                cfg.identity.as_ref().unwrap().cert_chain.clone(),
+                cfg.identity.as_ref().unwrap().key.clone(),
+            )
+            .build();
+        assert!(matches!(
+            Connection::server(&pinned),
+            Err(Error::UnsupportedVersion)
+        ));
     }
 
     /// A version-spanning (auto) client `Config`: default min 1.2 / max 1.3,

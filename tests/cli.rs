@@ -5834,16 +5834,76 @@ fn s_server_and_pkey_accept_pkcs8_ec_key() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `s_server -tls1_2` with an Ed25519 key used to start listening and fail
-/// only after `accept()` with a bare `UnsupportedVersion`; it must be
-/// refused up front with a message naming the limitation.
+/// `s_server -tls1_2` / `-dtls1_2` with an ML-DSA key — which nothing
+/// specifies for TLS 1.2 — used to start listening and fail only after
+/// `accept()` with a bare `UnsupportedVersion`; it must be refused up front
+/// with a message naming the limitation. (An Ed25519 key used to be refused
+/// the same way; RFC 8422 puts EdDSA under the ECDHE_ECDSA suites and it is
+/// accepted now — see `s_client_s_server_tls12_ed25519_roundtrip`.)
+#[cfg(feature = "mldsa")]
 #[test]
-fn s_server_tls12_refuses_ed25519_key_up_front() {
+fn s_server_tls12_refuses_mldsa_key_up_front() {
+    use purecrypto::mldsa::MlDsa65PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let dir = std::env::temp_dir().join(format!("pc_tls12_mldsa_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+    let (key, _) = MlDsa65PrivateKey::generate(&mut OsRng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::MlDsa65(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
+    for version in ["-tls1_2", "-dtls1_2"] {
+        let (_out, err, ok) = run_capture(
+            &[
+                "s_server",
+                version,
+                "-cert",
+                cert_path.to_str().unwrap(),
+                "-key",
+                key_path.to_str().unwrap(),
+                "-accept",
+                "1",
+                "-www",
+            ],
+            b"",
+        );
+        assert!(!ok);
+        assert!(err.contains("not specified for TLS 1.2"), "got: {err}");
+        assert!(!err.contains("UnsupportedVersion"), "got: {err}");
+        assert!(
+            !err.contains("listening"),
+            "must be refused before listening: {err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `s_client -tls1_2` ↔ `s_server -tls1_2` with an Ed25519 server
+/// certificate (RFC 8422: EdDSA authenticates the ECDHE_ECDSA suites, the
+/// ServerKeyExchange signed `ed25519`): the client's report names the
+/// scheme it verified the server under.
+#[test]
+fn s_client_s_server_tls12_ed25519_roundtrip() {
     use purecrypto::ec::Ed25519PrivateKey;
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
-    let dir = std::env::temp_dir().join(format!("pc_tls12_ed_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pc_tls12_ed_rt_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path = dir.join("server.pem");
     let key_path = dir.join("server.key");
@@ -5863,31 +5923,66 @@ fn s_server_tls12_refuses_ed25519_key_up_front() {
     .unwrap();
     std::fs::write(&cert_path, cert.to_pem()).unwrap();
     std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
-    let (_out, err, ok) = run_capture(
-        &[
-            "s_server",
-            "-tls1_2",
-            "-cert",
-            cert_path.to_str().unwrap(),
-            "-key",
-            key_path.to_str().unwrap(),
-            "-accept",
-            "1",
-            "-www",
-        ],
-        b"",
-    );
-    assert!(!ok);
-    assert!(err.contains("RSA or ECDSA"), "got: {err}");
-    assert!(!err.contains("UnsupportedVersion"), "got: {err}");
-    assert!(
-        !err.contains("listening"),
-        "must be refused before listening: {err}"
-    );
 
-    // The QUIC server must likewise refuse a key from a different pair
-    // before it starts listening (it used to validate the identity only
-    // when the first Initial arrived, hanging ~30 s here).
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server",
+        "-tls1_2",
+        "-cert",
+        cert_path.to_str().unwrap(),
+        "-key",
+        key_path.to_str().unwrap(),
+        "-accept",
+        "0",
+        "-www",
+    ]);
+    let port = server_proc.port;
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-tls1_2",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-CAfile",
+            cert_path.to_str().unwrap(),
+        ],
+        b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
+    );
+    server_proc.finish();
+    assert!(ok, "s_client -tls1_2 failed: {err}");
+    assert!(out.contains("hello from purecrypto s_server"), "{out:?}");
+    assert!(err.contains("connected: TLSv1.2"), "{err}");
+    assert!(err.contains("cipher suite: TLS_ECDHE_ECDSA_WITH_"), "{err}");
+    assert!(err.contains("peer signature: ed25519"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The QUIC server must refuse a key from a different pair before it
+/// starts listening (it used to validate the identity only when the first
+/// Initial arrived, hanging ~30 s here).
+#[test]
+fn q_server_refuses_mismatched_key_up_front() {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let dir = std::env::temp_dir().join(format!("pc_quic_mismatch_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key = Ed25519PrivateKey::generate(&mut OsRng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ed25519(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
     let other = Ed25519PrivateKey::generate(&mut OsRng);
     let other_path = dir.join("other.key");
     std::fs::write(&other_path, other.to_pkcs8_pem()).unwrap();

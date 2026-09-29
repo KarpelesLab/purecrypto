@@ -27,6 +27,7 @@ pub(crate) enum Role {
 /// external PSK: none
 /// early data: none
 /// peer certificate: X.509 (2)
+/// peer signature: ed25519
 /// peer certificate compression: none
 /// own certificate: raw public key
 /// own certificate compression: zlib
@@ -35,7 +36,11 @@ pub(crate) enum Role {
 /// ```
 ///
 /// The `own certificate` line is printed only where this side sent one
-/// (always on a server; on a client only under mTLS).
+/// (always on a server; on a client only under mTLS). `peer signature` is
+/// the IANA `SignatureScheme` name of the peer's handshake signature (the
+/// server's CertificateVerify or ServerKeyExchange; the client's
+/// CertificateVerify under mTLS), `none` on a resumed session or when the
+/// peer did not sign.
 pub(crate) fn report_handshake(conn: &Connection, role: Role) {
     let version = conn.negotiated_version();
     // DTLS 1.3 shares the TLS 1.3 handshake (HelloRetryRequest, 0-RTT slots).
@@ -93,6 +98,12 @@ pub(crate) fn report_handshake(conn: &Connection, role: Role) {
     } else {
         eprintln!("peer certificate: none");
     }
+    eprintln!(
+        "peer signature: {}",
+        conn.peer_signature_scheme()
+            .map(signature_scheme_name)
+            .unwrap_or_else(|| "none".to_string())
+    );
     #[cfg(feature = "cert-compression")]
     if role == Role::Client {
         eprintln!(
@@ -176,6 +187,35 @@ pub(crate) fn report_session_end(conn: &Connection) {
             "not received"
         }
     );
+}
+
+/// The IANA `SignatureScheme` name for a code point (RFC 8446 §4.2.3, RFC
+/// 8734, draft-ietf-tls-mldsa), or its hex value.
+fn signature_scheme_name(scheme: u16) -> String {
+    match scheme {
+        0x0401 => "rsa_pkcs1_sha256",
+        0x0501 => "rsa_pkcs1_sha384",
+        0x0601 => "rsa_pkcs1_sha512",
+        0x0403 => "ecdsa_secp256r1_sha256",
+        0x0503 => "ecdsa_secp384r1_sha384",
+        0x0603 => "ecdsa_secp521r1_sha512",
+        0x0804 => "rsa_pss_rsae_sha256",
+        0x0805 => "rsa_pss_rsae_sha384",
+        0x0806 => "rsa_pss_rsae_sha512",
+        0x0807 => "ed25519",
+        0x0808 => "ed448",
+        0x0809 => "rsa_pss_pss_sha256",
+        0x080a => "rsa_pss_pss_sha384",
+        0x080b => "rsa_pss_pss_sha512",
+        0x081a => "ecdsa_brainpoolP256r1tls13_sha256",
+        0x081b => "ecdsa_brainpoolP384r1tls13_sha384",
+        0x081c => "ecdsa_brainpoolP512r1tls13_sha512",
+        0x0904 => "mldsa44",
+        0x0905 => "mldsa65",
+        0x0906 => "mldsa87",
+        other => return format!("0x{other:04x}"),
+    }
+    .to_string()
 }
 
 fn yes_no(b: bool) -> &'static str {

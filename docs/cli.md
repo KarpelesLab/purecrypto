@@ -372,8 +372,10 @@ purecrypto crl -in crl.pem -is-revoked -serial 0x1A2B
 ## `s_client` / `s_server`
 
 TLS 1.3 by default; `-tls1_2` forces TLS 1.2 (ECDHE-AEAD only, mTLS and
-RFC 5077 tickets supported). The same two commands drive DTLS and QUIC
-through version flags, described below.
+RFC 5077 tickets supported; RSA, ECDSA, Ed25519 and Ed448 certificates —
+an EdDSA one goes with the `ECDHE-ECDSA` suites per RFC 8422, an ML-DSA
+one is refused, nothing specifies it for TLS 1.2). The same two commands
+drive DTLS and QUIC through version flags, described below.
 
 ```text
 purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2]
@@ -429,6 +431,7 @@ PSK mode: none                       # psk_ke | psk_dhe_ke | none (TLS 1.3)
 external PSK: none                   # the identity, when one authenticated the handshake
 early data: none                     # accepted | rejected | none
 peer certificate: X.509 (2)          # raw public key | none
+peer signature: ed25519              # IANA SignatureScheme name of the peer's handshake signature | none
 peer certificate compression: none   # client: zlib when the server compressed
 own certificate: X.509               # server (and an RPK client): raw public key
 own certificate compression: zlib    # server

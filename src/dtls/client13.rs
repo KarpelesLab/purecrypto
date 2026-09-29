@@ -398,6 +398,10 @@ pub struct DtlsClientConnection13 {
     cert_chain: Vec<Vec<u8>>,
     /// Peer leaf public key (recovered or verified).
     leaf_key: Option<AnyPublicKey>,
+    /// The `SignatureScheme` the peer's handshake signature carried and
+    /// verified under, for the negotiated-parameter report. `None` until
+    /// then.
+    peer_signature_scheme: Option<SignatureScheme>,
     /// Negotiated ALPN protocol from EncryptedExtensions.
     alpn_negotiated: Option<Vec<u8>>,
     /// The server sent a `CertificateRequest` (RFC 8446 §4.3.2): our final
@@ -504,6 +508,7 @@ impl DtlsClientConnection13 {
             exporter_secret: None,
             cert_chain: Vec::new(),
             leaf_key: None,
+            peer_signature_scheme: None,
             alpn_negotiated: None,
             cert_request_received: false,
             cr_signature_algorithms: Vec::new(),
@@ -584,6 +589,12 @@ impl DtlsClientConnection13 {
     /// The peer's certificate chain in wire order (DER), leaf first.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.cert_chain
+    }
+
+    /// The IANA `SignatureScheme` code point of the peer's verified
+    /// handshake signature, — its `CertificateVerify` — once verified.
+    pub fn peer_signature_scheme(&self) -> Option<u16> {
+        self.peer_signature_scheme.map(|s| s.0)
     }
 
     /// The negotiated ALPN protocol, if any.
@@ -1943,6 +1954,7 @@ impl DtlsClientConnection13 {
             &signature,
             &self.config.signature_policy,
         )?;
+        self.peer_signature_scheme = Some(scheme);
         self.leaf_key = Some(leaf_key);
         self.transcript.update(raw);
         self.state = State::WaitFinished;

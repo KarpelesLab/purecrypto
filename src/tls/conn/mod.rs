@@ -7572,6 +7572,454 @@ mod tls12_loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"mtls12-pong");
     }
 
+    /// An EdDSA self-signed server config (`ed448 = false`: Ed25519) plus
+    /// its certificate DER.
+    fn eddsa_server12(ed448: bool) -> (ServerConfig12, Vec<u8>) {
+        use crate::ec::{Ed448PrivateKey, Ed25519PrivateKey};
+        let mut rng = HmacDrbg::<Sha256>::new(b"loopback-eddsa12-key", b"nonce", &[]);
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let issue = |signer: &CertSigner<'_>| {
+            Certificate::self_signed_general(
+                signer,
+                &name,
+                &validity,
+                1,
+                false,
+                &["loopback.example"],
+            )
+            .unwrap()
+            .to_der()
+            .to_vec()
+        };
+        if ed448 {
+            let key = Ed448PrivateKey::generate(&mut rng);
+            let der = issue(&CertSigner::Ed448(&key));
+            (
+                ServerConfig12::with_ed448(alloc::vec![der.clone()], key),
+                der,
+            )
+        } else {
+            let key = Ed25519PrivateKey::generate(&mut rng);
+            let der = issue(&CertSigner::Ed25519(&key));
+            (
+                ServerConfig12::with_ed25519(alloc::vec![der.clone()], key),
+                der,
+            )
+        }
+    }
+
+    /// Drives `client` and `server` to completion, `tamper` seeing every
+    /// flight before it is delivered (`true`: the flight is from the
+    /// server). The first error either side reports ends the exchange, as
+    /// `(client_side, error)`.
+    fn pump12_with(
+        client: &mut ClientConnection12,
+        server: &mut ServerConnection12<HmacDrbg<Sha256>>,
+        mut tamper: impl FnMut(bool, &mut Vec<u8>),
+    ) -> Result<(), (bool, crate::tls::Error)> {
+        for _ in 0..16 {
+            let mut c = client.write_tls();
+            if !c.is_empty() {
+                tamper(false, &mut c);
+                server.read_tls(&c);
+                server.process_new_packets().map_err(|e| (false, e))?;
+            }
+            let mut s = server.write_tls();
+            if !s.is_empty() {
+                tamper(true, &mut s);
+                client.read_tls(&s);
+                client.process_new_packets().map_err(|e| (true, e))?;
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrites the `SignatureAndHashAlgorithm` of the first handshake
+    /// message of type `msg_type` in a plaintext flight — `ServerKeyExchange`
+    /// (12) or `CertificateVerify` (15) — to `scheme`, and flips a bit in
+    /// the middle of the signature when `tamper_sig`. One handshake message
+    /// per record, as the engines write them. `false` when no such message
+    /// is in the flight.
+    fn patch_signature(flight: &mut [u8], msg_type: u8, scheme: u16, tamper_sig: bool) -> bool {
+        let mut i = 0;
+        while i + 5 <= flight.len() {
+            let len = usize::from(u16::from_be_bytes([flight[i + 3], flight[i + 4]]));
+            let rec = i + 5;
+            if flight[i] == 22 && flight[rec] == msg_type {
+                let body = rec + 4;
+                let off = if msg_type == 12 {
+                    // ECParameters (3) + point<1..2^8-1>, then the scheme.
+                    body + 4 + usize::from(flight[body + 3])
+                } else {
+                    body
+                };
+                flight[off..off + 2].copy_from_slice(&scheme.to_be_bytes());
+                if tamper_sig {
+                    flight[off + 4 + 40] ^= 1;
+                }
+                return true;
+            }
+            i = rec + len;
+        }
+        false
+    }
+
+    /// RFC 8422 §2.2 / §5.4: an Ed25519 or Ed448 server identity
+    /// authenticates the `ECDHE_ECDSA` suites, its `ServerKeyExchange`
+    /// signed PureEdDSA under `ed25519` / `ed448`; under mTLS an EdDSA
+    /// client identity signs its `CertificateVerify` the same way (§5.8),
+    /// requested by `ecdsa_sign` (§5.5). Both directions exchange data.
+    #[test]
+    fn tls12_eddsa_identities_both_ends() {
+        use super::ClientCertConfig;
+        use crate::ec::{Ed448PrivateKey, Ed25519PrivateKey};
+        use crate::tls::codec::SignatureScheme;
+
+        for server_ed448 in [false, true] {
+            let (server_config, server_cert_der) = eddsa_server12(server_ed448);
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert_der).unwrap();
+
+            // The client identity is the other EdDSA variant.
+            let mut crng_seed = HmacDrbg::<Sha256>::new(b"eddsa12-client-key", b"nonce", &[]);
+            let client_name = DistinguishedName::common_name("eddsa12-client");
+            let validity = Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            );
+            let (cc, client_cert_der, client_scheme) = if server_ed448 {
+                let key = Ed25519PrivateKey::generate(&mut crng_seed);
+                let der = Certificate::self_signed_general(
+                    &CertSigner::Ed25519(&key),
+                    &client_name,
+                    &validity,
+                    1,
+                    false,
+                    &["eddsa12-client"],
+                )
+                .unwrap()
+                .to_der()
+                .to_vec();
+                (
+                    ClientCertConfig::with_ed25519(alloc::vec![der.clone()], key),
+                    der,
+                    SignatureScheme::ED25519,
+                )
+            } else {
+                let key = Ed448PrivateKey::generate(&mut crng_seed);
+                let der = Certificate::self_signed_general(
+                    &CertSigner::Ed448(&key),
+                    &client_name,
+                    &validity,
+                    1,
+                    false,
+                    &["eddsa12-client"],
+                )
+                .unwrap()
+                .to_der()
+                .to_vec();
+                (
+                    ClientCertConfig::with_ed448(alloc::vec![der.clone()], key),
+                    der,
+                    SignatureScheme::ED448,
+                )
+            };
+            let mut server_roots = RootCertStore::new();
+            server_roots.add_der(client_cert_der).unwrap();
+            let server_config = server_config
+                .with_client_auth(server_roots, true)
+                .with_verification_time(fixture_time());
+            let client_cfg = client_config12(roots).with_client_cert(cc);
+
+            let mut crng = HmacDrbg::<Sha256>::new(b"eddsa12-client-rng", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"eddsa12-server-rng", b"nonce", &[]);
+            // Every suite offered: the server must land on an ECDSA one.
+            let mut client =
+                ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection12::new(server_config, srng);
+            pump12_with(&mut client, &mut server, |_, _| {}).unwrap();
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            assert_eq!(
+                client.negotiated_cipher_suite(),
+                Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.0)
+            );
+            let server_scheme = if server_ed448 {
+                SignatureScheme::ED448
+            } else {
+                SignatureScheme::ED25519
+            };
+            assert_eq!(client.peer_signature_scheme(), Some(server_scheme.0));
+            assert_eq!(server.peer_signature_scheme(), Some(client_scheme.0));
+            assert_eq!(server.peer_certificates().len(), 1);
+
+            client.send_application_data(b"eddsa12-ping").unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets().unwrap();
+            assert_eq!(server.take_received_plaintext(), b"eddsa12-ping");
+            server.send_application_data(b"eddsa12-pong").unwrap();
+            let s = server.write_tls();
+            client.read_tls(&s);
+            client.process_new_packets().unwrap();
+            assert_eq!(client.take_received_plaintext(), b"eddsa12-pong");
+        }
+    }
+
+    /// The client holds the server to RFC 5246 §7.4.3 and RFC 8422 §5.9:
+    /// a `ServerKeyExchange` signed under a scheme the ClientHello did not
+    /// offer (`rsa_pkcs1_sha256`), one TLS 1.2 does not define (ML-DSA-65,
+    /// the RFC 8734 Brainpool code points), or one that does not fit the
+    /// key (an ECDSA pair over an Ed25519 key; `ed25519` over a P-256 key)
+    /// is refused with `illegal_parameter`, and a signature that does not
+    /// verify with `decrypt_error` — before any key exchange is done.
+    #[test]
+    fn tls12_client_polices_the_server_key_exchange_scheme() {
+        use crate::tls::Error;
+
+        let cases: [(bool, u16, bool, Error); 7] = [
+            // (server is Ed25519, scheme, tamper signature, expected)
+            (true, 0x0401, false, Error::IllegalParameter),
+            (true, 0x0905, false, Error::PeerMisbehaved),
+            (true, 0x081a, false, Error::PeerMisbehaved),
+            (true, 0x0403, false, Error::PeerMisbehaved),
+            (false, 0x0807, false, Error::PeerMisbehaved),
+            (true, 0x0807, true, Error::DecryptError),
+            (false, 0x0403, true, Error::DecryptError),
+        ];
+        for (eddsa, scheme, tamper, expected) in cases {
+            let (server_config, server_cert_der) = if eddsa {
+                eddsa_server12(false)
+            } else {
+                ecdsa_server12()
+            };
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert_der).unwrap();
+            let mut crng = HmacDrbg::<Sha256>::new(b"ske-scheme-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"ske-scheme-s", b"nonce", &[]);
+            let mut client =
+                ClientConnection12::new(client_config12(roots), "loopback.example", &mut crng)
+                    .unwrap();
+            let mut server = ServerConnection12::new(server_config, srng);
+            let mut patched = false;
+            let r = pump12_with(&mut client, &mut server, |from_server, flight| {
+                if from_server && !patched {
+                    patched = patch_signature(flight, 12, scheme, tamper);
+                }
+            });
+            assert!(patched);
+            match r {
+                Err((true, e)) => assert_eq!(e, expected, "scheme {scheme:#06x}"),
+                other => panic!("scheme {scheme:#06x}: {other:?}"),
+            }
+            assert!(!client.is_handshake_complete());
+        }
+    }
+
+    /// The server holds the client to RFC 5246 §7.4.8: a `CertificateVerify`
+    /// under a scheme its `CertificateRequest` did not list (ML-DSA-65 —
+    /// never listed, TLS 1.2 does not define it) is `illegal_parameter`; one
+    /// listed but not fitting the key (an ECDSA pair over the Ed25519
+    /// client key) likewise; a listed, fitting scheme whose signature does
+    /// not verify is `decrypt_error`.
+    #[test]
+    fn tls12_server_polices_the_certificate_verify_scheme() {
+        use super::ClientCertConfig;
+        use crate::ec::Ed25519PrivateKey;
+        use crate::tls::Error;
+
+        let cases: [(u16, bool, Error); 3] = [
+            (0x0905, false, Error::IllegalParameter),
+            (0x0403, false, Error::PeerMisbehaved),
+            (0x0807, true, Error::DecryptError),
+        ];
+        for (scheme, tamper, expected) in cases {
+            let (server_config, server_cert_der) = ecdsa_server12();
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert_der).unwrap();
+            let mut crng_seed = HmacDrbg::<Sha256>::new(b"cv-scheme-client-key", b"nonce", &[]);
+            let client_key = Ed25519PrivateKey::generate(&mut crng_seed);
+            let client_cert_der = Certificate::self_signed_general(
+                &CertSigner::Ed25519(&client_key),
+                &DistinguishedName::common_name("cv-scheme-client"),
+                &Validity::new(
+                    Time::utc(2024, 1, 1, 0, 0, 0),
+                    Time::utc(2034, 1, 1, 0, 0, 0),
+                ),
+                1,
+                false,
+                &["cv-scheme-client"],
+            )
+            .unwrap()
+            .to_der()
+            .to_vec();
+            let mut server_roots = RootCertStore::new();
+            server_roots.add_der(client_cert_der.clone()).unwrap();
+            let server_config = server_config
+                .with_client_auth(server_roots, true)
+                .with_verification_time(fixture_time());
+            let cc = ClientCertConfig::with_ed25519(alloc::vec![client_cert_der], client_key);
+            let client_cfg = client_config12(roots).with_client_cert(cc);
+            let mut crng = HmacDrbg::<Sha256>::new(b"cv-scheme-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"cv-scheme-s", b"nonce", &[]);
+            let mut client =
+                ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection12::new(server_config, srng);
+            let mut patched = false;
+            let r = pump12_with(&mut client, &mut server, |from_server, flight| {
+                if !from_server && !patched {
+                    patched = patch_signature(flight, 15, scheme, tamper);
+                }
+            });
+            assert!(patched);
+            match r {
+                Err((false, e)) => assert_eq!(e, expected, "scheme {scheme:#06x}"),
+                other => panic!("scheme {scheme:#06x}: {other:?}"),
+            }
+            assert!(!server.is_handshake_complete());
+            assert_eq!(server.peer_signature_scheme(), None);
+        }
+    }
+
+    /// A client identity the server's `CertificateRequest` does not admit —
+    /// here an Ed25519 key while the server's policy permits no EdDSA, so
+    /// its list carries neither `ed25519` nor `ed448` — is not "suitable"
+    /// (RFC 5246 §7.4.6): the client sends an empty `Certificate`, which the
+    /// server refuses with `certificate_required` when it requires one and
+    /// accepts otherwise. An ML-DSA identity has no TLS 1.2 scheme at all
+    /// and is a configuration error (`UnsupportedKeyType`) instead.
+    #[test]
+    fn tls12_client_presents_no_certificate_the_request_does_not_admit() {
+        use super::ClientCertConfig;
+        use crate::ec::Ed25519PrivateKey;
+        use crate::signature_registry::SignaturePolicy;
+        use crate::tls::Error;
+
+        let no_eddsa = || {
+            SignaturePolicy::empty()
+                .permit("ecdsa-with-sha256")
+                .permit("ecdsa-secp256r1-sha256")
+                .permit("rsa-pss-rsae-sha256")
+        };
+        let mut crng_seed = HmacDrbg::<Sha256>::new(b"unsuitable-client-key", b"nonce", &[]);
+        let client_key = Ed25519PrivateKey::generate(&mut crng_seed);
+        let client_cert_der = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&client_key),
+            &DistinguishedName::common_name("unsuitable-client"),
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            1,
+            false,
+            &["unsuitable-client"],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+
+        for required in [true, false] {
+            let (server_config, server_cert_der) = ecdsa_server12();
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert_der).unwrap();
+            let mut server_roots = RootCertStore::new();
+            server_roots.add_der(client_cert_der.clone()).unwrap();
+            let server_config = server_config
+                .with_client_auth(server_roots, required)
+                .with_signature_policy(no_eddsa())
+                .with_verification_time(fixture_time());
+            let cc = ClientCertConfig::with_ed25519(
+                alloc::vec![client_cert_der.clone()],
+                client_key.clone(),
+            );
+            let client_cfg = client_config12(roots).with_client_cert(cc);
+            let mut crng = HmacDrbg::<Sha256>::new(b"unsuitable-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"unsuitable-s", b"nonce", &[]);
+            let mut client =
+                ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection12::new(server_config, srng);
+            let r = pump12_with(&mut client, &mut server, |_, _| {});
+            if required {
+                assert!(
+                    matches!(r, Err((false, Error::CertificateRequired))),
+                    "{r:?}"
+                );
+            } else {
+                r.unwrap();
+                assert!(!client.is_handshaking() && !server.is_handshaking());
+                assert!(server.peer_certificates().is_empty());
+                assert_eq!(server.peer_signature_scheme(), None);
+            }
+        }
+
+        #[cfg(feature = "mldsa")]
+        {
+            let mut rng = HmacDrbg::<Sha256>::new(b"mldsa-client-key-12", b"nonce", &[]);
+            let (key, _) = crate::mldsa::MlDsa65PrivateKey::generate(&mut rng);
+            let der = Certificate::self_signed_general(
+                &CertSigner::MlDsa65(&key),
+                &DistinguishedName::common_name("mldsa-client"),
+                &Validity::new(
+                    Time::utc(2024, 1, 1, 0, 0, 0),
+                    Time::utc(2034, 1, 1, 0, 0, 0),
+                ),
+                1,
+                false,
+                &["mldsa-client"],
+            )
+            .unwrap()
+            .to_der()
+            .to_vec();
+            let (server_config, server_cert_der) = ecdsa_server12();
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert_der).unwrap();
+            let mut server_roots = RootCertStore::new();
+            server_roots.add_der(der.clone()).unwrap();
+            let server_config = server_config
+                .with_client_auth(server_roots, false)
+                .with_verification_time(fixture_time());
+            let cc = ClientCertConfig::with_mldsa65(alloc::vec![der], key);
+            let client_cfg = client_config12(roots).with_client_cert(cc);
+            let mut crng = HmacDrbg::<Sha256>::new(b"mldsa-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"mldsa-s", b"nonce", &[]);
+            let mut client =
+                ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection12::new(server_config, srng);
+            let r = pump12_with(&mut client, &mut server, |_, _| {});
+            assert!(matches!(r, Err((true, Error::UnsupportedKeyType))), "{r:?}");
+        }
+    }
+
+    /// `signature_algorithms` does not exist before TLS 1.2, and RFC 8422
+    /// gives EdDSA no pre-1.2 encoding: a legacy (TLS 1.0) client meets an
+    /// Ed25519 server with `handshake_failure` — the legacy suites are all
+    /// RSA-authenticated — instead of some improvised signature.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn legacy_versions_get_no_eddsa() {
+        use crate::tls::{Error, ProtocolVersion};
+        let (server_config, server_cert_der) = eddsa_server12(false);
+        let server_config = server_config.with_min_version(ProtocolVersion::TLSv1_0);
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let client_cfg = client_config12(roots)
+            .with_min_version(ProtocolVersion::TLSv1_0)
+            .with_max_version(ProtocolVersion::TLSv1_0);
+        let mut crng = HmacDrbg::<Sha256>::new(b"legacy-eddsa-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"legacy-eddsa-s", b"nonce", &[]);
+        let mut client =
+            ClientConnection12::new(client_cfg, "loopback.example", &mut crng).unwrap();
+        let mut server = ServerConnection12::new(server_config, srng);
+        let r = pump12_with(&mut client, &mut server, |_, _| {});
+        assert!(matches!(r, Err((false, Error::HandshakeFailure))), "{r:?}");
+    }
+
     /// mTLS with `required = false`: client has a cert and presents it — same
     /// path as the required case, both sides finish.
     #[test]

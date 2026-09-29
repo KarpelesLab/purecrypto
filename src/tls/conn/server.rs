@@ -1057,6 +1057,11 @@ pub struct ServerConnection<R: RngCore> {
     client_cert_chain: Vec<Vec<u8>>,
     /// mTLS: the client's leaf public key, recovered from the chain.
     client_leaf_key: Option<crate::x509::AnyPublicKey>,
+    /// The `SignatureScheme` the peer's handshake signature carried and
+    /// verified under (its `CertificateVerify`), for the negotiated-parameter
+    /// report. `None` until then, and on a connection without client
+    /// authentication.
+    peer_signature_scheme: Option<SignatureScheme>,
     /// On a PSK-resumed handshake whose ticket carried a client leaf: the
     /// unix time that leaf was verified by the original full handshake
     /// (see [`TicketPlaintext::client_auth_secs`]). Re-embedded, unchanged,
@@ -1246,6 +1251,7 @@ impl<R: RngCore> ServerConnection<R> {
             deferred_chts: None,
             client_cert_chain: Vec::new(),
             client_leaf_key: None,
+            peer_signature_scheme: None,
             resumed_client_auth_secs: None,
             #[cfg(test)]
             server_hs_secret: None,
@@ -1451,6 +1457,12 @@ impl<R: RngCore> ServerConnection<R> {
     /// where the server did not request client authentication).
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.client_cert_chain
+    }
+
+    /// The IANA `SignatureScheme` code point of the peer's verified
+    /// handshake signature, once verified (mTLS only).
+    pub fn peer_signature_scheme(&self) -> Option<u16> {
+        self.peer_signature_scheme.map(|s| s.0)
     }
 
     /// Whether the just-completed handshake accepted 0-RTT data from the
@@ -3519,6 +3531,7 @@ impl<R: RngCore> ServerConnection<R> {
             &signature,
             &self.config.signature_policy,
         )?;
+        self.peer_signature_scheme = Some(scheme);
 
         self.core.transcript.update(raw);
         self.state = State::WaitClientFinished;

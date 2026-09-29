@@ -80,15 +80,19 @@ pub(crate) fn signature_algorithms() -> RawExtension {
 }
 
 /// [`signature_algorithms`] for a ClientHello that offers TLS 1.2 (or DTLS
-/// 1.2) at most: the same list minus the RFC 8734 Brainpool code points,
-/// which are defined for TLS 1.3 only and MUST NOT be used in TLS 1.2. A
-/// version-flexible TLS 1.3 ClientHello keeps them (one list serves both
-/// versions; a 1.2 server ignores code points it does not use).
+/// 1.2) at most: the same list minus what that version does not define
+/// (`is_tls12_signature_scheme`) — the RFC 8734 Brainpool code points,
+/// which are TLS 1.3 only and MUST NOT be used in TLS 1.2, and ML-DSA,
+/// which no specification gives a TLS 1.2 meaning. `ed25519` / `ed448`
+/// stay: RFC 8422 §5.1.3 defines them for TLS 1.2 as the pairs (8, 7) and
+/// (8, 8). A version-flexible TLS 1.3 ClientHello keeps the whole list (one
+/// list serves both versions; a 1.2 server ignores code points it does not
+/// use, and the 1.2 client engine refuses a signature under one).
 pub(crate) fn signature_algorithms_tls12() -> RawExtension {
     let mut body = Vec::new();
     with_len_u16(&mut body, |b| {
         for s in offered_signature_schemes() {
-            if !s.is_brainpool_tls13() {
+            if crate::tls::crypto::sign::is_tls12_signature_scheme(s) {
                 put_u16(b, s.0);
             }
         }
