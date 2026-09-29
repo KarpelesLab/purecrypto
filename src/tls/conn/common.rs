@@ -748,21 +748,31 @@ impl ConnectionCore {
     }
 }
 
+/// What a (D)TLS 1.3 client takes from a `CertificateRequest` (RFC 8446
+/// §4.3.2), as parsed by [`parse_certificate_request_13`].
+pub(crate) struct CertificateRequest13 {
+    /// The `signature_algorithms` the client's `CertificateVerify` scheme is
+    /// chosen from (§4.4.3).
+    pub(crate) signature_algorithms: Vec<super::super::codec::SignatureScheme>,
+    /// RFC 8879 §3: the `compress_certificate` algorithms the server can
+    /// decompress the client's `Certificate` under; empty when the extension
+    /// is absent.
+    #[cfg(feature = "cert-compression")]
+    pub(crate) cert_compression_algorithms: Vec<u16>,
+}
+
 /// Parses a (D)TLS 1.3 `CertificateRequest` body received during the
-/// handshake (RFC 8446 §4.3.2) and returns its `signature_algorithms` — the
-/// list the client's `CertificateVerify` scheme is chosen from (§4.4.3).
-/// Shared by the TLS and DTLS 1.3 clients.
+/// handshake (RFC 8446 §4.3.2). Shared by the TLS and DTLS 1.3 clients.
 ///
 /// `certificate_request_context` MUST be empty in handshake authentication
 /// (a non-empty one belongs to post-handshake authentication, which no
 /// client of this crate opts into via `post_handshake_auth`), and "the
 /// signature_algorithms extension MUST be specified"; a missing list is
-/// [`Error::MissingExtension`], a duplicated one [`Error::IllegalParameter`].
-/// Other extensions (`certificate_authorities`, `oid_filters`, ...) are
-/// advisory and skipped.
-pub(crate) fn parse_certificate_request_13(
-    body: &[u8],
-) -> Result<Vec<super::super::codec::SignatureScheme>, Error> {
+/// [`Error::MissingExtension`]. "There MUST NOT be more than one extension
+/// of the same type" (§4.2): a duplicated `signature_algorithms` or
+/// `compress_certificate` is [`Error::IllegalParameter`]. Other extensions
+/// (`certificate_authorities`, `oid_filters`, ...) are advisory and skipped.
+pub(crate) fn parse_certificate_request_13(body: &[u8]) -> Result<CertificateRequest13, Error> {
     use super::super::codec::{ExtensionType, MAX_EXTENSIONS, ReadCursor, extension as ext};
     let mut c = ReadCursor::new(body);
     if !c.vec_u8()?.is_empty() {
@@ -772,6 +782,8 @@ pub(crate) fn parse_certificate_request_13(
     c.expect_empty()?;
     let mut ec = ReadCursor::new(exts);
     let mut sig_algs = None;
+    #[cfg(feature = "cert-compression")]
+    let mut cert_compression: Option<Vec<u16>> = None;
     let mut count = 0usize;
     while !ec.is_empty() {
         let ty = ec.u16()?;
@@ -786,8 +798,19 @@ pub(crate) fn parse_certificate_request_13(
             }
             sig_algs = Some(ext::parse_signature_algorithms(ext_body)?);
         }
+        #[cfg(feature = "cert-compression")]
+        if ty == ExtensionType::COMPRESS_CERTIFICATE.0 {
+            if cert_compression.is_some() {
+                return Err(Error::IllegalParameter);
+            }
+            cert_compression = Some(crate::tls::cert_compression::decode_extension(ext_body)?);
+        }
     }
-    sig_algs.ok_or(Error::MissingExtension)
+    Ok(CertificateRequest13 {
+        signature_algorithms: sig_algs.ok_or(Error::MissingExtension)?,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_algorithms: cert_compression.unwrap_or_default(),
+    })
 }
 
 /// RFC 7250 trust decision for a peer's raw public key, shared by every

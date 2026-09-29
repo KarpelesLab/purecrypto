@@ -470,6 +470,13 @@ pub(crate) struct ClientConfig {
     /// Externally provisioned PSKs to offer after the resumption ticket, if
     /// any (RFC 8446 §4.2.11). See [`crate::tls::Config::external_psks`].
     pub external_psks: Vec<ExternalPsk>,
+    /// RFC 8879: the algorithms the client is willing to compress its own
+    /// mTLS `Certificate` with, in preference order, when the server's
+    /// `CertificateRequest` advertises `compress_certificate`; `None`
+    /// means the same list as `cert_compression_algorithms`. Empty never
+    /// compresses.
+    #[cfg(feature = "cert-compression")]
+    pub own_cert_compression_algorithms: Option<Vec<u16>>,
 }
 
 impl ClientConfig {
@@ -502,6 +509,8 @@ impl ClientConfig {
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
             psk_modes: alloc::vec![PskKeyExchangeMode::PskDheKe],
             external_psks: Vec::new(),
+            #[cfg(feature = "cert-compression")]
+            own_cert_compression_algorithms: None,
         }
     }
 
@@ -608,6 +617,24 @@ impl ClientConfig {
     pub fn with_cert_compression_algorithms(mut self, algorithms: Vec<u16>) -> Self {
         self.cert_compression_algorithms = algorithms;
         self
+    }
+
+    /// Sets the algorithms the client compresses its own mTLS
+    /// `Certificate` with (RFC 8879), in preference order; empty never
+    /// compresses. Unset, `cert_compression_algorithms` applies.
+    #[cfg(feature = "cert-compression")]
+    pub fn with_own_cert_compression_algorithms(mut self, algorithms: Vec<u16>) -> Self {
+        self.own_cert_compression_algorithms = Some(algorithms);
+        self
+    }
+
+    /// The send-side RFC 8879 list: `own_cert_compression_algorithms`, or
+    /// `cert_compression_algorithms` when unset.
+    #[cfg(feature = "cert-compression")]
+    pub(crate) fn own_cert_compression_list(&self) -> &[u16] {
+        self.own_cert_compression_algorithms
+            .as_deref()
+            .unwrap_or(&self.cert_compression_algorithms)
     }
 }
 
@@ -842,6 +869,15 @@ pub struct ClientConnection {
     /// Post-handshake `KeyUpdate`s received from / sent to the server.
     peer_key_updates: u32,
     sent_key_updates: u32,
+    /// RFC 8879 §3: the algorithms the server's `CertificateRequest`
+    /// advertised in `compress_certificate` — what it can decompress our
+    /// mTLS `Certificate` under. Empty when it sent no such extension.
+    #[cfg(feature = "cert-compression")]
+    cr_cert_compression_algorithms: Vec<u16>,
+    /// RFC 8879: the algorithm we compressed our own mTLS `Certificate`
+    /// with, when we sent a `CompressedCertificate`.
+    #[cfg(feature = "cert-compression")]
+    own_cert_compression: Option<u16>,
     /// RFC 8879: the algorithm of the `CompressedCertificate` the server
     /// sent, when it compressed its chain.
     #[cfg(feature = "cert-compression")]
@@ -1294,6 +1330,21 @@ impl ClientConnection {
     #[cfg(feature = "cert-compression")]
     pub fn peer_cert_compression(&self) -> Option<u16> {
         self.peer_cert_compression
+    }
+
+    /// RFC 8879: the `CertificateCompressionAlgorithm` this client
+    /// compressed its own mTLS `Certificate` with, or `None` when it went
+    /// out uncompressed (or was never requested).
+    #[cfg(feature = "cert-compression")]
+    pub fn own_cert_compression(&self) -> Option<u16> {
+        self.own_cert_compression
+    }
+
+    /// Test hook: the algorithm IDs the server's `CertificateRequest`
+    /// advertised in `compress_certificate` (RFC 8879).
+    #[cfg(all(test, feature = "cert-compression"))]
+    pub(crate) fn cr_cert_compression_algorithms(&self) -> &[u16] {
+        &self.cr_cert_compression_algorithms
     }
 
     /// RFC 7250: the negotiated `server_certificate_type` (`0` = X.509, the
@@ -1788,6 +1839,10 @@ impl ClientConnection {
             peer_key_updates: 0,
             sent_key_updates: 0,
             #[cfg(feature = "cert-compression")]
+            cr_cert_compression_algorithms: Vec::new(),
+            #[cfg(feature = "cert-compression")]
+            own_cert_compression: None,
+            #[cfg(feature = "cert-compression")]
             peer_cert_compression: None,
             hrr_selected_group: None,
             hrr_selected_suite: None,
@@ -2182,16 +2237,19 @@ impl ClientConnection {
             ));
         }
         // RFC 8879 §3: `compress_certificate`. Advertise the algorithms we
-        // can decompress, in our preference order. Suppressed when the
-        // configured list is empty (caller opted out).
+        // can decompress (the configured list, less anything this build
+        // does not implement). Suppressed when nothing is left (caller
+        // opted out).
         #[cfg(feature = "cert-compression")]
-        if !self.config.cert_compression_algorithms.is_empty() {
-            extensions.push((
-                crate::tls::codec::ExtensionType::COMPRESS_CERTIFICATE,
-                crate::tls::cert_compression::encode_extension(
-                    &self.config.cert_compression_algorithms,
-                ),
-            ));
+        {
+            let algs =
+                crate::tls::cert_compression::advertised(&self.config.cert_compression_algorithms);
+            if !algs.is_empty() {
+                extensions.push((
+                    crate::tls::codec::ExtensionType::COMPRESS_CERTIFICATE,
+                    crate::tls::cert_compression::encode_extension(&algs),
+                ));
+            }
         }
 
         extensions.extend_from_slice(extra_extensions);
@@ -3900,7 +3958,14 @@ impl ClientConnection {
             if self.cert_request_received {
                 return Err(Error::UnexpectedMessage);
             }
-            self.cr_signature_algorithms = super::common::parse_certificate_request_13(body)?;
+            let cr = super::common::parse_certificate_request_13(body)?;
+            self.cr_signature_algorithms = cr.signature_algorithms;
+            // RFC 8879 §3: the algorithms the server can decompress our
+            // Certificate under.
+            #[cfg(feature = "cert-compression")]
+            {
+                self.cr_cert_compression_algorithms = cr.cert_compression_algorithms;
+            }
             self.cert_request_received = true;
             self.core.transcript.update(raw);
             // Stay in WaitCertificate — Certificate is the next message.
@@ -3916,25 +3981,16 @@ impl ClientConnection {
         let _decompressed: Vec<u8>;
         #[cfg(feature = "cert-compression")]
         let body: &[u8] = if msg_type == hs_type::COMPRESSED_CERTIFICATE {
-            // Refuse if the client never advertised the extension —
-            // a peer must not invent compression we did not consent to.
-            if self.config.cert_compression_algorithms.is_empty() {
-                return Err(Error::UnexpectedMessage);
-            }
-            // RFC 8879 §3/§4: the peer may only compress with an algorithm
-            // from our `compress_certificate` advertisement. The decoder
-            // checks what this build *can* decompress; that is not the same
-            // set when the configured list names other algorithms, so pin the
-            // wire algorithm to the advertised list before decompressing.
-            let algorithm = body
-                .get(..2)
-                .map(|b| u16::from_be_bytes([b[0], b[1]]))
-                .ok_or(Error::CertDecompressionFailed)?;
-            if !self.config.cert_compression_algorithms.contains(&algorithm) {
-                return Err(Error::IllegalParameter);
-            }
-            _decompressed = crate::tls::cert_compression::decode_compressed_certificate(body)?;
+            // Refused unless we advertised, and only under an algorithm we
+            // advertised (RFC 8879 §4) — the shared helper checks both
+            // before the decoder sees the payload.
+            let (algorithm, decompressed) =
+                crate::tls::cert_compression::decode_compressed_certificate_from(
+                    &self.config.cert_compression_algorithms,
+                    body,
+                )?;
             self.peer_cert_compression = Some(algorithm);
+            _decompressed = decompressed;
             &_decompressed
         } else if msg_type == hs_type::CERTIFICATE {
             body
@@ -4418,6 +4474,30 @@ impl ClientConnection {
                 }
             });
         });
+        // RFC 8879 §4: when the server's CertificateRequest advertised
+        // `compress_certificate` and one of our preferred algorithms is
+        // in its list, send a CompressedCertificate instead — the wire
+        // bytes of which are what the transcript hashes, as for the
+        // server's certificate. An empty chain ("no certificate": the
+        // body is the context byte and a zero u24 list length) stays
+        // plain: there is nothing to shrink, and a compressed empty list
+        // is longer than the plain one. RFC 7250 §4.4 raw public keys are
+        // compressed like any other Certificate body (RFC 8879 §4: "the
+        // resulting altered message is compressed instead").
+        #[cfg(feature = "cert-compression")]
+        if msg.len() > 4 + 4
+            && !self.cr_cert_compression_algorithms.is_empty()
+            && let Some(alg) = crate::tls::cert_compression::pick_from_lists(
+                &self.cr_cert_compression_algorithms,
+                self.config.own_cert_compression_list(),
+            )
+            && let Ok(compressed) =
+                crate::tls::cert_compression::encode_compressed_certificate(alg, &msg[4..])
+        {
+            self.own_cert_compression = Some(alg);
+            self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, compressed);
+            return;
+        }
         // RFC 9001 §4.1.4: mTLS client Certificate rides at Handshake level.
         self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, msg);
     }
@@ -5664,9 +5744,10 @@ mod tests {
     }
 
     /// RFC 8879 §3: a `CompressedCertificate` may only use an algorithm the
-    /// client advertised. A client advertising brotli alone used to accept a
+    /// client advertised. A client advertising zstd alone used to accept a
     /// zlib-compressed Certificate because the decoder only asked whether
-    /// zlib was *supported*; it must be refused as `illegal_parameter`.
+    /// zlib was *supported*; it must be refused as `illegal_parameter`. A
+    /// client that advertised nothing refuses the message outright.
     #[cfg(feature = "cert-compression")]
     #[test]
     fn client_rejects_compressed_certificate_with_unadvertised_algorithm() {
@@ -5678,12 +5759,22 @@ mod tests {
 
         let mut rng = HmacDrbg::<Sha256>::new(b"cc-unadvertised", b"nonce", &[]);
         let config = ClientConfig::new(RootCertStore::new())
-            .with_cert_compression_algorithms(alloc::vec![algorithm::BROTLI]);
+            .with_cert_compression_algorithms(alloc::vec![algorithm::ZSTD]);
         let mut client = ClientConnection::new(config, "h", &mut rng).unwrap();
         client.state = State::WaitCertificate;
         assert!(matches!(
             client.handle_handshake_for_test(msg.clone()),
             Err(Error::IllegalParameter)
+        ));
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"cc-uninvited", b"nonce", &[]);
+        let config =
+            ClientConfig::new(RootCertStore::new()).with_cert_compression_algorithms(Vec::new());
+        let mut client = ClientConnection::new(config, "h", &mut rng).unwrap();
+        client.state = State::WaitCertificate;
+        assert!(matches!(
+            client.handle_handshake_for_test(msg.clone()),
+            Err(Error::UnexpectedMessage)
         ));
 
         // Control: with zlib advertised the message is decompressed and

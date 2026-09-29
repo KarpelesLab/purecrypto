@@ -1872,7 +1872,8 @@ impl DtlsClientConnection13 {
             if self.cert_request_received {
                 return Err(Error::UnexpectedMessage);
             }
-            self.cr_signature_algorithms = crate::tls::conn::parse_certificate_request_13(body)?;
+            self.cr_signature_algorithms =
+                crate::tls::conn::parse_certificate_request_13(body)?.signature_algorithms;
             self.cert_request_received = true;
             self.transcript.update(raw);
             return Ok(());

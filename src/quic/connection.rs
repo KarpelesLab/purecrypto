@@ -8003,7 +8003,11 @@ mod tests {
         };
         assert_eq!(
             engine.peer_cert_compression_algorithms(),
-            &[cert_compression::algorithm::ZLIB]
+            cert_compression::default_algorithms().as_slice()
+        );
+        assert_eq!(
+            engine.own_cert_compression(),
+            Some(cert_compression::algorithm::ZLIB)
         );
     }
 

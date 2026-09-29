@@ -474,19 +474,30 @@ pub struct Config {
     pub ech_server: Option<super::ech::EchServer>,
 
     // ---- RFC 8879 certificate compression (TLS 1.3 only) ----
-    /// IANA `CertificateCompressionAlgorithm` codepoints the endpoint
-    /// will advertise in the `compress_certificate` extension and is
-    /// itself willing to DECOMPRESS, in preference order. Only `1` (zlib)
-    /// is wired today; entries for unsupported algorithms (`2 = brotli`,
-    /// `3 = zstd`) are allowed on the advertisement but ignored when
-    /// selecting on the receive path. Empty `Vec` disables the
-    /// extension entirely on the wire — neither advertise nor accept.
-    /// The default is `[1]` (advertise zlib). Applies bidirectionally:
-    /// clients advertise in their `ClientHello` (covering the server's
-    /// `Certificate`), servers advertise in `CertificateRequest`
-    /// (covering the client's mTLS `Certificate`).
+    /// The PEER's certificate: IANA `CertificateCompressionAlgorithm`
+    /// codepoints this endpoint advertises in its `compress_certificate`
+    /// extension and accepts a `CompressedCertificate` under — a client
+    /// in its `ClientHello` (covering the server's `Certificate`), a
+    /// server in its `CertificateRequest` (covering the client's mTLS
+    /// `Certificate`). `1` = zlib, `2` = brotli, `3` = zstd; an entry this
+    /// build does not implement is neither advertised nor accepted (see
+    /// [`cert_compression::default_algorithms`]). Empty disables the
+    /// extension on the wire: nothing advertised, a `CompressedCertificate`
+    /// refused. The default is every algorithm the build implements.
+    ///
+    /// [`cert_compression::default_algorithms`]: super::cert_compression::default_algorithms
     #[cfg(feature = "cert-compression")]
     pub cert_compression_algorithms: Vec<u16>,
+    /// This endpoint's OWN certificate: the algorithms it is willing to
+    /// compress its `Certificate` with, in preference order — the first
+    /// one the peer advertised is used; none in common (or an empty list)
+    /// sends the plain `Certificate`. `None` (the default) means the same
+    /// list as `cert_compression_algorithms`, so a single empty list turns
+    /// certificate compression off in both directions. A server
+    /// compresses for a client that advertised, a client compresses for a
+    /// server that advertised in its `CertificateRequest`.
+    #[cfg(feature = "cert-compression")]
+    pub own_cert_compression_algorithms: Option<Vec<u16>>,
 
     // ---- DTLS-only (inert when version is TLS) ----
     /// 32-byte secret for stateless cookie issuance / validation. `None` on
@@ -717,6 +728,8 @@ impl Default for Config {
             ech_server: None,
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: super::cert_compression::default_algorithms(),
+            #[cfg(feature = "cert-compression")]
+            own_cert_compression_algorithms: None,
             cookie_secret: None,
             previous_cookie_secret: None,
             require_cookie: true,
@@ -825,7 +838,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `preferred_key_exchange_group` | yes | inert | inert | inert | yes |
 /// | RFC 7250 raw public keys / cert-type preferences | yes | yes | **refused** | **refused** | yes |
 /// | `ech` / `ech_server` | yes | inert | **refused** | **refused** | yes |
-/// | `cert_compression_algorithms` | yes | inert | inert | inert | yes |
+/// | `cert_compression_algorithms`, `own_cert_compression_algorithms` | yes | inert | inert | inert | yes |
 /// | `cookie_secret`, `previous_cookie_secret`, `no_cookie`, `peer_address` | inert | inert | yes | yes | inert |
 /// | `max_record_size` | inert | inert | yes | inert (fixed 1100) | inert |
 /// | `connection_id` / `connection_id_len` | inert | inert | yes | yes | inert |
@@ -1323,15 +1336,29 @@ impl ConfigBuilder {
     }
 
     /// Sets the `compress_certificate` (RFC 8879) advertisement —
-    /// `CertificateCompressionAlgorithm` IDs the endpoint can decompress,
-    /// in preference order. The default is `[1]` (zlib only). Pass an
+    /// `CertificateCompressionAlgorithm` IDs the endpoint accepts the
+    /// PEER's certificate compressed with (`1` = zlib, `2` = brotli, `3` =
+    /// zstd). The default is every algorithm the build implements. Pass an
     /// empty `Vec` to turn the extension off entirely (no advertisement;
-    /// `CompressedCertificate` replies are also refused). Only zlib is
-    /// implemented today; entries for brotli (`2`) or zstd (`3`) are
-    /// allowed on the wire but ignored when selecting.
+    /// a `CompressedCertificate` is refused) — and, unless
+    /// [`own_cert_compression_algorithms`](Self::own_cert_compression_algorithms)
+    /// is set, to stop compressing this endpoint's own certificate too.
+    /// See [`Config::cert_compression_algorithms`].
     #[cfg(feature = "cert-compression")]
     pub fn cert_compression_algorithms(mut self, algorithms: Vec<u16>) -> Self {
         self.inner.cert_compression_algorithms = algorithms;
+        self
+    }
+
+    /// Sets the algorithms this endpoint compresses its OWN certificate
+    /// with (RFC 8879), in preference order; an empty `Vec` never
+    /// compresses it. Unset, the list set by
+    /// [`cert_compression_algorithms`](Self::cert_compression_algorithms)
+    /// applies to both directions. See
+    /// [`Config::own_cert_compression_algorithms`].
+    #[cfg(feature = "cert-compression")]
+    pub fn own_cert_compression_algorithms(mut self, algorithms: Vec<u16>) -> Self {
+        self.inner.own_cert_compression_algorithms = Some(algorithms);
         self
     }
 

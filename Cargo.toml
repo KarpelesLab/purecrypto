@@ -56,7 +56,10 @@ name = "purecrypto"
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
 default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "ed25519-table", "p256-table", "streebog-table", "whirlpool-table", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "jose"]
-std = ["alloc"]
+# `compcol?/…`: under `cert-compression` a `std` build also gets compcol's
+# brotli codec, whose encoder uses floating-point `log2` and so cannot be
+# built for `no_std` (zlib and zstd can).
+std = ["alloc", "compcol?/std", "compcol?/brotli"]
 alloc = []
 
 # --- module gates (added as each layer lands) ---
@@ -305,9 +308,9 @@ ech = ["tls", "hpke"]
 # Karpeles-Lab `compcol` crate for the zlib (RFC 1950 over RFC 1951
 # DEFLATE) codec — the sole vendored dependency, carved out from the
 # crate's "no foreign code" charter because compcol is a sibling
-# pure-Rust no_std project under the same maintainership. Algorithm 1
-# (zlib) is the only codepoint wired today; brotli (2) and zstd (3)
-# remain unimplemented.
+# pure-Rust no_std project under the same maintainership. All three
+# registered algorithms are wired: zlib (1) and zstd (3) always, brotli
+# (2) in a `std` build (see the `std` feature).
 cert-compression = ["tls", "dep:compcol"]
 # Embedded root-CA trust store: pre-seed a `RootCertStore` with the curated
 # first-party `cacrt` bundle — built from the Mozilla root program and others,
@@ -331,12 +334,12 @@ mio = ["tls", "std", "dep:mio"]
 # This crate's design principle is to ship no foreign code, primarily so the
 # cryptographic critical path stays in-house and auditable. The single exception
 # is `compcol` (also a Karpeles Lab project, MIT, pure-safe no_std + alloc),
-# pulled in only under the `cert-compression` feature for RFC 8879 zlib certificate
-# compression — re-implementing DEFLATE in-house just to satisfy the letter of
+# pulled in only under the `cert-compression` feature for RFC 8879 certificate
+# compression (zlib, brotli, zstd) — re-implementing DEFLATE in-house just to satisfy the letter of
 # the policy would burn ~2-3 kLoC of review surface for no security gain, since
 # compcol sits outside the cryptographic trust boundary.
 [dependencies]
-compcol = { version = "0.6", default-features = false, features = ["zlib"], optional = true }
+compcol = { version = "0.6.11", default-features = false, features = ["zlib", "zstd"], optional = true }
 # Embedded root-CA bundle (curated from the Mozilla root program and others
 # per CA/Browser Forum rules, parsed at build time into static DER).
 # First-party (Karpeles Lab), `no_std`/no-alloc, fully-safe Rust with a

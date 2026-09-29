@@ -26,6 +26,10 @@ pub(crate) use client::ClientKey;
 pub(crate) use client12::ClientConfig12;
 pub(crate) use client12::ClientConnection12;
 pub(crate) use client12::StoredSession12;
+// The handshake-message ceiling: RFC 8879 §5 wants the same limit on a
+// decompressed Certificate as on a plain one.
+#[cfg(feature = "cert-compression")]
+pub(crate) use common::MAX_HANDSHAKE_REASSEMBLY;
 // Re-exported for the DTLS 1.2 client / server, which drive suite negotiation
 // from the same 6-entry SUITES_12 table as the TLS 1.2 layer.
 #[allow(unused_imports)]
@@ -4803,15 +4807,52 @@ mod loopback_tests {
         assert!(!server.is_handshaking());
     }
 
-    /// RFC 8879 §4: both ends opt into cert-compression with algorithm
-    /// `zlib`. The handshake must complete, the server must record the
-    /// client's offer, and application data must flow both ways. This
-    /// is the wiring smoke for the `CompressedCertificate` emission/
-    /// reception path; the codec round-trips are covered by
+    /// Drives `client` and `server` to the end of the handshake and checks
+    /// that application data flows both ways.
+    #[cfg(feature = "cert-compression")]
+    fn drive_cert_compression_loopback(
+        client: &mut ClientConnection,
+        server: &mut ServerConnection<HmacDrbg<Sha256>>,
+    ) {
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+        client.send_application_data(b"ping cc").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ping cc");
+        server.send_application_data(b"pong cc").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"pong cc");
+    }
+
+    /// RFC 8879 §4, server certificate: both ends opt into
+    /// cert-compression with their defaults. The handshake must
+    /// complete, the server must record the client's offer, both sides
+    /// must report the algorithm used, and application data must flow
+    /// both ways. This is the wiring smoke for the `CompressedCertificate`
+    /// emission/reception path; the codec round-trips are covered by
     /// `tls::cert_compression::tests` and need not be re-asserted here.
     #[cfg(feature = "cert-compression")]
     #[test]
-    fn cert_compression_zlib_loopback() {
+    fn cert_compression_server_certificate_loopback() {
         use crate::tls::cert_compression;
         let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
         server_config =
@@ -4825,79 +4866,222 @@ mod loopback_tests {
         let srng = HmacDrbg::<Sha256>::new(b"cc-zlib-s", b"nonce", &[]);
         let mut client = ClientConnection::new(config, "loopback.example", &mut crng).unwrap();
         let mut server = ServerConnection::new(server_config, srng);
-        for _ in 0..16 {
-            let c = client.write_tls();
-            if !c.is_empty() {
-                server.read_tls(&c);
-                server.process_new_packets().unwrap();
-            }
-            let s = server.write_tls();
-            if !s.is_empty() {
-                client.read_tls(&s);
-                client.process_new_packets().unwrap();
-            }
-            if c.is_empty() && s.is_empty() {
-                break;
-            }
-        }
-        assert!(!client.is_handshaking());
-        assert!(!server.is_handshaking());
-        // Server saw the client's compress_certificate offer with zlib.
+        drive_cert_compression_loopback(&mut client, &mut server);
+        // Server saw the client's full compress_certificate offer.
         assert_eq!(
             server.peer_cert_compression_algorithms(),
-            &[cert_compression::algorithm::ZLIB]
+            cert_compression::default_algorithms().as_slice()
         );
-        // App data round-trips both ways.
-        client.send_application_data(b"ping cc").unwrap();
-        let c = client.write_tls();
-        server.read_tls(&c);
-        server.process_new_packets().unwrap();
-        assert_eq!(server.take_received_plaintext(), b"ping cc");
-        server.send_application_data(b"pong cc").unwrap();
-        let s = server.write_tls();
-        client.read_tls(&s);
-        client.process_new_packets().unwrap();
-        assert_eq!(client.take_received_plaintext(), b"pong cc");
+        // The server's first preference (zlib) was used, and both sides
+        // say so; nothing was requested of the client.
+        assert_eq!(
+            server.own_cert_compression(),
+            Some(cert_compression::algorithm::ZLIB)
+        );
+        assert_eq!(
+            client.peer_cert_compression(),
+            Some(cert_compression::algorithm::ZLIB)
+        );
+        assert_eq!(client.own_cert_compression(), None);
+        assert_eq!(server.peer_cert_compression(), None);
     }
 
-    /// RFC 8879: when the server's configured algorithm set is disjoint
-    /// from the client's offer (or vice-versa), the server falls back to
-    /// emitting plain `Certificate`. The handshake still completes.
+    /// RFC 8879 §4: the sender picks by ITS preference among what the
+    /// peer listed. Pin the server to each algorithm in turn (the client
+    /// keeps its defaults); the chosen one must round-trip.
+    #[cfg(feature = "cert-compression")]
+    #[test]
+    fn cert_compression_each_algorithm_loopback() {
+        use crate::tls::cert_compression;
+        for alg in cert_compression::default_algorithms() {
+            let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
+            server_config = server_config.with_own_cert_compression_algorithms(alloc::vec![alg]);
+            let mut roots = RootCertStore::new();
+            roots.add_der(root_der).unwrap();
+            let mut config = client_config(roots);
+            config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+            let mut crng = HmacDrbg::<Sha256>::new(b"cc-each-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"cc-each-s", b"nonce", &[]);
+            let mut client = ClientConnection::new(config, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection::new(server_config, srng);
+            drive_cert_compression_loopback(&mut client, &mut server);
+            assert_eq!(server.own_cert_compression(), Some(alg), "algorithm {alg}");
+            assert_eq!(client.peer_cert_compression(), Some(alg), "algorithm {alg}");
+        }
+    }
+
+    /// RFC 8879: when the server's send list is disjoint from the
+    /// client's offer, the server falls back to the plain `Certificate`.
+    /// The handshake still completes. Likewise when the client's accept
+    /// list is empty: no extension goes out and nothing is compressed.
     #[cfg(feature = "cert-compression")]
     #[test]
     fn cert_compression_falls_back_on_no_overlap() {
-        // Server advertises an unsupported algorithm only (e.g. brotli);
-        // client offers zlib. Server picks neither — falls back to plain.
         use crate::tls::cert_compression;
-        let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
-        server_config = server_config
-            .with_cert_compression_algorithms(alloc::vec![cert_compression::algorithm::BROTLI]);
-        let mut roots = RootCertStore::new();
-        roots.add_der(root_der).unwrap();
-        let mut config = client_config(roots)
-            .with_cert_compression_algorithms(cert_compression::default_algorithms());
-        config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
-        let mut crng = HmacDrbg::<Sha256>::new(b"cc-fb-c", b"nonce", &[]);
-        let srng = HmacDrbg::<Sha256>::new(b"cc-fb-s", b"nonce", &[]);
-        let mut client = ClientConnection::new(config, "loopback.example", &mut crng).unwrap();
-        let mut server = ServerConnection::new(server_config, srng);
-        for _ in 0..16 {
-            let c = client.write_tls();
-            if !c.is_empty() {
-                server.read_tls(&c);
-                server.process_new_packets().unwrap();
-            }
-            let s = server.write_tls();
-            if !s.is_empty() {
-                client.read_tls(&s);
-                client.process_new_packets().unwrap();
-            }
-            if c.is_empty() && s.is_empty() {
-                break;
-            }
+        for (server_send, client_accept) in [
+            // Server sends only with zstd; client accepts only zlib.
+            (
+                alloc::vec![cert_compression::algorithm::ZSTD],
+                alloc::vec![cert_compression::algorithm::ZLIB],
+            ),
+            // Server sends only with a codepoint nobody implements.
+            (alloc::vec![9000u16], cert_compression::default_algorithms()),
+            // Client opted out entirely.
+            (cert_compression::default_algorithms(), Vec::new()),
+            // Client lists only codepoints the build cannot decode — as
+            // good as opting out (nothing is advertised).
+            (cert_compression::default_algorithms(), alloc::vec![9000u16]),
+        ] {
+            let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
+            server_config = server_config.with_own_cert_compression_algorithms(server_send);
+            let mut roots = RootCertStore::new();
+            roots.add_der(root_der).unwrap();
+            let mut config = client_config(roots).with_cert_compression_algorithms(client_accept);
+            config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+            let mut crng = HmacDrbg::<Sha256>::new(b"cc-fb-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"cc-fb-s", b"nonce", &[]);
+            let mut client = ClientConnection::new(config, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection::new(server_config, srng);
+            drive_cert_compression_loopback(&mut client, &mut server);
+            assert_eq!(server.own_cert_compression(), None);
+            assert_eq!(client.peer_cert_compression(), None);
         }
-        assert!(!client.is_handshaking());
-        assert!(!server.is_handshaking());
+    }
+
+    /// An mTLS pair for the client-certificate direction: the server
+    /// requires a client certificate and trusts the (self-signed) Ed25519
+    /// client leaf; the client trusts the server's RSA certificate.
+    #[cfg(feature = "cert-compression")]
+    fn mtls_pair_for_cert_compression(
+        server_accept: Vec<u16>,
+        client_send: Vec<u16>,
+    ) -> (ClientConnection, ServerConnection<HmacDrbg<Sha256>>) {
+        use crate::tls::{ClientCertConfig, RootCertStore};
+        let (server_config, server_cert_der) = rsa_server();
+        let mut ckeygen = HmacDrbg::<Sha256>::new(b"cc-mtls-client-key", b"nonce", &[]);
+        let client_key = Ed25519PrivateKey::generate(&mut ckeygen);
+        let client_cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&client_key),
+            &DistinguishedName::common_name("cc-mtls-client"),
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            1,
+            false,
+            &["cc-mtls-client"],
+        )
+        .unwrap();
+        let client_cert_der = client_cert.to_der().to_vec();
+        let mut server_roots = RootCertStore::new();
+        server_roots.add_der(client_cert_der.clone()).unwrap();
+        let server_config = server_config
+            .with_client_auth(server_roots, true)
+            .with_verification_time(fixture_time())
+            .with_cert_compression_algorithms(server_accept);
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let cc = ClientCertConfig::with_ed25519(alloc::vec![client_cert_der], client_key);
+        let client_cfg = client_config(roots)
+            .with_client_cert(cc)
+            .with_own_cert_compression_algorithms(client_send);
+        let mut crng = HmacDrbg::<Sha256>::new(b"cc-mtls-client-rng", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"cc-mtls-server-rng", b"nonce", &[]);
+        let client = ClientConnection::new(client_cfg, "loopback.example", &mut crng).unwrap();
+        let server = ServerConnection::new(server_config, srng);
+        (client, server)
+    }
+
+    /// RFC 8879 §3/§4, client certificate: the server advertises
+    /// `compress_certificate` in its `CertificateRequest`, the client
+    /// answers with a `CompressedCertificate` under its first preference
+    /// the server listed, and the server authenticates it. Each algorithm
+    /// in turn, plus the default lists.
+    #[cfg(feature = "cert-compression")]
+    #[test]
+    fn cert_compression_client_certificate_loopback() {
+        use crate::tls::cert_compression;
+        let mut cases: Vec<(Vec<u16>, Vec<u16>, u16)> = cert_compression::default_algorithms()
+            .into_iter()
+            .map(|alg| {
+                (
+                    cert_compression::default_algorithms(),
+                    alloc::vec![alg],
+                    alg,
+                )
+            })
+            .collect();
+        cases.push((
+            cert_compression::default_algorithms(),
+            cert_compression::default_algorithms(),
+            cert_compression::algorithm::ZLIB,
+        ));
+        // The client's order decides, not the server's.
+        cases.push((
+            alloc::vec![
+                cert_compression::algorithm::ZLIB,
+                cert_compression::algorithm::ZSTD
+            ],
+            alloc::vec![
+                cert_compression::algorithm::ZSTD,
+                cert_compression::algorithm::ZLIB
+            ],
+            cert_compression::algorithm::ZSTD,
+        ));
+        for (server_accept, client_send, expected) in cases {
+            let (mut client, mut server) =
+                mtls_pair_for_cert_compression(server_accept.clone(), client_send.clone());
+            drive_cert_compression_loopback(&mut client, &mut server);
+            assert_eq!(
+                client.cr_cert_compression_algorithms(),
+                server_accept.as_slice()
+            );
+            assert_eq!(server.peer_certificates().len(), 1);
+            assert_eq!(
+                client.own_cert_compression(),
+                Some(expected),
+                "client send list {client_send:?}"
+            );
+            assert_eq!(
+                server.peer_cert_compression(),
+                Some(expected),
+                "client send list {client_send:?}"
+            );
+            // The server's own certificate was compressed independently
+            // (the client accepts the defaults).
+            assert_eq!(
+                server.own_cert_compression(),
+                Some(cert_compression::algorithm::ZLIB)
+            );
+        }
+    }
+
+    /// RFC 8879: with no `compress_certificate` in the CertificateRequest
+    /// (server accept list empty) or nothing in common, the client sends
+    /// its plain `Certificate`; mTLS still completes.
+    #[cfg(feature = "cert-compression")]
+    #[test]
+    fn cert_compression_client_certificate_falls_back() {
+        use crate::tls::cert_compression;
+        for (server_accept, client_send) in [
+            (Vec::new(), cert_compression::default_algorithms()),
+            (cert_compression::default_algorithms(), Vec::new()),
+            (
+                alloc::vec![cert_compression::algorithm::ZLIB],
+                alloc::vec![cert_compression::algorithm::ZSTD],
+            ),
+        ] {
+            let (mut client, mut server) =
+                mtls_pair_for_cert_compression(server_accept.clone(), client_send);
+            drive_cert_compression_loopback(&mut client, &mut server);
+            assert_eq!(
+                client.cr_cert_compression_algorithms(),
+                server_accept.as_slice()
+            );
+            assert_eq!(server.peer_certificates().len(), 1);
+            assert_eq!(client.own_cert_compression(), None);
+            assert_eq!(server.peer_cert_compression(), None);
+        }
     }
 
     /// With `verify_certificates = false` the stapled CRL is ignored

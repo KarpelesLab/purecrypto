@@ -70,6 +70,10 @@ pub(crate) struct CommonOpts<'a> {
     pub raw_public_key_spki: Option<&'a [u8]>,
     #[cfg(feature = "cert-compression")]
     pub cert_compression_algorithms: &'a [u16],
+    /// The send-side list (`Config::own_cert_compression_algorithms`),
+    /// already defaulted to `cert_compression_algorithms` when unset.
+    #[cfg(feature = "cert-compression")]
+    pub own_cert_compression_algorithms: &'a [u16],
     pub key_log: &'a Option<Arc<dyn KeyLog>>,
     pub rng: &'a Option<Arc<dyn EntropySource>>,
     pub signer: &'a Option<Arc<dyn HandshakeSigner>>,
@@ -156,6 +160,8 @@ impl Config {
             ech_server,
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms,
+            #[cfg(feature = "cert-compression")]
+            own_cert_compression_algorithms,
             cookie_secret,
             previous_cookie_secret,
             require_cookie,
@@ -188,6 +194,10 @@ impl Config {
                 raw_public_key_spki: raw_public_key_spki.as_deref(),
                 #[cfg(feature = "cert-compression")]
                 cert_compression_algorithms,
+                #[cfg(feature = "cert-compression")]
+                own_cert_compression_algorithms: own_cert_compression_algorithms
+                    .as_deref()
+                    .unwrap_or(cert_compression_algorithms),
                 key_log,
                 rng,
                 signer,

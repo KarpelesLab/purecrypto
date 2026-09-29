@@ -105,8 +105,8 @@ cc app.c -I include target/release/libpurecrypto.a -lpthread -ldl -lm -o app
 - **No foreign code.** No C, no assembly borrowed from other libraries, no
   third-party crypto crates. Everything is implemented here, in Rust. The
   only dependencies are two sibling pure-Rust `no_std` crates under the
-  same maintainership, `compcol` (the zlib codec for RFC 8879 certificate
-  compression) and `cacrt` (the embedded root bundle), plus the optional
+  same maintainership, `compcol` (the zlib, brotli and zstd codecs for RFC
+  8879 certificate compression) and `cacrt` (the embedded root bundle), plus the optional
   `tokio` / `mio` I/O adapters.
 - **Constant time by default.** Secret-dependent values flow through the
   [`ct`](src/ct) layer (branchless equality, selection, ordering). Where an
@@ -170,7 +170,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `dtls` | DTLS 1.2 and 1.3 (RFC 6347 / RFC 9147): cookies, fragmentation, replay windows, ACK-driven retransmission, KeyUpdate |
 | `quic` | QUIC v1 (RFC 9000/9001/9002) plus DATAGRAM (RFC 9221), sans-I/O |
 | `ech` | Encrypted Client Hello (draft-ietf-tls-esni-22), client and server |
-| `cert-compression` | RFC 8879 certificate compression |
+| `cert-compression` | RFC 8879 certificate compression (zlib, zstd; brotli with `std`), both directions |
 | `embedded-roots` | A curated root-certificate bundle (`RootCertStore::with_embedded_roots()`) |
 | `tls-legacy` | SSL 3.0 / TLS 1.0 / TLS 1.1 with CBC suites. **Deprecated and insecure**, off by default, for talking to legacy devices only |
 | `tokio`, `mio` | Async and non-blocking I/O adapters for `tls` |

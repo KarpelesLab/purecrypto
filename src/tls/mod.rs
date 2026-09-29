@@ -68,7 +68,6 @@
 #![cfg_attr(not(feature = "quic"), doc = "", doc = "[`crate::quic`]: crate")]
 
 #[cfg(feature = "cert-compression")]
-#[doc(hidden)]
 pub mod cert_compression;
 pub(crate) mod codec;
 mod config;
