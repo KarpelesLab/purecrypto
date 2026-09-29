@@ -959,12 +959,15 @@ pc_status pc_dtls_use_spare_connection_id(PcTls *tls);
  *      pc_quic_stream_read(q, id, app, &m, &fin);
  *   5. pc_quic_free(q); pc_quic_cfg_free(cfg);
  *
- * Only QUIC v1 (RFC 9000) is supported; PC_QUIC_V1 is provided for
- * future-proofing.
+ * QUIC v1 (RFC 9000) and v2 (RFC 9369) are supported, with RFC 9368
+ * compatible version negotiation. By default v1 is used on the wire and v2
+ * is offered for a compatible upgrade; pc_quic_cfg_set_versions overrides
+ * the set and order, and pc_quic_version reports the negotiated version.
  * ========================================================================== */
 
-/* QUIC wire version. */
+/* QUIC wire versions (long-header Version field). */
 #define PC_QUIC_V1 0x00000001
+#define PC_QUIC_V2 ((int32_t)0x6b3343cf)
 
 PcQuicCfg *pc_quic_cfg_new(int32_t role);     /* PC_TLS_CLIENT | PC_TLS_SERVER */
 void       pc_quic_cfg_free(PcQuicCfg *cfg);
@@ -988,6 +991,10 @@ pc_status pc_quic_cfg_set_initial_max_data(PcQuicCfg *cfg, uint64_t bytes);
 pc_status pc_quic_cfg_set_initial_max_streams_bidi(PcQuicCfg *cfg, uint64_t streams);
 pc_status pc_quic_cfg_set_max_datagram_frame_size(PcQuicCfg *cfg, uint64_t bytes);
 pc_status pc_quic_cfg_set_require_retry(PcQuicCfg *cfg, int32_t require);   /* server-only */
+/* QUIC versions in preference order (RFC 9368/9369); each PC_QUIC_V1 or
+ * PC_QUIC_V2, the first the client's first-flight version. Empty/unknown/
+ * duplicate -> PC_UNSUPPORTED. Default {PC_QUIC_V1, PC_QUIC_V2}. */
+pc_status pc_quic_cfg_set_versions(PcQuicCfg *cfg, const int32_t *versions, size_t n);
 
 PcQuic *pc_quic_new(const PcQuicCfg *cfg);
 void    pc_quic_free(PcQuic *q);
@@ -1077,6 +1084,9 @@ pc_status pc_quic_set_peer_addr(PcQuic *q,
  * (PC_BUFFER_TOO_SMALL when the capacity is insufficient). */
 pc_status pc_quic_negotiated_alpn(const PcQuic *q, uint8_t *out, size_t *out_len);
 pc_status pc_quic_peer_certificate(const PcQuic *q, uint8_t *out, size_t *out_len);
+/* The QUIC version in use (PC_QUIC_V1 / PC_QUIC_V2): the negotiated version
+ * once the handshake settles (RFC 9368), else the first-flight version. */
+pc_status pc_quic_version(const PcQuic *q, int32_t *out);
 
 #ifdef __cplusplus
 }

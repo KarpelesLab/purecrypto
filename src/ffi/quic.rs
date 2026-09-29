@@ -25,15 +25,26 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use super::tls::{PcKey, parse_private_key_pem};
 use crate::quic::{
-    CloseInitiator, CloseKind, QuicConfig, QuicConnection, Role as QuicRole, StreamId,
+    CloseInitiator, CloseKind, QuicConfig, QuicConnection, QuicVersion, Role as QuicRole, StreamId,
     TransportParameters,
 };
 use crate::tls::{Config, ConfigBuilder, ProtocolVersion, RootCertStore};
 
-/// QUIC v1 wire version. Mirrors the `PC_QUIC_V1` macro in
+/// QUIC v1 wire version (RFC 9000). Mirrors the `PC_QUIC_V1` macro in
 /// `include/purecrypto.h`.
 #[allow(dead_code)]
 pub const PC_QUIC_V1: i32 = 0x0000_0001;
+
+/// QUIC v2 wire version (RFC 9369, `0x6b3343cf`). Mirrors `PC_QUIC_V2`.
+/// The value is negative as `i32` (its top bit is set); the C header
+/// exposes it as an `int32_t` with the same bit pattern.
+#[allow(dead_code)]
+pub const PC_QUIC_V2: i32 = 0x6b33_43cfu32 as i32;
+
+/// Maps a `PC_QUIC_V1` / `PC_QUIC_V2` constant to a [`QuicVersion`].
+fn version_from_i32(v: i32) -> Option<QuicVersion> {
+    QuicVersion::from_wire(v as u32)
+}
 
 /// QUIC client / server discriminant. Mirrors the values of
 /// `pc_tls_role` (`PC_TLS_CLIENT = 0`, `PC_TLS_SERVER = 1`) so a caller
@@ -62,6 +73,9 @@ pub struct PcQuicCfg {
     // overwrites just one field.
     tp: TransportParameters,
     require_retry: bool,
+    // QUIC versions in preference order, and the client's original version.
+    versions: Vec<QuicVersion>,
+    original_version: Option<QuicVersion>,
 }
 
 /// The identity `pc_quic_cfg_set_certificate` installs. The key is the
@@ -101,6 +115,8 @@ impl PcQuicCfg {
             verify_certs: true,
             tp,
             require_retry: false,
+            versions: crate::quic::SUPPORTED_VERSIONS.to_vec(),
+            original_version: None,
         }
     }
 
@@ -454,6 +470,62 @@ pub unsafe extern "C" fn pc_quic_cfg_set_require_retry(
     })
 }
 
+/// Sets the QUIC versions this endpoint speaks, in preference order (RFC
+/// 9368 §3 / RFC 9369). `versions` points to `n` entries, each `PC_QUIC_V1`
+/// or `PC_QUIC_V2`; the first is the client's original (first-flight)
+/// version. A `NULL`/empty list, an unknown value, or a repeated entry is
+/// rejected with [`PcStatus::Unsupported`]. Without a call the default is
+/// `{PC_QUIC_V1, PC_QUIC_V2}` — v1 on the wire, v2 offered for a compatible
+/// upgrade.
+///
+/// # Safety
+/// `cfg` valid; `versions` points to `n` readable `int32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_quic_cfg_set_versions(
+    cfg: *mut PcQuicCfg,
+    versions: *const i32,
+    n: usize,
+) -> PcStatus {
+    guard(|| {
+        if cfg.is_null() || (n != 0 && versions.is_null()) {
+            return PcStatus::NullPointer;
+        }
+        if n == 0 {
+            return PcStatus::Unsupported;
+        }
+        let raw = unsafe { core::slice::from_raw_parts(versions, n) };
+        let mut vs = Vec::with_capacity(n);
+        for &r in raw {
+            match version_from_i32(r) {
+                Some(v) if !vs.contains(&v) => vs.push(v),
+                _ => return PcStatus::Unsupported,
+            }
+        }
+        let c = unsafe { &mut *cfg };
+        c.original_version = Some(vs[0]);
+        c.versions = vs;
+        PcStatus::Ok
+    })
+}
+
+/// Writes the QUIC version in use on the connection — the Negotiated
+/// Version once version negotiation has settled (RFC 9368 §1.2), else the
+/// first-flight version — into `*out` as a `PC_QUIC_V1` / `PC_QUIC_V2`
+/// value.
+///
+/// # Safety
+/// `q` and `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_quic_version(q: *const PcQuic, out: *mut i32) -> PcStatus {
+    guard(|| {
+        if q.is_null() || out.is_null() {
+            return PcStatus::NullPointer;
+        }
+        unsafe { *out = (&*q).inner.version().wire() as i32 };
+        PcStatus::Ok
+    })
+}
+
 /// Wall-clock seconds since the Unix epoch, for the retry-token clock
 /// ([`QuicConnection::set_now_secs`]). Returns 0 — the engine's "no
 /// clock" sentinel, which disables stateless Retry fail-closed — if the
@@ -515,6 +587,8 @@ pub unsafe extern "C" fn pc_quic_new(cfg: *const PcQuicCfg) -> *mut PcQuic {
         let mut qcfg = QuicConfig {
             tls: tls_cfg,
             transport_params: c.tp.clone(),
+            versions: c.versions.clone(),
+            original_version: c.original_version,
             ..QuicConfig::default()
         };
         if c.role == QuicRole::Server && c.require_retry {
