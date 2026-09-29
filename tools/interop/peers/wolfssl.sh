@@ -85,7 +85,10 @@ wolf_group_name() {
         x25519) echo X25519 ;;
         p256) echo SECP256R1 ;;
         p384) echo SECP384R1 ;;
+        p521) echo SECP521R1 ;;
         x25519mlkem768) echo X25519MLKEM768 ;;
+        secp256r1mlkem768) echo SecP256r1MLKEM768 ;;
+        secp384r1mlkem1024) echo SecP384r1MLKEM1024 ;;
     esac
 }
 # The server's option pinning the case's group (accept-set of one; a
@@ -95,7 +98,10 @@ server_group_opt() {
         x25519) echo "-t" ;;
         p256) echo "-Y" ;;
         p384) echo "--force-curve SECP384R1" ;;
+        p521) echo "--force-curve SECP521R1" ;;
         x25519mlkem768) echo "--pqc X25519MLKEM768" ;;
+        secp256r1mlkem768) echo "--pqc SecP256r1MLKEM768" ;;
+        secp384r1mlkem1024) echo "--pqc SecP384r1MLKEM1024" ;;
     esac
 }
 # The client's option sharing (only) the case's group, or empty when the
@@ -105,6 +111,8 @@ client_group_opt() {
         x25519) echo "-t" ;;
         p256) echo "-Y" ;;
         x25519mlkem768) echo "--pqc X25519MLKEM768" ;;
+        secp256r1mlkem768) echo "--pqc SecP256r1MLKEM768" ;;
+        secp384r1mlkem1024) echo "--pqc SecP384r1MLKEM1024" ;;
         *) echo "" ;;
     esac
 }
@@ -174,13 +182,17 @@ cmd_supports() {
         skip "the wolfSSL (D)TLS 1.2 server takes its ECDSA certificate's curve for ECDHE and requires it in supported_groups (RFC 8422 §5.1.1)"
     fi
     if [ "$CASE_PROTO" = dtls13 ] && [ "$CASE_ROLE" = peer-server ] &&
-        [ "$CASE_GROUP" = x25519mlkem768 ] && [ "$CASE_FEAT" != hrr ]; then
-        # The stateless server validates the cookie on the first fragment
-        # of a ClientHello and drops a cookieless one; a first ClientHello
-        # carrying the hybrid share does not fit in one 1200-byte datagram
-        # (wolfSSL's own client sends an empty key_share and takes the
-        # HelloRetryRequest instead — which the hrr case exercises).
-        skip "the wolfSSL stateless DTLS 1.3 server drops a fragmented first ClientHello (the hybrid share does not fit in one datagram; covered by hrr)"
+        [ "$CASE_FEAT" != hrr ]; then
+        case $CASE_GROUP in
+            x25519mlkem768|secp256r1mlkem768|secp384r1mlkem1024)
+                # The stateless server validates the cookie on the first
+                # fragment of a ClientHello and drops a cookieless one; a
+                # first ClientHello carrying a hybrid share (1216 to 1665
+                # bytes) does not fit in one 1200-byte datagram (wolfSSL's
+                # own client sends an empty key_share and takes the
+                # HelloRetryRequest instead — which the hrr case exercises).
+                skip "the wolfSSL stateless DTLS 1.3 server drops a fragmented first ClientHello (the hybrid share does not fit in one datagram; covered by hrr)" ;;
+        esac
     fi
     return 0
 }

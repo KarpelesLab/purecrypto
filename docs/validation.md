@@ -203,22 +203,23 @@ update with the commands in `tools/wycheproof/README.md`.
   exchanges application data and is checked on **both** sides for the
   negotiated version, suite and group (a handshake that completed with the
   wrong group is a failure) and, where the tool sends one, for the peer's
-  `close_notify`. 228 cases per peer; `⏭` is a SKIP with the reason (a peer
+  `close_notify`. 264 cases per peer; `⏭` is a SKIP with the reason (a peer
   or tool limitation, never a relaxed check):
 
   | Case | OpenSSL 3.0 (C / S) | OpenSSL 3.6 (C / S) | BoringSSL (C / S) |
   |---|---|---|---|
-  | Plain: `{RSA-2048, P-256, P-384, Ed25519}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (S: AES-128-GCM only — `bssl client` cannot pin a TLS 1.3 suite) |
+  | Plain: `{RSA-2048, P-256, P-384, Ed25519}` × `{x25519, P-256, P-384, P-521}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (S: AES-128-GCM only — `bssl client` cannot pin a TLS 1.3 suite) |
   | Plain, `X25519MLKEM768` | ⏭ 3.0 has none | ✅ / ✅ | ✅ / ✅ |
-  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | ⏭ | ⏭ |
+  | Plain, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` (RFC 10024) | ⏭ 3.0 has none | ✅ / ✅ | ⏭ BoringSSL has no NIST-curve hybrids |
   | Plain, ML-DSA-65 certificate | ⏭ 3.0 has none | ✅ / ✅ | ⏭ no ML-DSA |
   | Resumption (PSK + DHE) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
   | Resumption, PSK-only (`psk_ke`) | ✅ / ✅ (`-allow_no_dhe_kex`) | ✅ / ✅ | ⏭ BoringSSL has no `psk_ke` |
   | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`-psk` / `-psk_identity`) | ✅ / ✅ | ✅ / ✅ (RFC 9258 importer, `-psk-hex`) |
   | 0-RTT accepted | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
   | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ✅ / ✅ | ✅ / ✅ | ✅ / ⏭ `bssl client` treats `EARLY_DATA_REJECTED` as fatal |
-  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384`, `P-521` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
   | HelloRetryRequest to `X25519MLKEM768` | ⏭ | ✅ / ✅ | ✅ / ⏭ `bssl client` always shares it |
+  | HelloRetryRequest to `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ⏭ | ✅ / ✅ | ⏭ |
   | mTLS, client certificate `{RSA-2048, P-256, P-384, Ed25519}` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (C with Ed25519: ⏭ `bssl server` cannot be told to accept it) |
   | mTLS, ML-DSA-65 client certificate | ⏭ | ✅ / ✅ | ⏭ |
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
@@ -262,9 +263,8 @@ update with the commands in `tools/wycheproof/README.md`.
 
   | Case | Mbed TLS 4.2.0 (C / S) |
   |---|---|
-  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ |
-  | Plain, `X25519MLKEM768` | ⏭ no ML-KEM hybrids |
-  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them |
+  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384, P-521}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ |
+  | Plain, `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ⏭ no ML-KEM hybrids |
   | Plain, Ed25519 certificate | ⏭ no EdDSA |
   | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA |
   | Resumption (PSK + DHE) | ✅ / ✅ |
@@ -272,8 +272,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`psk=` / `psk_identity=`) |
   | 0-RTT accepted | ✅ / ✅ |
   | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ✅ / ✅ |
-  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ |
-  | HelloRetryRequest to `X25519MLKEM768` | ⏭ |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384`, `P-521` | ✅ / ✅ |
+  | HelloRetryRequest to the ML-KEM hybrids | ⏭ |
   | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ |
   | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ / ⏭ |
   | KeyUpdate from either side | ⏭ Mbed TLS does not implement TLS 1.3 KeyUpdate at all: a received one is a fatal `unexpected_message` |
@@ -326,8 +326,10 @@ update with the commands in `tools/wycheproof/README.md`.
   pins SChannel's TLS policy (the group-policy cipher-suite and ECC-curve
   lists under `HKLM\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002`)
   to a list without curve25519 and ChaCha20, both of which the OS supports
-  and has in its local defaults, so the job appends them to the policy
-  lists before the matrix (SChannel picks that up at once); and
+  and has in its local defaults, and without NistP521, which it supports
+  but leaves out of its default curve order — so the job appends the
+  three to the policy lists before the matrix (SChannel picks that up at
+  once); and
   `SslStream` has no knob for cipher suites or groups on Windows
   (`CipherSuitesPolicy` is Linux/macOS only), so the SChannel *client*
   offers everything the policy enables, and the purecrypto server's own
@@ -336,11 +338,10 @@ update with the commands in `tools/wycheproof/README.md`.
 
   | Case | SChannel (C / S) |
   |---|---|
-  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ (S: AES-128-GCM only — the client cannot restrict suites) |
+  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384, P-521}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ (S: AES-128-GCM only — the client cannot restrict suites) |
   | Plain, Ed25519 certificate | ⏭ SChannel has no Ed25519 (and .NET cannot load the key) |
   | Plain, ML-DSA-65 certificate | ⏭ SChannel has no ML-DSA |
-  | Plain, `X25519MLKEM768` | ⏭ no ML-KEM hybrid group in Server 2025's SChannel |
-  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them |
+  | Plain, `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ⏭ no ML-KEM hybrid group in Server 2025's SChannel |
   | Resumption (PSK + DHE) | ✅ / ✅ (`SslStream` does not report resumption; the purecrypto side's `resumed: yes` on the second connection of one peer process does) |
   | Resumption, PSK-only (`psk_ke`) | ⏭ `SslStream` exposes no PSK-only resumption |
   | External PSK (RFC 8446 §4.2.11) | ⏭ `SslStream` has no external-PSK API |
@@ -392,17 +393,18 @@ update with the commands in `tools/wycheproof/README.md`.
 
   | Case | Apple (C / S) |
   |---|---|
-  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384, X25519MLKEM768}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ (the client offers both AES-GCM suites whichever is asked for; the purecrypto server's `-ciphersuites` pins the case's) |
+  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384, P-521, X25519MLKEM768}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ (the client offers both AES-GCM suites whichever is asked for; the purecrypto server's `-ciphersuites` pins the case's) |
   | Plain, Ed25519 certificate | ⏭ the stack offers no `ed25519` signature scheme (with or without the eddsa SPI) and its keychain has no Ed25519 keys |
   | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA |
-  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them |
+  | Plain, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ⏭ the stack has no NIST-curve ML-KEM hybrids |
   | Resumption (PSK + DHE) | ✅ / ✅ |
   | Resumption, PSK-only (`psk_ke`) | ⏭ Network.framework exposes no PSK-only resumption |
   | External PSK (RFC 8446 §4.2.11) | ⏭ Network.framework has no external-PSK API |
   | 0-RTT accepted | ✅ / ⏭ a listener that accepts 0-RTT never completes the connection (`errSSLClosedNoNotify`; OpenSSL's client sees the same) |
   | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ✅ / ✅ |
-  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384`, `P-521` | ✅ / ✅ |
   | HelloRetryRequest to `X25519MLKEM768` | ⏭ the client always shares it / ✅ |
+  | HelloRetryRequest to the NIST-curve hybrids | ⏭ |
   | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ |
   | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ as above |
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ |
@@ -438,16 +440,17 @@ update with the commands in `tools/wycheproof/README.md`.
 
   | Case | LibreSSL 4.3 (C / S) | LibreSSL 3.3, macOS (C / S) |
   |---|---|---|
-  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ | ✅ / ✅ |
+  | Plain: `{RSA-2048, P-256, P-384}` × `{x25519, P-256, P-384, P-521}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ | ✅ / ✅ |
   | Plain, `X25519MLKEM768` | ✅ / ✅ | ⏭ 4.3+ |
-  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | ⏭ |
+  | Plain, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ⏭ LibreSSL has no NIST-curve hybrids | ⏭ |
   | Plain, Ed25519 certificate | ⏭ no Ed25519 in TLS: the apps cannot load the key, `signature_algorithms` omits it | ⏭ |
   | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA | ⏭ |
   | Resumption (PSK + DHE), 0-RTT accepted, 0-RTT rejected across HRR | ⏭ LibreSSL's TLS 1.3 has no resumption: no `psk_key_exchange_modes`, no NewSessionTicket | ⏭ |
   | Resumption, PSK-only (`psk_ke`) | ⏭ LibreSSL's TLS 1.3 has no resumption | ⏭ |
   | External PSK (RFC 8446 §4.2.11) | ⏭ LibreSSL's TLS 1.3 has no external PSK | ⏭ |
-  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ | ✅ / ✅ |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384`, `P-521` | ✅ / ✅ | ✅ / ✅ |
   | HelloRetryRequest to `X25519MLKEM768` | ✅ / ✅ | ⏭ |
+  | HelloRetryRequest to the NIST-curve hybrids | ⏭ | ⏭ |
   | mTLS, client certificate `{RSA-2048, P-256, P-384}` | ✅ / ✅ | ✅ / ✅ |
   | mTLS, Ed25519 / ML-DSA-65 client certificate | ⏭ | ⏭ |
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ | ⏭ 3.3's `s_server` answers with records neither side can decrypt (also against OpenSSL 3.6) / ✅ |
@@ -493,17 +496,16 @@ update with the commands in `tools/wycheproof/README.md`.
 
   | Case | GnuTLS 3.8.3 (C / S) | GnuTLS 3.8.13 + leancrypto (C / S) |
   |---|---|---|
-  | Plain: `{RSA-2048, P-256, P-384, Ed25519}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ | ✅ / ✅ |
-  | Plain, `X25519MLKEM768` | ⏭ no ML-KEM in this build | ✅ / ✅ |
-  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | ⏭ |
+  | Plain: `{RSA-2048, P-256, P-384, Ed25519}` × `{x25519, P-256, P-384, P-521}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ | ✅ / ✅ |
+  | Plain, `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ⏭ no ML-KEM in this build | ✅ / ✅ |
   | Plain, ML-DSA-65 certificate | ⏭ no ML-DSA in this build | ✅ / ✅ |
   | Resumption (PSK + DHE) | ✅ / ✅ | ✅ / ✅ |
   | Resumption, PSK-only (`psk_ke`) | ✅ / ✅ (server priority `+PSK`) | ✅ / ✅ |
   | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`--pskusername` / `--pskpasswd`) | ✅ / ✅ |
   | 0-RTT accepted | ✅ / ✅ (C: `gnutls-serv` < 3.8.10 drops the early data it read, so the record-layer log stands in for the echo) | ✅ / ✅ |
   | 0-RTT rejected across a HelloRetryRequest, PSK still accepted | ⏭ GnuTLS issue #1429, both roles (below) | ⏭ |
-  | HelloRetryRequest to `x25519`, `P-256`, `P-384` | ✅ / ✅ | ✅ / ✅ |
-  | HelloRetryRequest to `X25519MLKEM768` | ⏭ | ✅ / ⏭ `gnutls-cli` always lists and shares the hybrid first |
+  | HelloRetryRequest to `x25519`, `P-256`, `P-384`, `P-521` | ✅ / ✅ | ✅ / ✅ |
+  | HelloRetryRequest to the ML-KEM hybrids | ⏭ | ✅ / ⏭ `gnutls-cli` always lists and shares the hybrids first |
   | mTLS, client certificate `{RSA-2048, P-256, P-384, Ed25519}` | ✅ / ✅ | ✅ / ✅ |
   | mTLS, ML-DSA-65 client certificate | ⏭ | ✅ / ✅ |
   | KeyUpdate (`update_requested`) from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ |
@@ -553,20 +555,19 @@ update with the commands in `tools/wycheproof/README.md`.
   epoch change from either side, ALPN, the > 16 KiB chain at the default
   and at a 512-byte MTU (dozens of fragments each way), and a handshake
   through a relay dropping 20 % of the datagrams in each direction (ACK-
-  driven retransmission on 1.3, whole flights on 1.2). 522 cases; `C` /
+  driven retransmission on 1.3, whole flights on 1.2). 754 cases; `C` /
   `S` as above, `⏭` a SKIP with the reason:
 
   | Case | TLS 1.3 (C / S) | DTLS 1.3 (C / S) | DTLS 1.2 (C / S) |
   |---|---|---|---|
   | Plain: `{RSA-2048, P-256, P-384, Ed25519, ML-DSA-65}` × `{x25519, P-256}` × three suites | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (RSA, P-256 and P-384 certificates: the 1.2 engines sign with RSA or ECDSA only) |
-  | Plain, `P-384` key exchange | ✅ / ⏭ the example client can share X25519, P-256 or a hybrid first, not P-384 (the `hrr` case steers there) | ✅ / ⏭ same | ✅ (P-384 certificate; with another certificate ⏭ RFC 8422 §5.1.1: the wolfSSL 1.2 server uses its certificate's curve and requires it in `supported_groups`) / ✅ |
-  | Plain, `X25519MLKEM768` | ✅ / ✅ | ⏭ the stateless server validates the cookie on the first fragment, and a first ClientHello with the hybrid share does not fit in one datagram (the `hrr` case carries it in CH2) / ✅ | ⏭ the 1.2 engines have no hybrid |
-  | Plain, `P-521`, `SecP256r1MLKEM768` | ⏭ purecrypto does not implement them | — | — |
+  | Plain, `P-384` / `P-521` key exchange | ✅ / ⏭ the example client can share X25519, P-256 or a hybrid first, not P-384 or P-521 (the `hrr` case steers there) | ✅ / ⏭ same | ✅ (P-384 certificate; with another certificate ⏭ RFC 8422 §5.1.1: the wolfSSL 1.2 server uses its certificate's curve and requires it in `supported_groups`) / ✅ |
+  | Plain, `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ✅ / ✅ | ⏭ the stateless server validates the cookie on the first fragment, and a first ClientHello with a hybrid share (1216 to 1665 bytes) does not fit in one datagram (the `hrr` case carries it in CH2) / ✅ | ⏭ the 1.2 engines have no hybrid |
   | Resumption (PSK + DHE); 0-RTT accepted | ✅ / ✅ | ⏭ purecrypto's DTLS engines have no resumption | ⏭ |
   | Resumption, PSK-only (`psk_ke`) | ✅ / ✅ (`-K`) | — | — |
   | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`-s`) | — | — |
   | 0-RTT rejected across a HelloRetryRequest | ⏭ the wolfSSL server deprotects the 0-RTT records it must skip under the early keys it derived, then refuses the plaintext second ClientHello / ⏭ the example client shares the resumed session's group, so no HRR can be forced | — | — |
-  | HelloRetryRequest to `x25519`, `P-256`, `P-384`, `X25519MLKEM768` | ✅ / ✅ | ✅ / ✅ (the hybrid arrives in a fragmented CH2 with the cookie first) | — (no HRR in 1.2) |
+  | HelloRetryRequest to every group (`x25519`, `P-256`, `P-384`, `P-521`, the three hybrids) | ✅ / ✅ | ✅ / ✅ (a hybrid arrives in a fragmented CH2 with the cookie first) | — (no HRR in 1.2) |
   | mTLS, client certificate of every kind | ✅ / ✅ | ⏭ purecrypto's DTLS servers do not verify client certificates | ⏭ |
   | KeyUpdate from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ | — |
   | KeyUpdate from the peer, purecrypto replies | ✅ / ✅ | ✅ / ✅ (the example client's `-I` writes a message it never reads back, and `wolfSSL_shutdown` sends no close_notify while that echo is pending, so the peer's close_notify is not demanded in that one case) | — |
@@ -665,6 +666,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | Stateless reset (§10.3; server restarted with the same reset key) | ✅ | ✅ | — |
   | ECN validation (§13.4; both sides report the path capable) | ✅ (Linux) | ✅ (Linux) | — |
   | X25519MLKEM768 key exchange | ✅ | ✅ | ✅ |
+  | `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` (RFC 10024), `P-521`: pinned on both sides (`-groups` / quic-go `-curves`), the 1665-byte shares in two Initials each way | ✅ | ✅ | ✅ |
+  | HelloRetryRequest over QUIC: the purecrypto server pinned to a group the client only advertised (each of the three above; OpenSSL: `SecP384r1MLKEM1024`) | — | ✅ (`hrr=yes`) | ✅ |
 
   Two engine bugs that loopback had hidden fell to this matrix on its first
   run, both in the server: a PATH_CHALLENGE arriving from an address the

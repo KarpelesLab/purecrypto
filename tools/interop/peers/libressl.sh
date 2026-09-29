@@ -62,7 +62,6 @@ lssl_group() {
         p384) echo P-384 ;;
         p521) echo P-521 ;;
         x25519mlkem768) echo X25519MLKEM768 ;;
-        secp256r1mlkem768) echo SecP256r1MLKEM768 ;;
     esac
 }
 lssl_suite() {
@@ -90,6 +89,7 @@ lssl_group_re() {
         x25519) echo "^Server Temp Key: ECDH, X25519, 253 bits" ;;
         p256) echo "^Server Temp Key: ECDH, P-256, 256 bits" ;;
         p384) echo "^Server Temp Key: ECDH, P-384, 384 bits" ;;
+        p521) echo "^Server Temp Key: ECDH, P-521, 521 bits" ;;
         *) echo "" ;;
     esac
 }
@@ -101,6 +101,7 @@ hrr_client_groups() {
         x25519) echo "P-256:P-384:X25519" ;;
         p256) echo "X25519:P-384:P-256" ;;
         p384) echo "X25519:P-256:P-384" ;;
+        p521) echo "X25519:P-256:P-521" ;;
         x25519mlkem768) echo "X25519:P-256:X25519MLKEM768" ;;
     esac
 }
@@ -109,6 +110,8 @@ cmd_supports() {
     case $CASE_GROUP in
         x25519mlkem768)
             version_ge "$VERSION" 4.3 || skip "LibreSSL $VERSION has no X25519MLKEM768 (4.3+)" ;;
+        secp256r1mlkem768|secp384r1mlkem1024)
+            skip "LibreSSL $VERSION has no NIST-curve ML-KEM hybrids (X25519MLKEM768 only)" ;;
     esac
     case $CASE_CERT in
         ed25519) skip "LibreSSL has no Ed25519 in TLS (its apps cannot load the key; signature_algorithms omit ed25519)" ;;

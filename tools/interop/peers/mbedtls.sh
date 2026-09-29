@@ -83,7 +83,7 @@ other_group() {
 
 cmd_supports() {
     case $CASE_GROUP in
-        x25519mlkem768|secp256r1mlkem768) skip "Mbed TLS has no ML-KEM hybrids" ;;
+        x25519mlkem768|secp256r1mlkem768|secp384r1mlkem1024) skip "Mbed TLS has no ML-KEM hybrids" ;;
     esac
     case $CASE_CERT in
         ed25519) skip "Mbed TLS has no EdDSA" ;;

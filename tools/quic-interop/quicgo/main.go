@@ -77,6 +77,35 @@ func curveName(id tls.CurveID) string {
 	return id.String()
 }
 
+// parseCurves turns a comma-separated list of TLS group names (as
+// crypto/tls prints them) into CurvePreferences; "" keeps Go's default.
+// Note that crypto/tls ignores the order of the list and applies its own
+// (post-quantum groups first, then the client's shares), so a list of one
+// is how a group is pinned.
+func parseCurves(s string) []tls.CurveID {
+	if s == "" {
+		return nil
+	}
+	names := map[string]tls.CurveID{
+		"X25519":             tls.X25519,
+		"P-256":              tls.CurveP256,
+		"P-384":              tls.CurveP384,
+		"P-521":              tls.CurveP521,
+		"X25519MLKEM768":     tls.X25519MLKEM768,
+		"SecP256r1MLKEM768":  tls.SecP256r1MLKEM768,
+		"SecP384r1MLKEM1024": tls.SecP384r1MLKEM1024,
+	}
+	var out []tls.CurveID
+	for _, n := range strings.Split(s, ",") {
+		id, ok := names[strings.TrimSpace(n)]
+		if !ok {
+			log.Fatalf("unknown TLS group %q", n)
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
 func sha(b []byte) string {
 	s := sha256.Sum256(b)
 	return hex.EncodeToString(s[:])
@@ -187,6 +216,7 @@ func runServer(args []string) {
 	resetKey := fs.String("reset-key", "", "32-byte hex stateless-reset key (defaults to random)")
 	deadline := fs.Duration("timeout", 60*time.Second, "exit after this long regardless")
 	loss := fs.Int("loss", 0, "drop one in N datagrams in each direction (0 = none)")
+	curves := fs.String("curves", "", "TLS groups to accept, comma-separated (default: Go's)")
 	fs.Parse(args)
 
 	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
@@ -194,9 +224,10 @@ func runServer(args []string) {
 		log.Fatalf("cannot load identity: %v", err)
 	}
 	tlsConf := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{*alpn},
-		MinVersion:   tls.VersionTLS13,
+		Certificates:     []tls.Certificate{cert},
+		NextProtos:       []string{*alpn},
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: parseCurves(*curves),
 	}
 	conf := &quic.Config{
 		MaxIdleTimeout:  *idle,
@@ -379,6 +410,7 @@ func runClient(args []string) {
 	versions := fs.String("versions", "", "QUIC versions to offer, in order (v1,v2)")
 	deadline := fs.Duration("timeout", 30*time.Second, "give up after this long")
 	loss := fs.Int("loss", 0, "drop one in N datagrams in each direction (0 = none)")
+	curves := fs.String("curves", "", "TLS groups to offer, comma-separated (default: Go's)")
 	fs.Parse(args)
 	if *addr == "" {
 		log.Fatal("-addr is required")
@@ -411,6 +443,7 @@ func runClient(args []string) {
 		NextProtos:         []string{*alpn},
 		MinVersion:         tls.VersionTLS13,
 		ClientSessionCache: tls.NewLRUClientSessionCache(8),
+		CurvePreferences:   parseCurves(*curves),
 	}
 	conf := &quic.Config{
 		MaxIdleTimeout:  *idle,

@@ -65,7 +65,7 @@ cmd_supports() {
         mldsa65) skip "SChannel has no ML-DSA" ;;
     esac
     case $CASE_GROUP in
-        x25519mlkem768) skip "SChannel offers no ML-KEM hybrid group" ;;
+        x25519mlkem768|secp256r1mlkem768|secp384r1mlkem1024) skip "SChannel offers no ML-KEM hybrid group" ;;
     esac
     # The client offers every suite the system policy enables, in the
     # system's order, and the purecrypto server takes its own first
@@ -166,6 +166,7 @@ ss_kex_bits() {
         x25519) echo 255 ;;
         p256) echo 256 ;;
         p384) echo 384 ;;
+        p521) echo 521 ;;
     esac
 }
 ss_suite() {

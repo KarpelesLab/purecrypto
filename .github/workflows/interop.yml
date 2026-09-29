@@ -257,6 +257,7 @@ jobs:
             if ($p.PSObject.Properties.Name -contains 'EccCurves') {
               $curves = @($p.EccCurves)
               if ($curves -notcontains 'curve25519') { $curves += 'curve25519' }
+              if ($curves -notcontains 'NistP521') { $curves += 'NistP521' }
               Set-ItemProperty $pol -Name EccCurves -Value ([string[]]$curves) -Type MultiString
             }
             if ($p.PSObject.Properties.Name -contains 'Functions') {

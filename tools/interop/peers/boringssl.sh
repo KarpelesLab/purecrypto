@@ -28,7 +28,6 @@ bssl_group() {
         p384) echo P-384 ;;
         p521) echo P-521 ;;
         x25519mlkem768) echo X25519MLKEM768 ;;
-        secp256r1mlkem768) echo SecP256r1MLKEM768 ;;
     esac
 }
 bssl_suite() {
@@ -48,6 +47,11 @@ other_group() {
 cmd_supports() {
     case $CASE_CERT in
         mldsa65) skip "BoringSSL has no ML-DSA certificates" ;;
+    esac
+    # BoringSSL's TLS groups are P-256/384/521, X25519, X25519MLKEM768 and
+    # a standalone MLKEM1024 (`kNamedGroups` in ssl/ssl_key_share.cc).
+    case $CASE_GROUP in
+        secp256r1mlkem768|secp384r1mlkem1024) skip "BoringSSL has no NIST-curve ML-KEM hybrids" ;;
     esac
     # The client offers every TLS 1.3 suite and the purecrypto server takes
     # its first, so only that one can be pinned from the peer's side.

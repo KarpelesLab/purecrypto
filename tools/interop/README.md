@@ -32,7 +32,7 @@ A case is a set of `key=value` words:
 | `proto` | `tls13`, `tls12` (the TLS 1.2 fallback case), `dtls13`, `dtls12` (see [DTLS](#dtls)) |
 | `role`  | `peer-server` (purecrypto is the client), `peer-client` (purecrypto is the server) |
 | `cert`  | `rsa2048`, `p256`, `p384`, `ed25519`, `mldsa65`, `large` (a > 16 KiB chain) |
-| `group` | `x25519`, `p256`, `p384`, `p521`, `x25519mlkem768`, `secp256r1mlkem768` |
+| `group` | `x25519`, `p256`, `p384`, `p521`, `x25519mlkem768`, `secp256r1mlkem768`, `secp384r1mlkem1024` |
 | `suite` | `aes128gcm`, `aes256gcm`, `chacha20` |
 | `feat`  | see below |
 
@@ -82,10 +82,9 @@ the DTLS matrix, over loopback UDP, driving `s_client -dtls1_3` /
 negotiated-parameter report is checked, plus `HelloRetryRequest: yes` for
 the `hrr` cases (a DTLS 1.3 handshake goes through one anyway, for the
 server's stateless cookie exchange, so the line is not refuted elsewhere).
-Per DTLS version: the `cert × group × suite` product for `plain` (`p521`
-and `secp256r1mlkem768` are left out, and the DTLS 1.2 suite is the
-`ECDHE-{ECDSA,RSA}-…` one for the certificate — pinned by the peer, since
-`-ciphersuites` takes TLS 1.3 names), then:
+Per DTLS version: the `cert × group × suite` product for `plain` (the
+DTLS 1.2 suite is the `ECDHE-{ECDSA,RSA}-…` one for the certificate —
+pinned by the peer, since `-ciphersuites` takes TLS 1.3 names), then:
 
 | `feat` | what is exercised |
 |---|---|

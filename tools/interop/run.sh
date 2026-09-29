@@ -99,7 +99,7 @@ log() { printf '%s\n' "$*" >&2; }
 # ---------------------------------------------------------------- matrix
 
 CERTS="rsa2048 p256 p384 ed25519 mldsa65"
-GROUPS_ALL="x25519 p256 p384 p521 x25519mlkem768 secp256r1mlkem768"
+GROUPS_ALL="x25519 p256 p384 p521 x25519mlkem768 secp256r1mlkem768 secp384r1mlkem1024"
 SUITES="aes128gcm aes256gcm chacha20"
 # Features beyond the plain handshake, run with cert=p256 group=x25519
 # suite=aes128gcm unless the feature says otherwise.
@@ -121,7 +121,7 @@ FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp rpk
 # side receives under the CID it named — purecrypto under PC_CID, the peer
 # under PEER_CID, which the adapter configures its tool with — and both
 # report the pair).
-DTLS_GROUPS="x25519 p256 p384 x25519mlkem768"
+DTLS_GROUPS="x25519 p256 p384 p521 x25519mlkem768 secp256r1mlkem768 secp384r1mlkem1024"
 # The connection IDs of the `cid` cases (hex; every byte >= 0x10 so a tool
 # that prints them without zero padding still prints these digits).
 export PC_CID=a1b2c3d4
@@ -157,7 +157,7 @@ matrix() {
                 hrr)
                     # The peer pins each group; the purecrypto side shares
                     # a different one first, so the pin costs a round trip.
-                    for group in x25519 p256 p384 x25519mlkem768; do
+                    for group in $GROUPS_ALL; do
                         echo "proto=tls13 role=$role cert=p256 group=$group suite=aes128gcm feat=hrr"
                     done ;;
                 large-chain)
@@ -354,7 +354,10 @@ pc_group() {
         x25519) echo x25519 ;;
         p256) echo secp256r1 ;;
         p384) echo secp384r1 ;;
+        p521) echo secp521r1 ;;
         x25519mlkem768) echo X25519MLKEM768 ;;
+        secp256r1mlkem768) echo SecP256r1MLKEM768 ;;
+        secp384r1mlkem1024) echo SecP384r1MLKEM1024 ;;
         *) echo "" ;;
     esac
 }
@@ -413,7 +416,8 @@ pc_supports() {
                 keyupdate|keyupdate-peer) skip "DTLS 1.2 has no KeyUpdate" ;;
             esac
             case $CASE_GROUP in
-                x25519mlkem768) skip "purecrypto's DTLS 1.2 engines have no ML-KEM hybrid" ;;
+                x25519mlkem768|secp256r1mlkem768|secp384r1mlkem1024)
+                    skip "purecrypto's DTLS 1.2 engines have no ML-KEM hybrid" ;;
             esac
             case $CASE_CERT in
                 ed25519|mldsa65) skip "purecrypto's (D)TLS 1.2 engines sign with RSA or ECDSA only" ;;

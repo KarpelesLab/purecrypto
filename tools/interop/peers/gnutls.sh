@@ -53,6 +53,7 @@ gt_group() {
         p521) echo GROUP-SECP521R1 ;;
         x25519mlkem768) echo GROUP-X25519-MLKEM768 ;;
         secp256r1mlkem768) echo GROUP-SECP256R1-MLKEM768 ;;
+        secp384r1mlkem1024) echo GROUP-SECP384R1-MLKEM1024 ;;
     esac
 }
 gt_group_desc() {
@@ -63,6 +64,7 @@ gt_group_desc() {
         p521) echo "ECDHE-SECP521R1" ;;
         x25519mlkem768) echo "HYBRID-X25519-MLKEM768" ;;
         secp256r1mlkem768) echo "HYBRID-SECP256R1-MLKEM768" ;;
+        secp384r1mlkem1024) echo "HYBRID-SECP384R1-MLKEM1024" ;;
     esac
 }
 gt_curve() {
@@ -99,6 +101,7 @@ cmd_supports() {
     case $CASE_GROUP in
         x25519mlkem768) has_algo "GROUP-X25519-MLKEM768" || skip "GnuTLS $VERSION build has no ML-KEM hybrids (3.8.10+ with leancrypto)" ;;
         secp256r1mlkem768) has_algo "GROUP-SECP256R1-MLKEM768" || skip "GnuTLS $VERSION build has no ML-KEM hybrids (3.8.10+ with leancrypto)" ;;
+        secp384r1mlkem1024) has_algo "GROUP-SECP384R1-MLKEM1024" || skip "GnuTLS $VERSION build has no ML-KEM hybrids (3.8.10+ with leancrypto)" ;;
     esac
     case $CASE_CERT in
         mldsa65) has_algo "ML-DSA-65" || skip "GnuTLS $VERSION build has no ML-DSA (3.8.10+ with leancrypto)" ;;
@@ -124,7 +127,12 @@ cmd_supports() {
         # the key share goes with the first group: no HelloRetryRequest to
         # the hybrid can be forced from its client.
         hrr) [ "$CASE_ROLE" = peer-server ] || [ "$CASE_GROUP" != x25519mlkem768 ] ||
-            skip "gnutls-cli always lists and shares X25519MLKEM768 first; no HRR possible" ;;
+            skip "gnutls-cli always lists and shares X25519MLKEM768 first; no HRR possible"
+            case $CASE_GROUP in
+                secp256r1mlkem768|secp384r1mlkem1024)
+                    [ "$CASE_ROLE" = peer-server ] ||
+                        skip "gnutls-cli lists and shares the ML-KEM hybrids first; no HRR possible" ;;
+            esac ;;
     esac
     return 0
 }

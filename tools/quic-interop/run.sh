@@ -784,6 +784,61 @@ case_go_go_to_pc_mlkem() {
     expect "$d/client.err" "curve=X25519MLKEM768"
 }
 
+# The RFC 10024 NIST-curve hybrids and P-521 (Go 1.26 crypto/tls has all
+# three; P-521 is not in its default list, and neither hybrid is in
+# purecrypto's default *shares*), pinned on both sides: the purecrypto
+# side offers the one group (`-groups`), the quic-go side accepts / offers
+# it alone (`-curves`). Both report the group — under their own names:
+# GROUP is Go's `-curves` spelling, GO_NAME what its `CurveID.String()`
+# prints, PC_NAME the IANA name the purecrypto side uses. The
+# SecP384r1MLKEM1024 shares are 1665 bytes each way, so a ClientHello or
+# ServerHello with one spans two Initial datagrams in either direction; the
+# purecrypto server pinned to a share-less group answers a default client
+# with a HelloRetryRequest, so the third case of each trio takes that
+# round trip.
+group_case_pc_to_go() {
+    local d=$1 group=$2 go_name=$3 pc_name=$4
+    start_go_server "$d" -curves "$group"
+    pc_client "$d" "$WORK/small.txt" -groups "$pc_name"
+    stop_server
+    rc_is 0
+    echoed "$d" "$WORK/small.txt" "$SMALL_SHA"
+    expect "$d/server.err" "curve=$go_name"
+    expect "$d/client.err" "group=$pc_name hrr=no"
+}
+group_case_go_to_pc() {
+    local d=$1 group=$2 go_name=$3 pc_name=$4
+    start_pc_server "$d" -groups "$pc_name"
+    go_client "$d" "$WORK/small.txt" -curves "$group"
+    stop_server
+    rc_is 0
+    echoed "$d" "$WORK/small.txt" "$SMALL_SHA"
+    expect "$d/client.err" "curve=$go_name"
+    expect "$d/server.err" "group=$pc_name hrr=no"
+}
+# A default quic-go client (every group offered, shares for Go's default
+# ones) against a purecrypto server pinned to the group: the server asks
+# for it with a HelloRetryRequest, which quic-go answers.
+group_case_go_hrr_to_pc() {
+    local d=$1 group=$2 go_name=$3 pc_name=$4
+    start_pc_server "$d" -groups "$pc_name"
+    go_client "$d" "$WORK/small.txt"
+    stop_server
+    rc_is 0
+    echoed "$d" "$WORK/small.txt" "$SMALL_SHA"
+    expect "$d/client.err" "curve=$go_name"
+    expect "$d/server.err" "group=$pc_name hrr=yes"
+}
+case_go_pc_to_go_p521() { group_case_pc_to_go "$1" P-521 CurveP521 secp521r1; }
+case_go_go_to_pc_p521() { group_case_go_to_pc "$1" P-521 CurveP521 secp521r1; }
+case_go_go_hrr_to_pc_p521() { group_case_go_hrr_to_pc "$1" P-521 CurveP521 secp521r1; }
+case_go_pc_to_go_secp256r1mlkem768() { group_case_pc_to_go "$1" SecP256r1MLKEM768 SecP256r1MLKEM768 SecP256r1MLKEM768; }
+case_go_go_to_pc_secp256r1mlkem768() { group_case_go_to_pc "$1" SecP256r1MLKEM768 SecP256r1MLKEM768 SecP256r1MLKEM768; }
+case_go_go_hrr_to_pc_secp256r1mlkem768() { group_case_go_hrr_to_pc "$1" SecP256r1MLKEM768 SecP256r1MLKEM768 SecP256r1MLKEM768; }
+case_go_pc_to_go_secp384r1mlkem1024() { group_case_pc_to_go "$1" SecP384r1MLKEM1024 SecP384r1MLKEM1024 SecP384r1MLKEM1024; }
+case_go_go_to_pc_secp384r1mlkem1024() { group_case_go_to_pc "$1" SecP384r1MLKEM1024 SecP384r1MLKEM1024 SecP384r1MLKEM1024; }
+case_go_go_hrr_to_pc_secp384r1mlkem1024() { group_case_go_hrr_to_pc "$1" SecP384r1MLKEM1024 SecP384r1MLKEM1024 SecP384r1MLKEM1024; }
+
 # Background clients for the stateless-reset cases: the server has to be
 # restarted while the client waits between its exchanges.
 CLIENT_PID=""
@@ -899,6 +954,35 @@ case_ossl_to_pc_mlkem() {
     expect "$d/client.out" "NamedGroup: X25519MLKEM768"
 }
 
+# The other groups, as the X25519MLKEM768 case: OpenSSL pins the group and
+# its trace shows the ServerHello's key_share; the purecrypto server
+# reports it too.
+group_case_ossl_to_pc() {
+    local d=$1 group=$2
+    start_pc_server "$d"
+    ossl_client "$d" "$WORK/small.txt" -groups "$group" -trace
+    stop_server
+    rc_is 0
+    expect "$d/client.out" "ping from the QUIC interop matrix"
+    expect "$d/client.out" "NamedGroup: $group"
+    expect "$d/server.err" "group=$group hrr=no"
+}
+case_ossl_to_pc_p521() { group_case_ossl_to_pc "$1" secp521r1; }
+case_ossl_to_pc_secp256r1mlkem768() { group_case_ossl_to_pc "$1" SecP256r1MLKEM768; }
+case_ossl_to_pc_secp384r1mlkem1024() { group_case_ossl_to_pc "$1" SecP384r1MLKEM1024; }
+# The purecrypto server pinned to a group OpenSSL offers without a share
+# (s_client shares its first group only): a HelloRetryRequest over QUIC.
+case_ossl_to_pc_hrr_secp384r1mlkem1024() {
+    local d=$1
+    start_pc_server "$d" -groups SecP384r1MLKEM1024
+    ossl_client "$d" "$WORK/small.txt" -groups X25519:SecP384r1MLKEM1024 -trace
+    stop_server
+    rc_is 0
+    expect "$d/client.out" "ping from the QUIC interop matrix"
+    expect "$d/client.out" "NamedGroup: SecP384r1MLKEM1024"
+    expect "$d/server.err" "retry=no group=SecP384r1MLKEM1024 hrr=yes"
+}
+
 case_ossl_to_pc_aes256() {
     local d=$1
     start_pc_server "$d"
@@ -936,14 +1020,19 @@ go_pc_to_go_bidi go_pc_to_go_uni go_pc_to_go_large go_pc_to_go_loss go_pc_to_go_
 go_pc_to_go_resume go_pc_to_go_0rtt go_pc_to_go_keyupdate go_pc_to_go_chacha20 go_pc_to_go_aes256
 go_pc_to_go_close go_pc_to_go_idle go_pc_to_go_datagram go_pc_to_go_migrate go_pc_to_go_switchcid
 go_pc_to_go_reset go_pc_to_go_ecn go_pc_to_go_mlkem
+go_pc_to_go_p521 go_pc_to_go_secp256r1mlkem768 go_pc_to_go_secp384r1mlkem1024
 go_go_to_pc_bidi go_go_to_pc_uni go_go_to_pc_large go_go_to_pc_loss go_go_to_pc_retry
 go_go_to_pc_resume go_go_to_pc_0rtt go_go_to_pc_keyupdate go_go_to_pc_chacha20 go_go_to_pc_aes256
 go_go_to_pc_close go_go_to_pc_idle go_go_to_pc_datagram go_go_to_pc_migrate go_go_to_pc_switchcid
 go_go_to_pc_vn go_go_to_pc_reset go_go_to_pc_ecn go_go_to_pc_mlkem
+go_go_to_pc_p521 go_go_to_pc_secp256r1mlkem768 go_go_to_pc_secp384r1mlkem1024
+go_go_hrr_to_pc_p521 go_go_hrr_to_pc_secp256r1mlkem768 go_go_hrr_to_pc_secp384r1mlkem1024
 "
 if [ -n "$OPENSSL" ]; then
     CASES="$CASES ossl_to_pc_bidi ossl_to_pc_chacha20 ossl_to_pc_aes256 ossl_to_pc_retry
-           ossl_to_pc_large ossl_to_pc_resume ossl_to_pc_mlkem ossl_to_pc_keyupdate"
+           ossl_to_pc_large ossl_to_pc_resume ossl_to_pc_mlkem ossl_to_pc_keyupdate
+           ossl_to_pc_p521 ossl_to_pc_secp256r1mlkem768 ossl_to_pc_secp384r1mlkem1024
+           ossl_to_pc_hrr_secp384r1mlkem1024"
 fi
 for c in $CASES; do
     if [ -n "$ONLY" ] && [ "$c" != "$ONLY" ]; then continue; fi

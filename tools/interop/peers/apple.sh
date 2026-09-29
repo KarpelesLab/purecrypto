@@ -76,6 +76,7 @@ apple_group() {
         x25519) echo X25519 ;;
         p256) echo P-256 ;;
         p384) echo P-384 ;;
+        p521) echo P-521 ;;
         x25519mlkem768) echo X25519MLKEM768 ;;
     esac
 }
@@ -106,6 +107,8 @@ cmd_supports() {
     esac
     case $CASE_GROUP in
         x25519mlkem768) spi_or_skip sec_protocol_options_append_tls_key_exchange_group ;;
+        # boringssl-shaped: no NIST-curve ML-KEM hybrids in the stack.
+        secp256r1mlkem768|secp384r1mlkem1024) skip "Apple's TLS stack has no NIST-curve ML-KEM hybrids" ;;
     esac
     # Pinning a group on the Apple side (so no HelloRetryRequest happens in
     # a plain case, or exactly one does in an HRR case) is SPI.

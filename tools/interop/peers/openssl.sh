@@ -25,6 +25,7 @@ ossl_group() {
         p521) echo P-521 ;;
         x25519mlkem768) echo X25519MLKEM768 ;;
         secp256r1mlkem768) echo SecP256r1MLKEM768 ;;
+        secp384r1mlkem1024) echo SecP384r1MLKEM1024 ;;
     esac
 }
 # A regex for the group as the connection summaries spell it: a classical
@@ -36,7 +37,10 @@ ossl_group_re() {
         x25519) echo "^(Peer|Server) Temp Key: X25519, 253 bits" ;;
         p256) echo "^(Peer|Server) Temp Key: ECDH, (prime256v1|secp256r1|P-256), 256 bits" ;;
         p384) echo "^(Peer|Server) Temp Key: ECDH, (secp384r1|P-384), 384 bits" ;;
+        p521) echo "^(Peer|Server) Temp Key: ECDH, (secp521r1|P-521), 521 bits" ;;
         x25519mlkem768) echo "^(Negotiated TLS1.3 group|Peer Temp Key): X25519MLKEM768" ;;
+        secp256r1mlkem768) echo "^(Negotiated TLS1.3 group|Peer Temp Key): SecP256r1MLKEM768" ;;
+        secp384r1mlkem1024) echo "^(Negotiated TLS1.3 group|Peer Temp Key): SecP384r1MLKEM1024" ;;
     esac
 }
 # The group as `Supported groups:` lists it.
@@ -45,7 +49,10 @@ ossl_group_offer_name() {
         x25519) echo x25519 ;;
         p256) echo secp256r1 ;;
         p384) echo secp384r1 ;;
+        p521) echo secp521r1 ;;
         x25519mlkem768) echo X25519MLKEM768 ;;
+        secp256r1mlkem768) echo SecP256r1MLKEM768 ;;
+        secp384r1mlkem1024) echo SecP384r1MLKEM1024 ;;
     esac
 }
 ossl_suite() {
@@ -70,7 +77,7 @@ has_zlib() {
 
 cmd_supports() {
     case $CASE_GROUP in
-        x25519mlkem768|secp256r1mlkem768)
+        x25519mlkem768|secp256r1mlkem768|secp384r1mlkem1024)
             version_ge "$VERSION" 3.5 || skip "OpenSSL $VERSION has no ML-KEM hybrids (3.5+)" ;;
     esac
     case $CASE_CERT in
