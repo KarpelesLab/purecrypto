@@ -73,7 +73,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
 | `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8, Apple's Network.framework and wolfSSL 5.9, both roles** (CI: certs × groups × suites, resumption (incl. PSK-only), external PSK, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, RSA / ECDSA / Ed25519 certificates** (CI); TLS 1.2 with Ed25519 identities (server and client) vs OpenSSL, BoringSSL, GnuTLS and wolfSSL (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
-| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3), RFC 9146 (connection IDs) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello, client certificates** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, mTLS, fragmentation at two MTUs, a lossy path, connection IDs); **DTLS 1.2 vs Mbed TLS 4.2, both roles** (CI: certs × groups × suites, ALPN, a lossy path, connection IDs) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
+| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3), RFC 9146 (connection IDs) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello, client certificates, RFC 5077 resumption** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, mTLS, fragmentation at two MTUs, a lossy path, connection IDs, resumption — RFC 5077 tickets on 1.2, PSK and 0-RTT on 1.3 — including through a lossy path, and 1.3 0-RTT towards a wolfSSL server through a small libwolfssl driver); **DTLS 1.2 vs Mbed TLS 4.2, both roles** (CI: certs × groups × suites, ALPN, a lossy path, connection IDs, RFC 5077 resumption) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221/9368/9369 | loopback | loopback; **QUIC v1 + v2 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
 | `signature_registry` | — (X.509/TLS dispatch) | via primitives | via X.509/TLS | — | delegates |
@@ -176,6 +176,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | `ECDHE-{ECDSA,RSA}-AES256-GCM-SHA384` | ✅ / ✅ | ✅ / ✅ | ✅ | ✅ / ✅ (✅) |
   | `ECDHE-{ECDSA,RSA}-CHACHA20-POLY1305` (RFC 7905) | ✅ / ✅ | ✅ / ✅ | ✅ | ✅ / ✅ (✅) |
   | The three `ECDHE-ECDSA-*` suites with an Ed25519 certificate | ✅ / ✅ | ⏭ `openssl s_server -dtls1_2` admits an EdDSA certificate for `ECDHE-ECDSA` only when the version is exactly TLS 1.2 (`ssl_set_masks`): "no shared cipher", against its own client too / ✅ | ✅ | ⏭ as in the plain case / ✅ (✅) |
+  | DTLS 1.2 RFC 5077 resumption, every suite above | — | ✅ / ✅ | — | — |
 
   Every DTLS 1.2 case also runs with a client certificate: the server
   demands one (`openssl s_server -Verify 1` / `purecrypto s_server
@@ -185,6 +186,15 @@ update with the commands in `tools/wycheproof/README.md`.
   §7.4.8) — are verified by the other implementation; in the fragmented
   variant the OpenSSL client's 256-byte MTU splits its Certificate across
   datagrams too.
+
+
+  The resumption cases (`_resume`) run a first connection that collects a
+  session ticket and a second that resumes it through the abbreviated
+  handshake (RFC 6347 §4.2.4, figure 2), with the HelloVerifyRequest
+  cookie exchange still on: OpenSSL's side is `s_client -sess_out` then
+  `-sess_in` ("Reused, TLSv1.2") and `s_server -naccept 2` ("Reused
+  session-id"), purecrypto's `s_client -reconnect` and `s_server -naccept 2`
+  (`resumed: yes`).
 
   The OpenSSL → purecrypto DTLS 1.2 cases run twice: as OpenSSL sends by
   default, and with `s_client` at its minimum link MTU (256) and an ALPN
@@ -306,7 +316,7 @@ update with the commands in `tools/wycheproof/README.md`.
   external peer for purecrypto's DTLS 1.2 after OpenSSL and wolfSSL, and
   the second for RFC 9146 connection IDs (`dtls=1 force_version=dtls12`,
   `cid=1 cid_val=HEX` on both programs; the summary's `Peer CID (length N
-  Bytes): …` is the purecrypto side's CID). 44 of the 152 DTLS 1.2 cases
+  Bytes): …` is the purecrypto side's CID). 72 of the 248 DTLS 1.2 cases
   run:
 
   | Case | Mbed TLS 4.2.0, DTLS 1.2 (C / S) |
@@ -318,8 +328,10 @@ update with the commands in `tools/wycheproof/README.md`.
   | Handshake over a path dropping 20 % of datagrams; the last flight lost (`loss-final`) | ✅ / ✅ |
   | RFC 9146 connection IDs | ✅ / ✅ |
   | Chain > 16 KiB, at the default and at a 512-byte MTU | ⏭ the 16 KiB I/O buffer |
-  | HelloRetryRequest, KeyUpdate | — (none in DTLS 1.2) |
-  | Resumption, 0-RTT, mTLS | ⏭ purecrypto's DTLS engines |
+  | RFC 5077 session resumption (the client's `reconnect=1`; its debug log shows the abbreviated handshake) | ✅ / ✅ |
+  | Resumption with the resumed handshake's final flight lost once (`resume-loss`) | ✅ / ✅ |
+  | HelloRetryRequest, KeyUpdate, 0-RTT | — (none in DTLS 1.2) |
+  | mTLS | ⏭ purecrypto's DTLS servers do not verify client certificates |
 
   No purecrypto defect surfaced against Mbed TLS. One tool behaviour is
   worked around on the peer side: `ssl_server2` answers one request per
@@ -578,7 +590,8 @@ update with the commands in `tools/wycheproof/README.md`.
   ML-DSA-65 identity, several KiB across many records; on DTLS 1.2 the
   Certificate / CertificateVerify wrap the ClientKeyExchange), and a
   handshake through a relay dropping 20 % of the datagrams in each
-  direction (ACK-driven retransmission on 1.3, whole flights on 1.2). 772
+  direction (ACK-driven retransmission on 1.3, whole flights on 1.2), and
+  resumption (RFC 5077 tickets on 1.2; PSK and 0-RTT on 1.3). NNN
   cases; `C` / `S` as above, `⏭` a SKIP with the reason:
 
   | Case | TLS 1.3 (C / S) | DTLS 1.3 (C / S) | DTLS 1.2 (C / S) |
@@ -586,7 +599,9 @@ update with the commands in `tools/wycheproof/README.md`.
   | Plain: `{RSA-2048, P-256, P-384, Ed25519, ML-DSA-65}` × `{x25519, P-256}` × three suites | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (Ed25519 under the `ECDHE_ECDSA` suites, RFC 8422; ML-DSA-65 ⏭ not specified for TLS 1.2) |
   | Plain, `P-384` / `P-521` key exchange | ✅ / ⏭ the example client can share X25519, P-256 or a hybrid first, not P-384 or P-521 (the `hrr` case steers there) | ✅ / ⏭ same | ✅ (P-384 certificate; with another certificate ⏭ RFC 8422 §5.1.1: the wolfSSL 1.2 server uses its certificate's curve and requires it in `supported_groups`) / ✅ |
   | Plain, `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ✅ / ✅ | ⏭ the stateless server validates the cookie on the first fragment, and a first ClientHello with a hybrid share (1216 to 1665 bytes) does not fit in one datagram (the `hrr` case carries it in CH2) / ✅ | ⏭ the 1.2 engines have no hybrid |
-  | Resumption (PSK + DHE); 0-RTT accepted | ✅ / ✅ | ⏭ purecrypto's DTLS engines have no resumption | ⏭ |
+  | Resumption (TLS 1.3 / DTLS 1.3: PSK + DHE; DTLS 1.2: RFC 5077 ticket, abbreviated handshake) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | Resumption with the resumed handshake's final flight lost once (`resume-loss`) | — | ✅ / ✅ | ✅ / ✅ |
+  | 0-RTT accepted | ✅ / ✅ | ✅ / ⏭ the example server always answers a resumed ClientHello with its cookie HelloRetryRequest, which rejects early data; covered by the `wolfssl-driver` peer | — (no 0-RTT in 1.2) |
   | Resumption, PSK-only (`psk_ke`) | ✅ / ✅ (`-K`) | — | — |
   | External PSK (RFC 8446 §4.2.11) | ✅ / ✅ (`-s`) | — | — |
   | 0-RTT rejected across a HelloRetryRequest | ⏭ the wolfSSL server deprotects the 0-RTT records it must skip under the early keys it derived, then refuses the plaintext second ClientHello / ⏭ the example client shares the resumed session's group, so no HRR can be forced | — | — |
@@ -677,6 +692,38 @@ update with the commands in `tools/wycheproof/README.md`.
   reproduces it every time. That case now runs the client without `-w`:
   it still sends its close_notify, which `s_server` must report, and
   only the client's own check for ours is dropped.
+
+  Resumption brought three more, all in purecrypto: the DTLS 1.3 server
+  **echoed the client's `legacy_session_id`** in its ServerHello, which
+  RFC 9147 §5 forbids (DTLS 1.3 has no middlebox-compatibility mode) and
+  wolfSSL's client refuses (`-425`, found with a debug build of the
+  library: `args->sessIdSz != 0`); the DTLS 1.3 server skipped the cookie
+  exchange for a resumption only when the ticket's **full address** —
+  port included — matched, but RFC 9147 §5.1 speaks of the IP address, and
+  wolfSSL's client reconnects from a fresh port, so its 0-RTT was always
+  rejected; and the DTLS 1.2 server **refused tickets sent with an empty
+  session ID**, which RFC 5077 §3.4 allows (the client then recognises the
+  resumption by the messages that follow) and wolfSSL does.
+- **wolfSSL 5.9.4 through a libwolfssl driver, DTLS 1.2 and 1.3
+  resumption, both roles** (the `wolfssl-driver` job of `interop.yml`;
+  adapter `tools/interop/peers/wolfssl-driver.sh`, program
+  `tools/interop/peers/wolfssl-driver/driver.c`, built against the
+  library the `wolfssl` job installs, with
+  `-DWOLFSSL_DTLS13_NO_HRR_ON_RESUME`). The example server cannot accept
+  DTLS 1.3 0-RTT: it never calls `wolfSSL_dtls13_no_hrr_on_resume()`, so
+  every resumed ClientHello gets the cookie HelloRetryRequest that
+  rejects early data (RFC 8446 §4.2.10). The driver does, and serves
+  sequential connections on one socket the way the purecrypto client
+  reconnects; it also drives the other resumption cases as a second
+  libwolfssl client and server. Adding the define to the CI build changes
+  nothing else in the `wolfssl` matrix (it is a runtime opt-in).
+
+  | Case | DTLS 1.3 (C / S) | DTLS 1.2 (C / S) |
+  |---|---|---|
+  | Plain handshake | ✅ / ✅ | ✅ / ✅ |
+  | Resumption | ✅ / ✅ | ✅ / ✅ |
+  | Resumption, final flight lost once (`resume-loss`) | ✅ / ✅ | ✅ / ✅ |
+  | 0-RTT accepted (the server skips the cookie exchange for the ticket's address, RFC 9147 §5.1; early data at epoch 1, §6.1) | ✅ / ✅ | — (no 0-RTT in 1.2) |
 - **quic-go and OpenSSL, QUIC v1 + v2** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server
@@ -1091,8 +1138,9 @@ code site:
   signature; **reuse is catastrophic** and the caller must persist state after
   every `sign`.
 - **Phased interop**: TLS 1.2 and DTLS 1.2 are validated against OpenSSL,
-  wolfSSL and Mbed TLS in both roles, DTLS 1.3 against wolfSSL in both
-  roles (one peer so far — OpenSSL exposes no `-dtls1_3` client), RFC 9146
+  wolfSSL and Mbed TLS in both roles (DTLS 1.2 resumption included), DTLS
+  1.3 against wolfSSL in both roles (one peer so far — OpenSSL exposes no
+  `-dtls1_3` client; resumption and 0-RTT included), RFC 9146
   connection IDs against wolfSSL (DTLS 1.2 and 1.3) and Mbed TLS (DTLS
   1.2), and QUIC v1 + v2 (RFC 9369) with RFC 9368 version negotiation
   against quic-go in both roles, plus QUIC v1 against OpenSSL's (v1-only)
@@ -1102,8 +1150,7 @@ code site:
 - **Scope**: the crate is primitives + TLS/PKI plumbing (OpenSSL-like). Threshold
   / multi-party / message-envelope layers are out of scope.
 - **Coverage gaps**: ML-KEM ACVP is a trimmed slice (not the full corpus);
-  DTLS 1.3 has a single external peer (wolfSSL), and its resumption and
-  0-RTT are not implemented at all; the
+  DTLS 1.3 has a single external peer (wolfSSL); the
   RFC 9146 §6 peer-address update is exercised end to end by the CLI's own
   client and server only (no peer tool moves its socket mid-connection),
   and the return-routability check of draft-ietf-tls-dtls-rrc is not
