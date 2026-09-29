@@ -165,7 +165,9 @@ client_args() {
         ARGS+=(force_version=tls13 "groups=$groups" "force_ciphersuite=$(mbed_suite "$CASE_SUITE")")
     fi
     case $CASE_FEAT in
-        resume) ARGS+=(reconnect=1) ;;
+        # (D)TLS 1.2: an RFC 5077 ticket; TLS 1.3: a PSK. `resume-loss` is
+        # the DTLS resumption through the lossy relay.
+        resume|resume-loss) ARGS+=(reconnect=1) ;;
         # PSK-only ticket resumption: reconnect with the saved session; the
         # client advertises both modes (default) and the purecrypto server
         # selects psk_ke.
@@ -313,6 +315,17 @@ verify_dtls() {
         cid) verify_cid "$f" || ok=1 ;;
         *) refute "$f" "Use of Connection ID has been negotiated" || ok=1 ;;
     esac
+    # RFC 5077 resumption: the client's second handshake is the abbreviated
+    # one (its debug log; the server logs at a level too low to say, and
+    # the purecrypto client reports it in that role).
+    if [ "$CASE_ROLE" = peer-client ]; then
+        case $CASE_FEAT in
+            resume|resume-loss)
+                expect "$f" "Reconnecting with saved session..." || ok=1
+                expect "$f" "a session has been resumed" || ok=1 ;;
+            *) refute "$f" "a session has been resumed" || ok=1 ;;
+        esac
+    fi
     return $ok
 }
 

@@ -845,10 +845,11 @@ final_flight_drops() {
 }
 
 # resume_flight_drops: what the relay drops in a `resume-loss` case — the
-# final flight of the SECOND (resumed) handshake, picked by size (a
-# Finished record is at least 60 bytes on the wire; an ACK, a close_notify
-# or the short application data of these cases is less), so #1 is the
-# full handshake's and #2 the resumed one's.
+# final flight of the SECOND (resumed) handshake, so #1 is the full
+# handshake's and #2 the resumed one's: on DTLS 1.2 the datagram carrying
+# an epoch-1 handshake record (the Finished; the record header names its
+# content type), on DTLS 1.3 an epoch-2 datagram of at least 60 bytes (the
+# Finished, not an ACK; the unified header hides the type).
 #
 #   DTLS 1.2 (RFC 5077 abbreviated handshake, RFC 6347 §4.2.4 figure 2),
 #     purecrypto client: its CCS + Finished, the final flight, is lost
@@ -864,8 +865,8 @@ final_flight_drops() {
 #     the client retransmits it on its timer until the server ACKs it.
 resume_flight_drops() {
     case $CASE_PROTO:$CASE_ROLE in
-        dtls12:peer-server) echo 'c->s@e1>=60#2' ;;
-        dtls12:peer-client) echo 's->c@e1>=60#2' ;;
+        dtls12:peer-server) echo 'c->s@e1:handshake#2' ;;
+        dtls12:peer-client) echo 's->c@e1:handshake#2' ;;
         dtls13:*) echo 'c->s@e2>=60#2' ;;
     esac
 }

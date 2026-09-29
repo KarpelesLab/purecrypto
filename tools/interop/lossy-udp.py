@@ -22,6 +22,10 @@ Two environment variables turn the relay into a debugging tool:
                epoch 2 (the DTLS 1.3 handshake epoch: an ACK or the
                client's final flight), `c->s@e2>=60#1` the 1st such
                datagram of at least 60 bytes (the Finished, not an ACK),
+               `s->c@e1:handshake#2` the server's 2nd datagram with a
+               handshake record in epoch 1 (a DTLS 1.2 Finished: its
+               record header names the content type, unlike the DTLS 1.3
+               unified header, whose records only match `:enc`),
                `s->c@e2~3000` every datagram of the server with a record
                in epoch 2 during the 3000 ms that follow the first one
                (a flight and its first retransmissions, however many
@@ -52,9 +56,10 @@ HANDSHAKE = {
 
 
 def records(data: bytes):
-    """The records of a datagram as (label, epoch, length); stops at the
-    first one it cannot walk (a unified header without a length field
-    takes the rest of the datagram)."""
+    """The records of a datagram as (label, epoch, length, type); stops at
+    the first one it cannot walk (a unified header without a length field
+    takes the rest of the datagram). `type` is the content type's name, or
+    `enc` for a DTLS 1.3 unified header."""
     out = []
     off = 0
     while off < len(data):
@@ -69,7 +74,7 @@ def records(data: bytes):
                 hdr += 2
             else:
                 length = len(data) - off - hdr
-            out.append(("enc", first & 0x03, length))
+            out.append(("enc", first & 0x03, length, "enc"))
             off += hdr + length
         elif first in TYPES and off + 13 <= len(data):
             epoch = int.from_bytes(data[off + 3:off + 5], "big")
@@ -85,7 +90,7 @@ def records(data: bytes):
                 frag_off = int.from_bytes(body[6:9], "big")
                 frag_len = int.from_bytes(body[9:12], "big")
                 label = f"{name}[seq {msg_seq}, {frag_off}+{frag_len}/{total}]"
-            out.append((label, epoch, length))
+            out.append((label, epoch, length, TYPES[first]))
             off += 13 + length
         else:
             break
@@ -93,18 +98,22 @@ def records(data: bytes):
 
 
 def parse_rules(spec: str):
-    """LOSSY_DROP as a list of (direction, epoch or None, min size, first,
-    last, window in seconds or None)."""
+    """LOSSY_DROP as a list of (direction, epoch or None, content type or
+    None, min size, first, last, window in seconds or None)."""
     rules = []
     for item in filter(None, (s.strip() for s in spec.split(","))):
         m = re.fullmatch(
-            r"(c->s|s->c)(?:@e(\d+))?(?:>=(\d+))?(?:#(\d+)(?:-(\d+))?|~(\d+))", item)
+            r"(c->s|s->c)(?:@e(\d+))?(?::([a-z]+))?(?:>=(\d+))?(?:#(\d+)(?:-(\d+))?|~(\d+))",
+            item)
         if not m:
             sys.exit(f"lossy-udp: bad LOSSY_DROP entry {item!r}")
-        direction, epoch, size, first, last, window = m.groups()
+        direction, epoch, ctype, size, first, last, window = m.groups()
+        if ctype is not None and ctype not in list(TYPES.values()) + ["enc"]:
+            sys.exit(f"lossy-udp: bad content type in LOSSY_DROP entry {item!r}")
         rules.append((
             direction,
             None if epoch is None else int(epoch),
+            ctype,
             int(size or 0),
             int(first or 0),
             int(last or first or 0),
@@ -130,10 +139,12 @@ def coin() -> bool:
 def targeted(direction: str, data: bytes, recs) -> bool:
     hit = False
     now = time.monotonic()
-    for i, (rdir, epoch, size, first, last, window) in enumerate(rules):
+    for i, (rdir, epoch, ctype, size, first, last, window) in enumerate(rules):
         if rdir != direction or len(data) < size:
             continue
-        if epoch is not None and all(rec[1] != epoch for rec in recs):
+        # The epoch and the content type must hold for the same record.
+        if not any((epoch is None or rec[1] == epoch) and (ctype is None or rec[3] == ctype)
+                   for rec in recs):
             continue
         rule_counts[i] += 1
         if rule_first[i] is None:
@@ -173,7 +184,7 @@ while True:
         drop = coin()
         drop = targeted(direction, data, recs) or drop
         if trace:
-            what = " ".join(f"{label}/e{epoch}/{length}" for label, epoch, length in recs)
+            what = " ".join(f"{label}/e{epoch}/{length}" for label, epoch, length, _ in recs)
             ms = int((time.monotonic() - start) * 1000)
             verb = "drop" if drop else "pass"
             print(f"{ms:6d} {verb} {direction} #{counts[direction]} ({len(data)} bytes) {what}",
