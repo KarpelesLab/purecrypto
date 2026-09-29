@@ -5378,7 +5378,7 @@ mod wolfssl_capture {
         let suite = lookup_suite(CipherSuite(0x1301)).unwrap();
         let body = &wire[5..];
         let mask_full = sn_mask_for(suite, epoch.sn_key.as_slice(), body).ok()?;
-        let (hdr, ct) = decode_record(wire, &mask_full[..2]).ok()?;
+        let (hdr, ct) = decode_record(wire, &mask_full[..2], 0).ok()?;
         let seq = reconstruct_seq(hdr.seq_low, hdr.seq_is_16bit, 0);
         let mut aad = wire[..hdr.header_len].to_vec();
         aad[1] ^= mask_full[0];

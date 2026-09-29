@@ -176,6 +176,39 @@ fn leaf_certifies(chain: &[Vec<u8>], key: &crate::x509::AnyPublicKey) -> Result<
     }
 }
 
+/// The DTLS connection ID (RFC 9146) an endpoint wants to receive, set
+/// with [`ConfigBuilder::connection_id`] / [`ConfigBuilder::connection_id_len`].
+///
+/// Each side of a DTLS connection names the CID it wants the *peer* to put
+/// in every protected record it sends (RFC 9146 §3), so that a server can
+/// route a datagram to its connection by
+/// [`dtls::peek_connection_id`](crate::dtls::peek_connection_id) when the
+/// 4-tuple changed (NAT rebinding, a mobile client), and an endpoint can
+/// follow the peer to a new address under the RFC 9146 §6 rules
+/// ([`Connection::datagram_allows_peer_address_update`](super::Connection::datagram_allows_peer_address_update)).
+/// CIDs are visible on the wire and link every record of a connection
+/// (RFC 9146 §8); on DTLS 1.3 fresh ones can be issued and switched to
+/// mid-session (RFC 9147 §9), on DTLS 1.2 the one negotiated lasts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectionId {
+    /// This exact CID (at most
+    /// [`dtls::MAX_LOCAL_CID_LEN`](crate::dtls::MAX_LOCAL_CID_LEN) bytes).
+    /// Empty means "send me no CID, I will still send yours": the peer's
+    /// records stay in the RFC 6347 / plain unified-header form. A server
+    /// that routes by CID gives every connection a distinct value of one
+    /// length; a fixed value is otherwise for tests and interop.
+    Fixed(Vec<u8>),
+    /// A CID of this many bytes (1 to
+    /// [`dtls::MAX_LOCAL_CID_LEN`](crate::dtls::MAX_LOCAL_CID_LEN)) drawn
+    /// from [`ConfigBuilder::rng`] when the connection is created — the
+    /// recommended form: unguessable by an off-path attacker, and one
+    /// length for every connection so a server can parse any datagram's
+    /// CID. The DTLS 1.3 engines draw spare CIDs of the same length for
+    /// `NewConnectionId` from the same source.
+    Random(usize),
+}
+
 /// Client-authentication policy for a server (mTLS).
 #[derive(Clone)]
 #[non_exhaustive]
@@ -490,6 +523,15 @@ pub struct Config {
     /// form: an attacker who can vary the spelling (`1.2.3.4:80` vs
     /// `001.002.003.004:80`) can mint distinct cookies for one address.
     pub peer_address: Vec<u8>,
+    /// DTLS: negotiate RFC 9146 connection IDs, receiving under this one.
+    /// `None` (the default) neither offers nor answers the `connection_id`
+    /// extension. A client offers it in the ClientHello; a server answers
+    /// a client that offered it (a client that did not gets none). Whether
+    /// CIDs were negotiated, and which, is read back from
+    /// [`Connection::local_connection_id`](super::Connection::local_connection_id)
+    /// / [`peer_connection_id`](super::Connection::peer_connection_id).
+    /// Inert on TLS and QUIC. See [`ConnectionId`].
+    pub connection_id: Option<ConnectionId>,
 
     // ---- Observability ----
     /// Optional sink receiving every traffic / master secret as it is
@@ -670,6 +712,7 @@ impl Default for Config {
             require_cookie: true,
             max_record_size: 1200,
             peer_address: Vec::new(),
+            connection_id: None,
             key_log: None,
             rng: None,
             signer: None,
@@ -775,6 +818,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `cert_compression_algorithms` | yes | inert | inert | inert | yes |
 /// | `cookie_secret`, `previous_cookie_secret`, `no_cookie`, `peer_address` | inert | inert | yes | yes | inert |
 /// | `max_record_size` | inert | inert | yes | inert (fixed 1100) | inert |
+/// | `connection_id` / `connection_id_len` | inert | inert | yes | yes | inert |
 ///
 /// Internally every engine builder consumes the same exhaustive split of
 /// `Config`, so a new option cannot be added without deciding, for each
@@ -1064,6 +1108,25 @@ impl ConfigBuilder {
     /// DTLS: target MTU for emitted records.
     pub fn max_record_size(mut self, n: usize) -> Self {
         self.inner.max_record_size = n;
+        self
+    }
+    /// DTLS: negotiate RFC 9146 connection IDs and receive under exactly
+    /// `cid` ([`ConnectionId::Fixed`]; see [`Config::connection_id`]).
+    /// Longer than [`dtls::MAX_LOCAL_CID_LEN`](crate::dtls::MAX_LOCAL_CID_LEN)
+    /// is refused when the connection is built
+    /// ([`Error::InappropriateState`](super::Error::InappropriateState)).
+    pub fn connection_id(mut self, cid: Vec<u8>) -> Self {
+        self.inner.connection_id = Some(ConnectionId::Fixed(cid));
+        self
+    }
+    /// DTLS: negotiate RFC 9146 connection IDs and receive under a random
+    /// `len`-byte one ([`ConnectionId::Random`]; see
+    /// [`Config::connection_id`]) drawn from [`Self::rng`] per connection.
+    /// `len` outside `1..=`[`dtls::MAX_LOCAL_CID_LEN`](crate::dtls::MAX_LOCAL_CID_LEN)
+    /// is refused when the connection is built
+    /// ([`Error::InappropriateState`](super::Error::InappropriateState)).
+    pub fn connection_id_len(mut self, len: usize) -> Self {
+        self.inner.connection_id = Some(ConnectionId::Random(len));
         self
     }
     /// TLS 1.3 server: DER bytes of a CRL to staple to the leaf cert.

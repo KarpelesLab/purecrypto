@@ -1708,6 +1708,125 @@ impl Connection {
         }
     }
 
+    /// DTLS: the RFC 9146 connection ID the peer puts in the records it
+    /// sends this endpoint — the one [`Config::connection_id`] asked for
+    /// (or the random one drawn from it). `Some(&[])` when CIDs were
+    /// negotiated but this side receives none, `None` when they were not
+    /// negotiated, before the ServerHello, and on TLS / QUIC. A server
+    /// keeps this to route datagrams with
+    /// [`dtls::peek_connection_id`](crate::dtls::peek_connection_id).
+    pub fn local_connection_id(&self) -> Option<&[u8]> {
+        match &self.inner {
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(c) => c.local_connection_id(),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.local_connection_id(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls12(c) => c.local_connection_id(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.local_connection_id(),
+            _ => None,
+        }
+    }
+
+    /// DTLS: the RFC 9146 connection ID this endpoint currently puts in
+    /// the records it sends — the one the peer asked for, or on DTLS 1.3
+    /// the one switched to since ([`use_spare_connection_id`](Self::use_spare_connection_id),
+    /// a peer `NewConnectionId(cid_immediate)`). `Some(&[])` when the
+    /// peer receives none, `None` when CIDs were not negotiated.
+    pub fn peer_connection_id(&self) -> Option<&[u8]> {
+        match &self.inner {
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(c) => c.peer_connection_id(),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.peer_connection_id(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls12(c) => c.peer_connection_id(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.peer_connection_id(),
+            _ => None,
+        }
+    }
+
+    /// DTLS: `true` when the datagram most recently [`feed`](Self::feed)
+    /// contained a record that carried a connection ID, authenticated, and
+    /// was newer (epoch, then sequence number) than every record received
+    /// before it — the record-layer conditions RFC 9146 §6 sets before the
+    /// peer's transport address may be moved to that datagram's source
+    /// (a reordered or replayed datagram must not move it). `false`
+    /// otherwise, and always on TLS / QUIC.
+    ///
+    /// The engine never sees addresses, so the caller compares the
+    /// datagram's source with the address it sends to and, when they
+    /// differ and this is `true`, decides. RFC 9146 §6 and RFC 9147 §9
+    /// make a third condition the application's: **do not send to the new
+    /// address before testing that it is reachable** (a ping-pong at the
+    /// application layer, or a DTLS return-routability check), unless
+    /// what would be sent is no larger than what was received — an
+    /// on-path attacker rewriting source addresses could otherwise turn
+    /// this endpoint into a reflector towards a victim (RFC 9146 §9).
+    pub fn datagram_allows_peer_address_update(&self) -> bool {
+        match &self.inner {
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(c) => c.datagram_allows_peer_address_update(),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.datagram_allows_peer_address_update(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls12(c) => c.datagram_allows_peer_address_update(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.datagram_allows_peer_address_update(),
+            _ => false,
+        }
+    }
+
+    /// DTLS 1.3: asks the peer for `num` fresh connection IDs to send
+    /// with (`RequestConnectionId`, RFC 9147 §9) — ahead of an expected
+    /// path change, so a new path can carry a CID an observer of the old
+    /// one has not seen. The peer answers with `NewConnectionId`; the
+    /// spares are then counted by [`spare_connection_ids`](Self::spare_connection_ids)
+    /// and taken up by [`use_spare_connection_id`](Self::use_spare_connection_id).
+    /// [`Error::InappropriateState`] before the handshake completes, on
+    /// DTLS 1.2 / TLS / QUIC, when CIDs were not negotiated or this side
+    /// sends without one, and while an earlier request is unanswered.
+    #[cfg_attr(not(feature = "dtls"), allow(unused_variables))]
+    pub fn request_connection_ids(&mut self, num: u8) -> Result<(), Error> {
+        match &mut self.inner {
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.request_connection_ids(num),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.request_connection_ids(num),
+            _ => Err(Error::InappropriateState),
+        }
+    }
+
+    /// DTLS 1.3: the spare connection IDs the peer issued
+    /// (`NewConnectionId(cid_spare)`, RFC 9147 §9) that this side has not
+    /// switched to yet. 0 on every other protocol.
+    pub fn spare_connection_ids(&self) -> usize {
+        match &self.inner {
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.spare_connection_ids(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.spare_connection_ids(),
+            _ => 0,
+        }
+    }
+
+    /// DTLS 1.3: switches the connection ID this side sends with to the
+    /// next spare the peer issued (RFC 9147 §9: "implementations SHOULD
+    /// use a new CID whenever sending on a new path"). Every record from
+    /// now on carries it. [`Error::InappropriateState`] when there is no
+    /// spare, and on every other protocol.
+    pub fn use_spare_connection_id(&mut self) -> Result<(), Error> {
+        match &mut self.inner {
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls13(c) => c.use_spare_connection_id(),
+            #[cfg(feature = "dtls")]
+            Engine::ServerDtls13(c) => c.use_spare_connection_id(),
+            _ => Err(Error::InappropriateState),
+        }
+    }
+
     /// DTLS: advances the engine's clock to `now`, a time on the same
     /// monotonic clock as [`next_timeout`](Self::next_timeout) and
     /// [`on_timeout`](Self::on_timeout) (any epoch, e.g. the time since the
@@ -2517,6 +2636,7 @@ struct DtlsClientOpts<'a> {
     max_record_size: usize,
     key_exchange_groups: Option<&'a [NamedGroup]>,
     key_shares: Option<&'a [NamedGroup]>,
+    connection_id: Option<Vec<u8>>,
 }
 
 /// Takes `cfg` apart for a DTLS client and refuses, with
@@ -2570,6 +2690,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         require_cookie,
         max_record_size,
         peer_address,
+        connection_id,
     } = parts.dtls;
     // Inert on a DTLS client: the version pair chose the engine; the cookie
     // knobs and the peer address are server-side; `rng` is drawn through
@@ -2618,6 +2739,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         return Err(Error::InappropriateState);
     }
     let server_name = resolve_server_name(server_name, verify_certificates)?;
+    let connection_id = resolve_connection_id(cfg, connection_id)?;
     Ok(DtlsClientOpts {
         roots,
         server_name,
@@ -2632,7 +2754,43 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         max_record_size,
         key_exchange_groups,
         key_shares,
+        connection_id,
     })
+}
+
+/// The connection ID this endpoint will receive under
+/// ([`Config::connection_id`]): a fixed value checked against
+/// [`crate::dtls::MAX_LOCAL_CID_LEN`], or one of the requested length drawn
+/// from the config's entropy source — per connection, so a server routing
+/// by CID never hands two connections the same one. A length the record
+/// layer would not accept fails closed with [`Error::InappropriateState`]
+/// rather than silently negotiating no CID.
+#[cfg(feature = "dtls")]
+fn resolve_connection_id(
+    cfg: &Config,
+    cid: Option<&super::config::ConnectionId>,
+) -> Result<Option<Vec<u8>>, Error> {
+    use crate::dtls::MAX_LOCAL_CID_LEN;
+    match cid {
+        None => Ok(None),
+        Some(super::config::ConnectionId::Fixed(v)) => {
+            if v.len() > MAX_LOCAL_CID_LEN {
+                return Err(Error::InappropriateState);
+            }
+            Ok(Some(v.clone()))
+        }
+        Some(super::config::ConnectionId::Random(len)) => {
+            if *len == 0 || *len > MAX_LOCAL_CID_LEN {
+                return Err(Error::InappropriateState);
+            }
+            let mut v = alloc::vec![0u8; *len];
+            config_rng(cfg)?.fill_bytes(&mut v);
+            Ok(Some(v))
+        }
+        // `ConnectionId` is `#[non_exhaustive]`; nothing else exists today.
+        #[allow(unreachable_patterns)]
+        Some(_) => Err(Error::InappropriateState),
+    }
 }
 
 /// Applies a [`Config::key_exchange_groups`] restriction to a DTLS
@@ -2705,6 +2863,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         max_record_size,
         key_exchange_groups,
         key_shares,
+        connection_id,
     } = dtls_client_opts(cfg)?;
     // DTLS 1.2 fragments handshake records at a fixed 1100 bytes (see
     // `Config::max_record_size`) and has no key shares.
@@ -2726,6 +2885,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     dc.cipher_suites = restrict_dtls_cipher_suites(dc.cipher_suites, cipher_suites)?;
     dc.groups = restrict_dtls_groups(&dc.groups, key_exchange_groups)?;
     dc.key_log = key_log.clone();
+    dc.connection_id = connection_id;
     Ok(crate::dtls::DtlsClientConnection12::new(
         dc,
         Vec::new(),
@@ -2749,6 +2909,7 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         max_record_size,
         key_exchange_groups,
         key_shares,
+        connection_id,
     } = dtls_client_opts(cfg)?;
     // EMS is a TLS 1.2 mechanism (DTLS 1.3 binds every secret to the
     // transcript).
@@ -2776,6 +2937,7 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     dc.alpn_protocols = alpn_protocols.to_vec();
     dc.max_record_size = max_record_size;
     dc.key_log = key_log.clone();
+    dc.connection_id = connection_id;
     Ok(crate::dtls::DtlsClientConnection13::new(
         dc,
         Vec::new(),
@@ -2798,6 +2960,7 @@ struct DtlsServerOpts<'a> {
     require_extended_master_secret: bool,
     max_record_size: usize,
     key_exchange_groups: Option<&'a [NamedGroup]>,
+    connection_id: Option<Vec<u8>>,
 }
 
 /// Takes `cfg` apart for a DTLS server, failing closed on what the DTLS
@@ -2860,6 +3023,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         require_cookie,
         max_record_size,
         peer_address,
+        connection_id,
     } = parts.dtls;
     // Inert on a DTLS server (see the `Config` docs): the version pair chose
     // the engine; `roots` / `crls` / `verification_time` only serve mTLS,
@@ -2916,6 +3080,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     {
         return Err(Error::InappropriateState);
     }
+    let connection_id = resolve_connection_id(cfg, connection_id)?;
     Ok(DtlsServerOpts {
         identity,
         cookie_secret,
@@ -2928,6 +3093,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         require_extended_master_secret,
         max_record_size,
         key_exchange_groups,
+        connection_id,
     })
 }
 
@@ -2947,6 +3113,7 @@ fn build_dtls12_server(
         require_extended_master_secret,
         max_record_size,
         key_exchange_groups,
+        connection_id,
     } = dtls_server_opts(cfg)?;
     // The DTLS 1.2 server verifies no client certificate (so the signature
     // policy has nothing to govern) and fragments at a fixed 1100 bytes; see
@@ -2982,6 +3149,7 @@ fn build_dtls12_server(
     let groups = restrict_dtls_groups(&sc.groups, key_exchange_groups)?;
     sc = sc.with_groups(groups);
     sc.key_log = key_log.clone();
+    sc = sc.with_connection_id(connection_id);
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
         peer_address.to_vec(),
@@ -3005,6 +3173,7 @@ fn build_dtls13_server(
         require_extended_master_secret,
         max_record_size,
         key_exchange_groups,
+        connection_id,
     } = dtls_server_opts(cfg)?;
     // The DTLS 1.3 server verifies no client certificate (so the signature
     // policy has nothing to govern) and EMS is a TLS 1.2 mechanism; see the
@@ -3027,6 +3196,7 @@ fn build_dtls13_server(
     sc.alpn_protocols = alpn_protocols.to_vec();
     sc.groups = restrict_dtls_groups(&sc.groups, key_exchange_groups)?;
     sc.key_log = key_log.clone();
+    sc.connection_id = connection_id;
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
         peer_address.to_vec(),

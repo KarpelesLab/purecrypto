@@ -76,6 +76,12 @@ impl AlertDescription {
     /// [`from_u8`](Self::from_u8) round-trip it correctly either way.
     pub const INAPPROPRIATE_FALLBACK: AlertDescription = AlertDescription::Unknown(86);
 
+    /// `too_many_cids_requested` (52) — RFC 9147 §9: a DTLS 1.3 peer asked
+    /// for more connection IDs than this endpoint will issue. Spelled as an
+    /// associated constant for the same reason as
+    /// [`INAPPROPRIATE_FALLBACK`](Self::INAPPROPRIATE_FALLBACK).
+    pub const TOO_MANY_CIDS_REQUESTED: AlertDescription = AlertDescription::Unknown(52);
+
     /// The 8-bit wire encoding.
     pub fn as_u8(self) -> u8 {
         match self {
@@ -282,6 +288,12 @@ pub enum Error {
     /// `.rng(alloc::sync::Arc::new(crate::rng::OsRng))` under `std`, or a
     /// hardware [`crate::tls::EntropySource`]). Fail-closed at construction.
     MissingEntropySource,
+    /// A DTLS 1.3 peer sent more `RequestConnectionId` messages than this
+    /// engine will answer (RFC 9147 §9: "endpoints MAY handle an excessive
+    /// number of RequestConnectionId messages by terminating the connection
+    /// using a `too_many_cids_requested` alert"). Maps to
+    /// `too_many_cids_requested` (52).
+    TooManyConnectionIdsRequested,
     /// The signing key handed to
     /// [`ConfigBuilder::try_identity`](crate::tls::ConfigBuilder::try_identity)
     /// (or the public key a [`HandshakeSigner`](crate::tls::HandshakeSigner)
@@ -351,6 +363,9 @@ impl core::fmt::Display for Error {
             }
             Error::MissingEntropySource => {
                 f.write_str("Config has no entropy source (set ConfigBuilder::rng)")
+            }
+            Error::TooManyConnectionIdsRequested => {
+                f.write_str("peer requested too many DTLS connection IDs")
             }
             Error::IdentityKeyMismatch => {
                 f.write_str("signing key does not match the leaf certificate's public key")

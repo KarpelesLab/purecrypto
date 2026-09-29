@@ -56,6 +56,10 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use super::ack::{ACK_CONTENT_TYPE, MAX_PENDING_ACKS, RecordNumber, decode as decode_ack};
+use super::cid::{
+    CidState, ConnectionIdUsage, NewConnectionId, RequestConnectionId, connection_id_extension,
+    draw_cid_pool, negotiate_server,
+};
 use super::client13::{
     decrypt_dtls13_record, derive_sn_key, encrypt_protected_record_with, sn_key_len_for,
 };
@@ -69,7 +73,9 @@ use super::reassembly::{
     write_fragments, write_message,
 };
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
-use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
+use super::record13::{
+    self, header_aad, header_cid, peek_header_layout, reconstruct_seq, sn_mask_for,
+};
 use super::reliability13::{InFlightRecord, Retransmit13};
 
 /// HelloRetryRequest sentinel `random` value (RFC 8446 §4.1.3).
@@ -137,6 +143,13 @@ pub(crate) struct ServerConfig13Internal {
     /// (X25519MLKEM768, X25519, P-256, P-384). Forwarded from
     /// [`crate::tls::Config::key_exchange_groups`].
     pub groups: Vec<NamedGroup>,
+    /// The connection ID this server wants to receive on this connection
+    /// (RFC 9146 §3), answered in the ServerHello when the client offered
+    /// the `connection_id` extension; `None` never negotiates CIDs. An
+    /// empty value asks the client to send without a CID while this server
+    /// sends with the client's. At most [`super::cid::MAX_LOCAL_CID_LEN`]
+    /// bytes; per connection, never shared across them.
+    pub connection_id: Option<Vec<u8>>,
 }
 
 impl ServerConfig13Internal {
@@ -158,6 +171,7 @@ impl ServerConfig13Internal {
             max_record_size: record::DEFAULT_MAX_RECORD_SIZE,
             alpn_protocols: Vec::new(),
             groups: supported_server_groups().to_vec(),
+            connection_id: None,
         }
     }
 
@@ -364,6 +378,14 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// [`Self::on_timeout`]. Governs the cookie-clock fallback — see
     /// [`Self::cookie_now_minutes`].
     clock_driven: bool,
+
+    /// Connection-ID state once the extension is negotiated (RFC 9146 §3,
+    /// RFC 9147 §9); `None` when no CIDs are in use.
+    cid: Option<CidState>,
+    /// CIDs a client `RequestConnectionId` asked for while a
+    /// `NewConnectionId` of ours was still unacknowledged — RFC 9147 §9
+    /// allows only one outstanding, so the answer waits for the ACK.
+    cid_reply_owed: u8,
 }
 
 impl<R: RngCore> DtlsServerConnection13<R> {
@@ -441,6 +463,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             retransmit: Retransmit13::new(),
             last_now: Duration::from_secs(0),
             clock_driven: false,
+            cid: None,
+            cid_reply_owed: 0,
         }
     }
 
@@ -499,6 +523,74 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// (RFC 8446 §6.1, carried in a protected record on DTLS 1.3).
     pub fn received_close_notify(&self) -> bool {
         self.close_notify_received
+    }
+
+    /// The connection ID the client puts in records to this server
+    /// (RFC 9146 §3): `Some(&[])` when CIDs were negotiated but this side
+    /// receives none, `None` when they were not negotiated (or not yet).
+    pub fn local_connection_id(&self) -> Option<&[u8]> {
+        self.cid.as_ref().map(CidState::local)
+    }
+
+    /// The connection ID this server currently puts in records to the
+    /// client; `Some(&[])` when the client receives none, `None` when CIDs
+    /// were not negotiated.
+    pub fn peer_connection_id(&self) -> Option<&[u8]> {
+        self.cid.as_ref().map(CidState::peer)
+    }
+
+    /// Spare send CIDs the client issued (`NewConnectionId(cid_spare)`,
+    /// RFC 9147 §9) that [`Self::use_spare_connection_id`] can switch to.
+    pub fn spare_connection_ids(&self) -> usize {
+        self.cid.as_ref().map_or(0, CidState::spare_count)
+    }
+
+    /// `true` when the datagram most recently fed contained a record that
+    /// carried a connection ID, authenticated, and was newer (epoch, then
+    /// sequence number) than every record received before it — the two
+    /// record-layer conditions RFC 9146 §6 sets for moving the peer's
+    /// transport address to that datagram's source. The third, a
+    /// reachability test of the new address, is the caller's: RFC 9147 §9
+    /// / RFC 9146 §6 forbid updating the address without one, since an
+    /// on-path attacker who rewrites source addresses can otherwise turn
+    /// this side into a reflector towards a third party — a server that
+    /// answers with more than it received must exchange a ping-pong (or a
+    /// return-routability check) with the new address before sending it
+    /// anything else. A datagram that fails this test is still a valid
+    /// datagram; only the address must not move.
+    pub fn datagram_allows_peer_address_update(&self) -> bool {
+        self.cid.as_ref().is_some_and(CidState::address_update_ok)
+    }
+
+    /// Asks the client for `num` fresh send CIDs with a
+    /// `RequestConnectionId` (RFC 9147 §9), tracked and retransmitted until
+    /// acknowledged. Refused with [`Error::InappropriateState`] before the
+    /// handshake completes, when CIDs were not negotiated, when this server
+    /// sends without a CID (§9: "MUST NOT send RequestConnectionId when
+    /// sending an empty Connection ID"), or while an earlier request is
+    /// unanswered.
+    pub fn request_connection_ids(&mut self, num: u8) -> Result<(), Error> {
+        if self.state != State::Connected {
+            return Err(Error::InappropriateState);
+        }
+        let cid = self.cid.as_mut().ok_or(Error::InappropriateState)?;
+        if cid.peer().is_empty() {
+            return Err(Error::InappropriateState);
+        }
+        cid.begin_request()?;
+        let body = RequestConnectionId { num_cids: num }.encode_body();
+        self.emit_encrypted_handshake(hs_type::REQUEST_CONNECTION_ID, &body)
+    }
+
+    /// Switches the CID this server sends with to the next spare the
+    /// client issued (RFC 9147 §9). [`Error::InappropriateState`] when no
+    /// spare is on hand.
+    pub fn use_spare_connection_id(&mut self) -> Result<(), Error> {
+        if self.cid.as_mut().is_some_and(CidState::use_spare) {
+            Ok(())
+        } else {
+            Err(Error::InappropriateState)
+        }
     }
 
     /// `true` while the handshake is not known to be over on both sides:
@@ -714,6 +806,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
     /// Feeds one incoming UDP datagram.
     pub fn feed_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
+        if let Some(cid) = self.cid.as_mut() {
+            cid.start_datagram();
+        }
         let mut off = 0usize;
         while off < datagram.len() {
             let first = datagram[off];
@@ -783,14 +878,34 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// silent drop (skip the record, or the rest of the datagram where
     /// framing is lost), never connection-fatal.
     fn process_protected_record(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        // The CID length this side receives (RFC 9147 §4: not on the wire,
+        // so the header is parsed with the negotiated length). With none
+        // negotiated, a record with the C bit set is refused (§9) — as a
+        // malformed header, below.
+        let cid_len = self.cid.as_ref().map_or(0, CidState::local_len);
         // A malformed unified header means framing is lost: drop the rest
         // of the datagram.
-        let Ok((hdr_len, body_len)) = peek_header_layout(buf) else {
+        let Ok((hdr_len, body_len)) = peek_header_layout(buf, cid_len) else {
             return Ok(0);
         };
         let total = hdr_len + body_len;
         if total > buf.len() {
             return Ok(0);
+        }
+        // RFC 9146 §3 / RFC 9147 §4: once this side receives a CID, a record
+        // without one is invalid, and one under a CID we never issued is
+        // another association's (or forged): silently dropped either way,
+        // before any key is touched.
+        if cid_len > 0 {
+            let has_cid = buf[0] & 0b0001_0000 != 0;
+            if !has_cid
+                || !self
+                    .cid
+                    .as_ref()
+                    .is_some_and(|c| c.accepts(&buf[1..1 + cid_len]))
+            {
+                return Ok(total);
+            }
         }
         let body = &buf[hdr_len..total];
         if body.len() < 16 {
@@ -819,21 +934,16 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         } else {
             &mask_full[..1]
         };
-        let Ok((hdr, ct_body)) = record13::decode_record(buf, mask) else {
+        let Ok((hdr, ct_body)) = record13::decode_record(buf, mask, cid_len) else {
             return Ok(total);
         };
         let consumed = hdr.header_len + ct_body.len();
 
         let seq = reconstruct_seq(hdr.seq_low, hdr.seq_is_16bit, ctx.seq.wrapping_add(1));
 
-        // RFC 9147 §4.2.3: AAD is the unified header prior to seq masking.
-        let mut aad = buf[..hdr.header_len].to_vec();
-        if hdr.seq_is_16bit {
-            aad[1] ^= mask[0];
-            aad[2] ^= mask[1];
-        } else {
-            aad[1] ^= mask[0];
-        }
+        // RFC 9147 §4.2.3: AAD is the unified header (CID included) prior
+        // to seq masking.
+        let aad = header_aad(buf, &hdr, mask);
         // Pre-AEAD anti-replay check: cheap rejection of duplicate /
         // too-old seq numbers without touching window state. The window
         // is only `mark`-ed after AEAD verification succeeds so a forged
@@ -854,6 +964,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             ctx.seq = seq;
         }
         let read_epoch = ctx.epoch;
+        // RFC 9146 §6: an authenticated record newer than any before it,
+        // carrying a CID, may move the peer's address (the caller's
+        // decision, see `datagram_allows_peer_address_update`).
+        if let Some(cid) = self.cid.as_mut() {
+            cid.note_authenticated(read_epoch, seq, !header_cid(buf, &hdr).is_empty());
+        }
         // Grace accounting for the retired epoch: once enough traffic has
         // arrived under the current epoch, nothing from the previous one is
         // still plausibly in flight (RFC 9147 §4.2.2).
@@ -955,6 +1071,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 let acks = decode_ack(&plain)?;
                 self.retransmit.on_ack(&acks);
                 self.complete_key_update_if_acked()?;
+                self.flush_owed_new_connection_id()?;
             }
             _ => return Err(Error::UnexpectedMessage),
         }
@@ -1063,8 +1180,69 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 let ku = KeyUpdate::decode(body)?;
                 self.on_key_update_received(ku)
             }
+            hs_type::NEW_CONNECTION_ID => self.on_new_connection_id(body),
+            hs_type::REQUEST_CONNECTION_ID => self.on_request_connection_id(body),
             _ => Err(Error::UnexpectedMessage),
         }
+    }
+
+    /// A client `NewConnectionId` (RFC 9147 §9): switch to the first CID
+    /// at once for `cid_immediate`, keep the rest as spares (bounded). A
+    /// client that never negotiated CIDs, or that negotiated receiving an
+    /// empty one, MUST NOT send this: `unexpected_message`.
+    fn on_new_connection_id(&mut self, body: &[u8]) -> Result<(), Error> {
+        let cid = self.cid.as_mut().ok_or(Error::UnexpectedMessage)?;
+        if cid.peer().is_empty() {
+            return Err(Error::UnexpectedMessage);
+        }
+        let msg = NewConnectionId::decode(body)?;
+        cid.on_new_connection_id(msg);
+        Ok(())
+    }
+
+    /// A client `RequestConnectionId` (RFC 9147 §9): answer with a
+    /// `NewConnectionId(cid_spare)` carrying up to `num_cids` fresh receive
+    /// CIDs from the pool (possibly none once it is spent), as soon as no
+    /// earlier `NewConnectionId` of ours is unacknowledged. A client that
+    /// sends without a CID MUST NOT ask (`unexpected_message`); one that
+    /// asks too often is refused with `too_many_cids_requested`.
+    fn on_request_connection_id(&mut self, body: &[u8]) -> Result<(), Error> {
+        let cid = self.cid.as_mut().ok_or(Error::UnexpectedMessage)?;
+        if cid.local().is_empty() {
+            return Err(Error::UnexpectedMessage);
+        }
+        cid.note_request_received()?;
+        let req = RequestConnectionId::decode(body)?;
+        self.cid_reply_owed = self.cid_reply_owed.saturating_add(req.num_cids);
+        self.flush_owed_new_connection_id()
+    }
+
+    /// Sends the `NewConnectionId` owed for received `RequestConnectionId`s
+    /// once no earlier one is in flight (RFC 9147 §9: "endpoints MUST NOT
+    /// have more than one NewConnectionId message outstanding").
+    fn flush_owed_new_connection_id(&mut self) -> Result<(), Error> {
+        if self.cid_reply_owed == 0 || self.state != State::Connected {
+            return Ok(());
+        }
+        let outstanding = self
+            .retransmit
+            .in_flight()
+            .iter()
+            .any(|r| r.fragment.first() == Some(&hs_type::NEW_CONNECTION_ID));
+        if outstanding {
+            return Ok(());
+        }
+        let Some(cid) = self.cid.as_mut() else {
+            return Ok(());
+        };
+        let cids = cid.issue(self.cid_reply_owed as usize);
+        self.cid_reply_owed = 0;
+        let body = NewConnectionId {
+            cids,
+            usage: ConnectionIdUsage::Spare,
+        }
+        .encode_body();
+        self.emit_encrypted_handshake(hs_type::NEW_CONNECTION_ID, &body)
     }
 
     /// Arms the wall-clock expiry of the read epoch just retired into
@@ -1378,6 +1556,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // pinned on `self` only once this CH is committed (below the HRR
         // paths, which re-enter here with the cookie-bearing CH2).
         let alpn_pick = super::select_alpn(&self.config.alpn_protocols, &ch.extensions)?;
+        // Connection IDs (RFC 9146 §3): negotiated only when the client
+        // offered the extension and this server has a CID to receive under;
+        // decided here, committed with the rest below.
+        let cid_pick = negotiate_server(
+            self.config.connection_id.as_deref(),
+            ext::find(&ch.extensions, ExtensionType::CONNECTION_ID),
+        )?;
 
         // Parse offered groups + offered shares. We need them both to
         // detect "send HRR-for-group-change" and to pick a share.
@@ -1737,13 +1922,24 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.reassembler = Some(reasm);
         self.server_random = Some(sr);
         self.alpn_negotiated = alpn_pick;
+        // The spare receive CIDs come from the connection's RNG now, so no
+        // entropy is needed later (RFC 9147 §9 `NewConnectionId`).
+        self.cid = cid_pick.map(|(local, peer)| {
+            let pool = draw_cid_pool(&mut self.rng, local.len());
+            CidState::negotiated(local, peer, pool)
+        });
 
         // ServerHello with the negotiated group's `key_share`; selects
-        // DTLS 1.3 (`0xfefc`, RFC 9147 §5.3).
-        let sh_extensions = alloc::vec![
+        // DTLS 1.3 (`0xfefc`, RFC 9147 §5.3), and answers the client's
+        // `connection_id` offer with the CID this server receives under
+        // (RFC 9146 §3).
+        let mut sh_extensions = alloc::vec![
             ext::server_key_share(selected_group, &server_pub),
             super::server_supported_versions_dtls13(),
         ];
+        if let Some(cid) = self.cid.as_ref() {
+            sh_extensions.push(connection_id_extension(cid.local()));
+        }
         let sh_bytes = ServerHello {
             random: sr,
             session_id: ch.session_id.clone(),
@@ -2147,7 +2343,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .ok_or(Error::InappropriateState)?;
         let epoch = self.enc_write_epoch;
         let seq = self.enc_write_seq;
-        let wire = encrypt_protected_record_with(suite, crypter, sn_key, epoch, seq, ct, payload)?;
+        let cid = self.cid.as_ref().map_or(&[][..], CidState::peer);
+        let wire =
+            encrypt_protected_record_with(suite, crypter, sn_key, epoch, seq, cid, ct, payload)?;
         self.enc_write_seq += 1;
         Ok(wire)
     }

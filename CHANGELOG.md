@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(dtls)* RFC 9146 connection IDs on DTLS 1.2 and 1.3 (`Config::connection_id`, `ConfigBuilder::connection_id` / `connection_id_len`, `Connection::local_connection_id` / `peer_connection_id` / `datagram_allows_peer_address_update`, `dtls::peek_connection_id`), the RFC 9147 §9 `NewConnectionId` / `RequestConnectionId` messages (`Connection::request_connection_ids` / `spare_connection_ids` / `use_spare_connection_id`), the matching `pc_dtls_*` FFI, and `s_client` / `s_server -cid` / `-cid_len` with `s_client -rebind`
+
 ## [0.9.6](https://github.com/KarpelesLab/purecrypto/compare/v0.9.5...v0.9.6) - 2026-09-29
 
 ### Added

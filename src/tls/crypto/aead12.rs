@@ -34,6 +34,11 @@
 //! In DTLS 1.2 the `seq_num` slot is `epoch(2) || sequence_number(6)` (RFC
 //! 6347 §4.1.2.1), for the nonce as well as the AAD.
 //!
+//! DTLS 1.2 records carrying a connection ID (RFC 9146 §5.3) use a
+//! different, longer additional data, and wrap the content in a
+//! `DTLSInnerPlaintext` (`content ‖ real_type ‖ zeros`) like TLS 1.3 —
+//! see [`RecordCrypter12::encrypt_dtls_cid`].
+//!
 //! [`RecordCrypter12::derive_pair`] expands the `key_block` (RFC 5246 §6.3)
 //! with the right layout for the suite — `client_write_key ||
 //! server_write_key || client_write_IV || server_write_IV`, the IVs 4 bytes
@@ -43,7 +48,7 @@
 //! `content_type` is the real content type, so `decrypt` simply hands it
 //! back to the caller alongside the recovered plaintext.
 
-use super::aead::Aead;
+use super::aead::{Aead, ct_find_last_nonzero};
 use super::prf;
 use super::schedule::HashAlg;
 use super::suite::AeadAlg;
@@ -90,6 +95,10 @@ pub(crate) fn record_iv_len(alg: AeadAlg) -> usize {
 
 /// The AEAD tag length; both families use 16-byte tags.
 const TAG_LEN: usize = 16;
+
+/// The `tls12_cid` content type (RFC 9146 §4), as it appears in the CID
+/// additional data.
+const TLS12_CID: u8 = 25;
 
 /// How a suite turns the record sequence number into the 12-byte AEAD nonce.
 enum NonceScheme {
@@ -254,10 +263,40 @@ impl RecordCrypter12 {
         aad
     }
 
+    /// Builds the additional data for a DTLS 1.2 record carrying a
+    /// connection ID (RFC 9146 §5.3):
+    ///
+    /// ```text
+    /// seq_num_placeholder(8 × 0xff) ‖ tls12_cid ‖ cid_length ‖ tls12_cid ‖
+    /// version(0xfefd) ‖ epoch(2) ‖ sequence_number(6) ‖ cid ‖
+    /// length_of_DTLSInnerPlaintext(2)
+    /// ```
+    ///
+    /// The eight `0xff` bytes followed by `tls12_cid` separate this input
+    /// from any CID-less AAD (which starts with a real sequence number
+    /// followed by a content type that is never 25); `inner_len` is the
+    /// length of the serialised `DTLSInnerPlaintext`, i.e. the ciphertext
+    /// length.
+    fn aad_dtls_cid(seq_combined: u64, cid: &[u8], inner_len: u16) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(23 + cid.len());
+        aad.extend_from_slice(&[0xff; 8]);
+        aad.push(TLS12_CID);
+        // `cid_length` is a one-byte integer: the caller never passes a
+        // CID longer than the extension can carry.
+        aad.push(cid.len() as u8);
+        aad.push(TLS12_CID);
+        aad.extend_from_slice(&[0xfe, 0xfd]);
+        // `epoch ‖ sequence_number`, as they appear on the wire.
+        aad.extend_from_slice(&seq_combined.to_be_bytes());
+        aad.extend_from_slice(cid);
+        aad.extend_from_slice(&inner_len.to_be_bytes());
+        aad
+    }
+
     /// Seals `payload` as the record numbered `seq` under `aad`, returning
     /// the fragment: the explicit nonce (GCM only) followed by the
     /// ciphertext and tag.
-    fn seal(&self, seq: u64, aad: &[u8; 13], payload: &[u8]) -> Vec<u8> {
+    fn seal(&self, seq: u64, aad: &[u8], payload: &[u8]) -> Vec<u8> {
         let explicit = seq.to_be_bytes();
         let explicit = &explicit[..self.explicit_len()];
         let nonce = self.aead_nonce(seq, explicit);
@@ -274,11 +313,11 @@ impl RecordCrypter12 {
     /// ciphertext length is known. Fails with `Decode` on a fragment too
     /// short to hold the explicit nonce and tag, `RecordOverflow` past the
     /// 2^14 plaintext limit, and `BadRecordMac` on an authentication failure.
-    fn open(
+    fn open<A: AsRef<[u8]>>(
         &self,
         seq: u64,
         fragment: &[u8],
-        aad_for: impl FnOnce(u16) -> [u8; 13],
+        aad_for: impl FnOnce(u16) -> A,
     ) -> Result<Vec<u8>, Error> {
         let explicit_len = self.explicit_len();
         if fragment.len() < explicit_len + TAG_LEN {
@@ -295,7 +334,7 @@ impl RecordCrypter12 {
         let aad = aad_for(plaintext_len as u16);
         let nonce = self.aead_nonce(seq, explicit);
         let mut buf = ct_bytes.to_vec();
-        if !self.aead.decrypt(&nonce, &aad, &mut buf, &tag) {
+        if !self.aead.decrypt(&nonce, aad.as_ref(), &mut buf, &tag) {
             return Err(Error::BadRecordMac);
         }
         Ok(buf)
@@ -335,6 +374,55 @@ impl RecordCrypter12 {
         self.open(seq_combined, fragment, |len| {
             Self::aad_dtls(seq_combined, content_type, len)
         })
+    }
+
+    /// Encrypts one DTLS 1.2 record carrying the connection ID `cid`
+    /// (RFC 9146 §4, §5.3): the content is wrapped as
+    /// `DTLSInnerPlaintext = content ‖ real_type ‖ zeros` (no padding is
+    /// added here) and sealed under the CID additional data. The caller
+    /// frames the result as a `tls12_cid` record. `content_type` is the
+    /// real type that goes inside the envelope.
+    ///
+    /// The serialised inner plaintext MUST NOT exceed 2^14 bytes (§5), so
+    /// the content is capped one byte below that.
+    #[allow(dead_code)]
+    pub(crate) fn encrypt_dtls_cid(
+        &self,
+        seq_combined: u64,
+        cid: &[u8],
+        content_type: ContentType,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if payload.len() + 1 > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
+        let mut inner = Vec::with_capacity(payload.len() + 1);
+        inner.extend_from_slice(payload);
+        inner.push(content_type.as_u8());
+        let aad = Self::aad_dtls_cid(seq_combined, cid, inner.len() as u16);
+        Ok(self.seal(seq_combined, &aad, &inner))
+    }
+
+    /// Decrypts one `tls12_cid` record's fragment (RFC 9146 §4, §5.3),
+    /// returning the real content type from inside the envelope and the
+    /// content with the type byte and zero padding stripped. The padding is
+    /// found with the TLS 1.3 record layer's constant-time scan
+    /// ([`ct_find_last_nonzero`]): a backward search would take time
+    /// proportional to the padding and give an observer the content length
+    /// the padding is there to hide.
+    #[allow(dead_code)]
+    pub(crate) fn decrypt_dtls_cid(
+        &self,
+        seq_combined: u64,
+        cid: &[u8],
+        fragment: &[u8],
+    ) -> Result<(ContentType, Vec<u8>), Error> {
+        let mut inner = self.open(seq_combined, fragment, |len| {
+            Self::aad_dtls_cid(seq_combined, cid, len)
+        })?;
+        let (real_type, end) = ct_find_last_nonzero(&inner)?;
+        inner.truncate(end);
+        Ok((ContentType::from_u8(real_type), inner))
     }
 
     /// Encrypts one record's payload, returning the on-wire fragment:
@@ -423,6 +511,7 @@ impl Drop for RecordCrypter12 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     /// Builds a pair of `RecordCrypter12` instances for one direction's worth
     /// of round-trip testing (encrypter writes, decrypter reads, using the
@@ -443,6 +532,98 @@ mod tests {
     /// The per-direction IV the key block yields for `alg`, as test filler.
     fn iv_for(alg: AeadAlg) -> Vec<u8> {
         (0xa1..).take(fixed_iv_len(alg)).collect()
+    }
+
+    /// RFC 9146 §5.3: a CID record round-trips under every AEAD, the real
+    /// content type travels inside the envelope, and the additional data
+    /// binds the CID, the record number and the inner length — changing
+    /// any of them fails authentication. A plain DTLS record and a CID
+    /// record never authenticate under each other's AAD.
+    #[test]
+    fn dtls_cid_round_trip_and_aad_binding() {
+        let payload = (0..100u8).collect::<Vec<u8>>();
+        let cid = [0xc1, 0xd2, 0xe3, 0xf4];
+        let seq = (1u64 << 48) | 42;
+        for (alg, key_len) in [
+            (AeadAlg::Aes128Gcm, 16usize),
+            (AeadAlg::Aes256Gcm, 32),
+            (AeadAlg::ChaCha20Poly1305, 32),
+        ] {
+            let key: Vec<u8> = (0..key_len as u8).collect();
+            let (enc, dec) = pair(alg, &key, &iv_for(alg));
+            let wire = enc
+                .encrypt_dtls_cid(seq, &cid, ContentType::Handshake, &payload)
+                .unwrap();
+            // One inner type byte more than a plain record.
+            assert_eq!(wire.len(), record_iv_len(alg) + payload.len() + 1 + 16);
+            let (ct, plain) = dec.decrypt_dtls_cid(seq, &cid, &wire).unwrap();
+            assert_eq!(ct, ContentType::Handshake);
+            assert_eq!(plain, payload);
+            // Wrong CID, wrong record number: bad_record_mac.
+            assert!(matches!(
+                dec.decrypt_dtls_cid(seq, &[0xc1, 0xd2, 0xe3, 0xf5], &wire),
+                Err(Error::BadRecordMac)
+            ));
+            assert!(matches!(
+                dec.decrypt_dtls_cid(seq + 1, &cid, &wire),
+                Err(Error::BadRecordMac)
+            ));
+            // A CID-less record does not open under the CID AAD, nor a CID
+            // record under the RFC 6347 AAD (§5: "the modified algorithm
+            // MUST NOT be applied to records that do not carry a CID").
+            let plain_wire = enc
+                .encrypt_dtls(seq, ContentType::Handshake, &payload)
+                .unwrap();
+            assert!(dec.decrypt_dtls_cid(seq, &cid, &plain_wire).is_err());
+            assert!(
+                dec.decrypt_dtls(seq, ContentType::Unknown(25), &wire)
+                    .is_err()
+            );
+            // The AAD layout, byte for byte (§5.3).
+            let aad = RecordCrypter12::aad_dtls_cid(seq, &cid, 7);
+            let mut expected = vec![0xff; 8];
+            expected.extend_from_slice(&[25, 4, 25, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 42]);
+            expected.extend_from_slice(&cid);
+            expected.extend_from_slice(&[0, 7]);
+            assert_eq!(aad, expected);
+        }
+    }
+
+    /// `DTLSInnerPlaintext` padding (RFC 9146 §4) is stripped, an all-zero
+    /// inner plaintext is a protocol violation, and the 2^14 ceiling on
+    /// the inner plaintext holds on both sides.
+    #[test]
+    fn dtls_cid_inner_plaintext_rules() {
+        let key: Vec<u8> = (0..16u8).collect();
+        let (enc, dec) = pair(AeadAlg::Aes128Gcm, &key, &iv_for(AeadAlg::Aes128Gcm));
+        let cid = [7u8; 2];
+        // Hand-build a padded inner plaintext: content ‖ type ‖ zeros.
+        let mut inner = b"data".to_vec();
+        inner.push(ContentType::ApplicationData.as_u8());
+        inner.extend_from_slice(&[0u8; 37]);
+        let aad = RecordCrypter12::aad_dtls_cid(5, &cid, inner.len() as u16);
+        let wire = enc.seal(5, &aad, &inner);
+        let (ct, plain) = dec.decrypt_dtls_cid(5, &cid, &wire).unwrap();
+        assert_eq!(ct, ContentType::ApplicationData);
+        assert_eq!(plain, b"data");
+        // All zeros: no content type at all.
+        let zeros = vec![0u8; 8];
+        let aad = RecordCrypter12::aad_dtls_cid(6, &cid, 8);
+        let wire = enc.seal(6, &aad, &zeros);
+        assert!(matches!(
+            dec.decrypt_dtls_cid(6, &cid, &wire),
+            Err(Error::PeerMisbehaved)
+        ));
+        // Content of 2^14 bytes would make a 2^14 + 1 inner plaintext.
+        let big = vec![1u8; 1 << 14];
+        assert!(matches!(
+            enc.encrypt_dtls_cid(7, &cid, ContentType::ApplicationData, &big),
+            Err(Error::RecordOverflow)
+        ));
+        assert!(
+            enc.encrypt_dtls_cid(7, &cid, ContentType::ApplicationData, &big[1..])
+                .is_ok()
+        );
     }
 
     /// Round-trip a 100-byte payload under each supported AEAD; the wire

@@ -284,6 +284,13 @@ u16_id!(
         SERVER_CERTIFICATE_TYPE = 0x0014,
         /// key_share.
         KEY_SHARE = 0x0033,
+        /// connection_id (RFC 9146 §3; DTLS only — RFC 9147 §9 carries it
+        /// into DTLS 1.3). Body: `opaque cid<0..2^8-1>`, the connection ID
+        /// the sender wants to RECEIVE in the peer's protected records; an
+        /// empty one means "I will send with a CID but do not need one".
+        /// Offered in the ClientHello, answered in the ServerHello.
+        #[cfg_attr(not(feature = "dtls"), allow(dead_code))]
+        CONNECTION_ID = 0x0036,
         /// quic_transport_parameters (RFC 9001 §8.2 + §18 codepoint registry).
         /// Body: the opaque transport-parameter list defined by RFC 9000 §18,
         /// carried verbatim in TLS — the TLS engine treats it as a byte blob

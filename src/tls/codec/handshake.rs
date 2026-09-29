@@ -48,6 +48,15 @@ pub(crate) mod hs_type {
     pub(crate) const CLIENT_KEY_EXCHANGE: u8 = 16;
     pub(crate) const FINISHED: u8 = 20;
     pub(crate) const KEY_UPDATE: u8 = 24;
+    /// `request_connection_id` (RFC 9147 §5.2 / §9). DTLS 1.3 only: a
+    /// post-handshake request for `num_cids` fresh connection IDs.
+    #[cfg_attr(not(feature = "dtls"), allow(dead_code))]
+    pub(crate) const REQUEST_CONNECTION_ID: u8 = 9;
+    /// `new_connection_id` (RFC 9147 §5.2 / §9). DTLS 1.3 only: a
+    /// post-handshake message issuing connection IDs the peer is to send
+    /// with, immediately or as spares.
+    #[cfg_attr(not(feature = "dtls"), allow(dead_code))]
+    pub(crate) const NEW_CONNECTION_ID: u8 = 10;
     /// `compressed_certificate` (RFC 8879 §4). TLS 1.3+ only. Replaces a
     /// regular `Certificate` (type 11) on the wire when both peers have
     /// negotiated certificate compression. Body:

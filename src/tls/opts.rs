@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use crate::signature_registry::SignaturePolicy;
 use crate::x509::Time;
 
-use super::config::{ClientAuth, Config, EntropySource, Identity};
+use super::config::{ClientAuth, Config, ConnectionId, EntropySource, Identity};
 use super::connection::ResumptionSession;
 use super::groups::NamedGroup;
 use super::keylog::KeyLog;
@@ -111,6 +111,7 @@ pub(crate) struct DtlsOpts<'a> {
     pub require_cookie: bool,
     pub max_record_size: usize,
     pub peer_address: &'a [u8],
+    pub connection_id: Option<&'a ConnectionId>,
 }
 
 impl Config {
@@ -160,6 +161,7 @@ impl Config {
             require_cookie,
             max_record_size,
             peer_address,
+            connection_id,
             key_log,
             rng,
             signer,
@@ -220,6 +222,7 @@ impl Config {
                 require_cookie: *require_cookie,
                 max_record_size: *max_record_size,
                 peer_address,
+                connection_id: connection_id.as_ref(),
             },
         }
     }

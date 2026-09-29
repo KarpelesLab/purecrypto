@@ -302,7 +302,9 @@ pub mod dtls {
     use super::Suite;
     use crate::dtls::client13::{decrypt_dtls13_record, encrypt_protected_record_with};
     use crate::dtls::epoch13::ReadEpoch;
-    use crate::dtls::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
+    use crate::dtls::record13::{
+        self, header_aad, peek_header_layout, reconstruct_seq, sn_mask_for,
+    };
     use crate::tls::crypto::Secret;
     use crate::tls::crypto::aead12::RecordCrypter12;
     use crate::tls::{ContentType, Error};
@@ -342,15 +344,52 @@ pub mod dtls {
         )
     }
 
+    /// Protects one DTLS 1.2 record carrying the connection ID `cid`
+    /// (RFC 9146 §4, §5.3): the `DTLSInnerPlaintext` wrapping and the CID
+    /// additional data of `RecordCrypter12::encrypt_dtls_cid`.
+    pub fn dtls12_cid_seal(
+        suite: Suite,
+        key: &[u8],
+        write_iv: &[u8],
+        epoch_seq: u64,
+        cid: &[u8],
+        content_type: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        RecordCrypter12::new(suite.params().aead, key, write_iv).encrypt_dtls_cid(
+            epoch_seq,
+            cid,
+            ContentType::from_u8(content_type),
+            payload,
+        )
+    }
+
+    /// Removes DTLS 1.2 CID record protection and strips the inner type
+    /// and padding (constant-time scan). Returns `(content_type, content)`.
+    pub fn dtls12_cid_open(
+        suite: Suite,
+        key: &[u8],
+        write_iv: &[u8],
+        epoch_seq: u64,
+        cid: &[u8],
+        fragment: &[u8],
+    ) -> Result<(u8, Vec<u8>), Error> {
+        let (ct, content) = RecordCrypter12::new(suite.params().aead, key, write_iv)
+            .decrypt_dtls_cid(epoch_seq, cid, fragment)?;
+        Ok((ct.as_u8(), content))
+    }
+
     /// Protects one DTLS 1.3 record under the traffic secret `secret` at
-    /// `(epoch, seq)`, with sequence-number encryption (RFC 9147 §4.2.3):
-    /// the engines' `encrypt_protected_record_with`, keyed as a write epoch
-    /// is (record keys and `sn_key` both from `secret`).
+    /// `(epoch, seq)`, with sequence-number encryption (RFC 9147 §4.2.3)
+    /// and the connection ID `cid` in the header (empty for none, RFC 9147
+    /// §4): the engines' `encrypt_protected_record_with`, keyed as a write
+    /// epoch is (record keys and `sn_key` both from `secret`).
     pub fn dtls13_seal(
         suite: Suite,
         secret: &[u8],
         epoch: u16,
         seq: u64,
+        cid: &[u8],
         content_type: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
@@ -364,6 +403,7 @@ pub mod dtls {
             &e.sn_key,
             epoch,
             seq,
+            cid,
             ContentType::from_u8(content_type),
             payload,
         )
@@ -372,7 +412,8 @@ pub mod dtls {
     /// Removes DTLS 1.3 record protection from the first record in
     /// `datagram`, mirroring the engines' receive path
     /// (`dtls::client13` / `dtls::server13` `process_protected_record`):
-    /// locate the body, compute the sequence-number mask from it, unmask
+    /// locate the body (parsing the header with the receiver's CID
+    /// length `cid_len`), compute the sequence-number mask from it, unmask
     /// and reconstruct the sequence number against `high_water`, rebuild the
     /// AAD, then open the AEAD and strip the inner type and padding.
     /// Returns `(seq, content_type, content)`.
@@ -381,12 +422,13 @@ pub mod dtls {
         secret: &[u8],
         epoch: u16,
         high_water: u64,
+        cid_len: usize,
         datagram: &[u8],
     ) -> Result<(u64, u8, Vec<u8>), Error> {
         let p = suite.params();
         let mut ctx = ReadEpoch::new(p, epoch, &Secret::new(secret));
         ctx.seq = high_water;
-        let (hdr_len, body_len) = peek_header_layout(datagram)?;
+        let (hdr_len, body_len) = peek_header_layout(datagram, cid_len)?;
         let total = hdr_len + body_len;
         if datagram.len() < total || body_len < 16 {
             return Err(Error::Decode);
@@ -398,15 +440,9 @@ pub mod dtls {
         } else {
             &mask_full[..1]
         };
-        let (hdr, ct_body) = record13::decode_record(datagram, mask)?;
+        let (hdr, ct_body) = record13::decode_record(datagram, mask, cid_len)?;
         let seq = reconstruct_seq(hdr.seq_low, hdr.seq_is_16bit, ctx.seq.wrapping_add(1));
-        let mut aad = datagram[..hdr.header_len].to_vec();
-        if hdr.seq_is_16bit {
-            aad[1] ^= mask[0];
-            aad[2] ^= mask[1];
-        } else {
-            aad[1] ^= mask[0];
-        }
+        let aad = header_aad(datagram, &hdr, mask);
         let (ct, content) = decrypt_dtls13_record(&mut ctx.crypter, seq, &aad, ct_body)?;
         Ok((seq, ct.as_u8(), content))
     }

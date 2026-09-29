@@ -32,6 +32,17 @@
 //!   updates is capped. `NewSessionTicket` is accepted and acknowledged but
 //!   discarded — the DTLS engines have no resumption store. DTLS 1.2 has no
 //!   post-handshake handshake messages; anything after `Finished` is fatal.
+//! - **Connection IDs (RFC 9146, RFC 9147 §9).** Negotiated through the
+//!   `connection_id` extension when [`crate::tls::Config::connection_id`]
+//!   is set; each side then sends every protected record under the CID
+//!   the peer chose (DTLS 1.2: the `tls12_cid` record and its own MAC
+//!   input; DTLS 1.3: the unified header's C bit). DTLS 1.3 adds the
+//!   `NewConnectionId` / `RequestConnectionId` post-handshake messages.
+//!   The engines are sans-I/O and never see addresses: [`peek_connection_id`]
+//!   routes an incoming datagram to its connection, and
+//!   `datagram_allows_peer_address_update` reports the RFC 9146 §6
+//!   record-layer conditions for following the peer to a new address.
+//!   See `src/dtls/cid.rs` for the bounds and the security reasoning.
 //! - **Path MTU.** Outbound handshake messages are fragmented so that no
 //!   record exceeds the configured `max_record_size` (default 1200 bytes,
 //!   RFC 9147 §4.4); each fragment is its own record and datagram, and
@@ -108,6 +119,7 @@ pub(crate) fn system_now() -> Option<Time> {
 }
 
 pub(crate) mod ack;
+pub(crate) mod cid;
 pub mod client12;
 pub mod client13;
 pub(crate) mod cookie;
@@ -121,6 +133,7 @@ pub(crate) mod replay;
 pub mod server12;
 pub mod server13;
 
+pub use cid::{MAX_LOCAL_CID_LEN, peek_connection_id};
 pub(crate) use client12::ClientConfig12Internal;
 pub use client12::DtlsClientConnection12;
 pub(crate) use client13::ClientConfig13Internal;
@@ -157,6 +170,8 @@ pub(crate) fn select_alpn(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_cid;
 #[cfg(test)]
 mod tests_deferred;
 #[cfg(test)]

@@ -1321,15 +1321,86 @@ fn dtls13_records() -> String {
         let payload = secret_bytes::<150>(tag + 1);
         let expected = public_copy(&payload);
         let (epoch, seq) = (3u16, 0x1234u64);
-        let wire = hooks::dtls::dtls13_seal(suite, secret, epoch, seq, 23, &payload).expect("seal");
+        let wire =
+            hooks::dtls::dtls13_seal(suite, secret, epoch, seq, &[], 23, &payload).expect("seal");
         declassify(&wire);
         let (got_seq, ty, got) =
-            hooks::dtls::dtls13_open(suite, secret, epoch, seq - 1, &wire).expect("authentic");
+            hooks::dtls::dtls13_open(suite, secret, epoch, seq - 1, 0, &wire).expect("authentic");
         declassify(&got);
         assert_eq!((got_seq, ty, &got[..]), (seq, 23, &expected[..]));
         let mut bad = wire.clone();
         bad[20] ^= 1;
-        assert!(hooks::dtls::dtls13_open(suite, secret, epoch, seq - 1, &bad).is_err());
+        assert!(hooks::dtls::dtls13_open(suite, secret, epoch, seq - 1, 0, &bad).is_err());
+        out.push(hex8(&wire));
+    }
+    out.join(" ")
+}
+
+/// DTLS 1.2 records carrying a connection ID (RFC 9146 §4, §5.3): the
+/// `DTLSInnerPlaintext` wrapping, the CID additional data, and the
+/// constant-time strip of the inner content type and padding on the way
+/// back. The CID is public (it travels in the clear in every record
+/// header), the key, IV and content are secret.
+fn dtls12_cid_records() -> String {
+    let mut out = Vec::new();
+    let cid = [0xc1, 0xd2, 0xe3, 0xf4, 0x05];
+    for (i, suite) in SUITES.into_iter().enumerate() {
+        let tag = 360 + 10 * i as u64;
+        let key = secret_bytes::<32>(tag);
+        let key = &key[..key_len(suite)];
+        let iv = secret_bytes::<12>(tag + 1);
+        let iv = &iv[..hooks::tls::tls12_fixed_iv_len(suite)];
+        let payload = secret_bytes::<150>(tag + 2);
+        let expected = public_copy(&payload);
+        let epoch_seq = (1u64 << 48) | 0x2a;
+        let frag = hooks::dtls::dtls12_cid_seal(suite, key, iv, epoch_seq, &cid, 23, &payload)
+            .expect("seal");
+        declassify(&frag);
+        let explicit = hooks::tls::tls12_record_iv_len(suite);
+        assert_eq!(frag.len(), explicit + payload.len() + 1 + 16);
+        let (ty, got) = hooks::dtls::dtls12_cid_open(suite, key, iv, epoch_seq, &cid, &frag)
+            .expect("authentic");
+        declassify(&got);
+        assert_eq!((ty, &got[..]), (23, &expected[..]));
+        let mut bad = frag.clone();
+        bad[frag.len() - 1] ^= 1;
+        assert!(hooks::dtls::dtls12_cid_open(suite, key, iv, epoch_seq, &cid, &bad).is_err());
+        // Another CID: the additional data no longer matches.
+        let other = [0xc1, 0xd2, 0xe3, 0xf4, 0x06];
+        assert!(hooks::dtls::dtls12_cid_open(suite, key, iv, epoch_seq, &other, &frag).is_err());
+        out.push(hex8(&frag[explicit..]));
+    }
+    out.join(" ")
+}
+
+/// DTLS 1.3 records with a connection ID in the unified header (RFC 9147
+/// §4, §9): the header parsed with the receiver's CID length, the CID in
+/// the AEAD additional data, sequence-number encryption unaffected.
+fn dtls13_cid_records() -> String {
+    let mut out = Vec::new();
+    let cid = [0xa1, 0xb2, 0xc3];
+    for (i, suite) in SUITES.into_iter().enumerate() {
+        let tag = 390 + 10 * i as u64;
+        let secret = secret_bytes::<48>(tag);
+        let secret = &secret[..hash_len(suite)];
+        let payload = secret_bytes::<150>(tag + 1);
+        let expected = public_copy(&payload);
+        let (epoch, seq) = (3u16, 0x1234u64);
+        let wire =
+            hooks::dtls::dtls13_seal(suite, secret, epoch, seq, &cid, 23, &payload).expect("seal");
+        declassify(&wire);
+        // C bit set, the CID right after the first byte.
+        assert_eq!(wire[0] & 0b0001_0000, 0b0001_0000);
+        assert_eq!(&wire[1..4], &cid);
+        let (got_seq, ty, got) =
+            hooks::dtls::dtls13_open(suite, secret, epoch, seq - 1, 3, &wire).expect("authentic");
+        declassify(&got);
+        assert_eq!((got_seq, ty, &got[..]), (seq, 23, &expected[..]));
+        let mut bad = wire.clone();
+        bad[20] ^= 1;
+        assert!(hooks::dtls::dtls13_open(suite, secret, epoch, seq - 1, 3, &bad).is_err());
+        // A receiver with no CID negotiated refuses the C bit outright.
+        assert!(hooks::dtls::dtls13_open(suite, secret, epoch, seq - 1, 0, &wire).is_err());
         out.push(hex8(&wire));
     }
     out.join(" ")
@@ -2136,6 +2207,8 @@ const CASES: &[Case] = &[
     ("tls12_records", tls12_records),
     ("dtls12_records", dtls12_records),
     ("dtls13_records", dtls13_records),
+    ("dtls12_cid_records", dtls12_cid_records),
+    ("dtls13_cid_records", dtls13_cid_records),
     ("quic_packets", quic_packets),
     // secp256k1 extensions, more curves and RSA variants
     ("bip340_sign", bip340_sign),

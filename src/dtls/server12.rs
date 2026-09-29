@@ -35,12 +35,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use super::cid::{CidState, connection_id_extension, negotiate_server};
 use super::cookie::{CookieGenerator, build_ch_fingerprint};
 use super::reassembly::{
     HandshakeFragment, MAX_HS_MSG_SEQ, PreCookieBuffer, Reassembler, read_fragment,
     transcript_message, write_fragments, write_message,
 };
-use super::record::{self, ParsedDtlsRecord};
+use super::record::{self, ParsedDtlsRecord, TLS12_CID_CONTENT_TYPE};
 use super::reliability::{Flight, FlightRecord, Retransmit};
 use super::replay::AntiReplayWindow;
 
@@ -105,6 +106,13 @@ pub(crate) struct ServerConfig12Internal {
     signature_policy: SignaturePolicy,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub(crate) key_log: Option<Arc<dyn KeyLog>>,
+    /// The connection ID this server wants to receive on this connection
+    /// (RFC 9146 §3), answered in the ServerHello when the client offered
+    /// the `connection_id` extension; `None` never negotiates CIDs. An
+    /// empty value asks the client to send without a CID while this server
+    /// sends with the client's. At most [`super::cid::MAX_LOCAL_CID_LEN`]
+    /// bytes; per connection, never shared across them.
+    pub(crate) connection_id: Option<Vec<u8>>,
 }
 
 impl ServerConfig12Internal {
@@ -135,6 +143,7 @@ impl ServerConfig12Internal {
             ],
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
+            connection_id: None,
         }
     }
 
@@ -205,6 +214,13 @@ impl ServerConfig12Internal {
     /// (see [`Self::alpn_protocols`]).
     pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
         self.alpn_protocols = protocols;
+        self
+    }
+
+    /// Sets the connection ID this server receives under (see
+    /// [`Self::connection_id`]).
+    pub fn with_connection_id(mut self, cid: Option<Vec<u8>>) -> Self {
+        self.connection_id = cid;
         self
     }
 }
@@ -359,6 +375,9 @@ pub struct DtlsServerConnection12<R: RngCore> {
     close_notify_received: bool,
     /// Our `close_notify` went out; no more application data may follow.
     close_notify_sent: bool,
+    /// Connection-ID state once the extension is negotiated (RFC 9146 §3);
+    /// `None` when no CIDs are in use.
+    cid: Option<CidState>,
 }
 
 // The DTLS 1.2 master secret lives for the whole connection (exporters,
@@ -436,6 +455,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             negotiated_group: None,
             close_notify_received: false,
             close_notify_sent: false,
+            cid: None,
         }
     }
 
@@ -468,6 +488,37 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// (RFC 5246 §7.2.1).
     pub fn received_close_notify(&self) -> bool {
         self.close_notify_received
+    }
+
+    /// The connection ID the client puts in records to this server
+    /// (RFC 9146 §3): `Some(&[])` when CIDs were negotiated but this side
+    /// receives none, `None` when they were not negotiated (or not yet).
+    pub fn local_connection_id(&self) -> Option<&[u8]> {
+        self.cid.as_ref().map(CidState::local)
+    }
+
+    /// The connection ID this server puts in records to the client;
+    /// `Some(&[])` when the client receives none, `None` when CIDs were
+    /// not negotiated. Fixed for the connection's life: DTLS 1.2 has no
+    /// way to change CIDs mid-session (RFC 9146 §3).
+    pub fn peer_connection_id(&self) -> Option<&[u8]> {
+        self.cid.as_ref().map(CidState::peer)
+    }
+
+    /// `true` when the datagram most recently fed contained a record that
+    /// carried a connection ID, authenticated, and was newer (epoch, then
+    /// sequence number) than every record received before it — the two
+    /// record-layer conditions RFC 9146 §6 sets for moving the peer's
+    /// transport address to that datagram's source. The third, a
+    /// reachability test of the new address, is the caller's: RFC 9146 §6
+    /// / §9 warn that an on-path attacker who rewrites source addresses can
+    /// otherwise turn this server into a reflector towards a third party,
+    /// so an application that answers with more than it received must
+    /// exchange a ping-pong (or a return-routability check) with the new
+    /// address before sending it anything else. A datagram that fails this
+    /// test is still a valid datagram; only the address must not move.
+    pub fn datagram_allows_peer_address_update(&self) -> bool {
+        self.cid.as_ref().is_some_and(CidState::address_update_ok)
     }
 
     /// `true` while the handshake is not known to be over on both sides:
@@ -670,6 +721,12 @@ impl<R: RngCore> DtlsServerConnection12<R> {
 
     /// Feeds one incoming UDP datagram into the connection.
     pub fn feed_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
+        if let Some(cid) = self.cid.as_mut() {
+            cid.start_datagram();
+        }
+        // A `tls12_cid` record is framed with the CID length this side
+        // receives (RFC 9146 §4: the length is not on the wire).
+        let cid_len = self.cid.as_ref().map_or(0, CidState::local_len);
         let mut off = 0usize;
         while off < datagram.len() {
             // Truncated trailing record, or a header whose declared length
@@ -677,7 +734,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             // rest of the datagram. RFC 6347 §4.1.2.7 requires invalid
             // records to be silently discarded — a single spoofed datagram
             // must never be fatal.
-            let rec = match record::read_record(&datagram[off..]) {
+            let rec = match record::read_record_cid(&datagram[off..], cid_len) {
                 Ok(Some(rec)) => rec,
                 Ok(None) | Err(_) => return Ok(()),
             };
@@ -718,10 +775,50 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             // is a replay: silent drop.
             let finished_retransmit = self.state == State::Connected
                 && self.final_flight.is_some()
-                && rec.content_type == ContentType::Handshake;
+                && (rec.content_type == ContentType::Handshake
+                    || rec.content_type == ContentType::Unknown(TLS12_CID_CONTENT_TYPE));
             if !finished_retransmit {
                 return Ok(());
             }
+        }
+
+        // RFC 9146 §3: once this side receives a CID, only `tls12_cid`
+        // records under one of its CIDs are valid at epoch ≥ 1 — a record
+        // without a CID, one with a CID it did not issue, and a CID record
+        // when none was negotiated (or at epoch 0, where nothing is
+        // protected) are all invalid, i.e. silently discarded (RFC 6347
+        // §4.1.2.7). The real content type is inside the envelope (§4).
+        let expects_cid = self.cid.as_ref().is_some_and(|c| c.local_len() > 0);
+        if let Some(cid) = rec.cid {
+            if self.read_epoch < 1 || !expects_cid {
+                return Ok(());
+            }
+            let Some(c) = self.read_crypter.as_ref() else {
+                return Ok(());
+            };
+            if !self.cid.as_ref().is_some_and(|s| s.accepts(cid)) {
+                return Ok(());
+            }
+            // The real content type is inside the envelope, so a record the
+            // replay window already holds could only be let through above
+            // as a possible Finished retransmission (RFC 6347 §4.2.4): once
+            // decrypted, anything else that is a duplicate is a replay.
+            let duplicate = !self.replay.check(rec.seq);
+            let combined = ((self.read_epoch as u64) << 48) | rec.seq;
+            let Ok((real_type, plain)) = c.decrypt_dtls_cid(combined, cid, rec.fragment) else {
+                // AEAD failure: silent drop, window not advanced.
+                return Ok(());
+            };
+            if duplicate && real_type != ContentType::Handshake {
+                return Ok(());
+            }
+            // AEAD verified: commit to the window only now.
+            self.replay.mark(rec.seq);
+            self.note_authenticated(rec.seq, true);
+            return self.on_authenticated_record(real_type, plain);
+        }
+        if self.read_epoch >= 1 && expects_cid {
+            return Ok(());
         }
         match rec.content_type {
             ContentType::ChangeCipherSpec => {
@@ -761,13 +858,18 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                     };
                     // AEAD verified: now it's safe to commit to the window.
                     self.replay.mark(rec.seq);
+                    self.note_authenticated(rec.seq, false);
                     plain = p;
                     authenticated = true;
                 } else {
                     plain = rec.fragment.to_vec();
                     authenticated = false;
                 }
-                self.process_handshake_record(&plain, authenticated)
+                if authenticated {
+                    self.on_authenticated_record(ContentType::Handshake, plain)
+                } else {
+                    self.process_handshake_record(&plain, false)
+                }
             }
             ContentType::ApplicationData => {
                 if self.read_epoch < 1 {
@@ -786,27 +888,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 };
                 // AEAD verified: commit to the window only now.
                 self.replay.mark(rec.seq);
-                match self.state {
-                    State::Connected => {
-                        // The client only sends application data once it
-                        // has verified our Finished: the final flight is
-                        // implicitly acknowledged.
-                        self.final_flight = None;
-                        self.app_in.extend_from_slice(&plain);
-                        Ok(())
-                    }
-                    // The peer's close_notify ended the connection; data
-                    // after it is a genuine (authenticated) peer fault —
-                    // surface it instead of quietly delivering it, as the
-                    // DTLS 1.3 engine does (DTLS-I4).
-                    State::Closed => Err(Error::UnexpectedMessage),
-                    // Read keys exist (client CCS seen) but its Finished
-                    // has not been processed yet: a client only sends
-                    // application data once Connected, so this is a
-                    // record reordered ahead of its Finished — benign
-                    // under UDP, so drop it rather than abort.
-                    _ => Ok(()),
-                }
+                self.note_authenticated(rec.seq, false);
+                self.on_authenticated_record(ContentType::ApplicationData, plain)
             }
             ContentType::Alert => {
                 if self.read_epoch < 1 {
@@ -827,6 +910,52 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 };
                 // AEAD verified: commit to the window only now.
                 self.replay.mark(rec.seq);
+                self.note_authenticated(rec.seq, false);
+                self.on_authenticated_record(ContentType::Alert, plain)
+            }
+            // Unknown / unexpected content type: silent discard.
+            _ => Ok(()),
+        }
+    }
+
+    /// RFC 9146 §6 bookkeeping for an authenticated record at the current
+    /// read epoch (see [`Self::datagram_allows_peer_address_update`]).
+    fn note_authenticated(&mut self, seq: u64, with_cid: bool) {
+        if let Some(cid) = self.cid.as_mut() {
+            cid.note_authenticated(self.read_epoch, seq, with_cid);
+        }
+    }
+
+    /// Dispatches the content of an AEAD-authenticated record by its real
+    /// content type — the header's for an RFC 6347 record, the one from
+    /// inside the envelope for a `tls12_cid` record (RFC 9146 §4). Past
+    /// this point protocol violations come from the genuine peer and are
+    /// fatal.
+    fn on_authenticated_record(&mut self, ct: ContentType, plain: Vec<u8>) -> Result<(), Error> {
+        match ct {
+            ContentType::Handshake => self.process_handshake_record(&plain, true),
+            ContentType::ApplicationData => match self.state {
+                State::Connected => {
+                    // The client only sends application data once it
+                    // has verified our Finished: the final flight is
+                    // implicitly acknowledged.
+                    self.final_flight = None;
+                    self.app_in.extend_from_slice(&plain);
+                    Ok(())
+                }
+                // The peer's close_notify ended the connection; data
+                // after it is a genuine (authenticated) peer fault —
+                // surface it instead of quietly delivering it, as the
+                // DTLS 1.3 engine does (DTLS-I4).
+                State::Closed => Err(Error::UnexpectedMessage),
+                // Read keys exist (client CCS seen) but its Finished
+                // has not been processed yet: a client only sends
+                // application data once Connected, so this is a
+                // record reordered ahead of its Finished — benign
+                // under UDP, so drop it rather than abort.
+                _ => Ok(()),
+            },
+            ContentType::Alert => {
                 // Authenticated, so a malformed alert is a genuine peer
                 // fault (RFC 5246 §7.2: an alert is exactly two bytes).
                 if plain.len() != 2 {
@@ -844,8 +973,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                     Err(Error::AlertReceived(desc))
                 }
             }
-            // Unknown / unexpected content type: silent discard.
-            _ => Ok(()),
+            // A `DTLSInnerPlaintext` naming any other type (a CCS is
+            // never encrypted) is a protocol violation.
+            _ => Err(Error::UnexpectedMessage),
         }
     }
 
@@ -1253,6 +1383,12 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         }
         // ALPN (RFC 7301), decided into a local like everything else here.
         let alpn_pick = super::select_alpn(&self.config.alpn_protocols, &parsed.extensions)?;
+        // Connection IDs (RFC 9146 §3): negotiated only when the client
+        // offered the extension and this server has a CID to receive under.
+        let cid_pick = negotiate_server(
+            self.config.connection_id.as_deref(),
+            ext::find(&parsed.extensions, ExtensionType::CONNECTION_ID),
+        )?;
 
         // RFC 5746 §3.6: echo an empty `renegotiation_info` when the client
         // signalled secure renegotiation — either via the extension (whose
@@ -1293,6 +1429,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.group = Some(group);
         self.ems_negotiated = ems_negotiated;
         self.alpn_negotiated = alpn_pick;
+        // DTLS 1.2 issues no further CIDs, so there is no pool to draw.
+        self.cid = cid_pick.map(|(local, peer)| CidState::negotiated(local, peer, Vec::new()));
         // Initialise the reassembler at expected_msg_seq = msg_seq + 1
         // (the client's next handshake msg after CH).
         let mut reasm = Reassembler::new();
@@ -1370,6 +1508,11 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // signalled secure renegotiation (decided in the validation phase).
         if signalled_reneg {
             sh_exts.push(ext::renegotiation_info_empty());
+        }
+        // RFC 9146 §3: answer the client's `connection_id` offer with the
+        // CID this server receives under.
+        if let Some(cid) = self.cid.as_ref() {
+            sh_exts.push(connection_id_extension(cid.local()));
         }
         let sh = ServerHello {
             random: sr,
@@ -1550,14 +1693,26 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // `record::MAX_RECORDS_PER_EPOCH`). Connection-fatal — no rekey path.
         record::check_seq_cap(self.write_seq_in_epoch)?;
         let combined = ((self.write_epoch as u64) << 48) | self.write_seq_in_epoch;
-        let fragment = crypter.encrypt_dtls(combined, ct, payload)?;
+        // RFC 9146 §3: with a non-empty CID negotiated for this direction,
+        // every protected record is a `tls12_cid` record under the CID
+        // MAC input (§5.3); otherwise the RFC 6347 form is used.
+        let cid = self
+            .cid
+            .as_ref()
+            .map(CidState::peer)
+            .filter(|c| !c.is_empty());
+        let fragment = match cid {
+            Some(cid) => crypter.encrypt_dtls_cid(combined, cid, ct, payload)?,
+            None => crypter.encrypt_dtls(combined, ct, payload)?,
+        };
         let mut out = Vec::new();
-        record::write_record(
+        record::write_record_cid(
             &mut out,
             ct,
             ProtocolVersion::DTLSv1_2,
             self.write_epoch,
             self.write_seq_in_epoch,
+            cid,
             &fragment,
         )?;
         self.write_seq_in_epoch += 1;

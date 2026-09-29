@@ -98,7 +98,9 @@ mod signer;
 pub mod tokio;
 mod version;
 
-pub use config::{ClientAuth, Config, ConfigBuilder, EntropySource, Identity, SigningKey};
+pub use config::{
+    ClientAuth, Config, ConfigBuilder, ConnectionId, EntropySource, Identity, SigningKey,
+};
 #[cfg(test)]
 pub(crate) use conn::ClientCertConfig;
 #[cfg(test)]

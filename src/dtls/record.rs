@@ -18,6 +18,25 @@
 //!
 //! Total header = 13 bytes (vs TLS's 5).
 //!
+//! With a connection ID negotiated (RFC 9146 §4), a protected record uses
+//! the outer content type `tls12_cid` (25) and carries the CID between the
+//! sequence number and the length:
+//!
+//! ```text
+//! struct {
+//!     ContentType    outer_type = tls12_cid;
+//!     ProtocolVersion version;
+//!     uint16         epoch;
+//!     uint48         sequence_number;
+//!     opaque         cid[cid_length];          // length known to the receiver
+//!     uint16         length;
+//!     opaque         enc_content[length];
+//! } DTLSCiphertext;
+//! ```
+//!
+//! The CID length is not on the wire: [`read_record_cid`] takes the length
+//! the receiver negotiated. Plaintext records never use this form.
+//!
 //! This module only frames the opaque payload — record protection (AEAD) is
 //! layered on top in the version-specific connection modules.
 //!
@@ -45,6 +64,11 @@ pub(crate) const MAX_PLAINTEXT_LEN: usize = 1 << 14;
 
 /// Fixed DTLS record header length: 13 bytes.
 pub(crate) const HEADER_LEN: usize = 13;
+
+/// The `tls12_cid` outer content type (RFC 9146 §4, IANA 25): a DTLS 1.2
+/// protected record carrying a connection ID, whose real content type is
+/// inside the encryption envelope. Never used by plaintext records.
+pub(crate) const TLS12_CID_CONTENT_TYPE: u8 = 25;
 
 /// Default ceiling on the size of an emitted record (header included):
 /// RFC 9147 §4.4 recommends staying well inside the 1280-byte IPv6 minimum
@@ -110,6 +134,9 @@ pub(crate) struct ParsedDtlsRecord<'a> {
     pub(crate) epoch: u16,
     /// 48-bit on the wire, widened to `u64` for arithmetic.
     pub(crate) seq: u64,
+    /// The connection ID (RFC 9146 §4) when the outer content type is
+    /// `tls12_cid`; `None` for every other record.
+    pub(crate) cid: Option<&'a [u8]>,
     pub(crate) fragment: &'a [u8],
     /// Total bytes consumed (header + fragment).
     pub(crate) len: usize,
@@ -119,8 +146,26 @@ pub(crate) struct ParsedDtlsRecord<'a> {
 /// `Ok(None)` if more bytes are needed for a complete record.
 ///
 /// The version field is decoded but not validated — each protocol path
-/// applies its own version filter at the call site.
+/// applies its own version filter at the call site. A `tls12_cid` record
+/// is parsed as carrying a zero-length CID (see [`read_record_cid`]).
 pub(crate) fn read_record(buf: &[u8]) -> Result<Option<ParsedDtlsRecord<'_>>, Error> {
+    read_record_cid(buf, 0)
+}
+
+/// [`read_record`] for a connection that receives `cid_len`-byte
+/// connection IDs (RFC 9146 §4): a `tls12_cid` record has its CID read
+/// out from between the sequence number and the length. Every other
+/// content type is framed as in RFC 6347, whatever `cid_len`.
+///
+/// The record does not say how long its CID is, so a `tls12_cid` record
+/// from a peer that negotiated another length is misframed here — and
+/// then dropped by the caller as a CID it does not know, or as a length
+/// that overruns the datagram. Either way the rest of the datagram is
+/// unparseable, which is what RFC 6347 §4.1.2.7 asks for: silent discard.
+pub(crate) fn read_record_cid(
+    buf: &[u8],
+    cid_len: usize,
+) -> Result<Option<ParsedDtlsRecord<'_>>, Error> {
     if buf.len() < HEADER_LEN {
         return Ok(None);
     }
@@ -134,11 +179,21 @@ pub(crate) fn read_record(buf: &[u8]) -> Result<Option<ParsedDtlsRecord<'_>>, Er
         | ((buf[8] as u64) << 16)
         | ((buf[9] as u64) << 8)
         | (buf[10] as u64);
-    let frag_len = u16::from_be_bytes([buf[11], buf[12]]) as usize;
+    // The CID sits between the sequence number and the length field.
+    let (cid, len_off) = if buf[0] == TLS12_CID_CONTENT_TYPE {
+        if buf.len() < HEADER_LEN + cid_len {
+            return Ok(None);
+        }
+        (Some(&buf[11..11 + cid_len]), 11 + cid_len)
+    } else {
+        (None, 11)
+    };
+    let frag_len = u16::from_be_bytes([buf[len_off], buf[len_off + 1]]) as usize;
     if frag_len > MAX_FRAGMENT {
         return Err(Error::RecordOverflow);
     }
-    let total = HEADER_LEN + frag_len;
+    let body_off = len_off + 2;
+    let total = body_off + frag_len;
     if buf.len() < total {
         return Ok(None);
     }
@@ -147,7 +202,8 @@ pub(crate) fn read_record(buf: &[u8]) -> Result<Option<ParsedDtlsRecord<'_>>, Er
         version,
         epoch,
         seq,
-        fragment: &buf[HEADER_LEN..total],
+        cid,
+        fragment: &buf[body_off..total],
         len: total,
     }))
 }
@@ -171,6 +227,22 @@ pub(crate) fn write_record(
     seq: u64,
     fragment: &[u8],
 ) -> Result<(), Error> {
+    write_record_cid(out, ct, version, epoch, seq, None, fragment)
+}
+
+/// [`write_record`] with an optional connection ID: `Some(cid)` writes a
+/// `tls12_cid` record (RFC 9146 §4) — `ct` is then ignored, the real
+/// content type being inside `fragment` — with the CID between the
+/// sequence number and the length. `None` writes an RFC 6347 record.
+pub(crate) fn write_record_cid(
+    out: &mut Vec<u8>,
+    ct: ContentType,
+    version: ProtocolVersion,
+    epoch: u16,
+    seq: u64,
+    cid: Option<&[u8]>,
+    fragment: &[u8],
+) -> Result<(), Error> {
     debug_assert!(
         seq <= SEQ_MASK_48,
         "DTLS sequence numbers are 48-bit; caller must rekey before overflow",
@@ -178,9 +250,16 @@ pub(crate) fn write_record(
     if fragment.len() > MAX_FRAGMENT {
         return Err(Error::RecordOverflow);
     }
+    // RFC 9146 §3: `opaque cid<0..2^8-1>` — a peer never negotiates more.
+    if cid.is_some_and(|c| c.len() > 255) {
+        return Err(Error::IllegalParameter);
+    }
     let seq = seq & SEQ_MASK_48;
 
-    out.push(ct.as_u8());
+    out.push(match cid {
+        Some(_) => TLS12_CID_CONTENT_TYPE,
+        None => ct.as_u8(),
+    });
     out.extend_from_slice(&version.as_u16().to_be_bytes());
     out.extend_from_slice(&epoch.to_be_bytes());
     out.push((seq >> 40) as u8);
@@ -189,6 +268,9 @@ pub(crate) fn write_record(
     out.push((seq >> 16) as u8);
     out.push((seq >> 8) as u8);
     out.push(seq as u8);
+    if let Some(cid) = cid {
+        out.extend_from_slice(cid);
+    }
     // Checked above (MAX_FRAGMENT < 2^16), so the cast cannot truncate.
     out.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
     out.extend_from_slice(fragment);
@@ -234,6 +316,79 @@ mod tests {
         assert_eq!(rec.seq, 42);
         assert_eq!(rec.fragment, b"hi");
         assert_eq!(rec.len, HEADER_LEN + 2);
+    }
+
+    /// RFC 9146 §4: a `tls12_cid` record carries the CID between the
+    /// sequence number and the length, and only a receiver that knows the
+    /// CID length can frame it.
+    #[test]
+    fn cid_record_roundtrip_and_length_dependence() {
+        let mut out = Vec::new();
+        write_record_cid(
+            &mut out,
+            ContentType::ApplicationData,
+            ProtocolVersion::DTLSv1_2,
+            1,
+            7,
+            Some(&[0xc1, 0xd2, 0xe3]),
+            b"body",
+        )
+        .unwrap();
+        let expected: Vec<u8> = vec![
+            25, 0xfe, 0xfd, 0x00, 0x01, 0, 0, 0, 0, 0, 7, 0xc1, 0xd2, 0xe3, 0x00, 0x04, b'b', b'o',
+            b'd', b'y',
+        ];
+        assert_eq!(out, expected);
+        let rec = read_record_cid(&out, 3).unwrap().unwrap();
+        assert_eq!(
+            rec.content_type,
+            ContentType::Unknown(TLS12_CID_CONTENT_TYPE)
+        );
+        assert_eq!(rec.epoch, 1);
+        assert_eq!(rec.seq, 7);
+        assert_eq!(rec.cid, Some(&[0xc1, 0xd2, 0xe3][..]));
+        assert_eq!(rec.fragment, b"body");
+        assert_eq!(rec.len, out.len());
+        // Truncated before the CID / the body: more bytes needed.
+        assert!(read_record_cid(&out[..12], 3).unwrap().is_none());
+        assert!(read_record_cid(&out[..out.len() - 1], 3).unwrap().is_none());
+        // With the wrong CID length the length field is misread: here the
+        // bytes `0xe3 0x00` make a length beyond `MAX_FRAGMENT`, an
+        // error — a shorter misreading would instead run past the
+        // datagram (`None`); the caller drops the datagram either way.
+        assert!(matches!(
+            read_record_cid(&out, 2),
+            Err(Error::RecordOverflow)
+        ));
+        // A non-CID record is unaffected by the receiver's CID length,
+        // and reports no CID.
+        let mut plain = Vec::new();
+        write_record(
+            &mut plain,
+            ContentType::Handshake,
+            ProtocolVersion::DTLSv1_2,
+            0,
+            1,
+            b"hi",
+        )
+        .unwrap();
+        let rec = read_record_cid(&plain, 3).unwrap().unwrap();
+        assert_eq!(rec.cid, None);
+        assert_eq!(rec.fragment, b"hi");
+        // A CID longer than the 8-bit extension length is refused.
+        let mut out = Vec::new();
+        assert!(matches!(
+            write_record_cid(
+                &mut out,
+                ContentType::ApplicationData,
+                ProtocolVersion::DTLSv1_2,
+                1,
+                0,
+                Some(&[0u8; 256]),
+                b"",
+            ),
+            Err(Error::IllegalParameter)
+        ));
     }
 
     #[test]

@@ -29,8 +29,11 @@
 //! before keys are derived) still use the legacy DTLS 1.2 13-byte header
 //! from [`super::record`].
 //!
-//! This commit lands the framing only; the DTLS 1.3 state machine and ACK
-//! reliability layer build on top in subsequent commits.
+//! With a connection ID negotiated (RFC 9146, RFC 9147 §9) the C bit is
+//! set and the CID follows the first byte. Its length is not on the wire:
+//! the receiver parses with the length of the CIDs *it* issued
+//! ([`decode_record`] / [`peek_header_layout`] take it), and the whole
+//! header — CID included — is the AEAD additional data (RFC 9147 §4.2.3).
 
 use crate::cipher::{Aes128, Aes256, BlockCipher, ChaCha20};
 use crate::tls::Error;
@@ -55,9 +58,8 @@ const SEQ_MASK_48: u64 = (1u64 << 48) - 1;
 
 /// Parsed DTLS 1.3 unified record header.
 // A full decode of the unified-header first byte: `is_ciphertext`/`has_length`
-// document the parsed wire form and `has_cid` is reserved for not-yet-supported
-// Connection IDs, so they are retained even though the current record path does
-// not read them back.
+// document the parsed wire form, so they are retained even though the
+// current record path does not read them back.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub(crate) struct UnifiedHeader {
@@ -77,12 +79,34 @@ pub(crate) struct UnifiedHeader {
     /// True if the record carried an explicit length; false means it
     /// occupies the rest of the datagram.
     pub(crate) has_length: bool,
-    /// True if a Connection ID field was present. We don't support CID
-    /// yet — set false in `encode_record`, returning [`Error::IllegalParameter`]
-    /// in `decode_record` if encountered.
+    /// True if a Connection ID field was present (the C bit, RFC 9147
+    /// §4). The CID is then the `cid_len` bytes after the first byte, see
+    /// [`header_cid`].
     pub(crate) has_cid: bool,
-    /// Total bytes consumed by the header (1 + maybe 1/2 seq + maybe 2 len).
+    /// Length of the CID field: the receiver's negotiated length when
+    /// `has_cid`, else 0.
+    pub(crate) cid_len: usize,
+    /// Total bytes consumed by the header (1 + cid + 1/2 seq + maybe 2 len).
     pub(crate) header_len: usize,
+}
+
+/// The connection ID a decoded header carries (empty when the C bit is
+/// clear). `buf` is the buffer the header was decoded from.
+pub(crate) fn header_cid<'a>(buf: &'a [u8], hdr: &UnifiedHeader) -> &'a [u8] {
+    &buf[1..1 + hdr.cid_len]
+}
+
+/// The AEAD additional data of a decoded record: the header bytes prior
+/// to sequence-number masking (RFC 9147 §4.2.3), i.e. `buf[..header_len]`
+/// with `sn_mask` XORed back out of the sequence-number bytes.
+pub(crate) fn header_aad(buf: &[u8], hdr: &UnifiedHeader, sn_mask: &[u8]) -> Vec<u8> {
+    let mut aad = buf[..hdr.header_len].to_vec();
+    let off = 1 + hdr.cid_len;
+    aad[off] ^= sn_mask[0];
+    if hdr.seq_is_16bit {
+        aad[off + 1] ^= sn_mask[1];
+    }
+    aad
 }
 
 /// Reconstructs the full 48-bit sequence number from a wire low-half and
@@ -146,8 +170,10 @@ fn abs_diff(a: u64, b: u64) -> u64 {
 /// `omit_length` must only be true when this record is the LAST one in
 /// its UDP datagram, per RFC 9147 §4.2.
 ///
-/// Connection IDs are not supported in this commit; the `C` bit is always
-/// cleared on output.
+/// A non-empty `cid` sets the `C` bit and is written right after the first
+/// byte (RFC 9147 §4; the peer negotiated it, RFC 9146 §3); an empty one
+/// leaves the bit clear. A CID over 255 bytes cannot have been negotiated
+/// and is refused with [`Error::IllegalParameter`].
 ///
 /// Returns [`Error::RecordOverflow`] when an explicit length is requested
 /// (`omit_length == false`) for a payload that does not fit the 16-bit
@@ -156,18 +182,23 @@ fn abs_diff(a: u64, b: u64) -> u64 {
 /// `as u16` truncation, so a release build emitted a record whose declared
 /// length was smaller than its body — a framing desynchronisation on the
 /// wire.
+#[allow(clippy::too_many_arguments)] // every field of the unified header
 pub(crate) fn encode_record(
     out: &mut Vec<u8>,
     epoch: u16,
     seq: u64,
     seq_is_16bit: bool,
     omit_length: bool,
+    cid: &[u8],
     encrypted_payload: &[u8],
     sn_mask: &[u8],
 ) -> Result<(), Error> {
     debug_assert!(seq <= SEQ_MASK_48, "DTLS seq must fit in 48 bits");
     if !omit_length && encrypted_payload.len() > u16::MAX as usize {
         return Err(Error::RecordOverflow);
+    }
+    if cid.len() > 255 {
+        return Err(Error::IllegalParameter);
     }
     let expected_mask_len = if seq_is_16bit { 2 } else { 1 };
     debug_assert_eq!(
@@ -177,6 +208,9 @@ pub(crate) fn encode_record(
     );
 
     let mut first = UNIFIED_HDR_PREFIX;
+    if !cid.is_empty() {
+        first |= FLAG_CID;
+    }
     if seq_is_16bit {
         first |= FLAG_SEQ_16;
     }
@@ -186,7 +220,8 @@ pub(crate) fn encode_record(
     first |= (epoch as u8) & FLAG_EPOCH_LO2;
     out.push(first);
 
-    // Connection ID: not yet supported — `C` bit stays clear, no bytes emitted.
+    // RFC 9147 §4: the connection ID, when present, follows the first byte.
+    out.extend_from_slice(cid);
 
     if seq_is_16bit {
         let seq_bytes = (seq as u16).to_be_bytes();
@@ -224,9 +259,18 @@ pub(crate) fn encode_record(
 /// The returned ciphertext slice covers `encrypted_payload` exactly: tag
 /// included, header bytes excluded. When the L bit was absent the slice
 /// runs to the end of `buf`.
+///
+/// `cid_len` is the length of the CIDs this receiver issued: a record with
+/// the C bit set carries that many CID bytes after the first byte
+/// (RFC 9147 §4 — the length is not on the wire). With `cid_len == 0` a
+/// record with the C bit set is refused with [`Error::IllegalParameter`]
+/// (RFC 9147 §9: "if no CID is negotiated, then the receiver MUST reject
+/// any records it receives that contain a CID"). Whether the CID is one of
+/// ours is the caller's check ([`header_cid`]).
 pub(crate) fn decode_record<'a>(
     buf: &'a [u8],
     sn_mask: &[u8],
+    cid_len: usize,
 ) -> Result<(UnifiedHeader, &'a [u8]), Error> {
     if buf.is_empty() {
         return Err(Error::Decode);
@@ -236,10 +280,10 @@ pub(crate) fn decode_record<'a>(
         return Err(Error::Decode);
     }
     let has_cid = (first & FLAG_CID) != 0;
-    if has_cid {
-        // RFC 9146 connection IDs are out of scope for this commit.
+    if has_cid && cid_len == 0 {
         return Err(Error::IllegalParameter);
     }
+    let cid_len = if has_cid { cid_len } else { 0 };
     let seq_is_16bit = (first & FLAG_SEQ_16) != 0;
     let has_length = (first & FLAG_LENGTH) != 0;
     let epoch_low2 = first & FLAG_EPOCH_LO2;
@@ -249,17 +293,18 @@ pub(crate) fn decode_record<'a>(
         return Err(Error::Decode);
     }
     let len_bytes = if has_length { 2usize } else { 0usize };
-    let header_len = 1 + seq_bytes + len_bytes;
+    let header_len = 1 + cid_len + seq_bytes + len_bytes;
     if buf.len() < header_len {
         return Err(Error::Decode);
     }
 
+    let seq_off = 1 + cid_len;
     let seq_low = if seq_is_16bit {
-        let hi = buf[1] ^ sn_mask[0];
-        let lo = buf[2] ^ sn_mask[1];
+        let hi = buf[seq_off] ^ sn_mask[0];
+        let lo = buf[seq_off + 1] ^ sn_mask[1];
         ((hi as u16) << 8) | (lo as u16)
     } else {
-        (buf[1] ^ sn_mask[0]) as u16
+        (buf[seq_off] ^ sn_mask[0]) as u16
     };
     // Declassified (Valgrind harness): sequence-number encryption hides the
     // number from on-path observers only (RFC 9147 §4.2.3); the receiving
@@ -269,7 +314,7 @@ pub(crate) fn decode_record<'a>(
 
     let body_start = header_len;
     let body_end = if has_length {
-        let off = 1 + seq_bytes;
+        let off = seq_off + seq_bytes;
         let len = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
         let end = body_start + len;
         if end > buf.len() {
@@ -288,6 +333,7 @@ pub(crate) fn decode_record<'a>(
             seq_is_16bit,
             has_length,
             has_cid,
+            cid_len,
             header_len,
         },
         &buf[body_start..body_end],
@@ -299,8 +345,8 @@ pub(crate) fn decode_record<'a>(
 /// Returns `(header_len, body_len)` where `body_len` is the explicit
 /// length when L=1 or `buf.len() - header_len` when L=0. Used by callers
 /// that need to locate the ciphertext to compute the sn_mask before they
-/// can finish decoding.
-pub(crate) fn peek_header_layout(buf: &[u8]) -> Result<(usize, usize), Error> {
+/// can finish decoding. `cid_len` is as for [`decode_record`].
+pub(crate) fn peek_header_layout(buf: &[u8], cid_len: usize) -> Result<(usize, usize), Error> {
     if buf.is_empty() {
         return Err(Error::Decode);
     }
@@ -308,19 +354,21 @@ pub(crate) fn peek_header_layout(buf: &[u8]) -> Result<(usize, usize), Error> {
     if (first & UNIFIED_HDR_PREFIX_MASK) != UNIFIED_HDR_PREFIX {
         return Err(Error::Decode);
     }
-    if (first & FLAG_CID) != 0 {
+    let has_cid = (first & FLAG_CID) != 0;
+    if has_cid && cid_len == 0 {
         return Err(Error::IllegalParameter);
     }
+    let cid_len = if has_cid { cid_len } else { 0 };
     let seq_is_16bit = (first & FLAG_SEQ_16) != 0;
     let has_length = (first & FLAG_LENGTH) != 0;
     let seq_bytes = if seq_is_16bit { 2 } else { 1 };
     let len_bytes = if has_length { 2 } else { 0 };
-    let header_len = 1 + seq_bytes + len_bytes;
+    let header_len = 1 + cid_len + seq_bytes + len_bytes;
     if buf.len() < header_len {
         return Err(Error::Decode);
     }
     let body_len = if has_length {
-        let off = 1 + seq_bytes;
+        let off = 1 + cid_len + seq_bytes;
         let len = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
         if header_len + len > buf.len() {
             return Err(Error::Decode);
@@ -426,7 +474,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 2];
         let ct = dummy_ct();
-        encode_record(&mut out, 1, 42, true, false, &ct, &mask).unwrap();
+        encode_record(&mut out, 1, 42, true, false, &[], &ct, &mask).unwrap();
 
         // first byte: 001_C=0_S=1_L=1_EE=01 = 0b0010_1101 = 0x2D
         assert_eq!(out[0], 0b0010_1101);
@@ -436,7 +484,7 @@ mod tests {
         assert_eq!(&out[3..5], &[0x00, 0x20]);
         assert_eq!(&out[5..], ct.as_slice());
 
-        let (hdr, body) = decode_record(&out, &mask).unwrap();
+        let (hdr, body) = decode_record(&out, &mask, 0).unwrap();
         assert!(hdr.is_ciphertext);
         assert_eq!(hdr.epoch_low2, 0b01);
         assert!(hdr.seq_is_16bit);
@@ -452,7 +500,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 1];
         let ct = dummy_ct();
-        encode_record(&mut out, 2, 0x0055, false, false, &ct, &mask).unwrap();
+        encode_record(&mut out, 2, 0x0055, false, false, &[], &ct, &mask).unwrap();
 
         // first byte: 001_0_0_1_10 — S=0, L=1, EE=10 — = 0b0010_0110 = 0x26
         assert_eq!(out[0], 0b0010_0110);
@@ -460,7 +508,7 @@ mod tests {
         assert_eq!(&out[2..4], &[0x00, 0x20]);
         assert_eq!(&out[4..], ct.as_slice());
 
-        let (hdr, body) = decode_record(&out, &mask).unwrap();
+        let (hdr, body) = decode_record(&out, &mask, 0).unwrap();
         assert_eq!(hdr.epoch_low2, 0b10);
         assert!(!hdr.seq_is_16bit);
         assert_eq!(hdr.seq_low, 0x55);
@@ -475,7 +523,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 2];
         let ct = dummy_ct();
-        encode_record(&mut out, 0, 7, true, true, &ct, &mask).unwrap();
+        encode_record(&mut out, 0, 7, true, true, &[], &ct, &mask).unwrap();
 
         // first byte: 001 0_0_0_00 with S=1 -> 0b0010_1000 = 0x28
         assert_eq!(out[0], 0b0010_1000);
@@ -484,7 +532,7 @@ mod tests {
         assert_eq!(&out[3..], ct.as_slice());
         assert_eq!(out.len(), 1 + 2 + ct.len());
 
-        let (hdr, body) = decode_record(&out, &mask).unwrap();
+        let (hdr, body) = decode_record(&out, &mask, 0).unwrap();
         assert!(!hdr.has_length);
         assert!(hdr.seq_is_16bit);
         assert_eq!(hdr.seq_low, 7);
@@ -492,26 +540,96 @@ mod tests {
         assert_eq!(body, ct.as_slice());
     }
 
+    /// RFC 9147 §9: with no CID negotiated (`cid_len == 0`) a record with
+    /// the C bit set is rejected, by both entry points.
     #[test]
-    fn cid_bit_rejected() {
+    fn cid_bit_rejected_without_negotiated_cid() {
         // C bit set; rest doesn't matter.
         let bad = vec![0b0011_0101u8, 0, 0, 0, 0];
-        match decode_record(&bad, &[0u8; 2]) {
+        match decode_record(&bad, &[0u8; 2], 0) {
             Err(Error::IllegalParameter) => {}
             other => panic!("expected IllegalParameter, got {other:?}"),
         }
         // peek_header_layout enforces the same rule.
-        match peek_header_layout(&bad) {
+        match peek_header_layout(&bad, 0) {
             Err(Error::IllegalParameter) => {}
             other => panic!("expected IllegalParameter, got {other:?}"),
         }
+    }
+
+    /// RFC 9147 §4: the CID follows the first byte, the sequence number and
+    /// length come after it, and the additional data is the whole header
+    /// with the sequence number unmasked. The CID length is the receiver's
+    /// knowledge: the same bytes parse differently under another length.
+    #[test]
+    fn cid_header_roundtrip_and_aad() {
+        let mut out = Vec::new();
+        let mask = [0xAA, 0x55];
+        let ct = dummy_ct();
+        let cid = [0xc1, 0xd2, 0xe3];
+        encode_record(&mut out, 3, 0x1234, true, false, &cid, &ct, &mask).unwrap();
+        // first byte: 001_C=1_S=1_L=1_EE=11 = 0b0011_1111
+        assert_eq!(out[0], 0b0011_1111);
+        assert_eq!(&out[1..4], &cid);
+        assert_eq!(&out[4..6], &[0x12 ^ 0xAA, 0x34 ^ 0x55]);
+        assert_eq!(&out[6..8], &[0x00, 0x20]);
+        assert_eq!(&out[8..], ct.as_slice());
+
+        let (hdr_len, body_len) = peek_header_layout(&out, 3).unwrap();
+        assert_eq!((hdr_len, body_len), (8, ct.len()));
+        let (hdr, body) = decode_record(&out, &mask, 3).unwrap();
+        assert!(hdr.has_cid);
+        assert_eq!(hdr.cid_len, 3);
+        assert_eq!(hdr.header_len, 8);
+        assert_eq!(hdr.seq_low, 0x1234);
+        assert_eq!(header_cid(&out, &hdr), &cid);
+        assert_eq!(body, ct.as_slice());
+        let aad = header_aad(&out, &hdr, &mask);
+        assert_eq!(aad, [0b0011_1111, 0xc1, 0xd2, 0xe3, 0x12, 0x34, 0x00, 0x20]);
+
+        // Under a 2-byte CID length the length field is read from the
+        // wrong place: here `0xe3 0x??` claims a body far longer than the
+        // buffer, which is a decode error.
+        assert!(matches!(decode_record(&out, &mask, 2), Err(Error::Decode)));
+        // A CID-less record parses the same whatever the receiver's length.
+        let mut plain = Vec::new();
+        encode_record(&mut plain, 3, 0x1234, true, false, &[], &ct, &mask).unwrap();
+        let (hdr, _) = decode_record(&plain, &mask, 3).unwrap();
+        assert!(!hdr.has_cid);
+        assert_eq!(hdr.cid_len, 0);
+        assert_eq!(hdr.header_len, 5);
+        assert!(header_cid(&plain, &hdr).is_empty());
+        // 8-bit sequence number with a CID: the seq byte sits after the CID.
+        let mut out8 = Vec::new();
+        encode_record(&mut out8, 1, 0x77, false, true, &cid, &ct, &[0x0F]).unwrap();
+        assert_eq!(out8[4], 0x77 ^ 0x0F);
+        let (hdr, body) = decode_record(&out8, &[0x0F], 3).unwrap();
+        assert_eq!(hdr.seq_low, 0x77);
+        assert_eq!(hdr.header_len, 5);
+        assert_eq!(body, ct.as_slice());
+        assert_eq!(header_aad(&out8, &hdr, &[0x0F])[4], 0x77);
+        // A CID the extension could never have carried is refused.
+        let mut too_long = Vec::new();
+        assert!(matches!(
+            encode_record(&mut too_long, 1, 1, true, false, &[0u8; 256], &ct, &mask),
+            Err(Error::IllegalParameter)
+        ));
+        // Truncated inside the CID field.
+        assert!(matches!(
+            decode_record(&out[..3], &mask, 3),
+            Err(Error::Decode)
+        ));
+        assert!(matches!(
+            peek_header_layout(&out[..3], 3),
+            Err(Error::Decode)
+        ));
     }
 
     #[test]
     fn non_dtls13_prefix_rejected() {
         // First three bits != 001.
         let bad = vec![0b1010_0101u8, 0, 0, 0, 0];
-        match decode_record(&bad, &[0u8; 2]) {
+        match decode_record(&bad, &[0u8; 2], 0) {
             Err(Error::Decode) => {}
             other => panic!("expected Decode, got {other:?}"),
         }
@@ -523,10 +641,10 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 2];
         let ct = dummy_ct();
-        encode_record(&mut out, 0, 1, true, false, &ct, &mask).unwrap();
+        encode_record(&mut out, 0, 1, true, false, &[], &ct, &mask).unwrap();
         // Drop the last byte of the ciphertext.
         out.pop();
-        match decode_record(&out, &mask) {
+        match decode_record(&out, &mask, 0) {
             Err(Error::Decode) => {}
             other => panic!("expected Decode, got {other:?}"),
         }
@@ -634,11 +752,11 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0xAA, 0x55];
         let ct = dummy_ct();
-        encode_record(&mut out, 3, 0x1234, true, false, &ct, &mask).unwrap();
+        encode_record(&mut out, 3, 0x1234, true, false, &[], &ct, &mask).unwrap();
 
         // On the wire the seq bytes are 0x12^0xAA, 0x34^0x55 = 0xB8, 0x61.
         assert_eq!(&out[1..3], &[0xB8, 0x61]);
-        let (hdr, body) = decode_record(&out, &mask).unwrap();
+        let (hdr, body) = decode_record(&out, &mask, 0).unwrap();
         assert_eq!(hdr.seq_low, 0x1234);
         assert_eq!(body, ct.as_slice());
     }
@@ -648,16 +766,16 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 2];
         let ct = dummy_ct();
-        encode_record(&mut out, 0, 9, true, false, &ct, &mask).unwrap();
+        encode_record(&mut out, 0, 9, true, false, &[], &ct, &mask).unwrap();
 
-        let (hdr_len, body_len) = peek_header_layout(&out).unwrap();
+        let (hdr_len, body_len) = peek_header_layout(&out, 0).unwrap();
         assert_eq!(hdr_len, 5);
         assert_eq!(body_len, ct.len());
 
         // L=0 path: body_len = remaining datagram bytes.
         let mut out2 = Vec::new();
-        encode_record(&mut out2, 0, 9, true, true, &ct, &mask).unwrap();
-        let (hdr_len2, body_len2) = peek_header_layout(&out2).unwrap();
+        encode_record(&mut out2, 0, 9, true, true, &[], &ct, &mask).unwrap();
+        let (hdr_len2, body_len2) = peek_header_layout(&out2, 0).unwrap();
         assert_eq!(hdr_len2, 3);
         assert_eq!(body_len2, ct.len());
     }
@@ -668,6 +786,6 @@ mod tests {
     fn encode_panics_on_oversized_seq() {
         let mut out = Vec::new();
         let mask = [0u8; 2];
-        encode_record(&mut out, 0, 1u64 << 48, true, false, b"", &mask).unwrap();
+        encode_record(&mut out, 0, 1u64 << 48, true, false, &[], b"", &mask).unwrap();
     }
 }
