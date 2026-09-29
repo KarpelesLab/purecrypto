@@ -316,7 +316,7 @@ update with the commands in `tools/wycheproof/README.md`.
   external peer for purecrypto's DTLS 1.2 after OpenSSL and wolfSSL, and
   the second for RFC 9146 connection IDs (`dtls=1 force_version=dtls12`,
   `cid=1 cid_val=HEX` on both programs; the summary's `Peer CID (length N
-  Bytes): …` is the purecrypto side's CID). 72 of the 248 DTLS 1.2 cases
+  Bytes): …` is the purecrypto side's CID). 90 of the 256 DTLS 1.2 cases
   run:
 
   | Case | Mbed TLS 4.2.0, DTLS 1.2 (C / S) |
@@ -331,7 +331,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | RFC 5077 session resumption (the client's `reconnect=1`; its debug log shows the abbreviated handshake) | ✅ / ✅ |
   | Resumption with the resumed handshake's final flight lost once (`resume-loss`) | ✅ / ✅ |
   | HelloRetryRequest, KeyUpdate, 0-RTT | — (none in DTLS 1.2) |
-  | mTLS | ⏭ purecrypto's DTLS servers do not verify client certificates |
+  | mTLS, RSA-2048 / P-256 / P-384 client certificate (Ed25519 and ML-DSA-65: ⏭ Mbed TLS has neither) | ✅ / ✅ |
 
   No purecrypto defect surfaced against Mbed TLS. One tool behaviour is
   worked around on the peer side: `ssl_server2` answers one request per
@@ -591,7 +591,7 @@ update with the commands in `tools/wycheproof/README.md`.
   Certificate / CertificateVerify wrap the ClientKeyExchange), and a
   handshake through a relay dropping 20 % of the datagrams in each
   direction (ACK-driven retransmission on 1.3, whole flights on 1.2), and
-  resumption (RFC 5077 tickets on 1.2; PSK and 0-RTT on 1.3). NNN
+  resumption (RFC 5077 tickets on 1.2; PSK and 0-RTT on 1.3). 786
   cases; `C` / `S` as above, `⏭` a SKIP with the reason:
 
   | Case | TLS 1.3 (C / S) | DTLS 1.3 (C / S) | DTLS 1.2 (C / S) |
