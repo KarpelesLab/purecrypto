@@ -1439,6 +1439,17 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             .copied()
             .find(|p| parsed.cipher_suites.contains(&p.suite) && p.sig_kind == sig_kind)
             .ok_or(Error::HandshakeFailure)?;
+        // RFC 5246 §7.4.1.4.1: a (D)TLS 1.2 ClientHello MUST carry
+        // `signature_algorithms`, and §7.4.3 has the ServerKeyExchange
+        // signed under a pair "present in the signature_algorithms
+        // extension" — the scheme this key signs under has to be one the
+        // client offered, or the client has no verifier for it. Without
+        // the extension the default would be SHA-1 pairs, which this server
+        // does not sign; mirrors `src/tls/conn/server12.rs`.
+        let sig_algs = ext::find(&parsed.extensions, ExtensionType::SIGNATURE_ALGORITHMS)
+            .ok_or(Error::HandshakeFailure)?;
+        let offered = ext::parse_signature_algorithms(sig_algs)?;
+        let ske_scheme = signature_scheme(&self.config.key, &offered)?;
         // Pick the negotiated ECDHE group: the first of this server's
         // groups (its preference order, default X25519 > P-256 > P-384,
         // mirroring `src/tls/conn/server12.rs::on_client_hello_initial`)
@@ -1634,7 +1645,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // `src/tls/conn/server12.rs::send_server_key_exchange`.
         let cr = self.client_random.expect("set above");
         let to_sign = signed_message(&cr, &sr, group, &our_point);
-        let scheme = signature_scheme(&self.config.key).ok_or(Error::UnsupportedKeyType)?;
+        let scheme = ske_scheme;
         let signature: Vec<u8> = match &self.config.key {
             ServerKey::Rsa(k) | ServerKey::RsaPss(k, _) => {
                 crate::tls::crypto::sign::sign_rsa_pss(k, scheme, &to_sign, &mut self.rng)?
@@ -2275,32 +2286,82 @@ fn build_certificate_msg(chain: &[Vec<u8>]) -> Vec<u8> {
 /// IANA registry); for RSA we use `rsa_pss_rsae_sha256`, the modern default
 /// for TLS 1.2 + 1.3 interop.
 ///
-/// `None` when the key has no DTLS 1.2 scheme: the RFC 8734 Brainpool code
-/// points are TLS 1.3 only (§2: "MUST NOT be used in TLS 1.2"), secp256k1 /
-/// SM2 have none at all, and ML-DSA is not specified for the version. The
-/// caller turns that into `Error::UnsupportedKeyType` rather than signing
-/// under a code point the client would reject. An EdDSA key signs under its
-/// own scheme (RFC 8422 §5.9: an Ed25519 key "MUST use the ed25519
-/// signature algorithm", an Ed448 key `ed448`).
-fn signature_scheme(key: &ServerKey) -> Option<SignatureScheme> {
-    match key {
+/// `Error::UnsupportedKeyType` when the key has no DTLS 1.2 scheme: the RFC
+/// 8734 Brainpool code points are TLS 1.3 only (§2: "MUST NOT be used in
+/// TLS 1.2"), secp256k1 / SM2 have none at all, and ML-DSA is not specified
+/// for the version — a configuration error, not something to sign under a
+/// code point the client would reject. `Error::HandshakeFailure` when the
+/// key's scheme is not among the ones the client `offered` (RFC 5246
+/// §7.4.3). An EdDSA key signs under its own scheme (RFC 8422 §5.9: an
+/// Ed25519 key "MUST use the ed25519 signature algorithm", an Ed448 key
+/// `ed448`); an external key under the first of its advertised schemes
+/// that DTLS 1.2 defines and the client offered.
+fn signature_scheme(
+    key: &ServerKey,
+    offered: &[SignatureScheme],
+) -> Result<SignatureScheme, Error> {
+    let own = match key {
         ServerKey::Rsa(_) => Some(SignatureScheme::RSA_PSS_RSAE_SHA256),
         ServerKey::RsaPss(_, hash) => Some(crate::tls::crypto::sign::rsa_pss_pss_scheme(*hash)),
         ServerKey::Ecdsa(k) => crate::tls::crypto::sign::tls_signature_scheme_for_curve(k.curve())
             .filter(|s| !s.is_brainpool_tls13()),
         ServerKey::Ed25519(_) => Some(SignatureScheme::ED25519),
         ServerKey::Ed448(_) => Some(SignatureScheme::ED448),
-        // External key: the caller advertises the scheme(s); use the
-        // preferred one that DTLS 1.2 defines.
+        ServerKey::External { schemes } => {
+            let mut usable = schemes
+                .iter()
+                .copied()
+                .filter(|s| crate::tls::crypto::sign::is_tls12_signature_scheme(*s))
+                .peekable();
+            if usable.peek().is_none() {
+                return Err(Error::UnsupportedKeyType);
+            }
+            return usable
+                .find(|s| offered.contains(s))
+                .ok_or(Error::HandshakeFailure);
+        }
+        // ML-DSA: nothing specifies it for (D)TLS 1.2.
+        #[cfg(feature = "mldsa")]
+        ServerKey::MlDsa44(_) | ServerKey::MlDsa65(_) | ServerKey::MlDsa87(_) => None,
+    };
+    let own = own.ok_or(Error::UnsupportedKeyType)?;
+    if offered.contains(&own) {
+        Ok(own)
+    } else {
+        Err(Error::HandshakeFailure)
+    }
+}
+
+/// The scheme [`signature_scheme`] would pick for `key` before any client
+/// offer is known — what suite selection needs to know the key's family.
+fn own_signature_scheme(key: &ServerKey) -> Option<SignatureScheme> {
+    match key {
+        // Every scheme the key could sign under is of one family; the
+        // first is as good as any for that.
         ServerKey::External { schemes } => schemes
             .iter()
             .copied()
             .find(|s| crate::tls::crypto::sign::is_tls12_signature_scheme(*s)),
-        // ML-DSA: nothing specifies it for (D)TLS 1.2.
-        #[cfg(feature = "mldsa")]
-        ServerKey::MlDsa44(_) | ServerKey::MlDsa65(_) | ServerKey::MlDsa87(_) => None,
+        _ => signature_scheme(key, &ALL_TLS12_SCHEMES).ok(),
     }
 }
+
+/// Every code point [`crate::tls::crypto::sign::is_tls12_signature_scheme`]
+/// admits that this server could sign under, as an "offer" that never
+/// narrows [`signature_scheme`].
+const ALL_TLS12_SCHEMES: [SignatureScheme; 11] = [
+    SignatureScheme::RSA_PSS_RSAE_SHA256,
+    SignatureScheme::RSA_PSS_RSAE_SHA384,
+    SignatureScheme::RSA_PSS_RSAE_SHA512,
+    SignatureScheme::RSA_PSS_PSS_SHA256,
+    SignatureScheme::RSA_PSS_PSS_SHA384,
+    SignatureScheme::RSA_PSS_PSS_SHA512,
+    SignatureScheme::ECDSA_SECP256R1_SHA256,
+    SignatureScheme::ECDSA_SECP384R1_SHA384,
+    SignatureScheme::ECDSA_SECP521R1_SHA512,
+    SignatureScheme::ED25519,
+    SignatureScheme::ED448,
+];
 
 /// The signature family of an IANA `SignatureScheme` code point, for DTLS 1.2
 /// `ECDHE-*` suite selection: the ECDSA and EdDSA code points map to
@@ -2328,7 +2389,7 @@ fn sig_kind_for_key(key: &ServerKey) -> SigKind {
         // will sign under, so the matching `ECDHE-RSA-*` / `ECDHE-ECDSA-*`
         // suites are offered.
         ServerKey::External { .. } => {
-            signature_scheme(key).map_or(SigKind::Rsa, sig_kind_from_scheme)
+            own_signature_scheme(key).map_or(SigKind::Rsa, sig_kind_from_scheme)
         }
         // ML-DSA has no DTLS 1.2 scheme (`signature_scheme` refuses it before
         // any suite is used); the family is immaterial.

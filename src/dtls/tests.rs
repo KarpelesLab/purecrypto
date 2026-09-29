@@ -3110,6 +3110,62 @@ mod dtls12 {
             assert_eq!(client.take_received(), b"pong-eddsa");
         }
     }
+
+    /// RFC 5246 §7.4.3: the server signs its ServerKeyExchange only under a
+    /// scheme the ClientHello's `signature_algorithms` listed. The DTLS
+    /// 1.2 server used to skip the extension altogether and sign under its
+    /// key's scheme regardless; a client without `ed25519` in its list —
+    /// this one's first entry rewritten to a duplicate ECDSA pair — gets no
+    /// ServerHello from an Ed25519 server (the rejection is a silent drop,
+    /// like every other pre-cookie one), and none without the extension.
+    #[test]
+    fn server_signs_only_under_an_offered_scheme() {
+        use crate::ec::Ed25519PrivateKey;
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"dtls12-eddsa-unoffered", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut rng);
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &DistinguishedName::common_name("dtls.example"),
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        let server_cfg = PcServerConfig12::with_ed25519(alloc::vec![cert.clone()], key)
+            .require_cookie_exchange(false);
+        let server_cfg = Arc::new(server_cfg);
+
+        // The ClientHello's `signature_algorithms` (type 0x000d) opens with
+        // ed25519 (0x0807): overwrite that entry with ecdsa_secp256r1_sha256
+        // (already listed; a duplicate is harmless).
+        let mut client = make_client(&cert);
+        let mut ch = client.pop_outbound_datagrams().remove(0);
+        let ext = ch
+            .windows(8)
+            .position(|w| w[..2] == [0x00, 0x0d] && w[6..8] == [0x08, 0x07])
+            .expect("signature_algorithms with ed25519 first");
+        ch[ext + 6..ext + 8].copy_from_slice(&[0x04, 0x03]);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-unoffered", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(server_cfg.clone(), b"client-addr".to_vec(), srng);
+        server.feed_datagram(&ch).unwrap();
+        assert!(server.pop_outbound_datagrams().is_empty());
+        assert!(!server.is_handshake_complete());
+
+        // Whereas the unmodified offer is served.
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-offered", b"nonce", &[]);
+        let mut server = DtlsServerConnection12::new(server_cfg, b"client-addr".to_vec(), srng);
+        assert!(pump(&mut client, &mut server));
+        assert_eq!(client.peer_signature_scheme(), Some(0x0807));
+    }
 }
 
 /// Regression tests for the DTLS security audit (2026-09).
