@@ -74,7 +74,8 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
 | `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8, Apple's Network.framework and wolfSSL 5.9, both roles** (CI: certs × groups × suites, resumption (incl. PSK-only), external PSK, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
 | `dtls` | RFC 6347 (1.2), RFC 9147 (1.3), RFC 9146 (connection IDs) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, fragmentation at two MTUs, a lossy path, connection IDs); **DTLS 1.2 vs Mbed TLS 4.2, both roles** (CI: certs × groups × suites, ALPN, a lossy path, connection IDs) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
-| `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
+| `quic` | RFC 9000/9001/9002/9221/9368/9369 | loopback | loopback; **QUIC v1 + v2 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
+
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
 | `signature_registry` | — (X.509/TLS dispatch) | via primitives | via X.509/TLS | — | delegates |
 | `ffi` | — (C ABI) | unit (C-boundary) | — | — | delegates; panic-catching |
@@ -636,7 +637,7 @@ update with the commands in `tools/wycheproof/README.md`.
   close_notify, and the two commands drive the connection until the
   handshake is over on both sides. The `loss-final` cases lose exactly
   those datagrams, deterministically.
-- **quic-go and OpenSSL, QUIC v1** (CI job `interop-quic.yml`, script
+- **quic-go and OpenSSL, QUIC v1 + v2** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server
   (`tools/quic-interop/quicgo`, quic-go pinned in its `go.mod`) in **both
@@ -662,7 +663,11 @@ update with the commands in `tools/wycheproof/README.md`.
   | DATAGRAM frames (RFC 9221), four each way | ✅ | ✅ | — |
   | Client migration to a new socket (§9; path validation both ways) | ✅ | ✅ | — |
   | Connection-ID switch + RETIRE_CONNECTION_ID (§5.1.2) | ✅ | ✅ | — |
-  | Version negotiation (client offers v2 first) | — (the client speaks v1 only and cannot offer another version; VN handling is unit-tested) | ✅ | — |
+  | Plain QUIC v2 (RFC 9369; both sides settle on v2) | ✅ (`version=v2`, quic-go `version=6b3343cf`) | ✅ | — (OpenSSL's QUIC client is v1-only) |
+  | Incompatible version negotiation (peer v1-only → VN → restart on v1, RFC 9000 §6 / RFC 9368 §2.1) | ✅ (client offers v2 first, restarts on v1) | ✅ (`version negotiation sent`, quic-go opens a second trace) | — |
+  | Retry (RFC 9000 §8.1.2) under v2 (v2 Retry integrity tag, RFC 9369 §3.3.3; version-bound token) | ✅ (`retry=yes version=v2`) | — | — |
+  | Resumption + 0-RTT under v2 (RFC 9369 §5 version-bound ticket) | ✅ (`version=v2 resumed=yes`, 0-RTT accepted) | — | — |
+  | Key update under v2 (RFC 9369 §3.3.2 `quicv2 ku`) | skipped vs quic-go: quic-go v0.63 derives the update secret with the v1 `quic ku` label regardless of version (`internal/handshake/updatable_aead.go`), so it cannot decrypt a conformant v2 update; covered pc↔pc (loopback test + RFC 9369 §A.5 `quicv2 ku` vector + the ct_valgrind v2 arm) | — | — |
   | Stateless reset (§10.3; server restarted with the same reset key) | ✅ | ✅ | — |
   | ECN validation (§13.4; both sides report the path capable) | ✅ (Linux) | ✅ (Linux) | — |
   | X25519MLKEM768 key exchange | ✅ | ✅ | ✅ |
@@ -706,7 +711,8 @@ update with the commands in `tools/wycheproof/README.md`.
   (`sni=encrypted`), and a corrupted config is rejected with `retry_configs`
   equal to the published list. That check needs the network and is not in CI.
 - **Loopback** (own client ↔ own server, all platforms): TLS 1.2/1.3, DTLS
-  1.2/1.3, QUIC v1.
+  1.2/1.3, QUIC v1 and v2 (including RFC 9368 compatible and incompatible
+  version negotiation).
 
 ## Fuzzing
 
@@ -1046,9 +1052,9 @@ code site:
   wolfSSL and Mbed TLS in both roles, DTLS 1.3 against wolfSSL in both
   roles (one peer so far — OpenSSL exposes no `-dtls1_3` client), RFC 9146
   connection IDs against wolfSSL (DTLS 1.2 and 1.3) and Mbed TLS (DTLS
-  1.2), QUIC v1 against
-  quic-go in both roles and against OpenSSL's QUIC client. QUIC v1 ships
-  without QUIC v2 (RFC 9369) and without HTTP/3.
+  1.2), and QUIC v1 + v2 (RFC 9369) with RFC 9368 version negotiation
+  against quic-go in both roles, plus QUIC v1 against OpenSSL's (v1-only)
+  QUIC client. QUIC ships without HTTP/3.
 - **Hazmat**: the `hazmat-*` features expose low-level arithmetic with **no
   semver and no constant-time guarantee** — the caller owns correctness and CT.
 - **Scope**: the crate is primitives + TLS/PKI plumbing (OpenSSL-like). Threshold
