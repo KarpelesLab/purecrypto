@@ -13,6 +13,8 @@ use crate::quic::cid::{CidPair, ConnectionId};
 use crate::quic::crypto::{AeadAlg, derive_dir_keys, derive_initial_secrets};
 use crate::quic::endpoint::Endpoint;
 use crate::quic::tls_glue::{HookHandle, build_hooks};
+use crate::quic::transport_params::TransportParameters;
+use crate::quic::version::QuicVersion;
 use crate::rng::OsRng;
 use crate::tls::Error;
 use crate::tls::codec::{CipherSuite, NamedGroup};
@@ -72,23 +74,28 @@ pub(crate) fn offered_cipher_suites(
 
 /// Builds the Initial-level [`crate::quic::endpoint::Endpoint`] for a new
 /// client connection: picks `our_scid`, derives Initial secrets from
-/// `peer_dcid` (RFC 9001 §5.2), installs the Initial-level AEAD keys, and
-/// records the CID pair. `peer_dcid` is the client's *chosen* DCID, which
-/// the server will see as the DCID on the first Initial — and which also
-/// keys both directions' Initial AEAD per RFC 9001 §5.2.
+/// `peer_dcid` (RFC 9001 §5.2) for `version` (the first flight's), installs
+/// the Initial-level AEAD keys, and records the CID pair. `peer_dcid` is the
+/// client's *chosen* DCID, which the server will see as the DCID on the
+/// first Initial — and which also keys both directions' Initial AEAD per
+/// RFC 9001 §5.2.
 ///
 /// Returns the constructed `Endpoint`, ready to be wrapped in a
 /// [`crate::quic::QuicConnection`].
-pub(crate) fn build_initial_endpoint(peer_dcid: ConnectionId, our_scid: ConnectionId) -> Endpoint {
-    let (client_secret, server_secret) = derive_initial_secrets(peer_dcid.as_slice());
+pub(crate) fn build_initial_endpoint(
+    version: QuicVersion,
+    peer_dcid: ConnectionId,
+    our_scid: ConnectionId,
+) -> Endpoint {
+    let (client_secret, server_secret) = derive_initial_secrets(version, peer_dcid.as_slice());
 
     // Client Tx uses the "client in" secret; client Rx uses "server in"
     // (RFC 9001 §5.2).
     let mut ep = Endpoint::new(CidPair::new(peer_dcid, our_scid));
     ep.crypto.levels[Level::Initial as usize].tx =
-        Some(derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret));
+        Some(derive_dir_keys(version, AeadAlg::Aes128Gcm, &client_secret));
     ep.crypto.levels[Level::Initial as usize].rx =
-        Some(derive_dir_keys(AeadAlg::Aes128Gcm, &server_secret));
+        Some(derive_dir_keys(version, AeadAlg::Aes128Gcm, &server_secret));
     ep
 }
 
@@ -107,7 +114,7 @@ pub(crate) fn build_initial_endpoint(peer_dcid: ConnectionId, our_scid: Connecti
 pub(crate) fn build_tls_engine(
     tls_cfg: ClientConfig,
     server_name: &str,
-    transport_params: Vec<u8>,
+    transport_params: TransportParameters,
 ) -> Result<(ClientConnection, HookHandle), Error> {
     let (hooks, handle) = build_hooks(transport_params);
     let suites = offered_cipher_suites(&tls_cfg.cipher_suites)?;
@@ -123,6 +130,21 @@ pub(crate) fn build_tls_engine(
         hooks as Box<_>,
     )?;
     Ok((engine, handle))
+}
+
+/// The client's `(tx, rx)` Initial keys for its chosen DCID in `version`
+/// (RFC 9001 §5.2: on the client, Tx = "client in"; Rx = "server in").
+/// Used when a compatible version switch (RFC 9369 §4.1) re-derives the
+/// Initial keys for the Negotiated Version.
+pub(crate) fn initial_keys_client(
+    version: QuicVersion,
+    peer_dcid: &[u8],
+) -> (crate::quic::crypto::DirKeys, crate::quic::crypto::DirKeys) {
+    let (client_secret, server_secret) = derive_initial_secrets(version, peer_dcid);
+    (
+        derive_dir_keys(version, AeadAlg::Aes128Gcm, &client_secret),
+        derive_dir_keys(version, AeadAlg::Aes128Gcm, &server_secret),
+    )
 }
 
 /// Convenience: produces a freshly randomised CID of the

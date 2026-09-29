@@ -1,13 +1,16 @@
-//! RFC 9001 §5 — packet protection for QUIC v1.
+//! RFC 9001 §5 — packet protection for QUIC v1 and, with the RFC 9369 §3.3
+//! substitutions, QUIC v2.
 //!
 //! This module is the cryptographic core of the QUIC implementation. It
 //! provides:
 //!
 //! * RFC 9001 §5.2 — Initial-secret derivation from the client's chosen
-//!   Destination Connection ID and the version-1 salt.
+//!   Destination Connection ID and the version's salt (RFC 9369 §3.3.1 for
+//!   v2).
 //! * RFC 9001 §5.1 — per-direction expansion of a traffic secret into a
 //!   `(key, iv, hp)` triple using the `quic key` / `quic iv` / `quic hp`
-//!   HKDF-Expand-Label outputs.
+//!   HKDF-Expand-Label outputs (`quicv2 key` / `quicv2 iv` / `quicv2 hp`
+//!   in v2, RFC 9369 §3.3.2).
 //! * RFC 9001 §5.3 — AEAD nonce reconstruction: the packet number is
 //!   left-padded to 8 bytes big-endian and XORed into IV bytes 4..12.
 //!   The unprotected packet header (including the encoded packet number)
@@ -17,7 +20,13 @@
 //!   sample into a 32-bit little-endian counter and a 12-byte nonce, then
 //!   takes the first 5 bytes of the keystream block.
 //! * RFC 9001 §6.1 — pre-derivation of the next application-traffic
-//!   secret with label `quic ku`, exposed for the future key-update path.
+//!   secret with label `quic ku` (`quicv2 ku`), exposed for the key-update
+//!   path.
+//!
+//! Every derivation takes the [`QuicVersion`] whose labels and salt apply:
+//! the version the packets it protects are sent in (RFC 9369 §4.1 — after
+//! compatible negotiation, Handshake and 1-RTT keys belong to the
+//! negotiated version, 0-RTT keys to the original one).
 //!
 //! All other QUIC state (PN spaces, packet framing, frame codec, …) lives
 //! in sibling modules. This module is sans-I/O and side-effect-free.
@@ -29,6 +38,8 @@ use crate::hash::Sha256;
 use crate::kdf::hkdf_extract;
 use crate::tls::Error;
 use crate::tls::crypto::{HashAlg, expand_label_dyn};
+
+use super::version::QuicVersion;
 
 /// AEAD suite selected for an encryption level.
 ///
@@ -419,16 +430,6 @@ impl LevelKeys {
     }
 }
 
-/// RFC 9001 §5.2 — the QUIC v1 Initial salt
-/// `0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a`.
-///
-/// This is the salt fed to HKDF-Extract together with the client's chosen
-/// Destination Connection ID to derive the per-connection Initial secret.
-pub(crate) const INITIAL_SALT_V1: [u8; 20] = [
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
-    0xcc, 0xbb, 0x7f, 0x0a,
-];
-
 /// RFC 9001 §5.2 — derive `(client_initial_secret, server_initial_secret)`
 /// from the client's chosen Destination Connection ID:
 ///
@@ -438,10 +439,16 @@ pub(crate) const INITIAL_SALT_V1: [u8; 20] = [
 ///   server_initial_secret = HKDF-Expand-Label(initial_secret, "server in", "", Hash.length)
 /// ```
 ///
-/// Initial keys always use SHA-256 (RFC 9001 §5.2: "The hash function for
-/// HKDF when deriving initial secrets and keys is SHA-256.").
-pub(crate) fn derive_initial_secrets(client_dcid: &[u8]) -> ([u8; 32], [u8; 32]) {
-    let initial_secret = hkdf_extract::<Sha256>(&INITIAL_SALT_V1, client_dcid);
+/// `initial_salt` is the one of `version` (RFC 9001 §5.2 for v1, RFC 9369
+/// §3.3.1 for v2); the `client in` / `server in` labels are the same in
+/// both versions. Initial keys always use SHA-256 (RFC 9001 §5.2: "The
+/// hash function for HKDF when deriving initial secrets and keys is
+/// SHA-256.").
+pub(crate) fn derive_initial_secrets(
+    version: QuicVersion,
+    client_dcid: &[u8],
+) -> ([u8; 32], [u8; 32]) {
+    let initial_secret = hkdf_extract::<Sha256>(version.initial_salt(), client_dcid);
     let mut cs = [0u8; 32];
     let mut ss = [0u8; 32];
     expand_label_dyn(
@@ -464,44 +471,28 @@ pub(crate) fn derive_initial_secrets(client_dcid: &[u8]) -> ([u8; 32], [u8; 32])
 /// RFC 9001 §5.1 — derive `(key, iv, hp)` from a traffic secret.
 ///
 /// `alg` selects the AEAD; its [`AeadAlg::hash`] selects the HKDF dispatch.
-/// The labels (RFC 9001 §5.1) are `"quic key"`, `"quic iv"`, `"quic hp"`,
+/// The labels are those of `version` — `"quic key"`, `"quic iv"`,
+/// `"quic hp"` (RFC 9001 §5.1) or their `quicv2` forms (RFC 9369 §3.3.2) —
 /// each with an empty context per the HKDF-Expand-Label structure inherited
 /// from RFC 8446 §7.1.
-pub(crate) fn derive_dir_keys(alg: AeadAlg, secret: &[u8]) -> DirKeys {
-    let hash = alg.hash();
-    let kl = alg.key_len();
-    let mut key = alloc::vec![0u8; kl];
-    let mut iv = [0u8; 12];
-    expand_label_dyn(hash, secret, b"quic key", &[], &mut key);
-    expand_label_dyn(hash, secret, b"quic iv", &[], &mut iv);
-
-    let mut hp_key = alloc::vec![0u8; kl];
-    expand_label_dyn(hash, secret, b"quic hp", &[], &mut hp_key);
-    let hp = match alg {
-        AeadAlg::Aes128Gcm => HeaderProt::Aes128(Aes128::new(hp_key[..16].try_into().expect("16"))),
-        AeadAlg::Aes256Gcm => HeaderProt::Aes256(Aes256::new(hp_key[..32].try_into().expect("32"))),
-        AeadAlg::ChaCha20Poly1305 => {
-            HeaderProt::ChaCha20(ChaCha20::new(hp_key[..32].try_into().expect("32")))
-        }
-    };
-
-    DirKeys {
-        alg,
-        key,
-        iv,
-        hp,
-        secret: secret.to_vec(),
-    }
+pub(crate) fn derive_dir_keys(version: QuicVersion, alg: AeadAlg, secret: &[u8]) -> DirKeys {
+    let hp_key = derive_hp_key_bytes(version, alg, secret);
+    derive_dir_keys_preserve_hp(version, alg, secret, &hp_key)
 }
 
 /// RFC 9001 §6.1 — derive the next application-traffic secret for a
-/// direction, using HKDF-Expand-Label with label `"quic ku"`.
+/// direction, using HKDF-Expand-Label with label `"quic ku"` (`"quicv2 ku"`
+/// in v2, RFC 9369 §3.3.2).
 ///
 /// Used by the key-update path (`QuicConnection::initiate_key_update`).
 /// The output is one hash-output long (matching the input secret length).
-pub(crate) fn derive_next_application_secret(alg: AeadAlg, current: &[u8]) -> Vec<u8> {
+pub(crate) fn derive_next_application_secret(
+    version: QuicVersion,
+    alg: AeadAlg,
+    current: &[u8],
+) -> Vec<u8> {
     let mut next = alloc::vec![0u8; current.len()];
-    expand_label_dyn(alg.hash(), current, b"quic ku", &[], &mut next);
+    expand_label_dyn(alg.hash(), current, version.label_ku(), &[], &mut next);
     next
 }
 
@@ -524,6 +515,7 @@ pub(crate) fn derive_next_application_secret(alg: AeadAlg, current: &[u8]) -> Ve
 /// can pass in the original "quic hp" key bytes via
 /// [`derive_dir_keys_preserve_hp`].
 pub(crate) fn derive_dir_keys_preserve_hp(
+    version: QuicVersion,
     alg: AeadAlg,
     secret: &[u8],
     hp_key_bytes: &[u8],
@@ -532,8 +524,8 @@ pub(crate) fn derive_dir_keys_preserve_hp(
     let kl = alg.key_len();
     let mut key = alloc::vec![0u8; kl];
     let mut iv = [0u8; 12];
-    expand_label_dyn(hash, secret, b"quic key", &[], &mut key);
-    expand_label_dyn(hash, secret, b"quic iv", &[], &mut iv);
+    expand_label_dyn(hash, secret, version.label_key(), &[], &mut key);
+    expand_label_dyn(hash, secret, version.label_iv(), &[], &mut iv);
 
     let hp = match alg {
         AeadAlg::Aes128Gcm => {
@@ -556,13 +548,13 @@ pub(crate) fn derive_dir_keys_preserve_hp(
     }
 }
 
-/// Compute the raw "quic hp" key bytes for a secret. The output length
-/// equals [`AeadAlg::key_len`].
-pub(crate) fn derive_hp_key_bytes(alg: AeadAlg, secret: &[u8]) -> Vec<u8> {
+/// Compute the raw "quic hp" (v2: "quicv2 hp") key bytes for a secret. The
+/// output length equals [`AeadAlg::key_len`].
+pub(crate) fn derive_hp_key_bytes(version: QuicVersion, alg: AeadAlg, secret: &[u8]) -> Vec<u8> {
     let hash = alg.hash();
     let kl = alg.key_len();
     let mut hp_key = alloc::vec![0u8; kl];
-    expand_label_dyn(hash, secret, b"quic hp", &[], &mut hp_key);
+    expand_label_dyn(hash, secret, version.label_hp(), &[], &mut hp_key);
     hp_key
 }
 
@@ -687,7 +679,7 @@ mod tests {
         //   server_initial_secret
         //       = 3c199828fd139efd216c155ad844cc81
         //         fb82fa8d7446fa7d78be803acdda951b
-        let (cs, ss) = derive_initial_secrets(&DCID);
+        let (cs, ss) = derive_initial_secrets(QuicVersion::V1, &DCID);
         assert_eq!(
             cs.as_slice(),
             hex("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea").as_slice(),
@@ -704,8 +696,8 @@ mod tests {
         //   key = 1f369613dd76d5467730efcbe3b1a22d
         //   iv  = fa044b2f42a3fd3b46fb255c
         //   hp  = 9f50449e04a0e810283a1e9933adedd2
-        let (cs, _) = derive_initial_secrets(&DCID);
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &cs);
+        let (cs, _) = derive_initial_secrets(QuicVersion::V1, &DCID);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &cs);
         assert_eq!(dk.key.as_slice(), hex("1f369613dd76d5467730efcbe3b1a22d"));
         assert_eq!(dk.iv.as_slice(), hex("fa044b2f42a3fd3b46fb255c"));
 
@@ -722,8 +714,8 @@ mod tests {
         //   key = cf3a5331653c364c88f0f379b6067e37
         //   iv  = 0ac1493ca1905853b0bba03e
         //   hp  = c206b8d9b9f0f37644430b490eeaa314
-        let (_, ss) = derive_initial_secrets(&DCID);
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &ss);
+        let (_, ss) = derive_initial_secrets(QuicVersion::V1, &DCID);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &ss);
         assert_eq!(dk.key.as_slice(), hex("cf3a5331653c364c88f0f379b6067e37"));
         assert_eq!(dk.iv.as_slice(), hex("0ac1493ca1905853b0bba03e"));
 
@@ -770,8 +762,8 @@ mod tests {
         // `fa044b2f42a3fd3b46fb255c`. The nonce is the IV XORed with the
         // 8-byte big-endian PN (`0000000000000002` → only the last byte
         // flips bit 1), giving `fa044b2f42a3fd3b46fb255e`.
-        let (cs, _) = derive_initial_secrets(&DCID);
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &cs);
+        let (cs, _) = derive_initial_secrets(QuicVersion::V1, &DCID);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &cs);
         let nonce = nonce_for(&dk.iv, 2);
         assert_eq!(nonce.as_slice(), hex("fa044b2f42a3fd3b46fb255e"));
     }
@@ -783,8 +775,8 @@ mod tests {
         let header = hex("c300000001088394c8f03e5157080000449e00000002");
         let mut payload = a2_plaintext();
 
-        let (cs, _) = derive_initial_secrets(&DCID);
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &cs);
+        let (cs, _) = derive_initial_secrets(QuicVersion::V1, &DCID);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &cs);
         let tag = aead_seal(&dk, 2, &header, &mut payload);
 
         // The §A.2 sample is the first 16 bytes of the ciphertext
@@ -806,8 +798,8 @@ mod tests {
     fn rfc9001_a2_header_protection_mask() {
         // §A.2: sample = d1b1c98dd7689fb8ec11d242b123dc9b
         //       mask   = 437b9aec36
-        let (cs, _) = derive_initial_secrets(&DCID);
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &cs);
+        let (cs, _) = derive_initial_secrets(QuicVersion::V1, &DCID);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &cs);
         let sample = hex("d1b1c98dd7689fb8ec11d242b123dc9b");
         let mask = dk.hp.mask(&sample).expect("16-byte sample");
         assert_eq!(mask.as_slice(), hex("437b9aec36"));
@@ -832,8 +824,8 @@ mod tests {
         let header = hex("c1000000010008f067a5502a4262b50040750001");
 
         let mut buf = payload.clone();
-        let (_, ss) = derive_initial_secrets(&DCID);
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &ss);
+        let (_, ss) = derive_initial_secrets(QuicVersion::V1, &DCID);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &ss);
         // Packet number for this server Initial is 1 (RFC 9001 §A.3:
         // "a 2-byte packet number encoding for a packet number of 1").
         let tag = aead_seal(&dk, 1, &header, &mut buf);
@@ -860,8 +852,8 @@ mod tests {
     fn rfc9001_a3_header_protection_mask() {
         // §A.3: sample = 2cd0991cd25b0aac406a5816b6394100
         //       mask   = 2ec0d8356a
-        let (_, ss) = derive_initial_secrets(&DCID);
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &ss);
+        let (_, ss) = derive_initial_secrets(QuicVersion::V1, &DCID);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &ss);
         let sample = hex("2cd0991cd25b0aac406a5816b6394100");
         let mask = dk.hp.mask(&sample).expect("16-byte sample");
         assert_eq!(mask.as_slice(), hex("2ec0d8356a"));
@@ -882,7 +874,7 @@ mod tests {
         //   hp  = 25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4
         //   ku  = 1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9
         let s = a5_secret();
-        let dk = derive_dir_keys(AeadAlg::ChaCha20Poly1305, &s);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::ChaCha20Poly1305, &s);
         assert_eq!(
             dk.key.as_slice(),
             hex("c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8").as_slice(),
@@ -898,7 +890,7 @@ mod tests {
             hex("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4").as_slice(),
         );
 
-        let ku = derive_next_application_secret(AeadAlg::ChaCha20Poly1305, &s);
+        let ku = derive_next_application_secret(QuicVersion::V1, AeadAlg::ChaCha20Poly1305, &s);
         assert_eq!(
             ku.as_slice(),
             hex("1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9").as_slice(),
@@ -912,7 +904,7 @@ mod tests {
         // 655e5cd55c41f69080575d7999c25a5bfb (the 16-byte tag is the
         // trailing 16 bytes of the 17-byte ciphertext+tag sequence).
         let s = a5_secret();
-        let dk = derive_dir_keys(AeadAlg::ChaCha20Poly1305, &s);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::ChaCha20Poly1305, &s);
 
         let pn: u64 = 654360564;
         let nonce = nonce_for(&dk.iv, pn);
@@ -937,10 +929,102 @@ mod tests {
         // RFC 9001 §A.5: sample = 5e5cd55c41f69080575d7999c25a5bfb,
         //                mask   = aefefe7d03.
         let s = a5_secret();
-        let dk = derive_dir_keys(AeadAlg::ChaCha20Poly1305, &s);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::ChaCha20Poly1305, &s);
         let sample = hex("5e5cd55c41f69080575d7999c25a5bfb");
         let mask = dk.hp.mask(&sample).expect("16-byte sample");
         assert_eq!(mask.as_slice(), hex("aefefe7d03").as_slice());
+    }
+
+    // -------- RFC 9369 Appendix A — QUIC v2 -----------------------------
+
+    /// RFC 9369 §A.1: the v2 Initial secrets for the same DCID as RFC 9001
+    /// §A.1 (`0x8394c8f03e515708`) come out different because of the v2
+    /// salt (§3.3.1), and the `quicv2 key` / `quicv2 iv` / `quicv2 hp`
+    /// labels (§3.3.2) change every derived key.
+    #[test]
+    fn rfc9369_a1_initial_keys() {
+        let (cs, ss) = derive_initial_secrets(QuicVersion::V2, &DCID);
+        assert_eq!(
+            cs.as_slice(),
+            hex("14ec9d6eb9fd7af83bf5a668bc17a7e283766aade7ecd0891f70f9ff7f4bf47b").as_slice(),
+        );
+        assert_eq!(
+            ss.as_slice(),
+            hex("0263db1782731bf4588e7e4d93b7463907cb8cd8200b5da55a8bd488eafc37c1").as_slice(),
+        );
+        let ck = derive_dir_keys(QuicVersion::V2, AeadAlg::Aes128Gcm, &cs);
+        assert_eq!(
+            ck.key.as_slice(),
+            hex("8b1a0bc121284290a29e0971b5cd045d").as_slice()
+        );
+        assert_eq!(ck.iv.as_slice(), hex("91f73e2351d8fa91660e909f").as_slice());
+        assert_eq!(
+            derive_hp_key_bytes(QuicVersion::V2, AeadAlg::Aes128Gcm, &cs).as_slice(),
+            hex("45b95e15235d6f45a6b19cbcb0294ba9").as_slice(),
+        );
+        let sk = derive_dir_keys(QuicVersion::V2, AeadAlg::Aes128Gcm, &ss);
+        assert_eq!(
+            sk.key.as_slice(),
+            hex("82db637861d55e1d011f19ea71d5d2a7").as_slice()
+        );
+        assert_eq!(sk.iv.as_slice(), hex("dd13c276499c0249d3310652").as_slice());
+        assert_eq!(
+            derive_hp_key_bytes(QuicVersion::V2, AeadAlg::Aes128Gcm, &ss).as_slice(),
+            hex("edf6d05c83121201b436e16877593c3a").as_slice(),
+        );
+        // The v1 derivation of the same DCID gives different keys: a v2
+        // Initial is unreadable to a v1-only observer (§6).
+        let (cs1, _) = derive_initial_secrets(QuicVersion::V1, &DCID);
+        assert_ne!(cs1, cs);
+    }
+
+    /// RFC 9369 §A.5: the ChaCha20-Poly1305 short-header example, same
+    /// secret as RFC 9001 §A.5 but under the `quicv2` labels.
+    #[test]
+    fn rfc9369_a5_chacha20_short_header() {
+        let s = a5_secret();
+        let dk = derive_dir_keys(QuicVersion::V2, AeadAlg::ChaCha20Poly1305, &s);
+        assert_eq!(
+            dk.key.as_slice(),
+            hex("3bfcddd72bcf02541d7fa0dd1f5f9eeea817e09a6963a0e6c7df0f9a1bab90f2").as_slice(),
+        );
+        assert_eq!(dk.iv.as_slice(), hex("a6b5bc6ab7dafce30ffff5dd").as_slice());
+        assert_eq!(
+            derive_hp_key_bytes(QuicVersion::V2, AeadAlg::ChaCha20Poly1305, &s).as_slice(),
+            hex("d659760d2ba434a226fd37b35c69e2da8211d10c4f12538787d65645d5d1b8e2").as_slice(),
+        );
+        let ku = derive_next_application_secret(QuicVersion::V2, AeadAlg::ChaCha20Poly1305, &s);
+        assert_eq!(
+            ku.as_slice(),
+            hex("c69374c49e3d2a9466fa689e49d476db5d0dfbc87d32ceeaa6343fd0ae4c7d88").as_slice(),
+        );
+
+        // pn = 654360564, unprotected header = 4200bff4, payload = 01.
+        let pn: u64 = 654360564;
+        assert_eq!(
+            nonce_for(&dk.iv, pn).as_slice(),
+            hex("a6b5bc6ab7dafce328ff4a29").as_slice()
+        );
+        let header = hex("4200bff4");
+        let mut payload = hex("01");
+        let tag = aead_seal(&dk, pn, &header, &mut payload);
+        let mut ct = payload.clone();
+        ct.extend_from_slice(&tag);
+        assert_eq!(
+            ct.as_slice(),
+            hex("0ae7b6b932bc27d786f4bc2bb20f2162ba").as_slice()
+        );
+        // sample = e7b6b932bc27d786f4bc2bb20f2162ba (one byte skipped),
+        // mask = 97580e32bf, protected header = 5558b1c6.
+        let mask = dk.hp.mask(&ct[1..17]).expect("16-byte sample");
+        assert_eq!(mask.as_slice(), hex("97580e32bf").as_slice());
+        let mut pkt = header.clone();
+        pkt.extend_from_slice(&ct);
+        crate::quic::pkt::apply_header_protection(&mut pkt, 1, 3, &mask, false);
+        assert_eq!(
+            pkt.as_slice(),
+            hex("5558b1c60ae7b6b932bc27d786f4bc2bb20f2162ba").as_slice()
+        );
     }
 
     // -------- Unit tests (not from the RFC) ----------------------------
@@ -974,8 +1058,8 @@ mod tests {
         // RFC 9001 §5.4.1 fixes the sample at 16 bytes; anything else is
         // a protocol error and should be reported as a decode failure so
         // the packet is dropped.
-        let (cs, _) = derive_initial_secrets(&DCID);
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &cs);
+        let (cs, _) = derive_initial_secrets(QuicVersion::V1, &DCID);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &cs);
         assert!(matches!(dk.hp.mask(&[0u8; 15]), Err(Error::Decode)));
         assert!(matches!(dk.hp.mask(&[0u8; 17]), Err(Error::Decode)));
         assert!(matches!(dk.hp.mask(&[]), Err(Error::Decode)));
@@ -991,8 +1075,8 @@ mod tests {
         // Synthetic 32-byte initial secret. Hash output for SHA-256 ⇒
         // each Si is also 32 bytes.
         let s0: alloc::vec::Vec<u8> = (0..32u8).map(|i| i ^ 0x5a).collect();
-        let s1 = derive_next_application_secret(AeadAlg::Aes128Gcm, &s0);
-        let s2 = derive_next_application_secret(AeadAlg::Aes128Gcm, &s1);
+        let s1 = derive_next_application_secret(QuicVersion::V1, AeadAlg::Aes128Gcm, &s0);
+        let s2 = derive_next_application_secret(QuicVersion::V1, AeadAlg::Aes128Gcm, &s1);
 
         assert_ne!(s0, s1, "S0 vs S1 must differ");
         assert_ne!(s1, s2, "S1 vs S2 must differ");
@@ -1000,9 +1084,9 @@ mod tests {
         assert_eq!(s0.len(), s1.len());
         assert_eq!(s1.len(), s2.len());
 
-        let dk0 = derive_dir_keys(AeadAlg::Aes128Gcm, &s0);
-        let dk1 = derive_dir_keys(AeadAlg::Aes128Gcm, &s1);
-        let dk2 = derive_dir_keys(AeadAlg::Aes128Gcm, &s2);
+        let dk0 = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &s0);
+        let dk1 = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &s1);
+        let dk2 = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &s2);
 
         // Pairwise: keys distinct, IVs distinct.
         assert_ne!(dk0.key, dk1.key);
@@ -1027,7 +1111,7 @@ mod tests {
 
     #[test]
     fn level_keys_phase_lookup_falls_back_to_legacy() {
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &alloc::vec![0u8; 32]);
+        let dk = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &alloc::vec![0u8; 32]);
         // Legacy fields populated, phase table empty: phase lookup
         // falls back.
         let lk = LevelKeys {
@@ -1074,7 +1158,7 @@ mod tests {
         ] {
             let secret =
                 alloc::vec![0x55u8; if matches!(alg, AeadAlg::Aes256Gcm) { 48 } else { 32 }];
-            let dk = derive_dir_keys(alg, &secret);
+            let dk = derive_dir_keys(QuicVersion::V1, alg, &secret);
             let aad = [0xc3, 0x00, 0x01];
             let original: [u8; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 

@@ -3,10 +3,10 @@
 //! The server mints a token that proves the client received a Retry packet
 //! at the IP address it claims to be using. The token is sized so that the
 //! server need not keep any per-token state: the token's HMAC tag
-//! authenticates the binding `(client_addr, ODCID, Retry SCID, timestamp)`
-//! under a
-//! server-secret HMAC key. When the client retransmits its Initial with
-//! the token, the server re-derives the tag and constant-time-compares.
+//! authenticates the binding `(client_addr, ODCID, Retry SCID, QUIC
+//! version, timestamp)` under a server-secret HMAC key. When the client
+//! retransmits its Initial with the token, the server re-derives the tag
+//! and constant-time-compares.
 //!
 //! ## Wire format
 //!
@@ -16,18 +16,26 @@
 //!   odcid_bytes        (odcid_len) -- original Destination CID
 //!   scid_len           (1 byte)    -- 0..=20
 //!   scid_bytes         (scid_len)  -- the SCID of the Retry packet we sent
+//!   version_be         (4 bytes)   -- the QUIC version the Retry was sent in
 //!   timestamp_be       (8 bytes)   -- u64 seconds since server start (big-endian)
 //!   tag                (16 bytes)  -- HMAC-SHA256( retry_secret, body )[..16]
 //! ```
 //!
-//! The address, the ODCID and the Retry SCID are all inputs to the HMAC;
-//! recomputation on validate uses the *received* `client_addr_bytes` (the same
-//! the server observed on the second Initial) and the rest from the token
-//! body. Binding the Retry SCID is what lets the server trust the DCID of the
-//! retried Initial: that CID becomes the server's own SCID and its
-//! `retry_source_connection_id`, so without the binding a client (or anyone
-//! who captured the token) could hand the server a connection ID of its
-//! choosing.
+//! The address, the ODCID, the Retry SCID and the version are all inputs to
+//! the HMAC; recomputation on validate uses the *received*
+//! `client_addr_bytes` (the same the server observed on the second Initial)
+//! and the rest from the token body. Binding the Retry SCID is what lets
+//! the server trust the DCID of the retried Initial: that CID becomes the
+//! server's own SCID and its `retry_source_connection_id`, so without the
+//! binding a client (or anyone who captured the token) could hand the
+//! server a connection ID of its choosing. Binding the version is RFC 9369
+//! §4.1: a Retry is sent in the version of the Initial it answers and "the
+//! client MUST NOT use a different version in the subsequent Initial packet
+//! that contains the Retry token"; the server "MAY encode the QUIC version
+//! in its Retry token to validate that the client did not switch versions,
+//! and drop the packet if it switched". This one does, so a token is only
+//! ever redeemed in the version it was issued for (the RFC 9369 §5 rule
+//! that tokens are specific to a version).
 //!
 //! ## Lifetime
 //!
@@ -116,13 +124,15 @@ pub(crate) const CLIENT_ADDR_BYTES: usize = 18;
 const TAG_LEN: usize = 16;
 
 /// Mints a retry token binding `(client_addr_bytes, odcid, retry_scid,
-/// now_secs)` under `retry_secret`. Length of the returned `Vec` is
-/// `18 + 1 + odcid.len() + 1 + retry_scid.len() + 8 + 16`.
+/// version, now_secs)` under `retry_secret`. Length of the returned `Vec`
+/// is `18 + 1 + odcid.len() + 1 + retry_scid.len() + 4 + 8 + 16`.
 ///
 /// `retry_scid` is the Source Connection ID of the Retry packet this token
 /// travels in — the value the client must use as the DCID of its retried
 /// Initial, and which the server then adopts as its own SCID. Binding it
-/// here is what makes that adoption safe (see [`validate`]).
+/// here is what makes that adoption safe (see [`validate`]). `version` is
+/// the wire version of the Retry packet (RFC 9369 §4.1: the version of the
+/// Initial it answers); the retried Initial must arrive in the same one.
 ///
 /// `now_secs` must be nonzero — 0 is the "no clock configured" sentinel,
 /// and [`validate`] rejects it unconditionally, so a token minted at 0
@@ -133,6 +143,7 @@ pub(crate) fn mint(
     client_addr_bytes: &[u8; CLIENT_ADDR_BYTES],
     odcid: &[u8],
     retry_scid: &[u8],
+    version: u32,
     now_secs: u64,
 ) -> Vec<u8> {
     debug_assert!(odcid.len() <= 20, "QUIC v1 CID length must be ≤ 20 bytes");
@@ -145,13 +156,14 @@ pub(crate) fn mint(
         "retry tokens must not be minted without a clock (now_secs == 0)"
     );
     let mut out = Vec::with_capacity(
-        CLIENT_ADDR_BYTES + 1 + odcid.len() + 1 + retry_scid.len() + 8 + TAG_LEN,
+        CLIENT_ADDR_BYTES + 1 + odcid.len() + 1 + retry_scid.len() + 4 + 8 + TAG_LEN,
     );
     out.extend_from_slice(client_addr_bytes);
     out.push(odcid.len() as u8);
     out.extend_from_slice(odcid);
     out.push(retry_scid.len() as u8);
     out.extend_from_slice(retry_scid);
+    out.extend_from_slice(&version.to_be_bytes());
     out.extend_from_slice(&now_secs.to_be_bytes());
     // Body (everything we just wrote) is the HMAC input.
     let body_len = out.len();
@@ -160,9 +172,10 @@ pub(crate) fn mint(
     out
 }
 
-/// Validates a retry token. Returns the bound `(ODCID, Retry SCID)` on
-/// success; the caller MUST check that the retried Initial's DCID equals the
-/// returned Retry SCID before adopting it.
+/// Validates a retry token. Returns the bound `(ODCID, Retry SCID, version)`
+/// on success; the caller MUST check that the retried Initial's DCID equals
+/// the returned Retry SCID before adopting it, and that the Initial's
+/// Version field equals the returned version (RFC 9369 §4.1).
 ///
 /// Failure modes:
 /// * `now_secs == 0` (no clock configured — token age cannot be bounded,
@@ -178,7 +191,7 @@ pub(crate) fn validate(
     client_addr_bytes: &[u8; CLIENT_ADDR_BYTES],
     token: &[u8],
     now_secs: u64,
-) -> Result<(Vec<u8>, Vec<u8>), Error> {
+) -> Result<(Vec<u8>, Vec<u8>, u32), Error> {
     // Fail-closed clock check: with `now_secs == 0` (the "clock never
     // configured" default) the age comparison below degenerates — every
     // token minted at ts = 0 would stay valid forever. No token is ever
@@ -189,8 +202,8 @@ pub(crate) fn validate(
     }
 
     // Minimum: 18 addr + 1 odcid_len + 0 odcid + 1 scid_len + 0 scid
-    //          + 8 ts + 16 tag = 44.
-    if token.len() < CLIENT_ADDR_BYTES + 2 + 8 + TAG_LEN {
+    //          + 4 version + 8 ts + 16 tag = 48.
+    if token.len() < CLIENT_ADDR_BYTES + 2 + 4 + 8 + TAG_LEN {
         return Err(Error::Decode);
     }
 
@@ -219,7 +232,8 @@ pub(crate) fn validate(
     }
     let scid_start = odcid_end + 1;
     let scid_end = scid_start + scid_len;
-    let ts_start = scid_end;
+    let version_start = scid_end;
+    let ts_start = version_start + 4;
     let ts_end = ts_start + 8;
     let tag_start = ts_end;
     let tag_end = tag_start + TAG_LEN;
@@ -257,9 +271,12 @@ pub(crate) fn validate(
         return Err(Error::Decode);
     }
 
+    let mut version_bytes = [0u8; 4];
+    version_bytes.copy_from_slice(&token[version_start..ts_start]);
     Ok((
         token[odcid_start..odcid_end].to_vec(),
         token[scid_start..scid_end].to_vec(),
+        u32::from_be_bytes(version_bytes),
     ))
 }
 
@@ -284,6 +301,10 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+    /// The wire versions the tests mint tokens for.
+    const V1: u32 = crate::quic::version::QuicVersion::V1.wire();
+    const V2: u32 = crate::quic::version::QuicVersion::V2.wire();
+
     fn fixed_secret() -> [u8; 32] {
         let mut s = [0u8; 32];
         for (i, b) in s.iter_mut().enumerate() {
@@ -302,9 +323,9 @@ mod tests {
         let odcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
         let now = 1000u64;
         let scid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        let tok = mint(&secret, &addr, &odcid, &scid, now);
+        let tok = mint(&secret, &addr, &odcid, &scid, V1, now);
         let got = validate(&secret, &addr, &tok, now).expect("validate ok");
-        assert_eq!(got, (odcid.to_vec(), scid.to_vec()));
+        assert_eq!(got, (odcid.to_vec(), scid.to_vec(), V1));
     }
 
     /// L-8 — the Retry SCID is bound into the token: a token minted for one
@@ -319,10 +340,12 @@ mod tests {
         ));
         let odcid = [0x11u8; 8];
         let scid = [0x22u8; 8];
-        let tok = mint(&secret, &addr, &odcid, &scid, 1000);
-        let (got_odcid, got_scid) = validate(&secret, &addr, &tok, 1000).expect("validate ok");
+        let tok = mint(&secret, &addr, &odcid, &scid, V1, 1000);
+        let (got_odcid, got_scid, got_version) =
+            validate(&secret, &addr, &tok, 1000).expect("validate ok");
         assert_eq!(got_odcid, odcid);
         assert_eq!(got_scid, scid);
+        assert_eq!(got_version, V1);
         // Tampering with the bound SCID invalidates the tag.
         let mut bad = tok.clone();
         let scid_off = CLIENT_ADDR_BYTES + 1 + odcid.len() + 1;
@@ -342,7 +365,7 @@ mod tests {
             4433,
         ));
         let odcid = [0xaa; 8];
-        let tok = mint(&secret, &addr1, &odcid, &[0x09; 8], 1000);
+        let tok = mint(&secret, &addr1, &odcid, &[0x09; 8], V1, 1000);
         let err = validate(&secret, &addr2, &tok, 1000);
         assert!(err.is_err());
     }
@@ -357,7 +380,7 @@ mod tests {
         let addr1 = encode_addr(&SocketAddr::new(ip, 4433));
         let addr2 = encode_addr(&SocketAddr::new(ip, 4434));
         let odcid = [0xbb; 8];
-        let tok = mint(&secret, &addr1, &odcid, &[0x09; 8], 1000);
+        let tok = mint(&secret, &addr1, &odcid, &[0x09; 8], V1, 1000);
         assert!(validate(&secret, &addr2, &tok, 1000).is_err());
         // Sanity: the original port still validates.
         assert!(validate(&secret, &addr1, &tok, 1000).is_ok());
@@ -373,7 +396,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             4433,
         ));
-        let tok = mint(&secret, &addr, &[0xcc; 8], &[0x09; 8], 1000);
+        let tok = mint(&secret, &addr, &[0xcc; 8], &[0x09; 8], V1, 1000);
         // Same token is valid with a real clock...
         assert!(validate(&secret, &addr, &tok, 1000).is_ok());
         // ...but a clock-less server must reject it.
@@ -386,7 +409,7 @@ mod tests {
         let mut secret_b = fixed_secret();
         secret_b[0] ^= 1;
         let addr = encode_addr(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0));
-        let tok = mint(&secret_a, &addr, &[1, 2, 3, 4], &[0x09; 8], 100);
+        let tok = mint(&secret_a, &addr, &[1, 2, 3, 4], &[0x09; 8], V1, 100);
         let err = validate(&secret_b, &addr, &tok, 100);
         assert!(err.is_err());
     }
@@ -396,7 +419,7 @@ mod tests {
         let secret = fixed_secret();
         let addr = encode_addr(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0));
         let odcid = [0xab; 8];
-        let tok = mint(&secret, &addr, &odcid, &[0x09; 8], 100);
+        let tok = mint(&secret, &addr, &odcid, &[0x09; 8], V1, 100);
         // 100 + MAX_TOKEN_AGE_SECS → still good
         assert!(validate(&secret, &addr, &tok, 100 + MAX_TOKEN_AGE_SECS).is_ok());
         // one second past the window → expired
@@ -409,7 +432,7 @@ mod tests {
         // (clock skew or attacker manipulation), reject.
         let secret = fixed_secret();
         let addr = encode_addr(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0));
-        let tok = mint(&secret, &addr, &[0xcd; 4], &[0x09; 8], 500);
+        let tok = mint(&secret, &addr, &[0xcd; 4], &[0x09; 8], V1, 500);
         let err = validate(&secret, &addr, &tok, 100);
         assert!(err.is_err());
     }
@@ -422,7 +445,7 @@ mod tests {
             7777,
         ));
         let odcid = [0xde, 0xad, 0xbe, 0xef];
-        let mut tok = mint(&secret, &addr, &odcid, &[0x09; 8], 1234);
+        let mut tok = mint(&secret, &addr, &odcid, &[0x09; 8], V1, 1234);
         // Flip a byte inside the tag.
         let last = tok.len() - 1;
         tok[last] ^= 1;
@@ -437,7 +460,7 @@ mod tests {
             7777,
         ));
         let odcid = [0xde, 0xad, 0xbe, 0xef];
-        let mut tok = mint(&secret, &addr, &odcid, &[0x09; 8], 1234);
+        let mut tok = mint(&secret, &addr, &odcid, &[0x09; 8], V1, 1234);
         // Flip a byte in the ODCID bytes.
         let body_offset = CLIENT_ADDR_BYTES + 1; // first ODCID byte
         tok[body_offset] ^= 1;
@@ -448,17 +471,35 @@ mod tests {
     fn retry_token_rejects_short_token() {
         let secret = fixed_secret();
         let addr = encode_addr(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0));
-        // Any sub-43-byte input is structurally invalid. (Nonzero clock so
+        // Any sub-48-byte input is structurally invalid. (Nonzero clock so
         // the length check, not the clock check, is what rejects.)
         assert!(validate(&secret, &addr, &[], 100).is_err());
-        assert!(validate(&secret, &addr, &[0u8; 42], 100).is_err());
+        assert!(validate(&secret, &addr, &[0u8; 47], 100).is_err());
+    }
+
+    /// RFC 9369 §4.1 / §5 — the token carries the version of the Retry it
+    /// came with, authenticated: the caller learns it back, and a token
+    /// rewritten for the other version fails the tag.
+    #[test]
+    fn retry_token_binds_the_version() {
+        let secret = fixed_secret();
+        let addr = encode_addr(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0));
+        let tok = mint(&secret, &addr, &[0x11; 8], &[0x09; 8], V2, 100);
+        let (_, _, version) = validate(&secret, &addr, &tok, 100).expect("validate ok");
+        assert_eq!(version, V2);
+        // The version field sits right after the two CIDs; patching it to
+        // v1 changes the HMAC input.
+        let mut bad = tok.clone();
+        let off = CLIENT_ADDR_BYTES + 1 + 8 + 1 + 8;
+        bad[off..off + 4].copy_from_slice(&V1.to_be_bytes());
+        assert!(validate(&secret, &addr, &bad, 100).is_err());
     }
 
     #[test]
     fn retry_token_rejects_extra_trailing_bytes() {
         let secret = fixed_secret();
         let addr = encode_addr(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0));
-        let mut tok = mint(&secret, &addr, &[0u8; 8], &[0x09; 8], 100);
+        let mut tok = mint(&secret, &addr, &[0u8; 8], &[0x09; 8], V1, 100);
         tok.push(0); // append garbage
         assert!(validate(&secret, &addr, &tok, 100).is_err());
     }
@@ -488,7 +529,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             1234,
         ));
-        let tok = mint(&secret, &addr, &[1, 2, 3, 4], &[0x09; 8], 1000);
+        let tok = mint(&secret, &addr, &[1, 2, 3, 4], &[0x09; 8], V1, 1000);
         // Flip each byte in the tag region; every single-bit corruption
         // must be rejected. (Earlier-byte vs later-byte rejection takes
         // the same code path — constant-time `ct_eq` accumulates a

@@ -19,6 +19,8 @@ use crate::quic::cid::{CidPair, ConnectionId};
 use crate::quic::crypto::{AeadAlg, derive_dir_keys, derive_initial_secrets};
 use crate::quic::endpoint::Endpoint;
 use crate::quic::tls_glue::{HookHandle, build_hooks};
+use crate::quic::transport_params::TransportParameters;
+use crate::quic::version::QuicVersion;
 use crate::rng::OsRng;
 use crate::tls::Error;
 use crate::tls::conn::{ServerConfig, ServerConnection};
@@ -42,7 +44,7 @@ const MIN_INITIAL_DCID_LEN: usize = 8;
 /// ServerHello.
 pub(crate) fn build_tls_engine(
     tls_cfg: ServerConfig,
-    transport_params: Vec<u8>,
+    transport_params: TransportParameters,
 ) -> Result<(ServerConnection<OsRng>, HookHandle), Error> {
     let (hooks, handle) = build_hooks(transport_params);
     let engine = ServerConnection::new_for_quic(tls_cfg, OsRng, hooks as Box<_>);
@@ -52,17 +54,32 @@ pub(crate) fn build_tls_engine(
 /// Installs the Initial-level AEAD keys on `endpoint`, keyed by the
 /// client's chosen DCID. The client picked this DCID at random; per RFC
 /// 9001 §5.2 both Initial keys derive from
-/// `HKDF-Extract(initial_salt, client_dcid)`.
+/// `HKDF-Extract(initial_salt, client_dcid)`, with the salt and labels of
+/// `version` — the version of the Initial the DCID came in (RFC 9369 §3.3).
 ///
 /// `client_dcid` is the bytes the client wrote into the DCID slot of its
 /// first Initial long header.
-pub(crate) fn install_initial_keys(endpoint: &mut Endpoint, client_dcid: &[u8]) {
-    let (client_secret, server_secret) = derive_initial_secrets(client_dcid);
-    // On the server, Tx = "server in"; Rx = "client in".
-    endpoint.crypto.levels[Level::Initial as usize].tx =
-        Some(derive_dir_keys(AeadAlg::Aes128Gcm, &server_secret));
-    endpoint.crypto.levels[Level::Initial as usize].rx =
-        Some(derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret));
+pub(crate) fn install_initial_keys(
+    endpoint: &mut Endpoint,
+    version: QuicVersion,
+    client_dcid: &[u8],
+) {
+    let (tx, rx) = initial_keys(version, client_dcid);
+    endpoint.crypto.levels[Level::Initial as usize].tx = Some(tx);
+    endpoint.crypto.levels[Level::Initial as usize].rx = Some(rx);
+}
+
+/// The server's `(tx, rx)` Initial keys for a client DCID in `version`
+/// (RFC 9001 §5.2: on the server, Tx = "server in"; Rx = "client in").
+pub(crate) fn initial_keys(
+    version: QuicVersion,
+    client_dcid: &[u8],
+) -> (crate::quic::crypto::DirKeys, crate::quic::crypto::DirKeys) {
+    let (client_secret, server_secret) = derive_initial_secrets(version, client_dcid);
+    (
+        derive_dir_keys(version, AeadAlg::Aes128Gcm, &server_secret),
+        derive_dir_keys(version, AeadAlg::Aes128Gcm, &client_secret),
+    )
 }
 
 /// Derives just the *receive* direction of the Initial keys for a client
@@ -70,9 +87,12 @@ pub(crate) fn install_initial_keys(endpoint: &mut Endpoint, client_dcid: &[u8]) 
 /// first Initial under keys it has not yet committed to, so a forged packet
 /// cannot pin the connection's Initial keys to an attacker-chosen DCID —
 /// see `QuicConnection::commit_first_initial`.
-pub(crate) fn initial_rx_keys(client_dcid: &[u8]) -> crate::quic::crypto::DirKeys {
-    let (client_secret, _server_secret) = derive_initial_secrets(client_dcid);
-    derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret)
+pub(crate) fn initial_rx_keys(
+    version: QuicVersion,
+    client_dcid: &[u8],
+) -> crate::quic::crypto::DirKeys {
+    let (client_secret, _server_secret) = derive_initial_secrets(version, client_dcid);
+    derive_dir_keys(version, AeadAlg::Aes128Gcm, &client_secret)
 }
 
 /// Constructs a placeholder [`Endpoint`] with unset CIDs. The server's
@@ -110,8 +130,9 @@ use std::time::Instant;
 
 use crate::quic::connection::{MIN_INITIAL_DATAGRAM, QuicConfig, QuicConnection};
 use crate::quic::ecn::EcnCodepoint;
-use crate::quic::pkt::{LongHeader, LongType, QUIC_V1, build_version_negotiation};
+use crate::quic::pkt::{LongHeader, LongType, build_version_negotiation};
 use crate::quic::reset::{MIN_STATELESS_RESET_LEN, build_stateless_reset, stateless_reset_token};
+use crate::quic::version::SUPPORTED_VERSIONS;
 use crate::rng::RngCore;
 
 /// Parses the version-independent invariant fields of a long header
@@ -245,6 +266,13 @@ pub struct QuicServer {
     recently_closed: VecDeque<ClosedConnection>,
     /// Version Negotiation packets queued so far (RFC 9000 §6.1).
     version_negotiations: u64,
+    /// The QUIC versions this deployment offers, in preference order — the
+    /// list a Version Negotiation packet advertises (RFC 9000 §6.1 / RFC
+    /// 9368 §5) and the set of versions an Initial is accepted in. Defaults
+    /// to [`SUPPORTED_VERSIONS`]; keep it consistent with the
+    /// [`QuicConfig::versions`](crate::quic::QuicConfig::versions) the config
+    /// factory produces.
+    offered_versions: Vec<QuicVersion>,
     next_id: u64,
     now_secs: u64,
 }
@@ -305,6 +333,7 @@ impl QuicServer {
             pending: VecDeque::new(),
             recently_closed: VecDeque::new(),
             version_negotiations: 0,
+            offered_versions: SUPPORTED_VERSIONS.to_vec(),
             next_id: 0,
             now_secs: 0,
         })
@@ -328,6 +357,25 @@ impl QuicServer {
     /// peer that has proved nothing. Existing connections are never evicted.
     pub fn set_max_connections(&mut self, max: usize) {
         self.max_connections = max;
+    }
+
+    /// Sets the QUIC versions this router offers (RFC 9368 §5): the
+    /// Version Negotiation packet's list, and the versions an inbound
+    /// Initial is accepted in. Keep this the same as the
+    /// [`QuicConfig::versions`](crate::quic::QuicConfig::versions) the config
+    /// factory returns, so a client that clears an incompatible negotiation
+    /// with a version this list advertises actually connects. An empty list
+    /// is ignored (the default [`SUPPORTED_VERSIONS`] is kept), since a
+    /// server that offers no version could never be reached.
+    pub fn set_offered_versions(&mut self, versions: &[QuicVersion]) {
+        if !versions.is_empty() {
+            self.offered_versions = versions.to_vec();
+        }
+    }
+
+    /// The QUIC versions this router offers (RFC 9368 §5).
+    pub fn offered_versions(&self) -> &[QuicVersion] {
+        &self.offered_versions
     }
 
     /// Number of hosted connections whose peer address is not yet validated
@@ -392,13 +440,13 @@ impl QuicServer {
                 None => return Ok(()),
             };
             // Version 0 *is* a Version Negotiation packet, which a server never
-            // receives — drop. Any other non-v1 version draws a VN listing what
-            // we support (RFC 9000 §6.1); VN swaps the CIDs: its DCID echoes the
-            // client's SCID and vice versa (§17.2.1).
+            // receives — drop. A version we do not offer draws a VN listing
+            // the ones we do (RFC 9000 §6.1 / RFC 9368 §5); VN swaps the CIDs:
+            // its DCID echoes the client's SCID and vice versa (§17.2.1).
             if version == 0 {
                 return Ok(());
             }
-            if version != QUIC_V1 {
+            if QuicVersion::from_wire(version).is_none_or(|v| !self.offered_versions.contains(&v)) {
                 // RFC 9000 §14.1: "Servers MUST drop smaller packets that
                 // specify unsupported versions." M-3: without this a 7-byte
                 // spoofed datagram draws an 11-byte Version Negotiation at an
@@ -406,12 +454,13 @@ impl QuicServer {
                 if datagram.len() < MIN_INITIAL_DATAGRAM {
                     return Ok(());
                 }
-                let vn = build_version_negotiation(inv_scid, inv_dcid, &[QUIC_V1]);
+                let versions: Vec<u32> = self.offered_versions.iter().map(|v| v.wire()).collect();
+                let vn = build_version_negotiation(inv_scid, inv_dcid, &versions);
                 self.push_pending(from, EcnCodepoint::NotEct, vn);
                 self.version_negotiations = self.version_negotiations.saturating_add(1);
                 return Ok(());
             }
-            // v1 — now the full type-aware parse is valid.
+            // A version we offer — the full type-aware parse is valid.
             let hdr = match LongHeader::parse(datagram) {
                 Ok(h) => h,
                 Err(_) => return Ok(()),
@@ -771,6 +820,7 @@ mod server_tests {
     use super::*;
     use crate::ec::Ed25519PrivateKey;
     use crate::hash::Sha256;
+    use crate::quic::pkt::QUIC_V1;
     use crate::quic::transport_params::TransportParameters;
     use crate::rng::HmacDrbg;
     use crate::tls::{Config, Identity, ProtocolVersion, RootCertStore, SigningKey};

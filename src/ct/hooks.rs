@@ -462,6 +462,7 @@ pub mod quic {
         remove_header_protection,
     };
     use crate::quic::pn::decode_packet_number;
+    use crate::quic::version::QuicVersion;
     use crate::tls::Error;
     use alloc::vec::Vec;
 
@@ -478,7 +479,9 @@ pub mod quic {
     /// seal the payload with the header as AAD, then apply header
     /// protection with the mask of the ciphertext sample (the engines'
     /// send path).
+    #[allow(clippy::too_many_arguments)]
     pub fn protect(
+        version: QuicVersion,
         suite: Suite,
         secret: &[u8],
         dcid: &[u8],
@@ -487,7 +490,7 @@ pub mod quic {
         key_phase: bool,
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        let keys = derive_dir_keys(alg(suite), secret);
+        let keys = derive_dir_keys(version, alg(suite), secret);
         let (mut pkt, pn_offset) = build_short_header(dcid, false, key_phase, pn, pn_len);
         let mut body = payload.to_vec();
         let tag = aead_seal(&keys, pn, &pkt, &mut body);
@@ -508,13 +511,14 @@ pub mod quic {
     /// `largest_rx`, open the AEAD over the unprotected header, then check
     /// the reserved bits. Returns `(packet_number, first_byte, payload)`.
     pub fn unprotect(
+        version: QuicVersion,
         suite: Suite,
         secret: &[u8],
         dcid_len: usize,
         largest_rx: u64,
         datagram: &[u8],
     ) -> Result<(u64, u8, Vec<u8>), Error> {
-        let keys = derive_dir_keys(alg(suite), secret);
+        let keys = derive_dir_keys(version, alg(suite), secret);
         let hdr = ShortHeader::parse(datagram, dcid_len)?;
         let sample_start = hdr.pn_offset.checked_add(4).ok_or(Error::Decode)?;
         let sample_end = sample_start.checked_add(16).ok_or(Error::Decode)?;
@@ -548,11 +552,11 @@ pub mod quic {
     /// The RFC 9001 §6 key update: the next application secret (`"quic
     /// ku"`) and its AEAD key and IV, keeping the header-protection key of
     /// the current secret. Returns `next_secret ‖ key ‖ iv`.
-    pub fn key_update(suite: Suite, secret: &[u8]) -> Vec<u8> {
+    pub fn key_update(version: QuicVersion, suite: Suite, secret: &[u8]) -> Vec<u8> {
         let a = alg(suite);
-        let hp = derive_hp_key_bytes(a, secret);
-        let next = derive_next_application_secret(a, secret);
-        let keys = derive_dir_keys_preserve_hp(a, &next, &hp);
+        let hp = derive_hp_key_bytes(version, a, secret);
+        let next = derive_next_application_secret(version, a, secret);
+        let keys = derive_dir_keys_preserve_hp(version, a, &next, &hp);
         let mut out = next;
         out.extend_from_slice(&keys.key);
         out.extend_from_slice(&keys.iv);

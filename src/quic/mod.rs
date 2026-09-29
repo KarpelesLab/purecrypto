@@ -1,6 +1,7 @@
-//! QUIC v1 (RFC 9000) — transport layer over UDP, secured by TLS 1.3 keys
-//! per RFC 9001. Includes RFC 9002 loss recovery + congestion control and
-//! RFC 9221 unreliable datagram extension.
+//! QUIC v1 (RFC 9000) and v2 (RFC 9369) — transport layer over UDP, secured
+//! by TLS 1.3 keys per RFC 9001. Includes RFC 9002 loss recovery +
+//! congestion control, RFC 9221 unreliable datagram extension and RFC 9368
+//! compatible version negotiation.
 //!
 //! This module is sans-I/O: the engine takes wire datagrams via `feed`
 //! and produces wire datagrams via `pop`. The host wires it to a
@@ -57,6 +58,7 @@ pub(crate) mod streams;
 pub(crate) mod tls_glue;
 pub mod transport_params;
 pub(crate) mod varint;
+pub mod version;
 
 pub use connection::{
     CloseInfo, CloseInitiator, CloseKind, DEFAULT_MAX_IDLE_TIMEOUT_MS, QuicConfig, QuicConnection,
@@ -68,4 +70,5 @@ pub use peek::{peek_initial_sni, peek_initial_sni_datagrams};
 pub use crate::tls::ClientHelloInfo;
 pub use server::{ClosedConnection, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_HALF_OPEN, QuicServer};
 pub use stream::StreamId;
-pub use transport_params::{PreferredAddress, TransportParameters};
+pub use transport_params::{PreferredAddress, TransportParameters, VersionInformation};
+pub use version::{QuicVersion, SUPPORTED_VERSIONS};

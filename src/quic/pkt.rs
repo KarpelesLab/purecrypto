@@ -1,6 +1,8 @@
 //! RFC 9000 §17 — packet header serialization and parsing.
 //!
-//! QUIC v1 packets come in two header flavors:
+//! QUIC v1 packets (and v2 ones, RFC 9369: same layout, different Version
+//! field and Long Packet Type code points — see [`QuicVersion`]) come in two
+//! header flavors:
 //!
 //! * **Long header** (§17.2) — Initial, 0-RTT, Handshake, Retry, plus the
 //!   special Version Negotiation form (§17.2.1, version field = 0).
@@ -24,44 +26,35 @@ use alloc::vec::Vec;
 
 use crate::cipher::{Aes128, Gcm};
 use crate::quic::varint;
+use crate::quic::version::QuicVersion;
 use crate::tls::Error;
 
-/// QUIC version 1 (RFC 9000): the only version this stack speaks.
-pub(crate) const QUIC_V1: u32 = 0x0000_0001;
+/// The wire value of QUIC version 1 (RFC 9000), for the tests and the few
+/// places that compare a raw Version field.
+pub(crate) const QUIC_V1: u32 = QuicVersion::V1.wire();
 
 /// Long-header packet type (RFC 9000 §17.2, Table 5).
 ///
-/// The 2-bit Long Packet Type lives in bits 5..4 of byte 0 (mask 0x30);
-/// these are the constants `0..3` shifted into that position.
-#[repr(u8)]
+/// The 2-bit Long Packet Type lives in bits 5..4 of byte 0 (mask 0x30). The
+/// code point of each type depends on the version — RFC 9369 §3.2 permutes
+/// them in v2 — so the mapping lives on [`QuicVersion::long_type_bits`] /
+/// [`QuicVersion::long_type_from_bits`] and this enum carries no wire value.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LongType {
-    Initial = 0x00,
-    ZeroRtt = 0x01,
-    Handshake = 0x02,
-    Retry = 0x03,
+    Initial,
+    ZeroRtt,
+    Handshake,
+    Retry,
 }
 
 impl LongType {
-    /// Maps the raw 2-bit type field (already shifted into 0..=3) to the
-    /// enum. Returns `None` if the value is out of range — it cannot be,
-    /// but the conversion is total at the type level.
-    fn from_bits(bits: u8) -> Option<Self> {
-        Some(match bits & 0x03 {
-            0x00 => Self::Initial,
-            0x01 => Self::ZeroRtt,
-            0x02 => Self::Handshake,
-            0x03 => Self::Retry,
-            _ => return None,
-        })
-    }
-
     /// First-byte template for an unprotected long-header packet with this
-    /// type. Sets Header Form (0x80), Fixed Bit (0x40), and the 2-bit Long
-    /// Packet Type (mask 0x30); the low 4 bits — Reserved (0x0c) and PN
-    /// Length (0x03) — are filled in by the caller. RFC 9000 §17.2.
-    fn first_byte_template(self) -> u8 {
-        0x80 | 0x40 | ((self as u8) << 4)
+    /// type in `version`. Sets Header Form (0x80), Fixed Bit (0x40), and the
+    /// 2-bit Long Packet Type (mask 0x30) of the version; the low 4 bits —
+    /// Reserved (0x0c) and PN Length (0x03) — are filled in by the caller.
+    /// RFC 9000 §17.2 / RFC 9369 §3.2.
+    fn first_byte_template(self, version: QuicVersion) -> u8 {
+        0x80 | 0x40 | (version.long_type_bits(self) << 4)
     }
 }
 
@@ -105,6 +98,15 @@ impl<'a> LongHeader<'a> {
     /// Returns [`Error::Decode`] for any wire-syntax violation (RFC 9000
     /// §17.2: CID lengths > 20 in v1, missing Fixed Bit, truncated buffer,
     /// varint decode failure, …).
+    ///
+    /// The Long Packet Type is read with the code-point table of the
+    /// header's own Version field (RFC 9369 §3.2 permutes it in v2), so a
+    /// v2 packet carrying v1's Initial code point parses as the v2 packet
+    /// type that code point names — a Retry — never as an Initial. A
+    /// version this stack does not speak is read with the v1 table; only
+    /// the RFC 8999 invariant fields (`version`, `dcid`, `scid`) are
+    /// meaningful for such a packet, and every caller checks `version`
+    /// before it looks at anything else.
     pub(crate) fn parse(buf: &'a [u8]) -> Result<Self, Error> {
         if buf.is_empty() {
             return Err(Error::Decode);
@@ -161,7 +163,9 @@ impl<'a> LongHeader<'a> {
         if b0 & 0x40 == 0 {
             return Err(Error::Decode);
         }
-        let typ = LongType::from_bits((b0 >> 4) & 0x03).ok_or(Error::Decode)?;
+        let typ = QuicVersion::from_wire(version)
+            .unwrap_or(QuicVersion::V1)
+            .long_type_from_bits(b0 >> 4);
 
         let mut p = 5usize;
         let dcid_len = *buf.get(p).ok_or(Error::Decode)? as usize;
@@ -263,11 +267,12 @@ impl<'a> LongHeader<'a> {
 /// remainder of the packet (that is, the Packet Number and Payload
 /// fields) in bytes").
 ///
-/// Token must be empty unless `typ == Initial`.
+/// Token must be empty unless `typ == Initial`. `version` selects both the
+/// Version field and the Long Packet Type code point (RFC 9369 §3.2).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_long_header(
     typ: LongType,
-    version: u32,
+    version: QuicVersion,
     dcid: &[u8],
     scid: &[u8],
     token: &[u8],
@@ -285,8 +290,8 @@ pub(crate) fn build_long_header(
     // First byte: long-header template plus low 2 bits = pn_len - 1
     // (RFC 9000 §17.2 "Packet Number Length"). The Reserved bits (mask
     // 0x0c) are zero.
-    out.push(typ.first_byte_template() | (pn_len - 1));
-    out.extend_from_slice(&version.to_be_bytes());
+    out.push(typ.first_byte_template(version) | (pn_len - 1));
+    out.extend_from_slice(&version.wire().to_be_bytes());
     out.push(dcid.len() as u8);
     out.extend_from_slice(dcid);
     out.push(scid.len() as u8);
@@ -487,21 +492,6 @@ pub(crate) fn check_reserved_bits(first_byte: u8, long_header: bool) -> Result<(
     Ok(())
 }
 
-/// RFC 9001 §5.8 — fixed AES-128-GCM key for the Retry Integrity Tag,
-/// `0xbe0c690b9f66575a1d766b54e368c84e`. Derived in the RFC from the
-/// retry secret `0xd9c9943e6101fd200021506bcc02814c73030f25c79d71ce876e\
-/// ca876e6fca8e` via `HKDF-Expand-Label(secret, "quic key", "", 16)`,
-/// but the spec gives the final value directly and we use it as-is — the
-/// key is constant for QUIC v1.
-const RETRY_INTEGRITY_KEY_V1: [u8; 16] = [
-    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
-];
-
-/// RFC 9001 §5.8 — fixed 96-bit nonce `0x461599d35d632bf2239825bb`.
-const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
-    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
-];
-
 /// RFC 9001 §5.8 — compute the 16-byte Retry Integrity Tag.
 ///
 /// The pseudo-packet (RFC 9001 §5.8 Figure 8) is:
@@ -528,17 +518,24 @@ const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
 /// the integrity-tag slot — i.e. `first_byte || version || dcid_len ||
 /// dcid || scid_len || scid || retry_token`. The function builds the
 /// pseudo-packet AAD by prepending `ODCID_len || ODCID`, then runs
-/// AES-128-GCM with the fixed retry key+nonce over an empty plaintext.
-pub(crate) fn retry_integrity_tag(odcid: &[u8], retry_unauth: &[u8]) -> [u8; 16] {
+/// AES-128-GCM with the fixed retry key+nonce of `version` (RFC 9001 §5.8
+/// for v1, RFC 9369 §3.3.3 for v2) over an empty plaintext. `version` is
+/// the one in the Retry packet's own Version field: a Retry is sent in the
+/// version of the Initial it answers (RFC 9369 §4.1).
+pub(crate) fn retry_integrity_tag(
+    version: QuicVersion,
+    odcid: &[u8],
+    retry_unauth: &[u8],
+) -> [u8; 16] {
     let mut aad = Vec::with_capacity(1 + odcid.len() + retry_unauth.len());
     aad.push(odcid.len() as u8);
     aad.extend_from_slice(odcid);
     aad.extend_from_slice(retry_unauth);
 
-    let aes = Aes128::new(&RETRY_INTEGRITY_KEY_V1);
+    let aes = Aes128::new(version.retry_integrity_key());
     let g: Gcm<Aes128> = Gcm::new(aes);
     let mut empty: [u8; 0] = [];
-    g.encrypt(&RETRY_INTEGRITY_NONCE_V1, &aad, &mut empty)
+    g.encrypt(version.retry_integrity_nonce(), &aad, &mut empty)
 }
 
 /// Build the unprotected portion of a Retry packet — every byte from the
@@ -547,10 +544,11 @@ pub(crate) fn retry_integrity_tag(odcid: &[u8], retry_unauth: &[u8]) -> [u8; 16]
 /// 16-byte tag and concatenate.
 ///
 /// First byte for Retry (RFC 9000 §17.2.5): Header Form (0x80) + Fixed
-/// Bit (0x40) + Long Packet Type 3 (0x30). The low 4 bits (Unused per
-/// §17.2.5) are arbitrary; we emit zero for determinism in tests.
+/// Bit (0x40) + the version's Retry code point (0x30 in v1, 0x00 in v2 —
+/// RFC 9369 §3.2). The low 4 bits (Unused per §17.2.5) are arbitrary; we
+/// emit zero for determinism in tests.
 pub(crate) fn build_retry_unauth(
-    version: u32,
+    version: QuicVersion,
     dcid: &[u8],
     scid: &[u8],
     retry_token: &[u8],
@@ -558,8 +556,8 @@ pub(crate) fn build_retry_unauth(
     debug_assert!(dcid.len() <= 20);
     debug_assert!(scid.len() <= 20);
     let mut out = Vec::with_capacity(7 + dcid.len() + scid.len() + retry_token.len());
-    out.push(0x80 | 0x40 | 0x30); // Retry first byte (Unused bits = 0).
-    out.extend_from_slice(&version.to_be_bytes());
+    out.push(LongType::Retry.first_byte_template(version)); // Unused bits = 0.
+    out.extend_from_slice(&version.wire().to_be_bytes());
     out.push(dcid.len() as u8);
     out.extend_from_slice(dcid);
     out.push(scid.len() as u8);
@@ -571,14 +569,14 @@ pub(crate) fn build_retry_unauth(
 /// Build a full Retry packet — the unprotected portion followed by the
 /// 16-byte integrity tag (RFC 9001 §5.8).
 pub(crate) fn build_retry(
-    version: u32,
+    version: QuicVersion,
     dcid: &[u8],
     scid: &[u8],
     retry_token: &[u8],
     odcid: &[u8],
 ) -> Vec<u8> {
     let mut pkt = build_retry_unauth(version, dcid, scid, retry_token);
-    let tag = retry_integrity_tag(odcid, &pkt);
+    let tag = retry_integrity_tag(version, odcid, &pkt);
     pkt.extend_from_slice(&tag);
     pkt
 }
@@ -612,6 +610,7 @@ pub(crate) fn build_version_negotiation(dcid: &[u8], scid: &[u8], versions: &[u3
 mod tests {
     use super::*;
     use crate::quic::crypto::{AeadAlg, derive_dir_keys, derive_initial_secrets};
+    use QuicVersion::{V1, V2};
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -658,7 +657,7 @@ mod tests {
         let token: [u8; 0] = [];
         let (hdr, pn_off) = build_long_header(
             LongType::Initial,
-            QUIC_V1,
+            V1,
             &dcid,
             &scid,
             &token,
@@ -694,8 +693,7 @@ mod tests {
         //   c1000000010008f067a5502a4262b50040750001
         let dcid: [u8; 0] = [];
         let scid = hex("f067a5502a4262b5");
-        let (hdr, pn_off) =
-            build_long_header(LongType::Initial, QUIC_V1, &dcid, &scid, &[], 1, 2, 117);
+        let (hdr, pn_off) = build_long_header(LongType::Initial, V1, &dcid, &scid, &[], 1, 2, 117);
         assert_eq!(
             hdr.as_slice(),
             hex("c1000000010008f067a5502a4262b50040750001").as_slice(),
@@ -716,7 +714,7 @@ mod tests {
         for pn_len in 1u8..=4 {
             let (hdr, pn_off) = build_long_header(
                 LongType::Handshake,
-                QUIC_V1,
+                V1,
                 &[1, 2, 3, 4],
                 &[5, 6, 7, 8],
                 &[],
@@ -768,7 +766,7 @@ mod tests {
         // original bytes plus the original PN length.
         let (mut hdr, pn_off) = build_long_header(
             LongType::Initial,
-            QUIC_V1,
+            V1,
             &hex("8394c8f03e515708"),
             &[],
             &[],
@@ -875,7 +873,7 @@ mod tests {
         unauth.extend_from_slice(&hex("f067a5502a4262b5"));
         unauth.extend_from_slice(b"token");
 
-        let tag = retry_integrity_tag(&odcid, &unauth);
+        let tag = retry_integrity_tag(V1, &odcid, &unauth);
         assert_eq!(
             tag.as_slice(),
             hex("04a265ba2eff4d829058fb3f0f2496ba").as_slice()
@@ -898,13 +896,190 @@ mod tests {
     fn build_retry_tag_matches_helper() {
         let odcid = hex("8394c8f03e515708");
         let scid = hex("f067a5502a4262b5");
-        let pkt = build_retry(QUIC_V1, &[], &scid, b"token", &odcid);
+        let pkt = build_retry(V1, &[], &scid, b"token", &odcid);
         // The tag should validate against the same call shape used by
         // peers receiving the packet.
         let unauth_len = pkt.len() - 16;
         let tag_field: [u8; 16] = pkt[unauth_len..].try_into().expect("16");
-        let computed = retry_integrity_tag(&odcid, &pkt[..unauth_len]);
+        let computed = retry_integrity_tag(V1, &odcid, &pkt[..unauth_len]);
         assert_eq!(tag_field, computed);
+    }
+
+    // -------- RFC 9369 Appendix A — QUIC v2 -----------------------------
+
+    /// RFC 9369 §A.2: the v2 client Initial header — Version `0x6b3343cf`
+    /// and the v2 Initial code point `0b01` (first byte `0xd3`, not v1's
+    /// `0xc3`) — and its protection under the v2 keys.
+    #[test]
+    fn rfc9369_a2_client_initial() {
+        let dcid = hex("8394c8f03e515708");
+        let (hdr, pn_off) = build_long_header(LongType::Initial, V2, &dcid, &[], &[], 2, 4, 1182);
+        assert_eq!(
+            hdr.as_slice(),
+            hex("d36b3343cf088394c8f03e5157080000449e00000002").as_slice()
+        );
+        let parsed = LongHeader::parse(&hdr).expect("parse");
+        assert_eq!(parsed.typ, LongType::Initial);
+        assert_eq!(parsed.version, V2.wire());
+        assert_eq!(parsed.dcid, dcid.as_slice());
+        assert_eq!(parsed.pn_offset, 18);
+
+        // Same CRYPTO frame as RFC 9001 §A.2, padded to 1162 bytes.
+        let mut payload = hex(
+            "060040f1010000ed0303ebf8fa56f12939b9584a3896472ec40bb863cfd3e868\
+             04fe3a47f06a2b69484c000004130113\
+             02010000c000000010000e00000b6578\
+             616d706c652e636f6dff01000100000a\
+             00080006001d00170018001000070005\
+             04616c706e000500050100000000\
+             003300260024001d00209370b2c9caa47fba\
+             baf4559fedba753de171fa71f50f1ce1\
+             5d43e994ec74d748002b00030203040\
+             00d0010000e040305030603020308040\
+             8050806002d00020101001c00024001\
+             003900320408ffffffffffffffff050480\
+             00ffff07048000ffff080110010480\
+             0075300901100f088394c8f03e515708\
+             06048000ffff",
+        );
+        payload.resize(1162, 0);
+        let (cs, _) = derive_initial_secrets(V2, &dcid);
+        let dk = derive_dir_keys(V2, AeadAlg::Aes128Gcm, &cs);
+        let tag = crate::quic::crypto::aead_seal(&dk, 2, &hdr, &mut payload);
+        let mut wire = hdr.clone();
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(&tag);
+        // sample = ffe67b6abcdb4298b485dd04de806071, mask = 94a0c95e80.
+        let sample: [u8; 16] = wire[pn_off + 4..pn_off + 20].try_into().expect("16");
+        assert_eq!(
+            &sample[..],
+            hex("ffe67b6abcdb4298b485dd04de806071").as_slice()
+        );
+        let mask = dk.hp.mask(&sample).expect("mask");
+        assert_eq!(mask.as_slice(), hex("94a0c95e80").as_slice());
+        apply_header_protection(&mut wire, pn_off, 4, &mask, true);
+        let expected = hex("d76b3343cf088394c8f03e5157080000449ea0c95e82ffe67b6abcdb4298b485");
+        assert_eq!(&wire[..expected.len()], expected.as_slice());
+        assert_eq!(wire.len(), 1200);
+        // The AEAD tag is the last 16 bytes of the §A.2 protected packet.
+        assert_eq!(
+            &wire[wire.len() - 16..],
+            hex("a18b2faa745b6fe189cf772a9f84cbfc").as_slice()
+        );
+    }
+
+    /// RFC 9369 §A.3: the v2 server Initial (2-byte packet number, packet
+    /// number 1) — first byte `0xd1` unprotected, `0xdc` protected.
+    #[test]
+    fn rfc9369_a3_server_initial() {
+        let scid = hex("f067a5502a4262b5");
+        let (hdr, pn_off) = build_long_header(LongType::Initial, V2, &[], &scid, &[], 1, 2, 117);
+        assert_eq!(
+            hdr.as_slice(),
+            hex("d16b3343cf0008f067a5502a4262b50040750001").as_slice()
+        );
+        let mut payload = hex(
+            "02000000000600405a020000560303eefce7f7b37ba1d1632e96677825ddf739\
+             88cfc79825df566dc5430b9a045a1200130100002e00330024001d00209d3c94\
+             0d89690b84d08a60993c144eca684d1081287c834d5311bcf32bb9da1a002b00\
+             020304",
+        );
+        let dcid = hex("8394c8f03e515708");
+        let (_, ss) = derive_initial_secrets(V2, &dcid);
+        let dk = derive_dir_keys(V2, AeadAlg::Aes128Gcm, &ss);
+        let tag = crate::quic::crypto::aead_seal(&dk, 1, &hdr, &mut payload);
+        let mut wire = hdr.clone();
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(&tag);
+        let sample: [u8; 16] = wire[pn_off + 4..pn_off + 20].try_into().expect("16");
+        assert_eq!(
+            &sample[..],
+            hex("6f05d8a4398c47089698baeea26b91eb").as_slice()
+        );
+        let mask = dk.hp.mask(&sample).expect("mask");
+        assert_eq!(mask.as_slice(), hex("4dd92e91ea").as_slice());
+        apply_header_protection(&mut wire, pn_off, 2, &mask, true);
+        assert_eq!(
+            wire.as_slice(),
+            hex(
+                "dc6b3343cf0008f067a5502a4262b5004075d92faaf16f05d8a4398c47089698\
+                 baeea26b91eb761d9b89237bbf87263017915358230035f7fd3945d88965cf17\
+                 f9af6e16886c61bfc703106fbaf3cb4cfa52382dd16a393e42757507698075b2\
+                 c984c707f0a0812d8cd5a6881eaf21ceda98f4bd23f6fe1a3e2c43edd9ce7ca8\
+                 4bed8521e2e140"
+            )
+            .as_slice()
+        );
+    }
+
+    /// RFC 9369 §A.4: the v2 Retry packet — Retry code point `0b00` and the
+    /// v2 integrity key + nonce (§3.3.3). The §A.4 sample fixes the Unused
+    /// bits to `1111` (first byte `0xcf`), so — like the §A.4 v1 test — we
+    /// rebuild the same unauth bytes and check the tag directly rather than
+    /// against `build_retry`, which emits `0` for the Unused bits (§17.2.5:
+    /// they are arbitrary).
+    #[test]
+    fn rfc9369_a4_retry() {
+        let odcid = hex("8394c8f03e515708");
+        let mut unauth = Vec::new();
+        unauth.push(0xcf); // v2 Retry first byte, Unused = 0b1111.
+        unauth.extend_from_slice(&V2.wire().to_be_bytes());
+        unauth.push(0x00); // DCID len = 0.
+        unauth.push(0x08); // SCID len = 8.
+        unauth.extend_from_slice(&hex("f067a5502a4262b5"));
+        unauth.extend_from_slice(b"token");
+        let tag = retry_integrity_tag(V2, &odcid, &unauth);
+        assert_eq!(
+            tag.as_slice(),
+            hex("c8646ce8bfe33952d955543665dcc7b6").as_slice()
+        );
+        let mut full = unauth.clone();
+        full.extend_from_slice(&tag);
+        assert_eq!(
+            full.as_slice(),
+            hex("cf6b3343cf0008f067a5502a4262b5746f6b656ec8646ce8bfe33952d955543665dcc7b6")
+                .as_slice()
+        );
+        // The parser identifies a v2 Retry from its version + code point.
+        let parsed = LongHeader::parse(&full).expect("parse");
+        assert_eq!(parsed.typ, LongType::Retry);
+        assert_eq!(parsed.token, b"token");
+        // The v1 key over the same bytes gives another tag: a Retry is
+        // authenticated in the version it was sent in.
+        assert_ne!(retry_integrity_tag(V1, &odcid, &unauth), tag);
+        // And `build_retry` (Unused = 0) round-trips against the tag helper.
+        let built = build_retry(V2, &[], &hex("f067a5502a4262b5"), b"token", &odcid);
+        assert_eq!(built[0], 0xc0);
+        assert_eq!(
+            &built[built.len() - 16..],
+            retry_integrity_tag(V2, &odcid, &built[..built.len() - 16]).as_slice()
+        );
+    }
+
+    /// RFC 9369 §3.2 — the version field decides how the type bits are
+    /// read: the byte that is an Initial in v1 (`0xc0`) is a Retry in v2,
+    /// and v2's Initial (`0xd0`) is a 0-RTT packet in v1.
+    #[test]
+    fn long_type_code_points_follow_the_version() {
+        for (first, version, typ) in [
+            (0xc0u8, V1, LongType::Initial),
+            (0xd0, V1, LongType::ZeroRtt),
+            (0xe0, V1, LongType::Handshake),
+            (0xf0, V1, LongType::Retry),
+            (0xc0, V2, LongType::Retry),
+            (0xd0, V2, LongType::Initial),
+            (0xe0, V2, LongType::ZeroRtt),
+            (0xf0, V2, LongType::Handshake),
+        ] {
+            let mut buf = alloc::vec![first];
+            buf.extend_from_slice(&version.wire().to_be_bytes());
+            buf.extend_from_slice(&[0, 0]); // empty DCID and SCID
+            // Enough trailing bytes for any type's fixed fields: a Retry
+            // wants 16 tag bytes, the others a token length / Length varint.
+            buf.extend_from_slice(&[0u8; 20]);
+            let hdr = LongHeader::parse(&buf).expect("parse");
+            assert_eq!(hdr.typ, typ, "first byte {first:#x} in {version}");
+        }
     }
 
     // -------- Version Negotiation --------------------------------------
@@ -973,8 +1148,7 @@ mod tests {
     #[test]
     fn rfc9001_a2_end_to_end_protected_header_prefix() {
         let dcid = hex("8394c8f03e515708");
-        let (hdr, pn_off) =
-            build_long_header(LongType::Initial, QUIC_V1, &dcid, &[], &[], 2, 4, 1182);
+        let (hdr, pn_off) = build_long_header(LongType::Initial, V1, &dcid, &[], &[], 2, 4, 1182);
         // Construct §A.2 plaintext (1162 bytes).
         let crypto_frame = hex(
             "060040f1010000ed0303ebf8fa56f12939b9584a3896472ec40bb863cfd3e868\
@@ -996,8 +1170,8 @@ mod tests {
         let mut payload = crypto_frame;
         payload.resize(1162, 0);
 
-        let (cs, _) = derive_initial_secrets(&dcid);
-        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &cs);
+        let (cs, _) = derive_initial_secrets(V1, &dcid);
+        let dk = derive_dir_keys(V1, AeadAlg::Aes128Gcm, &cs);
         let tag = crate::quic::crypto::aead_seal(&dk, 2, &hdr, &mut payload);
 
         // Now `hdr || payload || tag` is the full unprotected-header wire

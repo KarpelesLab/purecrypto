@@ -22,8 +22,9 @@ use crate::tls::{ClientHelloInfo, Error};
 use super::crypto::{AeadAlg, DirKeys, aead_open, derive_dir_keys, derive_initial_secrets};
 use super::crypto_buf::CryptoBuf;
 use super::frame::Frame;
-use super::pkt::{LongHeader, LongType, QUIC_V1, remove_header_protection};
+use super::pkt::{LongHeader, LongType, remove_header_protection};
 use super::pn::decode_packet_number;
+use super::version::QuicVersion;
 
 /// Inspects the first QUIC **Initial** packet in `datagram` and extracts the
 /// ClientHello's SNI + offered ALPN, **without consuming or mutating `datagram`**.
@@ -38,8 +39,8 @@ use super::pn::decode_packet_number;
 ///   browsers) needs two, and the ALPN extension lands in the second. Keep
 ///   the datagram and hand it, with the next one from the same client, to
 ///   [`peek_initial_sni_datagrams`].
-/// - `Err(_)` — not a QUIC v1 Initial long-header packet
-///   ([`Error::UnsupportedVersion`] for a non-v1 version), or the AEAD tag failed
+/// - `Err(_)` — not a QUIC v1 or v2 Initial long-header packet
+///   ([`Error::UnsupportedVersion`] for any other version), or the AEAD tag failed
 ///   (wrong DCID / tampered / not actually an Initial we can read), or the frames
 ///   were malformed.
 ///
@@ -59,9 +60,10 @@ pub fn peek_initial_sni(datagram: &[u8]) -> Result<Option<ClientHelloInfo>, Erro
 /// [`peek_initial_sni`] over the Initial packets of several datagrams from the
 /// same client, in the order they arrived — for a ClientHello that did not
 /// fit the first one (see there). Each datagram is checked like the single
-/// one: it must start with a readable QUIC v1 Initial keyed by its own DCID
-/// (all of a client's first Initials share the DCID, so the keys are derived
-/// once), and the CRYPTO stream is reassembled across all of them. Returns
+/// one: it must start with a readable QUIC v1 or v2 Initial keyed by its own
+/// DCID (all of a client's first Initials share the DCID and version, so the
+/// keys are derived once), and the CRYPTO stream is reassembled across all
+/// of them. Returns
 /// `Ok(None)` while the ClientHello is still incomplete.
 pub fn peek_initial_sni_datagrams(datagrams: &[&[u8]]) -> Result<Option<ClientHelloInfo>, Error> {
     // The ClientHello's CRYPTO stream can be split across several Initial
@@ -72,9 +74,9 @@ pub fn peek_initial_sni_datagrams(datagrams: &[&[u8]]) -> Result<Option<ClientHe
     // bound a pre-handshake flood.
     let mut crypto = CryptoBuf::new();
     let mut handshake: Vec<u8> = Vec::new();
-    // A client's first Initials share its chosen DCID, so the keys are
-    // derived once and re-derived only if a datagram names another.
-    let mut keys: Option<(Vec<u8>, DirKeys)> = None;
+    // A client's first Initials share its chosen DCID and version, so the
+    // keys are derived once and re-derived only if a datagram names another.
+    let mut keys: Option<(QuicVersion, Vec<u8>, DirKeys)> = None;
 
     for datagram in datagrams {
         if let Some(info) = peek_datagram_crypto(datagram, &mut keys, &mut crypto, &mut handshake)?
@@ -92,7 +94,7 @@ pub fn peek_initial_sni_datagrams(datagrams: &[&[u8]]) -> Result<Option<ClientHe
 /// soon as it is complete.
 fn peek_datagram_crypto(
     datagram: &[u8],
-    keys: &mut Option<(Vec<u8>, DirKeys)>,
+    keys: &mut Option<(QuicVersion, Vec<u8>, DirKeys)>,
     crypto: &mut CryptoBuf,
     handshake: &mut Vec<u8>,
 ) -> Result<Option<ClientHelloInfo>, Error> {
@@ -108,14 +110,15 @@ fn peek_datagram_crypto(
             Err(_) if off > 0 => break,
             Err(e) => return Err(e),
         };
-        // Only QUIC v1 has a defined Initial salt here (also catches Version
+        // Only the versions this stack speaks have an Initial salt here
+        // (RFC 9001 §5.2 / RFC 9369 §3.3.1; also catches Version
         // Negotiation, version == 0).
-        if hdr.version != QUIC_V1 {
+        let Some(version) = QuicVersion::from_wire(hdr.version) else {
             if off == 0 {
                 return Err(Error::UnsupportedVersion);
             }
             break;
-        }
+        };
         if hdr.typ != LongType::Initial {
             // 0-RTT / Handshake / Retry don't carry the ClientHello, and their
             // keys aren't derivable here; stop at the first non-Initial.
@@ -138,15 +141,20 @@ fn peek_datagram_crypto(
             break;
         }
 
-        // RFC 9001 §5.2: derive the client's Initial read keys from the DCID.
-        if keys.as_ref().is_none_or(|(dcid, _)| dcid != hdr.dcid) {
-            let (client_secret, _server_secret) = derive_initial_secrets(hdr.dcid);
+        // RFC 9001 §5.2: derive the client's Initial read keys from the DCID
+        // (and the version's salt and labels).
+        if keys
+            .as_ref()
+            .is_none_or(|(v, dcid, _)| *v != version || dcid != hdr.dcid)
+        {
+            let (client_secret, _server_secret) = derive_initial_secrets(version, hdr.dcid);
             *keys = Some((
+                version,
                 hdr.dcid.to_vec(),
-                derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret),
+                derive_dir_keys(version, AeadAlg::Aes128Gcm, &client_secret),
             ));
         }
-        let keys = &keys.as_ref().expect("derived above").1;
+        let keys = &keys.as_ref().expect("derived above").2;
 
         // Owned copy of this packet — header protection and AEAD mutate it, and
         // we must not touch the caller's `datagram`.
@@ -281,15 +289,54 @@ mod tests {
     #[test]
     fn unknown_version_is_rejected() {
         let mut dg = client_initial_datagram("x.example", &[b"h3"]);
-        // Flip the version field (bytes 1..5) to a non-v1 value.
-        dg[1] = 0x6b;
-        dg[2] = 0x33;
-        dg[3] = 0x43;
-        dg[4] = 0xcf;
+        // Flip the version field (bytes 1..5) to a value this stack does not
+        // speak (the RFC 9369 §9 provisional draft code point).
+        dg[1] = 0x70;
+        dg[2] = 0x9a;
+        dg[3] = 0x50;
+        dg[4] = 0xc4;
         assert!(matches!(
             peek_initial_sni(&dg),
             Err(Error::UnsupportedVersion)
         ));
+    }
+
+    /// A v2 first flight (RFC 9369) is read with the v2 salt and labels; a
+    /// v1 flight relabelled as v2 fails its AEAD tag rather than being read
+    /// under the wrong keys.
+    #[test]
+    fn peeks_a_v2_initial() {
+        let tls = crate::tls::Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .tls_only()
+            .server_name("v2.example")
+            .verify_certificates(false)
+            .alpn(alloc::vec![b"h3".to_vec()])
+            .build();
+        let cfg = QuicConfig {
+            tls,
+            original_version: Some(QuicVersion::V2),
+            ..QuicConfig::default()
+        };
+        let mut client = QuicConnection::client(cfg, "v2.example").expect("client");
+        let mut flight = Vec::new();
+        loop {
+            let dg = client.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            flight.push(dg);
+        }
+        assert_eq!(&flight[0][1..5], &QuicVersion::V2.wire().to_be_bytes());
+        let refs: Vec<&[u8]> = flight.iter().map(Vec::as_slice).collect();
+        let info = peek_initial_sni_datagrams(&refs)
+            .expect("ok")
+            .expect("complete CH");
+        assert_eq!(info.server_name.as_deref(), Some("v2.example"));
+
+        let mut relabelled = client_initial_datagram("x.example", &[b"h3"]);
+        relabelled[1..5].copy_from_slice(&QuicVersion::V2.wire().to_be_bytes());
+        assert!(peek_initial_sni(&relabelled).is_err());
     }
 
     #[test]
@@ -322,14 +369,14 @@ mod tests {
     fn seal_initial(dcid: &[u8], plaintext: &mut [u8]) -> Vec<u8> {
         use super::super::crypto::aead_seal;
         use super::super::pkt::{apply_header_protection, build_long_header};
-        let (cs, _ss) = derive_initial_secrets(dcid);
-        let keys = derive_dir_keys(AeadAlg::Aes128Gcm, &cs);
+        let (cs, _ss) = derive_initial_secrets(QuicVersion::V1, dcid);
+        let keys = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &cs);
         let pn: u64 = 0;
         let pn_len: u8 = 1;
         let payload_len_field = pn_len as u64 + plaintext.len() as u64 + 16;
         let (hdr, pn_offset) = build_long_header(
             LongType::Initial,
-            QUIC_V1,
+            QuicVersion::V1,
             dcid,
             &[],
             &[],

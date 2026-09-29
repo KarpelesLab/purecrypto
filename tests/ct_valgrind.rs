@@ -1407,26 +1407,39 @@ fn dtls13_cid_records() -> String {
 }
 
 fn quic_packets() -> String {
+    use purecrypto::quic::QuicVersion;
     let mut out = Vec::new();
+    // Cover both QUIC versions: v2 (RFC 9369) uses the same primitives with
+    // different HKDF labels, so the constant-time property must hold there too.
     for (i, suite) in SUITES.into_iter().enumerate() {
-        let tag = 360 + 10 * i as u64;
-        let secret = secret_bytes::<48>(tag);
-        let secret = &secret[..hash_len(suite)];
-        let payload = secret_bytes::<120>(tag + 1);
-        let expected = public_copy(&payload);
-        let dcid = fixed_bytes::<8>(tag + 2);
-        let pn = 0x1a_2b3c;
-        let pkt = hooks::quic::protect(suite, secret, &dcid, pn, 3, true, &payload).expect("seal");
-        declassify(&pkt);
-        let (got_pn, first, got) =
-            hooks::quic::unprotect(suite, secret, dcid.len(), pn - 5, &pkt).expect("authentic");
-        declassify(&got);
-        assert_eq!((got_pn, first & 0x04, &got[..]), (pn, 0x04, &expected[..]));
-        let mut bad = pkt.clone();
-        bad[40] ^= 1;
-        assert!(hooks::quic::unprotect(suite, secret, dcid.len(), pn - 5, &bad).is_err());
-        let next = hooks::quic::key_update(suite, secret);
-        out.push(format!("pkt={} ku={}", hex8(&pkt), hex8(public(&next[..]))));
+        for version in [QuicVersion::V1, QuicVersion::V2] {
+            let tag = 360 + 10 * i as u64;
+            let secret = secret_bytes::<48>(tag);
+            let secret = &secret[..hash_len(suite)];
+            let payload = secret_bytes::<120>(tag + 1);
+            let expected = public_copy(&payload);
+            let dcid = fixed_bytes::<8>(tag + 2);
+            let pn = 0x1a_2b3c;
+            let pkt = hooks::quic::protect(version, suite, secret, &dcid, pn, 3, true, &payload)
+                .expect("seal");
+            declassify(&pkt);
+            let (got_pn, first, got) =
+                hooks::quic::unprotect(version, suite, secret, dcid.len(), pn - 5, &pkt)
+                    .expect("authentic");
+            declassify(&got);
+            assert_eq!((got_pn, first & 0x04, &got[..]), (pn, 0x04, &expected[..]));
+            let mut bad = pkt.clone();
+            bad[40] ^= 1;
+            assert!(
+                hooks::quic::unprotect(version, suite, secret, dcid.len(), pn - 5, &bad).is_err()
+            );
+            let next = hooks::quic::key_update(version, suite, secret);
+            out.push(format!(
+                "{version} pkt={} ku={}",
+                hex8(&pkt),
+                hex8(public(&next[..]))
+            ));
+        }
     }
     out.join(" ")
 }
