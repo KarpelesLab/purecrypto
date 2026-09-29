@@ -2346,7 +2346,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         let sh_bytes = ServerHello {
             random: sr,
-            session_id: ch.session_id.clone(),
+            // RFC 9147 §5: DTLS 1.3 has no middlebox-compatibility mode and
+            // "DTLS servers MUST NOT echo the legacy_session_id value from
+            // the client". A client holding a pre-1.3 session ID sends one
+            // (§5.3 SHOULD) — the wolfSSL client does on resumption — and
+            // aborts on a non-empty echo with illegal_parameter.
+            session_id: Vec::new(),
             cipher_suite: suite.suite,
             extensions: sh_extensions,
         }

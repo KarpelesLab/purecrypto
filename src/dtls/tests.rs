@@ -1118,6 +1118,59 @@ mod dtls13 {
         assert!(pump_handshake_13(&mut client, &mut server));
     }
 
+    /// RFC 9147 §5: "DTLS servers MUST NOT echo the legacy_session_id value
+    /// from the client". A client holding a pre-1.3 session ID sends one
+    /// (§5.3); the server used to echo it, and wolfSSL's resuming client
+    /// aborted with illegal_parameter (`-425`). The ServerHello must carry an
+    /// empty `legacy_session_id_echo` whatever the client sent.
+    #[test]
+    fn server_hello_never_echoes_legacy_session_id() {
+        use crate::dtls::reassembly::write_fragments;
+        use crate::tls::codec::{ClientHello, ServerHello, hs_type};
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        // One share, so the ClientHello fits one record.
+        client_cfg.groups = alloc::vec![crate::tls::codec::NamedGroup::X25519];
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-sid-echo", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let dgs = client.pop_outbound_datagrams();
+        assert_eq!(dgs.len(), 1);
+        // Re-encode the genuine ClientHello with a 32-byte session ID.
+        let body = &dgs[0][13 + 12..];
+        let (mut ch, _) = ClientHello::decode_dtls(body).unwrap();
+        ch.session_id = alloc::vec![0x5c; 32];
+        let full = ch.encode_dtls(&[]);
+        let mut dg = Vec::new();
+        for frag in write_fragments(hs_type::CLIENT_HELLO, 0, &full[4..], 1100) {
+            crate::dtls::record::write_record(
+                &mut dg,
+                crate::tls::ContentType::Handshake,
+                crate::tls::ProtocolVersion::DTLSv1_2,
+                0,
+                0,
+                &frag,
+            )
+            .unwrap();
+        }
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-sid-echo-s", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        server.feed_datagram(&dg).unwrap();
+        let out = server.pop_outbound_datagrams();
+        // The first datagram is the plaintext ServerHello record.
+        let sh_body = &out[0][13 + 12..];
+        let sh = ServerHello::decode_dtls(sh_body).unwrap();
+        assert!(
+            sh.session_id.is_empty(),
+            "RFC 9147 §5: no legacy_session_id echo"
+        );
+    }
+
     /// The cookie-bearing second ClientHello carries the `cookie` extension
     /// FIRST. A stateless server validates the cookie before it keeps any
     /// state, and one that only reassembles a fragmented CH2 once the
