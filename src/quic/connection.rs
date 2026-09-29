@@ -2207,6 +2207,29 @@ impl QuicConnection {
         self.negotiated_suite
     }
 
+    /// The key-exchange group of the ServerHello `key_share`, or `None`
+    /// until the ServerHello has been processed.
+    ///
+    /// Mirrors [`crate::tls::Connection::negotiated_group`].
+    pub fn negotiated_group(&self) -> Option<crate::tls::NamedGroup> {
+        match &self.engine {
+            EngineSide::Client(c) => c.negotiated_group(),
+            EngineSide::Server(s) => s.negotiated_group(),
+        }
+        .and_then(crate::tls::NamedGroup::from_wire)
+    }
+
+    /// `true` when a HelloRetryRequest was part of this handshake
+    /// (received, on a client; sent, on a server) — RFC 8446 §4.1.4.
+    ///
+    /// Mirrors [`crate::tls::Connection::hello_retry_request_used`].
+    pub fn hello_retry_request_used(&self) -> bool {
+        match &self.engine {
+            EngineSide::Client(c) => c.hello_retry_request_seen(),
+            EngineSide::Server(s) => s.hello_retry_request_sent(),
+        }
+    }
+
     /// Returns the monotonic [`Duration`] since this connection was
     /// constructed. Used as the time axis for the RFC 9002 loss-recovery
     /// state machine — every internal caller of `LossState::on_packet_sent`
@@ -8261,6 +8284,76 @@ mod tests {
         );
         assert!(c.is_handshake_complete());
         handshake_and_echo(&mut c, &mut s);
+    }
+
+    /// `Config::key_exchange_groups` used to be ignored over QUIC: the
+    /// client offered its built-in list whatever the restriction said. It
+    /// now narrows the offer as over TCP. The RFC 10024 NIST-curve hybrids
+    /// have the largest shares of any group — 1665 bytes each way for
+    /// SecP384r1MLKEM1024 — so a ClientHello carrying them, and the
+    /// ServerHello answering, cross in as many Initial-bearing datagrams
+    /// as they need, each padded to the §14.1 minimum and none beyond it,
+    /// and the handshake still completes in one round trip.
+    #[test]
+    fn key_exchange_groups_restrict_the_quic_offer_and_large_hybrids_span_initials() {
+        use crate::tls::NamedGroup;
+        for (group, min_initials) in [
+            (NamedGroup::SecP256r1MlKem768, 2),
+            (NamedGroup::SecP384r1MlKem1024, 2),
+            (NamedGroup::Secp521r1, 1),
+        ] {
+            let (mut c, mut s) = loopback_pair_with(
+                |cfg| cfg.key_exchange_groups = Some(alloc::vec![group]),
+                |_| {},
+            );
+            let flight = feed_flight(&mut c, &mut s);
+            assert!(flight.len() >= min_initials, "{group:?}: {}", flight.len());
+            for dg in &flight {
+                assert!(first_packet_is_initial(dg));
+                assert_eq!(dg.len(), MIN_INITIAL_DATAGRAM);
+            }
+            let reply = feed_flight(&mut s, &mut c);
+            assert!(reply.len() >= min_initials, "{group:?}: {}", reply.len());
+            assert!(c.is_handshake_complete(), "{group:?}");
+            handshake_and_echo(&mut c, &mut s);
+            assert_eq!(c.negotiated_group(), Some(group));
+            assert_eq!(s.negotiated_group(), Some(group));
+        }
+
+        // The default offer shares only the usual groups; a server pinned
+        // to a share-less one gets it through a HelloRetryRequest, and the
+        // ClientHello of the retry carries the one large share.
+        let (mut c, mut s) = loopback_pair_with(
+            |_| {},
+            |cfg| cfg.key_exchange_groups = Some(alloc::vec![NamedGroup::SecP384r1MlKem1024]),
+        );
+        handshake_and_echo(&mut c, &mut s);
+        assert!(c.hello_retry_request_used());
+        assert_eq!(c.negotiated_group(), Some(NamedGroup::SecP384r1MlKem1024));
+        assert_eq!(s.negotiated_group(), Some(NamedGroup::SecP384r1MlKem1024));
+
+        // An empty restriction fails closed, as over TCP.
+        let (server_cfg, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let _ = server_cfg;
+        let client_cfg = Config {
+            roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
+            key_exchange_groups: Some(Vec::new()),
+            ..Config::default()
+        };
+        assert!(
+            QuicConnection::client(
+                QuicConfig {
+                    tls: client_cfg,
+                    transport_params: loopback_params(),
+                    ..QuicConfig::default()
+                },
+                "localhost",
+            )
+            .is_err()
+        );
     }
 
     /// Drives one round of `c → s` then `s → c` datagram exchange.

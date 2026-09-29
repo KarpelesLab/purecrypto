@@ -16,7 +16,9 @@ use crate::quic::tls_glue::{HookHandle, build_hooks};
 use crate::rng::OsRng;
 use crate::tls::Error;
 use crate::tls::codec::{CipherSuite, NamedGroup};
-use crate::tls::conn::{ClientConfig, ClientConnection, select_offered_suites};
+use crate::tls::conn::{
+    ClientConfig, ClientConnection, select_offered_groups, select_offered_suites,
+};
 use crate::tls::quic_hooks::Level;
 
 /// Default Initial-CID byte length used by Phase 4. RFC 9000 §17.2 allows
@@ -40,21 +42,21 @@ pub(crate) const QUIC_CIPHER_SUITES: [CipherSuite; 3] = [
     CipherSuite::CHACHA20_POLY1305_SHA256,
 ];
 
-/// The key-exchange groups a QUIC client offers (with a `key_share` for
-/// each), in preference order — the same offer the TLS 1.3 engine makes
-/// over TCP, so a server's
+/// The key-exchange groups a QUIC client offers unless
+/// [`Config::key_exchange_groups`](crate::tls::Config::key_exchange_groups)
+/// narrows them, in preference order, with a `key_share` for the first
+/// four (unless [`key_shares`](crate::tls::ConfigBuilder::key_shares) says
+/// otherwise) — the same offer the TLS 1.3 engine makes over TCP, so a
+/// server's
 /// [`preferred_key_exchange_group`](crate::tls::ConfigBuilder::preferred_key_exchange_group)
 /// steers QUIC handshakes exactly as it steers TLS ones. The X25519MLKEM768
 /// share is 1216 bytes, so the ClientHello no longer fits one 1200-byte
 /// Initial: the CRYPTO stream is carved into two Initial packets, each in
 /// its own datagram padded to the RFC 9000 §14.1 minimum, and the server's
-/// ServerHello (a 1120-byte KEM ciphertext) crosses back the same way.
-pub(crate) const QUIC_CLIENT_GROUPS: [NamedGroup; 4] = [
-    NamedGroup::X25519MLKEM768,
-    NamedGroup::X25519,
-    NamedGroup::SECP256R1,
-    NamedGroup::SECP384R1,
-];
+/// ServerHello (a 1120-byte KEM ciphertext) crosses back the same way. A
+/// restriction that shares the larger RFC 10024 hybrids (up to 1665 bytes
+/// each) spreads the ClientHello over as many Initials as it takes.
+pub(crate) const QUIC_CLIENT_GROUPS: [NamedGroup; 7] = crate::tls::conn::DEFAULT_GROUPS;
 
 /// The suites a client offers: [`QUIC_CIPHER_SUITES`] narrowed and ordered
 /// by a [`Config::cipher_suites`](crate::tls::Config::cipher_suites)
@@ -97,7 +99,8 @@ pub(crate) fn build_initial_endpoint(peer_dcid: ConnectionId, our_scid: Connecti
 /// `tls_cfg` is the `pub(crate)` engine-internal `ClientConfig` (built by
 /// the QuicConfig adapter); its `cipher_suites` restriction narrows the
 /// [`QUIC_CIPHER_SUITES`] offer (see [`offered_cipher_suites`]) and the
-/// key shares cover [`QUIC_CLIENT_GROUPS`]. `server_name` is the SNI
+/// `groups` restriction narrows the [`QUIC_CLIENT_GROUPS`] offer (see
+/// [`select_offered_groups`]). `server_name` is the SNI
 /// hostname. Returns the constructed engine and the hook handle; the caller
 /// then drains `hook.drain_handshake(Level::Initial)` to discover the
 /// ClientHello.
@@ -108,6 +111,7 @@ pub(crate) fn build_tls_engine(
 ) -> Result<(ClientConnection, HookHandle), Error> {
     let (hooks, handle) = build_hooks(transport_params);
     let suites = offered_cipher_suites(&tls_cfg.cipher_suites)?;
+    let groups = select_offered_groups(&tls_cfg.groups)?;
 
     let mut rng = OsRng;
     let engine = ClientConnection::new_for_quic(
@@ -115,7 +119,7 @@ pub(crate) fn build_tls_engine(
         server_name,
         &mut rng,
         &suites,
-        &QUIC_CLIENT_GROUPS,
+        &groups,
         hooks as Box<_>,
     )?;
     Ok((engine, handle))
