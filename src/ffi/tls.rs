@@ -101,6 +101,9 @@ pub struct PcTlsCfg {
     server_name: Option<String>,
     cert: Option<CertAndKey>,
     alpn: Vec<Vec<u8>>,
+    /// Key-exchange groups, in preference order (see
+    /// [`pc_tls_cfg_set_groups`]); empty means the engine's defaults.
+    groups: Vec<crate::tls::NamedGroup>,
     verify_certs: bool,
     /// DTLS server cookie secret; a [`Secret32`] so it is wiped when the
     /// config's storage is handed back to the allocator on `pc_tls_cfg_free`.
@@ -181,6 +184,7 @@ impl PcTlsCfg {
             server_name: None,
             cert: None,
             alpn: Vec::new(),
+            groups: Vec::new(),
             verify_certs: true,
             cookie_secret: None,
             no_cookie: false,
@@ -266,6 +270,9 @@ impl PcTlsCfg {
             .roots(self.build_roots());
         if !self.alpn.is_empty() {
             b = b.alpn(self.alpn.clone());
+        }
+        if !self.groups.is_empty() {
+            b = b.key_exchange_groups(&self.groups);
         }
         if !self.crls_pem.is_empty() {
             b = b.crls(self.build_crls());
@@ -495,6 +502,51 @@ pub unsafe extern "C" fn pc_tls_cfg_set_alpn(
             out.push(bytes.to_vec());
         }
         unsafe { &mut *cfg }.alpn = out;
+        PcStatus::Ok
+    })
+}
+
+/// Restricts (and orders) the key-exchange groups: `codepoints` is an
+/// array of `n` IANA "TLS Supported Groups" identifiers (the `PC_GROUP_*`
+/// constants in `purecrypto.h`) in preference order. A client offers them
+/// in this order; a server accepts them and selects in this order (RFC 8446
+/// §4.2.7, asking with a HelloRetryRequest for a listed group the client
+/// only advertised). Pass `n == 0` to restore the engine's defaults. A
+/// codepoint the engine does not implement is `Unsupported` and leaves the
+/// configuration unchanged. See `Config::key_exchange_groups`.
+///
+/// # Safety
+/// `cfg` valid; `codepoints` valid for `n` entries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_cfg_set_groups(
+    cfg: *mut PcTlsCfg,
+    codepoints: *const u16,
+    n: usize,
+) -> PcStatus {
+    guard(|| {
+        if cfg.is_null() {
+            return PcStatus::NullPointer;
+        }
+        // There are seven implemented groups; a list longer than the
+        // registry itself is garbage, bounded before any allocation.
+        const PC_GROUPS_MAX: usize = 64;
+        if n > PC_GROUPS_MAX {
+            return PcStatus::Unsupported;
+        }
+        if n > 0 && codepoints.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let mut out: Vec<crate::tls::NamedGroup> = Vec::with_capacity(n);
+        for i in 0..n {
+            let cp = unsafe { *codepoints.add(i) };
+            let Some(g) = crate::tls::NamedGroup::from_codepoint(cp) else {
+                return PcStatus::Unsupported;
+            };
+            if !out.contains(&g) {
+                out.push(g);
+            }
+        }
+        unsafe { &mut *cfg }.groups = out;
         PcStatus::Ok
     })
 }
@@ -1214,6 +1266,59 @@ pub unsafe extern "C" fn pc_tls_negotiated_cipher_suite_name(
             .inner
             .negotiated_cipher_suite_name()
             .map(str::as_bytes)
+            .unwrap_or(&[]);
+        unsafe { out_write(name, out, out_len) }
+    });
+    unsafe { settle_out_len(out_len, st) }
+}
+
+/// Writes the IANA "TLS Supported Groups" codepoint of the key-exchange
+/// group the handshake used to `*out` (the `PC_GROUP_*` constants in
+/// `purecrypto.h`), or `0` while no group has been fixed yet and on a
+/// resumed TLS 1.2 session (no key exchange). Always returns `Ok` once the
+/// pointer check passes.
+///
+/// # Safety
+/// `tls`, `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_negotiated_group(tls: *const PcTls, out: *mut u16) -> PcStatus {
+    guard(|| {
+        if tls.is_null() || out.is_null() {
+            return PcStatus::NullPointer;
+        }
+        unsafe { *out = 0 };
+        let v = unsafe { &*tls }
+            .inner
+            .negotiated_group()
+            .map(crate::tls::NamedGroup::codepoint)
+            .unwrap_or(0);
+        unsafe { *out = v };
+        PcStatus::Ok
+    })
+}
+
+/// Writes the IANA name of the negotiated key-exchange group (e.g.
+/// `"X25519MLKEM768"`, `"secp521r1"`) into `out` as raw UTF-8 bytes (no
+/// trailing NUL — `*out_len` is the exact byte count, as
+/// [`pc_tls_negotiated_cipher_suite_name`] does it). When no group has
+/// been fixed yet, `*out_len = 0` and `Ok` is returned.
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_negotiated_group_name(
+    tls: *const PcTls,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    let st = guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let name: &[u8] = unsafe { &*tls }
+            .inner
+            .negotiated_group()
+            .map(|g| g.name().as_bytes())
             .unwrap_or(&[]);
         unsafe { out_write(name, out, out_len) }
     });

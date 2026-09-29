@@ -1985,6 +1985,138 @@ fn tls13_loopback_pair() -> (*mut tls::PcTls, *mut tls::PcTls) {
     (client, server)
 }
 
+/// `pc_tls_cfg_set_groups` restricts the offer and the accept-set, and the
+/// group the handshake used is readable by codepoint and by name — through
+/// the default (X25519MLKEM768, the first share), a client pinned to
+/// SecP256r1MLKEM768 (RFC 10024), and a server pinned to secp521r1, which
+/// the default client reaches through a HelloRetryRequest.
+#[test]
+fn tls_cfg_set_groups_restricts_and_negotiated_group_reports() {
+    fn pair(client_groups: &[u16], server_groups: &[u16]) -> (*mut tls::PcTls, *mut tls::PcTls) {
+        let (chain_pem, key_pem) = loopback_identity();
+        let scfg = tls::pc_tls_cfg_new(1, 0x0304);
+        unsafe {
+            assert_eq!(
+                tls::pc_tls_cfg_set_certificate(
+                    scfg,
+                    chain_pem.as_ptr(),
+                    chain_pem.len(),
+                    key_pem.as_ptr(),
+                    key_pem.len()
+                ),
+                PcStatus::Ok
+            );
+            assert_eq!(
+                tls::pc_tls_cfg_set_groups(scfg, server_groups.as_ptr(), server_groups.len()),
+                PcStatus::Ok
+            );
+        }
+        let server = unsafe { tls::pc_tls_new(scfg) };
+        unsafe { tls::pc_tls_cfg_free(scfg) };
+        let ccfg = tls::pc_tls_cfg_new(0, 0x0304);
+        unsafe {
+            assert_eq!(
+                tls::pc_tls_cfg_set_verify_certificates(ccfg, 0),
+                PcStatus::Ok
+            );
+            let sni = b"loopback.example\0";
+            assert_eq!(
+                tls::pc_tls_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char),
+                PcStatus::Ok
+            );
+            assert_eq!(
+                tls::pc_tls_cfg_set_groups(ccfg, client_groups.as_ptr(), client_groups.len()),
+                PcStatus::Ok
+            );
+        }
+        let client = unsafe { tls::pc_tls_new(ccfg) };
+        unsafe { tls::pc_tls_cfg_free(ccfg) };
+        assert!(!client.is_null() && !server.is_null());
+        for _ in 0..20 {
+            unsafe {
+                let _ = tls::pc_tls_handshake(client);
+                pump_wire(client, server);
+                let _ = tls::pc_tls_handshake(server);
+                pump_wire(server, client);
+            }
+            if unsafe { tls::pc_tls_is_handshake_complete(client) } == 1
+                && unsafe { tls::pc_tls_is_handshake_complete(server) } == 1
+            {
+                break;
+            }
+        }
+        assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(client) }, 1);
+        assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(server) }, 1);
+        (client, server)
+    }
+    fn group_of(t: *mut tls::PcTls) -> (u16, alloc::vec::Vec<u8>) {
+        let mut cp = 0u16;
+        assert_eq!(
+            unsafe { tls::pc_tls_negotiated_group(t, &mut cp) },
+            PcStatus::Ok
+        );
+        let name = read_out(|p, l| unsafe { tls::pc_tls_negotiated_group_name(t, p, l) });
+        (cp, name)
+    }
+
+    for (client_groups, server_groups, want, name) in [
+        (&[][..], &[][..], 0x11ecu16, &b"X25519MLKEM768"[..]),
+        (
+            &[0x11eb, 0x001d][..],
+            &[][..],
+            0x11eb,
+            &b"SecP256r1MLKEM768"[..],
+        ),
+        (&[][..], &[0x0019][..], 0x0019, &b"secp521r1"[..]),
+        (
+            &[0x11ed][..],
+            &[0x11ed, 0x001d][..],
+            0x11ed,
+            &b"SecP384r1MLKEM1024"[..],
+        ),
+    ] {
+        let (client, server) = pair(client_groups, server_groups);
+        assert_eq!(group_of(client), (want, name.to_vec()));
+        assert_eq!(group_of(server), (want, name.to_vec()));
+        unsafe {
+            tls::pc_tls_free(client);
+            tls::pc_tls_free(server);
+        }
+    }
+
+    // Before the handshake: 0 and an empty name. Unknown codepoints and
+    // null pointers are refused.
+    let cfg = tls::pc_tls_cfg_new(0, 0x0304);
+    let ffdhe2048 = [0x0100u16];
+    unsafe {
+        assert_eq!(
+            tls::pc_tls_cfg_set_groups(cfg, ffdhe2048.as_ptr(), 1),
+            PcStatus::Unsupported
+        );
+        assert_eq!(
+            tls::pc_tls_cfg_set_groups(cfg, core::ptr::null(), 1),
+            PcStatus::NullPointer
+        );
+        assert_eq!(
+            tls::pc_tls_cfg_set_groups(core::ptr::null_mut(), ffdhe2048.as_ptr(), 1),
+            PcStatus::NullPointer
+        );
+        assert_eq!(
+            tls::pc_tls_cfg_set_verify_certificates(cfg, 0),
+            PcStatus::Ok
+        );
+    }
+    let client = unsafe { tls::pc_tls_new(cfg) };
+    unsafe { tls::pc_tls_cfg_free(cfg) };
+    assert_eq!(group_of(client), (0, alloc::vec::Vec::new()));
+    let mut cp = 1u16;
+    assert_eq!(
+        unsafe { tls::pc_tls_negotiated_group(core::ptr::null(), &mut cp) },
+        PcStatus::NullPointer
+    );
+    unsafe { tls::pc_tls_free(client) };
+}
+
 /// FC-2: the peer's close_notify is observable — `pc_tls_recv` returns
 /// `Closed` once the plaintext that preceded it has been drained, and
 /// `pc_tls_received_close_notify` flips to 1. Before the alert both report

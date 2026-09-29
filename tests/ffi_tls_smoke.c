@@ -78,6 +78,14 @@ int main(void) {
     return fail("pc_tls_cfg_add_root_pem");
   if (pc_tls_cfg_set_server_name(ccfg, "ffi-tls.test") != PC_OK)
     return fail("pc_tls_cfg_set_server_name");
+  /* Pin the RFC 10024 SecP256r1MLKEM768 hybrid (with X25519 behind it),
+   * so the negotiated-group accessors have something specific to report. */
+  const uint16_t groups[2] = { PC_GROUP_SECP256R1MLKEM768, PC_GROUP_X25519 };
+  if (pc_tls_cfg_set_groups(ccfg, groups, 2) != PC_OK)
+    return fail("pc_tls_cfg_set_groups");
+  const uint16_t ffdhe2048 = 0x0100;
+  if (pc_tls_cfg_set_groups(ccfg, &ffdhe2048, 1) != PC_UNSUPPORTED)
+    return fail("pc_tls_cfg_set_groups accepted an unimplemented group");
 
   /* 5. Materialise both connections. */
   PcTls *server = pc_tls_new(scfg);
@@ -129,6 +137,22 @@ int main(void) {
   if (pc_tls_negotiated_cipher_suite_name(client, cs_name, &cs_name_len) != PC_OK)
     return fail("pc_tls_negotiated_cipher_suite_name");
   if (cs_name_len == 0) return fail("cipher suite name empty");
+
+  /* 7a'. The key-exchange group: the hybrid the client pinned first. */
+  uint16_t group = 0;
+  if (pc_tls_negotiated_group(client, &group) != PC_OK)
+    return fail("pc_tls_negotiated_group");
+  if (group != PC_GROUP_SECP256R1MLKEM768) return fail("unexpected group");
+  if (pc_tls_negotiated_group(server, &group) != PC_OK
+      || group != PC_GROUP_SECP256R1MLKEM768)
+    return fail("server group");
+  uint8_t group_name[32];
+  size_t group_name_len = sizeof(group_name);
+  if (pc_tls_negotiated_group_name(client, group_name, &group_name_len) != PC_OK)
+    return fail("pc_tls_negotiated_group_name");
+  if (group_name_len != strlen("SecP256r1MLKEM768")
+      || memcmp(group_name, "SecP256r1MLKEM768", group_name_len) != 0)
+    return fail("unexpected group name");
 
   /* 7b. Server-side SNI: the client set "ffi-tls.test"; the server should see it. */
   uint8_t sni[64];

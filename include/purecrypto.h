@@ -266,6 +266,20 @@ typedef enum {
   PC_DTLS_1_3 = (int)0xFEFC
 } pc_tls_version;
 
+/* IANA "TLS Supported Groups" codepoints of the key-exchange groups the
+ * engines implement, for pc_tls_cfg_set_groups / pc_tls_negotiated_group.
+ * The TLS 1.3 client offers them all, in this order, with key shares for
+ * the first four; the TLS 1.2 engines use the plain curves only. */
+typedef enum {
+  PC_GROUP_X25519MLKEM768 = 0x11EC,     /* RFC 10024 hybrid, ML-KEM part first */
+  PC_GROUP_X25519 = 0x001D,
+  PC_GROUP_SECP256R1 = 0x0017,
+  PC_GROUP_SECP384R1 = 0x0018,
+  PC_GROUP_SECP256R1MLKEM768 = 0x11EB,  /* RFC 10024 hybrid, ECDH part first */
+  PC_GROUP_SECP384R1MLKEM1024 = 0x11ED, /* RFC 10024 hybrid, ECDH part first */
+  PC_GROUP_SECP521R1 = 0x0019
+} pc_tls_group;
+
 /* ---- Hashing ---- */
 pc_status pc_digest(int32_t alg, const uint8_t *data, size_t data_len,
                     uint8_t *out, size_t *out_len);
@@ -773,6 +787,10 @@ pc_status pc_tls_cfg_set_certificate(PcTlsCfg *cfg,
                                      const uint8_t *chain_pem, size_t chain_len,
                                      const uint8_t *key_pem, size_t key_pem_len);
 pc_status pc_tls_cfg_set_alpn(PcTlsCfg *cfg, const char *const *protocols, size_t n);
+/* Key-exchange groups (pc_tls_group codepoints) in preference order: the
+ * client's offer, the server's accept-set and selection order. n == 0
+ * restores the defaults; an unknown codepoint is PC_UNSUPPORTED. */
+pc_status pc_tls_cfg_set_groups(PcTlsCfg *cfg, const uint16_t *codepoints, size_t n);
 pc_status pc_tls_cfg_set_verify_certificates(PcTlsCfg *cfg, int32_t verify);
 pc_status pc_tls_cfg_set_client_auth(PcTlsCfg *cfg, int32_t required,
                                      const uint8_t *roots_pem, size_t roots_pem_len);
@@ -861,6 +879,10 @@ pc_status pc_tls_negotiated_version(const PcTls *tls, uint16_t *out);
 pc_status pc_tls_negotiated_cipher_suite(const PcTls *tls, uint16_t *out);
 pc_status pc_tls_negotiated_cipher_suite_name(const PcTls *tls,
                                               uint8_t *out, size_t *out_len);
+/* The key-exchange group the handshake used (a pc_tls_group codepoint, or
+ * 0 before the ServerHello and on a resumed TLS 1.2 session). */
+pc_status pc_tls_negotiated_group(const PcTls *tls, uint16_t *out);
+pc_status pc_tls_negotiated_group_name(const PcTls *tls, uint8_t *out, size_t *out_len);
 pc_status pc_tls_alpn_selected(const PcTls *tls, uint8_t *out, size_t *out_len);
 pc_status pc_tls_peer_server_name(const PcTls *tls, uint8_t *out, size_t *out_len);
 pc_status pc_tls_peer_certificate(const PcTls *tls, uint8_t *out, size_t *out_len);
