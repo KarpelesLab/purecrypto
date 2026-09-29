@@ -183,7 +183,7 @@ fn leaf_certifies(chain: &[Vec<u8>], key: &crate::x509::AnyPublicKey) -> Result<
 /// Each side of a DTLS connection names the CID it wants the *peer* to put
 /// in every protected record it sends (RFC 9146 §3), so that a server can
 /// route a datagram to its connection by
-/// [`dtls::peek_connection_id`](crate::dtls::peek_connection_id) when the
+/// `dtls::peek_connection_id` when the
 /// 4-tuple changed (NAT rebinding, a mobile client), and an endpoint can
 /// follow the peer to a new address under the RFC 9146 §6 rules
 /// ([`Connection::datagram_allows_peer_address_update`](super::Connection::datagram_allows_peer_address_update)).
@@ -194,14 +194,14 @@ fn leaf_certifies(chain: &[Vec<u8>], key: &crate::x509::AnyPublicKey) -> Result<
 #[non_exhaustive]
 pub enum ConnectionId {
     /// This exact CID (at most
-    /// [`dtls::MAX_LOCAL_CID_LEN`](crate::dtls::MAX_LOCAL_CID_LEN) bytes).
+    /// `dtls::MAX_LOCAL_CID_LEN` bytes).
     /// Empty means "send me no CID, I will still send yours": the peer's
     /// records stay in the RFC 6347 / plain unified-header form. A server
     /// that routes by CID gives every connection a distinct value of one
     /// length; a fixed value is otherwise for tests and interop.
     Fixed(Vec<u8>),
     /// A CID of this many bytes (1 to
-    /// [`dtls::MAX_LOCAL_CID_LEN`](crate::dtls::MAX_LOCAL_CID_LEN)) drawn
+    /// `dtls::MAX_LOCAL_CID_LEN`) drawn
     /// from [`ConfigBuilder::rng`] when the connection is created — the
     /// recommended form: unguessable by an off-path attacker, and one
     /// length for every connection so a server can parse any datagram's
@@ -1135,7 +1135,7 @@ impl ConfigBuilder {
     }
     /// DTLS: negotiate RFC 9146 connection IDs and receive under exactly
     /// `cid` ([`ConnectionId::Fixed`]; see [`Config::connection_id`]).
-    /// Longer than [`dtls::MAX_LOCAL_CID_LEN`](crate::dtls::MAX_LOCAL_CID_LEN)
+    /// Longer than `dtls::MAX_LOCAL_CID_LEN`
     /// is refused when the connection is built
     /// ([`Error::InappropriateState`](super::Error::InappropriateState)).
     pub fn connection_id(mut self, cid: Vec<u8>) -> Self {
@@ -1145,7 +1145,7 @@ impl ConfigBuilder {
     /// DTLS: negotiate RFC 9146 connection IDs and receive under a random
     /// `len`-byte one ([`ConnectionId::Random`]; see
     /// [`Config::connection_id`]) drawn from [`Self::rng`] per connection.
-    /// `len` outside `1..=`[`dtls::MAX_LOCAL_CID_LEN`](crate::dtls::MAX_LOCAL_CID_LEN)
+    /// `len` outside `1..=``dtls::MAX_LOCAL_CID_LEN`
     /// is refused when the connection is built
     /// ([`Error::InappropriateState`](super::Error::InappropriateState)).
     pub fn connection_id_len(mut self, len: usize) -> Self {

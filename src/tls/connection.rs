@@ -1751,7 +1751,7 @@ impl Connection {
     /// negotiated but this side receives none, `None` when they were not
     /// negotiated, before the ServerHello, and on TLS / QUIC. A server
     /// keeps this to route datagrams with
-    /// [`dtls::peek_connection_id`](crate::dtls::peek_connection_id).
+    /// `dtls::peek_connection_id`.
     pub fn local_connection_id(&self) -> Option<&[u8]> {
         match &self.inner {
             #[cfg(feature = "dtls")]
