@@ -311,7 +311,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | Case | Mbed TLS 4.2.0, DTLS 1.2 (C / S) |
   |---|---|
   | Plain: `{P-256, P-384}` × `{x25519, P-256, P-384}` × `{AES-128-GCM, AES-256-GCM, ChaCha20}` | ✅ / ✅ |
-  | Plain, RSA-2048 certificate | ✅ / ⏭ the Mbed TLS (D)TLS 1.2 server signs ServerKeyExchange with PKCS#1 v1.5 only, and purecrypto's 1.2 client offers RSA-PSS only ("got ciphersuites in common, but none of them usable"); the Mbed TLS client verifies the purecrypto server's `rsa_pss_rsae_sha256` signature |
+  | Plain, RSA-2048 certificate | ✅ / ✅ — Mbed TLS's 1.2 endpoints use RSA as PKCS#1 v1.5 only (its client lists no `rsa_pss_rsae_*` for 1.2, its server signs `rsa_pkcs1_sha256`), so the purecrypto 1.2 engines offer `rsa_pkcs1_sha256` / `_sha384` after RSA-PSS and sign with them when a client offers no RSA-PSS scheme (RFC 5246 §7.4.1.4.1; RFC 8446 forbids them only in TLS 1.3 handshake signatures) |
   | Plain, Ed25519 / ML-DSA-65 certificate; `X25519MLKEM768` | ⏭ purecrypto's 1.2 engines |
   | ALPN | ✅ / ✅ |
   | Handshake over a path dropping 20 % of datagrams; the last flight lost (`loss-final`) | ✅ / ✅ |

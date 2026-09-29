@@ -107,14 +107,6 @@ cmd_supports() {
         resume-psk) [ "$CASE_ROLE" = peer-client ] ||
             skip "the Mbed TLS server prefers (psk_)ephemeral and never selects psk_ke while a key_share is offered" ;;
     esac
-    if is_dtls && [ "$CASE_ROLE" = peer-server ] && [ "$CASE_CERT" = rsa2048 ]; then
-        # The (D)TLS 1.2 server signs ServerKeyExchange with PKCS#1 v1.5
-        # only, and purecrypto's 1.2 client offers RSA-PSS only (RFC 8446
-        # §4.2.3 schemes, its modern policy): "got ciphersuites in common,
-        # but none of them usable". The other role works — the Mbed TLS
-        # client verifies the purecrypto server's rsa_pss_rsae signature.
-        skip "the Mbed TLS (D)TLS 1.2 server signs with PKCS#1 v1.5 only; purecrypto's client offers RSA-PSS only"
-    fi
     return 0
 }
 
