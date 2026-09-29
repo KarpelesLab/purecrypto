@@ -441,16 +441,21 @@ close_notify: received               # the peer ended the session properly
 
 Behaviour worth knowing:
 
-- The client offers `X25519MLKEM768` first, then `x25519`, `secp256r1` and
-  `secp384r1`, with a key share for each; all three TLS 1.3 suites; and
-  Ed25519, Ed448, ECDSA and RSA peer signatures. `-key-shares x25519` (a
-  comma-separated list) pre-shares keys for those groups only: every group is
-  still offered, and a server preferring another answers with a
-  HelloRetryRequest.
+- The client offers `X25519MLKEM768` first, then `x25519`, `secp256r1`,
+  `secp384r1`, and after those the RFC 10024 NIST-curve hybrids
+  `SecP256r1MLKEM768` and `SecP384r1MLKEM1024` and `secp521r1`, with a key
+  share for the first four (a share for each of the other three would add
+  some 3 kB to every ClientHello; a server that wants one asks with a
+  HelloRetryRequest); all three TLS 1.3 suites; and Ed25519, Ed448, ECDSA
+  and RSA peer signatures. `-key-shares x25519` (a comma-separated list)
+  pre-shares keys for those groups only: every group is still offered, and
+  a server preferring another answers with a HelloRetryRequest.
 - `-groups x25519:secp256r1` (colon- or comma-separated, `openssl -groups`
-  spelling; `p256` / `P-256` are accepted too) restricts and orders the
-  groups. On the client it is the `supported_groups` offer, with a share
-  for each (narrow those further with `-key-shares`). On the server it is
+  spelling, any case; `p256` / `P-256` / `p521` are accepted too) restricts
+  and orders the groups. On the client it is the `supported_groups` offer,
+  with a share for each (narrow those further with `-key-shares`) — so
+  `-groups SecP384r1MLKEM1024` offers and shares that hybrid alone. On the
+  server it is
   the accept-set in *server* preference: the first listed group the client
   shared wins, and a client that shared none of them but offered one is
   sent a HelloRetryRequest for it. `-ciphersuites TLS_AES_128_GCM_SHA256:…`
@@ -458,7 +463,8 @@ Behaviour worth knowing:
   or the server's accept-set in *server* preference (the first listed suite
   the client offered wins; a client offering none of them is refused).
 - `s_server -prefer-group NAME` (`x25519`, `secp256r1`, `secp384r1`,
-  `X25519MLKEM768`) makes the server ask, by HelloRetryRequest, for that group
+  `secp521r1`, `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024`)
+  makes the server ask, by HelloRetryRequest, for that group
   whenever the client offers it without a key share. After the handshake the
   server prints the SNI it was sent (`SNI: …`).
 - `-min_protocol TLSv1.2` widens the pinned TLS 1.3 client or server into a
@@ -690,12 +696,13 @@ reply to stdout. ALPN is mandatory (RFC 9001 §8.1).
 ```text
 purecrypto q_client -connect host:port -alpn proto [-insecure] [-servername name] [-CAfile bundle.pem]
                     [-uni | -datagram] [-exchanges N] [-pause ms] [-migrate] [-switch-cid]
-                    [-reconnect [-early-data]] [-key-update] [-ciphersuites list] [-key-shares groups]
-                    [-close-code N] [-close-reason text] [-idle-timeout ms] [-linger ms]
-                    [-timeout secs] [-keylogfile keys.log] [-quiet]
+                    [-reconnect [-early-data]] [-key-update] [-ciphersuites list] [-groups list]
+                    [-key-shares groups] [-close-code N] [-close-reason text] [-idle-timeout ms]
+                    [-linger ms] [-timeout secs] [-keylogfile keys.log] [-quiet]
 purecrypto q_server -cert cert.pem -key key.pem -accept host:port -alpn proto [-www] [-retry]
-                    [-early-data] [-key-update] [-switch-cid] [-ciphersuites list] [-idle-timeout ms]
-                    [-reset-key hex32] [-naccept N] [-timeout secs] [-keylogfile keys.log] [-quiet]
+                    [-early-data] [-key-update] [-switch-cid] [-ciphersuites list] [-groups list]
+                    [-idle-timeout ms] [-reset-key hex32] [-naccept N] [-timeout secs]
+                    [-keylogfile keys.log] [-quiet]
 ```
 
 ```sh
@@ -704,7 +711,7 @@ purecrypto q_client -connect localhost:4434 -alpn h3
 ```
 
 Both print what the handshake negotiated on stderr (`negotiated: alpn=…
-suite=… resumed=… early_data=… retry=… ecn=…`), one line per stream with
+suite=… resumed=… early_data=… retry=… group=… hrr=…`), one line per stream with
 the byte count and SHA-256 of what arrived, and how the connection ended
 (`closed: application error 0x0 () by peer`, `closed: idle timeout`,
 `closed: stateless reset`).
@@ -726,8 +733,10 @@ Client options:
 - `-key-update` initiates a 1-RTT key update once the handshake is
   confirmed and reports when the peer's reply in the new phase confirms it.
 - `-ciphersuites` restricts the offered TLS 1.3 suites (OpenSSL names,
-  `:`-separated); `-key-shares` restricts the groups a `key_share` is sent
-  for (`x25519`, `secp256r1`, `secp384r1`, `X25519MLKEM768`).
+  `:`-separated); `-groups` restricts and orders the offered groups and
+  `-key-shares` the groups a `key_share` is sent for, both as `s_client`
+  takes them (the same seven groups; a ClientHello whose shares outgrow one
+  Initial datagram is carved into as many as it takes).
 - `-close-code N` / `-close-reason text` set the application error the
   final CONNECTION_CLOSE carries (default `0`). `-idle-timeout ms` sets the
   advertised `max_idle_timeout` (default 60 000). `-linger ms` keeps the
@@ -750,6 +759,9 @@ Server options:
 - `-naccept N` exits after N connections have ended (default 1; `0` keeps
   serving until `-timeout secs`, default 30, elapses). `-www` answers the
   first bidirectional stream with a canned body instead of echoing.
+- `-ciphersuites` and `-groups` are the accept-sets in server preference,
+  as `s_server` takes them (a client that offered a listed group without a
+  share is sent a HelloRetryRequest for it).
 
 Only the `s_client -quic` direction is available from OpenSSL; both roles
 are exercised against quic-go by `tools/quic-interop/run.sh` (see

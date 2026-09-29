@@ -5433,7 +5433,8 @@ fn q_client_q_server_streams_datagrams_and_resumption() {
     std::fs::write(&cert_path, cert.to_pem()).unwrap();
     std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
 
-    // Five connections: bidi, uni, datagram, and the two of `-reconnect`.
+    // Six connections: bidi, uni, datagram, one pinned to an RFC 10024
+    // hybrid, and the two of `-reconnect`.
     let server_proc = spawn_server_wait_listening(&[
         "q_server",
         "-accept",
@@ -5446,7 +5447,7 @@ fn q_client_q_server_streams_datagrams_and_resumption() {
         "pc-echo",
         "-early-data",
         "-naccept",
-        "5",
+        "6",
         "-timeout",
         "80",
     ]);
@@ -5469,11 +5470,20 @@ fn q_client_q_server_streams_datagrams_and_resumption() {
     assert!(ok, "bidi: {err}");
     assert_eq!(out, "bidi echo\n");
     assert!(err.contains("negotiated: alpn=pc-echo suite="), "{err}");
+    // The default offer shares X25519MLKEM768 first and the server takes it.
+    assert!(err.contains(" group=X25519MLKEM768 hrr=no"), "{err}");
     assert!(err.contains("key update confirmed: phase 1"), "{err}");
     assert!(
         err.contains("switched to a new destination connection id"),
         "{err}"
     );
+
+    // `-groups` pins the offer (and its one share) to the RFC 10024 hybrid;
+    // the 1665-byte shares each way cross in two Initial datagrams.
+    let (out, err, ok) = client(&["-groups", "SecP384r1MLKEM1024"], b"hybrid echo\n");
+    assert!(ok, "hybrid: {err}");
+    assert_eq!(out, "hybrid echo\n");
+    assert!(err.contains(" group=SecP384r1MLKEM1024 hrr=no"), "{err}");
 
     let (out, err, ok) = client(&["-uni"], b"uni echo\n");
     assert!(ok, "uni: {err}");
@@ -5510,7 +5520,11 @@ fn q_client_q_server_streams_datagrams_and_resumption() {
         "{server_err}"
     );
     assert!(
-        server_err.contains("served 5 connection(s)"),
+        server_err.contains(" group=SecP384r1MLKEM1024 hrr=no"),
+        "{server_err}"
+    );
+    assert!(
+        server_err.contains("served 6 connection(s)"),
         "{server_err}"
     );
 

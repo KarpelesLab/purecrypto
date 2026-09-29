@@ -153,10 +153,14 @@ fn negotiated_line(qc: &QuicConnection) -> String {
         None if qc.early_data_offered() => "offered",
         None => "none",
     };
+    // `group=` and `hrr=` go last: the interop harnesses match the line
+    // by prefix.
+    let group = qc.negotiated_group().map(|g| g.name()).unwrap_or("none");
     format!(
-        "negotiated: alpn={alpn} suite={suite} resumed={} early_data={early} retry={}",
+        "negotiated: alpn={alpn} suite={suite} resumed={} early_data={early} retry={} group={group} hrr={}",
         yes_no(qc.is_resumed()),
         yes_no(qc.retry_used()),
+        yes_no(qc.hello_retry_request_used()),
     )
 }
 
@@ -462,6 +466,7 @@ struct ClientSetup<'a> {
     alpn: Vec<Vec<u8>>,
     keylog: Option<&'a str>,
     suites: Option<Vec<u16>>,
+    groups: Option<Vec<purecrypto::tls::NamedGroup>>,
     key_shares: Option<Vec<purecrypto::tls::NamedGroup>>,
     idle_ms: Option<u64>,
     early_data: bool,
@@ -492,6 +497,9 @@ impl ClientSetup<'_> {
         if let Some(suites) = &self.suites {
             builder = builder.cipher_suites(suites);
         }
+        if let Some(groups) = &self.groups {
+            builder = builder.key_exchange_groups(groups);
+        }
         if let Some(groups) = &self.key_shares {
             builder = builder.key_shares(groups);
         }
@@ -514,6 +522,7 @@ pub(crate) fn run_client(args: Args) {
         "-keylogfile",
         "-mtu",
         "-ciphersuites",
+        "-groups",
         "-key-shares",
         "-close-code",
         "-close-reason",
@@ -532,7 +541,7 @@ pub(crate) fn run_client(args: Args) {
                  [-servername name] [-CAfile bundle.pem] [-keylogfile keys.log] [-quiet] \
                  [-uni | -datagram] [-exchanges N] [-pause ms] [-migrate] [-switch-cid] \
                  [-reconnect [-early-data]] [-key-update] [-ciphersuites list] \
-                 [-key-shares groups] [-close-code N] [-close-reason text] \
+                 [-groups list] [-key-shares groups] [-close-code N] [-close-reason text] \
                  [-idle-timeout ms] [-linger ms] [-timeout secs]",
             )
         });
@@ -585,6 +594,10 @@ pub(crate) fn run_client(args: Args) {
         alpn,
         keylog: args.value("-keylogfile"),
         suites: args.value("-ciphersuites").map(parse_ciphersuites),
+        // `-groups`: the `supported_groups` offer, as `s_client -groups`.
+        groups: args
+            .value("-groups")
+            .map(|list| crate::tlsinfo::parse_groups(list, "-groups")),
         key_shares: args.value("-key-shares").map(|list| {
             list.split(',')
                 .filter(|g| !g.is_empty())
@@ -864,7 +877,7 @@ pub(crate) fn run_server(args: Args) {
         die(
             "usage: purecrypto q_server -cert cert.pem -key key.pem -accept host:port -alpn proto \
              [-www] [-retry] [-early-data] [-key-update] [-switch-cid] [-ciphersuites list] \
-             [-idle-timeout ms] [-reset-key hex32] [-naccept N] [-timeout secs] \
+             [-groups list] [-idle-timeout ms] [-reset-key hex32] [-naccept N] [-timeout secs] \
              [-keylogfile keys.log] [-quiet]",
         )
     });
@@ -883,6 +896,10 @@ pub(crate) fn run_server(args: Args) {
     let early_data = args.flag("-early-data");
     let keylog = args.value("-keylogfile").map(open_keylog);
     let suites = args.value("-ciphersuites").map(parse_ciphersuites);
+    // `-groups`: the accept-set in server preference, as `s_server -groups`.
+    let groups = args
+        .value("-groups")
+        .map(|list| crate::tlsinfo::parse_groups(list, "-groups"));
     let idle_ms = parse_num(&args, "-idle-timeout");
     let opts = ServerOpts {
         www,
@@ -940,6 +957,9 @@ pub(crate) fn run_server(args: Args) {
         }
         if let Some(suites) = &suites {
             builder = builder.cipher_suites(suites);
+        }
+        if let Some(groups) = &groups {
+            builder = builder.key_exchange_groups(groups);
         }
         let mut qcfg = QuicConfig::default();
         qcfg.tls = builder.build();
