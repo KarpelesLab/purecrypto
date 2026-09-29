@@ -217,6 +217,7 @@ func runServer(args []string) {
 	deadline := fs.Duration("timeout", 60*time.Second, "exit after this long regardless")
 	loss := fs.Int("loss", 0, "drop one in N datagrams in each direction (0 = none)")
 	curves := fs.String("curves", "", "TLS groups to accept, comma-separated (default: Go's)")
+	versions := fs.String("versions", "", "QUIC versions to accept, in order (v1,v2); default both")
 	fs.Parse(args)
 
 	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
@@ -233,6 +234,7 @@ func runServer(args []string) {
 		MaxIdleTimeout:  *idle,
 		Allow0RTT:       *allow0RTT,
 		EnableDatagrams: true,
+		Versions:        parseVersions(*versions),
 		Tracer:          qlog.DefaultConnectionTracer,
 	}
 

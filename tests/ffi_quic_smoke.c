@@ -88,6 +88,10 @@ int main(void) {
     return fail("pc_quic_cfg_set_certificate");
   if (pc_quic_cfg_set_alpn(scfg, alpn, 1) != PC_OK)
     return fail("pc_quic_cfg_set_alpn server");
+  /* Pin both sides to QUIC v2 (RFC 9369) to exercise the version API. */
+  static const int32_t v2_only[1] = { PC_QUIC_V2 };
+  if (pc_quic_cfg_set_versions(scfg, v2_only, 1) != PC_OK)
+    return fail("pc_quic_cfg_set_versions server");
 
   /* 3. Client config: trust the server cert as a root + SNI + ALPN. */
   PcQuicCfg *ccfg = pc_quic_cfg_new(PC_TLS_CLIENT);
@@ -98,6 +102,12 @@ int main(void) {
     return fail("pc_quic_cfg_set_server_name");
   if (pc_quic_cfg_set_alpn(ccfg, alpn, 1) != PC_OK)
     return fail("pc_quic_cfg_set_alpn client");
+  if (pc_quic_cfg_set_versions(ccfg, v2_only, 1) != PC_OK)
+    return fail("pc_quic_cfg_set_versions client");
+  /* An unknown version is rejected. */
+  static const int32_t bogus[1] = { 0x12345678 };
+  if (pc_quic_cfg_set_versions(ccfg, bogus, 1) != PC_UNSUPPORTED)
+    return fail("pc_quic_cfg_set_versions must reject an unknown version");
 
   /* 4. Materialise both connections. */
   PcQuic *server = pc_quic_new(scfg);
@@ -143,6 +153,15 @@ int main(void) {
   pc_quic_is_handshake_complete(server, &s_done);
   if (!c_done) return fail("client handshake did not complete");
   if (!s_done) return fail("server handshake did not complete");
+
+  /* 6b. Both sides negotiated QUIC v2 (RFC 9369). */
+  int32_t cver = 0, sver = 0;
+  if (pc_quic_version(client, &cver) != PC_OK)
+    return fail("pc_quic_version client");
+  if (pc_quic_version(server, &sver) != PC_OK)
+    return fail("pc_quic_version server");
+  if (cver != PC_QUIC_V2 || sver != PC_QUIC_V2)
+    return fail("negotiated version != v2");
 
   /* 7. pc_quic_handshake returns Ok now (post-completion). */
   if (pc_quic_handshake(client) != PC_OK)

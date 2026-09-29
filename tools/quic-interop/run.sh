@@ -366,8 +366,8 @@ case_go_pc_to_go_resume() {
     rc_is 0
     expect "$d/client.err" "session ticket received (0-RTT not permitted)"
     expect "$d/client.err" "reconnecting with the session ticket (0-RTT not offered)"
-    expect "$d/client.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 resumed=no"
-    expect "$d/client.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 resumed=yes early_data=none"
+    expect "$d/client.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 version=v1 resumed=no"
+    expect "$d/client.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 version=v1 resumed=yes early_data=none"
     expect "$d/server.err" "conn 1 from 127.0.0.1"
     expect "$d/server.err" "used0rtt=false resumed=false"
     expect "$d/server.err" "conn 2 from 127.0.0.1"
@@ -691,20 +691,37 @@ case_go_go_to_pc_switchcid() {
     expect_qlog_received "$d/qlog-client" retire_connection_id
 }
 
-# Version negotiation: the quic-go client offers QUIC v2 first (RFC 9369),
-# which the purecrypto server does not speak; its Version Negotiation packet
-# must list v1 and the client must retry with it.
+# Incompatible version negotiation (RFC 9000 §6 / RFC 9368 §2.1): the quic-go
+# client offers QUIC v2 first, but the purecrypto server is pinned to v1 only,
+# so it answers with a Version Negotiation packet listing v1 and the client
+# restarts on v1 (a fresh connection attempt, hence a second qlog trace).
 case_go_go_to_pc_vn() {
     local d=$1
-    start_pc_server "$d"
+    start_pc_server "$d" -quic_versions v1
     go_client "$d" "$WORK/small.txt" -versions v2,v1
     stop_server
     rc_is 0
     echoed "$d" "$WORK/small.txt" "$SMALL_SHA"
     expect "$d/client.err" "version=1"
     expect "$d/server.err" "version negotiation sent to 127.0.0.1:"
+    expect "$d/server.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 version=v1"
     # quic-go starts a fresh connection (new trace) for the retry with v1.
     [ "$(ls "$d"/qlog-client/*.sqlog | wc -l)" -eq 2 ]
+}
+
+# Plain QUIC v2 (RFC 9369): the quic-go client offers only v2 and the
+# purecrypto server (offering both) settles on v2 with no round trip. Both
+# sides report v2 (quic-go's version field is 0x6b3343cf).
+case_go_go_to_pc_v2() {
+    local d=$1
+    start_pc_server "$d"
+    go_client "$d" "$WORK/small.txt" -versions v2
+    stop_server
+    rc_is 0
+    echoed "$d" "$WORK/small.txt" "$SMALL_SHA"
+    expect "$d/client.err" "version=6b3343cf"
+    expect "$d/server.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 version=v2"
+    expect "$d/server.err" "stream 0: 34 bytes received sha256=$SMALL_SHA"
 }
 
 # Stateless reset: the purecrypto server is killed after the first exchange
@@ -772,6 +789,92 @@ case_go_pc_to_go_mlkem() {
     rc_is 0
     echoed "$d" "$WORK/small.txt" "$SMALL_SHA"
     expect "$d/server.err" "curve=X25519MLKEM768"
+}
+
+# ---------------------------------------------------------------- QUIC v2 (RFC 9369)
+
+# Plain v2: the purecrypto client offers only v2 and the quic-go server
+# (which supports both) uses it. Both sides report v2.
+case_go_pc_to_go_v2() {
+    local d=$1
+    start_go_server "$d"
+    pc_client "$d" "$WORK/small.txt" -quic_versions v2
+    stop_server
+    rc_is 0
+    echoed "$d" "$WORK/small.txt" "$SMALL_SHA"
+    expect "$d/client.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 version=v2"
+    expect "$d/server.err" "version=6b3343cf"
+}
+
+# Incompatible version negotiation from the purecrypto client's side: it
+# offers v2 first but the quic-go server is pinned to v1, so quic-go's
+# transport answers with a Version Negotiation packet and the purecrypto
+# client restarts on v1 (RFC 9000 §6 / RFC 9368 §2.1, §4 downgrade checks).
+case_go_pc_to_go_vn() {
+    local d=$1
+    start_go_server "$d" -versions v1
+    pc_client "$d" "$WORK/small.txt" -quic_versions v2,v1
+    stop_server
+    rc_is 0
+    echoed "$d" "$WORK/small.txt" "$SMALL_SHA"
+    expect "$d/client.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 version=v1"
+    expect "$d/server.err" "version=1"
+}
+
+# Retry (RFC 9000 §8.1.2) under v2: the v2 Retry packet (RFC 9369 §3.3.3
+# integrity tag) and a v2-bound token round-trip against quic-go.
+case_go_pc_to_go_v2_retry() {
+    local d=$1
+    start_go_server "$d" -retry
+    pc_client "$d" "$WORK/small.txt" -quic_versions v2
+    stop_server
+    rc_is 0
+    echoed "$d" "$WORK/small.txt" "$SMALL_SHA"
+    expect "$d/client.err" "version=v2"
+    expect "$d/client.err" "retry=yes"
+    expect "$d/server.err" "addr_verified=true"
+}
+
+# Key update (RFC 9001 §6) under v2 is NOT interop-tested against quic-go:
+# quic-go v0.63 derives the key-update secret with the version-1 label
+# "quic ku" regardless of the connection's version (internal/handshake/
+# updatable_aead.go getNextTrafficSecret hardcodes "quic ku"), rather than
+# RFC 9369 §3.3.2's "quicv2 ku". So quic-go cannot decrypt a conformant v2
+# key update and drops the phase-1 packets. purecrypto's v2 key update is
+# RFC-correct — proved by the RFC 9369 §A.5 "quicv2 ku" vector, the
+# pc<->pc `key_update_bidirectional_integration_v2` loopback test, and the
+# v2 arm of the ct_valgrind `quic_packets` case — so this stays a SKIP
+# rather than a workaround that would send a non-conformant label.
+case_go_pc_to_go_v2_keyupdate() {
+    log "  SKIP: quic-go v0.63 uses the v1 \"quic ku\" label under v2 (RFC 9369 §3.3.2 violation); covered pc<->pc"
+    return 77
+}
+
+# Resumption under v2 (RFC 9369 §5: the ticket is v2-bound). Both connections
+# run on v2; the second resumes the first.
+case_go_pc_to_go_v2_resume() {
+    local d=$1
+    start_go_server "$d" -naccept 2
+    pc_client "$d" "$WORK/small.txt" -quic_versions v2 -reconnect
+    stop_server
+    rc_is 0
+    expect "$d/client.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 version=v2 resumed=no"
+    expect "$d/client.err" "negotiated: alpn=pc-echo suite=TLS_AES_128_GCM_SHA256 version=v2 resumed=yes"
+    [ "$(grep -c "echoed 34 bytes sha256=$SMALL_SHA" "$d/server.err")" -eq 2 ]
+}
+
+# 0-RTT under v2 (RFC 9369 §4.1: 0-RTT stays the original version — here v2
+# throughout — and §5: the v2 ticket permits it).
+case_go_pc_to_go_v2_0rtt() {
+    local d=$1
+    start_go_server "$d" -naccept 2 -0rtt
+    pc_client "$d" "$WORK/small.txt" -quic_versions v2 -reconnect -early-data
+    stop_server
+    rc_is 0
+    expect "$d/client.err" "resumed=yes early_data=accepted"
+    expect "$d/client.err" "version=v2 resumed=yes"
+    expect "$d/server.err" "used0rtt=true resumed=true"
+    [ "$(grep -c "echoed 34 bytes sha256=$SMALL_SHA" "$d/server.err")" -eq 2 ]
 }
 
 case_go_go_to_pc_mlkem() {
@@ -1021,10 +1124,12 @@ go_pc_to_go_resume go_pc_to_go_0rtt go_pc_to_go_keyupdate go_pc_to_go_chacha20 g
 go_pc_to_go_close go_pc_to_go_idle go_pc_to_go_datagram go_pc_to_go_migrate go_pc_to_go_switchcid
 go_pc_to_go_reset go_pc_to_go_ecn go_pc_to_go_mlkem
 go_pc_to_go_p521 go_pc_to_go_secp256r1mlkem768 go_pc_to_go_secp384r1mlkem1024
+go_pc_to_go_v2 go_pc_to_go_vn go_pc_to_go_v2_retry go_pc_to_go_v2_keyupdate
+go_pc_to_go_v2_resume go_pc_to_go_v2_0rtt
 go_go_to_pc_bidi go_go_to_pc_uni go_go_to_pc_large go_go_to_pc_loss go_go_to_pc_retry
 go_go_to_pc_resume go_go_to_pc_0rtt go_go_to_pc_keyupdate go_go_to_pc_chacha20 go_go_to_pc_aes256
 go_go_to_pc_close go_go_to_pc_idle go_go_to_pc_datagram go_go_to_pc_migrate go_go_to_pc_switchcid
-go_go_to_pc_vn go_go_to_pc_reset go_go_to_pc_ecn go_go_to_pc_mlkem
+go_go_to_pc_vn go_go_to_pc_v2 go_go_to_pc_reset go_go_to_pc_ecn go_go_to_pc_mlkem
 go_go_to_pc_p521 go_go_to_pc_secp256r1mlkem768 go_go_to_pc_secp384r1mlkem1024
 go_go_hrr_to_pc_p521 go_go_hrr_to_pc_secp256r1mlkem768 go_go_hrr_to_pc_secp384r1mlkem1024
 "
