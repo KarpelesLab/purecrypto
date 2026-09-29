@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::dtls_io::{self, Clock, Step};
+use crate::dtls_io::{self, Clock, Link, Step};
 use crate::tlsinfo::{self, Role};
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, zero_buf};
 use purecrypto::rng::OsRng;
@@ -136,7 +136,8 @@ pub(crate) fn run(args: Args) {
              [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-no_ticket] \
              [-early_data [-max_early_data N]] [-key_update] [-status_file resp.der] \
              [-enable_server_rpk] [-enable_client_rpk -rpk_peer_key pub.pem] \
-             [-record_size_limit N] [-no_cert_comp] [-keylogfile keys.log] \
+             [-record_size_limit N] [-no_cert_comp] [-cid HEX | -cid_len N] \
+             [-keylogfile keys.log] \
              [-ech-key key.bin -ech-config config.bin] [-psk_modes psk_dhe_ke:psk_ke] \
              [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]] (-cert/-key may be \
              omitted with -psk: a PSK-only TLS 1.3 server)",
@@ -185,6 +186,10 @@ pub(crate) fn run(args: Args) {
     if key_update && !matches!(version, ProtocolVersion::Tls13 | ProtocolVersion::Dtls13) {
         die("-key_update needs TLS 1.3 or DTLS 1.3");
     }
+    // RFC 9146 connection IDs (DTLS): this server receives under `-cid
+    // HEX` or a random `-cid_len N`-byte one, and follows the client to a
+    // new address when its records say so (see `dtls_io::Link`).
+    let cid = crate::util::dtls_cid_option(&args, !is_tcp);
     // `-min_protocol TLSv1.2` widens the pinned TLS 1.3 server into one
     // that also accepts TLS 1.2 clients (the engine is picked from the
     // ClientHello).
@@ -322,6 +327,7 @@ pub(crate) fn run(args: Args) {
         let roots = load_roots_file(p);
         builder = builder.client_auth(ClientAuth::new(roots, true));
     }
+    builder = crate::util::apply_dtls_cid(builder, cid.clone());
     if matches!(version, ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13) {
         if no_cookie {
             builder = builder.no_cookie();
@@ -383,7 +389,7 @@ pub(crate) fn run(args: Args) {
             } else {
                 format!("127.0.0.1:{accept}")
             };
-            run_udp(&cfg, &accept, mtu, quiet, key_update);
+            run_udp(&cfg, &accept, mtu, quiet, key_update, cid.is_some());
         }
     }
 }
@@ -630,7 +636,7 @@ fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream, ech: bool) {
     }
 }
 
-fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool) {
+fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool, with_cid: bool) {
     let socket =
         UdpSocket::bind(accept).unwrap_or_else(|e| die(format!("cannot bind UDP {accept}: {e}")));
     let bound = socket.local_addr().ok();
@@ -649,9 +655,18 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool
         eprintln!("accepted handshake start from {peer}");
     }
     buf.truncate(n);
-    socket
-        .connect(peer)
-        .unwrap_or_else(|e| die(format!("UDP connect to peer {peer}: {e}")));
+    // With connection IDs the socket stays unconnected: the client may
+    // move to another address mid-connection, and the link follows it
+    // under the RFC 9146 §6 rules. Without them a moved client cannot be
+    // recognised anyway, and a connected socket reports it gone (ICMP).
+    let mut link = if with_cid {
+        Link::addressed(socket, peer)
+    } else {
+        socket
+            .connect(peer)
+            .unwrap_or_else(|e| die(format!("UDP connect to peer {peer}: {e}")));
+        Link::connected(socket)
+    };
 
     // Bind the DTLS cookie to the source address we just learned. Without
     // it a cookie-requiring server refuses to handshake at all (an
@@ -675,7 +690,7 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool
     conn.set_now(clock.now());
     let _ = conn.feed(&buf);
 
-    drive_udp_handshake(&mut conn, &socket, &clock, mtu);
+    drive_udp_handshake(&mut conn, &mut link, &clock, mtu);
 
     if !quiet {
         let v_str = match conn.negotiated_version() {
@@ -695,9 +710,16 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool
         conn.set_now(clock.now());
         conn.request_key_update()
             .unwrap_or_else(|e| die(format!("KeyUpdate refused: {e:?}")));
-        dtls_io::flush(&mut conn, &socket);
+        dtls_io::flush(&mut conn, &link);
     }
-    drive_udp_echo(&mut conn, &socket, &clock, mtu, Duration::from_secs(5));
+    drive_udp_echo(
+        &mut conn,
+        &mut link,
+        &clock,
+        mtu,
+        Duration::from_secs(5),
+        quiet,
+    );
     if !quiet {
         tlsinfo::report_session_end(&conn);
     }
@@ -705,7 +727,7 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool, key_update: bool
     let _: Option<SocketAddr> = bound;
 }
 
-fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, clock: &Clock, mtu: usize) {
+fn drive_udp_handshake(conn: &mut Connection, link: &mut Link, clock: &Clock, mtu: usize) {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
     while !conn.is_handshake_complete() {
         if clock.now() > dtls_io::HANDSHAKE_DEADLINE {
@@ -714,14 +736,14 @@ fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, clock: &Clock,
         // The retransmit timer fires on the engine's own schedule (1 s,
         // doubling: RFC 6347 §4.2.4.1 / RFC 9147 §5.8.2), on the
         // connection's clock; see the matching note in `s_client`.
-        match dtls_io::step(conn, socket, clock, &mut buf) {
+        match dtls_io::step(conn, link, clock, &mut buf) {
             Ok(Step::Datagram | Step::Quiet) => {}
             Ok(Step::Gone) => die("UDP recv failed: the client is unreachable"),
             Err(e) => die(format!("DTLS handshake failed: {e:?}")),
         }
     }
     // The flight that completed the handshake (the final flight, ACKs).
-    dtls_io::flush(conn, socket);
+    dtls_io::flush(conn, link);
 }
 
 /// Echoes the application data in `plain`; `false` when the engine
@@ -744,10 +766,11 @@ fn echo(conn: &mut Connection, plain: &[u8]) -> bool {
 /// close_notify sent into that gap fails its handshake.
 fn drive_udp_echo(
     conn: &mut Connection,
-    socket: &UdpSocket,
+    link: &mut Link,
     clock: &Clock,
     mtu: usize,
     idle_limit: Duration,
+    quiet: bool,
 ) {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
     let mut last_activity = Instant::now();
@@ -757,7 +780,7 @@ fn drive_udp_echo(
         }
         if last_activity.elapsed() > idle_limit {
             if conn.handshake_flight_pending() {
-                dtls_io::settle(conn, socket, clock, &mut buf, |conn, plain| {
+                dtls_io::settle(conn, link, clock, &mut buf, |conn, plain| {
                     echo(conn, &plain);
                 });
                 if !conn.handshake_flight_pending() && !conn.received_close_notify() {
@@ -768,21 +791,29 @@ fn drive_udp_echo(
             }
             break;
         }
-        match dtls_io::step(conn, socket, clock, &mut buf) {
+        match dtls_io::step(conn, link, clock, &mut buf) {
             Ok(Step::Datagram) => {
                 last_activity = Instant::now();
+                // The client moved (RFC 9146 §6: an authenticated, newer
+                // record under its connection ID from a new address); the
+                // echo below already goes there.
+                if let Some((old, new)) = link.take_move()
+                    && !quiet
+                {
+                    eprintln!("peer address updated: {old} -> {new}");
+                }
                 // (A KeyUpdate reply the engine owed the client went out
                 // in `step`, before any echo under the new key.)
                 let plain = conn.recv().unwrap_or_default();
                 if !echo(conn, &plain) {
                     break;
                 }
-                dtls_io::flush(conn, socket);
+                dtls_io::flush(conn, link);
             }
             Ok(Step::Quiet) => {}
             Ok(Step::Gone) | Err(_) => break,
         }
     }
     let _ = conn.close();
-    dtls_io::flush(conn, socket);
+    dtls_io::flush(conn, link);
 }

@@ -19,7 +19,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::dtls_io::{self, Clock, Step};
+use crate::dtls_io::{self, Clock, Link, Step};
 use crate::pki::format_dn;
 use crate::tlsinfo::{self, Role};
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn};
@@ -200,6 +200,8 @@ pub(crate) fn run(args: Args) {
         "-min_protocol",
         "-read_timeout",
         "-resend",
+        "-cid",
+        "-cid_len",
     ];
     value_flags.extend(crate::ech::CLIENT_VALUE_FLAGS);
     value_flags.extend(tlsinfo::PSK_VALUE_FLAGS);
@@ -208,7 +210,7 @@ pub(crate) fn run(args: Args) {
         .or_else(|| args.positionals(&value_flags).first().copied())
         .unwrap_or_else(|| {
             die(
-                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-groups x25519:secp256r1] [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]] [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk] [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS] [-resend N] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease] [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]",
+                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-groups x25519:secp256r1] [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]] [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk] [-record_size_limit N] [-no_cert_comp] [-read_timeout SECS] [-resend N] [-cid HEX | -cid_len N] [-rebind] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease] [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]",
             )
         });
     let (host, port) = match connect.rsplit_once(':') {
@@ -260,6 +262,20 @@ pub(crate) fn run(args: Args) {
     if resend != 0 && !matches!(version, ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13) {
         die("-resend is a DTLS option: TLS delivers the input reliably");
     }
+    // RFC 9146 connection IDs: `-cid HEX` receives under that exact CID
+    // (`-cid ""` for a zero-length one: we send with the server's but need
+    // none), `-cid_len N` under a random N-byte one. `-rebind` moves to a
+    // new local port after the first exchange — what CIDs exist for.
+    let cid = crate::util::dtls_cid_option(
+        &args,
+        matches!(version, ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13),
+    );
+    let rebind = args.flag("-rebind") || args.flag("--rebind");
+    if rebind && cid.is_none() {
+        die(
+            "-rebind needs -cid or -cid_len: without a connection ID the server cannot recognise the connection from a new port (RFC 9146)",
+        );
+    }
     let is_tcp = matches!(version, ProtocolVersion::Tls12 | ProtocolVersion::Tls13);
     if (reconnect || enable_server_rpk || enable_client_rpk) && !is_tcp {
         die("-reconnect / -enable_*_rpk are TLS-over-TCP options");
@@ -297,6 +313,7 @@ pub(crate) fn run(args: Args) {
         .server_name(server_name)
         .verify_certificates(!insecure)
         .max_record_size(mtu);
+    builder = crate::util::apply_dtls_cid(builder, cid);
     if let Some(a) = alpn {
         builder = builder.alpn(a);
     }
@@ -433,6 +450,9 @@ pub(crate) fn run(args: Args) {
             socket
                 .connect((host, port))
                 .unwrap_or_else(|e| die(format!("UDP connect to {host}:{port} failed: {e}")));
+            let peer = socket
+                .peer_addr()
+                .unwrap_or_else(|e| die(format!("UDP peer address: {e}")));
             let udp = UdpOpts {
                 mtu,
                 version,
@@ -442,8 +462,11 @@ pub(crate) fn run(args: Args) {
                 key_update,
                 read_timeout,
                 resend,
+                rebind,
+                peer,
             };
-            run_udp(&mut conn, &socket, &udp);
+            let mut link = Link::connected(socket);
+            run_udp(&mut conn, &mut link, &udp);
         }
     }
 }
@@ -465,6 +488,12 @@ struct UdpOpts {
     /// `-resend`: how many more times the input is sent when
     /// `read_timeout` passes without application data from the server.
     resend: u32,
+    /// `-rebind`: after the first exchange, move to a new local port and
+    /// send the input again (RFC 9146: the connection ID lets the server
+    /// find the connection from the new address).
+    rebind: bool,
+    /// The server, for the socket `-rebind` opens.
+    peer: std::net::SocketAddr,
 }
 
 /// Handshake + report, shared by the plain and the `-reconnect` flows.
@@ -592,11 +621,11 @@ fn flush_out(conn: &mut Connection, sock: &mut TcpStream) {
     }
 }
 
-fn run_udp(conn: &mut Connection, socket: &UdpSocket, opts: &UdpOpts) {
+fn run_udp(conn: &mut Connection, link: &mut Link, opts: &UdpOpts) {
     // One clock for the connection's whole life: the engine's timers are
     // expressed in it (see `dtls_io`).
     let clock = Clock::start();
-    drive_udp_handshake(conn, socket, &clock, opts.mtu);
+    drive_udp_handshake(conn, link, &clock, opts.mtu);
 
     // Unconditional security warning — see the TCP path for the rationale.
     if opts.insecure {
@@ -627,7 +656,7 @@ fn run_udp(conn: &mut Connection, socket: &UdpSocket, opts: &UdpOpts) {
         }
     }
 
-    drive_udp_data(conn, socket, &clock, opts);
+    drive_udp_data(conn, link, &clock, opts);
 }
 
 /// Fails the handshake: flushes any alert the engine queued (an ECH
@@ -798,7 +827,7 @@ fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream, opts: &TcpOpts<'_
     }
 }
 
-fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, clock: &Clock, mtu: usize) {
+fn drive_udp_handshake(conn: &mut Connection, link: &mut Link, clock: &Clock, mtu: usize) {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
     while !conn.is_handshake_complete() {
         if clock.now() > dtls_io::HANDSHAKE_DEADLINE {
@@ -807,14 +836,14 @@ fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, clock: &Clock,
         // The retransmit timer fires on the engine's own schedule (1 s,
         // doubling: RFC 6347 §4.2.4.1 / RFC 9147 §5.8.2), on the
         // connection's clock.
-        match dtls_io::step(conn, socket, clock, &mut buf) {
+        match dtls_io::step(conn, link, clock, &mut buf) {
             Ok(Step::Datagram | Step::Quiet) => {}
             Ok(Step::Gone) => die("UDP recv failed: the server is unreachable"),
             Err(e) => die(format!("DTLS handshake failed: {e:?}")),
         }
     }
     // The flight that completed the handshake (ACKs, our Finished).
-    dtls_io::flush(conn, socket);
+    dtls_io::flush(conn, link);
 }
 
 /// What a [`pump_udp`] round saw.
@@ -831,7 +860,7 @@ struct Pumped {
 /// timer is fired on the way.
 fn pump_udp(
     conn: &mut Connection,
-    socket: &UdpSocket,
+    link: &mut Link,
     clock: &Clock,
     buf: &mut [u8],
     idle: Duration,
@@ -844,7 +873,7 @@ fn pump_udp(
     };
     let mut last_inbound = Instant::now();
     while clock.now() < deadline && !conn.received_close_notify() {
-        match dtls_io::step(conn, socket, clock, buf) {
+        match dtls_io::step(conn, link, clock, buf) {
             Ok(Step::Datagram) => {
                 last_inbound = Instant::now();
                 let plain = conn.recv().unwrap_or_default();
@@ -856,7 +885,7 @@ fn pump_udp(
                     }
                 }
                 let _ = stdout.flush();
-                dtls_io::flush(conn, socket);
+                dtls_io::flush(conn, link);
             }
             Ok(Step::Quiet) => {
                 if last_inbound.elapsed() > idle {
@@ -888,15 +917,65 @@ fn print_data(_conn: &mut Connection, plain: Vec<u8>) {
 /// Queues `input` as application data, one record per datagram
 /// (application data is not fragmented by the engine, so each record stays
 /// under the MTU), and sends it.
-fn send_input(conn: &mut Connection, socket: &UdpSocket, input: &[u8], mtu: usize) {
+fn send_input(conn: &mut Connection, link: &Link, input: &[u8], mtu: usize) {
     let chunk = mtu.saturating_sub(64).max(64);
     for piece in input.chunks(chunk) {
         let _ = conn.send(piece);
     }
-    dtls_io::flush(conn, socket);
+    dtls_io::flush(conn, link);
 }
 
-fn drive_udp_data(conn: &mut Connection, socket: &UdpSocket, clock: &Clock, opts: &UdpOpts) {
+/// `-rebind`: moves the connection to a fresh local UDP port — what a NAT
+/// rebinding or a change of network looks like from the server — and,
+/// on DTLS 1.3, to a fresh connection ID for the new path (RFC 9147 §9:
+/// "implementations SHOULD use a new CID whenever sending on a new
+/// path"), asked from the server beforehand with `RequestConnectionId`.
+/// The server can only follow because the records carry its CID
+/// (RFC 9146 §6). Reports `rebind: OLD -> NEW`.
+fn rebind(conn: &mut Connection, link: &mut Link, clock: &Clock, buf: &mut [u8], opts: &UdpOpts) {
+    let old = link.socket().local_addr().ok();
+    if opts.version == ProtocolVersion::Dtls13
+        && conn.peer_connection_id().is_some_and(|c| !c.is_empty())
+    {
+        conn.set_now(clock.now());
+        conn.request_connection_ids(1)
+            .unwrap_or_else(|e| die(format!("RequestConnectionId refused: {e:?}")));
+        dtls_io::flush(conn, link);
+        // The spare arrives in the server's NewConnectionId, which we ACK.
+        let until = clock.now() + Duration::from_secs(10);
+        while conn.spare_connection_ids() == 0 && clock.now() < until {
+            match dtls_io::step(conn, link, clock, buf) {
+                Ok(Step::Datagram) => {
+                    let plain = conn.recv().unwrap_or_default();
+                    print_data(conn, plain);
+                }
+                Ok(Step::Quiet) => {}
+                Ok(Step::Gone) => die("UDP recv failed: the server is unreachable"),
+                Err(e) => die(format!("DTLS error after handshake: {e:?}")),
+            }
+        }
+        if conn.spare_connection_ids() == 0 {
+            die("the server issued no connection ID to move to");
+        }
+    }
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .unwrap_or_else(|e| die(format!("cannot bind a new local UDP socket: {e}")));
+    socket
+        .connect(opts.peer)
+        .unwrap_or_else(|e| die(format!("UDP connect to {} failed: {e}", opts.peer)));
+    let new = socket.local_addr().ok();
+    link.replace_socket(socket);
+    if conn.spare_connection_ids() > 0 {
+        let _ = conn.use_spare_connection_id();
+    }
+    if !opts.quiet {
+        let show =
+            |a: Option<std::net::SocketAddr>| a.map_or_else(|| "?".to_string(), |a| a.to_string());
+        eprintln!("rebind: {} -> {}", show(old), show(new));
+    }
+}
+
+fn drive_udp_data(conn: &mut Connection, link: &mut Link, clock: &Clock, opts: &UdpOpts) {
     let mut buf = vec![0u8; opts.mtu.max(1500) + 256];
     // This side is done with the handshake; the server may not be. A DTLS
     // 1.3 client completes when it has *sent* its Finished, and if that
@@ -904,7 +983,7 @@ fn drive_udp_data(conn: &mut Connection, socket: &UdpSocket, clock: &Clock, opts
     // discards application data and fails on a close_notify. Keep the
     // retransmission going until the server has acknowledged the Finished
     // (RFC 9147 §5.8.1, §7), bounded, before saying anything.
-    dtls_io::settle(conn, socket, clock, &mut buf, print_data);
+    dtls_io::settle(conn, link, clock, &mut buf, print_data);
     // The data phase gets its own budget, on the connection's clock.
     let deadline = clock.now() + Duration::from_secs(30);
 
@@ -914,20 +993,20 @@ fn drive_udp_data(conn: &mut Connection, socket: &UdpSocket, clock: &Clock, opts
         conn.set_now(clock.now());
         conn.request_key_update()
             .unwrap_or_else(|e| die(format!("KeyUpdate refused: {e:?}")));
-        dtls_io::flush(conn, socket);
+        dtls_io::flush(conn, link);
     }
     let mut input = Vec::new();
     if !std::io::stdin().is_terminal() {
         let _ = std::io::stdin().read_to_end(&mut input);
     }
     if !input.is_empty() {
-        send_input(conn, socket, &input, opts.mtu);
+        send_input(conn, link, &input, opts.mtu);
     }
     // `-resend`: application data is not retransmitted by DTLS, so an
     // application that needs an answer asks again.
     let mut resends = if input.is_empty() { 0 } else { opts.resend };
     loop {
-        let seen = pump_udp(conn, socket, clock, &mut buf, opts.read_timeout, deadline);
+        let seen = pump_udp(conn, link, clock, &mut buf, opts.read_timeout, deadline);
         if seen.data || seen.gone || resends == 0 || conn.received_close_notify() {
             break;
         }
@@ -935,21 +1014,40 @@ fn drive_udp_data(conn: &mut Connection, socket: &UdpSocket, clock: &Clock, opts
             break;
         }
         resends -= 1;
-        send_input(conn, socket, &input, opts.mtu);
+        send_input(conn, link, &input, opts.mtu);
+    }
+    // `-rebind`: the same exchange once more from a new local port.
+    if opts.rebind && !conn.received_close_notify() {
+        rebind(conn, link, clock, &mut buf, opts);
+        if !input.is_empty() {
+            send_input(conn, link, &input, opts.mtu);
+        }
+        let mut resends = if input.is_empty() { 0 } else { opts.resend };
+        loop {
+            let seen = pump_udp(conn, link, clock, &mut buf, opts.read_timeout, deadline);
+            if seen.data || seen.gone || resends == 0 || conn.received_close_notify() {
+                break;
+            }
+            if clock.now() >= deadline {
+                break;
+            }
+            resends -= 1;
+            send_input(conn, link, &input, opts.mtu);
+        }
     }
     // Say goodbye (RFC 8446 §6.1, in a protected record) rather than just
     // going silent, then wait — bounded by the read timeout — for the peer's
     // own close_notify, so a peer that shuts down cleanly is told apart from
     // one that merely stopped talking.
     if !conn.received_close_notify() && conn.close().is_ok() {
-        dtls_io::flush(conn, socket);
+        dtls_io::flush(conn, link);
         // A close_notify the engine is holding back for an unacknowledged
         // Finished (a KeyUpdate in the air counts too) goes out when the
         // ACK arrives.
-        dtls_io::settle(conn, socket, clock, &mut buf, print_data);
-        dtls_io::flush(conn, socket);
+        dtls_io::settle(conn, link, clock, &mut buf, print_data);
+        dtls_io::flush(conn, link);
         let deadline = clock.now() + opts.read_timeout + Duration::from_secs(1);
-        pump_udp(conn, socket, clock, &mut buf, opts.read_timeout, deadline);
+        pump_udp(conn, link, clock, &mut buf, opts.read_timeout, deadline);
     }
     if !opts.quiet {
         tlsinfo::report_session_end(conn);

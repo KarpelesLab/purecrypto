@@ -123,6 +123,20 @@ pub(crate) fn report_handshake(conn: &Connection, role: Role) {
             yes_no(conn.peer_ocsp_response().is_some())
         );
     }
+    if matches!(
+        version,
+        Some(ProtocolVersion::DTLSv1_2) | Some(ProtocolVersion::DTLSv1_3)
+    ) {
+        // RFC 9146 connection IDs: `rx` is the one the peer puts in its
+        // records to us, `tx` the one we put in ours; `empty` is a
+        // negotiated zero-length CID (that direction carries none).
+        match (conn.local_connection_id(), conn.peer_connection_id()) {
+            (Some(rx), Some(tx)) => {
+                eprintln!("connection id: rx={} tx={}", cid_hex(rx), cid_hex(tx));
+            }
+            _ => eprintln!("connection id: none"),
+        }
+    }
     if version == Some(ProtocolVersion::TLSv1_3) {
         eprintln!(
             "record_size_limit: {}",
@@ -166,6 +180,15 @@ pub(crate) fn report_session_end(conn: &Connection) {
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
+}
+
+/// A connection ID for the report: hex, or `empty` for a zero-length one.
+fn cid_hex(cid: &[u8]) -> String {
+    if cid.is_empty() {
+        "empty".to_string()
+    } else {
+        crate::util::to_hex(cid)
+    }
 }
 
 #[cfg(feature = "cert-compression")]

@@ -646,6 +646,32 @@ peer still in its handshake fails that handshake.) Application data is
 not retransmitted by DTLS: `s_client -resend N` sends the input again, up
 to N more times, each time `-read_timeout` passes without an answer.
 
+Connection IDs (RFC 9146; RFC 9147 §9 on DTLS 1.3) let a server find a
+connection whose 4-tuple changed — a NAT rebinding, a client that moved
+networks. `-cid HEX` (either side) negotiates them and receives under that
+exact CID (`-cid ""` for a zero-length one: this side sends with the
+peer's CID but asks for none), `-cid_len N` under a random N-byte one
+(1..=20). The report then carries `connection id: rx=HEX tx=HEX` — `rx`
+the CID the peer puts in its records, `tx` the one this side puts in its
+(each side's `rx` is the other's `tx`; `empty` for a zero-length one) —
+or `connection id: none`. A server given either option keeps its socket
+unconnected and follows the client to a new address only once an
+authenticated record under the connection's CID, newer than every record
+before it, arrives from there (RFC 9146 §6), reporting `peer address
+updated: OLD -> NEW`; it sends nothing to the new address beyond what it
+received from it (an echo, the `close_notify`), so a spoofed source cannot
+make a reflector of it — an application that answers with more must test
+the new address first (RFC 9147 §9). `s_client -rebind` (with `-cid` /
+`-cid_len`) is the client side of that: after the first exchange it moves
+to a new local port — on DTLS 1.3 also to a fresh CID the server issued
+on request (`RequestConnectionId` / `NewConnectionId`) — reports
+`rebind: OLD -> NEW`, and sends its input again.
+
+```sh
+purecrypto s_dtls_server -dtls1_3 -accept 0.0.0.0:5685 -cert cert.pem -key key.pem -cid_len 4
+printf 'ping' | purecrypto s_dtls_client -dtls1_3 -connect localhost:5685 -cid_len 4 -rebind
+```
+
 Not implemented over DTLS, and refused up front: client certificates
 (`-Verify`, `-cert`), resumption and 0-RTT (`-reconnect`, `-early_data`,
 `-naccept`), raw public keys, `-record_size_limit`, ECH.

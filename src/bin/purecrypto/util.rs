@@ -684,6 +684,55 @@ pub(crate) fn parse_hex_flag(value: &str, flag: &str) -> Vec<u8> {
     from_hex(value).unwrap_or_else(|| die(format!("invalid hex value for {flag}: {value}")))
 }
 
+/// The `-cid HEX` / `-cid_len N` options of `s_client` / `s_server`
+/// (RFC 9146 connection IDs, DTLS only): the connection ID this side wants
+/// to receive under, or `None` when neither is given. `-cid ""` asks for a
+/// zero-length one (this side sends with the peer's CID but receives none).
+pub(crate) fn dtls_cid_option(args: &Args, is_dtls: bool) -> Option<purecrypto::tls::ConnectionId> {
+    let cid = args.value("-cid");
+    let len = args.value("-cid_len");
+    if (cid.is_some() || len.is_some()) && !is_dtls {
+        die("-cid / -cid_len are DTLS options (RFC 9146 connection IDs)");
+    }
+    match (cid, len) {
+        (Some(_), Some(_)) => die("-cid and -cid_len are mutually exclusive"),
+        (Some(hex), None) => Some(purecrypto::tls::ConnectionId::Fixed(parse_hex_flag(
+            hex, "-cid",
+        ))),
+        (None, Some(n)) => {
+            let n = parse_usize_flag(n, "-cid_len");
+            if n == 0 || n > purecrypto::dtls::MAX_LOCAL_CID_LEN {
+                die(format!(
+                    "-cid_len must be 1..={} (use -cid \"\" for a zero-length connection ID)",
+                    purecrypto::dtls::MAX_LOCAL_CID_LEN
+                ));
+            }
+            Some(purecrypto::tls::ConnectionId::Random(n))
+        }
+        (None, None) => None,
+    }
+}
+
+/// Applies a [`dtls_cid_option`] to a config builder.
+pub(crate) fn apply_dtls_cid(
+    builder: purecrypto::tls::ConfigBuilder,
+    cid: Option<purecrypto::tls::ConnectionId>,
+) -> purecrypto::tls::ConfigBuilder {
+    match cid {
+        Some(purecrypto::tls::ConnectionId::Fixed(v)) => {
+            if v.len() > purecrypto::dtls::MAX_LOCAL_CID_LEN {
+                die(format!(
+                    "-cid is at most {} bytes",
+                    purecrypto::dtls::MAX_LOCAL_CID_LEN
+                ));
+            }
+            builder.connection_id(v)
+        }
+        Some(purecrypto::tls::ConnectionId::Random(n)) => builder.connection_id_len(n),
+        _ => builder,
+    }
+}
+
 /// Best-effort overwrite of `buf` with zeros, mirroring
 /// `src/hash/zeroize.rs::zero_bytes`. Used after parsing a hex-encoded secret
 /// off argv (or out of a file) into a `Vec<u8>` we no longer need — the

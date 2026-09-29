@@ -7789,3 +7789,131 @@ fn dtls12_server_resends_a_lost_final_flight() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// RFC 9146 connection IDs, the point of them: the client moves to a new
+/// local UDP port mid-connection (`-rebind`, what a NAT rebinding looks
+/// like to the server) and data still flows, because the server finds the
+/// connection by the CID in the record and follows the client to the new
+/// address once an authenticated, newer record arrives from it (§6). Both
+/// sides report the negotiated CIDs (`connection id: rx=… tx=…`, each
+/// side's `rx` being the other's `tx`), the client reports the rebind and
+/// the server the address update; on DTLS 1.3 the client also moves to a
+/// spare CID the server issued for the new path (RFC 9147 §9).
+#[test]
+fn dtls_connection_ids_survive_a_client_rebind() {
+    let dir = std::env::temp_dir().join(format!("pc_dtls_cid_{}", std::process::id()));
+    let (cert, key) = write_dtls_identity(&dir);
+    for version in ["-dtls1_2", "-dtls1_3"] {
+        let server = spawn_server_wait_listening(&[
+            "s_server", version, "-cert", &cert, "-key", &key, "-accept", "0", "-cid_len", "4",
+        ]);
+        let (out, err, ok) = run_capture(
+            &[
+                "s_client",
+                version,
+                "-connect",
+                &format!("127.0.0.1:{}", server.port),
+                "-insecure",
+                "-cid",
+                "c1d2e3",
+                "-rebind",
+                "-read_timeout",
+                "1",
+            ],
+            b"hello\n",
+        );
+        let server_err = server.finish_with_stderr();
+        assert!(ok, "{version}: s_client failed: {err}");
+        // The echo came back twice: before and after the rebind.
+        assert_eq!(out.matches("hello").count(), 2, "{version}: {out:?}\n{err}");
+        let client_tx = err
+            .lines()
+            .find_map(|l| l.strip_prefix("connection id: rx=c1d2e3 tx="))
+            .unwrap_or_else(|| panic!("{version}: no connection id line: {err}"));
+        assert_eq!(client_tx.len(), 8, "{version}: a 4-byte random CID: {err}");
+        assert!(
+            server_err.contains(&format!("connection id: rx={client_tx} tx=c1d2e3")),
+            "{version}: server:\n{server_err}"
+        );
+        assert!(err.contains("rebind: 127.0.0.1:"), "{version}: {err}");
+        assert!(
+            server_err.contains("peer address updated: 127.0.0.1:"),
+            "{version}: server:\n{server_err}"
+        );
+        assert!(
+            server_err.contains("close_notify: received"),
+            "{version}: server:\n{server_err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `-cid` / `-cid_len` are DTLS options, exclusive of each other, bounded,
+/// and `-rebind` needs one of them: each misuse is refused up front.
+#[test]
+fn dtls_cid_options_are_validated() {
+    for (args, msg) in [
+        (
+            &["s_client", "-connect", "127.0.0.1:1", "-cid", "01"][..],
+            "DTLS options",
+        ),
+        (
+            &[
+                "s_client",
+                "-dtls1_3",
+                "-connect",
+                "127.0.0.1:1",
+                "-cid",
+                "01",
+                "-cid_len",
+                "4",
+            ][..],
+            "mutually exclusive",
+        ),
+        (
+            &[
+                "s_client",
+                "-dtls1_3",
+                "-connect",
+                "127.0.0.1:1",
+                "-cid_len",
+                "21",
+            ][..],
+            "-cid_len must be 1..=20",
+        ),
+        (
+            &[
+                "s_client",
+                "-dtls1_3",
+                "-connect",
+                "127.0.0.1:1",
+                "-cid_len",
+                "0",
+            ][..],
+            "-cid_len must be 1..=20",
+        ),
+        (
+            &[
+                "s_client",
+                "-dtls1_3",
+                "-connect",
+                "127.0.0.1:1",
+                "-cid",
+                "zz",
+            ][..],
+            "invalid hex value for -cid",
+        ),
+        (
+            &["s_client", "-dtls1_3", "-connect", "127.0.0.1:1", "-rebind"][..],
+            "-rebind needs -cid or -cid_len",
+        ),
+        (
+            &["s_server", "-cert", "x", "-key", "y", "-cid_len", "4"][..],
+            "DTLS options",
+        ),
+    ] {
+        let (_out, err, ok) = run_capture(args, b"");
+        assert!(!ok, "{args:?} was accepted");
+        assert!(err.contains(msg), "{args:?}: {err}");
+    }
+}
