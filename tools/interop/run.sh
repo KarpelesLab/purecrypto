@@ -121,7 +121,9 @@ FEATS="resume resume-psk 0rtt 0rtt-hrr hrr keyupdate keyupdate-peer certcomp cer
 # kind, verified by the server: on DTLS 1.3 the client's Certificate +
 # CertificateVerify + Finished flight is multi-message and fragmented, on
 # DTLS 1.2 the Certificate / CertificateVerify wrap the ClientKeyExchange),
-# `cid` (RFC 9146 connection IDs: each
+# `resume-loss` (a resumption whose abbreviated handshake loses its final
+# flight through that relay — see `resume_flight_drops`), `cid` (RFC 9146
+# connection IDs: each
 # side receives under the CID it named — purecrypto under PC_CID, the peer
 # under PEER_CID, which the adapter configures its tool with — and both
 # report the pair).
@@ -130,7 +132,7 @@ DTLS_GROUPS="x25519 p256 p384 p521 x25519mlkem768 secp256r1mlkem768 secp384r1mlk
 # that prints them without zero padding still prints these digits).
 export PC_CID=a1b2c3d4
 export PEER_CID=776f6c66
-DTLS_FEATS="resume 0rtt hrr keyupdate keyupdate-peer alpn large-chain mtu loss loss-final mtls cid"
+DTLS_FEATS="resume resume-loss 0rtt hrr keyupdate keyupdate-peer alpn large-chain mtu loss loss-final mtls cid"
 
 # The protocols the adapter speaks (`protos`, optional): TLS only unless it
 # says otherwise.
@@ -432,9 +434,9 @@ pc_supports() {
     if is_dtls; then
         case $CASE_FEAT in
             # DTLS 1.3 resumes (RFC 9147 + RFC 8446 §2.2) and accepts 0-RTT
-            # (§4.2.10). DTLS 1.2 has no resumption in this build.
-            resume|0rtt) [ "$CASE_PROTO" = dtls13 ] || skip "purecrypto's DTLS 1.2 engine has no session resumption" ;;
-            loss|loss-final) command -v python3 >/dev/null 2>&1 || skip "no python3 for the lossy relay" ;;
+            # (§4.2.10); DTLS 1.2 resumes by RFC 5077 ticket.
+            0rtt) [ "$CASE_PROTO" = dtls13 ] || skip "DTLS 1.2 has no 0-RTT" ;;
+            loss|loss-final|resume-loss) command -v python3 >/dev/null 2>&1 || skip "no python3 for the lossy relay" ;;
         esac
         if [ "$CASE_PROTO" = dtls12 ]; then
             case $CASE_FEAT in
@@ -469,9 +471,13 @@ pc_client_args() {
         fi
         case $CASE_FEAT in
             hrr) a="-connect 127.0.0.1:$PORT -CAfile $PKI/ca.crt -servername localhost -read_timeout 2 $(pc_dtls_flag) -groups $(other_group "$CASE_GROUP"):$(pc_group "$CASE_GROUP") -key-shares $(other_group "$CASE_GROUP") -ciphersuites $(pc_suite "$CASE_SUITE")" ;;
-            # DTLS 1.3 resumption / 0-RTT ride a second connection, as they
-            # do over TLS: RFC 9147 + RFC 8446 §2.2 / §4.2.10.
+            # DTLS resumption / 0-RTT ride a second connection, as they do
+            # over TLS: RFC 9147 + RFC 8446 §2.2 / §4.2.10 on DTLS 1.3, an
+            # RFC 5077 ticket on DTLS 1.2.
             resume) a="$a -reconnect" ;;
+            # The data sent right behind a lost final flight is lost with
+            # it (a server still in its handshake drops it): ask again.
+            resume-loss) a="$a -reconnect -resend 3" ;;
             0rtt) a="$a -reconnect -early_data $PKI/early.txt" ;;
             keyupdate) a="$a -key_update" ;;
             alpn) a="$a -alpn h2,http/1.1" ;;
@@ -537,9 +543,9 @@ pc_server_args() {
     if is_dtls; then
         a="$a $(pc_dtls_flag) -groups $(pc_group "$CASE_GROUP")"
         case $CASE_FEAT in
-            # Sequential DTLS 1.3 connections sharing the ticket key; the
-            # second resumes (and, with -early_data, accepts 0-RTT).
-            resume) a="$a -naccept 2" ;;
+            # Sequential DTLS connections sharing the ticket key; the second
+            # resumes (and, on DTLS 1.3 with -early_data, accepts 0-RTT).
+            resume|resume-loss) a="$a -naccept 2" ;;
             0rtt) a="$a -naccept 2 -early_data" ;;
             keyupdate) a="$a -key_update" ;;
             alpn) a="$a -alpn h2,http/1.1" ;;
@@ -745,11 +751,11 @@ pc_verify_dtls() {
     case $CASE_FEAT in
         hrr) expect "$f" "HelloRetryRequest: yes" || ok=1 ;;
     esac
-    # DTLS 1.3 resumption (RFC 9147 + RFC 8446 §2.2) reports on the second
-    # connection; 0-RTT additionally accepts early data (§4.2.10). Every
-    # other case must NOT resume or accept 0-RTT.
+    # DTLS resumption (RFC 9147 + RFC 8446 §2.2; RFC 5077 on DTLS 1.2)
+    # reports on the second connection; 0-RTT additionally accepts early
+    # data (§4.2.10). Every other case must NOT resume or accept 0-RTT.
     case $CASE_FEAT in
-        resume|0rtt) expect "$f" "resumed: yes" || ok=1 ;;
+        resume|resume-loss|0rtt) expect "$f" "resumed: yes" || ok=1 ;;
         *) refute "$f" "resumed: yes" || ok=1 ;;
     esac
     case $CASE_FEAT in
@@ -838,6 +844,32 @@ final_flight_drops() {
     esac
 }
 
+# resume_flight_drops: what the relay drops in a `resume-loss` case — the
+# final flight of the SECOND (resumed) handshake, picked by size (a
+# Finished record is at least 60 bytes on the wire; an ACK, a close_notify
+# or the short application data of these cases is less), so #1 is the
+# full handshake's and #2 the resumed one's.
+#
+#   DTLS 1.2 (RFC 5077 abbreviated handshake, RFC 6347 §4.2.4 figure 2),
+#     purecrypto client: its CCS + Finished, the final flight, is lost
+#     once. The server's timer retransmits SH / CCS / Finished, and the
+#     client, which counts the handshake complete, must answer with its
+#     final flight again (the line it sent behind it is lost too, so it
+#     asks again: `-resend`).
+#   DTLS 1.2, purecrypto server: its Finished is lost once, and its timer
+#     must retransmit the whole abbreviated flight. (Not the client's final
+#     flight: the peer's example client sends its line right behind it and
+#     never asks again.)
+#   DTLS 1.3 (RFC 9147 §5.8.1): the client's resumed Finished is lost once;
+#     the client retransmits it on its timer until the server ACKs it.
+resume_flight_drops() {
+    case $CASE_PROTO:$CASE_ROLE in
+        dtls12:peer-server) echo 'c->s@e1>=60#2' ;;
+        dtls12:peer-client) echo 's->c@e1>=60#2' ;;
+        dtls13:*) echo 'c->s@e2>=60#2' ;;
+    esac
+}
+
 # start_lossy_relay: for the `loss` cases, a relay in front of the server
 # on PORT that drops 20% of the datagrams each way; PORT then points at it.
 # LOSSY_SEED picks another pseudo-random pattern than the default (1),
@@ -846,13 +878,13 @@ final_flight_drops() {
 # relay.err.
 #
 # `loss-final` drops no datagram at random, only those of
-# `final_flight_drops`.
+# `final_flight_drops`; `resume-loss` only those of `resume_flight_drops`.
 start_lossy_relay() {
     local rport attempt percent=${LOSSY_PERCENT:-20} drops=${LOSSY_DROP:-}
-    if [ "$CASE_FEAT" = loss-final ]; then
-        percent=0
-        drops=$(final_flight_drops)
-    fi
+    case $CASE_FEAT in
+        loss-final) percent=0; drops=$(final_flight_drops) ;;
+        resume-loss) percent=0; drops=$(resume_flight_drops) ;;
+    esac
     for attempt in 1 2 3 4 5; do
         rport=$(random_port)
         LOSSY_DROP=$drops python3 "$HERE/lossy-udp.py" "$rport" "$PORT" "$percent" "${LOSSY_SEED:-1}" >"$WORK/relay.out" 2>"$WORK/relay.err" &
@@ -937,7 +969,7 @@ run_case() {
         esac
     done
     export CASE_PROTO CASE_ROLE CASE_CERT CASE_GROUP CASE_SUITE CASE_FEAT
-    case $CASE_FEAT in loss|loss-final) set_timeouts 3 ;; *) set_timeouts 1 ;; esac
+    case $CASE_FEAT in loss|loss-final|resume-loss) set_timeouts 3 ;; *) set_timeouts 1 ;; esac
     mkdir -p "$WORK"
     # What the client (whichever side) sends, and what a peer server sends
     # back from its stdin. The record_size_limit case sends more than one
@@ -976,7 +1008,7 @@ run_case() {
         fi
         PORT=$(cat "$WORK/server.port")
         export PORT
-        case $CASE_FEAT in loss|loss-final)
+        case $CASE_FEAT in loss|loss-final|resume-loss)
             start_lossy_relay || { REASON="lossy relay did not start"; return 1; } ;;
         esac
         rc=0
@@ -992,7 +1024,7 @@ run_case() {
         REASON=$("${ADAPTER[@]}" verify) || { REASON="$PEER: $REASON"; return 1; }
     else
         start_pc_server || { REASON="purecrypto s_server did not start"; return 1; }
-        case $CASE_FEAT in loss|loss-final)
+        case $CASE_FEAT in loss|loss-final|resume-loss)
             start_lossy_relay || { REASON="lossy relay did not start"; return 1; } ;;
         esac
         rc=0

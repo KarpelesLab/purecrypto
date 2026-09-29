@@ -18,7 +18,8 @@ Output is one `PASS|FAIL|SKIP <case> [reason]` line per case and a summary;
 the exit status is non-zero on any FAIL, and a failed case dumps every log
 from its work directory. Every process runs under `timeout`
 (`INTEROP_TIMEOUT` seconds per client step, default 30; three times that in
-the `loss` cases, where every lost flight costs a retransmission backoff),
+the `loss`, `loss-final` and `resume-loss` cases, where every lost flight
+costs a retransmission backoff),
 so a hang fails its case rather than the CI job. `--keep` preserves the scratch directory.
 
 The peers in CI: `.github/workflows/interop.yml` runs one job per adapter.
@@ -101,7 +102,9 @@ pinned by the peer, since `-ciphersuites` takes TLS 1.3 names), then:
 | `loss-final` | the same relay dropping named datagrams only: the **last flight** of the handshake — the DTLS 1.3 client's Finished, the DTLS 1.3 server's ACK for it, the DTLS 1.2 final flights — lost when the other side's retransmission backoff has grown to several seconds (`final_flight_drops` in `run.sh` has the pattern per version and role). The side that finished first must keep retransmitting / answering retransmissions until the other has finished too (RFC 9147 §5.8.1, RFC 6347 §4.2.4) and must not say goodbye before; data and close_notify are checked as in any other case |
 | `cid` | RFC 9146 connection IDs (RFC 9147 §9 on DTLS 1.3): each side receives under the CID it named — purecrypto under `PC_CID`, the peer under `PEER_CID` (both exported by the runner, hex; the adapter configures its tool with the latter and checks its summary for the former) — and the purecrypto side's `connection id: rx=… tx=…` line is checked (`none` in every other DTLS case) |
 | `mtls` | a client certificate of each kind (as over TLS), requested and verified by the server: the DTLS 1.3 client's final flight is then Certificate + CertificateVerify + Finished, fragmented across datagrams and ACKed record by record; on DTLS 1.2 the Certificate and CertificateVerify wrap the ClientKeyExchange (RSA and ECDSA identities only, as the 1.2 engines sign) |
-| `resume`, `0rtt` | *SKIP: purecrypto's DTLS engines have no resumption or 0-RTT* |
+| `resume` | resumption on a second connection: PSK (`psk_dhe_ke`) on DTLS 1.3 (RFC 9147 + RFC 8446 §2.2), an RFC 5077 ticket and the abbreviated handshake on DTLS 1.2; the cookie exchange stays on | `-reconnect` / `-naccept 2` |
+| `resume-loss` | the same through `lossy-udp.py` dropping the resumed handshake's final flight once (`resume_flight_drops` in `run.sh`): the DTLS 1.3 client's Finished; on DTLS 1.2 the purecrypto client's CCS + Finished — it must answer the server's retransmitted flight with it again — or the purecrypto server's Finished, which its timer must retransmit |
+| `0rtt` | 0-RTT on the resumed DTLS 1.3 connection, accepted only from the ticket's address, which skips the cookie HelloRetryRequest (RFC 9147 §5.1, §6.1) | *SKIP on DTLS 1.2 (no 0-RTT)* |
 
 Adapters without `protos` are TLS-only and see no DTLS case. The peer
 server for a DTLS case is found by `lib.sh`'s `listening` on a bound UDP
@@ -159,6 +162,14 @@ that has no command-line client or server of its own; its README lists
 what is public API, what is SPI, and what the stack was observed to do.
 `peers/wolfssl.sh` (wolfSSL's example `client` / `server` from
 `WOLFSSL_HOME`) speaks DTLS 1.2 and 1.3; `peers/mbedtls.sh` DTLS 1.2.
+`peers/wolfssl-driver.sh` is a small
+C program on libwolfssl (`peers/wolfssl-driver/driver.c`, built on first use
+against `WOLFSSL_HOME/lib/libwolfssl.a`) for the DTLS resumption and 0-RTT
+cases the examples cannot express — 0-RTT towards a wolfSSL DTLS 1.3 server
+needs `wolfSSL_dtls13_no_hrr_on_resume()` (a library built with
+`-DWOLFSSL_DTLS13_NO_HRR_ON_RESUME`), which the example server never calls.
+It runs `plain`, `resume`, `resume-loss` and `0rtt` on both DTLS versions
+and SKIPs everything else as the `wolfssl` peer's.
 
 Skip rather than weaken: when a peer's tool cannot express a case, `supports`
 says so with the reason, and the reason lands in the run output and in

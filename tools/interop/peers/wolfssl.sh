@@ -229,7 +229,7 @@ server_args() {
         *) a="$a -d" ;;
     esac
     case $CASE_FEAT in
-        resume) a="$a -r" ;;
+        resume|resume-loss) a="$a -r" ;;
         0rtt) a="$a -r -0" ;;
         # Pinned to X25519 while the purecrypto client shares only P-256:
         # HelloRetryRequest on both connections, the early data refused.
@@ -313,7 +313,7 @@ client_args() {
         *) a="$a -x" ;;
     esac
     case $CASE_FEAT in
-        resume) a="$a -r" ;;
+        resume|resume-loss) a="$a -r" ;;
         0rtt) a="$a -r -0" ;;
         0rtt-hrr) a="$a -r -0" ;;
         # `-r` reconnects and resumes; `-K` makes the resumed handshake
@@ -396,7 +396,7 @@ cmd_verify() {
         # handshake is checked.)
         [ "$CASE_FEAT" = loss ] || expect "$WORK/client.out" "I hear you fa shizzle!" || ok=1
         case $CASE_FEAT in
-            resume|0rtt|0rtt-hrr|resume-psk) expect "$WORK/server.out" "SSL reused session" || ok=1 ;;
+            resume|resume-loss|0rtt|0rtt-hrr|resume-psk) expect "$WORK/server.out" "SSL reused session" || ok=1 ;;
             *) refute "$WORK/server.out" "SSL reused session" || ok=1 ;;
         esac
         case $CASE_FEAT in
@@ -413,7 +413,7 @@ cmd_verify() {
         # The greeting came back from the purecrypto echo server.
         [ "$CASE_FEAT" = loss ] || expect "$f" "hello wolfssl!" || ok=1
         case $CASE_FEAT in
-            resume|0rtt|0rtt-hrr|resume-psk) expect "$f" "SSL reused session" || ok=1 ;;
+            resume|resume-loss|0rtt|0rtt-hrr|resume-psk) expect "$f" "SSL reused session" || ok=1 ;;
             *) refute "$f" "SSL reused session" || ok=1 ;;
         esac
         case $CASE_FEAT in

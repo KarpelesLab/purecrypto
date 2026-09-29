@@ -22,7 +22,15 @@
 # transcript hashed TLS-shaped handshake headers instead of the DTLS ones
 # (RFC 6347 §4.2.6). This matrix fails on either.
 #
-# The OpenSSL -> purecrypto DTLS 1.2 cases run twice: once as OpenSSL sends
+# DTLS 1.2 session resumption (RFC 5077 tickets, the abbreviated handshake
+# of RFC 6347 §4.2.4 figure 2) runs in both roles as the `_resume` variant:
+# a first connection collects a ticket, a second one resumes it — OpenSSL's
+# side with `s_client -sess_out` / `-sess_in` and `s_server -naccept 2`,
+# purecrypto's with `s_client -reconnect` and `s_server -naccept 2`. The
+# HelloVerifyRequest cookie exchange stays on for the resumed connection
+# (both servers require it), so the resumed ClientHello is sent twice.
+#
+# The OpenSSL -> purecrypto DTLS 1.2 cases also run as OpenSSL sends
 # by default, and once with the ClientHello forced across two datagrams
 # (`_fragch`), which the purecrypto server's stateless cookie path used to
 # refuse outright — a client on a small path MTU could never complete the
@@ -40,8 +48,8 @@
 #
 # Optional: TLS12_INTEROP_TIMEOUT (seconds per client step, default 20),
 # TLS12_INTEROP_KEEP=1 (keep the scratch directory), TLS12_INTEROP_ONLY=<case>
-# (run a single case by name, e.g. `tls12_pc_to_ossl_ec_chacha20` or
-# `dtls12_ossl_to_pc_ec_aes128gcm_fragch`).
+# (run a single case by name, e.g. `tls12_pc_to_ossl_ec_chacha20`,
+# `dtls12_ossl_to_pc_ec_aes128gcm_fragch` or `dtls12_pc_to_ossl_rsa_chacha20_resume`).
 #
 # Every process runs under `timeout`, so a hang fails its case fast instead of
 # burning the CI job. The purecrypto server binds port 0 and reports the port
@@ -166,7 +174,8 @@ listening() {
 # port, retried on a collision; sets PORT and SERVER_PID. Its stdin is the
 # idle pipe on fd 3 (see above). `-mtu 1500` pins the DTLS fragment size,
 # since s_server cannot query the loopback path MTU on every platform and
-# would otherwise fragment to the 256-byte minimum.
+# would otherwise fragment to the 256-byte minimum. NACCEPT (default 1) is
+# the number of connections it serves.
 start_ossl_server() {
     local dir=$1 proto=$2 attempt i
     shift 2
@@ -175,7 +184,7 @@ start_ossl_server() {
     for attempt in 1 2 3 4 5; do
         PORT=$(((RANDOM % 25000) + 30000))
         # shellcheck disable=SC2086
-        "$TO" 60 "$OPENSSL" s_server -accept "$PORT" $vers -naccept 1 \
+        "$TO" 60 "$OPENSSL" s_server -accept "$PORT" $vers -naccept "${NACCEPT:-1}" \
             -CAfile "$PKI/ca.crt" "$@" <&3 >"$dir/server.out" 2>"$dir/server.err" &
         SERVER_PID=$!
         for i in $(seq 1 100); do
@@ -221,9 +230,10 @@ stop_server() {
     SERVER_PID=""
 }
 
-# pc_client DIR PROTO [IDENT...] — purecrypto s_client sending one line;
+# pc_client DIR PROTO [ARGS...] — purecrypto s_client sending one line;
 # stdin stays open a moment so the echo can come back before EOF ends the
-# session. IDENT (`-cert`/`-key`) presents a client certificate. The exit
+# session. ARGS are passed through (`-cert`/`-key` presents a client
+# certificate, `-reconnect` resumes on a second connection). The exit
 # status lands in RC.
 pc_client() {
     local dir=$1 proto=$2
@@ -267,25 +277,31 @@ FRAG_ALPN_PICK=dtls12-interop
 FRAG_MTU=256
 
 # ossl_client DIR PROTO CIPHER VARIANT [IDENT...] — openssl s_client
-# pinned to CIPHER, sending one line to the purecrypto echo server; the exit
-# status lands in RC. A `fragch` VARIANT (UDP only) forces the ClientHello
-# across two datagrams, see above; otherwise OpenSSL sends as it does by
-# default. IDENT (`-cert`/`-key`) presents a client certificate.
+# pinned to CIPHER, sending one line to the purecrypto echo server, its
+# output in OSSL_OUT.out / .err (default `client`); the exit status lands
+# in RC. A `fragch` VARIANT (UDP only) forces the ClientHello across two
+# datagrams, see above; `sess_out` saves the session to DIR/session.pem and
+# `sess_in` offers it back for resumption; otherwise OpenSSL sends as it
+# does by default. IDENT (`-cert`/`-key`) presents a client certificate.
 ossl_client() {
     local dir=$1 proto=$2 cipher=$3 variant=$4
     shift 4
-    local vers=-tls1_2 alpn=
+    local vers=-tls1_2 alpn= sess= out=${OSSL_OUT:-client}
     if [ "$proto" = udp ]; then vers=-dtls1_2; fi
     if is_fragch "$variant"; then
         vers="$vers -mtu $FRAG_MTU -msg"
         alpn="-alpn $FRAG_ALPN_OFFER"
     fi
+    case $variant in
+        sess_out) sess="-sess_out $dir/session.pem" ;;
+        sess_in) sess="-sess_in $dir/session.pem" ;;
+    esac
     RC=0
     # shellcheck disable=SC2086
     (printf 'ping from openssl\n'; sleep 1) |
-        "$TO" "$STEP_TIMEOUT" "$OPENSSL" s_client -connect "127.0.0.1:$PORT" $vers $alpn \
+        "$TO" "$STEP_TIMEOUT" "$OPENSSL" s_client -connect "127.0.0.1:$PORT" $vers $alpn $sess \
             -cipher "$cipher" -CAfile "$PKI/ca.crt" -servername localhost "$@" \
-            >"$dir/client.out" 2>"$dir/client.err" || RC=$?
+            >"$dir/$out.out" 2>"$dir/$out.err" || RC=$?
 }
 
 # The signature scheme a certificate kind signs the ServerKeyExchange
@@ -342,6 +358,10 @@ case_pc_to_ossl() {
     local d=$1 proto=$2 kind=$3 suite=$4 variant=${5:-plain}
     local cipher
     cipher=$(ossl_cipher "$kind" "$suite")
+    if [ "$variant" = resume ]; then
+        case_pc_to_ossl_resume "$d" "$proto" "$cipher" "$kind"
+        return
+    fi
     local rev=-rev verify= ident=
     if [ "$proto" = udp ]; then rev=; fi
     if is_mtls "$variant"; then
@@ -375,6 +395,45 @@ case_pc_to_ossl() {
     expect "$d/client.err" "peer signature: $(pc_scheme "$kind")"
 }
 
+# purecrypto client -> openssl server, resumed (RFC 5077): `-reconnect`
+# collects a ticket on a first connection and resumes it on a second one,
+# which carries the line. s_server reports the resumption.
+case_pc_to_ossl_resume() {
+    local d=$1 proto=$2 cipher=$3 kind=$4
+    NACCEPT=2 start_ossl_server "$d" "$proto" -cipher "$cipher" \
+        -cert "$PKI/$kind.crt" -key "$PKI/$kind.key"
+    pc_client "$d" "$proto" -reconnect
+    stop_server kill
+    rc_is 0
+    expect "$d/client.err" "session ticket received"
+    expect "$d/client.err" "resumed: no"
+    expect "$d/client.err" "resumed: yes"
+    expect "$d/client.err" "peer certificate: none"
+    expect "$d/server.out" "Reused session-id"
+    expect "$d/server.out" "ping from purecrypto"
+    expect "$d/server.out" "CIPHER is $cipher"
+}
+
+# openssl client -> purecrypto echo server, resumed (RFC 5077): a first
+# `s_client -sess_out` saves the ticketed session, a second `-sess_in`
+# offers it back, and both sides must report the abbreviated handshake.
+case_ossl_to_pc_resume() {
+    local d=$1 proto=$2 cipher=$3 kind=$4
+    start_pc_server "$d" "$proto" -cert "$PKI/$kind.crt" -key "$PKI/$kind.key" -naccept 2
+    OSSL_OUT=client1 ossl_client "$d" "$proto" "$cipher" sess_out
+    rc_is 0
+    expect "$d/client1.out" "New, TLSv1.2, Cipher is $cipher"
+    expect "$d/client1.out" "TLS session ticket:"
+    [ -s "$d/session.pem" ] || { log "  no session saved"; return 1; }
+    OSSL_OUT=client2 ossl_client "$d" "$proto" "$cipher" sess_in
+    stop_server kill
+    rc_is 0
+    expect "$d/client2.out" "Reused, TLSv1.2, Cipher is $cipher"
+    expect "$d/client2.out" "ping from openssl"
+    expect "$d/server.err" "resumed: no"
+    expect "$d/server.err" "resumed: yes"
+}
+
 # openssl client pinned to one suite -> purecrypto echo server. The
 # `fragch` variant (UDP only) sends the ClientHello in two datagrams; the
 # `mtls` variant has the server demand a client certificate (`-Verify`)
@@ -385,6 +444,10 @@ case_ossl_to_pc() {
     local d=$1 proto=$2 kind=$3 suite=$4 variant=${5:-plain}
     local cipher alpn= verify= ident=
     cipher=$(ossl_cipher "$kind" "$suite")
+    if [ "$variant" = resume ]; then
+        case_ossl_to_pc_resume "$d" "$proto" "$cipher" "$kind"
+        return
+    fi
     if is_fragch "$variant"; then alpn="-alpn $FRAG_ALPN_PICK"; fi
     if is_mtls "$variant"; then
         verify="-Verify $PKI/ca.crt"
@@ -430,9 +493,9 @@ for proto in tcp udp; do
             for suite in aes128gcm aes256gcm chacha20; do
                 variants=plain
                 if [ "$proto" = udp ] && [ "$dir" = ossl_to_pc ]; then
-                    variants="plain fragch mtls fragch_mtls"
+                    variants="plain fragch mtls fragch_mtls resume"
                 elif [ "$proto" = udp ]; then
-                    variants="plain mtls"
+                    variants="plain mtls resume"
                 fi
                 for variant in $variants; do
                     name=tls12

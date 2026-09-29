@@ -4,7 +4,9 @@
 # example client / server cannot express — above all 0-RTT towards a wolfSSL
 # DTLS 1.3 *server*, which needs wolfSSL_dtls13_no_hrr_on_resume() (the
 # examples never call it, so they always answer a resumed ClientHello with
-# the cookie HelloRetryRequest that rejects early data, RFC 8446 §4.2.10).
+# the cookie HelloRetryRequest that rejects early data, RFC 8446 §4.2.10) —
+# plus the plain, resume and resume-loss cases of both DTLS versions (DTLS
+# 1.2 resuming by RFC 5077 ticket) as a second libwolfssl client / server.
 # Everything else is the `wolfssl` peer's (the examples); this adapter SKIPs
 # it with that reason.
 #
@@ -65,7 +67,7 @@ cmd_supports() {
         *) skip "TLS is covered by the wolfssl peer (the example tools)" ;;
     esac
     case $CASE_FEAT in
-        plain|resume|0rtt) ;;
+        plain|resume|resume-loss|0rtt) ;;
         *) skip "covered by the wolfssl peer (the example tools)" ;;
     esac
     # One combination each: the plain product is the wolfssl peer's.
@@ -84,7 +86,7 @@ server_cmd() {
         --cipher "$(wolf_cipher)" --group "$CASE_GROUP")
     is13 || a+=(--dtls12)
     case $CASE_FEAT in
-        resume) a+=(--accept 2) ;;
+        resume|resume-loss) a+=(--accept 2) ;;
         # Skip the cookie HRR on a resumption from the ticket's address
         # (RFC 9147 §5.1) and read the 0-RTT data.
         0rtt) a+=(--accept 2 --early-data --no-hrr-on-resume) ;;
@@ -105,7 +107,7 @@ cmd_client() {
         --cipher "$(wolf_cipher)" --group "$CASE_GROUP" --msg "$(cat "$WORK/client.in")")
     is13 || a+=(--dtls12)
     case $CASE_FEAT in
-        resume) a+=(--resume) ;;
+        resume|resume-loss) a+=(--resume) ;;
         0rtt) a+=(--resume --early-data "$PKI/early.txt") ;;
     esac
     local rc=0
@@ -122,7 +124,7 @@ block() {
 cmd_verify() {
     local f ok=0 last=1 version
     if [ "$CASE_ROLE" = peer-server ]; then f=$WORK/server.out; else f=$WORK/client.out; fi
-    case $CASE_FEAT in resume|0rtt) last=2 ;; esac
+    case $CASE_FEAT in resume|resume-loss|0rtt) last=2 ;; esac
     if is13; then version=DTLSv1.3; else version=DTLSv1.2; fi
     local b1 bl
     b1=$(block 1 "$f")
@@ -132,7 +134,7 @@ cmd_verify() {
     expect "$b1" "resumed: no" || ok=1
     expect "$bl" "version: $version" || ok=1
     case $CASE_FEAT in
-        resume|0rtt) expect "$bl" "resumed: yes" || ok=1 ;;
+        resume|resume-loss|0rtt) expect "$bl" "resumed: yes" || ok=1 ;;
     esac
     case $CASE_FEAT in
         0rtt)
