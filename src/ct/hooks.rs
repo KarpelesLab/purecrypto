@@ -560,6 +560,88 @@ pub mod quic {
     }
 }
 
+/// The TLS 1.3 key exchanges that concatenate two primitives, and secp521r1
+/// ECDHE: the `key_agreement` arms the TLS 1.3, DTLS 1.3 and QUIC engines
+/// share (`tls::crypto::kex`), run on caller-supplied keys so the harness
+/// can classify the private scalar, the ML-KEM decapsulation key and the
+/// randomness the server side draws.
+#[cfg(feature = "tls")]
+pub mod kex {
+    use crate::ec::BoxedEcdhPrivateKey;
+    use crate::mlkem::{MlKem768DecapsKey, MlKem1024DecapsKey};
+    use crate::rng::RngCore;
+    use crate::tls::Error;
+    use crate::tls::crypto::kex;
+    use alloc::vec::Vec;
+
+    /// Client share (RFC 10024 §4.1) of SecP256r1MLKEM768.
+    pub fn p256_mlkem768_client_share(ec: &BoxedEcdhPrivateKey, dk: &MlKem768DecapsKey) -> Vec<u8> {
+        kex::p256_mlkem768_client_share(ec, dk)
+    }
+
+    /// Server side of SecP256r1MLKEM768: `(server share, shared secret)`.
+    pub fn p256_mlkem768_server<R: RngCore>(
+        rng: &mut R,
+        client_share: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        kex::p256_mlkem768_server(rng, client_share)
+            .map(|(share, s)| (share, s.as_slice().to_vec()))
+    }
+
+    /// Client side of SecP256r1MLKEM768: the shared secret.
+    pub fn p256_mlkem768_client(
+        ec: &BoxedEcdhPrivateKey,
+        dk: &MlKem768DecapsKey,
+        server_share: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        kex::p256_mlkem768_client(ec, dk, server_share).map(|s| s.as_slice().to_vec())
+    }
+
+    /// Client share (RFC 10024 §4.1) of SecP384r1MLKEM1024.
+    pub fn p384_mlkem1024_client_share(
+        ec: &BoxedEcdhPrivateKey,
+        dk: &MlKem1024DecapsKey,
+    ) -> Vec<u8> {
+        kex::p384_mlkem1024_client_share(ec, dk)
+    }
+
+    /// Server side of SecP384r1MLKEM1024: `(server share, shared secret)`.
+    pub fn p384_mlkem1024_server<R: RngCore>(
+        rng: &mut R,
+        client_share: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        kex::p384_mlkem1024_server(rng, client_share)
+            .map(|(share, s)| (share, s.as_slice().to_vec()))
+    }
+
+    /// Client side of SecP384r1MLKEM1024: the shared secret.
+    pub fn p384_mlkem1024_client(
+        ec: &BoxedEcdhPrivateKey,
+        dk: &MlKem1024DecapsKey,
+        server_share: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        kex::p384_mlkem1024_client(ec, dk, server_share).map(|s| s.as_slice().to_vec())
+    }
+
+    /// Server side of secp521r1 ECDHE (RFC 8446 §4.2.8.2):
+    /// `(server share, shared secret)`.
+    pub fn secp521r1_server<R: RngCore>(
+        rng: &mut R,
+        client_share: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        kex::ecdhe_server(crate::ec::CurveId::P521, rng, client_share)
+            .map(|(share, s)| (share, s.as_slice().to_vec()))
+    }
+
+    /// Client side of secp521r1 ECDHE: the shared secret.
+    pub fn secp521r1_client(
+        ec: &BoxedEcdhPrivateKey,
+        server_share: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        kex::ecdhe_client(ec, server_share).map(|s| s.as_slice().to_vec())
+    }
+}
+
 /// Marks the secret buffers of an imported Falcon private key as secret:
 /// the NTRU basis `f, g, F, G`, its FFT form and the LDL tree the signer
 /// walks. The public `h` and the key's shape (degree, buffer lengths and

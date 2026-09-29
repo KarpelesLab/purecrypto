@@ -1431,6 +1431,75 @@ fn quic_packets() -> String {
     out.join(" ")
 }
 
+/// ML-KEM-1024 decapsulation key with its secret parts classified, as
+/// [`mlkem768_dk`] does for ML-KEM-768 (`dk_PKE` is 1536 bytes here).
+fn mlkem1024_dk() -> MlKem1024DecapsKey {
+    let (dk, _) = MlKem1024DecapsKey::from_seeds(&fixed_bytes::<32>(380), &fixed_bytes::<32>(381));
+    let raw = dk.to_bytes();
+    classify(&raw[..1536]);
+    let n = raw.len();
+    classify(&raw[n - 32..]);
+    MlKem1024DecapsKey::from_bytes(raw)
+}
+
+/// The RFC 10024 hybrids and secp521r1 as the TLS 1.3 / DTLS 1.3 / QUIC
+/// engines run them (`tls::crypto::kex`): the client's scalar and
+/// decapsulation key are secret, so is the server's randomness (its
+/// ephemeral scalar and the ML-KEM encapsulation coins); the shares are
+/// public, the shared secrets are compared after declassification.
+fn tls13_kex_hybrids() -> String {
+    let mut out = Vec::new();
+
+    // SecP256r1MLKEM768.
+    let mut d = secret_bytes::<32>(382);
+    d[0] &= 0x7f;
+    let ec = BoxedEcdhPrivateKey::from_bytes(CurveId::P256, &d).expect("scalar in range");
+    let (dk, _) = mlkem768_dk();
+    let cshare = hooks::kex::p256_mlkem768_client_share(&ec, &dk);
+    declassify(&cshare);
+    let (sshare, ss_server) =
+        hooks::kex::p256_mlkem768_server(&mut TaintRng::new(383), &cshare).expect("valid share");
+    declassify(&sshare);
+    let ss_client = hooks::kex::p256_mlkem768_client(&ec, &dk, &sshare).expect("valid share");
+    declassify(&ss_client);
+    declassify(&ss_server);
+    assert_eq!(ss_client, ss_server);
+    out.push(format!("p256mlkem768={}", hex8(&ss_client)));
+
+    // SecP384r1MLKEM1024.
+    let mut d = secret_bytes::<48>(384);
+    d[0] &= 0x7f;
+    let ec = BoxedEcdhPrivateKey::from_bytes(CurveId::P384, &d).expect("scalar in range");
+    let dk = mlkem1024_dk();
+    let cshare = hooks::kex::p384_mlkem1024_client_share(&ec, &dk);
+    declassify(&cshare);
+    let (sshare, ss_server) =
+        hooks::kex::p384_mlkem1024_server(&mut TaintRng::new(385), &cshare).expect("valid share");
+    declassify(&sshare);
+    let ss_client = hooks::kex::p384_mlkem1024_client(&ec, &dk, &sshare).expect("valid share");
+    declassify(&ss_client);
+    declassify(&ss_server);
+    assert_eq!(ss_client, ss_server);
+    out.push(format!("p384mlkem1024={}", hex8(&ss_client)));
+
+    // secp521r1.
+    let mut d = secret_bytes::<66>(386);
+    d[0] &= 0x01;
+    let ec = BoxedEcdhPrivateKey::from_bytes(CurveId::P521, &d).expect("scalar in range");
+    let cshare = ec.public_key().to_sec1();
+    declassify(&cshare);
+    let (sshare, ss_server) =
+        hooks::kex::secp521r1_server(&mut TaintRng::new(387), &cshare).expect("valid share");
+    declassify(&sshare);
+    let ss_client = hooks::kex::secp521r1_client(&ec, &sshare).expect("valid share");
+    declassify(&ss_client);
+    declassify(&ss_server);
+    assert_eq!(ss_client, ss_server);
+    out.push(format!("secp521r1={}", hex8(&ss_client)));
+
+    out.join(" ")
+}
+
 // ---------------------------------------------------------------------------
 // secp256k1 extensions, ristretto255, more curves, DSA, RSA variants
 // ---------------------------------------------------------------------------
@@ -2210,6 +2279,7 @@ const CASES: &[Case] = &[
     ("dtls12_cid_records", dtls12_cid_records),
     ("dtls13_cid_records", dtls13_cid_records),
     ("quic_packets", quic_packets),
+    ("tls13_kex_hybrids", tls13_kex_hybrids),
     // secp256k1 extensions, more curves and RSA variants
     ("bip340_sign", bip340_sign),
     ("zkp_sign_to_contract", zkp_sign_to_contract),
