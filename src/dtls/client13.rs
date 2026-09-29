@@ -36,7 +36,11 @@
 //!   carried in the unified header of every protected record once
 //!   negotiated, plus the `NewConnectionId` / `RequestConnectionId`
 //!   post-handshake messages (see `src/dtls/cid.rs`).
-//! - Out of scope: mTLS, PSK, 0-RTT.
+//! - Client certificates (mutual authentication, RFC 8446 §4.4.2): the
+//!   configured identity answers a `CertificateRequest`, an in-process key
+//!   signing inline and an external one through the suspend / resume
+//!   pair `pending_signature` / `provide_signature`, as on TLS 1.3.
+//! - Out of scope: PSK, 0-RTT.
 
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
@@ -47,8 +51,9 @@ use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
     CipherSuite, ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket, Random,
-    ReadCursor, ServerHello, SignatureScheme, hs_type,
+    ReadCursor, ServerHello, SignatureScheme, hs_type, with_len_u16, with_len_u24,
 };
+use crate::tls::conn::{ClientCertConfig, ClientKey};
 use crate::tls::crypto::{
     AeadAlg, HashAlg, KeySchedule, LabelPrefix, RecordCrypter, Secret, SuiteParams, Transcript,
     certificate_verify_content, ct_find_last_nonzero, expand_label_dyn_with,
@@ -145,6 +150,12 @@ pub(crate) struct ClientConfig13Internal {
     /// while this client will send with the server's. At most
     /// [`super::cid::MAX_LOCAL_CID_LEN`] bytes.
     pub connection_id: Option<Vec<u8>>,
+    /// Client certificate + signing key presented when the server sends a
+    /// `CertificateRequest` (RFC 8446 §4.3.2). `None` answers such a
+    /// request with an empty `Certificate`; a server that requires one
+    /// then aborts with `certificate_required`. Forwarded from
+    /// [`crate::tls::Config::identity`].
+    pub client_cert: Option<ClientCertConfig>,
 }
 
 impl ClientConfig13Internal {
@@ -171,7 +182,15 @@ impl ClientConfig13Internal {
             groups: crate::tls::conn::DEFAULT_GROUPS.to_vec(),
             key_share_groups: None,
             connection_id: None,
+            client_cert: None,
         }
+    }
+
+    /// Sets the client identity presented under mutual authentication
+    /// (see [`Self::client_cert`]).
+    pub fn with_client_cert(mut self, cert: ClientCertConfig) -> Self {
+        self.client_cert = Some(cert);
+        self
     }
 
     /// Installs a [`CrlStore`] consulted during chain validation.
@@ -208,8 +227,23 @@ enum State {
     WaitCertificate,
     WaitCertificateVerify,
     WaitFinished,
+    /// External-signing pause: the final flight is sent through our
+    /// `Certificate` and waits for the caller to supply the
+    /// `CertificateVerify` signature ([`DtlsClientConnection13::provide_signature`]).
+    AwaitingCertVerifySignature,
     Connected,
     Closed,
+}
+
+/// State stashed while the final flight is suspended awaiting an external
+/// `CertificateVerify` signature (see [`ClientKey::External`]). The
+/// application secrets are already parked on the connection, so only the
+/// signature input and scheme need keeping.
+struct PendingFlight {
+    /// Negotiated signature scheme for the `CertificateVerify`.
+    scheme: SignatureScheme,
+    /// The signature input the caller signs.
+    content: Vec<u8>,
 }
 
 /// A write context retired by an epoch change but kept for retransmitting
@@ -366,6 +400,16 @@ pub struct DtlsClientConnection13 {
     leaf_key: Option<AnyPublicKey>,
     /// Negotiated ALPN protocol from EncryptedExtensions.
     alpn_negotiated: Option<Vec<u8>>,
+    /// The server sent a `CertificateRequest` (RFC 8446 §4.3.2): our final
+    /// flight opens with a `Certificate` (and, with a chain, a
+    /// `CertificateVerify`).
+    cert_request_received: bool,
+    /// The `signature_algorithms` the `CertificateRequest` offered, which
+    /// our `CertificateVerify` scheme is chosen from (§4.4.3).
+    cr_signature_algorithms: Vec<SignatureScheme>,
+    /// External-signing continuation; `Some` while suspended awaiting the
+    /// `CertificateVerify` signature.
+    pending_flight: Option<PendingFlight>,
 
     /// Pending ACKs to emit: (epoch, seq) of records we received that need
     /// acknowledgement.
@@ -461,6 +505,9 @@ impl DtlsClientConnection13 {
             cert_chain: Vec::new(),
             leaf_key: None,
             alpn_negotiated: None,
+            cert_request_received: false,
+            cr_signature_algorithms: Vec::new(),
+            pending_flight: None,
             pending_acks: Vec::new(),
             retransmit: Retransmit13::new(),
             last_now: Duration::from_secs(0),
@@ -1481,7 +1528,10 @@ impl DtlsClientConnection13 {
             State::WaitCertificateVerify => self.on_certificate_verify(msg_type, body, &raw),
             State::WaitFinished => self.on_finished(msg_type, body, &raw),
             State::Connected => self.on_post_handshake(msg_type, body),
-            State::Closed => Err(Error::UnexpectedMessage),
+            // The server has nothing new to say while we sign; a
+            // retransmission of its flight is a duplicate the reassembler
+            // already dropped.
+            State::AwaitingCertVerifySignature | State::Closed => Err(Error::UnexpectedMessage),
         }
     }
 
@@ -1804,6 +1854,18 @@ impl DtlsClientConnection13 {
     }
 
     fn on_certificate(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        // mTLS: a `CertificateRequest` may precede the server's Certificate
+        // (RFC 8446 §4.3.2) — at most one, and only there; a second is a
+        // protocol violation like any other unexpected message.
+        if msg_type == hs_type::CERTIFICATE_REQUEST {
+            if self.cert_request_received {
+                return Err(Error::UnexpectedMessage);
+            }
+            self.cr_signature_algorithms = crate::tls::conn::parse_certificate_request_13(body)?;
+            self.cert_request_received = true;
+            self.transcript.update(raw);
+            return Ok(());
+        }
         if msg_type != hs_type::CERTIFICATE {
             return Err(Error::UnexpectedMessage);
         }
@@ -1942,6 +2004,132 @@ impl DtlsClientConnection13 {
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
 
+        // mTLS (RFC 8446 §4.4.2): a `CertificateRequest` is answered, ahead
+        // of our Finished, with a `Certificate` — our chain, or an empty
+        // one when no identity is configured or it can sign under none of
+        // the offered schemes (§4.4.3) — and, with a chain, a
+        // `CertificateVerify`. All of it rides under the handshake keys in
+        // the same flight as the Finished.
+        if self.cert_request_received {
+            let scheme = self
+                .config
+                .client_cert
+                .as_ref()
+                .and_then(|cc| cc.scheme_for_request(&self.cr_signature_algorithms));
+            self.send_client_certificate(scheme.is_some())?;
+            if let Some(scheme) = scheme {
+                let th = self.transcript.current_hash();
+                let content = certificate_verify_content(false, th.as_slice());
+                let external = self
+                    .config
+                    .client_cert
+                    .as_ref()
+                    .is_some_and(|cc| matches!(cc.key, ClientKey::External { .. }));
+                if external {
+                    // The caller signs `content` and resumes via
+                    // `provide_signature`, which emits the CertificateVerify
+                    // and the rest of the flight. The Certificate already
+                    // queued goes out (and is retransmitted) meanwhile.
+                    self.pending_flight = Some(PendingFlight { scheme, content });
+                    self.state = State::AwaitingCertVerifySignature;
+                    return Ok(());
+                }
+                let cc = self
+                    .config
+                    .client_cert
+                    .as_ref()
+                    .ok_or(Error::InappropriateState)?;
+                let signature = crate::tls::crypto::sign::sign_client_certificate_verify(
+                    &cc.key, scheme, &content,
+                )?;
+                self.emit_client_certificate_verify(scheme, &signature)?;
+            }
+        }
+        self.finish_client_flight()
+    }
+
+    /// mTLS external signing: emits the `CertificateVerify` with the
+    /// caller-supplied `signature`, then finishes the flight. Only valid
+    /// while suspended ([`Self::pending_signature`] is `Some`); an error in
+    /// any other state — after a fatal error closed the connection in
+    /// particular — and nothing is emitted.
+    pub(crate) fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
+        if self.state != State::AwaitingCertVerifySignature {
+            return Err(Error::InappropriateState);
+        }
+        let pf = self
+            .pending_flight
+            .take()
+            .ok_or(Error::InappropriateState)?;
+        self.emit_client_certificate_verify(pf.scheme, &signature)?;
+        self.finish_client_flight()
+    }
+
+    /// If the final flight is suspended awaiting an external signature,
+    /// returns the IANA scheme code point and the bytes to sign.
+    pub(crate) fn pending_signature(&self) -> Option<(u16, Vec<u8>)> {
+        self.pending_flight
+            .as_ref()
+            .map(|pf| (pf.scheme.0, pf.content.clone()))
+    }
+
+    /// mTLS: emits our `Certificate` (RFC 8446 §4.4.2) — the configured
+    /// chain, or an empty `certificate_list` for "no certificate" when
+    /// `present` is false. `certificate_request_context` echoes the
+    /// request's, always empty in handshake authentication.
+    fn send_client_certificate(&mut self, present: bool) -> Result<(), Error> {
+        let mut body = Vec::new();
+        body.push(0);
+        with_len_u24(&mut body, |list| {
+            if let (true, Some(cc)) = (present, self.config.client_cert.as_ref()) {
+                for cert in &cc.chain {
+                    with_len_u24(list, |c| c.extend_from_slice(cert));
+                    with_len_u16(list, |_| {}); // per-cert extensions
+                }
+            }
+        });
+        self.emit_final_flight_message(hs_type::CERTIFICATE, &body)
+    }
+
+    /// mTLS: emits our `CertificateVerify` (RFC 8446 §4.4.3) under
+    /// `scheme` from the produced `signature`.
+    fn emit_client_certificate_verify(
+        &mut self,
+        scheme: SignatureScheme,
+        signature: &[u8],
+    ) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(4 + signature.len());
+        body.extend_from_slice(&scheme.0.to_be_bytes());
+        with_len_u16(&mut body, |b| b.extend_from_slice(signature));
+        self.emit_final_flight_message(hs_type::CERTIFICATE_VERIFY, &body)
+    }
+
+    /// Adds the TLS-shaped `msg_type` / `body` to the transcript (RFC 9147
+    /// §5.2) and emits it, fragmented to the record ceiling, under the
+    /// handshake write keys, each fragment tracked for retransmission.
+    fn emit_final_flight_message(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
+        let mut tls_msg = Vec::with_capacity(4 + body.len());
+        tls_msg.push(msg_type);
+        let n = body.len() as u32;
+        tls_msg.push(((n >> 16) & 0xff) as u8);
+        tls_msg.push(((n >> 8) & 0xff) as u8);
+        tls_msg.push((n & 0xff) as u8);
+        tls_msg.extend_from_slice(body);
+        self.transcript.update(&tls_msg);
+        let msg_seq = self.out_msg_seq;
+        self.out_msg_seq += 1;
+        for frag in write_fragments(msg_type, msg_seq, body, self.max_fragment()) {
+            self.emit_protected_handshake(frag)?;
+        }
+        Ok(())
+    }
+
+    /// The tail of the final flight, shared by the inline and external
+    /// signing paths: emits our Finished over the transcript so far (our
+    /// Certificate and CertificateVerify included under mTLS) and installs
+    /// the application keys parked by `on_finished`.
+    fn finish_client_flight(&mut self) -> Result<(), Error> {
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         // Emit our Finished under the handshake-write key.
         let chts = self
             .client_hs_secret
@@ -1955,26 +2143,7 @@ impl DtlsClientConnection13 {
             th_for_cfin.as_slice(),
         );
         let fin_body = verify_data.as_slice().to_vec();
-        // Update transcript with Finished.
-        let mut fin_tls = Vec::with_capacity(4 + fin_body.len());
-        fin_tls.push(hs_type::FINISHED);
-        let n = fin_body.len() as u32;
-        fin_tls.push(((n >> 16) & 0xff) as u8);
-        fin_tls.push(((n >> 8) & 0xff) as u8);
-        fin_tls.push((n & 0xff) as u8);
-        fin_tls.extend_from_slice(&fin_body);
-        self.transcript.update(&fin_tls);
-
-        let fin_msg_seq = self.out_msg_seq;
-        self.out_msg_seq += 1;
-        for frag in write_fragments(
-            hs_type::FINISHED,
-            fin_msg_seq,
-            &fin_body,
-            self.max_fragment(),
-        ) {
-            self.emit_protected_handshake(frag)?;
-        }
+        self.emit_final_flight_message(hs_type::FINISHED, &fin_body)?;
 
         // Swap in application keys. The handshake write context is
         // retired, not dropped: our Finished is still in flight and a

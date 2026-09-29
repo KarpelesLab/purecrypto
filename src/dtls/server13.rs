@@ -19,7 +19,9 @@
 //! 3. On the cookie-validated CH, derives handshake traffic secrets and
 //!    sends the encrypted server flight (EE / Certificate /
 //!    CertificateVerify / Finished).
-//! 4. On the client's Finished, transitions to the application epoch.
+//! 4. On the client's Finished — preceded, when a client certificate was
+//!    requested, by its Certificate and CertificateVerify (RFC 8446
+//!    §4.4.2 / §4.4.3) — transitions to the application epoch.
 //!
 //! Negotiation surface (matches the TLS 1.3 layer):
 //!
@@ -29,7 +31,9 @@
 //!   (draft-ietf-tls-ecdhe-mlkem).
 //! - Server certificate signatures: RSA-PSS, ECDSA (any curve), Ed25519,
 //!   ML-DSA-44/65/87 (draft-ietf-tls-mldsa).
-//! - Out of scope: mTLS, PSK, 0-RTT, Connection ID.
+//! - Client certificates (mutual authentication, RFC 8446 §4.3.2): the
+//!   same policy as the TLS 1.3 server (`ClientAuthPolicy`).
+//! - Out of scope: PSK, 0-RTT, Connection ID.
 
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
@@ -43,14 +47,17 @@ use crate::tls::codec::{
     CipherSuite, ClientHello, ExtensionType, KeyUpdate, NamedGroup, Random, ReadCursor,
     ServerHello, hs_type, put_u16, with_len_u16, with_len_u24,
 };
+use crate::tls::conn::ClientAuthPolicy;
 use crate::tls::crypto::sign::{sign_certificate_verify, signature_scheme_for};
 use crate::tls::crypto::{
     HashAlg, KeySchedule, LabelPrefix, RecordCrypter, SuiteParams, Transcript,
     certificate_verify_content, finished_verify_data_with, kex, next_traffic_secret_with,
-    supported_suites,
+    supported_suites, verify_signature,
 };
 use crate::tls::keylog::KeyLog;
+use crate::tls::pki::CrlStore;
 use crate::tls::{AlertDescription, ContentType, Error, ProtocolVersion};
+use crate::x509::{AnyPublicKey, Time};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -87,9 +94,12 @@ const HRR_RANDOM: [u8; 32] = [
 /// `cookie` extension type (RFC 8446 §4.2.2).
 const EXT_COOKIE: u16 = 0x002C;
 /// Record numbers of the client's final flight kept for the ACK that
-/// precedes an early `close_notify`: its Finished is one record, and a
-/// client gives up after a handful of retransmissions.
-const MAX_FINAL_FLIGHT_RECORDS: usize = 8;
+/// precedes an early `close_notify`: its Finished is one record, a
+/// Certificate + CertificateVerify answering a `CertificateRequest` a
+/// dozen more (a multi-KB chain is fragmented to the record ceiling), and
+/// a client gives up after a handful of retransmissions. Bounded like the
+/// ACK queue itself ([`MAX_PENDING_ACKS`]).
+const MAX_FINAL_FLIGHT_RECORDS: usize = MAX_PENDING_ACKS;
 
 /// Configuration for a DTLS 1.3 server.
 ///
@@ -117,11 +127,21 @@ pub(crate) struct ServerConfig13Internal {
     /// the server allocates any per-connection handshake state. Default
     /// `true`.
     pub require_cookie: bool,
-    /// Allowed signature algorithms (reserved for client-auth in a future
-    /// commit; currently unused on the server side because we don't accept
-    /// client certificates yet).
-    #[allow(dead_code)]
+    /// Allowed signature algorithms in a client's certificate chain and
+    /// `CertificateVerify` (see [`Self::client_auth`]).
     pub signature_policy: Arc<SignaturePolicy>,
+    /// Client-certificate policy (mutual authentication). `None` (the
+    /// default) sends no `CertificateRequest`. Forwarded from
+    /// [`crate::tls::Config::client_auth`].
+    pub client_auth: Option<ClientAuthPolicy>,
+    /// CRLs consulted while validating a client's chain. Forwarded from
+    /// [`crate::tls::Config::crls`].
+    pub crls: CrlStore,
+    /// Clock for the client chain's validity period. `None` uses the
+    /// system clock under `std` and fails closed on `no_std` (see
+    /// [`crate::tls::pki::verify_client_chain`]). Forwarded from
+    /// [`crate::tls::Config::verification_time`].
+    pub verification_time: Option<Time>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub key_log: Option<Arc<dyn KeyLog>>,
     /// Ceiling on the size of an emitted handshake record, header included
@@ -167,12 +187,27 @@ impl ServerConfig13Internal {
             previous_cookie_secret: None,
             require_cookie: true,
             signature_policy: Arc::new(SignaturePolicy::modern()),
+            client_auth: None,
+            crls: CrlStore::new(),
+            verification_time: None,
             key_log: None,
             max_record_size: record::DEFAULT_MAX_RECORD_SIZE,
             alpn_protocols: Vec::new(),
             groups: supported_server_groups().to_vec(),
             connection_id: None,
         }
+    }
+
+    /// Demands a client certificate: the server flight carries a
+    /// `CertificateRequest` (RFC 8446 §4.3.2) and the client's chain is
+    /// verified against `roots` for the client-authentication purpose.
+    /// With `required`, an empty client `Certificate` aborts the handshake
+    /// with `certificate_required` (§4.4.2.4); otherwise an anonymous
+    /// client is admitted and [`DtlsServerConnection13::peer_certificates`]
+    /// stays empty. Forwarded from [`crate::tls::Config::client_auth`].
+    pub fn with_client_auth(mut self, roots: crate::tls::RootCertStore, required: bool) -> Self {
+        self.client_auth = Some(ClientAuthPolicy { roots, required });
+        self
     }
 
     /// Sets the pre-rotation cookie secret (see
@@ -220,6 +255,12 @@ enum State {
     WaitFirstClientHello,
     /// Sent HRR with cookie; awaiting cookie-bearing second CH.
     WaitSecondClientHello,
+    /// Sent the server flight with a `CertificateRequest`; awaiting the
+    /// client's `Certificate`.
+    WaitClientCertificate,
+    /// The client's `Certificate` carried a chain; awaiting its
+    /// `CertificateVerify`.
+    WaitClientCertVerify,
     /// Sent the server flight; awaiting client Finished.
     WaitClientFinished,
     /// External-signing pause: the flight is built through Certificate and is
@@ -341,6 +382,12 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// server-Finished derivation so [`Self::tls_exporter`] can be called
     /// any number of times once the handshake completes.
     exporter_secret: Option<crate::tls::crypto::Secret>,
+    /// The client's certificate chain (leaf first, DER), once verified;
+    /// empty for an anonymous client.
+    client_cert_chain: Vec<Vec<u8>>,
+    /// The verified client leaf key its `CertificateVerify` is checked
+    /// under.
+    client_leaf_key: Option<AnyPublicKey>,
     /// Group selected for HelloRetryRequest, if any. When set, CH2 must
     /// carry a `key_share` for this group (RFC 8446 §4.1.4 / §4.2.8).
     hrr_selected_group: Option<NamedGroup>,
@@ -450,6 +497,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             suite: None,
             alpn_negotiated: None,
             exporter_secret: None,
+            client_cert_chain: Vec::new(),
+            client_leaf_key: None,
             hrr_selected_group: None,
             hrr_sent: false,
             negotiated_group: None,
@@ -492,6 +541,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// The ALPN protocol selected from the client's offer, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
+    }
+
+    /// The client's certificate chain (leaf first, DER) once its
+    /// `CertificateVerify` has been checked; empty when no certificate was
+    /// requested or the client presented none.
+    pub fn peer_certificates(&self) -> &[Vec<u8>] {
+        &self.client_cert_chain
     }
 
     /// `true` when the handshake went through a HelloRetryRequest this
@@ -1479,6 +1535,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         raw.push((n & 0xff) as u8);
         raw.extend_from_slice(body);
         match self.state {
+            State::WaitClientCertificate => self.on_client_certificate(msg_type, body, &raw),
+            State::WaitClientCertVerify => self.on_client_cert_verify(msg_type, body, &raw),
             State::WaitClientFinished => self.on_client_finished(msg_type, body, &raw),
             State::Connected => self.on_post_handshake(msg_type, body),
             _ => Err(Error::UnexpectedMessage),
@@ -2002,9 +2060,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.client_hs_secret = Some(chts);
         self.server_hs_secret = Some(shts);
 
-        // Build and emit the encrypted server flight: EE, Certificate, CV,
-        // Finished.
+        // Build and emit the encrypted server flight: EE,
+        // [CertificateRequest], Certificate, CV, Finished (RFC 8446 §4.3.2:
+        // the request follows EncryptedExtensions and precedes Certificate).
         self.send_encrypted_extensions()?;
+        if self.config.client_auth.is_some() {
+            self.send_certificate_request()?;
+        }
         self.send_certificate()?;
         // CertificateVerify. For an external key, stash the signature input and
         // suspend; the caller signs and resumes via `provide_signature`, after
@@ -2085,7 +2147,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
 
-        self.state = State::WaitClientFinished;
+        // With a CertificateRequest out, the client's flight opens with its
+        // Certificate (RFC 8446 §4.4.2); otherwise its Finished is next.
+        self.state = if self.config.client_auth.is_some() {
+            State::WaitClientCertificate
+        } else {
+            State::WaitClientFinished
+        };
         Ok(())
     }
 
@@ -2183,9 +2251,135 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         Ok(())
     }
 
+    /// RFC 8446 §4.3.2: emits a `CertificateRequest` with an empty
+    /// `certificate_request_context` (handshake authentication) and the
+    /// `signature_algorithms` a client `CertificateVerify` may use — the
+    /// same list the TLS 1.3 server sends, which
+    /// [`Self::on_client_cert_verify`] enforces.
+    fn send_certificate_request(&mut self) -> Result<(), Error> {
+        let mut body = Vec::new();
+        body.push(0); // certificate_request_context: empty
+        with_len_u16(&mut body, |exts| {
+            let (ty, ext_body) = ext::signature_algorithms();
+            put_u16(exts, ty.0);
+            with_len_u16(exts, |b| b.extend_from_slice(&ext_body));
+        });
+        let mut tls_msg = Vec::with_capacity(4 + body.len());
+        tls_msg.push(hs_type::CERTIFICATE_REQUEST);
+        let n = body.len() as u32;
+        tls_msg.push(((n >> 16) & 0xff) as u8);
+        tls_msg.push(((n >> 8) & 0xff) as u8);
+        tls_msg.push((n & 0xff) as u8);
+        tls_msg.extend_from_slice(&body);
+        self.transcript.update(&tls_msg);
+        self.emit_encrypted_handshake(hs_type::CERTIFICATE_REQUEST, &body)
+    }
+
+    /// The client's `Certificate` answering our `CertificateRequest`
+    /// (RFC 8446 §4.4.2). An empty chain is "no certificate": admitted when
+    /// the policy does not require one (its Finished follows directly),
+    /// `certificate_required` otherwise (§4.4.2.4). A chain is verified
+    /// against the policy's roots for client authentication, and its
+    /// `CertificateVerify` must follow (§4.4.3).
+    ///
+    /// The record was AEAD-authenticated under the handshake keys, so every
+    /// rejection here is a genuine peer fault and fatal — mirroring the TLS
+    /// 1.3 server, whose logic this is.
+    fn on_client_certificate(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        if msg_type != hs_type::CERTIFICATE {
+            return Err(Error::UnexpectedMessage);
+        }
+        let chain = crate::tls::conn::parse_certificate_list_server(body)?;
+        let policy = self
+            .config
+            .client_auth
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        if chain.is_empty() {
+            if policy.required {
+                return Err(Error::CertificateRequired);
+            }
+            self.transcript.update(raw);
+            self.client_cert_chain.clear();
+            self.client_leaf_key = None;
+            self.state = State::WaitClientFinished;
+            return Ok(());
+        }
+        // Chain validation for `ChainPurpose::Client` (`id-kp-clientAuth`),
+        // under the server's signature policy, at the configured clock or
+        // the system's — and fail closed with neither.
+        let leaf_key = crate::tls::pki::verify_client_chain(
+            &policy.roots,
+            &self.config.crls,
+            &chain,
+            self.config.verification_time.as_ref(),
+            &self.config.signature_policy,
+        )?;
+        self.transcript.update(raw);
+        self.client_cert_chain = chain;
+        self.client_leaf_key = Some(leaf_key);
+        self.state = State::WaitClientCertVerify;
+        Ok(())
+    }
+
+    /// The client's `CertificateVerify` (RFC 8446 §4.4.3): a signature, in
+    /// the client context, over the transcript through its Certificate,
+    /// under the leaf key [`Self::on_client_certificate`] verified. The
+    /// scheme must be one our `CertificateRequest` offered and must not be
+    /// `rsa_pkcs1_*` (chain signatures only in TLS 1.3).
+    fn on_client_cert_verify(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        if msg_type != hs_type::CERTIFICATE_VERIFY {
+            return Err(Error::UnexpectedMessage);
+        }
+        let mut c = ReadCursor::new(body);
+        let scheme = SignatureScheme(c.u16()?);
+        let signature = c.vec_u16()?.to_vec();
+        c.expect_empty()?;
+        if scheme.is_rsa_pkcs1() || !ext::offered_signature_schemes().contains(&scheme) {
+            return Err(Error::IllegalParameter);
+        }
+        let th = self.transcript.current_hash();
+        let content = certificate_verify_content(false, th.as_slice());
+        let leaf_key = self
+            .client_leaf_key
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        verify_signature(
+            scheme,
+            leaf_key,
+            &content,
+            &signature,
+            &self.config.signature_policy,
+        )?;
+        self.transcript.update(raw);
+        self.state = State::WaitClientFinished;
+        Ok(())
+    }
+
     fn on_client_finished(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
         if msg_type != hs_type::FINISHED {
             return Err(Error::UnexpectedMessage);
+        }
+        // Defence in depth (RFC 8446 §4.4.2.4): with client authentication
+        // required, a verified client key must exist before the connection
+        // is accepted. The state machine already guarantees it (an empty
+        // Certificate is refused, a chain must be followed by a verified
+        // CertificateVerify); re-check so no later change to it can let a
+        // required-certificate handshake reach `Connected` anonymously.
+        if self.config.client_auth.as_ref().is_some_and(|p| p.required)
+            && self.client_leaf_key.is_none()
+        {
+            return Err(Error::CertificateRequired);
         }
         let suite = self.suite.ok_or(Error::InappropriateState)?;
         let chts = self
@@ -2481,6 +2675,20 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     pub(crate) fn send_handshake_for_test(&mut self, msg_type: u8, body: &[u8]) {
         self.emit_encrypted_handshake(msg_type, body)
             .expect("protected write keys installed");
+    }
+
+    /// Test-only: hands a reassembled handshake message straight to the
+    /// state machine, as if it had arrived authenticated at the expected
+    /// `message_seq`, so tests can present the client messages a conforming
+    /// client never sends (a Finished in place of a CertificateVerify, a
+    /// CertificateVerify under a scheme that was not offered).
+    #[cfg(test)]
+    pub(crate) fn dispatch_handshake_for_test(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+    ) -> Result<(), Error> {
+        self.dispatch_one(msg_type, body)
     }
 
     /// Test-only: like `send_handshake_for_test` but the message is framed
