@@ -877,6 +877,12 @@ int pc_tls_received_close_notify(const PcTls *tls);
 int pc_tls_is_handshake_complete(const PcTls *tls);
 pc_status pc_tls_negotiated_version(const PcTls *tls, uint16_t *out);
 pc_status pc_tls_negotiated_cipher_suite(const PcTls *tls, uint16_t *out);
+/* The IANA SignatureScheme code point the peer's handshake signature was
+ * verified under (0x0807 ed25519, 0x0403 ecdsa_secp256r1_sha256, ...): the
+ * server's CertificateVerify / ServerKeyExchange on a client, the client's
+ * CertificateVerify on a server with client authentication. 0 before it was
+ * verified, on a resumed session, or without client authentication. */
+pc_status pc_tls_peer_signature_scheme(const PcTls *tls, uint16_t *out);
 pc_status pc_tls_negotiated_cipher_suite_name(const PcTls *tls,
                                               uint8_t *out, size_t *out_len);
 /* The key-exchange group the handshake used (a pc_tls_group codepoint, or

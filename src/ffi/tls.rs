@@ -1222,6 +1222,33 @@ pub unsafe extern "C" fn pc_tls_negotiated_cipher_suite(
     })
 }
 
+/// Writes the IANA `SignatureScheme` code point (RFC 8446 §4.2.3; RFC 8422
+/// §5.1.3 for `ed25519` / `ed448` on 1.2) the peer's handshake signature
+/// was verified under to `*out` — the server's CertificateVerify on a
+/// (D)TLS 1.3 client, its ServerKeyExchange on a (D)TLS 1.2 client, the
+/// client's CertificateVerify on a server that received client
+/// authentication — or `0` before that signature was verified, on a resumed
+/// session, and on a server the client did not authenticate to. Always
+/// returns `Ok` once the pointer check passes.
+///
+/// # Safety
+/// `tls`, `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_peer_signature_scheme(
+    tls: *const PcTls,
+    out: *mut u16,
+) -> PcStatus {
+    guard(|| {
+        if tls.is_null() || out.is_null() {
+            return PcStatus::NullPointer;
+        }
+        unsafe { *out = 0 };
+        let v = unsafe { &*tls }.inner.peer_signature_scheme().unwrap_or(0);
+        unsafe { *out = v };
+        PcStatus::Ok
+    })
+}
+
 /// Writes the IANA name of the negotiated cipher suite (e.g.
 /// `"TLS_AES_128_GCM_SHA256"`) into `out` as raw UTF-8 bytes (no trailing
 /// NUL — `*out_len` is the exact byte count, matching the convention used
