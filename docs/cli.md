@@ -684,7 +684,8 @@ Not implemented over DTLS, and refused up front: client certificates
 
 ## QUIC: `q_client` / `q_server`
 
-QUIC v1 (RFC 9000) over UDP, secured by TLS 1.3 keys. Use the dedicated
+QUIC v1 (RFC 9000) and v2 (RFC 9369) over UDP, secured by TLS 1.3 keys, with
+RFC 9368 compatible/incompatible version negotiation. Use the dedicated
 commands or pass `-quic` to `s_client` / `s_server`. The two commands speak
 a small echo protocol that the interop matrix in `tools/quic-interop/` also
 implements on the quic-go side: the server echoes every client-initiated
@@ -698,10 +699,10 @@ purecrypto q_client -connect host:port -alpn proto [-insecure] [-servername name
                     [-uni | -datagram] [-exchanges N] [-pause ms] [-migrate] [-switch-cid]
                     [-reconnect [-early-data]] [-key-update] [-ciphersuites list] [-groups list]
                     [-key-shares groups] [-close-code N] [-close-reason text] [-idle-timeout ms]
-                    [-linger ms] [-timeout secs] [-keylogfile keys.log] [-quiet]
+                    [-linger ms] [-quic_versions v1,v2] [-timeout secs] [-keylogfile keys.log] [-quiet]
 purecrypto q_server -cert cert.pem -key key.pem -accept host:port -alpn proto [-www] [-retry]
                     [-early-data] [-key-update] [-switch-cid] [-ciphersuites list] [-groups list]
-                    [-idle-timeout ms] [-reset-key hex32] [-naccept N] [-timeout secs]
+                    [-idle-timeout ms] [-quic_versions v1,v2] [-reset-key hex32] [-naccept N] [-timeout secs]
                     [-keylogfile keys.log] [-quiet]
 ```
 
@@ -711,7 +712,7 @@ purecrypto q_client -connect localhost:4434 -alpn h3
 ```
 
 Both print what the handshake negotiated on stderr (`negotiated: alpn=…
-suite=… resumed=… early_data=… retry=… group=… hrr=…`), one line per stream with
+suite=… version=v1|v2 resumed=… early_data=… retry=… group=… hrr=…`), one line per stream with
 the byte count and SHA-256 of what arrived, and how the connection ended
 (`closed: application error 0x0 () by peer`, `closed: idle timeout`,
 `closed: stateless reset`).
@@ -732,6 +733,13 @@ Client options:
   `early_data=accepted|rejected|offered|none`.
 - `-key-update` initiates a 1-RTT key update once the handshake is
   confirmed and reports when the peer's reply in the new phase confirms it.
+- `-quic_versions v1,v2` sets the QUIC versions to offer, in preference
+  order (RFC 9368/9369). The first is the client's original/first-flight
+  version; the rest are offered for a compatible upgrade. A server that
+  cannot parse the first flight answers with a Version Negotiation packet
+  and the client restarts with a version both support. Default:
+  `v1,v2` (v1 on the wire, v2 offered). The negotiated version shows in the
+  `version=` field of the report.
 - `-ciphersuites` restricts the offered TLS 1.3 suites (OpenSSL names,
   `:`-separated); `-groups` restricts and orders the offered groups and
   `-key-shares` the groups a `key_share` is sent for, both as `s_client`
@@ -753,6 +761,10 @@ Server options:
 - `-key-update` initiates a key update on every connection once the client
   has acknowledged HANDSHAKE_DONE; `-switch-cid` switches to a spare
   client-issued connection ID.
+- `-quic_versions v1,v2` sets the QUIC versions the server accepts and lists
+  in Version Negotiation packets, in preference order (RFC 9368 §5). The
+  server picks the negotiated version from the client's offer using this
+  order (the client's is advisory). Default: `v1,v2`.
 - `-reset-key hex32` fixes the stateless-reset key (§10.3.1) so a restarted
   server still resets the connections its predecessor held; random
   otherwise.

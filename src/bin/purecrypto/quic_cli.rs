@@ -38,7 +38,7 @@ use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, parse_hex
 use purecrypto::hash::{Digest, Sha256};
 use purecrypto::quic::{
     CloseInfo, CloseInitiator, CloseKind, QuicConfig, QuicConnection, QuicServer, QuicSession,
-    StreamId, TransportParameters,
+    QuicVersion, StreamId, TransportParameters,
 };
 use purecrypto::rng::OsRng;
 use purecrypto::tls::{
@@ -95,6 +95,29 @@ fn default_transport_params(idle_ms: Option<u64>) -> TransportParameters {
         max_datagram_frame_size: Some(1200),
         ..TransportParameters::default()
     }
+}
+
+/// `-quic_versions v1,v2` → [`QuicVersion`]s in preference order (the first
+/// is the client's original / first-flight version). Comma-separated,
+/// `v1`/`1` and `v2`/`2` accepted (RFC 9368 / RFC 9369).
+fn parse_versions(list: &str) -> Vec<QuicVersion> {
+    let mut out = Vec::new();
+    for name in list.split(',').filter(|s| !s.is_empty()) {
+        let v = match name.trim() {
+            "v1" | "1" => QuicVersion::V1,
+            "v2" | "2" => QuicVersion::V2,
+            other => die(format!(
+                "-quic_versions: unknown QUIC version '{other}' (v1, v2)"
+            )),
+        };
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    if out.is_empty() {
+        die("-quic_versions: empty version list");
+    }
+    out
 }
 
 /// `-ciphersuites TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256` →
@@ -157,7 +180,8 @@ fn negotiated_line(qc: &QuicConnection) -> String {
     // by prefix.
     let group = qc.negotiated_group().map(|g| g.name()).unwrap_or("none");
     format!(
-        "negotiated: alpn={alpn} suite={suite} resumed={} early_data={early} retry={} group={group} hrr={}",
+        "negotiated: alpn={alpn} suite={suite} version={} resumed={} early_data={early} retry={} group={group} hrr={}",
+        qc.version(),
         yes_no(qc.is_resumed()),
         yes_no(qc.retry_used()),
         yes_no(qc.hello_retry_request_used()),
@@ -470,6 +494,7 @@ struct ClientSetup<'a> {
     key_shares: Option<Vec<purecrypto::tls::NamedGroup>>,
     idle_ms: Option<u64>,
     early_data: bool,
+    versions: Option<Vec<QuicVersion>>,
 }
 
 impl ClientSetup<'_> {
@@ -508,6 +533,13 @@ impl ClientSetup<'_> {
         qcfg.transport_params = default_transport_params(self.idle_ms);
         qcfg.enable_early_data = self.early_data;
         qcfg.resumption = resumption;
+        // `-quic_versions` (RFC 9368/9369): the first entry is the client's
+        // original / first-flight version, the rest are offered for a
+        // compatible upgrade. Left at the library default when unset.
+        if let Some(versions) = &self.versions {
+            qcfg.versions = versions.clone();
+            qcfg.original_version = versions.first().copied();
+        }
         QuicConnection::client(qcfg, self.server_name)
             .unwrap_or_else(|e| die(format!("QUIC client config rejected: {e:?}")))
     }
@@ -531,6 +563,7 @@ pub(crate) fn run_client(args: Args) {
         "-exchanges",
         "-pause",
         "-timeout",
+        "-quic_versions",
     ];
     let connect = args
         .value("-connect")
@@ -606,6 +639,7 @@ pub(crate) fn run_client(args: Args) {
         }),
         idle_ms: parse_num(&args, "-idle-timeout"),
         early_data,
+        versions: args.value("-quic_versions").map(parse_versions),
     };
 
     // The payload: stdin when piped, else empty (finish the stream at once,
@@ -901,6 +935,11 @@ pub(crate) fn run_server(args: Args) {
         .value("-groups")
         .map(|list| crate::tlsinfo::parse_groups(list, "-groups"));
     let idle_ms = parse_num(&args, "-idle-timeout");
+    // `-quic_versions` (RFC 9368/9369): the versions this server accepts and
+    // advertises in Version Negotiation, in preference order. Default: the
+    // library's SUPPORTED_VERSIONS.
+    let versions = args.value("-quic_versions").map(parse_versions);
+    let server_versions = versions.clone();
     let opts = ServerOpts {
         www,
         quiet,
@@ -966,6 +1005,9 @@ pub(crate) fn run_server(args: Args) {
         qcfg.transport_params = default_transport_params(idle_ms);
         // 0-RTT data is replayable; an echo server has nothing to lose.
         qcfg.enable_early_data = early_data;
+        if let Some(vs) = &versions {
+            qcfg.versions = vs.clone();
+        }
         if retry {
             let mut secret = [0u8; 32];
             purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
@@ -1004,6 +1046,12 @@ pub(crate) fn run_server(args: Args) {
 
     let mut server = QuicServer::with_reset_key(reset_key, make_config)
         .unwrap_or_else(|e| die(format!("QUIC server build: {e:?}")));
+    // Keep the router's Version Negotiation offer consistent with the config
+    // factory's versions (RFC 9368 §5), so a client the router bounced with
+    // a VN packet reconnects with a version this server actually accepts.
+    if let Some(vs) = &server_versions {
+        server.set_offered_versions(vs);
+    }
     server.set_now_secs(unix_now_secs());
 
     run_quic_server_loop(&mut server, &socket, &opts);
