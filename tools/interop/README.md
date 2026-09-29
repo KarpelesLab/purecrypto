@@ -60,14 +60,16 @@ the *client* identity):
 | `alpn` | ALPN selects `h2` | `-alpn h2,http/1.1` |
 | `rsl` | RFC 8449 `record_size_limit` (with a payload over the limit) | `-record_size_limit 512` |
 | `large-chain` | a certificate chain over 16 KiB (must span records) | `cert=large` |
-| `tls12` | the peer speaks TLS 1.2 only; purecrypto negotiates down | `-min_protocol TLSv1.2` |
+| `tls12` | the peer speaks TLS 1.2 only; purecrypto negotiates down — with a P-256 and an Ed25519 server identity (RFC 8422: EdDSA under the `ECDHE_ECDSA` suites), and once more as `mtls` with an Ed25519 client identity | `-min_protocol TLSv1.2` |
 
 The purecrypto side's expectations come from the case (`pc_verify` in
 `run.sh`, reading the `key: value` report `s_client` / `s_server` print —
 `cipher suite:`, `key exchange:`, `HelloRetryRequest:`, `resumed:`,
-`early data:`, `peer certificate:`, `own certificate:`, `… compression:`,
-`OCSP staple:`, `record_size_limit:`, `KeyUpdate: sent N, received M`,
-`close_notify:`). The peer side's expectations are the adapter's job.
+`early data:`, `peer certificate:`, `peer signature:` (the scheme the
+peer's handshake signature was verified under — `ed25519` for an Ed25519
+identity), `own certificate:`, `… compression:`, `OCSP staple:`,
+`record_size_limit:`, `KeyUpdate: sent N, received M`, `close_notify:`).
+The peer side's expectations are the adapter's job.
 
 Certificates are generated at run time with the purecrypto CLI (one CA, one
 leaf per key kind, the oversized chain, the raw public keys) and the OCSP

@@ -3,10 +3,18 @@
 #
 # Drives the `purecrypto` CLI (`s_client` / `s_server`) against `openssl`
 # over real loopback TCP (TLS 1.2) and UDP (DTLS 1.2) sockets, in both roles,
-# with an ECDSA and an RSA certificate, for every AEAD suite the 1.2 engines
-# offer: AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305. The OpenSSL side pins
-# the suite (`-cipher`), so a completed handshake proves that suite's record
-# protection and key-block layout on both ends.
+# with an ECDSA, an RSA and an Ed25519 certificate (RFC 8422: EdDSA under
+# the ECDHE-ECDSA suites, the ServerKeyExchange signed `ed25519`), for every
+# AEAD suite the 1.2 engines offer: AES-128-GCM, AES-256-GCM and
+# ChaCha20-Poly1305. The OpenSSL side pins the suite (`-cipher`), so a
+# completed handshake proves that suite's record protection and key-block
+# layout on both ends.
+#
+# One combination is SKIPped: `openssl s_server -dtls1_2` with the Ed25519
+# certificate answers "no shared cipher" to every client, its own included
+# (`ssl_set_masks` admits an EdDSA certificate for ECDHE-ECDSA only when the
+# version is exactly TLS 1.2, which DTLS 1.2 is not). OpenSSL's DTLS 1.2
+# *client* verifies an Ed25519 ServerKeyExchange fine, so those cases run.
 #
 # Loopback purecrypto<->purecrypto cannot catch a symmetric wire-format bug:
 # it passed while the ChaCha20-Poly1305 suites used the AES-GCM explicit
@@ -95,6 +103,10 @@ setup() {
         "$PURECRYPTO" genpkey -algorithm RSA -bits 2048 -out rsa.key
         "$PURECRYPTO" req -key rsa.key -subj "/CN=localhost" -out rsa.csr
         "$PURECRYPTO" x509 -req -in rsa.csr -CA ca.crt -CAkey ca.key -san localhost -out rsa.crt
+        # And an Ed25519 leaf: the ECDHE-ECDSA-* suites again (RFC 8422 §2.2).
+        "$PURECRYPTO" genpkey -algorithm ED25519 -out ed25519.key
+        "$PURECRYPTO" req -key ed25519.key -subj "/CN=localhost" -out ed25519.csr
+        "$PURECRYPTO" x509 -req -in ed25519.csr -CA ca.crt -CAkey ca.key -san localhost -out ed25519.crt
     ) >/dev/null
     chmod 600 "$d"/*.key
     PKI=$d
@@ -119,12 +131,12 @@ expect_re() {
     fi
 }
 
-# The OpenSSL cipher name for a certificate kind (ec|rsa) and a suite
-# (aes128gcm|aes256gcm|chacha20).
+# The OpenSSL cipher name for a certificate kind (ec|rsa|ed25519) and a
+# suite (aes128gcm|aes256gcm|chacha20).
 ossl_cipher() {
     local auth suite
     case $1 in
-        ec) auth=ECDHE-ECDSA ;;
+        ec|ed25519) auth=ECDHE-ECDSA ;;
         rsa) auth=ECDHE-RSA ;;
     esac
     case $2 in
@@ -276,6 +288,25 @@ ossl_client() {
             >"$dir/client.out" 2>"$dir/client.err" || RC=$?
 }
 
+# The signature scheme a certificate kind signs the ServerKeyExchange
+# under, as the purecrypto report names it (`peer signature:`), and a
+# regex for `openssl s_client`'s `Peer signature type:` line — the key
+# type on 3.0, the IANA scheme name from 3.2 on.
+pc_scheme() {
+    case $1 in
+        ec) echo ecdsa_secp256r1_sha256 ;;
+        rsa) echo rsa_pss_rsae_sha256 ;;
+        ed25519) echo ed25519 ;;
+    esac
+}
+ossl_sigtype_re() {
+    case $1 in
+        ec) echo "^Peer signature type: (ECDSA|ecdsa_secp256r1_sha256)$" ;;
+        rsa) echo "^Peer signature type: (RSA-PSS|rsa_pss_rsae_sha256)$" ;;
+        ed25519) echo "^Peer signature type: (Ed25519|ed25519)$" ;;
+    esac
+}
+
 rc_is() {
     if [ "$RC" -ne "$1" ]; then
         log "  client exited $RC, expected $1"
@@ -339,6 +370,9 @@ case_pc_to_ossl() {
         # OpenSSL 3.0 prints `subject=CN = localhost`, 3.2+ `subject=CN=localhost`.
         expect_re "$d/server.out" "^subject=CN ?= ?localhost"
     fi
+    # The purecrypto client verified OpenSSL's ServerKeyExchange under the
+    # scheme the key kind calls for.
+    expect "$d/client.err" "peer signature: $(pc_scheme "$kind")"
 }
 
 # openssl client pinned to one suite -> purecrypto echo server. The
@@ -364,6 +398,10 @@ case_ossl_to_pc() {
     rc_is 0
     expect "$d/client.out" "ping from openssl"
     expect "$d/client.out" "Cipher    : $cipher"
+    # OpenSSL verified the purecrypto server's ServerKeyExchange under the
+    # scheme the key kind calls for (`Peer signature type:` in s_client's
+    # summary; 3.x names it, 1.1.1 would not).
+    expect_re "$d/client.out" "$(ossl_sigtype_re "$kind")"
     if [ "$proto" = tcp ]; then
         expect "$d/client.out" "Protocol  : TLSv1.2"
     else
@@ -384,10 +422,11 @@ case_ossl_to_pc() {
 setup
 PASS=0
 FAIL=0
+SKIP=0
 FAILED=""
 for proto in tcp udp; do
     for dir in pc_to_ossl ossl_to_pc; do
-        for kind in ec rsa; do
+        for kind in ec rsa ed25519; do
             for suite in aes128gcm aes256gcm chacha20; do
                 variants=plain
                 if [ "$proto" = udp ] && [ "$dir" = ossl_to_pc ]; then
@@ -401,6 +440,11 @@ for proto in tcp udp; do
                     c="${name}_${dir}_${kind}_${suite}"
                     if [ "$variant" != plain ]; then c="${c}_${variant}"; fi
                     if [ -n "$ONLY" ] && [ "$c" != "$ONLY" ]; then continue; fi
+                    if [ "$proto" = udp ] && [ "$dir" = pc_to_ossl ] && [ "$kind" = ed25519 ]; then
+                        SKIP=$((SKIP + 1))
+                        log "--- SKIP $c (openssl s_server -dtls1_2 cannot use an Ed25519 certificate: no shared cipher)"
+                        continue
+                    fi
                     cdir=$WORK/$c
                     mkdir -p "$cdir"
                     log "=== $c"
@@ -435,7 +479,7 @@ for proto in tcp udp; do
 done
 
 log ""
-log "TLS 1.2 / DTLS 1.2 interop vs OpenSSL: $PASS passed, $FAIL failed"
+log "TLS 1.2 / DTLS 1.2 interop vs OpenSSL: $PASS passed, $FAIL failed, $SKIP skipped"
 if [ "$FAIL" -ne 0 ]; then
     log "failed:$FAILED"
     exit 1

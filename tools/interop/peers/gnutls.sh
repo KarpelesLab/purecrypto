@@ -368,7 +368,7 @@ cmd_verify() {
                     expect_re "$e" "decrypted early data with length: 27, in epoch" || ok=1
                 fi ;;
             mtls)
-                expect_re "$f" "^- Description: \(TLS1\.3-X\.509\)" || ok=1
+                expect_re "$f" "^- Description: \(TLS1\.[23]-X\.509\)" || ok=1
                 expect "$f" "- Status: The certificate is trusted." || ok=1
                 expect "$f" "- Client Signature:" || ok=1 ;;
             rpk) expect_re "$f" "^- Description: \(TLS1\.3-X\.509-Raw Public Key\)" || ok=1 ;;

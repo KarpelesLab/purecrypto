@@ -72,10 +72,9 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `xmss` | RFC 8391, SP 800-208 | ref-impl KAT | ref vectors | `xmss_parse` | n/a (hash-based, **stateful**) |
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pkcs12_parse` (outer PFX / MacData / KDF params; the bags behind the MAC need a seeded corpus) | MAC CT, wrong-pw gate, wipe |
-| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8, Apple's Network.framework and wolfSSL 5.9, both roles** (CI: certs × groups × suites, resumption (incl. PSK-only), external PSK, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites** (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
+| `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces; OpenSSL ChaCha20-Poly1305 record capture (RFC 7905) | loopback; **TLS 1.3 vs OpenSSL 3.0, OpenSSL 3.6, BoringSSL, GnuTLS 3.8, Apple's Network.framework and wolfSSL 5.9, both roles** (CI: certs × groups × suites, resumption (incl. PSK-only), external PSK, 0-RTT, HRR, mTLS, KeyUpdate, compression, RPK, OCSP, ALPN, record_size_limit, TLS 1.2 fallback); **TLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, RSA / ECDSA / Ed25519 certificates** (CI); TLS 1.2 with Ed25519 identities (server and client) vs OpenSSL, BoringSSL, GnuTLS and wolfSSL (CI); legacy vs OpenSSL 1.1.1; ECH vs BoringSSL; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
 | `dtls` | RFC 6347 (1.2), RFC 9147 (1.3), RFC 9146 (connection IDs) | loopback; **wolfSSL 5.9 DTLS 1.3 record capture** (RFC 9147 §5.9 label prefix) | loopback; **DTLS 1.2 vs OpenSSL 3.x, both roles, all AEAD suites, fragmented ClientHello, client certificates** (CI); **DTLS 1.2 and DTLS 1.3 vs wolfSSL 5.9, both roles** (CI: certs × groups × suites, HRR, KeyUpdate, ALPN, mTLS, fragmentation at two MTUs, a lossy path, connection IDs); **DTLS 1.2 vs Mbed TLS 4.2, both roles** (CI: certs × groups × suites, ALPN, a lossy path, connection IDs) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
 | `quic` | RFC 9000/9001/9002/9221/9368/9369 | loopback | loopback; **QUIC v1 + v2 vs quic-go, both roles** and **vs OpenSSL 3.6 `s_client -quic`** (CI) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
-
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
 | `signature_registry` | — (X.509/TLS dispatch) | via primitives | via X.509/TLS | — | delegates |
 | `ffi` | — (C ABI) | unit (C-boundary) | — | — | delegates; panic-catching |
@@ -163,16 +162,20 @@ update with the commands in `tools/wycheproof/README.md`.
 - **OpenSSL 3.x, TLS 1.2 and DTLS 1.2 cipher-suite matrix** (CI job
   `interop-openssl-tls12.yml`, script `tools/tls12-interop/run.sh`): the
   purecrypto CLI against the runner's `openssl s_client` / `s_server`, in
-  **both roles**, over TCP (TLS 1.2) and UDP (DTLS 1.2), with an ECDSA and
-  an RSA certificate, for every AEAD suite the 1.2 engines offer — the
-  OpenSSL side pins the suite and each handshake exchanges application
-  data:
+  **both roles**, over TCP (TLS 1.2) and UDP (DTLS 1.2), with an ECDSA, an
+  RSA and an Ed25519 certificate (RFC 8422: EdDSA authenticates the
+  `ECDHE_ECDSA` suites, the `ServerKeyExchange` signed `ed25519`), for
+  every AEAD suite the 1.2 engines offer — the OpenSSL side pins the suite,
+  each handshake exchanges application data, and both sides report the
+  scheme the other signed under (`peer signature:` / `Peer signature
+  type:`):
 
   | Suite | TLS 1.2 client / server | DTLS 1.2 client / server | DTLS 1.2 server, fragmented ClientHello | DTLS 1.2 mTLS client / server (+ fragmented) |
   |---|---|---|---|---|
   | `ECDHE-{ECDSA,RSA}-AES128-GCM-SHA256` | ✅ / ✅ | ✅ / ✅ | ✅ | ✅ / ✅ (✅) |
   | `ECDHE-{ECDSA,RSA}-AES256-GCM-SHA384` | ✅ / ✅ | ✅ / ✅ | ✅ | ✅ / ✅ (✅) |
   | `ECDHE-{ECDSA,RSA}-CHACHA20-POLY1305` (RFC 7905) | ✅ / ✅ | ✅ / ✅ | ✅ | ✅ / ✅ (✅) |
+  | The three `ECDHE-ECDSA-*` suites with an Ed25519 certificate | ✅ / ✅ | ⏭ `openssl s_server -dtls1_2` admits an EdDSA certificate for `ECDHE-ECDSA` only when the version is exactly TLS 1.2 (`ssl_set_masks`): "no shared cipher", against its own client too / ✅ | ✅ | ⏭ as in the plain case / ✅ (✅) |
 
   Every DTLS 1.2 case also runs with a client certificate: the server
   demands one (`openssl s_server -Verify 1` / `purecrypto s_server
@@ -241,7 +244,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | ALPN | ✅ / ✅ | ✅ / ✅ | ⏭ `bssl server` has no ALPN option / ✅ |
   | RFC 8449 `record_size_limit` | ⏭ not implemented by OpenSSL | ⏭ | ⏭ not implemented by BoringSSL |
   | Chain > 16 KiB (Certificate spans records) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | TLS 1.2 fallback (peer is 1.2-only), P-256 and Ed25519 server identity | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+  | TLS 1.2 mTLS, Ed25519 client identity (RFC 8422 §5.5 / §5.8) | ✅ / ✅ | ✅ / ✅ | ⏭ `bssl server` cannot be told to accept it / ✅ |
   | `close_notify` from the peer | ✅ / ✅ | ✅ / ✅ | ⏭ neither `bssl` role sends one |
 
   What this matrix caught that loopback could not: the client only sent
@@ -293,7 +297,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | ALPN | ✅ / ✅ |
   | RFC 8449 `record_size_limit` | ✅ / ✅ — the Mbed TLS server splits its 3000-byte response into six 511-byte records for the purecrypto client's limit of 512; the Mbed TLS client advertises 16384 on every TLS 1.3 connection, which the purecrypto server accepts |
   | Chain > 16 KiB (Certificate spans records) | ⏭ a handshake message must fit Mbed TLS's fixed 16 KiB I/O buffer (`MBEDTLS_SSL_{IN,OUT}_CONTENT_LEN` cannot be larger): its server cannot write the Certificate, its client cannot reassemble it |
-  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ |
+  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ (P-256 identity; the Ed25519 server and client identities ⏭ as above) |
   | `close_notify` from the peer | ✅ / ✅ |
 
   Mbed TLS also speaks DTLS 1.2 (no DTLS 1.3), and the adapter lists it
@@ -367,7 +371,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | ALPN | ✅ / ✅ |
   | RFC 8449 `record_size_limit` | ⏭ not implemented by SChannel |
   | Chain > 16 KiB (Certificate spans records) | ✅ / ⏭ SChannel cannot send a Certificate message over 16 KiB: the server credential is refused up front (`AcquireCredentialsHandle`: `SEC_E_INVALID_PARAMETER`; the same 9 KiB leaf under a small issuer, or the same 9 KiB intermediate under a small leaf, is fine). Receiving such a chain works (C) |
-  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ |
+  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ (P-256 identity; the Ed25519 server and client identities ⏭ as above) |
   | `close_notify` from the peer | ✅ / ✅ (`SslStream.ShutdownAsync`) |
 
   Nothing on the purecrypto side needed changing. Two Windows behaviours
@@ -426,7 +430,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | ALPN | ✅ / ✅ |
   | RFC 8449 `record_size_limit` | ⏭ not implemented by Apple's stack |
   | Chain > 16 KiB (Certificate spans records) | ✅ / ✅ |
-  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ |
+  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ (P-256 identity; the Ed25519 server and client identities ⏭ as above) |
   | `close_notify` from the peer | ✅ / ✅ (checked on the purecrypto side; Network.framework reports a `close_notify` and a bare FIN alike) |
 
   What this peer caught: a server may issue its NewSessionTickets with its
@@ -471,7 +475,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | ALPN | ✅ / ✅ | ✅ / ✅ |
   | RFC 8449 `record_size_limit` | ⏭ not implemented by LibreSSL | ⏭ |
   | Chain > 16 KiB (Certificate spans records) | ✅ / ✅ | ✅ / ✅ |
-  | TLS 1.2 fallback (peer is 1.2-only) | ⏭ LibreSSL has no RFC 7627 `extended_master_secret`; purecrypto requires it on TLS 1.2 (both roles abort with `handshake_failure`, as RFC 7627 §5.3 describes) | ⏭ |
+  | TLS 1.2 fallback (peer is 1.2-only), P-256 or Ed25519 identity | ⏭ LibreSSL has no RFC 7627 `extended_master_secret`; purecrypto requires it on TLS 1.2 (both roles abort with `handshake_failure`, as RFC 7627 §5.3 describes) | ⏭ |
   | `close_notify` from the peer | ✅ / ⏭ `s_server` sets the shutdown flags without sending the alert | ✅ / ⏭ |
 
   LibreSSL peculiarities the adapter accommodates rather than skips: its
@@ -527,7 +531,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | ALPN | ✅ / ✅ | ✅ / ✅ |
   | RFC 8449 `record_size_limit` (512; both sides' records checked) | ✅ / ✅ | ✅ / ✅ |
   | Chain > 16 KiB (Certificate spans records) | ✅ / ✅ | ✅ / ✅ |
-  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ | ✅ / ✅ |
+  | TLS 1.2 fallback (peer is 1.2-only), P-256 and Ed25519 server identity | ✅ / ✅ | ✅ / ✅ |
+  | TLS 1.2 mTLS, Ed25519 client identity | ✅ / ✅ | ✅ / ✅ |
   | `close_notify` from the peer | ✅ / ✅ | ✅ / ✅ |
 
   The one GnuTLS limitation that is a protocol bug rather than a missing
@@ -574,7 +579,7 @@ update with the commands in `tools/wycheproof/README.md`.
 
   | Case | TLS 1.3 (C / S) | DTLS 1.3 (C / S) | DTLS 1.2 (C / S) |
   |---|---|---|---|
-  | Plain: `{RSA-2048, P-256, P-384, Ed25519, ML-DSA-65}` × `{x25519, P-256}` × three suites | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (RSA, P-256 and P-384 certificates: the 1.2 engines sign with RSA or ECDSA only) |
+  | Plain: `{RSA-2048, P-256, P-384, Ed25519, ML-DSA-65}` × `{x25519, P-256}` × three suites | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (Ed25519 under the `ECDHE_ECDSA` suites, RFC 8422; ML-DSA-65 ⏭ not specified for TLS 1.2) |
   | Plain, `P-384` / `P-521` key exchange | ✅ / ⏭ the example client can share X25519, P-256 or a hybrid first, not P-384 or P-521 (the `hrr` case steers there) | ✅ / ⏭ same | ✅ (P-384 certificate; with another certificate ⏭ RFC 8422 §5.1.1: the wolfSSL 1.2 server uses its certificate's curve and requires it in `supported_groups`) / ✅ |
   | Plain, `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` | ✅ / ✅ | ⏭ the stateless server validates the cookie on the first fragment, and a first ClientHello with a hybrid share (1216 to 1665 bytes) does not fit in one datagram (the `hrr` case carries it in CH2) / ✅ | ⏭ the 1.2 engines have no hybrid |
   | Resumption (PSK + DHE); 0-RTT accepted | ✅ / ✅ | ⏭ purecrypto's DTLS engines have no resumption | ⏭ |
@@ -595,7 +600,8 @@ update with the commands in `tools/wycheproof/README.md`.
   | Handshake over a path dropping 20 % of datagrams | — | ✅ / ✅ (large chain) | ✅ / ✅ |
   | The last flight of the handshake lost (`loss-final`) | — | ✅ / ✅ (large chain) | ✅ / ✅ |
   | RFC 9146 connection IDs (`--cid` on the example tools; each side receives under its own CID, both report the other's) | — | ✅ / ✅ (RFC 9147 §9 unified-header C bit) | ✅ / ✅ (`tls12_cid` records, the §5.3 additional data) |
-  | TLS 1.2 fallback (peer is 1.2-only) | ✅ / ✅ | — | — |
+  | TLS 1.2 fallback (peer is 1.2-only), P-256 and Ed25519 server identity | ✅ / ✅ | — | — |
+  | TLS 1.2 mTLS, Ed25519 client identity | ✅ / ✅ | — | — |
   | `close_notify` from the peer | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 
   Four bugs fell to this peer, all invisible to loopback because both

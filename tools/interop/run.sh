@@ -167,7 +167,12 @@ matrix() {
                 large-chain)
                     echo "proto=tls13 role=$role cert=large group=x25519 suite=aes128gcm feat=large-chain" ;;
                 tls12)
-                    echo "proto=tls12 role=$role cert=p256 group=x25519 suite=aes128gcm feat=tls12" ;;
+                    echo "proto=tls12 role=$role cert=p256 group=x25519 suite=aes128gcm feat=tls12"
+                    # RFC 8422: an EdDSA certificate under the ECDHE_ECDSA
+                    # suites — as the server identity, and as the client
+                    # identity under mTLS (the server's `ecdsa_sign` type).
+                    echo "proto=tls12 role=$role cert=ed25519 group=x25519 suite=aes128gcm feat=tls12"
+                    echo "proto=tls12 role=$role cert=ed25519 group=x25519 suite=aes128gcm feat=mtls" ;;
                 *)
                     echo "proto=tls13 role=$role cert=p256 group=x25519 suite=aes128gcm feat=$feat" ;;
             esac
@@ -389,6 +394,16 @@ pc_suite12() {
         chacha20) echo "TLS_ECDHE_${kx}_WITH_CHACHA20_POLY1305_SHA256" ;;
     esac
 }
+# The IANA name of the (D)TLS 1.2 signature scheme a peer signs with under
+# the case's key kind, as `peer signature:` prints it. RSA and P-384 are
+# left out: peers differ there (RSA-PSS or PKCS#1 v1.5, by digest; RFC
+# 5246 §7.4.1.4.1 lets a P-384 key sign with SHA-256, as wolfSSL does).
+pc_scheme12() {
+    case $1 in
+        p256) echo ecdsa_secp256r1_sha256 ;;
+        ed25519) echo ed25519 ;;
+    esac
+}
 is_dtls() { case $CASE_PROTO in dtls*) return 0 ;; esac; return 1; }
 # The s_client / s_server version flag for a DTLS case.
 pc_dtls_flag() {
@@ -429,7 +444,7 @@ pc_supports() {
                     skip "purecrypto's DTLS 1.2 engines have no ML-KEM hybrid" ;;
             esac
             case $CASE_CERT in
-                ed25519|mldsa65) skip "purecrypto's (D)TLS 1.2 engines sign with RSA or ECDSA only" ;;
+                mldsa65) skip "ML-DSA is not specified for TLS 1.2" ;;
             esac
         fi
     fi
@@ -557,6 +572,16 @@ pc_verify() {
         else
             expect "$f" "handshake complete: TLSv1.2" || ok=1
         fi
+        # The peer's handshake signature was made under the case's key kind
+        # (RFC 8422 §5.9: an Ed25519 key signs `ed25519` and nothing else):
+        # the server's ServerKeyExchange on the purecrypto client, the
+        # client's CertificateVerify on the purecrypto server under mTLS.
+        if [ "$CASE_ROLE" = peer-server ] || [ "$CASE_FEAT" = mtls ]; then
+            expect "$f" "peer signature: $(pc_scheme12 "$CASE_CERT")" || ok=1
+        fi
+        if [ "$CASE_FEAT" = mtls ] && [ "$CASE_ROLE" = peer-client ]; then
+            expect "$f" "peer certificate: X.509" || ok=1
+        fi
         if ! has_quirk no-close-notify; then
             expect "$f" "close_notify: received" || ok=1
         fi
@@ -671,6 +696,10 @@ pc_verify_dtls() {
     fi
     expect "$f" "cipher suite: $suite" || ok=1
     expect "$f" "key exchange: $(pc_group "$CASE_GROUP")" || ok=1
+    if [ "$CASE_PROTO" = dtls12 ] && [ "$CASE_ROLE" = peer-server ] &&
+        [ -n "$(pc_scheme12 "$CASE_CERT")" ]; then
+        expect "$f" "peer signature: $(pc_scheme12 "$CASE_CERT")" || ok=1
+    fi
     case $CASE_FEAT in
         hrr) expect "$f" "HelloRetryRequest: yes" || ok=1 ;;
     esac
