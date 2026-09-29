@@ -253,8 +253,20 @@ wolf_cid() {
 # client exits with no close_notify at all when the echo arrived first
 # (see `cmd_quirks`). Nor under `loss`, where the close_notify may be the
 # dropped datagram.
+#
+# Over TCP the same second message makes `-w` hang the client whenever
+# the echo server reads it on its own: `s_server` echoes it, the client's
+# first bidirectional `wolfSSL_shutdown` decrypts that echo, and every
+# later call returns WOLFSSL_SHUTDOWN_NOT_DONE on "Pending application
+# data" without reading — while the socket, holding our close_notify and
+# FIN, stays readable, so the `-w` loop spins until the timeout. When the
+# message and the client's close_notify arrive together the server has
+# already closed and there is no echo, so the case only flaked (on a
+# loaded runner). Without `-w` the client still sends its close_notify
+# first thing in `wolfSSL_shutdown` (verified on our side, no quirk); only
+# its own check that ours arrived is lost, in this one case.
 client_shutdown_opt() {
-    if is_dtls && { [ "$CASE_FEAT" = keyupdate-peer ] || [ "$CASE_FEAT" = loss ]; }; then
+    if [ "$CASE_FEAT" = keyupdate-peer ] || { is_dtls && [ "$CASE_FEAT" = loss ]; }; then
         echo ""
     else
         echo "-w"

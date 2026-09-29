@@ -593,7 +593,7 @@ update with the commands in `tools/wycheproof/README.md`.
   | HelloRetryRequest to every group (`x25519`, `P-256`, `P-384`, `P-521`, the three hybrids) | ✅ / ✅ | ✅ / ✅ (a hybrid arrives in a fragmented CH2 with the cookie first) | — (no HRR in 1.2) |
   | mTLS, client certificate of every kind | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ (RSA, P-256, P-384: the 1.2 engines sign with RSA or ECDSA only; C with P-384 ⏭ RFC 8422 §5.1.1 as in the plain case) |
   | KeyUpdate from purecrypto, peer replies | ✅ / ✅ | ✅ / ✅ | — |
-  | KeyUpdate from the peer, purecrypto replies | ✅ / ✅ | ✅ / ✅ (the example client's `-I` writes a message it never reads back, and `wolfSSL_shutdown` sends no close_notify while that echo is pending, so the peer's close_notify is not demanded in that one case) | — |
+  | KeyUpdate from the peer, purecrypto replies | ✅ / ✅ (the example client's `-I` second message: see below) | ✅ / ✅ (the example client's `-I` writes a message it never reads back, and `wolfSSL_shutdown` sends no close_notify while that echo is pending, so the peer's close_notify is not demanded in that one case) | — |
   | RFC 8879 certificate compression (either certificate); RFC 8449 `record_size_limit` | ⏭ not implemented by wolfSSL | — | — |
   | RFC 7250 raw public key, server identity | ⏭ the example server has no RPK option / ✅ | — | — |
   | RFC 7250 raw public key, client identity | ⏭ the client's `--rpk` offers raw keys for both directions with no X.509 fallback | — | — |
@@ -660,6 +660,23 @@ update with the commands in `tools/wycheproof/README.md`.
   close_notify, and the two commands drive the connection until the
   handshake is over on both sides. The `loss-final` cases lose exactly
   those datagrams, deterministically.
+
+  One flake was the example client's own: TLS 1.3 `keyupdate-peer` with
+  purecrypto as the server hung the client now and then on the Linux
+  runners, never on macOS (`peer client exited 124`, the server's report complete: `KeyUpdate:
+  sent 1, received 1`, `close_notify: received`). After its KeyUpdate and
+  one echoed message, `-I` writes a second message it never reads, then
+  sends its close_notify. When `s_server` reads that message on its own it
+  echoes it; the client's `-w` bidirectional shutdown decrypts the echo,
+  and from then on `wolfSSL_shutdown` answers "Pending application data,
+  read it before shutdown" without reading, while the socket (our
+  close_notify and FIN) stays readable — a busy loop, 1.3 million calls
+  in 8 s under the debug build. When the message and the close_notify
+  arrive together, `s_server` has closed and does not echo, so the test
+  passed. A TCP relay that forwards the client's records 50 ms apart
+  reproduces it every time. That case now runs the client without `-w`:
+  it still sends its close_notify, which `s_server` must report, and
+  only the client's own check for ours is dropped.
 - **quic-go and OpenSSL, QUIC v1 + v2** (CI job `interop-quic.yml`, script
   `tools/quic-interop/run.sh`): the purecrypto CLI (`q_client` /
   `q_server`) against a small quic-go client and server
