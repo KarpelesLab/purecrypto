@@ -188,11 +188,23 @@ impl Ticket12Plaintext {
 /// `key` well before 2^32 tickets have been sealed under it (NIST SP
 /// 800-38D §8.3).
 pub(crate) fn seal_ticket<R: RngCore>(rng: &mut R, key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
+    seal_ticket_with_aad(rng, key, TICKET12_AAD, plain)
+}
+
+/// [`seal_ticket`] under an explicit associated-data string: the DTLS 1.2
+/// server seals the same plaintext layout under its own AAD, so a DTLS
+/// ticket never opens at a TLS listener sharing the key, nor the reverse.
+pub(crate) fn seal_ticket_with_aad<R: RngCore>(
+    rng: &mut R,
+    key: &[u8; 32],
+    aad: &[u8],
+    plain: &[u8],
+) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut nonce);
     let gcm = Gcm::new(Aes256::new(key));
     let mut buf = plain.to_vec();
-    let tag = gcm.encrypt(&nonce, TICKET12_AAD, &mut buf);
+    let tag = gcm.encrypt(&nonce, aad, &mut buf);
     let mut ticket = Vec::with_capacity(NONCE_LEN + buf.len() + TAG_LEN);
     ticket.extend_from_slice(&nonce);
     ticket.extend_from_slice(&buf);
@@ -203,6 +215,12 @@ pub(crate) fn seal_ticket<R: RngCore>(rng: &mut R, key: &[u8; 32], plain: &[u8])
 /// Decrypts a ticket sealed by `seal_ticket`. Returns `None` on any
 /// structural / AEAD failure — callers fall back to a fresh full handshake.
 pub(crate) fn open_ticket(key: &[u8; 32], ticket: &[u8]) -> Option<Vec<u8>> {
+    open_ticket_with_aad(key, TICKET12_AAD, ticket)
+}
+
+/// [`open_ticket`] under an explicit associated-data string (see
+/// [`seal_ticket_with_aad`]).
+pub(crate) fn open_ticket_with_aad(key: &[u8; 32], aad: &[u8], ticket: &[u8]) -> Option<Vec<u8>> {
     if ticket.len() < NONCE_LEN + TAG_LEN {
         return None;
     }
@@ -212,7 +230,7 @@ pub(crate) fn open_ticket(key: &[u8; 32], ticket: &[u8]) -> Option<Vec<u8>> {
     let tag: &[u8; TAG_LEN] = tag_slice.try_into().ok()?;
     let mut buf = ct.to_vec();
     let gcm = Gcm::new(Aes256::new(key));
-    gcm.decrypt(nonce, TICKET12_AAD, &mut buf, tag).ok()?;
+    gcm.decrypt(nonce, aad, &mut buf, tag).ok()?;
     Some(buf)
 }
 

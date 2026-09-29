@@ -1,14 +1,18 @@
-//! Session tickets and PSK resumption for the DTLS 1.3 engine.
+//! Session tickets and PSK resumption, shared by the DTLS engines.
 //!
-//! The DTLS 1.3 engine reuses the TLS 1.3 server's RFC 8446 §4.6.1 ticket
-//! plaintext ([`TicketPlaintext`](crate::tls::conn::TicketPlaintext)) but
-//! seals it under its own associated data ([`TICKET_DTLS13_AAD`]) and
-//! derives the PSK and its binder under the `"dtls13"` label prefix (RFC
-//! 9147 §5.9). A ticket is therefore single-protocol: one minted by a TLS
-//! listener never opens at a DTLS listener sharing `Config::ticket_key`,
-//! nor the reverse. On the client the same separation is enforced by the
-//! [`ResumptionSession`] variant the session was captured into. (DTLS 1.2
-//! RFC 5077 ticket resumption is deferred to a later change.)
+//! The DTLS engines reuse the TLS ticket *formats* — the RFC 8446 §4.6.1
+//! plaintext of the TLS 1.3 server
+//! ([`TicketPlaintext`](crate::tls::conn::TicketPlaintext)) and the RFC 5077
+//! plaintext of the TLS 1.2 server
+//! ([`Ticket12Plaintext`](crate::tls::conn::Ticket12Plaintext)) — but seal
+//! them under their own associated data ([`TICKET_DTLS13_AAD`],
+//! [`TICKET_DTLS12_AAD`]) and, for DTLS 1.3, derive the PSK and its binder
+//! under the `"dtls13"` label prefix (RFC 9147 §5.9). A ticket is therefore
+//! single-protocol: one minted by a TLS listener never opens at a DTLS
+//! listener sharing `Config::ticket_key`, nor the reverse, and a DTLS 1.3
+//! ticket never opens at a DTLS 1.2 listener. On the client the same
+//! separation is enforced by the [`ResumptionSession`] variant the session
+//! was captured into.
 //!
 //! [`ResumptionSession`]: crate::tls::ResumptionSession
 //!
@@ -43,6 +47,10 @@ use crate::ct::ConstantTimeEq;
 /// Associated data every DTLS 1.3 ticket is sealed under (see the module
 /// docs; the TLS 1.3 counterpart is `server::TICKET13_AAD`).
 pub(crate) const TICKET_DTLS13_AAD: &[u8] = b"purecrypto dtls13 ticket v1";
+/// Associated data every DTLS 1.2 (RFC 5077) ticket is sealed under — the
+/// TLS 1.2 ticket plaintext, domain-separated from TLS 1.2's own AAD and
+/// from DTLS 1.3's.
+pub(crate) const TICKET_DTLS12_AAD: &[u8] = b"purecrypto dtls12 ticket v1";
 
 /// Upper bound on a ticket the DTLS clients keep for resumption. The ticket
 /// is re-presented verbatim in a later ClientHello, which the server must

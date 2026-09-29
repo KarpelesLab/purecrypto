@@ -20,12 +20,20 @@
 //!   `CertificateVerify` (RFC 5246 §7.4.6 / §7.4.8), signed in-process —
 //!   an external key is refused at construction, as on TLS 1.2
 //!
+//! RFC 5077 session tickets: the client always sends the `session_ticket`
+//! extension — empty to ask for a ticket, or carrying a stored session's
+//! ticket with a fresh random session ID to resume it. A server that
+//! accepts echoes that session ID and answers with the abbreviated flight
+//! (ServerHello, optionally NewSessionTicket, ChangeCipherSpec, Finished); the
+//! client's ChangeCipherSpec + Finished is then the final flight of the
+//! handshake, kept and re-sent when the server retransmits its Finished
+//! (RFC 6347 §4.2.4, figure 2). A `NewSessionTicket` is only accepted in
+//! its RFC 5077 §3.3 slot, right before the server's ChangeCipherSpec, and
+//! the session built from it is only released once the server's Finished
+//! — which covers it — has verified.
+//!
 //! Post-handshake handshake messages are fatal (`UnexpectedMessage`), as
-//! they are in the TLS 1.2 engine: DTLS 1.2 has no KeyUpdate, and this
-//! client never offers the `session_ticket` extension, so a server that
-//! sends `NewSessionTicket` — at any point, including its RFC 5077 slot
-//! before `Finished` — violates RFC 5077 §3.3 ("the server MUST NOT send
-//! a NewSessionTicket unless the client sent the extension").
+//! they are in the TLS 1.2 engine: DTLS 1.2 has no KeyUpdate.
 //! Renegotiation (`HelloRequest`) is likewise unsupported.
 //!
 //! The state machine intentionally re-implements the TLS 1.2 client logic
@@ -40,13 +48,15 @@ use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::handshake12::{
-    CertificateRequest12, ClientKeyExchange, ServerKeyExchange, signed_message,
+    CertificateRequest12, ClientKeyExchange, NewSessionTicket12, ServerKeyExchange, signed_message,
 };
 use crate::tls::codec::{
     CipherSuite, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme, hs_type,
     with_len_u8, with_len_u16, with_len_u24,
 };
-use crate::tls::conn::{ClientCertConfig, SUITES_12, SuiteParams12, lookup_suite_12};
+use crate::tls::conn::{
+    ClientCertConfig, SUITES_12, StoredSession12, SuiteParams12, lookup_suite_12,
+};
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, master_secret, tls12_exporter,
@@ -69,6 +79,12 @@ use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, FlightRecord, Retransmit};
 use super::replay::AntiReplayWindow;
 use super::system_now;
+use super::ticket::MAX_DTLS_SESSION_TICKET_LEN;
+
+/// Cap on re-sends of the resumed handshake's final flight (our CCS +
+/// Finished) in answer to a retransmitted server Finished (RFC 6347
+/// §4.2.4), bounding what a replayed record can make us send.
+const MAX_FINAL_FLIGHT_RESENDS: u32 = 6;
 
 #[allow(unused_imports)]
 use crate::ct::ConstantTimeEq;
@@ -138,6 +154,14 @@ pub(crate) struct ClientConfig12Internal {
     /// then aborts the handshake. Forwarded from
     /// [`crate::tls::Config::identity`].
     pub client_cert: Option<ClientCertConfig>,
+    /// A session captured off a previous DTLS 1.2 connection
+    /// ([`DtlsClientConnection12::take_session`]) to resume by RFC 5077
+    /// ticket. Dropped (full handshake) unless issued by this `server_name`
+    /// under a verification context at least as strict, unexpired, and
+    /// small enough to fit a ClientHello. A TLS or DTLS 1.3 session never
+    /// reaches this field: the protocol is bound into
+    /// [`crate::tls::ResumptionSession`].
+    pub session: Option<StoredSession12>,
 }
 
 impl ClientConfig12Internal {
@@ -158,6 +182,7 @@ impl ClientConfig12Internal {
             groups: crate::tls::conn::GROUPS_12.to_vec(),
             connection_id: None,
             client_cert: None,
+            session: None,
         }
     }
 
@@ -338,6 +363,23 @@ pub struct DtlsClientConnection12 {
     /// flight then opens with a `Certificate`, and our `CertificateVerify`
     /// scheme is chosen from this list (§7.4.8).
     cert_request: Option<Vec<SignatureScheme>>,
+    /// RFC 5077 §3.4: the session ID sent alongside a stored ticket; a
+    /// server that resumes echoes it. `None` when no ticket is offered.
+    resume_session_id: Option<Vec<u8>>,
+    /// The handshake resumed the stored session (abbreviated flights).
+    resumed: bool,
+    /// The ticket (and lifetime hint) of the server's NewSessionTicket,
+    /// held until its Finished verifies (see [`Self::take_session`]).
+    received_ticket: Option<(Vec<u8>, u32)>,
+    /// On a resumed handshake, our final flight (CCS + Finished), kept to
+    /// re-send while the server retransmits its Finished (RFC 6347
+    /// §4.2.4); released at the first authenticated record that shows the
+    /// server holds it (application data or an alert).
+    final_flight: Option<Flight>,
+    final_flight_resends: u32,
+    /// The server Finished `verify_data` of a resumed handshake, to
+    /// recognise its retransmission.
+    server_finished: Option<[u8; 12]>,
 }
 
 // The DTLS 1.2 master secret lives for the whole connection (exporters,
@@ -366,6 +408,28 @@ impl DtlsClientConnection12 {
         let p521 = BoxedEcdhPrivateKey::generate(CurveId::P521, rng);
         let mut client_random: Random = [0u8; 32];
         rng.fill_bytes(&mut client_random);
+
+        // RFC 5077 / RFC 5246 §7.4.1.2 scoping: an abbreviated handshake
+        // carries no certificate, so a stored session is only offered to
+        // the name that authenticated it, under a verification context at
+        // least as strict, before it expires — and only when its ticket
+        // fits a ClientHello the server can reassemble before it holds any
+        // state.
+        let mut config = config;
+        let now = config.verification_time.clone().or_else(system_now);
+        if config.session.as_ref().is_some_and(|s| {
+            s.ticket.len() > MAX_DTLS_SESSION_TICKET_LEN
+                || !s.usable_for(&config.server_name, config.verify_certificates, now.clone())
+        }) {
+            config.session = None;
+        }
+        // RFC 5077 §3.4: a ticket goes with a fresh random session ID, whose
+        // echo tells us the server resumed.
+        let resume_session_id = config.session.as_ref().map(|_| {
+            let mut sid = alloc::vec![0u8; 32];
+            rng.fill_bytes(&mut sid);
+            sid
+        });
 
         let mut conn = DtlsClientConnection12 {
             config,
@@ -408,6 +472,12 @@ impl DtlsClientConnection12 {
             alpn_negotiated: None,
             cid: None,
             cert_request: None,
+            resume_session_id,
+            resumed: false,
+            received_ticket: None,
+            final_flight: None,
+            final_flight_resends: 0,
+            server_finished: None,
         };
         // We don't include the first CH in the transcript: per RFC 6347 §4.2.1,
         // "the initial ClientHello and HelloVerifyRequest are not included in
@@ -451,6 +521,36 @@ impl DtlsClientConnection12 {
         self.peer_signature_scheme.map(|s| s.0)
     }
 
+    /// `true` when the handshake resumed a stored session (RFC 5077 §3.4).
+    pub fn did_resume(&self) -> bool {
+        self.resumed
+    }
+
+    /// Moves out the session built from the server's NewSessionTicket, for
+    /// RFC 5077 resumption on a later connection to the same server. Only
+    /// after the handshake completed: the ticket arrives before the
+    /// server's Finished, which is what authenticates it, so a ticket an
+    /// attacker slipped in is never handed out. `None` when the server
+    /// issued none.
+    pub fn take_session(&mut self) -> Option<StoredSession12> {
+        if self.state != State::Connected {
+            return None;
+        }
+        let (ticket, lifetime_seconds) = self.received_ticket.take()?;
+        let suite = self.suite?;
+        Some(StoredSession12 {
+            ticket,
+            master_secret: self.master?,
+            cipher_suite: suite.suite.0,
+            alpn: self.alpn_negotiated.clone(),
+            received_at: self.config.verification_time.clone().or_else(system_now),
+            ems_used: self.ems_negotiated,
+            server_name: self.config.server_name.clone(),
+            verify_certificates: self.config.verify_certificates,
+            lifetime_seconds,
+        })
+    }
+
     /// RFC 5705 §4 — DTLS 1.2 application-layer Exporter. Computes
     /// `PRF(master_secret, label, client_random ‖ server_random
     /// [‖ uint16(len(context)) ‖ context])`, matching TLS 1.2's exporter
@@ -486,13 +586,20 @@ impl DtlsClientConnection12 {
     }
 
     /// `true` while a flight this side sent awaits the server's answer
-    /// (RFC 6347 §4.2.4). A DTLS 1.2 client completes its handshake on the
-    /// server's Finished, which answers its own final flight, so this is
-    /// `false` from [`Self::is_handshake_complete`] on: nothing is left to
-    /// retransmit, and the connection may be closed at once.
+    /// (RFC 6347 §4.2.4). After a full handshake the client completes on
+    /// the server's Finished, which answers its own final flight, so this
+    /// is `false` from [`Self::is_handshake_complete`] on: nothing is left
+    /// to retransmit, and the connection may be closed at once.
+    ///
+    /// On a resumed handshake the client's CCS + Finished is the final
+    /// flight instead (RFC 6347 §4.2.4, figure 2): this stays `true` until
+    /// the server shows it holds it — its first application data or alert
+    /// — so the caller keeps answering its retransmitted Finished.
     pub fn handshake_flight_pending(&self) -> bool {
         // (A closed connection waits for nothing.)
-        self.state != State::Closed && self.retransmit.next_timeout().is_some()
+        self.state != State::Closed
+            && (self.retransmit.next_timeout().is_some()
+                || (self.state == State::Connected && self.final_flight.is_some()))
     }
 
     /// Advances the connection's monotonic clock to `now` (the same clock
@@ -854,6 +961,9 @@ impl DtlsClientConnection12 {
             ContentType::Handshake => self.process_handshake_record(&plain, true),
             ContentType::ApplicationData => match self.state {
                 State::Connected => {
+                    // The server sends application data only once it
+                    // holds our Finished.
+                    self.final_flight = None;
                     self.app_in.extend_from_slice(&plain);
                     Ok(())
                 }
@@ -877,6 +987,7 @@ impl DtlsClientConnection12 {
                 }
                 let desc = AlertDescription::from_u8(plain[1]);
                 self.state = State::Closed;
+                self.final_flight = None;
                 if desc == AlertDescription::CloseNotify {
                     self.close_notify_received = true;
                     Ok(())
@@ -949,6 +1060,13 @@ impl DtlsClientConnection12 {
                         return Ok(());
                     }
                 }
+                off += consumed;
+                continue;
+            }
+            if self.state == State::Connected
+                && authenticated
+                && self.on_retransmitted_server_finished(&frag)
+            {
                 off += consumed;
                 continue;
             }
@@ -1029,6 +1147,8 @@ impl DtlsClientConnection12 {
     /// dropped silently; from `WaitServerFinished` on, the peer's messages
     /// are AEAD-protected and every fault is a genuine peer fault.
     fn plaintext_flight_state(&self) -> bool {
+        // In `WaitServerFinished` the Finished itself is authenticated, but
+        // the RFC 5077 NewSessionTicket before it travels in plaintext.
         matches!(
             self.state,
             State::WaitServerHelloOrHvr
@@ -1036,7 +1156,43 @@ impl DtlsClientConnection12 {
                 | State::WaitCertificate
                 | State::WaitServerKeyExchange
                 | State::WaitServerHelloDone
+                | State::WaitServerFinished
         )
+    }
+
+    /// Recognises a retransmitted server Finished of a resumed handshake —
+    /// the server did not get our final flight — and re-sends that flight
+    /// (RFC 6347 §4.2.4), boundedly. `true` when the fragment was consumed.
+    fn on_retransmitted_server_finished(&mut self, frag: &HandshakeFragment<'_>) -> bool {
+        if frag.msg_type != hs_type::FINISHED
+            || frag.fragment_offset != 0
+            || frag.total_length != 12
+            || frag.fragment.len() != 12
+        {
+            return false;
+        }
+        let Some(expected) = self.server_finished.as_ref() else {
+            return false;
+        };
+        if !bool::from(expected.as_slice().ct_eq(frag.fragment)) {
+            return false;
+        }
+        if self.final_flight_resends >= MAX_FINAL_FLIGHT_RESENDS {
+            self.final_flight = None;
+            return true;
+        }
+        if let Some(flight) = self.final_flight.take() {
+            // Fresh sequence numbers (see `encode_flight_record`); the CCS
+            // stays epoch 0, the Finished epoch 1.
+            for rec in &flight.records {
+                if let Ok(dg) = self.encode_flight_record(rec) {
+                    self.out_dgrams.push(dg);
+                }
+            }
+            self.final_flight = Some(flight);
+            self.final_flight_resends += 1;
+        }
+        true
     }
 
     /// Dispatches one reassembled handshake message. `message_seq` is the
@@ -1055,6 +1211,17 @@ impl DtlsClientConnection12 {
             State::WaitCertificate => self.on_certificate(msg_type, body, raw),
             State::WaitServerKeyExchange => self.on_server_key_exchange(msg_type, body, raw),
             State::WaitServerHelloDone => self.on_server_hello_done(msg_type, body, raw),
+            // RFC 5077 §3.3: the NewSessionTicket precedes the server's CCS
+            // (epoch 0); the Finished follows it (epoch 1). Once the CCS is
+            // in, epoch-0 records are dropped, so `ccs_received` tells the
+            // two apart and neither is accepted on the wrong side of it.
+            State::WaitServerFinished if msg_type == hs_type::NEW_SESSION_TICKET => {
+                if self.ccs_received {
+                    return Err(Error::UnexpectedMessage);
+                }
+                self.on_new_session_ticket(body, raw)
+            }
+            State::WaitServerFinished if !self.ccs_received => Err(Error::UnexpectedMessage),
             State::WaitServerFinished => self.on_server_finished(msg_type, body, raw),
             State::Connected | State::Closed => Err(Error::UnexpectedMessage),
         }
@@ -1140,12 +1307,11 @@ impl DtlsClientConnection12 {
             return Err(Error::UnexpectedMessage);
         }
         let sh = ServerHello::decode_dtls(body)?;
-        // RFC 5246 §7.4.1.3: `SessionID<0..32>`. This client never offers a
-        // session ticket or a session id, so it never resumes and the echo
-        // rule of RFC 5077 §3.4 does not apply: a non-empty id is simply a
-        // server-assigned one we will never present again. An oversized id
-        // is a protocol violation, though, and is refused like the TLS 1.2
-        // client refuses it.
+        // RFC 5246 §7.4.1.3: `SessionID<0..32>`. Outside the RFC 5077 §3.4
+        // echo of our resumption id (below), a non-empty id is simply a
+        // server-assigned one we never present again: this client resumes
+        // by ticket only. An oversized id is a protocol violation, though,
+        // and is refused like the TLS 1.2 client refuses it.
         if sh.session_id.len() > 32 {
             return Err(Error::IllegalParameter);
         }
@@ -1204,12 +1370,76 @@ impl DtlsClientConnection12 {
             ),
         )?
         .map(|(local, peer)| CidState::negotiated(local, peer, Vec::new()));
+        // RFC 5077 §3.4: a server that accepts our ticket echoes the session
+        // ID we sent with it; comparing against what we generated (never
+        // an empty id) keeps a server from claiming a resumption we never
+        // offered.
+        let server_resumed = self
+            .resume_session_id
+            .as_deref()
+            .is_some_and(|sid| !sh.session_id.is_empty() && sh.session_id == sid);
+        if server_resumed {
+            let stored = self
+                .config
+                .session
+                .as_ref()
+                .ok_or(Error::IllegalParameter)?;
+            // RFC 5246 §7.4.1.3: a resumed session keeps its cipher suite.
+            if stored.cipher_suite != sh.cipher_suite.0 {
+                return Err(Error::IllegalParameter);
+            }
+            // RFC 7627 §5.3: EMS status must match the original session.
+            if stored.ems_used != self.ems_negotiated {
+                return Err(Error::IllegalParameter);
+            }
+            let master = stored.master_secret;
+            let cr = self.client_random;
+            let sr = sh.random;
+            if let Some(kl) = self.config.key_log.as_ref() {
+                kl.log("CLIENT_RANDOM", &cr, &master);
+            }
+            let (write_crypter, read_crypter) = RecordCrypter12::derive_pair(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &master,
+                &sr,
+                &cr,
+            );
+            self.master = Some(master);
+            // The read keys are needed for the server's CCS; ours are only
+            // used once we send our own CCS (write_epoch stays 0 till then).
+            self.read_crypter = Some(read_crypter);
+            self.write_crypter = Some(write_crypter);
+            self.resumed = true;
+        }
         self.server_random = Some(sh.random);
         self.transcript.update(raw);
-        self.state = State::WaitCertificate;
+        self.state = if server_resumed {
+            State::WaitServerFinished
+        } else {
+            State::WaitCertificate
+        };
         // We've received the first real flight from the server; cancel the
         // retransmit timer for our CH-with-cookie.
         self.retransmit.on_peer_response();
+        Ok(())
+    }
+
+    /// RFC 5077 §3.3: the NewSessionTicket right before the server's CCS.
+    /// It is a handshake message covered by the server's Finished, so it
+    /// joins the transcript; the ticket is held until that Finished has
+    /// verified (see [`Self::take_session`]). A ticket too large to fit a
+    /// later ClientHello is kept out of the session but still hashed.
+    fn on_new_session_ticket(&mut self, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        if self.received_ticket.is_some() {
+            return Err(Error::UnexpectedMessage);
+        }
+        let nst = NewSessionTicket12::decode(body)?;
+        self.transcript.update(raw);
+        if !nst.ticket.is_empty() && nst.ticket.len() <= MAX_DTLS_SESSION_TICKET_LEN {
+            self.received_ticket = Some((nst.ticket, nst.lifetime));
+        }
         Ok(())
     }
 
@@ -1546,6 +1776,44 @@ impl DtlsClientConnection12 {
         }
         self.transcript.update(raw);
         self.retransmit.on_peer_response();
+        if self.resumed {
+            // RFC 5077 §3.4 / RFC 6347 §4.2.4 (figure 2): on a resumed
+            // handshake our CCS + Finished follow the server's Finished and
+            // are the final flight — sent once and kept, not timer-driven,
+            // re-sent when the server retransmits its Finished.
+            let mut sf = [0u8; 12];
+            sf.copy_from_slice(body);
+            self.server_finished = Some(sf);
+            let mut flight = Flight::new();
+            flight.push_record(ContentType::ChangeCipherSpec, 0, alloc::vec![0x01]);
+            self.write_epoch = 1;
+            self.write_seq_in_epoch = 0;
+            let th = self.transcript.current_hash();
+            let verify_data =
+                finished_verify_data(suite.hash, &master, b"client finished", th.as_slice());
+            let fin_body: Vec<u8> = verify_data.to_vec();
+            let fin_msg_seq = self.out_msg_seq;
+            self.out_msg_seq += 1;
+            self.transcript.update(&transcript_message(
+                hs_type::FINISHED,
+                fin_msg_seq,
+                &fin_body,
+            ));
+            for frag in write_fragments(
+                hs_type::FINISHED,
+                fin_msg_seq,
+                &fin_body,
+                DEFAULT_MAX_FRAGMENT,
+            ) {
+                flight.push_record(ContentType::Handshake, 1, frag);
+            }
+            for rec in &flight.records {
+                let dg = self.encode_flight_record(rec)?;
+                self.out_dgrams.push(dg);
+            }
+            self.final_flight = Some(flight);
+            self.final_flight_resends = 0;
+        }
         self.state = State::Connected;
         Ok(())
     }
@@ -1609,6 +1877,14 @@ impl DtlsClientConnection12 {
             // Always offer; the server echoes only when it also supports EMS.
             ext::extended_master_secret_empty(),
         ];
+        // RFC 5077 §3.1: always send `session_ticket` — empty to be issued
+        // a ticket, or a stored session's ticket to resume it.
+        extensions.push(ext::session_ticket(
+            self.config
+                .session
+                .as_ref()
+                .map_or(&[][..], |s| s.ticket.as_slice()),
+        ));
         // RFC 7301: offer ALPN protocols when configured.
         if !self.config.alpn_protocols.is_empty() {
             let protos: Vec<&[u8]> = self
@@ -1640,7 +1916,9 @@ impl DtlsClientConnection12 {
         let mut body = Vec::new();
         body.extend_from_slice(&0xfefd_u16.to_be_bytes());
         body.extend_from_slice(&self.client_random);
-        with_len_u8(&mut body, |b| b.extend_from_slice(&[]));
+        // RFC 5077 §3.4: the resumption session ID (empty otherwise).
+        let sid = self.resume_session_id.clone().unwrap_or_default();
+        with_len_u8(&mut body, |b| b.extend_from_slice(&sid));
         with_len_u8(&mut body, |b| b.extend_from_slice(&self.cookie));
         with_len_u16(&mut body, |b| {
             for cs in &suites {

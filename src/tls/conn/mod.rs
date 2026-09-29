@@ -59,6 +59,8 @@ pub(crate) use common::check_raw_public_key;
 #[cfg(feature = "dtls")]
 #[allow(unused_imports)]
 pub(crate) use server::{ClientAuthPolicy, TicketPlaintext, open_ticket13, seal_ticket13};
+#[cfg(feature = "dtls")]
+pub(crate) use ticket12::{Ticket12Plaintext, open_ticket_with_aad, seal_ticket_with_aad};
 
 // Fuzz-only re-exports of crate-private decoders; see `tls::fuzz`.
 #[cfg(feature = "__fuzz")]

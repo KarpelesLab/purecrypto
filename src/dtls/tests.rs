@@ -980,7 +980,7 @@ fn oversized_client_hello_session_id_is_dropped_12() {
 
 /// RFC 5246 §7.4.1.3: the DTLS 1.2 client ignored the ServerHello's
 /// `session_id` entirely. A server-assigned id of legal length is fine
-/// (this client never resumes, so nothing is echoed or compared), but an
+/// (no resumption was offered, so nothing is compared), but an
 /// oversized one is a protocol violation: dropped as spoofable epoch-0
 /// input, without derailing the genuine ServerHello that follows.
 #[test]
@@ -5801,5 +5801,441 @@ mod wolfssl_capture {
         expand_label_dyn(suite.hash, secret.as_slice(), b"sn", &[], &mut sn);
         wrong_sn.sn_key = Secret::new(&sn);
         assert!(open(&mut wrong_sn, &from_hex_vec(FINISHED_RECORD)).is_none());
+    }
+}
+
+/// DTLS 1.2 RFC 5077 session-ticket resumption (abbreviated handshake,
+/// RFC 6347 §4.2.4 figure 2) loopback tests.
+mod resume12 {
+    use super::*;
+    use crate::tls::conn::StoredSession12;
+
+    const TICKET_KEY: [u8; 32] = [0x7e; 32];
+
+    fn now() -> Time {
+        Time::utc(2026, 6, 1, 0, 0, 0)
+    }
+
+    fn server(cookie: bool, key: [u8; 32]) -> (Arc<PcServerConfig12>, Vec<u8>) {
+        let (cfg, cert) = make_server();
+        let mut cfg = cfg
+            .with_ticket_key(key)
+            .with_verification_time(now())
+            .require_cookie_exchange(cookie);
+        if cookie {
+            cfg = cfg.with_cookie_secret([0xa5; 32]);
+        }
+        (Arc::new(cfg), cert)
+    }
+
+    fn client_cfg(cert: &[u8]) -> PcClientConfig12 {
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.to_vec()).unwrap();
+        PcClientConfig12::new(roots, "dtls.example").with_verification_time(now())
+    }
+
+    fn client(
+        cert: &[u8],
+        session: Option<StoredSession12>,
+        seed: &[u8],
+    ) -> DtlsClientConnection12 {
+        let mut cfg = client_cfg(cert);
+        cfg.session = session;
+        let mut crng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+        DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng)
+    }
+
+    fn server_conn(
+        cfg: &Arc<PcServerConfig12>,
+        seed: &[u8],
+    ) -> DtlsServerConnection12<HmacDrbg<Sha256>> {
+        let srng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+        DtlsServerConnection12::new(cfg.clone(), b"client-addr".to_vec(), srng)
+    }
+
+    /// A full handshake under `cfg`, returning the session it issued.
+    fn first_session(cfg: &Arc<PcServerConfig12>, cert: &[u8]) -> StoredSession12 {
+        let mut c = client(cert, None, b"resume12-c1");
+        let mut s = server_conn(cfg, b"resume12-s1");
+        assert!(pump_handshake(&mut c, &mut s));
+        assert!(!c.did_resume() && !s.did_resume());
+        c.take_session().expect("the server issued a ticket")
+    }
+
+    fn app_round_trip<R: crate::rng::RngCore>(
+        c: &mut DtlsClientConnection12,
+        s: &mut DtlsServerConnection12<R>,
+    ) {
+        c.send(b"ping").unwrap();
+        for dg in c.pop_outbound_datagrams() {
+            s.feed_datagram(&dg).unwrap();
+        }
+        assert_eq!(s.take_received(), b"ping");
+        s.send(b"pong").unwrap();
+        for dg in s.pop_outbound_datagrams() {
+            c.feed_datagram(&dg).unwrap();
+        }
+        assert_eq!(c.take_received(), b"pong");
+    }
+
+    /// Runs the first three flights of a full handshake and returns the
+    /// server's final flight (NST, CCS, Finished) undelivered.
+    fn to_server_final_flight<R: crate::rng::RngCore>(
+        c: &mut DtlsClientConnection12,
+        s: &mut DtlsServerConnection12<R>,
+    ) -> Vec<Vec<u8>> {
+        for dg in c.pop_outbound_datagrams() {
+            s.feed_datagram(&dg).unwrap();
+        }
+        for dg in s.pop_outbound_datagrams() {
+            c.feed_datagram(&dg).unwrap();
+        }
+        for dg in c.pop_outbound_datagrams() {
+            s.feed_datagram(&dg).unwrap();
+        }
+        let fin = s.pop_outbound_datagrams();
+        assert_eq!(fin.len(), 3, "NST, CCS, Finished");
+        assert_eq!(fin[0][13], crate::tls::codec::hs_type::NEW_SESSION_TICKET);
+        assert_eq!(fin[1][0], 20);
+        fin
+    }
+
+    /// RFC 5077 §3.1/§3.4 with the RFC 6347 §4.2.1 cookie exchange still
+    /// applied: the resumed ClientHello is answered by a HelloVerifyRequest
+    /// first, then by the abbreviated flight, and both sides agree on keys.
+    #[test]
+    fn resumption_round_trip_with_cookie() {
+        let (cfg, cert) = server(true, TICKET_KEY);
+        let session = first_session(&cfg, &cert);
+        let mut c = client(&cert, Some(session), b"resume12-c2");
+        let mut s = server_conn(&cfg, b"resume12-s2");
+
+        for dg in c.pop_outbound_datagrams() {
+            s.feed_datagram(&dg).unwrap();
+        }
+        let hvr = s.pop_outbound_datagrams();
+        assert_eq!(hvr.len(), 1);
+        assert_eq!(
+            hvr[0][13], 3,
+            "the resumed ClientHello still gets a HelloVerifyRequest"
+        );
+        for dg in &hvr {
+            c.feed_datagram(dg).unwrap();
+        }
+        assert!(pump_handshake(&mut c, &mut s));
+        assert!(c.did_resume(), "client resumed");
+        assert!(s.did_resume(), "server resumed");
+        assert!(
+            c.peer_certificates().is_empty(),
+            "no Certificate on resumption"
+        );
+        app_round_trip(&mut c, &mut s);
+        // The resumed handshake issues no new ticket.
+        assert!(c.take_session().is_none());
+    }
+
+    /// The abbreviated handshake: SH, CCS, Finished from the server; CCS +
+    /// Finished from the client (RFC 5077 §3.1 figure 2).
+    #[test]
+    fn abbreviated_flight_shape() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let session = first_session(&cfg, &cert);
+        let mut c = client(&cert, Some(session), b"resume12-shape-c");
+        let mut s = server_conn(&cfg, b"resume12-shape-s");
+        for dg in c.pop_outbound_datagrams() {
+            s.feed_datagram(&dg).unwrap();
+        }
+        let flight = s.pop_outbound_datagrams();
+        assert_eq!(flight.len(), 3, "SH, CCS, Finished");
+        assert_eq!(flight[0][0], 22);
+        assert_eq!(flight[0][13], crate::tls::codec::hs_type::SERVER_HELLO);
+        assert_eq!(flight[1][0], 20, "ChangeCipherSpec");
+        assert_eq!(flight[2][0], 22);
+        assert_eq!(&flight[2][3..5], &[0, 1], "Finished at epoch 1");
+        for dg in &flight {
+            c.feed_datagram(dg).unwrap();
+        }
+        assert!(c.is_handshake_complete());
+        let fin = c.pop_outbound_datagrams();
+        assert_eq!(fin.len(), 2, "client CCS + Finished");
+        assert_eq!(fin[0][0], 20);
+        for dg in &fin {
+            s.feed_datagram(dg).unwrap();
+        }
+        assert!(s.is_handshake_complete() && s.did_resume());
+        app_round_trip(&mut c, &mut s);
+    }
+
+    /// RFC 6347 §4.2.4: the client's CCS + Finished is the resumed
+    /// handshake's final flight. When it is lost the server retransmits its
+    /// flight; the client, already Connected, answers the retransmitted
+    /// Finished by re-sending its final flight, and the server completes.
+    #[test]
+    fn lost_final_flight_is_resent_on_server_retransmit() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let session = first_session(&cfg, &cert);
+        let mut c = client(&cert, Some(session), b"resume12-rtx-c");
+        let mut s = server_conn(&cfg, b"resume12-rtx-s");
+        for dg in c.pop_outbound_datagrams() {
+            s.feed_datagram(&dg).unwrap();
+        }
+        for dg in s.pop_outbound_datagrams() {
+            c.feed_datagram(&dg).unwrap();
+        }
+        assert!(c.is_handshake_complete());
+        assert!(c.handshake_flight_pending(), "final flight kept");
+        // Lose the client's final flight.
+        assert_eq!(c.pop_outbound_datagrams().len(), 2);
+        assert!(!s.is_handshake_complete());
+        let t = s.next_timeout().expect("server retransmit armed");
+        s.on_timeout(t);
+        let rtx = s.pop_outbound_datagrams();
+        assert!(!rtx.is_empty(), "server retransmits its flight");
+        for dg in &rtx {
+            c.feed_datagram(dg).unwrap();
+        }
+        let again = c.pop_outbound_datagrams();
+        assert_eq!(again.len(), 2, "client re-sends CCS + Finished");
+        for dg in &again {
+            s.feed_datagram(dg).unwrap();
+        }
+        assert!(s.is_handshake_complete() && s.did_resume());
+        assert_eq!(s.next_timeout(), None);
+        // The server's first application data releases the kept flight.
+        app_round_trip(&mut c, &mut s);
+        assert!(!c.handshake_flight_pending());
+    }
+
+    /// A ticket sealed under another key does not open: the server runs a
+    /// full handshake (RFC 5077 §3.4) and issues a fresh ticket.
+    #[test]
+    fn unknown_ticket_key_falls_back_to_full_handshake() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let session = first_session(&cfg, &cert);
+        let (cfg_other, cert_other) = server(false, [0x11; 32]);
+        assert_eq!(cert, cert_other, "make_server is deterministic");
+        let mut c = client(&cert, Some(session), b"resume12-unk-c");
+        let mut s = server_conn(&cfg_other, b"resume12-unk-s");
+        assert!(pump_handshake(&mut c, &mut s));
+        assert!(!c.did_resume() && !s.did_resume());
+        assert!(!c.peer_certificates().is_empty());
+        assert!(c.take_session().is_some(), "a fresh ticket was issued");
+    }
+
+    /// A server without a ticket key neither issues nor accepts tickets.
+    #[test]
+    fn no_ticket_key_no_ticket() {
+        let (cfg, cert) = make_server();
+        let cfg = Arc::new(cfg.require_cookie_exchange(false));
+        let mut c = client(&cert, None, b"resume12-nokey-c");
+        let mut s = server_conn(&cfg, b"resume12-nokey-s");
+        assert!(pump_handshake(&mut c, &mut s));
+        assert!(c.take_session().is_none());
+    }
+
+    /// RFC 7627 §5.3 on the client: a server resuming a session under an
+    /// EMS status different from the original is refused.
+    #[test]
+    fn client_refuses_ems_status_change() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let mut session = first_session(&cfg, &cert);
+        assert!(session.ems_used);
+        // The server still resumes (its ticket says EMS); the client's copy
+        // claims the original session had none.
+        session.ems_used = false;
+        let mut c = client(&cert, Some(session), b"resume12-ems-c");
+        let mut s = server_conn(&cfg, b"resume12-ems-s");
+        for dg in c.pop_outbound_datagrams() {
+            s.feed_datagram(&dg).unwrap();
+        }
+        for dg in s.pop_outbound_datagrams() {
+            let _ = c.feed_datagram(&dg);
+        }
+        assert!(!c.is_handshake_complete());
+        assert!(!c.did_resume());
+        assert!(c.pop_outbound_datagrams().is_empty());
+    }
+
+    /// RFC 7627 §5.3 on the server: a session that used EMS is never
+    /// resumed by a ClientHello that no longer offers it.
+    #[test]
+    fn server_refuses_ems_downgrade_on_resumption() {
+        use crate::tls::codec::{ClientHello, ExtensionType};
+        let (cfg, cert) = make_server();
+        let cfg = Arc::new(
+            cfg.with_ticket_key(TICKET_KEY)
+                .with_verification_time(now())
+                .with_require_ems(false)
+                .require_cookie_exchange(false),
+        );
+        let session = first_session(&cfg, &cert);
+        assert!(session.ems_used);
+        let mut c = client(&cert, Some(session), b"resume12-emsdown-c");
+        let dgs = c.pop_outbound_datagrams();
+        assert_eq!(dgs.len(), 1);
+        let (mut ch, _) = ClientHello::decode_dtls(&dgs[0][13 + 12..]).unwrap();
+        let before = ch.extensions.len();
+        ch.extensions
+            .retain(|(t, _)| *t != ExtensionType::EXTENDED_MASTER_SECRET);
+        assert_eq!(ch.extensions.len(), before - 1);
+        let dg = client_hello_datagram(&ch);
+        let mut s = server_conn(&cfg, b"resume12-emsdown-s");
+        let _ = s.feed_datagram(&dg);
+        assert!(!s.did_resume());
+        let out = s.pop_outbound_datagrams();
+        assert!(
+            out.len() < 2 || out[1][0] != 20,
+            "no abbreviated flight for an EMS downgrade"
+        );
+    }
+
+    /// Re-frames `ch` as the one-record, message_seq 0 ClientHello datagram.
+    fn client_hello_datagram(ch: &crate::tls::codec::ClientHello) -> Vec<u8> {
+        use crate::dtls::reassembly::write_fragments;
+        use crate::tls::codec::hs_type;
+        let full = ch.encode_dtls(&[]);
+        let mut dg = Vec::new();
+        for frag in write_fragments(hs_type::CLIENT_HELLO, 0, &full[4..], 1100) {
+            crate::dtls::record::write_record(
+                &mut dg,
+                crate::tls::ContentType::Handshake,
+                crate::tls::ProtocolVersion::DTLSv1_2,
+                0,
+                0,
+                &frag,
+            )
+            .unwrap();
+        }
+        dg
+    }
+
+    /// RFC 5077 §3.4: "the client MAY include an empty Session ID in the
+    /// ClientHello" alongside its ticket (wolfSSL does), and then tells the
+    /// resumption apart by the handshake messages that follow. The server
+    /// used to require a session ID and fell back to a full handshake; it
+    /// now resumes, echoing the empty ID.
+    #[test]
+    fn ticket_with_empty_session_id_resumes() {
+        use crate::tls::codec::{ClientHello, ServerHello};
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let session = first_session(&cfg, &cert);
+        let mut c = client(&cert, Some(session), b"resume12-nosid-c");
+        let dgs = c.pop_outbound_datagrams();
+        assert_eq!(dgs.len(), 1);
+        let (mut ch, _) = ClientHello::decode_dtls(&dgs[0][13 + 12..]).unwrap();
+        assert_eq!(ch.session_id.len(), 32, "this client sends one");
+        ch.session_id.clear();
+        let mut s = server_conn(&cfg, b"resume12-nosid-s");
+        s.feed_datagram(&client_hello_datagram(&ch)).unwrap();
+        let flight = s.pop_outbound_datagrams();
+        assert_eq!(flight.len(), 3, "SH, CCS, Finished: abbreviated");
+        assert_eq!(flight[1][0], 20);
+        let sh = ServerHello::decode_dtls(&flight[0][13 + 12..]).unwrap();
+        assert!(sh.session_id.is_empty());
+        assert!(s.did_resume());
+    }
+
+    /// RFC 9146 §3: connection IDs are negotiated on every handshake, the
+    /// abbreviated one included — the resumed ServerHello answers the
+    /// client's `connection_id` offer, and the resumed connection's records
+    /// carry the CIDs both ways.
+    #[test]
+    fn resumption_negotiates_connection_ids() {
+        const CLIENT_CID: &[u8] = &[0xc1, 0xc2, 0xc3, 0xc4];
+        const SERVER_CID: &[u8] = &[0x51, 0x52, 0x53, 0x54, 0x55, 0x56];
+        let (cfg, cert) = make_server();
+        let cfg = Arc::new(
+            cfg.with_ticket_key(TICKET_KEY)
+                .with_verification_time(now())
+                .require_cookie_exchange(false)
+                .with_connection_id(Some(SERVER_CID.to_vec())),
+        );
+        let session = first_session(&cfg, &cert);
+        let mut ccfg = client_cfg(&cert);
+        ccfg.session = Some(session);
+        ccfg.connection_id = Some(CLIENT_CID.to_vec());
+        let mut crng = HmacDrbg::<Sha256>::new(b"resume12-cid-c", b"nonce", &[]);
+        let mut c = DtlsClientConnection12::new(ccfg, b"client-addr".to_vec(), &mut crng);
+        let mut s = server_conn(&cfg, b"resume12-cid-s");
+        assert!(pump_handshake(&mut c, &mut s));
+        assert!(c.did_resume() && s.did_resume());
+        assert_eq!(c.local_connection_id(), Some(CLIENT_CID));
+        assert_eq!(c.peer_connection_id(), Some(SERVER_CID));
+        assert_eq!(s.local_connection_id(), Some(SERVER_CID));
+        assert_eq!(s.peer_connection_id(), Some(CLIENT_CID));
+        c.send(b"ping").unwrap();
+        let dgs = c.pop_outbound_datagrams();
+        assert_eq!(
+            crate::dtls::peek_connection_id(&dgs[0], SERVER_CID.len()),
+            Some(SERVER_CID)
+        );
+        for dg in &dgs {
+            s.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(s.take_received(), b"ping");
+    }
+
+    /// A session is only offered to the name that authenticated it
+    /// (RFC 5246 §7.4.1.2 scoping): another name gets a full handshake.
+    #[test]
+    fn session_not_offered_to_another_name() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let mut session = first_session(&cfg, &cert);
+        session.server_name = "other.example".into();
+        let mut c = client(&cert, Some(session), b"resume12-name-c");
+        let mut s = server_conn(&cfg, b"resume12-name-s");
+        assert!(pump_handshake(&mut c, &mut s));
+        assert!(!c.did_resume() && !s.did_resume());
+    }
+
+    /// RFC 5246 §7.4.1.3: a resumed session keeps its suite, and the
+    /// server only resumes one the client still offers.
+    #[test]
+    fn ticket_suite_not_offered_runs_full_handshake() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let session = first_session(&cfg, &cert);
+        let mut ccfg = client_cfg(&cert);
+        ccfg.cipher_suites.retain(|s| s.0 != session.cipher_suite);
+        assert!(!ccfg.cipher_suites.is_empty());
+        ccfg.session = Some(session);
+        let mut crng = HmacDrbg::<Sha256>::new(b"resume12-suite-c", b"nonce", &[]);
+        let mut c = DtlsClientConnection12::new(ccfg, b"client-addr".to_vec(), &mut crng);
+        let mut s = server_conn(&cfg, b"resume12-suite-s");
+        assert!(pump_handshake(&mut c, &mut s));
+        assert!(!c.did_resume() && !s.did_resume());
+    }
+
+    /// The session is only released once the handshake completed: the
+    /// NewSessionTicket precedes the server Finished that authenticates it.
+    #[test]
+    fn take_session_waits_for_completion() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let mut c = client(&cert, None, b"resume12-wait-c");
+        let mut s = server_conn(&cfg, b"resume12-wait-s");
+        let fin = to_server_final_flight(&mut c, &mut s);
+        c.feed_datagram(&fin[0]).unwrap();
+        assert!(c.take_session().is_none(), "not before the Finished");
+        for dg in &fin[1..] {
+            c.feed_datagram(dg).unwrap();
+        }
+        assert!(c.is_handshake_complete());
+        assert!(c.take_session().is_some());
+    }
+
+    /// RFC 5077 §3.3: the NewSessionTicket belongs before the server's CCS.
+    /// Delivered after it, the (epoch-0) ticket is dropped; the Finished,
+    /// which covers the ticket, then fails to verify, and no session is
+    /// ever released.
+    #[test]
+    fn ticket_after_ccs_is_not_accepted() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let mut c = client(&cert, None, b"resume12-late-c");
+        let mut s = server_conn(&cfg, b"resume12-late-s");
+        let fin = to_server_final_flight(&mut c, &mut s);
+        c.feed_datagram(&fin[1]).unwrap();
+        c.feed_datagram(&fin[0]).unwrap();
+        let _ = c.feed_datagram(&fin[2]);
+        assert!(!c.is_handshake_complete());
+        assert!(c.take_session().is_none());
     }
 }

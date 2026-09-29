@@ -303,7 +303,8 @@ pub struct Config {
     /// Honoured only when the client advertised `status_request` in its
     /// `ClientHello`.
     pub stapled_ocsp_response: Option<Vec<u8>>,
-    /// TLS 1.2 / TLS 1.3 session-ticket key. `None` = no tickets issued.
+    /// (D)TLS 1.2 / (D)TLS 1.3 session-ticket key. `None` = no tickets
+    /// issued.
     /// Wiped when the `Config` is dropped (see [`Secret32`]).
     pub ticket_key: Option<Secret32>,
     /// Cap on bytes the server accepts as 0-RTT early data. `0` = no 0-RTT.
@@ -613,8 +614,10 @@ pub struct Config {
     /// client offers none and advertises no mode, the server accepts none
     /// and issues no tickets.
     ///
-    /// Honoured by TLS 1.3 and QUIC; inert on TLS 1.2 (whose tickets have
-    /// no such modes) and on DTLS.
+    /// Honoured by TLS 1.3 and QUIC, and by DTLS 1.3 for its one mode,
+    /// `psk_dhe_ke` (without it the DTLS 1.3 client offers no session and
+    /// the server issues and accepts no ticket); inert on (D)TLS 1.2, whose
+    /// tickets have no such modes.
     pub psk_modes: Vec<PskKeyExchangeMode>,
     /// Pre-shared keys provisioned out of band (RFC 8446 §4.2.11, RFC
     /// 9257), installed with [`ConfigBuilder::external_psk`]. Empty by

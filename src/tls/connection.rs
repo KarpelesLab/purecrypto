@@ -114,14 +114,16 @@ pub struct SignatureRequest {
     pub message: Vec<u8>,
 }
 
-/// An opaque, resumable TLS session captured from a completed client
-/// handshake.
+/// An opaque, resumable TLS or DTLS session captured from a completed
+/// client handshake.
 ///
 /// Obtain one with [`Connection::take_session`] after the handshake finishes,
 /// persist it, and prime a later connection to the same server by passing it
-/// to [`super::ConfigBuilder::resumption_session`]. A TLS 1.3 session resumes
-/// via PSK (RFC 8446 §2.2); a TLS 1.2 session via an RFC 5077 ticket. The
-/// contents are version-specific and deliberately not inspectable.
+/// to [`super::ConfigBuilder::resumption_session`]. A (D)TLS 1.3 session
+/// resumes via PSK (RFC 8446 §2.2, RFC 9147 §5); a (D)TLS 1.2 session via an
+/// RFC 5077 ticket. The contents are protocol- and version-specific (a
+/// session only resumes on the protocol that issued it) and deliberately not
+/// inspectable.
 #[derive(Clone)]
 pub struct ResumptionSession(ResumptionSessionKind);
 
@@ -135,6 +137,11 @@ enum ResumptionSessionKind {
     /// §5.9 — the keys would differ anyway).
     #[cfg(feature = "dtls")]
     Dtls13(super::conn::StoredSession),
+    /// A DTLS 1.2 session: the TLS 1.2 `StoredSession12` shape, kept
+    /// single-protocol the same way (the server seals DTLS 1.2 tickets
+    /// under their own AAD, so a TLS 1.2 ticket would not open anyway).
+    #[cfg(feature = "dtls")]
+    Dtls12(super::conn::StoredSession12),
 }
 
 /// A unified TLS or DTLS connection (client or server, any supported
@@ -1108,6 +1115,10 @@ impl Connection {
             Engine::ClientDtls13(c) => c
                 .take_session()
                 .map(|s| ResumptionSession(ResumptionSessionKind::Dtls13(s))),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(c) => c
+                .take_session()
+                .map(|s| ResumptionSession(ResumptionSessionKind::Dtls12(s))),
             _ => None,
         }
     }
@@ -1534,8 +1545,8 @@ impl Connection {
         }
     }
 
-    /// `true` when the handshake resumed an earlier session: a TLS 1.3
-    /// PSK (RFC 8446 §2.2) or a TLS 1.2 session ticket (RFC 5077). A
+    /// `true` when the handshake resumed an earlier session: a (D)TLS 1.3
+    /// PSK (RFC 8446 §2.2) or a (D)TLS 1.2 session ticket (RFC 5077). A
     /// handshake under an external PSK resumes nothing (see
     /// [`external_psk_identity`](Self::external_psk_identity)).
     pub fn resumed(&self) -> bool {
@@ -1553,6 +1564,10 @@ impl Connection {
                 Engine::ClientDtls13(c) => c.psk_accepted(),
                 #[cfg(feature = "dtls")]
                 Engine::ServerDtls13(c) => c.psk_used(),
+                #[cfg(feature = "dtls")]
+                Engine::ClientDtls12(c) => c.did_resume(),
+                #[cfg(feature = "dtls")]
+                Engine::ServerDtls12(c) => c.did_resume(),
                 _ => false,
             }
         }
@@ -1754,7 +1769,11 @@ impl Connection {
     ///   the client shows it has moved on — its first application data or
     ///   alert — which a client with nothing to say never does, so a
     ///   server bounds the wait;
-    /// - a DTLS 1.2 client is complete on the server's Finished: `false`.
+    /// - a DTLS 1.2 client is complete on the server's Finished: `false`
+    ///   after a full handshake. After an abbreviated (resumed) one the
+    ///   roles swap (RFC 5077 §3.1, RFC 6347 §4.2.4): its CCS + Finished is
+    ///   the final flight, and it reports `true` like a server does, until
+    ///   the server's first application data or alert.
     ///
     /// It is also `true` during the handshake while a flight is in the
     /// air, and while a DTLS 1.3 `KeyUpdate` is unacknowledged.
@@ -2956,10 +2975,9 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         psk_modes,
     } = dtls_client_opts(cfg)?;
     // DTLS 1.2 fragments handshake records at a fixed 1100 bytes (see
-    // `Config::max_record_size`) and has no key shares. RFC 5077 ticket
-    // resumption over DTLS 1.2 lands in a later commit; a session offered
-    // meanwhile is ignored (the "wrong version is inert" rule).
-    let _ = (max_record_size, key_shares, resumption, psk_modes);
+    // `Config::max_record_size`) and has no key shares; `psk_modes` is a
+    // TLS 1.3 extension (RFC 8446 §4.2.9) with no DTLS 1.2 counterpart.
+    let _ = (max_record_size, key_shares, psk_modes);
 
     let mut dc = crate::dtls::ClientConfig12Internal::new(roots.clone_store(), server_name)
         .with_require_ems(require_extended_master_secret)
@@ -2990,6 +3008,11 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     dc.groups = restrict_dtls_groups(&dc.groups, key_exchange_groups)?;
     dc.key_log = key_log.clone();
     dc.connection_id = connection_id;
+    // RFC 5077 ticket resumption from a stored DTLS 1.2 session; any other
+    // protocol's session is ignored (the "wrong version is inert" rule).
+    if let Some(ResumptionSession(ResumptionSessionKind::Dtls12(s))) = resumption {
+        dc.session = Some(s.clone());
+    }
     Ok(crate::dtls::DtlsClientConnection12::new(
         dc,
         Vec::new(),
@@ -3084,9 +3107,13 @@ struct DtlsServerOpts<'a> {
     max_record_size: usize,
     key_exchange_groups: Option<&'a [NamedGroup]>,
     connection_id: Option<Vec<u8>>,
-    /// RFC 8446 §4.6.1 ticket key, forwarded to the DTLS 1.3 server (the
-    /// DTLS 1.2 server resumes by RFC 5077 ticket in a later commit).
+    /// Session-ticket key: RFC 8446 §4.6.1 tickets on the DTLS 1.3 server,
+    /// RFC 5077 tickets on the DTLS 1.2 server.
     ticket_key: Option<&'a super::secret::Secret32>,
+    /// `psk_modes` allows `psk_dhe_ke`, the only DTLS 1.3 PSK mode
+    /// (RFC 8446 §4.2.9); without it the DTLS 1.3 server resumes nothing
+    /// and issues no ticket. Inert on DTLS 1.2.
+    psk_dhe_ke: bool,
     max_early_data_size: u32,
     #[cfg(feature = "std")]
     replay_window: Option<&'a super::conn::ReplayWindow>,
@@ -3157,9 +3184,9 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     // the engine; a server's trust anchors for mTLS come from `client_auth`,
     // not `roots`; the DTLS 1.3 server issues RFC 8446 §4.6.1 tickets and
     // accepts 0-RTT (so `ticket_key`, `max_early_data_size` and
-    // `replay_window` are forwarded — the DTLS 1.2 server picks the ticket
-    // key up in a later commit); the servers staple nothing, do not compress
-    // certificates, take no `preferred_key_exchange_group`
+    // `replay_window` are forwarded; the DTLS 1.2 server issues RFC 5077
+    // tickets under the same key); the servers staple nothing, do not
+    // compress certificates, take no `preferred_key_exchange_group`
     // (`key_exchange_groups` orders the accept-set instead) and pick the
     // cipher suite from their own fixed order. `rng` is drawn through
     // `config_rng` and `signer` through `Connection::drive`.
@@ -3173,15 +3200,14 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         preferred_key_exchange_group,
         rng,
         signer,
-        psk_modes,
     );
     #[cfg(feature = "cert-compression")]
     let _ = (cert_compression_algorithms, own_cert_compression_algorithms);
 
     let identity = identity.ok_or(Error::InappropriateState)?;
-    // External PSKs are not implemented over DTLS (the engines accept no
-    // PSK at all, so `psk_modes` has nothing to restrict): refuse rather
-    // than run a certificate handshake the caller did not ask for.
+    // External PSKs are not implemented over DTLS (the engines resume only
+    // their own tickets): refuse rather than run a certificate handshake
+    // the caller did not ask for.
     if !external_psks.is_empty() {
         return Err(Error::InappropriateState);
     }
@@ -3218,6 +3244,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         key_exchange_groups,
         connection_id,
         ticket_key,
+        psk_dhe_ke: psk_modes.contains(&super::psk::PskKeyExchangeMode::PskDheKe),
         max_early_data_size,
         #[cfg(feature = "std")]
         replay_window,
@@ -3245,14 +3272,15 @@ fn build_dtls12_server(
         key_exchange_groups,
         connection_id,
         ticket_key,
+        psk_dhe_ke,
         max_early_data_size,
         #[cfg(feature = "std")]
         replay_window,
     } = dtls_server_opts(cfg)?;
-    // DTLS 1.2 fragments at a fixed 1100 bytes; see the `Config` docs. RFC
-    // 5077 ticket resumption lands in a later commit, so the ticket knobs
-    // are inert here for now.
-    let _ = (max_record_size, ticket_key, max_early_data_size);
+    // DTLS 1.2 fragments at a fixed 1100 bytes and has no early data, so the
+    // 0-RTT knobs are inert; see the `Config` docs. `psk_modes` is a TLS 1.3
+    // extension (RFC 8446 §4.2.9).
+    let _ = (max_record_size, max_early_data_size, psk_dhe_ke);
     #[cfg(feature = "std")]
     let _ = replay_window;
 
@@ -3303,6 +3331,14 @@ fn build_dtls12_server(
     sc.verification_time = verification_time.cloned();
     sc.key_log = key_log.clone();
     sc = sc.with_connection_id(connection_id);
+    // RFC 5077 session tickets: issued and accepted only under a ticket key;
+    // their clock is `verification_time` (else the system clock).
+    if let Some(tk) = ticket_key {
+        sc = sc.with_ticket_key(*tk.as_bytes());
+    }
+    if let Some(t) = verification_time {
+        sc = sc.with_verification_time(t.clone());
+    }
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
         peer_address.to_vec(),
@@ -3331,6 +3367,7 @@ fn build_dtls13_server(
         key_exchange_groups,
         connection_id,
         ticket_key,
+        psk_dhe_ke,
         max_early_data_size,
         #[cfg(feature = "std")]
         replay_window,
@@ -3365,8 +3402,9 @@ fn build_dtls13_server(
     sc.connection_id = connection_id;
     // RFC 8446 §4.6.1 session tickets, RFC 8446 §4.2.10 0-RTT. The ticket
     // clock is `verification_time` (else the system clock, inside the
-    // engine); without it, no ticket is issued or accepted.
-    if let Some(tk) = ticket_key {
+    // engine); without it — or without `psk_dhe_ke` among `psk_modes` —
+    // no ticket is issued or accepted.
+    if let Some(tk) = ticket_key.filter(|_| psk_dhe_ke) {
         sc = sc.with_ticket_key(*tk.as_bytes());
         if max_early_data_size > 0 {
             sc = sc.with_max_early_data(max_early_data_size);
@@ -5418,6 +5456,80 @@ mod tests {
             .versions(version, version)
             .verify_certificates(false)
             .server_name("dtls.example")
+    }
+
+    /// Session resumption through the unified API on both DTLS versions
+    /// (RFC 9147 §5 PSK for DTLS 1.3, RFC 5077 tickets for DTLS 1.2), and
+    /// sessions staying single-protocol: one version's session offered to
+    /// the other version's client runs a full handshake.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_resumption_through_connection() {
+        let versions = [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3];
+        let mut sessions = Vec::new();
+        for version in versions {
+            let mut server_cfg = dtls_server_cfg_without_cookie_secret(version);
+            server_cfg.require_cookie = false;
+            server_cfg.ticket_key = Some([0x42; 32].into());
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let mut client = Connection::client(&dtls_client_builder(version).build()).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert!(!client.resumed() && !server.resumed());
+            // DTLS 1.3 sends its ticket after the handshake: one more pump.
+            loop {
+                let out = server.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                client.feed(&out).unwrap();
+            }
+            let session = client
+                .take_session()
+                .unwrap_or_else(|| panic!("{version:?}: a session"));
+
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let client_cfg = dtls_client_builder(version)
+                .resumption_session(session.clone())
+                .build();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert!(client.resumed(), "{version:?}: client resumed");
+            assert!(server.resumed(), "{version:?}: server resumed");
+            // Application data both ways on the resumed connection.
+            client.send(b"ping").unwrap();
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            assert_eq!(server.recv().unwrap(), b"ping", "{version:?}");
+            server.send(b"pong").unwrap();
+            loop {
+                let out = server.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                client.feed(&out).unwrap();
+            }
+            assert_eq!(client.recv().unwrap(), b"pong", "{version:?}");
+            sessions.push((version, server_cfg, session));
+        }
+        // Cross-version: each session offered to the other version.
+        for (i, (version, server_cfg, _)) in sessions.iter().enumerate() {
+            let other = &sessions[1 - i].2;
+            let mut server = Connection::server(server_cfg).unwrap();
+            let client_cfg = dtls_client_builder(*version)
+                .resumption_session(other.clone())
+                .build();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            drive_dtls_pair(&mut client, &mut server);
+            assert!(
+                !client.resumed() && !server.resumed(),
+                "{version:?}: a foreign-version session must not resume"
+            );
+        }
     }
 
     /// `Config::cipher_suites` used to be silently ignored by the DTLS

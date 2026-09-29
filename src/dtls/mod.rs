@@ -36,8 +36,13 @@
 //!   Resumption may skip the cookie exchange for the address the ticket
 //!   was issued to (RFC 9147 §5.1), the only path that carries 0-RTT early
 //!   data (epoch 1, RFC 9147 §6.1; no `EndOfEarlyData`, §5.6). DTLS 1.2 has
-//!   no post-handshake handshake messages and no resumption in this build;
-//!   anything after `Finished` is fatal.
+//!   no post-handshake handshake messages (anything after `Finished` is
+//!   fatal); it resumes by RFC 5077 session ticket, the `NewSessionTicket`
+//!   travelling in its §3.3 slot before the server's `ChangeCipherSpec`, and
+//!   the resumed handshake is the abbreviated one of RFC 6347 §4.2.4
+//!   (figure 2), whose final flight is the client's. Tickets are
+//!   single-protocol: each DTLS version seals its own under a distinct AAD,
+//!   so neither opens the other's nor a TLS one.
 //! - **Connection IDs (RFC 9146, RFC 9147 §9).** Negotiated through the
 //!   `connection_id` extension when [`crate::tls::Config::connection_id`]
 //!   is set; each side then sends every protected record under the CID
