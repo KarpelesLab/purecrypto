@@ -3130,6 +3130,63 @@ fn s_client_s_server_dtls12_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// DTLS 1.2 session resumption through the CLI (RFC 5077 tickets, RFC 6347
+/// §4.2.4 abbreviated handshake): `s_server -naccept 2` issues a ticket by
+/// default and `s_client -reconnect` offers it on a second connection, with
+/// the HelloVerifyRequest cookie exchange still on. Both sides report the
+/// resumption and the line crosses on the resumed connection — the client
+/// speaks right behind its final flight instead of waiting for an
+/// acknowledgement no DTLS 1.2 server sends.
+#[test]
+fn s_client_s_server_dtls12_reconnect_resumes() {
+    let dir = std::env::temp_dir().join(format!("pc_dtls12_resume_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = write_dtls_identity(&dir);
+    let server_proc = spawn_server_wait_listening(&[
+        "s_server", "-dtls1_2", "-cert", &cert, "-key", &key, "-accept", "0", "-naccept", "2",
+    ]);
+    let port = server_proc.port;
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-dtls1_2",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-reconnect",
+            "-read_timeout",
+            "2",
+        ],
+        b"hello resumed\n",
+    );
+    let server_err = server_proc.finish_with_stderr();
+    assert!(ok, "s_client failed: {err}");
+    assert!(err.contains("session ticket received"), "{err}");
+    assert!(err.contains("resumed: no"), "{err}");
+    assert!(err.contains("resumed: yes"), "{err}");
+    assert!(out.contains("hello resumed"), "echo: {out:?} / {err}");
+    assert!(server_err.contains("resumed: yes"), "{server_err}");
+
+    // DTLS 1.2 has no 0-RTT: `-early_data` is refused up front.
+    let early = dir.join("early.txt");
+    std::fs::write(&early, b"early").unwrap();
+    let (_, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-dtls1_2",
+            "-connect",
+            "127.0.0.1:9",
+            "-insecure",
+            "-reconnect",
+            "-early_data",
+            early.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert!(!ok && err.contains("no 0-RTT"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// DTLS 1.3 roundtrip using the unified `s_client -dtls1_3` ↔
 /// `s_server -dtls1_3` flags from commit 14.
 #[test]

@@ -167,15 +167,14 @@ pub(crate) fn run(args: Args) {
     let enable_server_rpk = args.flag("-enable_server_rpk") || args.flag("--enable_server_rpk");
     let enable_client_rpk = args.flag("-enable_client_rpk") || args.flag("--enable_client_rpk");
     let is_tcp = matches!(version, ProtocolVersion::Tls12 | ProtocolVersion::Tls13);
-    // Session tickets, 0-RTT and sequential accepts work over DTLS 1.3 too
-    // (RFC 9147); the RPK options remain TLS-over-TCP only, and DTLS 1.2
-    // has no resumption in this build.
-    let tickets_ok = is_tcp || version == ProtocolVersion::Dtls13;
+    // Session tickets and sequential accepts work over DTLS too (RFC 9147
+    // for DTLS 1.3, RFC 5077 for DTLS 1.2), 0-RTT over DTLS 1.3; the RPK
+    // options remain TLS-over-TCP only.
     if (enable_server_rpk || enable_client_rpk) && !is_tcp {
         die("-enable_*_rpk are TLS-over-TCP options");
     }
-    if (naccept > 1 || early_data) && !tickets_ok {
-        die("-naccept / -early_data need TLS or DTLS 1.3 (not DTLS 1.2)");
+    if early_data && version == ProtocolVersion::Dtls12 {
+        die("-early_data needs TLS or DTLS 1.3 (DTLS 1.2 has no 0-RTT)");
     }
     // DTLS 1.3 rekeys with KeyUpdate too (RFC 9147 §8); DTLS 1.2 has no
     // such mechanism.
@@ -295,12 +294,12 @@ pub(crate) fn run(args: Args) {
     }
     // Session tickets are issued by default, as `openssl s_server` does,
     // under a per-process random key: a client that reconnects to this
-    // same process can resume (TLS, or DTLS 1.3). `-no_ticket` turns them
-    // off; `-early_data` additionally accepts 0-RTT on a resumed
-    // connection (echoed back like any other data — this is a test server;
-    // early data is replayable). The DTLS 1.3 ticket clock falls back to
-    // the system clock under std, so no verification time need be pinned.
-    if tickets_ok && !no_ticket {
+    // same process can resume (TLS or DTLS). `-no_ticket` turns them off;
+    // `-early_data` additionally accepts 0-RTT on a resumed connection
+    // (echoed back like any other data — this is a test server; early data
+    // is replayable). The DTLS ticket clock falls back to the system clock
+    // under std, so no verification time need be pinned.
+    if !no_ticket {
         let mut ticket_key = [0u8; 32];
         purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut ticket_key);
         builder = builder.ticket_key(ticket_key);

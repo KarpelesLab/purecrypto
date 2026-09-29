@@ -474,8 +474,8 @@ Behaviour worth knowing:
   version-spanning one (1.2..=1.3), the fallback `openssl` performs by
   default; the `connected:` / `handshake complete:` line says which was
   negotiated.
-- `s_server` issues a session ticket after every TLS 1.3 **or DTLS 1.3**
-  handshake (under a per-process random key; `-no_ticket` turns it off) and,
+- `s_server` issues a session ticket after every TLS **or DTLS** handshake
+  (under a per-process random key; `-no_ticket` turns it off) and,
   with `-naccept N`, serves N connections in a row, so a client can come
   back and resume. `-early_data` accepts 0-RTT on a resumed connection
   (`-max_early_data` caps it, default 16384) and echoes it like any other
@@ -487,9 +487,10 @@ Behaviour worth knowing:
   connection sends nothing and waits 2 s for a ticket; a server that bundles
   its NewSessionTickets with its first write instead (Apple's
   Network.framework does) gets a `close_notify` then, and the tickets that
-  come back with its own goodbye are used. These work over TLS 1.3 and over
-  DTLS 1.3 (RFC 9147 rides RFC 8446 §2.2 / §4.2.10); DTLS 1.2 has no
-  resumption. Over DTLS the reconnecting `s_client` reuses its UDP source
+  come back with its own goodbye are used. These work over TLS and over DTLS:
+  DTLS 1.3 rides RFC 8446 §2.2 / §4.2.10 (RFC 9147), DTLS 1.2 resumes by RFC
+  5077 ticket with the abbreviated handshake (no 0-RTT: `-early_data` is
+  refused). Over DTLS the reconnecting `s_client` reuses its UDP source
   port, and `s_server -naccept` keeps one unconnected socket and services
   each client by address, so a peer whose resumed connection comes from a
   fresh port is handled too. DTLS 1.3 0-RTT is accepted only from the

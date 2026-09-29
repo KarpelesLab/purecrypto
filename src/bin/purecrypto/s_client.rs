@@ -249,9 +249,10 @@ pub(crate) fn run(args: Args) {
         }
         std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read -early_data {path}: {e}")))
     });
-    // `-reconnect` resumes on a second connection: TLS, or DTLS 1.3 (RFC
-    // 9147 rides RFC 8446 §2.2). DTLS 1.2 has no resumption in this build.
-    let dtls13_reconnect = version == ProtocolVersion::Dtls13 && reconnect;
+    // `-reconnect` resumes on a second connection: over TLS, DTLS 1.3 (RFC
+    // 9147 rides RFC 8446 §2.2) or DTLS 1.2 (an RFC 5077 ticket).
+    let dtls_reconnect =
+        matches!(version, ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13) && reconnect;
     let read_timeout = Duration::from_secs(
         args.value("-read_timeout")
             .unwrap_or("5")
@@ -284,8 +285,8 @@ pub(crate) fn run(args: Args) {
     if (enable_server_rpk || enable_client_rpk) && !is_tcp {
         die("-enable_*_rpk are TLS-over-TCP options");
     }
-    if reconnect && !is_tcp && version != ProtocolVersion::Dtls13 {
-        die("-reconnect needs TLS or DTLS 1.3 (DTLS 1.2 has no resumption)");
+    if early_data.is_some() && version == ProtocolVersion::Dtls12 {
+        die("-early_data needs TLS or DTLS 1.3 (DTLS 1.2 has no 0-RTT)");
     }
     // DTLS 1.3 rekeys with KeyUpdate too (RFC 9147 §8); DTLS 1.2 has no
     // such mechanism.
@@ -471,12 +472,13 @@ pub(crate) fn run(args: Args) {
                 reconnected: false,
             };
             let mut link = Link::connected(socket);
-            if dtls13_reconnect {
-                // `-reconnect` over DTLS 1.3: a first connection whose only
+            if dtls_reconnect {
+                // `-reconnect` over DTLS: a first connection whose only
                 // purpose is to collect a NewSessionTicket, then a second
-                // that resumes it — carrying `-early_data` as 0-RTT when
-                // the ticket allows it (RFC 9147 rides RFC 8446 §2.2 /
-                // §4.2.10). The SAME local socket (source port) is reused,
+                // that resumes it — over DTLS 1.3 carrying `-early_data` as
+                // 0-RTT when the ticket allows it (RFC 9147 rides RFC 8446
+                // §2.2 / §4.2.10), over DTLS 1.2 as an RFC 5077 abbreviated
+                // handshake. The SAME local socket (source port) is reused,
                 // matching how OpenSSL reconnects.
                 if !quiet {
                     eprintln!("=== connection 1 (full handshake)");
@@ -672,7 +674,8 @@ fn flush_out(conn: &mut Connection, sock: &mut TcpStream) {
 
 /// The `-reconnect` first DTLS connection: handshake, then drive the
 /// connection until the server's NewSessionTicket arrives (a post-handshake
-/// flight, RFC 9147 §5.8.4), say goodbye, and hand the session back. Nothing
+/// flight over DTLS 1.3, RFC 9147 §5.8.4; part of the handshake over DTLS
+/// 1.2, RFC 5077 §3.3), say goodbye, and hand the session back. Nothing
 /// from stdin is sent on this connection.
 fn run_udp_for_ticket(
     cfg: &purecrypto::tls::Config,
@@ -1096,8 +1099,15 @@ fn drive_udp_data(conn: &mut Connection, link: &mut Link, clock: &Clock, opts: &
     // datagram is lost the server is still in its handshake, where it
     // discards application data and fails on a close_notify. Keep the
     // retransmission going until the server has acknowledged the Finished
-    // (RFC 9147 §5.8.1, §7), bounded, before saying anything.
-    dtls_io::settle(conn, link, clock, &mut buf, print_data);
+    // (RFC 9147 §5.8.1, §7), bounded, before saying anything. A resumed
+    // DTLS 1.2 client holds the final flight too (its CCS + Finished, RFC
+    // 6347 §4.2.4), but nothing acknowledges it short of the server's own
+    // application data — which an echo server only sends once it has heard
+    // from us — so it speaks at once and answers a retransmitted server
+    // Finished from the data loop below.
+    if opts.version == ProtocolVersion::Dtls13 {
+        dtls_io::settle(conn, link, clock, &mut buf, print_data);
+    }
     // The data phase gets its own budget, on the connection's clock.
     let deadline = clock.now() + Duration::from_secs(30);
 
