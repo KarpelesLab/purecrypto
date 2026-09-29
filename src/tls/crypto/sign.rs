@@ -16,7 +16,7 @@ use crate::signature_registry::{
 };
 use crate::tls::Error;
 use crate::tls::codec::SignatureScheme;
-use crate::tls::conn::ServerKey;
+use crate::tls::conn::{ClientKey, ServerKey};
 use crate::x509::{AnyPublicKey, Certificate, Error as X509Error, PssHash};
 use alloc::vec::Vec;
 
@@ -273,6 +273,89 @@ pub(crate) fn sign_certificate_verify<R: RngCore>(
         ServerKey::External { .. } => return Err(Error::HandshakeFailure),
     };
     Ok((scheme, signature))
+}
+
+/// The `supported_signature_algorithms` a (D)TLS 1.2 server lists in its
+/// `CertificateRequest` (RFC 5246 §7.4.4): every TLS scheme of every
+/// registry algorithm `policy` permits, in registry order, minus the RFC
+/// 8734 Brainpool code points, which are TLS 1.3 only (§2: "MUST NOT be
+/// used in TLS 1.2"). The client's `CertificateVerify` scheme is then
+/// checked against this list (§7.4.8).
+///
+/// The policy is probed with an empty SPKI: the RSA entries' minimum
+/// modulus size can only be judged against a concrete key, which happens
+/// when the chain is verified.
+pub(crate) fn tls12_certificate_request_schemes(policy: &SignaturePolicy) -> Vec<SignatureScheme> {
+    let mut out: Vec<SignatureScheme> = Vec::new();
+    for algo in crate::signature_registry::ALGORITHMS {
+        if !policy.permits(*algo, &[]) {
+            continue;
+        }
+        for &scheme in algo.tls_schemes() {
+            let s = SignatureScheme(scheme);
+            if !s.is_brainpool_tls13() && !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// Signs `content` with a client identity's in-process `key` under `scheme`,
+/// for the client `CertificateVerify` of every engine: the context-bound
+/// transcript hash of (D)TLS 1.3 (RFC 8446 §4.4.3), the raw handshake
+/// messages of (D)TLS 1.2 (RFC 5246 §7.4.8) — each primitive hashes its
+/// input itself.
+///
+/// The client engines thread no RNG through the handshake, so RSA-PSS takes
+/// a salt derived from the key and the content
+/// ([`sign_rsa_pss_deterministic`]) and ML-DSA signs in its deterministic
+/// mode (FIPS 204 §5.2); both verify like their hedged counterparts. ECDSA
+/// hashes with the digest the curve's scheme names — SHA-384 / SHA-512 for
+/// the 384- and 512/521-bit curves, Brainpool (RFC 8734) included.
+///
+/// An [`ClientKey::External`] key never reaches this path — the engine
+/// suspends and the caller supplies the signature — and is
+/// [`Error::HandshakeFailure`] here.
+pub(crate) fn sign_client_certificate_verify(
+    key: &ClientKey,
+    scheme: SignatureScheme,
+    content: &[u8],
+) -> Result<Vec<u8>, Error> {
+    Ok(match key {
+        ClientKey::Rsa(k) | ClientKey::RsaPss(k, _) => {
+            sign_rsa_pss_deterministic(k, scheme, content)?
+        }
+        ClientKey::Ecdsa(k) => {
+            let curve = k.curve();
+            let sig = match curve {
+                CurveId::P384 | CurveId::BrainpoolP384r1 => k.sign::<Sha384>(content),
+                CurveId::P521 | CurveId::BrainpoolP512r1 => k.sign::<Sha512>(content),
+                _ => k.sign::<Sha256>(content),
+            }
+            .map_err(|_| Error::HandshakeFailure)?;
+            sig.to_der(curve)
+        }
+        ClientKey::Ed25519(k) => k.sign(content).to_bytes().to_vec(),
+        // Ed448: raw 114-byte R‖S over the empty context (pure Ed448).
+        ClientKey::Ed448(k) => k.sign(content).to_bytes().to_vec(),
+        #[cfg(feature = "mldsa")]
+        ClientKey::MlDsa44(k) => k
+            .sign_deterministic(content, b"")
+            .map(|s| s.to_vec())
+            .map_err(|_| Error::HandshakeFailure)?,
+        #[cfg(feature = "mldsa")]
+        ClientKey::MlDsa65(k) => k
+            .sign_deterministic(content, b"")
+            .map(|s| s.to_vec())
+            .map_err(|_| Error::HandshakeFailure)?,
+        #[cfg(feature = "mldsa")]
+        ClientKey::MlDsa87(k) => k
+            .sign_deterministic(content, b"")
+            .map(|s| s.to_vec())
+            .map_err(|_| Error::HandshakeFailure)?,
+        ClientKey::External { .. } => return Err(Error::HandshakeFailure),
+    })
 }
 
 /// Verifies a TLS 1.3 handshake signature of `message` under `key`, dispatching

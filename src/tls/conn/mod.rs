@@ -19,6 +19,10 @@ pub(crate) use client::{
     ClientCertConfig, ClientConnection, DEFAULT_GROUPS, DEFAULT_SHARE_GROUPS,
     ReceivedSessionTicket, StoredSession, select_offered_groups,
 };
+// The signing key behind a client identity: `tls::crypto::sign` signs the
+// client `CertificateVerify` of every engine with it, and the DTLS clients
+// tell an external key from an in-process one.
+pub(crate) use client::ClientKey;
 pub(crate) use client12::ClientConfig12;
 pub(crate) use client12::ClientConnection12;
 pub(crate) use client12::StoredSession12;
@@ -33,14 +37,24 @@ pub(crate) use server::ServerConnection;
 pub(crate) use server::{ServerConfig, ServerKey};
 pub(crate) use server12::ServerConfig12;
 pub(crate) use server12::ServerConnection12;
+// The client-certificate policies and the `Certificate` decoders of both
+// versions, shared with the DTLS servers (mutual authentication).
+#[allow(unused_imports)]
+pub(crate) use client12::parse_certificate_list_12;
+#[allow(unused_imports)]
+pub(crate) use common::parse_certificate_request_13;
+#[allow(unused_imports)]
+pub(crate) use server::ClientAuthPolicy;
+#[allow(unused_imports)]
+pub(crate) use server::parse_certificate_list as parse_certificate_list_server;
+#[allow(unused_imports)]
+pub(crate) use server12::ClientAuthPolicy12;
 
 // Fuzz-only re-exports of crate-private decoders; see `tls::fuzz`.
 #[cfg(feature = "__fuzz")]
 pub(crate) use client::parse_certificate_list as parse_certificate_list_client;
 #[cfg(feature = "__fuzz")]
 pub(crate) use common::parse_alert;
-#[cfg(feature = "__fuzz")]
-pub(crate) use server::parse_certificate_list as parse_certificate_list_server;
 
 use crate::tls::codec::CipherSuite;
 use alloc::vec::Vec;

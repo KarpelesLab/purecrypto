@@ -748,6 +748,48 @@ impl ConnectionCore {
     }
 }
 
+/// Parses a (D)TLS 1.3 `CertificateRequest` body received during the
+/// handshake (RFC 8446 §4.3.2) and returns its `signature_algorithms` — the
+/// list the client's `CertificateVerify` scheme is chosen from (§4.4.3).
+/// Shared by the TLS and DTLS 1.3 clients.
+///
+/// `certificate_request_context` MUST be empty in handshake authentication
+/// (a non-empty one belongs to post-handshake authentication, which no
+/// client of this crate opts into via `post_handshake_auth`), and "the
+/// signature_algorithms extension MUST be specified"; a missing list is
+/// [`Error::MissingExtension`], a duplicated one [`Error::IllegalParameter`].
+/// Other extensions (`certificate_authorities`, `oid_filters`, ...) are
+/// advisory and skipped.
+pub(crate) fn parse_certificate_request_13(
+    body: &[u8],
+) -> Result<Vec<super::super::codec::SignatureScheme>, Error> {
+    use super::super::codec::{ExtensionType, MAX_EXTENSIONS, ReadCursor, extension as ext};
+    let mut c = ReadCursor::new(body);
+    if !c.vec_u8()?.is_empty() {
+        return Err(Error::IllegalParameter);
+    }
+    let exts = c.vec_u16()?;
+    c.expect_empty()?;
+    let mut ec = ReadCursor::new(exts);
+    let mut sig_algs = None;
+    let mut count = 0usize;
+    while !ec.is_empty() {
+        let ty = ec.u16()?;
+        let ext_body = ec.vec_u16()?;
+        count += 1;
+        if count > MAX_EXTENSIONS {
+            return Err(Error::Decode);
+        }
+        if ty == ExtensionType::SIGNATURE_ALGORITHMS.0 {
+            if sig_algs.is_some() {
+                return Err(Error::IllegalParameter);
+            }
+            sig_algs = Some(ext::parse_signature_algorithms(ext_body)?);
+        }
+    }
+    sig_algs.ok_or(Error::MissingExtension)
+}
+
 /// RFC 7250 trust decision for a peer's raw public key, shared by every
 /// engine that negotiates `RawPublicKey`: `spki` is the bare
 /// `SubjectPublicKeyInfo` DER the peer put in its `Certificate`, `allowlist`

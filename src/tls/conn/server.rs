@@ -3458,25 +3458,14 @@ impl<R: RngCore> ServerConnection<R> {
         // server's signature-algorithm whitelist to every chain signature and
         // enforcing the client cert's notBefore/notAfter validity period via
         // the configured verification time, falling back to the system clock
-        // under `std` (F1). mTLS: leaf is a client cert, so require
-        // `id-kp-clientAuth` EKU.
-        let now = self.config.verification_time.clone().or_else(system_now);
-        // No clock at all (a `no_std` build with no configured verification
-        // time): the validity period could not be checked, and a client
-        // certificate whose `notBefore`/`notAfter` were never enforced must
-        // not authenticate anyone — fail closed. Under `std` the system
-        // clock always supplies a time, so this is unreachable there.
-        #[cfg(not(feature = "std"))]
-        if now.is_none() {
-            return Err(Error::BadCertificate);
-        }
-        let leaf_key = crate::tls::pki::verify_chain_with_crls_for_purpose(
+        // under `std` (F1) and failing closed when there is no clock at all.
+        // mTLS: leaf is a client cert, so require `id-kp-clientAuth` EKU.
+        let leaf_key = crate::tls::pki::verify_client_chain(
             &policy.roots,
             &self.config.crls,
             &chain,
-            now.as_ref(),
+            self.config.verification_time.as_ref(),
             &self.config.signature_policy,
-            crate::tls::pki::ChainPurpose::Client,
         )?;
         self.client_cert_chain = chain;
         self.client_leaf_key = Some(leaf_key);

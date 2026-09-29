@@ -338,6 +338,60 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
     .map(|v| v.leaf_key)
 }
 
+/// Verifies the certificate chain a client presented to a server that
+/// requested one (RFC 8446 §4.4.2.4 / RFC 5246 §7.4.6) and returns the leaf
+/// key its `CertificateVerify` is then checked under. Shared by the TLS and
+/// DTLS servers of both protocol versions.
+///
+/// The chain is validated against `roots` for [`ChainPurpose::Client`] (a
+/// leaf carrying `extKeyUsage` must list `id-kp-clientAuth`), every chain
+/// signature is held to `policy`, and `crls` is consulted. The validity
+/// period is checked at `verification_time` when the caller pinned one, at
+/// the system clock otherwise.
+///
+/// With no clock at all — a `no_std` build and no pinned time — the
+/// `notBefore` / `notAfter` bounds could not be enforced, and a certificate
+/// whose validity was never checked must not authenticate anyone: the chain
+/// is refused with [`Error::BadCertificate`]. Under `std` the system clock
+/// always supplies a time, so that branch is unreachable there.
+pub(crate) fn verify_client_chain(
+    roots: &RootCertStore,
+    crls: &CrlStore,
+    chain: &[Vec<u8>],
+    verification_time: Option<&Time>,
+    policy: &SignaturePolicy,
+) -> Result<AnyPublicKey, Error> {
+    let now = verification_time.cloned().or_else(system_now);
+    #[cfg(not(feature = "std"))]
+    if now.is_none() {
+        return Err(Error::BadCertificate);
+    }
+    verify_chain_with_crls_for_purpose(
+        roots,
+        crls,
+        chain,
+        now.as_ref(),
+        policy,
+        ChainPurpose::Client,
+    )
+}
+
+/// The system clock as a [`Time`]; `None` on `no_std`, which has none.
+#[cfg(feature = "std")]
+fn system_now() -> Option<Time> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| Time::from_unix(d.as_secs()))
+}
+
+/// The system clock as a [`Time`]; `None` on `no_std`, which has none.
+#[cfg(not(feature = "std"))]
+fn system_now() -> Option<Time> {
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_chain_inner(
     store: &RootCertStore,

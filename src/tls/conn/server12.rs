@@ -52,7 +52,7 @@ use crate::hash::{Digest, Md5, Sha1};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
-use crate::signature_registry::{ALGORITHMS, SignaturePolicy};
+use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 #[cfg(feature = "tls-legacy")]
 use crate::tls::codec::handshake12::RsaClientKeyExchange;
@@ -2376,28 +2376,15 @@ impl<R: RngCore> ServerConnection12<R> {
     }
 
     /// RFC 5246 §7.4.4: emit a `CertificateRequest` listing the cert types
-    /// (rsa_sign + ecdsa_sign), our `signature_algorithms` (filtered by the
-    /// configured policy), and an empty CA list (we accept any chain that
-    /// validates against the configured `roots`).
+    /// (rsa_sign + ecdsa_sign), our `signature_algorithms` (the registry's
+    /// TLS 1.2 schemes filtered by the configured policy — see
+    /// `tls12_certificate_request_schemes`), and an empty CA list (we
+    /// accept any chain that validates against the configured `roots`).
     fn send_certificate_request(&mut self) {
         let cert_types = alloc::vec![1u8, 64u8]; // rsa_sign, ecdsa_sign
-        // Permitted-by-policy entries with a non-empty TLS scheme list.
-        // We use an empty SPKI as the "no key context" probe — the RSA
-        // entries' `rsa_modulus_bits` returns None on an empty SPKI, so
-        // the min-bits check is skipped; other entries return None
-        // unconditionally.
-        let mut sig_schemes: Vec<SignatureScheme> = Vec::new();
-        for algo in ALGORITHMS {
-            if !self.config.signature_policy.permits(*algo, &[]) {
-                continue;
-            }
-            for &scheme in algo.tls_schemes() {
-                let s = SignatureScheme(scheme);
-                if !sig_schemes.contains(&s) {
-                    sig_schemes.push(s);
-                }
-            }
-        }
+        let sig_schemes = crate::tls::crypto::sign::tls12_certificate_request_schemes(
+            &self.config.signature_policy,
+        );
         let cr = CertificateRequest12 {
             cert_types,
             sig_schemes,
@@ -2470,25 +2457,15 @@ impl<R: RngCore> ServerConnection12<R> {
         }
         // Validate the chain, enforcing the client cert's notBefore/notAfter
         // validity period: use the configured verification time, falling back
-        // to the system clock under `std` (F1). mTLS: the leaf is a client
-        // cert, so require `id-kp-clientAuth` EKU.
-        let now = self.config.verification_time.clone().or_else(system_now);
-        // No clock at all (a `no_std` build with no configured verification
-        // time): the validity period could not be checked, and a client
-        // certificate whose `notBefore`/`notAfter` were never enforced must
-        // not authenticate anyone — fail closed. Under `std` the system
-        // clock always supplies a time, so this is unreachable there.
-        #[cfg(not(feature = "std"))]
-        if now.is_none() {
-            return Err(Error::BadCertificate);
-        }
-        let leaf_key = crate::tls::pki::verify_chain_with_crls_for_purpose(
+        // to the system clock under `std` (F1) and failing closed when there
+        // is no clock at all. mTLS: the leaf is a client cert, so require
+        // `id-kp-clientAuth` EKU.
+        let leaf_key = crate::tls::pki::verify_client_chain(
             &policy.roots,
             &self.config.crls,
             &chain,
-            now.as_ref(),
+            self.config.verification_time.as_ref(),
             &self.config.signature_policy,
-            crate::tls::pki::ChainPurpose::Client,
         )?;
         self.transcript.update(raw);
         self.client_cert_chain = chain;

@@ -18,7 +18,7 @@ use crate::ec::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed448PrivateKey,
     Ed25519PrivateKey,
 };
-use crate::hash::{Hmac, Sha256, Sha384, Sha512};
+use crate::hash::{Hmac, Sha256, Sha384};
 use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey, MlKem1024DecapsKey};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
@@ -258,6 +258,47 @@ impl ClientCertConfig {
                 let s = Self::signature_scheme_for(key)?;
                 (!s.is_rsa_pkcs1()).then_some(s)
             }
+        }
+    }
+
+    /// The scheme a (D)TLS 1.3 `CertificateVerify` answering a
+    /// `CertificateRequest` will use: this identity's scheme (for an
+    /// external key, its first acceptable one) restricted to the request's
+    /// `signature_algorithms`, `offered` (RFC 8446 §4.4.3: "the signature
+    /// algorithm MUST be one offered in the [...] CertificateRequest").
+    /// `None` when the key can sign under none of them — the client then has
+    /// no appropriate certificate and sends an empty `Certificate`.
+    pub(crate) fn scheme_for_request(
+        &self,
+        offered: &[SignatureScheme],
+    ) -> Option<SignatureScheme> {
+        match &self.key {
+            ClientKey::External { schemes } => schemes
+                .iter()
+                .copied()
+                .find(|s| !s.is_rsa_pkcs1() && offered.contains(s)),
+            _ => self
+                .tls13_signature_scheme()
+                .filter(|s| offered.contains(s)),
+        }
+    }
+
+    /// [`Self::scheme_for_request`] for a DTLS 1.2 `CertificateVerify`
+    /// (RFC 5246 §7.4.8: the algorithm "MUST be one of those present in the
+    /// supported_signature_algorithms field of the CertificateRequest"). The
+    /// RFC 8734 Brainpool code points are TLS 1.3 only and never selected.
+    #[cfg(feature = "dtls")]
+    pub(crate) fn scheme_for_request_12(
+        &self,
+        offered: &[SignatureScheme],
+    ) -> Option<SignatureScheme> {
+        match &self.key {
+            ClientKey::External { schemes } => schemes
+                .iter()
+                .copied()
+                .find(|s| !s.is_brainpool_tls13() && offered.contains(s)),
+            key => Self::signature_scheme_for(key)
+                .filter(|s| !s.is_brainpool_tls13() && offered.contains(s)),
         }
     }
 
@@ -3841,39 +3882,7 @@ impl ClientConnection {
             if self.cert_request_received {
                 return Err(Error::UnexpectedMessage);
             }
-            let mut c = ReadCursor::new(body);
-            let ctx = c.vec_u8()?;
-            // RFC 8446 §4.3.2: in handshake authentication
-            // `certificate_request_context` MUST be zero length (a non-empty
-            // one belongs to post-handshake auth, which we never opted into
-            // via `post_handshake_auth`).
-            if !ctx.is_empty() {
-                return Err(Error::IllegalParameter);
-            }
-            let exts = c.vec_u16()?;
-            c.expect_empty()?;
-            // RFC 8446 §4.3.2: "The signature_algorithms extension MUST be
-            // specified" — it is what our CertificateVerify scheme is chosen
-            // from (§4.4.3). Other extensions (certificate_authorities,
-            // oid_filters, ...) are advisory and ignored.
-            let mut ec = ReadCursor::new(exts);
-            let mut sig_algs: Option<Vec<SignatureScheme>> = None;
-            let mut count = 0usize;
-            while !ec.is_empty() {
-                let ty = ec.u16()?;
-                let body = ec.vec_u16()?;
-                count += 1;
-                if count > crate::tls::codec::MAX_EXTENSIONS {
-                    return Err(Error::Decode);
-                }
-                if ty == ExtensionType::SIGNATURE_ALGORITHMS.0 {
-                    if sig_algs.is_some() {
-                        return Err(Error::IllegalParameter);
-                    }
-                    sig_algs = Some(ext::parse_signature_algorithms(body)?);
-                }
-            }
-            self.cr_signature_algorithms = sig_algs.ok_or(Error::MissingExtension)?;
+            self.cr_signature_algorithms = super::common::parse_certificate_request_13(body)?;
             self.cert_request_received = true;
             self.core.transcript.update(raw);
             // Stay in WaitCertificate — Certificate is the next message.
@@ -4354,15 +4363,10 @@ impl ClientConnection {
     /// `signature_algorithms` (RFC 8446 §4.4.3). `None` when no client cert
     /// is configured or the key can sign under none of the offered schemes.
     fn client_cert_scheme(&self) -> Option<SignatureScheme> {
-        let cc = self.config.client_cert.as_ref()?;
-        let offered = &self.cr_signature_algorithms;
-        match &cc.key {
-            ClientKey::External { schemes } => schemes
-                .iter()
-                .copied()
-                .find(|s| !s.is_rsa_pkcs1() && offered.contains(s)),
-            _ => cc.tls13_signature_scheme().filter(|s| offered.contains(s)),
-        }
+        self.config
+            .client_cert
+            .as_ref()?
+            .scheme_for_request(&self.cr_signature_algorithms)
     }
 
     /// mTLS: emit a `Certificate` carrying our configured chain, or an empty
@@ -4409,47 +4413,10 @@ impl ClientConnection {
             .ok_or(Error::InappropriateState)?;
         let th = self.core.transcript.current_hash();
         let content = certificate_verify_content(false, th.as_slice());
-        let signature = match &cc.key {
-            // No RNG is threaded through the client state machine: the PSS
-            // salt is derived from the key and the content instead.
-            ClientKey::Rsa(k) | ClientKey::RsaPss(k, _) => {
-                crate::tls::crypto::sign::sign_rsa_pss_deterministic(k, scheme, &content)?
-            }
-            ClientKey::Ecdsa(k) => {
-                let sig = match k.curve() {
-                    CurveId::P384 => k.sign::<Sha384>(&content),
-                    CurveId::P521 => k.sign::<Sha512>(&content),
-                    _ => k.sign::<Sha256>(&content),
-                }
-                .map_err(|_| Error::HandshakeFailure)?;
-                sig.to_der(k.curve())
-            }
-            ClientKey::Ed25519(k) => k.sign(&content).to_bytes().to_vec(),
-            // Ed448: raw 114-byte R‖S over the empty context (pure Ed448).
-            ClientKey::Ed448(k) => k.sign(&content).to_bytes().to_vec(),
-            // Client-side ML-DSA: sign deterministically (FIPS 204 supports
-            // both deterministic and hedged modes; the client has no RNG
-            // to thread here). The resulting signature still verifies under
-            // the standard ML-DSA verify routine.
-            #[cfg(feature = "mldsa")]
-            ClientKey::MlDsa44(k) => k
-                .sign_deterministic(&content, b"")
-                .map(|s| s.to_vec())
-                .map_err(|_| Error::HandshakeFailure)?,
-            #[cfg(feature = "mldsa")]
-            ClientKey::MlDsa65(k) => k
-                .sign_deterministic(&content, b"")
-                .map(|s| s.to_vec())
-                .map_err(|_| Error::HandshakeFailure)?,
-            #[cfg(feature = "mldsa")]
-            ClientKey::MlDsa87(k) => k
-                .sign_deterministic(&content, b"")
-                .map(|s| s.to_vec())
-                .map_err(|_| Error::HandshakeFailure)?,
-            // External keys are handled by the suspend/resume path before this
-            // inline signer is reached; this arm is defensive only.
-            ClientKey::External { .. } => return Err(Error::HandshakeFailure),
-        };
+        // No RNG is threaded through the client state machine: the shared
+        // signer derives the PSS salt and signs ML-DSA deterministically.
+        let signature =
+            crate::tls::crypto::sign::sign_client_certificate_verify(&cc.key, scheme, &content)?;
         self.emit_client_certificate_verify(scheme, &signature);
         Ok(())
     }

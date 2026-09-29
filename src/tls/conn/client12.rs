@@ -44,14 +44,15 @@ use super::super::codec::{
     MAX_PLAINTEXT_FRAGMENT, ParsedRecord, fragments, is_legal_record_version, read_record_with_max,
     write_record,
 };
-use super::client::{ClientCertConfig, ClientKey};
+use super::client::ClientCertConfig;
+#[cfg(feature = "tls-legacy")]
+use super::client::ClientKey;
 use super::common::MAX_HANDSHAKE_REASSEMBLY;
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
 #[cfg(feature = "tls-legacy")]
 use crate::hash::{Digest, Md5, Sha1};
-use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
@@ -2886,42 +2887,11 @@ impl ClientConnection12 {
         let scheme = ClientCertConfig::signature_scheme_for(cc.key())
             .filter(|s| !s.is_brainpool_tls13())
             .ok_or(Error::UnsupportedKeyType)?;
-        let signature: Vec<u8> = match cc.key() {
-            // No RNG in the client state machine: the PSS salt is derived
-            // from the key and the signed bytes (see
-            // `sign_rsa_pss_deterministic`).
-            ClientKey::Rsa(k) | ClientKey::RsaPss(k, _) => {
-                crate::tls::crypto::sign::sign_rsa_pss_deterministic(k, scheme, &to_sign)?
-            }
-            ClientKey::Ecdsa(k) => {
-                let sig = match k.curve() {
-                    CurveId::P384 => k.sign::<Sha384>(&to_sign),
-                    CurveId::P521 => k.sign::<Sha512>(&to_sign),
-                    _ => k.sign::<Sha256>(&to_sign),
-                }
-                .map_err(|_| Error::HandshakeFailure)?;
-                sig.to_der(k.curve())
-            }
-            ClientKey::Ed25519(k) => k.sign(&to_sign).to_bytes().to_vec(),
-            ClientKey::Ed448(k) => k.sign(&to_sign).to_bytes().to_vec(),
-            #[cfg(feature = "mldsa")]
-            ClientKey::MlDsa44(k) => k
-                .sign_deterministic(&to_sign, b"")
-                .map(|s| s.to_vec())
-                .map_err(|_| Error::HandshakeFailure)?,
-            #[cfg(feature = "mldsa")]
-            ClientKey::MlDsa65(k) => k
-                .sign_deterministic(&to_sign, b"")
-                .map(|s| s.to_vec())
-                .map_err(|_| Error::HandshakeFailure)?,
-            #[cfg(feature = "mldsa")]
-            ClientKey::MlDsa87(k) => k
-                .sign_deterministic(&to_sign, b"")
-                .map(|s| s.to_vec())
-                .map_err(|_| Error::HandshakeFailure)?,
-            // Classic TLS 1.2 client-cert external signing is out of scope.
-            ClientKey::External { .. } => return Err(Error::HandshakeFailure),
-        };
+        // No RNG in the client state machine: the shared signer derives the
+        // PSS salt from the key and the signed bytes and signs ML-DSA
+        // deterministically. An external key is not supported on this path.
+        let signature =
+            crate::tls::crypto::sign::sign_client_certificate_verify(cc.key(), scheme, &to_sign)?;
         let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
         with_len_u24(&mut msg, |b| {
             b.extend_from_slice(&scheme.0.to_be_bytes());
@@ -3137,7 +3107,7 @@ fn parse_alert(body: &[u8]) -> Result<Incoming, Error> {
 /// Parses a TLS 1.2 `Certificate` message body (RFC 5246 §7.4.2): a single
 /// `certificate_list<0..2^24-1>` of `ASN.1Cert<1..2^24-1>`. No per-cert
 /// extensions (unlike TLS 1.3).
-pub(super) fn parse_certificate_list_12(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+pub(crate) fn parse_certificate_list_12(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let mut c = ReadCursor::new(body);
     let list = c.vec_u24()?;
     c.expect_empty()?;
