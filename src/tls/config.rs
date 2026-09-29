@@ -17,6 +17,7 @@ use crate::signature_registry::SignaturePolicy;
 use super::groups::NamedGroup;
 use super::keylog::KeyLog;
 use super::pki::{CrlStore, RootCertStore};
+use super::psk::{ExternalPsk, PskKeyExchangeMode};
 use super::secret::Secret32;
 use super::version::ProtocolVersion;
 use crate::x509::Time;
@@ -522,6 +523,66 @@ pub struct Config {
     /// session whose TLS version doesn't match the negotiated engine is
     /// ignored. `None` (default) starts a full handshake.
     pub resumption: Option<super::connection::ResumptionSession>,
+
+    // ---- TLS 1.3 pre-shared keys (RFC 8446 §4.2.9, §4.2.11) ----
+    /// The key-exchange modes a TLS 1.3 PSK — a resumption ticket or an
+    /// [`external PSK`](Self::external_psks) — may be used with (RFC 8446
+    /// §4.2.9). The default is [`PskDheKe`](PskKeyExchangeMode::PskDheKe)
+    /// alone.
+    ///
+    /// Client: the modes advertised in `psk_key_exchange_modes`. A
+    /// ServerHello that selects a PSK in a mode not listed here aborts the
+    /// handshake with `illegal_parameter` — in particular, unless
+    /// [`PskKe`](PskKeyExchangeMode::PskKe) is listed, a ServerHello
+    /// without a `key_share` is never accepted.
+    ///
+    /// Server: the modes it is willing to select, in ITS preference order;
+    /// the first one the client also advertised is used. A PSK is never
+    /// accepted in a mode the client did not advertise, and no
+    /// NewSessionTicket is sent to a client that advertised none of the
+    /// modes listed here (§4.2.9: it could not use the ticket).
+    ///
+    /// **[`PskKe`](PskKeyExchangeMode::PskKe) gives up forward secrecy**:
+    /// the PSK is then the only secret in the key schedule, so its later
+    /// disclosure — or that of the server's [`ticket_key`](Self::ticket_key)
+    /// — opens every recorded connection made with it. See
+    /// [`PskKeyExchangeMode`]. An empty list turns PSKs off altogether: the
+    /// client offers none and advertises no mode, the server accepts none
+    /// and issues no tickets.
+    ///
+    /// Honoured by TLS 1.3 and QUIC; inert on TLS 1.2 (whose tickets have
+    /// no such modes) and on DTLS.
+    pub psk_modes: Vec<PskKeyExchangeMode>,
+    /// Pre-shared keys provisioned out of band (RFC 8446 §4.2.11, RFC
+    /// 9257), installed with [`ConfigBuilder::external_psk`]. Empty by
+    /// default.
+    ///
+    /// Client: every key whose hash goes with an offered cipher suite is
+    /// offered in `pre_shared_key` (after the resumption ticket, if any; at
+    /// most 8 of them). When the server selects one, the handshake is
+    /// authenticated by that key and no certificate is exchanged; when it
+    /// selects none, the handshake is an ordinary certificate handshake,
+    /// verified against [`roots`](Self::roots) as usual — a client that
+    /// must not fall back to certificates leaves `roots` empty.
+    ///
+    /// Server: a ClientHello offering one of these identities with a valid
+    /// binder is served a PSK handshake, in one of the
+    /// [`psk_modes`](Self::psk_modes). A known identity with a wrong binder
+    /// aborts with `decrypt_error` (§4.2.11). A server may be configured
+    /// with external PSKs and no [`identity`](Self::identity) at all,
+    /// provided it is pinned to TLS 1.3: it then refuses
+    /// (`handshake_failure`) every client that offers no acceptable PSK. A
+    /// PSK handshake carries no client certificate, so a server whose
+    /// [`client_auth`](Self::client_auth) *requires* one accepts no
+    /// external PSK.
+    ///
+    /// No 0-RTT data is sent or accepted under an external PSK, and the RFC
+    /// 9258 importer interface is not implemented: a key is used with the
+    /// one hash it was provisioned with.
+    ///
+    /// Honoured by TLS 1.3 and QUIC; inert when TLS 1.2 is negotiated
+    /// (certificate handshake); **refused** on DTLS.
+    pub external_psks: Vec<ExternalPsk>,
 }
 
 /// A caller-supplied entropy source (e.g. a TPM/HSM RNG), installed via
@@ -613,6 +674,8 @@ impl Default for Config {
             rng: None,
             signer: None,
             resumption: None,
+            psk_modes: alloc::vec![PskKeyExchangeMode::PskDheKe],
+            external_psks: Vec::new(),
         }
     }
 }
@@ -704,6 +767,8 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `ticket_key` | yes | yes | inert (no tickets) | inert (no tickets) | yes |
 /// | `max_early_data`, `replay_window` | yes | inert | inert (no 0-RTT) | inert (no 0-RTT) | via `QuicConfig::enable_early_data` |
 /// | `resumption_session` | yes | yes | inert | inert | via `QuicConfig::resumption` |
+/// | `psk_modes` | yes | inert | inert (no PSKs) | inert | yes |
+/// | `external_psk` | yes | inert (certificate handshake) | **refused** | **refused** | yes |
 /// | `preferred_key_exchange_group` | yes | inert | inert | inert | yes |
 /// | RFC 7250 raw public keys / cert-type preferences | yes | yes | **refused** | **refused** | yes |
 /// | `ech` / `ech_server` | yes | inert | **refused** | **refused** | yes |
@@ -1153,6 +1218,23 @@ impl ConfigBuilder {
     /// to set even when the version is not pinned.
     pub fn resumption_session(mut self, session: super::connection::ResumptionSession) -> Self {
         self.inner.resumption = Some(session);
+        self
+    }
+
+    /// TLS 1.3: the PSK key-exchange modes allowed, replacing the default
+    /// (`psk_dhe_ke` only). See [`Config::psk_modes`] — and
+    /// [`PskKeyExchangeMode`] for what listing `psk_ke` costs: **no forward
+    /// secrecy** for the connections that use it.
+    pub fn psk_modes(mut self, modes: &[PskKeyExchangeMode]) -> Self {
+        self.inner.psk_modes = modes.to_vec();
+        self
+    }
+    /// TLS 1.3: adds a pre-shared key provisioned out of band (RFC 8446
+    /// §4.2.11). See [`Config::external_psks`] for how each role uses it and
+    /// [`ExternalPsk`] for what the key must be (high-entropy, one per pair
+    /// of peers).
+    pub fn external_psk(mut self, psk: ExternalPsk) -> Self {
+        self.inner.external_psks.push(psk);
         self
     }
 

@@ -4140,7 +4140,8 @@ mod loopback_tests {
 
         // Control: the same flow with the HRR-pinned suite passes the pin
         // check and fails later for a different reason (the synthetic SH
-        // has no key_share), proving the rejection above is the pin.
+        // has neither key_share nor pre_shared_key — no key exchange at
+        // all, `missing_extension`), proving the rejection above is the pin.
         let mut client = fresh_client(b"hrr-suite-pin-ok");
         let _ch1 = client.write_tls();
         let hrr = synthetic_hrr_record(CipherSuite::AES_128_GCM_SHA256, NamedGroup::SECP256R1);
@@ -4150,7 +4151,7 @@ mod loopback_tests {
         client.read_tls(&synthetic_sh_record(CipherSuite::AES_128_GCM_SHA256));
         let err = client.process_new_packets().unwrap_err();
         assert!(
-            matches!(err, crate::tls::Error::HandshakeFailure),
+            matches!(err, crate::tls::Error::MissingExtension),
             "matching suite must pass the pin (and fail on missing key_share), got {err:?}"
         );
     }
@@ -11742,7 +11743,8 @@ mod audit_regression_tests {
         let (real_ticket, age) = identities[0].clone();
         let junk = alloc::vec![0x5au8; real_ticket.len()];
         let (psk_ext, binders_len) =
-            ext::client_pre_shared_key_placeholder(&[(junk, 0), (real_ticket, age)], 32).unwrap();
+            ext::client_pre_shared_key_placeholder(&[(junk, 0, 32), (real_ticket, age, 32)])
+                .unwrap();
         ch.extensions.push(psk_ext);
         let mut msg = ch.encode();
         let truncated_len = msg.len() - binders_len;

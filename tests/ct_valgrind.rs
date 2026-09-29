@@ -1128,7 +1128,8 @@ fn tls13_key_schedule() -> String {
         let ks = hooks::tls::tls13_key_schedule(
             suite,
             (i != 0).then_some(&psk[..n]),
-            &ecdhe,
+            false,
+            Some(&ecdhe),
             &th[..n],
             &th[48..48 + n],
             &th[96..96 + n],
@@ -1136,6 +1137,19 @@ fn tls13_key_schedule() -> String {
         out.push(hex8(public(&ks[..])));
         let next = hooks::tls::tls13_next_traffic_secret(suite, &ks[..n]);
         out.push(hex8(public(&next[..])));
+        // RFC 8446 §4.2.9 `psk_ke` (no (EC)DHE input, §7.1 zero string)
+        // with an external PSK (§4.2.11, `"ext binder"`): the PSK is then
+        // the only secret in the schedule.
+        let ks = hooks::tls::tls13_key_schedule(
+            suite,
+            Some(&psk[..n]),
+            true,
+            None,
+            &th[..n],
+            &th[48..48 + n],
+            &th[96..96 + n],
+        );
+        out.push(hex8(public(&ks[..])));
     }
     out.join(" ")
 }

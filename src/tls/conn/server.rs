@@ -37,6 +37,7 @@ use crate::tls::crypto::{
     finished_verify_data, next_traffic_secret, psk_from_resumption, supported_suites, tls_exporter,
 };
 use crate::tls::keylog::KeyLog;
+use crate::tls::psk::{ExternalPsk, PskKeyExchangeMode};
 use crate::tls::{AlertDescription, Error};
 use alloc::vec::Vec;
 
@@ -381,6 +382,16 @@ pub(crate) struct ServerConfig {
     /// (the default) is the engine's full set in its built-in order. See
     /// [`crate::tls::Config::cipher_suites`].
     pub(crate) cipher_suites: Vec<CipherSuite>,
+    /// PSK key-exchange modes (RFC 8446 §4.2.9) this server is willing to
+    /// select, in ITS preference order; `psk_dhe_ke` alone by default. A
+    /// PSK is accepted only in a mode listed here that the client also
+    /// advertised, and tickets are issued only to clients that advertised
+    /// one of them. See [`crate::tls::Config::psk_modes`].
+    pub(crate) psk_modes: Vec<PskKeyExchangeMode>,
+    /// Externally provisioned PSKs (RFC 8446 §4.2.11), looked up by the
+    /// identities a ClientHello offers. See
+    /// [`crate::tls::Config::external_psks`].
+    pub(crate) external_psks: Vec<ExternalPsk>,
 }
 
 // The ticket key seals (and unseals) every resumption ticket this server
@@ -429,7 +440,26 @@ impl ServerConfig {
             preferred_key_exchange_group: None,
             groups: Vec::new(),
             cipher_suites: Vec::new(),
+            psk_modes: alloc::vec![PskKeyExchangeMode::PskDheKe],
+            external_psks: Vec::new(),
         }
+    }
+
+    /// A configuration with no certificate at all, for a server that only
+    /// serves [external PSKs](Self::external_psks): a PSK handshake sends
+    /// neither `Certificate` nor `CertificateVerify` (RFC 8446 §2.2).
+    ///
+    /// It is an [`ServerKey::External`] key that can produce no signature
+    /// scheme, so a ClientHello that ends up without an accepted PSK finds
+    /// nothing to negotiate in `signature_algorithms` and is refused with
+    /// `handshake_failure` before any certificate message could be built.
+    pub(crate) fn psk_only() -> Self {
+        Self::from_key(
+            Vec::new(),
+            ServerKey::External {
+                schemes: Vec::new(),
+            },
+        )
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with an
@@ -963,8 +993,18 @@ pub struct ServerConnection<R: RngCore> {
     /// and, once echoed, receive-side enforcement of the value we
     /// advertised.
     peer_offered_record_size_limit: bool,
-    /// `true` if the handshake was a PSK resumption.
+    /// `true` if the handshake was authenticated by a PSK — a resumption
+    /// ticket or an external PSK (see `external_psk_identity`).
     psk_used: bool,
+    /// The key-exchange mode the accepted PSK is used in (RFC 8446 §4.2.9).
+    psk_mode: Option<PskKeyExchangeMode>,
+    /// The identity of the external PSK this handshake selected; `None` on
+    /// a full handshake and on a ticket resumption.
+    external_psk_identity: Option<Vec<u8>>,
+    /// The modes the client advertised in `psk_key_exchange_modes` (wire
+    /// values; empty when it sent none). RFC 8446 §4.2.9: tickets are only
+    /// issued to a client that can use them.
+    client_psk_modes: Vec<u8>,
     /// Set once after the handshake completes to drive one-shot
     /// NewSessionTicket emission on the next process loop.
     pending_nst: bool,
@@ -1191,6 +1231,9 @@ impl<R: RngCore> ServerConnection<R> {
             peer_server_name: None,
             peer_offered_record_size_limit: false,
             psk_used: false,
+            psk_mode: None,
+            external_psk_identity: None,
+            client_psk_modes: Vec::new(),
             pending_nst: false,
             rms: None,
             ks: None,
@@ -1416,9 +1459,21 @@ impl<R: RngCore> ServerConnection<R> {
     }
 
     /// Whether the just-completed handshake resumed a prior session via PSK
-    /// (RFC 8446 §2.2). Always `false` for fresh handshakes.
+    /// (RFC 8446 §2.2). Always `false` for fresh handshakes, and for a
+    /// handshake under an external PSK, which resumes nothing.
     pub fn psk_used(&self) -> bool {
-        self.psk_used
+        self.psk_used && self.external_psk_identity.is_none()
+    }
+
+    /// The key-exchange mode of the PSK this handshake selected (RFC 8446
+    /// §4.2.9); `None` when it selected no PSK.
+    pub fn psk_key_exchange_mode(&self) -> Option<PskKeyExchangeMode> {
+        self.psk_mode
+    }
+
+    /// The identity of the external PSK this handshake selected, if any.
+    pub fn external_psk_identity(&self) -> Option<&[u8]> {
+        self.external_psk_identity.as_deref()
     }
 
     /// The key-exchange group the ServerHello's `key_share` answered, once
@@ -2199,8 +2254,13 @@ impl<R: RngCore> ServerConnection<R> {
         if client_offered_early {
             self.early_data_offered = true;
         }
+        // §4.2.10 again: the client protected its early data under the
+        // FIRST identity it offered, so it can only be accepted when that is
+        // the one selected.
         let mut accept_early = !is_retry
-            && psk_state.as_ref().is_some_and(|s| s.age_fresh)
+            && psk_state
+                .as_ref()
+                .is_some_and(|s| s.age_fresh && s.selected_identity == 0)
             && client_offered_early
             && self.config.max_early_data_size > 0;
         #[cfg(feature = "std")]
@@ -2313,10 +2373,11 @@ impl<R: RngCore> ServerConnection<R> {
         //    containing a supported_groups extension, it MUST also contain a
         //    key_share extension, and vice versa");
         //  * a TLS 1.3 ClientHello MUST carry `key_share` (an empty
-        //    `client_shares` list is fine — it requests an HRR) unless the
-        //    client only offers PSK-only key exchange (`psk_ke`, §4.2.8 /
-        //    §4.2.9). We do not implement `psk_ke`, so that lone legal shape
-        //    still fails below — with `handshake_failure`, since the CH
+        //    `client_shares` list is fine — it requests an HRR) unless it
+        //    offers a PSK for PSK-only key exchange (`psk_ke`, §4.2.8 /
+        //    §4.2.9), which needs none. When that PSK is not accepted in
+        //    `psk_ke` there is no key exchange left to run, and the
+        //    handshake fails below — with `handshake_failure`, since the CH
         //    itself is well-formed.
         let has_key_share = ext::find(&ch.extensions, ExtensionType::KEY_SHARE).is_some();
         let has_supported_groups =
@@ -2332,10 +2393,21 @@ impl<R: RngCore> ServerConnection<R> {
         if has_key_share != has_supported_groups {
             return Err(Error::MissingExtension);
         }
-        let psk_ke_only = psk_offered && psk_modes.as_deref().is_some_and(|m| !m.contains(&1));
-        if !has_key_share && !psk_ke_only {
+        let psk_ke_offered = psk_offered
+            && psk_modes
+                .as_deref()
+                .is_some_and(|m| m.contains(&PskKeyExchangeMode::PskKe.wire()));
+        if !has_key_share && !psk_ke_offered {
             return Err(Error::MissingExtension);
         }
+        // RFC 8446 §4.2.9: remembered for NewSessionTicket issuance.
+        self.client_psk_modes = psk_modes.unwrap_or_default();
+        // PSK-only key exchange: no (EC)DHE, hence no group to negotiate,
+        // no HelloRetryRequest to ask for one and no `key_share` in the
+        // ServerHello (§4.2.9: "the server MUST NOT supply a key_share").
+        let psk_ke = psk_state
+            .as_ref()
+            .is_some_and(|s| s.mode == PskKeyExchangeMode::PskKe);
 
         // The client must accept a signature scheme our key can produce —
         // unless PSK is being used, in which case we sign nothing. For an
@@ -2525,7 +2597,10 @@ impl<R: RngCore> ServerConnection<R> {
         // supported too (draft §7.2.1 / §7.2.2): `emit_hello_retry_request`
         // patches the `hrr_accept_confirmation` signal into the HRR
         // `encrypted_client_hello` extension when CH1 accepted ECH.
-        if !is_retry && let Some(preferred_pub) = self.config.preferred_key_exchange_group {
+        if !is_retry
+            && !psk_ke
+            && let Some(preferred_pub) = self.config.preferred_key_exchange_group
+        {
             let preferred = preferred_pub.to_wire();
             let supported = match ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS) {
                 Some(sg_body) => ext::parse_supported_groups(sg_body)?,
@@ -2562,7 +2637,7 @@ impl<R: RngCore> ServerConnection<R> {
         // advertised one in `supported_groups`, ask for the first such group
         // by HelloRetryRequest. A client that neither shared nor advertised
         // any of them cannot be served (`handshake_failure`, §4.2.7).
-        if !is_retry && !self.config.groups.is_empty() {
+        if !is_retry && !psk_ke && !self.config.groups.is_empty() {
             let shared_groups: Vec<NamedGroup> =
                 match ext::find(&ch.extensions, ExtensionType::KEY_SHARE) {
                     Some(ks_body) => ext::parse_client_key_shares(ks_body)?
@@ -2655,22 +2730,29 @@ impl<R: RngCore> ServerConnection<R> {
 
         // Pick a key-exchange group offered by the client. On retry CH2
         // MUST carry exactly one share, for the group we asked for in HRR
-        // (RFC 8446 §4.2.8); anything else is `illegal_parameter`.
-        let ks_ext =
-            ext::find(&ch.extensions, ExtensionType::KEY_SHARE).ok_or(Error::HandshakeFailure)?;
-        let shares = ext::parse_client_key_shares(ks_ext)?;
-        let (group, client_pub) = if is_retry {
+        // (RFC 8446 §4.2.8); anything else is `illegal_parameter`. Under
+        // `psk_ke` the client's shares (if it sent any) are not used.
+        let shares = if psk_ke {
+            Vec::new()
+        } else {
+            let ks_ext = ext::find(&ch.extensions, ExtensionType::KEY_SHARE)
+                .ok_or(Error::HandshakeFailure)?;
+            ext::parse_client_key_shares(ks_ext)?
+        };
+        let client_share: Option<(&NamedGroup, &[u8])> = if psk_ke {
+            None
+        } else if is_retry {
             let want = self.hrr_selected_group.ok_or(Error::HandshakeFailure)?;
             if shares.len() != 1 || shares[0].0 != want {
                 return Err(Error::IllegalParameter);
             }
-            (&shares[0].0, shares[0].1.as_slice())
+            Some((&shares[0].0, shares[0].1.as_slice()))
         } else if self.config.groups.is_empty() {
             let (g, k) = shares
                 .iter()
                 .find(|(g, _)| Self::implements_group(*g))
                 .ok_or(Error::HandshakeFailure)?;
-            (g, k.as_slice())
+            Some((g, k.as_slice()))
         } else {
             // Server preference order (`ServerConfig::groups`): the first
             // configured group the client shared wins. The share-less case
@@ -2682,9 +2764,9 @@ impl<R: RngCore> ServerConnection<R> {
                 .filter(|g| Self::implements_group(**g))
                 .find_map(|g| shares.iter().find(|(sg, _)| sg == g))
                 .ok_or(Error::HandshakeFailure)?;
-            (g, k.as_slice())
+            Some((g, k.as_slice()))
         };
-        self.negotiated_group = Some(*group);
+        self.negotiated_group = client_share.map(|(g, _)| *g);
 
         // Server random and ephemeral key share.
         let mut random: Random = [0u8; 32];
@@ -2706,14 +2788,21 @@ impl<R: RngCore> ServerConnection<R> {
                 *b = 0;
             }
         }
-        let (server_pub, shared) = self.key_agreement(*group, client_pub)?;
+        // `None` under `psk_ke`: the ServerHello then carries no
+        // `key_share` (RFC 8446 §4.2.9) and the key schedule runs on the
+        // PSK alone.
+        let key_exchange: Option<(Vec<u8>, Secret)> = match client_share {
+            Some((group, client_pub)) => Some(self.key_agreement(*group, client_pub)?),
+            None => None,
+        };
 
         // ServerHello with the selected suite and key share. When PSK is
-        // accepted, also echo `pre_shared_key` with `selected_identity = 0`.
-        let mut sh_extensions = alloc::vec![
-            ext::server_key_share(*group, &server_pub),
-            ext::server_supported_versions(),
-        ];
+        // accepted, also echo `pre_shared_key` with the selected identity.
+        let mut sh_extensions = Vec::with_capacity(3);
+        if let (Some((group, _)), Some((server_pub, _))) = (client_share, key_exchange.as_ref()) {
+            sh_extensions.push(ext::server_key_share(*group, server_pub));
+        }
+        sh_extensions.push(ext::server_supported_versions());
         // RFC 8446 §4.2.11: `selected_identity` is the index of the identity
         // whose ticket we actually resumed — not necessarily the first one
         // the client offered.
@@ -2739,7 +2828,10 @@ impl<R: RngCore> ServerConnection<R> {
         } else {
             KeySchedule::new(suite.hash)
         };
-        ks.enter_handshake(shared.as_slice());
+        match key_exchange.as_ref() {
+            Some((_, shared)) => ks.enter_handshake(shared.as_slice()),
+            None => ks.enter_handshake_psk_only(),
+        }
 
         // ECH accept signal (draft §7.2): compute
         // `HKDF-Expand-Label(HKDF-Extract(0, ClientHelloInner.random),
@@ -2831,6 +2923,8 @@ impl<R: RngCore> ServerConnection<R> {
         // are mutually exclusive here.
         self.send_encrypted_extensions();
         self.psk_used = psk_state.is_some();
+        self.psk_mode = psk_state.as_ref().map(|s| s.mode);
+        self.external_psk_identity = psk_state.as_ref().and_then(|s| s.external.clone());
         // Resumption carries the issuing handshake's client identity
         // forward: restore the leaf so `peer_certificates()` reflects it.
         if let Some(s) = psk_state.as_ref()
@@ -3495,7 +3589,7 @@ impl<R: RngCore> ServerConnection<R> {
         // out in the same write_tls() drain as our Finished's responses.
         // A ticket we cannot expire (no clock configured) is a permanent
         // bearer token, so `tickets_available()` also gates on the clock.
-        if self.tickets_available() {
+        if self.tickets_available() && self.client_can_use_tickets() {
             self.pending_nst = true;
             self.emit_session_ticket()?;
         }
@@ -3691,9 +3785,16 @@ fn system_now() -> Option<crate::x509::Time> {
 /// PSK accepted from the client's ClientHello: the recovered PSK bytes and
 /// the hash function that pinned them.
 struct AcceptedPsk {
-    /// The resumption PSK recovered from the ticket, wiped on drop.
+    /// The resumption PSK recovered from the ticket, or the external PSK
+    /// the identity named; wiped on drop.
     psk: crate::zeroize::Zeroizing<Vec<u8>>,
     hash: HashAlg,
+    /// The key-exchange mode the PSK is used in: the first of the server's
+    /// [`ServerConfig::psk_modes`] the client advertised (RFC 8446 §4.2.9).
+    mode: PskKeyExchangeMode,
+    /// The identity, when this is an external PSK (RFC 8446 §4.2.11) rather
+    /// than a ticket. An external PSK never carries early data here.
+    external: Option<Vec<u8>>,
     /// ALPN protocol negotiated on the connection that issued the ticket
     /// (empty when none was). RFC 8446 §4.2.10: 0-RTT may only be accepted
     /// when the new connection selects the identical protocol.
@@ -3737,6 +3838,49 @@ struct AcceptedPsk {
     client_auth_secs: u64,
 }
 
+/// How many of the identities a ClientHello offers are looked at (RFC 8446
+/// §4.2.11 lets the server pick any one of them, so the rest are simply not
+/// candidates). Each candidate costs a ticket decryption — and, on a match,
+/// a binder computation over the whole ClientHello — before the client has
+/// proved anything, so the work an unauthenticated peer can demand per
+/// ClientHello is bounded here rather than by how many seven-byte
+/// identities fit into one.
+const MAX_PSK_IDENTITIES: usize = 16;
+
+/// The PSK binder for one identity (RFC 8446 §4.2.11.2):
+/// `HMAC(finished_key(binder_key), Transcript-Hash(prefix ‖ truncated CH))`,
+/// where `binder_key` is derived from the PSK's early secret under `label`
+/// — `"res binder"` for a resumption PSK, `"ext binder"` / `"imp binder"`
+/// for an external one ([`ExternalPsk::binder_label`]), so no kind can
+/// stand in for another.
+fn psk_binder(
+    hash: HashAlg,
+    psk: &[u8],
+    label: &[u8],
+    transcript_prefix: &[u8],
+    truncated: &[u8],
+) -> Vec<u8> {
+    let ks = KeySchedule::with_psk(hash, psk);
+    let bk = ks.binder_key(label);
+    let fk = binder_finished_key(hash, &bk);
+    let th = if transcript_prefix.is_empty() {
+        hash.hash(truncated)
+    } else {
+        let mut tbuf = Vec::with_capacity(transcript_prefix.len() + truncated.len());
+        tbuf.extend_from_slice(transcript_prefix);
+        tbuf.extend_from_slice(truncated);
+        hash.hash(&tbuf)
+    };
+    match hash {
+        HashAlg::Sha256 => Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
+            .as_ref()
+            .to_vec(),
+        HashAlg::Sha384 => Hmac::<Sha384>::mac(fk.as_slice(), th.as_slice())
+            .as_ref()
+            .to_vec(),
+    }
+}
+
 /// RFC 8446 §8.2: maximum allowed deviation, in milliseconds, between the
 /// client's reported ticket age and the server-side expected age before
 /// 0-RTT is refused. Covers the round-trip time of the ClientHello plus the
@@ -3764,6 +3908,19 @@ impl<R: RngCore> ServerConnection<R> {
     /// lifetime.
     fn tickets_available(&self) -> bool {
         self.config.ticket_key.is_some() && self.ticket_now().is_some()
+    }
+
+    /// RFC 8446 §4.2.9: "Servers SHOULD NOT send NewSessionTicket with
+    /// tickets that are not compatible with the advertised modes" — and a
+    /// client that sent no `psk_key_exchange_modes` at all cannot resume
+    /// ("servers MUST NOT select a key exchange mode that is not listed by
+    /// the client"). Whether a ticket issued now could ever be redeemed
+    /// here: the client advertised a mode this server selects.
+    fn client_can_use_tickets(&self) -> bool {
+        self.config
+            .psk_modes
+            .iter()
+            .any(|m| self.client_psk_modes.contains(&m.wire()))
     }
 
     /// The effective ticket-sealing key: the configured `ticket_key` bound to
@@ -3833,9 +3990,26 @@ impl<R: RngCore> ServerConnection<R> {
     ///
     /// Returns:
     /// * `Ok(Some(AcceptedPsk))` — pick this PSK, run a resumed handshake.
-    /// * `Ok(None)` — no offered PSK we recognize; fall back to 1-RTT.
-    /// * `Err(Error::DecryptError)` — a ticket decrypted but its binder is
-    ///   wrong: an active attacker or a tampered CH. Reject hard.
+    /// * `Ok(None)` — no offered PSK we recognize, or none in a key-exchange
+    ///   mode both sides allow; fall back to a full handshake.
+    /// * `Err(Error::DecryptError)` — a ticket decrypted, or an identity
+    ///   named an external PSK, but its binder is wrong: an active attacker
+    ///   or a tampered CH. Reject hard.
+    ///
+    /// The key-exchange mode is settled first (RFC 8446 §4.2.9): the first
+    /// of [`ServerConfig::psk_modes`] that the client advertised. "The
+    /// server MUST NOT select a key exchange mode that is not listed by the
+    /// client": with no common mode, no PSK is accepted at all. (A client
+    /// advertising `psk_dhe_ke` without a `key_share` is malformed, §9.2;
+    /// the caller's mandatory-extension checks refuse it.)
+    ///
+    /// Each identity (the first [`MAX_PSK_IDENTITIES`] of them) is looked up
+    /// among the external PSKs, then tried as a ticket. External PSKs need
+    /// neither the ticket key nor a clock. They are skipped when this
+    /// listener *requires* a client certificate: a PSK handshake carries
+    /// none (§4.2.11 — PSK and certificate authentication do not combine),
+    /// and the identity of a key is not the certificate the application was
+    /// promised.
     ///
     /// `transcript_prefix` is the handshake transcript preceding this
     /// ClientHello: empty for CH1, and `message_hash(Hash(CH1)) ‖ HRR` for
@@ -3850,32 +4024,50 @@ impl<R: RngCore> ServerConnection<R> {
         raw: &[u8],
         transcript_prefix: &[u8],
     ) -> Result<Option<AcceptedPsk>, Error> {
-        // No clock ⇒ no way to expire a ticket: refuse to resume rather than
-        // honour a permanent bearer token (see `ticket_now`).
-        let Some(now) = self.ticket_now() else {
-            return Ok(None);
+        // Tickets: no clock ⇒ no way to expire a ticket: refuse to resume
+        // rather than honour a permanent bearer token (see `ticket_now`).
+        // They are sealed under the key bound to this listener's
+        // client-auth trust configuration, so a ticket minted by a listener
+        // with different client roots simply fails to open (full
+        // handshake). The derived key is wiped on every exit path
+        // (including the `?`s below).
+        let tickets = match (self.ticket_now(), self.ticket_seal_key()) {
+            (Some(now), Some(key)) => Some((now, crate::zeroize::Zeroizing::new(key))),
+            _ => None,
         };
-        // Sealed under the key bound to this listener's client-auth trust
-        // configuration, so a ticket minted by a listener with different
-        // client roots simply fails to open (full handshake).
-        let Some(ticket_key) = self.ticket_seal_key() else {
+        let external_psks: &[ExternalPsk] =
+            if self.config.client_auth.as_ref().is_some_and(|p| p.required) {
+                &[]
+            } else {
+                &self.config.external_psks
+            };
+        if tickets.is_none() && external_psks.is_empty() {
             return Ok(None);
-        };
-        // Wipe the derived key on every exit path (including the `?`s below).
-        let ticket_key = crate::zeroize::Zeroizing::new(ticket_key);
+        }
         let Some(modes_body) = ext::find(&ch.extensions, ExtensionType::PSK_KEY_EXCHANGE_MODES)
         else {
             return Ok(None);
         };
         let modes = ext::parse_psk_key_exchange_modes(modes_body)?;
-        if !modes.contains(&1) {
-            // We only support psk_dhe_ke.
+        let Some(mode) = self
+            .config
+            .psk_modes
+            .iter()
+            .copied()
+            .find(|m| modes.contains(&m.wire()))
+        else {
             return Ok(None);
-        }
+        };
         let Some(psk_body) = ext::find(&ch.extensions, ExtensionType::PRE_SHARED_KEY) else {
             return Ok(None);
         };
         let (identities, binders) = ext::parse_client_pre_shared_key(psk_body)?;
+        // Binder field at the tail of the CH wire bytes.
+        let binders_field_len: usize = 2 + binders.iter().map(|b| 1 + b.len()).sum::<usize>();
+        if raw.len() < binders_field_len {
+            return Ok(None);
+        }
+        let truncated = &raw[..raw.len() - binders_field_len];
 
         // RFC 8446 §4.6.1 + §8.1: enforce ticket expiry on decrypt. The
         // clock is guaranteed non-zero here, so the age check is
@@ -3884,8 +4076,61 @@ impl<R: RngCore> ServerConnection<R> {
 
         // RFC 8446 §4.2.11: pick the first identity whose ticket decrypts
         // cleanly. Then verify its binder; mismatch is fatal.
-        for (idx, (ticket, obfuscated_age)) in identities.iter().enumerate() {
-            let Some(decrypted) = decrypt_ticket(&ticket_key, ticket, now, ticket_lifetime) else {
+        for (idx, (ticket, obfuscated_age)) in
+            identities.iter().enumerate().take(MAX_PSK_IDENTITIES)
+        {
+            // `identities` came out of a `u16`-length wire vector whose
+            // entries are at least 7 bytes, so the index always fits.
+            let selected_identity = u16::try_from(idx).map_err(|_| Error::IllegalParameter)?;
+            // An external PSK, by identity. The identity is public (it was
+            // just read off the wire), so which entry matches is not a
+            // secret; the comparison is constant-time all the same, and
+            // only the binder check below involves the key.
+            if let Some(ext_psk) = external_psks
+                .iter()
+                .find(|p| bool::from(p.identity().ct_eq(ticket.as_slice())))
+            {
+                let hash = ext_psk.hash();
+                let expected = psk_binder(
+                    hash,
+                    ext_psk.secret(),
+                    ext_psk.binder_label(),
+                    transcript_prefix,
+                    truncated,
+                );
+                // RFC 8446 §4.2.11: "If this value is not present or does
+                // not validate, the server MUST abort the handshake."
+                let presented = binders.get(idx).ok_or(Error::DecryptError)?;
+                if presented.len() != hash.output_len()
+                    || !bool::from(expected.as_slice().ct_eq(presented.as_slice()))
+                {
+                    return Err(Error::DecryptError);
+                }
+                return Ok(Some(AcceptedPsk {
+                    psk: ext_psk.secret().clone(),
+                    hash,
+                    mode,
+                    external: Some(ext_psk.identity().to_vec()),
+                    // No parameters were provisioned with the key for early
+                    // data (RFC 8446 §4.2.10 wants the suite, the ALPN
+                    // protocol, ... agreed out of band), and an external
+                    // PSK has no ticket age to bound a replay by: never
+                    // fresh, so never eligible for 0-RTT.
+                    alpn: Vec::new(),
+                    age_fresh: false,
+                    age_checked: false,
+                    suite: None,
+                    selected_identity,
+                    selected_binder: presented.to_vec(),
+                    client_leaf: None,
+                    client_auth_secs: 0,
+                }));
+            }
+            let Some((now, ticket_key)) = tickets.as_ref() else {
+                continue;
+            };
+            let now = *now;
+            let Some(decrypted) = decrypt_ticket(ticket_key, ticket, now, ticket_lifetime) else {
                 continue;
             };
             // A PSK handshake skips client authentication, so it can only
@@ -3926,32 +4171,7 @@ impl<R: RngCore> ServerConnection<R> {
             };
             let hash_len = hash.output_len();
 
-            // Binder field at the tail of the CH wire bytes.
-            let binders_field_len: usize = 2 + binders.iter().map(|b| 1 + b.len()).sum::<usize>();
-            if raw.len() < binders_field_len {
-                continue;
-            }
-            let truncated = &raw[..raw.len() - binders_field_len];
-
-            let ks = KeySchedule::with_psk(hash, &psk);
-            let res_bk = ks.binder_key(b"res binder");
-            let fk = binder_finished_key(hash, &res_bk);
-            let th = if transcript_prefix.is_empty() {
-                hash.hash(truncated)
-            } else {
-                let mut tbuf = Vec::with_capacity(transcript_prefix.len() + truncated.len());
-                tbuf.extend_from_slice(transcript_prefix);
-                tbuf.extend_from_slice(truncated);
-                hash.hash(&tbuf)
-            };
-            let expected: Vec<u8> = match hash {
-                HashAlg::Sha256 => Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
-                    .as_ref()
-                    .to_vec(),
-                HashAlg::Sha384 => Hmac::<Sha384>::mac(fk.as_slice(), th.as_slice())
-                    .as_ref()
-                    .to_vec(),
-            };
+            let expected = psk_binder(hash, &psk, b"res binder", transcript_prefix, truncated);
             let presented = binders.get(idx).ok_or(Error::DecryptError)?;
             if presented.len() != hash_len
                 || !bool::from(expected.as_slice().ct_eq(presented.as_slice()))
@@ -3970,12 +4190,11 @@ impl<R: RngCore> ServerConnection<R> {
                 let expected_age_ms = now.saturating_sub(creation_secs).saturating_mul(1000);
                 client_age_ms.abs_diff(expected_age_ms) <= MAX_TICKET_AGE_DEVIATION_MS
             };
-            // `identities` came out of a `u16`-length wire vector whose
-            // entries are at least 7 bytes, so the index always fits.
-            let selected_identity = u16::try_from(idx).map_err(|_| Error::IllegalParameter)?;
             return Ok(Some(AcceptedPsk {
                 psk,
                 hash,
+                mode,
+                external: None,
                 alpn,
                 age_fresh,
                 age_checked: true,
@@ -4702,7 +4921,7 @@ mod tests {
             .filter(|(t, _)| *t != ExtensionType::PSK_KEY_EXCHANGE_MODES)
             .collect();
         let (psk, _) =
-            ext::client_pre_shared_key_placeholder(&[(alloc::vec![0x77u8; 16], 0)], 32).unwrap();
+            ext::client_pre_shared_key_placeholder(&[(alloc::vec![0x77u8; 16], 0, 32)]).unwrap();
         exts.push(psk);
         let err = forged_ch_result(exts).unwrap_err();
         assert!(matches!(err, Error::MissingExtension), "{err:?}");
@@ -4725,7 +4944,7 @@ mod tests {
             .collect();
         exts.push(ext::psk_key_exchange_modes(&[0]));
         let (psk, _) =
-            ext::client_pre_shared_key_placeholder(&[(alloc::vec![0x77u8; 16], 0)], 32).unwrap();
+            ext::client_pre_shared_key_placeholder(&[(alloc::vec![0x77u8; 16], 0, 32)]).unwrap();
         exts.push(psk);
         let err = forged_ch_result(exts).unwrap_err();
         assert!(matches!(err, Error::HandshakeFailure), "{err:?}");

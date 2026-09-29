@@ -90,6 +90,7 @@ pub mod mio;
 pub(crate) mod opts;
 pub(crate) mod peek;
 pub(crate) mod pki;
+pub(crate) mod psk;
 pub(crate) mod quic_hooks;
 mod secret;
 mod signer;
@@ -114,6 +115,7 @@ pub use keylog::KeyLog;
 pub use keylog::{WriterKeyLog, file_keylog};
 pub use peek::{ClientHelloInfo, peek_client_hello};
 pub use pki::{CrlStore, PolicyOptions, RootCertStore};
+pub use psk::{ExternalPsk, PskKeyExchangeMode};
 pub use secret::Secret32;
 #[cfg(feature = "std")]
 pub use signer::LocalSigner;

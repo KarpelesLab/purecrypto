@@ -67,17 +67,20 @@ pub mod tls {
     use crate::tls::{ContentType, Error};
     use alloc::vec::Vec;
 
-    /// The RFC 8446 §7.1 key schedule: with a PSK, the resumption binder key
-    /// and its Finished key; then from the (EC)DHE shared secret the client
-    /// and server handshake traffic secrets (over `th_hello`), the client
-    /// and server application traffic secrets and the exporter master
-    /// secret (over `th_server_finished`), a 32-byte exporter output, the
+    /// The RFC 8446 §7.1 key schedule: with a PSK, the binder key (the
+    /// resumption one, or the external one when `external_psk`) and its
+    /// Finished key; then from the (EC)DHE shared secret — or, for `psk_ke`
+    /// (`ecdhe == None`), from the zero string (§7.1) — the client and
+    /// server handshake traffic secrets (over `th_hello`), the client and
+    /// server application traffic secrets and the exporter master secret
+    /// (over `th_server_finished`), a 32-byte exporter output, the
     /// resumption master secret (over `th_client_finished`) and a resumption
     /// PSK. Returns every derived secret, concatenated.
     pub fn tls13_key_schedule(
         suite: Suite,
         psk: Option<&[u8]>,
-        ecdhe: &[u8],
+        external_psk: bool,
+        ecdhe: Option<&[u8]>,
         th_hello: &[u8],
         th_server_finished: &[u8],
         th_client_finished: &[u8],
@@ -87,14 +90,22 @@ pub mod tls {
         let mut ks = match psk {
             Some(psk) => {
                 let ks = KeySchedule::with_psk(p.hash, psk);
-                let binder = ks.binder_key(b"res binder");
+                let label: &[u8] = if external_psk {
+                    b"ext binder"
+                } else {
+                    b"res binder"
+                };
+                let binder = ks.binder_key(label);
                 out.extend_from_slice(binder.as_slice());
                 out.extend_from_slice(binder_finished_key(p.hash, &binder).as_slice());
                 ks
             }
             None => KeySchedule::new(p.hash),
         };
-        ks.enter_handshake(ecdhe);
+        match ecdhe {
+            Some(ecdhe) => ks.enter_handshake(ecdhe),
+            None => ks.enter_handshake_psk_only(),
+        }
         out.extend_from_slice(ks.client_handshake_traffic_secret(th_hello).as_slice());
         out.extend_from_slice(ks.server_handshake_traffic_secret(th_hello).as_slice());
         ks.enter_master();

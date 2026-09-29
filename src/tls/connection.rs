@@ -680,11 +680,18 @@ impl Connection {
     }
 
     /// Build a server connection. Picks the engine from `config.max_version`.
-    /// Requires `config.identity.is_some()`.
+    /// Requires `config.identity.is_some()` — except for a server pinned to
+    /// TLS 1.3 that serves [external PSKs](Config::external_psks) only (RFC
+    /// 8446 §2.2: a PSK handshake sends no certificate).
     pub fn server(config: &Config) -> Result<Self, Error> {
         config.check_versions()?;
         if config.identity.is_none() {
-            return Err(Error::InappropriateState);
+            let psk_only = !config.external_psks.is_empty()
+                && config.min_version == ProtocolVersion::TLSv1_3
+                && config.max_version == ProtocolVersion::TLSv1_3;
+            if !psk_only {
+                return Err(Error::InappropriateState);
+            }
         }
         // When the configured range spans TLS 1.2 and 1.3 (e.g. the default
         // `min 1.2 / max 1.3`), the engine cannot be chosen from config alone —
@@ -1455,8 +1462,36 @@ impl Connection {
         }
     }
 
+    /// The key-exchange mode of the TLS 1.3 PSK this handshake used (RFC
+    /// 8446 §4.2.9) — a resumption ticket or an external PSK — or `None`
+    /// when it used no PSK (a full handshake, or TLS 1.2).
+    pub fn psk_key_exchange_mode(&self) -> Option<super::psk::PskKeyExchangeMode> {
+        if let Some(c) = self.tls13_client() {
+            c.psk_key_exchange_mode()
+        } else if let Some(c) = self.tls13_server() {
+            c.psk_key_exchange_mode()
+        } else {
+            None
+        }
+    }
+
+    /// The identity of the [external PSK](Config::external_psks) this TLS
+    /// 1.3 handshake was authenticated by, or `None` when it selected none
+    /// (a certificate handshake, or a resumption).
+    pub fn external_psk_identity(&self) -> Option<&[u8]> {
+        if let Some(c) = self.tls13_client() {
+            c.external_psk_identity()
+        } else if let Some(c) = self.tls13_server() {
+            c.external_psk_identity()
+        } else {
+            None
+        }
+    }
+
     /// `true` when the handshake resumed an earlier session: a TLS 1.3
-    /// PSK (RFC 8446 §2.2) or a TLS 1.2 session ticket (RFC 5077).
+    /// PSK (RFC 8446 §2.2) or a TLS 1.2 session ticket (RFC 5077). A
+    /// handshake under an external PSK resumes nothing (see
+    /// [`external_psk_identity`](Self::external_psk_identity)).
     pub fn resumed(&self) -> bool {
         if let Some(c) = self.tls13_client() {
             c.psk_accepted()
@@ -1874,6 +1909,8 @@ pub(crate) fn tls13_client_config(
         key_log,
         rng,
         signer,
+        psk_modes,
+        external_psks,
     } = parts.common;
     let ClientOpts {
         server_name,
@@ -1898,6 +1935,11 @@ pub(crate) fn tls13_client_config(
 
     let mut cc = super::conn::ClientConfig::new(roots.clone_store());
     cc.verify_certificates = verify_certificates;
+    // RFC 8446 §4.2.9 / §4.2.11: the PSK key-exchange modes and the
+    // external PSKs belong to the TLS 1.3 handshake, so they apply to QUIC
+    // unchanged (RFC 9001 §4 places no restriction on either).
+    cc.psk_modes = psk_modes.to_vec();
+    cc.external_psks = external_psks.to_vec();
     if let Some(groups) = key_shares {
         cc.key_share_groups = groups.iter().map(|g| g.to_wire()).collect();
     }
@@ -2023,6 +2065,8 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         key_log,
         rng,
         signer,
+        psk_modes,
+        external_psks,
     } = parts.common;
     let ClientOpts {
         server_name,
@@ -2038,8 +2082,18 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
     // through `config_rng`, `signer` through `Connection::drive`, and the
     // caller resolves `server_name`.
     // TLS 1.2 has no key shares (its ECDHE group is picked by the server
-    // from `supported_groups`).
-    let _ = (rng, signer, server_name, key_shares, key_exchange_groups);
+    // from `supported_groups`). The PSK key-exchange modes and external
+    // PSKs are TLS 1.3 mechanisms (RFC 8446 §4.2.9, §4.2.11): a 1.2
+    // handshake is a certificate handshake.
+    let _ = (
+        rng,
+        signer,
+        server_name,
+        key_shares,
+        key_exchange_groups,
+        psk_modes,
+        external_psks,
+    );
     #[cfg(feature = "cert-compression")]
     let _ = cert_compression_algorithms;
     #[cfg(feature = "ech")]
@@ -2182,6 +2236,8 @@ pub(crate) fn tls13_server_config(
         key_log,
         rng,
         signer,
+        psk_modes,
+        external_psks,
     } = parts.common;
     let ServerOpts {
         client_auth,
@@ -2209,16 +2265,27 @@ pub(crate) fn tls13_server_config(
         signer,
     );
 
-    let id = identity.ok_or(Error::InappropriateState)?;
-    if transport == Tls13Transport::Quic
-        && matches!(id.key, super::config::SigningKey::External { .. })
-    {
-        // External (suspend/resume) signing is not wired through the QUIC
-        // driver — the QUIC connection has no `provide_signature` resume path
-        // — so reject it at construction rather than stalling the handshake.
-        return Err(Error::InappropriateState);
-    }
-    let mut sc = tls13_server_config_from_identity(id);
+    let mut sc = match identity {
+        Some(id) => {
+            if transport == Tls13Transport::Quic
+                && matches!(id.key, super::config::SigningKey::External { .. })
+            {
+                // External (suspend/resume) signing is not wired through the
+                // QUIC driver — the QUIC connection has no
+                // `provide_signature` resume path — so reject it at
+                // construction rather than stalling the handshake.
+                return Err(Error::InappropriateState);
+            }
+            tls13_server_config_from_identity(id)
+        }
+        // RFC 8446 §2.2: a PSK handshake sends no certificate, so a server
+        // that only ever serves external PSKs needs none. Without PSKs to
+        // serve it could not authenticate itself to anyone.
+        None if !external_psks.is_empty() => super::conn::ServerConfig::psk_only(),
+        None => return Err(Error::InappropriateState),
+    };
+    sc.psk_modes = psk_modes.to_vec();
+    sc.external_psks = external_psks.to_vec();
     if !alpn_protocols.is_empty() {
         sc = sc.with_alpn(alpn_protocols.to_vec());
     }
@@ -2337,6 +2404,8 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
         key_log,
         rng,
         signer,
+        psk_modes,
+        external_psks,
     } = parts.common;
     let ServerOpts {
         client_auth,
@@ -2358,6 +2427,8 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     // negotiates from its own fixed group list and picks its suite from its
     // own fixed order). `rng` is drawn through `config_rng`, `signer`
     // through `Connection::drive`.
+    // The PSK key-exchange modes and external PSKs are TLS 1.3 mechanisms
+    // (RFC 8446 §4.2.9, §4.2.11); RFC 5077 tickets have no such modes.
     let _ = (
         roots,
         stapled_crl,
@@ -2367,6 +2438,8 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
         cipher_suites,
         rng,
         signer,
+        psk_modes,
+        external_psks,
     );
     #[cfg(feature = "std")]
     let _ = replay_window;
@@ -2479,6 +2552,8 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         key_log,
         rng,
         signer,
+        psk_modes,
+        external_psks,
     } = parts.common;
     let ClientOpts {
         server_name,
@@ -2505,6 +2580,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     // the documented "wrong version is ignored" rule. RFC 8879 certificate
     // compression is not implemented over DTLS: the advertisement is not
     // sent, and the peer's certificate arrives uncompressed.
+    // The DTLS engines offer no PSK, so there is no mode to restrict.
     let _ = (
         min_version,
         max_version,
@@ -2515,6 +2591,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         rng,
         signer,
         resumption,
+        psk_modes,
     );
     #[cfg(feature = "cert-compression")]
     let _ = cert_compression_algorithms;
@@ -2522,6 +2599,12 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     // Fail closed (see the doc comment above).
     #[cfg(feature = "ech")]
     if ech.is_some() {
+        return Err(Error::InappropriateState);
+    }
+    // External PSKs are not implemented over DTLS: a caller that
+    // provisioned one expects a PSK-authenticated handshake, which a
+    // silent certificate handshake is not.
+    if !external_psks.is_empty() {
         return Err(Error::InappropriateState);
     }
     if identity.is_some() || record_size_limit.is_some() {
@@ -2755,6 +2838,8 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         key_log,
         rng,
         signer,
+        psk_modes,
+        external_psks,
     } = parts.common;
     let ServerOpts {
         client_auth,
@@ -2799,6 +2884,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         preferred_key_exchange_group,
         rng,
         signer,
+        psk_modes,
     );
     #[cfg(feature = "std")]
     let _ = replay_window;
@@ -2806,6 +2892,12 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     let _ = cert_compression_algorithms;
 
     let identity = identity.ok_or(Error::InappropriateState)?;
+    // External PSKs are not implemented over DTLS (the engines accept no
+    // PSK at all, so `psk_modes` has nothing to restrict): refuse rather
+    // than run a certificate handshake the caller did not ask for.
+    if !external_psks.is_empty() {
+        return Err(Error::InappropriateState);
+    }
     #[cfg(feature = "ech")]
     if ech_server.is_some() {
         return Err(Error::InappropriateState);
@@ -3466,6 +3558,370 @@ mod tests {
             assert!(!c.hello_retry_request_used());
         }
         assert_eq!(server.take_early_data().unwrap(), b"0rtt");
+    }
+
+    /// Drives a client and a server until one of them refuses a flight,
+    /// returning that error; panics when both finish or stall instead.
+    fn drive_until_error(client: &mut Connection, server: &mut Connection) -> Error {
+        for _ in 0..16 {
+            let _ = client.handshake();
+            let c = client.pop().unwrap_or_default();
+            if !c.is_empty()
+                && let Err(e) = server.feed(&c)
+            {
+                return e;
+            }
+            let _ = server.handshake();
+            let s = server.pop().unwrap_or_default();
+            if !s.is_empty()
+                && let Err(e) = client.feed(&s)
+            {
+                return e;
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                panic!("the handshake completed");
+            }
+        }
+        panic!("the handshake stalled");
+    }
+
+    /// A completed handshake, then one application record each way.
+    fn drive_and_exchange(client: &mut Connection, server: &mut Connection) {
+        drive_pair(client, server);
+        client.send(b"ping").unwrap();
+        server.feed(&client.pop().unwrap()).unwrap();
+        assert_eq!(server.recv().unwrap(), b"ping");
+        server.send(b"pong").unwrap();
+        client.feed(&server.pop().unwrap()).unwrap();
+        assert_eq!(client.recv().unwrap(), b"pong");
+    }
+
+    /// RFC 8446 §4.2.9 `psk_ke`: when both sides allow PSK-only key
+    /// exchange the resumed handshake carries no `key_share`, the (EC)DHE
+    /// input of the key schedule is the zero string (§7.1) and 0-RTT works
+    /// as under `psk_dhe_ke`. The mode is the SERVER's preference among
+    /// the client's advertised ones, and a client that did not advertise
+    /// `psk_ke` is never served it.
+    #[test]
+    fn psk_ke_resumption_with_early_data() {
+        use crate::tls::PskKeyExchangeMode::{self, PskDheKe, PskKe};
+        let session_from = |server_cfg: &Config, client_cfg: &Config| {
+            let mut client = Connection::client(client_cfg).unwrap();
+            let mut server = Connection::server(server_cfg).unwrap();
+            drive_pair(&mut client, &mut server);
+            client.take_session().expect("ticket")
+        };
+        let server_cfg = |modes: &[PskKeyExchangeMode]| {
+            let mut c = tls13_server_builder()
+                .ticket_key([0x5a; 32])
+                .psk_modes(modes)
+                .build();
+            c.max_early_data_size = 4096;
+            c
+        };
+        let client_cfg = |modes: &[PskKeyExchangeMode], session: Option<ResumptionSession>| {
+            let mut b = tls13_client_builder().psk_modes(modes);
+            if let Some(s) = session {
+                b = b.resumption_session(s);
+            }
+            b.build()
+        };
+        for (server_modes, client_modes, expect) in [
+            // The server prefers psk_ke; the client allows it.
+            (&[PskKe, PskDheKe][..], &[PskDheKe, PskKe][..], PskKe),
+            // The server allows only psk_ke; the client allows both.
+            (&[PskKe][..], &[PskKe, PskDheKe][..], PskKe),
+            // The server prefers psk_dhe_ke.
+            (&[PskDheKe, PskKe][..], &[PskKe, PskDheKe][..], PskDheKe),
+            // The client did not advertise psk_ke: the server may prefer
+            // it, but "MUST NOT select a key exchange mode that is not
+            // listed by the client".
+            (&[PskKe, PskDheKe][..], &[PskDheKe][..], PskDheKe),
+        ] {
+            let scfg = server_cfg(server_modes);
+            let session = session_from(&scfg, &client_cfg(client_modes, None));
+            let mut client = Connection::client(&client_cfg(client_modes, Some(session))).unwrap();
+            client.write_early_data(b"0rtt").unwrap();
+            let mut server = Connection::server(&scfg).unwrap();
+            drive_and_exchange(&mut client, &mut server);
+            for c in [&client, &server] {
+                assert!(c.resumed(), "{server_modes:?} / {client_modes:?}");
+                assert!(c.early_data_accepted());
+                assert_eq!(c.psk_key_exchange_mode(), Some(expect));
+                assert_eq!(c.negotiated_group().is_none(), expect == PskKe);
+                assert!(c.external_psk_identity().is_none());
+            }
+            assert_eq!(server.take_early_data().unwrap(), b"0rtt");
+            // The resumed connection is itself resumable (a fresh ticket
+            // came with it).
+            assert!(client.take_session().is_some());
+        }
+
+        // No common mode: the server refuses the PSK and the handshake is a
+        // full one — and a client that advertised only psk_ke can use no
+        // ticket from a psk_dhe_ke-only server, so it is issued none
+        // (§4.2.9). The full handshake itself is unaffected.
+        let scfg = server_cfg(&[PskDheKe]);
+        let mut client = Connection::client(&client_cfg(&[PskKe], None)).unwrap();
+        let mut server = Connection::server(&scfg).unwrap();
+        drive_and_exchange(&mut client, &mut server);
+        assert!(client.take_session().is_none(), "no usable ticket");
+        // With the ticket from a psk_ke-capable server and only psk_ke
+        // advertised, a psk_dhe_ke-only server falls back to a full
+        // handshake rather than pick a mode the client did not list.
+        let session = session_from(&server_cfg(&[PskKe]), &client_cfg(&[PskKe], None));
+        let mut client = Connection::client(&client_cfg(&[PskKe], Some(session))).unwrap();
+        let mut server = Connection::server(&scfg).unwrap();
+        drive_and_exchange(&mut client, &mut server);
+        assert!(!client.resumed() && !server.resumed());
+        assert_eq!(client.psk_key_exchange_mode(), None);
+        // An empty mode list: no PSK offer, no ticket.
+        let session = session_from(&server_cfg(&[PskKe]), &client_cfg(&[PskKe], None));
+        let mut client = Connection::client(&client_cfg(&[], Some(session))).unwrap();
+        let mut server = Connection::server(&server_cfg(&[PskKe, PskDheKe])).unwrap();
+        drive_and_exchange(&mut client, &mut server);
+        assert!(!client.resumed() && client.take_session().is_none());
+    }
+
+    /// A ServerHello without `key_share` is only acceptable when it selects
+    /// a PSK the client offered for `psk_ke`: a server that drops the
+    /// key_share against a client that only advertised `psk_dhe_ke` is
+    /// refused with `illegal_parameter` (RFC 8446 §4.2.9), and one that
+    /// does neither key exchange with `missing_extension` (§9.2).
+    #[test]
+    fn client_refuses_server_hello_without_key_share_unless_psk_ke_offered() {
+        use crate::tls::PskKeyExchangeMode::{self, PskDheKe, PskKe};
+        use crate::tls::codec::{ExtensionType, ReadCursor, ServerHello, read_handshake};
+        // A real resumption ServerHello from a psk_ke server, captured.
+        let server_cfg = tls13_server_builder()
+            .ticket_key([0x5a; 32])
+            .psk_modes(&[PskKe])
+            .build();
+        let client_cfg = |modes: &[PskKeyExchangeMode], s: Option<ResumptionSession>| {
+            let mut b = tls13_client_builder().psk_modes(modes);
+            if let Some(s) = s {
+                b = b.resumption_session(s);
+            }
+            b.build()
+        };
+        let mut client = Connection::client(&client_cfg(&[PskKe, PskDheKe], None)).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        let session = client.take_session().unwrap();
+        // The same session offered under psk_dhe_ke only; the psk_ke server
+        // then runs a full handshake (no common mode) — so instead splice a
+        // key_share-less ServerHello in front of this client by hand:
+        // replay the CH of a psk_ke-capable client to the server, strip
+        // the ServerHello's key exchange, and feed it to the strict one.
+        let strict_cfg = client_cfg(&[PskDheKe], Some(session.clone()));
+        let mut strict = Connection::client(&strict_cfg).unwrap();
+        let _ = strict.handshake();
+        let _ch = strict.pop().unwrap();
+        let mut lax = Connection::client(&client_cfg(&[PskKe, PskDheKe], Some(session))).unwrap();
+        let _ = lax.handshake();
+        let ch = lax.pop().unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        server.feed(&ch).unwrap();
+        let flight = server.pop().unwrap();
+        // The flight is `ServerHello ‖ CCS ‖ encrypted…`; its first record
+        // is the plaintext ServerHello.
+        let sh_len = 5 + u16::from_be_bytes([flight[3], flight[4]]) as usize;
+        let (sh_record, _rest) = flight.split_at(sh_len);
+        let mut c = ReadCursor::new(&sh_record[5..]);
+        let (_, body) = read_handshake(&mut c).unwrap();
+        let sh = ServerHello::decode(body).unwrap();
+        assert!(
+            ext_find(&sh, ExtensionType::KEY_SHARE).is_none()
+                && ext_find(&sh, ExtensionType::PRE_SHARED_KEY).is_some(),
+            "a psk_ke ServerHello: pre_shared_key, no key_share"
+        );
+        fn ext_find(sh: &ServerHello, t: ExtensionType) -> Option<&[u8]> {
+            crate::tls::codec::extension::find(&sh.extensions, t)
+        }
+        fn record(sh: &ServerHello) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::tls::codec::write_record(
+                &mut out,
+                crate::tls::ContentType::Handshake,
+                crate::tls::ProtocolVersion::TLSv1_2,
+                &sh.encode(),
+            )
+            .unwrap();
+            out
+        }
+        // The strict client did not offer psk_ke (its binder differs, but
+        // the SH is checked before any key is derived): illegal_parameter.
+        // (Its own transcript differs from the captured one; the SH
+        // extension check comes first.)
+        let strict_sh = ServerHello {
+            session_id: Vec::new(),
+            ..sh.clone()
+        };
+        assert!(matches!(
+            strict.feed(&record(&strict_sh)),
+            Err(Error::IllegalParameter)
+        ));
+        // Neither PSK nor key_share: missing_extension.
+        let mut none = sh.clone();
+        none.extensions
+            .retain(|(t, _)| *t != ExtensionType::PRE_SHARED_KEY);
+        let mut client = Connection::client(&client_cfg(&[PskKe, PskDheKe], None)).unwrap();
+        let _ = client.handshake();
+        let _ = client.pop().unwrap();
+        assert!(matches!(
+            client.feed(&record(&none)),
+            Err(Error::MissingExtension)
+        ));
+        // A selected_identity past the offered list: illegal_parameter.
+        let mut out_of_range = sh.clone();
+        for (t, body) in out_of_range.extensions.iter_mut() {
+            if *t == ExtensionType::PRE_SHARED_KEY {
+                *body = alloc::vec![0x00, 0x07];
+            }
+        }
+        assert!(matches!(
+            lax.feed(&record(&out_of_range)),
+            Err(Error::IllegalParameter)
+        ));
+    }
+
+    /// RFC 8446 §4.2.11 external PSKs: the same key on both sides
+    /// authenticates the handshake without any certificate, under
+    /// `psk_dhe_ke` or `psk_ke`, on a server with an identity or without
+    /// one; the client offers several and the server picks by identity; a
+    /// wrong key with a known identity is `decrypt_error`; an unknown
+    /// identity falls back to the certificate handshake.
+    #[test]
+    fn external_psk_handshakes() {
+        use crate::tls::PskKeyExchangeMode::{PskDheKe, PskKe};
+        use crate::tls::{ExternalPsk, HashAlg};
+        let psk_a = ExternalPsk::new(b"client-a".to_vec(), alloc::vec![0xA1; 32]).unwrap();
+        let psk_b = ExternalPsk::new(b"client-b".to_vec(), alloc::vec![0xB2; 48])
+            .unwrap()
+            .with_hash(HashAlg::Sha384);
+        let wrong_b = ExternalPsk::new(b"client-b".to_vec(), alloc::vec![0xB3; 48])
+            .unwrap()
+            .with_hash(HashAlg::Sha384);
+
+        for (server_modes, expect) in [(&[PskDheKe][..], PskDheKe), (&[PskKe][..], PskKe)] {
+            // With a certificate, and without one.
+            let with_identity = tls13_server_builder()
+                .psk_modes(server_modes)
+                .external_psk(psk_a.clone())
+                .external_psk(psk_b.clone())
+                .build();
+            let psk_only = Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+                .psk_modes(server_modes)
+                .external_psk(psk_a.clone())
+                .external_psk(psk_b.clone())
+                .build();
+            for server_cfg in [&with_identity, &psk_only] {
+                for (offer, identity) in [
+                    (alloc::vec![psk_a.clone()], &b"client-a"[..]),
+                    // Both offered: the first known one is selected.
+                    (alloc::vec![psk_b.clone(), psk_a.clone()], &b"client-b"[..]),
+                ] {
+                    // A client that verifies certificates against NO
+                    // roots: the PSK must be what authenticates.
+                    let mut b = tls13_client_builder()
+                        .verify_certificates(true)
+                        .psk_modes(&[PskKe, PskDheKe]);
+                    for p in offer {
+                        b = b.external_psk(p);
+                    }
+                    let mut client = Connection::client(&b.build()).unwrap();
+                    let mut server = Connection::server(server_cfg).unwrap();
+                    drive_and_exchange(&mut client, &mut server);
+                    for c in [&client, &server] {
+                        assert_eq!(c.external_psk_identity(), Some(identity));
+                        assert_eq!(c.psk_key_exchange_mode(), Some(expect));
+                        assert!(!c.resumed(), "an external PSK resumes nothing");
+                        assert!(c.peer_certificates().is_empty());
+                        assert_eq!(c.negotiated_group().is_none(), expect == PskKe);
+                    }
+                    // SHA-384 PSK ⇒ a SHA-384 suite.
+                    if identity == b"client-b" {
+                        assert_eq!(client.negotiated_cipher_suite(), Some(0x1302));
+                    }
+                }
+            }
+            // Known identity, wrong key: the binder does not validate and
+            // "the server MUST abort the handshake" (decrypt_error).
+            let mut client = Connection::client(
+                &tls13_client_builder()
+                    .psk_modes(&[PskKe, PskDheKe])
+                    .external_psk(wrong_b.clone())
+                    .build(),
+            )
+            .unwrap();
+            let mut server = Connection::server(&with_identity).unwrap();
+            assert!(matches!(
+                drive_until_error(&mut client, &mut server),
+                Error::DecryptError
+            ));
+        }
+
+        // An unknown identity: the server ignores it and the handshake is
+        // an ordinary certificate one (here with verification off).
+        let unknown = ExternalPsk::new(b"nobody".to_vec(), alloc::vec![0x11; 32]).unwrap();
+        let mut client =
+            Connection::client(&tls13_client_builder().external_psk(unknown.clone()).build())
+                .unwrap();
+        let mut server = Connection::server(
+            &tls13_server_builder()
+                .external_psk(psk_a.clone())
+                .ticket_key([0x5a; 32])
+                .build(),
+        )
+        .unwrap();
+        drive_and_exchange(&mut client, &mut server);
+        assert!(client.external_psk_identity().is_none());
+        assert!(!client.peer_certificates().is_empty());
+        // ... but a PSK-only server has nothing else to offer it.
+        let mut client =
+            Connection::client(&tls13_client_builder().external_psk(unknown).build()).unwrap();
+        let mut server = Connection::server(
+            &Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+                .external_psk(psk_a.clone())
+                .build(),
+        )
+        .unwrap();
+        assert!(matches!(
+            drive_until_error(&mut client, &mut server),
+            Error::HandshakeFailure
+        ));
+        // A PSK-only server needs TLS 1.3 pinned: a version-spanning one
+        // could be asked for a TLS 1.2 certificate handshake.
+        assert!(matches!(
+            Connection::server(&Config::builder().external_psk(psk_a.clone()).build()),
+            Err(Error::InappropriateState)
+        ));
+        // A server that REQUIRES a client certificate accepts no external
+        // PSK (a PSK handshake carries none).
+        let mut roots = crate::tls::RootCertStore::new();
+        roots
+            .add_der(tls13_server_cfg(false).identity.unwrap().cert_chain[0].clone())
+            .unwrap();
+        let mut client =
+            Connection::client(&tls13_client_builder().external_psk(psk_a.clone()).build())
+                .unwrap();
+        let mut server = Connection::server(
+            &tls13_server_builder()
+                .external_psk(psk_a.clone())
+                .client_auth(crate::tls::ClientAuth::new(roots, true))
+                .build(),
+        )
+        .unwrap();
+        assert!(matches!(
+            drive_until_error(&mut client, &mut server),
+            Error::CertificateRequired
+        ));
+        // The key is wiped with the config; it never shows in Debug.
+        assert!(!alloc::format!("{psk_a:?}").contains("161"));
     }
 
     /// `Connection::ech_accepted` reports real ECH on both ends, and stays

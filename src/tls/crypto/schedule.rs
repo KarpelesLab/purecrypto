@@ -310,6 +310,18 @@ impl KeySchedule {
         self.secret = extract(self.alg, derived.as_slice(), ecdhe);
     }
 
+    /// Advances Early → Handshake Secret for PSK-only key exchange
+    /// (`psk_ke`): RFC 8446 §7.1, "if a given secret is not available, then
+    /// the 0-value consisting of a string of Hash.length bytes set to zeros
+    /// is used" — here the (EC)DHE input. The PSK in the Early Secret is
+    /// then the only secret the traffic keys depend on, which is why this
+    /// mode has no forward secrecy.
+    pub(crate) fn enter_handshake_psk_only(&mut self) {
+        let zeros = [0u8; MAX_SECRET];
+        let n = self.alg.output_len();
+        self.enter_handshake(&zeros[..n]);
+    }
+
     /// Advances Handshake → Master Secret (extract with a zero IKM).
     pub(crate) fn enter_master(&mut self) {
         let derived = self.derive_for_next();

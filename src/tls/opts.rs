@@ -30,6 +30,7 @@ use super::connection::ResumptionSession;
 use super::groups::NamedGroup;
 use super::keylog::KeyLog;
 use super::pki::{CrlStore, RootCertStore};
+use super::psk::{ExternalPsk, PskKeyExchangeMode};
 use super::secret::Secret32;
 use super::signer::HandshakeSigner;
 use super::version::ProtocolVersion;
@@ -72,6 +73,8 @@ pub(crate) struct CommonOpts<'a> {
     pub key_log: &'a Option<Arc<dyn KeyLog>>,
     pub rng: &'a Option<Arc<dyn EntropySource>>,
     pub signer: &'a Option<Arc<dyn HandshakeSigner>>,
+    pub psk_modes: &'a [PskKeyExchangeMode],
+    pub external_psks: &'a [ExternalPsk],
 }
 
 /// Options only a client consumes.
@@ -161,6 +164,8 @@ impl Config {
             rng,
             signer,
             resumption,
+            psk_modes,
+            external_psks,
         } = self;
         ConfigParts {
             common: CommonOpts {
@@ -184,6 +189,8 @@ impl Config {
                 key_log,
                 rng,
                 signer,
+                psk_modes,
+                external_psks,
             },
             client: ClientOpts {
                 server_name: server_name.as_deref(),

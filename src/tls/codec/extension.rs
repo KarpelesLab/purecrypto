@@ -592,7 +592,7 @@ pub(crate) fn client_offers_tls13(body: &[u8]) -> Result<bool, Error> {
 }
 
 /// `psk_key_exchange_modes` (RFC 8446 §4.2.9): a `u8`-length list of mode
-/// bytes. We use `1 = psk_dhe_ke` (PSK with ECDHE for forward secrecy).
+/// bytes (`0 = psk_ke`, `1 = psk_dhe_ke`).
 pub(crate) fn psk_key_exchange_modes(modes: &[u8]) -> RawExtension {
     let mut body = Vec::new();
     with_len_u8(&mut body, |b| b.extend_from_slice(modes));
@@ -626,8 +626,10 @@ pub(crate) fn early_data_with_size(max: u32) -> RawExtension {
 }
 
 /// Builds a client-side `pre_shared_key` extension carrying `identities` and
-/// placeholder zero binders. Each identity is `(ticket_bytes,
-/// obfuscated_ticket_age)`. Each binder is `hash_len` bytes of zero.
+/// placeholder zero binders. Each identity is `(identity_bytes,
+/// obfuscated_ticket_age, hash_len)` — a ticket or an external PSK
+/// identity — and its binder is `hash_len` bytes of zero (the length of the
+/// hash the PSK goes with, RFC 8446 §4.2.11.2).
 ///
 /// Returns `(extension, binders_field_len)` where `binders_field_len` is the
 /// number of bytes at the END of the extension body occupied by the binders
@@ -641,24 +643,26 @@ pub(crate) fn early_data_with_size(max: u32) -> RawExtension {
 /// their size is peer-influenced and must not reach the encoder's length
 /// assertion).
 pub(crate) fn client_pre_shared_key_placeholder(
-    identities: &[(Vec<u8>, u32)],
-    hash_len: usize,
+    identities: &[(Vec<u8>, u32, usize)],
 ) -> Result<(RawExtension, usize), Error> {
-    let ids_len = identities
-        .iter()
-        .fold(0usize, |acc, (id, _)| acc.saturating_add(2 + id.len() + 4));
-    let binders_len = identities.len().saturating_mul(1 + hash_len);
+    let ids_len = identities.iter().fold(0usize, |acc, (id, _, _)| {
+        acc.saturating_add(2 + id.len() + 4)
+    });
+    let binders_len = identities.iter().fold(0usize, |acc, (_, _, hash_len)| {
+        acc.saturating_add(1 + hash_len)
+    });
     if ids_len > 0xFFFF
         || binders_len > 0xFFFF
-        || hash_len > 0xFF
-        || identities.iter().any(|(id, _)| id.len() > 0xFFFF)
+        || identities
+            .iter()
+            .any(|(id, _, hash_len)| id.len() > 0xFFFF || *hash_len > 0xFF)
     {
         return Err(Error::HandshakeFailure);
     }
     let mut body = Vec::new();
     // identities<7..2^16-1>
     with_len_u16(&mut body, |list| {
-        for (id, age) in identities {
+        for (id, age, _) in identities {
             with_len_u16(list, |b| b.extend_from_slice(id));
             list.extend_from_slice(&age.to_be_bytes());
         }
@@ -667,8 +671,8 @@ pub(crate) fn client_pre_shared_key_placeholder(
     // + `hash_len` zeros.
     let binders_start = body.len();
     with_len_u16(&mut body, |list| {
-        for _ in identities {
-            with_len_u8(list, |b| b.extend(core::iter::repeat_n(0u8, hash_len)));
+        for (_, _, hash_len) in identities {
+            with_len_u8(list, |b| b.extend(core::iter::repeat_n(0u8, *hash_len)));
         }
     });
     let binders_len = body.len() - binders_start;

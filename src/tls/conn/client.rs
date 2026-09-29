@@ -36,6 +36,7 @@ use crate::tls::crypto::{
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
+use crate::tls::psk::{ExternalPsk, PskKeyExchangeMode, modes_wire};
 use crate::tls::{AlertDescription, Error};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
@@ -412,6 +413,14 @@ pub(crate) struct ClientConfig {
     /// wire; any `CompressedCertificate` received is rejected).
     #[cfg(feature = "cert-compression")]
     pub cert_compression_algorithms: Vec<u16>,
+    /// The PSK key-exchange modes advertised in `psk_key_exchange_modes`
+    /// (RFC 8446 §4.2.9) and accepted from the ServerHello; `psk_dhe_ke`
+    /// alone by default. Empty offers no PSK at all. See
+    /// [`crate::tls::Config::psk_modes`].
+    pub psk_modes: Vec<PskKeyExchangeMode>,
+    /// Externally provisioned PSKs to offer after the resumption ticket, if
+    /// any (RFC 8446 §4.2.11). See [`crate::tls::Config::external_psks`].
+    pub external_psks: Vec<ExternalPsk>,
 }
 
 impl ClientConfig {
@@ -442,6 +451,8 @@ impl ClientConfig {
             ech: None,
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
+            psk_modes: alloc::vec![PskKeyExchangeMode::PskDheKe],
+            external_psks: Vec::new(),
         }
     }
 
@@ -804,10 +815,17 @@ pub struct ClientConnection {
     /// records the server sends under the application-traffic keys.
     record_size_limit_negotiated: bool,
 
-    /// PSK we offered in CH (if `config.session` was set). When the server
-    /// echoes `pre_shared_key` in SH with `selected_identity = 0`, we
-    /// seed the key schedule from this PSK.
-    psk_offered: Option<PskOfferState>,
+    /// The PSKs offered in the ClientHello, in identity order: the
+    /// resumption ticket of `config.session` first (when one is offered),
+    /// then the external PSKs. The server's `selected_identity` indexes
+    /// this list; the key schedule is seeded from the selected entry.
+    psk_offered: Vec<OfferedPsk>,
+    /// The key-exchange mode of the accepted PSK (RFC 8446 §4.2.9): with a
+    /// `key_share` in the ServerHello `psk_dhe_ke`, without one `psk_ke`.
+    psk_mode: Option<PskKeyExchangeMode>,
+    /// The identity of the accepted external PSK; `None` when the accepted
+    /// PSK was the resumption ticket, or none was accepted.
+    external_psk_identity: Option<Vec<u8>>,
     /// Set to `true` if the server accepted our PSK offer. Drives the
     /// resumption-specific code paths after SH.
     psk_accepted: bool,
@@ -982,15 +1000,31 @@ pub(crate) enum EchOutcome {
     Rejected,
 }
 
-/// What the client retains across CH emission so it can verify the server's
-/// PSK selection and seed the key schedule when the PSK is accepted.
-struct PskOfferState {
+/// One PSK offered in the ClientHello, retained so the client can verify
+/// the server's selection and seed the key schedule when it is accepted.
+struct OfferedPsk {
+    /// The identity on the wire: the session ticket, or the external PSK's
+    /// identity.
+    identity: Vec<u8>,
     /// The PSK bytes (derived from a prior session's
-    /// `resumption_master_secret`), wiped when the connection drops.
+    /// `resumption_master_secret`, or provisioned out of band), wiped when
+    /// the connection drops.
     psk: Zeroizing<Vec<u8>>,
-    /// The hash function fixed by the original session's cipher suite.
+    /// The hash function the PSK goes with: the original session's cipher
+    /// suite's, or the one the external PSK was provisioned for.
     hash: HashAlg,
+    /// `true` for an external PSK (RFC 8446 §4.2.11): its
+    /// `obfuscated_ticket_age` is 0 and its binder is keyed under
+    /// `binder_label`.
+    external: bool,
+    /// The binder key's label: `"res binder"` for the ticket, the
+    /// [`ExternalPsk::binder_label`] otherwise.
+    binder_label: &'static [u8],
 }
+
+/// Cap on the external PSKs one ClientHello offers. Each identity rides in
+/// the hello with a binder, and a server tries them in order.
+const MAX_OFFERED_EXTERNAL_PSKS: usize = 8;
 
 /// A `NewSessionTicket` received from the server, exposed for inspection and
 /// (eventually) PSK-based resumption.
@@ -1095,11 +1129,24 @@ impl ClientConnection {
         self.stored_session.take()
     }
 
-    /// Whether the server accepted our PSK offer in the just-completed
-    /// handshake. Always `false` for a fresh connection; `true` only when
-    /// `ClientConfig::with_session` was used and the server selected the PSK.
+    /// Whether the server accepted our resumption offer in the
+    /// just-completed handshake. Always `false` for a fresh connection;
+    /// `true` only when `ClientConfig::with_session` was used and the server
+    /// selected that PSK — an external PSK resumes nothing (see
+    /// [`external_psk_identity`](Self::external_psk_identity)).
     pub fn psk_accepted(&self) -> bool {
-        self.psk_accepted
+        self.psk_accepted && self.external_psk_identity.is_none()
+    }
+
+    /// The key-exchange mode of the PSK the server selected (RFC 8446
+    /// §4.2.9); `None` when it selected none.
+    pub fn psk_key_exchange_mode(&self) -> Option<PskKeyExchangeMode> {
+        self.psk_mode
+    }
+
+    /// The identity of the external PSK the server selected, if any.
+    pub fn external_psk_identity(&self) -> Option<&[u8]> {
+        self.external_psk_identity.as_deref()
     }
 
     /// Whether the server accepted our 0-RTT offer (`early_data` extension
@@ -1535,13 +1582,21 @@ impl ClientConnection {
             }
         }
 
-        // Real ECH and PSK resumption are not wired together yet
+        // Real ECH and PSKs are not wired together yet
         // (`seal_real_ech_on_ch1` refuses to seal when a PSK is offered).
         // ECH must win that conflict: it exists to keep `server_name` off the
         // wire, whereas the ticket only saves a certificate round trip — so
-        // drop the session and run a full, sealed handshake instead.
-        if config.session.is_some() && config_wants_real_ech(&config) {
+        // drop the session (and the external PSKs) and run a full, sealed
+        // handshake instead.
+        if config_wants_real_ech(&config) {
             config.session = None;
+            config.external_psks.clear();
+        }
+        // RFC 8446 §4.2.9: a PSK is only usable in an advertised mode. With
+        // none allowed there is nothing to offer.
+        if config.psk_modes.is_empty() {
+            config.session = None;
+            config.external_psks.clear();
         }
 
         // draft-ietf-tls-esni-22 §6.1 / §6.1.7: a real-ECH client never
@@ -1645,7 +1700,9 @@ impl ClientConnection {
             last_ticket: None,
             alpn_negotiated: None,
             record_size_limit_negotiated: false,
-            psk_offered: None,
+            psk_offered: Vec::new(),
+            psk_mode: None,
+            external_psk_identity: None,
             psk_accepted: false,
             handshake_start: system_now(),
             stored_session: None,
@@ -1671,13 +1728,40 @@ impl ClientConnection {
             #[cfg(feature = "ech")]
             ech_grease_seed,
         };
-        // Remember the offered PSK so we can seed the schedule when the
-        // server selects it in SH.
+        // Remember the offered PSKs so we can seed the schedule when the
+        // server selects one in SH: the session first (identity 0, the one
+        // any early data is keyed under), then the external PSKs whose hash
+        // goes with a suite of this offer (RFC 8446 §4.2.11: the server can
+        // only select a PSK together with a suite of its hash).
         if let Some(session) = conn.config.session.as_ref() {
-            conn.psk_offered = Some(PskOfferState {
+            conn.psk_offered.push(OfferedPsk {
+                identity: session.ticket.clone(),
                 psk: session.psk.clone(),
                 hash: session.cipher_suite_hash,
+                external: false,
+                binder_label: b"res binder",
             });
+        }
+        for psk in conn
+            .config
+            .external_psks
+            .iter()
+            .filter(|p| {
+                effective_suites
+                    .iter()
+                    .any(|s| suite_hash(*s) == Some(p.hash()))
+            })
+            .take(MAX_OFFERED_EXTERNAL_PSKS)
+        {
+            conn.psk_offered.push(OfferedPsk {
+                identity: psk.identity().to_vec(),
+                psk: psk.secret().clone(),
+                hash: psk.hash(),
+                external: true,
+                binder_label: psk.binder_label(),
+            });
+        }
+        if let Some(session) = conn.config.session.as_ref() {
             // 0-RTT is keyed under the suite that issued the ticket, so it
             // can only be offered when that suite is still in our offer.
             if matches!(session.max_early_data_size, Some(n) if n > 0)
@@ -1789,7 +1873,7 @@ impl ClientConnection {
         // is set).
         if conn.early_data_offered
             && let (Some(psk_state), Some(session_suite)) = (
-                conn.psk_offered.as_ref(),
+                conn.psk_offered.first().filter(|p| !p.external),
                 conn.config.session.as_ref().map(|s| s.cipher_suite),
             )
             // RFC 8446 §4.6.1: the early-data keys come from the *stored
@@ -1829,9 +1913,9 @@ impl ClientConnection {
     /// specific group); if empty, all `groups` get one. `extra_extensions`
     /// (typically the HRR-supplied `cookie`) are appended verbatim.
     ///
-    /// When `self.config.session` carries a resumption ticket, also adds
-    /// `psk_key_exchange_modes` and a `pre_shared_key` extension whose binder
-    /// is computed over the truncated ClientHello and patched in place. The
+    /// When `self.psk_offered` is non-empty (a resumption ticket and/or
+    /// external PSKs), also adds a `pre_shared_key` extension whose binders
+    /// are computed over the truncated ClientHello and patched in place. The
     /// returned bytes are ready to emit to the wire and to feed to the
     /// transcript.
     ///
@@ -2039,24 +2123,27 @@ impl ClientConnection {
             }
         }
 
-        // RFC 8446 §4.2.9: `psk_key_exchange_modes` names the resumption
-        // modes this client can use for the tickets it is about to be
-        // issued — not only for a PSK it is offering now. It goes out on
-        // every ClientHello: a server "SHOULD NOT send NewSessionTicket with
+        // RFC 8446 §4.2.9: `psk_key_exchange_modes` names the modes this
+        // client can use PSKs in — for the tickets it is about to be issued,
+        // not only for a PSK it is offering now. It goes out on every
+        // ClientHello: a server "SHOULD NOT send NewSessionTicket with
         // tickets that are not compatible with the advertised modes", and
         // BoringSSL reads no advertisement as no compatible mode and issues
         // no ticket at all, so a fresh handshake that left it out could
-        // never be resumed against such a server.
-        extensions.push(ext::psk_key_exchange_modes(&[1])); // psk_dhe_ke
+        // never be resumed against such a server. `psk_dhe_ke` alone by
+        // default; `psk_ke` only when the configuration opted into giving
+        // up forward secrecy. No modes at all means no PSK use whatsoever
+        // (the constructor then offers none either).
+        let modes = modes_wire(&self.config.psk_modes);
+        if !modes.is_empty() {
+            extensions.push(ext::psk_key_exchange_modes(&modes));
+        }
 
-        // PSK resumption: optional early_data, then pre_shared_key (which
-        // must be LAST per RFC 8446 §4.2.11). The binder is patched after
-        // we know the truncated CH bytes.
-        // The binder PSK copy is `Zeroizing`: it is a clone of the stored
-        // session's long-lived resumption secret and must not outlive this
-        // function on the stack.
-        let mut psk_binder_info: Option<(HashAlg, Zeroizing<Vec<u8>>, usize)> = None;
-        if let Some(session) = &self.config.session {
+        // PSKs: optional early_data, then pre_shared_key (which must be
+        // LAST per RFC 8446 §4.2.11). The binders are patched after we know
+        // the truncated CH bytes.
+        let mut binders_len = 0;
+        if !self.psk_offered.is_empty() {
             // RFC 8446 §4.1.4 / §4.2.10: `early_data` MUST NOT appear in
             // the retry ClientHello — 0-RTT is over once an HRR arrives.
             // And only when 0-RTT is actually offered (`early_data_offered`:
@@ -2068,13 +2155,22 @@ impl ClientConnection {
             if hrr_transcript.is_none() && self.early_data_offered {
                 extensions.push(ext::early_data_empty());
             }
-            let hash = session.cipher_suite_hash;
-            let hash_len = hash.output_len();
-            let age = self.compute_obfuscated_age(session);
-            let (ext_with_zeros, binders_len) =
-                ext::client_pre_shared_key_placeholder(&[(session.ticket.clone(), age)], hash_len)?;
+            // §4.2.11: `obfuscated_ticket_age` is the ticket's age for a
+            // resumption PSK and "SHOULD" be 0 for an external one.
+            let identities: Vec<(Vec<u8>, u32, usize)> = self
+                .psk_offered
+                .iter()
+                .map(|p| {
+                    let age = match (p.external, self.config.session.as_ref()) {
+                        (false, Some(session)) => self.compute_obfuscated_age(session),
+                        _ => 0,
+                    };
+                    (p.identity.clone(), age, p.hash.output_len())
+                })
+                .collect();
+            let (ext_with_zeros, len) = ext::client_pre_shared_key_placeholder(&identities)?;
             extensions.push(ext_with_zeros);
-            psk_binder_info = Some((hash, session.psk.clone(), binders_len));
+            binders_len = len;
         }
 
         // `try_encode` rather than `encode`: the extension list can carry
@@ -2092,16 +2188,15 @@ impl ClientConnection {
         }
         .try_encode()?;
 
-        // Patch the binder: HMAC(binder_finished_key, Transcript-Hash(
+        // Patch the binders: HMAC(binder_finished_key, Transcript-Hash(
         // [message_hash(CH1) ‖ HRR ‖] truncated_CH)) — the bracketed prefix
         // only on the post-HRR retry (RFC 8446 §4.2.11.2).
-        if let Some((hash, psk, binders_len)) = psk_binder_info {
+        if binders_len > 0 {
             let truncated_len = bytes.len().saturating_sub(binders_len);
-            patch_psk_binder(
+            patch_psk_binders(
                 &mut bytes,
                 truncated_len,
-                hash,
-                &psk,
+                &self.psk_offered,
                 hrr_transcript.unwrap_or(&[]),
             );
         }
@@ -2681,49 +2776,95 @@ impl ClientConnection {
         // reordering — the transcript update happens a few lines down.
         self.core.transcript.set_alg(suite.hash);
 
-        // ECDHE from the server's key share.
-        let ks_ext = ext::find(&sh.extensions, crate::tls::codec::ExtensionType::KEY_SHARE)
-            .ok_or(Error::HandshakeFailure)?;
-        let (group, server_pub) = ext::parse_server_key_share(ks_ext)?;
-        // RFC 8446 §4.1.3: the server's key_share group MUST be one the client
-        // offered (and for which we therefore hold a private key). Reject any
-        // other group with illegal_parameter (mirrors the HRR path's check).
-        if !self.offered_groups.contains(&group) {
+        // PSK acceptance (RFC 8446 §4.2.11): `pre_shared_key` in the SH
+        // names one of the identities we offered; "clients MUST verify that
+        // the server's selected_identity is within the range supplied by
+        // the client, that the server selected a cipher suite indicating a
+        // Hash associated with the PSK". The key schedule is then seeded
+        // from that PSK instead of all-zeros.
+        let selected_psk: Option<&OfferedPsk> =
+            match ext::find(&sh.extensions, ExtensionType::PRE_SHARED_KEY) {
+                Some(psk_body) => {
+                    let idx = usize::from(ext::parse_server_pre_shared_key(psk_body)?);
+                    let offered = self.psk_offered.get(idx).ok_or(Error::IllegalParameter)?;
+                    if suite.hash != offered.hash {
+                        return Err(Error::IllegalParameter);
+                    }
+                    Some(offered)
+                }
+                None => None,
+            };
+        // The key-exchange mode (§4.2.9) follows from the `key_share`: with
+        // one, the (EC)DHE secret is mixed in (`psk_dhe_ke`, or a full
+        // handshake when no PSK was selected); without one, the PSK is the
+        // only secret (`psk_ke`). "Servers MUST NOT select a key exchange
+        // mode that is not listed by the client": a ServerHello without a
+        // key_share is accepted only when the PSK it selects was offered
+        // for `psk_ke`, and one with a key_share only when the selected PSK
+        // was offered for `psk_dhe_ke` (`illegal_parameter` otherwise). A
+        // ServerHello with neither a PSK nor a key_share has done no key
+        // exchange at all (§9.2: `missing_extension`).
+        let ks_ext = ext::find(&sh.extensions, crate::tls::codec::ExtensionType::KEY_SHARE);
+        let mode = match (selected_psk.is_some(), ks_ext.is_some()) {
+            (true, false) => Some(PskKeyExchangeMode::PskKe),
+            (true, true) => Some(PskKeyExchangeMode::PskDheKe),
+            (false, true) => None,
+            (false, false) => return Err(Error::MissingExtension),
+        };
+        if let Some(m) = mode
+            && !self.config.psk_modes.contains(&m)
+        {
             return Err(Error::IllegalParameter);
         }
         // RFC 8446 §4.1.4: when this ServerHello follows a HelloRetryRequest
         // that selected a group, the server MUST send a key_share for that
-        // exact group. Pin it — a mismatch is a protocol violation (the server
-        // forcing us to a different group than the one it just demanded).
-        if let Some(hrr_group) = self.hrr_selected_group
-            && group != hrr_group
-        {
+        // exact group. Pin it — a mismatch is a protocol violation (the
+        // server forcing us to a different group than the one it just
+        // demanded), and so is doing without one after asking for it.
+        if self.hrr_selected_group.is_some() && ks_ext.is_none() {
             return Err(Error::IllegalParameter);
         }
-        let shared = self.key_agreement(group, &server_pub)?;
-        self.negotiated_group = Some(group);
 
-        // PSK acceptance: if the server echoes pre_shared_key in SH with
-        // `selected_identity = 0`, seed the schedule from the offered PSK
-        // instead of all-zeros. Suite hash must match the offered PSK's hash.
-        let mut ks =
-            if let Some(psk_body) = ext::find(&sh.extensions, ExtensionType::PRE_SHARED_KEY) {
-                let idx = ext::parse_server_pre_shared_key(psk_body)?;
-                let offered = self.psk_offered.as_ref().ok_or(Error::IllegalParameter)?;
-                // We only offer one identity; the server must select index 0.
-                if idx != 0 {
+        // ECDHE from the server's key share (`psk_dhe_ke` / full handshake).
+        let shared: Option<Secret> = match ks_ext {
+            Some(ks_ext) => {
+                let (group, server_pub) = ext::parse_server_key_share(ks_ext)?;
+                // RFC 8446 §4.1.3: the server's key_share group MUST be one
+                // the client offered (and for which we therefore hold a
+                // private key). Reject any other group with
+                // illegal_parameter (mirrors the HRR path's check).
+                if !self.offered_groups.contains(&group) {
                     return Err(Error::IllegalParameter);
                 }
-                // The hash of the selected suite must match the offered PSK's hash.
-                if suite.hash != offered.hash {
+                if let Some(hrr_group) = self.hrr_selected_group
+                    && group != hrr_group
+                {
                     return Err(Error::IllegalParameter);
                 }
+                let shared = self.key_agreement(group, &server_pub)?;
+                self.negotiated_group = Some(group);
+                Some(shared)
+            }
+            None => None,
+        };
+
+        let mut ks = match selected_psk {
+            Some(offered) => {
                 self.psk_accepted = true;
+                self.psk_mode = mode;
+                if offered.external {
+                    self.external_psk_identity = Some(offered.identity.clone());
+                }
                 KeySchedule::with_psk(suite.hash, &offered.psk)
-            } else {
-                KeySchedule::new(suite.hash)
-            };
-        ks.enter_handshake(shared.as_slice());
+            }
+            None => KeySchedule::new(suite.hash),
+        };
+        // RFC 8446 §7.1: without an (EC)DHE secret the handshake secret is
+        // extracted from a string of Hash.length zeros.
+        match shared.as_ref() {
+            Some(shared) => ks.enter_handshake(shared.as_slice()),
+            None => ks.enter_handshake_psk_only(),
+        }
 
         // draft-ietf-tls-esni-22 §7: if real-ECH was attempted, the
         // server tells us whether it accepted by writing 8 bytes into
@@ -2949,6 +3090,11 @@ impl ClientConnection {
         // Pin the negotiated hash so the transcript helpers below can
         // run (HRR is the first message after CH1 where we know it).
         self.core.transcript.set_alg(suite.hash);
+        // RFC 8446 §4.1.4 lets the retry ClientHello drop "any PSKs which
+        // are incompatible with the server's indicated cipher suite"; do
+        // so, since the server could not select them anyway (§4.2.11) and
+        // the identity indices it echoes then refer to this shorter list.
+        self.psk_offered.retain(|p| p.hash == suite.hash);
 
         // draft-ietf-tls-esni-22 §7.2.1: if the HRR carries an
         // `encrypted_client_hello` extension, it MUST be exactly 8
@@ -3471,7 +3617,10 @@ impl ClientConnection {
                     // client MUST abort with `illegal_parameter`. Accepting
                     // would mark 0-RTT as "accepted" on a full handshake and
                     // emit EndOfEarlyData under keys the server never had.
-                    if !self.psk_accepted {
+                    // Early data is keyed under the FIRST offered identity,
+                    // the resumption ticket; a server that selected an
+                    // external PSK instead cannot have read it either.
+                    if !self.psk_accepted || self.external_psk_identity.is_some() {
                         return Err(Error::IllegalParameter);
                     }
                     // RFC 8446 §4.6.1: our 0-RTT records were protected
@@ -4336,7 +4485,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     // Real ECH + PSK is not wired together; the constructor already
     // dropped any stored session, so a PSK here is a bug — refuse rather
     // than send the plain hello.
-    if conn.psk_offered.is_some() {
+    if !conn.psk_offered.is_empty() {
         return Err(Error::EchConfigUnusable);
     }
     // Clone the selected ECHConfig so we don't hold a long borrow of
@@ -4518,51 +4667,63 @@ fn suite_hash(s: CipherSuite) -> Option<HashAlg> {
     lookup_suite(s).map(|p| p.hash)
 }
 
-/// Patches a single PSK binder into the ClientHello bytes built by
+/// Patches the PSK binders into the ClientHello bytes built by
 /// [`ClientConnection::build_client_hello`].
 ///
 /// `ch[..truncated_len]` is the truncated CH (everything before the
 /// `pre_shared_key` binders field). The remaining `ch[truncated_len..]` is
-/// the binders field laid out as `u16 outer_len ‖ u8 inner_len ‖ binder_bytes`,
-/// where `binder_bytes` is currently `hash_len` zeros. The function computes
-/// `binder = HMAC(binder_finished_key(binder_key("res binder")),
-/// Transcript-Hash(transcript_prefix ‖ truncated_CH))` and overwrites the
-/// trailing `hash_len` bytes of `ch` in place.
+/// the binders field laid out as `u16 outer_len ‖ (u8 inner_len ‖
+/// binder_bytes)*`, one entry per offered PSK in order, where each
+/// `binder_bytes` is currently `hash_len` zeros. The function computes
+/// `binder = HMAC(binder_finished_key(binder_key(label)),
+/// Transcript-Hash(transcript_prefix ‖ truncated_CH))` for each PSK — the
+/// label is `"res binder"` for a resumption PSK and `"ext binder"` or
+/// `"imp binder"` for an external one (RFC 8446 §4.2.11.2, RFC 9258
+/// §5.2), so no kind of binder can stand in for another — and overwrites
+/// the zeros in place. Every binder is computed over the same truncated
+/// hello, only the key differs.
 ///
 /// `transcript_prefix` is empty for the first ClientHello. For the retry
 /// ClientHello after a HelloRetryRequest it is the running transcript
 /// `message_hash(Hash(CH1)) ‖ HRR` (RFC 8446 §4.4.1), because §4.2.11.2
 /// defines the CH2 binder over `Transcript-Hash(ClientHello1,
 /// HelloRetryRequest, Truncate(ClientHello2))`.
-fn patch_psk_binder(
+fn patch_psk_binders(
     ch: &mut [u8],
     truncated_len: usize,
-    hash: HashAlg,
-    psk: &[u8],
+    psks: &[OfferedPsk],
     transcript_prefix: &[u8],
 ) {
-    let hash_len = hash.output_len();
-    let ks = KeySchedule::with_psk(hash, psk);
-    let res_bk = ks.binder_key(b"res binder");
-    let fk = binder_finished_key(hash, &res_bk);
-    let th = if transcript_prefix.is_empty() {
-        hash.hash(&ch[..truncated_len])
-    } else {
-        let mut tbuf = Vec::with_capacity(transcript_prefix.len() + truncated_len);
-        tbuf.extend_from_slice(transcript_prefix);
-        tbuf.extend_from_slice(&ch[..truncated_len]);
-        hash.hash(&tbuf)
-    };
-    let binder: Vec<u8> = match hash {
-        HashAlg::Sha256 => Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
-            .as_ref()
-            .to_vec(),
-        HashAlg::Sha384 => Hmac::<Sha384>::mac(fk.as_slice(), th.as_slice())
-            .as_ref()
-            .to_vec(),
-    };
-    let start = ch.len() - hash_len;
-    ch[start..].copy_from_slice(&binder);
+    // Past the `u16 outer_len` of the binders field.
+    let mut pos = truncated_len + 2;
+    for p in psks {
+        let hash = p.hash;
+        let hash_len = hash.output_len();
+        let ks = KeySchedule::with_psk(hash, &p.psk);
+        let bk = ks.binder_key(p.binder_label);
+        let fk = binder_finished_key(hash, &bk);
+        let th = if transcript_prefix.is_empty() {
+            hash.hash(&ch[..truncated_len])
+        } else {
+            let mut tbuf = Vec::with_capacity(transcript_prefix.len() + truncated_len);
+            tbuf.extend_from_slice(transcript_prefix);
+            tbuf.extend_from_slice(&ch[..truncated_len]);
+            hash.hash(&tbuf)
+        };
+        let binder: Vec<u8> = match hash {
+            HashAlg::Sha256 => Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
+                .as_ref()
+                .to_vec(),
+            HashAlg::Sha384 => Hmac::<Sha384>::mac(fk.as_slice(), th.as_slice())
+                .as_ref()
+                .to_vec(),
+        };
+        // Past this binder's `u8 inner_len`.
+        pos += 1;
+        ch[pos..pos + hash_len].copy_from_slice(&binder);
+        pos += hash_len;
+    }
+    debug_assert_eq!(pos, ch.len());
 }
 
 fn is_hello_retry_request(random: &Random) -> bool {
@@ -5855,7 +6016,7 @@ mod tests {
         let mut rng = HmacDrbg::<Sha256>::new(b"ech-psk-client", b"nonce", &[]);
         let mut client = ClientConnection::new(cfg, inner_sni, &mut rng).unwrap();
 
-        assert!(client.psk_offered.is_none(), "the session must be dropped");
+        assert!(client.psk_offered.is_empty(), "the session must be dropped");
         assert!(client.ech_state.is_some(), "the hello must be sealed");
         let out = client.write_tls();
         assert!(
@@ -6312,7 +6473,7 @@ mod tests {
             let mut rng = HmacDrbg::<Sha256>::new(b"psk-scope", connect_to.as_bytes(), &[]);
             let config = ClientConfig::new(RootCertStore::new()).with_session(session);
             let client = ClientConnection::new(config, connect_to, &mut rng).unwrap();
-            client.psk_offered.is_some()
+            !client.psk_offered.is_empty()
         }
 
         // Control: same name, fresh ticket.
