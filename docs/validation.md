@@ -1073,15 +1073,16 @@ code site:
 - **Scope**: the crate is primitives + TLS/PKI plumbing (OpenSSL-like). Threshold
   / multi-party / message-envelope layers are out of scope.
 - **Coverage gaps**: ML-KEM ACVP is a trimmed slice (not the full corpus);
-  DTLS 1.3 has a single external peer (wolfSSL), and its resumption,
+  DTLS 1.3 has a single external peer (wolfSSL), and its resumption and
   0-RTT are not implemented at all; the
   RFC 9146 §6 peer-address update is exercised end to end by the CLI's own
   client and server only (no peer tool moves its socket mid-connection),
   and the return-routability check of draft-ietf-tls-dtls-rrc is not
   implemented (no peer in the matrix speaks it; the application's
   obligation is documented on `Connection::datagram_allows_peer_address_update`);
-  the QUIC client cannot offer a
-  non-v1 version, so its Version Negotiation handling is unit-tested only;
+  RFC 9368 compatible version negotiation (the v1 → v2 upgrade without a
+  round trip) is exercised by purecrypto against itself only, since
+  quic-go v0.63 does not send `version_information`;
   no NIST FIPS validation (CMVP) and no third-party audit.
 
 ---
