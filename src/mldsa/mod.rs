@@ -577,12 +577,16 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         // the two bounds it failed. The attempt count itself is public.
         let z_bad = vec_inf_norm(&z) >= p.gamma1 - p.beta;
 
-        // r0 = LowBits(w − c·s2).
+        // r0 = LowBits(w − c·s2). w itself is not needed again (w1 is
+        // already hashed), so it is overwritten with w − c·s2 for the hint
+        // pass below instead of recomputing c·s2 there.
         for i in 0..K {
             let mut cs2 = ntt_mul(&c_ntt, &s2_ntt[i]);
             cs2.inv_ntt();
             for (jj, slot) in r0[i].iter_mut().enumerate() {
-                let (_, low) = decompose(sub(w[i].c[jj], cs2.c[jj]), p.gamma2);
+                let r = sub(w[i].c[jj], cs2.c[jj]);
+                w[i].c[jj] = r;
+                let (_, low) = decompose(r, p.gamma2);
                 *slot = low;
             }
             wipe_polys(core::slice::from_mut(&mut cs2));
@@ -602,16 +606,12 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         }
         let ct0_bad = vec_inf_norm(&ct0) >= p.gamma2;
 
-        // Hints.
+        // Hints, from the w − c·s2 the r0 pass left in w.
         let mut hints = [Poly::zero(); K];
         for i in 0..K {
-            let mut cs2 = ntt_mul(&c_ntt, &s2_ntt[i]);
-            cs2.inv_ntt();
             for jj in 0..N {
-                let r = sub(w[i].c[jj], cs2.c[jj]);
-                hints[i].c[jj] = make_hint(ct0[i].c[jj], r, p.gamma2);
+                hints[i].c[jj] = make_hint(ct0[i].c[jj], w[i].c[jj], p.gamma2);
             }
-            wipe_polys(core::slice::from_mut(&mut cs2));
         }
         let hint_bad = count_ones(&hints) > p.omega;
         // As above: the reject decision is public.
@@ -640,7 +640,7 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     // Wipe the transient secrets before returning: rho' (and seed_buf, which
     // carries a copy of it), the unpacked secret vectors s1 / s2 / t0 and
     // their NTT copies, the accepted candidate's mask vectors y / y_ntt, and
-    // the secret-derived w / r0 / ct0. mu, w1, c, ctilde, hints and z are
+    // the secret-derived w (by now w − c·s2) / r0 / ct0. mu, w1, c, ctilde, hints and z are
     // public or part of the signature.
     Zeroize::zeroize(&mut rho_prime);
     Zeroize::zeroize(&mut seed_buf);
