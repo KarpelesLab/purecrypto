@@ -5,8 +5,9 @@
 //! points use the untwisted Edwards curve `x² + y² = 1 + d·x²·y²` (`a = +1`,
 //! `d = −39081`) in extended homogeneous coordinates `(X:Y:Z:T)`, with complete
 //! addition formulas (Hisil–Wong–Carter–Dawson 2008 for `a = +1`), so there are
-//! no exceptional cases. Scalar multiplication is a constant-time
-//! double-and-add. Reduction of scalars modulo the group order `L` rides on the
+//! no exceptional cases. Secret scalar multiplications are a constant-time
+//! fixed-window ladder; signature *verification* — whose inputs are all
+//! public — uses a clearly-marked variable-time double-base multiplication. Reduction of scalars modulo the group order `L` rides on the
 //! constant-time [`Uint`](crate::bignum::Uint) long division.
 //!
 //! Hashing is SHAKE256 (FIPS 202): the seed expansion, the nonce `r`, and the
@@ -397,13 +398,12 @@ impl Ed448PublicKey {
         let k_scalar = fe_to_scalar_bytes(&k);
         let s_scalar = fe_to_scalar_bytes(&s);
 
-        // Cofactored verify: accept iff [4S]B == [4R] + [4k]A. Multiply each
-        // side of the cofactor-less equation by 4 = [2][2].
-        let lhs = f.scalar_mult(&s_scalar, &f.base());
-        let ka = f.scalar_mult(&k_scalar, &a_point);
-        let rhs = f.point_add(&r_point, &ka);
-        let lhs4 = f.point_double(&f.point_double(&lhs));
-        let rhs4 = f.point_double(&f.point_double(&rhs));
+        // Cofactored verify: accept iff [4]([S]B − [k]A) == [4]R, i.e.
+        // [4S]B == [4R] + [4k]A. Every input here (S, k, A, R) is public, so
+        // the combination uses the variable-time interleaved ladder.
+        let q = f.double_scalar_mult_base_vartime(&k_scalar, &f.point_negate(&a_point), &s_scalar);
+        let lhs4 = f.point_double(&f.point_double(&q));
+        let rhs4 = f.point_double(&f.point_double(&r_point));
         if bool::from(f.point_ct_eq(&lhs4, &rhs4)) {
             Ok(())
         } else {

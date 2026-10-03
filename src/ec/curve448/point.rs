@@ -207,6 +207,78 @@ impl Field {
         acc
     }
 
+    /// Negates a point: `−(X:Y:Z:T) = (−X:Y:Z:−T)`.
+    pub(crate) fn point_negate(&self, p: &Point) -> Point {
+        Point {
+            x: self.neg(p.x),
+            y: p.y,
+            z: p.z,
+            t: self.neg(p.t),
+        }
+    }
+
+    /// **Variable-time** `[a]·p + [b]·B`, the Ed448 verification
+    /// combination: two interleaved (Straus) width-5 wNAF ladders sharing one
+    /// run of ~446 doublings, plus one addition per nonzero digit (≈ 1 in 6
+    /// per scalar) against the 8 odd multiples `[1]X..[15]X` of each point.
+    ///
+    /// # Warning: public inputs only
+    ///
+    /// Both the branch pattern and the table indices leak the scalars. This
+    /// must ONLY ever be called with **public** scalars and points (the
+    /// signature scalar `S`, the challenge `k` and the public key `A` during
+    /// verification) — never with signing nonces or secret keys.
+    pub(crate) fn double_scalar_mult_base_vartime(
+        &self,
+        a: &[u8; 57],
+        p: &Point,
+        b: &[u8; 57],
+    ) -> Point {
+        let odd_p = self.odd_multiples(p);
+        let odd_b = self.odd_multiples(&self.base());
+        let naf_a = wnaf5(a);
+        let naf_b = wnaf5(b);
+        let Some(top) = naf_a
+            .iter()
+            .zip(naf_b.iter())
+            .rposition(|(&x, &y)| x != 0 || y != 0)
+        else {
+            return self.identity();
+        };
+
+        let mut acc = self.identity();
+        for i in (0..=top).rev() {
+            acc = self.point_double(&acc);
+            acc = self.add_naf_digit(&acc, naf_a[i], &odd_p);
+            acc = self.add_naf_digit(&acc, naf_b[i], &odd_b);
+        }
+        acc
+    }
+
+    /// The odd multiples `odd[i] = [2i+1]P` for `i in 0..8`, the lookup table
+    /// of the width-5 wNAF ladder.
+    fn odd_multiples(&self, p: &Point) -> [Point; 8] {
+        let p2 = self.point_double(p);
+        let mut odd = [*p; 8];
+        for i in 1..8 {
+            odd[i] = self.point_add(&odd[i - 1], &p2);
+        }
+        odd
+    }
+
+    /// Adds the wNAF digit `d` (odd, `|d| <= 15`, or zero for a no-op) times
+    /// the point whose odd multiples are `odd`. **Variable-time.**
+    #[inline]
+    fn add_naf_digit(&self, acc: &Point, d: i8, odd: &[Point; 8]) -> Point {
+        if d > 0 {
+            self.point_add(acc, &odd[(d as usize) / 2])
+        } else if d < 0 {
+            self.point_add(acc, &self.point_negate(&odd[(-d as usize) / 2]))
+        } else {
+            *acc
+        }
+    }
+
     /// Constant-time equality of two points, comparing the affine
     /// representatives via cross-multiplication: `X₁·Z₂ == X₂·Z₁` and
     /// `Y₁·Z₂ == Y₂·Z₁`.
@@ -217,6 +289,57 @@ impl Field {
         let y2z1 = self.mul(q.y, p.z);
         self.ct_eq(x1z2, x2z1) & self.ct_eq(y1z2, y2z1)
     }
+}
+
+/// Width-5 non-adjacent form of a 456-bit (57-byte) little-endian scalar:
+/// digits in `{0, ±1, ±3, …, ±15}` with at least 4 zeros between nonzero
+/// digits. The trailing positions absorb the recoding carry, so any 456-bit
+/// integer is represented exactly. **Variable-time**; only for public
+/// scalars.
+fn wnaf5(scalar: &[u8; 57]) -> [i8; 461] {
+    let mut naf = [0i8; 461];
+
+    // Nine u64 limbs (57 bytes zero-padded, plus one spare) so the window
+    // read below may index one limb past the scalar's top byte.
+    let mut x = [0u64; 9];
+    for (i, chunk) in scalar.chunks(8).enumerate() {
+        let mut b = [0u8; 8];
+        b[..chunk.len()].copy_from_slice(chunk);
+        x[i] = u64::from_le_bytes(b);
+    }
+
+    let width = 1u64 << 5;
+    let window_mask = width - 1;
+
+    let mut pos = 0;
+    let mut carry = 0u64;
+    while pos < 456 {
+        let idx = pos / 64;
+        let bit = pos % 64;
+        let bit_buf = if bit < 64 - 5 {
+            x[idx] >> bit
+        } else {
+            (x[idx] >> bit) | (x[idx + 1] << (64 - bit))
+        };
+        let window = carry + (bit_buf & window_mask);
+        if window & 1 == 0 {
+            pos += 1;
+            continue;
+        }
+        if window < width / 2 {
+            carry = 0;
+            naf[pos] = window as i8;
+        } else {
+            carry = 1;
+            naf[pos] = (window as i8).wrapping_sub(width as i8);
+        }
+        pos += 5;
+    }
+    // A carry surviving past bit 455 stands for `+2^pos` (pos <= 460).
+    if carry != 0 {
+        naf[pos] = 1;
+    }
+    naf
 }
 
 /// Constant-time point selection: `b` if `c` is set, else `a`.
@@ -287,6 +410,61 @@ mod tests {
                 let r = f.scalar_mult_bitwise(&k, pt);
                 assert!(bool::from(f.point_ct_eq(&w, &r)), "mismatch for {k:02x?}");
             }
+        }
+    }
+
+    /// The vartime Straus ladder agrees with two constant-time
+    /// multiplications, including all-ones scalars (maximal wNAF carry) and
+    /// zero on either side.
+    #[test]
+    fn double_scalar_mult_vartime_matches_ct() {
+        let f = Field::new();
+        let b = f.base();
+        let p = f.point_double(&f.point_add(&b, &f.point_double(&b)));
+        let mut full = [0xffu8; 57];
+        full[56] = 0;
+        let mut one = [0u8; 57];
+        one[0] = 1;
+        let mut st = 0xd5;
+        let mut rnd = || {
+            let mut k = [0u8; 57];
+            for c in k[..56].chunks_mut(8) {
+                c.copy_from_slice(&splitmix(&mut st).to_le_bytes());
+            }
+            k
+        };
+        let mut cases = [([0u8; 57], [0u8; 57]); 21];
+        cases[1] = ([0u8; 57], one);
+        cases[2] = (one, [0u8; 57]);
+        cases[3] = (full, full);
+        cases[4] = ([0xffu8; 57], [0xffu8; 57]);
+        for c in cases[5..].iter_mut() {
+            *c = (rnd(), rnd());
+        }
+        for (ka, kb) in cases {
+            let got = f.double_scalar_mult_base_vartime(&ka, &p, &kb);
+            let want = f.point_add(&f.scalar_mult(&ka, &p), &f.scalar_mult(&kb, &b));
+            // scalar_mult consumes only the low 448 bits; the all-0xff
+            // 57-byte case is checked against bit 448..455 added explicitly.
+            let want = if ka[56] != 0 || kb[56] != 0 {
+                let mut hi_a = [0u8; 57];
+                hi_a[0] = ka[56];
+                let mut hi_b = [0u8; 57];
+                hi_b[0] = kb[56];
+                let shift = |x: &Point, hi: &[u8; 57]| {
+                    let mut q = f.scalar_mult(hi, x);
+                    for _ in 0..448 {
+                        q = f.point_double(&q);
+                    }
+                    q
+                };
+                let ha = shift(&p, &hi_a);
+                let hb = shift(&b, &hi_b);
+                f.point_add(&want, &f.point_add(&ha, &hb))
+            } else {
+                want
+            };
+            assert!(bool::from(f.point_ct_eq(&got, &want)));
         }
     }
 }
