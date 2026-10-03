@@ -50,6 +50,7 @@
 
 use super::{BlockCipher, InvalidLength};
 use crate::ct::ConstantTimeEq;
+use crate::zeroize::Zeroize;
 
 /// Errors from the validating XTS entry points (the byte-key constructors and
 /// the `*_checked` sector methods).
@@ -192,14 +193,13 @@ impl<C: BlockCipher> Xts<C> {
         let full_to_emit = if rem == 0 { n_full } else { n_full - 1 };
 
         // Encrypt the first `full_to_emit` complete blocks.
+        xex_blocks(
+            &self.cipher_data,
+            &mut buf[..full_to_emit * 16],
+            &mut t,
+            true,
+        );
         let mut block = [0u8; 16];
-        for i in 0..full_to_emit {
-            let off = i * 16;
-            block.copy_from_slice(&buf[off..off + 16]);
-            xex(&self.cipher_data, &mut block, &t, true);
-            buf[off..off + 16].copy_from_slice(&block);
-            double_tweak(&mut t);
-        }
 
         if rem == 0 {
             return Ok(());
@@ -251,14 +251,12 @@ impl<C: BlockCipher> Xts<C> {
         let full_to_emit = if rem == 0 { n_full } else { n_full - 1 };
 
         // Decrypt the first `full_to_emit` complete blocks.
-        let mut block = [0u8; 16];
-        for i in 0..full_to_emit {
-            let off = i * 16;
-            block.copy_from_slice(&buf[off..off + 16]);
-            xex(&self.cipher_data, &mut block, &t, false);
-            buf[off..off + 16].copy_from_slice(&block);
-            double_tweak(&mut t);
-        }
+        xex_blocks(
+            &self.cipher_data,
+            &mut buf[..full_to_emit * 16],
+            &mut t,
+            false,
+        );
 
         if rem == 0 {
             return Ok(());
@@ -294,6 +292,34 @@ impl<C: BlockCipher> Xts<C> {
 
         Ok(())
     }
+}
+
+/// XEX over whole blocks in place, a window at a time: the tweaks for the
+/// window are generated serially (`t` advances by α per block, ending at the
+/// tweak for the block after `buf`), and the masked blocks go through the
+/// batched cipher, which feeds the hardware pipeline.
+fn xex_blocks<C: BlockCipher>(cipher: &C, buf: &mut [u8], t: &mut [u8; 16], encrypt: bool) {
+    const W: usize = 16;
+    let mut tweaks = [0u8; 16 * W];
+    for window in buf.chunks_mut(16 * W) {
+        for (blk, tw) in window.chunks_exact_mut(16).zip(tweaks.chunks_exact_mut(16)) {
+            tw.copy_from_slice(t);
+            for (b, k) in blk.iter_mut().zip(tw.iter()) {
+                *b ^= *k;
+            }
+            double_tweak(t);
+        }
+        if encrypt {
+            cipher.encrypt_blocks(window);
+        } else {
+            cipher.decrypt_blocks(window);
+        }
+        for (b, k) in window.iter_mut().zip(tweaks.iter()) {
+            *b ^= *k;
+        }
+    }
+    // The tweaks are E_K2(sector) multiples: key-derived masks.
+    tweaks.zeroize();
 }
 
 /// XEX in place: if `encrypt`, computes `out = AES_K(in ⊕ T) ⊕ T`; otherwise
