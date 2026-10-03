@@ -477,11 +477,9 @@ pub fn verify_signature(pubkey: &[u8; 33], msg32: &[u8; 32], sig: &[u8; 64]) -> 
 
     // Key, digest and signature are public: the variable-time path applies.
     let point = ProjectivePoint::mul_generator_double_vartime(&u1, &u2, &q.to_projective());
-    let affine = point.to_affine().ok_or(Error::Verification)?;
-    let v = Scalar::from_bytes_be_reduce(&affine.x_bytes()).to_bytes_be();
-    // Declassified (Valgrind harness): a public verdict (an error return or
-    // a rejected candidate).
-    if v.ct_eq(&r).declassify() {
+    // x(point) mod n == r, checked projectively (no inversion); `r` is the
+    // canonical scalar decoded above.
+    if point.x_mod_n_equals_vartime(&r_scalar) {
         Ok(())
     } else {
         Err(Error::Verification)

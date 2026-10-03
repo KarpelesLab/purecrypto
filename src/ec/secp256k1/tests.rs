@@ -497,3 +497,39 @@ fn gen_secp256k1_gen_table() {
     }
     println!("];");
 }
+
+/// The projective ECDSA x-check: true exactly when `x mod n == r`,
+/// including the `x ≥ n` (r + n) branch, on a non-normalised Z, and never for
+/// the identity.
+#[test]
+fn x_mod_n_equals_vartime_cases() {
+    let n = Scalar::ORDER;
+    // Find a curve point with n <= x < p (the rare `x mod n = x − n` case).
+    let mut x = n;
+    let pt = loop {
+        let mut enc = [0u8; 33];
+        enc[0] = 0x02;
+        x.write_be_bytes(&mut enc[1..]);
+        if let Ok(p) = AffinePoint::from_sec1(&enc) {
+            break p;
+        }
+        x = x.wrapping_add(&Fe::ONE);
+    };
+    // Re-randomise Z: 2P − P = P with Z ≠ 1.
+    let proj = pt
+        .to_projective()
+        .double()
+        .add(&pt.to_projective().negate());
+    assert!(!bool::from(proj.0.z.ct_eq(&Fe::ONE)));
+    let r_low = Scalar(x.wrapping_sub(&n));
+    assert!(proj.x_mod_n_equals_vartime(&r_low));
+    assert!(!proj.x_mod_n_equals_vartime(&Scalar(r_low.0.wrapping_add(&Fe::ONE))));
+    // An ordinary point: x < n.
+    let g = ProjectivePoint::generator()
+        .double()
+        .add(&ProjectivePoint::generator().negate());
+    let gx = Scalar(fe_from_hex(GX_HEX));
+    assert!(g.x_mod_n_equals_vartime(&gx));
+    assert!(!g.x_mod_n_equals_vartime(&Scalar::ONE));
+    assert!(!ProjectivePoint::identity().x_mod_n_equals_vartime(&Scalar::ZERO));
+}

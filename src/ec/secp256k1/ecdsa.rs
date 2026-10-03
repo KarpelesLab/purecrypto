@@ -66,7 +66,7 @@
 
 use super::field_backend::{Fe, p};
 use super::{AffinePoint, ProjectivePoint, Scalar};
-use crate::ct::{ConstantTimeEq, ConstantTimeLess};
+use crate::ct::ConstantTimeLess;
 use crate::ec::Error;
 use crate::ec::ecdsa::{bits2int, generate_k, in_range};
 use crate::ec::reduce_256;
@@ -350,9 +350,8 @@ impl Secp256k1EcdsaPublicKey {
 
         let sum =
             ProjectivePoint::mul_generator_double_vartime(&u1, &u2, &self.point().to_projective());
-        let v = sum.to_affine().ok_or(Error::Verification)?;
-        let vx = reduce_256(&v.x, &n);
-        if bool::from(vx.ct_eq(&sig.r)) {
+        // x(sum) mod n == r, checked projectively (no inversion).
+        if sum.x_mod_n_equals_vartime(&r) {
             Ok(())
         } else {
             Err(Error::Verification)

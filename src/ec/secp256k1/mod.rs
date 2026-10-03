@@ -361,6 +361,27 @@ impl ProjectivePoint {
         Self::mul_double_vartime(a, &Self::generator(), b, q)
     }
 
+    /// Whether `x(self) mod n == r`, for a public point and `r < n` — the
+    /// ECDSA acceptance test — without the field inversion of a conversion to
+    /// affine. `x = X/Z` lies in `[0, p)` and `p < 2n`, so `x mod n == r` iff
+    /// `x == r` or `x == r + n` (possible only when `r + n < p`), i.e. iff
+    /// `X == r·Z` or `X == (r + n)·Z`. The identity never matches.
+    /// **Variable time**: public inputs only (verification).
+    pub(crate) fn x_mod_n_equals_vartime(&self, r: &Scalar) -> bool {
+        let r = &r.0;
+        if bool::from(self.is_identity()) {
+            return false;
+        }
+        let f = field();
+        let pt = &self.0;
+        if bool::from(f.mul(r, &pt.z).ct_eq(&pt.x)) {
+            return true;
+        }
+        let p_minus_n = field_backend::p().wrapping_sub(&Scalar::ORDER);
+        bool::from(r.ct_lt(&p_minus_n))
+            && bool::from(f.mul(&r.wrapping_add(&Scalar::ORDER), &pt.z).ct_eq(&pt.x))
+    }
+
     /// Constant-time point equality (different projective representatives of the
     /// same affine point compare equal).
     pub fn ct_eq(&self, other: &ProjectivePoint) -> Choice {
