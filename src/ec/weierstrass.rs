@@ -7,8 +7,9 @@
 //! including the identity and equal points — and for any coefficient `a`, so
 //! both `a = -3` (the NIST curves) and `a = 0` (secp256k1) share one path.
 
-use crate::bignum::{BoxedMontModulus, BoxedUint};
-use crate::ct::{Choice, ConstantTimeEq};
+use crate::bignum::{BoxedMontModulus, BoxedUint, Limb};
+use crate::ct::{ConditionallySelectable, ConstantTimeEq};
+use alloc::vec;
 
 /// A point in projective coordinates `(X : Y : Z)`, field elements in
 /// Montgomery form. The identity is `(0 : 1 : 0)`.
@@ -20,11 +21,33 @@ pub(crate) struct Point {
 }
 
 impl Point {
-    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+    /// Constant-time `table[digit]` for coordinates `limbs` wide: every
+    /// entry is read in a fixed order and masked into one fresh buffer per
+    /// coordinate, so neither the access pattern nor the timing depends on
+    /// `digit` (the index test is `ct_eq`, not a `==` the compiler may lower
+    /// to a branch). Masking limbs in place costs three allocations per
+    /// lookup where chaining `BoxedUint::conditional_select` cost three per
+    /// entry and coordinate. Exactly one entry matches (`digit < table.len()`),
+    /// so starting from zero is sound.
+    fn ct_lookup(table: &[Point], digit: usize, limbs: usize) -> Point {
+        let mut out = [vec![0 as Limb; limbs], vec![0; limbs], vec![0; limbs]];
+        for (j, entry) in table.iter().enumerate() {
+            let hit = j.ct_eq(&digit);
+            for (dst, src) in out.iter_mut().zip([&entry.x, &entry.y, &entry.z]) {
+                let src = src.as_limbs();
+                for (i, d) in dst.iter_mut().enumerate() {
+                    // The limb index is public; widths are those of the
+                    // (public) field.
+                    let s = src.get(i).copied().unwrap_or(0);
+                    *d = Limb::conditional_select(&s, d, hit);
+                }
+            }
+        }
+        let [x, y, z] = out;
         Point {
-            x: BoxedUint::conditional_select(&a.x, &b.x, choice),
-            y: BoxedUint::conditional_select(&a.y, &b.y, choice),
-            z: BoxedUint::conditional_select(&a.z, &b.z, choice),
+            x: BoxedUint::from_limbs(x),
+            y: BoxedUint::from_limbs(y),
+            z: BoxedUint::from_limbs(z),
         }
     }
 
@@ -629,17 +652,7 @@ impl Curve {
                 acc = self.double(&acc);
 
                 let digit = ((limb >> shift) & 0xf) as usize;
-                // Constant-time gather of table[digit]: touch every entry in a
-                // fixed order and keep the matching one. The index comparison
-                // goes through `ct_eq` rather than a `==` the compiler is free
-                // to lower to a branch on the secret window digit (the same
-                // convention as `bignum::modpow`). Note the argument order —
-                // this crate's `conditional_select(a, b, c)` returns `a` when
-                // `c` is true, inverted from the `subtle` crate.
-                let mut sel = table[0].clone();
-                for (j, entry) in table.iter().enumerate() {
-                    sel = Point::conditional_select(entry, &sel, j.ct_eq(&digit));
-                }
+                let mut sel = Point::ct_lookup(&table, digit, self.fp.limbs());
                 acc = self.point_add(&acc, &sel);
                 sel.zeroize();
             }
@@ -678,6 +691,9 @@ impl Curve {
 }
 
 #[cfg(test)]
+// `CurveRef` is a plain reference only with `std`; without it the `&c`
+// borrows below are needed.
+#[allow(clippy::needless_borrow)]
 mod tests {
     use super::*;
     use crate::ec::curves::CurveId;
@@ -725,6 +741,32 @@ mod tests {
     /// general complete addition (Algorithm 1), on every curve: identity,
     /// equal, opposite and unrelated points, each under random projective
     /// representatives.
+    /// The masked gather returns exactly `table[digit]`, including for an
+    /// entry stored narrower than the field (its missing limbs read as 0).
+    #[test]
+    fn ct_lookup_selects_the_entry() {
+        let c = CurveId::P384.curve();
+        let w = c.fp.limbs();
+        let mut table = vec![Point {
+            x: BoxedUint::from_u64(7),
+            y: BoxedUint::from_u64(8),
+            z: BoxedUint::from_u64(9),
+        }];
+        let mut st = 0x100c_u64;
+        for _ in 1..16 {
+            table.push(Point {
+                x: rand_fe(&c, &mut st),
+                y: rand_fe(&c, &mut st),
+                z: rand_fe(&c, &mut st),
+            });
+        }
+        for (d, e) in table.iter().enumerate() {
+            let got = Point::ct_lookup(&table, d, w);
+            assert_eq!(got.x.limbs(), w);
+            assert!(got.x == e.x && got.y == e.y && got.z == e.z, "digit {d}");
+        }
+    }
+
     #[test]
     fn coefficient_classes() {
         for (id, kind) in [
@@ -740,9 +782,6 @@ mod tests {
     }
 
     #[test]
-    // `CurveRef` is a plain reference only with `std`; without it the
-    // borrow is needed.
-    #[allow(clippy::needless_borrow)]
     fn specialised_formulas_match_general_addition() {
         let mut st = 0xadd5_u64;
         for &id in CurveId::ALL {
