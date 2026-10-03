@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.9](https://github.com/KarpelesLab/purecrypto/compare/v0.9.8...v0.9.9) - 2026-10-03
+
+### Other
+
+- *(slhdsa)* absorb the SHA-2 PK.seed block once per operation
+- *(ecdsa)* reduce 256-bit values mod n with one masked subtraction
+- *(ecdsa)* build the P-256 order Montgomery context at compile time
+- *(ed448)* Barrett scalar reduction and a compile-time field context
+- *(ed25519)* constant-time Barrett reduction modulo L
+
 ## [0.9.8](https://github.com/KarpelesLab/purecrypto/compare/v0.9.7...v0.9.8) - 2026-10-03
 
 ### Other
