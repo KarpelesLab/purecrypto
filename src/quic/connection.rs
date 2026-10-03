@@ -5649,13 +5649,12 @@ impl QuicConnection {
 
         // AAD = unprotected header bytes [0 .. pn_offset + pn_len].
         let aad_end = hdr.pn_offset + pn_len as usize;
-        let aad: Vec<u8> = pkt[..aad_end].to_vec();
         // Snapshot the unprotected first byte for the post-AEAD
-        // reserved-bit check (the mutable `ct_with_tag` borrow below
-        // makes `pkt[0]` inaccessible later).
+        // reserved-bit check.
         let first_byte = pkt[0];
         // Ciphertext (including 16-byte tag) is [aad_end .. pkt_total_len].
-        let ct_with_tag = &mut pkt[aad_end..];
+        let (aad, ct_with_tag) = pkt.split_at_mut(aad_end);
+        let aad: &[u8] = aad;
         if ct_with_tag.len() < 16 {
             return Err(Error::Decode);
         }
@@ -5674,7 +5673,7 @@ impl QuicConnection {
         // processing any coalesced packets that follow. A forged or
         // bit-flipped coalesced packet MUST NOT cause valid packets in
         // the same datagram to be dropped or tear the connection down.
-        if let Err(_e) = aead_open(dir_keys_ref, pn, &aad, payload, &tag) {
+        if let Err(_e) = aead_open(dir_keys_ref, pn, aad, payload, &tag) {
             // `bump_rx_aead_failure` flips `self.closed` when the
             // integrity limit is reached; we don't need its return value
             // since both outcomes consume `pkt_total_len` and continue.
@@ -5759,10 +5758,11 @@ impl QuicConnection {
             self.active_path.validated = true;
         }
 
-        // Parse frames. Dispatch on the cleartext.
-        let cleartext: Vec<u8> = payload.to_vec();
-        self.rx_packet_dcid = hdr.dcid.to_vec();
-        self.dispatch_frames(level, pn, &cleartext)?;
+        // Parse frames. Dispatch on the cleartext, decrypted in place in
+        // this packet's own copy.
+        self.rx_packet_dcid.clear();
+        self.rx_packet_dcid.extend_from_slice(hdr.dcid);
+        self.dispatch_frames(level, pn, payload)?;
 
         // G-4: a non-VN packet from the peer has been successfully
         // processed — any future VN packet on this connection MUST be
@@ -5847,11 +5847,11 @@ impl QuicConnection {
         let current_phase = self.endpoint.crypto.rx_phase;
 
         let aad_end = hdr.pn_offset + pn_len as usize;
-        let aad: Vec<u8> = pkt[..aad_end].to_vec();
         // Snapshot the unprotected first byte for the post-AEAD
         // reserved-bit check (see the long-header path).
         let first_byte = pkt[0];
-        let ct_with_tag = &mut pkt[aad_end..];
+        let (aad, ct_with_tag) = pkt.split_at_mut(aad_end);
+        let aad: &[u8] = aad;
         if ct_with_tag.len() < 16 {
             return Err(Error::Decode);
         }
@@ -5864,63 +5864,42 @@ impl QuicConnection {
         // Pick rx keys for the packet's advertised phase. RFC 9001
         // §6.2: the pre-derived next-phase keys are always ready so
         // an out-of-order phase-flipped packet decrypts without
-        // stalling.
-        let rx_keys_for_phase = if self.one_rtt_phase_initialized {
-            self.endpoint
-                .crypto
-                .at(Level::OneRtt)
-                .rx_for_phase(pkt_phase)
-                .cloned()
+        // stalling. The keys are borrowed, not cloned: nothing below
+        // touches the key state until the open has finished.
+        let lk = self.endpoint.crypto.at(Level::OneRtt);
+        let rx_keys = if self.one_rtt_phase_initialized {
+            lk.rx_for_phase(pkt_phase)
         } else {
-            self.endpoint.crypto.at(Level::OneRtt).rx.clone()
+            lk.rx.as_ref()
         };
-        let rx_keys = match rx_keys_for_phase {
-            Some(k) => k,
-            None => return Ok(datagram.len()),
+        let Some(rx_keys) = rx_keys else {
+            return Ok(datagram.len());
         };
-        // First attempt with the primary slot for this phase.
-        let primary_result = aead_open(&rx_keys, pn, &aad, payload, &tag);
-        let opened_with_prev = if primary_result.is_err() {
+        // First attempt with the primary slot for this phase. On failure
+        // the payload is left as ciphertext, so it can be retried.
+        let opened_with_prev = if aead_open(rx_keys, pn, aad, payload, &tag).is_ok() {
+            Some(false)
+        } else if self.one_rtt_phase_initialized
+            && pkt_phase != current_phase
+            && let Some(prev) = lk.prev_rx_keys.as_ref()
+        {
             // Fallback: a delayed packet at the *previous* phase (RFC
             // 9001 §6.2) — if `prev_rx_keys` is populated AND the
             // packet's phase matches the just-rotated-out slot, try
             // it before giving up.
-            if self.one_rtt_phase_initialized
-                && pkt_phase != current_phase
-                && self
-                    .endpoint
-                    .crypto
-                    .at(Level::OneRtt)
-                    .prev_rx_keys
-                    .is_some()
-            {
-                let prev = self
-                    .endpoint
-                    .crypto
-                    .at(Level::OneRtt)
-                    .prev_rx_keys
-                    .clone()
-                    .expect("checked");
-                if let Err(_e) = aead_open(&prev, pn, &aad, payload, &tag) {
-                    // SILENT per-packet drop (RFC 9000 §12.2). A 1-RTT
-                    // packet is the last packet in a datagram (no packets
-                    // may be coalesced after a short-header packet), so
-                    // consuming the rest of the datagram is correct.
-                    // `bump_rx_aead_failure` flips `self.closed` on
-                    // crossing the integrity limit (RFC 9001 §6.6).
-                    let _ = self.bump_rx_aead_failure(Level::OneRtt)?;
-                    return Ok(datagram.len());
-                }
-                true
-            } else {
-                // No prev-phase fallback available: count this as a
-                // genuine integrity failure (RFC 9001 §6.6) and drop the
-                // packet silently per RFC 9000 §12.2.
-                let _ = self.bump_rx_aead_failure(Level::OneRtt)?;
-                return Ok(datagram.len());
-            }
+            aead_open(prev, pn, aad, payload, &tag).ok().map(|()| true)
         } else {
-            false
+            None
+        };
+        let Some(opened_with_prev) = opened_with_prev else {
+            // SILENT per-packet drop (RFC 9000 §12.2), counted as a
+            // genuine integrity failure (RFC 9001 §6.6). A 1-RTT packet
+            // is the last packet in a datagram (no packets may be
+            // coalesced after a short-header packet), so consuming the
+            // rest of the datagram is correct. `bump_rx_aead_failure`
+            // flips `self.closed` on crossing the integrity limit.
+            let _ = self.bump_rx_aead_failure(Level::OneRtt)?;
+            return Ok(datagram.len());
         };
         // Authenticated (under the primary or previous-phase keys): errors
         // past this point close the connection (see `feed_datagram`).
@@ -6024,9 +6003,9 @@ impl QuicConnection {
             lk.rx = None;
         }
 
-        let cleartext: Vec<u8> = payload.to_vec();
-        self.rx_packet_dcid = hdr.dcid.to_vec();
-        self.dispatch_frames(Level::OneRtt, pn, &cleartext)?;
+        self.rx_packet_dcid.clear();
+        self.rx_packet_dcid.extend_from_slice(hdr.dcid);
+        self.dispatch_frames(Level::OneRtt, pn, payload)?;
         // RFC 9000 §9.3 — the packet authenticated, so its source address is
         // now trustworthy enough to act on. `largest_rx` was read before
         // dispatch, so it is the high-water mark *excluding* this packet.
@@ -7062,14 +7041,15 @@ impl QuicConnection {
             }
         };
 
-        // Append the (still-plaintext) payload bytes.
+        // Append the (still-plaintext) payload bytes, leaving room for the
+        // tag so the packet is built in one allocation.
+        wire.reserve(payload.len() + 16);
         wire.extend_from_slice(&payload);
 
-        // Seal.
+        // Seal in place; the header in front of the payload is the AAD.
         let aad_len = pn_offset + pn_len as usize;
-        let aad: Vec<u8> = wire[..aad_len].to_vec();
-        let pt = &mut wire[aad_len..];
-        let tag = aead_seal(dir_keys, pn, &aad, pt);
+        let (aad, pt) = wire.split_at_mut(aad_len);
+        let tag = aead_seal(dir_keys, pn, aad, pt);
         wire.extend_from_slice(&tag);
 
         // Header protection (last use of `dir_keys` — its immutable
