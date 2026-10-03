@@ -460,151 +460,243 @@ impl BoxedMontModulus {
         BoxedUint::from_limbs(self.mont_mul_limbs(&t, &self.r2))
     }
 
-    /// Computes `base^exp mod n` in constant time (square-and-multiply-always
-    /// over all bits of `exp`).
+    /// Computes `base^exp mod n` in constant time (fixed-window
+    /// square-and-multiply-always over every bit of `exp`'s storage).
     ///
-    /// The exponent is zero-padded to at least `self.limbs` 64-bit limbs
-    /// before the loop. The RSA case (`d < n`) hits this branch directly;
-    /// callers that need a wider exponent (e.g. Diffie-Hellman with a
-    /// secret exponent unrelated to the modulus width) get a loop sized to
-    /// the larger of the two, never the silent truncation that an
-    /// unconditional `limbs_resized(self.limbs)` would impose.
-    ///
-    /// The loop runs over `max(self.limbs, s)` limbs, where `s` is the number
-    /// of *significant* limbs of `exp` (leading zero limbs stripped). For any
-    /// exponent below `2^(64·self.limbs)` — every RSA `d < n` and DH `x < p`,
-    /// however the caller padded its `Vec` — that is exactly `self.limbs`,
-    /// a public quantity, so the running time reveals nothing about the
-    /// exponent's value. Only an exponent that is itself wider than the
-    /// modulus makes the count depend on where its top set limb sits.
+    /// The exponent is zero-padded to at least `self.limbs` 64-bit limbs, so
+    /// the loop runs over `max(self.limbs, exp.limbs())` limbs: the storage
+    /// width, which is public, never the position of the exponent's top set
+    /// bit. The RSA case (`d < n`) is exactly `self.limbs`; a wider exponent
+    /// keeps every bit rather than being silently truncated to
+    /// `exp mod 2^(64·self.limbs)`. A caller whose secret exponent has a
+    /// smaller public bound (a DH exponent of `priv_bits`, a DSA nonce below
+    /// `q`) should use [`pow_bits`](Self::pow_bits) instead of paying for the
+    /// padding.
     pub fn pow(&self, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
-        let base_m = self.to_mont_limbs(&base.limbs_resized(self.limbs));
-        let mut one = vec![0 as Limb; self.limbs];
+        // `exp.limbs()` (the storage width) is public; `significant_limbs()`
+        // would scan the secret exponent's leading zero limbs.
+        let exp_width = exp.limbs().max(self.limbs);
+        self.pow_bits(base, exp, 64 * exp_width)
+    }
+
+    /// Computes `base^exp mod n` in constant time for a secret `exp` known to
+    /// be below `2^bits`, where `bits` is a **public** bound (the width of the
+    /// group order, a configured exponent size): the ladder runs
+    /// `⌈bits/4⌉` windows, independent of the exponent's value. Bits of `exp`
+    /// at or above `bits` are ignored, so the bound must hold — `exp < 2^bits`
+    /// is the caller's precondition.
+    ///
+    /// Fixed 4-bit window: precompute `base^0 … base^15` (Montgomery form)
+    /// once, then consume the exponent four bits at a time — four squarings
+    /// and one multiply by the window's value per nibble. The table value is
+    /// chosen by scanning all 16 entries with a constant-time select (no
+    /// secret-indexed memory access) and the per-nibble multiply is
+    /// unconditional, so the operation sequence is a function of `bits`
+    /// only, leaking nothing about `base` or the exponent's bits.
+    pub fn pow_bits(&self, base: &BoxedUint, exp: &BoxedUint, bits: usize) -> BoxedUint {
+        let l = self.limbs;
+        let base_m = self.to_mont_limbs(&base.limbs_resized(l));
+        let mut one = vec![0 as Limb; l];
         one[0] = 1;
         let r_mod_n = self.to_mont_limbs(&one); // R mod N (= 1 in Montgomery form)
-
-        // Fixed 4-bit window: precompute `base^0 … base^15` (Montgomery form)
-        // once, then consume the exponent four bits at a time — four squarings
-        // and one multiply by the window's value per nibble, versus the eight
-        // squarings + four multiplies a bit-by-bit ladder would do over the same
-        // four bits. The table value is chosen by scanning all 16 entries with a
-        // constant-time select (no secret-indexed memory access) and the per-
-        // nibble multiply is unconditional, so this stays square-and-multiply-
-        // *always*: the operation count is a function of the (public) exponent
-        // width only, leaking nothing about `base` or the exponent's bits.
         let mut table: Vec<Vec<Limb>> = Vec::with_capacity(16);
-        table.push(r_mod_n.clone());
+        table.push(r_mod_n);
         table.push(base_m);
         for i in 2..16 {
             table.push(self.mont_mul_limbs(&table[i - 1], &table[1]));
         }
-
-        let mut acc = r_mod_n;
-        // Reused scratch: accumulator `t` (sized 2·limbs for the squaring's
-        // full product; `mont_mul_to` uses its low half), ping-pong output
-        // `nxt`, and the per-nibble gather buffer `sel`. All hold base-derived
-        // secrets during the loop and are scrubbed once at the end — reusing
-        // them (instead of a fresh allocation per multiply) changes where the
-        // intermediate values live, not what is computed.
-        let mut t = vec![0 as Limb; 2 * self.limbs];
-        let mut nxt = vec![0 as Limb; self.limbs];
-        let mut sel = vec![0 as Limb; self.limbs];
-
-        // Pad the exponent to at least `self.limbs` 64-bit words; if the
-        // caller hands in a wider exponent we keep every bit. `limbs_resized`
-        // would silently truncate the high limbs of an over-wide exponent,
-        // turning the computation into `base^(exp mod 2^(64·self.limbs))` —
-        // the precise foot-gun called out in the foundations audit.
-        // `exp.limbs()` (the storage width) is public; `significant_limbs()`
-        // would scan the secret exponent's leading zero limbs.
-        let exp_width = exp.limbs().max(self.limbs);
-        let exp_limbs = exp.limbs_resized(exp_width);
-        let mut i = exp_limbs.len();
-        while i > 0 {
-            i -= 1;
-            let limb = exp_limbs[i];
-            let mut shift = 64;
-            while shift > 0 {
-                shift -= 4;
-                for _ in 0..4 {
-                    self.mont_sqr_to(&acc, &mut t, &mut nxt);
-                    core::mem::swap(&mut acc, &mut nxt);
-                }
-
-                let digit = ((limb >> shift) & 0xf) as usize;
-                // Constant-time gather of table[digit]. The index comparison
-                // goes through `ct_eq` (branch-free by construction) rather
-                // than a `==` the compiler may lower to a branch on the secret.
-                sel.copy_from_slice(&table[0]);
-                for (j, entry) in table.iter().enumerate() {
-                    let hit = j.ct_eq(&digit);
-                    for (s, e) in sel.iter_mut().zip(entry.iter()) {
-                        *s = Limb::conditional_select(e, s, hit);
-                    }
-                }
-                self.mont_mul_to(&acc, &sel, &mut t, &mut nxt);
-                core::mem::swap(&mut acc, &mut nxt);
-            }
-        }
-        // Construct the result first, then scrub the Montgomery accumulator,
-        // the scratch buffers, and the precomputed window table (all
-        // base-derived secrets). The returned `BoxedUint` owns a fresh Vec
-        // from `demont_limbs`, so the zeroing below cannot corrupt it.
-        let result = BoxedUint::from_limbs(self.demont_limbs(&acc));
-        zeroize_limbs(&mut acc);
-        zeroize_limbs(&mut t);
-        zeroize_limbs(&mut nxt);
-        zeroize_limbs(&mut sel);
+        let exp = exp.as_limbs();
+        let windows = bits.div_ceil(4).max(1);
+        // Nibble `w` of the exponent; positions past its storage read as 0.
+        // The limb index and shift are public loop quantities.
+        let digit = |w: usize| (exp.get(w / 16).copied().unwrap_or(0) >> (4 * (w % 16))) & 0xf;
+        let result = self.window_ladder(&table, windows, 4, |w| digit(w) as usize);
         for entry in table.iter_mut() {
             zeroize_limbs(entry);
         }
         result
     }
 
-    /// Computes `base^exp mod n` for a **public** exponent, sized to the
-    /// exponent's actual bit length rather than the modulus width.
+    /// Computes `a^x · b^y mod n` in constant time, for secret `x, y` below
+    /// `2^bits` (`bits` public, as in [`pow_bits`](Self::pow_bits)), with one
+    /// shared chain of squarings (Straus/Shamir): a 2-bit joint window over
+    /// the table `a^i·b^j`, `i, j ∈ 0..4`, so `bits` squarings plus `bits/2`
+    /// multiplies instead of the `2·bits` squarings two separate ladders
+    /// would spend.
     ///
-    /// This is square-and-multiply-*always* exactly like [`pow`](Self::pow) — it
-    /// is branchless and leaks nothing about `base`. It differs only in the loop
-    /// length: it iterates `exp.bit_len()` times instead of padding to the
-    /// modulus width, so its running time depends on `exp`. **`exp` must be
-    /// public** (e.g. an RSA public exponent in verify/encrypt, where both `exp`
-    /// and `base` are public). Never call it with a secret exponent — use
-    /// [`pow`](Self::pow) for those. For RSA `e = 65537` this replaces ~2048
-    /// squarings with ~17.
-    pub fn pow_public(&self, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
-        let base_m = self.to_mont_limbs(&base.limbs_resized(self.limbs));
-        let mut one = vec![0 as Limb; self.limbs];
+    /// The RSA CRT half uses it to fold the Fermat inverse of the blinder
+    /// (`r^(p−2)`) into the exponentiation it unblinds. Same constant-time
+    /// discipline as `pow_bits`: the 16-entry table is gathered by a full
+    /// masked scan and every window multiplies unconditionally.
+    pub fn pow2_bits(
+        &self,
+        a: &BoxedUint,
+        x: &BoxedUint,
+        b: &BoxedUint,
+        y: &BoxedUint,
+        bits: usize,
+    ) -> BoxedUint {
+        let l = self.limbs;
+        let mut one = vec![0 as Limb; l];
         one[0] = 1;
-        let mut acc = self.to_mont_limbs(&one); // R mod N
-
-        let bits = exp.bit_len();
-        if bits == 0 {
-            // base^0 = 1.
-            return BoxedUint::from_limbs(self.demont_limbs(&acc));
-        }
-        // Reused scratch, as in `pow` (`t` again sized 2·limbs for the
-        // squaring): `acc` still holds a base-derived secret even though the
-        // exponent is public.
-        let mut t = vec![0 as Limb; 2 * self.limbs];
-        let mut nxt = vec![0 as Limb; self.limbs];
-        let exp_limbs = exp.limbs_resized(exp.significant_limbs().max(1));
-        let mut i = bits;
-        while i > 0 {
-            i -= 1;
-            self.mont_sqr_to(&acc, &mut t, &mut nxt);
-            core::mem::swap(&mut acc, &mut nxt);
-            self.mont_mul_to(&acc, &base_m, &mut t, &mut nxt);
-            let limb = exp_limbs[i / 64];
-            let set = Choice::from(((limb >> (i % 64)) & 1) as u8);
-            for (a, m) in acc.iter_mut().zip(nxt.iter()) {
-                *a = Limb::conditional_select(m, a, set);
+        // table[i + 4j] = a^i · b^j (Montgomery form).
+        let mut table: Vec<Vec<Limb>> = vec![Vec::new(); 16];
+        table[0] = self.to_mont_limbs(&one);
+        table[1] = self.to_mont_limbs(&a.limbs_resized(l));
+        table[4] = self.to_mont_limbs(&b.limbs_resized(l));
+        table[8] = self.mont_mul_limbs(&table[4], &table[4]);
+        table[12] = self.mont_mul_limbs(&table[8], &table[4]);
+        for j in 0..4 {
+            for i in 1..4 {
+                if j == 0 && i == 1 {
+                    continue;
+                }
+                table[4 * j + i] = self.mont_mul_limbs(&table[4 * j + i - 1], &table[1]);
             }
         }
+        let (x, y) = (x.as_limbs(), y.as_limbs());
+        let windows = bits.div_ceil(2).max(1);
+        let two_bits =
+            |e: &[Limb], w: usize| (e.get(w / 32).copied().unwrap_or(0) >> (2 * (w % 32))) & 3;
+        let result = self.window_ladder(&table, windows, 2, |w| {
+            (two_bits(x, w) | (two_bits(y, w) << 2)) as usize
+        });
+        for entry in table.iter_mut() {
+            zeroize_limbs(entry);
+        }
+        result
+    }
+
+    /// The shared fixed-window ladder: `windows` windows of `width` bits,
+    /// most significant first, where `digit(w)` is the (secret) table index
+    /// of window `w`. The accumulator starts at the top window's entry
+    /// (saving the squarings of 1); each later window squares `width` times
+    /// and multiplies by its entry. Entries are gathered by a full masked
+    /// scan of `table` — the index comparison goes through `ct_eq`
+    /// (branch-free by construction) rather than a `==` the compiler may
+    /// lower to a branch on the secret — and every multiply is
+    /// unconditional, so the operation sequence depends only on `windows`
+    /// and `width`.
+    fn window_ladder(
+        &self,
+        table: &[Vec<Limb>],
+        windows: usize,
+        width: usize,
+        digit: impl Fn(usize) -> usize,
+    ) -> BoxedUint {
+        let l = self.limbs;
+        // Reused scratch: accumulator `t` (sized 2·limbs for the squaring's
+        // full product; `mont_mul_to` uses its low half), ping-pong output
+        // `nxt`, and the gather buffer `sel`. All hold base-derived secrets
+        // during the loop and are scrubbed at the end.
+        let mut t = vec![0 as Limb; 2 * l];
+        let mut nxt = vec![0 as Limb; l];
+        let mut sel = vec![0 as Limb; l];
+        let gather = |sel: &mut [Limb], idx: usize| {
+            sel.copy_from_slice(&table[0]);
+            for (j, entry) in table.iter().enumerate() {
+                let hit = j.ct_eq(&idx);
+                for (s, e) in sel.iter_mut().zip(entry.iter()) {
+                    *s = Limb::conditional_select(e, s, hit);
+                }
+            }
+        };
+        let mut w = windows - 1;
+        let mut acc = vec![0 as Limb; l];
+        gather(&mut acc, digit(w));
+        while w > 0 {
+            w -= 1;
+            for _ in 0..width {
+                self.mont_sqr_to(&acc, &mut t, &mut nxt);
+                core::mem::swap(&mut acc, &mut nxt);
+            }
+            gather(&mut sel, digit(w));
+            self.mont_mul_to(&acc, &sel, &mut t, &mut nxt);
+            core::mem::swap(&mut acc, &mut nxt);
+        }
+        // Construct the result first (a fresh Vec from `demont_limbs`), then
+        // scrub the accumulator and scratch.
         let result = BoxedUint::from_limbs(self.demont_limbs(&acc));
         zeroize_limbs(&mut acc);
         zeroize_limbs(&mut t);
         zeroize_limbs(&mut nxt);
+        zeroize_limbs(&mut sel);
+        result
+    }
+
+    /// Computes `base^exp mod n` for a **public** exponent, sized to the
+    /// exponent's actual bit length rather than the modulus width.
+    ///
+    /// Variable time in `exp` only — **`exp` must be public** (an RSA public
+    /// exponent, a DSA verification scalar, a group order); never call it
+    /// with a secret exponent, use [`pow`](Self::pow) /
+    /// [`pow_bits`](Self::pow_bits) for those. The sequence of squarings and
+    /// multiplications, and the table entry each multiply reads, are
+    /// functions of `exp` alone, so a secret `base` is still protected:
+    /// nothing branches on or is indexed by a base-derived value.
+    ///
+    /// Exponents up to 64 bits (RSA `e = 65537`: 16 squarings and one
+    /// multiply) run left-to-right binary, multiplying only on set bits;
+    /// wider ones a fixed 4-bit window that skips zero windows.
+    pub fn pow_public(&self, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
+        let l = self.limbs;
+        let bits = exp.bit_len();
+        if bits == 0 {
+            // base^0 = 1.
+            let mut one = vec![0 as Limb; l];
+            one[0] = 1;
+            return BoxedUint::from_limbs(self.demont_limbs(&self.to_mont_limbs(&one)));
+        }
+        let exp = exp.as_limbs();
+        let bit = |i: usize| (exp[i / 64] >> (i % 64)) & 1 == 1;
+        let mut base_m = self.to_mont_limbs(&base.limbs_resized(l));
+        let mut t = vec![0 as Limb; 2 * l];
+        let mut nxt = vec![0 as Limb; l];
+        let mut table: Vec<Vec<Limb>> = Vec::new();
+        let mut acc;
+        if bits <= 64 {
+            acc = base_m.clone();
+            for i in (0..bits - 1).rev() {
+                self.mont_sqr_to(&acc, &mut t, &mut nxt);
+                core::mem::swap(&mut acc, &mut nxt);
+                if bit(i) {
+                    self.mont_mul_to(&acc, &base_m, &mut t, &mut nxt);
+                    core::mem::swap(&mut acc, &mut nxt);
+                }
+            }
+        } else {
+            // table[i] = base^i for i in 1..16 (index 0 is never read).
+            table.push(Vec::new());
+            table.push(base_m.clone());
+            for i in 2..16 {
+                table.push(self.mont_mul_limbs(&table[i - 1], &table[1]));
+            }
+            let digit = |w: usize| ((exp[w / 16] >> (4 * (w % 16))) & 0xf) as usize;
+            let mut w = (bits - 1) / 4;
+            acc = table[digit(w)].clone(); // the top window is nonzero
+            while w > 0 {
+                w -= 1;
+                for _ in 0..4 {
+                    self.mont_sqr_to(&acc, &mut t, &mut nxt);
+                    core::mem::swap(&mut acc, &mut nxt);
+                }
+                let d = digit(w);
+                if d != 0 {
+                    self.mont_mul_to(&acc, &table[d], &mut t, &mut nxt);
+                    core::mem::swap(&mut acc, &mut nxt);
+                }
+            }
+        }
+        // `acc` and the table still hold base-derived values even though the
+        // exponent is public.
+        let result = BoxedUint::from_limbs(self.demont_limbs(&acc));
+        zeroize_limbs(&mut base_m);
+        zeroize_limbs(&mut acc);
+        zeroize_limbs(&mut t);
+        zeroize_limbs(&mut nxt);
+        for entry in table.iter_mut() {
+            zeroize_limbs(entry);
+        }
         result
     }
 
@@ -920,6 +1012,78 @@ mod tests {
                     assert_eq!(got.limbs(), m.limbs());
                     assert_eq!(got, x.reduce(&n), "n={n:?} x={x:?}");
                 }
+            }
+        }
+    }
+
+    /// Reference modexp: right-to-left binary over `mul_mod`, one bit at a
+    /// time with ordinary branches (test-only, nothing secret).
+    fn pow_reference(m: &BoxedMontModulus, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
+        let mut acc = m.reduce(&BoxedUint::from_u64(1));
+        let mut b = m.reduce(base);
+        for i in 0..exp.limbs() * 64 {
+            if (exp.as_limbs()[i / 64] >> (i % 64)) & 1 == 1 {
+                acc = m.mul_mod(&acc, &b);
+            }
+            b = m.mul_mod(&b, &b);
+        }
+        acc
+    }
+
+    #[test]
+    fn pow_variants_match_reference() {
+        let mut rng: u64 = 0x7A3C_91E5_0B2D_F468;
+        for nl in [1usize, 2, 3, 5, 8, 16] {
+            let mut v: Vec<Limb> = (0..nl).map(|_| splitmix64(&mut rng)).collect();
+            v[0] |= 1;
+            v[nl - 1] |= 1 << 63;
+            let n = BoxedUint::from_limbs(v);
+            let m = BoxedMontModulus::new(&n);
+            let rand = |rng: &mut u64, limbs: usize| {
+                BoxedUint::from_limbs((0..limbs).map(|_| splitmix64(rng)).collect())
+            };
+            let mut exps = vec![
+                BoxedUint::zero(1),
+                BoxedUint::from_u64(1),
+                BoxedUint::from_u64(2),
+                BoxedUint::from_u64(65537),
+                BoxedUint::from_u64(u64::MAX),
+                BoxedUint::from_limbs(vec![0, 1]),
+                BoxedUint::from_limbs(vec![u64::MAX; nl + 1]),
+            ];
+            for el in [1, nl, nl + 2] {
+                exps.push(rand(&mut rng, el));
+            }
+            // Exponents with a sparse top: bit lengths 65..=68 exercise the
+            // public window's partial top nibble.
+            for top in 0..4u32 {
+                exps.push(BoxedUint::from_limbs(vec![splitmix64(&mut rng), 1 << top]));
+            }
+            let bases = [
+                BoxedUint::zero(1),
+                BoxedUint::from_u64(1),
+                n.sub(&BoxedUint::from_u64(1)),
+                m.reduce(&rand(&mut rng, nl)),
+            ];
+            for base in &bases {
+                for e in &exps {
+                    let want = pow_reference(&m, base, e);
+                    assert_eq!(m.pow(base, e), want, "pow nl={nl} e={e:?}");
+                    assert_eq!(m.pow_public(base, e), want, "pow_public nl={nl} e={e:?}");
+                    // Tightest public bound and a looser, odd one.
+                    let bits = e.bit_len();
+                    assert_eq!(m.pow_bits(base, e, bits), want, "pow_bits nl={nl}");
+                    assert_eq!(m.pow_bits(base, e, bits + 7), want, "pow_bits nl={nl}");
+                }
+            }
+            for i in 0..exps.len() {
+                let j = (i * 5 + 3) % exps.len();
+                let (x, y) = (&exps[i], &exps[j]);
+                let (a, b) = (&bases[i % 4], &bases[3 - j % 4]);
+                let want = m.mul_mod(&pow_reference(&m, a, x), &pow_reference(&m, b, y));
+                let bits = x.bit_len().max(y.bit_len());
+                assert_eq!(m.pow2_bits(a, x, b, y, bits), want, "pow2 nl={nl}");
+                assert_eq!(m.pow2_bits(a, x, b, y, bits + 3), want, "pow2 nl={nl}");
             }
         }
     }

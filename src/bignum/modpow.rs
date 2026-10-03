@@ -2,7 +2,7 @@
 
 use super::MontModulus;
 use super::Uint;
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::ct::{ConditionallySelectable, ConstantTimeEq};
 
 impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// Computes `base^exp mod N` in constant time, for `base < N`.
@@ -72,34 +72,86 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         self.from_mont(&acc)
     }
 
+    /// Computes `a^x · b^y mod N` in constant time, for `a, b < N` and secret
+    /// exponents `x, y` of the full `LIMBS` width, with one shared chain of
+    /// squarings (Straus/Shamir): a 2-bit joint window over the 16-entry
+    /// table `a^i·b^j` (`i, j ∈ 0..4`), so `64·LIMBS` squarings plus half as
+    /// many multiplies, against the `2·64·LIMBS` squarings of two
+    /// [`pow`](Self::pow) calls.
+    ///
+    /// Same constant-time discipline as `pow`: every window gathers its entry
+    /// by a full masked scan of the table and multiplies unconditionally. The
+    /// table costs `16 * LIMBS * 8` bytes of stack, like `pow`'s.
+    pub fn pow2(
+        &self,
+        a: &Uint<LIMBS>,
+        x: &Uint<LIMBS>,
+        b: &Uint<LIMBS>,
+        y: &Uint<LIMBS>,
+    ) -> Uint<LIMBS> {
+        let one_m = self.to_mont(&Uint::ONE);
+        let mut table = [one_m; 16];
+        table[1] = self.to_mont(a);
+        table[4] = self.to_mont(b);
+        table[8] = self.mont_sqr(&table[4]);
+        table[12] = self.mont_mul(&table[8], &table[4]);
+        let mut j = 0;
+        while j < 16 {
+            let mut i = 1;
+            while i < 4 {
+                if j + i != 1 {
+                    table[j + i] = self.mont_mul(&table[j + i - 1], &table[1]);
+                }
+                i += 1;
+            }
+            j += 4;
+        }
+
+        let (x, y) = (x.as_limbs(), y.as_limbs());
+        let mut acc = one_m;
+        let mut bit = LIMBS * 64;
+        while bit >= 2 {
+            bit -= 2;
+            acc = self.mont_sqr(&acc);
+            acc = self.mont_sqr(&acc);
+            let idx = (((x[bit / 64] >> (bit % 64)) & 3) | (((y[bit / 64] >> (bit % 64)) & 3) << 2))
+                as usize;
+            // Constant-time gather, as in `pow` (matching entry goes first).
+            let mut sel = table[0];
+            for (k, t) in table.iter().enumerate() {
+                sel = Uint::conditional_select(t, &sel, k.ct_eq(&idx));
+            }
+            acc = self.mont_mul(&acc, &sel);
+        }
+        self.from_mont(&acc)
+    }
+
     /// Computes `base^exp mod N` for a **public** exponent.
     ///
-    /// Square-and-multiply-*always* exactly like [`pow`](Self::pow) — branchless
-    /// and leaking nothing about `base` — but it iterates `exp.bit_len()` times
-    /// instead of padding to the full modulus width, so its running time depends
-    /// on `exp`. **`exp` must be public** (e.g. an RSA public exponent in
-    /// verify/encrypt, where both `exp` and `base` are public); never call it
-    /// with a secret exponent — use [`pow`](Self::pow) for those. For the common
-    /// RSA `e = 65537` this replaces ~2048 squarings with ~17.
+    /// Left-to-right binary over `exp.bit_len()` bits, multiplying only where
+    /// a bit is set, so its running time depends on `exp` — **`exp` must be
+    /// public** (e.g. an RSA public exponent in verify/encrypt); never call it
+    /// with a secret exponent, use [`pow`](Self::pow) for those. The sequence
+    /// of operations is a function of `exp` alone, so a secret `base` is still
+    /// protected. For the common RSA `e = 65537` this is 16 squarings and one
+    /// multiply instead of `pow`'s ~2048 squarings.
     pub fn pow_public(&self, base: &Uint<LIMBS>, exp: &Uint<LIMBS>) -> Uint<LIMBS> {
-        let base_m = self.to_mont(base);
-        // Montgomery form of 1 is R mod N.
-        let mut acc = self.to_mont(&Uint::ONE);
-
         let bits = exp.bit_len();
         // base^0 = 1.
         if bits == 0 {
-            return self.from_mont(&acc);
+            return self.from_mont(&self.to_mont(&Uint::ONE));
         }
+        let base_m = self.to_mont(base);
         let exp = exp.as_limbs();
-        let mut i = bits;
+        // The top bit is set: start from `base` itself.
+        let mut acc = base_m;
+        let mut i = bits - 1;
         while i > 0 {
             i -= 1;
             acc = self.mont_sqr(&acc);
-            let multiplied = self.mont_mul(&acc, &base_m);
-            let set = Choice::from(((exp[i / 64] >> (i % 64)) & 1) as u8);
-            // Take the multiplied value when the exponent bit is set.
-            acc = Uint::conditional_select(&multiplied, &acc, set);
+            if (exp[i / 64] >> (i % 64)) & 1 == 1 {
+                acc = self.mont_mul(&acc, &base_m);
+            }
         }
 
         self.from_mont(&acc)
@@ -170,6 +222,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn pow_variants_width<const L: usize>(rng: &mut u64) {
+        let rand = |rng: &mut u64| {
+            let mut v = [0u64; L];
+            for l in v.iter_mut() {
+                *l = splitmix64(rng);
+            }
+            Uint::<L>::from_limbs(v)
+        };
+        for _ in 0..3 {
+            let mut n = *rand(rng).as_limbs();
+            n[0] |= 1;
+            n[L - 1] |= 1 << 63;
+            let n = Uint::<L>::from_limbs(n);
+            let m = MontModulus::new(n);
+            let below_n = |v: Uint<L>| {
+                let mut l = *v.as_limbs();
+                l[L - 1] >>= 1;
+                Uint::<L>::from_limbs(l)
+            };
+            let bases = [
+                Uint::ZERO,
+                Uint::ONE,
+                n.wrapping_sub(&Uint::ONE),
+                below_n(rand(rng)),
+            ];
+            let exps = [
+                Uint::ZERO,
+                Uint::ONE,
+                Uint::from_u64(65537),
+                Uint::from_limbs([u64::MAX; L]),
+                rand(rng),
+                rand(rng),
+            ];
+            for (i, a) in bases.iter().enumerate() {
+                for (j, x) in exps.iter().enumerate() {
+                    // pow_public (skip-zero binary) against the CT window.
+                    assert_eq!(m.pow_public(a, x), m.pow(a, x), "L={L}");
+                    let b = &bases[(i + j + 1) % 4];
+                    let y = &exps[(i * 3 + j + 2) % exps.len()];
+                    let want = m.mul_mod(&m.pow(a, x), &m.pow(b, y));
+                    assert_eq!(m.pow2(a, x, b, y), want, "L={L}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pow_variants_agree() {
+        let mut rng = 0x3C6E_F372_FE94_F82Bu64;
+        pow_variants_width::<1>(&mut rng);
+        pow_variants_width::<2>(&mut rng);
+        pow_variants_width::<3>(&mut rng);
+        pow_variants_width::<4>(&mut rng);
+        pow_variants_width::<8>(&mut rng);
     }
 
     #[test]
