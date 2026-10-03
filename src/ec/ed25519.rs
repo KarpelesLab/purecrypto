@@ -114,7 +114,7 @@ impl Ed25519PrivateKey {
         hr.update(&prefix);
         hr.update(message);
         let mut r_hash = hr.finalize();
-        let mut r = scalar_reduce_wide(&r_hash, &f.l8);
+        let mut r = scalar_reduce_wide(&r_hash);
         let mut r_bytes = [0u8; 32];
         r.write_le_bytes(&mut r_bytes);
         let r_enc = f.encode(&f.mul_base(&r_bytes));
@@ -124,9 +124,9 @@ impl Ed25519PrivateKey {
         hk.update(&r_enc);
         hk.update(&a_enc);
         hk.update(message);
-        let k = scalar_reduce_wide(&hk.finalize(), &f.l8);
+        let k = scalar_reduce_wide(&hk.finalize());
         let mut a_scalar = ScalarInt::from_le_bytes(&a);
-        let s = scalar_muladd(&r, &k, &a_scalar, &f.l8);
+        let s = scalar_muladd(&r, &k, &a_scalar);
 
         let mut sig = [0u8; 64];
         sig[..32].copy_from_slice(&r_enc);
@@ -332,7 +332,7 @@ impl Ed25519PublicKey {
         hk.update(&r_bytes);
         hk.update(&self.0);
         hk.update(message);
-        let k = scalar_reduce_wide(&hk.finalize(), &f.l8);
+        let k = scalar_reduce_wide(&hk.finalize());
         let mut k_bytes = [0u8; 32];
         k.write_le_bytes(&mut k_bytes);
 
@@ -630,7 +630,7 @@ mod tests {
         hk.update(&r_bytes);
         hk.update(&pk.0);
         hk.update(message);
-        let k = scalar_reduce_wide(&hk.finalize(), &f.l8);
+        let k = scalar_reduce_wide(&hk.finalize());
         let mut k_bytes = [0u8; 32];
         k.write_le_bytes(&mut k_bytes);
         let lhs = f.mul_base(&s_bytes);

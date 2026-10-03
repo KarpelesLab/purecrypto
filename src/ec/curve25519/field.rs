@@ -395,13 +395,10 @@ pub(crate) struct Field {
     pub(crate) p: ScalarInt,
     /// The group order `L`.
     pub(crate) l: ScalarInt,
-    /// `L` zero-extended to eight limbs, for reducing 512-bit scalars.
-    pub(crate) l8: Uint<8>,
 }
 
 impl Field {
     pub(crate) fn new() -> Self {
-        let ll = L_INT.as_limbs();
         Field {
             one: Fe::ONE,
             d: Fe::D,
@@ -409,7 +406,6 @@ impl Field {
             sqrtm1: Fe::SQRT_M1,
             p: P_INT,
             l: L_INT,
-            l8: Uint::<8>::from_limbs([ll[0], ll[1], ll[2], ll[3], 0, 0, 0, 0]),
         }
     }
 

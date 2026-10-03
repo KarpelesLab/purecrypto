@@ -92,8 +92,7 @@ impl Scalar {
     /// Reduces a 64-byte little-endian integer modulo `L` (the wide
     /// reduction used for hash-to-scalar, RFC 8032 / FROST).
     pub fn from_bytes_mod_order(bytes: &[u8; 64]) -> Scalar {
-        let f = Field::new();
-        Scalar(scalar_reduce_wide(bytes, &f.l8))
+        Scalar(scalar_reduce_wide(bytes))
     }
 
     /// The 32-byte little-endian canonical encoding.
@@ -117,8 +116,7 @@ impl Scalar {
 
     /// `self * rhs (mod L)`.
     pub fn mul(&self, rhs: &Scalar) -> Scalar {
-        let f = Field::new();
-        Scalar(scalar_mul(&self.0, &rhs.0, &f.l8))
+        Scalar(scalar_mul(&self.0, &rhs.0))
     }
 
     /// `-self (mod L)`.
@@ -131,7 +129,7 @@ impl Scalar {
     /// (`self^(L-2)`). The inverse of `0` is `0`.
     pub fn invert(&self) -> Scalar {
         let f = Field::new();
-        Scalar(scalar_invert(&self.0, &f.l, &f.l8))
+        Scalar(scalar_invert(&self.0, &f.l))
     }
 
     /// Constant-time equality.
