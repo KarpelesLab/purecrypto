@@ -177,14 +177,18 @@ pub type HmacSha512Prf = HmacPrf<crate::hash::Sha512>;
 /// cipher key), so the trait is implemented only by the AES-specific
 /// [`CmacAes128Prf`] / [`CmacAes256Prf`] wrappers, which delegate here.
 struct CmacPrf<C: BlockCipher + Clone> {
-    cipher: C,
+    /// A keyed-but-unfed CMAC (subkeys derived), cloned once per PRF block
+    /// rather than re-running `E_K(0)` and the subkey doublings, as
+    /// [`HmacPrf`] does with its keyed HMAC.
+    template: Cmac<C>,
     mac: Cmac<C>,
 }
 
 impl<C: BlockCipher + Clone> CmacPrf<C> {
     fn from_cipher(cipher: C) -> Self {
-        let mac = Cmac::new(cipher.clone());
-        CmacPrf { cipher, mac }
+        let template = Cmac::new(cipher);
+        let mac = template.clone();
+        CmacPrf { template, mac }
     }
 
     fn update(&mut self, data: &[u8]) {
@@ -192,7 +196,7 @@ impl<C: BlockCipher + Clone> CmacPrf<C> {
     }
 
     fn finalize(&mut self, out: &mut [u8]) {
-        let next = Cmac::new(self.cipher.clone());
+        let next = self.template.clone();
         let done = core::mem::replace(&mut self.mac, next);
         let mut tag = done.finalize();
         out.copy_from_slice(&tag);
