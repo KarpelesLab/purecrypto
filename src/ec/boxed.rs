@@ -14,7 +14,7 @@ use super::curves::CurveId;
 /// (which depends on `ec`).
 #[cfg(feature = "der")]
 const EC_PUBLIC_KEY_OID: &[u64] = &[1, 2, 840, 10045, 2, 1];
-use crate::bignum::{BoxedMontModulus, BoxedUint};
+use crate::bignum::BoxedUint;
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, Hmac};
 use crate::rng::{CryptoRng, RngCore};
@@ -79,11 +79,6 @@ fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
     // `Ok`/`Err`, or an RFC 6979 / rejection-sampling decision whose only
     // observable is the (public) retry count.
     (!v.ct_is_zero() & v.reduce(n).ct_eq(v)).declassify()
-}
-
-/// Modular inverse `a^-1 mod m` for prime `m`, via Fermat (`a^(m-2) mod m`).
-fn inv_mod(fm: &BoxedMontModulus, a: &BoxedUint, m: &BoxedUint) -> BoxedUint {
-    fm.pow(a, &m.sub(&BoxedUint::from_u64(2)))
 }
 
 /// RFC 6979 `bits2int`: the integer of the leftmost `qlen` bits of `data`.
@@ -289,12 +284,12 @@ impl BoxedEcdsaPublicKey {
     pub fn verify_prehash(&self, prehash: &[u8], sig: &BoxedEcdsaSignature) -> Result<(), Error> {
         let c = self.curve.curve();
         let n = c.order().clone();
-        let fq = BoxedMontModulus::new(&n);
+        let fq = c.order_modulus();
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
         }
         let z = bits2int(prehash, n.bit_len()).reduce(&n);
-        let w = inv_mod(&fq, &sig.s, &n);
+        let w = c.invert_scalar(&sig.s);
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
 
@@ -394,7 +389,7 @@ impl BoxedEcdsaPrivateKey {
     ) -> Result<(BoxedUint, BoxedUint, bool, bool), Error> {
         let c = self.curve.curve();
         let n = c.order().clone();
-        let fq = BoxedMontModulus::new(&n);
+        let fq = c.order_modulus();
         let order_len = self.curve.order_len();
 
         let z = bits2int(prehash, n.bit_len()).reduce(&n);
@@ -417,7 +412,7 @@ impl BoxedEcdsaPrivateKey {
         let x_overflow = !full_x.lt(&n);
         let y_is_odd = full_y.is_odd();
 
-        let mut k_inv = inv_mod(&fq, &k, &n);
+        let mut k_inv = c.invert_scalar(&k);
         let mut z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
         let s = fq.mul_mod(&k_inv, &z_rd);
         // Wipe the per-signature secrets: `k` alone recovers the long-term
@@ -610,7 +605,7 @@ impl BoxedEcdsaSignature {
         }
         let c = curve.curve();
         let n = c.order().clone();
-        let fq = BoxedMontModulus::new(&n);
+        let fq = c.order_modulus();
         if !in_range(&self.r, &n) || !in_range(&self.s, &n) {
             return Err(Error::Verification);
         }
@@ -630,7 +625,7 @@ impl BoxedEcdsaSignature {
         // Q = u1·G + u2·R with u1 = −z·r⁻¹, u2 = s·r⁻¹ (mod n). r is public, so
         // the variable-time Fermat inverse used elsewhere here is fine.
         let z = bits2int(prehash, n.bit_len()).reduce(&n);
-        let r_inv = inv_mod(&fq, &self.r, &n);
+        let r_inv = c.invert_scalar(&self.r);
         let neg_z = fq.sub_mod(&BoxedUint::zero(1), &z);
         let u1 = fq.mul_mod(&neg_z, &r_inv);
         let u2 = fq.mul_mod(&self.s, &r_inv);

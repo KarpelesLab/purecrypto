@@ -12,7 +12,7 @@
 //!
 //! The secret scalar is held in a [`BoxedUint`] and wiped on drop; all scalar
 //! arithmetic reuses the crate's constant-time field/scalar primitives
-//! ([`BoxedMontModulus`], `weierstrass::Curve::scalar_mul`).
+//! ([`BoxedMontModulus`](crate::bignum::BoxedMontModulus), `weierstrass::Curve::scalar_mul`).
 //!
 //! Keys serialize as standard SEC1 / PKIX structures carrying the SM2 named
 //! curve OID (`1.2.156.10197.1.301`), so PKCS#8 / PEM round-trips work through
@@ -20,7 +20,7 @@
 
 use super::Error;
 use super::curves::CurveId;
-use crate::bignum::{BoxedMontModulus, BoxedUint};
+use crate::bignum::BoxedUint;
 use crate::ct::{Choice, ConstantTimeEq};
 use crate::hash::{Digest, Sm3};
 use crate::rng::{CryptoRng, RngCore};
@@ -83,11 +83,6 @@ enum SignFailure {
     /// A permanent error (bad identity length, out-of-range nonce) that no
     /// amount of resampling fixes.
     Fatal(Error),
-}
-
-/// Modular inverse `a^-1 mod m` for prime `m`, via Fermat (`a^(m-2) mod m`).
-fn inv_mod(fm: &BoxedMontModulus, a: &BoxedUint, m: &BoxedUint) -> BoxedUint {
-    fm.pow(a, &m.sub(&BoxedUint::from_u64(2)))
 }
 
 /// A uniformly random scalar in `[1, n-1]` via rejection sampling, masking the
@@ -268,7 +263,7 @@ impl Sm2PublicKey {
     pub fn verify(&self, msg: &[u8], sig: &Sm2Signature, id: &[u8]) -> Result<(), Error> {
         let c = CURVE.curve();
         let n = c.order().clone();
-        let fq = BoxedMontModulus::new(&n);
+        let fq = c.order_modulus();
         // r, s ∈ [1, n-1].
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
@@ -473,7 +468,7 @@ impl Sm2PrivateKey {
     ) -> Result<Sm2Signature, SignFailure> {
         let c = CURVE.curve();
         let n = c.order().clone();
-        let fq = BoxedMontModulus::new(&n);
+        let fq = c.order_modulus();
         if !in_range(k, &n) {
             return Err(SignFailure::Fatal(Error::InvalidInput));
         }
@@ -491,7 +486,7 @@ impl Sm2PrivateKey {
         }
         // s = ((1 + dA)^-1 · (k − r·dA)) mod n.
         let one = BoxedUint::from_u64(1);
-        let mut d_plus_1_inv = inv_mod(&fq, &fq.add_mod(&one, &self.d), &n);
+        let mut d_plus_1_inv = c.invert_scalar(&fq.add_mod(&one, &self.d));
         let mut rd = fq.mul_mod(&r, &self.d);
         let mut k_minus_rd = fq.sub_mod(k, &rd);
         let s = fq.mul_mod(&d_plus_1_inv, &k_minus_rd);

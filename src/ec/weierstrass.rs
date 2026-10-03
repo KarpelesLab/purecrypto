@@ -50,6 +50,10 @@ pub(crate) struct Curve {
     gx: BoxedUint,
     gy: BoxedUint,
     n: BoxedUint,
+    /// Montgomery context for the group order, for the scalar arithmetic
+    /// (`mod n`) of the signature schemes built on this curve.
+    fq: BoxedMontModulus,
+    n_minus_2: BoxedUint,
 }
 
 impl Curve {
@@ -66,7 +70,10 @@ impl Curve {
         let fp = BoxedMontModulus::new(&p);
         let b3 = fp.add_mod(&fp.add_mod(&b, &b), &b); // 3b mod p
         let one = BoxedUint::from_u64(1);
+        let fq = BoxedMontModulus::new(&n);
         Curve {
+            fq,
+            n_minus_2: n.sub(&BoxedUint::from_u64(2)),
             a_mont: fp.to_mont(&a),
             b3_mont: fp.to_mont(&b3),
             a_plain: a,
@@ -83,6 +90,17 @@ impl Curve {
     /// The group order `n`.
     pub(crate) fn order(&self) -> &BoxedUint {
         &self.n
+    }
+
+    /// The Montgomery context for arithmetic modulo the group order `n`.
+    pub(crate) fn order_modulus(&self) -> &BoxedMontModulus {
+        &self.fq
+    }
+
+    /// `a⁻¹ mod n` via Fermat (`a^(n-2)`, `n` prime): the constant-time
+    /// fixed-window exponentiation, so `a` may be secret (a nonce).
+    pub(crate) fn invert_scalar(&self, a: &BoxedUint) -> BoxedUint {
+        self.fq.pow(a, &self.n_minus_2)
     }
 
     /// The field modulus `p`.

@@ -3,6 +3,14 @@
 use super::weierstrass::Curve;
 use crate::bignum::BoxedUint;
 
+/// A handle to a curve's arithmetic context: the process-wide cached copy
+/// with `std`, an owned one otherwise. Both deref to [`Curve`].
+#[cfg(feature = "std")]
+pub(crate) type CurveRef = &'static Curve;
+/// See the `std` variant.
+#[cfg(not(feature = "std"))]
+pub(crate) type CurveRef = alloc::boxed::Box<Curve>;
+
 /// A supported prime-order curve.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[non_exhaustive]
@@ -309,10 +317,36 @@ impl CurveId {
         }
     }
 
-    /// Builds the runtime [`Curve`] for this identifier.
-    pub(crate) fn curve(self) -> Curve {
+    /// Builds the runtime [`Curve`] for this identifier from its parameters.
+    fn build_curve(self) -> Curve {
         let p = self.params();
         Curve::new(hex(p.p), hex(p.a), hex(p.b), hex(p.gx), hex(p.gy), hex(p.n))
+    }
+
+    /// The runtime [`Curve`] for this identifier, built once per process.
+    ///
+    /// Building one parses six hex strings and sets up two Montgomery
+    /// contexts (`p` and `n`) — tens of µs, which every sign / verify / key
+    /// import used to pay. The context is public curve data, so caching it
+    /// raises no secrecy question; it is a few hundred bytes per curve,
+    /// built on first use only. The cache needs `std`'s `OnceLock` (the
+    /// crate keeps its core free of `unsafe`, which a `no_std` atomic-pointer
+    /// cache would need), so `no_std` builds rebuild on every call instead.
+    #[cfg(feature = "std")]
+    pub(crate) fn curve(self) -> CurveRef {
+        static CACHE: [std::sync::OnceLock<Curve>; CurveId::ALL.len()] =
+            [const { std::sync::OnceLock::new() }; CurveId::ALL.len()];
+        // `ALL` lists the variants in declaration order (cfg'd-out variants
+        // take no discriminant), so the discriminant is the index.
+        debug_assert_eq!(CurveId::ALL[self as usize], self);
+        CACHE[self as usize].get_or_init(|| self.build_curve())
+    }
+
+    /// The runtime [`Curve`] for this identifier (rebuilt per call without
+    /// `std`; see the cached variant).
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn curve(self) -> CurveRef {
+        alloc::boxed::Box::new(self.build_curve())
     }
 
     /// The field-element byte length: the width of one SEC1 coordinate and
