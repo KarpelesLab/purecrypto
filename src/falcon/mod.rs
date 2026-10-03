@@ -51,8 +51,9 @@
 //! heap allocations (measured: 0 bytes, 0 calls, at both degrees). The whole
 //! working set is one `[i16; 1024]` for the decompressed `s₂`: the hashed point
 //! `c` is squeezed off SHAKE-256 one coefficient at a time, and the negacyclic
-//! product `s₂·h` is computed one output coefficient at a time, so neither
-//! needs a buffer. Measured `thumbv7em-none-eabi` release frames:
+//! product `s₂·h` is computed in place in that same buffer by an NTT mod `q`
+//! (the key holds `h` already transformed; twiddles are generated on the fly,
+//! so there is no table). Measured `thumbv7em-none-eabi` release frames:
 //! [`FalconPublicKey::verify_with_format`] 2 584 B, and 4 160 B more for the
 //! free [`verify`], which parses the 2 056-byte key into its own frame — so an
 //! embedded caller that parses once and keeps the [`FalconPublicKey`] pays
@@ -259,9 +260,12 @@ const MAX_N: usize = 1024;
 /// needs no allocator.
 pub struct FalconPublicKey {
     degree: Degree,
-    /// `h`, `n` coefficients, each already reduced into `[0, q)`; entries past
-    /// `degree.n()` are zero and never read.
-    h: [u16; MAX_N],
+    /// `NTT(h)`: `h` transformed once at construction (see [`ntt`]), so each
+    /// verification pays one forward and one inverse transform of `s₂` instead
+    /// of an `O(n²)` product. Every entry is in `[0, q)`; entries past
+    /// `degree.n()` are zero and never read. Nothing serializes this key, so
+    /// the coefficient form is not kept.
+    h_ntt: [i16; MAX_N],
 }
 
 #[cfg(feature = "alloc")]
@@ -289,7 +293,7 @@ impl FalconPublicKey {
 
         let body = &pk[1..];
         // Unpack n 14-bit big-endian values from `body`.
-        let mut h = [0u16; MAX_N];
+        let mut h = [0i16; MAX_N];
         let mut acc: u32 = 0;
         let mut acc_bits: u32 = 0;
         let mut idx = 0usize;
@@ -306,7 +310,7 @@ impl FalconPublicKey {
             if coeff >= Q {
                 return Err(Error::Malformed);
             }
-            *slot = coeff as u16;
+            *slot = coeff as i16;
         }
 
         // Any leftover bits (the padding tail of the final byte) must be zero,
@@ -326,7 +330,8 @@ impl FalconPublicKey {
             return Err(Error::Malformed);
         }
 
-        Ok(FalconPublicKey { degree, h })
+        ntt(&mut h[..n]);
+        Ok(FalconPublicKey { degree, h_ntt: h })
     }
 
     /// The parameter set (degree) of this key.
@@ -423,8 +428,8 @@ impl FalconPublicKey {
         //
         // `s2` is the only polynomial buffer verification needs: `c` is consumed
         // one coefficient at a time straight off the SHAKE-256 stream, and the
-        // convolution below is transposed so it needs no accumulator array. The
-        // frame is therefore `2·MAX_N` bytes regardless of degree.
+        // product `s2·h` below overwrites `s2` in place. The frame is therefore
+        // `2·MAX_N` bytes regardless of degree.
         let mut s2 = [0i16; MAX_N];
         let consumed_bits = match decompress(s_bytes, &mut s2[..n]) {
             Some(v) => v,
@@ -444,45 +449,146 @@ impl FalconPublicKey {
 
         // --- s1 = c - s2*h mod q, centered; accumulate ||(s1, s2)||^2. ---
         //
-        // `c = HashToPoint(nonce ‖ msg)` is squeezed lazily: coefficient `k` is
-        // drawn exactly when it is needed, so the whole polynomial never has to
-        // be materialized. The negacyclic product `s2·h mod (xⁿ+1)` is likewise
-        // computed one output coefficient at a time — `(s2·h)_k` gathers
-        // `s2_i·h_{k-i}` for `i ≤ k` and `−s2_i·h_{k+n-i}` for `i > k`
-        // (`xⁿ = −1`) — which is the same `O(n²)` schoolbook work as
-        // accumulating into a `[i64; n]` product array, minus the array.
-        let mut point = hash_to_point_reader(nonce, msg);
-
+        // s2's half of the norm is taken first, while the buffer still holds
+        // the centered values; the buffer is then reused in place for
+        // `s2·h mod (xⁿ+1, q)`, computed as `NTT⁻¹(NTT(s2) ⊙ NTT(h))`.
+        // `c = HashToPoint(nonce ‖ msg)` is squeezed lazily, one coefficient
+        // exactly when it is needed, so the whole polynomial is never
+        // materialized.
         let bound = self.degree.sig_bound();
-        let mut norm: u64 = 0;
-        for k in 0..n {
-            let c_k = next_point_coeff(&mut point);
+        // |s2_i| ≤ 2047 (`decompress` caps the unary run): n ≤ 1024 squares
+        // stay far inside u64.
+        let mut norm: u64 = s2[..n].iter().map(|&v| (v as i32 * v as i32) as u64).sum();
+        if norm > bound {
+            return Ok(false);
+        }
 
-            // |s2_i| ≤ 2047 (`decompress` caps the unary run) and h_j < q, so
-            // each term is below 2²⁵ and n ≤ 1024 of them stay far inside i64.
-            let mut prod: i64 = 0;
-            for i in 0..=k {
-                prod += s2[i] as i64 * self.h[k - i] as i64;
+        let s2h = &mut s2[..n];
+        for v in s2h.iter_mut() {
+            if *v < 0 {
+                *v += Q as i16;
             }
-            for i in k + 1..n {
-                prod -= s2[i] as i64 * self.h[k + n - i] as i64;
-            }
+        }
+        ntt(s2h);
+        for (v, &h) in s2h.iter_mut().zip(self.h_ntt.iter()) {
+            *v = mq_mul(*v as u32, h as u32) as i16;
+        }
+        intt(s2h);
 
+        let mut point = hash_to_point_reader(nonce, msg);
+        for &prod in s2h.iter() {
+            let c_k = next_point_coeff(&mut point) as u32;
             // s1_k = c_k - (s2·h)_k (mod q), then centered to (-q/2, q/2].
-            let v = (c_k as i64 - prod).rem_euclid(Q as i64); // in [0, q)
-            let centered = center(v as u32);
+            let centered = center((c_k + Q - prod as u32) % Q);
             norm += (centered as i64 * centered as i64) as u64;
-
-            // s2 is already a centered signed value.
-            let s2v = s2[k] as i64;
-            norm += (s2v * s2v) as u64;
-
             if norm > bound {
                 return Ok(false);
             }
         }
 
         Ok(norm <= bound)
+    }
+}
+
+/// `a·b mod q` for `a·b < 2³²` (every caller passes `a < 2q`, `b < q`).
+///
+/// Verification-only: its operands are public, so the `%` (a multiply-shift
+/// on most targets, a divide on some) needs no constant-time treatment.
+#[inline]
+fn mq_mul(a: u32, b: u32) -> u32 {
+    a * b % Q
+}
+
+/// `ψ`, a primitive 2048-th root of unity mod `q` (`ψ¹⁰²⁴ ≡ −1`), and `ψ⁻¹`.
+/// The degree-`n` transforms use `ψ^(1024/n)`, a primitive `2n`-th root.
+const PSI_2048: u32 = 1945;
+const PSI_2048_INV: u32 = 4050;
+
+/// `r^(1024/n)` for the two Falcon degrees: the primitive `2n`-th root of
+/// unity derived from a 2048-th one.
+#[inline]
+fn root_for(r: u32, n: usize) -> u32 {
+    let mut r = r;
+    let mut m = n;
+    while m < MAX_N {
+        r = mq_mul(r, r);
+        m *= 2;
+    }
+    r
+}
+
+/// In-place negacyclic NTT mod `(xⁿ + 1, q)`: `a(x)` with coefficients in
+/// `[0, q)` becomes its evaluations at the odd powers of `ψ`, in bit-reversed
+/// order (the order is irrelevant: the only consumers are a pointwise
+/// product and [`intt`]). Pre-scaling by `ψᵏ` turns the negacyclic transform
+/// into a cyclic one, which runs as a decimation-in-frequency radix-2 NTT.
+///
+/// Every twiddle is the running power of one per-level base, so no table is
+/// stored: that is `n` extra `mq_mul`s per call on top of `(n/2)·log n`
+/// butterflies. Public data only (verification and public-key parsing).
+fn ntt(a: &mut [i16]) {
+    let n = a.len();
+    let psi = root_for(PSI_2048, n);
+    let mut w = 1;
+    for v in a.iter_mut() {
+        *v = mq_mul(*v as u32, w) as i16;
+        w = mq_mul(w, psi);
+    }
+    // ω = ψ² is a primitive n-th root; level `len` uses ω^(n/2len).
+    let mut base = mq_mul(psi, psi);
+    let mut len = n / 2;
+    while len >= 1 {
+        let mut w = 1;
+        for j in 0..len {
+            for s in (j..n).step_by(2 * len) {
+                let u = a[s] as u32;
+                let v = a[s + len] as u32;
+                let t = u + v;
+                a[s] = if t >= Q { t - Q } else { t } as i16;
+                a[s + len] = mq_mul(u + Q - v, w) as i16;
+            }
+            w = mq_mul(w, base);
+        }
+        base = mq_mul(base, base);
+        len /= 2;
+    }
+}
+
+/// Inverse of [`ntt`]: bit-reversed evaluations back to coefficients in
+/// `[0, q)` — a decimation-in-time cyclic inverse NTT, then the `n⁻¹·ψ⁻ᵏ`
+/// post-scaling folded into one multiplication per coefficient.
+fn intt(a: &mut [i16]) {
+    let n = a.len();
+    let psi_inv = root_for(PSI_2048_INV, n);
+    let omega_inv = mq_mul(psi_inv, psi_inv);
+    let mut len = 1;
+    while len < n {
+        // Level `len` uses ω^(−n/2len).
+        let mut base = omega_inv;
+        let mut m = 2 * len;
+        while m < n {
+            base = mq_mul(base, base);
+            m *= 2;
+        }
+        let mut w = 1;
+        for j in 0..len {
+            for s in (j..n).step_by(2 * len) {
+                let u = a[s] as u32;
+                let v = mq_mul(a[s + len] as u32, w);
+                let t = u + v;
+                a[s] = if t >= Q { t - Q } else { t } as i16;
+                let d = u + Q - v;
+                a[s + len] = if d >= Q { d - Q } else { d } as i16;
+            }
+            w = mq_mul(w, base);
+        }
+        len *= 2;
+    }
+    // n⁻¹ = q − (q − 1)/n, since n divides q − 1.
+    let mut w = Q - (Q - 1) / n as u32;
+    for v in a.iter_mut() {
+        *v = mq_mul(*v as u32, w) as i16;
+        w = mq_mul(w, psi_inv);
     }
 }
 
@@ -789,11 +895,14 @@ impl FalconPrivateKey {
 
     /// The matching public key.
     pub fn public_key(&self) -> FalconPublicKey {
-        let mut h = [0u16; MAX_N];
-        h[..self.h.len()].copy_from_slice(&self.h);
+        let mut h = [0i16; MAX_N];
+        for (d, &c) in h.iter_mut().zip(self.h.iter()) {
+            *d = c as i16;
+        }
+        ntt(&mut h[..self.h.len()]);
         FalconPublicKey {
             degree: self.degree,
-            h,
+            h_ntt: h,
         }
     }
 

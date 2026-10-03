@@ -876,3 +876,75 @@ fn sign_timing() {
         );
     }
 }
+
+/// The `O(n²)` schoolbook `s2·h mod (xⁿ+1, q)` the verifier used before the
+/// NTT, kept as the oracle for [`ntt_product_matches_schoolbook`].
+fn schoolbook_mul(s2: &[i16], h: &[i16]) -> alloc::vec::Vec<i16> {
+    let n = s2.len();
+    (0..n)
+        .map(|k| {
+            let mut prod: i64 = 0;
+            for i in 0..=k {
+                prod += s2[i] as i64 * h[k - i] as i64;
+            }
+            for i in k + 1..n {
+                prod -= s2[i] as i64 * h[k + n - i] as i64;
+            }
+            prod.rem_euclid(super::Q as i64) as i16
+        })
+        .collect()
+}
+
+#[test]
+fn ntt_product_matches_schoolbook() {
+    use super::{Q, intt, mq_mul, ntt};
+    let q = Q as i16;
+    let mut state = 0x0123_4567_89AB_CDEFu64;
+    let mut next = move || {
+        // splitmix64
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for n in [512usize, 1024] {
+        // Edge polynomials (zero, all-max, unit, x^(n-1)), then random ones,
+        // with s2 drawn over the full signed range decompress can produce.
+        let mut cases: alloc::vec::Vec<(alloc::vec::Vec<i16>, alloc::vec::Vec<i16>)> =
+            alloc::vec::Vec::new();
+        cases.push((alloc::vec![0; n], alloc::vec![q - 1; n]));
+        cases.push((alloc::vec![2047; n], alloc::vec![q - 1; n]));
+        cases.push((alloc::vec![-2047; n], alloc::vec![q - 1; n]));
+        let mut one = alloc::vec![0i16; n];
+        one[0] = 1;
+        let mut top = alloc::vec![0i16; n];
+        top[n - 1] = -1;
+        let mut top_h = alloc::vec![0i16; n];
+        top_h[n - 1] = q - 1;
+        cases.push((one.clone(), top_h));
+        cases.push((top, one));
+        for _ in 0..8 {
+            let s2 = (0..n).map(|_| (next() % 4095) as i16 - 2047).collect();
+            let h = (0..n).map(|_| (next() % Q as u64) as i16).collect();
+            cases.push((s2, h));
+        }
+        for (s2, h) in cases {
+            let want = schoolbook_mul(&s2, &h);
+            let mut a: alloc::vec::Vec<i16> = s2.iter().map(|&v| v.rem_euclid(q)).collect();
+            let mut b = h.clone();
+            ntt(&mut a);
+            ntt(&mut b);
+            for (x, &y) in a.iter_mut().zip(b.iter()) {
+                *x = mq_mul(*x as u32, y as u32) as i16;
+            }
+            intt(&mut a);
+            assert_eq!(a, want, "n = {n}");
+            // Round trip alone is the identity.
+            let mut c = h.clone();
+            ntt(&mut c);
+            intt(&mut c);
+            assert_eq!(c, h);
+        }
+    }
+}
