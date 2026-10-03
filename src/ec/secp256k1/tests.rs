@@ -342,3 +342,113 @@ fn xonly_tweak_add_bip341_vector() {
     let (x, _parity) = xonly_tweak_add(&internal, &tweak).unwrap();
     assert_eq!(x, expected);
 }
+
+/// Re-derives every entry of the embedded fixed-base table from the group law,
+/// so `SECP256K1_GEN_TABLE` is verified on every test run rather than trusted.
+/// Inversion-free: the stored affine `(x, y)` matches the computed projective
+/// `(X : Y : Z)` iff `x·Z == X` and `y·Z == Y`.
+#[test]
+#[cfg(feature = "secp256k1-table")]
+fn gen_table_matches_computed() {
+    let f = field();
+    let mut base = ProjectivePoint::generator().0;
+    for window in gtable::SECP256K1_GEN_TABLE.iter() {
+        let mut acc = base;
+        for (j, entry) in window.iter().enumerate() {
+            if j > 0 {
+                acc = Point::add(&f, &acc, &base);
+            }
+            assert!(!bool::from(acc.is_identity()), "entry is the identity");
+            let ex = Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]);
+            let ey = Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]);
+            assert_eq!(f.mul(&ex, &acc.z), acc.x, "x mismatch");
+            assert_eq!(f.mul(&ey, &acc.z), acc.y, "y mismatch");
+        }
+        for _ in 0..4 {
+            base = Point::double(&f, &base);
+        }
+    }
+}
+
+/// The fixed-base path (the comb when `secp256k1-table` is on) agrees with
+/// the generic ladder over `G` for edge scalars and a pseudo-random batch.
+#[test]
+fn mul_generator_matches_ladder() {
+    let n = Scalar::ORDER;
+    let edges = [
+        Scalar::ZERO,
+        Scalar::ONE,
+        scalar_from_u64(2),
+        scalar_from_u64(15),
+        scalar_from_u64(16),
+        Scalar(n.wrapping_sub(&Fe::ONE)),
+        Scalar(n.wrapping_sub(&Fe::from_u64(2))),
+        Scalar(n.shr1()),
+        Scalar(Fe::from_limbs([u64::MAX, u64::MAX, 0, 0])),
+        Scalar(Fe::from_limbs([0x1111_1111_1111_1111; 4])),
+    ];
+    let mut x = 0x6E7A_B1E5_0001u64;
+    let mut rnd = || {
+        let mut b = [0u8; 32];
+        for c in b.chunks_mut(8) {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            c.copy_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        Scalar::from_bytes_be_reduce(&b)
+    };
+    let g = ProjectivePoint::generator();
+    let check = |k: &Scalar| {
+        let want = g.mul(k);
+        let got = ProjectivePoint::mul_generator(k);
+        assert!(bool::from(got.ct_eq(&want)), "k={:x?}", k.to_bytes_be());
+    };
+    for k in &edges {
+        check(k);
+    }
+    for _ in 0..64 {
+        check(&rnd());
+    }
+}
+
+/// Regenerates the fixed-base table source (`src/ec/secp256k1/gtable.rs`).
+/// Run with:
+/// `cargo test --release gen_secp256k1_gen_table -- --ignored --nocapture`
+/// and paste the emitted `static` between the file's header comment and
+/// EOF. The non-ignored `gen_table_matches_computed` test keeps the pasted
+/// constants honest on every test run.
+#[test]
+#[ignore = "table generator; emits Rust source on stdout"]
+#[cfg(feature = "std")]
+fn gen_secp256k1_gen_table() {
+    use std::{print, println};
+    let f = field();
+    // base = [16^i]G for the current window i.
+    let mut base = ProjectivePoint::generator().0;
+    println!("pub(crate) static SECP256K1_GEN_TABLE: [[[u64; 8]; 15]; 64] = [");
+    for _ in 0..64 {
+        println!("    [");
+        let mut acc = base;
+        for j in 1..=15u32 {
+            if j > 1 {
+                acc = Point::add(&f, &acc, &base);
+            }
+            let (x, y) = acc.to_affine(&f).expect("table entry is never identity");
+            print!("        [");
+            for l in x.as_limbs() {
+                print!("0x{l:016x}, ");
+            }
+            for l in y.as_limbs() {
+                print!("0x{l:016x}, ");
+            }
+            println!("],");
+        }
+        println!("    ],");
+        for _ in 0..4 {
+            base = Point::double(&f, &base);
+        }
+    }
+    println!("];");
+}

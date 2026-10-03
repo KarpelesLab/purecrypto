@@ -205,6 +205,41 @@ impl Point {
         acc
     }
 
+    /// Constant-time fixed-base multiplication `scalar · G` via the
+    /// precomputed comb table [`SECP256K1_GEN_TABLE`]:
+    /// `[k]G = Σᵢ [dᵢ · 16^i]G` over the 64 base-16 digits `dᵢ` of the scalar,
+    /// so there are **no doublings** — just 64 unconditional additions, each
+    /// operand fetched by a masked scan of that window's 15 stored points (no
+    /// secret-indexed memory access, the same gather discipline as
+    /// [`Self::mul`]). A zero digit adds the identity, a uniform no-op under
+    /// the complete RCB formulas, so the schedule depends only on the
+    /// (public) scalar width.
+    ///
+    /// [`SECP256K1_GEN_TABLE`]: super::gtable::SECP256K1_GEN_TABLE
+    #[cfg(feature = "secp256k1-table")]
+    pub(crate) fn mul_generator_table<F: FieldBackend>(f: &F, scalar: &[u64; 4]) -> Point {
+        let id = Point::identity(f);
+        let mut acc = id;
+        for (i, window) in super::gtable::SECP256K1_GEN_TABLE.iter().enumerate() {
+            // Digit i = bits [4i, 4i+4) of the little-endian scalar.
+            let digit = ((scalar[i / 16] >> ((i % 16) * 4)) & 0xf) as usize;
+            // Constant-time gather: scan all 15 entries, keep entry j when
+            // j + 1 == digit; a zero digit keeps the identity.
+            let mut sel = id;
+            for (j, entry) in window.iter().enumerate() {
+                let cand = Point {
+                    x: Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]),
+                    y: Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]),
+                    z: f.one(),
+                };
+                sel = Point::conditional_select(&cand, &sel, (j + 1).ct_eq(&digit));
+            }
+            acc = Point::add(f, &acc, &sel);
+            sel.zeroize();
+        }
+        acc
+    }
+
     /// Converts to affine `(x, y)`, returning `None` for the identity. The
     /// inversion uses the constant-time Fermat inverse from the field backend.
     // Takes `&self` for consistency with the other by-reference point ops.

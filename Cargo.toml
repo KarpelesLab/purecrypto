@@ -55,7 +55,7 @@ name = "purecrypto"
 # The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "ed25519-table", "p256-table", "streebog-table", "whirlpool-table", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "jose"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "ed25519-table", "p256-table", "secp256k1-table", "streebog-table", "whirlpool-table", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "jose"]
 # `compcol?/…`: under `cert-compression` a `std` build also gets compcol's
 # brotli codec, whose encoder uses floating-point `log2` and so cannot be
 # built for `no_std` (zlib and zstd can).
@@ -134,6 +134,12 @@ ed25519-table = ["ec"]
 # verification to an interleaved double-scalar multiplication: identical
 # results, a smaller binary, slower signing and key generation.
 p256-table = ["ec"]
+# The precomputed fixed-base comb table for secp256k1 (~61 KB of static data)
+# behind secp256k1 ECDSA / BIP340 signing and key generation, the secp256k1
+# hazmat `mul_generator` and the zkp provers. Without it `[k]G` falls back to
+# the constant-time windowed ladder: identical results, a smaller binary,
+# slower signing and key generation. (Verification never uses the table.)
+secp256k1-table = ["ec"]
 tls = ["cipher", "hash", "kdf", "ec", "rsa", "x509", "der", "rng", "mlkem", "alloc"]
 # DTLS (RFC 6347 + RFC 9147). Builds on the `tls` stack — the record / replay /
 # reassembly / cookie chassis lives in `src/dtls/`, with version-specific

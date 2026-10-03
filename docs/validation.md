@@ -898,7 +898,7 @@ machine code hides:
 |---|---|---|
 | `x86_64` | `x86_64-unknown-linux-gnu` on `ubuntu-latest` | the CPU dispatch memcheck's emulated CPU allows: AES-NI, PCLMULQDQ, AVX2 (Valgrind hides AVX-512 and SHA-NI) |
 | `x86_64, portable` | same | every dispatch site forced onto its portable kernel (`PURECRYPTO_CT_FORCE_PORTABLE=1`): table-free AES, the branchless GHASH multiply, scalar ChaCha20 / Poly1305 / BLAKE3 / Keccak / SHA |
-| `x86_64, table-free` | same, `--no-default-features` minus `ed25519-table` / `p256-table` | the constant-time windowed ladders for `[k]B` / `[k]G` and interleaved double-scalar verification instead of the precomputed comb tables |
+| `x86_64, table-free` | same, `--no-default-features` minus `ed25519-table` / `p256-table` / `secp256k1-table` | the constant-time windowed ladders for `[k]B` / `[k]G` and interleaved double-scalar verification instead of the precomputed comb tables |
 | `aarch64`, `aarch64, portable`, `aarch64, table-free` | `aarch64-unknown-linux-gnu` on `ubuntu-24.04-arm` | as above with the Arm extensions (AES, PMULL, SHA-2, SHA-512) |
 | `i686` | `i686-unknown-linux-gnu` under the amd64 Valgrind's x86 tool | 32-bit `usize` and limbs: 64-bit multiplies and shifts become multi-instruction sequences, 64-bit divisions library calls; no hardware backends are compiled for it, so this is the portable code throughout |
 | `armv7` | `armv7-unknown-linux-gnueabihf` under `valgrind:armhf`, in AArch32 mode on the Neoverse-N2 runner | the 32-bit Arm lowering of the same |

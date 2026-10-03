@@ -30,7 +30,7 @@ env:
   CARGO_TERM_COLOR: always
   # Opt-in features the harness needs on top of the default set.
   CT_FEATURES: __ct-check,hpke,bls,falcon,quic,bip340,zkp,ristretto255,dsa,chunked,legacy-ciphers,vmac
-  # The default set minus the Ed25519 / P-256 base-point tables (and the
+  # The default set minus the Ed25519 / P-256 / secp256k1 base-point tables (and the
   # parts the harness does not need), for the table-free variant.
   CT_TABLE_FREE_BASE: std,alloc,hash,cipher,kdf,bignum,rng,rsa,der,dh,x509,ec,tls,dtls,mlkem,mldsa,slhdsa,ascon,aez,lms,xmss,mac,key,jose
 

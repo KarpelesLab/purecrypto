@@ -2383,6 +2383,7 @@ fn main() {
     let tables: Vec<&str> = [
         ("ed25519", cfg!(feature = "ed25519-table")),
         ("p256", cfg!(feature = "p256-table")),
+        ("secp256k1", cfg!(feature = "secp256k1-table")),
     ]
     .iter()
     .filter(|(_, on)| *on)

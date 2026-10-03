@@ -43,6 +43,8 @@ pub mod schnorr;
 pub mod ecdsa;
 pub(crate) mod field_backend;
 mod group;
+#[cfg(feature = "secp256k1-table")]
+mod gtable;
 mod vartime;
 
 use crate::bignum::MontModulus;
@@ -259,9 +261,22 @@ impl ProjectivePoint {
         ProjectivePoint(Point::mul(&field(), scalar.0.as_limbs(), &self.0))
     }
 
-    /// Returns `scalar · G` (scalar times the generator).
+    /// Returns `scalar · G` (scalar times the generator), constant time in the
+    /// scalar.
+    ///
+    /// With the `secp256k1-table` feature this is a doubling-free comb over a
+    /// precomputed table of `[j·16^i]G` (64 complete additions, each operand
+    /// gathered by a masked scan); without it, the [`mul`](Self::mul) ladder
+    /// over `G`. Same result and the same secret-scalar discipline either way.
     pub fn mul_generator(scalar: &Scalar) -> ProjectivePoint {
-        Self::generator().mul(scalar)
+        #[cfg(feature = "secp256k1-table")]
+        {
+            ProjectivePoint(Point::mul_generator_table(&field(), scalar.0.as_limbs()))
+        }
+        #[cfg(not(feature = "secp256k1-table"))]
+        {
+            Self::generator().mul(scalar)
+        }
     }
 
     /// **Variable-time** `a·p + b·q` (GLV split, then Straus over width-5
