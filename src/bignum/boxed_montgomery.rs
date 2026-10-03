@@ -31,6 +31,27 @@ fn add_mod_limbs(n: &[Limb], a: &[Limb], b: &[Limb]) -> Vec<Limb> {
     select_limbs(&diff, &sum, Choice::from(subtract as u8))
 }
 
+/// `out ← (a + b) mod n` for equal-length `a, b < n`, where `a` is consumed as
+/// the sum buffer — the allocation-free form of [`add_mod_limbs`].
+fn add_mod_in_place(n: &[Limb], a: &mut [Limb], b: &[Limb], out: &mut [Limb]) {
+    let mut c: Limb = 0;
+    for (x, &y) in a.iter_mut().zip(b) {
+        let (s, co) = adc(*x, y, c);
+        *x = s;
+        c = co;
+    }
+    let mut bo: Limb = 0;
+    for j in 0..n.len() {
+        let (d, b) = sbb(a[j], n[j], bo);
+        out[j] = d;
+        bo = b;
+    }
+    let subtract = Choice::from((c | (bo ^ 1)) as u8);
+    for j in 0..n.len() {
+        out[j] = Limb::conditional_select(&out[j], &a[j], subtract);
+    }
+}
+
 /// `(a - b) mod n` for equal-length `a, b < n`.
 fn sub_mod_limbs(n: &[Limb], a: &[Limb], b: &[Limb]) -> Vec<Limb> {
     let (diff, borrow) = sbb_limbs(a, b, 0);
@@ -383,6 +404,52 @@ impl BoxedMontModulus {
         BoxedUint::from_limbs(
             self.mont_mul_limbs(&a.limbs_resized(self.limbs), &b.limbs_resized(self.limbs)),
         )
+    }
+
+    /// Reduces `x` (of any width) modulo `n` — the result is `limbs` wide.
+    ///
+    /// Horner over `limbs`-sized chunks `c_i` of `x = Σ c_i·R^i` in the
+    /// Montgomery domain: `M(c) = mont_mul(c, R²)` holds for *any* `c < R`
+    /// (CIOS only needs one operand below `n` for its `< 2n` output bound),
+    /// and `M(acc·R) = mont_mul(M(acc), R²)`, so each chunk costs two
+    /// Montgomery multiplications plus a modular addition, and one final
+    /// `from_mont` undoes the domain. For the RSA CRT split (a 2048-bit value
+    /// mod a 1024-bit prime) that is five half-width multiplies instead of
+    /// the 2048 trial subtractions of [`BoxedUint::reduce`].
+    ///
+    /// Constant time: the chunk count and every loop bound are functions of
+    /// the (public) widths of `x` and `n`; the arithmetic is the masked CIOS
+    /// and add/select code, so neither the value of `x` nor of a secret `n`
+    /// steers anything.
+    pub fn reduce(&self, x: &BoxedUint) -> BoxedUint {
+        let l = self.limbs;
+        let xl = x.as_limbs();
+        let chunks = xl.len().div_ceil(l);
+        let mut t = vec![0 as Limb; l];
+        let mut acc = vec![0 as Limb; l];
+        let mut c = vec![0 as Limb; l];
+        let mut cm = vec![0 as Limb; l];
+        for i in (0..chunks).rev() {
+            for (j, cj) in c.iter_mut().enumerate() {
+                *cj = xl.get(i * l + j).copied().unwrap_or(0);
+            }
+            self.mont_mul_to(&c, &self.r2, &mut t, &mut cm);
+            if i + 1 == chunks {
+                core::mem::swap(&mut acc, &mut cm);
+            } else {
+                // acc ← M(prefix·R), then add M(c_i).
+                self.mont_mul_to(&acc, &self.r2, &mut t, &mut c);
+                add_mod_in_place(&self.n, &mut c, &cm, &mut acc);
+            }
+        }
+        // from_mont: multiply by plain 1 (`cm` reused as the constant).
+        cm.fill(0);
+        cm[0] = 1;
+        self.mont_mul_to(&acc, &cm, &mut t, &mut c);
+        zeroize_limbs(&mut t);
+        zeroize_limbs(&mut acc);
+        zeroize_limbs(&mut cm);
+        BoxedUint::from_limbs(c)
     }
 
     /// Returns `(a * b) mod n` for `a, b < n`.
@@ -807,6 +874,52 @@ mod tests {
                     v[0] = 3;
                 }
                 check(BoxedUint::from_limbs(v));
+            }
+        }
+    }
+
+    #[test]
+    fn mont_reduce_matches_long_division() {
+        let mut rng: u64 = 0xA076_1D64_78BD_642F;
+        for nl in 1..=20usize {
+            for k in 0..2 {
+                let mut v: Vec<Limb> = (0..nl).map(|_| splitmix64(&mut rng)).collect();
+                if k == 0 {
+                    v[nl - 1] |= 1 << 63;
+                } else {
+                    v[nl - 1] = (v[nl - 1] >> 33).max(1);
+                }
+                v[0] |= 1;
+                if v == [1] {
+                    v[0] = 3;
+                }
+                let n = BoxedUint::from_limbs(v);
+                let m = BoxedMontModulus::new(&n);
+                // Inputs narrower, equal and up to 3x wider than n, plus the
+                // edge values 0, n - 1, n, all-ones.
+                let mut xs = vec![
+                    BoxedUint::zero(1),
+                    n.sub(&BoxedUint::from_u64(1)),
+                    n.clone(),
+                    BoxedUint::from_limbs(vec![Limb::MAX; 3 * nl]),
+                ];
+                for xl in [
+                    1,
+                    nl.saturating_sub(1).max(1),
+                    nl,
+                    nl + 1,
+                    2 * nl,
+                    3 * nl + 1,
+                ] {
+                    xs.push(BoxedUint::from_limbs(
+                        (0..xl).map(|_| splitmix64(&mut rng)).collect(),
+                    ));
+                }
+                for x in &xs {
+                    let got = m.reduce(x);
+                    assert_eq!(got.limbs(), m.limbs());
+                    assert_eq!(got, x.reduce(&n), "n={n:?} x={x:?}");
+                }
             }
         }
     }

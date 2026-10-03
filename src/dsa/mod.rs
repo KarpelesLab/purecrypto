@@ -498,7 +498,7 @@ impl DsaPublicKey {
         }
         let fq = BoxedMontModulus::new(q);
         let fp = BoxedMontModulus::new(p);
-        let z = bits2int(prehash, q.bit_len()).reduce(q);
+        let z = fq.reduce(&bits2int(prehash, q.bit_len()));
         // `q` prime and `1 ≤ s < q` make the inverse exist; `None` can only
         // mean a composite `q` that slipped past Miller-Rabin, and then the
         // signature is not verifiable in any meaningful sense.
@@ -507,9 +507,7 @@ impl DsaPublicKey {
             .ok_or(Error::Verification)?;
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
-        let v = fp
-            .mul_mod(&fp.pow_public(g, &u1), &fp.pow_public(&self.y, &u2))
-            .reduce(q);
+        let v = fq.reduce(&fp.mul_mod(&fp.pow_public(g, &u1), &fp.pow_public(&self.y, &u2)));
         if v == sig.r {
             Ok(())
         } else {
@@ -638,11 +636,11 @@ impl DsaPrivateKey {
         let fq = BoxedMontModulus::new(q);
         let fp = BoxedMontModulus::new(p);
         let qbits = q.bit_len();
-        let z = bits2int(prehash, qbits).reduce(q);
+        let z = fq.reduce(&bits2int(prehash, qbits));
         let mut drbg = Rfc6979::<D>::new(&self.x, prehash, q, self.params.q_len(), qbits);
         loop {
             let mut k = drbg.next_k();
-            let r = fp.pow(g, &k).reduce(q);
+            let r = fq.reduce(&fp.pow(g, &k));
             // Declassified (Valgrind harness): `r` is the first half of the
             // signature (its `r = 0` check is a public retry).
             crate::ct::declassify_val(r.as_limbs());

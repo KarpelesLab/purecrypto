@@ -49,6 +49,56 @@ pub(crate) fn select_limbs(a: &[Limb], b: &[Limb], choice: Choice) -> Vec<Limb> 
         .collect()
 }
 
+/// Constant-time bitwise long division of `x` by `n` (`n.len()` limbs, top
+/// limb nonzero), leaving the remainder in `r` (`n.len()` limbs). `scratch`
+/// (`n.len()` limbs) holds the trial subtraction; `on_bit(i, bit, ge)` is told
+/// each quotient bit, at limb `i` / bit `bit` of the quotient.
+///
+/// Allocation-free and in place: the old per-bit `adc_limbs` / `sbb_limbs` /
+/// `select_limbs` returned three fresh `Vec`s per input bit. The top
+/// `n.len() − 1` limbs of `x` are loaded into `r` directly — a value below
+/// `2^(64·(n.len()−1)) ≤ n` is its own remainder with quotient bits zero — so
+/// only the remaining limbs run the shift/subtract/select loop. Every branch
+/// is on limb counts and bit positions (public widths), none on values.
+fn long_divide(
+    x: &[Limb],
+    n: &[Limb],
+    r: &mut [Limb],
+    scratch: &mut [Limb],
+    mut on_bit: impl FnMut(usize, u32, Choice),
+) {
+    let m = n.len();
+    let pre = x.len().min(m - 1);
+    let rest = x.len() - pre;
+    r.fill(0);
+    r[..pre].copy_from_slice(&x[rest..]);
+    for i in (0..rest).rev() {
+        let mut bit = LIMB_BITS as u32;
+        while bit > 0 {
+            bit -= 1;
+            // r = (r << 1) | next bit of x
+            let mut carry = (x[i] >> bit) & 1;
+            for w in r.iter_mut() {
+                let next = *w >> (LIMB_BITS - 1);
+                *w = (*w << 1) | carry;
+                carry = next;
+            }
+            // Subtract n when the shift overflowed or r >= n.
+            let mut bo: Limb = 0;
+            for j in 0..m {
+                let (d, b) = sbb(r[j], n[j], bo);
+                scratch[j] = d;
+                bo = b;
+            }
+            let ge = Choice::from((carry | (bo ^ 1)) as u8);
+            for j in 0..m {
+                r[j] = Limb::conditional_select(&scratch[j], &r[j], ge);
+            }
+            on_bit(i, bit, ge);
+        }
+    }
+}
+
 /// An unsigned integer of runtime-chosen width, stored as little-endian 64-bit
 /// limbs (limb 0 is least significant).
 #[derive(Clone, Debug)]
@@ -251,6 +301,11 @@ impl BoxedUint {
     /// The schedule depends only on the bit widths, not the values. `modulus`
     /// must be nonzero.
     ///
+    /// For an odd modulus a [`BoxedMontModulus`](super::BoxedMontModulus) at
+    /// hand, [`BoxedMontModulus::reduce`](super::BoxedMontModulus::reduce) is
+    /// far cheaper (a few Montgomery multiplications instead of one trial
+    /// subtraction per input bit).
+    ///
     /// # Panics
     /// Panics if `modulus` is zero. (Long division by zero would silently
     /// produce a meaningless result — every iteration "subtracts" because
@@ -266,19 +321,9 @@ impl BoxedUint {
         let m = modulus.significant_limbs();
         let n = modulus.limbs_resized(m);
         let mut r = vec![0 as Limb; m];
-        for i in (0..self.limbs.len()).rev() {
-            let mut bit = LIMB_BITS;
-            while bit > 0 {
-                bit -= 1;
-                // shifted = (r << 1) | next bit of self
-                let (mut shifted, carry) = adc_limbs(&r, &r, 0);
-                shifted[0] |= (self.limbs[i] >> bit) & 1;
-                // Subtract the modulus when shifted overflowed or shifted >= n.
-                let (diff, borrow) = sbb_limbs(&shifted, &n, 0);
-                let ge = Choice::from((carry | (borrow ^ 1)) as u8);
-                r = select_limbs(&diff, &shifted, ge);
-            }
-        }
+        let mut scratch = vec![0 as Limb; m];
+        long_divide(&self.limbs, &n, &mut r, &mut scratch, |_, _, _| {});
+        crate::zeroize::Zeroize::zeroize(scratch.as_mut_slice());
         BoxedUint::from_limbs(r)
     }
 
@@ -331,22 +376,12 @@ impl BoxedUint {
         let d = divisor.limbs_resized(m);
         let mut q = vec![0 as Limb; self.limbs.len()];
         let mut r = vec![0 as Limb; m];
-        for i in (0..self.limbs.len()).rev() {
-            let mut bit = LIMB_BITS;
-            while bit > 0 {
-                bit -= 1;
-                // r = (r << 1) | next bit of self
-                let (mut shifted, carry) = adc_limbs(&r, &r, 0);
-                shifted[0] |= (self.limbs[i] >> bit) & 1;
-                let (diff, borrow) = sbb_limbs(&shifted, &d, 0);
-                let ge = Choice::from((carry | (borrow ^ 1)) as u8);
-                r = select_limbs(&diff, &shifted, ge);
-                // q = (q << 1) | quotient bit
-                let (mut q_shifted, _) = adc_limbs(&q, &q, 0);
-                q_shifted[0] |= ge.unwrap_u8() as Limb;
-                q = q_shifted;
-            }
-        }
+        let mut scratch = vec![0 as Limb; m];
+        // Each quotient bit lands at its own (public) position, so it is
+        // OR-ed in place rather than shifting the whole quotient per bit.
+        long_divide(&self.limbs, &d, &mut r, &mut scratch, |i, bit, ge| {
+            q[i] |= (ge.unwrap_u8() as Limb) << bit;
+        });
         (BoxedUint::from_limbs(q), BoxedUint::from_limbs(r))
     }
 
@@ -450,6 +485,73 @@ mod tests {
         ] {
             let u = BoxedUint::from_limbs(limbs);
             assert_eq!(bool::from(u.ct_is_zero()), u.is_zero());
+        }
+    }
+
+    /// The pre-optimization bit-serial `divrem` (fresh `Vec`s per bit, no
+    /// preloaded prefix), kept as the differential oracle.
+    fn divrem_oracle(x: &BoxedUint, divisor: &BoxedUint) -> (BoxedUint, BoxedUint) {
+        let m = divisor.significant_limbs();
+        let d = divisor.limbs_resized(m);
+        let mut q = vec![0 as Limb; x.limbs.len()];
+        let mut r = vec![0 as Limb; m];
+        for i in (0..x.limbs.len()).rev() {
+            for bit in (0..LIMB_BITS).rev() {
+                let (mut shifted, carry) = adc_limbs(&r, &r, 0);
+                shifted[0] |= (x.limbs[i] >> bit) & 1;
+                let (diff, borrow) = sbb_limbs(&shifted, &d, 0);
+                let ge = Choice::from((carry | (borrow ^ 1)) as u8);
+                r = select_limbs(&diff, &shifted, ge);
+                let (mut q_shifted, _) = adc_limbs(&q, &q, 0);
+                q_shifted[0] |= ge.unwrap_u8() as Limb;
+                q = q_shifted;
+            }
+        }
+        (BoxedUint::from_limbs(q), BoxedUint::from_limbs(r))
+    }
+
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn reduce_and_divrem_match_oracle() {
+        let mut rng = 0xD1B5_4A32_D192_ED03u64;
+        let mut cases: Vec<(BoxedUint, BoxedUint)> = Vec::new();
+        for xl in 1..=12usize {
+            for nl in 1..=8usize {
+                for k in 0..3 {
+                    let x: Vec<Limb> = (0..xl).map(|_| splitmix64(&mut rng)).collect();
+                    let mut n: Vec<Limb> = (0..nl).map(|_| splitmix64(&mut rng)).collect();
+                    match k {
+                        0 => n[nl - 1] |= 1 << 63,
+                        1 => n[nl - 1] = (n[nl - 1] >> 50).max(1),
+                        // Padded divisor storage (leading zero limbs).
+                        _ => n.push(0),
+                    }
+                    if n.iter().all(|&l| l == 0) {
+                        n[0] = 1;
+                    }
+                    cases.push((BoxedUint::from_limbs(x), BoxedUint::from_limbs(n)));
+                }
+            }
+        }
+        // Edge values: all-ones, x = n, x = n - 1, divisor 1, power of two.
+        let ones = BoxedUint::from_limbs(vec![Limb::MAX; 6]);
+        let n3 = BoxedUint::from_limbs(vec![5, 0, 7]);
+        cases.push((ones.clone(), BoxedUint::from_u64(1)));
+        cases.push((ones.clone(), ones.clone()));
+        cases.push((n3.clone(), n3.clone()));
+        cases.push((n3.sub(&BoxedUint::from_u64(1)), n3.clone()));
+        cases.push((ones, BoxedUint::from_limbs(vec![0, 0, 1])));
+        for (x, n) in &cases {
+            let (q, r) = divrem_oracle(x, n);
+            assert_eq!(x.divrem(n), (q, r.clone()), "x={x:?} n={n:?}");
+            assert_eq!(x.reduce(n), r, "x={x:?} n={n:?}");
         }
     }
 

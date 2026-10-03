@@ -305,7 +305,7 @@ fn derive_crt_boxed(
     let dq = d.reduce(&q.sub(&one));
     let mont_p = BoxedMontModulus::new(p);
     let mont_q = BoxedMontModulus::new(q);
-    let qinv = mont_p.pow(&q.reduce(p), &pm2);
+    let qinv = mont_p.pow(&mont_p.reduce(q), &pm2);
     // RFC 8017 §3.2: tᵢ = (r₁ · r₂ ⋯ rᵢ₋₁)⁻¹ mod rᵢ, with r₁ = p, r₂ = q.
     // `prod` is the running product of the preceding primes — secret
     // (it factors `n`), so it is wiped once the last coefficient is out.
@@ -314,7 +314,7 @@ fn derive_crt_boxed(
     for r in other_primes {
         let rm2 = r.sub(&two);
         let mont = BoxedMontModulus::new(r);
-        let t = mont.pow(&prod.reduce(r), &rm2);
+        let t = mont.pow(&mont.reduce(&prod), &rm2);
         others.push(BoxedRsaOtherPrime {
             d: d.reduce(&r.sub(&one)),
             t,
@@ -372,7 +372,7 @@ fn derive_blinder_boxed(
     // byte form now that it lives in `r_raw` (a `BoxedUint`, which zeroizes
     // itself on drop).
     super::wipe(&mut blinder_bytes);
-    let r = r_raw.reduce(&mont.modulus());
+    let r = mont.reduce(&r_raw);
     // The blinder is secret: replace the two degenerate values by a masked
     // select rather than an early-exit compare.
     let degenerate = r.ct_is_zero() | r.ct_eq(&BoxedUint::from_u64(1));
@@ -425,9 +425,9 @@ fn raw_private_crt_blinded(
     let mont_q = &crt.mont_q;
 
     let half = |mp: &BoxedMontModulus, dx: &BoxedUint, xm2: &BoxedUint| {
-        let mut cx = c_blind.reduce(&mp.modulus());
+        let mut cx = mp.reduce(&c_blind);
         let mut mx_blind = mp.pow(&cx, dx);
-        let mut rx = r.reduce(&mp.modulus());
+        let mut rx = mp.reduce(&r);
         let mut rx_inv = mp.pow(&rx, xm2);
         let mx = mp.mul_mod(&mx_blind, &rx_inv);
         cx.zeroize();
@@ -440,7 +440,7 @@ fn raw_private_crt_blinded(
     let mut m_q = half(mont_q, &crt.dq, &crt.qm2);
 
     // Garner recombination: m = m_q + q·(qInv·(m_p − m_q) mod p).
-    let mut m_q_mod_p = m_q.reduce(&key.p);
+    let mut m_q_mod_p = mont_p.reduce(&m_q);
     let mut diff = mont_p.sub_mod(&m_p, &m_q_mod_p);
     let mut h = mont_p.mul_mod(&diff, &crt.qinv);
     let mut m = m_q.add(&key.q.mul(&h));
@@ -459,7 +459,7 @@ fn raw_private_crt_blinded(
         let mut big_r = key.p.mul(&key.q);
         for (op, r_i) in crt.others.iter().zip(key.other_primes.iter()) {
             let mut m_i = half(&op.mont, &op.d, &op.rm2);
-            let mut m_mod_r = m.reduce(r_i);
+            let mut m_mod_r = op.mont.reduce(&m);
             let mut diff = op.mont.sub_mod(&m_i, &m_mod_r);
             let mut h = op.mont.mul_mod(&diff, &op.t);
             let mut lifted = m.add(&big_r.mul(&h));
@@ -531,7 +531,7 @@ fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUi
     // `c` is public in every caller (a ciphertext or an EMSA-encoded
     // digest), so the variable-time `lt` shortcut leaks nothing.
     let n = mont.modulus();
-    let c_mod_n = if c.lt(&n) { c.clone() } else { c.reduce(&n) };
+    let c_mod_n = if c.lt(&n) { c.clone() } else { mont.reduce(c) };
     // `m^e` is compared with the constant-time limb compare (the variable-
     // time `==` would scan a value derived from the secret `m`); the
     // verdict is public — it is `true` for every fault-free operation.
