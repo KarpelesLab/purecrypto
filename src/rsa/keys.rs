@@ -178,10 +178,9 @@ fn derive_blinding<const LIMBS: usize>(
 /// ```text
 ///   r        = HMAC-SHA256(blinding_seed, nonce ‖ salt ‖ c)  // reduced mod n
 ///   r_e      = r^e mod n                        // public exponent, cheap
-///   r_inv    = r^{φ(n)-1} mod n                 // Fermat inverse, constant time
 ///   c_blind  = (c · r_e) mod n
-///   m_blind  = c_blind^d mod n
-///   m        = (m_blind · r_inv) mod n
+///   m        = c_blind^d · r^{φ(n)-1} mod n     // one joint CT ladder;
+///                                               // r^{φ(n)-1} = r⁻¹ (Fermat)
 /// ```
 ///
 /// When `phi_n_minus_1` is zero (key imported without primes), the function
@@ -269,10 +268,11 @@ fn raw_private_blinded<const LIMBS: usize>(
     // for e = 65537 instead of a full modulus-width pass. It is still
     // branchless and constant-time in the secret base `r`.
     let r_e = modulus.pow_public(&r, e);
-    let r_inv = modulus.pow(&r, phi_n_minus_1);
     let c_blind = modulus.mul_mod(c, &r_e);
-    let m_blind = modulus.pow(&c_blind, d);
-    modulus.mul_mod(&m_blind, &r_inv)
+    // c_blind^d · r^(φ(n)−1): the unblinding and the Fermat inverse of the
+    // blinder share one joint constant-time ladder (half the squarings of
+    // two separate exponentiations).
+    modulus.pow2(&c_blind, d, &r, phi_n_minus_1)
 }
 
 impl<const LIMBS: usize> RsaPublicKey<LIMBS> {

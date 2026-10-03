@@ -507,7 +507,10 @@ impl DsaPublicKey {
             .ok_or(Error::Verification)?;
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
-        let v = fq.reduce(&fp.mul_mod(&fp.pow_public(g, &u1), &fp.pow_public(&self.y, &u2)));
+        // One joint ladder for g^u1 · y^u2 (u1, u2 < q): it is constant-time,
+        // which verification does not need, but it shares the squarings and
+        // so beats two variable-time ladders.
+        let v = fq.reduce(&fp.pow2_bits(g, &u1, &self.y, &u2, q.bit_len()));
         if v == sig.r {
             Ok(())
         } else {

@@ -381,7 +381,9 @@ fn derive_blinder_boxed(
 
 /// Base-blinded raw RSA private op via the CRT: two half-width
 /// exponentiations instead of one full-width one (~4× fewer limb
-/// multiplications), with the blinder inverted per prime by Fermat.
+/// multiplications), with the blinder inverted per prime by Fermat — folded
+/// into the same joint (Straus) ladder as the unblinding exponentiation, so
+/// the inverse costs extra multiplies but no extra squarings.
 ///
 /// ```text
 ///   c_blind = c · r^e mod n            (pow_public: e is public, base CT)
@@ -426,14 +428,13 @@ fn raw_private_crt_blinded(
 
     let half = |mp: &BoxedMontModulus, dx: &BoxedUint, xm2: &BoxedUint| {
         let mut cx = mp.reduce(&c_blind);
-        let mut mx_blind = mp.pow(&cx, dx);
         let mut rx = mp.reduce(&r);
-        let mut rx_inv = mp.pow(&rx, xm2);
-        let mx = mp.mul_mod(&mx_blind, &rx_inv);
+        // cx^dx · rx^(x−2) in one joint ladder: the Fermat inverse of the
+        // blinder shares the unblinding exponentiation's squarings. Both
+        // exponents are below the prime, so its (public) width bounds them.
+        let mx = mp.pow2_bits(&cx, dx, &rx, xm2, 64 * mp.limbs());
         cx.zeroize();
-        mx_blind.zeroize();
         rx.zeroize();
-        rx_inv.zeroize();
         mx
     };
     let mut m_p = half(mont_p, &crt.dp, &crt.pm2);
@@ -498,10 +499,12 @@ fn raw_private_full_width(
     // `e` is public, so the exponent-length ladder applies (still branchless
     // and constant-time in the secret base `r`).
     let r_e = mont.pow_public(&r, &key.e);
-    let r_inv = mont.pow(&r, phi_n_minus_1);
     let c_blind = mont.mul_mod(c, &r_e);
-    let m_blind = mont.pow(&c_blind, &key.d);
-    mont.mul_mod(&m_blind, &r_inv)
+    // c_blind^d · r^(φ(n)−1) — the unblinding and the Fermat inverse of the
+    // blinder in one joint ladder. The bound is the (public) storage width
+    // of the exponents, padded to the modulus as `pow` does.
+    let bits = 64 * mont.limbs().max(key.d.limbs()).max(phi_n_minus_1.limbs());
+    mont.pow2_bits(&c_blind, &key.d, &r, phi_n_minus_1, bits)
 }
 
 /// Base-blinded raw RSA private op for the runtime-sized key.
