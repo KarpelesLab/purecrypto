@@ -89,8 +89,25 @@ macro_rules! ml_kem_set {
         $oid:ident
     ) => {
         #[doc = concat!("An ", $set_doc, " encapsulation (public) key.")]
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        pub struct $ek_name([u8; $ek_size]);
+        #[derive(Clone, Copy)]
+        // Field 1 caches `H(ek)` (FIPS 203 Algorithm 17, line 1), a pure
+        // function of field 0, so encapsulation does not rehash the whole key
+        // every time. Equality and `Debug` look at the encoding only.
+        pub struct $ek_name([u8; $ek_size], [u8; 32]);
+
+        impl PartialEq for $ek_name {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+
+        impl Eq for $ek_name {}
+
+        impl core::fmt::Debug for $ek_name {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.debug_tuple(stringify!($ek_name)).field(&self.0).finish()
+            }
+        }
 
         #[doc = concat!("An ", $set_doc, " decapsulation (secret) key.")]
         #[derive(Clone)]
@@ -144,7 +161,11 @@ macro_rules! ml_kem_set {
                 let mut seed = [0u8; 64];
                 seed[..32].copy_from_slice(d);
                 seed[32..].copy_from_slice(z);
-                ($dk_name(dk, Some(seed)), $ek_name(ek))
+                // keygen just wrote H(ek) into dk, right after ek.
+                let pke_dk = 384 * $k;
+                let mut hek = [0u8; 32];
+                hek.copy_from_slice(&dk[pke_dk + $ek_size..pke_dk + $ek_size + 32]);
+                ($dk_name(dk, Some(seed)), $ek_name(ek, hek))
             }
 
             /// The matching encapsulation key.
@@ -152,7 +173,9 @@ macro_rules! ml_kem_set {
                 let pke_dk = 384 * $k;
                 let mut ek = [0u8; $ek_size];
                 ek.copy_from_slice(&self.0[pke_dk..pke_dk + $ek_size]);
-                $ek_name(ek)
+                // Hashed afresh rather than copied from dk: an expanded dk
+                // imported with `from_bytes` is not checked for H(ek).
+                $ek_name::from_array(ek)
             }
 
             /// Decapsulates `ct`, returning the 32-byte shared secret. On an
@@ -256,7 +279,7 @@ macro_rules! ml_kem_set {
                 m: &[u8; 32],
             ) -> ($ct_name, [u8; SHARED_SECRET_BYTES]) {
                 let mut ct = [0u8; $ct_size];
-                let ss = kem::encaps::<$k, $eta1, $eta2, $du, $dv>(&self.0, m, &mut ct);
+                let ss = kem::encaps::<$k, $eta1, $eta2, $du, $dv>(&self.0, &self.1, m, &mut ct);
                 ($ct_name(ct), ss)
             }
 
@@ -268,7 +291,12 @@ macro_rules! ml_kem_set {
             /// (re-encoding round-trip), otherwise an attacker can supply
             /// off-modulus EKs as an oracle into the encapsulator's noise.
             pub fn from_bytes(bytes: [u8; $ek_size]) -> Self {
-                $ek_name(bytes)
+                $ek_name::from_array(bytes)
+            }
+
+            fn from_array(ek: [u8; $ek_size]) -> Self {
+                let hek = crate::hash::sha3_256(&ek);
+                $ek_name(ek, hek)
             }
 
             /// FIPS 203 §7.2 "Encapsulation key check": confirms
@@ -287,7 +315,7 @@ macro_rules! ml_kem_set {
                         return Err(crate::mlkem::EncapsKeyCheckError);
                     }
                 }
-                Ok($ek_name(bytes))
+                Ok($ek_name::from_array(bytes))
             }
 
             /// The byte encoding.

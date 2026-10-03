@@ -51,7 +51,8 @@ pub(crate) fn keygen<const K: usize, const ETA1: usize>(
 }
 
 /// ML-KEM.Encaps_internal (FIPS 203 Algorithm 17). Writes the ciphertext to
-/// `ct` and returns the 32-byte shared secret.
+/// `ct` and returns the 32-byte shared secret. `hek` is `H(ek)`, which the
+/// encapsulation-key types compute once at construction.
 pub(crate) fn encaps<
     const K: usize,
     const ETA1: usize,
@@ -60,6 +61,7 @@ pub(crate) fn encaps<
     const DV: usize,
 >(
     ek: &[u8],
+    hek: &[u8; 32],
     m: &[u8; 32],
     ct: &mut [u8],
 ) -> [u8; 32] {
@@ -68,7 +70,7 @@ pub(crate) fn encaps<
 
     let mut g_in = [0u8; 64];
     g_in[..32].copy_from_slice(m);
-    g_in[32..].copy_from_slice(&sha3_256(ek));
+    g_in[32..].copy_from_slice(hek);
     let mut g = sha3_512(&g_in);
     let mut shared = [0u8; 32];
     shared.copy_from_slice(&g[..32]);
