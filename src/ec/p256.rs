@@ -8,7 +8,7 @@
 use super::p256_field as field;
 #[cfg(feature = "p256-table")]
 use super::p256_gtable::P256_GEN_TABLE;
-use crate::bignum::Uint;
+use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
 use crate::zeroize::Zeroize;
@@ -65,9 +65,14 @@ const G_AFFINE: [u64; 8] = [
     0x4fe342e2fe1a7f9b,
 ];
 const N_HEX: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
+/// The group order `n`, decoded at compile time.
+const ORDER: Fe = fe_from_hex(N_HEX);
+/// The order-`n` Montgomery context, so ECDSA does not redo the `R² mod n`
+/// setup on every sign / verify.
+static ORDER_MODULUS: MontModulus<4> = MontModulus::new(ORDER);
 
 /// Decodes a 64-character hex string into a [`Fe`].
-pub(crate) fn fe_from_hex(hex: &str) -> Fe {
+pub(crate) const fn fe_from_hex(hex: &str) -> Fe {
     super::uint_from_be_hex(hex)
 }
 
@@ -116,8 +121,14 @@ impl P256 {
     }
 
     /// The group order `n`.
-    pub(crate) fn order() -> Fe {
-        fe_from_hex(N_HEX)
+    pub(crate) const fn order() -> Fe {
+        ORDER
+    }
+
+    /// The scalar-field (order `n`) Montgomery context, built at compile time.
+    #[inline]
+    pub(crate) fn order_modulus() -> &'static MontModulus<4> {
+        &ORDER_MODULUS
     }
 
     /// The field prime `p`.

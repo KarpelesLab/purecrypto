@@ -2,7 +2,6 @@
 
 use super::Error;
 use super::p256::{Fe, P256, random_scalar};
-use crate::bignum::MontModulus;
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::{Digest, Hmac};
 use crate::rng::{CryptoRng, RngCore};
@@ -116,7 +115,7 @@ impl EcdsaPrivateKey {
     pub fn sign_prehash<D: Digest>(&self, prehash: &[u8]) -> Result<Signature, Error> {
         let curve = P256::new();
         let n = P256::order();
-        let fq = MontModulus::new(n);
+        let fq = P256::order_modulus();
 
         let z = bits2int(prehash).reduce(&n);
         let mut k = generate_k::<D>(&self.d, prehash, &n);
@@ -223,7 +222,7 @@ impl EcdsaPublicKey {
     pub fn verify_prehash(&self, prehash: &[u8], sig: &Signature) -> Result<(), Error> {
         let curve = P256::new();
         let n = P256::order();
-        let fq = MontModulus::new(n);
+        let fq = P256::order_modulus();
 
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
@@ -618,7 +617,7 @@ mod tests {
     fn verify_ct_reference(pk: &EcdsaPublicKey, prehash: &[u8], sig: &Signature) -> bool {
         let curve = P256::new();
         let n = P256::order();
-        let fq = MontModulus::new(n);
+        let fq = P256::order_modulus();
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return false;
         }
