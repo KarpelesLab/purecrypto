@@ -131,7 +131,7 @@ fn sqrt_ratio_fp(u: &Fp, v: &Fp) -> (Choice, Fp) {
     let tv1 = v.square();
     let tv2 = u.mul(v);
     let tv1 = tv1.mul(&tv2);
-    let y1 = tv1.pow(&P_MINUS_3_DIV_4);
+    let y1 = tv1.pow_public_exp(&P_MINUS_3_DIV_4);
     let y1 = y1.mul(&tv2);
     let y2 = y1.mul(&SQRT_MINUS_Z1);
     let tv3 = y1.square();
@@ -151,7 +151,7 @@ fn sqrt_ratio_fp2(u: &Fp2, v: &Fp2) -> (Choice, Fp2) {
     let mut tv2 = v4.mul(&v2).mul(v);
     let mut tv3 = tv2.square().mul(v);
     let mut tv5 = u.mul(&tv3);
-    tv5 = tv5.pow(&SQRT_RATIO_C3);
+    tv5 = tv5.pow_public_exp(&SQRT_RATIO_C3);
     tv5 = tv5.mul(&tv2);
     tv2 = tv5.mul(v);
     tv3 = tv5.mul(u);

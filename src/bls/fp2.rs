@@ -173,6 +173,13 @@ impl Fp2 {
         acc
     }
 
+    /// `self^e` for a **public** exponent (fixed 4-bit window, see
+    /// [`super::mont::pow_public_exp`]): constant time in `self`, not in `e`.
+    #[inline]
+    pub(crate) fn pow_public_exp(&self, e: &[u64]) -> Fp2 {
+        super::mont::pow_public_exp(self, e, &Fp2::ONE, Fp2::mul, Fp2::square)
+    }
+
     /// A square root, `None` when `self` is a non-residue.
     ///
     /// Algorithm 9 of <https://eprint.iacr.org/2012/685> for `p ≡ 3 (mod 4)`,
@@ -181,7 +188,7 @@ impl Fp2 {
     pub fn sqrt(&self) -> CtOption<Fp2> {
         // a1 = self^((p-3)/4); alpha = a1²·self = self^((p-1)/2);
         // x0 = a1·self = self^((p+1)/4).
-        let a1 = self.pow(&super::fp::P_MINUS_3_DIV_4);
+        let a1 = self.pow_public_exp(&super::fp::P_MINUS_3_DIV_4);
         let alpha = a1.square().mul(self);
         let x0 = a1.mul(self);
         // alpha == -1: self is the square of a subfield element times u,
@@ -191,7 +198,10 @@ impl Fp2 {
             c1: x0.c0,
         };
         // Otherwise the root is (1 + alpha)^((p-1)/2) · x0.
-        let cand_b = alpha.add(&Fp2::ONE).pow(&P_MINUS_1_DIV_2).mul(&x0);
+        let cand_b = alpha
+            .add(&Fp2::ONE)
+            .pow_public_exp(&P_MINUS_1_DIV_2)
+            .mul(&x0);
         let is_minus_one = alpha.ct_eq(&Fp2::ONE.neg());
         let cand = Fp2::conditional_select(&cand_a, &cand_b, is_minus_one);
         CtOption::new(cand, cand.square().ct_eq(self))
@@ -268,6 +278,51 @@ mod tests {
             Fp::from_canonical(&[0, 0, 0, 0, 0, 0x0100]),
         );
         (a, b)
+    }
+
+    /// The public-exponent window against the exponent-oblivious ladder, for
+    /// `Fp` and `Fp2`, on the field's own exponents, edge exponents (0, 1,
+    /// 15, 16, all-ones) and random ones, over pseudo-random bases (and 0, 1).
+    #[test]
+    fn pow_public_exp_matches_pow() {
+        let mut x = 0x0B15_0001u64;
+        let mut next = || {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let fp = |next: &mut dyn FnMut() -> u64| {
+            let mut w = [0u8; 64];
+            for c in w.chunks_mut(8) {
+                c.copy_from_slice(&next().to_le_bytes());
+            }
+            Fp::from_bytes_wide(&w)
+        };
+        let mut exps: [[u64; 6]; 12] = [[0; 6]; 12];
+        exps[0] = super::super::fp::P_MINUS_3_DIV_4;
+        exps[1] = P_MINUS_1_DIV_2;
+        exps[2] = [1, 0, 0, 0, 0, 0];
+        exps[3] = [15, 0, 0, 0, 0, 0];
+        exps[4] = [16, 0, 0, 0, 0, 0];
+        exps[5] = [u64::MAX; 6];
+        exps[6] = [0, 0, 0, 0, 0, 1 << 60];
+        for e in &mut exps[8..] {
+            *e = [next(), next(), next(), next(), next(), next()];
+        }
+        for i in 0..24 {
+            let a = match i {
+                0 => Fp::ZERO,
+                1 => Fp::ONE,
+                _ => fp(&mut next),
+            };
+            let b = Fp2::new(a, fp(&mut next));
+            for e in &exps {
+                assert_eq!(a.pow_public_exp(e), a.pow(e));
+                assert_eq!(b.pow_public_exp(e), b.pow(e));
+            }
+        }
     }
 
     #[test]

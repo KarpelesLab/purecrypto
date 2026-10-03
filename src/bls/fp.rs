@@ -155,10 +155,17 @@ impl Fp {
         Fp(mont::pow(&self.0, e, &R, &MODULUS, INV))
     }
 
+    /// `self^e` for a **public** exponent (fixed 4-bit window, see
+    /// [`mont::pow_public_exp`]): constant time in `self`, not in `e`.
+    #[inline]
+    pub(crate) fn pow_public_exp(&self, e: &[u64]) -> Fp {
+        mont::pow_public_exp(self, e, &Fp::ONE, Fp::mul, Fp::square)
+    }
+
     /// Multiplicative inverse, `None` for zero (Fermat: `self^(p-2)`).
     #[inline]
     pub fn invert(&self) -> CtOption<Fp> {
-        CtOption::new(self.pow(&P_MINUS_2), !self.is_zero())
+        CtOption::new(self.pow_public_exp(&P_MINUS_2), !self.is_zero())
     }
 
     /// A square root, `None` when `self` is a non-residue. With
@@ -166,7 +173,7 @@ impl Fp {
     /// squaring, so the presence flag is exact.
     #[inline]
     pub fn sqrt(&self) -> CtOption<Fp> {
-        let cand = self.pow(&P_PLUS_1_DIV_4);
+        let cand = self.pow_public_exp(&P_PLUS_1_DIV_4);
         CtOption::new(cand, cand.square().ct_eq(self))
     }
 

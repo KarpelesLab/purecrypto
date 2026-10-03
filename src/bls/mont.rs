@@ -274,6 +274,56 @@ pub(crate) fn pow<const N: usize>(
     acc
 }
 
+/// `base^e` for a **public** exponent `e` (little-endian limbs), by a fixed
+/// 4-bit window: 14 multiplications build `base^0 … base^15`, then each
+/// exponent nibble costs four squarings and — when the nibble is nonzero —
+/// one multiplication by the table entry it names. Leading zero nibbles are
+/// skipped. About 381 squarings and ~100 multiplications for a 381-bit
+/// exponent, against 381 of each for [`pow`].
+///
+/// Constant time in `base`: the branches and the table index are functions
+/// of the exponent alone, which every caller passes as a public constant
+/// (`p − 2`, `(p + 1)/4`, …). Never call it with a secret exponent; [`pow`]
+/// (and the public `Fp::pow` / `Fp2::pow`) keep their exponent-oblivious
+/// schedule for that.
+#[inline]
+pub(crate) fn pow_public_exp<T: Copy>(
+    base: &T,
+    e: &[u64],
+    one: &T,
+    mul: impl Fn(&T, &T) -> T,
+    square: impl Fn(&T) -> T,
+) -> T {
+    let mut table = [*one; 16];
+    table[1] = *base;
+    let mut i = 2;
+    while i < 16 {
+        table[i] = mul(&table[i - 1], base);
+        i += 1;
+    }
+    let mut acc = *one;
+    let mut started = false;
+    let mut l = e.len();
+    while l > 0 {
+        l -= 1;
+        let mut shift = 64;
+        while shift > 0 {
+            shift -= 4;
+            let d = ((e[l] >> shift) & 0xf) as usize;
+            if started {
+                acc = square(&square(&square(&square(&acc))));
+                if d != 0 {
+                    acc = mul(&acc, &table[d]);
+                }
+            } else if d != 0 {
+                acc = table[d];
+                started = true;
+            }
+        }
+    }
+    acc
+}
+
 /// Loads a big-endian byte string of exactly `8N` bytes as limbs.
 #[inline]
 pub(crate) fn from_be_bytes<const N: usize>(bytes: &[u8]) -> [u64; N] {
