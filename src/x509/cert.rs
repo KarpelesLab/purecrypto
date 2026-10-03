@@ -1335,9 +1335,12 @@ impl Certificate {
         };
 
         let mut seq = self.tbs_after_algid()?;
-        DistinguishedName::decode(&mut seq)?; // issuer
+        // The names are validated exactly as `DistinguishedName::decode`
+        // would, without building their strings: every extension accessor
+        // must still reject a certificate with a malformed issuer/subject.
+        DistinguishedName::skip(&mut seq)?; // issuer
         Validity::decode(&mut seq)?; // validity
-        DistinguishedName::decode(&mut seq)?; // subject
+        DistinguishedName::skip(&mut seq)?; // subject
         seq.read_element()?; // subjectPublicKeyInfo
 
         // Skip the optional issuerUniqueID [1] and subjectUniqueID [2]
@@ -1398,11 +1401,16 @@ impl Certificate {
         // parsers that disagree on which copy wins (the first or the last)
         // can be steered to opposite policy decisions on the same cert —
         // the classic CVE-2014-1568 / CVE-2020-0601 shape.
-        let mut seen: Vec<Vec<u64>> = Vec::new();
+        //
+        // The OIDs are compared as their DER bodies: `parse_oid` accepts
+        // only the canonical encoding, so two bodies name the same OID
+        // exactly when they are byte-equal.
+        let mut seen: Vec<&[u8]> = Vec::new();
         while !exts.is_empty() {
             let mut ext = exts.read_sequence()?;
-            let id = parse_oid(ext.read_oid()?)?;
-            if seen.iter().any(|prior| prior.as_slice() == id.as_slice()) {
+            let id_der = ext.read_oid()?;
+            let id = parse_oid(id_der)?;
+            if seen.contains(&id_der) {
                 return Err(Error::Malformed);
             }
             // Bound the quadratic duplicate scan (see `MAX_CERT_EXTENSIONS`)
@@ -1410,7 +1418,7 @@ impl Certificate {
             if seen.len() >= MAX_CERT_EXTENSIONS {
                 return Err(Error::Malformed);
             }
-            seen.push(id.clone());
+            seen.push(id_der);
             let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
                 ext.read_boolean()?
             } else {

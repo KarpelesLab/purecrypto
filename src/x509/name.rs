@@ -141,6 +141,46 @@ impl DistinguishedName {
         }
         Ok(dn)
     }
+
+    /// Reads past one `Name`, applying exactly the checks of
+    /// [`Self::decode`] (RDN shape, strict DER, the directory-string
+    /// decoding and control-character rule, the attribute OID) without
+    /// building the decoded strings. For callers that only need to skip a
+    /// name they must still reject when malformed.
+    pub(crate) fn skip(reader: &mut Reader) -> Result<(), Error> {
+        let mut seq = reader.read_sequence()?;
+        while !seq.is_empty() {
+            let set = seq.read_tlv(tag::SET)?;
+            let mut set_reader = Reader::new(set);
+            if set_reader.is_empty() {
+                return Err(Error::Malformed);
+            }
+            while !set_reader.is_empty() {
+                let mut atv = set_reader.read_sequence()?;
+                let oid_body = atv.read_oid()?;
+                let (value_tag, value) = atv.read_any()?;
+                atv.finish()?;
+                let mut control = false;
+                if matches!(
+                    value_tag,
+                    tag::UTF8_STRING | tag::PRINTABLE_STRING | tag::IA5_STRING
+                ) && value.is_ascii()
+                {
+                    // ASCII is valid UTF-8, and its control characters
+                    // (`char::is_control`, category Cc) are C0 and DEL.
+                    control = value.iter().any(|&b| b < 0x20 || b == 0x7f);
+                } else {
+                    for_each_directory_char(value_tag, value, |c| control |= c.is_control())?;
+                }
+                if control {
+                    return Err(Error::Malformed);
+                }
+                parse_oid(oid_body)?;
+            }
+            set_reader.finish()?;
+        }
+        Ok(())
+    }
 }
 
 /// Every PKCS#9 `emailAddress` attribute value in a DER `Name` TLV, in
@@ -191,13 +231,24 @@ const TAG_UNIVERSAL: u8 = 0x1c;
 /// their raw bytes as UTF-8 (which would silently mis-render and enable
 /// display spoofing). Unrecognized / non-string tags are rejected.
 fn decode_directory_string(tag: u8, value: &[u8]) -> Result<String, Error> {
+    let mut s = String::new();
+    for_each_directory_char(tag, value, |c| s.push(c))?;
+    Ok(s)
+}
+
+/// The decoding behind [`decode_directory_string`]: feeds each character of
+/// the attribute value to `f`, or fails on a malformed value or an
+/// unaccepted tag. Shared with [`DistinguishedName::skip`], which validates
+/// without building the string.
+fn for_each_directory_char(tag: u8, value: &[u8], mut f: impl FnMut(char)) -> Result<(), Error> {
     match tag {
         // UTF8String / PrintableString / IA5String are all ASCII- or
         // UTF-8-compatible byte sequences: validate as UTF-8 and keep.
         tag::UTF8_STRING | tag::PRINTABLE_STRING | tag::IA5_STRING => {
-            Ok(core::str::from_utf8(value)
+            core::str::from_utf8(value)
                 .map_err(|_| Error::Malformed)?
-                .into())
+                .chars()
+                .for_each(f);
         }
         // BMPString: UTF-16BE code units. Reject odd-length bodies and any
         // ill-formed (lone-surrogate) sequence.
@@ -208,9 +259,9 @@ fn decode_directory_string(tag: u8, value: &[u8]) -> Result<String, Error> {
             let units = value
                 .chunks_exact(2)
                 .map(|c| u16::from_be_bytes([c[0], c[1]]));
-            char::decode_utf16(units)
-                .collect::<Result<String, _>>()
-                .map_err(|_| Error::Malformed)
+            for c in char::decode_utf16(units) {
+                f(c.map_err(|_| Error::Malformed)?);
+            }
         }
         // UniversalString: UTF-32BE scalar values. Reject lengths that aren't a
         // multiple of four and any value that isn't a valid Unicode scalar.
@@ -218,22 +269,20 @@ fn decode_directory_string(tag: u8, value: &[u8]) -> Result<String, Error> {
             if !value.len().is_multiple_of(4) {
                 return Err(Error::Malformed);
             }
-            value
-                .chunks_exact(4)
-                .map(|c| {
-                    let cp = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
-                    char::from_u32(cp).ok_or(Error::Malformed)
-                })
-                .collect::<Result<String, _>>()
+            for c in value.chunks_exact(4) {
+                let cp = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+                f(char::from_u32(cp).ok_or(Error::Malformed)?);
+            }
         }
         // TeletexString (T.61) has no single portable mapping; in practice CAs
         // emit Latin-1 in this slot. Decode each byte as a Latin-1 code point
         // (a lossless, unambiguous byte→scalar mapping) rather than guessing a
         // multi-byte charset or treating it as UTF-8.
-        TAG_TELETEX => Ok(value.iter().map(|&b| b as char).collect()),
+        TAG_TELETEX => value.iter().for_each(|&b| f(b as char)),
         // Any other tag is not a directory string we accept.
-        _ => Err(Error::Malformed),
+        _ => return Err(Error::Malformed),
     }
+    Ok(())
 }
 
 /// Encodes a single-attribute RDN: `SET { SEQUENCE { type OID, value } }`.
@@ -245,6 +294,77 @@ fn rdn(attr_oid: &[u64], value_tag: u8, value: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `skip` accepts exactly the names `decode` accepts and consumes the
+    /// same bytes: checked on hand-built names in every string type, then on
+    /// every single-byte corruption of them and a random multi-byte sweep.
+    #[test]
+    fn skip_agrees_with_decode() {
+        fn atv(tag_byte: u8, value: &[u8]) -> Vec<u8> {
+            let a =
+                encode_sequence(&[oid_tlv(oid::COMMON_NAME), encode_tlv(tag_byte, value)].concat());
+            encode_sequence(&encode_tlv(tag::SET, &a))
+        }
+        let mut names = alloc::vec![
+            DistinguishedName::common_name("x")
+                .with_organization("Corp")
+                .with_country("FR")
+                .with_organizational_unit("Unit")
+                .with_email_address("a@example.com")
+                .to_der(),
+            atv(tag::UTF8_STRING, "h\u{e9}llo".as_bytes()),
+            atv(tag::UTF8_STRING, b"bad\x01ctl"),
+            atv(tag::UTF8_STRING, b"\xff\xfe"),
+            atv(tag::PRINTABLE_STRING, b"ok"),
+            atv(tag::IA5_STRING, b"tab\there"),
+            atv(TAG_BMP, &[0x00, 0x41, 0xd8, 0x00]),
+            atv(TAG_BMP, &[0x00, 0x41, 0x00]),
+            atv(TAG_BMP, &[0x00, 0x41, 0x00, 0x42]),
+            atv(TAG_UNIVERSAL, &[0, 0, 0, 0x41, 0, 0x11, 0, 0]),
+            atv(TAG_UNIVERSAL, &[0, 0, 0, 0x41]),
+            atv(TAG_TELETEX, &[0x41, 0xe9, 0x85]),
+            atv(TAG_TELETEX, &[0x41, 0xe9]),
+            atv(0x04, b"octets"),
+            encode_sequence(&encode_tlv(tag::SET, &[])),
+        ];
+        names.push([names[0].clone(), alloc::vec![0x00]].concat());
+        let agree = |der: &[u8]| {
+            let mut a = Reader::new(der);
+            let mut b = Reader::new(der);
+            let d = DistinguishedName::decode(&mut a);
+            let s = DistinguishedName::skip(&mut b);
+            assert_eq!(d.is_ok(), s.is_ok(), "name {der:02x?}");
+            if d.is_ok() {
+                assert_eq!(a.is_empty(), b.is_empty());
+                assert_eq!(a.read_element().ok(), b.read_element().ok());
+            }
+        };
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for der in &names {
+            agree(der);
+            for i in 0..der.len() {
+                for v in [0x00u8, 0x01, 0x1f, 0x7f, 0x80, 0xff, der[i] ^ 0x20] {
+                    let mut m = der.clone();
+                    m[i] = v;
+                    agree(&m);
+                }
+            }
+            for _ in 0..500 {
+                let mut m = der.clone();
+                for _ in 0..1 + next() % 3 {
+                    let i = (next() as usize) % m.len();
+                    m[i] = next() as u8;
+                }
+                agree(&m);
+            }
+        }
+    }
 
     /// `emailAddress` round-trips through the builder (as an IA5String,
     /// after the CN) and is picked up by the decoder; `email_addresses_in_name`
