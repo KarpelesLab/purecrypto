@@ -189,6 +189,25 @@ pub trait Digest: Clone {
     /// Consumes the hasher and returns the final digest.
     fn finalize(self) -> Self::Output;
 
+    /// Crate-internal fast path for iterated HMAC (the PBKDF2 inner loop);
+    /// not part of the stable API. Given the HMAC `inner`/`outer` hashers
+    /// right after their pad blocks, runs `rounds` times
+    /// `u = HMAC(K, u); acc ^= u` on bare compressions and returns `true`, or
+    /// returns `false` without touching anything when the digest has no such
+    /// path (the default) or the states are not in the expected shape.
+    #[doc(hidden)]
+    #[inline]
+    fn hmac_iterate(
+        inner: &Self,
+        outer: &Self,
+        u: &mut Self::Output,
+        acc: &mut Self::Output,
+        rounds: u32,
+    ) -> bool {
+        let _ = (inner, outer, u, acc, rounds);
+        false
+    }
+
     /// Hashes `data` in a single call.
     #[inline]
     fn digest(data: &[u8]) -> Self::Output {

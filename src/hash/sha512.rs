@@ -193,6 +193,40 @@ impl State512 {
         self.msg_len = 0;
     }
 
+    /// [`Digest::hmac_iterate`] for an `N`-byte digest: requires both states
+    /// to sit right after their single pad block.
+    fn hmac_iterate<const N: usize>(
+        &self,
+        outer: &Self,
+        u: &mut [u8; N],
+        acc: &mut [u8; N],
+        rounds: u32,
+    ) -> bool {
+        if self.block_len != 0
+            || outer.block_len != 0
+            || self.msg_len != 128
+            || outer.msg_len != 128
+        {
+            return false;
+        }
+        let len = ((128 + N as u128) * 8).to_be_bytes();
+        super::hmac::hmac_iterate_with(
+            (&self.h, &outer.h),
+            &len,
+            u,
+            acc,
+            rounds,
+            compress512,
+            |h, out| {
+                // Truncated variants keep a partial last word (SHA-512/224).
+                for (o, w) in out.chunks_mut(8).zip(h.iter()) {
+                    o.copy_from_slice(&w.to_be_bytes()[..o.len()]);
+                }
+            },
+        );
+        true
+    }
+
     /// Applies SHA-2 padding and returns the final state words.
     fn finalize(mut self) -> [u64; 8] {
         // 128-bit big-endian bit length occupies the last 16 bytes.
@@ -357,6 +391,17 @@ macro_rules! sha512_variant {
             #[inline]
             fn update(&mut self, data: &[u8]) {
                 self.state.update(data);
+            }
+
+            #[inline]
+            fn hmac_iterate(
+                inner: &Self,
+                outer: &Self,
+                u: &mut [u8; $out],
+                acc: &mut [u8; $out],
+                rounds: u32,
+            ) -> bool {
+                inner.state.hmac_iterate(&outer.state, u, acc, rounds)
             }
 
             #[inline]

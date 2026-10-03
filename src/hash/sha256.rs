@@ -156,6 +156,36 @@ impl State256 {
         self.msg_len = 0;
     }
 
+    /// [`Digest::hmac_iterate`] for an `N`-byte digest (32 or 28): requires
+    /// both states to sit right after their single pad block.
+    fn hmac_iterate<const N: usize>(
+        &self,
+        outer: &Self,
+        u: &mut [u8; N],
+        acc: &mut [u8; N],
+        rounds: u32,
+    ) -> bool {
+        if self.block_len != 0 || outer.block_len != 0 || self.msg_len != 64 || outer.msg_len != 64
+        {
+            return false;
+        }
+        let len = ((64 + N as u64) * 8).to_be_bytes();
+        super::hmac::hmac_iterate_with(
+            (&self.h, &outer.h),
+            &len,
+            u,
+            acc,
+            rounds,
+            compress256,
+            |h, out| {
+                for (o, w) in out.chunks_mut(4).zip(h.iter()) {
+                    o.copy_from_slice(&w.to_be_bytes()[..o.len()]);
+                }
+            },
+        );
+        true
+    }
+
     /// Applies SHA-2 padding and returns the final state words.
     fn finalize(mut self) -> [u32; 8] {
         let bit_len = self.msg_len.wrapping_mul(8);
@@ -342,6 +372,17 @@ impl Digest for Sha256 {
     }
 
     #[inline]
+    fn hmac_iterate(
+        inner: &Self,
+        outer: &Self,
+        u: &mut [u8; 32],
+        acc: &mut [u8; 32],
+        rounds: u32,
+    ) -> bool {
+        inner.state.hmac_iterate(&outer.state, u, acc, rounds)
+    }
+
+    #[inline]
     fn finalize(self) -> [u8; 32] {
         words_to_bytes(&self.state.finalize())
     }
@@ -384,6 +425,17 @@ impl Digest for Sha224 {
     #[inline]
     fn update(&mut self, data: &[u8]) {
         self.state.update(data);
+    }
+
+    #[inline]
+    fn hmac_iterate(
+        inner: &Self,
+        outer: &Self,
+        u: &mut [u8; 28],
+        acc: &mut [u8; 28],
+        rounds: u32,
+    ) -> bool {
+        inner.state.hmac_iterate(&outer.state, u, acc, rounds)
     }
 
     #[inline]

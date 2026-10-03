@@ -132,6 +132,17 @@ impl Digest for Sha1 {
         self.state.update(data);
     }
     #[inline]
+    fn hmac_iterate(
+        inner: &Self,
+        outer: &Self,
+        u: &mut [u8; 20],
+        acc: &mut [u8; 20],
+        rounds: u32,
+    ) -> bool {
+        inner.state.hmac_iterate(&outer.state, u, acc, rounds)
+    }
+
+    #[inline]
     fn finalize(self) -> [u8; 20] {
         words_to_bytes_be(&self.state.finalize())
     }

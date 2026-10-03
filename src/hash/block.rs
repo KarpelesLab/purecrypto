@@ -101,6 +101,46 @@ impl<const W: usize> MdState<W> {
         self.msg_len = 0;
     }
 
+    /// [`Digest::hmac_iterate`](super::Digest::hmac_iterate) for an `N`-byte
+    /// digest whose output words use the same byte order as the length field
+    /// (SHA-1: big-endian; the caller opts in per hash). Requires both states
+    /// to sit right after their single pad block.
+    pub(super) fn hmac_iterate<const N: usize>(
+        &self,
+        outer: &Self,
+        u: &mut [u8; N],
+        acc: &mut [u8; N],
+        rounds: u32,
+    ) -> bool {
+        if self.block_len != 0 || outer.block_len != 0 || self.msg_len != 64 || outer.msg_len != 64
+        {
+            return false;
+        }
+        let bits = (64 + N as u64) * 8;
+        let be = self.len_be;
+        let len = if be {
+            bits.to_be_bytes()
+        } else {
+            bits.to_le_bytes()
+        };
+        let compress = self.compress;
+        super::hmac::hmac_iterate_with(
+            (&self.h, &outer.h),
+            &len,
+            u,
+            acc,
+            rounds,
+            compress,
+            |h, out| {
+                for (o, w) in out.chunks_mut(4).zip(h.iter()) {
+                    let b = if be { w.to_be_bytes() } else { w.to_le_bytes() };
+                    o.copy_from_slice(&b[..o.len()]);
+                }
+            },
+        );
+        true
+    }
+
     /// Applies the padding and returns the final state words.
     pub(super) fn finalize(mut self) -> [u32; W] {
         let bit_len = self.msg_len.wrapping_mul(8);

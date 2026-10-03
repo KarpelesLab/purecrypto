@@ -127,13 +127,9 @@ fn derive_block<D: Digest>(
         .finalize();
 
     let mut acc = u; // running XOR, starts at U_1
-    for _ in 1..iterations {
-        // U_j = PRF(password, U_{j-1})
-        u = prf.clone().chain(u.as_ref()).finalize();
-        for (a, b) in acc.as_mut().iter_mut().zip(u.as_ref().iter()) {
-            *a ^= *b;
-        }
-    }
+    // U_j = PRF(password, U_{j-1}) for j = 2..=c, XORed into `acc` — on bare
+    // compressions over a pre-padded block for SHA-1/SHA-2.
+    prf.iterate_xor(&mut u, &mut acc, iterations - 1);
 
     let n = out.len().min(acc.as_ref().len());
     out[..n].copy_from_slice(&acc.as_ref()[..n]);

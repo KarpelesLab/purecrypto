@@ -129,6 +129,69 @@ impl<D: Digest> Hmac<D> {
         h.update(data);
         h.finalize()
     }
+
+    /// Iterated HMAC, the PBKDF2 inner loop: `rounds` times sets
+    /// `u = HMAC(K, u)` and XORs the new `u` into `acc`. Uses the digest's
+    /// raw-compression fast path ([`Digest::hmac_iterate`]) when it has one,
+    /// else clones the keyed state per round.
+    #[cfg_attr(not(feature = "kdf"), allow(dead_code))]
+    pub(crate) fn iterate_xor(&self, u: &mut D::Output, acc: &mut D::Output, rounds: u32) {
+        if D::hmac_iterate(&self.inner, &self.outer, u, acc, rounds) {
+            return;
+        }
+        for _ in 0..rounds {
+            *u = self.clone().chain(u.as_ref()).finalize();
+            for (a, b) in acc.as_mut().iter_mut().zip(u.as_ref().iter()) {
+                *a ^= *b;
+            }
+        }
+    }
+}
+
+/// The shared raw-compression loop behind the [`Digest::hmac_iterate`] fast
+/// paths of the Merkle–Damgård hashes.
+///
+/// `inner_h` / `outer_h` are the chaining values after absorbing exactly the
+/// `K ⊕ ipad` / `K ⊕ opad` block. Every message hashed in the loop is one
+/// digest (`u.len()` bytes) after that block, so both the inner and the outer
+/// hash are a single compression of the same pre-padded block template:
+/// `u ‖ 0x80 ‖ 0… ‖ len_field`, where `len_field` is the encoded bit length
+/// of `B + u.len()` bytes. Each round compresses it under the inner state,
+/// writes the inner digest over its head (`out`), compresses it under the
+/// outer state, and writes the new `u` back over the head. The template and
+/// the working state hold key-derived values and are wiped once at the end.
+pub(super) fn hmac_iterate_with<H, const B: usize>(
+    (inner_h, outer_h): (&H, &H),
+    len_field: &[u8],
+    u: &mut [u8],
+    acc: &mut [u8],
+    rounds: u32,
+    compress: impl Fn(&mut H, &[u8; B]),
+    out: impl Fn(&H, &mut [u8]),
+) where
+    H: Copy + crate::zeroize::Zeroize,
+{
+    use crate::zeroize::Zeroize;
+    let n = u.len();
+    let mut block = [0u8; B];
+    block[..n].copy_from_slice(u);
+    block[n] = 0x80;
+    block[B - len_field.len()..].copy_from_slice(len_field);
+    let mut h = *inner_h;
+    for _ in 0..rounds {
+        h = *inner_h;
+        compress(&mut h, &block);
+        out(&h, &mut block[..n]);
+        h = *outer_h;
+        compress(&mut h, &block);
+        out(&h, &mut block[..n]);
+        for (a, b) in acc.iter_mut().zip(&block[..n]) {
+            *a ^= *b;
+        }
+    }
+    u.copy_from_slice(&block[..n]);
+    block.zeroize();
+    h.zeroize();
 }
 
 impl<D: Digest> Drop for Hmac<D> {
@@ -184,6 +247,54 @@ pub type HmacSha512_256 = Hmac<super::Sha512_256>;
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
+
+    /// The raw-compression `hmac_iterate` fast paths must equal the generic
+    /// clone-and-finalize loop bit for bit, for short and over-long keys,
+    /// several round counts and every digest that has the fast path (plus
+    /// one without it, to exercise the fallback through `iterate_xor`).
+    #[test]
+    fn hmac_iterate_fast_paths_match_generic_loop() {
+        fn check<D: Digest>() {
+            let long_key = [0x5au8; 200];
+            for key in [&b"pw"[..], &long_key[..]] {
+                let mac = Hmac::<D>::new(key);
+                for rounds in [0u32, 1, 2, 7] {
+                    let mut u = mac.clone().chain(b"salt\0\0\0\x01").finalize();
+                    let (mut acc, mut u_ref) = (u, u);
+                    let mut acc_ref = acc;
+                    for _ in 0..rounds {
+                        u_ref = mac.clone().chain(u_ref.as_ref()).finalize();
+                        for (a, b) in acc_ref.as_mut().iter_mut().zip(u_ref.as_ref()) {
+                            *a ^= *b;
+                        }
+                    }
+                    mac.iterate_xor(&mut u, &mut acc, rounds);
+                    assert_eq!(u.as_ref(), u_ref.as_ref(), "{} r={rounds}", D::OUTPUT_LEN);
+                    assert_eq!(
+                        acc.as_ref(),
+                        acc_ref.as_ref(),
+                        "{} r={rounds}",
+                        D::OUTPUT_LEN
+                    );
+                }
+            }
+            // A state that is not right after the pad block must be refused.
+            let mut mac = Hmac::<D>::new(b"k");
+            mac.update(b"x");
+            let (mut u, mut acc) = (D::zeroed_output(), D::zeroed_output());
+            assert!(!D::hmac_iterate(
+                &mac.inner, &mac.outer, &mut u, &mut acc, 1
+            ));
+        }
+        check::<crate::hash::Sha1>();
+        check::<crate::hash::Sha224>();
+        check::<crate::hash::Sha256>();
+        check::<crate::hash::Sha384>();
+        check::<crate::hash::Sha512>();
+        check::<crate::hash::Sha512_224>();
+        check::<crate::hash::Sha512_256>();
+        check::<crate::hash::Md5>();
+    }
 
     // RFC 4231 test vectors.
 
