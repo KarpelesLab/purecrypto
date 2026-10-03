@@ -47,15 +47,31 @@ unsafe fn dec_core(ks: &[uint8x16_t], nr: usize, mut s: uint8x16_t) -> uint8x16_
     unsafe {
         // Equivalent inverse cipher with the forward key schedule (canonical
         // OpenSSL aesv8 decrypt): the first AESD uses the raw last round key,
-        // the middle round keys are InvMixColumns-transformed (vaesimcq) before
-        // AESD, and the state is InvMixColumns'd between rounds. AESD(x,k) =
+        // the middle round keys are InvMixColumns-transformed (vaesimcq, done
+        // once per schedule by `load_dec_schedule`) before AESD, and the state
+        // is InvMixColumns'd between rounds. AESD(x,k) =
         // InvSubBytes(InvShiftRows(x XOR k)).
         s = vaesdq_u8(s, ks[nr]);
         for round in (1..nr).rev() {
             s = vaesimcq_u8(s);
-            s = vaesdq_u8(s, vaesimcq_u8(ks[round]));
+            s = vaesdq_u8(s, ks[round]);
         }
         veorq_u8(s, ks[0])
+    }
+}
+
+/// Preloads the decryption schedule: the forward round keys with the middle
+/// ones already InvMixColumns-transformed, as [`dec_core`] expects, so a batch
+/// pays the `vaesimcq` per round key once rather than per block.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn load_dec_schedule(round_keys: &[u8], nr: usize) -> [uint8x16_t; 15] {
+    unsafe {
+        let mut ks = load_schedule(round_keys, nr);
+        for k in ks.iter_mut().take(nr).skip(1) {
+            *k = vaesimcq_u8(*k);
+        }
+        ks
     }
 }
 
@@ -131,13 +147,19 @@ pub(super) unsafe fn encrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8
     }
 }
 
-/// Single inverse block.
+/// Single inverse block. For one block the per-round `vaesimcq` of the key is
+/// off the state's dependency chain, so transforming each key in the round
+/// loop overlaps with the AESD chain; preloading the transformed schedule
+/// (as the batch path does) would serialise it in front instead.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn decrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8; 16]) {
     unsafe {
         let mut ks = load_schedule(round_keys, nr);
-        let s = dec_core(&ks, nr, vld1q_u8(block.as_ptr()));
-        vst1q_u8(block.as_mut_ptr(), s);
+        let mut s = vaesdq_u8(vld1q_u8(block.as_ptr()), ks[nr]);
+        for round in (1..nr).rev() {
+            s = vaesdq_u8(vaesimcq_u8(s), vaesimcq_u8(ks[round]));
+        }
+        vst1q_u8(block.as_mut_ptr(), veorq_u8(s, ks[0]));
         wipe(&mut ks);
     }
 }
@@ -174,7 +196,7 @@ pub(super) unsafe fn encrypt_blocks(round_keys: &[u8], nr: usize, blocks: &mut [
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn decrypt_blocks(round_keys: &[u8], nr: usize, blocks: &mut [u8]) {
     unsafe {
-        let mut ks = load_schedule(round_keys, nr);
+        let mut ks = load_dec_schedule(round_keys, nr);
         let mut wide = blocks.chunks_exact_mut(16 * 4);
         for c in &mut wide {
             let mut b = [vdupq_n_u8(0); 4];
