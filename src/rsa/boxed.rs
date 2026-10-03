@@ -352,8 +352,10 @@ fn derive_blinder_boxed(
     let c_bytes = c.to_be_bytes(k_bytes);
     let mut blinder_bytes = Vec::with_capacity(k_bytes);
     let mut counter: u32 = 0;
+    // Key the HMAC once; each chunk continues from a clone of that state.
+    let keyed = HmacSha256::new(blinding_seed);
     while blinder_bytes.len() < k_bytes {
-        let mut m = HmacSha256::new(blinding_seed);
+        let mut m = keyed.clone();
         m.update(b"r");
         m.update(&counter.to_be_bytes());
         m.update(&nonce.to_be_bytes());

@@ -214,8 +214,10 @@ fn raw_private_blinded<const LIMBS: usize>(
     let mut r_limbs = [0u64; LIMBS];
     let mut counter: u32 = 0;
     let mut limbs_remaining = LIMBS;
+    // Key the HMAC once; each chunk continues from a clone of that state.
+    let keyed = HmacSha256::new(blinding_seed);
     while limbs_remaining > 0 {
-        let mut m = HmacSha256::new(blinding_seed);
+        let mut m = keyed.clone();
         m.update(b"r");
         m.update(&counter.to_be_bytes());
         // Per-operation nonce: without it the whole blinded computation is a
