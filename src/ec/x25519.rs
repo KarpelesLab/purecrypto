@@ -7,6 +7,8 @@
 
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use crate::ec::curve25519::field::Fe;
+#[cfg(feature = "ed25519-table")]
+use crate::ec::curve25519::field::Field;
 use crate::rng::RngCore;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -118,6 +120,39 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+/// `X25519(scalar, 9)` through the edwards25519 fixed-base comb instead of
+/// the Montgomery ladder: `u([k]P₉) = (1 + y)/(1 − y)` for `[k]B` on
+/// edwards25519, since the birational map between the curves sends the
+/// Ed25519 base point `B` to the `u = 9` point and is a group isomorphism.
+///
+/// The comb consumes all 256 bits of the clamped scalar `k` as-is (no
+/// reduction), so the point is exactly `[k]B`; `[k]B = [k mod L]B` is never
+/// the identity because `k` is a multiple of 8 in `[2²⁵⁴, 2²⁵⁵)` and `L` is
+/// an odd prime above `2²⁵²`, so `1 − y ≠ 0`. Same constant-time discipline
+/// as the ladder: the comb gathers by masked scans, and the projective
+/// `(Z + Y)/(Z − Y)` costs one Fermat inversion.
+#[cfg(feature = "ed25519-table")]
+fn x25519_base(scalar: &[u8; 32]) -> [u8; 32] {
+    let mut k = *scalar;
+    k[0] &= 248;
+    k[31] &= 127;
+    k[31] |= 64;
+
+    let f = Field::new();
+    let mut p = f.mul_base(&k);
+    let mut num = p.z.add(&p.y);
+    let mut den = p.z.sub(&p.y);
+    let out = num.mul(&den.invert()).to_bytes();
+
+    // The clamped scalar and the point [k]B (all four coordinates, and the
+    // sum/difference fed to the inversion) are secret; wipe them.
+    k.zeroize();
+    for v in [&mut p.x, &mut p.y, &mut p.z, &mut p.t, &mut num, &mut den] {
+        v.zeroize();
+    }
+    out
+}
+
 /// The X25519 base point (`u = 9`).
 pub const BASE_POINT: [u8; 32] = {
     let mut b = [0u8; 32];
@@ -172,7 +207,14 @@ impl X25519PrivateKey {
 
     /// The public key `X25519(scalar, 9)` to send to the peer.
     pub fn public_key(&self) -> [u8; 32] {
-        x25519(&self.scalar, &BASE_POINT)
+        #[cfg(feature = "ed25519-table")]
+        {
+            x25519_base(&self.scalar)
+        }
+        #[cfg(not(feature = "ed25519-table"))]
+        {
+            x25519(&self.scalar, &BASE_POINT)
+        }
     }
 
     /// The shared secret with `peer`'s public key. Returns
@@ -465,6 +507,36 @@ mod tests {
         let shared = hex32("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
         assert_eq!(a.diffie_hellman(&b.public_key()).unwrap(), shared);
         assert_eq!(b.diffie_hellman(&a.public_key()).unwrap(), shared);
+    }
+
+    /// The comb-based public key equals the Montgomery ladder on the base
+    /// point, over edge scalars (all-zero / all-one bytes, which clamp to
+    /// the extremes of the range, and a scalar whose clamp-cleared bits are
+    /// set) and a deterministic random sweep.
+    #[cfg(feature = "ed25519-table")]
+    #[test]
+    fn base_comb_matches_ladder() {
+        let mut st = 0x25519_u64;
+        let mut next = || {
+            st = st.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = st;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let mut cases = [[0u8; 32]; 68];
+        cases[1] = [0xff; 32];
+        cases[2][0] = 7;
+        cases[2][31] = 0x80;
+        cases[3][31] = 0x40;
+        for c in cases[4..].iter_mut() {
+            for w in c.chunks_mut(8) {
+                w.copy_from_slice(&next().to_le_bytes());
+            }
+        }
+        for k in cases {
+            assert_eq!(x25519_base(&k), x25519(&k, &BASE_POINT), "k = {k:02x?}");
+        }
     }
 
     #[test]

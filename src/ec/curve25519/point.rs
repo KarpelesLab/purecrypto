@@ -487,6 +487,7 @@ fn wnaf5(scalar: &[u8; 32]) -> [i8; 261] {
 /// Constant-time point selection: `b` if `c` is set, else `a`. (This crate's
 /// `conditional_select(x, y, c)` returns `x` when `c` is set, so the chosen
 /// value goes first.)
+#[inline]
 pub(crate) fn point_select(a: &Point, b: &Point, c: Choice) -> Point {
     Point {
         x: Fe::conditional_select(&b.x, &a.x, c),
