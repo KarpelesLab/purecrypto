@@ -133,6 +133,9 @@ fn small_factor_in(n: &BoxedUint, primes: &[u64]) -> Option<u64> {
 /// harness, `tests/ct_valgrind.rs`): the candidate is rejected, or is
 /// decided prime. The tests themselves are the branch-free ones, so a
 /// candidate that is kept has run exactly the same code as any other.
+// Only DSA / DH parameter validation (and tests) need the self-sieving form;
+// RSA keygen passes a table it sieved once to `is_prime_boxed_with`.
+#[cfg(any(test, feature = "dsa", feature = "dh"))]
 pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usize) -> bool {
     is_prime_boxed_with(n, rng, rounds, &small_odd_primes())
 }
