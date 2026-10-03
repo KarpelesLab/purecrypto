@@ -135,19 +135,17 @@ impl<const LIMBS: usize> Uint<LIMBS> {
     ///
     /// # Panics
     /// Panics if `bytes` is longer than the integer can hold (`LIMBS * 8`).
-    pub fn from_be_bytes(bytes: &[u8]) -> Self {
+    pub const fn from_be_bytes(bytes: &[u8]) -> Self {
         assert!(bytes.len() <= LIMBS * 8, "input too large for Uint");
         let mut limbs = [0; LIMBS];
-        let mut end = bytes.len();
-        let mut i = 0;
-        while end > 0 {
-            let start = end.saturating_sub(8);
-            let mut buf = [0u8; 8];
-            let slice = &bytes[start..end];
-            buf[8 - slice.len()..].copy_from_slice(slice);
-            limbs[i] = Limb::from_be_bytes(buf);
-            i += 1;
-            end = start;
+        // Byte `j` counted from the least-significant end lands in limb
+        // `j / 8` at bit offset `8 * (j % 8)`. Byte-wise so it stays `const`
+        // (slice range indexing is not); the loop bound is the public length.
+        let len = bytes.len();
+        let mut j = 0;
+        while j < len {
+            limbs[j / 8] |= (bytes[len - 1 - j] as Limb) << (8 * (j % 8));
+            j += 1;
         }
         Uint { limbs }
     }
@@ -198,7 +196,7 @@ impl<const LIMBS: usize> Uint<LIMBS> {
 
     /// Adds `self + rhs + carry`, returning the sum and the carry out of the
     /// most significant limb.
-    pub fn adc(&self, rhs: &Self, carry: Limb) -> (Self, Limb) {
+    pub const fn adc(&self, rhs: &Self, carry: Limb) -> (Self, Limb) {
         let mut limbs = [0; LIMBS];
         let mut c = carry;
         let mut i = 0;
@@ -213,7 +211,7 @@ impl<const LIMBS: usize> Uint<LIMBS> {
 
     /// Subtracts `self - rhs - borrow`, returning the difference and the borrow
     /// out (`1` if the true result was negative).
-    pub fn sbb(&self, rhs: &Self, borrow: Limb) -> (Self, Limb) {
+    pub const fn sbb(&self, rhs: &Self, borrow: Limb) -> (Self, Limb) {
         let mut limbs = [0; LIMBS];
         let mut b = borrow;
         let mut i = 0;

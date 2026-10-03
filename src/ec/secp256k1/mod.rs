@@ -96,17 +96,12 @@ impl Scalar {
     /// The multiplicative identity `1`.
     pub const ONE: Scalar = Scalar(Fe::ONE);
 
-    /// Builds the scalar-field modulus context (order `n`).
-    #[inline]
-    fn modulus() -> MontModulus<4> {
-        MontModulus::new(fe_from_hex(N_HEX))
-    }
+    /// The group order `n` as a [`Fe`], decoded at compile time.
+    pub(crate) const ORDER: Fe = fe_from_hex(N_HEX);
 
-    /// The group order `n` as a [`Fe`].
-    #[inline]
-    fn order() -> Fe {
-        fe_from_hex(N_HEX)
-    }
+    /// The scalar-field modulus context (order `n`), built at compile time so
+    /// no arithmetic op pays for the `R^2 mod n` setup.
+    pub(crate) const MODULUS: MontModulus<4> = MontModulus::new(Self::ORDER);
 
     /// Decodes a canonical 32-byte big-endian scalar, rejecting any value
     /// `>= n` (including `n` itself).
@@ -116,7 +111,7 @@ impl Scalar {
     pub fn from_bytes_be(bytes: &[u8; 32]) -> Result<Scalar, Error> {
         let v = Fe::from_be_bytes(bytes);
         // Declassified (Valgrind harness): the range verdict is returned.
-        if v.ct_lt(&Self::order()).declassify() {
+        if v.ct_lt(&Self::ORDER).declassify() {
             Ok(Scalar(v))
         } else {
             Err(Error::InvalidInput)
@@ -129,7 +124,7 @@ impl Scalar {
     /// that should be folded into `[0, n)` rather than rejected.
     pub fn from_bytes_be_reduce(bytes: &[u8; 32]) -> Scalar {
         let v = Fe::from_be_bytes(bytes);
-        Scalar(v.reduce(&Self::order()))
+        Scalar(v.reduce(&Self::ORDER))
     }
 
     /// Returns the 32-byte big-endian encoding of this scalar.
@@ -141,30 +136,30 @@ impl Scalar {
 
     /// Returns `(self + rhs) mod n`.
     pub fn add(&self, rhs: &Scalar) -> Scalar {
-        Scalar(Self::modulus().add_mod(&self.0, &rhs.0))
+        Scalar(Self::MODULUS.add_mod(&self.0, &rhs.0))
     }
 
     /// Returns `(self - rhs) mod n`.
     pub fn sub(&self, rhs: &Scalar) -> Scalar {
-        Scalar(Self::modulus().sub_mod(&self.0, &rhs.0))
+        Scalar(Self::MODULUS.sub_mod(&self.0, &rhs.0))
     }
 
     /// Returns `(self * rhs) mod n`.
     pub fn mul(&self, rhs: &Scalar) -> Scalar {
-        Scalar(Self::modulus().mul_mod(&self.0, &rhs.0))
+        Scalar(Self::MODULUS.mul_mod(&self.0, &rhs.0))
     }
 
     /// Returns `(-self) mod n`.
     pub fn negate(&self) -> Scalar {
-        Scalar(Self::modulus().sub_mod(&Fe::ZERO, &self.0))
+        Scalar(Self::MODULUS.sub_mod(&Fe::ZERO, &self.0))
     }
 
     /// Returns the modular inverse `self^-1 mod n` (constant-time Fermat), or
     /// `0` when `self` is `0`.
     pub fn invert(&self) -> Scalar {
         // n is prime, so a^(n-2) is the inverse.
-        let n_minus_2 = Self::order().wrapping_sub(&Fe::from_u64(2));
-        Scalar(Self::modulus().pow(&self.0, &n_minus_2))
+        let n_minus_2 = Self::ORDER.wrapping_sub(&Fe::from_u64(2));
+        Scalar(Self::MODULUS.pow(&self.0, &n_minus_2))
     }
 
     /// Returns a [`Choice`] that is true iff this scalar is `0`.

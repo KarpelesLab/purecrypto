@@ -60,13 +60,13 @@ impl CtOption {
 pub(crate) const P_HEX: &str = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f";
 
 /// Decodes a 64-character big-endian hex string into an [`Fe`].
-pub(crate) fn fe_from_hex(hex: &str) -> Fe {
+pub(crate) const fn fe_from_hex(hex: &str) -> Fe {
     super::super::uint_from_be_hex(hex)
 }
 
 /// Returns the prime `p` as a [`Fe`].
 #[inline]
-pub(crate) fn p() -> Fe {
+pub(crate) const fn p() -> Fe {
     fe_from_hex(P_HEX)
 }
 

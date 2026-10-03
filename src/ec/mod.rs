@@ -126,7 +126,7 @@ mod key_impl;
 /// and byte loop; this is the one shared copy. The input is always a hardcoded,
 /// even-length, valid-hex curve constant of at most `LIMBS * 8` bytes, so a
 /// malformed digit decodes as a zero nibble rather than erroring.
-pub(crate) fn uint_from_be_hex<const LIMBS: usize>(hex: &str) -> crate::bignum::Uint<LIMBS> {
+pub(crate) const fn uint_from_be_hex<const LIMBS: usize>(hex: &str) -> crate::bignum::Uint<LIMBS> {
     const fn nibble(c: u8) -> u8 {
         match c {
             b'0'..=b'9' => c - b'0',
@@ -146,7 +146,7 @@ pub(crate) fn uint_from_be_hex<const LIMBS: usize>(hex: &str) -> crate::bignum::
         bytes[i] = (nibble(h[2 * i]) << 4) | nibble(h[2 * i + 1]);
         i += 1;
     }
-    crate::bignum::Uint::from_be_bytes(&bytes[..n])
+    crate::bignum::Uint::from_be_bytes(bytes.split_at(n).0)
 }
 
 /// Errors from elliptic-curve operations.

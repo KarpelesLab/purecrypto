@@ -274,9 +274,9 @@ fn scalar_invert_roundtrip() {
 #[test]
 fn scalar_from_bytes_rejects_ge_n() {
     let mut nb = [0u8; 32];
-    Scalar::order().write_be_bytes(&mut nb);
+    Scalar::ORDER.write_be_bytes(&mut nb);
     assert!(Scalar::from_bytes_be(&nb).is_err());
-    let n_minus_1 = Scalar::order().wrapping_sub(&Fe::from_u64(1));
+    let n_minus_1 = Scalar::ORDER.wrapping_sub(&Fe::from_u64(1));
     let mut b = [0u8; 32];
     n_minus_1.write_be_bytes(&mut b);
     assert!(Scalar::from_bytes_be(&b).is_ok());
@@ -285,7 +285,7 @@ fn scalar_from_bytes_rejects_ge_n() {
 #[test]
 fn scalar_reduce_folds_large_input() {
     // n + 5 reduces to 5.
-    let np5 = Scalar::order().wrapping_add(&Fe::from_u64(5));
+    let np5 = Scalar::ORDER.wrapping_add(&Fe::from_u64(5));
     let mut b = [0u8; 32];
     np5.write_be_bytes(&mut b);
     let s = Scalar::from_bytes_be_reduce(&b);

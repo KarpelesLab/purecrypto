@@ -102,7 +102,7 @@ pub struct Secp256k1EcdsaSignature {
 /// within `2^-128` of `2^256`, so a draw is accepted with probability
 /// effectively 1.
 fn random_scalar<R: RngCore>(rng: &mut R) -> Scalar {
-    let n = Scalar::order();
+    let n = Scalar::ORDER;
     loop {
         let mut limbs = [0u64; 4];
         for limb in &mut limbs {
@@ -123,7 +123,7 @@ impl Secp256k1EcdsaPrivateKey {
     /// in `[1, n-1]`.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, Error> {
         let mut d = Fe::from_be_bytes(bytes);
-        if in_range(&d, &Scalar::order()) {
+        if in_range(&d, &Scalar::ORDER) {
             Ok(Secp256k1EcdsaPrivateKey { d: Scalar(d) })
         } else {
             // Out of range, but still caller-supplied key material.
@@ -185,7 +185,7 @@ impl Secp256k1EcdsaPrivateKey {
     /// exceeded the group order before reduction (`x_overflow`) and the parity
     /// of its y-coordinate (`y_is_odd`).
     fn sign_prehash_inner<D: Digest>(&self, prehash: &[u8]) -> Result<(Fe, Fe, bool, bool), Error> {
-        let n = Scalar::order();
+        let n = Scalar::ORDER;
         let z = Scalar(bits2int(prehash).reduce(&n));
 
         // The nonce and every value derived from it are held in `Scalar`s,
@@ -263,7 +263,7 @@ impl Secp256k1EcdsaPrivateKey {
         let (r, s, x_overflow, y_is_odd) = self.sign_prehash_inner::<D>(prehash)?;
         // Normalise to low-S; negating s reflects R across the x-axis, flipping
         // its y-parity, so the recovery id's parity bit must flip with it.
-        let n = Scalar::order();
+        let n = Scalar::ORDER;
         let (s, y_is_odd) = if is_low_s(&s, &n) {
             (s, y_is_odd)
         } else {
@@ -335,7 +335,7 @@ impl Secp256k1EcdsaPublicKey {
         prehash: &[u8],
         sig: &Secp256k1EcdsaSignature,
     ) -> Result<(), Error> {
-        let n = Scalar::order();
+        let n = Scalar::ORDER;
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
         }
@@ -406,7 +406,7 @@ impl Secp256k1EcdsaSignature {
     /// valid ECDSA signature `(r, s)`, the pair `(r, n − s)` also verifies, so
     /// callers needing unique signature bytes must require `is_low_s()`.
     pub fn is_low_s(&self) -> bool {
-        is_low_s(&self.s, &Scalar::order())
+        is_low_s(&self.s, &Scalar::ORDER)
     }
 
     /// Returns the canonical low-S representative for this signature: if
@@ -418,7 +418,7 @@ impl Secp256k1EcdsaSignature {
         } else {
             Secp256k1EcdsaSignature {
                 r: self.r,
-                s: Scalar::order().wrapping_sub(&self.s),
+                s: Scalar::ORDER.wrapping_sub(&self.s),
             }
         }
     }
@@ -462,7 +462,7 @@ impl Secp256k1EcdsaSignature {
         if recid > 3 {
             return Err(Error::InvalidInput);
         }
-        let n = Scalar::order();
+        let n = Scalar::ORDER;
         if !in_range(&self.r, &n) || !in_range(&self.s, &n) {
             return Err(Error::Verification);
         }
@@ -719,7 +719,7 @@ mod tests {
             // The malleable twin verifies; the low-S form is unique.
             let twin = Secp256k1EcdsaSignature {
                 r: sig.r,
-                s: Scalar::order().wrapping_sub(&sig.s),
+                s: Scalar::ORDER.wrapping_sub(&sig.s),
             };
             pk.verify::<Sha256>(&msg, &twin).unwrap();
             assert_ne!(sig.is_low_s(), twin.is_low_s());
@@ -803,7 +803,7 @@ mod tests {
         let sk = key_one();
         let pk = sk.public_key();
         let sig = sk.sign::<Sha256>(SATOSHI_MSG).unwrap();
-        let n = be32(&Scalar::order());
+        let n = be32(&Scalar::ORDER);
 
         // Wrong message, wrong key, tampered r / s, swapped halves.
         assert_eq!(
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn from_bytes_range_checks() {
-        let n = be32(&Scalar::order());
+        let n = be32(&Scalar::ORDER);
         assert_eq!(
             Secp256k1EcdsaPrivateKey::from_bytes(&[0u8; 32]).err(),
             Some(Error::InvalidInput)

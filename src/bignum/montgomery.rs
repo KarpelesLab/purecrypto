@@ -24,21 +24,50 @@ pub(crate) const fn inv_mod_2_64(n: u64) -> u64 {
     x
 }
 
+/// Returns `a` when `bit == 1`, `b` when `bit == 0`, without branching on
+/// `bit`. A `const` counterpart of
+/// [`ConditionallySelectable::conditional_select`]
+/// with the same `black_box`-masked limb select, so that [`add_mod`],
+/// [`sub_mod`] and [`MontModulus::new`] can run at compile time while staying
+/// constant time when called at runtime on secret moduli (RSA primes).
+#[inline]
+const fn select<const LIMBS: usize>(a: &Uint<LIMBS>, b: &Uint<LIMBS>, bit: Limb) -> Uint<LIMBS> {
+    // All-ones when bit is 1, all-zeros when 0.
+    let mask = core::hint::black_box(bit.wrapping_neg());
+    let a = a.as_limbs();
+    let b = b.as_limbs();
+    let mut limbs = [0 as Limb; LIMBS];
+    let mut i = 0;
+    while i < LIMBS {
+        limbs[i] = b[i] ^ (mask & (a[i] ^ b[i]));
+        i += 1;
+    }
+    Uint::from_limbs(limbs)
+}
+
 /// Returns `(a + b) mod n`, assuming `a, b < n`.
-fn add_mod<const LIMBS: usize>(n: &Uint<LIMBS>, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
+const fn add_mod<const LIMBS: usize>(
+    n: &Uint<LIMBS>,
+    a: &Uint<LIMBS>,
+    b: &Uint<LIMBS>,
+) -> Uint<LIMBS> {
     let (sum, carry) = a.adc(b, 0);
     let (diff, borrow) = sum.sbb(n, 0);
     // Subtract n when the sum overflowed (carry) or sum >= n (no borrow).
     let subtract = carry | (borrow ^ 1);
-    Uint::conditional_select(&diff, &sum, Choice::from(subtract as u8))
+    select(&diff, &sum, subtract)
 }
 
 /// Returns `(a - b) mod n`, assuming `a, b < n`.
-fn sub_mod<const LIMBS: usize>(n: &Uint<LIMBS>, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
+const fn sub_mod<const LIMBS: usize>(
+    n: &Uint<LIMBS>,
+    a: &Uint<LIMBS>,
+    b: &Uint<LIMBS>,
+) -> Uint<LIMBS> {
     let (diff, borrow) = a.sbb(b, 0);
     let (wrapped, _) = diff.adc(n, 0);
     // If a < b (borrow), the true result wrapped negative; add n back.
-    Uint::conditional_select(&wrapped, &diff, Choice::from(borrow as u8))
+    select(&wrapped, &diff, borrow)
 }
 
 /// Parameters for modular arithmetic with a fixed odd modulus.
@@ -56,8 +85,11 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     ///
     /// # Panics
     /// Panics if `modulus` is even (Montgomery reduction requires an odd
-    /// modulus).
-    pub fn new(modulus: Uint<LIMBS>) -> Self {
+    /// modulus). In a `const` context that panic is a compile error.
+    ///
+    /// Costs `2 * 64 * LIMBS` modular doublings, so a fixed modulus should be
+    /// built once, ideally as a `const`.
+    pub const fn new(modulus: Uint<LIMBS>) -> Self {
         assert!(
             modulus.as_limbs()[0] & 1 == 1,
             "Montgomery modulus must be odd"
@@ -291,13 +323,13 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
 
     /// Returns `(a + b) mod N` for plain residues `a, b < N`.
     #[inline]
-    pub fn add_mod(&self, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
+    pub const fn add_mod(&self, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
         add_mod(&self.modulus, a, b)
     }
 
     /// Returns `(a - b) mod N` for plain residues `a, b < N`.
     #[inline]
-    pub fn sub_mod(&self, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
+    pub const fn sub_mod(&self, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
         sub_mod(&self.modulus, a, b)
     }
 
