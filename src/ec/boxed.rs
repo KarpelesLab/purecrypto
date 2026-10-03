@@ -15,7 +15,7 @@ use super::curves::CurveId;
 #[cfg(feature = "der")]
 const EC_PUBLIC_KEY_OID: &[u64] = &[1, 2, 840, 10045, 2, 1];
 use crate::bignum::BoxedUint;
-use crate::ct::{Choice, ConstantTimeEq};
+use crate::ct::Choice;
 use crate::hash::{Digest, Hmac};
 use crate::rng::{CryptoRng, RngCore};
 use crate::zeroize::Zeroize;
@@ -663,11 +663,12 @@ impl BoxedEcdsaPublicKey {
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
 
+        // Every input here (signature, digest, public key) is public, so the
+        // variable-time double-scalar multiplication and the inversion-free
+        // `x mod n == r` test are sound — and used only on this path.
         let point = c.lift_affine(&self.x, &self.y);
-        let sum = c.point_add(&c.mul_generator(&u1), &c.scalar_mul(&u2, &point));
-        let (vx, _) = c.to_affine(&sum).ok_or(Error::Verification)?;
-        let v = reduce_once(&vx, &n);
-        if bool::from(v.ct_eq(&sig.r)) {
+        let sum = c.mul_double_vartime(&u1, &u2, &point);
+        if c.affine_x_eq_mod_n(&sum, &sig.r) {
             Ok(())
         } else {
             Err(Error::Verification)
@@ -1042,7 +1043,8 @@ impl BoxedEcdsaSignature {
         let neg_z = fq.sub_mod(&BoxedUint::zero(1), &z);
         let u1 = fq.mul_mod(&neg_z, &r_inv);
         let u2 = fq.mul_mod(&self.s, &r_inv);
-        let q = c.point_add(&c.mul_generator(&u1), &c.scalar_mul(&u2, &r_point));
+        // Public inputs only (signature, digest): variable time is fine.
+        let q = c.mul_double_vartime(&u1, &u2, &r_point);
         let (x, y) = c.to_affine(&q).ok_or(Error::Verification)?;
         Ok(BoxedEcdsaPublicKey { curve, x, y })
     }

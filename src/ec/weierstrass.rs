@@ -10,6 +10,7 @@
 use crate::bignum::{BoxedMontModulus, BoxedUint, Limb};
 use crate::ct::{ConditionallySelectable, ConstantTimeEq};
 use alloc::vec;
+use alloc::vec::Vec;
 
 /// A point in projective coordinates `(X : Y : Z)`, field elements in
 /// Montgomery form. The identity is `(0 : 1 : 0)`.
@@ -666,6 +667,89 @@ impl Curve {
         acc
     }
 
+    /// `-p`: `(X : −Y : Z)`.
+    fn negate(&self, p: &Point) -> Point {
+        Point {
+            x: p.x.clone(),
+            y: self.fp.sub_mod(&BoxedUint::zero(1), &p.y),
+            z: p.z.clone(),
+        }
+    }
+
+    /// The odd multiples `[1]P, [3]P, …, [15]P` for a width-5 wNAF ladder.
+    fn odd_multiples(&self, p: &Point) -> Vec<Point> {
+        let two_p = self.double(p);
+        let mut table = Vec::with_capacity(8);
+        table.push(p.clone());
+        for i in 1..8 {
+            let next = self.point_add(&table[i - 1], &two_p);
+            table.push(next);
+        }
+        table
+    }
+
+    /// **VARIABLE-TIME** `u1·G + u2·Q`: width-5 wNAF recodings of both
+    /// scalars interleaved over one run of doublings (Straus–Shamir), with
+    /// zero digits skipped and the table indexed directly.
+    ///
+    /// Only for **public** inputs — signature verification and public-key
+    /// recovery, where the scalars, the point and the result are all known
+    /// to (or computable by) an observer, so timing reveals nothing. Signing,
+    /// key derivation and ECDH keep the constant-time [`Self::scalar_mul`].
+    /// The tables are 16 points (a few KB at P-521, transient).
+    pub(crate) fn mul_double_vartime(&self, u1: &BoxedUint, u2: &BoxedUint, q: &Point) -> Point {
+        let naf1 = wnaf5(u1);
+        let naf2 = wnaf5(u2);
+        let digit = |naf: &[i8], i: usize| naf.get(i).copied().unwrap_or(0);
+        let len = naf1.len().max(naf2.len());
+        let Some(top) = (0..len)
+            .rev()
+            .find(|&i| digit(&naf1, i) != 0 || digit(&naf2, i) != 0)
+        else {
+            return self.identity();
+        };
+        let odd_g = self.odd_multiples(&self.generator());
+        let odd_q = self.odd_multiples(q);
+        let mut acc = self.identity();
+        for i in (0..=top).rev() {
+            acc = self.double(&acc);
+            for (naf, odd) in [(&naf1, &odd_g), (&naf2, &odd_q)] {
+                let d = digit(naf, i);
+                if d > 0 {
+                    acc = self.point_add(&acc, &odd[(d as usize - 1) / 2]);
+                } else if d < 0 {
+                    let neg = self.negate(&odd[((-d) as usize - 1) / 2]);
+                    acc = self.point_add(&acc, &neg);
+                }
+            }
+        }
+        acc
+    }
+
+    /// **VARIABLE-TIME** test that `point`'s affine x-coordinate is
+    /// congruent to `v` modulo the group order (`v < n`), without the field
+    /// inversion of [`Self::to_affine`]: `x = X/Z ≡ v (mod n)` with `x < p <
+    /// 2n` (cofactor 1, so Hasse gives `n > p/2`) means `x ∈ {v, v + n}`, and
+    /// each candidate `c < p` is checked as `c·Z == X`. The identity never
+    /// matches. Public inputs only (the ECDSA / SM2 verification equations).
+    pub(crate) fn affine_x_eq_mod_n(&self, point: &Point, v: &BoxedUint) -> bool {
+        if point.z.is_zero() {
+            return false;
+        }
+        let p = self.field_modulus();
+        let mut cand = v.clone();
+        for _ in 0..2 {
+            if !cand.lt(&p) {
+                break;
+            }
+            if self.fp.mont_mul(&self.fp.to_mont(&cand), &point.z) == point.x {
+                return true;
+            }
+            cand = cand.add(&self.n);
+        }
+        false
+    }
+
     /// Convenience: `scalar * G`.
     pub(crate) fn mul_generator(&self, scalar: &BoxedUint) -> Point {
         let g = self.generator();
@@ -688,6 +772,45 @@ impl Curve {
         // `v` is a public coordinate, so the variable-time compare is fine.
         v.lt(&self.fp.modulus())
     }
+}
+
+/// Width-5 wNAF recoding of `k`, least-significant digit first: digits in
+/// `{0, ±1, ±3, …, ±15}`, any two nonzero digits at least five positions
+/// apart. **Variable time** in `k` — public scalars only.
+fn wnaf5(k: &BoxedUint) -> Vec<i8> {
+    // One spare limb absorbs the carry of `k + 15`.
+    let mut limbs = k.as_limbs().to_vec();
+    limbs.push(0);
+    let mut naf = Vec::with_capacity(64 * limbs.len());
+    while limbs.iter().any(|&l| l != 0) {
+        let mut d = 0i8;
+        if limbs[0] & 1 == 1 {
+            let low = (limbs[0] & 31) as i8;
+            d = if low > 16 { low - 32 } else { low };
+            // k -= d, making the low five bits zero.
+            let (mut borrow, mut carry) = if d > 0 {
+                (d as u64, 0)
+            } else {
+                (0, (-d) as u64)
+            };
+            for l in limbs.iter_mut() {
+                let (v, b) = l.overflowing_sub(borrow);
+                let (v, c) = v.overflowing_add(carry);
+                *l = v;
+                borrow = b as u64;
+                carry = c as u64;
+            }
+        }
+        naf.push(d);
+        // k >>= 1
+        let mut hi = 0;
+        for l in limbs.iter_mut().rev() {
+            let next = *l & 1;
+            *l = (*l >> 1) | (hi << 63);
+            hi = next;
+        }
+    }
+    naf
 }
 
 #[cfg(test)]
@@ -764,6 +887,83 @@ mod tests {
             let got = Point::ct_lookup(&table, d, w);
             assert_eq!(got.x.limbs(), w);
             assert!(got.x == e.x && got.y == e.y && got.z == e.z, "digit {d}");
+        }
+    }
+
+    /// The variable-time double-scalar multiplication against the
+    /// constant-time ladder, and the inversion-free x-coordinate test
+    /// against `to_affine`, on every curve with edge and random scalars.
+    #[test]
+    fn vartime_double_mul_matches_constant_time() {
+        let mut st = 0xd0b1_u64;
+        for &id in CurveId::ALL {
+            let c: &Curve = &id.curve();
+            let n = c.order().clone();
+            let one = BoxedUint::from_u64(1);
+            let rand_scalar = |st: &mut u64| {
+                let limbs = (0..n.limbs()).map(|_| splitmix64(st)).collect();
+                BoxedUint::from_limbs(limbs).reduce(&n)
+            };
+            let q = c.scalar_mul(&rand_scalar(&mut st), &c.generator());
+            let q = rescale(c, &q, &mut st);
+            let mut pairs = vec![
+                (BoxedUint::zero(1), BoxedUint::zero(1)),
+                (one.clone(), BoxedUint::zero(1)),
+                (BoxedUint::zero(1), n.sub(&one)),
+                (n.sub(&one), n.sub(&one)),
+            ];
+            pairs.push((rand_scalar(&mut st), rand_scalar(&mut st)));
+            for (u1, u2) in &pairs {
+                let fast = c.mul_double_vartime(u1, u2, &q);
+                let slow = c.point_add(&c.mul_generator(u1), &c.scalar_mul(u2, &q));
+                let aff = c.to_affine(&slow);
+                assert_eq!(c.to_affine(&fast), aff, "{id:?}");
+                // x mod n against the affine value, plus a near miss.
+                let p = c.field_modulus();
+                for v in [BoxedUint::zero(1), one.clone(), n.sub(&one)] {
+                    let want = aff.as_ref().is_some_and(|(x, _)| x.reduce(&n) == v);
+                    assert_eq!(c.affine_x_eq_mod_n(&fast, &v), want, "{id:?}");
+                }
+                if let Some((x, _)) = &aff {
+                    let v = x.reduce(&n);
+                    assert!(c.affine_x_eq_mod_n(&fast, &v), "{id:?}");
+                    let off = c.fp.add_mod(&v.reduce(&p), &one).reduce(&n);
+                    assert!(!c.affine_x_eq_mod_n(&fast, &off), "{id:?}");
+                }
+            }
+        }
+    }
+
+    /// wNAF digits reconstruct the scalar and respect the window rules.
+    #[test]
+    fn wnaf5_reconstructs() {
+        let mut st = 0x7a7a_u64;
+        for len in [1usize, 4, 6, 9] {
+            for _ in 0..20 {
+                let k = BoxedUint::from_limbs((0..len).map(|_| splitmix64(&mut st)).collect());
+                let naf = wnaf5(&k);
+                // Horner from the top digit: acc = 2·acc + d, tracked as
+                // (positive part, negative part) to stay unsigned.
+                let (mut pos, mut neg) = (BoxedUint::zero(1), BoxedUint::zero(1));
+                let mut last = None;
+                for (i, &d) in naf.iter().enumerate().rev() {
+                    pos = pos.add(&pos);
+                    neg = neg.add(&neg);
+                    if d != 0 {
+                        assert!(d % 2 != 0 && (-15..=15).contains(&d));
+                        if let Some(j) = last {
+                            assert!(j - i >= 5);
+                        }
+                        last = Some(i);
+                        if d > 0 {
+                            pos = pos.add(&BoxedUint::from_u64(d as u64));
+                        } else {
+                            neg = neg.add(&BoxedUint::from_u64((-d) as u64));
+                        }
+                    }
+                }
+                assert!(pos.sub(&neg) == k);
+            }
         }
     }
 

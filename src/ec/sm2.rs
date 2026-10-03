@@ -277,12 +277,13 @@ impl Sm2PublicKey {
             return Err(Error::Verification);
         }
         // (x1, _) = [s]G + [t]PA.
+        // (x1, _) = [s]G + [t]PA. Signature, digest and key are public, so
+        // the variable-time double-scalar multiplication is sound here.
         let point = c.lift_affine(&self.x, &self.y);
-        let sum = c.point_add(&c.mul_generator(&sig.s), &c.scalar_mul(&t, &point));
-        let (x1, _) = c.to_affine(&sum).ok_or(Error::Verification)?;
-        // R = (e + x1) mod n; accept iff R == r.
-        let r = fq.add_mod(&e, &reduce_once(&x1, &n));
-        if bool::from(r.ct_eq(&sig.r)) {
+        let sum = c.mul_double_vartime(&sig.s, &t, &point);
+        // Accept iff R = (e + x1) mod n equals r, i.e. x1 ≡ r − e (mod n),
+        // tested without inverting Z.
+        if c.affine_x_eq_mod_n(&sum, &fq.sub_mod(&sig.r, &e)) {
             Ok(())
         } else {
             Err(Error::Verification)
