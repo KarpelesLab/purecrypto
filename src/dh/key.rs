@@ -206,8 +206,9 @@ impl DhPrivateKey {
     ///   safe-prime groups;
     /// * `peer.y ^ q mod p ∉ {1, p − 1}` where `q = (p − 1) / 2` — a
     ///   consistency check that, by Euler's criterion, can only fail when
-    ///   `p` is not prime at all. It costs one full-width exponentiation and
-    ///   exists so that a modulus smuggled in through
+    ///   `p` is not prime at all. It costs one full-width exponentiation, is
+    ///   skipped for the RFC 3526 groups (published safe primes, where it
+    ///   cannot fail), and exists so that a modulus smuggled in through
     ///   [`DhGroup::from_custom_unchecked`] without the primality test still
     ///   cannot silently confine `x` to a subgroup of a composite "prime".
     ///   Note it does **not** protect an unchecked group whose `p` is a
@@ -251,11 +252,18 @@ impl DhPrivateKey {
         // here. Accepting p − 1 (order-2q peer values) is what keeps
         // primitive-root generators — the RFC 4419 / OpenSSH `moduli`
         // groups — interoperable; see the doc comment.
-        let q = p_minus_one.shr_bits(1);
+        //
+        // The RFC 3526 groups' `p` is a published safe prime, for which the
+        // check cannot fail, so it is skipped there; custom groups (whose
+        // validation, if any, rests on public Miller-Rabin bases) keep it.
+        // `y` and `q` are both public, so the variable-time ladder is fine.
         let one = BoxedUint::from_u64(1);
-        let y_to_q = m.pow(&peer.y, &q);
-        if !bool::from(y_to_q.ct_eq(&one) | y_to_q.ct_eq(&p_minus_one)) {
-            return Err(Error::InvalidPublicKey);
+        if !self.group.known_safe_prime {
+            let q = p_minus_one.shr_bits(1);
+            let y_to_q = m.pow_public(&peer.y, &q);
+            if !bool::from(y_to_q.ct_eq(&one) | y_to_q.ct_eq(&p_minus_one)) {
+                return Err(Error::InvalidPublicKey);
+            }
         }
 
         let z = m.pow_bits(&peer.y, &self.x, self.exp_bits());

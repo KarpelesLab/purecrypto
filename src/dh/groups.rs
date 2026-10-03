@@ -31,6 +31,12 @@ pub struct DhGroup {
     ///
     /// [`DhPrivateKey::generate`]: super::DhPrivateKey::generate
     pub(crate) priv_bits: usize,
+    /// Set only by the RFC 3526 constructors, whose `p` is a published safe
+    /// prime: `shared_secret` then skips the `y^q` consistency check, which
+    /// cannot fail for a genuine safe prime. Custom groups — even ones
+    /// [`from_custom`](Self::from_custom) validated, whose Miller-Rabin half
+    /// uses public bases — keep it.
+    pub(crate) known_safe_prime: bool,
 }
 
 impl DhGroup {
@@ -283,6 +289,7 @@ impl DhGroup {
             p,
             g,
             priv_bits,
+            known_safe_prime: false,
         })
     }
 }
@@ -521,6 +528,7 @@ pub fn group14() -> DhGroup {
         p: BoxedUint::from_be_bytes(&GROUP14_P),
         g: BoxedUint::from_u64(2),
         priv_bits: 256,
+        known_safe_prime: true,
     }
 }
 
@@ -535,6 +543,7 @@ pub fn group15() -> DhGroup {
         p: BoxedUint::from_be_bytes(&GROUP15_P),
         g: BoxedUint::from_u64(2),
         priv_bits: 288,
+        known_safe_prime: true,
     }
 }
 
@@ -547,6 +556,7 @@ pub fn group16() -> DhGroup {
         p: BoxedUint::from_be_bytes(&GROUP16_P),
         g: BoxedUint::from_u64(2),
         priv_bits: 384,
+        known_safe_prime: true,
     }
 }
 
@@ -559,6 +569,7 @@ pub fn group17() -> DhGroup {
         p: BoxedUint::from_be_bytes(&GROUP17_P),
         g: BoxedUint::from_u64(2),
         priv_bits: 512,
+        known_safe_prime: true,
     }
 }
 
@@ -571,12 +582,26 @@ pub fn group18() -> DhGroup {
         p: BoxedUint::from_be_bytes(&GROUP18_P),
         g: BoxedUint::from_u64(2),
         priv_bits: 512,
+        known_safe_prime: true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the RFC 3526 constructors may mark a group as a known safe prime
+    /// (it lets `shared_secret` skip the `y^q` check); a custom group with
+    /// the very same `p` must not inherit that.
+    #[test]
+    fn only_named_groups_are_known_safe_primes() {
+        for g in [group14(), group15(), group16(), group17(), group18()] {
+            assert!(g.known_safe_prime, "{}", g.name());
+        }
+        let custom =
+            DhGroup::from_custom_unchecked(group14().p, BoxedUint::from_u64(2), 256).unwrap();
+        assert!(!custom.known_safe_prime);
+    }
 
     #[test]
     fn group14_constants() {
