@@ -200,12 +200,29 @@ impl RecordCrypter {
     ///
     /// Returns `Err(TooManyRecords)` once the per-key record cap is hit and
     /// `Err(RecordOverflow)` if `content` would exceed the `2^14` plaintext
-    /// fragment limit (RFC 8446 §5.1).
+    /// fragment limit (RFC 8446 §5.1). The engines use
+    /// [`Self::encrypt_into`]; this wrapper serves the tests and the
+    /// Valgrind hooks.
+    #[cfg(any(test, feature = "__ct-check"))]
     pub(crate) fn encrypt(
         &mut self,
         content_type: ContentType,
         content: &[u8],
     ) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        self.encrypt_into(content_type, content, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Self::encrypt`], appending the record to `out` and encrypting it
+    /// there in place (no intermediate buffers). On error nothing is
+    /// appended.
+    pub(crate) fn encrypt_into(
+        &mut self,
+        content_type: ContentType,
+        content: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
         if content.len() > (1usize << 14) {
             return Err(Error::RecordOverflow);
         }
@@ -216,18 +233,16 @@ impl RecordCrypter {
         header[2] = 0x03;
         header[3..5].copy_from_slice(&(fragment_len as u16).to_be_bytes());
 
-        let mut inner = Vec::with_capacity(content.len() + 1);
-        inner.extend_from_slice(content);
-        inner.push(content_type.as_u8());
-
         let nonce = self.next_nonce()?;
-        let tag = self.aead.encrypt(&nonce, &header, &mut inner);
 
-        let mut out = Vec::with_capacity(5 + fragment_len);
+        out.reserve(5 + fragment_len);
         out.extend_from_slice(&header);
-        out.extend_from_slice(&inner);
+        let inner_start = out.len();
+        out.extend_from_slice(content);
+        out.push(content_type.as_u8());
+        let tag = self.aead.encrypt(&nonce, &header, &mut out[inner_start..]);
         out.extend_from_slice(&tag);
-        Ok(out)
+        Ok(())
     }
 
     /// Per-record nonce for an externally-supplied sequence number. Mirrors
@@ -283,24 +298,42 @@ impl RecordCrypter {
     /// Decrypts one record. `header` is the 5-byte `TLSCiphertext` header
     /// (used as AEAD additional data) and `fragment` is the encrypted record
     /// (ciphertext followed by the 16-byte tag). Returns the true content type
-    /// and the recovered content (padding stripped).
+    /// and the recovered content (padding stripped). The engines use
+    /// [`Self::decrypt_in_place`]; this wrapper serves the tests and the
+    /// Valgrind hooks.
+    #[cfg(any(test, feature = "__ct-check"))]
     pub(crate) fn decrypt(
         &mut self,
         header: &[u8; 5],
         fragment: &[u8],
     ) -> Result<(ContentType, Vec<u8>), Error> {
+        let mut buf = fragment.to_vec();
+        let (content_type, len) = self.decrypt_in_place(header, &mut buf)?;
+        buf.truncate(len);
+        Ok((content_type, buf))
+    }
+
+    /// [`Self::decrypt`] in place: `fragment` (ciphertext ‖ tag) is
+    /// decrypted where it lies, and the content is `fragment[..len]` for the
+    /// returned `(content type, len)`. On an authentication failure the
+    /// bytes are left as they were.
+    pub(crate) fn decrypt_in_place(
+        &mut self,
+        header: &[u8; 5],
+        fragment: &mut [u8],
+    ) -> Result<(ContentType, usize), Error> {
         if fragment.len() < AEAD_TAG_LEN {
             return Err(Error::Decode);
         }
-        let (ct, tag_bytes) = fragment.split_at(fragment.len() - AEAD_TAG_LEN);
+        let tag_at = fragment.len() - AEAD_TAG_LEN;
+        let (buf, tag_bytes) = fragment.split_at_mut(tag_at);
         let mut tag = [0u8; 16];
         tag.copy_from_slice(tag_bytes);
 
-        let mut buf = ct.to_vec();
         // Peek, don't consume: the sequence number advances only once the
         // AEAD has actually accepted the record (see `peek_nonce`).
         let nonce = self.peek_nonce(MAX_READ_SEQ)?;
-        if !self.aead.decrypt(&nonce, header, &mut buf, &tag) {
+        if !self.aead.decrypt(&nonce, header, buf, &tag) {
             return Err(Error::BadRecordMac);
         }
         self.seq += 1;
@@ -312,15 +345,14 @@ impl RecordCrypter {
         // (TLS-2 audit finding). Walk the buffer ONCE front-to-back,
         // tracking the most recent non-zero position and value in
         // constant time.
-        let (content_type_byte, end) = ct_find_last_nonzero(&buf)?;
+        let (content_type_byte, end) = ct_find_last_nonzero(buf)?;
         let content_type = ContentType::from_u8(content_type_byte);
-        buf.truncate(end);
         // RFC 8446 §5.2: the recovered TLSPlaintext.fragment must not exceed
         // 2^14 bytes (the type byte and padding are already stripped).
-        if buf.len() > (1usize << 14) {
+        if end > (1usize << 14) {
             return Err(Error::RecordOverflow);
         }
-        Ok((content_type, buf))
+        Ok((content_type, end))
     }
 }
 

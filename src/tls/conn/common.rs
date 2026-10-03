@@ -56,6 +56,11 @@ pub(crate) enum Incoming {
 /// The shared record-layer / transcript / buffering core.
 pub(crate) struct ConnectionCore {
     inbuf: Vec<u8>,
+    /// Read cursor into `inbuf`: the bytes before it are consumed records.
+    /// Records are parsed (and decrypted in place) at the cursor; the
+    /// consumed prefix is dropped when more input arrives, so a burst of
+    /// records costs one memmove rather than one per record.
+    in_off: usize,
     outbuf: Vec<u8>,
     /// Reassembly buffer for handshake-message bytes spanning records.
     hs_pending: Vec<u8>,
@@ -130,6 +135,7 @@ impl ConnectionCore {
     pub(crate) fn new() -> Self {
         ConnectionCore {
             inbuf: Vec::new(),
+            in_off: 0,
             outbuf: Vec::new(),
             hs_pending: Vec::new(),
             app_in: Vec::new(),
@@ -251,6 +257,10 @@ impl ConnectionCore {
 
     /// Feeds received TLS bytes into the input buffer.
     pub(crate) fn read_tls(&mut self, bytes: &[u8]) {
+        if self.in_off > 0 {
+            self.inbuf.drain(..self.in_off);
+            self.in_off = 0;
+        }
         self.inbuf.extend_from_slice(bytes);
     }
 
@@ -261,6 +271,7 @@ impl ConnectionCore {
     /// (or fed later) are neither decrypted nor delivered.
     pub(crate) fn discard_input(&mut self) {
         self.inbuf.clear();
+        self.in_off = 0;
         self.hs_pending.clear();
     }
 
@@ -482,8 +493,8 @@ impl ConnectionCore {
     /// already bounded it (see [`Self::emit_record`]).
     fn emit_one_record(&mut self, ct: ContentType, payload: &[u8]) {
         match &mut self.write {
-            Some(crypter) => match crypter.encrypt(ct, payload) {
-                Ok(rec) => self.outbuf.extend_from_slice(&rec),
+            Some(crypter) => match crypter.encrypt_into(ct, payload, &mut self.outbuf) {
+                Ok(()) => {}
                 Err(e) => {
                     // The only failures here are `TooManyRecords` (the
                     // per-key sequence cap — the engines pre-empt it with an
@@ -529,7 +540,7 @@ impl ConnectionCore {
                 version,
                 fragment,
                 len,
-            }) = read_record(&self.inbuf)?
+            }) = read_record(&self.inbuf[self.in_off..])?
             else {
                 return Ok(None);
             };
@@ -547,8 +558,9 @@ impl ConnectionCore {
             if !matches!(content_type, ContentType::ApplicationData) && fragment.len() > (1 << 14) {
                 return Err(Error::RecordOverflow);
             }
-            let fragment = fragment.to_vec();
-            self.inbuf.drain(..len);
+            let frag_start = self.in_off + 5;
+            let frag_end = frag_start + fragment.len();
+            self.in_off += len;
 
             // RFC 8446 §5.1: "Handshake messages MUST NOT be interleaved
             // with other record types. That is, if a handshake message is
@@ -568,105 +580,129 @@ impl ConnectionCore {
                 return Err(Error::UnexpectedMessage);
             }
 
-            match content_type {
-                ContentType::ChangeCipherSpec => {
-                    // RFC 8446 §5: must be exactly `[0x01]`, and only inside
-                    // the middlebox-compat window. Reject anything else as
-                    // `unexpected_message`.
-                    if !self.ccs_window_open || fragment.as_slice() != [0x01] {
-                        return Err(Error::UnexpectedMessage);
-                    }
-                    continue;
-                }
-                ContentType::ApplicationData if self.read.is_some() => {
-                    match self.decrypt(&fragment) {
-                        Ok((inner_ct, content)) => {
-                            // A record that deprotects ends the RFC 8446
-                            // §4.2.10 skip window: we have reached the
-                            // client's real flight under the handshake key.
-                            self.skip_early_data = None;
-                            // RFC 8449 §4: the negotiated limit counts the
-                            // whole TLSInnerPlaintext — content, the type
-                            // byte and any padding — i.e. the ciphertext
-                            // minus the AEAD tag. Receipt of a larger record
-                            // "MUST be treated as a fatal error" with
-                            // `record_overflow`.
-                            if let Some(limit) = self.inbound_record_size_limit
-                                && fragment.len().saturating_sub(AEAD_TAG_LEN) > usize::from(limit)
-                            {
-                                return Err(Error::RecordOverflow);
-                            }
-                            if let Some(msg) = self.dispatch_inner(inner_ct, content)? {
-                                return Ok(Some(msg));
-                            }
-                        }
-                        Err(Error::BadRecordMac) if self.skip_early_data.is_some() => {
-                            // RFC 8446 §4.2.10: a server that rejects early
-                            // data skips past it, discarding records that
-                            // fail to deprotect under the handshake key.
-                            // `decrypt` peeks the nonce, so the read sequence
-                            // number has NOT advanced — the next record is
-                            // tried at the same seq, which is exactly what
-                            // the client's real flight expects.
-                            let budget = self.skip_early_data.take().expect("armed");
-                            match budget.checked_sub(fragment.len()) {
-                                Some(rest) => self.skip_early_data = Some(rest),
-                                // Budget exhausted: this really is a bad
-                                // record, not skipped early data.
-                                None => return Err(Error::BadRecordMac),
-                            }
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                ContentType::ApplicationData if self.skip_early_data.is_some() => {
-                    // No read key at all, yet a protected record arrived and
-                    // the skip window is armed: the server answered a 0-RTT
-                    // ClientHello with a HelloRetryRequest and the client's
-                    // early-data records were already in flight (RFC 8446
-                    // §4.2.10 / §4.1.4). They can never be deprotected — no
-                    // early-traffic key was ever installed — so discard
-                    // them against the same byte budget the post-CH2 skip
-                    // uses; exhausting it is a real protocol violation.
-                    let budget = self.skip_early_data.take().expect("armed");
-                    match budget.checked_sub(fragment.len()) {
-                        Some(rest) => self.skip_early_data = Some(rest),
-                        None => return Err(Error::UnexpectedMessage),
-                    }
-                }
-                ContentType::Handshake => {
-                    // RFC 8446 §5: once read keys are installed, every
-                    // record except CCS (in the middlebox-compat window)
-                    // MUST be `application_data` (ciphertext). A plaintext
-                    // Handshake record at this point is an injection
-                    // attempt — refuse rather than feed it into the
-                    // reassembly buffer.
-                    if self.read.is_some() {
-                        return Err(Error::UnexpectedMessage);
-                    }
-                    // RFC 8446 §5.1: zero-length handshake fragments MUST
-                    // NOT be sent. Same treatment as the protected case in
-                    // `dispatch_inner` (§5.4): `unexpected_message`.
-                    if fragment.is_empty() {
-                        return Err(Error::UnexpectedMessage);
-                    }
-                    self.append_handshake_bytes(&fragment)?;
-                }
-                ContentType::Alert => {
-                    // Same rule as Handshake above: plaintext Alert after
-                    // read keys are active is forbidden (RFC 8446 §5).
-                    if self.read.is_some() {
-                        return Err(Error::UnexpectedMessage);
-                    }
-                    return Ok(Some(parse_alert(&fragment)?));
-                }
-                _ => return Err(Error::UnexpectedMessage),
+            // The fragment is processed (and, if protected, decrypted) in
+            // place. `inbuf` is moved out for the call so the record can be
+            // borrowed mutably alongside `self`; nothing below reads it.
+            let mut inbuf = core::mem::take(&mut self.inbuf);
+            let r = self.process_record(content_type, &mut inbuf[frag_start..frag_end]);
+            self.inbuf = inbuf;
+            if self.in_off == self.inbuf.len() {
+                self.inbuf.clear();
+                self.in_off = 0;
+            }
+            if let Some(msg) = r? {
+                return Ok(Some(msg));
             }
         }
     }
 
-    /// Decrypts a protected record into `(inner content type, content)`.
-    fn decrypt(&mut self, fragment: &[u8]) -> Result<(ContentType, Vec<u8>), Error> {
+    /// Handles one record read by [`Self::next_message`]: `Ok(None)` when
+    /// it yields no message and the next record should be read.
+    fn process_record(
+        &mut self,
+        content_type: ContentType,
+        fragment: &mut [u8],
+    ) -> Result<Option<Incoming>, Error> {
+        match content_type {
+            ContentType::ChangeCipherSpec => {
+                // RFC 8446 §5: must be exactly `[0x01]`, and only inside
+                // the middlebox-compat window. Reject anything else as
+                // `unexpected_message`.
+                if !self.ccs_window_open || *fragment != [0x01] {
+                    return Err(Error::UnexpectedMessage);
+                }
+                return Ok(None);
+            }
+            ContentType::ApplicationData if self.read.is_some() => {
+                match self.decrypt(fragment) {
+                    Ok((inner_ct, end)) => {
+                        // A record that deprotects ends the RFC 8446
+                        // §4.2.10 skip window: we have reached the
+                        // client's real flight under the handshake key.
+                        self.skip_early_data = None;
+                        // RFC 8449 §4: the negotiated limit counts the
+                        // whole TLSInnerPlaintext — content, the type
+                        // byte and any padding — i.e. the ciphertext
+                        // minus the AEAD tag. Receipt of a larger record
+                        // "MUST be treated as a fatal error" with
+                        // `record_overflow`.
+                        if let Some(limit) = self.inbound_record_size_limit
+                            && fragment.len().saturating_sub(AEAD_TAG_LEN) > usize::from(limit)
+                        {
+                            return Err(Error::RecordOverflow);
+                        }
+                        if let Some(msg) = self.dispatch_inner(inner_ct, &fragment[..end])? {
+                            return Ok(Some(msg));
+                        }
+                    }
+                    Err(Error::BadRecordMac) if self.skip_early_data.is_some() => {
+                        // RFC 8446 §4.2.10: a server that rejects early
+                        // data skips past it, discarding records that
+                        // fail to deprotect under the handshake key.
+                        // `decrypt` peeks the nonce, so the read sequence
+                        // number has NOT advanced — the next record is
+                        // tried at the same seq, which is exactly what
+                        // the client's real flight expects.
+                        let budget = self.skip_early_data.take().expect("armed");
+                        match budget.checked_sub(fragment.len()) {
+                            Some(rest) => self.skip_early_data = Some(rest),
+                            // Budget exhausted: this really is a bad
+                            // record, not skipped early data.
+                            None => return Err(Error::BadRecordMac),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            ContentType::ApplicationData if self.skip_early_data.is_some() => {
+                // No read key at all, yet a protected record arrived and
+                // the skip window is armed: the server answered a 0-RTT
+                // ClientHello with a HelloRetryRequest and the client's
+                // early-data records were already in flight (RFC 8446
+                // §4.2.10 / §4.1.4). They can never be deprotected — no
+                // early-traffic key was ever installed — so discard
+                // them against the same byte budget the post-CH2 skip
+                // uses; exhausting it is a real protocol violation.
+                let budget = self.skip_early_data.take().expect("armed");
+                match budget.checked_sub(fragment.len()) {
+                    Some(rest) => self.skip_early_data = Some(rest),
+                    None => return Err(Error::UnexpectedMessage),
+                }
+            }
+            ContentType::Handshake => {
+                // RFC 8446 §5: once read keys are installed, every
+                // record except CCS (in the middlebox-compat window)
+                // MUST be `application_data` (ciphertext). A plaintext
+                // Handshake record at this point is an injection
+                // attempt — refuse rather than feed it into the
+                // reassembly buffer.
+                if self.read.is_some() {
+                    return Err(Error::UnexpectedMessage);
+                }
+                // RFC 8446 §5.1: zero-length handshake fragments MUST
+                // NOT be sent. Same treatment as the protected case in
+                // `dispatch_inner` (§5.4): `unexpected_message`.
+                if fragment.is_empty() {
+                    return Err(Error::UnexpectedMessage);
+                }
+                self.append_handshake_bytes(fragment)?;
+            }
+            ContentType::Alert => {
+                // Same rule as Handshake above: plaintext Alert after
+                // read keys are active is forbidden (RFC 8446 §5).
+                if self.read.is_some() {
+                    return Err(Error::UnexpectedMessage);
+                }
+                return Ok(Some(parse_alert(fragment)?));
+            }
+            _ => return Err(Error::UnexpectedMessage),
+        }
+        Ok(None)
+    }
+
+    /// Decrypts a protected record in place into `(inner content type,
+    /// content length)`; the content is `fragment[..len]`.
+    fn decrypt(&mut self, fragment: &mut [u8]) -> Result<(ContentType, usize), Error> {
         // The AAD is the wire header of the ciphertext record.
         let mut header = [0u8; 5];
         header[0] = ContentType::ApplicationData.as_u8();
@@ -674,7 +710,7 @@ impl ConnectionCore {
         header[2] = 0x03;
         header[3..5].copy_from_slice(&(fragment.len() as u16).to_be_bytes());
         let crypter = self.read.as_mut().expect("read keys present");
-        crypter.decrypt(&header, fragment)
+        crypter.decrypt_in_place(&header, fragment)
     }
 
     /// Routes the plaintext recovered from a protected record. RFC 8446 §5.4
@@ -683,7 +719,7 @@ impl ConnectionCore {
     fn dispatch_inner(
         &mut self,
         inner_ct: ContentType,
-        content: Vec<u8>,
+        content: &[u8],
     ) -> Result<Option<Incoming>, Error> {
         // RFC 8446 §5.1 interleaving rule, for protected records (see the
         // plaintext check in `next_message`): while a handshake message is
@@ -698,7 +734,7 @@ impl ConnectionCore {
                 if content.is_empty() {
                     return Err(Error::UnexpectedMessage);
                 }
-                self.append_handshake_bytes(&content)?;
+                self.append_handshake_bytes(content)?;
                 Ok(None)
             }
             ContentType::ApplicationData => {
@@ -706,9 +742,9 @@ impl ConnectionCore {
                 if self.early_data_routing {
                     // Replayable 0-RTT bytes: quarantine away from `app_in`
                     // so `take_received` never mixes them with 1-RTT data.
-                    self.early_in.extend_from_slice(&content);
+                    self.early_in.extend_from_slice(content);
                 } else if self.app_data_allowed {
-                    self.app_in.extend_from_slice(&content);
+                    self.app_in.extend_from_slice(content);
                 }
                 // Otherwise the handshake has not completed: the peer is not
                 // yet authenticated, so the plaintext is dropped rather than
@@ -721,7 +757,7 @@ impl ConnectionCore {
                 if content.is_empty() {
                     return Err(Error::UnexpectedMessage);
                 }
-                Ok(Some(parse_alert(&content)?))
+                Ok(Some(parse_alert(content)?))
             }
             _ => Err(Error::UnexpectedMessage),
         }
