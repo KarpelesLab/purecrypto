@@ -37,11 +37,25 @@ impl Point {
     }
 }
 
+/// Which specialised Renes–Costello–Batina formulas the coefficient `a`
+/// admits. Public curve data: the choice is fixed per curve.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ACoeff {
+    /// `a = 0` (secp256k1, the Koblitz curves): Algorithms 7 / 9.
+    Zero,
+    /// `a = −3` (NIST, SM2, the SEC 2 `r` curves): Algorithms 4 / 6.
+    MinusThree,
+    /// Anything else (Brainpool): the general Algorithms 1 / 3.
+    General,
+}
+
 /// A prime-order short-Weierstrass curve `y² = x³ + a·x + b (mod p)` with a
 /// fixed generator and group order, ready for constant-time arithmetic.
 pub(crate) struct Curve {
     fp: BoxedMontModulus,
+    a_kind: ACoeff,
     a_mont: BoxedUint,
+    b_mont: BoxedUint,
     b3_mont: BoxedUint,
     a_plain: BoxedUint,
     b_plain: BoxedUint,
@@ -71,8 +85,17 @@ impl Curve {
         let b3 = fp.add_mod(&fp.add_mod(&b, &b), &b); // 3b mod p
         let one = BoxedUint::from_u64(1);
         let fq = BoxedMontModulus::new(&n);
+        let a_kind = if a.is_zero() {
+            ACoeff::Zero
+        } else if a == p.sub(&BoxedUint::from_u64(3)) {
+            ACoeff::MinusThree
+        } else {
+            ACoeff::General
+        };
         Curve {
             fq,
+            a_kind,
+            b_mont: fp.to_mont(&b),
             n_minus_2: n.sub(&BoxedUint::from_u64(2)),
             a_mont: fp.to_mont(&a),
             b3_mont: fp.to_mont(&b3),
@@ -248,9 +271,265 @@ impl Curve {
         Some(r)
     }
 
-    /// Complete projective addition (Renes–Costello–Batina, Algorithm 1).
-    /// Correct for all inputs and any `a`.
+    /// Complete projective addition `p + q`, correct for all inputs
+    /// (including `p == q` and the identity), through the cheapest
+    /// Renes–Costello–Batina formula the curve's `a` admits. Every branch is
+    /// straight-line field arithmetic; which one runs depends only on the
+    /// (public) curve.
     pub(crate) fn point_add(&self, p: &Point, q: &Point) -> Point {
+        match self.a_kind {
+            ACoeff::MinusThree => self.add_a_minus_3(p, q),
+            ACoeff::Zero => self.add_a_zero(p, q),
+            ACoeff::General => self.add_general(p, q),
+        }
+    }
+
+    /// Complete projective doubling `2·p`, correct for all inputs including
+    /// the identity: RCB Algorithm 6 (`a = −3`, 8M + 3S + 2·m_b),
+    /// 9 (`a = 0`, 6M + 2S + m_3b) or 3 (any `a`), against the 12M + 5·m_a,b
+    /// of `point_add(p, p)`.
+    fn double(&self, p: &Point) -> Point {
+        match self.a_kind {
+            ACoeff::MinusThree => self.double_a_minus_3(p),
+            ACoeff::Zero => self.double_a_zero(p),
+            ACoeff::General => self.double_general(p),
+        }
+    }
+
+    /// RCB Algorithm 4: complete addition for `a = −3`.
+    fn add_a_minus_3(&self, p: &Point, q: &Point) -> Point {
+        let b = &self.b_mont;
+        let m = |x: &BoxedUint, y: &BoxedUint| self.fp.mont_mul(x, y);
+        let add = |x: &BoxedUint, y: &BoxedUint| self.fp.add_mod(x, y);
+        let sub = |x: &BoxedUint, y: &BoxedUint| self.fp.sub_mod(x, y);
+
+        let t0 = m(&p.x, &q.x);
+        let t1 = m(&p.y, &q.y);
+        let t2 = m(&p.z, &q.z);
+        let t3 = add(&p.x, &p.y);
+        let t4 = add(&q.x, &q.y);
+        let t3 = m(&t3, &t4);
+        let t4 = add(&t0, &t1);
+        let t3 = sub(&t3, &t4);
+        let t4 = add(&p.y, &p.z);
+        let x3 = add(&q.y, &q.z);
+        let t4 = m(&t4, &x3);
+        let x3 = add(&t1, &t2);
+        let t4 = sub(&t4, &x3);
+        let x3 = add(&p.x, &p.z);
+        let y3 = add(&q.x, &q.z);
+        let x3 = m(&x3, &y3);
+        let y3 = add(&t0, &t2);
+        let y3 = sub(&x3, &y3);
+        let z3 = m(b, &t2);
+        let x3 = sub(&y3, &z3);
+        let z3 = add(&x3, &x3);
+        let x3 = add(&x3, &z3);
+        let z3 = sub(&t1, &x3);
+        let x3 = add(&t1, &x3);
+        let y3 = m(b, &y3);
+        let t1 = add(&t2, &t2);
+        let t2 = add(&t1, &t2);
+        let y3 = sub(&y3, &t2);
+        let y3 = sub(&y3, &t0);
+        let t1 = add(&y3, &y3);
+        let y3 = add(&t1, &y3);
+        let t1 = add(&t0, &t0);
+        let t0 = add(&t1, &t0);
+        let t0 = sub(&t0, &t2);
+        let t1 = m(&t4, &y3);
+        let t2 = m(&t0, &y3);
+        let y3 = m(&x3, &z3);
+        let y3 = add(&y3, &t2);
+        let x3 = m(&t3, &x3);
+        let x3 = sub(&x3, &t1);
+        let z3 = m(&t4, &z3);
+        let t1 = m(&t3, &t0);
+        let z3 = add(&z3, &t1);
+        Point {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// RCB Algorithm 7: complete addition for `a = 0`.
+    fn add_a_zero(&self, p: &Point, q: &Point) -> Point {
+        let b3 = &self.b3_mont;
+        let m = |x: &BoxedUint, y: &BoxedUint| self.fp.mont_mul(x, y);
+        let add = |x: &BoxedUint, y: &BoxedUint| self.fp.add_mod(x, y);
+        let sub = |x: &BoxedUint, y: &BoxedUint| self.fp.sub_mod(x, y);
+
+        let t0 = m(&p.x, &q.x);
+        let t1 = m(&p.y, &q.y);
+        let t2 = m(&p.z, &q.z);
+        let t3 = add(&p.x, &p.y);
+        let t4 = add(&q.x, &q.y);
+        let t3 = m(&t3, &t4);
+        let t4 = add(&t0, &t1);
+        let t3 = sub(&t3, &t4);
+        let t4 = add(&p.y, &p.z);
+        let x3 = add(&q.y, &q.z);
+        let t4 = m(&t4, &x3);
+        let x3 = add(&t1, &t2);
+        let t4 = sub(&t4, &x3);
+        let x3 = add(&p.x, &p.z);
+        let y3 = add(&q.x, &q.z);
+        let x3 = m(&x3, &y3);
+        let y3 = add(&t0, &t2);
+        let y3 = sub(&x3, &y3);
+        let x3 = add(&t0, &t0);
+        let t0 = add(&x3, &t0);
+        let t2 = m(b3, &t2);
+        let z3 = add(&t1, &t2);
+        let t1 = sub(&t1, &t2);
+        let y3 = m(b3, &y3);
+        let x3 = m(&t4, &y3);
+        let t2 = m(&t3, &t1);
+        let x3 = sub(&t2, &x3);
+        let y3 = m(&y3, &t0);
+        let t1 = m(&t1, &z3);
+        let y3 = add(&t1, &y3);
+        let t0 = m(&t0, &t3);
+        let z3 = m(&z3, &t4);
+        let z3 = add(&z3, &t0);
+        Point {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// RCB Algorithm 6: complete doubling for `a = −3`.
+    fn double_a_minus_3(&self, p: &Point) -> Point {
+        let b = &self.b_mont;
+        let m = |x: &BoxedUint, y: &BoxedUint| self.fp.mont_mul(x, y);
+        let add = |x: &BoxedUint, y: &BoxedUint| self.fp.add_mod(x, y);
+        let sub = |x: &BoxedUint, y: &BoxedUint| self.fp.sub_mod(x, y);
+
+        let t0 = m(&p.x, &p.x);
+        let t1 = m(&p.y, &p.y);
+        let t2 = m(&p.z, &p.z);
+        let t3 = m(&p.x, &p.y);
+        let t3 = add(&t3, &t3);
+        let z3 = m(&p.x, &p.z);
+        let z3 = add(&z3, &z3);
+        let y3 = m(b, &t2);
+        let y3 = sub(&y3, &z3);
+        let x3 = add(&y3, &y3);
+        let y3 = add(&x3, &y3);
+        let x3 = sub(&t1, &y3);
+        let y3 = add(&t1, &y3);
+        let y3 = m(&x3, &y3);
+        let x3 = m(&x3, &t3);
+        let t3 = add(&t2, &t2);
+        let t2 = add(&t2, &t3);
+        let z3 = m(b, &z3);
+        let z3 = sub(&z3, &t2);
+        let z3 = sub(&z3, &t0);
+        let t3 = add(&z3, &z3);
+        let z3 = add(&z3, &t3);
+        let t3 = add(&t0, &t0);
+        let t0 = add(&t3, &t0);
+        let t0 = sub(&t0, &t2);
+        let t0 = m(&t0, &z3);
+        let y3 = add(&y3, &t0);
+        let t0 = m(&p.y, &p.z);
+        let t0 = add(&t0, &t0);
+        let z3 = m(&t0, &z3);
+        let x3 = sub(&x3, &z3);
+        let z3 = m(&t0, &t1);
+        let z3 = add(&z3, &z3);
+        let z3 = add(&z3, &z3);
+        Point {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// RCB Algorithm 9: complete doubling for `a = 0`.
+    fn double_a_zero(&self, p: &Point) -> Point {
+        let b3 = &self.b3_mont;
+        let m = |x: &BoxedUint, y: &BoxedUint| self.fp.mont_mul(x, y);
+        let add = |x: &BoxedUint, y: &BoxedUint| self.fp.add_mod(x, y);
+        let sub = |x: &BoxedUint, y: &BoxedUint| self.fp.sub_mod(x, y);
+
+        let t0 = m(&p.y, &p.y);
+        let z3 = add(&t0, &t0);
+        let z3 = add(&z3, &z3);
+        let z3 = add(&z3, &z3);
+        let t1 = m(&p.y, &p.z);
+        let t2 = m(&p.z, &p.z);
+        let t2 = m(b3, &t2);
+        let x3 = m(&t2, &z3);
+        let y3 = add(&t0, &t2);
+        let z3 = m(&t1, &z3);
+        let t1 = add(&t2, &t2);
+        let t2 = add(&t1, &t2);
+        let t0 = sub(&t0, &t2);
+        let y3 = m(&t0, &y3);
+        let y3 = add(&x3, &y3);
+        let t1 = m(&p.x, &p.y);
+        let x3 = m(&t0, &t1);
+        let x3 = add(&x3, &x3);
+        Point {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// RCB Algorithm 3: complete doubling for any `a`.
+    fn double_general(&self, p: &Point) -> Point {
+        let a = &self.a_mont;
+        let b3 = &self.b3_mont;
+        let m = |x: &BoxedUint, y: &BoxedUint| self.fp.mont_mul(x, y);
+        let add = |x: &BoxedUint, y: &BoxedUint| self.fp.add_mod(x, y);
+        let sub = |x: &BoxedUint, y: &BoxedUint| self.fp.sub_mod(x, y);
+
+        let t0 = m(&p.x, &p.x);
+        let t1 = m(&p.y, &p.y);
+        let t2 = m(&p.z, &p.z);
+        let t3 = m(&p.x, &p.y);
+        let t3 = add(&t3, &t3);
+        let z3 = m(&p.x, &p.z);
+        let z3 = add(&z3, &z3);
+        let x3 = m(a, &z3);
+        let y3 = m(b3, &t2);
+        let y3 = add(&x3, &y3);
+        let x3 = sub(&t1, &y3);
+        let y3 = add(&t1, &y3);
+        let y3 = m(&x3, &y3);
+        let x3 = m(&t3, &x3);
+        let z3 = m(b3, &z3);
+        let t2 = m(a, &t2);
+        let t3 = sub(&t0, &t2);
+        let t3 = m(a, &t3);
+        let t3 = add(&t3, &z3);
+        let z3 = add(&t0, &t0);
+        let t0 = add(&z3, &t0);
+        let t0 = add(&t0, &t2);
+        let t0 = m(&t0, &t3);
+        let y3 = add(&y3, &t0);
+        let t2 = m(&p.y, &p.z);
+        let t2 = add(&t2, &t2);
+        let t0 = m(&t2, &t3);
+        let x3 = sub(&x3, &t0);
+        let z3 = m(&t2, &t1);
+        let z3 = add(&z3, &z3);
+        let z3 = add(&z3, &z3);
+        Point {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// Complete projective addition (Renes–Costello–Batina, Algorithm 1).
+    /// Correct for all inputs and any `a`; also the tests' oracle for the
+    /// specialised formulas.
+    fn add_general(&self, p: &Point, q: &Point) -> Point {
         let a = &self.a_mont;
         let b3 = &self.b3_mont;
         let m = |x: &BoxedUint, y: &BoxedUint| self.fp.mont_mul(x, y);
@@ -303,10 +582,6 @@ impl Curve {
             y: y3,
             z: z3,
         }
-    }
-
-    fn double(&self, p: &Point) -> Point {
-        self.point_add(p, p)
     }
 
     /// Constant-time `scalar * point` over a fixed number of bits (the
@@ -399,5 +674,104 @@ impl Curve {
     pub(crate) fn in_field(&self, v: &BoxedUint) -> bool {
         // `v` is a public coordinate, so the variable-time compare is fine.
         v.lt(&self.fp.modulus())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ec::curves::CurveId;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// A random non-zero field element in Montgomery form.
+    fn rand_fe(c: &Curve, st: &mut u64) -> BoxedUint {
+        loop {
+            let limbs = (0..c.fp.limbs()).map(|_| splitmix64(st)).collect();
+            let v = BoxedUint::from_limbs(limbs).reduce(&c.field_modulus());
+            if !v.is_zero() {
+                return c.fp.to_mont(&v);
+            }
+        }
+    }
+
+    /// The same point under a random projective scaling `(λX : λY : λZ)`.
+    fn rescale(c: &Curve, p: &Point, st: &mut u64) -> Point {
+        let l = rand_fe(c, st);
+        Point {
+            x: c.fp.mont_mul(&p.x, &l),
+            y: c.fp.mont_mul(&p.y, &l),
+            z: c.fp.mont_mul(&p.z, &l),
+        }
+    }
+
+    fn neg(c: &Curve, p: &Point) -> Point {
+        Point {
+            x: p.x.clone(),
+            y: c.fp.sub_mod(&BoxedUint::zero(1), &p.y),
+            z: p.z.clone(),
+        }
+    }
+
+    /// The specialised RCB formulas (Algorithms 3/4/6/7/9) against the
+    /// general complete addition (Algorithm 1), on every curve: identity,
+    /// equal, opposite and unrelated points, each under random projective
+    /// representatives.
+    #[test]
+    fn coefficient_classes() {
+        for (id, kind) in [
+            (CurveId::P256, ACoeff::MinusThree),
+            (CurveId::P384, ACoeff::MinusThree),
+            (CurveId::P521, ACoeff::MinusThree),
+            (CurveId::Sm2p256v1, ACoeff::MinusThree),
+            (CurveId::Secp256k1, ACoeff::Zero),
+            (CurveId::BrainpoolP256r1, ACoeff::General),
+        ] {
+            assert_eq!(id.curve().a_kind, kind, "{id:?}");
+        }
+    }
+
+    #[test]
+    // `CurveRef` is a plain reference only with `std`; without it the
+    // borrow is needed.
+    #[allow(clippy::needless_borrow)]
+    fn specialised_formulas_match_general_addition() {
+        let mut st = 0xadd5_u64;
+        for &id in CurveId::ALL {
+            let c: &Curve = &id.curve();
+            let g = c.generator();
+            let mut pts = vec![c.identity(), g.clone()];
+            let mut acc = g.clone();
+            for _ in 0..6 {
+                acc = c.add_general(&c.add_general(&acc, &acc), &g);
+                pts.push(rescale(c, &acc, &mut st));
+            }
+            let negs: Vec<Point> = pts.iter().map(|p| neg(c, p)).collect();
+            pts.extend(negs);
+            let aff = |p: &Point| c.to_affine(p);
+            for p in &pts {
+                assert_eq!(
+                    aff(&c.double(p)),
+                    aff(&c.add_general(p, p)),
+                    "{id:?} double"
+                );
+                for q in &pts {
+                    let q = rescale(c, q, &mut st);
+                    assert_eq!(
+                        aff(&c.point_add(p, &q)),
+                        aff(&c.add_general(p, &q)),
+                        "{id:?} add"
+                    );
+                }
+            }
+        }
     }
 }
