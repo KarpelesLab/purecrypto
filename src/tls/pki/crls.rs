@@ -18,21 +18,27 @@
 //! plumbed; the design space is left open for a future `policy.require_crl`
 //! field.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::tls::Error;
 use crate::x509::CertificateRevocationList;
 
 /// A set of CRLs against which peer certificate chains may be checked.
+///
+/// Cloning a store is cheap: the CRLs are shared behind a reference count
+/// and copied only when a shared store is added to.
 #[derive(Clone, Default)]
 pub struct CrlStore {
-    crls: Vec<CertificateRevocationList>,
+    crls: Arc<Vec<CertificateRevocationList>>,
 }
 
 impl CrlStore {
     /// An empty store.
     pub fn new() -> Self {
-        CrlStore { crls: Vec::new() }
+        CrlStore {
+            crls: Arc::new(Vec::new()),
+        }
     }
 
     /// Adds a CRL from its DER encoding. The CRL's signature is **not**
@@ -47,7 +53,7 @@ impl CrlStore {
         // Cheap sanity: issuer must parse and entries must decode.
         crl.issuer().map_err(|_| Error::BadCertificate)?;
         crl.entries().map_err(|_| Error::BadCertificate)?;
-        self.crls.push(crl);
+        Arc::make_mut(&mut self.crls).push(crl);
         Ok(())
     }
 
@@ -87,12 +93,20 @@ impl CrlStore {
     /// CRL from `other`. Used to unite the connection-config CRLs with
     /// per-connection stapled CRLs at verify time.
     pub(crate) fn merged_with(&self, other: &CrlStore) -> CrlStore {
-        let mut out = CrlStore {
-            crls: Vec::with_capacity(self.crls.len() + other.crls.len()),
-        };
-        out.crls.extend(self.crls.iter().cloned());
-        out.crls.extend(other.crls.iter().cloned());
-        out
+        // The common cases share rather than copy: no stapled CRLs, or no
+        // configured ones.
+        if other.crls.is_empty() {
+            return self.clone();
+        }
+        if self.crls.is_empty() {
+            return other.clone();
+        }
+        let mut crls = Vec::with_capacity(self.crls.len() + other.crls.len());
+        crls.extend(self.crls.iter().cloned());
+        crls.extend(other.crls.iter().cloned());
+        CrlStore {
+            crls: Arc::new(crls),
+        }
     }
 }
 

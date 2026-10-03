@@ -2,6 +2,7 @@
 
 use crate::tls::Error;
 use crate::x509::{AnyPublicKey, Certificate, NameConstraints};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// A trust anchor: a root certificate's subject name (raw DER), its public
@@ -64,16 +65,21 @@ pub(crate) struct TrustAnchor {
 /// the same way constraints declared by in-chain intermediate CAs are. See
 /// [`RootCertStore::add_der`] for the handling of constraint forms the
 /// validator cannot evaluate.
+///
+/// Cloning a store is cheap: the anchors are shared behind a reference
+/// count (every connection built from a [`crate::tls::Config`] takes its own
+/// copy of the store, and a full embedded root bundle is hundreds of parsed
+/// keys and names), and are copied only when a shared store is added to.
 #[derive(Clone, Default)]
 pub struct RootCertStore {
-    anchors: Vec<TrustAnchor>,
+    anchors: Arc<Vec<TrustAnchor>>,
 }
 
 impl RootCertStore {
     /// An empty store.
     pub fn new() -> Self {
         RootCertStore {
-            anchors: Vec::new(),
+            anchors: Arc::new(Vec::new()),
         }
     }
 
@@ -120,7 +126,7 @@ impl RootCertStore {
         let extended_key_usages = cert
             .extended_key_usages()
             .map_err(|_| Error::BadCertificate)?;
-        self.anchors.push(TrustAnchor {
+        Arc::make_mut(&mut self.anchors).push(TrustAnchor {
             subject_der,
             key,
             spki_der,
@@ -244,7 +250,7 @@ mod embedded_roots_tests {
     #[test]
     fn embedded_roots_carry_no_blocking_self_constraints() {
         let store = RootCertStore::with_embedded_roots();
-        for anchor in &store.anchors {
+        for anchor in store.anchors.iter() {
             assert!(
                 anchor.extended_key_usages.is_empty(),
                 "an embedded root declares an EKU; revisit RFC 5937 enforcement"
