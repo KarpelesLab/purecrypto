@@ -161,8 +161,64 @@ impl Scalar {
     /// `0` when `self` is `0`.
     pub fn invert(&self) -> Scalar {
         // n is prime, so a^(n-2) is the inverse.
-        let n_minus_2 = Self::ORDER.wrapping_sub(&Fe::from_u64(2));
-        Scalar(Self::MODULUS.pow(&self.0, &n_minus_2))
+        Scalar(Self::pow_public_exp(
+            &self.0,
+            &Self::ORDER.wrapping_sub(&Fe::from_u64(2)),
+        ))
+    }
+
+    /// `a^e mod n` for a **public** exponent `e`, by a width-5 sliding window
+    /// in the Montgomery domain: the 16 odd powers `a, a³, …, a³¹` are built
+    /// once, then every exponent bit costs a squaring and every window (an
+    /// odd run of at most five bits) one multiplication by the power it names
+    /// — ~255 squarings and ~60 multiplications for `n − 2`, against the
+    /// generic exponent-oblivious window's 256 + 78 plus a 16-entry masked
+    /// gather per nibble.
+    ///
+    /// Constant time in `a`: every branch and table index is a function of
+    /// the exponent alone, and the only caller passes the public `n − 2`.
+    fn pow_public_exp(a: &Fe, e: &Fe) -> Fe {
+        let m = &Self::MODULUS;
+        let bit = |i: usize| (e.as_limbs()[i / 64] >> (i % 64)) & 1;
+        let base = m.to_mont(a);
+        let sq = m.mont_sqr(&base);
+        // odd[k] = a^(2k + 1), Montgomery form.
+        let mut odd = [base; 16];
+        for k in 1..16 {
+            odd[k] = m.mont_mul(&odd[k - 1], &sq);
+        }
+        let mut acc = m.to_mont(&Fe::ONE);
+        let mut started = false;
+        let mut i = 256;
+        while i > 0 {
+            if bit(i - 1) == 0 {
+                if started {
+                    acc = m.mont_sqr(&acc);
+                }
+                i -= 1;
+                continue;
+            }
+            // Window e[j..i): at most five bits, ending on a set bit j.
+            let mut j = i.saturating_sub(5);
+            while bit(j) == 0 {
+                j += 1;
+            }
+            let mut val = 0usize;
+            for k in (j..i).rev() {
+                val = (val << 1) | bit(k) as usize;
+                if started {
+                    acc = m.mont_sqr(&acc);
+                }
+            }
+            acc = if started {
+                m.mont_mul(&acc, &odd[val >> 1])
+            } else {
+                odd[val >> 1]
+            };
+            started = true;
+            i = j;
+        }
+        m.from_mont(&acc)
     }
 
     /// Returns a [`Choice`] that is true iff this scalar is `0`.

@@ -343,6 +343,51 @@ fn xonly_tweak_add_bip341_vector() {
     assert_eq!(x, expected);
 }
 
+/// The sliding-window `Scalar::invert` against the generic Montgomery `pow`
+/// it replaced, and against the defining property, on edge values and a
+/// pseudo-random sweep; plus the public-exponent pow on assorted exponents.
+#[test]
+fn scalar_invert_matches_generic_pow() {
+    let n = Scalar::ORDER;
+    let n_minus_2 = n.wrapping_sub(&Fe::from_u64(2));
+    let mut x = 0x1A7E_0001u64;
+    let mut rnd = || {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut cases = [Fe::ZERO; 300];
+    cases[1] = Fe::ONE;
+    cases[2] = Fe::from_u64(2);
+    cases[3] = n.wrapping_sub(&Fe::ONE);
+    cases[4] = n.shr1();
+    for c in &mut cases[5..] {
+        *c = Fe::from_limbs([rnd(), rnd(), rnd(), rnd()]).reduce(&n);
+    }
+    let exps = [
+        n_minus_2,
+        Fe::ZERO,
+        Fe::ONE,
+        Fe::from_u64(31),
+        Fe::from_u64(32),
+        Fe::from_limbs([u64::MAX; 4]),
+        Fe::from_limbs([0, 0, 0, 1 << 63]),
+        Fe::from_limbs([rnd(), rnd(), rnd(), rnd()]),
+    ];
+    for a in &cases {
+        let inv = Scalar(*a).invert();
+        assert_eq!(inv.0, Scalar::MODULUS.pow(a, &n_minus_2), "a={a:x?}");
+        if !bool::from(a.is_zero()) {
+            assert!(bool::from(inv.mul(&Scalar(*a)).ct_eq(&Scalar::ONE)));
+        }
+        for e in &exps {
+            assert_eq!(Scalar::pow_public_exp(a, e), Scalar::MODULUS.pow(a, e));
+        }
+    }
+}
+
 /// Re-derives every entry of the embedded fixed-base table from the group law,
 /// so `SECP256K1_GEN_TABLE` is verified on every test run rather than trusted.
 /// Inversion-free: the stored affine `(x, y)` matches the computed projective
