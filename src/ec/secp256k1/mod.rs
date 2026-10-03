@@ -43,6 +43,7 @@ pub mod schnorr;
 pub mod ecdsa;
 mod field_backend;
 mod group;
+mod vartime;
 
 use crate::bignum::MontModulus;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
@@ -261,6 +262,32 @@ impl ProjectivePoint {
     /// Returns `scalar · G` (scalar times the generator).
     pub fn mul_generator(scalar: &Scalar) -> ProjectivePoint {
         Self::generator().mul(scalar)
+    }
+
+    /// **Variable-time** `a·p + b·q` (GLV split, then Straus over width-5
+    /// wNAF digits).
+    ///
+    /// # Warning — never call with secret inputs
+    /// Timing, branches and table indices all depend on the scalars, so this
+    /// is only for verification, where signature, digest, keys and proof are
+    /// public. Signing and every prover keep the constant-time [`mul`](Self::mul).
+    pub(crate) fn mul_double_vartime(
+        a: &Scalar,
+        p: &ProjectivePoint,
+        b: &Scalar,
+        q: &ProjectivePoint,
+    ) -> ProjectivePoint {
+        ProjectivePoint(vartime::multi_mul(&field(), [(a, &p.0), (b, &q.0)]))
+    }
+
+    /// **Variable-time** `a·G + b·q`; public inputs only, as
+    /// [`mul_double_vartime`](Self::mul_double_vartime).
+    pub(crate) fn mul_generator_double_vartime(
+        a: &Scalar,
+        b: &Scalar,
+        q: &ProjectivePoint,
+    ) -> ProjectivePoint {
+        Self::mul_double_vartime(a, &Self::generator(), b, q)
     }
 
     /// Constant-time point equality (different projective representatives of the

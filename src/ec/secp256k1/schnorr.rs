@@ -345,10 +345,10 @@ pub fn verify(pubkey_xonly: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> Result<(),
     // s = int(sig[32:64]); fail if s >= n.
     let s = Scalar::from_bytes_be(&s_bytes).map_err(|_| Error::Verification)?;
 
-    // R = s⋅G - e⋅P. Everything here is public, so no constant-time care is
-    // owed; the ladder is used simply because it is the available primitive.
+    // R = s⋅G - e⋅P. Everything here is public (key, message, signature),
+    // so the variable-time double multiplication is sound.
     let e = challenge(&r, pubkey_xonly, msg);
-    let big_r = ProjectivePoint::mul_generator(&s).add(&p.to_projective().mul(&e.negate()));
+    let big_r = ProjectivePoint::mul_generator_double_vartime(&s, &e.negate(), &p.to_projective());
 
     // Fail if is_infinite(R), if not has_even_y(R), or if x(R) != r.
     let r_aff = big_r.to_affine().ok_or(Error::Verification)?;

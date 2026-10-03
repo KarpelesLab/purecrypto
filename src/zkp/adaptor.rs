@@ -305,17 +305,15 @@ fn dleq_verify(
     let neg_b = b.negate();
     // A_G = c·G − b·X, A_Y = c·Y − b·Z. Both must be non-identity: the
     // challenge hash serialises them as compressed points, which the identity
-    // has no encoding for.
-    let a_g = ProjectivePoint::mul_generator(&c)
-        .add(&x.to_projective().mul(&neg_b))
+    // has no encoding for. Statement and proof are public, so the
+    // variable-time double multiplication applies.
+    let a_g = ProjectivePoint::mul_generator_double_vartime(&c, &neg_b, &x.to_projective())
         .to_affine()
         .ok_or(Error::Verification)?;
-    let a_y = y
-        .to_projective()
-        .mul(&c)
-        .add(&z.to_projective().mul(&neg_b))
-        .to_affine()
-        .ok_or(Error::Verification)?;
+    let a_y =
+        ProjectivePoint::mul_double_vartime(&c, &y.to_projective(), &neg_b, &z.to_projective())
+            .to_affine()
+            .ok_or(Error::Verification)?;
 
     let implied = dleq_challenge(x, y, z, &a_g, &a_y);
     // Declassified (Valgrind harness): a public verdict (an error return or
@@ -557,9 +555,8 @@ pub fn verify(
     let u1 = s_inv.mul(&m);
     let u2 = s_inv.mul(&r);
 
-    // Everything here is public, but the hazmat API only offers the
-    // constant-time ladder; using it costs a little speed and leaks nothing.
-    let lhs = ProjectivePoint::mul_generator(&u1).add(&x_point.to_projective().mul(&u2));
+    // Everything here is public, so the variable-time path applies.
+    let lhs = ProjectivePoint::mul_generator_double_vartime(&u1, &u2, &x_point.to_projective());
     // Declassified (Valgrind harness): a public verdict (an error return or
     // a rejected candidate).
     if lhs.ct_eq(&p.r_a.to_projective()).declassify() {

@@ -752,8 +752,8 @@ impl SurjectionProof {
             let es = Scalar::from_bytes_be_reduce(&e);
             // An `R` on infinity has no encoding to hash; a prover reaches it
             // only with a zero nonce, and the reference rejects such a proof.
-            r = ProjectivePoint::mul_generator(&s)
-                .add(&key.mul(&es))
+            // Proof and generators are public: variable time is sound.
+            r = ProjectivePoint::mul_generator_double_vartime(&s, &es, &key)
                 .to_affine()
                 .ok_or(Error::Verification)?
                 .to_sec1_compressed();

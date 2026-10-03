@@ -852,7 +852,8 @@ fn borromean_verify(
             let s =
                 Scalar::from_bytes_be(&parsed.scalar(start + j)).map_err(|_| Error::Malformed)?;
             let scalar = Scalar::from_bytes_be_reduce(&e);
-            let r = ProjectivePoint::mul_generator(&s).add(&parsed.member(i, j).mul(&scalar));
+            let r =
+                ProjectivePoint::mul_generator_double_vartime(&s, &scalar, &parsed.member(i, j));
             let affine = r.to_affine().ok_or(Error::Verification)?;
             let ser = affine.to_sec1_compressed();
             if j + 1 < layout.rsizes[i] {

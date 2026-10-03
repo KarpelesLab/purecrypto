@@ -509,9 +509,9 @@ pub fn verify(
         let s = Scalar::from_bytes_be(si).map_err(|_| Error::Verification)?;
         let es = Scalar::from_bytes_be_reduce(&e);
         // An `R` on infinity has no encoding to hash; a signer reaches it only
-        // with a zero nonce, and upstream rejects such a proof.
-        r = ProjectivePoint::mul_generator(&s)
-            .add(&ki.mul(&es))
+        // with a zero nonce, and upstream rejects such a proof. Proof and
+        // ring are public, so the variable-time path applies.
+        r = ProjectivePoint::mul_generator_double_vartime(&s, &es, ki)
             .to_affine()
             .ok_or(Error::Verification)?
             .to_sec1_compressed();

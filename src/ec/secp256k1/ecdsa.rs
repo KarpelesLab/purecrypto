@@ -25,9 +25,8 @@
 //! ladder, the constant-time Fermat inverse for `k⁻¹`, and non-short-circuit
 //! range checks; the nonce, its inverse, the HMAC-DRBG state and the copy of
 //! the private scalar are wiped before each call returns. Verification and
-//! recovery operate on public data only and reuse the same constant-time
-//! routines (there is no variable-time double-scalar multiplication on this
-//! curve yet, so they are simply slower than they could be, not less safe).
+//! recovery operate on public data only and use a variable-time Straus /
+//! wNAF double-scalar multiplication.
 //!
 //! # Malleability
 //!
@@ -343,13 +342,14 @@ impl Secp256k1EcdsaPublicKey {
         let z = Scalar(reduce_256(&bits2int(prehash), &n));
         let r = Scalar(sig.r);
         // `sig.s` is in [1, n-1] (checked above), so the Fermat inverse is
-        // exact. Everything here is public, so constant time is not needed
-        // but costs nothing in correctness.
+        // exact. Everything here is public (signature, digest, key), which is
+        // what licenses the variable-time double multiplication.
         let w = Scalar(sig.s).invert();
         let u1 = z.mul(&w);
         let u2 = r.mul(&w);
 
-        let sum = ProjectivePoint::mul_generator(&u1).add(&self.point().to_projective().mul(&u2));
+        let sum =
+            ProjectivePoint::mul_generator_double_vartime(&u1, &u2, &self.point().to_projective());
         let v = sum.to_affine().ok_or(Error::Verification)?;
         let vx = reduce_256(&v.x, &n);
         if bool::from(vx.ct_eq(&sig.r)) {
@@ -488,13 +488,13 @@ impl Secp256k1EcdsaSignature {
         rx.write_be_bytes(&mut enc[1..]);
         let r_point = AffinePoint::from_sec1(&enc).map_err(|_| Error::Verification)?;
 
-        // Q = u1·G + u2·R with u1 = −z·r⁻¹, u2 = s·r⁻¹ (mod n).
+        // Q = u1·G + u2·R with u1 = −z·r⁻¹, u2 = s·r⁻¹ (mod n). Signature
+        // and digest are public, so the variable-time path applies.
         let z = Scalar(reduce_256(&bits2int(prehash), &n));
         let r_inv = Scalar(self.r).invert();
         let u1 = z.negate().mul(&r_inv);
         let u2 = Scalar(self.s).mul(&r_inv);
-        let q = ProjectivePoint::mul_generator(&u1)
-            .add(&r_point.to_projective().mul(&u2))
+        let q = ProjectivePoint::mul_generator_double_vartime(&u1, &u2, &r_point.to_projective())
             .to_affine()
             .ok_or(Error::Verification)?;
         Ok(Secp256k1EcdsaPublicKey { x: q.x, y: q.y })
