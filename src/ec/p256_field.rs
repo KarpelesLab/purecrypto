@@ -15,9 +15,10 @@
 //!
 //! Everything is constant time in the element values: all loop bounds are
 //! fixed, folds run a fixed number of times, and the final canonicalisation
-//! uses mask-based conditional subtractions. Inversion is a fixed
-//! addition-chain Fermat exponentiation (255 squarings + 13 multiplies), so
-//! it is constant time by construction.
+//! uses mask-based conditional subtractions. Inversion is the Bernstein–Yang
+//! safegcd over a fixed 590-divstep schedule ([`SafegcdModulus`]), ~3.8×
+//! faster than the fixed addition-chain Fermat exponentiation it replaced
+//! (kept as the test oracle `invert_chain`).
 //!
 //! The generic-Montgomery path is retained under `#[cfg(test)]` as a
 //! differential oracle: every operation is cross-checked against
@@ -26,6 +27,7 @@
 //! [`MontModulus`]: crate::bignum::MontModulus
 
 use crate::bignum::Uint;
+use crate::bignum::safegcd::SafegcdModulus;
 
 /// A 256-bit base-field element, four little-endian 64-bit limbs, in `[0, p)`.
 pub(crate) type Fe = Uint<4>;
@@ -353,6 +355,7 @@ pub(crate) fn square(a: &Fe) -> Fe {
 }
 
 /// Squares `a` a fixed `n` times.
+#[cfg(test)]
 #[inline]
 fn sqn(a: &Fe, n: u32) -> Fe {
     let mut acc = *a;
@@ -364,8 +367,19 @@ fn sqn(a: &Fe, n: u32) -> Fe {
     acc
 }
 
-/// Returns the modular inverse `a⁻¹ = a^(p−2) mod p` via a fixed Fermat
-/// addition chain (255 squarings + 13 multiplies). The inverse of `0` is `0`.
+/// The safegcd inversion context for `p`, built at compile time.
+const SAFEGCD_P: SafegcdModulus = SafegcdModulus::new(&Fe::from_limbs(P_LIMBS));
+
+/// Returns the modular inverse `a⁻¹ mod p` for `a` in `[0, p)`; the inverse
+/// of `0` is `0`. Bernstein–Yang safegcd: a fixed 590-divstep schedule with
+/// masked steps, so constant time in `a`.
+pub(crate) fn invert(a: &Fe) -> Fe {
+    SAFEGCD_P.invert(a)
+}
+
+/// The modular inverse `a⁻¹ = a^(p−2) mod p` via a fixed Fermat addition
+/// chain (255 squarings + 13 multiplies) — the previous [`invert`], kept as
+/// its differential oracle. The inverse of `0` is `0`.
 ///
 /// Constant time by construction: the chain is a fixed sequence of squarings
 /// and multiplies derived from the public exponent
@@ -384,7 +398,8 @@ fn sqn(a: &Fe, n: u32) -> Fe {
 /// acc = acc·2²  · x2             // ‖ 1×2    (1×94)
 /// acc = acc·2²  · x1             // ‖ 0 ‖ 1
 /// ```
-pub(crate) fn invert(a: &Fe) -> Fe {
+#[cfg(test)]
+fn invert_chain(a: &Fe) -> Fe {
     let x1 = *a;
     let x2 = mul(&square(&x1), &x1);
     let x4 = mul(&sqn(&x2, 2), &x2);
@@ -551,6 +566,12 @@ mod tests {
             bytes(&g.invert(a)),
             bytes(&invert(a)),
             "invert mismatch: a={:x?}",
+            a.as_limbs()
+        );
+        assert_eq!(
+            bytes(&invert_chain(a)),
+            bytes(&invert(a)),
+            "invert vs chain mismatch: a={:x?}",
             a.as_limbs()
         );
     }

@@ -177,12 +177,11 @@ impl P256 {
 
     /// Converts a point to affine `(x, y)`, or `None` if it is the identity.
     ///
-    /// The inversion is the fixed-addition-chain Fermat exponentiation
-    /// `z^{p-2} mod p` ([`field::invert`]) — constant time by construction
-    /// (a fixed sequence of 255 squarings and 13 multiplies), NOT the
-    /// variable-time extended-Euclidean `inv_mod` — `z` is derived from the
-    /// secret scalar on every ECDH / ECDSA hot path and a timing leak here
-    /// would be exploitable.
+    /// The inversion is the fixed-schedule safegcd [`field::invert`] —
+    /// constant time by construction, NOT the variable-time
+    /// extended-Euclidean `inv_mod` — `z` is derived from the secret scalar
+    /// on every ECDH / ECDSA hot path and a timing leak here would be
+    /// exploitable.
     ///
     /// Whether the point is the identity is public in every caller: P-256
     /// has prime order, so `[k]P` is the identity iff `k ≡ 0 (mod n)` or `P`
