@@ -660,9 +660,12 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     }
 }
 
-/// ML-DSA.Verify_internal (FIPS 204 Algorithm 8).
+/// ML-DSA.Verify_internal (FIPS 204 Algorithm 8), with `tr = H(pk, 64)`
+/// supplied by the caller (the public-key types compute it once, at
+/// construction, rather than on every verification).
 pub(crate) fn verify_internal<const K: usize, const L: usize>(
     pk: &[u8],
+    tr: &[u8; 64],
     sig: &[u8],
     m_prime: &[&[u8]],
     p: &Params,
@@ -678,12 +681,10 @@ pub(crate) fn verify_internal<const K: usize, const L: usize>(
         off += POLY_T1;
     }
 
-    let mut tr = [0u8; 64];
-    shake256(&[pk], &mut tr);
     let mut mu = [0u8; 64];
     {
         let mut parts = [&[] as &[u8]; 4];
-        parts[0] = &tr;
+        parts[0] = tr;
         parts[1..1 + m_prime.len()].copy_from_slice(m_prime);
         shake256(&parts[..1 + m_prime.len()], &mut mu);
     }
@@ -858,8 +859,25 @@ macro_rules! ml_dsa_level {
         pub struct $sk([u8; $params.privkey], Option<[u8; SEED_SIZE]>);
 
         #[doc = concat!("An ", stringify!($kind), " public (verification) key.")]
-        #[derive(Clone, PartialEq, Eq, Debug)]
-        pub struct $pk([u8; $params.pubkey]);
+        #[derive(Clone)]
+        // Field 1 caches `tr = H(pk, 64)` (FIPS 204 Algorithm 8, line 6), a
+        // pure function of field 0, so verification does not rehash the whole
+        // key every time. Equality and `Debug` look at the encoding only.
+        pub struct $pk([u8; $params.pubkey], [u8; 64]);
+
+        impl PartialEq for $pk {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+
+        impl Eq for $pk {}
+
+        impl core::fmt::Debug for $pk {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.debug_tuple(stringify!($pk)).field(&self.0).finish()
+            }
+        }
 
         impl $sk {
             /// Deterministically derives a key pair from a 32-byte seed.
@@ -867,7 +885,10 @@ macro_rules! ml_dsa_level {
                 let mut pk = [0u8; $params.pubkey];
                 let mut sk = [0u8; $params.privkey];
                 keygen::<$k, $l>(seed, &$params, &mut pk, &mut sk);
-                ($sk(sk, Some(*seed)), $pk(pk))
+                // keygen just wrote tr = H(pk) into the secret key.
+                let mut tr = [0u8; 64];
+                tr.copy_from_slice(&sk[64..128]);
+                ($sk(sk, Some(*seed)), $pk(pk, tr))
             }
 
             /// Generates a fresh key pair from `rng`. The RNG must be a
@@ -924,7 +945,9 @@ macro_rules! ml_dsa_level {
             pub fn public_key(&self) -> $pk {
                 let mut pk = [0u8; $params.pubkey];
                 derive_public_from_sk::<$k, $l>(&self.0, &$params, &mut pk);
-                $pk(pk)
+                // Hashed afresh rather than copied from the secret key's tr:
+                // an imported key's tr is not checked against its (s1, s2).
+                $pk::from_array(pk)
             }
 
             /// The encoded private key.
@@ -1116,7 +1139,7 @@ macro_rules! ml_dsa_level {
                 }
                 {
                     let mut pfx = [0u8; 2];
-                    verify_internal::<$k, $l>(&self.0, sig, &m_prime_parts(&mut pfx, ctx, msg), &$params)
+                    verify_internal::<$k, $l>(&self.0, &self.1, sig, &m_prime_parts(&mut pfx, ctx, msg), &$params)
                 }
             }
 
@@ -1132,7 +1155,13 @@ macro_rules! ml_dsa_level {
                 }
                 let mut b = [0u8; $params.pubkey];
                 b.copy_from_slice(bytes);
-                Ok($pk(b))
+                Ok($pk::from_array(b))
+            }
+
+            fn from_array(pk: [u8; $params.pubkey]) -> Self {
+                let mut tr = [0u8; 64];
+                shake256(&[&pk], &mut tr);
+                $pk(pk, tr)
             }
 
             /// Encodes the key as a PKIX `SubjectPublicKeyInfo` DER structure
@@ -1277,7 +1306,9 @@ mod tests {
                     let msg = unhex(it.next().unwrap());
                     let sig = unhex(it.next().unwrap());
                     let want = it.next().unwrap() == "1";
-                    let got = verify_internal::<$k, $l>(&pk, &sig, &[&msg[..]], &$params);
+                    let mut tr = [0u8; 64];
+                    shake256(&[&pk], &mut tr);
+                    let got = verify_internal::<$k, $l>(&pk, &tr, &sig, &[&msg[..]], &$params);
                     assert_eq!(got, want, "verify");
                 }
             }
