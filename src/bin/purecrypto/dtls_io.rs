@@ -285,6 +285,13 @@ pub(crate) fn step(
         }
         Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Step::Quiet,
         Err(e) if e.kind() == ErrorKind::Interrupted => Step::Quiet,
+        // Windows reports an ICMP port-unreachable for an *earlier* send as
+        // WSAECONNRESET on the next recv, even on an unconnected socket —
+        // e.g. the reply that raced a client's rebind to its old, now
+        // closed port (RFC 9146). On an unconnected (addressed) link that
+        // says nothing about the current peer, so keep serving; only a
+        // connected link treats it as the peer being gone.
+        Err(e) if e.kind() == ErrorKind::ConnectionReset && link.peer.is_some() => Step::Quiet,
         Err(_) => Step::Gone,
     };
     tick(conn, clock);

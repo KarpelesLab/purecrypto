@@ -1151,6 +1151,12 @@ fn run_quic_server_loop(server: &mut QuicServer, sock: &UdpSocket, opts: &Server
             {
                 server.on_timeout();
             }
+            // Windows reports an ICMP port-unreachable for an earlier send
+            // (a client that has since exited, the readiness probe) as
+            // WSAECONNRESET on the next recv, even on this unconnected
+            // socket. It says nothing about the remaining clients: keep
+            // serving rather than shutting the whole server down.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
             Err(_) => break,
         }
         // Connections the router dropped since the last pass (idle timeout,
