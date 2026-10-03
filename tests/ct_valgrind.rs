@@ -91,6 +91,7 @@ use purecrypto::ec::ecdsa::EcdsaPrivateKey;
 use purecrypto::ec::ed448::Ed448PrivateKey;
 use purecrypto::ec::ed25519::Ed25519PrivateKey;
 use purecrypto::ec::ristretto255::{RistrettoPoint, Scalar as RistrettoScalar};
+use purecrypto::ec::secp256k1::ProjectivePoint as Secp256k1ProjectivePoint;
 use purecrypto::ec::secp256k1::Scalar as Secp256k1Scalar;
 use purecrypto::ec::secp256k1::schnorr;
 use purecrypto::ec::secp256k1_ecdsa::Secp256k1EcdsaPrivateKey;
@@ -768,6 +769,18 @@ fn secp256k1_ecdsa_sign_recoverable() -> String {
         .unwrap();
     let sig = sig.to_bytes();
     format!("sig={} recid={}", hex8(public(&sig)), public(&[recid])[0])
+}
+
+/// The safegcd inversions on tainted inputs: `Scalar::invert` (mod `n`)
+/// directly, and the base-field inverse (mod `p`) through `to_affine` of a
+/// secret multiple of `G`. The P-256 safegcd (both moduli) runs on secret
+/// data inside `p256_ecdsa_sign` (`k⁻¹`, and `to_affine` of `k·G`).
+fn secp256k1_safegcd_invert() -> String {
+    let k = Secp256k1Scalar::from_bytes_be_reduce(&secret_bytes::<32>(42));
+    let inv = k.invert().to_bytes_be();
+    let pt = Secp256k1ProjectivePoint::mul_generator(&k).double();
+    let x = pt.to_affine().expect("k != 0").x_bytes();
+    format!("inv={} x={}", hex8(public(&inv)), hex8(public(&x)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2334,6 +2347,7 @@ const CASES: &[Case] = &[
         "secp256k1_ecdsa_sign_recoverable",
         secp256k1_ecdsa_sign_recoverable,
     ),
+    ("secp256k1_safegcd_invert", secp256k1_safegcd_invert),
     ("p384_ecdsa_sign", p384_ecdsa_sign),
     ("p384_ecdh", p384_ecdh),
     ("sm2_sign", sm2_sign),
