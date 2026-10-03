@@ -162,32 +162,38 @@ pub fn scrypt(
 }
 
 /// ROMix(X, N, r) — the memory-hard core (RFC 7914 §4). `y` is a caller-owned
-/// `128·r`-byte BlockMix scratch buffer, reused across every BlockMix call.
+/// `128·r`-byte BlockMix scratch buffer. BlockMix writes its output into the
+/// other buffer, and the two swap roles after every call (ping-pong) instead
+/// of copying the result back. There are `2N` calls, an even number, so the
+/// result ends up back in `x`.
 fn romix(x: &mut [u8], n: usize, r: usize, v: &mut [u8], y: &mut [u8]) {
     let block_size = 128 * r;
+    let (mut cur, mut next) = (x, y);
 
     // V_i = X^{(i)} for i = 0..N
     for i in 0..n {
-        v[i * block_size..(i + 1) * block_size].copy_from_slice(x);
-        block_mix(x, r, y);
+        v[i * block_size..(i + 1) * block_size].copy_from_slice(cur);
+        block_mix(cur, r, next);
+        core::mem::swap(&mut cur, &mut next);
     }
 
     // Second loop: data-dependent indexing.
     for _ in 0..n {
-        let j = integerify(x, r) % n as u64;
+        let j = integerify(cur, r) % n as u64;
         let j_off = j as usize * block_size;
         for k in 0..block_size {
-            x[k] ^= v[j_off + k];
+            cur[k] ^= v[j_off + k];
         }
-        block_mix(x, r, y);
+        block_mix(cur, r, next);
+        core::mem::swap(&mut cur, &mut next);
     }
 }
 
 /// BlockMix(B, r) — applies Salsa20/8 sequentially over `2r` 64-byte sub-blocks
-/// and reorders the result (RFC 7914 §3). `y` is a `128·r`-byte scratch buffer
-/// supplied by the caller (fully overwritten here, so its prior contents are
-/// irrelevant).
-fn block_mix(b: &mut [u8], r: usize, y: &mut [u8]) {
+/// of `b` and writes them, reordered, into `out` (RFC 7914 §3): `Y_i` lands at
+/// position `i/2` for even `i` and `r + i/2` for odd `i`. `out` is fully
+/// overwritten.
+fn block_mix(b: &[u8], r: usize, out: &mut [u8]) {
     let two_r = 2 * r;
     // X = B_{2r-1}.
     let mut x = [0u8; 64];
@@ -199,13 +205,8 @@ fn block_mix(b: &mut [u8], r: usize, y: &mut [u8]) {
             x[k] ^= b[i * 64 + k];
         }
         salsa20_8(&mut x);
-        y[i * 64..(i + 1) * 64].copy_from_slice(&x);
-    }
-
-    // Reorder: Y_0, Y_2, ..., Y_{2r-2}, Y_1, Y_3, ..., Y_{2r-1}.
-    for i in 0..r {
-        b[i * 64..(i + 1) * 64].copy_from_slice(&y[(2 * i) * 64..(2 * i + 1) * 64]);
-        b[(r + i) * 64..(r + i + 1) * 64].copy_from_slice(&y[(2 * i + 1) * 64..(2 * i + 2) * 64]);
+        let pos = i / 2 + (i % 2) * r;
+        out[pos * 64..(pos + 1) * 64].copy_from_slice(&x);
     }
 }
 
