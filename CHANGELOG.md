@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.9](https://github.com/KarpelesLab/purecrypto/compare/v0.9.8...v0.9.9) - 2026-10-03
+
+### Fixed
+
+- *(quic)* box the packet AEAD so QuicConnection fits a 1 MiB stack
+- *(cli)* keep UDP servers alive across Windows' stray WSAECONNRESET
+- *(bignum)* gate is_prime_boxed to its DSA / DH / test callers
+- *(ct)* three Valgrind findings from today's performance landings
+- *(interop)* retry a fixed-port peer server whose IPv4 bind collided
+- *(secp256k1)* declassify the published R and s before signing branches on them
+
+### Other
+
+- cancel superseded runs when a newer commit is pushed
+- *(zkp)* Scalar::invert is now the constant-time safegcd, not Fermat
+- *(ct)* Valgrind case for the secp256k1 safegcd inversions
+- *(p256)* safegcd base-field inversion
+- *(p256)* safegcd scalar inversion for ECDSA
+- *(secp256k1)* safegcd base-field inversion
+- *(secp256k1)* constant-time safegcd scalar inversion
+- *(tls)* key the legacy CBC record HMAC once per direction
+- *(dtls)* build DTLS 1.3 protected records in place
+- *(tls)* locate the padding's last nonzero byte once, after the word scan
+- *(x509)* validate names without decoding them when walking extensions
+- *(hpke)* key the context AEAD once, not on every Seal / Open
+- *(tls)* scan the inner-plaintext padding eight bytes at a time
+- *(tls)* parse TLS 1.3 records at a read cursor and protect them in place
+- *(quic)* bulk-copy stream bytes and prune ACKed chunks by offset
+- *(quic)* open packets in place and borrow the receive keys
+- *(tls)* share RootCertStore and CrlStore contents behind an Arc
+- *(dtls)* key the DTLS 1.3 sequence-number cipher once per epoch
+- *(quic)* key the packet AEAD once per key, not once per packet
+- *(ct)* cover the new symmetric fast paths in the Valgrind harness
+- *(scrypt)* ping-pong the BlockMix buffers instead of copying back
+- *(argon2)* read G's inputs in place, generate addresses on demand
+- *(umac)* pre-convert the L1 key to words, hash chunks in place
+- *(fpe)* hoist FF1's constant CBC-MAC prefix, batch the S extension
+- *(kbkdf)* clone a keyed CMAC template per PRF block
+- *(siv)* cache the keyed CMAC and D0, stream the final S2V block
+- *(blake2)* store the SIGMA schedule as u8
+- *(pbkdf2)* iterate HMAC on bare compressions for SHA-1/SHA-2
+- *(aes-arm)* InvMixColumns the decryption schedule once per batch
+- *(ccm)* generate the CTR keystream with the shared windowed loop
+- *(xts)* XEX a window of blocks through the batched cipher
+- *(cbc)* decrypt a window of blocks through decrypt_blocks
+- *(gcm-siv)* hardware POLYVAL via the GHASH kernel, batched key derivation
+- *(keccak)* squeeze whole lanes and absorb blocks straight from input
+- *(rng)* key HMAC once per K in HMAC-DRBG
+- *(aes)* run the key schedule's SubWord on the AES instruction
+- *(aes)* bitsliced Boyar-Peralta S-box and word-level software rounds
+- *(secp256k1)* check ECDSA x(R) mod n == r projectively
+- *(secp256k1)* sliding-window scalar inversion over the public n - 2
+- *(secp256k1)* opt-in precomputed comb table for [k]G (secp256k1-table)
+- *(bls)* share one Miller loop across multi_pairing's pairs
+- *(bls)* fixed-window powering for the public field exponents
+- *(zkp)* back the Pedersen field with the native secp256k1 backend
+- *(zkp)* walk rangeproof ring members by addition, not a ladder each
+- *(secp256k1)* variable-time GLV + Straus double multiplication for verifiers
+- *(secp256k1)* multiply by b3 = 21 with a single-limb product
+- *(secp256k1)* fixed addition chains for field inversion and sqrt
+- *(secp256k1)* one masked correction per field op, dedicated squaring
+- *(xmss)* cap the signer's subtree cache at a 4 MiB top tier
+- *(falcon)* store only the non-redundant half of each FFT spectrum
+- *(falcon)* pin the signature bytes for a deterministic key and stream
+- *(xmss)* build the RAND_HASH PRF midstate once per tree walk
+- *(falcon)* build the signing target once, outside the resampling loop
+- *(mlkem)* cache H(ek) in the encapsulation key
+- *(mldsa)* cache tr = H(pk) in the public key
+- *(mldsa)* compute c·s2 once per signing attempt
+- *(falcon)* compute s2·h in verification with an NTT mod q
+- *(rsa)* key the blinder HMAC once per private operation
+- *(bignum)* one-sided in-place constant-time binary xgcd
+- *(bignum)* sieve trial-division primes once per keygen, MR squarings in Montgomery form
+- *(rsa,dsa)* fold the blinder inverse into a joint exponentiation
+- *(dh)* skip the y^q consistency check for the RFC 3526 groups
+- *(dh,dsa)* size secret-exponent ladders to the exponent's public bound
+- *(bignum)* variable-time public-exponent ladder, bounded and joint CT ladders
+- *(bignum)* Montgomery wide reduction and allocation-free long division
+- *(bignum)* compute Montgomery R² by squarings instead of 2k doublings
+- *(sm2)* derive the signer's public key once, read G's coordinates directly
+- *(ec)* variable-time wNAF double-scalar multiplication for verification
+- *(ec)* gather the scalar-multiplication window entry without per-entry allocations
+- *(ec)* dedicated complete doubling and a-specialised addition formulas
+- *(ec)* replace bit-serial reductions with a CT compare / one subtraction
+- *(ec)* route runtime-curve P-256 and secp256k1 to the fixed backends
+- *(ec)* cache the runtime curve contexts and the order Montgomery context
+- *(x448)* multiply by A24 without a Montgomery multiplication
+- *(p256)* decode the curve coefficient b at compile time
+- *(ristretto255)* decode the RFC 9496 constants at compile time
+- *(x25519)* derive public keys through the edwards25519 comb
+- *(ed25519, ed448)* derive the public key once per private key
+- *(ed448)* variable-time Straus double-scalar multiplication for verify
+- *(ed448)* 4-bit fixed-window constant-time scalar multiplication
+- *(ed448)* precompute the base point at compile time
+- *(ed448)* fixed addition chains for inversion and square roots
+- *(ed448)* square Z once in point doubling
+- *(slhdsa)* absorb the SHA-2 PK.seed block once per operation
+- *(ecdsa)* reduce 256-bit values mod n with one masked subtraction
+- *(ecdsa)* build the P-256 order Montgomery context at compile time
+- *(ed448)* Barrett scalar reduction and a compile-time field context
+- *(ed25519)* constant-time Barrett reduction modulo L
+
 ## [0.9.8](https://github.com/KarpelesLab/purecrypto/compare/v0.9.7...v0.9.8) - 2026-10-03
 
 ### Other
