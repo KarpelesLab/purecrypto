@@ -17,7 +17,7 @@ use super::cmac::Cmac;
 use super::ctr::Ctr;
 use super::{AeadError, Aes128, Aes192, Aes256, TagMismatch};
 use crate::ct::ConstantTimeEq;
-use crate::zeroize::{Zeroize, Zeroizing};
+use crate::zeroize::Zeroize;
 
 /// Doubles a 128-bit value in GF(2¹²⁸) per RFC 5297 §2.3 (same field and
 /// big-endian convention as CMAC's `dbl`).
@@ -44,10 +44,12 @@ fn xorend(a: &mut [u8], b: &[u8]) {
 
 /// The three block-cipher choices SIV is instantiated over, sharing the same
 /// S2V / CTR logic via dynamic dispatch on the (already public) key length.
+/// `mac` is a keyed CMAC template (subkeys already derived), cloned per S2V
+/// component instead of re-running `E_K(0)` and the subkey doublings.
 enum Cipher {
-    Aes128 { mac: Aes128, ctr: Aes128 },
-    Aes192 { mac: Aes192, ctr: Aes192 },
-    Aes256 { mac: Aes256, ctr: Aes256 },
+    Aes128 { mac: Cmac<Aes128>, ctr: Aes128 },
+    Aes192 { mac: Cmac<Aes192>, ctr: Aes192 },
+    Aes256 { mac: Cmac<Aes256>, ctr: Aes256 },
 }
 
 /// AES-SIV context (RFC 5297). Built from a double-length key with
@@ -55,6 +57,8 @@ enum Cipher {
 /// authenticated encryption.
 pub struct AesSiv {
     cipher: Cipher,
+    /// `D₀ = AES-CMAC(K1, 0¹²⁸)`, the key-only start of every S2V chain.
+    d0: [u8; 16],
 }
 
 impl AesSiv {
@@ -79,47 +83,47 @@ impl AesSiv {
             32 => {
                 let (k1, k2) = key.split_at(16);
                 Cipher::Aes128 {
-                    mac: Aes128::new(k1.try_into().unwrap()),
+                    mac: Cmac::new(Aes128::new(k1.try_into().unwrap())),
                     ctr: Aes128::new(k2.try_into().unwrap()),
                 }
             }
             48 => {
                 let (k1, k2) = key.split_at(24);
                 Cipher::Aes192 {
-                    mac: Aes192::new(k1.try_into().unwrap()),
+                    mac: Cmac::new(Aes192::new(k1.try_into().unwrap())),
                     ctr: Aes192::new(k2.try_into().unwrap()),
                 }
             }
             64 => {
                 let (k1, k2) = key.split_at(32);
                 Cipher::Aes256 {
-                    mac: Aes256::new(k1.try_into().unwrap()),
+                    mac: Cmac::new(Aes256::new(k1.try_into().unwrap())),
                     ctr: Aes256::new(k2.try_into().unwrap()),
                 }
             }
             _ => return Err(AeadError::InvalidKeyLength),
         };
-        Ok(AesSiv { cipher })
+        let mut siv = AesSiv {
+            cipher,
+            d0: [0u8; 16],
+        };
+        siv.d0 = siv.cmac(&[&[0u8; 16]]);
+        Ok(siv)
     }
 
-    /// CMAC of `data` under the S2V key half.
-    fn cmac(&self, data: &[u8]) -> [u8; 16] {
+    /// CMAC of the concatenation of `parts` under the S2V key half.
+    fn cmac(&self, parts: &[&[u8]]) -> [u8; 16] {
+        fn run<C: super::BlockCipher + Clone>(mac: &Cmac<C>, parts: &[&[u8]]) -> [u8; 16] {
+            let mut c = mac.clone();
+            for p in parts {
+                c.update(p);
+            }
+            c.finalize()
+        }
         match &self.cipher {
-            Cipher::Aes128 { mac, .. } => {
-                let mut c = Cmac::new(mac.clone());
-                c.update(data);
-                c.finalize()
-            }
-            Cipher::Aes192 { mac, .. } => {
-                let mut c = Cmac::new(mac.clone());
-                c.update(data);
-                c.finalize()
-            }
-            Cipher::Aes256 { mac, .. } => {
-                let mut c = Cmac::new(mac.clone());
-                c.update(data);
-                c.finalize()
-            }
+            Cipher::Aes128 { mac, .. } => run(mac, parts),
+            Cipher::Aes192 { mac, .. } => run(mac, parts),
+            Cipher::Aes256 { mac, .. } => run(mac, parts),
         }
     }
 
@@ -138,13 +142,13 @@ impl AesSiv {
             ad.len() <= Self::MAX_ASSOCIATED_DATA,
             "AES-SIV: at most 126 associated-data components (RFC 5297 §2.4)"
         );
-        // D = AES-CMAC(K, <zero>) where <zero> is one zero block.
-        let mut d = self.cmac(&[0u8; 16]);
+        // D = AES-CMAC(K, <zero>) where <zero> is one zero block (cached).
+        let mut d = self.d0;
 
         for s in ad {
             // D = dbl(D) xor AES-CMAC(K, Si)
             d = dbl(d);
-            let mut cs = self.cmac(s);
+            let mut cs = self.cmac(&[s]);
             for i in 0..16 {
                 d[i] ^= cs[i];
             }
@@ -153,11 +157,15 @@ impl AesSiv {
 
         // Final string Sn = plaintext.
         let v = if plaintext.len() >= 16 {
-            // T = Sn xorend D, then V = AES-CMAC(K, T). `t` is a copy of the
-            // plaintext, so it is wiped when the guard drops.
-            let mut t = Zeroizing::new(plaintext.to_vec());
-            xorend(&mut t, &d);
-            self.cmac(&t)
+            // T = Sn xorend D, then V = AES-CMAC(K, T): CMAC streams over
+            // the untouched head of Sn and then its last block XOR D, so no
+            // copy of the plaintext is made.
+            let (head, tail) = plaintext.split_at(plaintext.len() - 16);
+            let mut last: [u8; 16] = tail.try_into().expect("16-byte tail");
+            xorend(&mut last, &d);
+            let v = self.cmac(&[head, &last]);
+            last.zeroize();
+            v
         } else {
             // T = dbl(D) xor pad(Sn); V = AES-CMAC(K, T).
             let mut t = dbl(d);
@@ -165,7 +173,7 @@ impl AesSiv {
                 t[i] ^= *b;
             }
             t[plaintext.len()] ^= 0x80;
-            let v = self.cmac(&t);
+            let v = self.cmac(&[&t]);
             t.zeroize();
             v
         };
@@ -289,9 +297,13 @@ impl AesSiv {
     }
 }
 
-// Key material is held only inside the AES halves, which zeroize their own
-// round keys on drop (see `cipher/aes/mod.rs`), so `AesSiv` needs no extra
-// `Drop` of its own.
+// The AES halves and the CMAC template wipe their own key material on drop;
+// the cached `D₀` is CMAC output under the S2V key, so wipe it here.
+impl Drop for AesSiv {
+    fn drop(&mut self) {
+        self.d0.zeroize();
+    }
+}
 
 #[cfg(test)]
 mod tests {
