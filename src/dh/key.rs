@@ -184,7 +184,7 @@ impl DhPrivateKey {
     /// Computes the public value `y = g^x mod p` to send to the peer.
     pub fn public_key(&self) -> DhPublicKey {
         let m = BoxedMontModulus::new(self.group.p());
-        let y = m.pow(self.group.g(), &self.x);
+        let y = m.pow_bits(self.group.g(), &self.x, self.exp_bits());
         DhPublicKey {
             group: self.group.clone(),
             y,
@@ -258,7 +258,7 @@ impl DhPrivateKey {
             return Err(Error::InvalidPublicKey);
         }
 
-        let z = m.pow(&peer.y, &self.x);
+        let z = m.pow_bits(&peer.y, &self.x, self.exp_bits());
 
         // Contributory-failure rejection: z != 0 and z != 1. Use ct_eq for
         // consistency with the rest of the codebase even though z is no
@@ -277,6 +277,16 @@ impl DhPrivateKey {
     /// The group this key lives on.
     pub fn group(&self) -> &DhGroup {
         &self.group
+    }
+
+    /// Public bound on the bit length of `x` for the exponentiation ladder:
+    /// its storage width. That is fixed by how the key was made — `priv_bits`
+    /// rounded up to a limb by [`generate`](Self::generate), the input length
+    /// for [`from_bytes`](Self::from_bytes) — never by the value, so a
+    /// 256-bit exponent on group14 runs a 256-bit ladder instead of being
+    /// padded to the 2048-bit width of `p`.
+    fn exp_bits(&self) -> usize {
+        64 * self.x.limbs()
     }
 
     /// The raw private scalar as big-endian bytes, left-padded to the

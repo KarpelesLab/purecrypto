@@ -602,7 +602,12 @@ impl DsaPrivateKey {
 
     /// The public key `y = g^x mod p` (constant-time in `x`).
     pub fn public_key(&self) -> DsaPublicKey {
-        let y = BoxedMontModulus::new(&self.params.p).pow(&self.params.g, &self.x);
+        // `x < q`, so `q`'s (public) width bounds the ladder instead of `p`'s.
+        let y = BoxedMontModulus::new(&self.params.p).pow_bits(
+            &self.params.g,
+            &self.x,
+            self.params.q.bit_len(),
+        );
         DsaPublicKey {
             params: self.params.clone(),
             y,
@@ -620,8 +625,8 @@ impl DsaPrivateKey {
     /// the leftmost `N` bits when wider than `q` (FIPS 186-4 §4.6).
     ///
     /// # Constant time
-    /// `g^k mod p` uses the constant-time [`BoxedMontModulus::pow`] (a
-    /// fixed-window ladder padded to the width of `p`), `k⁻¹ mod q` the
+    /// `g^k mod p` uses the constant-time [`BoxedMontModulus::pow_bits`] (a
+    /// fixed-window ladder over the public width of `q`), `k⁻¹ mod q` the
     /// constant-time binary extended GCD, and `x·r`, `z + x·r`, `k⁻¹·(…)`
     /// the Montgomery `mul_mod`/`add_mod`. The `r = 0` / `s = 0` retry is
     /// public (it reveals nothing beyond the fact that the DRBG's first
@@ -640,7 +645,8 @@ impl DsaPrivateKey {
         let mut drbg = Rfc6979::<D>::new(&self.x, prehash, q, self.params.q_len(), qbits);
         loop {
             let mut k = drbg.next_k();
-            let r = fq.reduce(&fp.pow(g, &k));
+            // `1 ≤ k < q`: a ladder over `q`'s width, not `p`'s.
+            let r = fq.reduce(&fp.pow_bits(g, &k, qbits));
             // Declassified (Valgrind harness): `r` is the first half of the
             // signature (its `r = 0` check is a public retry).
             crate::ct::declassify_val(r.as_limbs());
