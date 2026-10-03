@@ -31,6 +31,7 @@
 //! All other QUIC state (PN spaces, packet framing, frame codec, …) lives
 //! in sibling modules. This module is sans-I/O and side-effect-free.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::cipher::{Aes128, Aes256, BlockCipher, ChaCha20, ChaCha20Poly1305, Gcm};
@@ -146,8 +147,11 @@ impl PacketAead {
 pub(crate) struct DirKeys {
     pub(crate) alg: AeadAlg,
     /// The AEAD keyed with the derived `quic key`; the raw key bytes are
-    /// not retained.
-    pub(crate) aead: PacketAead,
+    /// not retained. Boxed: the expanded cipher is ~400 bytes and a
+    /// connection holds a `DirKeys` per level, direction and key phase, so
+    /// inline it grew `QuicConnection` past what a 1 MiB main-thread stack
+    /// (Windows' default) survives in an unoptimised build.
+    pub(crate) aead: Box<PacketAead>,
     /// The raw AEAD key, kept only in test and `__ct-check` builds so the
     /// RFC 9001 Appendix A vectors and the Valgrind hooks can read it.
     #[cfg(any(test, feature = "__ct-check"))]
@@ -584,7 +588,7 @@ pub(crate) fn derive_dir_keys_preserve_hp(
         }
     };
 
-    let aead = PacketAead::new(alg, &key);
+    let aead = Box::new(PacketAead::new(alg, &key));
     #[cfg(not(any(test, feature = "__ct-check")))]
     crate::kdf::wipe(&mut key);
     DirKeys {
@@ -645,7 +649,7 @@ pub(crate) fn aead_seal(
     plaintext_in_place: &mut [u8],
 ) -> [u8; 16] {
     let nonce = nonce_for(&keys.iv, packet_number);
-    match &keys.aead {
+    match &*keys.aead {
         PacketAead::Aes128(g) => g.encrypt(&nonce, aad, plaintext_in_place),
         PacketAead::Aes256(g) => g.encrypt(&nonce, aad, plaintext_in_place),
         PacketAead::ChaCha20Poly1305(c) => c.encrypt(&nonce, aad, plaintext_in_place),
@@ -667,7 +671,7 @@ pub(crate) fn aead_open(
     tag: &[u8; 16],
 ) -> Result<(), Error> {
     let nonce = nonce_for(&keys.iv, packet_number);
-    let ok = match &keys.aead {
+    let ok = match &*keys.aead {
         PacketAead::Aes128(g) => g.decrypt(&nonce, aad, ciphertext_in_place, tag).is_ok(),
         PacketAead::Aes256(g) => g.decrypt(&nonce, aad, ciphertext_in_place, tag).is_ok(),
         PacketAead::ChaCha20Poly1305(c) => c.decrypt(&nonce, aad, ciphertext_in_place, tag).is_ok(),
