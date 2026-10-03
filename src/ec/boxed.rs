@@ -323,7 +323,7 @@ mod fixed {
     /// RFC 6979 P-256 signing returning `(r, s, x_overflow, y_is_odd)`, as
     /// `BoxedEcdsaPrivateKey::sign_prehash_inner` does. The constant-time
     /// discipline is that of [`crate::ec::ecdsa::EcdsaPrivateKey::sign_prehash`]
-    /// (fixed-window `k·G`, Fermat `k⁻¹`, single exit wiping the nonce).
+    /// (fixed-window `k·G`, safegcd `k⁻¹`, single exit wiping the nonce).
     pub(super) fn p256_sign<D: Digest>(
         d: &BoxedUint,
         prehash: &[u8],
@@ -344,7 +344,7 @@ mod fixed {
                 } else {
                     let x_overflow = !bool::from(x.ct_lt(&n));
                     let y_is_odd = bool::from(y.is_odd());
-                    let mut k_inv = fq.inv_prime(&k);
+                    let mut k_inv = P256::invert_scalar(&k);
                     let mut z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &d));
                     let s = fq.mul_mod(&k_inv, &z_rd);
                     k_inv.zeroize();
@@ -384,7 +384,7 @@ mod fixed {
         let fq = P256::order_modulus();
         let (r, s) = (to_fe(r), to_fe(s));
         let z = reduce_256(&bits2int(prehash), &n);
-        let w = fq.inv_prime(&s);
+        let w = P256::invert_scalar(&s);
         let (u1, u2) = (fq.mul_mod(&z, &w), fq.mul_mod(&r, &w));
         match p256_double_mul(&u1, &u2, &to_fe(x), &to_fe(y)) {
             Some((vx, _)) => bool::from(reduce_256(&vx, &n).ct_eq(&r)),
@@ -404,7 +404,7 @@ mod fixed {
         let n = P256::order();
         let fq = P256::order_modulus();
         let z = reduce_256(&bits2int(prehash), &n);
-        let r_inv = fq.inv_prime(&to_fe(r));
+        let r_inv = P256::invert_scalar(&to_fe(r));
         let u1 = fq.mul_mod(&fq.sub_mod(&Fe::ZERO, &z), &r_inv);
         let u2 = fq.mul_mod(&to_fe(s), &r_inv);
         let (x, y) = p256_double_mul(&u1, &u2, &to_fe(rx), &to_fe(ry))?;

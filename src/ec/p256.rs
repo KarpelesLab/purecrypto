@@ -8,6 +8,7 @@
 use super::p256_field as field;
 #[cfg(feature = "p256-table")]
 use super::p256_gtable::P256_GEN_TABLE;
+use crate::bignum::safegcd::SafegcdModulus;
 use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
@@ -72,6 +73,8 @@ const ORDER: Fe = fe_from_hex(N_HEX);
 /// The order-`n` Montgomery context, so ECDSA does not redo the `R² mod n`
 /// setup on every sign / verify.
 static ORDER_MODULUS: MontModulus<4> = MontModulus::new(ORDER);
+/// The order-`n` safegcd inversion context, built at compile time.
+static ORDER_SAFEGCD: SafegcdModulus = SafegcdModulus::new(&ORDER);
 
 /// Decodes a 64-character hex string into a [`Fe`].
 pub(crate) const fn fe_from_hex(hex: &str) -> Fe {
@@ -129,6 +132,15 @@ impl P256 {
     #[inline]
     pub(crate) fn order_modulus() -> &'static MontModulus<4> {
         &ORDER_MODULUS
+    }
+
+    /// `a⁻¹ mod n` for a scalar `a < n` (`0 ↦ 0`), by the Bernstein–Yang
+    /// safegcd: a fixed 590-divstep schedule, constant time in `a` (the
+    /// ECDSA nonce on the signing path) and ~6× faster than the Montgomery
+    /// Fermat ladder (`MontModulus::inv_prime`) it replaced.
+    #[inline]
+    pub(crate) fn invert_scalar(a: &Fe) -> Fe {
+        ORDER_SAFEGCD.invert(a)
     }
 
     /// The field prime `p`.

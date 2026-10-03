@@ -135,15 +135,13 @@ impl EcdsaPrivateKey {
                     // s = k^-1 (z + r*d) mod n.
                     //
                     // The nonce `k` is secret, so the inversion MUST be
-                    // constant time. We use Fermat's little theorem
-                    // (`k^{n-2} mod n`, where `n` is the prime order of the
-                    // base point) via the constant-time Montgomery ladder,
-                    // NOT the variable-time extended-Euclidean `inv_mod` —
-                    // leaking `k` through timing would let an attacker recover
-                    // the long-term key `d = (s·k − z)·r^{-1} mod n`
-                    // (Brumley–Tuveri, "Remote Timing Attacks Are Still
-                    // Practical").
-                    let mut k_inv = fq.inv_prime(&k);
+                    // constant time. We use the fixed-schedule safegcd
+                    // ([`P256::invert_scalar`]), NOT the variable-time
+                    // extended-Euclidean `inv_mod` — leaking `k` through
+                    // timing would let an attacker recover the long-term key
+                    // `d = (s·k − z)·r^{-1} mod n` (Brumley–Tuveri, "Remote
+                    // Timing Attacks Are Still Practical").
+                    let mut k_inv = P256::invert_scalar(&k);
                     let mut z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
                     let s = fq.mul_mod(&k_inv, &z_rd);
                     k_inv.zeroize();
@@ -229,10 +227,10 @@ impl EcdsaPublicKey {
         }
 
         let z = reduce_256(&bits2int(prehash), &n);
-        // Public-side inversion: `sig.s` is in [1, n-1] (checked above), so
-        // Fermat works and is consistent with the constant-time discipline
-        // used elsewhere (no leakage matters here, since `sig.s` is public).
-        let w = fq.inv_prime(&sig.s);
+        // Public-side inversion: `sig.s` is in [1, n-1] (checked above). The
+        // constant-time safegcd is used here too (no leakage matters, since
+        // `sig.s` is public).
+        let w = P256::invert_scalar(&sig.s);
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
 
