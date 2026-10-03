@@ -7,7 +7,7 @@
 //! the formulas are complete (no exceptional cases). Scalar multiplication is a
 //! constant-time double-and-add. This is the shared point backend behind Ed448.
 
-use super::field::{BASE_ENC, Fe, Field};
+use super::field::{Fe, Field};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 
 /// A curve point in extended homogeneous coordinates `(X:Y:Z:T)`, all in
@@ -21,9 +21,10 @@ pub(crate) struct Point {
 }
 
 impl Field {
-    /// The base point `B`, decompressed from its standard encoding.
+    /// The base point `B` (precomputed at compile time).
+    #[inline]
     pub(crate) fn base(&self) -> Point {
-        self.decode(&BASE_ENC).expect("valid base point")
+        self.base_point
     }
 
     /// Decompresses a 57-byte point encoding (RFC 8032 §5.2.3), or `None` if the
@@ -178,5 +179,25 @@ pub(crate) fn point_select(a: &Point, b: &Point, c: Choice) -> Point {
         y: Fe::conditional_select(&b.y, &a.y, c),
         z: Fe::conditional_select(&b.z, &a.z, c),
         t: Fe::conditional_select(&b.t, &a.t, c),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::field::BASE_ENC;
+    use super::*;
+
+    /// The compile-time base point is exactly the decompression of the
+    /// RFC 8032 encoding (same Montgomery-form limbs, `Z = 1`, `T = X·Y`).
+    #[test]
+    fn const_base_matches_decoded_encoding() {
+        let f = Field::new();
+        let dec = f.decode(&BASE_ENC).expect("valid base point");
+        let b = f.base();
+        assert_eq!(b.x, dec.x);
+        assert_eq!(b.y, dec.y);
+        assert_eq!(b.z, dec.z);
+        assert_eq!(b.t, dec.t);
+        assert_eq!(f.encode(&b), BASE_ENC);
     }
 }

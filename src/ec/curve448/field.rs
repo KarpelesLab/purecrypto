@@ -9,6 +9,7 @@
 //! the single exponentiation `√w = w^((p+1)/4)` (no `√−1` correction is needed,
 //! unlike the `p ≡ 5 (mod 8)` edwards25519 field).
 
+use super::point::Point;
 use crate::bignum::{MontModulus, Uint};
 #[cfg(test)]
 use crate::ct::ConditionallySelectable;
@@ -27,8 +28,18 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffff6756";
 const L_HEX: &str = "3fffffffffffffffffffffffffffffffffffffffffffffffffffffff\
 7cca23e9c44edb49aed63690216cc2728dc58f552378c292ab5844f3";
 
+/// The affine coordinates of the standard edwards448 base point `B`
+/// (RFC 8032 §5.2, big-endian hex).
+const BX_HEX: &str = "4f1970c66bed0ded221d15a622bf36da9e146570470f1767ea6de324\
+a3d3a46412ae1af72ab66511433b80e18b00938e2626a82bc70cc05e";
+const BY_HEX: &str = "693f46716eb6bc248876203756c9c7624bea73736ca3984087789c1e\
+05a0c2d73ad3ff1ce67c39c4fdbd132c4ed7c8ad9808795bf230fa14";
+
 /// The standard edwards448 base point `B`, as its 57-byte RFC 8032 §5.2
 /// encoding (the canonical generator; `x` is even, so the sign bit is 0).
+/// The library uses the precomputed [`Field::base`] point; this encoding is
+/// what the tests decompress to check it.
+#[cfg(test)]
 pub(crate) const BASE_ENC: [u8; 57] = {
     let mut b = [0u8; 57];
     // y (56 bytes, little-endian), then octet[56] sign bit = (Bx & 1) = 0.
@@ -81,6 +92,9 @@ pub(crate) struct Field {
     pub(crate) p: Fe,
     /// The group order `L`.
     pub(crate) l: Fe,
+    /// The base point `B` in extended coordinates (Montgomery form, `Z = 1`),
+    /// so `[k]B` needs no per-call decompression (a 446-bit exponentiation).
+    pub(crate) base_point: Point,
 }
 
 /// The field context, built once at compile time: the `R² mod p` setup,
@@ -101,7 +115,22 @@ impl Field {
         let one = fp.to_mont(&Fe::ONE);
         let d = fp.to_mont(&fe_from_be_hex(D_HEX));
         let l = fe_from_be_hex(L_HEX);
-        Field { fp, one, d, p, l }
+        let bx = fp.to_mont(&fe_from_be_hex(BX_HEX));
+        let by = fp.to_mont(&fe_from_be_hex(BY_HEX));
+        let base_point = Point {
+            x: bx,
+            y: by,
+            z: one,
+            t: fp.mont_mul(&bx, &by),
+        };
+        Field {
+            fp,
+            one,
+            d,
+            p,
+            l,
+            base_point,
+        }
     }
 
     #[inline]
