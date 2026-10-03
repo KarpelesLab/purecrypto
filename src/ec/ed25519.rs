@@ -37,6 +37,11 @@ pub(crate) const ED25519_OID: &[u64] = &[1, 3, 101, 112];
 #[derive(Clone)]
 pub struct Ed25519PrivateKey {
     seed: [u8; 32],
+    /// The encoded public key `A`, derived once at construction: signing
+    /// hashes it into every challenge, and recomputing it was a full
+    /// fixed-base scalar multiplication per signature. Public, so it is not
+    /// wiped on drop.
+    public: [u8; 32],
 }
 
 impl Drop for Ed25519PrivateKey {
@@ -64,12 +69,12 @@ impl Ed25519PrivateKey {
     pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
-        Ed25519PrivateKey { seed }
+        Self::from_seed(seed)
     }
 
     /// Creates a private key from its 32-byte seed.
     pub fn from_bytes(seed: [u8; 32]) -> Self {
-        Ed25519PrivateKey { seed }
+        Self::from_seed(seed)
     }
 
     /// The 32-byte seed.
@@ -93,21 +98,30 @@ impl Ed25519PrivateKey {
         (a, prefix)
     }
 
-    /// The corresponding public key `A = [a]B`.
-    pub fn public_key(&self) -> Ed25519PublicKey {
+    /// Builds the key from its seed, deriving the public key `A = [a]B` once.
+    fn from_seed(seed: [u8; 32]) -> Self {
+        let mut key = Ed25519PrivateKey {
+            seed,
+            public: [0u8; 32],
+        };
         let f = Field::new();
-        let (mut a, mut prefix) = self.expand();
-        let pk = Ed25519PublicKey(f.encode(&f.mul_base(&a)));
+        let (mut a, mut prefix) = key.expand();
+        key.public = f.encode(&f.mul_base(&a));
         wipe(&mut a);
         wipe(&mut prefix);
-        pk
+        key
+    }
+
+    /// The corresponding public key `A = [a]B` (computed at construction).
+    pub fn public_key(&self) -> Ed25519PublicKey {
+        Ed25519PublicKey(self.public)
     }
 
     /// Signs `message`, returning the 64-byte signature (RFC 8032 §5.1.6).
     pub fn sign(&self, message: &[u8]) -> Ed25519Signature {
         let f = Field::new();
         let (mut a, mut prefix) = self.expand();
-        let a_enc = f.encode(&f.mul_base(&a));
+        let a_enc = self.public;
 
         // r = SHA-512(prefix ‖ message) mod L; R = [r]B.
         let mut hr = Sha512::new();
@@ -204,7 +218,7 @@ impl Ed25519PrivateKey {
         }
         seq.finish()?;
         r.finish()?;
-        Ok(Ed25519PrivateKey { seed })
+        Ok(Self::from_seed(seed))
     }
 
     /// Parses a PKCS#8 PEM private key.

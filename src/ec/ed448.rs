@@ -62,6 +62,11 @@ fn shake_dom4(ctx: &[u8], parts: &[&[u8]]) -> [u8; HASH_LEN] {
 #[derive(Clone)]
 pub struct Ed448PrivateKey {
     seed: [u8; 57],
+    /// The encoded public key `A`, derived once at construction: signing
+    /// hashes it into every challenge, and recomputing it was a full
+    /// fixed-base scalar multiplication per signature. Public, so it is not
+    /// wiped on drop.
+    public: [u8; 57],
 }
 
 impl Drop for Ed448PrivateKey {
@@ -89,12 +94,12 @@ impl Ed448PrivateKey {
     pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut seed = [0u8; 57];
         rng.fill_bytes(&mut seed);
-        Ed448PrivateKey { seed }
+        Self::from_seed(seed)
     }
 
     /// Creates a private key from its 57-byte seed.
     pub fn from_bytes(seed: [u8; 57]) -> Self {
-        Ed448PrivateKey { seed }
+        Self::from_seed(seed)
     }
 
     /// The 57-byte seed.
@@ -124,14 +129,23 @@ impl Ed448PrivateKey {
         (s, prefix)
     }
 
-    /// The corresponding public key `A = [s]B`.
-    pub fn public_key(&self) -> Ed448PublicKey {
+    /// Builds the key from its seed, deriving the public key `A = [s]B` once.
+    fn from_seed(seed: [u8; 57]) -> Self {
+        let mut key = Ed448PrivateKey {
+            seed,
+            public: [0u8; 57],
+        };
         let f = Field::new();
-        let (mut s, mut prefix) = self.expand();
-        let pk = Ed448PublicKey(f.encode(&f.scalar_mult(&s, &f.base())));
+        let (mut s, mut prefix) = key.expand();
+        key.public = f.encode(&f.scalar_mult(&s, &f.base()));
         wipe(&mut s);
         wipe(&mut prefix);
-        pk
+        key
+    }
+
+    /// The corresponding public key `A = [s]B` (computed at construction).
+    pub fn public_key(&self) -> Ed448PublicKey {
+        Ed448PublicKey(self.public)
     }
 
     /// Signs `message` with the empty context, returning the 114-byte signature
@@ -162,7 +176,7 @@ impl Ed448PrivateKey {
         }
         let f = Field::new();
         let (mut s, mut prefix) = self.expand();
-        let a_enc = f.encode(&f.scalar_mult(&s, &f.base()));
+        let a_enc = self.public;
 
         // r = SHAKE256(dom4(0,ctx) ‖ prefix ‖ M, 114) mod L; R = [r]B.
         let mut r_hash = shake_dom4(context, &[&prefix, message]);
@@ -265,7 +279,7 @@ impl Ed448PrivateKey {
         }
         seq.finish()?;
         r.finish()?;
-        Ok(Ed448PrivateKey { seed })
+        Ok(Self::from_seed(seed))
     }
 
     /// Parses a PKCS#8 PEM private key.
