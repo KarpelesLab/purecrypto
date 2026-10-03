@@ -104,44 +104,64 @@ fn kdf(aes: &Aes128, index: u64, out: &mut [u8]) {
 //  NH and L1-HASH
 // ---------------------------------------------------------------------------
 
-/// NH (RFC 4418 §5.2.2). `data` must be a multiple of 32 bytes; `key` is the
-/// same length or longer. Returns the 64-bit NH value (before the L1 length
-/// adjustment).
+/// NH (RFC 4418 §5.2.2). `data` must be a multiple of 32 bytes; `key` holds
+/// at least `data.len() / 4` words. Returns the 64-bit NH value (before the
+/// L1 length adjustment).
 ///
 /// Message words are read little-endian (per the ENDIAN-SWAP step of L1-HASH);
-/// key words are read big-endian (`str2uint` semantics, no ENDIAN-SWAP).
-fn nh(key: &[u8], data: &[u8]) -> u64 {
+/// key words were read big-endian (`str2uint` semantics, no ENDIAN-SWAP) once,
+/// when the key was derived.
+fn nh(key: &[u32], data: &[u8]) -> u64 {
+    debug_assert!(data.len().is_multiple_of(32) && key.len() >= data.len() / 4);
     let mut y: u64 = 0;
-    let mut i = 0;
-    while i < data.len() {
-        // Each 32-byte step processes 8 32-bit words; pairs are (j, j+4).
-        let mut sums = [0u32; 8];
-        for (j, slot) in sums.iter_mut().enumerate() {
-            let off = i + j * 4;
-            let m = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-            let k = u32::from_be_bytes([key[off], key[off + 1], key[off + 2], key[off + 3]]);
-            *slot = m.wrapping_add(k);
-        }
+    // Each 32-byte step processes 8 32-bit words; pairs are (j, j+4).
+    for (blk, k) in data.chunks_exact(32).zip(key.chunks_exact(8)) {
+        let m = |j: usize| u32::from_le_bytes(blk[4 * j..4 * j + 4].try_into().unwrap());
         for j in 0..4 {
-            y = y.wrapping_add((sums[j] as u64).wrapping_mul(sums[j + 4] as u64));
+            let a = m(j).wrapping_add(k[j]) as u64;
+            let b = m(j + 4).wrapping_add(k[j + 4]) as u64;
+            y = y.wrapping_add(a.wrapping_mul(b));
         }
-        i += 32;
     }
     y
 }
 
 /// Computes NH on a chunk (zero-padded to the next 32-byte boundary) and adds
-/// the original bit length, as RFC 4418 §5.2.1 prescribes.
-fn l1_chunk(key: &[u8; L1_KEY_LEN], data: &[u8], bit_length: u64) -> u64 {
+/// the original bit length, as RFC 4418 §5.2.1 prescribes. NH is a sum over
+/// 32-byte steps, so the whole steps are hashed in place and only a partial
+/// last step is padded in a 32-byte scratch block.
+fn l1_chunk(key: &[u32], data: &[u8], bit_length: u64) -> u64 {
     debug_assert!(data.len() <= L1_KEY_LEN);
-    let pad_len = data.len().div_ceil(32) * 32;
-    // For an empty chunk (used when the entire message is empty) we still
-    // need one 32-byte zero block.
-    let pad_len = pad_len.max(32);
-    let mut buf = [0u8; L1_KEY_LEN];
-    buf[..data.len()].copy_from_slice(data);
-    let nh_out = nh(&key[..pad_len], &buf[..pad_len]);
-    nh_out.wrapping_add(bit_length)
+    let full = data.len() - data.len() % 32;
+    let mut y = nh(key, &data[..full]);
+    let rem = &data[full..];
+    // An empty chunk (the whole message is empty) still hashes one 32-byte
+    // zero block.
+    if !rem.is_empty() || data.is_empty() {
+        let mut last = [0u8; 32];
+        last[..rem.len()].copy_from_slice(rem);
+        y = y.wrapping_add(nh(&key[full / 4..], &last));
+        last.zeroize();
+    }
+    y.wrapping_add(bit_length)
+}
+
+/// Runs L1-HASH on one chunk for every iteration and feeds the outputs to
+/// the per-iteration L2 state. A free function over the key/state fields so
+/// the chunk can be borrowed from the caller's input or from the streaming
+/// buffer alike.
+fn absorb_chunk<const ITER: usize>(
+    l1_key: &[u32; MAX_L1_KEY_BUF / 4],
+    l2: (&[u64; ITER], &[u128; ITER]),
+    iter_state: &mut [UmacIter; ITER],
+    chunk: &[u8],
+    bit_len: u64,
+) {
+    for (i, st) in iter_state.iter_mut().enumerate() {
+        // Iteration `i` uses the key shifted by 16 bytes (4 words) per step.
+        let key = &l1_key[i * 4..i * 4 + L1_KEY_LEN / 4];
+        st.absorb(l2.0[i], l2.1[i], l1_chunk(key, chunk, bit_len));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,9 +523,9 @@ const MAX_L1_KEY_BUF: usize = L1_KEY_LEN + (MAX_ITER - 1) * 16;
 struct UmacInner<const ITER: usize> {
     /// AES cipher pre-keyed with K' = KDF(K, 0).
     pdf_aes: Aes128,
-    /// L1 keys, packed contiguously: iteration `i` uses
-    /// `l1_key[i*16 .. i*16 + 1024]`.
-    l1_key: [u8; MAX_L1_KEY_BUF],
+    /// L1 keys as big-endian 32-bit words, packed contiguously: iteration
+    /// `i` uses bytes `i*16 .. i*16 + 1024`, i.e. words `i*4 .. i*4 + 256`.
+    l1_key: [u32; MAX_L1_KEY_BUF / 4],
     /// L2 keys, post-mask, per iteration.
     l2_k64: [u64; ITER],
     l2_k128: [u128; ITER],
@@ -534,8 +554,13 @@ impl<const ITER: usize> UmacInner<ITER> {
 
         // L1-Key: 1024 + (ITER-1)*16 bytes
         let l1_len = L1_KEY_LEN + (ITER - 1) * 16;
-        let mut l1_key = [0u8; MAX_L1_KEY_BUF];
-        kdf(&master, 1, &mut l1_key[..l1_len]);
+        let mut l1_bytes = [0u8; MAX_L1_KEY_BUF];
+        kdf(&master, 1, &mut l1_bytes[..l1_len]);
+        let mut l1_key = [0u32; MAX_L1_KEY_BUF / 4];
+        for (w, b) in l1_key.iter_mut().zip(l1_bytes.chunks_exact(4)) {
+            *w = u32::from_be_bytes(b.try_into().unwrap());
+        }
+        l1_bytes.zeroize();
 
         // L2-Key: 24·ITER bytes; split into k64 || k128 per iteration.
         let mut l2_buf = [0u8; 24 * MAX_ITER];
@@ -586,26 +611,39 @@ impl<const ITER: usize> UmacInner<ITER> {
         }
     }
 
-    /// Absorbs the chunk currently held in `self.chunk[..1024]` as one full
-    /// L1 chunk (bit length = 8192).
-    fn process_full_chunk(&mut self) {
-        for i in 0..ITER {
-            let key_slice = &self.l1_key[i * 16..i * 16 + L1_KEY_LEN];
-            let key_arr: &[u8; L1_KEY_LEN] = key_slice.try_into().unwrap();
-            let l1_out = l1_chunk(key_arr, &self.chunk, (L1_KEY_LEN as u64) * 8);
-            self.iter_state[i].absorb(self.l2_k64[i], self.l2_k128[i], l1_out);
-        }
+    /// Absorbs `chunk` (the caller's input), or the buffered
+    /// `self.chunk[..chunk_off]` when `None`, as one L1 chunk of the given
+    /// bit length.
+    fn process_chunk(&mut self, chunk: Option<&[u8]>, bit_len: u64) {
+        let chunk = chunk.unwrap_or(&self.chunk[..self.chunk_off]);
+        absorb_chunk(
+            &self.l1_key,
+            (&self.l2_k64, &self.l2_k128),
+            &mut self.iter_state,
+            chunk,
+            bit_len,
+        );
     }
 
     fn update(&mut self, mut data: &[u8]) {
         while !data.is_empty() {
+            if self.chunk_off == 0 && data.len() >= L1_KEY_LEN {
+                // Whole chunks are hashed straight from the input. A full
+                // chunk's bit length is 8192 whether or not it ends up last
+                // (see `finalize_uhash`), so eager processing is exact.
+                let (c, rest) = data.split_at(L1_KEY_LEN);
+                self.process_chunk(Some(c), (L1_KEY_LEN as u64) * 8);
+                self.total_bytes = self.total_bytes.wrapping_add(L1_KEY_LEN as u64);
+                data = rest;
+                continue;
+            }
             let take = (L1_KEY_LEN - self.chunk_off).min(data.len());
             self.chunk[self.chunk_off..self.chunk_off + take].copy_from_slice(&data[..take]);
             self.chunk_off += take;
             self.total_bytes = self.total_bytes.wrapping_add(take as u64);
             data = &data[take..];
             if self.chunk_off == L1_KEY_LEN {
-                self.process_full_chunk();
+                self.process_chunk(None, (L1_KEY_LEN as u64) * 8);
                 self.chunk_off = 0;
             }
         }
@@ -619,22 +657,12 @@ impl<const ITER: usize> UmacInner<ITER> {
         if self.total_bytes == 0 {
             // RFC 4418: t = max(ceil(0/8192), 1) = 1 → process one empty
             // chunk so each iter has an L1 output to fold.
-            for i in 0..ITER {
-                let key_slice = &self.l1_key[i * 16..i * 16 + L1_KEY_LEN];
-                let key_arr: &[u8; L1_KEY_LEN] = key_slice.try_into().unwrap();
-                let l1_out = l1_chunk(key_arr, &[], 0);
-                self.iter_state[i].absorb(self.l2_k64[i], self.l2_k128[i], l1_out);
-            }
+            self.process_chunk(Some(&[]), 0);
         } else if self.chunk_off > 0 {
             // Partial final chunk; its bit length is the real (pre-pad)
             // length, not 8192.
             let bit_len = (self.chunk_off as u64) * 8;
-            for i in 0..ITER {
-                let key_slice = &self.l1_key[i * 16..i * 16 + L1_KEY_LEN];
-                let key_arr: &[u8; L1_KEY_LEN] = key_slice.try_into().unwrap();
-                let l1_out = l1_chunk(key_arr, &self.chunk[..self.chunk_off], bit_len);
-                self.iter_state[i].absorb(self.l2_k64[i], self.l2_k128[i], l1_out);
-            }
+            self.process_chunk(None, bit_len);
         }
         // else: total_bytes is a positive multiple of 1024; every chunk was
         // a full chunk already absorbed by process_full_chunk with bit
@@ -1082,6 +1110,47 @@ mod tests {
         let streamed = state.finalize(nonce);
 
         assert_eq!(one_shot, streamed);
+    }
+
+    /// `l1_chunk` over pre-converted key words, hashing whole 32-byte steps
+    /// in place, must equal the byte-wise RFC 4418 §5.2 definition (copy and
+    /// zero-pad the chunk, read key words big-endian per step) for every
+    /// chunk length.
+    #[test]
+    fn l1_chunk_matches_bytewise_reference() {
+        fn reference(key: &[u8], data: &[u8], bit_length: u64) -> u64 {
+            let pad_len = data.len().div_ceil(32).max(1) * 32;
+            let mut buf = [0u8; L1_KEY_LEN];
+            buf[..data.len()].copy_from_slice(data);
+            let mut y = 0u64;
+            for i in (0..pad_len).step_by(32) {
+                let w = |src: &[u8], j: usize| -> [u8; 4] {
+                    src[i + 4 * j..i + 4 * j + 4].try_into().unwrap()
+                };
+                for j in 0..4 {
+                    let a =
+                        u32::from_le_bytes(w(&buf, j)).wrapping_add(u32::from_be_bytes(w(key, j)));
+                    let b = u32::from_le_bytes(w(&buf, j + 4))
+                        .wrapping_add(u32::from_be_bytes(w(key, j + 4)));
+                    y = y.wrapping_add((a as u64).wrapping_mul(b as u64));
+                }
+            }
+            y.wrapping_add(bit_length)
+        }
+        let key_bytes: [u8; L1_KEY_LEN] = core::array::from_fn(|i| (i as u8) ^ 0x9c);
+        let mut key = [0u32; L1_KEY_LEN / 4];
+        for (w, b) in key.iter_mut().zip(key_bytes.chunks_exact(4)) {
+            *w = u32::from_be_bytes(b.try_into().unwrap());
+        }
+        let data: [u8; L1_KEY_LEN] = core::array::from_fn(|i| (i as u8).wrapping_mul(77));
+        for len in 0..=L1_KEY_LEN {
+            let bits = 8 * len as u64;
+            assert_eq!(
+                l1_chunk(&key, &data[..len], bits),
+                reference(&key_bytes, &data[..len], bits),
+                "len {len}"
+            );
+        }
     }
 
     #[test]
