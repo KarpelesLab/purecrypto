@@ -10,7 +10,9 @@
 //! unlike the `p ≡ 5 (mod 8)` edwards25519 field).
 
 use crate::bignum::{MontModulus, Uint};
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+#[cfg(test)]
+use crate::ct::ConditionallySelectable;
+use crate::ct::{Choice, ConstantTimeEq};
 
 /// A field element, seven 64-bit limbs (448 bits).
 pub(crate) type Fe = Uint<7>;
@@ -49,9 +51,9 @@ const fn fe_from_be_hex(hex: &str) -> Fe {
     crate::ec::uint_from_be_hex(hex)
 }
 
-/// Modular exponentiation in Montgomery form (`base` and the result are in
-/// Montgomery domain). The exponent is public, so the fixed 448-step schedule
-/// leaks nothing secret.
+/// Generic square-and-multiply exponentiation in Montgomery form, the
+/// reference the fixed addition chains are checked against.
+#[cfg(test)]
 fn fe_pow(fp: &MontModulus<7>, one: &Fe, base: Fe, exp: &Fe) -> Fe {
     let mut r = *one;
     let limbs = exp.as_limbs();
@@ -61,8 +63,6 @@ fn fe_pow(fp: &MontModulus<7>, one: &Fe, base: Fe, exp: &Fe) -> Fe {
         r = fp.mont_sqr(&r);
         let bit = ((limbs[i / 64] >> (i % 64)) & 1) as u8;
         let prod = fp.mont_mul(&r, &base);
-        // conditional_select(a, b, c) returns a when c is set (this crate's
-        // convention): pick `prod` when the exponent bit is 1.
         r = Fe::conditional_select(&prod, &r, Choice::from(bit));
     }
     r
@@ -77,10 +77,6 @@ pub(crate) struct Field {
     /// `d = −39081` in Montgomery form (the single Edwards constant; the
     /// `a = +1` formulas do not need `2d`).
     pub(crate) d: Fe,
-    /// `p − 2` (the Fermat inversion exponent).
-    p_minus_2: Fe,
-    /// `(p − 3) / 4` (the square-root candidate exponent for `p ≡ 3 (mod 4)`).
-    p_minus_3_div_4: Fe,
     /// The prime `p`.
     pub(crate) p: Fe,
     /// The group order `L`.
@@ -104,19 +100,8 @@ impl Field {
         let fp = MontModulus::new(p);
         let one = fp.to_mont(&Fe::ONE);
         let d = fp.to_mont(&fe_from_be_hex(D_HEX));
-        let p_minus_2 = p.wrapping_sub(&Fe::from_u64(2));
-        // (p − 3) / 4
-        let p_minus_3_div_4 = p.wrapping_sub(&Fe::from_u64(3)).shr1().shr1();
         let l = fe_from_be_hex(L_HEX);
-        Field {
-            fp,
-            one,
-            d,
-            p_minus_2,
-            p_minus_3_div_4,
-            p,
-            l,
-        }
+        Field { fp, one, d, p, l }
     }
 
     #[inline]
@@ -139,9 +124,46 @@ impl Field {
     pub(crate) fn neg(&self, a: Fe) -> Fe {
         self.fp.sub_mod(&Fe::ZERO, &a)
     }
+    /// `a` squared `n` times.
+    #[inline]
+    fn sqn(&self, a: Fe, n: u32) -> Fe {
+        let mut r = a;
+        for _ in 0..n {
+            r = self.sq(r);
+        }
+        r
+    }
+
+    /// `a^((p−3)/4)` by a fixed addition chain (451 squarings, 12
+    /// multiplications), the shared core of inversion and square roots.
+    ///
+    /// `(p−3)/4 = 2⁴⁴⁶ − 2²²² − 1 = (2²²³ − 1)·2²²³ + (2²²² − 1)`, so with
+    /// `eₖ = a^(2ᵏ−1)` the result is `e₂₂₃^(2²²³) · e₂₂₂`, and the `eₖ` are
+    /// built by `e_{j+k} = e_j^(2ᵏ) · eₖ`. The exponent is public and the
+    /// schedule fixed, so this is constant time in `a` — and roughly half the
+    /// work of the bit-at-a-time ladder (448 squarings plus 448 masked
+    /// multiplications).
+    fn pow_p3_4(&self, a: Fe) -> Fe {
+        let e1 = a;
+        let e2 = self.mul(self.sq(e1), e1);
+        let e3 = self.mul(self.sq(e2), e1);
+        let e6 = self.mul(self.sqn(e3, 3), e3);
+        let e12 = self.mul(self.sqn(e6, 6), e6);
+        let e24 = self.mul(self.sqn(e12, 12), e12);
+        let e30 = self.mul(self.sqn(e24, 6), e6);
+        let e48 = self.mul(self.sqn(e24, 24), e24);
+        let e96 = self.mul(self.sqn(e48, 48), e48);
+        let e192 = self.mul(self.sqn(e96, 96), e96);
+        let e222 = self.mul(self.sqn(e192, 30), e30);
+        let e223 = self.mul(self.sq(e222), e1);
+        self.mul(self.sqn(e223, 223), e222)
+    }
+
+    /// `a⁻¹ = a^(p−2)` (Fermat; `0` maps to `0`). `p − 2 = 4·(p−3)/4 + 1`,
+    /// so this is [`Self::pow_p3_4`] plus two squarings and a multiply.
     #[inline]
     pub(crate) fn inv(&self, a: Fe) -> Fe {
-        fe_pow(&self.fp, &self.one, a, &self.p_minus_2)
+        self.mul(self.sqn(self.pow_p3_4(a), 2), a)
     }
 
     /// Converts a plain residue `< p` into Montgomery form.
@@ -163,13 +185,6 @@ impl Field {
         a.ct_eq(&b)
     }
 
-    /// Raises a Montgomery-form element to a (public) exponent given as a plain
-    /// integer `Fe`.
-    #[inline]
-    pub(crate) fn pow(&self, base: Fe, exp: &Fe) -> Fe {
-        fe_pow(&self.fp, &self.one, base, exp)
-    }
-
     /// Square root of the ratio `u / v` for the `p ≡ 3 (mod 4)` field.
     ///
     /// Returns `(is_square, r)` where, when `v ≠ 0` and `u/v` is a quadratic
@@ -184,12 +199,69 @@ impl Field {
         let v2 = self.sq(v);
         let v3 = self.mul(v2, v);
         let uv3 = self.mul(u, v3);
-        let pw = self.pow(uv3, &self.p_minus_3_div_4);
+        let pw = self.pow_p3_4(uv3);
         let r = self.mul(self.mul(u, v), pw);
 
         // Validate: v·r² must equal u for a genuine root.
         let check = self.mul(v, self.sq(r));
         let is_square = self.ct_eq(check, u);
         (is_square, r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic splitmix64 stream for the differential sweeps.
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// The addition chains agree with the generic ladder on the exponents
+    /// they replace (`p − 2` and `(p − 3) / 4`), over edge values and a
+    /// random sweep.
+    #[test]
+    fn addition_chains_match_generic_pow() {
+        let f = Field::new();
+        let p_minus_2 = f.p.wrapping_sub(&Fe::from_u64(2));
+        let p_minus_3_div_4 = f.p.wrapping_sub(&Fe::from_u64(3)).shr1().shr1();
+        let edges = [
+            Fe::ZERO,
+            Fe::ONE,
+            Fe::from_u64(2),
+            f.p.wrapping_sub(&Fe::ONE),
+            f.p.wrapping_sub(&Fe::from_u64(2)),
+            f.d,
+        ];
+        let mut st = 0x448;
+        let random = core::iter::repeat_with(|| {
+            let mut l = [0u64; 7];
+            for x in l.iter_mut() {
+                *x = splitmix(&mut st);
+            }
+            Fe::from_limbs(l).reduce(&f.p)
+        })
+        .take(64);
+        for x in edges.into_iter().chain(random) {
+            let xm = f.to_mont(&x);
+            assert_eq!(
+                f.inv(xm),
+                fe_pow(&f.fp, &f.one, xm, &p_minus_2),
+                "inv mismatch"
+            );
+            assert_eq!(
+                f.pow_p3_4(xm),
+                fe_pow(&f.fp, &f.one, xm, &p_minus_3_div_4),
+                "pow_p3_4 mismatch"
+            );
+            if !bool::from(x.ct_eq(&Fe::ZERO)) {
+                assert_eq!(f.mul(f.inv(xm), xm), f.one);
+            }
+        }
     }
 }

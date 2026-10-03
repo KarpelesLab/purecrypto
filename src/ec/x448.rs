@@ -16,6 +16,7 @@
 
 use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::ec::curve448::field::Field;
 use crate::rng::RngCore;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -125,15 +126,15 @@ pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
     Fe::conditional_swap(&mut x2, &mut x3, sw);
     Fe::conditional_swap(&mut z2, &mut z3, sw);
 
-    // result = x2 / z2 (or 0 if z2 == 0). The inverse is via Fermat's little
-    // theorem (`z^{p-2} mod p`) on the constant-time Montgomery ladder, NOT a
-    // variable-time extended-Euclidean inverse — z2 depends on the secret
-    // scalar. Fermat naturally returns 0 when z2 == 0, so the small-order case
-    // yields the all-zero output without a data-dependent branch.
-    let mut z2_plain = fp.from_mont(&z2);
-    let p_minus_2 = fp.modulus().wrapping_sub(&Fe::from_u64(2));
-    let mut z_inv = fp.pow(&z2_plain, &p_minus_2);
-    let res = fp.mul_mod(&fp.from_mont(&x2), &z_inv);
+    // result = x2 / z2 (or 0 if z2 == 0). The inverse is Fermat's
+    // `z^{p-2} mod p` through the shared curve448 field's fixed addition
+    // chain (constant time, same modulus and so the same Montgomery domain as
+    // `FP`), NOT a variable-time extended-Euclidean inverse — z2 depends on
+    // the secret scalar. Fermat naturally returns 0 when z2 == 0, so the
+    // small-order case yields the all-zero output without a data-dependent
+    // branch.
+    let mut z_inv = Field::new().inv(z2);
+    let res = fp.from_mont(&fp.mont_mul(&x2, &z_inv));
     let mut out = [0u8; 56];
     res.write_le_bytes(&mut out);
 
@@ -142,15 +143,7 @@ pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
     // a function of the secret scalar. `Zeroize` issues volatile stores, so
     // LLVM cannot elide them as dead.
     k_bytes.zeroize();
-    for v in [
-        &mut k,
-        &mut x2,
-        &mut z2,
-        &mut x3,
-        &mut z3,
-        &mut z2_plain,
-        &mut z_inv,
-    ] {
+    for v in [&mut k, &mut x2, &mut z2, &mut x3, &mut z3, &mut z_inv] {
         v.zeroize();
     }
     out
