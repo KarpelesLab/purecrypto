@@ -92,12 +92,76 @@ pub fn pairing(p: &G1, q: &G2) -> Gt {
 
 /// `∏ e(Pᵢ, Qᵢ)` with a single final exponentiation — the cheap way to
 /// evaluate a product-of-pairings equation such as a signature check.
+///
+/// The Miller loops share one accumulator: `∏ fᵢ` is built in a single run
+/// over the loop constant, squaring the accumulator once per step for all
+/// pairs instead of once per pair, and without the per-pair `Fp12`
+/// products at the end.
 pub fn multi_pairing(pairs: &[(&G1, &G2)]) -> Gt {
-    let mut f = Fp12::ONE;
-    for (p, q) in pairs {
-        f = f.mul(&miller_loop(p, q));
+    let mut legs: alloc::vec::Vec<Leg> = pairs.iter().map(|(p, q)| Leg::new(p, q)).collect();
+    Gt(final_exponentiation(&shared_miller_loop(&mut legs)))
+}
+
+/// One pair's state in a (shared) Miller loop.
+struct Leg {
+    px: super::fp::Fp,
+    py: super::fp::Fp,
+    qx: Fp2,
+    qy: Fp2,
+    q_aff: Projective<Fp2>,
+    t: Projective<Fp2>,
+    /// Either input is the identity: the pair contributes `1`.
+    skip: Choice,
+}
+
+impl Leg {
+    fn new(p: &G1, q: &G2) -> Leg {
+        let (px, py, p_inf) = p.0.to_affine();
+        let (qx, qy, q_inf) = q.0.to_affine();
+        let q_aff = Projective::from_affine(qx, qy);
+        Leg {
+            px,
+            py,
+            qx,
+            qy,
+            q_aff,
+            t: q_aff,
+            skip: p_inf | q_inf,
+        }
     }
-    Gt(final_exponentiation(&f))
+}
+
+/// Multiplies `f` by the sparse line `(c0, c3, c5)`, or leaves it alone
+/// when `skip` is set (selected, so the schedule does not depend on it).
+#[inline]
+fn mul_line(f: &Fp12, line: (Fp2, Fp2, Fp2), skip: Choice) -> Fp12 {
+    let (c0, c3, c5) = line;
+    let g = f.mul_by_035(&c0, &c3, &c5);
+    Fp12::conditional_select(f, &g, skip)
+}
+
+/// `∏ f_{|x|,Qᵢ}(Pᵢ)` conjugated (since `x < 0`), pairs whose input is the
+/// identity contributing `1`. Runs a fixed schedule over the public loop
+/// constant and the number of pairs.
+fn shared_miller_loop(legs: &mut [Leg]) -> Fp12 {
+    let mut f = Fp12::ONE;
+    // Bit 63 of |x| is set; start below it with f = 1, T = Q.
+    for bit in (0..63).rev() {
+        f = f.square();
+        for leg in legs.iter_mut() {
+            let line = doubling_line(&leg.t, &leg.px, &leg.py);
+            f = mul_line(&f, line, leg.skip);
+            leg.t = leg.t.double();
+        }
+        if (X_ABS >> bit) & 1 == 1 {
+            for leg in legs.iter_mut() {
+                let line = addition_line(&leg.t, &leg.qx, &leg.qy, &leg.px, &leg.py);
+                f = mul_line(&f, line, leg.skip);
+                leg.t = leg.t.add(&leg.q_aff);
+            }
+        }
+    }
+    f.conjugate()
 }
 
 /// The line through `T` and `2T` (before doubling), evaluated at `P`,
@@ -130,25 +194,7 @@ fn addition_line(
 /// `f_{|x|,Q}(P)` conjugated (since `x < 0`), or `1` if either input is the
 /// identity. Runs a fixed schedule over the public loop constant.
 pub(crate) fn miller_loop(p: &G1, q: &G2) -> Fp12 {
-    let (px, py, p_inf) = p.0.to_affine();
-    let (qx, qy, q_inf) = q.0.to_affine();
-    let q_aff = Projective::from_affine(qx, qy);
-    let mut t = q_aff;
-    let mut f = Fp12::ONE;
-    // Bit 63 of |x| is set; start below it with f = 1, T = Q.
-    for bit in (0..63).rev() {
-        f = f.square();
-        let (c0, c3, c5) = doubling_line(&t, &px, &py);
-        f = f.mul_by_035(&c0, &c3, &c5);
-        t = t.double();
-        if (X_ABS >> bit) & 1 == 1 {
-            let (c0, c3, c5) = addition_line(&t, &qx, &qy, &px, &py);
-            f = f.mul_by_035(&c0, &c3, &c5);
-            t = t.add(&q_aff);
-        }
-    }
-    let f = f.conjugate();
-    Fp12::conditional_select(&Fp12::ONE, &f, p_inf | q_inf)
+    shared_miller_loop(&mut [Leg::new(p, q)])
 }
 
 /// `f^((p¹² - 1)/r)`.
@@ -210,6 +256,39 @@ mod tests {
             multi_pairing(&[(&ag1, &g2), (&ng1, &ag2)]).is_identity()
         ));
         assert_eq!(multi_pairing(&[(&g1, &g2), (&g1, &g2)]), e.mul(&e));
+    }
+
+    /// The shared Miller loop equals the product of separate pairings, with
+    /// identity legs (on either side) contributing 1.
+    #[test]
+    fn multi_pairing_matches_product_of_pairings() {
+        let g1 = G1::generator();
+        let g2 = G2::generator();
+        let a = Fr::from_u64(0x0123_4567_89ab_cdef);
+        let b = Fr::from_u64(0x0fed_cba9_8765_4321);
+        let p = [g1.mul(&a), g1.mul(&b), G1::IDENTITY, g1];
+        let q = [g2, g2.mul(&b), g2.mul(&a), G2::IDENTITY];
+        let mut want = Gt::IDENTITY;
+        for (pi, qi) in p.iter().zip(q.iter()) {
+            want = want.mul(&pairing(pi, qi));
+        }
+        let pairs: [(&G1, &G2); 4] = [
+            (&p[0], &q[0]),
+            (&p[1], &q[1]),
+            (&p[2], &q[2]),
+            (&p[3], &q[3]),
+        ];
+        assert_eq!(multi_pairing(&pairs), want);
+        assert_eq!(multi_pairing(&pairs[..1]), pairing(&p[0], &q[0]));
+        assert_eq!(multi_pairing(&pairs[2..]), Gt::IDENTITY);
+        assert_eq!(multi_pairing(&[]), Gt::IDENTITY);
+        // Cross-check the shared loop against an independent product of
+        // per-pair Miller loops evaluated the old way (one f per pair).
+        let mut f = Fp12::ONE;
+        for (pi, qi) in &pairs {
+            f = f.mul(&miller_loop(pi, qi));
+        }
+        assert_eq!(Gt(final_exponentiation(&f)), want);
     }
 
     #[test]
