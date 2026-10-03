@@ -40,13 +40,28 @@ const SQRT_AD_MINUS_ONE_HEX: &str =
 const INVSQRT_A_MINUS_D_HEX: &str =
     "786c8905cfaffca216c27b91fe01d8409d2f16175a4172be99c8fdaa805d40ea";
 
-/// Parses 64 big-endian hex chars into a field element.
-fn fe_from_be_hex(hex: &str) -> Fe {
+/// Parses 64 big-endian hex chars into a field element at compile time,
+/// splitting the 256-bit value into the 5×51-bit limbs exactly as
+/// `Fe::from_bytes` does (bit offsets 0, 51, 102, 153, 204; top bit masked).
+const fn fe_from_be_hex(hex: &str) -> Fe {
     let v: ScalarInt = super::uint_from_be_hex(hex);
-    let mut b = [0u8; 32];
-    v.write_le_bytes(&mut b);
-    Fe::from_bytes(&b)
+    let w = v.as_limbs();
+    const M51: u64 = (1 << 51) - 1;
+    Fe([
+        w[0] & M51,
+        ((w[0] >> 51) | (w[1] << 13)) & M51,
+        ((w[1] >> 38) | (w[2] << 26)) & M51,
+        ((w[2] >> 25) | (w[3] << 39)) & M51,
+        (w[3] >> 12) & M51,
+    ])
 }
+
+/// The RFC 9496 constants, decoded in const evaluation rather than on every
+/// group operation.
+const ONE_MINUS_D_SQ: Fe = fe_from_be_hex(ONE_MINUS_D_SQ_HEX);
+const D_MINUS_ONE_SQ: Fe = fe_from_be_hex(D_MINUS_ONE_SQ_HEX);
+const SQRT_AD_MINUS_ONE: Fe = fe_from_be_hex(SQRT_AD_MINUS_ONE_HEX);
+const INVSQRT_A_MINUS_D: Fe = fe_from_be_hex(INVSQRT_A_MINUS_D_HEX);
 
 /// The ristretto255-specific field constants alongside the shared [`Field`]
 /// backend.
@@ -59,18 +74,14 @@ struct R255 {
 }
 
 impl R255 {
+    #[inline]
     fn new() -> Self {
-        let f = Field::new();
-        let one_minus_d_sq = fe_from_be_hex(ONE_MINUS_D_SQ_HEX);
-        let d_minus_one_sq = fe_from_be_hex(D_MINUS_ONE_SQ_HEX);
-        let sqrt_ad_minus_one = fe_from_be_hex(SQRT_AD_MINUS_ONE_HEX);
-        let invsqrt_a_minus_d = fe_from_be_hex(INVSQRT_A_MINUS_D_HEX);
         R255 {
-            f,
-            one_minus_d_sq,
-            d_minus_one_sq,
-            sqrt_ad_minus_one,
-            invsqrt_a_minus_d,
+            f: Field::new(),
+            one_minus_d_sq: ONE_MINUS_D_SQ,
+            d_minus_one_sq: D_MINUS_ONE_SQ,
+            sqrt_ad_minus_one: SQRT_AD_MINUS_ONE,
+            invsqrt_a_minus_d: INVSQRT_A_MINUS_D,
         }
     }
 }
@@ -360,6 +371,23 @@ mod tests {
     use super::*;
     use crate::hash::{Digest, Sha512};
     use crate::test_util::from_hex;
+
+    /// The const limb split matches the runtime `Fe::from_bytes` decoding of
+    /// each constant.
+    #[test]
+    fn const_constants_match_runtime_decode() {
+        for (hex, c) in [
+            (ONE_MINUS_D_SQ_HEX, ONE_MINUS_D_SQ),
+            (D_MINUS_ONE_SQ_HEX, D_MINUS_ONE_SQ),
+            (SQRT_AD_MINUS_ONE_HEX, SQRT_AD_MINUS_ONE),
+            (INVSQRT_A_MINUS_D_HEX, INVSQRT_A_MINUS_D),
+        ] {
+            let v: ScalarInt = crate::ec::uint_from_be_hex(hex);
+            let mut b = [0u8; 32];
+            v.write_le_bytes(&mut b);
+            assert_eq!(c.0, Fe::from_bytes(&b).0, "{hex}");
+        }
+    }
 
     /// RFC 9496 Appendix A.1 — encodings of `[0]B .. [15]B`.
     const MULTIPLES: [&str; 16] = [
