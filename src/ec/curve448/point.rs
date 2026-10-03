@@ -128,7 +128,8 @@ impl Field {
     pub(crate) fn point_double(&self, p: &Point) -> Point {
         let a = self.sq(p.x);
         let b = self.sq(p.y);
-        let c = self.add(self.sq(p.z), self.sq(p.z));
+        let zz = self.sq(p.z);
+        let c = self.add(zz, zz);
         let e = self.sub(self.sub(self.sq(self.add(p.x, p.y)), a), b);
         let g = self.add(a, b);
         let ff = self.sub(g, c);
