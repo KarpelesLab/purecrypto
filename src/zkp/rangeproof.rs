@@ -664,20 +664,23 @@ fn member_offset(j: u64, ring: usize, scale: u64) -> u64 {
         .wrapping_mul(scale)
 }
 
-/// Builds ring member `j`'s public key `Cᵢ − j·4ⁱ·scale·H`.
-fn member_pubkey(
-    digit_commit: &ProjectivePoint,
-    j: u64,
-    ring: usize,
-    scale: u64,
-    generator: &ProjectivePoint,
-) -> ProjectivePoint {
-    let offset = member_offset(j, ring, scale);
-    if offset == 0 {
-        *digit_commit
-    } else {
-        digit_commit.add(&generator.mul(&value_scalar(offset)).negate())
-    }
+/// Ring 0's member spacing `scale·H`; ring `i`'s is `stepᵢ = 4ⁱ·scale·H`.
+///
+/// Ring member `j`'s public key is `Cᵢ − j·stepᵢ`, so a walk over a ring's
+/// members costs one point addition per member instead of a scalar
+/// multiplication, and each ring's step is the previous one doubled twice.
+/// `scale` is public (it is in the proof header) and the multiplication, the
+/// additions and the doublings are all constant-time point operations, so the
+/// walk serves the prover as well as the verifier. Every `j·4ⁱ·scale` stays
+/// below `2⁶⁴` (see [`member_offset`]), so these points agree with the
+/// integer offsets.
+fn first_step(generator: &ProjectivePoint, scale: u64) -> ProjectivePoint {
+    generator.mul(&value_scalar(scale))
+}
+
+/// `4·step`, the next ring's member spacing.
+fn next_step(step: &ProjectivePoint) -> ProjectivePoint {
+    step.double().double()
 }
 
 /// Recovers the first `count` digit commitments from a proof body into
@@ -705,10 +708,9 @@ fn parse_digit_commitments(
 /// The pieces of a parsed proof that both [`verify`] and [`rewind`] need.
 ///
 /// The ring member public keys are *not* stored: 128 of them would be 12 KiB,
-/// and every one is `Cᵢ − j·4ⁱ·scale·H`, derivable from its ring's digit
-/// commitment. [`Parsed::member`] recomputes one on demand, and each caller
-/// uses each member exactly once. The ring scalars likewise stay in the
-/// caller's proof buffer rather than being copied out.
+/// and every one is `Cᵢ − j·stepᵢ`, derivable from its ring's digit
+/// commitment by walking the ring (see [`first_step`]). The ring scalars
+/// likewise stay in the caller's proof buffer rather than being copied out.
 struct Parsed<'a> {
     params: Params,
     layout: Layout,
@@ -728,17 +730,6 @@ struct Parsed<'a> {
 }
 
 impl Parsed<'_> {
-    /// Ring member `j` of ring `i`'s public key.
-    fn member(&self, i: usize, j: usize) -> ProjectivePoint {
-        member_pubkey(
-            &self.digit_commits[i],
-            j as u64,
-            i,
-            self.params.scale,
-            &self.gen_point,
-        )
-    }
-
     /// The flat ring scalar at `slot`, `0 <= slot < layout.npub`.
     fn scalar(&self, slot: usize) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -842,9 +833,15 @@ fn borromean_verify(
 ) -> Result<(), Error> {
     let layout = &parsed.layout;
     let mut e0h = Sha256::new();
+    let mut step = first_step(&parsed.gen_point, parsed.params.scale);
     for i in 0..layout.rings {
         let start = layout.starts[i];
         let mut e = borromean_hash(&parsed.message, &parsed.e0, i as u32, 0);
+        if i > 0 {
+            step = next_step(&step);
+        }
+        let neg_step = step.negate();
+        let mut member = parsed.digit_commits[i];
         for j in 0..layout.rsizes[i] {
             if let Some(out) = challenges.as_deref_mut() {
                 out[start + j] = e;
@@ -852,8 +849,10 @@ fn borromean_verify(
             let s =
                 Scalar::from_bytes_be(&parsed.scalar(start + j)).map_err(|_| Error::Malformed)?;
             let scalar = Scalar::from_bytes_be_reduce(&e);
-            let r =
-                ProjectivePoint::mul_generator_double_vartime(&s, &scalar, &parsed.member(i, j));
+            if j > 0 {
+                member = member.add(&neg_step);
+            }
+            let r = ProjectivePoint::mul_generator_double_vartime(&s, &scalar, &member);
             let affine = r.to_affine().ok_or(Error::Verification)?;
             let ser = affine.to_sec1_compressed();
             if j + 1 < layout.rsizes[i] {
@@ -1161,12 +1160,9 @@ pub fn sign_into(
         encs[i] = point_enc(&tagged);
     }
 
-    // Ring member keys are recomputed on demand rather than kept in a
-    // 128-entry table; see `Parsed::member` for the same trade in the
-    // verifier.
-    let member = |i: usize, j: usize| {
-        member_pubkey(&digit_commits[i], j as u64, i, params.scale, &gen_point)
-    };
+    // Ring member keys are walked per ring rather than kept in a 128-entry
+    // table; see `first_step` (the same trade the verifier makes).
+    let step0 = first_step(&gen_point, params.scale);
 
     let m = proof_message(
         &commit_enc,
@@ -1183,11 +1179,17 @@ pub fn sign_into(
     // known member it is replaced by k·G with a constant-time select; after it
     // the real chain runs. The work is identical whatever the digit is.
     let mut e0h = Sha256::new();
+    let mut step = step0;
     for i in 0..layout.rings {
         let start = layout.starts[i];
         let k = Scalar::from_bytes_be_reduce(&nonces[i]);
         let kg = ProjectivePoint::mul_generator(&k);
         let mut r = ProjectivePoint::generator();
+        if i > 0 {
+            step = next_step(&step);
+        }
+        let neg_step = step.negate();
+        let mut member = digit_commits[i];
         for j in 0..layout.rsizes[i] {
             let is_known = (j as u64).ct_eq(&digits[i]);
             r = ProjectivePoint::conditional_select(&kg, &r, is_known);
@@ -1195,7 +1197,9 @@ pub fn sign_into(
                 let e = borromean_hash(&m, &sec1(&r), i as u32, (j + 1) as u32);
                 let e = Scalar::from_bytes_be_reduce(&e);
                 let sj = Scalar::from_bytes_be_reduce(&s[start + j + 1]);
-                r = ProjectivePoint::mul_generator(&sj).add(&member(i, j + 1).mul(&e));
+                // Member j + 1.
+                member = member.add(&neg_step);
+                r = ProjectivePoint::mul_generator(&sj).add(&member.mul(&e));
             }
         }
         let affine = r.to_affine().ok_or(Error::InvalidInput)?;
@@ -1205,17 +1209,26 @@ pub fn sign_into(
     let e0 = e0h.finalize();
 
     // --- Borromean signature, closing pass ---------------------------
+    let mut step = step0;
     for i in 0..layout.rings {
         let start = layout.starts[i];
         let mut e = borromean_hash(&m, &e0, i as u32, 0);
         let mut e_known = [0u8; 32];
+        if i > 0 {
+            step = next_step(&step);
+        }
+        let neg_step = step.negate();
+        let mut member = digit_commits[i];
         for j in 0..layout.rsizes[i] {
             let is_known = (j as u64).ct_eq(&digits[i]);
             e_known = <[u8; 32]>::conditional_select(&e, &e_known, is_known);
             if j + 1 < layout.rsizes[i] {
                 let scalar = Scalar::from_bytes_be_reduce(&e);
                 let sj = Scalar::from_bytes_be_reduce(&s[start + j]);
-                let r = ProjectivePoint::mul_generator(&sj).add(&member(i, j).mul(&scalar));
+                if j > 0 {
+                    member = member.add(&neg_step);
+                }
+                let r = ProjectivePoint::mul_generator(&sj).add(&member.mul(&scalar));
                 e = borromean_hash(&m, &sec1(&r), i as u32, (j + 1) as u32);
             }
         }
@@ -1371,22 +1384,21 @@ pub fn rewind(
 
     // The digits of every ring but the last follow from its blinding share:
     // Cᵢ − rᵢ·G must be dᵢ·4ⁱ·scale·H.
-    let gen_point = generator.as_point();
     let mut digits = [0u64; MAX_RINGS];
+    let mut step = first_step(&parsed.gen_point, params.scale);
     for i in 0..layout.rings - 1 {
+        if i > 0 {
+            step = next_step(&step);
+        }
         let share = Scalar::from_bytes_be_reduce(&sec[i]);
-        // Member 0 of ring `i` is the digit commitment itself.
-        let target = parsed
-            .member(i, 0)
-            .add(&ProjectivePoint::mul_generator(&share).negate());
+        let target = parsed.digit_commits[i].add(&ProjectivePoint::mul_generator(&share).negate());
         let mut found = Choice::from(0u8);
+        // Candidates j·stepᵢ, walked by addition from the identity.
+        let mut candidate = ProjectivePoint::identity();
         for j in 0..layout.rsizes[i] {
-            let offset = member_offset(j as u64, i, params.scale);
-            let candidate = if offset == 0 {
-                ProjectivePoint::identity()
-            } else {
-                gen_point.mul(&value_scalar(offset))
-            };
+            if j > 0 {
+                candidate = candidate.add(&step);
+            }
             let hit = target.ct_eq(&candidate);
             digits[i] = u64::conditional_select(&(j as u64), &digits[i], hit);
             found |= hit;
