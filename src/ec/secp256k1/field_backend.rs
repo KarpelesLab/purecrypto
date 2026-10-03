@@ -501,11 +501,7 @@ impl FieldBackend for Secp256k1Field {
     }
     fn sqrt(&self, a: &Fe) -> CtOption {
         // p ≡ 3 (mod 4) ⇒ candidate root a^((p+1)/4); valid iff its square == a.
-        // (p + 1)/4 = [1]²²³ 0 [1]²² 0000 11 00 in binary: the same prefix as
-        // the inverse, then 6 + 2 more squarings and one multiplication.
-        let (x2, t) = self.pow_chain_prefix(a);
-        let t = self.mul(&self.sqn(&t, 6), &x2);
-        let cand = self.sqn(&t, 2);
+        let cand = self.sqrt_candidate(a);
         let ok = self.square(&cand).ct_eq(a);
         CtOption::new(cand, ok)
     }
@@ -522,6 +518,17 @@ impl FieldBackend for Secp256k1Field {
 }
 
 impl Secp256k1Field {
+    /// The principal square-root candidate `a^((p+1)/4)`, whether or not `a`
+    /// is a residue (for a non-residue its square is `−a`).
+    ///
+    /// (p + 1)/4 = [1]²²³ 0 [1]²² 0000 11 00 in binary: the inverse's chain
+    /// prefix, then 6 + 2 more squarings and one multiplication.
+    pub(crate) fn sqrt_candidate(&self, a: &Fe) -> Fe {
+        let (x2, t) = self.pow_chain_prefix(a);
+        let t = self.mul(&self.sqn(&t, 6), &x2);
+        self.sqn(&t, 2)
+    }
+
     /// `a^(2^n)`: `n` successive squarings.
     #[inline]
     fn sqn(&self, a: &Fe, n: u32) -> Fe {

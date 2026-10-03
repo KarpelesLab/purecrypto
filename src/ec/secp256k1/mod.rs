@@ -41,7 +41,7 @@
 pub mod schnorr;
 
 pub mod ecdsa;
-mod field_backend;
+pub(crate) mod field_backend;
 mod group;
 mod vartime;
 

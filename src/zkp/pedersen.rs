@@ -138,9 +138,10 @@
 //! in practice): this module reduces it modulo `p`, and no vector exercises
 //! that path. Nothing else in the wire format is left unchecked.
 
-use crate::bignum::{MontModulus, Uint};
+use crate::bignum::Uint;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::ec::Error;
+use crate::ec::secp256k1::field_backend::{FieldBackend, Secp256k1Field};
 use crate::ec::secp256k1::{AffinePoint, ProjectivePoint, Scalar};
 use crate::hash::sha256;
 use crate::zeroize::Zeroize;
@@ -187,7 +188,9 @@ const fn hex_digit(c: u8) -> u8 {
 /// The base field prime `p = 2²⁵⁶ − 2³² − 977`.
 const P_BYTES: [u8; 32] = hex32("fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f");
 
-/// `(p + 1) / 4`, the square-root exponent for `p ≡ 3 (mod 4)`.
+/// `(p + 1) / 4`, the square-root exponent for `p ≡ 3 (mod 4)` (the field
+/// computes it by a fixed chain; the tests check the chain against it).
+#[cfg(test)]
 const SQRT_EXP_BYTES: [u8; 32] =
     hex32("3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c");
 
@@ -227,53 +230,58 @@ type Fe = Uint<4>;
 
 /// The secp256k1 base field `GF(p)`.
 ///
-/// A thin wrapper over [`MontModulus`] providing the handful of operations the
-/// hash-to-curve map and the point codec need. All of them are constant time.
+/// A thin wrapper over the curve's native pseudo-Mersenne backend
+/// ([`Secp256k1Field`]: stateless, with fixed addition chains for the inverse
+/// and square root) providing the handful of operations the hash-to-curve map
+/// and the point codec need. All of them are constant time.
 struct Field {
-    m: MontModulus<4>,
+    b: Secp256k1Field,
 }
 
+/// The modulus `p`, decoded at compile time.
+const P: Fe = Fe::from_be_bytes(&P_BYTES);
+
 impl Field {
-    /// Builds the field context.
+    /// Builds the field context (free: the backend is stateless).
     fn new() -> Field {
         Field {
-            m: MontModulus::new(Fe::from_be_bytes(&P_BYTES)),
+            b: Secp256k1Field::new(),
         }
     }
 
     /// The modulus `p`.
     fn p(&self) -> &Fe {
-        self.m.modulus()
+        &P
     }
 
     /// `a + b mod p`.
     fn add(&self, a: &Fe, b: &Fe) -> Fe {
-        self.m.add_mod(a, b)
+        self.b.add(a, b)
     }
 
     /// `a − b mod p`.
     fn sub(&self, a: &Fe, b: &Fe) -> Fe {
-        self.m.sub_mod(a, b)
+        self.b.sub(a, b)
     }
 
     /// `a · b mod p`.
     fn mul(&self, a: &Fe, b: &Fe) -> Fe {
-        self.m.mul_mod(a, b)
+        self.b.mul(a, b)
     }
 
     /// `a² mod p`.
     fn sqr(&self, a: &Fe) -> Fe {
-        self.m.mul_mod(a, a)
+        self.b.square(a)
     }
 
     /// `−a mod p`.
     fn neg(&self, a: &Fe) -> Fe {
-        self.m.sub_mod(&Fe::ZERO, a)
+        self.b.negate(a)
     }
 
     /// `a⁻¹ mod p`, or `0` when `a == 0`.
     fn inv(&self, a: &Fe) -> Fe {
-        self.m.inv_prime(a)
+        self.b.invert(a)
     }
 
     /// The principal square root `a^((p+1)/4) mod p`.
@@ -282,7 +290,7 @@ impl Field {
     /// its square is `−a`. Since `p ≡ 7 (mod 8)` the exponent is even, so the
     /// result is always itself a quadratic residue.
     fn sqrt(&self, a: &Fe) -> Fe {
-        self.m.pow(a, &Fe::from_be_bytes(&SQRT_EXP_BYTES))
+        self.b.sqrt_candidate(a)
     }
 
     /// Returns a [`Choice`] that is true iff `a` is a quadratic residue
@@ -1061,6 +1069,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(neg, expect);
+    }
+
+    /// The backend-wrapping `Field` against the generic Montgomery
+    /// arithmetic it replaced, on edge values and a random sweep.
+    #[test]
+    fn field_matches_montgomery_reference() {
+        let f = Field::new();
+        let m = crate::bignum::MontModulus::new(P);
+        let e = Fe::from_be_bytes(&SQRT_EXP_BYTES);
+        let mut x = 0x0123_4567_89ab_cdefu64;
+        let mut next = || {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut cases = [Fe::ZERO; 260];
+        cases[1] = Fe::ONE;
+        cases[2] = P.wrapping_sub(&Fe::ONE);
+        cases[3] = Fe::from_u64(7);
+        for c in &mut cases[4..] {
+            *c = Fe::from_limbs([next(), next(), next(), next()]).reduce(&P);
+        }
+        for (i, a) in cases.iter().enumerate() {
+            let b = &cases[(i * 31 + 7) % cases.len()];
+            assert_eq!(f.add(a, b), m.add_mod(a, b));
+            assert_eq!(f.sub(a, b), m.sub_mod(a, b));
+            assert_eq!(f.mul(a, b), m.mul_mod(a, b));
+            assert_eq!(f.sqr(a), m.mul_mod(a, a));
+            assert_eq!(f.neg(a), m.sub_mod(&Fe::ZERO, a));
+            assert_eq!(f.inv(a), m.inv_prime(a));
+            assert_eq!(f.sqrt(a), m.pow(a, &e));
+        }
     }
 
     #[test]
