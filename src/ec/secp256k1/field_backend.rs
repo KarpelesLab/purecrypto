@@ -71,6 +71,7 @@ pub(crate) const fn p() -> Fe {
 }
 
 /// The square-root exponent `(p + 1) / 4` for the `p ≡ 3 (mod 4)` root formula.
+#[cfg_attr(not(test), allow(dead_code))]
 fn sqrt_exponent() -> Fe {
     // (p + 1) / 4. Computed directly from p to avoid a second hard-coded constant.
     let p_plus_1 = p().wrapping_add(&Fe::ONE);
@@ -78,6 +79,7 @@ fn sqrt_exponent() -> Fe {
 }
 
 /// The Fermat-inverse exponent `p - 2`, computed directly from `p`.
+#[cfg(test)]
 fn p_minus_2() -> Fe {
     p().wrapping_sub(&Fe::from_u64(2))
 }
@@ -463,13 +465,20 @@ impl FieldBackend for Secp256k1Field {
         Fe::from_limbs(out)
     }
     fn invert(&self, a: &Fe) -> Fe {
-        // Fermat: a^(p-2). Public exponent, secret base — square-and-(always)
-        // multiply keeps it constant time in the base.
-        self.pow(a, &p_minus_2())
+        // Fermat: a^(p-2), with p − 2 = [1]²²³ 0 [1]²² 0000 101101 in binary
+        // (libsecp256k1's chain): 255 squarings and 15 multiplications.
+        let (x2, t) = self.pow_chain_prefix(a);
+        let t = self.mul(&self.sqn(&t, 5), a);
+        let t = self.mul(&self.sqn(&t, 3), &x2);
+        self.mul(&self.sqn(&t, 2), a)
     }
     fn sqrt(&self, a: &Fe) -> CtOption {
         // p ≡ 3 (mod 4) ⇒ candidate root a^((p+1)/4); valid iff its square == a.
-        let cand = self.pow(a, &sqrt_exponent());
+        // (p + 1)/4 = [1]²²³ 0 [1]²² 0000 11 00 in binary: the same prefix as
+        // the inverse, then 6 + 2 more squarings and one multiplication.
+        let (x2, t) = self.pow_chain_prefix(a);
+        let t = self.mul(&self.sqn(&t, 6), &x2);
+        let cand = self.sqn(&t, 2);
         let ok = self.square(&cand).ct_eq(a);
         CtOption::new(cand, ok)
     }
@@ -486,10 +495,49 @@ impl FieldBackend for Secp256k1Field {
 }
 
 impl Secp256k1Field {
+    /// `a^(2^n)`: `n` successive squarings.
+    #[inline]
+    fn sqn(&self, a: &Fe, n: u32) -> Fe {
+        let mut r = *a;
+        for _ in 0..n {
+            r = self.square(&r);
+        }
+        r
+    }
+
+    /// The shared head of the fixed inversion / square-root addition chains
+    /// (libsecp256k1's `secp256k1_fe_inv` / `_sqrt`). Writing `xk` for
+    /// `a^(2^k − 1)` (k one bits), returns `(x2, x223·2²³ · x22)`, the second
+    /// being `a` raised to `[1]²²³ 0 [1]²²`, the top 246 bits both exponents
+    /// share.
+    ///
+    /// The chain is a fixed sequence of squarings and multiplications set by
+    /// the public modulus alone, so it is constant time in `a` without any
+    /// per-bit select.
+    fn pow_chain_prefix(&self, a: &Fe) -> (Fe, Fe) {
+        let x2 = self.mul(&self.square(a), a);
+        let x3 = self.mul(&self.square(&x2), a);
+        let x6 = self.mul(&self.sqn(&x3, 3), &x3);
+        let x9 = self.mul(&self.sqn(&x6, 3), &x3);
+        let x11 = self.mul(&self.sqn(&x9, 2), &x2);
+        let x22 = self.mul(&self.sqn(&x11, 11), &x11);
+        let x44 = self.mul(&self.sqn(&x22, 22), &x22);
+        let x88 = self.mul(&self.sqn(&x44, 44), &x44);
+        let x176 = self.mul(&self.sqn(&x88, 88), &x88);
+        let x220 = self.mul(&self.sqn(&x176, 44), &x44);
+        let x223 = self.mul(&self.sqn(&x220, 3), &x3);
+        let t = self.mul(&self.sqn(&x223, 23), &x22);
+        (x2, t)
+    }
+
+    /// Generic exponentiation, kept as the test oracle for the fixed
+    /// addition chains above.
+    ///
     /// Constant-time modular exponentiation by a **public** exponent, via
     /// square-and-always-multiply (Montgomery-ladder-style: the multiply runs
     /// every bit and the result is selected by the public exponent bit, so the
     /// secret base never drives a branch).
+    #[cfg(test)]
     fn pow(&self, base: &Fe, exp: &Fe) -> Fe {
         let exp = exp.as_limbs();
         let mut acc = Fe::ONE;
@@ -682,6 +730,35 @@ mod backend_tests {
         for _ in 0..20_000 {
             let a = rand_fe(&mut rng);
             check_unary(&g, &n, &a);
+        }
+    }
+
+    /// The fixed inversion / square-root chains against the generic
+    /// square-and-multiply `pow` they replaced, on the edge values and a
+    /// random sweep (the raw chain output is compared even for non-residues).
+    #[test]
+    fn addition_chains_match_generic_pow() {
+        let n = Secp256k1Field::new();
+        let check = |a: &Fe| {
+            assert_eq!(
+                bytes(&n.invert(a)),
+                bytes(&n.pow(a, &p_minus_2())),
+                "invert chain: a={:x?}",
+                a.as_limbs()
+            );
+            assert_eq!(
+                bytes(&n.sqrt(a).value),
+                bytes(&n.pow(a, &sqrt_exponent())),
+                "sqrt chain: a={:x?}",
+                a.as_limbs()
+            );
+        };
+        for a in &edge_cases() {
+            check(a);
+        }
+        let mut rng = SplitMix64(0x5EC9_256B_1C4A_17F0);
+        for _ in 0..2_000 {
+            check(&rand_fe(&mut rng));
         }
     }
 
