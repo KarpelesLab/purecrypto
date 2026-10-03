@@ -47,8 +47,11 @@ use crate::hash::{Digest, Hmac};
 #[cfg_attr(not(feature = "std"), doc = "", doc = "[super::OsRng]: crate#no_std")]
 #[derive(Clone)]
 pub struct HmacDrbg<D: Digest> {
-    /// HMAC key.
-    k: D::Output,
+    /// HMAC keyed with the current key `K`: the ipad/opad blocks absorbed
+    /// once per key, cloned for every HMAC under that key. `K` itself is
+    /// never needed again (every SP 800-90A use of `K` is as an HMAC key).
+    /// `Hmac` wipes its state on drop.
+    keyed: Hmac<D>,
     /// Internal value updated on each output block.
     v: D::Output,
     reseed_counter: u64,
@@ -77,44 +80,51 @@ impl<D: Digest> HmacDrbg<D> {
             "HMAC-DRBG requires non-empty entropy input (SP 800-90A §8.6.5)"
         );
         // K = 0x00…, V = 0x01…
-        let k = D::zeroed_output();
+        let mut k = D::zeroed_output();
         let mut v = D::zeroed_output();
         for b in v.as_mut() {
             *b = 0x01;
         }
         let mut drbg = HmacDrbg {
-            k,
+            keyed: Hmac::new(k.as_ref()),
             v,
             reseed_counter: 1,
         };
+        crate::zeroize::Zeroize::zeroize(k.as_mut());
         drbg.update(&[entropy, nonce, personalization]);
         drbg
+    }
+
+    /// `HMAC(K, V)` under the cached key.
+    #[inline]
+    fn mac_v(&self) -> D::Output {
+        let mut mac = self.keyed.clone();
+        mac.update(self.v.as_ref());
+        mac.finalize()
+    }
+
+    /// Re-keys to `K = HMAC(K, V || sep || provided)` and then sets
+    /// `V = HMAC(K, V)` under the new key.
+    fn rekey(&mut self, sep: u8, provided: &[&[u8]]) {
+        let mut mac = self.keyed.clone();
+        mac.update(self.v.as_ref());
+        mac.update(&[sep]);
+        for p in provided {
+            mac.update(p);
+        }
+        let mut k = mac.finalize();
+        self.keyed = Hmac::new(k.as_ref());
+        crate::zeroize::Zeroize::zeroize(k.as_mut());
+        self.v = self.mac_v();
     }
 
     /// The SP 800-90A `HMAC_DRBG_Update` step over the concatenation of
     /// `provided`.
     fn update(&mut self, provided: &[&[u8]]) {
-        // K = HMAC(K, V || 0x00 || provided)
-        let mut mac = Hmac::<D>::new(self.k.as_ref());
-        mac.update(self.v.as_ref());
-        mac.update(&[0x00]);
-        for p in provided {
-            mac.update(p);
-        }
-        self.k = mac.finalize();
-        // V = HMAC(K, V)
-        self.v = Hmac::<D>::mac(self.k.as_ref(), self.v.as_ref());
-
+        self.rekey(0x00, provided);
         // The second pass runs only when there was provided data.
         if provided.iter().any(|p| !p.is_empty()) {
-            let mut mac = Hmac::<D>::new(self.k.as_ref());
-            mac.update(self.v.as_ref());
-            mac.update(&[0x01]);
-            for p in provided {
-                mac.update(p);
-            }
-            self.k = mac.finalize();
-            self.v = Hmac::<D>::mac(self.k.as_ref(), self.v.as_ref());
+            self.rekey(0x01, provided);
         }
     }
 
@@ -180,7 +190,7 @@ impl<D: Digest> HmacDrbg<D> {
 
         let mut filled = 0;
         while filled < out.len() {
-            self.v = Hmac::<D>::mac(self.k.as_ref(), self.v.as_ref());
+            self.v = self.mac_v();
             let block = self.v.as_ref();
             let n = (out.len() - filled).min(block.len());
             out[filled..filled + n].copy_from_slice(&block[..n]);
@@ -194,11 +204,11 @@ impl<D: Digest> HmacDrbg<D> {
 
 impl<D: Digest> Drop for HmacDrbg<D> {
     fn drop(&mut self) {
-        // Wipe the secret HMAC key and chaining value so they do not linger
-        // in freed memory, with the volatile stores in `crate::zeroize`
-        // (which LLVM may not elide), as `HmacPrf` in `kdf::kbkdf` does.
+        // Wipe the secret chaining value so it does not linger in freed
+        // memory, with the volatile stores in `crate::zeroize` (which LLVM
+        // may not elide), as `HmacPrf` in `kdf::kbkdf` does. The keyed HMAC
+        // state wipes itself in its own `Drop`.
         use crate::zeroize::Zeroize;
-        self.k.as_mut().zeroize();
         self.v.as_mut().zeroize();
     }
 }
@@ -329,6 +339,85 @@ mod tests {
         let mut buf = [0u8; MAX_BYTES_PER_REQUEST];
         a.generate(&mut buf, &[]);
         assert_eq!(a.reseed_counter, 2);
+    }
+
+    /// The literal SP 800-90A HMAC-DRBG, re-keying `HMAC(K, ·)` from the raw
+    /// key on every call (the implementation the cached-key one replaced),
+    /// as a bit-exact oracle.
+    struct RefDrbg {
+        k: [u8; 32],
+        v: [u8; 32],
+    }
+
+    impl RefDrbg {
+        fn update(&mut self, provided: &[&[u8]]) {
+            for sep in [0u8, 1] {
+                if sep == 1 && provided.iter().all(|p| p.is_empty()) {
+                    break;
+                }
+                let mut mac = Hmac::<Sha256>::new(&self.k);
+                mac.update(&self.v);
+                mac.update(&[sep]);
+                for p in provided {
+                    mac.update(p);
+                }
+                self.k = mac.finalize();
+                self.v = Hmac::<Sha256>::mac(&self.k, &self.v);
+            }
+        }
+
+        fn generate(&mut self, out: &mut [u8], additional: &[u8]) {
+            if !additional.is_empty() {
+                self.update(&[additional]);
+            }
+            for chunk in out.chunks_mut(32) {
+                self.v = Hmac::<Sha256>::mac(&self.k, &self.v);
+                chunk.copy_from_slice(&self.v[..chunk.len()]);
+            }
+            self.update(&[additional]);
+        }
+    }
+
+    #[test]
+    fn matches_rekeying_reference() {
+        let mut x = 0x0123_4567_89ab_cdefu64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut bytes = [0u8; 200];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37) ^ 0x5c;
+        }
+        for _ in 0..40 {
+            let (e, n, p) = (
+                1 + next() as usize % 64,
+                next() as usize % 32,
+                next() as usize % 80,
+            );
+            let mut d =
+                HmacDrbg::<Sha256>::new(&bytes[..e], &bytes[50..50 + n], &bytes[100..100 + p]);
+            let mut r = RefDrbg {
+                k: [0; 32],
+                v: [1; 32],
+            };
+            r.update(&[&bytes[..e], &bytes[50..50 + n], &bytes[100..100 + p]]);
+            for _ in 0..4 {
+                let len = next() as usize % 130;
+                let add = &bytes[next() as usize % 100..][..next() as usize % 3 * 17];
+                let (mut a, mut b) = ([0u8; 130], [0u8; 130]);
+                d.generate(&mut a[..len], add);
+                r.generate(&mut b[..len], add);
+                assert_eq!(a[..len], b[..len]);
+                if next() % 3 == 0 {
+                    let ent = &bytes[next() as usize % 100..][..1 + next() as usize % 40];
+                    d.reseed(ent, add);
+                    r.update(&[ent, add]);
+                }
+            }
+        }
     }
 
     #[test]
