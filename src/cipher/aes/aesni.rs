@@ -36,6 +36,17 @@ pub(super) unsafe fn aes_round(state: [u8; 16], rk: [u8; 16]) -> [u8; 16] {
     }
 }
 
+/// SubWord for the key schedule: `AESKEYGENASSIST` with a zero round constant
+/// puts `SubWord(X[1])` in lane 0 (RotWord and Rcon stay in the shared
+/// software schedule, which keeps the round-constant immediate out of a
+/// per-round match).
+#[target_feature(enable = "aes,sse2")]
+pub(super) unsafe fn sub_word(w: [u8; 4]) -> [u8; 4] {
+    let v = _mm_set1_epi32(i32::from_le_bytes(w));
+    let s = _mm_aeskeygenassist_si128::<0>(v);
+    _mm_cvtsi128_si32(s).to_le_bytes()
+}
+
 /// Single forward block via AES-NI.
 #[target_feature(enable = "aes,sse2")]
 pub(super) unsafe fn encrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8; 16]) {

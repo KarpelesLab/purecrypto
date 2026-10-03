@@ -194,10 +194,19 @@ fn inv_mix_columns(s: u128) -> u128 {
     mix_columns(s ^ xtime(xtime(s ^ rot_columns::<2>(s))))
 }
 
-/// SubWord: the S-box on the four bytes of a key-schedule word, through the
-/// bitsliced S-box (the spare twelve lanes are zero).
+/// SubWord: the S-box on the four bytes of a key-schedule word, on the
+/// backend's S-box (the AES instruction when present, else the bitsliced
+/// circuit with the spare lanes zero).
 #[inline]
-fn sub_word(w: [u8; 4]) -> [u8; 4] {
+#[allow(unsafe_code)]
+fn sub_word(backend: AesBackend, w: [u8; 4]) -> [u8; 4] {
+    match backend {
+        AesBackend::Software => {}
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        AesBackend::Hardware => return unsafe { aesni::sub_word(w) },
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        AesBackend::Hardware => return unsafe { aes_arm::sub_word(w) },
+    }
     let mut s = [u32::from_le_bytes(w) as u128];
     sub_layer(&mut s, false);
     let out = (s[0] as u32).to_le_bytes();
@@ -208,7 +217,7 @@ fn sub_word(w: [u8; 4]) -> [u8; 4] {
 /// Expands `key` (`nk` 32-bit words) into `out`, the round-key bytes for `nr`
 /// rounds (`16 * (nr + 1)` bytes). The control flow depends only on the public
 /// key length, not on key contents.
-fn key_expansion(key: &[u8], nk: usize, nr: usize, out: &mut [u8]) {
+fn key_expansion(backend: AesBackend, key: &[u8], nk: usize, nr: usize, out: &mut [u8]) {
     let total_words = 4 * (nr + 1);
     out[..key.len()].copy_from_slice(key);
 
@@ -227,13 +236,13 @@ fn key_expansion(key: &[u8], nk: usize, nr: usize, out: &mut [u8]) {
 
         if i % nk == 0 {
             // RotWord, then SubWord, then XOR the round constant.
-            t = sub_word([t[1], t[2], t[3], t[0]]);
+            t = sub_word(backend, [t[1], t[2], t[3], t[0]]);
             t[0] ^= rcon;
             // rcon = xtime(rcon); public, so the branch is fine.
             rcon = (rcon << 1) ^ if rcon & 0x80 != 0 { 0x1b } else { 0 };
         } else if nk > 6 && i % nk == 4 {
             // AES-256 applies an extra SubWord a quarter of the way in.
-            t = sub_word(t);
+            t = sub_word(backend, t);
         }
 
         let base = i * 4;
@@ -365,8 +374,9 @@ macro_rules! aes_variant {
             /// selected once here.
             pub fn new(key: &[u8; $key_bytes]) -> Self {
                 let mut rk = [0u8; $rk_len];
-                key_expansion(key, $nk, $nr, &mut rk);
-                $name { rk, backend: detect_backend() }
+                let backend = detect_backend();
+                key_expansion(backend, key, $nk, $nr, &mut rk);
+                $name { rk, backend }
             }
 
             /// Forces the constant-time software backend, regardless of CPU
@@ -375,7 +385,7 @@ macro_rules! aes_variant {
             #[cfg(test)]
             pub(crate) fn new_software(key: &[u8; $key_bytes]) -> Self {
                 let mut rk = [0u8; $rk_len];
-                key_expansion(key, $nk, $nr, &mut rk);
+                key_expansion(AesBackend::Software, key, $nk, $nr, &mut rk);
                 $name { rk, backend: AesBackend::Software }
             }
         }
@@ -607,6 +617,23 @@ mod tests {
 
     fn fwd_xor(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
         core::array::from_fn(|i| a[i] ^ b[i])
+    }
+
+    /// The key-schedule SubWord on the detected backend (the AES instruction
+    /// on a host that has one) must match the bitsliced software S-box for
+    /// every byte value in every lane.
+    #[test]
+    fn sub_word_backends_agree() {
+        let hw = detect_backend();
+        for x in 0u32..256 {
+            for lane in 0..4 {
+                let w = (0x9e37_79b9u32.rotate_left(x) & !(0xff << (8 * lane)) | x << (8 * lane))
+                    .to_le_bytes();
+                let expect: [u8; 4] = core::array::from_fn(|i| gf::sub_byte(w[i]));
+                assert_eq!(sub_word(AesBackend::Software, w), expect, "sw {w:02x?}");
+                assert_eq!(sub_word(hw, w), expect, "hw {w:02x?}");
+            }
+        }
     }
 
     /// The hardware bare AES round must equal the software round for all inputs.

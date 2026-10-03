@@ -108,6 +108,18 @@ pub(super) unsafe fn aes_round(state: [u8; 16], rk: [u8; 16]) -> [u8; 16] {
     }
 }
 
+/// SubWord for the key schedule. With the word broadcast to all four columns,
+/// ShiftRows only moves bytes between identical columns, so lane 0 of
+/// `AESE(dup(w), 0)` is exactly `SubBytes(w)`.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn sub_word(w: [u8; 4]) -> [u8; 4] {
+    unsafe {
+        let v = vreinterpretq_u8_u32(vdupq_n_u32(u32::from_le_bytes(w)));
+        let s = vaeseq_u8(v, vdupq_n_u8(0));
+        vgetq_lane_u32::<0>(vreinterpretq_u32_u8(s)).to_le_bytes()
+    }
+}
+
 /// Single forward block.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn encrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8; 16]) {
