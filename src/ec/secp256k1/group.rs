@@ -241,7 +241,7 @@ impl Point {
     }
 
     /// Converts to affine `(x, y)`, returning `None` for the identity. The
-    /// inversion uses the constant-time Fermat inverse from the field backend.
+    /// inversion uses the constant-time safegcd inverse from the field backend.
     // Takes `&self` for consistency with the other by-reference point ops.
     #[allow(clippy::wrong_self_convention)]
     ///

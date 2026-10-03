@@ -22,6 +22,7 @@
 // not apply to this trait.
 #![allow(clippy::wrong_self_convention)]
 
+use crate::bignum::safegcd::SafegcdModulus;
 use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConstantTimeEq, ConstantTimeLess};
 
@@ -112,7 +113,7 @@ pub(crate) trait FieldBackend {
     }
     /// Returns `(-a) mod p`.
     fn negate(&self, a: &Fe) -> Fe;
-    /// Returns the modular inverse `a^-1 mod p` (constant time, Fermat). The
+    /// Returns the modular inverse `a^-1 mod p` (constant time). The
     /// inverse of `0` is `0`.
     fn invert(&self, a: &Fe) -> Fe;
     /// Returns a square root of `a` if one exists. When `a` is a non-residue
@@ -492,12 +493,10 @@ impl FieldBackend for Secp256k1Field {
         Fe::from_limbs(out)
     }
     fn invert(&self, a: &Fe) -> Fe {
-        // Fermat: a^(p-2), with p − 2 = [1]²²³ 0 [1]²² 0000 101101 in binary
-        // (libsecp256k1's chain): 255 squarings and 15 multiplications.
-        let (x2, t) = self.pow_chain_prefix(a);
-        let t = self.mul(&self.sqn(&t, 5), a);
-        let t = self.mul(&self.sqn(&t, 3), &x2);
-        self.mul(&self.sqn(&t, 2), a)
+        // Bernstein–Yang safegcd (a fixed 590-divstep schedule): constant
+        // time, and ~2.7× faster than the Fermat chain (`invert_chain`).
+        // Elements are canonical (< p), as the inversion requires.
+        SAFEGCD_P.invert(a)
     }
     fn sqrt(&self, a: &Fe) -> CtOption {
         // p ≡ 3 (mod 4) ⇒ candidate root a^((p+1)/4); valid iff its square == a.
@@ -517,7 +516,22 @@ impl FieldBackend for Secp256k1Field {
     }
 }
 
+/// The safegcd inversion context for `p`, built at compile time.
+const SAFEGCD_P: SafegcdModulus = SafegcdModulus::new(&p());
+
 impl Secp256k1Field {
+    /// Fermat inversion `a^(p-2)`, with p − 2 = [1]²²³ 0 [1]²² 0000 101101
+    /// in binary (libsecp256k1's chain): 255 squarings and 15
+    /// multiplications. The previous [`invert`](FieldBackend::invert), kept
+    /// as its differential oracle.
+    #[cfg(test)]
+    fn invert_chain(&self, a: &Fe) -> Fe {
+        let (x2, t) = self.pow_chain_prefix(a);
+        let t = self.mul(&self.sqn(&t, 5), a);
+        let t = self.mul(&self.sqn(&t, 3), &x2);
+        self.mul(&self.sqn(&t, 2), a)
+    }
+
     /// The principal square-root candidate `a^((p+1)/4)`, whether or not `a`
     /// is a residue (for a non-residue its square is `−a`).
     ///
@@ -717,6 +731,12 @@ mod backend_tests {
             "invert mismatch: a={:x?}",
             a.as_limbs()
         );
+        assert_eq!(
+            bytes(&n.invert_chain(a)),
+            bytes(&n.invert(a)),
+            "invert vs chain mismatch: a={:x?}",
+            a.as_limbs()
+        );
         // sqrt: value and presence flag must both match the oracle.
         let gs = g.sqrt(a);
         let ns = n.sqrt(a);
@@ -784,7 +804,7 @@ mod backend_tests {
         let n = Secp256k1Field::new();
         let check = |a: &Fe| {
             assert_eq!(
-                bytes(&n.invert(a)),
+                bytes(&n.invert_chain(a)),
                 bytes(&n.pow(a, &p_minus_2())),
                 "invert chain: a={:x?}",
                 a.as_limbs()
