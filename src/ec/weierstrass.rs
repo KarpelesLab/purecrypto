@@ -397,7 +397,7 @@ impl Curve {
 
     /// Whether `v` is a valid field element (`v < p`).
     pub(crate) fn in_field(&self, v: &BoxedUint) -> bool {
-        // v < p  ⟺  v mod p == v.
-        v.reduce(&self.fp.modulus()) == *v
+        // `v` is a public coordinate, so the variable-time compare is fine.
+        v.lt(&self.fp.modulus())
     }
 }

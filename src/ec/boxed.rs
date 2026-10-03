@@ -15,7 +15,7 @@ use super::curves::CurveId;
 #[cfg(feature = "der")]
 const EC_PUBLIC_KEY_OID: &[u64] = &[1, 2, 840, 10045, 2, 1];
 use crate::bignum::BoxedUint;
-use crate::ct::ConstantTimeEq;
+use crate::ct::{Choice, ConstantTimeEq};
 use crate::hash::{Digest, Hmac};
 use crate::rng::{CryptoRng, RngCore};
 use crate::zeroize::Zeroize;
@@ -78,7 +78,41 @@ fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
     // Public in every caller: a key-import verdict the caller sees as
     // `Ok`/`Err`, or an RFC 6979 / rejection-sampling decision whose only
     // observable is the (public) retry count.
-    (!v.ct_is_zero() & v.reduce(n).ct_eq(v)).declassify()
+    (!v.ct_is_zero() & ct_lt(v, n)).declassify()
+}
+
+/// `a < b` as a [`Choice`]: one borrow chain over the wider of the two
+/// (public) limb widths, with no branch on and no allocation for the values,
+/// so either operand may be secret. Replaces `v.reduce(n) == v`, a
+/// bit-serial long division allocating three vectors per bit.
+pub(super) fn ct_lt(a: &BoxedUint, b: &BoxedUint) -> Choice {
+    let (a, b) = (a.as_limbs(), b.as_limbs());
+    let mut borrow = 0u64;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        let d = (x as u128)
+            .wrapping_sub(y as u128)
+            .wrapping_sub(borrow as u128);
+        borrow = ((d >> 64) as u64) & 1;
+    }
+    Choice::from(borrow as u8)
+}
+
+/// `v mod n` for `v < 2n`, by one masked subtraction (constant time in `v`),
+/// returned at `n`'s limb width — the width `BoxedUint::reduce` produces.
+///
+/// Every caller is within that bound:
+/// - `bits2int(h, qlen)` with `qlen = n.bit_len()` is `< 2^qlen ≤ 2n`, since
+///   `n ≥ 2^(qlen-1)`;
+/// - an affine x-coordinate is `< p`, and `p < 2n` on every supported curve:
+///   they all have cofactor 1, so Hasse gives `n ≥ p + 1 − 2√p > p / 2`;
+/// - an SM3 digest is `< 2^256 < 2n` for SM2's `n > 2^255`.
+pub(super) fn reduce_once(v: &BoxedUint, n: &BoxedUint) -> BoxedUint {
+    let below = ct_lt(v, n);
+    let r = BoxedUint::conditional_select(v, &v.sub(n), below);
+    // Both candidates fit `n`'s width (`v < n`, or `v − n < n`).
+    BoxedUint::from_limbs(r.as_limbs()[..n.limbs()].to_vec())
 }
 
 /// RFC 6979 `bits2int`: the integer of the leftmost `qlen` bits of `data`.
@@ -138,7 +172,7 @@ fn generate_k<D: Digest>(
     qlen: usize,
 ) -> BoxedUint {
     let mut d_oct = d.to_be_bytes(order_len);
-    let mut h_oct = bits2int(hash, qlen).reduce(n).to_be_bytes(order_len);
+    let mut h_oct = reduce_once(&bits2int(hash, qlen), n).to_be_bytes(order_len);
 
     let mut v = D::zeroed_output();
     for b in v.as_mut() {
@@ -624,7 +658,7 @@ impl BoxedEcdsaPublicKey {
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
         }
-        let z = bits2int(prehash, n.bit_len()).reduce(&n);
+        let z = reduce_once(&bits2int(prehash, n.bit_len()), &n);
         let w = c.invert_scalar(&sig.s);
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
@@ -632,7 +666,7 @@ impl BoxedEcdsaPublicKey {
         let point = c.lift_affine(&self.x, &self.y);
         let sum = c.point_add(&c.mul_generator(&u1), &c.scalar_mul(&u2, &point));
         let (vx, _) = c.to_affine(&sum).ok_or(Error::Verification)?;
-        let v = vx.reduce(&n);
+        let v = reduce_once(&vx, &n);
         if bool::from(v.ct_eq(&sig.r)) {
             Ok(())
         } else {
@@ -733,7 +767,7 @@ impl BoxedEcdsaPrivateKey {
         let fq = c.order_modulus();
         let order_len = self.curve.order_len();
 
-        let z = bits2int(prehash, n.bit_len()).reduce(&n);
+        let z = reduce_once(&bits2int(prehash, n.bit_len()), &n);
         let mut k = generate_k::<D>(&self.d, prehash, &n, order_len, n.bit_len());
 
         let affine = c.to_affine(&c.mul_generator(&k));
@@ -741,7 +775,7 @@ impl BoxedEcdsaPrivateKey {
             k.zeroize();
             return Err(Error::InvalidInput);
         };
-        let r = full_x.reduce(&n);
+        let r = reduce_once(&full_x, &n);
         // `r` is published in the signature; the degenerate `r = 0` is a
         // public error return.
         if r.ct_is_zero().declassify() {
@@ -1003,7 +1037,7 @@ impl BoxedEcdsaSignature {
 
         // Q = u1·G + u2·R with u1 = −z·r⁻¹, u2 = s·r⁻¹ (mod n). r is public, so
         // the variable-time Fermat inverse used elsewhere here is fine.
-        let z = bits2int(prehash, n.bit_len()).reduce(&n);
+        let z = reduce_once(&bits2int(prehash, n.bit_len()), &n);
         let r_inv = c.invert_scalar(&self.r);
         let neg_z = fq.sub_mod(&BoxedUint::zero(1), &z);
         let u1 = fq.mul_mod(&neg_z, &r_inv);
@@ -2595,6 +2629,42 @@ x2dqVh/sT12MnE=\n\
                         slow.map(|k| k.to_sec1()),
                         "{curve:?} recover r={r} recid {recid}"
                     );
+                }
+            }
+        }
+    }
+
+    /// `ct_lt` / `reduce_once` against the bit-serial `lt` / `reduce` they
+    /// replace, for every curve's order and field prime, on the edges of the
+    /// `[0, 2n)` domain and a random sweep (including operands stored wider
+    /// than the modulus, as a 64-byte digest is).
+    #[test]
+    fn reduce_once_matches_long_division() {
+        let mut st = 0xd1ff_u64;
+        for &curve in CurveId::ALL {
+            let c = curve.curve();
+            for m in [c.order().clone(), c.field_modulus()] {
+                let one = BoxedUint::from_u64(1);
+                let two_m = m.add(&m);
+                let mut vals = vec![
+                    BoxedUint::zero(1),
+                    one.clone(),
+                    m.sub(&one),
+                    m.clone(),
+                    m.add(&one),
+                    two_m.sub(&one),
+                    BoxedUint::from_limbs(vec![0; m.limbs() + 3]),
+                ];
+                for _ in 0..64 {
+                    let bytes = rand_bytes(&mut st, 8 * m.limbs() + 8);
+                    vals.push(BoxedUint::from_be_bytes(&bytes).reduce(&two_m));
+                }
+                for v in &vals {
+                    assert_eq!(bool::from(ct_lt(v, &m)), v.lt(&m), "{curve:?}");
+                    assert_eq!(bool::from(ct_lt(&m, v)), m.lt(v), "{curve:?}");
+                    let r = reduce_once(v, &m);
+                    assert_eq!(r, v.reduce(&m), "{curve:?}");
+                    assert_eq!(r.limbs(), m.limbs());
                 }
             }
         }

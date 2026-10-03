@@ -19,6 +19,7 @@
 //! the same DER machinery as the other EC curves.
 
 use super::Error;
+use super::boxed::reduce_once;
 use super::curves::CurveId;
 use crate::bignum::BoxedUint;
 use crate::ct::{Choice, ConstantTimeEq};
@@ -269,7 +270,7 @@ impl Sm2PublicKey {
             return Err(Error::Verification);
         }
         let za = self.za(id)?;
-        let e = message_hash(&za, msg).reduce(&n);
+        let e = reduce_once(&message_hash(&za, msg), &n);
         // t = (r + s) mod n; reject t == 0.
         let t = fq.add_mod(&sig.r, &sig.s);
         if t.is_zero() {
@@ -280,7 +281,7 @@ impl Sm2PublicKey {
         let sum = c.point_add(&c.mul_generator(&sig.s), &c.scalar_mul(&t, &point));
         let (x1, _) = c.to_affine(&sum).ok_or(Error::Verification)?;
         // R = (e + x1) mod n; accept iff R == r.
-        let r = fq.add_mod(&e, &x1.reduce(&n));
+        let r = fq.add_mod(&e, &reduce_once(&x1, &n));
         if bool::from(r.ct_eq(&sig.r)) {
             Ok(())
         } else {
@@ -472,13 +473,13 @@ impl Sm2PrivateKey {
         if !in_range(k, &n) {
             return Err(SignFailure::Fatal(Error::InvalidInput));
         }
-        let e = message_hash(za, msg).reduce(&n);
+        let e = reduce_once(&message_hash(za, msg), &n);
 
         // (x1, _) = [k]G. k ∈ [1, n-1] and G has prime order n, so this is
         // never the identity; treat it as retryable regardless.
         let (x1, _) = c.to_affine(&c.mul_generator(k)).ok_or(SignFailure::Retry)?;
         // r = (e + x1) mod n; reject r == 0 or r + k == n.
-        let r = fq.add_mod(&e, &x1.reduce(&n));
+        let r = fq.add_mod(&e, &reduce_once(&x1, &n));
         // `r + k` involves the nonce: no early-exit zero test on it, and one
         // combined retry verdict (public: only the retry count is observable).
         if (r.ct_is_zero() | fq.add_mod(&r, k).ct_is_zero()).declassify() {
