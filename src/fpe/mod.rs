@@ -249,6 +249,15 @@ impl<C: BlockCipher> Ff1<C> {
         let round_pos = tweak.len() + pad;
         let mut s = Zeroizing::new(vec![0u8; d.div_ceil(16) * 16]);
 
+        // P and the leading whole blocks of Q (tweak bytes only, before the
+        // block holding the round number) are the same in every round, so
+        // the CBC-MAC state after them is computed once.
+        let fixed = round_pos / 16 * 16;
+        let mut mac0 = self.prf_from(&[0u8; 16], &p);
+        let mac0_fixed = self.prf_from(&mac0, &q[..fixed]);
+        mac0.zeroize();
+        let mac0_fixed = Zeroizing::new(mac0_fixed);
+
         for round in 0..ROUNDS {
             let i = if forward { round } else { ROUNDS - 1 - round };
             q[round_pos] = i;
@@ -259,7 +268,8 @@ impl<C: BlockCipher> Ff1<C> {
             q[round_pos + 1..].copy_from_slice(&num);
             drop(num);
             // Step 6.ii-iii: R = PRF(P || Q); S = R || E(R xor [1]) || E(R xor [2]) ...
-            let mut r = self.prf(&p, &q);
+            // The extension blocks are independent: one batched call.
+            let mut r = self.prf_from(&mac0_fixed, &q[fixed..]);
             s[..16].copy_from_slice(&r);
             for (j, block) in s.chunks_exact_mut(16).enumerate().skip(1) {
                 block.copy_from_slice(&r);
@@ -267,9 +277,8 @@ impl<C: BlockCipher> Ff1<C> {
                 for (x, c) in block.iter_mut().zip(ctr) {
                     *x ^= c;
                 }
-                let block: &mut [u8; 16] = block.try_into().expect("16-byte chunk");
-                self.cipher.encrypt_block(block);
             }
+            self.cipher.encrypt_blocks(&mut s[16..]);
             r.zeroize();
             // Step 6.iv-vi: y = NUM(S[..d]); m = u (even round) or v; the
             // other half moves by y modulo radix^m.
@@ -292,13 +301,14 @@ impl<C: BlockCipher> Ff1<C> {
         Ok(out)
     }
 
-    /// `PRF(P || Q)`: CBC-MAC with a zero IV over the whole-block input, as
-    /// Algorithm 6 defines it.
-    fn prf(&self, p: &[u8; 16], q: &[u8]) -> [u8; 16] {
-        debug_assert_eq!(q.len() % 16, 0);
-        let mut r = *p;
-        self.cipher.encrypt_block(&mut r);
-        for block in q.chunks_exact(16) {
+    /// Continues the Algorithm 6 `PRF` (CBC-MAC with a zero IV) from chaining
+    /// value `state` over the whole blocks of `data`; `PRF(X)` is
+    /// `prf_from(&[0; 16], X)`, and the computation splits at any block
+    /// boundary.
+    fn prf_from(&self, state: &[u8; 16], data: &[u8]) -> [u8; 16] {
+        debug_assert_eq!(data.len() % 16, 0);
+        let mut r = *state;
+        for block in data.chunks_exact(16) {
             for (x, y) in r.iter_mut().zip(block) {
                 *x ^= y;
             }
