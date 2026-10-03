@@ -143,11 +143,58 @@ impl Field {
         }
     }
 
-    /// Constant-time `[scalar]·p`, scanning the (up to) 448-bit little-endian
-    /// scalar from the most significant bit. The scalar bytes are treated as
-    /// secret. `scalar` is 57 bytes; only the low 448 bits are consumed (the
-    /// Ed448 secret scalar is pruned to fit, and `r < L < 2⁴⁴⁶`).
+    /// Constant-time `[scalar]·p` over the low 448 bits of the 57-byte
+    /// little-endian scalar, via a fixed 4-bit window: 4 doublings and one
+    /// *unconditional* addition per nibble (112 additions instead of the 448
+    /// of a bit-at-a-time ladder), with the window value fetched by a masked
+    /// scan of all 16 table entries (no secret-indexed memory access). A zero
+    /// nibble adds the identity — a no-op with the same operation sequence,
+    /// since the HWCD formulas are complete — so the schedule depends only on
+    /// the (public) scalar width. The scalar bytes are treated as secret; the
+    /// Ed448 secret scalar is pruned to fit, and `r < L < 2⁴⁴⁶`.
+    ///
+    /// The table is 16 points (3.5 KB) of stack, the same shape as the
+    /// edwards25519 window; a 3-bit window would halve it but cost ~38 more
+    /// additions per multiplication.
     pub(crate) fn scalar_mult(&self, scalar: &[u8; 57], p: &Point) -> Point {
+        // table[j] = [j]P; table[0] is the identity.
+        let mut table = [self.identity(); 16];
+        table[1] = *p;
+        for i in 2..16 {
+            table[i] = if i % 2 == 0 {
+                self.point_double(&table[i / 2])
+            } else {
+                self.point_add(&table[i - 1], p)
+            };
+        }
+
+        let mut acc = self.identity();
+        let mut i = 112;
+        while i > 0 {
+            i -= 1;
+            acc = self.point_double(&acc);
+            acc = self.point_double(&acc);
+            acc = self.point_double(&acc);
+            acc = self.point_double(&acc);
+
+            let byte = scalar[i / 2];
+            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as usize;
+            // Constant-time gather of table[digit]: the index comparison is
+            // the branch-free `ct_eq`, not `==`, so the secret digit never
+            // feeds a compare-and-branch the compiler could emit.
+            let mut sel = table[0];
+            for (j, entry) in table.iter().enumerate() {
+                sel = point_select(&sel, entry, j.ct_eq(&digit));
+            }
+            acc = self.point_add(&acc, &sel);
+        }
+        acc
+    }
+
+    /// The previous bit-at-a-time double-and-add-always ladder, kept as the
+    /// differential oracle for the windowed [`Self::scalar_mult`].
+    #[cfg(test)]
+    pub(crate) fn scalar_mult_bitwise(&self, scalar: &[u8; 57], p: &Point) -> Point {
         let mut acc = self.identity();
         let mut i = 448;
         while i > 0 {
@@ -199,5 +246,47 @@ mod tests {
         assert_eq!(b.z, dec.z);
         assert_eq!(b.t, dec.t);
         assert_eq!(f.encode(&b), BASE_ENC);
+    }
+
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// The windowed ladder matches the bit-at-a-time one on edge scalars
+    /// (zero, one, all-ones in the consumed 448 bits, single nibbles at
+    /// both ends) and a random sweep, over the base point and a non-base
+    /// point.
+    #[test]
+    fn windowed_scalar_mult_matches_bitwise() {
+        let f = Field::new();
+        let b = f.base();
+        let p = f.point_double(&f.point_add(&b, &f.point_double(&b)));
+        let mut edges = [[0u8; 57]; 6];
+        edges[1][0] = 1;
+        edges[2][..56].fill(0xff);
+        edges[3][0] = 0x0f;
+        edges[4][55] = 0xf0;
+        edges[5][..56].fill(0xa5);
+        let mut st = 0x5ca1;
+        let random = core::iter::repeat_with(|| {
+            let mut k = [0u8; 57];
+            for c in k.chunks_mut(8) {
+                let w = splitmix(&mut st).to_le_bytes();
+                c.copy_from_slice(&w[..c.len()]);
+            }
+            k
+        })
+        .take(24);
+        for k in edges.into_iter().chain(random) {
+            for pt in [&b, &p] {
+                let w = f.scalar_mult(&k, pt);
+                let r = f.scalar_mult_bitwise(&k, pt);
+                assert!(bool::from(f.point_ct_eq(&w, &r)), "mismatch for {k:02x?}");
+            }
+        }
     }
 }
