@@ -142,22 +142,6 @@ pub fn inv_mod_ct<const LIMBS: usize>(e: &Uint<LIMBS>, phi: &Uint<LIMBS>) -> CtO
 
 // ---- runtime-sized ---------------------------------------------------------
 
-/// Low bit of a limb vector as a [`Choice`].
-#[cfg(feature = "alloc")]
-fn odd_limbs(x: &[u64]) -> Choice {
-    Choice::from((x[0] & 1) as u8)
-}
-
-/// `x / 2 mod m` on limb slices of equal length, `x < m`, `m` odd.
-#[cfg(feature = "alloc")]
-fn half_mod_limbs(x: &[u64], m: &[u64]) -> Vec<u64> {
-    let n = x.len();
-    let (sum, carry) = adc_limbs(x, m, 0);
-    let mut sum_half = shr1_limbs(&sum);
-    sum_half[n - 1] |= carry << (LIMB_BITS - 1);
-    select_limbs(&sum_half, &shr1_limbs(x), odd_limbs(x))
-}
-
 /// `(a − b) mod m` on limb slices of equal length, `a, b < m`.
 #[cfg(feature = "alloc")]
 fn sub_mod_limbs(a: &[u64], b: &[u64], m: &[u64]) -> Vec<u64> {
@@ -166,24 +150,47 @@ fn sub_mod_limbs(a: &[u64], b: &[u64], m: &[u64]) -> Vec<u64> {
     select_limbs(&fixed, &diff, Choice::from(borrow as u8))
 }
 
-/// `x >> 1` on a limb slice.
+/// `dst ← src` when `choice`, else unchanged (constant time).
 #[cfg(feature = "alloc")]
-fn shr1_limbs(x: &[u64]) -> Vec<u64> {
-    let mut out = x.to_vec();
-    let mut carry = 0u64;
-    for limb in out.iter_mut().rev() {
+fn cmov(dst: &mut [u64], src: &[u64], choice: Choice) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = u64::conditional_select(s, d, choice);
+    }
+}
+
+/// `x ← (x >> 1) | (top << 63)` in place; `top` is 0 or 1.
+#[cfg(feature = "alloc")]
+fn shr1_in_place(x: &mut [u64], top: u64) {
+    let mut carry = top;
+    for limb in x.iter_mut().rev() {
         let next = *limb & 1;
         *limb = (*limb >> 1) | (carry << (LIMB_BITS - 1));
         carry = next;
     }
-    out
 }
 
-/// `a < b` on limb slices of equal length, as a [`Choice`].
+/// `x ← x − y` in place, returning the borrow.
 #[cfg(feature = "alloc")]
-fn lt_limbs(a: &[u64], b: &[u64]) -> Choice {
-    let (_, borrow) = sbb_limbs(a, b, 0);
-    Choice::from(borrow as u8)
+fn sub_in_place(x: &mut [u64], y: &[u64]) -> u64 {
+    let mut bo = 0;
+    for (xi, &yi) in x.iter_mut().zip(y) {
+        let (d, b) = super::uint::sbb(*xi, yi, bo);
+        *xi = d;
+        bo = b;
+    }
+    bo
+}
+
+/// `x ← x + (y & mask)` in place, returning the carry.
+#[cfg(feature = "alloc")]
+fn add_masked_in_place(x: &mut [u64], y: &[u64], mask: u64) -> u64 {
+    let mut c = 0;
+    for (xi, &yi) in x.iter_mut().zip(y) {
+        let (s, co) = super::uint::adc(*xi, yi & mask, c);
+        *xi = s;
+        c = co;
+    }
+    c
 }
 
 /// Runtime-sized [`inv_mod_odd_ct`]. The result has `m`'s limb count.
@@ -195,38 +202,78 @@ pub fn inv_mod_odd_ct_boxed(a: &BoxedUint, m: &BoxedUint) -> CtOption<BoxedUint>
 
 /// The binary extended GCD behind [`inv_mod_odd_ct_boxed`]: returns the
 /// candidate inverse and whether `gcd(a, m) = 1`.
+///
+/// Same iteration as [`inv_mod_odd_ct`] — `2·bits(m)` rounds, each one of
+/// the four steps chosen by masks — but organized around the fact that every
+/// step updates exactly one side: either `(u, A)` (u even, or both odd with
+/// `u ≥ v`) or `(v, C)` (the mirror cases). Each round therefore selects the
+/// side to update into a scratch pair, applies the one shared shape —
+/// subtract the other side when both `u` and `v` are odd, then halve (mod
+/// `m` for the coefficient) — and writes it back under the same mask. That
+/// is one subtraction and one halving per round instead of the four
+/// candidate results the textbook masked form computes, all in place over
+/// fixed scratch buffers (the old loop allocated ~20 `Vec`s per round).
+/// Every limb loop runs over `m`'s (public) width and every choice is a
+/// mask, so nothing branches on or is indexed by `a`.
 #[cfg(feature = "alloc")]
 fn xgcd_boxed(a: &BoxedUint, m: &BoxedUint) -> (BoxedUint, Choice) {
     assert!(m.is_odd(), "inv_mod_odd_ct_boxed: modulus must be odd");
     let n = m.limbs();
-    let m_limbs = m.as_limbs();
+    let ml = m.as_limbs();
     let mut u = a.reduce(m).limbs_resized(n);
-    let mut v = m_limbs.to_vec();
-    let mut big_a = BoxedUint::from_u64(1).limbs_resized(n);
+    let mut v = ml.to_vec();
+    let mut big_a = alloc::vec![0u64; n];
+    big_a[0] = 1;
     let mut big_c = alloc::vec![0u64; n];
+    let mut x = alloc::vec![0u64; n];
+    let mut t = alloc::vec![0u64; n];
+    let mut d = alloc::vec![0u64; n];
     for _ in 0..2 * m.bit_len() {
-        let u_odd = odd_limbs(&u);
-        let v_odd = odd_limbs(&v);
-        let u_ge_v = !lt_limbs(&u, &v);
-        let c1 = !u_odd;
-        let c2 = u_odd & !v_odd;
-        let c3 = u_odd & v_odd & u_ge_v;
-        let c4 = u_odd & v_odd & !u_ge_v;
+        let u_odd = Choice::from((u[0] & 1) as u8);
+        let v_odd = Choice::from((v[0] & 1) as u8);
+        // u ≥ v, from the borrow of u − v (computed into `t`, discarded).
+        t.copy_from_slice(&u);
+        let u_ge_v = !Choice::from(sub_in_place(&mut t, &v) as u8);
+        let both = u_odd & v_odd;
+        // The (u, A) side moves when u is even, or both are odd and u ≥ v.
+        let su = !u_odd | (v_odd & u_ge_v);
 
-        let u_half = shr1_limbs(&u);
-        let v_half = shr1_limbs(&v);
-        let umv_half = shr1_limbs(&sbb_limbs(&u, &v, 0).0);
-        let vmu_half = shr1_limbs(&sbb_limbs(&v, &u, 0).0);
-        let a_half = half_mod_limbs(&big_a, m_limbs);
-        let c_half = half_mod_limbs(&big_c, m_limbs);
-        let amc_half = half_mod_limbs(&sub_mod_limbs(&big_a, &big_c, m_limbs), m_limbs);
-        let cma_half = half_mod_limbs(&sub_mod_limbs(&big_c, &big_a, m_limbs), m_limbs);
+        // Integer side: x = selected, minus the other when both are odd
+        // (then x ≥ other, so no borrow), halved.
+        x.copy_from_slice(&v);
+        cmov(&mut x, &u, su);
+        t.copy_from_slice(&u);
+        cmov(&mut t, &v, su); // t = the other side
+        d.copy_from_slice(&x);
+        sub_in_place(&mut d, &t);
+        cmov(&mut x, &d, both);
+        shr1_in_place(&mut x, 0);
+        cmov(&mut u, &x, su);
+        cmov(&mut v, &x, !su);
 
-        u = select_limbs(&u_half, &select_limbs(&umv_half, &u, c3), c1);
-        v = select_limbs(&v_half, &select_limbs(&vmu_half, &v, c4), c2);
-        big_a = select_limbs(&a_half, &select_limbs(&amc_half, &big_a, c3), c1);
-        big_c = select_limbs(&c_half, &select_limbs(&cma_half, &big_c, c4), c2);
+        // Coefficient side, mod m: X = selected − other (mod m) when both
+        // are odd, then X / 2 mod m.
+        x.copy_from_slice(&big_c);
+        cmov(&mut x, &big_a, su);
+        t.copy_from_slice(&big_a);
+        cmov(&mut t, &big_c, su);
+        d.copy_from_slice(&x);
+        let borrow = sub_in_place(&mut d, &t);
+        add_masked_in_place(&mut d, ml, borrow.wrapping_neg());
+        cmov(&mut x, &d, both);
+        // Halve mod m: (x + m) / 2 when x is odd, x / 2 otherwise; the carry
+        // out of x + m becomes the shifted-in top bit.
+        let odd = x[0] & 1;
+        let carry = add_masked_in_place(&mut x, ml, odd.wrapping_neg());
+        shr1_in_place(&mut x, carry);
+        cmov(&mut big_a, &x, su);
+        cmov(&mut big_c, &x, !su);
     }
+    crate::zeroize::Zeroize::zeroize(d.as_mut_slice());
+    crate::zeroize::Zeroize::zeroize(x.as_mut_slice());
+    crate::zeroize::Zeroize::zeroize(t.as_mut_slice());
+    crate::zeroize::Zeroize::zeroize(u.as_mut_slice());
+    crate::zeroize::Zeroize::zeroize(big_a.as_mut_slice());
     let is_one = BoxedUint::from_limbs(v).ct_eq(&BoxedUint::from_u64(1));
     (BoxedUint::from_limbs(big_c), is_one)
 }
@@ -358,6 +405,56 @@ mod tests {
         let e = Uint::<8>::from_limbs([0x1234_5679, 0xabcd, 0, 0x8000_0000_0000_0001, 0, 0, 0, 0]);
         let phi = Uint::<8>::from_limbs([0xfffe, 0, 0, 0, 0, 0x77, 0, 0x1234]);
         assert_eq!(inv_mod_ct(&e, &phi).into_option(), inv_mod(&e, &phi));
+    }
+
+    /// The in-place one-sided xgcd against the variable-time Euclid oracle
+    /// across widths, including short moduli, non-coprime inputs, `a ≡ 0`,
+    /// `a = 1`, `a = m − 1`, and `a` wider than `m`.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn boxed_odd_inverse_sweep() {
+        use crate::bignum::inv_mod_boxed;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for limbs in 1..=17usize {
+            for k in 0..4 {
+                let mut ml: Vec<u64> = (0..limbs).map(|_| lcg(&mut state)).collect();
+                if k == 1 {
+                    ml[limbs - 1] = (ml[limbs - 1] >> 37).max(1);
+                }
+                if k == 2 {
+                    // A multiple of 3, so inputs sharing that factor exist.
+                    ml[limbs - 1] >>= 2;
+                    let m3 = BoxedUint::from_limbs(ml.clone()).mul(&BoxedUint::from_u64(3));
+                    ml = m3.as_limbs().to_vec();
+                }
+                ml[0] |= 1;
+                if ml == [1] {
+                    ml[0] = 3;
+                }
+                let m = BoxedUint::from_limbs(ml);
+                let mut inputs = alloc::vec![
+                    BoxedUint::zero(1),
+                    BoxedUint::from_u64(1),
+                    BoxedUint::from_u64(3),
+                    m.sub(&BoxedUint::from_u64(1)),
+                    m.clone(),
+                ];
+                for w in [limbs, limbs + 2] {
+                    inputs.push(BoxedUint::from_limbs(
+                        (0..w).map(|_| lcg(&mut state)).collect(),
+                    ));
+                }
+                for a in &inputs {
+                    let got = inv_mod_odd_ct_boxed(a, &m).into_option();
+                    let want = inv_mod_boxed(a, &m);
+                    assert_eq!(
+                        got.as_ref().map(|v| v.to_be_bytes(limbs * 8 + 16)),
+                        want.as_ref().map(|v| v.to_be_bytes(limbs * 8 + 16)),
+                        "a={a:?} m={m:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(feature = "alloc")]
