@@ -56,9 +56,12 @@ listening() {
     esac
 }
 
-# random_port: a port in the ephemeral-ish 30000..54999 range.
+# random_port: a port in 20000..32767, below every OS's ephemeral range
+# (Linux 32768..60999, macOS / Windows 49152..65535), so a fixed-port peer
+# server never collides with the source port of some live outgoing
+# connection on the runner.
 random_port() {
-    echo $(((RANDOM % 25000) + 30000))
+    echo $(((RANDOM % 12768) + 20000))
 }
 
 # start_bg_server STDIN CMD ARGS... — for peers whose server takes a fixed
@@ -103,6 +106,15 @@ start_bg_server() {
         pid=$!
         for i in $(seq 1 100); do
             if listening "$port"; then
+                # A dual-stack server (gnutls-serv) whose IPv4 bind collided
+                # logs EADDRINUSE yet keeps serving on IPv6, so `listening`
+                # alone would accept it and the 127.0.0.1 client be refused:
+                # treat that as a collision and retry on another port. The
+                # message is written before the IPv6 listen, so checking
+                # after `listening` succeeds cannot miss it.
+                if grep -qi "address already in use" "$WORK/server.err" 2>/dev/null; then
+                    break
+                fi
                 echo "$pid" >"$WORK/server.pid"
                 echo "$port" >"$WORK/server.port"
                 PORT=$port
