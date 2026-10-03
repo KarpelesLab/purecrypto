@@ -38,7 +38,7 @@ impl core::error::Error for Error {}
 /// Message-word schedule (12 rounds). BLAKE2b uses all 12; BLAKE2s uses the
 /// first 10.
 #[rustfmt::skip]
-const SIGMA: [[usize; 16]; 12] = [
+const SIGMA: [[u8; 16]; 12] = [
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
     [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
@@ -95,14 +95,14 @@ fn compress_b(h: &mut [u64; 8], block: &[u8; 128], t0: u64, t1: u64, last: bool)
     }
 
     for s in SIGMA.iter() {
-        g!(0, 4, 8, 12, m[s[0]], m[s[1]]);
-        g!(1, 5, 9, 13, m[s[2]], m[s[3]]);
-        g!(2, 6, 10, 14, m[s[4]], m[s[5]]);
-        g!(3, 7, 11, 15, m[s[6]], m[s[7]]);
-        g!(0, 5, 10, 15, m[s[8]], m[s[9]]);
-        g!(1, 6, 11, 12, m[s[10]], m[s[11]]);
-        g!(2, 7, 8, 13, m[s[12]], m[s[13]]);
-        g!(3, 4, 9, 14, m[s[14]], m[s[15]]);
+        g!(0, 4, 8, 12, m[s[0] as usize], m[s[1] as usize]);
+        g!(1, 5, 9, 13, m[s[2] as usize], m[s[3] as usize]);
+        g!(2, 6, 10, 14, m[s[4] as usize], m[s[5] as usize]);
+        g!(3, 7, 11, 15, m[s[6] as usize], m[s[7] as usize]);
+        g!(0, 5, 10, 15, m[s[8] as usize], m[s[9] as usize]);
+        g!(1, 6, 11, 12, m[s[10] as usize], m[s[11] as usize]);
+        g!(2, 7, 8, 13, m[s[12] as usize], m[s[13] as usize]);
+        g!(3, 4, 9, 14, m[s[14] as usize], m[s[15] as usize]);
     }
 
     for i in 0..8 {
@@ -309,14 +309,14 @@ fn compress_s(h: &mut [u32; 8], block: &[u8; 64], t0: u32, t1: u32, last: bool) 
     }
 
     for s in SIGMA.iter().take(10) {
-        g!(0, 4, 8, 12, m[s[0]], m[s[1]]);
-        g!(1, 5, 9, 13, m[s[2]], m[s[3]]);
-        g!(2, 6, 10, 14, m[s[4]], m[s[5]]);
-        g!(3, 7, 11, 15, m[s[6]], m[s[7]]);
-        g!(0, 5, 10, 15, m[s[8]], m[s[9]]);
-        g!(1, 6, 11, 12, m[s[10]], m[s[11]]);
-        g!(2, 7, 8, 13, m[s[12]], m[s[13]]);
-        g!(3, 4, 9, 14, m[s[14]], m[s[15]]);
+        g!(0, 4, 8, 12, m[s[0] as usize], m[s[1] as usize]);
+        g!(1, 5, 9, 13, m[s[2] as usize], m[s[3] as usize]);
+        g!(2, 6, 10, 14, m[s[4] as usize], m[s[5] as usize]);
+        g!(3, 7, 11, 15, m[s[6] as usize], m[s[7] as usize]);
+        g!(0, 5, 10, 15, m[s[8] as usize], m[s[9] as usize]);
+        g!(1, 6, 11, 12, m[s[10] as usize], m[s[11] as usize]);
+        g!(2, 7, 8, 13, m[s[12] as usize], m[s[13] as usize]);
+        g!(3, 4, 9, 14, m[s[14] as usize], m[s[15] as usize]);
     }
 
     for i in 0..8 {
