@@ -170,14 +170,19 @@ pub(crate) fn sign_internal<R: SamplerRng>(
     let inv_q = Fpr::from_f64(1.0).div(Fpr::of_i64(super::Q as i64));
     let neg_inv_q = inv_q.neg();
 
+    // Target: t0 = c·d/q, t1 = −c·b/q (FFT domain). It depends only on c and
+    // the key, so it is built once and reused by every resampling round.
+    let mut t0 = mul_fft(&point_fft, &key.d);
+    for z in t0.iter_mut() {
+        *z = z.scale(inv_q);
+    }
+    let mut t1 = mul_fft(&point_fft, &key.b);
+    for z in t1.iter_mut() {
+        *z = z.scale(neg_inv_q);
+    }
+
     let mut result = None;
     for _ in 0..MAX_SIGN_ATTEMPTS {
-        // Target: t0 = c·d/q, t1 = −c·b/q (FFT domain).
-        let mut pd = mul_fft(&point_fft, &key.d);
-        let mut t0: Vec<Cplx> = pd.iter().map(|z| z.scale(inv_q)).collect();
-        let mut pb = mul_fft(&point_fft, &key.b);
-        let mut t1: Vec<Cplx> = pb.iter().map(|z| z.scale(neg_inv_q)).collect();
-
         let (mut z0, mut z1) = ff_sampling(&key.fft, &t0, &t1, &key.tree, key.sigmin, rng);
 
         // v = z·B; s = (c, 0) − v.
@@ -210,12 +215,12 @@ pub(crate) fn sign_internal<R: SamplerRng>(
             }
         }
 
-        // Every buffer above is a function of the secret basis: `t0`/`t1` are
-        // the target expressed in it, `z0`/`z1` the sampled lattice point,
-        // `v0`/`v1` = z·B, and `s0`/`s1` a rejected (or accepted) short vector.
-        // The accepted `s1` survives only inside the compressed signature; none
-        // of the raw buffers may be freed in the clear, on any exit path.
-        for v in [&mut pd, &mut pb, &mut t0, &mut t1, &mut z0, &mut z1] {
+        // Every buffer above is a function of the secret basis: `z0`/`z1` the
+        // sampled lattice point, `v0`/`v1` = z·B, and `s0`/`s1` a rejected (or
+        // accepted) short vector. The accepted `s1` survives only inside the
+        // compressed signature; none of the raw buffers may be freed in the
+        // clear, on any exit path.
+        for v in [&mut z0, &mut z1] {
             wipe_cplx(v);
         }
         for v in [&mut v0, &mut v1] {
@@ -228,6 +233,9 @@ pub(crate) fn sign_internal<R: SamplerRng>(
             break;
         }
     }
+    // The target is the hashed point expressed in the secret basis.
+    wipe_cplx(&mut t0);
+    wipe_cplx(&mut t1);
     result
 }
 
