@@ -2250,6 +2250,39 @@ fn control_side_effect(x: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// 2026-10 symmetric fast paths
+// ---------------------------------------------------------------------------
+
+/// Secret-dependent paths added by the 2026-10 symmetric performance pass
+/// that no case above reaches: KBKDF over a cloned keyed CMAC template, the
+/// PBKDF2 raw-compression loops for SHA-1 and SHA-512 (SHA-256 is
+/// `pbkdf2_sha256`), and UMAC hashing whole 1 KiB chunks straight from the
+/// input.
+fn symmetric_fast_paths_2026_10() -> String {
+    let mut okm = [0u8; 40];
+    kbkdf_counter::<purecrypto::kdf::CmacAes128Prf>(
+        &secret_bytes::<16>(600),
+        b"label",
+        b"context",
+        &mut okm,
+    )
+    .expect("kbkdf");
+    let mut p1 = [0u8; 24];
+    pbkdf2::<purecrypto::hash::Sha1>(&secret_bytes::<20>(601), b"salt", 3, &mut p1);
+    let mut p5 = [0u8; 70];
+    pbkdf2::<Sha512>(&secret_bytes::<20>(602), b"salt", 3, &mut p5);
+    let msg = secret_bytes::<2100>(603);
+    let utag = Umac64::compute(&secret_bytes::<16>(604), &msg, &fixed_bytes::<8>(605));
+    format!(
+        "kbkdf={} pbkdf2-sha1={} pbkdf2-sha512={} umac={}",
+        hex8(public(&okm)),
+        hex8(public(&p1)),
+        hex8(public(&p5)),
+        hex8(public(&utag)),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 
@@ -2373,6 +2406,8 @@ const CASES: &[Case] = &[
     ("pbes2_gcm", pbes2_gcm),
     ("jose_jwe_decrypt", jose_jwe_decrypt),
     ("jose_jws_sign", jose_jws_sign),
+    // 2026-10 symmetric fast paths
+    ("symmetric_fast_paths_2026_10", symmetric_fast_paths_2026_10),
 ];
 
 fn main() {
