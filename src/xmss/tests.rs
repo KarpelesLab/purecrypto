@@ -565,3 +565,35 @@ fn subtree_cache_matches_cold_recomputation() {
     layers.dedup();
     assert_eq!(layers.len(), warm.cache.entries.len());
 }
+
+#[test]
+fn tiered_subtree_matches_full_subtree() {
+    // The two-tier cache that bounds the `h = 16 / 20` subtrees, exercised on
+    // an `h = 10` tree with a 4-level top tier (bottom blocks of 64 leaves):
+    // every leaf's authentication path and the root must equal the ones read
+    // from the fully resident subtree, in signing order and after jumping
+    // between blocks.
+    let p = XmssParamSet::Sha2_10_256.params();
+    let n = p.n;
+    let th = p.tree_height as usize;
+    let sk_seed: Vec<u8> = (0..n).map(|i| (i * 7 + 1) as u8).collect();
+    let pub_seed: Vec<u8> = (0..n).map(|i| (i * 13 + 5) as u8).collect();
+    let mut addr = Adrs::new();
+    addr.set_layer(0);
+    addr.set_tree(3);
+    let mut full = Subtree::build(&p, &sk_seed, &pub_seed, &addr);
+    assert_eq!(full.split, 0);
+    let mut tiered = Subtree::build_tiered(&p, &sk_seed, &pub_seed, &addr, 4);
+    assert_eq!(tiered.split, 6);
+    assert_eq!(tiered.top.len(), 5);
+    assert_eq!(tiered.root(), full.root());
+    let order = (0..1u32 << th).chain([5, 1000, 64, 63, 0]);
+    for idx in order {
+        let mut want = vec![0u8; th * n];
+        let mut got = vec![0u8; th * n];
+        full.auth_path(&p, &sk_seed, &pub_seed, &addr, idx, &mut want);
+        tiered.auth_path(&p, &sk_seed, &pub_seed, &addr, idx, &mut got);
+        assert_eq!(got, want, "leaf {idx}");
+        assert_eq!(tiered.bottom.as_ref().map(|b| b.0), Some(idx >> 6));
+    }
+}

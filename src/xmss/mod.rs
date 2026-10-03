@@ -657,103 +657,270 @@ fn gen_leaf(
 }
 
 #[cfg(feature = "alloc")]
-/// All nodes of a subtree, returned level-by-level.
-type SubtreeNodes = Vec<Vec<u8>>;
+/// How many levels below a subtree's root a [`Subtree`] keeps resident:
+/// heights `h − TOP_LEVELS ..= h`, i.e. at most `2^(TOP_LEVELS+1) − 1` nodes
+/// (4 MiB at `n = 32`). Subtrees of height `h <= TOP_LEVELS` are kept whole;
+/// the `h = 20` ones (64 MiB whole) keep that top tier plus the one 16-leaf
+/// bottom block holding the current leaf, rebuilt every 16 signatures — about
+/// one extra leaf computation per signature, amortized.
+///
+/// One level more than `lms::tree::TOP_LEVELS`: XMSS has `h = 16` sets, and
+/// tiering those would buy 2 MiB for that same per-signature leaf rebuild
+/// (measured: ~3× the signing time), so they stay whole.
+const TOP_LEVELS: usize = 16;
 
 #[cfg(feature = "alloc")]
-/// Builds **all** nodes of the subtree addressed by `subtree_addr` (its layer +
-/// tree fields), level-by-level: `levels[0]` holds the `2^h` leaves, `levels[L]`
-/// the `2^{h-L}` nodes at height `L`, and `levels[h]` the single subtree root.
-///
-/// A subtree depends only on `(sk_seed, pub_seed, layer, tree)` — never on the
-/// message or the leaf index — so a signer builds it once and reads every
-/// authentication path out of it in `O(h)` (see [`SubtreeCache`]) rather than
-/// re-hashing all `2^h` leaves per signature.
-fn build_subtree(p: &Params, sk_seed: &[u8], pub_seed: &[u8], subtree_addr: &Adrs) -> SubtreeNodes {
+/// Every node of the `2^height`-leaf block whose first leaf is `start`, within
+/// the subtree addressed by `subtree_addr` (its layer + tree fields),
+/// level-by-level: `levels[0]` holds the leaves, `levels[L]` the `2^{height-L}`
+/// nodes at height `L`, `levels[height]` the block root. Node addresses use
+/// the subtree-wide index, so a block's nodes are exactly the corresponding
+/// nodes of the whole subtree (`start = 0, height = h` is the whole subtree).
+fn build_block(
+    p: &Params,
+    sk_seed: &[u8],
+    pub_seed: &[u8],
+    base: &Option<Sha256>,
+    subtree_addr: &Adrs,
+    start: u32,
+    height: usize,
+) -> Vec<Vec<u8>> {
     let n = p.n;
-    let th = p.tree_height as usize;
-
     let mut ots_addr = Adrs::new();
     let mut ltree_addr = Adrs::new();
-    let mut node_addr = Adrs::new();
     ots_addr.copy_subtree(subtree_addr);
     ltree_addr.copy_subtree(subtree_addr);
-    node_addr.copy_subtree(subtree_addr);
     ots_addr.set_type(AdrsType::Ots);
     ltree_addr.set_type(AdrsType::Ltree);
-    node_addr.set_type(AdrsType::HashTree);
-    let base = hash::prf_base(p, pub_seed);
 
-    // Level 0: the 2^h WOTS+ leaves.
-    let leaf_count = 1usize << th;
+    let leaf_count = 1usize << height;
     let mut leaves = vec![0u8; leaf_count * n];
-    for idx in 0..leaf_count {
-        ltree_addr.set_ltree(idx as u32);
-        ots_addr.set_ots(idx as u32);
+    for k in 0..leaf_count {
+        let idx = start + k as u32;
+        ltree_addr.set_ltree(idx);
+        ots_addr.set_ots(idx);
         gen_leaf(
             p,
             sk_seed,
             pub_seed,
-            &base,
+            base,
             &mut ltree_addr,
             &mut ots_addr,
-            &mut leaves[idx * n..idx * n + n],
+            &mut leaves[k * n..k * n + n],
         );
     }
-    let mut levels: SubtreeNodes = Vec::with_capacity(th + 1);
+    let mut levels = Vec::with_capacity(height + 1);
     levels.push(leaves);
-
-    // Internal levels: node `i` at height `L` hashes children `2i`, `2i+1` at
-    // height `L-1` under ADRS{tree_height = L-1, tree_index = i} — the same
-    // addressing `root_from_sig` (the verifier) uses.
-    for level in 1..=th {
-        let count = 1usize << (th - level);
-        let mut nodes = vec![0u8; count * n];
-        let child = &levels[level - 1];
-        for i in 0..count {
-            node_addr.set_tree_height((level - 1) as u32);
-            node_addr.set_tree_index(i as u32);
-            let mut parent = [0u8; MAX_N];
-            rand_hash(
-                p,
-                &child[2 * i * n..2 * i * n + n],
-                &child[(2 * i + 1) * n..(2 * i + 1) * n + n],
-                pub_seed,
-                &base,
-                &mut node_addr,
-                &mut parent,
-            );
-            nodes[i * n..i * n + n].copy_from_slice(&parent[..n]);
-        }
-        levels.push(nodes);
+    for level in 1..=height {
+        let parents = hash_level(
+            p,
+            pub_seed,
+            base,
+            subtree_addr,
+            &levels[level - 1],
+            level,
+            start >> level,
+        );
+        levels.push(parents);
     }
     levels
 }
 
 #[cfg(feature = "alloc")]
-/// Writes the height-`h` authentication path for `idx_leaf` out of a subtree
-/// built by [`build_subtree`]: `auth_path[j]` is the sibling of the path node at
-/// height `j`, i.e. node `(idx_leaf >> j) ^ 1` of `levels[j]`.
-fn auth_path_from_subtree(p: &Params, levels: &[Vec<u8>], idx_leaf: u32, auth_path: &mut [u8]) {
+/// The parents (at height `level`) of the consecutive height-`level − 1`
+/// nodes `children`, the first parent having subtree-wide index `first`.
+/// Parent `first + i` hashes children `2i`, `2i+1` under
+/// ADRS{tree_height = level − 1, tree_index = first + i} — the same addressing
+/// `root_from_sig` (the verifier) uses.
+fn hash_level(
+    p: &Params,
+    pub_seed: &[u8],
+    base: &Option<Sha256>,
+    subtree_addr: &Adrs,
+    children: &[u8],
+    level: usize,
+    first: u32,
+) -> Vec<u8> {
     let n = p.n;
-    for j in 0..p.tree_height as usize {
-        let sib = ((idx_leaf >> j) ^ 1) as usize;
-        auth_path[j * n..j * n + n].copy_from_slice(&levels[j][sib * n..sib * n + n]);
+    let mut node_addr = Adrs::new();
+    node_addr.copy_subtree(subtree_addr);
+    node_addr.set_type(AdrsType::HashTree);
+    let count = children.len() / (2 * n);
+    let mut nodes = vec![0u8; count * n];
+    for i in 0..count {
+        node_addr.set_tree_height((level - 1) as u32);
+        node_addr.set_tree_index(first + i as u32);
+        let mut parent = [0u8; MAX_N];
+        rand_hash(
+            p,
+            &children[2 * i * n..2 * i * n + n],
+            &children[(2 * i + 1) * n..(2 * i + 1) * n + n],
+            pub_seed,
+            base,
+            &mut node_addr,
+            &mut parent,
+        );
+        nodes[i * n..i * n + n].copy_from_slice(&parent[..n]);
+    }
+    nodes
+}
+
+#[cfg(feature = "alloc")]
+/// The resident nodes of one subtree: its top tier (heights `split ..= h`)
+/// and, when `split > 0`, the bottom block (heights `0 .. split`) holding the
+/// leaf being signed.
+///
+/// A subtree depends only on `(sk_seed, pub_seed, layer, tree)` — never on the
+/// message or the leaf index — so a signer builds it once and reads every
+/// authentication path out of it in `O(h)` (see [`SubtreeCache`]) rather than
+/// re-hashing all `2^h` leaves per signature. Every node is a public Merkle
+/// hash, and which bottom block is resident follows the public leaf index, so
+/// the tiering leaks nothing. It cannot affect one-time-key use either: the
+/// index is reserved by the caller before any of this runs, and a wrong node
+/// would only make the signature fail to verify.
+struct Subtree {
+    /// Lowest height held in `top`: `h − TOP_LEVELS`, or 0 when the whole
+    /// subtree fits.
+    split: usize,
+    /// `top[k]`: every node at height `split + k`; the last entry is the root.
+    top: Vec<Vec<u8>>,
+    /// `(block, levels)`: heights `0 ..= split` of the block of leaves
+    /// starting at `block · 2^split`, as built by [`build_block`]. Always
+    /// `None` when `split == 0`.
+    bottom: Option<(u32, Vec<Vec<u8>>)>,
+}
+
+#[cfg(feature = "alloc")]
+impl Subtree {
+    /// Builds the subtree addressed by `subtree_addr`. A tall subtree is built
+    /// one bottom block at a time, keeping only each block's root, so the peak
+    /// footprint is the resident top tier plus a single block.
+    fn build(p: &Params, sk_seed: &[u8], pub_seed: &[u8], subtree_addr: &Adrs) -> Subtree {
+        Self::build_tiered(p, sk_seed, pub_seed, subtree_addr, TOP_LEVELS)
+    }
+
+    /// [`build`](Self::build) with the resident tier height as a parameter,
+    /// so tests can exercise the two-tier path on a cheap tree.
+    fn build_tiered(
+        p: &Params,
+        sk_seed: &[u8],
+        pub_seed: &[u8],
+        subtree_addr: &Adrs,
+        top_levels: usize,
+    ) -> Subtree {
+        let n = p.n;
+        let th = p.tree_height as usize;
+        let split = th.saturating_sub(top_levels);
+        let base = hash::prf_base(p, pub_seed);
+        if split == 0 {
+            let top = build_block(p, sk_seed, pub_seed, &base, subtree_addr, 0, th);
+            return Subtree {
+                split,
+                top,
+                bottom: None,
+            };
+        }
+        let blocks = 1usize << (th - split);
+        let mut roots = vec![0u8; blocks * n];
+        for b in 0..blocks {
+            let block = build_block(
+                p,
+                sk_seed,
+                pub_seed,
+                &base,
+                subtree_addr,
+                (b << split) as u32,
+                split,
+            );
+            roots[b * n..b * n + n].copy_from_slice(&block[split][..n]);
+        }
+        let mut top = Vec::with_capacity(th - split + 1);
+        top.push(roots);
+        for level in split + 1..=th {
+            let parents = hash_level(
+                p,
+                pub_seed,
+                &base,
+                subtree_addr,
+                &top[level - split - 1],
+                level,
+                0,
+            );
+            top.push(parents);
+        }
+        Subtree {
+            split,
+            top,
+            bottom: None,
+        }
+    }
+
+    /// The subtree root.
+    fn root(&self) -> &[u8] {
+        &self.top[self.top.len() - 1]
+    }
+
+    /// Writes the height-`h` authentication path for `idx_leaf`:
+    /// `auth_path[j]` is the sibling of the path node at height `j`, i.e. node
+    /// `(idx_leaf >> j) ^ 1` at that height. Heights below `split` come from
+    /// the bottom block holding `idx_leaf` (below the block root a sibling lies
+    /// in the same block), built first if it is not the resident one.
+    fn auth_path(
+        &mut self,
+        p: &Params,
+        sk_seed: &[u8],
+        pub_seed: &[u8],
+        subtree_addr: &Adrs,
+        idx_leaf: u32,
+        auth_path: &mut [u8],
+    ) {
+        let n = p.n;
+        let split = self.split;
+        if split > 0 {
+            let block = idx_leaf >> split;
+            if !matches!(&self.bottom, Some((b, _)) if *b == block) {
+                // Drop the old block before building its successor.
+                self.bottom = None;
+                let base = hash::prf_base(p, pub_seed);
+                let levels = build_block(
+                    p,
+                    sk_seed,
+                    pub_seed,
+                    &base,
+                    subtree_addr,
+                    block << split,
+                    split,
+                );
+                self.bottom = Some((block, levels));
+            }
+            if let Some((_, bottom)) = &self.bottom {
+                let first = (block << split) as usize;
+                for j in 0..split {
+                    let sib = ((idx_leaf >> j) ^ 1) as usize - (first >> j);
+                    auth_path[j * n..j * n + n].copy_from_slice(&bottom[j][sib * n..sib * n + n]);
+                }
+            }
+        }
+        for j in split..p.tree_height as usize {
+            let sib = ((idx_leaf >> j) ^ 1) as usize;
+            auth_path[j * n..j * n + n].copy_from_slice(&self.top[j - split][sib * n..sib * n + n]);
+        }
     }
 }
 
 #[cfg(feature = "alloc")]
-/// A signer-side cache of fully-built subtrees, keyed by `(layer, tree)`.
+/// A signer-side cache of built subtrees, keyed by `(layer, tree)`.
 ///
 /// XMSS / XMSS^MT consume leaves sequentially, so at any moment only the `d`
 /// subtrees on the current index path are live; this keeps at most one entry per
 /// layer (signing into a new tree at a layer evicts the old one), bounding the
-/// cache to `d` subtrees. Cached nodes are public Merkle hashes — the cache holds
-/// no secret material and is never serialized; it is rebuilt lazily from the
-/// seeds after [`XmssPrivateKey::from_bytes`].
+/// cache to `d` subtrees of at most ~4 MiB each (see [`TOP_LEVELS`]). Cached
+/// nodes are public Merkle hashes — the cache holds no secret material and is
+/// never serialized; it is rebuilt lazily from the seeds after
+/// [`XmssPrivateKey::from_bytes`].
 #[derive(Default)]
 struct SubtreeCache {
-    entries: Vec<(u32, u64, SubtreeNodes)>,
+    entries: Vec<(u32, u64, Subtree)>,
 }
 
 #[cfg(feature = "alloc")]
@@ -761,21 +928,29 @@ impl SubtreeCache {
     /// A cache pre-populated with one already-built subtree (used to hand the
     /// top subtree built during key generation straight to the signer, so the
     /// first signature doesn't rebuild it).
-    fn seeded(layer: u32, tree: u64, nodes: SubtreeNodes) -> Self {
+    fn seeded(layer: u32, tree: u64, nodes: Subtree) -> Self {
         SubtreeCache {
             entries: alloc::vec![(layer, tree, nodes)],
         }
     }
 
-    /// Returns the cached subtree for `(layer, tree)`, building it on first use.
-    fn get_or_build(
+    /// Writes the authentication path of leaf `idx_leaf` of subtree
+    /// `(layer, tree)` and returns that subtree's root, building the subtree on
+    /// first use.
+    #[allow(clippy::too_many_arguments)]
+    fn auth_path(
         &mut self,
         p: &Params,
         sk_seed: &[u8],
         pub_seed: &[u8],
         layer: u32,
         tree: u64,
-    ) -> &[Vec<u8>] {
+        idx_leaf: u32,
+        auth_path: &mut [u8],
+    ) -> &[u8] {
+        let mut subtree_addr = Adrs::new();
+        subtree_addr.set_layer(layer);
+        subtree_addr.set_tree(tree);
         let pos = match self
             .entries
             .iter()
@@ -785,15 +960,14 @@ impl SubtreeCache {
             None => {
                 // Only one active subtree per layer; drop any stale sibling.
                 self.entries.retain(|(l, _, _)| *l != layer);
-                let mut subtree_addr = Adrs::new();
-                subtree_addr.set_layer(layer);
-                subtree_addr.set_tree(tree);
-                let nodes = build_subtree(p, sk_seed, pub_seed, &subtree_addr);
+                let nodes = Subtree::build(p, sk_seed, pub_seed, &subtree_addr);
                 self.entries.push((layer, tree, nodes));
                 self.entries.len() - 1
             }
         };
-        &self.entries[pos].2
+        let subtree = &mut self.entries[pos].2;
+        subtree.auth_path(p, sk_seed, pub_seed, &subtree_addr, idx_leaf, auth_path);
+        subtree.root()
     }
 }
 
@@ -969,10 +1143,17 @@ fn core_sign(p: &Params, sk: &SkView, idx: u64, msg: &[u8], cache: &mut SubtreeC
         // Authentication path + new (upper) root, read from the cached subtree
         // (built once per (layer, tree) instead of rebuilt every signature).
         let th = p.tree_height as usize;
-        let nodes = cache.get_or_build(p, sk.sk_seed(), sk.pub_seed(), layer, tree);
-        auth_path_from_subtree(p, nodes, idx_leaf, &mut sig[off..off + th * n]);
+        let subtree_root = cache.auth_path(
+            p,
+            sk.sk_seed(),
+            sk.pub_seed(),
+            layer,
+            tree,
+            idx_leaf,
+            &mut sig[off..off + th * n],
+        );
         // The subtree root becomes the message signed at the next layer up.
-        root[..n].copy_from_slice(&nodes[th][..n]);
+        root[..n].copy_from_slice(&subtree_root[..n]);
         // Declassified (Valgrind harness): a subtree root is public — the
         // verifier recomputes it from the signature, and it is the message
         // the next layer's WOTS+ signs (its digits set the chain lengths).
@@ -1070,7 +1251,7 @@ fn core_verify(p: &Params, pub_root: &[u8], pub_seed: &[u8], sig: &[u8], msg: &[
 /// (`SK_SEED ‖ SK_PRF ‖ PUB_SEED`). Returns `(sk_bytes, pk_bytes, top_subtree)`,
 /// where `top_subtree` is the fully-built layer-`(d-1)` tree (for seeding the
 /// signer's [`SubtreeCache`]).
-fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>, SubtreeNodes) {
+fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>, Subtree) {
     let n = p.n;
     let mut sk = vec![0u8; p.sk_bytes()];
     // idx = 0 (already zero).
@@ -1084,12 +1265,11 @@ fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>, SubtreeNodes) {
     let pub_seed = &seed[2 * n..3 * n];
     let mut top_addr = Adrs::new();
     top_addr.set_layer(p.d - 1);
-    let levels = build_subtree(p, sk_seed, pub_seed, &top_addr);
-    let th = p.tree_height as usize;
-    sk[p.index_bytes + 2 * n..p.index_bytes + 3 * n].copy_from_slice(&levels[th][..n]);
+    let levels = Subtree::build(p, sk_seed, pub_seed, &top_addr);
+    sk[p.index_bytes + 2 * n..p.index_bytes + 3 * n].copy_from_slice(&levels.root()[..n]);
 
     let mut pk = vec![0u8; p.pk_bytes()];
-    pk[..n].copy_from_slice(&levels[th][..n]);
+    pk[..n].copy_from_slice(&levels.root()[..n]);
     pk[n..2 * n].copy_from_slice(pub_seed);
     // Hand the just-built top subtree to the caller so it can seed the signer's
     // cache (the top layer's tree is always tree 0, so this is reused on every
@@ -1181,9 +1361,8 @@ fn validate_raw_sk(p: &Params, raw: &[u8]) -> Result<(), Error> {
     let pub_seed = &raw[p.index_bytes + 3 * n..p.index_bytes + 4 * n];
     let mut top_addr = Adrs::new();
     top_addr.set_layer(p.d - 1);
-    let levels = build_subtree(p, sk_seed, pub_seed, &top_addr);
-    let th = p.tree_height as usize;
-    if !bool::from(levels[th][..n].ct_eq(stored_root)) {
+    let levels = Subtree::build(p, sk_seed, pub_seed, &top_addr);
+    if !bool::from(levels.root()[..n].ct_eq(stored_root)) {
         return Err(Error::InvalidKey);
     }
     Ok(())
