@@ -181,9 +181,14 @@ fn sub_in_place(x: &mut [u64], y: &[u64]) -> u64 {
     bo
 }
 
-/// `x ← x + (y & mask)` in place, returning the carry.
+/// `x ← x + (y & mask)` in place, returning the carry. `mask` is 0 or all
+/// ones derived from a secret bit; it goes through `black_box`, as in
+/// `u64::conditional_select`, because otherwise LLVM sees the 0 / −1 range
+/// and on x86 turns the masked add into a branch (flagged by the Valgrind
+/// harness under RSA keygen and DSA signing).
 #[cfg(feature = "alloc")]
 fn add_masked_in_place(x: &mut [u64], y: &[u64], mask: u64) -> u64 {
+    let mask = core::hint::black_box(mask);
     let mut c = 0;
     for (xi, &yi) in x.iter_mut().zip(y) {
         let (s, co) = super::uint::adc(*xi, yi & mask, c);

@@ -185,11 +185,12 @@ impl SafegcdModulus {
         for i in 1..5 {
             cd += u * d[i] as i128 + v * e[i] as i128;
             ce += q * d[i] as i128 + r * e[i] as i128;
-            // Public branch: skip the modulus's zero limbs.
-            if m[i] != 0 {
-                cd += m[i] as i128 * md as i128;
-                ce += m[i] as i128 * me as i128;
-            }
+            // Always multiply, even by a zero modulus limb: a "skip zero
+            // limbs" branch on the public modulus was folded by LLVM on
+            // 32-bit ARM into a branch on secret-derived halves (flagged by
+            // the Valgrind armv7 run), and the saved multiplies are noise.
+            cd += m[i] as i128 * md as i128;
+            ce += m[i] as i128 * me as i128;
             d[i - 1] = (cd as u64 & M62) as i64;
             e[i - 1] = (ce as u64 & M62) as i64;
             cd >>= 62;

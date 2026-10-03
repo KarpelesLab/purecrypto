@@ -888,6 +888,10 @@ macro_rules! ml_dsa_level {
                 // keygen just wrote tr = H(pk) into the secret key.
                 let mut tr = [0u8; 64];
                 tr.copy_from_slice(&sk[64..128]);
+                // Declassified (Valgrind harness): the public key, and so the
+                // cached tr = H(pk) that verification branches on, is public.
+                crate::ct::declassify(&pk);
+                crate::ct::declassify(&tr);
                 ($sk(sk, Some(*seed)), $pk(pk, tr))
             }
 
@@ -1161,6 +1165,10 @@ macro_rules! ml_dsa_level {
             fn from_array(pk: [u8; $params.pubkey]) -> Self {
                 let mut tr = [0u8; 64];
                 shake256(&[&pk], &mut tr);
+                // Declassified (Valgrind harness): a public key derived from a
+                // private key is public, as is its cached tr.
+                crate::ct::declassify(&pk);
+                crate::ct::declassify(&tr);
                 $pk(pk, tr)
             }
 
