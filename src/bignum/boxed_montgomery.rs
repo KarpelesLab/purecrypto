@@ -452,6 +452,17 @@ impl BoxedMontModulus {
         BoxedUint::from_limbs(c)
     }
 
+    /// Montgomery-domain squaring: given `a` in Montgomery form, returns `a²`
+    /// in Montgomery form — [`mont_mul`](Self::mont_mul)`(a, a)` with the
+    /// dedicated squaring's roughly halved multiply count.
+    pub fn mont_sqr(&self, a: &BoxedUint) -> BoxedUint {
+        let mut t = vec![0 as Limb; 2 * self.limbs];
+        let mut out = vec![0 as Limb; self.limbs];
+        self.mont_sqr_to(&a.limbs_resized(self.limbs), &mut t, &mut out);
+        zeroize_limbs(&mut t);
+        BoxedUint::from_limbs(out)
+    }
+
     /// Returns `(a * b) mod n` for `a, b < n`.
     pub fn mul_mod(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
         let a = a.limbs_resized(self.limbs);

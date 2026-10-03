@@ -25,9 +25,11 @@ const TRIAL_DIVISION_BOUND: u64 = 1 << 14;
 const TRIAL_DIVISION_EXACT_BITS: usize = 28;
 
 /// The odd primes below [`TRIAL_DIVISION_BOUND`], by a plain sieve of
-/// Eratosthenes. ~16 KiB of scratch and ~20 µs; negligible next to the
-/// modular exponentiation it front-runs.
-fn small_odd_primes() -> Vec<u64> {
+/// Eratosthenes. ~16 KiB of scratch and ~20 µs: negligible next to one
+/// modular exponentiation, but not next to the trial division of one
+/// candidate, so a caller testing many candidates (RSA key generation)
+/// sieves once and passes the table to [`is_prime_boxed_with`].
+pub(crate) fn small_odd_primes() -> Vec<u64> {
     let bound = TRIAL_DIVISION_BOUND as usize;
     let mut composite = alloc::vec![false; bound];
     let mut primes = Vec::with_capacity(2000);
@@ -75,15 +77,22 @@ fn split_pow2_boxed(x: &BoxedUint) -> (BoxedUint, u32) {
     (d, s)
 }
 
-/// Trial division of `n` by every odd prime below [`TRIAL_DIVISION_BOUND`].
-/// Returns the smallest such prime dividing `n`, or `None`.
+/// Trial division of `n` by every odd prime below [`TRIAL_DIVISION_BOUND`]
+/// (sieving them first; see [`small_factor_in`]).
+#[cfg(any(feature = "dh", test))]
+fn small_factor_boxed(n: &BoxedUint) -> Option<u64> {
+    small_factor_in(n, &small_odd_primes())
+}
+
+/// Trial division of `n` by every prime of `primes` (the
+/// [`small_odd_primes`] table). Returns the smallest one dividing `n`, or
+/// `None`.
 ///
 /// The primes are packed into products below `2^32` (as many consecutive
 /// primes as fit) so each product costs one Horner pass over the limbs; the
 /// residue is then reduced modulo each prime of the batch. Both reductions
 /// are multiply-by-reciprocal, so no division instruction sees `n`.
-fn small_factor_boxed(n: &BoxedUint) -> Option<u64> {
-    let primes = small_odd_primes();
+fn small_factor_in(n: &BoxedUint, primes: &[u64]) -> Option<u64> {
     let mut i = 0;
     while i < primes.len() {
         // Greedily extend the batch while the product stays below 2^32.
@@ -125,6 +134,17 @@ fn small_factor_boxed(n: &BoxedUint) -> Option<u64> {
 /// decided prime. The tests themselves are the branch-free ones, so a
 /// candidate that is kept has run exactly the same code as any other.
 pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usize) -> bool {
+    is_prime_boxed_with(n, rng, rounds, &small_odd_primes())
+}
+
+/// [`is_prime_boxed`] with the trial-division table supplied by the caller
+/// (`primes` must be [`small_odd_primes`]), so a candidate loop sieves once.
+pub(crate) fn is_prime_boxed_with<R: RngCore>(
+    n: &BoxedUint,
+    rng: &mut R,
+    rounds: usize,
+    primes: &[u64],
+) -> bool {
     let one = BoxedUint::from_u64(1);
     let two = BoxedUint::from_u64(2);
     if (n.ct_is_zero() | n.ct_eq(&one)).declassify() {
@@ -136,7 +156,7 @@ pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usi
     if !crate::ct::declassify_value(n.is_odd()) {
         return false;
     }
-    if let Some(p) = small_factor_boxed(n) {
+    if let Some(p) = small_factor_in(n, primes) {
         return n.ct_eq(&BoxedUint::from_u64(p)).declassify();
     }
     // `n < 2^TRIAL_DIVISION_EXACT_BITS`, without scanning `n` for its length.
@@ -152,13 +172,17 @@ pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usi
     let (d, s) = split_pow2_boxed(&n_minus_1);
 
     let modulus = BoxedMontModulus::new(n);
+    // The squarings stay in the Montgomery domain (one CIOS squaring each,
+    // against `mul_mod`'s two multiplies), compared with M(n - 1).
+    let n_minus_1_m = modulus.to_mont(&n_minus_1);
     for _ in 0..rounds {
-        let a = random_base(n, &n_minus_1, rng);
-        let mut x = modulus.pow(&a, &d);
+        let a = random_base(&modulus, &n_minus_1, rng);
+        let x = modulus.pow(&a, &d);
         let mut pass = x.ct_eq(&one) | x.ct_eq(&n_minus_1);
+        let mut x = modulus.to_mont(&x);
         for j in 1..MR_FIXED_SQUARINGS {
-            x = modulus.mul_mod(&x, &x);
-            pass |= j.ct_lt(&s) & x.ct_eq(&n_minus_1);
+            x = modulus.mont_sqr(&x);
+            pass |= j.ct_lt(&s) & x.ct_eq(&n_minus_1_m);
         }
         // The rare tail (`2^64 | n − 1`, probability 2^-64 for a random
         // candidate): whether it runs is the one bit this test reveals about
@@ -166,8 +190,8 @@ pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usi
         // `s`: it squares up to the full width, masked by `j < s`.
         if crate::ct::declassify_value(s > MR_FIXED_SQUARINGS) {
             for j in MR_FIXED_SQUARINGS..(n.limbs() * super::LIMB_BITS) as u32 {
-                x = modulus.mul_mod(&x, &x);
-                pass |= j.ct_lt(&s) & x.ct_eq(&n_minus_1);
+                x = modulus.mont_sqr(&x);
+                pass |= j.ct_lt(&s) & x.ct_eq(&n_minus_1_m);
             }
         }
         // A witness rejects the candidate: a public verdict.
@@ -181,12 +205,12 @@ pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usi
 /// A random base in `[2, n − 2]` for an odd `n ≥ 5`: a full-width draw
 /// reduced mod `n`, with the three useless values `0`, `1`, `n − 1` mapped
 /// to `2`.
-fn random_base<R: RngCore>(n: &BoxedUint, n_minus_1: &BoxedUint, rng: &mut R) -> BoxedUint {
+fn random_base<R: RngCore>(n: &BoxedMontModulus, n_minus_1: &BoxedUint, rng: &mut R) -> BoxedUint {
     let mut limbs = alloc::vec![0u64; n.limbs()];
     for limb in &mut limbs {
         *limb = rng.next_u64();
     }
-    let a = BoxedUint::from_limbs(limbs).reduce(n);
+    let a = n.reduce(&BoxedUint::from_limbs(limbs));
     let useless = a.ct_is_zero() | a.ct_eq(&BoxedUint::from_u64(1)) | a.ct_eq(n_minus_1);
     BoxedUint::conditional_select(&BoxedUint::from_u64(2), &a, useless)
 }
@@ -254,7 +278,7 @@ pub(crate) fn is_safe_prime_boxed<R: RngCore>(p: &BoxedUint, rng: &mut R, rounds
     // Lucas test on p with the factorization p − 1 = 2 · q.
     let modulus = BoxedMontModulus::new(p);
     for _ in 0..rounds {
-        let a = random_base(p, &p_minus_1, rng);
+        let a = random_base(&modulus, &p_minus_1, rng);
         let t = modulus.pow(&a, &q);
         if t == p_minus_1 {
             return true; // a has order 2q = p − 1: p is prime.

@@ -200,8 +200,10 @@ pub fn random_prime<const LIMBS: usize, R: RngCore>(
 // The Miller-Rabin core for `BoxedUint` lives in `bignum::prime` so the `dh`
 // feature (custom-group validation) can share it without depending on `rsa`.
 // `rsa` implies `rng`, so under `alloc` the shared module is always present.
+#[cfg(all(feature = "alloc", test))]
+use crate::bignum::prime::is_prime_boxed;
 #[cfg(feature = "alloc")]
-pub(crate) use crate::bignum::prime::is_prime_boxed;
+use crate::bignum::prime::{is_prime_boxed_with, small_odd_primes};
 
 /// Generates a random (probable) prime of exactly `bits` bits as a
 /// [`BoxedUint`](crate::bignum::BoxedUint), with the top two bits and bit 0 set.
@@ -222,6 +224,8 @@ pub(crate) fn random_prime_boxed<R: RngCore>(
     assert!(bits >= 2, "random_prime_boxed: bits must be >= 2");
     let rounds = rounds.max(min_mr_rounds(bits));
     let nlimbs = bits.div_ceil(64);
+    // Sieve the trial-division primes once for the whole candidate loop.
+    let primes = small_odd_primes();
     loop {
         let mut limbs = alloc::vec![0u64; nlimbs];
         for limb in &mut limbs {
@@ -232,7 +236,7 @@ pub(crate) fn random_prime_boxed<R: RngCore>(
         limbs[(bits - 2) / 64] |= 1 << ((bits - 2) % 64);
         limbs[0] |= 1;
         let candidate = BoxedUint::from_limbs(limbs);
-        if is_prime_boxed(&candidate, rng, rounds) {
+        if is_prime_boxed_with(&candidate, rng, rounds, &primes) {
             return candidate;
         }
     }
