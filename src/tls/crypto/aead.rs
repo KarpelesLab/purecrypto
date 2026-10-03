@@ -379,11 +379,13 @@ fn wipe(buf: &mut [u8]) {
 /// Constant-time properties (RFC 8446 §5.4 traffic-analysis note):
 ///
 /// - Every byte of `buf` is visited exactly once, eight at a time: each
-///   little-endian word's nonzero bytes are flagged with a carry-free
-///   SWAR test, and the highest flagged byte (value and position) is
-///   located by three branch-free halvings ([`u64::conditional_select`]
-///   on constant shifts — no secret-dependent shift or index). The
-///   trailing `len % 8` bytes are scanned one at a time.
+///   little-endian word is tested for a nonzero byte with a carry-free
+///   SWAR test, and the last such word (and its index) is kept. Once,
+///   after the scan, the highest nonzero byte of that word (value and
+///   position) is located by three branch-free halvings
+///   ([`u64::conditional_select`] on constant shifts — no
+///   secret-dependent shift or index). The trailing `len % 8` bytes are
+///   then scanned one at a time.
 /// - Whether a word or byte holds the new candidate is applied with
 ///   [`ConditionallySelectable::conditional_select`], which is data-flow
 ///   only.
@@ -407,8 +409,10 @@ pub(crate) fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
     const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HIGH: u64 = 0x8080_8080_8080_8080;
     let mut found_any = Choice::from(0);
-    let mut cur_byte: u8 = 0;
-    let mut cur_end: usize = 0;
+    // The last word holding a nonzero byte, its flags and its index.
+    let mut last_w: u64 = 0;
+    let mut last_f: u64 = 0;
+    let mut last_wi: usize = 0;
     let words = buf.chunks_exact(8);
     let tail = words.remainder();
     for (wi, chunk) in words.enumerate() {
@@ -418,23 +422,27 @@ pub(crate) fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
         // are nonzero, and never carries into the next byte.
         let f = (((w & LOW7) + LOW7) | w) & HIGH;
         let word_nz = nonzero(f);
-        // Narrow to the half holding the highest flagged byte, three
-        // times; `v` keeps that byte's value in its low eight bits.
-        let (mut v, mut f, mut pos) = (w, f, 0usize);
-        for shift in [32u32, 16, 8] {
-            let low_mask = (1u64 << shift) - 1;
-            let up = nonzero(f >> shift);
-            v = u64::conditional_select(&(v >> shift), &(v & low_mask), up);
-            f = u64::conditional_select(&(f >> shift), &(f & low_mask), up);
-            pos += (shift as usize / 8) * usize::from(up.unwrap_u8());
-        }
-        // Conditionally promote (byte, index+1) as the new "last non-zero"
-        // candidate. `index+1` is the truncation index (one past the
-        // content-type byte position).
-        cur_byte = u8::conditional_select(&(v as u8), &cur_byte, word_nz);
-        cur_end = usize::conditional_select(&(wi * 8 + pos + 1), &cur_end, word_nz);
+        last_w = u64::conditional_select(&w, &last_w, word_nz);
+        last_f = u64::conditional_select(&f, &last_f, word_nz);
+        last_wi = usize::conditional_select(&wi, &last_wi, word_nz);
         found_any |= word_nz;
     }
+    // Narrow `last_w` to the half holding its highest flagged byte, three
+    // times; `v` keeps that byte's value in its low eight bits. When no
+    // word held a nonzero byte the result is unused (`found_any` is clear,
+    // or a tail byte replaces it below).
+    let (mut v, mut f, mut pos) = (last_w, last_f, 0usize);
+    for shift in [32u32, 16, 8] {
+        let low_mask = (1u64 << shift) - 1;
+        let up = nonzero(f >> shift);
+        v = u64::conditional_select(&(v >> shift), &(v & low_mask), up);
+        f = u64::conditional_select(&(f >> shift), &(f & low_mask), up);
+        pos += (shift as usize / 8) * usize::from(up.unwrap_u8());
+    }
+    // The candidate (byte, index+1): `index+1` is the truncation index (one
+    // past the content-type byte position).
+    let mut cur_byte = v as u8;
+    let mut cur_end = last_wi * 8 + pos + 1;
     let base = buf.len() - tail.len();
     for (i, &b) in tail.iter().enumerate() {
         let nonzero = !b.ct_eq(&0u8);
