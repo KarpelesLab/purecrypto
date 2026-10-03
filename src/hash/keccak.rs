@@ -196,12 +196,19 @@ impl Keccak {
         }
     }
 
+    /// XORs one `rate`-byte block into the state and permutes. Every rate is
+    /// a whole number of lanes.
+    #[inline]
+    fn absorb_block(state: &mut [u64; 25], rounds: usize, block: &[u8]) {
+        for (lane, chunk) in state.iter_mut().zip(block.chunks_exact(8)) {
+            *lane ^= u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        keccak_p(state, rounds);
+    }
+
     /// XORs the full `rate`-byte buffer into the state and permutes.
     fn absorb_buf(&mut self) {
-        for (i, chunk) in self.buf[..self.rate].chunks_exact(8).enumerate() {
-            self.state[i] ^= u64::from_le_bytes(chunk.try_into().unwrap());
-        }
-        keccak_p(&mut self.state, self.rounds);
+        Self::absorb_block(&mut self.state, self.rounds, &self.buf[..self.rate]);
     }
 
     pub(super) fn update(&mut self, mut data: &[u8]) {
@@ -215,10 +222,11 @@ impl Keccak {
                 self.buf_len = 0;
             }
         }
+        // Whole blocks are XORed into the state straight from the input.
         while data.len() >= self.rate {
-            self.buf[..self.rate].copy_from_slice(&data[..self.rate]);
-            self.absorb_buf();
-            data = &data[self.rate..];
+            let (block, rest) = data.split_at(self.rate);
+            Self::absorb_block(&mut self.state, self.rounds, block);
+            data = rest;
         }
         if !data.is_empty() {
             self.buf[..data.len()].copy_from_slice(data);
@@ -250,15 +258,42 @@ impl Keccak {
 
     /// Squeezes `out.len()` bytes, continuing the stream across calls.
     pub(super) fn squeeze(&mut self, out: &mut [u8]) {
-        for b in out.iter_mut() {
-            if self.squeeze_offset == self.rate {
-                keccak_p(&mut self.state, self.rounds);
-                self.squeeze_offset = 0;
+        let mut p = self.squeeze_offset;
+        if out.len() < 8 {
+            // Short reads (e.g. 3-byte rejection-sampling draws): the plain
+            // byte loop, without the alignment test below.
+            for b in out.iter_mut() {
+                if p == self.rate {
+                    keccak_p(&mut self.state, self.rounds);
+                    p = 0;
+                }
+                *b = (self.state[p / 8] >> (8 * (p % 8))) as u8;
+                p += 1;
             }
-            let p = self.squeeze_offset;
-            *b = (self.state[p / 8] >> (8 * (p % 8))) as u8;
-            self.squeeze_offset += 1;
+            self.squeeze_offset = p;
+            return;
         }
+        let mut i = 0;
+        while i < out.len() {
+            if p == self.rate {
+                keccak_p(&mut self.state, self.rounds);
+                p = 0;
+            }
+            let lane = self.state[p / 8];
+            // A whole lane at a time where aligned (the rate is a whole
+            // number of lanes, so an aligned lane never crosses it), else a
+            // byte (short reads and the unaligned edges).
+            if p.is_multiple_of(8) && out.len() - i >= 8 {
+                out[i..i + 8].copy_from_slice(&lane.to_le_bytes());
+                i += 8;
+                p += 8;
+            } else {
+                out[i] = (lane >> (8 * (p % 8))) as u8;
+                i += 1;
+                p += 1;
+            }
+        }
+        self.squeeze_offset = p;
     }
 }
 
@@ -286,5 +321,48 @@ impl XofReader for KeccakReader {
 impl Drop for KeccakReader {
     fn drop(&mut self) {
         self.keccak.zeroize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Absorbing and squeezing in arbitrary pieces must match feeding and
+    /// reading one byte at a time (the lane-at-a-time paths against the
+    /// byte-wise reference), for every rate used in the crate.
+    #[test]
+    fn chunked_absorb_and_squeeze_match_bytewise() {
+        let input: [u8; 700] = core::array::from_fn(|i| (i as u8).wrapping_mul(29) ^ 0xa5);
+        for rate in [72, 104, 136, 144, 168] {
+            let mut bytewise = Keccak::new(rate);
+            for b in &input {
+                bytewise.update(core::slice::from_ref(b));
+            }
+            bytewise.finalize(0x1f);
+            let mut expect = [0u8; 600];
+            for b in expect.iter_mut() {
+                bytewise.squeeze(core::slice::from_mut(b));
+            }
+
+            for step in [1usize, 3, 7, 8, 13, 64, 167, 169, 600] {
+                let mut k = Keccak::new(rate);
+                for c in input.chunks(step) {
+                    k.update(c);
+                }
+                k.finalize(0x1f);
+                let mut got = [0u8; 600];
+                let pattern = [step, 5, 8, 1, 200];
+                let mut sizes = pattern.iter().cycle();
+                let mut rest = &mut got[..];
+                while !rest.is_empty() {
+                    let n = (*sizes.next().unwrap()).min(rest.len());
+                    let (h, t) = rest.split_at_mut(n);
+                    k.squeeze(h);
+                    rest = t;
+                }
+                assert_eq!(got, expect, "rate {rate} step {step}");
+            }
+        }
     }
 }
