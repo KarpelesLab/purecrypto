@@ -88,29 +88,62 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// Panics if `modulus` is even (Montgomery reduction requires an odd
     /// modulus). In a `const` context that panic is a compile error.
     ///
-    /// Costs `2 * 64 * LIMBS` modular doublings, so a fixed modulus should be
-    /// built once, ideally as a `const`.
+    /// Costs about `64·(LIMBS − s + 1)` modular doublings plus
+    /// `⌊log₂(64·LIMBS)⌋` Montgomery squarings, where `s` is the number of
+    /// significant limbs of the modulus — so a full-width modulus is cheap to
+    /// build, but a fixed one should still be built once, ideally as a
+    /// `const`.
     pub const fn new(modulus: Uint<LIMBS>) -> Self {
         assert!(
             modulus.as_limbs()[0] & 1 == 1,
             "Montgomery modulus must be odd"
         );
         let n_prime = inv_mod_2_64(modulus.as_limbs()[0]).wrapping_neg();
-
-        // R^2 mod N = 2^(2*64*LIMBS) mod N, by doubling 1 that many times.
-        let mut r2 = Uint::ONE;
-        let mut i = 0;
-        let bits = 2 * 64 * LIMBS;
-        while i < bits {
-            r2 = add_mod(&modulus, &r2, &r2);
-            i += 1;
-        }
-
-        MontModulus {
+        let mut m = MontModulus {
             modulus,
             n_prime,
-            r2,
+            r2: Uint::ZERO,
+        };
+
+        // R² mod N without the 2·64·LIMBS doublings of the textbook loop.
+        // With M(x) = x·R mod N, a modular doubling maps M(2^e) to
+        // M(2^(e+1)) and a Montgomery squaring maps it to M(2^(2e)); the
+        // target is R² = M(2^k), k = 64·LIMBS. Reach M(2) = 2R mod N by
+        // doublings, then walk the bits of k below its leading one: square,
+        // and double where the bit is set.
+        //
+        // The doublings start at 2^(64·(s−1)), s = significant limbs, which is
+        // already below N (N's limb s−1 is nonzero, and N is odd so it cannot
+        // equal that power unless s = 1, where the start 1 is below any N > 1).
+        // `s` reveals only the modulus width, which is public even for a
+        // secret modulus (an RSA prime's size is fixed by the key size) — the
+        // convention `BoxedUint::significant_limbs` documents and
+        // declassifies; it cannot here because this is a `const fn`. The other
+        // branches are on bits of k; the arithmetic itself is masked.
+        let n = modulus.as_limbs();
+        let mut s = LIMBS;
+        while s > 1 && n[s - 1] == 0 {
+            s -= 1;
         }
+        let mut start = [0 as Limb; LIMBS];
+        start[s - 1] = 1;
+        let mut x = Uint::from_limbs(start);
+        let mut i = 0;
+        while i < 64 * (LIMBS - s + 1) + 1 {
+            x = add_mod(&modulus, &x, &x);
+            i += 1;
+        }
+        let k = 64 * LIMBS;
+        let mut bit = usize::BITS - 1 - k.leading_zeros();
+        while bit > 0 {
+            bit -= 1;
+            x = m.mont_mul(&x, &x);
+            if (k >> bit) & 1 == 1 {
+                x = add_mod(&modulus, &x, &x);
+            }
+        }
+        m.r2 = x;
+        m
     }
 
     /// The modulus `N`.
@@ -498,6 +531,61 @@ mod tests {
         sqr_matches_mul_width::<7>(&mut rng);
         sqr_matches_mul_width::<8>(&mut rng);
         sqr_matches_mul_width::<16>(&mut rng);
+    }
+
+    /// The textbook `R²` loop `new` replaced: `2·64·L` doublings of 1.
+    fn r2_by_doubling<const L: usize>(n: &Uint<L>) -> Uint<L> {
+        let mut r2 = Uint::ONE;
+        for _ in 0..2 * 64 * L {
+            r2 = add_mod(n, &r2, &r2);
+        }
+        r2
+    }
+
+    fn r2_matches_width<const L: usize>(rng: &mut u64) {
+        for k in 0..8 {
+            let mut v = [0 as Limb; L];
+            for l in v.iter_mut() {
+                *l = splitmix64(rng);
+            }
+            // Full-width, short (leading zero limbs, as a half-width RSA
+            // prime in a full-width type), and a single-limb top.
+            let top = if k < 3 { L } else { 1 + (k % L) };
+            for l in v.iter_mut().skip(top) {
+                *l = 0;
+            }
+            if k == 1 {
+                v[top - 1] = 1;
+            }
+            v[0] |= 1;
+            if v[0] == 1 && top == 1 {
+                v[0] = 3;
+            }
+            let n = Uint::<L>::from_limbs(v);
+            assert_eq!(MontModulus::new(n).r2, r2_by_doubling(&n), "L={L} n={n:?}");
+        }
+    }
+
+    #[test]
+    fn r2_matches_doubling_oracle() {
+        let mut rng: u64 = 0x5151_7E57_0DD5_EED5;
+        for v in [3u64, 5, 97, 0xFFFF_FFFF_FFFF_FFC5, u64::MAX] {
+            let n = Uint::<1>::from_u64(v);
+            assert_eq!(MontModulus::new(n).r2, r2_by_doubling(&n));
+            let n = Uint::<3>::from_u64(v);
+            assert_eq!(MontModulus::new(n).r2, r2_by_doubling(&n));
+        }
+        r2_matches_width::<1>(&mut rng);
+        r2_matches_width::<2>(&mut rng);
+        r2_matches_width::<3>(&mut rng);
+        r2_matches_width::<4>(&mut rng);
+        r2_matches_width::<5>(&mut rng);
+        r2_matches_width::<7>(&mut rng);
+        r2_matches_width::<8>(&mut rng);
+        r2_matches_width::<16>(&mut rng);
+        r2_matches_width::<17>(&mut rng);
+        r2_matches_width::<32>(&mut rng);
+        r2_matches_width::<48>(&mut rng);
     }
 
     #[test]

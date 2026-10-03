@@ -555,7 +555,7 @@ fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUi
 pub(crate) const MIN_RSA_BITS: usize = 1024;
 
 /// Upper bound to prevent CPU-exhaustion on parsing huge SPKI moduli.
-/// `BoxedMontModulus::new` runs `2 * 64 * limbs` `add_mod` iterations for the
+/// `BoxedMontModulus::new` costs O(log(limbs)) Montgomery squarings for the
 /// R² precomp, and every subsequent `mont_mul` is O(limbs²). 16384 bits is
 /// well above any legitimate use.
 pub(crate) const MAX_RSA_BITS: usize = 16384;

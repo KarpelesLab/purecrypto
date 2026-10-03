@@ -103,19 +103,81 @@ impl BoxedMontModulus {
         );
         let n_prime = inv_mod_2_64(n[0]).wrapping_neg();
 
-        // r2 = 2^(2*64*limbs) mod n, by doubling 1 that many times.
-        let mut r2 = vec![0 as Limb; limbs];
-        r2[0] = 1;
-        let bits = 2 * 64 * limbs;
-        for _ in 0..bits {
-            r2 = add_mod_limbs(&n, &r2, &r2);
-        }
-
-        BoxedMontModulus {
+        let mut m = BoxedMontModulus {
             n,
             n_prime,
-            r2,
+            r2: vec![0 as Limb; limbs],
             limbs,
+        };
+        m.r2 = m.compute_r2();
+        m
+    }
+
+    /// `R² mod n` for `R = 2^k`, `k = 64·limbs`, without the `2k` modular
+    /// doublings of the textbook loop (and without an allocation per step).
+    ///
+    /// Writing `M(x) = x·R mod n` for the Montgomery form, a modular doubling
+    /// maps `M(2^e)` to `M(2^(e+1))` and a Montgomery squaring maps it to
+    /// `M(2^(2e))`; the target `R² = M(2^k)`. So: reach `M(2) = 2R mod n` by
+    /// doublings, then walk the bits of `k` below its leading one — square,
+    /// and double where the bit is set — which takes `e` from 1 to `k` in
+    /// `⌊log₂ k⌋` squarings (11 at 2048 bits) plus `popcount(k) − 1`
+    /// doublings.
+    ///
+    /// The doublings start at `2^(64·(limbs−1))`, which is already below `n`:
+    /// the top limb of `n` is nonzero, and `n` is odd so it cannot equal that
+    /// power for `limbs > 1` (for `limbs = 1` the start is `1 < n`). That
+    /// leaves `64 + 1` doublings to `M(2)` instead of `64·limbs + 1`.
+    ///
+    /// Constant time in `n`: the only branches are on `limbs` and the bits of
+    /// `k`, both functions of the (public) modulus width; every doubling and
+    /// squaring is the masked-select arithmetic used everywhere else.
+    fn compute_r2(&self) -> Vec<Limb> {
+        let l = self.limbs;
+        let mut x = vec![0 as Limb; l];
+        x[l - 1] = 1;
+        let mut tmp = vec![0 as Limb; 2 * l];
+        for _ in 0..65 {
+            self.double_in_place(&mut x, &mut tmp);
+        }
+        let k = 64 * l;
+        let mut out = vec![0 as Limb; l];
+        let mut i = usize::BITS - 1 - k.leading_zeros();
+        while i > 0 {
+            i -= 1;
+            self.mont_sqr_to(&x, &mut tmp, &mut out);
+            core::mem::swap(&mut x, &mut out);
+            if (k >> i) & 1 == 1 {
+                self.double_in_place(&mut x, &mut tmp);
+            }
+        }
+        // The intermediates are powers of two mod `n` — functions of the
+        // (possibly secret) modulus — so scrub them like the CIOS scratch.
+        zeroize_limbs(&mut tmp);
+        zeroize_limbs(&mut out);
+        x
+    }
+
+    /// `x ← 2x mod n` for `x < n`, using `tmp` (at least `limbs` long) as the
+    /// trial-subtraction buffer. Same masked conditional subtraction as
+    /// [`add_mod_limbs`], minus its three allocations.
+    fn double_in_place(&self, x: &mut [Limb], tmp: &mut [Limb]) {
+        let mut carry: Limb = 0;
+        for w in x.iter_mut() {
+            let next = *w >> 63;
+            *w = (*w << 1) | carry;
+            carry = next;
+        }
+        let mut bo: Limb = 0;
+        for j in 0..self.limbs {
+            let (d, b) = sbb(x[j], self.n[j], bo);
+            tmp[j] = d;
+            bo = b;
+        }
+        // Subtract when the shift overflowed or the shifted value is >= n.
+        let ge = Choice::from((carry | (bo ^ 1)) as u8);
+        for j in 0..self.limbs {
+            x[j] = Limb::conditional_select(&tmp[j], &x[j], ge);
         }
     }
 
@@ -700,6 +762,51 @@ mod tests {
                     m.mont_sqr_to(&a, &mut t_sqr, &mut out_sqr);
                     assert_eq!(out_sqr, out_mul, "limbs={limbs} a={a:x?}");
                 }
+            }
+        }
+    }
+
+    /// The textbook `R²` computation `compute_r2` replaced: `2·64·limbs`
+    /// modular doublings of 1.
+    fn r2_by_doubling(n: &[Limb]) -> Vec<Limb> {
+        let mut r2 = vec![0 as Limb; n.len()];
+        r2[0] = 1;
+        for _ in 0..2 * 64 * n.len() {
+            r2 = add_mod_limbs(n, &r2, &r2);
+        }
+        r2
+    }
+
+    #[test]
+    fn r2_matches_doubling_oracle() {
+        let mut rng: u64 = 0x0123_4567_89AB_CDEF;
+        let check = |n: BoxedUint| {
+            let m = BoxedMontModulus::new(&n);
+            let expected = r2_by_doubling(&n.limbs_resized(m.limbs()));
+            assert_eq!(m.r2, expected, "n={:x?}", n.as_limbs());
+        };
+        // Small and boundary moduli, including padded storage (the context
+        // strips leading zero limbs).
+        for v in [3u64, 5, 7, 0xFFFF_FFFF_FFFF_FFC5, 1 << 63 | 1, u64::MAX] {
+            check(BoxedUint::from_u64(v));
+            check(BoxedUint::from_limbs(vec![v, 0, 0]));
+        }
+        check(BoxedUint::from_limbs(vec![1, 1]));
+        check(BoxedUint::from_limbs(vec![u64::MAX; 5]));
+        for limbs in 1..=40usize {
+            for k in 0..3 {
+                let mut v: Vec<Limb> = (0..limbs).map(|_| splitmix64(&mut rng)).collect();
+                // Full-width, small top limb, and top limb = 1.
+                match k {
+                    0 => v[limbs - 1] |= 1 << 63,
+                    1 => v[limbs - 1] = (v[limbs - 1] >> 40).max(1),
+                    _ => v[limbs - 1] = 1,
+                }
+                v[0] |= 1;
+                if v == [1] {
+                    v[0] = 3;
+                }
+                check(BoxedUint::from_limbs(v));
             }
         }
     }
