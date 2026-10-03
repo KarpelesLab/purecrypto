@@ -45,6 +45,8 @@ pub(crate) fn random_scalar<R: RngCore>(rng: &mut R) -> Fe {
 // Curve parameters (hex, big-endian).
 const P_HEX: &str = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
 const B_HEX: &str = "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b";
+/// The curve coefficient `b`, decoded at compile time.
+const B: Fe = fe_from_hex(B_HEX);
 // The generator's affine coordinates, test-only: the library takes `G` from
 // `G_AFFINE`, checked against these by `tests::generator_matches_hex`.
 #[cfg(test)]
@@ -115,9 +117,7 @@ pub(crate) struct P256 {
 
 impl P256 {
     pub(crate) fn new() -> Self {
-        P256 {
-            b: fe_from_hex(B_HEX),
-        }
+        P256 { b: B }
     }
 
     /// The group order `n`.
