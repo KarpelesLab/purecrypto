@@ -182,6 +182,7 @@ fn abs_diff(a: u64, b: u64) -> u64 {
 /// `as u16` truncation, so a release build emitted a record whose declared
 /// length was smaller than its body — a framing desynchronisation on the
 /// wire.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // every field of the unified header
 pub(crate) fn encode_record(
     out: &mut Vec<u8>,
@@ -193,8 +194,37 @@ pub(crate) fn encode_record(
     encrypted_payload: &[u8],
     sn_mask: &[u8],
 ) -> Result<(), Error> {
+    encode_header(
+        out,
+        epoch,
+        seq,
+        seq_is_16bit,
+        omit_length,
+        cid,
+        encrypted_payload.len(),
+        sn_mask,
+    )?;
+    out.extend_from_slice(encrypted_payload);
+    Ok(())
+}
+
+/// The unified header [`encode_record`] writes in front of a body of
+/// `payload_len` bytes, on its own (same checks, same errors). Lets the
+/// write path build the header, append the plaintext behind it and
+/// encrypt in place.
+#[allow(clippy::too_many_arguments)] // every field of the unified header
+pub(crate) fn encode_header(
+    out: &mut Vec<u8>,
+    epoch: u16,
+    seq: u64,
+    seq_is_16bit: bool,
+    omit_length: bool,
+    cid: &[u8],
+    payload_len: usize,
+    sn_mask: &[u8],
+) -> Result<(), Error> {
     debug_assert!(seq <= SEQ_MASK_48, "DTLS seq must fit in 48 bits");
-    if !omit_length && encrypted_payload.len() > u16::MAX as usize {
+    if !omit_length && payload_len > u16::MAX as usize {
         return Err(Error::RecordOverflow);
     }
     if cid.len() > 255 {
@@ -233,9 +263,8 @@ pub(crate) fn encode_record(
 
     if !omit_length {
         // Checked above, so the cast cannot truncate.
-        out.extend_from_slice(&(encrypted_payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(payload_len as u16).to_be_bytes());
     }
-    out.extend_from_slice(encrypted_payload);
     Ok(())
 }
 

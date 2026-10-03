@@ -3031,55 +3031,46 @@ pub(crate) fn encrypt_protected_record_with(
     let seq_is_16bit = true;
     let omit_length = false;
 
-    // Inner = payload || true_content_type (TLS 1.3 InnerPlaintext,
-    // no extra padding).
-    let mut inner = Vec::with_capacity(payload.len() + 1);
-    inner.extend_from_slice(payload);
-    inner.push(ct.as_u8());
-
-    // AAD bytes: encode the header against a placeholder ciphertext
-    // of the known final size, then truncate to the header length.
-    let mut aad = Vec::new();
-    let aad_zero_mask = [0u8; 2];
-    let ct_len = inner.len() + 16;
-    record13::encode_record(
-        &mut aad,
-        epoch,
-        seq,
-        seq_is_16bit,
-        omit_length,
-        cid,
-        &alloc::vec![0u8; ct_len],
-        &aad_zero_mask,
-    )?;
-    let hdr_len = aad.len() - ct_len;
-    aad.truncate(hdr_len);
-
-    encrypt_dtls13_record(crypter, seq, &aad, &mut inner)?;
-    // Declassified (Valgrind harness): the ciphertext and tag are the
-    // record's public wire bytes; the sequence-number mask is computed from
-    // them (RFC 9147 §4.2.3).
-    crate::ct::declassify(&inner);
-
-    // Compute sn_mask over the first 16 bytes of ciphertext+tag and
-    // emit the on-wire record with the masked seq.
-    let mask_full = sn_key.mask(&inner);
-    let mask: &[u8] = if seq_is_16bit {
-        &mask_full[..2]
-    } else {
-        &mask_full[..1]
-    };
-    let mut wire = Vec::new();
-    record13::encode_record(
+    // The record is built in place: the header (sequence number still
+    // unmasked — that is the AAD) and behind it the inner plaintext,
+    // payload || true_content_type (TLS 1.3 InnerPlaintext, no extra
+    // padding), encrypted where it lies.
+    let ct_len = payload.len() + 1 + 16;
+    let mut wire = Vec::with_capacity(1 + cid.len() + 2 + 2 + ct_len);
+    record13::encode_header(
         &mut wire,
         epoch,
         seq,
         seq_is_16bit,
         omit_length,
         cid,
-        &inner,
-        mask,
+        ct_len,
+        &[0u8; 2],
     )?;
+    let hdr_len = wire.len();
+    wire.extend_from_slice(payload);
+    wire.push(ct.as_u8());
+    // `encrypt_raw`, not `RecordCrypter::encrypt`: the AAD is the unified
+    // header, not TLS 1.3's 5-byte one, and `seq` alone forms the nonce
+    // (static IV XOR 64-bit big-endian seq, RFC 9147 §4.2.2); the epoch is
+    // implicit in `crypter`, which is keyed per epoch.
+    let (aad, inner) = wire.split_at_mut(hdr_len);
+    let tag = crypter.encrypt_raw(seq, aad, inner)?;
+    wire.extend_from_slice(&tag);
+    // Declassified (Valgrind harness): the ciphertext and tag are the
+    // record's public wire bytes; the sequence-number mask is computed from
+    // them (RFC 9147 §4.2.3).
+    crate::ct::declassify(&wire[hdr_len..]);
+
+    // Compute sn_mask over the first 16 bytes of ciphertext+tag and
+    // mask the on-wire sequence number, which follows the first byte and
+    // the CID.
+    let mask = sn_key.mask(&wire[hdr_len..]);
+    let seq_off = 1 + cid.len();
+    wire[seq_off] ^= mask[0];
+    if seq_is_16bit {
+        wire[seq_off + 1] ^= mask[1];
+    }
     Ok(wire)
 }
 
@@ -3090,24 +3081,6 @@ pub(crate) fn sn_key_len_for(aead: AeadAlg) -> usize {
         AeadAlg::Aes128Gcm => 16,
         AeadAlg::Aes256Gcm | AeadAlg::ChaCha20Poly1305 => 32,
     }
-}
-
-/// Encrypts `inner` in-place under `crypter` with the DTLS-style AAD.
-///
-/// This bypasses `RecordCrypter::encrypt` because we need the AAD to be the
-/// caller-supplied unified-header bytes (not the TLS-1.3 5-byte header
-/// the standard wrapper produces). `seq` alone forms the nonce
-/// (static IV XOR 64-bit big-endian seq, per RFC 9147 §4.2.2); the epoch
-/// is implicit in `crypter`, which is keyed per-epoch.
-pub(crate) fn encrypt_dtls13_record(
-    crypter: &mut RecordCrypter,
-    seq: u64,
-    aad: &[u8],
-    inner: &mut Vec<u8>,
-) -> Result<(), Error> {
-    let tag = crypter.encrypt_raw(seq, aad, inner)?;
-    inner.extend_from_slice(&tag);
-    Ok(())
 }
 
 /// Decrypts one DTLS 1.3 protected record.
@@ -3134,4 +3107,96 @@ pub(crate) fn decrypt_dtls13_record(
     buf.truncate(end);
     let ct = ContentType::from_u8(true_type);
     Ok((ct, buf))
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    /// The pre-in-place construction of a protected record: AAD from a
+    /// placeholder-body header, encrypt a separate inner buffer, mask, then
+    /// encode the full record. Kept as the oracle for the in-place builder.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_record(
+        crypter: &mut RecordCrypter,
+        sn_key: &SnKey,
+        epoch: u16,
+        seq: u64,
+        cid: &[u8],
+        ct: ContentType,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut inner = payload.to_vec();
+        inner.push(ct.as_u8());
+        let ct_len = inner.len() + 16;
+        let mut aad = Vec::new();
+        record13::encode_record(
+            &mut aad,
+            epoch,
+            seq,
+            true,
+            false,
+            cid,
+            &alloc::vec![0u8; ct_len],
+            &[0, 0],
+        )
+        .unwrap();
+        aad.truncate(aad.len() - ct_len);
+        let tag = crypter.encrypt_raw(seq, &aad, &mut inner).unwrap();
+        inner.extend_from_slice(&tag);
+        let mask = sn_key.mask(&inner);
+        let mut wire = Vec::new();
+        record13::encode_record(&mut wire, epoch, seq, true, false, cid, &inner, &mask).unwrap();
+        wire
+    }
+
+    /// The in-place record builder emits byte-identical records for every
+    /// suite, with and without a connection ID, across payload sizes.
+    #[test]
+    fn in_place_record_matches_reference() {
+        for suite in supported_suites() {
+            let secret = Secret::new(&alloc::vec![0x5au8; suite.hash.output_len()]);
+            let sn_key = SnKey::new(
+                suite.aead,
+                derive_sn_key(suite.hash, &secret, sn_key_len_for(suite.aead)),
+            );
+            let mk = || {
+                RecordCrypter::new_with(
+                    LabelPrefix::Dtls13,
+                    suite.hash,
+                    suite.aead,
+                    suite.key_len,
+                    &secret,
+                )
+            };
+            let (mut a, mut b) = (mk(), mk());
+            for (i, cid) in [&[][..], &[1, 2, 3, 4][..]].iter().enumerate() {
+                for len in [0usize, 1, 15, 16, 17, 1000] {
+                    let payload: Vec<u8> = (0..len).map(|j| (j * 31 + i) as u8).collect();
+                    let seq = (len as u64) * 977 + i as u64;
+                    let got = encrypt_protected_record_with(
+                        *suite,
+                        &mut a,
+                        &sn_key,
+                        3,
+                        seq,
+                        cid,
+                        ContentType::ApplicationData,
+                        &payload,
+                    )
+                    .unwrap();
+                    let want = reference_record(
+                        &mut b,
+                        &sn_key,
+                        3,
+                        seq,
+                        cid,
+                        ContentType::ApplicationData,
+                        &payload,
+                    );
+                    assert_eq!(got, want);
+                }
+            }
+        }
+    }
 }
