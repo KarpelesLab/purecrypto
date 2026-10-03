@@ -378,9 +378,15 @@ fn wipe(buf: &mut [u8]) {
 ///
 /// Constant-time properties (RFC 8446 §5.4 traffic-analysis note):
 ///
-/// - Every byte of `buf` is visited exactly once.
-/// - The per-byte branch decides which of `(0, 0)` and `(byte, idx+1)`
-///   to keep using [`u8::conditional_select`], which is data-flow only.
+/// - Every byte of `buf` is visited exactly once, eight at a time: each
+///   little-endian word's nonzero bytes are flagged with a carry-free
+///   SWAR test, and the highest flagged byte (value and position) is
+///   located by three branch-free halvings ([`u64::conditional_select`]
+///   on constant shifts — no secret-dependent shift or index). The
+///   trailing `len % 8` bytes are scanned one at a time.
+/// - Whether a word or byte holds the new candidate is applied with
+///   [`ConditionallySelectable::conditional_select`], which is data-flow
+///   only.
 /// - No early exit; the running candidate is updated on every iteration
 ///   regardless of value.
 ///
@@ -392,16 +398,48 @@ pub(crate) fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
     if buf.is_empty() {
         return Err(Error::PeerMisbehaved);
     }
+    /// `Choice` of `x != 0`, branch-free: `x | -x` has its top bit set
+    /// exactly when `x` is nonzero.
+    #[inline(always)]
+    fn nonzero(x: u64) -> Choice {
+        Choice::from(((x | x.wrapping_neg()) >> 63) as u8)
+    }
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
     let mut found_any = Choice::from(0);
     let mut cur_byte: u8 = 0;
     let mut cur_end: usize = 0;
-    for (i, &b) in buf.iter().enumerate() {
-        let nonzero = !b.ct_eq(&0u8);
-        // Conditionally promote (b, i+1) as the new "last non-zero"
-        // candidate. `i+1` is the truncation index (one past the
+    let words = buf.chunks_exact(8);
+    let tail = words.remainder();
+    for (wi, chunk) in words.enumerate() {
+        let w = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        // The top bit of each byte of `f` is set iff that byte of `w` is
+        // nonzero: `(b & 0x7f) + 0x7f` reaches 0x80 iff the low seven bits
+        // are nonzero, and never carries into the next byte.
+        let f = (((w & LOW7) + LOW7) | w) & HIGH;
+        let word_nz = nonzero(f);
+        // Narrow to the half holding the highest flagged byte, three
+        // times; `v` keeps that byte's value in its low eight bits.
+        let (mut v, mut f, mut pos) = (w, f, 0usize);
+        for shift in [32u32, 16, 8] {
+            let low_mask = (1u64 << shift) - 1;
+            let up = nonzero(f >> shift);
+            v = u64::conditional_select(&(v >> shift), &(v & low_mask), up);
+            f = u64::conditional_select(&(f >> shift), &(f & low_mask), up);
+            pos += (shift as usize / 8) * usize::from(up.unwrap_u8());
+        }
+        // Conditionally promote (byte, index+1) as the new "last non-zero"
+        // candidate. `index+1` is the truncation index (one past the
         // content-type byte position).
+        cur_byte = u8::conditional_select(&(v as u8), &cur_byte, word_nz);
+        cur_end = usize::conditional_select(&(wi * 8 + pos + 1), &cur_end, word_nz);
+        found_any |= word_nz;
+    }
+    let base = buf.len() - tail.len();
+    for (i, &b) in tail.iter().enumerate() {
+        let nonzero = !b.ct_eq(&0u8);
         cur_byte = u8::conditional_select(&b, &cur_byte, nonzero);
-        cur_end = usize::conditional_select(&(i + 1), &cur_end, nonzero);
+        cur_end = usize::conditional_select(&(base + i + 1), &cur_end, nonzero);
         found_any |= nonzero;
     }
     // Declassified (Valgrind harness): an all-zero inner plaintext is a
@@ -426,6 +464,84 @@ pub(crate) fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The original byte-at-a-time scan, kept as the oracle for the
+    /// word-at-a-time [`ct_find_last_nonzero`].
+    fn ct_find_last_nonzero_bytewise(buf: &[u8]) -> Result<(u8, usize), Error> {
+        if buf.is_empty() {
+            return Err(Error::PeerMisbehaved);
+        }
+        let mut found_any = Choice::from(0);
+        let mut cur_byte: u8 = 0;
+        let mut cur_end: usize = 0;
+        for (i, &b) in buf.iter().enumerate() {
+            let nonzero = !b.ct_eq(&0u8);
+            cur_byte = u8::conditional_select(&b, &cur_byte, nonzero);
+            cur_end = usize::conditional_select(&(i + 1), &cur_end, nonzero);
+            found_any |= nonzero;
+        }
+        if !bool::from(found_any) {
+            return Err(Error::PeerMisbehaved);
+        }
+        Ok((cur_byte, cur_end - 1))
+    }
+
+    fn same_result(buf: &[u8]) {
+        let got = ct_find_last_nonzero(buf);
+        let want = ct_find_last_nonzero_bytewise(buf);
+        match (got, want) {
+            (Ok(g), Ok(w)) => assert_eq!(g, w, "buf = {buf:02x?}"),
+            (Err(g), Err(w)) => assert_eq!(g, w),
+            (g, w) => panic!("{g:?} vs {w:?} for {buf:02x?}"),
+        }
+    }
+
+    /// Edge values: every length up to four words, the last nonzero byte at
+    /// every position, and byte values that probe the SWAR flag (0x01,
+    /// 0x7f, 0x80, 0xff) with zero and nonzero bytes around them.
+    #[test]
+    fn last_nonzero_matches_bytewise_on_edges() {
+        same_result(&[]);
+        for len in 1..=32usize {
+            same_result(&alloc::vec![0u8; len]);
+            for pos in 0..len {
+                for v in [0x01u8, 0x7f, 0x80, 0xff, 0x17] {
+                    let mut b = alloc::vec![0u8; len];
+                    b[pos] = v;
+                    same_result(&b);
+                    // Earlier nonzero bytes in the same and previous words.
+                    for q in 0..pos {
+                        let mut c = b.clone();
+                        c[q] = 0x80;
+                        same_result(&c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Deterministic random sweep over lengths and sparsities.
+    #[test]
+    fn last_nonzero_matches_bytewise_random() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 300) as usize;
+            let density = next() % 5;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = next();
+                    if r % 8 < density { (r >> 8) as u8 } else { 0 }
+                })
+                .collect();
+            same_result(&buf);
+        }
+    }
     use crate::test_util::from_hex_vec;
 
     // RFC 8448 §3: the server's first encrypted handshake record (the flight
