@@ -13,7 +13,7 @@ mod aes_arm;
 mod aesni;
 
 use super::BlockCipher;
-use gf::{gf_mul, inv_sub_byte, sub_byte};
+use gf::sub_words;
 
 /// Which implementation a keyed AES instance dispatches to. Chosen once at
 /// construction from a cached runtime CPU-feature probe; the software path is
@@ -81,12 +81,7 @@ fn dispatch_decrypt_block(backend: AesBackend, rk: &[u8], nr: usize, block: &mut
 #[allow(unsafe_code)]
 fn dispatch_encrypt_blocks(backend: AesBackend, rk: &[u8], nr: usize, blocks: &mut [u8]) {
     match backend {
-        AesBackend::Software => {
-            for block in blocks.chunks_exact_mut(16) {
-                let b: &mut [u8; 16] = block.try_into().expect("16-byte chunk");
-                encrypt(rk, nr, b);
-            }
-        }
+        AesBackend::Software => crypt_blocks_soft::<false>(rk, nr, blocks),
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
         AesBackend::Hardware => unsafe { aesni::encrypt_blocks(rk, nr, blocks) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
@@ -98,12 +93,7 @@ fn dispatch_encrypt_blocks(backend: AesBackend, rk: &[u8], nr: usize, blocks: &m
 #[allow(unsafe_code)]
 fn dispatch_decrypt_blocks(backend: AesBackend, rk: &[u8], nr: usize, blocks: &mut [u8]) {
     match backend {
-        AesBackend::Software => {
-            for block in blocks.chunks_exact_mut(16) {
-                let b: &mut [u8; 16] = block.try_into().expect("16-byte chunk");
-                decrypt(rk, nr, b);
-            }
-        }
+        AesBackend::Software => crypt_blocks_soft::<true>(rk, nr, blocks),
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
         AesBackend::Hardware => unsafe { aesni::decrypt_blocks(rk, nr, blocks) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
@@ -111,92 +101,108 @@ fn dispatch_decrypt_blocks(backend: AesBackend, rk: &[u8], nr: usize, blocks: &m
     }
 }
 
-/// XORs a 16-byte round key into the state.
-#[inline]
-fn add_round_key(state: &mut [u8; 16], rk: &[u8]) {
-    for (s, k) in state.iter_mut().zip(rk.iter()) {
-        *s ^= *k;
+// --- Software backend --------------------------------------------------------
+//
+// The state is one little-endian `u128` per block (byte `4·col + row` at bits
+// `8·(4·col + row)`), so ShiftRows, MixColumns and AddRoundKey are a handful of
+// whole-state shifts, masks and XORs. SubBytes goes through the bitsliced
+// S-box in [`gf`], two blocks per evaluation when a batch allows it.
+
+/// Bytes of row 0 (state bytes 0, 4, 8, 12); row `r` is this shifted by `8r`.
+const ROW0: u128 = 0x0000_00ff_0000_00ff_0000_00ff_0000_00ff;
+/// The low bit of every byte lane.
+const LSB: u128 = 0x0101_0101_0101_0101_0101_0101_0101_0101;
+/// The low bit of every 32-bit column.
+const EVERY_COLUMN: u128 = 0x0000_0001_0000_0001_0000_0001_0000_0001;
+
+/// Loads round key `i` as a state word.
+#[inline(always)]
+fn round_key(rk: &[u8], i: usize) -> u128 {
+    u128::from_le_bytes(
+        rk[16 * i..16 * i + 16]
+            .try_into()
+            .expect("16-byte round key"),
+    )
+}
+
+/// SubBytes (`inv == false`) or InvSubBytes on one or two states.
+#[inline(always)]
+fn sub_layer(s: &mut [u128], inv: bool) {
+    debug_assert!(s.len() <= 2);
+    let mut w = [0u64; 4];
+    for (pair, &x) in w.chunks_exact_mut(2).zip(s.iter()) {
+        pair[0] = x as u64;
+        pair[1] = (x >> 64) as u64;
+    }
+    sub_words(&mut w, inv);
+    for (pair, x) in w.chunks_exact(2).zip(s.iter_mut()) {
+        *x = pair[0] as u128 | (pair[1] as u128) << 64;
     }
 }
 
-#[inline]
-fn sub_bytes(state: &mut [u8; 16]) {
-    for b in state.iter_mut() {
-        *b = sub_byte(*b);
-    }
+/// ShiftRows: row `r` moves left by `r` columns, i.e. byte `4c + r` takes
+/// byte `4(c + r) + r`, which is a rotation of the whole state by `32r` bits.
+#[inline(always)]
+fn shift_rows(s: u128) -> u128 {
+    (s & ROW0)
+        | (s.rotate_right(32) & ROW0 << 8)
+        | (s.rotate_right(64) & ROW0 << 16)
+        | (s.rotate_right(96) & ROW0 << 24)
 }
 
-#[inline]
-fn inv_sub_bytes(state: &mut [u8; 16]) {
-    for b in state.iter_mut() {
-        *b = inv_sub_byte(*b);
-    }
+/// Inverse of [`shift_rows`].
+#[inline(always)]
+fn inv_shift_rows(s: u128) -> u128 {
+    (s & ROW0)
+        | (s.rotate_left(32) & ROW0 << 8)
+        | (s.rotate_left(64) & ROW0 << 16)
+        | (s.rotate_left(96) & ROW0 << 24)
 }
 
-/// Cyclically shifts row `r` left by `r` bytes (column-major layout).
-#[inline]
-fn shift_rows(s: &mut [u8; 16]) {
-    let t = *s;
-    // Row 1: <<< 1
-    s[1] = t[5];
-    s[5] = t[9];
-    s[9] = t[13];
-    s[13] = t[1];
-    // Row 2: <<< 2
-    s[2] = t[10];
-    s[6] = t[14];
-    s[10] = t[2];
-    s[14] = t[6];
-    // Row 3: <<< 3
-    s[3] = t[15];
-    s[7] = t[3];
-    s[11] = t[7];
-    s[15] = t[11];
+/// `xtime` (multiplication by `x` mod `0x11b`) on every byte lane. The
+/// reduction is a shift-XOR of each lane's carried-out top bit: branch-free
+/// and multiplier-free.
+#[inline(always)]
+fn xtime(x: u128) -> u128 {
+    let hi = (x >> 7) & LSB;
+    ((x & (LSB * 0x7f)) << 1) ^ hi ^ (hi << 1) ^ (hi << 3) ^ (hi << 4)
 }
 
-/// Inverse of [`shift_rows`]: cyclically shifts row `r` right by `r` bytes.
-#[inline]
-fn inv_shift_rows(s: &mut [u8; 16]) {
-    let t = *s;
-    // Row 1: >>> 1
-    s[1] = t[13];
-    s[5] = t[1];
-    s[9] = t[5];
-    s[13] = t[9];
-    // Row 2: >>> 2
-    s[2] = t[10];
-    s[6] = t[14];
-    s[10] = t[2];
-    s[14] = t[6];
-    // Row 3: >>> 3
-    s[3] = t[7];
-    s[7] = t[11];
-    s[11] = t[15];
-    s[15] = t[3];
+/// Rotates every column by `k` bytes: byte `r` of each column takes byte
+/// `r + k` of the same column.
+#[inline(always)]
+fn rot_columns<const K: u32>(s: u128) -> u128 {
+    // The low `32 - 8k` bits of every column: the right shift fills them from
+    // the same column, the left shift fills the rest.
+    let low = ((u32::MAX >> (8 * K)) as u128) * EVERY_COLUMN;
+    ((s >> (8 * K)) & low) | ((s << (32 - 8 * K)) & !low)
 }
 
-#[inline]
-fn mix_columns(s: &mut [u8; 16]) {
-    for c in 0..4 {
-        let i = 4 * c;
-        let (a0, a1, a2, a3) = (s[i], s[i + 1], s[i + 2], s[i + 3]);
-        s[i] = gf_mul(a0, 2) ^ gf_mul(a1, 3) ^ a2 ^ a3;
-        s[i + 1] = a0 ^ gf_mul(a1, 2) ^ gf_mul(a2, 3) ^ a3;
-        s[i + 2] = a0 ^ a1 ^ gf_mul(a2, 2) ^ gf_mul(a3, 3);
-        s[i + 3] = gf_mul(a0, 3) ^ a1 ^ a2 ^ gf_mul(a3, 2);
-    }
+/// MixColumns: `out_r = 2·a_r ⊕ 3·a_{r+1} ⊕ a_{r+2} ⊕ a_{r+3}`
+/// `= 2·(a_r ⊕ a_{r+1}) ⊕ a_{r+1} ⊕ (a_{r+2} ⊕ a_{r+3})` in every column.
+#[inline(always)]
+fn mix_columns(s: u128) -> u128 {
+    let r1 = rot_columns::<1>(s);
+    let t = s ^ r1;
+    xtime(t) ^ r1 ^ rot_columns::<2>(t)
 }
 
+/// InvMixColumns = MixColumns ∘ (`a_r ⊕= 4·(a_r ⊕ a_{r+2})`), the
+/// factorisation of the inverse matrix from *The Design of Rijndael*.
+#[inline(always)]
+fn inv_mix_columns(s: u128) -> u128 {
+    mix_columns(s ^ xtime(xtime(s ^ rot_columns::<2>(s))))
+}
+
+/// SubWord: the S-box on the four bytes of a key-schedule word, through the
+/// bitsliced S-box (the spare twelve lanes are zero).
 #[inline]
-fn inv_mix_columns(s: &mut [u8; 16]) {
-    for c in 0..4 {
-        let i = 4 * c;
-        let (a0, a1, a2, a3) = (s[i], s[i + 1], s[i + 2], s[i + 3]);
-        s[i] = gf_mul(a0, 0x0e) ^ gf_mul(a1, 0x0b) ^ gf_mul(a2, 0x0d) ^ gf_mul(a3, 0x09);
-        s[i + 1] = gf_mul(a0, 0x09) ^ gf_mul(a1, 0x0e) ^ gf_mul(a2, 0x0b) ^ gf_mul(a3, 0x0d);
-        s[i + 2] = gf_mul(a0, 0x0d) ^ gf_mul(a1, 0x09) ^ gf_mul(a2, 0x0e) ^ gf_mul(a3, 0x0b);
-        s[i + 3] = gf_mul(a0, 0x0b) ^ gf_mul(a1, 0x0d) ^ gf_mul(a2, 0x09) ^ gf_mul(a3, 0x0e);
-    }
+fn sub_word(w: [u8; 4]) -> [u8; 4] {
+    let mut s = [u32::from_le_bytes(w) as u128];
+    sub_layer(&mut s, false);
+    let out = (s[0] as u32).to_le_bytes();
+    crate::zeroize::Zeroize::zeroize(&mut s);
+    out
 }
 
 /// Expands `key` (`nk` 32-bit words) into `out`, the round-key bytes for `nr`
@@ -221,17 +227,13 @@ fn key_expansion(key: &[u8], nk: usize, nr: usize, out: &mut [u8]) {
 
         if i % nk == 0 {
             // RotWord, then SubWord, then XOR the round constant.
-            t = [t[1], t[2], t[3], t[0]];
-            for b in t.iter_mut() {
-                *b = sub_byte(*b);
-            }
+            t = sub_word([t[1], t[2], t[3], t[0]]);
             t[0] ^= rcon;
-            rcon = gf_mul(rcon, 2);
+            // rcon = xtime(rcon); public, so the branch is fine.
+            rcon = (rcon << 1) ^ if rcon & 0x80 != 0 { 0x1b } else { 0 };
         } else if nk > 6 && i % nk == 4 {
             // AES-256 applies an extra SubWord a quarter of the way in.
-            for b in t.iter_mut() {
-                *b = sub_byte(*b);
-            }
+            t = sub_word(t);
         }
 
         let base = i * 4;
@@ -243,32 +245,78 @@ fn key_expansion(key: &[u8], nk: usize, nr: usize, out: &mut [u8]) {
     crate::zeroize::Zeroize::zeroize(&mut t);
 }
 
-/// Encrypts one block using the expanded round keys.
-fn encrypt(rk: &[u8], nr: usize, block: &mut [u8; 16]) {
-    add_round_key(block, &rk[0..16]);
+/// Encrypts one or two states with the expanded round keys. SubBytes is
+/// a byte-wise map and ShiftRows a byte permutation, so they commute; the
+/// S-box layer runs first so both states share one bitsliced evaluation.
+fn encrypt_n(rk: &[u8], nr: usize, s: &mut [u128]) {
+    let k = round_key(rk, 0);
+    s.iter_mut().for_each(|x| *x ^= k);
     for round in 1..nr {
-        sub_bytes(block);
-        shift_rows(block);
-        mix_columns(block);
-        add_round_key(block, &rk[round * 16..round * 16 + 16]);
+        sub_layer(s, false);
+        let k = round_key(rk, round);
+        s.iter_mut()
+            .for_each(|x| *x = mix_columns(shift_rows(*x)) ^ k);
     }
-    sub_bytes(block);
-    shift_rows(block);
-    add_round_key(block, &rk[nr * 16..nr * 16 + 16]);
+    sub_layer(s, false);
+    let k = round_key(rk, nr);
+    s.iter_mut().for_each(|x| *x = shift_rows(*x) ^ k);
 }
 
-/// Decrypts one block using the expanded round keys (FIPS-197 inverse cipher).
-fn decrypt(rk: &[u8], nr: usize, block: &mut [u8; 16]) {
-    add_round_key(block, &rk[nr * 16..nr * 16 + 16]);
+/// Decrypts one or two states (FIPS-197 inverse cipher).
+fn decrypt_n(rk: &[u8], nr: usize, s: &mut [u128]) {
+    let k = round_key(rk, nr);
+    s.iter_mut().for_each(|x| *x ^= k);
     for round in (1..nr).rev() {
-        inv_shift_rows(block);
-        inv_sub_bytes(block);
-        add_round_key(block, &rk[round * 16..round * 16 + 16]);
-        inv_mix_columns(block);
+        sub_layer(s, true);
+        let k = round_key(rk, round);
+        s.iter_mut()
+            .for_each(|x| *x = inv_mix_columns(inv_shift_rows(*x) ^ k));
     }
-    inv_shift_rows(block);
-    inv_sub_bytes(block);
-    add_round_key(block, &rk[0..16]);
+    sub_layer(s, true);
+    let k = round_key(rk, 0);
+    s.iter_mut().for_each(|x| *x = inv_shift_rows(*x) ^ k);
+}
+
+/// Encrypts one block using the expanded round keys.
+fn encrypt(rk: &[u8], nr: usize, block: &mut [u8; 16]) {
+    let mut s = [u128::from_le_bytes(*block)];
+    encrypt_n(rk, nr, &mut s);
+    *block = s[0].to_le_bytes();
+}
+
+/// Decrypts one block using the expanded round keys.
+fn decrypt(rk: &[u8], nr: usize, block: &mut [u8; 16]) {
+    let mut s = [u128::from_le_bytes(*block)];
+    decrypt_n(rk, nr, &mut s);
+    *block = s[0].to_le_bytes();
+}
+
+/// Applies the software cipher to every 16-byte block of `blocks`, two at a
+/// time (one bitsliced S-box evaluation covers both), then the odd one.
+fn crypt_blocks_soft<const INV: bool>(rk: &[u8], nr: usize, blocks: &mut [u8]) {
+    let mut pairs = blocks.chunks_exact_mut(32);
+    for pair in &mut pairs {
+        let (a, b) = pair.split_at_mut(16);
+        let mut s = [
+            u128::from_le_bytes((&*a).try_into().expect("16-byte block")),
+            u128::from_le_bytes((&*b).try_into().expect("16-byte block")),
+        ];
+        if INV {
+            decrypt_n(rk, nr, &mut s);
+        } else {
+            encrypt_n(rk, nr, &mut s);
+        }
+        a.copy_from_slice(&s[0].to_le_bytes());
+        b.copy_from_slice(&s[1].to_le_bytes());
+    }
+    for block in pairs.into_remainder().chunks_exact_mut(16) {
+        let b: &mut [u8; 16] = block.try_into().expect("16-byte chunk");
+        if INV {
+            decrypt(rk, nr, b);
+        } else {
+            encrypt(rk, nr, b);
+        }
+    }
 }
 
 /// Applies one full AES round to `state`: `MixColumns(ShiftRows(SubBytes(state)))`
@@ -294,12 +342,9 @@ pub(crate) fn aes_round(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
 
 /// Table-free constant-time AES round (the software fallback for [`aes_round`]).
 fn aes_round_soft(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
-    let mut s = state;
-    sub_bytes(&mut s);
-    shift_rows(&mut s);
-    mix_columns(&mut s);
-    add_round_key(&mut s, &round_key);
-    s
+    let mut s = [u128::from_le_bytes(state)];
+    sub_layer(&mut s, false);
+    (mix_columns(shift_rows(s[0])) ^ u128::from_le_bytes(round_key)).to_le_bytes()
 }
 
 /// Defines an AES variant with a given key size, key-word count, round count,
@@ -490,6 +535,78 @@ mod tests {
         check!(Aes128, 16);
         check!(Aes192, 24);
         check!(Aes256, 32);
+    }
+
+    /// Byte-wise FIPS-197 rounds over the scalar `gf_inv` S-box and `gf_mul`
+    /// (the implementation the word-level software path replaced), as an
+    /// oracle for the forward and inverse round transforms.
+    fn reference_round(s: [u8; 16], rk: [u8; 16]) -> [u8; 16] {
+        use gf::{gf_mul, sub_byte};
+        let mut t = [0u8; 16];
+        for c in 0..4 {
+            for r in 0..4 {
+                t[4 * c + r] = sub_byte(s[4 * ((c + r) % 4) + r]);
+            }
+        }
+        let mut out = [0u8; 16];
+        for c in 0..4 {
+            let a = &t[4 * c..4 * c + 4];
+            for r in 0..4 {
+                out[4 * c + r] = gf_mul(a[r], 2)
+                    ^ gf_mul(a[(r + 1) % 4], 3)
+                    ^ a[(r + 2) % 4]
+                    ^ a[(r + 3) % 4]
+                    ^ rk[4 * c + r];
+            }
+        }
+        out
+    }
+
+    fn reference_inv_round(s: [u8; 16]) -> [u8; 16] {
+        use gf::{gf_mul, inv_sub_byte};
+        let mut m = [0u8; 16];
+        for c in 0..4 {
+            let a = &s[4 * c..4 * c + 4];
+            for r in 0..4 {
+                m[4 * c + r] = gf_mul(a[r], 0x0e)
+                    ^ gf_mul(a[(r + 1) % 4], 0x0b)
+                    ^ gf_mul(a[(r + 2) % 4], 0x0d)
+                    ^ gf_mul(a[(r + 3) % 4], 0x09);
+            }
+        }
+        let mut out = [0u8; 16];
+        for c in 0..4 {
+            for r in 0..4 {
+                out[4 * ((c + r) % 4) + r] = inv_sub_byte(m[4 * c + r]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn software_round_matches_bytewise_reference() {
+        let mut st = [0u8; 16];
+        let mut rk = [0u8; 16];
+        for seed in 0..512u64 {
+            fill(seed, &mut st);
+            fill(seed ^ 0xA5A5, &mut rk);
+            if seed < 256 {
+                st = [seed as u8; 16]; // every byte value in every lane
+            }
+            let fwd = aes_round_soft(st, rk);
+            assert_eq!(fwd, reference_round(st, rk), "fwd seed {seed}");
+            // inv_mix_columns ∘ inv_shift_rows ∘ inv_sub undoes the round.
+            let mut s = [u128::from_le_bytes(fwd) ^ u128::from_le_bytes(rk)];
+            s[0] = inv_mix_columns(s[0]);
+            assert_eq!(reference_inv_round(fwd_xor(fwd, rk)), st, "ref inv {seed}");
+            s[0] = inv_shift_rows(s[0]);
+            sub_layer(&mut s, true);
+            assert_eq!(s[0].to_le_bytes(), st, "inv seed {seed}");
+        }
+    }
+
+    fn fwd_xor(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+        core::array::from_fn(|i| a[i] ^ b[i])
     }
 
     /// The hardware bare AES round must equal the software round for all inputs.
