@@ -24,6 +24,7 @@ pub(crate) mod registry;
 use adrs::{Adrs, AdrsType};
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
+use hash::Seed;
 use params::{MAX_CONTEXT, MAX_K, MAX_M, MAX_N, MAX_WOTS_LEN, Params, SETS};
 
 use crate::ct::ConstantTimeEq;
@@ -136,7 +137,7 @@ fn bytes_to_nibbles(input: &[u8], out: &mut [u8]) {
 }
 
 /// WOTS+ chaining (Algorithm 5): apply `F` `steps` times from `start`.
-fn wots_chain(p: &Params, pk_seed: &[u8], inout: &mut [u8], start: u8, steps: u8, addr: &mut Adrs) {
+fn wots_chain(p: &Params, pk_seed: &Seed, inout: &mut [u8], start: u8, steps: u8, addr: &mut Adrs) {
     let n = p.n as usize;
     for i in start..start + steps {
         addr.set_hash(i as u32);
@@ -149,7 +150,7 @@ fn wots_chain(p: &Params, pk_seed: &[u8], inout: &mut [u8], start: u8, steps: u8
 /// WOTS+ public-key generation (Algorithm 6).
 fn wots_pk_gen(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     sk_seed: &[u8],
     out: &mut [u8],
     tmp: &mut [u8],
@@ -241,7 +242,8 @@ mod wots_x8_tests {
             for (i, b) in starts.iter_mut().enumerate() {
                 *b = (i.wrapping_mul(7).wrapping_add(1)) as u8;
             }
-            let pk_seed: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
+            let pk_seed_bytes: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
+            let pk_seed = Seed::new(p, &pk_seed_bytes);
 
             let mut base = Adrs::new(p.is_shake);
             base.set_type_and_clear(AdrsType::WotsHash);
@@ -625,7 +627,8 @@ mod wots_shake_x4_tests {
             for (i, b) in starts.iter_mut().enumerate() {
                 *b = (i.wrapping_mul(13).wrapping_add(3)) as u8;
             }
-            let pk_seed: Vec<u8> = (0..n).map(|i| (i * 5 + 7) as u8).collect();
+            let pk_seed_bytes: Vec<u8> = (0..n).map(|i| (i * 5 + 7) as u8).collect();
+            let pk_seed = Seed::new(p, &pk_seed_bytes);
 
             let mut base = Adrs::new(p.is_shake);
             base.set_type_and_clear(AdrsType::WotsHash);
@@ -664,7 +667,8 @@ mod wots_shake_x4_tests {
             let p = set.params();
             let n = p.n as usize;
             let total = p.len as usize * n;
-            let pk_seed: Vec<u8> = (0..n).map(|i| (i * 5 + 7) as u8).collect();
+            let pk_seed_bytes: Vec<u8> = (0..n).map(|i| (i * 5 + 7) as u8).collect();
+            let pk_seed = Seed::new(p, &pk_seed_bytes);
             let sk_seed: Vec<u8> = (0..n).map(|i| (i * 9 + 4) as u8).collect();
 
             let mut base = Adrs::new(p.is_shake);
@@ -719,7 +723,7 @@ fn wots_msg_csum(p: &Params, msg: &[u8]) -> [u8; MAX_WOTS_LEN] {
 /// WOTS+ sign (Algorithm 7): writes `len·n` bytes into `sig`.
 fn wots_sign(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     sk_seed: &[u8],
     msg: &[u8],
     addr: &mut Adrs,
@@ -742,7 +746,7 @@ fn wots_sign(
 /// WOTS+ public key from a signature (Algorithm 8).
 fn wots_pk_from_sig(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     sig: &[u8],
     msg: &[u8],
     tmp: &mut [u8],
@@ -768,7 +772,7 @@ fn wots_pk_from_sig(
 /// XMSS node computation (Algorithm 9).
 fn xmss_node(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     sk_seed: &[u8],
     out: &mut [u8],
     tmp: &mut [u8],
@@ -796,7 +800,7 @@ fn xmss_node(
 /// XMSS sign (Algorithm 10): WOTS+ signature followed by the authentication path.
 fn xmss_sign(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     sk_seed: &[u8],
     msg: &[u8],
     tmp: &mut [u8],
@@ -829,7 +833,7 @@ fn xmss_sign(
 /// XMSS public key from a signature (Algorithm 11).
 fn xmss_pk_from_sig(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     mut leaf_idx: u32,
     sig: &[u8],
     msg: &[u8],
@@ -867,7 +871,7 @@ fn xmss_pk_from_sig(
 /// Hypertree sign (Algorithm 12).
 fn ht_sign(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     sk_seed: &[u8],
     pk_fors: &[u8],
     mut tree_idx: u64,
@@ -925,7 +929,7 @@ fn ht_sign(
 /// Hypertree verify (Algorithm 13).
 fn ht_verify(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     pk_root: &[u8],
     pk_fors: &[u8],
     sig: &[u8],
@@ -967,7 +971,7 @@ fn ht_verify(
 }
 
 /// FORS private value (Algorithm 14).
-fn fors_gen_sk(p: &Params, pk_seed: &[u8], sk_seed: &[u8], idx: u32, addr: &Adrs, out: &mut [u8]) {
+fn fors_gen_sk(p: &Params, pk_seed: &Seed, sk_seed: &[u8], idx: u32, addr: &Adrs, out: &mut [u8]) {
     let mut sk_addr = *addr;
     sk_addr.set_type_and_clear(AdrsType::ForsPrf);
     sk_addr.copy_key_pair(addr);
@@ -978,7 +982,7 @@ fn fors_gen_sk(p: &Params, pk_seed: &[u8], sk_seed: &[u8], idx: u32, addr: &Adrs
 /// FORS node (Algorithm 15).
 fn fors_node(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     sk_seed: &[u8],
     node_id: u32,
     layer: u32,
@@ -1008,7 +1012,7 @@ fn fors_node(
 /// higher than 3 still batch their height-3 subtrees.
 fn fors_node_scalar(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     sk_seed: &[u8],
     node_id: u32,
     layer: u32,
@@ -1061,6 +1065,7 @@ fn fors_node_scalar(
 /// computed once per subtree.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 mod fors_x4 {
+    use super::Seed;
     use super::adrs::{Adrs, AdrsType};
     use super::params::Params;
     use super::wots_x8::{block1_f, midstate256, state_be};
@@ -1215,7 +1220,7 @@ mod fors_x4 {
     /// Hash-for-hash identical to the scalar recursion (same ADRS values).
     pub(super) fn subtree8(
         p: &Params,
-        pk_seed: &[u8],
+        pk_seed: &Seed,
         sk_seed: &[u8],
         node_id: u32,
         addr: &mut Adrs,
@@ -1233,7 +1238,7 @@ mod fors_x4 {
     /// lanes duplicated on the upper levels).
     fn subtree16(
         p: &Params,
-        pk_seed: &[u8],
+        pk_seed: &Seed,
         sk_seed: &[u8],
         node_id: u32,
         addr: &mut Adrs,
@@ -1254,7 +1259,7 @@ mod fors_x4 {
     /// [`subtree8`] for the n = 24/32 sets, where `H` is SHA-512 (4-wide).
     fn subtree512<const N: usize>(
         p: &Params,
-        pk_seed: &[u8],
+        pk_seed: &Seed,
         sk_seed: &[u8],
         node_id: u32,
         addr: &mut Adrs,
@@ -1299,7 +1304,8 @@ mod fors_x4_tests {
         ] {
             let p = set.params();
             let n = p.n as usize;
-            let pk_seed: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
+            let pk_seed_bytes: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
+            let pk_seed = Seed::new(p, &pk_seed_bytes);
             let sk_seed: Vec<u8> = (0..n).map(|i| (i * 11 + 1) as u8).collect();
 
             let mut base = Adrs::new(p.is_shake);
@@ -1329,6 +1335,7 @@ mod fors_x4_tests {
 /// [`fors_node_scalar`] recursion (pinned by a differential test).
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 mod fors_shake_x4 {
+    use super::Seed;
     use super::adrs::{Adrs, AdrsType};
     use super::params::Params;
     use super::wots_shake_x4::{RATE, fill_msg, shake_n};
@@ -1343,7 +1350,7 @@ mod fors_shake_x4 {
     /// AVX-512 kernel the whole subtree is one batch per stage; with the
     /// 4-lane kernel it is two.
     fn leaves8<const N: usize>(
-        pk_seed: &[u8],
+        pk_seed: &Seed,
         sk_seed: &[u8],
         leaf0: u32,
         addr: &mut Adrs,
@@ -1407,7 +1414,7 @@ mod fors_shake_x4 {
     /// into `nodes[j]` with tree index `idx0 + j` at `height`, one four-wide
     /// `H` batch. Idle lanes duplicate pair 0.
     fn merge_level<const N: usize>(
-        pk_seed: &[u8],
+        pk_seed: &Seed,
         addr: &mut Adrs,
         idx0: u32,
         height: u32,
@@ -1437,7 +1444,7 @@ mod fors_shake_x4 {
     /// Hash-for-hash identical to the scalar recursion (same ADRS values).
     pub(super) fn subtree8(
         p: &Params,
-        pk_seed: &[u8],
+        pk_seed: &Seed,
         sk_seed: &[u8],
         node_id: u32,
         addr: &mut Adrs,
@@ -1453,7 +1460,7 @@ mod fors_shake_x4 {
 
     fn subtree8_n<const N: usize>(
         p: &Params,
-        pk_seed: &[u8],
+        pk_seed: &Seed,
         sk_seed: &[u8],
         node_id: u32,
         addr: &mut Adrs,
@@ -1488,7 +1495,8 @@ mod fors_shake_x4_tests {
         ] {
             let p = set.params();
             let n = p.n as usize;
-            let pk_seed: Vec<u8> = (0..n).map(|i| (i * 7 + 2) as u8).collect();
+            let pk_seed_bytes: Vec<u8> = (0..n).map(|i| (i * 7 + 2) as u8).collect();
+            let pk_seed = Seed::new(p, &pk_seed_bytes);
             let sk_seed: Vec<u8> = (0..n).map(|i| (i * 13 + 9) as u8).collect();
 
             let mut base = Adrs::new(p.is_shake);
@@ -1513,7 +1521,7 @@ mod fors_shake_x4_tests {
 /// FORS sign (Algorithm 16).
 fn fors_sign(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     sk_seed: &[u8],
     md: &[u8],
     addr: &mut Adrs,
@@ -1558,7 +1566,7 @@ fn fors_sign(
 /// FORS public key from a signature (Algorithm 17). Returns the bytes consumed.
 fn fors_pk_from_sig(
     p: &Params,
-    pk_seed: &[u8],
+    pk_seed: &Seed,
     md: &[u8],
     sig: &[u8],
     addr: &mut Adrs,
@@ -1629,6 +1637,7 @@ fn fors_pk_from_sig(
 
 /// Computes the top-tree root (FIPS 205 Algorithm 18, slh_keygen step).
 fn compute_root(p: &Params, pk_seed: &[u8], sk_seed: &[u8], out: &mut [u8]) {
+    let pk_seed = &Seed::new(p, pk_seed);
     let mut addr = Adrs::new(p.is_shake);
     addr.set_layer(p.d - 1);
     let mut tmp = [0u8; MAX_WOTS_LEN * MAX_N];
@@ -1665,6 +1674,7 @@ fn sign_internal(
     sig: &mut [u8],
 ) {
     let n = p.n as usize;
+    let pk_seed = &Seed::new(p, pk_seed);
     debug_assert_eq!(sig.len(), p.sig_size);
     sig.fill(0);
 
@@ -1721,6 +1731,7 @@ fn verify_internal(
     msg: &[u8],
 ) -> bool {
     let n = p.n as usize;
+    let pk_seed = &Seed::new(p, pk_seed);
     let r = &sig[..n];
 
     let mut digest = [0u8; MAX_M];
