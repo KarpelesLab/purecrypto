@@ -108,14 +108,49 @@ impl AeadAlg {
     }
 }
 
+/// The packet-protection AEAD, keyed once when a [`DirKeys`] is derived.
+///
+/// Building the cipher is not free — the AES key schedule, GCM's hash key
+/// `H` and its precomputed powers, the CPU-feature probe — so it is done once
+/// per key rather than once per packet. Each variant wipes its own key
+/// material on drop.
+#[derive(Clone)]
+pub(crate) enum PacketAead {
+    Aes128(Gcm<Aes128>),
+    Aes256(Gcm<Aes256>),
+    ChaCha20Poly1305(ChaCha20Poly1305),
+}
+
+impl PacketAead {
+    /// Keys the AEAD for `alg`; `key` is exactly [`AeadAlg::key_len`] bytes.
+    fn new(alg: AeadAlg, key: &[u8]) -> Self {
+        match alg {
+            AeadAlg::Aes128Gcm => {
+                PacketAead::Aes128(Gcm::new(Aes128::new(key[..16].try_into().expect("16"))))
+            }
+            AeadAlg::Aes256Gcm => {
+                PacketAead::Aes256(Gcm::new(Aes256::new(key[..32].try_into().expect("32"))))
+            }
+            AeadAlg::ChaCha20Poly1305 => PacketAead::ChaCha20Poly1305(ChaCha20Poly1305::new(
+                key[..32].try_into().expect("32"),
+            )),
+        }
+    }
+}
+
 /// One direction (transmit or receive) of packet protection for one
-/// encryption level. Holds the derived AEAD key, IV, header-protection
+/// encryption level. Holds the keyed AEAD, IV, header-protection
 /// state, and the traffic secret that produced them (kept so the key
 /// update path can call [`derive_next_application_secret`]).
 #[derive(Clone)]
 pub(crate) struct DirKeys {
     pub(crate) alg: AeadAlg,
-    /// AEAD key — exactly [`AeadAlg::key_len`] bytes long.
+    /// The AEAD keyed with the derived `quic key`; the raw key bytes are
+    /// not retained.
+    pub(crate) aead: PacketAead,
+    /// The raw AEAD key, kept only in test and `__ct-check` builds so the
+    /// RFC 9001 Appendix A vectors and the Valgrind hooks can read it.
+    #[cfg(any(test, feature = "__ct-check"))]
     pub(crate) key: Vec<u8>,
     /// AEAD static IV. Per RFC 9001 §5.1 the IV is always 12 bytes long
     /// (the QUIC nonce is also 12 bytes — see §5.3).
@@ -126,6 +161,16 @@ pub(crate) struct DirKeys {
     /// [`derive_next_application_secret`] can compute the next-generation
     /// secret without the caller threading state around.
     pub(crate) secret: Vec<u8>,
+}
+
+impl Drop for DirKeys {
+    fn drop(&mut self) {
+        // The AEAD and header-protection ciphers wipe themselves; the
+        // traffic secret is plain heap memory and is wiped here.
+        crate::kdf::wipe(&mut self.secret);
+        #[cfg(any(test, feature = "__ct-check"))]
+        crate::kdf::wipe(&mut self.key);
+    }
 }
 
 /// RFC 9001 §9.5 — per-key receive packet-number replay window.
@@ -539,8 +584,13 @@ pub(crate) fn derive_dir_keys_preserve_hp(
         }
     };
 
+    let aead = PacketAead::new(alg, &key);
+    #[cfg(not(any(test, feature = "__ct-check")))]
+    crate::kdf::wipe(&mut key);
     DirKeys {
         alg,
+        aead,
+        #[cfg(any(test, feature = "__ct-check"))]
         key,
         iv,
         hp,
@@ -595,21 +645,10 @@ pub(crate) fn aead_seal(
     plaintext_in_place: &mut [u8],
 ) -> [u8; 16] {
     let nonce = nonce_for(&keys.iv, packet_number);
-    match keys.alg {
-        AeadAlg::Aes128Gcm => {
-            let aes = Aes128::new(keys.key[..16].try_into().expect("16"));
-            let g: Gcm<Aes128> = Gcm::new(aes);
-            g.encrypt(&nonce, aad, plaintext_in_place)
-        }
-        AeadAlg::Aes256Gcm => {
-            let aes = Aes256::new(keys.key[..32].try_into().expect("32"));
-            let g: Gcm<Aes256> = Gcm::new(aes);
-            g.encrypt(&nonce, aad, plaintext_in_place)
-        }
-        AeadAlg::ChaCha20Poly1305 => {
-            let c = ChaCha20Poly1305::new(keys.key[..32].try_into().expect("32"));
-            c.encrypt(&nonce, aad, plaintext_in_place)
-        }
+    match &keys.aead {
+        PacketAead::Aes128(g) => g.encrypt(&nonce, aad, plaintext_in_place),
+        PacketAead::Aes256(g) => g.encrypt(&nonce, aad, plaintext_in_place),
+        PacketAead::ChaCha20Poly1305(c) => c.encrypt(&nonce, aad, plaintext_in_place),
     }
 }
 
@@ -628,21 +667,10 @@ pub(crate) fn aead_open(
     tag: &[u8; 16],
 ) -> Result<(), Error> {
     let nonce = nonce_for(&keys.iv, packet_number);
-    let ok = match keys.alg {
-        AeadAlg::Aes128Gcm => {
-            let aes = Aes128::new(keys.key[..16].try_into().expect("16"));
-            let g: Gcm<Aes128> = Gcm::new(aes);
-            g.decrypt(&nonce, aad, ciphertext_in_place, tag).is_ok()
-        }
-        AeadAlg::Aes256Gcm => {
-            let aes = Aes256::new(keys.key[..32].try_into().expect("32"));
-            let g: Gcm<Aes256> = Gcm::new(aes);
-            g.decrypt(&nonce, aad, ciphertext_in_place, tag).is_ok()
-        }
-        AeadAlg::ChaCha20Poly1305 => {
-            let c = ChaCha20Poly1305::new(keys.key[..32].try_into().expect("32"));
-            c.decrypt(&nonce, aad, ciphertext_in_place, tag).is_ok()
-        }
+    let ok = match &keys.aead {
+        PacketAead::Aes128(g) => g.decrypt(&nonce, aad, ciphertext_in_place, tag).is_ok(),
+        PacketAead::Aes256(g) => g.decrypt(&nonce, aad, ciphertext_in_place, tag).is_ok(),
+        PacketAead::ChaCha20Poly1305(c) => c.decrypt(&nonce, aad, ciphertext_in_place, tag).is_ok(),
     };
     if ok { Ok(()) } else { Err(Error::BadRecordMac) }
 }
@@ -1115,18 +1143,7 @@ mod tests {
         // Legacy fields populated, phase table empty: phase lookup
         // falls back.
         let lk = LevelKeys {
-            tx: Some(DirKeys {
-                alg: dk.alg,
-                key: dk.key.clone(),
-                iv: dk.iv,
-                hp: match dk.alg {
-                    AeadAlg::Aes128Gcm => {
-                        HeaderProt::Aes128(Aes128::new(dk.key[..16].try_into().unwrap()))
-                    }
-                    _ => unreachable!(),
-                },
-                secret: dk.secret.clone(),
-            }),
+            tx: Some(dk.clone()),
             rx: None,
             tx_by_phase: [None, None],
             rx_by_phase: [None, None],
