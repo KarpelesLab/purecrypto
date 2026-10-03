@@ -22,7 +22,7 @@
 //! # Constant-time discipline
 //!
 //! Signing and public-key derivation use the constant-time fixed-window
-//! ladder, the constant-time Fermat inverse for `k⁻¹`, and non-short-circuit
+//! ladder, the constant-time safegcd inverse for `k⁻¹`, and non-short-circuit
 //! range checks; the nonce, its inverse, the HMAC-DRBG state and the copy of
 //! the private scalar are wiped before each call returns. Verification and
 //! recovery operate on public data only and use a variable-time Straus /
@@ -217,8 +217,9 @@ impl Secp256k1EcdsaPrivateKey {
         let y_is_odd = bool::from(r_point.y.is_odd());
 
         // s = k⁻¹ (z + r·d) mod n. `k` is secret, so the inversion is the
-        // constant-time Fermat exponentiation (`Scalar::invert`), never a
-        // variable-time Euclid: a timing leak on `k` gives away
+        // constant-time safegcd (`Scalar::invert`, a fixed divstep
+        // schedule), never a variable-time Euclid: a timing leak on `k`
+        // gives away
         // `d = (s·k − z)·r⁻¹ mod n`.
         let k_inv = k.invert();
         let z_rd = z.add(&Scalar(r).mul(&self.d));
@@ -350,7 +351,7 @@ impl Secp256k1EcdsaPublicKey {
         }
         let z = Scalar(reduce_256(&bits2int(prehash), &n));
         let r = Scalar(sig.r);
-        // `sig.s` is in [1, n-1] (checked above), so the Fermat inverse is
+        // `sig.s` is in [1, n-1] (checked above), so the inverse is
         // exact. Everything here is public (signature, digest, key), which is
         // what licenses the variable-time double multiplication.
         let w = Scalar(sig.s).invert();

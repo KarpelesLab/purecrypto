@@ -19,6 +19,9 @@ mod inverse;
 mod modpow;
 mod montgomery;
 mod mul;
+// Safegcd inversion backs the fixed 256-bit curves (secp256k1, P-256) only.
+#[cfg(feature = "ec")]
+pub(crate) mod safegcd;
 // Probable-prime testing needs `BoxedUint` (alloc) and random bases (rng);
 // only the `rsa` (keygen), `dh` (custom-group validation) and `dsa`
 // (subgroup-order validation) features use it, so gate on those too to keep

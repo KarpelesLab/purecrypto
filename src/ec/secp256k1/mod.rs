@@ -48,6 +48,7 @@ mod gtable;
 mod vartime;
 
 use crate::bignum::MontModulus;
+use crate::bignum::safegcd::SafegcdModulus;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::ec::Error;
 
@@ -157,14 +158,15 @@ impl Scalar {
         Scalar(Self::MODULUS.sub_mod(&Fe::ZERO, &self.0))
     }
 
-    /// Returns the modular inverse `self^-1 mod n` (constant-time Fermat), or
-    /// `0` when `self` is `0`.
+    /// The safegcd context for `n`, built at compile time.
+    const SAFEGCD: SafegcdModulus = SafegcdModulus::new(&Self::ORDER);
+
+    /// Returns the modular inverse `self^-1 mod n` (constant time), or `0`
+    /// when `self` is `0`.
     pub fn invert(&self) -> Scalar {
-        // n is prime, so a^(n-2) is the inverse.
-        Scalar(Self::pow_public_exp(
-            &self.0,
-            &Self::ORDER.wrapping_sub(&Fe::from_u64(2)),
-        ))
+        // Bernstein–Yang divsteps: a fixed 590-step schedule, constant time
+        // in the (often secret: ECDSA nonce) input.
+        Scalar(Self::SAFEGCD.invert(&self.0))
     }
 
     /// `a^e mod n` for a **public** exponent `e`, by a width-5 sliding window
@@ -176,7 +178,9 @@ impl Scalar {
     /// gather per nibble.
     ///
     /// Constant time in `a`: every branch and table index is a function of
-    /// the exponent alone, and the only caller passes the public `n − 2`.
+    /// the exponent alone. Retained as the differential oracle for the
+    /// safegcd [`invert`](Self::invert).
+    #[cfg(test)]
     fn pow_public_exp(a: &Fe, e: &Fe) -> Fe {
         let m = &Self::MODULUS;
         let bit = |i: usize| (e.as_limbs()[i / 64] >> (i % 64)) & 1;
