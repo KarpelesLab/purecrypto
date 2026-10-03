@@ -262,24 +262,17 @@ fn fill_segment(
         Argon2Type::Argon2id => pass == 0 && slice < 2,
     };
 
-    // Pre-compute (J1, J2) pairs for the Argon2i / Argon2id-first-half path.
-    let pseudo_random_pairs: Vec<(u32, u32)> = if data_independent {
-        compute_addresses(pass, lane, slice, p, q, seg_len, params)
-    } else {
-        Vec::new()
-    };
-
     let start_idx = if pass == 0 && slice == 0 { 2 } else { 0 };
 
-    // Stack copies of the previous / reference blocks, reused across the
-    // segment and wiped once at the end (they hold password-derived state).
-    let mut prev_buf = [0u8; 1024];
-    let mut ref_buf = [0u8; 1024];
     // G's working blocks live here rather than in `g_compress`'s own frame, so
-    // that they too can be wiped once per segment instead of on every one of
-    // the millions of block compressions (a per-call volatile wipe of 2 KiB
-    // would cost more than the compression itself).
+    // that they can be wiped once per segment instead of on every one of the
+    // millions of block compressions (a per-call volatile wipe of 2 KiB would
+    // cost more than the compression itself).
     let mut scratch = GScratch::new();
+    // The Argon2i / Argon2id-first-half (J1, J2) stream, one address block
+    // (128 pairs) at a time, generated as the segment reaches it. Built only
+    // from public segment parameters, so it needs no wipe.
+    let mut addr_block = [0u8; 1024];
 
     #[allow(clippy::needless_range_loop)]
     for i_seg in start_idx..seg_len {
@@ -289,7 +282,16 @@ fn fill_segment(
         // Get J1, J2 — either from previous block (Argon2d) or precomputed
         // pseudo-random stream (Argon2i / first-half Argon2id).
         let (j1, j2) = if data_independent {
-            pseudo_random_pairs[i_seg]
+            if i_seg == start_idx || i_seg % 128 == 0 {
+                // Address block `k` (counter `k + 1`) covers blocks
+                // `128k .. 128k + 128` of the segment.
+                let counter = (i_seg / 128) as u64 + 1;
+                address_block(pass, lane, slice, p * q, params, counter, &mut addr_block);
+            }
+            let off = (i_seg % 128) * 8;
+            let j1 = u32::from_le_bytes(addr_block[off..off + 4].try_into().unwrap());
+            let j2 = u32::from_le_bytes(addr_block[off + 4..off + 8].try_into().unwrap());
+            (j1, j2)
         } else {
             let prev = &mem[block_off(lane, prev_col)..block_off(lane, prev_col) + 1024];
             let j1 = u32::from_le_bytes(prev[..4].try_into().unwrap());
@@ -307,76 +309,49 @@ fn fill_segment(
         let ref_off = block_off(ref_lane, ref_col);
         let dst_off = block_off(lane, j_abs);
 
-        prev_buf.copy_from_slice(&mem[prev_off..prev_off + 1024]);
-        ref_buf.copy_from_slice(&mem[ref_off..ref_off + 1024]);
-
+        // G reads both inputs into its own working block before it writes
+        // `dst` (distinct from both: the reference area excludes the current
+        // block), so they are read in place rather than copied out first.
         let xor_into = pass > 0 && params.version == 0x13;
-        g_compress(
-            &prev_buf,
-            &ref_buf,
-            &mut mem[dst_off..dst_off + 1024],
-            xor_into,
-            &mut scratch,
+        scratch.load(
+            &mem[prev_off..prev_off + 1024],
+            &mem[ref_off..ref_off + 1024],
         );
+        scratch.mix_store(&mut mem[dst_off..dst_off + 1024], xor_into);
     }
 
-    super::wipe(&mut prev_buf);
-    super::wipe(&mut ref_buf);
     scratch.wipe();
 }
 
-/// Argon2i / Argon2id (first-half) pseudo-random address generation. Produces
-/// one (J1, J2) pair per block in the segment.
-fn compute_addresses(
+/// Argon2i / Argon2id (first-half) pseudo-random address generation: fills
+/// `addr_block` with address block number `counter` of the segment, 128
+/// (J1, J2) pairs as consecutive little-endian `u32`s.
+fn address_block(
     pass: usize,
     lane: usize,
     slice: usize,
-    p: usize,
-    q: usize,
-    seg_len: usize,
+    total_blocks: usize,
     params: &Argon2Params,
-) -> Vec<(u32, u32)> {
-    let mut pairs = Vec::with_capacity(seg_len);
+    counter: u64,
+    addr_block: &mut [u8; 1024],
+) {
     let zero_block = [0u8; 1024];
     let mut input = [0u8; 1024];
-    let mut addr_block = [0u8; 1024];
+    input[0..8].copy_from_slice(&(pass as u64).to_le_bytes());
+    input[8..16].copy_from_slice(&(lane as u64).to_le_bytes());
+    input[16..24].copy_from_slice(&(slice as u64).to_le_bytes());
+    input[24..32].copy_from_slice(&(total_blocks as u64).to_le_bytes()); // m'
+    input[32..40].copy_from_slice(&(params.t_cost as u64).to_le_bytes());
+    input[40..48].copy_from_slice(&(params.variant.ty_byte() as u64).to_le_bytes());
+    input[48..56].copy_from_slice(&counter.to_le_bytes());
+
+    // ADDR_BLOCK = G(zero, G(zero, INPUT_BLOCK))
+    // Nothing here is password-derived (the inputs are the public segment
+    // parameters), so this scratch needs no wipe.
     let mut scratch = GScratch::new();
-
-    // Each ADDR_BLOCK gives 128 (J1, J2) pairs.
-    let mut counter: u64 = 0;
-    while pairs.len() < seg_len {
-        counter += 1;
-
-        // Build INPUT_BLOCK with the segment parameters and counter.
-        for b in input.iter_mut() {
-            *b = 0;
-        }
-        input[0..8].copy_from_slice(&(pass as u64).to_le_bytes());
-        input[8..16].copy_from_slice(&(lane as u64).to_le_bytes());
-        input[16..24].copy_from_slice(&(slice as u64).to_le_bytes());
-        input[24..32].copy_from_slice(&((p * q) as u64).to_le_bytes()); // total blocks m'
-        input[32..40].copy_from_slice(&(params.t_cost as u64).to_le_bytes());
-        input[40..48].copy_from_slice(&(params.variant.ty_byte() as u64).to_le_bytes());
-        input[48..56].copy_from_slice(&counter.to_le_bytes());
-
-        // ADDR_BLOCK = G(zero, G(zero, INPUT_BLOCK))
-        // Nothing here is password-derived (the inputs are the public segment
-        // parameters), so this scratch needs no wipe.
-        let mut tmp = [0u8; 1024];
-        g_compress(&zero_block, &input, &mut tmp, false, &mut scratch);
-        g_compress(&zero_block, &tmp, &mut addr_block, false, &mut scratch);
-
-        for chunk_idx in 0..128 {
-            if pairs.len() >= seg_len {
-                break;
-            }
-            let off = chunk_idx * 8;
-            let j1 = u32::from_le_bytes(addr_block[off..off + 4].try_into().unwrap());
-            let j2 = u32::from_le_bytes(addr_block[off + 4..off + 8].try_into().unwrap());
-            pairs.push((j1, j2));
-        }
-    }
-    pairs
+    let mut tmp = [0u8; 1024];
+    g_compress(&zero_block, &input, &mut tmp, false, &mut scratch);
+    g_compress(&zero_block, &tmp, addr_block, false, &mut scratch);
 }
 
 /// Maps (J1, J2) to a `(ref_lane, ref_col)` using RFC 9106 §3.4's mapping.
@@ -539,6 +514,61 @@ impl GScratch {
         self.r.zeroize();
         self.z.zeroize();
     }
+
+    /// First half of `G(X, Y)`: `R = X ⊕ Y` (and `Z = R`), reading both
+    /// 1024-byte inputs.
+    fn load(&mut self, x: &[u8], y: &[u8]) {
+        for (i, (xc, yc)) in x.chunks_exact(8).zip(y.chunks_exact(8)).enumerate() {
+            let xi = u64::from_le_bytes(xc.try_into().unwrap());
+            let yi = u64::from_le_bytes(yc.try_into().unwrap());
+            self.r[i] = xi ^ yi;
+            self.z[i] = self.r[i];
+        }
+    }
+
+    /// Second half of `G`: applies the row and column `P` rounds to `Z` and
+    /// writes `R ⊕ Z` to `out` (XORed into its contents if `xor_into`, the
+    /// v1.3 pass > 0 behavior).
+    fn mix_store(&mut self, out: &mut [u8], xor_into: bool) {
+        let (r, z) = (&self.r, &mut self.z);
+
+        // One P-round working row, shared by both passes and wiped once at
+        // the end: it holds password-derived state and would otherwise drop
+        // in the clear on the stack (every use below overwrites all 16 words
+        // first).
+        let mut tmp = [0u64; 16];
+
+        // Apply P to each row (16 consecutive u64s).
+        for row in 0..8 {
+            tmp.copy_from_slice(&z[row * 16..row * 16 + 16]);
+            p_round(&mut tmp);
+            z[row * 16..row * 16 + 16].copy_from_slice(&tmp);
+        }
+
+        // Apply P to each "column" (2 consecutive u64s per row, 8 rows → 16
+        // u64s).
+        for col in 0..8 {
+            for i in 0..8 {
+                tmp[2 * i] = z[16 * i + 2 * col];
+                tmp[2 * i + 1] = z[16 * i + 2 * col + 1];
+            }
+            p_round(&mut tmp);
+            for i in 0..8 {
+                z[16 * i + 2 * col] = tmp[2 * i];
+                z[16 * i + 2 * col + 1] = tmp[2 * i + 1];
+            }
+        }
+        tmp.zeroize();
+
+        // Output = R ⊕ Z (optionally XORed into existing `out`).
+        for (i, o) in out.chunks_exact_mut(8).enumerate() {
+            let mut val = r[i] ^ z[i];
+            if xor_into {
+                val ^= u64::from_le_bytes((&*o).try_into().unwrap());
+            }
+            o.copy_from_slice(&val.to_le_bytes());
+        }
+    }
 }
 
 /// `G(X, Y)` writes the resulting 1024-byte block to `out`. If `xor_into` is
@@ -546,51 +576,8 @@ impl GScratch {
 /// pass > 0 behavior). `s` supplies the `R`/`Z` working blocks; its previous
 /// contents are fully overwritten.
 fn g_compress(x: &[u8; 1024], y: &[u8; 1024], out: &mut [u8], xor_into: bool, s: &mut GScratch) {
-    let (r, z) = (&mut s.r, &mut s.z);
-    for i in 0..128 {
-        let xi = u64::from_le_bytes(x[i * 8..i * 8 + 8].try_into().unwrap());
-        let yi = u64::from_le_bytes(y[i * 8..i * 8 + 8].try_into().unwrap());
-        r[i] = xi ^ yi;
-        z[i] = r[i];
-    }
-
-    // One P-round working row, shared by both passes and wiped once at the
-    // end: it holds password-derived state and would otherwise drop in the
-    // clear on the stack (every use below overwrites all 16 words first).
-    let mut tmp = [0u64; 16];
-
-    // Apply P to each row (16 consecutive u64s).
-    for row in 0..8 {
-        tmp.copy_from_slice(&z[row * 16..row * 16 + 16]);
-        p_round(&mut tmp);
-        z[row * 16..row * 16 + 16].copy_from_slice(&tmp);
-    }
-
-    // Apply P to each "column" (2 consecutive u64s per row, 8 rows → 16 u64s).
-    for col in 0..8 {
-        for i in 0..8 {
-            tmp[2 * i] = z[16 * i + 2 * col];
-            tmp[2 * i + 1] = z[16 * i + 2 * col + 1];
-        }
-        p_round(&mut tmp);
-        for i in 0..8 {
-            z[16 * i + 2 * col] = tmp[2 * i];
-            z[16 * i + 2 * col + 1] = tmp[2 * i + 1];
-        }
-    }
-    tmp.zeroize();
-
-    // Output = R ⊕ Z (optionally XORed into existing `out`).
-    for i in 0..128 {
-        let val = r[i] ^ z[i];
-        let off = i * 8;
-        if xor_into {
-            let prev = u64::from_le_bytes(out[off..off + 8].try_into().unwrap());
-            out[off..off + 8].copy_from_slice(&(prev ^ val).to_le_bytes());
-        } else {
-            out[off..off + 8].copy_from_slice(&val.to_le_bytes());
-        }
-    }
+    s.load(x, y);
+    s.mix_store(out, xor_into);
 }
 
 #[cfg(test)]
@@ -655,6 +642,60 @@ mod tests {
     }
 
     /// RFC 9106 §5.3: Argon2id test vector.
+    #[test]
+    fn multi_address_block_segments() {
+        // Segments longer than one 128-pair address block (m = 2048 KiB,
+        // p = 1: 512 blocks per segment), so the data-independent path walks
+        // several address blocks generated on demand. Pinned to the output of
+        // the previous implementation (which precomputed every pair of the
+        // segment up front); the RFC 9106 vectors only have 2-block segments.
+        for (variant, hex) in [
+            (
+                Argon2Type::Argon2i,
+                "bd34fcc2a9ed6be231f431864134d250fee5c104b03abc4a0fcd14add0bb327f",
+            ),
+            (
+                Argon2Type::Argon2id,
+                "9bc1d339eedaa42961447df64465675eb061d5797b7b63f47af520832daf971f",
+            ),
+            (
+                Argon2Type::Argon2d,
+                "b643ff91180a11ddbf6bd6dd6601166d165e01007892cbc20e2d6d99e45b5b78",
+            ),
+        ] {
+            let params = Argon2Params {
+                t_cost: 2,
+                m_cost_kib: 2048,
+                parallelism: 1,
+                variant,
+                version: 0x13,
+            };
+            let mut out = [0u8; 32];
+            argon2(&params, b"password", b"somesalt", &[], &[], &mut out).unwrap();
+            assert_eq!(out, from_hex::<32>(hex), "{variant:?}");
+        }
+    }
+
+    /// The phc-winner-argon2 reference test vector (`test.c`, Argon2i v1.3,
+    /// t = 2, m = 2^16 KiB, p = 1).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "64 MiB fill; run with --release")]
+    fn reference_argon2i_m65536() {
+        let params = Argon2Params {
+            t_cost: 2,
+            m_cost_kib: 1 << 16,
+            parallelism: 1,
+            variant: Argon2Type::Argon2i,
+            version: 0x13,
+        };
+        let mut out = [0u8; 32];
+        argon2(&params, b"password", b"somesalt", &[], &[], &mut out).unwrap();
+        assert_eq!(
+            out,
+            from_hex::<32>("c1628832147d9720c5bd1cfd61367078729f6dfb6f8fea9ff98158e0d7816ed0")
+        );
+    }
+
     #[test]
     fn rfc9106_argon2id() {
         let (mut params, p, s, k, x) = rfc_inputs();
