@@ -1,8 +1,9 @@
 //! Complex FFT over the emulated [`Fpr`] double, for the ring `R = ℝ[x]/(xⁿ+1)`.
 //!
 //! Falcon does its lattice arithmetic — the LDL tree and fast-Fourier sampling —
-//! in the FFT domain. A real polynomial `f` of degree `< n` is represented by its
-//! `n` complex evaluations at the roots of `xⁿ+1`; the layout, the recursive
+//! in the FFT domain. A real polynomial `f` of degree `< n` is represented by
+//! `n/2` of its complex evaluations at the roots of `xⁿ+1` (the other half are
+//! their conjugates; see "Layout" on [`Fft`]); the recursive
 //! `split`/`merge` structure, and the `splitfft`/`mergefft` operators follow the
 //! Falcon specification (§3.4) and the `tprest/falcon.py` reference.
 //!
@@ -111,9 +112,25 @@ impl Cplx {
 
 /// Precomputed twiddle factors for an FFT over `ℝ[x]/(xⁿ+1)`.
 ///
-/// `rho[k]` holds the `2^k / 2` roots used by the merge/split at level
-/// `m = 2^k` (`k = 1..=log2 n`); `rho[k][i]` is a principal square root of the
-/// level-`(m/2)` root `eta[i]`.
+/// `rho[k]` holds the roots used by the merge/split at level `m = 2^k`
+/// (`k = 1..=log2 n`); `rho[k][i]` is a principal square root of the
+/// level-`(m/2)` root `eta[i]`. Only the first `max(1, m/4)` are kept: that is
+/// all the half-spectrum layout below ever reads.
+///
+/// # Layout
+///
+/// A real polynomial of logical size `m ≥ 2` is stored as its first `m/2`
+/// evaluations. With the root ordering built here, evaluation `j + m/2` is at
+/// the conjugate root of evaluation `j` (`ζ̄ = √η̄`, and the principal square
+/// root commutes with conjugation off the negative real axis), so for real
+/// polynomials it is `conj` of entry `j` and carries no information. Every
+/// operator is closed on the first half — a pointwise op trivially, a merge's
+/// output `j` reads its inputs at `j/2 < m/4`, a split's output `i < m/4`
+/// reads entries `2i, 2i+1 < m/2` — so dropping the upper half changes no
+/// stored value's bits; it only skips computing the redundant ones. The one
+/// exception is a split at `m = 2`, which needs entry 1: there it is rebuilt
+/// as `conj(entry 0)` (see [`Fft::split_fft`]). A logical size-1 polynomial
+/// (a tree leaf) is stored as its single, real, value.
 pub(crate) struct Fft {
     pub(crate) n: usize,
     rho: Vec<Vec<Cplx>>,
@@ -137,6 +154,7 @@ impl Fft {
                 next_eta[2 * i] = r;
                 next_eta[2 * i + 1] = r.neg_c();
             }
+            rho_m.truncate((m / 4).max(1));
             rho.push(rho_m);
             eta = next_eta;
             m *= 2;
@@ -144,8 +162,8 @@ impl Fft {
         Fft { n, rho }
     }
 
-    /// Forward FFT: real coefficients (length `n`) → complex evaluations
-    /// (length `n`, with conjugate redundancy, matching the reference layout).
+    /// Forward FFT: real coefficients (length `n`) → the `n/2` stored complex
+    /// evaluations (see "Layout" on [`Fft`]).
     pub(crate) fn fft(&self, f: &[Fpr]) -> Vec<Cplx> {
         debug_assert_eq!(f.len(), self.n);
         let cplx: Vec<Cplx> = f
@@ -158,13 +176,11 @@ impl Fft {
     fn fft_rec(&self, f: &[Cplx]) -> Vec<Cplx> {
         let m = f.len();
         if m == 2 {
-            // x²+1: evaluate at ±i. f = f0 + f1·x → f(i) = f0 + i·f1.
+            // x²+1: evaluate at i (the value at −i is its conjugate).
+            // f = f0 + f1·x → f(i) = f0 + i·f1.
             let f0 = f[0];
             let f1 = f[1];
-            return vec![
-                Cplx::new(f0.re.sub(f1.im), f0.im.add(f1.re)),
-                Cplx::new(f0.re.add(f1.im), f0.im.sub(f1.re)),
-            ];
+            return vec![Cplx::new(f0.re.sub(f1.im), f0.im.add(f1.re))];
         }
         // Coefficient split into even/odd halves.
         let half = m / 2;
@@ -176,18 +192,19 @@ impl Fft {
         }
         let f0h = self.fft_rec(&f0);
         let f1h = self.fft_rec(&f1);
-        self.merge_fft(&f0h, &f1h)
+        self.merge_fft(&f0h, &f1h, m)
     }
 
-    /// Inverse FFT: complex evaluations (length `n`) → real coefficients.
+    /// Inverse FFT: the `n/2` stored evaluations → real coefficients
+    /// (length `n`).
     pub(crate) fn ifft(&self, fh: &[Cplx]) -> Vec<Fpr> {
-        debug_assert_eq!(fh.len(), self.n);
-        let c = self.ifft_rec(fh);
+        debug_assert_eq!(fh.len(), self.n / 2);
+        let c = self.ifft_rec(fh, self.n);
         c.iter().map(|z| z.re).collect()
     }
 
-    fn ifft_rec(&self, fh: &[Cplx]) -> Vec<Cplx> {
-        let m = fh.len();
+    /// Inverse FFT of a logical size-`m` polynomial stored as `m/2` values.
+    fn ifft_rec(&self, fh: &[Cplx], m: usize) -> Vec<Cplx> {
         if m == 2 {
             // Invert the n=2 base: f0 = Re(fh[0]), f1 = Im(fh[0]).
             return vec![
@@ -195,9 +212,9 @@ impl Fft {
                 Cplx::new(fh[0].im, Fpr::from_f64(0.0)),
             ];
         }
-        let (f0h, f1h) = self.split_fft(fh);
-        let f0 = self.ifft_rec(&f0h);
-        let f1 = self.ifft_rec(&f1h);
+        let (f0h, f1h) = self.split_fft(fh, m);
+        let f0 = self.ifft_rec(&f0h, m / 2);
+        let f1 = self.ifft_rec(&f1h, m / 2);
         // Coefficient merge (interleave even/odd).
         let mut out = vec![Cplx::zero(); m];
         for i in 0..m / 2 {
@@ -207,35 +224,45 @@ impl Fft {
         out
     }
 
-    /// `mergefft`: combine the FFTs of the even/odd halves into the level-`m` FFT.
+    /// `mergefft`: combine the FFTs of the even/odd halves into the FFT of the
+    /// logical size-`m` polynomial (`m ≥ 2`; stored output length `m/2`).
     /// `f_fft[2i] = f0[i] + ρ·f1[i]`, `f_fft[2i+1] = f0[i] − ρ·f1[i]`.
-    pub(crate) fn merge_fft(&self, f0h: &[Cplx], f1h: &[Cplx]) -> Vec<Cplx> {
-        let half = f0h.len();
-        let m = 2 * half;
+    pub(crate) fn merge_fft(&self, f0h: &[Cplx], f1h: &[Cplx], m: usize) -> Vec<Cplx> {
         let level = m.trailing_zeros() as usize;
         let rho = &self.rho[level];
-        let mut out = vec![Cplx::zero(); m];
-        for i in 0..half {
+        let mut out = Vec::with_capacity(m / 2);
+        for j in 0..m / 2 {
+            let i = j / 2;
             let t = rho[i].mul(f1h[i]);
-            out[2 * i] = f0h[i].add(t);
-            out[2 * i + 1] = f0h[i].sub(t);
+            out.push(if j & 1 == 0 {
+                f0h[i].add(t)
+            } else {
+                f0h[i].sub(t)
+            });
         }
         out
     }
 
-    /// `splitfft`: inverse of `merge_fft` in the FFT domain.
+    /// `splitfft`: inverse of `merge_fft` in the FFT domain, for a logical
+    /// size-`m` polynomial (`m ≥ 2`) stored as `m/2` values.
     /// `f0[i] = ½(f_fft[2i] + f_fft[2i+1])`,
     /// `f1[i] = ½(f_fft[2i] − f_fft[2i+1])·conj(ρ)`.
-    pub(crate) fn split_fft(&self, fh: &[Cplx]) -> (Vec<Cplx>, Vec<Cplx>) {
-        let m = fh.len();
-        let half = m / 2;
+    ///
+    /// At `m = 2` the second evaluation is not stored; it is `conj(f_fft[0])`
+    /// up to the sign of a zero imaginary part. Each half is then a size-1,
+    /// real, polynomial, and only its real part is ever read (by the sampler),
+    /// which those zero signs cannot reach: `½(a + b).re` uses only `a.re = b.re`,
+    /// and `(½(a − b)·(−i)).re` is `½(a.im − b.im)` — exactly `a.im` when
+    /// `a.im ≠ 0`, and `+0` whatever the signs when it is zero.
+    pub(crate) fn split_fft(&self, fh: &[Cplx], m: usize) -> (Vec<Cplx>, Vec<Cplx>) {
         let level = m.trailing_zeros() as usize;
         let rho = &self.rho[level];
-        let mut f0 = Vec::with_capacity(half);
-        let mut f1 = Vec::with_capacity(half);
-        for i in 0..half {
+        let pairs = (m / 4).max(1);
+        let mut f0 = Vec::with_capacity(pairs);
+        let mut f1 = Vec::with_capacity(pairs);
+        for i in 0..pairs {
             let a = fh[2 * i];
-            let b = fh[2 * i + 1];
+            let b = if m == 2 { a.conj() } else { fh[2 * i + 1] };
             f0.push(a.add(b).scale(Fpr::from_f64(0.5)));
             f1.push(a.sub(b).scale(Fpr::from_f64(0.5)).mul(rho[i].conj()));
         }

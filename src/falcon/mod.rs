@@ -64,16 +64,16 @@
 //!
 //! | | Falcon-512 | Falcon-1024 |
 //! |---|---|---|
-//! | expanded key, resident for the key's lifetime | 170 KiB | 354 KiB |
-//! | transient, per signature | 141 KiB | 282 KiB |
-//! | transient, `generate` | 881 KiB | 3 265 KiB |
-//! | transient, `FalconPrivateKey::from_bytes` | 393 KiB | 802 KiB |
+//! | expanded key, resident for the key's lifetime | 117 KiB | 242 KiB |
+//! | transient, per signature | 65 KiB | 130 KiB |
+//! | transient, `generate` | 885 KiB | 3 301 KiB |
+//! | transient, `FalconPrivateKey::from_bytes` | 244 KiB | 487 KiB |
 //!
 //! A caller-supplied scratch buffer in the style of the reference
 //! implementation's `falcon_sign_dyn(tmp, tmp_len)` would therefore have to be
-//! ~311 KiB (Falcon-512) or ~636 KiB (Falcon-1024) to sign, which is more RAM
-//! than the Cortex-M class of part this directive is for has in total; the
-//! expanded basis and LDL tree alone exceed it. `generate` is worse still and
+//! ~182 KiB (Falcon-512) or ~372 KiB (Falcon-1024) to sign, which is more RAM
+//! than most of the Cortex-M class of part this directive is for has in total;
+//! the expanded basis and LDL tree alone come close to it. `generate` is worse still and
 //! not even fixed-size: NTRUSolve's tower-of-rings recursion drives
 //! variable-width big integers (~8 kbit at n = 512, ~16 kbit at n = 1024) and
 //! 21.6 M / 122 M individual allocations, whose sizes depend on the sampled
@@ -772,8 +772,8 @@ impl Format {
 /// # Memory
 ///
 /// Requires the `alloc` feature. Signing keeps the expanded basis and LDL tree
-/// resident — measured at 170 KiB (Falcon-512) / 354 KiB (Falcon-1024) — and
-/// each signature needs a further 141 KiB / 282 KiB of transient buffers, so
+/// resident — measured at 117 KiB (Falcon-512) / 242 KiB (Falcon-1024) — and
+/// each signature needs a further 65 KiB / 130 KiB of transient buffers, so
 /// there is no stack- or scratch-buffer form of this type that would be usable
 /// on the targets the allocator-free verification path is for. See the "Memory"
 /// section in the module docs.

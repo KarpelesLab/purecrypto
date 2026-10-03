@@ -61,7 +61,7 @@ impl Drop for ExpandedKey {
         // `b = FFT(−f)` (and `d = FFT(−F)`) is a *lossless* representation of
         // the secret polynomial: one `ifft` plus `rint` recovers `f` exactly.
         // The LDL tree is likewise a function of the whole secret basis. That
-        // is ~128 KB of key-equivalent material at n = 1024, and
+        // is ~110 KB of key-equivalent material at n = 1024, and
         // `FalconPrivateKey`'s own `Drop` never reached any of it.
         for v in [&mut self.a, &mut self.b, &mut self.c, &mut self.d] {
             wipe_cplx(v);
@@ -183,7 +183,7 @@ pub(crate) fn sign_internal<R: SamplerRng>(
 
     let mut result = None;
     for _ in 0..MAX_SIGN_ATTEMPTS {
-        let (mut z0, mut z1) = ff_sampling(&key.fft, &t0, &t1, &key.tree, key.sigmin, rng);
+        let (mut z0, mut z1) = ff_sampling(&key.fft, &t0, &t1, n, &key.tree, key.sigmin, rng);
 
         // v = z·B; s = (c, 0) − v.
         let mut v0 = key

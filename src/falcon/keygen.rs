@@ -117,9 +117,11 @@ pub(crate) fn recompute_g(f: &[i64], g: &[i64], cap_f: &[i64], n: usize) -> Vec<
     let mut cf_fft = fft.fft(&cff);
     let qf = Fpr::of_i64(Q);
     // num = q + g·F (the constant polynomial q has FFT equal to q everywhere).
-    let mut num: Vec<Cplx> = (0..n)
-        .map(|i| {
-            let gf = g_fft[i].mul(cf_fft[i]);
+    let mut num: Vec<Cplx> = g_fft
+        .iter()
+        .zip(cf_fft.iter())
+        .map(|(&g, &cf)| {
+            let gf = g.mul(cf);
             Cplx::new(gf.re.add(qf), gf.im)
         })
         .collect();

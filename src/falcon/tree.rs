@@ -22,7 +22,8 @@ use super::sampler::{SamplerRng, sampler_z};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-/// A 2×2 Gram matrix in FFT form: `g[i][j]` is a length-`m` FFT array.
+/// A 2×2 Gram matrix in FFT form: `g[i][j]` is the FFT array (stored length
+/// `m/2`) of a logical size-`m` polynomial.
 pub(crate) type Gram = [[Vec<Cplx>; 2]; 2];
 
 /// A node of the Falcon LDL tree.
@@ -114,11 +115,12 @@ fn vec_zero(m: usize) -> Vec<Cplx> {
     v
 }
 
-/// Build the normalized Falcon tree from a Gram matrix `g` (length-`m` entries),
-/// for signing standard deviation `sigma`. Folds the `normalize_tree` pass into
-/// construction: leaves are stored as `sigma / √(D_ii[0].re)`.
+/// Build the normalized Falcon tree from a Gram matrix `g` (logical size-`m`
+/// entries, `m ≥ 2`), for signing standard deviation `sigma`. Folds the
+/// `normalize_tree` pass into construction: leaves are stored as
+/// `sigma / √(D_ii[0].re)`.
 pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr) -> FftTree {
-    let m = g[0][0].len();
+    let m = 2 * g[0][0].len();
     // LDL*: D00 = G00; L10 = G10 / G00; D11 = G11 − L10·adj(L10)·G00.
     let mut d00 = g[0][0].clone();
     let l10 = div_fft(&g[1][0], &g[0][0]);
@@ -128,8 +130,8 @@ pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr) -> FftTree {
 
     let node = if m > 2 {
         // Bisect each diagonal block and recurse.
-        let (d00a, d00b) = fft.split_fft(&d00);
-        let (d11a, d11b) = fft.split_fft(&d11);
+        let (d00a, d00b) = fft.split_fft(&d00, m);
+        let (d11a, d11b) = fft.split_fft(&d11, m);
         let mut g0: Gram = [[d00a.clone(), d00b.clone()], [adj_fft(&d00b), d00a]];
         let mut g1: Gram = [[d11a.clone(), d11b.clone()], [adj_fft(&d11b), d11a]];
         let left = Box::new(ffldl(fft, &g0, sigma));
@@ -155,13 +157,15 @@ pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr) -> FftTree {
     node
 }
 
-/// Fast-Fourier sampling: given the target `(t0, t1)` (length-`m` FFT arrays)
-/// and the tree, return `(z0, z1)`, the FFT of an integral lattice vector close
-/// to the target. Draws leaf integers with [`sampler_z`] (consuming `rng`).
+/// Fast-Fourier sampling: given the target `(t0, t1)` (FFT arrays of logical
+/// size `m`, the size `tree` was built for) and the tree, return `(z0, z1)`,
+/// the FFT of an integral lattice vector close to the target. Draws leaf
+/// integers with [`sampler_z`] (consuming `rng`).
 pub(crate) fn ff_sampling<R: SamplerRng>(
     fft: &Fft,
     t0: &[Cplx],
     t1: &[Cplx],
+    m: usize,
     tree: &FftTree,
     sigmin: Fpr,
     rng: &mut R,
@@ -178,15 +182,15 @@ pub(crate) fn ff_sampling<R: SamplerRng>(
         }
         FftTree::Node { l10, left, right } => {
             // Sample the second coordinate first (split → recurse → merge).
-            let (mut t1a, mut t1b) = fft.split_fft(t1);
-            let (mut z1a, mut z1b) = ff_sampling(fft, &t1a, &t1b, right, sigmin, rng);
-            let z1 = fft.merge_fft(&z1a, &z1b);
+            let (mut t1a, mut t1b) = fft.split_fft(t1, m);
+            let (mut z1a, mut z1b) = ff_sampling(fft, &t1a, &t1b, m / 2, right, sigmin, rng);
+            let z1 = fft.merge_fft(&z1a, &z1b, m);
             // t0' = t0 + (t1 − z1)·L10.
             let mut diff = sub_fft(t1, &z1);
             let mut t0b = add_fft(t0, &mul_fft(&diff, l10));
-            let (mut t0a, mut t0bb) = fft.split_fft(&t0b);
-            let (mut z0a, mut z0b) = ff_sampling(fft, &t0a, &t0bb, left, sigmin, rng);
-            let z0 = fft.merge_fft(&z0a, &z0b);
+            let (mut t0a, mut t0bb) = fft.split_fft(&t0b, m);
+            let (mut z0a, mut z0b) = ff_sampling(fft, &t0a, &t0bb, m / 2, left, sigmin, rng);
+            let z0 = fft.merge_fft(&z0a, &z0b, m);
             // Every split half, sub-result and the L10-corrected target are
             // functions of the secret basis and of the sampled lattice point;
             // only the merged `(z0, z1)` leave this frame, so the rest is wiped

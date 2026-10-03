@@ -121,8 +121,8 @@ fn ffsampling_integral_and_deterministic() {
         let t0 = fft.fft(&rng.small_poly(n));
         let t1 = fft.fft(&rng.small_poly(n));
 
-        let (z0a, z1a) = ff_sampling(&fft, &t0, &t1, &tree, sigmin, &mut DetRng(42));
-        let (z0b, z1b) = ff_sampling(&fft, &t0, &t1, &tree, sigmin, &mut DetRng(42));
+        let (z0a, z1a) = ff_sampling(&fft, &t0, &t1, n, &tree, sigmin, &mut DetRng(42));
+        let (z0b, z1b) = ff_sampling(&fft, &t0, &t1, n, &tree, sigmin, &mut DetRng(42));
         // Determinism: identical random stream → identical output.
         assert!(
             maxdiff(&z0a, &z0b) == 0.0 && maxdiff(&z1a, &z1b) == 0.0,
