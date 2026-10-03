@@ -485,7 +485,7 @@ fn encrypt_inner(
         if r.is_zero().declassify() {
             return Err(Error::InvalidInput);
         }
-        // s_a = k⁻¹·(m + r·x). `invert` is a constant-time Fermat inversion —
+        // s_a = k⁻¹·(m + r·x). `invert` is a constant-time safegcd inversion —
         // a variable-time inversion here would leak the nonce and hence `x`.
         let s_a = k.invert().mul(&m.add(&r.mul(&x)));
         // Declassified (Valgrind harness): a public verdict (an error return or

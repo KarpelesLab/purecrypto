@@ -359,8 +359,8 @@ pub fn sign_with_commitment(
     }
 
     // s = k2⁻¹ (z + r·d). The inversion must be constant time in the secret
-    // nonce — `Scalar::invert` is Fermat over the constant-time ladder, not a
-    // variable-time extended Euclid (Brumley–Tuveri).
+    // nonce — `Scalar::invert` is the fixed-iteration constant-time safegcd,
+    // not a variable-time extended Euclid (Brumley–Tuveri).
     let s = k2.invert().mul(&z.add(&r.mul(&d)));
     // Declassified (Valgrind harness): a public verdict (an error return or
     // a rejected candidate).
