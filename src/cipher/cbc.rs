@@ -54,14 +54,23 @@ impl<C: BlockCipher> Cbc<C> {
         if !data.len().is_multiple_of(16) {
             return Err(InvalidLength);
         }
-        for chunk in data.chunks_exact_mut(16) {
-            let saved = <[u8; 16]>::try_from(&chunk[..]).unwrap();
-            let block: &mut [u8; 16] = chunk.try_into().unwrap();
-            self.cipher.decrypt_block(block);
-            for (b, c) in block.iter_mut().zip(self.chain.iter()) {
+        // Unlike encryption, CBC decryption is parallel: every block's
+        // inverse permutation is independent, so a window of blocks goes
+        // through the batched `decrypt_blocks` (the hardware pipeline), after
+        // which each is XORed with the ciphertext block before it. The window
+        // keeps a copy of that (public) ciphertext, since decryption is in
+        // place.
+        const W: usize = 16;
+        let mut prev = [0u8; 16 * W];
+        for window in data.chunks_mut(16 * W) {
+            let n = window.len();
+            prev[..16].copy_from_slice(&self.chain);
+            prev[16..n].copy_from_slice(&window[..n - 16]);
+            self.chain.copy_from_slice(&window[n - 16..]);
+            self.cipher.decrypt_blocks(window);
+            for (b, c) in window.iter_mut().zip(prev.iter()) {
                 *b ^= *c;
             }
-            self.chain = saved;
         }
         Ok(())
     }
@@ -108,6 +117,35 @@ mod tests {
 
         Cbc::new(Aes128::new(&key), &iv).decrypt(&mut buf).unwrap();
         assert_eq!(buf, from_hex::<64>(PLAINTEXT));
+    }
+
+    /// The windowed decryptor must invert the (serial) encryptor for every
+    /// block count across the window boundary, also when the chain is
+    /// continued over several calls of uneven length.
+    #[test]
+    fn windowed_decrypt_roundtrips_across_calls() {
+        let key = from_hex::<16>(KEY);
+        let iv = from_hex::<16>(IV);
+        let pt: [u8; 16 * 40] = core::array::from_fn(|i| (i as u8).wrapping_mul(13) ^ 0x3c);
+        for blocks in 0..=40 {
+            let mut buf = pt;
+            let data = &mut buf[..16 * blocks];
+            Cbc::new(Aes128::new(&key), &iv).encrypt(data).unwrap();
+            let mut ct = [0u8; 16 * 40];
+            ct[..16 * blocks].copy_from_slice(data);
+            Cbc::new(Aes128::new(&key), &iv).decrypt(data).unwrap();
+            assert_eq!(data, &pt[..16 * blocks], "{blocks} blocks");
+
+            // The same ciphertext decrypted in pieces of 1, 17 and the rest.
+            data.copy_from_slice(&ct[..16 * blocks]);
+            let mut dec = Cbc::new(Aes128::new(&key), &iv);
+            let (a, rest) = data.split_at_mut(16 * blocks.min(1));
+            let (b, c) = rest.split_at_mut(16 * (blocks.saturating_sub(1)).min(17));
+            for part in [a, b, c] {
+                dec.decrypt(part).unwrap();
+            }
+            assert_eq!(data, &pt[..16 * blocks], "{blocks} blocks, split");
+        }
     }
 
     #[test]
