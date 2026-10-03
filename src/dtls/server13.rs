@@ -97,9 +97,7 @@ use super::reassembly::{
     write_fragments, write_message,
 };
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
-use super::record13::{
-    self, header_aad, header_cid, peek_header_layout, reconstruct_seq, sn_mask_for,
-};
+use super::record13::{self, SnKey, header_aad, header_cid, peek_header_layout, reconstruct_seq};
 use super::reliability13::{InFlightRecord, Retransmit13};
 use super::ticket::{
     AcceptedPsk13, PskAcceptContext, TICKET_DTLS13_AAD, seal_key, ticket_now, try_accept_psk13,
@@ -448,8 +446,8 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// Sequence-number protection key (length matches the AEAD key length:
     /// 16 for AES-128-GCM, 32 for AES-256-GCM and ChaCha20-Poly1305, per
     /// RFC 9147 §4.2.3).
-    write_sn_key: Option<crate::tls::crypto::Secret>,
-    write_app_sn_key: Option<crate::tls::crypto::Secret>,
+    write_sn_key: Option<SnKey>,
+    write_app_sn_key: Option<SnKey>,
     /// Application (epoch 3) read epoch, parked until the client Finished.
     pending_read_app: Option<ReadEpoch>,
     pending_write_app_crypter: Option<RecordCrypter>,
@@ -1169,9 +1167,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         // A protected record that arrives before the protected read keys
         // exist is unprocessable — skip it.
-        let Some(suite) = self.suite else {
+        if self.suite.is_none() {
             return Ok(total);
-        };
+        }
         // RFC 9147 §4.2.2: the unified header carries only the low two
         // epoch bits. Resolve them against the current read epoch first,
         // then the retained previous one, then the early-data epoch while
@@ -1186,9 +1184,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                     _ => return Ok(total),
                 },
             };
-        let Ok(mask_full) = sn_mask_for(suite, ctx.sn_key.as_slice(), body) else {
-            return Ok(total);
-        };
+        let mask_full = ctx.sn_key.mask(body);
         let mask: &[u8] = if (buf[0] & 0b0000_1000) != 0 {
             &mask_full[..2]
         } else {
@@ -1470,7 +1466,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             suite.key_len,
             &next,
         ));
-        self.write_sn_key = Some(derive_sn_key(suite.hash, &next, sn_len));
+        self.write_sn_key = Some(SnKey::new(
+            suite.aead,
+            derive_sn_key(suite.hash, &next, sn_len),
+        ));
         self.server_app_secret = Some(next);
         self.enc_write_epoch += 1;
         self.enc_write_seq = 0;
@@ -2414,7 +2413,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         );
         self.write_crypter = Some(w_crypter);
         let sn_len = sn_key_len_for(suite.aead);
-        self.write_sn_key = Some(derive_sn_key(suite.hash, &shts, sn_len));
+        self.write_sn_key = Some(SnKey::new(
+            suite.aead,
+            derive_sn_key(suite.hash, &shts, sn_len),
+        ));
         self.enc_write_epoch = 2;
         self.enc_write_seq = 0;
         self.read = Some(ReadEpoch::new(suite, 2, &chts));
@@ -2515,7 +2517,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             &sats,
         ));
         self.pending_read_app = Some(ReadEpoch::new(suite, 3, &cats));
-        self.write_app_sn_key = Some(derive_sn_key(suite.hash, &sats, sn_len));
+        self.write_app_sn_key = Some(SnKey::new(
+            suite.aead,
+            derive_sn_key(suite.hash, &sats, sn_len),
+        ));
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
 

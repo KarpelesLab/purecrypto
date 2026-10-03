@@ -31,6 +31,7 @@ use super::replay::AntiReplayWindow;
 use crate::tls::crypto::{LabelPrefix, RecordCrypter, Secret, SuiteParams};
 
 use super::client13::{derive_sn_key, sn_key_len_for};
+use super::record13::SnKey;
 
 /// Records received under the current read epoch before the previous
 /// epoch's read keys are discarded. Sized to outlast the peer's full
@@ -74,7 +75,7 @@ pub(crate) const KEY_UPDATE_WINDOW: core::time::Duration = core::time::Duration:
 pub(crate) struct ReadEpoch {
     pub(crate) epoch: u16,
     pub(crate) crypter: RecordCrypter,
-    pub(crate) sn_key: Secret,
+    pub(crate) sn_key: SnKey,
     /// Highest sequence number successfully authenticated in this epoch.
     pub(crate) seq: u64,
     pub(crate) replay: AntiReplayWindow,
@@ -93,7 +94,7 @@ impl ReadEpoch {
                 suite.key_len,
                 secret,
             ),
-            sn_key: derive_sn_key(suite.hash, secret, sn_len),
+            sn_key: SnKey::new(suite.aead, derive_sn_key(suite.hash, secret, sn_len)),
             seq: 0,
             replay: AntiReplayWindow::new(),
         }

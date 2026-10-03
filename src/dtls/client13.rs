@@ -92,9 +92,7 @@ use super::epoch13::{
 };
 use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_fragments};
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
-use super::record13::{
-    self, header_aad, header_cid, peek_header_layout, reconstruct_seq, sn_mask_for,
-};
+use super::record13::{self, SnKey, header_aad, header_cid, peek_header_layout, reconstruct_seq};
 use super::reliability13::{InFlightRecord, Retransmit13};
 use super::system_now;
 use super::ticket::{
@@ -291,7 +289,7 @@ struct EarlyWrite {
     /// have accepted.
     suite: SuiteParams,
     crypter: RecordCrypter,
-    sn_key: Secret,
+    sn_key: SnKey,
     seq: u64,
     /// Plaintext bytes still allowed under the ticket's
     /// `max_early_data_size` (RFC 8446 §4.6.1).
@@ -303,7 +301,7 @@ struct EarlyWrite {
 struct RetiredWrite {
     epoch: u16,
     crypter: RecordCrypter,
-    sn_key: Secret,
+    sn_key: SnKey,
     /// Next sequence number in that epoch.
     seq: u64,
 }
@@ -426,9 +424,9 @@ pub struct DtlsClientConnection13 {
     /// Sequence-number protection key for outgoing records (key length
     /// matches the AEAD key length: 16 for AES-128-GCM, 32 for AES-256-GCM
     /// and ChaCha20-Poly1305, per RFC 9147 §4.2.3).
-    write_sn_key: Option<Secret>,
+    write_sn_key: Option<SnKey>,
     /// Application write-side `sn_key`, ready to swap in at our Finished.
-    write_app_sn_key: Option<Secret>,
+    write_app_sn_key: Option<SnKey>,
     /// Application (epoch 3) read epoch, parked until our Finished.
     pending_read_app: Option<ReadEpoch>,
     /// Application-secret write crypter, parked until our Finished.
@@ -688,7 +686,10 @@ impl DtlsClientConnection13 {
                     suite.key_len,
                     &cets,
                 ),
-                sn_key: derive_sn_key(suite.hash, &cets, sn_key_len_for(suite.aead)),
+                sn_key: SnKey::new(
+                    suite.aead,
+                    derive_sn_key(suite.hash, &cets, sn_key_len_for(suite.aead)),
+                ),
                 seq: 0,
                 remaining: budget,
             });
@@ -1235,9 +1236,9 @@ impl DtlsClientConnection13 {
 
         // A protected record that arrives before the protected read keys
         // exist is unprocessable — skip it.
-        let Some(suite) = self.suite else {
+        if self.suite.is_none() {
             return Ok(total);
-        };
+        }
         // RFC 9147 §4.2.2: the unified header carries only the low two
         // epoch bits. Resolve them against the current read epoch first,
         // then the retained previous one; anything else is unreadable and
@@ -1247,9 +1248,7 @@ impl DtlsClientConnection13 {
         else {
             return Ok(total);
         };
-        let Ok(mask_full) = sn_mask_for(suite, ctx.sn_key.as_slice(), body) else {
-            return Ok(total);
-        };
+        let mask_full = ctx.sn_key.mask(body);
         let mask: &[u8] = if (buf[0] & 0b0000_1000) != 0 {
             &mask_full[..2]
         } else {
@@ -1479,7 +1478,10 @@ impl DtlsClientConnection13 {
             suite.key_len,
             &next,
         ));
-        self.write_sn_key = Some(derive_sn_key(suite.hash, &next, sn_len));
+        self.write_sn_key = Some(SnKey::new(
+            suite.aead,
+            derive_sn_key(suite.hash, &next, sn_len),
+        ));
         self.client_app_secret = Some(next);
         self.enc_write_epoch += 1;
         self.enc_write_seq = 0;
@@ -1990,7 +1992,10 @@ impl DtlsClientConnection13 {
         );
         self.write_crypter = Some(w_crypter);
         let sn_len = sn_key_len_for(suite.aead);
-        self.write_sn_key = Some(derive_sn_key(suite.hash, &chts, sn_len));
+        self.write_sn_key = Some(SnKey::new(
+            suite.aead,
+            derive_sn_key(suite.hash, &chts, sn_len),
+        ));
         self.enc_write_epoch = 2;
         self.enc_write_seq = 0;
         self.read = Some(ReadEpoch::new(suite, 2, &shts));
@@ -2370,7 +2375,10 @@ impl DtlsClientConnection13 {
         ));
         self.pending_read_app = Some(ReadEpoch::new(suite, 3, &sats));
         let sn_len = sn_key_len_for(suite.aead);
-        self.write_app_sn_key = Some(derive_sn_key(suite.hash, &cats, sn_len));
+        self.write_app_sn_key = Some(SnKey::new(
+            suite.aead,
+            derive_sn_key(suite.hash, &cats, sn_len),
+        ));
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
 
@@ -3002,12 +3010,13 @@ pub(crate) fn derive_sn_key(hash: HashAlg, secret: &Secret, len: usize) -> Secre
 /// to sequence-number masking. Build the header, compute the AEAD with
 /// that AAD, then compute and apply the sn_mask. `cid` is the connection
 /// ID the peer asked to receive (RFC 9146 §3; empty for none), carried in
-/// the header and thus covered by the AEAD.
+/// the header and thus covered by the AEAD. The suite is fixed by
+/// `crypter` and `sn_key`, which are keyed for it; `_suite` is unused.
 #[allow(clippy::too_many_arguments)] // one record's worth of write context
 pub(crate) fn encrypt_protected_record_with(
-    suite: SuiteParams,
+    _suite: SuiteParams,
     crypter: &mut RecordCrypter,
-    sn_key: &Secret,
+    sn_key: &SnKey,
     epoch: u16,
     seq: u64,
     cid: &[u8],
@@ -3054,7 +3063,7 @@ pub(crate) fn encrypt_protected_record_with(
 
     // Compute sn_mask over the first 16 bytes of ciphertext+tag and
     // emit the on-wire record with the masked seq.
-    let mask_full = sn_mask_for(suite, sn_key.as_slice(), &inner)?;
+    let mask_full = sn_key.mask(&inner);
     let mask: &[u8] = if seq_is_16bit {
         &mask_full[..2]
     } else {

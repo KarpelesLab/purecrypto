@@ -5799,7 +5799,7 @@ mod wolfssl_capture {
         let mut wrong_sn = ReadEpoch::new(suite, 2, &secret);
         let mut sn = [0u8; 16];
         expand_label_dyn(suite.hash, secret.as_slice(), b"sn", &[], &mut sn);
-        wrong_sn.sn_key = Secret::new(&sn);
+        wrong_sn.sn_key = crate::dtls::record13::SnKey::new(suite.aead, Secret::new(&sn));
         assert!(open(&mut wrong_sn, &from_hex_vec(FINISHED_RECORD)).is_none());
     }
 }

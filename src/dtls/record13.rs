@@ -37,7 +37,7 @@
 
 use crate::cipher::{Aes128, Aes256, BlockCipher, ChaCha20};
 use crate::tls::Error;
-use crate::tls::crypto::{AeadAlg, SuiteParams};
+use crate::tls::crypto::AeadAlg;
 use alloc::vec::Vec;
 
 /// Fixed top 3 bits of every DTLS 1.3 protected record's first byte: `001`.
@@ -387,12 +387,14 @@ pub(crate) fn peek_header_layout(buf: &[u8], cid_len: usize) -> Result<(usize, u
 /// least 16 bytes long — the AEAD tag alone is 16 bytes, so a real
 /// ciphertext always satisfies that bound. Shorter inputs are zero-padded
 /// in this helper to keep the API total.
+#[cfg(any(test, feature = "__ct-check"))]
 pub(crate) fn sn_mask_aes128(sn_key: &[u8; 16], ciphertext: &[u8]) -> [u8; 2] {
     let cipher = Aes128::new(sn_key);
     sn_mask_block(&cipher, ciphertext)
 }
 
 /// Like [`sn_mask_aes128`] but using an AES-256 sn_key (32 bytes).
+#[cfg(any(test, feature = "__ct-check"))]
 pub(crate) fn sn_mask_aes256(sn_key: &[u8; 32], ciphertext: &[u8]) -> [u8; 2] {
     let cipher = Aes256::new(sn_key);
     sn_mask_block(&cipher, ciphertext)
@@ -419,7 +421,12 @@ fn sn_mask_block<C: BlockCipher>(cipher: &C, ciphertext: &[u8]) -> [u8; 2] {
 /// QUIC header-protection construction in [`crate::quic::crypto`]
 /// (RFC 9001 §5.4.4), which the TLS working group adopted as the
 /// reference for the DTLS ChaCha mask.
+#[cfg(any(test, feature = "__ct-check"))]
 pub(crate) fn sn_mask_chacha20(sn_key: &[u8; 32], ciphertext: &[u8]) -> [u8; 2] {
+    sn_mask_chacha20_with(&ChaCha20::new(sn_key), ciphertext)
+}
+
+fn sn_mask_chacha20_with(cipher: &ChaCha20, ciphertext: &[u8]) -> [u8; 2] {
     let mut sample = [0u8; 16];
     let take = ciphertext.len().min(16);
     sample[..take].copy_from_slice(&ciphertext[..take]);
@@ -427,8 +434,64 @@ pub(crate) fn sn_mask_chacha20(sn_key: &[u8; 32], ciphertext: &[u8]) -> [u8; 2] 
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&sample[4..16]);
     let mut block = [0u8; 64];
-    ChaCha20::new(sn_key).apply_keystream(&nonce, counter, &mut block);
+    cipher.apply_keystream(&nonce, counter, &mut block);
     [block[0], block[1]]
+}
+
+/// A DTLS 1.3 `sn_key` (RFC 9147 §4.2.3) with its cipher already keyed.
+///
+/// Every protected record sent or received computes one sequence-number
+/// mask, so the AES key schedule (or ChaCha20 key setup) is run once per
+/// epoch here instead of once per record. The ciphers wipe themselves on
+/// drop.
+pub(crate) struct SnKey {
+    cipher: SnCipher,
+    /// The raw key, kept only for the tests and the Valgrind hooks, which
+    /// drive [`sn_mask_for`] directly.
+    #[cfg(any(test, feature = "__ct-check"))]
+    raw: crate::tls::crypto::Secret,
+}
+
+enum SnCipher {
+    Aes128(Aes128),
+    Aes256(Aes256),
+    ChaCha20(ChaCha20),
+}
+
+impl SnKey {
+    /// Keys the mask cipher for `aead` from a derived `sn_key`, whose length
+    /// is the AEAD key length (16 for AES-128-GCM, 32 otherwise).
+    pub(crate) fn new(aead: AeadAlg, key: crate::tls::crypto::Secret) -> Self {
+        let k = key.as_slice();
+        let cipher = match aead {
+            AeadAlg::Aes128Gcm => SnCipher::Aes128(Aes128::new(k[..16].try_into().expect("16"))),
+            AeadAlg::Aes256Gcm => SnCipher::Aes256(Aes256::new(k[..32].try_into().expect("32"))),
+            AeadAlg::ChaCha20Poly1305 => {
+                SnCipher::ChaCha20(ChaCha20::new(k[..32].try_into().expect("32")))
+            }
+        };
+        SnKey {
+            cipher,
+            #[cfg(any(test, feature = "__ct-check"))]
+            raw: key,
+        }
+    }
+
+    /// The 2-byte sequence-number mask for a record whose ciphertext (and
+    /// tag) is `ciphertext`; same output as [`sn_mask_for`].
+    pub(crate) fn mask(&self, ciphertext: &[u8]) -> [u8; 2] {
+        match &self.cipher {
+            SnCipher::Aes128(c) => sn_mask_block(c, ciphertext),
+            SnCipher::Aes256(c) => sn_mask_block(c, ciphertext),
+            SnCipher::ChaCha20(c) => sn_mask_chacha20_with(c, ciphertext),
+        }
+    }
+
+    /// The raw `sn_key` bytes.
+    #[cfg(any(test, feature = "__ct-check"))]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.raw.as_slice()
+    }
 }
 
 /// Dispatches the DTLS 1.3 sequence-number mask computation on the
@@ -437,8 +500,9 @@ pub(crate) fn sn_mask_chacha20(sn_key: &[u8; 32], ciphertext: &[u8]) -> [u8; 2] 
 /// key length (16 for AES-128-GCM, 32 for AES-256-GCM and
 /// ChaCha20-Poly1305). A size mismatch is a crate-internal invariant
 /// violation and is reported as [`Error::InappropriateState`].
+#[cfg(any(test, feature = "__ct-check"))]
 pub(crate) fn sn_mask_for(
-    suite: SuiteParams,
+    suite: crate::tls::crypto::SuiteParams,
     sn_key: &[u8],
     ciphertext: &[u8],
 ) -> Result<[u8; 2], Error> {
@@ -682,6 +746,35 @@ mod tests {
         // 0x205 wins.
         let got = reconstruct_seq(0x05, false, 0x200);
         assert_eq!(got, 0x205);
+    }
+
+    /// The keyed [`SnKey`] produces exactly the per-call masks of
+    /// [`sn_mask_for`] for every suite, over short, exact-block and long
+    /// ciphertexts.
+    #[test]
+    fn sn_key_matches_per_call_mask() {
+        use crate::tls::crypto::{Secret, supported_suites};
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        };
+        for suite in supported_suites() {
+            for _ in 0..32 {
+                let raw: Vec<u8> = (0..sn_key_len(suite.aead)).map(|_| next()).collect();
+                let key = SnKey::new(suite.aead, Secret::new(&raw));
+                for len in [0usize, 5, 16, 17, 40] {
+                    let ct: Vec<u8> = (0..len).map(|_| next()).collect();
+                    assert_eq!(key.mask(&ct), sn_mask_for(*suite, &raw, &ct).unwrap());
+                }
+            }
+        }
+    }
+
+    fn sn_key_len(aead: AeadAlg) -> usize {
+        crate::dtls::client13::sn_key_len_for(aead)
     }
 
     #[test]
