@@ -59,3 +59,28 @@ fn round_trip(n: usize, degree: Degree, logn: u8, seed: u64) {
 fn sign_verify_round_trip_512() {
     round_trip(512, Degree::Falcon512, 9, 0xF00D_BEEF_2468_1357);
 }
+
+/// Pins the exact signature bytes for a deterministic key and sampler stream.
+///
+/// Falcon signing has no byte-exact external vectors here (the table-free FFT
+/// roots differ from the C reference's by a few ulps), so this guards the
+/// emulated-FP pipeline — FFT layout, LDL tree, ffSampling — against any
+/// refactor that changes a single rounding.
+#[test]
+fn signatures_are_pinned_512() {
+    let mut rng = DetRng(0x0DDB_A11C_AFE0_5EED);
+    let (f, g, cap_f, cap_g, _h) = ntru_gen(512, &mut rng);
+    let key = expand_key(&f, &g, &cap_f, &cap_g, Degree::Falcon512);
+    let mut all = alloc::vec::Vec::new();
+    for m in 0..4u8 {
+        let mut salt = [0u8; 40];
+        rng.fill(&mut salt);
+        let sig = sign_internal(&key, &[m; 5], &salt, &mut rng).expect("converges");
+        all.extend_from_slice(&sig);
+    }
+    let digest = crate::hash::sha256(&all);
+    let want: [u8; 32] = crate::test_util::from_hex(
+        "ec2181bdf3f1cfcb52c5622267def45f58c7a1cacd599bc966c08daf580eb4cc",
+    );
+    assert_eq!(digest, want);
+}
