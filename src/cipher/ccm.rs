@@ -312,22 +312,32 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
         a
     }
 
-    /// XORs the CCM CTR keystream into `buffer`, starting at counter `start`.
+    /// XORs the CCM CTR keystream into `buffer`, starting at counter `start`,
+    /// a window of blocks at a time through the batched cipher (the shared
+    /// [`windowed_ctr`](super::ctr::windowed_ctr) loop, which wipes the
+    /// keystream window).
     fn ctr_xor(&self, nonce: &[u8], start: u128, buffer: &mut [u8]) {
-        let mut counter = start;
-        let mut ks = [0u8; 16];
-        let mut pos = 16;
-        for byte in buffer.iter_mut() {
-            if pos == 16 {
-                ks = self.gen_s(nonce, counter);
-                counter = counter.wrapping_add(1);
-                pos = 0;
-            }
-            *byte ^= ks[pos];
-            pos += 1;
-        }
-        // The last block of keystream would otherwise stay on the stack.
-        crate::zeroize::Zeroize::zeroize(&mut ks);
+        let q = 15 - nonce.len();
+        let mut a = [0u8; 16];
+        a[0] = (q as u8) - 1;
+        a[1..1 + nonce.len()].copy_from_slice(nonce);
+        a[16 - q..].copy_from_slice(&start.to_be_bytes()[16 - q..]);
+        super::ctr::windowed_ctr(
+            a,
+            buffer,
+            // Big-endian increment of the q-byte counter field. The counter
+            // is public (a block index), so the early exit is fine; `validate`
+            // bounds the payload so the field never wraps.
+            |b| {
+                for byte in b[16 - q..].iter_mut().rev() {
+                    *byte = byte.wrapping_add(1);
+                    if *byte != 0 {
+                        break;
+                    }
+                }
+            },
+            |ks| self.cipher.encrypt_blocks(ks),
+        );
     }
 }
 
@@ -582,5 +592,33 @@ mod tests {
         let ccm = Aes128Ccm::new(Aes128::new(&[0u8; 16]));
         let mut buf = [0u8; 4];
         let _ = ccm.encrypt(&[0u8; 6], b"", &mut buf);
+    }
+
+    /// The windowed CTR must produce exactly the per-block `gen_s` keystream
+    /// (the byte-at-a-time loop it replaced) for every nonce length, for
+    /// lengths across the 64-block window boundary, and across a carry
+    /// between counter-field bytes.
+    #[test]
+    fn windowed_ctr_matches_per_block_keystream() {
+        let ccm = Aes128Ccm::new(Aes128::new(&[0x42; 16]));
+        let nonce: [u8; 13] = core::array::from_fn(|i| 0xa0 + i as u8);
+        let check = |nonce: &[u8], start: u128, len: usize| {
+            let mut buf: [u8; 2100] = core::array::from_fn(|i| i as u8);
+            let mut want = buf;
+            ccm.ctr_xor(nonce, start, &mut buf[..len]);
+            for (j, chunk) in want[..len].chunks_mut(16).enumerate() {
+                let s = ccm.gen_s(nonce, start + j as u128);
+                for (b, k) in chunk.iter_mut().zip(s.iter()) {
+                    *b ^= *k;
+                }
+            }
+            assert_eq!(buf[..len], want[..len], "nonce {} len {len}", nonce.len());
+        };
+        for nlen in 7..=13 {
+            for len in [0usize, 1, 15, 16, 17, 255, 1023, 1024, 1025, 1100, 2100] {
+                check(&nonce[..nlen], 1, len);
+            }
+        }
+        check(&nonce, 0xfffe, 64);
     }
 }
