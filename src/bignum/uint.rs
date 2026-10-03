@@ -232,7 +232,7 @@ impl<const LIMBS: usize> Uint<LIMBS> {
 
     /// Subtracts modulo `2^(64*LIMBS)`, discarding the final borrow.
     #[inline]
-    pub fn wrapping_sub(&self, rhs: &Self) -> Self {
+    pub const fn wrapping_sub(&self, rhs: &Self) -> Self {
         self.sbb(rhs, 0).0
     }
 
@@ -284,7 +284,7 @@ impl<const LIMBS: usize> Uint<LIMBS> {
     }
 
     /// Returns `self >> 1` (one-bit logical right shift).
-    pub fn shr1(&self) -> Self {
+    pub const fn shr1(&self) -> Self {
         let mut limbs = self.limbs;
         let mut carry = 0;
         let mut i = LIMBS;

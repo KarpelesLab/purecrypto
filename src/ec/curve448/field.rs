@@ -45,7 +45,7 @@ pub(crate) const BASE_ENC: [u8; 57] = {
 };
 
 /// Parses 112 big-endian hex characters into a field element.
-fn fe_from_be_hex(hex: &str) -> Fe {
+const fn fe_from_be_hex(hex: &str) -> Fe {
     crate::ec::uint_from_be_hex(hex)
 }
 
@@ -85,13 +85,21 @@ pub(crate) struct Field {
     pub(crate) p: Fe,
     /// The group order `L`.
     pub(crate) l: Fe,
-    /// `L` zero-extended to fifteen limbs, for reducing the 114-byte (912-bit)
-    /// SHAKE256 outputs used as Ed448 nonces/challenges.
-    pub(crate) l15: Uint<15>,
 }
 
+/// The field context, built once at compile time: the `R² mod p` setup,
+/// the Montgomery conversions of `1` and `d` and the hex decoding all run in
+/// `const` evaluation instead of on every operation.
+static FIELD: Field = Field::build();
+
 impl Field {
-    pub(crate) fn new() -> Self {
+    /// The shared, compile-time-built field context.
+    #[inline]
+    pub(crate) fn new() -> &'static Self {
+        &FIELD
+    }
+
+    const fn build() -> Self {
         let p = fe_from_be_hex(P_HEX);
         let fp = MontModulus::new(p);
         let one = fp.to_mont(&Fe::ONE);
@@ -100,10 +108,6 @@ impl Field {
         // (p − 3) / 4
         let p_minus_3_div_4 = p.wrapping_sub(&Fe::from_u64(3)).shr1().shr1();
         let l = fe_from_be_hex(L_HEX);
-        let ll = l.as_limbs();
-        let l15 = Uint::<15>::from_limbs([
-            ll[0], ll[1], ll[2], ll[3], ll[4], ll[5], ll[6], 0, 0, 0, 0, 0, 0, 0, 0,
-        ]);
         Field {
             fp,
             one,
@@ -112,7 +116,6 @@ impl Field {
             p_minus_3_div_4,
             p,
             l,
-            l15,
         }
     }
 

@@ -165,15 +165,15 @@ impl Ed448PrivateKey {
 
         // r = SHAKE256(dom4(0,ctx) ‖ prefix ‖ M, 114) mod L; R = [r]B.
         let mut r_hash = shake_dom4(context, &[&prefix, message]);
-        let mut r = scalar_reduce_wide(&r_hash, &f.l15);
+        let mut r = scalar_reduce_wide(&r_hash);
         let mut r_scalar = fe_to_scalar_bytes(&r);
         let r_enc = f.encode(&f.scalar_mult(&r_scalar, &f.base()));
 
         // k = SHAKE256(dom4(0,ctx) ‖ R ‖ A ‖ M, 114) mod L; S = (r + k·s) mod L.
         let k_hash = shake_dom4(context, &[&r_enc, &a_enc, message]);
-        let k = scalar_reduce_wide(&k_hash, &f.l15);
+        let k = scalar_reduce_wide(&k_hash);
         let mut s_scalar = Fe::from_le_bytes(&s[..56]); // s[56] == 0 after pruning
-        let sig_s = scalar_muladd(&r, &k, &s_scalar, &f.l15);
+        let sig_s = scalar_muladd(&r, &k, &s_scalar);
 
         let mut sig = [0u8; 114];
         sig[..57].copy_from_slice(&r_enc);
@@ -393,7 +393,7 @@ impl Ed448PublicKey {
 
         // k = SHAKE256(dom4(0,ctx) ‖ R ‖ A ‖ M, 114) mod L.
         let k_hash = shake_dom4(context, &[&r_bytes, &self.0, message]);
-        let k = scalar_reduce_wide(&k_hash, &f.l15);
+        let k = scalar_reduce_wide(&k_hash);
         let k_scalar = fe_to_scalar_bytes(&k);
         let s_scalar = fe_to_scalar_bytes(&s);
 

@@ -49,9 +49,12 @@ const A24: u64 = 39081;
 
 type Fe = Uint<7>;
 
-fn fe_from_hex(hex: &str) -> Fe {
+const fn fe_from_hex(hex: &str) -> Fe {
     super::uint_from_be_hex(hex)
 }
+
+/// The Curve448 field context, built at compile time.
+static FP: MontModulus<7> = MontModulus::new(fe_from_hex(P448_HEX));
 
 /// Computes the raw X448 function: `scalar * point` on Curve448, returning the
 /// resulting u-coordinate (little-endian, 56 bytes).
@@ -61,7 +64,7 @@ fn fe_from_hex(hex: &str) -> Fe {
 /// Callers exposed to network peer input should use
 /// [`X448PrivateKey::diffie_hellman`] (which returns `Result`) instead.
 pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
-    let fp = MontModulus::new(fe_from_hex(P448_HEX));
+    let fp = &FP;
 
     // Clamp the scalar (RFC 7748 §5): clear the bottom two bits and set the top
     // bit. Curve448's cofactor is 4, hence two low bits; 448 is a multiple of

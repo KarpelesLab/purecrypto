@@ -28,7 +28,8 @@ pub(crate) const fn inv_mod_2_64(n: u64) -> u64 {
 /// `bit`. A `const` counterpart of
 /// [`ConditionallySelectable::conditional_select`]
 /// with the same `black_box`-masked limb select, so that [`add_mod`],
-/// [`sub_mod`] and [`MontModulus::new`] can run at compile time while staying
+/// [`sub_mod`], [`MontModulus::new`] and [`MontModulus::mont_mul`] can run at
+/// compile time while staying
 /// constant time when called at runtime on secret moduli (RSA primes).
 #[inline]
 const fn select<const LIMBS: usize>(a: &Uint<LIMBS>, b: &Uint<LIMBS>, bit: Limb) -> Uint<LIMBS> {
@@ -121,7 +122,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// Montgomery multiplication: given `a, b` in Montgomery form, returns
     /// `a*b*R^-1 mod N` (the Montgomery form of the product). CIOS, constant
     /// time.
-    pub fn mont_mul(&self, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
+    pub const fn mont_mul(&self, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
         let a = a.as_limbs();
         let b = b.as_limbs();
         let n = self.modulus.as_limbs();
@@ -170,8 +171,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         let (_, borrow) = sbb(ts, 0, borrow_low);
         // borrow == 0 means the (LIMBS+1)-word value was >= N: take the
         // subtracted result; otherwise keep the original.
-        let ge = Choice::from((borrow ^ 1) as u8);
-        Uint::conditional_select(&diff, &result, ge)
+        select(&diff, &result, borrow ^ 1)
     }
 
     /// Montgomery squaring: given `a` in Montgomery form, returns
@@ -307,9 +307,10 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// guards [`pow`](Self::pow), which routes its `base` through here).
     /// Release behavior is unchanged.
     #[inline]
-    pub fn to_mont(&self, x: &Uint<LIMBS>) -> Uint<LIMBS> {
+    pub const fn to_mont(&self, x: &Uint<LIMBS>) -> Uint<LIMBS> {
+        // x < N iff x − N borrows (a `const`-usable comparison).
         debug_assert!(
-            bool::from(crate::ct::ConstantTimeLess::ct_lt(x, &self.modulus)),
+            x.sbb(&self.modulus, 0).1 == 1,
             "to_mont precondition violated: base must be < N"
         );
         self.mont_mul(x, &self.r2)
@@ -317,7 +318,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
 
     /// Converts `x` out of Montgomery form, returning the plain residue.
     #[inline]
-    pub fn from_mont(&self, x: &Uint<LIMBS>) -> Uint<LIMBS> {
+    pub const fn from_mont(&self, x: &Uint<LIMBS>) -> Uint<LIMBS> {
         self.mont_mul(x, &Uint::ONE)
     }
 
