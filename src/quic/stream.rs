@@ -198,6 +198,12 @@ pub(crate) struct SendStream {
     /// it is declared lost ([`Self::on_range_lost`]) or a PTO fires
     /// ([`Self::requeue_all_sent`]).
     pub(crate) sent_chunks: VecDeque<(u64, Vec<u8>, bool)>,
+    /// True while `sent_chunks` is in non-decreasing offset order — the
+    /// usual case, as fresh data is carved in order; a retransmission
+    /// pushed behind a higher offset clears it until the deque empties.
+    /// Lets [`Self::on_range_acked`] find the newly covered chunks by
+    /// binary search instead of re-checking every chunk in flight.
+    sent_sorted: bool,
     /// Chunks awaiting retransmission. The packet packer emits these
     /// ahead of fresh `write_buf` bytes (they fill the receiver's
     /// contiguity gap); an emitted entry re-enters `sent_chunks`.
@@ -210,6 +216,17 @@ pub(crate) struct SendStream {
     pub(crate) acked_ranges: BTreeMap<u64, u64>,
     /// True once a FIN-bearing STREAM frame has been acknowledged.
     pub(crate) fin_acked: bool,
+}
+
+/// Moves the first `n` bytes of `src` (`n <= src.len()`) into `out`, a
+/// slice-wise copy rather than one `pop_front` per byte.
+fn drain_front_into(src: &mut VecDeque<u8>, out: &mut [u8]) {
+    let n = out.len();
+    let (a, b) = src.as_slices();
+    let from_a = n.min(a.len());
+    out[..from_a].copy_from_slice(&a[..from_a]);
+    out[from_a..].copy_from_slice(&b[..n - from_a]);
+    src.drain(..n);
 }
 
 /// True if `[start, end)` is fully contained in one of the merged
@@ -264,6 +281,7 @@ impl SendStream {
             blocked_at: None,
             reset_pending: false,
             sent_chunks: VecDeque::new(),
+            sent_sorted: true,
             rtx_queue: VecDeque::new(),
             acked_ranges: BTreeMap::new(),
             fin_acked: false,
@@ -299,25 +317,46 @@ impl SendStream {
     /// frame's FIN bit) was acknowledged. Records the range and prunes
     /// the in-flight / queued-retransmit copies of the data.
     pub(crate) fn on_range_acked(&mut self, offset: u64, len: u64, fin: bool) {
+        let fin_newly_acked = fin && !self.fin_acked;
         if fin {
             self.fin_acked = true;
         }
-        insert_range(&mut self.acked_ranges, offset, offset.saturating_add(len));
+        let end = offset.saturating_add(len);
+        insert_range(&mut self.acked_ranges, offset, end);
         // Contiguous acked prefix (informational).
         if let Some((&s, &e)) = self.acked_ranges.iter().next()
             && s == 0
         {
             self.acked_offset = e;
         }
-        // Drop every copy of now-fully-acked data.
-        let ranges = &self.acked_ranges;
-        let fin_acked = self.fin_acked;
-        let covered = |(off, bytes, c_fin): &(u64, Vec<u8>, bool)| {
-            range_covered(ranges, *off, off.saturating_add(bytes.len() as u64))
-                && (!*c_fin || fin_acked)
-        };
-        self.sent_chunks.retain(|c| !covered(c));
-        self.rtx_queue.retain(|c| !covered(c));
+        // Drop every copy of now-fully-acked data. No chunk held here was
+        // covered before this call (each call prunes every covered chunk,
+        // and `push_sent` never stores one), so unless the FIN just became
+        // acknowledged, only chunks inside the one merged interval that
+        // absorbed `[offset, end)` can have become covered.
+        if offset < end && !fin_newly_acked && self.sent_sorted {
+            if let Some((&ms, &me)) = self.acked_ranges.range(..=offset).next_back() {
+                self.prune_sorted_sent(ms, me);
+            }
+        } else {
+            let ranges = &self.acked_ranges;
+            let fin_acked = self.fin_acked;
+            self.sent_chunks.retain(|(off, bytes, c_fin)| {
+                !(range_covered(ranges, *off, off.saturating_add(bytes.len() as u64))
+                    && (!*c_fin || fin_acked))
+            });
+        }
+        if self.sent_chunks.is_empty() {
+            self.sent_sorted = true;
+        }
+        if !self.rtx_queue.is_empty() {
+            let ranges = &self.acked_ranges;
+            let fin_acked = self.fin_acked;
+            self.rtx_queue.retain(|(off, bytes, c_fin)| {
+                !(range_covered(ranges, *off, off.saturating_add(bytes.len() as u64))
+                    && (!*c_fin || fin_acked))
+            });
+        }
         // RFC 9000 §3.1 — once every carved byte and the FIN have been
         // acknowledged the send half is in `Data Recvd`, a terminal state.
         // Recording it lets `Streams` retire the stream's bookkeeping.
@@ -328,6 +367,44 @@ impl SendStream {
         {
             self.state = SendState::DataRecvd;
         }
+    }
+
+    /// [`Self::on_range_acked`]'s fast path: with `sent_chunks` sorted by
+    /// offset, drop the chunks lying inside the merged acked interval
+    /// `[ms, me)` — a contiguous run located by binary search. Falls back to
+    /// a full scan should the run not have the expected shape.
+    fn prune_sorted_sent(&mut self, ms: u64, me: u64) {
+        let fin_acked = self.fin_acked;
+        let covered = |(off, bytes, c_fin): &(u64, Vec<u8>, bool)| {
+            ms <= *off && off.saturating_add(bytes.len() as u64) <= me && (!*c_fin || fin_acked)
+        };
+        let lo = self.sent_chunks.partition_point(|c| c.0 < ms);
+        let mut hi = self.sent_chunks.partition_point(|c| c.0 < me);
+        // Chunks are disjoint, so only the run's last chunk can stick out
+        // past `me` (or be a FIN chunk whose FIN is still unacknowledged).
+        while hi > lo && !covered(&self.sent_chunks[hi - 1]) {
+            hi -= 1;
+        }
+        if self.sent_chunks.range(lo..hi).all(covered) {
+            self.sent_chunks.drain(lo..hi);
+        } else {
+            self.sent_chunks.retain(|c| !covered(c));
+        }
+    }
+
+    /// Records an emitted chunk as in flight, unless the peer has already
+    /// acknowledged all of it (possible for the head of a split
+    /// retransmission), which the next acknowledgement would prune anyway.
+    fn push_sent(&mut self, chunk: (u64, Vec<u8>, bool)) {
+        if self.chunk_acked(chunk.0, chunk.1.len(), chunk.2) {
+            return;
+        }
+        match self.sent_chunks.back() {
+            Some(back) if back.0 > chunk.0 => self.sent_sorted = false,
+            None => self.sent_sorted = true,
+            _ => {}
+        }
+        self.sent_chunks.push_back(chunk);
     }
 
     /// True when the send half has no further work and never will: either
@@ -388,6 +465,9 @@ impl SendStream {
             }
         }
         self.sent_chunks = keep;
+        if self.sent_chunks.is_empty() {
+            self.sent_sorted = true;
+        }
         moved
     }
 
@@ -412,7 +492,7 @@ impl SendStream {
     pub(crate) fn pop_rtx(&mut self, max_payload: usize) -> Option<(u64, Vec<u8>, bool)> {
         let (off, bytes, fin) = self.rtx_queue.pop_front()?;
         if bytes.len() <= max_payload {
-            self.sent_chunks.push_back((off, bytes.clone(), fin));
+            self.push_sent((off, bytes.clone(), fin));
             Some((off, bytes, fin))
         } else {
             debug_assert!(max_payload > 0);
@@ -420,7 +500,7 @@ impl SendStream {
             let head = bytes[..max_payload].to_vec();
             self.rtx_queue
                 .push_front((off + max_payload as u64, tail, fin));
-            self.sent_chunks.push_back((off, head.clone(), false));
+            self.push_sent((off, head.clone(), false));
             Some((off, head, false))
         }
     }
@@ -450,7 +530,7 @@ impl SendStream {
         if take == 0 {
             return 0;
         }
-        self.write_buf.extend(data[..take].iter().copied());
+        self.write_buf.extend(&data[..take]);
         if matches!(self.state, SendState::Ready) {
             self.state = SendState::Send;
         }
@@ -477,10 +557,8 @@ impl SendStream {
         }
         let offset = self.write_off;
         let take = core::cmp::min(cap, self.write_buf.len());
-        let mut bytes: Vec<u8> = Vec::with_capacity(take);
-        for _ in 0..take {
-            bytes.push(self.write_buf.pop_front().expect("just-checked"));
-        }
+        let mut bytes: Vec<u8> = alloc::vec![0u8; take];
+        drain_front_into(&mut self.write_buf, &mut bytes);
         self.write_off += take as u64;
         if self.write_off > self.sent_offset {
             self.sent_offset = self.write_off;
@@ -498,7 +576,7 @@ impl SendStream {
         }
         // Record the chunk so the ack/loss/PTO machinery can confirm or
         // retransmit it.
-        self.sent_chunks.push_back((offset, bytes.clone(), fin));
+        self.push_sent((offset, bytes.clone(), fin));
         Some((offset, bytes, fin))
     }
 
@@ -515,6 +593,7 @@ impl SendStream {
             }
             self.rtx_queue.push_back((off, bytes, fin));
         }
+        self.sent_sorted = true;
     }
 
     /// True if any chunks are currently unconfirmed (in flight or
@@ -532,12 +611,8 @@ impl SendStream {
     pub(crate) fn requeue(&mut self, offset: u64, bytes: &[u8], was_fin: bool) {
         // Prepend.
         let mut new_buf: VecDeque<u8> = VecDeque::with_capacity(bytes.len() + self.write_buf.len());
-        for b in bytes.iter() {
-            new_buf.push_back(*b);
-        }
-        while let Some(b) = self.write_buf.pop_front() {
-            new_buf.push_back(b);
-        }
+        new_buf.extend(bytes);
+        new_buf.append(&mut self.write_buf);
         self.write_buf = new_buf;
         self.write_off = offset;
         if was_fin {
@@ -555,6 +630,7 @@ impl SendStream {
         self.write_buf.clear();
         self.rtx_queue.clear();
         self.sent_chunks.clear();
+        self.sent_sorted = true;
         self.reset_code = Some(code);
         self.reset_pending = true;
         self.state = SendState::ResetSent;
@@ -770,7 +846,7 @@ impl RecvStream {
         let mut newly_contig: u64 = 0;
         if offset == self.next_offset {
             // Fast-path: appends in order.
-            self.delivered.extend(data.iter().copied());
+            self.delivered.extend(data);
             newly_contig += data.len() as u64;
             self.next_offset += data.len() as u64;
             // Absorb pending fragments at or below next_offset.
@@ -785,7 +861,7 @@ impl RecvStream {
                 }
                 let skip = (self.next_offset - p_off) as usize;
                 let take = &frag[skip..];
-                self.delivered.extend(take.iter().copied());
+                self.delivered.extend(take);
                 newly_contig += take.len() as u64;
                 self.next_offset = p_end;
             }
@@ -909,16 +985,8 @@ impl RecvStream {
     /// `delivered`, returns `(bytes_copied, fin_seen)`. `fin_seen` is
     /// true only when all stream bytes have been delivered.
     pub(crate) fn read(&mut self, into: &mut [u8]) -> (usize, bool) {
-        let mut copied = 0;
-        while copied < into.len() {
-            match self.delivered.pop_front() {
-                Some(b) => {
-                    into[copied] = b;
-                    copied += 1;
-                }
-                None => break,
-            }
-        }
+        let copied = into.len().min(self.delivered.len());
+        drain_front_into(&mut self.delivered, &mut into[..copied]);
         self.read_off += copied as u64;
         // FIN-seen: all data delivered AND read out.
         let fin_seen = matches!(self.fin_offset, Some(fin) if self.read_off == fin)
@@ -1040,6 +1108,138 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Randomised send-side driver: packets carry carved or retransmitted
+    /// chunks and are acknowledged, lost or PTO-requeued in random order.
+    /// After every acknowledgement the in-flight / retransmit sets must be
+    /// exactly what pruning *every* covered chunk would leave (the old
+    /// full-scan behaviour the sorted fast path replaces): nothing covered
+    /// remains, and nothing uncovered was dropped. The stream must also
+    /// deliver every byte and reach `Data Recvd`.
+    #[test]
+    fn ack_pruning_matches_full_scan() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let covered = |s: &SendStream, c: &(u64, Vec<u8>, bool)| s.chunk_acked(c.0, c.1.len(), c.2);
+        for round in 0..200 {
+            let total = 1 + rnd(4000) as usize;
+            let mut s = SendStream::new(u64::MAX);
+            let data: Vec<u8> = (0..total).map(|i| (i * 7 + round) as u8).collect();
+            assert_eq!(s.enqueue(&data), total);
+            s.finish();
+            // In-flight "packets": one chunk each.
+            let mut packets: Vec<(u64, u64, bool)> = Vec::new();
+            let mut steps = 0;
+            while s.state != SendState::DataRecvd {
+                steps += 1;
+                assert!(steps < 100_000, "send stream did not converge");
+                match rnd(10) {
+                    0..=3 => {
+                        let cap = 1 + rnd(300) as usize;
+                        let c = if s.has_rtx() {
+                            s.pop_rtx(cap)
+                        } else if s.has_outbound() {
+                            s.carve(if s.write_buf.is_empty() { 0 } else { cap })
+                        } else {
+                            None
+                        };
+                        if let Some((off, bytes, fin)) = c {
+                            assert_eq!(&data[off as usize..off as usize + bytes.len()], &bytes[..]);
+                            packets.push((off, bytes.len() as u64, fin));
+                        }
+                    }
+                    4..=7 if !packets.is_empty() => {
+                        let i = rnd(packets.len() as u64) as usize;
+                        let (off, len, fin) = packets.swap_remove(i);
+                        let before: Vec<_> = s
+                            .sent_chunks
+                            .iter()
+                            .chain(s.rtx_queue.iter())
+                            .cloned()
+                            .collect();
+                        s.on_range_acked(off, len, fin);
+                        for c in s.sent_chunks.iter().chain(s.rtx_queue.iter()) {
+                            assert!(
+                                !covered(&s, c),
+                                "covered chunk kept: {:?}",
+                                (c.0, c.1.len())
+                            );
+                        }
+                        let after: Vec<_> = s
+                            .sent_chunks
+                            .iter()
+                            .chain(s.rtx_queue.iter())
+                            .cloned()
+                            .collect();
+                        for c in &before {
+                            assert!(
+                                covered(&s, c) || after.contains(c),
+                                "uncovered chunk dropped"
+                            );
+                        }
+                    }
+                    8 if !packets.is_empty() => {
+                        let i = rnd(packets.len() as u64) as usize;
+                        let (off, len, fin) = packets.swap_remove(i);
+                        s.on_range_lost(off, len, fin);
+                    }
+                    9 if packets.is_empty() || rnd(8) == 0 => s.requeue_all_sent(),
+                    _ => {}
+                }
+                if packets.is_empty() && !s.has_outbound() && s.has_unacked() {
+                    s.requeue_all_sent();
+                }
+            }
+            assert!(s.fin_acked && !s.has_unacked());
+            assert_eq!(s.acked_offset, total as u64);
+        }
+    }
+
+    /// Bulk reads and carves move exactly the bytes the per-byte loops did,
+    /// across the ring buffer's wrap point.
+    #[test]
+    fn bulk_carve_and_read_cross_the_ring_wrap() {
+        let mut s = SendStream::new(u64::MAX);
+        let mut r = RecvStream::new(u64::MAX / 2);
+        let mut next = 0u8;
+        let mut expect_off = 0u64;
+        let mut got = Vec::new();
+        let mut sent = Vec::new();
+        for i in 0..400usize {
+            let chunk: Vec<u8> = (0..(i * 37) % 97 + 1)
+                .map(|_| {
+                    next = next.wrapping_add(1);
+                    next
+                })
+                .collect();
+            sent.extend_from_slice(&chunk);
+            assert_eq!(s.enqueue(&chunk), chunk.len());
+            let (off, bytes, _) = s.carve((i * 13) % 61 + 1).unwrap();
+            assert_eq!(off, expect_off);
+            expect_off += bytes.len() as u64;
+            r.on_data(off, &bytes, false).unwrap();
+            let mut buf = [0u8; 50];
+            let (n, _) = r.read(&mut buf[..(i * 11) % 50]);
+            got.extend_from_slice(&buf[..n]);
+        }
+        while let Some((off, bytes, _)) = s.carve(64) {
+            r.on_data(off, &bytes, false).unwrap();
+        }
+        let mut buf = [0u8; 64];
+        loop {
+            let (n, _) = r.read(&mut buf);
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, sent);
+    }
 
     /// Exhaustive check of the 4 ID spaces (RFC 9000 §2.1).
     #[test]
