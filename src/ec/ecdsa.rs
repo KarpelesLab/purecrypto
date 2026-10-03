@@ -1,7 +1,7 @@
 //! ECDSA over NIST P-256, with RFC 6979 deterministic nonces.
 
-use super::Error;
 use super::p256::{Fe, P256, random_scalar};
+use super::{Error, reduce_256};
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::{Digest, Hmac};
 use crate::rng::{CryptoRng, RngCore};
@@ -117,7 +117,7 @@ impl EcdsaPrivateKey {
         let n = P256::order();
         let fq = P256::order_modulus();
 
-        let z = bits2int(prehash).reduce(&n);
+        let z = reduce_256(&bits2int(prehash), &n);
         let mut k = generate_k::<D>(&self.d, prehash, &n);
 
         // Single exit so the nonce and its derivatives are wiped on every
@@ -126,7 +126,7 @@ impl EcdsaPrivateKey {
             None => Err(Error::InvalidInput),
             Some((x, _)) => {
                 // r = (k*G).x mod n
-                let r = x.reduce(&n);
+                let r = reduce_256(&x, &n);
                 // `r` is published in the signature; the degenerate `r = 0`
                 // is a public error return (probability ~2^-256).
                 if r.is_zero().declassify() {
@@ -228,7 +228,7 @@ impl EcdsaPublicKey {
             return Err(Error::Verification);
         }
 
-        let z = bits2int(prehash).reduce(&n);
+        let z = reduce_256(&bits2int(prehash), &n);
         // Public-side inversion: `sig.s` is in [1, n-1] (checked above), so
         // Fermat works and is consistent with the constant-time discipline
         // used elsewhere (no leakage matters here, since `sig.s` is public).
@@ -244,7 +244,7 @@ impl EcdsaPublicKey {
         let point = curve.lift_affine(&self.x, &self.y);
         let sum = curve.mul_double_vartime(&u1, &u2, &point);
         let (vx, _) = curve.to_affine(&sum).ok_or(Error::Verification)?;
-        let v = vx.reduce(&n);
+        let v = reduce_256(&vx, &n);
 
         if bool::from(v.ct_eq(&sig.r)) {
             Ok(())
@@ -388,7 +388,7 @@ pub(super) fn generate_k<D: Digest>(d: &Fe, hash: &[u8], n: &Fe) -> Fe {
     d.write_be_bytes(&mut d_oct);
     // bits2octets(hash) = (bits2int(hash) mod n), 32 bytes.
     let mut h_oct = [0u8; 32];
-    bits2int(hash).reduce(n).write_be_bytes(&mut h_oct);
+    reduce_256(&bits2int(hash), n).write_be_bytes(&mut h_oct);
 
     let mut v = D::zeroed_output();
     for b in v.as_mut() {
@@ -621,14 +621,14 @@ mod tests {
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return false;
         }
-        let z = bits2int(prehash).reduce(&n);
+        let z = reduce_256(&bits2int(prehash), &n);
         let w = fq.inv_prime(&sig.s);
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
         let point = curve.lift_affine(&pk.x, &pk.y);
         let sum = curve.point_add(&curve.mul_generator(&u1), &curve.scalar_mul(&u2, &point));
         match curve.to_affine(&sum) {
-            Some((vx, _)) => bool::from(vx.reduce(&n).ct_eq(&sig.r)),
+            Some((vx, _)) => bool::from(reduce_256(&vx, &n).ct_eq(&sig.r)),
             None => false,
         }
     }

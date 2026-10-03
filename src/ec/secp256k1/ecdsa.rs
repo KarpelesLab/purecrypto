@@ -70,6 +70,7 @@ use super::{AffinePoint, ProjectivePoint, Scalar};
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::ec::Error;
 use crate::ec::ecdsa::{bits2int, generate_k, in_range};
+use crate::ec::reduce_256;
 use crate::hash::Digest;
 use crate::rng::{CryptoRng, RngCore};
 use crate::zeroize::Zeroize;
@@ -186,7 +187,7 @@ impl Secp256k1EcdsaPrivateKey {
     /// of its y-coordinate (`y_is_odd`).
     fn sign_prehash_inner<D: Digest>(&self, prehash: &[u8]) -> Result<(Fe, Fe, bool, bool), Error> {
         let n = Scalar::ORDER;
-        let z = Scalar(bits2int(prehash).reduce(&n));
+        let z = Scalar(reduce_256(&bits2int(prehash), &n));
 
         // The nonce and every value derived from it are held in `Scalar`s,
         // whose `Drop` wipes the limbs with volatile stores — so they
@@ -201,7 +202,7 @@ impl Secp256k1EcdsaPrivateKey {
         // r = R.x mod n. R.x is a base-field residue (< p); reducing mod n
         // only ever subtracts n once, since p < 2n.
         let full_x = r_point.x;
-        let r = full_x.reduce(&n);
+        let r = reduce_256(&full_x, &n);
         // `r` is published in the signature; the degenerate `r = 0` is a
         // public error return (probability ~2^-256).
         if r.is_zero().declassify() {
@@ -339,7 +340,7 @@ impl Secp256k1EcdsaPublicKey {
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
         }
-        let z = Scalar(bits2int(prehash).reduce(&n));
+        let z = Scalar(reduce_256(&bits2int(prehash), &n));
         let r = Scalar(sig.r);
         // `sig.s` is in [1, n-1] (checked above), so the Fermat inverse is
         // exact. Everything here is public, so constant time is not needed
@@ -350,7 +351,7 @@ impl Secp256k1EcdsaPublicKey {
 
         let sum = ProjectivePoint::mul_generator(&u1).add(&self.point().to_projective().mul(&u2));
         let v = sum.to_affine().ok_or(Error::Verification)?;
-        let vx = v.x.reduce(&n);
+        let vx = reduce_256(&v.x, &n);
         if bool::from(vx.ct_eq(&sig.r)) {
             Ok(())
         } else {
@@ -488,7 +489,7 @@ impl Secp256k1EcdsaSignature {
         let r_point = AffinePoint::from_sec1(&enc).map_err(|_| Error::Verification)?;
 
         // Q = u1·G + u2·R with u1 = −z·r⁻¹, u2 = s·r⁻¹ (mod n).
-        let z = Scalar(bits2int(prehash).reduce(&n));
+        let z = Scalar(reduce_256(&bits2int(prehash), &n));
         let r_inv = Scalar(self.r).invert();
         let u1 = z.negate().mul(&r_inv);
         let u2 = Scalar(self.s).mul(&r_inv);

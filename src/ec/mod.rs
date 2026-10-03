@@ -149,6 +149,28 @@ pub(crate) const fn uint_from_be_hex<const LIMBS: usize>(hex: &str) -> crate::bi
     crate::bignum::Uint::from_be_bytes(bytes.split_at(n).0)
 }
 
+/// Reduces any 256-bit `v` modulo a 256-bit modulus `n > 2²⁵⁵` (constant
+/// time).
+///
+/// Every curve order and prime this is used with (P-256 and secp256k1 `n`)
+/// has its top bit set, so `v < 2²⁵⁶ < 2n` and one masked conditional
+/// subtraction is the whole reduction. That replaces the 256-step bit-serial
+/// [`Uint::reduce`](crate::bignum::Uint::reduce) on hashes, nonces and
+/// x-coordinates.
+#[inline]
+pub(crate) fn reduce_256(
+    v: &crate::bignum::Uint<4>,
+    n: &crate::bignum::Uint<4>,
+) -> crate::bignum::Uint<4> {
+    use crate::ct::{Choice, ConditionallySelectable};
+    debug_assert!(
+        n.as_limbs()[3] >> 63 == 1,
+        "reduce_256: n must exceed 2^255"
+    );
+    let (d, borrow) = v.sbb(n, 0);
+    crate::bignum::Uint::conditional_select(&d, v, Choice::from((borrow ^ 1) as u8))
+}
+
 /// Errors from elliptic-curve operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -173,3 +195,50 @@ impl core::fmt::Display for Error {
 }
 
 impl core::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::reduce_256;
+    use crate::bignum::Uint;
+
+    /// `reduce_256` must agree with the bit-serial long division for both
+    /// orders it serves, on edge values and a deterministic random sweep.
+    #[test]
+    fn reduce_256_matches_long_division() {
+        let orders: [Uint<4>; 2] = [
+            // P-256 n
+            super::uint_from_be_hex(
+                "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+            ),
+            // secp256k1 n
+            super::uint_from_be_hex(
+                "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+            ),
+        ];
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for n in &orders {
+            let one = Uint::<4>::ONE;
+            let edges = [
+                Uint::ZERO,
+                one,
+                n.wrapping_sub(&one),
+                *n,
+                n.wrapping_add(&one),
+                Uint::from_limbs([u64::MAX; 4]),
+            ];
+            for v in &edges {
+                assert_eq!(reduce_256(v, n), v.reduce(n), "edge {v:?}");
+            }
+            for _ in 0..10_000 {
+                let v = Uint::from_limbs([next(), next(), next(), next()]);
+                assert_eq!(reduce_256(&v, n), v.reduce(n), "input {v:?}");
+            }
+        }
+    }
+}

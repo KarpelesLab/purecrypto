@@ -124,7 +124,7 @@ impl Scalar {
     /// that should be folded into `[0, n)` rather than rejected.
     pub fn from_bytes_be_reduce(bytes: &[u8; 32]) -> Scalar {
         let v = Fe::from_be_bytes(bytes);
-        Scalar(v.reduce(&Self::ORDER))
+        Scalar(super::reduce_256(&v, &Self::ORDER))
     }
 
     /// Returns the 32-byte big-endian encoding of this scalar.
