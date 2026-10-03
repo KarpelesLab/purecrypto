@@ -73,15 +73,15 @@ impl HpkeAead {
         matches!(self, HpkeAead::ExportOnly)
     }
 
-    /// Encrypts `pt` under `key` and `nonce`, binding `aad`, writing
-    /// `ciphertext || tag` into `out` and returning its length
-    /// (`pt.len() + Nt`).
+    /// Encrypts `pt` under `cipher` (keyed for this AEAD) and `nonce`,
+    /// binding `aad`, writing `ciphertext || tag` into `out` and returning
+    /// its length (`pt.len() + Nt`).
     ///
     /// The AEADs encrypt in place, so `pt` is copied into `out` first; `out`
     /// may be longer than needed (the tail is left untouched).
     pub(crate) fn seal(
         self,
-        key: &[u8],
+        cipher: &AeadCipher,
         nonce: &[u8],
         aad: &[u8],
         pt: &[u8],
@@ -95,37 +95,18 @@ impl HpkeAead {
         if out.len() < total {
             return Err(Error::BufferTooSmall);
         }
-        if key.len() != self.key_len() || nonce.len() != self.nonce_len() {
-            return Err(Error::AeadError);
-        }
+        let nonce: &[u8; 12] = nonce.try_into().map_err(|_| Error::AeadError)?;
         let (body, tag_out) = out[..total].split_at_mut(pt.len());
         body.copy_from_slice(pt);
-        let tag = match self {
-            HpkeAead::Aes128Gcm => {
-                let mut k = [0u8; 16];
-                k.copy_from_slice(key);
-                let cipher = Aes128Gcm::new(Aes128::new(&k));
-                super::wipe(&mut k);
-                cipher.encrypt(nonce, aad, body)
+        let tag = match (self, cipher) {
+            (HpkeAead::Aes128Gcm, AeadCipher::Aes128(c)) => c.encrypt(nonce, aad, body),
+            (HpkeAead::Aes256Gcm, AeadCipher::Aes256(c)) => c.encrypt(nonce, aad, body),
+            (HpkeAead::ChaCha20Poly1305, AeadCipher::ChaCha20Poly1305(c)) => {
+                c.encrypt(nonce, aad, body)
             }
-            HpkeAead::Aes256Gcm => {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(key);
-                let cipher = Aes256Gcm::new(Aes256::new(&k));
-                super::wipe(&mut k);
-                cipher.encrypt(nonce, aad, body)
-            }
-            HpkeAead::ChaCha20Poly1305 => {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(key);
-                let mut n = [0u8; 12];
-                n.copy_from_slice(nonce);
-                let cipher = ChaCha20Poly1305::new(&k);
-                super::wipe(&mut k);
-                cipher.encrypt(&n, aad, body)
-            }
-            // Rejected above; repeated so the match stays exhaustive.
-            HpkeAead::ExportOnly => return Err(Error::ExportOnly),
+            // A cipher keyed for another AEAD (or none) is a crate bug, never
+            // reached: the contexts key `cipher` from their own suite.
+            _ => return Err(Error::AeadError),
         };
         tag_out.copy_from_slice(&tag);
         Ok(total)
@@ -140,7 +121,7 @@ impl HpkeAead {
     /// restore it, on a tag mismatch) — never unauthenticated plaintext.
     pub(crate) fn open(
         self,
-        key: &[u8],
+        cipher: &AeadCipher,
         nonce: &[u8],
         aad: &[u8],
         ct: &[u8],
@@ -157,41 +138,64 @@ impl HpkeAead {
         if out.len() < body.len() {
             return Err(Error::BufferTooSmall);
         }
-        if key.len() != self.key_len() || nonce.len() != self.nonce_len() {
-            return Err(Error::AeadError);
-        }
+        let nonce: &[u8; 12] = nonce.try_into().map_err(|_| Error::AeadError)?;
         let mut tag_arr = [0u8; 16];
         tag_arr.copy_from_slice(tag);
         let buf = &mut out[..body.len()];
         buf.copy_from_slice(body);
-        let res = match self {
-            HpkeAead::Aes128Gcm => {
-                let mut k = [0u8; 16];
-                k.copy_from_slice(key);
-                let cipher = Aes128Gcm::new(Aes128::new(&k));
-                super::wipe(&mut k);
-                cipher.decrypt(nonce, aad, buf, &tag_arr)
+        let res = match (self, cipher) {
+            (HpkeAead::Aes128Gcm, AeadCipher::Aes128(c)) => c.decrypt(nonce, aad, buf, &tag_arr),
+            (HpkeAead::Aes256Gcm, AeadCipher::Aes256(c)) => c.decrypt(nonce, aad, buf, &tag_arr),
+            (HpkeAead::ChaCha20Poly1305, AeadCipher::ChaCha20Poly1305(c)) => {
+                c.decrypt(nonce, aad, buf, &tag_arr)
             }
-            HpkeAead::Aes256Gcm => {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(key);
-                let cipher = Aes256Gcm::new(Aes256::new(&k));
-                super::wipe(&mut k);
-                cipher.decrypt(nonce, aad, buf, &tag_arr)
-            }
-            HpkeAead::ChaCha20Poly1305 => {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(key);
-                let mut n = [0u8; 12];
-                n.copy_from_slice(nonce);
-                let cipher = ChaCha20Poly1305::new(&k);
-                super::wipe(&mut k);
-                cipher.decrypt(&n, aad, buf, &tag_arr)
-            }
-            // Rejected above; repeated so the match stays exhaustive.
-            HpkeAead::ExportOnly => return Err(Error::ExportOnly),
+            // See `seal`.
+            _ => return Err(Error::AeadError),
         };
         res.map_err(|_| Error::AeadError)?;
         Ok(body.len())
+    }
+}
+
+/// An HPKE context's AEAD, keyed once from the key schedule's `key`
+/// instead of on every `Seal` / `Open` (the AES key schedule, GCM's hash
+/// key powers and the CPU-feature probe are not free). Each cipher wipes
+/// its own key material on drop. No heap: the context stays usable without
+/// `alloc`.
+pub(crate) enum AeadCipher {
+    /// [`HpkeAead::ExportOnly`]: no cipher.
+    None,
+    Aes128(Aes128Gcm),
+    Aes256(Aes256Gcm),
+    ChaCha20Poly1305(ChaCha20Poly1305),
+}
+
+impl AeadCipher {
+    /// Keys the cipher for `aead`; `key` is its `Nk` bytes.
+    pub(crate) fn new(aead: HpkeAead, key: &[u8]) -> Self {
+        match aead {
+            HpkeAead::Aes128Gcm => {
+                let mut k = [0u8; 16];
+                k.copy_from_slice(&key[..16]);
+                let c = AeadCipher::Aes128(Aes128Gcm::new(Aes128::new(&k)));
+                super::wipe(&mut k);
+                c
+            }
+            HpkeAead::Aes256Gcm => {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&key[..32]);
+                let c = AeadCipher::Aes256(Aes256Gcm::new(Aes256::new(&k)));
+                super::wipe(&mut k);
+                c
+            }
+            HpkeAead::ChaCha20Poly1305 => {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&key[..32]);
+                let c = AeadCipher::ChaCha20Poly1305(ChaCha20Poly1305::new(&k));
+                super::wipe(&mut k);
+                c
+            }
+            HpkeAead::ExportOnly => AeadCipher::None,
+        }
     }
 }

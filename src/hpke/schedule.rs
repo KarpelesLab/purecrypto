@@ -8,7 +8,7 @@
 //! interface respectively.
 
 use super::Error;
-use super::aead::HpkeAead;
+use super::aead::{AeadCipher, HpkeAead};
 use super::kdf::HpkeKdf;
 use super::labeled::{labeled_expand, labeled_extract};
 use super::suite::CipherSuite;
@@ -206,6 +206,8 @@ pub struct SenderContext {
     suite: CipherSuite,
     /// The `(key, base_nonce, exporter_secret)` triple; wiped on drop.
     keys: ScheduleKeys,
+    /// The AEAD keyed with `keys.key`; wipes itself on drop.
+    cipher: AeadCipher,
     seq: u64,
     /// Sticky poison flag: set once the per-suite message limit is reached.
     /// Once set, all further `seal` calls fail without recomputing or using
@@ -221,6 +223,8 @@ pub struct ReceiverContext {
     suite: CipherSuite,
     /// The `(key, base_nonce, exporter_secret)` triple; wiped on drop.
     keys: ScheduleKeys,
+    /// The AEAD keyed with `keys.key`; wipes itself on drop.
+    cipher: AeadCipher,
     seq: u64,
     /// Sticky poison flag — see [`SenderContext::exhausted`].
     exhausted: bool,
@@ -240,6 +244,7 @@ impl SenderContext {
         let mut this = Self {
             suite,
             keys: ScheduleKeys::zeroed(),
+            cipher: AeadCipher::None,
             seq: 0,
             exhausted: false,
         };
@@ -252,6 +257,7 @@ impl SenderContext {
             psk_id,
             &mut this.keys,
         )?;
+        this.cipher = AeadCipher::new(suite.aead, &this.keys.key[..suite.aead.key_len()]);
         Ok(this)
     }
 
@@ -273,12 +279,11 @@ impl SenderContext {
             return Err(Error::MessageLimitReached);
         }
         let nn = self.suite.aead.nonce_len();
-        let nk = self.suite.aead.key_len();
         let nonce = compute_nonce(&self.keys.base_nonce[..nn], self.seq);
         let n = self
             .suite
             .aead
-            .seal(&self.keys.key[..nk], &nonce[..nn], aad, pt, out)?;
+            .seal(&self.cipher, &nonce[..nn], aad, pt, out)?;
         if let Err(e) = increment_seq(&mut self.seq, self.suite.aead) {
             self.exhausted = true;
             return Err(e);
@@ -346,6 +351,7 @@ impl ReceiverContext {
         let mut this = Self {
             suite,
             keys: ScheduleKeys::zeroed(),
+            cipher: AeadCipher::None,
             seq: 0,
             exhausted: false,
         };
@@ -358,6 +364,7 @@ impl ReceiverContext {
             psk_id,
             &mut this.keys,
         )?;
+        this.cipher = AeadCipher::new(suite.aead, &this.keys.key[..suite.aead.key_len()]);
         Ok(this)
     }
 
@@ -376,12 +383,11 @@ impl ReceiverContext {
             return Err(Error::MessageLimitReached);
         }
         let nn = self.suite.aead.nonce_len();
-        let nk = self.suite.aead.key_len();
         let nonce = compute_nonce(&self.keys.base_nonce[..nn], self.seq);
         let n = self
             .suite
             .aead
-            .open(&self.keys.key[..nk], &nonce[..nn], aad, ct, out)?;
+            .open(&self.cipher, &nonce[..nn], aad, ct, out)?;
         if let Err(e) = increment_seq(&mut self.seq, self.suite.aead) {
             self.exhausted = true;
             return Err(e);
@@ -528,6 +534,7 @@ mod tests {
         SenderContext {
             suite,
             keys: ScheduleKeys::zeroed(),
+            cipher: AeadCipher::new(suite.aead, &[0u8; MAX_AEAD_KEY]),
             seq,
             exhausted: false,
         }
