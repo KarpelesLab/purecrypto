@@ -48,23 +48,104 @@ fn polyval_mul(a: u128, b: u128) -> u128 {
     z
 }
 
+/// `mulX_GHASH` (RFC 8452 Appendix A): multiplication by `x` in GHASH's
+/// field and bit order (a GCM `u128` holds `x⁰` in its top bit).
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn mulx_ghash(v: u128) -> u128 {
+    const R: u128 = 0xe1000000000000000000000000000000;
+    (v >> 1) ^ (0u128.wrapping_sub(v & 1) & R)
+}
+
 /// POLYVAL hash state: accumulates 16-byte blocks under hash key `h`.
+///
+/// With a hardware carryless multiply the blocks go through the GHASH kernel
+/// via RFC 8452 Appendix A: `POLYVAL(H, X…) = ByteReverse(GHASH(mulX_GHASH(
+/// ByteReverse(H)), ByteReverse(X)…))`. In `u128` terms the GHASH
+/// accumulator over byte-reversed blocks (read big-endian) *is* the POLYVAL
+/// accumulator read little-endian, so only the blocks need reversing and the
+/// key needs one `mulX`. The software fallback is [`polyval_mul`].
 struct Polyval {
     h: u128,
     acc: u128,
+    /// `hpow[i] = (H·x)^{i+1}` in GHASH's representation, for the aggregated
+    /// hardware GHASH (computed per message: the POLYVAL key is per nonce).
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    hpow: Option<[u128; 8]>,
 }
 
 impl Polyval {
+    #[allow(unsafe_code)]
     fn new(h: &[u8; 16]) -> Self {
+        let h = u128::from_le_bytes(*h);
         Polyval {
-            h: u128::from_le_bytes(*h),
+            h,
             acc: 0,
+            #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            hpow: super::clmul::supported().then(|| {
+                let hx = mulx_ghash(h);
+                let mut hp = [hx; 8];
+                for i in 1..8 {
+                    // SAFETY: `supported()` confirmed the carryless-multiply
+                    // features `gf_mul` requires.
+                    hp[i] = unsafe { super::clmul::gf_mul(hp[i - 1], hx) };
+                }
+                hp
+            }),
+        }
+    }
+
+    /// Absorbs whole `blocks` through the hardware GHASH when it is available
+    /// and returns what is left for the software path (all or nothing).
+    #[allow(unsafe_code)]
+    fn update_blocks_hw<'a>(&mut self, blocks: &'a [u8]) -> &'a [u8] {
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if let Some(hpow) = &self.hpow {
+            // Byte-reverse eight blocks at a time into a scratch window and
+            // hand them to the aggregated GHASH.
+            let mut win = [0u8; 128];
+            for chunk in blocks.chunks(128) {
+                for (dst, src) in win.chunks_exact_mut(16).zip(chunk.chunks_exact(16)) {
+                    dst.copy_from_slice(src);
+                    dst.reverse();
+                }
+                // SAFETY: `hpow` is only set when `clmul::supported()`
+                // confirmed the features `ghash_blocks` requires.
+                self.acc =
+                    unsafe { super::clmul::ghash_blocks(self.acc, hpow, &win[..chunk.len()]) };
+            }
+            // The window held (reversed) message blocks.
+            win.zeroize();
+            return &[];
+        }
+        blocks
+    }
+
+    /// Absorbs `data`, zero-padded to a whole number of blocks:
+    /// `acc = (acc ⊕ block) · H` per block.
+    fn update_padded(&mut self, data: &[u8]) {
+        let full = data.len() - data.len() % 16;
+        for c in self.update_blocks_hw(&data[..full]).chunks_exact(16) {
+            self.update_block(c.try_into().expect("16-byte block"));
+        }
+        let rem = &data[full..];
+        if !rem.is_empty() {
+            let mut b = [0u8; 16];
+            b[..rem.len()].copy_from_slice(rem);
+            self.update_block(&b);
+            b.zeroize();
         }
     }
 
     /// Absorbs one 16-byte block: `acc = (acc ⊕ block) · H`.
+    #[allow(unsafe_code)]
     fn update_block(&mut self, block: &[u8; 16]) {
         self.acc ^= u128::from_le_bytes(*block);
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if let Some(hpow) = &self.hpow {
+            // SAFETY: as in `update_padded`.
+            self.acc = unsafe { super::clmul::gf_mul(self.acc, hpow[0]) };
+            return;
+        }
         self.acc = polyval_mul(self.acc, self.h);
     }
 
@@ -75,11 +156,15 @@ impl Polyval {
 
 impl Drop for Polyval {
     fn drop(&mut self) {
-        // `h` is the per-message POLYVAL key and `acc` the running hash: both
-        // are secret, so wipe them rather than leaving them on the stack.
-        use crate::zeroize::Zeroize;
+        // `h` (and its powers) is the per-message POLYVAL key and `acc` the
+        // running hash: all secret, so wipe them rather than leaving them on
+        // the stack.
         self.h.zeroize();
         self.acc.zeroize();
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if let Some(hp) = &mut self.hpow {
+            hp.zeroize();
+        }
     }
 }
 
@@ -112,8 +197,6 @@ pub struct AesGcmSiv {
     cipher: Cipher,
     /// Key length (16 or 32) — selects how many key-derivation blocks to read.
     key_len: usize,
-    /// The key-generating key, kept to re-derive per-nonce keys.
-    kgk: [u8; 32],
 }
 
 impl AesGcmSiv {
@@ -132,22 +215,16 @@ impl AesGcmSiv {
     /// Fallible [`new`](Self::new): returns [`AeadError::InvalidKeyLength`]
     /// instead of panicking when `key.len()` is neither 16 nor 32.
     pub fn try_new(key: &[u8]) -> Result<Self, AeadError> {
-        let mut kgk = [0u8; 32];
+        // The key-generating key lives only as the AES schedule (wiped by
+        // the cipher's own `Drop`); no raw copy is kept.
         let cipher = match key.len() {
-            16 => {
-                kgk[..16].copy_from_slice(key);
-                Cipher::Aes128(Aes128::new(key.try_into().unwrap()))
-            }
-            32 => {
-                kgk.copy_from_slice(key);
-                Cipher::Aes256(Aes256::new(key.try_into().unwrap()))
-            }
+            16 => Cipher::Aes128(Aes128::new(key.try_into().unwrap())),
+            32 => Cipher::Aes256(Aes256::new(key.try_into().unwrap())),
             _ => return Err(AeadError::InvalidKeyLength),
         };
         Ok(AesGcmSiv {
             cipher,
             key_len: key.len(),
-            kgk,
         })
     }
 
@@ -155,21 +232,20 @@ impl AesGcmSiv {
     /// key (RFC 8452 §4). Each output block is the low 8 bytes of
     /// `AES_K(LE32(counter) ‖ nonce)`.
     fn derive_keys(&self, nonce: &[u8; 12]) -> ([u8; 16], Cipher) {
-        let mut block = [0u8; 16];
-        block[4..].copy_from_slice(nonce);
+        // Counters 0,1 -> auth key; 2.. -> encryption key: all 4 or 6 blocks
+        // in one batched call.
+        let n = 2 + self.key_len / 8; // 4 for AES-128, 6 for AES-256.
+        let mut blocks = [0u8; 16 * 6];
+        for (counter, b) in blocks.chunks_exact_mut(16).take(n).enumerate() {
+            b[..4].copy_from_slice(&(counter as u32).to_le_bytes());
+            b[4..].copy_from_slice(nonce);
+        }
+        self.cipher.encrypt_blocks(&mut blocks[..16 * n]);
 
         let mut auth_key = [0u8; 16];
         let mut enc_key = [0u8; 32];
-        let enc_blocks = self.key_len / 8; // 2 for AES-128, 4 for AES-256.
-
-        // Counters 0,1 -> auth key; 2.. -> encryption key.
-        let mut b = [0u8; 16];
-        for counter in 0u32..(2 + enc_blocks as u32) {
-            block[..4].copy_from_slice(&counter.to_le_bytes());
-            b = block;
-            self.cipher.encrypt_block(&mut b);
+        for (idx, b) in blocks.chunks_exact(16).take(n).enumerate() {
             let half = &b[..8];
-            let idx = counter as usize;
             if idx < 2 {
                 auth_key[idx * 8..idx * 8 + 8].copy_from_slice(half);
             } else {
@@ -177,8 +253,8 @@ impl AesGcmSiv {
                 enc_key[j * 8..j * 8 + 8].copy_from_slice(half);
             }
         }
-        // The last AES output block holds half of the encryption key.
-        b.zeroize();
+        // The AES output blocks hold both derived keys.
+        blocks.zeroize();
 
         let enc_cipher = match self.key_len {
             16 => Cipher::Aes128(Aes128::new(enc_key[..16].try_into().unwrap())),
@@ -223,33 +299,9 @@ impl AesGcmSiv {
     ) -> [u8; 16] {
         let mut pv = Polyval::new(auth_key);
 
-        // AAD, zero-padded to a block boundary.
-        let mut chunks = aad.chunks_exact(16);
-        for c in chunks.by_ref() {
-            let mut b = [0u8; 16];
-            b.copy_from_slice(c);
-            pv.update_block(&b);
-        }
-        let rem = chunks.remainder();
-        if !rem.is_empty() {
-            let mut b = [0u8; 16];
-            b[..rem.len()].copy_from_slice(rem);
-            pv.update_block(&b);
-        }
-
-        // Plaintext, zero-padded to a block boundary.
-        let mut chunks = plaintext.chunks_exact(16);
-        for c in chunks.by_ref() {
-            let mut b = [0u8; 16];
-            b.copy_from_slice(c);
-            pv.update_block(&b);
-        }
-        let rem = chunks.remainder();
-        if !rem.is_empty() {
-            let mut b = [0u8; 16];
-            b[..rem.len()].copy_from_slice(rem);
-            pv.update_block(&b);
-        }
+        // AAD, then plaintext, each zero-padded to a block boundary.
+        pv.update_padded(aad);
+        pv.update_padded(plaintext);
 
         // Length block: [bitlen(AAD)]₆₄ ‖ [bitlen(plaintext)]₆₄, little-endian.
         let mut len_block = [0u8; 16];
@@ -334,14 +386,7 @@ impl AesGcmSiv {
     }
 }
 
-impl Drop for AesGcmSiv {
-    fn drop(&mut self) {
-        // Best-effort wipe of the retained key-generating key, through
-        // `Zeroize` (volatile stores plus a compiler fence).
-        self.kgk.zeroize();
-    }
-}
-
+// The only key material is the AES schedule, which wipes itself on drop.
 impl ZeroizeOnDrop for AesGcmSiv {}
 
 /// AES-128-GCM-SIV (16-byte key).
@@ -369,6 +414,46 @@ mod tests {
             pv.finish(),
             from_hex::<16>("f7a3b47b846119fae5b7866cf5e5b77e")
         );
+    }
+
+    /// The (hardware, where available) bulk POLYVAL must equal the bit-serial
+    /// `polyval_mul` chain for every length 0..=300 (exercising the 8-block
+    /// window, the 4-block and serial GHASH tails and the padded remainder),
+    /// under edge and pseudo-random keys.
+    #[test]
+    fn bulk_polyval_matches_serial() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let data: [u8; 300] = core::array::from_fn(|_| next() as u8);
+        let keys = [
+            [0u8; 16],
+            [0xff; 16],
+            core::array::from_fn(|i| (i == 0) as u8),
+            core::array::from_fn(|i| ((i == 15) as u8) << 7),
+            core::array::from_fn(|_| next() as u8),
+            core::array::from_fn(|_| next() as u8),
+        ];
+        for h in keys {
+            for len in 0..=data.len() {
+                let mut pv = Polyval::new(&h);
+                pv.update_padded(&data[..len]);
+                let got = pv.finish();
+
+                let hv = u128::from_le_bytes(h);
+                let mut acc = 0u128;
+                for c in data[..len].chunks(16) {
+                    let mut b = [0u8; 16];
+                    b[..c.len()].copy_from_slice(c);
+                    acc = polyval_mul(acc ^ u128::from_le_bytes(b), hv);
+                }
+                assert_eq!(got, acc.to_le_bytes(), "len {len} h {h:02x?}");
+            }
+        }
     }
 
     // RFC 8452 Appendix C.1: AES-128-GCM-SIV, empty plaintext, empty AAD.
