@@ -703,6 +703,41 @@ fn sm2_sign() -> String {
     format!("sig={}", hex8(public(&sig[..])))
 }
 
+/// The runtime-curve API on the two curves it routes to the fixed backends
+/// (P-256, secp256k1): public key, RFC 6979 signing (plus low-S recoverable
+/// signing on P-256) and ECDH.
+fn boxed_fixed_curves() -> String {
+    let mut out = String::new();
+    for (i, curve) in [CurveId::P256, CurveId::Secp256k1].into_iter().enumerate() {
+        let tag = 600 + 2 * i as u64;
+        let sk = BoxedEcdsaPrivateKey::from_bytes(curve, &secret_bytes::<32>(tag))
+            .expect("scalar in range");
+        let pk = sk.public_key().to_sec1();
+        let sig = sk.sign::<Sha256>(b"ct_valgrind message").unwrap();
+        let sig = sig.to_bytes(curve);
+        if curve == CurveId::P256 {
+            let (rsig, recid) = sk
+                .sign_recoverable::<Sha256>(b"ct_valgrind message")
+                .unwrap();
+            let rsig = rsig.to_bytes(curve);
+            out += &format!("rsig={} v={} ", hex8(public(&rsig[..])), public(&recid));
+        }
+        let peer = BoxedEcdhPrivateKey::from_bytes(curve, &fixed_bytes::<32>(tag + 1))
+            .unwrap()
+            .public_key();
+        let shared = BoxedEcdhPrivateKey::from(sk)
+            .diffie_hellman(&peer)
+            .expect("valid peer");
+        out += &format!(
+            "pk={} sig={} ss={} ",
+            hex8(public(&pk[..])),
+            hex8(public(&sig[..])),
+            hex8(public(&shared[..]))
+        );
+    }
+    out
+}
+
 fn ffdh_group14() -> String {
     let sk = DhPrivateKey::from_bytes(group14(), &secret_bytes::<32>(119)).expect("in range");
     let peer = DhPrivateKey::from_bytes(group14(), &fixed_bytes::<32>(120))
@@ -2253,6 +2288,7 @@ const CASES: &[Case] = &[
     ("p384_ecdsa_sign", p384_ecdsa_sign),
     ("p384_ecdh", p384_ecdh),
     ("sm2_sign", sm2_sign),
+    ("boxed_fixed_curves", boxed_fixed_curves),
     ("ffdh_group14", ffdh_group14),
     ("rsa2048_pss_sign", rsa2048_pss_sign),
     ("rsa2048_oaep_decrypt", rsa2048_oaep_decrypt),

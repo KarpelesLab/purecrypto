@@ -184,6 +184,319 @@ fn generate_k<D: Digest>(
     candidate
 }
 
+/// Fixed-curve backends behind the runtime-curve API.
+///
+/// P-256 and secp256k1 have dedicated stack-only implementations
+/// ([`super::p256`] / [`super::ecdsa`], [`super::secp256k1`]) some 20–40×
+/// faster than the generic `BoxedUint` arithmetic, and the TLS / X.509 /
+/// hybrid-KEM callers reach those curves through these runtime types. The
+/// `Boxed*` operations for the two curves are routed here, converting at the
+/// boundary. Each helper computes the same integers as the generic path
+/// (same RFC 6979 nonce, same range checks, same rejection of degenerate
+/// points) — pinned by the differential tests against the generic code — so
+/// the dispatch is observable only as speed.
+///
+/// Inputs are already validated by the caller: key scalars are in
+/// `[1, n-1]`, signature components were range-checked against `n`, and
+/// public-key coordinates are `< p` and on the curve. All of those fit in
+/// four limbs.
+mod fixed {
+    use super::{BoxedUint, Error};
+    use crate::bignum::Uint;
+    use crate::ct::{ConstantTimeEq, ConstantTimeLess};
+    use crate::ec::ecdsa::{bits2int, generate_k};
+    use crate::ec::p256::P256;
+    use crate::ec::reduce_256;
+    use crate::ec::secp256k1::ecdsa::{
+        Secp256k1EcdsaPrivateKey, Secp256k1EcdsaPublicKey, Secp256k1EcdsaSignature,
+    };
+    use crate::ec::secp256k1::{AffinePoint, Scalar};
+    use crate::hash::Digest;
+    use crate::zeroize::Zeroize;
+    use alloc::vec::Vec;
+
+    type Fe = Uint<4>;
+
+    /// The low four limbs of `v` (see the module note for why nothing above
+    /// them is set). A straight copy, so `v` may be secret.
+    fn to_fe(v: &BoxedUint) -> Fe {
+        let mut limbs = [0u64; 4];
+        for (dst, src) in limbs.iter_mut().zip(v.as_limbs()) {
+            *dst = *src;
+        }
+        let fe = Fe::from_limbs(limbs);
+        limbs.zeroize();
+        fe
+    }
+
+    /// A four-limb `BoxedUint`, the width the generic path produces for a
+    /// 256-bit curve.
+    fn from_fe(v: &Fe) -> BoxedUint {
+        BoxedUint::from_limbs(v.as_limbs().to_vec())
+    }
+
+    /// `v` as 32 big-endian bytes on the stack (no heap copy of a secret).
+    fn be32(v: &BoxedUint) -> [u8; 32] {
+        let mut fe = to_fe(v);
+        let mut out = [0u8; 32];
+        fe.write_be_bytes(&mut out);
+        fe.zeroize();
+        out
+    }
+
+    fn from_be(b: &[u8]) -> BoxedUint {
+        from_fe(&Fe::from_be_bytes(b))
+    }
+
+    /// A public point, declassified as the generic path does (its encoders
+    /// scan the limbs for their width).
+    fn public_point(x: BoxedUint, y: BoxedUint) -> (BoxedUint, BoxedUint) {
+        crate::ct::declassify_val(x.as_limbs());
+        crate::ct::declassify_val(y.as_limbs());
+        (x, y)
+    }
+
+    // --- P-256 ---
+
+    pub(super) fn p256_public_key(d: &BoxedUint) -> (BoxedUint, BoxedUint) {
+        let c = P256::new();
+        let mut k = to_fe(d);
+        let (x, y) = c
+            .to_affine(&c.mul_generator(&k))
+            .expect("d in [1,n-1] so d*G is not the identity");
+        k.zeroize();
+        public_point(from_fe(&x), from_fe(&y))
+    }
+
+    pub(super) fn p256_diffie_hellman(
+        d: &BoxedUint,
+        px: &BoxedUint,
+        py: &BoxedUint,
+    ) -> Result<Vec<u8>, Error> {
+        let c = P256::new();
+        let mut k = to_fe(d);
+        let shared = c.scalar_mul(&k, &c.lift_affine(&to_fe(px), &to_fe(py)));
+        k.zeroize();
+        let (mut x, _) = c.to_affine(&shared).ok_or(Error::InvalidInput)?;
+        let mut out = [0u8; 32];
+        x.write_be_bytes(&mut out);
+        x.zeroize();
+        let v = out.to_vec();
+        out.zeroize();
+        Ok(v)
+    }
+
+    /// RFC 6979 P-256 signing returning `(r, s, x_overflow, y_is_odd)`, as
+    /// `BoxedEcdsaPrivateKey::sign_prehash_inner` does. The constant-time
+    /// discipline is that of [`crate::ec::ecdsa::EcdsaPrivateKey::sign_prehash`]
+    /// (fixed-window `k·G`, Fermat `k⁻¹`, single exit wiping the nonce).
+    pub(super) fn p256_sign<D: Digest>(
+        d: &BoxedUint,
+        prehash: &[u8],
+    ) -> Result<(BoxedUint, BoxedUint, bool, bool), Error> {
+        let c = P256::new();
+        let n = P256::order();
+        let fq = P256::order_modulus();
+        let mut d = to_fe(d);
+        let z = reduce_256(&bits2int(prehash), &n);
+        let mut k = generate_k::<D>(&d, prehash, &n);
+        let out = match c.to_affine(&c.mul_generator(&k)) {
+            None => Err(Error::InvalidInput),
+            Some((x, y)) => {
+                let r = reduce_256(&x, &n);
+                // Public: `r` is published, `r = 0` is a public error.
+                if r.is_zero().declassify() {
+                    Err(Error::InvalidInput)
+                } else {
+                    let x_overflow = !bool::from(x.ct_lt(&n));
+                    let y_is_odd = bool::from(y.is_odd());
+                    let mut k_inv = fq.inv_prime(&k);
+                    let mut z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &d));
+                    let s = fq.mul_mod(&k_inv, &z_rd);
+                    k_inv.zeroize();
+                    z_rd.zeroize();
+                    if s.is_zero().declassify() {
+                        Err(Error::InvalidInput)
+                    } else {
+                        Ok((r, s, x_overflow, y_is_odd))
+                    }
+                }
+            }
+        };
+        k.zeroize();
+        d.zeroize();
+        let (r, s, x_overflow, y_is_odd) = out?;
+        let (r, s) = public_point(from_fe(&r), from_fe(&s));
+        Ok((r, s, x_overflow, y_is_odd))
+    }
+
+    /// `u1·G + u2·Q` and its affine form, through the variable-time
+    /// double-scalar multiplication — every input is public (verification /
+    /// recovery).
+    fn p256_double_mul(u1: &Fe, u2: &Fe, qx: &Fe, qy: &Fe) -> Option<(Fe, Fe)> {
+        let c = P256::new();
+        c.to_affine(&c.mul_double_vartime(u1, u2, &c.lift_affine(qx, qy)))
+    }
+
+    /// ECDSA verification; `r, s` already range-checked against `n`.
+    pub(super) fn p256_verify(
+        x: &BoxedUint,
+        y: &BoxedUint,
+        prehash: &[u8],
+        r: &BoxedUint,
+        s: &BoxedUint,
+    ) -> bool {
+        let n = P256::order();
+        let fq = P256::order_modulus();
+        let (r, s) = (to_fe(r), to_fe(s));
+        let z = reduce_256(&bits2int(prehash), &n);
+        let w = fq.inv_prime(&s);
+        let (u1, u2) = (fq.mul_mod(&z, &w), fq.mul_mod(&r, &w));
+        match p256_double_mul(&u1, &u2, &to_fe(x), &to_fe(y)) {
+            Some((vx, _)) => bool::from(reduce_256(&vx, &n).ct_eq(&r)),
+            None => false,
+        }
+    }
+
+    /// Public-key recovery `Q = r⁻¹·(s·R − z·G)` given the lifted `R`;
+    /// `r, s` already range-checked. `None` when `Q` is the identity.
+    pub(super) fn p256_recover(
+        rx: &BoxedUint,
+        ry: &BoxedUint,
+        prehash: &[u8],
+        r: &BoxedUint,
+        s: &BoxedUint,
+    ) -> Option<(BoxedUint, BoxedUint)> {
+        let n = P256::order();
+        let fq = P256::order_modulus();
+        let z = reduce_256(&bits2int(prehash), &n);
+        let r_inv = fq.inv_prime(&to_fe(r));
+        let u1 = fq.mul_mod(&fq.sub_mod(&Fe::ZERO, &z), &r_inv);
+        let u2 = fq.mul_mod(&to_fe(s), &r_inv);
+        let (x, y) = p256_double_mul(&u1, &u2, &to_fe(rx), &to_fe(ry))?;
+        Some((from_fe(&x), from_fe(&y)))
+    }
+
+    // --- secp256k1 ---
+
+    fn k256_key(d: &BoxedUint) -> Secp256k1EcdsaPrivateKey {
+        let mut b = be32(d);
+        let key = Secp256k1EcdsaPrivateKey::from_bytes(&b);
+        b.zeroize();
+        key.expect("d in [1,n-1]")
+    }
+
+    fn k256_sec1(x: &BoxedUint, y: &BoxedUint) -> [u8; 65] {
+        let mut out = [0u8; 65];
+        out[0] = 0x04;
+        out[1..33].copy_from_slice(&be32(x));
+        out[33..].copy_from_slice(&be32(y));
+        out
+    }
+
+    fn k256_point(sec1: &[u8; 65]) -> (BoxedUint, BoxedUint) {
+        public_point(from_be(&sec1[1..33]), from_be(&sec1[33..]))
+    }
+
+    fn k256_sig(sig: &Secp256k1EcdsaSignature) -> (BoxedUint, BoxedUint) {
+        public_point(from_be(&sig.r_bytes()), from_be(&sig.s_bytes()))
+    }
+
+    pub(super) fn k256_public_key(d: &BoxedUint) -> (BoxedUint, BoxedUint) {
+        k256_point(&k256_key(d).public_key().to_sec1())
+    }
+
+    pub(super) fn k256_diffie_hellman(
+        d: &BoxedUint,
+        px: &BoxedUint,
+        py: &BoxedUint,
+    ) -> Result<Vec<u8>, Error> {
+        let peer = AffinePoint::from_sec1(&k256_sec1(px, py))?;
+        let mut b = be32(d);
+        let scalar = Scalar::from_bytes_be(&b);
+        b.zeroize();
+        let shared = peer
+            .to_projective()
+            .mul(&scalar?)
+            .to_affine()
+            .ok_or(Error::InvalidInput)?;
+        let mut x = shared.x_bytes();
+        let v = x.to_vec();
+        x.zeroize();
+        Ok(v)
+    }
+
+    /// Raw (not low-S) RFC 6979 signature `(r, s)`.
+    pub(super) fn k256_sign<D: Digest>(
+        d: &BoxedUint,
+        prehash: &[u8],
+    ) -> Result<(BoxedUint, BoxedUint), Error> {
+        Ok(k256_sig(&k256_key(d).sign_prehash::<D>(prehash)?))
+    }
+
+    /// Low-S signature and recovery id.
+    pub(super) fn k256_sign_recoverable<D: Digest>(
+        d: &BoxedUint,
+        prehash: &[u8],
+    ) -> Result<(BoxedUint, BoxedUint, u8), Error> {
+        let (sig, recid) = k256_key(d).sign_prehash_recoverable::<D>(prehash)?;
+        let (r, s) = k256_sig(&sig);
+        Ok((r, s, recid))
+    }
+
+    fn k256_signature(r: &BoxedUint, s: &BoxedUint) -> Secp256k1EcdsaSignature {
+        Secp256k1EcdsaSignature::from_components(&be32(r), &be32(s))
+    }
+
+    /// ECDSA verification; `r, s` already range-checked against `n`.
+    pub(super) fn k256_verify(
+        x: &BoxedUint,
+        y: &BoxedUint,
+        prehash: &[u8],
+        r: &BoxedUint,
+        s: &BoxedUint,
+    ) -> bool {
+        match Secp256k1EcdsaPublicKey::from_sec1(&k256_sec1(x, y)) {
+            Ok(pk) => pk.verify_prehash(prehash, &k256_signature(r, s)).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Public-key recovery; `recid ≤ 3` and `r, s` already range-checked, so
+    /// every error left is `Error::Verification`, as on the generic path.
+    pub(super) fn k256_recover(
+        prehash: &[u8],
+        r: &BoxedUint,
+        s: &BoxedUint,
+        recid: u8,
+    ) -> Result<(BoxedUint, BoxedUint), Error> {
+        let pk = k256_signature(r, s).recover_prehash(prehash, recid)?;
+        Ok(k256_point(&pk.to_sec1()))
+    }
+}
+
+/// The public key `d·G` for a scalar `d ∈ [1, n-1]` on `curve`.
+fn derive_public_key(curve: CurveId, d: &BoxedUint) -> BoxedEcdsaPublicKey {
+    let (x, y) = match curve {
+        CurveId::P256 => fixed::p256_public_key(d),
+        CurveId::Secp256k1 => fixed::k256_public_key(d),
+        _ => return derive_public_key_generic(curve, d),
+    };
+    BoxedEcdsaPublicKey { curve, x, y }
+}
+
+/// [`derive_public_key`] on the generic arithmetic.
+fn derive_public_key_generic(curve: CurveId, d: &BoxedUint) -> BoxedEcdsaPublicKey {
+    let c = curve.curve();
+    let (x, y) = c
+        .to_affine(&c.mul_generator(d))
+        .expect("d in [1,n-1] so d*G is not the identity");
+    // The public key is public (its encoders scan it for its width).
+    crate::ct::declassify_val(x.as_limbs());
+    crate::ct::declassify_val(y.as_limbs());
+    BoxedEcdsaPublicKey { curve, x, y }
+}
+
 impl BoxedEcdsaPublicKey {
     /// Parses a SEC1 point on `curve`, accepting both the uncompressed form
     /// (`0x04 || X || Y`, `1 + 2·field_len` bytes) and the **compressed** form
@@ -282,6 +595,29 @@ impl BoxedEcdsaPublicKey {
     /// `prehash` to the curve order's bit length. See
     /// [`BoxedEcdsaPrivateKey::sign_prehash`].
     pub fn verify_prehash(&self, prehash: &[u8], sig: &BoxedEcdsaSignature) -> Result<(), Error> {
+        let fast = match self.curve {
+            CurveId::P256 => fixed::p256_verify,
+            CurveId::Secp256k1 => fixed::k256_verify,
+            _ => return self.verify_prehash_generic(prehash, sig),
+        };
+        let c = self.curve.curve();
+        if !in_range(&sig.r, c.order()) || !in_range(&sig.s, c.order()) {
+            return Err(Error::Verification);
+        }
+        if fast(&self.x, &self.y, prehash, &sig.r, &sig.s) {
+            Ok(())
+        } else {
+            Err(Error::Verification)
+        }
+    }
+
+    /// [`verify_prehash`](Self::verify_prehash) on the generic arithmetic
+    /// (every curve without a fixed backend, and the tests' oracle).
+    fn verify_prehash_generic(
+        &self,
+        prehash: &[u8],
+        sig: &BoxedEcdsaSignature,
+    ) -> Result<(), Error> {
         let c = self.curve.curve();
         let n = c.order().clone();
         let fq = c.order_modulus();
@@ -335,18 +671,7 @@ impl BoxedEcdsaPrivateKey {
 
     /// Derives the public key `d * G`.
     pub fn public_key(&self) -> BoxedEcdsaPublicKey {
-        let c = self.curve.curve();
-        let (x, y) = c
-            .to_affine(&c.mul_generator(&self.d))
-            .expect("d in [1,n-1] so d*G is not the identity");
-        // The public key is public (its encoders scan it for its width).
-        crate::ct::declassify_val(x.as_limbs());
-        crate::ct::declassify_val(y.as_limbs());
-        BoxedEcdsaPublicKey {
-            curve: self.curve,
-            x,
-            y,
-        }
+        derive_public_key(self.curve, &self.d)
     }
 
     /// Signs `msg`, hashing with `D` and deriving the nonce per RFC 6979.
@@ -372,6 +697,10 @@ impl BoxedEcdsaPrivateKey {
     /// at the application layer. Prefer [`sign`](Self::sign) whenever the full
     /// message is available.
     pub fn sign_prehash<D: Digest>(&self, prehash: &[u8]) -> Result<BoxedEcdsaSignature, Error> {
+        if self.curve == CurveId::Secp256k1 {
+            let (r, s) = fixed::k256_sign::<D>(&self.d, prehash)?;
+            return Ok(BoxedEcdsaSignature { r, s });
+        }
         let (r, s, _, _) = self.sign_prehash_inner::<D>(prehash)?;
         Ok(BoxedEcdsaSignature { r, s })
     }
@@ -384,6 +713,18 @@ impl BoxedEcdsaPrivateKey {
     /// its historical raw form, and [`sign_prehash_recoverable`] does the
     /// normalization itself.
     fn sign_prehash_inner<D: Digest>(
+        &self,
+        prehash: &[u8],
+    ) -> Result<(BoxedUint, BoxedUint, bool, bool), Error> {
+        if self.curve == CurveId::P256 {
+            return fixed::p256_sign::<D>(&self.d, prehash);
+        }
+        self.sign_prehash_inner_generic::<D>(prehash)
+    }
+
+    /// [`sign_prehash_inner`](Self::sign_prehash_inner) on the generic
+    /// arithmetic.
+    fn sign_prehash_inner_generic<D: Digest>(
         &self,
         prehash: &[u8],
     ) -> Result<(BoxedUint, BoxedUint, bool, bool), Error> {
@@ -469,19 +810,35 @@ impl BoxedEcdsaPrivateKey {
         &self,
         prehash: &[u8],
     ) -> Result<(BoxedEcdsaSignature, u8), Error> {
-        let (r, s, x_overflow, y_is_odd) = self.sign_prehash_inner::<D>(prehash)?;
-        // Normalize to low-S; negating s reflects R across the x-axis, flipping
-        // its y-parity, so the recovery id's parity bit must flip with it.
-        let n = self.curve.curve().order().clone();
-        let half_n = n.shr_bits(1).add(&BoxedUint::from_u64(1));
-        let (s, y_is_odd) = if s.lt(&half_n) {
-            (s, y_is_odd)
-        } else {
-            (n.sub(&s), !y_is_odd)
-        };
-        let recid = (y_is_odd as u8) | ((x_overflow as u8) << 1);
-        Ok((BoxedEcdsaSignature { r, s }, recid))
+        if self.curve == CurveId::Secp256k1 {
+            let (r, s, recid) = fixed::k256_sign_recoverable::<D>(&self.d, prehash)?;
+            return Ok((BoxedEcdsaSignature { r, s }, recid));
+        }
+        Ok(low_s_with_recid(
+            self.curve,
+            self.sign_prehash_inner::<D>(prehash)?,
+        ))
     }
+}
+
+/// Turns raw `(r, s, x_overflow, y_is_odd)` into the low-S signature and its
+/// recovery id.
+fn low_s_with_recid(
+    curve: CurveId,
+    (r, s, x_overflow, y_is_odd): (BoxedUint, BoxedUint, bool, bool),
+) -> (BoxedEcdsaSignature, u8) {
+    // Normalize to low-S; negating s reflects R across the x-axis, flipping
+    // its y-parity, so the recovery id's parity bit must flip with it.
+    let c = curve.curve();
+    let n = c.order();
+    let half_n = n.shr_bits(1).add(&BoxedUint::from_u64(1));
+    let (s, y_is_odd) = if s.lt(&half_n) {
+        (s, y_is_odd)
+    } else {
+        (n.sub(&s), !y_is_odd)
+    };
+    let recid = (y_is_odd as u8) | ((x_overflow as u8) << 1);
+    (BoxedEcdsaSignature { r, s }, recid)
 }
 
 impl BoxedEcdsaSignature {
@@ -600,6 +957,19 @@ impl BoxedEcdsaSignature {
         prehash: &[u8],
         recid: u8,
     ) -> Result<BoxedEcdsaPublicKey, Error> {
+        self.recover_prehash_impl(curve, prehash, recid, true)
+    }
+
+    /// [`recover_prehash`](Self::recover_prehash), with `fast` choosing
+    /// whether P-256 / secp256k1 use their fixed backends (`false` is the
+    /// tests' generic oracle).
+    fn recover_prehash_impl(
+        &self,
+        curve: CurveId,
+        prehash: &[u8],
+        recid: u8,
+        fast: bool,
+    ) -> Result<BoxedEcdsaPublicKey, Error> {
         if recid > 3 {
             return Err(Error::InvalidInput);
         }
@@ -608,6 +978,10 @@ impl BoxedEcdsaSignature {
         let fq = c.order_modulus();
         if !in_range(&self.r, &n) || !in_range(&self.s, &n) {
             return Err(Error::Verification);
+        }
+        if fast && curve == CurveId::Secp256k1 {
+            let (x, y) = fixed::k256_recover(prehash, &self.r, &self.s, recid)?;
+            return Ok(BoxedEcdsaPublicKey { curve, x, y });
         }
 
         // R.x = r + (recid>>1)·n; decompress (lift_x) rejects an x ≥ p or an
@@ -620,6 +994,11 @@ impl BoxedEcdsaSignature {
         let (rx, ry) = c
             .decompress(&rx, recid & 1 == 1)
             .ok_or(Error::Verification)?;
+        if fast && curve == CurveId::P256 {
+            let (x, y) = fixed::p256_recover(&rx, &ry, prehash, &self.r, &self.s)
+                .ok_or(Error::Verification)?;
+            return Ok(BoxedEcdsaPublicKey { curve, x, y });
+        }
         let r_point = c.lift_affine(&rx, &ry);
 
         // Q = u1·G + u2·R with u1 = −z·r⁻¹, u2 = s·r⁻¹ (mod n). r is public, so
@@ -1011,18 +1390,7 @@ impl BoxedEcdhPrivateKey {
 
     /// The public key `d * G` to send to the peer.
     pub fn public_key(&self) -> BoxedEcdsaPublicKey {
-        let c = self.curve.curve();
-        let (x, y) = c
-            .to_affine(&c.mul_generator(&self.d))
-            .expect("d in [1,n-1] so d*G is not the identity");
-        // The public key is public (its encoders scan it for its width).
-        crate::ct::declassify_val(x.as_limbs());
-        crate::ct::declassify_val(y.as_limbs());
-        BoxedEcdsaPublicKey {
-            curve: self.curve,
-            x,
-            y,
-        }
+        derive_public_key(self.curve, &self.d)
     }
 
     /// The ECDH shared secret with `peer`: the affine x-coordinate of
@@ -1031,6 +1399,15 @@ impl BoxedEcdhPrivateKey {
         if peer.curve != self.curve {
             return Err(Error::InvalidInput);
         }
+        match self.curve {
+            CurveId::P256 => fixed::p256_diffie_hellman(&self.d, &peer.x, &peer.y),
+            CurveId::Secp256k1 => fixed::k256_diffie_hellman(&self.d, &peer.x, &peer.y),
+            _ => self.diffie_hellman_generic(peer),
+        }
+    }
+
+    /// [`diffie_hellman`](Self::diffie_hellman) on the generic arithmetic.
+    fn diffie_hellman_generic(&self, peer: &BoxedEcdsaPublicKey) -> Result<Vec<u8>, Error> {
         let c = self.curve.curve();
         let point = c.lift_affine(&peer.x, &peer.y);
         let shared = c.scalar_mul(&self.d, &point);
@@ -2078,5 +2455,148 @@ x2dqVh/sT12MnE=\n\
                 .to_bytes(CurveId::P256),
             good.to_bytes(CurveId::P256)
         );
+    }
+
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn rand_bytes(state: &mut u64, len: usize) -> Vec<u8> {
+        (0..len).map(|_| splitmix64(state) as u8).collect()
+    }
+
+    fn generic_sign<D: crate::hash::Digest>(
+        sk: &BoxedEcdsaPrivateKey,
+        h: &[u8],
+    ) -> Result<(BoxedUint, BoxedUint, bool, bool), Error> {
+        sk.sign_prehash_inner_generic::<D>(h)
+    }
+
+    /// The P-256 / secp256k1 fixed backends behind the runtime-curve API must
+    /// be indistinguishable from the generic arithmetic they replace: the same
+    /// public keys, byte-identical RFC 6979 signatures (raw and low-S +
+    /// recovery id), the same verify verdicts on valid, malleated and
+    /// corrupted signatures, the same recovered keys / errors for every
+    /// recovery id, and the same ECDH secrets. Edge scalars plus a
+    /// deterministic random sweep.
+    #[test]
+    fn fixed_backends_match_generic() {
+        use crate::hash::{Digest, Sha256, Sha512};
+        let one = BoxedUint::from_u64(1);
+        for curve in [CurveId::P256, CurveId::Secp256k1] {
+            let n = curve.curve().order().clone();
+            let mut st = 0x5eed_0000 ^ curve as u64;
+            let mut scalars = vec![
+                one.clone(),
+                BoxedUint::from_u64(2),
+                n.sub(&one),
+                n.sub(&BoxedUint::from_u64(2)),
+                n.shr_bits(1),
+            ];
+            while scalars.len() < 8 {
+                let v = BoxedUint::from_be_bytes(&rand_bytes(&mut st, 32)).reduce(&n);
+                if !v.is_zero() {
+                    scalars.push(v);
+                }
+            }
+            let peer = BoxedEcdhPrivateKey::from_bytes(curve, &rand_bytes(&mut st, 32))
+                .unwrap()
+                .public_key();
+            for d in &scalars {
+                let sk = BoxedEcdsaPrivateKey::from_bytes(curve, &d.to_be_bytes(32)).unwrap();
+                let pk = sk.public_key();
+                let pk_generic = derive_public_key_generic(curve, &sk.d);
+                assert_eq!(pk.to_sec1(), pk_generic.to_sec1(), "{curve:?} public key");
+
+                let dh = BoxedEcdhPrivateKey::from(sk.clone());
+                assert_eq!(
+                    dh.diffie_hellman(&peer).unwrap(),
+                    dh.diffie_hellman_generic(&peer).unwrap(),
+                    "{curve:?} ECDH"
+                );
+
+                for len in [0usize, 20, 33, 64] {
+                    let h = rand_bytes(&mut st, len);
+                    // Raw signature, two nonce hashes.
+                    let raw = generic_sign::<Sha256>(&sk, &h);
+                    let sig = sk.sign_prehash::<Sha256>(&h);
+                    assert_eq!(
+                        sig.clone().map(|s| (s.r, s.s)),
+                        raw.clone().map(|(r, s, _, _)| (r, s)),
+                        "{curve:?} sign len {len}"
+                    );
+                    let raw512 = generic_sign::<Sha512>(&sk, &h).map(|(r, s, _, _)| (r, s));
+                    let sig512 = sk.sign_prehash::<Sha512>(&h).map(|s| (s.r, s.s));
+                    assert_eq!(sig512, raw512, "{curve:?} sign/SHA-512 len {len}");
+                    // Low-S + recovery id.
+                    let rec = sk.sign_prehash_recoverable::<Sha256>(&h).unwrap();
+                    let rec_generic = low_s_with_recid(curve, raw.unwrap());
+                    assert_eq!(rec, rec_generic, "{curve:?} recoverable len {len}");
+
+                    // Verification verdicts.
+                    let sig = sig.unwrap();
+                    let neg_s = BoxedEcdsaSignature::from_components(sig.r.clone(), n.sub(&sig.s));
+                    let other_h = Sha256::digest(&h);
+                    let mut cases = vec![
+                        (sig.clone(), h.clone()),
+                        (neg_s.clone(), h.clone()),
+                        (sig.clone(), other_h.as_ref().to_vec()),
+                    ];
+                    for (r, s) in [
+                        (sig.r.add(&one), sig.s.clone()),
+                        (sig.r.clone(), sig.s.add(&one)),
+                        (BoxedUint::zero(4), sig.s.clone()),
+                        (sig.r.clone(), BoxedUint::zero(4)),
+                        (n.clone(), sig.s.clone()),
+                        (sig.r.clone(), n.clone()),
+                        (n.sub(&one), sig.s.clone()),
+                        (sig.r.add(&n), sig.s.clone()),
+                    ] {
+                        cases.push((BoxedEcdsaSignature::from_components(r, s), h.clone()));
+                    }
+                    for (i, (cand, msg)) in cases.iter().enumerate() {
+                        assert_eq!(
+                            pk.verify_prehash(msg, cand),
+                            pk.verify_prehash_generic(msg, cand),
+                            "{curve:?} verify case {i} len {len}"
+                        );
+                    }
+                    assert!(pk.verify_prehash(&h, &sig).is_ok());
+                    assert!(pk.verify_prehash(&h, &neg_s).is_ok());
+
+                    // Recovery, every recid, on the signature and a malleated one.
+                    for cand in [&rec.0, &neg_s] {
+                        for recid in 0..5u8 {
+                            let fast = cand.recover_prehash_impl(curve, &h, recid, true);
+                            let slow = cand.recover_prehash_impl(curve, &h, recid, false);
+                            assert_eq!(
+                                fast.map(|k| k.to_sec1()),
+                                slow.map(|k| k.to_sec1()),
+                                "{curve:?} recover recid {recid} len {len}"
+                            );
+                        }
+                    }
+                }
+            }
+            // Small r values exercise the `recid & 2` (R.x = r + n) branch,
+            // whose acceptance hinges on r + n < p.
+            for r in 1..6u64 {
+                let s = BoxedUint::from_be_bytes(&rand_bytes(&mut st, 32)).reduce(&n);
+                let sig = BoxedEcdsaSignature::from_components(BoxedUint::from_u64(r), s);
+                for recid in 0..4u8 {
+                    let fast = sig.recover_prehash_impl(curve, b"h", recid, true);
+                    let slow = sig.recover_prehash_impl(curve, b"h", recid, false);
+                    assert_eq!(
+                        fast.map(|k| k.to_sec1()),
+                        slow.map(|k| k.to_sec1()),
+                        "{curve:?} recover r={r} recid {recid}"
+                    );
+                }
+            }
+        }
     }
 }
