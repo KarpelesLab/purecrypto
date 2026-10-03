@@ -71,6 +71,7 @@ use params::{MAX_N, MAX_WOTS_LEN, Params};
 pub use params::{XmssMtParamSet, XmssParamSet};
 
 use crate::ct::ConstantTimeEq;
+use crate::hash::Sha256;
 #[cfg(feature = "alloc")]
 use crate::rng::{CryptoRng, RngCore};
 
@@ -566,24 +567,27 @@ fn wots_pk_from_sig(
 
 /// `RAND_HASH(left, right, PUB_SEED, ADRS)` = `H(KEY, (L⊕BM0)‖(R⊕BM1))` with
 /// KEY/BM0/BM1 derived from `PUB_SEED` and the address via PRF.
+///
+/// `base` is `hash::prf_base(p, pub_seed)`, built once by the caller per tree
+/// walk: rebuilding it here cost one extra compression in seven.
 fn rand_hash(
     p: &Params,
     left: &[u8],
     right: &[u8],
     pub_seed: &[u8],
+    base: &Option<Sha256>,
     addr: &mut Adrs,
     out: &mut [u8],
 ) {
     let n = p.n;
     let mut key = [0u8; MAX_N];
     let mut bm = [0u8; 2 * MAX_N];
-    let base = hash::prf_base(p, pub_seed);
     addr.set_key_and_mask(0);
-    hash::prf_with(p, &base, pub_seed, &addr.to_bytes(), &mut key);
+    hash::prf_with(p, base, pub_seed, &addr.to_bytes(), &mut key);
     addr.set_key_and_mask(1);
-    hash::prf_with(p, &base, pub_seed, &addr.to_bytes(), &mut bm[..n]);
+    hash::prf_with(p, base, pub_seed, &addr.to_bytes(), &mut bm[..n]);
     addr.set_key_and_mask(2);
-    hash::prf_with(p, &base, pub_seed, &addr.to_bytes(), &mut bm[n..2 * n]);
+    hash::prf_with(p, base, pub_seed, &addr.to_bytes(), &mut bm[n..2 * n]);
 
     let mut masked = [0u8; 2 * MAX_N];
     for i in 0..n {
@@ -595,7 +599,14 @@ fn rand_hash(
 
 /// L-tree (RFC 8391 §4.1.5): compresses a WOTS+ public key to a single leaf.
 /// Operates in place over `wots_pk` (which it consumes).
-fn l_tree(p: &Params, wots_pk: &mut [u8], pub_seed: &[u8], addr: &mut Adrs, leaf: &mut [u8]) {
+fn l_tree(
+    p: &Params,
+    wots_pk: &mut [u8],
+    pub_seed: &[u8],
+    base: &Option<Sha256>,
+    addr: &mut Adrs,
+    leaf: &mut [u8],
+) {
     let n = p.n;
     let mut l = p.wots_len;
     let mut height = 0u32;
@@ -609,7 +620,7 @@ fn l_tree(p: &Params, wots_pk: &mut [u8], pub_seed: &[u8], addr: &mut Adrs, leaf
             let mut right = [0u8; MAX_N];
             left[..n].copy_from_slice(&wots_pk[2 * i * n..2 * i * n + n]);
             right[..n].copy_from_slice(&wots_pk[(2 * i + 1) * n..(2 * i + 1) * n + n]);
-            rand_hash(p, &left[..n], &right[..n], pub_seed, addr, &mut node);
+            rand_hash(p, &left[..n], &right[..n], pub_seed, base, addr, &mut node);
             wots_pk[i * n..i * n + n].copy_from_slice(&node[..n]);
         }
         if l & 1 == 1 {
@@ -632,6 +643,7 @@ fn gen_leaf(
     p: &Params,
     sk_seed: &[u8],
     pub_seed: &[u8],
+    base: &Option<Sha256>,
     ltree_addr: &mut Adrs,
     ots_addr: &mut Adrs,
     leaf: &mut [u8],
@@ -641,7 +653,7 @@ fn gen_leaf(
     let mut pk = [0u8; MAX_WOTS_LEN * MAX_N];
     let pk = &mut pk[..p.wots_sig_bytes()];
     wots_pkgen(p, sk_seed, pub_seed, ots_addr, pk);
-    l_tree(p, pk, pub_seed, ltree_addr, leaf);
+    l_tree(p, pk, pub_seed, base, ltree_addr, leaf);
 }
 
 #[cfg(feature = "alloc")]
@@ -670,6 +682,7 @@ fn build_subtree(p: &Params, sk_seed: &[u8], pub_seed: &[u8], subtree_addr: &Adr
     ots_addr.set_type(AdrsType::Ots);
     ltree_addr.set_type(AdrsType::Ltree);
     node_addr.set_type(AdrsType::HashTree);
+    let base = hash::prf_base(p, pub_seed);
 
     // Level 0: the 2^h WOTS+ leaves.
     let leaf_count = 1usize << th;
@@ -681,6 +694,7 @@ fn build_subtree(p: &Params, sk_seed: &[u8], pub_seed: &[u8], subtree_addr: &Adr
             p,
             sk_seed,
             pub_seed,
+            &base,
             &mut ltree_addr,
             &mut ots_addr,
             &mut leaves[idx * n..idx * n + n],
@@ -705,6 +719,7 @@ fn build_subtree(p: &Params, sk_seed: &[u8], pub_seed: &[u8], subtree_addr: &Adr
                 &child[2 * i * n..2 * i * n + n],
                 &child[(2 * i + 1) * n..(2 * i + 1) * n + n],
                 pub_seed,
+                &base,
                 &mut node_addr,
                 &mut parent,
             );
@@ -790,6 +805,7 @@ fn root_from_sig(
     leaf: &[u8],
     auth_path: &[u8],
     pub_seed: &[u8],
+    base: &Option<Sha256>,
     node_addr: &mut Adrs,
     root: &mut [u8],
 ) {
@@ -814,7 +830,15 @@ fn root_from_sig(
         let mut right = [0u8; MAX_N];
         left[..n].copy_from_slice(&buffer[..n]);
         right[..n].copy_from_slice(&buffer[n..2 * n]);
-        rand_hash(p, &left[..n], &right[..n], pub_seed, node_addr, &mut out);
+        rand_hash(
+            p,
+            &left[..n],
+            &right[..n],
+            pub_seed,
+            base,
+            node_addr,
+            &mut out,
+        );
         if leaf_idx & 1 == 1 {
             buffer[n..2 * n].copy_from_slice(&out[..n]);
             buffer[..n].copy_from_slice(&ap[..n]);
@@ -831,7 +855,7 @@ fn root_from_sig(
     let mut right = [0u8; MAX_N];
     left[..n].copy_from_slice(&buffer[..n]);
     right[..n].copy_from_slice(&buffer[n..2 * n]);
-    rand_hash(p, &left[..n], &right[..n], pub_seed, node_addr, root);
+    rand_hash(p, &left[..n], &right[..n], pub_seed, base, node_addr, root);
 }
 
 // ---------------------------------------------------------------------------
@@ -989,6 +1013,7 @@ fn core_verify(p: &Params, pub_root: &[u8], pub_seed: &[u8], sig: &[u8], msg: &[
     ots_addr.set_type(AdrsType::Ots);
     ltree_addr.set_type(AdrsType::Ltree);
     node_addr.set_type(AdrsType::HashTree);
+    let base = hash::prf_base(p, pub_seed);
 
     for layer in 0..p.d {
         let idx_leaf = (cur_idx & leaf_mask) as u32;
@@ -1019,7 +1044,7 @@ fn core_verify(p: &Params, pub_root: &[u8], pub_seed: &[u8], sig: &[u8], msg: &[
 
         ltree_addr.set_ltree(idx_leaf);
         let mut leaf = [0u8; MAX_N];
-        l_tree(p, wots_pk, pub_seed, &mut ltree_addr, &mut leaf);
+        l_tree(p, wots_pk, pub_seed, &base, &mut ltree_addr, &mut leaf);
 
         let auth_path = &sig[off..off + p.tree_height as usize * n];
         off += p.tree_height as usize * n;
@@ -1030,6 +1055,7 @@ fn core_verify(p: &Params, pub_root: &[u8], pub_seed: &[u8], sig: &[u8], msg: &[
             &leaf[..n],
             auth_path,
             pub_seed,
+            &base,
             &mut node_addr,
             &mut new_root,
         );
