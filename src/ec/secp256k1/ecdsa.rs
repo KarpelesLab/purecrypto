@@ -198,6 +198,12 @@ impl Secp256k1EcdsaPrivateKey {
         let r_point = ProjectivePoint::mul_generator(&k)
             .to_affine()
             .ok_or(Error::InvalidInput)?;
+        // Declassified (Valgrind harness): R = k·G is public — any verifier
+        // recomputes it as u1·G + u2·Q from the signature and the key — so
+        // its coordinates, and with them the recovery-id bits derived below
+        // (x overflow, y parity), are published information.
+        crate::ct::declassify_val(r_point.x.as_limbs());
+        crate::ct::declassify_val(r_point.y.as_limbs());
         // r = R.x mod n. R.x is a base-field residue (< p); reducing mod n
         // only ever subtracts n once, since p < 2n.
         let full_x = r_point.x;
@@ -217,7 +223,10 @@ impl Secp256k1EcdsaPrivateKey {
         let k_inv = k.invert();
         let z_rd = z.add(&Scalar(r).mul(&self.d));
         let s = k_inv.mul(&z_rd);
-        // Likewise `s`: published, or the public `s = 0` error.
+        // Likewise `s`: published (so the recoverable path's low-S test may
+        // branch on it), or the public `s = 0` error.
+        // Declassified (Valgrind harness): `s` is the returned signature half.
+        crate::ct::declassify_val(s.0.as_limbs());
         if s.is_zero().declassify() {
             return Err(Error::InvalidInput);
         }

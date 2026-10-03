@@ -758,6 +758,18 @@ fn secp256k1_ecdsa_sign() -> String {
     format!("pk={} sig={}", hex8(public(&pk)), hex8(public(&sig)))
 }
 
+/// Recoverable secp256k1 signing: the low-S normalisation and the recovery
+/// id branch only on the published `s` and `R`.
+fn secp256k1_ecdsa_sign_recoverable() -> String {
+    let sk =
+        Secp256k1EcdsaPrivateKey::from_bytes(&secret_bytes::<32>(41)).expect("scalar in range");
+    let (sig, recid) = sk
+        .sign_recoverable::<Sha256>(b"ct_valgrind message")
+        .unwrap();
+    let sig = sig.to_bytes();
+    format!("sig={} recid={}", hex8(public(&sig)), public(&[recid])[0])
+}
+
 // ---------------------------------------------------------------------------
 // RSA
 // ---------------------------------------------------------------------------
@@ -2285,6 +2297,10 @@ const CASES: &[Case] = &[
     ("p256_ecdh", p256_ecdh),
     ("p256_keygen", p256_keygen),
     ("secp256k1_ecdsa_sign", secp256k1_ecdsa_sign),
+    (
+        "secp256k1_ecdsa_sign_recoverable",
+        secp256k1_ecdsa_sign_recoverable,
+    ),
     ("p384_ecdsa_sign", p384_ecdsa_sign),
     ("p384_ecdh", p384_ecdh),
     ("sm2_sign", sm2_sign),
