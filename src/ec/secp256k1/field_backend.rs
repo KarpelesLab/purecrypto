@@ -104,6 +104,12 @@ pub(crate) trait FieldBackend {
     fn square(&self, a: &Fe) -> Fe {
         self.mul(a, a)
     }
+    /// Returns `(a * k) mod p` for a small constant `k` (the curve's
+    /// `b3 = 21`).
+    #[inline]
+    fn mul_small(&self, a: &Fe, k: u32) -> Fe {
+        self.mul(a, &Fe::from_u64(u64::from(k)))
+    }
     /// Returns `(-a) mod p`.
     fn negate(&self, a: &Fe) -> Fe;
     /// Returns the modular inverse `a^-1 mod p` (constant time, Fermat). The
@@ -446,6 +452,27 @@ impl FieldBackend for Secp256k1Field {
         Fe::from_limbs(reduce512(square_wide(a.as_limbs())))
     }
     #[inline]
+    fn mul_small(&self, a: &Fe, k: u32) -> Fe {
+        // a·k < 2²⁸⁸: four limb products leave a carry h < 2³². Folding h·c
+        // (< 2⁶⁵) carries at most one bit, after which the wrapped value is
+        // < 2⁶⁵ and folding that bit cannot carry again — the same argument
+        // as `reduce512`, from a much smaller excess.
+        let a = a.as_limbs();
+        let mut r = [0u64; 4];
+        let mut carry: u128 = 0;
+        let mut i = 0;
+        while i < 4 {
+            let acc = (a[i] as u128) * (k as u128) + carry;
+            r[i] = acc as u64;
+            carry = acc >> 64;
+            i += 1;
+        }
+        let (r, c1) = fold_carry(r, carry as u64);
+        let (r, c2) = fold_carry(r, c1);
+        debug_assert_eq!(c2, 0);
+        Fe::from_limbs(canonicalize(r, c2))
+    }
+    #[inline]
     fn negate(&self, a: &Fe) -> Fe {
         let a = a.as_limbs();
         // p - a, then select 0 when a == 0 (since p - 0 == p is non-canonical).
@@ -632,6 +659,15 @@ mod backend_tests {
     }
 
     fn check_pair(g: &GenericMont, n: &Secp256k1Field, a: &Fe, b: &Fe) {
+        // `mul_small` against a full multiplication, with `k` taken from the
+        // low 32 bits of `b` (so the edge cases reach k = 0 and 2³² − 1).
+        let k = b.as_limbs()[0] as u32;
+        assert_eq!(
+            bytes(&g.mul(a, &Fe::from_u64(u64::from(k)))),
+            bytes(&n.mul_small(a, k)),
+            "mul_small mismatch: a={:x?} k={k}",
+            a.as_limbs()
+        );
         assert_eq!(
             bytes(&g.add(a, b)),
             bytes(&n.add(a, b)),

@@ -14,7 +14,7 @@ use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use crate::zeroize::Zeroize;
 
 /// The curve constant `b3 = 3·b = 21` for `b = 7`.
-const B3: u64 = 21;
+const B3: u32 = 21;
 
 /// A point in projective coordinates `(X : Y : Z)`. The identity is
 /// `(0 : 1 : 0)`. Field coordinates are plain residues in `[0, p)`.
@@ -77,8 +77,6 @@ impl Point {
     /// Complete projective addition `p + q` for `a = 0` (RCB Algorithm 7).
     /// Correct for all inputs, including `p == q` and the identity.
     pub(crate) fn add<F: FieldBackend>(f: &F, p: &Point, q: &Point) -> Point {
-        let b3 = Fe::from_u64(B3);
-
         let mut t0 = f.mul(&p.x, &q.x);
         let mut t1 = f.mul(&p.y, &q.y);
         let mut t2 = f.mul(&p.z, &q.z);
@@ -99,10 +97,10 @@ impl Point {
         y3 = f.sub(&x3, &y3);
         x3 = f.add(&t0, &t0);
         t0 = f.add(&x3, &t0);
-        t2 = f.mul(&b3, &t2);
+        t2 = f.mul_small(&t2, B3);
         let mut z3 = f.add(&t1, &t2);
         t1 = f.sub(&t1, &t2);
-        y3 = f.mul(&b3, &y3);
+        y3 = f.mul_small(&y3, B3);
         x3 = f.mul(&t4, &y3);
         t2 = f.mul(&t3, &t1);
         x3 = f.sub(&t2, &x3);
@@ -122,15 +120,13 @@ impl Point {
 
     /// Complete projective doubling `2·p` for `a = 0` (RCB Algorithm 9).
     pub(crate) fn double<F: FieldBackend>(f: &F, p: &Point) -> Point {
-        let b3 = Fe::from_u64(B3);
-
         let mut t0 = f.square(&p.y);
         let mut z3 = f.add(&t0, &t0);
         z3 = f.add(&z3, &z3);
         z3 = f.add(&z3, &z3);
         let mut t1 = f.mul(&p.y, &p.z);
         let mut t2 = f.square(&p.z);
-        t2 = f.mul(&b3, &t2);
+        t2 = f.mul_small(&t2, B3);
         let mut x3 = f.mul(&t2, &z3);
         let mut y3 = f.add(&t0, &t2);
         z3 = f.mul(&t1, &z3);
