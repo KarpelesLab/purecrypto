@@ -57,6 +57,34 @@ const fn fe_from_hex(hex: &str) -> Fe {
 /// The Curve448 field context, built at compile time.
 static FP: MontModulus<7> = MontModulus::new(fe_from_hex(P448_HEX));
 
+/// `A24 · x mod p` for a residue `x < p`, without a Montgomery multiply.
+///
+/// Multiplying by a small integer commutes with the Montgomery scaling
+/// (`A24 · xR = (A24·x)·R`), so a Montgomery-form input needs no `R`
+/// correction: a 7×1-limb product plus a fold of the 16-bit overflow `h`
+/// through `2⁴⁴⁸ ≡ 2²²⁴ + 1 (mod p)` replaces the full 7×7-limb
+/// `mont_mul`. A second fold absorbs the at most one-bit carry of the first
+/// (it cannot carry again: after an overflow the low 448 bits are below
+/// `2²⁴¹`), leaving a value `< 2⁴⁴⁸ < 2p` that one masked subtraction of `p`
+/// makes canonical. Straight-line and branch-free: constant time in `x`.
+#[inline]
+fn mul_a24(x: &Fe) -> Fe {
+    let l = x.as_limbs();
+    let mut r = [0u64; 7];
+    let mut carry = 0u64;
+    for (ri, &li) in r.iter_mut().zip(l.iter()) {
+        let t = (li as u128) * (A24 as u128) + carry as u128;
+        *ri = t as u64;
+        carry = (t >> 64) as u64;
+    }
+    let fold = |h: u64| Fe::from_limbs([h, 0, 0, h << 32, 0, 0, 0]);
+    let (r, c) = Fe::from_limbs(r).adc(&fold(carry), 0);
+    let (r, _) = r.adc(&fold(c), 0);
+    let (d, borrow) = r.sbb(FP.modulus(), 0);
+    // borrow = 1 iff r < p, in which case r is already canonical.
+    Fe::conditional_select(&r, &d, Choice::from(borrow as u8))
+}
+
 /// Computes the raw X448 function: `scalar * point` on Curve448, returning the
 /// resulting u-coordinate (little-endian, 56 bytes).
 ///
@@ -85,7 +113,6 @@ pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
     let mut z2 = Fe::ZERO;
     let mut x3 = x1;
     let mut z3 = one;
-    let a24 = fp.to_mont(&Fe::from_u64(A24));
 
     let mul = |a: &Fe, b: &Fe| fp.mont_mul(a, b);
     let sq = |a: &Fe| fp.mont_sqr(a);
@@ -119,7 +146,7 @@ pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
         let t1sq = sq(&t1);
         z3 = mul(&x1, &t1sq);
         x2 = mul(&aa, &bb);
-        let t2 = add(&aa, &mul(&a24, &e));
+        let t2 = add(&aa, &mul_a24(&e));
         z2 = mul(&e, &t2);
     }
     let sw = Choice::from(swap);
@@ -319,6 +346,49 @@ mod tests {
 
     fn hex56(s: &str) -> [u8; 56] {
         from_hex::<56>(s)
+    }
+
+    /// The small-constant multiply matches a Montgomery multiplication by
+    /// `A24·R` on edge residues (0, 1, p−1, p−A24, one that exercises the
+    /// second fold, 2²²⁴) and a splitmix sweep.
+    #[test]
+    fn mul_a24_matches_mont_mul() {
+        let p = *FP.modulus();
+        let a24 = FP.to_mont(&Fe::from_u64(A24));
+        let mut st = 0x448_a24_u64;
+        let mut next = || {
+            st = st.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = st;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let mut cases = [Fe::ZERO; 70];
+        cases[1] = Fe::ONE;
+        cases[2] = p.wrapping_sub(&Fe::ONE);
+        cases[3] = p.wrapping_sub(&Fe::from_u64(39081));
+        // floor((39080·2⁴⁴⁸ − 1)/A24): the product's low 448 bits sit just
+        // under 2⁴⁴⁸, so the first fold carries and the second one runs.
+        cases[4] = Fe::from_limbs([
+            3221017414062945682,
+            12130736744053004696,
+            12272340674917436,
+            15076098506033189494,
+            2714075341568279260,
+            2371393828876353914,
+            18446272060606670176,
+        ]);
+        cases[5] = Fe::from_limbs([0, 0, 0, 1 << 32, 0, 0, 0]);
+        for c in cases[6..].iter_mut() {
+            let mut l = [0u64; 7];
+            for x in l.iter_mut() {
+                *x = next();
+            }
+            *c = Fe::from_limbs(l).reduce(&p);
+        }
+        for x in cases {
+            assert_eq!(mul_a24(&x), FP.mont_mul(&x, &a24), "x = {x:?}");
+        }
     }
 
     #[cfg(all(feature = "der", feature = "alloc"))]
