@@ -497,9 +497,30 @@ fn ct_extract_mac(buf: &[u8], content_len: usize, mac_len: usize) -> Vec<u8> {
 }
 
 /// One direction's TLS 1.0/1.1 CBC record protection (MAC-then-encrypt).
+/// The record HMAC keyed once: each record's MAC clones this state rather
+/// than re-hashing the `ipad` / `opad` key blocks. (A fixed cost per record,
+/// independent of the content, so the Lucky13 equaliser's accounting of
+/// content-dependent compressions is unaffected.) Wipes itself on drop.
+#[derive(Clone)]
+enum KeyedMac {
+    Sha1(Hmac<Sha1>),
+    Sha256(Hmac<Sha256>),
+}
+
+impl KeyedMac {
+    fn new(alg: CbcMacAlg, key: &[u8]) -> Self {
+        match alg {
+            CbcMacAlg::Sha1 => KeyedMac::Sha1(Hmac::new(key)),
+            CbcMacAlg::Sha256 => KeyedMac::Sha256(Hmac::new(key)),
+        }
+    }
+}
+
 pub(crate) struct CbcRecordCrypter {
     cipher: Cipher,
     mac_key: Vec<u8>,
+    /// HMAC keyed with `mac_key` (unused in SSL 3.0 mode).
+    keyed_mac: KeyedMac,
     mac: CbcMacAlg,
     block_size: usize,
     /// TLS 1.1+ prepends a fresh random explicit IV; TLS 1.0 chains.
@@ -526,6 +547,8 @@ impl Zeroize for CbcRecordCrypter {
     fn zeroize(&mut self) {
         self.mac_key.zeroize();
         self.chain.zeroize();
+        // Replacing the keyed state drops (and so wipes) the old one.
+        self.keyed_mac = KeyedMac::new(self.mac, &[]);
     }
 }
 
@@ -567,6 +590,7 @@ impl CbcRecordCrypter {
         CbcRecordCrypter {
             cipher,
             mac_key: mac_key.to_vec(),
+            keyed_mac: KeyedMac::new(mac_alg, mac_key),
             mac: mac_alg,
             block_size: cipher_alg.block_size(),
             explicit_iv,
@@ -617,19 +641,9 @@ impl CbcRecordCrypter {
         header[8] = ct.as_u8();
         header[9..11].copy_from_slice(&version.as_u16().to_be_bytes());
         header[11..13].copy_from_slice(&(content.len() as u16).to_be_bytes());
-        match self.mac {
-            CbcMacAlg::Sha1 => Hmac::<Sha1>::new(&self.mac_key)
-                .chain(&header)
-                .chain(content)
-                .finalize()
-                .as_ref()
-                .to_vec(),
-            CbcMacAlg::Sha256 => Hmac::<Sha256>::new(&self.mac_key)
-                .chain(&header)
-                .chain(content)
-                .finalize()
-                .as_ref()
-                .to_vec(),
+        match self.keyed_mac.clone() {
+            KeyedMac::Sha1(h) => h.chain(&header).chain(content).finalize().as_ref().to_vec(),
+            KeyedMac::Sha256(h) => h.chain(&header).chain(content).finalize().as_ref().to_vec(),
         }
     }
 
