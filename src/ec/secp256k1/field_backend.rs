@@ -214,8 +214,8 @@ const P_LIMBS: [u64; 4] = [
 /// `[0, p)` form — the exact in-memory layout of [`Fe`], so the trait-boundary
 /// conversions are pure reinterpretations. Multiplication uses a schoolbook
 /// 256×256→512 product folded back through `2²⁵⁶ ≡ c`; the carry is folded a
-/// fixed number of times (no data-dependent loop counts), then a fixed number
-/// of mask-based conditional subtractions of `p` restore canonical form. All
+/// fixed number of times (no data-dependent loop counts), then one mask-based
+/// conditional subtraction of `p` restores canonical form. All
 /// operations are constant time in the element values; only the public prime
 /// and (public) Fermat / square-root exponents drive any branching.
 pub(crate) struct Secp256k1Field;
@@ -249,30 +249,6 @@ fn fold_carry(mut r: [u64; 4], carry: u64) -> ([u64; 4], u64) {
     (r, acc as u64)
 }
 
-/// Computes `r - P` over four limbs plus an incoming high carry bit `hi`
-/// (so the operand is `hi·2²⁵⁶ + r`), returning the difference limbs and a
-/// `0/0xFFFF…FF` mask that is all-ones iff `hi·2²⁵⁶ + r >= P` (i.e. the
-/// subtraction did not underflow).
-#[inline]
-fn sub_p_mask(r: &[u64; 4], hi: u64) -> ([u64; 4], u64) {
-    let mut out = [0u64; 4];
-    let mut borrow: u128 = 0;
-    let mut i = 0;
-    while i < 4 {
-        // r[i] - P_LIMBS[i] - borrow, in two's-complement over 128 bits.
-        let tmp = (r[i] as u128).wrapping_sub(P_LIMBS[i] as u128 + borrow);
-        out[i] = tmp as u64;
-        borrow = (tmp >> 64) & 1;
-        i += 1;
-    }
-    // The value is >= P iff there is a high carry bit, or no final borrow.
-    // Both conditions are formed arithmetically (no `!=`/`==` bools for
-    // LLVM to lower to a branch): `hi | -hi` has its top bit set iff `hi != 0`.
-    let hi_nonzero = (hi | hi.wrapping_neg()) >> 63;
-    let ge = hi_nonzero | ((borrow as u64) ^ 1);
-    (out, mask_from_bit(ge))
-}
-
 /// Expands a secret-derived `0`/`1` limb into an all-ones / all-zeros mask
 /// without a branch: `wrapping_neg`, behind a `black_box` barrier so LLVM
 /// cannot turn the mask back into a conditional jump. Takes the bit as a
@@ -295,26 +271,19 @@ fn select(a: &[u64; 4], b: &[u64; 4], mask: u64) -> [u64; 4] {
     out
 }
 
-/// Reduces `(r, hi)` — a value `hi·2²⁵⁶ + r` with `hi <= 1` and `r < 2²⁵⁶` —
-/// into canonical `[0, p)` form via mask-based conditional subtractions of `p`.
+/// Canonicalises `hi·2²⁵⁶ + r` into `[0, p)`, given that the value is `< 2p`
+/// (`hi <= 1`).
 ///
-/// Two subtractions are applied. One always suffices once the carry has been
-/// fully folded (a fully-folded value is `< 2²⁵⁶ = p + c < 2p`, so a single
-/// `−p` lands in `[0, p)`); the second is a harmless constant-time safety
-/// margin. Both run unconditionally and select via a mask, so there is no
-/// secret-dependent branch.
+/// One masked correction suffices: the value is `>= p` iff adding
+/// `c = 2²⁵⁶ − p` carries past `2²⁵⁶` (or `hi` is already set), and in that
+/// case the low 256 bits of `r + c` are exactly `value − p`. (With `hi = 1`
+/// the value is `< 2p`, so `r + c < p` and the addition itself cannot carry.)
+/// The add runs unconditionally and the result is picked by a mask, so there
+/// is no secret-dependent branch.
 #[inline]
-fn reduce_once(mut r: [u64; 4], mut hi: u64) -> [u64; 4] {
-    let mut k = 0;
-    while k < 2 {
-        let (diff, mask) = sub_p_mask(&r, hi);
-        r = select(&r, &diff, mask);
-        // After a subtraction the high bit is cleared (we only subtract when
-        // the value was >= P, which removes any 2²⁵⁶ contribution).
-        hi = 0;
-        k += 1;
-    }
-    r
+fn canonicalize(r: [u64; 4], hi: u64) -> [u64; 4] {
+    let (w, carry) = fold_carry(r, 1);
+    select(&r, &w, mask_from_bit(hi | carry))
 }
 
 /// Folds a 512-bit product (eight little-endian limbs) down to canonical
@@ -335,16 +304,14 @@ fn reduce512(t: [u64; 8]) -> [u64; 4] {
     }
     let d = carry as u64; // < 2³⁴
 
-    // Fold the carry a fixed three times. The first fold reduces d (< 2³⁴) and
-    // leaves a 0/1 carry; the next two are provably enough to drive the carry
-    // to zero (each fold of a 0/1 carry can produce at most one more 0/1
-    // carry, and that chain terminates within two steps). The schedule is
-    // fixed — no data-dependent iteration count.
+    // Fold d·c (< 2⁶⁷) back in; it can carry out at most one bit, c1. When
+    // it does, the wrapped low part is < d·c < 2⁶⁷, so folding c1·c (< 2³⁴)
+    // a second time cannot carry again: two folds always leave a value
+    // < 2²⁵⁶ < 2p, which `canonicalize` finishes. The schedule is fixed.
     let (r, c1) = fold_carry(r, d);
     let (r, c2) = fold_carry(r, c1);
-    let (r, c3) = fold_carry(r, c2);
-    // c3 is provably 0; carry it into the final reduction anyway for uniformity.
-    reduce_once(r, c3)
+    debug_assert_eq!(c2, 0);
+    canonicalize(r, c2)
 }
 
 /// Schoolbook 256×256→512 multiply of two little-endian 4-limb operands.
@@ -362,6 +329,48 @@ fn mul_wide(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
             j += 1;
         }
         t[i + 4] = carry as u64;
+        i += 1;
+    }
+    t
+}
+
+/// 256-bit → 512-bit squaring: the six distinct cross products `aᵢ·aⱼ`
+/// (`i < j`) are summed once and doubled by a one-bit shift, then the four
+/// diagonal squares are added — 10 limb products instead of `mul_wide`'s 16.
+#[inline]
+fn square_wide(a: &[u64; 4]) -> [u64; 8] {
+    // Cross products into t[1..7].
+    let mut t = [0u64; 8];
+    let mut i = 0;
+    while i < 3 {
+        let mut carry: u128 = 0;
+        let mut j = i + 1;
+        while j < 4 {
+            let acc = (t[i + j] as u128) + (a[i] as u128) * (a[j] as u128) + carry;
+            t[i + j] = acc as u64;
+            carry = acc >> 64;
+            j += 1;
+        }
+        t[i + 4] = carry as u64;
+        i += 1;
+    }
+    // Double: the cross sum is < 2⁵¹¹, so the shift loses nothing.
+    let mut k = 7;
+    while k > 0 {
+        t[k] = (t[k] << 1) | (t[k - 1] >> 63);
+        k -= 1;
+    }
+    t[0] <<= 1;
+    // Add the diagonal squares aᵢ² at t[2i..2i+2].
+    let mut carry: u128 = 0;
+    let mut i = 0;
+    while i < 4 {
+        let sq = (a[i] as u128) * (a[i] as u128);
+        let lo = (t[2 * i] as u128) + (sq as u64 as u128) + carry;
+        t[2 * i] = lo as u64;
+        let hi = (t[2 * i + 1] as u128) + (sq >> 64) + (lo >> 64);
+        t[2 * i + 1] = hi as u64;
+        carry = hi >> 64;
         i += 1;
     }
     t
@@ -397,9 +406,8 @@ impl FieldBackend for Secp256k1Field {
             carry = acc >> 64;
             i += 1;
         }
-        // Sum < 2p < 2²⁵⁷; one masked −p restores [0, p). reduce_once applies
-        // two as a constant-time margin.
-        Fe::from_limbs(reduce_once(r, carry as u64))
+        // Sum < 2p, so one masked −p restores [0, p).
+        Fe::from_limbs(canonicalize(r, carry as u64))
     }
     #[inline]
     fn sub(&self, a: &Fe, b: &Fe) -> Fe {
@@ -430,6 +438,10 @@ impl FieldBackend for Secp256k1Field {
     #[inline]
     fn mul(&self, a: &Fe, b: &Fe) -> Fe {
         Fe::from_limbs(Self::mul_limbs(a.as_limbs(), b.as_limbs()))
+    }
+    #[inline]
+    fn square(&self, a: &Fe) -> Fe {
+        Fe::from_limbs(reduce512(square_wide(a.as_limbs())))
     }
     #[inline]
     fn negate(&self, a: &Fe) -> Fe {
