@@ -150,6 +150,10 @@ pub struct Sm2PublicKey {
 #[derive(Clone)]
 pub struct Sm2PrivateKey {
     d: BoxedUint,
+    /// `PA = [dA]G`, derived once at construction: every signature hashes it
+    /// into `ZA`, and deriving it is a full scalar multiplication plus an
+    /// inversion — about half the cost of a signature.
+    pk: Sm2PublicKey,
 }
 
 /// An SM2 signature `(r, s)`, each in `[1, n-1]`.
@@ -171,17 +175,15 @@ fn za(id: &[u8], x: &BoxedUint, y: &BoxedUint) -> Result<[u8; 32], Error> {
     let c = CURVE.curve();
     // a, b in plain (non-Montgomery) form, 32-byte big-endian.
     let (a, b) = c.coefficients();
-    let (gx, gy) = c
-        .to_affine(&c.generator())
-        .expect("generator is not the identity");
+    let (gx, gy) = c.generator_affine();
 
     let mut h = Sm3::new();
     h.update(&[(bitlen >> 8) as u8, bitlen as u8]);
     h.update(id);
     h.update(&enc32(&a));
     h.update(&enc32(&b));
-    h.update(&enc32(&gx));
-    h.update(&enc32(&gy));
+    h.update(&enc32(gx));
+    h.update(&enc32(gy));
     h.update(&enc32(x));
     h.update(&enc32(y));
     Ok(h.finalize())
@@ -379,7 +381,7 @@ impl Sm2PrivateKey {
         let mut d = BoxedUint::from_be_bytes(bytes);
         let n = CURVE.curve().order().clone();
         if in_key_range(&d, &n) {
-            Ok(Sm2PrivateKey { d })
+            Ok(Self::from_scalar(d))
         } else {
             d.zeroize();
             Err(Error::InvalidInput)
@@ -391,8 +393,21 @@ impl Sm2PrivateKey {
         let n = CURVE.curve().order().clone();
         // Draw from [1, n-2]: bound the sampler by n-1.
         let n_minus_1 = n.sub(&BoxedUint::from_u64(1));
+        Self::from_scalar(random_scalar(&n_minus_1, rng))
+    }
+
+    /// Wraps an in-range scalar, deriving its public key once.
+    fn from_scalar(d: BoxedUint) -> Self {
+        let c = CURVE.curve();
+        let (x, y) = c
+            .to_affine(&c.mul_generator(&d))
+            .expect("d in [1,n-2] so d*G is not the identity");
+        // The public key is public (its encoders scan it for its width).
+        crate::ct::declassify_val(x.as_limbs());
+        crate::ct::declassify_val(y.as_limbs());
         Sm2PrivateKey {
-            d: random_scalar(&n_minus_1, rng),
+            d,
+            pk: Sm2PublicKey { x, y },
         }
     }
 
@@ -401,16 +416,9 @@ impl Sm2PrivateKey {
         enc32_secret(&self.d)
     }
 
-    /// Derives the public key `PA = [dA]G`.
+    /// The public key `PA = [dA]G`.
     pub fn public_key(&self) -> Sm2PublicKey {
-        let c = CURVE.curve();
-        let (x, y) = c
-            .to_affine(&c.mul_generator(&self.d))
-            .expect("d in [1,n-2] so d*G is not the identity");
-        // The public key is public (its encoders scan it for its width).
-        crate::ct::declassify_val(x.as_limbs());
-        crate::ct::declassify_val(y.as_limbs());
-        Sm2PublicKey { x, y }
+        self.pk.clone()
     }
 
     /// Signs `msg` under identity `id`, drawing the nonce `k` from `rng`
@@ -428,7 +436,7 @@ impl Sm2PrivateKey {
             return Err(Error::InvalidInput);
         }
         let n = CURVE.curve().order().clone();
-        let za = self.public_key().za(id)?;
+        let za = self.pk.za(id)?;
         for _ in 0..MAX_SIGN_ATTEMPTS {
             let mut k = random_scalar(&n, rng);
             let out = self.sign_digest_with_k(&za, msg, &k);
@@ -453,7 +461,7 @@ impl Sm2PrivateKey {
     /// `k` MUST be a secret, uniformly-random value in `[1, n-1]` — reusing or
     /// leaking it discloses the private key.
     pub fn sign_with_k(&self, msg: &[u8], id: &[u8], k: &BoxedUint) -> Result<Sm2Signature, Error> {
-        let za = self.public_key().za(id)?;
+        let za = self.pk.za(id)?;
         self.sign_digest_with_k(&za, msg, k).map_err(|f| match f {
             SignFailure::Retry => Error::InvalidInput,
             SignFailure::Fatal(e) => e,

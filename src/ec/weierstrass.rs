@@ -179,6 +179,11 @@ impl Curve {
         }
     }
 
+    /// The base point's affine coordinates `(gx, gy)` (plain form).
+    pub(crate) fn generator_affine(&self) -> (&BoxedUint, &BoxedUint) {
+        (&self.gx, &self.gy)
+    }
+
     /// The base point `G`.
     pub(crate) fn generator(&self) -> Point {
         self.lift_affine(&self.gx, &self.gy)
