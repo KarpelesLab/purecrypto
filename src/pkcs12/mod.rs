@@ -450,7 +450,10 @@ impl Pfx {
                 let inner = ci.read_element()?;
                 let mut ctx = Reader::new(inner);
                 let body = ctx.read_tlv(tag::context(0))?;
-                let plain = decrypt_encrypted_data(body, pw_bmp, password, budget)?;
+                // The plaintext SafeContents may hold key bags: wipe it.
+                let plain = crate::zeroize::Zeroizing::new(decrypt_encrypted_data(
+                    body, pw_bmp, password, budget,
+                )?);
                 parse_safe_contents(&plain, pw_bmp, password, &mut out, budget)?;
             } else {
                 return Err(Error::UnsupportedAlgorithm);

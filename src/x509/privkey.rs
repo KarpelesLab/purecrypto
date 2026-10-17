@@ -18,7 +18,8 @@ use crate::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 #[cfg(feature = "slhdsa")]
 use crate::slhdsa;
-use alloc::borrow::Cow;
+use crate::zeroize::Zeroizing;
+use alloc::vec::Vec;
 
 /// A private key of any algorithm this crate supports — the value returned by
 /// [`AnyPrivateKey::from_pkcs8_der`]. Mirrors [`AnyPublicKey`](super::AnyPublicKey).
@@ -150,13 +151,16 @@ impl AnyPrivateKey {
     /// undecryptable blob) yields [`Error::Malformed`]. An algorithm this crate
     /// does not support yields [`Error::UnsupportedAlgorithm`].
     pub fn from_pkcs8_der(der: &[u8], opts: Pkcs8ReadOptions) -> Result<Self, Error> {
-        let plaintext: Cow<[u8]> = if is_encrypted_pkcs8(der)? {
+        // The decrypted PrivateKeyInfo is secret: keep it in a wiped buffer
+        // for the per-type parser and let nothing of it outlive this call.
+        let decrypted: Zeroizing<Vec<u8>>;
+        let plain: &[u8] = if is_encrypted_pkcs8(der)? {
             let password = opts.password.ok_or(Error::PasswordRequired)?;
-            Cow::Owned(decrypt_pkcs8(der, password)?)
+            decrypted = decrypt_pkcs8(der, password)?;
+            &decrypted
         } else {
-            Cow::Borrowed(der)
+            der
         };
-        let plain = plaintext.as_ref();
 
         // Read the privateKeyAlgorithm OID, then hand the whole (plaintext)
         // PKCS#8 to the matching per-type parser.
@@ -232,11 +236,13 @@ impl AnyPrivateKey {
     /// `-----BEGIN PRIVATE KEY-----` and `-----BEGIN ENCRYPTED PRIVATE KEY-----`
     /// labels. See [`Self::from_pkcs8_der`].
     pub fn from_pkcs8_pem(pem: &str, opts: Pkcs8ReadOptions) -> Result<Self, Error> {
-        let der = if pem.contains("ENCRYPTED PRIVATE KEY") {
+        // A plaintext PEM decodes straight to the secret PrivateKeyInfo, so
+        // the DER buffer is wiped on drop either way.
+        let der = Zeroizing::new(if pem.contains("ENCRYPTED PRIVATE KEY") {
             pem_decode(pem, "ENCRYPTED PRIVATE KEY")?
         } else {
             pem_decode(pem, "PRIVATE KEY")?
-        };
+        });
         Self::from_pkcs8_der(&der, opts)
     }
 }
@@ -342,12 +348,14 @@ fn is_encrypted_pkcs8(der: &[u8]) -> Result<bool, Error> {
 /// Decrypts a PBES2 `EncryptedPrivateKeyInfo` to its inner PKCS#8 DER. Requires
 /// the `kdf` feature; otherwise encrypted keys are unsupported.
 #[cfg(feature = "kdf")]
-fn decrypt_pkcs8(der: &[u8], password: &[u8]) -> Result<alloc::vec::Vec<u8>, Error> {
-    crate::kdf::pbes2::decrypt(der, password).map_err(|_| Error::Malformed)
+fn decrypt_pkcs8(der: &[u8], password: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+    crate::kdf::pbes2::decrypt(der, password)
+        .map(Zeroizing::new)
+        .map_err(|_| Error::Malformed)
 }
 
 #[cfg(not(feature = "kdf"))]
-fn decrypt_pkcs8(_der: &[u8], _password: &[u8]) -> Result<alloc::vec::Vec<u8>, Error> {
+fn decrypt_pkcs8(_der: &[u8], _password: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
     Err(Error::UnsupportedAlgorithm)
 }
 
