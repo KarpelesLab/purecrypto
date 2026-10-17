@@ -79,21 +79,35 @@ pub struct HpkeKeyConfig {
     pub cipher_suites: Vec<HpkeSymCipherSuite>,
 }
 
+/// Largest `cipher_suites` list the `<4..2^16-4>` vector can carry.
+const MAX_CIPHER_SUITES: usize = (u16::MAX as usize - 4) / 4;
+
 impl HpkeKeyConfig {
+    /// Whether every field fits its wire length prefix (`public_key` and the
+    /// `cipher_suites` list under a `u16`). The fallible constructors refuse
+    /// a config that does not; the infallible encoders truncate instead.
+    pub(crate) fn fits_wire_limits(&self) -> bool {
+        self.public_key.len() <= u16::MAX as usize && self.cipher_suites.len() <= MAX_CIPHER_SUITES
+    }
+
+    /// Wire encoding. Infallible, so an oversized field is **truncated** to
+    /// what its length prefix can describe (the prefix always matches the
+    /// bytes that follow it) rather than emitted with a saturated prefix
+    /// and a longer body; [`fits_wire_limits`](Self::fits_wire_limits) says
+    /// whether that will happen.
     pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
         out.push(self.config_id);
         out.extend_from_slice(&self.kem_id.to_be_bytes());
 
         // public_key: opaque <1..2^16-1>
-        let pk_len: u16 = u16::try_from(self.public_key.len()).unwrap_or(u16::MAX);
-        out.extend_from_slice(&pk_len.to_be_bytes());
-        out.extend_from_slice(&self.public_key);
+        let pk = &self.public_key[..self.public_key.len().min(u16::MAX as usize)];
+        out.extend_from_slice(&(pk.len() as u16).to_be_bytes());
+        out.extend_from_slice(pk);
 
         // cipher_suites: HpkeSymmetricCipherSuite <4..2^16-4>, length in bytes.
-        let cs_bytes: usize = self.cipher_suites.len() * 4;
-        let cs_bytes_u16: u16 = u16::try_from(cs_bytes).unwrap_or(u16::MAX);
-        out.extend_from_slice(&cs_bytes_u16.to_be_bytes());
-        for cs in &self.cipher_suites {
+        let suites = &self.cipher_suites[..self.cipher_suites.len().min(MAX_CIPHER_SUITES)];
+        out.extend_from_slice(&((suites.len() * 4) as u16).to_be_bytes());
+        for cs in suites {
             cs.encode_into(out);
         }
     }
@@ -145,17 +159,28 @@ pub struct EchConfigContents {
 }
 
 impl EchConfigContents {
+    /// Whether every field fits its wire length prefix: `public_name` under
+    /// 255 bytes, `extensions` under a `u16`, and the key config's own
+    /// limits. See [`HpkeKeyConfig::fits_wire_limits`].
+    pub(crate) fn fits_wire_limits(&self) -> bool {
+        self.key_config.fits_wire_limits()
+            && self.public_name.len() <= 255
+            && self.extensions.len() <= u16::MAX as usize
+    }
+
+    /// Wire encoding; oversized fields are truncated to what their length
+    /// prefix can describe (see [`HpkeKeyConfig::encode_into`]).
     fn encode_into(&self, out: &mut Vec<u8>) {
         self.key_config.encode_into(out);
         out.push(self.maximum_name_length);
         // public_name<1..255>
-        let pn_len: u8 = u8::try_from(self.public_name.len()).unwrap_or(255);
-        out.push(pn_len);
-        out.extend_from_slice(&self.public_name);
+        let pn = &self.public_name[..self.public_name.len().min(255)];
+        out.push(pn.len() as u8);
+        out.extend_from_slice(pn);
         // extensions<0..2^16-1>
-        let ext_len: u16 = u16::try_from(self.extensions.len()).unwrap_or(u16::MAX);
-        out.extend_from_slice(&ext_len.to_be_bytes());
-        out.extend_from_slice(&self.extensions);
+        let ext = &self.extensions[..self.extensions.len().min(u16::MAX as usize)];
+        out.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        out.extend_from_slice(ext);
     }
 
     fn decode(rd: &mut Reader<'_>) -> Result<Self, Error> {
@@ -276,12 +301,16 @@ impl EchConfig {
         Ok(cfg)
     }
 
-    /// Encode this entry (version || u16 length || contents).
+    /// Encode this entry (version || u16 length || contents). Contents
+    /// longer than a `u16` can describe are truncated so the length prefix
+    /// always matches the bytes that follow — a decoded entry is bounded by
+    /// construction, and [`EchConfig::new`] builds `raw_contents` from
+    /// already-truncated fields, so this only guards hand-built entries.
     fn encode_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.version.to_be_bytes());
-        let len: u16 = u16::try_from(self.raw_contents.len()).unwrap_or(u16::MAX);
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(&self.raw_contents);
+        let raw = &self.raw_contents[..self.raw_contents.len().min(u16::MAX as usize)];
+        out.extend_from_slice(&(raw.len() as u16).to_be_bytes());
+        out.extend_from_slice(raw);
     }
 
     fn decode_entry(rd: &mut Reader<'_>) -> Result<Self, Error> {
@@ -353,11 +382,19 @@ impl EchConfigList {
     pub fn encode(&self) -> Vec<u8> {
         let mut inner = Vec::new();
         for cfg in &self.configs {
+            // Stop at the last whole entry the u16 list length can carry:
+            // the prefix must describe exactly the bytes that follow, and a
+            // cut mid-entry would not decode. A list decoded from the wire
+            // always fits; only a hand-built one can overflow.
+            let before = inner.len();
             cfg.encode_into(&mut inner);
+            if inner.len() > u16::MAX as usize {
+                inner.truncate(before);
+                break;
+            }
         }
         let mut out = Vec::with_capacity(2 + inner.len());
-        let len: u16 = u16::try_from(inner.len()).unwrap_or(u16::MAX);
-        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&(inner.len() as u16).to_be_bytes());
         out.extend_from_slice(&inner);
         out
     }
@@ -476,4 +513,72 @@ fn valid_public_name(name: &[u8]) -> bool {
         && (last[..2] == *b"0x" || last[..2] == *b"0X")
         && last[2..].iter().all(u8::is_ascii_hexdigit);
     !(all_digits || hex)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contents(public_name: Vec<u8>, extensions: Vec<u8>) -> EchConfigContents {
+        EchConfigContents {
+            key_config: HpkeKeyConfig {
+                config_id: 7,
+                kem_id: 0x0020,
+                public_key: alloc::vec![0x42; 32],
+                cipher_suites: alloc::vec![HpkeSymCipherSuite {
+                    kdf_id: 1,
+                    aead_id: 1
+                }],
+            },
+            maximum_name_length: 0,
+            public_name,
+            extensions,
+        }
+    }
+
+    /// CFG-F3: the encoders used to saturate a length prefix (`255`,
+    /// `u16::MAX`) while emitting the whole oversized body, producing bytes
+    /// no decoder could read back consistently. They now truncate to what
+    /// the prefix describes, so every encoding round-trips, and the fallible
+    /// key-pair constructor refuses such a config outright.
+    #[test]
+    fn oversized_fields_encode_consistently_and_are_refused_by_constructors() {
+        // A 300-byte public_name next to a large but well-formed extension
+        // list (one 65 000-byte extension): the name is cut to 255, the
+        // rest is untouched, and the result decodes.
+        let long_name = alloc::vec![b'a'; 300];
+        let mut big_ext = alloc::vec![0x00, 0x01, 0xfd, 0xe4]; // type 1, len 64 996
+        big_ext.resize(65_000, 0);
+        let c = contents(long_name.clone(), big_ext.clone());
+        assert!(!c.fits_wire_limits());
+        assert!(contents(alloc::vec![b'a'; 255], big_ext.clone()).fits_wire_limits());
+
+        let cfg = EchConfig::new(c);
+        let wire = cfg.encode();
+        let back = EchConfig::decode(&wire).expect("truncated encoding is self-consistent");
+        let back = back.contents.unwrap();
+        assert_eq!(back.public_name, &long_name[..255]);
+        assert_eq!(back.extensions, big_ext);
+
+        // A list whose entries overflow the u16 list length keeps whole
+        // entries only.
+        let list = EchConfigList::new(alloc::vec![cfg.clone(), cfg.clone()]);
+        let wire = list.encode();
+        let back = EchConfigList::decode(&wire).unwrap();
+        assert_eq!(back.configs.len(), 1);
+
+        // Extensions beyond a u16: the prefix says 65 535 and exactly that
+        // many bytes follow (the key config is 43 bytes: 1 + 2 + 2 + 32 +
+        // 2 + 4; then max_name_length, the name prefix and 9 name bytes).
+        let c = contents(b"pub.local".to_vec(), alloc::vec![0u8; 70_000]);
+        let mut raw = Vec::new();
+        c.encode_into(&mut raw);
+        assert_eq!(raw.len(), 43 + 1 + 1 + 9 + 2 + u16::MAX as usize);
+        assert_eq!(&raw[43 + 1 + 1 + 9..43 + 1 + 1 + 9 + 2], &[0xff, 0xff]);
+
+        // `from_private_key` refuses the oversized config outright (the
+        // limits check runs before the key comparison).
+        let err = super::super::keys::EchKeyPair::from_private_key(cfg, &[0x11; 32]).unwrap_err();
+        assert!(matches!(err, Error::EchDecodeError));
+    }
 }

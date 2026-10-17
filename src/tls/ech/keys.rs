@@ -116,7 +116,13 @@ impl EchKeyPair {
             .filter(|_| config.is_supported())
             .ok_or(Error::EchDecodeError)?;
         let kem = super::hpke_setup::map_kem(contents.key_config.kem_id)?;
-        if contents.key_config.cipher_suites.is_empty() || contents.public_name.is_empty() {
+        // The same bounds `generate` enforces, plus every wire length limit:
+        // a config whose fields overflow their length prefixes would be
+        // truncated on encode and never match what the server publishes.
+        if contents.key_config.cipher_suites.is_empty()
+            || contents.public_name.is_empty()
+            || !contents.fits_wire_limits()
+        {
             return Err(Error::EchDecodeError);
         }
         let mut pk = [0u8; HpkeKem::MAX_N_ENC];
