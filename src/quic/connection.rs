@@ -6902,6 +6902,21 @@ impl QuicConnection {
         if self.closed || self.pending_close.is_some() {
             return None;
         }
+        // RFC 9001 §6.6: "Endpoints MUST initiate a key update before
+        // sending more packets than the confidentiality limit" — the close
+        // below is the mandatory backstop, not the intended path (F7). At
+        // three quarters of the limit the 1-RTT keys are rotated here, when
+        // §6.1 permits it: handshake confirmed (for a server, HANDSHAKE_DONE
+        // acknowledged) and no update of ours still awaiting the peer's
+        // reply. `initiate_key_update` refuses otherwise, the counter keeps
+        // climbing under the current key, and the limit check decides.
+        if matches!(level, Level::OneRtt) {
+            let lk = self.endpoint.crypto.at(level);
+            let limit = lk.effective_usage_limit();
+            if lk.tx_packets >= limit.saturating_sub(limit / 4) && !lk.tx_phase_pending_confirm {
+                let _ = self.initiate_key_update();
+            }
+        }
         {
             let lk = self.endpoint.crypto.at(level);
             if lk.tx_packets >= lk.effective_usage_limit() {
@@ -15442,52 +15457,129 @@ mod tests {
     // QUIC-1 — RFC 9001 §6.6: per-key tx usage limit. We drop the
     // override to a small number and verify the connection closes
     // after the corresponding number of 1-RTT packets have been
-    // emitted.
+    // emitted — when a key update is not permitted (RFC 9001 §6.1), which
+    // for a server means its HANDSHAKE_DONE has not been acknowledged yet.
+    // (F7: with an update permitted the engine rotates keys instead; see
+    // `tx_usage_limit_rotates_keys_before_the_limit`.)
     #[test]
     fn quic1_tx_usage_limit_closes_connection() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        assert!(
+            !s.handshake_done_acked,
+            "test premise: the client's ACK of HANDSHAKE_DONE is still in flight"
+        );
+
+        // Force a tiny override on the server's 1-RTT tx key. Capture
+        // the current `tx_packets` value first — after a handshake
+        // there will already have been some 1-RTT packets emitted
+        // (NEW_CID, etc), so we set the override at `current + 2` and
+        // then push two more packets to trip the limit.
+        let baseline = s.endpoint.crypto.at(Level::OneRtt).tx_packets;
+        s.endpoint.crypto.at_mut(Level::OneRtt).usage_limit_override = Some(baseline + 2);
+        assert!(!s.closed, "precondition: connection still open");
+
+        // Open a stream and write some bytes. The packer should emit
+        // up to 2 packets before tripping the limit and refusing. Only the
+        // server's datagrams are delivered: the client's ACKs stay away, so
+        // HANDSHAKE_DONE is never acknowledged and no key update may start.
+        let sid = s.open_bidi().expect("open bidi");
+        s.write(sid, &[0xCDu8; 4096]).expect("write");
+        for _ in 0..16 {
+            for dg in drain_datagrams(&mut s) {
+                c.feed_datagram(&dg).expect("client feed");
+            }
+            drop(drain_datagrams(&mut c));
+            if s.is_closing() {
+                break;
+            }
+        }
+        // RFC 9001 §6.6 — the close is a CONNECTION_CLOSE carrying
+        // AEAD_LIMIT_REACHED, not a silent local shutdown: the server enters
+        // the closing state and the peer learns the reason.
+        assert!(
+            s.is_closing(),
+            "server must close after tx_packets crosses the usage limit override"
+        );
+        assert_eq!(s.key_phase(), 0, "no key update was permitted");
+        let info = s.close_info().expect("close info");
+        assert_eq!(info.error_code, ERROR_AEAD_LIMIT_REACHED);
+        assert_eq!(info.kind, CloseKind::Transport);
+        for dg in drain_datagrams(&mut s) {
+            c.feed_datagram(&dg).expect("client feed");
+        }
+        assert!(c.is_draining(), "the peer received the CONNECTION_CLOSE");
+        let peer = c.close_info().expect("peer close info");
+        assert_eq!(peer.initiator, CloseInitiator::Peer);
+        assert_eq!(peer.error_code, ERROR_AEAD_LIMIT_REACHED);
+    }
+
+    /// F7 — RFC 9001 §6.6: "Endpoints MUST initiate a key update before
+    /// sending more packets than the confidentiality limit." With the
+    /// handshake confirmed, pushing traffic towards the (overridden) limit
+    /// rotates the keys automatically; the connection stays open, the data
+    /// arrives, and the per-key counter restarts.
+    #[test]
+    fn tx_usage_limit_rotates_keys_before_the_limit() {
         let (mut c, mut s) = loopback_pair();
         drive_until_complete(&mut c, &mut s, 8);
         for _ in 0..4 {
             let _ = pump(&mut c, &mut s);
         }
-        assert!(c.is_handshake_complete() && s.is_handshake_complete());
-
-        // Force a tiny override on the client's 1-RTT tx key. Capture
-        // the current `tx_packets` value first — after a handshake
-        // there will already have been some 1-RTT packets emitted
-        // (NEW_CID, etc), so we set the override at `current + 2` and
-        // then push two more packets to trip the limit.
+        assert!(c.handshake_confirmed);
+        assert_eq!(c.key_phase(), 0);
         let baseline = c.endpoint.crypto.at(Level::OneRtt).tx_packets;
-        c.endpoint.crypto.at_mut(Level::OneRtt).usage_limit_override = Some(baseline + 2);
-        assert!(!c.closed, "precondition: connection still open");
+        let limit = baseline + 8;
+        c.endpoint.crypto.at_mut(Level::OneRtt).usage_limit_override = Some(limit);
+        let secret_before = c
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .tx
+            .as_ref()
+            .expect("tx keys")
+            .secret
+            .clone();
 
-        // Open a stream and write some bytes. The packer should emit
-        // up to 2 packets before tripping the limit and refusing.
         let sid = c.open_bidi().expect("open bidi");
-        c.write(sid, &[0xCDu8; 4096]).expect("write");
-        // Pump until either the limit closes the client or the server
-        // sees the data.
-        for _ in 0..16 {
+        c.write(sid, &[0xCDu8; 16 * 1024]).expect("write");
+        let mut got = 0usize;
+        let mut buf = [0u8; 2048];
+        for _ in 0..64 {
             let _ = pump(&mut c, &mut s);
-            if c.is_closing() {
+            while let Ok((n, _)) = s.read(sid, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got += n;
+            }
+            if got == 16 * 1024 {
                 break;
             }
         }
-        // RFC 9001 §6.6 — the close is a CONNECTION_CLOSE carrying
-        // AEAD_LIMIT_REACHED, not a silent local shutdown: the client enters
-        // the closing state and the peer learns the reason.
-        assert!(
-            c.is_closing(),
-            "client must close after tx_packets crosses the usage limit override"
+        assert_eq!(got, 16 * 1024, "all data delivered");
+        assert!(!c.is_closing() && !c.is_closed(), "no AEAD_LIMIT_REACHED");
+        assert!(!s.is_closing() && !s.is_draining());
+        // The chain of tx secrets moved (possibly more than once, so the
+        // phase bit alone cannot tell): a key update was initiated before
+        // the limit, and the peer followed it.
+        assert_ne!(
+            c.endpoint
+                .crypto
+                .at(Level::OneRtt)
+                .tx
+                .as_ref()
+                .expect("tx keys")
+                .secret,
+            secret_before,
+            "a key update was initiated before the limit"
         );
-        let info = c.close_info().expect("close info");
-        assert_eq!(info.error_code, ERROR_AEAD_LIMIT_REACHED);
-        assert_eq!(info.kind, CloseKind::Transport);
-        let _ = pump(&mut c, &mut s);
-        assert!(s.is_draining(), "the peer received the CONNECTION_CLOSE");
-        let peer = s.close_info().expect("peer close info");
-        assert_eq!(peer.initiator, CloseInitiator::Peer);
-        assert_eq!(peer.error_code, ERROR_AEAD_LIMIT_REACHED);
+        assert_eq!(s.key_phase(), c.key_phase(), "the peer followed");
+        assert!(
+            c.endpoint.crypto.at(Level::OneRtt).tx_packets < limit,
+            "the per-key counter restarted under the new key"
+        );
     }
 
     /// RFC 9001 §6.6 — crossing the rx *integrity* limit likewise MUST close
