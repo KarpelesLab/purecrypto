@@ -245,7 +245,14 @@ mod x86 {
         buf: &mut [u8],
         encrypt: bool,
     ) -> u128 {
-        debug_assert_eq!(buf.len() % 128, 0);
+        // Hard precondition, not a `debug_assert`: the loop below reads and
+        // writes `buf` through raw pointers in 128-byte groups and the lag
+        // flush reads `n - 128`, so a short or ragged buffer would be an
+        // out-of-bounds access in release builds.
+        assert!(
+            buf.len().is_multiple_of(128),
+            "ctr_ghash_fused: buffer length must be a multiple of 128 bytes"
+        );
         // Defence in depth: the schedule comes from an overridable trait
         // method, and the loads below are raw-pointer reads of
         // `16 * (nr + 1)` bytes. The caller already validates this; the check
@@ -541,6 +548,44 @@ mod arm {
             let mut out = [0u8; 16];
             vst1q_u8(out.as_mut_ptr(), acc);
             u128::from_le_bytes(out)
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    /// The fused CTR+GHASH kernel walks its buffer through raw pointers in
+    /// 128-byte groups, so the length precondition is a hard `assert!`
+    /// (not `debug_assert!`): a ragged buffer must panic in release builds
+    /// too, before any pointer arithmetic happens. Runs only where the
+    /// extensions exist (the kernel is `#[target_feature]`-gated).
+    #[test]
+    fn ctr_ghash_fused_rejects_ragged_buffer() {
+        if !super::supported() {
+            std::eprintln!("ctr_ghash_fused: SKIPPED precondition test (no carryless multiply)");
+            return;
+        }
+        // A zero AES-128 schedule: never read, the length check fires first.
+        let rk = [0u8; 176];
+        let hpow = [0u128; 8];
+        for len in [16usize, 64, 127, 129, 256 + 16] {
+            let mut buf = std::vec![0u8; len];
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                super::ctr_ghash_fused(&rk, 10, 0, &hpow, 0, &mut buf, true)
+            }));
+            let msg = match r {
+                Ok(_) => panic!("ctr_ghash_fused accepted a {len}-byte buffer"),
+                Err(e) => e,
+            };
+            let msg = msg
+                .downcast_ref::<std::string::String>()
+                .map(std::string::String::as_str)
+                .or_else(|| msg.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(
+                msg.contains("multiple of 128"),
+                "unexpected panic message for len {len}: {msg:?}"
+            );
         }
     }
 }
