@@ -16,14 +16,142 @@
 //! per-lane arithmetic is byte-for-byte the scalar [`super::sha256`] compression
 //! (same `Σ`/`σ`/`Ch`/`Maj`, same constants), executed 8-wide; this is pinned by
 //! a differential test against the scalar path. Callers (e.g. the WOTS+ batcher)
-//! assemble the padded blocks and manage the lane states. x86_64 + AVX2 only.
+//! assemble the padded blocks and manage the lane states.
+//!
+//! On aarch64 the SHA-256 instructions are serial per stream, but the SHA
+//! unit pipelines two independent streams (one block each costs ~17 ns per
+//! block interleaved versus ~25 ns alone), so [`compress2`] interleaves two
+//! copies of the straight-line `sha2` kernel; callers pick the width from
+//! [`supported16`] / [`supported`] / [`supported2`].
 #![allow(unsafe_code)]
+#![allow(unused_unsafe)]
+// Each architecture has only its own kernels' callers; the other width's
+// names are kept so callers can be written once against all three.
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 
 /// Lanes processed in parallel (AVX2 32-bit lane count).
 pub(crate) const LANES: usize = 8;
 
 /// Lanes processed in parallel by the AVX-512 kernel.
 pub(crate) const LANES16: usize = 16;
+
+/// Lanes processed in parallel by the aarch64 two-stream kernel.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const LANES2: usize = 2;
+
+/// Whether the two-stream aarch64 SHA-256 backend is available (the `sha2`
+/// extension; `false` elsewhere).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn supported2() -> bool {
+    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha2")
+}
+#[cfg(not(target_arch = "aarch64"))]
+#[allow(dead_code)]
+pub(crate) fn supported2() -> bool {
+    false
+}
+
+/// Applies one SHA-256 block compression to each of the two `(state, block)`
+/// lanes, interleaved on the aarch64 SHA instructions. Same contract as
+/// [`compress8`].
+///
+/// Callers are expected to have checked [`supported2`]; this re-checks the
+/// (cached) CPU feature flag and panics rather than executing the kernel on
+/// a CPU without the SHA-256 instructions, so it is safe to call
+/// unconditionally.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn compress2(states: &mut [[u32; 8]; LANES2], blocks: &[[u8; 64]; LANES2]) {
+    assert!(
+        supported2(),
+        "sha256_mb::compress2 called on a CPU without SHA-256 instructions; check supported2() first"
+    );
+    // SAFETY: `supported2()` just confirmed the `sha2` extension on this CPU,
+    // and the kernel has no other preconditions (the array types fix the
+    // lengths).
+    unsafe { arm::compress2(states, blocks) }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use crate::hash::sha256::K256;
+    use core::arch::aarch64::*;
+
+    /// Two independent SHA-256 block compressions, interleaved group by group
+    /// so the two dependency chains overlap in the SHA unit. Per stream this
+    /// is exactly the unrolled single-stream kernel in `sha_hw`.
+    #[target_feature(enable = "sha2")]
+    pub(super) unsafe fn compress2(states: &mut [[u32; 8]; 2], blocks: &[[u8; 64]; 2]) {
+        unsafe {
+            let mut a0 = vld1q_u32(states[0].as_ptr());
+            let mut e0 = vld1q_u32(states[0].as_ptr().add(4));
+            let mut a1 = vld1q_u32(states[1].as_ptr());
+            let mut e1 = vld1q_u32(states[1].as_ptr().add(4));
+            let (a00, e00, a10, e10) = (a0, e0, a1, e1);
+            let p0 = blocks[0].as_ptr();
+            let p1 = blocks[1].as_ptr();
+            let mut m00 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p0)));
+            let mut m01 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p0.add(16))));
+            let mut m02 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p0.add(32))));
+            let mut m03 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p0.add(48))));
+            let mut m10 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p1)));
+            let mut m11 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p1.add(16))));
+            let mut m12 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p1.add(32))));
+            let mut m13 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p1.add(48))));
+            // Four rounds of both streams under `K[k..k + 4]`.
+            macro_rules! r4 {
+                ($ma:ident, $mb:ident, $k:expr) => {{
+                    let k = vld1q_u32(K256.as_ptr().add($k));
+                    let wk0 = vaddq_u32($ma, k);
+                    let wk1 = vaddq_u32($mb, k);
+                    let t0 = a0;
+                    let t1 = a1;
+                    a0 = vsha256hq_u32(a0, e0, wk0);
+                    a1 = vsha256hq_u32(a1, e1, wk1);
+                    e0 = vsha256h2q_u32(e0, t0, wk0);
+                    e1 = vsha256h2q_u32(e1, t1, wk1);
+                }};
+            }
+            macro_rules! sch {
+                ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident) => {
+                    $a = vsha256su1q_u32(vsha256su0q_u32($a, $b), $c, $d);
+                    $e = vsha256su1q_u32(vsha256su0q_u32($e, $f), $g, $h);
+                };
+            }
+            r4!(m00, m10, 0);
+            sch!(m00, m01, m02, m03, m10, m11, m12, m13);
+            r4!(m01, m11, 4);
+            sch!(m01, m02, m03, m00, m11, m12, m13, m10);
+            r4!(m02, m12, 8);
+            sch!(m02, m03, m00, m01, m12, m13, m10, m11);
+            r4!(m03, m13, 12);
+            sch!(m03, m00, m01, m02, m13, m10, m11, m12);
+            r4!(m00, m10, 16);
+            sch!(m00, m01, m02, m03, m10, m11, m12, m13);
+            r4!(m01, m11, 20);
+            sch!(m01, m02, m03, m00, m11, m12, m13, m10);
+            r4!(m02, m12, 24);
+            sch!(m02, m03, m00, m01, m12, m13, m10, m11);
+            r4!(m03, m13, 28);
+            sch!(m03, m00, m01, m02, m13, m10, m11, m12);
+            r4!(m00, m10, 32);
+            sch!(m00, m01, m02, m03, m10, m11, m12, m13);
+            r4!(m01, m11, 36);
+            sch!(m01, m02, m03, m00, m11, m12, m13, m10);
+            r4!(m02, m12, 40);
+            sch!(m02, m03, m00, m01, m12, m13, m10, m11);
+            r4!(m03, m13, 44);
+            sch!(m03, m00, m01, m02, m13, m10, m11, m12);
+            r4!(m00, m10, 48);
+            r4!(m01, m11, 52);
+            r4!(m02, m12, 56);
+            r4!(m03, m13, 60);
+            vst1q_u32(states[0].as_mut_ptr(), vaddq_u32(a0, a00));
+            vst1q_u32(states[0].as_mut_ptr().add(4), vaddq_u32(e0, e00));
+            vst1q_u32(states[1].as_mut_ptr(), vaddq_u32(a1, a10));
+            vst1q_u32(states[1].as_mut_ptr().add(4), vaddq_u32(e1, e10));
+        }
+    }
+}
 
 /// Whether the 16-lane multi-buffer SHA-256 backend is available.
 ///
@@ -308,6 +436,55 @@ mod avx2 {
             for (lane, orow) in out.iter().enumerate() {
                 _mm256_storeu_si256(states[lane].as_mut_ptr() as *mut __m256i, *orow);
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests_arm {
+    use super::*;
+    use crate::hash::sha256::compress256_soft as soft;
+
+    /// The interleaved two-stream kernel must reproduce the scalar
+    /// compression exactly in both lanes, over random states and blocks and
+    /// across chained blocks.
+    #[test]
+    fn compress2_matches_scalar() {
+        std::eprintln!(
+            "sha256_mb compress2: {}",
+            if supported2() { "RUNNING" } else { "SKIPPED" }
+        );
+        if !supported2() {
+            return;
+        }
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..200 {
+            let mut states = [[0u32; 8]; LANES2];
+            for lane in states.iter_mut() {
+                for w in lane.iter_mut() {
+                    *w = next() as u32;
+                }
+            }
+            let mut want = states;
+            for _block in 0..3 {
+                let mut blocks = [[0u8; 64]; LANES2];
+                for lane in blocks.iter_mut() {
+                    for byte in lane.iter_mut() {
+                        *byte = (next() >> 17) as u8;
+                    }
+                }
+                for lane in 0..LANES2 {
+                    soft(&mut want[lane], &blocks[lane]);
+                }
+                compress2(&mut states, &blocks);
+            }
+            assert_eq!(states, want);
         }
     }
 }

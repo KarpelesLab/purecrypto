@@ -97,13 +97,17 @@ pub(crate) mod sha256;
 // one of those modules is in the build (otherwise they are entirely dead code).
 #[cfg(all(
     feature = "std",
-    target_arch = "x86_64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
     any(feature = "slhdsa", feature = "lms", feature = "xmss")
 ))]
 pub(crate) mod sha256_mb;
 mod sha3;
 pub(crate) mod sha512;
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "slhdsa"))]
+#[cfg(all(
+    feature = "std",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "slhdsa"
+))]
 pub(crate) mod sha512_mb;
 #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod sha_hw;
