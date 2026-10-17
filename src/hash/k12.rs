@@ -50,6 +50,57 @@ const M14_CV: usize = 64;
 /// MarsupilamiFourteen shares the same 8 KiB chunking.
 const K12_CHUNK: usize = 8192;
 
+/// Hashes two full leaves side by side on the aarch64 two-stream Keccak
+/// kernel, returning their `CV`-byte chaining values.
+///
+/// Each leaf is a fresh `RATE`-byte sponge over its 8 KiB chunk, finalized
+/// with domain byte `0x0B` — exactly what `absorb_leaf` does one leaf at a
+/// time with the scalar sponge, but the two states ride in the two lanes of
+/// every permutation. Pinned by the tree-mode vectors (which cover both the
+/// paired and the scalar leaf paths through `feed`).
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+fn leaf_pair_cvs<const RATE: usize, const CV: usize>(
+    rounds: usize,
+    a: &[u8],
+    b: &[u8],
+) -> ([u8; CV], [u8; CV]) {
+    use super::keccak_x4::keccak_p_x2;
+    debug_assert!(a.len() == K12_CHUNK && b.len() == K12_CHUNK);
+    let mut st = [0u64; 50];
+    let mut off = 0;
+    while off + RATE <= K12_CHUNK {
+        for i in 0..RATE / 8 {
+            let o = off + 8 * i;
+            st[2 * i] ^= u64::from_le_bytes(a[o..o + 8].try_into().unwrap());
+            st[2 * i + 1] ^= u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        }
+        keccak_p_x2(&mut st, rounds);
+        off += RATE;
+    }
+    // The final (partial) block with `pad10*1` under the leaf domain byte.
+    let rem = K12_CHUNK - off;
+    let mut pa = [0u8; RATE];
+    let mut pb = [0u8; RATE];
+    pa[..rem].copy_from_slice(&a[off..]);
+    pb[..rem].copy_from_slice(&b[off..]);
+    pa[rem] ^= 0x0B;
+    pb[rem] ^= 0x0B;
+    pa[RATE - 1] ^= 0x80;
+    pb[RATE - 1] ^= 0x80;
+    for i in 0..RATE / 8 {
+        st[2 * i] ^= u64::from_le_bytes(pa[8 * i..8 * i + 8].try_into().unwrap());
+        st[2 * i + 1] ^= u64::from_le_bytes(pb[8 * i..8 * i + 8].try_into().unwrap());
+    }
+    keccak_p_x2(&mut st, rounds);
+    let mut cva = [0u8; CV];
+    let mut cvb = [0u8; CV];
+    for i in 0..CV / 8 {
+        cva[8 * i..8 * i + 8].copy_from_slice(&st[2 * i].to_le_bytes());
+        cvb[8 * i..8 * i + 8].copy_from_slice(&st[2 * i + 1].to_le_bytes());
+    }
+    (cva, cvb)
+}
+
 /// Defines a TurboSHAKE variant at the given rate.
 macro_rules! turboshake {
     ($name:ident, $rate:expr, $doc:literal) => {
@@ -182,6 +233,25 @@ impl<'a> KangarooTwelve<'a> {
                     self.tree = true;
                 }
             } else {
+                // Two whole leaves ahead on a leaf boundary: hash them as a
+                // pair on the two-stream kernel.
+                #[cfg(all(feature = "std", target_arch = "aarch64"))]
+                if self.leaf_len == 0
+                    && data.len() >= 2 * K12_CHUNK
+                    && super::keccak_x4::supported2()
+                {
+                    let (pair, rest) = data.split_at(2 * K12_CHUNK);
+                    let (cva, cvb) = leaf_pair_cvs::<TS128_RATE, 32>(
+                        ROUNDS,
+                        &pair[..K12_CHUNK],
+                        &pair[K12_CHUNK..],
+                    );
+                    self.root.update(&cva);
+                    self.root.update(&cvb);
+                    self.leaves += 2;
+                    data = rest;
+                    continue;
+                }
                 let take = (K12_CHUNK - self.leaf_len).min(data.len());
                 self.leaf.update(&data[..take]);
                 self.leaf_len += take;
@@ -315,6 +385,23 @@ impl<'a> MarsupilamiFourteen<'a> {
                     self.tree = true;
                 }
             } else {
+                #[cfg(all(feature = "std", target_arch = "aarch64"))]
+                if self.leaf_len == 0
+                    && data.len() >= 2 * K12_CHUNK
+                    && super::keccak_x4::supported2()
+                {
+                    let (pair, rest) = data.split_at(2 * K12_CHUNK);
+                    let (cva, cvb) = leaf_pair_cvs::<TS256_RATE, M14_CV>(
+                        M14_ROUNDS,
+                        &pair[..K12_CHUNK],
+                        &pair[K12_CHUNK..],
+                    );
+                    self.root.update(&cva);
+                    self.root.update(&cvb);
+                    self.leaves += 2;
+                    data = rest;
+                    continue;
+                }
                 let take = (K12_CHUNK - self.leaf_len).min(data.len());
                 self.leaf.update(&data[..take]);
                 self.leaf_len += take;
@@ -613,6 +700,50 @@ mod tests {
         h.update(&buf);
         h.finalize_into(&mut b);
         assert_eq!(a, b);
+    }
+
+    /// Multi-leaf trees fed in one call (which takes the paired-leaf kernel
+    /// where available, two leaves at a time) must equal the same bytes fed in
+    /// small pieces (always the scalar one-leaf path), for both tree hashes.
+    /// Sizes straddle the 2-, 3- and 4-leaf boundaries after the 8 KiB root
+    /// node, with and without a trailing partial leaf.
+    #[test]
+    fn multi_leaf_pairs_match_piecewise() {
+        for &len in &[
+            3 * 8192,
+            3 * 8192 + 1,
+            4 * 8192,
+            4 * 8192 + 100,
+            5 * 8192 + 4097,
+            7 * 8192 - 1,
+        ] {
+            let mut buf = alloc::vec![0u8; len];
+            ptn(&mut buf);
+
+            let mut one = [0u8; 48];
+            let mut h = KangarooTwelve::new(b"c");
+            h.update(&buf);
+            h.finalize_into(&mut one);
+            let mut pieces = [0u8; 48];
+            let mut h = KangarooTwelve::new(b"c");
+            for c in buf.chunks(1000) {
+                h.update(c);
+            }
+            h.finalize_into(&mut pieces);
+            assert_eq!(one, pieces, "k12 len {len}");
+
+            let mut one = [0u8; 48];
+            let mut h = MarsupilamiFourteen::new(b"c");
+            h.update(&buf);
+            h.finalize_into(&mut one);
+            let mut pieces = [0u8; 48];
+            let mut h = MarsupilamiFourteen::new(b"c");
+            for c in buf.chunks(1000) {
+                h.update(c);
+            }
+            h.finalize_into(&mut pieces);
+            assert_eq!(one, pieces, "m14 len {len}");
+        }
     }
 
     // The domain byte doubles as the pad byte and must leave its top bit

@@ -11,13 +11,31 @@
 //!
 //! The kernel exposes [`keccak_p_x4`] over an interleaved `[u64; 100]` state
 //! (lane `i` of stream `l` at index `4·i + l`, so each register loads
-//! contiguously), plus [`KeccakX4`], a four-stream one-shot sponge for
+//! contiguously), plus [`KeccakXn`], an `L`-stream one-shot sponge for
 //! short (single-block) inputs with block-at-a-time squeezing. Per-stream
 //! output is byte-identical to the scalar [`super::keccak::Keccak`] sponge —
-//! pinned by a differential test against four scalar `keccak_p` runs. The
-//! kernel is branch-free in the state (bitwise/rotate only); x86_64 + AVX2
-//! only, callers check [`supported`] and fall back to the scalar path.
+//! pinned by a differential test against `L` scalar `keccak_p` runs. The
+//! kernels are branch-free in the state (bitwise/rotate only).
+//!
+//! Widths per architecture: x86_64 has the 4-way AVX2 and 8-way AVX-512
+//! kernels ([`supported`] / [`supported8`]); aarch64 has a 2-way kernel on
+//! the FEAT_SHA3 instructions (`eor3`, `rax1`, `xar`, `bcax`; [`supported2`],
+//! [`keccak_p_x2`]), where two states ride in the two 64-bit lanes of a
+//! `uint64x2_t`. Callers pick the widest `supported*()` width and fall back
+//! to the scalar path.
 #![allow(unsafe_code)]
+#![allow(unused_unsafe)]
+// On aarch64 only the 2-way kernel has a caller today (the KangarooTwelve /
+// MarsupilamiFourteen leaf pairs); the sponge and the x86 names are kept
+// compiled so the PQ modules can adopt the 2-way width without touching this
+// file, and so the sponge differential test runs there.
+#![cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(feature = "mlkem", feature = "mldsa", feature = "slhdsa")
+    )),
+    allow(dead_code)
+)]
 
 /// Streams processed in parallel (AVX2 64-bit lane count).
 pub(crate) const LANES: usize = 4;
@@ -25,14 +43,52 @@ pub(crate) const LANES: usize = 4;
 /// Streams processed in parallel by the AVX-512 kernel.
 pub(crate) const LANES8: usize = 8;
 
+/// Streams processed in parallel by the aarch64 FEAT_SHA3 kernel.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const LANES2: usize = 2;
+
+/// Whether the 2-way aarch64 Keccak backend is available on this CPU
+/// (FEAT_SHA3; `false` elsewhere).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn supported2() -> bool {
+    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha3")
+}
+#[cfg(not(target_arch = "aarch64"))]
+#[allow(dead_code)]
+pub(crate) fn supported2() -> bool {
+    false
+}
+
+/// Keccak-p[1600, `rounds`] applied to two interleaved states: lane `i` of
+/// stream `l` lives at `state[2 * i + l]`.
+///
+/// Callers are expected to have checked [`supported2`]; this re-checks the
+/// (cached) CPU feature flag and panics rather than executing the kernel on
+/// a CPU without FEAT_SHA3, so the function is safe to call unconditionally.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn keccak_p_x2(state: &mut [u64; 50], rounds: usize) {
+    assert!(
+        supported2(),
+        "keccak_p_x2 called on a CPU without FEAT_SHA3; check supported2() first"
+    );
+    // SAFETY: `supported2()` just confirmed FEAT_SHA3 on this CPU, and the
+    // kernel has no other preconditions (the array type fixes the length).
+    unsafe { neon_sha3::keccak_p_x2(state, rounds) }
+}
+
 /// Interleaved state words for the widest kernel (`25 * LANES8`). The generic
 /// sponge always carries this array and uses the `25 * L` prefix, because
 /// `[u64; 25 * L]` needs unstable generic-const-expressions to spell.
 const MAX_STATE: usize = 25 * LANES8;
 
 /// Whether the 8-way Keccak backend is available on this CPU.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn supported8() -> bool {
     !crate::ct::force_portable() && std::is_x86_feature_detected!("avx512f")
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn supported8() -> bool {
+    false
 }
 
 /// Keccak-p[1600, `rounds`] applied to eight interleaved states: lane `i` of
@@ -41,6 +97,7 @@ pub(crate) fn supported8() -> bool {
 /// Callers are expected to have checked [`supported8`]; this re-checks the
 /// (cached) CPU feature flag and panics rather than executing the kernel on
 /// a CPU without AVX-512F, so the function is safe to call unconditionally.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn keccak_p_x8(state: &mut [u64; MAX_STATE], rounds: usize) {
     assert!(
         supported8(),
@@ -55,8 +112,13 @@ pub(crate) fn keccak_p_x8(state: &mut [u64; MAX_STATE], rounds: usize) {
 pub(crate) const MAX_RATE: usize = 168;
 
 /// Whether the 4-way Keccak backend is available on this CPU.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn supported() -> bool {
     !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn supported() -> bool {
+    false
 }
 
 /// Keccak-p[1600, `rounds`] applied to four interleaved states: lane `i` of
@@ -65,6 +127,7 @@ pub(crate) fn supported() -> bool {
 /// Callers are expected to have checked [`supported`]; this re-checks the
 /// (cached) CPU feature flag and panics rather than executing the kernel on
 /// a CPU without AVX2, so the function is safe to call unconditionally.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn keccak_p_x4(state: &mut [u64; 100], rounds: usize) {
     assert!(
         supported(),
@@ -75,6 +138,7 @@ pub(crate) fn keccak_p_x4(state: &mut [u64; 100], rounds: usize) {
     unsafe { avx2::keccak_p_x4(state, rounds) }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod avx512 {
     use crate::hash::keccak::RC;
     use core::arch::x86_64::*;
@@ -190,6 +254,7 @@ mod avx512 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod avx2 {
     use crate::hash::keccak::RC;
     use core::arch::x86_64::*;
@@ -296,15 +361,112 @@ mod avx2 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+mod neon_sha3 {
+    use crate::hash::keccak::RC;
+    use core::arch::aarch64::*;
+
+    /// One Keccak-p round on two states (one per 64-bit lane) with the
+    /// FEAT_SHA3 instructions: θ's five-way parities are two `eor3`s each,
+    /// the `c[x-1] ^ rotl(c[x+1], 1)` mixers one `rax1` each, the fused
+    /// θ-update/ρ/π one `xar` per lane (`rotr(a ^ d, 64 - ρ)`), and χ one
+    /// `bcax` per lane (`a ^ (!b & c)`), so the plain χ form needs no lane
+    /// complementing. Same data flow as the scalar / AVX rounds.
+    #[inline(always)]
+    unsafe fn round(a: &mut [uint64x2_t; 25], rc: uint64x2_t) {
+        unsafe {
+            let c0 = veor3q_u64(veor3q_u64(a[0], a[5], a[10]), a[15], a[20]);
+            let c1 = veor3q_u64(veor3q_u64(a[1], a[6], a[11]), a[16], a[21]);
+            let c2 = veor3q_u64(veor3q_u64(a[2], a[7], a[12]), a[17], a[22]);
+            let c3 = veor3q_u64(veor3q_u64(a[3], a[8], a[13]), a[18], a[23]);
+            let c4 = veor3q_u64(veor3q_u64(a[4], a[9], a[14]), a[19], a[24]);
+            let d0 = vrax1q_u64(c4, c1);
+            let d1 = vrax1q_u64(c0, c2);
+            let d2 = vrax1q_u64(c1, c3);
+            let d3 = vrax1q_u64(c2, c4);
+            let d4 = vrax1q_u64(c3, c0);
+            let b0 = veorq_u64(a[0], d0);
+            let b1 = vxarq_u64::<{ 64 - 44 }>(a[6], d1);
+            let b2 = vxarq_u64::<{ 64 - 43 }>(a[12], d2);
+            let b3 = vxarq_u64::<{ 64 - 21 }>(a[18], d3);
+            let b4 = vxarq_u64::<{ 64 - 14 }>(a[24], d4);
+            let b5 = vxarq_u64::<{ 64 - 28 }>(a[3], d3);
+            let b6 = vxarq_u64::<{ 64 - 20 }>(a[9], d4);
+            let b7 = vxarq_u64::<{ 64 - 3 }>(a[10], d0);
+            let b8 = vxarq_u64::<{ 64 - 45 }>(a[16], d1);
+            let b9 = vxarq_u64::<{ 64 - 61 }>(a[22], d2);
+            let b10 = vxarq_u64::<{ 64 - 1 }>(a[1], d1);
+            let b11 = vxarq_u64::<{ 64 - 6 }>(a[7], d2);
+            let b12 = vxarq_u64::<{ 64 - 25 }>(a[13], d3);
+            let b13 = vxarq_u64::<{ 64 - 8 }>(a[19], d4);
+            let b14 = vxarq_u64::<{ 64 - 18 }>(a[20], d0);
+            let b15 = vxarq_u64::<{ 64 - 27 }>(a[4], d4);
+            let b16 = vxarq_u64::<{ 64 - 36 }>(a[5], d0);
+            let b17 = vxarq_u64::<{ 64 - 10 }>(a[11], d1);
+            let b18 = vxarq_u64::<{ 64 - 15 }>(a[17], d2);
+            let b19 = vxarq_u64::<{ 64 - 56 }>(a[23], d3);
+            let b20 = vxarq_u64::<{ 64 - 62 }>(a[2], d2);
+            let b21 = vxarq_u64::<{ 64 - 55 }>(a[8], d3);
+            let b22 = vxarq_u64::<{ 64 - 39 }>(a[14], d4);
+            let b23 = vxarq_u64::<{ 64 - 41 }>(a[15], d0);
+            let b24 = vxarq_u64::<{ 64 - 2 }>(a[21], d1);
+            // χ: a[i] = b[i] ^ (!b[i+1] & b[i+2]) = bcax(b[i], b[i+2], b[i+1]).
+            a[0] = veorq_u64(vbcaxq_u64(b0, b2, b1), rc);
+            a[1] = vbcaxq_u64(b1, b3, b2);
+            a[2] = vbcaxq_u64(b2, b4, b3);
+            a[3] = vbcaxq_u64(b3, b0, b4);
+            a[4] = vbcaxq_u64(b4, b1, b0);
+            a[5] = vbcaxq_u64(b5, b7, b6);
+            a[6] = vbcaxq_u64(b6, b8, b7);
+            a[7] = vbcaxq_u64(b7, b9, b8);
+            a[8] = vbcaxq_u64(b8, b5, b9);
+            a[9] = vbcaxq_u64(b9, b6, b5);
+            a[10] = vbcaxq_u64(b10, b12, b11);
+            a[11] = vbcaxq_u64(b11, b13, b12);
+            a[12] = vbcaxq_u64(b12, b14, b13);
+            a[13] = vbcaxq_u64(b13, b10, b14);
+            a[14] = vbcaxq_u64(b14, b11, b10);
+            a[15] = vbcaxq_u64(b15, b17, b16);
+            a[16] = vbcaxq_u64(b16, b18, b17);
+            a[17] = vbcaxq_u64(b17, b19, b18);
+            a[18] = vbcaxq_u64(b18, b15, b19);
+            a[19] = vbcaxq_u64(b19, b16, b15);
+            a[20] = vbcaxq_u64(b20, b22, b21);
+            a[21] = vbcaxq_u64(b21, b23, b22);
+            a[22] = vbcaxq_u64(b22, b24, b23);
+            a[23] = vbcaxq_u64(b23, b20, b24);
+            a[24] = vbcaxq_u64(b24, b21, b20);
+        }
+    }
+
+    #[target_feature(enable = "sha3")]
+    pub(super) unsafe fn keccak_p_x2(state: &mut [u64; 50], rounds: usize) {
+        unsafe {
+            let p = state.as_mut_ptr();
+            let mut a = [vdupq_n_u64(0); 25];
+            for (i, ai) in a.iter_mut().enumerate() {
+                *ai = vld1q_u64(p.add(2 * i));
+            }
+            for &rc in RC[24 - rounds..].iter() {
+                round(&mut a, vdupq_n_u64(rc));
+            }
+            for (i, ai) in a.iter().enumerate() {
+                vst1q_u64(p.add(2 * i), *ai);
+            }
+        }
+    }
+}
+
 /// Parallel one-shot Keccak sponges over short (single-block) inputs, squeezed
 /// a rate block at a time — the shape of the FIPS 203/204/205 expansion XOFs
 /// (`SHAKE(seed ‖ indices)` squeezed until rejection sampling finishes).
 ///
-/// Generic over the lane count so one implementation serves both kernels;
-/// instantiate `KeccakXn<LANES8>` when [`supported8`] and `KeccakXn<LANES>`
-/// otherwise. The state array is always sized for the widest kernel and only
-/// its `25 * L` prefix is used, because `[u64; 25 * L]` needs unstable
-/// generic-const-expressions to spell.
+/// Generic over the lane count so one implementation serves every kernel;
+/// instantiate `KeccakXn<LANES8>` when [`supported8`], `KeccakXn<LANES>` when
+/// [`supported`], and `KeccakXn<LANES2>` when [`supported2`]. The state array
+/// is always sized for the widest kernel and only its `25 * L` prefix is
+/// used, because `[u64; 25 * L]` needs unstable generic-const-expressions to
+/// spell.
 pub(crate) struct KeccakXn<const L: usize> {
     /// Interleaved states: lane `i` of stream `l` at `L * i + l`.
     state: [u64; MAX_STATE],
@@ -318,8 +480,9 @@ impl<const L: usize> KeccakXn<L> {
     /// Absorbs `msgs[l]` into stream `l` with domain-separation byte `pad`.
     /// Each message must be shorter than `rate` (a single padded block).
     ///
-    /// Callers must have checked [`supported`] (for `L == LANES`) or
-    /// [`supported8`] (for `L == LANES8`).
+    /// Callers must have checked [`supported`] (for `L == LANES`),
+    /// [`supported8`] (for `L == LANES8`) or [`supported2`] (for
+    /// `L == LANES2`).
     ///
     /// # Panics
     ///
@@ -362,14 +525,23 @@ impl<const L: usize> KeccakXn<L> {
     /// Applies the 24-round permutation with the kernel matching `L`.
     fn permute(&mut self) {
         match L {
+            #[cfg(target_arch = "x86_64")]
             LANES => {
                 let st: &mut [u64; 25 * LANES] = (&mut self.state[..25 * LANES])
                     .try_into()
                     .expect("prefix is exactly 25 * LANES words");
                 keccak_p_x4(st, 24);
             }
+            #[cfg(target_arch = "x86_64")]
             LANES8 => keccak_p_x8(&mut self.state, 24),
-            _ => unreachable!("only the 4- and 8-lane Keccak kernels exist"),
+            #[cfg(target_arch = "aarch64")]
+            LANES2 => {
+                let st: &mut [u64; 25 * LANES2] = (&mut self.state[..25 * LANES2])
+                    .try_into()
+                    .expect("prefix is exactly 25 * LANES2 words");
+                keccak_p_x2(st, 24);
+            }
+            _ => unreachable!("no Keccak kernel of this lane count on this architecture"),
         }
     }
 
@@ -418,8 +590,47 @@ mod tests {
         *s
     }
 
+    /// The aarch64 2-way kernel must match two independent scalar
+    /// permutations, for every round count the crate uses, over random
+    /// states.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn keccak_p_x2_matches_scalar() {
+        std::eprintln!(
+            "keccak_p_x2: sha3={}",
+            if supported2() { "RUNNING" } else { "SKIPPED" },
+        );
+        if !supported2() {
+            return;
+        }
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for trial in 0..60 {
+            let rounds = [24usize, 12, 14][trial % 3];
+            let mut scalar = [[0u64; 25]; LANES2];
+            let mut interleaved = [0u64; 50];
+            for (l, st) in scalar.iter_mut().enumerate() {
+                for (i, w) in st.iter_mut().enumerate() {
+                    *w = xorshift(&mut seed);
+                    interleaved[LANES2 * i + l] = *w;
+                }
+            }
+            keccak_p_x2(&mut interleaved, rounds);
+            for (l, st) in scalar.iter_mut().enumerate() {
+                keccak_p(st, rounds);
+                for (i, w) in st.iter().enumerate() {
+                    assert_eq!(
+                        interleaved[LANES2 * i + l],
+                        *w,
+                        "trial {trial} rounds {rounds}: lane {i} stream {l}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The 4-way kernel must match four independent scalar permutations,
     /// for both supported round counts, over random states.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn keccak_p_x4_matches_scalar() {
         std::eprintln!(
@@ -459,13 +670,25 @@ mod tests {
     /// over the same messages, for every available lane width.
     #[test]
     fn keccak_sponge_matches_scalar_shake() {
+        #[cfg(target_arch = "x86_64")]
         if supported() {
             sponge_matches_scalar::<LANES>();
         }
+        #[cfg(target_arch = "x86_64")]
         if supported8() {
             sponge_matches_scalar::<LANES8>();
         }
+        #[cfg(target_arch = "aarch64")]
+        if supported2() {
+            sponge_matches_scalar::<LANES2>();
+        }
     }
+
+    /// The lane width every `KeccakXn` test below instantiates.
+    #[cfg(target_arch = "x86_64")]
+    const TEST_LANES: usize = LANES;
+    #[cfg(target_arch = "aarch64")]
+    const TEST_LANES: usize = LANES2;
 
     /// A message at least as long as the rate would push the domain byte past
     /// `block[..rate]`, dropping domain separation entirely. The check must
@@ -474,8 +697,8 @@ mod tests {
     #[should_panic(expected = "shorter than the rate")]
     fn absorb_rejects_message_at_or_above_rate() {
         let msg = [0u8; 136];
-        let msgs: [&[u8]; LANES] = [&msg[..]; LANES];
-        let _ = KeccakXn::<LANES>::new(136, msgs, 0x1F);
+        let msgs: [&[u8]; TEST_LANES] = [&msg[..]; TEST_LANES];
+        let _ = KeccakXn::<TEST_LANES>::new(136, msgs, 0x1F);
     }
 
     /// Likewise for a rate the interleaved block buffer cannot hold.
@@ -483,8 +706,8 @@ mod tests {
     #[should_panic(expected = "multiple of 8")]
     fn absorb_rejects_oversized_rate() {
         let msg = [0u8; 4];
-        let msgs: [&[u8]; LANES] = [&msg[..]; LANES];
-        let _ = KeccakXn::<LANES>::new(MAX_RATE + 8, msgs, 0x1F);
+        let msgs: [&[u8]; TEST_LANES] = [&msg[..]; TEST_LANES];
+        let _ = KeccakXn::<TEST_LANES>::new(MAX_RATE + 8, msgs, 0x1F);
     }
 
     fn sponge_matches_scalar<const L: usize>() {
@@ -516,7 +739,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests_x8 {
     use super::*;
     use crate::hash::keccak::keccak_p;

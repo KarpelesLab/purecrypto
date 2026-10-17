@@ -72,12 +72,17 @@ mod hmac;
 mod k12;
 pub(crate) mod keccak;
 // Batched Keccak for the matrix / tree expansion of ML-KEM, ML-DSA and
-// SLH-DSA-SHAKE; like the multi-buffer SHA-2 kernels below, nothing else calls
-// it.
+// SLH-DSA-SHAKE (x86_64), and for the KangarooTwelve / MarsupilamiFourteen
+// leaf pairs (aarch64, where it is always compiled with `std`).
 #[cfg(all(
     feature = "std",
-    target_arch = "x86_64",
-    any(feature = "mlkem", feature = "mldsa", feature = "slhdsa")
+    any(
+        all(
+            target_arch = "x86_64",
+            any(feature = "mlkem", feature = "mldsa", feature = "slhdsa")
+        ),
+        target_arch = "aarch64"
+    )
 ))]
 pub(crate) mod keccak_x4;
 mod kmac;
