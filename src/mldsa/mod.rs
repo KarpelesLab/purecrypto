@@ -31,7 +31,10 @@ use alloc::vec::Vec;
 use crate::rng::{CryptoRng, RngCore};
 use crate::zeroize::Zeroize;
 use encode::*;
-use field::{D, N, Poly, ntt_mul, sub};
+use field::{
+    D, LPoly, N, Poly, caddq, from_lazy, invntt_acc, invntt_lazy, ntt_lazy, ntt_mul_acc,
+    ntt_mul_lazy, sub, to_lazy,
+};
 use reduce::{
     GAMMA2_32, GAMMA2_88, decompose, high_bits, inf_norm, make_hint, power2_round, use_hint,
 };
@@ -316,6 +319,41 @@ fn wipe_polys(v: &mut [Poly]) {
     }
 }
 
+/// [`wipe_polys`] for lazy (NTT-domain working) polynomials.
+fn wipe_lazy(v: &mut [LPoly]) {
+    for f in v.iter_mut() {
+        Zeroize::zeroize(f);
+    }
+}
+
+/// The NTT of each polynomial of `v`, in the lazy domain (see
+/// [`field::LPoly`]).
+fn ntt_vec<const K: usize>(v: &[Poly; K]) -> [LPoly; K] {
+    let mut out = [[0i32; N]; K];
+    for (o, p) in out.iter_mut().zip(v.iter()) {
+        *o = to_lazy(p);
+        ntt_lazy(o);
+    }
+    out
+}
+
+/// Row `i` of the matrix-vector product `A·v` back in the ring: `invntt(Σⱼ
+/// Â[i][j] ∘ v̂[j])`, accumulated in place in the lazy domain (no per-term
+/// temporaries).
+fn matrix_row_mul<const K: usize, const L: usize>(
+    a: &[[Poly; L]; K],
+    i: usize,
+    v: &[LPoly; L],
+) -> Poly {
+    let mut acc = [0i32; N];
+    for j in 0..L {
+        ntt_mul_acc(&mut acc, &a[i][j], &v[j]);
+    }
+    let r = invntt_acc(&mut acc);
+    Zeroize::zeroize(&mut acc);
+    r
+}
+
 /// Samples the public matrix `Â` (NTT domain) from `rho`.
 ///
 /// On x86_64 with AVX2 the K·L independent SHAKE128 streams are squeezed
@@ -383,20 +421,12 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
     }
     let a = matrix::<K, L>(rho);
 
-    let mut s1_ntt = s1;
-    for s in s1_ntt.iter_mut() {
-        s.ntt();
-    }
+    let mut s1_ntt = ntt_vec(&s1);
 
     let mut t1 = [Poly::zero(); K];
     let mut t0 = [Poly::zero(); K];
     for i in 0..K {
-        let mut acc = Poly::zero();
-        for j in 0..L {
-            acc = acc.add(&ntt_mul(&a[i][j], &s1_ntt[j]));
-        }
-        acc.inv_ntt();
-        let t = acc.add(&s2[i]);
+        let t = matrix_row_mul(&a, i, &s1_ntt).add(&s2[i]);
         for jj in 0..N {
             let (hi, lo) = power2_round(t.c[jj]);
             t1[i].c[jj] = hi;
@@ -437,7 +467,7 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
     // s1 / s2 / t0 and the NTT copy of s1 (t1 is the public key).
     Zeroize::zeroize(&mut expanded);
     wipe_polys(&mut s1);
-    wipe_polys(&mut s1_ntt);
+    wipe_lazy(&mut s1_ntt);
     wipe_polys(&mut s2);
     wipe_polys(&mut t0);
 }
@@ -475,18 +505,9 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     }
     let a = matrix::<K, L>(rho);
 
-    let mut s1_ntt = s1;
-    let mut s2_ntt = s2;
-    let mut t0_ntt = t0;
-    for s in s1_ntt.iter_mut() {
-        s.ntt();
-    }
-    for s in s2_ntt.iter_mut() {
-        s.ntt();
-    }
-    for t in t0_ntt.iter_mut() {
-        t.ntt();
-    }
+    let mut s1_ntt = ntt_vec(&s1);
+    let mut s2_ntt = ntt_vec(&s2);
+    let mut t0_ntt = ntt_vec(&t0);
 
     let mut mu = [0u8; 64];
     {
@@ -509,7 +530,7 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     // candidates are overwritten by the next attempt and the final values are
     // wiped once after the loop.
     let mut y = [Poly::zero(); L];
-    let mut y_ntt = [Poly::zero(); L];
+    let mut y_ntt = [[0i32; N]; L];
     let mut w = [Poly::zero(); K];
     let mut z = [Poly::zero(); L];
     let mut r0 = [[0i32; N]; K];
@@ -519,20 +540,15 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         // permutation when the AVX2 kernel is available).
         expand_mask_vec(&mut y, &mut seed_buf, kappa, p.gamma1_bits);
 
-        for (i, yi) in y_ntt.iter_mut().enumerate() {
-            *yi = y[i];
-            yi.ntt();
+        for (yi, src) in y_ntt.iter_mut().zip(y.iter()) {
+            *yi = to_lazy(src);
+            ntt_lazy(yi);
         }
 
         // w = A·y; w1 = HighBits(w).
         let mut w1 = [Poly::zero(); K];
         for i in 0..K {
-            let mut acc = Poly::zero();
-            for j in 0..L {
-                acc = acc.add(&ntt_mul(&a[i][j], &y_ntt[j]));
-            }
-            acc.inv_ntt();
-            w[i] = acc;
+            w[i] = matrix_row_mul(&a, i, &y_ntt);
             for jj in 0..N {
                 w1[i].c[jj] = high_bits(w[i].c[jj], p.gamma2);
             }
@@ -560,15 +576,15 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         // challenge (not z, not y) is exposed.
         crate::ct::declassify(ctilde);
         let c = sample_challenge(ctilde, p.tau);
-        let mut c_ntt = c;
-        c_ntt.ntt();
+        let mut c_ntt = to_lazy(&c);
+        ntt_lazy(&mut c_ntt);
 
         // z = y + c·s1.
         for i in 0..L {
-            let mut cs1 = ntt_mul(&c_ntt, &s1_ntt[i]);
-            cs1.inv_ntt();
-            z[i] = y[i].add(&cs1);
-            wipe_polys(core::slice::from_mut(&mut cs1));
+            let mut cs1 = ntt_mul_lazy(&c_ntt, &s1_ntt[i]);
+            invntt_lazy(&mut cs1);
+            z[i] = y[i].add(&from_lazy(&cs1));
+            Zeroize::zeroize(&mut cs1);
         }
         // FIPS 204 Algorithm 7 tests ‖z‖∞ and ‖r0‖∞ *jointly* (line 23), and
         // ‖ct0‖∞ with the hint count jointly (line 30). Keep that grouping:
@@ -581,15 +597,15 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         // already hashed), so it is overwritten with w − c·s2 for the hint
         // pass below instead of recomputing c·s2 there.
         for i in 0..K {
-            let mut cs2 = ntt_mul(&c_ntt, &s2_ntt[i]);
-            cs2.inv_ntt();
+            let mut cs2 = ntt_mul_lazy(&c_ntt, &s2_ntt[i]);
+            invntt_lazy(&mut cs2);
             for (jj, slot) in r0[i].iter_mut().enumerate() {
-                let r = sub(w[i].c[jj], cs2.c[jj]);
+                let r = sub(w[i].c[jj], caddq(cs2[jj]) as u32);
                 w[i].c[jj] = r;
                 let (_, low) = decompose(r, p.gamma2);
                 *slot = low;
             }
-            wipe_polys(core::slice::from_mut(&mut cs2));
+            Zeroize::zeroize(&mut cs2);
         }
         let r0_bad = vec_inf_norm_signed(&r0) >= (p.gamma2 - p.beta) as i32;
         // The reject decision is public (only the attempt count is
@@ -601,8 +617,10 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
 
         // ct0 = c·t0; bound check.
         for i in 0..K {
-            ct0[i] = ntt_mul(&c_ntt, &t0_ntt[i]);
-            ct0[i].inv_ntt();
+            let mut t = ntt_mul_lazy(&c_ntt, &t0_ntt[i]);
+            invntt_lazy(&mut t);
+            ct0[i] = from_lazy(&t);
+            Zeroize::zeroize(&mut t);
         }
         let ct0_bad = vec_inf_norm(&ct0) >= p.gamma2;
 
@@ -645,13 +663,13 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     Zeroize::zeroize(&mut rho_prime);
     Zeroize::zeroize(&mut seed_buf);
     wipe_polys(&mut s1);
-    wipe_polys(&mut s1_ntt);
+    wipe_lazy(&mut s1_ntt);
     wipe_polys(&mut s2);
-    wipe_polys(&mut s2_ntt);
+    wipe_lazy(&mut s2_ntt);
     wipe_polys(&mut t0);
-    wipe_polys(&mut t0_ntt);
+    wipe_lazy(&mut t0_ntt);
     wipe_polys(&mut y);
-    wipe_polys(&mut y_ntt);
+    wipe_lazy(&mut y_ntt);
     wipe_polys(&mut w);
     wipe_polys(&mut z);
     wipe_polys(&mut ct0);
@@ -708,20 +726,16 @@ pub(crate) fn verify_internal<const K: usize, const L: usize>(
 
     let a = matrix::<K, L>(rho);
     let c = sample_challenge(ctilde, p.tau);
-    let mut c_ntt = c;
-    c_ntt.ntt();
-    let mut z_ntt = z;
-    for zi in z_ntt.iter_mut() {
-        zi.ntt();
-    }
-    let mut t1_ntt = [Poly::zero(); K];
-    for i in 0..K {
-        let mut scaled = Poly::zero();
-        for jj in 0..N {
-            scaled.c[jj] = t1[i].c[jj] << D;
+    let mut c_ntt = to_lazy(&c);
+    ntt_lazy(&mut c_ntt);
+    let z_ntt = ntt_vec(&z);
+    // t1·2ᵈ < q for every 10-bit t1 (1023 · 2¹³ = q − 1), so it is canonical.
+    let mut t1_ntt = [[0i32; N]; K];
+    for (f, t) in t1_ntt.iter_mut().zip(t1.iter()) {
+        for (x, c) in f.iter_mut().zip(t.c.iter()) {
+            *x = (c << D) as i32;
         }
-        scaled.ntt();
-        t1_ntt[i] = scaled;
+        ntt_lazy(f);
     }
 
     // w'1 = UseHint(A·z − c·t1·2ᵈ), accumulated into the commitment hash.
@@ -729,12 +743,17 @@ pub(crate) fn verify_internal<const K: usize, const L: usize>(
     let mut h = Shake256::new();
     h.update(&mu);
     for i in 0..K {
-        let mut acc = Poly::zero();
+        // A·z − c·t1·2ᵈ, accumulated lazily: L + 1 Montgomery products each
+        // in (−q, q), well inside the inverse NTT's reduce32 range.
+        let mut acc = [0i32; N];
         for j in 0..L {
-            acc = acc.add(&ntt_mul(&a[i][j], &z_ntt[j]));
+            ntt_mul_acc(&mut acc, &a[i][j], &z_ntt[j]);
         }
-        acc = acc.sub(&ntt_mul(&c_ntt, &t1_ntt[i]));
-        acc.inv_ntt();
+        let ct1 = ntt_mul_lazy(&c_ntt, &t1_ntt[i]);
+        for (x, y) in acc.iter_mut().zip(ct1.iter()) {
+            *x -= *y;
+        }
+        let acc = invntt_acc(&mut acc);
         let mut w1 = Poly::zero();
         for jj in 0..N {
             w1.c[jj] = use_hint(hints[i].c[jj], acc.c[jj], p.gamma2);
@@ -778,19 +797,11 @@ pub(crate) fn derive_public_from_sk<const K: usize, const L: usize>(
         off += eb;
     }
     let a = matrix::<K, L>(rho);
-    let mut s1_ntt = s1;
-    for s in s1_ntt.iter_mut() {
-        s.ntt();
-    }
+    let mut s1_ntt = ntt_vec(&s1);
     let mut pkc = Cursor::new(pk_out);
     pkc.put(rho);
-    for i in 0..K {
-        let mut acc = Poly::zero();
-        for j in 0..L {
-            acc = acc.add(&ntt_mul(&a[i][j], &s1_ntt[j]));
-        }
-        acc.inv_ntt();
-        let t = acc.add(&s2[i]);
+    for (i, s2i) in s2.iter().enumerate() {
+        let t = matrix_row_mul(&a, i, &s1_ntt).add(s2i);
         let mut t1 = Poly::zero();
         for jj in 0..N {
             (t1.c[jj], _) = power2_round(t.c[jj]);
@@ -801,7 +812,7 @@ pub(crate) fn derive_public_from_sk<const K: usize, const L: usize>(
     // Wipe the unpacked secret vectors (and the NTT copy of s1) before they
     // drop — same hygiene as `sign_internal`.
     wipe_polys(&mut s1);
-    wipe_polys(&mut s1_ntt);
+    wipe_lazy(&mut s1_ntt);
     wipe_polys(&mut s2);
 }
 
