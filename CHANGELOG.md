@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/KarpelesLab/purecrypto/compare/v0.10.0...v0.10.1) - 2026-10-17
+
+### Added
+
+- *(bignum)* const-generic safegcd inversion up to nine limbs
+
+### Fixed
+
+- *(ct)* barriers and declassifications the Valgrind harness flagged after the perf pass
+- *(cli)* q_client survives ICMP port-unreachable on its UDP socket
+- *(hash)* gate BLAKE3 MSG_PERMUTATION to the SIMD backends that use it
+
+### Other
+
+- gate lean-build-only test and helper code after the perf pass
+- forward compcol's alloc feature; gate lean-build-only dead code
+- *(cli)* default certificate compression now reports zstd
+- *(aes)* word-oriented key expansion, batched UMAC KDF, POLYVAL without the byte-reversal window
+- *(aes)* register-resident AEGIS and AEZ kernels on a per-key AES-round backend
+- *(gcm)* fused AES-CTR + GHASH kernel on aarch64 (PMULL interleaved into the AES rounds)
+- *(cipher)* u128 CTR counter and XTS tweak arithmetic
+- *(cipher)* whole-block CFB/OFB paths, windowed CFB decrypt, direct CMAC absorb
+- *(aes)* const-generic round count, round-major 8-wide ARMv8 kernels
+- *(chacha20)* leave two-block tails to the scalar loop
+- *(des)* delta-swap IP/FP, rotate-and-mask E, P folded into nibble spreads
+- *(scrypt)* keep the BlockMix chaining value in words
+- *(cipher)* bitsliced S-boxes for ARIA, Camellia, SM4 and SEED
+- *(poly1305)* radix-2^44 limbs with 2- and 4-stripe Horner on 64-bit
+- *(chacha20)* NEON 2x4-way keystream kernel on aarch64
+- add RSA-3072/4096 sign and DH group14 agree lines
+- *(rsa)* incremental sieve keygen, bounded ladders, 256-prime fixed table
+- *(rsa)* fixed-width keys cache their Montgomery contexts and sign via the CRT
+- *(bignum)* R² by s+1 doublings and six squarings; fixed context at its significant width
+- *(dh,dsa)* cache the Montgomery contexts in DhGroup and DsaParams
+- *(bignum)* one opaque mask per multi-limb select, flat window table
+- *(bignum)* merged two-rows-per-pass CIOS and squaring kernels
+- *(quic)* prefer secp256r1 in the server-preferred-group test
+- *(ec)* share the Weierstrass engine per limb width, keep only the field multiply per curve
+- *(ec)* binary-field multiply on PMULL / PCLMULQDQ with a bit-sliced fallback
+- *(ec)* no private intra-doc link from the public boxed module
+- *(ec)* stack-based, per-curve monomorphised runtime Weierstrass engine
+- *(curve25519)* signed 4-bit digits for the table-free scalar_mult
+- *(ed25519)* Straus verification with a static wNAF-8 base table
+- *(ed25519)* signed radix-16 Niels fixed-base table (115 KB -> 60 KB)
+- *(x25519)* multiply by a24 as a small constant
+- *(curve25519)* safegcd inversion for the field and the scalar ring
+- *(curve25519)* one barriered mask per select, swap and table gather
+- *(hash)* raw-compression short-message HMAC path for HKDF, HMAC-DRBG, KBKDF
+- *(hash)* aarch64 two-stream SHA-256 / SHA-512 multi-buffer kernels
+- *(hash)* aarch64 two-stream Keccak (FEAT_SHA3) and paired K12/M14 leaves
+- *(hash)* BLAKE3 NEON 4-chunk kernel, slice-direct blocks, bounded wipe
+- *(hash)* straight-line MD5, RIPEMD-160, SM3 and software SHA-1 rounds
+- *(hash)* compile-time Keccak round count
+- *(hash)* straight-line SHA-1/SHA-256 hardware kernels
+- *(secp256k1)* lazily reduced field elements in the native backend
+- *(zkp)* fixed-base comb for H behind `zkp-h-table`; two-comb rangeproof prover
+- *(secp256k1)* static width-8 generator tables for the vartime verifier
+- *(secp256k1)* constant-time GLV ladder, signed-digit comb, public-width mul
+- *(falcon)* per-leaf sampler constants, const 1/(2σmax²), small Babai products
+- *(slhdsa,xmss)* single-permutation SHAKE for one-block preimages
+- *(mldsa)* lazy signed-i32 NTT and in-place matrix-vector products
+- *(mlkem)* word-wise compress/decompress, cbd and from_bytes
+- *(slhdsa,lms,xmss)* multi-buffer batchers on every 64-bit target
+- *(bls)* do not link private div_rem_ct from public docs
+- *(bls)* GLV split for G1::mul and 4-D GLS split for G2::mul
+- *(bls)* one batched inversion to normalise all pairing inputs
+- *(bls)* Fp2 square root by the norm method, two Fp exponentiations
+- *(bls)* fused Miller-loop steps on the twist with mul_by_014 lines
+- *(bls)* Fp2 multiplication by fused sums of products; 3b by additions
+- *(bls)* Gt::pow by cyclotomic squaring and a masked 4-bit window
+- *(bls)* sparse cyclotomic exponentiation in the final exponentiation
+- *(quic)* delay 1-RTT ACKs per RFC 9000 §13.2 (every second packet)
+- *(quic)* reuse the receive scratch, append delivered data by slices
+- *(quic)* build and seal packets in place, carve stream data once
+- *(quic)* read the clock once per feed/pop/timeout call
+- *(quic)* O(1)-ish persistent-congestion check per loss batch
+- *(tls)* do not link the private CompressedCertificateCache from the module docs
+- *(tls)* decrypt TLS 1.2 records in place, encrypt straight into the output
+- *(tls)* cursor-based Stream reads, moved write buffers in the tokio adapter
+- *(tls)* scan TLS 1.3 inner plaintext padding 32 bytes at a time
+- *(x509)* verify with the parsed key; DER-only key-size policy probes
+- *(tls)* cache compressed Certificate messages, prefer zstd
+- *(tls)* build the NIST hybrid client shares through the kex helpers
+- *(tls)* derive the client's ML-KEM keys lazily, build each key share once
+- *(tls)* drop the secp384r1 share from the default ClientHello
+- *(p256)* odd signed-digit CT ladders, half-size comb, Jacobian verify
+- *(p256)* Montgomery-form base field with a const-p reduction kernel
+- *(curve448)* ed448-table fixed-base and wNAF-8 tables for Ed448
+- *(curve448)* one opaque mask per point selection and ladder swap
+- *(curve448)* dedicated 8x56-bit Solinas field for Ed448 and X448
+- *(dtls)* ACK on flight end or timer, coalesce a flight's records per datagram
+- *(dtls)* open and seal records in place, keep buffers across records
+- *(dtls)* build DTLS 1.3 client key shares once, expand ML-KEM keys lazily
+- raise MSRV to Rust 1.95
+- *(deps)* bump compcol to 0.7.2
+
 ## [0.10.0](https://github.com/KarpelesLab/purecrypto/compare/v0.9.9...v0.10.0) - 2026-10-17
 
 ### Fixed
