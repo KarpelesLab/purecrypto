@@ -21,7 +21,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::cipher::salsa20::salsa20_8;
+use crate::cipher::salsa20::salsa20_8_words;
 use crate::hash::Sha256;
 use crate::kdf::pbkdf2;
 use crate::zeroize::zero_bulk;
@@ -181,32 +181,42 @@ fn romix(x: &mut [u8], n: usize, r: usize, v: &mut [u8], y: &mut [u8]) {
     for _ in 0..n {
         let j = integerify(cur, r) % n as u64;
         let j_off = j as usize * block_size;
-        for k in 0..block_size {
-            cur[k] ^= v[j_off + k];
+        for (c, vj) in cur.iter_mut().zip(&v[j_off..j_off + block_size]) {
+            *c ^= *vj;
         }
         block_mix(cur, r, next);
         core::mem::swap(&mut cur, &mut next);
     }
 }
 
+/// Loads one 64-byte sub-block as words (the byte order is little-endian;
+/// on such targets this is sixteen plain loads).
+#[inline(always)]
+fn load_sub(b: &[u8]) -> [u32; 16] {
+    core::array::from_fn(|i| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().expect("4 bytes")))
+}
+
 /// BlockMix(B, r) — applies Salsa20/8 sequentially over `2r` 64-byte sub-blocks
 /// of `b` and writes them, reordered, into `out` (RFC 7914 §3): `Y_i` lands at
 /// position `i/2` for even `i` and `r + i/2` for odd `i`. `out` is fully
-/// overwritten.
+/// overwritten. The chaining value `X` stays in words throughout.
 fn block_mix(b: &[u8], r: usize, out: &mut [u8]) {
     let two_r = 2 * r;
     // X = B_{2r-1}.
-    let mut x = [0u8; 64];
-    x.copy_from_slice(&b[(two_r - 1) * 64..two_r * 64]);
+    let mut x = load_sub(&b[(two_r - 1) * 64..two_r * 64]);
 
     // Y_i = Salsa20/8(X ⊕ B_i); X' = Y_i for the next iteration.
     for i in 0..two_r {
-        for k in 0..64 {
-            x[k] ^= b[i * 64 + k];
+        let bi = load_sub(&b[i * 64..(i + 1) * 64]);
+        for (w, v) in x.iter_mut().zip(bi.iter()) {
+            *w ^= *v;
         }
-        salsa20_8(&mut x);
+        salsa20_8_words(&mut x);
         let pos = i / 2 + (i % 2) * r;
-        out[pos * 64..(pos + 1) * 64].copy_from_slice(&x);
+        let dst = &mut out[pos * 64..(pos + 1) * 64];
+        for (chunk, w) in dst.chunks_exact_mut(4).zip(x.iter()) {
+            chunk.copy_from_slice(&w.to_le_bytes());
+        }
     }
 }
 
@@ -214,7 +224,7 @@ fn block_mix(b: &[u8], r: usize, out: &mut [u8]) {
 /// little-endian u64.
 fn integerify(b: &[u8], r: usize) -> u64 {
     let off = (2 * r - 1) * 64;
-    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+    u64::from_le_bytes(b[off..off + 8].try_into().expect("8 bytes"))
 }
 
 #[cfg(test)]
