@@ -128,16 +128,54 @@ fn round(a: &mut [u64; 25], rc: u64) {
 /// The Keccak-p[1600, `rounds`] permutation over a 5×5 array of 64-bit lanes.
 ///
 /// `rounds == 24` is the full Keccak-f used by SHA-3, SHAKE, and KMAC; the
-/// reduced-round variant (`rounds == 12`, the last 12 round constants) is used
-/// by TurboSHAKE and KangarooTwelve. Constant time: bitwise operations only.
+/// reduced-round variants (the last `rounds` round constants) are 12 for
+/// TurboSHAKE / KangarooTwelve and 14 for MarsupilamiFourteen. Constant time:
+/// bitwise operations only.
+///
+/// The sponge carries its round count at runtime (the public
+/// [`KeccakReader`] wraps it, so it cannot be a type parameter), but the
+/// permutation body wants a compile-time trip count: with `rounds` opaque LLVM
+/// keeps a counted loop with a bounds-checked `RC` index, measured at ~10%
+/// over the `const` form across every SHA-3/SHAKE/KMAC/K12 block. So the three
+/// counts the crate uses are dispatched to [`keccak_p_const`] here, one
+/// predictable branch per permutation; any other count takes the generic loop.
+#[inline]
 pub(crate) fn keccak_p(a: &mut [u64; 25], rounds: usize) {
+    match rounds {
+        24 => keccak_p_const::<24>(a),
+        12 => keccak_p_const::<12>(a),
+        14 => keccak_p_const::<14>(a),
+        _ => {
+            for &i in COMPLEMENTED.iter() {
+                a[i] = !a[i];
+            }
+            for &rc in RC[24 - rounds..].iter() {
+                round(a, rc);
+            }
+            for &i in COMPLEMENTED.iter() {
+                a[i] = !a[i];
+            }
+        }
+    }
+}
+
+/// [`keccak_p`] with the round count fixed at compile time (`ROUNDS <= 24`).
+///
+/// Never inlined: each instantiation is a ~3 KB straight-line round body, and
+/// letting LLVM copy three of them into every absorb/squeeze call site
+/// measurably hurt (the opposite of the intent of [`keccak_p`]'s dispatch).
+#[inline(never)]
+pub(super) fn keccak_p_const<const ROUNDS: usize>(a: &mut [u64; 25]) {
     // Enter the lane-complemented representation, run the (identical) rounds,
     // and leave it again. The pattern is round-invariant, so the round count
-    // (24 or 12) does not matter.
+    // does not matter.
     for &i in COMPLEMENTED.iter() {
         a[i] = !a[i];
     }
-    for &rc in RC[24 - rounds..].iter() {
+    let rc: &[u64; ROUNDS] = RC[24 - ROUNDS..]
+        .try_into()
+        .expect("ROUNDS <= 24 round constants");
+    for &rc in rc.iter() {
         round(a, rc);
     }
     for &i in COMPLEMENTED.iter() {
