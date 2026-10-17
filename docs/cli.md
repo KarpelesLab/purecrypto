@@ -203,7 +203,9 @@ and `-certfile`; it refuses a key that does not match the leaf. The archive
 is the same shape `openssl pkcs12 -export` writes by default — PBES2 with
 PBKDF2-SHA256 and AES-256-CBC around the key, a SHA-256 MAC over the whole —
 and imports into macOS's Security framework and OpenSSL 3. Passwords come
-from `pass:STRING`, `env:VARIABLE` or `file:PATH` (first line); the
+from `pass:STRING`, `env:VARIABLE` or `file:PATH` (first line); `pass:`
+puts the password on the command line, visible to every local user, so the
+tool warns and the other two forms are preferred. The
 `-passin` side also reads the legacy 3DES/SHA-1 archives `openssl pkcs12
 -legacy` writes. Output holding a private key is written `0600`, never over
 an existing file.
@@ -386,7 +388,7 @@ purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_pro
                     [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk]
                     [-record_size_limit N] [-no_cert_comp | -cert_comp LIST [-cert_comp_own LIST]] [-read_timeout SECS]
                     [-resend N] [-keylogfile keys.log] [-quiet]
-                    [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]
+                    [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME (-psk HEX | -psk_file FILE) [-psk_hash sha384] [-psk_import [-psk_context STR]]]
                     [-ech-config-list list [-ech-retry-configs-out FILE] | -ech-grease]
 purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2 | -dtls1_2 | -dtls1_3]
                     [-min_protocol TLSv1.2] [-Verify ca.pem] [-alpn h2,http/1.1] [-www]
@@ -396,7 +398,7 @@ purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2 | -dtls1_2
                     [-key_update] [-status_file resp.der] [-enable_server_rpk]
                     [-enable_client_rpk -rpk_peer_key pub.pem] [-record_size_limit N]
                     [-no_cert_comp | -cert_comp LIST [-cert_comp_own LIST]] [-keylogfile keys.log] [-quiet]
-                    [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]]
+                    [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME (-psk HEX | -psk_file FILE) [-psk_hash sha384] [-psk_import [-psk_context STR]]]
                     [-ech-key key.bin -ech-config config.bin]
 ```
 
@@ -508,7 +510,10 @@ Behaviour worth knowing:
   `-psk_identity NAME -psk HEX` provisions an external PSK (OpenSSL's flag
   names), authenticating the handshake by the key with no certificate on
   either side; the key must be high-entropy (see
-  [recommended-usage](recommended-usage.md)). `-psk_hash sha384` pairs it
+  [recommended-usage](recommended-usage.md)). Prefer `-psk_file FILE` (hex
+  or raw bytes) over `-psk HEX`: a key on the command line is visible to
+  every local user through `ps` / `/proc/<pid>/cmdline`, and the tool warns
+  when it is used that way. `-psk_hash sha384` pairs it
   with the SHA-384 suite instead of SHA-256. `-psk_import` (optionally
   `-psk_context STR`) runs the pair through the RFC 9258 importer rather
   than using the key as given, which is what a BoringSSL peer expects. On
@@ -727,7 +732,7 @@ purecrypto q_client -connect host:port -alpn proto [-insecure] [-servername name
                     [-linger ms] [-quic_versions v1,v2] [-timeout secs] [-keylogfile keys.log] [-quiet]
 purecrypto q_server -cert cert.pem -key key.pem -accept host:port -alpn proto [-www] [-retry]
                     [-early-data] [-key-update] [-switch-cid] [-ciphersuites list] [-groups list]
-                    [-idle-timeout ms] [-quic_versions v1,v2] [-reset-key hex32] [-naccept N] [-timeout secs]
+                    [-idle-timeout ms] [-quic_versions v1,v2] [-reset-key hex32 | -reset-key-file FILE] [-naccept N] [-timeout secs]
                     [-keylogfile keys.log] [-quiet]
 ```
 
@@ -792,7 +797,9 @@ Server options:
   order (the client's is advisory). Default: `v1,v2`.
 - `-reset-key hex32` fixes the stateless-reset key (§10.3.1) so a restarted
   server still resets the connections its predecessor held; random
-  otherwise.
+  otherwise. `-reset-key-file FILE` (hex or raw bytes) keeps the key off the
+  command line, where `-reset-key` is visible to every local user (the tool
+  warns).
 - `-naccept N` exits after N connections have ended (default 1; `0` keeps
   serving until `-timeout secs`, default 30, elapses). `-www` answers the
   first bidirectional stream with a canned body instead of echoing.
