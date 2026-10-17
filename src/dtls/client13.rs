@@ -1421,8 +1421,12 @@ impl DtlsClientConnection13 {
             request_update: request_peer,
         }
         .encode();
+        // `message_seq` is 16 bits (RFC 9147 §5.2) and this path stays open
+        // for the life of the connection — the peer drives it with
+        // `update_requested` KeyUpdates — so running out is an error to
+        // surface, not an overflow to panic on.
         let msg_seq = self.out_msg_seq;
-        self.out_msg_seq += 1;
+        self.out_msg_seq = msg_seq.checked_add(1).ok_or(Error::TooManyRecords)?;
         for frag in write_fragments(
             hs_type::KEY_UPDATE,
             msg_seq,
@@ -1579,8 +1583,10 @@ impl DtlsClientConnection13 {
     /// Fragments and sends one post-handshake message under the current
     /// write keys, tracked for retransmission until acknowledged.
     fn send_post_handshake(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
+        // 16-bit `message_seq` (RFC 9147 §5.2) on a path the peer can drive
+        // (`RequestConnectionId`): exhaustion is an error, not a panic.
         let msg_seq = self.out_msg_seq;
-        self.out_msg_seq += 1;
+        self.out_msg_seq = msg_seq.checked_add(1).ok_or(Error::TooManyRecords)?;
         for frag in write_fragments(msg_type, msg_seq, body, self.max_fragment()) {
             self.emit_protected_handshake(frag)?;
         }

@@ -14,7 +14,7 @@ use crate::hash::Sha256;
 use crate::rng::HmacDrbg;
 use crate::tls::codec::{ClientHello, ExtensionType, NamedGroup, ReadCursor, ServerHello, hs_type};
 use crate::tls::pki::RootCertStore;
-use crate::tls::{ContentType, ProtocolVersion};
+use crate::tls::{ContentType, Error, ProtocolVersion};
 use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -400,6 +400,22 @@ fn connected_pair() -> (
     assert_eq!(client.read_epoch(), Some(3));
     assert_eq!(server.read_epoch(), Some(3));
     (client, server)
+}
+
+/// Regression: the post-handshake `message_seq` is 16 bits and the peer
+/// can drive it (`update_requested` KeyUpdates, `RequestConnectionId`).
+/// Running out must surface as `TooManyRecords`, not an overflow panic,
+/// and nothing goes out under a wrapped sequence number.
+#[test]
+fn post_handshake_message_seq_exhaustion_is_an_error_13() {
+    let (mut client, mut server) = connected_pair();
+    client.set_out_msg_seq_for_test(u16::MAX);
+    server.set_out_msg_seq_for_test(u16::MAX);
+    assert_eq!(client.request_key_update(false), Err(Error::TooManyRecords));
+    assert_eq!(server.request_key_update(false), Err(Error::TooManyRecords));
+    assert!(!client.key_update_pending() && !server.key_update_pending());
+    assert!(client.pop_outbound_datagrams().is_empty());
+    assert!(server.pop_outbound_datagrams().is_empty());
 }
 
 /// Server-initiated KeyUpdate: the server keeps writing under epoch 3

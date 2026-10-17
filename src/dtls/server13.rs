@@ -3093,8 +3093,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// datagrams). Each record is pushed to the outbound queue AND
     /// registered individually with the ACK-driven retransmit machine.
     fn emit_encrypted_handshake(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
+        // `message_seq` is 16 bits (RFC 9147 §5.2) and this path stays open
+        // for the life of the connection (tickets, KeyUpdate,
+        // NewConnectionId) — the peer drives it with `update_requested`
+        // KeyUpdates and `RequestConnectionId`s — so running out is an
+        // error to surface, not an overflow to panic on.
         let msg_seq = self.out_msg_seq;
-        self.out_msg_seq += 1;
+        self.out_msg_seq = msg_seq.checked_add(1).ok_or(Error::TooManyRecords)?;
         for frag in write_fragments(msg_type, msg_seq, body, self.max_fragment()) {
             let dg = self.encrypt_protected_record(ContentType::Handshake, &frag)?;
             let record_number = RecordNumber {
@@ -3152,6 +3157,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .encrypt_protected_record(ContentType::ApplicationData, data)
             .expect("protected write keys installed");
         self.out_dgrams.push(dg);
+    }
+
+    /// Test-only: pins the outbound handshake `message_seq`, so a test can
+    /// drive the counter to its end without 65 535 messages.
+    #[cfg(test)]
+    pub(crate) fn set_out_msg_seq_for_test(&mut self, seq: u16) {
+        self.out_msg_seq = seq;
     }
 
     /// Test-only: sends an arbitrary handshake message (`msg_type` + body)
