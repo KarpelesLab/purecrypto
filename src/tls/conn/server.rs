@@ -2260,17 +2260,16 @@ impl<R: RngCore> ServerConnection<R> {
         // TLS-1.3 server (we always top out at the highest version we
         // support), the only legitimate inclusion is when the client offered
         // only TLS 1.2 — but if `supported_versions` also offers 1.3, that's
-        // an attacker-driven downgrade and we MUST refuse with
-        // `inappropriate_fallback`. We surface it as `IllegalParameter` here
-        // because the existing alert code set doesn't carry the dedicated
-        // 86 / `inappropriate_fallback` description.
+        // an attacker-driven downgrade and we refuse with the dedicated
+        // `inappropriate_fallback` (86) alert, as the TLS 1.2 engine does
+        // (`AlertDescription::INAPPROPRIATE_FALLBACK`).
         const TLS_FALLBACK_SCSV: super::super::codec::CipherSuite =
             super::super::codec::CipherSuite(0x5600);
         if ch.cipher_suites.contains(&TLS_FALLBACK_SCSV)
             && let Some(sv_ext) = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
             && ext::client_offers_tls13(sv_ext).unwrap_or(false)
         {
-            return Err(Error::IllegalParameter);
+            return Err(Error::InappropriateFallback);
         }
 
         // RFC 8446 §4.2.11: when pre_shared_key is present, it MUST be the
@@ -4607,7 +4606,11 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::Decode => AlertDescription::DecodeError,
         Error::UnexpectedMessage => AlertDescription::UnexpectedMessage,
         Error::BadRecordMac => AlertDescription::BadRecordMac,
+        // A rejected client certificate (mTLS) is `bad_certificate`, as on
+        // the client side — not a generic `handshake_failure`.
+        Error::BadCertificate => AlertDescription::BadCertificate,
         Error::UnsupportedVersion => AlertDescription::ProtocolVersion,
+        Error::InappropriateFallback => AlertDescription::INAPPROPRIATE_FALLBACK,
         Error::PeerMisbehaved | Error::InappropriateState | Error::IllegalParameter => {
             AlertDescription::IllegalParameter
         }
