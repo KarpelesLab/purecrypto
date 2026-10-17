@@ -9,6 +9,11 @@
 
 use super::super::fpr::Fpr;
 use super::{SamplerRng, sampler_z};
+
+#[test]
+fn inv_2sigma2_const_matches_fpr() {
+    assert_eq!(super::INV_2SIGMA2.0, super::inv_2sigma2().0);
+}
 use crate::test_util::from_hex_vec;
 use alloc::vec::Vec;
 

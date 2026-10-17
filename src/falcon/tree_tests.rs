@@ -101,7 +101,12 @@ fn tree_has_n_leaves() {
         let fft = Fft::new(n);
         let b = synthetic_basis(&mut rng, &fft, n);
         let g = gram(&b);
-        let tree = ffldl(&fft, &g, Fpr::from_f64(165.736_617_182_977_6));
+        let tree = ffldl(
+            &fft,
+            &g,
+            Fpr::from_f64(165.736_617_182_977_6),
+            Fpr::from_f64(1.277_833_696_912_833_7),
+        );
         assert_eq!(count_leaves(&tree), n, "n={n} leaf count");
     }
 }
@@ -115,14 +120,14 @@ fn ffsampling_integral_and_deterministic() {
         let fft = Fft::new(n);
         let b = synthetic_basis(&mut rng, &fft, n);
         let g = gram(&b);
-        let tree = ffldl(&fft, &g, sigma);
+        let tree = ffldl(&fft, &g, sigma, sigmin);
 
         // Arbitrary target in FFT form (from a small real vector).
         let t0 = fft.fft(&rng.small_poly(n));
         let t1 = fft.fft(&rng.small_poly(n));
 
-        let (z0a, z1a) = ff_sampling(&fft, &t0, &t1, n, &tree, sigmin, &mut DetRng(42));
-        let (z0b, z1b) = ff_sampling(&fft, &t0, &t1, n, &tree, sigmin, &mut DetRng(42));
+        let (z0a, z1a) = ff_sampling(&fft, &t0, &t1, n, &tree, &mut DetRng(42));
+        let (z0b, z1b) = ff_sampling(&fft, &t0, &t1, n, &tree, &mut DetRng(42));
         // Determinism: identical random stream → identical output.
         assert!(
             maxdiff(&z0a, &z0b) == 0.0 && maxdiff(&z1a, &z1b) == 0.0,

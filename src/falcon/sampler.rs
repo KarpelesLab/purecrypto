@@ -92,15 +92,51 @@ const ILN2: Fpr = Fpr::from_f64(1.442_695_040_89);
 const LN2: Fpr = Fpr::from_f64(0.693_147_180_56);
 /// `2⁶³` as a double (exactly representable).
 const TWO63: Fpr = Fpr::from_f64(9_223_372_036_854_775_808.0);
-/// `σ_max = 1.8205`.
+/// `σ_max = 1.8205` (the literal inside [`INV_2SIGMA2`]; kept for the test
+/// that pins that constant to the emulated computation).
+#[cfg(test)]
 const MAX_SIGMA: Fpr = Fpr::from_f64(1.8205);
 
-/// `1 / (2·σ_max²)`, computed in `Fpr` to match the reference's double exactly.
-#[inline]
+/// `1 / (2·σ_max²)`, the reference's `1 / (2 * (MAX_SIGMA ** 2))`. Under a
+/// correctly-rounded libm `x ** 2 == x * x`, doubling is exact, and `const`
+/// `f64` arithmetic is IEEE round-to-nearest like `Fpr`, so this literal is
+/// bit-identical to the emulated computation (pinned by
+/// `inv_2sigma2_const_matches_fpr`) without two emulated operations per
+/// sample.
+const INV_2SIGMA2: Fpr = Fpr::from_f64(1.0 / (2.0 * 1.8205 * 1.8205));
+
+/// `1 / (2·σ_max²)` computed in `Fpr`, the reference for [`INV_2SIGMA2`].
+#[cfg(test)]
 fn inv_2sigma2() -> Fpr {
-    // Reference: `1 / (2 * (MAX_SIGMA ** 2))`. Under a correctly-rounded libm,
-    // `x ** 2 == x * x`, so `(2*σ)*σ` reproduces it.
     Fpr::from_f64(1.0).div(MAX_SIGMA.double().mul(MAX_SIGMA))
+}
+
+/// The per-leaf sampler parameters derived from a leaf deviation `σ'`:
+/// `dss = 1 / (2σ'²)` and `ccs = σ_min / σ'`. Two emulated divisions, so the
+/// LDL tree stores them once per leaf instead of recomputing them for every
+/// sample (about 4% of signing).
+#[derive(Clone, Copy)]
+pub(crate) struct LeafParams {
+    pub(crate) sigma: Fpr,
+    pub(crate) dss: Fpr,
+    pub(crate) ccs: Fpr,
+}
+
+impl LeafParams {
+    pub(crate) fn new(sigma: Fpr, sigmin: Fpr) -> LeafParams {
+        // dss = 1 / (2·σ²); reference writes `2 * sigma * sigma` = (2σ)·σ.
+        let dss = Fpr::from_f64(1.0).div(sigma.double().mul(sigma));
+        let ccs = sigmin.div(sigma);
+        LeafParams { sigma, dss, ccs }
+    }
+}
+
+impl crate::zeroize::Zeroize for LeafParams {
+    fn zeroize(&mut self) {
+        self.sigma.zeroize();
+        self.dss.zeroize();
+        self.ccs.zeroize();
+    }
 }
 
 /// Half-Gaussian base sampler at `σ_max`: reads 9 bytes little-endian as a
@@ -173,12 +209,16 @@ fn ber_exp<R: SamplerRng>(x: Fpr, ccs: Fpr, rng: &mut R) -> bool {
 /// Consumes random bytes from `rng` in the reference order: per iteration,
 /// 9 bytes (base sampler), 1 byte (sign), then `ber_exp`'s bytes.
 pub(crate) fn sampler_z<R: SamplerRng>(mu: Fpr, sigma: Fpr, sigmin: Fpr, rng: &mut R) -> i64 {
+    sampler_z_leaf(mu, &LeafParams::new(sigma, sigmin), rng)
+}
+
+/// [`sampler_z`] with the per-leaf constants precomputed (see [`LeafParams`]).
+pub(crate) fn sampler_z_leaf<R: SamplerRng>(mu: Fpr, leaf: &LeafParams, rng: &mut R) -> i64 {
     let s = mu.floor();
     let r = mu.sub(Fpr::of_i64(s));
-    // dss = 1 / (2·σ²); reference writes `2 * sigma * sigma` = (2σ)·σ.
-    let dss = Fpr::from_f64(1.0).div(sigma.double().mul(sigma));
-    let ccs = sigmin.div(sigma);
-    let inv2s2 = inv_2sigma2();
+    let dss = leaf.dss;
+    let ccs = leaf.ccs;
+    let inv2s2 = INV_2SIGMA2;
     loop {
         let z0 = base_sampler(rng);
         let mut sign = [0u8; 1];

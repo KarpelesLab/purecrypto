@@ -175,7 +175,6 @@ impl Zint {
         Zint { neg, mag }
     }
 
-    #[cfg(test)]
     pub(crate) fn from_i128(v: i128) -> Zint {
         let neg = v < 0;
         let mut x = v.unsigned_abs();

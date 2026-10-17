@@ -18,7 +18,7 @@
 
 use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft, sub_fft, wipe_cplx};
 use super::fpr::Fpr;
-use super::sampler::{SamplerRng, sampler_z};
+use super::sampler::{LeafParams, SamplerRng, sampler_z_leaf};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -29,8 +29,9 @@ pub(crate) type Gram = [[Vec<Cplx>; 2]; 2];
 /// A node of the Falcon LDL tree.
 pub(crate) enum FftTree {
     /// Bottom of the recursion: the normalized leaf standard deviation
-    /// `σ / √(D[0].re)` used directly as the [`sampler_z`] sigma.
-    Leaf(Fpr),
+    /// `σ / √(D[0].re)` used as the [`sampler_z_leaf`] sigma, with the
+    /// sampler's derived per-leaf constants.
+    Leaf(LeafParams),
     /// Internal node: the `L₁₀` factor (length-`m` FFT array) and the two
     /// half-size subtrees from the diagonal bisection.
     Node {
@@ -47,7 +48,11 @@ impl FftTree {
     #[cfg(feature = "__ct-check")]
     pub(crate) fn ct_classify(&self) {
         match self {
-            FftTree::Leaf(sigma) => crate::ct::classify_val(sigma),
+            FftTree::Leaf(leaf) => {
+                crate::ct::classify_val(&leaf.sigma);
+                crate::ct::classify_val(&leaf.dss);
+                crate::ct::classify_val(&leaf.ccs);
+            }
             FftTree::Node { l10, left, right } => {
                 crate::ct::classify_val(l10.as_slice());
                 left.ct_classify();
@@ -64,8 +69,8 @@ impl FftTree {
     /// dropped. Recursion depth is `log₂ n` (≤ 10).
     pub(crate) fn wipe(&mut self) {
         match self {
-            FftTree::Leaf(sigma) => {
-                crate::zeroize::Zeroize::zeroize(sigma);
+            FftTree::Leaf(leaf) => {
+                crate::zeroize::Zeroize::zeroize(leaf);
             }
             FftTree::Node { l10, left, right } => {
                 wipe_cplx(l10);
@@ -116,10 +121,11 @@ fn vec_zero(m: usize) -> Vec<Cplx> {
 }
 
 /// Build the normalized Falcon tree from a Gram matrix `g` (logical size-`m`
-/// entries, `m ≥ 2`), for signing standard deviation `sigma`. Folds the
-/// `normalize_tree` pass into construction: leaves are stored as
-/// `sigma / √(D_ii[0].re)`.
-pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr) -> FftTree {
+/// entries, `m ≥ 2`), for signing standard deviation `sigma` and the
+/// parameter set's `sigmin`. Folds the `normalize_tree` pass into
+/// construction: leaves are stored as `sigma / √(D_ii[0].re)` together with
+/// the sampler constants derived from that deviation and `sigmin`.
+pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr, sigmin: Fpr) -> FftTree {
     let m = 2 * g[0][0].len();
     // LDL*: D00 = G00; L10 = G10 / G00; D11 = G11 − L10·adj(L10)·G00.
     let mut d00 = g[0][0].clone();
@@ -134,8 +140,8 @@ pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr) -> FftTree {
         let (d11a, d11b) = fft.split_fft(&d11, m);
         let mut g0: Gram = [[d00a.clone(), d00b.clone()], [adj_fft(&d00b), d00a]];
         let mut g1: Gram = [[d11a.clone(), d11b.clone()], [adj_fft(&d11b), d11a]];
-        let left = Box::new(ffldl(fft, &g0, sigma));
-        let right = Box::new(ffldl(fft, &g1, sigma));
+        let left = Box::new(ffldl(fft, &g0, sigma, sigmin));
+        let right = Box::new(ffldl(fft, &g1, sigma, sigmin));
         // The bisected diagonal blocks are as key-equivalent as the tree they
         // build; only the tree itself (wiped by `FftTree::wipe`) may survive.
         wipe_gram(&mut g0);
@@ -143,8 +149,8 @@ pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr) -> FftTree {
         FftTree::Node { l10, left, right }
     } else {
         // m == 2: the two diagonal entries become normalized leaves.
-        let leaf0 = sigma.div(d00[0].re.sqrt());
-        let leaf1 = sigma.div(d11[0].re.sqrt());
+        let leaf0 = LeafParams::new(sigma.div(d00[0].re.sqrt()), sigmin);
+        let leaf1 = LeafParams::new(sigma.div(d11[0].re.sqrt()), sigmin);
         FftTree::Node {
             l10,
             left: Box::new(FftTree::Leaf(leaf0)),
@@ -167,14 +173,13 @@ pub(crate) fn ff_sampling<R: SamplerRng>(
     t1: &[Cplx],
     m: usize,
     tree: &FftTree,
-    sigmin: Fpr,
     rng: &mut R,
 ) -> (Vec<Cplx>, Vec<Cplx>) {
     match tree {
-        FftTree::Leaf(sigma) => {
+        FftTree::Leaf(leaf) => {
             // Length-1 arrays: sample both coordinates with the leaf sigma.
-            let z0 = sampler_z(t0[0].re, *sigma, sigmin, rng);
-            let z1 = sampler_z(t1[0].re, *sigma, sigmin, rng);
+            let z0 = sampler_z_leaf(t0[0].re, leaf, rng);
+            let z1 = sampler_z_leaf(t1[0].re, leaf, rng);
             (
                 alloc::vec![Cplx::new(Fpr::of_i64(z0), Fpr::from_f64(0.0))],
                 alloc::vec![Cplx::new(Fpr::of_i64(z1), Fpr::from_f64(0.0))],
@@ -183,13 +188,13 @@ pub(crate) fn ff_sampling<R: SamplerRng>(
         FftTree::Node { l10, left, right } => {
             // Sample the second coordinate first (split → recurse → merge).
             let (mut t1a, mut t1b) = fft.split_fft(t1, m);
-            let (mut z1a, mut z1b) = ff_sampling(fft, &t1a, &t1b, m / 2, right, sigmin, rng);
+            let (mut z1a, mut z1b) = ff_sampling(fft, &t1a, &t1b, m / 2, right, rng);
             let z1 = fft.merge_fft(&z1a, &z1b, m);
             // t0' = t0 + (t1 − z1)·L10.
             let mut diff = sub_fft(t1, &z1);
             let mut t0b = add_fft(t0, &mul_fft(&diff, l10));
             let (mut t0a, mut t0bb) = fft.split_fft(&t0b, m);
-            let (mut z0a, mut z0b) = ff_sampling(fft, &t0a, &t0bb, m / 2, left, sigmin, rng);
+            let (mut z0a, mut z0b) = ff_sampling(fft, &t0a, &t0bb, m / 2, left, rng);
             let z0 = fft.merge_fft(&z0a, &z0b, m);
             // Every split half, sub-result and the L10-corrected target are
             // functions of the secret basis and of the sampled lattice point;

@@ -228,6 +228,42 @@ fn karamul(a: &[Zint], b: &[Zint]) -> Vec<Zint> {
     (0..n).map(|i| ab[i].sub(&ab[i + n])).collect()
 }
 
+/// [`karamul`] for the Babai step's `f·k` / `g·k` products, whose operands
+/// are small at the outer recursion levels (`f`, `g` have single-limb
+/// coefficients and `k` is a rounded quotient): when every coefficient of
+/// both fits in 56 bits the negacyclic product is computed directly in
+/// `i128` (`|aᵢ·bⱼ| < 2¹¹²`, at most `2¹⁰` terms, so `< 2¹²²` — exact)
+/// instead of allocating a `Zint` per Karatsuba node; otherwise it falls
+/// back to [`karamul`]. Key generation is variable-time by design (the NTRU
+/// solve), so the operand-size dispatch leaks nothing new.
+fn mul_small_or_karamul(a: &[Zint], b: &[Zint]) -> Vec<Zint> {
+    const BOUND: u64 = 1 << 56;
+    let small = |p: &[Zint]| -> Option<Vec<i64>> {
+        p.iter()
+            .map(|c| c.to_i64().filter(|v| v.unsigned_abs() < BOUND))
+            .collect()
+    };
+    let (Some(x), Some(y)) = (small(a), small(b)) else {
+        return karamul(a, b);
+    };
+    let n = x.len();
+    let mut acc = alloc::vec![0i128; n];
+    for (i, &xi) in x.iter().enumerate() {
+        if xi == 0 {
+            continue;
+        }
+        for (j, &yj) in y.iter().enumerate() {
+            let p = xi as i128 * yj as i128;
+            if i + j < n {
+                acc[i + j] += p;
+            } else {
+                acc[i + j - n] -= p;
+            }
+        }
+    }
+    acc.iter().map(|&v| Zint::from_i128(v)).collect()
+}
+
 /// Galois conjugate `a(−x)`: negate odd-index coefficients.
 fn galois_conjugate(a: &[Zint]) -> Vec<Zint> {
     a.iter()
@@ -300,8 +336,8 @@ fn reduce(f: &[Zint], g: &[Zint], cap_f: &mut [Zint], cap_g: &mut [Zint]) {
         if k.iter().all(|z| z.is_zero()) {
             break;
         }
-        let fk = karamul(f, &k);
-        let gk = karamul(g, &k);
+        let fk = mul_small_or_karamul(f, &k);
+        let gk = mul_small_or_karamul(g, &k);
         let sh = big - size;
         for i in 0..n {
             cap_f[i] = cap_f[i].sub(&fk[i].shl(sh));

@@ -119,7 +119,7 @@ pub(crate) fn expand_key(
     }
     let mut basis = [[a.clone(), b.clone()], [c.clone(), d.clone()]];
     let mut g_gram = gram(&basis);
-    let tree = ffldl(&fft, &g_gram, sigma_of(degree));
+    let tree = ffldl(&fft, &g_gram, sigma_of(degree), sigmin_of(degree));
     // The basis copy and the Gram matrix are both secret-derived.
     wipe_gram(&mut basis);
     wipe_gram(&mut g_gram);
@@ -183,7 +183,7 @@ pub(crate) fn sign_internal<R: SamplerRng>(
 
     let mut result = None;
     for _ in 0..MAX_SIGN_ATTEMPTS {
-        let (mut z0, mut z1) = ff_sampling(&key.fft, &t0, &t1, n, &key.tree, key.sigmin, rng);
+        let (mut z0, mut z1) = ff_sampling(&key.fft, &t0, &t1, n, &key.tree, rng);
 
         // v = z·B; s = (c, 0) − v.
         let mut v0 = key
