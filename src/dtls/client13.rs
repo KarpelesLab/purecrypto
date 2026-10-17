@@ -309,6 +309,32 @@ struct RetiredWrite {
     seq: u64,
 }
 
+/// The `(d, z)` seeds of an ML-KEM key pair (FIPS 203 §7.1), held until
+/// the key is expanded with `from_seeds` — or never, when no share needs
+/// it. Wiped on drop like the key they derive.
+struct MlKemSeeds {
+    d: [u8; 32],
+    z: [u8; 32],
+}
+
+impl MlKemSeeds {
+    /// Draws the seeds in the order `MlKem768DecapsKey::generate` does.
+    fn draw<R: RngCore>(rng: &mut R) -> Self {
+        let mut d = [0u8; 32];
+        let mut z = [0u8; 32];
+        rng.fill_bytes(&mut d);
+        rng.fill_bytes(&mut z);
+        Self { d, z }
+    }
+}
+
+impl Drop for MlKemSeeds {
+    fn drop(&mut self) {
+        crate::zeroize::Zeroize::zeroize(&mut self.d);
+        crate::zeroize::Zeroize::zeroize(&mut self.z);
+    }
+}
+
 /// A DTLS 1.3 client connection.
 pub struct DtlsClientConnection13 {
     config: ClientConfig13Internal,
@@ -384,19 +410,30 @@ pub struct DtlsClientConnection13 {
     /// never reach a server that has not completed the handshake.
     close_notify_held: bool,
 
-    /// Random + key material. All four keypairs are pre-generated so the
-    /// matching `key_share` is ready regardless of which group the server
-    /// picks (or selects via HelloRetryRequest).
+    /// Random + key material. The ECDHE scalar of every group is drawn up
+    /// front — cheap, the public point is only computed when a share is
+    /// built — so the `key_share` of whichever group the server selects via
+    /// HelloRetryRequest can be made without an RNG.
     x25519: X25519PrivateKey,
     p256: BoxedEcdhPrivateKey,
     p384: BoxedEcdhPrivateKey,
     /// Ephemeral P-521 key, for secp521r1.
     p521: BoxedEcdhPrivateKey,
     /// Ephemeral ML-KEM-768 key, shared by the X25519MLKEM768 and
-    /// SecP256r1MLKEM768 shares (RFC 9954 §3.2 allows it).
-    mlkem: MlKem768DecapsKey,
-    /// Ephemeral ML-KEM-1024 key, for SecP384r1MLKEM1024.
-    mlkem1024: alloc::boxed::Box<MlKem1024DecapsKey>,
+    /// SecP256r1MLKEM768 shares (RFC 9954 §3.2 allows it). Expanded from
+    /// `mlkem_seeds` the first time a share needs it.
+    mlkem: Option<MlKem768DecapsKey>,
+    mlkem_seeds: MlKemSeeds,
+    /// Ephemeral ML-KEM-1024 key, for SecP384r1MLKEM1024; expanded from
+    /// `mlkem1024_seeds` on demand (a HelloRetryRequest asking for the
+    /// group — it is not in the default share set).
+    mlkem1024: Option<alloc::boxed::Box<MlKem1024DecapsKey>>,
+    mlkem1024_seeds: MlKemSeeds,
+    /// The serialised `key_share` entries built so far, by group. CH2 after
+    /// a cookie-only HelloRetryRequest repeats CH1's shares byte for byte
+    /// (RFC 8446 §4.1.2), straight from here — no public point is computed
+    /// twice.
+    share_cache: Vec<(NamedGroup, Vec<u8>)>,
     client_random: Random,
     server_random: Option<Random>,
 
@@ -526,8 +563,11 @@ impl DtlsClientConnection13 {
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
         let p521 = BoxedEcdhPrivateKey::generate(CurveId::P521, rng);
-        let (mlkem, _) = MlKem768DecapsKey::generate(rng);
-        let mlkem1024 = alloc::boxed::Box::new(MlKem1024DecapsKey::generate(rng).0);
+        // The ML-KEM keys are expanded from these seeds only when a share
+        // needs them (`share_for`): ML-KEM-1024 keygen alone is a third of
+        // the default ClientHello's cost, for a group no default share uses.
+        let mlkem_seeds = MlKemSeeds::draw(rng);
+        let mlkem1024_seeds = MlKemSeeds::draw(rng);
         let mut client_random: Random = [0u8; 32];
         rng.fill_bytes(&mut client_random);
         let cid_pool = draw_cid_pool(rng, config.connection_id.as_ref().map_or(0, |c| c.len()));
@@ -609,8 +649,11 @@ impl DtlsClientConnection13 {
             p256,
             p384,
             p521,
-            mlkem,
-            mlkem1024,
+            mlkem: None,
+            mlkem_seeds,
+            mlkem1024: None,
+            mlkem1024_seeds,
+            share_cache: Vec::new(),
             client_random,
             server_random: None,
             cookie_extension: None,
@@ -2163,7 +2206,10 @@ impl DtlsClientConnection13 {
                 let peer: [u8; 32] = server_pub[CIPHERTEXT_BYTES..]
                     .try_into()
                     .map_err(|_| Error::Decode)?;
-                let mut ml_ss = self.mlkem.decapsulate(&MlKem768Ciphertext::from_bytes(ct));
+                // A server selecting a group this hello carried no share
+                // for is a protocol violation (RFC 8446 §4.2.8).
+                let mlkem = self.mlkem.as_ref().ok_or(Error::IllegalParameter)?;
+                let mut ml_ss = mlkem.decapsulate(&MlKem768Ciphertext::from_bytes(ct));
                 // RFC 8446 §7.4.2: reject all-zero X25519 contribution.
                 let mut x_ss = self
                     .x25519
@@ -2185,11 +2231,13 @@ impl DtlsClientConnection13 {
                 kex::ecdhe_client(&self.p521, server_pub).map(|s| s.as_slice().to_vec())
             }
             NamedGroup::SECP256R1MLKEM768 => {
-                kex::p256_mlkem768_client(&self.p256, &self.mlkem, server_pub)
+                let mlkem = self.mlkem.as_ref().ok_or(Error::IllegalParameter)?;
+                kex::p256_mlkem768_client(&self.p256, mlkem, server_pub)
                     .map(|s| s.as_slice().to_vec())
             }
             NamedGroup::SECP384R1MLKEM1024 => {
-                kex::p384_mlkem1024_client(&self.p384, &self.mlkem1024, server_pub)
+                let mlkem = self.mlkem1024.as_ref().ok_or(Error::IllegalParameter)?;
+                kex::p384_mlkem1024_client(&self.p384, mlkem, server_pub)
                     .map(|s| s.as_slice().to_vec())
             }
             _ => Err(Error::HandshakeFailure),
@@ -2583,6 +2631,75 @@ impl DtlsClientConnection13 {
         Ok(())
     }
 
+    /// The ML-KEM-768 decapsulation key, expanded from its seeds on first
+    /// use.
+    fn mlkem768(&mut self) -> &MlKem768DecapsKey {
+        let seeds = &self.mlkem_seeds;
+        self.mlkem
+            .get_or_insert_with(|| MlKem768DecapsKey::from_seeds(&seeds.d, &seeds.z).0)
+    }
+
+    /// The ML-KEM-1024 decapsulation key, expanded from its seeds on first
+    /// use.
+    fn mlkem1024(&mut self) -> &MlKem1024DecapsKey {
+        let seeds = &self.mlkem1024_seeds;
+        self.mlkem1024.get_or_insert_with(|| {
+            alloc::boxed::Box::new(MlKem1024DecapsKey::from_seeds(&seeds.d, &seeds.z).0)
+        })
+    }
+
+    /// Our X25519 public key: taken from the X25519 share, or the tail of
+    /// the X25519MLKEM768 one, when either is already built; otherwise the
+    /// scalar multiplication.
+    fn x25519_public(&self) -> [u8; 32] {
+        for (g, share) in &self.share_cache {
+            match *g {
+                NamedGroup::X25519 => return share.as_slice().try_into().expect("32 bytes"),
+                NamedGroup::X25519MLKEM768 => {
+                    return share[share.len() - 32..].try_into().expect("32 bytes");
+                }
+                _ => {}
+            }
+        }
+        self.x25519.public_key()
+    }
+
+    /// The serialised `key_share` entry for `group`, built once per
+    /// connection (see `share_cache`). `None` for a group this client holds
+    /// no key for.
+    fn share_for(&mut self, group: NamedGroup) -> Option<Vec<u8>> {
+        if let Some((_, share)) = self.share_cache.iter().find(|(g, _)| *g == group) {
+            return Some(share.clone());
+        }
+        let share = match group {
+            NamedGroup::X25519 => self.x25519_public().to_vec(),
+            NamedGroup::SECP256R1 => self.p256.public_key().to_sec1(),
+            NamedGroup::SECP384R1 => self.p384.public_key().to_sec1(),
+            NamedGroup::SECP521R1 => self.p521.public_key().to_sec1(),
+            NamedGroup::X25519MLKEM768 => {
+                // Client share: ML-KEM-768 encapsulation key ‖ X25519 key
+                // (draft-ietf-tls-ecdhe-mlkem §3.1.1).
+                let x = self.x25519_public();
+                let mut share = self.mlkem768().encapsulation_key().to_bytes().to_vec();
+                share.extend_from_slice(&x);
+                share
+            }
+            NamedGroup::SECP256R1MLKEM768 => {
+                self.mlkem768();
+                let mlkem = self.mlkem.as_ref().expect("expanded above");
+                kex::p256_mlkem768_client_share(&self.p256, mlkem)
+            }
+            NamedGroup::SECP384R1MLKEM1024 => {
+                self.mlkem1024();
+                let mlkem = self.mlkem1024.as_ref().expect("expanded above");
+                kex::p384_mlkem1024_client_share(&self.p384, mlkem)
+            }
+            _ => return None,
+        };
+        self.share_cache.push((group, share.clone()));
+        Some(share)
+    }
+
     /// Builds the current ClientHello as DTLS handshake fragments, one per
     /// record to emit (RFC 9147 §4.4: a multi-share hello exceeds the MTU).
     /// If `self.cookie_extension` is set, the CH includes a `cookie`
@@ -2613,35 +2730,8 @@ impl DtlsClientConnection13 {
                     continue;
                 }
             }
-            match g {
-                NamedGroup::X25519 => {
-                    key_shares.push((NamedGroup::X25519, self.x25519.public_key().to_vec()))
-                }
-                NamedGroup::SECP256R1 => {
-                    key_shares.push((NamedGroup::SECP256R1, self.p256.public_key().to_sec1()))
-                }
-                NamedGroup::SECP384R1 => {
-                    key_shares.push((NamedGroup::SECP384R1, self.p384.public_key().to_sec1()))
-                }
-                NamedGroup::X25519MLKEM768 => {
-                    // Client share: ML-KEM-768 encapsulation key ‖ X25519 key
-                    // (draft-ietf-tls-ecdhe-mlkem §3.1.1).
-                    let mut share = self.mlkem.encapsulation_key().to_bytes().to_vec();
-                    share.extend_from_slice(&self.x25519.public_key());
-                    key_shares.push((NamedGroup::X25519MLKEM768, share));
-                }
-                NamedGroup::SECP521R1 => {
-                    key_shares.push((NamedGroup::SECP521R1, self.p521.public_key().to_sec1()))
-                }
-                NamedGroup::SECP256R1MLKEM768 => key_shares.push((
-                    NamedGroup::SECP256R1MLKEM768,
-                    kex::p256_mlkem768_client_share(&self.p256, &self.mlkem),
-                )),
-                NamedGroup::SECP384R1MLKEM1024 => key_shares.push((
-                    NamedGroup::SECP384R1MLKEM1024,
-                    kex::p384_mlkem1024_client_share(&self.p384, &self.mlkem1024),
-                )),
-                _ => {}
+            if let Some(share) = self.share_for(g) {
+                key_shares.push((g, share));
             }
         }
 
