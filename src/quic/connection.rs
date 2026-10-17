@@ -1116,6 +1116,22 @@ pub(crate) struct PacketMeta {
 /// to send, a protocol violation on our side).
 const MAX_LOCAL_ACTIVE_CID_LIMIT: u64 = 64;
 
+/// Ceiling on the `initial_max_streams_bidi` / `initial_max_streams_uni` this
+/// endpoint will advertise.
+///
+/// RFC 9000 §18.2 allows anything up to 2^60, but like the CID limit the
+/// value is a promise about state *we* hold: RFC 9000 §3.2 opens every
+/// lower-numbered stream of a type the moment the peer uses a higher one, so
+/// a single authenticated STREAM frame on ordinal `limit - 1` makes
+/// [`crate::quic::streams::Streams`] account for `limit` streams at once
+/// (the skipped ordinals are recorded individually until they are used or
+/// the stream window moves past them). Advertising an enormous limit would
+/// let one frame drive that much work and memory before any flow-control
+/// check, so the advertisement is capped at construction. 2^16 concurrent
+/// streams per direction is far beyond what any deployed application
+/// protocol asks for (HTTP/3 servers typically advertise 100).
+const MAX_LOCAL_INITIAL_MAX_STREAMS: u64 = 1 << 16;
+
 /// Rejects a [`QuicConfig::versions`] list the engine cannot honour: empty,
 /// with a repeated entry, or (client) not containing the configured
 /// [`QuicConfig::original_version`].
@@ -1160,6 +1176,19 @@ fn validate_local_transport_params(tp: &TransportParameters) -> Result<(), Error
     // shift overflow; refuse it up front like the peer would.
     if tp.ack_delay_exponent.is_some_and(|v| v > 20)
         || tp.max_ack_delay_ms.is_some_and(|v| v >= 1 << 14)
+    {
+        return Err(Error::IllegalParameter);
+    }
+    // The stream limits bound how much stream state one peer frame can make
+    // us materialise at once (RFC 9000 §3.2); see MAX_LOCAL_INITIAL_MAX_STREAMS.
+    // Only the *local* advertisement is capped — a peer may legitimately
+    // offer us up to 2^60.
+    if tp
+        .initial_max_streams_bidi
+        .is_some_and(|v| v > MAX_LOCAL_INITIAL_MAX_STREAMS)
+        || tp
+            .initial_max_streams_uni
+            .is_some_and(|v| v > MAX_LOCAL_INITIAL_MAX_STREAMS)
     {
         return Err(Error::IllegalParameter);
     }
@@ -13885,6 +13914,69 @@ mod tests {
         };
         s.validate_peer_transport_params(&good_tp)
             .expect("boundary-legal numeric params must pass");
+    }
+
+    /// F1 — the *local* stream limits are capped at construction
+    /// (`MAX_LOCAL_INITIAL_MAX_STREAMS`): advertising more would let one
+    /// peer STREAM frame on a high ordinal materialise that many implicitly
+    /// opened streams (RFC 9000 §3.2). The ceiling itself is accepted, on
+    /// both roles; the peer-side validator keeps taking up to 2^60 (covered
+    /// by `tp_server_rejects_out_of_range_numeric_params`).
+    #[test]
+    fn local_stream_limits_are_capped_at_construction() {
+        let (server_tls, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_tls = Config {
+            roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let with = |bidi: u64, uni: u64| TransportParameters {
+            initial_max_streams_bidi: Some(bidi),
+            initial_max_streams_uni: Some(uni),
+            ..loopback_params()
+        };
+        let cases = [
+            (MAX_LOCAL_INITIAL_MAX_STREAMS + 1, 3, true),
+            (100, MAX_LOCAL_INITIAL_MAX_STREAMS + 1, true),
+            (1 << 60, 1 << 60, true),
+            (
+                MAX_LOCAL_INITIAL_MAX_STREAMS,
+                MAX_LOCAL_INITIAL_MAX_STREAMS,
+                false,
+            ),
+        ];
+        for (bidi, uni, rejected) in cases {
+            let c = QuicConnection::client(
+                QuicConfig {
+                    tls: client_tls.clone(),
+                    transport_params: with(bidi, uni),
+                    ..QuicConfig::default()
+                },
+                "loopback.example",
+            );
+            let s = QuicConnection::server(QuicConfig {
+                tls: server_tls.clone(),
+                transport_params: with(bidi, uni),
+                ..QuicConfig::default()
+            });
+            if rejected {
+                assert!(
+                    matches!(c, Err(Error::IllegalParameter)),
+                    "client bidi={bidi} uni={uni} must be refused"
+                );
+                assert!(
+                    matches!(s, Err(Error::IllegalParameter)),
+                    "server bidi={bidi} uni={uni} must be refused"
+                );
+            } else {
+                assert!(c.is_ok(), "client at the ceiling is legal");
+                assert!(s.is_ok(), "server at the ceiling is legal");
+            }
+        }
     }
 
     /// The validator must reject a server's TP whose

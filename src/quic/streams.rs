@@ -1844,7 +1844,13 @@ impl Streams {
             // RFC 9000 §3.2 — the ordinals skipped over are now open too.
             // Bounded: `used - peer_bidi_closed` never exceeds the window
             // we advertised, and every such ordinal is either live in
-            // `map` or listed here.
+            // `map` or listed here. The window itself is capped at
+            // construction (`MAX_LOCAL_INITIAL_MAX_STREAMS` in
+            // `connection.rs`), so the burst of inserts a single frame on
+            // a high ordinal can cause is bounded too — and each ordinal
+            // is inserted at most once over the connection's lifetime
+            // (`peer_bidi_used` only grows), so the cost amortises to O(1)
+            // per peer frame.
             self.implicit_open_bidi
                 .extend(self.peer_bidi_used.min(ordinal)..ordinal);
             self.implicit_open_bidi.remove(&ordinal);
@@ -2159,6 +2165,41 @@ mod tests {
         assert_eq!(s.implicit_open_uni.len(), 5);
         assert_eq!(s.peer_uni_used, 8);
         assert!(s.implicit_open_uni.len() as u64 + s.map.len() as u64 <= 8);
+    }
+
+    /// F1 — the largest stream window a connection may advertise
+    /// (`MAX_LOCAL_INITIAL_MAX_STREAMS` in `connection.rs`, 2^16): one
+    /// STREAM frame on the highest permitted ordinal implicitly opens every
+    /// ordinal below it (RFC 9000 §3.2). The bookkeeping that creates stays
+    /// bounded by the window, a second frame on the same ordinal costs
+    /// nothing, and a frame one past the window is a STREAM_LIMIT_ERROR
+    /// that leaves the state untouched.
+    #[test]
+    fn implicit_open_burst_is_bounded_by_the_largest_advertisable_window() {
+        const WINDOW: u64 = 1 << 16;
+        let our = params_with(1 << 16, 1 << 20, WINDOW);
+        let peer = params_with(1 << 16, 1 << 20, 4);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        // Highest client-initiated bidi id the window allows: ordinal
+        // WINDOW-1.
+        let top = (WINDOW - 1) * 4;
+        s.on_stream(top, 0, false, b"x").expect("top ordinal opens");
+        assert_eq!(s.peer_bidi_used, WINDOW);
+        assert_eq!(s.map.len(), 1);
+        assert_eq!(s.implicit_open_bidi.len() as u64, WINDOW - 1);
+        // Materialising one of the implicitly-open ordinals is O(log n)
+        // and shrinks the set by exactly one.
+        s.on_stream(4 * 1234, 0, false, b"y")
+            .expect("implicitly-open ordinal");
+        assert_eq!(s.implicit_open_bidi.len() as u64, WINDOW - 2);
+        assert_eq!(s.map.len(), 2);
+        // Over the window: rejected without growing anything.
+        assert_eq!(
+            s.on_stream(top + 4, 0, false, b"z"),
+            Err(StreamError::StreamLimit)
+        );
+        assert_eq!(s.implicit_open_bidi.len() as u64, WINDOW - 2);
+        assert_eq!(s.peer_bidi_used, WINDOW);
     }
 
     /// QUIC-A2: RESET_STREAM must not pin a stream slot forever. Reading
