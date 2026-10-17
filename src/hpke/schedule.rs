@@ -274,8 +274,11 @@ impl SenderContext {
         }
         // Once the message limit has been reached, refuse *without* deriving
         // or using a nonce. This makes the limit sticky so a caller that
-        // ignored the first error cannot trigger nonce reuse.
-        if self.exhausted {
+        // ignored the first error cannot trigger nonce reuse. The check
+        // covers the saturation point itself too, so a call that reports
+        // `MessageLimitReached` never wrote a ciphertext into `out`.
+        if self.exhausted || seq_at_limit(self.seq, self.suite.aead) {
+            self.exhausted = true;
             return Err(Error::MessageLimitReached);
         }
         let nn = self.suite.aead.nonce_len();
@@ -378,8 +381,11 @@ impl ReceiverContext {
         if self.suite.aead.is_export_only() {
             return Err(Error::ExportOnly);
         }
-        // Sticky limit — symmetric to [`SenderContext::seal_into`].
-        if self.exhausted {
+        // Sticky limit — symmetric to [`SenderContext::seal_into`]: checked
+        // before the nonce is derived so no plaintext is produced for a
+        // call that reports failure.
+        if self.exhausted || seq_at_limit(self.seq, self.suite.aead) {
+            self.exhausted = true;
             return Err(Error::MessageLimitReached);
         }
         let nn = self.suite.aead.nonce_len();
@@ -494,21 +500,33 @@ fn export(
 
 /// `IncrementSeq()` (RFC 9180 §5.2): bumps `seq`, with overflow at
 /// `2^(8·Nn) − 1` mapped to [`Error::MessageLimitReached`].
+/// Whether `seq` sits at the RFC 9180 message limit for `aead`, i.e. the
+/// nonce for `seq` must not be used.
+///
+/// The spec limit is `2^(8·Nn) − 1`. For all wired AEADs Nn = 12,
+/// i.e. 2^96 − 1 — far beyond u64::MAX, so the only ceiling we will
+/// ever hit is u64::MAX. Smaller Nn (none today) would need an
+/// earlier cutoff; keep the computation correct anyway.
+fn seq_at_limit(seq: u64, aead: HpkeAead) -> bool {
+    if aead.is_export_only() {
+        return false;
+    }
+    let nn = aead.nonce_len();
+    if (8 * nn) >= 64 {
+        seq == u64::MAX
+    } else {
+        seq == (1u64 << (8 * nn)) - 1
+    }
+}
+
+/// Advances `seq` past a message that was just sealed / opened, refusing
+/// at the limit. `seal_into` / `open_into` check [`seq_at_limit`] *before*
+/// using the nonce, so the error here is a second line of defence.
 fn increment_seq(seq: &mut u64, aead: HpkeAead) -> Result<(), Error> {
     if aead.is_export_only() {
         return Ok(());
     }
-    let nn = aead.nonce_len();
-    // The spec limit is `2^(8·Nn) − 1`. For all wired AEADs Nn = 12,
-    // i.e. 2^96 − 1 — far beyond u64::MAX, so the only ceiling we will
-    // ever hit is u64::MAX. Smaller Nn (none today) would need an
-    // earlier cutoff; keep the computation correct anyway.
-    let limit_reached = if (8 * nn) >= 64 {
-        *seq == u64::MAX
-    } else {
-        *seq == (1u64 << (8 * nn)) - 1
-    };
-    if limit_reached {
+    if seq_at_limit(*seq, aead) {
         return Err(Error::MessageLimitReached);
     }
     *seq += 1;
@@ -578,10 +596,16 @@ mod tests {
         let suite = aes128_suite();
         let mut ctx = sender_at(suite, u64::MAX);
 
-        // First seal at seq == u64::MAX: increment_seq detects the limit and
-        // returns the error; the context is now poisoned.
-        let first = ctx.seal(b"aad", b"pt");
+        // First seal at seq == u64::MAX: the limit is detected before the
+        // nonce is derived — the error comes back with `out` untouched and
+        // the context is now poisoned.
+        let mut out = [0xa5u8; 64];
+        let first = ctx.seal_into(b"aad", b"pt", &mut out);
         assert_eq!(first, Err(Error::MessageLimitReached));
+        assert!(
+            out.iter().all(|&b| b == 0xa5),
+            "no ciphertext may be produced for a call that reports the limit"
+        );
         assert!(ctx.exhausted, "context must be poisoned after limit");
         // seq must be unchanged at the saturation point.
         assert_eq!(ctx.seq, u64::MAX);
