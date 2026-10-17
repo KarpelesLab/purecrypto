@@ -125,8 +125,8 @@ impl Scalar {
         Scalar(scalar_negate(&self.0, &f.l))
     }
 
-    /// The multiplicative inverse `self⁻¹ (mod L)`, constant-time via Fermat
-    /// (`self^(L-2)`). The inverse of `0` is `0`.
+    /// The multiplicative inverse `self⁻¹ (mod L)`, constant-time (a fixed
+    /// safegcd divstep schedule). The inverse of `0` is `0`.
     pub fn invert(&self) -> Scalar {
         let f = Field::new();
         Scalar(scalar_invert(&self.0, &f.l))

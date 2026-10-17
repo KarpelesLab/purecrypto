@@ -102,10 +102,10 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
 
     // result = x2 / z2 (or 0 if z2 == 0).
     //
-    // The inverse is the constant-time Fermat addition chain (`z^{p-2}`),
-    // NOT a variable-time extended-Euclidean inverse — z2 depends on the
-    // secret scalar and any timing variation here would leak. Fermat
-    // naturally returns 0 when z2 == 0, so the small-order /
+    // The inverse is the constant-time safegcd divstep machine (a fixed
+    // 590-step schedule with barriered masks), NOT a variable-time
+    // extended-Euclidean inverse — z2 depends on the secret scalar and any
+    // timing variation here would leak. It maps 0 to 0, so the small-order /
     // contributory-failure case yields the all-zero output without a
     // data-dependent branch.
     let out = x2.mul(&z2.invert()).to_bytes();
@@ -131,7 +131,7 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
 /// the identity because `k` is a multiple of 8 in `[2²⁵⁴, 2²⁵⁵)` and `L` is
 /// an odd prime above `2²⁵²`, so `1 − y ≠ 0`. Same constant-time discipline
 /// as the ladder: the comb gathers by masked scans, and the projective
-/// `(Z + Y)/(Z − Y)` costs one Fermat inversion.
+/// `(Z + Y)/(Z − Y)` costs one constant-time inversion.
 #[cfg(feature = "ed25519-table")]
 fn x25519_base(scalar: &[u8; 32]) -> [u8; 32] {
     let mut k = *scalar;

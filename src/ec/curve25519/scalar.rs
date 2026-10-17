@@ -7,6 +7,8 @@
 //! [`reduce512`], a constant-time Barrett reduction specialised to `L`.
 
 use crate::bignum::Uint;
+#[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
+use crate::bignum::safegcd::SafegcdModulus;
 use crate::ct::{Choice, ConditionallySelectable};
 
 use super::field::ScalarInt;
@@ -124,11 +126,28 @@ pub(crate) fn scalar_negate(a: &ScalarInt, l: &ScalarInt) -> ScalarInt {
     scalar_sub(&ScalarInt::ZERO, a, l)
 }
 
-/// Computes the modular inverse `a⁻¹ mod L` for `a < L` via Fermat's little
-/// theorem (`a^(L−2) mod L`), constant time in the value of `a`. `L` is prime,
-/// so this is well-defined for every nonzero `a`; the inverse of `0` is `0`.
+/// `L` prepared for constant-time safegcd inversion ([`scalar_invert`]).
+#[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
+const SAFEGCD_L: SafegcdModulus = SafegcdModulus::new(&super::field::L_INT);
+
+/// Computes the modular inverse `a⁻¹ mod L`, constant time in the value of
+/// `a`, by the Bernstein–Yang safegcd divstep machine ([`SafegcdModulus`]:
+/// a fixed 590-divstep schedule with barriered masks). The input is first
+/// canonicalised with one masked subtraction of `L`, so any `a < 2L`
+/// (every canonical scalar, plus the non-canonical encodings in `[L, 2L)`
+/// a caller might hand through) is accepted. `L` is prime, so this is
+/// well-defined for every nonzero `a`; the inverse of `0` is `0`.
 #[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
 pub(crate) fn scalar_invert(a: &ScalarInt, l: &ScalarInt) -> ScalarInt {
+    let (reduced, borrow) = a.sbb(l, 0);
+    let a = ScalarInt::conditional_select(&reduced, a, Choice::from((borrow ^ 1) as u8));
+    SAFEGCD_L.invert(&a)
+}
+
+/// The Fermat ladder `a^(L−2) mod L` the safegcd path replaced: a fixed
+/// 256-step square-and-masked-multiply, kept as the test oracle.
+#[cfg(all(test, any(feature = "hazmat-edwards25519", feature = "ristretto255")))]
+pub(crate) fn scalar_invert_fermat(a: &ScalarInt, l: &ScalarInt) -> ScalarInt {
     // exponent = L − 2
     let exp = l.wrapping_sub(&ScalarInt::from_u64(2));
     let mut r = ScalarInt::ONE;
@@ -173,6 +192,51 @@ mod tests {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    /// The safegcd inverse agrees with the Fermat ladder on edge scalars
+    /// (0 ↦ 0, 1, 2, L − 1, L − 2, and the non-canonical L, L + 1, 2L − 1
+    /// which the masked pre-subtraction folds into `[0, L)`) and on random
+    /// scalars; and `a · a⁻¹ ≡ 1`.
+    #[test]
+    #[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
+    fn scalar_invert_matches_fermat() {
+        let l = super::super::field::L_INT;
+        let ll = l.as_limbs();
+        let (two_l, _) = l.adc(&l, 0);
+        let edges = [
+            ScalarInt::ZERO,
+            ScalarInt::ONE,
+            ScalarInt::from_u64(2),
+            ScalarInt::from_limbs([ll[0] - 1, ll[1], ll[2], ll[3]]),
+            ScalarInt::from_limbs([ll[0] - 2, ll[1], ll[2], ll[3]]),
+            l,
+            ScalarInt::from_limbs([ll[0] + 1, ll[1], ll[2], ll[3]]),
+            two_l.wrapping_sub(&ScalarInt::ONE),
+        ];
+        let check = |a: &ScalarInt| {
+            let (reduced, borrow) = a.sbb(&l, 0);
+            let canon = if borrow == 1 { *a } else { reduced };
+            let inv = scalar_invert(a, &l);
+            assert_eq!(inv, scalar_invert_fermat(&canon, &l), "input {a:?}");
+            if canon != ScalarInt::ZERO {
+                assert_eq!(scalar_mul(&canon, &inv), ScalarInt::ONE, "a·a⁻¹ for {a:?}");
+            } else {
+                assert_eq!(inv, ScalarInt::ZERO);
+            }
+        };
+        for a in &edges {
+            check(a);
+        }
+        let mut st = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..200 {
+            let mut w = [0u64; 4];
+            for limb in &mut w {
+                *limb = next(&mut st);
+            }
+            w[3] &= 0x0fff_ffff_ffff_ffff; // < 2^252 < L
+            check(&ScalarInt::from_limbs(w));
+        }
     }
 
     #[test]
