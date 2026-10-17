@@ -543,7 +543,10 @@ Behaviour worth knowing:
   the server's certificate in its ClientHello, the server what it accepts
   for the client's certificate in its CertificateRequest (`-Verify`), and
   each side compresses its own certificate with the first of its
-  algorithms the peer listed — zlib, brotli, zstd, in that order.
+  algorithms the peer listed — zstd, zlib, brotli, in that order (zstd
+  has the best ratio and the cheapest decoder; brotli's encoder is a
+  hundred times the cost of the others for the worst ratio). A
+  certificate is compressed once per configuration, not per handshake.
   `-no_cert_comp` turns it off in both directions; `-cert_comp LIST` sets
   the algorithms accepted for the peer's certificate (names or codepoints,
   comma-separated, in preference order; `none` for an empty list) and,

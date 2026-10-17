@@ -74,6 +74,9 @@ pub(crate) struct CommonOpts<'a> {
     /// already defaulted to `cert_compression_algorithms` when unset.
     #[cfg(feature = "cert-compression")]
     pub own_cert_compression_algorithms: &'a [u16],
+    /// `Config::cert_compression_cache`, shared with the engine configs.
+    #[cfg(feature = "cert-compression")]
+    pub cert_compression_cache: &'a Arc<super::cert_compression::CompressedCertificateCache>,
     pub key_log: &'a Option<Arc<dyn KeyLog>>,
     pub rng: &'a Option<Arc<dyn EntropySource>>,
     pub signer: &'a Option<Arc<dyn HandshakeSigner>>,
@@ -162,6 +165,8 @@ impl Config {
             cert_compression_algorithms,
             #[cfg(feature = "cert-compression")]
             own_cert_compression_algorithms,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_cache,
             cookie_secret,
             previous_cookie_secret,
             require_cookie,
@@ -198,6 +203,8 @@ impl Config {
                 own_cert_compression_algorithms: own_cert_compression_algorithms
                     .as_deref()
                     .unwrap_or(cert_compression_algorithms),
+                #[cfg(feature = "cert-compression")]
+                cert_compression_cache,
                 key_log,
                 rng,
                 signer,

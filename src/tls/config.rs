@@ -500,6 +500,13 @@ pub struct Config {
     /// server that advertised in its `CertificateRequest`.
     #[cfg(feature = "cert-compression")]
     pub own_cert_compression_algorithms: Option<Vec<u16>>,
+    /// The compressed `Certificate` messages this endpoint has sent,
+    /// shared by every connection built from this configuration (clones
+    /// included) so each certificate is compressed once, not per
+    /// handshake. Keyed by algorithm and plaintext, so a changed identity
+    /// never hits a stale entry.
+    #[cfg(feature = "cert-compression")]
+    pub(crate) cert_compression_cache: Arc<super::cert_compression::CompressedCertificateCache>,
 
     // ---- DTLS-only (inert when version is TLS) ----
     /// 32-byte secret for stateless cookie issuance / validation. `None` on
@@ -734,6 +741,8 @@ impl Default for Config {
             cert_compression_algorithms: super::cert_compression::default_algorithms(),
             #[cfg(feature = "cert-compression")]
             own_cert_compression_algorithms: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_cache: Arc::default(),
             cookie_secret: None,
             previous_cookie_secret: None,
             require_cookie: true,

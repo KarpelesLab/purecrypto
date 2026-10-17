@@ -2153,6 +2153,8 @@ pub(crate) fn tls13_client_config(
         cert_compression_algorithms,
         #[cfg(feature = "cert-compression")]
         own_cert_compression_algorithms,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_cache,
         key_log,
         rng,
         signer,
@@ -2263,6 +2265,7 @@ pub(crate) fn tls13_client_config(
         cc = cc
             .with_cert_compression_algorithms(cert_compression_algorithms.to_vec())
             .with_own_cert_compression_algorithms(own_cert_compression_algorithms.to_vec());
+        cc.cert_compression_cache = cert_compression_cache.clone();
     }
     match transport {
         // Prime PSK resumption from a stored TLS 1.3 session, if one was
@@ -2313,6 +2316,8 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         cert_compression_algorithms,
         #[cfg(feature = "cert-compression")]
         own_cert_compression_algorithms,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_cache,
         key_log,
         rng,
         signer,
@@ -2346,7 +2351,11 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         external_psks,
     );
     #[cfg(feature = "cert-compression")]
-    let _ = (cert_compression_algorithms, own_cert_compression_algorithms);
+    let _ = (
+        cert_compression_algorithms,
+        own_cert_compression_algorithms,
+        cert_compression_cache,
+    );
     #[cfg(feature = "ech")]
     let _ = ech;
     #[cfg(not(feature = "tls-legacy"))]
@@ -2486,6 +2495,8 @@ pub(crate) fn tls13_server_config(
         cert_compression_algorithms,
         #[cfg(feature = "cert-compression")]
         own_cert_compression_algorithms,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_cache,
         key_log,
         rng,
         signer,
@@ -2594,6 +2605,7 @@ pub(crate) fn tls13_server_config(
         sc = sc
             .with_cert_compression_algorithms(cert_compression_algorithms.to_vec())
             .with_own_cert_compression_algorithms(own_cert_compression_algorithms.to_vec());
+        sc.cert_compression_cache = cert_compression_cache.clone();
     }
     #[cfg(feature = "ech")]
     if let Some(ech) = ech_server.clone() {
@@ -2658,6 +2670,8 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
         cert_compression_algorithms,
         #[cfg(feature = "cert-compression")]
         own_cert_compression_algorithms,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_cache,
         key_log,
         rng,
         signer,
@@ -2701,7 +2715,11 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     #[cfg(feature = "std")]
     let _ = replay_window;
     #[cfg(feature = "cert-compression")]
-    let _ = (cert_compression_algorithms, own_cert_compression_algorithms);
+    let _ = (
+        cert_compression_algorithms,
+        own_cert_compression_algorithms,
+        cert_compression_cache,
+    );
     #[cfg(feature = "ech")]
     let _ = ech_server;
     #[cfg(not(feature = "tls-legacy"))]
@@ -2812,6 +2830,8 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         cert_compression_algorithms,
         #[cfg(feature = "cert-compression")]
         own_cert_compression_algorithms,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_cache,
         key_log,
         rng,
         signer,
@@ -2856,7 +2876,11 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         signer,
     );
     #[cfg(feature = "cert-compression")]
-    let _ = (cert_compression_algorithms, own_cert_compression_algorithms);
+    let _ = (
+        cert_compression_algorithms,
+        own_cert_compression_algorithms,
+        cert_compression_cache,
+    );
 
     // Fail closed (see the doc comment above).
     #[cfg(feature = "ech")]
@@ -3191,6 +3215,8 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         cert_compression_algorithms,
         #[cfg(feature = "cert-compression")]
         own_cert_compression_algorithms,
+        #[cfg(feature = "cert-compression")]
+        cert_compression_cache,
         key_log,
         rng,
         signer,
@@ -3240,7 +3266,11 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         signer,
     );
     #[cfg(feature = "cert-compression")]
-    let _ = (cert_compression_algorithms, own_cert_compression_algorithms);
+    let _ = (
+        cert_compression_algorithms,
+        own_cert_compression_algorithms,
+        cert_compression_cache,
+    );
 
     let identity = identity.ok_or(Error::InappropriateState)?;
     // External PSKs are not implemented over DTLS (the engines resume only

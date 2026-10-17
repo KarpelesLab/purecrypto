@@ -457,9 +457,13 @@ pub(crate) struct ClientConfig {
     pub ech: Option<crate::tls::ech::EchClient>,
     /// RFC 8879 `CertificateCompressionAlgorithm` IDs the client can
     /// DECOMPRESS (covering the server's `Certificate`) and is willing
-    /// to USE when sending its own mTLS `Certificate`. Default `[1]`
-    /// (zlib). Empty disables the path entirely (no extension on the
-    /// wire; any `CompressedCertificate` received is rejected).
+    /// to USE when sending its own mTLS `Certificate`. Default: every
+    /// algorithm the build implements, zstd, zlib, brotli in that order
+    /// ([`cert_compression::default_algorithms`]). Empty disables the
+    /// path entirely (no extension on the wire; any
+    /// `CompressedCertificate` received is rejected).
+    ///
+    /// [`cert_compression::default_algorithms`]: crate::tls::cert_compression::default_algorithms
     #[cfg(feature = "cert-compression")]
     pub cert_compression_algorithms: Vec<u16>,
     /// The PSK key-exchange modes advertised in `psk_key_exchange_modes`
@@ -477,6 +481,12 @@ pub(crate) struct ClientConfig {
     /// compresses.
     #[cfg(feature = "cert-compression")]
     pub own_cert_compression_algorithms: Option<Vec<u16>>,
+    /// The compressed mTLS `Certificate` messages already built, shared
+    /// across the connections of one [`Config`](crate::tls::Config) (see
+    /// [`CompressedCertificateCache`](crate::tls::cert_compression::CompressedCertificateCache)).
+    #[cfg(feature = "cert-compression")]
+    pub(crate) cert_compression_cache:
+        Arc<crate::tls::cert_compression::CompressedCertificateCache>,
 }
 
 impl ClientConfig {
@@ -511,6 +521,8 @@ impl ClientConfig {
             external_psks: Vec::new(),
             #[cfg(feature = "cert-compression")]
             own_cert_compression_algorithms: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_cache: Arc::default(),
         }
     }
 
@@ -4626,8 +4638,7 @@ impl ClientConnection {
                 &self.cr_cert_compression_algorithms,
                 self.config.own_cert_compression_list(),
             )
-            && let Ok(compressed) =
-                crate::tls::cert_compression::encode_compressed_certificate(alg, &msg[4..])
+            && let Ok(compressed) = self.config.cert_compression_cache.encode(alg, &msg[4..])
         {
             self.own_cert_compression = Some(alg);
             self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, compressed);

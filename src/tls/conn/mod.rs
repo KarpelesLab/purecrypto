@@ -5047,15 +5047,15 @@ mod loopback_tests {
             server.peer_cert_compression_algorithms(),
             cert_compression::default_algorithms().as_slice()
         );
-        // The server's first preference (zlib) was used, and both sides
+        // The server's first preference (zstd) was used, and both sides
         // say so; nothing was requested of the client.
         assert_eq!(
             server.own_cert_compression(),
-            Some(cert_compression::algorithm::ZLIB)
+            Some(cert_compression::algorithm::ZSTD)
         );
         assert_eq!(
             client.peer_cert_compression(),
-            Some(cert_compression::algorithm::ZLIB)
+            Some(cert_compression::algorithm::ZSTD)
         );
         assert_eq!(client.own_cert_compression(), None);
         assert_eq!(server.peer_cert_compression(), None);
@@ -5189,7 +5189,7 @@ mod loopback_tests {
         cases.push((
             cert_compression::default_algorithms(),
             cert_compression::default_algorithms(),
-            cert_compression::algorithm::ZLIB,
+            cert_compression::algorithm::ZSTD,
         ));
         // The client's order decides, not the server's.
         cases.push((
@@ -5222,12 +5222,10 @@ mod loopback_tests {
                 Some(expected),
                 "client send list {client_send:?}"
             );
-            // The server's own certificate was compressed independently
-            // (the client accepts the defaults).
-            assert_eq!(
-                server.own_cert_compression(),
-                Some(cert_compression::algorithm::ZLIB)
-            );
+            // The server's own certificate was compressed independently,
+            // with the first of its own list (the client accepts the
+            // defaults, which list every algorithm).
+            assert_eq!(server.own_cert_compression(), Some(server_accept[0]));
         }
     }
 

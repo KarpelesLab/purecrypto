@@ -359,6 +359,12 @@ pub(crate) struct ServerConfig {
     /// as `cert_compression_algorithms`. Empty never compresses.
     #[cfg(feature = "cert-compression")]
     pub(crate) own_cert_compression_algorithms: Option<Vec<u16>>,
+    /// The compressed `Certificate` messages already built, shared across
+    /// the connections of one [`Config`](crate::tls::Config) (see
+    /// [`CompressedCertificateCache`](crate::tls::cert_compression::CompressedCertificateCache)).
+    #[cfg(feature = "cert-compression")]
+    pub(crate) cert_compression_cache:
+        Arc<crate::tls::cert_compression::CompressedCertificateCache>,
     /// Encrypted Client Hello (draft-ietf-tls-esni-22) server-side
     /// state: the key ring this server tries to HPKE-decrypt incoming
     /// `encrypted_client_hello` extensions with, plus the
@@ -443,6 +449,8 @@ impl ServerConfig {
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
             #[cfg(feature = "cert-compression")]
             own_cert_compression_algorithms: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_cache: Arc::default(),
             #[cfg(feature = "ech")]
             ech_server: None,
             key_log: None,
@@ -3403,9 +3411,7 @@ impl<R: RngCore> ServerConnection<R> {
             // wrapper.
             debug_assert_eq!(msg[0], hs_type::CERTIFICATE);
             let cert_body = &msg[4..];
-            if let Ok(compressed) =
-                crate::tls::cert_compression::encode_compressed_certificate(alg, cert_body)
-            {
+            if let Ok(compressed) = self.config.cert_compression_cache.encode(alg, cert_body) {
                 self.own_cert_compression = Some(alg);
                 self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, compressed);
                 return;
