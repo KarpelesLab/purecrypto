@@ -10,7 +10,8 @@ use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 use crate::zeroize::Zeroize;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
-/// `(p - 1) / 2` — used by the `Fp2` square root.
+/// `(p - 1) / 2` — a test exponent for the public-exponent window.
+#[cfg(test)]
 const P_MINUS_1_DIV_2: [u64; 6] = [
     0xdcff7fffffffd555,
     0x0f55ffff58a9ffff,
@@ -183,28 +184,35 @@ impl Fp2 {
 
     /// A square root, `None` when `self` is a non-residue.
     ///
-    /// Algorithm 9 of <https://eprint.iacr.org/2012/685> for `p ≡ 3 (mod 4)`,
-    /// made constant time: both candidate roots are computed and selected by
-    /// mask, and the result is verified by squaring so the flag is exact.
+    /// The norm method for `Fp2 = Fp[u]/(u² + 1)`, `p ≡ 3 (mod 4)`, in two
+    /// `Fp` exponentiations and no inversion. With `a = a0 + a1·u`,
+    /// `s = √(a0² + a1²)` and `δ = (a0 + s)/2`, the root is `x0 + x1·u`
+    /// with `x0² ∈ {δ, δ'}` for `δ' = (a0 - s)/2 = -a1²/(4δ)` — exactly one
+    /// of the two is a residue — and `2·x0·x1 = a1`. From
+    /// `w = δ^((3p-5)/4) = 1/δ^((p+1)/4)`: `χ(δ) = δ·w² = ±1`,
+    /// `t = χ·δ·w` squares to `δ` (residue) or `-δ` (non-residue), and
+    /// `a1·w/2` is the other coordinate in both cases: the root is
+    /// `t + (a1·w/2)·u` when `δ` is a residue and `(a1·w/2) + t·u`
+    /// otherwise. `δ = 0` (then `a1 = 0`, `a0` a non-residue, `s = -a0`)
+    /// takes `s` in place of `δ` and the second shape: `√(s)·u`.
+    ///
+    /// Constant time: fixed exponent schedules, both shapes computed and
+    /// selected by mask; the result is verified by squaring so the flag is
+    /// exact (a non-residue input yields garbage that fails the check).
     pub fn sqrt(&self) -> CtOption<Fp2> {
-        // a1 = self^((p-3)/4); alpha = a1²·self = self^((p-1)/2);
-        // x0 = a1·self = self^((p+1)/4).
-        let a1 = self.pow_public_exp(&super::fp::P_MINUS_3_DIV_4);
-        let alpha = a1.square().mul(self);
-        let x0 = a1.mul(self);
-        // alpha == -1: self is the square of a subfield element times u,
-        // the root is x0·u = -x0.c1 + x0.c0·u.
-        let cand_a = Fp2 {
-            c0: x0.c1.neg(),
-            c1: x0.c0,
-        };
-        // Otherwise the root is (1 + alpha)^((p-1)/2) · x0.
-        let cand_b = alpha
-            .add(&Fp2::ONE)
-            .pow_public_exp(&P_MINUS_1_DIV_2)
-            .mul(&x0);
-        let is_minus_one = alpha.ct_eq(&Fp2::ONE.neg());
-        let cand = Fp2::conditional_select(&cand_a, &cand_b, is_minus_one);
+        let n = self.c0.square().add(&self.c1.square());
+        let s = n.pow_public_exp(&super::fp::P_PLUS_1_DIV_4);
+        let delta = self.c0.add(&s).mul(&super::fp::HALF);
+        let special = delta.is_zero();
+        let d = Fp::conditional_select(&s, &delta, special);
+        let w = d.pow_public_exp(&super::fp::P3_MINUS_5_DIV_4);
+        let chi = d.mul(&w.square());
+        let t = chi.mul(&d).mul(&w);
+        let x1 = self.c1.mul(&w).mul(&super::fp::HALF);
+        let use_b = !chi.ct_eq(&Fp::ONE) | special;
+        let cand_a = Fp2 { c0: t, c1: x1 };
+        let cand_b = Fp2 { c0: x1, c1: t };
+        let cand = Fp2::conditional_select(&cand_b, &cand_a, use_b);
         CtOption::new(cand, cand.square().ct_eq(self))
     }
 
@@ -351,6 +359,48 @@ mod tests {
         let t = Fp2::new(Fp::ZERO, Fp::from_canonical(&[7, 0, 0, 0, 0, 0]));
         let r = t.square().sqrt().unwrap();
         assert!(r == t || r == -t);
+    }
+
+    /// Square roots on every shape the norm method distinguishes: zero,
+    /// subfield residues and non-residues (the `δ = 0` case), pure `u`
+    /// multiples, general elements, and non-squares (`None`).
+    #[test]
+    fn sqrt_shapes() {
+        let (a, b) = sample();
+        let u = Fp2::new(Fp::ZERO, Fp::ONE);
+        let check = |x: Fp2| {
+            let r = x.square().sqrt().unwrap();
+            assert!(r == x || r == -x, "{x:?}");
+        };
+        assert_eq!(Fp2::ZERO.sqrt().unwrap(), Fp2::ZERO);
+        assert_eq!(Fp2::ONE.sqrt().unwrap(), Fp2::ONE);
+        // -1 = u²: a subfield non-residue whose root lies outside Fp.
+        let r = (-Fp2::ONE).sqrt().unwrap();
+        assert!(r == u || r == -u);
+        // 11 is a non-residue in Fp, so 11·u² = -11 has root √11·u... and
+        // 11 itself has the root √(-11)·u.
+        let eleven = Fp2::new(Fp::from_canonical(&[11, 0, 0, 0, 0, 0]), Fp::ZERO);
+        let r = eleven.sqrt().unwrap();
+        assert_eq!(r.square(), eleven);
+        assert_eq!(r.c0, Fp::ZERO);
+        // Subfield residue (4 = 2²), pure-u multiples and general elements.
+        check(Fp2::new(Fp::ONE.double(), Fp::ZERO));
+        check(Fp2::new(Fp::ZERO, Fp::ONE.double()));
+        check(u * a);
+        check(a);
+        check(b);
+        check(a * b);
+        check(a + u);
+        // Non-squares: Fp2's known non-residue -(2 + u) (the SSWU Z for G2)
+        // and that times a square.
+        let z = Fp2::new(-Fp::ONE.double(), -Fp::ONE);
+        assert!(bool::from(z.sqrt().is_none()));
+        assert!(bool::from((z * a.square()).sqrt().is_none()));
+        let mut x = a;
+        for _ in 0..8 {
+            check(x);
+            x = x * b + Fp2::ONE;
+        }
     }
 
     #[test]

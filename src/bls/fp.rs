@@ -62,7 +62,7 @@ const P_MINUS_2: [u64; 6] = [
     0x1a0111ea397fe69a,
 ];
 /// `(p + 1) / 4` (square-root exponent; `p ≡ 3 mod 4`).
-const P_PLUS_1_DIV_4: [u64; 6] = [
+pub(crate) const P_PLUS_1_DIV_4: [u64; 6] = [
     0xee7fbfffffffeaab,
     0x07aaffffac54ffff,
     0xd9cc34a83dac3d89,
@@ -79,6 +79,25 @@ const P_MINUS_1_DIV_2: [u64; 6] = [
     0x258dd3db21a5d66b,
     0x0d0088f51cbff34d,
 ];
+/// `(3p - 5) / 4`: `a^((3p-5)/4) = 1 / a^((p+1)/4)`, the inverse of the
+/// `p ≡ 3 (mod 4)` square-root candidate (used by the `Fp2` square root).
+pub(crate) const P3_MINUS_5_DIV_4: [u64; 6] = [
+    0xcb7f3fffffffbfff,
+    0x1700ffff04feffff,
+    0x8d649df8b904b89b,
+    0x8b5978a3b6a3ce0f,
+    0xb854bdc8b278c1a1,
+    0x1380cd6fab1fecf3,
+];
+/// `1/2` in Montgomery form.
+pub(crate) const HALF: Fp = Fp([
+    0x1804000000015554,
+    0x855000053ab00001,
+    0x633cb57c253c276f,
+    0x6e22d1ec31ebb502,
+    0xd3916126f2d14ca2,
+    0x17fbb8571a006596,
+]);
 /// `(p - 3) / 4` (the `sqrt_ratio_3mod4` exponent of RFC 9380 F.2.1.2).
 pub(crate) const P_MINUS_3_DIV_4: [u64; 6] = [
     0xee7fbfffffffeaaa,
