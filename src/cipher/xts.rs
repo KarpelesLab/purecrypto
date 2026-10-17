@@ -92,15 +92,15 @@ impl From<InvalidLength> for XtsError {
 /// `x¹²⁸ + x⁷ + x² + x + 1` (reduction constant `0x87`). Constant time.
 #[inline]
 fn double_tweak(t: &mut [u8; 16]) {
-    let mut carry = 0u8;
-    for byte in t.iter_mut() {
-        let b = *byte;
-        *byte = (b << 1) | carry;
-        carry = b >> 7;
-    }
-    // If the top bit was set, reduce by the polynomial: XOR low byte with 0x87.
-    // Constant-time formulation: 0u8.wrapping_sub(carry) = 0x00 or 0xff.
-    t[0] ^= 0u8.wrapping_sub(carry) & 0x87;
+    *t = double_tweak_u128(u128::from_le_bytes(*t)).to_le_bytes();
+}
+
+/// [`double_tweak`] on the little-endian `u128` form: `t·α` with the carried-out
+/// top bit folded back as `0x87` through an all-ones/all-zeros mask, so there
+/// is no branch on the (secret) tweak.
+#[inline]
+fn double_tweak_u128(t: u128) -> u128 {
+    (t << 1) ^ (0u128.wrapping_sub(t >> 127) & 0x87)
 }
 
 /// AES-XTS context — uses two independent block-cipher instances (data key
@@ -299,15 +299,17 @@ impl<C: BlockCipher> Xts<C> {
 /// tweak for the block after `buf`), and the masked blocks go through the
 /// batched cipher, which feeds the hardware pipeline.
 fn xex_blocks<C: BlockCipher>(cipher: &C, buf: &mut [u8], t: &mut [u8; 16], encrypt: bool) {
-    const W: usize = 16;
+    const W: usize = 64;
     let mut tweaks = [0u8; 16 * W];
+    // The tweak advances as a little-endian `u128` (one shift, one mask, one
+    // XOR per block) and is stored once per block for the post-XOR.
+    let mut tw = u128::from_le_bytes(*t);
     for window in buf.chunks_mut(16 * W) {
-        for (blk, tw) in window.chunks_exact_mut(16).zip(tweaks.chunks_exact_mut(16)) {
-            tw.copy_from_slice(t);
-            for (b, k) in blk.iter_mut().zip(tw.iter()) {
-                *b ^= *k;
-            }
-            double_tweak(t);
+        for (blk, slot) in window.chunks_exact_mut(16).zip(tweaks.chunks_exact_mut(16)) {
+            slot.copy_from_slice(&tw.to_le_bytes());
+            let b: &mut [u8; 16] = blk.try_into().expect("16-byte block");
+            *b = (u128::from_le_bytes(*b) ^ tw).to_le_bytes();
+            tw = double_tweak_u128(tw);
         }
         if encrypt {
             cipher.encrypt_blocks(window);
@@ -318,6 +320,7 @@ fn xex_blocks<C: BlockCipher>(cipher: &C, buf: &mut [u8], t: &mut [u8; 16], encr
             *b ^= *k;
         }
     }
+    *t = tw.to_le_bytes();
     // The tweaks are E_K2(sector) multiples: key-derived masks.
     tweaks.zeroize();
 }

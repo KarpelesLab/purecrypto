@@ -65,19 +65,23 @@ impl<C: BlockCipher> Ctr<C> {
         // High-water mark of `ks`: only this prefix ever held keystream, so
         // only it needs wiping on the way out.
         let mut ks_used = 0;
+        // The counter is a big-endian `u128`, kept as an integer across the
+        // window so each block costs one add and one byte-swapped store.
+        let mut counter = u128::from_be_bytes(self.counter);
         while data.len() - i >= 16 {
             let nblk = ((data.len() - i) / 16).min(W);
             for blk in ks[..nblk * 16].chunks_exact_mut(16) {
-                blk.copy_from_slice(&self.counter);
-                increment(&mut self.counter);
+                blk.copy_from_slice(&counter.to_be_bytes());
+                counter = counter.wrapping_add(1);
             }
             self.cipher.encrypt_blocks(&mut ks[..nblk * 16]);
-            for k in 0..nblk * 16 {
-                data[i + k] ^= ks[k];
+            for (d, k) in data[i..i + nblk * 16].iter_mut().zip(ks.iter()) {
+                *d ^= *k;
             }
             ks_used = ks_used.max(nblk * 16);
             i += nblk * 16;
         }
+        self.counter = counter.to_be_bytes();
         // Raw keystream for this key: leaving up to 1 KiB of it in the stack
         // frame would let anyone who later reads that frame decrypt the
         // matching ciphertext blocks outright, no key recovery needed. `Drop`
@@ -109,18 +113,13 @@ impl<C: BlockCipher> ZeroizeOnDrop for Ctr<C> {}
 
 /// Increments a 16-byte big-endian counter in place, wrapping at 2¹²⁸.
 ///
-/// Branchless: the carry is propagated through every byte rather than
-/// stopping at the first one that does not roll over. The initial counter
-/// is secret in some modes (EAX uses `OMAC⁰(nonce)`), and an early exit would
+/// Branchless: a `u128` add (an `add`/`adc` chain on every target, no early
+/// exit at the first byte that does not roll over). The initial counter is
+/// secret in some modes (EAX uses `OMAC⁰(nonce)`), and an early exit would
 /// let the per-block timing reveal how many low bytes of it are `0xff`.
 #[inline]
 fn increment(counter: &mut [u8; 16]) {
-    let mut carry = 1u16;
-    for byte in counter.iter_mut().rev() {
-        let sum = u16::from(*byte) + carry;
-        *byte = sum as u8;
-        carry = sum >> 8;
-    }
+    *counter = u128::from_be_bytes(*counter).wrapping_add(1).to_be_bytes();
 }
 
 /// Windowed CTR keystream generation shared by the AEAD modes (GCM and
