@@ -1,25 +1,31 @@
-//! Constant-time modular inversion modulo a public odd 256-bit modulus by
-//! Bernstein–Yang "safegcd" divsteps ("Fast constant-time gcd computation and
-//! modular inversion", TCHES 2019), in the form of libsecp256k1's
-//! `modinv64` (Pieter Wuille's `doc/safegcd_implementation.md`).
+//! Constant-time modular inversion modulo a public odd modulus of up to
+//! nine 64-bit limbs by Bernstein–Yang "safegcd" divsteps ("Fast
+//! constant-time gcd computation and modular inversion", TCHES 2019), in the
+//! form of libsecp256k1's `modinv64` (Pieter Wuille's
+//! `doc/safegcd_implementation.md`).
 //!
-//! Numbers are held as five signed 62-bit limbs (`Σ vᵢ·2⁶²ⁱ`). Each round
-//! runs 59 divsteps on the low 64 bits of `f`, `g` alone, collecting them
-//! into a 2×2 transition matrix scaled by 2⁶², then applies that matrix to
-//! the full-width `(f, g)` (dividing by 2⁶², exact) and to the Bézout
-//! coefficients `(d, e)` (made exactly divisible by adding a multiple of the
-//! modulus chosen through `m⁻¹ mod 2⁶²`). Ten rounds give 590 divsteps.
+//! Numbers are held as signed 62-bit limbs (`Σ vᵢ·2⁶²ⁱ`), `⌊64·LIMBS/62⌋ + 1`
+//! of them (five for 256 bits). Each round runs 59 divsteps on the low 64
+//! bits of `f`, `g` alone, collecting them into a 2×2 transition matrix
+//! scaled by 2⁶², then applies that matrix to the full-width `(f, g)`
+//! (dividing by 2⁶², exact) and to the Bézout coefficients `(d, e)` (made
+//! exactly divisible by adding a multiple of the modulus chosen through
+//! `m⁻¹ mod 2⁶²`).
 //!
 //! **Iteration bound.** This is the "half-delta" divstep (δ starts at ½,
-//! tracked as `ζ = −(δ + ½)`), for which **590 divsteps reach `g = 0` for
-//! every `0 ≤ g < f < 2²⁵⁶` with `f` odd** — the bound libsecp256k1 relies
-//! on, established in its `doc/safegcd_implementation.md` by the
-//! computer-verified convex-hull analysis of sipa/safegcd-bounds (after
-//! Bernstein–Yang §11, whose closed-form theorem for the original δ = 1
-//! divstep gives the weaker ⌊(49·256 + 57)/17⌋ = 741). The round count is
-//! therefore a fixed public constant; a debug assertion checks `g = 0` at
-//! the end, and the tests hunt for inputs with long divstep chains (the
-//! longest found are ~535 steps).
+//! tracked as `ζ = −(δ + ½)`), for which `⌊(45907·b + 26313) / 19929⌋`
+//! divsteps reach `g = 0` for every `0 ≤ g < f < 2ᵇ` with `f` odd — the
+//! bound established by the computer-verified convex-hull analysis of
+//! sipa/safegcd-bounds, which libsecp256k1 relies on (after Bernstein–Yang
+//! §11, whose closed-form theorem for the original δ = 1 divstep gives the
+//! weaker ⌊(49·b + 57)/17⌋). For `b = 256` the exact computation gives
+//! **590 divsteps, ten rounds** (the closed form, 591, is one step looser);
+//! above 256 bits the closed form is used with one extra round of margin:
+//! 384 bits need 885 (16 rounds), 448 bits 1033 (19), 521 bits 1201 (22).
+//! The round count is derived from the modulus's bit length at construction
+//! and is a public constant of the modulus; a debug assertion checks
+//! `g = 0` at the end, and the tests hunt for 256-bit inputs with long
+//! divstep chains (the longest found are ~535 steps).
 //!
 //! **Constant time.** Every round does the same work. Inside a divstep the
 //! two data-dependent conditions (`δ > 0`, `g` odd) become all-ones/all-zero
@@ -75,8 +81,37 @@ mod barrier {
 /// The low-62-bit mask.
 const M62: u64 = u64::MAX >> 2;
 
-/// Number of 59-divstep rounds: 10 × 59 = 590, the proven bound above.
-const ROUNDS: usize = 10;
+/// Divsteps per round (the matrix is collected over 59 steps so its entries
+/// fit `2⁶²`-scaled `i64`s).
+const DIVSTEPS_PER_ROUND: usize = 59;
+
+/// The widest modulus supported, in 64-bit limbs (P-521 in nine limbs).
+const MAX_LIMBS: usize = 9;
+
+/// Signed-62 limbs covering `MAX_LIMBS` 64-bit limbs: `⌊64·9/62⌋ + 1`. The
+/// arrays are sized for the maximum; every loop runs to the width in use
+/// (`N62`, a constant per `LIMBS`), so the 256-bit path only pays the
+/// larger stack frame.
+const S: usize = 10;
+
+/// The divstep bound for inputs below `2^bits` (see the module docs): the
+/// exact, computer-verified 590 up to 256 bits (the closed form gives 591
+/// there), the closed form `⌊(45907·bits + 26313) / 19929⌋` above.
+const fn divstep_bound(bits: usize) -> usize {
+    if bits <= 256 {
+        590
+    } else {
+        (45907 * bits + 26313) / 19929
+    }
+}
+
+/// 59-divstep rounds for a `bits`-bit modulus: the bound rounded up to
+/// whole rounds, plus one round of margin above 256 bits, where the bound
+/// is the closed form rather than the exact convex-hull computation.
+const fn rounds_for(bits: usize) -> usize {
+    let rounds = divstep_bound(bits).div_ceil(DIVSTEPS_PER_ROUND);
+    if bits <= 256 { rounds } else { rounds + 1 }
+}
 
 /// A 2×2 divstep transition matrix `[[u, v], [q, r]]`, scaled by 2⁶².
 /// Entries lie in `[−2⁶², 2⁶²]` and `|u| + |v|, |q| + |r| ≤ 2⁶²`.
@@ -87,39 +122,68 @@ struct Trans {
     r: i64,
 }
 
-/// A public odd modulus `m < 2²⁵⁶`, prepared for [`invert`](Self::invert).
-pub(crate) struct SafegcdModulus {
-    /// `m` in signed-62 form.
-    m: [i64; 5],
+/// A public odd modulus `m < 2^(64·LIMBS)`, `LIMBS ≤ 9`, prepared for
+/// [`invert`](Self::invert). The default width is the 256-bit curves'.
+pub(crate) struct SafegcdModulus<const LIMBS: usize = 4> {
+    /// `m` in signed-62 form (limbs `N62..` unused).
+    m: [i64; S],
     /// `m⁻¹ mod 2⁶²`.
     m_inv62: u64,
+    /// 59-divstep rounds covering the proven bound for `m`'s bit length.
+    rounds: usize,
 }
 
-/// Splits four 64-bit limbs into five 62-bit ones (all non-negative).
-const fn to_signed62(a: &[u64; 4]) -> [i64; 5] {
-    [
-        (a[0] & M62) as i64,
-        ((a[0] >> 62 | a[1] << 2) & M62) as i64,
-        ((a[1] >> 60 | a[2] << 4) & M62) as i64,
-        ((a[2] >> 58 | a[3] << 6) & M62) as i64,
-        (a[3] >> 56) as i64,
-    ]
+/// Splits `LIMBS` 64-bit limbs into `n62` 62-bit ones (all non-negative).
+const fn to_signed62<const LIMBS: usize>(a: &[u64; LIMBS], n62: usize) -> [i64; S] {
+    let mut out = [0i64; S];
+    let mut i = 0;
+    while i < n62 {
+        let bit = 62 * i;
+        let (w, sh) = (bit / 64, bit % 64);
+        let mut v = if w < LIMBS { a[w] >> sh } else { 0 };
+        // With `sh ≤ 2` the 62 bits lie within one word.
+        if sh > 2 && w + 1 < LIMBS {
+            v |= a[w + 1] << (64 - sh);
+        }
+        out[i] = (v & M62) as i64;
+        i += 1;
+    }
+    out
 }
 
-/// Joins normalised 62-bit limbs (`v₀..v₃ ∈ [0, 2⁶²)`, `v₄ ∈ [0, 2⁸)`).
-fn from_signed62(v: &[i64; 5]) -> [u64; 4] {
-    let v = v.map(|x| x as u64);
-    [
-        v[0] | v[1] << 62,
-        v[1] >> 2 | v[2] << 60,
-        v[2] >> 4 | v[3] << 58,
-        v[3] >> 6 | v[4] << 56,
-    ]
+/// Joins normalised 62-bit limbs (`vᵢ ∈ [0, 2⁶²)`, the value below
+/// `2^(64·LIMBS)`).
+fn from_signed62<const LIMBS: usize>(v: &[i64; S], n62: usize) -> [u64; LIMBS] {
+    let mut out = [0u64; LIMBS];
+    for (i, &x) in v.iter().enumerate().take(n62) {
+        let x = x as u64;
+        let bit = 62 * i;
+        let (w, sh) = (bit / 64, bit % 64);
+        if w < LIMBS {
+            out[w] |= x << sh;
+        }
+        if sh > 2 && w + 1 < LIMBS {
+            out[w + 1] |= x >> (64 - sh);
+        }
+    }
+    out
 }
 
-impl SafegcdModulus {
+impl<const LIMBS: usize> SafegcdModulus<LIMBS> {
+    /// Signed-62 limbs in use: `62·N62 > 64·LIMBS`, leaving at least 30
+    /// bits of headroom in the top limb for the sign and the `(−2m, m)`
+    /// range of the Bézout coefficients.
+    const N62: usize = 64 * LIMBS / 62 + 1;
+
     /// Prepares an odd modulus (compile-time constructible).
-    pub(crate) const fn new(m: &Uint<4>) -> Self {
+    ///
+    /// The round count is `⌈bound / 59⌉` for the divstep bound of the
+    /// modulus's bit length (a public quantity of a public modulus).
+    pub(crate) const fn new(m: &Uint<LIMBS>) -> Self {
+        assert!(
+            LIMBS >= 1 && LIMBS <= MAX_LIMBS,
+            "safegcd supports moduli of 1 to 9 limbs"
+        );
         let l = m.as_limbs();
         assert!(l[0] & 1 == 1, "safegcd modulus must be odd");
         // Newton's iteration x ← x·(2 − m·x) doubles the correct low bits;
@@ -130,42 +194,51 @@ impl SafegcdModulus {
             x = x.wrapping_mul(2u64.wrapping_sub(l[0].wrapping_mul(x)));
             i += 1;
         }
+        let mut top = LIMBS;
+        while top > 1 && l[top - 1] == 0 {
+            top -= 1;
+        }
+        let bits = 64 * top - l[top - 1].leading_zeros() as usize;
         SafegcdModulus {
-            m: to_signed62(l),
+            m: to_signed62(l, Self::N62),
             m_inv62: x & M62,
+            rounds: rounds_for(bits),
         }
     }
 
     /// `a⁻¹ mod m` in `[0, m)`, constant time in `a`; requires `a < m` and
     /// `m` prime (or at least `gcd(a, m) = 1`), and maps `0` to `0`.
-    pub(crate) fn invert(&self, a: &Uint<4>) -> Uint<4> {
-        let mut d = [0i64; 5];
-        let mut e = [1i64, 0, 0, 0, 0];
+    pub(crate) fn invert(&self, a: &Uint<LIMBS>) -> Uint<LIMBS> {
+        let n = Self::N62;
+        let mut d = [0i64; S];
+        let mut e = [0i64; S];
+        e[0] = 1;
         let mut f = self.m;
-        let mut g = to_signed62(a.as_limbs());
+        let mut g = to_signed62(a.as_limbs(), n);
         let mut zeta: i64 = -1; // ζ = −(δ + ½), δ = ½.
-        for _ in 0..ROUNDS {
+        for _ in 0..self.rounds {
             let (z, t) = divsteps_59(zeta, f[0] as u64, g[0] as u64);
             zeta = z;
             self.update_de(&mut d, &mut e, &t);
-            update_fg(&mut f, &mut g, &t);
+            update_fg(&mut f, &mut g, &t, n);
         }
         // g = 0, f = ±gcd = ±1 and d = ±a⁻¹ (for a = 0: f = m, d = 0).
-        debug_assert!(g == [0; 5], "safegcd: g did not reach 0 in 590 divsteps");
-        self.normalize(&mut d, f[4]);
-        Uint::from_limbs(from_signed62(&d))
+        debug_assert!(g == [0; S], "safegcd: g did not reach 0 within the bound");
+        self.normalize(&mut d, f[n - 1]);
+        Uint::from_limbs(from_signed62(&d, n))
     }
 
     /// `(d, e) ← (t·(d, e) + m·(md, me)) / 2⁶²`, with `md`, `me` chosen to
     /// make the division exact and to keep `d`, `e` in `(−2m, m)`.
     #[inline(always)]
-    fn update_de(&self, d: &mut [i64; 5], e: &mut [i64; 5], t: &Trans) {
+    fn update_de(&self, d: &mut [i64; S], e: &mut [i64; S], t: &Trans) {
+        let n = Self::N62;
         let m = &self.m;
         let (u, v, q, r) = (t.u as i128, t.v as i128, t.q as i128, t.r as i128);
         // Start (md, me) at [u, q] if d < 0 plus [v, r] if e < 0: this, with
         // the correction below, keeps the outputs in range.
-        let sd = opaque((d[4] >> 63) as u64) as i64;
-        let se = opaque((e[4] >> 63) as u64) as i64;
+        let sd = opaque((d[n - 1] >> 63) as u64) as i64;
+        let se = opaque((e[n - 1] >> 63) as u64) as i64;
         let mut md = (t.u & sd).wrapping_add(t.v & se);
         let mut me = (t.q & sd).wrapping_add(t.r & se);
         let mut cd = u * d[0] as i128 + v * e[0] as i128;
@@ -182,7 +255,7 @@ impl SafegcdModulus {
         debug_assert!(cd as u64 & M62 == 0 && ce as u64 & M62 == 0);
         cd >>= 62;
         ce >>= 62;
-        for i in 1..5 {
+        for i in 1..n {
             cd += u * d[i] as i128 + v * e[i] as i128;
             ce += q * d[i] as i128 + r * e[i] as i128;
             // Always multiply, even by a zero modulus limb: a "skip zero
@@ -196,39 +269,40 @@ impl SafegcdModulus {
             cd >>= 62;
             ce >>= 62;
         }
-        d[4] = cd as i64;
-        e[4] = ce as i64;
+        d[n - 1] = cd as i64;
+        e[n - 1] = ce as i64;
     }
 
     /// Brings `d ∈ (−2m, m)` to `sign(f)·d mod m ∈ [0, m)` with masked adds.
     #[inline(always)]
-    fn normalize(&self, d: &mut [i64; 5], f_top: i64) {
+    fn normalize(&self, d: &mut [i64; S], f_top: i64) {
+        let n = Self::N62;
         let m = &self.m;
         // Add m if negative: (−2m, m) → (−m, m).
-        let add = opaque((d[4] >> 63) as u64) as i64;
-        for i in 0..5 {
+        let add = opaque((d[n - 1] >> 63) as u64) as i64;
+        for i in 0..n {
             d[i] += m[i] & add;
         }
         // Negate if f = −1.
         let neg = opaque((f_top >> 63) as u64) as i64;
-        for x in d.iter_mut() {
+        for x in d.iter_mut().take(n) {
             *x = (*x ^ neg).wrapping_sub(neg);
         }
-        carry62(d);
+        carry62(d, n);
         // Add m again if still negative: (−m, m) → [0, m).
-        let add = opaque((d[4] >> 63) as u64) as i64;
-        for i in 0..5 {
+        let add = opaque((d[n - 1] >> 63) as u64) as i64;
+        for i in 0..n {
             d[i] += m[i] & add;
         }
-        carry62(d);
+        carry62(d, n);
     }
 }
 
-/// Propagates carries so limbs 0..3 lie in `[0, 2⁶²)` (signed arithmetic
+/// Propagates carries so limbs `0..n−1` lie in `[0, 2⁶²)` (signed arithmetic
 /// shifts move each limb's excess, negative or not, upward).
 #[inline(always)]
-fn carry62(d: &mut [i64; 5]) {
-    for i in 0..4 {
+fn carry62(d: &mut [i64; S], n: usize) {
+    for i in 0..n - 1 {
         d[i + 1] += d[i] >> 62;
         d[i] &= M62 as i64;
     }
@@ -276,16 +350,16 @@ fn divsteps_59(mut zeta: i64, f0: u64, g0: u64) -> (i64, Trans) {
     (zeta, t)
 }
 
-/// `(f, g) ← t·(f, g) / 2⁶²` (exact by construction of `t`).
+/// `(f, g) ← t·(f, g) / 2⁶²` (exact by construction of `t`), over `n` limbs.
 #[inline(always)]
-fn update_fg(f: &mut [i64; 5], g: &mut [i64; 5], t: &Trans) {
+fn update_fg(f: &mut [i64; S], g: &mut [i64; S], t: &Trans, n: usize) {
     let (u, v, q, r) = (t.u as i128, t.v as i128, t.q as i128, t.r as i128);
     let mut cf = u * f[0] as i128 + v * g[0] as i128;
     let mut cg = q * f[0] as i128 + r * g[0] as i128;
     debug_assert!(cf as u64 & M62 == 0 && cg as u64 & M62 == 0);
     cf >>= 62;
     cg >>= 62;
-    for i in 1..5 {
+    for i in 1..n {
         cf += u * f[i] as i128 + v * g[i] as i128;
         cg += q * f[i] as i128 + r * g[i] as i128;
         f[i - 1] = (cf as u64 & M62) as i64;
@@ -293,8 +367,8 @@ fn update_fg(f: &mut [i64; 5], g: &mut [i64; 5], t: &Trans) {
         cf >>= 62;
         cg >>= 62;
     }
-    f[4] = cf as i64;
-    g[4] = cg as i64;
+    f[n - 1] = cf as i64;
+    g[n - 1] = cg as i64;
 }
 
 #[cfg(test)]
@@ -410,9 +484,115 @@ mod tests {
         for (name, h) in MODULI {
             let m = hex(h);
             let sg = SafegcdModulus::new(&m);
-            assert_eq!(from_signed62(&sg.m), *m.as_limbs(), "{name}");
+            assert_eq!(from_signed62(&sg.m, 5), *m.as_limbs(), "{name}");
             assert_eq!(sg.m_inv62.wrapping_mul(m.as_limbs()[0]) & M62, 1, "{name}");
+            assert_eq!(sg.rounds, 10, "{name}: 590 divsteps = 10 rounds");
+            assert_eq!(SafegcdModulus::<4>::N62, 5);
         }
+        assert_eq!(divstep_bound(256), 590);
+        assert_eq!((45907 * 256 + 26313) / 19929, 591);
+        assert_eq!(divstep_bound(384), 885);
+        assert_eq!(divstep_bound(448), 1033);
+        assert_eq!(divstep_bound(521), 1201);
+        assert_eq!(rounds_for(255), 10);
+        assert_eq!(rounds_for(384), 16);
+        assert_eq!(rounds_for(448), 19);
+        assert_eq!(rounds_for(521), 22);
+    }
+
+    fn hex_wide<const L: usize>(s: &str) -> Uint<L> {
+        let bytes: alloc::vec::Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect();
+        Uint::from_be_bytes(&bytes)
+    }
+
+    /// Wider moduli: the P-384 and P-521 field primes and group orders,
+    /// against Fermat, on edges, powers of two and random residues; the
+    /// signed-62 conversions round-trip; the round counts match the bound.
+    fn wide_matches_fermat<const L: usize>(
+        name: &str,
+        h: &str,
+        rounds: usize,
+        rng: &mut SplitMix64,
+    ) {
+        let m = hex_wide::<L>(h);
+        let sg = SafegcdModulus::<L>::new(&m);
+        assert_eq!(sg.rounds, rounds, "{name}");
+        let n = SafegcdModulus::<L>::N62;
+        assert_eq!(
+            from_signed62::<L>(&to_signed62(m.as_limbs(), n), n),
+            *m.as_limbs()
+        );
+        let mm = MontModulus::new(m);
+        let one = Uint::ONE;
+        let m1 = m.wrapping_sub(&one);
+        let chk = |a: &Uint<L>| {
+            let got = sg.invert(a);
+            let want = mm.inv_prime(a);
+            assert_eq!(
+                got.as_limbs(),
+                want.as_limbs(),
+                "{name}: a={:x?}",
+                a.as_limbs()
+            );
+        };
+        assert_eq!(sg.invert(&Uint::ZERO), Uint::ZERO, "{name}: 0");
+        for a in [one, Uint::from_u64(2), Uint::from_u64(3), m1, m1.shr1()] {
+            chk(&a);
+        }
+        for k in (0..64 * L).step_by(7) {
+            let mut l = [0u64; L];
+            l[k / 64] = 1 << (k % 64);
+            let p2 = Uint::from_limbs(l);
+            for x in [p2, p2.wrapping_sub(&one), m.wrapping_sub(&p2)] {
+                chk(&x.reduce(&m));
+            }
+        }
+        for _ in 0..300 {
+            let mut l = [0u64; L];
+            for w in l.iter_mut() {
+                *w = rng.next();
+            }
+            chk(&Uint::from_limbs(l).reduce(&m));
+        }
+    }
+
+    #[test]
+    fn matches_fermat_384_and_521() {
+        let mut rng = SplitMix64(0x5a3e_9cd1_0384_0521);
+        wide_matches_fermat::<6>(
+            "P-384 p",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff",
+            16,
+            &mut rng,
+        );
+        wide_matches_fermat::<6>(
+            "P-384 n",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973",
+            16,
+            &mut rng,
+        );
+        wide_matches_fermat::<9>(
+            "P-521 p",
+            "01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            22,
+            &mut rng,
+        );
+        wide_matches_fermat::<9>(
+            "P-521 n",
+            "01fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409",
+            22,
+            &mut rng,
+        );
+        // A 7-limb odd prime (2^448 − 2^224 − 1, curve448's field).
+        wide_matches_fermat::<7>(
+            "curve448 p",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            19,
+            &mut rng,
+        );
     }
 
     #[test]
