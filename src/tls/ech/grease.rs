@@ -150,6 +150,7 @@ impl GreaseParams {
         let mut enc = alloc::vec![0u8; enc_len];
         if !enc.is_empty() {
             rng.fill_bytes(&mut enc);
+            shape_enc(&mut enc);
         }
         let mut payload = alloc::vec![0u8; payload_len];
         if !payload.is_empty() {
@@ -207,14 +208,52 @@ impl GreaseParams {
             GreaseConfigIdStrategy::Random => out[0],
         };
         let (enc, payload) = out[1..].split_at(enc_len);
+        let mut enc = enc.to_vec();
+        shape_enc(&mut enc);
         let ext = super::extension::EchExtension::Outer {
             cipher_suite: self.cipher_suite,
             config_id,
-            enc: enc.to_vec(),
+            enc,
             payload: payload.to_vec(),
         };
         ext.encode()
     }
+}
+
+/// RFC 9849 §6.2: a GREASE `enc` must be "a valid encapsulated key" for
+/// the KEM it mimics — uniform random bytes are not one. An X25519 `enc`
+/// is a fully reduced field element (bit 7 of the last byte is clear in any
+/// real encapsulation); a NIST `enc` is an uncompressed SEC1 point (`0x04`
+/// tag, on-curve coordinates). A censor can therefore tell random bytes
+/// from genuine ECH on the first byte, or with probability 1/2 per hello.
+///
+/// When `enc` has the `Nenc` of a compiled-in DHKEM, the random bytes are
+/// used as the `ikm` of that KEM's deterministic `DeriveKeyPair` (RFC 9180
+/// §7.1.3) and replaced by the resulting public key — a valid encapsulation
+/// (an ephemeral public key is exactly what `Encap` sends) that keeps the
+/// builders deterministic in their seed. The throwaway private key is wiped.
+/// Any other length is left as it was: it mimics no KEM this crate knows.
+fn shape_enc(enc: &mut [u8]) {
+    use crate::hpke::HpkeKem;
+    const KEMS: &[HpkeKem] = &[
+        HpkeKem::DhkemX25519HkdfSha256,
+        HpkeKem::DhkemP256HkdfSha256,
+        HpkeKem::DhkemP384HkdfSha384,
+        HpkeKem::DhkemP521HkdfSha512,
+    ];
+    let Some(kem) = KEMS.iter().copied().find(|k| k.n_enc() == enc.len()) else {
+        return;
+    };
+    let mut sk = [0u8; HpkeKem::MAX_N_SK];
+    let mut pk = [0u8; HpkeKem::MAX_N_ENC];
+    let ikm = enc.to_vec();
+    // `DeriveKeyPair` only fails on a too-small buffer; the buffers are
+    // sized for every compiled-in KEM, so this cannot happen. Were it to,
+    // the random `enc` is left in place rather than emitting nothing.
+    if let Ok((_, n_pk)) = kem.derive_key_pair_into(&ikm, &mut sk, &mut pk) {
+        enc.copy_from_slice(&pk[..n_pk]);
+    }
+    crate::zeroize::Zeroize::zeroize(&mut sk);
 }
 
 #[cfg(test)]
@@ -276,6 +315,68 @@ mod tests {
         assert_eq!(1 + enc_len + payload_len, MAX_GREASE_TOTAL_LEN);
         let body = p.build_extension_from_seed(&[1u8; 32], &[2u8; 32]);
         assert_eq!(body.len(), OUTER_OVERHEAD + enc_len + payload_len);
+    }
+
+    /// CFG-F1 — RFC 9849 §6.2: the GREASE `enc` must be a valid KEM output.
+    /// Over 64 seeds, every X25519-shaped `enc` is a reduced field element
+    /// (top bit clear — raw random bytes fail this half the time) and every
+    /// P-256-shaped one is an uncompressed on-curve point the HPKE KEM
+    /// accepts. The seeded builder stays deterministic in its inputs, and
+    /// the RNG builder is shaped the same way.
+    #[test]
+    fn grease_enc_is_a_valid_kem_encapsulation() {
+        use crate::hpke::HpkeKem;
+        let decode = |body: &[u8]| match EchExtension::decode(body).unwrap() {
+            EchExtension::Outer { enc, payload, .. } => (enc, payload),
+            _ => panic!("GREASE builds the outer form"),
+        };
+        for i in 0u8..64 {
+            let seed = [i; 32];
+            let random = [i.wrapping_mul(7); 32];
+
+            let x = params(32, DEFAULT_GREASE_PAYLOAD_LEN);
+            let body = x.build_extension_from_seed(&seed, &random);
+            let (enc, payload) = decode(&body);
+            assert_eq!(enc.len(), 32);
+            assert_eq!(enc[31] & 0x80, 0, "seed {i}: X25519 enc not reduced");
+            assert!(enc.iter().any(|&b| b != 0));
+            assert_eq!(payload.len(), DEFAULT_GREASE_PAYLOAD_LEN);
+            assert_eq!(
+                body,
+                x.build_extension_from_seed(&seed, &random),
+                "seeded builder must be deterministic"
+            );
+
+            let p = params(65, DEFAULT_GREASE_PAYLOAD_LEN);
+            let (enc, _) = decode(&p.build_extension_from_seed(&seed, &random));
+            assert_eq!(enc.len(), 65);
+            assert_eq!(enc[0], 0x04, "seed {i}: P-256 enc lacks the SEC1 tag");
+            HpkeKem::DhkemP256HkdfSha256
+                .validate_public_key(&enc)
+                .expect("P-256 GREASE enc is on the curve");
+        }
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"grease-shape", b"nonce", &[]);
+        for _ in 0..16 {
+            match params(32, DEFAULT_GREASE_PAYLOAD_LEN).build_extension(&mut rng) {
+                EchExtension::Outer { enc, .. } => assert_eq!(enc[31] & 0x80, 0),
+                _ => panic!("GREASE builds the outer form"),
+            }
+            match params(65, DEFAULT_GREASE_PAYLOAD_LEN).build_extension(&mut rng) {
+                EchExtension::Outer { enc, .. } => {
+                    assert_eq!(enc[0], 0x04);
+                    HpkeKem::DhkemP256HkdfSha256
+                        .validate_public_key(&enc)
+                        .unwrap();
+                }
+                _ => panic!("GREASE builds the outer form"),
+            }
+        }
+
+        // A length that mimics no known KEM is left as raw bytes.
+        let odd = params(40, DEFAULT_GREASE_PAYLOAD_LEN);
+        let (enc, _) = decode(&odd.build_extension_from_seed(&[1; 32], &[2; 32]));
+        assert_eq!(enc.len(), 40);
     }
 
     /// The exact ceiling is accepted, one byte over is not, and the defaults
