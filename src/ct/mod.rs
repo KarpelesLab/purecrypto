@@ -67,8 +67,9 @@ pub use eq::ConstantTimeEq;
 pub use negate::ConditionallyNegatable;
 pub use ord::{ConstantTimeGreater, ConstantTimeLess};
 pub use select::ConditionallySelectable;
+#[cfg(feature = "bignum")]
 pub(crate) use select::limb_mask;
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "bignum"))]
 pub(crate) use select::{assign_limbs, select_limbs_into};
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not};

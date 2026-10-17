@@ -1029,9 +1029,9 @@ mod aegis128_tests {
         let sw = Aegis128::new_software(&[0x42u8; 16]);
         let nonce = [7u8; 16];
         for aad_len in [0usize, 5, 16, 33] {
-            let aad: std::vec::Vec<u8> = (0..aad_len).map(|i| i as u8 ^ 0x5a).collect();
+            let aad: alloc::vec::Vec<u8> = (0..aad_len).map(|i| i as u8 ^ 0x5a).collect();
             for len in [0usize, 1, 15, 16, 17, 32, 48, 63, 64, 100, 255, 256, 1000] {
-                let pt: std::vec::Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(7)).collect();
+                let pt: alloc::vec::Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(7)).collect();
                 let (mut a, mut b) = (pt.clone(), pt.clone());
                 let ta = hw.encrypt(&nonce, &aad, &mut a);
                 let tb = sw.encrypt(&nonce, &aad, &mut b);
@@ -1298,11 +1298,11 @@ mod tests {
         let nonce = [7u8; 16];
         let nonce32 = [7u8; 32];
         for aad_len in [0usize, 5, 16, 32, 33, 50] {
-            let aad: std::vec::Vec<u8> = (0..aad_len).map(|i| i as u8 ^ 0x5a).collect();
+            let aad: alloc::vec::Vec<u8> = (0..aad_len).map(|i| i as u8 ^ 0x5a).collect();
             for len in [
                 0usize, 1, 15, 16, 17, 31, 32, 33, 48, 63, 64, 100, 255, 256, 1000,
             ] {
-                let pt: std::vec::Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(7)).collect();
+                let pt: alloc::vec::Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(7)).collect();
                 let (mut a, mut b) = (pt.clone(), pt.clone());
                 let ta = hw.encrypt(&nonce, &aad, &mut a);
                 let tb = sw.encrypt(&nonce, &aad, &mut b);

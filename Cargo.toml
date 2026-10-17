@@ -335,7 +335,10 @@ ech = ["tls", "hpke"]
 # pure-Rust no_std project under the same maintainership. All three
 # registered algorithms are wired: zlib (1) and zstd (3) always, brotli
 # (2) in a `std` build (see the `std` feature).
-cert-compression = ["tls", "dep:compcol"]
+# `compcol/alloc`: since compcol 0.7 its `deflate`/`zlib` codecs no longer
+# imply `alloc`, and a lean `--features cert-compression` build (no `std`)
+# would otherwise hit compcol's compile_error asking for it.
+cert-compression = ["tls", "dep:compcol", "compcol/alloc"]
 # Embedded root-CA trust store: pre-seed a `RootCertStore` with the curated
 # first-party `cacrt` bundle — built from the Mozilla root program and others,
 # following CA/Browser Forum rules (no filesystem access; portable across
@@ -391,7 +394,9 @@ mio = { version = "1", default-features = false, features = ["os-ext", "net"], o
 tokio = { version = "1.53.3", features = ["net", "io-util", "rt", "macros", "time"] }
 # zlib inflate for the Wycheproof chunked-encryption vectors, whose `ct`
 # field is zlib-compressed (tests/wycheproof/chunked.rs).
-compcol = { version = "0.7.2", default-features = false, features = ["zlib"] }
+# `alloc` explicitly: since compcol 0.7 the `zlib` codec no longer implies it,
+# and this dev-dependency is built into every `--all-targets` lean check.
+compcol = { version = "0.7.2", default-features = false, features = ["zlib", "alloc"] }
 
 [[bin]]
 name = "purecrypto"

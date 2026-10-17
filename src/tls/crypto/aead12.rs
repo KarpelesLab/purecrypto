@@ -602,10 +602,12 @@ impl Drop for RecordCrypter12 {
 
 /// Stack room for the `tls12_cid` additional data (RFC 9146 §5.3): its 23
 /// fixed bytes plus a CID of at most 255.
+#[cfg(feature = "dtls")]
 const AAD_CID_MAX: usize = 23 + 255;
 
 /// A received DTLS record fragment, split: explicit nonce (empty for
 /// ChaCha20-Poly1305), ciphertext, tag.
+#[cfg(feature = "dtls")]
 struct DtlsFragment<'a> {
     explicit: &'a [u8],
     ct: &'a [u8],
@@ -616,6 +618,7 @@ struct DtlsFragment<'a> {
 /// sealed in place at the tail of the buffer that already holds its header,
 /// and opened in place — in the fragment itself, or in a scratch buffer the
 /// caller keeps across records.
+#[cfg(feature = "dtls")]
 impl RecordCrypter12 {
     /// [`Self::aad_dtls_cid`] written into a stack buffer; returns the
     /// filled prefix.

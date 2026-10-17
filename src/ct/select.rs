@@ -70,6 +70,7 @@ pub trait ConditionallySelectable: Copy {
 /// [`u64::conditional_select`] would pay the barrier (a memory round-trip)
 /// on each limb — the difference between 2.2 and 1 µs on a 16-entry gather
 /// of 32-limb values.
+#[cfg(feature = "bignum")]
 #[inline]
 pub(crate) fn limb_mask(choice: Choice) -> u64 {
     core::hint::black_box((choice.unwrap_u8() as u64).wrapping_neg())
@@ -78,7 +79,7 @@ pub(crate) fn limb_mask(choice: Choice) -> u64 {
 /// `out[i] ← a[i]` when `choice` is true, else `b[i]`, over the common
 /// length of the three slices, with one opaque mask for the whole select.
 /// (The slice forms serve the runtime-sized bignums, hence the gate.)
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "bignum"))]
 #[inline]
 pub(crate) fn select_limbs_into(a: &[u64], b: &[u64], choice: Choice, out: &mut [u64]) {
     let mask = limb_mask(choice);
@@ -89,7 +90,7 @@ pub(crate) fn select_limbs_into(a: &[u64], b: &[u64], choice: Choice, out: &mut 
 
 /// `dst[i] ← src[i]` when `choice` is true, else unchanged, over the common
 /// length, with one opaque mask.
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "bignum"))]
 #[inline]
 pub(crate) fn assign_limbs(dst: &mut [u64], src: &[u64], choice: Choice) {
     let mask = limb_mask(choice);

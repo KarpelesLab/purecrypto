@@ -50,7 +50,7 @@ pub use montgomery::MontModulus;
 // dead code.
 pub use uint::{LIMB_BITS, Limb, Uint};
 #[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
-pub(crate) use uint::{
-    SIEVE_MIN_BITS, SIEVE_WINDOW, mod_small_limbs, mod_u32_with_recip, recip_u32,
-    trailing_zeros_step,
-};
+pub(crate) use uint::{mod_small_limbs, mod_u32_with_recip, recip_u32, trailing_zeros_step};
+// The incremental-sieve window is RSA key generation's alone.
+#[cfg(all(feature = "rng", feature = "rsa"))]
+pub(crate) use uint::{SIEVE_MIN_BITS, SIEVE_WINDOW};
