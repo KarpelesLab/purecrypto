@@ -14,10 +14,100 @@ use crate::rng::{CryptoRng, RngCore};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// An RSA public key `(n, e)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct RsaPublicKey<const LIMBS: usize> {
     n: Uint<LIMBS>,
     e: Uint<LIMBS>,
+    /// Montgomery context for `n`, built once with the key so repeated
+    /// verifications do not each derive `R² mod n`. `None` when `n` is even
+    /// (a key assembled from unchecked components), in which case the public
+    /// operation panics as it always did.
+    mont: Option<MontModulus<LIMBS>>,
+}
+
+// Equality is over the key material; the context is a function of `n`.
+impl<const LIMBS: usize> PartialEq for RsaPublicKey<LIMBS> {
+    fn eq(&self, other: &Self) -> bool {
+        self.n == other.n && self.e == other.e
+    }
+}
+
+impl<const LIMBS: usize> Eq for RsaPublicKey<LIMBS> {}
+
+/// The Montgomery context for a modulus, or `None` when it is even (so the
+/// unvalidated constructors keep deferring the "modulus must be odd" panic
+/// to the first operation, as documented).
+fn mont_for<const LIMBS: usize>(n: &Uint<LIMBS>) -> Option<MontModulus<LIMBS>> {
+    // `n` is public; a plain branch on its parity is fine.
+    if bool::from(n.is_odd()) {
+        Some(MontModulus::new(*n))
+    } else {
+        None
+    }
+}
+
+/// The CRT parameters of a fixed-width private key, as secret as the primes
+/// they derive from: `dP = d mod (p − 1)`, `dQ = d mod (q − 1)`,
+/// `qInv = q⁻¹ mod p`, and the Montgomery contexts of `p` and `q` (built at
+/// the primes' significant width, so a 2048-bit key's halves run 16-limb
+/// arithmetic).
+#[derive(Clone)]
+struct FixedRsaCrt<const LIMBS: usize> {
+    dp: Uint<LIMBS>,
+    dq: Uint<LIMBS>,
+    qinv: Uint<LIMBS>,
+    mont_p: MontModulus<LIMBS>,
+    mont_q: MontModulus<LIMBS>,
+}
+
+impl<const LIMBS: usize> crate::zeroize::Zeroize for FixedRsaCrt<LIMBS> {
+    fn zeroize(&mut self) {
+        self.dp.zeroize();
+        self.dq.zeroize();
+        self.qinv.zeroize();
+        self.mont_p.zeroize();
+        self.mont_q.zeroize();
+    }
+}
+
+/// Derives the CRT parameters from the prime factors, or `None` when the key
+/// has no usable primes (zero, even, tiny, or equal — the verdicts are
+/// public properties of the key, selecting the CRT or the full-width path).
+/// `qInv` comes from the constant-time Fermat ladder `q^(p−2) mod p`, like
+/// the runtime-sized key's. A key whose primes merely *lie* (wrong factors
+/// for `n`) still gets parameters; the fault check in
+/// [`RsaPrivateKey::raw`] routes it to the full-width path at runtime.
+fn derive_crt_fixed<const LIMBS: usize>(
+    p: &Uint<LIMBS>,
+    q: &Uint<LIMBS>,
+    d: &Uint<LIMBS>,
+) -> Option<FixedRsaCrt<LIMBS>> {
+    // `r ≥ 4` (bit length ≥ 3) and odd, without scanning the secret limbs.
+    let usable = |r: &Uint<LIMBS>| (r.is_odd() & !r.shr_bits(2).is_zero()).declassify();
+    if !usable(p) || !usable(q) || p.ct_eq(q).declassify() {
+        return None;
+    }
+    let one = Uint::ONE;
+    let two = Uint::from_u64(2);
+    // `Uint::reduce` is the bitwise long division (the moduli are even, so
+    // no Montgomery shortcut); it runs once per key construction.
+    let dp = d.reduce(&p.wrapping_sub(&one));
+    let dq = d.reduce(&q.wrapping_sub(&one));
+    // The primes are secret: `new_secret` declassifies only the width scan.
+    let mont_p = MontModulus::new_secret(*p);
+    let mont_q = MontModulus::new_secret(*q);
+    let qinv = mont_p.pow_bits(
+        &mont_p.reduce(q),
+        &p.wrapping_sub(&two),
+        64 * mont_p.limbs(),
+    );
+    Some(FixedRsaCrt {
+        dp,
+        dq,
+        qinv,
+        mont_p,
+        mont_q,
+    })
 }
 
 /// An RSA private key. Holds the private exponent `d` and the primes `p`, `q`.
@@ -80,6 +170,11 @@ pub struct RsaPrivateKey<const LIMBS: usize> {
     /// with an OS CSPRNG, all-zero on bare-metal `no_std`. Re-drawn on
     /// `Clone` so a cloned key does not replay the original's blinders.
     blind_salt: [u8; 16],
+    /// Montgomery context for `n` (`None` for an even modulus, see
+    /// [`RsaPublicKey`]'s field), built once with the key.
+    mont: Option<MontModulus<LIMBS>>,
+    /// CRT parameters, when the primes are known and usable.
+    crt: Option<FixedRsaCrt<LIMBS>>,
 }
 
 // Manual `Clone`: `AtomicU32` is not `Clone`. The clone starts from the
@@ -98,6 +193,8 @@ impl<const LIMBS: usize> Clone for RsaPrivateKey<LIMBS> {
             // Fresh salt: two clones must not produce the same blinder
             // sequence (the counter alone is copied).
             blind_salt: fresh_blind_salt(),
+            mont: self.mont.clone(),
+            crt: self.crt.clone(),
         }
     }
 }
@@ -172,45 +269,25 @@ fn derive_blinding<const LIMBS: usize>(
     (phi_n_minus_1, seed)
 }
 
-/// Performs the raw RSA private operation with base blinding (Coron's variant
-/// of Kocher / Messerges blinding):
-///
-/// ```text
-///   r        = HMAC-SHA256(blinding_seed, nonce ‖ salt ‖ c)  // reduced mod n
-///   r_e      = r^e mod n                        // public exponent, cheap
-///   c_blind  = (c · r_e) mod n
-///   m        = c_blind^d · r^{φ(n)-1} mod n     // one joint CT ladder;
-///                                               // r^{φ(n)-1} = r⁻¹ (Fermat)
-/// ```
-///
-/// When `phi_n_minus_1` is zero (key imported without primes), the function
-/// falls back to the unblinded `c^d mod n`.
-fn raw_private_blinded<const LIMBS: usize>(
-    n: &Uint<LIMBS>,
-    e: &Uint<LIMBS>,
-    d: &Uint<LIMBS>,
-    phi_n_minus_1: &Uint<LIMBS>,
+/// Derives the per-call blinder `r ∈ [2, n)` — `HMAC-SHA256(seed, counter ‖
+/// nonce ‖ salt ‖ c)` chunks filling the modulus width, reduced mod `n` —
+/// without a heap allocation. The blinder is wider than `n.bit_len()` by up
+/// to 64 bits, so the reduction has bias ≤ 2⁻⁶⁴, negligible because the
+/// blinder is a per-call masking value, not a key. If `r` happens to be 0
+/// or 1 the blinder degenerates; that astronomically rare case maps to
+/// `r = 2` by a masked select (still coprime to `n` with probability
+/// 1 − negligible), which keeps the function total.
+fn derive_blinder_fixed<const LIMBS: usize>(
+    modulus: &MontModulus<LIMBS>,
     blinding_seed: &[u8; 32],
     nonce: &BlindNonce,
     c: &Uint<LIMBS>,
 ) -> Uint<LIMBS> {
     use crate::hash::HmacSha256;
 
-    let modulus = MontModulus::new(*n);
-
-    if bool::from(phi_n_minus_1.ct_eq(&Uint::ZERO)) {
-        // Imported key without primes — no φ(n) to drive Fermat. Fall back to
-        // the plain constant-time ladder; the caller is responsible for
-        // upstream blinding if they need it (see struct docs).
-        return modulus.pow(c, d);
-    }
-
-    // Derive blinder limbs directly from HMAC-SHA256 output, no heap.
     // Each HMAC call yields 32 bytes; we walk the modulus's limbs from MSB
     // downward and fill 4 limbs per chunk, advancing a counter so successive
-    // chunks are independent. The blinder is wider than `n.bit_len()` by up to
-    // 64 bits, so the subsequent `reduce(n)` has bias ≤ 2⁻⁶⁴ — negligible
-    // because the blinder is not a secret key, only a per-call masking value.
+    // chunks are independent.
     let mut r_limbs = [0u64; LIMBS];
     let mut counter: u32 = 0;
     let mut limbs_remaining = LIMBS;
@@ -253,19 +330,46 @@ fn raw_private_blinded<const LIMBS: usize>(
         counter += 1;
     }
     let r_raw = Uint::<LIMBS>::from_limbs(r_limbs);
-    let r = r_raw.reduce(n);
-    // If r happens to be 0 or 1, the blinder degenerates (no effective masking).
-    // In that astronomically rare case, fall back to r = 2 (still coprime to n
-    // with probability 1 − negligible). This keeps the function total.
-    let r_is_zero = r.ct_eq(&Uint::ZERO);
-    let r_is_one = r.ct_eq(&Uint::ONE);
-    let bad = r_is_zero | r_is_one;
-    let r = <Uint<LIMBS> as crate::ct::ConditionallySelectable>::conditional_select(
+    // Montgomery chunk reduction, not the bitwise long division.
+    let r = modulus.reduce(&r_raw);
+    let bad = r.ct_eq(&Uint::ZERO) | r.ct_eq(&Uint::ONE);
+    <Uint<LIMBS> as crate::ct::ConditionallySelectable>::conditional_select(
         &Uint::from_u64(2),
         &r,
         bad,
-    );
+    )
+}
 
+/// Performs the raw RSA private operation with base blinding (Coron's variant
+/// of Kocher / Messerges blinding), full width:
+///
+/// ```text
+///   r        = HMAC-SHA256(blinding_seed, nonce ‖ salt ‖ c)  // reduced mod n
+///   r_e      = r^e mod n                        // public exponent, cheap
+///   c_blind  = (c · r_e) mod n
+///   m        = c_blind^d · r^{φ(n)-1} mod n     // one joint CT ladder;
+///                                               // r^{φ(n)-1} = r⁻¹ (Fermat)
+/// ```
+///
+/// When `phi_n_minus_1` is zero (key imported without primes), the function
+/// falls back to the unblinded `c^d mod n`.
+fn raw_private_blinded<const LIMBS: usize>(
+    modulus: &MontModulus<LIMBS>,
+    e: &Uint<LIMBS>,
+    d: &Uint<LIMBS>,
+    phi_n_minus_1: &Uint<LIMBS>,
+    blinding_seed: &[u8; 32],
+    nonce: &BlindNonce,
+    c: &Uint<LIMBS>,
+) -> Uint<LIMBS> {
+    if bool::from(phi_n_minus_1.ct_eq(&Uint::ZERO)) {
+        // Imported key without primes — no φ(n) to drive Fermat. Fall back to
+        // the plain constant-time ladder; the caller is responsible for
+        // upstream blinding if they need it (see struct docs).
+        return modulus.pow(c, d);
+    }
+
+    let r = derive_blinder_fixed(modulus, blinding_seed, nonce, c);
     // `e` is public, so the exponent-length ladder applies — ~17 iterations
     // for e = 65537 instead of a full modulus-width pass. It is still
     // branchless and constant-time in the secret base `r`.
@@ -275,6 +379,75 @@ fn raw_private_blinded<const LIMBS: usize>(
     // blinder share one joint constant-time ladder (half the squarings of
     // two separate exponentiations).
     modulus.pow2(&c_blind, d, &r, phi_n_minus_1)
+}
+
+/// The base-blinded private operation via the CRT: two half-width
+/// exponentiations instead of one full-width one (~4× fewer limb
+/// multiplications), with the blinder inverted per prime by Fermat — folded
+/// into the same joint (Straus) ladder as the unblinding exponentiation, so
+/// the inverse costs extra multiplies but no extra squarings. The fixed-width
+/// counterpart of the runtime-sized key's `raw_private_crt_blinded`:
+///
+/// ```text
+///   c_blind = c · r^e mod n            (pow_public: e is public, base CT)
+///   m_p     = (c_blind mod p)^dP · r^(p−2) mod p    ( = m·r·r⁻¹ = m mod p )
+///   m_q     = (c_blind mod q)^dQ · r^(q−2) mod q
+///   m       = m_q + q · (qInv·(m_p − m_q) mod p)    (Garner)
+/// ```
+///
+/// Every exponentiation runs the constant-time windowed ladder with secret
+/// exponents bounded by the (public) width of their prime; the reductions
+/// mod each prime are the Montgomery chunk reduction, and `sub_mod` /
+/// `mul_mod` / the widening `mul_wide` have operand-independent schedules.
+/// The caller MUST fault-check the result (`m^e ≡ c mod n`) before releasing
+/// it: a fault in one CRT half — or a key imported with inconsistent primes
+/// — otherwise yields output that factors `n` (Boneh–DeMillo–Lipton).
+fn raw_private_crt_blinded<const LIMBS: usize>(
+    key: &RsaPrivateKey<LIMBS>,
+    modulus: &MontModulus<LIMBS>,
+    crt: &FixedRsaCrt<LIMBS>,
+    nonce: &BlindNonce,
+    c: &Uint<LIMBS>,
+) -> Uint<LIMBS> {
+    use crate::zeroize::Zeroize;
+
+    let mut r = derive_blinder_fixed(modulus, &key.blinding_seed, nonce, c);
+    let mut r_e = modulus.pow_public(&r, &key.e);
+    let mut c_blind = modulus.mul_mod(c, &r_e);
+    let two = Uint::from_u64(2);
+
+    let half = |mp: &MontModulus<LIMBS>, prime: &Uint<LIMBS>, dx: &Uint<LIMBS>| {
+        let mut cx = mp.reduce(&c_blind);
+        let mut rx = mp.reduce(&r);
+        let mut xm2 = prime.wrapping_sub(&two);
+        // cx^dx · rx^(x−2) in one joint ladder: the Fermat inverse of the
+        // blinder shares the unblinding exponentiation's squarings. Both
+        // exponents are below the prime, so its (public) width bounds them.
+        let mx = mp.pow2_bits(&cx, dx, &rx, &xm2, 64 * mp.limbs());
+        cx.zeroize();
+        rx.zeroize();
+        xm2.zeroize();
+        mx
+    };
+    let mut m_p = half(&crt.mont_p, &key.p, &crt.dp);
+    let mut m_q = half(&crt.mont_q, &key.q, &crt.dq);
+
+    // Garner recombination: m = m_q + q·(qInv·(m_p − m_q) mod p). The
+    // product `q·h < q·p = n` fits the key width (low half of `mul_wide`).
+    let mut m_q_mod_p = crt.mont_p.reduce(&m_q);
+    let mut diff = crt.mont_p.sub_mod(&m_p, &m_q_mod_p);
+    let mut h = crt.mont_p.mul_mod(&diff, &crt.qinv);
+    let m = m_q.wrapping_add(&key.q.mul_wide(&h).0);
+
+    r.zeroize();
+    r_e.zeroize();
+    c_blind.zeroize();
+    m_p.zeroize();
+    m_q.zeroize();
+    m_q_mod_p.zeroize();
+    diff.zeroize();
+    h.zeroize();
+    m
 }
 
 impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
@@ -300,7 +473,8 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         doc = "[`Self::from_spki_der`]: crate"
     )]
     pub fn new(n: Uint<LIMBS>, e: Uint<LIMBS>) -> Self {
-        RsaPublicKey { n, e }
+        let mont = mont_for(&n);
+        RsaPublicKey { n, e, mont }
     }
 
     /// The modulus `n`.
@@ -333,7 +507,10 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     pub fn raw(&self, m: &Uint<LIMBS>) -> Uint<LIMBS> {
         // `e` is public, so use the public-exponent ladder (~17 squarings for
         // e = 65537) rather than the secret-width constant-time `pow`.
-        MontModulus::new(self.n).pow_public(m, &self.e)
+        self.mont
+            .as_ref()
+            .expect("Montgomery modulus must be odd")
+            .pow_public(m, &self.e)
     }
 }
 
@@ -415,6 +592,9 @@ impl<const LIMBS: usize> Drop for RsaPrivateKey<LIMBS> {
         self.phi_n_minus_1.zeroize();
         self.blinding_seed.zeroize();
         self.blind_salt.zeroize();
+        // The CRT parameters are as secret as the primes (`n`'s context is
+        // public and needs no wipe).
+        self.crt.zeroize();
     }
 }
 
@@ -487,18 +667,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             // count (`inv_mod_ct`); retry if e is not coprime to φ — that
             // outcome is public by nature.
             if let Some(d) = inv_mod_ct(&e, &phi).into_option() {
-                let (phi_n_minus_1, blinding_seed) = derive_blinding(&p, &q, &d);
-                return RsaPrivateKey {
-                    n,
-                    e,
-                    d,
-                    p,
-                    q,
-                    phi_n_minus_1,
-                    blinding_seed,
-                    blind_counter: AtomicU32::new(0),
-                    blind_salt: fresh_blind_salt(),
-                };
+                return Self::from_components_with_primes(n, e, d, p, q);
             }
         }
     }
@@ -527,6 +696,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     pub fn from_components(n: Uint<LIMBS>, e: Uint<LIMBS>, d: Uint<LIMBS>) -> Self {
         let (phi_n_minus_1, blinding_seed) =
             derive_blinding(&Uint::<LIMBS>::ZERO, &Uint::<LIMBS>::ZERO, &d);
+        let mont = mont_for(&n);
         RsaPrivateKey {
             n,
             e,
@@ -537,6 +707,58 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             blinding_seed,
             blind_counter: AtomicU32::new(0),
             blind_salt: fresh_blind_salt(),
+            mont,
+            crt: None,
+        }
+    }
+
+    /// Constructs a private key from all components, including the prime
+    /// factors `p` and `q`, so that base blinding and the CRT private
+    /// operation are available — the fixed-width counterpart of
+    /// [`BoxedRsaPrivateKey::from_components_with_primes`].
+    ///
+    /// This constructor performs **no validation** beyond what the private
+    /// operation's fault check enforces at runtime: primes that are not the
+    /// factors of `n` make every private operation fall back to the
+    /// (blinded) full-width path, and an even or zero `n` panics there as
+    /// for [`from_components`](Self::from_components). Untrusted key
+    /// material must go through the fallible parsers.
+    ///
+    /// Derives `dP`, `dQ`, `qInv` and the primes' Montgomery contexts once
+    /// (a few hundred microseconds for a 2048-bit key), so build a key once
+    /// and keep it rather than reconstructing it per operation.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[`BoxedRsaPrivateKey::from_components_with_primes`]: crate"
+    )]
+    #[cfg_attr(
+        feature = "alloc",
+        doc = "",
+        doc = "[`BoxedRsaPrivateKey::from_components_with_primes`]: super::BoxedRsaPrivateKey::from_components_with_primes"
+    )]
+    pub fn from_components_with_primes(
+        n: Uint<LIMBS>,
+        e: Uint<LIMBS>,
+        d: Uint<LIMBS>,
+        p: Uint<LIMBS>,
+        q: Uint<LIMBS>,
+    ) -> Self {
+        let (phi_n_minus_1, blinding_seed) = derive_blinding(&p, &q, &d);
+        let mont = mont_for(&n);
+        let crt = derive_crt_fixed(&p, &q, &d);
+        RsaPrivateKey {
+            n,
+            e,
+            d,
+            p,
+            q,
+            phi_n_minus_1,
+            blinding_seed,
+            blind_counter: AtomicU32::new(0),
+            blind_salt: fresh_blind_salt(),
+            mont,
+            crt,
         }
     }
 
@@ -545,6 +767,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         RsaPublicKey {
             n: self.n,
             e: self.e,
+            mont: self.mont.clone(),
         }
     }
 
@@ -596,10 +819,10 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         &self.d
     }
 
-    /// Constructs a private key from all components, including the primes.
-    /// Used by key deserialization, which is `alloc`-gated along with the DER
-    /// codecs — hence the cfg, which keeps allocator-free builds free of a
-    /// dead-code warning.
+    /// [`from_components_with_primes`](Self::from_components_with_primes),
+    /// as key deserialization calls it (which is `alloc`-gated along with
+    /// the DER codecs — hence the cfg, which keeps allocator-free builds
+    /// free of a dead-code warning).
     #[cfg(feature = "alloc")]
     pub(crate) fn from_raw_parts(
         n: Uint<LIMBS>,
@@ -608,18 +831,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         p: Uint<LIMBS>,
         q: Uint<LIMBS>,
     ) -> Self {
-        let (phi_n_minus_1, blinding_seed) = derive_blinding(&p, &q, &d);
-        RsaPrivateKey {
-            n,
-            e,
-            d,
-            p,
-            q,
-            phi_n_minus_1,
-            blinding_seed,
-            blind_counter: AtomicU32::new(0),
-            blind_salt: fresh_blind_salt(),
-        }
+        Self::from_components_with_primes(n, e, d, p, q)
     }
 
     /// The raw RSA private operation `c^d mod n` (decryption / signing
@@ -631,19 +843,60 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// an odd modulus). Keys from [`Self::generate`] or the fallible parsers
     /// are pre-validated; only a key assembled from unchecked components via
     /// [`Self::from_components`] can trip this.
+    ///
+    /// With the primes known the operation runs the CRT (two half-width
+    /// exponentiations) and fault-checks the result with the cheap
+    /// public-exponent `m^e ≡ c mod n` before releasing it, so a faulted CRT
+    /// half can never escape (Boneh–DeMillo–Lipton). On mismatch it
+    /// recomputes with the full-width path — and fault-checks *that* too. If
+    /// the recomputation also fails to verify (a transient fault on both
+    /// attempts, or a key whose `e`, `d` and `n` are not consistent), the op
+    /// returns zero: a value that cannot be a valid signature or a
+    /// well-padded plaintext, so every caller fails closed.
     pub fn raw(&self, c: &Uint<LIMBS>) -> Uint<LIMBS> {
-        raw_private_blinded(
-            &self.n,
-            &self.e,
-            &self.d,
-            &self.phi_n_minus_1,
-            &self.blinding_seed,
-            &BlindNonce {
-                counter: self.blind_counter.fetch_add(1, Ordering::Relaxed),
-                salt: per_op_blind_salt(&self.blind_salt),
-            },
-            c,
-        )
+        let modulus = self.mont.as_ref().expect("Montgomery modulus must be odd");
+        let nonce = BlindNonce {
+            counter: self.blind_counter.fetch_add(1, Ordering::Relaxed),
+            salt: per_op_blind_salt(&self.blind_salt),
+        };
+        let full_width = || {
+            raw_private_blinded(
+                modulus,
+                &self.e,
+                &self.d,
+                &self.phi_n_minus_1,
+                &self.blinding_seed,
+                &nonce,
+                c,
+            )
+        };
+        let Some(crt) = self.crt.as_ref() else {
+            return full_width();
+        };
+        let m = raw_private_crt_blinded(self, modulus, crt, &nonce, c);
+        // `c` is public in every caller (a ciphertext or an EMSA-encoded
+        // digest), so a plain branch on its range leaks nothing; the
+        // comparison with `m^e` is the constant-time limb compare (a
+        // variable-time `==` would scan a value derived from the secret `m`)
+        // and its verdict is public — `true` for every fault-free operation.
+        let c_mod_n = if bool::from(c.ct_lt(&self.n)) {
+            *c
+        } else {
+            modulus.reduce(c)
+        };
+        if modulus.pow_public(&m, &self.e).ct_eq(&c_mod_n).declassify() {
+            return m;
+        }
+        let mut m2 = full_width();
+        if modulus
+            .pow_public(&m2, &self.e)
+            .ct_eq(&c_mod_n)
+            .declassify()
+        {
+            return m2;
+        }
+        crate::zeroize::Zeroize::zeroize(&mut m2);
+        Uint::ZERO
     }
 }
 

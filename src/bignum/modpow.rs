@@ -2,6 +2,7 @@
 
 use super::MontModulus;
 use super::Uint;
+use super::uint::Limb;
 use crate::ct::{ConditionallySelectable, ConstantTimeEq};
 
 impl<const LIMBS: usize> MontModulus<LIMBS> {
@@ -23,6 +24,23 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// an 8192-bit one. That matters on small no-`alloc` targets; the window is
     /// a compile-time constant here so it can be lowered if it ever needs to be.
     pub fn pow(&self, base: &Uint<LIMBS>, exp: &Uint<LIMBS>) -> Uint<LIMBS> {
+        // The storage width is public; the exponent's own bit length is not.
+        self.pow_bits(base, exp, LIMBS * 64)
+    }
+
+    /// Computes `base^exp mod N` in constant time for a secret `exp` known
+    /// to be below `2^bits`, where `bits` is a **public** bound (the width
+    /// of a prime factor for an RSA CRT exponent, a group order): the
+    /// ladder runs `⌈bits/4⌉` windows, independent of the exponent's value.
+    /// Bits of `exp` at or above `bits` are ignored, so the bound must hold
+    /// — `exp < 2^bits` is the caller's precondition. [`pow`](Self::pow) is
+    /// this with `bits = 64·LIMBS`.
+    ///
+    /// Same discipline as `pow`: a 16-entry table gathered by a full masked
+    /// scan (one opaque mask per entry, via `Uint::conditional_select`) and
+    /// an unconditional multiply per window. The accumulator starts at the
+    /// top window's entry, saving the squarings of 1.
+    pub fn pow_bits(&self, base: &Uint<LIMBS>, exp: &Uint<LIMBS>, bits: usize) -> Uint<LIMBS> {
         /// Window width in bits. Must divide 64 so windows never straddle limbs.
         const W: usize = 4;
         const TABLE: usize = 1 << W;
@@ -40,33 +58,36 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         }
 
         let exp = exp.as_limbs();
-        let mut acc = one_m;
-        // Most-significant window first. `LIMBS * 64` is a multiple of W, so
-        // every window lies inside one limb.
-        let mut bit = LIMBS * 64;
-        while bit >= W {
-            bit -= W;
-            // acc = acc^(2^W)
+        let windows = bits.div_ceil(W).max(1);
+        // Nibble `w` of the exponent; positions past its storage read as 0.
+        // The limb index and shift are public loop quantities.
+        let digit =
+            |w: usize| ((exp.get(w / 16).copied().unwrap_or(0) >> (4 * (w % 16))) & 0xf) as usize;
+        // Constant-time gather: touch every table entry in a fixed order and
+        // keep the one whose index matches. A direct `table[idx]` would make
+        // the load address depend on the secret exponent. Note the argument
+        // order: this crate's `conditional_select(a, b, c)` returns `a` when
+        // `c` is true, so the matching entry goes first. The index comparison
+        // goes through `ct_eq` (branch-free by construction) rather than a
+        // `==` the compiler is free to lower to a data-dependent branch.
+        let gather = |idx: usize| {
+            let mut sel = table[0];
+            for (j, t) in table.iter().enumerate() {
+                sel = Uint::conditional_select(t, &sel, j.ct_eq(&idx));
+            }
+            sel
+        };
+        let mut w = windows - 1;
+        let mut acc = gather(digit(w));
+        while w > 0 {
+            w -= 1;
             let mut k = 0;
             while k < W {
                 acc = self.mont_sqr(&acc);
                 k += 1;
             }
-            let idx = ((exp[bit / 64] >> (bit % 64)) & ((1 << W) - 1)) as usize;
-            // Constant-time gather: touch every table entry in a fixed order
-            // and keep the one whose index matches. A direct `table[idx]` would
-            // make the load address depend on the secret exponent.
-            // Note the argument order: this crate's `conditional_select(a, b, c)`
-            // returns `a` when `c` is true (inverted from the `subtle` crate),
-            // so the matching entry goes first. The index comparison itself
-            // goes through `ct_eq` (branch-free by construction) rather than a
-            // `==` the compiler is free to lower to a data-dependent branch.
-            let mut sel = table[0];
-            for (j, t) in table.iter().enumerate() {
-                sel = Uint::conditional_select(t, &sel, j.ct_eq(&idx));
-            }
             // Unconditional: a zero window multiplies by the Montgomery 1.
-            acc = self.mont_mul(&acc, &sel);
+            acc = self.mont_mul(&acc, &gather(digit(w)));
         }
 
         self.from_mont(&acc)
@@ -77,17 +98,32 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// squarings (Straus/Shamir): a 2-bit joint window over the 16-entry
     /// table `a^i·b^j` (`i, j ∈ 0..4`), so `64·LIMBS` squarings plus half as
     /// many multiplies, against the `2·64·LIMBS` squarings of two
-    /// [`pow`](Self::pow) calls.
-    ///
-    /// Same constant-time discipline as `pow`: every window gathers its entry
-    /// by a full masked scan of the table and multiplies unconditionally. The
-    /// table costs `16 * LIMBS * 8` bytes of stack, like `pow`'s.
+    /// [`pow`](Self::pow) calls. [`pow2_bits`](Self::pow2_bits) is the
+    /// bounded-exponent form.
     pub fn pow2(
         &self,
         a: &Uint<LIMBS>,
         x: &Uint<LIMBS>,
         b: &Uint<LIMBS>,
         y: &Uint<LIMBS>,
+    ) -> Uint<LIMBS> {
+        self.pow2_bits(a, x, b, y, LIMBS * 64)
+    }
+
+    /// [`pow2`](Self::pow2) for secret `x, y` below `2^bits`, `bits` a
+    /// **public** bound as in [`pow_bits`](Self::pow_bits): `bits` squarings
+    /// and `⌈bits/2⌉` multiplies.
+    ///
+    /// Same constant-time discipline as `pow`: every window gathers its entry
+    /// by a full masked scan of the table and multiplies unconditionally. The
+    /// table costs `16 * LIMBS * 8` bytes of stack, like `pow`'s.
+    pub fn pow2_bits(
+        &self,
+        a: &Uint<LIMBS>,
+        x: &Uint<LIMBS>,
+        b: &Uint<LIMBS>,
+        y: &Uint<LIMBS>,
+        bits: usize,
     ) -> Uint<LIMBS> {
         let one_m = self.to_mont(&Uint::ONE);
         let mut table = [one_m; 16];
@@ -108,20 +144,63 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         }
 
         let (x, y) = (x.as_limbs(), y.as_limbs());
-        let mut acc = one_m;
-        let mut bit = LIMBS * 64;
-        while bit >= 2 {
-            bit -= 2;
-            acc = self.mont_sqr(&acc);
-            acc = self.mont_sqr(&acc);
-            let idx = (((x[bit / 64] >> (bit % 64)) & 3) | (((y[bit / 64] >> (bit % 64)) & 3) << 2))
-                as usize;
-            // Constant-time gather, as in `pow` (matching entry goes first).
+        let windows = bits.div_ceil(2).max(1);
+        let two_bits = |e: &[Limb], w: usize| {
+            ((e.get(w / 32).copied().unwrap_or(0) >> (2 * (w % 32))) & 3) as usize
+        };
+        let digit = |w: usize| two_bits(x, w) | (two_bits(y, w) << 2);
+        // Constant-time gather, as in `pow_bits` (matching entry goes first).
+        let gather = |idx: usize| {
             let mut sel = table[0];
             for (k, t) in table.iter().enumerate() {
                 sel = Uint::conditional_select(t, &sel, k.ct_eq(&idx));
             }
-            acc = self.mont_mul(&acc, &sel);
+            sel
+        };
+        let mut w = windows - 1;
+        let mut acc = gather(digit(w));
+        while w > 0 {
+            w -= 1;
+            acc = self.mont_sqr(&acc);
+            acc = self.mont_sqr(&acc);
+            acc = self.mont_mul(&acc, &gather(digit(w)));
+        }
+        self.from_mont(&acc)
+    }
+
+    /// Reduces `x` (any `Uint<LIMBS>`) modulo `N`.
+    ///
+    /// Horner over chunks of `x` the width of the modulus's significant
+    /// limbs `s`, in the Montgomery domain: `M(c) = mont_mul(c, R²)` holds
+    /// for any chunk `c < R`, and `M(acc·R) = mont_mul(M(acc), R²)`, so each
+    /// chunk costs two Montgomery multiplications plus a modular addition,
+    /// and one final `from_mont` undoes the domain — the fixed-width
+    /// counterpart of [`BoxedMontModulus::reduce`](super::BoxedMontModulus::reduce).
+    /// For the RSA CRT split (a 2048-bit value mod a 1024-bit prime held in
+    /// the same `Uint<32>`) that is five half-width multiplies instead of
+    /// the 2048 trial subtractions of [`Uint::reduce`].
+    ///
+    /// Constant time: the chunk count and every loop bound are functions of
+    /// `LIMBS` and the (public) width of `N`; the arithmetic is the masked
+    /// kernel and add/select code, so neither `x` nor a secret `N` steers
+    /// anything.
+    pub fn reduce(&self, x: &Uint<LIMBS>) -> Uint<LIMBS> {
+        let s = self.limbs();
+        let xl = x.as_limbs();
+        let chunks = LIMBS.div_ceil(s);
+        let mut acc = Uint::ZERO;
+        for i in (0..chunks).rev() {
+            let mut c = [0 as Limb; LIMBS];
+            for (j, cj) in c.iter_mut().enumerate().take(s) {
+                *cj = xl.get(i * s + j).copied().unwrap_or(0);
+            }
+            let cm = self.mont_mul(&Uint::from_limbs(c), self.r2());
+            if i + 1 == chunks {
+                acc = cm;
+            } else {
+                // acc ← M(prefix·R), then add M(c_i).
+                acc = self.add_mod(&self.mont_mul(&acc, self.r2()), &cm);
+            }
         }
         self.from_mont(&acc)
     }
@@ -276,6 +355,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `pow_bits` / `pow2_bits` with the tightest bound (and a loose, odd
+    /// one) must equal the full-width ladders, and `reduce` must equal the
+    /// bitwise long division — across short moduli held in a wider type,
+    /// where the context runs at its significant width.
+    fn bounded_variants_width<const L: usize>(rng: &mut u64) {
+        for top in 1..=L {
+            let mut n = [0 as Limb; L];
+            for l in n.iter_mut().take(top) {
+                *l = splitmix64(rng);
+            }
+            n[0] |= 1;
+            n[top - 1] |= 1 << 63;
+            let n = Uint::<L>::from_limbs(n);
+            let m = MontModulus::new(n);
+            assert_eq!(m.limbs(), top);
+            for _ in 0..3 {
+                let mut v = [0 as Limb; L];
+                for l in v.iter_mut() {
+                    *l = splitmix64(rng);
+                }
+                let x = Uint::<L>::from_limbs(v);
+                assert_eq!(m.reduce(&x), x.reduce(&n), "reduce L={L} top={top}");
+                let a = m.reduce(&x);
+                let mut e = [0 as Limb; L];
+                for l in e.iter_mut().take(top) {
+                    *l = splitmix64(rng);
+                }
+                let e = Uint::<L>::from_limbs(e);
+                let want = m.pow(&a, &e);
+                assert_eq!(m.pow_bits(&a, &e, 64 * top), want, "pow_bits L={L}");
+                assert_eq!(m.pow_bits(&a, &e, 64 * top + 5), want, "pow_bits+5 L={L}");
+                let b = m.reduce(&Uint::from_limbs(v.map(|l| l.rotate_left(17))));
+                // A second exponent below the same bound (only the low
+                // `top` limbs are perturbed).
+                let mut f = *e.as_limbs();
+                for l in f.iter_mut().take(top) {
+                    *l ^= 0x5555;
+                }
+                let f = Uint::<L>::from_limbs(f);
+                let want2 = m.pow2(&a, &e, &b, &f);
+                assert_eq!(
+                    m.pow2_bits(&a, &e, &b, &f, 64 * top),
+                    want2,
+                    "pow2_bits L={L}"
+                );
+                assert_eq!(
+                    m.pow2_bits(&a, &e, &b, &f, 64 * top + 3),
+                    want2,
+                    "pow2_bits+3 L={L}"
+                );
+            }
+            // Edge inputs for `reduce`: 0, n − 1, n, all-ones.
+            assert_eq!(m.reduce(&Uint::ZERO), Uint::ZERO);
+            assert_eq!(m.reduce(&n), Uint::ZERO);
+            let nm1 = n.wrapping_sub(&Uint::ONE);
+            assert_eq!(m.reduce(&nm1), nm1);
+            let ones = Uint::<L>::from_limbs([Limb::MAX; L]);
+            assert_eq!(m.reduce(&ones), ones.reduce(&n));
+        }
+    }
+
+    #[test]
+    fn bounded_variants_agree() {
+        let mut rng = 0x1F2E_3D4C_5B6A_7988u64;
+        bounded_variants_width::<1>(&mut rng);
+        bounded_variants_width::<2>(&mut rng);
+        bounded_variants_width::<3>(&mut rng);
+        bounded_variants_width::<5>(&mut rng);
+        bounded_variants_width::<8>(&mut rng);
     }
 
     #[test]

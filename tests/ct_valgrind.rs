@@ -73,7 +73,7 @@ use purecrypto::rng::{CryptoRng, HmacDrbg, RngCore};
 use purecrypto::ct::hooks::{self, Suite};
 
 use purecrypto::ascon::{Ascon128, Ascon128a, AsconAead128};
-use purecrypto::bignum::BoxedUint;
+use purecrypto::bignum::{BoxedUint, Uint};
 use purecrypto::bls;
 use purecrypto::chunked::{self, Cobblestone128};
 use purecrypto::cipher::{
@@ -114,7 +114,7 @@ use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey}
 use purecrypto::mlkem::{
     MlKem512DecapsKey, MlKem768Ciphertext, MlKem768DecapsKey, MlKem1024DecapsKey,
 };
-use purecrypto::rsa::BoxedRsaPrivateKey;
+use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
 use purecrypto::slhdsa::{self, ParamSet};
 use purecrypto::xmss::{XmssMtParamSet, XmssMtPrivateKey, XmssParamSet, XmssPrivateKey};
 use purecrypto::zkp::pedersen::{Commitment, Generator};
@@ -961,6 +961,50 @@ fn rsa2048_keygen() -> String {
     let key = BoxedRsaPrivateKey::generate(2048, BoxedUint::from_u64(65537), &mut rng, 0);
     let n = key.modulus().to_be_bytes(256);
     hex8(public(&n[..]))
+}
+
+/// A fixed-width `Uint` whose limbs are classified secret.
+fn secret_fixed<const L: usize>(v: &Uint<L>) -> Uint<L> {
+    let copy = *v;
+    ct::classify_val(&copy);
+    copy
+}
+
+/// The fixed-width (`Uint<32>`, allocator-free) private key: the CRT
+/// derivation at construction (`dP`, `dQ`, `qInv`, the primes' Montgomery
+/// contexts at their significant width) and the CRT private operation with
+/// its fault check, plus the full-width blinded path a key without primes
+/// takes. Same key as `rsa_key`, with `d`, `p`, `q` classified.
+fn rsa2048_fixed_sign() -> String {
+    let parsed = RsaPrivateKey::<32>::from_pkcs1_pem(RSA_PEM).expect("test key parses");
+    let (p, q) = parsed.primes();
+    let key = RsaPrivateKey::<32>::from_components_with_primes(
+        *parsed.modulus(),
+        *parsed.exponent(),
+        secret_fixed(parsed.private_exponent()),
+        secret_fixed(p),
+        secret_fixed(q),
+    );
+    let sig = key
+        .sign_pkcs1v15::<Sha256>(b"ct_valgrind message")
+        .expect("sign");
+    declassify(&sig);
+    key.public_key()
+        .verify_pkcs1v15::<Sha256>(b"ct_valgrind message", &sig)
+        .expect("signature verifies");
+    // Without primes: blinding is off (no φ(n)), the plain full-width ladder
+    // runs on the classified exponent.
+    let bare = RsaPrivateKey::<32>::from_components(
+        *parsed.modulus(),
+        *parsed.exponent(),
+        secret_fixed(parsed.private_exponent()),
+    );
+    let sig2 = bare
+        .sign_pkcs1v15::<Sha256>(b"ct_valgrind message")
+        .expect("sign");
+    declassify(&sig2);
+    assert_eq!(sig, sig2);
+    hex8(&sig)
 }
 
 // ---------------------------------------------------------------------------
@@ -2429,6 +2473,7 @@ const CASES: &[Case] = &[
     ("rsa2048_pkcs1v15_explicit", rsa2048_pkcs1v15_explicit),
     ("rsa2048_pkcs1v15_session", rsa2048_pkcs1v15_session),
     ("rsa2048_keygen", rsa2048_keygen),
+    ("rsa2048_fixed_sign", rsa2048_fixed_sign),
     ("mlkem768_keygen", mlkem768_keygen),
     ("mlkem768_encaps", mlkem768_encaps),
     ("mlkem768_decaps", mlkem768_decaps),

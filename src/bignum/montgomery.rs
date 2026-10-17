@@ -375,7 +375,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// the same "widths are public" rule `BoxedUint::significant_limbs`
     /// follows. This `const fn` cannot declassify its scan for the taint
     /// harness; a modulus whose *limbs* are classified secret goes through
-    /// [`new_secret`](Self::new_secret), which does.
+    /// `new_secret`, which does.
     pub const fn new(modulus: Uint<LIMBS>) -> Self {
         let n = modulus.as_limbs();
         let mut s = LIMBS;
@@ -454,6 +454,12 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         self.limbs
     }
 
+    /// `R² mod N` (for `reduce`).
+    #[inline]
+    pub(crate) fn r2(&self) -> &Uint<LIMBS> {
+        &self.r2
+    }
+
     /// The modulus `N`.
     #[inline]
     pub fn modulus(&self) -> &Uint<LIMBS> {
@@ -462,7 +468,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
 
     /// Montgomery multiplication: given `a, b` in Montgomery form, returns
     /// `a*b*R^-1 mod N` (the Montgomery form of the product). CIOS with
-    /// merged, two-rows-per-pass inner loops ([`mont_mul_kernel`]), constant
+    /// merged, two-rows-per-pass inner loops (`mont_mul_kernel`), constant
     /// time.
     pub const fn mont_mul(&self, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
         let mut t = [0 as Limb; LIMBS];
@@ -483,7 +489,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
 
     /// Montgomery squaring: given `a` in Montgomery form, returns
     /// `a²·R^-1 mod N` — exactly [`mont_mul`](Self::mont_mul)`(a, a)`, but
-    /// with each off-diagonal product computed once ([`mont_sqr_kernel`]:
+    /// with each off-diagonal product computed once (`mont_sqr_kernel`:
     /// roughly half the multiplies of the general product), constant time.
     ///
     /// The `2·LIMBS`-limb square lives in a `[[Limb; 2]; LIMBS]` viewed as
@@ -542,6 +548,16 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         // mont_mul(a, b) = ab·R^-1; multiplying by R^2 (·R^-1) restores ab.
         let t = self.mont_mul(a, b);
         self.mont_mul(&t, &self.r2)
+    }
+}
+
+// The modulus is secret whenever it is an RSA prime factor (the fixed-width
+// CRT path builds one context per prime), so a key can wipe its contexts.
+impl<const LIMBS: usize> crate::zeroize::Zeroize for MontModulus<LIMBS> {
+    fn zeroize(&mut self) {
+        self.modulus.zeroize();
+        self.r2.zeroize();
+        self.n_prime.zeroize();
     }
 }
 
