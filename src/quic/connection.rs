@@ -3365,6 +3365,10 @@ impl QuicConnection {
                     })
                     .map_err(|_| Error::IllegalParameter)?,
             }
+            // The pool's notion of the active CID must follow: a
+            // NEW_CONNECTION_ID that arrives while the new path is being
+            // validated re-syncs `cids.peer` from it (F2).
+            pool.active_seq = 1;
         }
         self.begin_migration(current, target);
         self.endpoint.cids.peer = cid;
@@ -3390,10 +3394,15 @@ impl QuicConnection {
             return;
         };
         self.endpoint.cids.peer = next;
+        // Keep the pool's active sequence in step with `cids.peer`: the
+        // NEW_CONNECTION_ID handler re-syncs the outbound DCID from the pool
+        // whenever the pool rotates, and left behind here it would put the
+        // OLD path's CID back on packets to the new address (F2 — the §9.5
+        // linkability this rotation exists to prevent).
+        pool.active_seq = seq;
         // The old CID is retired once the new path validates
         // (`on_migration_validated`) — keeping it until then is what lets
         // `abandon_migration` fall back to it.
-        let _ = seq;
     }
 
     /// RFC 9000 §9.3 / §9.4 — the peer echoed the challenge we sent on the
@@ -3434,7 +3443,26 @@ impl QuicConnection {
             return;
         };
         self.peer_addr = Some(m.prev_addr);
-        self.endpoint.cids.peer = m.prev_cid;
+        // Address the restored path by the CID it used, and move the pool's
+        // active sequence back with it (F2) — unless the peer retired that
+        // CID while the probe was outstanding, in which case the pool's
+        // active entry (already re-synced by the NEW_CONNECTION_ID handler)
+        // is the only one we may still write.
+        let restored = self.cid_remote.as_mut().and_then(|pool| {
+            let prev_seq = pool
+                .entries
+                .iter()
+                .find(|(_, e)| e.cid == m.prev_cid)
+                .map(|(&seq, _)| seq);
+            match prev_seq {
+                Some(seq) => {
+                    pool.active_seq = seq;
+                    Some(m.prev_cid)
+                }
+                None => pool.active().map(|e| e.cid),
+            }
+        });
+        self.endpoint.cids.peer = restored.unwrap_or(m.prev_cid);
         self.peer_addr_validated = true;
         // The failed path's budget goes with it: whoever sends from that
         // address next starts over from nothing (§9.3.1).
@@ -6541,16 +6569,26 @@ impl QuicConnection {
                         // older entries and queue RETIRE frames), then
                         // try to add this entry. Both can reject a peer
                         // that floods CID state (F2).
+                        let active_before = pool.active_seq;
                         pool.note_retire_prior_to(retire_prior_to)?;
                         pool.add(entry)?;
-                        // L-2: `note_retire_prior_to`/`add` may have
-                        // rotated the pool's active CID (the old active
-                        // DCID was retired and a surviving higher-seq CID
-                        // took its place). Re-sync the outbound DCID
+                        // L-2: `note_retire_prior_to` may have rotated the
+                        // pool's active CID (the old active DCID was
+                        // retired and a surviving higher-seq CID took its
+                        // place). Re-sync the outbound DCID
                         // (`endpoint.cids.peer`) to the pool's active
                         // entry so we never keep writing a retired CID.
-                        let active_cid = pool.active().map(|e| e.cid);
-                        if let Some(cid) = active_cid {
+                        //
+                        // F2: only when it actually rotated. Every path
+                        // that moves `cids.peer` (migration, preferred
+                        // address, `switch_connection_id`) keeps
+                        // `active_seq` in step, so an unconditional
+                        // re-sync was a no-op in the steady state — but
+                        // while a migration was being validated it put
+                        // the OLD path's CID back on the new path.
+                        if pool.active_seq != active_before
+                            && let Some(cid) = pool.active().map(|e| e.cid)
+                        {
                             self.endpoint.cids.peer = cid;
                         }
                     }
@@ -9662,7 +9700,108 @@ mod tests {
             c.endpoint.cids.peer, before_cid,
             "a failed migration restores the old connection ID too"
         );
+        assert_eq!(
+            c.cid_remote
+                .as_ref()
+                .and_then(|p| p.active().map(|e| e.cid)),
+            Some(before_cid),
+            "F2: the pool's active sequence moves back with it"
+        );
         let _ = &mut s;
+    }
+
+    /// F2 — RFC 9000 §9.5 / §9.6: a NEW_CONNECTION_ID that arrives while a
+    /// preferred-address migration is still being validated must not put the
+    /// OLD path's connection ID back on packets to the new address (the
+    /// linkability the rotation exists to prevent), and the old CID is still
+    /// retired once the path validates. Before the fix the handler re-synced
+    /// `cids.peer` from a pool whose active sequence the migration had never
+    /// moved, reverting the DCID — after which `on_migration_validated` saw
+    /// "still using the old CID" and retired nothing.
+    #[test]
+    fn new_connection_id_during_migration_keeps_the_new_paths_cid() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let old_addr = ip4(192, 0, 2, 1, 7777);
+        let pa = PreferredAddress {
+            ipv4: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 21), 4433)),
+            ipv6: None,
+            connection_id: alloc::vec![0xC7; 8],
+            stateless_reset_token: [0x79; 16],
+        };
+        let (mut c, mut s) = migration_pair(old_addr);
+        quiesce(&mut c, &mut s, old_addr);
+        let server_addr = ip4(198, 51, 100, 1, 443);
+        c.set_peer_addr(server_addr);
+        c.peer_params
+            .as_mut()
+            .expect("peer params")
+            .preferred_address = Some(pa.encode());
+        {
+            let pool = c.cid_remote.as_mut().expect("pool");
+            pool.entries.remove(&1);
+            // Room for the CID the server is about to issue.
+            pool.set_limit(4);
+        }
+        let old_cid = c.endpoint.cids.peer;
+        let old_seq = c
+            .cid_remote
+            .as_ref()
+            .expect("pool")
+            .entries
+            .iter()
+            .find(|(_, e)| e.cid == old_cid)
+            .map(|(&seq, _)| seq)
+            .expect("the old CID is in the pool");
+        let target = c.migrate_to_preferred_address().expect("migrate");
+        let new_cid = ConnectionId::from_slice(&pa.connection_id).expect("cid");
+        assert_eq!(c.endpoint.cids.peer, new_cid);
+        assert_eq!(c.pop_datagram().len(), 1200, "the probe goes out");
+
+        // The server issues another CID (retiring nothing) mid-validation.
+        let mut payload = Vec::new();
+        Frame::NewConnectionId {
+            seq: 2,
+            retire_prior_to: 0,
+            cid: &[0xD2; 8],
+            reset_token: [0x22; 16],
+        }
+        .encode(&mut payload);
+        c.dispatch_frames(Level::OneRtt, 1, &payload)
+            .expect("NEW_CONNECTION_ID");
+        assert_eq!(
+            c.endpoint.cids.peer, new_cid,
+            "§9.5: the new path keeps its own connection ID"
+        );
+        assert!(c.is_migrating());
+
+        // The one challenge re-send is still addressed by the new CID.
+        let retry_at = c.migration.as_ref().expect("migrating").retry_at;
+        c.on_timeout(retry_at);
+        let probe = c.pop_datagram();
+        assert!(!probe.is_empty(), "the challenge re-send");
+        assert_eq!(probe[0] & 0x80, 0, "a short-header packet");
+        assert_eq!(
+            &probe[1..1 + new_cid.len()],
+            new_cid.as_slice(),
+            "the DCID on the new path is the new CID"
+        );
+        assert_eq!(c.peer_address(), Some(target));
+
+        // Validation: the server echoes the challenge; the old CID retires.
+        let challenge = c.migration.as_ref().expect("migrating").challenge;
+        let mut payload = Vec::new();
+        Frame::PathResponse(challenge).encode(&mut payload);
+        c.dispatch_frames(Level::OneRtt, 2, &payload)
+            .expect("PATH_RESPONSE");
+        assert!(!c.is_migrating());
+        let pool = c.cid_remote.as_ref().expect("pool");
+        assert!(
+            !pool.entries.contains_key(&old_seq),
+            "§9.5: the old path's CID is retired once the new path validates"
+        );
+        assert!(pool.pending_retire.contains(&old_seq));
+        assert_eq!(pool.active().map(|e| e.cid), Some(new_cid));
+        assert_eq!(c.endpoint.cids.peer, new_cid);
     }
 
     /// H-4 — RFC 9000 §21.5.3: a client MUST NOT send non-probing frames to a
