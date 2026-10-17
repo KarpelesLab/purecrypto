@@ -8338,3 +8338,100 @@ fn dtls_naccept_server_ignores_a_foreign_client_hello() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Secrets belong in files, not on argv (`/proc/<pid>/cmdline` is readable
+/// by every user): `-psk_file FILE` carries an external PSK on both ends,
+/// while the `-psk HEX` and `pkcs12 -pass* pass:STR` forms still work but
+/// warn, like `enc -key` and `kdf -password` already did.
+#[test]
+fn psk_file_and_argv_secret_warnings() {
+    let dir = std::env::temp_dir().join(format!("pc_psk_file_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let psk_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let psk_file = dir.join("psk.hex").to_str().unwrap().to_string();
+    std::fs::write(&psk_file, format!("{psk_hex}\n")).unwrap();
+
+    // A PSK-only TLS 1.3 server and client, the key read from the file on
+    // both sides: no warning, and the exchange works.
+    let server = spawn_server_wait_listening(&[
+        "s_server",
+        "-accept",
+        "0",
+        "-psk_identity",
+        "client1",
+        "-psk_file",
+        &psk_file,
+    ]);
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{}", server.port),
+            "-psk_identity",
+            "client1",
+            "-psk_file",
+            &psk_file,
+            "-read_timeout",
+            "1",
+        ],
+        b"over psk\n",
+    );
+    let server_err = server.finish_with_stderr();
+    assert!(ok, "s_client failed: {err}\nserver:\n{server_err}");
+    assert!(out.contains("over psk"), "no echo: {out:?}\n{err}");
+    assert!(!err.contains("/proc/<pid>/cmdline"), "{err}");
+    assert!(!server_err.contains("/proc/<pid>/cmdline"), "{server_err}");
+
+    // The argv form warns (and then fails to connect: nothing listens on
+    // the discard port).
+    let (_out, err, _ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            "127.0.0.1:9",
+            "-psk_identity",
+            "client1",
+            "-psk",
+            psk_hex,
+        ],
+        b"",
+    );
+    assert!(
+        err.contains("-psk HEX exposes the PSK via /proc/<pid>/cmdline; prefer -psk_file FILE"),
+        "{err}"
+    );
+    let (_out, err, ok) = run_capture(
+        &[
+            "pkcs12",
+            "-in",
+            dir.join("missing.p12").to_str().unwrap(),
+            "-passin",
+            "pass:secret",
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("-passin pass:STR exposes the password via /proc/<pid>/cmdline"),
+        "{err}"
+    );
+    // Both key sources at once is a mistake, not a choice.
+    let (_out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            "127.0.0.1:9",
+            "-psk_identity",
+            "client1",
+            "-psk",
+            psk_hex,
+            "-psk_file",
+            &psk_file,
+        ],
+        b"",
+    );
+    assert!(
+        !ok && err.contains("-psk and -psk_file are alternatives"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -124,7 +124,7 @@ pub(crate) fn run(args: Args) {
     let version = resolve_version(&args);
     // A server that only serves an external PSK (RFC 8446 §2.2: a PSK
     // handshake sends no certificate) needs no `-cert` / `-key`.
-    let psk_only = args.value("-psk").is_some() && args.value("-cert").is_none();
+    let psk_only = tlsinfo::has_psk(&args) && args.value("-cert").is_none();
     let identity = match (args.value("-cert"), args.value("-key")) {
         (Some(c), Some(k)) => Some((c, k)),
         (None, None) if psk_only => None,
@@ -139,8 +139,8 @@ pub(crate) fn run(args: Args) {
              [-record_size_limit N] [-no_cert_comp | -cert_comp LIST [-cert_comp_own LIST]] \
              [-cid HEX | -cid_len N] [-keylogfile keys.log] \
              [-ech-key key.bin -ech-config config.bin] [-psk_modes psk_dhe_ke:psk_ke] \
-             [-psk_identity NAME -psk HEX [-psk_hash sha384] [-psk_import [-psk_context STR]]] (-cert/-key may be \
-             omitted with -psk: a PSK-only TLS 1.3 server)",
+             [-psk_identity NAME (-psk HEX | -psk_file FILE) [-psk_hash sha384] [-psk_import [-psk_context STR]]] \
+             (-cert/-key may be omitted with -psk / -psk_file: a PSK-only TLS 1.3 server)",
         ),
     };
     let verify_ca = args.value("-Verify");

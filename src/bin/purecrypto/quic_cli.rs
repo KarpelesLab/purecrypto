@@ -912,7 +912,7 @@ pub(crate) fn run_server(args: Args) {
         die(
             "usage: purecrypto q_server -cert cert.pem -key key.pem -accept host:port -alpn proto \
              [-www] [-retry] [-early-data] [-key-update] [-switch-cid] [-ciphersuites list] \
-             [-groups list] [-idle-timeout ms] [-reset-key hex32] [-naccept N] [-timeout secs] \
+             [-groups list] [-idle-timeout ms] [-reset-key hex32 | -reset-key-file FILE] [-naccept N] [-timeout secs] \
              [-keylogfile keys.log] [-quiet]",
         )
     });
@@ -949,14 +949,31 @@ pub(crate) fn run_server(args: Args) {
         naccept: parse_num(&args, "-naccept").unwrap_or(1) as usize,
         deadline: Duration::from_secs(parse_num(&args, "-timeout").unwrap_or(30)),
     };
-    // `-reset-key`: the RFC 9000 §10.3.1 stateless-reset key. Fixed so a
-    // restarted server can still reset the connections its predecessor
-    // held; random otherwise.
-    let reset_key: [u8; 32] = match args.value("-reset-key") {
-        Some(hex) => parse_hex_flag(hex, "-reset-key")
-            .try_into()
-            .unwrap_or_else(|_| die("-reset-key: expected 32 bytes of hex")),
-        None => {
+    // `-reset-key` / `-reset-key-file`: the RFC 9000 §10.3.1 stateless-reset
+    // key. Fixed so a restarted server can still reset the connections its
+    // predecessor held; random otherwise. It is a secret (whoever holds it
+    // can reset any connection of this server, §21.11), so the argv form
+    // is warned about like every other secret-on-argv flag.
+    let reset_key: [u8; 32] = match (args.value("-reset-key"), args.value("-reset-key-file")) {
+        (Some(_), Some(_)) => die("-reset-key and -reset-key-file are alternatives; give one"),
+        (Some(hex), None) => {
+            crate::util::warn_argv_secret(
+                "-reset-key HEX",
+                "the stateless-reset key",
+                "-reset-key-file FILE",
+            );
+            let mut k = parse_hex_flag(hex, "-reset-key");
+            let key = k.as_slice().try_into();
+            zero_buf(&mut k);
+            key.unwrap_or_else(|_| die("-reset-key: expected 32 bytes of hex"))
+        }
+        (None, Some(path)) => {
+            let mut k = crate::util::read_secret_file_hex_or_raw(path, "-reset-key-file");
+            let key = k.as_slice().try_into();
+            zero_buf(&mut k);
+            key.unwrap_or_else(|_| die("-reset-key-file: expected 32 bytes (raw or hex)"))
+        }
+        (None, None) => {
             let mut k = [0u8; 32];
             purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut k);
             k

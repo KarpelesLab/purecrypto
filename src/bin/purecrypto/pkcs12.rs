@@ -10,14 +10,15 @@
 //! ```
 
 use crate::util::{
-    Args, die, read_secret_file, warn_if_world_readable_key, write_output, write_output_with_mode,
-    zero_buf,
+    Args, die, read_secret_file, warn_argv_secret, warn_if_world_readable_key, write_output,
+    write_output_with_mode, zero_buf,
 };
 use purecrypto::der::{pem_decode, pem_encode};
 use purecrypto::ec::BoxedEcdsaPrivateKey;
 use purecrypto::pkcs12::Pfx;
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::x509::{AnyPrivateKey, Certificate, Pkcs8ReadOptions};
+use purecrypto::zeroize::Zeroizing;
 
 const USAGE: &str = "\
 usage: purecrypto pkcs12 -export -inkey key.pem -in cert.pem [-certfile chain.pem]
@@ -27,25 +28,36 @@ usage: purecrypto pkcs12 -export -inkey key.pem -in cert.pem [-certfile chain.pe
   -export      build an archive from a private key (PKCS#8, PKCS#1 or SEC1 PEM)
                and one or more CERTIFICATE blocks (-in first, then -certfile)
   -passout /   the password, as pass:STRING, env:VARIABLE or file:PATH
-  -passin      (the first line of the file)
+  -passin      (the first line of the file); pass: puts it on the command
+               line, which other users can read, and is warned about
   -info        print what the archive holds instead of PEM";
 
-/// Resolves an `openssl`-style password source: `pass:STR`, `env:VAR` or
-/// `file:PATH` (first line).
-fn password(spec: Option<&str>, flag: &str) -> String {
+/// Resolves an `openssl`-style password source: `pass:STR` (warned about:
+/// argv is readable by every user on the host), `env:VAR` or `file:PATH`
+/// (first line). The password is wiped when the result is dropped.
+fn password(spec: Option<&str>, flag: &str) -> Zeroizing<String> {
     let spec = spec.unwrap_or_else(|| die(format!("{flag} is required\n{USAGE}")));
     if let Some(p) = spec.strip_prefix("pass:") {
-        p.to_string()
+        warn_argv_secret(
+            &format!("{flag} pass:STR"),
+            "the password",
+            &format!("{flag} file:PATH or {flag} env:VAR"),
+        );
+        Zeroizing::new(p.to_string())
     } else if let Some(v) = spec.strip_prefix("env:") {
-        std::env::var(v)
-            .unwrap_or_else(|_| die(format!("{flag}: environment variable {v} is not set")))
+        Zeroizing::new(
+            std::env::var(v)
+                .unwrap_or_else(|_| die(format!("{flag}: environment variable {v} is not set"))),
+        )
     } else if let Some(path) = spec.strip_prefix("file:") {
         let mut raw = read_secret_file(path);
-        let s = String::from_utf8_lossy(&raw)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let s = Zeroizing::new(
+            String::from_utf8_lossy(&raw)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        );
         zero_buf(&mut raw);
         s
     } else {

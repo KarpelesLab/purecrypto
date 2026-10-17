@@ -745,6 +745,42 @@ pub(crate) fn zero_buf(buf: &mut [u8]) {
     let _ = core::hint::black_box(buf);
 }
 
+/// The warning every subcommand prints when a secret is taken off argv:
+/// the command line of a running process is readable by every other user
+/// (`/proc/<pid>/cmdline`, `ps`), and shells keep it in their history.
+/// `flag` is the offending flag as typed (`-psk HEX`), `what` the secret
+/// (`the PSK`) and `instead` the file/env form to use (`-psk_file FILE`).
+pub(crate) fn warn_argv_secret(flag: &str, what: &str, instead: &str) {
+    eprintln!(
+        "purecrypto: warning: {flag} exposes {what} via /proc/<pid>/cmdline; prefer {instead}"
+    );
+}
+
+/// Reads a secret that an argv flag took as hex from a file instead: the
+/// file holds either the same hex digits (whitespace ignored) or the raw
+/// bytes. It is hex when it decodes as such — a raw key whose every byte
+/// happens to be an ASCII hex digit (with an even count) is misread, which
+/// is astronomically unlikely for a random key and avoidable by writing the
+/// key as hex. Same permission warning and `-` (stdin) handling as
+/// [`read_secret_file`]; the caller [`zero_buf`]s the result.
+pub(crate) fn read_secret_file_hex_or_raw(path: &str, flag: &str) -> Vec<u8> {
+    let mut raw = read_secret_file(path);
+    let text = core::str::from_utf8(&raw).ok().map(str::trim);
+    let decoded = match text {
+        Some(t) if !t.is_empty() => from_hex(t),
+        _ => None,
+    };
+    let out = match decoded {
+        Some(bytes) => bytes,
+        None => raw.clone(),
+    };
+    zero_buf(&mut raw);
+    if out.is_empty() {
+        die(format!("{flag}: {path} is empty"));
+    }
+    out
+}
+
 /// Reads raw bytes from `path` (no hex decoding). Use this for `-*file`
 /// flags that carry secret material — the caller is responsible for
 /// [`zero_buf`]-ing the result once it's no longer needed. `-` reads stdin

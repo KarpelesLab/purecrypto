@@ -362,13 +362,19 @@ pub(crate) fn load_spki_pems(path: &str, flag: &str) -> Vec<Vec<u8>> {
 }
 
 /// The `-psk*` flags both commands accept, with a value:
-pub(crate) const PSK_VALUE_FLAGS: [&str; 5] = [
+pub(crate) const PSK_VALUE_FLAGS: [&str; 6] = [
     "-psk_modes",
     "-psk_identity",
     "-psk",
+    "-psk_file",
     "-psk_hash",
     "-psk_context",
 ];
+
+/// Whether an external PSK was given (`-psk HEX` or `-psk_file FILE`).
+pub(crate) fn has_psk(args: &Args) -> bool {
+    args.value("-psk").is_some() || args.value("-psk_file").is_some()
+}
 
 /// Applies the `-psk*` flags to `builder`:
 ///
@@ -376,8 +382,10 @@ pub(crate) const PSK_VALUE_FLAGS: [&str; 5] = [
 ///   (advertised by the client; the server's preference order). The
 ///   default is `psk_dhe_ke` only: `psk_ke` gives up forward secrecy.
 /// * `-psk_identity NAME -psk HEX` — an external PSK (RFC 8446 §4.2.11),
-///   as `openssl s_client` / `s_server` take them; `-psk_hash sha384`
-///   pairs it with the SHA-384 suite instead of SHA-256. `-psk_import`
+///   as `openssl s_client` / `s_server` take them, or `-psk_file FILE`
+///   (the hex, or the raw bytes) to keep it off the world-readable
+///   command line; `-psk_hash sha384` pairs it with the SHA-384 suite
+///   instead of SHA-256. `-psk_import`
 ///   (optionally `-psk_context STR`) runs the pair through the RFC 9258
 ///   importer instead of using the key as given, as `bssl` does.
 ///
@@ -407,9 +415,18 @@ pub(crate) fn apply_psk_flags(
             .collect();
         builder = builder.psk_modes(&modes);
     }
-    match (args.value("-psk_identity"), args.value("-psk")) {
-        (Some(identity), Some(hex)) => {
-            let mut secret = crate::util::parse_hex_flag(hex, "-psk");
+    // The key: `-psk HEX` (warned about — argv is public) or `-psk_file`.
+    let secret = match (args.value("-psk"), args.value("-psk_file")) {
+        (Some(_), Some(_)) => die("-psk and -psk_file are alternatives; give one"),
+        (Some(hex), None) => {
+            crate::util::warn_argv_secret("-psk HEX", "the PSK", "-psk_file FILE");
+            Some(crate::util::parse_hex_flag(hex, "-psk"))
+        }
+        (None, Some(path)) => Some(crate::util::read_secret_file_hex_or_raw(path, "-psk_file")),
+        (None, None) => None,
+    };
+    match (args.value("-psk_identity"), secret) {
+        (Some(identity), Some(mut secret)) => {
             let hash = match args.value("-psk_hash").unwrap_or("sha256") {
                 "sha256" | "SHA256" => HashAlg::Sha256,
                 "sha384" | "SHA384" => HashAlg::Sha384,
@@ -434,7 +451,9 @@ pub(crate) fn apply_psk_flags(
             builder = builder.external_psk(psk);
         }
         (None, None) if !import && args.value("-psk_context").is_none() => {}
-        _ => die("-psk_identity and -psk go together (-psk_import / -psk_context need both)"),
+        _ => die(
+            "-psk_identity and -psk / -psk_file go together (-psk_import / -psk_context need both)",
+        ),
     }
     builder
 }
