@@ -170,7 +170,12 @@
 //! (probability ≈ 2⁻¹²⁷ per draw); this module reduces such a draw modulo `n`
 //! instead, so the two would diverge on an input no one will ever find. The
 //! exponent/mantissa/`min_value` selection was cross-checked against the
-//! oracle over 7040 parameter combinations, including every rejection.
+//! oracle over 7040 parameter combinations, including every rejection. Two
+//! `u64` edges lay outside that sweep and follow the reference's rules rather
+//! than an observed vector: `min_value = 2⁶⁴−1` is treated as a request for
+//! an exact-value proof whatever `exp` asks for, and
+//! `value = min_value = 2⁶³−1` is refused like any other offset proof that
+//! reaches `2⁶³−1`.
 #![cfg_attr(
     not(feature = "alloc"),
     doc = "",
@@ -453,6 +458,10 @@ fn choose_params(
     if !(-1..=MAX_EXP).contains(&exp) || min_bits > 64 || min_value.ct_gt(&value).declassify() {
         return Err(Error::InvalidInput);
     }
+    // `min_value == 2⁶⁴ − 1` (so `value` is too) leaves no room for a
+    // mantissa; the reference treats it as a request for an exact-value proof
+    // whatever `exp` asked for. `min_value` is public: it is in the header.
+    let exp = if min_value == u64::MAX { -1 } else { exp };
     if exp == -1 {
         return Ok((
             Params {
@@ -465,11 +474,16 @@ fn choose_params(
             0,
         ));
     }
-    // The reference restricts a shifted or offset proof to [0, 2^63) so the
-    // proven interval cannot run past 2^64; with min_value == 0 it silently
-    // falls back to exp = 0 rather than failing.
+    // The reference keeps a shifted or offset proof inside [0, 2^63) so the
+    // proven interval cannot run past 2^64: if either `value` or `min_value`
+    // is at or above 2^63 − 1, the other must be zero. With min_value == 0 a
+    // large value silently falls back to exp = 0 rather than failing.
     let big = value.ct_gt(&(i64::MAX as u64));
-    if min_value != 0 && big.declassify() {
+    let offset = Choice::from(u8::from(min_value != 0));
+    let min_big = Choice::from(u8::from(min_value >= i64::MAX as u64));
+    // Declassified (Valgrind harness): the combined verdict is returned as an
+    // error and reveals only that the arguments were invalid.
+    if ((offset & big) | (min_big & !value.ct_eq(&0))).declassify() {
         return Err(Error::InvalidInput);
     }
     let mut exp = i32::conditional_select(&0, &exp, big);
@@ -2035,6 +2049,77 @@ mod tests {
         // A shifted proof of a value at or above 2^63 with a nonzero minimum.
         let big = Commitment::new(u64::MAX, &blind).unwrap();
         assert!(sign(&big, &blind, &nonce, u64::MAX, 1, 0, 0, &[], &[], &h()).is_err());
+        // An offset proof whose minimum reaches 2^63 - 1 is refused by the
+        // reference even when it equals the value...
+        let edge = i64::MAX as u64;
+        let at_edge = Commitment::new(edge, &blind).unwrap();
+        assert_eq!(
+            sign(&at_edge, &blind, &nonce, edge, edge, 0, 0, &[], &[], &h()),
+            Err(Error::InvalidInput)
+        );
+        // ...while one just below it, and the same statement as an exact
+        // proof, are fine.
+        let below = Commitment::new(edge - 1, &blind).unwrap();
+        let proof = sign(
+            &below,
+            &blind,
+            &nonce,
+            edge - 1,
+            edge - 1,
+            0,
+            0,
+            &[],
+            &[],
+            &h(),
+        )
+        .unwrap();
+        assert_eq!(verify(&below, &proof, &[], &h()).unwrap(), (edge - 1, edge));
+        assert!(sign(&at_edge, &blind, &nonce, edge, edge, -1, 0, &[], &[], &h()).is_ok());
+    }
+
+    #[test]
+    fn min_value_at_u64_max_is_an_exact_value_proof() {
+        // min_value == value == 2^64 - 1 leaves no mantissa at all; like the
+        // reference, any requested exponent collapses to the exact-value
+        // shape instead of failing.
+        let blind = blind_of(57);
+        let nonce = nonce_of(57);
+        let commit = Commitment::new(u64::MAX, &blind).unwrap();
+        let exact = sign(
+            &commit,
+            &blind,
+            &nonce,
+            u64::MAX,
+            u64::MAX,
+            -1,
+            0,
+            &[],
+            &[],
+            &h(),
+        )
+        .unwrap();
+        for exp in [0, 3, MAX_EXP] {
+            let proof = sign(
+                &commit,
+                &blind,
+                &nonce,
+                u64::MAX,
+                u64::MAX,
+                exp,
+                64,
+                &[],
+                &[],
+                &h(),
+            )
+            .unwrap();
+            assert_eq!(info(&proof).unwrap(), (-1, 0, u64::MAX, u64::MAX));
+            assert_eq!(
+                verify(&commit, &proof, &[], &h()).unwrap(),
+                (u64::MAX, u64::MAX)
+            );
+            assert_eq!(proof, exact, "exp={exp}");
+            assert_eq!(message_capacity(u64::MAX, u64::MAX, exp, 64), Ok(0));
+        }
     }
 
     #[test]
@@ -2109,6 +2194,7 @@ mod tests {
         if !(-1..=MAX_EXP).contains(&exp) || min_bits > 64 || min_value > value {
             return Err(Error::InvalidInput);
         }
+        let exp = if min_value == u64::MAX { -1 } else { exp };
         if exp == -1 {
             return Ok((
                 Params {
@@ -2121,11 +2207,13 @@ mod tests {
                 0,
             ));
         }
+        if (min_value != 0 && value > i64::MAX as u64)
+            || (value != 0 && min_value >= i64::MAX as u64)
+        {
+            return Err(Error::InvalidInput);
+        }
         let mut exp = exp;
         if value > i64::MAX as u64 {
-            if min_value != 0 {
-                return Err(Error::InvalidInput);
-            }
             exp = 0;
         }
         let max_bits = 64 - bit_len(min_value);
@@ -2189,7 +2277,20 @@ mod tests {
             values.push(next() >> 32);
             values.push(next() >> 50);
         }
-        let mins = [0u64, 1, 7, 500, 1000, 1 << 32, 1 << 62, u64::MAX];
+        let mins = [
+            0u64,
+            1,
+            7,
+            500,
+            1000,
+            1 << 32,
+            1 << 62,
+            (i64::MAX as u64) - 1,
+            i64::MAX as u64,
+            1 << 63,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
         let mut checked = 0;
         for &value in &values {
             for &min_value in &mins {
