@@ -103,17 +103,96 @@ impl<W: std::io::Write + Send> KeyLog for WriterKeyLog<W> {
 /// returning a [`WriterKeyLog`] ready to register on a
 /// [`super::ConfigBuilder`]. The 0o600 mode keeps the file readable only
 /// by its owner — these secrets are sensitive.
+///
+/// The path is opened without following a symbolic link at `path` itself
+/// (`O_NOFOLLOW` where the platform's flag is known, plus an explicit
+/// symlink check), must be a regular file once open, and on Unix its
+/// permissions are reset to `0o600` even when it already existed: the
+/// creation mode never applies to a pre-existing file, and a world-readable
+/// file (or a link into someone else's directory) planted ahead of time
+/// would otherwise collect the session secrets.
 #[cfg(feature = "std")]
 pub fn file_keylog(path: &std::path::Path) -> std::io::Result<Arc<WriterKeyLog<std::fs::File>>> {
+    // A link at `path` is refused rather than opened through: `O_NOFOLLOW`
+    // makes the kernel do it (`ELOOP`); this pre-check covers the platforms
+    // whose flag value is not spelled out below. It is not a race-free
+    // guard on those, only a best effort on top of the mode reset.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other(
+            "keylog path is a symbolic link; refusing to write secrets through it",
+        ));
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
+        if let Some(flag) = o_nofollow() {
+            opts.custom_flags(flag);
+        }
     }
     let f = opts.open(path)?;
+    if !f.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other(
+            "keylog path is not a regular file; refusing to write secrets to it",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(Arc::new(WriterKeyLog::new(f)))
+}
+
+/// The platform's `O_NOFOLLOW` open flag, or `None` where its value is not
+/// known here (the caller then relies on the symlink pre-check alone). Kept
+/// as literals so the crate stays free of a `libc` dependency; the values are
+/// the kernels' ABI constants, which do not change.
+#[cfg(all(feature = "std", unix))]
+fn o_nofollow() -> Option<i32> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))]
+    {
+        Some(0o400000)
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        Some(0x0100)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        None
+    }
 }
 
 /// Formats one `SSLKEYLOGFILE` line: `<label> <hex client_random> <hex
@@ -188,5 +267,49 @@ mod tests {
         let mut line = line;
         crate::zeroize::Zeroize::zeroize(&mut line);
         assert!(line.is_empty());
+    }
+
+    /// CFG-F4: `file_keylog` followed a symbolic link at the path and left a
+    /// pre-existing file's permissions alone (`mode(0o600)` only governs
+    /// creation). A link is now refused and an existing file is reset to
+    /// owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn file_keylog_refuses_symlinks_and_tightens_existing_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(alloc::format!(
+            "purecrypto-keylog-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A pre-existing, group/world-readable file: opened and tightened.
+        let existing = dir.join("existing.log");
+        std::fs::write(&existing, b"").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let sink = file_keylog(&existing).unwrap();
+        sink.log("CLIENT_RANDOM", &[0x01; 32], &[0x02; 48]);
+        drop(sink);
+        let mode = std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "existing keylog file must be owner-only");
+
+        // A symlink to it: refused, and nothing written through it.
+        let before = std::fs::read(&existing).unwrap();
+        let link = dir.join("link.log");
+        std::os::unix::fs::symlink(&existing, &link).unwrap();
+        assert!(file_keylog(&link).is_err(), "symlink must be refused");
+        assert_eq!(std::fs::read(&existing).unwrap(), before);
+
+        // A dangling symlink is refused too (it must not be created through).
+        let dangling = dir.join("dangling.log");
+        std::os::unix::fs::symlink(dir.join("nowhere.log"), &dangling).unwrap();
+        assert!(file_keylog(&dangling).is_err());
+        assert!(!dir.join("nowhere.log").exists());
+
+        // A directory is not a regular file.
+        assert!(file_keylog(&dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
