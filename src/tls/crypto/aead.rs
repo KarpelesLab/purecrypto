@@ -378,16 +378,20 @@ fn wipe(buf: &mut [u8]) {
 ///
 /// Constant-time properties (RFC 8446 §5.4 traffic-analysis note):
 ///
-/// - Every byte of `buf` is visited exactly once, eight at a time: each
-///   little-endian word is tested for a nonzero byte with a carry-free
-///   SWAR test, and the last such word (and its index) is kept. Once,
-///   after the scan, the highest nonzero byte of that word (value and
-///   position) is located by three branch-free halvings
+/// - Every byte of `buf` is visited exactly once, thirty-two at a time:
+///   a block of four little-endian words holds a nonzero byte iff the OR
+///   of the words is nonzero, and the last such block (its four words and
+///   its index) is kept under one opaque mask per block. Once, after the
+///   scan, the last word of that block holding a nonzero byte is found
+///   with a carry-free SWAR test, and the highest nonzero byte of that
+///   word (value and position) by three branch-free halvings
 ///   ([`u64::conditional_select`] on constant shifts — no
-///   secret-dependent shift or index). The trailing `len % 8` bytes are
+///   secret-dependent shift or index). The trailing `len % 32` bytes are
 ///   then scanned one at a time.
-/// - Whether a word or byte holds the new candidate is applied with
-///   [`ConditionallySelectable::conditional_select`], which is data-flow
+/// - Whether a block, word or byte holds the new candidate is applied
+///   with one mask per decision — `black_box`ed, then plain `&`/`^`
+///   across the block's words — or with
+///   [`ConditionallySelectable::conditional_select`]; both are data-flow
 ///   only.
 /// - No early exit; the running candidate is updated on every iteration
 ///   regardless of value.
@@ -408,15 +412,37 @@ pub(crate) fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
     }
     const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HIGH: u64 = 0x8080_8080_8080_8080;
+    const WORDS: usize = 4;
+    const BLOCK: usize = WORDS * 8;
     let mut found_any = Choice::from(0);
-    // The last word holding a nonzero byte, its flags and its index.
-    let mut last_w: u64 = 0;
-    let mut last_f: u64 = 0;
-    let mut last_wi: usize = 0;
-    let words = buf.chunks_exact(8);
-    let tail = words.remainder();
-    for (wi, chunk) in words.enumerate() {
-        let w = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+    // The last block holding a nonzero byte, and its index.
+    let mut last_b = [0u64; WORDS];
+    let mut last_bi: usize = 0;
+    let blocks = buf.chunks_exact(BLOCK);
+    let tail = blocks.remainder();
+    for (bi, chunk) in blocks.enumerate() {
+        let mut w = [0u64; WORDS];
+        for (word, bytes) in w.iter_mut().zip(chunk.chunks_exact(8)) {
+            *word = u64::from_le_bytes(bytes.try_into().expect("8-byte chunk"));
+        }
+        // The block holds a nonzero byte iff the OR of its words is
+        // nonzero. One opaque all-ones/all-zeros mask per block then
+        // selects the four words and the index: a `conditional_select`
+        // per word would `black_box` a mask each.
+        let block_nz = nonzero(w[0] | w[1] | w[2] | w[3]);
+        let mask = core::hint::black_box((block_nz.unwrap_u8() as u64).wrapping_neg());
+        for (saved, word) in last_b.iter_mut().zip(w) {
+            *saved ^= mask & (word ^ *saved);
+        }
+        // Truncating the mask keeps all-ones / all-zeros on 32-bit targets.
+        last_bi ^= (mask as usize) & (bi ^ last_bi);
+        found_any |= block_nz;
+    }
+    // Within the saved block, the last word holding a nonzero byte, its
+    // flags and its index: the SWAR test and three selects run four times
+    // here instead of once per word of the buffer.
+    let (mut last_w, mut last_f, mut last_wi) = (0u64, 0u64, 0usize);
+    for (wi, &w) in last_b.iter().enumerate() {
         // The top bit of each byte of `f` is set iff that byte of `w` is
         // nonzero: `(b & 0x7f) + 0x7f` reaches 0x80 iff the low seven bits
         // are nonzero, and never carries into the next byte.
@@ -425,12 +451,11 @@ pub(crate) fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
         last_w = u64::conditional_select(&w, &last_w, word_nz);
         last_f = u64::conditional_select(&f, &last_f, word_nz);
         last_wi = usize::conditional_select(&wi, &last_wi, word_nz);
-        found_any |= word_nz;
     }
     // Narrow `last_w` to the half holding its highest flagged byte, three
     // times; `v` keeps that byte's value in its low eight bits. When no
-    // word held a nonzero byte the result is unused (`found_any` is clear,
-    // or a tail byte replaces it below).
+    // block held a nonzero byte the result is unused (`found_any` is
+    // clear, or a tail byte replaces it below).
     let (mut v, mut f, mut pos) = (last_w, last_f, 0usize);
     for shift in [32u32, 16, 8] {
         let low_mask = (1u64 << shift) - 1;
@@ -442,7 +467,7 @@ pub(crate) fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
     // The candidate (byte, index+1): `index+1` is the truncation index (one
     // past the content-type byte position).
     let mut cur_byte = v as u8;
-    let mut cur_end = last_wi * 8 + pos + 1;
+    let mut cur_end = last_bi * BLOCK + last_wi * 8 + pos + 1;
     let base = buf.len() - tail.len();
     for (i, &b) in tail.iter().enumerate() {
         let nonzero = !b.ct_eq(&0u8);
@@ -474,7 +499,7 @@ mod tests {
     use super::*;
 
     /// The original byte-at-a-time scan, kept as the oracle for the
-    /// word-at-a-time [`ct_find_last_nonzero`].
+    /// block-at-a-time [`ct_find_last_nonzero`].
     fn ct_find_last_nonzero_bytewise(buf: &[u8]) -> Result<(u8, usize), Error> {
         if buf.is_empty() {
             return Err(Error::PeerMisbehaved);
@@ -504,13 +529,14 @@ mod tests {
         }
     }
 
-    /// Edge values: every length up to four words, the last nonzero byte at
-    /// every position, and byte values that probe the SWAR flag (0x01,
-    /// 0x7f, 0x80, 0xff) with zero and nonzero bytes around them.
+    /// Edge values: every length up to two blocks and a word, the last
+    /// nonzero byte at every position, and byte values that probe the SWAR
+    /// flag (0x01, 0x7f, 0x80, 0xff) with zero and nonzero bytes around
+    /// them.
     #[test]
     fn last_nonzero_matches_bytewise_on_edges() {
         same_result(&[]);
-        for len in 1..=32usize {
+        for len in 1..=72usize {
             same_result(&alloc::vec![0u8; len]);
             for pos in 0..len {
                 for v in [0x01u8, 0x7f, 0x80, 0xff, 0x17] {
