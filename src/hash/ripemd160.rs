@@ -66,8 +66,10 @@ const SR: [u32; 80] = [
     8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11,
 ];
 
-/// The five nonlinear functions, indexed by round (0..=4).
-#[inline]
+/// The five nonlinear functions, indexed by round (0..=4). Only ever called
+/// with a constant `round` from the unrolled schedule below, so the `match`
+/// folds away after inlining.
+#[inline(always)]
 fn boolfn(round: usize, x: u32, y: u32, z: u32) -> u32 {
     match round {
         0 => x ^ y ^ z,
@@ -85,33 +87,60 @@ fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
     let (mut ar, mut br, mut cr, mut dr, mut er) =
         (state[0], state[1], state[2], state[3], state[4]);
 
-    for j in 0..80 {
-        let round = j / 16;
-
-        let tl = al
-            .wrapping_add(boolfn(round, bl, cl, dl))
-            .wrapping_add(x[RL[j]])
-            .wrapping_add(KL[round])
-            .rotate_left(SL[j])
-            .wrapping_add(el);
-        al = el;
-        el = dl;
-        dl = cl.rotate_left(10);
-        cl = bl;
-        bl = tl;
-
-        let tr = ar
-            .wrapping_add(boolfn(4 - round, br, cr, dr))
-            .wrapping_add(x[RR[j]])
-            .wrapping_add(KR[round])
-            .rotate_left(SR[j])
-            .wrapping_add(er);
-        ar = er;
-        er = dr;
-        dr = cr.rotate_left(10);
-        cr = br;
-        br = tr;
+    // One step `j` of both lines. `t = rotl(a + f(b, c, d) + x + k, s) + e`
+    // then `(a, b, c, d, e) = (e, t, b, rotl(c, 10), d)`: rather than moving
+    // four registers, the new `a` is written over the old `e`, `c` is rotated
+    // in place, and the next step is called with the names rotated
+    // `(a, b, c, d, e) -> (e, a, b, c, d)`. Five steps bring the names back
+    // round, and 80 is a multiple of 5, so `step5` covers the schedule in 16
+    // straight-line calls with every `RL`/`SL`/`KL` index (and the round
+    // function) a constant.
+    macro_rules! step {
+        ($al:ident, $bl:ident, $cl:ident, $dl:ident, $el:ident,
+         $ar:ident, $br:ident, $cr:ident, $dr:ident, $er:ident, $j:expr) => {{
+            const J: usize = $j;
+            const ROUND: usize = J / 16;
+            $al = $al
+                .wrapping_add(boolfn(ROUND, $bl, $cl, $dl))
+                .wrapping_add(x[RL[J]])
+                .wrapping_add(KL[ROUND])
+                .rotate_left(SL[J])
+                .wrapping_add($el);
+            $cl = $cl.rotate_left(10);
+            $ar = $ar
+                .wrapping_add(boolfn(4 - ROUND, $br, $cr, $dr))
+                .wrapping_add(x[RR[J]])
+                .wrapping_add(KR[ROUND])
+                .rotate_left(SR[J])
+                .wrapping_add($er);
+            $cr = $cr.rotate_left(10);
+        }};
     }
+    macro_rules! step5 {
+        ($j:expr) => {
+            step!(al, bl, cl, dl, el, ar, br, cr, dr, er, $j);
+            step!(el, al, bl, cl, dl, er, ar, br, cr, dr, $j + 1);
+            step!(dl, el, al, bl, cl, dr, er, ar, br, cr, $j + 2);
+            step!(cl, dl, el, al, bl, cr, dr, er, ar, br, $j + 3);
+            step!(bl, cl, dl, el, al, br, cr, dr, er, ar, $j + 4);
+        };
+    }
+    step5!(0);
+    step5!(5);
+    step5!(10);
+    step5!(15);
+    step5!(20);
+    step5!(25);
+    step5!(30);
+    step5!(35);
+    step5!(40);
+    step5!(45);
+    step5!(50);
+    step5!(55);
+    step5!(60);
+    step5!(65);
+    step5!(70);
+    step5!(75);
 
     let t = state[1].wrapping_add(cl).wrapping_add(dr);
     state[1] = state[2].wrapping_add(dl).wrapping_add(er);

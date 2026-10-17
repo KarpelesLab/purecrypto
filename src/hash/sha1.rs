@@ -74,25 +74,62 @@ fn compress_soft(state: &mut [u32; 5], block: &[u8; 64]) {
     }
 
     let [mut a, mut b, mut c, mut d, mut e] = *state;
-    for (i, &wi) in w.iter().enumerate() {
-        let (f, k) = match i {
-            0..=19 => ((b & c) | (!b & d), K1[0]),
-            20..=39 => (b ^ c ^ d, K1[1]),
-            40..=59 => ((b & c) | (b & d) | (c & d), K1[2]),
-            _ => (b ^ c ^ d, K1[3]),
+
+    // Round `i`: `t = rotl(a, 5) + f(b, c, d) + e + k + w[i]`, then
+    // `(a, b, c, d, e) = (t, a, rotl(b, 30), c, d)`. The new `a` is written
+    // over the old `e`, `b` is rotated in place, and the next round is called
+    // with the names rotated `(a, b, c, d, e) -> (e, a, b, c, d)`; five rounds
+    // bring them back round, and each 20-round stage is four such groups, so
+    // the stage function and constant are fixed per macro call rather than
+    // selected by a per-round `match`.
+    macro_rules! round {
+        ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $k:expr, $i:expr) => {
+            $e = $a
+                .rotate_left(5)
+                .wrapping_add($f!($b, $c, $d))
+                .wrapping_add($e)
+                .wrapping_add($k)
+                .wrapping_add(w[$i]);
+            $b = $b.rotate_left(30);
         };
-        let tmp = a
-            .rotate_left(5)
-            .wrapping_add(f)
-            .wrapping_add(e)
-            .wrapping_add(k)
-            .wrapping_add(wi);
-        e = d;
-        d = c;
-        c = b.rotate_left(30);
-        b = a;
-        a = tmp;
     }
+    macro_rules! round5 {
+        ($f:ident, $k:expr, $i:expr) => {
+            round!(a, b, c, d, e, $f, $k, $i);
+            round!(e, a, b, c, d, $f, $k, $i + 1);
+            round!(d, e, a, b, c, $f, $k, $i + 2);
+            round!(c, d, e, a, b, $f, $k, $i + 3);
+            round!(b, c, d, e, a, $f, $k, $i + 4);
+        };
+    }
+    macro_rules! stage {
+        ($f:ident, $k:expr, $i:expr) => {
+            round5!($f, $k, $i);
+            round5!($f, $k, $i + 5);
+            round5!($f, $k, $i + 10);
+            round5!($f, $k, $i + 15);
+        };
+    }
+    // `Ch`, `Parity`, `Maj`, `Parity`.
+    macro_rules! ch {
+        ($b:ident, $c:ident, $d:ident) => {
+            $d ^ ($b & ($c ^ $d))
+        };
+    }
+    macro_rules! parity {
+        ($b:ident, $c:ident, $d:ident) => {
+            $b ^ $c ^ $d
+        };
+    }
+    macro_rules! maj {
+        ($b:ident, $c:ident, $d:ident) => {
+            ($b & $c) | ($d & ($b | $c))
+        };
+    }
+    stage!(ch, K1[0], 0);
+    stage!(parity, K1[1], 20);
+    stage!(maj, K1[2], 40);
+    stage!(parity, K1[3], 60);
 
     state[0] = state[0].wrapping_add(a);
     state[1] = state[1].wrapping_add(b);

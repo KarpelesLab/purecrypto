@@ -26,6 +26,28 @@ fn p1(x: u32) -> u32 {
     x ^ x.rotate_left(15) ^ x.rotate_left(23)
 }
 
+/// The boolean functions: `FF`/`GG` are XOR for rounds 0..16 and
+/// majority / choice for rounds 16..64.
+macro_rules! ff0 {
+    ($a:ident, $b:ident, $c:ident) => {
+        $a ^ $b ^ $c
+    };
+}
+macro_rules! ff1 {
+    ($a:ident, $b:ident, $c:ident) => {
+        ($a & $b) | ($a & $c) | ($b & $c)
+    };
+}
+macro_rules! gg1 {
+    ($e:ident, $f:ident, $g:ident) => {
+        ($e & $f) | (!$e & $g)
+    };
+}
+
+/// Round constants, rotated by `j mod 32` per round.
+const T0: u32 = 0x79cc_4519;
+const T1: u32 = 0x7a87_9d8a;
+
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     // Message expansion: W[0..68], W'[j] = W[j] ^ W[j+4].
     let mut w = [0u32; 68];
@@ -39,33 +61,63 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     }
 
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
-    for j in 0..64 {
-        let tj: u32 = if j < 16 { 0x79cc_4519 } else { 0x7a87_9d8a };
-        let a12 = a.rotate_left(12);
-        let ss1 = a12
-            .wrapping_add(e)
-            .wrapping_add(tj.rotate_left(j as u32 % 32))
-            .rotate_left(7);
-        let ss2 = ss1 ^ a12;
-        let (ffj, ggj) = if j < 16 {
-            (a ^ b ^ c, e ^ f ^ g)
-        } else {
-            ((a & b) | (a & c) | (b & c), (e & f) | (!e & g))
-        };
-        let tt1 = ffj
-            .wrapping_add(d)
-            .wrapping_add(ss2)
-            .wrapping_add(w[j] ^ w[j + 4]);
-        let tt2 = ggj.wrapping_add(h).wrapping_add(ss1).wrapping_add(w[j]);
-        d = c;
-        c = b.rotate_left(9);
-        b = a;
-        a = tt1;
-        h = g;
-        g = f.rotate_left(19);
-        f = e;
-        e = p0(tt2);
+
+    // Round `j`. The standard's `d = c; c = rotl(b, 9); b = a; a = tt1` (and
+    // likewise `h = g; g = rotl(f, 19); f = e; e = p0(tt2)`) is done by
+    // writing the new `a`/`e` over the old `d`/`h`, rotating `b`/`f` in place,
+    // and calling the next round with the names rotated
+    // `(a, b, c, d) -> (d, a, b, c)`; four rounds bring them back round. The
+    // 64 rounds are straight-line, so `T`, `w` and the round function are all
+    // constants per round (the loop form with per-round `if j < 16` selects
+    // measured 1.4x slower).
+    macro_rules! round {
+        ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident,
+         $ff:ident, $gg:ident, $t:ident, $j:expr) => {{
+            const J: usize = $j;
+            let a12 = $a.rotate_left(12);
+            let ss1 = a12
+                .wrapping_add($e)
+                .wrapping_add($t.rotate_left(J as u32 % 32))
+                .rotate_left(7);
+            let ss2 = ss1 ^ a12;
+            let tt1 = $ff!($a, $b, $c)
+                .wrapping_add($d)
+                .wrapping_add(ss2)
+                .wrapping_add(w[J] ^ w[J + 4]);
+            let tt2 = $gg!($e, $f, $g)
+                .wrapping_add($h)
+                .wrapping_add(ss1)
+                .wrapping_add(w[J]);
+            $d = tt1;
+            $b = $b.rotate_left(9);
+            $h = p0(tt2);
+            $f = $f.rotate_left(19);
+        }};
     }
+    macro_rules! r4 {
+        ($ff:ident, $gg:ident, $t:ident, $j:expr) => {
+            round!(a, b, c, d, e, f, g, h, $ff, $gg, $t, $j);
+            round!(d, a, b, c, h, e, f, g, $ff, $gg, $t, $j + 1);
+            round!(c, d, a, b, g, h, e, f, $ff, $gg, $t, $j + 2);
+            round!(b, c, d, a, f, g, h, e, $ff, $gg, $t, $j + 3);
+        };
+    }
+    r4!(ff0, ff0, T0, 0);
+    r4!(ff0, ff0, T0, 4);
+    r4!(ff0, ff0, T0, 8);
+    r4!(ff0, ff0, T0, 12);
+    r4!(ff1, gg1, T1, 16);
+    r4!(ff1, gg1, T1, 20);
+    r4!(ff1, gg1, T1, 24);
+    r4!(ff1, gg1, T1, 28);
+    r4!(ff1, gg1, T1, 32);
+    r4!(ff1, gg1, T1, 36);
+    r4!(ff1, gg1, T1, 40);
+    r4!(ff1, gg1, T1, 44);
+    r4!(ff1, gg1, T1, 48);
+    r4!(ff1, gg1, T1, 52);
+    r4!(ff1, gg1, T1, 56);
+    r4!(ff1, gg1, T1, 60);
 
     state[0] ^= a;
     state[1] ^= b;

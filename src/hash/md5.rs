@@ -83,23 +83,77 @@ const K: [u32; 64] = [
     0xeb86_d391,
 ];
 
+/// The four MD5 round functions, in the `d ^ (b & (c ^ d))` form (one fewer
+/// operation than the RFC's `(b & c) | (!b & d)`, same truth table).
+macro_rules! f1 {
+    ($b:ident, $c:ident, $d:ident) => {
+        $d ^ ($b & ($c ^ $d))
+    };
+}
+macro_rules! f2 {
+    ($b:ident, $c:ident, $d:ident) => {
+        $c ^ ($d & ($b ^ $c))
+    };
+}
+macro_rules! f3 {
+    ($b:ident, $c:ident, $d:ident) => {
+        $b ^ $c ^ $d
+    };
+}
+macro_rules! f4 {
+    ($b:ident, $c:ident, $d:ident) => {
+        $c ^ ($b | !$d)
+    };
+}
+
 fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
     let m = block_words_le(block);
     let [mut a, mut b, mut c, mut d] = *state;
 
-    for i in 0..64 {
-        let (func, g) = match i {
-            0..=15 => ((b & c) | (!b & d), i),
-            16..=31 => ((b & d) | (c & !d), (1 + 5 * i) % 16),
-            32..=47 => (b ^ c ^ d, (5 + 3 * i) % 16),
-            _ => (c ^ (b | !d), (7 * i) % 16),
+    // Step `i`: `a = b + rotl(a + f(b, c, d) + K[i] + m[g], S[i])`. Instead of
+    // the RFC's `a = d; d = c; c = b` register shuffle, consecutive steps are
+    // called with the register names rotated `(a, b, c, d) -> (d, a, b, c)`,
+    // and the whole 64-step schedule is straight-line so every `K`/`S`/`m`
+    // index is a constant (the loop form with a per-step `match` on the round
+    // measured 2.3x slower).
+    macro_rules! step {
+        ($a:ident, $b:ident, $c:ident, $d:ident, $f:ident, $i:expr, $g:expr) => {
+            $a = $b.wrapping_add(
+                $a.wrapping_add($f!($b, $c, $d))
+                    .wrapping_add(K[$i])
+                    .wrapping_add(m[$g])
+                    .rotate_left(S[$i]),
+            );
         };
-        let tmp = a.wrapping_add(func).wrapping_add(K[i]).wrapping_add(m[g]);
-        a = d;
-        d = c;
-        c = b;
-        b = b.wrapping_add(tmp.rotate_left(S[i]));
     }
+    macro_rules! r4 {
+        ($f:ident, $i:expr, $g0:expr, $g1:expr, $g2:expr, $g3:expr) => {
+            step!(a, b, c, d, $f, $i, $g0);
+            step!(d, a, b, c, $f, $i + 1, $g1);
+            step!(c, d, a, b, $f, $i + 2, $g2);
+            step!(b, c, d, a, $f, $i + 3, $g3);
+        };
+    }
+    // Round 1: g = i.
+    r4!(f1, 0, 0, 1, 2, 3);
+    r4!(f1, 4, 4, 5, 6, 7);
+    r4!(f1, 8, 8, 9, 10, 11);
+    r4!(f1, 12, 12, 13, 14, 15);
+    // Round 2: g = (5i + 1) mod 16.
+    r4!(f2, 16, 1, 6, 11, 0);
+    r4!(f2, 20, 5, 10, 15, 4);
+    r4!(f2, 24, 9, 14, 3, 8);
+    r4!(f2, 28, 13, 2, 7, 12);
+    // Round 3: g = (3i + 5) mod 16.
+    r4!(f3, 32, 5, 8, 11, 14);
+    r4!(f3, 36, 1, 4, 7, 10);
+    r4!(f3, 40, 13, 0, 3, 6);
+    r4!(f3, 44, 9, 12, 15, 2);
+    // Round 4: g = 7i mod 16.
+    r4!(f4, 48, 0, 7, 14, 5);
+    r4!(f4, 52, 12, 3, 10, 1);
+    r4!(f4, 56, 8, 15, 6, 13);
+    r4!(f4, 60, 4, 11, 2, 9);
 
     state[0] = state[0].wrapping_add(a);
     state[1] = state[1].wrapping_add(b);
