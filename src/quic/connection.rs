@@ -2534,10 +2534,7 @@ impl QuicConnection {
             Level::Handshake => &self.endpoint.pn.handshake,
             _ => &self.endpoint.pn.application,
         };
-        if !matches!(level, Level::EarlyData)
-            && !space.pending_ack.is_empty()
-            && space.ack_eliciting_pending
-        {
+        if !matches!(level, Level::EarlyData) && !space.pending_ack.is_empty() && space.ack_due {
             return true;
         }
         // 1-RTT and 0-RTT both carry stream-related frames; the path/CID
@@ -2971,6 +2968,12 @@ impl QuicConnection {
             (Some(a), None) => Some(a),
             (None, b) => b,
         };
+        // RFC 9000 §13.2.1 — a delayed ACK must go out within max_ack_delay.
+        let base = match (base, self.ack_delay_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
         // RFC 9000 §8.2.4 — a migration under validation has its own deadline.
         match (base, self.migration.as_ref().map(|m| m.deadline)) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -2989,6 +2992,14 @@ impl QuicConnection {
     }
 
     fn on_timeout_inner(&mut self, now_since_start: Duration) {
+        // RFC 9000 §13.2.1 — the delayed ACK's `max_ack_delay` ran out: the
+        // next `pop_datagram` carries it.
+        if self
+            .ack_delay_deadline()
+            .is_some_and(|deadline| now_since_start >= deadline)
+        {
+            self.endpoint.pn.application.ack_due = true;
+        }
         // RFC 9001 §6.5 — drop retained previous-phase read keys once
         // 3×PTO has elapsed since the key-phase commit installed them.
         self.maybe_discard_prev_rx_keys(now_since_start);
@@ -5316,19 +5327,18 @@ impl QuicConnection {
                 return true;
             }
         }
-        // ACK-pending PN spaces:
-        if !self.endpoint.pn.initial.pending_ack.is_empty()
-            && self.endpoint.pn.initial.ack_eliciting_pending
-        {
+        // ACK-pending PN spaces (RFC 9000 §13.2: only once an ACK is due —
+        // a pending one otherwise waits for a packet sent for another
+        // reason, or for the `max_ack_delay` timer).
+        if !self.endpoint.pn.initial.pending_ack.is_empty() && self.endpoint.pn.initial.ack_due {
             return true;
         }
-        if !self.endpoint.pn.handshake.pending_ack.is_empty()
-            && self.endpoint.pn.handshake.ack_eliciting_pending
+        if !self.endpoint.pn.handshake.pending_ack.is_empty() && self.endpoint.pn.handshake.ack_due
         {
             return true;
         }
         if !self.endpoint.pn.application.pending_ack.is_empty()
-            && self.endpoint.pn.application.ack_eliciting_pending
+            && self.endpoint.pn.application.ack_due
         {
             return true;
         }
@@ -6883,6 +6893,7 @@ impl QuicConnection {
             Level::Handshake => &mut self.endpoint.pn.handshake,
             _ => &mut self.endpoint.pn.application,
         };
+        let largest_before = space.largest_rx;
         space.largest_rx = Some(match space.largest_rx {
             Some(prev) => prev.max(pn),
             None => pn,
@@ -6897,13 +6908,57 @@ impl QuicConnection {
             EcnCodepoint::NotEct => {}
         }
         if ack_eliciting {
+            if !space.ack_eliciting_pending {
+                space.first_eliciting_arrival_us = Some(arrival_us);
+            }
             space.ack_eliciting_pending = true;
             // Track the arrival time of the most recent ack-eliciting
             // packet so the next outbound ACK can advertise an
             // RFC 9000 §13.2.5-compliant ack_delay.
             space.largest_eliciting_arrival_us = Some(arrival_us);
+            space.eliciting_since_ack = space.eliciting_since_ack.saturating_add(1);
+            // RFC 9000 §13.2.1 — Initial and Handshake packets are
+            // acknowledged immediately, as is a packet received out of
+            // order (below the largest seen, or leaving a gap) or marked
+            // CE; §13.2.2 — otherwise every second ack-eliciting packet,
+            // the rest waiting for `max_ack_delay` (`on_timeout`) or a
+            // packet going out anyway.
+            let out_of_order = largest_before.is_some_and(|l| pn < l || pn > l.saturating_add(1));
+            if !matches!(level, Level::OneRtt | Level::EarlyData)
+                || space.eliciting_since_ack >= 2
+                || out_of_order
+                || rx_ecn == EcnCodepoint::Ce
+            {
+                space.ack_due = true;
+            }
         }
         Ok(())
+    }
+
+    /// RFC 9000 §13.2.1 — when the oldest 1-RTT ack-eliciting packet still
+    /// awaiting acknowledgement must have been acknowledged by: its arrival
+    /// plus our advertised `max_ack_delay`. `None` when no ACK is owed or
+    /// one is already due.
+    fn ack_delay_deadline(&self) -> Option<Duration> {
+        let space = &self.endpoint.pn.application;
+        if !space.ack_eliciting_pending || space.ack_due {
+            return None;
+        }
+        let first = space.first_eliciting_arrival_us?;
+        let max_ack_delay = Duration::from_millis(self.our_params.max_ack_delay_ms.unwrap_or(25));
+        Some(Duration::from_micros(first).saturating_add(max_ack_delay))
+    }
+
+    /// Test stand-in for the RFC 9000 §13.2.1 `max_ack_delay` timer: makes
+    /// a delayed 1-RTT ACK due now, without moving the loss-detection
+    /// clock the way `on_timeout` at the deadline would. The loopback
+    /// helpers call it between flights so a pump round still carries the
+    /// acknowledgments a real peer would have sent within `max_ack_delay`.
+    #[cfg(test)]
+    pub(crate) fn expire_ack_delay(&mut self) {
+        if self.ack_delay_deadline().is_some() {
+            self.endpoint.pn.application.ack_due = true;
+        }
     }
 
     /// Hands `bytes` (already in-order, just released by the per-level
@@ -7006,8 +7061,7 @@ impl QuicConnection {
             Level::Handshake => &self.endpoint.pn.handshake,
             _ => &self.endpoint.pn.application,
         };
-        let has_pending_ack =
-            !zero_rtt && !space_ref.pending_ack.is_empty() && space_ref.ack_eliciting_pending;
+        let has_pending_ack = !zero_rtt && !space_ref.pending_ack.is_empty() && space_ref.ack_due;
         let has_streams = matches!(level, Level::OneRtt | Level::EarlyData)
             && self
                 .streams
@@ -7425,6 +7479,9 @@ impl QuicConnection {
             space.pending_ack.clear();
             space.ack_eliciting_pending = false;
             space.largest_eliciting_arrival_us = None;
+            space.first_eliciting_arrival_us = None;
+            space.eliciting_since_ack = 0;
+            space.ack_due = false;
         }
 
         // RFC 9002 Appendix A — `OnPacketSent`. Record this packet for
@@ -8121,7 +8178,9 @@ mod tests {
         max_round_trips: usize,
     ) {
         for i in 0..max_round_trips {
-            // Drain client → server.
+            // Drain client → server (a delayed ACK counts as expired: a
+            // real peer sends it within max_ack_delay).
+            client.expire_ack_delay();
             loop {
                 let dg = client.pop_datagram();
                 if dg.is_empty() {
@@ -8130,6 +8189,7 @@ mod tests {
                 server.feed_datagram(&dg).expect("server feed");
             }
             // Drain server → client.
+            server.expire_ack_delay();
             loop {
                 let dg = server.pop_datagram();
                 if dg.is_empty() {
@@ -9231,6 +9291,9 @@ mod tests {
     /// Returns `true` if anything moved.
     fn pump(c: &mut QuicConnection, s: &mut QuicConnection) -> bool {
         let mut any = false;
+        // A delayed ACK counts as expired on each side before it sends: a
+        // real peer sends it within max_ack_delay.
+        c.expire_ack_delay();
         loop {
             let dg = c.pop_datagram();
             if dg.is_empty() {
@@ -9239,6 +9302,7 @@ mod tests {
             any = true;
             s.feed_datagram(&dg).expect("server feed");
         }
+        s.expire_ack_delay();
         loop {
             let dg = s.pop_datagram();
             if dg.is_empty() {
@@ -9521,6 +9585,9 @@ mod tests {
     fn quiesce(c: &mut QuicConnection, s: &mut QuicConnection, addr: SocketAddr) {
         for _ in 0..16 {
             let mut moved = false;
+            // Delayed ACKs count as expired before each side sends, so the
+            // quiescent state owes nothing.
+            c.expire_ack_delay();
             loop {
                 let dg = c.pop_datagram();
                 if dg.is_empty() {
@@ -9529,6 +9596,7 @@ mod tests {
                 moved = true;
                 s.feed_datagram_from(addr, &dg).expect("server feed");
             }
+            s.expire_ack_delay();
             loop {
                 let dg = s.pop_datagram();
                 if dg.is_empty() {
@@ -9659,6 +9727,7 @@ mod tests {
                 space.pending_ack.insert(pn);
             }
             space.ack_eliciting_pending = true;
+            space.ack_due = true;
         }
 
         const CAP: usize = 48;
@@ -10725,6 +10794,82 @@ mod tests {
         assert_eq!(s.endpoint.cc.bytes_in_flight, 0);
     }
 
+    /// RFC 9000 §13.2.1 / §13.2.2 — a 1-RTT ACK is delayed: it goes out
+    /// after every second ack-eliciting packet, at once for a packet that
+    /// leaves a gap, or when `max_ack_delay` runs out (`next_timeout` /
+    /// `on_timeout`); never on its own after a single in-order packet.
+    #[test]
+    fn one_rtt_acks_every_second_packet_or_on_max_ack_delay() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+        let addr = ip4(192, 0, 2, 1, 1111);
+        quiesce(&mut c, &mut s, addr);
+        assert!(s.pop_datagram().is_empty());
+        let max_ack_delay = Duration::from_millis(s.our_params.max_ack_delay_ms.unwrap_or(25));
+        let sid = c.open_bidi().expect("open");
+        let send = |c: &mut QuicConnection, data: &[u8]| -> (Vec<u8>, u64) {
+            c.write(sid, data).expect("write");
+            let dg = c.pop_datagram();
+            assert!(!dg.is_empty());
+            (dg, c.endpoint.pn.application.next_tx - 1)
+        };
+
+        // One packet: the ACK is owed but waits.
+        let (dg, _) = send(&mut c, b"one");
+        s.feed_datagram(&dg).expect("server feed");
+        assert!(s.endpoint.pn.application.ack_eliciting_pending);
+        assert!(!s.endpoint.pn.application.ack_due);
+        assert!(s.pop_datagram().is_empty(), "no ACK after a single packet");
+        let arrival = Duration::from_micros(
+            s.endpoint
+                .pn
+                .application
+                .first_eliciting_arrival_us
+                .expect("arrival recorded"),
+        );
+        assert_eq!(
+            s.next_timeout(),
+            Some(arrival + max_ack_delay),
+            "the max_ack_delay timer is the next event"
+        );
+
+        // A second packet makes it due: one ACK for the two.
+        let (dg, pn2) = send(&mut c, b"two");
+        s.feed_datagram(&dg).expect("server feed");
+        assert!(s.endpoint.pn.application.ack_due);
+        let ack = s.pop_datagram();
+        assert!(!ack.is_empty(), "an ACK after every second packet");
+        assert!(s.pop_datagram().is_empty());
+        assert!(!s.endpoint.pn.application.ack_eliciting_pending);
+        c.feed_datagram(&ack).expect("client feed");
+        assert_eq!(c.endpoint.pn.application.largest_acked_tx, Some(pn2));
+
+        // A lone packet again: `on_timeout` at the deadline releases it.
+        let (dg, pn3) = send(&mut c, b"three");
+        s.feed_datagram(&dg).expect("server feed");
+        assert!(s.pop_datagram().is_empty());
+        let deadline = s.next_timeout().expect("timer armed");
+        s.on_timeout(deadline);
+        assert!(s.endpoint.pn.application.ack_due);
+        let ack = s.pop_datagram();
+        assert!(
+            !ack.is_empty(),
+            "the ACK goes out when max_ack_delay elapses"
+        );
+        c.feed_datagram(&ack).expect("client feed");
+        assert_eq!(c.endpoint.pn.application.largest_acked_tx, Some(pn3));
+
+        // A packet arriving ahead of its predecessor leaves a gap: due at once.
+        let (_lost, _) = send(&mut c, b"four");
+        let (dg, _) = send(&mut c, b"five");
+        s.feed_datagram(&dg).expect("server feed");
+        assert!(
+            s.endpoint.pn.application.ack_due,
+            "a gap is acknowledged immediately"
+        );
+        assert!(!s.pop_datagram().is_empty());
+    }
+
     /// H-6(c) — RFC 9002 §2: ACK-only packets are not congestion controlled.
     /// The cwnd guard used to suppress the entire 1-RTT packet, so once
     /// `bytes_in_flight` reached the window the endpoint could not even send
@@ -10748,6 +10893,7 @@ mod tests {
         assert!(!dg.is_empty());
         s.feed_datagram(&dg).expect("server feed");
         assert!(!s.endpoint.pn.application.pending_ack.is_empty());
+        s.expire_ack_delay();
 
         let before_in_flight = s.endpoint.cc.bytes_in_flight;
         let out = s.pop_datagram();
@@ -15516,6 +15662,7 @@ mod tests {
             // up the delta.
             s.endpoint.pn.application.pending_ack.insert(0);
             s.endpoint.pn.application.ack_eliciting_pending = true;
+            s.endpoint.pn.application.ack_due = true;
             // Pretend the eliciting packet arrived earlier.
             let now_us = s.now_since_start().as_micros() as u64;
             s.endpoint.pn.application.largest_eliciting_arrival_us =
@@ -15596,6 +15743,7 @@ mod tests {
         s.set_start_for_test(Instant::now() - Duration::from_secs(1));
         s.endpoint.pn.application.pending_ack.insert(7);
         s.endpoint.pn.application.ack_eliciting_pending = true;
+        s.endpoint.pn.application.ack_due = true;
         let now_us = s.now_since_start().as_micros() as u64;
         s.endpoint.pn.application.largest_eliciting_arrival_us =
             Some(now_us.saturating_sub(80_000));
@@ -16143,6 +16291,7 @@ mod tests {
         // the moment it goes out.
         c.endpoint.pn.handshake.pending_ack.insert(0);
         c.endpoint.pn.handshake.ack_eliciting_pending = true;
+        c.endpoint.pn.handshake.ack_due = true;
         let hs_flight = drain_datagrams(&mut c);
         assert!(!hs_flight.is_empty(), "the Handshake ACK goes out");
         assert!(

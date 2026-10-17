@@ -188,6 +188,22 @@ pub(crate) struct PnSpace {
     /// `ack_delay` field on the outbound ACK frame (RFC 9000 §13.2.5).
     /// `None` whenever `ack_eliciting_pending == false`.
     pub(crate) largest_eliciting_arrival_us: Option<u64>,
+    /// Arrival time (microseconds since connection start) of the oldest
+    /// ack-eliciting packet still pending ACK: the RFC 9000 §13.2.1
+    /// `max_ack_delay` deadline runs from it. `None` whenever
+    /// `ack_eliciting_pending == false`.
+    pub(crate) first_eliciting_arrival_us: Option<u64>,
+    /// Ack-eliciting packets received since the last ACK frame went out
+    /// (RFC 9000 §13.2.2 counts to two before an ACK is owed).
+    pub(crate) eliciting_since_ack: u8,
+    /// An ACK frame for this space must go out in the next packet
+    /// (RFC 9000 §13.2.1 / §13.2.2): set by an ack-eliciting Initial or
+    /// Handshake packet, by the second ack-eliciting 1-RTT packet since
+    /// the last ACK, by one received out of order or marked CE, and when
+    /// `max_ack_delay` has run out since the oldest pending one arrived.
+    /// Until then a pending ACK only rides along in a packet sent for
+    /// another reason.
+    pub(crate) ack_due: bool,
     /// RFC 9000 §13.4: running totals of the IP ECN codepoints observed on
     /// received packets in this space, echoed back in ACK_ECN frames so the
     /// sender can detect congestion (CE) and validate the path.

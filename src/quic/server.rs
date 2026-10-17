@@ -1231,6 +1231,9 @@ mod server_tests {
         let (ca, sa) = (addr(41200), addr(443));
         // Drive the handshake to completion so both sides issue extra CIDs.
         for _ in 0..64 {
+            // The client's delayed 1-RTT ACKs (RFC 9000 §13.2) would wait
+            // for max_ack_delay; stand in for the timer.
+            c.expire_ack_delay();
             let dg = c.pop_datagram();
             if !dg.is_empty() {
                 srv.recv(ca, EcnCodepoint::NotEct, &dg).unwrap();
