@@ -15,7 +15,7 @@
 use alloc::vec::Vec;
 
 use super::{Error, PssParams, PssRestriction, oid};
-use crate::der::{Reader, parse_oid};
+use crate::der::{Reader, parse_oid, tag};
 
 /// The parameters a signature `AlgorithmIdentifier` carries, as far as they
 /// affect verification.
@@ -88,8 +88,15 @@ impl SignatureAlgorithmIdentifier {
     /// MGF1 is [`Error::UnsupportedAlgorithm`]; a `trailerField` other than
     /// 1 is [`Error::Malformed`] and trailing junk a DER error. The RFC 8702
     /// `id-RSASSA-PSS-SHAKE128` / `-SHAKE256` identifiers must carry no
-    /// parameters at all (§3.1). Parameters after any other OID are not
-    /// interpreted.
+    /// parameters at all (§3.1).
+    ///
+    /// The other identifiers carry nothing a verifier reads, but their
+    /// grammar is still checked: a PKCS#1 v1.5 identifier (the pkcs-1 arc,
+    /// `sha256WithRSAEncryption` and kin) takes `NULL` or nothing (RFC 4055
+    /// §5, RFC 3279 §2.2.1); ECDSA (RFC 5758 §3.2), EdDSA (RFC 8410 §3),
+    /// ML-DSA / SLH-DSA and SM2 MUST omit the field, so anything after the
+    /// OID is a DER error. Two verifiers can then never read different
+    /// parameters from the same bytes.
     ///
     /// [`AnyPublicKey::from_spki_der`]: super::AnyPublicKey::from_spki_der
     pub fn from_der(der: &[u8]) -> Result<Self, Error> {
@@ -107,12 +114,11 @@ impl SignatureAlgorithmIdentifier {
         } else {
             SignatureParams::None
         };
-        if oid.as_slice() == oid::ID_RSASSA_PSS
-            || oid.as_slice() == oid::ID_RSASSA_PSS_SHAKE128
-            || oid.as_slice() == oid::ID_RSASSA_PSS_SHAKE256
-        {
-            algid.finish()?;
+        if is_pkcs1_v15_oid(&oid) && algid.peek_tag() == Some(tag::NULL) {
+            algid.read_null()?;
         }
+        // Everything an identifier may carry has been consumed by now.
+        algid.finish()?;
         r.finish()?;
         Ok(SignatureAlgorithmIdentifier { oid, params })
     }
@@ -135,6 +141,16 @@ impl SignatureAlgorithmIdentifier {
             SignatureParams::None => None,
         }
     }
+}
+
+/// Whether `oid` is a PKCS#1 v1.5 signature identifier: a leaf of the
+/// pkcs-1 arc (1.2.840.113549.1.1) other than `id-RSASSA-PSS`. These are
+/// the only signature identifiers whose parameters are a `NULL`.
+fn is_pkcs1_v15_oid(oid: &[u64]) -> bool {
+    const PKCS1_ARC: &[u64] = &[1, 2, 840, 113549, 1, 1];
+    oid.len() == PKCS1_ARC.len() + 1
+        && oid[..PKCS1_ARC.len()] == *PKCS1_ARC
+        && oid != oid::ID_RSASSA_PSS
 }
 
 /// The OID arcs of a DER `AlgorithmIdentifier` TLV, parameters ignored.
@@ -239,5 +255,44 @@ mod tests {
             algid_oid(&encode_sequence(&oid_tlv(oid::ID_ED25519))).unwrap(),
             oid::ID_ED25519
         );
+    }
+
+    /// F6: the parameters of the non-PSS identifiers are validated, not
+    /// skipped — `NULL` only after a PKCS#1 v1.5 OID, nothing after any
+    /// other, and never anything beyond that.
+    #[test]
+    fn non_pss_parameters_are_validated() {
+        let with = |o: &[u64], params: &[u8]| {
+            SignatureAlgorithmIdentifier::from_der(&encode_sequence(
+                &[oid_tlv(o), params.to_vec()].concat(),
+            ))
+        };
+        // PKCS#1 v1.5: absent or NULL, nothing more.
+        assert!(with(oid::SHA256_WITH_RSA, &[]).is_ok());
+        assert!(with(oid::SHA256_WITH_RSA, &encode_null()).is_ok());
+        assert!(with(oid::SHA1_WITH_RSA, &encode_null()).is_ok());
+        assert!(
+            with(
+                oid::SHA256_WITH_RSA,
+                &[encode_null(), encode_null()].concat()
+            )
+            .is_err()
+        );
+        assert!(with(oid::SHA256_WITH_RSA, &encode_integer(&[0])).is_err());
+        assert!(with(oid::SHA256_WITH_RSA, &encode_sequence(&[])).is_err());
+        // ECDSA, EdDSA, ML-DSA: absent only.
+        for o in [
+            oid::ECDSA_WITH_SHA256,
+            oid::ECDSA_WITH_SHA384,
+            oid::ECDSA_WITH_SHA512,
+            oid::ID_ED25519,
+            oid::ID_ED448,
+            oid::ID_ML_DSA_65,
+        ] {
+            assert!(with(o, &[]).is_ok());
+            assert!(with(o, &encode_null()).is_err(), "{o:?} with NULL");
+            assert!(with(o, &encode_sequence(&[])).is_err());
+            assert!(with(o, &[0xff]).is_err(), "{o:?} with garbage");
+        }
     }
 }
