@@ -64,9 +64,11 @@
 //! the encoding documented in the upstream `secp256k1_whitelist.h`, and
 //! [`MAX_KEYS`] (255) is the ring-size ceiling it implies.
 //! [`Whitelist::from_bytes`] rejects a length that is not exactly
-//! `33 + 32·n_keys`, a zero ring, and any scalar that is zero or `>= n` (the
-//! group order) — upstream guarantees such a signature fails verification, so
-//! rejecting it up front is equivalent and keeps the parsed type canonical.
+//! `33 + 32·n_keys`, a zero ring, and any `s` value that is zero or `>= n`
+//! (the group order) — upstream guarantees such a signature fails
+//! verification, so rejecting it up front is equivalent and keeps the parsed
+//! type canonical. `e0` is a hash output that is only ever hashed again, so,
+//! like upstream's parser, this accepts any 32 bytes for it.
 //!
 //! # Interop
 //!
@@ -166,8 +168,10 @@ impl Whitelist {
     /// # Errors
     /// [`Error::Malformed`] if the buffer is empty, if its length is not
     /// exactly `33 + 32·n_keys` for the leading `n_keys` byte, if `n_keys` is
-    /// zero, or if `e0` or any `s` value is zero or not less than the group
-    /// order.
+    /// zero, or if any `s` value is zero or not less than the group order.
+    /// `e0` is not a scalar — it only ever seeds a hash — so, as upstream's
+    /// parser does, any 32 bytes are accepted for it; a wrong `e0` simply
+    /// fails [`verify`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Whitelist, Error> {
         let n = match bytes.first() {
             Some(&n) => n as usize,
@@ -181,7 +185,6 @@ impl Whitelist {
         }
         let mut e0 = [0u8; 32];
         e0.copy_from_slice(&bytes[1..33]);
-        check_scalar(&e0)?;
         let mut s = Vec::with_capacity(n);
         for i in 0..n {
             let mut si = [0u8; 32];
@@ -781,11 +784,22 @@ mod tests {
         big[0] = 255;
         assert_eq!(Whitelist::from_bytes(&big).unwrap().n_keys(), 255);
 
-        // Zero scalars are rejected.
+        // `e0` is only ever hashed, so — as upstream's parser does — any 32
+        // bytes parse, zero and `>= n` included; such a proof then fails
+        // verification like any other wrong `e0`.
         let mut zero_e0 = vec![0u8; Whitelist::serialized_len(1)];
         zero_e0[0] = 1;
         zero_e0[64] = 1;
-        assert_eq!(Whitelist::from_bytes(&zero_e0), Err(Error::Malformed));
+        let parsed = Whitelist::from_bytes(&zero_e0).unwrap();
+        assert_eq!(parsed.n_keys(), 1);
+        let (on, off, sub, _osk, _ssk) = ring(1, 0);
+        assert_eq!(verify(&parsed, &on, &off, &sub), Err(Error::Verification));
+        let mut big_e0 = zero_e0.clone();
+        big_e0[1..33].fill(0xff);
+        let parsed = Whitelist::from_bytes(&big_e0).unwrap();
+        assert_eq!(verify(&parsed, &on, &off, &sub), Err(Error::Verification));
+
+        // Zero `s` scalars are rejected.
         let mut zero_s = vec![0u8; Whitelist::serialized_len(1)];
         zero_s[0] = 1;
         zero_s[32] = 1;

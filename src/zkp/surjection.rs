@@ -587,6 +587,13 @@ impl SurjectionProof {
         // The ring secret: r_out − r_in, the discrete logarithm of
         // `A_out − A_in_index` with respect to G.
         let secret = Scalar::from_bytes_be(output_blind)?.sub(&Scalar::from_bytes_be(input_blind)?);
+        // A zero secret means the output generator *is* the input generator:
+        // the ring key would be the identity, which `verify` (and the
+        // reference's) refuses, so such a proof could never be used.
+        // Declassified (Valgrind harness): a public verdict (an error return).
+        if secret.is_zero().declassify() {
+            return Err(Error::InvalidInput);
+        }
 
         // Ring position of `input_index`, without branching on it.
         let mut pos = 0usize;
@@ -723,9 +730,9 @@ impl SurjectionProof {
     /// [`Error::InvalidInput`] if the number of generators does not match
     /// [`n_inputs`](SurjectionProof::n_inputs);
     /// [`Error::Verification`] if the anonymity set is empty, if a scalar in
-    /// the proof is not canonical (`>= n`), if an `R` value is the point at
-    /// infinity, or if the ring does not close. Never panics, whatever the
-    /// proof contains.
+    /// the proof is zero or not canonical (`>= n`), if a ring key or an `R`
+    /// value is the point at infinity, or if the ring does not close. Never
+    /// panics, whatever the proof contains.
     pub fn verify(
         &self,
         input_generators: &[Generator],
@@ -749,6 +756,13 @@ impl SurjectionProof {
         for (j, &u) in used.iter().enumerate() {
             let s = Scalar::from_bytes_be(&self.s[j]).map_err(|_| Error::Verification)?;
             let key = out_point.add(&input_generators[u].as_point().negate());
+            // The reference's Borromean verifier refuses a zero ring scalar
+            // and a ring key on infinity. The latter — the output generator
+            // equal to an input generator — makes R = s·G independent of the
+            // challenge, so the ring would close without any secret.
+            if bool::from(s.is_zero()) || bool::from(key.is_identity()) {
+                return Err(Error::Verification);
+            }
             let es = Scalar::from_bytes_be_reduce(&e);
             // An `R` on infinity has no encoding to hash; a prover reaches it
             // only with a zero nonce, and the reference rejects such a proof.
@@ -1160,6 +1174,53 @@ mod tests {
         // The same bytes through the parser.
         let parsed = SurjectionProof::parse(&proof.serialize()).unwrap();
         assert_eq!(parsed.verify(&gens, &out), Err(Error::Verification));
+    }
+
+    #[test]
+    fn rejects_a_ring_key_on_infinity() {
+        // Output generator identical to the only input generator: the ring
+        // key is O and R = s·G + e·O = s·G ignores the challenge, so
+        // e0 = SHA-256(ser(G) ‖ m) with s = 1 closes the ring without any
+        // secret. The reference refuses the identity key; so must we.
+        let (tags, gens, _out, _ob) = setup(1, 0);
+        let out = gens[0];
+        let m = message(&gens, &out);
+        let g = ProjectivePoint::mul_generator(&Scalar::ONE)
+            .to_affine()
+            .unwrap()
+            .to_sec1_compressed();
+        let proof = SurjectionProof {
+            n_inputs: 1,
+            used: vec![0x01],
+            e0: close(&g, &m),
+            s: vec![Scalar::ONE.to_bytes_be()],
+        };
+        assert_eq!(proof.verify(&gens, &out), Err(Error::Verification));
+        let parsed = SurjectionProof::parse(&proof.serialize()).unwrap();
+        assert_eq!(parsed.verify(&gens, &out), Err(Error::Verification));
+
+        // The prover refuses to build that statement in the first place.
+        let (mut proof, _) =
+            SurjectionProof::initialize(&tags, 1, &tags[0], 100, &[7u8; 32]).unwrap();
+        assert_eq!(
+            proof.generate(&gens, &out, 0, &blind(0), &blind(0)),
+            Err(Error::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_ring_scalar() {
+        // Zero scalars are refused before the ring is walked, as the
+        // reference does; an honest prover produces one with probability
+        // 2^-256, so nothing legitimate is lost.
+        for position in 0..3 {
+            let (mut proof, gens, out) = prove(3, 3, 1, 5);
+            proof.verify(&gens, &out).unwrap();
+            proof.s[position] = [0u8; 32];
+            assert_eq!(proof.verify(&gens, &out), Err(Error::Verification));
+            let parsed = SurjectionProof::parse(&proof.serialize()).unwrap();
+            assert_eq!(parsed.verify(&gens, &out), Err(Error::Verification));
+        }
     }
 
     #[test]

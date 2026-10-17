@@ -809,6 +809,14 @@ fn parse<'a>(
     if ncommit + 1 != layout.rings {
         return Err(Error::Malformed);
     }
+    // A recovered commitment on infinity makes the last ring's first member
+    // key the identity, whose "signature" R = s·G + e·O ignores the challenge
+    // and lets anyone close that ring without a secret. The reference refuses
+    // it before running the ring signature; so do we, which also keeps the
+    // structure `rewind` works from honest.
+    if bool::from(last.is_identity()) {
+        return Err(Error::Verification);
+    }
     digit_commits[ncommit] = last;
 
     let sig = &proof[header_len + body_len..];
@@ -865,6 +873,14 @@ fn borromean_verify(
             let scalar = Scalar::from_bytes_be_reduce(&e);
             if j > 0 {
                 member = member.add(&neg_step);
+            }
+            // The reference's Borromean verifier refuses a zero ring scalar
+            // and a ring key on infinity. Neither comes from an honest prover
+            // except with negligible probability, and an identity key makes
+            // R = s·G independent of the challenge. Public data, so plain
+            // branches are fine.
+            if bool::from(s.is_zero()) || bool::from(member.is_identity()) {
+                return Err(Error::Verification);
             }
             let r = ProjectivePoint::mul_generator_double_vartime(&s, &scalar, &member);
             let affine = r.to_affine().ok_or(Error::Verification)?;
@@ -2120,6 +2136,50 @@ mod tests {
             assert_eq!(proof, exact, "exp={exp}");
             assert_eq!(message_capacity(u64::MAX, u64::MAX, exp, 64), Ok(0));
         }
+    }
+
+    #[test]
+    fn a_ring_key_on_infinity_is_rejected() {
+        // An exact-value proof of C = 5·H with a zero blinding factor: the
+        // verifier recovers the single ring key C − 5·H = O, whose
+        // "signature" R = s·G + e·O = s·G never depends on the challenge, so
+        // e0 = SHA-256(ser(G) ‖ m) with s = 1 closes the ring without any
+        // secret. The reference refuses the identity key; so must we.
+        let commit = Commitment::new(5, &[0u8; 32]).unwrap();
+        let mut proof = vec![0x20u8];
+        proof.extend_from_slice(&5u64.to_be_bytes());
+        let m = proof_message(
+            &point_enc(&commit.serialize()),
+            &point_enc(&h().serialize()),
+            &proof,
+            &[],
+            &[],
+        );
+        let g = ProjectivePoint::mul_generator(&Scalar::ONE)
+            .to_affine()
+            .unwrap()
+            .to_sec1_compressed();
+        let mut e0h = Sha256::new();
+        e0h.update(&g);
+        e0h.update(&m);
+        proof.extend_from_slice(&e0h.finalize());
+        proof.extend_from_slice(&Scalar::ONE.to_bytes_be());
+        assert_eq!(verify(&commit, &proof, &[], &h()), Err(Error::Verification));
+        assert_eq!(
+            rewind(&commit, &proof, &nonce_of(58), &[], &h()).map(|_| ()),
+            Err(Error::Verification)
+        );
+
+        // The same shape with a nonzero blinding factor is an honest exact
+        // proof, so the rejection is specific to the identity key...
+        let blind = blind_of(58);
+        let honest = Commitment::new(5, &blind).unwrap();
+        let mut proof = sign(&honest, &blind, &nonce_of(58), 5, 5, -1, 0, &[], &[], &h()).unwrap();
+        assert_eq!(verify(&honest, &proof, &[], &h()).unwrap(), (5, 5));
+        // ...and a zero ring scalar is refused outright as well.
+        let n = proof.len();
+        proof[n - 32..].fill(0);
+        assert_eq!(verify(&honest, &proof, &[], &h()), Err(Error::Verification));
     }
 
     #[test]
