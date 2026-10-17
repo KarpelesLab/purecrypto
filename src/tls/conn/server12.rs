@@ -2595,10 +2595,13 @@ impl<R: RngCore> ServerConnection12<R> {
         Ok(())
     }
 
-    /// mTLS for the legacy path: verify a TLS 1.0/1.1 `CertificateVerify`. The
-    /// body is a bare `opaque signature<0..2^16-1>`; RSA verifies raw PKCS#1
-    /// v1.5 over `MD5(tr)||SHA1(tr)`, ECDSA over `SHA1(tr)`, where `tr` is the
-    /// transcript through `ClientKeyExchange`.
+    /// mTLS for the legacy path: verify a TLS 1.0/1.1 or SSL 3.0
+    /// `CertificateVerify`. The body is a bare `opaque signature<0..2^16-1>`
+    /// over the transcript `tr` through `ClientKeyExchange`: under TLS
+    /// 1.0/1.1 RSA verifies raw PKCS#1 v1.5 over `MD5(tr)||SHA1(tr)` and
+    /// ECDSA over `SHA1(tr)`; under SSL 3.0 (RFC 6101 §5.6.8) RSA verifies
+    /// the master-keyed cascade [`ssl3::ssl3_certificate_verify`] instead,
+    /// and ECDSA — which RFC 6101 never defined — is refused.
     #[cfg(feature = "tls-legacy")]
     fn on_client_cert_verify_legacy(&mut self, body: &[u8], raw: &[u8]) -> Result<(), Error> {
         let mut c = ReadCursor::new(body);
@@ -2609,21 +2612,31 @@ impl<R: RngCore> ServerConnection12<R> {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let buf = self.transcript.buffered_bytes();
+        let is_ssl3 = self.negotiated_version == ProtocolVersion::SSLv3;
         match leaf_key {
             AnyPublicKey::Rsa(k) => {
-                let mut t = Vec::with_capacity(36);
-                t.extend_from_slice(Md5::digest(buf).as_ref());
-                t.extend_from_slice(Sha1::digest(buf).as_ref());
+                let t: Vec<u8> = if is_ssl3 {
+                    // The master secret exists: this message is only
+                    // accepted after `ClientKeyExchange` derived it.
+                    let master = self.master.as_ref().ok_or(Error::InappropriateState)?;
+                    ssl3::ssl3_certificate_verify(buf, master).to_vec()
+                } else {
+                    let mut t = Vec::with_capacity(36);
+                    t.extend_from_slice(Md5::digest(buf).as_ref());
+                    t.extend_from_slice(Sha1::digest(buf).as_ref());
+                    t
+                };
                 k.verify_pkcs1v15_prehashed(&t, &signature)
                     .map_err(|_| Error::DecryptError)?;
             }
-            AnyPublicKey::Ecdsa(k) => {
+            AnyPublicKey::Ecdsa(k) if !is_ssl3 => {
                 let sig = crate::ec::BoxedEcdsaSignature::from_der(&signature)
                     .map_err(|_| Error::DecryptError)?;
                 k.verify::<Sha1>(buf, &sig)
                     .map_err(|_| Error::DecryptError)?;
             }
-            // No legacy CertificateVerify encoding for Ed25519/Ed448/ML-DSA.
+            // No legacy CertificateVerify encoding for Ed25519/Ed448/ML-DSA,
+            // and none for ECDSA under SSL 3.0.
             _ => return Err(Error::HandshakeFailure),
         }
         self.transcript.update(raw);

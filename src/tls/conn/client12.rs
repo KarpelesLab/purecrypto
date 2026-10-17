@@ -2503,17 +2503,23 @@ impl ClientConnection12 {
                 Some(legacy_session_hash(self.transcript.buffered_bytes()).to_vec());
         }
 
-        // CertificateVerify (RFC 5246 §7.4.8) signs CH..CKE; emit it now, after
-        // the ClientKeyExchange is in the transcript.
-        if send_cert_verify {
-            self.send_client_certificate_verify_legacy()?;
-        }
-
+        // The master secret is derived before a `CertificateVerify` goes out:
+        // SSL 3.0's CertificateVerify digest is keyed by it (RFC 6101
+        // §5.6.8). The inputs are complete at this point on every version —
+        // the EMS session hash was snapshotted above, through CKE, as RFC
+        // 7627 §3 requires.
         let mut premaster = premaster;
         let master = self.legacy_master_secret(&premaster, &cr, &sr);
         // The raw ECDHE/static-RSA premaster is no longer needed once the
         // master secret is derived; scrub it so it does not linger.
         super::wipe(&mut premaster);
+
+        // CertificateVerify (RFC 5246 §7.4.8) signs CH..CKE; emit it now, after
+        // the ClientKeyExchange is in the transcript.
+        if send_cert_verify {
+            self.send_client_certificate_verify_legacy(&master)?;
+        }
+
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
@@ -2531,35 +2537,46 @@ impl ClientConnection12 {
         Ok(())
     }
 
-    /// mTLS on the legacy path: emit a TLS 1.0/1.1 `CertificateVerify`. Unlike
-    /// TLS 1.2 there is no `SignatureAndHashAlgorithm` prefix — an RSA signature
+    /// mTLS on the legacy path: emit a TLS 1.0/1.1 or SSL 3.0
+    /// `CertificateVerify`. Unlike TLS 1.2 there is no
+    /// `SignatureAndHashAlgorithm` prefix — under TLS 1.0/1.1 an RSA signature
     /// is raw PKCS#1 v1.5 over `MD5(handshake) || SHA1(handshake)` (no
     /// DigestInfo) and ECDSA signs `SHA1(handshake)`, over the transcript
-    /// through `ClientKeyExchange`. PKCS#1 v1.5 signing is deterministic, so —
+    /// through `ClientKeyExchange`; under SSL 3.0 (RFC 6101 §5.6.8) RSA signs
+    /// the master-keyed cascade [`ssl3::ssl3_certificate_verify`] instead,
+    /// which is why `master` is needed here, and ECDSA — which RFC 6101 never
+    /// defined — is refused. PKCS#1 v1.5 signing is deterministic, so —
     /// unlike the TLS 1.2 RSA-PSS path — no RNG is needed here.
     #[cfg(feature = "tls-legacy")]
-    fn send_client_certificate_verify_legacy(&mut self) -> Result<(), Error> {
+    fn send_client_certificate_verify_legacy(&mut self, master: &[u8; 48]) -> Result<(), Error> {
         let cc = self
             .config
             .client_cert
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let buf = self.transcript.buffered_bytes().to_vec();
+        let is_ssl3 = self.negotiated_version == ProtocolVersion::SSLv3;
         let signature: Vec<u8> = match cc.key() {
             ClientKey::Rsa(k) => {
-                let mut t = Vec::with_capacity(36);
-                t.extend_from_slice(Md5::digest(&buf).as_ref());
-                t.extend_from_slice(Sha1::digest(&buf).as_ref());
+                let t: Vec<u8> = if is_ssl3 {
+                    ssl3::ssl3_certificate_verify(&buf, master).to_vec()
+                } else {
+                    let mut t = Vec::with_capacity(36);
+                    t.extend_from_slice(Md5::digest(&buf).as_ref());
+                    t.extend_from_slice(Sha1::digest(&buf).as_ref());
+                    t
+                };
                 k.sign_pkcs1v15_prehashed(&t)
                     .map_err(|_| Error::HandshakeFailure)?
             }
-            ClientKey::Ecdsa(k) => k
+            ClientKey::Ecdsa(k) if !is_ssl3 => k
                 .sign::<Sha1>(&buf)
                 .map_err(|_| Error::HandshakeFailure)?
                 .to_der(k.curve()),
             // Ed25519 / Ed448 / ML-DSA have no TLS 1.0/1.1 CertificateVerify
             // encoding (no IANA SignatureScheme without the 1.2 algorithm
-            // negotiation), so they cannot be used for legacy client auth.
+            // negotiation), and ECDSA has none under SSL 3.0, so they cannot
+            // be used for legacy client auth.
             _ => return Err(Error::HandshakeFailure),
         };
         // TLS 1.0/1.1 CertificateVerify body: just `opaque signature<0..2^16-1>`.

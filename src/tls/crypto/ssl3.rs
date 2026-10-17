@@ -169,7 +169,9 @@ pub(crate) fn ssl3_record_mac(
 
 /// One half of the SSL 3.0 Finished (RFC 6101 §5.6.9), for a single hash:
 /// `hash(master ‖ pad2 ‖ hash(handshake ‖ sender ‖ master ‖ pad1))`.
-fn finished_half_md5(handshake: &[u8], sender: &[u8; 4], master: &[u8; 48]) -> [u8; 16] {
+/// `sender` is the 4-byte role tag for Finished and empty for
+/// CertificateVerify (§5.6.8 uses the same cascade without it).
+fn finished_half_md5(handshake: &[u8], sender: &[u8], master: &[u8; 48]) -> [u8; 16] {
     let pad1 = [0x36u8; MD5_PAD_LEN];
     let pad2 = [0x5cu8; MD5_PAD_LEN];
     let mut inner = Md5::new();
@@ -187,7 +189,7 @@ fn finished_half_md5(handshake: &[u8], sender: &[u8; 4], master: &[u8; 48]) -> [
     out
 }
 
-fn finished_half_sha1(handshake: &[u8], sender: &[u8; 4], master: &[u8; 48]) -> [u8; 20] {
+fn finished_half_sha1(handshake: &[u8], sender: &[u8], master: &[u8; 48]) -> [u8; 20] {
     let pad1 = [0x36u8; SHA_PAD_LEN];
     let pad2 = [0x5cu8; SHA_PAD_LEN];
     let mut inner = Sha1::new();
@@ -214,9 +216,63 @@ pub(crate) fn ssl3_finished(handshake: &[u8], sender: &[u8; 4], master: &[u8; 48
     out
 }
 
+/// SSL 3.0 `CertificateVerify` digest (RFC 6101 §5.6.8), 36 bytes: the
+/// Finished cascade **without** the `Sender` tag —
+/// `MD5(master ‖ pad2 ‖ MD5(handshake ‖ master ‖ pad1)) ‖
+/// SHA(master ‖ pad2 ‖ SHA(handshake ‖ master ‖ pad1))` over the handshake
+/// messages through `ClientKeyExchange`. An RSA client signs it raw (PKCS#1
+/// v1.5, no DigestInfo), exactly like the TLS 1.0/1.1 `MD5 ‖ SHA-1` value —
+/// but unlike TLS 1.0 the master secret is an input, so the signature cannot
+/// be produced before the key exchange has been derived.
+pub(crate) fn ssl3_certificate_verify(handshake: &[u8], master: &[u8; 48]) -> [u8; 36] {
+    let mut out = [0u8; 36];
+    out[..16].copy_from_slice(&finished_half_md5(handshake, &[], master));
+    out[16..].copy_from_slice(&finished_half_sha1(handshake, &[], master));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 6101 §5.6.8 spelled out by hand, independently of the shared
+    /// `finished_half_*` helpers: the CertificateVerify digest is the
+    /// master-keyed MD5/SHA-1 cascade over the handshake with **no** Sender
+    /// tag, so it differs from both Finished values over the same transcript.
+    #[test]
+    fn certificate_verify_is_the_senderless_cascade() {
+        let master = [0x99u8; 48];
+        let hs = b"client hello ... client key exchange";
+
+        let mut md5_inner = Md5::new();
+        md5_inner.update(hs);
+        md5_inner.update(&master);
+        md5_inner.update(&[0x36u8; 48]);
+        let md5_inner = md5_inner.finalize();
+        let mut md5_outer = Md5::new();
+        md5_outer.update(&master);
+        md5_outer.update(&[0x5cu8; 48]);
+        md5_outer.update(md5_inner.as_ref());
+
+        let mut sha_inner = Sha1::new();
+        sha_inner.update(hs);
+        sha_inner.update(&master);
+        sha_inner.update(&[0x36u8; 40]);
+        let sha_inner = sha_inner.finalize();
+        let mut sha_outer = Sha1::new();
+        sha_outer.update(&master);
+        sha_outer.update(&[0x5cu8; 40]);
+        sha_outer.update(sha_inner.as_ref());
+
+        let got = ssl3_certificate_verify(hs, &master);
+        assert_eq!(&got[..16], md5_outer.finalize().as_ref());
+        assert_eq!(&got[16..], sha_outer.finalize().as_ref());
+        assert_ne!(got, ssl3_finished(hs, &SENDER_CLIENT, &master));
+        assert_ne!(got, ssl3_finished(hs, &SENDER_SERVER, &master));
+        // And it is not the TLS 1.0 construction (plain MD5 ‖ SHA-1).
+        assert_ne!(&got[..16], Md5::digest(hs).as_ref());
+        assert_ne!(&got[16..], Sha1::digest(hs).as_ref());
+    }
 
     #[test]
     fn salts_grow() {

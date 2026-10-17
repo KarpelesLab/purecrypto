@@ -7346,6 +7346,142 @@ mod tls12_loopback_tests {
         );
     }
 
+    /// T12-F1 — RFC 6101 §5.6.8: SSL 3.0's `CertificateVerify` is the
+    /// master-keyed MD5/SHA-1 cascade (the Finished construction without the
+    /// Sender tag), not TLS 1.0's plain `MD5 ‖ SHA-1`. Both engines used the
+    /// TLS 1.0 form under SSL 3.0 and only agreed with each other. Mutual
+    /// auth over static RSA at SSL 3.0 must complete, and the signature on
+    /// the wire must be over the §5.6.8 digest — checked by re-verifying it
+    /// against the server's master secret.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn ssl3_static_rsa_mutual_auth_uses_the_keyed_certificate_verify() {
+        use super::ClientCertConfig;
+        use crate::test_util::rsa_test_key_b;
+        use crate::tls::codec::{ReadCursor, hs_type, read_record};
+
+        let (server_config, server_cert_der) = rsa_server12();
+        let server_config = server_config
+            .with_min_version(crate::tls::ProtocolVersion::SSLv3)
+            .with_require_ems(false);
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+
+        let client_key = rsa_test_key_b();
+        let name = DistinguishedName::common_name("ssl3-mtls-client");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let client_cert =
+            Certificate::self_signed(&client_key, &name, &validity, 1, false).unwrap();
+        let client_cert_der = client_cert.to_der().to_vec();
+        let boxed_client = BoxedRsaPrivateKey::from_pkcs1_der(&client_key.to_pkcs1_der()).unwrap();
+        let client_pub = boxed_client.public_key();
+
+        let mut server_roots = RootCertStore::new();
+        server_roots.add_der(client_cert_der.clone()).unwrap();
+        let server_config = server_config
+            .with_client_auth(server_roots, true)
+            .with_verification_time(fixture_time());
+
+        let cc = ClientCertConfig::with_rsa(alloc::vec![client_cert_der], boxed_client);
+        let client_cfg = client_config12(roots)
+            .with_min_version(crate::tls::ProtocolVersion::SSLv3)
+            .with_max_version(crate::tls::ProtocolVersion::SSLv3)
+            .with_require_ems(false)
+            .with_client_cert(cc);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ssl3-mtls-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ssl3-mtls-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            client_cfg,
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        // Collect every plaintext handshake message of both flights, in wire
+        // order, so the transcript through ClientKeyExchange can be rebuilt
+        // and the CertificateVerify signature re-checked independently.
+        fn collect(wire: &[u8], into: &mut Vec<(u8, Vec<u8>)>) {
+            let mut rest = wire;
+            while let Some(rec) = read_record(rest).unwrap() {
+                if rec.content_type == crate::tls::ContentType::ChangeCipherSpec {
+                    return; // everything after is encrypted
+                }
+                if rec.content_type == crate::tls::ContentType::Handshake {
+                    let mut cur = ReadCursor::new(&rec.fragment);
+                    while let Ok((ty, body)) = crate::tls::codec::read_handshake(&mut cur) {
+                        into.push((ty, body.to_vec()));
+                    }
+                }
+                rest = &rest[rec.len..];
+            }
+        }
+        let mut hs: Vec<(u8, Vec<u8>)> = Vec::new();
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                collect(&c, &mut hs);
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                collect(&s, &mut hs);
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "client did not finish");
+        assert!(!server.is_handshaking(), "server did not finish");
+        assert_eq!(
+            client.negotiated_protocol_version(),
+            Some(crate::tls::ProtocolVersion::SSLv3)
+        );
+        assert_eq!(server.peer_certificates().len(), 1);
+        assert_eq!(client.master_secret(), server.master_secret());
+
+        // Transcript through ClientKeyExchange (handshake headers included,
+        // as the engines hash it) and the CertificateVerify that follows.
+        let cv_at = hs
+            .iter()
+            .position(|(ty, _)| *ty == hs_type::CERTIFICATE_VERIFY)
+            .expect("client sent CertificateVerify");
+        assert_eq!(hs[cv_at - 1].0, hs_type::CLIENT_KEY_EXCHANGE);
+        let mut transcript = Vec::new();
+        for (ty, body) in &hs[..cv_at] {
+            transcript.push(*ty);
+            transcript.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+            transcript.extend_from_slice(body);
+        }
+        let mut c = ReadCursor::new(&hs[cv_at].1);
+        let signature = c.vec_u16().unwrap().to_vec();
+        c.expect_empty().unwrap();
+
+        let master = server.master_secret().unwrap();
+        let keyed = crate::tls::crypto::ssl3::ssl3_certificate_verify(&transcript, &master);
+        client_pub
+            .verify_pkcs1v15_prehashed(&keyed, &signature)
+            .expect("CertificateVerify signs the RFC 6101 §5.6.8 digest");
+        // And not the TLS 1.0 construction over the same transcript.
+        use crate::hash::Digest as _;
+        let mut tls10 = Vec::with_capacity(36);
+        tls10.extend_from_slice(crate::hash::Md5::digest(&transcript).as_ref());
+        tls10.extend_from_slice(crate::hash::Sha1::digest(&transcript).as_ref());
+        assert!(
+            client_pub
+                .verify_pkcs1v15_prehashed(&tls10, &signature)
+                .is_err()
+        );
+    }
+
     /// BEAST (CVE-2011-3389) applies to every chained-IV CBC version, SSL
     /// 3.0 included: both engines must send application data with the 1/n-1
     /// record split there, exactly as they do for TLS 1.0. Counts the
