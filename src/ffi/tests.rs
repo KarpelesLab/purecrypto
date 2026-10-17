@@ -2953,6 +2953,55 @@ unsafe fn pump_wire_lenient(from: *mut tls::PcTls, to: *mut tls::PcTls) {
     }
 }
 
+/// `pc_quic_cfg_set_versions` must bound `n` before it allocates or reads
+/// anything: a count whose byte length is not even addressable is refused
+/// with `Unsupported` (not an allocation abort or an out-of-range read), and
+/// the configuration is left exactly as the previous valid call set it.
+#[test]
+fn quic_cfg_set_versions_caps_the_count_before_reading() {
+    let cfg = quic::pc_quic_cfg_new(0 /* client */);
+    assert!(!cfg.is_null());
+    let v2_first = [quic::PC_QUIC_V2, quic::PC_QUIC_V1];
+    assert_eq!(
+        unsafe { quic::pc_quic_cfg_set_versions(cfg, v2_first.as_ptr(), v2_first.len()) },
+        PcStatus::Ok
+    );
+    // A valid pointer with a hostile count: refused before any read.
+    assert_eq!(
+        unsafe { quic::pc_quic_cfg_set_versions(cfg, v2_first.as_ptr(), usize::MAX / 8) },
+        PcStatus::Unsupported
+    );
+    assert_eq!(
+        unsafe { quic::pc_quic_cfg_set_versions(cfg, v2_first.as_ptr(), 17) },
+        PcStatus::Unsupported
+    );
+    // The cap is checked before the pointer, so a NULL list with a huge
+    // count is `Unsupported` too; an in-range NULL is still `NullPointer`.
+    assert_eq!(
+        unsafe { quic::pc_quic_cfg_set_versions(cfg, core::ptr::null(), usize::MAX) },
+        PcStatus::Unsupported
+    );
+    assert_eq!(
+        unsafe { quic::pc_quic_cfg_set_versions(cfg, core::ptr::null(), 1) },
+        PcStatus::NullPointer
+    );
+    // The earlier valid setting survived: a connection from this cfg
+    // starts on v2.
+    let sni = b"loopback.example\0";
+    assert_eq!(
+        unsafe { quic::pc_quic_cfg_set_server_name(cfg, sni.as_ptr() as *const core::ffi::c_char) },
+        PcStatus::Ok
+    );
+    set_test_alpn(cfg);
+    let q = unsafe { quic::pc_quic_new(cfg) };
+    unsafe { quic::pc_quic_cfg_free(cfg) };
+    assert!(!q.is_null());
+    let mut v = 0i32;
+    assert_eq!(unsafe { quic::pc_quic_version(q, &mut v) }, PcStatus::Ok);
+    assert_eq!(v, quic::PC_QUIC_V2);
+    unsafe { quic::pc_quic_free(q) };
+}
+
 /// `pc_malloc` memory is handed to the entry points as `size_t *` /
 /// `uint16_t *` / `int32_t *` out-parameters by the wasm glue, so it must be
 /// aligned for any of them; 16 is the documented guarantee.

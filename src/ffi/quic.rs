@@ -487,15 +487,27 @@ pub unsafe extern "C" fn pc_quic_cfg_set_versions(
     n: usize,
 ) -> PcStatus {
     guard(|| {
-        if cfg.is_null() || (n != 0 && versions.is_null()) {
+        if cfg.is_null() {
+            return PcStatus::NullPointer;
+        }
+        // Two versions exist and repeats are rejected, so a list longer
+        // than this is garbage; bound it before any allocation or read
+        // (the same cap-first shape as `pc_tls_cfg_set_groups`), and read
+        // the entries one at a time instead of materialising a slice
+        // whose byte length might not even be addressable.
+        const PC_QUIC_VERSIONS_MAX: usize = 16;
+        if n > PC_QUIC_VERSIONS_MAX {
+            return PcStatus::Unsupported;
+        }
+        if n != 0 && versions.is_null() {
             return PcStatus::NullPointer;
         }
         if n == 0 {
             return PcStatus::Unsupported;
         }
-        let raw = unsafe { core::slice::from_raw_parts(versions, n) };
         let mut vs = Vec::with_capacity(n);
-        for &r in raw {
+        for i in 0..n {
+            let r = unsafe { versions.add(i).read_unaligned() };
             match version_from_i32(r) {
                 Some(v) if !vs.contains(&v) => vs.push(v),
                 _ => return PcStatus::Unsupported,
