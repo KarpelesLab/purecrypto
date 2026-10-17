@@ -17,6 +17,12 @@ const REGISTERED_HEADERS: [&str; 11] = [
     "alg", "jku", "jwk", "kid", "x5u", "x5c", "x5t", "x5t#S256", "typ", "cty", "crit",
 ];
 
+/// Upper bound on the number of signatures accepted in a general-JSON
+/// JWS. Every signature is tried in turn on verification (an RSA or ECDSA
+/// verify each), so the count is a work factor the message controls;
+/// real multi-signature messages have a handful.
+pub const MAX_SIGNATURES: usize = 32;
+
 /// One signature of a JWS: its protected header (verbatim, as it enters
 /// the signing input), optional unprotected header and signature bytes.
 #[derive(Clone, Debug)]
@@ -182,7 +188,7 @@ impl Jws {
                 {
                     return Err(Error::Malformed);
                 }
-                if list.is_empty() {
+                if list.is_empty() || list.len() > MAX_SIGNATURES {
                     return Err(Error::Malformed);
                 }
                 let mut sigs = Vec::with_capacity(list.len());
@@ -716,6 +722,31 @@ mod tests {
                 .unwrap()
                 .verify(&key)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn signature_count_limit() {
+        let one = alloc::format!(
+            r#"{{"protected":"{}","signature":"AA"}}"#,
+            base64url::encode(br#"{"alg":"ES512"}"#)
+        );
+        let build = |n: usize| {
+            alloc::format!(
+                r#"{{"payload":"Zm9v","signatures":[{}]}}"#,
+                alloc::vec![one.as_str(); n].join(",")
+            )
+        };
+        assert_eq!(
+            Jws::parse(&build(MAX_SIGNATURES))
+                .unwrap()
+                .signatures()
+                .len(),
+            MAX_SIGNATURES
+        );
+        assert_eq!(
+            Jws::parse(&build(MAX_SIGNATURES + 1)).unwrap_err(),
+            Error::Malformed
         );
     }
 

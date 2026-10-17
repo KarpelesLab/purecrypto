@@ -63,7 +63,7 @@ mod jws;
 
 pub use jwe::{Jwe, JweRecipient, MAX_PBES2_ITERATIONS, MAX_RECIPIENTS};
 pub use jwk::{EcCurve, Jwk, JwkKey, JwkSet, OkpCurve, RsaPrivateParts};
-pub use jws::{Jws, JwsSignature};
+pub use jws::{Jws, JwsSignature, MAX_SIGNATURES};
 
 use crate::ec::CurveId;
 
