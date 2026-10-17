@@ -198,6 +198,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TlsStream<S> {
         (self.conn, self.sock)
     }
 
+    /// Queues `out` for the socket: as `wbuf` itself when nothing is
+    /// pending (no copy of the records the engine just built), appended
+    /// otherwise.
+    fn queue_out(&mut self, out: Vec<u8>) {
+        if self.wpos >= self.wbuf.len() {
+            self.wbuf = out;
+            self.wpos = 0;
+        } else {
+            self.wbuf.extend_from_slice(&out);
+        }
+    }
+
     /// Flush `wbuf` to the socket without blocking; `Ready(Ok(()))` once empty.
     fn flush_wbuf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.wpos < self.wbuf.len() {
@@ -301,8 +313,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<S> {
                     // ceiling and no backpressure — a peer streaming
                     // `KeyUpdate(update_requested)` could grow it until
                     // the process runs out of memory.
-                    this.wbuf
-                        .extend_from_slice(&this.conn.pop().map_err(ioerr)?);
+                    let out = this.conn.pop().map_err(ioerr)?;
+                    this.queue_out(out);
                     // Best-effort flush: if the socket is not writable right
                     // now the bytes stay in `wbuf` and go out on the next
                     // poll (step 3) or write. `poll_read` must not return
@@ -333,7 +345,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
         ready!(this.flush_wbuf(cx))?;
         this.conn.send(buf).map_err(ioerr)?;
         let out = this.conn.pop().map_err(ioerr)?;
-        this.wbuf.extend_from_slice(&out);
+        this.queue_out(out);
         // Best-effort flush; any remainder is drained by poll_flush.
         if let Poll::Ready(Err(e)) = this.flush_wbuf(cx) {
             return Poll::Ready(Err(e));
@@ -353,7 +365,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
         // Emit close_notify, then flush it before shutting the transport.
         this.conn.close().map_err(ioerr)?;
         let out = this.conn.pop().map_err(ioerr)?;
-        this.wbuf.extend_from_slice(&out);
+        this.queue_out(out);
         ready!(this.flush_wbuf(cx))?;
         Pin::new(&mut this.sock).poll_shutdown(cx)
     }

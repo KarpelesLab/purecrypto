@@ -95,8 +95,12 @@ impl<R: RngCore> ConnectionIo for ServerConnection<R> {
 pub struct Stream<'a, C: ConnectionIo, T: Read + Write> {
     conn: &'a mut C,
     sock: &'a mut T,
-    /// Received plaintext not yet handed to the reader.
+    /// Received plaintext: `pending[pos..]` is not yet handed to the
+    /// reader. A cursor rather than a `drain` per `read`, which moved the
+    /// rest of the buffer down on every call (quadratic for small reads
+    /// of a large record).
     pending: Vec<u8>,
+    pos: usize,
 }
 
 impl<'a, C: ConnectionIo, T: Read + Write> Stream<'a, C, T> {
@@ -106,6 +110,7 @@ impl<'a, C: ConnectionIo, T: Read + Write> Stream<'a, C, T> {
             conn,
             sock,
             pending: Vec::new(),
+            pos: 0,
         }
     }
 
@@ -122,7 +127,8 @@ impl<'a, C: ConnectionIo, T: Read + Write> Stream<'a, C, T> {
     /// Reads one chunk from the transport and processes it. Returns the number
     /// of transport bytes consumed (0 on EOF).
     fn read_and_process(&mut self) -> io::Result<usize> {
-        let mut buf = [0u8; 4096];
+        // A full 16 KiB record plus its framing per transport read.
+        let mut buf = [0u8; 16 * 1024 + 512];
         let n = self.sock.read(&mut buf)?;
         if n == 0 {
             return Ok(0);
@@ -131,8 +137,14 @@ impl<'a, C: ConnectionIo, T: Read + Write> Stream<'a, C, T> {
         self.conn
             .process_new_packets()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        self.pending
-            .extend_from_slice(&self.conn.take_received_plaintext());
+        let plaintext = self.conn.take_received_plaintext();
+        if self.pos >= self.pending.len() {
+            // Nothing left to deliver: take the engine's buffer as is.
+            self.pending = plaintext;
+            self.pos = 0;
+        } else {
+            self.pending.extend_from_slice(&plaintext);
+        }
         Ok(n)
     }
 
@@ -165,7 +177,7 @@ impl<C: ConnectionIo, T: Read + Write> Read for Stream<'_, C, T> {
         if self.conn.is_handshaking() {
             self.complete_handshake()?;
         }
-        while self.pending.is_empty() {
+        while self.pos >= self.pending.len() {
             if self.read_and_process()? == 0 {
                 // Transport EOF. RFC 8446 §6.1: only a received
                 // `close_notify` makes this a clean end of stream. Without
@@ -182,9 +194,13 @@ impl<C: ConnectionIo, T: Read + Write> Read for Stream<'_, C, T> {
                 ));
             }
         }
-        let n = self.pending.len().min(buf.len());
-        buf[..n].copy_from_slice(&self.pending[..n]);
-        self.pending.drain(..n);
+        let n = (self.pending.len() - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
+        self.pos += n;
+        if self.pos == self.pending.len() {
+            self.pending.clear();
+            self.pos = 0;
+        }
         Ok(n)
     }
 }
