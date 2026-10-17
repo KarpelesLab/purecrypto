@@ -2744,10 +2744,9 @@ impl QuicConnection {
     /// `kMinimumWindow` if the batch, with the losses declared before it,
     /// establishes it.
     fn feed_lost_to_cc(&mut self, space: PnSpaceId, lost: &[SentPacket], now: Duration) {
-        let in_flight: Vec<SentPacket> = lost.iter().filter(|p| p.in_flight).cloned().collect();
-        if !in_flight.is_empty() {
-            self.endpoint.cc.on_packets_lost(&in_flight, now);
-        }
+        self.endpoint
+            .cc
+            .on_packets_lost(lost.iter().filter(|p| p.in_flight), now);
         if self.endpoint.loss.record_lost_batch(space, lost, now) {
             self.endpoint.cc.on_persistent_congestion();
         }
@@ -6279,11 +6278,9 @@ impl QuicConnection {
                         now,
                     );
                     // 4. Filter ack to in-flight and feed CC.
-                    let in_flight_acked: Vec<SentPacket> =
-                        acked.iter().filter(|p| p.in_flight).cloned().collect();
-                    if !in_flight_acked.is_empty() {
-                        self.endpoint.cc.on_packets_acked(&in_flight_acked);
-                    }
+                    self.endpoint
+                        .cc
+                        .on_packets_acked(acked.iter().filter(|p| p.in_flight));
                     // 4a. ECN (RFC 9000 §13.4 / RFC 9002 §7.3): validate the
                     //     peer's echoed counts and react to new CE marks. Only
                     //     the application space drives congestion control here.

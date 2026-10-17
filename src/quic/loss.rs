@@ -103,6 +103,24 @@ pub(crate) struct StreamHint {
     pub(crate) fin: bool,
 }
 
+/// A run of acknowledged packets' send times, `first..=last`, in which
+/// every two consecutive packets were sent less than [`K_GRANULARITY`]
+/// apart. [`LossState::acked_send_times`] stores acknowledgments this way
+/// instead of one entry per packet: a bulk flow acknowledges thousands of
+/// packets per persistent-congestion window, and a span answers the only
+/// question asked of the record — did anything sent during a candidate
+/// period get through? — exactly. The period is at least
+/// `3 × kGranularity` long ([`LossState::persistent_congestion_duration`]),
+/// so no two packets of one span can straddle it: a span either has a
+/// packet inside the period or lies wholly outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AckedSpan {
+    /// Send time of the earliest packet of the run.
+    first: Duration,
+    /// Send time of the latest packet of the run.
+    last: Duration,
+}
+
 /// What [`LossState`] remembers of a packet it declared lost, for the RFC
 /// 9002 §7.6 persistent-congestion test across loss batches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,16 +199,16 @@ pub(crate) struct LossState {
     // ---- Persistent congestion (RFC 9002 §7.6) ------------------------------
     /// `time_sent` of every acknowledged packet that was sent no earlier
     /// than the oldest packet still in flight or the oldest entry of
-    /// [`Self::lost_history`], across all packet-number spaces.
-    /// [`Self::in_persistent_congestion`] consults it to tell an
-    /// acknowledged packet apart from a lost one when it checks that nothing
-    /// sent between two lost packets got through (§7.6.2). Anything older
-    /// can never fall between two packets a future batch could pair, so
-    /// [`Self::prune_acked_send_times`] drops it; the packet threshold keeps
-    /// the oldest in-flight packet within a few packet numbers of the
-    /// largest acknowledged one, and the history is time-bounded, which
-    /// keeps this short.
-    acked_send_times: Vec<Duration>,
+    /// [`Self::lost_history`], across all packet-number spaces, as sorted,
+    /// disjoint [`AckedSpan`]s. [`Self::in_persistent_congestion`] consults
+    /// it to tell an acknowledged packet apart from a lost one when it
+    /// checks that nothing sent between two lost packets got through
+    /// (§7.6.2). Anything older can never fall between two packets a future
+    /// batch could pair, so [`Self::prune_acked_send_times`] drops it; the
+    /// packet threshold keeps the oldest in-flight packet within a few
+    /// packet numbers of the largest acknowledged one, and the history is
+    /// time-bounded, which keeps this short.
+    acked_send_times: Vec<AckedSpan>,
     /// Packets declared lost by earlier batches that could still be the
     /// older edge of a persistent-congestion period. The reference §B.8
     /// judges each `DetectAndRemoveLostPackets` batch on its own, but a
@@ -409,14 +427,13 @@ impl LossState {
         // CPU-exhaustion DoS). `BTreeMap::range` bounds the work by the number
         // of packets we are tracking, not by the width of the range, and is
         // behaviourally identical for legitimate ACKs.
+        //
+        // Each removal re-enters the map at the range's start: one
+        // `O(log n)` probe per acknowledged packet and no scratch
+        // allocation, instead of collecting the keys first.
         let ps = &mut self.per_space[space as usize];
         for r in acked_ranges {
-            let pns: Vec<u64> = ps
-                .sent_packets
-                .range(*r.start()..=*r.end())
-                .map(|(k, _)| *k)
-                .collect();
-            for pn in pns {
+            while let Some((&pn, _)) = ps.sent_packets.range(*r.start()..=*r.end()).next() {
                 if let Some(p) = ps.sent_packets.remove(&pn) {
                     newly_acked.push(p);
                 }
@@ -431,13 +448,16 @@ impl LossState {
 
         // RTT sample: §A.7 step "If the largest acknowledged is newly
         // acked and at least one ack-eliciting packet was newly acked".
-        let largest_newly_acked = newly_acked.iter().find(|p| p.pn == frame_largest).cloned();
+        let largest_newly_acked_sent = newly_acked
+            .iter()
+            .find(|p| p.pn == frame_largest)
+            .map(|p| p.time_sent);
         let any_ack_eliciting_newly_acked = newly_acked.iter().any(|p| p.ack_eliciting);
-        if let Some(largest_pkt) = largest_newly_acked
+        if let Some(time_sent) = largest_newly_acked_sent
             && any_ack_eliciting_newly_acked
         {
             // RFC 9002 §5.3 — UpdateRtt.
-            let latest = now.saturating_sub(largest_pkt.time_sent);
+            let latest = now.saturating_sub(time_sent);
             self.update_rtt(latest, ack_delay, space, now);
         }
 
@@ -446,8 +466,9 @@ impl LossState {
         // packets did get through. The loss history is aged first: what it
         // still holds decides how far back the acknowledgments must reach.
         self.prune_lost_history(now);
-        self.acked_send_times
-            .extend(newly_acked.iter().map(|p| p.time_sent));
+        for p in &newly_acked {
+            self.record_acked_send_time(p.time_sent);
+        }
         self.prune_acked_send_times();
 
         // §A.7 step "DetectAndRemoveLostPackets" is invoked separately by
@@ -567,17 +588,18 @@ impl LossState {
         // `largest_acked` is packet-threshold lost), so every packet is
         // visited O(1) times amortized. Keys are collected first so the
         // matching ones can be removed without holding the iterator.
-        let candidate_pns: Vec<u64> = ps
-            .sent_packets
-            .range(..=largest_acked)
-            .map(|(&pn, _)| pn)
-            .collect();
-        #[cfg(test)]
-        {
-            self.detect_lost_visits += candidate_pns.len() as u64;
-        }
-        for pn in candidate_pns {
-            let p = ps.sent_packets.get(&pn).expect("just-listed key");
+        // The walk re-enters the map after each visited key — one `O(log n)`
+        // probe per candidate — so it needs no scratch allocation.
+        let mut cursor = 0u64;
+        while let Some((&pn, p)) = ps.sent_packets.range(cursor..=largest_acked).next() {
+            cursor = match pn.checked_add(1) {
+                Some(c) => c,
+                None => break,
+            };
+            #[cfg(test)]
+            {
+                self.detect_lost_visits += 1;
+            }
             // Packet-threshold (§6.1.1): `largest_acked − pn ≥
             // kPacketThreshold`.
             let is_threshold_lost = largest_acked.saturating_sub(pn) >= K_PACKET_THRESHOLD;
@@ -651,6 +673,50 @@ impl LossState {
             .persistent_congestion_declared
             .map_or(first_sample, |declared| first_sample.max(declared));
         let duration = self.persistent_congestion_duration();
+        // §7.6.2 span pre-check: the period's edges are two ack-eliciting
+        // losses sent after `floor` at least `duration` apart, so when the
+        // earliest and the latest candidate edge are closer than that no
+        // pair can be. One O(history + batch) pass settles the overwhelmingly
+        // common case — every loss batch of an ordinarily lossy path — before
+        // anything is gathered or sorted.
+        let (mut earliest, mut latest) = (Duration::MAX, Duration::ZERO);
+        let edges = self
+            .lost_history
+            .iter()
+            .filter(|r| r.ack_eliciting)
+            .map(|r| r.time_sent)
+            .chain(lost.iter().filter(|p| p.ack_eliciting).map(|p| p.time_sent))
+            .filter(|&t| t > floor);
+        for t in edges {
+            earliest = earliest.min(t);
+            latest = latest.max(t);
+        }
+        if earliest > latest || latest.saturating_sub(earliest) < duration {
+            return false;
+        }
+        // Second pre-check, on the acknowledgments: no packet sent during a
+        // persistent-congestion period was acknowledged, so the period lies
+        // in a gap of the (sorted, disjoint) acknowledged record at least
+        // `duration` long, within the edges found above. Under sustained
+        // moderate loss the history spans more than `duration` and the first
+        // check passes, but acknowledgments arrive all along, so this one
+        // settles it in O(spans) — a handful — without gathering the losses
+        // or the packets in flight.
+        let mut cursor = earliest;
+        let mut gap_fits = false;
+        for span in &self.acked_send_times {
+            if span.last < cursor {
+                continue;
+            }
+            if span.first.min(latest).saturating_sub(cursor) >= duration {
+                gap_fits = true;
+                break;
+            }
+            cursor = cursor.max(span.last);
+        }
+        if !gap_fits && latest.saturating_sub(cursor) < duration {
+            return false;
+        }
         let mut losses: Vec<(Duration, bool)> = self
             .lost_history
             .iter()
@@ -662,27 +728,41 @@ impl LossState {
         // F5: the "anything between two losses got through?" question is
         // asked once per consecutive pair, so answering it by scanning every
         // acknowledged send time and every packet in flight made the check
-        // O(losses × (acked + in flight)) per loss batch. Sort both sets
-        // once and binary-search each pair instead.
-        let mut acked: Vec<Duration> = self.acked_send_times.clone();
-        acked.sort_unstable();
-        let mut outstanding: Vec<Duration> = self
-            .per_space
-            .iter()
-            .flat_map(|ps| ps.sent_packets.values().map(|q| q.time_sent))
-            .collect();
-        outstanding.sort_unstable();
+        // O(losses × (acked + in flight)) per loss batch. Binary-search each
+        // pair instead: `acked_send_times` is kept sorted, and within a
+        // packet-number space packet-number order is send order, so each
+        // space's in-flight send times come out sorted as well (checked —
+        // a clock that is not monotonic is tolerated, not relied upon).
+        let acked: &[AckedSpan] = &self.acked_send_times;
+        let outstanding: [Vec<Duration>; 3] = core::array::from_fn(|i| {
+            let mut v: Vec<Duration> = self.per_space[i]
+                .sent_packets
+                .values()
+                .map(|q| q.time_sent)
+                .collect();
+            if !v.is_sorted() {
+                v.sort_unstable();
+            }
+            v
+        });
         // §7.6.2 — did anything sent between two lost packets (sent at `lo`
         // and `hi`, in any space) get acknowledged, or is it still awaiting
         // a verdict? An acknowledgment counts even for a packet sent in the
         // same instant as an edge (something sent then did get through); a
         // packet still in flight only counts strictly between, since the
         // packet threshold routinely declares a packet lost while its
-        // same-instant successors are still pending.
+        // same-instant successors are still pending. A span overlapping
+        // `lo..=hi` stands for an acknowledged packet in it: that may
+        // over-report progress for one pair (its packets could sit on either
+        // side of a sub-granularity pair), never for a whole period, and only
+        // the period's verdict matters.
         let progress_between = |lo: Duration, hi: Duration| -> bool {
-            acked.partition_point(|&t| t < lo) < acked.partition_point(|&t| t <= hi)
-                || outstanding.partition_point(|&t| t <= lo)
-                    < outstanding.partition_point(|&t| t < hi)
+            acked
+                .get(acked.partition_point(|s| s.last < lo))
+                .is_some_and(|s| s.first <= hi)
+                || outstanding
+                    .iter()
+                    .any(|o| o.partition_point(|&t| t <= lo) < o.partition_point(|&t| t < hi))
         };
         // `run_start`: send time of the earliest ack-eliciting packet of the
         // current run of losses with nothing acknowledged or outstanding in
@@ -749,10 +829,49 @@ impl LossState {
         self.lost_history.retain(|r| r.time_sent > floor);
     }
 
+    /// Records the send time of an acknowledged packet in
+    /// [`Self::acked_send_times`], keeping the spans sorted and disjoint.
+    /// Acknowledgments arrive in nearly send order, so this extends the
+    /// last span or starts a new one; an older packet acknowledged late
+    /// either already lies within a span or becomes a span of its own.
+    fn record_acked_send_time(&mut self, time_sent: Duration) {
+        match self.acked_send_times.last_mut() {
+            Some(span) if time_sent >= span.last => {
+                if time_sent - span.last < K_GRANULARITY {
+                    span.last = time_sent;
+                } else {
+                    self.acked_send_times.push(AckedSpan {
+                        first: time_sent,
+                        last: time_sent,
+                    });
+                }
+            }
+            Some(_) => {
+                let at = self
+                    .acked_send_times
+                    .partition_point(|s| s.last < time_sent);
+                if self.acked_send_times[at].first > time_sent {
+                    self.acked_send_times.insert(
+                        at,
+                        AckedSpan {
+                            first: time_sent,
+                            last: time_sent,
+                        },
+                    );
+                }
+            }
+            None => self.acked_send_times.push(AckedSpan {
+                first: time_sent,
+                last: time_sent,
+            }),
+        }
+    }
+
     /// Drops every recorded acknowledged send time older than both the
     /// oldest packet still in flight in any space and the oldest recorded
     /// loss (all of them once neither exists): no future loss batch can
-    /// have an edge sent before that.
+    /// have an edge sent before that. The record is sorted, so what goes is
+    /// a prefix.
     fn prune_acked_send_times(&mut self) {
         let oldest = self
             .per_space
@@ -761,7 +880,10 @@ impl LossState {
             .chain(self.lost_history.iter().map(|r| r.time_sent))
             .min();
         match oldest {
-            Some(t) => self.acked_send_times.retain(|&a| a >= t),
+            Some(t) => {
+                let stale = self.acked_send_times.partition_point(|s| s.last < t);
+                self.acked_send_times.drain(..stale);
+            }
             None => self.acked_send_times.clear(),
         }
     }
@@ -2039,7 +2161,13 @@ mod tests {
         assert_eq!(s.lost_history.len(), 5);
         // The record of the ACK that revealed them stays as long as the
         // history reaches back to 200 ms.
-        assert_eq!(s.acked_send_times, alloc::vec![ms(1600)]);
+        assert_eq!(
+            s.acked_send_times,
+            alloc::vec![AckedSpan {
+                first: ms(1600),
+                last: ms(1600)
+            }]
+        );
 
         let mut t = 1700u64;
         for pn in 7..=200u64 {

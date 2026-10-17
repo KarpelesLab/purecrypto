@@ -88,7 +88,7 @@ impl NewReno {
     /// in flight"). For each: drops `sent_bytes` off `bytes_in_flight`;
     /// if not in recovery, grows the window (slow-start if `cwnd <
     /// ssthresh`, else congestion-avoidance).
-    pub(crate) fn on_packets_acked(&mut self, acked: &[SentPacket]) {
+    pub(crate) fn on_packets_acked<'a>(&mut self, acked: impl IntoIterator<Item = &'a SentPacket>) {
         for p in acked {
             debug_assert!(p.in_flight, "caller must filter to in-flight packets");
             self.bytes_in_flight = self.bytes_in_flight.saturating_sub(p.sent_bytes as u64);
@@ -118,18 +118,21 @@ impl NewReno {
     /// the loss state's ([`crate::quic::loss::LossState::in_persistent_congestion`]);
     /// when it holds, the connection follows up with
     /// [`Self::on_persistent_congestion`].
-    pub(crate) fn on_packets_lost(&mut self, lost: &[SentPacket], _now: Duration) {
-        if lost.is_empty() {
-            return;
-        }
-        let mut most_recent_time = Duration::ZERO;
+    pub(crate) fn on_packets_lost<'a>(
+        &mut self,
+        lost: impl IntoIterator<Item = &'a SentPacket>,
+        _now: Duration,
+    ) {
+        let mut most_recent_time: Option<Duration> = None;
         for p in lost {
             self.bytes_in_flight = self.bytes_in_flight.saturating_sub(p.sent_bytes as u64);
-            if p.time_sent > most_recent_time {
-                most_recent_time = p.time_sent;
+            if most_recent_time.is_none_or(|t| p.time_sent > t) {
+                most_recent_time = Some(p.time_sent);
             }
         }
-        self.on_new_congestion_event(most_recent_time);
+        if let Some(t) = most_recent_time {
+            self.on_new_congestion_event(t);
+        }
     }
 
     /// RFC 9002 Appendix B — `OnCongestionEvent`.
