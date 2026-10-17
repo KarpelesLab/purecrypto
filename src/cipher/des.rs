@@ -47,7 +47,15 @@
 //! straddling two. An adversary who can observe cache-line granularity
 //! therefore learns nothing about which entry was read — without alignment,
 //! the split leaked roughly one extra bit of the secret index per lookup,
-//! 128 lookups per block.
+//! 128 lookups per block. The P-box is applied through a second lookup
+//! per S-box, a 16-entry table of the P-spread nibble (also one line each);
+//! its index is the S-box output, the same secret the first lookup already
+//! exposed, so it adds no new leak.
+//!
+//! The fixed bit permutations are not table loops: IP/FP are a byte swap, a
+//! three-step 8×8 bit transpose and a byte unzip (delta swaps with constant
+//! masks), E reads its eight 6-bit fields off a rotated doubled `R`, and the
+//! S-boxes are stored in direct 6-bit-index order.
 //!
 //! Parity bits in the 64-bit key encoding (bits 8, 16, 24, 32, 40, 48,
 //! 56, 64 per FIPS 46-3 §3) are silently ignored by the key schedule;
@@ -65,7 +73,8 @@ use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Initial Permutation (FIPS 46-3 §8.1): output bit `i` ← input bit
 /// `IP[i-1]`, where bit 1 is the most-significant bit of the 64-bit
-/// block.
+/// block. Test oracle for [`ip`].
+#[cfg(test)]
 #[rustfmt::skip]
 const IP: [u8; 64] = [
     58, 50, 42, 34, 26, 18, 10,  2,
@@ -78,7 +87,9 @@ const IP: [u8; 64] = [
     63, 55, 47, 39, 31, 23, 15,  7,
 ];
 
-/// Final Permutation (FIPS 46-3 §8.1): the inverse of [`IP`].
+/// Final Permutation (FIPS 46-3 §8.1): the inverse of [`IP`]. Test oracle
+/// for [`fp`].
+#[cfg(test)]
 #[rustfmt::skip]
 const FP: [u8; 64] = [
     40,  8, 48, 16, 56, 24, 64, 32,
@@ -92,7 +103,8 @@ const FP: [u8; 64] = [
 ];
 
 /// Expansion function E (FIPS 46-3 §8.1): expands the 32-bit right half
-/// to 48 bits for XOR with the round key.
+/// to 48 bits for XOR with the round key. Test oracle for [`expand`].
+#[cfg(test)]
 #[rustfmt::skip]
 const E: [u8; 48] = [
     32,  1,  2,  3,  4,  5,
@@ -106,7 +118,7 @@ const E: [u8; 48] = [
 ];
 
 /// P-box (FIPS 46-3 §8.1): the 32-bit permutation applied after the
-/// S-box layer in the F-function.
+/// S-box layer in the F-function. Folded into [`SP`] at compile time.
 #[rustfmt::skip]
 const P: [u8; 32] = [
     16,  7, 20, 21, 29, 12, 28, 17,
@@ -231,6 +243,62 @@ const S: [SBox; 8] = [
     ]),
 ];
 
+/// The S-boxes of [`S`] re-indexed by the raw 6-bit chunk `b1..b6`
+/// (`row = b1 b6`, `column = b2..b5`), so a lookup needs no index shuffle.
+const S6: [SBox; 8] = {
+    let mut out = [const { SBox([0; 64]) }; 8];
+    let mut k = 0;
+    while k < 8 {
+        let mut chunk = 0;
+        while chunk < 64 {
+            let row = ((chunk & 0b100000) >> 4) | (chunk & 1);
+            let col = (chunk >> 1) & 0b1111;
+            out[k].0[chunk] = S[k].0[row * 16 + col];
+            chunk += 1;
+        }
+        k += 1;
+    }
+    out
+};
+
+/// One S-box's P-spread outputs, aligned to a cache line (see [`SBox`]).
+#[repr(align(64))]
+struct Spread([u32; 16]);
+
+/// `SP[k][v]` is the 4-bit output `v` of S-box `k` placed where the P-box
+/// sends its four bits, as a right-justified 32-bit value (FIPS bit 1 at
+/// u32 bit 31): the F-function's P step is the XOR of the eight lookups.
+const SP: [Spread; 8] = {
+    let mut out = [const { Spread([0; 16]) }; 8];
+    let mut k = 0;
+    while k < 8 {
+        let mut v = 0;
+        while v < 16 {
+            let mut word = 0u32;
+            let mut j = 0;
+            while j < 4 {
+                if (v >> (3 - j)) & 1 == 1 {
+                    // Pre-P FIPS bit 4k+j+1 lands at the output position i
+                    // with P[i] == 4k+j+1.
+                    let src = (4 * k + j + 1) as u8;
+                    let mut i = 0;
+                    while i < 32 {
+                        if P[i] == src {
+                            word |= 1 << (31 - i);
+                        }
+                        i += 1;
+                    }
+                }
+                j += 1;
+            }
+            out[k].0[v] = word;
+            v += 1;
+        }
+        k += 1;
+    }
+    out
+};
+
 // ---- Bit-level helpers -------------------------------------------------
 
 /// Permutes `input` (a right-justified `from_bits`-bit value: FIPS
@@ -239,7 +307,8 @@ const S: [SBox; 8] = [
 ///
 /// `from_bits` and `to_bits` are compile-time constants of the FIPS spec,
 /// so this loop runs in `table.len()` iterations with no key-dependent
-/// branches.
+/// branches. Used by the key schedule (PC-1 / PC-2, once per key) and as
+/// the test oracle for the delta-swap forms of the per-block permutations.
 #[inline]
 fn permute(input: u64, from_bits: u32, table: &[u8], to_bits: u32) -> u64 {
     let mut out: u64 = 0;
@@ -248,6 +317,55 @@ fn permute(input: u64, from_bits: u32, table: &[u8], to_bits: u32) -> u64 {
         out |= bit << (to_bits - 1 - i as u32);
     }
     out
+}
+
+/// Swaps the bits of `x` selected by `mask` with the bits `shift` places
+/// above them (a "delta swap"; an involution).
+#[inline(always)]
+fn delta_swap(x: u64, mask: u64, shift: u32) -> u64 {
+    let t = ((x >> shift) ^ x) & mask;
+    x ^ t ^ (t << shift)
+}
+
+/// Transposes the 8×8 bit matrix held in `x` (byte `j` bit `i` ↔ byte `i`
+/// bit `j`, little-endian numbering), Hacker's Delight §7-3. An involution.
+#[inline(always)]
+fn transpose8(x: u64) -> u64 {
+    let x = delta_swap(x, 0x00aa_00aa_00aa_00aa, 7);
+    let x = delta_swap(x, 0x0000_cccc_0000_cccc, 14);
+    delta_swap(x, 0x0000_0000_f0f0_f0f0, 28)
+}
+
+/// The Initial Permutation on a big-endian block word. IP reads the input
+/// as an 8×8 bit matrix and emits its columns 2, 4, 6, 8, 1, 3, 5, 7 (FIPS
+/// numbering), each from the last row to the first: a byte reversal, the
+/// transpose, and an unzip of the odd/even bytes (two delta swaps and a
+/// half-word rotate). Pinned to the [`IP`] table by `ip_fp_match_tables`.
+#[inline(always)]
+fn ip(x: u64) -> u64 {
+    let x = transpose8(x.swap_bytes());
+    let x = delta_swap(x, 0x0000_ff00_0000_ff00, 8);
+    let x = delta_swap(x, 0x0000_0000_ffff_0000, 16);
+    x.rotate_left(32)
+}
+
+/// The Final Permutation: [`ip`] undone step by step.
+#[inline(always)]
+fn fp(x: u64) -> u64 {
+    let x = x.rotate_left(32);
+    let x = delta_swap(x, 0x0000_0000_ffff_0000, 16);
+    let x = delta_swap(x, 0x0000_ff00_0000_ff00, 8);
+    transpose8(x).swap_bytes()
+}
+
+/// The expansion E as eight 6-bit S-box inputs: group `k` is bits
+/// `4k, 4k+1, …, 4k+5` of `R` (FIPS numbering, cyclic), i.e. six
+/// consecutive bits of `R` rotated right by one, read off a doubled copy so
+/// the last group wraps. Pinned to the [`E`] table by `expand_matches_table`.
+#[inline(always)]
+fn expand(r: u32) -> [u8; 8] {
+    let w = ((u64::from(r) << 32) | u64::from(r)).rotate_right(1);
+    core::array::from_fn(|k| ((w >> (58 - 4 * k)) as u8) & 0x3f)
 }
 
 /// 28-bit left-rotation, used for the `C` / `D` halves in the key
@@ -273,35 +391,26 @@ fn store_be(state: u64, block: &mut [u8; 8]) {
 
 // ---- F-function and key schedule ---------------------------------------
 
-/// The DES F-function: expansion E, XOR with round key, 8 S-box
-/// substitutions, then permutation P. The round-key argument is a
-/// right-justified 48-bit value (FIPS bit 1 at u64 bit 47).
-fn feistel_f(r: u32, round_key: u64) -> u32 {
-    // E: 32 → 48 bits, right-justified. Input is a right-justified
-    // u32 (FIPS bit 1 at u32 bit 31).
-    let expanded = permute(r as u64, 32, &E, 48);
-    let xored = expanded ^ round_key;
-    // Extract eight 6-bit groups. With the 48-bit value right-
-    // justified, FIPS bits (6k+1..6k+6) sit at u64 bits 47-6k..42-6k.
-    let mut sbox_out: u64 = 0;
-    for (k, sbox) in S.iter().enumerate() {
-        let chunk = ((xored >> (42 - 6 * k)) & 0x3f) as usize;
-        // FIPS row: bits 1 and 6 of the 6-bit chunk (the MSB and LSB).
-        let row = ((chunk & 0b100000) >> 4) | (chunk & 0b000001);
-        let col = (chunk >> 1) & 0b1111;
-        let s = sbox[row * 16 + col] as u64;
-        // Place the 4-bit S-box output into the right-justified 32-bit
-        // pre-P value. FIPS bits (4k+1..4k+4) sit at u64 bits 31-4k..28-4k.
-        sbox_out |= s << (28 - 4 * k);
+/// A round key as its eight 6-bit S-box chunks (`b1..b6` of chunk `k` in
+/// the low six bits of byte `k`).
+type RoundKey = [u8; 8];
+
+/// The DES F-function: expansion E, XOR with the round key, 8 S-box
+/// substitutions, then permutation P (through the [`SP`] spreads).
+#[inline(always)]
+fn feistel_f(r: u32, round_key: &RoundKey) -> u32 {
+    let e = expand(r);
+    let mut out = 0u32;
+    for k in 0..8 {
+        let idx = (e[k] ^ round_key[k]) as usize;
+        out ^= SP[k].0[S6[k][idx] as usize];
     }
-    // P: 32 → 32 bits, right-justified.
-    permute(sbox_out, 32, &P, 32) as u32
+    out
 }
 
-/// Expands a 64-bit DES key (8 parity bits ignored) into the 16
-/// 48-bit round keys, each a right-justified 48-bit `u64` (FIPS bit 1
-/// at u64 bit 47).
-fn key_schedule(key: u64) -> [u64; 16] {
+/// Expands a 64-bit DES key (8 parity bits ignored) into the 16 round
+/// keys, each split into its eight 6-bit chunks.
+fn key_schedule(key: u64) -> [RoundKey; 16] {
     // PC-1: 64 → 56 bits, right-justified. Input `key` is also
     // right-justified 64-bit (`load_be` of an 8-byte key).
     let mut pc1 = permute(key, 64, &PC1, 56);
@@ -310,14 +419,20 @@ fn key_schedule(key: u64) -> [u64; 16] {
     let mask28 = (1u32 << 28) - 1;
     let mut c = ((pc1 >> 28) as u32) & mask28;
     let mut d = (pc1 as u32) & mask28;
-    let mut rk = [0u64; 16];
+    let mut rk = [[0u8; 8]; 16];
     let mut cd = 0u64;
+    let mut k48 = 0u64;
     for i in 0..16 {
         c = rol28(c, SHIFTS[i] as u32);
         d = rol28(d, SHIFTS[i] as u32);
-        // Re-pack C || D as a 56-bit right-justified u64 for PC-2.
+        // Re-pack C || D as a 56-bit right-justified u64 for PC-2, then
+        // split the 48-bit result (FIPS bit 1 at u64 bit 47) into chunks:
+        // FIPS bits 6k+1..6k+6 sit at u64 bits 47-6k..42-6k.
         cd = ((c as u64) << 28) | (d as u64);
-        rk[i] = permute(cd, 56, &PC2, 48);
+        k48 = permute(cd, 56, &PC2, 48);
+        for (k, chunk) in rk[i].iter_mut().enumerate() {
+            *chunk = ((k48 >> (42 - 6 * k)) & 0x3f) as u8;
+        }
     }
     // `pc1` and the rotating halves are the 56 effective key bits (PC-1 is a
     // permutation, so the key is read straight off them); scrub the frame.
@@ -325,16 +440,17 @@ fn key_schedule(key: u64) -> [u64; 16] {
     c.zeroize();
     d.zeroize();
     cd.zeroize();
+    k48.zeroize();
     rk
 }
 
 /// Encrypts one block using already-scheduled round keys, in order
 /// `rk[0..16]`.
-fn des_encrypt_with(rk: &[u64; 16], block: &mut [u8; 8]) {
-    let mut state = permute(load_be(block), 64, &IP, 64);
+fn des_encrypt_with(rk: &[RoundKey; 16], block: &mut [u8; 8]) {
+    let mut state = ip(load_be(block));
     let mut l = (state >> 32) as u32;
     let mut r = state as u32;
-    for &k in rk.iter() {
+    for k in rk.iter() {
         let tmp = r;
         r = l ^ feistel_f(r, k);
         l = tmp;
@@ -342,23 +458,23 @@ fn des_encrypt_with(rk: &[u64; 16], block: &mut [u8; 8]) {
     // After 16 rounds, the spec calls for a final swap (the "R16 L16"
     // ordering before FP).
     state = ((r as u64) << 32) | (l as u64);
-    state = permute(state, 64, &FP, 64);
+    state = fp(state);
     store_be(state, block);
 }
 
 /// Decrypts one block using already-scheduled round keys, applied in
 /// reverse order.
-fn des_decrypt_with(rk: &[u64; 16], block: &mut [u8; 8]) {
-    let mut state = permute(load_be(block), 64, &IP, 64);
+fn des_decrypt_with(rk: &[RoundKey; 16], block: &mut [u8; 8]) {
+    let mut state = ip(load_be(block));
     let mut l = (state >> 32) as u32;
     let mut r = state as u32;
-    for &k in rk.iter().rev() {
+    for k in rk.iter().rev() {
         let tmp = r;
         r = l ^ feistel_f(r, k);
         l = tmp;
     }
     state = ((r as u64) << 32) | (l as u64);
-    state = permute(state, 64, &FP, 64);
+    state = fp(state);
     store_be(state, block);
 }
 
@@ -370,7 +486,7 @@ fn des_decrypt_with(rk: &[u64; 16], block: &mut [u8; 8]) {
 /// docs.
 #[derive(Clone)]
 pub struct Des {
-    rk: [u64; 16],
+    rk: [RoundKey; 16],
 }
 
 impl Des {
@@ -414,9 +530,9 @@ impl ZeroizeOnDrop for Des {}
 /// not use for new code.
 #[derive(Clone)]
 pub struct TdesEde3 {
-    k1: [u64; 16],
-    k2: [u64; 16],
-    k3: [u64; 16],
+    k1: [RoundKey; 16],
+    k2: [RoundKey; 16],
+    k3: [RoundKey; 16],
 }
 
 impl TdesEde3 {
@@ -474,8 +590,8 @@ impl ZeroizeOnDrop for TdesEde3 {}
 /// envelope). **Legacy.** Sweet32-vulnerable. Do not use for new code.
 #[derive(Clone)]
 pub struct TdesEde2 {
-    k1: [u64; 16],
-    k2: [u64; 16],
+    k1: [RoundKey; 16],
+    k2: [RoundKey; 16],
 }
 
 impl TdesEde2 {
@@ -599,6 +715,61 @@ impl<C: BlockCipher64> ZeroizeOnDrop for Cbc64<C> {}
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The delta-swap IP/FP must equal the FIPS tables and invert each
+    /// other.
+    #[test]
+    fn ip_fp_match_tables() {
+        let mut s = 0x0123_4567_89ab_cdefu64;
+        for _ in 0..4096 {
+            let x = xorshift(&mut s);
+            assert_eq!(ip(x), permute(x, 64, &IP, 64), "IP of {x:#018x}");
+            assert_eq!(fp(x), permute(x, 64, &FP, 64), "FP of {x:#018x}");
+            assert_eq!(fp(ip(x)), x);
+        }
+    }
+
+    /// The rotate-and-mask expansion must equal the E table.
+    #[test]
+    fn expand_matches_table() {
+        let mut s = 0xdead_beef_cafe_babeu64;
+        for _ in 0..4096 {
+            let r = xorshift(&mut s) as u32;
+            let want = permute(u64::from(r), 32, &E, 48);
+            let got = expand(r);
+            for (k, &chunk) in got.iter().enumerate() {
+                assert_eq!(u64::from(chunk), (want >> (42 - 6 * k)) & 0x3f, "group {k}");
+            }
+        }
+    }
+
+    /// The 6-bit-indexed S-boxes and the P spreads must reproduce the
+    /// row/column lookup followed by the P table for every S-box and input.
+    #[test]
+    fn s6_and_sp_match_tables() {
+        for (k, (s6, sp)) in S6.iter().zip(SP.iter()).enumerate() {
+            for chunk in 0..64usize {
+                let row = ((chunk & 0b100000) >> 4) | (chunk & 1);
+                let col = (chunk >> 1) & 0b1111;
+                let v = S[k][row * 16 + col];
+                assert_eq!(s6[chunk], v, "S{} chunk {chunk}", k + 1);
+                let pre_p = u64::from(v) << (28 - 4 * k);
+                assert_eq!(
+                    u64::from(sp.0[v as usize]),
+                    permute(pre_p, 32, &P, 32),
+                    "SP{} value {v}",
+                    k + 1
+                );
+            }
+        }
+    }
 
     /// Canonical DES KAT: key 0x0123456789ABCDEF, plaintext "Now is t"
     /// (0x4E6F772069732074), ciphertext 0x3FA40E8A984D4815. Appears
