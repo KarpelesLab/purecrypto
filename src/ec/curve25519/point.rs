@@ -16,11 +16,8 @@
 
 #[cfg(feature = "ed25519-table")]
 use super::base_table::{ED25519_BASE_2_256, ED25519_BASE_ODD, ED25519_BASE_TABLE};
-#[cfg(feature = "ed25519-table")]
-use super::field::mask_from_bit;
-use super::field::{Fe, Field, ScalarInt, eq_mask};
+use super::field::{Fe, Field, ScalarInt, eq_mask, mask_from_bit};
 use crate::ct::{Choice, ConstantTimeLess};
-#[cfg(feature = "ed25519-table")]
 use crate::zeroize::Zeroize;
 
 /// A curve point in extended homogeneous coordinates `(X:Y:Z:T)`.
@@ -158,7 +155,6 @@ impl Niels {
 /// `scalar = Σ d[i]·16^i` exactly (no reduction, no assumption on the top
 /// bit). Constant time: a fixed carry chain of plain arithmetic, no
 /// comparisons. The digits are secret; callers wipe them.
-#[cfg(feature = "ed25519-table")]
 fn radix16_signed(scalar: &[u8; 32]) -> [i8; 65] {
     let mut d = [0i8; 65];
     for (i, &b) in scalar.iter().enumerate() {
@@ -319,13 +315,16 @@ impl Field {
     }
 
     /// Constant-time `[scalar]·p` over the 256-bit little-endian scalar, via
-    /// a fixed 4-bit window: 4 doublings and one *unconditional* addition per
-    /// nibble, with the window value fetched by a masked scan of all 16 table
-    /// entries (no secret-indexed memory access). A zero nibble adds the
-    /// identity — a no-op with the same operation sequence, since the HWCD
-    /// formulas are complete — so the schedule depends only on the (public)
-    /// scalar width, exactly like the previous bit-at-a-time ladder. The
-    /// scalar bytes are treated as secret.
+    /// a fixed signed 4-bit window ([`radix16_signed`], digits in `[−8, 8)`
+    /// plus a carry digit in `{0, 1}` that seeds the accumulator): 4
+    /// doublings and one *unconditional* addition per digit, with the
+    /// operand fetched by a masked scan of the 8 table entries `[1]P..[8]P`
+    /// (one barriered equality mask each, no secret-indexed memory access)
+    /// followed by a masked negation (one barriered mask). A zero digit adds
+    /// the identity — a no-op with the same operation sequence, since the
+    /// HWCD formulas are complete — so the schedule depends only on the
+    /// (public) scalar width. The scalar bytes and digits are treated as
+    /// secret (the digits are wiped).
     // Ed25519 verification moved to the vartime path (its inputs are public),
     // so on the default build this constant-time generic multiplication only
     // backs the test-side differential oracles; the hazmat/ristretto group
@@ -338,34 +337,41 @@ impl Field {
         not(feature = "ed25519-table")
     ))]
     pub(crate) fn scalar_mult(&self, scalar: &[u8; 32], p: &Point) -> Point {
-        // table[j] = [j]P; table[0] is the identity.
-        let mut table = [self.identity(); 16];
-        table[1] = *p;
-        for i in 2..16 {
+        // table[j] = [j + 1]P.
+        let mut table = [*p; 8];
+        for i in 1..8 {
             table[i] = self.point_add(&table[i - 1], p);
         }
 
-        let mut acc = self.identity();
-        let mut i = 64;
-        while i > 0 {
-            i -= 1;
+        let mut digits = radix16_signed(scalar);
+        // The carry digit (bit 256 of the recoding) seeds the accumulator
+        // with [d₆₄]P ∈ {O, P}, selected by one barriered mask.
+        let mut acc = point_select(p, &self.identity(), mask_from_bit(digits[64] as u64));
+        for &d in digits[..64].iter().rev() {
             acc = self.point_double(&acc);
             acc = self.point_double(&acc);
             acc = self.point_double(&acc);
             acc = self.point_double(&acc);
 
-            let byte = scalar[i / 2];
-            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as u64;
-            // Constant-time gather of table[digit]: one barriered equality
+            // `smask` is 0xff iff d < 0; `mag` = |d| ∈ 0..=8, branch-free.
+            let smask = (d >> 7) as u8;
+            let mag = ((d as u8) ^ smask).wrapping_sub(smask) as u64;
+            // Constant-time gather of table[mag − 1]: one barriered equality
             // mask per entry (`eq_mask`, never `==`), applied across all
             // four coordinates, so the secret digit never feeds a
-            // compare-and-branch the compiler could emit.
-            let mut sel = table[0];
+            // compare-and-branch the compiler could emit; mag = 0 keeps the
+            // identity.
+            let mut sel = self.identity();
             for (j, entry) in table.iter().enumerate() {
-                sel = point_select(entry, &sel, eq_mask(j as u64, digit));
+                sel = point_select(entry, &sel, eq_mask(j as u64 + 1, mag));
             }
+            // Masked negation: −(X:Y:Z:T) = (−X:Y:Z:−T).
+            let neg = mask_from_bit((smask & 1) as u64);
+            sel.x = Fe::select(&sel.x.neg(), &sel.x, neg);
+            sel.t = Fe::select(&sel.t.neg(), &sel.t, neg);
             acc = self.point_add(&acc, &sel);
         }
+        digits.zeroize();
         acc
     }
 
@@ -746,7 +752,6 @@ mod tests {
     /// `[−8, 8)` and the carry digit in `{0, 1}` — on the edge scalars and
     /// random ones.
     #[test]
-    #[cfg(feature = "ed25519-table")]
     fn radix16_signed_round_trips() {
         use crate::hash::Sha256;
         use crate::rng::{HmacDrbg, RngCore};
