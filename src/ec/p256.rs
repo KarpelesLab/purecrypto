@@ -48,7 +48,7 @@ pub(crate) fn random_scalar<R: RngCore>(rng: &mut R) -> Fe {
 const B_HEX: &str = "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b";
 /// The curve coefficient `b`, decoded and converted to Montgomery form at
 /// compile time.
-const B: Fe = field::to_mont(&fe_from_hex(B_HEX));
+const B: Fe = field::to_mont_const(&fe_from_hex(B_HEX));
 #[cfg(any(test, not(feature = "p256-table")))]
 const GX_HEX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
 #[cfg(any(test, not(feature = "p256-table")))]
@@ -57,9 +57,9 @@ const GY_HEX: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837
 /// conversion of the FIPS 186 hex) — the same values as
 /// `P256_GEN_TABLE[0][0]`.
 #[cfg(any(test, not(feature = "p256-table")))]
-const GX: Fe = field::to_mont(&fe_from_hex(GX_HEX));
+const GX: Fe = field::to_mont_const(&fe_from_hex(GX_HEX));
 #[cfg(any(test, not(feature = "p256-table")))]
-const GY: Fe = field::to_mont(&fe_from_hex(GY_HEX));
+const GY: Fe = field::to_mont_const(&fe_from_hex(GY_HEX));
 const N_HEX: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
 /// The group order `n`, decoded at compile time.
 const ORDER: Fe = fe_from_hex(N_HEX);
@@ -794,10 +794,13 @@ impl Zeroize for OddScalar {
     }
 }
 
-/// Returns an all-ones/all-zeros `u64` mask from a 0/1 bit.
+/// Returns an all-ones/all-zeros `u64` mask from a 0/1 bit, behind an
+/// optimisation barrier so the masked selects it feeds (digit signs, the
+/// final negation) cannot be lowered to a branch or conditional move on
+/// the secret bit.
 #[inline]
 fn mask_from_bit(bit: u64) -> u64 {
-    0u64.wrapping_sub(bit & 1)
+    core::hint::black_box(0u64.wrapping_sub(bit & 1))
 }
 
 /// All-ones iff `a == b`, by arithmetic only.

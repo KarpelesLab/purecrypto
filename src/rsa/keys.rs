@@ -238,9 +238,10 @@ fn derive_blinding<const LIMBS: usize>(
     q: &Uint<LIMBS>,
     d: &Uint<LIMBS>,
 ) -> (Uint<LIMBS>, [u8; 32]) {
-    let p_is_zero = bool::from(p.ct_eq(&Uint::ZERO));
-    let q_is_zero = bool::from(q.ct_eq(&Uint::ZERO));
-    let phi_n_minus_1 = if p_is_zero || q_is_zero {
+    // Whether the key carries its primes is public (it decides which private
+    // operation runs); the verdict is declassified like the boxed key's.
+    let missing = p.ct_eq(&Uint::ZERO) | q.ct_eq(&Uint::ZERO);
+    let phi_n_minus_1 = if missing.declassify() {
         Uint::ZERO
     } else {
         // φ(n) = (p−1)·(q−1); we want φ(n) − 1 as a fixed-width Uint<LIMBS>.

@@ -79,20 +79,34 @@ const R2: Fe = {
 /// `R³ mod p`: turns the safegcd inverse of a Montgomery representative
 /// (`(aR)⁻¹ = a⁻¹R⁻¹`) back into Montgomery form (`a⁻¹R`) with one
 /// multiplication (`a⁻¹R⁻¹ · R³ · R⁻¹`).
-const R3: Fe = mul(&R2, &R2);
+const R3: Fe = mul_const(&R2, &R2);
 
-/// Returns an all-ones/all-zeros `u64` mask from a 0/1 bit.
+/// Returns an all-ones/all-zeros `u64` mask from a 0/1 bit, behind an
+/// optimisation barrier: without it LLVM sees a mask that is provably
+/// `0` or `−1` and lowers the masked selects below into a conditional
+/// move or branch on the bit — which, for a borrow out of a secret
+/// operand, is exactly the secret-dependent control flow the Valgrind
+/// harness flags. One barrier per selection, as in the other backends.
 #[inline(always)]
-const fn mask_from_bit(bit: u64) -> u64 {
+fn mask_from_bit(bit: u64) -> u64 {
+    core::hint::black_box(0u64.wrapping_sub(bit & 1))
+}
+
+/// [`mask_from_bit`] without the barrier, for the `const` chain that
+/// derives compile-time constants (`R2`, `R3`, the Montgomery form of the
+/// curve constants); never used on a runtime secret.
+#[inline(always)]
+const fn mask_from_bit_const(bit: u64) -> u64 {
     0u64.wrapping_sub(bit & 1)
 }
 
 /// Computes `r - p` over four limbs plus an incoming high bit `hi` (so the
 /// operand is `hi·2²⁵⁶ + r`, `hi ∈ {0, 1}`), returning the difference limbs
-/// and a `0/0xFFFF…FF` mask that is all-ones iff `hi·2²⁵⁶ + r >= p` (i.e. the
-/// subtraction did not underflow).
+/// and a 0/1 bit that is 1 iff `hi·2²⁵⁶ + r >= p` (i.e. the subtraction did
+/// not underflow). The caller turns the bit into a mask with or without
+/// the barrier.
 #[inline(always)]
-const fn sub_p_mask(r: &[u64; 4], hi: u64) -> ([u64; 4], u64) {
+const fn sub_p_bit(r: &[u64; 4], hi: u64) -> ([u64; 4], u64) {
     let mut out = [0u64; 4];
     let mut borrow: u128 = 0;
     let mut i = 0;
@@ -104,8 +118,7 @@ const fn sub_p_mask(r: &[u64; 4], hi: u64) -> ([u64; 4], u64) {
         i += 1;
     }
     // The value is >= p iff there is a high bit, or no final borrow.
-    let mask = mask_from_bit(hi | (borrow as u64 ^ 1));
-    (out, mask)
+    (out, hi | (borrow as u64 ^ 1))
 }
 
 /// Selects `a` when `mask == 0` and `b` when `mask == 0xFFFF…FF`, per limb.
@@ -126,9 +139,16 @@ const fn select(a: &[u64; 4], b: &[u64; 4], mask: u64) -> [u64; 4] {
 /// subtraction runs unconditionally and selects via a mask, so there is no
 /// secret-dependent branch.
 #[inline(always)]
-const fn reduce_once(r: [u64; 4], hi: u64) -> [u64; 4] {
-    let (diff, mask) = sub_p_mask(&r, hi);
-    select(&r, &diff, mask)
+fn reduce_once(r: [u64; 4], hi: u64) -> [u64; 4] {
+    let (diff, ge) = sub_p_bit(&r, hi);
+    select(&r, &diff, mask_from_bit(ge))
+}
+
+/// [`reduce_once`] for the compile-time constant chain (no barrier).
+#[inline(always)]
+const fn reduce_once_const(r: [u64; 4], hi: u64) -> [u64; 4] {
+    let (diff, ge) = sub_p_bit(&r, hi);
+    select(&r, &diff, mask_from_bit_const(ge))
 }
 
 /// `2a mod p` for `a < p` (compile-time constant derivation only).
@@ -141,7 +161,7 @@ const fn double_mod_p(a: &[u64; 4]) -> [u64; 4] {
         carry = a[i] >> 63;
         i += 1;
     }
-    reduce_once(r, carry)
+    reduce_once_const(r, carry)
 }
 
 /// Schoolbook 256×256→512 multiply of two little-endian 4-limb operands.
@@ -238,7 +258,22 @@ const fn sqr_wide(a: &[u64; 4]) -> [u64; 8] {
 /// the low 256 bits are zero and `t[4..8]` plus the carry-out is `< 2p`,
 /// so one masked subtraction canonicalises.
 #[inline(always)]
-const fn mont_reduce(t: &[u64; 8]) -> [u64; 4] {
+fn mont_reduce(t: &[u64; 8]) -> [u64; 4] {
+    let (r, hi) = mont_reduce_raw(t);
+    reduce_once(r, hi)
+}
+
+/// [`mont_reduce`] for the compile-time constant chain (no barrier).
+#[inline(always)]
+const fn mont_reduce_const(t: &[u64; 8]) -> [u64; 4] {
+    let (r, hi) = mont_reduce_raw(t);
+    reduce_once_const(r, hi)
+}
+
+/// The reduction proper, up to (not including) the final masked `−p`:
+/// returns the value as four limbs plus a high bit, `< 2p`.
+#[inline(always)]
+const fn mont_reduce_raw(t: &[u64; 8]) -> ([u64; 4], u64) {
     let mut acc = *t;
     let mut carry: u128 = 0;
     let mut i = 0;
@@ -257,7 +292,7 @@ const fn mont_reduce(t: &[u64; 8]) -> [u64; 4] {
         i += 1;
     }
     let r = (acc[7] as u128) + carry;
-    reduce_once([acc[4], acc[5], acc[6], r as u64], (r >> 64) as u64)
+    ([acc[4], acc[5], acc[6], r as u64], (r >> 64) as u64)
 }
 
 /// Returns `(a + b) mod p`. Operands must be in `[0, p)` (representation
@@ -331,25 +366,39 @@ pub(crate) fn negate(a: &Fe) -> Fe {
 /// Montgomery product `a·b·R⁻¹ mod p`: the Montgomery form of the product of
 /// two Montgomery-form operands. Operands must be in `[0, p)`.
 #[inline]
-pub(crate) const fn mul(a: &Fe, b: &Fe) -> Fe {
+pub(crate) fn mul(a: &Fe, b: &Fe) -> Fe {
     Fe::from_limbs(mont_reduce(&mul_wide(a.as_limbs(), b.as_limbs())))
+}
+
+/// [`mul`] for compile-time constants only: the final reduction's mask
+/// carries no barrier (not `const`-callable), so this must never run on a
+/// secret.
+#[inline]
+pub(crate) const fn mul_const(a: &Fe, b: &Fe) -> Fe {
+    Fe::from_limbs(mont_reduce_const(&mul_wide(a.as_limbs(), b.as_limbs())))
 }
 
 /// Montgomery square `a²·R⁻¹ mod p`. The operand must be in `[0, p)`.
 #[inline]
-pub(crate) const fn square(a: &Fe) -> Fe {
+pub(crate) fn square(a: &Fe) -> Fe {
     Fe::from_limbs(mont_reduce(&sqr_wide(a.as_limbs())))
 }
 
 /// Converts a plain residue `a < p` into Montgomery form `a·R mod p`.
 #[inline]
-pub(crate) const fn to_mont(a: &Fe) -> Fe {
+pub(crate) fn to_mont(a: &Fe) -> Fe {
     mul(a, &R2)
+}
+
+/// [`to_mont`] for compile-time constants (see [`mul_const`]).
+#[inline]
+pub(crate) const fn to_mont_const(a: &Fe) -> Fe {
+    mul_const(a, &R2)
 }
 
 /// Converts a Montgomery-form element back into the plain residue `a < p`.
 #[inline]
-pub(crate) const fn from_mont(a: &Fe) -> Fe {
+pub(crate) fn from_mont(a: &Fe) -> Fe {
     mul(a, &Fe::ONE)
 }
 

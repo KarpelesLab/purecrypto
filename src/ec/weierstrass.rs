@@ -174,7 +174,11 @@ fn sbb(a: Limb, b: Limb, borrow: Limb) -> (Limb, Limb) {
 /// once per window, pays for an opaque mask.
 #[inline(always)]
 fn mask(bit: Limb) -> Limb {
-    bit.wrapping_neg()
+    // Barrier: the bit is a borrow or carry out of a secret operand, and
+    // without it LLVM lowers the masked select that follows into a
+    // conditional move or branch on that bit (the Valgrind harness flags
+    // both). Measured at a few percent on the field kernels.
+    core::hint::black_box(bit.wrapping_neg())
 }
 
 /// Montgomery multiplication `a·b·R⁻¹ mod m` (CIOS) for `a, b < m`, with the

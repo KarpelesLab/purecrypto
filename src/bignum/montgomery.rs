@@ -378,6 +378,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// `new_secret`, which does.
     pub const fn new(modulus: Uint<LIMBS>) -> Self {
         let n = modulus.as_limbs();
+        assert!(n[0] & 1 == 1, "Montgomery modulus must be odd");
         let mut s = LIMBS;
         while s > 1 && n[s - 1] == 0 {
             s -= 1;
@@ -392,6 +393,11 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// bounds as secret-derived. Same result as `new`.
     pub(crate) fn new_secret(modulus: Uint<LIMBS>) -> Self {
         let n = modulus.as_limbs();
+        // A prime's parity is public; declassify the bit the assert reads.
+        assert!(
+            crate::ct::declassify_value(n[0] & 1) == 1,
+            "Montgomery modulus must be odd"
+        );
         let mut s = LIMBS;
         while s > 1 && crate::ct::declassify_value(n[s - 1] == 0) {
             s -= 1;
@@ -419,10 +425,9 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// Montgomery kernel. (`mont_mul` rather than `mont_sqr` so this stays
     /// `const`.)
     const fn with_shape(modulus: Uint<LIMBS>, s: usize, bits: usize) -> Self {
-        assert!(
-            modulus.as_limbs()[0] & 1 == 1,
-            "Montgomery modulus must be odd"
-        );
+        // Oddness is asserted by the two constructors (`new` directly,
+        // `new_secret` on a declassified bit) so this shared body never
+        // branches on the modulus value.
         let n_prime = inv_mod_2_64(modulus.as_limbs()[0]).wrapping_neg();
         let mut m = MontModulus {
             modulus,

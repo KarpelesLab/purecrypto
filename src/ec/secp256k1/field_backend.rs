@@ -319,7 +319,9 @@ fn canonicalize(r: [u64; 4], hi: u64) -> [u64; 4] {
 /// representative of `d`.
 #[inline]
 fn fold_borrow(mut r: [u64; 4], borrow: u64) -> ([u64; 4], u64) {
-    let mut b: u128 = (borrow as u128) * C;
+    // The borrow is a secret 0/1 bit; behind a barrier, so `borrow * C`
+    // stays a multiply rather than a branch on the bit.
+    let mut b: u128 = (core::hint::black_box(borrow) as u128) * C;
     let mut i = 0;
     while i < 4 {
         let tmp = (r[i] as u128).wrapping_sub(b);

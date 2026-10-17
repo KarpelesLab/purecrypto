@@ -282,7 +282,10 @@ impl BinaryPrivateKey {
         let c = curve.curve();
         let d = limbs_from_be(bytes).ok_or(Error::InvalidInput)?;
         let ok = !limbs_is_zero(&d) & limbs_lt(&d, &c.n);
-        if bool::from(ok) {
+        // The verdict is the public outcome of the import (as for the
+        // prime-field keys): declassified, so the branch on it is not a
+        // branch on the scalar.
+        if ok.declassify() {
             Ok(BinaryPrivateKey { curve, d })
         } else {
             Err(Error::InvalidInput)
@@ -331,7 +334,9 @@ impl BinaryPrivateKey {
         let inf: Choice = shared.inf;
         shared.x.zeroize();
         shared.y.zeroize();
-        if bool::from(inf) {
+        // Identity verdict: the public result of the agreement (the error
+        // is returned to the caller), declassified like `ec::ecdh`.
+        if inf.declassify() {
             out.zeroize();
             return Err(Error::InvalidInput);
         }
