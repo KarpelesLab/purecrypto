@@ -4405,6 +4405,172 @@ mod loopback_tests {
         assert!(matches!(err, crate::tls::Error::IllegalParameter));
     }
 
+    /// A plaintext ServerHello record selecting TLS 1.3 with a `key_share`
+    /// for `group` (placeholder public key of `key_len` bytes).
+    fn synthetic_tls13_server_hello(group: NamedGroup, key_len: usize) -> Vec<u8> {
+        use crate::tls::codec::{ExtensionType, ServerHello, put_u16, write_record};
+        let mut ks_body = Vec::new();
+        put_u16(&mut ks_body, group.0);
+        crate::tls::codec::with_len_u16(&mut ks_body, |b| {
+            b.extend_from_slice(&alloc::vec![0u8; key_len])
+        });
+        let sh = ServerHello {
+            random: [0x44; 32],
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                (ExtensionType::KEY_SHARE, ks_body),
+            ],
+        };
+        let mut out = Vec::new();
+        write_record(
+            &mut out,
+            crate::tls::ContentType::Handshake,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &sh.encode(),
+        )
+        .unwrap();
+        out
+    }
+
+    /// RFC 8446 §4.2.8: without a HelloRetryRequest the server must select
+    /// one of the `KeyShareEntry` values the client actually sent. The
+    /// default client lists secp521r1 in `supported_groups` but ships no
+    /// share for it (`DEFAULT_SHARE_GROUPS`); a ServerHello answering with a
+    /// secp521r1 share is `illegal_parameter`, not a key agreement against a
+    /// share we never offered. (The same group reached through an HRR is
+    /// fine — see `hello_retry_request_preferred_group_loopback`.)
+    #[test]
+    fn rejects_server_hello_key_share_for_a_group_without_a_client_share() {
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"no-share-group-client", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
+        let _ch1 = client.write_tls();
+
+        client.read_tls(&synthetic_tls13_server_hello(NamedGroup::SECP521R1, 133));
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::IllegalParameter));
+    }
+
+    /// A HelloRetryRequest carrying only a `cookie` (RFC 8446 §4.2.2).
+    fn synthetic_cookie_only_hrr_record(cookie: &[u8]) -> Vec<u8> {
+        use crate::tls::codec::{ExtensionType, ServerHello, write_record};
+        let hrr_random: [u8; 32] = [
+            0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65,
+            0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
+            0xc8, 0xa8, 0x33, 0x9c,
+        ];
+        let mut cookie_body = Vec::new();
+        crate::tls::codec::with_len_u16(&mut cookie_body, |b| b.extend_from_slice(cookie));
+        let sh = ServerHello {
+            random: hrr_random,
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                (ExtensionType(0x002c), cookie_body),
+            ],
+        };
+        let mut out = Vec::new();
+        write_record(
+            &mut out,
+            crate::tls::ContentType::Handshake,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &sh.encode(),
+        )
+        .unwrap();
+        out
+    }
+
+    /// The `key_share` groups of a plaintext ClientHello record.
+    fn client_hello_share_groups(record: &[u8]) -> Vec<NamedGroup> {
+        use crate::tls::codec::extension as ext;
+        use crate::tls::codec::{ClientHello, ExtensionType, ReadCursor, read_handshake};
+        let mut c = ReadCursor::new(&record[5..]);
+        let (ty, body) = read_handshake(&mut c).unwrap();
+        assert_eq!(ty, crate::tls::codec::hs_type::CLIENT_HELLO);
+        let ch = ClientHello::decode(body).unwrap();
+        let ks = ext::find(&ch.extensions, ExtensionType::KEY_SHARE).unwrap();
+        ext::parse_client_key_shares(ks)
+            .unwrap()
+            .into_iter()
+            .map(|(g, _)| g)
+            .collect()
+    }
+
+    /// RFC 8446 §4.1.2: after a cookie-only HelloRetryRequest the client may
+    /// only add the cookie; its `key_share` list must be the one CH1
+    /// carried. The default client ships shares for a subset of its offered
+    /// groups, and CH2 used to grow to a share per offered group.
+    #[test]
+    fn cookie_only_hrr_keeps_ch1_key_shares() {
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"cookie-hrr-client", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(client_config(roots), "loopback.example", &mut crng).unwrap();
+        let ch1 = client.write_tls();
+        let ch1_groups = client_hello_share_groups(&ch1);
+        assert_eq!(
+            ch1_groups.len(),
+            super::client::DEFAULT_SHARE_GROUPS.len(),
+            "CH1 carries the default shares only"
+        );
+
+        client.read_tls(&synthetic_cookie_only_hrr_record(b"stateless-cookie"));
+        client.process_new_packets().unwrap();
+        let ch2 = client.write_tls();
+        assert!(!ch2.is_empty(), "client must emit CH2 after HRR");
+        assert_eq!(client_hello_share_groups(&ch2), ch1_groups);
+    }
+
+    /// RFC 8446 §4.1.4: a HelloRetryRequest commits the server to TLS 1.3;
+    /// a TLS 1.2 ServerHello after it is a version change the client MUST
+    /// reject. A version-spanning client (`offer_tls12`) used to hand such a
+    /// ServerHello to the TLS 1.2 engine as a legitimate downgrade.
+    #[test]
+    fn rejects_tls12_server_hello_after_hello_retry_request() {
+        use crate::tls::codec::{ServerHello, write_record};
+
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"hrr-then-12-client", b"nonce", &[]);
+        let mut config = client_config(roots);
+        config.offer_tls12 = true;
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng).unwrap();
+        let _ch1 = client.write_tls();
+
+        client.read_tls(&synthetic_cookie_only_hrr_record(b"c"));
+        client.process_new_packets().unwrap();
+        let _ch2 = client.write_tls();
+
+        // A TLS 1.2 ServerHello: no `supported_versions`, a 1.2 suite.
+        let sh = ServerHello {
+            random: [0x55; 32],
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            extensions: Vec::new(),
+        };
+        let mut out = Vec::new();
+        write_record(
+            &mut out,
+            crate::tls::ContentType::Handshake,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &sh.encode(),
+        )
+        .unwrap();
+        client.read_tls(&out);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::IllegalParameter));
+        assert!(!client.downgrade_requested());
+    }
+
     /// RFC 10024 §4.2 / RFC 8446 §4.2.8.2: a hostile `key_share` for one of
     /// the RFC 10024 hybrids or secp521r1 aborts the handshake with
     /// `illegal_parameter` on whichever side receives it — the server on a

@@ -2876,6 +2876,16 @@ impl ClientConnection {
             None => false,
         };
         if !selected_tls13 {
+            // RFC 8446 §4.1.4: the server "MUST NOT change" its selected
+            // version between the HelloRetryRequest and the ServerHello —
+            // the HRR's `supported_versions` already committed it to TLS
+            // 1.3, so a TLS 1.2 ServerHello after it is a downgrade, not a
+            // legitimate 1.2 selection. Refuse it here rather than letting
+            // the version-spanning front-end hand the connection to the
+            // 1.2 engine.
+            if self.hrr_processed {
+                return Err(Error::IllegalParameter);
+            }
             // draft-ietf-tls-esni-22 §6.1.7: a real-ECH hello never offers
             // TLS 1.2 (see the constructor), and the 1.2 engine could not
             // honour ECH's rules anyway — it would verify the certificate
@@ -3014,10 +3024,26 @@ impl ClientConnection {
                 if !self.offered_groups.contains(&group) {
                     return Err(Error::IllegalParameter);
                 }
-                if let Some(hrr_group) = self.hrr_selected_group
-                    && group != hrr_group
-                {
-                    return Err(Error::IllegalParameter);
+                match self.hrr_selected_group {
+                    Some(hrr_group) => {
+                        if group != hrr_group {
+                            return Err(Error::IllegalParameter);
+                        }
+                    }
+                    // RFC 8446 §4.2.8: without a HelloRetryRequest "the
+                    // server selects one of the KeyShareEntry values the
+                    // client offered" — a group merely listed in
+                    // `supported_groups` without a share is not one of
+                    // them. A server wanting such a group must ask for it
+                    // through an HRR; answering with it directly is
+                    // `illegal_parameter`. The same holds after a
+                    // cookie-only HRR, since CH2 repeats CH1's shares
+                    // unchanged (§4.1.2).
+                    None => {
+                        if !self.ch1_share_groups.contains(&group) {
+                            return Err(Error::IllegalParameter);
+                        }
+                    }
                 }
                 let shared = self.key_agreement(group, &server_pub)?;
                 self.negotiated_group = Some(group);
@@ -3381,7 +3407,16 @@ impl ClientConnection {
         // The PSK binder (if any) is bound to the HRR-inclusive transcript
         // (§4.2.11.2) — `build_client_hello` reads the running transcript
         // `message_hash(Hash(CH1)) ‖ HRR` through `hrr_transcript`.
-        let share_only: alloc::vec::Vec<NamedGroup> = selected_group.into_iter().collect();
+        // RFC 8446 §4.1.2: the only `key_share` change CH2 may make is
+        // replacing the list with a single share for the HRR-selected group.
+        // A cookie-only HRR (no `key_share`) therefore repeats CH1's shares
+        // exactly — an empty `share_only` would make `build_client_hello`
+        // emit a share for every offered group instead, which the server's
+        // CH1/CH2 comparison must refuse.
+        let share_only: alloc::vec::Vec<NamedGroup> = match selected_group {
+            Some(g) => alloc::vec![g],
+            None => self.ch1_share_groups.clone(),
+        };
         let extras: alloc::vec::Vec<crate::tls::codec::RawExtension> =
             cookie_ext.into_iter().collect();
 
