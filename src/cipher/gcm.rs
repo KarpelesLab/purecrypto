@@ -54,9 +54,25 @@ fn inc32(block: u128) -> u128 {
 /// trait method, so a safe third-party implementation could return anything;
 /// the kernel dereferences the schedule through a raw pointer for
 /// `16 * (nr + 1)` bytes, so nothing may be taken on trust.
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn fused_schedule_ok(rk: &[u8], nr: usize) -> bool {
     matches!(nr, 10 | 12 | 14) && rk.len() >= 16 * (nr + 1)
+}
+
+/// Whether this CPU implements the AES instruction-set extension the fused
+/// kernel executes (AES-NI on x86_64, FEAT_AES on aarch64). Re-checked here
+/// rather than trusting `hw_aes_schedule`'s word for it.
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn hw_aes_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("aes")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+    }
 }
 
 /// AES-GCM context, parameterized over the underlying block cipher.
@@ -241,7 +257,7 @@ impl<C: BlockCipher> Gcm<C> {
     /// Folds `data` (any length; the final partial block is zero-padded) into
     /// the GHASH accumulator `x` via the aggregated hardware path. Only called
     /// from the fused path, i.e. with `ghash_hw` set.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[allow(unsafe_code)]
     fn ghash_partial(&self, mut x: u128, data: &[u8]) -> u128 {
         let full = data.len() & !15;
@@ -268,7 +284,7 @@ impl<C: BlockCipher> Gcm<C> {
     /// falls back to the generic path. NB: on decrypt the tag is computed but
     /// NOT verified here — and the buffer has already been decrypted — so the
     /// caller must check the tag and restore the ciphertext on mismatch.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[allow(unsafe_code)]
     fn crypt_fused(
         &self,
@@ -285,9 +301,9 @@ impl<C: BlockCipher> Gcm<C> {
         // untrusted: a third-party `BlockCipher` could hand back a short
         // schedule, a bogus round count, or claim hardware AES on a CPU
         // without it. The kernel below reads `16 * (nr + 1)` bytes through a
-        // raw pointer and executes AES-NI instructions, so validate all of it
+        // raw pointer and executes AES instructions, so validate all of it
         // and fall back to the generic two-pass path on any mismatch.
-        if !fused_schedule_ok(rk, nr) || !std::is_x86_feature_detected!("aes") {
+        if !fused_schedule_ok(rk, nr) || !hw_aes_available() {
             return None;
         }
         let total_len = buffer.len();
@@ -299,9 +315,10 @@ impl<C: BlockCipher> Gcm<C> {
         let fused = total_len & !127;
         let ctr0 = inc32(j0);
         if fused > 0 {
-            // SAFETY: `ghash_hw` confirmed PCLMULQDQ/SSE2/SSSE3 and the
-            // runtime check above confirmed AES-NI — the features the kernel
-            // requires; `fused_schedule_ok` checked `nr ∈ {10, 12, 14}` and
+            // SAFETY: `ghash_hw` confirmed the carryless multiplier
+            // (PCLMULQDQ/SSSE3 or PMULL/NEON) and the runtime check above
+            // confirmed the AES extension — the features the kernel requires;
+            // `fused_schedule_ok` checked `nr ∈ {10, 12, 14}` and
             // `rk.len() >= 16 * (nr + 1)`.
             x = unsafe {
                 super::clmul::ctr_ghash_fused(
@@ -412,7 +429,7 @@ impl<C: BlockCipher> Gcm<C> {
     ) -> Result<[u8; 16], AeadError> {
         Self::validate(nonce, buffer)?;
         let j0 = self.j0(nonce);
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         if let Some(tag) = self.crypt_fused(j0, aad, buffer, true) {
             return Ok(tag);
         }
@@ -427,7 +444,8 @@ impl<C: BlockCipher> Gcm<C> {
     ///
     /// How that is achieved depends on the code path. The portable two-pass
     /// implementation hashes first and never touches `buffer` unless the tag
-    /// matched. The fused AES-NI + PCLMULQDQ path (the default on x86_64 with
+    /// matched. The fused AES + carryless-multiply path (the default on
+    /// x86_64 with AES-NI/PCLMULQDQ and on aarch64 with FEAT_AES/PMULL, under
     /// `std`) decrypts *while* it hashes, so the full buffer is decrypted in
     /// place first and a second CTR pass re-encrypts it when the tag turns out
     /// to be wrong.
@@ -472,7 +490,7 @@ impl<C: BlockCipher> Gcm<C> {
     ) -> Result<(), AeadError> {
         Self::validate(nonce, buffer)?;
         let j0 = self.j0(nonce);
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         if let Some(expected) = self.crypt_fused(j0, aad, buffer, false) {
             // The accept/reject verdict is the public outcome of decryption.
             if expected.ct_eq(tag).declassify() {
@@ -641,7 +659,7 @@ mod tests {
     /// buffer untouched (the fused decrypt must restore the ciphertext).
     /// Without the hardware features both sides take the generic path and the
     /// test still holds trivially.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn fused_matches_two_pass() {
         use std::vec::Vec;
@@ -705,7 +723,7 @@ mod tests {
     /// pointer, so GCM must validate the pair and fall back to the generic
     /// path instead of reading out of bounds. Under Miri/ASan a regression
     /// here is an OOB read; without them it still shows up as a wrong tag.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn bogus_hw_schedule_falls_back() {
         use std::vec::Vec;

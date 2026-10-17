@@ -334,6 +334,45 @@ fn aes256_gcm() -> String {
     )
 }
 
+/// AES-GCM over a message long enough for the stitched AES-CTR ⊕ GHASH bulk
+/// kernel (AES-NI + PCLMULQDQ on x86_64, FEAT_AES + PMULL on aarch64): the
+/// fused loop only runs over whole 128-byte groups, which the 100-byte
+/// `aead_roundtrip` message never reaches. 300 bytes = two fused groups plus
+/// a 44-byte tail through the generic CTR/GHASH path, for both the one-group
+/// hash lag of encryption and the hash-before-XOR of decryption (including
+/// the ciphertext-restoring re-encryption on a rejected tag).
+fn aes_gcm_fused() -> String {
+    fn run<C: BlockCipher>(gcm: &Gcm<C>, nonce: &[u8; 12], seed: u64) -> String {
+        let pt = secret_bytes::<300>(seed);
+        let mut buf = pt;
+        let tag = gcm.encrypt(nonce, b"aad", &mut buf);
+        declassify(&buf);
+        declassify(&tag);
+        let out = format!("ct={} tag={}", hex8(&buf), hex8(&tag));
+        let sealed = buf;
+
+        let mut good = sealed;
+        assert!(gcm.decrypt(nonce, b"aad", &mut good, &tag).is_ok());
+        assert!(bool::from(ct::declassify_value(good[..].ct_eq(&pt[..]))));
+
+        let mut bad_tag = tag;
+        bad_tag[0] ^= 0x01;
+        let mut forged = sealed;
+        assert!(gcm.decrypt(nonce, b"aad", &mut forged, &bad_tag).is_err());
+        declassify(&forged);
+        assert_eq!(
+            forged[..],
+            sealed[..],
+            "rejection must restore the ciphertext"
+        );
+        out
+    }
+    let g128 = Gcm::new(Aes128::new(&secret_bytes::<16>(530)));
+    let g256 = Gcm::new(Aes256::new(&secret_bytes::<32>(531)));
+    let nonce = fixed_bytes::<12>(532);
+    format!("{} {}", run(&g128, &nonce, 533), run(&g256, &nonce, 534))
+}
+
 fn chacha20_poly1305() -> String {
     let aead = ChaCha20Poly1305::new(&secret_bytes::<32>(10));
     let nonce = fixed_bytes::<12>(11);
@@ -2427,6 +2466,7 @@ const CASES: &[Case] = &[
     ("sm4_block", sm4_block),
     ("aes128_gcm", aes128_gcm),
     ("aes256_gcm", aes256_gcm),
+    ("aes_gcm_fused", aes_gcm_fused),
     ("chacha20_poly1305", chacha20_poly1305),
     ("xchacha20_poly1305", xchacha20_poly1305),
     ("aes256_gcm_siv", aes256_gcm_siv),

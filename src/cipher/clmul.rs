@@ -13,7 +13,7 @@
 #![allow(unused_unsafe)]
 
 #[cfg(target_arch = "aarch64")]
-pub(super) use arm::{gf_mul, ghash_blocks};
+pub(super) use arm::{ctr_ghash_fused, gf_mul, ghash_blocks};
 #[cfg(target_arch = "x86_64")]
 pub(super) use x86::{ctr_ghash_fused, gf_mul, ghash_blocks};
 
@@ -375,23 +375,28 @@ mod arm {
     // ops used in the reflected GHASH reduction. `_mm_slli_si128(v, n)` (shift
     // left n bytes) == `vextq_u8(zero, v, 16 - n)`; `_mm_srli_si128(v, n)` ==
     // `vextq_u8(v, zero, n)`.
+
+    /// `PMULL` of the low 64-bit lanes: `a₀·b₀` (the x86 `clmulepi64 0x00`).
     #[inline]
     #[target_feature(enable = "aes,neon")]
-    unsafe fn clmul(a: uint8x16_t, b: uint8x16_t, imm: u32) -> uint8x16_t {
+    unsafe fn clmul_lo(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
         unsafe {
             let au = vreinterpretq_u64_u8(a);
             let bu = vreinterpretq_u64_u8(b);
-            let ax = if imm & 0x01 != 0 {
-                vgetq_lane_u64(au, 1)
-            } else {
-                vgetq_lane_u64(au, 0)
-            };
-            let bx = if imm & 0x10 != 0 {
-                vgetq_lane_u64(bu, 1)
-            } else {
-                vgetq_lane_u64(bu, 0)
-            };
-            vreinterpretq_u8_p128(vmull_p64(ax, bx))
+            vreinterpretq_u8_p128(vmull_p64(vgetq_lane_u64(au, 0), vgetq_lane_u64(bu, 0)))
+        }
+    }
+
+    /// `PMULL2` of the high 64-bit lanes: `a₁·b₁` (the x86 `clmulepi64
+    /// 0x11`), straight from the vector registers.
+    #[inline]
+    #[target_feature(enable = "aes,neon")]
+    unsafe fn clmul_hi(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+        unsafe {
+            vreinterpretq_u8_p128(vmull_high_p64(
+                vreinterpretq_p64_u8(a),
+                vreinterpretq_p64_u8(b),
+            ))
         }
     }
 
@@ -417,11 +422,11 @@ mod arm {
     unsafe fn clmul_halves(a: uint8x16_t, b: uint8x16_t) -> (uint8x16_t, uint8x16_t) {
         unsafe {
             let zero = vdupq_n_u8(0);
-            let t3 = clmul(a, b, 0x00); // a₀·b₀
-            let t6 = clmul(a, b, 0x11); // a₁·b₁
+            let t3 = clmul_lo(a, b); // a₀·b₀
+            let t6 = clmul_hi(a, b); // a₁·b₁
             let ax = veorq_u8(a, vextq_u8(a, zero, 8)); // low 64 = a₀⊕a₁
             let bx = veorq_u8(b, vextq_u8(b, zero, 8)); // low 64 = b₀⊕b₁
-            let mid = clmul(ax, bx, 0x00);
+            let mid = clmul_lo(ax, bx);
             let mid = veorq_u8(mid, veorq_u8(t3, t6)); // a₀b₁ ⊕ a₁b₀
             let t5 = vextq_u8(zero, mid, 8); // slli_si128(mid, 8)
             let t4 = vextq_u8(mid, zero, 8); // srli_si128(mid, 8)
@@ -574,9 +579,182 @@ mod arm {
             u128::from_le_bytes(out)
         }
     }
+
+    /// Loads round key `i` of a FIPS-197 schedule.
+    #[inline]
+    #[target_feature(enable = "aes,neon")]
+    unsafe fn rk(round_keys: &[u8], i: usize) -> uint8x16_t {
+        unsafe { vld1q_u8(round_keys.as_ptr().add(i * 16)) }
+    }
+
+    /// Best-effort wipe of a vector group (volatile zero stores plus a
+    /// compiler fence; see `aes_arm::wipe`, the same idiom).
+    #[inline]
+    #[target_feature(enable = "aes,neon")]
+    unsafe fn wipe(v: &mut [uint8x16_t]) {
+        for x in v.iter_mut() {
+            // SAFETY: `x` is a live `&mut uint8x16_t`, hence non-null, aligned
+            // and exclusively held; this is `*x = zero` with the store marked
+            // volatile so it cannot be elided.
+            unsafe { core::ptr::write_volatile(x, vdupq_n_u8(0)) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Stitched AES-CTR ⊕ GHASH bulk loop on NEON — the aarch64 twin of the
+    /// x86 [`super::x86::ctr_ghash_fused`], with the same contract.
+    ///
+    /// CTR-encrypts (⇔ decrypts) `buf` in place with AES under `round_keys`
+    /// (`nr` ∈ {10, 12, 14} rounds), starting from counter block `ctr` (GCM
+    /// `inc32` semantics), while folding the *ciphertext* blocks into the
+    /// GHASH accumulator `acc` using the precomputed powers `hpow[i] =
+    /// H^{i+1}`. Encryption hashes each group's output with a one-group lag
+    /// (the ciphertext exists only after the XOR); decryption hashes its
+    /// input group directly, before the XOR overwrites it. `buf.len()` must
+    /// be a multiple of 128. Returns the updated accumulator.
+    ///
+    /// The interleave is at instruction granularity: the eight AESE→AESMC
+    /// chains of a group go round-major, and the eight PMULL pairs of the
+    /// neighbouring group's aggregated GHASH are issued one per AES round
+    /// (rounds 0..8), so the AES and polynomial-multiply units run
+    /// concurrently and neither dependency chain stalls the other.
+    ///
+    /// Constant-time: AESE/AESMC and PMULL are data-independent, and the only
+    /// branches depend on the public buffer length and direction flag.
+    #[target_feature(enable = "aes,neon")]
+    pub(in super::super) unsafe fn ctr_ghash_fused(
+        round_keys: &[u8],
+        nr: usize,
+        ctr: u128,
+        hpow: &[u128; 8],
+        acc: u128,
+        buf: &mut [u8],
+        encrypt: bool,
+    ) -> u128 {
+        // Hard preconditions, not `debug_assert`s: the loop reads and writes
+        // `buf` through raw pointers in 128-byte groups (the lag flush reads
+        // `n - 128`), and the schedule through `16 * (nr + 1)` bytes.
+        assert!(
+            buf.len().is_multiple_of(128),
+            "ctr_ghash_fused: buffer length must be a multiple of 128 bytes"
+        );
+        assert!(
+            matches!(nr, 10 | 12 | 14) && round_keys.len() >= 16 * (nr + 1),
+            "AES round-key schedule too short for the round count"
+        );
+        unsafe {
+            match nr {
+                10 => fused::<10>(round_keys, ctr, hpow, acc, buf, encrypt),
+                12 => fused::<12>(round_keys, ctr, hpow, acc, buf, encrypt),
+                _ => fused::<14>(round_keys, ctr, hpow, acc, buf, encrypt),
+            }
+        }
+    }
+
+    /// [`ctr_ghash_fused`] monomorphised on the round count so the round
+    /// loop unrolls and the key offsets are immediates.
+    #[inline]
+    #[target_feature(enable = "aes,neon")]
+    unsafe fn fused<const NR: usize>(
+        round_keys: &[u8],
+        ctr: u128,
+        hpow: &[u128; 8],
+        acc: u128,
+        buf: &mut [u8],
+        encrypt: bool,
+    ) -> u128 {
+        unsafe {
+            // The powers are `u128`, so their little-endian bytes already
+            // are the reflected representation.
+            let mut h = [vdupq_n_u8(0); 8];
+            for (hv, hp) in h.iter_mut().zip(hpow.iter()) {
+                let b = hp.to_le_bytes();
+                *hv = vld1q_u8(b.as_ptr());
+            }
+            let ab = acc.to_le_bytes();
+            let mut acc = vld1q_u8(ab.as_ptr());
+            let zero = vdupq_n_u8(0);
+
+            // Block `i`'s counter is independent of block `i-1`'s: GCM
+            // `inc32` advances only the rightmost 32 bits, so counter `i` is
+            // `hi ‖ (lo + i mod 2³²)` — no serial dependency chain.
+            let ctr_hi = ctr & !0xffff_ffffu128;
+            let ctr_lo = ctr as u32;
+            let mut blk: u32 = 0;
+
+            let n = buf.len();
+            let base = buf.as_mut_ptr();
+            let mut off = 0;
+            // Hoisted out of the loop so the wipe below covers the last
+            // group's raw keystream.
+            let mut b = [vdupq_n_u8(0); 8];
+            while off < n {
+                for bj in b.iter_mut() {
+                    let cb = (ctr_hi | ctr_lo.wrapping_add(blk) as u128).to_be_bytes();
+                    *bj = vld1q_u8(cb.as_ptr());
+                    blk = blk.wrapping_add(1);
+                }
+                // GHASH source: the previous output group when encrypting
+                // (none for the first group), the current input group when
+                // decrypting.
+                let hash = !encrypt || off >= 128;
+                let src = if encrypt {
+                    base.add(off.wrapping_sub(128))
+                } else {
+                    base.add(off)
+                };
+                let mut lo = zero;
+                let mut hi = zero;
+                for r in 0..NR - 1 {
+                    let k = rk(round_keys, r);
+                    for bj in b.iter_mut() {
+                        *bj = vaesmcq_u8(vaeseq_u8(*bj, k));
+                    }
+                    // One PMULL pair of the aggregated 8-block GHASH per AES
+                    // round: `(acc ⊕ b₀)·H⁸ ⊕ b₁·H⁷ ⊕ … ⊕ b₇·H`, accumulated
+                    // unreduced. `src` is only dereferenced when `hash`.
+                    if hash && r < 8 {
+                        let d = load_rev(src.add(r * 16));
+                        let d = if r == 0 { veorq_u8(acc, d) } else { d };
+                        let (l, hh) = clmul_halves(d, h[7 - r]);
+                        lo = veorq_u8(lo, l);
+                        hi = veorq_u8(hi, hh);
+                    }
+                }
+                let k = rk(round_keys, NR - 1);
+                let last = rk(round_keys, NR);
+                for bj in b.iter_mut() {
+                    *bj = veorq_u8(vaeseq_u8(*bj, k), last);
+                }
+                if hash {
+                    acc = reduce(lo, hi);
+                }
+                // XOR the keystream into the data.
+                for (j, bj) in b.iter().enumerate() {
+                    let q = base.add(off + j * 16);
+                    vst1q_u8(q, veorq_u8(vld1q_u8(q), *bj));
+                }
+                off += 128;
+            }
+            // Flush the lag: the last output group is still unhashed.
+            if encrypt && n != 0 {
+                acc = ghash_group8(acc, &h, base.add(n - 128));
+            }
+
+            let mut out = [0u8; 16];
+            vst1q_u8(out.as_mut_ptr(), acc);
+            // The GHASH key powers (H alone forges tags) and the last
+            // keystream group are key material; scrub their registers'
+            // spill slots rather than trust the allocator. The round keys
+            // were read from the schedule in place and never copied.
+            wipe(&mut h);
+            wipe(&mut b);
+            u128::from_le_bytes(out)
+        }
+    }
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
     /// The fused CTR+GHASH kernel walks its buffer through raw pointers in
     /// 128-byte groups, so the length precondition is a hard `assert!`
