@@ -106,7 +106,7 @@ impl G2 {
     /// below `|x| < 2^64` since `k < r < |x|⁴`)
     /// `k·P = d₀·P + d₁·(-ψ(P)) + d₂·ψ²(P) + d₃·(-ψ³(P))`, a four-way
     /// multi-scalar multiplication over 64-bit digits. The split is three
-    /// constant-time divisions ([`div_rem_ct`](super::curve::div_rem_ct)).
+    /// constant-time divisions (`div_rem_ct` in the curve module).
     pub fn mul(&self, k: &Fr) -> G2 {
         // The canonical limbs are the scalar in the clear; bind them so they
         // can be wiped, rather than leaving them as an unnamed temporary.

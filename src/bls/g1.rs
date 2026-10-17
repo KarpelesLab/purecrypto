@@ -99,7 +99,7 @@ impl G1 {
     /// digits, both below `x² < 2^128` since `k < r < x⁴`)
     /// `k·P = e₀·P + e₁·(-φ(P))`, a two-dimensional multi-scalar
     /// multiplication over 128-bit digits. The split is a constant-time
-    /// division ([`div_rem_ct`](super::curve::div_rem_ct)).
+    /// division (`div_rem_ct` in the curve module).
     pub fn mul(&self, k: &Fr) -> G1 {
         const X2: u128 = (X_ABS as u128) * (X_ABS as u128);
         // The canonical limbs are the scalar in the clear; bind them so they
