@@ -45,7 +45,7 @@
 //! 6.3 ms — brotli's encoder is a hundred times the cost for the worst
 //! ratio of the three — and decode in 1.4, 7.9 and 56 µs. (Every
 //! connection built from one [`Config`](super::Config) shares a
-//! [`CompressedCertificateCache`], so the encoder runs once per
+//! `CompressedCertificateCache`, so the encoder runs once per
 //! certificate, not per handshake; the order still decides which
 //! decoder the peer runs.)
 //!
