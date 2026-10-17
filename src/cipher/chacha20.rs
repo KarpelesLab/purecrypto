@@ -188,9 +188,11 @@ impl ChaCha20 {
         // is the normal path with no runtime probe. It hands back a tail of
         // under two blocks, where a 4-wide pass would mostly compute
         // discarded blocks, to the scalar loop below — which also remains the
-        // whole path in the constant-time harness's forced-portable mode.
+        // whole path for buffers that short (single-block callers such as
+        // the Poly1305 OTK derivation never enter the kernel) and in the
+        // constant-time harness's forced-portable mode.
         #[cfg(target_arch = "aarch64")]
-        let (done, mut block_counter) = if neon::supported() {
+        let (done, mut block_counter) = if buf.len() >= 128 && neon::supported() {
             neon::apply_keystream(&self.key, nonce, counter, buf)
         } else {
             (0, counter)
@@ -716,7 +718,11 @@ mod neon {
                 ctr = ctr.wrapping_add(used.div_ceil(64) as u32);
             }
             wipe(&mut a, &mut ia);
-            wipe(&mut b, &mut ib);
+            // The second set is only written by the 8-way loop (a public
+            // length condition).
+            if len >= 512 {
+                wipe(&mut b, &mut ib);
+            }
             (off, ctr)
         }
     }

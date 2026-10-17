@@ -434,10 +434,17 @@ fn siphash24() -> String {
 
 fn poly1305() -> String {
     let key = secret_bytes::<32>(14);
-    let msg = secret_bytes::<333>(15);
+    let msg = secret_bytes::<1333>(15);
     let mut p = Poly1305::new(&key);
+    // Chunked so that every scalar path runs on tainted data: the leftover
+    // buffer, the four-stripe (>= 512 B) and two-stripe (>= 64 B) radix-2^44
+    // loops on 64-bit targets, the single-block step, and the padded final
+    // block. On x86_64 with AVX2 the >= 256 B runs go through the vector
+    // kernel instead; `PURECRYPTO_CT_FORCE_PORTABLE=1` covers the scalar ones.
     p.update(&msg[..17]);
-    p.update(&msg[17..]);
+    p.update(&msg[17..617]);
+    p.update(&msg[617..717]);
+    p.update(&msg[717..]);
     hex8(public(&p.finish()))
 }
 

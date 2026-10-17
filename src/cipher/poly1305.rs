@@ -2,36 +2,30 @@
 //!
 //! Poly1305 evaluates a polynomial in the secret evaluation point `r` modulo
 //! the prime `2¹³⁰ − 5`, then adds the secret pad `s` modulo `2¹²⁸`. The
-//! 130-bit arithmetic here is carried in five 26-bit limbs (the "donna" layout),
-//! which keeps every step within 64-bit products and uses a branchless final
+//! 130-bit arithmetic is carried in the "donna" limb layouts: three 44-bit
+//! limbs with `u128` products on 64-bit targets (two interleaved Horner
+//! stripes hide the carry-chain latency on long inputs), five 26-bit limbs
+//! with `u64` products on 32-bit targets. Both use a branchless final
 //! reduction — there are no secret-dependent branches or table lookups.
 //!
 //! The (`r`, `s`) key is **single-use**: authenticating two messages under the
 //! same Poly1305 key reveals `r` and breaks the MAC. In ChaCha20-Poly1305 a
 //! fresh key is derived per record from the cipher keystream.
 
-/// Reads four bytes as a little-endian `u32`.
-#[inline]
-fn le32(b: &[u8]) -> u32 {
-    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
+use crate::zeroize::Zeroize;
 
 /// A Poly1305 authenticator state.
 ///
-/// Implements [`Drop`] to wipe the clamped `r`, the precomputed `5·r`, the
-/// accumulator `h`, the additive pad `s`, and the input-side buffer when the
-/// state goes out of scope — these are all derived from the secret one-time
-/// key.
+/// Implements [`Drop`] to wipe the clamped `r` and its precomputed multiples,
+/// the accumulator `h`, the additive pad `s`, and the input-side buffer when
+/// the state goes out of scope — these are all derived from the secret
+/// one-time key.
 #[derive(Clone)]
 pub struct Poly1305 {
-    /// Clamped evaluation point `r`, in five 26-bit limbs.
-    r: [u32; 5],
-    /// Precomputed `5·r[1..=4]` for the modular reduction.
-    s: [u32; 4],
-    /// Accumulator `h`, in five 26-bit limbs.
-    h: [u32; 5],
-    /// The final additive pad `s`, as four 32-bit words.
-    pad: [u32; 4],
+    /// The polynomial state: `r`, its reduction multiples and `h`.
+    st: imp::State,
+    /// The final additive pad `s`.
+    pad: u128,
     /// Bytes held back until a full 16-byte block (or finalization).
     buffer: [u8; 16],
     leftover: usize,
@@ -40,71 +34,13 @@ pub struct Poly1305 {
 impl Poly1305 {
     /// Creates a Poly1305 state from a 32-byte one-time key (`r ‖ s`).
     pub fn new(key: &[u8; 32]) -> Self {
-        // Clamp r (RFC 8439 §2.5): clear the high 4 bits of each r byte group
-        // and the low 2 bits of the upper three words.
-        let r0 = le32(&key[0..4]) & 0x03ff_ffff;
-        let r1 = (le32(&key[3..7]) >> 2) & 0x03ff_ff03;
-        let r2 = (le32(&key[6..10]) >> 4) & 0x03ff_c0ff;
-        let r3 = (le32(&key[9..13]) >> 6) & 0x03f0_3fff;
-        let r4 = (le32(&key[12..16]) >> 8) & 0x000f_ffff;
+        let (r, s) = key.split_at(16);
         Poly1305 {
-            r: [r0, r1, r2, r3, r4],
-            s: [r1 * 5, r2 * 5, r3 * 5, r4 * 5],
-            h: [0; 5],
-            pad: [
-                le32(&key[16..20]),
-                le32(&key[20..24]),
-                le32(&key[24..28]),
-                le32(&key[28..32]),
-            ],
+            st: imp::State::new(r.try_into().expect("16-byte r")),
+            pad: u128::from_le_bytes(s.try_into().expect("16-byte s")),
             buffer: [0; 16],
             leftover: 0,
         }
-    }
-
-    /// Absorbs one 16-byte block. `hibit` is `1 << 24` (the implicit 2¹²⁸ bit)
-    /// for a full block, or `0` for the padded final block.
-    fn block(&mut self, m: &[u8; 16], hibit: u32) {
-        let t0 = le32(&m[0..4]);
-        let t1 = le32(&m[4..8]);
-        let t2 = le32(&m[8..12]);
-        let t3 = le32(&m[12..16]);
-
-        // h += m
-        let h0 = (self.h[0] + (t0 & 0x03ff_ffff)) as u64;
-        let h1 = (self.h[1] + (((t0 >> 26) | (t1 << 6)) & 0x03ff_ffff)) as u64;
-        let h2 = (self.h[2] + (((t1 >> 20) | (t2 << 12)) & 0x03ff_ffff)) as u64;
-        let h3 = (self.h[3] + (((t2 >> 14) | (t3 << 18)) & 0x03ff_ffff)) as u64;
-        let h4 = (self.h[4] + ((t3 >> 8) | hibit)) as u64;
-
-        let [r0, r1, r2, r3, r4] = self.r.map(u64::from);
-        let [s1, s2, s3, s4] = self.s.map(u64::from);
-
-        // h *= r mod 2¹³⁰−5 (schoolbook with the 5·r wrap-around terms)
-        let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
-        let d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
-        let d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
-        let d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
-        let d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
-
-        // Partial carry propagation back into 26-bit limbs.
-        let mut c = d0 >> 26;
-        let nh0 = (d0 as u32) & 0x03ff_ffff;
-        let d1 = d1 + c;
-        c = d1 >> 26;
-        let nh1 = (d1 as u32) & 0x03ff_ffff;
-        let d2 = d2 + c;
-        c = d2 >> 26;
-        let nh2 = (d2 as u32) & 0x03ff_ffff;
-        let d3 = d3 + c;
-        c = d3 >> 26;
-        let nh3 = (d3 as u32) & 0x03ff_ffff;
-        let d4 = d4 + c;
-        c = d4 >> 26;
-        let nh4 = (d4 as u32) & 0x03ff_ffff;
-        let nh0 = nh0 as u64 + c * 5;
-        let carry = (nh0 >> 26) as u32;
-        self.h = [(nh0 as u32) & 0x03ff_ffff, nh1 + carry, nh2, nh3, nh4];
     }
 
     /// Absorbs `data` into the authenticator.
@@ -119,7 +55,7 @@ impl Poly1305 {
                 return;
             }
             let block = self.buffer;
-            self.block(&block, 1 << 24);
+            self.st.block(&block, true);
             self.leftover = 0;
         }
 
@@ -127,8 +63,8 @@ impl Poly1305 {
         // precomputed powers r¹..r⁸ (parallel Horner). Only worth it once the
         // message is long enough to amortize the power setup; the tail
         // (< 128 bytes of full blocks plus any partial block) falls through
-        // to the scalar path. Control flow depends only on the public message
-        // length.
+        // to the scalar paths. Control flow depends only on the public
+        // message length.
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
         if data.len() >= simd::MIN_LEN && simd::supported() {
             let vec_len = data.len() & !127;
@@ -136,11 +72,29 @@ impl Poly1305 {
             data = &data[vec_len..];
         }
 
+        // 64-bit targets: interleaved Horner stripes — four (`h = (h + m)·r⁴`)
+        // over runs of at least 512 bytes, where the `r³`/`r⁴` setup and
+        // the fold amortise, two (`r²`) over runs of at least four blocks;
+        // the odd blocks, if any, and anything shorter go through the
+        // single-stripe step.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let quad_len = data.len() & !63;
+            if quad_len >= 512 {
+                self.st.blocks4(&data[..quad_len]);
+                data = &data[quad_len..];
+            }
+            let pair_len = data.len() & !31;
+            if pair_len >= 64 {
+                self.st.blocks2(&data[..pair_len]);
+                data = &data[pair_len..];
+            }
+        }
+
         let mut chunks = data.chunks_exact(16);
         for chunk in &mut chunks {
-            let mut block = [0u8; 16];
-            block.copy_from_slice(chunk);
-            self.block(&block, 1 << 24);
+            let block: &[u8; 16] = chunk.try_into().expect("16-byte chunk");
+            self.st.block(block, true);
         }
         let rem = chunks.remainder();
         if !rem.is_empty() {
@@ -155,80 +109,11 @@ impl Poly1305 {
             let mut block = [0u8; 16];
             block[..self.leftover].copy_from_slice(&self.buffer[..self.leftover]);
             block[self.leftover] = 1;
-            self.block(&block, 0);
+            self.st.block(&block, false);
         }
-
-        // Fully carry h.
-        let [mut h0, mut h1, mut h2, mut h3, mut h4] = self.h;
-        let mut c = h1 >> 26;
-        h1 &= 0x03ff_ffff;
-        h2 += c;
-        c = h2 >> 26;
-        h2 &= 0x03ff_ffff;
-        h3 += c;
-        c = h3 >> 26;
-        h3 &= 0x03ff_ffff;
-        h4 += c;
-        c = h4 >> 26;
-        h4 &= 0x03ff_ffff;
-        h0 += c * 5;
-        c = h0 >> 26;
-        h0 &= 0x03ff_ffff;
-        h1 += c;
-
-        // Compute h − p; if it does not borrow, h ≥ p and we keep the result.
-        let mut g0 = h0 + 5;
-        c = g0 >> 26;
-        g0 &= 0x03ff_ffff;
-        let mut g1 = h1 + c;
-        c = g1 >> 26;
-        g1 &= 0x03ff_ffff;
-        let mut g2 = h2 + c;
-        c = g2 >> 26;
-        g2 &= 0x03ff_ffff;
-        let mut g3 = h3 + c;
-        c = g3 >> 26;
-        g3 &= 0x03ff_ffff;
-        let g4 = (h4 + c).wrapping_sub(1 << 26);
-
-        // mask = 0 when h < p (g4 borrowed, high bit set), else all-ones.
-        // `black_box` keeps the optimizer from turning the masked selects
-        // below into a branch on the secret comparison result.
-        let mask = core::hint::black_box((g4 >> 31).wrapping_sub(1));
-        g0 &= mask;
-        g1 &= mask;
-        g2 &= mask;
-        g3 &= mask;
-        let g4 = g4 & mask;
-        let nmask = !mask;
-        h0 = (h0 & nmask) | g0;
-        h1 = (h1 & nmask) | g1;
-        h2 = (h2 & nmask) | g2;
-        h3 = (h3 & nmask) | g3;
-        h4 = (h4 & nmask) | g4;
-
-        // Repack the 26-bit limbs into four 32-bit words (mod 2¹²⁸).
-        let h0 = h0 | (h1 << 26);
-        let h1 = (h1 >> 6) | (h2 << 20);
-        let h2 = (h2 >> 12) | (h3 << 14);
-        let h3 = (h3 >> 18) | (h4 << 8);
-
-        // tag = (h + pad) mod 2¹²⁸.
-        let mut f = h0 as u64 + self.pad[0] as u64;
-        let m0 = f as u32;
-        f = h1 as u64 + self.pad[1] as u64 + (f >> 32);
-        let m1 = f as u32;
-        f = h2 as u64 + self.pad[2] as u64 + (f >> 32);
-        let m2 = f as u32;
-        f = h3 as u64 + self.pad[3] as u64 + (f >> 32);
-        let m3 = f as u32;
-
-        let mut tag = [0u8; 16];
-        tag[0..4].copy_from_slice(&m0.to_le_bytes());
-        tag[4..8].copy_from_slice(&m1.to_le_bytes());
-        tag[8..12].copy_from_slice(&m2.to_le_bytes());
-        tag[12..16].copy_from_slice(&m3.to_le_bytes());
-        tag
+        // tag = (h mod p + pad) mod 2¹²⁸.
+        let h = self.st.reduce();
+        h.wrapping_add(self.pad).to_le_bytes()
     }
 }
 
@@ -240,13 +125,446 @@ impl Drop for Poly1305 {
         // nothing measurable (an earlier per-limb version cost ~7% on a 1 KiB
         // record, which is why this used to be a plain store plus a
         // `black_box` barrier).
-        use crate::zeroize::Zeroize;
-        self.r.zeroize();
-        self.s.zeroize();
-        self.h.zeroize();
+        self.st.wipe();
         self.pad.zeroize();
         self.buffer.zeroize();
         self.leftover.zeroize();
+    }
+}
+
+/// Radix-2⁴⁴ polynomial state (poly1305-donna-64): `r` and `h` in three
+/// limbs of 44, 44 and 42 bits, partial products as `u128`. Limbs are kept
+/// lazily reduced — a multiplication leaves `h0 < 2⁴⁴`, `h1 ≤ 2⁴⁴`,
+/// `h2 < 2⁴²`, and adding a message block or a second stripe stays under
+/// 2⁴⁶ — which every product sum (`< 3 · 2⁴⁶ · 2⁴⁹`) fits comfortably.
+#[cfg(target_pointer_width = "64")]
+mod imp {
+    use crate::zeroize::Zeroize;
+
+    const M44: u64 = 0x0fff_ffff_ffff;
+    const M42: u64 = 0x03ff_ffff_ffff;
+
+    #[derive(Clone)]
+    pub(super) struct State {
+        /// Clamped evaluation point `r`.
+        r: [u64; 3],
+        /// `20·r[1]`, `20·r[2]`: the wrap-around multiples (`5 · 4`, since
+        /// limb 2 is only 42 bits wide).
+        s: [u64; 2],
+        /// `r² mod p` and its multiples, for the two-stripe loop.
+        r2: [u64; 3],
+        s2: [u64; 2],
+        /// Accumulator `h`.
+        h: [u64; 3],
+    }
+
+    /// `h · r mod 2¹³⁰−5` with the lazy carry chain.
+    #[inline(always)]
+    fn mul(h: [u64; 3], r: [u64; 3], s: [u64; 2]) -> [u64; 3] {
+        let [h0, h1, h2] = h.map(u128::from);
+        let [r0, r1, r2] = r.map(u128::from);
+        let [s1, s2] = s.map(u128::from);
+        let d0 = h0 * r0 + h1 * s2 + h2 * s1;
+        let mut d1 = h0 * r1 + h1 * r0 + h2 * s2;
+        let mut d2 = h0 * r2 + h1 * r1 + h2 * r0;
+        let c = (d0 >> 44) as u64;
+        let mut h0 = (d0 as u64) & M44;
+        d1 += u128::from(c);
+        let c = (d1 >> 44) as u64;
+        let mut h1 = (d1 as u64) & M44;
+        d2 += u128::from(c);
+        let c = (d2 >> 42) as u64;
+        let h2 = (d2 as u64) & M42;
+        h0 += c * 5;
+        let c = h0 >> 44;
+        h0 &= M44;
+        h1 += c;
+        [h0, h1, h2]
+    }
+
+    /// Splits a 16-byte block into limbs, with the implicit 2¹²⁸ bit when
+    /// `full`, and adds it into `h`. `full` is derived from the public
+    /// message length, so the branch-free form is for uniformity only.
+    #[inline(always)]
+    fn add_block(h: &mut [u64; 3], m: &[u8; 16], full: bool) {
+        let t0 = u64::from_le_bytes(m[..8].try_into().expect("8 bytes"));
+        let t1 = u64::from_le_bytes(m[8..].try_into().expect("8 bytes"));
+        h[0] += t0 & M44;
+        h[1] += ((t0 >> 44) | (t1 << 20)) & M44;
+        h[2] += ((t1 >> 24) & M42) | (u64::from(full) << 40);
+    }
+
+    impl State {
+        pub(super) fn new(key: &[u8; 16]) -> Self {
+            // Clamp r (RFC 8439 §2.5): clear the high 4 bits of each r byte
+            // group and the low 2 bits of the upper three words.
+            let t0 =
+                u64::from_le_bytes(key[..8].try_into().expect("8 bytes")) & 0x0fff_fffc_0fff_ffff;
+            let t1 =
+                u64::from_le_bytes(key[8..].try_into().expect("8 bytes")) & 0x0fff_fffc_0fff_fffc;
+            let r = [t0 & M44, ((t0 >> 44) | (t1 << 20)) & M44, (t1 >> 24) & M42];
+            let s = [r[1] * 20, r[2] * 20];
+            let r2 = mul(r, r, s);
+            let s2 = [r2[1] * 20, r2[2] * 20];
+            State {
+                r,
+                s,
+                r2,
+                s2,
+                h: [0; 3],
+            }
+        }
+
+        /// Absorbs one block: `h = (h + m) · r`.
+        #[inline]
+        pub(super) fn block(&mut self, m: &[u8; 16], full: bool) {
+            add_block(&mut self.h, m, full);
+            self.h = mul(self.h, self.r, self.s);
+        }
+
+        /// Absorbs `data` (a non-empty multiple of 64 bytes) with four
+        /// interleaved Horner stripes, each advancing by `r⁴` per 64-byte
+        /// group with no data dependency between them. After the last group
+        /// the stripes are folded as `ha·r⁴ + hb·r³ + hc·r² + hd·r` (four
+        /// independent multiplications), which is exactly the serial Horner
+        /// value. `r³` and `r⁴` are derived here (two multiplications per
+        /// call) rather than in `new`, so short messages do not pay for
+        /// them.
+        #[inline]
+        pub(super) fn blocks4(&mut self, data: &[u8]) {
+            debug_assert!(!data.is_empty() && data.len().is_multiple_of(64));
+            let mut r3 = mul(self.r2, self.r, self.s);
+            let mut s3 = [r3[1] * 20, r3[2] * 20];
+            let mut r4 = mul(self.r2, self.r2, self.s2);
+            let mut s4 = [r4[1] * 20, r4[2] * 20];
+            let mut ha = self.h;
+            let mut hb = [0u64; 3];
+            let mut hc = [0u64; 3];
+            let mut hd = [0u64; 3];
+            let mut quads = data.chunks_exact(64);
+            let last = quads.next_back().expect("at least one group");
+            for q in quads {
+                add_block(&mut ha, q[..16].try_into().expect("16 bytes"), true);
+                add_block(&mut hb, q[16..32].try_into().expect("16 bytes"), true);
+                add_block(&mut hc, q[32..48].try_into().expect("16 bytes"), true);
+                add_block(&mut hd, q[48..].try_into().expect("16 bytes"), true);
+                ha = mul(ha, r4, s4);
+                hb = mul(hb, r4, s4);
+                hc = mul(hc, r4, s4);
+                hd = mul(hd, r4, s4);
+            }
+            add_block(&mut ha, last[..16].try_into().expect("16 bytes"), true);
+            add_block(&mut hb, last[16..32].try_into().expect("16 bytes"), true);
+            add_block(&mut hc, last[32..48].try_into().expect("16 bytes"), true);
+            add_block(&mut hd, last[48..].try_into().expect("16 bytes"), true);
+            ha = mul(ha, r4, s4);
+            hb = mul(hb, r3, s3);
+            hc = mul(hc, self.r2, self.s2);
+            hd = mul(hd, self.r, self.s);
+            self.h = [
+                ha[0] + hb[0] + hc[0] + hd[0],
+                ha[1] + hb[1] + hc[1] + hd[1],
+                ha[2] + hb[2] + hc[2] + hd[2],
+            ];
+            // `r³`/`r⁴` are key-derived and the stripes are accumulator
+            // state; this runs once per `update`, so the plain-store barrier
+            // suffices.
+            r3 = [0; 3];
+            s3 = [0; 2];
+            r4 = [0; 3];
+            s4 = [0; 2];
+            ha = [0; 3];
+            hb = [0; 3];
+            hc = [0; 3];
+            hd = [0; 3];
+            let _ = core::hint::black_box(&r3);
+            let _ = core::hint::black_box(&s3);
+            let _ = core::hint::black_box(&r4);
+            let _ = core::hint::black_box(&s4);
+            let _ = core::hint::black_box(&ha);
+            let _ = core::hint::black_box(&hb);
+            let _ = core::hint::black_box(&hc);
+            let _ = core::hint::black_box(&hd);
+        }
+
+        /// Absorbs `data` (a non-empty multiple of 32 bytes) with two
+        /// interleaved Horner stripes: the odd blocks advance one
+        /// accumulator by `r²` per pair, the even blocks the other, and the
+        /// two chains have no data dependency until the final fold. The last
+        /// pair multiplies the even stripe by `r` instead, so that
+        /// `ha + hb` is exactly the serial Horner value.
+        #[inline]
+        pub(super) fn blocks2(&mut self, data: &[u8]) {
+            debug_assert!(!data.is_empty() && data.len().is_multiple_of(32));
+            let mut ha = self.h;
+            let mut hb = [0u64; 3];
+            let mut pairs = data.chunks_exact(32);
+            let last = pairs.next_back().expect("at least one pair");
+            for pair in pairs {
+                add_block(&mut ha, pair[..16].try_into().expect("16 bytes"), true);
+                add_block(&mut hb, pair[16..].try_into().expect("16 bytes"), true);
+                ha = mul(ha, self.r2, self.s2);
+                hb = mul(hb, self.r2, self.s2);
+            }
+            add_block(&mut ha, last[..16].try_into().expect("16 bytes"), true);
+            add_block(&mut hb, last[16..].try_into().expect("16 bytes"), true);
+            ha = mul(ha, self.r2, self.s2);
+            hb = mul(hb, self.r, self.s);
+            self.h = [ha[0] + hb[0], ha[1] + hb[1], ha[2] + hb[2]];
+            // Stripe scratch is key-derived accumulator state; this runs once
+            // per `update`, so the plain-store barrier suffices.
+            ha = [0; 3];
+            hb = [0; 3];
+            let _ = core::hint::black_box(&ha);
+            let _ = core::hint::black_box(&hb);
+        }
+
+        /// Fully carries the lazy limbs (input limbs up to 2⁴⁶) so that
+        /// `h0, h1 < 2⁴⁴`, `h2 < 2⁴²`, i.e. `h < 2¹³⁰`.
+        #[inline(always)]
+        fn carry(&self) -> [u64; 3] {
+            let [mut h0, mut h1, mut h2] = self.h;
+            for _ in 0..2 {
+                let c = h1 >> 44;
+                h1 &= M44;
+                h2 += c;
+                let c = h2 >> 42;
+                h2 &= M42;
+                h0 += c * 5;
+                let c = h0 >> 44;
+                h0 &= M44;
+                h1 += c;
+            }
+            [h0, h1, h2]
+        }
+
+        /// `h mod p`, fully reduced, as a 128-bit value (mod 2¹²⁸).
+        pub(super) fn reduce(&self) -> u128 {
+            let [mut h0, mut h1, mut h2] = self.carry();
+
+            // Compute g = h + 5 − 2¹³⁰; if it does not borrow, h ≥ p and g is
+            // the reduced value.
+            let mut g0 = h0 + 5;
+            let c = g0 >> 44;
+            g0 &= M44;
+            let mut g1 = h1 + c;
+            let c = g1 >> 44;
+            g1 &= M44;
+            let g2 = (h2 + c).wrapping_sub(1 << 42);
+
+            // mask = 0 when h < p (g2 borrowed, high bit set), else all-ones.
+            // `black_box` keeps the optimizer from turning the masked
+            // selects into a branch on the secret comparison result.
+            let mask = core::hint::black_box((g2 >> 63).wrapping_sub(1));
+            let nmask = !mask;
+            h0 = (h0 & nmask) | (g0 & mask);
+            h1 = (h1 & nmask) | (g1 & mask);
+            h2 = (h2 & nmask) | (g2 & mask);
+
+            // Repack the limbs into 128 bits.
+            let lo = h0 | (h1 << 44);
+            let hi = (h1 >> 20) | (h2 << 24);
+            u128::from(lo) | (u128::from(hi) << 64)
+        }
+
+        pub(super) fn wipe(&mut self) {
+            self.r.zeroize();
+            self.s.zeroize();
+            self.r2.zeroize();
+            self.s2.zeroize();
+            self.h.zeroize();
+        }
+
+        /// `r` as five 26-bit limbs, for the AVX2 kernel's power table.
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        pub(super) fn r26(&self) -> [u32; 5] {
+            let r = u128::from(self.r[0])
+                | (u128::from(self.r[1]) << 44)
+                | (u128::from(self.r[2]) << 88);
+            core::array::from_fn(|i| ((r >> (26 * i)) as u32) & 0x03ff_ffff)
+        }
+
+        /// `h` as five lazily reduced 26-bit limbs (each below 2²⁷).
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        pub(super) fn h26(&self) -> [u32; 5] {
+            let [h0, h1, h2] = self.carry();
+            [
+                (h0 & 0x03ff_ffff) as u32,
+                ((h0 >> 26) + ((h1 & 0xff) << 18)) as u32,
+                ((h1 >> 8) & 0x03ff_ffff) as u32,
+                ((h1 >> 34) + ((h2 & 0xffff) << 10)) as u32,
+                (h2 >> 16) as u32,
+            ]
+        }
+
+        /// Loads `h` from five lazily reduced 26-bit limbs (each below 2²⁸).
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        pub(super) fn set_h26(&mut self, l: [u32; 5]) {
+            let l = l.map(u64::from);
+            // Sum (not OR) the correctly weighted pieces, so lazily reduced
+            // input limbs carry naturally.
+            self.h = [
+                l[0] + ((l[1] & 0x3ffff) << 26),
+                (l[1] >> 18) + (l[2] << 8) + ((l[3] & 0x3ff) << 34),
+                (l[3] >> 10) + (l[4] << 16),
+            ];
+        }
+    }
+}
+
+/// Radix-2²⁶ polynomial state (poly1305-donna-32): `r` and `h` in five
+/// 26-bit limbs, partial products as `u64`, for targets without a fast
+/// 64×64→128 multiply.
+#[cfg(not(target_pointer_width = "64"))]
+mod imp {
+    use crate::zeroize::Zeroize;
+
+    /// Reads four bytes as a little-endian `u32`.
+    #[inline]
+    fn le32(b: &[u8]) -> u32 {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    #[derive(Clone)]
+    pub(super) struct State {
+        /// Clamped evaluation point `r`, in five 26-bit limbs.
+        r: [u32; 5],
+        /// Precomputed `5·r[1..=4]` for the modular reduction.
+        s: [u32; 4],
+        /// Accumulator `h`, in five 26-bit limbs.
+        h: [u32; 5],
+    }
+
+    impl State {
+        pub(super) fn new(key: &[u8; 16]) -> Self {
+            // Clamp r (RFC 8439 §2.5): clear the high 4 bits of each r byte
+            // group and the low 2 bits of the upper three words.
+            let r0 = le32(&key[0..4]) & 0x03ff_ffff;
+            let r1 = (le32(&key[3..7]) >> 2) & 0x03ff_ff03;
+            let r2 = (le32(&key[6..10]) >> 4) & 0x03ff_c0ff;
+            let r3 = (le32(&key[9..13]) >> 6) & 0x03f0_3fff;
+            let r4 = (le32(&key[12..16]) >> 8) & 0x000f_ffff;
+            State {
+                r: [r0, r1, r2, r3, r4],
+                s: [r1 * 5, r2 * 5, r3 * 5, r4 * 5],
+                h: [0; 5],
+            }
+        }
+
+        /// Absorbs one block: `h = (h + m) · r`. `full` sets the implicit
+        /// 2¹²⁸ bit (it is derived from the public message length).
+        pub(super) fn block(&mut self, m: &[u8; 16], full: bool) {
+            let hibit = u32::from(full) << 24;
+            let t0 = le32(&m[0..4]);
+            let t1 = le32(&m[4..8]);
+            let t2 = le32(&m[8..12]);
+            let t3 = le32(&m[12..16]);
+
+            // h += m
+            let h0 = (self.h[0] + (t0 & 0x03ff_ffff)) as u64;
+            let h1 = (self.h[1] + (((t0 >> 26) | (t1 << 6)) & 0x03ff_ffff)) as u64;
+            let h2 = (self.h[2] + (((t1 >> 20) | (t2 << 12)) & 0x03ff_ffff)) as u64;
+            let h3 = (self.h[3] + (((t2 >> 14) | (t3 << 18)) & 0x03ff_ffff)) as u64;
+            let h4 = (self.h[4] + ((t3 >> 8) | hibit)) as u64;
+
+            let [r0, r1, r2, r3, r4] = self.r.map(u64::from);
+            let [s1, s2, s3, s4] = self.s.map(u64::from);
+
+            // h *= r mod 2¹³⁰−5 (schoolbook with the 5·r wrap-around terms)
+            let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+            let d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+            let d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+            let d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+            let d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+
+            // Partial carry propagation back into 26-bit limbs.
+            let mut c = d0 >> 26;
+            let nh0 = (d0 as u32) & 0x03ff_ffff;
+            let d1 = d1 + c;
+            c = d1 >> 26;
+            let nh1 = (d1 as u32) & 0x03ff_ffff;
+            let d2 = d2 + c;
+            c = d2 >> 26;
+            let nh2 = (d2 as u32) & 0x03ff_ffff;
+            let d3 = d3 + c;
+            c = d3 >> 26;
+            let nh3 = (d3 as u32) & 0x03ff_ffff;
+            let d4 = d4 + c;
+            c = d4 >> 26;
+            let nh4 = (d4 as u32) & 0x03ff_ffff;
+            let nh0 = nh0 as u64 + c * 5;
+            let carry = (nh0 >> 26) as u32;
+            self.h = [(nh0 as u32) & 0x03ff_ffff, nh1 + carry, nh2, nh3, nh4];
+        }
+
+        /// `h mod p`, fully reduced, as a 128-bit value (mod 2¹²⁸).
+        pub(super) fn reduce(&self) -> u128 {
+            // Fully carry h.
+            let [mut h0, mut h1, mut h2, mut h3, mut h4] = self.h;
+            let mut c = h1 >> 26;
+            h1 &= 0x03ff_ffff;
+            h2 += c;
+            c = h2 >> 26;
+            h2 &= 0x03ff_ffff;
+            h3 += c;
+            c = h3 >> 26;
+            h3 &= 0x03ff_ffff;
+            h4 += c;
+            c = h4 >> 26;
+            h4 &= 0x03ff_ffff;
+            h0 += c * 5;
+            c = h0 >> 26;
+            h0 &= 0x03ff_ffff;
+            h1 += c;
+
+            // Compute h − p; if it does not borrow, h ≥ p and we keep the
+            // result.
+            let mut g0 = h0 + 5;
+            c = g0 >> 26;
+            g0 &= 0x03ff_ffff;
+            let mut g1 = h1 + c;
+            c = g1 >> 26;
+            g1 &= 0x03ff_ffff;
+            let mut g2 = h2 + c;
+            c = g2 >> 26;
+            g2 &= 0x03ff_ffff;
+            let mut g3 = h3 + c;
+            c = g3 >> 26;
+            g3 &= 0x03ff_ffff;
+            let g4 = (h4 + c).wrapping_sub(1 << 26);
+
+            // mask = 0 when h < p (g4 borrowed, high bit set), else all-ones.
+            // `black_box` keeps the optimizer from turning the masked selects
+            // below into a branch on the secret comparison result.
+            let mask = core::hint::black_box((g4 >> 31).wrapping_sub(1));
+            g0 &= mask;
+            g1 &= mask;
+            g2 &= mask;
+            g3 &= mask;
+            let g4 = g4 & mask;
+            let nmask = !mask;
+            h0 = (h0 & nmask) | g0;
+            h1 = (h1 & nmask) | g1;
+            h2 = (h2 & nmask) | g2;
+            h3 = (h3 & nmask) | g3;
+            h4 = (h4 & nmask) | g4;
+
+            // Repack the 26-bit limbs into four 32-bit words (mod 2¹²⁸).
+            let w0 = h0 | (h1 << 26);
+            let w1 = (h1 >> 6) | (h2 << 20);
+            let w2 = (h2 >> 12) | (h3 << 14);
+            let w3 = (h3 >> 18) | (h4 << 8);
+            u128::from(w0)
+                | (u128::from(w1) << 32)
+                | (u128::from(w2) << 64)
+                | (u128::from(w3) << 96)
+        }
+
+        pub(super) fn wipe(&mut self) {
+            self.r.zeroize();
+            self.s.zeroize();
+            self.h.zeroize();
+        }
     }
 }
 
@@ -261,7 +579,9 @@ impl Drop for Poly1305 {
 /// scalar path. All arithmetic is multiply/add/shift/mask — no
 /// secret-dependent branches or lookups — and the result is pinned to the
 /// scalar path by a differential test over every length in `0..=1024` plus
-/// large and chunked-streaming cases.
+/// large and chunked-streaming cases. The scalar state is radix 2⁴⁴ on this
+/// target; `r` and `h` are converted to and from 26-bit limbs at the
+/// kernel boundary.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 #[allow(unsafe_code)]
 mod simd {
@@ -285,9 +605,9 @@ mod simd {
         unsafe { blocks_avx2(st, data) }
     }
 
-    /// Scalar `a·b mod 2¹³⁰−5` on 5×26-bit limbs (same schoolbook + partial
-    /// carry as `Poly1305::block`), used to precompute the powers of `r`.
-    /// Output limbs are below `2²⁶ + 2⁹`.
+    /// Scalar `a·b mod 2¹³⁰−5` on 5×26-bit limbs (schoolbook + partial
+    /// carry), used to precompute the powers of `r`. Output limbs are below
+    /// `2²⁶ + 2⁹`.
     fn mul_mod(a: &[u32; 5], b: &[u32; 5]) -> [u32; 5] {
         let [a0, a1, a2, a3, a4] = a.map(u64::from);
         let [b0, b1, b2, b3, b4] = b.map(u64::from);
@@ -431,7 +751,7 @@ mod simd {
             // Powers of the evaluation point: r¹..r⁸. Every one of these is
             // key-derived (r is half the Poly1305 one-time key), so they are
             // wiped at the end of the function alongside `sum`/`lanes`.
-            let mut r1 = st.r;
+            let mut r1 = st.st.r26();
             let mut r2 = mul_mod(&r1, &r1);
             let mut r3 = mul_mod(&r2, &r1);
             let mut r4 = mul_mod(&r2, &r2);
@@ -451,7 +771,8 @@ mod simd {
             // the oldest block, whose exponent is the highest).
             let mut ha = load4(data);
             let mut hb = load4(&data[64..128]);
-            for (a, &hin) in ha.iter_mut().zip(st.h.iter()) {
+            let mut h_in = st.st.h26();
+            for (a, &hin) in ha.iter_mut().zip(h_in.iter()) {
                 *a = _mm256_add_epi64(*a, _mm256_setr_epi64x(hin as i64, 0, 0, 0));
             }
 
@@ -496,7 +817,7 @@ mod simd {
                 let _ = core::hint::black_box(&lanes);
             }
 
-            // Carry back into the scalar accumulator's lazy 26-bit form.
+            // Carry back into lazy 26-bit limbs, then into the scalar state.
             let mut c = sum[0] >> 26;
             let h0 = (sum[0] as u32) & 0x03ff_ffff;
             sum[1] += c;
@@ -513,13 +834,17 @@ mod simd {
             let h4 = (sum[4] as u32) & 0x03ff_ffff;
             let h0 = h0 as u64 + c * 5;
             let carry = (h0 >> 26) as u32;
-            st.h = [(h0 as u32) & 0x03ff_ffff, h1 + carry, h2, h3, h4];
-            // `sum` is the folded accumulator. This kernel runs once per
-            // `update` of >= MIN_LEN bytes, so its scratch keeps the cheap
-            // vector store plus `black_box` rather than per-limb volatile
-            // stores (which would be a visible share of a 256-byte update).
+            st.st
+                .set_h26([(h0 as u32) & 0x03ff_ffff, h1 + carry, h2, h3, h4]);
+            // `sum` and `h_in` are accumulator state. This kernel runs once
+            // per `update` of >= MIN_LEN bytes, so its scratch keeps the
+            // cheap vector store plus `black_box` rather than per-limb
+            // volatile stores (which would be a visible share of a 256-byte
+            // update).
             sum = [0; 5];
+            h_in = [0; 5];
             let _ = core::hint::black_box(&sum);
+            let _ = core::hint::black_box(&h_in);
 
             // Best-effort wipe of the key-derived powers.
             for p in [
@@ -551,6 +876,130 @@ mod tests {
         );
     }
 
+    /// Small deterministic PRNG for keys and data (not security relevant).
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Independent reference: schoolbook Poly1305 over the crate's
+    /// `Uint`-free arithmetic — `u128` limbs are not enough for 2¹³⁰, so
+    /// this evaluates with a tiny 192-bit (three `u64`) big integer. Slow,
+    /// but unrelated to any limb layout above.
+    fn reference_tag(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
+        // 192-bit helpers: value = [lo, mid, hi], little-endian limbs.
+        type W = [u64; 3];
+        fn add(a: W, b: W) -> W {
+            let (l, c0) = a[0].overflowing_add(b[0]);
+            let (m, c1a) = a[1].overflowing_add(b[1]);
+            let (m, c1b) = m.overflowing_add(u64::from(c0));
+            let h = a[2]
+                .wrapping_add(b[2])
+                .wrapping_add(u64::from(c1a))
+                .wrapping_add(u64::from(c1b));
+            [l, m, h]
+        }
+        fn sub(a: W, b: W) -> W {
+            let (l, b0) = a[0].overflowing_sub(b[0]);
+            let (m, b1a) = a[1].overflowing_sub(b[1]);
+            let (m, b1b) = m.overflowing_sub(u64::from(b0));
+            let h = a[2]
+                .wrapping_sub(b[2])
+                .wrapping_sub(u64::from(b1a))
+                .wrapping_sub(u64::from(b1b));
+            [l, m, h]
+        }
+        fn ge(a: W, b: W) -> bool {
+            a.iter().rev().cmp(b.iter().rev()) != core::cmp::Ordering::Less
+        }
+        fn shl1(a: W) -> W {
+            [
+                a[0] << 1,
+                (a[1] << 1) | (a[0] >> 63),
+                (a[2] << 1) | (a[1] >> 63),
+            ]
+        }
+        // p = 2¹³⁰ − 5.
+        let p: W = [u64::MAX - 4, u64::MAX, 3];
+        // a · b mod p by double-and-add, both inputs below p.
+        let mulmod = |a: W, b: W| -> W {
+            let mut acc: W = [0; 3];
+            for i in (0..130).rev() {
+                acc = shl1(acc);
+                if ge(acc, p) {
+                    acc = sub(acc, p);
+                }
+                if (b[i / 64] >> (i % 64)) & 1 == 1 {
+                    acc = add(acc, a);
+                    if ge(acc, p) {
+                        acc = sub(acc, p);
+                    }
+                }
+            }
+            acc
+        };
+        let r = u128::from_le_bytes(key[..16].try_into().unwrap())
+            & 0x0fff_fffc_0fff_fffc_0fff_fffc_0fff_ffff;
+        let r: W = [r as u64, (r >> 64) as u64, 0];
+        let mut h: W = [0; 3];
+        for chunk in msg.chunks(16) {
+            let mut block = [0u8; 17];
+            block[..chunk.len()].copy_from_slice(chunk);
+            block[chunk.len()] = 1;
+            let lo = u128::from_le_bytes(block[..16].try_into().unwrap());
+            let m: W = [lo as u64, (lo >> 64) as u64, u64::from(block[16])];
+            h = add(h, m);
+            if ge(h, p) {
+                h = sub(h, p);
+            }
+            h = mulmod(h, r);
+        }
+        let h = u128::from(h[0]) | (u128::from(h[1]) << 64);
+        let s = u128::from_le_bytes(key[16..].try_into().unwrap());
+        h.wrapping_add(s).to_le_bytes()
+    }
+
+    /// Every length in `0..=1024`, one-shot and under chunked streaming that
+    /// straddles the leftover buffer, the two-stripe / vector paths and the
+    /// single-block tail, must match the independent big-integer reference.
+    /// This pins the radix-2⁴⁴ two-stripe fold and the AVX2 kernel alike.
+    #[test]
+    fn all_lengths_match_reference() {
+        use alloc::vec::Vec;
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut data = Vec::new();
+        for len in (0usize..=1024).chain([1500, 4096 + 17]) {
+            let mut key = [0u8; 32];
+            for b in key.iter_mut() {
+                *b = xorshift(&mut state) as u8;
+            }
+            data.resize(len, 0);
+            for b in data.iter_mut() {
+                *b = xorshift(&mut state) as u8;
+            }
+            let expected = reference_tag(&key, &data);
+
+            let mut p = Poly1305::new(&key);
+            p.update(&data);
+            assert_eq!(p.finish(), expected, "one-shot len={len}");
+
+            // Odd-sized chunks, preceded by a tiny one so the leftover
+            // buffer engages first; 48-byte chunks keep every run under the
+            // two-stripe threshold on some calls and over it on others.
+            let mut p = Poly1305::new(&key);
+            let mut rest = &data[..];
+            for chunk_len in [5usize, 301, 48, 48, 257] {
+                let take = chunk_len.min(rest.len());
+                p.update(&rest[..take]);
+                rest = &rest[take..];
+            }
+            p.update(rest);
+            assert_eq!(p.finish(), expected, "chunked len={len}");
+        }
+    }
+
     /// The AVX2 4-way path must produce the exact scalar tag for every
     /// length (byte-by-byte sweep across the dispatch threshold), for large
     /// messages, and under chunked streaming that straddles the leftover
@@ -564,17 +1013,10 @@ mod tests {
             return;
         }
 
-        // Small deterministic PRNG for keys and data (not security relevant).
         let mut state = 0x243f_6a88_85a3_08d3u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
         let mut fill = |buf: &mut [u8]| {
             for b in buf.iter_mut() {
-                *b = next() as u8;
+                *b = xorshift(&mut state) as u8;
             }
         };
 
