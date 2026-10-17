@@ -43,29 +43,92 @@ impl<C: BlockCipher> Cfb<C> {
 
     /// Encrypts `data` in place. May be called repeatedly across chunk
     /// boundaries.
+    ///
+    /// Whole blocks are processed 16 bytes at a time (the feedback chain is
+    /// inherently serial: each keystream block is `E` of the previous
+    /// ciphertext block); only a partial block at either end goes byte-wise.
     pub fn encrypt(&mut self, data: &mut [u8]) {
-        for byte in data.iter_mut() {
-            if self.pos == 16 {
-                self.refill();
-            }
-            let c = *byte ^ self.keystream[self.pos];
+        let mut i = 0;
+        // 1. Finish a partially consumed keystream block.
+        while self.pos < 16 && i < data.len() {
+            let c = data[i] ^ self.keystream[self.pos];
             self.feedback[self.pos] = c; // ciphertext feeds the next block
-            *byte = c;
+            data[i] = c;
             self.pos += 1;
+            i += 1;
+        }
+        // 2. Whole blocks (only reached with `pos == 16`): the ciphertext
+        //    block is the next feedback block in full.
+        while data.len() - i >= 16 {
+            let block: &mut [u8; 16] = (&mut data[i..i + 16]).try_into().expect("16 bytes");
+            self.cipher.encrypt_block(&mut self.feedback);
+            let c = u128::from_ne_bytes(*block) ^ u128::from_ne_bytes(self.feedback);
+            *block = c.to_ne_bytes();
+            self.feedback = *block;
+            i += 16;
+        }
+        // 3. Trailing partial block.
+        if i < data.len() {
+            self.refill();
+            while i < data.len() {
+                let c = data[i] ^ self.keystream[self.pos];
+                self.feedback[self.pos] = c;
+                data[i] = c;
+                self.pos += 1;
+                i += 1;
+            }
         }
     }
 
     /// Decrypts `data` in place. May be called repeatedly across chunk
     /// boundaries.
+    ///
+    /// Unlike encryption, CFB decryption is parallel: every keystream block
+    /// is `E` of a ciphertext block that is already known, so a window of
+    /// them goes through the batched
+    /// [`encrypt_blocks`](BlockCipher::encrypt_blocks) (the hardware
+    /// pipeline). Only a partial block at either end goes byte-wise.
     pub fn decrypt(&mut self, data: &mut [u8]) {
-        for byte in data.iter_mut() {
-            if self.pos == 16 {
-                self.refill();
-            }
-            let c = *byte;
+        let mut i = 0;
+        // 1. Finish a partially consumed keystream block.
+        while self.pos < 16 && i < data.len() {
+            let c = data[i];
             self.feedback[self.pos] = c; // ciphertext feeds the next block
-            *byte = c ^ self.keystream[self.pos];
+            data[i] = c ^ self.keystream[self.pos];
             self.pos += 1;
+            i += 1;
+        }
+        // 2. Whole blocks, a window at a time: the keystream for block `j` is
+        //    `E(C_{j-1})` with `C_{-1}` the current feedback block.
+        const W: usize = 64; // 1 KiB stack window
+        let mut ks = [0u8; 16 * W];
+        // High-water mark of `ks`: only this prefix ever held keystream.
+        let mut ks_used = 0;
+        while data.len() - i >= 16 {
+            let nblk = ((data.len() - i) / 16).min(W);
+            let n = nblk * 16;
+            ks[..16].copy_from_slice(&self.feedback);
+            ks[16..n].copy_from_slice(&data[i..i + n - 16]);
+            self.feedback.copy_from_slice(&data[i + n - 16..i + n]);
+            self.cipher.encrypt_blocks(&mut ks[..n]);
+            for (b, k) in data[i..i + n].iter_mut().zip(ks[..n].iter()) {
+                *b ^= *k;
+            }
+            ks_used = ks_used.max(n);
+            i += n;
+        }
+        // Raw keystream for this key: don't leave it in the stack frame.
+        ks[..ks_used].zeroize();
+        // 3. Trailing partial block.
+        if i < data.len() {
+            self.refill();
+            while i < data.len() {
+                let c = data[i];
+                self.feedback[self.pos] = c;
+                data[i] = c ^ self.keystream[self.pos];
+                self.pos += 1;
+                i += 1;
+            }
         }
     }
 }
@@ -131,5 +194,55 @@ mod tests {
             start += len;
         }
         assert_eq!(chunked, from_hex::<64>(CIPHERTEXT));
+
+        let mut chunked = from_hex::<64>(CIPHERTEXT);
+        let mut cfb = Cfb::new(Aes128::new(&key), &iv);
+        let mut start = 0;
+        for len in [5usize, 11, 16, 1, 31] {
+            cfb.decrypt(&mut chunked[start..start + len]);
+            start += len;
+        }
+        assert_eq!(chunked, plaintext);
+    }
+
+    /// The whole-block fast paths (serial encrypt, windowed decrypt) must
+    /// produce exactly the byte-wise stream across every split, including
+    /// windows larger than the batch width and splits inside a block.
+    #[test]
+    fn fast_paths_match_bytewise() {
+        let key = from_hex::<16>(KEY);
+        let iv = from_hex::<16>(IV);
+        let mut pt = [0u8; 16 * 70 + 7];
+        for (i, b) in pt.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(29).wrapping_add(3);
+        }
+        // Byte-wise reference: one byte per call.
+        let mut reference = pt;
+        let mut cfb = Cfb::new(Aes128::new(&key), &iv);
+        for i in 0..reference.len() {
+            cfb.encrypt(&mut reference[i..i + 1]);
+        }
+        let mut oneshot = pt;
+        Cfb::new(Aes128::new(&key), &iv).encrypt(&mut oneshot);
+        assert_eq!(oneshot[..], reference[..]);
+
+        let mut dec = reference;
+        Cfb::new(Aes128::new(&key), &iv).decrypt(&mut dec);
+        assert_eq!(dec[..], pt[..]);
+
+        let mut dec = reference;
+        let mut cfb = Cfb::new(Aes128::new(&key), &iv);
+        let mut start = 0;
+        for len in [
+            3usize,
+            13,
+            16 * 64 + 5,
+            50,
+            16 * 70 + 7 - 3 - 13 - 16 * 64 - 5 - 50,
+        ] {
+            cfb.decrypt(&mut dec[start..start + len]);
+            start += len;
+        }
+        assert_eq!(dec[..], pt[..]);
     }
 }

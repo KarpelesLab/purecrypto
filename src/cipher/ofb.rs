@@ -38,14 +38,31 @@ impl<C: BlockCipher> Ofb<C> {
     /// XORs the keystream into `data` in place, encrypting or decrypting it.
     ///
     /// May be called repeatedly; the keystream continues seamlessly across
-    /// calls regardless of chunk boundaries.
+    /// calls regardless of chunk boundaries. Whole blocks are XORed 16 bytes
+    /// at a time (the keystream chain itself is inherently serial).
     pub fn apply_keystream(&mut self, data: &mut [u8]) {
-        for byte in data.iter_mut() {
-            if self.pos == 16 {
-                self.refill();
-            }
-            *byte ^= self.block[self.pos];
+        let mut i = 0;
+        // 1. Finish a partially consumed keystream block.
+        while self.pos < 16 && i < data.len() {
+            data[i] ^= self.block[self.pos];
             self.pos += 1;
+            i += 1;
+        }
+        // 2. Whole blocks (only reached with `pos == 16`).
+        while data.len() - i >= 16 {
+            let chunk: &mut [u8; 16] = (&mut data[i..i + 16]).try_into().expect("16 bytes");
+            self.cipher.encrypt_block(&mut self.block);
+            *chunk = (u128::from_ne_bytes(*chunk) ^ u128::from_ne_bytes(self.block)).to_ne_bytes();
+            i += 16;
+        }
+        // 3. Trailing partial block.
+        if i < data.len() {
+            self.refill();
+            while i < data.len() {
+                data[i] ^= self.block[self.pos];
+                self.pos += 1;
+                i += 1;
+            }
         }
     }
 }
@@ -91,5 +108,34 @@ mod tests {
         // OFB is its own inverse.
         Ofb::new(Aes128::new(&key), &iv).apply_keystream(&mut buf);
         assert_eq!(buf, from_hex::<64>(PLAINTEXT));
+    }
+
+    /// The whole-block fast path must produce exactly the byte-wise stream
+    /// across every split.
+    #[test]
+    fn streaming_matches_bytewise() {
+        let key = from_hex::<16>("2b7e151628aed2a6abf7158809cf4f3c");
+        let iv = from_hex::<16>("000102030405060708090a0b0c0d0e0f");
+        let mut pt = [0u8; 16 * 9 + 5];
+        for (i, b) in pt.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(29).wrapping_add(3);
+        }
+        let mut reference = pt;
+        let mut ofb = Ofb::new(Aes128::new(&key), &iv);
+        for i in 0..reference.len() {
+            ofb.apply_keystream(&mut reference[i..i + 1]);
+        }
+        let mut oneshot = pt;
+        Ofb::new(Aes128::new(&key), &iv).apply_keystream(&mut oneshot);
+        assert_eq!(oneshot[..], reference[..]);
+
+        let mut chunked = pt;
+        let mut ofb = Ofb::new(Aes128::new(&key), &iv);
+        let mut start = 0;
+        for len in [3usize, 13, 40, 1, 16 * 9 + 5 - 3 - 13 - 40 - 1] {
+            ofb.apply_keystream(&mut chunked[start..start + len]);
+            start += len;
+        }
+        assert_eq!(chunked[..], reference[..]);
     }
 }

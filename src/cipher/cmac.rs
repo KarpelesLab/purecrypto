@@ -78,10 +78,9 @@ impl<C: BlockCipher> Cmac<C> {
     }
 
     /// Absorbs a completed 16-byte block into the CBC-MAC chain.
+    #[inline]
     fn absorb(&mut self, block: &[u8; 16]) {
-        for (s, b) in self.state.iter_mut().zip(block.iter()) {
-            *s ^= *b;
-        }
+        self.state = (u128::from_ne_bytes(self.state) ^ u128::from_ne_bytes(*block)).to_ne_bytes();
         self.cipher.encrypt_block(&mut self.state);
     }
 
@@ -89,20 +88,37 @@ impl<C: BlockCipher> Cmac<C> {
     ///
     /// A full block is only absorbed once a *following* byte arrives, so the
     /// final block (which is treated specially) is never absorbed early.
+    /// Whole blocks that are known not to be last are absorbed straight from
+    /// `data`; only the trailing (partial or possibly-final) block is staged.
     pub fn update(&mut self, mut data: &[u8]) {
-        while !data.is_empty() {
-            // If `pending` is a full block, it cannot be the last block (more
-            // data follows), so absorb it now before buffering more.
-            if self.pending_len == 16 {
-                let block = self.pending;
-                self.absorb(&block);
-                self.pending_len = 0;
-            }
+        if data.is_empty() {
+            return;
+        }
+        // Top up a partially filled staging block first.
+        if self.pending_len > 0 && self.pending_len < 16 {
             let n = core::cmp::min(16 - self.pending_len, data.len());
             self.pending[self.pending_len..self.pending_len + n].copy_from_slice(&data[..n]);
             self.pending_len += n;
             data = &data[n..];
+            if data.is_empty() {
+                return;
+            }
         }
+        // More data follows, so a full staging block cannot be the last.
+        if self.pending_len == 16 {
+            let block = self.pending;
+            self.absorb(&block);
+            self.pending_len = 0;
+        }
+        // Absorb every whole block except the final 1..=16 bytes, which are
+        // staged (they may be the last block).
+        let direct = (data.len() - 1) / 16 * 16;
+        for block in data[..direct].chunks_exact(16) {
+            self.absorb(block.try_into().expect("16-byte block"));
+        }
+        data = &data[direct..];
+        self.pending[..data.len()].copy_from_slice(data);
+        self.pending_len = data.len();
     }
 
     /// Consumes the MAC and returns the 16-byte tag (RFC 4493 §2.4).
