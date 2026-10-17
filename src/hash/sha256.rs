@@ -243,7 +243,7 @@ const fn rotr(x: u32, n: u32) -> u32 {
     all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
     allow(unsafe_code)
 )]
-fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
+pub(crate) fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if super::sha_hw::sha256_supported() {
         // SAFETY: guarded by the `sha256_supported()` feature check.

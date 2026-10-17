@@ -96,11 +96,12 @@ pub enum Error {
 #[cfg(feature = "alloc")]
 fn wots_expand_seed(p: &Params, sk_seed: &[u8], pub_seed: &[u8], addr: &mut Adrs, out: &mut [u8]) {
     // The `wots_len` (~67) PRF_keygen calls are mutually independent, so on
-    // x86_64+AVX2 (SHA-256 sets) derive them eight at a time through the
-    // multi-buffer SHA-256 kernel — this is on the hot keygen/tree-build path.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
-    if wots_x8::eligible(p) && crate::hash::sha256_mb::supported() {
-        wots_x8::expand_seed_x8(p, sk_seed, pub_seed, addr, out);
+    // x86_64 / aarch64 (SHA-256 sets) derive them several at a time through
+    // the multi-buffer SHA-256 kernel — this is on the hot keygen/tree-build
+    // path.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if wots_mb::eligible(p) {
+        wots_mb::expand_seed(p, sk_seed, pub_seed, addr, out);
         return;
     }
     wots_expand_seed_scalar(p, sk_seed, pub_seed, addr, out);
@@ -160,172 +161,207 @@ fn wots_chain(
     }
 }
 
-/// WOTS+ public key generation (RFC 8391 §3.1.4): full chains over the secret.
-#[cfg(feature = "alloc")]
-fn wots_pkgen(p: &Params, sk_seed: &[u8], pub_seed: &[u8], addr: &mut Adrs, pk: &mut [u8]) {
-    let n = p.n;
-    wots_expand_seed(p, sk_seed, pub_seed, addr, pk);
-    // Every chain runs the full 0..w-1 range here and the chains are mutually
-    // independent, so on x86_64+AVX2 (SHA-256 sets) run them 8 at a time through
-    // the multi-buffer SHA-256 kernel — this dominates keygen and tree building.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
-    if wots_x8::eligible(p) && crate::hash::sha256_mb::supported() {
-        wots_x8::full_chains(p, pub_seed, addr, pk);
+/// Advances every WOTS+ chain `i` of `vals` (`wots_len` values of `n` bytes,
+/// in place) from position `pos[i]` to `end[i]` (`end[i] <= w − 1`; chains
+/// with `pos >= end` are left untouched). `addr` is OTS-typed with the
+/// layer/tree/OTS fields set; chain, hash and keyAndMask are set per step.
+/// Chain positions are public (the base-`w` digits of the published
+/// signature's message digest).
+///
+/// The chains are mutually independent, so on x86_64 / aarch64 (SHA-256
+/// sets) they run in lockstep through the multi-buffer SHA-256 kernel — this
+/// dominates keygen, tree building, signing and verification. Byte-identical
+/// to the scalar [`wots_chain`] loop (pinned by differential tests).
+fn wots_chains(
+    p: &Params,
+    pub_seed: &[u8],
+    addr: &mut Adrs,
+    vals: &mut [u8],
+    pos: &[u32],
+    end: &[u32],
+) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if wots_mb::eligible(p) {
+        wots_mb::chains(p, pub_seed, addr, vals, pos, end);
         return;
     }
+    let n = p.n;
     for i in 0..p.wots_len {
         addr.set_chain(i as u32);
         wots_chain(
             p,
             pub_seed,
-            &mut pk[i * n..i * n + n],
-            0,
-            p.wots_w - 1,
+            &mut vals[i * n..i * n + n],
+            pos[i],
+            end[i].saturating_sub(pos[i]),
             addr,
         );
     }
 }
 
-/// Fast differential test: the batched WOTS+ chains must equal the scalar
-/// `wots_chain` loop over the same chain-start values (a single WOTS+ key, so it
-/// avoids the multi-second RFC KAT tree builds).
-#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
-mod wots_x8_tests {
-    use super::*;
+/// Chain position `0` for every chain (full-chain start).
+#[cfg(feature = "alloc")]
+const CHAIN_START: [u32; MAX_WOTS_LEN] = [0; MAX_WOTS_LEN];
 
-    #[test]
-    fn batched_matches_scalar() {
-        if !crate::hash::sha256_mb::supported() {
-            return;
-        }
-        let p = XmssParamSet::Sha2_10_256.params();
-        let n = p.n;
-        let mut starts = vec![0u8; p.wots_len * n];
-        for (i, b) in starts.iter_mut().enumerate() {
-            *b = (i * 7 + 1) as u8;
-        }
-        let pub_seed: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
-        let mut base = Adrs::new();
-        base.set_type(AdrsType::Ots);
-        base.set_ots(42);
-
-        let mut pk_scalar = starts.clone();
-        for i in 0..p.wots_len {
-            let mut a = base;
-            a.set_chain(i as u32);
-            wots_chain(
-                &p,
-                &pub_seed,
-                &mut pk_scalar[i * n..i * n + n],
-                0,
-                p.wots_w - 1,
-                &mut a,
-            );
-        }
-
-        let mut pk_batched = starts.clone();
-        wots_x8::full_chains(&p, &pub_seed, &base, &mut pk_batched);
-
-        assert_eq!(pk_scalar, pk_batched);
-    }
-
-    #[test]
-    fn expand_seed_batched_matches_scalar() {
-        if !crate::hash::sha256_mb::supported() {
-            return;
-        }
-        let p = XmssParamSet::Sha2_10_256.params();
-        let n = p.n;
-        let sk_seed: Vec<u8> = (0..n).map(|i| (i * 11 + 3) as u8).collect();
-        let pub_seed: Vec<u8> = (0..n).map(|i| (i * 5 + 9) as u8).collect();
-        let mut base = Adrs::new();
-        base.set_type(AdrsType::Ots);
-        base.set_ots(7);
-
-        let mut out_scalar = vec![0u8; p.wots_len * n];
-        let mut a_scalar = base;
-        wots_expand_seed_scalar(&p, &sk_seed, &pub_seed, &mut a_scalar, &mut out_scalar);
-
-        let mut out_batched = vec![0u8; p.wots_len * n];
-        let mut a_batched = base;
-        wots_x8::expand_seed_x8(&p, &sk_seed, &pub_seed, &mut a_batched, &mut out_batched);
-
-        assert_eq!(out_scalar, out_batched);
-        // The dispatcher and scalar fallback must leave `addr` in the same state.
-        assert_eq!(a_scalar.to_bytes(), a_batched.to_bytes());
-    }
+/// WOTS+ public key generation (RFC 8391 §3.1.4): full chains over the secret.
+#[cfg(feature = "alloc")]
+fn wots_pkgen(p: &Params, sk_seed: &[u8], pub_seed: &[u8], addr: &mut Adrs, pk: &mut [u8]) {
+    wots_expand_seed(p, sk_seed, pub_seed, addr, pk);
+    let end = [p.wots_w - 1; MAX_WOTS_LEN];
+    wots_chains(
+        p,
+        pub_seed,
+        addr,
+        pk,
+        &CHAIN_START[..p.wots_len],
+        &end[..p.wots_len],
+    );
 }
 
-/// Multi-buffer (AVX2) WOTS+ chain evaluation: eight independent chains hashed
-/// in lockstep through the 8-way SHA-256 kernel. Produces byte-identical output
-/// to the scalar [`wots_chain`] loop (pinned by a differential test); used only
-/// for the SHA-256 `n = 32` sets, where `F`/`PRF` are exactly two 64-byte blocks
-/// of a 96-byte message.
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
-mod wots_x8 {
+/// Multi-buffer WOTS+ evaluation: independent chains hashed in lockstep
+/// through a SHA-256 kernel — the AVX2 / AVX-512 multi-buffer kernels on
+/// x86_64, and otherwise (aarch64) four single-stream compressions issued
+/// back-to-back, which the out-of-order core overlaps (measured on Apple
+/// M-series: 51.6 → 22.9 ns per hardware SHA-256 compression). Produces
+/// byte-identical output to the scalar [`wots_chain`] / `wots_expand_seed`
+/// loops (pinned by differential tests); used only for the SHA-256 `n = 32`
+/// sets, where `F`/`PRF` are exactly two 64-byte blocks of a 96-byte message.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod wots_mb {
     use super::Adrs;
     use super::params::{HashFamily, Params};
     use crate::hash::sha256::{H256, compress256_soft};
-    use crate::hash::sha256_mb::{LANES, LANES16, compress8, compress16, supported16};
+
+    /// Lanes of the lockstep (non-SIMD) kernel.
+    pub(super) const LOCKSTEP: usize = 4;
+
+    /// An `L`-lane SHA-256 kernel: compresses `blocks[l]` into `states[l]` for
+    /// every `l < lanes` (the SIMD kernels process all `L` lanes regardless).
+    pub(super) type Sha256Kernel<const L: usize> = fn(&mut [[u32; 8]; L], &[[u8; 64]; L], usize);
+
+    pub(super) fn lockstep256<const L: usize>(
+        states: &mut [[u32; 8]; L],
+        blocks: &[[u8; 64]; L],
+        lanes: usize,
+    ) {
+        for (s, b) in states.iter_mut().zip(blocks).take(lanes) {
+            crate::hash::sha256::compress256(s, b);
+        }
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    fn sha256_x8(
+        states: &mut [[u32; 8]; crate::hash::sha256_mb::LANES],
+        blocks: &[[u8; 64]; crate::hash::sha256_mb::LANES],
+        _lanes: usize,
+    ) {
+        crate::hash::sha256_mb::compress8(states, blocks);
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    fn sha256_x16(
+        states: &mut [[u32; 8]; crate::hash::sha256_mb::LANES16],
+        blocks: &[[u8; 64]; crate::hash::sha256_mb::LANES16],
+        _lanes: usize,
+    ) {
+        crate::hash::sha256_mb::compress16(states, blocks);
+    }
+
+    /// Expands to `$f::<L>($args…, kernel)` with the widest available
+    /// SHA-256 kernel: 16 lanes on AVX-512, 8 on AVX2, else the lockstep
+    /// kernel. Must be the tail expression of a function returning what `$f`
+    /// returns.
+    macro_rules! sha256_dispatch {
+        ($f:ident($($a:expr),* $(,)?)) => {{
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            {
+                if crate::hash::sha256_mb::supported16() {
+                    return $f::<{ crate::hash::sha256_mb::LANES16 }>($($a,)* sha256_x16);
+                }
+                if crate::hash::sha256_mb::supported() {
+                    return $f::<{ crate::hash::sha256_mb::LANES }>($($a,)* sha256_x8);
+                }
+            }
+            $f::<LOCKSTEP>($($a,)* lockstep256::<LOCKSTEP>)
+        }};
+    }
+
+    const N: usize = 32;
 
     /// The batcher handles only the SHA-256, `n = 32`, `padding_len = 32` sets,
     /// where `pad‖key` is exactly one block and `F`/`PRF` are 96-byte messages.
     pub(super) fn eligible(p: &Params) -> bool {
-        matches!(p.family, HashFamily::Sha2_256) && p.n == 32 && p.padding_len == 32
+        matches!(p.family, HashFamily::Sha2_256) && p.n == N && p.padding_len == N
     }
 
     /// Second block of a 96-byte (2-block) SHA-256 message: `data ‖ 0x80 ‖
     /// 0…0 ‖ len`, with `len = 768` bits.
     #[inline]
-    fn block1_96(data: &[u8; 32]) -> [u8; 64] {
+    fn block1_96(data: &[u8; N]) -> [u8; 64] {
         let mut b = [0u8; 64];
-        b[..32].copy_from_slice(data);
-        b[32] = 0x80;
+        b[..N].copy_from_slice(data);
+        b[N] = 0x80;
         b[56..64].copy_from_slice(&768u64.to_be_bytes());
         b
     }
 
     /// Big-endian serialization of a SHA-256 state into its 32-byte digest.
     #[inline]
-    fn state_be(s: &[u32; 8]) -> [u8; 32] {
-        let mut o = [0u8; 32];
+    fn state_be(s: &[u32; 8]) -> [u8; N] {
+        let mut o = [0u8; N];
         for (i, w) in s.iter().enumerate() {
             o[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
         }
         o
     }
 
-    /// Runs every WOTS+ chain over its full `0..w-1` range, 16 chains at a
-    /// time on AVX-512, else 8. `pk` enters holding the chain start values and leaves holding the
-    /// chain ends. `addr` supplies the layer/tree/OTS fields (chain/hash/keymask
-    /// are set per lane).
-    pub(super) fn full_chains(p: &Params, pub_seed: &[u8], addr: &Adrs, pk: &mut [u8]) {
-        // Widest available multi-buffer kernel drives the same loop.
-        if supported16() {
-            full_chains_n::<LANES16>(p, pub_seed, addr, pk, compress16)
-        } else {
-            full_chains_n::<LANES>(p, pub_seed, addr, pk, compress8)
-        }
-    }
-
-    fn full_chains_n<const L: usize>(
-        p: &Params,
-        pub_seed: &[u8],
-        addr: &Adrs,
-        pk: &mut [u8],
-        compress: fn(&mut [[u32; 8]; L], &[[u8; 64]; L]),
-    ) {
-        const N: usize = 32;
-        // PRF shared block 0 = toByte(3, 32) ‖ PUB_SEED → a single midstate
-        // reused for every key/bitmask PRF (PUB_SEED is constant).
+    /// PRF shared block 0 = `toByte(3, 32) ‖ PUB_SEED` → a single midstate
+    /// reused for every key/bitmask PRF (PUB_SEED is constant).
+    fn prf_midstate(pub_seed: &[u8]) -> [u32; 8] {
         let mut b0 = [0u8; 64];
         b0[31] = 3;
         b0[32..64].copy_from_slice(&pub_seed[..N]);
-        let mut prf_mid = H256;
-        compress256_soft(&mut prf_mid, &b0);
+        let mut mid = H256;
+        compress256_soft(&mut mid, &b0);
+        mid
+    }
 
-        let steps = p.wots_w - 1;
-        let mut c0 = 0usize;
+    /// [`super::wots_chains`] through the SHA-256 kernel.
+    pub(super) fn chains(
+        p: &Params,
+        pub_seed: &[u8],
+        base: &Adrs,
+        vals: &mut [u8],
+        pos: &[u32],
+        end: &[u32],
+    ) {
+        sha256_dispatch!(chains_n(p, pub_seed, base, vals, pos, end))
+    }
+
+    /// Advances chain `c` (the value at `vals[c·N..]`, `c < wots_len`) from
+    /// position `pos[c]` to `end[c]` in place, `L` chains in lockstep: per
+    /// step, the key and bitmask PRFs (one block each on the PRF midstate),
+    /// then `F(KEY, inout ⊕ BM) = SHA-256(toByte(0,32) ‖ KEY ‖ masked)` (two
+    /// blocks) — four kernel calls per step.
+    ///
+    /// Lanes are refilled as chains finish, so the kernel runs with every
+    /// lane active until the last `L − 1` chains drain — the total work is
+    /// `⌈Σ steps / L⌉` kernel calls rather than `Σ max-of-group`. Chain
+    /// positions are public, so the scheduling may depend on them.
+    pub(super) fn chains_n<const L: usize>(
+        p: &Params,
+        pub_seed: &[u8],
+        base: &Adrs,
+        vals: &mut [u8],
+        pos: &[u32],
+        end: &[u32],
+        kernel: Sha256Kernel<L>,
+    ) {
+        let prf_mid = prf_midstate(pub_seed);
+        let len = p.wots_len;
+        let mut chain = [0u32; L];
+        let mut at = [0u32; L];
+        let mut stop = [0u32; L];
         // The lane buffers are declared once and reused (never shadowed inside
         // the step loop) so that every copy of a secret chain value lives in
         // memory that is wiped before this function returns.
@@ -337,54 +373,76 @@ mod wots_x8 {
         let mut ks = [prf_mid; L];
         let mut bs = [prf_mid; L];
         let mut fs = [H256; L];
-        while c0 < p.wots_len {
-            let lanes = (p.wots_len - c0).min(L);
-            for (l, io) in inout.iter_mut().enumerate().take(lanes) {
-                io.copy_from_slice(&pk[(c0 + l) * N..(c0 + l) * N + N]);
-            }
-
-            for step in 0..steps {
-                // KEY = PRF(.., keyAndMask=0); BM = PRF(.., keyAndMask=1).
-                for l in 0..L {
-                    let chain = if l < lanes { c0 + l } else { c0 };
-                    let mut a = *addr;
-                    a.set_chain(chain as u32);
-                    a.set_hash(step);
-                    a.set_key_and_mask(0);
-                    keyb1[l] = block1_96(&a.to_bytes());
-                    a.set_key_and_mask(1);
-                    bmb1[l] = block1_96(&a.to_bytes());
+        let mut active = 0usize;
+        let mut next = 0usize;
+        loop {
+            // Fill idle lanes with the next chains that have steps left.
+            while active < L && next < len {
+                let c = next;
+                next += 1;
+                if pos[c] >= end[c] {
+                    continue;
                 }
-                ks = [prf_mid; L];
-                compress(&mut ks, &keyb1);
-                bs = [prf_mid; L];
-                compress(&mut bs, &bmb1);
+                chain[active] = c as u32;
+                at[active] = pos[c];
+                stop[active] = end[c];
+                inout[active].copy_from_slice(&vals[c * N..c * N + N]);
+                active += 1;
+            }
+            if active == 0 {
+                break;
+            }
+            // KEY = PRF(.., keyAndMask=0); BM = PRF(.., keyAndMask=1).
+            for l in 0..active {
+                let mut a = *base;
+                a.set_chain(chain[l]);
+                a.set_hash(at[l]);
+                a.set_key_and_mask(0);
+                keyb1[l] = block1_96(&a.to_bytes());
+                a.set_key_and_mask(1);
+                bmb1[l] = block1_96(&a.to_bytes());
+            }
+            ks = [prf_mid; L];
+            kernel(&mut ks, &keyb1, active);
+            bs = [prf_mid; L];
+            kernel(&mut bs, &bmb1, active);
 
-                // F(KEY, inout ⊕ BM) = SHA-256(toByte(0,32) ‖ KEY ‖ masked).
-                fb0 = [[0u8; 64]; L];
-                for l in 0..L {
-                    let key = state_be(&ks[l]);
-                    let bm = state_be(&bs[l]);
-                    fb0[l][32..64].copy_from_slice(&key);
-                    let mut masked = [0u8; N];
-                    for j in 0..N {
-                        masked[j] = inout[l][j] ^ bm[j];
-                    }
-                    fb1[l] = block1_96(&masked);
-                    super::wipe(&mut masked);
+            // F(KEY, inout ⊕ BM) = SHA-256(toByte(0,32) ‖ KEY ‖ masked).
+            for l in 0..active {
+                let key = state_be(&ks[l]);
+                let bm = state_be(&bs[l]);
+                fb0[l] = [0u8; 64];
+                fb0[l][N..64].copy_from_slice(&key);
+                let mut masked = [0u8; N];
+                for j in 0..N {
+                    masked[j] = inout[l][j] ^ bm[j];
                 }
-                fs = [H256; L];
-                compress(&mut fs, &fb0);
-                compress(&mut fs, &fb1);
-                for (l, io) in inout.iter_mut().enumerate().take(lanes) {
-                    *io = state_be(&fs[l]);
+                fb1[l] = block1_96(&masked);
+                super::wipe(&mut masked);
+            }
+            fs = [H256; L];
+            kernel(&mut fs, &fb0, active);
+            kernel(&mut fs, &fb1, active);
+            for l in 0..active {
+                inout[l] = state_be(&fs[l]);
+                at[l] += 1;
+            }
+            // Retire finished lanes, moving the last active lane into the gap
+            // so the active lanes stay a prefix.
+            let mut l = 0;
+            while l < active {
+                if at[l] == stop[l] {
+                    let c = chain[l] as usize;
+                    vals[c * N..c * N + N].copy_from_slice(&inout[l]);
+                    active -= 1;
+                    chain[l] = chain[active];
+                    at[l] = at[active];
+                    stop[l] = stop[active];
+                    inout[l] = inout[active];
+                } else {
+                    l += 1;
                 }
             }
-
-            for (l, io) in inout.iter().enumerate().take(lanes) {
-                pk[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(io);
-            }
-            c0 += lanes;
         }
         // `inout` held the secret chain starts and every intermediate, `fb1`
         // the masked chain values, and `fs` the hash state over them. Only the
@@ -400,9 +458,21 @@ mod wots_x8 {
         }
     }
 
-    /// Derives every WOTS+ secret chain start via `PRF_keygen`, eight chains at
-    /// a time. Byte-identical to the scalar `wots_expand_seed` loop (pinned by a
-    /// differential test); SHA-256 `n = 32` sets only.
+    /// [`super::wots_expand_seed`] through the SHA-256 kernel.
+    #[cfg(feature = "alloc")]
+    pub(super) fn expand_seed(
+        p: &Params,
+        sk_seed: &[u8],
+        pub_seed: &[u8],
+        addr: &mut Adrs,
+        out: &mut [u8],
+    ) {
+        sha256_dispatch!(expand_seed_n(p, sk_seed, pub_seed, addr, out))
+    }
+
+    /// Derives every WOTS+ secret chain start via `PRF_keygen`, `L` chains at
+    /// a time. Byte-identical to the scalar `wots_expand_seed` loop (pinned by
+    /// a differential test); SHA-256 `n = 32` sets only.
     ///
     /// `PRF_keygen(SK_SEED, PUB_SEED ‖ ADRS_i)` = SHA-256 over a 128-byte
     /// (3-block) message `toByte(4,32) ‖ SK_SEED ‖ PUB_SEED ‖ ADRS_i`:
@@ -411,14 +481,15 @@ mod wots_x8 {
     /// - block1 = `PUB_SEED ‖ ADRS_i` — a full 64-byte block, ADRS differs per
     ///   lane (chain index);
     /// - block2 = padding only (`0x80 …  len=1024` bits), identical for all lanes.
-    pub(super) fn expand_seed_x8(
+    #[cfg(feature = "alloc")]
+    pub(super) fn expand_seed_n<const L: usize>(
         p: &Params,
         sk_seed: &[u8],
         pub_seed: &[u8],
         addr: &mut Adrs,
         out: &mut [u8],
+        kernel: Sha256Kernel<L>,
     ) {
-        const N: usize = 32;
         // block0 = toByte(4, 32) ‖ SK_SEED → one midstate (SK_SEED is constant).
         let mut b0 = [0u8; 64];
         b0[31] = 4;
@@ -430,10 +501,11 @@ mod wots_x8 {
         crate::zeroize::Zeroize::zeroize(&mut b0);
 
         // block2 = padding for a 128-byte message: 0x80 then the bit length
-        // (1024) in the trailing u64. Identical across all eight lanes.
+        // (1024) in the trailing u64. Identical across all lanes.
         let mut block2 = [0u8; 64];
         block2[0] = 0x80;
         block2[56..64].copy_from_slice(&1024u64.to_be_bytes());
+        let block2s = [block2; L];
 
         // Mirror the scalar address state: hash = 0, keyAndMask = 0 (chain set
         // per lane). Leaves `addr` with chain = wots_len - 1, matching the
@@ -441,37 +513,134 @@ mod wots_x8 {
         addr.set_hash(0);
         addr.set_key_and_mask(0);
 
+        let mut b1 = [[0u8; 64]; L];
+        let mut states = [keygen_mid; L];
         let mut c0 = 0usize;
         while c0 < p.wots_len {
-            let lanes = (p.wots_len - c0).min(LANES);
+            let lanes = (p.wots_len - c0).min(L);
             // block1 = PUB_SEED ‖ ADRS_i per lane.
-            let mut b1 = [[0u8; 64]; LANES];
-            for (l, b) in b1.iter_mut().enumerate() {
-                let chain = if l < lanes { c0 + l } else { c0 };
-                addr.set_chain(chain as u32);
+            for (l, b) in b1.iter_mut().enumerate().take(lanes) {
+                addr.set_chain((c0 + l) as u32);
                 b[..N].copy_from_slice(&pub_seed[..N]);
                 b[N..64].copy_from_slice(&addr.to_bytes());
             }
-            let mut states = [keygen_mid; LANES];
-            compress8(&mut states, &b1);
-            let block2s = [block2; LANES];
-            compress8(&mut states, &block2s);
-
+            states = [keygen_mid; L];
+            kernel(&mut states, &b1, lanes);
+            kernel(&mut states, &block2s, lanes);
             for (l, st) in states.iter().enumerate().take(lanes) {
                 out[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(&state_be(st));
             }
-            // `states` *is* the WOTS+ secret chain starts (the caller keeps its
-            // own copy in `out`); the padding lanes hold a duplicate of one.
-            crate::zeroize::Zeroize::zeroize(states.as_flattened_mut());
             c0 += lanes;
         }
+        // `states` *is* the WOTS+ secret chain starts (the caller keeps its
+        // own copy in `out`).
+        crate::zeroize::Zeroize::zeroize(states.as_flattened_mut());
 
-        // Leave `addr` exactly as the scalar loop does: chain = wots_len - 1
-        // (padding lanes above rolled it back to a group start).
+        // Leave `addr` exactly as the scalar loop does: chain = wots_len - 1.
         if p.wots_len > 0 {
             addr.set_chain((p.wots_len - 1) as u32);
         }
         crate::zeroize::Zeroize::zeroize(&mut keygen_mid);
+    }
+}
+
+/// Differential tests: the batched WOTS+ paths must equal the scalar loops
+/// over the same inputs (a single WOTS+ key, so they avoid the multi-second
+/// RFC KAT tree builds), for full and random partial chains, through the
+/// dispatched kernel and the lockstep kernel explicitly.
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod wots_mb_tests {
+    use super::*;
+
+    #[test]
+    fn batched_matches_scalar() {
+        let p = XmssParamSet::Sha2_10_256.params();
+        let n = p.n;
+        let len = p.wots_len;
+        let mut starts = vec![0u8; len * n];
+        for (i, b) in starts.iter_mut().enumerate() {
+            *b = (i * 7 + 1) as u8;
+        }
+        let pub_seed: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
+        let mut base = Adrs::new();
+        base.set_type(AdrsType::Ots);
+        base.set_ots(42);
+
+        for salt in 0..3u32 {
+            let mut pos = [0u32; MAX_WOTS_LEN];
+            let mut end = [p.wots_w - 1; MAX_WOTS_LEN];
+            if salt > 0 {
+                for i in 0..len {
+                    let a = (i as u32 * 7 + salt * 3) % 16;
+                    let b = (i as u32 * 11 + salt * 5 + 1) % 16;
+                    pos[i] = a.min(b);
+                    end[i] = a.max(b);
+                }
+            }
+            let mut want = starts.clone();
+            for i in 0..len {
+                let mut a = base;
+                a.set_chain(i as u32);
+                wots_chain(
+                    &p,
+                    &pub_seed,
+                    &mut want[i * n..i * n + n],
+                    pos[i],
+                    end[i] - pos[i],
+                    &mut a,
+                );
+            }
+            let mut got = starts.clone();
+            let mut a = base;
+            wots_chains(&p, &pub_seed, &mut a, &mut got, &pos[..len], &end[..len]);
+            assert_eq!(want, got, "salt {salt} dispatch");
+            let mut got = starts.clone();
+            wots_mb::chains_n::<4>(
+                &p,
+                &pub_seed,
+                &base,
+                &mut got,
+                &pos[..len],
+                &end[..len],
+                wots_mb::lockstep256::<4>,
+            );
+            assert_eq!(want, got, "salt {salt} lockstep");
+        }
+    }
+
+    #[test]
+    fn expand_seed_batched_matches_scalar() {
+        let p = XmssParamSet::Sha2_10_256.params();
+        let n = p.n;
+        let sk_seed: Vec<u8> = (0..n).map(|i| (i * 11 + 3) as u8).collect();
+        let pub_seed: Vec<u8> = (0..n).map(|i| (i * 5 + 9) as u8).collect();
+        let mut base = Adrs::new();
+        base.set_type(AdrsType::Ots);
+        base.set_ots(7);
+
+        let mut out_scalar = vec![0u8; p.wots_len * n];
+        let mut a_scalar = base;
+        wots_expand_seed_scalar(&p, &sk_seed, &pub_seed, &mut a_scalar, &mut out_scalar);
+
+        let mut out_batched = vec![0u8; p.wots_len * n];
+        let mut a_batched = base;
+        wots_expand_seed(&p, &sk_seed, &pub_seed, &mut a_batched, &mut out_batched);
+        assert_eq!(out_scalar, out_batched);
+        // The dispatcher and scalar fallback must leave `addr` in the same state.
+        assert_eq!(a_scalar.to_bytes(), a_batched.to_bytes());
+
+        let mut out_lockstep = vec![0u8; p.wots_len * n];
+        let mut a_lockstep = base;
+        wots_mb::expand_seed_n::<4>(
+            &p,
+            &sk_seed,
+            &pub_seed,
+            &mut a_lockstep,
+            &mut out_lockstep,
+            wots_mb::lockstep256::<4>,
+        );
+        assert_eq!(out_scalar, out_lockstep);
+        assert_eq!(a_scalar.to_bytes(), a_lockstep.to_bytes());
     }
 }
 
@@ -527,13 +696,16 @@ fn wots_sign(
     addr: &mut Adrs,
     sig: &mut [u8],
 ) {
-    let n = p.n;
     let lengths = chain_lengths(p, msg);
     wots_expand_seed(p, sk_seed, pub_seed, addr, sig);
-    for i in 0..p.wots_len {
-        addr.set_chain(i as u32);
-        wots_chain(p, pub_seed, &mut sig[i * n..i * n + n], 0, lengths[i], addr);
-    }
+    wots_chains(
+        p,
+        pub_seed,
+        addr,
+        sig,
+        &CHAIN_START[..p.wots_len],
+        &lengths[..p.wots_len],
+    );
 }
 
 /// WOTS+ public key from a signature (RFC 8391 §3.1.6).
@@ -545,20 +717,18 @@ fn wots_pk_from_sig(
     addr: &mut Adrs,
     pk: &mut [u8],
 ) {
-    let n = p.n;
+    let total = p.wots_len * p.n;
     let lengths = chain_lengths(p, msg);
-    for i in 0..p.wots_len {
-        addr.set_chain(i as u32);
-        pk[i * n..i * n + n].copy_from_slice(&sig[i * n..i * n + n]);
-        wots_chain(
-            p,
-            pub_seed,
-            &mut pk[i * n..i * n + n],
-            lengths[i],
-            p.wots_w - 1 - lengths[i],
-            addr,
-        );
-    }
+    pk[..total].copy_from_slice(&sig[..total]);
+    let end = [p.wots_w - 1; MAX_WOTS_LEN];
+    wots_chains(
+        p,
+        pub_seed,
+        addr,
+        pk,
+        &lengths[..p.wots_len],
+        &end[..p.wots_len],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,7 +1540,7 @@ fn validate_raw_sk(p: &Params, raw: &[u8]) -> Result<(), Error> {
 
 /// Wipes a secret byte buffer through [`crate::zeroize::Zeroize`]: volatile
 /// stores plus a compiler fence, so the writes cannot be elided as dead stores.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "alloc", target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 fn wipe(v: &mut [u8]) {
     crate::zeroize::Zeroize::zeroize(v);

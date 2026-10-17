@@ -130,7 +130,7 @@ fn round(a: &mut [u64; 25], rc: u64) {
 /// `rounds == 24` is the full Keccak-f used by SHA-3, SHAKE, and KMAC; the
 /// reduced-round variant (`rounds == 12`, the last 12 round constants) is used
 /// by TurboSHAKE and KangarooTwelve. Constant time: bitwise operations only.
-pub(super) fn keccak_p(a: &mut [u64; 25], rounds: usize) {
+pub(crate) fn keccak_p(a: &mut [u64; 25], rounds: usize) {
     // Enter the lane-complemented representation, run the (identical) rounds,
     // and leave it again. The pattern is round-invariant, so the round count
     // (24 or 12) does not matter.

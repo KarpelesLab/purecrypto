@@ -52,6 +52,7 @@ fn compute_q(i_id: &[u8; 16], q: u32, c: &[u8; N], message: &[u8]) -> [u8; N] {
 }
 
 /// One Winternitz-chain step: `H(I || u32str(q) || u16str(i) || u8str(j) || tmp)`.
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 fn chain_step(i_id: &[u8; 16], q: u32, chain: u16, j: u8, tmp: &mut [u8; N]) {
     let mut h = Sha256::new();
     h.update(i_id);
@@ -65,6 +66,14 @@ fn chain_step(i_id: &[u8; 16], q: u32, chain: u16, j: u8, tmp: &mut [u8; N]) {
 /// Derives the LM-OTS private element `x[chain]` pseudorandomly from the LMS
 /// master `seed` (RFC 8554 Appendix A; the variant standardized in
 /// NIST SP 800-208 §6.2): `x_q[i] = H(I || u32str(q) || u16str(i) || 0xff || SEED)`.
+///
+/// Used by the scalar chain walks and by the HSS child derivation; on the
+/// batched targets the chains derive their `x` through the kernel.
+#[cfg(any(
+    test,
+    feature = "alloc",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 pub(crate) fn derive_x(i_id: &[u8; 16], seed: &[u8; N], q: u32, chain: u16, out: &mut [u8; N]) {
     let mut h = Sha256::new();
     h.update(i_id);
@@ -130,24 +139,51 @@ pub(crate) fn derive_child(i_id: &[u8; 16], seed: &[u8; N], q: u32) -> ([u8; 16]
     (child_i, child_seed)
 }
 
+/// `K = H(I ‖ u32str(q) ‖ u16str(D_PBLC) ‖ K_0 ‖ … ‖ K_{p-1})` over the
+/// concatenated chain ends `ks` (RFC 8554 §4.3 step 4).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn k_hash(i_id: &[u8; 16], q: u32, ks: &[u8]) -> [u8; N] {
+    let mut h = Sha256::new();
+    h.update(i_id);
+    h.update(&q.to_be_bytes());
+    h.update(&D_PBLC.to_be_bytes());
+    h.update(ks);
+    h.finalize()
+}
+
+/// The `p` Winternitz digits `coef(Q ‖ Cksm(Q), i, w)` of a message digest.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn digits(t: LmotsType, qc: &[u8; N + 2]) -> [u16; MAX_P] {
+    let w = t.w();
+    let mut d = [0u16; MAX_P];
+    for (i, x) in d.iter_mut().enumerate().take(t.p()) {
+        *x = coef(qc, i, w) as u16;
+    }
+    d
+}
+
 /// Computes the LM-OTS public key `K` for leaf `q` from the master `seed`
 /// (RFC 8554 §4.3, Algorithm 1, with the Appendix A private-element derivation).
 ///
-/// On x86_64 with AVX2 this dispatches to a multi-buffer SHA-256 batcher
-/// ([`lmots_x8::public_key_x8`]) that evaluates the `p` Winternitz chains eight
-/// at a time; the scalar [`public_key_scalar`] is the fallback and the
-/// reference for the differential test.
+/// On x86_64 and aarch64 the `p` Winternitz chains are evaluated several at a
+/// time through a multi-buffer SHA-256 kernel ([`lmots_mb`]); the scalar
+/// [`public_key_scalar`] is the fallback elsewhere and the reference for the
+/// differential tests.
 pub(crate) fn public_key(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) -> [u8; N] {
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
-    if crate::hash::sha256_mb::supported() {
-        return lmots_x8::public_key_x8(t, i_id, seed, q);
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        lmots_mb::public_key(t, i_id, seed, q)
     }
-    public_key_scalar(t, i_id, seed, q)
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        public_key_scalar(t, i_id, seed, q)
+    }
 }
 
 /// Scalar reference implementation of [`public_key`]: runs each of the `p`
 /// Winternitz chains over its full `0..max` range one at a time, then folds the
 /// chain outputs into `K = H(I ‖ q ‖ D_PBLC ‖ K_0 ‖ … ‖ K_{p-1})`.
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 pub(crate) fn public_key_scalar(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) -> [u8; N] {
     let p = t.p();
     let max = t.max_digit();
@@ -169,21 +205,165 @@ pub(crate) fn public_key_scalar(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q
     k_hash.finalize()
 }
 
-/// Multi-buffer batcher for [`public_key`]: evaluates the LM-OTS Winternitz
-/// chains eight at a time through the AVX2 multi-buffer SHA-256 kernel.
+/// The chain walks of [`sign`]: writes `y[0] ‖ … ‖ y[p-1]` (`p · N` bytes)
+/// into `ys`, where `y[i]` is `x[i]` advanced `coef(Q ‖ Cksm(Q), i, w)` steps.
+fn sign_chains(
+    t: LmotsType,
+    i_id: &[u8; 16],
+    seed: &[u8; N],
+    q: u32,
+    qc: &[u8; N + 2],
+    ys: &mut [u8],
+) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        lmots_mb::sign_chains(t, i_id, seed, q, qc, ys)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        sign_chains_scalar(t, i_id, seed, q, qc, ys)
+    }
+}
+
+/// Scalar reference for [`sign_chains`].
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+fn sign_chains_scalar(
+    t: LmotsType,
+    i_id: &[u8; 16],
+    seed: &[u8; N],
+    q: u32,
+    qc: &[u8; N + 2],
+    ys: &mut [u8],
+) {
+    let p = t.p();
+    let w = t.w();
+    let mut tmp = [0u8; N];
+    for chain in 0..p {
+        let a = coef(qc, chain, w);
+        derive_x(i_id, seed, q, chain as u16, &mut tmp);
+        for j in 0..a {
+            chain_step(i_id, q, chain as u16, j as u8, &mut tmp);
+        }
+        ys[chain * N..chain * N + N].copy_from_slice(&tmp);
+    }
+    // Each iteration loaded the private element `x[chain]` into `tmp` before
+    // walking it forward `a` steps; the last one is still there. Wipe once per
+    // signature rather than inside the per-hash loop.
+    super::wipe(&mut tmp);
+}
+
+/// The chain walks of [`recover_public_key`]: advances each `y[i]` of `ys`
+/// (`p · N` bytes) from `coef(Q ‖ Cksm(Q), i, w)` to `max`, returning the
+/// public-key candidate `Kc`.
+fn recover_chains(t: LmotsType, i_id: &[u8; 16], q: u32, qc: &[u8; N + 2], ys: &[u8]) -> [u8; N] {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        lmots_mb::recover_chains(t, i_id, q, qc, ys)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        recover_chains_scalar(t, i_id, q, qc, ys)
+    }
+}
+
+/// Scalar reference for [`recover_chains`].
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+fn recover_chains_scalar(
+    t: LmotsType,
+    i_id: &[u8; 16],
+    q: u32,
+    qc: &[u8; N + 2],
+    ys: &[u8],
+) -> [u8; N] {
+    let p = t.p();
+    let max = t.max_digit();
+    let w = t.w();
+    let mut k_hash = Sha256::new();
+    k_hash.update(i_id);
+    k_hash.update(&q.to_be_bytes());
+    k_hash.update(&D_PBLC.to_be_bytes());
+    let mut tmp = [0u8; N];
+    for chain in 0..p {
+        let a = coef(qc, chain, w);
+        tmp.copy_from_slice(&ys[chain * N..chain * N + N]);
+        for j in a..max {
+            chain_step(i_id, q, chain as u16, j as u8, &mut tmp);
+        }
+        k_hash.update(&tmp);
+    }
+    k_hash.finalize()
+}
+
+/// Multi-buffer LM-OTS: the Winternitz chains evaluated several at a time
+/// through a SHA-256 kernel — the AVX2 / AVX-512 multi-buffer kernels on
+/// x86_64, and otherwise (aarch64) four single-stream compressions issued
+/// back-to-back, which the out-of-order core overlaps (measured on Apple
+/// M-series: 51.6 → 22.9 ns per hardware SHA-256 compression).
 ///
-/// Every chain runs the full `0..max` range in lockstep, so all eight lanes
-/// share the same `j` schedule. Each `derive_x` / `chain_step` is a single
-/// 55-byte (one-block) SHA-256 message; the layouts here are byte-for-byte the
-/// scalar [`derive_x`] / [`chain_step`] in this module. The final
-/// `K = H(I ‖ q ‖ D_PBLC ‖ K_0 ‖ … ‖ K_{p-1})` stays scalar and absorbs the
-/// chain outputs in strict order `0..p`.
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
-mod lmots_x8 {
-    use super::{D_PBLC, LmotsType, N};
+/// Each `derive_x` / `chain_step` is a single 55-byte (one-block) SHA-256
+/// message; the layouts here are byte-for-byte the scalar [`derive_x`] /
+/// [`chain_step`] in this module, and every routine is byte-identical to its
+/// scalar reference (pinned by differential tests). The final `K = H(I ‖ q ‖
+/// D_PBLC ‖ K_0 ‖ … ‖ K_{p-1})` stays scalar and absorbs the chain outputs in
+/// strict order `0..p`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod lmots_mb {
+    use super::{LmotsType, MAX_P, N, digits, k_hash};
     use crate::hash::sha256::H256;
-    use crate::hash::sha256_mb::{LANES, LANES16, compress8, compress16, supported16};
-    use crate::hash::{Digest, Sha256};
+
+    /// Lanes of the lockstep (non-SIMD) kernel.
+    pub(super) const LOCKSTEP: usize = 4;
+
+    /// An `L`-lane SHA-256 kernel: compresses `blocks[l]` into `states[l]` for
+    /// every `l < lanes` (the SIMD kernels process all `L` lanes regardless).
+    pub(super) type Sha256Kernel<const L: usize> = fn(&mut [[u32; 8]; L], &[[u8; 64]; L], usize);
+
+    pub(super) fn lockstep256<const L: usize>(
+        states: &mut [[u32; 8]; L],
+        blocks: &[[u8; 64]; L],
+        lanes: usize,
+    ) {
+        for (s, b) in states.iter_mut().zip(blocks).take(lanes) {
+            crate::hash::sha256::compress256(s, b);
+        }
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    fn sha256_x8(
+        states: &mut [[u32; 8]; crate::hash::sha256_mb::LANES],
+        blocks: &[[u8; 64]; crate::hash::sha256_mb::LANES],
+        _lanes: usize,
+    ) {
+        crate::hash::sha256_mb::compress8(states, blocks);
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    fn sha256_x16(
+        states: &mut [[u32; 8]; crate::hash::sha256_mb::LANES16],
+        blocks: &[[u8; 64]; crate::hash::sha256_mb::LANES16],
+        _lanes: usize,
+    ) {
+        crate::hash::sha256_mb::compress16(states, blocks);
+    }
+
+    /// Expands to `$f::<L>($args…, kernel)` with the widest available
+    /// SHA-256 kernel: 16 lanes on AVX-512, 8 on AVX2, else the lockstep
+    /// kernel. Must be the tail expression of a function returning what `$f`
+    /// returns.
+    macro_rules! sha256_dispatch {
+        ($f:ident($($a:expr),* $(,)?)) => {{
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            {
+                if crate::hash::sha256_mb::supported16() {
+                    return $f::<{ crate::hash::sha256_mb::LANES16 }>($($a,)* sha256_x16);
+                }
+                if crate::hash::sha256_mb::supported() {
+                    return $f::<{ crate::hash::sha256_mb::LANES }>($($a,)* sha256_x8);
+                }
+            }
+            $f::<LOCKSTEP>($($a,)* lockstep256::<LOCKSTEP>)
+        }};
+    }
 
     /// Builds the single padded SHA-256 block for a 55-byte LM-OTS message
     /// `I(16) ‖ u32be(q) ‖ u16be(chain) ‖ byte22 ‖ tail(32)`. `byte22` is `0xff`
@@ -204,106 +384,208 @@ mod lmots_x8 {
 
     /// Big-endian serialization of a SHA-256 state into its 32-byte digest.
     #[inline]
-    fn state_be(s: &[u32; 8]) -> [u8; N] {
-        let mut o = [0u8; N];
+    fn state_be(s: &[u32; 8], o: &mut [u8; N]) {
         for (i, w) in s.iter().enumerate() {
             o[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
         }
-        o
     }
 
-    /// Computes the LM-OTS public key `K` for leaf `q`, batching the `p`
-    /// Winternitz chains 16 at a time on AVX-512, else 8. Equivalent to
-    /// [`super::public_key_scalar`].
-    pub(super) fn public_key_x8(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) -> [u8; N] {
-        // Widest available multi-buffer kernel drives the same loop.
-        if supported16() {
-            public_key_xn::<LANES16>(t, i_id, seed, q, compress16)
-        } else {
-            public_key_xn::<LANES>(t, i_id, seed, q, compress8)
+    /// Fills `vals[c·N..]` with `x[c] = derive_x(c)` for `c < p`, `L` at a time.
+    fn derive_x_n<const L: usize>(
+        i_id: &[u8; 16],
+        seed: &[u8; N],
+        q: u32,
+        p: usize,
+        vals: &mut [u8],
+        kernel: Sha256Kernel<L>,
+    ) {
+        let mut blocks = [[0u8; 64]; L];
+        let mut states = [H256; L];
+        let mut c0 = 0usize;
+        while c0 < p {
+            let lanes = (p - c0).min(L);
+            for (l, blk) in blocks.iter_mut().enumerate().take(lanes) {
+                *blk = block55(i_id, q, (c0 + l) as u16, 0xff, seed);
+            }
+            states = [H256; L];
+            kernel(&mut states, &blocks, lanes);
+            for (l, s) in states.iter().enumerate().take(lanes) {
+                let o: &mut [u8; N] = (&mut vals[(c0 + l) * N..(c0 + l) * N + N])
+                    .try_into()
+                    .unwrap();
+                state_be(s, o);
+            }
+            c0 += lanes;
         }
+        // `blocks` embedded the master seed; `states` are the private x values
+        // (the caller owns the copies in `vals`).
+        super::super::wipe(blocks.as_flattened_mut());
+        crate::zeroize::Zeroize::zeroize(states.as_flattened_mut());
     }
 
-    fn public_key_xn<const L: usize>(
+    /// Advances chain `c` (the value at `vals[c·N..]`, `c < p`) from position
+    /// `pos[c]` to `end[c]` (`<= 255`) in place, `L` chains in lockstep.
+    ///
+    /// Lanes are refilled as chains finish, so the kernel runs with every
+    /// lane active until the last `L − 1` chains drain — the total work is
+    /// `⌈Σ steps / L⌉` kernel calls rather than `Σ max-of-group`. Chain
+    /// positions are public (they are the signature's Winternitz digits), so
+    /// the scheduling may depend on them.
+    fn chains_n<const L: usize>(
+        i_id: &[u8; 16],
+        q: u32,
+        p: usize,
+        vals: &mut [u8],
+        pos: &[u16],
+        end: &[u16],
+        kernel: Sha256Kernel<L>,
+    ) {
+        let mut chain = [0u16; L];
+        let mut at = [0u16; L];
+        let mut stop = [0u16; L];
+        let mut inout = [[0u8; N]; L];
+        let mut blocks = [[0u8; 64]; L];
+        let mut states = [H256; L];
+        let mut active = 0usize;
+        let mut next = 0usize;
+        loop {
+            // Fill idle lanes with the next chains that have steps left.
+            while active < L && next < p {
+                let c = next;
+                next += 1;
+                if pos[c] >= end[c] {
+                    continue;
+                }
+                chain[active] = c as u16;
+                at[active] = pos[c];
+                stop[active] = end[c];
+                inout[active].copy_from_slice(&vals[c * N..c * N + N]);
+                active += 1;
+            }
+            if active == 0 {
+                break;
+            }
+            for l in 0..active {
+                blocks[l] = block55(i_id, q, chain[l], at[l] as u8, &inout[l]);
+            }
+            states = [H256; L];
+            kernel(&mut states, &blocks, active);
+            for l in 0..active {
+                state_be(&states[l], &mut inout[l]);
+                at[l] += 1;
+            }
+            // Retire finished lanes, moving the last active lane into the gap
+            // so the active lanes stay a prefix.
+            let mut l = 0;
+            while l < active {
+                if at[l] == stop[l] {
+                    let c = chain[l] as usize;
+                    vals[c * N..c * N + N].copy_from_slice(&inout[l]);
+                    active -= 1;
+                    chain[l] = chain[active];
+                    at[l] = at[active];
+                    stop[l] = stop[active];
+                    inout[l] = inout[active];
+                } else {
+                    l += 1;
+                }
+            }
+        }
+        // The lanes and blocks carried the private x values and every chain
+        // intermediate.
+        super::super::wipe(inout.as_flattened_mut());
+        super::super::wipe(blocks.as_flattened_mut());
+        crate::zeroize::Zeroize::zeroize(states.as_flattened_mut());
+    }
+
+    /// [`super::public_key`] through the SHA-256 kernel.
+    pub(super) fn public_key(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) -> [u8; N] {
+        sha256_dispatch!(public_key_n(t, i_id, seed, q))
+    }
+
+    pub(super) fn public_key_n<const L: usize>(
         t: LmotsType,
         i_id: &[u8; 16],
         seed: &[u8; N],
         q: u32,
-        compress: fn(&mut [[u32; 8]; L], &[[u8; 64]; L]),
+        kernel: Sha256Kernel<L>,
     ) -> [u8; N] {
         let p = t.p();
-        let max = t.max_digit();
+        let max = [t.max_digit() as u16; MAX_P];
+        let mut vals = [0u8; MAX_P * N];
+        derive_x_n::<L>(i_id, seed, q, p, &mut vals, kernel);
+        chains_n::<L>(i_id, q, p, &mut vals, &[0u16; MAX_P], &max, kernel);
+        let k = k_hash(i_id, q, &vals[..p * N]);
+        // `vals` held the private x values before the chains ran.
+        super::super::wipe(&mut vals);
+        k
+    }
 
-        let mut k_hash = Sha256::new();
-        k_hash.update(i_id);
-        k_hash.update(&q.to_be_bytes());
-        k_hash.update(&D_PBLC.to_be_bytes());
+    /// [`super::sign_chains`] through the SHA-256 kernel.
+    pub(super) fn sign_chains(
+        t: LmotsType,
+        i_id: &[u8; 16],
+        seed: &[u8; N],
+        q: u32,
+        qc: &[u8; N + 2],
+        ys: &mut [u8],
+    ) {
+        sha256_dispatch!(sign_chains_n(t, i_id, seed, q, qc, ys))
+    }
 
-        // Lane buffers are declared once and reused (not shadowed) so that
-        // every copy of the seed / chain secrets lives in memory that is wiped
-        // before returning.
-        let mut blocks = [[0u8; 64]; L];
-        let mut states = [H256; L];
-        let mut tmps = [[0u8; N]; L];
+    pub(super) fn sign_chains_n<const L: usize>(
+        t: LmotsType,
+        i_id: &[u8; 16],
+        seed: &[u8; N],
+        q: u32,
+        qc: &[u8; N + 2],
+        ys: &mut [u8],
+        kernel: Sha256Kernel<L>,
+    ) {
+        let p = t.p();
+        let end = digits(t, qc);
+        derive_x_n::<L>(i_id, seed, q, p, ys, kernel);
+        chains_n::<L>(i_id, q, p, ys, &[0u16; MAX_P], &end, kernel);
+    }
 
-        let mut c0 = 0usize;
-        while c0 < p {
-            let lanes = (p - c0).min(L);
+    /// [`super::recover_chains`] through the SHA-256 kernel.
+    pub(super) fn recover_chains(
+        t: LmotsType,
+        i_id: &[u8; 16],
+        q: u32,
+        qc: &[u8; N + 2],
+        ys: &[u8],
+    ) -> [u8; N] {
+        sha256_dispatch!(recover_chains_n(t, i_id, q, qc, ys))
+    }
 
-            // derive_x for the lanes of this group. Lanes beyond `lanes`
-            // duplicate the first chain of the group so the kernel stays in
-            // bounds; their outputs are never consumed.
-            for (l, blk) in blocks.iter_mut().enumerate() {
-                let chain = if l < lanes { c0 + l } else { c0 };
-                *blk = block55(i_id, q, chain as u16, 0xff, seed);
-            }
-            states = [H256; L];
-            compress(&mut states, &blocks);
-            for (l, tmp) in tmps.iter_mut().enumerate() {
-                *tmp = state_be(&states[l]);
-            }
-
-            // Run the chains in lockstep over the full 0..max range.
-            for j in 0..max {
-                for (l, blk) in blocks.iter_mut().enumerate() {
-                    let chain = if l < lanes { c0 + l } else { c0 };
-                    *blk = block55(i_id, q, chain as u16, j as u8, &tmps[l]);
-                }
-                states = [H256; L];
-                compress(&mut states, &blocks);
-                for (l, tmp) in tmps.iter_mut().enumerate() {
-                    *tmp = state_be(&states[l]);
-                }
-            }
-
-            // Absorb the valid lanes' chain outputs into K in chain order.
-            for tmp in tmps.iter().take(lanes) {
-                k_hash.update(tmp);
-            }
-            c0 += lanes;
-        }
-
-        // `blocks` embedded the master seed (derive_x) and every chain
-        // intermediate; `states`/`tmps` held the private x values.
-        super::super::wipe(blocks.as_flattened_mut());
-        super::super::wipe(tmps.as_flattened_mut());
-        crate::zeroize::Zeroize::zeroize(states.as_flattened_mut());
-
-        k_hash.finalize()
+    pub(super) fn recover_chains_n<const L: usize>(
+        t: LmotsType,
+        i_id: &[u8; 16],
+        q: u32,
+        qc: &[u8; N + 2],
+        ys: &[u8],
+        kernel: Sha256Kernel<L>,
+    ) -> [u8; N] {
+        let p = t.p();
+        let pos = digits(t, qc);
+        let max = [t.max_digit() as u16; MAX_P];
+        let mut vals = [0u8; MAX_P * N];
+        vals[..p * N].copy_from_slice(&ys[..p * N]);
+        chains_n::<L>(i_id, q, p, &mut vals, &pos, &max, kernel);
+        k_hash(i_id, q, &vals[..p * N])
     }
 }
 
-/// Differential test: the AVX2 multi-buffer batcher must reproduce the scalar
-/// public key byte-for-byte across LM-OTS parameter sets and random inputs.
-#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
-mod lmots_x8_tests {
-    use super::{LmotsType, N, lmots_x8, public_key_scalar};
+/// Differential tests: the multi-buffer batchers must reproduce the scalar
+/// routines byte-for-byte across LM-OTS parameter sets and random inputs,
+/// through the dispatched kernel and the lockstep kernel explicitly.
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod lmots_mb_tests {
+    use super::{LmotsType, MAX_P, N, lmots_mb, q_with_checksum};
 
     #[test]
     fn batched_matches_scalar() {
-        if !crate::hash::sha256_mb::supported() {
-            return;
-        }
         // Cheap xorshift PRNG for random-but-deterministic I/seed/q.
         let mut s = 0x1234_5678_9abc_def0u64;
         let mut next = || {
@@ -320,7 +602,8 @@ mod lmots_x8_tests {
             LmotsType::Sha256N32W1,
         ];
         for t in types {
-            for _ in 0..8 {
+            let p = t.p();
+            for _ in 0..6 {
                 let mut i_id = [0u8; 16];
                 for b in i_id.iter_mut() {
                     *b = (next() >> 24) as u8;
@@ -330,9 +613,64 @@ mod lmots_x8_tests {
                     *b = (next() >> 24) as u8;
                 }
                 let q = next() as u32;
-                let want = public_key_scalar(t, &i_id, &seed, q);
-                let got = lmots_x8::public_key_x8(t, &i_id, &seed, q);
-                assert_eq!(got, want, "type {t:?}, q={q}");
+                let mut q_digest = [0u8; N];
+                for b in q_digest.iter_mut() {
+                    *b = (next() >> 24) as u8;
+                }
+                let qc = q_with_checksum(t, &q_digest);
+
+                let want = super::public_key_scalar(t, &i_id, &seed, q);
+                assert_eq!(
+                    super::public_key(t, &i_id, &seed, q),
+                    want,
+                    "pk {t:?} q={q}"
+                );
+                assert_eq!(
+                    lmots_mb::public_key_n::<4>(t, &i_id, &seed, q, lmots_mb::lockstep256::<4>),
+                    want,
+                    "pk lockstep {t:?} q={q}"
+                );
+
+                let mut want_ys = [0u8; MAX_P * N];
+                super::sign_chains_scalar(t, &i_id, &seed, q, &qc, &mut want_ys[..p * N]);
+                let mut got_ys = [0u8; MAX_P * N];
+                super::sign_chains(t, &i_id, &seed, q, &qc, &mut got_ys[..p * N]);
+                assert_eq!(got_ys[..p * N], want_ys[..p * N], "sign {t:?} q={q}");
+                let mut got_ys = [0u8; MAX_P * N];
+                lmots_mb::sign_chains_n::<4>(
+                    t,
+                    &i_id,
+                    &seed,
+                    q,
+                    &qc,
+                    &mut got_ys[..p * N],
+                    lmots_mb::lockstep256::<4>,
+                );
+                assert_eq!(
+                    got_ys[..p * N],
+                    want_ys[..p * N],
+                    "sign lockstep {t:?} q={q}"
+                );
+
+                let want_kc = super::recover_chains_scalar(t, &i_id, q, &qc, &want_ys[..p * N]);
+                assert_eq!(want_kc, want, "recover scalar {t:?} q={q}");
+                assert_eq!(
+                    super::recover_chains(t, &i_id, q, &qc, &want_ys[..p * N]),
+                    want,
+                    "recover {t:?} q={q}"
+                );
+                assert_eq!(
+                    lmots_mb::recover_chains_n::<4>(
+                        t,
+                        &i_id,
+                        q,
+                        &qc,
+                        &want_ys[..p * N],
+                        lmots_mb::lockstep256::<4>
+                    ),
+                    want,
+                    "recover lockstep {t:?} q={q}"
+                );
             }
         }
     }
@@ -357,21 +695,7 @@ pub(crate) fn sign(
 
     out[..4].copy_from_slice(&t.typecode().to_be_bytes());
     out[4..4 + N].copy_from_slice(c);
-    let w = t.w();
-    let mut tmp = [0u8; N];
-    for chain in 0..p {
-        let a = coef(&qc, chain, w);
-        derive_x(i_id, seed, q, chain as u16, &mut tmp);
-        for j in 0..a {
-            chain_step(i_id, q, chain as u16, j as u8, &mut tmp);
-        }
-        let off = 4 + N + chain * N;
-        out[off..off + N].copy_from_slice(&tmp);
-    }
-    // Each iteration loaded the private element `x[chain]` into `tmp` before
-    // walking it forward `a` steps; the last one is still there. Wipe once per
-    // signature rather than inside the per-hash loop.
-    super::wipe(&mut tmp);
+    sign_chains(t, i_id, seed, q, &qc, &mut out[4 + N..4 + N + p * N]);
 }
 
 /// Computes the LM-OTS public-key candidate `Kc` from a signature and message
@@ -401,23 +725,6 @@ pub(crate) fn recover_public_key(
     c.copy_from_slice(&sig[4..4 + N]);
     let q_digest = compute_q(i_id, q, &c, message);
     let qc = q_with_checksum(t, &q_digest);
-
-    let max = t.max_digit();
-    let w = t.w();
-    let mut k_hash = Sha256::new();
-    k_hash.update(i_id);
-    k_hash.update(&q.to_be_bytes());
-    k_hash.update(&D_PBLC.to_be_bytes());
-    let mut tmp = [0u8; N];
     debug_assert!(p <= MAX_P);
-    for chain in 0..p {
-        let a = coef(&qc, chain, w);
-        let off = 4 + N + chain * N;
-        tmp.copy_from_slice(&sig[off..off + N]);
-        for j in a..max {
-            chain_step(i_id, q, chain as u16, j as u8, &mut tmp);
-        }
-        k_hash.update(&tmp);
-    }
-    Some(k_hash.finalize())
+    Some(recover_chains(t, i_id, q, &qc, &sig[4 + N..4 + N + p * N]))
 }

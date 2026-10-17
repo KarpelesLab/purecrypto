@@ -68,7 +68,7 @@ mod blake3_simd;
 mod block;
 mod hmac;
 mod k12;
-mod keccak;
+pub(crate) mod keccak;
 // Batched Keccak for the matrix / tree expansion of ML-KEM, ML-DSA and
 // SLH-DSA-SHAKE; like the multi-buffer SHA-2 kernels below, nothing else calls
 // it.
