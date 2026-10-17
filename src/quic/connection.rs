@@ -7327,8 +7327,19 @@ impl QuicConnection {
                 first_range,
                 ecn,
             };
-            ack.encode(&mut out);
-            meta.carried_ack = true;
+            // F6: `payload_cap` is a hard limit (RFC 9000 §14: the datagram
+            // must not outgrow the path). An ACK that does not fit the room
+            // left behind the packets coalesced ahead of this one stays
+            // pending — `carried_ack` is what clears it — and rides the next
+            // packet, where a 1-RTT packet leads and the whole budget is
+            // available. (It can only fail to fit when coalesced: at most
+            // 32 ranges plus ECN counts is well under a lone packet's room.)
+            let mut ack_buf = Vec::new();
+            ack.encode(&mut ack_buf);
+            if out.len() + ack_buf.len() <= payload_cap {
+                out.extend_from_slice(&ack_buf);
+                meta.carried_ack = true;
+            }
             // ACK is NOT ack-eliciting; not in-flight on its own.
         }
 
@@ -7386,50 +7397,63 @@ impl QuicConnection {
                 // HANDSHAKE_DONE (RFC 9000 §19.20): the server MUST send it
                 // as soon as the handshake completes (RFC 9001 §4.1.2). It is
                 // ack-eliciting and re-queued if its packet is lost.
-                if full && self.handshake_done_pending {
+                if full && self.handshake_done_pending && out.len() < payload_cap {
                     Frame::HandshakeDone.encode(&mut out);
                     meta.ack_eliciting = true;
                     meta.in_flight = true;
                     meta.handshake_done = true;
                     self.handshake_done_pending = false;
                 }
+                // F6: the housekeeping frames below used to stop only at a
+                // ~900-byte soft mark, so with little room left behind a
+                // coalesced packet (`payload_cap` can be as small as 32) the
+                // packet — and the datagram — outgrew the path (RFC 9000
+                // §14). Each frame is now checked against `payload_cap`
+                // before its queue entry is popped, so what does not fit
+                // simply waits for the next packet. PATH_CHALLENGE /
+                // PATH_RESPONSE are 1 + 8 bytes; RETIRE_CONNECTION_ID is
+                // 1 + a varint, at most 9.
+                const PATH_FRAME_LEN: usize = 1 + 8;
+                const RETIRE_CID_FRAME_MAX: usize = 1 + 8;
+                let soft_mark = 900usize;
                 // PATH_RESPONSE (RFC 9000 §8.2.2): emit one per pending
                 // request before everything else. They're tiny (9 bytes
                 // each) and high-priority. Only the ones owed on the path
                 // this datagram is bound for — see `pop_outbound_response`.
                 let to = self.peer_addr;
-                while let Some(data) = self.path.pop_outbound_response(to) {
+                while out.len() <= soft_mark && out.len() + PATH_FRAME_LEN <= payload_cap {
+                    let Some(data) = self.path.pop_outbound_response(to) else {
+                        break;
+                    };
                     Frame::PathResponse(data).encode(&mut out);
                     meta.ack_eliciting = true;
                     meta.in_flight = true;
                     meta.has_path_frame = true;
-                    if out.len() > 900 {
-                        break;
-                    }
                 }
                 // PATH_CHALLENGE (RFC 9000 §8.2.1): challenges this endpoint has
                 // issued — either explicitly via `send_path_challenge` or by the
                 // §9.3 migration path — and not yet put on the wire.
-                while let Some(data) = self.path.pop_outbound_challenge() {
+                while out.len() <= soft_mark && out.len() + PATH_FRAME_LEN <= payload_cap {
+                    let Some(data) = self.path.pop_outbound_challenge() else {
+                        break;
+                    };
                     Frame::PathChallenge(data).encode(&mut out);
                     meta.ack_eliciting = true;
                     meta.in_flight = true;
                     meta.has_path_frame = true;
-                    if out.len() > 900 {
-                        break;
-                    }
                 }
                 // RETIRE_CONNECTION_ID (RFC 9000 §19.16): for every
                 // sequence the local CID pool retired (peer's
                 // retire_prior_to advanced), emit a frame.
                 if full && let Some(pool) = self.cid_remote.as_mut() {
-                    while let Some(seq) = pool.pop_pending_retire() {
+                    while out.len() <= soft_mark && out.len() + RETIRE_CID_FRAME_MAX <= payload_cap
+                    {
+                        let Some(seq) = pool.pop_pending_retire() else {
+                            break;
+                        };
                         Frame::RetireConnectionId { seq }.encode(&mut out);
                         meta.ack_eliciting = true;
                         meta.in_flight = true;
-                        if out.len() > 900 {
-                            break;
-                        }
                     }
                 }
 
@@ -7437,15 +7461,17 @@ impl QuicConnection {
                 // is complete, opportunistically issue fresh local CIDs to
                 // the peer up to the peer's `active_connection_id_limit`
                 // (default 2 — we have 1 from the handshake, so we send 1
-                // extra). Idempotent via `new_cids_issued`.
+                // extra). Idempotent via `new_cids_issued`, which is only
+                // set once every CID owed has gone out (F6: a batch cut
+                // short by `payload_cap` resumes in the next packet).
                 if full && self.handshake_complete && !self.new_cids_issued {
                     let prev_len = out.len();
-                    self.issue_new_local_cids(&mut out);
+                    let done = self.issue_new_local_cids(&mut out, payload_cap);
                     if out.len() > prev_len {
                         meta.ack_eliciting = true;
                         meta.in_flight = true;
                     }
-                    self.new_cids_issued = true;
+                    self.new_cids_issued = done;
                 }
             } // end 1-RTT-only path / CID housekeeping
 
@@ -7531,6 +7557,7 @@ impl QuicConnection {
         if !matches!(level, Level::EarlyData)
             && full
             && !meta.ack_eliciting
+            && out.len() < payload_cap
             && self
                 .endpoint
                 .loss
@@ -7541,14 +7568,17 @@ impl QuicConnection {
             meta.in_flight = true;
         }
         // A key update just initiated wants an ack-eliciting packet in the
-        // new phase; anything ack-eliciting already here serves.
+        // new phase; anything ack-eliciting already here serves. With no
+        // room even for the one byte, it stays owed (F6).
         if matches!(level, Level::OneRtt) && full && self.ping_pending {
-            if !meta.ack_eliciting {
+            if meta.ack_eliciting {
+                self.ping_pending = false;
+            } else if out.len() < payload_cap {
                 Frame::Ping.encode(&mut out);
                 meta.ack_eliciting = true;
                 meta.in_flight = true;
+                self.ping_pending = false;
             }
-            self.ping_pending = false;
         }
 
         if out.is_empty() {
@@ -7563,7 +7593,12 @@ impl QuicConnection {
     /// random 16-byte stateless-reset token; the token is stored in
     /// `cid_local` for future stateless-reset emission (Phase 8 work,
     /// not exercised by Phase 7).
-    fn issue_new_local_cids(&mut self, out: &mut Vec<u8>) {
+    ///
+    /// Frames are appended to `out` only while they fit `payload_cap` (F6);
+    /// a CID is added to the pool only together with its frame, so nothing
+    /// is issued silently. Returns `true` once the peer has every CID it is
+    /// owed, `false` if some must wait for a packet with more room.
+    fn issue_new_local_cids(&mut self, out: &mut Vec<u8>, payload_cap: usize) -> bool {
         // RFC 9000 §18.2 sets only a lower bound (>= 2) on the peer's
         // active_connection_id_limit; the value is otherwise attacker-
         // controlled and unbounded. Clamp it to a sane ceiling so a malicious
@@ -7578,22 +7613,32 @@ impl QuicConnection {
             .clamp(2, 8);
         let pool = match self.cid_local.as_mut() {
             Some(p) => p,
-            None => return,
+            None => return true,
         };
         pool.set_limit(limit);
         let to_issue = pool.how_many_to_issue();
         if to_issue == 0 {
-            return;
+            return true;
         }
+        // Random 8-byte CIDs: type + seq + retire_prior_to + length + CID +
+        // reset token, with the varints at their widest.
+        const CID_LEN: usize = 8;
+        const NEW_CID_FRAME_MAX: usize = 1 + 8 + 8 + 1 + CID_LEN + 16;
         let mut rng = OsRng;
         // Count from the high-water mark, not the highest *stored* sequence:
         // retiring an entry removes it, and reusing its sequence number for a
         // fresh CID would collide with the peer's own bookkeeping (L-12).
         let start_seq = pool.issued_high + 1;
         for (next_seq, _) in (start_seq..).zip(0..to_issue) {
+            // Out of room in this packet (hard cap), or past the soft mark
+            // that leaves space for the frames after this batch: the rest
+            // is issued by the next packet.
+            if out.len() + NEW_CID_FRAME_MAX > payload_cap || out.len() > 1000 {
+                return false;
+            }
             // Random 8-byte CID; its reset token is derived from our static
             // reset key (RFC 9000 §10.3.1) so a router can recompute it later.
-            let cid = ConnectionId::random(&mut rng, 8);
+            let cid = ConnectionId::random(&mut rng, CID_LEN);
             let reset_token =
                 crate::quic::reset::stateless_reset_token(self.reset_key.as_bytes(), &cid);
             let entry = CidEntry {
@@ -7602,9 +7647,9 @@ impl QuicConnection {
                 reset_token: Some(reset_token),
             };
             // Insert locally first; if the limit is somehow already
-            // saturated, stop.
+            // saturated, stop — the peer has as many as the pool allows.
             if pool.add(entry).is_err() {
-                break;
+                return true;
             }
             // Emit the frame. `retire_prior_to = 0` — we keep all
             // earlier CIDs alive.
@@ -7615,10 +7660,8 @@ impl QuicConnection {
                 reset_token,
             }
             .encode(out);
-            if out.len() > 1000 {
-                break;
-            }
         }
+        true
     }
 }
 
@@ -9372,6 +9415,101 @@ mod tests {
         assert!(
             s.endpoint.cc.cwnd < 999_999,
             "§9.4: the congestion window returns to its initial value"
+        );
+    }
+
+    /// F6 — `assemble_payload` treats `payload_cap` (the room left behind
+    /// the packets coalesced ahead of a 1-RTT packet, as little as 32 bytes)
+    /// as a hard limit for every frame: PATH_RESPONSE, RETIRE_CONNECTION_ID
+    /// and NEW_CONNECTION_ID used to stop only at a ~900/1000-byte soft mark
+    /// and the ACK was never checked, so the datagram could outgrow the path
+    /// (RFC 9000 §14). Nothing is lost: what does not fit waits for the next
+    /// packet, and a CID batch cut short resumes rather than being marked
+    /// done.
+    #[test]
+    fn onertt_payload_never_exceeds_the_room_left_for_it() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..6 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert!(s.pop_datagram().is_empty(), "quiescent");
+        // Queue: 8 PATH_RESPONSEs, 3 RETIRE_CONNECTION_IDs, a batch of
+        // NEW_CONNECTION_IDs (the peer's limit raised to 8) and an ACK with
+        // 30 ranges (~64 bytes encoded).
+        let to = s.peer_addr;
+        for i in 0..8u8 {
+            s.path.on_challenge([i; 8], to);
+        }
+        assert_eq!(s.path.pending_len(), 8);
+        s.cid_remote
+            .as_mut()
+            .expect("remote pool")
+            .pending_retire
+            .extend([40u64, 41, 42]);
+        s.peer_params
+            .as_mut()
+            .expect("peer params")
+            .active_connection_id_limit = Some(8);
+        s.new_cids_issued = false;
+        let issued_before = s.cid_local.as_ref().expect("local pool").issued_high;
+        {
+            let space = &mut s.endpoint.pn.application;
+            for pn in (1000..1060u64).step_by(2) {
+                space.pending_ack.insert(pn);
+            }
+            space.ack_eliciting_pending = true;
+        }
+
+        const CAP: usize = 48;
+        let (mut path_responses, mut retires, mut new_cids, mut acks) = (0, 0, 0u64, 0);
+        let mut packets = 0;
+        while let Some((payload, _meta)) =
+            s.assemble_payload(Level::OneRtt, PayloadScope::Full, CAP)
+        {
+            packets += 1;
+            assert!(packets < 64, "assembly must make progress");
+            assert!(
+                payload.len() <= CAP,
+                "payload of {} bytes exceeds the {CAP}-byte room",
+                payload.len()
+            );
+            for f in FrameIter::new(&payload) {
+                match f.expect("well-formed frame") {
+                    Frame::PathResponse(_) => path_responses += 1,
+                    Frame::RetireConnectionId { .. } => retires += 1,
+                    Frame::NewConnectionId { .. } => new_cids += 1,
+                    Frame::Ack { .. } => acks += 1,
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+        }
+        assert!(packets > 1, "test premise: the frames need several packets");
+        assert_eq!(path_responses, 8, "every PATH_RESPONSE went out");
+        assert_eq!(retires, 3, "every RETIRE_CONNECTION_ID went out");
+        let issued = s.cid_local.as_ref().expect("local pool").issued_high - issued_before;
+        assert!(issued >= 2, "test premise: more than one CID was owed");
+        assert_eq!(
+            new_cids, issued,
+            "every CID added to the local pool was announced"
+        );
+        assert!(s.new_cids_issued, "the batch completed across packets");
+        assert_eq!(
+            acks, 0,
+            "a 30-range ACK cannot fit {CAP} bytes: deferred, never truncated"
+        );
+        assert!(
+            !s.endpoint.pn.application.pending_ack.ranges().is_empty(),
+            "...and still pending"
+        );
+        // With a lone packet's room the ACK goes out at once.
+        let (payload, meta) = s
+            .assemble_payload(Level::OneRtt, PayloadScope::Full, 1100)
+            .expect("ACK packet");
+        assert!(meta.carried_ack);
+        assert!(
+            FrameIter::new(&payload).any(|f| matches!(f, Ok(Frame::Ack { .. }))),
+            "the deferred ACK is emitted once there is room"
         );
     }
 
