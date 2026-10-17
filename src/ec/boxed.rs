@@ -1,6 +1,6 @@
 //! Runtime multi-curve ECDSA and ECDH ([`BoxedUint`] keys and signatures;
-//! the arithmetic itself runs on the stack, see
-//! [`weierstrass`](super::weierstrass)).
+//! the arithmetic itself runs on the stack, in the crate-private
+//! `weierstrass` module).
 //!
 //! Unlike the const-generic [`ecdsa`](super::ecdsa)/[`ecdh`](super::ecdh) P-256
 //! API — which is faster when the curve is fixed at compile time — these types
