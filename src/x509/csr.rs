@@ -19,6 +19,10 @@ use crate::der::{
 
 const PEM_LABEL: &str = "CERTIFICATE REQUEST";
 
+/// Upper bound on the extensions a CSR may request, bounding the duplicate
+/// scan in `walk_extension_requests` (the certificate walker's limit).
+const MAX_REQUESTED_EXTENSIONS: usize = 64;
+
 /// A PKCS#10 certification request, stored as its DER encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertificationRequest {
@@ -173,38 +177,69 @@ impl CertificationRequest {
         AnyPublicKey::from_spki_der(spki)
     }
 
-    /// The dNSName entries requested via an `extensionRequest`/`subjectAltName`
-    /// attribute, or an empty list if none.
-    pub fn subject_alt_names(&self) -> Result<Vec<String>, Error> {
+    /// Walks every extension requested through `extensionRequest` PKCS#9
+    /// attributes (RFC 2985 §5.4.2), calling `f(oid, critical, extnValue)`
+    /// for each in order.
+    ///
+    /// The structure is held to the same strictness as a certificate's
+    /// extensions ([`Certificate::walk_extensions`](super::Certificate)):
+    /// every SEQUENCE and SET must be fully consumed, the attribute's
+    /// values SET holds exactly one `Extensions` SEQUENCE, and an OID may
+    /// appear only once across all requests — a CA that honours the first
+    /// `subjectAltName` and a reviewer who reads the last would otherwise
+    /// certify different names from the same CSR.
+    fn walk_extension_requests(
+        &self,
+        mut f: impl FnMut(&[u64], bool, &[u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let mut seq = self.cri_after_version()?;
         DistinguishedName::decode(&mut seq)?; // subject
         seq.read_element()?; // subjectPublicKeyInfo
         if seq.peek_tag() != Some(tag::context(0)) {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let attrs_der = seq.read_tlv(tag::context(0))?;
         let mut attrs = Reader::new(attrs_der);
-        let mut names = Vec::new();
+        // OIDs compared as their canonical DER bodies, as in the cert walker.
+        let mut seen: Vec<&[u8]> = Vec::new();
         while !attrs.is_empty() {
             let mut attr = attrs.read_sequence()?;
             let id = parse_oid(attr.read_oid()?)?;
             let values = attr.read_tlv(tag::SET)?;
-            if id.as_slice() == oid::EXTENSION_REQUEST {
-                let mut vreader = Reader::new(values);
-                let mut exts = vreader.read_sequence()?; // Extensions
-                while !exts.is_empty() {
-                    let mut ext = exts.read_sequence()?;
-                    let eid = parse_oid(ext.read_oid()?)?;
-                    if ext.peek_tag() == Some(tag::BOOLEAN) {
-                        ext.read_boolean()?; // critical
-                    }
-                    let value = ext.read_octet_string()?;
-                    if eid.as_slice() == oid::SUBJECT_ALT_NAME {
-                        parse_dns_names(value, &mut names)?;
-                    }
+            attr.finish()?;
+            if id.as_slice() != oid::EXTENSION_REQUEST {
+                continue;
+            }
+            let mut vreader = Reader::new(values);
+            let mut exts = vreader.read_sequence()?; // Extensions
+            vreader.finish()?;
+            while !exts.is_empty() {
+                let mut ext = exts.read_sequence()?;
+                let eid_der = ext.read_oid()?;
+                let eid = parse_oid(eid_der)?;
+                if seen.contains(&eid_der) || seen.len() >= MAX_REQUESTED_EXTENSIONS {
+                    return Err(Error::Malformed);
                 }
+                seen.push(eid_der);
+                let critical = super::read_default_false_boolean(&mut ext)?;
+                let value = ext.read_octet_string()?;
+                ext.finish()?;
+                f(&eid, critical, value)?;
             }
         }
+        Ok(())
+    }
+
+    /// The dNSName entries requested via an `extensionRequest`/`subjectAltName`
+    /// attribute, or an empty list if none.
+    pub fn subject_alt_names(&self) -> Result<Vec<String>, Error> {
+        let mut names = Vec::new();
+        self.walk_extension_requests(|eid, _critical, value| {
+            if eid == oid::SUBJECT_ALT_NAME {
+                parse_dns_names(value, &mut names)?;
+            }
+            Ok(())
+        })?;
         Ok(names)
     }
 
@@ -212,39 +247,15 @@ impl CertificationRequest {
     /// `extensionRequest` PKCS#9 attribute, in order. An empty list if the
     /// CSR has no extension request.
     pub fn extension_requests(&self) -> Result<Vec<Extension>, Error> {
-        let mut seq = self.cri_after_version()?;
-        DistinguishedName::decode(&mut seq)?; // subject
-        seq.read_element()?; // subjectPublicKeyInfo
-        if seq.peek_tag() != Some(tag::context(0)) {
-            return Ok(Vec::new());
-        }
-        let attrs_der = seq.read_tlv(tag::context(0))?;
-        let mut attrs = Reader::new(attrs_der);
         let mut out = Vec::new();
-        while !attrs.is_empty() {
-            let mut attr = attrs.read_sequence()?;
-            let id = parse_oid(attr.read_oid()?)?;
-            let values = attr.read_tlv(tag::SET)?;
-            if id.as_slice() == oid::EXTENSION_REQUEST {
-                let mut vreader = Reader::new(values);
-                let mut exts = vreader.read_sequence()?; // Extensions
-                while !exts.is_empty() {
-                    let mut ext = exts.read_sequence()?;
-                    let eid = parse_oid(ext.read_oid()?)?;
-                    let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
-                        ext.read_boolean()?
-                    } else {
-                        false
-                    };
-                    let value = ext.read_octet_string()?;
-                    out.push(Extension {
-                        oid: eid,
-                        critical,
-                        value: value.to_vec(),
-                    });
-                }
-            }
-        }
+        self.walk_extension_requests(|eid, critical, value| {
+            out.push(Extension {
+                oid: eid.to_vec(),
+                critical,
+                value: value.to_vec(),
+            });
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -429,6 +440,100 @@ mod tests {
         assert_eq!(got[3].oid, oid::SUBJECT_ALT_NAME);
         // The expected bytes match the builder output.
         assert_eq!(got[0], ext::basic_constraints(false, None));
+    }
+
+    /// F4: a CSR requesting the same extension twice is rejected, as a
+    /// certificate carrying a duplicate would be — a CA honouring the first
+    /// `subjectAltName` and a reviewer reading the last would otherwise
+    /// disagree on the names requested.
+    #[test]
+    fn csr_rejects_duplicate_requested_extension() {
+        use crate::x509::extension::{GeneralName, subject_alt_name};
+        let key = ec_signer_key();
+        let csr = CertificationRequest::create_with_extensions(
+            &CertSigner::Ecdsa(&key),
+            &DistinguishedName::common_name("dup"),
+            &[
+                subject_alt_name(&[GeneralName::Dns("a.example".into())]),
+                subject_alt_name(&[GeneralName::Dns("b.example".into())]),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(csr.extension_requests(), Err(Error::Malformed)));
+        assert!(matches!(csr.subject_alt_names(), Err(Error::Malformed)));
+    }
+
+    /// F4 / F5: the `extensionRequest` attribute is read as strictly as a
+    /// certificate's extensions — no bytes after `extnValue` inside an
+    /// `Extension`, exactly one `Extensions` SEQUENCE in the values SET,
+    /// nothing after the last Extension, and no explicit `critical FALSE`.
+    #[test]
+    fn csr_extension_request_rejects_loose_structure() {
+        use crate::der::{encode_boolean, encode_null, encode_octet_string};
+        use crate::x509::extension::{GeneralName, subject_alt_name};
+
+        let key = ec_signer_key();
+        let signer = CertSigner::Ecdsa(&key);
+        let san = subject_alt_name(&[GeneralName::Dns("strict.example".into())]);
+        // Builds an unsigned CSR around a hand-made `Extension` (`critical`
+        // slot and bytes after extnValue), `Extensions` tail and values-SET
+        // tail. The accessors do not verify the signature, so an empty BIT
+        // STRING will do.
+        let build = |critical: &[u8], ext_tail: &[u8], exts_tail: &[u8], set_tail: &[u8]| {
+            let mut ext_body = oid_tlv(&san.oid);
+            ext_body.extend_from_slice(critical);
+            ext_body.extend_from_slice(&encode_octet_string(&san.value));
+            ext_body.extend_from_slice(ext_tail);
+            let ext = encode_sequence(&ext_body);
+            let exts = encode_sequence(&[ext, exts_tail.to_vec()].concat());
+            let values = encode_tlv(tag::SET, &[exts, set_tail.to_vec()].concat());
+            let attr = encode_sequence(&[oid_tlv(oid::EXTENSION_REQUEST), values].concat());
+            let cri = encode_sequence(
+                &[
+                    encode_integer(&[0]),
+                    DistinguishedName::common_name("strict").to_der(),
+                    signer.public_key().to_spki_der(),
+                    encode_context(0, &attr),
+                ]
+                .concat(),
+            );
+            let der = encode_sequence(
+                &[cri, signer.algorithm_identifier(), encode_bit_string(&[])].concat(),
+            );
+            CertificationRequest::from_der(der).unwrap()
+        };
+        let clean = build(&[], &[], &[], &[]);
+        assert_eq!(clean.subject_alt_names().unwrap(), ["strict.example"]);
+        assert_eq!(clean.extension_requests().unwrap(), [san.clone()]);
+        // Explicit `critical TRUE` is fine; an explicit FALSE encodes the
+        // DEFAULT and is not DER.
+        assert!(
+            build(&encode_boolean(true), &[], &[], &[])
+                .extension_requests()
+                .unwrap()[0]
+                .critical
+        );
+        assert!(matches!(
+            build(&encode_boolean(false), &[], &[], &[]).extension_requests(),
+            Err(Error::Malformed)
+        ));
+        // A NULL after extnValue inside the Extension SEQUENCE.
+        let junk = build(&[], &encode_null(), &[], &[]);
+        assert!(junk.extension_requests().is_err());
+        assert!(junk.subject_alt_names().is_err());
+        // Junk after the last Extension inside the Extensions SEQUENCE.
+        assert!(
+            build(&[], &[], &encode_null(), &[])
+                .extension_requests()
+                .is_err()
+        );
+        // A second value in the SET: the attribute must hold exactly one
+        // Extensions SEQUENCE.
+        assert!(
+            build(&[], &[], &[], &encode_sequence(&[]))
+                .extension_requests()
+                .is_err()
+        );
     }
 
     #[test]
