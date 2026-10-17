@@ -603,9 +603,8 @@ impl AnyPublicKey {
     /// Dispatch goes through [`crate::signature_registry`]: the identifier
     /// picks an entry in [`ALGORITHMS`](crate::signature_registry::ALGORITHMS)
     /// (see [`signature_algorithm`](Self::signature_algorithm)), which then
-    /// re-parses the SPKI to recover the key and verifies with the
-    /// identifier's parameters
-    /// ([`SignatureAlgorithm::verify_with_params`](crate::signature_registry::SignatureAlgorithm::verify_with_params)).
+    /// verifies with this key as parsed and the identifier's parameters
+    /// ([`SignatureAlgorithm::verify_key_with_params`](crate::signature_registry::SignatureAlgorithm::verify_key_with_params)).
     /// RSA signatures are PKCS#1 v1.5 or RSA-PSS (the OID fixes which; the
     /// `RSASSA-PSS-params` fix the digest and salt length); ECDSA
     /// signatures are DER `Ecdsa-Sig-Value`; Ed25519 is raw 64-byte R‖S.
@@ -636,9 +635,7 @@ impl AnyPublicKey {
         let algo = self
             .signature_algorithm(sig_alg)
             .ok_or(Error::UnsupportedAlgorithm)?;
-        // The registry entry's `verify` parses an SPKI; round-trip ours.
-        let spki = self.to_spki_der();
-        algo.verify_with_params(&spki, msg, sig, sig_alg.params())
+        algo.verify_key_with_params(self, msg, sig, sig_alg.params())
     }
 
     /// The [`crate::signature_registry`] entry [`verify`](Self::verify)

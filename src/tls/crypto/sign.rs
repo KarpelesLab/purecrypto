@@ -588,14 +588,15 @@ fn verify_with(
     if !form_ok {
         return Err(Error::PeerMisbehaved);
     }
-    // The registry verifier needs an SPKI; round-trip the parsed key. (A few
-    // hundred bytes of allocation per CertificateVerify is negligible next to
-    // the asymmetric verify itself.)
+    // The policy's key-size floors read the SPKI form (a few hundred bytes
+    // re-encoded from the parsed key, walked with the DER reader only); the
+    // verification runs on the parsed key, so an RSA key's Montgomery
+    // context is never rebuilt here.
     let spki = key.to_spki_der();
     if !policy.permits(algo, &spki) {
         return Err(Error::BadCertificate);
     }
-    match algo.verify(&spki, message, signature) {
+    match algo.verify_key(key, message, signature) {
         Ok(()) => Ok(()),
         // `UnsupportedAlgorithm` here means the SPKI's key type doesn't match
         // the scheme (e.g. an RSA key against `ecdsa_secp256r1_sha256`).

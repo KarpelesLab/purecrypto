@@ -94,6 +94,38 @@ pub trait SignatureAlgorithm: Sync + 'static {
         }
     }
 
+    /// Like [`verify`](Self::verify), under an already-parsed key, with
+    /// the same acceptance rules (a key of another type, or an
+    /// `id-RSASSA-PSS` key whose restriction the entry cannot satisfy,
+    /// is [`Error::UnsupportedAlgorithm`]). The default re-encodes `key`
+    /// as an SPKI and takes the `verify` path; the RSA, ECDSA and EdDSA
+    /// entries override it to verify with the key as parsed — rebuilding
+    /// an RSA key's Montgomery context from its SPKI costs 16-34 µs per
+    /// 2048-bit key, more than the rest of a chain step.
+    fn verify_key(
+        &self,
+        key: &crate::x509::AnyPublicKey,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), Error> {
+        self.verify(&key.to_spki_der(), message, signature)
+    }
+
+    /// Like [`verify_with_params`](Self::verify_with_params), under an
+    /// already-parsed key; see [`verify_key`](Self::verify_key).
+    fn verify_key_with_params(
+        &self,
+        key: &crate::x509::AnyPublicKey,
+        message: &[u8],
+        signature: &[u8],
+        params: crate::x509::SignatureParams,
+    ) -> Result<(), Error> {
+        match params {
+            crate::x509::SignatureParams::None => self.verify_key(key, message, signature),
+            _ => self.verify_with_params(&key.to_spki_der(), message, signature, params),
+        }
+    }
+
     /// For policy decisions: RSA modulus length in bits. `None` for non-RSA
     /// algorithms.
     fn rsa_modulus_bits(&self, _spki: &[u8]) -> Option<u32> {

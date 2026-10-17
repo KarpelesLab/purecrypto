@@ -34,11 +34,12 @@ use crate::ec::{
 };
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::signature_registry::SignatureAlgorithm;
-use crate::x509::{Error, oid};
+use crate::x509::{AnyPublicKey, Error, oid};
 
-/// Parses an `id-ecPublicKey` SPKI and returns `(curve, key)`. Errors on a
-/// non-EC SPKI or an unsupported curve.
-fn parse_ecdsa_spki(spki: &[u8]) -> Result<(CurveId, BoxedEcdsaPublicKey), Error> {
+/// Walks an `id-ecPublicKey` SPKI and returns the curve it names and the
+/// raw `subjectPublicKey` (a SEC 1 point, not yet checked to lie on the
+/// curve). Errors on a non-EC SPKI or an unsupported curve.
+fn ecdsa_spki_curve(spki: &[u8]) -> Result<(CurveId, &[u8]), Error> {
     let mut reader = Reader::new(spki);
     let mut outer = reader.read_sequence()?;
     let mut algid = outer.read_sequence()?;
@@ -58,8 +59,29 @@ fn parse_ecdsa_spki(spki: &[u8]) -> Result<(CurveId, BoxedEcdsaPublicKey), Error
     algid.finish()?;
     let key_bits = outer.read_bit_string()?;
     outer.finish()?;
+    Ok((curve, key_bits))
+}
+
+/// Parses an `id-ecPublicKey` SPKI and returns `(curve, key)`. Errors on a
+/// non-EC SPKI, an unsupported curve or a point off the curve.
+fn parse_ecdsa_spki(spki: &[u8]) -> Result<(CurveId, BoxedEcdsaPublicKey), Error> {
+    let (curve, key_bits) = ecdsa_spki_curve(spki)?;
     let key = BoxedEcdsaPublicKey::from_sec1(curve, key_bits).map_err(|_| Error::Malformed)?;
     Ok((curve, key))
+}
+
+/// The ECDSA key inside an already-parsed `key` — on `curve` when one is
+/// named, on any curve but SM2 otherwise (an `sm2p256v1` key signs SM2,
+/// its own scheme) — under the same acceptance rules as the SPKI path.
+fn ecdsa_key(key: &AnyPublicKey, curve: Option<CurveId>) -> Result<&BoxedEcdsaPublicKey, Error> {
+    match key {
+        AnyPublicKey::Ecdsa(k)
+            if curve.map_or(k.curve() != CurveId::Sm2p256v1, |c| k.curve() == c) =>
+        {
+            Ok(k)
+        }
+        _ => Err(Error::UnsupportedAlgorithm),
+    }
 }
 
 /// The bit length of `curve`'s group order — the quantity
@@ -92,10 +114,28 @@ pub(crate) fn curve_order_bits(curve: CurveId) -> u32 {
 /// [`SignatureAlgorithm::ec_curve_bits`] for every ECDSA entry: the order
 /// bits of the curve `spki` names, or `None` when the SPKI is not a usable
 /// ECDSA key (which the entry's `verify` refuses anyway).
+///
+/// Reads the curve OID alone: the point is not decoded (the on-curve check
+/// is `verify`'s, and costs more than the rest of the policy decision).
 fn ecdsa_spki_curve_bits(spki: &[u8]) -> Option<u32> {
-    parse_ecdsa_spki(spki)
+    ecdsa_spki_curve(spki)
         .ok()
         .map(|(curve, _)| curve_order_bits(curve))
+}
+
+/// Verifies a raw 64-byte `R‖S` Ed25519 signature over `message`.
+fn verify_ed25519(key: &Ed25519PublicKey, message: &[u8], signature: &[u8]) -> Result<(), Error> {
+    let bytes: [u8; 64] = signature.try_into().map_err(|_| Error::Malformed)?;
+    key.verify(message, &Ed25519Signature::from_bytes(bytes))
+        .map_err(|_| Error::Verification)
+}
+
+/// Verifies a raw 114-byte `R‖S` Ed448 signature over `message`; X.509 /
+/// TLS use the empty context (pure Ed448, RFC 8032 §5.2).
+fn verify_ed448(key: &Ed448PublicKey, message: &[u8], signature: &[u8]) -> Result<(), Error> {
+    let bytes: [u8; 114] = signature.try_into().map_err(|_| Error::Malformed)?;
+    key.verify(message, &Ed448Signature::from_bytes(bytes))
+        .map_err(|_| Error::Verification)
 }
 
 /// Parses an Ed25519 SPKI and returns the 32-byte key.
@@ -144,6 +184,16 @@ fn verify_ecdsa_strict<D: crate::hash::Digest>(
     if curve != expected_curve {
         return Err(Error::UnsupportedAlgorithm);
     }
+    verify_ecdsa_key::<D>(&key, message, signature)
+}
+
+/// Verifies a DER `Ecdsa-Sig-Value` over `message` under `key`, hashing
+/// with `D`.
+fn verify_ecdsa_key<D: crate::hash::Digest>(
+    key: &BoxedEcdsaPublicKey,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), Error> {
     let sig = BoxedEcdsaSignature::from_der(signature).map_err(|_| Error::Malformed)?;
     key.verify::<D>(message, &sig)
         .map_err(|_| Error::Verification)
@@ -157,9 +207,7 @@ fn verify_ecdsa_any_curve<D: crate::hash::Digest>(
     signature: &[u8],
 ) -> Result<(), Error> {
     let (_curve, key) = parse_ecdsa_spki(spki)?;
-    let sig = BoxedEcdsaSignature::from_der(signature).map_err(|_| Error::Malformed)?;
-    key.verify::<D>(message, &sig)
-        .map_err(|_| Error::Verification)
+    verify_ecdsa_key::<D>(&key, message, signature)
 }
 
 // --- X.509-keyed ECDSA entries (one per OID, any curve) ---
@@ -180,6 +228,14 @@ impl SignatureAlgorithm for EcdsaSha256AnyCurve {
     }
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
         verify_ecdsa_any_curve::<Sha256>(spki, message, signature)
+    }
+    fn verify_key(
+        &self,
+        key: &AnyPublicKey,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), Error> {
+        verify_ecdsa_key::<Sha256>(ecdsa_key(key, None)?, message, signature)
     }
     fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
         ecdsa_spki_curve_bits(spki)
@@ -202,6 +258,14 @@ impl SignatureAlgorithm for EcdsaSha384AnyCurve {
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
         verify_ecdsa_any_curve::<Sha384>(spki, message, signature)
     }
+    fn verify_key(
+        &self,
+        key: &AnyPublicKey,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), Error> {
+        verify_ecdsa_key::<Sha384>(ecdsa_key(key, None)?, message, signature)
+    }
     fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
         ecdsa_spki_curve_bits(spki)
     }
@@ -222,6 +286,14 @@ impl SignatureAlgorithm for EcdsaSha512AnyCurve {
     }
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
         verify_ecdsa_any_curve::<Sha512>(spki, message, signature)
+    }
+    fn verify_key(
+        &self,
+        key: &AnyPublicKey,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), Error> {
+        verify_ecdsa_key::<Sha512>(ecdsa_key(key, None)?, message, signature)
     }
     fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
         ecdsa_spki_curve_bits(spki)
@@ -250,12 +322,15 @@ macro_rules! strict_ecdsa_entry {
             fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
                 verify_ecdsa_strict::<$digest>(spki, message, signature, $curve)
             }
+            fn verify_key(&self, key: &AnyPublicKey, message: &[u8], signature: &[u8]) -> Result<(), Error> {
+                verify_ecdsa_key::<$digest>(ecdsa_key(key, Some($curve))?, message, signature)
+            }
             // The entry pins its curve, so the size is a constant; but a
             // SPKI naming some other curve is reported as `None` (it fails
             // in `verify`), keeping the semantics identical to the
             // any-curve entries.
             fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
-                match parse_ecdsa_spki(spki) {
+                match ecdsa_spki_curve(spki) {
                     Ok((curve, _)) if curve == $curve => Some(curve_order_bits(curve)),
                     _ => None,
                 }
@@ -421,11 +496,18 @@ impl SignatureAlgorithm for Ed25519 {
         &[0x0807]
     }
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
-        let key = parse_ed25519_spki(spki)?;
-        // Ed25519 signatures are the raw 64-byte R‖S.
-        let bytes: [u8; 64] = signature.try_into().map_err(|_| Error::Malformed)?;
-        key.verify(message, &Ed25519Signature::from_bytes(bytes))
-            .map_err(|_| Error::Verification)
+        verify_ed25519(&parse_ed25519_spki(spki)?, message, signature)
+    }
+    fn verify_key(
+        &self,
+        key: &AnyPublicKey,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), Error> {
+        match key {
+            AnyPublicKey::Ed25519(k) => verify_ed25519(k, message, signature),
+            _ => Err(Error::UnsupportedAlgorithm),
+        }
     }
 }
 
@@ -444,12 +526,18 @@ impl SignatureAlgorithm for Ed448 {
         &[0x0808]
     }
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
-        let key = parse_ed448_spki(spki)?;
-        // Ed448 signatures are the raw 114-byte R‖S; X.509 / TLS use the empty
-        // context (pure Ed448, RFC 8032 §5.2).
-        let bytes: [u8; 114] = signature.try_into().map_err(|_| Error::Malformed)?;
-        key.verify(message, &Ed448Signature::from_bytes(bytes))
-            .map_err(|_| Error::Verification)
+        verify_ed448(&parse_ed448_spki(spki)?, message, signature)
+    }
+    fn verify_key(
+        &self,
+        key: &AnyPublicKey,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), Error> {
+        match key {
+            AnyPublicKey::Ed448(k) => verify_ed448(k, message, signature),
+            _ => Err(Error::UnsupportedAlgorithm),
+        }
     }
 }
 

@@ -17,7 +17,7 @@ use crate::der::{Reader, parse_oid};
 use crate::hash::{Digest, Sha1, Sha256, Sha384, Sha512, Shake128, Shake256};
 use crate::rsa::{BoxedRsaPublicKey, PssShake};
 use crate::signature_registry::SignatureAlgorithm;
-use crate::x509::{Error, PssHash, PssParams, PssRestriction, SignatureParams, oid};
+use crate::x509::{AnyPublicKey, Error, PssHash, PssParams, PssRestriction, SignatureParams, oid};
 
 /// Which SPKI forms an RSA registry entry accepts, and how it checks an
 /// `id-RSASSA-PSS` key's restriction.
@@ -52,18 +52,18 @@ enum SpkiUse {
     PssShake,
 }
 
-/// Parses the SPKI to extract an RSA public key, accepting the SPKI forms
-/// `use_` names.
+/// Walks `spki` to the PKCS#1 `RSAPublicKey` DER inside it, accepting the
+/// SPKI forms `use_` names.
 ///
 /// For `rsaEncryption` the explicit `NULL` parameters are required
 /// (RFC 3279 §2.3.1). For `id-RSASSA-PSS` the parameters are either absent
 /// (an unrestricted PSS key) or an `RSASSA-PSS-params` SEQUENCE, decoded by
 /// [`PssRestriction::decode`] and then required to permit the entry's
-/// parameter set — a key restricted to another set is rejected rather than
-/// silently verified with the wrong parameters. Trailing junk inside the
-/// AlgorithmIdentifier SEQUENCE or after the BIT STRING is rejected (strict
-/// DER).
-fn parse_rsa_spki(spki: &[u8], use_: SpkiUse) -> Result<BoxedRsaPublicKey, Error> {
+/// parameter set ([`check_pss_restriction`]) — a key restricted to another
+/// set is rejected rather than silently verified with the wrong
+/// parameters. Trailing junk inside the AlgorithmIdentifier SEQUENCE or
+/// after the BIT STRING is rejected (strict DER).
+fn rsa_spki_key_der(spki: &[u8], use_: SpkiUse) -> Result<&[u8], Error> {
     let mut reader = Reader::new(spki);
     let mut outer = reader.read_sequence()?;
     let mut algid = outer.read_sequence()?;
@@ -74,55 +74,96 @@ fn parse_rsa_spki(spki: &[u8], use_: SpkiUse) -> Result<BoxedRsaPublicKey, Error
     } else if alg.as_slice() == oid::ID_RSASSA_PSS {
         let restriction = PssRestriction::decode(&mut algid)?;
         algid.finish()?;
-        let (hash, mgf1_hash, salt_len) = match use_ {
-            SpkiUse::Pss {
-                hash,
-                mgf1_hash,
-                salt_len,
-                rsa_encryption_only: false,
-            } => (hash, mgf1_hash, salt_len),
-            SpkiUse::PssShake if restriction == PssRestriction::Unrestricted => {
-                let key_bits = outer.read_bit_string()?;
-                outer.finish()?;
-                reader.finish()?;
-                return Ok(BoxedRsaPublicKey::from_pkcs1_der(key_bits)?);
-            }
-            _ => return Err(Error::UnsupportedAlgorithm),
-        };
-        // The key-size policy probe leaves the MGF1 digest and the salt
-        // open: the key is usable by this entry iff its message digest
-        // matches; the MGF1 digest and the salt bound are checked per
-        // signature (`verify_with_params` names both).
-        let mgf1_hash = match (mgf1_hash, &restriction) {
-            (Some(m), _) => m,
-            (None, PssRestriction::Restricted(k)) => k.mgf1_hash,
-            (None, PssRestriction::Unrestricted) => hash,
-        };
-        let permitted = restriction.permits_params(&PssParams {
-            hash,
-            mgf1_hash,
-            salt_len: salt_len.unwrap_or(u32::MAX),
-            trailer_field: 1,
-        });
-        if !permitted {
-            return Err(Error::UnsupportedAlgorithm);
-        }
+        check_pss_restriction(&restriction, use_)?;
     } else {
         return Err(Error::UnsupportedAlgorithm);
     }
     let key_bits = outer.read_bit_string()?;
     outer.finish()?;
     reader.finish()?;
-    Ok(BoxedRsaPublicKey::from_pkcs1_der(key_bits)?)
+    Ok(key_bits)
+}
+
+/// Whether an `id-RSASSA-PSS` key carrying `restriction` may be used the
+/// way `use_` names: never for PKCS#1 v1.5 or the `rsa_pss_rsae_*`
+/// schemes, for SHAKE-PSS only when unrestricted, and for SHA-2 PSS when
+/// the restriction permits the parameter set (RFC 4055 §3.3: digests
+/// equal, salt at least the key's).
+fn check_pss_restriction(restriction: &PssRestriction, use_: SpkiUse) -> Result<(), Error> {
+    let (hash, mgf1_hash, salt_len) = match use_ {
+        SpkiUse::Pss {
+            hash,
+            mgf1_hash,
+            salt_len,
+            rsa_encryption_only: false,
+        } => (hash, mgf1_hash, salt_len),
+        SpkiUse::PssShake if *restriction == PssRestriction::Unrestricted => return Ok(()),
+        _ => return Err(Error::UnsupportedAlgorithm),
+    };
+    // The key-size policy probe leaves the MGF1 digest and the salt
+    // open: the key is usable by this entry iff its message digest
+    // matches; the MGF1 digest and the salt bound are checked per
+    // signature (`verify_with_params` names both).
+    let mgf1_hash = match (mgf1_hash, restriction) {
+        (Some(m), _) => m,
+        (None, PssRestriction::Restricted(k)) => k.mgf1_hash,
+        (None, PssRestriction::Unrestricted) => hash,
+    };
+    let permitted = restriction.permits_params(&PssParams {
+        hash,
+        mgf1_hash,
+        salt_len: salt_len.unwrap_or(u32::MAX),
+        trailer_field: 1,
+    });
+    if permitted {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedAlgorithm)
+    }
+}
+
+/// Parses the SPKI to extract an RSA public key, accepting the SPKI forms
+/// `use_` names (see [`rsa_spki_key_der`]).
+fn parse_rsa_spki(spki: &[u8], use_: SpkiUse) -> Result<BoxedRsaPublicKey, Error> {
+    Ok(BoxedRsaPublicKey::from_pkcs1_der(rsa_spki_key_der(
+        spki, use_,
+    )?)?)
+}
+
+/// The RSA key inside an already-parsed `key`, under the same acceptance
+/// rules as [`parse_rsa_spki`]: an `rsaEncryption` key as is, an
+/// `id-RSASSA-PSS` key when its restriction permits `use_`
+/// ([`check_pss_restriction`]), anything else refused.
+fn rsa_key(key: &AnyPublicKey, use_: SpkiUse) -> Result<&BoxedRsaPublicKey, Error> {
+    match key {
+        AnyPublicKey::Rsa(k) => Ok(k),
+        AnyPublicKey::RsaPss(k, restriction) => {
+            check_pss_restriction(restriction, use_)?;
+            Ok(k)
+        }
+        _ => Err(Error::UnsupportedAlgorithm),
+    }
 }
 
 /// Returns the modulus length, in bits, of the RSA key inside `spki` — or
 /// `None` when this entry would not accept the key at all, so the key-size
 /// policy hook agrees with `verify`.
+///
+/// Reads the modulus INTEGER with the DER reader alone: building the key
+/// would set up its Montgomery context (16-34 µs for a 2048-bit modulus)
+/// just to learn a length.
 fn rsa_bits(spki: &[u8], use_: SpkiUse) -> Option<u32> {
-    parse_rsa_spki(spki, use_)
-        .ok()
-        .map(|k| k.modulus().bit_len() as u32)
+    let key_der = rsa_spki_key_der(spki, use_).ok()?;
+    // RFC 8017 A.1.1: `RSAPublicKey ::= SEQUENCE { modulus INTEGER,
+    // publicExponent INTEGER }`.
+    let mut reader = Reader::new(key_der);
+    let mut seq = reader.read_sequence().ok()?;
+    let n = seq.read_unsigned_integer_bytes().ok()?;
+    // The bit length of the big-endian magnitude; an all-zero modulus is
+    // no key at all (`verify` refuses it).
+    let first = n.iter().position(|&b| b != 0)?;
+    let bits = (n.len() - first) * 8 - n[first].leading_zeros() as usize;
+    u32::try_from(bits).ok()
 }
 
 /// RSASSA-PSS verification with the signature's `RSASSA-PSS-params`: `D`
@@ -168,6 +209,10 @@ macro_rules! rsa_pkcs1_entry {
             fn tls_schemes(&self) -> &'static [u16] { $tls }
             fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
                 let key = parse_rsa_spki(spki, SpkiUse::Pkcs1)?;
+                key.verify_pkcs1v15::<$digest>(message, signature).map_err(Error::Rsa)
+            }
+            fn verify_key(&self, key: &AnyPublicKey, message: &[u8], signature: &[u8]) -> Result<(), Error> {
+                let key = rsa_key(key, SpkiUse::Pkcs1)?;
                 key.verify_pkcs1v15::<$digest>(message, signature).map_err(Error::Rsa)
             }
             fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> { rsa_bits(spki, SpkiUse::Pkcs1) }
@@ -224,6 +269,28 @@ macro_rules! rsa_pss_entry {
                 let key =
                     parse_rsa_spki(spki, Self::spki_use(Some(p.mgf1_hash), Some(p.salt_len)))?;
                 verify_pss_with_params::<$digest>(&key, $pss_hash, message, signature, &p)
+            }
+            fn verify_key(&self, key: &AnyPublicKey, message: &[u8], signature: &[u8]) -> Result<(), Error> {
+                let salt_len = $pss_hash.output_len();
+                let key = rsa_key(key, Self::spki_use(Some($pss_hash), Some(salt_len)))?;
+                key.verify_pss::<$digest>(message, signature).map_err(Error::Rsa)
+            }
+            fn verify_key_with_params(
+                &self,
+                key: &AnyPublicKey,
+                message: &[u8],
+                signature: &[u8],
+                params: SignatureParams,
+            ) -> Result<(), Error> {
+                let p = match params {
+                    SignatureParams::None => return self.verify_key(key, message, signature),
+                    SignatureParams::RsaPss(p) => p,
+                };
+                if p.hash != $pss_hash || p.trailer_field != 1 {
+                    return Err(Error::UnsupportedAlgorithm);
+                }
+                let key = rsa_key(key, Self::spki_use(Some(p.mgf1_hash), Some(p.salt_len)))?;
+                verify_pss_with_params::<$digest>(key, $pss_hash, message, signature, &p)
             }
             fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> {
                 rsa_bits(spki, Self::spki_use(None, None))
@@ -382,6 +449,10 @@ macro_rules! rsa_pss_shake_entry {
             fn tls_schemes(&self) -> &'static [u16] { &[] }
             fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
                 let key = parse_rsa_spki(spki, SpkiUse::PssShake)?;
+                key.verify_pss_shake::<$xof>(message, signature).map_err(Error::Rsa)
+            }
+            fn verify_key(&self, key: &AnyPublicKey, message: &[u8], signature: &[u8]) -> Result<(), Error> {
+                let key = rsa_key(key, SpkiUse::PssShake)?;
                 key.verify_pss_shake::<$xof>(message, signature).map_err(Error::Rsa)
             }
             fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> {

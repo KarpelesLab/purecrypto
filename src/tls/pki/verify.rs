@@ -586,7 +586,9 @@ fn check_revocation(
 ) -> Result<(), Error> {
     let cert_issuer = cert.issuer_der().map_err(|_| Error::BadCertificate)?;
     let serial = cert.serial_bytes().map_err(|_| Error::BadCertificate)?;
-    let issuer_spki = issuer_key.to_spki_der();
+    // Re-encoded only when a CRL for this issuer reaches the policy check
+    // (most issuers have none).
+    let mut issuer_spki: Option<Vec<u8>> = None;
     // RFC 5280 §6.3.3: a key used to sign a CRL MUST assert `cRLSign` in its
     // keyUsage extension when one is present. This is a property of the
     // issuer alone, so evaluate it once: an issuer that cannot validly sign
@@ -615,7 +617,10 @@ fn check_revocation(
         let Some(crl_algo) = issuer_key.signature_algorithm(&crl_sig_alg) else {
             continue;
         };
-        if !policy.permits(crl_algo, &issuer_spki) {
+        if !policy.permits(
+            crl_algo,
+            issuer_spki.get_or_insert_with(|| issuer_key.to_spki_der()),
+        ) {
             continue;
         }
         // Bound the peer-controlled public-key verification work. The
