@@ -330,33 +330,253 @@ fn crypt_blocks_soft<const INV: bool>(rk: &[u8], nr: usize, blocks: &mut [u8]) {
     }
 }
 
-/// Applies one full AES round to `state`: `MixColumns(ShiftRows(SubBytes(state)))`
-/// XOR'd with `round_key`. This is the AESENC primitive (the per-round transform
-/// of the FIPS-197 cipher, sans the key schedule), exposed for constructions —
-/// such as AEGIS and AEZ — that build on the bare round function rather than on a
-/// keyed AES instance.
-///
-/// Dispatches to the hardware AES round (AES-NI `aesenc` / ARMv8 `aese`+`aesmc`)
-/// when available, else the table-free software round. Both are constant-time and
-/// return identical results.
-#[inline]
-#[allow(unsafe_code)]
-pub(crate) fn aes_round(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
-    match detect_backend() {
-        AesBackend::Software => aes_round_soft(state, round_key),
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
-        AesBackend::Hardware => unsafe { aesni::aes_round(state, round_key) },
-        #[cfg(all(feature = "std", target_arch = "aarch64"))]
-        AesBackend::Hardware => unsafe { aes_arm::aes_round(state, round_key) },
-    }
-}
-
-/// Table-free constant-time AES round (the software fallback for [`aes_round`]).
+/// Table-free constant-time AES round: `MixColumns(ShiftRows(SubBytes(state)))`
+/// ⊕ `round_key`, the AESENC primitive (the software arm of [`AesRounds::round`]).
 fn aes_round_soft(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
     let mut s = [u128::from_le_bytes(state)];
     sub_layer(&mut s, false);
     (mix_columns(shift_rows(s[0])) ^ u128::from_le_bytes(round_key)).to_le_bytes()
 }
+
+/// Round-function modes of the AEGIS bulk kernels: absorb the data
+/// unchanged, encrypt it in place (update with the plaintext), or decrypt it
+/// in place (update with the recovered plaintext).
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+const AEGIS_ABSORB: u8 = 0;
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+const AEGIS_ENC: u8 = 1;
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+const AEGIS_DEC: u8 = 2;
+
+/// Dispatch handle for the constructions built on the bare AES round (AEGIS,
+/// AEZ). The backend is probed once per key (instead of once per round
+/// through a per-call probe) and the bulk kernels run with the whole state in
+/// registers, where the `[u8; 16]` round API costs a load/store round trip
+/// per round. Both backends are constant-time and produce identical results;
+/// the bulk methods report whether a hardware kernel ran so the caller keeps
+/// a single portable definition of the construction as its fallback.
+#[derive(Clone, Copy)]
+pub(crate) struct AesRounds {
+    backend: AesBackend,
+}
+
+impl AesRounds {
+    /// Probes the CPU (cached) and picks the backend.
+    #[inline]
+    pub(crate) fn detect() -> Self {
+        AesRounds {
+            backend: detect_backend(),
+        }
+    }
+
+    /// Forces the portable round. Test-only, for differential checks of the
+    /// hardware kernels against the reference construction.
+    #[cfg(test)]
+    pub(crate) fn software() -> Self {
+        AesRounds {
+            backend: AesBackend::Software,
+        }
+    }
+
+    /// One bare AES round (AESENC: `MixColumns(ShiftRows(SubBytes(state))) ⊕ rk`) on the cached backend.
+    #[inline]
+    #[allow(unsafe_code)]
+    pub(crate) fn round(self, state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
+        match self.backend {
+            AesBackend::Software => aes_round_soft(state, round_key),
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            AesBackend::Hardware => unsafe { aesni::aes_round(state, round_key) },
+            #[cfg(all(feature = "std", target_arch = "aarch64"))]
+            AesBackend::Hardware => unsafe { aes_arm::aes_round(state, round_key) },
+        }
+    }
+
+    #[cfg(feature = "aez")]
+    /// AEZ-core pass 1 over the `buf.len() / 32` i-block pairs of `buf` on
+    /// the hardware backend, all three `AES4` stages register-resident with
+    /// several pairs in flight and the tweak offsets formed in registers:
+    /// `keys` are the `AES4` round keys, `i1`/`j1` the `1I`/`1J` subkeys, `l`
+    /// the `L[0..8]` table, `i2 = 2I` the initial running offset, `x` the
+    /// running `X`. Returns `false` (touching nothing) without a hardware
+    /// backend, for the caller's portable loop.
+    // Without a hardware backend only the `Software => false` arm remains
+    // and the arguments go unused.
+    #[cfg_attr(
+        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(unused_variables)
+    )]
+    #[inline]
+    #[allow(unsafe_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn aez_pass1(
+        self,
+        keys: &[[u8; 16]; 4],
+        i1: &[u8; 16],
+        j1: &[u8; 16],
+        l: &[[u8; 16]; 8],
+        i2: &[u8; 16],
+        buf: &mut [u8],
+        x: &mut [u8; 16],
+    ) -> bool {
+        debug_assert!(buf.len().is_multiple_of(32));
+        let n = buf.len() / 32;
+        match self.backend {
+            AesBackend::Software => false,
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            AesBackend::Hardware => {
+                // SAFETY: `buf` is a live exclusive slice of `32 * n` bytes.
+                unsafe { aesni::aez_pass1(keys, i1, j1, l, i2, n, buf.as_mut_ptr(), x) };
+                true
+            }
+            #[cfg(all(feature = "std", target_arch = "aarch64"))]
+            AesBackend::Hardware => {
+                // SAFETY: as above.
+                unsafe { aes_arm::aez_pass1(keys, i1, j1, l, i2, n, buf.as_mut_ptr(), x) };
+                true
+            }
+        }
+    }
+
+    #[cfg(feature = "aez")]
+    /// AEZ-core pass 2, the counterpart of [`Self::aez_pass1`]: `j2 = 2J`,
+    /// `s` the `S` block, `y` the running `Y`.
+    // Without a hardware backend only the `Software => false` arm remains
+    // and the arguments go unused.
+    #[cfg_attr(
+        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(unused_variables)
+    )]
+    #[inline]
+    #[allow(unsafe_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn aez_pass2(
+        self,
+        keys: &[[u8; 16]; 4],
+        i1: &[u8; 16],
+        j1: &[u8; 16],
+        j2: &[u8; 16],
+        l: &[[u8; 16]; 8],
+        i2: &[u8; 16],
+        s: &[u8; 16],
+        buf: &mut [u8],
+        y: &mut [u8; 16],
+    ) -> bool {
+        debug_assert!(buf.len().is_multiple_of(32));
+        let n = buf.len() / 32;
+        match self.backend {
+            AesBackend::Software => false,
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            AesBackend::Hardware => {
+                // SAFETY: `buf` is a live exclusive slice of `32 * n` bytes.
+                unsafe { aesni::aez_pass2(keys, i1, j1, j2, l, i2, s, n, buf.as_mut_ptr(), y) };
+                true
+            }
+            #[cfg(all(feature = "std", target_arch = "aarch64"))]
+            AesBackend::Hardware => {
+                // SAFETY: as above.
+                unsafe { aes_arm::aez_pass2(keys, i1, j1, j2, l, i2, s, n, buf.as_mut_ptr(), y) };
+                true
+            }
+        }
+    }
+}
+
+/// Defines the AEGIS bulk methods on [`AesRounds`]: `$absorb` feeds whole
+/// blocks of `data` through the state update, `$crypt` encrypts
+/// (`decrypt == false`) or decrypts `buf` in place. Both require the length
+/// to be a multiple of `$blk` and return `true` when the hardware kernel
+/// ran; `false` leaves the state and buffer untouched for the caller's
+/// portable loop. `$kernel` is the backend function, generic over the mode.
+macro_rules! aegis_bulk {
+    ($absorb:ident, $crypt:ident, $words:literal, $blk:literal, $kernel:ident) => {
+        impl AesRounds {
+            // Without a hardware backend only the `Software => false` arm remains
+            // and the arguments go unused.
+            #[cfg_attr(
+                not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+                allow(unused_variables)
+            )]
+            #[inline]
+            #[allow(unsafe_code)]
+            pub(crate) fn $absorb(self, s: &mut [[u8; 16]; $words], data: &[u8]) -> bool {
+                debug_assert!(data.len().is_multiple_of($blk));
+                match self.backend {
+                    AesBackend::Software => false,
+                    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+                    AesBackend::Hardware => {
+                        // SAFETY: the absorb mode never writes through the
+                        // pointer, which is valid for `data.len()` bytes.
+                        unsafe {
+                            aesni::$kernel::<AEGIS_ABSORB>(s, data.as_ptr() as *mut u8, data.len())
+                        }
+                        true
+                    }
+                    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+                    AesBackend::Hardware => {
+                        // SAFETY: as above.
+                        unsafe {
+                            aes_arm::$kernel::<AEGIS_ABSORB>(
+                                s,
+                                data.as_ptr() as *mut u8,
+                                data.len(),
+                            )
+                        }
+                        true
+                    }
+                }
+            }
+
+            // Without a hardware backend only the `Software => false` arm remains
+            // and the arguments go unused.
+            #[cfg_attr(
+                not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+                allow(unused_variables)
+            )]
+            #[inline]
+            #[allow(unsafe_code)]
+            pub(crate) fn $crypt(
+                self,
+                s: &mut [[u8; 16]; $words],
+                buf: &mut [u8],
+                decrypt: bool,
+            ) -> bool {
+                debug_assert!(buf.len().is_multiple_of($blk));
+                match self.backend {
+                    AesBackend::Software => false,
+                    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+                    AesBackend::Hardware => {
+                        // SAFETY: `buf` is a live exclusive slice of `len` bytes.
+                        unsafe {
+                            if decrypt {
+                                aesni::$kernel::<AEGIS_DEC>(s, buf.as_mut_ptr(), buf.len())
+                            } else {
+                                aesni::$kernel::<AEGIS_ENC>(s, buf.as_mut_ptr(), buf.len())
+                            }
+                        }
+                        true
+                    }
+                    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+                    AesBackend::Hardware => {
+                        // SAFETY: as above.
+                        unsafe {
+                            if decrypt {
+                                aes_arm::$kernel::<AEGIS_DEC>(s, buf.as_mut_ptr(), buf.len())
+                            } else {
+                                aes_arm::$kernel::<AEGIS_ENC>(s, buf.as_mut_ptr(), buf.len())
+                            }
+                        }
+                        true
+                    }
+                }
+            }
+        }
+    };
+}
+
+aegis_bulk!(aegis128l_absorb, aegis128l_crypt, 8, 32, aegis128l);
+aegis_bulk!(aegis256_absorb, aegis256_crypt, 6, 16, aegis256);
+#[cfg(feature = "legacy-ciphers")]
+aegis_bulk!(aegis128_absorb, aegis128_crypt, 5, 16, aegis128);
 
 /// Defines an AES variant with a given key size, key-word count, round count,
 /// and round-key buffer length.
@@ -673,7 +893,11 @@ mod tests {
         for seed in 0..256u64 {
             fill(seed, &mut st);
             fill(seed ^ 0x5555, &mut rk);
-            assert_eq!(aes_round(st, rk), aes_round_soft(st, rk), "seed {seed}");
+            assert_eq!(
+                AesRounds::detect().round(st, rk),
+                aes_round_soft(st, rk),
+                "seed {seed}"
+            );
         }
     }
 

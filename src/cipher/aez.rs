@@ -33,7 +33,7 @@
 //! [`AEGIS`]: super::Aegis128L
 
 use super::TagMismatch;
-use super::aes::aes_round;
+use super::aes::AesRounds;
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Blake2b384, Digest};
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
@@ -46,18 +46,12 @@ const ZERO: Block = [0u8; BLOCK];
 
 #[inline]
 fn xor16(a: &Block, b: &Block) -> Block {
-    let mut o = [0u8; BLOCK];
-    for i in 0..BLOCK {
-        o[i] = a[i] ^ b[i];
-    }
-    o
+    (u128::from_ne_bytes(*a) ^ u128::from_ne_bytes(*b)).to_ne_bytes()
 }
 
 #[inline]
 fn xor_into(dst: &mut Block, a: &Block) {
-    for i in 0..BLOCK {
-        dst[i] ^= a[i];
-    }
+    *dst = xor16(dst, a);
 }
 
 #[inline]
@@ -75,14 +69,11 @@ fn wr(buf: &mut [u8], off: usize, b: &Block) {
 /// `dst = 2 · src` in GF(2¹²⁸) (the GCM/AEZ doubling: left-shift the 128-bit
 /// big-endian value by one bit, reduce by `0x87` on carry-out). Constant-time.
 fn double_block(p: &mut Block) {
-    let top = p[0] >> 7;
-    for i in 0..15 {
-        p[i] = (p[i] << 1) | (p[i + 1] >> 7);
-    }
+    let v = u128::from_be_bytes(*p);
     // 0x00 or 0x87, branchlessly: the top bit is key-derived (every doubled
     // block descends from `E_K(...)`), i.e. secret, so this must stay a mask
     // and never become a branch.
-    p[15] = (p[15] << 1) ^ (0u8.wrapping_sub(top) & 0x87);
+    *p = ((v << 1) ^ (0u128.wrapping_sub(v >> 127) & 0x87)).to_be_bytes();
 }
 
 /// `x · src` in GF(2¹²⁸) for a small non-negative integer `x`, via binary
@@ -114,6 +105,8 @@ pub struct Aez {
     i: [Block; 2], // 1I, 2I
     j: [Block; 3], // 1J, 2J, 4J
     l: [Block; 8], // 0L (=0), 1L … 7L
+    /// The AES round backend, probed once here.
+    rounds: AesRounds,
 }
 
 impl Drop for Aez {
@@ -157,7 +150,34 @@ impl Aez {
         l[7] = xor16(&l[6], &l[1]); // 7L
         // `ek` is the raw `I‖J‖L`; the state now owns everything needed.
         ek.zeroize();
-        Aez { i, j, l }
+        Aez {
+            i,
+            j,
+            l,
+            rounds: AesRounds::detect(),
+        }
+    }
+
+    /// Forces the portable AES round. Test-only (differential checks of the
+    /// batched hardware kernel against the reference construction).
+    #[cfg(test)]
+    pub(crate) fn new_software(key: &[u8]) -> Self {
+        let mut aez = Self::new(key);
+        aez.rounds = AesRounds::software();
+        aez
+    }
+
+    /// The `AES4` round keys `(1J, 1I, 1L, 0)`.
+    #[inline]
+    fn aes4_keys(&self) -> [Block; 4] {
+        [self.j[0], self.i[0], self.l[1], ZERO]
+    }
+
+    /// Pairs the core passes take from a buffer of `len` bytes: one per 32
+    /// bytes while at least 64 remain (the serial definition's loop bound).
+    #[inline]
+    fn core_pairs(len: usize) -> usize {
+        if len >= 64 { (len - 32) / 32 } else { 0 }
     }
 
     /// The authenticator length in bits, as the `u32` AEZ-hash tweak.
@@ -181,10 +201,11 @@ impl Aez {
         let mut x = xor16(src, off_j);
         xor_into(&mut x, off_i);
         xor_into(&mut x, off_l);
-        let t = aes_round(x, self.j[0]); // 1J
-        let t = aes_round(t, self.i[0]); // 1I
-        let t = aes_round(t, self.l[1]); // 1L
-        aes_round(t, ZERO)
+        let r = self.rounds;
+        let t = r.round(x, self.j[0]); // 1J
+        let t = r.round(t, self.i[0]); // 1I
+        let t = r.round(t, self.l[1]); // 1L
+        r.round(t, ZERO)
     }
 
     /// `E_K^{-1,i}`: ten AES rounds (keys 1I,1J,1L repeating) over `src ⊕ off_l`,
@@ -197,7 +218,7 @@ impl Aez {
             self.l[1], self.i[0],
         ];
         for k in keys {
-            t = aes_round(t, k);
+            t = self.rounds.round(t, k);
         }
         t
     }
@@ -301,55 +322,77 @@ impl Aez {
 
     /// AEZ-core pass 1 (in place over the i-blocks): computes `X` and writes the
     /// first-Feistel-round intermediates back into `buf`.
+    ///
+    /// The i-block pairs are independent, so they go to the register-resident
+    /// hardware kernel (several pairs in flight through all the `AES4` stages,
+    /// tweak offsets formed in registers); the loop below it is the portable
+    /// definition.
     fn core_pass1(&self, buf: &mut [u8], x: &mut Block) {
+        let n = Self::core_pairs(buf.len());
+        let buf = &mut buf[..32 * n];
+        if self.rounds.aez_pass1(
+            &self.aes4_keys(),
+            &self.i[0],
+            &self.j[0],
+            &self.l,
+            &self.i[1],
+            buf,
+            x,
+        ) {
+            return;
+        }
         let mut ii = self.i[1];
-        let mut i: u32 = 1;
-        let mut off = 0usize;
-        let mut remaining = buf.len();
-        while remaining >= 64 {
-            let m0 = rd(buf, off);
-            let m1 = rd(buf, off + BLOCK);
+        for (i, pair) in (1u32..).zip(buf.chunks_exact_mut(32)) {
+            let m0 = rd(pair, 0);
+            let m1 = rd(pair, BLOCK);
             let t = self.aes4(&self.j[0], &ii, &self.l[(i % 8) as usize], &m1); // E(1,i)
             let o0 = xor16(&m0, &t);
-            wr(buf, off, &o0);
             let t = self.aes4(&ZERO, &self.i[0], &self.l[0], &o0); // E(0,0)
             let o1 = xor16(&m1, &t);
-            wr(buf, off + BLOCK, &o1);
+            wr(pair, 0, &o0);
+            wr(pair, BLOCK, &o1);
             xor_into(x, &o1);
-            off += 32;
-            remaining -= 32;
             if i.is_multiple_of(8) {
                 double_block(&mut ii);
             }
-            i += 1;
         }
     }
 
     /// AEZ-core pass 2 (in place over the i-blocks): injects `S` and completes
     /// the second Feistel rounds, computing `Y` and the final i-block ciphertext.
+    /// Dispatched like [`Self::core_pass1`].
     fn core_pass2(&self, buf: &mut [u8], y: &mut Block, s: &Block) {
+        let n = Self::core_pairs(buf.len());
+        let buf = &mut buf[..32 * n];
+        if self.rounds.aez_pass2(
+            &self.aes4_keys(),
+            &self.i[0],
+            &self.j[0],
+            &self.j[1],
+            &self.l,
+            &self.i[1],
+            s,
+            buf,
+            y,
+        ) {
+            return;
+        }
         let mut ii = self.i[1];
-        let mut i: u32 = 1;
-        let mut off = 0usize;
-        let mut remaining = buf.len();
-        while remaining >= 64 {
+        for (i, pair) in (1u32..).zip(buf.chunks_exact_mut(32)) {
             let t = self.aes4(&self.j[1], &ii, &self.l[(i % 8) as usize], s); // E(2,i)
-            let mut o0 = xor16(&rd(buf, off), &t);
-            let mut o1 = xor16(&rd(buf, off + BLOCK), &t);
+            let mut o0 = xor16(&rd(pair, 0), &t);
+            let mut o1 = xor16(&rd(pair, BLOCK), &t);
             xor_into(y, &o0);
             let t = self.aes4(&ZERO, &self.i[0], &self.l[0], &o1); // E(0,0)
             xor_into(&mut o0, &t);
             let t = self.aes4(&self.j[0], &ii, &self.l[(i % 8) as usize], &o0); // E(1,i)
             xor_into(&mut o1, &t);
             // swap the two blocks on write-back
-            wr(buf, off, &o1);
-            wr(buf, off + BLOCK, &o0);
-            off += 32;
-            remaining -= 32;
+            wr(pair, 0, &o1);
+            wr(pair, BLOCK, &o0);
             if i.is_multiple_of(8) {
                 double_block(&mut ii);
             }
-            i += 1;
         }
     }
 
@@ -581,7 +624,10 @@ impl Aez {
         let tau_bits = Self::tau_bits(tau);
         assert_eq!(out.len(), m.len() + tau, "AEZ encrypt: wrong output length");
         let delta = self.aez_hash(nonce, ad, tau_bits);
-        out.fill(0);
+        // Only the trailing `tau` bytes need zeroing: the message overwrites
+        // the rest (a whole-buffer fill was a measurable share of a 64 KiB
+        // encipher).
+        out[m.len()..].fill(0);
         if m.is_empty() {
             self.aez_prf(&delta, out);
         } else {
@@ -815,6 +861,38 @@ mod tests {
         );
         // The untampered ciphertext still decrypts.
         assert_eq!(aez.decrypt(&n, &adr, tau, &cp).unwrap(), mp);
+    }
+
+    /// The register-resident hardware kernel of the core passes must match
+    /// the portable construction byte for byte, across lengths that cover no
+    /// pairs, partial groups, exact groups, several windows, with and
+    /// without a fragment.
+    #[test]
+    fn hardware_matches_software() {
+        let hw = Aez::new(&[0x42u8; 48]);
+        let sw = Aez::new_software(&[0x42u8; 48]);
+        let ad: [&[u8]; 1] = [b"associated"];
+        for len in [
+            0usize, 1, 16, 31, 32, 33, 63, 64, 65, 96, 100, 160, 161, 192, 255, 256, 287, 288, 289,
+            320, 1000, 1024, 1056, 1057, 1088, 2112, 4096,
+        ] {
+            let msg: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(13)).collect();
+            for tau in [0usize, 16] {
+                let a = hw.encrypt(b"nonce", &ad, tau, &msg);
+                let b = sw.encrypt(b"nonce", &ad, tau, &msg);
+                assert_eq!(a, b, "len={len} tau={tau}");
+                assert_eq!(
+                    sw.decrypt(b"nonce", &ad, tau, &a).unwrap(),
+                    msg,
+                    "sw dec len={len}"
+                );
+                assert_eq!(
+                    hw.decrypt(b"nonce", &ad, tau, &b).unwrap(),
+                    msg,
+                    "hw dec len={len}"
+                );
+            }
+        }
     }
 
     #[test]

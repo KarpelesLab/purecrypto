@@ -244,3 +244,455 @@ pub(super) unsafe fn decrypt_blocks<const NR: usize>(round_keys: &[u8], blocks: 
         wipe(&mut b);
     }
 }
+
+// --- Bare-round constructions (AEGIS, AEZ) ------------------------------------
+
+use super::{AEGIS_ABSORB, AEGIS_ENC};
+
+/// One AES round with AESENC semantics on registers:
+/// `MixColumns(ShiftRows(SubBytes(a))) ⊕ b`.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn round(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+    unsafe { veorq_u8(vaesmcq_u8(vaeseq_u8(a, vdupq_n_u8(0))), b) }
+}
+
+/// Loads an `N`-word byte state into registers.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn load_words<const N: usize>(s: &[[u8; 16]; N]) -> [uint8x16_t; N] {
+    unsafe {
+        let mut v = [vdupq_n_u8(0); N];
+        for (vj, sj) in v.iter_mut().zip(s.iter()) {
+            *vj = vld1q_u8(sj.as_ptr());
+        }
+        v
+    }
+}
+
+/// Stores an `N`-word register state back to bytes.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn store_words<const N: usize>(s: &mut [[u8; 16]; N], v: &[uint8x16_t; N]) {
+    unsafe {
+        for (sj, vj) in s.iter_mut().zip(v.iter()) {
+            vst1q_u8(sj.as_mut_ptr(), *vj);
+        }
+    }
+}
+
+/// Keystream/data step shared by the AEGIS kernels: with the keystream
+/// block `z`, returns the block to feed the state update (the data itself
+/// when absorbing or encrypting, the recovered plaintext when decrypting)
+/// and writes the output block in place for the two cipher modes. `p` is
+/// only written when `MODE != AEGIS_ABSORB`.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn aegis_step<const MODE: u8>(p: *mut u8, z: uint8x16_t) -> uint8x16_t {
+    unsafe {
+        let m = vld1q_u8(p);
+        if MODE == AEGIS_ABSORB {
+            return m;
+        }
+        let c = veorq_u8(m, z);
+        vst1q_u8(p, c);
+        if MODE == AEGIS_ENC { m } else { c }
+    }
+}
+
+/// AEGIS-128L bulk kernel: runs `StateUpdate128L` over every 32-byte block of
+/// `buf` (`len` must be a multiple of 32) with the state held in registers.
+/// `buf` is read only in [`AEGIS_ABSORB`] mode, read and written in place
+/// in the two cipher modes. The eight AES rounds of one update are
+/// independent; the only chain is between successive updates.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn aegis128l<const MODE: u8>(s: &mut [[u8; 16]; 8], buf: *mut u8, len: usize) {
+    unsafe {
+        let mut st = load_words(s);
+        let mut off = 0;
+        while off + 32 <= len {
+            let p = buf.add(off);
+            let z0 = veorq_u8(veorq_u8(st[1], st[6]), vandq_u8(st[2], st[3]));
+            let z1 = veorq_u8(veorq_u8(st[2], st[5]), vandq_u8(st[6], st[7]));
+            let t0 = aegis_step::<MODE>(p, z0);
+            let t1 = aegis_step::<MODE>(p.add(16), z1);
+            st = [
+                round(st[7], veorq_u8(st[0], t0)),
+                round(st[0], st[1]),
+                round(st[1], st[2]),
+                round(st[2], st[3]),
+                round(st[3], veorq_u8(st[4], t1)),
+                round(st[4], st[5]),
+                round(st[5], st[6]),
+                round(st[6], st[7]),
+            ];
+            off += 32;
+        }
+        store_words(s, &st);
+        // The state is key material (it yields the keystream and the tag);
+        // the caller's copy is wiped on drop, scrub any register spills here.
+        wipe(&mut st);
+    }
+}
+
+/// AEGIS-256 bulk kernel: `StateUpdate256` over every 16-byte block of `buf`
+/// (`len` a multiple of 16); see [`aegis128l`] for the buffer contract.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn aegis256<const MODE: u8>(s: &mut [[u8; 16]; 6], buf: *mut u8, len: usize) {
+    unsafe {
+        let mut st = load_words(s);
+        let mut off = 0;
+        while off + 16 <= len {
+            let z = veorq_u8(
+                veorq_u8(veorq_u8(st[1], st[4]), st[5]),
+                vandq_u8(st[2], st[3]),
+            );
+            let t = aegis_step::<MODE>(buf.add(off), z);
+            st = [
+                round(st[5], veorq_u8(st[0], t)),
+                round(st[0], st[1]),
+                round(st[1], st[2]),
+                round(st[2], st[3]),
+                round(st[3], st[4]),
+                round(st[4], st[5]),
+            ];
+            off += 16;
+        }
+        store_words(s, &st);
+        wipe(&mut st);
+    }
+}
+
+/// AEGIS-128 (the original five-word CAESAR variant) bulk kernel over every
+/// 16-byte block of `buf` (`len` a multiple of 16); see [`aegis128l`].
+#[cfg(feature = "legacy-ciphers")]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn aegis128<const MODE: u8>(s: &mut [[u8; 16]; 5], buf: *mut u8, len: usize) {
+    unsafe {
+        let mut st = load_words(s);
+        let mut off = 0;
+        while off + 16 <= len {
+            let z = veorq_u8(veorq_u8(st[1], st[4]), vandq_u8(st[2], st[3]));
+            let t = aegis_step::<MODE>(buf.add(off), z);
+            st = [
+                round(st[4], veorq_u8(st[0], t)),
+                round(st[0], st[1]),
+                round(st[1], st[2]),
+                round(st[2], st[3]),
+                round(st[3], st[4]),
+            ];
+            off += 16;
+        }
+        store_words(s, &st);
+        wipe(&mut st);
+    }
+}
+
+#[cfg(feature = "aez")]
+/// AEZ `AES4` (`keys[0..4]`) over the first `N` of the blocks held in
+/// registers, round-major so the `N` chains overlap.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn aes4_n<const N: usize>(b: &mut [uint8x16_t; AEZ_PAIRS], k: &[uint8x16_t; 4]) {
+    unsafe {
+        for kv in k {
+            for bj in b[..N].iter_mut() {
+                *bj = round(*bj, *kv);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "aez")]
+/// Pairs in flight in the AEZ-core pass kernels: the three dependent `AES4`
+/// stages are latency-bound below this on a wide core (32 vector registers
+/// hold the eight pairs plus the keys).
+const AEZ_PAIRS: usize = 8;
+#[cfg(feature = "aez")]
+const _: () = assert!(8 % AEZ_PAIRS == 0);
+
+#[cfg(feature = "aez")]
+/// Register-resident temporaries of the AEZ pass kernels: the two blocks of
+/// each pair and the `AES4` chain. Hoisted to the kernel entry so they are
+/// wiped once per call (a wipe per group would pin them to stack slots and
+/// fence every group's loads behind the previous group's stores).
+struct AezRegs {
+    m0: [uint8x16_t; AEZ_PAIRS],
+    m1: [uint8x16_t; AEZ_PAIRS],
+    t: [uint8x16_t; AEZ_PAIRS],
+}
+
+#[cfg(feature = "aez")]
+impl AezRegs {
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn new() -> Self {
+        AezRegs {
+            m0: [vdupq_n_u8(0); AEZ_PAIRS],
+            m1: [vdupq_n_u8(0); AEZ_PAIRS],
+            t: [vdupq_n_u8(0); AEZ_PAIRS],
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn wipe(&mut self) {
+        unsafe {
+            wipe(&mut self.m0);
+            wipe(&mut self.m1);
+            wipe(&mut self.t);
+        }
+    }
+}
+
+#[cfg(feature = "aez")]
+/// The AEZ tweak-offset schedule of the core passes: pair `i` (from 1) uses
+/// `ii ⊕ L[i mod 8]` with `ii` starting at `2I` and doubling (in GF(2¹²⁸),
+/// big-endian, `0x87`) after every pair with `i ≡ 0 (mod 8)`. Walked here in
+/// groups of eight pairs that share one `ii`, so the kernels form the
+/// offsets in registers from `ii` and the `L` table instead of a
+/// materialised offset array.
+struct AezTweaks {
+    /// The running `ii`, as the big-endian integer it is doubled as.
+    ii: u128,
+    /// `L[0..8]` table base.
+    l: *const u8,
+}
+
+#[cfg(feature = "aez")]
+impl AezTweaks {
+    /// `L[k]` for `k = (lbase + j) mod 8`.
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn l(&self, lbase: usize, j: usize) -> uint8x16_t {
+        unsafe { vld1q_u8(self.l.add(16 * ((lbase + j) & 7))) }
+    }
+
+    /// The current `ii` as a vector (`xored` with a base, e.g. `1J`).
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn ii_xor(&self, base: uint8x16_t) -> uint8x16_t {
+        unsafe { veorq_u8(base, vld1q_u8(self.ii.to_be_bytes().as_ptr())) }
+    }
+
+    /// Advances past a full group of eight pairs: `ii ← 2·ii`, branch-free.
+    #[inline]
+    fn double(&mut self) {
+        let v = self.ii;
+        self.ii = (v << 1) ^ (0u128.wrapping_sub(v >> 127) & 0x87);
+    }
+}
+
+#[cfg(feature = "aez")]
+/// AEZ-core pass 1 over `N` i-block pairs at `p` with offsets
+/// `jii ⊕ L[(lbase + j) mod 8]` (`jii = 1J ⊕ ii`): `o0 = m0 ⊕ E(1,i)(m1)`,
+/// `o1 = m1 ⊕ E(0,0)(o0)`, `x ⊕= o1`, written back in place.
+#[inline]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn aez_pass1_n<const N: usize>(
+    r: &mut AezRegs,
+    k: &[uint8x16_t; 4],
+    i1: uint8x16_t,
+    jii: uint8x16_t,
+    tw: &AezTweaks,
+    lbase: usize,
+    p: *mut u8,
+    x: &mut uint8x16_t,
+) {
+    unsafe {
+        for j in 0..N {
+            r.m0[j] = vld1q_u8(p.add(32 * j));
+            r.m1[j] = vld1q_u8(p.add(32 * j + 16));
+            r.t[j] = veorq_u8(veorq_u8(r.m1[j], jii), tw.l(lbase, j));
+        }
+        aes4_n::<N>(&mut r.t, k);
+        for j in 0..N {
+            r.m0[j] = veorq_u8(r.m0[j], r.t[j]);
+            r.t[j] = veorq_u8(r.m0[j], i1);
+        }
+        aes4_n::<N>(&mut r.t, k);
+        for j in 0..N {
+            r.m1[j] = veorq_u8(r.m1[j], r.t[j]);
+            *x = veorq_u8(*x, r.m1[j]);
+            vst1q_u8(p.add(32 * j), r.m0[j]);
+            vst1q_u8(p.add(32 * j + 16), r.m1[j]);
+        }
+    }
+}
+
+#[cfg(feature = "aez")]
+/// AEZ-core pass 2 over `N` pairs: with `t = E(2,i)(S)` (input
+/// `sj2 ⊕ L[..]`, `sj2 = S ⊕ 2J ⊕ ii`), `o0 = m0 ⊕ t`, `o1 = m1 ⊕ t`,
+/// `y ⊕= o0`, `o0 ⊕= E(0,0)(o1)`, `o1 ⊕= E(1,i)(o0)` (offset
+/// `jii ⊕ L[..]`, `jii = 1J ⊕ ii`), the pair written back swapped (`o1 ‖ o0`).
+#[inline]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn aez_pass2_n<const N: usize>(
+    r: &mut AezRegs,
+    k: &[uint8x16_t; 4],
+    i1: uint8x16_t,
+    jii: uint8x16_t,
+    sj2: uint8x16_t,
+    tw: &AezTweaks,
+    lbase: usize,
+    p: *mut u8,
+    y: &mut uint8x16_t,
+) {
+    unsafe {
+        for j in 0..N {
+            r.m0[j] = vld1q_u8(p.add(32 * j));
+            r.m1[j] = vld1q_u8(p.add(32 * j + 16));
+            r.t[j] = veorq_u8(sj2, tw.l(lbase, j));
+        }
+        aes4_n::<N>(&mut r.t, k);
+        for j in 0..N {
+            r.m0[j] = veorq_u8(r.m0[j], r.t[j]);
+            r.m1[j] = veorq_u8(r.m1[j], r.t[j]);
+            *y = veorq_u8(*y, r.m0[j]);
+            r.t[j] = veorq_u8(r.m1[j], i1);
+        }
+        aes4_n::<N>(&mut r.t, k);
+        for j in 0..N {
+            r.m0[j] = veorq_u8(r.m0[j], r.t[j]);
+            r.t[j] = veorq_u8(veorq_u8(r.m0[j], jii), tw.l(lbase, j));
+        }
+        aes4_n::<N>(&mut r.t, k);
+        for j in 0..N {
+            r.m1[j] = veorq_u8(r.m1[j], r.t[j]);
+            vst1q_u8(p.add(32 * j), r.m1[j]);
+            vst1q_u8(p.add(32 * j + 16), r.m0[j]);
+        }
+    }
+}
+
+#[cfg(feature = "aez")]
+/// AEZ-core pass 1 over the `npairs` i-block pairs at `buf` (see
+/// [`aez_pass1_n`]): `keys` are the `AES4` round keys, `i1`/`j1` the `1I` and
+/// `1J` subkeys, `l` the `L[0..8]` table, `i2 = 2I` the initial `ii`, `x` the
+/// running `X`. [`AEZ_PAIRS`] pairs in flight, then a four-group, then
+/// singly. Kept out of line so the register-resident body survives
+/// whole-program inlining into the scalar caller.
+#[inline(never)]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn aez_pass1(
+    keys: &[[u8; 16]; 4],
+    i1: &[u8; 16],
+    j1: &[u8; 16],
+    l: &[[u8; 16]; 8],
+    i2: &[u8; 16],
+    npairs: usize,
+    buf: *mut u8,
+    x: &mut [u8; 16],
+) {
+    unsafe {
+        let k = load_words(keys);
+        let i1v = vld1q_u8(i1.as_ptr());
+        let j1v = vld1q_u8(j1.as_ptr());
+        let mut xv = vld1q_u8(x.as_ptr());
+        let mut r = AezRegs::new();
+        let mut tw = AezTweaks {
+            ii: u128::from_be_bytes(*i2),
+            l: l.as_ptr() as *const u8,
+        };
+        let mut p = buf;
+        let mut left = npairs;
+        // Runs of eight pairs (`i ≡ 1..=0 (mod 8)`) share `ii` and use
+        // `L[1..7], L[0]`; a run is one or two groups depending on the
+        // backend's width, and `ii` doubles after each run.
+        while left >= 8 {
+            let jii = tw.ii_xor(j1v);
+            let mut lbase = 1;
+            for _ in 0..8 / AEZ_PAIRS {
+                aez_pass1_n::<AEZ_PAIRS>(&mut r, &k, i1v, jii, &tw, lbase, p, &mut xv);
+                p = p.add(32 * AEZ_PAIRS);
+                lbase += AEZ_PAIRS;
+            }
+            left -= 8;
+            tw.double();
+        }
+        // The remainder never reaches the next doubling point.
+        let jii = tw.ii_xor(j1v);
+        let mut lbase = 1;
+        if left >= 4 {
+            aez_pass1_n::<4>(&mut r, &k, i1v, jii, &tw, lbase, p, &mut xv);
+            p = p.add(128);
+            left -= 4;
+            lbase += 4;
+        }
+        for _ in 0..left {
+            aez_pass1_n::<1>(&mut r, &k, i1v, jii, &tw, lbase, p, &mut xv);
+            p = p.add(32);
+            lbase += 1;
+        }
+        vst1q_u8(x.as_mut_ptr(), xv);
+        r.wipe();
+        crate::zeroize::Zeroize::zeroize(&mut tw.ii);
+    }
+}
+
+#[cfg(feature = "aez")]
+/// AEZ-core pass 2 over the `npairs` pairs at `buf` (see [`aez_pass2_n`]);
+/// `j2 = 2J`, `s` the `S` block, `y` the running `Y`, the rest as in
+/// [`aez_pass1`].
+#[inline(never)]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn aez_pass2(
+    keys: &[[u8; 16]; 4],
+    i1: &[u8; 16],
+    j1: &[u8; 16],
+    j2: &[u8; 16],
+    l: &[[u8; 16]; 8],
+    i2: &[u8; 16],
+    s: &[u8; 16],
+    npairs: usize,
+    buf: *mut u8,
+    y: &mut [u8; 16],
+) {
+    unsafe {
+        let k = load_words(keys);
+        let i1v = vld1q_u8(i1.as_ptr());
+        let j1v = vld1q_u8(j1.as_ptr());
+        let sj2v = veorq_u8(vld1q_u8(s.as_ptr()), vld1q_u8(j2.as_ptr()));
+        let mut yv = vld1q_u8(y.as_ptr());
+        let mut r = AezRegs::new();
+        let mut tw = AezTweaks {
+            ii: u128::from_be_bytes(*i2),
+            l: l.as_ptr() as *const u8,
+        };
+        let mut p = buf;
+        let mut left = npairs;
+        while left >= 8 {
+            let jii = tw.ii_xor(j1v);
+            let sj2 = tw.ii_xor(sj2v);
+            let mut lbase = 1;
+            for _ in 0..8 / AEZ_PAIRS {
+                aez_pass2_n::<AEZ_PAIRS>(&mut r, &k, i1v, jii, sj2, &tw, lbase, p, &mut yv);
+                p = p.add(32 * AEZ_PAIRS);
+                lbase += AEZ_PAIRS;
+            }
+            left -= 8;
+            tw.double();
+        }
+        let jii = tw.ii_xor(j1v);
+        let sj2 = tw.ii_xor(sj2v);
+        let mut lbase = 1;
+        if left >= 4 {
+            aez_pass2_n::<4>(&mut r, &k, i1v, jii, sj2, &tw, lbase, p, &mut yv);
+            p = p.add(128);
+            left -= 4;
+            lbase += 4;
+        }
+        for _ in 0..left {
+            aez_pass2_n::<1>(&mut r, &k, i1v, jii, sj2, &tw, lbase, p, &mut yv);
+            p = p.add(32);
+            lbase += 1;
+        }
+        vst1q_u8(y.as_mut_ptr(), yv);
+        r.wipe();
+        crate::zeroize::Zeroize::zeroize(&mut tw.ii);
+    }
+}

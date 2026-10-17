@@ -2180,7 +2180,19 @@ fn aez() -> String {
     let mut bad = ct.clone();
     bad[5] ^= 1;
     assert!(aez.decrypt(&nonce, &[b"ad"], 16, &bad).is_err());
-    hex8(&ct)
+    // A message with core i-block pairs (every 32 bytes while 64 remain,
+    // so 60 bytes has none): 300 bytes is nine pairs, one full group of the
+    // register-resident AES4 pass kernels plus a single, with a fragment.
+    let long = secret_bytes::<300>(516);
+    let expected_long = public_copy(&long);
+    let ct_long = aez.encrypt(&nonce, &[b"ad"], 16, &long);
+    declassify(&ct_long);
+    let got = aez
+        .decrypt(&nonce, &[b"ad"], 16, &ct_long)
+        .expect("authentic");
+    declassify(&got);
+    assert_eq!(got, expected_long);
+    format!("{} {}", hex8(&ct), hex8(&ct_long))
 }
 
 fn c2sp_chunked() -> String {

@@ -6,9 +6,12 @@
 //! opt-in `legacy-ciphers` feature — the original CAESAR-portfolio `Aegis128`
 //! (128-bit key and nonce, five-block state, not interoperable with 128L).
 //! All are AEAD schemes whose state transition
-//! is built entirely from the bare AES round
-//! ([`aes_round`](super::aes::aes_round)), so on a constant-time AES core the
-//! whole construction is constant time and table-free.
+//! is built entirely from the bare AES round, so on a constant-time AES core
+//! the whole construction is constant time and table-free. The bulk of a
+//! message runs through a register-resident kernel on the hardware AES
+//! extension when one is present (the state never leaves the vector
+//! registers between updates); the portable definition below is the
+//! fallback and the reference the kernels are tested against.
 //!
 //! The crate AEAD shape is followed: [`encrypt`](Aegis128L::encrypt) transforms
 //! the buffer in place and returns the 128-bit tag; [`decrypt`](Aegis128L::decrypt)
@@ -40,7 +43,7 @@
 //! length is attacker-controlled, so aborting the process is not an option).
 
 use super::TagMismatch;
-use super::aes::aes_round;
+use super::aes::AesRounds;
 use crate::ct::ConstantTimeEq;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -114,12 +117,14 @@ fn len_block(ad_len: usize, msg_len: usize) -> [u8; 16] {
 #[derive(Clone)]
 pub struct Aegis128 {
     key: [u8; 16],
+    rounds: AesRounds,
 }
 
 /// The mutable 640-bit AEGIS-128 state: five 128-bit blocks.
 #[cfg(feature = "legacy-ciphers")]
 struct State128 {
     s: [[u8; 16]; 5],
+    rounds: AesRounds,
 }
 
 #[cfg(feature = "legacy-ciphers")]
@@ -128,26 +133,55 @@ impl State128 {
     /// block at state word 0.
     #[inline]
     fn update(&mut self, m: [u8; 16]) {
+        let r = self.rounds;
         let s = &self.s;
-        let n0 = aes_round(s[4], xor(s[0], m));
-        let n1 = aes_round(s[0], s[1]);
-        let n2 = aes_round(s[1], s[2]);
-        let n3 = aes_round(s[2], s[3]);
-        let n4 = aes_round(s[3], s[4]);
+        let n0 = r.round(s[4], xor(s[0], m));
+        let n1 = r.round(s[0], s[1]);
+        let n2 = r.round(s[1], s[2]);
+        let n3 = r.round(s[2], s[3]);
+        let n4 = r.round(s[3], s[4]);
         self.s = [n0, n1, n2, n3, n4];
+    }
+
+    /// Whole 16-byte blocks of AD through the state update (hardware
+    /// kernel, else the portable loop). `data.len()` must be a multiple of 16.
+    fn absorb_blocks(&mut self, data: &[u8]) {
+        if !self.rounds.aegis128_absorb(&mut self.s, data) {
+            for c in data.chunks_exact(16) {
+                self.update(zero_pad16(c));
+            }
+        }
+    }
+
+    /// Whole 16-byte blocks encrypted (`decrypt == false`) or decrypted in
+    /// place. `buf.len()` must be a multiple of 16.
+    fn crypt_blocks(&mut self, buf: &mut [u8], decrypt: bool) {
+        if !self.rounds.aegis128_crypt(&mut self.s, buf, decrypt) {
+            for c in buf.chunks_exact_mut(16) {
+                let b = zero_pad16(c);
+                let out = if decrypt { self.dec(b) } else { self.enc(b) };
+                c.copy_from_slice(&out);
+            }
+        }
     }
 
     /// `Init(key, nonce)`: `S = (K ⊕ IV, C1, C0, K ⊕ C0, K ⊕ C1)`, then ten
     /// updates with the alternating message blocks `K, K ⊕ IV, K, …`.
-    fn init(key: [u8; 16], nonce: [u8; 16]) -> Self {
+    fn init(key: [u8; 16], nonce: [u8; 16], rounds: AesRounds) -> Self {
         let kn = xor(key, nonce);
         let mut st = State128 {
             s: [kn, C1, C0, xor(key, C0), xor(key, C1)],
+            rounds,
         };
-        for _ in 0..5 {
-            st.update(key);
-            st.update(kn);
+        // Ten updates with `K, K ⊕ IV, K, …`: the bulk absorb over the
+        // repeated blocks keeps the state in registers throughout.
+        let mut rep = [0u8; 16 * 10];
+        for pair in rep.chunks_exact_mut(32) {
+            pair[..16].copy_from_slice(&key);
+            pair[16..].copy_from_slice(&kn);
         }
+        st.absorb_blocks(&rep);
+        rep.zeroize();
         st
     }
 
@@ -177,9 +211,12 @@ impl State128 {
     /// `Finalize`: seven updates with `S3 ⊕ (LE64(ad_bits) ‖ LE64(msg_bits))`.
     fn finalize(&mut self, ad_len: usize, msg_len: usize) {
         let t = xor(self.s[3], len_block(ad_len, msg_len));
-        for _ in 0..7 {
-            self.update(t);
+        let mut rep = [0u8; 16 * 7];
+        for b in rep.chunks_exact_mut(16) {
+            b.copy_from_slice(&t);
         }
+        self.absorb_blocks(&rep);
+        rep.zeroize();
     }
 
     /// 128-bit tag: `S0 ^ S1 ^ S2 ^ S3 ^ S4`.
@@ -210,16 +247,27 @@ impl Aegis128 {
 
     /// Creates an AEGIS-128 instance from a 128-bit key.
     pub fn new(key: &[u8; 16]) -> Self {
-        Aegis128 { key: *key }
+        Aegis128 {
+            key: *key,
+            rounds: AesRounds::detect(),
+        }
+    }
+
+    /// Forces the portable AES round. Test-only (differential checks of the
+    /// hardware bulk kernel against the reference construction).
+    #[cfg(test)]
+    pub(crate) fn new_software(key: &[u8; 16]) -> Self {
+        Aegis128 {
+            key: *key,
+            rounds: AesRounds::software(),
+        }
     }
 
     /// Absorbs the associated data in 16-byte blocks, zero-padding the tail.
     fn absorb_ad(st: &mut State128, ad: &[u8]) {
-        let mut chunks = ad.chunks_exact(16);
-        for c in &mut chunks {
-            st.update(zero_pad16(c));
-        }
-        let rem = chunks.remainder();
+        let full = ad.len() & !15;
+        st.absorb_blocks(&ad[..full]);
+        let rem = &ad[full..];
         if !rem.is_empty() {
             st.update(zero_pad16(rem));
         }
@@ -227,15 +275,12 @@ impl Aegis128 {
 
     /// Encrypts `buffer` in place, binding `aad`, and returns the 128-bit tag.
     pub fn encrypt(&self, nonce: &[u8; 16], aad: &[u8], buffer: &mut [u8]) -> [u8; 16] {
-        let mut st = State128::init(self.key, *nonce);
+        let mut st = State128::init(self.key, *nonce, self.rounds);
         Self::absorb_ad(&mut st, aad);
         let msg_len = buffer.len();
-        let mut chunks = buffer.chunks_exact_mut(16);
-        for c in &mut chunks {
-            let ct = st.enc(zero_pad16(c));
-            c.copy_from_slice(&ct);
-        }
-        let rem = chunks.into_remainder();
+        let full = msg_len & !15;
+        st.crypt_blocks(&mut buffer[..full], false);
+        let rem = &mut buffer[full..];
         if !rem.is_empty() {
             let ct = st.enc(zero_pad16(rem));
             rem.copy_from_slice(&ct[..rem.len()]);
@@ -247,17 +292,12 @@ impl Aegis128 {
     /// Decrypts `buffer` (ciphertext on entry, plaintext on return) and
     /// returns the final state, from which the caller takes the tag.
     fn decrypt_inner(&self, nonce: &[u8; 16], aad: &[u8], buffer: &mut [u8]) -> State128 {
-        let mut st = State128::init(self.key, *nonce);
+        let mut st = State128::init(self.key, *nonce, self.rounds);
         Self::absorb_ad(&mut st, aad);
         let msg_len = buffer.len();
-        let mut chunks = buffer.chunks_exact_mut(16);
-        for c in &mut chunks {
-            let mut ci = [0u8; 16];
-            ci.copy_from_slice(c);
-            let t = st.dec(ci);
-            c.copy_from_slice(&t);
-        }
-        let rem = chunks.into_remainder();
+        let full = msg_len & !15;
+        st.crypt_blocks(&mut buffer[..full], true);
+        let rem = &mut buffer[full..];
         if !rem.is_empty() {
             // DecPartial: keystream-XOR the zero-padded ciphertext, truncate
             // to the real length, then absorb the re-zero-padded plaintext.
@@ -319,11 +359,13 @@ impl ZeroizeOnDrop for Aegis128 {}
 #[derive(Clone)]
 pub struct Aegis128L {
     key: [u8; 16],
+    rounds: AesRounds,
 }
 
 /// The mutable 1024-bit AEGIS-128L state: eight 128-bit blocks.
 struct State128L {
     s: [[u8; 16]; 8],
+    rounds: AesRounds,
 }
 
 impl State128L {
@@ -331,27 +373,63 @@ impl State128L {
     /// message blocks at state words 0 and 4.
     #[inline]
     fn update(&mut self, m0: [u8; 16], m1: [u8; 16]) {
+        let r = self.rounds;
         let s = &self.s;
-        let n0 = aes_round(s[7], xor(s[0], m0));
-        let n1 = aes_round(s[0], s[1]);
-        let n2 = aes_round(s[1], s[2]);
-        let n3 = aes_round(s[2], s[3]);
-        let n4 = aes_round(s[3], xor(s[4], m1));
-        let n5 = aes_round(s[4], s[5]);
-        let n6 = aes_round(s[5], s[6]);
-        let n7 = aes_round(s[6], s[7]);
+        let n0 = r.round(s[7], xor(s[0], m0));
+        let n1 = r.round(s[0], s[1]);
+        let n2 = r.round(s[1], s[2]);
+        let n3 = r.round(s[2], s[3]);
+        let n4 = r.round(s[3], xor(s[4], m1));
+        let n5 = r.round(s[4], s[5]);
+        let n6 = r.round(s[5], s[6]);
+        let n7 = r.round(s[6], s[7]);
         self.s = [n0, n1, n2, n3, n4, n5, n6, n7];
     }
 
+    /// Whole 32-byte blocks of AD through the state update (hardware
+    /// kernel, else the portable loop). `data.len()` must be a multiple of 32.
+    fn absorb_blocks(&mut self, data: &[u8]) {
+        if !self.rounds.aegis128l_absorb(&mut self.s, data) {
+            for c in data.chunks_exact(32) {
+                self.absorb(zero_pad16(&c[..16]), zero_pad16(&c[16..]));
+            }
+        }
+    }
+
+    /// Whole 32-byte blocks encrypted (`decrypt == false`) or decrypted in
+    /// place. `buf.len()` must be a multiple of 32.
+    fn crypt_blocks(&mut self, buf: &mut [u8], decrypt: bool) {
+        if !self.rounds.aegis128l_crypt(&mut self.s, buf, decrypt) {
+            for c in buf.chunks_exact_mut(32) {
+                let b0 = zero_pad16(&c[..16]);
+                let b1 = zero_pad16(&c[16..]);
+                let (o0, o1) = if decrypt {
+                    self.dec(b0, b1)
+                } else {
+                    self.enc(b0, b1)
+                };
+                c[..16].copy_from_slice(&o0);
+                c[16..].copy_from_slice(&o1);
+            }
+        }
+    }
+
     /// `Init(key, nonce)`.
-    fn init(key: [u8; 16], nonce: [u8; 16]) -> Self {
+    fn init(key: [u8; 16], nonce: [u8; 16], rounds: AesRounds) -> Self {
         let kn = xor(key, nonce);
         let mut st = State128L {
             s: [kn, C1, C0, C1, kn, xor(key, C0), xor(key, C1), xor(key, C0)],
+            rounds,
         };
-        for _ in 0..10 {
-            st.update(nonce, key);
+        // Ten updates with `(nonce, key)`: the bulk absorb over the repeated
+        // blocks keeps the state in registers throughout.
+        let mut rep = [0u8; 32 * 10];
+        for pair in rep.chunks_exact_mut(32) {
+            pair[..16].copy_from_slice(&nonce);
+            pair[16..].copy_from_slice(&key);
         }
+        st.absorb_blocks(&rep);
+        rep.zeroize();
         st
     }
 
@@ -385,12 +463,16 @@ impl State128L {
         (t0, t1)
     }
 
-    /// `Finalize`: returns the 256-bit raw tag material `S0..S7`.
+    /// `Finalize`: seven updates with `S2 ⊕ (LE64(ad_bits) ‖ LE64(msg_bits))`
+    /// in both lanes.
     fn finalize(&mut self, ad_len: usize, msg_len: usize) {
         let t = xor(self.s[2], len_block(ad_len, msg_len));
-        for _ in 0..7 {
-            self.update(t, t);
+        let mut rep = [0u8; 32 * 7];
+        for b in rep.chunks_exact_mut(16) {
+            b.copy_from_slice(&t);
         }
+        self.absorb_blocks(&rep);
+        rep.zeroize();
     }
 
     /// 128-bit tag: `S0 ^ S1 ^ S2 ^ S3 ^ S4 ^ S5 ^ S6`.
@@ -421,11 +503,9 @@ impl Drop for State128L {
 
 /// Absorbs all associated data through the state.
 fn absorb_ad_128l(st: &mut State128L, ad: &[u8]) {
-    let mut chunks = ad.chunks_exact(32);
-    for c in &mut chunks {
-        st.absorb(zero_pad16(&c[..16]), zero_pad16(&c[16..]));
-    }
-    let rem = chunks.remainder();
+    let full = ad.len() & !31;
+    st.absorb_blocks(&ad[..full]);
+    let rem = &ad[full..];
     if !rem.is_empty() {
         let t0 = zero_pad16(&rem[..rem.len().min(16)]);
         let t1 = if rem.len() > 16 {
@@ -447,20 +527,29 @@ impl Aegis128L {
 
     /// Creates an AEGIS-128L instance from a 128-bit key.
     pub fn new(key: &[u8; 16]) -> Self {
-        Aegis128L { key: *key }
+        Aegis128L {
+            key: *key,
+            rounds: AesRounds::detect(),
+        }
+    }
+
+    /// Forces the portable AES round. Test-only (differential checks of the
+    /// hardware bulk kernel against the reference construction).
+    #[cfg(test)]
+    pub(crate) fn new_software(key: &[u8; 16]) -> Self {
+        Aegis128L {
+            key: *key,
+            rounds: AesRounds::software(),
+        }
     }
 
     fn encrypt_inner(&self, nonce: &[u8; 16], aad: &[u8], buffer: &mut [u8]) -> State128L {
-        let mut st = State128L::init(self.key, *nonce);
+        let mut st = State128L::init(self.key, *nonce, self.rounds);
         absorb_ad_128l(&mut st, aad);
         let msg_len = buffer.len();
-        let mut chunks = buffer.chunks_exact_mut(32);
-        for c in &mut chunks {
-            let (c0, c1) = st.enc(zero_pad16(&c[..16]), zero_pad16(&c[16..]));
-            c[..16].copy_from_slice(&c0);
-            c[16..].copy_from_slice(&c1);
-        }
-        let rem = chunks.into_remainder();
+        let full = msg_len & !31;
+        st.crypt_blocks(&mut buffer[..full], false);
+        let rem = &mut buffer[full..];
         if !rem.is_empty() {
             let t0 = zero_pad16(&rem[..rem.len().min(16)]);
             let t1 = if rem.len() > 16 {
@@ -496,20 +585,12 @@ impl Aegis128L {
     /// Decrypts the partial tail in place, returning the updated state. `buffer`
     /// holds the ciphertext on entry; the matching plaintext on return.
     fn decrypt_inner_tag(&self, nonce: &[u8; 16], aad: &[u8], buffer: &mut [u8]) -> State128L {
-        let mut st = State128L::init(self.key, *nonce);
+        let mut st = State128L::init(self.key, *nonce, self.rounds);
         absorb_ad_128l(&mut st, aad);
         let msg_len = buffer.len();
-        let mut chunks = buffer.chunks_exact_mut(32);
-        for c in &mut chunks {
-            let mut c0 = [0u8; 16];
-            let mut c1 = [0u8; 16];
-            c0.copy_from_slice(&c[..16]);
-            c1.copy_from_slice(&c[16..]);
-            let (t0, t1) = st.dec(c0, c1);
-            c[..16].copy_from_slice(&t0);
-            c[16..].copy_from_slice(&t1);
-        }
-        let rem = chunks.into_remainder();
+        let full = msg_len & !31;
+        st.crypt_blocks(&mut buffer[..full], true);
+        let rem = &mut buffer[full..];
         if !rem.is_empty() {
             // DecPartial: keystream-XOR the zero-padded ciphertext, truncate to
             // the real length, then absorb the re-zero-padded plaintext.
@@ -612,11 +693,13 @@ impl ZeroizeOnDrop for Aegis128L {}
 #[derive(Clone)]
 pub struct Aegis256 {
     key: [u8; 32],
+    rounds: AesRounds,
 }
 
 /// The mutable 768-bit AEGIS-256 state: six 128-bit blocks.
 struct State256 {
     s: [[u8; 16]; 6],
+    rounds: AesRounds,
 }
 
 impl State256 {
@@ -624,18 +707,41 @@ impl State256 {
     /// at state word 0.
     #[inline]
     fn update(&mut self, m: [u8; 16]) {
+        let r = self.rounds;
         let s = &self.s;
-        let n0 = aes_round(s[5], xor(s[0], m));
-        let n1 = aes_round(s[0], s[1]);
-        let n2 = aes_round(s[1], s[2]);
-        let n3 = aes_round(s[2], s[3]);
-        let n4 = aes_round(s[3], s[4]);
-        let n5 = aes_round(s[4], s[5]);
+        let n0 = r.round(s[5], xor(s[0], m));
+        let n1 = r.round(s[0], s[1]);
+        let n2 = r.round(s[1], s[2]);
+        let n3 = r.round(s[2], s[3]);
+        let n4 = r.round(s[3], s[4]);
+        let n5 = r.round(s[4], s[5]);
         self.s = [n0, n1, n2, n3, n4, n5];
     }
 
+    /// Whole 16-byte blocks of AD through the state update (hardware
+    /// kernel, else the portable loop). `data.len()` must be a multiple of 16.
+    fn absorb_blocks(&mut self, data: &[u8]) {
+        if !self.rounds.aegis256_absorb(&mut self.s, data) {
+            for c in data.chunks_exact(16) {
+                self.absorb(zero_pad16(c));
+            }
+        }
+    }
+
+    /// Whole 16-byte blocks encrypted (`decrypt == false`) or decrypted in
+    /// place. `buf.len()` must be a multiple of 16.
+    fn crypt_blocks(&mut self, buf: &mut [u8], decrypt: bool) {
+        if !self.rounds.aegis256_crypt(&mut self.s, buf, decrypt) {
+            for c in buf.chunks_exact_mut(16) {
+                let b = zero_pad16(c);
+                let out = if decrypt { self.dec(b) } else { self.enc(b) };
+                c.copy_from_slice(&out);
+            }
+        }
+    }
+
     /// `Init(key, nonce)`.
-    fn init(key: [u8; 32], nonce: [u8; 32]) -> Self {
+    fn init(key: [u8; 32], nonce: [u8; 32], rounds: AesRounds) -> Self {
         let mut k0 = [0u8; 16];
         let mut k1 = [0u8; 16];
         k0.copy_from_slice(&key[..16]);
@@ -646,15 +752,21 @@ impl State256 {
         n1.copy_from_slice(&nonce[16..]);
         let mut st = State256 {
             s: [xor(k0, n0), xor(k1, n1), C1, C0, xor(k0, C0), xor(k1, C1)],
+            rounds,
         };
         let kn0 = xor(k0, n0);
         let kn1 = xor(k1, n1);
-        for _ in 0..4 {
-            st.update(k0);
-            st.update(k1);
-            st.update(kn0);
-            st.update(kn1);
+        // Sixteen updates with `K0, K1, K0 ⊕ N0, K1 ⊕ N1, …`: the bulk
+        // absorb over the repeated blocks keeps the state in registers.
+        let mut rep = [0u8; 16 * 16];
+        for quad in rep.chunks_exact_mut(64) {
+            quad[..16].copy_from_slice(&k0);
+            quad[16..32].copy_from_slice(&k1);
+            quad[32..48].copy_from_slice(&kn0);
+            quad[48..].copy_from_slice(&kn1);
         }
+        st.absorb_blocks(&rep);
+        rep.zeroize();
         st
     }
 
@@ -684,12 +796,15 @@ impl State256 {
         t
     }
 
-    /// `Finalize`.
+    /// `Finalize`: seven updates with `S3 ⊕ (LE64(ad_bits) ‖ LE64(msg_bits))`.
     fn finalize(&mut self, ad_len: usize, msg_len: usize) {
         let t = xor(self.s[3], len_block(ad_len, msg_len));
-        for _ in 0..7 {
-            self.update(t);
+        let mut rep = [0u8; 16 * 7];
+        for b in rep.chunks_exact_mut(16) {
+            b.copy_from_slice(&t);
         }
+        self.absorb_blocks(&rep);
+        rep.zeroize();
     }
 
     /// 128-bit tag: `S0 ^ S1 ^ S2 ^ S3 ^ S4 ^ S5`.
@@ -720,11 +835,9 @@ impl Drop for State256 {
 
 /// Absorbs all associated data through the state.
 fn absorb_ad_256(st: &mut State256, ad: &[u8]) {
-    let mut chunks = ad.chunks_exact(16);
-    for c in &mut chunks {
-        st.absorb(zero_pad16(c));
-    }
-    let rem = chunks.remainder();
+    let full = ad.len() & !15;
+    st.absorb_blocks(&ad[..full]);
+    let rem = &ad[full..];
     if !rem.is_empty() {
         st.absorb(zero_pad16(rem));
     }
@@ -740,19 +853,29 @@ impl Aegis256 {
 
     /// Creates an AEGIS-256 instance from a 256-bit key.
     pub fn new(key: &[u8; 32]) -> Self {
-        Aegis256 { key: *key }
+        Aegis256 {
+            key: *key,
+            rounds: AesRounds::detect(),
+        }
+    }
+
+    /// Forces the portable AES round. Test-only (differential checks of the
+    /// hardware bulk kernel against the reference construction).
+    #[cfg(test)]
+    pub(crate) fn new_software(key: &[u8; 32]) -> Self {
+        Aegis256 {
+            key: *key,
+            rounds: AesRounds::software(),
+        }
     }
 
     fn encrypt_inner(&self, nonce: &[u8; 32], aad: &[u8], buffer: &mut [u8]) -> State256 {
-        let mut st = State256::init(self.key, *nonce);
+        let mut st = State256::init(self.key, *nonce, self.rounds);
         absorb_ad_256(&mut st, aad);
         let msg_len = buffer.len();
-        let mut chunks = buffer.chunks_exact_mut(16);
-        for c in &mut chunks {
-            let ct = st.enc(zero_pad16(c));
-            c.copy_from_slice(&ct);
-        }
-        let rem = chunks.into_remainder();
+        let full = msg_len & !15;
+        st.crypt_blocks(&mut buffer[..full], false);
+        let rem = &mut buffer[full..];
         if !rem.is_empty() {
             let ct = st.enc(zero_pad16(rem));
             rem.copy_from_slice(&ct[..rem.len()]);
@@ -777,17 +900,12 @@ impl Aegis256 {
     }
 
     fn decrypt_inner_tag(&self, nonce: &[u8; 32], aad: &[u8], buffer: &mut [u8]) -> State256 {
-        let mut st = State256::init(self.key, *nonce);
+        let mut st = State256::init(self.key, *nonce, self.rounds);
         absorb_ad_256(&mut st, aad);
         let msg_len = buffer.len();
-        let mut chunks = buffer.chunks_exact_mut(16);
-        for c in &mut chunks {
-            let mut ci = [0u8; 16];
-            ci.copy_from_slice(c);
-            let t = st.dec(ci);
-            c.copy_from_slice(&t);
-        }
-        let rem = chunks.into_remainder();
+        let full = msg_len & !15;
+        st.crypt_blocks(&mut buffer[..full], true);
+        let rem = &mut buffer[full..];
         if !rem.is_empty() {
             let s = &st.s;
             let z = xor(xor(xor(s[1], s[4]), s[5]), and(s[2], s[3]));
@@ -900,6 +1018,29 @@ mod aegis128_tests {
         assert_eq!(buf, ct);
         aead.decrypt(&nonce, b"ad", &mut buf, &tag).unwrap();
         assert_eq!(&buf, msg);
+    }
+
+    /// The hardware bulk kernel must match the portable construction for
+    /// every message/AD length residue (whole blocks, partial tails, AD
+    /// tails), both directions, including the tag.
+    #[test]
+    fn hardware_matches_software() {
+        let hw = Aegis128::new(&[0x42u8; 16]);
+        let sw = Aegis128::new_software(&[0x42u8; 16]);
+        let nonce = [7u8; 16];
+        for aad_len in [0usize, 5, 16, 33] {
+            let aad: std::vec::Vec<u8> = (0..aad_len).map(|i| i as u8 ^ 0x5a).collect();
+            for len in [0usize, 1, 15, 16, 17, 32, 48, 63, 64, 100, 255, 256, 1000] {
+                let pt: std::vec::Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(7)).collect();
+                let (mut a, mut b) = (pt.clone(), pt.clone());
+                let ta = hw.encrypt(&nonce, &aad, &mut a);
+                let tb = sw.encrypt(&nonce, &aad, &mut b);
+                assert_eq!(a, b, "ct len={len} aad={aad_len}");
+                assert_eq!(ta, tb, "tag len={len} aad={aad_len}");
+                hw.decrypt(&nonce, &aad, &mut a, &ta).unwrap();
+                assert_eq!(a, pt, "roundtrip len={len} aad={aad_len}");
+            }
+        }
     }
 }
 
@@ -1028,6 +1169,7 @@ mod tests {
                 from_hex::<16>("1639b56ea322c88568a176585bc915de"),
                 from_hex::<16>("640818ffb57dc0fbc2e72ae93457e39a"),
             ],
+            rounds: AesRounds::detect(),
         };
         st.update(
             from_hex::<16>("033e6975b94816879e42917650955aa0"),
@@ -1144,6 +1286,50 @@ mod tests {
         );
     }
 
+    /// The hardware bulk kernels (AEGIS-128L and AEGIS-256) must match the
+    /// portable construction for every message/AD length residue (whole
+    /// blocks, partial tails, AD tails), both directions, both tag sizes.
+    #[test]
+    fn hardware_matches_software() {
+        let hw = Aegis128L::new(&[0x42u8; 16]);
+        let sw = Aegis128L::new_software(&[0x42u8; 16]);
+        let hw256 = Aegis256::new(&[0x42u8; 32]);
+        let sw256 = Aegis256::new_software(&[0x42u8; 32]);
+        let nonce = [7u8; 16];
+        let nonce32 = [7u8; 32];
+        for aad_len in [0usize, 5, 16, 32, 33, 50] {
+            let aad: std::vec::Vec<u8> = (0..aad_len).map(|i| i as u8 ^ 0x5a).collect();
+            for len in [
+                0usize, 1, 15, 16, 17, 31, 32, 33, 48, 63, 64, 100, 255, 256, 1000,
+            ] {
+                let pt: std::vec::Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(7)).collect();
+                let (mut a, mut b) = (pt.clone(), pt.clone());
+                let ta = hw.encrypt(&nonce, &aad, &mut a);
+                let tb = sw.encrypt(&nonce, &aad, &mut b);
+                assert_eq!(a, b, "128L ct len={len} aad={aad_len}");
+                assert_eq!(ta, tb, "128L tag len={len} aad={aad_len}");
+                sw.decrypt(&nonce, &aad, &mut a, &ta).unwrap();
+                assert_eq!(a, pt, "128L sw-dec of hw-enc len={len} aad={aad_len}");
+                hw.decrypt(&nonce, &aad, &mut b, &tb).unwrap();
+                assert_eq!(b, pt, "128L hw-dec of sw-enc len={len} aad={aad_len}");
+                let (mut a, mut b) = (pt.clone(), pt.clone());
+                let ta = hw.encrypt_tag256(&nonce, &aad, &mut a);
+                let tb = sw.encrypt_tag256(&nonce, &aad, &mut b);
+                assert_eq!((a, ta), (b, tb), "128L tag256 len={len} aad={aad_len}");
+
+                let (mut a, mut b) = (pt.clone(), pt.clone());
+                let ta = hw256.encrypt(&nonce32, &aad, &mut a);
+                let tb = sw256.encrypt(&nonce32, &aad, &mut b);
+                assert_eq!(a, b, "256 ct len={len} aad={aad_len}");
+                assert_eq!(ta, tb, "256 tag len={len} aad={aad_len}");
+                sw256.decrypt(&nonce32, &aad, &mut a, &ta).unwrap();
+                assert_eq!(a, pt, "256 sw-dec of hw-enc len={len} aad={aad_len}");
+                hw256.decrypt(&nonce32, &aad, &mut b, &tb).unwrap();
+                assert_eq!(b, pt, "256 hw-dec of sw-enc len={len} aad={aad_len}");
+            }
+        }
+    }
+
     #[test]
     fn aegis128l_auth_failure() {
         // TV6: key/nonce swapped vs TV4 — must reject.
@@ -1194,6 +1380,7 @@ mod tests {
                 from_hex::<16>("a760bb3da073fbd92bdc24734b1f56fb"),
                 from_hex::<16>("a828a18d6a964497ac6e7e53c5f55c73"),
             ],
+            rounds: AesRounds::detect(),
         };
         st.update(from_hex::<16>("b165617ed04ab738afb2612c6d18a1ec"));
         assert_eq!(st.s[0], from_hex::<16>("e6bc643bae82dfa3d991b1b323839dcd"));
