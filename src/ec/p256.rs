@@ -8,7 +8,7 @@
 
 use super::p256_field as field;
 #[cfg(feature = "p256-table")]
-use super::p256_gtable::P256_GEN_TABLE;
+use super::p256_gtable::{P256_GEN_2_256, P256_GEN_TABLE};
 use crate::bignum::safegcd::SafegcdModulus;
 use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
@@ -141,7 +141,9 @@ impl P256 {
         field::P
     }
 
-    /// The identity point `(0 : 1 : 0)`.
+    /// The identity point `(0 : 1 : 0)`. The ladders no longer start from
+    /// it (their recoding has no zero digit), so it is test-only.
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> Point {
         Point {
             x: Fe::ZERO,
@@ -312,104 +314,169 @@ impl P256 {
         }
     }
 
-    /// Constant-time scalar multiplication `scalar * point` via a fixed
-    /// 4-bit window: 4 doublings and one *unconditional* addition per
-    /// nibble, with the window value fetched by a masked scan of all 16
-    /// table entries (no secret-indexed memory access). A zero nibble adds
-    /// the identity — the complete RCB formulas make that a no-op with the
-    /// same operation sequence — so, like the previous
-    /// double-and-add-always ladder, the schedule is a function of the
-    /// (public) scalar width only.
+    /// Complete mixed point addition `p + (x2, y2)` for `a = -3`
+    /// (Renes–Costello–Batina, Algorithm 5): `q` is an affine point, never
+    /// the identity (`Z2 = 1`), `p` is any projective point including the
+    /// identity, and the result is correct for every such pair — equal and
+    /// opposite points included. One multiplication and six additions
+    /// cheaper than [`Self::point_add`] (11M + 2m_b vs 12M + 2m_b).
+    #[cfg(any(test, feature = "p256-table"))]
+    fn add_mixed(&self, p: &Point, x2: &Fe, y2: &Fe) -> Point {
+        let b = self.b;
+        let mut t0 = self.mul(&p.x, x2);
+        let mut t1 = self.mul(&p.y, y2);
+        let mut t3 = self.add(x2, y2);
+        let mut t4 = self.add(&p.x, &p.y);
+        t3 = self.mul(&t3, &t4);
+        t4 = self.add(&t0, &t1);
+        t3 = self.sub(&t3, &t4);
+        t4 = self.mul(y2, &p.z);
+        t4 = self.add(&t4, &p.y);
+        let mut y3 = self.mul(x2, &p.z);
+        y3 = self.add(&y3, &p.x);
+        let mut z3 = self.mul(&b, &p.z);
+        let mut x3 = self.sub(&y3, &z3);
+        z3 = self.add(&x3, &x3);
+        x3 = self.add(&x3, &z3);
+        z3 = self.sub(&t1, &x3);
+        x3 = self.add(&t1, &x3);
+        y3 = self.mul(&b, &y3);
+        t1 = self.add(&p.z, &p.z);
+        let mut t2 = self.add(&t1, &p.z);
+        y3 = self.sub(&y3, &t2);
+        y3 = self.sub(&y3, &t0);
+        t1 = self.add(&y3, &y3);
+        y3 = self.add(&t1, &y3);
+        t1 = self.add(&t0, &t0);
+        t0 = self.add(&t1, &t0);
+        t0 = self.sub(&t0, &t2);
+        t1 = self.mul(&t4, &y3);
+        t2 = self.mul(&t0, &y3);
+        y3 = self.mul(&x3, &z3);
+        y3 = self.add(&y3, &t2);
+        x3 = self.mul(&t3, &x3);
+        x3 = self.sub(&x3, &t1);
+        z3 = self.mul(&t4, &z3);
+        t1 = self.mul(&t3, &t0);
+        z3 = self.add(&z3, &t1);
+        Point {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// Constant-time scalar multiplication `scalar * point` by a fixed
+    /// signed base-16 window over the odd recoding of
+    /// [`OddScalar::new`]: the accumulator starts at `[16⁶⁴]P = P` (the
+    /// recoding's implicit top digit), then each of the 64 windows, most
+    /// significant first, is 4 doublings and one *unconditional* addition
+    /// of `[dᵢ]P`, `dᵢ ∈ {±1, ±3, …, ±15}`. The operand is fetched by a
+    /// masked scan of the 8 precomputed odd multiples (one opaque mask per
+    /// entry, no secret-indexed memory access) and negated through a mask,
+    /// so the schedule depends only on the (public) scalar width. No digit
+    /// is zero, so no addition is ever a no-op, and the complete RCB
+    /// formulas absorb the remaining coincidences (`acc = ±[dᵢ]P`).
+    ///
+    /// The base point is public in every caller (a peer's public key, the
+    /// generator); only the scalar is secret.
     pub(crate) fn scalar_mul(&self, scalar: &Fe, point: &Point) -> Point {
-        // table[j] = [j]P; table[0] is the identity.
-        let mut table = [self.identity(); 16];
-        table[1] = *point;
-        for i in 2..16 {
-            table[i] = self.point_add(&table[i - 1], point);
+        let mut k = OddScalar::new(scalar);
+
+        // table[j] = [2j + 1]P.
+        let two_p = self.double(point);
+        let mut table = [*point; 8];
+        for j in 1..8 {
+            table[j] = self.point_add(&table[j - 1], &two_p);
         }
 
-        let mut acc = self.identity();
-        let limbs = scalar.as_limbs();
-        let mut i = 4;
+        let mut acc = *point;
+        let mut i = 64;
         while i > 0 {
             i -= 1;
-            let limb = limbs[i];
-            let mut shift = 64;
-            while shift > 0 {
-                shift -= 4;
-                acc = self.double(&acc);
-                acc = self.double(&acc);
-                acc = self.double(&acc);
-                acc = self.double(&acc);
+            acc = self.double(&acc);
+            acc = self.double(&acc);
+            acc = self.double(&acc);
+            acc = self.double(&acc);
 
-                let digit = ((limb >> shift) & 0xf) as usize;
-                // Constant-time gather of table[digit]: the index comparison
-                // goes through `ct_eq` rather than a `==` the compiler may
-                // lower to a branch on the secret window digit.
-                let mut sel = table[0];
-                for (j, entry) in table.iter().enumerate() {
-                    sel = Point::conditional_select(entry, &sel, j.ct_eq(&digit));
-                }
-                acc = self.point_add(&acc, &sel);
-                sel.zeroize();
+            let (index, neg) = k.digit(i);
+            let mut sel = Point {
+                x: Fe::ZERO,
+                y: Fe::ZERO,
+                z: Fe::ZERO,
+            };
+            for (j, entry) in table.iter().enumerate() {
+                let mask = core::hint::black_box(mask_eq(j as u64, index));
+                sel.x = or_masked(&sel.x, &entry.x, mask);
+                sel.y = or_masked(&sel.y, &entry.y, mask);
+                sel.z = or_masked(&sel.z, &entry.z, mask);
             }
+            sel.y = negate_masked(&sel.y, neg);
+            acc = self.point_add(&acc, &sel);
+            sel.zeroize();
         }
         // The table holds the multiples [j]P; with a secret scalar those are
         // secret intermediates, so do not leave them on the stack.
         table.zeroize();
+        acc.y = negate_masked(&acc.y, k.negate_result);
+        k.zeroize();
         acc
     }
 
     /// Constant-time fixed-base multiplication `scalar * G` via the
-    /// precomputed comb table [`P256_GEN_TABLE`]: `[k]G = Σᵢ [dᵢ · 16^i]G`
-    /// over the 64 base-16 digits `dᵢ` of the scalar, so there are **no
-    /// doublings** — just 64 unconditional additions, each operand fetched by
-    /// a masked scan of that window's 15 stored points (no secret-indexed
-    /// memory access, same gather discipline as [`Self::scalar_mul`]). A zero
-    /// digit adds the identity, a uniform no-op under the complete RCB
-    /// formulas, so the schedule depends only on the (public) scalar width.
+    /// precomputed comb table [`P256_GEN_TABLE`]: with the odd recoding of
+    /// [`OddScalar::new`], `[k]G = [16⁶⁴]G + Σᵢ [dᵢ · 16ⁱ]G` over 64 digits
+    /// `dᵢ ∈ {±1, ±3, …, ±15}`, so there are **no doublings** — just 64
+    /// unconditional mixed additions from the constant `[16⁶⁴]G`
+    /// ([`P256_GEN_2_256`]), each operand fetched by a masked scan of that
+    /// window's 8 stored affine points (one opaque mask per entry, the 8
+    /// coordinate limbs only, no secret-indexed memory access — the same
+    /// gather discipline as [`Self::scalar_mul`]) and negated through a
+    /// mask. The schedule depends only on the (public) scalar width.
     #[cfg(feature = "p256-table")]
     pub(crate) fn mul_generator(&self, scalar: &Fe) -> Point {
-        let id = self.identity();
-        let mut acc = id;
-        let limbs = scalar.as_limbs();
+        let mut k = OddScalar::new(scalar);
+        let mut acc = Point {
+            x: Fe::from_limbs([
+                P256_GEN_2_256[0],
+                P256_GEN_2_256[1],
+                P256_GEN_2_256[2],
+                P256_GEN_2_256[3],
+            ]),
+            y: Fe::from_limbs([
+                P256_GEN_2_256[4],
+                P256_GEN_2_256[5],
+                P256_GEN_2_256[6],
+                P256_GEN_2_256[7],
+            ]),
+            z: field::ONE,
+        };
         for (i, window) in P256_GEN_TABLE.iter().enumerate() {
-            // Digit i = bits [4i, 4i+4) of the little-endian scalar.
-            let digit = ((limbs[i / 16] >> ((i % 16) * 4)) & 0xf) as usize;
-            // Constant-time gather: scan all 15 entries, keep entry j when
-            // j + 1 == digit; a zero digit keeps the identity.
-            let mut sel = id;
+            let (index, neg) = k.digit(i);
+            let mut sel = [0u64; 8];
             for (j, entry) in window.iter().enumerate() {
-                let cand = Point {
-                    x: Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]),
-                    y: Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]),
-                    z: field::ONE,
-                };
-                sel = Point::conditional_select(&cand, &sel, (j + 1).ct_eq(&digit));
+                let mask = core::hint::black_box(mask_eq(j as u64, index));
+                for (s, e) in sel.iter_mut().zip(entry) {
+                    *s |= e & mask;
+                }
             }
-            acc = self.point_add(&acc, &sel);
+            let x = Fe::from_limbs([sel[0], sel[1], sel[2], sel[3]]);
+            let y = negate_masked(&Fe::from_limbs([sel[4], sel[5], sel[6], sel[7]]), neg);
+            acc = self.add_mixed(&acc, &x, &y);
             sel.zeroize();
         }
+        acc.y = negate_masked(&acc.y, k.negate_result);
+        k.zeroize();
         acc
     }
 
     /// Constant-time fixed-base multiplication `scalar * G` without the comb
     /// table (feature `p256-table` off): the generic windowed ladder
     /// [`Self::scalar_mul`] over `G`. Same result and the same secret-scalar
-    /// discipline, at the cost of ~252 doublings the table would avoid.
+    /// discipline, at the cost of ~256 doublings the table would avoid.
     #[cfg(not(feature = "p256-table"))]
     pub(crate) fn mul_generator(&self, scalar: &Fe) -> Point {
         self.scalar_mul(scalar, &self.generator())
-    }
-
-    /// Point negation `(X : -Y : Z)` (the negation itself is constant time;
-    /// currently only the variable-time verify path needs it).
-    fn negate_point(&self, p: &Point) -> Point {
-        Point {
-            x: p.x,
-            y: field::negate(&p.y),
-            z: p.z,
-        }
     }
 
     /// **VARIABLE-TIME** double-scalar multiplication `u1·G + u2·Q`.
@@ -422,107 +489,213 @@ impl P256 {
     /// generation and ECDH must keep using the constant-time
     /// [`Self::mul_generator`] / [`Self::scalar_mul`] paths.
     ///
-    /// Strategy: `u1·G` through the fixed-base comb with direct (public)
-    /// indexing and zero-digit skipping — no doublings at all — plus `u2·Q`
-    /// via width-5 wNAF (8 precomputed odd multiples, ~256 doublings and
-    /// ~43 additions on average), joined by one final addition. Without the
-    /// comb table (feature `p256-table` off), both wNAF ladders are
-    /// interleaved (Straus) so they share one run of doublings.
+    /// Strategy: Straus–Shamir interleaving of two width-5 wNAF ladders
+    /// (one shared run of doublings, ~43 additions each) over Jacobian
+    /// coordinates — `dbl-2001-b` doublings (3M + 5S, `a = −3`) and
+    /// `madd-2007-bl` mixed additions (7M + 4S) with the exceptional cases
+    /// handled explicitly. Both operand tables are affine: the odd
+    /// multiples of `G` come straight from the comb table's first window
+    /// (or are computed without it), and the odd multiples of `Q` are
+    /// batch-normalised with one inversion (Montgomery's trick). See
+    /// [`Self::verify_x_vartime`] for the inversion-free ECDSA check, which
+    /// is what the native ECDSA verifier uses; this projective form serves
+    /// the runtime-curve router (`ec::boxed`) and public-key recovery.
+    #[cfg(any(test, feature = "alloc"))]
     pub(crate) fn mul_double_vartime(&self, u1: &Fe, u2: &Fe, q: &Point) -> Point {
-        #[cfg(feature = "p256-table")]
-        {
-            self.point_add(
-                &self.mul_generator_vartime(u1),
-                &self.scalar_mul_vartime(u2, q),
-            )
-        }
-        #[cfg(not(feature = "p256-table"))]
-        {
-            let odd_g = self.odd_multiples(&self.generator());
-            let odd_q = self.odd_multiples(q);
-            let naf1 = wnaf5(u1);
-            let naf2 = wnaf5(u2);
-            let Some(top) = naf1
-                .iter()
-                .zip(naf2.iter())
-                .rposition(|(&a, &b)| a != 0 || b != 0)
-            else {
-                return self.identity();
-            };
-            let mut acc = self.identity();
-            for i in (0..=top).rev() {
-                acc = self.double(&acc);
-                acc = self.add_naf_digit(&acc, naf1[i], &odd_g);
-                acc = self.add_naf_digit(&acc, naf2[i], &odd_q);
-            }
-            acc
+        let acc = self.straus_vartime(u1, u2, q);
+        // Jacobian (X : Y : Z) → projective (X·Z : Y : Z³); the identity
+        // (Z = 0) maps to (0 : Y : 0), a valid identity representative.
+        let z2 = self.sqr(&acc.z);
+        Point {
+            x: self.mul(&acc.x, &acc.z),
+            y: acc.y,
+            z: self.mul(&z2, &acc.z),
         }
     }
 
-    /// The odd multiples `[1]P, [3]P, …, [15]P` for the width-5 wNAF ladders.
-    fn odd_multiples(&self, point: &Point) -> [Point; 8] {
+    /// **VARIABLE-TIME** ECDSA verification core: whether the affine
+    /// x-coordinate of `u1·G + u2·Q`, reduced mod `n`, equals `r` (with
+    /// `r < n`), without the final inversion: for the Jacobian result
+    /// `(X : Y : Z)`, `x = X/Z²`, so `x ≡ r (mod n)` iff `X = r·Z²` or
+    /// `X = (r + n)·Z²` (the only candidates below `p`). The identity never
+    /// verifies. Public inputs only — see [`Self::mul_double_vartime`].
+    pub(crate) fn verify_x_vartime(&self, u1: &Fe, u2: &Fe, q: &Point, r: &Fe) -> bool {
+        let acc = self.straus_vartime(u1, u2, q);
+        if bool::from(acc.z.is_zero()) {
+            return false;
+        }
+        let zz = self.sqr(&acc.z);
+        if bool::from(self.mul(&field::to_mont(r), &zz).ct_eq(&acc.x)) {
+            return true;
+        }
+        // r + n is a candidate only when it neither overflows 2²⁵⁶ (r is
+        // range-checked below n, but n > 2²⁵⁵, so r + n can carry — the
+        // Wycheproof "r = 2²⁵⁶ − n + 5, x = 5" vectors) nor reaches p.
+        let (r_n, carry) = r.adc(&ORDER, 0);
+        carry == 0
+            && bool::from(r_n.ct_lt(&field::P))
+            && bool::from(self.mul(&field::to_mont(&r_n), &zz).ct_eq(&acc.x))
+    }
+
+    /// The Straus–Shamir ladder behind [`Self::mul_double_vartime`], in
+    /// Jacobian coordinates. **Variable-time.**
+    fn straus_vartime(&self, u1: &Fe, u2: &Fe, q: &Point) -> Jacobian {
+        #[cfg(feature = "p256-table")]
+        let g_odd = &P256_GEN_TABLE[0];
+        #[cfg(not(feature = "p256-table"))]
+        let g_odd = &self.odd_multiples_affine(&self.generator());
+
+        // u2·Q vanishes for the identity (and its odd multiples could not
+        // be normalised); `q` is public, so the branch is sound.
+        let q_identity = bool::from(q.z.is_zero());
+        let q_odd = if q_identity {
+            [[0u64; 8]; 8]
+        } else {
+            self.odd_multiples_affine(q)
+        };
+        let naf1 = wnaf5(u1);
+        let naf2 = if q_identity { [0i8; 257] } else { wnaf5(u2) };
+
+        let mut acc = Jacobian::IDENTITY;
+        let Some(top) = naf1
+            .iter()
+            .zip(naf2.iter())
+            .rposition(|(&a, &b)| a != 0 || b != 0)
+        else {
+            return acc;
+        };
+        for i in (0..=top).rev() {
+            acc = self.jac_double(&acc);
+            if naf1[i] != 0 {
+                acc = self.jac_add_naf_digit(&acc, naf1[i], g_odd);
+            }
+            if naf2[i] != 0 {
+                acc = self.jac_add_naf_digit(&acc, naf2[i], &q_odd);
+            }
+        }
+        acc
+    }
+
+    /// Adds the nonzero wNAF digit `d` (odd, `|d| <= 15`) times the point
+    /// whose affine odd multiples are `odd`. **Variable-time.**
+    #[inline]
+    fn jac_add_naf_digit(&self, acc: &Jacobian, d: i8, odd: &[[u64; 8]]) -> Jacobian {
+        let entry = &odd[(d.unsigned_abs() as usize - 1) / 2];
+        let x = Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]);
+        let mut y = Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]);
+        if d < 0 {
+            y = field::negate(&y);
+        }
+        self.jac_add_affine(acc, &x, &y)
+    }
+
+    /// The odd multiples `[1]P, [3]P, …, [15]P` of a non-identity `P` as
+    /// affine points (Montgomery form, `x‖y` limbs), built with the complete
+    /// projective formulas and normalised together with a single inversion
+    /// (Montgomery's trick: `3(n − 1)` multiplications replace `n − 1`
+    /// inversions). **Variable-time** callers only (verification).
+    fn odd_multiples_affine(&self, point: &Point) -> [[u64; 8]; 8] {
         let two_p = self.double(point);
         let mut table = [*point; 8];
         for i in 1..8 {
             table[i] = self.point_add(&table[i - 1], &two_p);
         }
-        table
+        // prefix[i] = z₀·z₁·…·zᵢ; one inversion of prefix[7], then peel.
+        let mut prefix = [table[0].z; 8];
+        for i in 1..8 {
+            prefix[i] = self.mul(&prefix[i - 1], &table[i].z);
+        }
+        let mut inv = field::invert(&prefix[7]);
+        let mut out = [[0u64; 8]; 8];
+        for i in (0..8).rev() {
+            let z_inv = if i > 0 {
+                self.mul(&inv, &prefix[i - 1])
+            } else {
+                inv
+            };
+            inv = self.mul(&inv, &table[i].z);
+            let x = self.mul(&table[i].x, &z_inv);
+            let y = self.mul(&table[i].y, &z_inv);
+            out[i][..4].copy_from_slice(x.as_limbs());
+            out[i][4..].copy_from_slice(y.as_limbs());
+        }
+        out
     }
 
-    /// Adds the wNAF digit `d` (odd, `|d| <= 15`, or zero for a no-op) times
-    /// the point whose odd multiples are `odd`. **Variable-time.**
-    #[inline]
-    fn add_naf_digit(&self, acc: &Point, d: i8, odd: &[Point; 8]) -> Point {
-        if d > 0 {
-            self.point_add(acc, &odd[(d as usize - 1) / 2])
-        } else if d < 0 {
-            self.point_add(acc, &self.negate_point(&odd[((-d) as usize - 1) / 2]))
-        } else {
-            *acc
+    /// Jacobian doubling `dbl-2001-b` for `a = −3` (3M + 5S). The identity
+    /// (`Z = 0`) doubles to itself (`Z3 = 2·Y·Z = 0`). **Variable-time**
+    /// callers only (no exceptional inputs, but part of the public-input
+    /// verification path).
+    fn jac_double(&self, p: &Jacobian) -> Jacobian {
+        let delta = self.sqr(&p.z);
+        let gamma = self.sqr(&p.y);
+        let beta = self.mul(&p.x, &gamma);
+        // alpha = 3·(X − delta)·(X + delta)
+        let t = self.mul(&self.sub(&p.x, &delta), &self.add(&p.x, &delta));
+        let alpha = self.add(&self.add(&t, &t), &t);
+        // X3 = alpha² − 8·beta
+        let beta2 = self.add(&beta, &beta);
+        let beta4 = self.add(&beta2, &beta2);
+        let beta8 = self.add(&beta4, &beta4);
+        let x3 = self.sub(&self.sqr(&alpha), &beta8);
+        // Z3 = (Y + Z)² − gamma − delta
+        let yz = self.add(&p.y, &p.z);
+        let z3 = self.sub(&self.sub(&self.sqr(&yz), &gamma), &delta);
+        // Y3 = alpha·(4·beta − X3) − 8·gamma²
+        let gamma2 = self.sqr(&gamma);
+        let g2 = self.add(&gamma2, &gamma2);
+        let g4 = self.add(&g2, &g2);
+        let g8 = self.add(&g4, &g4);
+        let y3 = self.sub(&self.mul(&alpha, &self.sub(&beta4, &x3)), &g8);
+        Jacobian {
+            x: x3,
+            y: y3,
+            z: z3,
         }
     }
 
-    /// **VARIABLE-TIME** fixed-base multiplication `k·G` (comb table with
-    /// direct indexing, zero digits skipped). Public scalars only — see
-    /// [`Self::mul_double_vartime`].
-    #[cfg(feature = "p256-table")]
-    fn mul_generator_vartime(&self, k: &Fe) -> Point {
-        let mut acc = self.identity();
-        let limbs = k.as_limbs();
-        for (i, window) in P256_GEN_TABLE.iter().enumerate() {
-            let digit = ((limbs[i / 16] >> ((i % 16) * 4)) & 0xf) as usize;
-            if digit != 0 {
-                let entry = &window[digit - 1];
-                let cand = Point {
-                    x: Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]),
-                    y: Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]),
-                    z: field::ONE,
-                };
-                acc = self.point_add(&acc, &cand);
+    /// Mixed Jacobian + affine addition `madd-2007-bl` (7M + 4S) with the
+    /// exceptional cases handled explicitly: an identity accumulator
+    /// returns the affine point; `H = 0` (same x) is a doubling when the
+    /// y's agree and the identity when they are opposite. **Variable-time**
+    /// callers only (the branches are on the operands).
+    fn jac_add_affine(&self, p: &Jacobian, x2: &Fe, y2: &Fe) -> Jacobian {
+        if bool::from(p.z.is_zero()) {
+            return Jacobian {
+                x: *x2,
+                y: *y2,
+                z: field::ONE,
+            };
+        }
+        let z1z1 = self.sqr(&p.z);
+        let u2 = self.mul(x2, &z1z1);
+        let s2 = self.mul(y2, &self.mul(&p.z, &z1z1));
+        let h = self.sub(&u2, &p.x);
+        let r = self.sub(&s2, &p.y);
+        if bool::from(h.is_zero()) {
+            if bool::from(r.is_zero()) {
+                return self.jac_double(p);
             }
+            return Jacobian::IDENTITY;
         }
-        acc
-    }
-
-    /// **VARIABLE-TIME** scalar multiplication `k·point` via width-5 wNAF.
-    /// Public scalars only — see [`Self::mul_double_vartime`].
-    #[cfg(feature = "p256-table")]
-    fn scalar_mul_vartime(&self, k: &Fe, point: &Point) -> Point {
-        let table = self.odd_multiples(point);
-
-        let naf = wnaf5(k);
-        // Skip leading zero digits (public scalar, so this leak is fine).
-        let mut i = naf.len();
-        while i > 0 && naf[i - 1] == 0 {
-            i -= 1;
+        let r = self.add(&r, &r);
+        let hh = self.sqr(&h);
+        let i2 = self.add(&hh, &hh);
+        let i = self.add(&i2, &i2);
+        let j = self.mul(&h, &i);
+        let v = self.mul(&p.x, &i);
+        // X3 = r² − J − 2V
+        let x3 = self.sub(&self.sub(&self.sqr(&r), &j), &self.add(&v, &v));
+        // Y3 = r·(V − X3) − 2·Y1·J
+        let y1j = self.mul(&p.y, &j);
+        let y3 = self.sub(&self.mul(&r, &self.sub(&v, &x3)), &self.add(&y1j, &y1j));
+        // Z3 = (Z1 + H)² − Z1Z1 − HH
+        let z3 = self.sub(&self.sub(&self.sqr(&self.add(&p.z, &h)), &z1z1), &hh);
+        Jacobian {
+            x: x3,
+            y: y3,
+            z: z3,
         }
-        let mut acc = self.identity();
-        while i > 0 {
-            i -= 1;
-            acc = self.double(&acc);
-            acc = self.add_naf_digit(&acc, naf[i], &table);
-        }
-        acc
     }
 
     /// Tests whether affine `(x, y)` (plain residues `< p`) satisfies the
@@ -536,6 +709,130 @@ impl P256 {
         let rhs = field::add(&field::sub(&x3, &three_x), &self.b);
         bool::from(lhs.ct_eq(&rhs))
     }
+}
+
+/// A point in Jacobian coordinates `(X : Y : Z)` — affine `(X/Z², Y/Z³)`,
+/// identity `Z = 0` — used only by the variable-time verification ladder,
+/// where its cheaper doubling (3M + 5S) and mixed addition (7M + 4S) beat
+/// the complete projective formulas and the exceptional cases can simply
+/// be branched on.
+#[derive(Clone, Copy)]
+struct Jacobian {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+}
+
+impl Jacobian {
+    /// The identity `(1 : 1 : 0)`.
+    const IDENTITY: Jacobian = Jacobian {
+        x: field::ONE,
+        y: field::ONE,
+        z: Fe::ZERO,
+    };
+}
+
+/// A scalar recoded for the constant-time ladders.
+///
+/// `k' = k mod n` made odd: an even `k` is replaced by `n − k` (odd, since
+/// `n` is) and the result negated at the end (`[k]P = −[n − k]P`), through
+/// a mask. An odd `k' < 2²⁵⁶` has the regular signed representation
+/// `k' = 16⁶⁴ + Σᵢ₌₀⁶³ dᵢ·16ⁱ` with every `dᵢ ∈ {±1, ±3, …, ±15}` (no zero
+/// digit): with `eᵢ` the plain base-16 digits, `dᵢ = (eᵢ + 1 − (eᵢ mod 2))
+/// − 16·(1 − (eᵢ₊₁ mod 2))`, i.e. each even digit borrows one from the
+/// window above and lends 16 to the one below (`e₆₄ = 0`, so `d₆₃` is
+/// always negative and the implicit top digit is `+1`). Every digit is a
+/// local function of two adjacent windows, so [`Self::digit`] is a few
+/// masked operations with no carry chain.
+///
+/// Reducing mod `n` first gives the documented policy for scalars
+/// `>= n` (and `>= 2²⁵⁵`): `[k]P = [k mod n]P`, and the reduction is the
+/// crate's constant-time single masked subtraction ([`super::reduce_256`]).
+struct OddScalar {
+    /// The odd representative `k'`.
+    k: Fe,
+    /// All-ones iff the ladder's result must be negated (`k mod n` even).
+    negate_result: u64,
+}
+
+impl OddScalar {
+    fn new(scalar: &Fe) -> Self {
+        let k = super::reduce_256(scalar, &ORDER);
+        let even = !k.is_odd();
+        let n_minus_k = ORDER.wrapping_sub(&k);
+        OddScalar {
+            k: Fe::conditional_select(&n_minus_k, &k, even),
+            negate_result: mask_from_bit(u64::from(even.unwrap_u8())),
+        }
+    }
+
+    /// Digit `i` (window `i` of 64) as `(table index (|dᵢ| − 1) / 2, mask
+    /// that is all-ones iff dᵢ < 0)`. Constant time in the scalar (`i` is
+    /// the public loop index).
+    #[inline]
+    fn digit(&self, i: usize) -> (u64, u64) {
+        let limbs = self.k.as_limbs();
+        let e = (limbs[i / 16] >> ((i % 16) * 4)) & 0xF;
+        // Lowest bit of window i + 1 (zero above the top window).
+        let next_odd = if i + 1 < 64 {
+            (limbs[(i + 1) / 16] >> (((i + 1) % 16) * 4)) & 1
+        } else {
+            0
+        };
+        // Odd value in [1, 15]; negative iff the window above is even.
+        let v = e + 1 - (e & 1);
+        let neg = mask_from_bit(next_odd ^ 1);
+        let mag = v ^ ((v ^ (16 - v)) & neg);
+        (mag >> 1, neg)
+    }
+}
+
+impl Zeroize for OddScalar {
+    fn zeroize(&mut self) {
+        self.k.zeroize();
+        self.negate_result.zeroize();
+    }
+}
+
+/// Returns an all-ones/all-zeros `u64` mask from a 0/1 bit.
+#[inline]
+fn mask_from_bit(bit: u64) -> u64 {
+    0u64.wrapping_sub(bit & 1)
+}
+
+/// All-ones iff `a == b`, by arithmetic only.
+#[inline]
+fn mask_eq(a: u64, b: u64) -> u64 {
+    let x = a ^ b;
+    mask_from_bit(((x | x.wrapping_neg()) >> 63) ^ 1)
+}
+
+/// `acc | (v & mask)` per limb: the gather accumulator of a masked scan.
+#[inline]
+fn or_masked(acc: &Fe, v: &Fe, mask: u64) -> Fe {
+    let a = acc.as_limbs();
+    let v = v.as_limbs();
+    Fe::from_limbs([
+        a[0] | (v[0] & mask),
+        a[1] | (v[1] & mask),
+        a[2] | (v[2] & mask),
+        a[3] | (v[3] & mask),
+    ])
+}
+
+/// `−y` when `mask` is all-ones, `y` when it is zero (a masked select over
+/// the limbs; the negation itself is always computed).
+#[inline]
+fn negate_masked(y: &Fe, mask: u64) -> Fe {
+    let n = field::negate(y);
+    let y = y.as_limbs();
+    let n = n.as_limbs();
+    Fe::from_limbs([
+        y[0] ^ ((y[0] ^ n[0]) & mask),
+        y[1] ^ ((y[1] ^ n[1]) & mask),
+        y[2] ^ ((y[2] ^ n[2]) & mask),
+        y[3] ^ ((y[3] ^ n[3]) & mask),
+    ])
 }
 
 /// Width-5 wNAF recoding of a 256-bit scalar: digits in
@@ -648,24 +945,31 @@ mod tests {
     #[cfg(feature = "p256-table")]
     fn gen_table_matches_computed() {
         let curve = P256::new();
+        let check = |entry: &[u64; 8], acc: &Point| {
+            assert!(
+                !bool::from(acc.z.is_zero()),
+                "table entry must not be the identity"
+            );
+            let ex = Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]);
+            let ey = Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]);
+            assert_eq!(curve.mul(&ex, &acc.z), acc.x, "x mismatch");
+            assert_eq!(curve.mul(&ey, &acc.z), acc.y, "y mismatch");
+        };
+        // base = [16^i]G; entry j of window i is [(2j + 1)·16^i]G.
         let mut base = curve.generator();
         for window in P256_GEN_TABLE.iter() {
+            let two_base = curve.double(&base);
             let mut acc = base;
             for (j, entry) in window.iter().enumerate() {
                 if j > 0 {
-                    acc = curve.point_add(&acc, &base);
+                    acc = curve.point_add(&acc, &two_base);
                 }
-                assert!(
-                    !bool::from(acc.z.is_zero()),
-                    "table entry must not be the identity"
-                );
-                let ex = Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]);
-                let ey = Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]);
-                assert_eq!(curve.mul(&ex, &acc.z), acc.x, "x mismatch");
-                assert_eq!(curve.mul(&ey, &acc.z), acc.y, "y mismatch");
+                check(entry, &acc);
             }
             base = curve.double(&curve.double(&curve.double(&curve.double(&base))));
         }
+        // After 64 windows, base = [16^64]G, the comb's starting point.
+        check(&P256_GEN_2_256, &base);
     }
 
     /// Differential test: the fixed-base comb agrees with the generic
@@ -774,8 +1078,8 @@ mod tests {
     /// Regenerates the fixed-base table source (`src/ec/p256_gtable.rs`).
     /// Run with:
     /// `cargo test --release gen_p256_gen_table -- --ignored --nocapture`
-    /// and paste the emitted `static` between the file's header comment and
-    /// EOF. The non-ignored `gen_table_matches_computed` test keeps the
+    /// and paste the emitted `static`s between the file's header comment and
+    /// EOF (the trailing `],` of the last item becomes `];`). The non-ignored `gen_table_matches_computed` test keeps the
     /// pasted constants honest on every test run.
     #[test]
     #[ignore = "table generator; emits Rust source on stdout"]
@@ -785,30 +1089,354 @@ mod tests {
         let curve = P256::new();
         // base = [16^i]G for the current window i.
         let mut base = curve.generator();
-        println!("pub(crate) static P256_GEN_TABLE: [[[u64; 8]; 15]; 64] = [");
+        let emit = |indent: &str, point: &Point| {
+            let (x, y) = curve
+                .to_affine(point)
+                .expect("table entry is never identity");
+            print!("{indent}[");
+            for l in field::to_mont(&x).as_limbs() {
+                print!("0x{l:016x}, ");
+            }
+            for l in field::to_mont(&y).as_limbs() {
+                print!("0x{l:016x}, ");
+            }
+            println!("],");
+        };
+        println!("pub(crate) static P256_GEN_TABLE: [[[u64; 8]; 8]; 64] = [");
         for _ in 0..64 {
             println!("    [");
+            let two_base = curve.double(&base);
             let mut acc = base;
-            for j in 1..=15u32 {
-                if j > 1 {
-                    acc = curve.point_add(&acc, &base);
+            for j in 0..8 {
+                if j > 0 {
+                    acc = curve.point_add(&acc, &two_base);
                 }
-                let (x, y) = curve
-                    .to_affine(&acc)
-                    .expect("table entry is never identity");
-                print!("        [");
-                for l in field::to_mont(&x).as_limbs() {
-                    print!("0x{l:016x}, ");
-                }
-                for l in field::to_mont(&y).as_limbs() {
-                    print!("0x{l:016x}, ");
-                }
-                println!("],");
+                emit("        ", &acc);
             }
             println!("    ],");
             base = curve.double(&curve.double(&curve.double(&curve.double(&base))));
         }
         println!("];");
+        println!();
+        println!("/// `[16^64]G` (`[2^256 mod n]G`), the comb's starting point.");
+        print!("pub(crate) static P256_GEN_2_256: [u64; 8] = ");
+        emit("", &base);
+    }
+
+    /// Plain left-to-right double-and-add over the bits of `k` with the
+    /// complete formulas — the reference for the windowed ladders.
+    fn reference_mul(curve: &P256, k: &Fe, p: &Point) -> Point {
+        let mut acc = curve.identity();
+        for i in (0..256).rev() {
+            acc = curve.double(&acc);
+            if (k.as_limbs()[i / 64] >> (i % 64)) & 1 == 1 {
+                acc = curve.point_add(&acc, p);
+            }
+        }
+        acc
+    }
+
+    /// The scalars that stress the odd recoding: zero and the identity
+    /// multiples, even and odd values, `n ± 1`, scalars at and above
+    /// `2²⁵⁵` and `n` (reduced first), all-ones, powers of 16 (every other
+    /// digit even), and the all-`0xf` / alternating-nibble patterns.
+    fn recoding_edge_scalars() -> [Fe; 16] {
+        let n = P256::order();
+        [
+            Fe::ZERO,
+            Fe::ONE,
+            Fe::from_u64(2),
+            Fe::from_u64(15),
+            Fe::from_u64(16),
+            Fe::from_u64(17),
+            Fe::from_u64(0x8000_0000_0000_0000),
+            n.wrapping_sub(&Fe::from_u64(2)),
+            n.wrapping_sub(&Fe::ONE),
+            n,
+            n.wrapping_add(&Fe::ONE),
+            n.wrapping_add(&Fe::from_u64(16)),
+            fe_from_hex("8000000000000000000000000000000000000000000000000000000000000000"),
+            fe_from_hex("7fffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550"),
+            Fe::from_limbs([u64::MAX; 4]),
+            Fe::from_limbs([0xf0f0_f0f0_f0f0_f0f0; 4]),
+        ]
+    }
+
+    /// Both constant-time ladders agree with double-and-add on `G` and on
+    /// a random base for every edge scalar (a scalar `>= n` acts as `k mod
+    /// n`, the documented policy) and a random batch.
+    #[test]
+    fn ladders_match_double_and_add_reference() {
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        let curve = P256::new();
+        let n = P256::order();
+        let g = curve.generator();
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-ladder-reference", b"nonce", &[]);
+        let mut rand_fe = || {
+            let mut limbs = [0u64; 4];
+            for l in &mut limbs {
+                *l = rng.next_u64();
+            }
+            Fe::from_limbs(limbs)
+        };
+        let (qx, qy) = curve
+            .to_affine(&curve.mul_generator(&rand_fe().reduce(&n)))
+            .unwrap();
+        let q = curve.lift_affine(&qx, &qy);
+
+        let check = |k: &Fe| {
+            let want_g = curve.to_affine(&reference_mul(&curve, k, &g));
+            assert_eq!(
+                curve.to_affine(&curve.mul_generator(k)),
+                want_g,
+                "mul_generator mismatch for {:x?}",
+                k.as_limbs()
+            );
+            assert_eq!(
+                curve.to_affine(&curve.scalar_mul(k, &g)),
+                want_g,
+                "scalar_mul(G) mismatch for {:x?}",
+                k.as_limbs()
+            );
+            assert_eq!(
+                curve.to_affine(&curve.scalar_mul(k, &q)),
+                curve.to_affine(&reference_mul(&curve, k, &q)),
+                "scalar_mul(Q) mismatch for {:x?}",
+                k.as_limbs()
+            );
+        };
+        for k in &recoding_edge_scalars() {
+            check(k);
+        }
+        for _ in 0..16 {
+            check(&rand_fe());
+        }
+        // The identity base multiplies to the identity.
+        assert!(
+            curve
+                .to_affine(&curve.scalar_mul(&Fe::from_u64(7), &curve.identity()))
+                .is_none()
+        );
+    }
+
+    /// The odd recoding reconstructs `k'`: `16⁶⁴ + Σ dᵢ·16ⁱ`, evaluated
+    /// as integers, equals the odd representative, every digit is odd and
+    /// within `±15`, and the result-negation flag matches `k mod n`'s
+    /// parity.
+    #[test]
+    fn odd_scalar_recoding_is_exact() {
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        let n = P256::order();
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-odd-recoding", b"nonce", &[]);
+        let check = |k: &Fe| {
+            let odd = OddScalar::new(k);
+            let reduced = super::super::reduce_256(k, &n);
+            let even = !bool::from(reduced.is_odd());
+            assert_eq!(odd.negate_result, if even { u64::MAX } else { 0 });
+            let expect = if even {
+                n.wrapping_sub(&reduced)
+            } else {
+                reduced
+            };
+            assert!(bool::from(odd.k.is_odd()));
+            assert_eq!(odd.k, expect);
+            // Horner evaluation from the implicit top digit, in wrapping
+            // 256-bit arithmetic (the true value is < 2²⁵⁶, and every
+            // partial sum stays within ±2²⁵⁶ so the wrap is harmless).
+            let mut acc = Fe::ONE;
+            for i in (0..64).rev() {
+                let (index, neg) = odd.digit(i);
+                assert!(index < 8, "index out of range");
+                assert!(neg == 0 || neg == u64::MAX);
+                let mag = Fe::from_u64(2 * index + 1);
+                for _ in 0..4 {
+                    acc = acc.wrapping_add(&acc);
+                }
+                acc = if neg == u64::MAX {
+                    acc.wrapping_sub(&mag)
+                } else {
+                    acc.wrapping_add(&mag)
+                };
+            }
+            assert_eq!(acc, expect, "recoding mismatch for {:x?}", k.as_limbs());
+        };
+        for k in &recoding_edge_scalars() {
+            check(k);
+        }
+        for _ in 0..64 {
+            let mut limbs = [0u64; 4];
+            for l in &mut limbs {
+                *l = rng.next_u64();
+            }
+            check(&Fe::from_limbs(limbs));
+        }
+    }
+
+    /// The variable-time ladder against the constant-time path on the
+    /// bases that trigger every exceptional branch of the Jacobian
+    /// formulas: `Q = ±G` (digit collisions, `acc = ±[d]G`), `Q = [2^k]G`
+    /// (aligned digit positions), with `u1`/`u2` zero, one, `n − 1`, powers
+    /// of two and the recoding edges.
+    #[test]
+    fn mul_double_vartime_exceptional_bases() {
+        let curve = P256::new();
+        let n = P256::order();
+        let g = curve.generator();
+        let pow2 = |k: u32| {
+            let mut p = g;
+            for _ in 0..k {
+                p = curve.double(&p);
+            }
+            p
+        };
+        let bases = [
+            g,
+            Point {
+                x: g.x,
+                y: field::negate(&g.y),
+                z: g.z,
+            },
+            pow2(1),
+            pow2(4),
+            pow2(5),
+            pow2(64),
+            pow2(255),
+        ];
+        let scalars = [
+            Fe::ZERO,
+            Fe::ONE,
+            Fe::from_u64(2),
+            Fe::from_u64(3),
+            Fe::from_u64(16),
+            Fe::from_u64(17),
+            n.wrapping_sub(&Fe::ONE),
+            n.wrapping_sub(&Fe::from_u64(2)),
+            fe_from_hex("8000000000000000000000000000000000000000000000000000000000000000"),
+            fe_from_hex("0000000000000000000000000000000100000000000000000000000000000000"),
+        ];
+        for base in &bases {
+            let (qx, qy) = curve.to_affine(base).unwrap();
+            let q = curve.lift_affine(&qx, &qy);
+            for u1 in &scalars {
+                for u2 in &scalars {
+                    let ct = curve.point_add(&curve.mul_generator(u1), &curve.scalar_mul(u2, &q));
+                    let vt = curve.mul_double_vartime(u1, u2, &q);
+                    assert_eq!(
+                        curve.to_affine(&ct),
+                        curve.to_affine(&vt),
+                        "vartime/ct mismatch: u1={:x?} u2={:x?}",
+                        u1.as_limbs(),
+                        u2.as_limbs()
+                    );
+                }
+            }
+        }
+        // An identity base contributes nothing.
+        let id = curve.identity();
+        for u1 in &scalars {
+            assert_eq!(
+                curve.to_affine(&curve.mul_double_vartime(u1, &Fe::from_u64(5), &id)),
+                curve.to_affine(&curve.mul_generator(u1))
+            );
+        }
+    }
+
+    /// Each exceptional branch of the Jacobian mixed addition, directly:
+    /// identity accumulator, `acc = P` (doubling) and `acc = −P` (identity),
+    /// plus the generic case against the complete projective formulas.
+    #[test]
+    fn jacobian_add_affine_branches() {
+        let curve = P256::new();
+        let g = curve.generator();
+        let two_g = curve.double(&g);
+        let (gx, gy) = (g.x, g.y);
+        let affine_of = |j: &Jacobian| {
+            let z2 = curve.sqr(&j.z);
+            curve.to_affine(&Point {
+                x: curve.mul(&j.x, &j.z),
+                y: j.y,
+                z: curve.mul(&z2, &j.z),
+            })
+        };
+        // Identity + G = G.
+        let r = curve.jac_add_affine(&Jacobian::IDENTITY, &gx, &gy);
+        assert_eq!(affine_of(&r), curve.to_affine(&g));
+        // Non-trivially scaled G (Z ≠ 1) + G = 2G through the doubling branch.
+        let lambda = field::to_mont(&Fe::from_u64(7));
+        let l2 = curve.sqr(&lambda);
+        let scaled = Jacobian {
+            x: curve.mul(&gx, &l2),
+            y: curve.mul(&gy, &curve.mul(&l2, &lambda)),
+            z: lambda,
+        };
+        let r = curve.jac_add_affine(&scaled, &gx, &gy);
+        assert_eq!(affine_of(&r), curve.to_affine(&two_g));
+        // Scaled G + (−G) = identity.
+        let r = curve.jac_add_affine(&scaled, &gx, &field::negate(&gy));
+        assert!(bool::from(r.z.is_zero()));
+        assert!(affine_of(&r).is_none());
+        // Generic: 2G + G = 3G, and doubling 2G = 4G.
+        let j2 = curve.jac_add_affine(
+            &curve.jac_add_affine(&Jacobian::IDENTITY, &gx, &gy),
+            &gx,
+            &gy,
+        );
+        let r = curve.jac_add_affine(&j2, &gx, &gy);
+        assert_eq!(affine_of(&r), curve.to_affine(&curve.point_add(&two_g, &g)));
+        assert_eq!(
+            affine_of(&curve.jac_double(&j2)),
+            curve.to_affine(&curve.double(&two_g))
+        );
+        assert!(bool::from(
+            curve.jac_double(&Jacobian::IDENTITY).z.is_zero()
+        ));
+    }
+
+    /// The inversion-free x-check agrees with the affine computation,
+    /// including on the `x ≡ r (mod n)` wrap-around candidate `r + n`.
+    #[test]
+    fn verify_x_vartime_matches_affine_check() {
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        let curve = P256::new();
+        let n = P256::order();
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-verify-x", b"nonce", &[]);
+        let mut rand_fe = || {
+            let mut limbs = [0u64; 4];
+            for l in &mut limbs {
+                *l = rng.next_u64();
+            }
+            Fe::from_limbs(limbs).reduce(&n)
+        };
+        let (qx, qy) = curve.to_affine(&curve.mul_generator(&rand_fe())).unwrap();
+        let q = curve.lift_affine(&qx, &qy);
+        for _ in 0..16 {
+            let (u1, u2) = (rand_fe(), rand_fe());
+            let (x, _) = curve
+                .to_affine(&curve.mul_double_vartime(&u1, &u2, &q))
+                .unwrap();
+            let r = super::super::reduce_256(&x, &n);
+            assert!(curve.verify_x_vartime(&u1, &u2, &q, &r));
+            assert!(!curve.verify_x_vartime(&u1, &u2, &q, &r.wrapping_add(&Fe::ONE)));
+            assert!(!curve.verify_x_vartime(&u1, &u2, &q, &Fe::ZERO));
+            // The second candidate r + n (only when x >= n, never observed
+            // for a random point; the branch itself is exercised with a
+            // small r where r + n < p and cannot match).
+            assert!(!curve.verify_x_vartime(&u1, &u2, &q, &Fe::from_u64(1)));
+        }
+        // The identity never verifies: u1 = u2 = 0.
+        assert!(!curve.verify_x_vartime(&Fe::ZERO, &Fe::ZERO, &q, &Fe::ONE));
+        // A wrapped candidate must not match: with r = 2²⁵⁶ − n + x (in
+        // range, since 2²⁵⁶ − n < n), r + n wraps to x in 256-bit
+        // arithmetic, which must not count as `x ≡ r (mod n)`.
+        let (x, _) = curve
+            .to_affine(&curve.mul_double_vartime(&Fe::ONE, &Fe::ONE, &q))
+            .unwrap();
+        let wrapped = Fe::ZERO.wrapping_sub(&n).wrapping_add(&x);
+        assert!(bool::from(wrapped.ct_lt(&n)));
+        assert!(!curve.verify_x_vartime(&Fe::ONE, &Fe::ONE, &q, &wrapped));
     }
 
     #[test]

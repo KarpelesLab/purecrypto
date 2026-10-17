@@ -2,7 +2,7 @@
 
 use super::p256::{Fe, P256, random_scalar};
 use super::{Error, reduce_256};
-use crate::ct::{ConstantTimeEq, ConstantTimeLess};
+use crate::ct::ConstantTimeLess;
 use crate::hash::{Digest, Hmac};
 use crate::rng::{CryptoRng, RngCore};
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
@@ -239,12 +239,10 @@ impl EcdsaPublicKey {
         // public in the verification setting, so timing reveals nothing an
         // attacker does not already know. Signing and ECDH keep the
         // constant-time `mul_generator` / `scalar_mul` paths.
+        // The x-coordinate check `x(u1·G + u2·Q) ≡ r (mod n)` runs on the
+        // Jacobian result without the final inversion.
         let point = curve.lift_affine(&self.x, &self.y);
-        let sum = curve.mul_double_vartime(&u1, &u2, &point);
-        let (vx, _) = curve.to_affine(&sum).ok_or(Error::Verification)?;
-        let v = reduce_256(&vx, &n);
-
-        if bool::from(v.ct_eq(&sig.r)) {
+        if curve.verify_x_vartime(&u1, &u2, &point, &sig.r) {
             Ok(())
         } else {
             Err(Error::Verification)
@@ -442,6 +440,7 @@ pub(super) fn generate_k<D: Digest>(d: &Fe, hash: &[u8], n: &Fe) -> Fe {
 mod tests {
     use super::super::p256::fe_from_hex;
     use super::*;
+    use crate::ct::ConstantTimeEq;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
 
