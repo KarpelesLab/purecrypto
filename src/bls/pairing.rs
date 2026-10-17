@@ -203,18 +203,25 @@ pub(crate) fn final_exponentiation(f: &Fp12) -> Fp12 {
     // a zero input maps to zero rather than panicking.
     let inv = f.invert().unwrap_or(Fp12::ZERO);
     let t = f.conjugate().mul(&inv);
-    let m = t.frobenius_pow(2).mul(&t);
+    let m = t.frobenius_square().mul(&t);
     // Hard part on the cyclotomic subgroup, where x^k with x < 0 is
-    // cyclotomic_pow(|x|^k) followed by a conjugation (= inversion).
+    // cyclotomic_pow(|x|^k) followed by a conjugation (= inversion). The
+    // exponents are the public curve parameters, so the sparse
+    // square-and-multiply (one multiplication per set bit) is used.
     // a = m^((x-1)/3)
-    let a = m.cyclotomic_pow(X_MINUS_1_DIV_3_ABS).conjugate();
+    let a = m.cyclotomic_pow_public_exp(X_MINUS_1_DIV_3_ABS).conjugate();
     // a = m^((x-1)²/3)
-    let a = a.cyclotomic_pow(X_MINUS_1_ABS).conjugate();
+    let a = a.cyclotomic_pow_public_exp(X_MINUS_1_ABS).conjugate();
     // b = a^(x + p)
-    let b = a.cyclotomic_pow(X_ABS).conjugate().mul(&a.frobenius_map());
+    let b = a
+        .cyclotomic_pow_public_exp(X_ABS)
+        .conjugate()
+        .mul(&a.frobenius_map());
     // c = b^(x² + p² - 1)
-    let bx2 = b.cyclotomic_pow(X_ABS).cyclotomic_pow(X_ABS);
-    let c = bx2.mul(&b.frobenius_pow(2)).mul(&b.conjugate());
+    let bx2 = b
+        .cyclotomic_pow_public_exp(X_ABS)
+        .cyclotomic_pow_public_exp(X_ABS);
+    let c = bx2.mul(&b.frobenius_square()).mul(&b.conjugate());
     // λ = (x-1)²/3 · (x+p) · (x²+p²-1) + 1
     c.mul(&m)
 }

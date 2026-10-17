@@ -222,6 +222,44 @@ pub(crate) const FROB_5: Fp2 = Fp2 {
     ]),
 };
 
+// p²-Frobenius: xi^(i*(p²-1)/6) for i = 1, 2, 4, 5 (all in Fp; i = 3 gives -1)
+/// `0x5f19672fdf76ce51ba69c6076a0f77eaddb3a93be6f89688de17d813620a00022e01fffffffeffff`
+pub(crate) const FROB2_1: Fp = Fp([
+    0xecfb361b798dba3a,
+    0xc100ddb891865a2c,
+    0x0ec08ff1232bda8e,
+    0xd5c13cc6f1ca4721,
+    0x47222a47bf7b5c04,
+    0x0110f184e51c5f59,
+]);
+/// `0x5f19672fdf76ce51ba69c6076a0f77eaddb3a93be6f89688de17d813620a00022e01fffffffefffe`
+pub(crate) const FROB2_2: Fp = Fp([
+    0x30f1361b798a64e8,
+    0xf3b8ddab7ece5a2a,
+    0x16a8ca3ac61577f7,
+    0xc26a2ff874fd029b,
+    0x3636b76660701c6e,
+    0x051ba4ab241b6160,
+]);
+/// `0x1a0111ea397fe699ec02408663d4de85aa0d857d89759ad4897d29650fb85f9b409427eb4f49fffd8bfd00000000aaac`
+pub(crate) const FROB2_4: Fp = Fp([
+    0xcd03c9e48671f071,
+    0x5dab22461fcda5d2,
+    0x587042afd3851b95,
+    0x8eb60ebe01bacb9e,
+    0x03f97d6e83d050d2,
+    0x18f0206554638741,
+]);
+/// `0x1a0111ea397fe699ec02408663d4de85aa0d857d89759ad4897d29650fb85f9b409427eb4f49fffd8bfd00000000aaad`
+pub(crate) const FROB2_5: Fp = Fp([
+    0x890dc9e4867545c3,
+    0x2af322533285a5d5,
+    0x50880866309b7e2c,
+    0xa20d1b8c7e881024,
+    0x14e4f04fe2db9068,
+    0x14e56d3f1564853a,
+]);
+
 /// `0x0 + 0x1a0111ea397fe699ec02408663d4de85aa0d857d89759ad4897d29650fb85f9b409427eb4f49fffd8bfd00000000aaad·u`
 pub(crate) const PSI_X: Fp2 = Fp2 {
     c0: Fp([

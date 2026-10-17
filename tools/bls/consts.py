@@ -194,6 +194,12 @@ gam = [None] + [f2pow(xi, i * (p - 1) // 6) for i in range(1, 6)]
 for i in range(1, 6):
     emit(fp2(gam[i], "FROB_%d" % i))
 emit()
+emit("// p²-Frobenius: xi^(i*(p²-1)/6) for i = 1, 2, 4, 5 (all in Fp; i = 3 gives -1)")
+gam2 = [None] + [f2pow(xi, i * (p * p - 1) // 6) for i in range(1, 6)]
+assert all(g[1] == 0 for g in gam2[1:]) and gam2[3][0] == p - 1
+for i in (1, 2, 4, 5):
+    emit(fp(gam2[i][0], "FROB2_%d" % i))
+emit()
 
 # psi
 c1 = f2inv(gam[2])  # 1/(1+u)^((p-1)/3)

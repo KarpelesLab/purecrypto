@@ -6,7 +6,9 @@
 //! multiplication used by the Miller loop, and the cyclotomic squaring /
 //! exponentiation used by the final exponentiation's hard part.
 
-use super::constants::{FROB_1, FROB_2, FROB_3, FROB_4, FROB_5};
+use super::constants::{
+    FROB_1, FROB_2, FROB_3, FROB_4, FROB_5, FROB2_1, FROB2_2, FROB2_4, FROB2_5,
+};
 use super::fp::impl_field_ops;
 use super::fp2::Fp2;
 use super::fp6::Fp6;
@@ -146,10 +148,33 @@ impl Fp12 {
         }
     }
 
-    /// `self^(p^k)` by iterating the Frobenius map.
+    /// `self^(p²)`. The conjugations of two Frobenius maps cancel, and the
+    /// monomial constants `ξ^(i(p²-1)/6)` all lie in `Fp` (`i = 3` gives
+    /// `-1`), so this is eight `Fp` multiplications instead of two full
+    /// Frobenius maps.
+    pub fn frobenius_square(&self) -> Fp12 {
+        Fp12 {
+            c0: Fp6 {
+                c0: self.c0.c0,
+                c1: self.c0.c1.mul_by_fp(&FROB2_2),
+                c2: self.c0.c2.mul_by_fp(&FROB2_4),
+            },
+            c1: Fp6 {
+                c0: self.c1.c0.mul_by_fp(&FROB2_1),
+                c1: self.c1.c1.neg(),
+                c2: self.c1.c2.mul_by_fp(&FROB2_5),
+            },
+        }
+    }
+
+    /// `self^(p^k)` by iterating the Frobenius map (pairs of steps take the
+    /// cheaper [`frobenius_square`](Fp12::frobenius_square)).
     pub fn frobenius_pow(&self, k: usize) -> Fp12 {
         let mut f = *self;
-        for _ in 0..k {
+        for _ in 0..k / 2 {
+            f = f.frobenius_square();
+        }
+        if k % 2 == 1 {
             f = f.frobenius_map();
         }
         f
@@ -237,9 +262,9 @@ impl Fp12 {
         }
     }
 
-    /// `self^e` for a public 64-bit exponent using cyclotomic squarings.
-    /// Fixed schedule (every bit is processed); the multiplications are
-    /// selected by mask so the pattern is exponent-independent too.
+    /// `self^e` for a 64-bit exponent using cyclotomic squarings. Fixed
+    /// schedule (every bit is processed); the multiplications are selected
+    /// by mask so the pattern is exponent-independent too.
     pub fn cyclotomic_pow(&self, e: u64) -> Fp12 {
         let mut acc = Fp12::ONE;
         let mut bit = 64;
@@ -249,6 +274,26 @@ impl Fp12 {
             let prod = acc.mul(self);
             let take = Choice::from(((e >> bit) & 1) as u8);
             acc = Fp12::conditional_select(&prod, &acc, take);
+        }
+        acc
+    }
+
+    /// `self^e` for a **public** 64-bit exponent: cyclotomic squarings below
+    /// the leading set bit and one multiplication per set bit, so the
+    /// schedule is a function of the exponent alone and the running time is
+    /// independent of `self`. The final exponentiation uses it on the
+    /// compile-time curve parameters; never call it with a secret exponent
+    /// (use [`cyclotomic_pow`](Fp12::cyclotomic_pow) for that).
+    pub(crate) fn cyclotomic_pow_public_exp(&self, e: u64) -> Fp12 {
+        if e == 0 {
+            return Fp12::ONE;
+        }
+        let mut acc = *self;
+        for bit in (0..63 - e.leading_zeros()).rev() {
+            acc = acc.cyclotomic_square();
+            if (e >> bit) & 1 == 1 {
+                acc = acc.mul(self);
+            }
         }
         acc
     }
@@ -368,6 +413,9 @@ mod tests {
     fn frobenius_is_p_power() {
         let (a, _) = sample();
         assert_eq!(a.frobenius_map(), a.pow(&MODULUS));
+        assert_eq!(a.frobenius_square(), a.frobenius_map().frobenius_map());
+        assert_eq!(a.frobenius_pow(2), a.frobenius_square());
+        assert_eq!(a.frobenius_pow(3), a.frobenius_square().frobenius_map());
         assert_eq!(a.frobenius_pow(6), a.conjugate());
         assert_eq!(a.frobenius_pow(12), a);
         let (_, b) = sample();
@@ -388,6 +436,19 @@ mod tests {
             c.cyclotomic_pow(0xd201000000010000),
             c.pow(&[0xd201000000010000])
         );
+        for e in [
+            0u64,
+            1,
+            2,
+            3,
+            0xd201000000010000,
+            0xd201000000010001,
+            0x460055555555aaab,
+            u64::MAX,
+            1 << 63,
+        ] {
+            assert_eq!(c.cyclotomic_pow_public_exp(e), c.pow(&[e]));
+        }
         // Inverse equals conjugate on the subgroup.
         assert_eq!(c.conjugate() * c, Fp12::ONE);
     }
