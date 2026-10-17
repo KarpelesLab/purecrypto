@@ -38,7 +38,7 @@ pub use ocsp::{
 };
 pub use privkey::{AnyPrivateKey, Pkcs8ReadOptions};
 pub use pubkey::{AnyPublicKey, PssHash, PssParams, PssRestriction};
-pub use sct::{CtLog, Sct, SctVerification, SctVersion};
+pub use sct::{CtLog, MAX_SCTS, Sct, SctVerification, SctVersion};
 pub use sigalg::{SignatureAlgorithmIdentifier, SignatureParams};
 pub use signer::{CertSigner, SignatureAlgId};
 pub use time::{Time, Validity};

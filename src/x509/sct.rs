@@ -36,6 +36,12 @@ use super::{Certificate, Error, oid};
 use crate::der::Reader;
 use crate::hash::{Digest, Sha256};
 
+/// Upper bound on the number of SCTs accepted in one
+/// `SignedCertificateTimestampList`. Every entry naming a trusted log
+/// costs a signature verification, so the count is a work factor the
+/// certificate controls; real certificates carry two to five SCTs.
+pub const MAX_SCTS: usize = 32;
+
 /// SCT protocol version. RFC 6962 defines only `v1` (0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -109,6 +115,11 @@ pub enum SctVerification {
     /// verification time (a log must not issue an SCT dated after the moment
     /// it was created; a future timestamp is rejected, RFC 6962 §5.2).
     FutureTimestamp,
+    /// An earlier SCT in the same list already verified for this `LogID`.
+    /// The signature was not checked: a second SCT from a log that has
+    /// already spoken cannot raise the distinct-log count, so verifying it
+    /// would only let a certificate buy extra signature checks.
+    DuplicateLog,
 }
 
 /// A small cursor over a TLS-style big-endian length-prefixed byte stream.
@@ -179,6 +190,9 @@ pub fn parse_sct_list(body: &[u8]) -> Result<Vec<Sct>, Error> {
     }
     let mut out = Vec::new();
     while !r.is_empty() {
+        if out.len() == MAX_SCTS {
+            return Err(Error::Malformed);
+        }
         let one = r.opaque_u16()?;
         out.push(parse_one_sct(one)?);
     }
@@ -491,8 +505,12 @@ pub fn verify_embedded_scts(
     // Count distinct logs, not list elements — see the doc comment.
     let mut valid_logs: Vec<[u8; 32]> = Vec::new();
     for sct in &scts {
+        if valid_logs.contains(&sct.log_id) {
+            results.push(SctVerification::DuplicateLog);
+            continue;
+        }
         let res = verify_one(sct, issuer_spki, &tbs, logs, now_ms);
-        if res == SctVerification::Valid && !valid_logs.contains(&sct.log_id) {
+        if res == SctVerification::Valid {
             valid_logs.push(sct.log_id);
         }
         results.push(res);
@@ -657,6 +675,22 @@ mod tests {
     }
 
     #[test]
+    fn sct_list_count_limit() {
+        let log = make_test_log(b"many");
+        let sct = sign_sct(&log, 1_700_000_000_000, b"data");
+        let full = vec![sct.clone(); MAX_SCTS];
+        assert_eq!(
+            parse_sct_list(&serialize_sct_list(&full)).unwrap().len(),
+            MAX_SCTS
+        );
+        let over = vec![sct; MAX_SCTS + 1];
+        assert_eq!(
+            parse_sct_list(&serialize_sct_list(&over)).unwrap_err(),
+            Error::Malformed
+        );
+    }
+
+    #[test]
     fn standalone_x509_sct_accepts_and_rejects() {
         let (_issuer, leaf) = issue_issuer_and_leaf();
         let leaf_der = leaf.to_der().to_vec();
@@ -783,12 +817,29 @@ mod tests {
         let dup = embed(&[sign_for(&log_a, ts), sign_for(&log_a, ts + 1)]);
         let logs = vec![log_a.log.clone(), log_b.log.clone()];
         let (results, distinct) = verify_embedded_scts(&dup, &issuer, &logs, now).unwrap();
-        // Both elements verify individually...
+        // The first verifies; the second speaks for a log already counted
+        // and is not verified again (it would verify, but cannot add a log).
         assert_eq!(
             results,
-            vec![SctVerification::Valid, SctVerification::Valid]
+            vec![SctVerification::Valid, SctVerification::DuplicateLog]
         );
-        // ...but they speak for a single log.
+        assert_eq!(distinct, 1);
+        // A bad-signature duplicate of a counted log is likewise skipped,
+        // while a bad signature from a log not yet counted is reported.
+        let mut bad_a = sign_for(&log_a, ts + 1);
+        bad_a.signature[0] ^= 0x80;
+        let mut bad_b = sign_for(&log_b, ts);
+        bad_b.signature[0] ^= 0x80;
+        let mixed = embed(&[sign_for(&log_a, ts), bad_a, bad_b]);
+        let (results, distinct) = verify_embedded_scts(&mixed, &issuer, &logs, now).unwrap();
+        assert_eq!(
+            results,
+            vec![
+                SctVerification::Valid,
+                SctVerification::DuplicateLog,
+                SctVerification::BadSignature
+            ]
+        );
         assert_eq!(distinct, 1);
 
         // Two genuinely different logs do reach 2.
