@@ -110,13 +110,32 @@ impl Drop for Ticket12Plaintext {
 }
 
 impl Ticket12Plaintext {
-    /// Serialises the plaintext layout described in the module docs.
+    /// Largest client leaf the `leaf_len: u16` field can carry. An issuer
+    /// whose authenticated client leaf is longer must not mint a ticket at
+    /// all (see `ServerConnection12::emit_session_ticket`): `encode` cannot
+    /// record it, and a ticket without it would resume an authenticated
+    /// session as an anonymous one.
+    pub(crate) const MAX_CLIENT_LEAF_LEN: usize = u16::MAX as usize;
+
+    /// Largest client leaf a ticket carrying an `alpn_len`-byte ALPN can
+    /// record and still fit the `NewSessionTicket.ticket<0..2^16-1>` field
+    /// once sealed (`nonce ‖ plaintext ‖ tag`). Tighter than
+    /// [`MAX_CLIENT_LEAF_LEN`](Self::MAX_CLIENT_LEAF_LEN), and the bound an
+    /// issuer must apply: a sealed ticket past the u16 trips the encoder's
+    /// length assertion.
+    pub(crate) const fn max_client_leaf_len(alpn_len: usize) -> usize {
+        u16::MAX as usize - NONCE_LEN - TAG_LEN - MIN_PLAIN_LEN - 2 - alpn_len
+    }
+
+    /// Serialises the plaintext layout described in the module docs. A
+    /// `client_leaf` longer than [`Self::MAX_CLIENT_LEAF_LEN`] is omitted
+    /// (`client_auth = 0`) — the issuer checks that bound first.
     pub(crate) fn encode(&self) -> Vec<u8> {
         let alpn = self.alpn.as_deref().unwrap_or(&[]);
         let leaf = self
             .client_leaf
             .as_deref()
-            .filter(|l| l.len() <= u16::MAX as usize);
+            .filter(|l| l.len() <= Self::MAX_CLIENT_LEAF_LEN);
         let mut out =
             Vec::with_capacity(MIN_PLAIN_LEN + alpn.len() + 2 + leaf.map_or(0, |l| l.len()));
         out.push(TICKET12_FORMAT);
@@ -275,6 +294,45 @@ mod tests {
         assert!(!dec.ems_used);
         assert_eq!(dec.alpn.as_deref(), Some(b"h2".as_ref()));
         assert_eq!(dec.client_leaf.as_deref(), Some([0x30u8; 40].as_ref()));
+    }
+
+    /// T12-F3: the u16 `leaf_len` carries exactly up to
+    /// `MAX_CLIENT_LEAF_LEN` bytes; one byte more cannot be recorded and the
+    /// encoder drops the leaf (`client_auth = 0`) — which is why the issuer
+    /// must check the bound and refuse to mint such a ticket (see
+    /// `ServerConnection12::emit_session_ticket`).
+    #[test]
+    fn plaintext_client_leaf_bound() {
+        let at_max = Ticket12Plaintext {
+            cipher_suite: 0xC02F,
+            master_secret: [0x3c; 48],
+            creation_time: 1,
+            ems_used: true,
+            alpn: None,
+            client_leaf: Some(alloc::vec![0x30u8; Ticket12Plaintext::MAX_CLIENT_LEAF_LEN]),
+        };
+        let dec = Ticket12Plaintext::decode(&at_max.encode()).unwrap();
+        assert_eq!(
+            dec.client_leaf.as_ref().map(Vec::len),
+            Some(Ticket12Plaintext::MAX_CLIENT_LEAF_LEN)
+        );
+
+        let over = Ticket12Plaintext {
+            cipher_suite: 0xC02F,
+            master_secret: [0x3c; 48],
+            creation_time: 1,
+            ems_used: true,
+            alpn: None,
+            client_leaf: Some(alloc::vec![
+                0x30u8;
+                Ticket12Plaintext::MAX_CLIENT_LEAF_LEN + 1
+            ]),
+        };
+        let dec = Ticket12Plaintext::decode(&over.encode()).unwrap();
+        assert!(
+            dec.client_leaf.is_none(),
+            "oversized leaf cannot be recorded"
+        );
     }
 
     #[test]

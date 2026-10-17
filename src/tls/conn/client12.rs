@@ -1455,13 +1455,18 @@ impl ClientConnection12 {
     /// `use_context = 0`; `context = Some(_)` matches `use_context = 1`. An
     /// empty `Some(&[])` is *not* equivalent to `None`. Returns
     /// `Err(InappropriateState)` before the handshake completes (i.e. before
-    /// the master secret has been derived).
+    /// the master secret has been derived), and `Err(IllegalParameter)` for a
+    /// context longer than 65 535 bytes — the `uint16` length prefix cannot
+    /// encode it.
     pub fn tls_exporter(
         &self,
         label: &[u8],
         context: Option<&[u8]>,
         out: &mut [u8],
     ) -> Result<(), Error> {
+        if context.is_some_and(|c| c.len() > u16::MAX as usize) {
+            return Err(Error::IllegalParameter);
+        }
         let master = self.master.as_ref().ok_or(Error::InappropriateState)?;
         let suite = self.suite.ok_or(Error::InappropriateState)?;
         let sr = self.server_random.ok_or(Error::InappropriateState)?;

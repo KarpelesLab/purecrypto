@@ -7413,7 +7413,7 @@ mod tls12_loopback_tests {
                     return; // everything after is encrypted
                 }
                 if rec.content_type == crate::tls::ContentType::Handshake {
-                    let mut cur = ReadCursor::new(&rec.fragment);
+                    let mut cur = ReadCursor::new(rec.fragment);
                     while let Ok((ty, body)) = crate::tls::codec::read_handshake(&mut cur) {
                         into.push((ty, body.to_vec()));
                     }
@@ -7951,6 +7951,29 @@ mod tls12_loopback_tests {
             .tls_exporter(b"EXPERIMENTAL-test", Some(&[]), &mut c_empty)
             .unwrap();
         assert_ne!(c_out, c_empty);
+
+        // T12-F4 — the context carries a uint16 length: 65 535 bytes is the
+        // largest encodable context, one more is refused on both sides
+        // rather than silently truncated to a 0-length prefix.
+        let max_ctx = alloc::vec![0x5au8; u16::MAX as usize];
+        let mut c_max = [0u8; 48];
+        let mut s_max = [0u8; 48];
+        client
+            .tls_exporter(b"EXPERIMENTAL-test", Some(&max_ctx), &mut c_max)
+            .unwrap();
+        server
+            .tls_exporter(b"EXPERIMENTAL-test", Some(&max_ctx), &mut s_max)
+            .unwrap();
+        assert_eq!(c_max, s_max);
+        let too_long = alloc::vec![0x5au8; u16::MAX as usize + 1];
+        assert!(matches!(
+            client.tls_exporter(b"EXPERIMENTAL-test", Some(&too_long), &mut c_max),
+            Err(crate::tls::Error::IllegalParameter)
+        ));
+        assert!(matches!(
+            server.tls_exporter(b"EXPERIMENTAL-test", Some(&too_long), &mut s_max),
+            Err(crate::tls::Error::IllegalParameter)
+        ));
     }
 
     /// A client offering only an unknown cipher suite is rejected with
@@ -10210,6 +10233,103 @@ mod tls12_loopback_tests {
         assert!(!client2.is_handshaking() && !server2.is_handshaking());
         assert!(client2.did_resume() && server2.did_resume());
         assert!(!client2.ems_negotiated() && !server2.ems_negotiated());
+    }
+
+    /// T12-F2 — RFC 7627 §5.3: a legacy (no-EMS) ticket presented by a
+    /// ClientHello that offers EMS "MUST NOT" be resumed, but the server
+    /// "SHOULD fall back to a full handshake" rather than abort — the client
+    /// upgraded, which is not an attack (the attack direction, an EMS ticket
+    /// with the extension stripped, still aborts: see
+    /// `tls12_resumption_cross_ems_aborts`). The server used to send
+    /// `illegal_parameter` here. Phase 1 issues a legacy ticket (server
+    /// forced not to echo EMS); phase 2 presents it to a server that does
+    /// echo EMS: a full EMS handshake completes and nothing resumed.
+    // Session tickets need a wall clock (see `tls12_resumption_legacy_to_legacy`).
+    #[cfg(feature = "std")]
+    #[test]
+    fn tls12_legacy_ticket_with_ems_hello_falls_back_to_full_handshake() {
+        let ticket_key = [0x77u8; 32];
+
+        let (server_config, cert_der) = rsa_server12();
+        let server_config = server_config
+            .with_ticket_key(ticket_key)
+            .with_require_ems(false);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der.clone()).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"legacy-up-1c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"legacy-up-1s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            client_config12(roots).with_require_ems(false),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        server.test_force_no_ems = true;
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.ems_negotiated() && !server.ems_negotiated());
+        let session = client.take_session().expect("ticket");
+        assert!(!session.ems_used);
+
+        // Phase 2: the server now supports EMS (no forcing) and the client
+        // offers it as always.
+        let (server_config2, _) = rsa_server12();
+        let server_config2 = server_config2
+            .with_ticket_key(ticket_key)
+            .with_require_ems(false);
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(cert_der).unwrap();
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"legacy-up-2c", b"nonce", &[]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"legacy-up-2s", b"nonce", &[]);
+        let mut client2 = ClientConnection12::new_with_offer(
+            client_config12(roots2)
+                .with_session(session)
+                .with_require_ems(false),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection12::new(server_config2, srng2);
+        for _ in 0..16 {
+            let c = client2.write_tls();
+            if !c.is_empty() {
+                server2.read_tls(&c);
+                server2
+                    .process_new_packets()
+                    .expect("legacy ticket + EMS hello must not abort");
+            }
+            let s = server2.write_tls();
+            if !s.is_empty() {
+                client2.read_tls(&s);
+                client2.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client2.is_handshaking() && !server2.is_handshaking());
+        assert!(
+            !client2.did_resume() && !server2.did_resume(),
+            "a no-EMS session must not resume under EMS"
+        );
+        assert!(client2.ems_negotiated() && server2.ems_negotiated());
+        assert_eq!(client2.master_secret(), server2.master_secret());
     }
 
     /// An RSA-CA-signed P-256 leaf, returning the server config (chain

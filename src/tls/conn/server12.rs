@@ -202,6 +202,18 @@ pub(crate) struct ClientAuthPolicy12 {
     pub required: bool,
 }
 
+// The ticket key seals (and unseals) every RFC 5077 ticket this server
+// issues: a leak lets an attacker mint tickets and recover their master
+// secrets, so scrub it when the configuration is dropped — as the TLS 1.3
+// `ServerConfig` does, and as the `Secret32` it is copied out of would.
+impl Drop for ServerConfig12 {
+    fn drop(&mut self) {
+        if let Some(key) = self.ticket_key.as_mut() {
+            super::wipe(key);
+        }
+    }
+}
+
 impl ServerConfig12 {
     /// Shared constructor: a default TLS 1.2 configuration presenting
     /// `cert_chain` and signing with `key`. The `with_*` helpers differ only
@@ -833,8 +845,8 @@ impl<R: RngCore> ServerConnection12<R> {
     /// RFC 5705 §4 — TLS 1.2 application-layer Exporter. Derives `out.len()`
     /// bytes of keying material from the negotiated `master_secret` under
     /// `(label, context)`. See the [`ClientConnection12::tls_exporter`]
-    /// counterpart for the formula and the no-context vs empty-context
-    /// distinction.
+    /// counterpart for the formula, the no-context vs empty-context
+    /// distinction and the context length bound.
     ///
     /// [`ClientConnection12::tls_exporter`]: super::client12::ClientConnection12::tls_exporter
     #[allow(dead_code)] // introspection not yet surfaced by the public connection wrapper
@@ -844,6 +856,12 @@ impl<R: RngCore> ServerConnection12<R> {
         context: Option<&[u8]>,
         out: &mut [u8],
     ) -> Result<(), Error> {
+        // RFC 5705 §4: the context is length-prefixed as a uint16 inside the
+        // PRF seed; a longer one cannot be encoded (and would be silently
+        // truncated to its low 16 bits of length).
+        if context.is_some_and(|c| c.len() > u16::MAX as usize) {
+            return Err(Error::IllegalParameter);
+        }
         let master = self.master.as_ref().ok_or(Error::InappropriateState)?;
         let suite = self.suite.ok_or(Error::InappropriateState)?;
         let cr = self.client_random.ok_or(Error::InappropriateState)?;
@@ -1502,17 +1520,25 @@ impl<R: RngCore> ServerConnection12<R> {
             .filter(|t| !t.is_empty())
             .and_then(|t| self.try_resume(t, &ch.cipher_suites));
 
-        if let Some(rs) = resume {
-            // RFC 7627 §5.3: a session that used EMS MUST resume with EMS,
-            // and a session that did NOT use EMS MUST NOT resume with EMS.
-            // The current handshake's EMS status (`self.ems_negotiated`)
-            // is set by the client's CH extension and the server's
-            // willingness to echo; mismatch is a downgrade attempt and
-            // we abort.
-            if rs.ems_used != self.ems_negotiated {
-                return Err(Error::IllegalParameter);
-            }
+        // RFC 7627 §5.3, with the current handshake's EMS status
+        // (`self.ems_negotiated`) set from the client's CH extension and our
+        // willingness to echo it:
+        //  - a session that used EMS and a ClientHello without it: the
+        //    server "MUST abort the handshake" — an attacker stripping the
+        //    extension to drive the session back to the legacy derivation;
+        //  - a session that did NOT use EMS and a ClientHello offering it:
+        //    the server "MUST NOT resume the session" but "SHOULD fall back
+        //    to a full handshake" — the client upgraded, which is not an
+        //    attack, so the ticket is simply ignored.
+        if let Some(rs) = resume.as_ref()
+            && rs.ems_used
+            && !self.ems_negotiated
+        {
+            return Err(Error::IllegalParameter);
+        }
+        let resume = resume.filter(|rs| rs.ems_used || !self.ems_negotiated);
 
+        if let Some(rs) = resume {
             // RESUMED HANDSHAKE PATH (RFC 5077 §3.4).
             self.transcript.set_alg(rs.suite.hash);
             self.transcript.update(raw);
@@ -2942,26 +2968,47 @@ impl<R: RngCore> ServerConnection12<R> {
                 return Ok(());
             }
         };
-        let plain = Ticket12Plaintext {
-            cipher_suite: suite.suite.0,
-            master_secret: *master,
-            creation_time,
-            // RFC 7627 §5.3: record the EMS status so resumption can
-            // enforce that EMS↔EMS and legacy↔legacy.
-            ems_used: self.ems_negotiated,
-            alpn: self.alpn_negotiated.clone(),
-            // Record the authenticated client leaf (if any) so a resumed
-            // handshake can prove it was client-authenticated and restore
-            // `peer_certificates()`.
-            client_leaf: self.client_cert_chain.first().cloned(),
+        // Record the authenticated client leaf (if any) so a resumed
+        // handshake can prove it was client-authenticated and restore
+        // `peer_certificates()`. The ticket format carries it under a u16
+        // length; a leaf that does not fit cannot be recorded, and a ticket
+        // that silently dropped it would resume an authenticated session as
+        // an anonymous one (or, on a listener requiring client auth, be
+        // refused and fall back anyway). Issue no usable ticket instead:
+        // RFC 5077 §3.3 — having promised one in the ServerHello, send a
+        // zero-length ticket, which the client discards.
+        // The bound is the sealed ticket's: `NewSessionTicket.ticket` is a
+        // `<0..2^16-1>` too, and a leaf that fits the plaintext's `leaf_len`
+        // but pushes `nonce ‖ plaintext ‖ tag` past 65 535 bytes would trip
+        // the record encoder's length assertion.
+        let client_leaf = self.client_cert_chain.first().cloned();
+        let alpn_len = self.alpn_negotiated.as_ref().map_or(0, Vec::len);
+        let ticket = if client_leaf
+            .as_ref()
+            .is_some_and(|l| l.len() > Ticket12Plaintext::max_client_leaf_len(alpn_len))
+        {
+            super::wipe(&mut key);
+            Vec::new()
+        } else {
+            let plain = Ticket12Plaintext {
+                cipher_suite: suite.suite.0,
+                master_secret: *master,
+                creation_time,
+                // RFC 7627 §5.3: record the EMS status so resumption can
+                // enforce that EMS↔EMS and legacy↔legacy.
+                ems_used: self.ems_negotiated,
+                alpn: self.alpn_negotiated.clone(),
+                client_leaf,
+            };
+            // `encode()` serialises the master secret into a transient
+            // buffer; scrub it once the AEAD-sealed ticket has been
+            // produced. (`plain` itself wipes on drop.)
+            let mut plain_bytes = plain.encode();
+            let ticket = seal_ticket(&mut self.rng, &key, &plain_bytes);
+            super::wipe(&mut plain_bytes);
+            super::wipe(&mut key);
+            ticket
         };
-        // `encode()` serialises the master secret into a transient buffer;
-        // scrub it once the AEAD-sealed ticket has been produced. (`plain`
-        // itself wipes on drop.)
-        let mut plain_bytes = plain.encode();
-        let ticket = seal_ticket(&mut self.rng, &key, &plain_bytes);
-        super::wipe(&mut plain_bytes);
-        super::wipe(&mut key);
         let nst = NewSessionTicket12 {
             lifetime: self.config.ticket_lifetime,
             ticket,
@@ -3975,6 +4022,64 @@ mod tests {
 
     fn ticket_engine(config: ServerConfig12) -> ServerConnection12<HmacDrbg<Sha256>> {
         ServerConnection12::new(config, HmacDrbg::<Sha256>::new(b"ticket-s12", b"n", &[]))
+    }
+
+    /// T12-F3: an authenticated client whose leaf exceeds the ticket format's
+    /// u16 `leaf_len` cannot be recorded in a ticket, and a ticket without the
+    /// leaf would resume the session as anonymous. `emit_session_ticket` must
+    /// then send the RFC 5077 §3.3 zero-length ticket (the ServerHello already
+    /// promised one) instead of a usable ticket with `client_auth = 0`. A leaf
+    /// at the bound still gets a real ticket.
+    #[test]
+    fn tls12_ticket_not_issued_for_an_oversized_client_leaf() {
+        use crate::tls::codec::{hs_type, read_record};
+        use crate::x509::Time;
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let suite = lookup_suite_12(TICKET_SUITE).unwrap();
+        let nst_ticket_len = |engine: &mut ServerConnection12<HmacDrbg<Sha256>>| {
+            engine.emit_session_ticket(suite, &[0x5au8; 48]).unwrap();
+            let out = engine.write_tls();
+            // A 64 KiB NST spans several plaintext records: reassemble.
+            let mut body = Vec::new();
+            let mut rest = &out[..];
+            while let Some(rec) = read_record(rest).unwrap() {
+                body.extend_from_slice(rec.fragment);
+                rest = &rest[rec.len..];
+            }
+            assert_eq!(body[0], hs_type::NEW_SESSION_TICKET);
+            // body: type(1) len(3) lifetime(4) ticket_len(2) ticket
+            let ticket_len = u16::from_be_bytes([body[8], body[9]]) as usize;
+            assert_eq!(body.len(), 10 + ticket_len);
+            ticket_len
+        };
+
+        let mut engine = ticket_engine(
+            test_rsa_server_config()
+                .with_ticket_key([0x44u8; 32])
+                .with_verification_time(now.clone()),
+        );
+        // One byte past the sealed-ticket bound (which is tighter than the
+        // plaintext's `leaf_len`): used to panic in the NST encoder.
+        let max_leaf = Ticket12Plaintext::max_client_leaf_len(0);
+        assert!(max_leaf < Ticket12Plaintext::MAX_CLIENT_LEAF_LEN);
+        engine.client_cert_chain = alloc::vec![alloc::vec![0x30u8; max_leaf + 1]];
+        assert_eq!(
+            nst_ticket_len(&mut engine),
+            0,
+            "oversized leaf: empty ticket"
+        );
+
+        let mut engine = ticket_engine(
+            test_rsa_server_config()
+                .with_ticket_key([0x44u8; 32])
+                .with_verification_time(now),
+        );
+        engine.client_cert_chain = alloc::vec![alloc::vec![0x30u8; max_leaf]];
+        assert_eq!(
+            nst_ticket_len(&mut engine),
+            u16::MAX as usize,
+            "leaf at the bound: the largest encodable ticket"
+        );
     }
 
     /// A ticket issued by a listener that trusts client-auth root A must NOT
