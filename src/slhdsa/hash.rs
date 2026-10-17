@@ -55,8 +55,41 @@ fn seeded<D: Digest>(seed: &[u8]) -> D {
     h
 }
 
+/// SHAKE256's rate in bytes.
+const SHAKE256_RATE: usize = 136;
+
 /// `SHAKE256(parts...)` into `out`.
+///
+/// Every `F` / `H` / `PRF` preimage (`2n + 32` to `3n + 32 ≤ 128` bytes) and
+/// its `n`-byte output fit one rate block, so those take a single-permutation
+/// path: pad the block, load it as the fresh sponge state, permute, read
+/// `out` — no sponge bookkeeping. Longer inputs (`T`, `H_msg`, `PRF_msg`)
+/// or outputs go through the general sponge.
 fn shake(parts: &[&[u8]], out: &mut [u8]) {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    if total < SHAKE256_RATE && out.len() <= SHAKE256_RATE {
+        let mut block = [0u8; SHAKE256_RATE];
+        let mut off = 0;
+        for p in parts {
+            block[off..off + p.len()].copy_from_slice(p);
+            off += p.len();
+        }
+        block[off] = 0x1F;
+        block[SHAKE256_RATE - 1] |= 0x80;
+        let mut st = [0u64; 25];
+        for (lane, chunk) in st.iter_mut().zip(block.chunks_exact(8)) {
+            *lane = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        crate::hash::keccak::keccak_p(&mut st, 24);
+        for (o, lane) in out.chunks_mut(8).zip(st.iter()) {
+            o.copy_from_slice(&lane.to_le_bytes()[..o.len()]);
+        }
+        // The preimage may carry SK.seed / SK.prf or a secret chain value,
+        // and the state is a function of it.
+        crate::zeroize::Zeroize::zeroize(&mut block);
+        crate::zeroize::Zeroize::zeroize(&mut st);
+        return;
+    }
     let mut h = Shake256::new();
     for p in parts {
         h.update(p);

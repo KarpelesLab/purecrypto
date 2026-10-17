@@ -30,6 +30,39 @@ fn to_byte(x: u64, outlen: usize, out: &mut [u8]) {
     }
 }
 
+/// SHAKE of `parts` into `out` when both fit one `RATE`-byte block (every
+/// `F` / `H` / `PRF` / `PRF_keygen` preimage is at most `pad + 3n ≤ 128`
+/// bytes and `n ≤ 32`): pad the block, load it as the fresh sponge state,
+/// permute once, read `out` — no sponge bookkeeping. Returns `false` (and
+/// does nothing) when the input or output is too long for the fast path.
+fn shake_block<const RATE: usize>(parts: &[&[u8]], out: &mut [u8]) -> bool {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    if total >= RATE || out.len() > RATE {
+        return false;
+    }
+    let mut block = [0u8; RATE];
+    let mut off = 0;
+    for p in parts {
+        block[off..off + p.len()].copy_from_slice(p);
+        off += p.len();
+    }
+    block[off] = 0x1F;
+    block[RATE - 1] |= 0x80;
+    let mut st = [0u64; 25];
+    for (lane, chunk) in st.iter_mut().zip(block.chunks_exact(8)) {
+        *lane = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    crate::hash::keccak::keccak_p(&mut st, 24);
+    for (o, lane) in out.chunks_mut(8).zip(st.iter()) {
+        o.copy_from_slice(&lane.to_le_bytes()[..o.len()]);
+    }
+    // The preimage may carry SK_SEED (PRF_keygen) or a secret chain value
+    // (F), and the state is a function of it.
+    crate::zeroize::Zeroize::zeroize(&mut block);
+    crate::zeroize::Zeroize::zeroize(&mut st);
+    true
+}
+
 /// The raw hash primitive for the family, producing `n` bytes from the
 /// concatenated `parts`.
 fn core_hash(p: &Params, parts: &[&[u8]], out: &mut [u8]) {
@@ -44,6 +77,9 @@ fn core_hash(p: &Params, parts: &[&[u8]], out: &mut [u8]) {
             out[..n].copy_from_slice(&d.as_ref()[..n]);
         }
         HashFamily::Shake128 => {
+            if shake_block::<168>(parts, &mut out[..n]) {
+                return;
+            }
             let mut h = Shake128::new();
             for part in parts {
                 h.update(part);
@@ -51,6 +87,9 @@ fn core_hash(p: &Params, parts: &[&[u8]], out: &mut [u8]) {
             h.finalize_into(&mut out[..n]);
         }
         HashFamily::Shake256 => {
+            if shake_block::<136>(parts, &mut out[..n]) {
+                return;
+            }
             let mut h = Shake256::new();
             for part in parts {
                 h.update(part);
