@@ -7,8 +7,10 @@
 //! the formulas are complete (no exceptional cases). Scalar multiplication is a
 //! constant-time double-and-add. This is the shared point backend behind Ed448.
 
-use super::field::{Fe, Field, ScalarInt};
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
+#[cfg(test)]
+use super::field::mask_from_bit;
+use super::field::{Fe, Field, ScalarInt, eq_mask};
+use crate::ct::{Choice, ConstantTimeLess};
 
 /// A curve point in extended homogeneous coordinates `(X:Y:Z:T)` with
 /// `T = X·Y/Z`.
@@ -18,13 +20,6 @@ pub(crate) struct Point {
     pub(crate) y: Fe,
     pub(crate) z: Fe,
     pub(crate) t: Fe,
-}
-
-impl ConditionallySelectable for Fe {
-    #[inline]
-    fn conditional_select(a: &Fe, b: &Fe, choice: Choice) -> Fe {
-        Fe(<[u64; 8]>::conditional_select(&a.0, &b.0, choice))
-    }
 }
 
 impl Field {
@@ -187,13 +182,14 @@ impl Field {
             acc = self.point_double(&acc);
 
             let byte = scalar[i / 2];
-            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as usize;
-            // Constant-time gather of table[digit]: the index comparison is
-            // the branch-free `ct_eq`, not `==`, so the secret digit never
-            // feeds a compare-and-branch the compiler could emit.
+            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as u64;
+            // Constant-time gather of table[digit]: one opaque equality mask
+            // per entry (`eq_mask`, branch-free), applied across all 32
+            // limbs of the candidate, so the secret digit never feeds a
+            // compare-and-branch the compiler could emit.
             let mut sel = table[0];
             for (j, entry) in table.iter().enumerate() {
-                sel = point_select(&sel, entry, j.ct_eq(&digit));
+                sel = point_select(&sel, entry, eq_mask(j as u64, digit));
             }
             acc = self.point_add(&acc, &sel);
         }
@@ -217,7 +213,7 @@ impl Field {
             acc = self.point_double(&acc);
             let bit = (scalar[i / 8] >> (i % 8)) & 1;
             let sum = self.point_add(&acc, p);
-            acc = point_select(&acc, &sum, Choice::from(bit));
+            acc = point_select(&acc, &sum, mask_from_bit(bit as u64));
         }
         acc
     }
@@ -357,13 +353,16 @@ fn wnaf5(scalar: &[u8; 57]) -> [i8; 461] {
     naf
 }
 
-/// Constant-time point selection: `b` if `c` is set, else `a`.
-pub(crate) fn point_select(a: &Point, b: &Point, c: Choice) -> Point {
+/// Constant-time point selection: `b` if `mask` is all-ones, else `a`. The
+/// caller derives the single opaque mask ([`mask_from_bit`] / [`eq_mask`]);
+/// it is applied to all four coordinates with plain xor/and.
+#[inline]
+pub(crate) fn point_select(a: &Point, b: &Point, mask: u64) -> Point {
     Point {
-        x: Fe::conditional_select(&b.x, &a.x, c),
-        y: Fe::conditional_select(&b.y, &a.y, c),
-        z: Fe::conditional_select(&b.z, &a.z, c),
-        t: Fe::conditional_select(&b.t, &a.t, c),
+        x: Fe::select(&b.x, &a.x, mask),
+        y: Fe::select(&b.y, &a.y, mask),
+        z: Fe::select(&b.z, &a.z, mask),
+        t: Fe::select(&b.t, &a.t, mask),
     }
 }
 

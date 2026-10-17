@@ -174,7 +174,6 @@ pub(crate) fn mask_from_bit(bit: u64) -> u64 {
 
 /// An all-ones mask iff `a == b`, else all-zeros; branch-free with one
 /// barrier (via [`mask_from_bit`]).
-#[cfg(test)]
 #[inline]
 pub(crate) fn eq_mask(a: u64, b: u64) -> u64 {
     let x = a ^ b;
@@ -496,7 +495,6 @@ impl Fe {
     /// `a` when `mask` is all-ones, `b` when it is all-zeros, limb by limb.
     /// The mask comes from [`mask_from_bit`] / [`eq_mask`] (one barrier per
     /// selection, shared by every limb of every coordinate it decides).
-    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn select(a: &Fe, b: &Fe, mask: u64) -> Fe {
         let mut out = [0u64; 8];
