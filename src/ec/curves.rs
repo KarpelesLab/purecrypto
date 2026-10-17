@@ -1,7 +1,7 @@
 //! The set of supported elliptic curves and their parameters.
 
 use super::uint_from_be_hex;
-use super::weierstrass::{Curve, CurveParams, Fixed};
+use super::weierstrass::{Curve, CurveParams, Engine};
 #[cfg(test)]
 use crate::bignum::BoxedUint;
 use crate::bignum::Uint;
@@ -313,34 +313,34 @@ impl CurveId {
         }
     }
 
-    /// The arithmetic for this curve: a `&'static` handle to its
-    /// monomorphised engine (see [`weierstrass`](super::weierstrass)). Free
-    /// to call — every parameter is a compile-time constant.
+    /// The arithmetic for this curve: its `static` engine (see
+    /// [`weierstrass`](super::weierstrass)), built at compile time, so this
+    /// is free to call.
     pub(crate) fn curve(self) -> &'static dyn Curve {
         match self {
-            CurveId::P256 => &Fixed::<P256Params, 4>::INSTANCE,
-            CurveId::P384 => &Fixed::<P384Params, 6>::INSTANCE,
-            CurveId::P521 => &Fixed::<P521Params, 9>::INSTANCE,
-            CurveId::Secp256k1 => &Fixed::<Secp256k1Params, 4>::INSTANCE,
-            CurveId::Sm2p256v1 => &Fixed::<Sm2p256v1Params, 4>::INSTANCE,
-            CurveId::BrainpoolP256r1 => &Fixed::<BrainpoolP256r1Params, 4>::INSTANCE,
-            CurveId::BrainpoolP384r1 => &Fixed::<BrainpoolP384r1Params, 6>::INSTANCE,
-            CurveId::BrainpoolP512r1 => &Fixed::<BrainpoolP512r1Params, 8>::INSTANCE,
+            CurveId::P256 => &P256_ENGINE,
+            CurveId::P384 => &P384_ENGINE,
+            CurveId::P521 => &P521_ENGINE,
+            CurveId::Secp256k1 => &SECP256K1_ENGINE,
+            CurveId::Sm2p256v1 => &SM2P256V1_ENGINE,
+            CurveId::BrainpoolP256r1 => &BRAINPOOL_P256R1_ENGINE,
+            CurveId::BrainpoolP384r1 => &BRAINPOOL_P384R1_ENGINE,
+            CurveId::BrainpoolP512r1 => &BRAINPOOL_P512R1_ENGINE,
             #[cfg(feature = "legacy-ec")]
-            CurveId::Secp160k1 => &Fixed::<Secp160k1Params, 3>::INSTANCE,
+            CurveId::Secp160k1 => &SECP160K1_ENGINE,
             #[cfg(feature = "legacy-ec")]
-            CurveId::Secp160r1 => &Fixed::<Secp160r1Params, 3>::INSTANCE,
+            CurveId::Secp160r1 => &SECP160R1_ENGINE,
             #[cfg(feature = "legacy-ec")]
-            CurveId::Secp160r2 => &Fixed::<Secp160r2Params, 3>::INSTANCE,
+            CurveId::Secp160r2 => &SECP160R2_ENGINE,
             #[cfg(feature = "legacy-ec")]
-            CurveId::Secp192k1 => &Fixed::<Secp192k1Params, 3>::INSTANCE,
+            CurveId::Secp192k1 => &SECP192K1_ENGINE,
             #[cfg(feature = "legacy-ec")]
-            CurveId::P192 => &Fixed::<P192Params, 3>::INSTANCE,
+            CurveId::P192 => &P192_ENGINE,
             #[cfg(feature = "legacy-ec")]
-            CurveId::Secp224k1 => &Fixed::<Secp224k1Params, 4>::INSTANCE,
-            CurveId::P224 => &Fixed::<P224Params, 4>::INSTANCE,
-            CurveId::BrainpoolP224r1 => &Fixed::<BrainpoolP224r1Params, 4>::INSTANCE,
-            CurveId::BrainpoolP320r1 => &Fixed::<BrainpoolP320r1Params, 5>::INSTANCE,
+            CurveId::Secp224k1 => &SECP224K1_ENGINE,
+            CurveId::P224 => &P224_ENGINE,
+            CurveId::BrainpoolP224r1 => &BRAINPOOL_P224R1_ENGINE,
+            CurveId::BrainpoolP320r1 => &BRAINPOOL_P320R1_ENGINE,
         }
     }
 
@@ -432,10 +432,11 @@ impl CurveId {
     }
 }
 
-/// Declares the [`CurveParams`] marker type of one curve over `L` limbs,
-/// decoding its hex parameters at compile time.
+/// Declares the [`CurveParams`] marker type of one curve over `L` limbs
+/// (decoding its hex parameters at compile time) and the `static`
+/// [`Engine`] built from it.
 macro_rules! curve_params {
-    ($(#[$meta:meta])* $name:ident, $id:expr, $limbs:literal) => {
+    ($(#[$meta:meta])* $name:ident, $engine:ident, $id:expr, $limbs:literal) => {
         $(#[$meta])*
         #[derive(Clone, Copy)]
         pub(crate) struct $name;
@@ -448,58 +449,91 @@ macro_rules! curve_params {
             const GY: Uint<$limbs> = uint_from_be_hex($id.params().gy);
             const N: Uint<$limbs> = uint_from_be_hex($id.params().n);
         }
+        $(#[$meta])*
+        static $engine: Engine<$limbs> = Engine::new::<$name>();
     };
 }
 
 // The limb count covers the wider of `p` and `n` (the four curves whose
 // order outgrows the field by a bit still round to the field's limb count).
-curve_params!(P256Params, CurveId::P256, 4);
-curve_params!(P384Params, CurveId::P384, 6);
-curve_params!(P521Params, CurveId::P521, 9);
-curve_params!(Secp256k1Params, CurveId::Secp256k1, 4);
-curve_params!(Sm2p256v1Params, CurveId::Sm2p256v1, 4);
-curve_params!(BrainpoolP256r1Params, CurveId::BrainpoolP256r1, 4);
-curve_params!(BrainpoolP384r1Params, CurveId::BrainpoolP384r1, 6);
-curve_params!(BrainpoolP512r1Params, CurveId::BrainpoolP512r1, 8);
+curve_params!(P256Params, P256_ENGINE, CurveId::P256, 4);
+curve_params!(P384Params, P384_ENGINE, CurveId::P384, 6);
+curve_params!(P521Params, P521_ENGINE, CurveId::P521, 9);
+curve_params!(Secp256k1Params, SECP256K1_ENGINE, CurveId::Secp256k1, 4);
+curve_params!(Sm2p256v1Params, SM2P256V1_ENGINE, CurveId::Sm2p256v1, 4);
+curve_params!(
+    BrainpoolP256r1Params,
+    BRAINPOOL_P256R1_ENGINE,
+    CurveId::BrainpoolP256r1,
+    4
+);
+curve_params!(
+    BrainpoolP384r1Params,
+    BRAINPOOL_P384R1_ENGINE,
+    CurveId::BrainpoolP384r1,
+    6
+);
+curve_params!(
+    BrainpoolP512r1Params,
+    BRAINPOOL_P512R1_ENGINE,
+    CurveId::BrainpoolP512r1,
+    8
+);
 curve_params!(
     #[cfg(feature = "legacy-ec")]
     Secp160k1Params,
+    SECP160K1_ENGINE,
     CurveId::Secp160k1,
     3
 );
 curve_params!(
     #[cfg(feature = "legacy-ec")]
     Secp160r1Params,
+    SECP160R1_ENGINE,
     CurveId::Secp160r1,
     3
 );
 curve_params!(
     #[cfg(feature = "legacy-ec")]
     Secp160r2Params,
+    SECP160R2_ENGINE,
     CurveId::Secp160r2,
     3
 );
 curve_params!(
     #[cfg(feature = "legacy-ec")]
     Secp192k1Params,
+    SECP192K1_ENGINE,
     CurveId::Secp192k1,
     3
 );
 curve_params!(
     #[cfg(feature = "legacy-ec")]
     P192Params,
+    P192_ENGINE,
     CurveId::P192,
     3
 );
 curve_params!(
     #[cfg(feature = "legacy-ec")]
     Secp224k1Params,
+    SECP224K1_ENGINE,
     CurveId::Secp224k1,
     4
 );
-curve_params!(P224Params, CurveId::P224, 4);
-curve_params!(BrainpoolP224r1Params, CurveId::BrainpoolP224r1, 4);
-curve_params!(BrainpoolP320r1Params, CurveId::BrainpoolP320r1, 5);
+curve_params!(P224Params, P224_ENGINE, CurveId::P224, 4);
+curve_params!(
+    BrainpoolP224r1Params,
+    BRAINPOOL_P224R1_ENGINE,
+    CurveId::BrainpoolP224r1,
+    4
+);
+curve_params!(
+    BrainpoolP320r1Params,
+    BRAINPOOL_P320R1_ENGINE,
+    CurveId::BrainpoolP320r1,
+    5
+);
 
 /// Decodes a big-endian hex string (ASCII whitespace ignored) into a
 /// [`BoxedUint`].

@@ -3,13 +3,16 @@
 //! Every supported prime-order curve is a [`CurveParams`] implementor: a
 //! zero-sized marker type whose associated constants are the field modulus,
 //! coefficients, generator and order (plus the Montgomery constants derived
-//! from them at compile time). [`Fixed<C, L>`] is the arithmetic engine,
-//! monomorphised per curve over `L`-limb [`Uint`] field elements, so the
-//! modulus is an immediate in the Montgomery multiplication and no point
-//! operation allocates. The object-safe [`Curve`] trait is the
-//! `BoxedUint`-at-the-boundary view the [`boxed`](super::boxed) and
-//! [`sm2`](super::sm2) layers use; [`CurveId::curve`] hands out the
-//! `&'static dyn Curve` for a curve, which dispatches into its instance.
+//! from them at compile time). [`Engine<L>`] is the arithmetic over
+//! `L`-limb [`Uint`] field elements on the stack: its formulas, ladders and
+//! inversions are instantiated once per limb width and read the curve's
+//! parameters as data, while the field multiplication — the hot kernel — is
+//! instantiated per curve with the modulus as immediates and reached
+//! through a function pointer. No point operation allocates. The
+//! object-safe [`Curve`] trait is the `BoxedUint`-at-the-boundary view the
+//! [`boxed`](super::boxed) and [`sm2`](super::sm2) layers use;
+//! [`CurveId::curve`](super::curves::CurveId::curve) hands out the
+//! `&'static dyn Curve` for a curve.
 //!
 //! Point addition uses the Renes–Costello–Batina **complete** formulas
 //! (Algorithms 1 / 3 for general `a`, 4 / 6 for `a = −3`, 7 / 9 for
@@ -19,7 +22,6 @@
 use crate::bignum::{BoxedUint, Limb, MontModulus, Uint};
 use crate::ct::{Choice, ConstantTimeEq};
 use crate::zeroize::Zeroize;
-use core::marker::PhantomData;
 
 /// Limbs of the widest field (P-521: 521 bits → 9 × 64).
 pub(crate) const MAX_LIMBS: usize = 9;
@@ -37,7 +39,8 @@ pub(crate) enum ACoeff {
 }
 
 /// The parameters of one prime-order short-Weierstrass curve
-/// `y² = x³ + a·x + b (mod p)` over `L` limbs, as compile-time constants.
+/// `y² = x³ + a·x + b (mod p)` over `L` limbs, as compile-time constants
+/// (the source [`Engine::new`] builds an engine from).
 ///
 /// Implementors give the six SEC 1 parameters; everything else has a
 /// default computed from them at compile time (the Montgomery constants via
@@ -61,7 +64,7 @@ pub(crate) trait CurveParams<const L: usize>: 'static + Sync {
     /// Which RCB formulas `a` admits.
     const A_KIND: ACoeff = a_kind(&Self::P, &Self::A);
     /// Montgomery context for `p` — used at compile time only, to derive the
-    /// constants below; the runtime field kernel takes `P` and `P_INV` as
+    /// constants below; the field kernel takes `P` and `P_INV` as
     /// immediates.
     const FP: MontModulus<L> = MontModulus::new(Self::P);
     /// Montgomery context for `n` (compile time only, as `FP`).
@@ -342,58 +345,138 @@ impl<const L: usize> Point<L> {
     }
 }
 
-/// The arithmetic engine for curve `C` over `L` limbs. Zero-sized: every
-/// parameter is an associated constant of `C`.
-pub(crate) struct Fixed<C, const L: usize>(PhantomData<C>);
-
 /// Maximum width of a width-5 wNAF recoding (`64·MAX_LIMBS` bits plus the
 /// carry digit).
 const MAX_NAF: usize = 64 * MAX_LIMBS + 1;
 
-impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
-    /// The engine instance (stateless).
-    pub(crate) const INSTANCE: Self = Fixed(PhantomData);
+/// The field multiplication of curve `C`, with its modulus as immediates:
+/// the one piece of the engine instantiated per curve (reached through the
+/// function pointer in [`Engine`], so every curve of one width shares the
+/// formulas, ladders and inversions).
+fn field_mul<C: CurveParams<L>, const L: usize>(a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
+    mont_mul(a, b, &C::P, C::P_INV)
+}
+
+/// A complete point addition formula of an [`Engine`].
+type AddFn<const L: usize> = fn(&Engine<L>, &Point<L>, &Point<L>) -> Point<L>;
+/// A complete point doubling formula of an [`Engine`].
+type DblFn<const L: usize> = fn(&Engine<L>, &Point<L>) -> Point<L>;
+
+/// The arithmetic engine of one curve over `L` limbs: its parameters as
+/// plain data (built at compile time from a [`CurveParams`] by
+/// [`Engine::new`]) plus the curve's const-modulus multiply. The methods
+/// are generic over the width only, so the code is shared by every curve
+/// of that width — per-curve monomorphisation of the whole engine cost a
+/// megabyte of text across the seventeen curves.
+pub(crate) struct Engine<const L: usize> {
+    p: Uint<L>,
+    n: Uint<L>,
+    /// `−n⁻¹ mod 2⁶⁴`.
+    n_inv: Limb,
+    /// `R mod p`, `R² mod p`, `R mod n`, `R² mod n`.
+    one_mont: Uint<L>,
+    r2_p: Uint<L>,
+    one_mont_n: Uint<L>,
+    r2_n: Uint<L>,
+    a: Uint<L>,
+    b: Uint<L>,
+    gx: Uint<L>,
+    gy: Uint<L>,
+    a_mont: Uint<L>,
+    b_mont: Uint<L>,
+    b3_mont: Uint<L>,
+    #[cfg(test)]
+    a_kind: ACoeff,
+    p_minus_2: Uint<L>,
+    n_minus_2: Uint<L>,
+    sqrt_exp: Uint<L>,
+    p_bits: usize,
+    n_bits: usize,
+    /// [`field_mul`] for this curve.
+    mul: fn(&Uint<L>, &Uint<L>) -> Uint<L>,
+    /// The complete addition and doubling formulas the curve's `a` admits
+    /// (RCB Algorithms 4/6, 7/9 or 1/3), chosen at compile time; a variant
+    /// no curve of this width uses is never instantiated.
+    add_fn: AddFn<L>,
+    dbl_fn: DblFn<L>,
+}
+
+impl<const L: usize> Engine<L> {
+    /// The engine of curve `C`.
+    pub(crate) const fn new<C: CurveParams<L>>() -> Self {
+        let (add_fn, dbl_fn): (AddFn<L>, DblFn<L>) = match C::A_KIND {
+            ACoeff::MinusThree => (Self::add_a_minus_3, Self::double_a_minus_3),
+            ACoeff::Zero => (Self::add_a_zero, Self::double_a_zero),
+            ACoeff::General => (Self::add_general, Self::double_general),
+        };
+        Engine {
+            p: C::P,
+            n: C::N,
+            n_inv: C::N_INV,
+            one_mont: C::ONE_MONT,
+            r2_p: C::R2_P,
+            one_mont_n: C::ONE_MONT_N,
+            r2_n: C::R2_N,
+            a: C::A,
+            b: C::B,
+            gx: C::GX,
+            gy: C::GY,
+            a_mont: C::A_MONT,
+            b_mont: C::B_MONT,
+            b3_mont: C::B3_MONT,
+            #[cfg(test)]
+            a_kind: C::A_KIND,
+            p_minus_2: C::P_MINUS_2,
+            n_minus_2: C::N_MINUS_2,
+            sqrt_exp: C::SQRT_EXP,
+            p_bits: C::P_BITS,
+            n_bits: C::N_BITS,
+            mul: field_mul::<C, L>,
+            add_fn,
+            dbl_fn,
+        }
+    }
 
     // --- field arithmetic (Montgomery form) ---------------------------------
 
-    #[inline]
-    pub(crate) fn mul(a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
-        mont_mul(a, b, &C::P, C::P_INV)
+    #[inline(always)]
+    pub(crate) fn mul(&self, a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
+        (self.mul)(a, b)
     }
 
     #[inline(always)]
-    pub(crate) fn add(a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
-        add_mod(a, b, &C::P)
+    pub(crate) fn add(&self, a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
+        add_mod(a, b, &self.p)
     }
 
     #[inline(always)]
-    fn sub(a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
-        sub_mod(a, b, &C::P)
+    fn sub(&self, a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
+        sub_mod(a, b, &self.p)
     }
 
     /// Plain residue `x < p` into Montgomery form.
     #[inline]
-    fn to_mont(x: &Uint<L>) -> Uint<L> {
-        Self::mul(x, &C::R2_P)
+    fn to_mont(&self, x: &Uint<L>) -> Uint<L> {
+        self.mul(x, &self.r2_p)
     }
 
     /// Montgomery form back to the plain residue.
     #[inline]
-    fn from_mont(x: &Uint<L>) -> Uint<L> {
-        Self::mul(x, &Uint::ONE)
+    fn to_plain(&self, x: &Uint<L>) -> Uint<L> {
+        self.mul(x, &Uint::ONE)
     }
 
-    /// `base^exp` in Montgomery form, for a **public** exponent of at most
-    /// `bits` bits: fixed 4-bit windows, the table indexed directly (the
-    /// index is a function of the public exponent alone), so the operation
-    /// sequence and access pattern never depend on the (possibly secret)
-    /// base. Every exponent here is a curve constant (`p − 2`, `n − 2`,
-    /// `(p + 1) / 4`) or derived from `p`.
-    fn pow_mont(
+    /// `base^exp` in Montgomery form under `mul` (identity `one`), for a
+    /// **public** exponent of at most `bits` bits: fixed 4-bit windows, the
+    /// table indexed directly (the index is a function of the public
+    /// exponent alone), so the operation sequence and access pattern never
+    /// depend on the (possibly secret) base. Every exponent here is a curve
+    /// constant (`p − 2`, `n − 2`, `(p + 1) / 4`) or derived from `p`.
+    fn pow_mont<F: Fn(&Uint<L>, &Uint<L>) -> Uint<L>>(
         base: &Uint<L>,
         exp: &Uint<L>,
         bits: usize,
-        mul: fn(&Uint<L>, &Uint<L>) -> Uint<L>,
+        mul: F,
         one: &Uint<L>,
     ) -> Uint<L> {
         let mut table = [*one; 16];
@@ -419,56 +502,70 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
 
     /// `x⁻¹` in Montgomery form by Fermat (`x^(p−2)`; `0 ↦ 0`), constant
     /// time in `x`.
-    fn invert_mont(x: &Uint<L>) -> Uint<L> {
-        Self::pow_mont(x, &C::P_MINUS_2, C::P_BITS, Self::mul, &C::ONE_MONT)
+    fn invert_mont(&self, x: &Uint<L>) -> Uint<L> {
+        Self::pow_mont(
+            x,
+            &self.p_minus_2,
+            self.p_bits,
+            |a, b| self.mul(a, b),
+            &self.one_mont,
+        )
     }
 
     // --- scalar (mod n) arithmetic, plain residues --------------------------
 
+    /// Montgomery multiplication modulo the order (the modulus from memory:
+    /// the scalar ring is a few operations per signature).
     #[inline]
-    fn mul_n(a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
-        mont_mul(a, b, &C::N, C::N_INV)
+    fn mul_n(&self, a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
+        mont_mul(a, b, &self.n, self.n_inv)
     }
 
     /// `a·b mod n` for plain residues `a, b < n`.
-    fn mul_mod_n(a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
+    fn mul_mod_n(&self, a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
         // mont_mul(a, b) = ab·R⁻¹; a second multiply by R² restores ab.
-        Self::mul_n(&Self::mul_n(a, b), &C::R2_N)
+        self.mul_n(&self.mul_n(a, b), &self.r2_n)
     }
 
     /// `a⁻¹ mod n` (Fermat, `n` prime), constant time in `a`.
-    fn invert_mod_n(a: &Uint<L>) -> Uint<L> {
-        let a_m = Self::mul_n(a, &C::R2_N);
-        let inv_m = Self::pow_mont(&a_m, &C::N_MINUS_2, C::N_BITS, Self::mul_n, &C::ONE_MONT_N);
-        Self::mul_n(&inv_m, &Uint::ONE)
+    fn invert_mod_n(&self, a: &Uint<L>) -> Uint<L> {
+        let a_m = self.mul_n(a, &self.r2_n);
+        let inv_m = Self::pow_mont(
+            &a_m,
+            &self.n_minus_2,
+            self.n_bits,
+            |x, y| self.mul_n(x, y),
+            &self.one_mont_n,
+        );
+        self.mul_n(&inv_m, &Uint::ONE)
     }
 
     // --- points --------------------------------------------------------------
 
     /// The identity `(0 : 1 : 0)`.
     #[inline]
-    pub(crate) fn identity() -> Point<L> {
+    pub(crate) fn identity(&self) -> Point<L> {
         Point {
             x: Uint::ZERO,
-            y: C::ONE_MONT,
+            y: self.one_mont,
             z: Uint::ZERO,
         }
     }
 
     /// Lifts affine `(x, y)` (plain residues) to projective form.
     #[inline]
-    fn lift_affine(x: &Uint<L>, y: &Uint<L>) -> Point<L> {
+    fn lift_affine(&self, x: &Uint<L>, y: &Uint<L>) -> Point<L> {
         Point {
-            x: Self::to_mont(x),
-            y: Self::to_mont(y),
-            z: C::ONE_MONT,
+            x: self.to_mont(x),
+            y: self.to_mont(y),
+            z: self.one_mont,
         }
     }
 
     /// The base point `G`.
     #[inline]
-    pub(crate) fn generator() -> Point<L> {
-        Self::lift_affine(&C::GX, &C::GY)
+    pub(crate) fn generator(&self) -> Point<L> {
+        self.lift_affine(&self.gx, &self.gy)
     }
 
     /// Affine `(x, y)` as plain residues, or `None` for the identity.
@@ -479,57 +576,51 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     /// `k ≡ 0 (mod n)` or `P` is — a degenerate scalar or peer the caller
     /// rejects as an error. The inversion is the constant-time Fermat
     /// ladder.
-    pub(crate) fn to_affine(p: &Point<L>) -> Option<(Uint<L>, Uint<L>)> {
+    pub(crate) fn to_affine(&self, p: &Point<L>) -> Option<(Uint<L>, Uint<L>)> {
         if p.z.is_zero().declassify() {
             return None;
         }
-        let mut z_inv = Self::invert_mont(&p.z);
-        let x = Self::from_mont(&Self::mul(&p.x, &z_inv));
-        let y = Self::from_mont(&Self::mul(&p.y, &z_inv));
+        let mut z_inv = self.invert_mont(&p.z);
+        let x = self.to_plain(&self.mul(&p.x, &z_inv));
+        let y = self.to_plain(&self.mul(&p.y, &z_inv));
         z_inv.zeroize();
         Some((x, y))
     }
 
     /// `-p`: `(X : −Y : Z)`.
     #[inline]
-    fn negate(p: &Point<L>) -> Point<L> {
+    fn negate(&self, p: &Point<L>) -> Point<L> {
         Point {
             x: p.x,
-            y: Self::sub(&Uint::ZERO, &p.y),
+            y: self.sub(&Uint::ZERO, &p.y),
             z: p.z,
         }
     }
 
     /// Complete projective addition `p + q`, correct for all inputs
     /// (including `p == q` and the identity), through the cheapest RCB
-    /// formula the curve's `a` admits. Which one runs is a compile-time
-    /// property of the curve.
-    pub(crate) fn point_add(p: &Point<L>, q: &Point<L>) -> Point<L> {
-        match C::A_KIND {
-            ACoeff::MinusThree => Self::add_a_minus_3(p, q),
-            ACoeff::Zero => Self::add_a_zero(p, q),
-            ACoeff::General => Self::add_general(p, q),
-        }
+    /// formula the curve's `a` admits. Which one runs is a public property
+    /// of the curve.
+    #[inline]
+    pub(crate) fn point_add(&self, p: &Point<L>, q: &Point<L>) -> Point<L> {
+        (self.add_fn)(self, p, q)
     }
 
     /// Complete doubling `2·p`, correct for all inputs including the
     /// identity: RCB Algorithm 6 (`a = −3`, 8M + 3S + 2·m_b), 9 (`a = 0`,
     /// 6M + 2S + m_3b) or 3 (any `a`), against the 12M + 5·m_a,b of
     /// `point_add(p, p)`.
-    pub(crate) fn double(p: &Point<L>) -> Point<L> {
-        match C::A_KIND {
-            ACoeff::MinusThree => Self::double_a_minus_3(p),
-            ACoeff::Zero => Self::double_a_zero(p),
-            ACoeff::General => Self::double_general(p),
-        }
+    #[inline]
+    pub(crate) fn double(&self, p: &Point<L>) -> Point<L> {
+        (self.dbl_fn)(self, p)
     }
 
     /// RCB Algorithm 4: complete addition for `a = −3`.
-    fn add_a_minus_3(p: &Point<L>, q: &Point<L>) -> Point<L> {
-        let b = &C::B_MONT;
-        let m = Self::mul;
-        let add = Self::add;
-        let sub = Self::sub;
+    fn add_a_minus_3(&self, p: &Point<L>, q: &Point<L>) -> Point<L> {
+        let b = &self.b_mont;
+        let m = |x: &Uint<L>, y: &Uint<L>| self.mul(x, y);
+        let add = |x: &Uint<L>, y: &Uint<L>| self.add(x, y);
+        let sub = |x: &Uint<L>, y: &Uint<L>| self.sub(x, y);
 
         let t0 = m(&p.x, &q.x);
         let t1 = m(&p.y, &q.y);
@@ -582,11 +673,11 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     }
 
     /// RCB Algorithm 7: complete addition for `a = 0`.
-    fn add_a_zero(p: &Point<L>, q: &Point<L>) -> Point<L> {
-        let b3 = &C::B3_MONT;
-        let m = Self::mul;
-        let add = Self::add;
-        let sub = Self::sub;
+    fn add_a_zero(&self, p: &Point<L>, q: &Point<L>) -> Point<L> {
+        let b3 = &self.b3_mont;
+        let m = |x: &Uint<L>, y: &Uint<L>| self.mul(x, y);
+        let add = |x: &Uint<L>, y: &Uint<L>| self.add(x, y);
+        let sub = |x: &Uint<L>, y: &Uint<L>| self.sub(x, y);
 
         let t0 = m(&p.x, &q.x);
         let t1 = m(&p.y, &q.y);
@@ -629,11 +720,11 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     }
 
     /// RCB Algorithm 6: complete doubling for `a = −3`.
-    fn double_a_minus_3(p: &Point<L>) -> Point<L> {
-        let b = &C::B_MONT;
-        let m = Self::mul;
-        let add = Self::add;
-        let sub = Self::sub;
+    fn double_a_minus_3(&self, p: &Point<L>) -> Point<L> {
+        let b = &self.b_mont;
+        let m = |x: &Uint<L>, y: &Uint<L>| self.mul(x, y);
+        let add = |x: &Uint<L>, y: &Uint<L>| self.add(x, y);
+        let sub = |x: &Uint<L>, y: &Uint<L>| self.sub(x, y);
 
         let t0 = m(&p.x, &p.x);
         let t1 = m(&p.y, &p.y);
@@ -677,11 +768,11 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     }
 
     /// RCB Algorithm 9: complete doubling for `a = 0`.
-    fn double_a_zero(p: &Point<L>) -> Point<L> {
-        let b3 = &C::B3_MONT;
-        let m = Self::mul;
-        let add = Self::add;
-        let sub = Self::sub;
+    fn double_a_zero(&self, p: &Point<L>) -> Point<L> {
+        let b3 = &self.b3_mont;
+        let m = |x: &Uint<L>, y: &Uint<L>| self.mul(x, y);
+        let add = |x: &Uint<L>, y: &Uint<L>| self.add(x, y);
+        let sub = |x: &Uint<L>, y: &Uint<L>| self.sub(x, y);
 
         let t0 = m(&p.y, &p.y);
         let z3 = add(&t0, &t0);
@@ -709,12 +800,12 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     }
 
     /// RCB Algorithm 3: complete doubling for any `a`.
-    fn double_general(p: &Point<L>) -> Point<L> {
-        let a = &C::A_MONT;
-        let b3 = &C::B3_MONT;
-        let m = Self::mul;
-        let add = Self::add;
-        let sub = Self::sub;
+    fn double_general(&self, p: &Point<L>) -> Point<L> {
+        let a = &self.a_mont;
+        let b3 = &self.b3_mont;
+        let m = |x: &Uint<L>, y: &Uint<L>| self.mul(x, y);
+        let add = |x: &Uint<L>, y: &Uint<L>| self.add(x, y);
+        let sub = |x: &Uint<L>, y: &Uint<L>| self.sub(x, y);
 
         let t0 = m(&p.x, &p.x);
         let t1 = m(&p.y, &p.y);
@@ -757,12 +848,12 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     /// Complete projective addition (RCB Algorithm 1), correct for all
     /// inputs and any `a`; also the tests' oracle for the specialised
     /// formulas.
-    pub(crate) fn add_general(p: &Point<L>, q: &Point<L>) -> Point<L> {
-        let a = &C::A_MONT;
-        let b3 = &C::B3_MONT;
-        let m = Self::mul;
-        let add = Self::add;
-        let sub = Self::sub;
+    pub(crate) fn add_general(&self, p: &Point<L>, q: &Point<L>) -> Point<L> {
+        let a = &self.a_mont;
+        let b3 = &self.b3_mont;
+        let m = |x: &Uint<L>, y: &Uint<L>| self.mul(x, y);
+        let add = |x: &Uint<L>, y: &Uint<L>| self.add(x, y);
+        let sub = |x: &Uint<L>, y: &Uint<L>| self.sub(x, y);
 
         // Renes–Costello–Batina "add-2015-rcb", transcribed verbatim.
         let t0 = m(&p.x, &q.x);
@@ -820,16 +911,16 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     /// the RCB formulas are complete — so the schedule depends only on the
     /// public width. Any `scalar < 2^(64·L)` is multiplied exactly (the
     /// result is `[scalar mod n]P`), so nothing is silently truncated.
-    pub(crate) fn scalar_mul(scalar: &Uint<L>, point: &Point<L>) -> Point<L> {
+    pub(crate) fn scalar_mul(&self, scalar: &Uint<L>, point: &Point<L>) -> Point<L> {
         // table[j] = [j]P; table[0] is the identity.
-        let mut table = [Self::identity(); 16];
+        let mut table = [self.identity(); 16];
         table[1] = *point;
         for i in 2..16 {
-            table[i] = Self::point_add(&table[i - 1], point);
+            table[i] = self.point_add(&table[i - 1], point);
         }
 
         let limbs = scalar.as_limbs();
-        let mut acc = Self::identity();
+        let mut acc = self.identity();
         let mut i = L;
         while i > 0 {
             i -= 1;
@@ -837,14 +928,14 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
             let mut shift = 64;
             while shift > 0 {
                 shift -= 4;
-                acc = Self::double(&acc);
-                acc = Self::double(&acc);
-                acc = Self::double(&acc);
-                acc = Self::double(&acc);
+                acc = self.double(&acc);
+                acc = self.double(&acc);
+                acc = self.double(&acc);
+                acc = self.double(&acc);
 
                 let digit = ((limb >> shift) & 0xf) as usize;
                 let mut sel = Point::ct_lookup(&table, digit);
-                acc = Self::point_add(&acc, &sel);
+                acc = self.point_add(&acc, &sel);
                 sel.zeroize();
             }
         }
@@ -856,16 +947,16 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
 
     /// `scalar · G`.
     #[inline]
-    pub(crate) fn mul_generator(scalar: &Uint<L>) -> Point<L> {
-        Self::scalar_mul(scalar, &Self::generator())
+    pub(crate) fn mul_generator(&self, scalar: &Uint<L>) -> Point<L> {
+        self.scalar_mul(scalar, &self.generator())
     }
 
     /// The odd multiples `[1]P, [3]P, …, [15]P` for a width-5 wNAF ladder.
-    fn odd_multiples(p: &Point<L>) -> [Point<L>; 8] {
-        let two_p = Self::double(p);
+    fn odd_multiples(&self, p: &Point<L>) -> [Point<L>; 8] {
+        let two_p = self.double(p);
         let mut table = [*p; 8];
         for i in 1..8 {
-            table[i] = Self::point_add(&table[i - 1], &two_p);
+            table[i] = self.point_add(&table[i - 1], &two_p);
         }
         table
     }
@@ -873,11 +964,11 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     /// Adds the wNAF digit `d` (odd, `|d| ≤ 15`, or zero for a no-op) times
     /// the point whose odd multiples are `odd`. **Variable time.**
     #[inline]
-    fn add_naf_digit(acc: &Point<L>, d: i8, odd: &[Point<L>; 8]) -> Point<L> {
+    fn add_naf_digit(&self, acc: &Point<L>, d: i8, odd: &[Point<L>; 8]) -> Point<L> {
         if d > 0 {
-            Self::point_add(acc, &odd[(d as usize - 1) / 2])
+            self.point_add(acc, &odd[(d as usize - 1) / 2])
         } else if d < 0 {
-            Self::point_add(acc, &Self::negate(&odd[((-d) as usize - 1) / 2]))
+            self.point_add(acc, &self.negate(&odd[((-d) as usize - 1) / 2]))
         } else {
             *acc
         }
@@ -892,20 +983,20 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     /// to (or computable by) an observer, so timing reveals nothing.
     /// Signing, key derivation and ECDH keep the constant-time
     /// [`Self::scalar_mul`]. Both scalars must be `< n`.
-    pub(crate) fn mul_double_vartime(u1: &Uint<L>, u2: &Uint<L>, q: &Point<L>) -> Point<L> {
+    pub(crate) fn mul_double_vartime(&self, u1: &Uint<L>, u2: &Uint<L>, q: &Point<L>) -> Point<L> {
         let (naf1, len1) = wnaf5(u1);
         let (naf2, len2) = wnaf5(u2);
         let len = len1.max(len2);
         if len == 0 {
-            return Self::identity();
+            return self.identity();
         }
-        let odd_g = Self::odd_multiples(&Self::generator());
-        let odd_q = Self::odd_multiples(q);
-        let mut acc = Self::identity();
+        let odd_g = self.odd_multiples(&self.generator());
+        let odd_q = self.odd_multiples(q);
+        let mut acc = self.identity();
         for i in (0..len).rev() {
-            acc = Self::double(&acc);
-            acc = Self::add_naf_digit(&acc, naf1[i], &odd_g);
-            acc = Self::add_naf_digit(&acc, naf2[i], &odd_q);
+            acc = self.double(&acc);
+            acc = self.add_naf_digit(&acc, naf1[i], &odd_g);
+            acc = self.add_naf_digit(&acc, naf2[i], &odd_q);
         }
         acc
     }
@@ -917,33 +1008,32 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     /// `x ∈ {v, v + n}`, and each candidate `c < p` is checked as
     /// `c·Z == X`. The identity never matches. Public inputs only (the
     /// ECDSA / SM2 verification equations).
-    pub(crate) fn affine_x_eq_mod_n(point: &Point<L>, v: &Uint<L>) -> bool {
+    pub(crate) fn affine_x_eq_mod_n(&self, point: &Point<L>, v: &Uint<L>) -> bool {
         if bool::from(point.z.is_zero()) {
             return false;
         }
-        let check =
-            |c: &Uint<L>| bool::from(Self::mul(&Self::to_mont(c), &point.z).ct_eq(&point.x));
-        if bool::from(ct_lt(v, &C::P)) && check(v) {
+        let check = |c: &Uint<L>| bool::from(self.mul(&self.to_mont(c), &point.z).ct_eq(&point.x));
+        if bool::from(ct_lt(v, &self.p)) && check(v) {
             return true;
         }
-        let (v_n, carry) = v.adc(&C::N, 0);
-        carry == 0 && bool::from(ct_lt(&v_n, &C::P)) && check(&v_n)
+        let (v_n, carry) = v.adc(&self.n, 0);
+        carry == 0 && bool::from(ct_lt(&v_n, &self.p)) && check(&v_n)
     }
 
     /// Whether affine `(x, y)` (plain residues `< p`) satisfies
     /// `y² = x³ + a·x + b (mod p)`.
-    pub(crate) fn is_on_curve(x: &Uint<L>, y: &Uint<L>) -> bool {
-        let (xm, ym) = (Self::to_mont(x), Self::to_mont(y));
-        let lhs = Self::mul(&ym, &ym);
-        bool::from(lhs.ct_eq(&Self::rhs_mont(&xm)))
+    pub(crate) fn is_on_curve(&self, x: &Uint<L>, y: &Uint<L>) -> bool {
+        let (xm, ym) = (self.to_mont(x), self.to_mont(y));
+        let lhs = self.mul(&ym, &ym);
+        bool::from(lhs.ct_eq(&self.rhs_mont(&xm)))
     }
 
     /// `x³ + a·x + b` in Montgomery form.
-    fn rhs_mont(xm: &Uint<L>) -> Uint<L> {
-        let x2 = Self::mul(xm, xm);
-        let x3 = Self::mul(&x2, xm);
-        let ax = Self::mul(&C::A_MONT, xm);
-        Self::add(&Self::add(&x3, &ax), &C::B_MONT)
+    fn rhs_mont(&self, xm: &Uint<L>) -> Uint<L> {
+        let x2 = self.mul(xm, xm);
+        let x3 = self.mul(&x2, xm);
+        let ax = self.mul(&self.a_mont, xm);
+        self.add(&self.add(&x3, &ax), &self.b_mont)
     }
 
     /// Recovers the affine point `(x, y)` with the requested Y parity from a
@@ -955,24 +1045,30 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     /// and the root of the requested parity is returned (`p − y` flips it).
     /// The x-coordinate of a public key is not secret, so the variable-time
     /// pieces are fine.
-    pub(crate) fn decompress(x: &Uint<L>, y_odd: bool) -> Option<(Uint<L>, Uint<L>)> {
-        let xm = Self::to_mont(x);
-        let rhs = Self::rhs_mont(&xm);
-        let ym = if C::P.as_limbs()[0] & 3 == 3 {
-            Self::pow_mont(&rhs, &C::SQRT_EXP, C::P_BITS, Self::mul, &C::ONE_MONT)
+    pub(crate) fn decompress(&self, x: &Uint<L>, y_odd: bool) -> Option<(Uint<L>, Uint<L>)> {
+        let xm = self.to_mont(x);
+        let rhs = self.rhs_mont(&xm);
+        let ym = if self.p.as_limbs()[0] & 3 == 3 {
+            Self::pow_mont(
+                &rhs,
+                &self.sqrt_exp,
+                self.p_bits,
+                |a, b| self.mul(a, b),
+                &self.one_mont,
+            )
         } else {
-            Self::sqrt_tonelli_shanks(&rhs)?
+            self.sqrt_tonelli_shanks(&rhs)?
         };
-        if !bool::from(Self::mul(&ym, &ym).ct_eq(&rhs)) {
+        if !bool::from(self.mul(&ym, &ym).ct_eq(&rhs)) {
             return None;
         }
-        let y = Self::from_mont(&ym);
+        let y = self.to_plain(&ym);
         if bool::from(y.is_odd()) == y_odd {
             return Some((*x, y));
         }
         // The other root; only `y = 0` has no root of the other parity, and
         // it cannot occur on a curve of odd prime order (no 2-torsion).
-        let neg = C::P.wrapping_sub(&y);
+        let neg = self.p.wrapping_sub(&y);
         (!bool::from(y.is_zero())).then_some((*x, neg))
     }
 
@@ -981,14 +1077,16 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     /// secp224k1 `p ≡ 5 (mod 8)`). Returns `None` when `a` is a
     /// non-residue. Variable-time: the input is a public abscissa and the
     /// loop structure depends only on `p`.
-    fn sqrt_tonelli_shanks(a: &Uint<L>) -> Option<Uint<L>> {
-        let one = C::ONE_MONT;
-        let pow = |b: &Uint<L>, e: &Uint<L>| Self::pow_mont(b, e, C::P_BITS, Self::mul, &one);
+    fn sqrt_tonelli_shanks(&self, a: &Uint<L>) -> Option<Uint<L>> {
+        let one = self.one_mont;
+        let pow = |b: &Uint<L>, e: &Uint<L>| {
+            Self::pow_mont(b, e, self.p_bits, |x, y| self.mul(x, y), &one)
+        };
         if bool::from(a.is_zero()) {
             return Some(Uint::ZERO);
         }
         // p − 1 = q · 2^s with q odd.
-        let p_minus_1 = C::P.wrapping_sub(&Uint::ONE);
+        let p_minus_1 = self.p.wrapping_sub(&Uint::ONE);
         let mut q = p_minus_1;
         let mut s = 0usize;
         while !bool::from(q.is_odd()) {
@@ -1002,9 +1100,9 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
         }
         // A quadratic non-residue z (the smallest integer works; there is
         // one below 2·ln²p, so the scan is short and depends only on p).
-        let mut z = Self::to_mont(&Uint::from_u64(2));
+        let mut z = self.to_mont(&Uint::from_u64(2));
         while pow(&z, &half) == one {
-            z = Self::add(&z, &one);
+            z = self.add(&z, &one);
         }
         let mut c = pow(&z, &q);
         let mut t = pow(a, &q);
@@ -1015,7 +1113,7 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
             let mut i = 0usize;
             let mut t2 = t;
             while t2 != one {
-                t2 = Self::mul(&t2, &t2);
+                t2 = self.mul(&t2, &t2);
                 i += 1;
                 if i >= m {
                     return None;
@@ -1024,12 +1122,12 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
             // b = c^(2^(m − i − 1)).
             let mut b = c;
             for _ in 0..(m - i - 1) {
-                b = Self::mul(&b, &b);
+                b = self.mul(&b, &b);
             }
             m = i;
-            c = Self::mul(&b, &b);
-            t = Self::mul(&t, &c);
-            r = Self::mul(&r, &b);
+            c = self.mul(&b, &b);
+            t = self.mul(&t, &c);
+            r = self.mul(&r, &b);
         }
         Some(r)
     }
@@ -1041,9 +1139,9 @@ impl<C: CurveParams<L>, const L: usize> Fixed<C, L> {
     /// is validated `< n` or reduced) is reduced first so its high limbs are
     /// not silently dropped; that branch is on the public allocation width,
     /// not the value.
-    fn narrow_scalar(scalar: &BoxedUint) -> Uint<L> {
+    fn narrow_scalar(&self, scalar: &BoxedUint) -> Uint<L> {
         if scalar.limbs() > L {
-            narrow::<L>(&scalar.reduce(&widen(&C::N)))
+            narrow::<L>(&scalar.reduce(&widen(&self.n)))
         } else {
             narrow::<L>(scalar)
         }
@@ -1126,8 +1224,7 @@ impl Zeroize for AnyPoint {
 
 /// A prime-order short-Weierstrass curve, as the runtime-curve layers see
 /// it: `BoxedUint` in and out, the arithmetic dispatched to the curve's
-/// monomorphised [`Fixed`] engine. Plain residues everywhere; points are
-/// opaque [`AnyPoint`]s.
+/// [`Engine`]. Plain residues everywhere; points are opaque [`AnyPoint`]s.
 pub(crate) trait Curve: Sync {
     /// The group order `n`.
     fn order(&self) -> BoxedUint;
@@ -1158,7 +1255,7 @@ pub(crate) trait Curve: Sync {
     #[cfg(test)]
     fn generator(&self) -> AnyPoint;
     /// Converts a point to affine `(x, y)` (plain coordinates), or `None`
-    /// for the identity (a public verdict; see [`Fixed::to_affine`]).
+    /// for the identity (a public verdict; see [`Engine::to_affine`]).
     fn to_affine(&self, point: &AnyPoint) -> Option<(BoxedUint, BoxedUint)>;
     /// Recovers the affine point with the requested Y parity from a
     /// compressed x-coordinate, or `None` if `x ≥ p` or not on the curve.
@@ -1199,27 +1296,27 @@ pub(crate) trait Curve: Sync {
     fn a_kind(&self) -> ACoeff;
 }
 
-impl<C: CurveParams<L>, const L: usize> Curve for Fixed<C, L> {
+impl<const L: usize> Curve for Engine<L> {
     fn order(&self) -> BoxedUint {
-        widen(&C::N)
+        widen(&self.n)
     }
 
     #[cfg(test)]
     fn field_modulus(&self) -> BoxedUint {
-        widen(&C::P)
+        widen(&self.p)
     }
 
     fn coefficients(&self) -> (BoxedUint, BoxedUint) {
-        (widen(&C::A), widen(&C::B))
+        (widen(&self.a), widen(&self.b))
     }
 
     fn generator_affine(&self) -> (BoxedUint, BoxedUint) {
-        (widen(&C::GX), widen(&C::GY))
+        (widen(&self.gx), widen(&self.gy))
     }
 
     fn invert_scalar(&self, a: &BoxedUint) -> BoxedUint {
         let mut a = narrow::<L>(a);
-        let mut inv = Self::invert_mod_n(&a);
+        let mut inv = self.invert_mod_n(&a);
         let out = widen(&inv);
         a.zeroize();
         inv.zeroize();
@@ -1228,7 +1325,7 @@ impl<C: CurveParams<L>, const L: usize> Curve for Fixed<C, L> {
 
     fn mul_mod_n(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
         let (mut a, mut b) = (narrow::<L>(a), narrow::<L>(b));
-        let mut r = Self::mul_mod_n(&a, &b);
+        let mut r = self.mul_mod_n(&a, &b);
         let out = widen(&r);
         a.zeroize();
         b.zeroize();
@@ -1238,7 +1335,7 @@ impl<C: CurveParams<L>, const L: usize> Curve for Fixed<C, L> {
 
     fn add_mod_n(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
         let (mut a, mut b) = (narrow::<L>(a), narrow::<L>(b));
-        let mut r = add_mod(&a, &b, &C::N);
+        let mut r = add_mod(&a, &b, &self.n);
         let out = widen(&r);
         a.zeroize();
         b.zeroize();
@@ -1248,7 +1345,7 @@ impl<C: CurveParams<L>, const L: usize> Curve for Fixed<C, L> {
 
     fn sub_mod_n(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
         let (mut a, mut b) = (narrow::<L>(a), narrow::<L>(b));
-        let mut r = sub_mod(&a, &b, &C::N);
+        let mut r = sub_mod(&a, &b, &self.n);
         let out = widen(&r);
         a.zeroize();
         b.zeroize();
@@ -1258,21 +1355,21 @@ impl<C: CurveParams<L>, const L: usize> Curve for Fixed<C, L> {
 
     #[cfg(test)]
     fn identity(&self) -> AnyPoint {
-        Self::to_any(&Self::identity())
+        Self::to_any(&Engine::identity(self))
     }
 
     fn lift_affine(&self, x: &BoxedUint, y: &BoxedUint) -> AnyPoint {
-        Self::to_any(&Self::lift_affine(&narrow(x), &narrow(y)))
+        Self::to_any(&Engine::lift_affine(self, &narrow(x), &narrow(y)))
     }
 
     #[cfg(test)]
     fn generator(&self) -> AnyPoint {
-        Self::to_any(&Self::generator())
+        Self::to_any(&Engine::generator(self))
     }
 
     fn to_affine(&self, point: &AnyPoint) -> Option<(BoxedUint, BoxedUint)> {
         let mut p = Self::from_any(point);
-        let out = Self::to_affine(&p).map(|(mut x, mut y)| {
+        let out = Engine::to_affine(self, &p).map(|(mut x, mut y)| {
             let out = (widen(&x), widen(&y));
             x.zeroize();
             y.zeroize();
@@ -1284,20 +1381,24 @@ impl<C: CurveParams<L>, const L: usize> Curve for Fixed<C, L> {
 
     fn decompress(&self, x: &BoxedUint, y_odd: bool) -> Option<(BoxedUint, BoxedUint)> {
         let x = narrow_checked::<L>(x)?;
-        if !bool::from(ct_lt(&x, &C::P)) {
+        if !bool::from(ct_lt(&x, &self.p)) {
             return None;
         }
-        Self::decompress(&x, y_odd).map(|(x, y)| (widen(&x), widen(&y)))
+        Engine::decompress(self, &x, y_odd).map(|(x, y)| (widen(&x), widen(&y)))
     }
 
     fn point_add(&self, p: &AnyPoint, q: &AnyPoint) -> AnyPoint {
-        Self::to_any(&Self::point_add(&Self::from_any(p), &Self::from_any(q)))
+        Self::to_any(&Engine::point_add(
+            self,
+            &Self::from_any(p),
+            &Self::from_any(q),
+        ))
     }
 
     fn scalar_mul(&self, scalar: &BoxedUint, point: &AnyPoint) -> AnyPoint {
-        let mut k = Self::narrow_scalar(scalar);
+        let mut k = self.narrow_scalar(scalar);
         let mut p = Self::from_any(point);
-        let mut r = Self::scalar_mul(&k, &p);
+        let mut r = Engine::scalar_mul(self, &k, &p);
         let out = Self::to_any(&r);
         k.zeroize();
         p.zeroize();
@@ -1306,8 +1407,8 @@ impl<C: CurveParams<L>, const L: usize> Curve for Fixed<C, L> {
     }
 
     fn mul_generator(&self, scalar: &BoxedUint) -> AnyPoint {
-        let mut k = Self::narrow_scalar(scalar);
-        let mut r = Self::mul_generator(&k);
+        let mut k = self.narrow_scalar(scalar);
+        let mut r = Engine::mul_generator(self, &k);
         let out = Self::to_any(&r);
         k.zeroize();
         r.zeroize();
@@ -1315,7 +1416,8 @@ impl<C: CurveParams<L>, const L: usize> Curve for Fixed<C, L> {
     }
 
     fn mul_double_vartime(&self, u1: &BoxedUint, u2: &BoxedUint, q: &AnyPoint) -> AnyPoint {
-        Self::to_any(&Self::mul_double_vartime(
+        Self::to_any(&Engine::mul_double_vartime(
+            self,
             &narrow(u1),
             &narrow(u2),
             &Self::from_any(q),
@@ -1324,51 +1426,55 @@ impl<C: CurveParams<L>, const L: usize> Curve for Fixed<C, L> {
 
     fn affine_x_eq_mod_n(&self, point: &AnyPoint, v: &BoxedUint) -> bool {
         match narrow_checked::<L>(v) {
-            Some(v) => Self::affine_x_eq_mod_n(&Self::from_any(point), &v),
+            Some(v) => Engine::affine_x_eq_mod_n(self, &Self::from_any(point), &v),
             None => false,
         }
     }
 
     fn is_on_curve(&self, x: &BoxedUint, y: &BoxedUint) -> bool {
         match (narrow_checked::<L>(x), narrow_checked::<L>(y)) {
-            (Some(x), Some(y)) => Self::is_on_curve(&x, &y),
+            (Some(x), Some(y)) => Engine::is_on_curve(self, &x, &y),
             _ => false,
         }
     }
 
     fn in_field(&self, v: &BoxedUint) -> bool {
-        narrow_checked::<L>(v).is_some_and(|v| bool::from(ct_lt(&v, &C::P)))
+        narrow_checked::<L>(v).is_some_and(|v| bool::from(ct_lt(&v, &self.p)))
     }
 
     #[cfg(test)]
     fn double(&self, p: &AnyPoint) -> AnyPoint {
-        Self::to_any(&Self::double(&Self::from_any(p)))
+        Self::to_any(&Engine::double(self, &Self::from_any(p)))
     }
 
     #[cfg(test)]
     fn add_general(&self, p: &AnyPoint, q: &AnyPoint) -> AnyPoint {
-        Self::to_any(&Self::add_general(&Self::from_any(p), &Self::from_any(q)))
+        Self::to_any(&Engine::add_general(
+            self,
+            &Self::from_any(p),
+            &Self::from_any(q),
+        ))
     }
 
     #[cfg(test)]
     fn scale(&self, p: &AnyPoint, lambda: &BoxedUint) -> AnyPoint {
-        let l = Self::to_mont(&narrow(lambda));
+        let l = self.to_mont(&narrow(lambda));
         let p = Self::from_any(p);
         Self::to_any(&Point {
-            x: Self::mul(&p.x, &l),
-            y: Self::mul(&p.y, &l),
-            z: Self::mul(&p.z, &l),
+            x: self.mul(&p.x, &l),
+            y: self.mul(&p.y, &l),
+            z: self.mul(&p.z, &l),
         })
     }
 
     #[cfg(test)]
     fn negate(&self, p: &AnyPoint) -> AnyPoint {
-        Self::to_any(&Self::negate(&Self::from_any(p)))
+        Self::to_any(&Engine::negate(self, &Self::from_any(p)))
     }
 
     #[cfg(test)]
     fn a_kind(&self) -> ACoeff {
-        C::A_KIND
+        self.a_kind
     }
 }
 
@@ -1406,17 +1512,17 @@ mod tests {
     /// The masked gather returns exactly `table[digit]`.
     #[test]
     fn ct_lookup_selects_the_entry() {
-        type F = Fixed<crate::ec::curves::P384Params, 6>;
+        let f = Engine::<6>::new::<crate::ec::curves::P384Params>();
         let mut st = 0x100c_u64;
-        let mut table = [F::identity(); 16];
-        let mut acc = F::generator();
+        let mut table = [f.identity(); 16];
+        let mut acc = f.generator();
         for entry in table.iter_mut().skip(1) {
-            acc = F::point_add(&acc, &F::generator());
+            acc = f.point_add(&acc, &f.generator());
             let l = Uint::from_limbs([splitmix64(&mut st); 6]);
             *entry = Point {
-                x: F::mul(&acc.x, &l),
-                y: F::mul(&acc.y, &l),
-                z: F::mul(&acc.z, &l),
+                x: f.mul(&acc.x, &l),
+                y: f.mul(&acc.y, &l),
+                z: f.mul(&acc.z, &l),
             };
         }
         for (d, e) in table.iter().enumerate() {
