@@ -148,11 +148,7 @@ pub(crate) fn run(args: Args) {
     let www = args.flag("-www") || args.flag("--www");
     let quiet = args.flag("-quiet") || args.flag("--quiet");
     let no_cookie = args.flag("-no_cookie") || args.flag("--no_cookie");
-    let mtu: usize = args
-        .value("-mtu")
-        .unwrap_or("1200")
-        .parse()
-        .unwrap_or_else(|_| die("-mtu expects a number"));
+    let mtu = crate::util::parse_mtu_flag(&args);
     let keylog = args.value("-keylogfile").map(open_keylog);
     let naccept: usize = args
         .value("-naccept")

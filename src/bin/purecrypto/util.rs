@@ -810,6 +810,22 @@ pub(crate) fn reject_extra_positionals(pos: &[&str], allowed: usize) {
     }
 }
 
+/// Largest `-mtu` the (D)TLS tools accept: a UDP datagram cannot exceed
+/// 65535 bytes, and the receive buffers are sized from this value
+/// (`mtu + 256`), so an absurd one must not overflow or exhaust memory.
+pub(crate) const MAX_MTU: usize = 65535;
+
+/// Parses `-mtu N` (default 1200), refusing 0 and anything above
+/// [`MAX_MTU`].
+pub(crate) fn parse_mtu_flag(args: &Args) -> usize {
+    args.value("-mtu")
+        .unwrap_or("1200")
+        .parse()
+        .ok()
+        .filter(|n| (1..=MAX_MTU).contains(n))
+        .unwrap_or_else(|| die(format!("-mtu expects a number in 1..={MAX_MTU}")))
+}
+
 /// Parses a positive integer from a CLI flag.
 pub(crate) fn parse_u32_flag(value: &str, flag: &str) -> u32 {
     value

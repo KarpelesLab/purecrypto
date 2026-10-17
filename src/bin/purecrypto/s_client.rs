@@ -41,7 +41,8 @@ struct TcpOpts<'a> {
     /// it (RFC 8446 §4.2.10).
     early_data: Option<&'a [u8]>,
     /// `-read_timeout`: how long to wait for more data from the server
-    /// after the last byte before ending the session with close_notify.
+    /// after the last byte before ending the session with close_notify;
+    /// zero waits for the server to end the stream.
     read_timeout: Duration,
     ech: &'a crate::ech::ClientEch,
 }
@@ -228,11 +229,7 @@ pub(crate) fn run(args: Args) {
     let showcerts = args.flag("-showcerts") || args.flag("--showcerts");
     let quiet = args.flag("-quiet") || args.flag("--quiet");
     let alpn = args.value("-alpn").map(parse_alpn);
-    let mtu: usize = args
-        .value("-mtu")
-        .unwrap_or("1200")
-        .parse()
-        .unwrap_or_else(|_| die("-mtu expects a number"));
+    let mtu = crate::util::parse_mtu_flag(&args);
     let client_id = match (args.value("-cert"), args.value("-key")) {
         (Some(c), Some(k)) => Some((c, k, load_client_identity(c, k))),
         (Some(_), None) | (None, Some(_)) => die("both -cert and -key are required for mTLS"),
@@ -596,7 +593,12 @@ fn tcp_handshake_and_report(conn: &mut Connection, sock: &mut TcpStream, opts: &
 
 fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, opts: &TcpOpts<'_>) {
     tcp_handshake_and_report(conn, sock, opts);
-    sock.set_read_timeout(Some(opts.read_timeout)).ok();
+    // `-read_timeout 0`: no timeout — read until the server ends the
+    // stream. Said explicitly: `set_read_timeout(Some(0))` is an error to
+    // std, and an ignored one would silently mean the same thing.
+    let timeout = (!opts.read_timeout.is_zero()).then_some(opts.read_timeout);
+    sock.set_read_timeout(timeout)
+        .unwrap_or_else(|e| die(format!("cannot set the read timeout: {e}")));
     drive_tcp_data(conn, sock, opts);
 }
 
