@@ -39,7 +39,7 @@ pub(crate) const fn sbb(a: u64, b: u64, borrow: u64) -> (u64, u64) {
 /// and Montgomery reduction then branched on secret data (caught by
 /// tests/ct_valgrind.rs).
 #[inline(always)]
-fn mask_from_bit(bit: u64) -> u64 {
+pub(crate) fn mask_from_bit(bit: u64) -> u64 {
     core::hint::black_box(0u64.wrapping_sub(bit & 1))
 }
 

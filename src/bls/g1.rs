@@ -1,6 +1,6 @@
 //! The group `G1 = E(Fp)[r]` of BLS12-381, `E: y² = x³ + 4`.
 
-use super::constants::{BETA, G1_X, G1_Y};
+use super::constants::{BETA, G1_X, G1_Y, X_ABS};
 use super::curve::Projective;
 use super::fp::Fp;
 use super::fr::Fr;
@@ -94,13 +94,29 @@ impl G1 {
     }
 
     /// `k·P`, constant time in `k`.
-    #[inline]
+    ///
+    /// GLV: `φ(P) = -x²·P`, so with `k = e₀ + e₁·x²` (the base-`x²`
+    /// digits, both below `x² < 2^128` since `k < r < x⁴`)
+    /// `k·P = e₀·P + e₁·(-φ(P))`, a two-dimensional multi-scalar
+    /// multiplication over 128-bit digits. The split is a constant-time
+    /// division ([`div_rem_ct`](super::curve::div_rem_ct)).
     pub fn mul(&self, k: &Fr) -> G1 {
+        const X2: u128 = (X_ABS as u128) * (X_ABS as u128);
         // The canonical limbs are the scalar in the clear; bind them so they
         // can be wiped, rather than leaving them as an unnamed temporary.
         let mut limbs = k.to_canonical();
-        let r = G1(self.0.mul_limbs(&limbs));
+        let (mut e1, mut e0) = super::curve::div_rem_ct(&limbs, X2);
+        let mut e1v = e1[0] as u128 | (e1[1] as u128) << 64;
+        let minus_phi = Projective {
+            x: self.0.x.mul(&BETA),
+            y: self.0.y.neg(),
+            z: self.0.z,
+        };
+        let r = G1(Projective::mul_2x128(&[self.0, minus_phi], &[e0, e1v]));
         limbs.zeroize();
+        e0.zeroize();
+        e1.zeroize();
+        e1v.zeroize();
         r
     }
 
@@ -233,6 +249,63 @@ mod tests {
             CurveField::mul_by_b3(&x),
             x * Fp::from_canonical(&[12, 0, 0, 0, 0, 0])
         );
+    }
+
+    /// The GLV multiplication against the plain windowed ladder on edge
+    /// scalars (0, 1, r - 1, powers of |x| and their neighbours, the
+    /// digit boundaries) and pseudo-random ones.
+    #[test]
+    fn glv_mul_matches_ladder() {
+        let g = G1::generator();
+        let p = g.mul(&Fr::from_u64(0x0f0f_1234_5678_9abc));
+        let x = X_ABS as u128;
+        let x2 = x * x;
+        let mut cases: alloc::vec::Vec<[u64; 4]> = alloc::vec![
+            [0; 4],
+            [1, 0, 0, 0],
+            [2, 0, 0, 0],
+            [X_ABS, 0, 0, 0],
+            [X_ABS - 1, 0, 0, 0],
+            [X_ABS + 1, 0, 0, 0],
+            [x2 as u64, (x2 >> 64) as u64, 0, 0],
+            [(x2 - 1) as u64, ((x2 - 1) >> 64) as u64, 0, 0],
+            [(x2 + 1) as u64, ((x2 + 1) >> 64) as u64, 0, 0],
+            [u64::MAX, u64::MAX, 0, 0],
+            [0, 0, 1, 0],
+            [u64::MAX, u64::MAX, u64::MAX, 0],
+        ];
+        // r - 1, r - |x|, r - |x|², r - |x|³ and |x|³ ± 1.
+        let r = -Fr::ONE;
+        cases.push(r.to_canonical());
+        cases.push((r - Fr::from_u64(X_ABS) + Fr::ONE).to_canonical());
+        let fx = Fr::from_u64(X_ABS);
+        cases.push((r - fx * fx + Fr::ONE).to_canonical());
+        cases.push((r - fx * fx * fx + Fr::ONE).to_canonical());
+        cases.push((fx * fx * fx).to_canonical());
+        cases.push((fx * fx * fx + Fr::ONE).to_canonical());
+        cases.push((fx * fx * fx - Fr::ONE).to_canonical());
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..24 {
+            let mut k = [0u64; 4];
+            for l in k.iter_mut() {
+                s = s
+                    .wrapping_mul(0x5851_F42D_4C95_7F2D)
+                    .wrapping_add(0x1405_7B7E_F767_814F);
+                *l = s ^ (s >> 29);
+            }
+            k[3] &= 0x3fff_ffff_ffff_ffff;
+            cases.push(k);
+        }
+        for k in &cases {
+            let mut be = [0u8; 32];
+            super::super::mont::to_be_bytes(k, &mut be);
+            let Some(fr) = Fr::from_bytes(&be) else {
+                continue;
+            };
+            assert_eq!(p.mul(&fr), G1(p.0.mul_limbs(k)), "k = {k:x?}");
+            assert_eq!(g.mul(&fr), G1(g.0.mul_limbs(k)), "k = {k:x?}");
+        }
+        assert_eq!(G1::IDENTITY.mul(&Fr::from_u64(7)), G1::IDENTITY);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! The group `G2 = E'(Fp2)[r]` of BLS12-381, `E': y² = x³ + 4(1 + u)`.
 
-use super::constants::{G2_X, G2_Y, PSI_X, PSI_Y, PSI2_X};
+use super::constants::{G2_X, G2_Y, PSI_X, PSI_Y, PSI2_X, X_ABS};
 use super::curve::Projective;
 use super::fp2::Fp2;
 use super::fr::Fr;
@@ -100,13 +100,30 @@ impl G2 {
     }
 
     /// `k·P`, constant time in `k`.
-    #[inline]
+    ///
+    /// Four-dimensional GLS: `ψ` acts as multiplication by `x = -|x|`, so
+    /// with the base-`|x|` digits `k = d₀ + d₁|x| + d₂|x|² + d₃|x|³` (all
+    /// below `|x| < 2^64` since `k < r < |x|⁴`)
+    /// `k·P = d₀·P + d₁·(-ψ(P)) + d₂·ψ²(P) + d₃·(-ψ³(P))`, a four-way
+    /// multi-scalar multiplication over 64-bit digits. The split is three
+    /// constant-time divisions ([`div_rem_ct`](super::curve::div_rem_ct)).
     pub fn mul(&self, k: &Fr) -> G2 {
         // The canonical limbs are the scalar in the clear; bind them so they
         // can be wiped, rather than leaving them as an unnamed temporary.
         let mut limbs = k.to_canonical();
-        let r = G2(self.0.mul_limbs(&limbs));
+        let (mut q1, d0) = super::curve::div_rem_ct(&limbs, X_ABS as u128);
+        let (mut q2, d1) = super::curve::div_rem_ct(&q1, X_ABS as u128);
+        let (mut q3, d2) = super::curve::div_rem_ct(&q2, X_ABS as u128);
+        let mut digits = [d0 as u64, d1 as u64, d2 as u64, q3[0]];
+        let psi = self.psi();
+        let psi2 = self.psi2();
+        let points = [self.0, psi.0.neg(), psi2.0, psi2.psi().0.neg()];
+        let r = G2(Projective::mul_4x64(&points, &digits));
         limbs.zeroize();
+        q1.zeroize();
+        q2.zeroize();
+        q3.zeroize();
+        digits.zeroize();
         r
     }
 
@@ -245,6 +262,98 @@ mod tests {
         let (x, _) = g.to_affine().unwrap();
         let twelve = Fp::from_canonical(&[12, 0, 0, 0, 0, 0]);
         assert_eq!(CurveField::mul_by_b3(&x), x * Fp2::new(twelve, twelve));
+    }
+
+    /// The GLS multiplication against the plain windowed ladder on edge
+    /// scalars (0, 1, r - 1, powers of |x| and their neighbours, the
+    /// digit boundaries) and pseudo-random ones.
+    #[test]
+    fn gls_mul_matches_ladder() {
+        let g = G2::generator();
+        let p = g.mul(&Fr::from_u64(0x0f0f_1234_5678_9abc));
+        let x = X_ABS as u128;
+        let x2 = x * x;
+        let mut cases: alloc::vec::Vec<[u64; 4]> = alloc::vec![
+            [0; 4],
+            [1, 0, 0, 0],
+            [2, 0, 0, 0],
+            [X_ABS, 0, 0, 0],
+            [X_ABS - 1, 0, 0, 0],
+            [X_ABS + 1, 0, 0, 0],
+            [x2 as u64, (x2 >> 64) as u64, 0, 0],
+            [(x2 - 1) as u64, ((x2 - 1) >> 64) as u64, 0, 0],
+            [(x2 + 1) as u64, ((x2 + 1) >> 64) as u64, 0, 0],
+            [u64::MAX, u64::MAX, 0, 0],
+            [0, 0, 1, 0],
+            [u64::MAX, u64::MAX, u64::MAX, 0],
+        ];
+        let r = -Fr::ONE;
+        let fx = Fr::from_u64(X_ABS);
+        cases.push(r.to_canonical());
+        cases.push((r - fx + Fr::ONE).to_canonical());
+        cases.push((r - fx * fx + Fr::ONE).to_canonical());
+        cases.push((r - fx * fx * fx + Fr::ONE).to_canonical());
+        cases.push((fx * fx * fx).to_canonical());
+        cases.push((fx * fx * fx + Fr::ONE).to_canonical());
+        cases.push((fx * fx * fx - Fr::ONE).to_canonical());
+        cases.push((fx * fx * fx * (fx - Fr::ONE)).to_canonical());
+        let mut s = 0x1234_5678_9ABC_DEF1u64;
+        for _ in 0..16 {
+            let mut k = [0u64; 4];
+            for l in k.iter_mut() {
+                s = s
+                    .wrapping_mul(0x5851_F42D_4C95_7F2D)
+                    .wrapping_add(0x1405_7B7E_F767_814F);
+                *l = s ^ (s >> 29);
+            }
+            k[3] &= 0x3fff_ffff_ffff_ffff;
+            cases.push(k);
+        }
+        for k in &cases {
+            let mut be = [0u8; 32];
+            super::super::mont::to_be_bytes(k, &mut be);
+            let Some(fr) = Fr::from_bytes(&be) else {
+                continue;
+            };
+            assert_eq!(p.mul(&fr), G2(p.0.mul_limbs(k)), "k = {k:x?}");
+            assert_eq!(g.mul(&fr), G2(g.0.mul_limbs(k)), "k = {k:x?}");
+        }
+        assert_eq!(G2::IDENTITY.mul(&Fr::from_u64(7)), G2::IDENTITY);
+    }
+
+    /// The constant-time division against `u128` arithmetic on edge cases.
+    #[test]
+    fn div_rem_ct_matches_u128() {
+        use super::super::curve::div_rem_ct;
+        let x = X_ABS as u128;
+        for (k, d) in [
+            ([0u64; 4], x),
+            ([1, 0, 0, 0], x),
+            ([X_ABS, 0, 0, 0], x),
+            ([X_ABS - 1, 0, 0, 0], x),
+            ([u64::MAX, u64::MAX, 0, 0], x),
+            ([u64::MAX, u64::MAX, 0, 0], x * x),
+            ([u64::MAX, u64::MAX, 0, 0], u128::MAX),
+            ([0x1234, 0x5678, 0, 0], 1),
+            ([u64::MAX, u64::MAX, 0, 0], 1 << 127),
+        ] {
+            let v = k[0] as u128 | (k[1] as u128) << 64;
+            let (q, rem) = div_rem_ct(&k, d);
+            assert_eq!(rem, v % d);
+            assert_eq!(q, [(v / d) as u64, ((v / d) >> 64) as u64, 0, 0]);
+        }
+        // A full 256-bit value against the scalar field: r - 1 = Σ dᵢ|x|ⁱ.
+        let r1 = (-Fr::ONE).to_canonical();
+        let (q1, d0) = div_rem_ct(&r1, x);
+        let (q2, d1) = div_rem_ct(&q1, x);
+        let (q3, d2) = div_rem_ct(&q2, x);
+        assert_eq!(q3[1] | q3[2] | q3[3], 0);
+        let fx = Fr::from_u64(X_ABS);
+        let back = Fr::from_u64(d0 as u64)
+            + Fr::from_u64(d1 as u64) * fx
+            + Fr::from_u64(d2 as u64) * fx * fx
+            + Fr::from_u64(q3[0]) * fx * fx * fx;
+        assert_eq!(back, -Fr::ONE);
     }
 
     #[test]

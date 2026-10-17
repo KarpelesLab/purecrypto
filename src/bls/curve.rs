@@ -6,9 +6,11 @@
 //! formulas for `j = 0` curves (Algorithms 7 and 9 of
 //! <https://eprint.iacr.org/2015/1060>) are correct for every input pair —
 //! identity, doubling and inverse included — without a single branch. Scalar
-//! multiplication by a secret is a fixed 4-bit window with a masked table
-//! lookup, so neither the schedule nor the memory access pattern depends on
-//! the scalar.
+//! multiplication by a secret splits the scalar along the curve's
+//! endomorphism (GLV on `G1`, four-dimensional GLS on `G2`; the split is a
+//! constant-time base-`|x|` division) and runs simultaneous fixed windows
+//! with masked table gathers, so neither the schedule nor the memory
+//! access pattern depends on the scalar.
 
 use super::Error;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
@@ -27,6 +29,9 @@ pub(crate) trait CurveField:
     /// `3·b·self` (both curves have `3b = 12` or `12(1 + u)`, so this is a
     /// handful of additions rather than a multiplication).
     fn mul_by_b3(&self) -> Self;
+    /// `self |= mask & other` limb by limb — the masked-gather primitive
+    /// (`mask` is all-ones or all-zeros).
+    fn or_masked(&mut self, other: &Self, mask: u64);
     /// Byte length of one encoded coordinate.
     const ENCODED_LEN: usize;
 
@@ -211,7 +216,9 @@ impl<F: CurveField> Projective<F> {
 
     /// `k·P` for a little-endian limb scalar, constant time in `k`: fixed
     /// 4-bit windows over every bit of `k`, each digit fetched from a
-    /// 16-entry table by masked selection over all entries.
+    /// 16-entry table by masked selection over all entries. The plain
+    /// ladder the endomorphism-split multiplications are tested against.
+    #[cfg(test)]
     pub(crate) fn mul_limbs(&self, k: &[u64]) -> Self {
         let mut table = [Self::IDENTITY; 16];
         for i in 1..16 {
@@ -231,6 +238,89 @@ impl<F: CurveField> Projective<F> {
             // The selected entry and the digit that picked it are the scalar
             // window in the clear; wipe them rather than leave them in the
             // frame for the next iteration to overwrite (or not).
+            entry.zeroize();
+            digit.zeroize();
+        }
+        for t in table.iter_mut() {
+            t.zeroize();
+        }
+        acc
+    }
+
+    /// Fetches `table[digit]` by one masked pass over every entry: one
+    /// opaque mask per entry, applied with `|`/`&` across all limbs.
+    #[inline]
+    fn gather(table: &[Self], digit: u64) -> Self {
+        let mut entry = Projective {
+            x: F::ZERO,
+            y: F::ZERO,
+            z: F::ZERO,
+        };
+        for (i, t) in table.iter().enumerate() {
+            let x = (i as u64) ^ digit;
+            // All ones iff x == 0 (i.e. i == digit).
+            let mask = super::mont::mask_from_bit(((x | x.wrapping_neg()) >> 63) ^ 1);
+            entry.x.or_masked(&t.x, mask);
+            entry.y.or_masked(&t.y, mask);
+            entry.z.or_masked(&t.z, mask);
+        }
+        entry
+    }
+
+    /// `Σ dᵢ·Pᵢ` for four 64-bit digits, constant time in the digits:
+    /// simultaneous 1-bit windows over the 16 subset sums of the points,
+    /// 64 doublings and 64 masked-gather additions.
+    pub(crate) fn mul_4x64(points: &[Self; 4], digits: &[u64; 4]) -> Self {
+        let mut table = [Self::IDENTITY; 16];
+        for (i, p) in points.iter().enumerate() {
+            let bit = 1 << i;
+            table[bit] = *p;
+            for j in 1..bit {
+                table[bit + j] = table[j].add(p);
+            }
+        }
+        let mut acc = Self::IDENTITY;
+        for bit in (0..64).rev() {
+            acc = acc.double();
+            let mut digit = 0u64;
+            for (i, d) in digits.iter().enumerate() {
+                digit |= ((d >> bit) & 1) << i;
+            }
+            let mut entry = Self::gather(&table, digit);
+            acc = acc.add(&entry);
+            entry.zeroize();
+            digit.zeroize();
+        }
+        for t in table.iter_mut() {
+            t.zeroize();
+        }
+        acc
+    }
+
+    /// `d₀·P₀ + d₁·P₁` for two 128-bit digits, constant time in the
+    /// digits: simultaneous 2-bit windows over the 16 combinations
+    /// `a·P₀ + b·P₁` (`a, b < 4`), 128 doublings and 64 masked-gather
+    /// additions.
+    pub(crate) fn mul_2x128(points: &[Self; 2], digits: &[u128; 2]) -> Self {
+        let mut table = [Self::IDENTITY; 16];
+        table[1] = points[0];
+        table[2] = points[0].double();
+        table[3] = table[2].add(&points[0]);
+        table[4] = points[1];
+        table[8] = points[1].double();
+        table[12] = table[8].add(&points[1]);
+        for b in [4usize, 8, 12] {
+            for a in 1..4 {
+                table[a + b] = table[a].add(&table[b]);
+            }
+        }
+        let mut acc = Self::IDENTITY;
+        for w in (0..64).rev() {
+            acc = acc.double().double();
+            let shift = 2 * w;
+            let mut digit = (((digits[0] >> shift) & 3) | ((digits[1] >> shift) & 3) << 2) as u64;
+            let mut entry = Self::gather(&table, digit);
+            acc = acc.add(&entry);
             entry.zeroize();
             digit.zeroize();
         }
@@ -373,6 +463,29 @@ impl<F: CurveField> Projective<F> {
     }
 }
 
+/// Quotient and remainder of a 256-bit little-endian value by a nonzero
+/// divisor below `2^128`, in constant time: restoring division over all
+/// 256 bits with the subtraction selected by an opaque mask.
+pub(crate) fn div_rem_ct(k: &[u64; 4], d: u128) -> ([u64; 4], u128) {
+    let (dl, dh) = (d as u64, (d >> 64) as u64);
+    let mut q = [0u64; 4];
+    let mut rem: u128 = 0;
+    for bit in (0..256).rev() {
+        let top = (rem >> 127) as u64;
+        let r2 = (rem << 1) | (((k[bit / 64] >> (bit % 64)) & 1) as u128);
+        let (lo, borrow) = super::mont::sbb(r2 as u64, dl, 0);
+        let (hi, borrow) = super::mont::sbb((r2 >> 64) as u64, dh, borrow);
+        let diff = ((hi as u128) << 64) | lo as u128;
+        // r2 >= d iff the shift overflowed or the subtraction did not borrow.
+        let ge = top | (borrow ^ 1);
+        let mask = super::mont::mask_from_bit(ge);
+        let mask128 = ((mask as u128) << 64) | mask as u128;
+        rem = (r2 & !mask128) | (diff & mask128);
+        q[bit / 64] |= ge << (bit % 64);
+    }
+    (q, rem)
+}
+
 impl CurveField for super::fp::Fp {
     const ZERO: Self = Self::ZERO;
     const ONE: Self = Self::ONE;
@@ -416,6 +529,12 @@ impl CurveField for super::fp::Fp {
         // 12·x = 8x + 4x.
         let x4 = self.double().double();
         x4.double().add(&x4)
+    }
+    #[inline]
+    fn or_masked(&mut self, other: &Self, mask: u64) {
+        for (a, b) in self.0.iter_mut().zip(other.0.iter()) {
+            *a |= mask & b;
+        }
     }
     #[inline]
     fn lexicographically_largest(&self) -> Choice {
@@ -475,6 +594,11 @@ impl CurveField for super::fp2::Fp2 {
         let t = Self::new(self.c0.sub(&self.c1), self.c0.add(&self.c1));
         let t4 = t.double().double();
         t4.double().add(&t4)
+    }
+    #[inline]
+    fn or_masked(&mut self, other: &Self, mask: u64) {
+        CurveField::or_masked(&mut self.c0, &other.c0, mask);
+        CurveField::or_masked(&mut self.c1, &other.c1, mask);
     }
     #[inline]
     fn lexicographically_largest(&self) -> Choice {

@@ -11,6 +11,9 @@
 use super::fp::Fp;
 use super::fp2::Fp2;
 
+/// `|x|` for the BLS parameter `x = -0xd201000000010000`.
+pub(crate) const X_ABS: u64 = 0xd201000000010000;
+
 // generators
 /// `0x17f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb`
 pub(crate) const G1_X: Fp = Fp([
