@@ -31,6 +31,12 @@ pub(super) const IV: [u32; 8] = [
     0x5be0_cd19,
 ];
 
+// Only the SIMD backends permute message vectors between rounds; the scalar
+// compression reads through `MSG_SCHEDULE` instead.
+#[cfg_attr(
+    not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+    allow(dead_code)
+)]
 pub(super) const MSG_PERMUTATION: [usize; 16] =
     [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
