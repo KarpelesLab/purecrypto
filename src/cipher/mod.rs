@@ -81,7 +81,7 @@ mod cfb;
 mod chacha20;
 mod chacha20poly1305;
 #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod clmul;
+pub(crate) mod clmul;
 mod cmac;
 mod ctr;
 mod des;

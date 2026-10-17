@@ -19,7 +19,7 @@ pub(super) use x86::{ctr_ghash_fused, gf_mul, ghash_blocks};
 
 /// Whether a hardware GHASH backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
-pub(super) fn supported() -> bool {
+pub(crate) fn supported() -> bool {
     !crate::ct::force_portable()
         && std::is_x86_feature_detected!("pclmulqdq")
         && std::is_x86_feature_detected!("sse2")
@@ -27,11 +27,35 @@ pub(super) fn supported() -> bool {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(super) fn supported() -> bool {
+pub(crate) fn supported() -> bool {
     // FEAT_PMULL (the 64→128 polynomial multiply) is reported under "aes".
     !crate::ct::force_portable()
         && std::arch::is_aarch64_feature_detected!("aes")
         && std::arch::is_aarch64_feature_detected!("neon")
+}
+
+/// Raw 64×64 → 128 carry-less product `a · b` over GF(2)[X] (no
+/// reduction, no byte reflection), for the binary-field curves. Requires
+/// [`supported`].
+#[cfg(all(feature = "legacy-ec", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse2")]
+pub(crate) unsafe fn clmul64(a: u64, b: u64) -> u128 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let p = _mm_clmulepi64_si128(_mm_set_epi64x(0, a as i64), _mm_set_epi64x(0, b as i64), 0);
+        let mut out = [0u8; 16];
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, p);
+        u128::from_le_bytes(out)
+    }
+}
+
+/// See the x86_64 variant.
+#[cfg(all(feature = "legacy-ec", target_arch = "aarch64"))]
+#[inline]
+#[target_feature(enable = "aes,neon")]
+pub(crate) unsafe fn clmul64(a: u64, b: u64) -> u128 {
+    unsafe { core::arch::aarch64::vmull_p64(a, b) }
 }
 
 #[cfg(target_arch = "x86_64")]

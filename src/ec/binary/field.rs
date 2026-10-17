@@ -4,11 +4,12 @@
 //! little-endian `u64` limbs ([`Fe`]); a [`Field`] carries the public
 //! parameters (m, the number of limbs in use and the middle exponents of the
 //! SEC 2 reduction polynomial). Every operation is branch-free in the element
-//! data: multiplication is a schoolbook product of bit-serial, mask-driven
-//! 64×64 carry-less multiplications (no lookup tables indexed by secret
-//! data), squaring spreads bits with masks, reduction folds words with
-//! shifts by public constants, and inversion is Itoh–Tsujii with an addition
-//! chain fixed by the (public) field degree.
+//! data: multiplication is a schoolbook product of 64×64 carry-less
+//! multiplications — the PMULL / PCLMULQDQ instruction where the CPU has it,
+//! otherwise a bit-sliced integer-multiply emulation (no lookup tables
+//! indexed by secret data) — squaring spreads bits with masks, reduction
+//! folds words with shifts by public constants, and inversion is
+//! Itoh–Tsujii with an addition chain fixed by the (public) field degree.
 
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use crate::zeroize::Zeroize;
@@ -104,21 +105,74 @@ pub(super) const fn limbs_from_hex(hex: &str) -> Limbs {
     out
 }
 
-/// Bit-serial 64×64 → 128 carry-less multiplication. Each of the 64 steps
-/// masks `a << i` with the (all-ones or all-zeros) mask derived from bit `i`
-/// of `b`; shift amounts are loop constants, so the running time does not
-/// depend on either operand.
+/// The low 64 bits of the carry-less product `x · y` over GF(2)[X], from
+/// integer multiplications (BearSSL's `bmul64`): each operand is split
+/// into four words holding every fourth bit, so that in each of the sixteen
+/// integer products a column receives at most 16 partial products — few
+/// enough that carries never reach the bit of the next column kept by the
+/// final masks (the one 16-term column overflows past bit 63, which is
+/// discarded). Constant time wherever the integer multiplier is, which the
+/// rest of the crate's field arithmetic already assumes.
 #[inline]
-fn clmul64(a: u64, b: u64) -> (u64, u64) {
-    let a = a as u128;
-    let mut r = 0u128;
-    let mut i = 0;
-    while i < 64 {
-        let mask = core::hint::black_box((((b >> i) & 1) as u128).wrapping_neg());
-        r ^= (a << i) & mask;
-        i += 1;
+fn bmul64(x: u64, y: u64) -> u64 {
+    const M0: u64 = 0x1111_1111_1111_1111;
+    const M1: u64 = 0x2222_2222_2222_2222;
+    const M2: u64 = 0x4444_4444_4444_4444;
+    const M3: u64 = 0x8888_8888_8888_8888;
+    let (x0, x1, x2, x3) = (x & M0, x & M1, x & M2, x & M3);
+    let (y0, y1, y2, y3) = (y & M0, y & M1, y & M2, y & M3);
+    let z0 = x0.wrapping_mul(y0) ^ x1.wrapping_mul(y3) ^ x2.wrapping_mul(y2) ^ x3.wrapping_mul(y1);
+    let z1 = x0.wrapping_mul(y1) ^ x1.wrapping_mul(y0) ^ x2.wrapping_mul(y3) ^ x3.wrapping_mul(y2);
+    let z2 = x0.wrapping_mul(y2) ^ x1.wrapping_mul(y1) ^ x2.wrapping_mul(y0) ^ x3.wrapping_mul(y3);
+    let z3 = x0.wrapping_mul(y3) ^ x1.wrapping_mul(y2) ^ x2.wrapping_mul(y1) ^ x3.wrapping_mul(y0);
+    (z0 & M0) | (z1 & M1) | (z2 & M2) | (z3 & M3)
+}
+
+/// Software 64×64 → 128 carry-less multiplication `(lo, hi)`, constant
+/// time: the low word from [`bmul64`], the high word from the same product
+/// on the bit-reversed operands (`clmul(rev x, rev y)` is the degree-126
+/// product reversed, so its low word, reversed and shifted down one bit, is
+/// the top word of `x · y`).
+#[inline]
+fn clmul64_soft(a: u64, b: u64) -> (u64, u64) {
+    let lo = bmul64(a, b);
+    let hi = bmul64(a.reverse_bits(), b.reverse_bits()).reverse_bits() >> 1;
+    (lo, hi)
+}
+
+/// The carry-less multiply instructions (PMULL on aarch64, PCLMULQDQ on
+/// x86_64), when the build can detect them. The detection honours the
+/// constant-time harness's `force_portable` switch, so the software kernel
+/// is exercised under memcheck too.
+#[cfg(all(
+    feature = "cipher",
+    feature = "std",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod hw {
+    #![allow(unsafe_code)]
+    use super::{Fe, MAX_LIMBS};
+    use crate::cipher::clmul;
+
+    #[inline]
+    pub(super) fn supported() -> bool {
+        clmul::supported()
     }
-    (r as u64, (r >> 64) as u64)
+
+    /// XORs the unreduced product of the low `l` limbs of `a` and `b` into
+    /// `c`. The caller has checked [`supported`].
+    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "aes,neon"))]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "pclmulqdq,sse2"))]
+    pub(super) unsafe fn mul_into(l: usize, a: &Fe, b: &Fe, c: &mut [u64; 2 * MAX_LIMBS]) {
+        for i in 0..l {
+            for j in 0..l {
+                // SAFETY: the caller established the target feature.
+                let p = unsafe { clmul::clmul64(a.0[i], b.0[j]) };
+                c[i + j] ^= p as u64;
+                c[i + j + 1] ^= (p >> 64) as u64;
+            }
+        }
+    }
 }
 
 /// Interleaves a zero bit after every bit of `x` (the squaring map on one
@@ -224,16 +278,36 @@ impl Field {
 
     /// `a · b`.
     pub(super) fn mul(&self, a: &Fe, b: &Fe) -> Fe {
-        let l = self.limbs;
         let mut c = [0u64; 2 * MAX_LIMBS];
+        #[cfg(all(
+            feature = "cipher",
+            feature = "std",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if hw::supported() {
+            // SAFETY: `hw::supported` detected the carry-less multiply
+            // instructions on this CPU.
+            #[allow(unsafe_code)]
+            unsafe {
+                hw::mul_into(self.limbs, a, b, &mut c)
+            };
+            return self.reduce(&mut c);
+        }
+        self.mul_soft_into(a, b, &mut c);
+        self.reduce(&mut c)
+    }
+
+    /// The unreduced schoolbook product on the software carry-less
+    /// multiply, XORed into `c`.
+    fn mul_soft_into(&self, a: &Fe, b: &Fe, c: &mut [u64; 2 * MAX_LIMBS]) {
+        let l = self.limbs;
         for i in 0..l {
             for j in 0..l {
-                let (lo, hi) = clmul64(a.0[i], b.0[j]);
+                let (lo, hi) = clmul64_soft(a.0[i], b.0[j]);
                 c[i + j] ^= lo;
                 c[i + j + 1] ^= hi;
             }
         }
-        self.reduce(&mut c)
     }
 
     /// `a²` (the Frobenius map: bit spreading plus one reduction).
@@ -393,6 +467,59 @@ mod tests {
         let mut out = Fe::ZERO;
         out.0[..f.limbs].copy_from_slice(&acc[..f.limbs]);
         out
+    }
+
+    /// The bit-sliced software carry-less multiply against a bit-serial
+    /// reference, on structured and random operands (both words).
+    #[test]
+    fn clmul64_soft_matches_bit_serial() {
+        fn reference(a: u64, b: u64) -> (u64, u64) {
+            let mut r = 0u128;
+            for i in 0..64 {
+                if (b >> i) & 1 == 1 {
+                    r ^= (a as u128) << i;
+                }
+            }
+            (r as u64, (r >> 64) as u64)
+        }
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut cases = alloc::vec![
+            (0, 0),
+            (1, 1),
+            (u64::MAX, u64::MAX),
+            (u64::MAX, 1 << 63),
+            (0x8000_0000_0000_0001, 0xffff_ffff_ffff_ffff),
+            (0x1111_1111_1111_1111, 0x1111_1111_1111_1111),
+            (0xffff_ffff_0000_0000, 0x0000_0000_ffff_ffff),
+        ];
+        for _ in 0..2000 {
+            cases.push((next(), next()));
+        }
+        for (a, b) in cases {
+            assert_eq!(clmul64_soft(a, b), reference(a, b), "{a:#x} * {b:#x}");
+        }
+    }
+
+    /// The software product path agrees with whatever `mul` dispatches to
+    /// (the hardware instruction where detected).
+    #[test]
+    fn mul_soft_matches_dispatch() {
+        let mut seed = 0x6A09_E667_F3BC_C908u64;
+        for f in &FIELDS {
+            for _ in 0..16 {
+                let a = sample(f, &mut seed);
+                let b = sample(f, &mut seed);
+                let mut c = [0u64; 2 * MAX_LIMBS];
+                f.mul_soft_into(&a, &b, &mut c);
+                assert_eq!(f.reduce(&mut c).0, f.mul(&a, &b).0, "m={}", f.m);
+            }
+        }
     }
 
     #[test]

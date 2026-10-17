@@ -730,6 +730,32 @@ fn p384_ecdh() -> String {
     format!("ss={}", hex8(public(&shared[..])))
 }
 
+/// sect283k1 ECDH: the binary-field López–Dahab ladder, with the GF(2^m)
+/// multiplication on the carry-less multiply instruction where detected
+/// and on the bit-sliced software kernel under `force_portable`.
+#[cfg(feature = "legacy-ec")]
+fn sect283k1_ecdh() -> String {
+    use purecrypto::ec::binary::{BinaryCurveId, BinaryPrivateKey};
+    let mut raw = secret_bytes::<36>(126);
+    // The order is 281 bits: clear the top bits to stay in range.
+    raw[0] = 0;
+    raw[1] &= 0x01;
+    let sk = BinaryPrivateKey::from_bytes(BinaryCurveId::Sect283k1, &raw).expect("scalar in range");
+    let mut peer_raw = fixed_bytes::<36>(127);
+    peer_raw[0] = 0;
+    peer_raw[1] &= 0x01;
+    let peer = BinaryPrivateKey::from_bytes(BinaryCurveId::Sect283k1, &peer_raw)
+        .unwrap()
+        .public_key();
+    let pk = sk.public_key().to_sec1(false);
+    let shared = sk.diffie_hellman(&peer).expect("valid peer");
+    format!(
+        "pk={} ss={}",
+        hex8(public(&pk[..])),
+        hex8(public(&shared[..]))
+    )
+}
+
 fn sm2_sign() -> String {
     let sk = Sm2PrivateKey::from_bytes(&secret_bytes::<32>(117)).expect("scalar in range");
     let sig = sk
@@ -2392,6 +2418,8 @@ const CASES: &[Case] = &[
     ("secp256k1_safegcd_invert", secp256k1_safegcd_invert),
     ("p384_ecdsa_sign", p384_ecdsa_sign),
     ("p384_ecdh", p384_ecdh),
+    #[cfg(feature = "legacy-ec")]
+    ("sect283k1_ecdh", sect283k1_ecdh),
     ("sm2_sign", sm2_sign),
     ("boxed_fixed_curves", boxed_fixed_curves),
     ("ffdh_group14", ffdh_group14),
