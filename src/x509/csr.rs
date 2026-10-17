@@ -504,7 +504,10 @@ mod tests {
         };
         let clean = build(&[], &[], &[], &[]);
         assert_eq!(clean.subject_alt_names().unwrap(), ["strict.example"]);
-        assert_eq!(clean.extension_requests().unwrap(), [san.clone()]);
+        assert_eq!(
+            clean.extension_requests().unwrap(),
+            core::slice::from_ref(&san)
+        );
         // Explicit `critical TRUE` is fine; an explicit FALSE encodes the
         // DEFAULT and is not DER.
         assert!(
