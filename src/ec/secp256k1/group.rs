@@ -20,9 +20,9 @@
 //! negation covers every digit. The preparation of `v` from the scalar is a
 //! fixed sequence of modular operations (see [`glv`]).
 
-use super::field_backend::{Fe, FieldBackend, mask_from_bit, select};
+use super::field_backend::{Fe, FieldBackend, canonical_fe, mask_from_bit, select};
 use super::glv;
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::ct::{Choice, ConditionallySelectable};
 use crate::zeroize::Zeroize;
 
 /// The curve constant `b3 = 3·b = 21` for `b = 7`.
@@ -150,9 +150,11 @@ impl Point {
     }
 
     /// Returns a [`Choice`] that is true iff this is the identity (`Z = 0`).
+    /// `Z` may be any representative (the native backend reduces lazily),
+    /// so the test is on its canonical residue.
     #[inline]
     pub(crate) fn is_identity(&self) -> Choice {
-        self.z.is_zero()
+        canonical_fe(&self.z).is_zero()
     }
 
     /// Complete projective addition `p + q` for `a = 0` (RCB Algorithm 7).
@@ -406,6 +408,7 @@ impl Point {
     /// fixed-base combs.
     #[cfg(test)]
     pub(crate) fn mul_reference<F: FieldBackend>(f: &F, scalar: &[u64; 4], point: &Point) -> Point {
+        use crate::ct::ConstantTimeEq;
         let mut table = [Point::identity(f); 16];
         table[1] = *point;
         for i in 2..16 {
@@ -447,8 +450,10 @@ impl Point {
             return None;
         }
         let z_inv = f.invert(&self.z);
-        let x = f.mul(&self.x, &z_inv);
-        let y = f.mul(&self.y, &z_inv);
+        // Canonical coordinates: affine points are serialised, compared and
+        // parity-tested directly.
+        let x = f.canonical(&f.mul(&self.x, &z_inv));
+        let y = f.canonical(&f.mul(&self.y, &z_inv));
         Some((x, y))
     }
 
@@ -461,7 +466,7 @@ impl Point {
         let x2z1 = f.mul(&other.x, &self.z);
         let y1z2 = f.mul(&self.y, &other.z);
         let y2z1 = f.mul(&other.y, &self.z);
-        x1z2.ct_eq(&x2z1) & y1z2.ct_eq(&y2z1)
+        f.ct_eq(&x1z2, &x2z1) & f.ct_eq(&y1z2, &y2z1)
     }
 }
 

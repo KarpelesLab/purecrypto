@@ -121,8 +121,27 @@ pub(crate) trait FieldBackend {
     fn sqrt(&self, a: &Fe) -> CtOption;
     /// Decodes a 32-byte big-endian field element, rejecting any encoding `>= p`.
     fn from_bytes_be(&self, bytes: &[u8; 32]) -> CtOption;
-    /// Serialises an element as 32 big-endian bytes.
+    /// Serialises an element as 32 big-endian bytes (of the canonical
+    /// residue).
     fn to_bytes_be(&self, a: &Fe) -> [u8; 32];
+    /// The canonical residue in `[0, p)` of `a`. A backend whose arithmetic
+    /// may return a non-canonical representative (see [`Secp256k1Field`])
+    /// overrides this; comparisons must go through it (or [`Self::is_zero`]
+    /// / [`Self::ct_eq`]) rather than compare limbs directly.
+    #[inline]
+    fn canonical(&self, a: &Fe) -> Fe {
+        *a
+    }
+    /// Constant-time `a == 0 (mod p)`.
+    #[inline]
+    fn is_zero(&self, a: &Fe) -> Choice {
+        self.canonical(a).is_zero()
+    }
+    /// Constant-time `a == b (mod p)`.
+    #[inline]
+    fn ct_eq(&self, a: &Fe, b: &Fe) -> Choice {
+        self.canonical(a).ct_eq(&self.canonical(b))
+    }
 }
 
 /// Base-field backend over the crate's generic 4-limb Montgomery arithmetic.
@@ -208,25 +227,23 @@ impl FieldBackend for GenericMont {
 /// multiplying it by `c` and adding it in.
 const C: u128 = 0x1_0000_03D1;
 
-/// The prime `p` as little-endian 64-bit limbs (`p = 2²⁵⁶ − 2³² − 977`).
-const P_LIMBS: [u64; 4] = [
-    0xFFFF_FFFE_FFFF_FC2F,
-    0xFFFF_FFFF_FFFF_FFFF,
-    0xFFFF_FFFF_FFFF_FFFF,
-    0xFFFF_FFFF_FFFF_FFFF,
-];
-
 /// Native secp256k1 base-field backend using a pseudo-Mersenne reduction
 /// specialised to `p = 2²⁵⁶ − 2³² − 977`.
 ///
-/// Internally elements are four little-endian `u64` limbs in canonical
-/// `[0, p)` form — the exact in-memory layout of [`Fe`], so the trait-boundary
-/// conversions are pure reinterpretations. Multiplication uses a schoolbook
-/// 256×256→512 product folded back through `2²⁵⁶ ≡ c`; the carry is folded a
-/// fixed number of times (no data-dependent loop counts), then one mask-based
-/// conditional subtraction of `p` restores canonical form. All
-/// operations are constant time in the element values; only the public prime
-/// and (public) Fermat / square-root exponents drive any branching.
+/// Internally elements are four little-endian `u64` limbs — the exact
+/// in-memory layout of [`Fe`], so the trait-boundary conversions are pure
+/// reinterpretations — holding **any representative in `[0, 2²⁵⁶)`** of the
+/// residue, not necessarily the canonical one below `p` (lazy reduction).
+/// Every operation accepts any such representative and returns one:
+/// multiplication folds the schoolbook 256×256→512 product back through
+/// `2²⁵⁶ ≡ c` a fixed number of times, addition folds its carry bit and
+/// subtraction its borrow bit the same way (`2²⁵⁶ ≡ c` again), so no
+/// operation needs a masked select. Canonical form is restored only where
+/// it matters — serialisation, equality ([`FieldBackend::canonical`],
+/// [`FieldBackend::ct_eq`]), inversion and square roots — by one
+/// mask-driven conditional subtraction of `p`. All operations are constant
+/// time in the element values; only the public prime and (public) Fermat /
+/// square-root exponents drive any branching.
 pub(crate) struct Secp256k1Field;
 
 impl Secp256k1Field {
@@ -295,8 +312,26 @@ fn canonicalize(r: [u64; 4], hi: u64) -> [u64; 4] {
     select(&r, &w, mask_from_bit(hi | carry))
 }
 
-/// Folds a 512-bit product (eight little-endian limbs) down to canonical
-/// `[0, p)` using `2²⁵⁶ ≡ c`.
+/// Subtracts `borrow * C` from the four limbs `r` (wrapping), returning the
+/// new limbs and the 0/1 borrow that propagated out of the most significant
+/// limb. The mirror of [`fold_carry`] for subtraction: a wrapped negative
+/// value `d + 2²⁵⁶` represents `d + c`, so taking `c` back off restores a
+/// representative of `d`.
+#[inline]
+fn fold_borrow(mut r: [u64; 4], borrow: u64) -> ([u64; 4], u64) {
+    let mut b: u128 = (borrow as u128) * C;
+    let mut i = 0;
+    while i < 4 {
+        let tmp = (r[i] as u128).wrapping_sub(b);
+        r[i] = tmp as u64;
+        b = (tmp >> 64) & 1;
+        i += 1;
+    }
+    (r, b as u64)
+}
+
+/// Folds a 512-bit product (eight little-endian limbs) down to a
+/// representative in `[0, 2²⁵⁶)` using `2²⁵⁶ ≡ c`.
 #[inline]
 fn reduce512(t: [u64; 8]) -> [u64; 4] {
     // r = lo + hi*c, computed limb-by-limb with a u128 running accumulator.
@@ -316,11 +351,12 @@ fn reduce512(t: [u64; 8]) -> [u64; 4] {
     // Fold d·c (< 2⁶⁷) back in; it can carry out at most one bit, c1. When
     // it does, the wrapped low part is < d·c < 2⁶⁷, so folding c1·c (< 2³⁴)
     // a second time cannot carry again: two folds always leave a value
-    // < 2²⁵⁶ < 2p, which `canonicalize` finishes. The schedule is fixed.
+    // < 2²⁵⁶. The schedule is fixed. (The bound needs only t < 2⁵¹², so the
+    // operands may be any representatives below 2²⁵⁶.)
     let (r, c1) = fold_carry(r, d);
     let (r, c2) = fold_carry(r, c1);
     debug_assert_eq!(c2, 0);
-    canonicalize(r, c2)
+    r
 }
 
 /// Schoolbook 256×256→512 multiply of two little-endian 4-limb operands.
@@ -415,8 +451,13 @@ impl FieldBackend for Secp256k1Field {
             carry = acc >> 64;
             i += 1;
         }
-        // Sum < 2p, so one masked −p restores [0, p).
-        Fe::from_limbs(canonicalize(r, carry as u64))
+        // The carry bit is worth 2²⁵⁶ ≡ c. Folding it can carry out again
+        // only when r > 2²⁵⁶ − c, leaving a wrapped value < c, so a second
+        // fold cannot: two unconditional folds, no mask.
+        let (r, c1) = fold_carry(r, carry as u64);
+        let (r, c2) = fold_carry(r, c1);
+        debug_assert_eq!(c2, 0);
+        Fe::from_limbs(r)
     }
     #[inline]
     fn sub(&self, a: &Fe, b: &Fe) -> Fe {
@@ -431,18 +472,14 @@ impl FieldBackend for Secp256k1Field {
             borrow = (tmp >> 64) & 1;
             i += 1;
         }
-        // On underflow, add p back (constant-time, mask-driven).
-        let mask = mask_from_bit(borrow as u64);
-        let mut out = [0u64; 4];
-        let mut carry: u128 = 0;
-        let mut j = 0;
-        while j < 4 {
-            let acc = (r[j] as u128) + ((P_LIMBS[j] & mask) as u128) + carry;
-            out[j] = acc as u64;
-            carry = acc >> 64;
-            j += 1;
-        }
-        Fe::from_limbs(out)
+        // On underflow the wrapped value is d + 2²⁵⁶ ≡ d + c: take c back
+        // off. That can underflow again only when the wrapped value is < c,
+        // and then the result is ≥ 2²⁵⁶ − c > c, so a second fold cannot:
+        // two unconditional folds, no mask.
+        let (r, b1) = fold_borrow(r, borrow as u64);
+        let (r, b2) = fold_borrow(r, b1);
+        debug_assert_eq!(b2, 0);
+        Fe::from_limbs(r)
     }
     #[inline]
     fn mul(&self, a: &Fe, b: &Fe) -> Fe {
@@ -471,37 +508,25 @@ impl FieldBackend for Secp256k1Field {
         let (r, c1) = fold_carry(r, carry as u64);
         let (r, c2) = fold_carry(r, c1);
         debug_assert_eq!(c2, 0);
-        Fe::from_limbs(canonicalize(r, c2))
+        Fe::from_limbs(r)
     }
     #[inline]
     fn negate(&self, a: &Fe) -> Fe {
-        let a = a.as_limbs();
-        // p - a, then select 0 when a == 0 (since p - 0 == p is non-canonical).
-        let mut r = [0u64; 4];
-        let mut borrow: u128 = 0;
-        let mut i = 0;
-        while i < 4 {
-            let tmp = (P_LIMBS[i] as u128).wrapping_sub(a[i] as u128 + borrow);
-            r[i] = tmp as u64;
-            borrow = (tmp >> 64) & 1;
-            i += 1;
-        }
-        let acc = a[0] | a[1] | a[2] | a[3];
-        // Top bit of `acc | -acc` is 1 iff `acc != 0`; invert for "is zero".
-        let zero_mask = mask_from_bit(((acc | acc.wrapping_neg()) >> 63) ^ 1);
-        let out = select(&r, &[0u64; 4], zero_mask);
-        Fe::from_limbs(out)
+        // 0 − a with the borrow folded: p − a for a canonical nonzero `a`,
+        // and 0 for 0 (no borrow, nothing to fold).
+        self.sub(&Fe::ZERO, a)
     }
     fn invert(&self, a: &Fe) -> Fe {
         // Bernstein–Yang safegcd (a fixed 590-divstep schedule): constant
         // time, and ~2.7× faster than the Fermat chain (`invert_chain`).
-        // Elements are canonical (< p), as the inversion requires.
-        SAFEGCD_P.invert(a)
+        // The inversion requires a canonical (< p) input; its output is
+        // canonical.
+        SAFEGCD_P.invert(&self.canonical(a))
     }
     fn sqrt(&self, a: &Fe) -> CtOption {
         // p ≡ 3 (mod 4) ⇒ candidate root a^((p+1)/4); valid iff its square == a.
         let cand = self.sqrt_candidate(a);
-        let ok = self.square(&cand).ct_eq(a);
+        let ok = self.ct_eq(&self.square(&cand), a);
         CtOption::new(cand, ok)
     }
     fn from_bytes_be(&self, bytes: &[u8; 32]) -> CtOption {
@@ -511,9 +536,22 @@ impl FieldBackend for Secp256k1Field {
     }
     fn to_bytes_be(&self, a: &Fe) -> [u8; 32] {
         let mut out = [0u8; 32];
-        a.write_be_bytes(&mut out);
+        self.canonical(a).write_be_bytes(&mut out);
         out
     }
+    #[inline]
+    fn canonical(&self, a: &Fe) -> Fe {
+        // Every representative is < 2²⁵⁶ < 2p, so one masked −p suffices.
+        Fe::from_limbs(canonicalize(*a.as_limbs(), 0))
+    }
+}
+
+/// The canonical residue of a native-backend representative (see
+/// [`FieldBackend::canonical`]), for callers without a backend handle. A
+/// canonical input (any [`GenericMont`] output) passes through unchanged.
+#[inline]
+pub(super) fn canonical_fe(a: &Fe) -> Fe {
+    Fe::from_limbs(canonicalize(*a.as_limbs(), 0))
 }
 
 /// The safegcd inversion context for `p`, built at compile time.
@@ -540,7 +578,8 @@ impl Secp256k1Field {
     pub(crate) fn sqrt_candidate(&self, a: &Fe) -> Fe {
         let (x2, t) = self.pow_chain_prefix(a);
         let t = self.mul(&self.sqn(&t, 6), &x2);
-        self.sqn(&t, 2)
+        // Canonical, so a caller may read its parity or bytes directly.
+        self.canonical(&self.sqn(&t, 2))
     }
 
     /// `a^(2^n)`: `n` successive squarings.
@@ -646,11 +685,18 @@ mod backend_tests {
     }
 
     /// Canonical 32-byte big-endian encoding, independent of which backend
-    /// produced `a` (both return canonical `[0, p)` residues).
+    /// produced `a` (the native backend may hand back a representative
+    /// `>= p`; the oracle always returns canonical residues).
     fn bytes(a: &Fe) -> [u8; 32] {
         let mut out = [0u8; 32];
-        a.write_be_bytes(&mut out);
+        canonical_fe(a).write_be_bytes(&mut out);
         out
+    }
+
+    /// `a + p` when it fits in 256 bits (`a < c`): a non-canonical
+    /// representative of `a` the native backend must accept.
+    fn lifted(a: &Fe) -> Option<Fe> {
+        bool::from(a.ct_lt(&Fe::from_limbs([C as u64, 0, 0, 0]))).then(|| a.wrapping_add(&p()))
     }
 
     /// Field elements at and around the dangerous boundaries, all in `[0, p)`.
@@ -766,6 +812,56 @@ mod backend_tests {
             check_unary(&g, &n, a);
             for b in &cases {
                 check_pair(&g, &n, a, b);
+            }
+        }
+    }
+
+    /// Non-canonical representatives (`a + p`, for small `a`) as inputs to
+    /// the native backend give the same residues as the canonical values do
+    /// through the oracle, for every operation, and `canonical` / `is_zero`
+    /// / `ct_eq` see through them.
+    #[test]
+    fn native_accepts_non_canonical_inputs() {
+        let g = GenericMont::new();
+        let n = Secp256k1Field::new();
+        let mut rng = SplitMix64(0x1A2B_3C4D_5E6F_7081);
+        let mut small: [Fe; 24] = [Fe::ZERO; 24];
+        small[1] = Fe::ONE;
+        small[2] = Fe::from_u64(2);
+        small[3] = Fe::from_limbs([(C as u64) - 1, 0, 0, 0]);
+        for s in &mut small[4..] {
+            *s = Fe::from_u64(rng.next_u64() % (C as u64));
+        }
+        let rand = [rand_fe(&mut rng), rand_fe(&mut rng), Fe::ONE, Fe::ZERO];
+        for a in &small {
+            let al = lifted(a).expect("small values lift");
+            assert_eq!(bytes(&n.canonical(&al)), bytes(a));
+            assert_eq!(bool::from(n.is_zero(&al)), bool::from(a.is_zero()));
+            assert!(bool::from(n.ct_eq(&al, a)));
+            // Unary ops on the lifted input vs the oracle on the value.
+            assert_eq!(bytes(&n.square(&al)), bytes(&g.square(a)));
+            assert_eq!(bytes(&n.negate(&al)), bytes(&g.negate(a)));
+            assert_eq!(bytes(&n.invert(&al)), bytes(&g.invert(a)));
+            assert_eq!(bytes(&n.sqrt(&al).value), bytes(&g.sqrt(a).value));
+            assert_eq!(n.to_bytes_be(&al), g.to_bytes_be(a));
+            for b in small.iter().chain(rand.iter()) {
+                let k = b.as_limbs()[0] as u32;
+                assert_eq!(
+                    bytes(&n.mul_small(&al, k)),
+                    bytes(&g.mul(a, &Fe::from_u64(k as u64)))
+                );
+                assert_eq!(bytes(&n.add(&al, b)), bytes(&g.add(a, b)));
+                assert_eq!(bytes(&n.add(b, &al)), bytes(&g.add(b, a)));
+                assert_eq!(bytes(&n.sub(&al, b)), bytes(&g.sub(a, b)));
+                assert_eq!(bytes(&n.sub(b, &al)), bytes(&g.sub(b, a)));
+                assert_eq!(bytes(&n.mul(&al, b)), bytes(&g.mul(a, b)));
+                assert_eq!(bytes(&n.mul(b, &al)), bytes(&g.mul(b, a)));
+                if let Some(bl) = lifted(b) {
+                    assert_eq!(bytes(&n.add(&al, &bl)), bytes(&g.add(a, b)));
+                    assert_eq!(bytes(&n.sub(&al, &bl)), bytes(&g.sub(a, b)));
+                    assert_eq!(bytes(&n.mul(&al, &bl)), bytes(&g.mul(a, b)));
+                    assert!(bool::from(n.ct_eq(&al, &bl)) == bool::from(a.ct_eq(b)));
+                }
             }
         }
     }

@@ -139,7 +139,7 @@
 //! that path. Nothing else in the wire format is left unchecked.
 
 use crate::bignum::Uint;
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
+use crate::ct::{Choice, ConditionallySelectable, ConstantTimeLess};
 use crate::ec::Error;
 use crate::ec::secp256k1::field_backend::{FieldBackend, Secp256k1Field};
 use crate::ec::secp256k1::{AffinePoint, ProjectivePoint, Scalar};
@@ -296,7 +296,23 @@ impl Field {
     /// Returns a [`Choice`] that is true iff `a` is a quadratic residue
     /// (counting `0` as one).
     fn is_residue(&self, a: &Fe) -> Choice {
-        self.sqrt(&self.sqr(a)).ct_eq(a)
+        self.ct_eq(&self.sqrt(&self.sqr(a)), a)
+    }
+
+    /// Constant-time `a == b (mod p)`, for any representatives (the backend
+    /// reduces lazily, so limbs must not be compared directly).
+    fn ct_eq(&self, a: &Fe, b: &Fe) -> Choice {
+        self.b.ct_eq(a, b)
+    }
+
+    /// Constant-time `a == 0 (mod p)`.
+    fn is_zero(&self, a: &Fe) -> Choice {
+        self.b.is_zero(a)
+    }
+
+    /// The canonical 32-byte big-endian encoding of `a`.
+    fn to_bytes(&self, a: &Fe) -> [u8; 32] {
+        self.b.to_bytes_be(a)
     }
 
     /// `x³ + 7`, the right-hand side of the curve equation.
@@ -317,10 +333,9 @@ impl Field {
 /// coordinates here can be secret (the per-asset generator is a hash of the
 /// asset tag), so a parity-dependent branch would leak bits of the tag.
 fn affine_from_xy(x: &Fe, y: &Fe) -> Result<AffinePoint, Error> {
-    let mut x_bytes = [0u8; 32];
-    let mut y_bytes = [0u8; 32];
-    x.write_be_bytes(&mut x_bytes);
-    y.write_be_bytes(&mut y_bytes);
+    let f = Field::new();
+    let mut x_bytes = f.to_bytes(x);
+    let mut y_bytes = f.to_bytes(y);
     let point = AffinePoint::from_xy_be_bytes(&x_bytes, &y_bytes);
     x_bytes.zeroize();
     y_bytes.zeroize();
@@ -362,12 +377,12 @@ fn parse_tagged(f: &Field, bytes: &[u8; 33], tag: u8) -> Result<AffinePoint, Err
     let root = f.sqrt(&rhs);
     // Declassified (Valgrind harness): a public verdict (an error return or
     // a rejected candidate).
-    if !f.sqr(&root).ct_eq(&rhs).declassify() {
+    if !f.ct_eq(&f.sqr(&root), &rhs).declassify() {
         return Err(Error::InvalidInput);
     }
     // Declassified (Valgrind harness): a public verdict (an error return or
     // a rejected candidate).
-    if root.is_zero().declassify() {
+    if f.is_zero(&root).declassify() {
         // y = 0 would be a point of order two; secp256k1's group order is an
         // odd prime, so no such point exists. Defensive.
         return Err(Error::InvalidInput);
@@ -453,7 +468,7 @@ fn shallue_van_de_woestijne(f: &Field, t: &Fe) -> Result<(Fe, Fe), Error> {
 fn root_of(f: &Field, x: &Fe) -> (Fe, Choice) {
     let rhs = f.curve_rhs(x);
     let root = f.sqrt(&rhs);
-    let ok = f.sqr(&root).ct_eq(&rhs);
+    let ok = f.ct_eq(&f.sqr(&root), &rhs);
     (root, ok)
 }
 
@@ -638,6 +653,7 @@ impl Generator {
     /// takes is public too.
     #[cfg(feature = "zkp-h-table")]
     fn is_h(&self) -> bool {
+        use crate::ct::ConstantTimeEq;
         let h = Generator::h().0;
         (self.0.x_bytes().ct_eq(&h.x_bytes()) & self.0.y_bytes().ct_eq(&h.y_bytes())).declassify()
     }
@@ -1232,11 +1248,13 @@ mod tests {
         }
         for (i, a) in cases.iter().enumerate() {
             let b = &cases[(i * 31 + 7) % cases.len()];
-            assert_eq!(f.add(a, b), m.add_mod(a, b));
-            assert_eq!(f.sub(a, b), m.sub_mod(a, b));
-            assert_eq!(f.mul(a, b), m.mul_mod(a, b));
-            assert_eq!(f.sqr(a), m.mul_mod(a, a));
-            assert_eq!(f.neg(a), m.sub_mod(&Fe::ZERO, a));
+            // The backend reduces lazily: compare canonical residues.
+            let c = |v: Fe| f.b.canonical(&v);
+            assert_eq!(c(f.add(a, b)), m.add_mod(a, b));
+            assert_eq!(c(f.sub(a, b)), m.sub_mod(a, b));
+            assert_eq!(c(f.mul(a, b)), m.mul_mod(a, b));
+            assert_eq!(c(f.sqr(a)), m.mul_mod(a, a));
+            assert_eq!(c(f.neg(a)), m.sub_mod(&Fe::ZERO, a));
             assert_eq!(f.inv(a), m.inv_prime(a));
             assert_eq!(f.sqrt(a), m.pow(a, &e));
         }
@@ -1247,11 +1265,11 @@ mod tests {
         let f = Field::new();
         let c = Fe::from_be_bytes(&SQRT_MINUS3_BYTES);
         // c² = −3
-        assert!(bool::from(f.sqr(&c).ct_eq(&f.neg(&Fe::from_u64(3)))));
+        assert!(bool::from(f.ct_eq(&f.sqr(&c), &f.neg(&Fe::from_u64(3)))));
         // d = (c − 1)/2
         let d = Fe::from_be_bytes(&SVDW_D_BYTES);
         assert!(bool::from(
-            f.add(&d, &d).ct_eq(&f.sub(&c, &Fe::from_u64(1)))
+            f.ct_eq(&f.add(&d, &d), &f.sub(&c, &Fe::from_u64(1)))
         ));
         // 4·((p+1)/4) == p + 1
         let e = Fe::from_be_bytes(&SQRT_EXP_BYTES);
@@ -1561,7 +1579,7 @@ mod tests {
             let x = Fe::from_u64(k);
             let rhs = f.curve_rhs(&x);
             let root = f.sqrt(&rhs);
-            if bool::from(f.sqr(&root).ct_eq(&rhs)) {
+            if bool::from(f.ct_eq(&f.sqr(&root), &rhs)) {
                 continue;
             }
             found += 1;

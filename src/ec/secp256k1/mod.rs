@@ -433,12 +433,12 @@ impl ProjectivePoint {
         }
         let f = field();
         let pt = &self.0;
-        if bool::from(f.mul(r, &pt.z).ct_eq(&pt.x)) {
+        if bool::from(f.ct_eq(&f.mul(r, &pt.z), &pt.x)) {
             return true;
         }
         let p_minus_n = field_backend::p().wrapping_sub(&Scalar::ORDER);
         bool::from(r.ct_lt(&p_minus_n))
-            && bool::from(f.mul(&r.wrapping_add(&Scalar::ORDER), &pt.z).ct_eq(&pt.x))
+            && bool::from(f.ct_eq(&f.mul(&r.wrapping_add(&Scalar::ORDER), &pt.z), &pt.x))
     }
 
     /// Constant-time point equality (different projective representatives of the
@@ -515,7 +515,7 @@ impl AffinePoint {
         let y2 = f.square(y);
         let x3 = f.mul(&f.square(x), x);
         let rhs = f.add(&x3, &Fe::from_u64(7));
-        y2.ct_eq(&rhs)
+        f.ct_eq(&y2, &rhs)
     }
 
     /// Builds an affine point from big-endian coordinate bytes, validating
@@ -543,7 +543,7 @@ impl AffinePoint {
         }
         // The identity has no affine representation; `(0, 0)` is how a caller
         // would try to spell it.
-        if bool::from(x.is_zero() & y.is_zero()) {
+        if bool::from(f.is_zero(&x) & f.is_zero(&y)) {
             return Err(Error::InvalidInput);
         }
         Ok(AffinePoint { x, y })
@@ -610,11 +610,13 @@ impl AffinePoint {
                 // root when the parities already match. A plain `if` here
                 // would leak the parity of a secret-derived `y` through
                 // control flow.
+                // Both roots are canonical: `sqrt` returns the canonical
+                // residue and `negate` of a canonical nonzero value is `p − y`.
                 let y = Fe::conditional_select(&y, &f.negate(&y), have_odd.ct_eq(&want_odd));
                 let pt = AffinePoint { x, y };
                 // y == 0 would make both parities identical; reject (no such
                 // point exists on secp256k1, but the guard is cheap).
-                if bool::from(pt.x.is_zero() & pt.y.is_zero()) {
+                if bool::from(f.is_zero(&pt.x) & f.is_zero(&pt.y)) {
                     return Err(Error::InvalidInput);
                 }
                 Ok(pt)
@@ -638,7 +640,7 @@ impl AffinePoint {
                 if !bool::from(Self::is_on_curve(&f, &x, &y)) {
                     return Err(Error::InvalidInput);
                 }
-                if bool::from(x.is_zero() & y.is_zero()) {
+                if bool::from(f.is_zero(&x) & f.is_zero(&y)) {
                     return Err(Error::InvalidInput);
                 }
                 Ok(AffinePoint { x, y })
