@@ -186,13 +186,15 @@ impl ChaCha20 {
         }
         // On aarch64 NEON is part of the baseline ISA, so the 2×4-way kernel
         // is the normal path with no runtime probe. It hands back a tail of
-        // under two blocks, where a 4-wide pass would mostly compute
-        // discarded blocks, to the scalar loop below — which also remains the
-        // whole path for buffers that short (single-block callers such as
-        // the Poly1305 OTK derivation never enter the kernel) and in the
-        // constant-time harness's forced-portable mode.
+        // up to two blocks, where a 4-wide pass would mostly compute
+        // discarded blocks (measured: slower than the scalar loop up to 128
+        // bytes, faster from three blocks on), to the scalar loop below —
+        // which also remains the whole path for buffers that short
+        // (single-block callers such as the Poly1305 OTK derivation never
+        // enter the kernel) and in the constant-time harness's
+        // forced-portable mode.
         #[cfg(target_arch = "aarch64")]
-        let (done, mut block_counter) = if buf.len() >= 128 && neon::supported() {
+        let (done, mut block_counter) = if buf.len() > 128 && neon::supported() {
             neon::apply_keystream(&self.key, nonce, counter, buf)
         } else {
             (0, counter)
@@ -628,8 +630,8 @@ mod neon {
     }
 
     /// Applies the keystream to as much of `buf` as the wide kernels cover
-    /// and returns `(bytes done, next block counter)`. The remainder is
-    /// under 128 bytes, left for the caller's scalar loop (for a tail that
+    /// and returns `(bytes done, next block counter)`. The remainder is at
+    /// most 128 bytes, left for the caller's scalar loop (for a tail that
     /// short, a 4-wide pass would mostly compute discarded blocks).
     pub(super) fn apply_keystream(
         key: &[u32; 8],
@@ -695,10 +697,11 @@ mod neon {
                 off += 256;
                 ctr = ctr.wrapping_add(4);
             }
-            // Tail of 128..256 bytes: generate a 4-block set into scratch and
-            // XOR what is needed. Blocks past the end of `buf` are computed
-            // and discarded, so the counter wrap they could incur is harmless.
-            if off + 128 <= len {
+            // Tail of three or four blocks (129..256 bytes): generate a
+            // 4-block set into scratch and XOR what is needed. Blocks past the
+            // end of `buf` are computed and discarded, so the counter wrap
+            // they could incur is harmless.
+            if off + 128 < len {
                 ia = init4(key, &n, ctr);
                 a = ia;
                 for _ in 0..10 {
@@ -762,7 +765,7 @@ mod tests {
                 // report the right resume point and leave under 128 bytes.
                 let mut w = base.clone();
                 let (done, mut next) = super::neon::apply_keystream(&c.key, &nonce, ctr, &mut w);
-                assert!(len - done < 128, "neon tail len={len} done={done}");
+                assert!(len - done <= 128, "neon tail len={len} done={done}");
                 assert_eq!(next, ctr.wrapping_add(done.div_ceil(64) as u32));
                 for block in w[done..].chunks_mut(64) {
                     let ks = c.block(&nonce, next);
