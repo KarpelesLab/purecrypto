@@ -147,8 +147,10 @@ mod x86 {
     /// register layout once and kept there across every 64-byte block (only the
     /// per-block Davies–Meyer feed-forward touches it), so an N-block call pays
     /// the state load/store exactly once instead of N times. Each block runs the
-    /// standard 16-group `sha256rnds2` / `sha256msg1` / `sha256msg2` sequence,
-    /// with the schedule rotation computed from `g % 4`.
+    /// standard 16-group `sha256rnds2` / `sha256msg1` / `sha256msg2` sequence as
+    /// straight-line code: the four message vectors are named registers rotated
+    /// through the macro arguments, so nothing in the schedule goes through a
+    /// stack-resident array or a `g % 4` index.
     #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
     pub(super) unsafe fn compress256_blocks(state: &mut [u32; 8], data: &[u8]) {
         unsafe {
@@ -176,35 +178,105 @@ mod x86 {
                 let cdgh_save = state1;
 
                 // Load the four message vectors (16 bytes each), byte-reversed.
-                let mut m = [
-                    _mm_shuffle_epi8(_mm_loadu_si128(bptr as *const __m128i), mask),
-                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(16) as *const __m128i), mask),
-                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(32) as *const __m128i), mask),
-                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(48) as *const __m128i), mask),
-                ];
+                let mut m0 = _mm_shuffle_epi8(_mm_loadu_si128(bptr as *const __m128i), mask);
+                let mut m1 =
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(16) as *const __m128i), mask);
+                let mut m2 =
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(32) as *const __m128i), mask);
+                let mut m3 =
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(48) as *const __m128i), mask);
 
-                for g in 0..16usize {
-                    let i = g % 4;
-                    // Round constants K[4g..4g+4] line up with the message lanes.
-                    let mut msg =
-                        _mm_add_epi32(m[i], _mm_loadu_si128(kptr.add(4 * g) as *const __m128i));
-                    state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-
-                    // Message schedule (sha256msg2 half): groups 3..=14.
-                    if (3..=14).contains(&g) {
-                        let tmp = _mm_alignr_epi8(m[i], m[(i + 3) % 4], 4);
-                        m[(i + 1) % 4] = _mm_add_epi32(m[(i + 1) % 4], tmp);
-                        m[(i + 1) % 4] = _mm_sha256msg2_epu32(m[(i + 1) % 4], m[i]);
-                    }
-
-                    msg = _mm_shuffle_epi32(msg, 0x0E);
-                    state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-                    // Message schedule (sha256msg1 half): groups 1..=12.
-                    if (1..=12).contains(&g) {
-                        m[(i + 3) % 4] = _mm_sha256msg1_epu32(m[(i + 3) % 4], m[i]);
-                    }
+                // Four rounds under `K[k..k + 4]` with message vector `$mi`
+                // (round constants line up with the message lanes). Returns the
+                // low-half round key for the second `rnds2`.
+                macro_rules! rnds4 {
+                    ($mi:ident, $k:expr) => {{
+                        let msg =
+                            _mm_add_epi32($mi, _mm_loadu_si128(kptr.add($k) as *const __m128i));
+                        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
+                        msg
+                    }};
                 }
+                // The `sha256msg2` half of the schedule, between the two
+                // `rnds2`s: finishes the words of the next group (`$mi1`).
+                macro_rules! msg2 {
+                    ($mi:ident, $mi1:ident, $mi3:ident) => {{
+                        let tmp = _mm_alignr_epi8($mi, $mi3, 4);
+                        $mi1 = _mm_add_epi32($mi1, tmp);
+                        $mi1 = _mm_sha256msg2_epu32($mi1, $mi);
+                    }};
+                }
+                macro_rules! rnds4_hi {
+                    ($msg:ident) => {{
+                        let msg = _mm_shuffle_epi32($msg, 0x0E);
+                        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
+                    }};
+                }
+                // The `sha256msg1` half: starts the words three groups ahead
+                // (`$mi3`).
+                macro_rules! msg1 {
+                    ($mi:ident, $mi3:ident) => {
+                        $mi3 = _mm_sha256msg1_epu32($mi3, $mi);
+                    };
+                }
+                // Group `g` uses `m[g % 4]`; `msg2` runs for groups 3..=14 and
+                // `msg1` for groups 1..=12, exactly as the loop form did.
+                let t = rnds4!(m0, 0);
+                rnds4_hi!(t);
+                let t = rnds4!(m1, 4);
+                rnds4_hi!(t);
+                msg1!(m1, m0);
+                let t = rnds4!(m2, 8);
+                rnds4_hi!(t);
+                msg1!(m2, m1);
+                let t = rnds4!(m3, 12);
+                msg2!(m3, m0, m2);
+                rnds4_hi!(t);
+                msg1!(m3, m2);
+                let t = rnds4!(m0, 16);
+                msg2!(m0, m1, m3);
+                rnds4_hi!(t);
+                msg1!(m0, m3);
+                let t = rnds4!(m1, 20);
+                msg2!(m1, m2, m0);
+                rnds4_hi!(t);
+                msg1!(m1, m0);
+                let t = rnds4!(m2, 24);
+                msg2!(m2, m3, m1);
+                rnds4_hi!(t);
+                msg1!(m2, m1);
+                let t = rnds4!(m3, 28);
+                msg2!(m3, m0, m2);
+                rnds4_hi!(t);
+                msg1!(m3, m2);
+                let t = rnds4!(m0, 32);
+                msg2!(m0, m1, m3);
+                rnds4_hi!(t);
+                msg1!(m0, m3);
+                let t = rnds4!(m1, 36);
+                msg2!(m1, m2, m0);
+                rnds4_hi!(t);
+                msg1!(m1, m0);
+                let t = rnds4!(m2, 40);
+                msg2!(m2, m3, m1);
+                rnds4_hi!(t);
+                msg1!(m2, m1);
+                let t = rnds4!(m3, 44);
+                msg2!(m3, m0, m2);
+                rnds4_hi!(t);
+                msg1!(m3, m2);
+                let t = rnds4!(m0, 48);
+                msg2!(m0, m1, m3);
+                rnds4_hi!(t);
+                msg1!(m0, m3);
+                let t = rnds4!(m1, 52);
+                msg2!(m1, m2, m0);
+                rnds4_hi!(t);
+                let t = rnds4!(m2, 56);
+                msg2!(m2, m3, m1);
+                rnds4_hi!(t);
+                let t = rnds4!(m3, 60);
+                rnds4_hi!(t);
 
                 state0 = _mm_add_epi32(state0, abef_save);
                 state1 = _mm_add_epi32(state1, cdgh_save);
@@ -220,58 +292,23 @@ mod x86 {
         }
     }
 
-    /// One SHA-NI group of four SHA-1 rounds (`g` = 0..20, `IMM` = `g / 5`
-    /// selects the round function / constant group baked into `sha1rnds4`).
-    ///
-    /// `abcd` holds state words a..d in reverse lane order; `ecar` carries the
-    /// `e` term — it is the pre-round `abcd` of the previous group, from which
-    /// `sha1nexte` recovers `rotl30(a)` and adds the round's message words. The
-    /// first group instead adds the message to the incoming `e` (lane 3), which
-    /// is already un-rotated.
-    ///
-    /// The message schedule advances in three independent steps whose write
-    /// targets are distinct (`m[i+3]`, `m[i+2]`, `m[i+1]`), all reading only
-    /// `m[i]`: `sha1msg1` feeds groups `g + 3`, the XOR groups `g + 2`, and
-    /// `sha1msg2` finishes the words consumed by group `g + 1`. Their ranges stop
-    /// once the words for group 19 (round 79) are complete.
-    // Not `inline(always)`: that is rejected on `#[target_feature]` functions
-    // (rust#145574). The hint suffices — the caller enables the same features, so
-    // LLVM inlines and unrolls these into the block loop.
-    #[inline]
-    #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
-    unsafe fn sha1_group<const IMM: i32>(
-        g: usize,
-        abcd: &mut __m128i,
-        ecar: &mut __m128i,
-        m: &mut [__m128i; 4],
-    ) {
-        unsafe {
-            let i = g % 4;
-            let e = if g == 0 {
-                _mm_add_epi32(*ecar, m[0])
-            } else {
-                _mm_sha1nexte_epu32(*ecar, m[i])
-            };
-            *ecar = *abcd;
-            *abcd = _mm_sha1rnds4_epu32::<IMM>(*abcd, e);
-            if (1..=16).contains(&g) {
-                m[(i + 3) % 4] = _mm_sha1msg1_epu32(m[(i + 3) % 4], m[i]);
-            }
-            if (2..=17).contains(&g) {
-                m[(i + 2) % 4] = _mm_xor_si128(m[(i + 2) % 4], m[i]);
-            }
-            if (3..=18).contains(&g) {
-                m[(i + 1) % 4] = _mm_sha1msg2_epu32(m[(i + 1) % 4], m[i]);
-            }
-        }
-    }
-
     /// SHA-NI SHA-1 multi-block compression. The state is loaded into the
     /// reverse-lane `abcd` vector plus the lane-3 `e` term once and kept there
     /// across every 64-byte block (only the per-block feed-forward touches it), so
     /// an N-block call pays the state load/store exactly once instead of N times.
-    /// Each block runs 20 groups of four rounds via [`sha1_group`], one const-`IMM`
-    /// quarter at a time.
+    /// Each block is 20 straight-line groups of four rounds; the four message
+    /// vectors are named registers rotated through the macro arguments, so the
+    /// schedule never goes through a stack array or a `g % 4` index.
+    ///
+    /// Per group, `e` carries the `e` term — it is the pre-round `abcd` of the
+    /// previous group, from which `sha1nexte` recovers `rotl30(a)` and adds the
+    /// round's message words. The first group instead adds the message to the
+    /// incoming `e` (lane 3), which is already un-rotated. The message schedule
+    /// advances in three independent steps whose write targets are distinct
+    /// (`m[i+3]`, `m[i+2]`, `m[i+1]`), all reading only `m[i]`: `sha1msg1` feeds
+    /// groups `g + 3`, the XOR groups `g + 2`, and `sha1msg2` finishes the words
+    /// consumed by group `g + 1`. They run for groups 1..=16, 2..=17 and 3..=18
+    /// respectively, stopping once the words for group 19 (round 79) exist.
     #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
     pub(super) unsafe fn compress_sha1_blocks(state: &mut [u32; 5], data: &[u8]) {
         unsafe {
@@ -296,28 +333,110 @@ mod x86 {
                 let e_save = e;
 
                 // Load the four message vectors (16 bytes each), byte-reversed.
-                let mut m = [
-                    _mm_shuffle_epi8(_mm_loadu_si128(bptr as *const __m128i), mask),
-                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(16) as *const __m128i), mask),
-                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(32) as *const __m128i), mask),
-                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(48) as *const __m128i), mask),
-                ];
+                let mut m0 = _mm_shuffle_epi8(_mm_loadu_si128(bptr as *const __m128i), mask);
+                let mut m1 =
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(16) as *const __m128i), mask);
+                let mut m2 =
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(32) as *const __m128i), mask);
+                let mut m3 =
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(48) as *const __m128i), mask);
 
-                // `e` enters as the carry for group 0 and leaves as the carry of
-                // group 19 (the pre-round `abcd`), which the feed-forward below
-                // turns back into the next block's lane-3 `e`.
-                for g in 0..5 {
-                    sha1_group::<0>(g, &mut abcd, &mut e, &mut m);
+                // The four rounds themselves (`$imm` = `g / 5` selects the
+                // round function / constant baked into `sha1rnds4`).
+                macro_rules! rnds {
+                    ($imm:literal, $mi:ident) => {{
+                        let en = _mm_sha1nexte_epu32(e, $mi);
+                        e = abcd;
+                        abcd = _mm_sha1rnds4_epu32::<$imm>(abcd, en);
+                    }};
                 }
-                for g in 5..10 {
-                    sha1_group::<1>(g, &mut abcd, &mut e, &mut m);
+                macro_rules! msg1 {
+                    ($mi:ident, $mi3:ident) => {
+                        $mi3 = _mm_sha1msg1_epu32($mi3, $mi);
+                    };
                 }
-                for g in 10..15 {
-                    sha1_group::<2>(g, &mut abcd, &mut e, &mut m);
+                macro_rules! xor {
+                    ($mi:ident, $mi2:ident) => {
+                        $mi2 = _mm_xor_si128($mi2, $mi);
+                    };
                 }
-                for g in 15..20 {
-                    sha1_group::<3>(g, &mut abcd, &mut e, &mut m);
+                macro_rules! msg2 {
+                    ($mi:ident, $mi1:ident) => {
+                        $mi1 = _mm_sha1msg2_epu32($mi1, $mi);
+                    };
                 }
+                // Group 0: the incoming `e` is already un-rotated.
+                let en = _mm_add_epi32(e, m0);
+                e = abcd;
+                abcd = _mm_sha1rnds4_epu32::<0>(abcd, en);
+                // Group g uses m[g % 4]: m0 m1 m2 m3 m0 ...
+                rnds!(0, m1);
+                msg1!(m1, m0);
+                rnds!(0, m2);
+                msg1!(m2, m1);
+                xor!(m2, m0);
+                rnds!(0, m3);
+                msg1!(m3, m2);
+                xor!(m3, m1);
+                msg2!(m3, m0);
+                rnds!(0, m0);
+                msg1!(m0, m3);
+                xor!(m0, m2);
+                msg2!(m0, m1);
+                rnds!(1, m1);
+                msg1!(m1, m0);
+                xor!(m1, m3);
+                msg2!(m1, m2);
+                rnds!(1, m2);
+                msg1!(m2, m1);
+                xor!(m2, m0);
+                msg2!(m2, m3);
+                rnds!(1, m3);
+                msg1!(m3, m2);
+                xor!(m3, m1);
+                msg2!(m3, m0);
+                rnds!(1, m0);
+                msg1!(m0, m3);
+                xor!(m0, m2);
+                msg2!(m0, m1);
+                rnds!(1, m1);
+                msg1!(m1, m0);
+                xor!(m1, m3);
+                msg2!(m1, m2);
+                rnds!(2, m2);
+                msg1!(m2, m1);
+                xor!(m2, m0);
+                msg2!(m2, m3);
+                rnds!(2, m3);
+                msg1!(m3, m2);
+                xor!(m3, m1);
+                msg2!(m3, m0);
+                rnds!(2, m0);
+                msg1!(m0, m3);
+                xor!(m0, m2);
+                msg2!(m0, m1);
+                rnds!(2, m1);
+                msg1!(m1, m0);
+                xor!(m1, m3);
+                msg2!(m1, m2);
+                rnds!(2, m2);
+                msg1!(m2, m1);
+                xor!(m2, m0);
+                msg2!(m2, m3);
+                rnds!(3, m3);
+                msg1!(m3, m2);
+                xor!(m3, m1);
+                msg2!(m3, m0);
+                rnds!(3, m0);
+                msg1!(m0, m3);
+                xor!(m0, m2);
+                msg2!(m0, m1);
+                rnds!(3, m1);
+                xor!(m1, m3);
+                msg2!(m1, m2);
+                rnds!(3, m2);
+                msg2!(m2, m3);
+                rnds!(3, m3);
 
                 // Davies-Meyer feed-forward: `sha1nexte` supplies the rotate the
                 // final carry still owes, then adds the saved `e`.
@@ -344,9 +463,11 @@ mod arm {
 
     /// SHA-256 multi-block compression using the ARMv8 `sha2` extension. State
     /// (`abcd`/`efgh`) is loaded once and kept in registers across every block;
-    /// messages are byte-reversed per 32-bit word. Each block runs a 16-group
-    /// loop keyed on `g % 4`, evolving the schedule with `sha256su0`/`sha256su1`
-    /// (the round key uses the pre-update message words).
+    /// messages are byte-reversed per 32-bit word. Each block is 16 straight-line
+    /// groups of four rounds, evolving the schedule with `sha256su0`/`sha256su1`
+    /// (the round key uses the pre-update message words); the four message
+    /// vectors are named registers rotated through the macro arguments rather
+    /// than a `g % 4`-indexed array.
     #[target_feature(enable = "sha2")]
     pub(super) unsafe fn compress256_blocks(state: &mut [u32; 8], data: &[u8]) {
         unsafe {
@@ -358,26 +479,54 @@ mod arm {
                 let bptr = base.add(blk * 64);
                 let abcd0 = abcd;
                 let efgh0 = efgh;
-                let mut m = [
-                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr))),
-                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(16)))),
-                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(32)))),
-                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(48)))),
-                ];
-                for g in 0..16usize {
-                    let i = g % 4;
-                    let wk = vaddq_u32(m[i], vld1q_u32(K256.as_ptr().add(4 * g)));
-                    if g < 12 {
-                        m[i] = vsha256su1q_u32(
-                            vsha256su0q_u32(m[i], m[(i + 1) % 4]),
-                            m[(i + 2) % 4],
-                            m[(i + 3) % 4],
-                        );
-                    }
-                    let tmp = abcd;
-                    abcd = vsha256hq_u32(abcd, efgh, wk);
-                    efgh = vsha256h2q_u32(efgh, tmp, wk);
+                let mut m0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr)));
+                let mut m1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(16))));
+                let mut m2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(32))));
+                let mut m3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(48))));
+                // Four rounds under `K[k..k + 4]` with message vector `$mi`.
+                macro_rules! r4 {
+                    ($mi:ident, $k:expr) => {{
+                        let wk = vaddq_u32($mi, vld1q_u32(K256.as_ptr().add($k)));
+                        let tmp = abcd;
+                        abcd = vsha256hq_u32(abcd, efgh, wk);
+                        efgh = vsha256h2q_u32(efgh, tmp, wk);
+                    }};
                 }
+                // Schedule: `$a` becomes the words four groups ahead (runs for
+                // groups 0..12; the words for groups 12..16 then all exist).
+                macro_rules! sch {
+                    ($a:ident, $b:ident, $c:ident, $d:ident) => {
+                        $a = vsha256su1q_u32(vsha256su0q_u32($a, $b), $c, $d);
+                    };
+                }
+                r4!(m0, 0);
+                sch!(m0, m1, m2, m3);
+                r4!(m1, 4);
+                sch!(m1, m2, m3, m0);
+                r4!(m2, 8);
+                sch!(m2, m3, m0, m1);
+                r4!(m3, 12);
+                sch!(m3, m0, m1, m2);
+                r4!(m0, 16);
+                sch!(m0, m1, m2, m3);
+                r4!(m1, 20);
+                sch!(m1, m2, m3, m0);
+                r4!(m2, 24);
+                sch!(m2, m3, m0, m1);
+                r4!(m3, 28);
+                sch!(m3, m0, m1, m2);
+                r4!(m0, 32);
+                sch!(m0, m1, m2, m3);
+                r4!(m1, 36);
+                sch!(m1, m2, m3, m0);
+                r4!(m2, 40);
+                sch!(m2, m3, m0, m1);
+                r4!(m3, 44);
+                sch!(m3, m0, m1, m2);
+                r4!(m0, 48);
+                r4!(m1, 52);
+                r4!(m2, 56);
+                r4!(m3, 60);
                 abcd = vaddq_u32(abcd, abcd0);
                 efgh = vaddq_u32(efgh, efgh0);
             }
@@ -515,47 +664,93 @@ mod arm {
     /// SHA-1 multi-block compression using the ARMv8 `sha2` extension (its
     /// FEAT_SHA1 half). State (`abcd` vector + scalar `e`) is loaded once and kept
     /// in registers across every block; messages are byte-reversed per 32-bit
-    /// word. Each block runs 20 groups of four rounds keyed on `g % 4`, evolving
-    /// the schedule with `sha1su0`/`sha1su1` (the round key uses the pre-update
+    /// word. Each block is 20 straight-line groups of four rounds, evolving the
+    /// schedule with `sha1su0`/`sha1su1` (the round key uses the pre-update
     /// message words) and picking `sha1c`/`sha1p`/`sha1m` per 20-round stage.
+    /// The four message vectors are named registers rotated through the macro
+    /// arguments and the stage constants are splat once per block, so nothing
+    /// in the round goes through a stack array, a `g % 4` index or a `match`
+    /// (the loop form cost ~2x: 45 ns/block vs 23 ns).
     #[target_feature(enable = "sha2")]
     pub(super) unsafe fn compress_sha1_blocks(state: &mut [u32; 5], data: &[u8]) {
         unsafe {
             let mut abcd = vld1q_u32(state.as_ptr());
             let mut e = state[4];
+            let k0 = vdupq_n_u32(K1[0]);
+            let k1 = vdupq_n_u32(K1[1]);
+            let k2 = vdupq_n_u32(K1[2]);
+            let k3 = vdupq_n_u32(K1[3]);
             let base = data.as_ptr();
             let nblocks = data.len() / 64;
             for blk in 0..nblocks {
                 let bptr = base.add(blk * 64);
                 let abcd0 = abcd;
                 let e0 = e;
-                let mut m = [
-                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr))),
-                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(16)))),
-                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(32)))),
-                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(48)))),
-                ];
-                for g in 0..20usize {
-                    let i = g % 4;
-                    let wk = vaddq_u32(m[i], vdupq_n_u32(K1[g / 5]));
-                    // `sha1su0` starts the words for group `g + 4`, `sha1su1`
-                    // finishes those for group `g + 3`; both stop once the words
-                    // for group 19 (round 79) exist.
-                    if g < 16 {
-                        m[i] = vsha1su0q_u32(m[i], m[(i + 1) % 4], m[(i + 2) % 4]);
-                    }
-                    if (1..=16).contains(&g) {
-                        m[(i + 3) % 4] = vsha1su1q_u32(m[(i + 3) % 4], m[(i + 2) % 4]);
-                    }
-                    // `sha1h` rotates the pre-round `a` into the next group's `e`.
-                    let e_next = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
-                    abcd = match g / 5 {
-                        0 => vsha1cq_u32(abcd, e, wk),
-                        2 => vsha1mq_u32(abcd, e, wk),
-                        _ => vsha1pq_u32(abcd, e, wk),
-                    };
-                    e = e_next;
+                let mut m0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr)));
+                let mut m1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(16))));
+                let mut m2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(32))));
+                let mut m3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(48))));
+                // Four rounds with round key `$wk` and stage function `$op`;
+                // `sha1h` rotates the pre-round `a` into the next group's `e`.
+                macro_rules! rnd {
+                    ($op:ident, $wk:ident) => {{
+                        let e_next = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+                        abcd = $op(abcd, e, $wk);
+                        e = e_next;
+                    }};
                 }
+                // Group `g` with message vector `$mi` (= `m[g % 4]`); `$mi1`..
+                // `$mi3` are the following vectors in rotation. `sha1su0` starts
+                // the words for group `g + 4` (groups 0..16), `sha1su1` finishes
+                // those for group `g + 3` (groups 1..=16); both stop once the
+                // words for group 19 (round 79) exist, which the three tiers
+                // below spell out.
+                macro_rules! grp {
+                    // Group 0: `sha1su0` only.
+                    (su0 $op:ident, $k:ident, $mi:ident, $mi1:ident, $mi2:ident) => {{
+                        let wk = vaddq_u32($mi, $k);
+                        $mi = vsha1su0q_u32($mi, $mi1, $mi2);
+                        rnd!($op, wk);
+                    }};
+                    // Group 16: `sha1su1` only.
+                    (su1 $op:ident, $k:ident, $mi:ident, $mi2:ident, $mi3:ident) => {{
+                        let wk = vaddq_u32($mi, $k);
+                        $mi3 = vsha1su1q_u32($mi3, $mi2);
+                        rnd!($op, wk);
+                    }};
+                    // Groups 17..=19: no schedule left.
+                    (last $op:ident, $k:ident, $mi:ident) => {{
+                        let wk = vaddq_u32($mi, $k);
+                        rnd!($op, wk);
+                    }};
+                    // Groups 1..=15: both schedule steps.
+                    ($op:ident, $k:ident, $mi:ident, $mi1:ident, $mi2:ident, $mi3:ident) => {{
+                        let wk = vaddq_u32($mi, $k);
+                        $mi = vsha1su0q_u32($mi, $mi1, $mi2);
+                        $mi3 = vsha1su1q_u32($mi3, $mi2);
+                        rnd!($op, wk);
+                    }};
+                }
+                grp!(su0 vsha1cq_u32, k0, m0, m1, m2); // g0
+                grp!(vsha1cq_u32, k0, m1, m2, m3, m0); // g1
+                grp!(vsha1cq_u32, k0, m2, m3, m0, m1); // g2
+                grp!(vsha1cq_u32, k0, m3, m0, m1, m2); // g3
+                grp!(vsha1cq_u32, k0, m0, m1, m2, m3); // g4
+                grp!(vsha1pq_u32, k1, m1, m2, m3, m0); // g5
+                grp!(vsha1pq_u32, k1, m2, m3, m0, m1); // g6
+                grp!(vsha1pq_u32, k1, m3, m0, m1, m2); // g7
+                grp!(vsha1pq_u32, k1, m0, m1, m2, m3); // g8
+                grp!(vsha1pq_u32, k1, m1, m2, m3, m0); // g9
+                grp!(vsha1mq_u32, k2, m2, m3, m0, m1); // g10
+                grp!(vsha1mq_u32, k2, m3, m0, m1, m2); // g11
+                grp!(vsha1mq_u32, k2, m0, m1, m2, m3); // g12
+                grp!(vsha1mq_u32, k2, m1, m2, m3, m0); // g13
+                grp!(vsha1mq_u32, k2, m2, m3, m0, m1); // g14
+                grp!(vsha1pq_u32, k3, m3, m0, m1, m2); // g15
+                grp!(su1 vsha1pq_u32, k3, m0, m2, m3); // g16
+                grp!(last vsha1pq_u32, k3, m1); // g17
+                grp!(last vsha1pq_u32, k3, m2); // g18
+                grp!(last vsha1pq_u32, k3, m3); // g19
                 abcd = vaddq_u32(abcd, abcd0);
                 e = e.wrapping_add(e0);
             }
