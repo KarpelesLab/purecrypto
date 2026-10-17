@@ -659,6 +659,31 @@ impl LossState {
             .filter(|&(time_sent, _)| time_sent > floor)
             .collect();
         losses.sort_by_key(|&(time_sent, _)| time_sent);
+        // F5: the "anything between two losses got through?" question is
+        // asked once per consecutive pair, so answering it by scanning every
+        // acknowledged send time and every packet in flight made the check
+        // O(losses × (acked + in flight)) per loss batch. Sort both sets
+        // once and binary-search each pair instead.
+        let mut acked: Vec<Duration> = self.acked_send_times.clone();
+        acked.sort_unstable();
+        let mut outstanding: Vec<Duration> = self
+            .per_space
+            .iter()
+            .flat_map(|ps| ps.sent_packets.values().map(|q| q.time_sent))
+            .collect();
+        outstanding.sort_unstable();
+        // §7.6.2 — did anything sent between two lost packets (sent at `lo`
+        // and `hi`, in any space) get acknowledged, or is it still awaiting
+        // a verdict? An acknowledgment counts even for a packet sent in the
+        // same instant as an edge (something sent then did get through); a
+        // packet still in flight only counts strictly between, since the
+        // packet threshold routinely declares a packet lost while its
+        // same-instant successors are still pending.
+        let progress_between = |lo: Duration, hi: Duration| -> bool {
+            acked.partition_point(|&t| t < lo) < acked.partition_point(|&t| t <= hi)
+                || outstanding.partition_point(|&t| t <= lo)
+                    < outstanding.partition_point(|&t| t < hi)
+        };
         // `run_start`: send time of the earliest ack-eliciting packet of the
         // current run of losses with nothing acknowledged or outstanding in
         // between. `prev`: send time of the previous loss.
@@ -666,7 +691,7 @@ impl LossState {
         let mut prev: Option<Duration> = None;
         for (time_sent, ack_eliciting) in losses {
             if let Some(prev_t) = prev
-                && self.progress_between(prev_t, time_sent)
+                && progress_between(prev_t, time_sent)
             {
                 run_start = None;
             }
@@ -722,22 +747,6 @@ impl LossState {
             .persistent_congestion_declared
             .map_or(horizon, |declared| horizon.max(declared));
         self.lost_history.retain(|r| r.time_sent > floor);
-    }
-
-    /// §7.6.2 — did anything sent between two lost packets (sent at `lo` and
-    /// `hi`, in any space) get acknowledged, or is it still awaiting a
-    /// verdict? An acknowledgment counts even for a packet sent in the same
-    /// instant as an edge (something sent then did get through); a packet
-    /// still in flight only counts strictly between, since the packet
-    /// threshold routinely declares a packet lost while its
-    /// same-instant successors are still pending.
-    fn progress_between(&self, lo: Duration, hi: Duration) -> bool {
-        self.acked_send_times.iter().any(|&t| lo <= t && t <= hi)
-            || self.per_space.iter().any(|ps| {
-                ps.sent_packets
-                    .values()
-                    .any(|q| lo < q.time_sent && q.time_sent < hi)
-            })
     }
 
     /// Drops every recorded acknowledged send time older than both the
