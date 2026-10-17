@@ -52,52 +52,54 @@ fn detect_backend() -> AesBackend {
 
 // The four dispatch helpers route a keyed operation to the active backend. The
 // `Hardware` arms are reached only after `detect_backend` confirmed the
-// extension, satisfying the `#[target_feature]` safety contract.
+// extension, satisfying the `#[target_feature]` safety contract. The round
+// count is a const generic so each `Aes*` variant gets its own fully unrolled
+// hardware kernels (the software path takes it as a value).
 #[inline]
 #[allow(unsafe_code)]
-fn dispatch_encrypt_block(backend: AesBackend, rk: &[u8], nr: usize, block: &mut [u8; 16]) {
+fn dispatch_encrypt_block<const NR: usize>(backend: AesBackend, rk: &[u8], block: &mut [u8; 16]) {
     match backend {
-        AesBackend::Software => encrypt(rk, nr, block),
+        AesBackend::Software => encrypt(rk, NR, block),
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
-        AesBackend::Hardware => unsafe { aesni::encrypt_block(rk, nr, block) },
+        AesBackend::Hardware => unsafe { aesni::encrypt_block(rk, NR, block) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
-        AesBackend::Hardware => unsafe { aes_arm::encrypt_block(rk, nr, block) },
+        AesBackend::Hardware => unsafe { aes_arm::encrypt_block::<NR>(rk, block) },
     }
 }
 
 #[inline]
 #[allow(unsafe_code)]
-fn dispatch_decrypt_block(backend: AesBackend, rk: &[u8], nr: usize, block: &mut [u8; 16]) {
+fn dispatch_decrypt_block<const NR: usize>(backend: AesBackend, rk: &[u8], block: &mut [u8; 16]) {
     match backend {
-        AesBackend::Software => decrypt(rk, nr, block),
+        AesBackend::Software => decrypt(rk, NR, block),
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
-        AesBackend::Hardware => unsafe { aesni::decrypt_block(rk, nr, block) },
+        AesBackend::Hardware => unsafe { aesni::decrypt_block(rk, NR, block) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
-        AesBackend::Hardware => unsafe { aes_arm::decrypt_block(rk, nr, block) },
+        AesBackend::Hardware => unsafe { aes_arm::decrypt_block::<NR>(rk, block) },
     }
 }
 
 #[inline]
 #[allow(unsafe_code)]
-fn dispatch_encrypt_blocks(backend: AesBackend, rk: &[u8], nr: usize, blocks: &mut [u8]) {
+fn dispatch_encrypt_blocks<const NR: usize>(backend: AesBackend, rk: &[u8], blocks: &mut [u8]) {
     match backend {
-        AesBackend::Software => crypt_blocks_soft::<false>(rk, nr, blocks),
+        AesBackend::Software => crypt_blocks_soft::<false>(rk, NR, blocks),
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
-        AesBackend::Hardware => unsafe { aesni::encrypt_blocks(rk, nr, blocks) },
+        AesBackend::Hardware => unsafe { aesni::encrypt_blocks(rk, NR, blocks) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
-        AesBackend::Hardware => unsafe { aes_arm::encrypt_blocks(rk, nr, blocks) },
+        AesBackend::Hardware => unsafe { aes_arm::encrypt_blocks::<NR>(rk, blocks) },
     }
 }
 
 #[inline]
 #[allow(unsafe_code)]
-fn dispatch_decrypt_blocks(backend: AesBackend, rk: &[u8], nr: usize, blocks: &mut [u8]) {
+fn dispatch_decrypt_blocks<const NR: usize>(backend: AesBackend, rk: &[u8], blocks: &mut [u8]) {
     match backend {
-        AesBackend::Software => crypt_blocks_soft::<true>(rk, nr, blocks),
+        AesBackend::Software => crypt_blocks_soft::<true>(rk, NR, blocks),
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
-        AesBackend::Hardware => unsafe { aesni::decrypt_blocks(rk, nr, blocks) },
+        AesBackend::Hardware => unsafe { aesni::decrypt_blocks(rk, NR, blocks) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
-        AesBackend::Hardware => unsafe { aes_arm::decrypt_blocks(rk, nr, blocks) },
+        AesBackend::Hardware => unsafe { aes_arm::decrypt_blocks::<NR>(rk, blocks) },
     }
 }
 
@@ -396,12 +398,12 @@ macro_rules! aes_variant {
 
             #[inline]
             fn encrypt_block(&self, block: &mut [u8; 16]) {
-                dispatch_encrypt_block(self.backend, &self.rk, $nr, block);
+                dispatch_encrypt_block::<$nr>(self.backend, &self.rk, block);
             }
 
             #[inline]
             fn decrypt_block(&self, block: &mut [u8; 16]) {
-                dispatch_decrypt_block(self.backend, &self.rk, $nr, block);
+                dispatch_decrypt_block::<$nr>(self.backend, &self.rk, block);
             }
 
             #[inline]
@@ -413,7 +415,7 @@ macro_rules! aes_variant {
                     blocks.len().is_multiple_of(16),
                     "encrypt_blocks needs whole blocks"
                 );
-                dispatch_encrypt_blocks(self.backend, &self.rk, $nr, blocks);
+                dispatch_encrypt_blocks::<$nr>(self.backend, &self.rk, blocks);
             }
 
             #[inline]
@@ -422,7 +424,7 @@ macro_rules! aes_variant {
                     blocks.len().is_multiple_of(16),
                     "decrypt_blocks needs whole blocks"
                 );
-                dispatch_decrypt_blocks(self.backend, &self.rk, $nr, blocks);
+                dispatch_decrypt_blocks::<$nr>(self.backend, &self.rk, blocks);
             }
 
             // Exposes the round-key schedule to the GCM fused CTR+GHASH loop,
@@ -557,8 +559,8 @@ mod tests {
                 hw.decrypt_block(&mut h1);
                 assert_eq!(h1, a, "{} dec_block roundtrip", stringify!($ty));
 
-                // Batched: 19 blocks → exercises the 8-wide (x86) / 4-wide (arm)
-                // path and the remainder tail.
+                // Batched: 19 blocks → exercises the 8-wide path, the
+                // 4-block remainder group and the single-block tail.
                 let mut data = [0u8; 16 * 19];
                 fill(0xDEAD_BEEF, &mut data);
                 let (mut hb, mut sb) = (data, data);
