@@ -1,15 +1,10 @@
 //! The set of supported elliptic curves and their parameters.
 
-use super::weierstrass::Curve;
+use super::uint_from_be_hex;
+use super::weierstrass::{Curve, CurveParams, Fixed};
+#[cfg(test)]
 use crate::bignum::BoxedUint;
-
-/// A handle to a curve's arithmetic context: the process-wide cached copy
-/// with `std`, an owned one otherwise. Both deref to [`Curve`].
-#[cfg(feature = "std")]
-pub(crate) type CurveRef = &'static Curve;
-/// See the `std` variant.
-#[cfg(not(feature = "std"))]
-pub(crate) type CurveRef = alloc::boxed::Box<Curve>;
+use crate::bignum::Uint;
 
 /// A supported prime-order curve.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -69,7 +64,8 @@ pub enum CurveId {
     BrainpoolP320r1,
 }
 
-/// Big-endian hex parameters for a curve.
+/// Big-endian hex parameters for a curve (no whitespace: the string
+/// continuations below strip it).
 struct Params {
     p: &'static str,
     a: &'static str,
@@ -82,7 +78,7 @@ struct Params {
 }
 
 impl CurveId {
-    fn params(self) -> Params {
+    const fn params(self) -> Params {
         match self {
             CurveId::P256 => Params {
                 p: "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
@@ -317,36 +313,35 @@ impl CurveId {
         }
     }
 
-    /// Builds the runtime [`Curve`] for this identifier from its parameters.
-    fn build_curve(self) -> Curve {
-        let p = self.params();
-        Curve::new(hex(p.p), hex(p.a), hex(p.b), hex(p.gx), hex(p.gy), hex(p.n))
-    }
-
-    /// The runtime [`Curve`] for this identifier, built once per process.
-    ///
-    /// Building one parses six hex strings and sets up two Montgomery
-    /// contexts (`p` and `n`) — tens of µs, which every sign / verify / key
-    /// import used to pay. The context is public curve data, so caching it
-    /// raises no secrecy question; it is a few hundred bytes per curve,
-    /// built on first use only. The cache needs `std`'s `OnceLock` (the
-    /// crate keeps its core free of `unsafe`, which a `no_std` atomic-pointer
-    /// cache would need), so `no_std` builds rebuild on every call instead.
-    #[cfg(feature = "std")]
-    pub(crate) fn curve(self) -> CurveRef {
-        static CACHE: [std::sync::OnceLock<Curve>; CurveId::ALL.len()] =
-            [const { std::sync::OnceLock::new() }; CurveId::ALL.len()];
-        // `ALL` lists the variants in declaration order (cfg'd-out variants
-        // take no discriminant), so the discriminant is the index.
-        debug_assert_eq!(CurveId::ALL[self as usize], self);
-        CACHE[self as usize].get_or_init(|| self.build_curve())
-    }
-
-    /// The runtime [`Curve`] for this identifier (rebuilt per call without
-    /// `std`; see the cached variant).
-    #[cfg(not(feature = "std"))]
-    pub(crate) fn curve(self) -> CurveRef {
-        alloc::boxed::Box::new(self.build_curve())
+    /// The arithmetic for this curve: a `&'static` handle to its
+    /// monomorphised engine (see [`weierstrass`](super::weierstrass)). Free
+    /// to call — every parameter is a compile-time constant.
+    pub(crate) fn curve(self) -> &'static dyn Curve {
+        match self {
+            CurveId::P256 => &Fixed::<P256Params, 4>::INSTANCE,
+            CurveId::P384 => &Fixed::<P384Params, 6>::INSTANCE,
+            CurveId::P521 => &Fixed::<P521Params, 9>::INSTANCE,
+            CurveId::Secp256k1 => &Fixed::<Secp256k1Params, 4>::INSTANCE,
+            CurveId::Sm2p256v1 => &Fixed::<Sm2p256v1Params, 4>::INSTANCE,
+            CurveId::BrainpoolP256r1 => &Fixed::<BrainpoolP256r1Params, 4>::INSTANCE,
+            CurveId::BrainpoolP384r1 => &Fixed::<BrainpoolP384r1Params, 6>::INSTANCE,
+            CurveId::BrainpoolP512r1 => &Fixed::<BrainpoolP512r1Params, 8>::INSTANCE,
+            #[cfg(feature = "legacy-ec")]
+            CurveId::Secp160k1 => &Fixed::<Secp160k1Params, 3>::INSTANCE,
+            #[cfg(feature = "legacy-ec")]
+            CurveId::Secp160r1 => &Fixed::<Secp160r1Params, 3>::INSTANCE,
+            #[cfg(feature = "legacy-ec")]
+            CurveId::Secp160r2 => &Fixed::<Secp160r2Params, 3>::INSTANCE,
+            #[cfg(feature = "legacy-ec")]
+            CurveId::Secp192k1 => &Fixed::<Secp192k1Params, 3>::INSTANCE,
+            #[cfg(feature = "legacy-ec")]
+            CurveId::P192 => &Fixed::<P192Params, 3>::INSTANCE,
+            #[cfg(feature = "legacy-ec")]
+            CurveId::Secp224k1 => &Fixed::<Secp224k1Params, 4>::INSTANCE,
+            CurveId::P224 => &Fixed::<P224Params, 4>::INSTANCE,
+            CurveId::BrainpoolP224r1 => &Fixed::<BrainpoolP224r1Params, 4>::INSTANCE,
+            CurveId::BrainpoolP320r1 => &Fixed::<BrainpoolP320r1Params, 5>::INSTANCE,
+        }
     }
 
     /// The field-element byte length: the width of one SEC1 coordinate and
@@ -437,8 +432,78 @@ impl CurveId {
     }
 }
 
+/// Declares the [`CurveParams`] marker type of one curve over `L` limbs,
+/// decoding its hex parameters at compile time.
+macro_rules! curve_params {
+    ($(#[$meta:meta])* $name:ident, $id:expr, $limbs:literal) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy)]
+        pub(crate) struct $name;
+        $(#[$meta])*
+        impl CurveParams<$limbs> for $name {
+            const P: Uint<$limbs> = uint_from_be_hex($id.params().p);
+            const A: Uint<$limbs> = uint_from_be_hex($id.params().a);
+            const B: Uint<$limbs> = uint_from_be_hex($id.params().b);
+            const GX: Uint<$limbs> = uint_from_be_hex($id.params().gx);
+            const GY: Uint<$limbs> = uint_from_be_hex($id.params().gy);
+            const N: Uint<$limbs> = uint_from_be_hex($id.params().n);
+        }
+    };
+}
+
+// The limb count covers the wider of `p` and `n` (the four curves whose
+// order outgrows the field by a bit still round to the field's limb count).
+curve_params!(P256Params, CurveId::P256, 4);
+curve_params!(P384Params, CurveId::P384, 6);
+curve_params!(P521Params, CurveId::P521, 9);
+curve_params!(Secp256k1Params, CurveId::Secp256k1, 4);
+curve_params!(Sm2p256v1Params, CurveId::Sm2p256v1, 4);
+curve_params!(BrainpoolP256r1Params, CurveId::BrainpoolP256r1, 4);
+curve_params!(BrainpoolP384r1Params, CurveId::BrainpoolP384r1, 6);
+curve_params!(BrainpoolP512r1Params, CurveId::BrainpoolP512r1, 8);
+curve_params!(
+    #[cfg(feature = "legacy-ec")]
+    Secp160k1Params,
+    CurveId::Secp160k1,
+    3
+);
+curve_params!(
+    #[cfg(feature = "legacy-ec")]
+    Secp160r1Params,
+    CurveId::Secp160r1,
+    3
+);
+curve_params!(
+    #[cfg(feature = "legacy-ec")]
+    Secp160r2Params,
+    CurveId::Secp160r2,
+    3
+);
+curve_params!(
+    #[cfg(feature = "legacy-ec")]
+    Secp192k1Params,
+    CurveId::Secp192k1,
+    3
+);
+curve_params!(
+    #[cfg(feature = "legacy-ec")]
+    P192Params,
+    CurveId::P192,
+    3
+);
+curve_params!(
+    #[cfg(feature = "legacy-ec")]
+    Secp224k1Params,
+    CurveId::Secp224k1,
+    4
+);
+curve_params!(P224Params, CurveId::P224, 4);
+curve_params!(BrainpoolP224r1Params, CurveId::BrainpoolP224r1, 4);
+curve_params!(BrainpoolP320r1Params, CurveId::BrainpoolP320r1, 5);
+
 /// Decodes a big-endian hex string (ASCII whitespace ignored) into a
 /// [`BoxedUint`].
+#[cfg(test)]
 fn hex(s: &str) -> BoxedUint {
     let mut bytes = alloc::vec::Vec::with_capacity(s.len() / 2);
     let digits: alloc::vec::Vec<u8> = s
@@ -469,7 +534,7 @@ mod tests {
         let (gx, gy) = curve.to_affine(&curve.generator()).unwrap();
         assert!(curve.is_on_curve(&gx, &gy), "{id:?} generator off-curve");
         // n * G = identity.
-        let n = curve.order().clone();
+        let n = curve.order();
         assert!(
             curve.to_affine(&curve.mul_generator(&n)).is_none(),
             "{id:?} n*G != identity"

@@ -9,10 +9,12 @@
 //!   time: const-generic P-256 ([`ecdsa`], [`ecdh`]) and secp256k1 ECDSA on a
 //!   native pseudo-Mersenne field ([`secp256k1_ecdsa`], with Bitcoin /
 //!   Ethereum public-key recovery); and
-//! - a **runtime multi-curve** path ([`boxed`]) over heap-backed `BoxedUint`,
-//!   selecting P-256/P-384/P-521/secp256k1 at runtime via [`CurveId`] — used by
-//!   the TLS and X.509 layers, where the peer's curve is known only at parse
-//!   time.
+//! - a **runtime multi-curve** path ([`boxed`]) with `BoxedUint` at the API
+//!   boundary, selecting P-256/P-384/P-521/secp256k1 at runtime via
+//!   [`CurveId`] — used by the TLS and X.509 layers, where the peer's curve is
+//!   known only at parse time. Each curve's arithmetic is a stack-only
+//!   instance monomorphised over its limb width with the parameters as
+//!   compile-time constants.
 //!
 //! Also exposes X25519 ([`x25519`]) / X448 ([`x448`]) Diffie-Hellman and
 //! Ed25519 ([`ed25519`]) / Ed448 ([`ed448`]) signatures.
@@ -30,8 +32,9 @@
 //! Enabling `alloc` additionally provides:
 //!
 //! - the runtime multi-curve [`boxed`] path and [`CurveId`], i.e. P-384, P-521,
-//!   secp256k1 and the Brainpool curves, whose arithmetic is heap-backed;
-//! - [`sm2`], which is built on the same heap bignums; and
+//!   secp256k1 and the Brainpool curves, whose keys and signatures are
+//!   heap-backed `BoxedUint`s;
+//! - [`sm2`], which is built on the same runtime-curve engine; and
 //! - every DER/PEM codec (`to_pkcs8_der`, `to_pkcs8_pem`, `Signature::to_der`,
 //!   …). These are gated on `alloc` in *both* directions: the `der` encoders and
 //!   its OID parser allocate, so `from_pkcs8_der` needs `alloc` as much as

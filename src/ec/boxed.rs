@@ -1,4 +1,6 @@
-//! Runtime multi-curve ECDSA and ECDH (heap-backed [`BoxedUint`]).
+//! Runtime multi-curve ECDSA and ECDH ([`BoxedUint`] keys and signatures;
+//! the arithmetic itself runs on the stack, see
+//! [`weierstrass`](super::weierstrass)).
 //!
 //! Unlike the const-generic [`ecdsa`](super::ecdsa)/[`ecdh`](super::ecdh) P-256
 //! API — which is faster when the curve is fixed at compile time — these types
@@ -635,7 +637,7 @@ impl BoxedEcdsaPublicKey {
             _ => return self.verify_prehash_generic(prehash, sig),
         };
         let c = self.curve.curve();
-        if !in_range(&sig.r, c.order()) || !in_range(&sig.s, c.order()) {
+        if !in_range(&sig.r, &c.order()) || !in_range(&sig.s, &c.order()) {
             return Err(Error::Verification);
         }
         if fast(&self.x, &self.y, prehash, &sig.r, &sig.s) {
@@ -653,15 +655,14 @@ impl BoxedEcdsaPublicKey {
         sig: &BoxedEcdsaSignature,
     ) -> Result<(), Error> {
         let c = self.curve.curve();
-        let n = c.order().clone();
-        let fq = c.order_modulus();
+        let n = c.order();
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
         }
         let z = reduce_once(&bits2int(prehash, n.bit_len()), &n);
         let w = c.invert_scalar(&sig.s);
-        let u1 = fq.mul_mod(&z, &w);
-        let u2 = fq.mul_mod(&sig.r, &w);
+        let u1 = c.mul_mod_n(&z, &w);
+        let u2 = c.mul_mod_n(&sig.r, &w);
 
         // Every input here (signature, digest, public key) is public, so the
         // variable-time double-scalar multiplication and the inversion-free
@@ -681,7 +682,7 @@ impl BoxedEcdsaPrivateKey {
     /// in `[1, n-1]`.
     pub fn from_bytes(curve: CurveId, bytes: &[u8]) -> Result<Self, Error> {
         let d = BoxedUint::from_be_bytes(bytes);
-        let n = curve.curve().order().clone();
+        let n = curve.curve().order();
         if in_range(&d, &n) {
             Ok(BoxedEcdsaPrivateKey { curve, d })
         } else {
@@ -692,7 +693,7 @@ impl BoxedEcdsaPrivateKey {
     /// Generates a new private key on `curve` from `rng`. The RNG must be a
     /// cryptographically secure CSPRNG (see [`CryptoRng`]).
     pub fn generate<R: RngCore + CryptoRng>(curve: CurveId, rng: &mut R) -> Self {
-        let n = curve.curve().order().clone();
+        let n = curve.curve().order();
         BoxedEcdsaPrivateKey {
             curve,
             d: random_scalar(curve, &n, rng),
@@ -764,8 +765,7 @@ impl BoxedEcdsaPrivateKey {
         prehash: &[u8],
     ) -> Result<(BoxedUint, BoxedUint, bool, bool), Error> {
         let c = self.curve.curve();
-        let n = c.order().clone();
-        let fq = c.order_modulus();
+        let n = c.order();
         let order_len = self.curve.order_len();
 
         let z = reduce_once(&bits2int(prehash, n.bit_len()), &n);
@@ -789,8 +789,8 @@ impl BoxedEcdsaPrivateKey {
         let y_is_odd = full_y.is_odd();
 
         let mut k_inv = c.invert_scalar(&k);
-        let mut z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
-        let s = fq.mul_mod(&k_inv, &z_rd);
+        let mut z_rd = c.add_mod_n(&z, &c.mul_mod_n(&r, &self.d));
+        let s = c.mul_mod_n(&k_inv, &z_rd);
         // Wipe the per-signature secrets: `k` alone recovers the long-term
         // key as `d = (s·k − z)·r⁻¹ mod n`. `BoxedUint::zeroize` uses the
         // crate's volatile stores.
@@ -933,7 +933,7 @@ impl BoxedEcdsaSignature {
     /// helper in [`super::ecdsa::Signature::is_low_s`].
     pub fn is_low_s(&self, curve: CurveId) -> bool {
         // half_n = (n + 1) / 2 — the smallest "high-S" boundary.
-        let n = curve.curve().order().clone();
+        let n = curve.curve().order();
         let half_n = n.shr_bits(1).add(&BoxedUint::from_u64(1));
         self.s.lt(&half_n)
     }
@@ -946,7 +946,7 @@ impl BoxedEcdsaSignature {
         if self.is_low_s(curve) {
             self.clone()
         } else {
-            let n = curve.curve().order().clone();
+            let n = curve.curve().order();
             BoxedEcdsaSignature {
                 r: self.r.clone(),
                 s: n.sub(&self.s),
@@ -1009,8 +1009,7 @@ impl BoxedEcdsaSignature {
             return Err(Error::InvalidInput);
         }
         let c = curve.curve();
-        let n = c.order().clone();
-        let fq = c.order_modulus();
+        let n = c.order();
         if !in_range(&self.r, &n) || !in_range(&self.s, &n) {
             return Err(Error::Verification);
         }
@@ -1040,9 +1039,9 @@ impl BoxedEcdsaSignature {
         // the variable-time Fermat inverse used elsewhere here is fine.
         let z = reduce_once(&bits2int(prehash, n.bit_len()), &n);
         let r_inv = c.invert_scalar(&self.r);
-        let neg_z = fq.sub_mod(&BoxedUint::zero(1), &z);
-        let u1 = fq.mul_mod(&neg_z, &r_inv);
-        let u2 = fq.mul_mod(&self.s, &r_inv);
+        let neg_z = c.sub_mod_n(&BoxedUint::zero(1), &z);
+        let u1 = c.mul_mod_n(&neg_z, &r_inv);
+        let u2 = c.mul_mod_n(&self.s, &r_inv);
         // Public inputs only (signature, digest): variable time is fine.
         let q = c.mul_double_vartime(&u1, &u2, &r_point);
         let (x, y) = c.to_affine(&q).ok_or(Error::Verification)?;
@@ -1383,7 +1382,7 @@ impl BoxedEcdhPrivateKey {
     /// key-share generation; production callers should pass `OsRng` or an
     /// HMAC-DRBG seeded from one.
     pub fn generate<R: RngCore>(curve: CurveId, rng: &mut R) -> Self {
-        let n = curve.curve().order().clone();
+        let n = curve.curve().order();
         BoxedEcdhPrivateKey {
             curve,
             d: random_scalar(curve, &n, rng),
@@ -1393,7 +1392,7 @@ impl BoxedEcdhPrivateKey {
     /// Creates an ECDH private key from a big-endian scalar on `curve`.
     pub fn from_bytes(curve: CurveId, bytes: &[u8]) -> Result<Self, Error> {
         let d = BoxedUint::from_be_bytes(bytes);
-        let n = curve.curve().order().clone();
+        let n = curve.curve().order();
         if in_range(&d, &n) {
             Ok(BoxedEcdhPrivateKey { curve, d })
         } else {
@@ -1787,7 +1786,7 @@ mod tests {
             CurveId::Secp160r2,
             CurveId::Secp224k1,
         ] {
-            let n = curve.curve().order().clone();
+            let n = curve.curve().order();
             let olen = curve.order_len();
             assert_eq!(n.bit_len(), 8 * curve.field_len() + 1);
             // 2^(8·field_len): one more than any field element fits.
@@ -2107,7 +2106,7 @@ mod tests {
         assert_eq!(g(100).add(&g(1)).unwrap().to_sec1(), g(101).to_sec1());
 
         // a·G + (n − a)·G = identity (point at infinity) => error.
-        let n = curve.curve().order().clone();
+        let n = curve.curve().order();
         let a = BoxedUint::from_u64(7);
         let neg = n.sub(&a);
         let neg_g = BoxedEcdsaPrivateKey::from_bytes(curve, &neg.to_be_bytes(32))
@@ -2364,7 +2363,7 @@ x2dqVh/sT12MnE=\n\
 
         // Build the high-S form `(r, n − s)` by hand and verify the
         // helper canonicalises it back.
-        let n = curve.curve().order().clone();
+        let n = curve.curve().order();
         let high = BoxedEcdsaSignature::from_components(low.r().clone(), n.sub(low.s()));
         assert!(!high.is_low_s(curve));
         assert_eq!(high.to_low_s(curve), low);
@@ -2524,7 +2523,7 @@ x2dqVh/sT12MnE=\n\
         use crate::hash::{Digest, Sha256, Sha512};
         let one = BoxedUint::from_u64(1);
         for curve in [CurveId::P256, CurveId::Secp256k1] {
-            let n = curve.curve().order().clone();
+            let n = curve.curve().order();
             let mut st = 0x5eed_0000 ^ curve as u64;
             let mut scalars = vec![
                 one.clone(),
@@ -2645,7 +2644,7 @@ x2dqVh/sT12MnE=\n\
         let mut st = 0xd1ff_u64;
         for &curve in CurveId::ALL {
             let c = curve.curve();
-            for m in [c.order().clone(), c.field_modulus()] {
+            for m in [c.order(), c.field_modulus()] {
                 let one = BoxedUint::from_u64(1);
                 let two_m = m.add(&m);
                 let mut vals = vec![

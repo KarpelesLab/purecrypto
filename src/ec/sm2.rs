@@ -11,8 +11,8 @@
 //!   PKE producing the `C1 ‖ C3 ‖ C2` ciphertext layout mandated by RFC 8998.
 //!
 //! The secret scalar is held in a [`BoxedUint`] and wiped on drop; all scalar
-//! arithmetic reuses the crate's constant-time field/scalar primitives
-//! ([`BoxedMontModulus`](crate::bignum::BoxedMontModulus), `weierstrass::Curve::scalar_mul`).
+//! and point arithmetic runs on the constant-time stack engine of the
+//! runtime-curve layer (`weierstrass::Curve`).
 //!
 //! Keys serialize as standard SEC1 / PKIX structures carrying the SM2 named
 //! curve OID (`1.2.156.10197.1.301`), so PKCS#8 / PEM round-trips work through
@@ -182,8 +182,8 @@ fn za(id: &[u8], x: &BoxedUint, y: &BoxedUint) -> Result<[u8; 32], Error> {
     h.update(id);
     h.update(&enc32(&a));
     h.update(&enc32(&b));
-    h.update(&enc32(gx));
-    h.update(&enc32(gy));
+    h.update(&enc32(&gx));
+    h.update(&enc32(&gy));
     h.update(&enc32(x));
     h.update(&enc32(y));
     Ok(h.finalize())
@@ -265,8 +265,7 @@ impl Sm2PublicKey {
     /// (GB/T 32918.2 §7, RFC 8998 §2).
     pub fn verify(&self, msg: &[u8], sig: &Sm2Signature, id: &[u8]) -> Result<(), Error> {
         let c = CURVE.curve();
-        let n = c.order().clone();
-        let fq = c.order_modulus();
+        let n = c.order();
         // r, s ∈ [1, n-1].
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
@@ -274,7 +273,7 @@ impl Sm2PublicKey {
         let za = self.za(id)?;
         let e = reduce_once(&message_hash(&za, msg), &n);
         // t = (r + s) mod n; reject t == 0.
-        let t = fq.add_mod(&sig.r, &sig.s);
+        let t = c.add_mod_n(&sig.r, &sig.s);
         if t.is_zero() {
             return Err(Error::Verification);
         }
@@ -285,7 +284,7 @@ impl Sm2PublicKey {
         let sum = c.mul_double_vartime(&sig.s, &t, &point);
         // Accept iff R = (e + x1) mod n equals r, i.e. x1 ≡ r − e (mod n),
         // tested without inverting Z.
-        if c.affine_x_eq_mod_n(&sum, &fq.sub_mod(&sig.r, &e)) {
+        if c.affine_x_eq_mod_n(&sum, &c.sub_mod_n(&sig.r, &e)) {
             Ok(())
         } else {
             Err(Error::Verification)
@@ -301,7 +300,7 @@ impl Sm2PublicKey {
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
         let c = CURVE.curve();
-        let n = c.order().clone();
+        let n = c.order();
         let point = c.lift_affine(&self.x, &self.y);
         loop {
             let mut k = random_scalar(&n, rng);
@@ -379,7 +378,7 @@ impl Sm2PrivateKey {
     /// the order, so it can never produce a signature).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let mut d = BoxedUint::from_be_bytes(bytes);
-        let n = CURVE.curve().order().clone();
+        let n = CURVE.curve().order();
         if in_key_range(&d, &n) {
             Ok(Self::from_scalar(d))
         } else {
@@ -390,7 +389,7 @@ impl Sm2PrivateKey {
 
     /// Generates a new SM2 private key from `rng` (a CSPRNG).
     pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
-        let n = CURVE.curve().order().clone();
+        let n = CURVE.curve().order();
         // Draw from [1, n-2]: bound the sampler by n-1.
         let n_minus_1 = n.sub(&BoxedUint::from_u64(1));
         Self::from_scalar(random_scalar(&n_minus_1, rng))
@@ -435,7 +434,7 @@ impl Sm2PrivateKey {
         if !id_len_ok(id) {
             return Err(Error::InvalidInput);
         }
-        let n = CURVE.curve().order().clone();
+        let n = CURVE.curve().order();
         let za = self.pk.za(id)?;
         for _ in 0..MAX_SIGN_ATTEMPTS {
             let mut k = random_scalar(&n, rng);
@@ -477,8 +476,7 @@ impl Sm2PrivateKey {
         k: &BoxedUint,
     ) -> Result<Sm2Signature, SignFailure> {
         let c = CURVE.curve();
-        let n = c.order().clone();
-        let fq = c.order_modulus();
+        let n = c.order();
         if !in_range(k, &n) {
             return Err(SignFailure::Fatal(Error::InvalidInput));
         }
@@ -488,18 +486,18 @@ impl Sm2PrivateKey {
         // never the identity; treat it as retryable regardless.
         let (x1, _) = c.to_affine(&c.mul_generator(k)).ok_or(SignFailure::Retry)?;
         // r = (e + x1) mod n; reject r == 0 or r + k == n.
-        let r = fq.add_mod(&e, &reduce_once(&x1, &n));
+        let r = c.add_mod_n(&e, &reduce_once(&x1, &n));
         // `r + k` involves the nonce: no early-exit zero test on it, and one
         // combined retry verdict (public: only the retry count is observable).
-        if (r.ct_is_zero() | fq.add_mod(&r, k).ct_is_zero()).declassify() {
+        if (r.ct_is_zero() | c.add_mod_n(&r, k).ct_is_zero()).declassify() {
             return Err(SignFailure::Retry);
         }
         // s = ((1 + dA)^-1 · (k − r·dA)) mod n.
         let one = BoxedUint::from_u64(1);
-        let mut d_plus_1_inv = c.invert_scalar(&fq.add_mod(&one, &self.d));
-        let mut rd = fq.mul_mod(&r, &self.d);
-        let mut k_minus_rd = fq.sub_mod(k, &rd);
-        let s = fq.mul_mod(&d_plus_1_inv, &k_minus_rd);
+        let mut d_plus_1_inv = c.invert_scalar(&c.add_mod_n(&one, &self.d));
+        let mut rd = c.mul_mod_n(&r, &self.d);
+        let mut k_minus_rd = c.sub_mod_n(k, &rd);
+        let s = c.mul_mod_n(&d_plus_1_inv, &k_minus_rd);
         // Each intermediate is a function of `dA` or `k`; wipe them.
         d_plus_1_inv.zeroize();
         rd.zeroize();
@@ -1106,7 +1104,7 @@ mod tests {
     /// GB/T 32918.1 limits keys to `[1, n-2]` and import must enforce it.
     #[test]
     fn private_key_n_minus_1_rejected() {
-        let n = CURVE.curve().order().clone();
+        let n = CURVE.curve().order();
         let one = BoxedUint::from_u64(1);
         let n1 = n.sub(&one).to_be_bytes(32);
         assert!(matches!(
