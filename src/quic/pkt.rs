@@ -280,13 +280,42 @@ pub(crate) fn build_long_header(
     pn_len: u8,
     payload_len_for_field: u64,
 ) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(32 + token.len());
+    let pn_offset = build_long_header_into(
+        &mut out,
+        typ,
+        version,
+        dcid,
+        scid,
+        token,
+        pn_value,
+        pn_len,
+        payload_len_for_field,
+    );
+    (out, pn_offset)
+}
+
+/// [`build_long_header`] appending to `out`, so a packet can be assembled
+/// in place in the datagram buffer. Returns the packet-number offset
+/// relative to the start of `out`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_long_header_into(
+    out: &mut Vec<u8>,
+    typ: LongType,
+    version: QuicVersion,
+    dcid: &[u8],
+    scid: &[u8],
+    token: &[u8],
+    pn_value: u64,
+    pn_len: u8,
+    payload_len_for_field: u64,
+) -> usize {
     debug_assert!((1..=4).contains(&pn_len));
     debug_assert!(dcid.len() <= 20);
     debug_assert!(scid.len() <= 20);
     debug_assert!(token.is_empty() || matches!(typ, LongType::Initial));
     debug_assert!(!matches!(typ, LongType::Retry), "use build_retry()");
 
-    let mut out = Vec::with_capacity(32 + token.len());
     // First byte: long-header template plus low 2 bits = pn_len - 1
     // (RFC 9000 §17.2 "Packet Number Length"). The Reserved bits (mask
     // 0x0c) are zero.
@@ -298,16 +327,16 @@ pub(crate) fn build_long_header(
     out.extend_from_slice(scid);
 
     if matches!(typ, LongType::Initial) {
-        varint::encode(token.len() as u64, &mut out);
+        varint::encode(token.len() as u64, out);
         out.extend_from_slice(token);
     }
 
-    varint::encode(payload_len_for_field, &mut out);
+    varint::encode(payload_len_for_field, out);
     let pn_offset = out.len();
     // The PN is encoded big-endian truncated to `pn_len` bytes.
     let pn_bytes = pn_value.to_be_bytes();
     out.extend_from_slice(&pn_bytes[8 - pn_len as usize..]);
-    (out, pn_offset)
+    pn_offset
 }
 
 /// Parsed short-header view (RFC 9000 §17.3.1).
@@ -378,6 +407,22 @@ pub(crate) fn build_short_header(
     pn_value: u64,
     pn_len: u8,
 ) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(1 + dcid.len() + 4);
+    let pn_offset = build_short_header_into(&mut out, dcid, spin, key_phase, pn_value, pn_len);
+    (out, pn_offset)
+}
+
+/// [`build_short_header`] appending to `out`, so a packet can be
+/// assembled in place in the datagram buffer. Returns the packet-number
+/// offset relative to the start of `out`.
+pub(crate) fn build_short_header_into(
+    out: &mut Vec<u8>,
+    dcid: &[u8],
+    spin: bool,
+    key_phase: bool,
+    pn_value: u64,
+    pn_len: u8,
+) -> usize {
     debug_assert!((1..=4).contains(&pn_len));
     debug_assert!(dcid.len() <= 20);
 
@@ -388,13 +433,12 @@ pub(crate) fn build_short_header(
     if key_phase {
         b0 |= 0x04;
     }
-    let mut out = Vec::with_capacity(1 + dcid.len() + 4);
     out.push(b0);
     out.extend_from_slice(dcid);
     let pn_offset = out.len();
     let pn_bytes = pn_value.to_be_bytes();
     out.extend_from_slice(&pn_bytes[8 - pn_len as usize..]);
-    (out, pn_offset)
+    pn_offset
 }
 
 /// RFC 9001 §5.4 — apply a 5-byte header-protection mask to an

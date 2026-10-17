@@ -78,7 +78,7 @@ pub(crate) struct SentPacket {
     /// STREAM chunks this packet carried. On ack, the connection
     /// confirms the ranges (pruning the sender's retransmission state);
     /// on loss, it queues them for retransmission.
-    pub(crate) stream_hints: Vec<StreamHint>,
+    pub(crate) stream_hints: StreamHints,
     /// Stream-layer control frames this packet carried (MAX_DATA,
     /// MAX_STREAM_DATA, RESET_STREAM, ...). On loss the connection asks
     /// the stream layer to send them again (RFC 9000 §13.3).
@@ -89,9 +89,67 @@ pub(crate) struct SentPacket {
     pub(crate) handshake_done: bool,
 }
 
+/// The [`StreamHint`]s of one packet. A packet carries one STREAM chunk
+/// in the common case and rarely more than two (each is a few hundred
+/// bytes of a ~1200-byte packet), so the first two live inline and only a
+/// packet carrying more allocates — a data packet costs no allocation
+/// for its bookkeeping.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamHints {
+    /// The first hints, `inline_len` of them in use.
+    inline: [StreamHint; 2],
+    /// How many of `inline` are in use.
+    inline_len: u8,
+    /// Hints past the inline capacity, in order.
+    spill: Vec<StreamHint>,
+}
+
+impl StreamHints {
+    /// No hints.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends a hint.
+    pub(crate) fn push(&mut self, hint: StreamHint) {
+        let n = usize::from(self.inline_len);
+        if n < self.inline.len() {
+            self.inline[n] = hint;
+            self.inline_len += 1;
+        } else {
+            self.spill.push(hint);
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a StreamHints {
+    type Item = &'a StreamHint;
+    type IntoIter =
+        core::iter::Chain<core::slice::Iter<'a, StreamHint>, core::slice::Iter<'a, StreamHint>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inline[..usize::from(self.inline_len)]
+            .iter()
+            .chain(self.spill.iter())
+    }
+}
+
+impl core::ops::Index<usize> for StreamHints {
+    type Output = StreamHint;
+
+    fn index(&self, i: usize) -> &StreamHint {
+        let n = usize::from(self.inline_len);
+        if i < n {
+            &self.inline[i]
+        } else {
+            &self.spill[i - n]
+        }
+    }
+}
+
 /// One STREAM frame's `(id, offset, length, fin)` as carried by a sent
 /// packet — the stream-data analogue of [`CryptoHint`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct StreamHint {
     /// Stream identifier.
     pub(crate) id: u64,
@@ -1235,7 +1293,7 @@ mod tests {
             in_flight,
             time_sent,
             retransmit_hint: Vec::new(),
-            stream_hints: Vec::new(),
+            stream_hints: StreamHints::new(),
             control_hints: Vec::new(),
             handshake_done: false,
         }

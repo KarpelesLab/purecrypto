@@ -25,6 +25,8 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
+use crate::quic::varint;
+
 use crate::quic::connection::{
     ERROR_FINAL_SIZE, ERROR_FLOW_CONTROL, ERROR_STREAM_LIMIT, ERROR_STREAM_STATE,
 };
@@ -216,6 +218,43 @@ pub(crate) struct SendStream {
     pub(crate) acked_ranges: BTreeMap<u64, u64>,
     /// True once a FIN-bearing STREAM frame has been acknowledged.
     pub(crate) fin_acked: bool,
+}
+
+/// Appends `data` to `dst` with two slice copies (the deque's tail may
+/// wrap) rather than one element write per byte, which is what
+/// `VecDeque::extend` does.
+fn extend_deque(dst: &mut VecDeque<u8>, data: &[u8]) {
+    let old = dst.len();
+    dst.resize(old + data.len(), 0);
+    let (a, b) = dst.as_mut_slices();
+    if old < a.len() {
+        let n = (a.len() - old).min(data.len());
+        a[old..old + n].copy_from_slice(&data[..n]);
+        b[..data.len() - n].copy_from_slice(&data[n..]);
+    } else {
+        let s = old - a.len();
+        b[s..s + data.len()].copy_from_slice(data);
+    }
+}
+
+/// Writes the STREAM frame header (RFC 9000 §19.8) for `len` bytes of
+/// stream `id` at `offset` — LEN always set, OFF iff `offset != 0` —
+/// exactly as `Frame::Stream` encodes it. The data follows it in the
+/// same buffer, copied straight from the send buffer.
+fn encode_stream_header(out: &mut Vec<u8>, id: u64, offset: u64, len: usize, fin: bool) {
+    let mut t = 0x08u8 | 0x02;
+    if offset != 0 {
+        t |= 0x04;
+    }
+    if fin {
+        t |= 0x01;
+    }
+    out.push(t);
+    varint::encode(id, out);
+    if offset != 0 {
+        varint::encode(offset, out);
+    }
+    varint::encode(len as u64, out);
 }
 
 /// Moves the first `n` bytes of `src` (`n <= src.len()`) into `out`, a
@@ -489,19 +528,39 @@ impl SendStream {
     ///
     /// `max_payload` must be ≥ 1 unless the front chunk is a FIN-only
     /// (zero-length) entry.
+    #[cfg(test)]
     pub(crate) fn pop_rtx(&mut self, max_payload: usize) -> Option<(u64, Vec<u8>, bool)> {
-        let (off, bytes, fin) = self.rtx_queue.pop_front()?;
+        let mut out = Vec::new();
+        let (off, len, fin) = self.pop_rtx_frame(0, max_payload, &mut out)?;
+        Some((off, out[out.len() - len..].to_vec(), fin))
+    }
+
+    /// [`Self::pop_rtx`] writing the whole STREAM frame — header and data
+    /// — for stream `id` into `out`, returning `(offset, len, fin)`. The
+    /// emitted chunk re-enters `sent_chunks` without being copied.
+    pub(crate) fn pop_rtx_frame(
+        &mut self,
+        id: u64,
+        max_payload: usize,
+        out: &mut Vec<u8>,
+    ) -> Option<(u64, usize, bool)> {
+        let (off, mut bytes, fin) = self.rtx_queue.pop_front()?;
         if bytes.len() <= max_payload {
-            self.push_sent((off, bytes.clone(), fin));
-            Some((off, bytes, fin))
+            let len = bytes.len();
+            encode_stream_header(out, id, off, len, fin);
+            out.extend_from_slice(&bytes);
+            self.push_sent((off, bytes, fin));
+            Some((off, len, fin))
         } else {
             debug_assert!(max_payload > 0);
             let tail = bytes[max_payload..].to_vec();
-            let head = bytes[..max_payload].to_vec();
+            bytes.truncate(max_payload);
+            encode_stream_header(out, id, off, max_payload, false);
+            out.extend_from_slice(&bytes);
             self.rtx_queue
                 .push_front((off + max_payload as u64, tail, fin));
-            self.push_sent((off, head.clone(), false));
-            Some((off, head, false))
+            self.push_sent((off, bytes, false));
+            Some((off, max_payload, false))
         }
     }
 
@@ -530,7 +589,7 @@ impl SendStream {
         if take == 0 {
             return 0;
         }
-        self.write_buf.extend(&data[..take]);
+        extend_deque(&mut self.write_buf, &data[..take]);
         if matches!(self.state, SendState::Ready) {
             self.state = SendState::Send;
         }
@@ -551,33 +610,57 @@ impl SendStream {
     ///
     /// `fin` is set only if the carve drains every byte AND `finish()`
     /// has been called (so this exact chunk ends at `fin_offset`).
+    #[cfg(test)]
     pub(crate) fn carve(&mut self, cap: usize) -> Option<(u64, Vec<u8>, bool)> {
+        let mut out = Vec::new();
+        let (off, len, fin) = self.carve_frame(0, cap, &mut out)?;
+        Some((off, out[out.len() - len..].to_vec(), fin))
+    }
+
+    /// [`Self::carve`] writing the whole STREAM frame — header and data —
+    /// for stream `id` into `out`, returning `(offset, len, fin)`. The
+    /// data is copied once out of `write_buf` into the packet and once
+    /// into the retained copy loss recovery may need, nothing more.
+    pub(crate) fn carve_frame(
+        &mut self,
+        id: u64,
+        cap: usize,
+        out: &mut Vec<u8>,
+    ) -> Option<(u64, usize, bool)> {
         if !self.has_outbound() {
             return None;
         }
         let offset = self.write_off;
         let take = core::cmp::min(cap, self.write_buf.len());
-        let mut bytes: Vec<u8> = alloc::vec![0u8; take];
-        drain_front_into(&mut self.write_buf, &mut bytes);
-        self.write_off += take as u64;
+        let end = offset + take as u64;
+        // FIN: caller has called finish() AND the chunk carved here ends
+        // exactly at the final-byte offset AND FIN was not emitted before.
+        let fin = matches!(self.fin_offset, Some(fin) if end == fin && take == self.write_buf.len())
+            && !self.fin_sent;
+        encode_stream_header(out, id, offset, take, fin);
+        let mut bytes: Vec<u8> = Vec::with_capacity(take);
+        {
+            let (a, b) = self.write_buf.as_slices();
+            let from_a = take.min(a.len());
+            bytes.extend_from_slice(&a[..from_a]);
+            bytes.extend_from_slice(&b[..take - from_a]);
+        }
+        out.extend_from_slice(&bytes);
+        self.write_buf.drain(..take);
+        self.write_off = end;
         if self.write_off > self.sent_offset {
             self.sent_offset = self.write_off;
         }
-        // Determine FIN: caller has called finish() AND the chunk we
-        // just carved ends exactly at the final-byte offset AND we
-        // haven't emitted FIN before.
-        let fin = matches!(self.fin_offset, Some(fin) if self.write_off == fin && self.write_buf.is_empty())
-            && !self.fin_sent;
         if fin {
             self.fin_sent = true;
             self.state = SendState::DataSent;
-        } else if matches!(self.state, SendState::Ready) && !bytes.is_empty() {
+        } else if matches!(self.state, SendState::Ready) && take > 0 {
             self.state = SendState::Send;
         }
         // Record the chunk so the ack/loss/PTO machinery can confirm or
         // retransmit it.
-        self.push_sent((offset, bytes.clone(), fin));
-        Some((offset, bytes, fin))
+        self.push_sent((offset, bytes, fin));
+        Some((offset, take, fin))
     }
 
     /// Queue every sent-but-unconfirmed chunk for retransmission.

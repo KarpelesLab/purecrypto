@@ -82,13 +82,14 @@ use crate::quic::ecn::{EcnCodepoint, EcnValidation};
 use crate::quic::endpoint::Endpoint;
 use crate::quic::frame::{EcnCounts, Frame, FrameIter, StreamDir, build_ack_ranges_raw};
 use crate::quic::loss::{
-    CryptoHint, K_PTO_PROBES, SentPacket, StreamHint, TimeoutAction, build_retransmit_hint,
-    parse_retransmit_hint,
+    CryptoHint, K_PTO_PROBES, SentPacket, StreamHint, StreamHints, TimeoutAction,
+    build_retransmit_hint, parse_retransmit_hint,
 };
 use crate::quic::path::{Path, PathChallengeState};
 use crate::quic::pkt::{
-    LongHeader, LongType, ShortHeader, apply_header_protection, build_long_header, build_retry,
-    build_short_header, check_reserved_bits, remove_header_protection, retry_integrity_tag,
+    LongHeader, LongType, ShortHeader, apply_header_protection, build_long_header_into,
+    build_retry, build_short_header_into, check_reserved_bits, remove_header_protection,
+    retry_integrity_tag,
 };
 use crate::quic::pn::{PnSpaceId, decode_packet_number, encode_packet_number_length};
 use crate::quic::retry::encode_addr as encode_retry_addr;
@@ -936,6 +937,15 @@ pub struct QuicConnection {
     /// call instead of six or seven times per packet also keeps every
     /// decision taken while processing it consistent.
     now_cached: Option<Duration>,
+    /// Buffer the outbound datagram is assembled in — header, frames,
+    /// ciphertext and tag of every coalesced packet, in place. Kept
+    /// between calls so [`Self::pop_datagram_into`] allocates nothing;
+    /// [`Self::pop_datagram`] hands it to the caller and starts afresh.
+    tx_datagram: Vec<u8>,
+    /// Scratch the plaintext frames of one packet are assembled in before
+    /// they are appended to [`Self::tx_datagram`] and sealed; kept between
+    /// packets.
+    tx_payload: Vec<u8>,
     /// RFC 9000 §10.1 idle timeout: time (relative to [`Self::start`]) of the
     /// last packet we received and successfully processed from the peer. The
     /// idle timer is measured from here; an idle connection is silently closed
@@ -1108,7 +1118,7 @@ pub(crate) struct PacketMeta {
     /// STREAM chunks carved into this packet. Recorded on the
     /// [`SentPacket`] so the ack path can confirm the ranges and the
     /// loss path can queue them for retransmission.
-    pub(crate) stream_hints: Vec<StreamHint>,
+    pub(crate) stream_hints: StreamHints,
     /// True if this packet carries the server's HANDSHAKE_DONE frame
     /// (RFC 9000 §19.20), so loss recovery can re-queue it.
     pub(crate) handshake_done: bool,
@@ -1377,6 +1387,8 @@ impl QuicConnection {
             one_rtt_phase_initialized: false,
             start: Instant::now(),
             now_cached: None,
+            tx_datagram: Vec::new(),
+            tx_payload: Vec::new(),
             peer_ack_params_installed: false,
             peer_packet_seen: false,
             last_recv_activity: Duration::ZERO,
@@ -1533,6 +1545,8 @@ impl QuicConnection {
             one_rtt_phase_initialized: false,
             start: Instant::now(),
             now_cached: None,
+            tx_datagram: Vec::new(),
+            tx_payload: Vec::new(),
             peer_ack_params_installed: false,
             peer_packet_seen: false,
             last_recv_activity: Duration::ZERO,
@@ -2045,6 +2059,9 @@ impl QuicConnection {
 
     /// Drains one outbound UDP datagram. Returns an empty `Vec` when
     /// nothing is pending. Each call returns at most one datagram.
+    ///
+    /// [`Self::pop_datagram_into`] does the same into a caller-provided
+    /// buffer without allocating.
     pub fn pop_datagram(&mut self) -> Vec<u8> {
         let now = self.now_since_start();
         self.pop_datagram_at(now)
@@ -2058,25 +2075,71 @@ impl QuicConnection {
     /// datagrams.
     pub fn pop_datagram_at(&mut self, now: Duration) -> Vec<u8> {
         let prev = self.now_cached.replace(now);
-        let datagram = self.pop_datagram_timed();
+        let mut datagram = core::mem::take(&mut self.tx_datagram);
+        datagram.clear();
+        self.pop_datagram_timed(&mut datagram);
         self.now_cached = prev;
+        if datagram.is_empty() {
+            self.tx_datagram = datagram;
+            return Vec::new();
+        }
         datagram
     }
 
-    fn pop_datagram_timed(&mut self) -> Vec<u8> {
+    /// Drains one outbound UDP datagram into `out`, returning its length,
+    /// or 0 when nothing is pending. The datagram is assembled and sealed
+    /// in place, so unlike [`Self::pop_datagram`] this allocates nothing
+    /// per call. `out` must hold at least [`Self::max_datagram_size`]
+    /// bytes; a shorter buffer yields 0 and leaves the connection
+    /// untouched.
+    pub fn pop_datagram_into(&mut self, out: &mut [u8]) -> usize {
+        let now = self.now_since_start();
+        self.pop_datagram_into_at(now, out)
+    }
+
+    /// [`Self::pop_datagram_into`] against the caller's clock, as
+    /// [`Self::pop_datagram_at`].
+    pub fn pop_datagram_into_at(&mut self, now: Duration, out: &mut [u8]) -> usize {
+        if out.len() < self.datagram_budget() {
+            return 0;
+        }
+        let prev = self.now_cached.replace(now);
+        let mut datagram = core::mem::take(&mut self.tx_datagram);
+        datagram.clear();
+        self.pop_datagram_timed(&mut datagram);
+        self.now_cached = prev;
+        debug_assert!(datagram.len() <= out.len(), "datagram outgrew the budget");
+        let n = datagram.len().min(out.len());
+        out[..n].copy_from_slice(&datagram[..n]);
+        datagram.clear();
+        self.tx_datagram = datagram;
+        n
+    }
+
+    /// The largest datagram this connection emits (RFC 9000 §14): what a
+    /// buffer handed to [`Self::pop_datagram_into`] must hold.
+    pub fn max_datagram_size(&self) -> usize {
+        self.datagram_budget()
+    }
+
+    /// Appends the next outbound datagram, if any, to the empty `out`.
+    fn pop_datagram_timed(&mut self, out: &mut Vec<u8>) {
+        debug_assert!(out.is_empty());
         // Phase 8 — closed connections never emit.
         if self.closed {
-            return Vec::new();
+            return;
         }
         // RFC 9000 §10.2.2 — a draining connection MUST NOT send anything,
         // not even an ACK.
         if self.draining {
-            return Vec::new();
+            return;
         }
         // RFC 9000 §10.2.1 — a closing connection sends only its
         // CONNECTION_CLOSE, and only when the resend backoff has re-armed it.
         if self.pending_close.is_some() {
-            return self.pop_close_datagram();
+            let dg = self.pop_close_datagram();
+            out.extend_from_slice(&dg);
+            return;
         }
         // RFC 9000 §8.2.2 — a PATH_RESPONSE belongs on the path its
         // PATH_CHALLENGE arrived on. Debts owed on any other path can never
@@ -2097,15 +2160,16 @@ impl QuicConnection {
             // leaves ample budget for the ~74-byte Retry.
             if !self.active_path.can_send(dg.len()) {
                 self.pending_retry_datagram = Some(dg);
-                return Vec::new();
+                return;
             }
             self.active_path.note_sent(dg.len());
             self.endpoint.sent_first_datagram = true;
-            return dg;
+            out.extend_from_slice(&dg);
+            return;
         }
 
         if self.handshake_complete && !self.has_pending_outbound() {
-            return Vec::new();
+            return;
         }
         // G-5: AMP-cap envelope check BEFORE we start mutating any
         // outbound state. `build_packet_with_pad` and `assemble_payload`
@@ -2140,7 +2204,7 @@ impl QuicConnection {
             // small CRYPTO / ACK assemblies that *do* fit the budget
             // still go out.
             let snapshot = self.snapshot_one_shot_state();
-            let datagram = self.pop_datagram_inner();
+            self.pop_datagram_inner(out);
             // If the inner call rejected (returned empty) but had already
             // drained state that is never retransmitted — DATAGRAM frames
             // (RFC 9221 §5), PATH_RESPONSE, RETIRE_CONNECTION_ID and the
@@ -2148,12 +2212,12 @@ impl QuicConnection {
             // loss recovery owns (CRYPTO, STREAM, ACK) need no restoring.
             // (`bytes_sent` needs no restoring either — the inner path only
             // charges it on success.)
-            if datagram.is_empty() {
+            if out.is_empty() {
                 self.restore_one_shot_state(snapshot);
             }
-            return datagram;
+            return;
         }
-        self.pop_datagram_inner()
+        self.pop_datagram_inner(out)
     }
 
     /// Captures the outbound state that [`Self::pop_datagram_inner`] drains
@@ -2180,17 +2244,18 @@ impl QuicConnection {
 
     /// G-5: the original body of [`Self::pop_datagram`], extracted so
     /// the AMP-cap snapshot/restore wrapper can intercept rejected
-    /// builds. Returns the assembled datagram or an empty `Vec` if
-    /// nothing is pending OR the build was rejected by the AMP cap.
-    fn pop_datagram_inner(&mut self) -> Vec<u8> {
+    /// builds. Assembles the datagram in the empty `datagram`, which is
+    /// left empty if nothing is pending OR the build was rejected by the
+    /// AMP cap.
+    fn pop_datagram_inner(&mut self, datagram: &mut Vec<u8>) {
         // The packets built below register with loss recovery, which arms
         // the timer from the RFC 9002 §A.8 facts in `LossContext`.
         self.sync_loss_context();
         // Try to pack Initial → Handshake → 1-RTT into one datagram.
         // Each level contributes at most one packet (per RFC 9000 §12.2:
         // coalesced packets share a UDP datagram but each has its own
-        // header).
-        let mut datagram: Vec<u8> = Vec::with_capacity(1200);
+        // header). Every packet is built in place at the end of `datagram`.
+        datagram.reserve(1200);
 
         // Snapshot what (if anything) we'll emit BEFORE building the
         // Initial packet: we need to know whether Handshake / 1-RTT
@@ -2244,11 +2309,12 @@ impl QuicConnection {
         };
 
         // Initial-level packet (may carry CRYPTO + ACK + PADDING).
-        if let Some(pkt) =
-            self.build_packet_with_pad(Level::Initial, initial_pad_target.map(|t| (t, 0)), budget)
-        {
-            datagram.extend_from_slice(&pkt);
-        }
+        self.build_packet_with_pad(
+            Level::Initial,
+            initial_pad_target.map(|t| (t, 0)),
+            budget,
+            datagram,
+        );
         let initial_emitted = !datagram.is_empty();
 
         // 0-RTT packet (RFC 9001 §4.6): stream / DATAGRAM frames the
@@ -2259,9 +2325,10 @@ impl QuicConnection {
         if self.role == Role::Client
             && !self.early_keys_discarded
             && let Some(room) = self.coalesce_room(Level::EarlyData, budget, datagram.len())
-            && let Some(pkt) = self.build_packet_with_pad(Level::EarlyData, None, room)
+            && self
+                .build_packet_with_pad(Level::EarlyData, None, room, datagram)
+                .is_some()
         {
-            datagram.extend_from_slice(&pkt);
             zero_rtt_emitted = true;
         }
 
@@ -2273,9 +2340,10 @@ impl QuicConnection {
             None
         };
         if let Some(room) = self.coalesce_room(Level::Handshake, budget, datagram.len())
-            && let Some(pkt) = self.build_packet_with_pad(Level::Handshake, handshake_pad, room)
+            && self
+                .build_packet_with_pad(Level::Handshake, handshake_pad, room, datagram)
+                .is_some()
         {
-            datagram.extend_from_slice(&pkt);
             // RFC 9001 §4.9.1: "a client MUST discard Initial keys when it
             // first sends a Handshake packet". Sending one proves the
             // server's whole Initial flight (the ServerHello the Handshake
@@ -2311,10 +2379,8 @@ impl QuicConnection {
         } else {
             None
         };
-        if let Some(room) = self.coalesce_room(Level::OneRtt, budget, datagram.len())
-            && let Some(pkt) = self.build_packet_with_pad(Level::OneRtt, onertt_pad, room)
-        {
-            datagram.extend_from_slice(&pkt);
+        if let Some(room) = self.coalesce_room(Level::OneRtt, budget, datagram.len()) {
+            self.build_packet_with_pad(Level::OneRtt, onertt_pad, room, datagram);
         }
         // L-6: only a drop in the *challenge* count exempts this datagram
         // from the §8.1 budget. A PATH_RESPONSE is elicited by the peer, so
@@ -2325,7 +2391,7 @@ impl QuicConnection {
         let carries_own_challenge = self.path.pending_challenge_len() < challenge_pending_before;
 
         if datagram.is_empty() {
-            return Vec::new();
+            return;
         }
         // RFC 9000 §14.1 — Initial-bearing datagrams must be at least 1200
         // bytes. With a 0-RTT packet coalesced in, the Initial was built
@@ -2350,14 +2416,14 @@ impl QuicConnection {
             };
             // An empty payload lets `seal_packet`'s pad arithmetic size the
             // PADDING run exactly against the remaining room.
-            if let Some(pad_pkt) = self.seal_packet(
+            let already = datagram.len();
+            self.seal_packet(
                 trailer_level,
                 Vec::new(),
-                Some((1200, datagram.len())),
+                Some((1200, already)),
                 Some(PacketMeta::default()),
-            ) {
-                datagram.extend_from_slice(&pad_pkt);
-            }
+                datagram,
+            );
         }
 
         // RFC 9000 §8.1 / §9.3.1 — an endpoint MUST NOT send more than 3×
@@ -2370,7 +2436,8 @@ impl QuicConnection {
             // case we re-emit duplicate ACKs / CRYPTO chunks on the next
             // call. This is RFC-permissible (§13.3); the receiver
             // deduplicates by PN.
-            return Vec::new();
+            datagram.clear();
+            return;
         }
         self.active_path.note_sent(datagram.len());
 
@@ -2381,7 +2448,6 @@ impl QuicConnection {
         // anti-amplification state (§6.2.2.1), so recompute once more.
         let now = self.now_since_start();
         self.refresh_loss_timer(now);
-        datagram
     }
 
     /// True if any stream has carved-but-unacked chunks pending.
@@ -3814,9 +3880,13 @@ impl QuicConnection {
         };
         // RFC 9000 §10.2.1 — the close packet still counts against the
         // path's anti-amplification budget.
-        let Some(wire) = self.seal_packet(level, payload, pad, None) else {
+        let mut wire = Vec::new();
+        if self
+            .seal_packet(level, payload, pad, None, &mut wire)
+            .is_none()
+        {
             return Vec::new();
-        };
+        }
         if !self.path_budget_permits(wire.len(), true) {
             return Vec::new();
         }
@@ -3904,9 +3974,10 @@ impl QuicConnection {
             self.endpoint.cids.peer = cid;
         }
         let target = MIN_INITIAL_DATAGRAM.min(rx_len.saturating_mul(3));
-        let pkt = self.seal_packet(Level::OneRtt, payload, Some((target, 0)), None);
+        let mut pkt = Vec::new();
+        let built = self.seal_packet(Level::OneRtt, payload, Some((target, 0)), None, &mut pkt);
         self.endpoint.cids.peer = in_use;
-        pkt.map(|p| (to, p))
+        built.map(|_| (to, pkt))
     }
 
     /// Queues an outbound PATH_CHALLENGE (RFC 9000 §8.2). The peer will
@@ -6889,7 +6960,9 @@ impl QuicConnection {
     /// with header protection applied.
     fn build_packet_at(&mut self, level: Level) -> Option<Vec<u8>> {
         let room = self.datagram_budget();
-        self.build_packet_with_pad(level, None, room)
+        let mut out = Vec::new();
+        self.build_packet_with_pad(level, None, room, &mut out)
+            .map(|_| out)
     }
 
     /// Like [`build_packet_at`], but with optional PADDING to inflate the
@@ -6904,7 +6977,8 @@ impl QuicConnection {
         level: Level,
         pad: Option<(usize, usize)>,
         room: usize,
-    ) -> Option<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> Option<usize> {
         // Phase 4 emits Initial, Handshake, and 1-RTT. Phase 6 adds
         // STREAM and flow-control frames to the 1-RTT level. Phase 7
         // adds PATH_RESPONSE / NEW_CID / RETIRE_CID / pending CID
@@ -7047,12 +7121,13 @@ impl QuicConnection {
         let payload_cap = room.saturating_sub(self.packet_overhead(level));
         let (payload, meta) = self.assemble_payload(level, scope, payload_cap)?;
         if payload.is_empty() {
+            self.tx_payload = payload;
             return None;
         }
         if probing && meta.ack_eliciting {
             self.endpoint.loss.consume_probe_credit();
         }
-        self.seal_packet(level, payload, pad, Some(meta))
+        self.seal_packet(level, payload, pad, Some(meta), out)
     }
 
     /// Encrypts an already-assembled plaintext `payload` into a protected
@@ -7064,14 +7139,21 @@ impl QuicConnection {
     /// [`Self::build_close_packet`] — such a packet is neither ack-eliciting
     /// nor in flight (RFC 9002 §2), so it is not registered with loss recovery,
     /// and it must not clear the space's pending-ACK state.
+    ///
+    /// The packet is appended to `out` in place — header, payload,
+    /// ciphertext and tag — and its length returned; `out` is left as it
+    /// was when `None` is returned. `payload` is recycled as the scratch
+    /// the next payload is assembled in.
     fn seal_packet(
         &mut self,
         level: Level,
         payload: Vec<u8>,
         pad: Option<(usize, usize)>,
         meta: Option<PacketMeta>,
-    ) -> Option<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> Option<usize> {
         let mut payload = payload;
+        let base = out.len();
         // Keys must be installed for this direction.
         self.endpoint.crypto.at(level).tx.as_ref()?;
 
@@ -7193,7 +7275,9 @@ impl QuicConnection {
             .as_ref()
             .expect("checked above");
 
-        let (mut wire, pn_offset) = match level {
+        // Packet-number offset within the packet; the header goes straight
+        // into `out`.
+        let pn_offset = match level {
             Level::Initial => {
                 // The Initial packet's Length field covers PN + payload + tag.
                 let length_field = (pn_len as u64) + payload.len() as u64 + 16;
@@ -7205,7 +7289,8 @@ impl QuicConnection {
                 } else {
                     &[]
                 };
-                build_long_header(
+                build_long_header_into(
+                    out,
                     LongType::Initial,
                     self.version,
                     self.endpoint.cids.peer.as_slice(),
@@ -7218,7 +7303,8 @@ impl QuicConnection {
             }
             Level::Handshake => {
                 let length_field = (pn_len as u64) + payload.len() as u64 + 16;
-                build_long_header(
+                build_long_header_into(
+                    out,
                     LongType::Handshake,
                     self.version,
                     self.endpoint.cids.peer.as_slice(),
@@ -7234,7 +7320,8 @@ impl QuicConnection {
                 // the short-header first byte. The bit is covered by
                 // header protection.
                 let key_phase = self.endpoint.crypto.one_rtt_phase != 0;
-                build_short_header(
+                build_short_header_into(
+                    out,
                     self.endpoint.cids.peer.as_slice(),
                     false,
                     key_phase,
@@ -7247,7 +7334,8 @@ impl QuicConnection {
                 // 0x01, with no Token field, sharing the Application
                 // packet-number space with 1-RTT (§12.3).
                 let length_field = (pn_len as u64) + payload.len() as u64 + 16;
-                build_long_header(
+                build_long_header_into(
+                    out,
                     // RFC 9369 §4.1 — 0-RTT is always the original version.
                     LongType::ZeroRtt,
                     self.original_version,
@@ -7261,29 +7349,39 @@ impl QuicConnection {
             }
         };
 
+        // `pn_offset` is relative to `out`; the packet starts at `base`.
+        let pkt_pn_offset = pn_offset - base;
         // Append the (still-plaintext) payload bytes, leaving room for the
-        // tag so the packet is built in one allocation.
-        wire.reserve(payload.len() + 16);
-        wire.extend_from_slice(&payload);
+        // tag so the packet is built without a further move.
+        out.reserve(payload.len() + 16);
+        out.extend_from_slice(&payload);
 
         // Seal in place; the header in front of the payload is the AAD.
-        let aad_len = pn_offset + pn_len as usize;
-        let (aad, pt) = wire.split_at_mut(aad_len);
+        let aad_len = pkt_pn_offset + pn_len as usize;
+        let (aad, pt) = out[base..].split_at_mut(aad_len);
         let tag = aead_seal(dir_keys, pn, aad, pt);
-        wire.extend_from_slice(&tag);
+        out.extend_from_slice(&tag);
 
         // Header protection (last use of `dir_keys` — its immutable
         // borrow ends here so we can re-borrow crypto state mutably
         // below for the §6.6 tx counter increment).
         let sample_start = pn_offset + 4;
         let sample_end = sample_start + 16;
-        debug_assert!(sample_end <= wire.len());
-        let sample_arr: [u8; 16] = wire[sample_start..sample_end]
+        debug_assert!(sample_end <= out.len());
+        let sample_arr: [u8; 16] = out[sample_start..sample_end]
             .try_into()
             .expect("16-byte sample");
-        let mask = dir_keys.hp.mask(&sample_arr).ok()?;
+        let Ok(mask) = dir_keys.hp.mask(&sample_arr) else {
+            out.truncate(base);
+            return None;
+        };
         let long_header = !matches!(level, Level::OneRtt);
-        apply_header_protection(&mut wire, pn_offset, pn_len, &mask, long_header);
+        apply_header_protection(&mut out[base..], pkt_pn_offset, pn_len, &mask, long_header);
+        let packet_len = out.len() - base;
+        // The payload has been copied into the packet: keep its allocation
+        // for the next one.
+        payload.clear();
+        self.tx_payload = payload;
 
         // RFC 9001 §6.6 — count this packet against the per-key tx
         // usage limit. The pre-encrypt check above ensured we were
@@ -7296,7 +7394,7 @@ impl QuicConnection {
 
         // A close-only packet carries no ACK and never enters loss recovery.
         let Some(meta) = meta else {
-            return Some(wire);
+            return Some(packet_len);
         };
 
         // Clear the ack-eliciting flag and pending list for this space, but
@@ -7324,7 +7422,7 @@ impl QuicConnection {
         } else {
             build_retransmit_hint(&meta.crypto_hints)
         };
-        let sent_bytes = u16::try_from(wire.len()).unwrap_or(u16::MAX);
+        let sent_bytes = u16::try_from(packet_len).unwrap_or(u16::MAX);
         let space_id = pn_space_of_level(level);
         let sent_pkt = SentPacket {
             pn,
@@ -7333,8 +7431,8 @@ impl QuicConnection {
             in_flight: meta.in_flight,
             time_sent: now,
             retransmit_hint,
-            stream_hints: meta.stream_hints.clone(),
-            control_hints: meta.control_hints.clone(),
+            stream_hints: meta.stream_hints,
+            control_hints: meta.control_hints,
             handshake_done: meta.handshake_done,
         };
         self.endpoint.loss.on_packet_sent(space_id, sent_pkt);
@@ -7342,7 +7440,7 @@ impl QuicConnection {
             self.endpoint.cc.on_packet_sent(sent_bytes as u64);
         }
 
-        Some(wire)
+        Some(packet_len)
     }
 
     /// Build the *plaintext* frame payload for level `level`. Returns
@@ -7356,7 +7454,9 @@ impl QuicConnection {
         scope: PayloadScope,
         payload_cap: usize,
     ) -> Option<(Vec<u8>, PacketMeta)> {
-        let mut out: Vec<u8> = Vec::new();
+        // The scratch `seal_packet` hands back once the payload is sealed.
+        let mut out: Vec<u8> = core::mem::take(&mut self.tx_payload);
+        out.clear();
         let mut meta = PacketMeta::default();
         let full = scope == PayloadScope::Full;
 
@@ -7570,11 +7670,12 @@ impl QuicConnection {
                     if remaining < 4 {
                         break;
                     }
-                    let popped = match streams.pop_frame(remaining) {
+                    // The frame is written straight into `out` — STREAM
+                    // data copied once out of the send buffer.
+                    let popped = match streams.pop_frame_into(remaining, &mut out) {
                         Some(f) => f,
                         None => break,
                     };
-                    popped.encode(&mut out);
                     // Record control frames so a lost packet has them
                     // sent again (RFC 9000 §13.3).
                     if let Some(hint) = popped.control_hint() {
@@ -7584,14 +7685,14 @@ impl QuicConnection {
                     if let crate::quic::streams::PoppedFrame::Stream {
                         id,
                         offset,
-                        ref data,
+                        len,
                         fin,
                     } = popped
                     {
                         meta.stream_hints.push(StreamHint {
                             id,
                             offset,
-                            length: data.len() as u64,
+                            length: len,
                             fin,
                         });
                     }
@@ -7664,6 +7765,7 @@ impl QuicConnection {
         }
 
         if out.is_empty() {
+            self.tx_payload = out;
             None
         } else {
             Some((out, meta))
@@ -10453,7 +10555,7 @@ mod tests {
                     in_flight: true,
                     time_sent: Duration::ZERO,
                     retransmit_hint: Vec::new(),
-                    stream_hints: Vec::new(),
+                    stream_hints: crate::quic::loss::StreamHints::new(),
                     control_hints: Vec::new(),
                     handshake_done: false,
                 },
@@ -10498,7 +10600,7 @@ mod tests {
                     in_flight: true,
                     time_sent: sent_at,
                     retransmit_hint: Vec::new(),
-                    stream_hints: Vec::new(),
+                    stream_hints: crate::quic::loss::StreamHints::new(),
                     control_hints: Vec::new(),
                     handshake_done: false,
                 },
@@ -10568,7 +10670,7 @@ mod tests {
                     in_flight: true,
                     time_sent: Duration::from_millis(100),
                     retransmit_hint: Vec::new(),
-                    stream_hints: Vec::new(),
+                    stream_hints: crate::quic::loss::StreamHints::new(),
                     control_hints: Vec::new(),
                     handshake_done: false,
                 },
@@ -14713,7 +14815,7 @@ mod tests {
                     in_flight: true,
                     time_sent: Duration::from_millis(pn),
                     retransmit_hint: alloc::vec::Vec::new(),
-                    stream_hints: alloc::vec::Vec::new(),
+                    stream_hints: crate::quic::loss::StreamHints::new(),
                     control_hints: alloc::vec::Vec::new(),
                     handshake_done: false,
                 },

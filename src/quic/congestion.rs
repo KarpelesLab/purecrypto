@@ -210,7 +210,7 @@ mod tests {
             in_flight,
             time_sent,
             retransmit_hint: Vec::new(),
-            stream_hints: Vec::new(),
+            stream_hints: crate::quic::loss::StreamHints::new(),
             control_hints: Vec::new(),
             handshake_done: false,
         }

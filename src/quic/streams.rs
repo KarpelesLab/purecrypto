@@ -85,8 +85,10 @@ pub(crate) enum PoppedFrame {
         id: u64,
         /// Stream offset.
         offset: u64,
-        /// Stream data.
-        data: Vec<u8>,
+        /// Length of the stream data the frame carried. The data itself
+        /// was written into the packet by [`Streams::pop_frame_into`] as
+        /// it was carved; the sender keeps its own copy for retransmission.
+        len: u64,
         /// FIN bit.
         fin: bool,
     },
@@ -140,26 +142,194 @@ pub(crate) enum PoppedFrame {
     },
 }
 
+/// What [`Streams::pop_frame_into`] found on one stream.
+enum StreamPop {
+    /// A frame was written; `more` says the stream still has work queued.
+    Frame { frame: PoppedFrame, more: bool },
+    /// The stream's next frame does not fit the budget; try it again later.
+    NoRoom,
+    /// Nothing to send on this stream.
+    Idle,
+}
+
+/// Pops the next frame of `stream` (id `id`) into `out`, in the
+/// [`Streams::pop_frame`] priority order: RESET_STREAM, STOP_SENDING,
+/// MAX_STREAM_DATA, STREAM_DATA_BLOCKED, then a retransmission ahead of
+/// fresh STREAM data.
+fn pop_stream_frame(stream: &mut Stream, id: u64, budget: usize, out: &mut Vec<u8>) -> StreamPop {
+    // RESET_STREAM on the send side.
+    if let Some(send) = stream.send.as_mut()
+        && send.reset_pending
+    {
+        let frame = PoppedFrame::ResetStream {
+            id,
+            code: send.reset_code.unwrap_or(0),
+            final_size: send.sent_offset,
+        };
+        if frame.encoded_len() > budget {
+            return StreamPop::NoRoom;
+        }
+        send.reset_pending = false;
+        frame.encode(out);
+        let more = stream_needs_to_send(stream);
+        return StreamPop::Frame { frame, more };
+    }
+    // STOP_SENDING (recv side has been signaled).
+    if let Some(recv) = stream.recv.as_mut()
+        && let Some(code) = recv.stop_sending_pending
+    {
+        let frame = PoppedFrame::StopSending { id, code };
+        if frame.encoded_len() > budget {
+            return StreamPop::NoRoom;
+        }
+        // Clear the trigger so we don't re-emit.
+        recv.stop_sending_pending = None;
+        frame.encode(out);
+        let more = stream_needs_to_send(stream);
+        return StreamPop::Frame { frame, more };
+    }
+    // MAX_STREAM_DATA (recv side).
+    if let Some(recv) = stream.recv.as_mut()
+        && recv.max_data_pending
+    {
+        let frame = PoppedFrame::MaxStreamData {
+            id,
+            limit: recv.max_data,
+        };
+        if frame.encoded_len() > budget {
+            return StreamPop::NoRoom;
+        }
+        recv.max_data_pending = false;
+        recv.max_data_announced = recv.max_data;
+        frame.encode(out);
+        let more = stream_needs_to_send(stream);
+        return StreamPop::Frame { frame, more };
+    }
+    // STREAM_DATA_BLOCKED (send side).
+    if let Some(send) = stream.send.as_mut()
+        && let Some(lim) = send.blocked_at
+    {
+        let frame = PoppedFrame::StreamDataBlocked { id, limit: lim };
+        if frame.encoded_len() > budget {
+            return StreamPop::NoRoom;
+        }
+        send.blocked_at = None;
+        frame.encode(out);
+        let more = stream_needs_to_send(stream);
+        return StreamPop::Frame { frame, more };
+    }
+    // Retransmissions before fresh data: a queued rtx chunk is (usually)
+    // the receiver's contiguity gap, so it unblocks the peer's delivery
+    // (and credit consumption) fastest.
+    if let Some(send) = stream.send.as_mut()
+        && let Some((r_off, r_len)) = send.peek_rtx()
+    {
+        // Header sized with the FULL chunk length; the emitted length is
+        // ≤ that, so its varint is never wider.
+        let header_overhead = 1
+            + varint::encoded_len(id)
+            + (if r_off > 0 {
+                varint::encoded_len(r_off)
+            } else {
+                0
+            })
+            + varint::encoded_len(r_len as u64);
+        let min_payload = usize::from(r_len > 0);
+        if budget < header_overhead + min_payload {
+            return StreamPop::NoRoom;
+        }
+        let max_payload = budget - header_overhead;
+        let (off, len, fin) = send
+            .pop_rtx_frame(id, max_payload, out)
+            .expect("just-peeked");
+        let more = stream_needs_to_send(stream);
+        return StreamPop::Frame {
+            frame: PoppedFrame::Stream {
+                id,
+                offset: off,
+                len: len as u64,
+                fin,
+            },
+            more,
+        };
+    }
+    // Fresh STREAM data: carve as much as fits the budget. The per-stream
+    // and connection credit already capped what was accepted into
+    // `write_buf` (charged at `write()` time; retransmits are not
+    // re-charged), so the carve only respects the packet budget.
+    if let Some(send) = stream.send.as_mut()
+        && send.has_outbound()
+    {
+        let offset = send.write_off;
+        // Pessimistically sized with OFF + LEN always, matching the
+        // encoding.
+        let header_overhead = 1
+            + varint::encoded_len(id)
+            + (if offset > 0 {
+                varint::encoded_len(offset)
+            } else {
+                0
+            })
+            + varint::encoded_len(send.write_buf.len() as u64);
+        if budget < header_overhead + 1 {
+            // Not even one byte of payload fits.
+            return StreamPop::NoRoom;
+        }
+        let payload_budget = budget.saturating_sub(header_overhead);
+        let chunk_size = core::cmp::min(payload_budget, send.write_buf.len());
+        if chunk_size == 0 {
+            // FIN-only carve possible? Only if finish() was called and
+            // FIN hasn't been emitted yet.
+            if send.fin_offset.is_some() && !send.fin_sent && send.write_buf.is_empty() {
+                // header_overhead recomputed for length=0.
+                let header0 = 1
+                    + varint::encoded_len(id)
+                    + (if offset > 0 {
+                        varint::encoded_len(offset)
+                    } else {
+                        0
+                    })
+                    + varint::encoded_len(0);
+                if budget >= header0 {
+                    let (off, len, fin) = send.carve_frame(id, 0, out).expect("FIN-only carve");
+                    debug_assert!(fin && len == 0);
+                    return StreamPop::Frame {
+                        frame: PoppedFrame::Stream {
+                            id,
+                            offset: off,
+                            len: 0,
+                            fin,
+                        },
+                        more: false,
+                    };
+                }
+            }
+            return StreamPop::NoRoom;
+        }
+        let (off, len, fin) = send.carve_frame(id, chunk_size, out).expect("just-checked");
+        let more = send.has_outbound();
+        return StreamPop::Frame {
+            frame: PoppedFrame::Stream {
+                id,
+                offset: off,
+                len: len as u64,
+                fin,
+            },
+            more,
+        };
+    }
+    StreamPop::Idle
+}
+
 impl PoppedFrame {
-    /// Serialize this frame into `out`. Mirrors `Frame::encode` so the
-    /// connection packer doesn't need to construct borrowed `Frame<'a>`
-    /// values for owned data.
+    /// Serialize this control frame into `out`. Mirrors `Frame::encode` so
+    /// the connection packer doesn't need to construct borrowed `Frame<'a>`
+    /// values for owned data. A STREAM frame is written by
+    /// [`Streams::pop_frame_into`] as its data is carved, so for one this
+    /// adds nothing.
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            PoppedFrame::Stream {
-                id,
-                offset,
-                data,
-                fin,
-            } => {
-                let frame = Frame::Stream {
-                    id: *id,
-                    offset: *offset,
-                    fin: *fin,
-                    data,
-                };
-                frame.encode(out);
-            }
+            PoppedFrame::Stream { .. } => {}
             PoppedFrame::ResetStream {
                 id,
                 code,
@@ -216,13 +386,45 @@ impl PoppedFrame {
         }
     }
 
-    /// Approximate on-wire size of this frame (after encoding). Used by
-    /// the packet packer to budget the next frame against the packet's
-    /// remaining bytes.
+    /// Exact on-wire size of this frame, matching [`Self::encode`] (and,
+    /// for STREAM, `Frame::Stream`'s LEN-always / OFF-iff-nonzero form).
+    /// Used by the packet packer to budget the next frame against the
+    /// packet's remaining bytes.
     pub(crate) fn encoded_len(&self) -> usize {
-        let mut buf = Vec::new();
-        self.encode(&mut buf);
-        buf.len()
+        match *self {
+            PoppedFrame::Stream {
+                id, offset, len, ..
+            } => {
+                1 + varint::encoded_len(id)
+                    + if offset != 0 {
+                        varint::encoded_len(offset)
+                    } else {
+                        0
+                    }
+                    + varint::encoded_len(len)
+                    + usize::try_from(len).unwrap_or(usize::MAX)
+            }
+            PoppedFrame::ResetStream {
+                id,
+                code,
+                final_size,
+            } => {
+                1 + varint::encoded_len(id)
+                    + varint::encoded_len(code)
+                    + varint::encoded_len(final_size)
+            }
+            PoppedFrame::StopSending { id, code } => {
+                1 + varint::encoded_len(id) + varint::encoded_len(code)
+            }
+            PoppedFrame::MaxData(v) | PoppedFrame::DataBlocked(v) => 1 + varint::encoded_len(v),
+            PoppedFrame::MaxStreamData { id, limit }
+            | PoppedFrame::StreamDataBlocked { id, limit } => {
+                1 + varint::encoded_len(id) + varint::encoded_len(limit)
+            }
+            PoppedFrame::MaxStreams { limit, .. } | PoppedFrame::StreamsBlocked { limit, .. } => {
+                1 + varint::encoded_len(limit)
+            }
+        }
     }
 
     /// What the packet carrying this frame must remember of it for RFC
@@ -1198,13 +1400,28 @@ impl Streams {
     ///   3. MAX_STREAMS — let the peer open more streams.
     ///   4. STREAM data (round-robin across the ready queue).
     ///   5. *_BLOCKED frames — informational.
+    #[cfg(test)]
     pub(crate) fn pop_frame(&mut self, budget: usize) -> Option<PoppedFrame> {
+        let mut out = Vec::new();
+        self.pop_frame_into(budget, &mut out)
+    }
+
+    /// [`Self::pop_frame`] writing the frame's encoding into `out` as it is
+    /// popped — STREAM data goes straight from the send buffer into the
+    /// packet — and returning what was written, for the packet's
+    /// ack/loss bookkeeping. Nothing is appended when `None` is returned.
+    pub(crate) fn pop_frame_into(
+        &mut self,
+        budget: usize,
+        out: &mut Vec<u8>,
+    ) -> Option<PoppedFrame> {
         // 1. MAX_DATA.
         if self.max_data_pending {
             let frame = PoppedFrame::MaxData(self.conn_recv_max);
             if frame.encoded_len() <= budget {
                 self.max_data_pending = false;
                 self.conn_recv_max_announced = self.conn_recv_max;
+                frame.encode(out);
                 return Some(frame);
             }
         }
@@ -1218,6 +1435,7 @@ impl Streams {
             if frame.encoded_len() <= budget {
                 self.max_streams_bidi_pending = false;
                 self.self_max_bidi_announced = self.self_max_bidi;
+                frame.encode(out);
                 return Some(frame);
             }
         }
@@ -1229,6 +1447,7 @@ impl Streams {
             if frame.encoded_len() <= budget {
                 self.max_streams_uni_pending = false;
                 self.self_max_uni_announced = self.self_max_uni;
+                frame.encode(out);
                 return Some(frame);
             }
         }
@@ -1238,6 +1457,7 @@ impl Streams {
             let frame = PoppedFrame::DataBlocked(lim);
             if frame.encoded_len() <= budget {
                 self.data_blocked_at = None;
+                frame.encode(out);
                 return Some(frame);
             }
         }
@@ -1250,6 +1470,7 @@ impl Streams {
             };
             if frame.encoded_len() <= budget {
                 self.streams_blocked_bidi_at = None;
+                frame.encode(out);
                 return Some(frame);
             }
         }
@@ -1260,15 +1481,17 @@ impl Streams {
             };
             if frame.encoded_len() <= budget {
                 self.streams_blocked_uni_at = None;
+                frame.encode(out);
                 return Some(frame);
             }
         }
 
         // 5. Per-stream urgent frames (RESET_STREAM, STOP_SENDING,
-        //    MAX_STREAM_DATA, STREAM_DATA_BLOCKED). We walk the
-        //    `ready_to_send` queue round-robin; each iteration emits at
+        //    MAX_STREAM_DATA, STREAM_DATA_BLOCKED) and STREAM data. We walk
+        //    the `ready_to_send` queue round-robin; each iteration emits at
         //    most one frame and re-enqueues the stream if more work
-        //    remains.
+        //    remains. The stream is worked on in place; the ready queue is
+        //    only touched once the borrow is over.
         let scan_count = self.ready_to_send.len();
         for _ in 0..scan_count {
             let id = match self.ready_to_send.pop_front() {
@@ -1276,221 +1499,22 @@ impl Streams {
                 None => break,
             };
             self.ready_set.remove(&id);
-            // Take the stream out of the map briefly so we can examine
-            // both send + recv halves without aliasing.
-            let mut stream = match self.map.remove(&id) {
-                Some(s) => s,
-                None => continue,
+            let Some(stream) = self.map.get_mut(&id) else {
+                continue;
             };
-            // First: RESET_STREAM on the send side.
-            if let Some(send) = stream.send.as_mut()
-                && send.reset_pending
-            {
-                let frame = PoppedFrame::ResetStream {
-                    id,
-                    code: send.reset_code.unwrap_or(0),
-                    final_size: send.sent_offset,
-                };
-                if frame.encoded_len() <= budget {
-                    send.reset_pending = false;
-                    self.map.insert(id, stream);
-                    // Stream still has other pending work? Re-queue.
-                    let need_requeue = stream_needs_to_send(self.map.get(&id).unwrap());
-                    if need_requeue {
+            match pop_stream_frame(stream, id, budget, out) {
+                StreamPop::Frame { frame, more } => {
+                    if more {
                         self.enqueue_ready(id);
                     }
                     return Some(frame);
-                } else {
-                    self.map.insert(id, stream);
-                    self.enqueue_ready(id);
-                    continue;
                 }
+                StreamPop::NoRoom => self.enqueue_ready(id),
+                StreamPop::Idle => {}
             }
-            // STOP_SENDING (recv side has been signaled).
-            if let Some(recv) = stream.recv.as_mut()
-                && let Some(code) = recv.stop_sending_pending
-            {
-                let frame = PoppedFrame::StopSending { id, code };
-                if frame.encoded_len() <= budget {
-                    // Clear the trigger so we don't re-emit.
-                    recv.stop_sending_pending = None;
-                    self.map.insert(id, stream);
-                    let need_requeue = stream_needs_to_send(self.map.get(&id).unwrap());
-                    if need_requeue {
-                        self.enqueue_ready(id);
-                    }
-                    return Some(frame);
-                } else {
-                    self.map.insert(id, stream);
-                    self.enqueue_ready(id);
-                    continue;
-                }
-            }
-            // MAX_STREAM_DATA (recv side).
-            if let Some(recv) = stream.recv.as_mut()
-                && recv.max_data_pending
-            {
-                let frame = PoppedFrame::MaxStreamData {
-                    id,
-                    limit: recv.max_data,
-                };
-                if frame.encoded_len() <= budget {
-                    recv.max_data_pending = false;
-                    recv.max_data_announced = recv.max_data;
-                    self.map.insert(id, stream);
-                    let need_requeue = stream_needs_to_send(self.map.get(&id).unwrap());
-                    if need_requeue {
-                        self.enqueue_ready(id);
-                    }
-                    return Some(frame);
-                } else {
-                    self.map.insert(id, stream);
-                    self.enqueue_ready(id);
-                    continue;
-                }
-            }
-            // STREAM_DATA_BLOCKED (send side).
-            if let Some(send) = stream.send.as_mut()
-                && let Some(lim) = send.blocked_at
-            {
-                let frame = PoppedFrame::StreamDataBlocked { id, limit: lim };
-                if frame.encoded_len() <= budget {
-                    send.blocked_at = None;
-                    self.map.insert(id, stream);
-                    let need_requeue = stream_needs_to_send(self.map.get(&id).unwrap());
-                    if need_requeue {
-                        self.enqueue_ready(id);
-                    }
-                    return Some(frame);
-                } else {
-                    self.map.insert(id, stream);
-                    self.enqueue_ready(id);
-                    continue;
-                }
-            }
-            // Retransmissions before fresh data: a queued rtx chunk is
-            // (usually) the receiver's contiguity gap, so it unblocks
-            // the peer's delivery (and credit consumption) fastest.
-            if let Some(send) = stream.send.as_mut()
-                && let Some((r_off, r_len)) = send.peek_rtx()
-            {
-                // Header sized with the FULL chunk length; the emitted
-                // length is ≤ that, so its varint is never wider.
-                let header_overhead = 1
-                    + varint::encoded_len(id)
-                    + (if r_off > 0 {
-                        varint::encoded_len(r_off)
-                    } else {
-                        0
-                    })
-                    + varint::encoded_len(r_len as u64);
-                let min_payload = usize::from(r_len > 0);
-                if budget >= header_overhead + min_payload {
-                    let max_payload = budget - header_overhead;
-                    let (off, bytes, fin) = send.pop_rtx(max_payload).expect("just-peeked");
-                    self.map.insert(id, stream);
-                    if stream_needs_to_send(self.map.get(&id).unwrap()) {
-                        self.enqueue_ready(id);
-                    }
-                    return Some(PoppedFrame::Stream {
-                        id,
-                        offset: off,
-                        data: bytes,
-                        fin,
-                    });
-                } else {
-                    self.map.insert(id, stream);
-                    self.enqueue_ready(id);
-                    continue;
-                }
-            }
-            // Fallback: STREAM frame. Try to carve as much as possible
-            // up to the budget AND the conn_send_used credit.
-            if let Some(send) = stream.send.as_mut()
-                && send.has_outbound()
-            {
-                // Compute the frame-header overhead so we know how many
-                // payload bytes can fit.
-                let offset = send.write_off;
-                // We pessimistically encode with OFF + LEN bits always
-                // (the `Frame::encode` does this; matches what we
-                // serialize).
-                let header_overhead = 1
-                    + varint::encoded_len(id)
-                    + (if offset > 0 {
-                        varint::encoded_len(offset)
-                    } else {
-                        0
-                    })
-                    + varint::encoded_len(send.write_buf.len() as u64);
-                if budget < header_overhead + 1 {
-                    // Not even one byte of payload fits.
-                    self.map.insert(id, stream);
-                    self.enqueue_ready(id);
-                    continue;
-                }
-                // conn_send_used is charged at write() time; carve here
-                // just respects the packet budget. The per-stream + conn
-                // credit limits already capped what we ever accepted
-                // into write_buf, so we can carve up to `write_buf.len()`
-                // freely (modulo the packet budget).
-                let sent_off = send.sent_offset;
-                let buf_len = send.write_buf.len();
-                let payload_budget = budget.saturating_sub(header_overhead);
-                let chunk_size = core::cmp::min(payload_budget, buf_len);
-                if chunk_size == 0 {
-                    // FIN-only carve possible? Only if finish() was called
-                    // and FIN hasn't been emitted yet.
-                    if send.fin_offset.is_some() && !send.fin_sent && send.write_buf.is_empty() {
-                        // header_overhead recomputed for length=0.
-                        let header0 = 1
-                            + varint::encoded_len(id)
-                            + (if offset > 0 {
-                                varint::encoded_len(offset)
-                            } else {
-                                0
-                            })
-                            + varint::encoded_len(0);
-                        if budget >= header0 {
-                            let (off, bytes, fin) = send.carve(0).expect("FIN-only carve");
-                            debug_assert!(fin && bytes.is_empty());
-                            self.map.insert(id, stream);
-                            return Some(PoppedFrame::Stream {
-                                id,
-                                offset: off,
-                                data: bytes,
-                                fin,
-                            });
-                        }
-                    }
-                    self.map.insert(id, stream);
-                    self.enqueue_ready(id);
-                    continue;
-                }
-                let (off, bytes, fin) = send.carve(chunk_size).expect("just-checked");
-                // Don't double-charge: conn_send_used was bumped at
-                // write() time. (Retransmits also don't re-charge.)
-                let _ = sent_off;
-                // Re-enqueue if more work remains.
-                let need_requeue = send.has_outbound();
-                self.map.insert(id, stream);
-                if need_requeue {
-                    self.enqueue_ready(id);
-                }
-                return Some(PoppedFrame::Stream {
-                    id,
-                    offset: off,
-                    data: bytes,
-                    fin,
-                });
-            }
-            // Nothing more on this stream; drop it from ready set and
-            // re-insert.
-            self.map.insert(id, stream);
         }
         None
     }
-
     /// A packet carrying stream chunk `[offset, offset+len)` (with
     /// `fin` per its FIN bit) on stream `id` was acknowledged. Prunes
     /// the sender-side retransmission state for that range.
