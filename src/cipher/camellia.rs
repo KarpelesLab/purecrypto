@@ -15,78 +15,78 @@
 //! SBOX1(x) = Lb · AesSbox( La · x ⊕ 1 ) ⊕ 1
 //! ```
 //!
-//! where `La` and `Lb` are fixed 8×8 GF(2) matrices and `AesSbox` is the
-//! crate's table-free AES S-box (`affine ∘ inv` over GF(2⁸) with reduction
-//! polynomial `0x11b`, reused from [`super::aes::gf`]). The equivalence was
-//! recovered numerically and is verified against the RFC 3713 SBOX1 table for
-//! every input in the unit tests. `SBOX2/3/4` are the RFC's bit rotations of
-//! `SBOX1`. Every operation is branchless with no data-dependent indexing.
+//! where `La` and `Lb` are fixed 8×8 GF(2) matrices, and `SBOX2/3/4` are the
+//! RFC's bit rotations of `SBOX1` (which fold into the affine maps). The
+//! eight S-box applications of the round function `F` therefore run as one
+//! pass of the bitsliced AES circuit ([`super::sbox_bitsliced`]) with the
+//! per-position maps applied on the bit-planes — and the circuit has room
+//! for four blocks' worth, so [`BlockCipher::encrypt_blocks`] runs four
+//! blocks in lockstep. The equivalence was recovered numerically and is
+//! verified against the RFC 3713 SBOX1 table for every input in the unit
+//! tests. Every operation is branchless with no data-dependent indexing.
 
 use super::BlockCipher;
-use super::aes::gf::sub_byte;
+use super::sbox_bitsliced::{Affine, PlaneAffine, sbox_custom};
 use crate::zeroize::Zeroize;
 
-// --- S-boxes, computed table-free via the AES S-box ------------------------
+// --- S-boxes as (pre, post) affine conjugates of the AES S-box -------------
+//
+// `SBOXn = post_n ∘ S_aes ∘ pre_n`, with `post` applied to the raw AES S-box
+// output. `SBOX2 = SBOX1 <<< 1` and `SBOX3 = SBOX1 >>> 1` rotate the post
+// map, `SBOX4(x) = SBOX1(x <<< 1)` rotates the pre map. Recovered from the
+// RFC 3713 table; `affine_constants_match_derivation` recomputes them.
 
-/// Applies an 8×8 GF(2) matrix (rows MSB-first) to `x`, MSB-first output.
-#[inline]
-fn bit_matrix(rows: &[u8; 8], x: u8) -> u8 {
-    let mut out = 0u8;
-    let mut bit = 0;
-    while bit < 8 {
-        let parity = (rows[bit] & x).count_ones() & 1;
-        out |= (parity as u8) << (7 - bit);
-        bit += 1;
+/// `La · x ⊕ 1` (SBOX1, SBOX2, SBOX3).
+const PRE_S123: Affine = Affine {
+    rows: [0x2b, 0xc5, 0x0f, 0x15, 0x3a, 0xbb, 0x37, 0x93],
+    c: 0x01,
+};
+/// `La · (x <<< 1) ⊕ 1` (SBOX4).
+const PRE_S4: Affine = Affine {
+    rows: [0x95, 0xe2, 0x87, 0x8a, 0x1d, 0xdd, 0x9b, 0xc9],
+    c: 0x01,
+};
+/// `Lb · A_aes⁻¹(y) ⊕ 1` (SBOX1, SBOX4).
+const POST_S14: Affine = Affine {
+    rows: [0xcc, 0x27, 0xee, 0x02, 0xc1, 0x2c, 0x11, 0xb2],
+    c: 0x01,
+};
+/// SBOX2: the SBOX1 map rotated left one bit.
+const POST_S2: Affine = Affine {
+    rows: [0xb2, 0xcc, 0x27, 0xee, 0x02, 0xc1, 0x2c, 0x11],
+    c: 0x02,
+};
+/// SBOX3: the SBOX1 map rotated right one bit.
+const POST_S3: Affine = Affine {
+    rows: [0x27, 0xee, 0x02, 0xc1, 0x2c, 0x11, 0xb2, 0xcc],
+    c: 0x80,
+};
+
+/// `F` substitutes the big-endian bytes of its 64-bit input through
+/// `(s1, s2, s3, s4, s2, s3, s4, s1)`; lane `l` of a word is little-endian
+/// byte `l % 8`, i.e. big-endian position `7 - l % 8`.
+const F_PATTERN: [u8; 32] = {
+    // Index into [s1, s2, s3, s4] by lane.
+    let by_lane = [0u8, 3, 2, 1, 3, 2, 1, 0];
+    let mut p = [0u8; 32];
+    let mut l = 0;
+    while l < 32 {
+        p[l] = by_lane[l % 8];
+        l += 1;
     }
-    out
-}
-
-/// Pre-affine matrix `La` (rows MSB-first), recovered from the affine
-/// equivalence `SBOX1 = Lb · AesSbox(La·x ⊕ 1) ⊕ 1`.
-const LA: [u8; 8] = [147, 55, 187, 58, 21, 15, 197, 43];
-/// Post-affine matrix `Lb` (rows MSB-first).
-const LB: [u8; 8] = [178, 17, 44, 193, 2, 238, 39, 204];
-
-/// Camellia `SBOX1`, computed without a lookup table.
-#[inline]
-fn sbox1(x: u8) -> u8 {
-    bit_matrix(&LB, sub_byte(bit_matrix(&LA, x) ^ 0x01)) ^ 0x01
-}
-
-/// Camellia `SBOX2(x) = SBOX1(x) <<< 1`.
-#[inline]
-fn sbox2(x: u8) -> u8 {
-    sbox1(x).rotate_left(1)
-}
-
-/// Camellia `SBOX3(x) = SBOX1(x) >>> 1`.
-#[inline]
-fn sbox3(x: u8) -> u8 {
-    sbox1(x).rotate_right(1)
-}
-
-/// Camellia `SBOX4(x) = SBOX1(x <<< 1)`.
-#[inline]
-fn sbox4(x: u8) -> u8 {
-    sbox1(x.rotate_left(1))
-}
+    p
+};
+const F_PRE: PlaneAffine =
+    PlaneAffine::per_lane(&[PRE_S123, PRE_S123, PRE_S123, PRE_S4], &F_PATTERN);
+const F_POST: PlaneAffine =
+    PlaneAffine::per_lane(&[POST_S14, POST_S2, POST_S3, POST_S14], &F_PATTERN);
 
 // --- F, FL and FL⁻¹ functions (RFC 3713 §2.3) ------------------------------
 
-/// The Feistel round function `F(x, k)` (RFC 3713 §2.3).
+/// The linear `P` layer of `F` on the substituted bytes `t1..t8` (big-endian).
 #[inline]
-fn f(x: u64, k: u64) -> u64 {
-    let v = x ^ k;
-    let t = v.to_be_bytes();
-    let t1 = sbox1(t[0]);
-    let t2 = sbox2(t[1]);
-    let t3 = sbox3(t[2]);
-    let t4 = sbox4(t[3]);
-    let t5 = sbox2(t[4]);
-    let t6 = sbox3(t[5]);
-    let t7 = sbox4(t[6]);
-    let t8 = sbox1(t[7]);
-
+fn p_layer(v: u64) -> u64 {
+    let [t1, t2, t3, t4, t5, t6, t7, t8] = v.to_be_bytes();
     let y1 = t1 ^ t3 ^ t4 ^ t6 ^ t7 ^ t8;
     let y2 = t1 ^ t2 ^ t4 ^ t5 ^ t7 ^ t8;
     let y3 = t1 ^ t2 ^ t3 ^ t5 ^ t6 ^ t8;
@@ -96,6 +96,18 @@ fn f(x: u64, k: u64) -> u64 {
     let y7 = t3 ^ t4 ^ t5 ^ t6 ^ t8;
     let y8 = t1 ^ t4 ^ t5 ^ t6 ^ t7;
     u64::from_be_bytes([y1, y2, y3, y4, y5, y6, y7, y8])
+}
+
+/// The Feistel round function `F(x, k)` (RFC 3713 §2.3) on `N` blocks' left
+/// halves at once (`N` = 1 or 4).
+#[inline]
+fn f<const N: usize>(x: &[u64; N], k: u64) -> [u64; N] {
+    let mut w: [u64; N] = core::array::from_fn(|i| x[i] ^ k);
+    sbox_custom(&mut w, &F_PRE, &F_POST);
+    for v in w.iter_mut() {
+        *v = p_layer(*v);
+    }
+    w
 }
 
 /// The `FL` linear layer (RFC 3713 §2.3).
@@ -150,22 +162,28 @@ fn rotl_lo(hi: u64, lo: u64, n: u32) -> u64 {
     (u128::from(hi) << 64 | u128::from(lo)).rotate_left(n) as u64
 }
 
+/// `F` on a single value (key schedule).
+#[inline]
+fn f1(x: u64, k: u64) -> u64 {
+    f::<1>(&[x], k)[0]
+}
+
 /// Computes `KA` and `KB` from `KL` and `KR` (RFC 3713 §2.4).
 fn ka_kb(kl: (u64, u64), kr: (u64, u64)) -> ((u64, u64), (u64, u64)) {
     let mut d1 = kl.0 ^ kr.0;
     let mut d2 = kl.1 ^ kr.1;
-    d2 ^= f(d1, SIGMA[0]);
-    d1 ^= f(d2, SIGMA[1]);
+    d2 ^= f1(d1, SIGMA[0]);
+    d1 ^= f1(d2, SIGMA[1]);
     d1 ^= kl.0;
     d2 ^= kl.1;
-    d2 ^= f(d1, SIGMA[2]);
-    d1 ^= f(d2, SIGMA[3]);
+    d2 ^= f1(d1, SIGMA[2]);
+    d1 ^= f1(d2, SIGMA[3]);
     let ka = (d1, d2);
 
     let mut e1 = ka.0 ^ kr.0;
     let mut e2 = ka.1 ^ kr.1;
-    e2 ^= f(e1, SIGMA[4]);
-    e1 ^= f(e2, SIGMA[5]);
+    e2 ^= f1(e1, SIGMA[4]);
+    e1 ^= f1(e2, SIGMA[5]);
     let kb = (e1, e2);
 
     // The Feistel temporaries hold KA and KB, from which the whole schedule
@@ -335,33 +353,89 @@ impl Schedule {
         }
     }
 
-    /// Runs the Feistel network on a 128-bit block split as `(d1, d2)`.
+    /// Runs the Feistel network on `N` independent blocks in lockstep, each
+    /// split as `(d1, d2)`; `N` = 4 fills the bitsliced substitution.
     #[inline]
-    fn crypt(&self, mut d1: u64, mut d2: u64) -> (u64, u64) {
-        d1 ^= self.kw[0];
-        d2 ^= self.kw[1];
+    fn crypt<const N: usize>(&self, d1: &mut [u64; N], d2: &mut [u64; N]) {
+        for (a, b) in d1.iter_mut().zip(d2.iter_mut()) {
+            *a ^= self.kw[0];
+            *b ^= self.kw[1];
+        }
 
         let groups = self.rounds / 6; // 3 or 4
         let mut round = 0;
         for g in 0..groups {
             // Six Feistel rounds.
             for _ in 0..6 {
-                d2 ^= f(d1, self.k[round]);
+                let fx = f(d1, self.k[round]);
+                for (b, fv) in d2.iter_mut().zip(fx.iter()) {
+                    *b ^= fv;
+                }
                 round += 1;
-                core::mem::swap(&mut d1, &mut d2);
+                core::mem::swap(d1, d2);
             }
             // After each group except the last, an FL / FL⁻¹ layer.
             if g != groups - 1 {
-                d1 = fl(d1, self.ke[2 * g]);
-                d2 = fl_inv(d2, self.ke[2 * g + 1]);
+                for (a, b) in d1.iter_mut().zip(d2.iter_mut()) {
+                    *a = fl(*a, self.ke[2 * g]);
+                    *b = fl_inv(*b, self.ke[2 * g + 1]);
+                }
             }
         }
         // The last swap above is undone by the final-output swap convention:
         // after the loop d1/d2 are already in the post-swap order, so apply
         // post-whitening with the halves exchanged (RFC 3713 §2.2).
-        d2 ^= self.kw[2];
-        d1 ^= self.kw[3];
-        (d2, d1)
+        for (a, b) in d1.iter_mut().zip(d2.iter_mut()) {
+            *b ^= self.kw[2];
+            *a ^= self.kw[3];
+        }
+        core::mem::swap(d1, d2);
+    }
+
+    /// One block.
+    #[inline]
+    fn crypt_block(&self, block: &mut [u8; 16]) {
+        let mut d1 = [u64::from_be_bytes(block[..8].try_into().expect("8 bytes"))];
+        let mut d2 = [u64::from_be_bytes(block[8..].try_into().expect("8 bytes"))];
+        self.crypt(&mut d1, &mut d2);
+        block[..8].copy_from_slice(&d1[0].to_be_bytes());
+        block[8..].copy_from_slice(&d2[0].to_be_bytes());
+    }
+
+    /// Whole blocks, four at a time; a tail of two or three blocks is padded
+    /// to a batch (the padding lanes are discarded), a single trailing block
+    /// takes the one-block path.
+    fn crypt_blocks(&self, blocks: &mut [u8]) {
+        let mut d1 = [0u64; 4];
+        let mut d2 = [0u64; 4];
+        let mut batches = blocks.chunks_exact_mut(64);
+        for chunk in &mut batches {
+            for (i, blk) in chunk.chunks_exact(16).enumerate() {
+                d1[i] = u64::from_be_bytes(blk[..8].try_into().expect("8 bytes"));
+                d2[i] = u64::from_be_bytes(blk[8..].try_into().expect("8 bytes"));
+            }
+            self.crypt(&mut d1, &mut d2);
+            for (i, blk) in chunk.chunks_exact_mut(16).enumerate() {
+                blk[..8].copy_from_slice(&d1[i].to_be_bytes());
+                blk[8..].copy_from_slice(&d2[i].to_be_bytes());
+            }
+        }
+        let rest = batches.into_remainder();
+        if rest.len() == 16 {
+            self.crypt_block(rest.try_into().expect("16 bytes"));
+        } else if !rest.is_empty() {
+            for (i, blk) in rest.chunks_exact(16).enumerate() {
+                d1[i] = u64::from_be_bytes(blk[..8].try_into().expect("8 bytes"));
+                d2[i] = u64::from_be_bytes(blk[8..].try_into().expect("8 bytes"));
+            }
+            self.crypt(&mut d1, &mut d2);
+            for (i, blk) in rest.chunks_exact_mut(16).enumerate() {
+                blk[..8].copy_from_slice(&d1[i].to_be_bytes());
+                blk[8..].copy_from_slice(&d2[i].to_be_bytes());
+            }
+        }
+        d1.zeroize();
+        d2.zeroize();
     }
 }
 
@@ -390,20 +464,28 @@ macro_rules! camellia_variant {
 
             #[inline]
             fn encrypt_block(&self, block: &mut [u8; 16]) {
-                let d1 = u64::from_be_bytes(block[..8].try_into().unwrap());
-                let d2 = u64::from_be_bytes(block[8..].try_into().unwrap());
-                let (c1, c2) = self.enc.crypt(d1, d2);
-                block[..8].copy_from_slice(&c1.to_be_bytes());
-                block[8..].copy_from_slice(&c2.to_be_bytes());
+                self.enc.crypt_block(block);
             }
 
             #[inline]
             fn decrypt_block(&self, block: &mut [u8; 16]) {
-                let d1 = u64::from_be_bytes(block[..8].try_into().unwrap());
-                let d2 = u64::from_be_bytes(block[8..].try_into().unwrap());
-                let (c1, c2) = self.dec.crypt(d1, d2);
-                block[..8].copy_from_slice(&c1.to_be_bytes());
-                block[8..].copy_from_slice(&c2.to_be_bytes());
+                self.dec.crypt_block(block);
+            }
+
+            fn encrypt_blocks(&self, blocks: &mut [u8]) {
+                assert!(
+                    blocks.len().is_multiple_of(16),
+                    "encrypt_blocks needs whole blocks"
+                );
+                self.enc.crypt_blocks(blocks);
+            }
+
+            fn decrypt_blocks(&self, blocks: &mut [u8]) {
+                assert!(
+                    blocks.len().is_multiple_of(16),
+                    "decrypt_blocks needs whole blocks"
+                );
+                self.dec.crypt_blocks(blocks);
             }
         }
 
@@ -471,6 +553,7 @@ camellia_variant!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cipher::sbox_bitsliced::derive;
     use crate::test_util::from_hex;
 
     /// RFC 3713 SBOX1 reference table.
@@ -494,11 +577,59 @@ mod tests {
          64, 40,211,123,187,201, 67,193, 21,227,173,244,119,199,128,158,
     ];
 
+    /// `La` of the affine equivalence `SBOX1 = Lb · AesSbox(La·x ⊕ 1) ⊕ 1`
+    /// (rows MSB-first), for the derivation check.
+    const LA: [u8; 8] = [147, 55, 187, 58, 21, 15, 197, 43];
+
+    fn bit_matrix(rows: &[u8; 8], x: u8) -> u8 {
+        let mut out = 0u8;
+        for (bit, row) in rows.iter().enumerate() {
+            out |= (((row & x).count_ones() & 1) as u8) << (7 - bit);
+        }
+        out
+    }
+
+    /// Evaluates the S-box of big-endian byte position `pos` of `F`'s input
+    /// (`s1, s2, s3, s4, s2, s3, s4, s1`) on one byte, in every block lane.
+    fn sbox_at(pos: usize, x: u8) -> u8 {
+        let mut w = [u64::from(x) << (8 * (7 - pos)); 4];
+        sbox_custom(&mut w, &F_PRE, &F_POST);
+        let y = (w[0] >> (8 * (7 - pos))) as u8;
+        for v in &w[1..] {
+            assert_eq!((v >> (8 * (7 - pos))) as u8, y);
+        }
+        y
+    }
+
     #[test]
     fn sbox1_matches_reference_table() {
         for x in 0u16..=255 {
-            assert_eq!(sbox1(x as u8), SBOX1_REF[x as usize], "SBOX1 at {x:#04x}");
+            let x = x as u8;
+            let s1 = SBOX1_REF[x as usize];
+            assert_eq!(sbox_at(0, x), s1, "SBOX1 at {x:#04x}");
+            assert_eq!(sbox_at(7, x), s1, "SBOX1 (last) at {x:#04x}");
+            assert_eq!(sbox_at(1, x), s1.rotate_left(1), "SBOX2 at {x:#04x}");
+            assert_eq!(sbox_at(4, x), s1.rotate_left(1), "SBOX2 at {x:#04x}");
+            assert_eq!(sbox_at(2, x), s1.rotate_right(1), "SBOX3 at {x:#04x}");
+            assert_eq!(sbox_at(5, x), s1.rotate_right(1), "SBOX3 at {x:#04x}");
+            let s4 = SBOX1_REF[x.rotate_left(1) as usize];
+            assert_eq!(sbox_at(3, x), s4, "SBOX4 at {x:#04x}");
+            assert_eq!(sbox_at(6, x), s4, "SBOX4 at {x:#04x}");
         }
+    }
+
+    /// The hard-coded `(pre, post)` pairs are what the RFC 3713 table gives
+    /// under the documented affine equivalence and the rotations.
+    #[test]
+    fn affine_constants_match_derivation() {
+        let pre = |x: u8| bit_matrix(&LA, x) ^ 1;
+        assert_eq!(derive(&SBOX1_REF, pre), (PRE_S123, POST_S14));
+        let s2: [u8; 256] = core::array::from_fn(|i| SBOX1_REF[i].rotate_left(1));
+        assert_eq!(derive(&s2, pre), (PRE_S123, POST_S2));
+        let s3: [u8; 256] = core::array::from_fn(|i| SBOX1_REF[i].rotate_right(1));
+        assert_eq!(derive(&s3, pre), (PRE_S123, POST_S3));
+        let s4: [u8; 256] = core::array::from_fn(|i| SBOX1_REF[(i as u8).rotate_left(1) as usize]);
+        assert_eq!(derive(&s4, |x| pre(x.rotate_left(1))), (PRE_S4, POST_S14));
     }
 
     #[test]
@@ -571,6 +702,28 @@ mod tests {
             assert_ne!(b, orig);
             cipher.decrypt_block(&mut b);
             assert_eq!(b, orig);
+        }
+    }
+
+    /// The four-block batch (and the padded short tail) must equal
+    /// block-at-a-time processing for every block count up to two batches.
+    #[test]
+    fn batched_matches_single() {
+        let cipher = Camellia256::new(&[0x5au8; 32]);
+        for nblocks in 1..=9 {
+            let mut buf = alloc::vec![0u8; 16 * nblocks];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(197).wrapping_add(nblocks as u8);
+            }
+            let mut single = buf.clone();
+            for blk in single.chunks_exact_mut(16) {
+                cipher.encrypt_block(blk.try_into().unwrap());
+            }
+            let mut batched = buf.clone();
+            cipher.encrypt_blocks(&mut batched);
+            assert_eq!(batched, single, "{nblocks} blocks");
+            cipher.decrypt_blocks(&mut batched);
+            assert_eq!(batched, buf, "{nblocks} blocks");
         }
     }
 }

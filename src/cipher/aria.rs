@@ -13,90 +13,102 @@
 //!
 //! Like the table-free AES core in this crate, the four ARIA S-boxes are
 //! **computed** rather than looked up, so there are no secret-dependent
-//! memory accesses and hence no cache-timing leak:
+//! memory accesses and hence no cache-timing leak. All four are affine
+//! images of the GF(2⁸) inverse in the AES field (reduction polynomial
+//! `0x11b`):
 //!
-//! * `S1` is the AES S-box: `affine_aes(inv(x))`, reusing [`super::aes::gf`].
-//! * `S2(x) = B · inv(x) ⊕ 0xe2`, a different GF(2)-affine map of the same
-//!   GF(2⁸) inverse (reduction polynomial `0x11b`).
+//! * `S1` is the AES S-box itself;
+//! * `S2(x) = B · inv(x) ⊕ 0xe2` for the fixed matrix `B` of RFC 5794 §2.4.2;
 //! * `SS1 = S1⁻¹` and `SS2 = S2⁻¹` are the corresponding inverse affines
 //!   followed by the (self-inverse) field inversion.
 //!
-//! Every operation is branchless with no data-dependent indexing.
+//! A substitution layer therefore runs as one pass of the bitsliced AES
+//! circuit ([`super::sbox_bitsliced`]) over the whole 16-byte state — or two
+//! states at once from [`BlockCipher::encrypt_blocks`], which fills all 32
+//! lanes — with the per-position affine maps applied on the bit-planes. Every
+//! operation is branchless with no data-dependent indexing.
 
 use super::BlockCipher;
-use super::aes::gf::{gf_inv, inv_sub_byte, sub_byte};
+use super::sbox_bitsliced::{Affine, PlaneAffine, sbox_custom};
 use crate::zeroize::Zeroize;
 
-// --- S-boxes, computed table-free from the GF(2⁸) inverse -------------------
+// --- S-boxes as (pre, post) affine conjugates of the AES S-box -------------
+//
+// `S = post ∘ S_aes ∘ pre`; `post` is applied to the raw AES S-box output.
+// Recovered from the RFC 5794 tables; `affine_constants_match_derivation`
+// recomputes them from the reference tables in the tests.
 
-/// ARIA `S1` — identical to the AES S-box.
-#[inline]
-fn s1(x: u8) -> u8 {
-    sub_byte(x)
-}
+/// The inverse of the AES output affine, `A⁻¹(y) = (y<<<1) ⊕ (y<<<3) ⊕
+/// (y<<<6) ⊕ 0x05`, which turns `S_aes(x)` back into `inv(x)`.
+const AES_INV_AFFINE: Affine = Affine {
+    rows: [0xa4, 0x49, 0x92, 0x25, 0x4a, 0x94, 0x29, 0x52],
+    c: 0x05,
+};
 
-/// ARIA `SS1 = S1⁻¹` — the inverse AES S-box.
-#[inline]
-fn ss1(x: u8) -> u8 {
-    inv_sub_byte(x)
-}
+/// `S1 = S_aes`.
+const S1: (Affine, Affine) = (Affine::IDENTITY, Affine::IDENTITY);
+/// `S2 = B · inv(x) ⊕ 0xe2 = (B ∘ A⁻¹)(S_aes(x))`.
+const S2: (Affine, Affine) = (
+    Affine::IDENTITY,
+    Affine {
+        rows: [0x83, 0x12, 0xf3, 0x96, 0x32, 0x1a, 0xa0, 0xe7],
+        c: 0x88,
+    },
+);
+/// `SS1 = S_aes⁻¹ = A⁻¹ ∘ S_aes ∘ A⁻¹`.
+const SS1: (Affine, Affine) = (AES_INV_AFFINE, AES_INV_AFFINE);
+/// `SS2 = inv(B⁻¹(x ⊕ 0xe2)) = A⁻¹(S_aes(B⁻¹(x ⊕ 0xe2)))`.
+const SS2: (Affine, Affine) = (
+    Affine {
+        rows: [0x18, 0x64, 0x50, 0xc7, 0x37, 0xd6, 0xbd, 0xc9],
+        c: 0x2c,
+    },
+    AES_INV_AFFINE,
+);
 
-/// Applies an 8×8 GF(2) matrix (rows MSB-first) to `y`, MSB-first output.
-#[inline]
-fn bit_matrix(rows: &[u8; 8], y: u8) -> u8 {
-    let mut out = 0u8;
-    let mut bit = 0;
-    while bit < 8 {
-        let parity = (rows[bit] & y).count_ones() & 1;
-        out |= (parity as u8) << (7 - bit);
-        bit += 1;
+/// Lane pattern selecting a map by byte position mod 4 (lane `l` is state
+/// byte `l % 16` of block `l / 16`).
+const fn by_position(classes: [u8; 4]) -> [u8; 32] {
+    let mut p = [0u8; 32];
+    let mut l = 0;
+    while l < 32 {
+        p[l] = classes[l % 4];
+        l += 1;
     }
-    out
+    p
 }
 
-/// ARIA `S2(x) = B · inv(x) ⊕ 0xe2`.
-///
-/// `B` is the fixed 8×8 GF(2) matrix from RFC 5794 §2.4.2; applied as a
-/// per-output-bit parity over the bits of the field inverse `inv(x)`, so there
-/// is no table lookup. Validated against the standard S2 table in the tests.
-#[inline]
-fn s2(x: u8) -> u8 {
-    const B: [u8; 8] = [
-        0b0110_1111,
-        0b1100_0110,
-        0b0111_0011,
-        0b1100_0010,
-        0b1100_0011,
-        0b1011_0111,
-        0b1111_1100,
-        0b1110_1010,
-    ];
-    bit_matrix(&B, gf_inv(x)) ^ 0xe2
-}
+/// `SL1 = (S1, S2, SS1, SS2)` repeated; `SL2 = (SS1, SS2, S1, S2)`.
+const SL1_PRE: PlaneAffine =
+    PlaneAffine::per_lane(&[S1.0, S2.0, SS1.0, SS2.0], &by_position([0, 1, 2, 3]));
+const SL1_POST: PlaneAffine =
+    PlaneAffine::per_lane(&[S1.1, S2.1, SS1.1, SS2.1], &by_position([0, 1, 2, 3]));
+const SL2_PRE: PlaneAffine =
+    PlaneAffine::per_lane(&[S1.0, S2.0, SS1.0, SS2.0], &by_position([2, 3, 0, 1]));
+const SL2_POST: PlaneAffine =
+    PlaneAffine::per_lane(&[S1.1, S2.1, SS1.1, SS2.1], &by_position([2, 3, 0, 1]));
 
-/// ARIA `SS2 = S2⁻¹`: undo the affine `B·y ⊕ 0xe2`, then invert in GF(2⁸).
+/// Substitution layer `SL1` (`EVEN == false`) or `SL2` on `NW / 2` states
+/// held as little-endian word pairs.
 #[inline]
-fn ss2(x: u8) -> u8 {
-    const BINV: [u8; 8] = [
-        0b1100_1001,
-        0b1011_1101,
-        0b1101_0110,
-        0b0011_0111,
-        0b1100_0111,
-        0b0101_0000,
-        0b0110_0100,
-        0b0001_1000,
-    ];
-    gf_inv(bit_matrix(&BINV, x ^ 0xe2))
+fn sl<const EVEN: bool, const NW: usize>(w: &mut [u64; NW]) {
+    if EVEN {
+        sbox_custom(w, &SL2_PRE, &SL2_POST);
+    } else {
+        sbox_custom(w, &SL1_PRE, &SL1_POST);
+    }
 }
 
 // --- Diffusion layer A (RFC 5794 §2.4.3) ------------------------------------
 
-/// The involutional diffusion `A` on a 16-byte state. Each output byte is a
-/// XOR of seven input bytes per the RFC 5794 §2.4.3 matrix. `A` is its own
-/// inverse, so the same routine serves encryption and decryption.
+/// The involutional diffusion `A` on a 16-byte state: each output byte is
+/// the XOR of seven input bytes per the RFC 5794 §2.4.3 matrix. `A` is its
+/// own inverse, so the same routine serves encryption and decryption.
 #[inline]
-fn a_layer(x: &[u8; 16]) -> [u8; 16] {
+fn a_layer(w: &[u64; 2]) -> [u64; 2] {
+    let mut x = [0u8; 16];
+    x[..8].copy_from_slice(&w[0].to_le_bytes());
+    x[8..].copy_from_slice(&w[1].to_le_bytes());
     let mut y = [0u8; 16];
     y[0] = x[3] ^ x[4] ^ x[6] ^ x[8] ^ x[9] ^ x[13] ^ x[14];
     y[1] = x[2] ^ x[5] ^ x[7] ^ x[8] ^ x[9] ^ x[12] ^ x[15];
@@ -114,60 +126,87 @@ fn a_layer(x: &[u8; 16]) -> [u8; 16] {
     y[13] = x[0] ^ x[3] ^ x[6] ^ x[7] ^ x[8] ^ x[10] ^ x[13];
     y[14] = x[0] ^ x[3] ^ x[4] ^ x[5] ^ x[9] ^ x[11] ^ x[14];
     y[15] = x[1] ^ x[2] ^ x[4] ^ x[5] ^ x[8] ^ x[10] ^ x[15];
-    y
+
+    [
+        u64::from_le_bytes(y[..8].try_into().expect("8 bytes")),
+        u64::from_le_bytes(y[8..].try_into().expect("8 bytes")),
+    ]
 }
 
-/// Odd-round substitution layer `SL1`: `(S1, S2, SS1, SS2)` repeated.
+/// One round on `NW / 2` states: key XOR, substitution, diffusion.
 #[inline]
-fn sl1(x: &mut [u8; 16]) {
-    let mut i = 0;
-    while i < 16 {
-        x[i] = s1(x[i]);
-        x[i + 1] = s2(x[i + 1]);
-        x[i + 2] = ss1(x[i + 2]);
-        x[i + 3] = ss2(x[i + 3]);
-        i += 4;
+fn round<const EVEN: bool, const NW: usize>(w: &mut [u64; NW], rk: &[u64; 2]) {
+    for (i, x) in w.iter_mut().enumerate() {
+        *x ^= rk[i % 2];
+    }
+    sl::<EVEN, NW>(w);
+    for pair in w.chunks_exact_mut(2) {
+        let d = a_layer(&[pair[0], pair[1]]);
+        pair.copy_from_slice(&d);
     }
 }
 
-/// Even-round substitution layer `SL2`: `(SS1, SS2, S1, S2)` repeated.
-#[inline]
-fn sl2(x: &mut [u8; 16]) {
-    let mut i = 0;
-    while i < 16 {
-        x[i] = ss1(x[i]);
-        x[i + 1] = ss2(x[i + 1]);
-        x[i + 2] = s1(x[i + 2]);
-        x[i + 3] = s2(x[i + 3]);
-        i += 4;
+/// The ARIA round structure on `NW / 2` states (`NW` = 2 or 4),
+/// parameterised by round-key set.
+fn crypt<const NW: usize>(w: &mut [u64; NW], rk: &[[u64; 2]; 17], nr: usize) {
+    // Rounds 1 .. nr-1 alternate FO (odd) / FE (even); round nr is special.
+    // `nr` is even and public (it follows the key length), so that is
+    // (nr-2)/2 FO/FE pairs and one more FO.
+    let mut r = 0;
+    while r + 1 < nr - 1 {
+        round::<false, NW>(w, &rk[r]);
+        round::<true, NW>(w, &rk[r + 1]);
+        r += 2;
+    }
+    round::<false, NW>(w, &rk[nr - 2]);
+    // Final round (the (nr)-th): substitution-only, no diffusion, then the
+    // last whitening key. Round index nr-1 is odd-numbered (1-based round nr
+    // is even), so the final substitution uses SL2.
+    for (i, x) in w.iter_mut().enumerate() {
+        *x ^= rk[nr - 1][i % 2];
+    }
+    sl::<true, NW>(w);
+    for (i, x) in w.iter_mut().enumerate() {
+        *x ^= rk[nr][i % 2];
     }
 }
 
 #[inline]
-fn xor_block(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
-    let mut o = [0u8; 16];
-    let mut i = 0;
-    while i < 16 {
-        o[i] = a[i] ^ b[i];
-        i += 1;
+fn load(block: &[u8; 16]) -> [u64; 2] {
+    [
+        u64::from_le_bytes(block[..8].try_into().expect("8 bytes")),
+        u64::from_le_bytes(block[8..].try_into().expect("8 bytes")),
+    ]
+}
+
+#[inline]
+fn store(w: &[u64; 2], block: &mut [u8; 16]) {
+    block[..8].copy_from_slice(&w[0].to_le_bytes());
+    block[8..].copy_from_slice(&w[1].to_le_bytes());
+}
+
+/// Encrypts or decrypts `blocks` (whole 16-byte blocks) two at a time with
+/// the given round-key set, so each substitution layer fills all 32 lanes.
+fn crypt_blocks(blocks: &mut [u8], rk: &[[u64; 2]; 17], nr: usize) {
+    let mut pairs = blocks.chunks_exact_mut(32);
+    for pair in &mut pairs {
+        let (a, b) = pair.split_at_mut(16);
+        let a: &mut [u8; 16] = a.try_into().expect("16 bytes");
+        let b: &mut [u8; 16] = b.try_into().expect("16 bytes");
+        let [a0, a1] = load(a);
+        let [b0, b1] = load(b);
+        let mut w = [a0, a1, b0, b1];
+        crypt::<4>(&mut w, rk, nr);
+        store(&[w[0], w[1]], a);
+        store(&[w[2], w[3]], b);
+        w.zeroize();
     }
-    o
-}
-
-/// Odd round function `FO(D, RK) = A(SL1(D ⊕ RK))`.
-#[inline]
-fn fo(d: &[u8; 16], rk: &[u8; 16]) -> [u8; 16] {
-    let mut t = xor_block(d, rk);
-    sl1(&mut t);
-    a_layer(&t)
-}
-
-/// Even round function `FE(D, RK) = A(SL2(D ⊕ RK))`.
-#[inline]
-fn fe(d: &[u8; 16], rk: &[u8; 16]) -> [u8; 16] {
-    let mut t = xor_block(d, rk);
-    sl2(&mut t);
-    a_layer(&t)
+    if let Ok(last) = <&mut [u8; 16]>::try_from(pairs.into_remainder()) {
+        let mut w = load(last);
+        crypt::<2>(&mut w, rk, nr);
+        store(&w, last);
+        w.zeroize();
+    }
 }
 
 // --- Key schedule (RFC 5794 §2.5) -------------------------------------------
@@ -184,10 +223,33 @@ const C3: [u8; 16] = [
     0xdb, 0x92, 0x37, 0x1d, 0x21, 0x26, 0xe9, 0x70, 0x03, 0x24, 0x97, 0x75, 0x04, 0xe8, 0xc9, 0x0e,
 ];
 
-/// Rotates a 128-bit value right by `n` bits, big-endian.
+/// Odd round function `FO(D, RK) = A(SL1(D ⊕ RK))` on one state.
 #[inline]
-fn rotr128(x: &[u8; 16], n: u32) -> [u8; 16] {
-    u128::from_be_bytes(*x).rotate_right(n).to_be_bytes()
+fn fo(d: &[u64; 2], rk: &[u64; 2]) -> [u64; 2] {
+    let mut w = *d;
+    round::<false, 2>(&mut w, rk);
+    w
+}
+
+/// Even round function `FE(D, RK) = A(SL2(D ⊕ RK))` on one state.
+#[inline]
+fn fe(d: &[u64; 2], rk: &[u64; 2]) -> [u64; 2] {
+    let mut w = *d;
+    round::<true, 2>(&mut w, rk);
+    w
+}
+
+#[inline]
+fn xor(a: &[u64; 2], b: &[u64; 2]) -> [u64; 2] {
+    [a[0] ^ b[0], a[1] ^ b[1]]
+}
+
+/// Rotates a 128-bit value (big-endian byte order) right by `n` bits.
+#[inline]
+fn rotr128(x: &[u64; 2], n: u32) -> [u64; 2] {
+    let mut b = [0u8; 16];
+    store(x, &mut b);
+    load(&u128::from_be_bytes(b).rotate_right(n).to_be_bytes())
 }
 
 /// Number of rounds for the given key length in bytes.
@@ -202,13 +264,11 @@ const fn rounds_for(key_bytes: usize) -> usize {
 
 /// Expands the encryption and decryption round keys for `master` (the key
 /// zero-padded to 32 bytes, `KL || KR`) of length `key_bytes`.
-fn expand(master: &[u8; 32], key_bytes: usize) -> ([[u8; 16]; 17], [[u8; 16]; 17], usize) {
+fn expand(master: &[u8; 32], key_bytes: usize) -> ([[u64; 2]; 17], [[u64; 2]; 17], usize) {
     let nr = rounds_for(key_bytes);
 
-    let mut kl = [0u8; 16];
-    let mut kr = [0u8; 16];
-    kl.copy_from_slice(&master[..16]);
-    kr.copy_from_slice(&master[16..]);
+    let mut kl = load(master[..16].try_into().expect("16 bytes"));
+    let mut kr = load(master[16..].try_into().expect("16 bytes"));
 
     // (CK1, CK2, CK3) by key length (RFC 5794 §2.5.1).
     let (ck1, ck2, ck3) = match key_bytes {
@@ -219,9 +279,9 @@ fn expand(master: &[u8; 32], key_bytes: usize) -> ([[u8; 16]; 17], [[u8; 16]; 17
 
     // Four 128-bit words W0..W3 (RFC 5794 §2.5.1).
     let mut w0 = kl;
-    let mut w1 = xor_block(&fo(&w0, &ck1), &kr);
-    let mut w2 = xor_block(&fe(&w1, &ck2), &w0);
-    let mut w3 = xor_block(&fo(&w2, &ck3), &w1);
+    let mut w1 = xor(&fo(&w0, &load(&ck1)), &kr);
+    let mut w2 = xor(&fe(&w1, &load(&ck2)), &w0);
+    let mut w3 = xor(&fo(&w2, &load(&ck3)), &w1);
     let mut w = [w0, w1, w2, w3];
 
     // 17 encryption round keys (we always fill 17 slots; only nr+1 are used).
@@ -229,24 +289,17 @@ fn expand(master: &[u8; 32], key_bytes: usize) -> ([[u8; 16]; 17], [[u8; 16]; 17
     // The RFC writes the last three groups as left rotations 61, 31, 19, which
     // equal right rotations 67, 97, 109 — used here so a single rotr suffices.
     let rots = [19u32, 31, 67, 97, 109];
-    let mut ek = [[0u8; 16]; 17];
-    let mut i = 0;
-    while i <= nr {
-        let a = w[i % 4];
-        let r = rots[i / 4];
-        let b = rotr128(&w[(i + 1) % 4], r);
-        ek[i] = xor_block(&a, &b);
-        i += 1;
+    let mut ek = [[0u64; 2]; 17];
+    for (i, k) in ek.iter_mut().enumerate().take(nr + 1) {
+        *k = xor(&w[i % 4], &rotr128(&w[(i + 1) % 4], rots[i / 4]));
     }
 
     // Decryption round keys (RFC 5794 §2.5.3): reverse the encryption keys and
     // apply A to the interior ones.
-    let mut dk = [[0u8; 16]; 17];
+    let mut dk = [[0u64; 2]; 17];
     dk[0] = ek[nr];
-    let mut j = 1;
-    while j < nr {
+    for j in 1..nr {
         dk[j] = a_layer(&ek[nr - j]);
-        j += 1;
     }
     dk[nr] = ek[0];
 
@@ -261,35 +314,13 @@ fn expand(master: &[u8; 32], key_bytes: usize) -> ([[u8; 16]; 17], [[u8; 16]; 17
     (ek, dk, nr)
 }
 
-/// The ARIA round structure, parameterised by round-key set.
-#[inline]
-fn crypt(state: &mut [u8; 16], rk: &[[u8; 16]; 17], nr: usize) {
-    let mut p = *state;
-    // Rounds 1 .. nr-1 alternate FO (odd) / FE (even); round nr is special.
-    let mut round = 0;
-    while round < nr - 1 {
-        p = if round % 2 == 0 {
-            fo(&p, &rk[round])
-        } else {
-            fe(&p, &rk[round])
-        };
-        round += 1;
-    }
-    // Final round (the (nr)-th): substitution-only, no diffusion, then the
-    // last whitening key. Round index nr-1 is odd-numbered (1-based round nr
-    // is even), so the final substitution uses SL2.
-    let mut t = xor_block(&p, &rk[nr - 1]);
-    sl2(&mut t);
-    *state = xor_block(&t, &rk[nr]);
-}
-
 macro_rules! aria_variant {
     ($(#[$meta:meta])* $name:ident, $key_bytes:expr) => {
         $(#[$meta])*
         #[derive(Clone)]
         pub struct $name {
-            ek: [[u8; 16]; 17],
-            dk: [[u8; 16]; 17],
+            ek: [[u64; 2]; 17],
+            dk: [[u64; 2]; 17],
             nr: usize,
         }
 
@@ -299,6 +330,7 @@ macro_rules! aria_variant {
                 let mut master = [0u8; 32];
                 master[..$key_bytes].copy_from_slice(key);
                 let (ek, dk, nr) = expand(&master, $key_bytes);
+                master.zeroize();
                 $name { ek, dk, nr }
             }
         }
@@ -309,12 +341,28 @@ macro_rules! aria_variant {
 
             #[inline]
             fn encrypt_block(&self, block: &mut [u8; 16]) {
-                crypt(block, &self.ek, self.nr);
+                crypt_blocks(block, &self.ek, self.nr);
             }
 
             #[inline]
             fn decrypt_block(&self, block: &mut [u8; 16]) {
-                crypt(block, &self.dk, self.nr);
+                crypt_blocks(block, &self.dk, self.nr);
+            }
+
+            fn encrypt_blocks(&self, blocks: &mut [u8]) {
+                assert!(
+                    blocks.len().is_multiple_of(16),
+                    "encrypt_blocks needs whole blocks"
+                );
+                crypt_blocks(blocks, &self.ek, self.nr);
+            }
+
+            fn decrypt_blocks(&self, blocks: &mut [u8]) {
+                assert!(
+                    blocks.len().is_multiple_of(16),
+                    "decrypt_blocks needs whole blocks"
+                );
+                crypt_blocks(blocks, &self.dk, self.nr);
             }
         }
 
@@ -349,6 +397,8 @@ aria_variant!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cipher::aes::gf::{inv_sub_byte, sub_byte};
+    use crate::cipher::sbox_bitsliced::derive;
     use crate::test_util::from_hex;
 
     /// Reference ARIA S1 table (RFC 5794 §2.4.2 / AES S-box).
@@ -393,16 +443,77 @@ mod tests {
         0xed,0x14,0xe0,0xa5,0x3d,0x22,0xb3,0xf8,0x89,0xde,0x71,0x1a,0xaf,0xba,0xb5,0x81,
     ];
 
+    /// `B⁻¹` of RFC 5794 §2.4.2 (rows MSB-first), for the `SS2` derivation.
+    const BINV: [u8; 8] = [
+        0b1100_1001,
+        0b1011_1101,
+        0b1101_0110,
+        0b0011_0111,
+        0b1100_0111,
+        0b0101_0000,
+        0b0110_0100,
+        0b0001_1000,
+    ];
+
+    fn bit_matrix(rows: &[u8; 8], y: u8) -> u8 {
+        let mut out = 0u8;
+        for (bit, row) in rows.iter().enumerate() {
+            out |= (((row & y).count_ones() & 1) as u8) << (7 - bit);
+        }
+        out
+    }
+
+    /// Evaluates the S-box of byte position `class` (0..4) on one byte
+    /// through the bitsliced layer, in every lane of that class.
+    fn sbox_byte<const EVEN: bool>(class: usize, x: u8) -> u8 {
+        let mut w = [0u64; 4];
+        for l in (class..32).step_by(4) {
+            w[l / 8] |= u64::from(x) << (8 * (l % 8));
+        }
+        sl::<EVEN, 4>(&mut w);
+        let y = (w[class / 8] >> (8 * (class % 8))) as u8;
+        for l in (class..32).step_by(4) {
+            assert_eq!((w[l / 8] >> (8 * (l % 8))) as u8, y, "lane {l}");
+        }
+        y
+    }
+
     #[test]
     fn sboxes_match_reference_tables() {
         for x in 0u16..=255 {
             let x = x as u8;
-            assert_eq!(s1(x), S1_REF[x as usize], "S1 at {x:#04x}");
-            assert_eq!(s2(x), S2_REF[x as usize], "S2 at {x:#04x}");
-            // Inverses really invert.
-            assert_eq!(ss1(s1(x)), x, "SS1 at {x:#04x}");
-            assert_eq!(ss2(s2(x)), x, "SS2 at {x:#04x}");
+            let (s1, s2, ss1, ss2) = (
+                sbox_byte::<false>(0, x),
+                sbox_byte::<false>(1, x),
+                sbox_byte::<false>(2, x),
+                sbox_byte::<false>(3, x),
+            );
+            assert_eq!(s1, S1_REF[x as usize], "S1 at {x:#04x}");
+            assert_eq!(s2, S2_REF[x as usize], "S2 at {x:#04x}");
+            assert_eq!(ss1, inv_sub_byte(x), "SS1 at {x:#04x}");
+            assert_eq!(S2_REF[ss2 as usize], x, "SS2 at {x:#04x}");
+            // SL2 is the same four maps shifted by two positions.
+            assert_eq!(sbox_byte::<true>(2, x), s1);
+            assert_eq!(sbox_byte::<true>(3, x), s2);
+            assert_eq!(sbox_byte::<true>(0, x), ss1);
+            assert_eq!(sbox_byte::<true>(1, x), ss2);
         }
+    }
+
+    /// The hard-coded `(pre, post)` pairs are exactly what the reference
+    /// tables give under the documented structure of each S-box.
+    #[test]
+    fn affine_constants_match_derivation() {
+        assert_eq!(derive(&S1_REF, |x| x), S1);
+        assert_eq!(derive(&S2_REF, |x| x), S2);
+        let mut ss1 = [0u8; 256];
+        let mut ss2 = [0u8; 256];
+        for x in 0..=255u8 {
+            ss1[sub_byte(x) as usize] = x;
+            ss2[S2_REF[x as usize] as usize] = x;
+        }
+        assert_eq!(derive(&ss1, |x| AES_INV_AFFINE.apply(x)), SS1);
+        assert_eq!(derive(&ss2, |x| bit_matrix(&BINV, x ^ 0xe2)), SS2);
     }
 
     #[test]
@@ -412,7 +523,28 @@ mod tests {
             for (i, v) in b.iter_mut().enumerate() {
                 *v = (seed as u8).wrapping_add(i as u8).wrapping_mul(31);
             }
-            assert_eq!(a_layer(&a_layer(&b)), b);
+            let w = load(&b);
+            assert_eq!(a_layer(&a_layer(&w)), w);
+            // And against the RFC 5794 §2.4.3 matrix written out in full.
+            let x = b;
+            let mut y = [0u8; 16];
+            y[0] = x[3] ^ x[4] ^ x[6] ^ x[8] ^ x[9] ^ x[13] ^ x[14];
+            y[1] = x[2] ^ x[5] ^ x[7] ^ x[8] ^ x[9] ^ x[12] ^ x[15];
+            y[2] = x[1] ^ x[4] ^ x[6] ^ x[10] ^ x[11] ^ x[12] ^ x[15];
+            y[3] = x[0] ^ x[5] ^ x[7] ^ x[10] ^ x[11] ^ x[13] ^ x[14];
+            y[4] = x[0] ^ x[2] ^ x[5] ^ x[8] ^ x[11] ^ x[14] ^ x[15];
+            y[5] = x[1] ^ x[3] ^ x[4] ^ x[9] ^ x[10] ^ x[14] ^ x[15];
+            y[6] = x[0] ^ x[2] ^ x[7] ^ x[9] ^ x[10] ^ x[12] ^ x[13];
+            y[7] = x[1] ^ x[3] ^ x[6] ^ x[8] ^ x[11] ^ x[12] ^ x[13];
+            y[8] = x[0] ^ x[1] ^ x[4] ^ x[7] ^ x[10] ^ x[13] ^ x[15];
+            y[9] = x[0] ^ x[1] ^ x[5] ^ x[6] ^ x[11] ^ x[12] ^ x[14];
+            y[10] = x[2] ^ x[3] ^ x[5] ^ x[6] ^ x[8] ^ x[13] ^ x[15];
+            y[11] = x[2] ^ x[3] ^ x[4] ^ x[7] ^ x[9] ^ x[12] ^ x[14];
+            y[12] = x[1] ^ x[2] ^ x[6] ^ x[7] ^ x[9] ^ x[11] ^ x[12];
+            y[13] = x[0] ^ x[3] ^ x[6] ^ x[7] ^ x[8] ^ x[10] ^ x[13];
+            y[14] = x[0] ^ x[3] ^ x[4] ^ x[5] ^ x[9] ^ x[11] ^ x[14];
+            y[15] = x[1] ^ x[2] ^ x[4] ^ x[5] ^ x[8] ^ x[10] ^ x[15];
+            assert_eq!(a_layer(&w), load(&y));
         }
     }
 
@@ -476,5 +608,25 @@ mod tests {
             cipher.decrypt_block(&mut b);
             assert_eq!(b, orig);
         }
+    }
+
+    /// The two-block batch (all 32 lanes live) must equal block-at-a-time
+    /// processing for every pairing, including an odd trailing block.
+    #[test]
+    fn batched_matches_single() {
+        let cipher = Aria256::new(&[0x5au8; 32]);
+        let mut buf = [0u8; 16 * 7];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(197).wrapping_add(11);
+        }
+        let mut single = buf;
+        for blk in single.chunks_exact_mut(16) {
+            cipher.encrypt_block(blk.try_into().unwrap());
+        }
+        let mut batched = buf;
+        cipher.encrypt_blocks(&mut batched);
+        assert_eq!(batched, single);
+        cipher.decrypt_blocks(&mut batched);
+        assert_eq!(batched, buf);
     }
 }

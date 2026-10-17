@@ -98,6 +98,7 @@ mod poly1305;
 // permutation.
 #[cfg(all(feature = "kdf", feature = "alloc"))]
 pub(crate) mod salsa20;
+mod sbox_bitsliced;
 #[cfg(feature = "legacy-ciphers")]
 mod seed;
 mod sm4;

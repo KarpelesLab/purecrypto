@@ -13,13 +13,16 @@
 //! Like the table-free AES core in this crate, the S-box is **computed**
 //! rather than looked up: `S(x) = A(inv(A(x)))`, where `A` is a fixed affine
 //! transform and `inv` is inversion in GF(2⁸) modulo `x⁸+x⁷+x⁶+x⁵+x⁴+x²+1`
-//! (`0x1f5`). Every operation is branchless with no secret-dependent memory
-//! access, so SM4 is hardened against cache-timing attacks. The algebraic
-//! S-box costs roughly an order of magnitude more than a naive table lookup;
-//! the four bytes of each round word are processed in parallel as `u32` lanes
-//! to claw most of that back.
+//! (`0x1f5`). That field is isomorphic to the AES field, so the inversion is
+//! carried out by the bitsliced AES circuit ([`super::sbox_bitsliced`]) with
+//! the isomorphism and `A` folded into the affine maps around it. Every
+//! operation is branchless with no secret-dependent memory access, so SM4 is
+//! hardened against cache-timing attacks. The circuit substitutes 32 bytes
+//! at once, so [`BlockCipher::encrypt_blocks`] runs eight blocks in lockstep
+//! to fill it; a single block still pays for one pass per round.
 
 use super::BlockCipher;
+use super::sbox_bitsliced::{Affine, PlaneAffine, sbox_custom};
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// System parameter `FK` (GB/T 32907 §7.3.2).
@@ -38,90 +41,35 @@ const CK: [u32; 32] = [
     0x10171e25, 0x2c333a41, 0x484f565d, 0x646b7279,
 ];
 
-// --- Constant-time GF(2⁸) arithmetic, four byte lanes packed in a `u32` ---
+// --- The S-box as an affine conjugate of the AES S-box ---------------------
 //
-// The SM4 field is GF(2⁸) with reduction polynomial
-// `x⁸ + x⁷ + x⁶ + x⁵ + x⁴ + x² + 1` (`0x1f5`). Everything below mirrors the
-// table-free AES core in `aes::gf`, except that the four S-box applications
-// of `τ` are evaluated simultaneously, one per byte lane of a `u32`.
+// `S = post ∘ S_aes ∘ pre` with `pre = φ ∘ A` and `post = A ∘ φ⁻¹ ∘ A_aes⁻¹`,
+// where `φ` is the field isomorphism sending the SM4 generator to the root
+// `0x23` of `0x1f5` in the AES field. Recovered numerically from the GB/T
+// 32907 table; `affine_constants_match_derivation` recomputes them.
 
-/// Broadcasts the low bit of each byte lane (0 or 1) to the whole lane
-/// (`0x00` or `0xff`).
+const SBOX_PRE: PlaneAffine = PlaneAffine::uniform(Affine {
+    rows: [0x4c, 0x28, 0x7d, 0xb9, 0x1a, 0x22, 0x50, 0x5d],
+    c: 0x3e,
+});
+const SBOX_POST: PlaneAffine = PlaneAffine::uniform(Affine {
+    rows: [0x48, 0x0e, 0x4c, 0x47, 0x65, 0x1d, 0xba, 0xd3],
+    c: 0x6c,
+});
+
+/// Nonlinear transform `τ` on every byte of `NW` words (two 32-bit values
+/// per word), without table lookups.
 #[inline]
-fn lane_mask(m: u32) -> u32 {
-    // With bit b_k at position 8k, (m << 8) - m == Σ b_k · (0xff << 8k); the
-    // top lane's overflow wraps away harmlessly.
-    (m << 8).wrapping_sub(m)
+fn tau<const NW: usize>(w: &mut [u64; NW]) {
+    sbox_custom(w, &SBOX_PRE, &SBOX_POST);
 }
 
-/// Multiplies four pairs of field elements lane-wise in constant time
-/// (branchless Russian-peasant multiplication with reduction by `0x1f5`).
+/// `τ` on one 32-bit word (key schedule and the single-block path).
 #[inline]
-fn gf_mul4(mut a: u32, mut b: u32) -> u32 {
-    let mut product = 0u32;
-    let mut i = 0;
-    while i < 8 {
-        // Add lane `a` into the product where that lane's low bit of `b` is set.
-        product ^= lane_mask(b & 0x0101_0101) & a;
-        // a = xtime(a): multiply by x, reducing mod 0x1f5 on carry-out.
-        let carry = lane_mask((a >> 7) & 0x0101_0101);
-        a = ((a << 1) & 0xfefe_fefe) ^ (carry & 0xf5f5_f5f5);
-        b = (b >> 1) & 0x7f7f_7f7f;
-        i += 1;
-    }
-    product
-}
-
-/// Lane-wise multiplicative inverse in GF(2⁸), with `inverse(0) = 0`
-/// (matching the S-box convention).
-///
-/// Computed as `x²⁵⁴`; since `x²⁵⁵ = 1` for every nonzero `x`, this equals
-/// `x⁻¹`. The fixed addition chain runs in constant time.
-#[inline]
-fn gf_inv4(x: u32) -> u32 {
-    let x2 = gf_mul4(x, x); // x^2
-    let x4 = gf_mul4(x2, x2); // x^4
-    let x8 = gf_mul4(x4, x4); // x^8
-    let x16 = gf_mul4(x8, x8); // x^16
-    let x32 = gf_mul4(x16, x16); // x^32
-    let x64 = gf_mul4(x32, x32); // x^64
-    let x128 = gf_mul4(x64, x64); // x^128
-
-    // x^254 = x^2 · x^4 · x^8 · x^16 · x^32 · x^64 · x^128
-    let mut r = x2;
-    r = gf_mul4(r, x4);
-    r = gf_mul4(r, x8);
-    r = gf_mul4(r, x16);
-    r = gf_mul4(r, x32);
-    r = gf_mul4(r, x64);
-    gf_mul4(r, x128)
-}
-
-/// Rotates each byte lane left by `N` bits (1 ≤ `N` ≤ 7).
-#[inline]
-fn rotl4<const N: u32>(x: u32) -> u32 {
-    let keep = 0x0101_0101u32 * ((0xff << N) & 0xff);
-    let wrap = 0x0101_0101u32 * (0xff >> (8 - N));
-    ((x << N) & keep) | ((x >> (8 - N)) & wrap)
-}
-
-/// S-box affine transform, lane-wise:
-/// `A(x) = x ⊕ (x<<<1) ⊕ (x<<<3) ⊕ (x<<<6) ⊕ (x<<<7) ⊕ 0xd3`.
-#[inline]
-fn affine4(x: u32) -> u32 {
-    x ^ rotl4::<1>(x) ^ rotl4::<3>(x) ^ rotl4::<6>(x) ^ rotl4::<7>(x) ^ 0xd3d3_d3d3
-}
-
-/// Nonlinear transform `τ`: applies the S-box to each of the four bytes.
-///
-/// The GB/T 32907 §6.2 S-box decomposes as `S(x) = A(inv(A(x)))` — the same
-/// affine transform before and after a field inversion (the
-/// `sbox_matches_reference_table` test checks this against the standard's
-/// table for every input). All four bytes are substituted in parallel,
-/// without table lookups.
-#[inline]
-fn tau(x: u32) -> u32 {
-    affine4(gf_inv4(affine4(x)))
+fn tau1(x: u32) -> u32 {
+    let mut w = [u64::from(x)];
+    tau(&mut w);
+    w[0] as u32
 }
 
 /// Round linear transform `L(B) = B ⊕ (B<<<2) ⊕ (B<<<10) ⊕ (B<<<18) ⊕ (B<<<24)`.
@@ -136,16 +84,10 @@ fn l_key(b: u32) -> u32 {
     b ^ b.rotate_left(13) ^ b.rotate_left(23)
 }
 
-/// Round composite `T = L ∘ τ`.
-#[inline]
-fn t_round(x: u32) -> u32 {
-    l_round(tau(x))
-}
-
 /// Key-schedule composite `T' = L' ∘ τ`.
 #[inline]
 fn t_key(x: u32) -> u32 {
-    l_key(tau(x))
+    l_key(tau1(x))
 }
 
 /// SM4 block cipher (GB/T 32907 / RFC 8998).
@@ -155,14 +97,28 @@ pub struct Sm4 {
     rk: [u32; 32],
 }
 
+#[inline]
+fn load(block: &[u8; 16]) -> [u32; 4] {
+    core::array::from_fn(|i| {
+        u32::from_be_bytes(block[4 * i..4 * i + 4].try_into().expect("4 bytes"))
+    })
+}
+
+/// Stores the reverse-order output transform `R`: `(Y0..Y3) = (X35..X32)`.
+#[inline]
+fn store(x: &[u32; 4], block: &mut [u8; 16]) {
+    for (i, w) in x.iter().rev().enumerate() {
+        block[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+    }
+}
+
 impl Sm4 {
     /// Creates an SM4 cipher from a 128-bit key, expanding the round keys
     /// (GB/T 32907 §7.3).
     pub fn new(key: &[u8; 16]) -> Self {
-        let mut k = [0u32; 4];
-        for (i, w) in k.iter_mut().enumerate() {
-            *w = u32::from_be_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]])
-                ^ FK[i];
+        let mut k = load(key);
+        for (w, fk) in k.iter_mut().zip(FK) {
+            *w ^= fk;
         }
         let mut rk = [0u32; 32];
         for i in 0..32 {
@@ -181,37 +137,83 @@ impl Sm4 {
         Sm4 { rk }
     }
 
-    /// Runs the 32-round network with the given (possibly reversed) round-key
-    /// order, transforming `block` in place.
+    /// Round key `round` in encryption or (public) reversed order.
     #[inline]
-    fn crypt(&self, block: &mut [u8; 16], reverse: bool) {
-        let mut x = [0u32; 4];
-        for (i, w) in x.iter_mut().enumerate() {
-            *w = u32::from_be_bytes([
-                block[4 * i],
-                block[4 * i + 1],
-                block[4 * i + 2],
-                block[4 * i + 3],
-            ]);
+    fn key(&self, round: usize, reverse: bool) -> u32 {
+        if reverse {
+            self.rk[31 - round]
+        } else {
+            self.rk[round]
         }
+    }
+
+    /// Runs the 32-round network on one block.
+    #[inline]
+    fn crypt1(&self, block: &mut [u8; 16], reverse: bool) {
+        let mut x = load(block);
         for round in 0..32 {
-            let rk = if reverse {
-                self.rk[31 - round]
-            } else {
-                self.rk[round]
-            };
-            let t = x[1] ^ x[2] ^ x[3] ^ rk;
-            let next = x[0] ^ t_round(t);
-            x[0] = x[1];
-            x[1] = x[2];
-            x[2] = x[3];
-            x[3] = next;
+            let t = x[1] ^ x[2] ^ x[3] ^ self.key(round, reverse);
+            let next = x[0] ^ l_round(tau1(t));
+            x = [x[1], x[2], x[3], next];
         }
-        // Reverse-order output transform R: (Y0,Y1,Y2,Y3) = (X35,X34,X33,X32).
-        let out = [x[3], x[2], x[1], x[0]];
-        for (i, w) in out.iter().enumerate() {
-            block[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+        store(&x, block);
+        x.zeroize();
+    }
+
+    /// Runs the 32-round network on eight independent blocks in lockstep, so
+    /// each round's `τ` fills the 32 lanes of the bitsliced circuit.
+    fn crypt8(&self, blocks: &mut [[u8; 16]; 8], reverse: bool) {
+        let mut x: [[u32; 4]; 8] = core::array::from_fn(|b| load(&blocks[b]));
+        let mut w = [0u64; 4];
+        for round in 0..32 {
+            let rk = self.key(round, reverse);
+            for (k, pair) in x.chunks_exact(2).enumerate() {
+                let t0 = pair[0][1] ^ pair[0][2] ^ pair[0][3] ^ rk;
+                let t1 = pair[1][1] ^ pair[1][2] ^ pair[1][3] ^ rk;
+                w[k] = u64::from(t0) | (u64::from(t1) << 32);
+            }
+            tau(&mut w);
+            for (b, xb) in x.iter_mut().enumerate() {
+                let t = (w[b / 2] >> (32 * (b % 2))) as u32;
+                let next = xb[0] ^ l_round(t);
+                *xb = [xb[1], xb[2], xb[3], next];
+            }
         }
+        for (b, xb) in x.iter().enumerate() {
+            store(xb, &mut blocks[b]);
+        }
+        x.zeroize();
+        w.zeroize();
+    }
+
+    /// Processes whole blocks eight at a time; a short tail of two to seven
+    /// blocks is padded to a batch (the padding lanes are discarded), a
+    /// single trailing block takes the one-block path.
+    fn crypt_blocks(&self, blocks: &mut [u8], reverse: bool) {
+        let mut batches = blocks.chunks_exact_mut(128);
+        let mut batch = [[0u8; 16]; 8];
+        for chunk in &mut batches {
+            for (b, src) in batch.iter_mut().zip(chunk.chunks_exact(16)) {
+                b.copy_from_slice(src);
+            }
+            self.crypt8(&mut batch, reverse);
+            for (b, dst) in batch.iter().zip(chunk.chunks_exact_mut(16)) {
+                dst.copy_from_slice(b);
+            }
+        }
+        let rest = batches.into_remainder();
+        if rest.len() == 16 {
+            self.crypt1(rest.try_into().expect("16 bytes"), reverse);
+        } else if !rest.is_empty() {
+            for (b, src) in batch.iter_mut().zip(rest.chunks_exact(16)) {
+                b.copy_from_slice(src);
+            }
+            self.crypt8(&mut batch, reverse);
+            for (b, dst) in batch.iter().zip(rest.chunks_exact_mut(16)) {
+                dst.copy_from_slice(b);
+            }
+        }
+        batch.zeroize();
     }
 }
 
@@ -221,13 +223,29 @@ impl BlockCipher for Sm4 {
 
     #[inline]
     fn encrypt_block(&self, block: &mut [u8; 16]) {
-        self.crypt(block, false);
+        self.crypt1(block, false);
     }
 
     #[inline]
     fn decrypt_block(&self, block: &mut [u8; 16]) {
         // Decryption is the same network with the round keys reversed.
-        self.crypt(block, true);
+        self.crypt1(block, true);
+    }
+
+    fn encrypt_blocks(&self, blocks: &mut [u8]) {
+        assert!(
+            blocks.len().is_multiple_of(16),
+            "encrypt_blocks needs whole blocks"
+        );
+        self.crypt_blocks(blocks, false);
+    }
+
+    fn decrypt_blocks(&self, blocks: &mut [u8]) {
+        assert!(
+            blocks.len().is_multiple_of(16),
+            "decrypt_blocks needs whole blocks"
+        );
+        self.crypt_blocks(blocks, true);
     }
 }
 
@@ -244,6 +262,7 @@ impl ZeroizeOnDrop for Sm4 {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cipher::sbox_bitsliced::{derive, field_iso};
     use crate::test_util::from_hex;
 
     /// The SM4 S-box table (GB/T 32907 §6.2), kept here purely as the
@@ -269,12 +288,12 @@ mod tests {
     ];
 
     // The computed constant-time S-box must agree with the GB/T 32907 table
-    // for every input, in every lane.
+    // for every input, in every lane, at every batch width.
     #[test]
     fn sbox_matches_reference_table() {
         for x in 0u32..=255 {
             // All four lanes carry the same byte …
-            let same = tau(u32::from_be_bytes([x as u8; 4]));
+            let same = tau1(u32::from_be_bytes([x as u8; 4]));
             assert_eq!(
                 same.to_be_bytes(),
                 [SBOX[x as usize]; 4],
@@ -287,11 +306,35 @@ mod tests {
                 !(x as u8),
                 (x as u8).rotate_left(3),
             ];
-            let mixed = tau(u32::from_be_bytes(b)).to_be_bytes();
+            let mixed = tau1(u32::from_be_bytes(b)).to_be_bytes();
             for i in 0..4 {
                 assert_eq!(mixed[i], SBOX[b[i] as usize], "lane {i} for {x:#04x}");
             }
+            // The full-width batch, every lane distinct.
+            let mut w: [u64; 4] = core::array::from_fn(|k| {
+                u64::from_le_bytes(core::array::from_fn(|j| x as u8 ^ (8 * k + j) as u8))
+            });
+            let orig = w;
+            tau(&mut w);
+            for (word, o) in w.iter().zip(orig.iter()) {
+                for (y, i) in word.to_le_bytes().iter().zip(o.to_le_bytes()) {
+                    assert_eq!(*y, SBOX[i as usize]);
+                }
+            }
         }
+    }
+
+    /// The hard-coded `(pre, post)` pair is what the GB/T table gives under
+    /// `S = A ∘ inv₀ₓ₁f₅ ∘ A` with the field isomorphism into the AES field.
+    #[test]
+    fn affine_constants_match_derivation() {
+        let phi = field_iso(0x1f5);
+        let a = |x: u8| {
+            x ^ x.rotate_left(1) ^ x.rotate_left(3) ^ x.rotate_left(6) ^ x.rotate_left(7) ^ 0xd3
+        };
+        let (pre, post) = derive(&SBOX, |x| phi.apply(a(x)));
+        assert_eq!(PlaneAffine::uniform(pre), SBOX_PRE);
+        assert_eq!(PlaneAffine::uniform(post), SBOX_POST);
     }
 
     // GB/T 32907 Appendix A.1 / RFC 8998 Appendix A.1: single-block KAT.
@@ -330,6 +373,28 @@ mod tests {
             assert_ne!(block, original, "ciphertext should differ from plaintext");
             cipher.decrypt_block(&mut block);
             assert_eq!(block, original);
+        }
+    }
+
+    /// The eight-block batch (and the padded short tail) must equal
+    /// block-at-a-time processing for every block count up to two batches.
+    #[test]
+    fn batched_matches_single() {
+        let cipher = Sm4::new(&[0x5au8; 16]);
+        for nblocks in 1..=17 {
+            let mut buf = alloc::vec![0u8; 16 * nblocks];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(197).wrapping_add(nblocks as u8);
+            }
+            let mut single = buf.clone();
+            for blk in single.chunks_exact_mut(16) {
+                cipher.encrypt_block(blk.try_into().unwrap());
+            }
+            let mut batched = buf.clone();
+            cipher.encrypt_blocks(&mut batched);
+            assert_eq!(batched, single, "{nblocks} blocks");
+            cipher.decrypt_blocks(&mut batched);
+            assert_eq!(batched, buf, "{nblocks} blocks");
         }
     }
 }

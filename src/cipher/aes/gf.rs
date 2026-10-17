@@ -6,8 +6,14 @@
 //! lookup table** — so every operation runs in time independent of its
 //! (secret) input.
 
+// The scalar byte-at-a-time S-box below is the oracle the bitsliced circuit
+// is tested against (here and in `cipher::sbox_bitsliced`, whose ARIA /
+// Camellia / SM4 / SEED conjugates are derived from it); every production
+// path goes through `sub_words`, so outside the tests it is unused.
+
 /// Multiplies two field elements in constant time (branchless Russian-peasant
 /// multiplication with reduction by `0x11b`).
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 pub(crate) fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut product = 0u8;
@@ -30,6 +36,7 @@ pub(crate) fn gf_mul(mut a: u8, mut b: u8) -> u8 {
 ///
 /// Computed as `x²⁵⁴`; since `x²⁵⁵ = 1` for every nonzero `x`, this equals
 /// `x⁻¹`. The fixed addition chain runs in constant time.
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 pub(crate) fn gf_inv(x: u8) -> u8 {
     let x2 = gf_mul(x, x); // x^2
@@ -51,6 +58,7 @@ pub(crate) fn gf_inv(x: u8) -> u8 {
 }
 
 /// AES S-box: multiplicative inverse, then the forward affine transform.
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 pub(crate) fn sub_byte(x: u8) -> u8 {
     let inv = gf_inv(x);
@@ -59,6 +67,7 @@ pub(crate) fn sub_byte(x: u8) -> u8 {
 
 /// AES inverse S-box: inverse affine transform, then the multiplicative
 /// inverse.
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 pub(crate) fn inv_sub_byte(x: u8) -> u8 {
     let t = x.rotate_left(1) ^ x.rotate_left(3) ^ x.rotate_left(6) ^ 0x05;
@@ -118,7 +127,7 @@ fn from_planes(q: &[u32; 8], words: &mut [u64; 4]) {
 /// ("A depth-16 circuit for the AES S-box", 2011), in the gate order of
 /// BearSSL's `aes_ct`. `x0` is the most significant bit.
 #[inline(always)]
-fn sbox_planes(q: &mut [u32; 8]) {
+pub(crate) fn sbox_planes(q: &mut [u32; 8]) {
     let (x0, x1, x2, x3) = (q[7], q[6], q[5], q[4]);
     let (x4, x5, x6, x7) = (q[3], q[2], q[1], q[0]);
 
