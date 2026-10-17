@@ -1,0 +1,16 @@
+# Keep the GitHub Actions used by the workflows current. Only the
+# `github-actions` ecosystem is enabled: Cargo dependencies are managed
+# by hand (see CHANGELOG / release-plz), and the web/ demo site's npm
+# lockfile is refreshed deliberately alongside site changes.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      # One PR for all action bumps per week rather than one per action.
+      actions:
+        patterns:
+          - "*"
