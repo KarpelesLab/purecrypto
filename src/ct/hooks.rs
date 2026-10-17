@@ -300,10 +300,10 @@ pub mod tls {
 #[cfg(feature = "dtls")]
 pub mod dtls {
     use super::Suite;
-    use crate::dtls::client13::{decrypt_dtls13_record, encrypt_protected_record_with};
+    use crate::dtls::client13::{decrypt_dtls13_record_into, encrypt_protected_record_with};
     use crate::dtls::epoch13::ReadEpoch;
     use crate::dtls::record13::{
-        self, header_aad, peek_header_layout, reconstruct_seq, sn_mask_for,
+        self, header_aad_into, peek_header_layout, reconstruct_seq, sn_mask_for,
     };
     use crate::tls::crypto::Secret;
     use crate::tls::crypto::aead12::RecordCrypter12;
@@ -337,11 +337,15 @@ pub mod dtls {
         content_type: u8,
         fragment: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        RecordCrypter12::new(suite.params().aead, key, write_iv).decrypt_dtls(
+        // The engines' path: opened in place in a buffer they retain.
+        let mut out = Vec::new();
+        RecordCrypter12::new(suite.params().aead, key, write_iv).decrypt_dtls_into(
             epoch_seq,
             ContentType::from_u8(content_type),
             fragment,
-        )
+            &mut out,
+        )?;
+        Ok(out)
     }
 
     /// Protects one DTLS 1.2 record carrying the connection ID `cid`
@@ -374,8 +378,15 @@ pub mod dtls {
         cid: &[u8],
         fragment: &[u8],
     ) -> Result<(u8, Vec<u8>), Error> {
-        let (ct, content) = RecordCrypter12::new(suite.params().aead, key, write_iv)
-            .decrypt_dtls_cid(epoch_seq, cid, fragment)?;
+        // The engines' path: opened in place in a buffer they retain, the
+        // padding scan running over that buffer.
+        let mut content = Vec::new();
+        let ct = RecordCrypter12::new(suite.params().aead, key, write_iv).decrypt_dtls_cid_into(
+            epoch_seq,
+            cid,
+            fragment,
+            &mut content,
+        )?;
         Ok((ct.as_u8(), content))
     }
 
@@ -442,8 +453,10 @@ pub mod dtls {
         };
         let (hdr, ct_body) = record13::decode_record(datagram, mask, cid_len)?;
         let seq = reconstruct_seq(hdr.seq_low, hdr.seq_is_16bit, ctx.seq.wrapping_add(1));
-        let aad = header_aad(datagram, &hdr, mask);
-        let (ct, content) = decrypt_dtls13_record(&mut ctx.crypter, seq, &aad, ct_body)?;
+        let mut aad_buf = [0u8; record13::MAX_HEADER_LEN];
+        let aad = header_aad_into(datagram, &hdr, mask, &mut aad_buf);
+        let mut content = Vec::new();
+        let ct = decrypt_dtls13_record_into(&mut ctx.crypter, seq, aad, ct_body, &mut content)?;
         Ok((seq, ct.as_u8(), content))
     }
 }

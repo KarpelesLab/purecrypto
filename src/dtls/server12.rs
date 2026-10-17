@@ -395,6 +395,10 @@ pub struct DtlsServerConnection12<R: RngCore> {
     out_dgrams: Vec<Vec<u8>>,
     /// Decrypted application data.
     app_in: Vec<u8>,
+    /// Receive scratch: a protected record is opened here (see
+    /// `open_record`) and kept across records, so the receive path
+    /// allocates nothing in steady state.
+    rx_scratch: Vec<u8>,
 
     /// Record-layer sequence numbers.
     write_epoch: u16,
@@ -549,6 +553,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             pre_cookie: PreCookieBuffer::new(),
             out_dgrams: Vec::new(),
             app_in: Vec::new(),
+            rx_scratch: Vec::new(),
             write_epoch: 0,
             write_seq_in_epoch: 0,
             plain_write_seq: 0,
@@ -843,9 +848,22 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         core::mem::take(&mut self.out_dgrams)
     }
 
+    /// [`Self::pop_outbound_datagrams`] moving the datagrams into `out`
+    /// instead: the engine's queue keeps its capacity across drains.
+    pub fn pop_outbound_into(&mut self, out: &mut impl Extend<Vec<u8>>) {
+        out.extend(self.out_dgrams.drain(..));
+    }
+
     /// Drains decrypted application data.
     pub fn take_received(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.app_in)
+    }
+
+    /// [`Self::take_received`] appending to `out` instead. Both `out` and
+    /// the engine's buffer keep their capacity, so a caller that reuses
+    /// `out` reads records without allocating.
+    pub fn take_received_into(&mut self, out: &mut Vec<u8>) {
+        out.append(&mut self.app_in);
     }
 
     /// Encrypts application plaintext as a DTLS record. Must be called only
@@ -1003,8 +1021,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             && rec.cid.is_none()
             && self.state == State::WaitClientFlight
         {
-            let plain = rec.fragment.to_vec();
-            return self.process_handshake_record(&plain, false);
+            return self.process_handshake_record(rec.fragment, false);
         }
         if rec.epoch != self.read_epoch {
             return Ok(());
@@ -1044,9 +1061,6 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             if self.read_epoch < 1 || !expects_cid {
                 return Ok(());
             }
-            let Some(c) = self.read_crypter.as_ref() else {
-                return Ok(());
-            };
             if !self.cid.as_ref().is_some_and(|s| s.accepts(cid)) {
                 return Ok(());
             }
@@ -1055,12 +1069,13 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             // as a possible Finished retransmission (RFC 6347 §4.2.4): once
             // decrypted, anything else that is a duplicate is a replay.
             let duplicate = !self.replay.check(rec.seq);
-            let combined = ((self.read_epoch as u64) << 48) | rec.seq;
-            let Ok((real_type, plain)) = c.decrypt_dtls_cid(combined, cid, rec.fragment) else {
-                // AEAD failure: silent drop, window not advanced.
+            let Some((real_type, plain)) = self.open_cid_record(rec.seq, cid, rec.fragment) else {
+                // No read key yet, or an AEAD failure: silent drop, window
+                // not advanced.
                 return Ok(());
             };
             if duplicate && real_type != ContentType::Handshake {
+                self.rx_scratch = plain;
                 return Ok(());
             }
             // AEAD verified: commit to the window only now.
@@ -1093,48 +1108,32 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 Ok(())
             }
             ContentType::Handshake => {
-                let plain: Vec<u8>;
-                let authenticated;
-                if self.read_epoch >= 1 {
-                    let combined = ((self.read_epoch as u64) << 48) | rec.seq;
-                    let Some(c) = self.read_crypter.as_ref() else {
-                        return Ok(());
-                    };
-                    let Ok(p) = c.decrypt_dtls(combined, ContentType::Handshake, rec.fragment)
-                    else {
-                        // AEAD failure: silent drop (RFC 6347 §4.1.2.7) —
-                        // a spoofed datagram must not kill the connection.
-                        // The replay window was deliberately not advanced.
-                        return Ok(());
-                    };
-                    // AEAD verified: now it's safe to commit to the window.
-                    self.replay.mark(rec.seq);
-                    self.note_authenticated(rec.seq, false);
-                    plain = p;
-                    authenticated = true;
-                } else {
-                    plain = rec.fragment.to_vec();
-                    authenticated = false;
+                if self.read_epoch < 1 {
+                    return self.process_handshake_record(rec.fragment, false);
                 }
-                if authenticated {
-                    self.on_authenticated_record(ContentType::Handshake, plain)
-                } else {
-                    self.process_handshake_record(&plain, false)
-                }
+                let Some(plain) = self.open_record(rec.seq, ContentType::Handshake, rec.fragment)
+                else {
+                    // No read key yet, or an AEAD failure: silent drop
+                    // (RFC 6347 §4.1.2.7) — a spoofed datagram must not
+                    // kill the connection. The replay window was
+                    // deliberately not advanced.
+                    return Ok(());
+                };
+                // AEAD verified: now it's safe to commit to the window.
+                self.replay.mark(rec.seq);
+                self.note_authenticated(rec.seq, false);
+                self.on_authenticated_record(ContentType::Handshake, plain)
             }
             ContentType::ApplicationData => {
                 if self.read_epoch < 1 {
                     // Plaintext application data is spoofable: silent drop.
                     return Ok(());
                 }
-                let combined = ((self.read_epoch as u64) << 48) | rec.seq;
-                let Some(c) = self.read_crypter.as_ref() else {
-                    return Ok(());
-                };
-                let Ok(plain) =
-                    c.decrypt_dtls(combined, ContentType::ApplicationData, rec.fragment)
+                let Some(plain) =
+                    self.open_record(rec.seq, ContentType::ApplicationData, rec.fragment)
                 else {
-                    // AEAD failure: silent drop, window not advanced.
+                    // No read key yet, or an AEAD failure: silent drop,
+                    // window not advanced.
                     return Ok(());
                 };
                 // AEAD verified: commit to the window only now.
@@ -1151,12 +1150,10 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                     // (RFC 6347 §4.1.2.7), matching the DTLS 1.3 engine.
                     return Ok(());
                 }
-                let combined = ((self.read_epoch as u64) << 48) | rec.seq;
-                let Some(c) = self.read_crypter.as_ref() else {
-                    return Ok(());
-                };
-                let Ok(plain) = c.decrypt_dtls(combined, ContentType::Alert, rec.fragment) else {
-                    // AEAD failure: silent drop, window not advanced.
+                let Some(plain) = self.open_record(rec.seq, ContentType::Alert, rec.fragment)
+                else {
+                    // No read key yet, or an AEAD failure: silent drop,
+                    // window not advanced.
                     return Ok(());
                 };
                 // AEAD verified: commit to the window only now.
@@ -1183,15 +1180,62 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// this point protocol violations come from the genuine peer and are
     /// fatal.
     fn on_authenticated_record(&mut self, ct: ContentType, plain: Vec<u8>) -> Result<(), Error> {
+        let result = self.dispatch_authenticated(ct, &plain);
+        // The scratch goes back for the next record (`open_record`).
+        self.rx_scratch = plain;
+        result
+    }
+
+    /// Opens an RFC 6347 record's fragment (`ct` from its header) under the
+    /// read crypter into the retained receive scratch, which the caller
+    /// hands back through `on_authenticated_record` or `rx_scratch`. `None`
+    /// — a silent drop — when there is no read key yet or the AEAD fails.
+    fn open_record(&mut self, seq: u64, ct: ContentType, fragment: &[u8]) -> Option<Vec<u8>> {
+        let crypter = self.read_crypter.as_ref()?;
+        let combined = ((self.read_epoch as u64) << 48) | seq;
+        let mut plain = core::mem::take(&mut self.rx_scratch);
+        plain.clear();
+        if crypter
+            .decrypt_dtls_into(combined, ct, fragment, &mut plain)
+            .is_err()
+        {
+            self.rx_scratch = plain;
+            return None;
+        }
+        Some(plain)
+    }
+
+    /// [`Self::open_record`] for a `tls12_cid` record (RFC 9146 §4): the
+    /// real content type comes from inside the envelope.
+    fn open_cid_record(
+        &mut self,
+        seq: u64,
+        cid: &[u8],
+        fragment: &[u8],
+    ) -> Option<(ContentType, Vec<u8>)> {
+        let crypter = self.read_crypter.as_ref()?;
+        let combined = ((self.read_epoch as u64) << 48) | seq;
+        let mut plain = core::mem::take(&mut self.rx_scratch);
+        plain.clear();
+        match crypter.decrypt_dtls_cid_into(combined, cid, fragment, &mut plain) {
+            Ok(real_type) => Some((real_type, plain)),
+            Err(_) => {
+                self.rx_scratch = plain;
+                None
+            }
+        }
+    }
+
+    fn dispatch_authenticated(&mut self, ct: ContentType, plain: &[u8]) -> Result<(), Error> {
         match ct {
-            ContentType::Handshake => self.process_handshake_record(&plain, true),
+            ContentType::Handshake => self.process_handshake_record(plain, true),
             ContentType::ApplicationData => match self.state {
                 State::Connected => {
                     // The client only sends application data once it
                     // has verified our Finished: the final flight is
                     // implicitly acknowledged.
                     self.final_flight = None;
-                    self.app_in.extend_from_slice(&plain);
+                    self.app_in.extend_from_slice(plain);
                     Ok(())
                 }
                 // The peer's close_notify ended the connection; data
@@ -2046,20 +2090,24 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             .as_ref()
             .map(CidState::peer)
             .filter(|c| !c.is_empty());
-        let fragment = match cid {
-            Some(cid) => crypter.encrypt_dtls_cid(combined, cid, ct, payload)?,
-            None => crypter.encrypt_dtls(combined, ct, payload)?,
-        };
-        let mut out = Vec::new();
-        record::write_record_cid(
+        // The record is built in one buffer: the header, then the fragment
+        // sealed in place behind it.
+        let frag_len = crypter.dtls_fragment_len(payload.len(), cid.is_some());
+        let mut out =
+            Vec::with_capacity(record::HEADER_LEN + cid.map_or(0, <[u8]>::len) + frag_len);
+        record::write_record_header_cid(
             &mut out,
             ct,
             ProtocolVersion::DTLSv1_2,
             self.write_epoch,
             self.write_seq_in_epoch,
             cid,
-            &fragment,
+            frag_len,
         )?;
+        match cid {
+            Some(cid) => crypter.encrypt_dtls_cid_into(&mut out, combined, cid, ct, payload)?,
+            None => crypter.encrypt_dtls_into(&mut out, combined, ct, payload)?,
+        }
         self.write_seq_in_epoch += 1;
         Ok(out)
     }

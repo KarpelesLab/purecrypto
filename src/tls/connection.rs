@@ -991,20 +991,7 @@ impl Connection {
             _ => {
                 // Refill if buffer empty, then pop the next datagram.
                 if self.pending_dtls.is_empty() {
-                    let drained = match &mut self.inner {
-                        #[cfg(feature = "dtls")]
-                        Engine::ClientDtls12(c) => c.pop_outbound_datagrams(),
-                        #[cfg(feature = "dtls")]
-                        Engine::ClientDtls13(c) => c.pop_outbound_datagrams(),
-                        #[cfg(feature = "dtls")]
-                        Engine::ServerDtls12(c) => c.pop_outbound_datagrams(),
-                        #[cfg(feature = "dtls")]
-                        Engine::ServerDtls13(c) => c.pop_outbound_datagrams(),
-                        _ => Vec::new(),
-                    };
-                    for dg in drained {
-                        self.pending_dtls.push_back(dg);
-                    }
+                    self.refill_dtls_pending();
                 }
                 self.pending_dtls.pop_front().unwrap_or_default()
             }
@@ -1050,6 +1037,34 @@ impl Connection {
             #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.take_received(),
         })
+    }
+
+    /// [`recv`](Self::recv) appending to `out` instead of returning a new
+    /// buffer; returns the number of bytes appended. On a DTLS connection
+    /// the engine's receive buffer keeps its capacity, so a caller that
+    /// reuses `out` reads records without allocating.
+    pub fn recv_into(&mut self, out: &mut Vec<u8>) -> Result<usize, Error> {
+        let before = out.len();
+        #[cfg(feature = "dtls")]
+        match &mut self.inner {
+            Engine::ClientDtls12(c) => c.take_received_into(out),
+            Engine::ClientDtls13(c) => c.take_received_into(out),
+            Engine::ServerDtls12(c) => c.take_received_into(out),
+            Engine::ServerDtls13(c) => c.take_received_into(out),
+            _ => out.extend_from_slice(&self.recv()?),
+        }
+        #[cfg(not(feature = "dtls"))]
+        out.extend_from_slice(&self.recv()?);
+        Ok(out.len() - before)
+    }
+
+    /// [`pop`](Self::pop) appending to `out` instead of returning a new
+    /// buffer — one datagram per call on DTLS — and returning the number of
+    /// bytes appended (0 when nothing is pending).
+    pub fn pop_into(&mut self, out: &mut Vec<u8>) -> Result<usize, Error> {
+        let bytes = self.pop()?;
+        out.extend_from_slice(&bytes);
+        Ok(bytes.len())
     }
 
     /// Accepted 0-RTT early-data plaintext out (server side).
@@ -2017,19 +2032,13 @@ impl Connection {
     /// buffer. No-op for TLS variants.
     #[cfg(feature = "dtls")]
     fn refill_dtls_pending(&mut self) {
-        let drained: Vec<Vec<u8>> = match &mut self.inner {
-            #[cfg(feature = "dtls")]
-            Engine::ClientDtls12(c) => c.pop_outbound_datagrams(),
-            #[cfg(feature = "dtls")]
-            Engine::ClientDtls13(c) => c.pop_outbound_datagrams(),
-            #[cfg(feature = "dtls")]
-            Engine::ServerDtls12(c) => c.pop_outbound_datagrams(),
-            #[cfg(feature = "dtls")]
-            Engine::ServerDtls13(c) => c.pop_outbound_datagrams(),
-            _ => return,
-        };
-        for dg in drained {
-            self.pending_dtls.push_back(dg);
+        // Moved straight into the queue: neither side reallocates.
+        match &mut self.inner {
+            Engine::ClientDtls12(c) => c.pop_outbound_into(&mut self.pending_dtls),
+            Engine::ClientDtls13(c) => c.pop_outbound_into(&mut self.pending_dtls),
+            Engine::ServerDtls12(c) => c.pop_outbound_into(&mut self.pending_dtls),
+            Engine::ServerDtls13(c) => c.pop_outbound_into(&mut self.pending_dtls),
+            _ => {}
         }
     }
 }

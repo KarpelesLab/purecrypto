@@ -96,11 +96,29 @@ pub(crate) fn header_cid<'a>(buf: &'a [u8], hdr: &UnifiedHeader) -> &'a [u8] {
     &buf[1..1 + hdr.cid_len]
 }
 
+/// The longest unified header: first byte, a 255-byte CID, a 16-bit
+/// sequence number and the length (RFC 9147 §4).
+pub(crate) const MAX_HEADER_LEN: usize = 1 + 255 + 2 + 2;
+
 /// The AEAD additional data of a decoded record: the header bytes prior
 /// to sequence-number masking (RFC 9147 §4.2.3), i.e. `buf[..header_len]`
-/// with `sn_mask` XORed back out of the sequence-number bytes.
+/// with `sn_mask` XORed back out of the sequence-number bytes. The engines
+/// use [`header_aad_into`].
+#[cfg(test)]
 pub(crate) fn header_aad(buf: &[u8], hdr: &UnifiedHeader, sn_mask: &[u8]) -> Vec<u8> {
-    let mut aad = buf[..hdr.header_len].to_vec();
+    let mut aad = [0u8; MAX_HEADER_LEN];
+    header_aad_into(buf, hdr, sn_mask, &mut aad).to_vec()
+}
+
+/// [`header_aad`] written into a stack buffer; returns the filled prefix.
+pub(crate) fn header_aad_into<'a>(
+    buf: &[u8],
+    hdr: &UnifiedHeader,
+    sn_mask: &[u8],
+    out: &'a mut [u8; MAX_HEADER_LEN],
+) -> &'a [u8] {
+    let aad = &mut out[..hdr.header_len];
+    aad.copy_from_slice(&buf[..hdr.header_len]);
     let off = 1 + hdr.cid_len;
     aad[off] ^= sn_mask[0];
     if hdr.seq_is_16bit {

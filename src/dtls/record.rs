@@ -243,11 +243,28 @@ pub(crate) fn write_record_cid(
     cid: Option<&[u8]>,
     fragment: &[u8],
 ) -> Result<(), Error> {
+    write_record_header_cid(out, ct, version, epoch, seq, cid, fragment.len())?;
+    out.extend_from_slice(fragment);
+    Ok(())
+}
+
+/// The header of [`write_record_cid`] alone, declaring a `fragment_len`-byte
+/// fragment the caller appends afterwards — sealed in place by the record
+/// crypter, so the record is built in one buffer.
+pub(crate) fn write_record_header_cid(
+    out: &mut Vec<u8>,
+    ct: ContentType,
+    version: ProtocolVersion,
+    epoch: u16,
+    seq: u64,
+    cid: Option<&[u8]>,
+    fragment_len: usize,
+) -> Result<(), Error> {
     debug_assert!(
         seq <= SEQ_MASK_48,
         "DTLS sequence numbers are 48-bit; caller must rekey before overflow",
     );
-    if fragment.len() > MAX_FRAGMENT {
+    if fragment_len > MAX_FRAGMENT {
         return Err(Error::RecordOverflow);
     }
     // RFC 9146 §3: `opaque cid<0..2^8-1>` — a peer never negotiates more.
@@ -272,8 +289,7 @@ pub(crate) fn write_record_cid(
         out.extend_from_slice(cid);
     }
     // Checked above (MAX_FRAGMENT < 2^16), so the cast cannot truncate.
-    out.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
-    out.extend_from_slice(fragment);
+    out.extend_from_slice(&(fragment_len as u16).to_be_bytes());
     Ok(())
 }
 

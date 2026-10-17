@@ -95,7 +95,9 @@ use super::reassembly::{
     MAX_IN_PROGRESS, MAX_MESSAGE_LEN, Reassembler, read_fragment, write_fragments,
 };
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
-use super::record13::{self, SnKey, header_aad, header_cid, peek_header_layout, reconstruct_seq};
+use super::record13::{
+    self, SnKey, header_aad_into, header_cid, peek_header_layout, reconstruct_seq,
+};
 use super::reliability13::{InFlightRecord, Retransmit13};
 use super::system_now;
 use super::ticket::{
@@ -354,6 +356,10 @@ pub struct DtlsClientConnection13 {
     out_dgrams: Vec<Vec<u8>>,
     /// Decrypted application data ready for the consumer.
     app_in: Vec<u8>,
+    /// Receive scratch: a protected record is opened here (see
+    /// `decrypt_dtls13_record_into`) and kept across records, so the
+    /// receive path allocates nothing in steady state.
+    rx_scratch: Vec<u8>,
 
     /// Write-side record state for plaintext (epoch 0) records.
     plain_write_epoch: u16,
@@ -633,6 +639,7 @@ impl DtlsClientConnection13 {
             ),
             out_dgrams: Vec::new(),
             app_in: Vec::new(),
+            rx_scratch: Vec::new(),
             plain_write_epoch: 0,
             plain_write_seq: 0,
             enc_write_epoch: 0,
@@ -798,9 +805,23 @@ impl DtlsClientConnection13 {
         core::mem::take(&mut self.out_dgrams)
     }
 
+    /// [`Self::pop_outbound_datagrams`] moving the datagrams into `out`
+    /// instead: the engine's queue keeps its capacity across drains.
+    pub fn pop_outbound_into(&mut self, out: &mut impl Extend<Vec<u8>>) {
+        self.flush_pending_acks();
+        out.extend(self.out_dgrams.drain(..));
+    }
+
     /// Drains decrypted application data.
     pub fn take_received(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.app_in)
+    }
+
+    /// [`Self::take_received`] appending to `out` instead. Both `out` and
+    /// the engine's buffer keep their capacity, so a caller that reuses
+    /// `out` reads records without allocating.
+    pub fn take_received_into(&mut self, out: &mut Vec<u8>) {
+        out.append(&mut self.app_in);
     }
 
     /// The peer's certificate chain in wire order (DER), leaf first.
@@ -1318,7 +1339,8 @@ impl DtlsClientConnection13 {
 
         // RFC 9147 §4.2.3: AAD is the unified header bytes (CID included)
         // prior to sequence-number masking.
-        let aad = header_aad(buf, &hdr, mask);
+        let mut aad_buf = [0u8; record13::MAX_HEADER_LEN];
+        let aad = header_aad_into(buf, &hdr, mask, &mut aad_buf);
         // Pre-AEAD anti-replay check: cheap rejection of duplicate /
         // too-old seq numbers without touching window state. The window
         // is `mark`-ed only after AEAD verification succeeds so a forged
@@ -1326,11 +1348,17 @@ impl DtlsClientConnection13 {
         if !ctx.replay.check(seq) {
             return Ok(consumed);
         }
-        let Ok((inner_type, plain)) = decrypt_dtls13_record(&mut ctx.crypter, seq, &aad, ct_body)
+        // Opened into the retained scratch (handed back below), so a
+        // record costs no allocation.
+        let mut plain = core::mem::take(&mut self.rx_scratch);
+        plain.clear();
+        let Ok(inner_type) =
+            decrypt_dtls13_record_into(&mut ctx.crypter, seq, aad, ct_body, &mut plain)
         else {
             // AEAD authentication failed — a single spoofed datagram must
             // not kill the connection (RFC 9147 §4.5.2): silent drop. The
             // replay window was deliberately not advanced.
+            self.rx_scratch = plain;
             return Ok(consumed);
         };
 
@@ -1434,6 +1462,7 @@ impl DtlsClientConnection13 {
             }
             _ => return Err(Error::UnexpectedMessage),
         }
+        self.rx_scratch = plain;
         Ok(consumed)
     }
 
@@ -3207,30 +3236,57 @@ pub(crate) fn sn_key_len_for(aead: AeadAlg) -> usize {
     }
 }
 
-/// Decrypts one DTLS 1.3 protected record.
+/// Decrypts one DTLS 1.3 protected record into a fresh buffer (the engines
+/// use [`decrypt_dtls13_record_into`]).
+#[cfg(test)]
 pub(crate) fn decrypt_dtls13_record(
     crypter: &mut RecordCrypter,
     seq: u64,
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<(ContentType, Vec<u8>), Error> {
+    let mut out = Vec::new();
+    let ct = decrypt_dtls13_record_into(crypter, seq, aad, ciphertext, &mut out)?;
+    Ok((ct, out))
+}
+
+/// [`decrypt_dtls13_record`] appending the content to `out`: the ciphertext
+/// is copied onto `out`'s tail and opened there, so an engine that keeps
+/// `out` across records allocates nothing per record. On failure `out` is
+/// left as it was.
+pub(crate) fn decrypt_dtls13_record_into(
+    crypter: &mut RecordCrypter,
+    seq: u64,
+    aad: &[u8],
+    ciphertext: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<ContentType, Error> {
     if ciphertext.len() < 16 {
         return Err(Error::Decode);
     }
     let (ct, tag_bytes) = ciphertext.split_at(ciphertext.len() - 16);
     let mut tag = [0u8; 16];
     tag.copy_from_slice(tag_bytes);
-    let mut buf = ct.to_vec();
-    crypter.decrypt_raw(seq, aad, &mut buf, &tag)?;
+    let base = out.len();
+    out.extend_from_slice(ct);
     // TLSInnerPlaintext: content || true_type || zeros*. A backward search
     // for the last non-zero byte would take time proportional to the
     // padding, handing an on-path observer the true content length the
     // padding exists to hide (RFC 9147 §4 inherits RFC 8446 §5.4); use the
     // TLS 1.3 record layer's single front-to-back constant-time scan.
-    let (true_type, end) = ct_find_last_nonzero(&buf)?;
-    buf.truncate(end);
-    let ct = ContentType::from_u8(true_type);
-    Ok((ct, buf))
+    let opened = crypter
+        .decrypt_raw(seq, aad, &mut out[base..], &tag)
+        .and_then(|()| ct_find_last_nonzero(&out[base..]));
+    match opened {
+        Ok((true_type, end)) => {
+            out.truncate(base + end);
+            Ok(ContentType::from_u8(true_type))
+        }
+        Err(e) => {
+            out.truncate(base);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

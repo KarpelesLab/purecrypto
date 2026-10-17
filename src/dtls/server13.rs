@@ -85,7 +85,7 @@ use super::cid::{
     draw_cid_pool, negotiate_server,
 };
 use super::client13::{
-    decrypt_dtls13_record, derive_sn_key, encrypt_protected_record_with, sn_key_len_for,
+    decrypt_dtls13_record_into, derive_sn_key, encrypt_protected_record_with, sn_key_len_for,
 };
 use super::cookie::{CookieGenerator, build_ch_fingerprint};
 use super::epoch13::{
@@ -97,7 +97,9 @@ use super::reassembly::{
     write_fragments, write_message,
 };
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
-use super::record13::{self, SnKey, header_aad, header_cid, peek_header_layout, reconstruct_seq};
+use super::record13::{
+    self, SnKey, header_aad_into, header_cid, peek_header_layout, reconstruct_seq,
+};
 use super::reliability13::{InFlightRecord, Retransmit13};
 use super::ticket::{
     AcceptedPsk13, PskAcceptContext, TICKET_DTLS13_AAD, seal_key, ticket_now, try_accept_psk13,
@@ -387,6 +389,10 @@ pub struct DtlsServerConnection13<R: RngCore> {
 
     out_dgrams: Vec<Vec<u8>>,
     app_in: Vec<u8>,
+    /// Receive scratch: a protected record is opened here (see
+    /// `decrypt_dtls13_record_into`) and kept across records, so the
+    /// receive path allocates nothing in steady state.
+    rx_scratch: Vec<u8>,
 
     /// Plaintext (epoch 0) record state.
     plain_write_epoch: u16,
@@ -577,6 +583,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             pre_cookie: PreCookieBuffer::new(),
             out_dgrams: Vec::new(),
             app_in: Vec::new(),
+            rx_scratch: Vec::new(),
             plain_write_epoch: 0,
             plain_write_seq: 0,
             enc_write_epoch: 0,
@@ -943,9 +950,23 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         core::mem::take(&mut self.out_dgrams)
     }
 
+    /// [`Self::pop_outbound_datagrams`] moving the datagrams into `out`
+    /// instead: the engine's queue keeps its capacity across drains.
+    pub fn pop_outbound_into(&mut self, out: &mut impl Extend<Vec<u8>>) {
+        self.flush_pending_acks();
+        out.extend(self.out_dgrams.drain(..));
+    }
+
     /// Drains decrypted application data.
     pub fn take_received(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.app_in)
+    }
+
+    /// [`Self::take_received`] appending to `out` instead. Both `out` and
+    /// the engine's buffer keep their capacity, so a caller that reuses
+    /// `out` reads records without allocating.
+    pub fn take_received_into(&mut self, out: &mut Vec<u8>) {
+        out.append(&mut self.app_in);
     }
 
     /// Encrypts application plaintext into a single DTLS record. Must be
@@ -1199,7 +1220,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
         // RFC 9147 §4.2.3: AAD is the unified header (CID included) prior
         // to seq masking.
-        let aad = header_aad(buf, &hdr, mask);
+        let mut aad_buf = [0u8; record13::MAX_HEADER_LEN];
+        let aad = header_aad_into(buf, &hdr, mask, &mut aad_buf);
         // Pre-AEAD anti-replay check: cheap rejection of duplicate /
         // too-old seq numbers without touching window state. The window
         // is only `mark`-ed after AEAD verification succeeds so a forged
@@ -1207,11 +1229,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         if !ctx.replay.check(seq) {
             return Ok(consumed);
         }
-        let Ok((inner_type, plain)) = decrypt_dtls13_record(&mut ctx.crypter, seq, &aad, ct_body)
+        // Opened into the retained scratch (handed back below), so a
+        // record costs no allocation.
+        let mut plain = core::mem::take(&mut self.rx_scratch);
+        plain.clear();
+        let Ok(inner_type) =
+            decrypt_dtls13_record_into(&mut ctx.crypter, seq, aad, ct_body, &mut plain)
         else {
             // AEAD authentication failed — a single spoofed datagram must
             // not kill the connection (RFC 9147 §4.5.2): silent drop. The
             // replay window was deliberately not advanced.
+            self.rx_scratch = plain;
             return Ok(consumed);
         };
         // RFC 9147 §4.5.1: AEAD verified — now commit to the window.
@@ -1221,7 +1249,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         let read_epoch = ctx.epoch;
         if is_early {
-            self.on_early_data_record(inner_type, &plain)?;
+            let result = self.on_early_data_record(inner_type, &plain);
+            self.rx_scratch = plain;
+            result?;
             return Ok(consumed);
         }
         // RFC 9147 §5.6: once records arrive under the application keys
@@ -1359,6 +1389,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             }
             _ => return Err(Error::UnexpectedMessage),
         }
+        self.rx_scratch = plain;
         Ok(consumed)
     }
 

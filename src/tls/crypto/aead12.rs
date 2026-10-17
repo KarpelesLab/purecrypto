@@ -508,6 +508,199 @@ impl Drop for RecordCrypter12 {
     }
 }
 
+/// Stack room for the `tls12_cid` additional data (RFC 9146 §5.3): its 23
+/// fixed bytes plus a CID of at most 255.
+const AAD_CID_MAX: usize = 23 + 255;
+
+/// A received DTLS record fragment, split: explicit nonce (empty for
+/// ChaCha20-Poly1305), ciphertext, tag.
+struct DtlsFragment<'a> {
+    explicit: &'a [u8],
+    ct: &'a [u8],
+    tag: [u8; TAG_LEN],
+}
+
+/// DTLS record protection without per-record heap traffic: a record is
+/// sealed in place at the tail of the buffer that already holds its header,
+/// and opened in place — in the fragment itself, or in a scratch buffer the
+/// caller keeps across records.
+impl RecordCrypter12 {
+    /// [`Self::aad_dtls_cid`] written into a stack buffer; returns the
+    /// filled prefix.
+    fn aad_dtls_cid_into<'a>(
+        buf: &'a mut [u8; AAD_CID_MAX],
+        seq_combined: u64,
+        cid: &[u8],
+        inner_len: u16,
+    ) -> &'a [u8] {
+        let n = cid.len();
+        buf[..8].fill(0xff);
+        buf[8] = TLS12_CID;
+        // `cid_length` is a one-byte integer: the caller never passes a
+        // CID longer than the extension can carry.
+        buf[9] = n as u8;
+        buf[10] = TLS12_CID;
+        buf[11] = 0xfe;
+        buf[12] = 0xfd;
+        buf[13..21].copy_from_slice(&seq_combined.to_be_bytes());
+        buf[21..21 + n].copy_from_slice(cid);
+        buf[21 + n..23 + n].copy_from_slice(&inner_len.to_be_bytes());
+        &buf[..23 + n]
+    }
+
+    /// The length of the fragment the `*_dtls_into` writers append for a
+    /// `payload_len`-byte content: explicit nonce, the content (plus the
+    /// inner type byte of a `tls12_cid` record), tag. Lets the caller write
+    /// the record header, which carries that length, first.
+    pub(crate) fn dtls_fragment_len(&self, payload_len: usize, with_cid: bool) -> usize {
+        self.explicit_len() + payload_len + usize::from(with_cid) + TAG_LEN
+    }
+
+    /// Appends `explicit_nonce ‖ AEAD(payload ‖ trailer) ‖ tag` to `out`,
+    /// encrypting where the bytes lie.
+    fn seal_dtls_into(
+        &self,
+        out: &mut Vec<u8>,
+        seq_combined: u64,
+        aad: &[u8],
+        payload: &[u8],
+        trailer: &[u8],
+    ) {
+        let explicit = seq_combined.to_be_bytes();
+        let explicit = &explicit[..self.explicit_len()];
+        let nonce = self.aead_nonce(seq_combined, explicit);
+        out.reserve(explicit.len() + payload.len() + trailer.len() + TAG_LEN);
+        out.extend_from_slice(explicit);
+        let start = out.len();
+        out.extend_from_slice(payload);
+        out.extend_from_slice(trailer);
+        let tag = self.aead.encrypt(&nonce, aad, &mut out[start..]);
+        out.extend_from_slice(&tag);
+    }
+
+    /// [`Self::encrypt_dtls`] appending the fragment to `out` (behind the
+    /// record header the caller wrote) and sealing it in place.
+    pub(crate) fn encrypt_dtls_into(
+        &self,
+        out: &mut Vec<u8>,
+        seq_combined: u64,
+        content_type: ContentType,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        if payload.len() > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
+        let aad = Self::aad_dtls(seq_combined, content_type, payload.len() as u16);
+        self.seal_dtls_into(out, seq_combined, &aad, payload, &[]);
+        Ok(())
+    }
+
+    /// [`Self::encrypt_dtls_cid`] appending the fragment to `out` and
+    /// sealing it in place: the `DTLSInnerPlaintext` type byte is written
+    /// behind the content, nothing is copied through an intermediate.
+    pub(crate) fn encrypt_dtls_cid_into(
+        &self,
+        out: &mut Vec<u8>,
+        seq_combined: u64,
+        cid: &[u8],
+        content_type: ContentType,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        let inner_len = payload.len() + 1;
+        if inner_len > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
+        let mut aad_buf = [0u8; AAD_CID_MAX];
+        let aad = Self::aad_dtls_cid_into(&mut aad_buf, seq_combined, cid, inner_len as u16);
+        self.seal_dtls_into(out, seq_combined, aad, payload, &[content_type.as_u8()]);
+        Ok(())
+    }
+
+    /// Splits a received fragment into explicit nonce, ciphertext and tag.
+    /// `Decode` when too short for nonce and tag, `RecordOverflow` past the
+    /// 2^14 plaintext limit.
+    fn split_dtls_fragment<'a>(&self, fragment: &'a [u8]) -> Result<DtlsFragment<'a>, Error> {
+        let explicit_len = self.explicit_len();
+        if fragment.len() < explicit_len + TAG_LEN {
+            return Err(Error::Decode);
+        }
+        let (explicit, body) = fragment.split_at(explicit_len);
+        let (ct, tag_bytes) = body.split_at(body.len() - TAG_LEN);
+        if ct.len() > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(tag_bytes);
+        Ok(DtlsFragment { explicit, ct, tag })
+    }
+
+    /// Authenticates and decrypts `body` (a record's ciphertext, in place)
+    /// under its explicit nonce and `aad`.
+    fn open_dtls_body(
+        &self,
+        seq_combined: u64,
+        explicit: &[u8],
+        aad: &[u8],
+        body: &mut [u8],
+        tag: &[u8; TAG_LEN],
+    ) -> Result<(), Error> {
+        let nonce = self.aead_nonce(seq_combined, explicit);
+        if !self.aead.decrypt(&nonce, aad, body, tag) {
+            return Err(Error::BadRecordMac);
+        }
+        Ok(())
+    }
+
+    /// [`Self::decrypt_dtls`] appending the plaintext to `out`: the
+    /// ciphertext is copied onto `out`'s tail and opened there, so a caller
+    /// that keeps `out` across records allocates nothing per record. On
+    /// failure `out` is left as it was.
+    pub(crate) fn decrypt_dtls_into(
+        &self,
+        seq_combined: u64,
+        content_type: ContentType,
+        fragment: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        let DtlsFragment { explicit, ct, tag } = self.split_dtls_fragment(fragment)?;
+        let aad = Self::aad_dtls(seq_combined, content_type, ct.len() as u16);
+        let base = out.len();
+        out.extend_from_slice(ct);
+        self.open_dtls_body(seq_combined, explicit, &aad, &mut out[base..], &tag)
+            .inspect_err(|_| out.truncate(base))
+    }
+
+    /// [`Self::decrypt_dtls_cid`] appending the content to `out` (see
+    /// [`Self::decrypt_dtls_into`]); returns the real content type. On
+    /// failure `out` is left as it was.
+    pub(crate) fn decrypt_dtls_cid_into(
+        &self,
+        seq_combined: u64,
+        cid: &[u8],
+        fragment: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<ContentType, Error> {
+        let DtlsFragment { explicit, ct, tag } = self.split_dtls_fragment(fragment)?;
+        let mut aad_buf = [0u8; AAD_CID_MAX];
+        let aad = Self::aad_dtls_cid_into(&mut aad_buf, seq_combined, cid, ct.len() as u16);
+        let base = out.len();
+        out.extend_from_slice(ct);
+        let opened = self
+            .open_dtls_body(seq_combined, explicit, aad, &mut out[base..], &tag)
+            .and_then(|()| ct_find_last_nonzero(&out[base..]));
+        match opened {
+            Ok((real_type, end)) => {
+                out.truncate(base + end);
+                Ok(ContentType::from_u8(real_type))
+            }
+            Err(e) => {
+                out.truncate(base);
+                Err(e)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
