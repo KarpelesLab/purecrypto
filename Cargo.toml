@@ -349,7 +349,7 @@ mio = ["tls", "std", "dep:mio"]
 # the policy would burn ~2-3 kLoC of review surface for no security gain, since
 # compcol sits outside the cryptographic trust boundary.
 [dependencies]
-compcol = { version = "0.6.11", default-features = false, features = ["zlib", "zstd"], optional = true }
+compcol = { version = "0.7.2", default-features = false, features = ["zlib", "zstd"], optional = true }
 # Embedded root-CA bundle (curated from the Mozilla root program and others
 # per CA/Browser Forum rules, parsed at build time into static DER).
 # First-party (Karpeles Lab), `no_std`/no-alloc, fully-safe Rust with a
@@ -373,7 +373,7 @@ mio = { version = "1", default-features = false, features = ["os-ext", "net"], o
 tokio = { version = "1.53.3", features = ["net", "io-util", "rt", "macros", "time"] }
 # zlib inflate for the Wycheproof chunked-encryption vectors, whose `ct`
 # field is zlib-compressed (tests/wycheproof/chunked.rs).
-compcol = { version = "0.6", default-features = false, features = ["zlib"] }
+compcol = { version = "0.7.2", default-features = false, features = ["zlib"] }
 
 [[bin]]
 name = "purecrypto"
