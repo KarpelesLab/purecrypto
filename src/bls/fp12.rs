@@ -221,6 +221,22 @@ impl Fp12 {
         }
     }
 
+    /// Multiplies by the sparse element `c0 + c1·v + c4·(v·w)` — the shape
+    /// of the pairing's line functions on the twist (`w² = v`, `w³ = v·w`).
+    /// Thirteen `Fp2` multiplications against fifteen for
+    /// [`mul_by_035`](Fp12::mul_by_035).
+    pub fn mul_by_014(&self, c0: &Fp2, c1: &Fp2, c4: &Fp2) -> Fp12 {
+        // b = b0 + b1 w with b0 = (c0, c1, 0), b1 = (0, c4, 0).
+        let aa = self.c0.mul_by_01(c0, c1);
+        let bb = self.c1.mul_by_1(c4);
+        let o = c1.add(c4);
+        let c1 = self.c1.add(&self.c0).mul_by_01(c0, &o).sub(&aa).sub(&bb);
+        Fp12 {
+            c0: bb.mul_by_nonresidue().add(&aa),
+            c1,
+        }
+    }
+
     /// Squaring restricted to the cyclotomic subgroup `G_{Φ₁₂}(p)` (Granger
     /// and Scott, "Faster squaring in the cyclotomic subgroup of sixth
     /// degree extensions", via Algorithm 5.5.4 of the *Guide to
@@ -469,6 +485,11 @@ mod tests {
                 Fp6::new(Fp2::ZERO, b.c1.c1, b.c1.c2),
             );
             assert_eq!(a.mul_by_035(&b.c0.c0, &b.c1.c1, &b.c1.c2), a * sparse);
+            let sparse = Fp12::new(
+                Fp6::new(b.c0.c0, b.c0.c1, Fp2::ZERO),
+                Fp6::new(Fp2::ZERO, b.c1.c1, Fp2::ZERO),
+            );
+            assert_eq!(a.mul_by_014(&b.c0.c0, &b.c0.c1, &b.c1.c1), a * sparse);
             a = a * b + Fp12::ONE;
         }
         assert!(bool::from(Fp12::ZERO.invert().is_none()));

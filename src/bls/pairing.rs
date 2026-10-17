@@ -2,22 +2,28 @@
 //!
 //! `e(P, Q) = f_{x,Q}(P)^((p¹² - 1)/r)` with the BLS parameter
 //! `x = -0xd201000000010000`. The Miller loop keeps the `G2` accumulator on
-//! the twist in projective coordinates and evaluates the line functions
-//! through the untwist `ψ(x', y') = (x'·w⁻², y'·w⁻³)` directly at `P`, so
-//! each line is a sparse `Fp12` element `c0 + c3·w³ + c5·w⁵` (the scaling by
-//! `Fp2` constants is absorbed by the final exponentiation). The final
+//! the twist `E': y² = x³ + 4(1 + u)` in homogeneous projective coordinates
+//! and evaluates the twist's line functions at the image of `P` under the
+//! twist map `τ(x, y) = (x·w², y·w³)` (`E → E'`, since `w⁶ = 1 + u`), so
+//! each line is the sparse `Fp12` element `c0 + c1·w² + c4·w³` with
+//! `c0 ∈ Fp2` the line's constant term, `c1` its `xP` term and `c4` its
+//! `yP` term. Lines are scaled freely by `Fp2` factors (killed by the
+//! final exponentiation). The point and the line come out of one set of
+//! shared intermediates per step (Costello, Lange and Naehrig,
+//! <https://eprint.iacr.org/2009/615>, `a = 0`). The final
 //! exponentiation uses the standard easy part `(p⁶ - 1)(p² + 1)` and, for
 //! the hard part `(p⁴ - p² + 1)/r`, the polynomial identity
 //! `3·λ = (x - 1)²·(x + p)·(x² + p² - 1) + 3` (Hayashida, Hayasaka and
 //! Teruya, <https://eprint.iacr.org/2020/875>), i.e.
 //! `λ = ((x-1)/3)·(x-1)·(x+p)·(x²+p²-1) + 1` with `(x - 1)/3` integral.
 
+use super::curve::{CurveField, Projective};
+use super::fp::Fp;
 use super::fp2::Fp2;
 use super::fp12::Fp12;
 use super::fr::Fr;
 use super::g1::G1;
 use super::g2::G2;
-use super::{constants::B2_3, curve::Projective};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use crate::zeroize::Zeroize;
 
@@ -106,11 +112,10 @@ pub fn multi_pairing(pairs: &[(&G1, &G2)]) -> Gt {
 
 /// One pair's state in a (shared) Miller loop.
 struct Leg {
-    px: super::fp::Fp,
-    py: super::fp::Fp,
+    px: Fp,
+    py: Fp,
     qx: Fp2,
     qy: Fp2,
-    q_aff: Projective<Fp2>,
     t: Projective<Fp2>,
     /// Either input is the identity: the pair contributes `1`.
     skip: Choice,
@@ -120,25 +125,84 @@ impl Leg {
     fn new(p: &G1, q: &G2) -> Leg {
         let (px, py, p_inf) = p.0.to_affine();
         let (qx, qy, q_inf) = q.0.to_affine();
-        let q_aff = Projective::from_affine(qx, qy);
         Leg {
             px,
             py,
             qx,
             qy,
-            q_aff,
-            t: q_aff,
+            t: Projective::from_affine(qx, qy),
             skip: p_inf | q_inf,
         }
     }
+
+    /// Doubles `T` and returns the tangent line at `T` evaluated at
+    /// `τ(P)`, as `(c0, c1, c4)` (one set of intermediates for both):
+    /// `(Y² - 3b'Z²) - 3X²·xP·w² + 2YZ·yP·w³`.
+    fn doubling_step(&mut self) -> (Fp2, Fp2, Fp2) {
+        let (x, y, z) = (&self.t.x, &self.t.y, &self.t.z);
+        let a = x.mul(y);
+        let b = y.square();
+        let c = z.square();
+        // e = 3b'Z², f = 9b'Z², h = (Y + Z)² - Y² - Z² = 2YZ.
+        let e = c.mul_by_b3();
+        let f = e.double().add(&e);
+        let h = y.add(z).square().sub(&b).sub(&c);
+        let x2 = x.square();
+        let c0 = b.sub(&e);
+        let c1 = x2.double().add(&x2).mul_by_fp(&self.px).neg();
+        let c4 = h.mul_by_fp(&self.py);
+        // 2T (Costello–Lange–Naehrig, scaled by 4 to avoid halvings):
+        // X3 = 2·XY·(B - F), Y3 = (B + F)² - 12·E², Z3 = 4·B·H.
+        let x3 = a.mul(&b.sub(&f)).double();
+        let e2 = e.square();
+        let e2x4 = e2.double().double();
+        let y3 = b.add(&f).square().sub(&e2x4.double().add(&e2x4));
+        let z3 = b.mul(&h).double().double();
+        self.t = Projective {
+            x: x3,
+            y: y3,
+            z: z3,
+        };
+        (c0, c1, c4)
+    }
+
+    /// Adds the affine `Q` to `T` and returns the line through them
+    /// evaluated at `τ(P)`, scaled by `v = xQ·Z - X`:
+    /// `(X·yQ - Y·xQ) - u·xP·w² + v·yP·w³` with `u = yQ·Z - Y`.
+    ///
+    /// Not complete: `T ∈ {𝒪, ±Q}` would give the wrong answer, but the
+    /// loop only ever adds `Q` to `[m]Q` with `2 ≤ m < |x| < r`.
+    fn addition_step(&mut self) -> (Fp2, Fp2, Fp2) {
+        let (x, y, z) = (&self.t.x, &self.t.y, &self.t.z);
+        let u = self.qy.mul(z).sub(y);
+        let v = self.qx.mul(z).sub(x);
+        let c0 = x.mul(&self.qy).sub(&y.mul(&self.qx));
+        let c1 = u.mul_by_fp(&self.px).neg();
+        let c4 = v.mul_by_fp(&self.py);
+        // T + Q (projective mixed addition).
+        let uu = u.square();
+        let vv = v.square();
+        let vvv = v.mul(&vv);
+        let r = vv.mul(x);
+        let a = uu.mul(z).sub(&vvv).sub(&r.double());
+        let x3 = v.mul(&a);
+        let y3 = u.mul(&r.sub(&a)).sub(&vvv.mul(y));
+        let z3 = vvv.mul(z);
+        self.t = Projective {
+            x: x3,
+            y: y3,
+            z: z3,
+        };
+        (c0, c1, c4)
+    }
 }
 
-/// Multiplies `f` by the sparse line `(c0, c3, c5)`, or leaves it alone
+/// Multiplies `f` by the sparse line `(c0, c1, c4)`, or leaves it alone
 /// when `skip` is set (selected, so the schedule does not depend on it).
 #[inline]
 fn mul_line(f: &Fp12, line: (Fp2, Fp2, Fp2), skip: Choice) -> Fp12 {
-    let (c0, c3, c5) = line;
-    let g = f.mul_by_035(&c0, &c3, &c5);
+    let (c0, c1, c4) = line;
+    let g = f.mul_by_014(&c0, &c1, &c4);
     Fp12::conditional_select(f, &g, skip)
 }
 
@@ -151,46 +215,17 @@ fn shared_miller_loop(legs: &mut [Leg]) -> Fp12 {
     for bit in (0..63).rev() {
         f = f.square();
         for leg in legs.iter_mut() {
-            let line = doubling_line(&leg.t, &leg.px, &leg.py);
+            let line = leg.doubling_step();
             f = mul_line(&f, line, leg.skip);
-            leg.t = leg.t.double();
         }
         if (X_ABS >> bit) & 1 == 1 {
             for leg in legs.iter_mut() {
-                let line = addition_line(&leg.t, &leg.qx, &leg.qy, &leg.px, &leg.py);
+                let line = leg.addition_step();
                 f = mul_line(&f, line, leg.skip);
-                leg.t = leg.t.add(&leg.q_aff);
             }
         }
     }
     f.conjugate()
-}
-
-/// The line through `T` and `2T` (before doubling), evaluated at `P`,
-/// scaled by `ξ·2yT·Z³/Z`: `(ξ·2YZ·yP, Y² - 3b'Z², -3X²·xP)`.
-#[inline]
-fn doubling_line(t: &Projective<Fp2>, px: &super::fp::Fp, py: &super::fp::Fp) -> (Fp2, Fp2, Fp2) {
-    let c0 = t.y.mul(&t.z).double().mul_by_nonresidue().mul_by_fp(py);
-    let c3 = t.y.square().sub(&B2_3.mul(&t.z.square()));
-    let x2 = t.x.square();
-    let c5 = x2.double().add(&x2).mul_by_fp(px).neg();
-    (c0, c3, c5)
-}
-
-/// The line through `T` and `Q` (affine), evaluated at `P`, scaled by
-/// `ξ·(X - xQ·Z)`: `(ξ·(X - xQ·Z)·yP, xQ·Y - yQ·X, -(Y - yQ·Z)·xP)`.
-#[inline]
-fn addition_line(
-    t: &Projective<Fp2>,
-    qx: &Fp2,
-    qy: &Fp2,
-    px: &super::fp::Fp,
-    py: &super::fp::Fp,
-) -> (Fp2, Fp2, Fp2) {
-    let c0 = t.x.sub(&qx.mul(&t.z)).mul_by_nonresidue().mul_by_fp(py);
-    let c3 = qx.mul(&t.y).sub(&qy.mul(&t.x));
-    let c5 = t.y.sub(&qy.mul(&t.z)).mul_by_fp(px).neg();
-    (c0, c3, c5)
 }
 
 /// `f_{|x|,Q}(P)` conjugated (since `x < 0`), or `1` if either input is the
@@ -298,6 +333,53 @@ mod tests {
             f = f.mul(&miller_loop(pi, qi));
         }
         assert_eq!(Gt(final_exponentiation(&f)), want);
+    }
+
+    /// SHA-256 over the twelve 48-byte coefficients of a `Gt` element.
+    fn digest(e: &Gt) -> [u8; 32] {
+        use crate::hash::{Digest, Sha256};
+        let f = e.as_fp12();
+        let mut h = Sha256::new();
+        for c6 in [&f.c0, &f.c1] {
+            for c2 in [&c6.c0, &c6.c1, &c6.c2] {
+                h.update(&c2.c0.to_bytes());
+                h.update(&c2.c1.to_bytes());
+            }
+        }
+        h.finalize()
+    }
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// Pins the exact pairing values (this implementation computes
+    /// `f^((p¹²-1)/r)` itself, not a multiple of the exponent), so that
+    /// reformulations of the Miller loop or final exponentiation that are
+    /// only correct up to a factor killed by the exponentiation — or not
+    /// at all — are caught.
+    #[test]
+    fn pairing_values_are_pinned() {
+        let g1 = G1::generator();
+        let g2 = G2::generator();
+        assert_eq!(
+            digest(&pairing(&g1, &g2)),
+            hex32("4b4c07e7d5136bb2947bab11cf26a740cd2aeef4baf3e6f773bfadb5e505f8b4"),
+        );
+        let a = Fr::from_u64(0x1122_3344_5566_7788);
+        let b = Fr::from_u64(0x99aa_bbcc_ddee_ff01);
+        assert_eq!(
+            digest(&pairing(&g1.mul(&a), &g2.mul(&b))),
+            hex32("e0ef4076e6489c52511ca72e5dd5dc99c4fb4da9512fe8c923e5a6531c4cf6b5"),
+        );
+        assert_eq!(
+            digest(&multi_pairing(&[(&g1, &g2), (&g1.mul(&a), &g2.mul(&b))])),
+            hex32("edde1c6a19660c05271f113b05da31b84506bf9f5186a095837376c9e042d58c"),
+        );
     }
 
     #[test]

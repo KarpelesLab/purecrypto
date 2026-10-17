@@ -243,7 +243,8 @@ mod tests {
         // 3b'·x by additions equals the product with the constant.
         use super::super::curve::CurveField;
         let (x, _) = g.to_affine().unwrap();
-        assert_eq!(CurveField::mul_by_b3(&x), x * super::super::constants::B2_3);
+        let twelve = Fp::from_canonical(&[12, 0, 0, 0, 0, 0]);
+        assert_eq!(CurveField::mul_by_b3(&x), x * Fp2::new(twelve, twelve));
     }
 
     #[test]

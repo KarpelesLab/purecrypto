@@ -96,25 +96,6 @@ pub(crate) const B2: Fp2 = Fp2 {
         0x09d645513d83de7e,
     ]),
 };
-/// `0xc + 0xc·u`
-pub(crate) const B2_3: Fp2 = Fp2 {
-    c0: Fp([
-        0x447600000027552e,
-        0xdcb8009a43480020,
-        0x6f7ee9ce4a6e8b59,
-        0xb10330b7c0a95bc6,
-        0x6140b1fcfb1e54b7,
-        0x0381be097f0bb4e1,
-    ]),
-    c1: Fp([
-        0x447600000027552e,
-        0xdcb8009a43480020,
-        0x6f7ee9ce4a6e8b59,
-        0xb10330b7c0a95bc6,
-        0x6140b1fcfb1e54b7,
-        0x0381be097f0bb4e1,
-    ]),
-};
 
 // Frobenius: xi^(i*(p-1)/6), i = 1..5 (xi = 1 + u)
 /// `0x1904d3bf02bb0667c231beb4202c0d1f0fd603fd3cbd5f4f7b2443d784bab9c4f67ea53d63e7813d8d0775ed92235fb8 + 0xfc3e2b36c4e03288e9e902231f9fb854a14787b6c7b36fec0c8ec971f63c5f282d5ac14d6c7ec22cf78a126ddc4af3·u`
