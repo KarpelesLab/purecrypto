@@ -283,6 +283,25 @@ fn main() {
                 black_box(sk.sign_deterministic(b"bench message", &[]).unwrap());
             });
         }
+
+        // Larger RSA moduli (the CRT halves are 1536- / 2048-bit) and
+        // finite-field DH on group14, the bignum kernels' other users.
+        {
+            use purecrypto::dh::{DhPrivateKey, group14};
+            for bits in [3072usize, 4096] {
+                let key =
+                    BoxedRsaPrivateKey::generate(bits, BoxedUint::from_u64(65537), &mut rng, 5);
+                bench_latency(&format!("RSA-{bits} sign (pkcs1)"), t, || {
+                    black_box(key.sign_pkcs1v15::<Sha256>(black_box(msg)).unwrap());
+                });
+            }
+            let alice = DhPrivateKey::generate(group14(), &mut rng);
+            let bob = DhPrivateKey::generate(group14(), &mut rng);
+            let bob_pub = bob.public_key();
+            bench_latency("DH group14 agree", t, || {
+                black_box(alice.shared_secret(black_box(&bob_pub)).unwrap());
+            });
+        }
     }
     println!();
 }
