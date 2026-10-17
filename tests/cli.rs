@@ -8229,3 +8229,112 @@ fn dtls_cid_options_are_validated() {
         assert!(err.contains(msg), "{args:?}: {err}");
     }
 }
+
+/// A TCP client that connects and then says nothing must not hold
+/// `s_server` forever: the handshake reads are bounded (20 s), after which
+/// the server reports the deadline and exits non-zero. Before, the read
+/// blocked indefinitely — a port scan or a hung client parked a `-naccept`
+/// server and every client queued behind it.
+#[test]
+fn s_server_tcp_handshake_has_a_deadline() {
+    let dir = std::env::temp_dir().join(format!("pc_tcp_hs_deadline_{}", std::process::id()));
+    let (cert, key) = write_dtls_identity(&dir);
+    let server = spawn_server_wait_listening(&[
+        "s_server", "-cert", &cert, "-key", &key, "-accept", "0", "-naccept", "2",
+    ]);
+    let start = std::time::Instant::now();
+    let idle = std::net::TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    // Exits on its own (asserted by `finish_with_stderr`, which kills it
+    // after 90 s), and well before the 60 s accept deadline of a *second*
+    // client would — so it was the handshake deadline that fired.
+    let err = server.finish_with_stderr();
+    let elapsed = start.elapsed();
+    drop(idle);
+    assert!(
+        err.contains("TLS handshake deadline exceeded"),
+        "server stderr:\n{err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(50),
+        "the server took {elapsed:?} to give up on a silent client"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `-naccept` DTLS server used to end its live connection — without a
+/// close_notify — as soon as anything shaped like a plaintext ClientHello
+/// arrived from another address, and that shape is 14 bytes anyone can
+/// send. Now such a datagram is ignored: the first client's session runs to
+/// its end (echo, close_notify both ways), and the next real client is
+/// served afterwards.
+#[test]
+fn dtls_naccept_server_ignores_a_foreign_client_hello() {
+    let dir = std::env::temp_dir().join(format!("pc_dtls_foreign_ch_{}", std::process::id()));
+    let (cert, key) = write_dtls_identity(&dir);
+    let server = spawn_server_wait_listening(&[
+        "s_server", "-dtls1_3", "-cert", &cert, "-key", &key, "-accept", "0", "-naccept", "2",
+    ]);
+    let port = server.port;
+    // The spoof: a DTLS 1.2-style plaintext record header (type 22,
+    // version 254.253, epoch 0, sequence 0, length 0) and a `client_hello`
+    // handshake type byte, from a socket that is not the client's. Sent
+    // once the client has left its handshake (its first epoch-3 record
+    // towards the server), so the server's session is live.
+    let spoofer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut spoofed = false;
+    let relay = spawn_udp_relay(port, move |to_server, dg| {
+        if to_server && !spoofed && is_dtls13_record(dg, 3) {
+            spoofed = true;
+            let fake_ch = [22u8, 254, 253, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            spoofer.send_to(&fake_ch, ("127.0.0.1", port)).unwrap();
+        }
+        false
+    });
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-dtls1_3",
+            "-connect",
+            &format!("127.0.0.1:{relay}"),
+            "-insecure",
+            "-read_timeout",
+            "1",
+        ],
+        b"hello\n",
+    );
+    assert!(ok, "first s_client failed: {err}");
+    assert!(
+        out.contains("hello"),
+        "no echo for the first client: {out:?}\n{err}"
+    );
+    assert!(
+        err.contains("close_notify: received"),
+        "the first session did not end in an exchange of close_notify:\n{err}"
+    );
+    // The next real client is served once the first connection has ended.
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-dtls1_3",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-read_timeout",
+            "1",
+        ],
+        b"second\n",
+    );
+    let server_err = server.finish_with_stderr();
+    assert!(ok, "second s_client failed: {err}\nserver:\n{server_err}");
+    assert!(
+        out.contains("second"),
+        "no echo for the second client: {out:?}\n{err}\nserver:\n{server_err}"
+    );
+    assert_eq!(
+        server_err.matches("handshake complete: DTLSv1.3").count(),
+        2,
+        "server:\n{server_err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

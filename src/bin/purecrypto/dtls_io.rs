@@ -78,13 +78,22 @@ impl Clock {
 /// first (RFC 9147 §9: a reachability check before sending to it).
 ///
 /// An [`accepting`](Self::accepting) link is the addressed link of a
-/// `-naccept` server serving sequential connections on one socket: a
-/// ClientHello that opens the NEXT connection — from another source, or
-/// from the same one once the current handshake is complete (a
-/// `-reconnect` client may reuse its source port or take a fresh one) — is
-/// not fed to the current engine, which would drop it as a stray epoch-0
-/// record (RFC 9147 §4.5.2), but held for the caller ([`Step::Handoff`],
-/// [`take_handoff`](Self::take_handoff)).
+/// `-naccept` server serving sequential connections on one socket. A
+/// plaintext ClientHello is the start of the NEXT connection, and the
+/// current engine would drop it as a stray epoch-0 record (RFC 9147
+/// §4.5.2); what the link does with it depends on where it comes from:
+///
+/// - from the current peer, once its handshake is complete (a
+///   `-reconnect` client reusing its source port, whose close_notify for
+///   the first connection may have been lost): held for the caller
+///   ([`Step::Handoff`], [`take_handoff`](Self::take_handoff)), which
+///   ends the current connection and serves the new one;
+/// - from any other address: discarded. A ClientHello is unauthenticated
+///   and its source is trivially spoofed, so it must not be allowed to
+///   evict a live — possibly client-authenticated — session. The client
+///   that sent it retransmits it on its backoff (RFC 6347 §4.2.4, RFC
+///   9147 §5.8.2) and is served once the current connection has ended,
+///   by the caller's own wait for the next ClientHello.
 pub(crate) struct Link {
     socket: UdpSocket,
     /// The peer, for an unconnected socket; `None` for a connected one.
@@ -194,13 +203,15 @@ impl Link {
 pub(crate) enum Step {
     /// A datagram arrived and was processed.
     Datagram,
-    /// Nothing arrived within the poll interval (a timer may have fired).
+    /// Nothing arrived within the poll interval (a timer may have fired),
+    /// or what arrived was discarded unfed (a ClientHello from a foreign
+    /// address on an accepting link — see [`Link`]).
     Quiet,
     /// The socket failed — for a connected UDP socket typically an ICMP
     /// port-unreachable: the peer is gone.
     Gone,
-    /// An accepting link received the next connection's ClientHello and
-    /// held it back, unfed ([`Link::take_handoff`]).
+    /// An accepting link received the current peer's ClientHello for its
+    /// next connection and held it back, unfed ([`Link::take_handoff`]).
     Handoff,
 }
 
@@ -222,9 +233,12 @@ pub(crate) fn flush(conn: &mut Connection, link: &Link) {
 /// header (`content_type = 22` handshake, `epoch = 0` at bytes 3..5)
 /// carrying a handshake fragment whose type byte (at offset 13) is
 /// `client_hello` (1). Once one connection is established, such a datagram
-/// is the next client's opening flight and must be handed to a fresh
-/// engine rather than fed to the current one (which would drop it as a
-/// spoofed epoch-0 record — RFC 9147 §4.5.2).
+/// is the next client's opening flight: the current engine would drop it
+/// as a spoofed epoch-0 record (RFC 9147 §4.5.2), so it is held for a
+/// fresh engine — or, from an address other than the current peer's,
+/// discarded until that connection has ended (see [`Link`]). The shape
+/// is all that is checked: anyone can send it, which is why it must never
+/// end a session on its own.
 pub(crate) fn is_new_client_hello(dg: &[u8]) -> bool {
     dg.len() >= 14 && dg[0] == 22 && dg[3] == 0 && dg[4] == 0 && dg[13] == 1
 }
@@ -262,14 +276,22 @@ pub(crate) fn step(
         .socket
         .set_read_timeout(Some(wait.max(Duration::from_millis(1))));
     let seen = match link.recv(buf) {
+        // A ClientHello from another address while this connection is
+        // live, in handshake or not: discarded, never fed and never a
+        // handoff (see `Link` — it is unauthenticated, and acting on it
+        // would let any host end this session). Its sender retransmits.
         Ok((n, Some(src)))
-            if link.accepting
-                && is_new_client_hello(&buf[..n])
-                && (Some(src) != link.peer || conn.is_handshake_complete()) =>
+            if link.accepting && is_new_client_hello(&buf[..n]) && Some(src) != link.peer =>
         {
-            // The next connection (see `Link`). A ClientHello from the
-            // current peer during its handshake is a retransmission and
-            // is fed below.
+            Step::Quiet
+        }
+        Ok((n, Some(src)))
+            if link.accepting && is_new_client_hello(&buf[..n]) && conn.is_handshake_complete() =>
+        {
+            // The current peer's next connection (see `Link`). A
+            // ClientHello from it during its handshake is a
+            // retransmission (or its answer to a HelloRetryRequest /
+            // HelloVerifyRequest) and is fed below.
             link.handoff = Some((buf[..n].to_vec(), src));
             return Ok(Step::Handoff);
         }

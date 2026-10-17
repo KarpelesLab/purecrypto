@@ -370,6 +370,13 @@ pub(crate) fn run(args: Args) {
             // so the later ones can resume the earlier ones.
             for i in 0..naccept {
                 let (mut sock, peer) = accept_with_deadline(&listener, ACCEPT_DEADLINE);
+                // A client that connects and then says nothing must not
+                // park this process (and every later `-naccept` client)
+                // in a blocking read forever: every read of the handshake
+                // is bounded, like the DTLS path's. `run_tcp` sets the
+                // shorter data-phase timeout once the handshake is done.
+                sock.set_read_timeout(Some(HANDSHAKE_DEADLINE))
+                    .unwrap_or_else(|e| die(format!("cannot set a read timeout: {e}")));
                 if !quiet {
                     if naccept > 1 {
                         eprintln!("=== connection {}", i + 1);
@@ -409,6 +416,15 @@ pub(crate) fn run(args: Args) {
 /// port) cannot leave the process blocked in `accept()` forever. The DTLS
 /// path bounds its first `recv_from` the same way.
 const ACCEPT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one read of the TCP handshake may wait for the client, the
+/// counterpart of `dtls_io::HANDSHAKE_DEADLINE`. TCP retransmits below
+/// TLS, so a handshake that falls silent this long is not a lossy link
+/// but a peer that connected and never spoke (a port scan, a client that
+/// hung), and it must not hold the listener: with `-naccept` every later
+/// client would queue behind it. Shorter than the DTLS bound, which has
+/// to admit the handshake's own retransmission backoff.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(20);
 
 /// `TcpListener::accept` with a deadline: std has no accept timeout, so the
 /// listener is polled non-blocking until a client arrives or `deadline`
@@ -631,9 +647,21 @@ fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream, ech: bool) {
             Ok(HandshakeStatus::Complete) => return,
             Ok(HandshakeStatus::WantWrite) => continue,
             Ok(HandshakeStatus::WantRead) => {
-                let n = sock
-                    .read(&mut read_buf)
-                    .unwrap_or_else(|e| die(format!("socket read: {e}")));
+                let n = match sock.read(&mut read_buf) {
+                    Ok(n) => n,
+                    // The read timeout set at accept time (`HANDSHAKE_DEADLINE`).
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        die(format!(
+                            "TLS handshake deadline exceeded: no data from the client for {HANDSHAKE_DEADLINE:?}"
+                        ))
+                    }
+                    Err(e) => die(format!("socket read: {e}")),
+                };
                 if n == 0 {
                     die("peer closed during handshake");
                 }
@@ -689,11 +717,15 @@ fn run_udp(
     // unconnected too: a `-reconnect` client opens its resumed connection
     // either from the same 4-tuple (OpenSSL, this CLI) or from a fresh
     // source port (the wolfSSL example client), so each connection is
-    // served by address, and the next one's ClientHello is handed forward
-    // to a fresh engine (`Link::accepting`). The per-process ticket key is
-    // shared across them, so the later connections resume the earlier ones;
-    // DTLS 1.3 0-RTT is accepted only from the address the ticket was
-    // issued to (RFC 9147 §5.1).
+    // served by address. The next one's ClientHello is picked up once the
+    // current connection has ended (`recv_client_hello`) — or, when it
+    // comes from the current peer itself after its handshake, handed
+    // forward to a fresh engine at once (`Link::accepting`); one from any
+    // other address is ignored while a connection is live, since it is
+    // unauthenticated and must not be able to end that connection. The
+    // per-process ticket key is shared across them, so the later
+    // connections resume the earlier ones; DTLS 1.3 0-RTT is accepted only
+    // from the address the ticket was issued to (RFC 9147 §5.1).
     let first_peer = pending.1;
     let mut link = if naccept > 1 {
         Link::accepting(socket, first_peer)
@@ -791,8 +823,9 @@ fn run_udp_one(
     let _ = conn.feed(first_dgram);
 
     if !drive_udp_handshake(&mut conn, link, &clock, mtu) {
-        // Another client opened a connection before this one finished
-        // handshaking: hand it on rather than lose it.
+        // (Unreachable in practice: a handoff needs a completed handshake —
+        // see `dtls_io::step` — but hand on whatever was held rather than
+        // lose it.)
         return link.take_handoff();
     }
 
@@ -835,8 +868,10 @@ fn run_udp_one(
 
 /// Drives the server handshake, firing the retransmit timer on the
 /// connection's clock (1 s doubling — RFC 6347 §4.2.4.1 / RFC 9147
-/// §5.8.2). `false` when another client's ClientHello arrived meanwhile
-/// and was held back on an accepting link.
+/// §5.8.2). `false` when a ClientHello was held back on an accepting link
+/// (a `Step::Handoff`, which `dtls_io::step` only reports once the
+/// handshake is complete — so not before this returns `true`). A
+/// ClientHello from another address is dropped inside `step`.
 fn drive_udp_handshake(conn: &mut Connection, link: &mut Link, clock: &Clock, mtu: usize) -> bool {
     let mut buf = vec![0u8; mtu.max(1500) + 256];
     while !conn.is_handshake_complete() {
@@ -877,10 +912,12 @@ fn echo(conn: &mut Connection, plain: &[u8]) -> bool {
 /// retransmits its Finished on a backoff that outgrows the idle limit. A
 /// close_notify sent into that gap fails its handshake.
 ///
-/// On an accepting link, the next connection's ClientHello ends this one
-/// without a close_notify: the client that opened it is done with this one
-/// (and a same-port reconnect would take the alert for the new
-/// connection's).
+/// On an accepting link, a ClientHello from this same peer ends this
+/// connection without a close_notify: the client is done with it and has
+/// opened its next one from the same port, which would take the alert for
+/// the new connection's. A ClientHello from any other address is dropped
+/// in `dtls_io::step` and does not touch this connection: its sender is
+/// served once this one ends and `run_udp` waits for the next ClientHello.
 fn drive_udp_echo(
     conn: &mut Connection,
     link: &mut Link,
