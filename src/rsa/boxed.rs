@@ -350,7 +350,17 @@ fn derive_blinder_boxed(
     c: &BoxedUint,
 ) -> BoxedUint {
     let c_bytes = c.to_be_bytes(k_bytes);
-    let mut blinder_bytes = Vec::with_capacity(k_bytes);
+    // Reserve a whole number of HMAC tags: the loop appends 32 bytes at a
+    // time and only stops once `k_bytes` are present, so for a modulus
+    // length that is not a multiple of 32 (a 2056-bit key, say) the last
+    // tag would overrun a `k_bytes` capacity. A `Vec` that grows copies its
+    // contents and frees the old buffer *unwiped*, leaving most of the
+    // blinder on the heap; sized up front, the buffer below is the only
+    // copy and `wipe` reaches all of it.
+    let reserved = k_bytes.div_ceil(32) * 32;
+    let mut blinder_bytes = Vec::with_capacity(reserved);
+    let cap = blinder_bytes.capacity();
+    debug_assert!(cap >= reserved);
     let mut counter: u32 = 0;
     // Key the HMAC once; each chunk continues from a clone of that state.
     let keyed = HmacSha256::new(blinding_seed);
@@ -368,6 +378,11 @@ fn derive_blinder_boxed(
         blinder_bytes.extend_from_slice(tag.as_ref());
         counter += 1;
     }
+    debug_assert_eq!(
+        blinder_bytes.capacity(),
+        cap,
+        "derive_blinder_boxed: the blinder buffer must not reallocate"
+    );
     blinder_bytes.truncate(k_bytes);
     let r_raw = BoxedUint::from_be_bytes(&blinder_bytes);
     // The blinder is as secret as the private exponent it masks: wipe the
@@ -2737,6 +2752,38 @@ mod tests {
             .encrypt_pkcs1v15(b"secret", &mut rng)
             .unwrap();
         assert_eq!(sk.decrypt_pkcs1v15(&good).unwrap().as_slice(), b"secret");
+    }
+
+    /// A modulus length that is not a multiple of the HMAC output (2056
+    /// bits = 257 bytes → 9 tags = 288 bytes) must still derive a blinder
+    /// without the byte buffer reallocating mid-loop (the `debug_assert`
+    /// in `derive_blinder_boxed` checks the capacity; this test exercises
+    /// that path, which no 2048/3072/4096-bit key reaches).
+    #[test]
+    fn blinder_derivation_handles_non_multiple_of_32_modulus_length() {
+        // An odd 2056-bit modulus (top bit set, low bit set); it need not be
+        // an RSA modulus for the derivation itself.
+        let k = 257;
+        let mut nb = vec![0u8; k];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for b in nb.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        nb[0] |= 0x80;
+        nb[k - 1] |= 1;
+        let n = BoxedUint::from_be_bytes(&nb);
+        let mont = BoxedMontModulus::new(&n);
+        let seed = [0x5au8; 32];
+        let salt = [0x3cu8; 16];
+        let c = BoxedUint::from_u64(7);
+        let r0 = derive_blinder_boxed(&mont, &seed, k, 0, &salt, &c);
+        let r1 = derive_blinder_boxed(&mont, &seed, k, 1, &salt, &c);
+        assert!(r0.lt(&n) && r1.lt(&n), "blinder must be reduced mod n");
+        assert!(!r0.is_zero() && r0 != BoxedUint::from_u64(1));
+        assert_ne!(r0, r1);
     }
 
     /// The blinder must be fresh per operation: two calls with the same

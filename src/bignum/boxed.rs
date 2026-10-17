@@ -331,8 +331,30 @@ impl BoxedUint {
     /// lost.
     pub fn add(&self, other: &BoxedUint) -> BoxedUint {
         let n = self.limbs.len().max(other.limbs.len());
-        let (mut sum, carry) = adc_limbs(&self.limbs_resized(n), &other.limbs_resized(n), 0);
-        sum.push(carry);
+        // The result is sized `n + 1` up front and the operands are read in
+        // place (no `limbs_resized` copies): a `Vec` that has to grow for
+        // the carry limb moves its contents and frees the old buffer
+        // unwiped, and the operands here can be secret (the RSA private-op
+        // result in `raw_private_crt_blinded`, for one). With the capacity
+        // fixed from the start, nothing secret is ever left behind on the
+        // heap by this method.
+        let mut sum: Vec<Limb> = Vec::with_capacity(n + 1);
+        let cap = sum.capacity();
+        debug_assert!(cap > n);
+        let mut c: Limb = 0;
+        for i in 0..n {
+            let a = self.limbs.get(i).copied().unwrap_or(0);
+            let b = other.limbs.get(i).copied().unwrap_or(0);
+            let (s, co) = adc(a, b, c);
+            sum.push(s);
+            c = co;
+        }
+        sum.push(c);
+        debug_assert_eq!(
+            sum.capacity(),
+            cap,
+            "BoxedUint::add: the carry push must not reallocate"
+        );
         BoxedUint::from_limbs(sum)
     }
 
@@ -471,6 +493,25 @@ mod tests {
         let b = BoxedUint::from_limbs(vec![5, 0, 0]);
         assert_eq!(a, b);
         assert_ne!(a, BoxedUint::from_limbs(vec![6]));
+    }
+
+    /// `add` widens by exactly one limb and keeps the carry; the result
+    /// buffer is allocated at its final size so the carry limb never forces
+    /// a reallocation (which would leave the summands' limbs on the heap
+    /// unwiped — see the comment in `add`).
+    #[test]
+    fn add_widens_without_reallocating() {
+        let a = BoxedUint::from_limbs(vec![Limb::MAX, Limb::MAX]);
+        let b = BoxedUint::from_limbs(vec![1]);
+        let s = a.add(&b);
+        assert_eq!(s.limbs, vec![0, 0, 1]);
+        assert_eq!(s.limbs.capacity(), 3);
+        let t = b.add(&a);
+        assert_eq!(t, s);
+        // No carry out: the top limb is zero but still present.
+        let u = BoxedUint::from_u64(2).add(&BoxedUint::from_u64(3));
+        assert_eq!(u.limbs, vec![5, 0]);
+        assert_eq!(u.limbs.capacity(), 2);
     }
 
     #[test]
