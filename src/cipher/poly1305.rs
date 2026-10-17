@@ -877,6 +877,7 @@ mod tests {
     }
 
     /// Small deterministic PRNG for keys and data (not security relevant).
+    #[cfg(feature = "alloc")]
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;
         *state ^= *state >> 7;
@@ -888,6 +889,7 @@ mod tests {
     /// `Uint`-free arithmetic — `u128` limbs are not enough for 2¹³⁰, so
     /// this evaluates with a tiny 192-bit (three `u64`) big integer. Slow,
     /// but unrelated to any limb layout above.
+    #[cfg(feature = "alloc")]
     fn reference_tag(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
         // 192-bit helpers: value = [lo, mid, hi], little-endian limbs.
         type W = [u64; 3];
@@ -965,6 +967,7 @@ mod tests {
     /// straddles the leftover buffer, the two-stripe / vector paths and the
     /// single-block tail, must match the independent big-integer reference.
     /// This pins the radix-2⁴⁴ two-stripe fold and the AVX2 kernel alike.
+    #[cfg(feature = "alloc")]
     #[test]
     fn all_lengths_match_reference() {
         use alloc::vec::Vec;

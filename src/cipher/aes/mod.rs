@@ -370,7 +370,7 @@ impl AesRounds {
 
     /// Forces the portable round. Test-only, for differential checks of the
     /// hardware kernels against the reference construction.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "alloc"))]
     pub(crate) fn software() -> Self {
         AesRounds {
             backend: AesBackend::Software,

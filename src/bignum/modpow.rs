@@ -175,7 +175,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// for any chunk `c < R`, and `M(acc·R) = mont_mul(M(acc), R²)`, so each
     /// chunk costs two Montgomery multiplications plus a modular addition,
     /// and one final `from_mont` undoes the domain — the fixed-width
-    /// counterpart of [`BoxedMontModulus::reduce`](super::BoxedMontModulus::reduce).
+    /// counterpart of [`BoxedMontModulus::reduce`].
     /// For the RSA CRT split (a 2048-bit value mod a 1024-bit prime held in
     /// the same `Uint<32>`) that is five half-width multiplies instead of
     /// the 2048 trial subtractions of [`Uint::reduce`].
@@ -184,6 +184,16 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// `LIMBS` and the (public) width of `N`; the arithmetic is the masked
     /// kernel and add/select code, so neither `x` nor a secret `N` steers
     /// anything.
+    #[cfg_attr(
+        feature = "alloc",
+        doc = "",
+        doc = "[`BoxedMontModulus::reduce`]: super::BoxedMontModulus::reduce"
+    )]
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[`BoxedMontModulus::reduce`]: crate#no_std"
+    )]
     pub fn reduce(&self, x: &Uint<LIMBS>) -> Uint<LIMBS> {
         let s = self.limbs();
         let xl = x.as_limbs();

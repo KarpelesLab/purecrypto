@@ -320,7 +320,7 @@ impl P256 {
     /// identity, and the result is correct for every such pair — equal and
     /// opposite points included. One multiplication and six additions
     /// cheaper than [`Self::point_add`] (11M + 2m_b vs 12M + 2m_b).
-    #[cfg(any(test, feature = "p256-table"))]
+    #[cfg(feature = "p256-table")]
     fn add_mixed(&self, p: &Point, x2: &Fe, y2: &Fe) -> Point {
         let b = self.b;
         let mut t0 = self.mul(&p.x, x2);

@@ -739,7 +739,7 @@ mod tests {
     /// The NEON 2×4-way keystream must equal the scalar block path for every
     /// length in `0..=1024` (partial blocks, partial 4- and 8-block groups)
     /// plus larger buffers, across counter values near the 32-bit boundary.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "alloc"))]
     #[test]
     fn neon_matches_scalar() {
         use alloc::vec::Vec;

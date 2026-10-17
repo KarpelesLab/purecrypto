@@ -500,6 +500,7 @@ mod tests {
         assert_eq!(rounds_for(521), 22);
     }
 
+    #[cfg(feature = "alloc")]
     fn hex_wide<const L: usize>(s: &str) -> Uint<L> {
         let bytes: alloc::vec::Vec<u8> = (0..s.len())
             .step_by(2)
@@ -511,6 +512,7 @@ mod tests {
     /// Wider moduli: the P-384 and P-521 field primes and group orders,
     /// against Fermat, on edges, powers of two and random residues; the
     /// signed-62 conversions round-trip; the round counts match the bound.
+    #[cfg(feature = "alloc")]
     fn wide_matches_fermat<const L: usize>(
         name: &str,
         h: &str,
@@ -559,6 +561,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn matches_fermat_384_and_521() {
         let mut rng = SplitMix64(0x5a3e_9cd1_0384_0521);

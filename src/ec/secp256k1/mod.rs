@@ -333,6 +333,7 @@ impl ProjectivePoint {
     /// that depends on `BITS` alone, so a 64-bit committed value costs a
     /// 64-doubling ladder instead of a 256-bit one (libsecp256k1-zkp's
     /// `ecmult_const(…, 64)`). Bits at or above `BITS` must be clear.
+    #[cfg(feature = "zkp-pedersen")]
     pub(crate) fn mul_bits<const BITS: usize>(&self, scalar: &Scalar) -> ProjectivePoint {
         ProjectivePoint(Point::mul_bits::<_, BITS>(
             &field(),

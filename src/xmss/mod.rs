@@ -548,7 +548,11 @@ mod wots_mb {
 /// over the same inputs (a single WOTS+ key, so they avoid the multi-second
 /// RFC KAT tree builds), for full and random partial chains, through the
 /// dispatched kernel and the lockstep kernel explicitly.
-#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    test,
+    feature = "alloc",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod wots_mb_tests {
     use super::*;
 

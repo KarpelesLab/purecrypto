@@ -707,6 +707,7 @@ mod tests {
 
     /// The four-block batch (and the padded short tail) must equal
     /// block-at-a-time processing for every block count up to two batches.
+    #[cfg(feature = "alloc")]
     #[test]
     fn batched_matches_single() {
         let cipher = Camellia256::new(&[0x5au8; 32]);

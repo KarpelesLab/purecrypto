@@ -707,6 +707,7 @@ mod tests {
     /// small pieces (always the scalar one-leaf path), for both tree hashes.
     /// Sizes straddle the 2-, 3- and 4-leaf boundaries after the 8 KiB root
     /// node, with and without a trailing partial leaf.
+    #[cfg(feature = "alloc")]
     #[test]
     fn multi_leaf_pairs_match_piecewise() {
         for &len in &[

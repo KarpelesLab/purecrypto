@@ -800,7 +800,11 @@ mod wots_shake_mb {
 /// families, for full chains and for random partial chains. On x86_64 the
 /// dispatcher picks the SIMD kernel when the CPU has it; the lockstep kernels
 /// are exercised explicitly as well so both are pinned everywhere.
-#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    test,
+    feature = "alloc",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod wots_mb_tests {
     use super::*;
 
@@ -1632,7 +1636,11 @@ mod fors_shake_mb {
 /// scalar recursion (children of `fors_node_scalar` at layer ≤ 2 never
 /// re-batch), for every set (n = 16/24/32) of both hash families, through the
 /// dispatched kernel and (SHA-2) the lockstep kernels explicitly.
-#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    test,
+    feature = "alloc",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod fors_mb_tests {
     use super::*;
 

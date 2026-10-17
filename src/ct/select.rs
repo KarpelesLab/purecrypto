@@ -239,7 +239,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "alloc")]
+    #[cfg(all(feature = "alloc", feature = "bignum"))]
     #[test]
     fn slice_helpers() {
         assert_eq!(limb_mask(t()), u64::MAX);

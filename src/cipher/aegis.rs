@@ -255,7 +255,7 @@ impl Aegis128 {
 
     /// Forces the portable AES round. Test-only (differential checks of the
     /// hardware bulk kernel against the reference construction).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "alloc"))]
     pub(crate) fn new_software(key: &[u8; 16]) -> Self {
         Aegis128 {
             key: *key,
@@ -535,7 +535,7 @@ impl Aegis128L {
 
     /// Forces the portable AES round. Test-only (differential checks of the
     /// hardware bulk kernel against the reference construction).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "alloc"))]
     pub(crate) fn new_software(key: &[u8; 16]) -> Self {
         Aegis128L {
             key: *key,
@@ -861,7 +861,7 @@ impl Aegis256 {
 
     /// Forces the portable AES round. Test-only (differential checks of the
     /// hardware bulk kernel against the reference construction).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "alloc"))]
     pub(crate) fn new_software(key: &[u8; 32]) -> Self {
         Aegis256 {
             key: *key,
@@ -1023,6 +1023,7 @@ mod aegis128_tests {
     /// The hardware bulk kernel must match the portable construction for
     /// every message/AD length residue (whole blocks, partial tails, AD
     /// tails), both directions, including the tag.
+    #[cfg(feature = "alloc")]
     #[test]
     fn hardware_matches_software() {
         let hw = Aegis128::new(&[0x42u8; 16]);

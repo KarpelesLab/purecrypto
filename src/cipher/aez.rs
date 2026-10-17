@@ -160,7 +160,7 @@ impl Aez {
 
     /// Forces the portable AES round. Test-only (differential checks of the
     /// batched hardware kernel against the reference construction).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "alloc"))]
     pub(crate) fn new_software(key: &[u8]) -> Self {
         let mut aez = Self::new(key);
         aez.rounds = AesRounds::software();

@@ -87,13 +87,13 @@ pub(crate) fn mod_u32_with_recip(v: u64, p: u64, c: u64) -> u64 {
 /// start, but so is how many fresh draws the old loop took: both leak only
 /// the (public) rejection count, and the incremental search is the one
 /// OpenSSL and BoringSSL use.
-#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[cfg(feature = "rsa")]
 pub(crate) const SIEVE_WINDOW: u64 = 1 << 15;
 
 /// Below this many bits the sieve could reject the primes of its own table
 /// (every prime below the bound divides itself), so candidates are drawn and
 /// tested one by one instead.
-#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[cfg(feature = "rsa")]
 pub(crate) const SIEVE_MIN_BITS: usize = 32;
 
 /// Branch-free fold step for counting the trailing zero bits of a

@@ -271,6 +271,7 @@ mod tests {
     /// over `Hmac::new`/`update`/`finalize` (no fast paths), through
     /// instantiate, generate with and without additional input, and reseed —
     /// for SHA-256 (fast short-HMAC path) and SHA-512 (wider block) alike.
+    #[cfg(feature = "alloc")]
     #[test]
     fn matches_textbook_transcription() {
         struct Ref<D: Digest> {

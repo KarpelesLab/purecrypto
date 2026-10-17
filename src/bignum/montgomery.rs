@@ -391,6 +391,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// limbs: the width scan's verdicts — public by convention — are
     /// declassified so the constant-time harness does not see the loop
     /// bounds as secret-derived. Same result as `new`.
+    #[cfg(any(test, feature = "rsa"))]
     pub(crate) fn new_secret(modulus: Uint<LIMBS>) -> Self {
         let n = modulus.as_limbs();
         // A prime's parity is public; declassify the bit the assert reads.

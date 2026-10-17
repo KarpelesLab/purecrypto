@@ -98,6 +98,7 @@ impl TrialDivision {
     /// residues `res = residues(n₀)` and a `delta < 2^31`. Branch-free over
     /// the table (the verdict is public: a rejected candidate is discarded,
     /// as `is_prime_boxed`'s early exits are).
+    #[cfg(any(test, feature = "rsa"))]
     pub(crate) fn passes(&self, res: &[u32], delta: u64) -> bool {
         let mut any_zero: u64 = 0;
         for ((&p, &c), &r) in self.primes.iter().zip(&self.recips).zip(res) {

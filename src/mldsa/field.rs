@@ -23,7 +23,7 @@ pub(crate) const D: u32 = 13;
 pub(crate) const Q_MINUS_1_DIV2: u32 = (Q - 1) / 2;
 
 /// `−q⁻¹ mod 2³²`.
-#[cfg(any(test, feature = "hazmat-mldsa"))]
+#[cfg(feature = "hazmat-mldsa")]
 const Q_NEG_INV: u32 = 4236238847;
 /// `n⁻¹ · R² mod q`, the inverse-NTT scaling factor.
 const INV_N: u32 = 41978;
@@ -48,7 +48,7 @@ pub(crate) fn sub(a: u32, b: u32) -> u32 {
 }
 
 /// Montgomery reduction: `a · R⁻¹ mod q` for `a < q · 2³²`.
-#[cfg(any(test, feature = "hazmat-mldsa"))]
+#[cfg(feature = "hazmat-mldsa")]
 #[inline]
 fn mont_reduce(a: u64) -> u32 {
     let t = (a as u32).wrapping_mul(Q_NEG_INV);
@@ -58,7 +58,7 @@ fn mont_reduce(a: u64) -> u32 {
 /// Montgomery multiplication; with a Montgomery-domain `zeta` argument this
 /// yields the ordinary-domain product. The crate's own code runs the lazy
 /// signed arithmetic below; this canonical form is the `hazmat-mldsa` API.
-#[cfg(any(test, feature = "hazmat-mldsa"))]
+#[cfg(feature = "hazmat-mldsa")]
 #[inline]
 pub(crate) fn mul(a: u32, b: u32) -> u32 {
     mont_reduce(a as u64 * b as u64)
@@ -274,7 +274,7 @@ pub(crate) fn invntt_acc(acc: &mut LPoly) -> Poly {
 }
 
 /// Component-wise product of two NTT-domain polynomials (`a[i]·b[i]·R⁻¹`).
-#[cfg(any(test, feature = "hazmat-mldsa"))]
+#[cfg(feature = "hazmat-mldsa")]
 pub(crate) fn ntt_mul(a: &Poly, b: &Poly) -> Poly {
     let mut c = Poly::zero();
     for i in 0..N {

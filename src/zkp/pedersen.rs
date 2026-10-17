@@ -661,6 +661,7 @@ impl Generator {
     /// Whether [`mul_scalar`](Self::mul_scalar) runs over a comb table (true
     /// for `H` with the `zkp-h-table` feature), so a prover can trade a
     /// variable-base multiplication for fixed-base ones. Public.
+    #[cfg(any(test, feature = "zkp-rangeproof"))]
     pub(crate) fn has_comb(&self) -> bool {
         #[cfg(feature = "zkp-h-table")]
         {
@@ -686,6 +687,7 @@ impl Generator {
 
     /// `k · self` for a full-width secret scalar: the comb over the static
     /// table for `H` with `zkp-h-table`, the constant-time ladder otherwise.
+    #[cfg(any(test, feature = "zkp-rangeproof"))]
     pub(crate) fn mul_scalar(&self, k: &Scalar) -> ProjectivePoint {
         #[cfg(feature = "zkp-h-table")]
         if self.is_h() {
@@ -999,6 +1001,7 @@ mod tests {
 
     /// Big-endian coordinate bytes as little-endian 64-bit limbs (the comb
     /// table layout).
+    #[cfg(feature = "zkp-h-table")]
     fn limbs(be: &[u8; 32]) -> [u64; 4] {
         let l = |i: usize| u64::from_be_bytes(be[32 - 8 * (i + 1)..32 - 8 * i].try_into().unwrap());
         [l(0), l(1), l(2), l(3)]

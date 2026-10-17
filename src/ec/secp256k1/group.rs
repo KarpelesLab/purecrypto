@@ -57,6 +57,7 @@ pub(super) fn signed_window(v: &[u64; 4], w: usize) -> (u64, u64) {
 
 /// `(⌊k/2⌋ with bit `top` set, [k is even])`: the signed-digit preimage of a
 /// scalar of public width (`k < 2^top`), see [`Point::mul_bits`].
+#[cfg(any(test, feature = "secp256k1-table", feature = "zkp-pedersen"))]
 #[inline]
 pub(super) fn half_with_top(k: &[u64; 4], top: usize) -> ([u64; 4], u64) {
     let mut v = *Fe::from_limbs(*k).shr1().as_limbs();
@@ -284,6 +285,7 @@ impl Point {
 
     /// Per-limb masked select: `a` when `mask == 0`, `b` when `mask` is all
     /// ones (one opaque mask for all twelve limbs).
+    #[cfg(any(test, feature = "secp256k1-table", feature = "zkp-pedersen"))]
     #[inline]
     pub(super) fn select_mask(a: &Point, b: &Point, mask: u64) -> Point {
         Point {
@@ -385,6 +387,7 @@ impl Point {
     /// `D(v) = k + (1 − k mod 2)`; a final masked subtraction of `P` corrects
     /// even scalars. Bits of `scalar` at or above `BITS` are the caller's to
     /// keep clear.
+    #[cfg(any(test, feature = "secp256k1-table", feature = "zkp-pedersen"))]
     pub(crate) fn mul_bits<F: FieldBackend, const BITS: usize>(
         f: &F,
         scalar: &[u64; 4],
