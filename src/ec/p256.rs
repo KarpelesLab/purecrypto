@@ -1,9 +1,10 @@
 //! NIST P-256 (secp256r1) field and group arithmetic.
 //!
-//! The base field runs on the native Solinas backend
-//! ([`super::p256_field`]): plain (non-Montgomery) residues in `[0, p)` with
-//! the FIPS 186 fast reduction, so SEC1 encode/decode and the point formulas
-//! share one representation with no conversions.
+//! The base field runs on the native Montgomery backend
+//! ([`super::p256_field`]): every coordinate below is a Montgomery residue
+//! `a·R mod p`, converted once at the SEC1 boundary ([`P256::lift_affine`]
+//! / [`P256::to_affine`]) so the point formulas and the precomputed
+//! generator table never convert.
 
 use super::p256_field as field;
 #[cfg(feature = "p256-table")]
@@ -44,29 +45,21 @@ pub(crate) fn random_scalar<R: RngCore>(rng: &mut R) -> Fe {
 }
 
 // Curve parameters (hex, big-endian).
-const P_HEX: &str = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
 const B_HEX: &str = "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b";
-/// The curve coefficient `b`, decoded at compile time.
-const B: Fe = fe_from_hex(B_HEX);
-// The generator's affine coordinates, test-only: the library takes `G` from
-// `G_AFFINE`, checked against these by `tests::generator_matches_hex`.
-#[cfg(test)]
-const GX_HEX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
-#[cfg(test)]
-const GY_HEX: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
-/// The generator `G` as a comb-table entry: affine `x‖y`, little-endian
-/// 64-bit limbs, plain residues — the same value as `P256_GEN_TABLE[0][0]`.
+/// The curve coefficient `b`, decoded and converted to Montgomery form at
+/// compile time.
+const B: Fe = field::to_mont(&fe_from_hex(B_HEX));
 #[cfg(any(test, not(feature = "p256-table")))]
-const G_AFFINE: [u64; 8] = [
-    0xf4a13945d898c296,
-    0x77037d812deb33a0,
-    0xf8bce6e563a440f2,
-    0x6b17d1f2e12c4247,
-    0xcbb6406837bf51f5,
-    0x2bce33576b315ece,
-    0x8ee7eb4a7c0f9e16,
-    0x4fe342e2fe1a7f9b,
-];
+const GX_HEX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
+#[cfg(any(test, not(feature = "p256-table")))]
+const GY_HEX: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+/// The generator's affine coordinates in Montgomery form (compile-time
+/// conversion of the FIPS 186 hex) — the same values as
+/// `P256_GEN_TABLE[0][0]`.
+#[cfg(any(test, not(feature = "p256-table")))]
+const GX: Fe = field::to_mont(&fe_from_hex(GX_HEX));
+#[cfg(any(test, not(feature = "p256-table")))]
+const GY: Fe = field::to_mont(&fe_from_hex(GY_HEX));
 const N_HEX: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
 /// The group order `n`, decoded at compile time.
 const ORDER: Fe = fe_from_hex(N_HEX);
@@ -82,7 +75,7 @@ pub(crate) const fn fe_from_hex(hex: &str) -> Fe {
 }
 
 /// A point in projective coordinates `(X : Y : Z)` with field elements held
-/// as plain residues in `[0, p)`. The identity is `(0 : 1 : 0)`.
+/// in Montgomery form. The identity is `(0 : 1 : 0)`.
 #[derive(Clone, Copy)]
 pub(crate) struct Point {
     x: Fe,
@@ -144,15 +137,15 @@ impl P256 {
     }
 
     /// The field prime `p`.
-    pub(crate) fn field_modulus() -> Fe {
-        fe_from_hex(P_HEX)
+    pub(crate) const fn field_modulus() -> Fe {
+        field::P
     }
 
     /// The identity point `(0 : 1 : 0)`.
     pub(crate) fn identity(&self) -> Point {
         Point {
             x: Fe::ZERO,
-            y: Fe::ONE,
+            y: field::ONE,
             z: Fe::ZERO,
         }
     }
@@ -161,21 +154,25 @@ impl P256 {
     /// `G` through [`Self::mul_generator`] and never needs the point itself.
     #[cfg(any(test, not(feature = "p256-table")))]
     pub(crate) fn generator(&self) -> Point {
-        let x = Fe::from_limbs([G_AFFINE[0], G_AFFINE[1], G_AFFINE[2], G_AFFINE[3]]);
-        let y = Fe::from_limbs([G_AFFINE[4], G_AFFINE[5], G_AFFINE[6], G_AFFINE[7]]);
-        self.lift_affine(&x, &y)
-    }
-
-    /// Lifts an affine point `(x, y)` to projective form.
-    pub(crate) fn lift_affine(&self, x: &Fe, y: &Fe) -> Point {
         Point {
-            x: *x,
-            y: *y,
-            z: Fe::ONE,
+            x: GX,
+            y: GY,
+            z: field::ONE,
         }
     }
 
-    /// Converts a point to affine `(x, y)`, or `None` if it is the identity.
+    /// Lifts an affine point `(x, y)` — plain residues `< p`, as SEC1
+    /// decodes them — to projective form in Montgomery representation.
+    pub(crate) fn lift_affine(&self, x: &Fe, y: &Fe) -> Point {
+        Point {
+            x: field::to_mont(x),
+            y: field::to_mont(y),
+            z: field::ONE,
+        }
+    }
+
+    /// Converts a point to affine `(x, y)` as plain residues (the SEC1
+    /// encoding's form), or `None` if it is the identity.
     ///
     /// The inversion is the fixed-schedule safegcd [`field::invert`] —
     /// constant time by construction, NOT the variable-time
@@ -191,8 +188,8 @@ impl P256 {
             return None;
         }
         let z_inv = field::invert(&point.z);
-        let x = field::mul(&point.x, &z_inv);
-        let y = field::mul(&point.y, &z_inv);
+        let x = field::from_mont(&field::mul(&point.x, &z_inv));
+        let y = field::from_mont(&field::mul(&point.y, &z_inv));
         Some((x, y))
     }
 
@@ -386,7 +383,7 @@ impl P256 {
                 let cand = Point {
                     x: Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]),
                     y: Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]),
-                    z: Fe::ONE,
+                    z: field::ONE,
                 };
                 sel = Point::conditional_select(&cand, &sel, (j + 1).ct_eq(&digit));
             }
@@ -499,7 +496,7 @@ impl P256 {
                 let cand = Point {
                     x: Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]),
                     y: Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]),
-                    z: Fe::ONE,
+                    z: field::ONE,
                 };
                 acc = self.point_add(&acc, &cand);
             }
@@ -528,13 +525,14 @@ impl P256 {
         acc
     }
 
-    /// Tests whether affine `(x, y)` satisfies the curve equation
-    /// `y^2 = x^3 - 3x + b (mod p)`.
+    /// Tests whether affine `(x, y)` (plain residues `< p`) satisfies the
+    /// curve equation `y^2 = x^3 - 3x + b (mod p)`.
     pub(crate) fn is_on_curve(&self, x: &Fe, y: &Fe) -> bool {
-        let three = Fe::from_u64(3);
-        let lhs = field::square(y);
-        let x3 = field::mul(&field::square(x), x);
-        let three_x = field::mul(&three, x);
+        let x = field::to_mont(x);
+        let y = field::to_mont(y);
+        let lhs = field::square(&y);
+        let x3 = field::mul(&field::square(&x), &x);
+        let three_x = field::add(&field::add(&x, &x), &x);
         let rhs = field::add(&field::sub(&x3, &three_x), &self.b);
         bool::from(lhs.ct_eq(&rhs))
     }
@@ -635,9 +633,10 @@ mod tests {
     fn generator_matches_hex() {
         let curve = P256::new();
         let g = curve.generator();
-        assert_eq!(g.x, fe_from_hex(GX_HEX));
-        assert_eq!(g.y, fe_from_hex(GY_HEX));
-        assert!(curve.is_on_curve(&g.x, &g.y));
+        let (gx, gy) = curve.to_affine(&g).unwrap();
+        assert_eq!(gx, fe_from_hex(GX_HEX));
+        assert_eq!(gy, fe_from_hex(GY_HEX));
+        assert!(curve.is_on_curve(&gx, &gy));
     }
 
     /// Re-derives every entry of the embedded fixed-base table from the
@@ -798,10 +797,10 @@ mod tests {
                     .to_affine(&acc)
                     .expect("table entry is never identity");
                 print!("        [");
-                for l in x.as_limbs() {
+                for l in field::to_mont(&x).as_limbs() {
                     print!("0x{l:016x}, ");
                 }
-                for l in y.as_limbs() {
+                for l in field::to_mont(&y).as_limbs() {
                     print!("0x{l:016x}, ");
                 }
                 println!("],");
@@ -828,5 +827,92 @@ mod tests {
             assert!(!bool::from(d.is_zero()), "scalar must be nonzero");
             assert!(bool::from(d.ct_lt(&n)), "scalar must be < n");
         }
+    }
+
+    /// Manual microbenchmark of the group operations and the P-256 users
+    /// (`cargo test --release --all-features microbench_group_ops -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "manual microbenchmark"]
+    #[cfg(feature = "std")]
+    fn microbench_group_ops() {
+        use crate::ec::ecdh::EcdhPrivateKey;
+        use crate::ec::ecdsa::EcdsaPrivateKey;
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        use core::hint::black_box;
+        use std::println;
+        use std::time::Instant;
+
+        fn time<F: FnMut()>(name: &str, iters: u32, mut f: F) {
+            for _ in 0..(iters / 10).max(1) {
+                f();
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+            if ns < 10_000.0 {
+                println!("  {name:<36} {ns:>10.1} ns/op");
+            } else {
+                println!("  {name:<36} {:>10.2} us/op", ns / 1000.0);
+            }
+        }
+
+        let curve = P256::new();
+        let n = P256::order();
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-microbench", b"nonce", &[]);
+        let mut rand_fe = || {
+            let mut limbs = [0u64; 4];
+            for l in &mut limbs {
+                *l = rng.next_u64();
+            }
+            Fe::from_limbs(limbs).reduce(&n)
+        };
+        let k1 = rand_fe();
+        let k2 = rand_fe();
+        let (qx, qy) = curve.to_affine(&curve.mul_generator(&k2)).unwrap();
+        let qa = curve.lift_affine(&qx, &qy);
+        let q = curve.mul_generator(&k2);
+
+        let mut p = q;
+        time("point_add", 500_000, || p = curve.point_add(&p, &qa));
+        black_box(p);
+        let mut p = q;
+        time("double", 500_000, || p = curve.double(&p));
+        black_box(p);
+        time("to_affine", 20_000, || {
+            black_box(curve.to_affine(black_box(&q)));
+        });
+        time("scalar_mul (CT)", 2_000, || {
+            black_box(curve.scalar_mul(black_box(&k1), black_box(&qa)));
+        });
+        time("mul_generator (CT)", 5_000, || {
+            black_box(curve.mul_generator(black_box(&k1)));
+        });
+        time("mul_double_vartime", 2_000, || {
+            black_box(curve.mul_double_vartime(black_box(&k1), black_box(&k2), black_box(&qa)));
+        });
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-microbench-keys", b"nonce", &[]);
+        let sk = EcdsaPrivateKey::generate(&mut rng);
+        let pk = sk.public_key();
+        let msg = b"hello world, this is a benchmark message of modest length";
+        let sig = sk.sign::<Sha256>(msg).unwrap();
+        time("ECDSA sign", 5_000, || {
+            black_box(sk.sign::<Sha256>(black_box(msg)).unwrap());
+        });
+        time("ECDSA verify", 2_000, || {
+            pk.verify::<Sha256>(black_box(msg), black_box(&sig))
+                .unwrap();
+        });
+        let e1 = EcdhPrivateKey::generate(&mut rng);
+        let p2 = EcdhPrivateKey::generate(&mut rng).public_key();
+        time("ECDH public_key", 5_000, || {
+            black_box(e1.public_key());
+        });
+        time("ECDH diffie_hellman", 2_000, || {
+            black_box(e1.diffie_hellman(black_box(&p2)).unwrap());
+        });
     }
 }

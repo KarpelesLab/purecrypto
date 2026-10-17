@@ -1,35 +1,45 @@
-//! Native base-field arithmetic for NIST P-256, specialised to the Solinas
-//! prime `p = 2²⁵⁶ − 2²²⁴ + 2¹⁹² + 2⁹⁶ − 1`.
+//! Native base-field arithmetic for NIST P-256 over the prime
+//! `p = 2²⁵⁶ − 2²²⁴ + 2¹⁹² + 2⁹⁶ − 1`, in Montgomery form.
 //!
-//! This replaces the generic saturated-Montgomery [`MontModulus`] CIOS core on
-//! the P-256 hot path, mirroring the structure of the secp256k1 native backend
-//! (`src/ec/secp256k1/field_backend.rs`): field elements are plain
-//! (non-Montgomery) residues in `[0, p)`, stored as four little-endian `u64`
-//! limbs — the exact representation the SEC1 codec serialises, so boundary
-//! conversions vanish. Multiplication is a schoolbook 256×256→512 product
-//! followed by the FIPS 186 / Solinas fast reduction: the 512-bit product's
-//! sixteen 32-bit words are folded through nine fixed signed word
-//! combinations (`s₁ + 2s₂ + 2s₃ + s₄ + s₅ − s₆ − s₇ − s₈ − s₉`), an `8p`
-//! offset keeps the running value non-negative, and the small (≤ 4-bit)
-//! overflow past 2²⁵⁶ is folded back through `2²⁵⁶ ≡ 2²²⁴ − 2¹⁹² − 2⁹⁶ + 1`.
+//! Field elements are held as **Montgomery residues** `a·R mod p` with
+//! `R = 2²⁵⁶`, four little-endian `u64` limbs in `[0, p)`. Multiplication is
+//! a schoolbook 256×256→512 product followed by a word-serial Montgomery
+//! reduction specialised to `p`: because `p ≡ −1 (mod 2⁶⁴)` the Montgomery
+//! constant is `n' = −p⁻¹ mod 2⁶⁴ = 1`, so each of the four reduction steps
+//! takes its multiplier straight from the lowest live limb, and `m·p =
+//! m·2²⁵⁶ − m·2²²⁴ + m·2¹⁹² + m·2⁹⁶ − m` adds into the accumulator through two
+//! shifted terms (limb `i` is cleared exactly, limb `i+1` gains `m·2³²`, limb
+//! `i+3` gains `m·(2⁶⁴ − 2³² + 1)`), never a general 64×64 multiply. This
+//! replaced the FIPS 186 / Solinas fold of the plain-residue backend (kept
+//! below as the `#[cfg(test)]` oracle `mul_solinas`): the Solinas fold costs
+//! nine signed 32-bit word recombinations plus a `+8p` offset and a second
+//! fold, about 14 ns on its own, where the Montgomery pass is four fixed
+//! shift-and-add steps.
+//!
+//! Only the SEC1 boundaries convert: [`to_mont`] on decode / [`from_mont`]
+//! on encode (each one multiplication), so the point formulas run entirely
+//! in Montgomery form and the precomputed generator table is stored in it.
 //!
 //! Everything is constant time in the element values: all loop bounds are
-//! fixed, folds run a fixed number of times, and the final canonicalisation
-//! uses mask-based conditional subtractions. Inversion is the Bernstein–Yang
-//! safegcd over a fixed 590-divstep schedule ([`SafegcdModulus`]), ~3.8×
-//! faster than the fixed addition-chain Fermat exponentiation it replaced
-//! (kept as the test oracle `invert_chain`).
+//! fixed, carries propagate on a fixed schedule, and the final
+//! canonicalisation is a mask-based conditional subtraction. Inversion is
+//! the Bernstein–Yang safegcd over a fixed 590-divstep schedule
+//! ([`SafegcdModulus`]) on the Montgomery representative, corrected back
+//! into Montgomery form by one multiplication with `R³`.
 //!
 //! The generic-Montgomery path is retained under `#[cfg(test)]` as a
 //! differential oracle: every operation is cross-checked against
-//! [`MontModulus`] over edge values and large deterministic random batches.
+//! [`MontModulus`] (which uses the same `R`, so Montgomery products compare
+//! limb-for-limb) and the previous Solinas kernel over edge values and large
+//! deterministic random batches.
 //!
 //! [`MontModulus`]: crate::bignum::MontModulus
 
 use crate::bignum::Uint;
 use crate::bignum::safegcd::SafegcdModulus;
 
-/// A 256-bit base-field element, four little-endian 64-bit limbs, in `[0, p)`.
+/// A 256-bit base-field element in Montgomery form (`a·R mod p`, `R = 2²⁵⁶`),
+/// four little-endian 64-bit limbs in `[0, p)`.
 pub(crate) type Fe = Uint<4>;
 
 /// The prime `p = 2²⁵⁶ − 2²²⁴ + 2¹⁹² + 2⁹⁶ − 1` as little-endian 64-bit limbs.
@@ -40,20 +50,40 @@ pub(crate) const P_LIMBS: [u64; 4] = [
     0xFFFF_FFFF_0000_0001,
 ];
 
-/// The folding constant `K = 2²⁵⁶ − p = 2²²⁴ − 2¹⁹² − 2⁹⁶ + 1`, so that
-/// `2²⁵⁶ ≡ K (mod p)`: overflow past 256 bits is folded back by multiplying
-/// it by `K` and adding it in (`K < 2²²⁵`, so a ≤ 4-bit overflow folds to
-/// `< 2²²⁹`, leaving at most a single carry bit for the final reduction).
-const K_LIMBS: [u64; 4] = [
+/// The prime `p` as a [`Uint`].
+pub(crate) const P: Fe = Fe::from_limbs(P_LIMBS);
+
+/// `R mod p = 2²⁵⁶ − p = 2²²⁴ − 2¹⁹² − 2⁹⁶ + 1`: the Montgomery form of `1`.
+const R_LIMBS: [u64; 4] = [
     0x0000_0000_0000_0001,
     0xFFFF_FFFF_0000_0000,
     0xFFFF_FFFF_FFFF_FFFF,
     0x0000_0000_FFFF_FFFE,
 ];
 
+/// The field element `1` in Montgomery form (`R mod p`).
+pub(crate) const ONE: Fe = Fe::from_limbs(R_LIMBS);
+
+/// `R² mod p`, the [`to_mont`] multiplier, derived at compile time by 256
+/// modular doublings of `R mod p`.
+const R2: Fe = {
+    let mut x = R_LIMBS;
+    let mut i = 0;
+    while i < 256 {
+        x = double_mod_p(&x);
+        i += 1;
+    }
+    Fe::from_limbs(x)
+};
+
+/// `R³ mod p`: turns the safegcd inverse of a Montgomery representative
+/// (`(aR)⁻¹ = a⁻¹R⁻¹`) back into Montgomery form (`a⁻¹R`) with one
+/// multiplication (`a⁻¹R⁻¹ · R³ · R⁻¹`).
+const R3: Fe = mul(&R2, &R2);
+
 /// Returns an all-ones/all-zeros `u64` mask from a 0/1 bit.
-#[inline]
-fn mask_from_bit(bit: u64) -> u64 {
+#[inline(always)]
+const fn mask_from_bit(bit: u64) -> u64 {
     0u64.wrapping_sub(bit & 1)
 }
 
@@ -61,8 +91,8 @@ fn mask_from_bit(bit: u64) -> u64 {
 /// operand is `hi·2²⁵⁶ + r`, `hi ∈ {0, 1}`), returning the difference limbs
 /// and a `0/0xFFFF…FF` mask that is all-ones iff `hi·2²⁵⁶ + r >= p` (i.e. the
 /// subtraction did not underflow).
-#[inline]
-fn sub_p_mask(r: &[u64; 4], hi: u64) -> ([u64; 4], u64) {
+#[inline(always)]
+const fn sub_p_mask(r: &[u64; 4], hi: u64) -> ([u64; 4], u64) {
     let mut out = [0u64; 4];
     let mut borrow: u128 = 0;
     let mut i = 0;
@@ -79,8 +109,8 @@ fn sub_p_mask(r: &[u64; 4], hi: u64) -> ([u64; 4], u64) {
 }
 
 /// Selects `a` when `mask == 0` and `b` when `mask == 0xFFFF…FF`, per limb.
-#[inline]
-fn select(a: &[u64; 4], b: &[u64; 4], mask: u64) -> [u64; 4] {
+#[inline(always)]
+const fn select(a: &[u64; 4], b: &[u64; 4], mask: u64) -> [u64; 4] {
     let mut out = [0u64; 4];
     let mut i = 0;
     while i < 4 {
@@ -95,112 +125,28 @@ fn select(a: &[u64; 4], b: &[u64; 4], mask: u64) -> [u64; 4] {
 /// conditional subtraction of `p` (a value `< 2p` needs at most one). The
 /// subtraction runs unconditionally and selects via a mask, so there is no
 /// secret-dependent branch.
-#[inline]
-fn reduce_once(r: [u64; 4], hi: u64) -> [u64; 4] {
+#[inline(always)]
+const fn reduce_once(r: [u64; 4], hi: u64) -> [u64; 4] {
     let (diff, mask) = sub_p_mask(&r, hi);
     select(&r, &diff, mask)
 }
 
-/// Adds `m·K` into the four limbs `r`, returning the new limbs and the 0/1
-/// carry out of the top limb (`m <= 14`, so `m·K < 2²²⁹` and the carry out is
-/// at most one).
-#[inline]
-fn add_mul_k(r: &[u64; 4], m: u64) -> ([u64; 4], u64) {
-    let mut out = [0u64; 4];
-    let mut carry: u128 = 0;
+/// `2a mod p` for `a < p` (compile-time constant derivation only).
+const fn double_mod_p(a: &[u64; 4]) -> [u64; 4] {
+    let mut r = [0u64; 4];
+    let mut carry = 0u64;
     let mut i = 0;
     while i < 4 {
-        let acc = (r[i] as u128) + (m as u128) * (K_LIMBS[i] as u128) + carry;
-        out[i] = acc as u64;
-        carry = acc >> 64;
+        r[i] = (a[i] << 1) | carry;
+        carry = a[i] >> 63;
         i += 1;
     }
-    (out, carry as u64)
-}
-
-/// Folds a 512-bit product (eight little-endian limbs) down to canonical
-/// `[0, p)` via the FIPS 186 / Solinas fast reduction for P-256.
-///
-/// With `A₀..A₁₅` the sixteen little-endian 32-bit words of the product, the
-/// reduction is `s₁ + 2s₂ + 2s₃ + s₄ + s₅ − s₆ − s₇ − s₈ − s₉ (mod p)` for the
-/// nine fixed word recombinations of FIPS 186-4 §D.2.3. Each output word's
-/// signed coefficient sum is accumulated in an `i128` together with the
-/// matching word of a global `+8p` offset (the negative terms total
-/// `> −4·2²⁵⁶ > −8p`, so the offset keeps the final value non-negative;
-/// the positive terms total `< 7·2²⁵⁶`, so the offset value stays
-/// `< 15·2²⁵⁶`). Carries between words use arithmetic shifts (fixed
-/// schedule). The resulting ≤ 4-bit overflow `hi` past 2²⁵⁶ is folded back
-/// through `2²⁵⁶ ≡ K`, and the final masked subtraction canonicalises.
-#[inline]
-fn reduce512(t: &[u64; 8]) -> [u64; 4] {
-    // Split into sixteen 32-bit words held as i64 (every value < 2³², and
-    // each per-word signed sum below stays within ±2³⁵, far inside i64).
-    let a0 = (t[0] & 0xFFFF_FFFF) as i64;
-    let a1 = (t[0] >> 32) as i64;
-    let a2 = (t[1] & 0xFFFF_FFFF) as i64;
-    let a3 = (t[1] >> 32) as i64;
-    let a4 = (t[2] & 0xFFFF_FFFF) as i64;
-    let a5 = (t[2] >> 32) as i64;
-    let a6 = (t[3] & 0xFFFF_FFFF) as i64;
-    let a7 = (t[3] >> 32) as i64;
-    let a8 = (t[4] & 0xFFFF_FFFF) as i64;
-    let a9 = (t[4] >> 32) as i64;
-    let a10 = (t[5] & 0xFFFF_FFFF) as i64;
-    let a11 = (t[5] >> 32) as i64;
-    let a12 = (t[6] & 0xFFFF_FFFF) as i64;
-    let a13 = (t[6] >> 32) as i64;
-    let a14 = (t[7] & 0xFFFF_FFFF) as i64;
-    let a15 = (t[7] >> 32) as i64;
-
-    // Per-word signed coefficient sums of s₁ + 2s₂ + 2s₃ + s₄ + s₅ − s₆ − s₇
-    // − s₈ − s₉ (FIPS 186-4 §D.2.3), little-endian word order.
-    let w0 = a0 + a8 + a9 - a11 - a12 - a13 - a14;
-    let w1 = a1 + a9 + a10 - a12 - a13 - a14 - a15;
-    let w2 = a2 + a10 + a11 - a13 - a14 - a15;
-    let w3 = a3 + 2 * (a11 + a12) + a13 - a15 - a8 - a9;
-    let w4 = a4 + 2 * (a12 + a13) + a14 - a9 - a10;
-    let w5 = a5 + 2 * (a13 + a14) + a15 - a10 - a11;
-    let w6 = a6 + a13 + 3 * a14 + 2 * a15 - a8 - a9;
-    let w7 = a7 + a8 + 3 * a15 - a10 - a11 - a12 - a13;
-
-    // Add the +8p offset and propagate carries at 64-bit limb granularity
-    // (each limb pairs two words: w_{2k} + w_{2k+1}·2³², |w_j| < 2³⁵, so the
-    // i128 accumulator stays within ±2⁶⁹ plus carries). Arithmetic shifts
-    // give signed carries; the fixed 4-step schedule is data-independent.
-    // 8p = 7·2²⁵⁶ + [0xFFFF_FFFF_FFFF_FFF8, 0x0000_0007_FFFF_FFFF, 0,
-    //                0xFFFF_FFF8_0000_0008].
-    const P8: [u64; 4] = [
-        0xFFFF_FFFF_FFFF_FFF8,
-        0x0000_0007_FFFF_FFFF,
-        0,
-        0xFFFF_FFF8_0000_0008,
-    ];
-    const P8_TOP: u64 = 7;
-
-    let mut r = [0u64; 4];
-    let acc = (w0 as i128) + ((w1 as i128) << 32) + (P8[0] as i128);
-    r[0] = acc as u64;
-    let acc = (w2 as i128) + ((w3 as i128) << 32) + (P8[1] as i128) + (acc >> 64);
-    r[1] = acc as u64;
-    let acc = (w4 as i128) + ((w5 as i128) << 32) + (P8[2] as i128) + (acc >> 64);
-    r[2] = acc as u64;
-    let acc = (w6 as i128) + ((w7 as i128) << 32) + (P8[3] as i128) + (acc >> 64);
-    r[3] = acc as u64;
-    // The offset value is in [0, 15·2²⁵⁶), so the top carry is in [0, 14].
-    let hi = ((acc >> 64) as u64).wrapping_add(P8_TOP);
-
-    // Fold the overflow through 2²⁵⁶ ≡ K once: the result `c1·2²⁵⁶ + r` has
-    // `c1 <= 1` and is < 2²⁵⁶ + 14·K < 2p, which is exactly reduce_once's
-    // precondition — its masked `−p` absorbs the carry bit and canonicalises
-    // (when c1 = 1 the low part is < 2²²⁹, so the subtraction lands in
-    // [0, K + 2²²⁹) ⊂ [0, p); when c1 = 0 the value is < 2²⁵⁶ < 2p).
-    let (r, c1) = add_mul_k(&r, hi);
-    reduce_once(r, c1)
+    reduce_once(r, carry)
 }
 
 /// Schoolbook 256×256→512 multiply of two little-endian 4-limb operands.
-#[inline]
-fn mul_wide(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
+#[inline(always)]
+const fn mul_wide(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
     let mut t = [0u64; 8];
     let mut i = 0;
     while i < 4 {
@@ -222,8 +168,8 @@ fn mul_wide(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
 /// doubled (the cross sum is `< 2⁵¹¹`, so the shift cannot overflow), then the
 /// four diagonal squares are added in. Saves six of the sixteen schoolbook
 /// word multiplies versus `mul_wide(a, a)`.
-#[inline]
-fn sqr_wide(a: &[u64; 4]) -> [u64; 8] {
+#[inline(always)]
+const fn sqr_wide(a: &[u64; 4]) -> [u64; 8] {
     let mut t = [0u64; 8];
 
     // Cross products a[i]·a[j] for i < j, accumulated at position i + j.
@@ -275,7 +221,47 @@ fn sqr_wide(a: &[u64; 4]) -> [u64; 8] {
     t
 }
 
-/// Returns `(a + b) mod p`. Operands must be in `[0, p)`.
+/// Montgomery reduction of a 512-bit product `t < p·2²⁵⁶` (true of any
+/// product of two residues `< p`): returns `t·R⁻¹ mod p` in canonical
+/// `[0, p)` form.
+///
+/// Word-serial (`i = 0..4`): with `m = t[i]` (the Montgomery constant is
+/// `n' = 1` because `p ≡ −1 mod 2⁶⁴`), `t += m·p·2⁶⁴ⁱ` clears limb `i`
+/// exactly — `t[i] + m·(2⁶⁴ − 1) = m·2⁶⁴` — and the carried `m` folds into
+/// the next limb's `m·(2³² − 1)` to make `m·2³²`; limb `i+2` only takes the
+/// carry (`p`'s third limb is zero) and limb `i+3` takes `m·(2⁶⁴ − 2³² + 1)`,
+/// formed by shifts. The carry out of limb `i+3` is not propagated to the
+/// top: it belongs to limb `i+4`, which is exactly the limb the next step
+/// updates last, so it rides along as that step's extra addend (the `u128`
+/// sum stays below `2¹²⁸ − 2⁹⁶ + 3·2⁶⁴`, so it cannot overflow); only the
+/// last step's carry needs an explicit add into limb 7. After four steps
+/// the low 256 bits are zero and `t[4..8]` plus the carry-out is `< 2p`,
+/// so one masked subtraction canonicalises.
+#[inline(always)]
+const fn mont_reduce(t: &[u64; 8]) -> [u64; 4] {
+    let mut acc = *t;
+    let mut carry: u128 = 0;
+    let mut i = 0;
+    while i < 4 {
+        let m = acc[i];
+        // Limb i: acc[i] + m·(2⁶⁴ − 1) = m·2⁶⁴ — zero, carry m.
+        // Limb i+1: acc[i+1] + m·(2³² − 1) + m = acc[i+1] + m·2³².
+        let r = (acc[i + 1] as u128) + ((m as u128) << 32);
+        acc[i + 1] = r as u64;
+        let r = (acc[i + 2] as u128) + (r >> 64);
+        acc[i + 2] = r as u64;
+        let m3 = ((m as u128) << 64) + (m as u128) - ((m as u128) << 32);
+        let r = (acc[i + 3] as u128) + m3 + (r >> 64) + carry;
+        acc[i + 3] = r as u64;
+        carry = r >> 64;
+        i += 1;
+    }
+    let r = (acc[7] as u128) + carry;
+    reduce_once([acc[4], acc[5], acc[6], r as u64], (r >> 64) as u64)
+}
+
+/// Returns `(a + b) mod p`. Operands must be in `[0, p)` (representation
+/// agnostic: Montgomery form is closed under addition).
 #[inline]
 pub(crate) fn add(a: &Fe, b: &Fe) -> Fe {
     let a = a.as_limbs();
@@ -289,7 +275,7 @@ pub(crate) fn add(a: &Fe, b: &Fe) -> Fe {
         carry = acc >> 64;
         i += 1;
     }
-    // Sum < 2p < 2·2²⁵⁶; reduce_once's two masked −p restore [0, p).
+    // Sum < 2p; reduce_once's masked −p restores [0, p).
     Fe::from_limbs(reduce_once(r, carry as u64))
 }
 
@@ -342,16 +328,29 @@ pub(crate) fn negate(a: &Fe) -> Fe {
     Fe::from_limbs(select(&r, &[0u64; 4], zero_mask))
 }
 
-/// Returns `(a * b) mod p`. Operands must be in `[0, p)`.
+/// Montgomery product `a·b·R⁻¹ mod p`: the Montgomery form of the product of
+/// two Montgomery-form operands. Operands must be in `[0, p)`.
 #[inline]
-pub(crate) fn mul(a: &Fe, b: &Fe) -> Fe {
-    Fe::from_limbs(reduce512(&mul_wide(a.as_limbs(), b.as_limbs())))
+pub(crate) const fn mul(a: &Fe, b: &Fe) -> Fe {
+    Fe::from_limbs(mont_reduce(&mul_wide(a.as_limbs(), b.as_limbs())))
 }
 
-/// Returns `a² mod p`. The operand must be in `[0, p)`.
+/// Montgomery square `a²·R⁻¹ mod p`. The operand must be in `[0, p)`.
 #[inline]
-pub(crate) fn square(a: &Fe) -> Fe {
-    Fe::from_limbs(reduce512(&sqr_wide(a.as_limbs())))
+pub(crate) const fn square(a: &Fe) -> Fe {
+    Fe::from_limbs(mont_reduce(&sqr_wide(a.as_limbs())))
+}
+
+/// Converts a plain residue `a < p` into Montgomery form `a·R mod p`.
+#[inline]
+pub(crate) const fn to_mont(a: &Fe) -> Fe {
+    mul(a, &R2)
+}
+
+/// Converts a Montgomery-form element back into the plain residue `a < p`.
+#[inline]
+pub(crate) const fn from_mont(a: &Fe) -> Fe {
+    mul(a, &Fe::ONE)
 }
 
 /// Squares `a` a fixed `n` times.
@@ -368,18 +367,22 @@ fn sqn(a: &Fe, n: u32) -> Fe {
 }
 
 /// The safegcd inversion context for `p`, built at compile time.
-const SAFEGCD_P: SafegcdModulus = SafegcdModulus::new(&Fe::from_limbs(P_LIMBS));
+const SAFEGCD_P: SafegcdModulus = SafegcdModulus::new(&P);
 
-/// Returns the modular inverse `a⁻¹ mod p` for `a` in `[0, p)`; the inverse
-/// of `0` is `0`. Bernstein–Yang safegcd: a fixed 590-divstep schedule with
-/// masked steps, so constant time in `a`.
+/// Returns the Montgomery-form inverse `a⁻¹·R mod p` of a Montgomery-form
+/// `a·R` in `[0, p)`; the inverse of `0` is `0`. Bernstein–Yang safegcd on
+/// the representative gives `(aR)⁻¹ = a⁻¹R⁻¹`, which one multiplication by
+/// `R³` turns into `a⁻¹R`. A fixed 590-divstep schedule with masked steps,
+/// so constant time in `a`.
 pub(crate) fn invert(a: &Fe) -> Fe {
-    SAFEGCD_P.invert(a)
+    mul(&SAFEGCD_P.invert(a), &R3)
 }
 
 /// The modular inverse `a⁻¹ = a^(p−2) mod p` via a fixed Fermat addition
 /// chain (255 squarings + 13 multiplies) — the previous [`invert`], kept as
-/// its differential oracle. The inverse of `0` is `0`.
+/// its differential oracle. The inverse of `0` is `0`. Works on Montgomery
+/// representatives (the chain is a product of powers, which Montgomery
+/// multiplication preserves).
 ///
 /// Constant time by construction: the chain is a fixed sequence of squarings
 /// and multiplies derived from the public exponent
@@ -418,20 +421,101 @@ fn invert_chain(a: &Fe) -> Fe {
     mul(&sqn(&acc, 2), &x1)
 }
 
+/// The previous plain-residue kernel — FIPS 186 / Solinas fast reduction —
+/// kept as a differential oracle for the Montgomery kernel.
+#[cfg(test)]
+mod solinas {
+    use super::{Fe, mul_wide, reduce_once};
+
+    /// The folding constant `K = 2²⁵⁶ − p`, so that `2²⁵⁶ ≡ K (mod p)`.
+    pub(super) const K_LIMBS: [u64; 4] = super::R_LIMBS;
+
+    /// Adds `m·K` into the four limbs `r`, returning the new limbs and the
+    /// 0/1 carry out of the top limb (`m <= 14`).
+    fn add_mul_k(r: &[u64; 4], m: u64) -> ([u64; 4], u64) {
+        let mut out = [0u64; 4];
+        let mut carry: u128 = 0;
+        let mut i = 0;
+        while i < 4 {
+            let acc = (r[i] as u128) + (m as u128) * (K_LIMBS[i] as u128) + carry;
+            out[i] = acc as u64;
+            carry = acc >> 64;
+            i += 1;
+        }
+        (out, carry as u64)
+    }
+
+    /// Folds a 512-bit product down to canonical `[0, p)` via the FIPS
+    /// 186-4 §D.2.3 word recombination `s₁ + 2s₂ + 2s₃ + s₄ + s₅ − s₆ − s₇
+    /// − s₈ − s₉`, a `+8p` offset keeping the signed sums non-negative, one
+    /// fold of the ≤ 4-bit overflow through `2²⁵⁶ ≡ K`, and a final masked
+    /// subtraction.
+    fn reduce512(t: &[u64; 8]) -> [u64; 4] {
+        let a0 = (t[0] & 0xFFFF_FFFF) as i64;
+        let a1 = (t[0] >> 32) as i64;
+        let a2 = (t[1] & 0xFFFF_FFFF) as i64;
+        let a3 = (t[1] >> 32) as i64;
+        let a4 = (t[2] & 0xFFFF_FFFF) as i64;
+        let a5 = (t[2] >> 32) as i64;
+        let a6 = (t[3] & 0xFFFF_FFFF) as i64;
+        let a7 = (t[3] >> 32) as i64;
+        let a8 = (t[4] & 0xFFFF_FFFF) as i64;
+        let a9 = (t[4] >> 32) as i64;
+        let a10 = (t[5] & 0xFFFF_FFFF) as i64;
+        let a11 = (t[5] >> 32) as i64;
+        let a12 = (t[6] & 0xFFFF_FFFF) as i64;
+        let a13 = (t[6] >> 32) as i64;
+        let a14 = (t[7] & 0xFFFF_FFFF) as i64;
+        let a15 = (t[7] >> 32) as i64;
+
+        let w0 = a0 + a8 + a9 - a11 - a12 - a13 - a14;
+        let w1 = a1 + a9 + a10 - a12 - a13 - a14 - a15;
+        let w2 = a2 + a10 + a11 - a13 - a14 - a15;
+        let w3 = a3 + 2 * (a11 + a12) + a13 - a15 - a8 - a9;
+        let w4 = a4 + 2 * (a12 + a13) + a14 - a9 - a10;
+        let w5 = a5 + 2 * (a13 + a14) + a15 - a10 - a11;
+        let w6 = a6 + a13 + 3 * a14 + 2 * a15 - a8 - a9;
+        let w7 = a7 + a8 + 3 * a15 - a10 - a11 - a12 - a13;
+
+        const P8: [u64; 4] = [
+            0xFFFF_FFFF_FFFF_FFF8,
+            0x0000_0007_FFFF_FFFF,
+            0,
+            0xFFFF_FFF8_0000_0008,
+        ];
+        const P8_TOP: u64 = 7;
+
+        let mut r = [0u64; 4];
+        let acc = (w0 as i128) + ((w1 as i128) << 32) + (P8[0] as i128);
+        r[0] = acc as u64;
+        let acc = (w2 as i128) + ((w3 as i128) << 32) + (P8[1] as i128) + (acc >> 64);
+        r[1] = acc as u64;
+        let acc = (w4 as i128) + ((w5 as i128) << 32) + (P8[2] as i128) + (acc >> 64);
+        r[2] = acc as u64;
+        let acc = (w6 as i128) + ((w7 as i128) << 32) + (P8[3] as i128) + (acc >> 64);
+        r[3] = acc as u64;
+        let hi = ((acc >> 64) as u64).wrapping_add(P8_TOP);
+
+        let (r, c1) = add_mul_k(&r, hi);
+        reduce_once(r, c1)
+    }
+
+    /// Plain-residue product `a·b mod p` (no Montgomery factor).
+    pub(super) fn mul(a: &Fe, b: &Fe) -> Fe {
+        Fe::from_limbs(reduce512(&mul_wide(a.as_limbs(), b.as_limbs())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    //! Differential tests: the native Solinas backend must agree
-    //! byte-for-byte with the generic Montgomery oracle ([`MontModulus`], the
-    //! numeric core the P-256 layer previously ran on) on every field
-    //! operation, across edge cases and large deterministic random batches.
+    //! Differential tests: the native Montgomery backend must agree
+    //! byte-for-byte with the generic Montgomery oracle ([`MontModulus`],
+    //! same `R`, so products compare directly) and with the previous Solinas
+    //! plain-residue kernel on every field operation, across edge cases and
+    //! large deterministic random batches.
 
     use super::*;
     use crate::bignum::MontModulus;
-
-    /// The prime `p` as a [`Fe`].
-    fn p() -> Fe {
-        Fe::from_limbs(P_LIMBS)
-    }
 
     /// Generic-Montgomery differential oracle over the same prime.
     struct Oracle {
@@ -441,7 +525,7 @@ mod tests {
     impl Oracle {
         fn new() -> Self {
             Oracle {
-                fp: MontModulus::new(p()),
+                fp: MontModulus::new(P),
             }
         }
         fn add(&self, a: &Fe, b: &Fe) -> Fe {
@@ -450,14 +534,20 @@ mod tests {
         fn sub(&self, a: &Fe, b: &Fe) -> Fe {
             self.fp.sub_mod(a, b)
         }
-        fn mul(&self, a: &Fe, b: &Fe) -> Fe {
+        /// Plain-residue product.
+        fn mul_plain(&self, a: &Fe, b: &Fe) -> Fe {
             self.fp.mul_mod(a, b)
+        }
+        /// Montgomery product.
+        fn mont_mul(&self, a: &Fe, b: &Fe) -> Fe {
+            self.fp.mont_mul(a, b)
         }
         fn negate(&self, a: &Fe) -> Fe {
             self.fp.sub_mod(&Fe::ZERO, a)
         }
-        fn invert(&self, a: &Fe) -> Fe {
-            let p_minus_2 = p().wrapping_sub(&Fe::from_u64(2));
+        /// Plain-residue inverse.
+        fn invert_plain(&self, a: &Fe) -> Fe {
+            let p_minus_2 = P.wrapping_sub(&Fe::from_u64(2));
             self.fp.pow(a, &p_minus_2)
         }
     }
@@ -484,19 +574,18 @@ mod tests {
             rng.next_u64(),
             rng.next_u64(),
         ];
-        Fe::from_limbs(limbs).reduce(&p())
+        Fe::from_limbs(limbs).reduce(&P)
     }
 
     /// Field elements at and around the dangerous boundaries, all in `[0, p)`.
-    /// P-256's Solinas reduction is driven by 32-bit word patterns, so the
-    /// power-of-two words (2⁹⁶, 2¹⁹², 2²²⁴) and saturated-word values stress
-    /// the signed per-word sums hardest.
+    /// The Montgomery reduction's shifted terms and the Solinas oracle's
+    /// 32-bit word sums are both stressed hardest by the power-of-two words
+    /// (2⁹⁶, 2¹⁹², 2²²⁴) and saturated-word values.
     fn edge_cases() -> [Fe; 14] {
-        let prime = p();
-        let p_minus_1 = prime.wrapping_sub(&Fe::ONE);
-        let p_minus_2 = prime.wrapping_sub(&Fe::from_u64(2));
-        // 2²⁵⁶ − 1 reduced mod p (== K − 1, the largest near-2²⁵⁶ pattern).
-        let all_ones = Fe::from_limbs([u64::MAX; 4]).reduce(&prime);
+        let p_minus_1 = P.wrapping_sub(&Fe::ONE);
+        let p_minus_2 = P.wrapping_sub(&Fe::from_u64(2));
+        // 2²⁵⁶ − 1 reduced mod p (== R − 1, the largest near-2²⁵⁶ pattern).
+        let all_ones = Fe::from_limbs([u64::MAX; 4]).reduce(&P);
         [
             Fe::ZERO,
             Fe::ONE,
@@ -509,9 +598,9 @@ mod tests {
             Fe::from_limbs([0, 1 << 32, 0, 0]),
             Fe::from_limbs([0, 0, 0, 1]),
             Fe::from_limbs([0, 0, 0, 1 << 32]),
-            // K = 2²⁵⁶ mod p and K − 1.
-            Fe::from_limbs(K_LIMBS),
-            Fe::from_limbs([0, K_LIMBS[1], K_LIMBS[2], K_LIMBS[3]]),
+            // R mod p and R − 1.
+            ONE,
+            Fe::from_limbs([0, R_LIMBS[1], R_LIMBS[2], R_LIMBS[3]]),
             // Alternating saturated 32-bit words.
             Fe::from_limbs([0xFFFF_FFFF, 0xFFFF_FFFF_0000_0000, 0xFFFF_FFFF, 0]),
             // High half saturated, low half zero.
@@ -525,6 +614,8 @@ mod tests {
         out
     }
 
+    /// Binary operations on two residues `a, b` (interpreted both as plain
+    /// values and as Montgomery representatives).
     fn check_pair(g: &Oracle, a: &Fe, b: &Fe) {
         assert_eq!(
             bytes(&g.add(a, b)),
@@ -540,10 +631,28 @@ mod tests {
             a.as_limbs(),
             b.as_limbs()
         );
+        // Montgomery product against the generic CIOS (same R).
         assert_eq!(
-            bytes(&g.mul(a, b)),
+            bytes(&g.mont_mul(a, b)),
             bytes(&mul(a, b)),
-            "mul mismatch: a={:x?} b={:x?}",
+            "mont mul mismatch: a={:x?} b={:x?}",
+            a.as_limbs(),
+            b.as_limbs()
+        );
+        // Plain product through the conversion: (aR)·b·R⁻¹ = ab, against
+        // both the generic oracle and the previous Solinas kernel.
+        let plain = mul(&to_mont(a), b);
+        assert_eq!(
+            bytes(&g.mul_plain(a, b)),
+            bytes(&plain),
+            "plain mul mismatch: a={:x?} b={:x?}",
+            a.as_limbs(),
+            b.as_limbs()
+        );
+        assert_eq!(
+            bytes(&solinas::mul(a, b)),
+            bytes(&plain),
+            "solinas mismatch: a={:x?} b={:x?}",
             a.as_limbs(),
             b.as_limbs()
         );
@@ -551,7 +660,7 @@ mod tests {
 
     fn check_unary(g: &Oracle, a: &Fe) {
         assert_eq!(
-            bytes(&g.mul(a, a)),
+            bytes(&g.mont_mul(a, a)),
             bytes(&square(a)),
             "square mismatch: a={:x?}",
             a.as_limbs()
@@ -562,18 +671,34 @@ mod tests {
             "negate mismatch: a={:x?}",
             a.as_limbs()
         );
+        // Conversions round-trip and match the generic oracle's.
+        let am = to_mont(a);
+        assert_eq!(bytes(&g.fp.to_mont(a)), bytes(&am), "to_mont mismatch");
+        assert_eq!(bytes(&from_mont(&am)), bytes(a), "from_mont round trip");
+        // Inverse of the Montgomery form is the Montgomery form of the
+        // plain inverse.
         assert_eq!(
-            bytes(&g.invert(a)),
-            bytes(&invert(a)),
+            bytes(&to_mont(&g.invert_plain(a))),
+            bytes(&invert(&am)),
             "invert mismatch: a={:x?}",
             a.as_limbs()
         );
         assert_eq!(
-            bytes(&invert_chain(a)),
-            bytes(&invert(a)),
+            bytes(&invert_chain(&am)),
+            bytes(&invert(&am)),
             "invert vs chain mismatch: a={:x?}",
             a.as_limbs()
         );
+    }
+
+    #[test]
+    fn constants() {
+        let g = Oracle::new();
+        assert_eq!(bytes(&ONE), bytes(&g.fp.to_mont(&Fe::ONE)), "R mod p");
+        assert_eq!(bytes(&R2), bytes(&g.fp.to_mont(&ONE)), "R² mod p");
+        assert_eq!(bytes(&R3), bytes(&g.fp.to_mont(&R2)), "R³ mod p");
+        assert_eq!(bytes(&from_mont(&ONE)), bytes(&Fe::ONE));
+        assert_eq!(bytes(&to_mont(&Fe::ONE)), bytes(&ONE));
     }
 
     #[test]
@@ -598,7 +723,7 @@ mod tests {
             let a = rand_fe(&mut rng);
             let b = rand_fe(&mut rng);
             check_pair(&g, &a, &b);
-            assert_eq!(bytes(&g.mul(&a, &a)), bytes(&square(&a)));
+            assert_eq!(bytes(&g.mont_mul(&a, &a)), bytes(&square(&a)));
         }
     }
 
@@ -621,7 +746,8 @@ mod tests {
             if bool::from(a.is_zero()) {
                 continue;
             }
-            assert_eq!(bytes(&mul(&a, &invert(&a))), bytes(&Fe::ONE));
+            // In Montgomery form: (aR)·(a⁻¹R)·R⁻¹ = R = ONE.
+            assert_eq!(bytes(&mul(&a, &invert(&a))), bytes(&ONE));
         }
         assert_eq!(bytes(&invert(&Fe::ZERO)), bytes(&Fe::ZERO));
     }
@@ -636,8 +762,6 @@ mod tests {
         let mut rng = SplitMix64(42);
         let mut a = rand_fe(&mut rng);
         let b = rand_fe(&mut rng);
-        let am = g.fp.to_mont(&a);
-        let bm = g.fp.to_mont(&b);
         const N: u32 = 2_000_000;
 
         let t = Instant::now();
@@ -649,9 +773,17 @@ mod tests {
         println!("native mul:   {:?}/op", t.elapsed() / N);
 
         let t = Instant::now();
-        let mut x = am;
+        let mut x = a;
         for _ in 0..N {
-            x = g.fp.mont_mul(&x, &bm);
+            x = solinas::mul(&x, &b);
+        }
+        core::hint::black_box(&x);
+        println!("solinas mul:  {:?}/op", t.elapsed() / N);
+
+        let t = Instant::now();
+        let mut x = a;
+        for _ in 0..N {
+            x = g.fp.mont_mul(&x, &b);
         }
         core::hint::black_box(&x);
         println!("mont_mul:     {:?}/op", t.elapsed() / N);
@@ -665,7 +797,7 @@ mod tests {
         println!("native sqr:   {:?}/op", t.elapsed() / N);
 
         let t = Instant::now();
-        let mut x = am;
+        let mut x = a;
         for _ in 0..N {
             x = g.fp.mont_sqr(&x);
         }
@@ -681,14 +813,6 @@ mod tests {
         println!("native add:   {:?}/op", t.elapsed() / N);
 
         let t = Instant::now();
-        let mut x = a;
-        for _ in 0..N {
-            x = g.fp.add_mod(&x, &b);
-        }
-        core::hint::black_box(&x);
-        println!("generic add:  {:?}/op", t.elapsed() / N);
-
-        let t = Instant::now();
         let mut w = mul_wide(a.as_limbs(), b.as_limbs());
         for _ in 0..N {
             w = mul_wide(&[w[0], w[1], w[2], w[3]], &[w[4], w[5], w[6], w[7]]);
@@ -699,10 +823,10 @@ mod tests {
         let t = Instant::now();
         let mut r = *a.as_limbs();
         for _ in 0..N {
-            r = reduce512(&[r[0], r[1], r[2], r[3], r[0], r[1], r[2], r[3]]);
+            r = mont_reduce(&[r[0], r[1], r[2], r[3], r[0], r[1], r[2], r[3]]);
         }
         core::hint::black_box(&r);
-        println!("reduce512:    {:?}/op", t.elapsed() / N);
+        println!("mont_reduce:  {:?}/op", t.elapsed() / N);
 
         let t = Instant::now();
         for _ in 0..2000 {
@@ -710,34 +834,26 @@ mod tests {
         }
         core::hint::black_box(&a);
         println!("native inv:   {:?}/op", t.elapsed() / 2000);
-
-        let t = Instant::now();
-        for _ in 0..2000 {
-            a = g.invert(&a);
-        }
-        core::hint::black_box(&a);
-        println!("generic inv:  {:?}/op", t.elapsed() / 2000);
     }
 
-    /// Random-word (not pre-reduced) products stress the Solinas word sums:
-    /// feed the reducer edge-shaped *operands* whose wide products exercise
-    /// extreme positive and negative per-word coefficient sums.
+    /// Edge-shaped *operands* whose wide products exercise extreme carry
+    /// patterns in the reduction (and extreme signed word sums in the
+    /// Solinas oracle).
     #[test]
-    fn solinas_extreme_word_patterns() {
+    fn extreme_word_patterns() {
         let g = Oracle::new();
-        let prime = p();
         let patterns = [
-            Fe::from_limbs([u64::MAX, 0, u64::MAX, 0]).reduce(&prime),
-            Fe::from_limbs([0, u64::MAX, 0, u64::MAX]).reduce(&prime),
+            Fe::from_limbs([u64::MAX, 0, u64::MAX, 0]).reduce(&P),
+            Fe::from_limbs([0, u64::MAX, 0, u64::MAX]).reduce(&P),
             Fe::from_limbs([
                 0xFFFF_FFFF_0000_0000,
                 0xFFFF_FFFF,
                 0xFFFF_FFFF_0000_0000,
                 0xFFFF_FFFF,
             ])
-            .reduce(&prime),
-            prime.wrapping_sub(&Fe::ONE),
-            Fe::from_limbs([u64::MAX; 4]).reduce(&prime),
+            .reduce(&P),
+            P.wrapping_sub(&Fe::ONE),
+            Fe::from_limbs([u64::MAX; 4]).reduce(&P),
         ];
         for a in &patterns {
             for b in &patterns {
