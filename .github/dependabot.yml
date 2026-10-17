@@ -14,3 +14,10 @@ updates:
       actions:
         patterns:
           - "*"
+    ignore:
+      # `dtolnay/rust-toolchain@<version>` selects the Rust toolchain by its
+      # tag, so Dependabot would "upgrade" the MSRV job's `@1.89` to whatever
+      # the newest tag is (it bumped it to a non-existent `@1.120` once).
+      # The MSRV pin follows `rust-version` in Cargo.toml and is bumped by
+      # hand; `@stable` / `@nightly` are moving tags and need no updates.
+      - dependency-name: "dtolnay/rust-toolchain"

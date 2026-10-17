@@ -198,7 +198,7 @@ jobs:
       # language feature newer than 1.89 (behavior itself is covered by the
       # stable `test` jobs, so this is compile-only).
       - name: Install Rust 1.89 (declared MSRV)
-        uses: dtolnay/rust-toolchain@1.120
+        uses: dtolnay/rust-toolchain@1.89
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
