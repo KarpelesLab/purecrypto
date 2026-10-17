@@ -296,27 +296,28 @@ impl X25519PrivateKey {
         if parse_oid(algid.read_oid()?)?.as_slice() != X25519_OID {
             return Err(Error::Malformed);
         }
+        // privateKey OCTET STRING wraps `CurvePrivateKey ::= OCTET STRING`
+        // (RFC 8410 §7) and nothing else.
         let inner = seq.read_octet_string()?;
-        let scalar_bytes = Reader::new(inner).read_octet_string()?;
+        let mut ir = Reader::new(inner);
+        let scalar_bytes = ir.read_octet_string()?;
+        ir.finish()?;
         if scalar_bytes.len() != 32 {
             return Err(Error::Malformed);
         }
         let mut scalar = [0u8; 32];
         scalar.copy_from_slice(scalar_bytes);
-        // RFC 5958 (PKCS#8 v2): skip the OPTIONAL `[0]` attributes (constructed
-        // SET) and `[1]` publicKey (IMPLICIT BIT STRING, primitive tag `0x81`;
-        // also accept the constructed `0xA1` spelling) if present, then assert
-        // the SEQUENCE and outer reader are fully consumed so genuine trailing
-        // garbage is rejected.
+        let key = X25519PrivateKey { scalar };
+        // RFC 5958 (PKCS#8 v2): skip the OPTIONAL `[0]` attributes; the
+        // OPTIONAL `[1]` publicKey must match the scalar's (see
+        // `ed25519::check_pkcs8_public_key`).
         if seq.peek_tag() == Some(tag::context(0)) {
             seq.read_any()?;
         }
-        if matches!(seq.peek_tag(), Some(t) if t == tag::context(1) || t == (0x80 | 1)) {
-            seq.read_any()?;
-        }
+        super::ed25519::check_pkcs8_public_key(&mut seq, &key.public_key())?;
         seq.finish()?;
         r.finish()?;
-        Ok(X25519PrivateKey { scalar })
+        Ok(key)
     }
 
     /// Parses a PKCS#8 PEM private key.
@@ -408,6 +409,26 @@ mod tests {
         let parsed = X25519PrivateKey::from_pkcs8_der(&der).expect("v2 parse");
         assert_eq!(parsed.to_bytes(), scalar);
         assert_eq!(parsed.public_key(), pub_enc);
+
+        // F7: an embedded public key that is not the scalar's is rejected.
+        let mut wrong = der.clone();
+        let last = wrong.len() - 1;
+        wrong[last] ^= 0x01;
+        assert!(X25519PrivateKey::from_pkcs8_der(&wrong).is_err());
+
+        // F7: bytes after the CurvePrivateKey inside the privateKey wrapper.
+        let privkey = encode_octet_string(
+            &[encode_octet_string(&scalar), crate::der::encode_null()].concat(),
+        );
+        let der = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_sequence(&oid_tlv(X25519_OID)),
+                privkey,
+            ]
+            .concat(),
+        );
+        assert!(X25519PrivateKey::from_pkcs8_der(&der).is_err());
     }
 
     #[test]

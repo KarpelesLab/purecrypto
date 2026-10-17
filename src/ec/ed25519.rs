@@ -168,6 +168,46 @@ fn wipe(buf: &mut [u8]) {
     crate::zeroize::Zeroize::zeroize(buf);
 }
 
+/// Checks the OPTIONAL `[1] publicKey` of a PKCS#8 v2 `OneAsymmetricKey`
+/// (RFC 5958 §2) against `expected`, the public key derived from the private
+/// half just read, consuming the field when present.
+///
+/// The field is an IMPLICIT BIT STRING, so OpenSSL emits the primitive tag
+/// `0x81` with the usual unused-bits prefix; the constructed `[1]` spelling
+/// (an EXPLICIT BIT STRING inside) is accepted too. A key whose embedded
+/// public half belongs to a different private key is not a key at all —
+/// whichever half an application reads, the other is wrong — so a mismatch
+/// is rejected at parse time rather than surfacing as unverifiable
+/// signatures or a failed key agreement later. Shared by the Ed448, X25519
+/// and X448 parsers.
+#[cfg(all(feature = "der", feature = "alloc"))]
+pub(crate) fn check_pkcs8_public_key(
+    seq: &mut crate::der::Reader<'_>,
+    expected: &[u8],
+) -> Result<(), crate::der::Error> {
+    use crate::der::{Error, Reader, tag};
+    let bits = match seq.peek_tag() {
+        Some(0x81) => {
+            let content = seq.read_tlv(0x81)?;
+            match content.split_first() {
+                Some((0, rest)) => rest,
+                _ => return Err(Error::Malformed),
+            }
+        }
+        Some(t) if t == tag::context(1) => {
+            let mut inner = Reader::new(seq.read_tlv(t)?);
+            let bits = inner.read_bit_string()?;
+            inner.finish()?;
+            bits
+        }
+        _ => return Ok(()),
+    };
+    if bits != expected {
+        return Err(Error::Malformed);
+    }
+    Ok(())
+}
+
 /// PKCS#8 v1 (RFC 8410) private-key serialization.
 #[cfg(all(feature = "der", feature = "alloc"))]
 impl Ed25519PrivateKey {
@@ -196,29 +236,29 @@ impl Ed25519PrivateKey {
         if parse_oid(algid.read_oid()?)?.as_slice() != ED25519_OID {
             return Err(Error::Malformed);
         }
+        // privateKey OCTET STRING wraps `CurvePrivateKey ::= OCTET STRING`
+        // (RFC 8410 §7) and nothing else.
         let inner = seq.read_octet_string()?;
-        let seed_bytes = Reader::new(inner).read_octet_string()?;
+        let mut ir = Reader::new(inner);
+        let seed_bytes = ir.read_octet_string()?;
+        ir.finish()?;
         if seed_bytes.len() != 32 {
             return Err(Error::Malformed);
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(seed_bytes);
+        let key = Self::from_seed(seed);
         // RFC 5958 (PKCS#8 v2 / OneAsymmetricKey): an OPTIONAL `[0]` attributes
-        // (IMPLICIT SET, constructed) and an OPTIONAL `[1]` publicKey (IMPLICIT
-        // BIT STRING) may follow the privateKey OCTET STRING. The publicKey is
-        // a primitive BIT STRING, so its IMPLICIT tag is `0x81`; accept the
-        // constructed `0xA1` spelling too for robustness. Skip whichever are
-        // present, then assert the SEQUENCE and outer reader are fully consumed
-        // so genuine trailing garbage is rejected.
+        // (IMPLICIT SET, constructed) and an OPTIONAL `[1]` publicKey may
+        // follow the privateKey OCTET STRING. Attributes are skipped; the
+        // publicKey must match the one the seed derives.
         if seq.peek_tag() == Some(tag::context(0)) {
             seq.read_any()?;
         }
-        if matches!(seq.peek_tag(), Some(t) if t == tag::context(1) || t == (0x80 | 1)) {
-            seq.read_any()?;
-        }
+        check_pkcs8_public_key(&mut seq, &key.public_key().to_bytes())?;
         seq.finish()?;
         r.finish()?;
-        Ok(Self::from_seed(seed))
+        Ok(key)
     }
 
     /// Parses a PKCS#8 PEM private key.
@@ -611,6 +651,60 @@ mod tests {
         let parsed = Ed25519PrivateKey::from_pkcs8_der(&der).expect("v2 parse");
         assert_eq!(parsed.to_bytes(), seed);
         assert_eq!(parsed.public_key().to_bytes(), pub_enc);
+
+        // F7: the embedded public key must be the seed's. A different one
+        // (one byte flipped) is rejected, as is a wrong length.
+        let mut wrong = der.clone();
+        let last = wrong.len() - 1;
+        wrong[last] ^= 0x01;
+        assert!(Ed25519PrivateKey::from_pkcs8_der(&wrong).is_err());
+        let mut short_field = alloc::vec![0x81u8, 32, 0];
+        short_field.extend_from_slice(&pub_enc[..31]);
+        let short = encode_sequence(
+            &[
+                encode_integer(&[1]),
+                encode_sequence(&oid_tlv(ED25519_OID)),
+                encode_octet_string(&encode_octet_string(&seed)),
+                short_field,
+            ]
+            .concat(),
+        );
+        assert!(Ed25519PrivateKey::from_pkcs8_der(&short).is_err());
+        // The constructed `[1]` spelling (an EXPLICIT BIT STRING) is still
+        // read, and checked the same way.
+        let explicit = |pk: &[u8]| {
+            let bits = crate::der::encode_bit_string(pk);
+            encode_sequence(
+                &[
+                    encode_integer(&[1]),
+                    encode_sequence(&oid_tlv(ED25519_OID)),
+                    encode_octet_string(&encode_octet_string(&seed)),
+                    crate::der::encode_context(1, &bits),
+                ]
+                .concat(),
+            )
+        };
+        assert!(Ed25519PrivateKey::from_pkcs8_der(&explicit(&pub_enc)).is_ok());
+        let mut other = pub_enc;
+        other[0] ^= 0x01;
+        assert!(Ed25519PrivateKey::from_pkcs8_der(&explicit(&other)).is_err());
+    }
+
+    /// F7: the privateKey OCTET STRING holds exactly the CurvePrivateKey
+    /// OCTET STRING; bytes after it inside the wrapper are rejected.
+    #[cfg(all(feature = "der", feature = "alloc"))]
+    #[test]
+    fn pkcs8_rejects_junk_inside_private_key_wrapper() {
+        use crate::der::{
+            encode_integer, encode_null, encode_octet_string, encode_sequence, oid_tlv,
+        };
+        let seed =
+            from_hex::<32>("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let version = encode_integer(&[0]);
+        let algid = encode_sequence(&oid_tlv(ED25519_OID));
+        let privkey = encode_octet_string(&[encode_octet_string(&seed), encode_null()].concat());
+        let der = encode_sequence(&[version, algid, privkey].concat());
+        assert!(Ed25519PrivateKey::from_pkcs8_der(&der).is_err());
     }
 
     /// The old fully constant-time verification path (constant-time comb +
