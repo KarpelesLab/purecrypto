@@ -19,6 +19,7 @@
 
 use crate::hash::Sha256;
 use crate::rng::HmacDrbg;
+use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
     self, CertificateRequest12, CipherSuite, ClientHello, ClientKeyExchange, KeyUpdate, NamedGroup,
@@ -27,6 +28,7 @@ use crate::tls::codec::{
 };
 use crate::tls::conn::{ClientConfig, ClientConnection};
 use crate::tls::{Error, RootCertStore};
+use crate::x509::{Certificate, Time};
 use alloc::vec::Vec;
 
 /// Selector values understood by [`dispatch`](crate::tls::fuzz::dispatch): the first input byte picks
@@ -352,6 +354,29 @@ pub fn ech_outer_position(body: &[u8]) -> Result<(), Error> {
     crate::tls::ech::extension::decode_outer_position(body).map(drop)
 }
 
+// ---- PKI chain verification --------------------------------------------
+
+/// Runs the TLS server-chain verifier over `chain` (leaf first, DER) against
+/// `roots` at `now` under [`SignaturePolicy::modern`] — path building,
+/// anchor matching, per-link signature checks, validity, the
+/// critical-extension / name-constraint / EKU processing — and then the
+/// RFC 6125 hostname match of the leaf against `host`. This is the
+/// `pki::verify_chain` + `pki::verify_hostname` pair the TLS client runs on
+/// a server's `Certificate` message; the `x509_verify_chain` fuzz target
+/// feeds it attacker-shaped chains without a handshake in front.
+pub fn verify_server_chain(
+    roots: &RootCertStore,
+    chain: &[Vec<u8>],
+    host: &str,
+    now: Option<&Time>,
+) -> Result<(), Error> {
+    let policy = SignaturePolicy::modern();
+    crate::tls::pki::verify_chain(roots, chain, now, &policy)?;
+    let leaf = chain.first().ok_or(Error::BadCertificate)?;
+    let leaf = Certificate::from_der(leaf.clone()).map_err(|_| Error::BadCertificate)?;
+    crate::tls::pki::verify_hostname(&leaf, host)
+}
+
 // ---- Extension bodies ---------------------------------------------------
 
 /// Runs one extension-body parser, selected by `which`, on `body`:
@@ -454,5 +479,59 @@ mod tests {
             certificate_verify(&[0x04, 0x01, 0, 0]),
             Err(Error::IllegalParameter)
         ));
+    }
+
+    /// `verify_server_chain` accepts a root-anchored leaf for its own name,
+    /// refuses the wrong name, and rejects garbage / empty chains cleanly.
+    #[test]
+    fn verify_server_chain_round_trip() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::x509::{CertSigner, DistinguishedName, Validity};
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"fuzz-verify-chain", b"test", &[]);
+        let ca_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2099, 1, 1, 0, 0, 0),
+        );
+        let ca_name = DistinguishedName::common_name("fuzz root");
+        let root = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&ca_key),
+            &ca_name,
+            &validity,
+            1,
+            true,
+            &[],
+        )
+        .unwrap();
+        let leaf = Certificate::issue_general(
+            &CertSigner::Ecdsa(&ca_key),
+            &ca_name,
+            &DistinguishedName::common_name("leaf"),
+            &crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity,
+            2,
+            false,
+            &["fuzz.example"],
+        )
+        .unwrap();
+        let mut roots = RootCertStore::new();
+        roots.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let chain = alloc::vec![leaf.to_der().to_vec()];
+
+        verify_server_chain(&roots, &chain, "fuzz.example", Some(&now)).unwrap();
+        assert!(verify_server_chain(&roots, &chain, "other.example", Some(&now)).is_err());
+        assert!(verify_server_chain(&roots, &[], "fuzz.example", Some(&now)).is_err());
+        assert!(
+            verify_server_chain(
+                &roots,
+                &[alloc::vec![0x30, 0x00]],
+                "fuzz.example",
+                Some(&now)
+            )
+            .is_err()
+        );
     }
 }

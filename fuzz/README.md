@@ -5,7 +5,10 @@ the `purecrypto` crate. Built with [`cargo-fuzz`] + [libFuzzer].
 
 The parent crate's stable-Rust PR CI does **not** run this directory.
 Fuzzing requires nightly Rust; see `.github/workflows/fuzz.yml` for the
-weekly-cron + manual-dispatch CI job that does run the targets.
+weekly-cron + manual-dispatch CI job that does run the targets. That job
+runs each target for a few minutes and keeps the corpus libFuzzer grows
+in the Actions cache (`fuzz/corpus/<target>`, one entry per target), so
+coverage accumulates across weeks; it is a smoke budget, not a campaign.
 
 [`cargo-fuzz`]: https://github.com/rust-fuzz/cargo-fuzz
 [libFuzzer]: https://llvm.org/docs/LibFuzzer.html
