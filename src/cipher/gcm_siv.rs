@@ -62,8 +62,10 @@ fn mulx_ghash(v: u128) -> u128 {
 /// via RFC 8452 Appendix A: `POLYVAL(H, X…) = ByteReverse(GHASH(mulX_GHASH(
 /// ByteReverse(H)), ByteReverse(X)…))`. In `u128` terms the GHASH
 /// accumulator over byte-reversed blocks (read big-endian) *is* the POLYVAL
-/// accumulator read little-endian, so only the blocks need reversing and the
-/// key needs one `mulX`. The software fallback is [`polyval_mul`].
+/// accumulator read little-endian, and the kernel's reflected block form
+/// *is* the little-endian POLYVAL block, so the blocks go in unchanged
+/// (`polyval_blocks`) and only the key needs one `mulX`. The software
+/// fallback is [`polyval_mul`].
 struct Polyval {
     h: u128,
     acc: u128,
@@ -100,21 +102,12 @@ impl Polyval {
     fn update_blocks_hw<'a>(&mut self, blocks: &'a [u8]) -> &'a [u8] {
         #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         if let Some(hpow) = &self.hpow {
-            // Byte-reverse eight blocks at a time into a scratch window and
-            // hand them to the aggregated GHASH.
-            let mut win = [0u8; 128];
-            for chunk in blocks.chunks(128) {
-                for (dst, src) in win.chunks_exact_mut(16).zip(chunk.chunks_exact(16)) {
-                    dst.copy_from_slice(src);
-                    dst.reverse();
-                }
-                // SAFETY: `hpow` is only set when `clmul::supported()`
-                // confirmed the features `ghash_blocks` requires.
-                self.acc =
-                    unsafe { super::clmul::ghash_blocks(self.acc, hpow, &win[..chunk.len()]) };
-            }
-            // The window held (reversed) message blocks.
-            win.zeroize();
+            // The aggregated GHASH kernel in its POLYVAL form: little-endian
+            // blocks already are the kernel's reflected representation, so
+            // they are consumed in place (no byte-reversed scratch window).
+            // SAFETY: `hpow` is only set when `clmul::supported()` confirmed
+            // the features `polyval_blocks` requires.
+            self.acc = unsafe { super::clmul::polyval_blocks(self.acc, hpow, blocks) };
             return &[];
         }
         blocks

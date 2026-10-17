@@ -13,9 +13,9 @@
 #![allow(unused_unsafe)]
 
 #[cfg(target_arch = "aarch64")]
-pub(super) use arm::{ctr_ghash_fused, gf_mul, ghash_blocks};
+pub(super) use arm::{ctr_ghash_fused, gf_mul, ghash_blocks, polyval_blocks};
 #[cfg(target_arch = "x86_64")]
-pub(super) use x86::{ctr_ghash_fused, gf_mul, ghash_blocks};
+pub(super) use x86::{ctr_ghash_fused, gf_mul, ghash_blocks, polyval_blocks};
 
 /// Whether a hardware GHASH backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
@@ -178,13 +178,29 @@ mod x86 {
         }
     }
 
+    /// Loads a 16-byte block into the reflected representation: byte-swapped
+    /// for a big-endian GCM block (`REV`), as is for a little-endian POLYVAL
+    /// block, whose bytes already are the reflected form.
+    #[inline]
+    #[target_feature(enable = "sse2,ssse3")]
+    unsafe fn load_block<const REV: bool>(q: *const u8) -> __m128i {
+        unsafe {
+            let v = _mm_loadu_si128(q as *const __m128i);
+            if REV { bswap(v) } else { v }
+        }
+    }
+
     /// Folds the eight 16-byte blocks at `p` into `acc` with one reduction:
     /// `acc ← (acc ⊕ b₀)·H⁸ ⊕ b₁·H⁷ ⊕ … ⊕ b₇·H` (aggregated reduction).
     #[inline]
     #[target_feature(enable = "pclmulqdq,sse2,ssse3")]
-    unsafe fn ghash_group8(acc: __m128i, h: &[__m128i; 8], p: *const u8) -> __m128i {
+    unsafe fn ghash_group8<const REV: bool>(
+        acc: __m128i,
+        h: &[__m128i; 8],
+        p: *const u8,
+    ) -> __m128i {
         unsafe {
-            let load = |q: *const u8| bswap(_mm_loadu_si128(q as *const __m128i));
+            let load = |q: *const u8| load_block::<REV>(q);
             let d0 = _mm_xor_si128(acc, load(p));
             let (mut lo, mut hi) = clmul_halves(d0, h[7]);
             for j in 1..8 {
@@ -206,15 +222,36 @@ mod x86 {
     /// Returns the same value as repeated `gf_mul(x ⊕ bᵢ, h)`.
     #[target_feature(enable = "pclmulqdq,sse2,ssse3")]
     pub(in super::super) unsafe fn ghash_blocks(x: u128, hpow: &[u128; 8], blocks: &[u8]) -> u128 {
+        unsafe { hash_blocks::<true>(x, hpow, blocks) }
+    }
+
+    /// [`ghash_blocks`] over little-endian POLYVAL blocks (RFC 8452 Appendix
+    /// A): with `hpow` the powers of `mulX_GHASH(ByteReverse(H))` this is
+    /// POLYVAL, the blocks being consumed in place instead of byte-reversed
+    /// into a scratch window first. The accumulator is read and returned in
+    /// the same `u128` form as `ghash_blocks` (`to_le_bytes` of it is the
+    /// POLYVAL output block).
+    #[target_feature(enable = "pclmulqdq,sse2,ssse3")]
+    pub(in super::super) unsafe fn polyval_blocks(
+        x: u128,
+        hpow: &[u128; 8],
+        blocks: &[u8],
+    ) -> u128 {
+        unsafe { hash_blocks::<false>(x, hpow, blocks) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse2,ssse3")]
+    unsafe fn hash_blocks<const REV: bool>(x: u128, hpow: &[u128; 8], blocks: &[u8]) -> u128 {
         unsafe {
-            let load = |p: *const u8| bswap(_mm_loadu_si128(p as *const __m128i));
+            let load = |p: *const u8| load_block::<REV>(p);
             let h = load_hpow(hpow);
 
             let xb = x.to_le_bytes();
             let mut acc = _mm_loadu_si128(xb.as_ptr() as *const __m128i);
             let mut chunks = blocks.chunks_exact(128);
             for c in &mut chunks {
-                acc = ghash_group8(acc, &h, c.as_ptr());
+                acc = ghash_group8::<REV>(acc, &h, c.as_ptr());
             }
             let mut rest = chunks.remainder();
             if rest.len() >= 64 {
@@ -328,10 +365,10 @@ mod x86 {
                 // decrypting (before the XOR below overwrites it).
                 if encrypt {
                     if off >= 128 {
-                        acc = ghash_group8(acc, &h, base.add(off - 128));
+                        acc = ghash_group8::<true>(acc, &h, base.add(off - 128));
                     }
                 } else {
-                    acc = ghash_group8(acc, &h, base.add(off));
+                    acc = ghash_group8::<true>(acc, &h, base.add(off));
                 }
                 // XOR the keystream into the data.
                 for (j, bj) in b.iter().enumerate() {
@@ -343,7 +380,7 @@ mod x86 {
             }
             // Flush the lag: the last output group is still unhashed.
             if encrypt && n != 0 {
-                acc = ghash_group8(acc, &h, base.add(n - 128));
+                acc = ghash_group8::<true>(acc, &h, base.add(n - 128));
             }
 
             let p = bswap(acc);
@@ -516,16 +553,29 @@ mod arm {
         }
     }
 
+    /// [`load_rev`] for a big-endian GCM block (`REV`), or a plain load for
+    /// a little-endian POLYVAL block, whose bytes already are the reflected
+    /// representation.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn load_block<const REV: bool>(p: *const u8) -> uint8x16_t {
+        unsafe { if REV { load_rev(p) } else { vld1q_u8(p) } }
+    }
+
     /// Folds the eight 16-byte blocks at `p` into `acc` with one reduction:
     /// `acc ← (acc ⊕ b₀)·H⁸ ⊕ b₁·H⁷ ⊕ … ⊕ b₇·H` (aggregated reduction).
     #[inline]
     #[target_feature(enable = "aes,neon")]
-    unsafe fn ghash_group8(acc: uint8x16_t, h: &[uint8x16_t; 8], p: *const u8) -> uint8x16_t {
+    unsafe fn ghash_group8<const REV: bool>(
+        acc: uint8x16_t,
+        h: &[uint8x16_t; 8],
+        p: *const u8,
+    ) -> uint8x16_t {
         unsafe {
-            let d0 = veorq_u8(acc, load_rev(p));
+            let d0 = veorq_u8(acc, load_block::<REV>(p));
             let (mut lo, mut hi) = clmul_halves(d0, h[7]);
             for j in 1..8 {
-                let (l, hh) = clmul_halves(load_rev(p.add(j * 16)), h[7 - j]);
+                let (l, hh) = clmul_halves(load_block::<REV>(p.add(j * 16)), h[7 - j]);
                 lo = veorq_u8(lo, l);
                 hi = veorq_u8(hi, hh);
             }
@@ -541,10 +591,31 @@ mod arm {
     /// `gf_mul(x ⊕ bᵢ, h)`.
     #[target_feature(enable = "aes,neon")]
     pub(in super::super) unsafe fn ghash_blocks(x: u128, hpow: &[u128; 8], blocks: &[u8]) -> u128 {
+        unsafe { hash_blocks::<true>(x, hpow, blocks) }
+    }
+
+    /// [`ghash_blocks`] over little-endian POLYVAL blocks (RFC 8452 Appendix
+    /// A): with `hpow` the powers of `mulX_GHASH(ByteReverse(H))` this is
+    /// POLYVAL, the blocks being consumed in place instead of byte-reversed
+    /// into a scratch window first. The accumulator is read and returned in
+    /// the same `u128` form as `ghash_blocks` (`to_le_bytes` of it is the
+    /// POLYVAL output block).
+    #[target_feature(enable = "aes,neon")]
+    pub(in super::super) unsafe fn polyval_blocks(
+        x: u128,
+        hpow: &[u128; 8],
+        blocks: &[u8],
+    ) -> u128 {
+        unsafe { hash_blocks::<false>(x, hpow, blocks) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes,neon")]
+    unsafe fn hash_blocks<const REV: bool>(x: u128, hpow: &[u128; 8], blocks: &[u8]) -> u128 {
         unsafe {
             // `x` and the powers are `u128`, so their little-endian bytes
             // already are the reflected representation; the message blocks are
-            // reversed by `load_rev`.
+            // reversed by `load_rev` when they are big-endian GCM blocks.
             let mut h = [vdupq_n_u8(0); 8];
             for (hv, hp) in h.iter_mut().zip(hpow.iter()) {
                 let b = hp.to_le_bytes();
@@ -555,15 +626,15 @@ mod arm {
             let mut acc = vld1q_u8(xb.as_ptr());
             let mut chunks = blocks.chunks_exact(128);
             for c in &mut chunks {
-                acc = ghash_group8(acc, &h, c.as_ptr());
+                acc = ghash_group8::<REV>(acc, &h, c.as_ptr());
             }
             let mut rest = chunks.remainder();
             if rest.len() >= 64 {
                 let p = rest.as_ptr();
-                let d0 = veorq_u8(acc, load_rev(p));
+                let d0 = veorq_u8(acc, load_block::<REV>(p));
                 let (mut lo, mut hi) = clmul_halves(d0, h[3]);
                 for j in 1..4 {
-                    let (l, hh) = clmul_halves(load_rev(p.add(j * 16)), h[3 - j]);
+                    let (l, hh) = clmul_halves(load_block::<REV>(p.add(j * 16)), h[3 - j]);
                     lo = veorq_u8(lo, l);
                     hi = veorq_u8(hi, hh);
                 }
@@ -571,7 +642,7 @@ mod arm {
                 rest = &rest[64..];
             }
             for c in rest.chunks_exact(16) {
-                acc = gfmul(veorq_u8(acc, load_rev(c.as_ptr())), h[0]);
+                acc = gfmul(veorq_u8(acc, load_block::<REV>(c.as_ptr())), h[0]);
             }
 
             let mut out = [0u8; 16];
@@ -738,7 +809,7 @@ mod arm {
             }
             // Flush the lag: the last output group is still unhashed.
             if encrypt && n != 0 {
-                acc = ghash_group8(acc, &h, base.add(n - 128));
+                acc = ghash_group8::<true>(acc, &h, base.add(n - 128));
             }
 
             let mut out = [0u8; 16];

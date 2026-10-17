@@ -85,19 +85,29 @@ const MASK128: u128 = 0x01ff_ffff_01ff_ffff_01ff_ffff_01ff_ffff;
 /// RFC 4418 §3.2.1 KDF: AES-128 in counter mode with `(index, counter)` as
 /// the input block. `index` selects the keystream (0 = PDF, 1 = L1, 2 = L2,
 /// 3 = L3-K1, 4 = L3-K2); `out` receives `out.len()` bytes of keystream.
+///
+/// The counter blocks are independent, so they go through the batched
+/// [`encrypt_blocks`](BlockCipher::encrypt_blocks) a 1 KiB window at a time
+/// (the L1 key alone is 64 blocks) rather than one serial block each.
 fn kdf(aes: &Aes128, index: u64, out: &mut [u8]) {
-    let mut block = [0u8; 16];
-    block[0..8].copy_from_slice(&index.to_be_bytes());
-    let n = out.len().div_ceil(16);
+    const W: usize = 64;
+    let mut ks = [0u8; 16 * W];
+    let mut ctr: u64 = 1;
     let mut written = 0;
-    for i in 1..=n as u64 {
-        block[8..16].copy_from_slice(&i.to_be_bytes());
-        let mut ct = block;
-        aes.encrypt_block(&mut ct);
-        let take = (out.len() - written).min(16);
-        out[written..written + take].copy_from_slice(&ct[..take]);
+    while written < out.len() {
+        let nblk = (out.len() - written).div_ceil(16).min(W);
+        for blk in ks[..nblk * 16].chunks_exact_mut(16) {
+            blk[..8].copy_from_slice(&index.to_be_bytes());
+            blk[8..].copy_from_slice(&ctr.to_be_bytes());
+            ctr += 1;
+        }
+        aes.encrypt_blocks(&mut ks[..nblk * 16]);
+        let take = (out.len() - written).min(nblk * 16);
+        out[written..written + take].copy_from_slice(&ks[..take]);
         written += take;
     }
+    // Raw key-derivation keystream.
+    ks.zeroize();
 }
 
 // ---------------------------------------------------------------------------

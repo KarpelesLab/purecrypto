@@ -219,41 +219,40 @@ fn sub_word(backend: AesBackend, w: [u8; 4]) -> [u8; 4] {
 /// Expands `key` (`nk` 32-bit words) into `out`, the round-key bytes for `nr`
 /// rounds (`16 * (nr + 1)` bytes). The control flow depends only on the public
 /// key length, not on key contents.
+///
+/// Word-oriented (FIPS-197 §5.2 as written): the schedule is built as
+/// little-endian `u32` words - RotWord is a rotate, the XORs are one word
+/// each - and serialised once at the end, instead of byte loops per word.
 fn key_expansion(backend: AesBackend, key: &[u8], nk: usize, nr: usize, out: &mut [u8]) {
     let total_words = 4 * (nr + 1);
-    out[..key.len()].copy_from_slice(key);
+    // At most 60 words (AES-256: 4 × 15).
+    let mut w = [0u32; 60];
+    for (wi, k) in w.iter_mut().zip(key.chunks_exact(4)) {
+        *wi = u32::from_le_bytes(k.try_into().expect("4-byte word"));
+    }
 
     let mut rcon = 1u8;
-    // The temporary word is (a transform of) the previous round-key word;
-    // hoisted so one wipe after the loop covers it.
-    let mut t = [0u8; 4];
     for i in nk..total_words {
-        let prev = i - 1;
-        t = [
-            out[prev * 4],
-            out[prev * 4 + 1],
-            out[prev * 4 + 2],
-            out[prev * 4 + 3],
-        ];
-
+        let mut t = w[i - 1];
         if i % nk == 0 {
-            // RotWord, then SubWord, then XOR the round constant.
-            t = sub_word(backend, [t[1], t[2], t[3], t[0]]);
-            t[0] ^= rcon;
+            // RotWord (bytes `t1 t2 t3 t0`; byte 0 is the low byte of the
+            // little-endian word, so this is a rotate right by 8), then
+            // SubWord, then XOR the round constant into byte 0.
+            t = u32::from_le_bytes(sub_word(backend, t.rotate_right(8).to_le_bytes()))
+                ^ rcon as u32;
             // rcon = xtime(rcon); public, so the branch is fine.
             rcon = (rcon << 1) ^ if rcon & 0x80 != 0 { 0x1b } else { 0 };
         } else if nk > 6 && i % nk == 4 {
             // AES-256 applies an extra SubWord a quarter of the way in.
-            t = sub_word(backend, t);
+            t = u32::from_le_bytes(sub_word(backend, t.to_le_bytes()));
         }
-
-        let base = i * 4;
-        let src = (i - nk) * 4;
-        for j in 0..4 {
-            out[base + j] = out[src + j] ^ t[j];
-        }
+        w[i] = w[i - nk] ^ t;
     }
-    crate::zeroize::Zeroize::zeroize(&mut t);
+    for (o, wi) in out.chunks_exact_mut(4).zip(w.iter()) {
+        o.copy_from_slice(&wi.to_le_bytes());
+    }
+    // The word array is a second copy of the whole schedule.
+    crate::zeroize::Zeroize::zeroize(&mut w);
 }
 
 /// Encrypts one or two states with the expanded round keys. SubBytes is
