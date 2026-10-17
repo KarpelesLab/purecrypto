@@ -930,6 +930,12 @@ pub struct QuicConnection {
     /// callers feed `Instant::now() - self.start` (via
     /// [`Self::now_since_start`]).
     start: Instant,
+    /// The clock reading the current `feed_datagram*` / `pop_datagram*` /
+    /// `on_timeout` call runs against, `None` between calls. One event is
+    /// one instant in the RFC 9002 pseudocode; reading the clock once per
+    /// call instead of six or seven times per packet also keeps every
+    /// decision taken while processing it consistent.
+    now_cached: Option<Duration>,
     /// RFC 9000 §10.1 idle timeout: time (relative to [`Self::start`]) of the
     /// last packet we received and successfully processed from the peer. The
     /// idle timer is measured from here; an idle connection is silently closed
@@ -1370,6 +1376,7 @@ impl QuicConnection {
             close_resend_threshold: 1,
             one_rtt_phase_initialized: false,
             start: Instant::now(),
+            now_cached: None,
             peer_ack_params_installed: false,
             peer_packet_seen: false,
             last_recv_activity: Duration::ZERO,
@@ -1525,6 +1532,7 @@ impl QuicConnection {
             close_resend_threshold: 1,
             one_rtt_phase_initialized: false,
             start: Instant::now(),
+            now_cached: None,
             peer_ack_params_installed: false,
             peer_packet_seen: false,
             last_recv_activity: Duration::ZERO,
@@ -1629,13 +1637,28 @@ impl QuicConnection {
     /// address-validation bookkeeping). Equivalent to
     /// [`Self::feed_datagram_from_with_ecn`] with no ECN marking.
     pub fn feed_datagram_from(&mut self, addr: SocketAddr, datagram: &[u8]) -> Result<(), Error> {
+        let now = self.now_since_start();
+        self.feed_datagram_from_at(now, addr, datagram)
+    }
+
+    /// [`Self::feed_datagram_from`] against the caller's clock: `now` is
+    /// the time since the connection was constructed, as
+    /// [`Self::next_timeout`] / [`Self::on_timeout`] measure it, and stands
+    /// in for the clock throughout the call. Lets an I/O loop read the
+    /// clock once per batch of datagrams.
+    pub fn feed_datagram_from_at(
+        &mut self,
+        now: Duration,
+        addr: SocketAddr,
+        datagram: &[u8],
+    ) -> Result<(), Error> {
         if self.peer_addr.is_none() {
             self.peer_addr = Some(addr);
             self.peer_addr_validated = true;
         }
         self.current_rx_addr = Some(addr);
         self.current_rx_len = datagram.len();
-        let result = self.feed_datagram(datagram);
+        let result = self.feed_datagram_at(now, datagram);
         self.current_rx_addr = None;
         self.current_rx_len = 0;
         result
@@ -1649,6 +1672,24 @@ impl QuicConnection {
     /// returned error means the engine state was *not* updated by that
     /// packet; previously-applied progress remains).
     pub fn feed_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
+        let now = self.now_since_start();
+        self.feed_datagram_at(now, datagram)
+    }
+
+    /// [`Self::feed_datagram`] against the caller's clock: `now` is the
+    /// time since the connection was constructed, as
+    /// [`Self::next_timeout`] / [`Self::on_timeout`] measure it, and stands
+    /// in for the clock throughout the call (arrival time, RTT samples,
+    /// timer re-arming). Lets an I/O loop read the clock once per batch of
+    /// datagrams.
+    pub fn feed_datagram_at(&mut self, now: Duration, datagram: &[u8]) -> Result<(), Error> {
+        let prev = self.now_cached.replace(now);
+        let result = self.feed_datagram_inner(datagram);
+        self.now_cached = prev;
+        result
+    }
+
+    fn feed_datagram_inner(&mut self, datagram: &[u8]) -> Result<(), Error> {
         // RFC 9000 §10.3.1: once the connection has observed a
         // stateless reset, further datagrams are silently dropped.
         if self.closed {
@@ -2005,6 +2046,24 @@ impl QuicConnection {
     /// Drains one outbound UDP datagram. Returns an empty `Vec` when
     /// nothing is pending. Each call returns at most one datagram.
     pub fn pop_datagram(&mut self) -> Vec<u8> {
+        let now = self.now_since_start();
+        self.pop_datagram_at(now)
+    }
+
+    /// [`Self::pop_datagram`] against the caller's clock: `now` is the
+    /// time since the connection was constructed, as
+    /// [`Self::next_timeout`] / [`Self::on_timeout`] measure it, and stands
+    /// in for the clock throughout the call (send times, ACK delay, timer
+    /// re-arming). Lets an I/O loop read the clock once per batch of
+    /// datagrams.
+    pub fn pop_datagram_at(&mut self, now: Duration) -> Vec<u8> {
+        let prev = self.now_cached.replace(now);
+        let datagram = self.pop_datagram_timed();
+        self.now_cached = prev;
+        datagram
+    }
+
+    fn pop_datagram_timed(&mut self) -> Vec<u8> {
         // Phase 8 — closed connections never emit.
         if self.closed {
             return Vec::new();
@@ -2519,10 +2578,15 @@ impl QuicConnection {
     /// Returns the monotonic [`Duration`] since this connection was
     /// constructed. Used as the time axis for the RFC 9002 loss-recovery
     /// state machine — every internal caller of `LossState::on_packet_sent`
-    /// / `on_ack_received` / `detect_lost` passes this value.
+    /// / `on_ack_received` / `detect_lost` passes this value. Inside a
+    /// `feed_datagram*` / `pop_datagram*` / `on_timeout` call this is that
+    /// call's clock reading ([`Self::now_cached`]).
     #[inline]
     pub(crate) fn now_since_start(&self) -> Duration {
-        Instant::now().saturating_duration_since(self.start)
+        match self.now_cached {
+            Some(now) => now,
+            None => Instant::now().saturating_duration_since(self.start),
+        }
     }
 
     /// RFC 9000 §10.1: a packet was received and successfully processed —
@@ -2847,6 +2911,12 @@ impl QuicConnection {
     /// constructed. Caller passes a monotonic clock reading. Engine
     /// re-evaluates timers and may queue retransmissions.
     pub fn on_timeout(&mut self, now_since_start: Duration) {
+        let prev = self.now_cached.replace(now_since_start);
+        self.on_timeout_inner(now_since_start);
+        self.now_cached = prev;
+    }
+
+    fn on_timeout_inner(&mut self, now_since_start: Duration) {
         // RFC 9001 §6.5 — drop retained previous-phase read keys once
         // 3×PTO has elapsed since the key-phase commit installed them.
         self.maybe_discard_prev_rx_keys(now_since_start);
