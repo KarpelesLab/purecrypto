@@ -647,6 +647,62 @@ fn client_flight_order_is_enforced_12() {
     assert!(server.is_handshake_complete());
 }
 
+/// After the client's flight is in, both sides finish and the client's
+/// identity was authenticated; a late plaintext handshake record at the
+/// server is then ignored (epoch 0 is closed for good).
+fn assert_mutual_handshake_done_12(client: &mut DtlsClientConnection12, server: &mut Server12) {
+    assert!(server.is_handshake_complete());
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(client.is_handshake_complete());
+    let (_, ccert) = client_identity();
+    assert_eq!(server.peer_certificates(), &[ccert]);
+    let mut late = alloc::vec![22u8, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0x7f, 0, 12];
+    late.extend_from_slice(&[hs_type::CERTIFICATE_VERIFY, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0]);
+    server.feed_datagram(&late).unwrap();
+    client.send(b"ping").unwrap();
+    pump12(client, server).unwrap();
+    assert_eq!(server.take_received(), b"ping");
+}
+
+/// Regression: the client's CCS (plaintext, epoch 0) delivered ahead of
+/// its CertificateVerify. The CCS used to retire epoch 0 on the spot, so
+/// the CertificateVerify — and every retransmission of it — was dropped
+/// while the Finished sat in the reassembler forever. Epoch-0 handshake
+/// records must stay readable until the client's Finished has verified.
+#[test]
+fn ccs_reordered_before_certificate_verify_12() {
+    let (mut client, mut server) = Setup::mutual(true).pair12();
+    let flight = client_final_flight_12(&mut client, &mut server);
+    assert_eq!(flight.len(), 5);
+    // Certificate, ClientKeyExchange, CCS, CertificateVerify, Finished.
+    for i in [0usize, 1, 3, 2, 4] {
+        server.feed_datagram(&flight[i]).unwrap();
+    }
+    assert_mutual_handshake_done_12(&mut client, &mut server);
+}
+
+/// Regression: a forged plaintext CCS from an off-path spoofer lands
+/// between the ClientKeyExchange (which creates the pending read keys, so
+/// the forgery is honoured) and the CertificateVerify. The genuine CCS is
+/// then a duplicate — harmless, as long as the CertificateVerify is still
+/// read at epoch 0.
+#[test]
+fn spoofed_ccs_between_key_exchange_and_certificate_verify_12() {
+    let (mut client, mut server) = Setup::mutual(true).pair12();
+    let flight = client_final_flight_12(&mut client, &mut server);
+    assert_eq!(flight.len(), 5);
+    server.feed_datagram(&flight[0]).unwrap();
+    server.feed_datagram(&flight[1]).unwrap();
+    let spoofed_ccs = [20u8, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0x7f, 0, 1, 1];
+    server.feed_datagram(&spoofed_ccs).unwrap();
+    for dg in &flight[2..] {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert_mutual_handshake_done_12(&mut client, &mut server);
+}
+
 /// A server that requested no certificate refuses an unsolicited one, and
 /// a client that was not asked sends none.
 #[test]

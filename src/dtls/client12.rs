@@ -783,14 +783,34 @@ impl DtlsClientConnection12 {
             return Ok(());
         }
 
-        // Epoch must be either current read_epoch or one ahead (after server
-        // CCS). Anything else is silently dropped.
+        // The server's final flight is `[NewSessionTicket]` at epoch 0
+        // (RFC 5077 §3.3), then its CCS and, at epoch 1, its Finished. The
+        // CCS is plaintext: datagrams reorder, and an off-path spoofer who
+        // knows the 4-tuple can forge one (`20 fe fd 00 00 00 00 00 00 00
+        // 7f 00 01 01`) — our read keys exist from the moment our own
+        // flight leaves, so it would be honoured. Were epoch 0 retired the
+        // moment the CCS lands, a NewSessionTicket arriving after it would
+        // be dropped — and so would every retransmission, which carries the
+        // same epoch — wedging the handshake for good while the Finished
+        // sat in the reassembler waiting for it. So while we wait for the
+        // server's Finished, epoch-0 handshake records stay readable after
+        // the CCS: they are exactly as unauthenticated as before it, pass
+        // through the same reassembler `message_seq` filter and silent-drop
+        // policy, and the Finished, which covers the whole transcript,
+        // still has the last word. Once the handshake is over the epoch
+        // gate below closes epoch 0 for good.
+        if rec.epoch == 0
+            && self.read_epoch == 1
+            && rec.content_type == ContentType::Handshake
+            && rec.cid.is_none()
+            && self.state == State::WaitServerFinished
+        {
+            let plain = rec.fragment.to_vec();
+            return self.process_handshake_record(&plain, false);
+        }
+        // Otherwise the epoch must be the current read epoch: the server's
+        // CCS moves it to 1, and anything else is silently dropped.
         if rec.epoch != self.read_epoch {
-            // The peer's encrypted flight may arrive before its CCS in
-            // theory. In practice CCS is record-content-type 20 at epoch 0,
-            // and Finished is content-type 22 at epoch 1. We accept records
-            // at epoch+1 only if we've already installed the read crypter
-            // (which happens on CCS).
             return Ok(());
         }
 
@@ -1212,13 +1232,15 @@ impl DtlsClientConnection12 {
             State::WaitServerKeyExchange => self.on_server_key_exchange(msg_type, body, raw),
             State::WaitServerHelloDone => self.on_server_hello_done(msg_type, body, raw),
             // RFC 5077 §3.3: the NewSessionTicket precedes the server's CCS
-            // (epoch 0); the Finished follows it (epoch 1). Once the CCS is
-            // in, epoch-0 records are dropped, so `ccs_received` tells the
-            // two apart and neither is accepted on the wrong side of it.
+            // (epoch 0); the Finished follows it (epoch 1). Their order in
+            // the transcript is fixed by `message_seq` — the reassembler
+            // dispatches in sequence — and by the state: once the Finished
+            // has verified we are `Connected` and no ticket is accepted.
+            // The CCS itself is no ordering signal: it is plaintext and may
+            // be reordered after the ticket or forged ahead of it (see
+            // `process_record`), so `ccs_received` gates only the Finished,
+            // which cannot be read without the keys the CCS switches in.
             State::WaitServerFinished if msg_type == hs_type::NEW_SESSION_TICKET => {
-                if self.ccs_received {
-                    return Err(Error::UnexpectedMessage);
-                }
                 self.on_new_session_ticket(body, raw)
             }
             State::WaitServerFinished if !self.ccs_received => Err(Error::UnexpectedMessage),

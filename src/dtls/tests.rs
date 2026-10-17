@@ -6222,20 +6222,63 @@ mod resume12 {
         assert!(c.take_session().is_some());
     }
 
-    /// RFC 5077 §3.3: the NewSessionTicket belongs before the server's CCS.
-    /// Delivered after it, the (epoch-0) ticket is dropped; the Finished,
-    /// which covers the ticket, then fails to verify, and no session is
-    /// ever released.
+    /// After the handshake completed with the ticket in hand: the session
+    /// is released, data flows, and epoch 0 is closed for good — a late
+    /// plaintext handshake record is ignored, never fatal.
+    fn assert_done_with_ticket<R: crate::rng::RngCore>(
+        c: &mut DtlsClientConnection12,
+        s: &mut DtlsServerConnection12<R>,
+    ) {
+        assert!(c.is_handshake_complete());
+        assert!(c.take_session().is_some(), "the ticket was kept");
+        let late = dtls12_plaintext_handshake_record(
+            crate::tls::codec::hs_type::NEW_SESSION_TICKET,
+            9,
+            &[0u8; 6],
+        );
+        c.feed_datagram(&late).unwrap();
+        app_round_trip(c, s);
+    }
+
+    /// Regression: the server's CCS (plaintext, epoch 0) delivered ahead
+    /// of its NewSessionTicket — an ordinary datagram reorder. The CCS
+    /// used to retire epoch 0 on the spot, so the ticket, and every
+    /// retransmission of it, was dropped while the Finished sat in the
+    /// reassembler forever. RFC 5077 §3.3 fixes the ticket's place in the
+    /// transcript by `message_seq`, which the reassembler enforces, and
+    /// the Finished covers it: epoch-0 handshake records must stay
+    /// readable until that Finished has verified.
     #[test]
-    fn ticket_after_ccs_is_not_accepted() {
+    fn ticket_reordered_after_ccs_is_still_accepted() {
         let (cfg, cert) = server(false, TICKET_KEY);
         let mut c = client(&cert, None, b"resume12-late-c");
         let mut s = server_conn(&cfg, b"resume12-late-s");
         let fin = to_server_final_flight(&mut c, &mut s);
+        // CCS, NewSessionTicket, Finished.
         c.feed_datagram(&fin[1]).unwrap();
         c.feed_datagram(&fin[0]).unwrap();
-        let _ = c.feed_datagram(&fin[2]);
+        c.feed_datagram(&fin[2]).unwrap();
+        assert_done_with_ticket(&mut c, &mut s);
+    }
+
+    /// Regression: a forged plaintext CCS — `20 fe fd 00 00 00 00 00 00 00
+    /// 7f 00 01 01`, all an off-path spoofer who knows the 4-tuple needs —
+    /// lands before the server's genuine final flight. The client's read
+    /// keys exist from the moment its own flight leaves, so the forgery
+    /// is honoured and the genuine CCS becomes a duplicate: harmless, as
+    /// long as the NewSessionTicket that follows at epoch 0 is still read.
+    #[test]
+    fn spoofed_ccs_before_final_flight_does_not_wedge_client() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        let mut c = client(&cert, None, b"resume12-spoof-c");
+        let mut s = server_conn(&cfg, b"resume12-spoof-s");
+        let fin = to_server_final_flight(&mut c, &mut s);
+        let spoofed_ccs = [20u8, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0x7f, 0, 1, 1];
+        c.feed_datagram(&spoofed_ccs).unwrap();
         assert!(!c.is_handshake_complete());
-        assert!(c.take_session().is_none());
+        for dg in &fin {
+            c.feed_datagram(dg).unwrap();
+        }
+        assert_done_with_ticket(&mut c, &mut s);
     }
 }

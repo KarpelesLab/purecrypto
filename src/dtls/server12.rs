@@ -982,6 +982,30 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             // Unknown record version: silently discard.
             return Ok(());
         }
+        // The client's final flight is `[Certificate] ClientKeyExchange
+        // [CertificateVerify]` at epoch 0, then its CCS and, at epoch 1,
+        // its Finished. The CCS is plaintext: datagrams reorder, and an
+        // off-path spoofer who knows the 4-tuple can forge one (`20 fe fd
+        // 00 00 00 00 00 00 00 7f 00 01 01`). Were epoch 0 retired the
+        // moment the CCS lands, a CertificateVerify arriving after it would
+        // be dropped — and so would every retransmission, which carries the
+        // same epoch — wedging the handshake for good while the Finished
+        // sat in the reassembler waiting for it. So while the client's
+        // flight is still being collected, epoch-0 handshake records stay
+        // readable after the CCS: they are exactly as unauthenticated as
+        // before it, pass through the same reassembler `message_seq` filter
+        // and silent-drop policy, and the Finished, which covers the whole
+        // transcript, still has the last word. Once the handshake is over
+        // the epoch gate below closes epoch 0 for good.
+        if rec.epoch == 0
+            && self.read_epoch == 1
+            && rec.content_type == ContentType::Handshake
+            && rec.cid.is_none()
+            && self.state == State::WaitClientFlight
+        {
+            let plain = rec.fragment.to_vec();
+            return self.process_handshake_record(&plain, false);
+        }
         if rec.epoch != self.read_epoch {
             return Ok(());
         }
