@@ -312,8 +312,21 @@ impl ClientIo {
             {
                 qc.on_timeout(self.epoch.elapsed());
             }
-            // ICMP port-unreachable surfaces here on a connected socket:
-            // the peer is gone, and the caller decides what that means.
+            // ICMP port-unreachable surfaces here on a connected socket
+            // (ECONNREFUSED on Linux, WSAECONNRESET on Windows) when a
+            // datagram reached a port nobody is bound to — a peer that is
+            // restarting, or a NAT rebinding. RFC 9000 §10.3 does not let
+            // an unauthenticated ICMP message end a connection; the engine
+            // keeps its timers and the next packet either reaches a live
+            // peer or draws a stateless reset it can authenticate.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                qc.on_timeout(self.epoch.elapsed());
+            }
             Err(e) => return Err(format!("UDP recv failed: {e}")),
         }
         Ok(())
