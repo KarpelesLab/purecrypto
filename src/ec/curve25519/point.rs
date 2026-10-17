@@ -15,7 +15,7 @@
 //! never see secret scalars or secret points.
 
 #[cfg(feature = "ed25519-table")]
-use super::base_table::{ED25519_BASE_2_256, ED25519_BASE_TABLE};
+use super::base_table::{ED25519_BASE_2_256, ED25519_BASE_ODD, ED25519_BASE_TABLE};
 #[cfg(feature = "ed25519-table")]
 use super::field::mask_from_bit;
 use super::field::{Fe, Field, ScalarInt, eq_mask};
@@ -431,34 +431,6 @@ impl Field {
         self.scalar_mult(scalar, &self.base())
     }
 
-    /// **Variable-time** fixed-base multiplication `[scalar]·B` over the same
-    /// signed table as [`Self::mul_base`], but indexing each window entry
-    /// directly by the digit's magnitude and skipping zero digits.
-    ///
-    /// # Warning: public inputs only
-    ///
-    /// The lookup index and the skip pattern leak the scalar through timing
-    /// and memory access. This must ONLY ever be called with **public**
-    /// scalars (e.g. the signature scalar `S` during Ed25519 verification) —
-    /// never with signing nonces or secret keys.
-    #[cfg(feature = "ed25519-table")]
-    pub(crate) fn mul_base_vartime(&self, scalar: &[u8; 32]) -> Point {
-        let digits = radix16_signed(scalar);
-        let mut acc = self.identity();
-        for (window, &d) in ED25519_BASE_TABLE.iter().zip(digits.iter()) {
-            if d > 0 {
-                acc = self.add_niels(&acc, &Niels::from_entry(&window[d as usize - 1]));
-            } else if d < 0 {
-                let n = Niels::from_entry(&window[(-d) as usize - 1]);
-                acc = self.add_niels(&acc, &n.negate());
-            }
-        }
-        if digits[64] != 0 {
-            acc = self.add_niels(&acc, &Niels::from_entry(&ED25519_BASE_2_256));
-        }
-        acc
-    }
-
     /// **Variable-time** `[scalar]·p` via a width-5 wNAF ladder: ~254
     /// doublings plus one addition per nonzero digit (≈ 1 in 6), against a
     /// table of the 8 odd multiples `[1]P..[15]P`.
@@ -468,12 +440,13 @@ impl Field {
     /// Both the branch pattern and the table indices leak the scalar. This
     /// must ONLY ever be called with **public** scalars and points (e.g. the
     /// challenge scalar `k` and public key `A` during Ed25519 verification).
-    // With the comb table off, Ed25519 verification goes through the
-    // interleaved `double_scalar_mult_base_vartime` instead.
-    #[cfg(any(test, feature = "ed25519-table"))]
+    // Ed25519 verification goes through the interleaved
+    // `double_scalar_mult_base_vartime`; this single-scalar ladder is kept
+    // as a test oracle.
+    #[cfg(test)]
     pub(crate) fn scalar_mult_vartime(&self, scalar: &[u8; 32], p: &Point) -> Point {
         let odd = self.odd_multiples(p);
-        let naf = wnaf5(scalar);
+        let naf = wnaf(scalar, 5);
         let Some(top) = naf.iter().rposition(|&d| d != 0) else {
             return self.identity();
         };
@@ -487,9 +460,13 @@ impl Field {
     }
 
     /// **Variable-time** `[a]·p + [b]·B`, the Ed25519 verification
-    /// combination. With the comb table this is [`Self::scalar_mult_vartime`]
-    /// plus [`Self::mul_base_vartime`]; without it, both width-5 wNAF ladders
-    /// are interleaved (Straus) so they share one run of ~254 doublings.
+    /// combination: both wNAF ladders interleaved (Straus) so they share one
+    /// run of ~254 doublings. The variable point uses width 5 against its 8
+    /// odd multiples computed on the fly; the base point uses width 8
+    /// against the static Niels table [`ED25519_BASE_ODD`] (`[1]B, [3]B, …,
+    /// [127]B`, feature `ed25519-table`; ≈ 1 mixed addition per 9 bits) or,
+    /// without the table, width 5 against odd multiples of `B` computed on
+    /// the fly.
     ///
     /// # Warning: public inputs only
     ///
@@ -501,32 +478,43 @@ impl Field {
         p: &Point,
         b: &[u8; 32],
     ) -> Point {
+        let odd_p = self.odd_multiples(p);
+        let naf_a = wnaf(a, 5);
         #[cfg(feature = "ed25519-table")]
-        {
-            self.point_add(&self.scalar_mult_vartime(a, p), &self.mul_base_vartime(b))
-        }
+        let naf_b = wnaf(b, 8);
         #[cfg(not(feature = "ed25519-table"))]
-        {
-            let odd_p = self.odd_multiples(p);
-            let odd_b = self.odd_multiples(&self.base());
-            let naf_a = wnaf5(a);
-            let naf_b = wnaf5(b);
-            let Some(top) = naf_a
-                .iter()
-                .zip(naf_b.iter())
-                .rposition(|(&x, &y)| x != 0 || y != 0)
-            else {
-                return self.identity();
-            };
+        let naf_b = wnaf(b, 5);
+        #[cfg(not(feature = "ed25519-table"))]
+        let odd_b = self.odd_multiples(&self.base());
+        let Some(top) = naf_a
+            .iter()
+            .zip(naf_b.iter())
+            .rposition(|(&x, &y)| x != 0 || y != 0)
+        else {
+            return self.identity();
+        };
 
-            let mut acc = self.identity();
-            for i in (0..=top).rev() {
-                acc = self.point_double(&acc);
-                acc = self.add_naf_digit(&acc, naf_a[i], &odd_p);
+        let mut acc = self.identity();
+        for i in (0..=top).rev() {
+            acc = self.point_double(&acc);
+            acc = self.add_naf_digit(&acc, naf_a[i], &odd_p);
+            #[cfg(feature = "ed25519-table")]
+            {
+                let d = naf_b[i];
+                if d > 0 {
+                    acc =
+                        self.add_niels(&acc, &Niels::from_entry(&ED25519_BASE_ODD[d as usize / 2]));
+                } else if d < 0 {
+                    let n = Niels::from_entry(&ED25519_BASE_ODD[(-d) as usize / 2]);
+                    acc = self.add_niels(&acc, &n.negate());
+                }
+            }
+            #[cfg(not(feature = "ed25519-table"))]
+            {
                 acc = self.add_naf_digit(&acc, naf_b[i], &odd_b);
             }
-            acc
         }
+        acc
     }
 
     /// The odd multiples `odd[i] = [2i+1]P` for `i in 0..8`, the lookup table
@@ -566,13 +554,15 @@ impl Field {
     }
 }
 
-/// Width-5 non-adjacent form of a 256-bit little-endian scalar: digits in
-/// `{0, ±1, ±3, …, ±15}` with at least 4 zeros between nonzero digits. The
-/// extra trailing positions absorb the recoding carry of scalars close to
-/// `2^256`, so any 256-bit integer is represented exactly.
-/// **Variable-time**; only for public scalars.
-fn wnaf5(scalar: &[u8; 32]) -> [i8; 261] {
-    let mut naf = [0i8; 261];
+/// Width-`w` non-adjacent form (`w ∈ {5, 8}`) of a 256-bit little-endian
+/// scalar: odd digits in `(−2^(w−1), 2^(w−1))` with at least `w − 1` zeros
+/// between nonzero digits. The extra trailing positions absorb the recoding
+/// carry of scalars close to `2^256` (the last window may start at bit 255
+/// and the carry lands up to `w` positions later), so any 256-bit integer
+/// is represented exactly. **Variable-time**; only for public scalars.
+fn wnaf(scalar: &[u8; 32], w: u32) -> [i8; 264] {
+    debug_assert!(w == 5 || w == 8);
+    let mut naf = [0i8; 264];
 
     // Five u64 limbs so the window read below may index one limb past the
     // scalar's 256 bits.
@@ -583,15 +573,16 @@ fn wnaf5(scalar: &[u8; 32]) -> [i8; 261] {
         *limb = u64::from_le_bytes(b);
     }
 
-    let width = 1u64 << 5;
+    let width = 1u64 << w;
     let window_mask = width - 1;
+    let w = w as usize;
 
     let mut pos = 0;
     let mut carry = 0u64;
     while pos < 256 {
         let idx = pos / 64;
         let bit = pos % 64;
-        let bit_buf = if bit < 64 - 5 {
+        let bit_buf = if bit < 64 - w {
             x[idx] >> bit
         } else {
             (x[idx] >> bit) | (x[idx + 1] << (64 - bit))
@@ -608,10 +599,10 @@ fn wnaf5(scalar: &[u8; 32]) -> [i8; 261] {
             carry = 1;
             naf[pos] = (window as i8).wrapping_sub(width as i8);
         }
-        pos += 5;
+        pos += w;
     }
     // A carry surviving past bit 255 stands for `+2^pos`; record it (pos is
-    // at most 260, and the digit is always +1).
+    // at most 263, and the digit is always +1).
     if carry != 0 {
         naf[pos] = 1;
     }
@@ -689,6 +680,66 @@ mod tests {
         }
         // After 64 windows `base` is [16^64]B = [2^256]B.
         check(&ED25519_BASE_2_256, &base);
+        // The wNAF-8 table: [1]B, [3]B, …, [127]B.
+        let b = f.base();
+        let b2 = f.point_double(&b);
+        let mut acc = b;
+        for (i, entry) in ED25519_BASE_ODD.iter().enumerate() {
+            if i > 0 {
+                acc = f.point_add(&acc, &b2);
+            }
+            check(entry, &acc);
+        }
+    }
+
+    /// The width-5 and width-8 wNAF recodings reproduce every scalar exactly
+    /// (odd digits within range, enough zeros between them), on edge and
+    /// random scalars.
+    #[test]
+    fn wnaf_round_trips() {
+        use crate::hash::Sha256;
+        use crate::rng::{HmacDrbg, RngCore};
+        let check = |s: &[u8; 32], w: u32| {
+            let naf = wnaf(s, w);
+            let half = 1i16 << (w - 1);
+            let mut last_nonzero: Option<usize> = None;
+            let mut acc = Uint::<5>::ZERO;
+            for (i, &d) in naf.iter().enumerate().rev() {
+                acc = acc.wrapping_add(&acc);
+                if d != 0 {
+                    assert!(d % 2 != 0 && (d as i16).abs() < half, "digit {d} at {i}");
+                    if let Some(n) = last_nonzero {
+                        assert!(n - i >= w as usize, "digits too close at {i}, {n}");
+                    }
+                    last_nonzero = Some(i);
+                    if d > 0 {
+                        acc = acc.wrapping_add(&Uint::<5>::from_u64(d as u64));
+                    } else {
+                        acc = acc.wrapping_sub(&Uint::<5>::from_u64((-d) as u64));
+                    }
+                }
+            }
+            let mut want = [0u8; 40];
+            want[..32].copy_from_slice(s);
+            assert_eq!(acc, Uint::<5>::from_le_bytes(&want), "wnaf{w} of {s:02x?}");
+        };
+        let mut rng = HmacDrbg::<Sha256>::new(b"wnaf-roundtrip", b"nonce", &[]);
+        for w in [5u32, 8] {
+            for s in [
+                [0u8; 32],
+                [0xffu8; 32],
+                [0x80u8; 32],
+                [0x7fu8; 32],
+                [1u8; 32],
+            ] {
+                check(&s, w);
+            }
+            for _ in 0..200 {
+                let mut s = [0u8; 32];
+                rng.fill_bytes(&mut s);
+                check(&s, w);
+            }
+        }
     }
 
     /// The signed recoding reproduces every scalar exactly, with digits in
@@ -766,12 +817,6 @@ mod tests {
                 comb,
                 f.encode(&f.scalar_mult(s, &b)),
                 "comb/ladder mismatch"
-            );
-            #[cfg(feature = "ed25519-table")]
-            assert_eq!(
-                comb,
-                f.encode(&f.mul_base_vartime(s)),
-                "vartime comb mismatch"
             );
             assert_eq!(
                 comb,
@@ -879,6 +924,23 @@ mod tests {
             print!("0x{l:013x}, ");
         }
         println!();
+        println!("];");
+        println!();
+        // [1]B, [3]B, …, [127]B for the wNAF-8 verification ladder.
+        println!("pub(crate) static ED25519_BASE_ODD: [[u64; 15]; 64] = [");
+        let b = f.base();
+        let b2 = f.point_double(&b);
+        let mut acc = b;
+        for i in 0..64 {
+            if i > 0 {
+                acc = f.point_add(&acc, &b2);
+            }
+            print!("    [");
+            for l in &niels(&acc) {
+                print!("0x{l:013x}, ");
+            }
+            println!("],");
+        }
         println!("];");
     }
 }

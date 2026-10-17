@@ -352,9 +352,9 @@ impl Ed25519PublicKey {
     /// included).
     ///
     /// All verification inputs — signature, message, and public key — are
-    /// public, so this path deliberately uses the **variable-time** scalar
-    /// multiplications (`mul_base_vartime`, `scalar_mult_vartime`); nothing
-    /// secret flows through them. Signing and key generation stay on the
+    /// public, so this path deliberately uses the **variable-time**
+    /// interleaved double-scalar multiplication
+    /// (`double_scalar_mult_base_vartime`); nothing secret flows through it. Signing and key generation stay on the
     /// constant-time ladders.
     pub fn verify(&self, message: &[u8], signature: &Ed25519Signature) -> Result<(), Error> {
         let f = Field::new();
