@@ -34,7 +34,22 @@ pub(super) const IV: [u32; 8] = [
 pub(super) const MSG_PERMUTATION: [usize; 16] =
     [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
-#[inline]
+/// The message word order of each of the seven rounds: round `r` reads
+/// `m[MSG_SCHEDULE[r][k]]` where the reference applies [`MSG_PERMUTATION`]
+/// `r` times. Indexed only by constants from the unrolled compression, so it
+/// is a compile-time table (no copy of the 16 message words per round). The
+/// SIMD backends keep permuting their word vectors with `MSG_PERMUTATION`.
+pub(super) const MSG_SCHEDULE: [[usize; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
+#[inline(always)]
 fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
     state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
     state[d] = (state[d] ^ state[a]).rotate_right(16);
@@ -46,27 +61,20 @@ fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my:
     state[b] = (state[b] ^ state[c]).rotate_right(7);
 }
 
-#[inline]
-fn round(state: &mut [u32; 16], m: &[u32; 16]) {
+/// Round `R` (0..7) over the unpermuted message words.
+#[inline(always)]
+fn round<const R: usize>(state: &mut [u32; 16], m: &[u32; 16]) {
+    let s = &MSG_SCHEDULE[R];
     // Columns.
-    g(state, 0, 4, 8, 12, m[0], m[1]);
-    g(state, 1, 5, 9, 13, m[2], m[3]);
-    g(state, 2, 6, 10, 14, m[4], m[5]);
-    g(state, 3, 7, 11, 15, m[6], m[7]);
+    g(state, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+    g(state, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+    g(state, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+    g(state, 3, 7, 11, 15, m[s[6]], m[s[7]]);
     // Diagonals.
-    g(state, 0, 5, 10, 15, m[8], m[9]);
-    g(state, 1, 6, 11, 12, m[10], m[11]);
-    g(state, 2, 7, 8, 13, m[12], m[13]);
-    g(state, 3, 4, 9, 14, m[14], m[15]);
-}
-
-#[inline]
-fn permute(m: &[u32; 16]) -> [u32; 16] {
-    let mut out = [0u32; 16];
-    for (i, &p) in MSG_PERMUTATION.iter().enumerate() {
-        out[i] = m[p];
-    }
-    out
+    g(state, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+    g(state, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+    g(state, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+    g(state, 3, 4, 9, 14, m[s[14]], m[s[15]]);
 }
 
 /// The BLAKE3 compression: 7 rounds over the 16-word state, returning the full
@@ -96,13 +104,13 @@ fn compress(
         block_len,
         flags,
     ];
-    let mut m = *block;
-    for r in 0..7 {
-        round(&mut state, &m);
-        if r < 6 {
-            m = permute(&m);
-        }
-    }
+    round::<0>(&mut state, block);
+    round::<1>(&mut state, block);
+    round::<2>(&mut state, block);
+    round::<3>(&mut state, block);
+    round::<4>(&mut state, block);
+    round::<5>(&mut state, block);
+    round::<6>(&mut state, block);
     for i in 0..8 {
         state[i] ^= state[i + 8];
         state[i + 8] ^= cv[i];
@@ -192,20 +200,43 @@ impl ChunkState {
         }
     }
 
+    /// Folds one full block into the chaining value.
+    #[inline]
+    fn compress_block(&mut self, block: &[u8; 64]) {
+        let m = words_from_block(block);
+        self.cv = first8(compress(
+            &self.cv,
+            &m,
+            self.chunk_counter,
+            BLOCK_LEN as u32,
+            self.flags | self.start_flag(),
+        ));
+        self.blocks_compressed += 1;
+    }
+
     fn update(&mut self, mut input: &[u8]) {
+        // The last block of a chunk is never compressed here (its output needs
+        // `CHUNK_END`), so a full buffered block is only folded once more input
+        // arrives, and the direct path below stops while a block or less is
+        // left. The buffer's unused tail is kept zero (`output` reads all 64
+        // bytes), re-zeroed only when a fresh partial block starts.
         while !input.is_empty() {
             if self.block_len as usize == BLOCK_LEN {
-                let m = words_from_block(&self.block);
-                self.cv = first8(compress(
-                    &self.cv,
-                    &m,
-                    self.chunk_counter,
-                    BLOCK_LEN as u32,
-                    self.flags | self.start_flag(),
-                ));
-                self.blocks_compressed += 1;
-                self.block = [0u8; 64];
+                let block = self.block;
+                self.compress_block(&block);
                 self.block_len = 0;
+            }
+            if self.block_len == 0 {
+                // Full blocks straight from the input slice: no copy into the
+                // buffer and no re-zeroing of it per block.
+                while input.len() > BLOCK_LEN {
+                    let (block, rest) = input.split_at(BLOCK_LEN);
+                    self.compress_block(block.try_into().expect("BLOCK_LEN bytes"));
+                    input = rest;
+                }
+                if input.len() < BLOCK_LEN {
+                    self.block[input.len()..].fill(0);
+                }
             }
             let want = BLOCK_LEN - self.block_len as usize;
             let take = want.min(input.len());
@@ -325,6 +356,25 @@ impl Blake3 {
         // the batched chunks can be the final/root chunk), hash `DEGREE` chunks
         // at once and feed their chaining values into the tree. The scalar loop
         // below owns the last — possibly partial, possibly root — chunk.
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        {
+            use super::blake3_neon::{DEGREE, hash_chunks4, supported};
+            const BULK: usize = DEGREE * CHUNK_LEN;
+            if supported() {
+                while self.chunk_state.len() == 0 && input.len() > BULK {
+                    let base = self.chunk_state.chunk_counter;
+                    let block: &[u8; BULK] = input[..BULK]
+                        .try_into()
+                        .expect("slice is exactly BULK bytes");
+                    let cvs = hash_chunks4(block, &self.key, base, self.flags);
+                    for (k, cv) in cvs.iter().enumerate() {
+                        self.add_chunk_cv(*cv, base + k as u64 + 1);
+                    }
+                    self.chunk_state.chunk_counter = base + DEGREE as u64;
+                    input = &input[BULK..];
+                }
+            }
+        }
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
         {
             use super::blake3_simd::{
@@ -404,8 +454,26 @@ impl Blake3 {
 
     /// The standard 32-byte digest.
     pub fn finalize(&self) -> [u8; 32] {
+        // One root compression written straight out, rather than building a
+        // `Blake3Reader` (its own block buffer, fill and drop-wipe) for a
+        // single block's worth of output.
+        let mut output = self.root_output();
+        let mut words = compress(
+            &output.input_cv,
+            &output.block,
+            0,
+            output.block_len,
+            output.flags | ROOT,
+        );
         let mut out = [0u8; 32];
-        self.finalize_into_slice(&mut out);
+        for (chunk, w) in out.chunks_exact_mut(4).zip(words.iter()) {
+            chunk.copy_from_slice(&w.to_le_bytes());
+        }
+        // The root node is key material in the keyed modes, and the full
+        // 16-word state holds the next XOF block beyond the digest.
+        super::zeroize::zero_words(&mut words);
+        super::zeroize::zero_words(&mut output.input_cv);
+        super::zeroize::zero_words(&mut output.block);
         out
     }
 
@@ -425,9 +493,11 @@ impl Blake3 {
     fn zeroize(&mut self) {
         self.chunk_state.zeroize();
         super::zeroize::zero_words(&mut self.key);
-        for cv in self.cv_stack.iter_mut() {
-            super::zeroize::zero_words(cv);
-        }
+        // Only the live entries ever held anything; the rest of the 54-entry
+        // stack is still the zeros it was built with, and wiping all 1.7 KB
+        // with volatile stores dominated the cost of hashing a short message.
+        let used = self.cv_stack_len.min(self.cv_stack.len());
+        super::zeroize::zero_words(self.cv_stack[..used].as_flattened_mut());
         self.cv_stack_len = 0;
     }
 }
@@ -480,13 +550,16 @@ impl Blake3Reader {
 }
 
 impl XofReader for Blake3Reader {
-    fn read(&mut self, out: &mut [u8]) {
-        for b in out.iter_mut() {
+    fn read(&mut self, mut out: &mut [u8]) {
+        while !out.is_empty() {
             if self.offset == BLOCK_LEN {
                 self.fill();
             }
-            *b = self.block[self.offset];
-            self.offset += 1;
+            let n = (BLOCK_LEN - self.offset).min(out.len());
+            let (head, rest) = out.split_at_mut(n);
+            head.copy_from_slice(&self.block[self.offset..self.offset + n]);
+            self.offset += n;
+            out = rest;
         }
     }
 }
@@ -643,10 +716,32 @@ mod tests {
         h.update(&buf[1024..1025]);
         h.update(&buf[1025..]);
         assert_eq!(h.finalize(), oneshot);
+
+        // Every split of a few-block message, so the direct-from-slice block
+        // path, the buffered top-up and the kept-back final block are all
+        // exercised against each other (the tail of the block buffer must stay
+        // zero across a partial block that is later extended).
+        for len in [63usize, 64, 65, 127, 128, 129, 200, 1023, 1024, 1025, 2049] {
+            let want = blake3(&buf[..len]);
+            for split in [0usize, 1, 31, 63, 64, 65, 100, 128, 129] {
+                if split > len {
+                    continue;
+                }
+                let mut h = Blake3::new();
+                h.update(&buf[..split]);
+                h.update(&buf[split..len]);
+                assert_eq!(h.finalize(), want, "len {len} split {split}");
+            }
+            let mut h = Blake3::new();
+            for piece in buf[..len].chunks(7) {
+                h.update(piece);
+            }
+            assert_eq!(h.finalize(), want, "len {len} in 7-byte pieces");
+        }
     }
 
     /// Deterministic xorshift byte generator for the SIMD differential tests.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn xorshift(seed: u64) -> impl FnMut() -> u8 {
         let mut s = seed | 1;
         move || {
@@ -720,14 +815,57 @@ mod tests {
         }
     }
 
+    /// The NEON 4-chunk kernel must produce, for every lane, exactly the
+    /// chaining value the scalar `ChunkState` produces for that chunk — across
+    /// random data, several counter bases, and every keying mode.
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    #[test]
+    fn neon_chunk_kernel_matches_scalar() {
+        use super::super::blake3_neon::{DEGREE, hash_chunks4, supported};
+        std::eprintln!(
+            "blake3: neon={}",
+            if supported() { "RUNNING" } else { "SKIPPED" }
+        );
+        if !supported() {
+            return;
+        }
+        let mut next = xorshift(0x1234_5678_9abc_def0);
+        let mut key = [0u32; 8];
+        for w in key.iter_mut() {
+            *w = u32::from_le_bytes([next(), next(), next(), next()]);
+        }
+        for &(k, flags) in &[(IV, 0u32), (key, KEYED_HASH), (key, DERIVE_KEY_MATERIAL)] {
+            for &base in &[0u64, 1, 7, 8, 1_000_000, (1u64 << 32) - 3] {
+                let mut buf = alloc::vec![0u8; DEGREE * CHUNK_LEN];
+                for b in buf.iter_mut() {
+                    *b = next();
+                }
+                let block: &[u8; DEGREE * CHUNK_LEN] = buf[..].try_into().unwrap();
+                let got = hash_chunks4(block, &k, base, flags);
+                for (lane, g) in got.iter().enumerate() {
+                    let mut cs = ChunkState::new(k, base + lane as u64, flags);
+                    cs.update(&buf[lane * CHUNK_LEN..(lane + 1) * CHUNK_LEN]);
+                    assert_eq!(
+                        *g,
+                        cs.output().chaining_value(),
+                        "neon lane {lane}, base {base}, flags {flags}"
+                    );
+                }
+            }
+        }
+    }
+
     /// End-to-end: hashing a large buffer through the public API (which takes
-    /// the SIMD bulk path for inputs above 8 chunks) must equal feeding the same
-    /// bytes in sub-8-KiB pieces (which never triggers the bulk path), for every
-    /// hasher mode. Validates the bulk-path counter / tree-merge integration on
-    /// top of the kernel.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    /// the SIMD bulk path for inputs above 8 chunks — 4 on aarch64) must equal
+    /// feeding the same bytes in sub-4-KiB pieces (which never triggers the
+    /// bulk path), for every hasher mode. Validates the bulk-path counter /
+    /// tree-merge integration on top of the kernel.
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn simd_bulk_matches_scalar_end_to_end() {
+        #[cfg(target_arch = "aarch64")]
+        use super::super::blake3_neon::supported;
+        #[cfg(target_arch = "x86_64")]
         use super::super::blake3_simd::supported;
         if !supported() {
             return;
@@ -735,6 +873,7 @@ mod tests {
         // Sizes around chunk-batch boundaries plus a large value, including a
         // partial trailing chunk.
         for &n in &[
+            4 * CHUNK_LEN + 1,
             8 * CHUNK_LEN + 1,
             16 * CHUNK_LEN + 1,
             24 * CHUNK_LEN + 5,
@@ -757,8 +896,8 @@ mod tests {
                 let mut a = ctor();
                 a.update(&buf);
                 let simd = a.finalize();
-                // Scalar reference: feed in 4000-byte pieces (< 8 KiB each, so
-                // the bulk fast path never fires on a fresh chunk boundary).
+                // Scalar reference: feed in 4000-byte pieces (< 4 KiB each, so
+                // no bulk fast path ever fires on a fresh chunk boundary).
                 let mut b = ctor();
                 for piece in buf.chunks(4000) {
                     b.update(piece);
