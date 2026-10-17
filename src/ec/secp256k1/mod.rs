@@ -40,8 +40,11 @@
 #[cfg(feature = "bip340")]
 pub mod schnorr;
 
+#[cfg(feature = "secp256k1-table")]
+mod comb;
 pub mod ecdsa;
 pub(crate) mod field_backend;
+mod glv;
 mod group;
 #[cfg(feature = "secp256k1-table")]
 mod gtable;
@@ -312,13 +315,28 @@ impl ProjectivePoint {
         ProjectivePoint(Point::negate(&field(), &self.0))
     }
 
-    /// Returns `scalar · self`, constant time in the scalar: a fixed 4-bit
-    /// window (4 doublings and one unconditional complete addition per nibble)
-    /// whose table entry is fetched by a masked scan of all 16 entries, so
-    /// neither the operation schedule nor any memory index depends on the
-    /// scalar.
+    /// Returns `scalar · self`, constant time in the scalar: a GLV split into
+    /// two ~128-bit halves by a fixed sequence of modular operations, then a
+    /// single 128-doubling ladder over signed odd base-16 digits with, per
+    /// half and window, one masked scan of an eight-entry table, a masked
+    /// negation and one unconditional complete addition — so neither the
+    /// operation schedule nor any memory index depends on the scalar.
     pub fn mul(&self, scalar: &Scalar) -> ProjectivePoint {
         ProjectivePoint(Point::mul(&field(), scalar.0.as_limbs(), &self.0))
+    }
+
+    /// Returns `scalar · self` for a scalar whose **width** is public:
+    /// `scalar < 2^BITS` (`BITS` a multiple of four, at most 252). Constant
+    /// time in the value — every window does the same work — with a schedule
+    /// that depends on `BITS` alone, so a 64-bit committed value costs a
+    /// 64-doubling ladder instead of a 256-bit one (libsecp256k1-zkp's
+    /// `ecmult_const(…, 64)`). Bits at or above `BITS` must be clear.
+    pub(crate) fn mul_bits<const BITS: usize>(&self, scalar: &Scalar) -> ProjectivePoint {
+        ProjectivePoint(Point::mul_bits::<_, BITS>(
+            &field(),
+            scalar.0.as_limbs(),
+            &self.0,
+        ))
     }
 
     /// Returns `scalar · G` (scalar times the generator), constant time in the

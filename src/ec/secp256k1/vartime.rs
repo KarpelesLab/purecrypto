@@ -21,49 +21,10 @@
 //! two constant-time 4-bit-window ladders. No static table is used.
 
 use super::Scalar;
-use super::field_backend::{Fe, FieldBackend, fe_from_hex};
+use super::field_backend::{Fe, FieldBackend};
+use super::glv::{BETA, split_residues};
 use super::group::Point;
 use crate::ct::ConstantTimeLess;
-
-/// `β`, a primitive cube root of unity mod `p`: `(x, y) ↦ (β·x, y)` is the
-/// endomorphism acting as multiplication by [`LAMBDA`].
-const BETA: Fe = fe_from_hex("7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee");
-
-/// `λ`, the matching cube root of unity mod `n`.
-const LAMBDA: Fe = fe_from_hex("5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72");
-
-/// `−b₁ mod n` and `−b₂ mod n` for the short lattice basis
-/// `(a₁, b₁) = (0x3086…eb15, −0xe443…e4c3)`, `(a₂, b₂) = (0x1_14ca…4cfd8, a₁)`
-/// of `{(x, y) : x + y·λ ≡ 0 (mod n)}` (the libsecp256k1 constants).
-const MINUS_B1: Fe =
-    fe_from_hex("00000000000000000000000000000000e4437ed6010e88286f547fa90abfe4c3");
-const MINUS_B2: Fe =
-    fe_from_hex("fffffffffffffffffffffffffffffffe8a280ac50774346dd765cda83db1562c");
-
-/// `round(2³⁸⁴·b₂ / n)` and `round(2³⁸⁴·(−b₁) / n)`: `round(k·gᵢ / 2³⁸⁴)`
-/// approximates the Babai rounding coefficients of `k` in that basis.
-const G1: Fe = fe_from_hex("3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031");
-const G2: Fe = fe_from_hex("e4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71");
-
-/// `round(k·g / 2³⁸⁴)` for 256-bit `k` and `g`.
-fn mul_shift_384(k: &Fe, g: &Fe) -> Fe {
-    let (k, g) = (k.as_limbs(), g.as_limbs());
-    let mut t = [0u64; 8];
-    for i in 0..4 {
-        let mut carry: u128 = 0;
-        for j in 0..4 {
-            let acc = t[i + j] as u128 + (k[i] as u128) * (g[j] as u128) + carry;
-            t[i + j] = acc as u64;
-            carry = acc >> 64;
-        }
-        t[i + 4] = carry as u64;
-    }
-    // Bits 384.. plus the rounding bit 383 (no overflow: the quotient is
-    // < 2¹²⁸ since g < 2²⁵⁶ and k < 2²⁵⁶).
-    let round = t[5] >> 63;
-    let (lo, c) = t[6].overflowing_add(round);
-    Fe::from_limbs([lo, t[7] + c as u64, 0, 0])
-}
 
 /// `n/2`, the threshold above which a residue is treated as negative.
 fn half_order() -> Fe {
@@ -72,13 +33,10 @@ fn half_order() -> Fe {
 
 /// GLV split of `k < n`: returns `(k₁, k₂)` as `(magnitude, is_negative)`
 /// pairs with `k ≡ ±|k₁| ± |k₂|·λ (mod n)` and both magnitudes `< 2¹²⁸`.
-/// **Variable time** (public scalars only).
+/// **Variable time** (public scalars only): the sign normalisation of the
+/// constant-time [`split_residues`] branches.
 fn split_lambda(k: &Fe) -> [(Fe, bool); 2] {
-    let m = &Scalar::MODULUS;
-    let c1 = mul_shift_384(k, &G1);
-    let c2 = mul_shift_384(k, &G2);
-    let k2 = m.add_mod(&m.mul_mod(&c1, &MINUS_B1), &m.mul_mod(&c2, &MINUS_B2));
-    let k1 = m.sub_mod(k, &m.mul_mod(&k2, &LAMBDA));
+    let (k1, k2) = split_residues(k);
     let half = half_order();
     [k1, k2].map(|v| {
         if bool::from(half.ct_lt(&v)) {
@@ -214,6 +172,7 @@ mod tests {
     use super::*;
     use crate::ec::secp256k1::Scalar;
     use crate::ec::secp256k1::field_backend::Secp256k1Field;
+    use crate::ec::secp256k1::glv::LAMBDA;
 
     struct SplitMix64(u64);
     impl SplitMix64 {

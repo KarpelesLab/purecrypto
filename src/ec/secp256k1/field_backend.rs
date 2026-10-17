@@ -264,13 +264,13 @@ fn fold_carry(mut r: [u64; 4], carry: u64) -> ([u64; 4], u64) {
 /// limb rather than a `bool` so no comparison exists for the compiler to
 /// re-materialise as a jump.
 #[inline]
-fn mask_from_bit(bit: u64) -> u64 {
+pub(super) fn mask_from_bit(bit: u64) -> u64 {
     core::hint::black_box(bit.wrapping_neg())
 }
 
 /// Selects `a` when `mask == 0` and `b` when `mask == 0xFFFF…FF`, per limb.
 #[inline]
-fn select(a: &[u64; 4], b: &[u64; 4], mask: u64) -> [u64; 4] {
+pub(super) fn select(a: &[u64; 4], b: &[u64; 4], mask: u64) -> [u64; 4] {
     let mut out = [0u64; 4];
     let mut i = 0;
     while i < 4 {

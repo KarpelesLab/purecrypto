@@ -689,7 +689,7 @@ fn member_offset(j: u64, ring: usize, scale: u64) -> u64 {
 /// below `2⁶⁴` (see [`member_offset`]), so these points agree with the
 /// integer offsets.
 fn first_step(generator: &ProjectivePoint, scale: u64) -> ProjectivePoint {
-    generator.mul(&value_scalar(scale))
+    generator.mul_bits::<64>(&value_scalar(scale))
 }
 
 /// `4·step`, the next ring's member spacing.
@@ -800,7 +800,11 @@ fn parse<'a>(
     let gen_point = generator.as_point();
     let mut last = commit.as_point();
     if params.min_value != 0 {
-        last = last.add(&gen_point.mul(&value_scalar(params.min_value)).negate());
+        last = last.add(
+            &gen_point
+                .mul_bits::<64>(&value_scalar(params.min_value))
+                .negate(),
+        );
     }
     for point in &digit_commits[..ncommit] {
         last = last.add(&point.negate());
@@ -1176,8 +1180,10 @@ pub fn sign_into(
     for i in 0..layout.rings {
         let offset = value_scalar(member_offset(digits[i], i, params.scale));
         let share = Scalar::from_bytes_be_reduce(&sec[i]);
+        // The offset is secret (it carries the digit) but its 64-bit width
+        // is public, so the public-width ladder applies.
         digit_commits[i] = gen_point
-            .mul(&offset)
+            .mul_bits::<64>(&offset)
             .add(&ProjectivePoint::mul_generator(&share));
     }
     let mut encs = [[0u8; 33]; MAX_RINGS];

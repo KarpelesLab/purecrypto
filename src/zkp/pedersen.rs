@@ -495,8 +495,10 @@ fn hash_to_curve(f: &Field, tag: &[u8; 32]) -> Result<ProjectivePoint, Error> {
 /// Widens a `u64` value into a full group scalar.
 ///
 /// Every `u64` is far below the group order, so this never rejects. The
-/// conversion is constant time and the resulting scalar is used with the full
-/// 256-bit ladder, so the magnitude of `value` does not affect timing.
+/// conversion is constant time, and the point multiplications that consume
+/// the result run a ladder whose schedule depends only on the public 64-bit
+/// width (`mul_bits::<64>`), so the magnitude of `value` does not affect
+/// timing.
 pub fn value_scalar(value: u64) -> Scalar {
     let mut bytes = [0u8; 32];
     bytes[24..].copy_from_slice(&value.to_be_bytes());
@@ -699,9 +701,10 @@ impl Commitment {
     ) -> Result<Commitment, Error> {
         let r = blind_scalar(blind)?;
         let v = value_scalar(value);
+        // The value's width (64 bits) is public; its magnitude is not.
         let point = generator
             .as_point()
-            .mul(&v)
+            .mul_bits::<64>(&v)
             .add(&ProjectivePoint::mul_generator(&r));
         point.to_affine().map(Commitment).ok_or(Error::InvalidInput)
     }
@@ -837,7 +840,7 @@ pub fn verify_sum_with_generator(
     generator: &Generator,
 ) -> bool {
     let lhs = sum(inputs);
-    let fee_point = generator.as_point().mul(&value_scalar(fee));
+    let fee_point = generator.as_point().mul_bits::<64>(&value_scalar(fee));
     let rhs = sum(outputs).add(&fee_point);
     bool::from(lhs.ct_eq(&rhs))
 }
