@@ -77,15 +77,6 @@ pub(crate) const B1: Fp = Fp([
     0x8ec9733bbf78ab2f,
     0x09d645513d83de7e,
 ]);
-/// `0xc`
-pub(crate) const B1_3: Fp = Fp([
-    0x447600000027552e,
-    0xdcb8009a43480020,
-    0x6f7ee9ce4a6e8b59,
-    0xb10330b7c0a95bc6,
-    0x6140b1fcfb1e54b7,
-    0x0381be097f0bb4e1,
-]);
 /// `0x4 + 0x4·u`
 pub(crate) const B2: Fp2 = Fp2 {
     c0: Fp([

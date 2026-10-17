@@ -226,6 +226,13 @@ mod tests {
         assert_eq!(g + g, g.double());
         assert_eq!(g - g, G1::IDENTITY);
         assert_eq!(G1::IDENTITY.double(), G1::IDENTITY);
+        // 3b·x by additions equals the product with the constant.
+        use super::super::curve::CurveField;
+        let (x, _) = g.to_affine().unwrap();
+        assert_eq!(
+            CurveField::mul_by_b3(&x),
+            x * Fp::from_canonical(&[12, 0, 0, 0, 0, 0])
+        );
     }
 
     #[test]

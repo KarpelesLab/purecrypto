@@ -24,8 +24,9 @@ pub(crate) trait CurveField:
     const ONE: Self;
     /// The curve coefficient `b`.
     const B: Self;
-    /// `3·b`.
-    const B3: Self;
+    /// `3·b·self` (both curves have `3b = 12` or `12(1 + u)`, so this is a
+    /// handful of additions rather than a multiplication).
+    fn mul_by_b3(&self) -> Self;
     /// Byte length of one encoded coordinate.
     const ENCODED_LEN: usize;
 
@@ -134,10 +135,10 @@ impl<F: CurveField> Projective<F> {
         let y3 = x3.sub(&y3);
         let x3 = t0.add(&t0);
         let t0 = x3.add(&t0);
-        let t2 = F::B3.mul(&t2);
+        let t2 = t2.mul_by_b3();
         let z3 = t1.add(&t2);
         let t1 = t1.sub(&t2);
-        let y3 = F::B3.mul(&y3);
+        let y3 = y3.mul_by_b3();
         let x3 = t4.mul(&y3);
         let t2 = t3.mul(&t1);
         let x3 = t2.sub(&x3);
@@ -169,7 +170,7 @@ impl<F: CurveField> Projective<F> {
         let z3 = z3.add(&z3);
         let t1 = y.mul(z);
         let t2 = z.square();
-        let t2 = F::B3.mul(&t2);
+        let t2 = t2.mul_by_b3();
         let x3 = t2.mul(&z3);
         let y3 = t0.add(&t2);
         let z3 = t1.mul(&z3);
@@ -376,7 +377,6 @@ impl CurveField for super::fp::Fp {
     const ZERO: Self = Self::ZERO;
     const ONE: Self = Self::ONE;
     const B: Self = super::constants::B1;
-    const B3: Self = super::constants::B1_3;
     const ENCODED_LEN: usize = 48;
 
     #[inline]
@@ -412,6 +412,12 @@ impl CurveField for super::fp::Fp {
         Self::sqrt(self)
     }
     #[inline]
+    fn mul_by_b3(&self) -> Self {
+        // 12·x = 8x + 4x.
+        let x4 = self.double().double();
+        x4.double().add(&x4)
+    }
+    #[inline]
     fn lexicographically_largest(&self) -> Choice {
         Self::lexicographically_largest(self)
     }
@@ -429,7 +435,6 @@ impl CurveField for super::fp2::Fp2 {
     const ZERO: Self = Self::ZERO;
     const ONE: Self = Self::ONE;
     const B: Self = super::constants::B2;
-    const B3: Self = super::constants::B2_3;
     const ENCODED_LEN: usize = 96;
 
     #[inline]
@@ -463,6 +468,13 @@ impl CurveField for super::fp2::Fp2 {
     #[inline]
     fn sqrt(&self) -> CtOption<Self> {
         Self::sqrt(self)
+    }
+    #[inline]
+    fn mul_by_b3(&self) -> Self {
+        // (12 + 12u)(x + yu) = 12(x - y) + 12(x + y)u.
+        let t = Self::new(self.c0.sub(&self.c1), self.c0.add(&self.c1));
+        let t4 = t.double().double();
+        t4.double().add(&t4)
     }
     #[inline]
     fn lexicographically_largest(&self) -> Choice {

@@ -240,6 +240,10 @@ mod tests {
         assert_eq!(g.mul(&(a + b)), g.mul(&a) + g.mul(&b));
         assert_eq!(g.mul(&-Fr::ONE), -g);
         assert_eq!(g - g, G2::IDENTITY);
+        // 3b'·x by additions equals the product with the constant.
+        use super::super::curve::CurveField;
+        let (x, _) = g.to_affine().unwrap();
+        assert_eq!(CurveField::mul_by_b3(&x), x * super::super::constants::B2_3);
     }
 
     #[test]

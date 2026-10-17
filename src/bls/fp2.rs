@@ -86,15 +86,16 @@ impl Fp2 {
         self.add(self)
     }
 
-    /// `self · rhs` (Karatsuba: three `Fp` multiplications).
+    /// `self · rhs`: each output coefficient is a two-term sum of products
+    /// with a single Montgomery reduction (`c0 = a0·b0 + a1·(-b1)`,
+    /// `c1 = a0·b1 + a1·b0`) — the same multiply count as Karatsuba with one
+    /// reduction fewer and none of its additions.
     #[inline]
     pub fn mul(&self, rhs: &Fp2) -> Fp2 {
-        let aa = self.c0.mul(&rhs.c0);
-        let bb = self.c1.mul(&rhs.c1);
-        let sum = self.c0.add(&self.c1).mul(&rhs.c0.add(&rhs.c1));
+        let nb1 = rhs.c1.neg();
         Fp2 {
-            c0: aa.sub(&bb),
-            c1: sum.sub(&aa).sub(&bb),
+            c0: Fp::sum_of_products(&[self.c0, self.c1], &[rhs.c0, nb1]),
+            c1: Fp::sum_of_products(&[self.c0, self.c1], &[rhs.c1, rhs.c0]),
         }
     }
 

@@ -211,6 +211,74 @@ pub(crate) fn square<const N: usize>(a: &[u64; N], m: &[u64; N], inv: u64) -> [u
     mul(a, a, m, inv)
 }
 
+/// `Σᵢ aᵢ·bᵢ · 2^(-64N) mod m` for `M` pairs of operands `< m`, with a
+/// single interleaved Montgomery reduction instead of one per product
+/// (Algorithm 2 of Gueron, "Efficient software implementations of modular
+/// exponentiation"): limb `j` of every `bᵢ` is accumulated into a running
+/// `N + 2`-limb sum, which is then reduced by one Montgomery step.
+///
+/// The result is canonical provided `M·m < 2^(64N)` (the accumulator then
+/// ends below `2m` and one conditional subtraction finishes it); for the
+/// 381-bit `p` in six limbs that allows `M ≤ 9`. The schedule is fixed —
+/// nothing depends on the operand values.
+#[inline]
+pub(crate) fn sum_of_products<const N: usize, const M: usize>(
+    a: &[[u64; N]; M],
+    b: &[[u64; N]; M],
+    m: &[u64; N],
+    inv: u64,
+) -> [u64; N] {
+    const { assert!(N <= 6 && M >= 1) };
+    // `u` holds the running N+1-limb accumulator; `t` is u plus this
+    // column's products (N+2 limbs), before the shift by one limb.
+    let mut u = [0u64; 7];
+    let mut j = 0;
+    while j < N {
+        let mut t = [0u64; 8];
+        let mut l = 0;
+        while l <= N {
+            t[l] = u[l];
+            l += 1;
+        }
+        let mut i = 0;
+        while i < M {
+            let mut carry = 0u64;
+            let mut l = 0;
+            while l < N {
+                let (v, c) = mac(t[l], a[i][l], b[i][j], carry);
+                t[l] = v;
+                carry = c;
+                l += 1;
+            }
+            let (v, c) = adc(t[N], carry, 0);
+            t[N] = v;
+            t[N + 1] += c;
+            i += 1;
+        }
+        // One Montgomery step: add k·m so the low limb vanishes, drop it.
+        let k = t[0].wrapping_mul(inv);
+        let (_, mut carry) = mac(t[0], k, m[0], 0);
+        let mut l = 1;
+        while l < N {
+            let (v, c) = mac(t[l], k, m[l], carry);
+            u[l - 1] = v;
+            carry = c;
+            l += 1;
+        }
+        let (v, c) = adc(t[N], carry, 0);
+        u[N - 1] = v;
+        u[N] = t[N + 1] + c;
+        j += 1;
+    }
+    let mut r = [0u64; N];
+    let mut i = 0;
+    while i < N {
+        r[i] = u[i];
+        i += 1;
+    }
+    reduce_once(r, u[N], m)
+}
+
 /// Reduces the `2N`-limb value in `t[..2N]` (with `t[2N]` a spare limb that
 /// must be zero on entry) to `t·2^(-64N) mod m`.
 #[inline]

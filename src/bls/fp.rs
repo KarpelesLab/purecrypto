@@ -146,6 +146,22 @@ impl Fp {
         Fp(mont::square(&self.0, &MODULUS, INV))
     }
 
+    /// `Σᵢ aᵢ·bᵢ` with one Montgomery reduction for the whole sum (see
+    /// [`mont::sum_of_products`]); `M ≤ 9`.
+    #[inline]
+    pub(crate) fn sum_of_products<const M: usize>(a: &[Fp; M], b: &[Fp; M]) -> Fp {
+        const { assert!(M <= 9) };
+        let mut al = [[0u64; 6]; M];
+        let mut bl = [[0u64; 6]; M];
+        let mut i = 0;
+        while i < M {
+            al[i] = a[i].0;
+            bl[i] = b[i].0;
+            i += 1;
+        }
+        Fp(mont::sum_of_products(&al, &bl, &MODULUS, INV))
+    }
+
     /// `self^e` for a little-endian limb exponent. Fixed square-and-multiply
     /// schedule over every bit of `e`: the running time depends only on the
     /// exponent's limb count, so it is constant time in `self` whenever the
@@ -457,6 +473,17 @@ mod tests {
         .unwrap();
         for _ in 0..50 {
             assert_eq!(x * y, y * x);
+            assert_eq!(Fp::sum_of_products(&[x], &[y]), x * y);
+            assert_eq!(Fp::sum_of_products(&[x, y], &[y, x]), (x * y).double());
+            assert_eq!(
+                Fp::sum_of_products(&[x, -y, x], &[y, x, x]),
+                x * y - y * x + x.square()
+            );
+            let m1 = -Fp::ONE;
+            assert_eq!(
+                Fp::sum_of_products(&[m1; 9], &[m1; 9]),
+                Fp::from_canonical(&[9, 0, 0, 0, 0, 0])
+            );
             assert_eq!((x + y) * (x - y), x.square() - y.square());
             assert_eq!(x * x.invert().unwrap(), Fp::ONE);
             assert_eq!(x + (-x), Fp::ZERO);
