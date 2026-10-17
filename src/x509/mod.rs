@@ -288,6 +288,26 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
+/// Reads a `BOOLEAN DEFAULT FALSE` field at the reader's current position
+/// — an `Extension`'s `critical`, `BasicConstraints`' `cA` and the like.
+///
+/// Absent yields `false`, `TRUE` yields `true`. An explicit `FALSE` is
+/// [`Error::Malformed`]: DER (X.690 §11.5) forbids encoding a value equal
+/// to its DEFAULT, and a decoder that tolerates it accepts an encoding a
+/// strict peer rejects — the kind of disagreement that lets two parsers
+/// read different policy from the same bytes. The embedded root bundle
+/// and the fixtures all omit the default, so there is nothing to grandfather.
+pub(crate) fn read_default_false_boolean(r: &mut crate::der::Reader<'_>) -> Result<bool, Error> {
+    if r.peek_tag() != Some(crate::der::tag::BOOLEAN) {
+        return Ok(false);
+    }
+    if r.read_boolean()? {
+        Ok(true)
+    } else {
+        Err(Error::Malformed)
+    }
+}
+
 /// Encodes an `AlgorithmIdentifier`: `SEQUENCE { algorithm OID, parameters }`.
 /// For the algorithms here, `parameters` is `NULL` when `null_params` is set
 /// (RSA), else absent.

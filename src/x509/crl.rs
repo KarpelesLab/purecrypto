@@ -610,11 +610,7 @@ impl CertificateRevocationList {
                 return Err(Error::Malformed);
             }
             seen.push(id.clone());
-            let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
-                ext.read_boolean()?
-            } else {
-                false
-            };
+            let critical = super::read_default_false_boolean(&mut ext)?;
             let _value = ext.read_octet_string()?;
             ext.finish()?;
             let id = id.as_slice();
@@ -668,9 +664,7 @@ impl CertificateRevocationList {
         while !exts.is_empty() {
             let mut ext = exts.read_sequence()?;
             let id = parse_oid(ext.read_oid()?)?;
-            if ext.peek_tag() == Some(tag::BOOLEAN) {
-                ext.read_boolean()?;
-            }
+            super::read_default_false_boolean(&mut ext)?;
             let value = ext.read_octet_string()?;
             ext.finish()?;
             if id == OID_CRL_NUMBER {
@@ -729,11 +723,7 @@ impl CertificateRevocationList {
                             return Err(Error::Malformed);
                         }
                         seen.push(id.clone());
-                        let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
-                            ext.read_boolean()?
-                        } else {
-                            false
-                        };
+                        let critical = super::read_default_false_boolean(&mut ext)?;
                         let value = ext.read_octet_string()?;
                         // No trailing bytes inside the Extension SEQUENCE.
                         ext.finish()?;

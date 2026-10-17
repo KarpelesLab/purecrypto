@@ -934,11 +934,8 @@ impl Certificate {
             if id == oid::BASIC_CONSTRAINTS {
                 let mut r = Reader::new(value);
                 let mut seq = r.read_sequence()?;
-                let is_ca = if seq.peek_tag() == Some(tag::BOOLEAN) {
-                    seq.read_boolean()?
-                } else {
-                    false
-                };
+                // `cA BOOLEAN DEFAULT FALSE`: an explicit FALSE is not DER.
+                let is_ca = super::read_default_false_boolean(&mut seq)?;
                 let path_len = if !seq.is_empty() {
                     // Strict-DER unsigned INTEGER: no leading sign byte
                     // unnecessarily, no negative encodings, no empty body.
@@ -1226,6 +1223,16 @@ impl Certificate {
                 } else if unused != 0 {
                     return Err(Error::Malformed);
                 }
+                // DER §11.2.2 (named bit list): trailing zero bits are
+                // removed, so the final content octet is never 0x00 and
+                // `KeyUsage` (nine named bits) never needs more than two
+                // octets. Anything longer either carries bits RFC 5280 does
+                // not define or pads with zero octets a strict decoder
+                // would not emit — reject both rather than silently ignore
+                // the extra octets.
+                if bytes.len() > 2 || bytes.last() == Some(&0) {
+                    return Err(Error::Malformed);
+                }
                 let mut mask: u16 = 0;
                 if !bytes.is_empty() {
                     mask |= bytes[0] as u16;
@@ -1419,11 +1426,7 @@ impl Certificate {
                 return Err(Error::Malformed);
             }
             seen.push(id_der);
-            let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
-                ext.read_boolean()?
-            } else {
-                false
-            };
+            let critical = super::read_default_false_boolean(&mut ext)?;
             let value = ext.read_octet_string()?;
             // No trailing bytes inside the Extension SEQUENCE after extnValue.
             ext.finish()?;
@@ -3819,5 +3822,132 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         let cert = forge_cert_with_version_and_exts(2, &[raw_san(&[encode_tlv(0x81, b"")])]);
         assert!(cert.subject_alt_names().unwrap().is_empty());
         assert_eq!(cert.subject_alt_name_forms().unwrap(), 1 << 1);
+    }
+
+    /// F5: `cA BOOLEAN DEFAULT FALSE` — DER forbids encoding the default,
+    /// so an explicit `01 01 00` is rejected rather than read as `false`.
+    #[test]
+    fn basic_constraints_rejects_explicit_default_false() {
+        use crate::der::{encode_boolean, encode_sequence};
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::extension::Extension;
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"bc-false", b"n", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let signer = crate::x509::CertSigner::Ecdsa(&key);
+        let name = DistinguishedName::common_name("bc-false");
+        let ext = Extension {
+            oid: oid::BASIC_CONSTRAINTS.to_vec(),
+            critical: true,
+            value: encode_sequence(&encode_boolean(false)),
+        };
+        let cert = Certificate::self_signed_with_extensions(&signer, &name, &validity(), 1, &[ext])
+            .unwrap();
+        assert!(matches!(cert.basic_constraints(), Err(Error::Malformed)));
+        // The canonical empty SEQUENCE still reads as CA:FALSE.
+        let cert = Certificate::self_signed_with_extensions(
+            &signer,
+            &name,
+            &validity(),
+            1,
+            &[extension::basic_constraints(false, None)],
+        )
+        .unwrap();
+        assert_eq!(cert.basic_constraints().unwrap(), Some((false, None)));
+    }
+
+    /// F5: an `Extension` whose `critical` is an explicit `BOOLEAN FALSE`
+    /// encodes its DEFAULT and is rejected by every accessor that walks the
+    /// extensions; the `TRUE` counterpart parses.
+    #[test]
+    fn extension_explicit_critical_false_is_rejected() {
+        use crate::der::{encode_boolean, encode_context, encode_octet_string, encode_sequence};
+        let raw_ext = |critical: &[u8]| {
+            encode_sequence(
+                &[
+                    oid_tlv(oid::BASIC_CONSTRAINTS),
+                    critical.to_vec(),
+                    encode_octet_string(&encode_sequence(&[])),
+                ]
+                .concat(),
+            )
+        };
+        let field = |ext: Vec<u8>| encode_context(3, &encode_sequence(&ext));
+        let bad = forge_v3_cert_with_splices(&[], &[], &field(raw_ext(&encode_boolean(false))));
+        assert!(matches!(bad.extensions(), Err(Error::Malformed)));
+        assert!(matches!(bad.check_well_formed(), Err(Error::Malformed)));
+        let good = forge_v3_cert_with_splices(&[], &[], &field(raw_ext(&encode_boolean(true))));
+        assert!(good.extensions().unwrap()[0].critical);
+        let good = forge_v3_cert_with_splices(&[], &[], &field(raw_ext(&[])));
+        assert!(!good.extensions().unwrap()[0].critical);
+    }
+
+    /// F5: a `keyUsage` BIT STRING is a named bit list, so DER §11.2.2
+    /// trims trailing zero bits: a zero final octet (`03 03 07 80 00`) or
+    /// more than the two octets RFC 5280's nine bits need is rejected
+    /// instead of having the extra octets ignored.
+    #[test]
+    fn key_usage_rejects_non_minimal_bit_string() {
+        use crate::der::{encode_tlv, tag};
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::extension::Extension;
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ku-minimal", b"n", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let signer = crate::x509::CertSigner::Ecdsa(&key);
+        let name = DistinguishedName::common_name("ku-minimal");
+        let with = |content: &[u8]| {
+            let ext = Extension {
+                oid: oid::KEY_USAGE.to_vec(),
+                critical: true,
+                value: encode_tlv(tag::BIT_STRING, content),
+            };
+            Certificate::self_signed_with_extensions(&signer, &name, &validity(), 1, &[ext])
+                .unwrap()
+                .key_usage()
+        };
+        // Trailing zero octet.
+        assert!(matches!(with(&[0x07, 0x80, 0x00]), Err(Error::Malformed)));
+        // Three content octets, even with a defined-looking pattern.
+        assert!(matches!(
+            with(&[0x07, 0x80, 0x80, 0x80]),
+            Err(Error::Malformed)
+        ));
+        // Minimal encodings of the same usages parse.
+        assert_eq!(with(&[0x07, 0x80]).unwrap(), Some(0x0080));
+        assert_eq!(with(&[0x07, 0x80, 0x80]).unwrap(), Some(0x8080));
+        // The canonical empty keyUsage (`03 01 00`) is still accepted.
+        assert_eq!(with(&[0x00]).unwrap(), Some(0));
+    }
+
+    /// Every root in the embedded bundle must survive the strict-DER checks
+    /// on the fields the trust store reads: `RootCertStore::add_embedded_roots`
+    /// silently drops a root that fails to parse, so a tightening that
+    /// rejected a real-world encoding would shrink the trust store without
+    /// any test noticing.
+    #[cfg(feature = "embedded-roots")]
+    #[test]
+    fn embedded_roots_parse_under_strict_der() {
+        let mut failures = Vec::new();
+        for ca in cacrt::all() {
+            let der = ca.der();
+            let outcome = Certificate::from_der(der.to_vec()).and_then(|cert| {
+                cert.check_well_formed()?;
+                cert.basic_constraints()?;
+                cert.key_usage()?;
+                cert.signature_algorithm()?;
+                cert.extended_key_usages()?;
+                Ok(())
+            });
+            if let Err(e) = outcome {
+                failures.push(alloc::format!("{}: {e:?}", ca.label()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "embedded roots rejected: {failures:#?}"
+        );
     }
 }

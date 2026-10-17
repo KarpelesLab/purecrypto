@@ -539,10 +539,8 @@ impl OcspResponse {
         while !exts.is_empty() {
             let mut ext = exts.read_sequence()?;
             let id = parse_oid(ext.read_oid()?)?;
-            // critical BOOLEAN DEFAULT FALSE — skip if present.
-            if ext.peek_tag() == Some(tag::BOOLEAN) {
-                ext.read_boolean()?;
-            }
+            // critical BOOLEAN DEFAULT FALSE — the value is not needed here.
+            super::read_default_false_boolean(&mut ext)?;
             let value = ext.read_octet_string()?;
             if id.as_slice() == oid::ID_PKIX_OCSP_NONCE {
                 // RFC 8954 §2.1: the extnValue OCTET STRING wraps an inner
@@ -995,11 +993,7 @@ fn reject_unknown_critical_exts(wrapper: &[u8]) -> Result<(), Error> {
     while !exts.is_empty() {
         let mut ext = exts.read_sequence()?;
         let id = parse_oid(ext.read_oid()?)?;
-        let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
-            ext.read_boolean()?
-        } else {
-            false
-        };
+        let critical = super::read_default_false_boolean(&mut ext)?;
         let _value = ext.read_octet_string()?;
         ext.finish()?;
         if critical && id.as_slice() != oid::ID_PKIX_OCSP_NONCE {
