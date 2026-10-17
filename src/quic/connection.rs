@@ -989,6 +989,13 @@ pub struct QuicConnection {
     /// keyed" from "keyed, then discarded on handshake completion" (RFC 9001
     /// §4.9.1) so a later Initial can never be mistaken for the first one.
     initial_keys_installed: bool,
+    /// Client-only — the Source Connection ID of the first server packet
+    /// that authenticated. RFC 9000 §7.2: "Once a client has received a
+    /// valid Initial packet from the server, it MUST discard any subsequent
+    /// packet it receives on that connection with a different Source
+    /// Connection ID." Long-header packets whose SCID differs are dropped
+    /// before any AEAD work (F4).
+    server_scid: Option<ConnectionId>,
     /// RFC 9001 §4.1.2 — the handshake is *confirmed*: at the server once
     /// it completes, at the client once a HANDSHAKE_DONE frame arrives.
     /// Gates key updates (RFC 9001 §6.2) and the discard of Handshake keys
@@ -1375,6 +1382,7 @@ impl QuicConnection {
             reset_token_pinned: false,
             require_client_auth: false,
             initial_keys_installed: false,
+            server_scid: None,
             handshake_confirmed: false,
             handshake_done_pending: false,
             handshake_done_acked: false,
@@ -1529,6 +1537,7 @@ impl QuicConnection {
             reset_token_pinned,
             require_client_auth,
             initial_keys_installed: false,
+            server_scid: None,
             handshake_confirmed: false,
             handshake_done_pending: false,
             handshake_done_acked: false,
@@ -2208,6 +2217,18 @@ impl QuicConnection {
             && let Some(pkt) = self.build_packet_with_pad(Level::Handshake, handshake_pad, room)
         {
             datagram.extend_from_slice(&pkt);
+            // RFC 9001 §4.9.1: "a client MUST discard Initial keys when it
+            // first sends a Handshake packet". Sending one proves the
+            // server's whole Initial flight (the ServerHello the Handshake
+            // keys derive from) was received, so nothing legitimate can
+            // arrive at that level any more — only forgeries, which
+            // Initial's DCID-derived keys cannot tell apart (F4). The
+            // Initial packet coalesced ahead of this one, if any, is already
+            // built; §A.10 takes it out of loss recovery along with the
+            // level.
+            if self.role == Role::Client && self.endpoint.crypto.at(Level::Initial).tx.is_some() {
+                self.discard_level(Level::Initial);
+            }
         }
 
         // 1-RTT packet: ACK + stream / DATAGRAM / path / CID frames.
@@ -5088,7 +5109,10 @@ impl QuicConnection {
     ///   Discarding Initial is always safe once Handshake keys exist (RFC
     ///   9001 §4.9.1) and makes the client drop any stale retransmitted
     ///   server Initial via the rx-key `None` branch in
-    ///   `feed_long_header_packet`.
+    ///   `feed_long_header_packet`. Normally the client has already done
+    ///   so when it first *sent* a Handshake packet (`pop_datagram_inner`,
+    ///   per §4.9.1); this covers a client that completed without sending
+    ///   one yet, and `discard_level` is idempotent.
     fn discard_handshake_levels(&mut self) {
         let levels: &[Level] = match self.role {
             Role::Server => &[Level::Initial, Level::Handshake],
@@ -5652,6 +5676,20 @@ impl QuicConnection {
             return Err(Error::Decode);
         }
 
+        // RFC 9000 §7.2 — once a server packet has authenticated, its SCID
+        // is the only one this connection accepts: a long-header packet with
+        // a different Source Connection ID is discarded (F4). Checked before
+        // the AEAD so the drop is free, and only this packet is consumed —
+        // the Length field is authoritative for the coalesced packets behind
+        // it (RFC 9000 §12.2). Until that first authentic packet `cids.peer`
+        // may still legitimately move (a Retry's SCID, RFC 9000 §17.2.5.2).
+        if self.role == Role::Client
+            && let Some(pinned) = self.server_scid.as_ref()
+            && hdr.scid != pinned.as_slice()
+        {
+            return Ok(pkt_total_len);
+        }
+
         // Work on an owned mutable copy from the start of this packet
         // through its end; header protection mutates these bytes.
         let mut pkt = datagram[..pkt_total_len].to_vec();
@@ -5789,6 +5827,9 @@ impl QuicConnection {
             // outbound; on first inbound we sync to the server's
             // chosen SCID).
             self.endpoint.cids.peer = peer_cid;
+            // RFC 9000 §7.2 — and pin it: later long-header packets with a
+            // different SCID are discarded (F4).
+            self.server_scid = Some(peer_cid);
             // Propagate OUR `active_connection_id_limit` to the pool
             // bound (RFC 9000 §5.1.1). Without this, the pool's
             // default of 2 would reject any third NEW_CONNECTION_ID
@@ -15507,11 +15548,25 @@ mod tests {
     /// RFC 9001 §5.2 derives from that DCID alone — exactly what any observer
     /// of the connection's CIDs can forge.
     fn seal_forged_initial(dcid: &[u8], scid: &[u8], plaintext: &mut [u8]) -> Vec<u8> {
-        use crate::quic::crypto::{aead_seal, derive_dir_keys, derive_initial_secrets};
-        use crate::quic::pkt::{apply_header_protection, build_long_header};
+        use crate::quic::crypto::{derive_dir_keys, derive_initial_secrets};
         let (client_secret, _) = derive_initial_secrets(QuicVersion::V1, dcid);
         let keys = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &client_secret);
-        let (pn, pn_len) = (0u64, 1u8);
+        seal_initial_under(&keys, dcid, scid, 0, plaintext)
+    }
+
+    /// Seals `plaintext` as a v1 Initial `dcid`/`scid` with packet number
+    /// `pn` (one byte on the wire) under `keys`.
+    fn seal_initial_under(
+        keys: &crate::quic::crypto::DirKeys,
+        dcid: &[u8],
+        scid: &[u8],
+        pn: u64,
+        plaintext: &mut [u8],
+    ) -> Vec<u8> {
+        use crate::quic::crypto::aead_seal;
+        use crate::quic::pkt::{apply_header_protection, build_long_header};
+        assert!(pn < 256, "one-byte packet number");
+        let pn_len = 1u8;
         let length_field = pn_len as u64 + plaintext.len() as u64 + 16;
         let (mut pkt, pn_offset) = build_long_header(
             LongType::Initial,
@@ -15523,7 +15578,7 @@ mod tests {
             pn_len,
             length_field,
         );
-        let tag = aead_seal(&keys, pn, &pkt, plaintext);
+        let tag = aead_seal(keys, pn, &pkt, plaintext);
         pkt.extend_from_slice(plaintext);
         pkt.extend_from_slice(&tag);
         let sample: [u8; 16] = pkt[pn_offset + 4..pn_offset + 20].try_into().unwrap();
@@ -15577,6 +15632,128 @@ mod tests {
         let mut buf = [0u8; 32];
         let (n, _) = server.read(sid, &mut buf).expect("server read");
         assert_eq!(&buf[..n], b"still-alive");
+    }
+
+    /// F4 — RFC 9000 §7.2: once the client has processed a valid server
+    /// Initial, a long-header packet with a different Source Connection ID is
+    /// discarded, and RFC 9001 §4.9.1: the client discards its Initial keys
+    /// when it first sends a Handshake packet. Before the fix the SCID was
+    /// pinned only for as long as `cid_remote` was unseeded, and Initial keys
+    /// lived until handshake completion — so anyone who saw the ODCID could
+    /// keep feeding the client authenticated Initial packets.
+    #[test]
+    fn client_drops_initials_with_a_foreign_scid_and_initial_keys_once_handshake_is_sent() {
+        use crate::quic::crypto::{derive_dir_keys, derive_initial_secrets};
+        use crate::quic::pkt::LongHeader;
+        let (mut c, mut s) = loopback_pair();
+        let odcid = c.original_dcid().expect("ODCID").to_vec();
+        feed_flight(&mut c, &mut s);
+        // Deliver only the Initial packets of the server's flight (the
+        // ServerHello): the client then holds Handshake keys but has not
+        // completed, which is when the two rules below are observable.
+        // The Handshake packets coalesced behind them are held back.
+        let mut held_back: Vec<Vec<u8>> = Vec::new();
+        for dg in drain_datagrams(&mut s) {
+            let mut rest: &[u8] = &dg;
+            let mut initial_part = Vec::new();
+            while !rest.is_empty() {
+                let hdr = LongHeader::parse(rest).expect("long header");
+                let len = hdr.payload_off + usize::try_from(hdr.length).expect("len");
+                if hdr.typ != LongType::Initial {
+                    held_back.push(rest.to_vec());
+                    break;
+                }
+                initial_part.extend_from_slice(&rest[..len]);
+                rest = &rest[len..];
+            }
+            c.feed_datagram(&initial_part)
+                .expect("client feeds Initial");
+        }
+        assert!(
+            !held_back.is_empty(),
+            "test premise: a Handshake packet was held back"
+        );
+        assert!(
+            c.endpoint.crypto.at(Level::Handshake).rx.is_some(),
+            "precondition: the ServerHello was processed"
+        );
+        assert!(!c.is_handshake_complete());
+        assert!(
+            c.endpoint.crypto.at(Level::Initial).rx.is_some(),
+            "precondition: no Handshake packet sent yet, Initial keys still held"
+        );
+        let pinned = c.endpoint.cids.peer;
+        assert_eq!(c.server_scid, Some(pinned));
+        let acks_before = c.endpoint.pn.initial.pending_ack.clone();
+
+        // Server-direction Initial keys derive from the ODCID alone, so this
+        // packet authenticates; its SCID is not the server's.
+        let (_, server_secret) = derive_initial_secrets(QuicVersion::V1, &odcid);
+        let keys = derive_dir_keys(QuicVersion::V1, AeadAlg::Aes128Gcm, &server_secret);
+        let mut plain = alloc::vec![0x01u8]; // PING
+        Frame::Crypto {
+            offset: 4000,
+            data: b"not the server",
+        }
+        .encode(&mut plain);
+        plain.resize(64, 0x00);
+        let dcid = c.endpoint.cids.local.as_slice().to_vec();
+        let foreign = seal_initial_under(&keys, &dcid, &[0xEE; 8], 9, &mut plain.clone());
+        c.feed_datagram(&foreign).expect("dropped silently");
+        assert_eq!(c.endpoint.cids.peer, pinned, "DCID must not move");
+        assert_eq!(
+            c.endpoint.pn.initial.pending_ack, acks_before,
+            "§7.2: the packet is discarded, not processed"
+        );
+        assert!(!c.is_closing() && !c.is_closed());
+
+        // Control: the same PING under the genuine SCID is processed while
+        // the Initial keys are still held — the drop above is the SCID check.
+        let mut ping = alloc::vec![0x01u8];
+        ping.resize(64, 0x00);
+        let genuine = seal_initial_under(&keys, &dcid, pinned.as_slice(), 10, &mut ping);
+        c.feed_datagram(&genuine).expect("processed");
+        assert_ne!(c.endpoint.pn.initial.pending_ack, acks_before);
+
+        // Nothing at the Handshake level is owed yet, so the client's next
+        // flight is Initial-only and the Initial keys stay.
+        let ack_flight = drain_datagrams(&mut c);
+        assert!(!ack_flight.is_empty());
+        assert!(c.endpoint.crypto.at(Level::Initial).rx.is_some());
+
+        // The first server Handshake packet of a longer flight (say, a big
+        // certificate chain) would leave the client owing a Handshake-level
+        // ACK without completing the handshake. Stand that state up directly
+        // and let the client build the packet: §4.9.1 drops the Initial keys
+        // the moment it goes out.
+        c.endpoint.pn.handshake.pending_ack.insert(0);
+        c.endpoint.pn.handshake.ack_eliciting_pending = true;
+        let hs_flight = drain_datagrams(&mut c);
+        assert!(!hs_flight.is_empty(), "the Handshake ACK goes out");
+        assert!(
+            c.endpoint.crypto.at(Level::Initial).tx.is_none()
+                && c.endpoint.crypto.at(Level::Initial).rx.is_none(),
+            "§4.9.1: Initial keys go when the first Handshake packet is sent"
+        );
+        assert!(!c.is_handshake_complete(), "...well before completion");
+        assert!(c.endpoint.crypto.at(Level::Handshake).tx.is_some());
+        // Now even a genuine-SCID Initial is dropped (no keys) ...
+        let late = seal_initial_under(&keys, &dcid, pinned.as_slice(), 11, &mut ping);
+        c.feed_datagram(&late).expect("dropped: level discarded");
+        assert!(c.endpoint.pn.initial.pending_ack.ranges().is_empty());
+        // ... and the handshake still completes once the held-back
+        // Handshake packets arrive. (`ack_flight` acknowledges the injected
+        // PINGs' packet numbers, which the real server never sent, so it is
+        // "lost" on the way — the server needs nothing from it.)
+        drop(ack_flight);
+        for dg in &hs_flight {
+            s.feed_datagram(dg).expect("server feed");
+        }
+        for dg in &held_back {
+            c.feed_datagram(dg).expect("client feeds Handshake");
+        }
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
     }
 
     /// A server that REQUIRES a client certificate, against a client that has
