@@ -323,8 +323,12 @@ cert-compression = ["tls", "dep:compcol"]
 # following CA/Browser Forum rules (no filesystem access; portable across
 # Linux/macOS/Windows). Enables `RootCertStore::with_embedded_roots`.
 embedded-roots = ["tls", "dep:cacrt"]
-# C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
-# C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
+# C ABI: builds the `ffi` module. `unsafe_code` is denied crate-wide (see
+# `[lints.rust]` below); the FFI boundary is one of the scoped
+# `#[allow(unsafe_code)]` opt-ins, alongside the hardware kernels (AES-NI,
+# PMULL, SHA, SIMD), the raw syscalls, the volatile wipes and the inline-`asm!`
+# barriers listed there. Build a C library with
+# `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher", "ascon", "lms", "xmss"]
 # The `purecrypto` command-line tool (gates the binary target below).
 cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "pkcs12", "key", "tls", "dtls", "quic", "kdf", "cipher", "ascon", "lms", "xmss", "mldsa", "slhdsa", "embedded-roots"]
@@ -445,8 +449,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("fullrus
 # foundation honest.
 missing_docs = "warn"
 unreachable_pub = "warn"
-# Deny (not forbid) so a future `ffi`/SIMD module can opt back in locally
-# with a scoped `#[allow(unsafe_code)]`; the core stays safe.
+# Deny (not forbid) so a module can opt back in locally with a scoped
+# `#[allow(unsafe_code)]`. The opt-ins are the `ffi` C boundary, the
+# hardware kernels (AES-NI / PMULL / SHA / SIMD), the raw syscalls
+# (`getrandom`, `poll(2)` in `tls::signer`, the CLI's ECN socket options),
+# the WASM entropy import, the volatile wipes in `zeroize`, and the inline
+# `asm!` optimisation barriers / Valgrind client requests in `ct`,
+# `bignum::safegcd` and `falcon::fpr`; the rest of the crate stays safe.
 unsafe_code = "deny"
 
 [profile.release]

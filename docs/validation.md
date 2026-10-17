@@ -803,22 +803,39 @@ update with the commands in `tools/wycheproof/README.md`.
 
 ## Fuzzing
 
-33 `cargo-fuzz` (libFuzzer) targets under `fuzz/fuzz_targets/`, run in CI
+40 `cargo-fuzz` (libFuzzer) targets under `fuzz/fuzz_targets/`, run in CI
 (`.github/workflows/fuzz.yml`). They concentrate on the untrusted-input
 attack surface — parsers and protocol feeders:
 
 - **Encoding/parsers**: `der_reader`, `pem_decode`, `spki_pubkey`,
   `pkcs8_{rsa,ed25519,mldsa,slhdsa}`, `mlkem_pkcs8`, `ecdsa_sig_der`,
   `lms_parse`, `xmss_parse`, `dh_share`, `pbes2_decrypt`, `pkcs12_parse`.
+- **JOSE**: `jose_json` (the JSON reader), `jose_jws_parse`, `jose_jwe_parse`
+  (compact and JSON serializations, header validation) and `jose_jwk_parse`
+  (JWK / JWK Set, including private-member decoding and key validation).
 - **Signature decoders (through verify)**: `falcon_verify` (key + Golomb-Rice
   `s2` decoders), `mldsa_verify` (`z` / hint unpacking), `slhdsa_verify`.
 - **X.509 / PKI**: `x509_certificate`, `x509_crl`, `x509_csr`,
-  `ocsp_response`, `cert_decompress`.
+  `ocsp_response`, `cert_decompress`, `x509_sct_list` (RFC 6962 SCT lists,
+  raw and as the embedded-certificate extension value) and
+  `x509_verify_chain` (the TLS chain verifier against a pinned root: raw
+  DER leaf / intermediate chains, plus root-signed chains built from the
+  input so name constraints, hostname matching and EKU checks run past the
+  signature stage).
 - **Protocol feeders** (arbitrary bytes → state machine, must reject
   gracefully): `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`,
   `dtls_client_feed`, `dtls_server_feed`, `quic_client_feed`,
   `quic_server_feed`, `quic_transport_params`, `ech_config_list`,
-  `ech_extension`, `ech_retry_configs`.
+  `ech_extension`, `ech_retry_configs`, and `tls_handshake_messages` (the
+  crate-private handshake / extension decoders fed directly through the
+  hidden `__fuzz` feature, which the feed targets cannot reach past the key
+  exchange).
+
+The CI run is a smoke-level budget, not a campaign: it runs weekly, for a
+few minutes per target, from the corpus the previous runs accumulated in the
+Actions cache (no seed corpus is committed). Crashes are uploaded as workflow
+artifacts. For real coverage run a target locally for longer, e.g.
+`cargo +nightly fuzz run x509_certificate -- -max_total_time=3600`.
 
 ## Negative / malformed-input coverage
 
@@ -843,7 +860,8 @@ The suite contains explicit rejection tests throughout; representative classes:
   bytes, malformed RDNs, and bad string tags are rejected; PKCS#12 returns a
   single `MacMismatch` for a wrong password (no plaintext leak); TLS/DTLS/QUIC
   feeders surface alerts / errors rather than misbehaving. The fuzz targets
-  above exercise these paths continuously.
+  above cover these paths under the weekly, short-budget CI run described in
+  the previous section.
 
 ## Constant-time posture
 
