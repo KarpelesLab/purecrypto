@@ -371,6 +371,37 @@ impl Fe {
         z2_250_0.sqn(5).mul(&z11) // 2^255 − 21
     }
 
+    /// `self · k` for a small public constant `k < 2^17` (the Montgomery
+    /// ladder's `a24 = 121665`): five `u128` limb products and one carry
+    /// pass, instead of a full 25-product multiplication. Inputs may have
+    /// limbs up to `2^54` (`2^54 · 2^17 = 2^71` fits a `u128` limb product
+    /// with room for the carries); output limbs are `< 2^51 + 2^13`, the
+    /// same bound as [`Self::mul`].
+    #[inline]
+    pub(crate) fn mul_small(&self, k: u64) -> Fe {
+        debug_assert!(k < (1 << 17));
+        let a = &self.0;
+        let c0 = m(a[0], k);
+        let c1 = m(a[1], k) + (c0 >> 51);
+        let c2 = m(a[2], k) + (c1 >> 51);
+        let c3 = m(a[3], k) + (c2 >> 51);
+        let c4 = m(a[4], k) + (c3 >> 51);
+        let mut out = [
+            (c0 as u64) & M51,
+            (c1 as u64) & M51,
+            (c2 as u64) & M51,
+            (c3 as u64) & M51,
+            (c4 as u64) & M51,
+        ];
+        // The limb-4 carry is < 2^20 (limb < 2^54, k < 2^17, carry-in <
+        // 2^21 ⇒ c4 < 2^72 ⇒ c4 >> 51 < 2^21); ×19 keeps it < 2^26, so one
+        // more 0→1 carry leaves every limb < 2^51 + 2^13.
+        out[0] += ((c4 >> 51) as u64) * 19;
+        out[1] += out[0] >> 51;
+        out[0] &= M51;
+        Fe(out)
+    }
+
     /// `self^((p−5)/8) = self^(2^252 − 3)`, the candidate-root exponent used
     /// by `sqrt_ratio_i`. Same fixed addition chain discipline as
     /// [`Self::invert`].
@@ -752,6 +783,15 @@ mod tests {
                 a.invert_fermat().to_bytes(),
                 "invert (safegcd) != Fermat chain"
             );
+            // mul_small(k) == mul(k) for the ladder constant and the widest
+            // allowed multiplier.
+            for k in [121665u64, 1, 0, (1 << 17) - 1] {
+                assert_eq!(
+                    a.mul_small(k).to_bytes(),
+                    a.mul(&Fe::from_u64(k)).to_bytes(),
+                    "mul_small({k}) mismatch"
+                );
+            }
             let p_58 = P_INT
                 .wrapping_sub(&ScalarInt::from_u64(5))
                 .shr1()

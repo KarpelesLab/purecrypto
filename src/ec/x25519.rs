@@ -36,8 +36,9 @@ impl core::fmt::Display for X25519Error {
 
 impl core::error::Error for X25519Error {}
 
-/// `(A - 2) / 4 = 121665` for Curve25519, as a field element.
-const A24: Fe = Fe([121665, 0, 0, 0, 0]);
+/// `(A - 2) / 4 = 121665` for Curve25519, applied with the small-constant
+/// multiplication [`Fe::mul_small`].
+const A24: u64 = 121665;
 
 /// Computes the raw X25519 function: `scalar * point` on Curve25519, returning
 /// the resulting u-coordinate (little-endian, 32 bytes).
@@ -94,7 +95,7 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
         x3 = da.add(&cb).sq();
         z3 = x1.mul(&da.sub(&cb).sq());
         x2 = aa.mul(&bb);
-        z2 = e.mul(&aa.add(&A24.mul(&e)));
+        z2 = e.mul(&aa.add(&e.mul_small(A24)));
     }
     let sw = mask_from_bit(swap as u64);
     Fe::cswap(&mut x2, &mut x3, sw);
