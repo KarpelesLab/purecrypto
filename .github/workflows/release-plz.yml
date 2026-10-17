@@ -62,7 +62,12 @@ jobs:
               continue
             fi
             echo "Dispatching release-binaries for $tag"
-            gh workflow run release-binaries.yml -f tag="$tag"
+            # Dispatch on the tag ref itself so the run's workflow file and
+            # the checkout both come from the released commit (the workflow
+            # also pins its checkout to `refs/tags/$tag` and verifies it).
+            # Caveat: `--ref` requires release-binaries.yml to exist at that
+            # tag, which holds because the tag is cut from master.
+            gh workflow run release-binaries.yml --ref "$tag" -f tag="$tag"
           done
 
   release-plz-pr:

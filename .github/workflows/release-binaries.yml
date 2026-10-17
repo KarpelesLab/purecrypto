@@ -22,7 +22,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The release tag to upload against, supplied by the workflow_dispatch input.
+  # The release tag to build from and upload against, supplied by the
+  # workflow_dispatch input. Both jobs check out `refs/tags/$TAG` explicitly
+  # (not the default-branch HEAD the dispatch happened to run on) and then
+  # assert the checkout really is that tag, so the published binaries are
+  # built from exactly the commit the release names.
   TAG: ${{ inputs.tag }}
 
 jobs:
@@ -54,6 +58,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Verify the checkout is the release tag
+        shell: bash
+        run: |
+          got="$(git describe --tags --exact-match --match "$TAG")"
+          if [[ "$got" != "$TAG" ]]; then
+            echo "::error::checked out '$got', expected release tag '$TAG'"
+            exit 1
+          fi
+          echo "Building $TAG at $(git rev-parse HEAD)"
 
       - name: Install cross compiler (Linux aarch64)
         if: matrix.apt_packages
@@ -127,6 +143,18 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Verify the checkout is the release tag
+        shell: bash
+        run: |
+          got="$(git describe --tags --exact-match --match "$TAG")"
+          if [[ "$got" != "$TAG" ]]; then
+            echo "::error::checked out '$got', expected release tag '$TAG'"
+            exit 1
+          fi
+          echo "Building $TAG at $(git rev-parse HEAD)"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
