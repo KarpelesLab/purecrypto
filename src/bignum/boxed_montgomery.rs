@@ -133,43 +133,43 @@ impl BoxedMontModulus {
         m
     }
 
-    /// `R² mod n` for `R = 2^k`, `k = 64·limbs`, without the `2k` modular
-    /// doublings of the textbook loop (and without an allocation per step).
+    /// `R² mod n` for `R = 2^(64·l)`, `l = limbs`, without the `2·64·l`
+    /// modular doublings of the textbook loop (and without an allocation
+    /// per step).
     ///
     /// Writing `M(x) = x·R mod n` for the Montgomery form, a modular doubling
     /// maps `M(2^e)` to `M(2^(e+1))` and a Montgomery squaring maps it to
-    /// `M(2^(2e))`; the target `R² = M(2^k)`. So: reach `M(2) = 2R mod n` by
-    /// doublings, then walk the bits of `k` below its leading one — square,
-    /// and double where the bit is set — which takes `e` from 1 to `k` in
-    /// `⌊log₂ k⌋` squarings (11 at 2048 bits) plus `popcount(k) − 1`
-    /// doublings.
+    /// `M(2^(2e))`; the target `R² = M(2^(64·l))`. Starting from
+    /// `2^(bits−1)` — below `n`, which has that bit set — `64·l − bits + 1 + l`
+    /// doublings reach `M(2^l)`, and six squarings (`64 = 2^6`) reach
+    /// `M(2^(64·l))`. Six is about where another squaring stops paying for
+    /// the doublings it replaces (a doubling is ~3 limb operations, a
+    /// squaring ~l² multiplies): `l + 1` doublings for a full-width modulus
+    /// is a fraction of one squaring, against the 65 doublings and
+    /// `log₂(64·l)` (11 at 2048 bits) squarings of the previous chain.
     ///
-    /// The doublings start at `2^(64·(limbs−1))`, which is already below `n`:
-    /// the top limb of `n` is nonzero, and `n` is odd so it cannot equal that
-    /// power for `limbs > 1` (for `limbs = 1` the start is `1 < n`). That
-    /// leaves `64 + 1` doublings to `M(2)` instead of `64·limbs + 1`.
-    ///
-    /// Constant time in `n`: the only branches are on `limbs` and the bits of
-    /// `k`, both functions of the (public) modulus width; every doubling and
-    /// squaring is the masked-select arithmetic used everywhere else.
+    /// Constant time in `n`: the only branches are on `limbs` and on the
+    /// bit length of `n`, both public by the width convention documented at
+    /// [`BoxedUint::significant_limbs`] (the bit length is declassified for
+    /// the taint harness below); every doubling and squaring is the
+    /// masked-select arithmetic used everywhere else.
     fn compute_r2(&self) -> Vec<Limb> {
         let l = self.limbs;
+        // The bit length of a modulus is public (an RSA prime's is fixed by
+        // the key size, a group prime's by the group); declassified, like
+        // the limb count, so the doubling count may depend on it.
+        let top = crate::ct::declassify_value(self.n[l - 1].leading_zeros()) as usize;
+        let bits = 64 * l - top;
         let mut x = vec![0 as Limb; l];
-        x[l - 1] = 1;
+        x[(bits - 1) / 64] = 1 << ((bits - 1) % 64);
         let mut tmp = vec![0 as Limb; 2 * l];
-        for _ in 0..65 {
+        for _ in 0..(64 * l - bits + 1 + l) {
             self.double_in_place(&mut x, &mut tmp);
         }
-        let k = 64 * l;
         let mut out = vec![0 as Limb; l];
-        let mut i = usize::BITS - 1 - k.leading_zeros();
-        while i > 0 {
-            i -= 1;
+        for _ in 0..6 {
             self.mont_sqr_to(&x, &mut tmp, &mut out);
             core::mem::swap(&mut x, &mut out);
-            if (k >> i) & 1 == 1 {
-                self.double_in_place(&mut x, &mut tmp);
-            }
         }
         // The intermediates are powers of two mod `n` — functions of the
         // (possibly secret) modulus — so scrub them like the CIOS scratch.

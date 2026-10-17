@@ -338,6 +338,14 @@ const fn sub_mod<const LIMBS: usize>(
 }
 
 /// Parameters for modular arithmetic with a fixed odd modulus.
+///
+/// The arithmetic runs at the modulus's *significant* width `s ≤ LIMBS`
+/// (its non-leading-zero limbs): a half-width prime held in a full-width
+/// type — an RSA CRT factor in the key's `Uint<LIMBS>` — costs a quarter of
+/// the full-width multiply. `R = 2^(64·s)` accordingly, so Montgomery-form
+/// values are only meaningful within one context; the plain-residue API
+/// (`pow`, `mul_mod`, `to_mont` ∘ `from_mont`) is unaffected. The width is
+/// public by convention (see [`new`](Self::new)).
 #[derive(Clone, Debug)]
 pub struct MontModulus<const LIMBS: usize> {
     modulus: Uint<LIMBS>,
@@ -345,6 +353,8 @@ pub struct MontModulus<const LIMBS: usize> {
     n_prime: Limb,
     /// `R^2 mod N`, used to convert into Montgomery form.
     r2: Uint<LIMBS>,
+    /// Significant limbs of the modulus: the width every kernel runs at.
+    limbs: usize,
 }
 
 impl<const LIMBS: usize> MontModulus<LIMBS> {
@@ -354,12 +364,61 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// Panics if `modulus` is even (Montgomery reduction requires an odd
     /// modulus). In a `const` context that panic is a compile error.
     ///
-    /// Costs about `64·(LIMBS − s + 1)` modular doublings plus
-    /// `⌊log₂(64·LIMBS)⌋` Montgomery squarings, where `s` is the number of
-    /// significant limbs of the modulus — so a full-width modulus is cheap to
-    /// build, but a fixed one should still be built once, ideally as a
-    /// `const`.
+    /// Costs `s + 1` modular doublings plus six Montgomery multiplications
+    /// at the modulus's significant width `s` (plus one doubling per bit the
+    /// top limb is short of full) — cheap, but a fixed modulus should still
+    /// be built once, ideally as a `const`.
+    ///
+    /// The significant width and bit length of the modulus steer the
+    /// construction. They are public by convention — an RSA prime's size is
+    /// fixed by the key size, a Miller-Rabin candidate's by the generator —
+    /// the same "widths are public" rule `BoxedUint::significant_limbs`
+    /// follows. This `const fn` cannot declassify its scan for the taint
+    /// harness; a modulus whose *limbs* are classified secret goes through
+    /// [`new_secret`](Self::new_secret), which does.
     pub const fn new(modulus: Uint<LIMBS>) -> Self {
+        let n = modulus.as_limbs();
+        let mut s = LIMBS;
+        while s > 1 && n[s - 1] == 0 {
+            s -= 1;
+        }
+        let bits = 64 * s - n[s - 1].leading_zeros() as usize;
+        Self::with_shape(modulus, s, bits)
+    }
+
+    /// [`new`](Self::new) for a modulus held in classified (taint-tracked)
+    /// limbs: the width scan's verdicts — public by convention — are
+    /// declassified so the constant-time harness does not see the loop
+    /// bounds as secret-derived. Same result as `new`.
+    pub(crate) fn new_secret(modulus: Uint<LIMBS>) -> Self {
+        let n = modulus.as_limbs();
+        let mut s = LIMBS;
+        while s > 1 && crate::ct::declassify_value(n[s - 1] == 0) {
+            s -= 1;
+        }
+        let bits = 64 * s - crate::ct::declassify_value(n[s - 1].leading_zeros()) as usize;
+        Self::with_shape(modulus, s, bits)
+    }
+
+    /// The construction proper, for a modulus of `s` significant limbs and
+    /// `bits` bits (both public).
+    ///
+    /// `R² mod N`, `R = 2^(64·s)`, without the `2·64·s` doublings of the
+    /// textbook loop. With `M(x) = x·R mod N`, a modular doubling maps
+    /// `M(2^e)` to `M(2^(e+1))` and a Montgomery squaring maps it to
+    /// `M(2^(2e))`; the target is `R² = M(2^(64·s))`. Starting from
+    /// `2^(bits−1)` — below `N`, which has that bit set — `64·s − bits + 1 + s`
+    /// doublings reach `M(2^s)`, and six squarings (`64 = 2^6`) then reach
+    /// `M(2^(64·s))`. Six is about where the squaring count stops paying
+    /// for the doublings it replaces (a doubling is ~3 limb operations, a
+    /// squaring ~s² multiplies), and `s + 1` doublings for a full-width
+    /// modulus is a fraction of one squaring.
+    ///
+    /// Constant time in the modulus value: every loop bound is a function of
+    /// `s` and `bits`, the arithmetic is the masked add/select and the
+    /// Montgomery kernel. (`mont_mul` rather than `mont_sqr` so this stays
+    /// `const`.)
+    const fn with_shape(modulus: Uint<LIMBS>, s: usize, bits: usize) -> Self {
         assert!(
             modulus.as_limbs()[0] & 1 == 1,
             "Montgomery modulus must be odd"
@@ -369,47 +428,30 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
             modulus,
             n_prime,
             r2: Uint::ZERO,
+            limbs: s,
         };
-
-        // R² mod N without the 2·64·LIMBS doublings of the textbook loop.
-        // With M(x) = x·R mod N, a modular doubling maps M(2^e) to
-        // M(2^(e+1)) and a Montgomery squaring maps it to M(2^(2e)); the
-        // target is R² = M(2^k), k = 64·LIMBS. Reach M(2) = 2R mod N by
-        // doublings, then walk the bits of k below its leading one: square,
-        // and double where the bit is set.
-        //
-        // The doublings start at 2^(64·(s−1)), s = significant limbs, which is
-        // already below N (N's limb s−1 is nonzero, and N is odd so it cannot
-        // equal that power unless s = 1, where the start 1 is below any N > 1).
-        // `s` reveals only the modulus width, which is public even for a
-        // secret modulus (an RSA prime's size is fixed by the key size) — the
-        // convention `BoxedUint::significant_limbs` documents and
-        // declassifies; it cannot here because this is a `const fn`. The other
-        // branches are on bits of k; the arithmetic itself is masked.
-        let n = modulus.as_limbs();
-        let mut s = LIMBS;
-        while s > 1 && n[s - 1] == 0 {
-            s -= 1;
-        }
         let mut start = [0 as Limb; LIMBS];
-        start[s - 1] = 1;
+        start[(bits - 1) / 64] = 1 << ((bits - 1) % 64);
         let mut x = Uint::from_limbs(start);
         let mut i = 0;
-        while i < 64 * (LIMBS - s + 1) + 1 {
+        while i < 64 * s - bits + 1 + s {
             x = add_mod(&modulus, &x, &x);
             i += 1;
         }
-        let k = 64 * LIMBS;
-        let mut bit = usize::BITS - 1 - k.leading_zeros();
-        while bit > 0 {
-            bit -= 1;
+        let mut i = 0;
+        while i < 6 {
             x = m.mont_mul(&x, &x);
-            if (k >> bit) & 1 == 1 {
-                x = add_mod(&modulus, &x, &x);
-            }
+            i += 1;
         }
         m.r2 = x;
         m
+    }
+
+    /// The significant width of the modulus in limbs — the width every
+    /// operation of this context runs at (public by convention).
+    #[inline]
+    pub fn limbs(&self) -> usize {
+        self.limbs
     }
 
     /// The modulus `N`.
@@ -425,8 +467,11 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     pub const fn mont_mul(&self, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
         let mut t = [0 as Limb; LIMBS];
         let mut out = [0 as Limb; LIMBS];
+        // At the significant width: operands below the modulus have zero
+        // limbs above it, and so does the result.
+        let (n, _) = self.modulus.as_limbs().split_at(self.limbs);
         mont_mul_kernel(
-            self.modulus.as_limbs(),
+            n,
             self.n_prime,
             a.as_limbs(),
             b.as_limbs(),
@@ -449,7 +494,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         let mut p = [[0 as Limb; 2]; LIMBS];
         let mut out = [0 as Limb; LIMBS];
         mont_sqr_kernel(
-            self.modulus.as_limbs(),
+            &self.modulus.as_limbs()[..self.limbs],
             self.n_prime,
             a.as_limbs(),
             p.as_flattened_mut(),
@@ -658,13 +703,38 @@ mod tests {
         sqr_matches_mul_width::<16>(&mut rng);
     }
 
-    /// The textbook `R²` loop `new` replaced: `2·64·L` doublings of 1.
+    /// The textbook `R²` loop `new` replaced: `2·64·s` doublings of 1, for
+    /// `R = 2^(64·s)` at the modulus's significant width `s`.
     fn r2_by_doubling<const L: usize>(n: &Uint<L>) -> Uint<L> {
+        let s = n
+            .as_limbs()
+            .iter()
+            .rposition(|&l| l != 0)
+            .map_or(1, |i| i + 1);
         let mut r2 = Uint::ONE;
-        for _ in 0..2 * 64 * L {
+        for _ in 0..2 * 64 * s {
             r2 = add_mod(n, &r2, &r2);
         }
         r2
+    }
+
+    /// `new_secret` is `new` with the width scan declassified: same result.
+    #[test]
+    fn new_secret_matches_new() {
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        for top in [1usize, 2, 5, 8] {
+            let mut v = [0 as Limb; 8];
+            for l in v.iter_mut().take(top) {
+                *l = splitmix64(&mut rng);
+            }
+            v[0] |= 1;
+            let n = Uint::<8>::from_limbs(v);
+            let a = MontModulus::new(n);
+            let b = MontModulus::new_secret(n);
+            assert_eq!(a.r2, b.r2);
+            assert_eq!(a.limbs, b.limbs);
+            assert_eq!(a.limbs, top);
+        }
     }
 
     fn r2_matches_width<const L: usize>(rng: &mut u64) {

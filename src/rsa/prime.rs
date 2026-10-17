@@ -95,7 +95,9 @@ pub fn is_prime<const LIMBS: usize, R: RngCore>(
     let n_minus_1 = n.wrapping_sub(&one);
     let (d, s) = split_pow2(&n_minus_1);
 
-    let modulus = MontModulus::new(*n);
+    // The candidate is secret (it may become a key): declassify only the
+    // width scan, which is public by convention.
+    let modulus = MontModulus::new_secret(*n);
     for _ in 0..rounds {
         // Random base a, reduced into [2, n-2]; the three useless values
         // 0, 1, n − 1 map to 2 by a masked select.
