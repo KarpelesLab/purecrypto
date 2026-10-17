@@ -53,11 +53,13 @@ impl Gt {
         Gt(self.0.conjugate())
     }
 
-    /// `self^k`, fixed schedule in `k`.
+    /// `self^k`, constant time in `k` (fixed 4-bit windows with masked
+    /// table gathers and cyclotomic squarings — `GT` lies in the cyclotomic
+    /// subgroup, so the cheaper squaring is exact).
     pub fn pow(&self, k: &Fr) -> Gt {
         // As in `G1::mul`: the canonical limbs are the exponent in the clear.
         let mut limbs = k.to_canonical();
-        let r = Gt(self.0.pow(&limbs));
+        let r = Gt(self.0.cyclotomic_pow_limbs(&limbs));
         limbs.zeroize();
         r
     }

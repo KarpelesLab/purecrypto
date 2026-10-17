@@ -8,6 +8,7 @@
 use super::fp::impl_field_ops;
 use super::fp2::Fp2;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
+use crate::zeroize::Zeroize;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 /// An element `c0 + c1·v + c2·v²` of `GF(p⁶)`, `v³ = 1 + u`.
@@ -248,6 +249,14 @@ impl PartialEq for Fp6 {
 }
 
 impl Eq for Fp6 {}
+
+impl Zeroize for Fp6 {
+    fn zeroize(&mut self) {
+        self.c0.zeroize();
+        self.c1.zeroize();
+        self.c2.zeroize();
+    }
+}
 
 impl_field_ops!(Fp6);
 

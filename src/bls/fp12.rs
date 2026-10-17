@@ -13,6 +13,7 @@ use super::fp::impl_field_ops;
 use super::fp2::Fp2;
 use super::fp6::Fp6;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
+use crate::zeroize::Zeroize;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 /// An element `c0 + c1·w` of `GF(p¹²)`, `w² = v`.
@@ -278,6 +279,63 @@ impl Fp12 {
         acc
     }
 
+    /// `self^k` for a little-endian limb exponent, for `self` in the
+    /// cyclotomic subgroup; constant time in `k`. Fixed 4-bit windows over
+    /// every bit of `k`, four cyclotomic squarings per window, and each
+    /// digit's table entry fetched by one masked pass over all 16 entries
+    /// (one opaque mask per entry applied across all 72 limbs).
+    pub(crate) fn cyclotomic_pow_limbs(&self, k: &[u64]) -> Fp12 {
+        let mut table = [Fp12::ONE; 16];
+        table[1] = *self;
+        for i in 2..16 {
+            table[i] = table[i - 1].mul(self);
+        }
+        let mut acc = Fp12::ONE;
+        let windows = k.len() * 16;
+        for w in (0..windows).rev() {
+            acc = acc
+                .cyclotomic_square()
+                .cyclotomic_square()
+                .cyclotomic_square()
+                .cyclotomic_square();
+            let mut digit = (k[w / 16] >> (4 * (w % 16))) & 0xf;
+            let mut entry = Fp12::ZERO;
+            for (i, t) in table.iter().enumerate() {
+                let x = (i as u64) ^ digit;
+                // All ones iff x == 0; the barrier keeps it a mask, not a branch.
+                let mask = core::hint::black_box(((x | x.wrapping_neg()) >> 63).wrapping_sub(1));
+                entry.or_masked(t, mask);
+            }
+            acc = acc.mul(&entry);
+            entry.zeroize();
+            digit.zeroize();
+        }
+        for t in table.iter_mut() {
+            t.zeroize();
+        }
+        acc
+    }
+
+    /// `self |= mask & other` limb by limb (the masked gather primitive).
+    #[inline(always)]
+    fn or_masked(&mut self, other: &Fp12, mask: u64) {
+        for (a, b) in [
+            (&mut self.c0.c0, &other.c0.c0),
+            (&mut self.c0.c1, &other.c0.c1),
+            (&mut self.c0.c2, &other.c0.c2),
+            (&mut self.c1.c0, &other.c1.c0),
+            (&mut self.c1.c1, &other.c1.c1),
+            (&mut self.c1.c2, &other.c1.c2),
+        ] {
+            for (x, y) in a.c0.0.iter_mut().zip(b.c0.0.iter()) {
+                *x |= mask & y;
+            }
+            for (x, y) in a.c1.0.iter_mut().zip(b.c1.0.iter()) {
+                *x |= mask & y;
+            }
+        }
+    }
+
     /// `self^e` for a **public** 64-bit exponent: cyclotomic squarings below
     /// the leading set bit and one multiplication per set bit, so the
     /// schedule is a function of the exponent alone and the running time is
@@ -360,6 +418,13 @@ impl PartialEq for Fp12 {
 }
 
 impl Eq for Fp12 {}
+
+impl Zeroize for Fp12 {
+    fn zeroize(&mut self) {
+        self.c0.zeroize();
+        self.c1.zeroize();
+    }
+}
 
 impl_field_ops!(Fp12);
 
@@ -448,6 +513,22 @@ mod tests {
             1 << 63,
         ] {
             assert_eq!(c.cyclotomic_pow_public_exp(e), c.pow(&[e]));
+            assert_eq!(c.cyclotomic_pow_limbs(&[e]), c.pow(&[e]));
+        }
+        for k in [
+            [0u64; 4],
+            [1, 0, 0, 0],
+            [0xd201000000010000, 0, 0, 0],
+            [u64::MAX; 4],
+            [
+                0x0123456789abcdef,
+                0xfedcba9876543210,
+                0x0f0f0f0f0f0f0f0f,
+                0x7fffffffffffffff,
+            ],
+            super::super::fr::MODULUS,
+        ] {
+            assert_eq!(c.cyclotomic_pow_limbs(&k), c.pow(&k));
         }
         // Inverse equals conjugate on the subgroup.
         assert_eq!(c.conjugate() * c, Fp12::ONE);
