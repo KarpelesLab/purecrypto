@@ -3766,14 +3766,13 @@ impl ClientConnection {
     /// Computes the `key_exchange` value of every group among `groups`
     /// (narrowed to `share_only` when that is non-empty) that
     /// [`Self::build_client_hello`] will carry a share for and that no
-    /// earlier hello carried, into `key_shares`. Each public key is
-    /// computed once, even where two groups share it (X25519 under
-    /// X25519 and X25519MLKEM768, P-256 under secp256r1 and
-    /// SecP256r1MLKEM768, ...), and the ML-KEM keys are derived here.
+    /// earlier hello carried, into `key_shares`; the ML-KEM keys are
+    /// derived here. The X25519 public key is computed once for the two
+    /// default groups that carry it (X25519 and X25519MLKEM768); the NIST
+    /// hybrids (share-less by default) go through the `kex` helpers that
+    /// own the RFC 10024 layout.
     fn prepare_key_shares(&mut self, groups: &[NamedGroup], share_only: &[NamedGroup]) {
         let mut x25519_pub: Option<[u8; 32]> = None;
-        let mut p256_pub: Option<Vec<u8>> = None;
-        let mut p384_pub: Option<Vec<u8>> = None;
         for &g in groups {
             if (!share_only.is_empty() && !share_only.contains(&g))
                 || self.key_shares.iter().any(|(k, _)| *k == g)
@@ -3784,12 +3783,8 @@ impl ClientConnection {
                 NamedGroup::X25519 => x25519_pub
                     .get_or_insert_with(|| self.x25519.public_key())
                     .to_vec(),
-                NamedGroup::SECP256R1 => p256_pub
-                    .get_or_insert_with(|| self.p256.public_key().to_sec1())
-                    .clone(),
-                NamedGroup::SECP384R1 => p384_pub
-                    .get_or_insert_with(|| self.p384.public_key().to_sec1())
-                    .clone(),
+                NamedGroup::SECP256R1 => self.p256.public_key().to_sec1(),
+                NamedGroup::SECP384R1 => self.p384.public_key().to_sec1(),
                 NamedGroup::SECP521R1 => self.p521.public_key().to_sec1(),
                 NamedGroup::X25519MLKEM768 => {
                     // RFC 9954 §3.1: ML-KEM-768 encapsulation key ‖ X25519
@@ -3800,18 +3795,14 @@ impl ClientConnection {
                     share
                 }
                 NamedGroup::SECP256R1MLKEM768 => {
-                    // RFC 10024 §4.1: the uncompressed point ‖ the
-                    // encapsulation key.
-                    let mut share =
-                        p256_pub.get_or_insert_with(|| self.p256.public_key().to_sec1()).clone();
-                    share.extend_from_slice(&self.mlkem768().encapsulation_key().to_bytes());
-                    share
+                    self.mlkem768();
+                    let dk = self.mlkem.as_ref().expect("derived above");
+                    kex::p256_mlkem768_client_share(&self.p256, dk)
                 }
                 NamedGroup::SECP384R1MLKEM1024 => {
-                    let mut share =
-                        p384_pub.get_or_insert_with(|| self.p384.public_key().to_sec1()).clone();
-                    share.extend_from_slice(&self.mlkem1024().encapsulation_key().to_bytes());
-                    share
+                    self.mlkem1024();
+                    let dk = self.mlkem1024.as_ref().expect("derived above");
+                    kex::p384_mlkem1024_client_share(&self.p384, dk)
                 }
                 _ => continue,
             };
