@@ -946,6 +946,10 @@ pub struct QuicConnection {
     /// they are appended to [`Self::tx_datagram`] and sealed; kept between
     /// packets.
     tx_payload: Vec<u8>,
+    /// Buffer a received packet is copied into to have its header
+    /// protection removed and its payload opened in place; kept between
+    /// packets so the receive path allocates nothing per datagram.
+    rx_scratch: Vec<u8>,
     /// RFC 9000 §10.1 idle timeout: time (relative to [`Self::start`]) of the
     /// last packet we received and successfully processed from the peer. The
     /// idle timer is measured from here; an idle connection is silently closed
@@ -1389,6 +1393,7 @@ impl QuicConnection {
             now_cached: None,
             tx_datagram: Vec::new(),
             tx_payload: Vec::new(),
+            rx_scratch: Vec::new(),
             peer_ack_params_installed: false,
             peer_packet_seen: false,
             last_recv_activity: Duration::ZERO,
@@ -1547,6 +1552,7 @@ impl QuicConnection {
             now_cached: None,
             tx_datagram: Vec::new(),
             tx_payload: Vec::new(),
+            rx_scratch: Vec::new(),
             peer_ack_params_installed: false,
             peer_packet_seen: false,
             last_recv_activity: Duration::ZERO,
@@ -5831,8 +5837,12 @@ impl QuicConnection {
         }
 
         // Work on an owned mutable copy from the start of this packet
-        // through its end; header protection mutates these bytes.
-        let mut pkt = datagram[..pkt_total_len].to_vec();
+        // through its end; header protection mutates these bytes. The
+        // copy lives in the connection's receive scratch, handed back once
+        // the packet has been processed.
+        let mut pkt = core::mem::take(&mut self.rx_scratch);
+        pkt.clear();
+        pkt.extend_from_slice(&datagram[..pkt_total_len]);
 
         // RFC 9001 §5.4.2: sample at `pn_offset + 4` of length 16.
         let sample_start = hdr.pn_offset.checked_add(4).ok_or(Error::Decode)?;
@@ -6006,6 +6016,7 @@ impl QuicConnection {
         self.rx_packet_dcid.clear();
         self.rx_packet_dcid.extend_from_slice(hdr.dcid);
         self.dispatch_frames(level, pn, payload)?;
+        self.rx_scratch = pkt;
 
         // G-4: a non-VN packet from the peer has been successfully
         // processed — any future VN packet on this connection MUST be
@@ -6066,8 +6077,11 @@ impl QuicConnection {
             .expect("16-byte slice");
         let mask = dir_keys_for_hp.hp.mask(&sample_arr)?;
         // Short header: 1-RTT packet runs to end of datagram (no length
-        // field). We work on the whole remaining datagram.
-        let mut pkt = datagram.to_vec();
+        // field). We work on the whole remaining datagram, copied into the
+        // connection's receive scratch and handed back once processed.
+        let mut pkt = core::mem::take(&mut self.rx_scratch);
+        pkt.clear();
+        pkt.extend_from_slice(datagram);
         let pn_len = remove_header_protection(&mut pkt, hdr.pn_offset, &mask, false)?;
         let mut truncated_pn = 0u64;
         for i in 0..pn_len as usize {
@@ -6274,6 +6288,7 @@ impl QuicConnection {
         self.rx_packet_dcid.clear();
         self.rx_packet_dcid.extend_from_slice(hdr.dcid);
         self.dispatch_frames(Level::OneRtt, pn, payload)?;
+        self.rx_scratch = pkt;
         // RFC 9000 §9.3 — the packet authenticated, so its source address is
         // now trustworthy enough to act on. `largest_rx` was read before
         // dispatch, so it is the high-water mark *excluding* this packet.

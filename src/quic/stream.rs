@@ -929,7 +929,7 @@ impl RecvStream {
         let mut newly_contig: u64 = 0;
         if offset == self.next_offset {
             // Fast-path: appends in order.
-            self.delivered.extend(data);
+            extend_deque(&mut self.delivered, data);
             newly_contig += data.len() as u64;
             self.next_offset += data.len() as u64;
             // Absorb pending fragments at or below next_offset.
@@ -944,7 +944,7 @@ impl RecvStream {
                 }
                 let skip = (self.next_offset - p_off) as usize;
                 let take = &frag[skip..];
-                self.delivered.extend(take);
+                extend_deque(&mut self.delivered, take);
                 newly_contig += take.len() as u64;
                 self.next_offset = p_end;
             }
