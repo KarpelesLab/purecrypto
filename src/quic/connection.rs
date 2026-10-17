@@ -9191,29 +9191,27 @@ mod tests {
     /// A server's `preferred_key_exchange_group` reaches the QUIC engine as
     /// it reaches the TLS one (RFC 8446 §4.1.4: it asks for a
     /// HelloRetryRequest when the client advertises the group without a
-    /// share for it). This client ships a share for every group it offers,
-    /// so the server takes the client's first preference — the hybrid one,
-    /// two Initials each way — and the handshake completes, over QUIC
-    /// exactly as over TLS.
+    /// share for it). The default client ships a share for secp256r1, so a
+    /// server preferring it has a share to work with and sends no
+    /// HelloRetryRequest: the handshake completes on the server's first
+    /// flight, over QUIC exactly as over TLS.
     #[test]
     fn server_preferred_key_exchange_group_is_accepted_over_quic() {
         use crate::tls::NamedGroup;
         let (mut c, mut s) = loopback_pair_with(
             |_| {},
-            |cfg| cfg.preferred_key_exchange_group = Some(NamedGroup::Secp384r1),
+            |cfg| cfg.preferred_key_exchange_group = Some(NamedGroup::Secp256r1),
         );
         feed_flight(&mut c, &mut s);
-        let reply = feed_flight(&mut s, &mut c);
-        assert_eq!(
-            reply
-                .iter()
-                .filter(|dg| first_packet_is_initial(dg))
-                .count(),
-            2,
-            "the offered hybrid share is taken, no HelloRetryRequest: {:?}",
-            reply.iter().map(Vec::len).collect::<Vec<_>>()
+        feed_flight(&mut s, &mut c);
+        // No HelloRetryRequest: the client finishes on the server's first
+        // flight with one of the shares it offered.
+        assert!(!c.hello_retry_request_used());
+        assert!(
+            c.is_handshake_complete(),
+            "the client finishes on the server's first flight"
         );
-        assert!(c.is_handshake_complete());
+        assert!(c.negotiated_group().is_some());
         handshake_and_echo(&mut c, &mut s);
     }
 
