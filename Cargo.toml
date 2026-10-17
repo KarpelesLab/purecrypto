@@ -55,7 +55,7 @@ name = "purecrypto"
 # The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "ed25519-table", "p256-table", "secp256k1-table", "streebog-table", "whirlpool-table", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "jose"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "ed25519-table", "ed448-table", "p256-table", "secp256k1-table", "streebog-table", "whirlpool-table", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "jose"]
 # `compcol?/…`: under `cert-compression` a `std` build also gets compcol's
 # brotli codec, whose encoder uses floating-point `log2` and so cannot be
 # built for `no_std` (zlib and zstd can).
@@ -128,6 +128,15 @@ ec = ["bignum", "rng", "hash"]
 # an interleaved double-scalar multiplication: identical results, a smaller
 # binary, slower signing. Leave it out on flash-constrained targets.
 ed25519-table = ["ec"]
+# The precomputed fixed-base tables for edwards448 (~98 KB of static data: a
+# 56-window signed radix-16 table behind Ed448 signing and key generation,
+# plus the 64 odd multiples of `B` that Ed448 verification's width-8 wNAF
+# base ladder indexes). Without it `[k]B` falls back to the constant-time
+# windowed ladder over the base point and verification to the table-free
+# interleaved double-scalar multiplication: identical results, a smaller
+# binary, slower signing and verification. Leave it out on flash-constrained
+# targets.
+ed448-table = ["ec"]
 # The precomputed fixed-base comb table for P-256 (~61 KB of static data)
 # behind P-256 ECDSA signing, key generation and ECDH key generation. Without
 # it `[k]G` falls back to the constant-time windowed ladder and ECDSA

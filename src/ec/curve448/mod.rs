@@ -13,6 +13,8 @@
 //! of the `a = −1` edwards25519 set). Cofactor 4; `d` is a non-square, so the
 //! formulas have no exceptional cases.
 
+#[cfg(feature = "ed448-table")]
+pub(crate) mod base_table;
 pub(crate) mod field;
 pub(crate) mod point;
 pub(crate) mod scalar;

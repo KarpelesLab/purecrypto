@@ -7,7 +7,9 @@
 //! the formulas are complete (no exceptional cases). Scalar multiplication is a
 //! constant-time double-and-add. This is the shared point backend behind Ed448.
 
-#[cfg(test)]
+#[cfg(feature = "ed448-table")]
+use super::base_table::{ED448_BASE_TABLE, ED448_BASE_TOP, ED448_ODD_MULTIPLES};
+#[cfg(any(test, feature = "ed448-table"))]
 use super::field::mask_from_bit;
 use super::field::{Fe, Field, ScalarInt, eq_mask};
 use crate::ct::{Choice, ConstantTimeLess};
@@ -22,8 +24,113 @@ pub(crate) struct Point {
     pub(crate) t: Fe,
 }
 
+/// A precomputed affine point in the "Niels" form of the `a = +1` mixed
+/// addition: `(x, y, d·x·y)`. With `Z = 1` the HWCD sum needs `A = X1·x`,
+/// `B = Y1·y`, `C = T1·(d·x·y)` and `E` from `x + y`, so a table entry adds
+/// in 8 multiplications instead of 9 plus a small-constant multiply.
+#[cfg(feature = "ed448-table")]
+#[derive(Clone, Copy, Debug)]
+struct Affine {
+    x: Fe,
+    y: Fe,
+    dxy: Fe,
+}
+
+#[cfg(feature = "ed448-table")]
+impl Affine {
+    /// The neutral element `(0, 1, 0)`.
+    const IDENTITY: Affine = Affine {
+        x: Fe::ZERO,
+        y: Fe::ONE,
+        dxy: Fe::ZERO,
+    };
+
+    /// Lifts a stored table entry (`x‖y‖d·x·y`, eight little-endian 56-bit
+    /// limbs each, canonical residues).
+    #[inline]
+    fn from_entry(e: &[u64; 24]) -> Affine {
+        let mut x = [0u64; 8];
+        let mut y = [0u64; 8];
+        let mut dxy = [0u64; 8];
+        x.copy_from_slice(&e[..8]);
+        y.copy_from_slice(&e[8..16]);
+        dxy.copy_from_slice(&e[16..]);
+        Affine {
+            x: Fe(x),
+            y: Fe(y),
+            dxy: Fe(dxy),
+        }
+    }
+
+    /// `−(x, y, d·x·y) = (−x, y, −d·x·y)`.
+    #[inline]
+    fn neg(&self) -> Affine {
+        Affine {
+            x: self.x.neg(),
+            y: self.y,
+            dxy: self.dxy.neg(),
+        }
+    }
+
+    /// `a` when `mask` is all-ones, else `b`.
+    #[inline]
+    fn select(a: &Affine, b: &Affine, mask: u64) -> Affine {
+        Affine {
+            x: Fe::select(&a.x, &b.x, mask),
+            y: Fe::select(&a.y, &b.y, mask),
+            dxy: Fe::select(&a.dxy, &b.dxy, mask),
+        }
+    }
+}
+
+/// Constant-time gather of `[digit]·base` from a window of the 8 stored
+/// multiples `[1]base..[8]base`, for a signed digit in `[−8, 8)`: scan all 8
+/// entries with one opaque equality mask each (no secret-indexed memory
+/// access), then negate under one more mask. A zero digit yields the
+/// identity.
+#[cfg(feature = "ed448-table")]
+fn gather(window: &[[u64; 24]; 8], digit: i8) -> Affine {
+    // |digit| and its sign without a branch: `m` is −1 for a negative digit.
+    let m = digit >> 7;
+    let mag = ((digit ^ m) - m) as u64;
+    let neg = (m & 1) as u64;
+    // The identity entry (x = 0, y = 1, d·x·y = 0).
+    let mut sel = [0u64; 24];
+    sel[8] = 1;
+    for (j, entry) in window.iter().enumerate() {
+        let mask = eq_mask(j as u64 + 1, mag);
+        for (s, &e) in sel.iter_mut().zip(entry.iter()) {
+            *s ^= mask & (*s ^ e);
+        }
+    }
+    let a = Affine::from_entry(&sel);
+    Affine::select(&a.neg(), &a, mask_from_bit(neg))
+}
+
+/// Signed radix-16 recoding of the low 448 bits of a 57-byte little-endian
+/// scalar: 112 digits in `[−8, 8)` plus a carry digit `d₁₁₂ ∈ {0, 1}`, with
+/// `Σ dᵢ·16ⁱ` equal to the scalar exactly. Branch-free (the carry is
+/// arithmetic), so safe on secret scalars.
+#[cfg(feature = "ed448-table")]
+fn radix16_signed(scalar: &[u8; 57]) -> [i8; 113] {
+    let mut d = [0i8; 113];
+    for (i, &byte) in scalar[..56].iter().enumerate() {
+        d[2 * i] = (byte & 15) as i8;
+        d[2 * i + 1] = (byte >> 4) as i8;
+    }
+    for i in 0..112 {
+        let carry = (d[i] + 8) >> 4;
+        d[i] -= carry << 4;
+        d[i + 1] += carry;
+    }
+    d
+}
+
 impl Field {
     /// The base point `B` (precomputed at compile time).
+    // With the fixed-base table, library-path base multiplications never
+    // touch the point itself; only the table-free ladders and tests do.
+    #[cfg(any(test, not(feature = "ed448-table")))]
     #[inline]
     pub(crate) fn base(&self) -> Point {
         self.base_point
@@ -160,6 +267,9 @@ impl Field {
     /// The table is 16 points (4 KB) of stack, the same shape as the
     /// edwards25519 window; a 3-bit window would halve it but cost ~38 more
     /// additions per multiplication.
+    // Ed448 only ever multiplies the base point; with the fixed-base table
+    // this generic ladder has no library users.
+    #[cfg(any(test, not(feature = "ed448-table")))]
     pub(crate) fn scalar_mult(&self, scalar: &[u8; 57], p: &Point) -> Point {
         // table[j] = [j]P; table[0] is the identity.
         let mut table = [self.identity(); 16];
@@ -196,8 +306,71 @@ impl Field {
         acc
     }
 
-    /// Constant-time fixed-base multiplication `[scalar]·B`: the generic
-    /// windowed ladder [`Self::scalar_mult`] over `B`.
+    /// Mixed addition `p + q` of an extended point and a stored affine point
+    /// (`Z2 = 1`): the complete HWCD `a = +1` formula of [`Self::point_add`]
+    /// with `D = Z1` and `C = T1·(d·x2·y2)`, 8 multiplications.
+    #[cfg(feature = "ed448-table")]
+    fn add_affine(&self, p: &Point, q: &Affine) -> Point {
+        let a = self.mul(p.x, q.x);
+        let b = self.mul(p.y, q.y);
+        let c = self.mul(p.t, q.dxy);
+        let d = p.z;
+        let e = self.sub(
+            self.sub(self.mul(self.add(p.x, p.y), self.add(q.x, q.y)), a),
+            b,
+        );
+        let ff = self.sub(d, c);
+        let g = self.add(d, c);
+        let h = self.sub(b, a);
+        Point {
+            x: self.mul(e, ff),
+            y: self.mul(g, h),
+            t: self.mul(e, h),
+            z: self.mul(ff, g),
+        }
+    }
+
+    /// Constant-time fixed-base multiplication `[scalar]·B` (low 448 bits of
+    /// the 57-byte little-endian scalar) via the precomputed table
+    /// [`ED448_BASE_TABLE`]: the scalar is recoded into 112 signed radix-16
+    /// digits `dᵢ ∈ [−8, 8)` plus a carry digit `d₁₁₂ ∈ {0, 1}`, and
+    /// `[k]B = Σᵢ [dᵢ·16ⁱ]B` is accumulated as the odd-position digits (each
+    /// gathered from the window of `[16^(i−1)]B` multiples, then scaled by
+    /// four doublings), then the even-position digits, then the carry times
+    /// `[2⁴⁴⁸]B` — 113 mixed additions, 4 doublings and 112 masked window
+    /// scans (no secret-indexed memory access, one opaque mask per
+    /// candidate). A zero digit adds the identity, a uniform no-op under the
+    /// complete HWCD formulas, so the schedule depends only on the (public)
+    /// scalar width. The scalar bytes are treated as secret.
+    #[cfg(feature = "ed448-table")]
+    pub(crate) fn mul_base(&self, scalar: &[u8; 57]) -> Point {
+        let digits = radix16_signed(scalar);
+        let mut acc = self.identity();
+        for (j, window) in ED448_BASE_TABLE.iter().enumerate() {
+            acc = self.add_affine(&acc, &gather(window, digits[2 * j + 1]));
+        }
+        acc = self.point_double(&acc);
+        acc = self.point_double(&acc);
+        acc = self.point_double(&acc);
+        acc = self.point_double(&acc);
+        for (j, window) in ED448_BASE_TABLE.iter().enumerate() {
+            acc = self.add_affine(&acc, &gather(window, digits[2 * j]));
+        }
+        // d₁₁₂ ∈ {0, 1}: add [2⁴⁴⁸]B or the identity under one mask.
+        let top = Affine::select(
+            &Affine::from_entry(&ED448_BASE_TOP),
+            &Affine::IDENTITY,
+            mask_from_bit(digits[112] as u64),
+        );
+        self.add_affine(&acc, &top)
+    }
+
+    /// Constant-time fixed-base multiplication `[scalar]·B` without the
+    /// precomputed table (feature `ed448-table` off): the generic windowed
+    /// ladder [`Self::scalar_mult`] over `B`. Same result and the same
+    /// secret-scalar discipline, at the cost of ~448 doublings the table
+    /// would avoid.
+    #[cfg(not(feature = "ed448-table"))]
     pub(crate) fn mul_base(&self, scalar: &[u8; 57]) -> Point {
         self.scalar_mult(scalar, &self.base())
     }
@@ -229,9 +402,12 @@ impl Field {
     }
 
     /// **Variable-time** `[a]·p + [b]·B`, the Ed448 verification
-    /// combination: two interleaved (Straus) width-5 wNAF ladders sharing one
-    /// run of ~446 doublings, plus one addition per nonzero digit (≈ 1 in 6
-    /// per scalar) against the 8 odd multiples `[1]X..[15]X` of each point.
+    /// combination: two interleaved (Straus) wNAF ladders sharing one run of
+    /// ~446 doublings, plus one addition per nonzero digit. The `p` side is
+    /// width 5 (≈ 1 addition in 6) against the 8 odd multiples `[1]p..[15]p`
+    /// computed on the fly; the base side is width 8 (≈ 1 in 9) against the
+    /// 64 stored odd multiples `[1]B..[127]B` of [`ED448_ODD_MULTIPLES`],
+    /// each added with the 8-multiplication mixed formula.
     ///
     /// # Warning: public inputs only
     ///
@@ -239,6 +415,53 @@ impl Field {
     /// must ONLY ever be called with **public** scalars and points (the
     /// signature scalar `S`, the challenge `k` and the public key `A` during
     /// verification) — never with signing nonces or secret keys.
+    #[cfg(feature = "ed448-table")]
+    pub(crate) fn double_scalar_mult_base_vartime(
+        &self,
+        a: &[u8; 57],
+        p: &Point,
+        b: &[u8; 57],
+    ) -> Point {
+        let odd_p = self.odd_multiples(p);
+        let naf_a = wnaf::<5>(a);
+        let naf_b = wnaf::<8>(b);
+        let Some(top) = naf_a
+            .iter()
+            .zip(naf_b.iter())
+            .rposition(|(&x, &y)| x != 0 || y != 0)
+        else {
+            return self.identity();
+        };
+
+        let mut acc = self.identity();
+        for i in (0..=top).rev() {
+            acc = self.point_double(&acc);
+            acc = self.add_naf_digit(&acc, naf_a[i], &odd_p);
+            let d = naf_b[i];
+            if d > 0 {
+                let e = Affine::from_entry(&ED448_ODD_MULTIPLES[(d as usize) / 2]);
+                acc = self.add_affine(&acc, &e);
+            } else if d < 0 {
+                let e = Affine::from_entry(&ED448_ODD_MULTIPLES[(-d as usize) / 2]);
+                acc = self.add_affine(&acc, &e.neg());
+            }
+        }
+        acc
+    }
+
+    /// **Variable-time** `[a]·p + [b]·B`, the Ed448 verification
+    /// combination without the precomputed table (feature `ed448-table`
+    /// off): two interleaved (Straus) width-5 wNAF ladders sharing one run
+    /// of ~446 doublings, plus one addition per nonzero digit (≈ 1 in 6 per
+    /// scalar) against the 8 odd multiples `[1]X..[15]X` of each point.
+    ///
+    /// # Warning: public inputs only
+    ///
+    /// Both the branch pattern and the table indices leak the scalars. This
+    /// must ONLY ever be called with **public** scalars and points (the
+    /// signature scalar `S`, the challenge `k` and the public key `A` during
+    /// verification) — never with signing nonces or secret keys.
+    #[cfg(not(feature = "ed448-table"))]
     pub(crate) fn double_scalar_mult_base_vartime(
         &self,
         a: &[u8; 57],
@@ -247,8 +470,8 @@ impl Field {
     ) -> Point {
         let odd_p = self.odd_multiples(p);
         let odd_b = self.odd_multiples(&self.base());
-        let naf_a = wnaf5(a);
-        let naf_b = wnaf5(b);
+        let naf_a = wnaf::<5>(a);
+        let naf_b = wnaf::<5>(b);
         let Some(top) = naf_a
             .iter()
             .zip(naf_b.iter())
@@ -302,13 +525,13 @@ impl Field {
     }
 }
 
-/// Width-5 non-adjacent form of a 456-bit (57-byte) little-endian scalar:
-/// digits in `{0, ±1, ±3, …, ±15}` with at least 4 zeros between nonzero
-/// digits. The trailing positions absorb the recoding carry, so any 456-bit
-/// integer is represented exactly. **Variable-time**; only for public
-/// scalars.
-fn wnaf5(scalar: &[u8; 57]) -> [i8; 461] {
-    let mut naf = [0i8; 461];
+/// Width-`W` non-adjacent form (`W ≤ 8`) of a 456-bit (57-byte)
+/// little-endian scalar: odd digits in `(−2^(W−1), 2^(W−1))` with at least
+/// `W − 1` zeros between nonzero digits. The trailing positions absorb the
+/// recoding carry, so any 456-bit integer is represented exactly.
+/// **Variable-time**; only for public scalars.
+fn wnaf<const W: u32>(scalar: &[u8; 57]) -> [i8; 464] {
+    let mut naf = [0i8; 464];
 
     // Nine u64 limbs (57 bytes zero-padded, plus one spare) so the window
     // read below may index one limb past the scalar's top byte.
@@ -319,15 +542,16 @@ fn wnaf5(scalar: &[u8; 57]) -> [i8; 461] {
         x[i] = u64::from_le_bytes(b);
     }
 
-    let width = 1u64 << 5;
+    let width = 1u64 << W;
     let window_mask = width - 1;
+    let w = W as usize;
 
     let mut pos = 0;
     let mut carry = 0u64;
     while pos < 456 {
         let idx = pos / 64;
         let bit = pos % 64;
-        let bit_buf = if bit < 64 - 5 {
+        let bit_buf = if bit < 64 - w {
             x[idx] >> bit
         } else {
             (x[idx] >> bit) | (x[idx + 1] << (64 - bit))
@@ -342,11 +566,11 @@ fn wnaf5(scalar: &[u8; 57]) -> [i8; 461] {
             naf[pos] = window as i8;
         } else {
             carry = 1;
-            naf[pos] = (window as i8).wrapping_sub(width as i8);
+            naf[pos] = (window as i16 - width as i16) as i8;
         }
-        pos += 5;
+        pos += w;
     }
-    // A carry surviving past bit 455 stands for `+2^pos` (pos <= 460).
+    // A carry surviving past bit 455 stands for `+2^pos` (pos <= 463).
     if carry != 0 {
         naf[pos] = 1;
     }
@@ -356,6 +580,7 @@ fn wnaf5(scalar: &[u8; 57]) -> [i8; 461] {
 /// Constant-time point selection: `b` if `mask` is all-ones, else `a`. The
 /// caller derives the single opaque mask ([`mask_from_bit`] / [`eq_mask`]);
 /// it is applied to all four coordinates with plain xor/and.
+#[cfg(any(test, not(feature = "ed448-table")))]
 #[inline]
 pub(crate) fn point_select(a: &Point, b: &Point, mask: u64) -> Point {
     Point {
@@ -434,6 +659,199 @@ mod tests {
             let r = f.scalar_mult_bitwise(&k, &b);
             assert!(bool::from(f.point_ct_eq(&m, &r)), "mul_base mismatch");
         }
+    }
+
+    /// Differential test: the fixed-base multiplication agrees with the
+    /// generic windowed ladder for edge scalars (0, 1, 2, L−1, L, L+1, the
+    /// pruned-scalar shape 2⁴⁴⁷ + …, all-ones, and the nibble patterns that
+    /// make every signed radix-16 digit carry) and a batch of random ones —
+    /// and the vartime double-scalar path agrees with the constant-time
+    /// ladders on every one of them.
+    #[test]
+    fn mul_base_matches_generic_scalar_mult() {
+        use crate::hash::Sha256;
+        use crate::rng::{HmacDrbg, RngCore};
+        let f = Field::new();
+        let b = f.base();
+        // An independent point for the double-scalar check.
+        let p = f.scalar_mult(&[7u8; 57], &b);
+
+        let check = |s: &[u8; 57]| {
+            let fixed = f.encode(&f.mul_base(s));
+            assert_eq!(
+                fixed,
+                f.encode(&f.scalar_mult(s, &b)),
+                "fixed-base/ladder mismatch for {s:02x?}"
+            );
+            assert_eq!(
+                fixed,
+                f.encode(&f.double_scalar_mult_base_vartime(&[0u8; 57], &p, s)),
+                "vartime double-scalar [0]P + [s]B mismatch"
+            );
+            // [s]P + [s']B against the constant-time ladders, with s' = s
+            // byte-reversed (top byte cleared) so the two digit streams
+            // differ.
+            let mut s2 = *s;
+            s2[..56].reverse();
+            s2[56] = 0;
+            let want = f.point_add(&f.scalar_mult(s, &p), &f.mul_base(&s2));
+            assert_eq!(
+                f.encode(&want),
+                f.encode(&f.double_scalar_mult_base_vartime(s, &p, &s2)),
+                "vartime double-scalar mismatch"
+            );
+        };
+
+        let int_bytes = |v: &ScalarInt| {
+            let mut out = [0u8; 57];
+            v.write_le_bytes(&mut out[..56]);
+            out
+        };
+        let mut edges = [[0u8; 57]; 12];
+        edges[1][0] = 1;
+        edges[2][0] = 2;
+        edges[3] = int_bytes(&f.l.wrapping_sub(&ScalarInt::ONE));
+        edges[4] = int_bytes(&f.l);
+        edges[5] = int_bytes(&f.l.wrapping_add(&ScalarInt::ONE));
+        edges[6][55] = 0x80;
+        edges[6][0] = 0xfc;
+        edges[7][..56].fill(0xff);
+        edges[8][..56].fill(0x88);
+        edges[9][..56].fill(0x78);
+        edges[10][..56].fill(0xf8);
+        edges[11][..56].fill(0x08);
+        edges[11][55] = 0x88;
+        for s in &edges {
+            check(s);
+        }
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"ed448-fixed-base-differential", b"nonce", &[]);
+        for _ in 0..24 {
+            let mut s = [0u8; 57];
+            rng.fill_bytes(&mut s[..56]);
+            check(&s);
+        }
+    }
+
+    /// Re-derives every entry of the embedded fixed-base tables from the
+    /// group law, so `base_table.rs` is verified on every test run rather
+    /// than trusted. Inversion-free: the stored affine `(x, y, d·x·y)`
+    /// matches the computed `(X : Y : Z : T)` iff `x·Z == X`, `y·Z == Y`
+    /// and `(d·x·y)·Z == d·T`; every stored limb is also checked canonical.
+    #[test]
+    #[cfg(feature = "ed448-table")]
+    fn base_table_matches_computed() {
+        let f = Field::new();
+        let check = |entry: &[u64; 24], want: &Point| {
+            let e = Affine::from_entry(entry);
+            assert!(
+                bool::from(f.ct_eq(f.mul(e.x, want.z), want.x)),
+                "x mismatch"
+            );
+            assert!(
+                bool::from(f.ct_eq(f.mul(e.y, want.z), want.y)),
+                "y mismatch"
+            );
+            assert!(
+                bool::from(f.ct_eq(f.mul(e.dxy, want.z), f.mul(f.d, want.t))),
+                "d·x·y mismatch"
+            );
+            for c in [e.x, e.y, e.dxy] {
+                assert_eq!(Fe::from_bytes(&c.to_bytes()).0, c.0, "non-canonical limbs");
+            }
+        };
+        // base = [16^(2j)]B for window j.
+        let mut base = f.base();
+        for window in ED448_BASE_TABLE.iter() {
+            let mut acc = base;
+            for (k, entry) in window.iter().enumerate() {
+                if k > 0 {
+                    acc = f.point_add(&acc, &base);
+                }
+                check(entry, &acc);
+            }
+            for _ in 0..8 {
+                base = f.point_double(&base);
+            }
+        }
+        // After 56 windows, base = [16^112]B = [2^448]B.
+        check(&ED448_BASE_TOP, &base);
+
+        let b = f.base();
+        let b2 = f.point_double(&b);
+        let mut acc = b;
+        for (k, entry) in ED448_ODD_MULTIPLES.iter().enumerate() {
+            if k > 0 {
+                acc = f.point_add(&acc, &b2);
+            }
+            check(entry, &acc);
+        }
+    }
+
+    /// Regenerates the fixed-base table source
+    /// (`src/ec/curve448/base_table.rs`). Run with:
+    /// `cargo test --release gen_ed448_base_table -- --ignored --nocapture`
+    /// and paste the emitted statics between the file's header comment and
+    /// EOF. The non-ignored `base_table_matches_computed` test keeps the
+    /// pasted constants honest on every test run.
+    #[test]
+    #[ignore = "table generator; emits Rust source on stdout"]
+    #[cfg(feature = "std")]
+    fn gen_ed448_base_table() {
+        use std::{print, println};
+        let f = Field::new();
+        // Affine (x, y, d·x·y) as canonical 56-bit limbs (fully reduced via
+        // the to/from bytes round-trip).
+        let affine = |p: &Point| -> [u64; 24] {
+            let zinv = f.inv(p.z);
+            let x = Fe::from_bytes(&f.mul(p.x, zinv).to_bytes());
+            let y = Fe::from_bytes(&f.mul(p.y, zinv).to_bytes());
+            let dxy = Fe::from_bytes(&f.mul(f.d, f.mul(x, y)).to_bytes());
+            let mut e = [0u64; 24];
+            e[..8].copy_from_slice(&x.0);
+            e[8..16].copy_from_slice(&y.0);
+            e[16..].copy_from_slice(&dxy.0);
+            e
+        };
+        let entry = |e: &[u64; 24], term: &str| {
+            print!("    [");
+            for l in e {
+                print!("0x{l:014x}, ");
+            }
+            println!("]{term}");
+        };
+        println!("pub(crate) static ED448_BASE_TABLE: [[[u64; 24]; 8]; 56] = [");
+        let mut base = f.base();
+        for _ in 0..56 {
+            println!("    [");
+            let mut acc = base;
+            for k in 1..=8u32 {
+                if k > 1 {
+                    acc = f.point_add(&acc, &base);
+                }
+                entry(&affine(&acc), ",");
+            }
+            println!("    ],");
+            for _ in 0..8 {
+                base = f.point_double(&base);
+            }
+        }
+        println!("];");
+        println!();
+        println!("pub(crate) static ED448_BASE_TOP: [u64; 24] =");
+        entry(&affine(&base), ";");
+        println!();
+        println!("pub(crate) static ED448_ODD_MULTIPLES: [[u64; 24]; 64] = [");
+        let b = f.base();
+        let b2 = f.point_double(&b);
+        let mut acc = b;
+        for k in 0..64 {
+            if k > 0 {
+                acc = f.point_add(&acc, &b2);
+            }
+            entry(&affine(&acc), ",");
+        }
+        println!("];");
     }
 
     /// The vartime Straus ladder agrees with two constant-time

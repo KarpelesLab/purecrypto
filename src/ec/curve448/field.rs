@@ -31,6 +31,7 @@
 //! invariant trivial to audit, every operation re-reduces its result before
 //! returning, so a reduced value is all a caller ever holds.
 
+#[cfg(any(test, not(feature = "ed448-table")))]
 use super::point::Point;
 use crate::bignum::Uint;
 use crate::ct::{Choice, ConstantTimeEq};
@@ -75,10 +76,15 @@ pub(crate) const L_INT: ScalarInt = crate::ec::uint_from_be_hex(
 /// The affine coordinates of the standard edwards448 base point `B`
 /// (RFC 8032 §5.2, big-endian hex) and `T = X·Y`. The `T` literal is checked
 /// against the product by `point::tests::const_base_matches_decoded_encoding`.
+// With the fixed-base table the library takes `B` from the table; the
+// literals then only back the tests.
+#[cfg(any(test, not(feature = "ed448-table")))]
 const BX_HEX: &str = "4f1970c66bed0ded221d15a622bf36da9e146570470f1767ea6de324\
 a3d3a46412ae1af72ab66511433b80e18b00938e2626a82bc70cc05e";
+#[cfg(any(test, not(feature = "ed448-table")))]
 const BY_HEX: &str = "693f46716eb6bc248876203756c9c7624bea73736ca3984087789c1e\
 05a0c2d73ad3ff1ce67c39c4fdbd132c4ed7c8ad9808795bf230fa14";
+#[cfg(any(test, not(feature = "ed448-table")))]
 const BT_HEX: &str = "c75eb58aee221c6ccec39d2d508d91c9c5056a183f8451d260d71667\
 e2356d58f179de90b5b27da1f78fa07d85662d1deb06624e82af95f3";
 
@@ -107,6 +113,7 @@ pub(crate) const BASE_ENC: [u8; 57] = {
 /// Parses 112 big-endian hex characters (a canonical residue) into limbs at
 /// compile time. Each limb is exactly 14 nibbles, so no nibble straddles a
 /// limb boundary.
+#[cfg(any(test, not(feature = "ed448-table")))]
 const fn fe_from_be_hex(hex: &str) -> Fe {
     let h = hex.as_bytes();
     assert!(h.len() == 112, "field constant must be 112 hex digits");
@@ -545,7 +552,10 @@ pub(crate) struct Field {
     /// The group order `L`.
     pub(crate) l: ScalarInt,
     /// The base point `B` in extended coordinates (`Z = 1`, `T = X·Y`), so
-    /// `[k]B` needs no per-call decompression.
+    /// `[k]B` needs no per-call decompression. With the fixed-base table
+    /// (feature `ed448-table`) library paths never touch the point itself;
+    /// only the table-free ladders and the tests do.
+    #[cfg(any(test, not(feature = "ed448-table")))]
     pub(crate) base_point: Point,
 }
 
@@ -555,6 +565,7 @@ static FIELD: Field = Field {
     d: Fe::D,
     p: P_INT,
     l: L_INT,
+    #[cfg(any(test, not(feature = "ed448-table")))]
     base_point: Point {
         x: fe_from_be_hex(BX_HEX),
         y: fe_from_be_hex(BY_HEX),
