@@ -197,9 +197,14 @@ macro_rules! ml_kem_set {
             /// FIPS 203 §7.3 "Decapsulation key check": confirms that the
             /// SHA3-256 hash of the embedded encapsulation key matches
             /// the H(ek) field stored at offset `pke_dk + ek_size` of the
-            /// decapsulation key. This guards against a corrupted /
-            /// adversarially-modified key file that would otherwise
-            /// produce wrong shared secrets at decapsulation time.
+            /// decapsulation key, and (§7.2, applied to the embedded key)
+            /// that every 12-bit coefficient of its t̂ vector is below q.
+            /// This guards against a corrupted / adversarially-modified key
+            /// file that would otherwise produce wrong shared secrets at
+            /// decapsulation time, and keeps the key handed out by
+            /// [`encapsulation_key`](Self::encapsulation_key) one that the
+            /// encapsulation key type's own `from_bytes_validated` would
+            /// itself accept.
             pub fn from_bytes_validated(
                 bytes: [u8; $dk_size],
             ) -> Result<Self, crate::mlkem::EncapsKeyCheckError> {
@@ -221,6 +226,16 @@ macro_rules! ml_kem_set {
                 let h = hasher.finalize();
                 if h.as_ref() != &bytes[h_start..h_end] {
                     return Err(crate::mlkem::EncapsKeyCheckError);
+                }
+                // §7.2 modulus check on the embedded ek's polynomial vector
+                // (the first `384 * k` bytes of the ek; the trailing `rho`
+                // seed is opaque). A consistent H(ek) only proves the two
+                // fields match, not that the ek is well-formed.
+                for i in 0..$k {
+                    let chunk = &bytes[ek_start + 384 * i..ek_start + 384 * (i + 1)];
+                    if !crate::mlkem::poly::is_canonical(chunk) {
+                        return Err(crate::mlkem::EncapsKeyCheckError);
+                    }
                 }
                 Ok($dk_name(bytes, None))
             }
@@ -1075,6 +1090,42 @@ mod tests {
         // pke_dk = 384 * 4 = 1536; ek_size = 1568 → H starts at 3104.
         bad[3105] ^= 1;
         assert!(MlKem1024DecapsKey::from_bytes_validated(bad).is_err());
+    }
+
+    /// FIPS 203 §7.2 applied to the embedded encapsulation key: a
+    /// decapsulation key whose ek carries an off-modulus coefficient must be
+    /// rejected by `from_bytes_validated` even when its H(ek) field is
+    /// consistent with the (malformed) ek.
+    #[test]
+    fn decaps_key_from_bytes_validated_checks_embedded_ek_modulus() {
+        use crate::hash::Digest;
+        let mut rng = HmacDrbg::<Sha256>::new(b"dk-modulus", b"nonce", &[]);
+
+        macro_rules! check {
+            ($dk:ty, $k:expr, $ek_size:expr) => {{
+                let (dk, _) = <$dk>::generate(&mut rng);
+                let mut bad = dk.to_bytes();
+                let pke_dk = 384 * $k;
+                // Force the first 12-bit coefficient of the embedded ek to
+                // 0xFFF = 4095 ≥ q = 3329, then fix up the stored H(ek) so
+                // the §7.3 hash check alone would pass.
+                bad[pke_dk] = 0xff;
+                bad[pke_dk + 1] |= 0x0f;
+                let mut h = crate::hash::Sha3_256::new();
+                h.update(&bad[pke_dk..pke_dk + $ek_size]);
+                let h = h.finalize();
+                bad[pke_dk + $ek_size..pke_dk + $ek_size + 32].copy_from_slice(h.as_ref());
+                assert!(
+                    <$dk>::from_bytes_validated(bad).is_err(),
+                    "off-modulus embedded ek must be rejected"
+                );
+                // Sanity: the untouched key still validates.
+                assert!(<$dk>::from_bytes_validated(dk.to_bytes()).is_ok());
+            }};
+        }
+        check!(MlKem512DecapsKey, 2, 800);
+        check!(MlKem768DecapsKey, 3, 1184);
+        check!(MlKem1024DecapsKey, 4, 1568);
     }
 
     /// FIPS 203 §7.2 — `from_spki_der` must reject an encapsulation key
