@@ -13,12 +13,16 @@
 //! `λ·(x, y) = (β·x, y)` into two halves of at most 128 bits,
 //! `k ≡ k₁ + k₂·λ (mod n)`, so a term `k·P` becomes `k₁·P + k₂·λP`, where
 //! `λP` costs three field multiplications per table entry. The half-size
-//! terms are then interleaved by Straus' method over width-5 wNAF digits:
-//! each gets the eight odd multiples `[1]P, [3]P, …, [15]P`, one shared run
-//! of ~128 doublings serves them all, and a term costs an addition only at
-//! its nonzero digits (on average one in six). For `a·G + b·Q` that is ~128
-//! doublings and ~86 additions, against ~512 doublings and ~158 additions for
-//! two constant-time 4-bit-window ladders. No static table is used.
+//! terms are then interleaved by Straus' method over wNAF digits: one shared
+//! run of ~128 doublings serves them all, and a term costs an addition only
+//! at its nonzero digits. A runtime term gets the eight odd multiples
+//! `[1]P, [3]P, …, [15]P` (width 5, one addition per ~6 digits); with the
+//! `secp256k1-table` feature the generator term instead reads the 128
+//! precomputed affine odd multiples `[1]G … [255]G` and their `λ`-images
+//! ([`super::gtable_vartime`], width 8, one *mixed* addition per ~9 digits
+//! and no table to build). For `a·G + b·Q` that is ~128 doublings and ~70
+//! additions, against ~512 doublings and ~158 additions for two
+//! constant-time 4-bit-window ladders.
 
 use super::Scalar;
 use super::field_backend::{Fe, FieldBackend};
@@ -50,17 +54,23 @@ fn split_lambda(k: &Fe) -> [(Fe, bool); 2] {
 /// Most terms any caller combines at once (`a·P + b·Q`).
 const MAX_TERMS: usize = 2;
 
-/// The wNAF window width: digits are odd and in `[−15, 15]`.
+/// The wNAF window width of a term with a runtime table: digits are odd and
+/// in `[−15, 15]`.
 const WINDOW: u32 = 5;
 
-/// Number of odd multiples per table: `[1]P, [3]P, …, [2^(WINDOW−1) − 1]P`.
+/// Number of odd multiples per runtime table: `[1]P, [3]P, …, [15]P`.
 const TABLE_LEN: usize = 1 << (WINDOW - 2);
+
+/// The wNAF window width of the generator term over the static tables:
+/// digits are odd and in `[−255, 255]`.
+#[cfg(feature = "secp256k1-table")]
+const GEN_WINDOW: u32 = 8;
 
 /// Digit positions of a 256-bit scalar's wNAF (the top carry can spill into
 /// position 256).
 const NAF_LEN: usize = 257;
 
-/// `count <= WINDOW` bits of `k` starting at bit `pos` (bits past 255 read as
+/// `count <= 8` bits of `k` starting at bit `pos` (bits past 255 read as
 /// zero).
 #[inline]
 fn bits(k: &[u64; 4], pos: usize, count: u32) -> u32 {
@@ -73,11 +83,13 @@ fn bits(k: &[u64; 4], pos: usize, count: u32) -> u32 {
     (v as u32) & ((1u32 << count) - 1)
 }
 
-/// Width-5 wNAF recoding of `k` (libsecp256k1's `ecmult_wnaf`): every nonzero
-/// digit is odd with `|d| <= 15`, and any two nonzero digits are at least five
-/// positions apart. Returns the number of digit positions in use (one past the
-/// highest nonzero digit; `0` for `k = 0`). **Variable time** in `k`.
-fn wnaf(k: &[u64; 4], naf: &mut [i8; NAF_LEN]) -> usize {
+/// Width-`W` wNAF recoding of `k` (libsecp256k1's `ecmult_wnaf`): every
+/// nonzero digit is odd with `|d| < 2^(W−1)`, and any two nonzero digits are
+/// at least `W` positions apart. Returns the number of digit positions in
+/// use (one past the highest nonzero digit; `0` for `k = 0`). **Variable
+/// time** in `k`.
+fn wnaf<const W: u32>(k: &[u64; 4], naf: &mut [i16; NAF_LEN]) -> usize {
+    const { assert!(W >= 2 && W <= 8) };
     let mut carry = 0u32;
     let mut bit = 0usize;
     let mut len = 0usize;
@@ -88,11 +100,11 @@ fn wnaf(k: &[u64; 4], naf: &mut [i8; NAF_LEN]) -> usize {
             bit += 1;
             continue;
         }
-        let now = WINDOW.min((256 - bit) as u32);
+        let now = W.min((256 - bit) as u32);
         let mut word = bits(k, bit, now) as i32 + carry as i32;
-        carry = ((word >> (WINDOW - 1)) & 1) as u32;
-        word -= (carry as i32) << WINDOW;
-        naf[bit] = word as i8;
+        carry = ((word >> (W - 1)) & 1) as u32;
+        word -= (carry as i32) << W;
+        naf[bit] = word as i16;
         len = bit + 1;
         bit += now as usize;
     }
@@ -113,6 +125,51 @@ fn odd_multiples<F: FieldBackend>(f: &F, p: &Point) -> [Point; TABLE_LEN] {
     table
 }
 
+/// The runtime tables of a term `k·P`: the odd multiples of `±P` and of
+/// `±λP` (`λ·(X : Y : Z) = (β·X : Y : Z)`; flipping the sign of `k₂`
+/// relative to `k₁` is a negation of `Y`), with the signs of the split
+/// halves folded in. Returns the digit counts of the two halves.
+fn term_tables<F: FieldBackend>(
+    f: &F,
+    k: &Scalar,
+    p: &Point,
+    nafs: &mut [[i16; NAF_LEN]; 2],
+    tables: &mut [[Point; TABLE_LEN]; 2],
+) -> usize {
+    let [(k1, neg1), (k2, neg2)] = split_lambda(&k.0);
+    let len1 = wnaf::<WINDOW>(k1.as_limbs(), &mut nafs[0]);
+    let len2 = wnaf::<WINDOW>(k2.as_limbs(), &mut nafs[1]);
+    if len1.max(len2) == 0 {
+        return 0;
+    }
+    let base = if neg1 { Point::negate(f, p) } else { *p };
+    let odd = odd_multiples(f, &base);
+    let mut odd_lambda = odd;
+    for e in &mut odd_lambda {
+        e.x = f.mul(&e.x, &BETA);
+        if neg1 != neg2 {
+            e.y = f.negate(&e.y);
+        }
+    }
+    tables[0] = odd;
+    tables[1] = odd_lambda;
+    len1.max(len2)
+}
+
+/// `acc + d·P` for the wNAF digit `d` over the odd-multiple table of `P`
+/// (`table[i] = [2i + 1]P`); a zero digit is a no-op.
+#[inline]
+fn add_digit<F: FieldBackend>(f: &F, acc: &Point, table: &[Point; TABLE_LEN], d: i16) -> Point {
+    if d > 0 {
+        Point::add(f, acc, &table[(d as usize) / 2])
+    } else if d < 0 {
+        let neg = Point::negate(f, &table[(d.unsigned_abs() as usize) / 2]);
+        Point::add(f, acc, &neg)
+    } else {
+        *acc
+    }
+}
+
 /// **Variable-time** `Σ kᵢ·Pᵢ` over `N <= 2` public terms (scalars reduced
 /// mod `n`), by a GLV split of each scalar and Straus' method over width-5
 /// wNAF digits.
@@ -121,31 +178,11 @@ pub(crate) fn multi_mul<F: FieldBackend, const N: usize>(
     terms: [(&Scalar, &Point); N],
 ) -> Point {
     const { assert!(N <= MAX_TERMS) };
-    let mut nafs = [[0i8; NAF_LEN]; 2 * MAX_TERMS];
-    let mut tables = [[Point::identity(f); TABLE_LEN]; 2 * MAX_TERMS];
+    let mut nafs = [[[0i16; NAF_LEN]; 2]; MAX_TERMS];
+    let mut tables = [[[Point::identity(f); TABLE_LEN]; 2]; MAX_TERMS];
     let mut top = 0;
-    let beta = BETA;
     for (t, (k, p)) in terms.iter().enumerate() {
-        let [(k1, neg1), (k2, neg2)] = split_lambda(&k.0);
-        let len1 = wnaf(k1.as_limbs(), &mut nafs[2 * t]);
-        let len2 = wnaf(k2.as_limbs(), &mut nafs[2 * t + 1]);
-        if len1.max(len2) == 0 {
-            continue;
-        }
-        top = top.max(len1).max(len2);
-        let base = if neg1 { Point::negate(f, p) } else { **p };
-        let odd = odd_multiples(f, &base);
-        // λ·(X : Y : Z) = (β·X : Y : Z); flipping the sign of k₂ relative to
-        // k₁ is a negation of Y.
-        let mut odd_lambda = odd;
-        for e in &mut odd_lambda {
-            e.x = f.mul(&e.x, &beta);
-            if neg1 != neg2 {
-                e.y = f.negate(&e.y);
-            }
-        }
-        tables[2 * t] = odd;
-        tables[2 * t + 1] = odd_lambda;
+        top = top.max(term_tables(f, k, p, &mut nafs[t], &mut tables[t]));
     }
 
     let mut acc = Point::identity(f);
@@ -154,15 +191,51 @@ pub(crate) fn multi_mul<F: FieldBackend, const N: usize>(
         if i + 1 < top {
             acc = Point::double(f, &acc);
         }
-        for t in 0..2 * N {
-            let d = nafs[t][i];
-            if d > 0 {
-                acc = Point::add(f, &acc, &tables[t][(d as usize) / 2]);
-            } else if d < 0 {
-                let neg = Point::negate(f, &tables[t][((-d) as usize) / 2]);
-                acc = Point::add(f, &acc, &neg);
+        for t in 0..N {
+            acc = add_digit(f, &acc, &tables[t][0], nafs[t][0][i]);
+            acc = add_digit(f, &acc, &tables[t][1], nafs[t][1][i]);
+        }
+    }
+    acc
+}
+
+/// **Variable-time** `a·G + b·Q` for public `a`, `b`, `Q`: the generator
+/// term over the static width-8 tables of odd multiples of `G` and `λG`
+/// (affine entries, complete mixed additions, nothing to precompute), the
+/// `Q` term over runtime width-5 tables, both interleaved in one doubling
+/// chain.
+#[cfg(feature = "secp256k1-table")]
+pub(crate) fn generator_double<F: FieldBackend>(f: &F, a: &Scalar, b: &Scalar, q: &Point) -> Point {
+    use super::comb::affine_entry;
+    use super::gtable_vartime::{SECP256K1_G_ODD_TABLE, SECP256K1_LAMBDA_G_ODD_TABLE};
+
+    let [(a1, neg_a1), (a2, neg_a2)] = split_lambda(&a.0);
+    let mut naf_a = [[0i16; NAF_LEN]; 2];
+    let len_a1 = wnaf::<GEN_WINDOW>(a1.as_limbs(), &mut naf_a[0]);
+    let len_a2 = wnaf::<GEN_WINDOW>(a2.as_limbs(), &mut naf_a[1]);
+    let neg_a = [neg_a1, neg_a2];
+    let gen_tables = [&SECP256K1_G_ODD_TABLE, &SECP256K1_LAMBDA_G_ODD_TABLE];
+
+    let mut naf_b = [[0i16; NAF_LEN]; 2];
+    let mut tables_b = [[Point::identity(f); TABLE_LEN]; 2];
+    let len_b = term_tables(f, b, q, &mut naf_b, &mut tables_b);
+
+    let top = len_a1.max(len_a2).max(len_b);
+    let mut acc = Point::identity(f);
+    for i in (0..top).rev() {
+        if i + 1 < top {
+            acc = Point::double(f, &acc);
+        }
+        for t in 0..2 {
+            let d = naf_a[t][i];
+            if d != 0 {
+                let (x, y) = affine_entry(&gen_tables[t][(d.unsigned_abs() as usize) / 2]);
+                let y = if (d < 0) != neg_a[t] { f.negate(&y) } else { y };
+                acc = Point::add_mixed(f, &acc, &x, &y);
             }
         }
+        acc = add_digit(f, &acc, &tables_b[0], naf_b[0][i]);
+        acc = add_digit(f, &acc, &tables_b[1], naf_b[1][i]);
     }
     acc
 }
@@ -193,7 +266,53 @@ mod tests {
         }
     }
 
-    /// The recoding reconstructs `k` exactly, with the wNAF shape.
+    /// Σ dᵢ·2ⁱ of a wNAF, in 320-bit two's complement over five limbs, with
+    /// the digit-shape assertions for window `w`.
+    fn naf_value(naf: &[i16; NAF_LEN], len: usize, w: u32) -> [u64; 5] {
+        let mut acc = [0u64; 5];
+        let mut last: Option<usize> = None;
+        for (i, &d) in naf.iter().enumerate() {
+            if d == 0 {
+                continue;
+            }
+            assert!(
+                d % 2 != 0 && d.unsigned_abs() < (1 << (w - 1)),
+                "bad digit {d}"
+            );
+            if let Some(l) = last {
+                assert!(i - l >= w as usize, "digits too close");
+            }
+            last = Some(i);
+            assert!(i < len);
+            // Add sign(d)·|d|·2^i.
+            let mut term = [0u64; 5];
+            let mag = (d.unsigned_abs() as u128) << (i % 64);
+            term[i / 64] = mag as u64;
+            if i / 64 + 1 < 5 {
+                term[i / 64 + 1] = (mag >> 64) as u64;
+            }
+            if d < 0 {
+                let mut borrow = 0u128;
+                for j in 0..5 {
+                    let t = (acc[j] as u128).wrapping_sub(term[j] as u128 + borrow);
+                    acc[j] = t as u64;
+                    borrow = (t >> 64) & 1;
+                }
+            } else {
+                let mut carry = 0u128;
+                for j in 0..5 {
+                    let t = acc[j] as u128 + term[j] as u128 + carry;
+                    acc[j] = t as u64;
+                    carry = t >> 64;
+                }
+            }
+        }
+        assert_eq!(len, last.map_or(0, |l| l + 1));
+        acc
+    }
+
+    /// The recoding reconstructs `k` exactly, with the wNAF shape, at both
+    /// window widths.
     #[test]
     fn wnaf_reconstructs_scalar() {
         let mut rng = SplitMix64(0x77AF_0005);
@@ -207,46 +326,20 @@ mod tests {
             *c = rng.limbs();
         }
         for k in &cases {
-            let mut naf = [0i8; NAF_LEN];
-            let len = wnaf(k, &mut naf);
-            // Σ dᵢ·2ⁱ, in 320-bit two's complement over five limbs.
-            let mut acc = [0u64; 5];
-            let mut last: Option<usize> = None;
-            for (i, &d) in naf.iter().enumerate() {
-                if d == 0 {
-                    continue;
-                }
-                assert!(d % 2 != 0 && d.abs() <= 15, "bad digit {d}");
-                if let Some(l) = last {
-                    assert!(i - l >= WINDOW as usize, "digits too close");
-                }
-                last = Some(i);
-                assert!(i < len);
-                // Add sign(d)·|d|·2^i.
-                let mut term = [0u64; 5];
-                let mag = (d.unsigned_abs() as u128) << (i % 64);
-                term[i / 64] = mag as u64;
-                if i / 64 + 1 < 5 {
-                    term[i / 64 + 1] = (mag >> 64) as u64;
-                }
-                if d < 0 {
-                    let mut borrow = 0u128;
-                    for j in 0..5 {
-                        let t = (acc[j] as u128).wrapping_sub(term[j] as u128 + borrow);
-                        acc[j] = t as u64;
-                        borrow = (t >> 64) & 1;
-                    }
-                } else {
-                    let mut carry = 0u128;
-                    for j in 0..5 {
-                        let t = acc[j] as u128 + term[j] as u128 + carry;
-                        acc[j] = t as u64;
-                        carry = t >> 64;
-                    }
-                }
-            }
-            assert_eq!(acc, [k[0], k[1], k[2], k[3], 0], "k={k:x?}");
-            assert_eq!(len, last.map_or(0, |l| l + 1));
+            let mut naf = [0i16; NAF_LEN];
+            let len = wnaf::<5>(k, &mut naf);
+            assert_eq!(
+                naf_value(&naf, len, 5),
+                [k[0], k[1], k[2], k[3], 0],
+                "k={k:x?}"
+            );
+            let mut naf = [0i16; NAF_LEN];
+            let len = wnaf::<8>(k, &mut naf);
+            assert_eq!(
+                naf_value(&naf, len, 8),
+                [k[0], k[1], k[2], k[3], 0],
+                "k={k:x?}"
+            );
         }
     }
 
@@ -313,8 +406,9 @@ mod tests {
         assert!(bool::from(lg.ct_eq(&f, &bg)));
     }
 
-    /// `multi_mul` agrees with the constant-time ladder on random terms and on
-    /// the degenerate ones (zero scalars, the identity, `P == Q`, `Q == −P`).
+    /// `multi_mul` (and, with the table, `generator_double`) agree with the
+    /// reference ladder on random terms and on the degenerate ones (zero
+    /// scalars, the identity, `P == Q`, `Q == −P`).
     #[test]
     fn multi_mul_matches_ladder() {
         let f = Secp256k1Field::new();
@@ -324,7 +418,7 @@ mod tests {
         pts[1] = Point::identity(&f);
         pts[2] = Point::negate(&f, &g);
         for p in &mut pts[3..] {
-            *p = Point::mul(&f, rand_scalar(&mut rng).0.as_limbs(), &g);
+            *p = Point::mul_reference(&f, rand_scalar(&mut rng).0.as_limbs(), &g);
         }
         let edges = edge_scalars();
         let mut scalars = [
@@ -347,7 +441,7 @@ mod tests {
                 rand_scalar(&mut rng)
             };
         }
-        let ladder = |k: &Scalar, p: &Point| Point::mul(&f, k.0.as_limbs(), p);
+        let ladder = |k: &Scalar, p: &Point| Point::mul_reference(&f, k.0.as_limbs(), p);
         for (i, a) in scalars.iter().enumerate() {
             let b = &scalars[(i * 7 + 3) % scalars.len()];
             for p in &pts {
@@ -358,11 +452,22 @@ mod tests {
                     let one = multi_mul(&f, [(a, p)]);
                     assert!(bool::from(one.ct_eq(&f, &ladder(a, p))));
                 }
+                #[cfg(feature = "secp256k1-table")]
+                {
+                    let want = Point::add(&f, &ladder(a, &g), &ladder(b, p));
+                    let got = generator_double(&f, a, b, p);
+                    assert!(bool::from(got.ct_eq(&f, &want)), "generator i={i}");
+                }
             }
         }
         // a·G + (n − a)·G is the identity.
         let a = rand_scalar(&mut rng);
         let got = multi_mul(&f, [(&a, &g), (&a.negate(), &g)]);
         assert!(bool::from(got.is_identity()));
+        #[cfg(feature = "secp256k1-table")]
+        {
+            let got = generator_double(&f, &a, &a.negate(), &g);
+            assert!(bool::from(got.is_identity()));
+        }
     }
 }

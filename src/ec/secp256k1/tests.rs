@@ -533,3 +533,78 @@ fn x_mod_n_equals_vartime_cases() {
     assert!(!g.x_mod_n_equals_vartime(&Scalar::ONE));
     assert!(!ProjectivePoint::identity().x_mod_n_equals_vartime(&Scalar::ZERO));
 }
+
+/// Re-derives every entry of the variable-time generator tables from the
+/// group law, so `SECP256K1_G_ODD_TABLE` and `SECP256K1_LAMBDA_G_ODD_TABLE`
+/// are verified on every test run rather than trusted. Inversion-free: the
+/// stored affine `(x, y)` matches the computed projective `(X : Y : Z)` iff
+/// `x·Z == X` and `y·Z == Y`, and the `λ` entry iff `x·Z == β·X`.
+#[test]
+#[cfg(feature = "secp256k1-table")]
+fn vartime_tables_match_computed() {
+    use gtable_vartime::{SECP256K1_G_ODD_TABLE, SECP256K1_LAMBDA_G_ODD_TABLE};
+    let f = field();
+    let g = ProjectivePoint::generator().0;
+    let two_g = Point::double(&f, &g);
+    let mut acc = g;
+    for (j, (entry, lambda_entry)) in SECP256K1_G_ODD_TABLE
+        .iter()
+        .zip(SECP256K1_LAMBDA_G_ODD_TABLE.iter())
+        .enumerate()
+    {
+        if j > 0 {
+            acc = Point::add(&f, &acc, &two_g);
+        }
+        assert!(!bool::from(acc.is_identity()), "entry is the identity");
+        let (ex, ey) = comb::affine_entry(entry);
+        assert_eq!(f.mul(&ex, &acc.z), acc.x, "x mismatch at {j}");
+        assert_eq!(f.mul(&ey, &acc.z), acc.y, "y mismatch at {j}");
+        let (lx, ly) = comb::affine_entry(lambda_entry);
+        assert_eq!(f.mul(&lx, &acc.z), f.mul(&acc.x, &glv::BETA), "λx at {j}");
+        assert_eq!(f.mul(&ly, &acc.z), acc.y, "λy mismatch at {j}");
+    }
+}
+
+/// Regenerates the variable-time generator tables
+/// (`src/ec/secp256k1/gtable_vartime.rs`): the 128 odd multiples
+/// `[1]G, [3]G, …, [255]G` and their images under the endomorphism
+/// `λ·(x, y) = (β·x, y)`. Run with:
+/// `cargo test --release gen_secp256k1_vartime_tables -- --ignored --nocapture`
+/// and paste the emitted statics between the file's header comment and EOF.
+/// The non-ignored `vartime_tables_match_computed` test keeps the pasted
+/// constants honest on every test run.
+#[test]
+#[ignore = "table generator; emits Rust source on stdout"]
+#[cfg(feature = "std")]
+fn gen_secp256k1_vartime_tables() {
+    use std::{print, println};
+    let f = field();
+    let g = ProjectivePoint::generator().0;
+    let two_g = Point::double(&f, &g);
+    let mut odd = std::vec::Vec::with_capacity(128);
+    let mut acc = g;
+    for j in 0..128 {
+        if j > 0 {
+            acc = Point::add(&f, &acc, &two_g);
+        }
+        odd.push(acc.to_affine(&f).expect("odd multiple is never identity"));
+    }
+    let emit = |name: &str, beta: bool| {
+        println!("pub(crate) static {name}: [[u64; 8]; 128] = [");
+        for (x, y) in &odd {
+            let x = if beta { f.mul(x, &glv::BETA) } else { *x };
+            print!("    [");
+            for l in x.as_limbs() {
+                print!("0x{l:016x}, ");
+            }
+            for l in y.as_limbs() {
+                print!("0x{l:016x}, ");
+            }
+            println!("],");
+        }
+        println!("];");
+    };
+    emit("SECP256K1_G_ODD_TABLE", false);
+    println!();
+    emit("SECP256K1_LAMBDA_G_ODD_TABLE", true);
+}

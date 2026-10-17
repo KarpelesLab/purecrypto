@@ -48,6 +48,8 @@ mod glv;
 mod group;
 #[cfg(feature = "secp256k1-table")]
 mod gtable;
+#[cfg(feature = "secp256k1-table")]
+mod gtable_vartime;
 mod vartime;
 
 use crate::bignum::MontModulus;
@@ -374,13 +376,23 @@ impl ProjectivePoint {
     }
 
     /// **Variable-time** `a·G + b·q`; public inputs only, as
-    /// [`mul_double_vartime`](Self::mul_double_vartime).
+    /// [`mul_double_vartime`](Self::mul_double_vartime). With the
+    /// `secp256k1-table` feature the generator term reads precomputed
+    /// width-8 tables of odd multiples of `G` and `λG` instead of building
+    /// them per call.
     pub(crate) fn mul_generator_double_vartime(
         a: &Scalar,
         b: &Scalar,
         q: &ProjectivePoint,
     ) -> ProjectivePoint {
-        Self::mul_double_vartime(a, &Self::generator(), b, q)
+        #[cfg(feature = "secp256k1-table")]
+        {
+            ProjectivePoint(vartime::generator_double(&field(), a, b, &q.0))
+        }
+        #[cfg(not(feature = "secp256k1-table"))]
+        {
+            Self::mul_double_vartime(a, &Self::generator(), b, q)
+        }
     }
 
     /// Whether `x(self) mod n == r`, for a public point and `r < n` — the
