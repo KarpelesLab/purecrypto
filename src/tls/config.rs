@@ -347,12 +347,13 @@ pub struct Config {
     /// retries with it (§4.1.4). `None` (the default) sends a share for
     /// every group of a [`key_exchange_groups`](Self::key_exchange_groups)
     /// restriction — no round trip, at the cost of a larger hello — and,
-    /// without one, for the first four of the default offer
-    /// (`X25519MLKEM768`, `x25519`, `secp256r1`, `secp384r1`): a share for
-    /// each of the other three (`SecP256r1MLKEM768`, `SecP384r1MLKEM1024`,
-    /// `secp521r1`) would add some 3 kB to every ClientHello for groups
-    /// few servers select, so those cost one HelloRetryRequest when a
-    /// server insists on them. Groups the client does not offer are
+    /// without one, for the first three of the default offer
+    /// (`X25519MLKEM768`, `x25519`, `secp256r1` — the browsers' set): a
+    /// share for each of the other four (`secp384r1`, `SecP256r1MLKEM768`,
+    /// `SecP384r1MLKEM1024`, `secp521r1`) would add some 3 kB and a 1.7 ms
+    /// P-384 scalar multiplication to every ClientHello for groups few
+    /// servers select, so those cost one HelloRetryRequest when a server
+    /// insists on them. Groups the client does not offer are
     /// ignored; a list that names none of them sends no shares at all,
     /// which is legal and makes any TLS 1.3 server ask for one. Honoured
     /// by the DTLS 1.3 client the same way; inert on the server and on

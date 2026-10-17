@@ -449,9 +449,9 @@ Behaviour worth knowing:
 - The client offers `X25519MLKEM768` first, then `x25519`, `secp256r1`,
   `secp384r1`, and after those the RFC 10024 NIST-curve hybrids
   `SecP256r1MLKEM768` and `SecP384r1MLKEM1024` and `secp521r1`, with a key
-  share for the first four (a share for each of the other three would add
-  some 3 kB to every ClientHello; a server that wants one asks with a
-  HelloRetryRequest); all three TLS 1.3 suites; and Ed25519, Ed448, ECDSA
+  share for the first three (the browsers' set; a share for each of the
+  other four would add some 3 kB and a P-384 scalar multiplication to every
+  ClientHello; a server that wants one asks with a HelloRetryRequest); all three TLS 1.3 suites; and Ed25519, Ed448, ECDSA
   and RSA peer signatures. `-key-shares x25519` (a comma-separated list)
   pre-shares keys for those groups only: every group is still offered, and
   a server preferring another answers with a HelloRetryRequest.

@@ -760,16 +760,16 @@ struct PendingClientFlight {
 /// offers them when [`ClientConfig::groups`] is empty (the same order as
 /// [`crate::tls::NamedGroup::ALL`]).
 ///
-/// The first four are the groups the first ClientHello carries a share for
+/// The first three are the groups the first ClientHello carries a share for
 /// ([`DEFAULT_SHARE_GROUPS`]), so a server that follows the client's
 /// preference finds a share for whatever it picks among them. The groups
 /// after them are there for servers that accept nothing else — a policy
-/// that mandates NIST curves in the hybrid (SecP256r1MLKEM768,
-/// SecP384r1MLKEM1024; RFC 10024 marks both "Recommended: N") or P-521 —
-/// and cost such a server one HelloRetryRequest. They are listed last so
-/// that adding them changes no negotiation that worked without them; the
-/// hybrids come before secp521r1 because they are post-quantum and
-/// cheaper than a P-521 scalar multiplication.
+/// that mandates P-384 or P-521, or NIST curves in the hybrid
+/// (SecP256r1MLKEM768, SecP384r1MLKEM1024; RFC 10024 marks both
+/// "Recommended: N") — and cost such a server one HelloRetryRequest. They
+/// are listed last so that adding them changes no negotiation that worked
+/// without them; the hybrids come before secp521r1 because they are
+/// post-quantum and cheaper than a P-521 scalar multiplication.
 pub(crate) const DEFAULT_GROUPS: [NamedGroup; 7] = [
     NamedGroup::X25519MLKEM768,
     NamedGroup::X25519,
@@ -784,16 +784,21 @@ pub(crate) const DEFAULT_GROUPS: [NamedGroup; 7] = [
 /// the offer ([`ClientConfig::groups`]) nor the shares
 /// ([`ClientConfig::key_share_groups`]) are configured.
 ///
-/// A share for each of the other [`DEFAULT_GROUPS`] would add some 3 kB
-/// (1249, 1665 and 133 bytes, plus framing) to every ClientHello — three
-/// more TCP segments' worth, and a third and fourth QUIC Initial datagram —
-/// for groups few servers select. A server that wants one asks with a
-/// HelloRetryRequest (RFC 8446 §4.1.4).
-pub(crate) const DEFAULT_SHARE_GROUPS: [NamedGroup; 4] = [
+/// This is the set the browsers ship (X25519MLKEM768, X25519 and P-256):
+/// the ML-KEM hybrid for post-quantum servers, X25519 for the rest, P-256
+/// for a NIST-only policy. A share for each of the other [`DEFAULT_GROUPS`]
+/// would add some 3.1 kB (97, 1249, 1665 and 133 bytes, plus framing) to
+/// every ClientHello — three more TCP segments' worth, and a third and
+/// fourth QUIC Initial datagram — for groups few servers select; and a
+/// P-384 share costs a 1.7 ms scalar multiplication per connection on an
+/// Apple M-series core, three times the rest of the client's handshake
+/// put together (resumption included), for a group a server picks over
+/// X25519 or P-256 only under a Suite-B-style policy. A server that wants
+/// one of them asks with a HelloRetryRequest (RFC 8446 §4.1.4).
+pub(crate) const DEFAULT_SHARE_GROUPS: [NamedGroup; 3] = [
     NamedGroup::X25519MLKEM768,
     NamedGroup::X25519,
     NamedGroup::SECP256R1,
-    NamedGroup::SECP384R1,
 ];
 
 /// Resolves [`ClientConfig::groups`] against [`DEFAULT_GROUPS`]: an empty
@@ -4999,8 +5004,8 @@ mod tests {
             assert!(ext::find(&ch.extensions, ty).is_some());
         }
         // Every implemented group is offered; the key_share carries the
-        // `DEFAULT_SHARE_GROUPS` (x25519mlkem768, x25519, secp256r1,
-        // secp384r1) and leaves the rest to a HelloRetryRequest.
+        // `DEFAULT_SHARE_GROUPS` (x25519mlkem768, x25519, secp256r1) and
+        // leaves the rest to a HelloRetryRequest.
         let sg = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS).unwrap();
         assert_eq!(ext::parse_supported_groups(sg).unwrap(), DEFAULT_GROUPS);
         let ks = ext::find(&ch.extensions, ExtensionType::KEY_SHARE).unwrap();

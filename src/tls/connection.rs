@@ -3885,16 +3885,17 @@ mod tests {
     #[test]
     fn server_key_exchange_groups_selects_and_retries() {
         use crate::tls::NamedGroup;
-        // The default client shares every group; a server preferring P-384
-        // takes it although the client listed it last.
+        // The default client shares X25519MLKEM768, X25519 and P-256; a
+        // server preferring P-256 takes it although the client listed it
+        // last among its shares.
         let mut server_cfg = tls13_server_cfg(false);
         server_cfg.key_exchange_groups =
-            Some(alloc::vec![NamedGroup::Secp384r1, NamedGroup::X25519]);
+            Some(alloc::vec![NamedGroup::Secp256r1, NamedGroup::X25519]);
         let mut client = Connection::client(&tls13_client_cfg(None)).unwrap();
         let mut server = Connection::server(&server_cfg).unwrap();
         drive_pair(&mut client, &mut server);
-        assert_eq!(client.negotiated_group(), Some(NamedGroup::Secp384r1));
-        assert_eq!(server.negotiated_group(), Some(NamedGroup::Secp384r1));
+        assert_eq!(client.negotiated_group(), Some(NamedGroup::Secp256r1));
+        assert_eq!(server.negotiated_group(), Some(NamedGroup::Secp256r1));
         assert!(!server.hello_retry_request_used());
 
         // A client sharing only X25519 against a P-256-only server: HRR.
@@ -3932,12 +3933,13 @@ mod tests {
     }
 
     /// The default ClientHello advertises every implemented group but
-    /// carries shares only for the usual four (`DEFAULT_SHARE_GROUPS`): a
-    /// share for each RFC 10024 NIST-curve hybrid and for secp521r1 would
-    /// add some 3 kB to every handshake. A server that wants one of the
+    /// carries shares only for the usual three (`DEFAULT_SHARE_GROUPS`): a
+    /// share for each RFC 10024 NIST-curve hybrid, for secp384r1 and for
+    /// secp521r1 would add some 3 kB and a 1.7 ms P-384 scalar
+    /// multiplication to every handshake. A server that wants one of the
     /// share-less groups gets it through a HelloRetryRequest.
     #[test]
-    fn default_offer_advertises_all_groups_but_shares_four() {
+    fn default_offer_advertises_all_groups_but_shares_three() {
         use crate::tls::NamedGroup;
         use crate::tls::codec::extension as ext;
         use crate::tls::codec::{ClientHello, ExtensionType};
@@ -3956,11 +3958,12 @@ mod tests {
         )
         .unwrap();
         let share_groups: Vec<_> = shares.iter().map(|(g, _)| *g).collect();
-        assert_eq!(share_groups, all[..4]);
+        assert_eq!(share_groups, all[..3]);
 
         // Each share-less group is reachable through one HRR, on both the
         // server's preference knobs.
         for g in [
+            NamedGroup::Secp384r1,
             NamedGroup::SecP256r1MlKem768,
             NamedGroup::SecP384r1MlKem1024,
             NamedGroup::Secp521r1,
