@@ -147,13 +147,26 @@ pub struct Readiness {
 }
 
 impl Readiness {
-    /// Wrap a raw, borrowed file descriptor. The caller (a [`SignOp`]
-    /// implementation) guarantees the fd outlives this token, i.e. is not
-    /// closed before the next `resume`. Only available on `std` + unix; on
-    /// other targets a [`SignOp`] cannot construct a `Readiness` and must
+    /// Wrap a raw, borrowed file descriptor. Only available on `std` + unix;
+    /// on other targets a [`SignOp`] cannot construct a `Readiness` and must
     /// report no readiness (the caller busy-polls via `resume`).
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be a valid, open file descriptor, and it must remain open and
+    /// refer to the same underlying file description for as long as the
+    /// returned `Readiness` (or any copy of it) is in use — that is, until the
+    /// handshake step that received it from [`SignOp::readiness`] has
+    /// completed and the next [`resume`](SignOp::resume) has been called. The
+    /// connection and the async adapters hand the descriptor to `poll(2)`,
+    /// `tokio::io::unix::AsyncFd` or `mio::unix::SourceFd`, which rely on
+    /// that guarantee for I/O safety (a closed or recycled descriptor would be
+    /// polled, or registered with a reactor, as if it were the device). The
+    /// [`SignOp`] therefore must not close the descriptor before that point.
+    /// `Readiness` never closes it.
     #[cfg(all(feature = "std", unix))]
-    pub fn from_raw_fd(fd: core::ffi::c_int) -> Self {
+    #[allow(unsafe_code)]
+    pub unsafe fn from_raw_fd(fd: core::ffi::c_int) -> Self {
         Readiness { fd }
     }
 

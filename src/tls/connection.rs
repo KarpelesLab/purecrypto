@@ -6897,7 +6897,11 @@ mod tests {
                 Ok(SignProgress::Done(sig))
             }
             fn readiness(&self) -> Option<Readiness> {
-                Some(Readiness::from_raw_fd(self.near.as_raw_fd()))
+                // SAFETY: `near` is owned by this `DeviceOp`, which outlives
+                // every handshake step that polls the token; the socket is
+                // only closed when the op is dropped after `Done`.
+                #[allow(unsafe_code)]
+                Some(unsafe { Readiness::from_raw_fd(self.near.as_raw_fd()) })
             }
         }
 

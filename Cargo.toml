@@ -362,13 +362,15 @@ cacrt = { version = "0.1", default-features = false, optional = true }
 # `Connection`/`Readiness` surface and never compile unless requested, so the
 # default build and `no_std` stay free of them. `net` provides tokio's
 # `AsyncFd`; `os-ext` provides mio's `SourceFd`.
-tokio = { version = "1", default-features = false, features = ["net", "io-util"], optional = true }
+# tokio >= 1.53.3: `AsyncFd::register_with_interest` (the I/O-safe replacement
+# for the deprecated `AsyncFd::with_interest`) is what `tls::tokio` uses.
+tokio = { version = "1.53.3", default-features = false, features = ["net", "io-util"], optional = true }
 mio = { version = "1", default-features = false, features = ["os-ext", "net"], optional = true }
 
 # Test-only: a full tokio runtime + `#[tokio::test]` for the `tokio` integration
 # tests. Not shipped to consumers.
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
+tokio = { version = "1.53.3", features = ["net", "io-util", "rt", "macros", "time"] }
 # zlib inflate for the Wycheproof chunked-encryption vectors, whose `ct`
 # field is zlib-compressed (tests/wycheproof/chunked.rs).
 compcol = { version = "0.6", default-features = false, features = ["zlib"] }

@@ -162,7 +162,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TlsStream<S> {
                         // AsyncFd registers the (borrowed) fd; dropping it only
                         // deregisters — `Readiness` does not own/close the fd, so
                         // the SignOp retains it.
-                        let afd = AsyncFd::with_interest(r, Interest::READABLE)?;
+                        //
+                        // SAFETY: `Readiness::from_raw_fd`'s contract — the fd is
+                        // valid, open, and refers to the same file description for
+                        // as long as the token is in use. This `AsyncFd` lives only
+                        // for the `readable().await` below, inside the handshake
+                        // step that received the token, which is exactly the span
+                        // the `SignOp` guarantees.
+                        #[allow(unsafe_code)]
+                        let afd = unsafe { AsyncFd::register_with_interest(r, Interest::READABLE) }
+                            .map_err(io::Error::from)?;
                         let mut guard = afd.readable().await?;
                         guard.clear_ready();
                         continue;

@@ -217,7 +217,10 @@ fn mio_drive_device_signer() {
             Ok(SignProgress::Done(self.buf[2..2 + len].to_vec()))
         }
         fn readiness(&self) -> Option<Readiness> {
-            Some(Readiness::from_raw_fd(self.near.as_raw_fd()))
+            // SAFETY: `near` is owned by this op and stays open until the op
+            // is dropped, after the handshake step that polls the token.
+            #[allow(unsafe_code)]
+            Some(unsafe { Readiness::from_raw_fd(self.near.as_raw_fd()) })
         }
     }
 

@@ -119,7 +119,10 @@ mod unix {
 
         fn readiness(&self) -> Option<Readiness> {
             // Tell the caller which fd to wait on while we're Pending.
-            Some(Readiness::from_raw_fd(self.near.as_raw_fd()))
+            // SAFETY: `near` is owned by this op and stays open until the op
+            // is dropped, after the handshake step that polls the token.
+            #[allow(unsafe_code)]
+            Some(unsafe { Readiness::from_raw_fd(self.near.as_raw_fd()) })
         }
     }
 
