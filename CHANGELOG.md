@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/KarpelesLab/purecrypto/compare/v0.9.9...v0.10.0) - 2026-10-17
+
+### Fixed
+
+- *(dtls)* send an empty ticket when the client leaf cannot be sealed
+- *(tls)* server sends bad_certificate and inappropriate_fallback alerts
+- *(tls)* TLS 1.2 ticket, EMS-resumption and exporter hardening
+- *(tls)* open the keylog file without following links and keep it 0600
+- *(tls)* keep ECH config length prefixes consistent with their bodies
+- *(tls)* shape the GREASE ECH `enc` as a real KEM encapsulation
+- *(tls)* [**breaking**] make Readiness::from_raw_fd unsafe; use AsyncFd::register_with_interest
+- *(tls)* use the RFC 6101 §5.6.8 CertificateVerify digest under SSL 3.0
+- *(tls)* bound only retained bytes in the version-spanning front-ends
+- *(tls)* tighten TLS 1.3 client key_share and HRR handling
+- *(quic)* initiate a key update before the AEAD confidentiality limit
+- *(quic)* keep every 1-RTT frame inside the room left for the packet
+- *(quic)* pin the server SCID and drop client Initial keys per RFC 9001 §4.9.1
+- *(quic)* keep the remote CID pool's active sequence in step with cids.peer
+- *(quic)* enforce RFC 9001 §6.4 key ordering with KEY_UPDATE_ERROR
+- *(quic)* cap the locally advertised initial_max_streams_* at 2^16
+- *(dtls)* drop buffered reassembly once the 1.2 handshake completes
+- *(ec)* finish the CurvePrivateKey reader and check the PKCS#8 v2 publicKey
+- *(x509)* validate the parameters of non-PSS signature AlgorithmIdentifiers
+- *(x509)* parse CSR extensionRequest attributes as strictly as cert extensions
+- *(x509)* reject DEFAULT-valued BOOLEANs and non-minimal keyUsage BIT STRINGs
+- *(x509,pkcs12)* wipe decrypted and PEM-decoded private-key buffers
+- *(x509)* cap SCT list length and skip re-verifying an already-counted log
+- *(jose)* cap general-JSON JWS signature count at MAX_SIGNATURES
+- *(cli)* cap -mtu at 65535 and make s_client -read_timeout 0 explicit
+- *(examples)* verify the OpenSSL server's certificate in tls_legacy_interop
+- *(cli)* keep PSKs, PKCS#12 passwords and QUIC reset keys off argv
+- *(cli)* bound s_server's TCP handshake and ignore foreign DTLS ClientHellos
+- *(dtls)* make post-handshake message_seq exhaustion an error in 1.3
+- *(dtls)* cap plaintext handshake reassembly below the default budget
+- *(dtls)* keep epoch-0 handshake records readable after the 1.2 CCS
+- *(zkp)* match the reference's Borromean verifier checks and whitelist parser
+- *(zkp)* align range-proof parameter selection with the reference at two u64 edges
+- *(hpke)* check the message limit before sealing/opening at seq == u64::MAX
+- *(mlkem)* modulus-check the embedded ek in DecapsKey::from_bytes_validated
+- *(cipher)* reject partial blocks in BlockCipher::{encrypt,decrypt}_blocks
+- *(cipher)* make the fused CTR+GHASH buffer-length precondition a hard assert
+- *(bignum)* keep secret limbs off the heap in BoxedUint::add and the RSA blinder
+- *(ffi)* zero scalar out-params before the handle NULL check
+- *(ffi)* cap pc_quic_cfg_set_versions' count before reading the list
+- *(ffi)* align pc_malloc allocations to 16 bytes
+
+### Other
+
+- restore the MSRV toolchain pin Dependabot bumped to 1.120
+- *(deps)* bump the actions group with 10 updates ([#77](https://github.com/KarpelesLab/purecrypto/pull/77))
+- *(quic)* binary-search the persistent-congestion progress check
+- *(cli)* describe -psk_file, -reset-key-file and the argv-secret warning
+- *(x509)* use slice::from_ref in the CSR strictness test
+- *(web)* npm audit fix for the demo-site lockfile
+- add JOSE, SCT-list and chain-verifier targets
+- match the unsafe-code and fuzzing claims to the code
+- enable Dependabot for GitHub Actions
+- *(fuzz)* pass the duration via env, run 300 s, persist the corpus
+- *(release)* build release binaries from the release tag, not master HEAD
+- *(rng)* say that a sandbox EPERM on getrandom(2) makes OsRng fail closed
+
 ## [0.9.9](https://github.com/KarpelesLab/purecrypto/compare/v0.9.8...v0.9.9) - 2026-10-03
 
 ### Fixed
