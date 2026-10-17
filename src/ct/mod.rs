@@ -67,6 +67,7 @@ pub use eq::ConstantTimeEq;
 pub use negate::ConditionallyNegatable;
 pub use ord::{ConstantTimeGreater, ConstantTimeLess};
 pub use select::ConditionallySelectable;
+pub(crate) use select::{assign_limbs, limb_mask, select_limbs_into};
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not};
 

@@ -153,9 +153,8 @@ fn sub_mod_limbs(a: &[u64], b: &[u64], m: &[u64]) -> Vec<u64> {
 /// `dst ← src` when `choice`, else unchanged (constant time).
 #[cfg(feature = "alloc")]
 fn cmov(dst: &mut [u64], src: &[u64], choice: Choice) {
-    for (d, s) in dst.iter_mut().zip(src) {
-        *d = u64::conditional_select(s, d, choice);
-    }
+    // One opaque mask per move, applied across the limbs.
+    crate::ct::assign_limbs(dst, src, choice);
 }
 
 /// `x ← (x >> 1) | (top << 63)` in place; `top` is 0 or 1.

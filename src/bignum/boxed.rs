@@ -8,7 +8,7 @@
 
 use super::mul::mac;
 use super::uint::{LIMB_BITS, Limb, adc, sbb};
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::ct::{Choice, ConstantTimeEq};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -44,9 +44,9 @@ pub(crate) fn sbb_limbs(a: &[Limb], b: &[Limb], borrow_in: Limb) -> (Vec<Limb>, 
 /// Selects `a` if `choice` is true, else `b`, limb-by-limb (constant time).
 /// Shared with [`super::boxed_montgomery`].
 pub(crate) fn select_limbs(a: &[Limb], b: &[Limb], choice: Choice) -> Vec<Limb> {
-    (0..a.len())
-        .map(|i| Limb::conditional_select(&a[i], &b[i], choice))
-        .collect()
+    let mut out = vec![0 as Limb; a.len()];
+    crate::ct::select_limbs_into(a, b, choice, &mut out);
+    out
 }
 
 /// Constant-time bitwise long division of `x` by `n` (`n.len()` limbs, top
@@ -91,9 +91,7 @@ fn long_divide(
                 bo = b;
             }
             let ge = Choice::from((carry | (bo ^ 1)) as u8);
-            for j in 0..m {
-                r[j] = Limb::conditional_select(&scratch[j], &r[j], ge);
-            }
+            crate::ct::assign_limbs(&mut r[..m], &scratch[..m], ge);
             on_bit(i, bit, ge);
         }
     }

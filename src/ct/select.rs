@@ -61,12 +61,48 @@ pub trait ConditionallySelectable: Copy {
     }
 }
 
+/// The all-ones (`choice` true) / all-zero `u64` mask behind a multi-limb
+/// select, passed through `black_box` so LLVM cannot see its 0 / −1 range
+/// and lower the masked arithmetic back into a branch on the secret.
+///
+/// One barrier per *selection*: the slice helpers below derive this once
+/// and apply it with plain `&` / `^` across every limb, where a per-limb
+/// [`u64::conditional_select`] would pay the barrier (a memory round-trip)
+/// on each limb — the difference between 2.2 and 1 µs on a 16-entry gather
+/// of 32-limb values.
+#[inline]
+pub(crate) fn limb_mask(choice: Choice) -> u64 {
+    core::hint::black_box((choice.unwrap_u8() as u64).wrapping_neg())
+}
+
+/// `out[i] ← a[i]` when `choice` is true, else `b[i]`, over the common
+/// length of the three slices, with one opaque mask for the whole select.
+#[inline]
+pub(crate) fn select_limbs_into(a: &[u64], b: &[u64], choice: Choice, out: &mut [u64]) {
+    let mask = limb_mask(choice);
+    for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
+        *o = y ^ (mask & (x ^ y));
+    }
+}
+
+/// `dst[i] ← src[i]` when `choice` is true, else unchanged, over the common
+/// length, with one opaque mask.
+#[inline]
+pub(crate) fn assign_limbs(dst: &mut [u64], src: &[u64], choice: Choice) {
+    let mask = limb_mask(choice);
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d ^= mask & (*d ^ s);
+    }
+}
+
 macro_rules! impl_cond_select_uint {
     ($($t:ty),+ $(,)?) => {$(
         impl ConditionallySelectable for $t {
             #[inline]
             fn conditional_select(a: &$t, b: &$t, choice: Choice) -> $t {
-                // `mask` is all-ones when choice is true, all-zeros otherwise.
+                // `mask` is all-ones when choice is true, all-zeros otherwise;
+                // one barrier per scalar select (see `limb_mask` for the
+                // slice forms, which share one mask across all limbs).
                 let mask = core::hint::black_box((choice.unwrap_u8() as $t).wrapping_neg());
                 // choice => b ^ (a ^ b) = a; !choice => b ^ 0 = b.
                 b ^ (mask & (a ^ b))
@@ -197,6 +233,28 @@ mod tests {
                 assert_eq!(u8::conditional_select_b_if_true(&a, &b, f()), a);
             }
         }
+    }
+
+    #[test]
+    fn slice_helpers() {
+        assert_eq!(limb_mask(t()), u64::MAX);
+        assert_eq!(limb_mask(f()), 0);
+        let a = [1u64, u64::MAX, 3, 0];
+        let b = [9u64, 8, u64::MAX, 0];
+        let mut out = [0u64; 4];
+        select_limbs_into(&a, &b, t(), &mut out);
+        assert_eq!(out, a);
+        select_limbs_into(&a, &b, f(), &mut out);
+        assert_eq!(out, b);
+        let mut d = a;
+        assign_limbs(&mut d, &b, f());
+        assert_eq!(d, a);
+        assign_limbs(&mut d, &b, t());
+        assert_eq!(d, b);
+        // Shorter slices select over the common prefix only.
+        let mut d = a;
+        assign_limbs(&mut d[..2], &b, t());
+        assert_eq!(d, [9, 8, 3, 0]);
     }
 
     #[test]

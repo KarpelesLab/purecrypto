@@ -396,10 +396,12 @@ impl<const LIMBS: usize> ConstantTimeLess for Uint<LIMBS> {}
 impl<const LIMBS: usize> ConditionallySelectable for Uint<LIMBS> {
     #[inline]
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        // One opaque mask for the whole value, not a barrier per limb.
+        let mask = crate::ct::limb_mask(choice);
         let mut limbs = [0; LIMBS];
         let mut i = 0;
         while i < LIMBS {
-            limbs[i] = Limb::conditional_select(&a.limbs[i], &b.limbs[i], choice);
+            limbs[i] = b.limbs[i] ^ (mask & (a.limbs[i] ^ b.limbs[i]));
             i += 1;
         }
         Uint { limbs }

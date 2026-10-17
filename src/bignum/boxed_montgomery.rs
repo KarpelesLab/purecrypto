@@ -7,7 +7,7 @@
 use super::boxed::{BoxedUint, adc_limbs, sbb_limbs, select_limbs};
 use super::montgomery::{inv_mod_2_64, mont_mul_kernel, mont_sqr_kernel};
 use super::uint::{Limb, adc, sbb};
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::ct::{Choice, ConstantTimeEq};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -45,10 +45,10 @@ fn add_mod_in_place(n: &[Limb], a: &mut [Limb], b: &[Limb], out: &mut [Limb]) {
         out[j] = d;
         bo = b;
     }
+    // Keep the difference when the add carried or the sum is >= n; else
+    // take the sum back. One opaque mask for the whole select.
     let subtract = Choice::from((c | (bo ^ 1)) as u8);
-    for j in 0..n.len() {
-        out[j] = Limb::conditional_select(&out[j], &a[j], subtract);
-    }
+    crate::ct::assign_limbs(&mut out[..n.len()], &a[..n.len()], !subtract);
 }
 
 /// `(a - b) mod n` for equal-length `a, b < n`.
@@ -196,9 +196,7 @@ impl BoxedMontModulus {
         }
         // Subtract when the shift overflowed or the shifted value is >= n.
         let ge = Choice::from((carry | (bo ^ 1)) as u8);
-        for j in 0..self.limbs {
-            x[j] = Limb::conditional_select(&tmp[j], &x[j], ge);
-        }
+        crate::ct::assign_limbs(&mut x[..self.limbs], &tmp[..self.limbs], ge);
     }
 
     /// The modulus width in limbs.
@@ -381,15 +379,27 @@ impl BoxedMontModulus {
     /// only, leaking nothing about `base` or the exponent's bits.
     pub fn pow_bits(&self, base: &BoxedUint, exp: &BoxedUint, bits: usize) -> BoxedUint {
         let l = self.limbs;
-        let base_m = self.to_mont_limbs(&base.limbs_resized(l));
+        // Flat 16-entry table, entry i at `table[i*l..(i+1)*l]`: base^i in
+        // Montgomery form (entry 0 is R mod n, the Montgomery 1).
+        let mut table = vec![0 as Limb; 16 * l];
+        let mut t = vec![0 as Limb; l];
         let mut one = vec![0 as Limb; l];
         one[0] = 1;
-        let r_mod_n = self.to_mont_limbs(&one); // R mod N (= 1 in Montgomery form)
-        let mut table: Vec<Vec<Limb>> = Vec::with_capacity(16);
-        table.push(r_mod_n);
-        table.push(base_m);
+        self.mont_mul_to(&one, &self.r2, &mut t, &mut table[..l]);
+        self.mont_mul_to(
+            &base.limbs_resized(l),
+            &self.r2,
+            &mut t,
+            &mut table[l..2 * l],
+        );
         for i in 2..16 {
-            table.push(self.mont_mul_limbs(&table[i - 1], &table[1]));
+            let (done, rest) = table.split_at_mut(i * l);
+            self.mont_mul_to(
+                &done[(i - 1) * l..],
+                &done[l..2 * l],
+                &mut t,
+                &mut rest[..l],
+            );
         }
         let exp = exp.as_limbs();
         let windows = bits.div_ceil(4).max(1);
@@ -397,9 +407,8 @@ impl BoxedMontModulus {
         // The limb index and shift are public loop quantities.
         let digit = |w: usize| (exp.get(w / 16).copied().unwrap_or(0) >> (4 * (w % 16))) & 0xf;
         let result = self.window_ladder(&table, windows, 4, |w| digit(w) as usize);
-        for entry in table.iter_mut() {
-            zeroize_limbs(entry);
-        }
+        zeroize_limbs(&mut table);
+        zeroize_limbs(&mut t);
         result
     }
 
@@ -423,21 +432,44 @@ impl BoxedMontModulus {
         bits: usize,
     ) -> BoxedUint {
         let l = self.limbs;
+        // Flat table, entry i + 4j = a^i · b^j (Montgomery form) at
+        // `table[(i + 4j)*l..]`.
+        let mut table = vec![0 as Limb; 16 * l];
+        let mut t = vec![0 as Limb; l];
         let mut one = vec![0 as Limb; l];
         one[0] = 1;
-        // table[i + 4j] = a^i · b^j (Montgomery form).
-        let mut table: Vec<Vec<Limb>> = vec![Vec::new(); 16];
-        table[0] = self.to_mont_limbs(&one);
-        table[1] = self.to_mont_limbs(&a.limbs_resized(l));
-        table[4] = self.to_mont_limbs(&b.limbs_resized(l));
-        table[8] = self.mont_mul_limbs(&table[4], &table[4]);
-        table[12] = self.mont_mul_limbs(&table[8], &table[4]);
+        self.mont_mul_to(&one, &self.r2, &mut t, &mut table[..l]);
+        self.mont_mul_to(&a.limbs_resized(l), &self.r2, &mut t, &mut table[l..2 * l]);
+        self.mont_mul_to(
+            &b.limbs_resized(l),
+            &self.r2,
+            &mut t,
+            &mut table[4 * l..5 * l],
+        );
+        // Entry 8 = b², entry 12 = b³.
+        for (dst, src) in [(8usize, 4usize), (12, 8)] {
+            let (done, rest) = table.split_at_mut(dst * l);
+            self.mont_mul_to(
+                &done[src * l..(src + 1) * l],
+                &done[4 * l..5 * l],
+                &mut t,
+                &mut rest[..l],
+            );
+        }
+        // Within each row j: entry 4j+i = entry 4j+i−1 · a.
         for j in 0..4 {
             for i in 1..4 {
                 if j == 0 && i == 1 {
                     continue;
                 }
-                table[4 * j + i] = self.mont_mul_limbs(&table[4 * j + i - 1], &table[1]);
+                let k = 4 * j + i;
+                let (done, rest) = table.split_at_mut(k * l);
+                self.mont_mul_to(
+                    &done[(k - 1) * l..],
+                    &done[l..2 * l],
+                    &mut t,
+                    &mut rest[..l],
+                );
             }
         }
         let (x, y) = (x.as_limbs(), y.as_limbs());
@@ -447,25 +479,25 @@ impl BoxedMontModulus {
         let result = self.window_ladder(&table, windows, 2, |w| {
             (two_bits(x, w) | (two_bits(y, w) << 2)) as usize
         });
-        for entry in table.iter_mut() {
-            zeroize_limbs(entry);
-        }
+        zeroize_limbs(&mut table);
+        zeroize_limbs(&mut t);
         result
     }
 
     /// The shared fixed-window ladder: `windows` windows of `width` bits,
     /// most significant first, where `digit(w)` is the (secret) table index
-    /// of window `w`. The accumulator starts at the top window's entry
-    /// (saving the squarings of 1); each later window squares `width` times
-    /// and multiplies by its entry. Entries are gathered by a full masked
-    /// scan of `table` — the index comparison goes through `ct_eq`
-    /// (branch-free by construction) rather than a `==` the compiler may
-    /// lower to a branch on the secret — and every multiply is
-    /// unconditional, so the operation sequence depends only on `windows`
-    /// and `width`.
+    /// of window `w`. `table` is flat, `limbs` limbs per entry. The
+    /// accumulator starts at the top window's entry (saving the squarings
+    /// of 1); each later window squares `width` times and multiplies by its
+    /// entry. Entries are gathered by a full masked scan of `table` — the
+    /// index comparison goes through `ct_eq` (branch-free by construction)
+    /// rather than a `==` the compiler may lower to a branch on the secret,
+    /// one opaque mask per entry OR-accumulated across its limbs — and
+    /// every multiply is unconditional, so the operation sequence depends
+    /// only on `windows` and `width`.
     fn window_ladder(
         &self,
-        table: &[Vec<Limb>],
+        table: &[Limb],
         windows: usize,
         width: usize,
         digit: impl Fn(usize) -> usize,
@@ -479,11 +511,11 @@ impl BoxedMontModulus {
         let mut nxt = vec![0 as Limb; l];
         let mut sel = vec![0 as Limb; l];
         let gather = |sel: &mut [Limb], idx: usize| {
-            sel.copy_from_slice(&table[0]);
-            for (j, entry) in table.iter().enumerate() {
-                let hit = j.ct_eq(&idx);
-                for (s, e) in sel.iter_mut().zip(entry.iter()) {
-                    *s = Limb::conditional_select(e, s, hit);
+            sel.fill(0);
+            for (j, entry) in table.chunks_exact(l).enumerate() {
+                let mask = crate::ct::limb_mask(j.ct_eq(&idx));
+                for (s, e) in sel.iter_mut().zip(entry) {
+                    *s |= e & mask;
                 }
             }
         };
