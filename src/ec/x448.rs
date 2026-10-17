@@ -1,7 +1,7 @@
 //! X448 Diffie-Hellman over Curve448 (RFC 7748).
 //!
-//! The field is GF(2⁴⁴⁸−2²²⁴−1); arithmetic reuses the constant-time
-//! [`MontModulus`] over seven 64-bit limbs. The
+//! The field is GF(2⁴⁴⁸−2²²⁴−1); arithmetic is the shared constant-time
+//! unsaturated 8×56-bit limb field of the crate-private `curve448::field`. The
 //! scalar multiplication is the Montgomery ladder with constant-time
 //! conditional swaps on the Montgomery curve `v² = u³ + A·u² + u` with
 //! `A = 156326`.
@@ -14,9 +14,8 @@
 //! performs the check and surfaces the all-zero output as an error; the raw
 //! [`x448`] primitive performs no such check.
 
-use crate::bignum::{MontModulus, Uint};
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
-use crate::ec::curve448::field::Field;
+use crate::ct::ConstantTimeEq;
+use crate::ec::curve448::field::{Fe, mask_from_bit};
 use crate::rng::RngCore;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -42,48 +41,9 @@ impl core::fmt::Display for X448Error {
 
 impl core::error::Error for X448Error {}
 
-/// `p = 2⁴⁴⁸ − 2²²⁴ − 1` (big-endian hex).
-const P448_HEX: &str = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffe\
-ffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-/// `(A − 2) / 4 = 39081` for Curve448 (`A = 156326`).
-const A24: u64 = 39081;
-
-type Fe = Uint<7>;
-
-const fn fe_from_hex(hex: &str) -> Fe {
-    super::uint_from_be_hex(hex)
-}
-
-/// The Curve448 field context, built at compile time.
-static FP: MontModulus<7> = MontModulus::new(fe_from_hex(P448_HEX));
-
-/// `A24 · x mod p` for a residue `x < p`, without a Montgomery multiply.
-///
-/// Multiplying by a small integer commutes with the Montgomery scaling
-/// (`A24 · xR = (A24·x)·R`), so a Montgomery-form input needs no `R`
-/// correction: a 7×1-limb product plus a fold of the 16-bit overflow `h`
-/// through `2⁴⁴⁸ ≡ 2²²⁴ + 1 (mod p)` replaces the full 7×7-limb
-/// `mont_mul`. A second fold absorbs the at most one-bit carry of the first
-/// (it cannot carry again: after an overflow the low 448 bits are below
-/// `2²⁴¹`), leaving a value `< 2⁴⁴⁸ < 2p` that one masked subtraction of `p`
-/// makes canonical. Straight-line and branch-free: constant time in `x`.
-#[inline]
-fn mul_a24(x: &Fe) -> Fe {
-    let l = x.as_limbs();
-    let mut r = [0u64; 7];
-    let mut carry = 0u64;
-    for (ri, &li) in r.iter_mut().zip(l.iter()) {
-        let t = (li as u128) * (A24 as u128) + carry as u128;
-        *ri = t as u64;
-        carry = (t >> 64) as u64;
-    }
-    let fold = |h: u64| Fe::from_limbs([h, 0, 0, h << 32, 0, 0, 0]);
-    let (r, c) = Fe::from_limbs(r).adc(&fold(carry), 0);
-    let (r, _) = r.adc(&fold(c), 0);
-    let (d, borrow) = r.sbb(FP.modulus(), 0);
-    // borrow = 1 iff r < p, in which case r is already canonical.
-    Fe::conditional_select(&r, &d, Choice::from(borrow as u8))
-}
+/// `(A − 2) / 4 = 39081` for Curve448 (`A = 156326`), applied with the
+/// field's small-constant multiply.
+const A24: u32 = 39081;
 
 /// Computes the raw X448 function: `scalar * point` on Curve448, returning the
 /// resulting u-coordinate (little-endian, 56 bytes).
@@ -93,84 +53,70 @@ fn mul_a24(x: &Fe) -> Fe {
 /// Callers exposed to network peer input should use
 /// [`X448PrivateKey::diffie_hellman`] (which returns `Result`) instead.
 pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
-    let fp = &FP;
-
     // Clamp the scalar (RFC 7748 §5): clear the bottom two bits and set the top
     // bit. Curve448's cofactor is 4, hence two low bits; 448 is a multiple of
     // 8, so there is no top-byte mask (unlike X25519's 255-bit field).
-    let mut k_bytes = *scalar;
-    k_bytes[0] &= 252;
-    k_bytes[55] |= 128;
-    let mut k = Fe::from_le_bytes(&k_bytes);
+    let mut k = *scalar;
+    k[0] &= 252;
+    k[55] |= 128;
 
-    // Decode the u-coordinate: reduce mod p (no top-bit mask — the full 56
-    // bytes are significant for the 448-bit field).
-    let u = Fe::from_le_bytes(point).reduce(fp.modulus());
-
-    let one = fp.to_mont(&Fe::ONE);
-    let x1 = fp.to_mont(&u);
-    let mut x2 = one;
+    // Decode the u-coordinate (no top-bit mask — the full 56 bytes are
+    // significant for the 448-bit field). A non-canonical `u ≥ p` is
+    // accepted as RFC 7748 §5 requires: the lazy field representation is
+    // closed over it and the output is canonicalized by `to_bytes`.
+    let x1 = Fe::from_bytes(point);
+    let mut x2 = Fe::ONE;
     let mut z2 = Fe::ZERO;
     let mut x3 = x1;
-    let mut z3 = one;
+    let mut z3 = Fe::ONE;
 
-    let mul = |a: &Fe, b: &Fe| fp.mont_mul(a, b);
-    let sq = |a: &Fe| fp.mont_sqr(a);
-    let add = |a: &Fe, b: &Fe| fp.add_mod(a, b);
-    let sub = |a: &Fe, b: &Fe| fp.sub_mod(a, b);
-
+    // The conditional swaps use one opaque all-ones/all-zeros mask per
+    // ladder step (`mask_from_bit`), applied across every limb of both
+    // coordinate pairs with plain xor/and — no per-limb barrier, no branch.
     let mut swap = 0u8;
-    let limbs = k.as_limbs();
     let mut t = 448;
     while t > 0 {
         t -= 1;
-        let kt = ((limbs[t / 64] >> (t % 64)) & 1) as u8;
+        let kt = (k[t / 8] >> (t % 8)) & 1;
         swap ^= kt;
-        let sw = Choice::from(swap);
-        Fe::conditional_swap(&mut x2, &mut x3, sw);
-        Fe::conditional_swap(&mut z2, &mut z3, sw);
+        let mask = mask_from_bit(swap as u64);
+        Fe::cswap(&mut x2, &mut x3, mask);
+        Fe::cswap(&mut z2, &mut z3, mask);
         swap = kt;
 
-        let a = add(&x2, &z2);
-        let aa = sq(&a);
-        let b = sub(&x2, &z2);
-        let bb = sq(&b);
-        let e = sub(&aa, &bb);
-        let c = add(&x3, &z3);
-        let d = sub(&x3, &z3);
-        let da = mul(&d, &a);
-        let cb = mul(&c, &b);
-        let t0 = add(&da, &cb);
-        x3 = sq(&t0);
-        let t1 = sub(&da, &cb);
-        let t1sq = sq(&t1);
-        z3 = mul(&x1, &t1sq);
-        x2 = mul(&aa, &bb);
-        let t2 = add(&aa, &mul_a24(&e));
-        z2 = mul(&e, &t2);
+        let a = x2.add(&z2);
+        let aa = a.sq();
+        let b = x2.sub(&z2);
+        let bb = b.sq();
+        let e = aa.sub(&bb);
+        let c = x3.add(&z3);
+        let d = x3.sub(&z3);
+        let da = d.mul(&a);
+        let cb = c.mul(&b);
+        x3 = da.add(&cb).sq();
+        z3 = x1.mul(&da.sub(&cb).sq());
+        x2 = aa.mul(&bb);
+        z2 = e.mul(&aa.add(&e.mul_small(A24)));
     }
-    let sw = Choice::from(swap);
-    Fe::conditional_swap(&mut x2, &mut x3, sw);
-    Fe::conditional_swap(&mut z2, &mut z3, sw);
+    let mask = mask_from_bit(swap as u64);
+    Fe::cswap(&mut x2, &mut x3, mask);
+    Fe::cswap(&mut z2, &mut z3, mask);
 
     // result = x2 / z2 (or 0 if z2 == 0). The inverse is Fermat's
-    // `z^{p-2} mod p` through the shared curve448 field's fixed addition
-    // chain (constant time, same modulus and so the same Montgomery domain as
-    // `FP`), NOT a variable-time extended-Euclidean inverse — z2 depends on
+    // `z^{p-2} mod p` through the field's fixed addition chain (constant
+    // time), NOT a variable-time extended-Euclidean inverse — z2 depends on
     // the secret scalar. Fermat naturally returns 0 when z2 == 0, so the
     // small-order case yields the all-zero output without a data-dependent
     // branch.
-    let mut z_inv = Field::new().inv(z2);
-    let res = fp.from_mont(&fp.mont_mul(&x2, &z_inv));
-    let mut out = [0u8; 56];
-    res.write_le_bytes(&mut out);
+    let mut z_inv = z2.invert();
+    let out = x2.mul(&z_inv).to_bytes();
 
-    // Wipe the clamped scalar (bytes and limbs) and the ladder state: the
-    // projective coordinates (x2, z2, x3, z3) and the inversion operands are
-    // a function of the secret scalar. `Zeroize` issues volatile stores, so
-    // LLVM cannot elide them as dead.
-    k_bytes.zeroize();
-    for v in [&mut k, &mut x2, &mut z2, &mut x3, &mut z3, &mut z_inv] {
+    // Wipe the clamped scalar and the ladder state: the projective
+    // coordinates (x2, z2, x3, z3) and the inversion operands are a function
+    // of the secret scalar. `Zeroize` issues volatile stores, so LLVM cannot
+    // elide them as dead.
+    k.zeroize();
+    for v in [&mut x2, &mut z2, &mut x3, &mut z3, &mut z_inv] {
         v.zeroize();
     }
     out
@@ -347,49 +293,6 @@ mod tests {
 
     fn hex56(s: &str) -> [u8; 56] {
         from_hex::<56>(s)
-    }
-
-    /// The small-constant multiply matches a Montgomery multiplication by
-    /// `A24·R` on edge residues (0, 1, p−1, p−A24, one that exercises the
-    /// second fold, 2²²⁴) and a splitmix sweep.
-    #[test]
-    fn mul_a24_matches_mont_mul() {
-        let p = *FP.modulus();
-        let a24 = FP.to_mont(&Fe::from_u64(A24));
-        let mut st = 0x448_a24_u64;
-        let mut next = || {
-            st = st.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = st;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        };
-        let mut cases = [Fe::ZERO; 70];
-        cases[1] = Fe::ONE;
-        cases[2] = p.wrapping_sub(&Fe::ONE);
-        cases[3] = p.wrapping_sub(&Fe::from_u64(39081));
-        // floor((39080·2⁴⁴⁸ − 1)/A24): the product's low 448 bits sit just
-        // under 2⁴⁴⁸, so the first fold carries and the second one runs.
-        cases[4] = Fe::from_limbs([
-            3221017414062945682,
-            12130736744053004696,
-            12272340674917436,
-            15076098506033189494,
-            2714075341568279260,
-            2371393828876353914,
-            18446272060606670176,
-        ]);
-        cases[5] = Fe::from_limbs([0, 0, 0, 1 << 32, 0, 0, 0]);
-        for c in cases[6..].iter_mut() {
-            let mut l = [0u64; 7];
-            for x in l.iter_mut() {
-                *x = next();
-            }
-            *c = Fe::from_limbs(l).reduce(&p);
-        }
-        for x in cases {
-            assert_eq!(mul_a24(&x), FP.mont_mul(&x, &a24), "x = {x:?}");
-        }
     }
 
     #[cfg(all(feature = "der", feature = "alloc"))]

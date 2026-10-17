@@ -2,11 +2,10 @@
 //! order-`L` scalar arithmetic.
 //!
 //! This `pub(crate)` backend is the single arithmetic core consumed by the
-//! higher-level [`crate::ec::ed448`] (RFC 8032 signing/verification) path. The
-//! [`crate::ec::x448`] X448 Diffie-Hellman primitive shares the same field
-//! prime but runs its own Montgomery ladder, so it consumes only the
-//! [`MontModulus`](crate::bignum::MontModulus) directly rather than this
-//! Edwards point backend.
+//! higher-level [`crate::ec::ed448`] (RFC 8032 signing/verification) path and
+//! by the [`crate::ec::x448`] X448 Diffie-Hellman primitive, which shares the
+//! [`field`] (an unsaturated 8×56-bit Solinas representation) but runs its
+//! own Montgomery ladder rather than this Edwards point backend.
 //!
 //! The edwards448 curve here is the *untwisted* Edwards curve `x² + y² =
 //! 1 + d·x²·y²` with `a = +1` and `d = −39081 mod p`, so its complete

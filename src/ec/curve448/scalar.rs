@@ -10,7 +10,7 @@
 use crate::bignum::Uint;
 use crate::ct::{Choice, ConditionallySelectable};
 
-use super::field::Fe;
+use super::field::ScalarInt;
 
 /// `L` as nine 64-bit limbs (little-endian), the Barrett working width.
 const L9: Uint<9> = Uint::from_limbs([
@@ -58,7 +58,7 @@ fn sub_l_if_ge(r: &Uint<9>) -> Uint<9> {
 ///
 /// Constant time: a fixed sequence of limb multiplies and adds, then exactly
 /// two masked conditional subtractions, with no data-dependent branch.
-fn reduce960(x: &Uint<15>) -> Fe {
+fn reduce960(x: &Uint<15>) -> ScalarInt {
     let x = x.as_limbs();
     // x₁ = x >> 384, nine limbs.
     let q1 = Uint::<9>::from_limbs([x[6], x[7], x[8], x[9], x[10], x[11], x[12], x[13], x[14]]);
@@ -75,7 +75,7 @@ fn reduce960(x: &Uint<15>) -> Fe {
 }
 
 /// Zero-extends a seven-limb integer to fifteen limbs.
-fn widen(a: &Fe) -> Uint<15> {
+fn widen(a: &ScalarInt) -> Uint<15> {
     let l = a.as_limbs();
     Uint::from_limbs([
         l[0], l[1], l[2], l[3], l[4], l[5], l[6], 0, 0, 0, 0, 0, 0, 0, 0,
@@ -83,14 +83,14 @@ fn widen(a: &Fe) -> Uint<15> {
 }
 
 /// Reduces a 114-byte little-endian integer modulo `L`.
-pub(crate) fn scalar_reduce_wide(bytes: &[u8; 114]) -> Fe {
+pub(crate) fn scalar_reduce_wide(bytes: &[u8; 114]) -> ScalarInt {
     // 114 bytes fit in fifteen 64-bit limbs (120 bytes); the top six bytes are
     // zero-padded by `from_le_bytes`.
     reduce960(&Uint::<15>::from_le_bytes(bytes))
 }
 
 /// Computes `(r + k·a) mod L` for `r, k, a < L`.
-pub(crate) fn scalar_muladd(r: &Fe, k: &Fe, a: &Fe) -> Fe {
+pub(crate) fn scalar_muladd(r: &ScalarInt, k: &ScalarInt, a: &ScalarInt) -> ScalarInt {
     // k·a is the full 14-limb product; widen both operands to 15 limbs so the
     // sum with r cannot carry out of the representation.
     let (lo, hi) = k.mul_wide(a); // each seven limbs
@@ -119,7 +119,7 @@ mod tests {
 
     /// The bit-serial constant-time long division the Barrett path replaced,
     /// kept as the oracle.
-    fn reduce960_ref(x: &Uint<15>) -> Fe {
+    fn reduce960_ref(x: &Uint<15>) -> ScalarInt {
         let l = L9.as_limbs();
         let l15 = Uint::<15>::from_limbs([
             l[0], l[1], l[2], l[3], l[4], l[5], l[6], 0, 0, 0, 0, 0, 0, 0, 0,
@@ -160,8 +160,8 @@ mod tests {
     #[test]
     fn reduce960_matches_long_division() {
         let l = L9.as_limbs();
-        let lm1 = Fe::from_limbs([l[0] - 1, l[1], l[2], l[3], l[4], l[5], l[6]]);
-        let wide = |a: &Fe, b: &Fe| {
+        let lm1 = ScalarInt::from_limbs([l[0] - 1, l[1], l[2], l[3], l[4], l[5], l[6]]);
+        let wide = |a: &ScalarInt, b: &ScalarInt| {
             let (lo, hi) = a.mul_wide(b);
             let (lo, hi) = (lo.as_limbs(), hi.as_limbs());
             Uint::<15>::from_limbs([
@@ -176,9 +176,11 @@ mod tests {
             Uint::ONE,
             Uint::from_limbs([u64::MAX; 15]),
             Uint::from_limbs(top912),
-            widen(&Fe::from_limbs([l[0], l[1], l[2], l[3], l[4], l[5], l[6]])),
+            widen(&ScalarInt::from_limbs([
+                l[0], l[1], l[2], l[3], l[4], l[5], l[6],
+            ])),
             widen(&lm1),
-            widen(&Fe::from_limbs([
+            widen(&ScalarInt::from_limbs([
                 l[0] + 1,
                 l[1],
                 l[2],
@@ -189,7 +191,7 @@ mod tests {
             ])),
             // (L−1)², the largest muladd product, and (2⁴⁴⁸−1)·(L−1).
             wide(&lm1, &lm1),
-            wide(&Fe::from_limbs([u64::MAX; 7]), &lm1),
+            wide(&ScalarInt::from_limbs([u64::MAX; 7]), &lm1),
         ];
         for x in &edges {
             assert_eq!(reduce960(x), reduce960_ref(x), "edge {x:?}");

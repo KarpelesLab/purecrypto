@@ -7,17 +7,24 @@
 //! the formulas are complete (no exceptional cases). Scalar multiplication is a
 //! constant-time double-and-add. This is the shared point backend behind Ed448.
 
-use super::field::{Fe, Field};
+use super::field::{Fe, Field, ScalarInt};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 
-/// A curve point in extended homogeneous coordinates `(X:Y:Z:T)`, all in
-/// Montgomery form, with `T = X·Y/Z`.
+/// A curve point in extended homogeneous coordinates `(X:Y:Z:T)` with
+/// `T = X·Y/Z`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Point {
     pub(crate) x: Fe,
     pub(crate) y: Fe,
     pub(crate) z: Fe,
     pub(crate) t: Fe,
+}
+
+impl ConditionallySelectable for Fe {
+    #[inline]
+    fn conditional_select(a: &Fe, b: &Fe, choice: Choice) -> Fe {
+        Fe(<[u64; 8]>::conditional_select(&a.0, &b.0, choice))
+    }
 }
 
 impl Field {
@@ -37,11 +44,11 @@ impl Field {
         }
         let mut yb = [0u8; 56];
         yb.copy_from_slice(&enc[..56]);
-        let yval = Fe::from_le_bytes(&yb);
+        let yval = ScalarInt::from_le_bytes(&yb);
         if !bool::from(yval.ct_lt(&self.p)) {
             return None;
         }
-        let y = self.to_mont(&yval);
+        let y = Fe::from_bytes(&yb);
 
         // x² = (1 − y²) / (1 − d·y²) = u / v.
         let yy = self.sq(y);
@@ -55,13 +62,12 @@ impl Field {
             return None;
         }
 
-        let xplain = self.from_mont(&x);
         // Reject the non-canonical (0, ±1) encoding with sign bit set: x = 0
         // has no negative representative, so demanding x odd is unsatisfiable.
-        if bool::from(xplain.ct_eq(&Fe::ZERO)) && sign == 1 {
+        if bool::from(x.is_zero()) && sign == 1 {
             return None;
         }
-        if xplain.is_odd().unwrap_u8() != sign {
+        if x.is_negative().unwrap_u8() != sign {
             x = self.neg(x);
         }
 
@@ -77,13 +83,11 @@ impl Field {
     /// Compresses a point to its 57-byte encoding (RFC 8032 §5.2.2).
     pub(crate) fn encode(&self, p: &Point) -> [u8; 57] {
         let zinv = self.inv(p.z);
-        let x = self.from_mont(&self.mul(p.x, zinv));
-        let y = self.from_mont(&self.mul(p.y, zinv));
+        let x = self.mul(p.x, zinv);
+        let y = self.mul(p.y, zinv);
         let mut out = [0u8; 57];
-        let mut yb = [0u8; 56];
-        y.write_le_bytes(&mut yb);
-        out[..56].copy_from_slice(&yb);
-        out[56] = x.is_odd().unwrap_u8() << 7;
+        out[..56].copy_from_slice(&y.to_bytes());
+        out[56] = x.is_negative().unwrap_u8() << 7;
         out
     }
 
@@ -102,17 +106,22 @@ impl Field {
     ///
     /// `A=X1·X2; B=Y1·Y2; C=d·T1·T2; D=Z1·Z2; E=(X1+Y1)·(X2+Y2)−A−B;
     ///  F=D−C; G=D+C; H=B−A; X3=E·F; Y3=G·H; T3=E·H; Z3=F·G`.
+    ///
+    /// `d = −39081`, so `C` is computed as the small-constant product
+    /// `c = 39081·T1·T2 = −C` (a [`Fe::mul_small`] instead of a full
+    /// multiply) with `F = D + c`, `G = D − c`: 9 multiplications, one
+    /// small-constant multiply.
     pub(crate) fn point_add(&self, p: &Point, q: &Point) -> Point {
         let a = self.mul(p.x, q.x);
         let b = self.mul(p.y, q.y);
-        let c = self.mul(self.mul(self.d, p.t), q.t);
+        let c = self.mul_small(self.mul(p.t, q.t), Fe::NEG_D_SMALL);
         let d = self.mul(p.z, q.z);
         let e = self.sub(
             self.sub(self.mul(self.add(p.x, p.y), self.add(q.x, q.y)), a),
             b,
         );
-        let ff = self.sub(d, c);
-        let g = self.add(d, c);
+        let ff = self.add(d, c);
+        let g = self.sub(d, c);
         let h = self.sub(b, a);
         Point {
             x: self.mul(e, ff),
@@ -153,7 +162,7 @@ impl Field {
     /// the (public) scalar width. The scalar bytes are treated as secret; the
     /// Ed448 secret scalar is pruned to fit, and `r < L < 2⁴⁴⁶`.
     ///
-    /// The table is 16 points (3.5 KB) of stack, the same shape as the
+    /// The table is 16 points (4 KB) of stack, the same shape as the
     /// edwards25519 window; a 3-bit window would halve it but cost ~38 more
     /// additions per multiplication.
     pub(crate) fn scalar_mult(&self, scalar: &[u8; 57], p: &Point) -> Point {
@@ -189,6 +198,12 @@ impl Field {
             acc = self.point_add(&acc, &sel);
         }
         acc
+    }
+
+    /// Constant-time fixed-base multiplication `[scalar]·B`: the generic
+    /// windowed ladder [`Self::scalar_mult`] over `B`.
+    pub(crate) fn mul_base(&self, scalar: &[u8; 57]) -> Point {
+        self.scalar_mult(scalar, &self.base())
     }
 
     /// The previous bit-at-a-time double-and-add-always ladder, kept as the
@@ -358,17 +373,23 @@ mod tests {
     use super::*;
 
     /// The compile-time base point is exactly the decompression of the
-    /// RFC 8032 encoding (same Montgomery-form limbs, `Z = 1`, `T = X·Y`).
+    /// RFC 8032 encoding (`Z = 1`, `T = X·Y`).
     #[test]
     fn const_base_matches_decoded_encoding() {
         let f = Field::new();
         let dec = f.decode(&BASE_ENC).expect("valid base point");
         let b = f.base();
-        assert_eq!(b.x, dec.x);
-        assert_eq!(b.y, dec.y);
-        assert_eq!(b.z, dec.z);
-        assert_eq!(b.t, dec.t);
+        assert!(bool::from(f.ct_eq(b.x, dec.x)));
+        assert!(bool::from(f.ct_eq(b.y, dec.y)));
+        assert!(bool::from(f.ct_eq(b.z, dec.z)));
+        assert!(bool::from(f.ct_eq(b.t, dec.t)));
+        assert!(bool::from(f.ct_eq(b.z, f.one)));
+        assert!(bool::from(f.ct_eq(f.mul(b.x, b.y), b.t)));
         assert_eq!(f.encode(&b), BASE_ENC);
+        let (x, y, t) = f.base_affine();
+        assert!(bool::from(f.ct_eq(x, b.x)));
+        assert!(bool::from(f.ct_eq(y, b.y)));
+        assert!(bool::from(f.ct_eq(t, b.t)));
     }
 
     fn splitmix(state: &mut u64) -> u64 {
@@ -410,6 +431,9 @@ mod tests {
                 let r = f.scalar_mult_bitwise(&k, pt);
                 assert!(bool::from(f.point_ct_eq(&w, &r)), "mismatch for {k:02x?}");
             }
+            let m = f.mul_base(&k);
+            let r = f.scalar_mult_bitwise(&k, &b);
+            assert!(bool::from(f.point_ct_eq(&m, &r)), "mul_base mismatch");
         }
     }
 

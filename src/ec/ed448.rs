@@ -1,14 +1,15 @@
 //! Ed448 signatures (EdDSA over edwards448, RFC 8032).
 //!
-//! The field is GF(2⁴⁴⁸−2²²⁴−1); the arithmetic reuses the constant-time
-//! [`MontModulus`](crate::bignum::MontModulus) over seven 64-bit limbs. Curve
+//! The field is GF(2⁴⁴⁸−2²²⁴−1); the arithmetic is the constant-time
+//! unsaturated 8×56-bit limb field of the crate-private `curve448::field`. Curve
 //! points use the untwisted Edwards curve `x² + y² = 1 + d·x²·y²` (`a = +1`,
 //! `d = −39081`) in extended homogeneous coordinates `(X:Y:Z:T)`, with complete
 //! addition formulas (Hisil–Wong–Carter–Dawson 2008 for `a = +1`), so there are
 //! no exceptional cases. Secret scalar multiplications are a constant-time
 //! fixed-window ladder; signature *verification* — whose inputs are all
-//! public — uses a clearly-marked variable-time double-base multiplication. Reduction of scalars modulo the group order `L` rides on the
-//! constant-time [`Uint`](crate::bignum::Uint) long division.
+//! public — uses a clearly-marked variable-time double-base multiplication.
+//! Reduction of scalars modulo the group order `L` is a constant-time Barrett
+//! reduction over the saturated [`Uint`](crate::bignum::Uint) integers.
 //!
 //! Hashing is SHAKE256 (FIPS 202): the seed expansion, the nonce `r`, and the
 //! challenge `k` are all 114-byte SHAKE256 outputs, prefixed by the `dom4`
@@ -27,7 +28,7 @@
 
 use crate::ct::ConstantTimeLess;
 use crate::ec::Error;
-use crate::ec::curve448::field::{Fe, Field};
+use crate::ec::curve448::field::{Field, ScalarInt};
 use crate::ec::curve448::scalar::{prune, scalar_muladd, scalar_reduce_wide};
 use crate::hash::{ExtendableOutput, Shake256, XofReader};
 use crate::rng::{CryptoRng, RngCore};
@@ -137,7 +138,7 @@ impl Ed448PrivateKey {
         };
         let f = Field::new();
         let (mut s, mut prefix) = key.expand();
-        key.public = f.encode(&f.scalar_mult(&s, &f.base()));
+        key.public = f.encode(&f.mul_base(&s));
         wipe(&mut s);
         wipe(&mut prefix);
         key
@@ -182,12 +183,12 @@ impl Ed448PrivateKey {
         let mut r_hash = shake_dom4(context, &[&prefix, message]);
         let mut r = scalar_reduce_wide(&r_hash);
         let mut r_scalar = fe_to_scalar_bytes(&r);
-        let r_enc = f.encode(&f.scalar_mult(&r_scalar, &f.base()));
+        let r_enc = f.encode(&f.mul_base(&r_scalar));
 
         // k = SHAKE256(dom4(0,ctx) ‖ R ‖ A ‖ M, 114) mod L; S = (r + k·s) mod L.
         let k_hash = shake_dom4(context, &[&r_enc, &a_enc, message]);
         let k = scalar_reduce_wide(&k_hash);
-        let mut s_scalar = Fe::from_le_bytes(&s[..56]); // s[56] == 0 after pruning
+        let mut s_scalar = ScalarInt::from_le_bytes(&s[..56]); // s[56] == 0 after pruning
         let sig_s = scalar_muladd(&r, &k, &s_scalar);
 
         let mut sig = [0u8; 114];
@@ -221,7 +222,7 @@ fn wipe(buf: &mut [u8]) {
 
 /// Renders a scalar `< L` as the 57-byte little-endian buffer the point
 /// `scalar_mult` consumes (the top byte is always 0 since `L < 2⁴⁴⁶`).
-fn fe_to_scalar_bytes(x: &Fe) -> [u8; 57] {
+fn fe_to_scalar_bytes(x: &ScalarInt) -> [u8; 57] {
     let mut out = [0u8; 57];
     let mut b = [0u8; 56];
     x.write_le_bytes(&mut b);
@@ -388,7 +389,7 @@ impl Ed448PublicKey {
         }
         let mut s_bytes = [0u8; 56];
         s_bytes.copy_from_slice(&signature.0[57..113]);
-        let s = Fe::from_le_bytes(&s_bytes);
+        let s = ScalarInt::from_le_bytes(&s_bytes);
         if !bool::from(s.ct_lt(&f.l)) {
             return Err(Error::Verification);
         }
@@ -542,10 +543,10 @@ mod tests {
 
     #[test]
     fn field_invariants() {
-        use crate::ec::curve448::field::BASE_ENC;
+        use crate::ec::curve448::field::{BASE_ENC, Fe};
         let f = Field::new();
         // inversion: a * a^(p-2) == 1
-        let three = f.to_mont(&Fe::from_u64(3));
+        let three = Fe::from_u64(3);
         let inv3 = f.inv(three);
         assert!(bool::from(f.mul(three, inv3).ct_eq(&f.one)), "inv broken");
         // base point decodes
