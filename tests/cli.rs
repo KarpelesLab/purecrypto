@@ -7809,7 +7809,8 @@ fn s_client_s_server_compress_both_certificates() {
     let (client_cert, client_key) = write_dtls_identity(&dir.join("client"));
     // (server flags, client flags, server's own, client's own)
     let cases: [(&[&str], &[&str], &str, &str); 5] = [
-        (&[], &[], "zlib", "zlib"),
+        // Both sides advertise the default list, zstd first.
+        (&[], &[], "zstd", "zstd"),
         (
             &["-cert_comp", "zstd"],
             &["-cert_comp", "zstd"],
