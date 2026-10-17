@@ -1854,7 +1854,8 @@ mod dtls13 {
     }
 
     /// ACK-driven retransmit: drop the server's final encrypted record
-    /// (Finished), drive the client through the remaining records, then
+    /// (Finished), drive the client through the remaining records, let the
+    /// client's ACK timer acknowledge what it has (RFC 9147 §7.1), then
     /// fire a timer on the server — it should retransmit only the missing
     /// records (everything still in its in-flight set).
     #[test]
@@ -1872,8 +1873,13 @@ mod dtls13 {
             server.feed_datagram(dg).unwrap();
         }
         // Server emits its full encrypted flight (SH plaintext + EE/Cert/
-        // CV/Fin protected).
-        let s1 = server.pop_outbound_datagrams();
+        // CV/Fin protected), coalesced into as few datagrams as fit: taken
+        // apart here, since the loss below is of one record.
+        let s1: Vec<Vec<u8>> = server
+            .pop_outbound_datagrams()
+            .iter()
+            .flat_map(|dg| crate::dtls::record13::split_records(dg, 0))
+            .collect();
         assert!(
             s1.len() >= 4,
             "server should have emitted multi-record flight"
@@ -1885,8 +1891,14 @@ mod dtls13 {
         }
         // Client should NOT yet be complete (didn't see Finished).
         assert!(!client.is_handshake_complete());
-        // The client will have queued ACKs for the records it did receive.
+        // A flight that is still arriving is not acknowledged at once: the
+        // rest never comes, so the ACK timer fires and the client ACKs the
+        // records it did receive (RFC 9147 §7.1).
+        assert!(client.pop_outbound_datagrams().is_empty());
+        let ack_timer = client.next_timeout().expect("ACK timer armed");
+        client.on_timeout(ack_timer);
         let c_ack = client.pop_outbound_datagrams();
+        assert_eq!(c_ack.len(), 1, "one ACK record");
         // Feed those ACKs to the server.
         for dg in &c_ack {
             server.feed_datagram(dg).unwrap();

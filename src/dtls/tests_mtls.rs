@@ -214,8 +214,11 @@ fn pump12(client: &mut DtlsClientConnection12, server: &mut Server12) -> Result<
 
 /// Runs the DTLS 1.3 handshake until the client has processed the server's
 /// flight and queued its final flight, which is returned without being
-/// delivered: `[Certificate fragments…, CertificateVerify, Finished, ACK]`
-/// for a client with an identity.
+/// delivered: `[Certificate fragments…, CertificateVerify, Finished]` for
+/// a client with an identity (the flight answers the server's, so it
+/// carries no ACK — RFC 9147 §7.1). The engine coalesces the flight into
+/// as few datagrams as fit (§4.3); the tests here lose and deliver single
+/// records, so each is returned in a datagram of its own.
 fn client_final_flight_13(
     client: &mut DtlsClientConnection13,
     server: &mut Server13,
@@ -231,7 +234,11 @@ fn client_final_flight_13(
     }
     assert!(client.is_handshake_complete());
     assert!(!server.is_handshake_complete());
-    client.pop_outbound_datagrams()
+    client
+        .pop_outbound_datagrams()
+        .iter()
+        .flat_map(|dg| crate::dtls::record13::split_records(dg, 0))
+        .collect()
 }
 
 /// Runs the DTLS 1.2 handshake until the client has queued its final
@@ -398,18 +405,18 @@ fn untrusted_or_expired_client_chain_is_refused_13() {
 
 /// At a small MTU the client's Certificate spans several records, so its
 /// final flight is many records long. With one fragment lost, the server
-/// acknowledges what it received (RFC 9147 §7), the client retransmits
-/// only the missing record (§7.2) and the handshake completes with the
-/// chain verified.
+/// acknowledges what it received once its ACK timer fires (RFC 9147
+/// §7.1), the client retransmits only the missing record (§7.2) and the
+/// handshake completes with the chain verified.
 #[test]
 fn lost_certificate_fragment_is_the_only_retransmission_13() {
     let mut setup = Setup::mutual(true);
     setup.client_mtu = 256;
     let (mut client, mut server) = setup.pair13();
     let flight = client_final_flight_13(&mut client, &mut server);
-    // Certificate fragments, CertificateVerify, Finished and the ACK of the
-    // server flight: the certificate alone is several records.
-    assert!(flight.len() >= 5, "{} datagrams", flight.len());
+    // Certificate fragments, CertificateVerify and Finished: the
+    // certificate alone is several records.
+    assert!(flight.len() >= 4, "{} records", flight.len());
     for (i, dg) in flight.iter().enumerate() {
         if i == 1 {
             continue; // the second Certificate fragment is lost
@@ -417,9 +424,14 @@ fn lost_certificate_fragment_is_the_only_retransmission_13() {
         server.feed_datagram(dg).unwrap();
     }
     assert!(!server.is_handshake_complete());
-    // The server ACKs every record it got; the client is left with the
-    // one it lost.
-    for dg in &server.pop_outbound_datagrams() {
+    // The flight stops arriving: the server's ACK timer fires and it ACKs
+    // every record it got; the client is left with the one it lost.
+    assert!(server.pop_outbound_datagrams().is_empty());
+    let ack_timer = server.next_timeout().expect("ACK timer armed");
+    server.on_timeout(ack_timer);
+    let acks = server.pop_outbound_datagrams();
+    assert_eq!(acks.len(), 1, "one ACK record");
+    for dg in &acks {
         client.feed_datagram(dg).unwrap();
     }
     assert!(client.handshake_flight_pending());
@@ -450,7 +462,7 @@ fn close_behind_the_unacknowledged_final_flight_13() {
     setup.client_mtu = 256;
     let (mut client, mut server) = setup.pair13();
     let lost = client_final_flight_13(&mut client, &mut server);
-    assert!(lost.len() >= 5);
+    assert!(lost.len() >= 4);
     client.send(b"bye").unwrap();
     client.send_close_notify().unwrap();
     // Application data goes out, the alert does not.
@@ -464,12 +476,12 @@ fn close_behind_the_unacknowledged_final_flight_13() {
     // The retransmitted flight (every record) arrives.
     let t = client.next_timeout().unwrap();
     client.on_timeout(t);
-    let resent = client.pop_outbound_datagrams();
-    assert_eq!(
-        resent.len(),
-        lost.len() - 1,
-        "the flight minus its ACK record"
-    );
+    let resent: Vec<Vec<u8>> = client
+        .pop_outbound_datagrams()
+        .iter()
+        .flat_map(|dg| crate::dtls::record13::split_records(dg, 0))
+        .collect();
+    assert_eq!(resent.len(), lost.len(), "every record of the flight");
     for dg in &resent {
         server.feed_datagram(dg).unwrap();
     }

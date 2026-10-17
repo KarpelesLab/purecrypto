@@ -96,6 +96,30 @@ pub(crate) fn header_cid<'a>(buf: &'a [u8], hdr: &UnifiedHeader) -> &'a [u8] {
     &buf[1..1 + hdr.cid_len]
 }
 
+/// Test-only: the records of a datagram, each in a datagram of its own —
+/// the engines coalesce a flight into as few datagrams as fit (RFC 9147
+/// §4.3), while a test that loses or delivers single records wants them
+/// apart. Every record the engines write carries its length: a plaintext
+/// record in its RFC 6347 header, a protected one in its unified header
+/// (parsed with the receiver's `cid_len`).
+#[cfg(test)]
+pub(crate) fn split_records(datagram: &[u8], cid_len: usize) -> Vec<Vec<u8>> {
+    let mut records = Vec::new();
+    let mut off = 0;
+    while off < datagram.len() {
+        let rest = &datagram[off..];
+        let len = if rest[0] < 32 {
+            super::record::HEADER_LEN + u16::from_be_bytes([rest[11], rest[12]]) as usize
+        } else {
+            let (hdr_len, body_len) = peek_header_layout(rest, cid_len).expect("a record");
+            hdr_len + body_len
+        };
+        records.push(rest[..len].to_vec());
+        off += len;
+    }
+    records
+}
+
 /// The longest unified header: first byte, a 255-byte CID, a 16-bit
 /// sequence number and the length (RFC 9147 §4).
 pub(crate) const MAX_HEADER_LEN: usize = 1 + 255 + 2 + 2;

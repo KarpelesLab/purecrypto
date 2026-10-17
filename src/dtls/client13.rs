@@ -98,7 +98,7 @@ use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
 use super::record13::{
     self, SnKey, header_aad_into, header_cid, peek_header_layout, reconstruct_seq,
 };
-use super::reliability13::{InFlightRecord, Retransmit13};
+use super::reliability13::{ACK_DELAY, InFlightRecord, Retransmit13};
 use super::system_now;
 use super::ticket::{
     MAX_DTLS_SESSION_TICKET_LEN, obfuscated_age, patch_binder13, ticket_now, usable_session13,
@@ -514,6 +514,13 @@ pub struct DtlsClientConnection13 {
     /// Pending ACKs to emit: (epoch, seq) of records we received that need
     /// acknowledgement.
     pending_acks: Vec<RecordNumber>,
+    /// When the ACK timer fires (RFC 9147 §7.1): armed by the first record
+    /// of a flight that is still arriving, cleared by `flush_pending_acks`.
+    ack_deadline: Option<Duration>,
+    /// The epoch of the datagram at the end of `out_dgrams` while further
+    /// records of the same flight may still be coalesced into it; `None`
+    /// once a datagram of another kind follows or the queue is drained.
+    open_dgram: Option<u16>,
     /// ACK-driven retransmit state machine.
     retransmit: Retransmit13,
     /// Current logical time.
@@ -695,6 +702,8 @@ impl DtlsClientConnection13 {
             cr_signature_algorithms: Vec::new(),
             pending_flight: None,
             pending_acks: Vec::new(),
+            ack_deadline: None,
+            open_dgram: None,
             retransmit: Retransmit13::new(),
             last_now: Duration::from_secs(0),
             cid: None,
@@ -801,14 +810,14 @@ impl DtlsClientConnection13 {
     /// Drains pending UDP datagrams to send. Also drains any pending ACKs
     /// into a final ACK record.
     pub fn pop_outbound_datagrams(&mut self) -> Vec<Vec<u8>> {
-        self.flush_pending_acks();
+        self.open_dgram = None;
         core::mem::take(&mut self.out_dgrams)
     }
 
     /// [`Self::pop_outbound_datagrams`] moving the datagrams into `out`
     /// instead: the engine's queue keeps its capacity across drains.
     pub fn pop_outbound_into(&mut self, out: &mut impl Extend<Vec<u8>>) {
-        self.flush_pending_acks();
+        self.open_dgram = None;
         out.extend(self.out_dgrams.drain(..));
     }
 
@@ -910,7 +919,7 @@ impl DtlsClientConnection13 {
         )?;
         ctx.seq += 1;
         ctx.remaining -= len;
-        self.out_dgrams.push(wire);
+        self.push_datagram(wire);
         Ok(())
     }
 
@@ -1087,7 +1096,7 @@ impl DtlsClientConnection13 {
             // RFC 8446 §6: `close_notify` is a warning-level (1) alert.
             &[1, AlertDescription::CloseNotify.as_u8()],
         )?;
-        self.out_dgrams.push(dg);
+        self.push_datagram(dg);
         Ok(())
     }
 
@@ -1121,7 +1130,7 @@ impl DtlsClientConnection13 {
             return Err(Error::RecordOverflow);
         }
         let dg = self.encrypt_protected_record(ContentType::ApplicationData, plaintext)?;
-        self.out_dgrams.push(dg);
+        self.push_datagram(dg);
         Ok(())
     }
 
@@ -1142,7 +1151,10 @@ impl DtlsClientConnection13 {
     /// Returns the next absolute monotonic time at which the caller should
     /// invoke `on_timeout`. None when no retransmit is armed.
     pub fn next_timeout(&self) -> Option<Duration> {
-        self.retransmit.next_timeout()
+        match (self.retransmit.next_timeout(), self.ack_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Drives the retransmit machine. Any retransmitted datagrams land in
@@ -1151,6 +1163,12 @@ impl DtlsClientConnection13 {
         self.last_now = now;
         self.clock_driven = true;
         self.expire_prev_read();
+        // The ACK timer (RFC 9147 §7.1): a flight that stopped arriving is
+        // acknowledged as far as it got, so the peer retransmits the rest
+        // only.
+        if self.ack_deadline.is_some_and(|deadline| now >= deadline) {
+            self.flush_pending_acks();
+        }
         match self.retransmit.on_timeout(now) {
             super::reliability::Action::Retransmit => {
                 self.retransmit_in_flight();
@@ -1192,6 +1210,64 @@ impl DtlsClientConnection13 {
 
     /// Feeds an incoming UDP datagram.
     pub fn feed_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
+        let was_connected = self.state == State::Connected;
+        let result = self.feed_datagram_records(datagram);
+        if result.is_ok() {
+            self.schedule_acks(was_connected);
+        }
+        result
+    }
+
+    /// Decides, once a datagram is processed, when the records it queued
+    /// for acknowledgement are ACKed (RFC 9147 §7.1). A complete flight is
+    /// acknowledged implicitly by the flight that answers it: reaching
+    /// `Connected` means our final flight answers the server's, so those
+    /// ACKs are dropped. A post-handshake message, or a retransmitted
+    /// server flight after the handshake, is answered by nothing and is
+    /// ACKed at once. A flight still arriving is ACKed when the ACK timer
+    /// fires (`on_timeout`), so that only what is missing is retransmitted.
+    fn schedule_acks(&mut self, was_connected: bool) {
+        if self.pending_acks.is_empty() {
+            return;
+        }
+        if self.state == State::Connected {
+            if was_connected {
+                self.flush_pending_acks();
+            } else {
+                self.pending_acks.clear();
+                self.ack_deadline = None;
+            }
+        } else if self.ack_deadline.is_none() {
+            self.ack_deadline = Some(self.last_now + ACK_DELAY);
+        }
+    }
+
+    /// Queues a handshake record for the wire, coalescing it into the
+    /// datagram being built when both are of the same epoch and the result
+    /// stays within `max_record_size` (RFC 9147 §4.3: a datagram may carry
+    /// several records, each of ours carrying its length). Everything else
+    /// goes through `push_datagram`, which ends the datagram being built;
+    /// so does draining the queue, so a flight never spans two drains.
+    fn push_handshake_record(&mut self, epoch: u16, record: Vec<u8>) {
+        if self.open_dgram == Some(epoch)
+            && let Some(last) = self.out_dgrams.last_mut()
+            && last.len() + record.len() <= self.config.max_record_size
+        {
+            last.extend_from_slice(&record);
+            return;
+        }
+        self.out_dgrams.push(record);
+        self.open_dgram = Some(epoch);
+    }
+
+    /// Queues a datagram of its own (application data, ACKs, alerts).
+    fn push_datagram(&mut self, datagram: Vec<u8>) {
+        self.out_dgrams.push(datagram);
+        self.open_dgram = None;
+    }
+
+    /// The records of one datagram, in order.
+    fn feed_datagram_records(&mut self, datagram: &[u8]) -> Result<(), Error> {
         if let Some(cid) = self.cid.as_mut() {
             cid.start_datagram();
         }
@@ -2914,7 +2990,7 @@ impl DtlsClientConnection13 {
             epoch: self.plain_write_epoch as u64,
             seq: self.plain_write_seq.saturating_sub(1),
         };
-        self.out_dgrams.push(datagram);
+        self.push_handshake_record(self.plain_write_epoch, datagram);
         self.retransmit.on_record_sent(
             InFlightRecord::new(record_number, self.plain_write_epoch, fragment),
             self.last_now,
@@ -2931,7 +3007,7 @@ impl DtlsClientConnection13 {
             epoch: self.enc_write_epoch as u64,
             seq: self.enc_write_seq.saturating_sub(1),
         };
-        self.out_dgrams.push(datagram);
+        self.push_handshake_record(self.enc_write_epoch, datagram);
         self.retransmit.on_record_sent(
             InFlightRecord::new(record_number, self.enc_write_epoch, fragment),
             self.last_now,
@@ -2995,7 +3071,7 @@ impl DtlsClientConnection13 {
                 Err(Error::InappropriateState)
             };
             if let Ok((dg, rn)) = framed {
-                self.out_dgrams.push(dg);
+                self.push_handshake_record(epoch, dg);
                 self.retransmit.note_resent(i, rn);
             }
         }
@@ -3005,6 +3081,7 @@ impl DtlsClientConnection13 {
     /// protected write key. No-op if there are no pending ACKs or we
     /// haven't yet installed the protected write key.
     fn flush_pending_acks(&mut self) {
+        self.ack_deadline = None;
         if self.pending_acks.is_empty() {
             return;
         }
@@ -3024,7 +3101,7 @@ impl DtlsClientConnection13 {
             {
                 // ACK records are NOT retransmitted (RFC 9147 §7: only
                 // handshake and application records get tracked).
-                self.out_dgrams.push(dg);
+                self.push_datagram(dg);
             }
         }
     }
@@ -3050,7 +3127,7 @@ impl DtlsClientConnection13 {
         let dg = self
             .encrypt_protected_record(ContentType::Alert, &[level, description])
             .expect("protected write keys installed");
-        self.out_dgrams.push(dg);
+        self.push_datagram(dg);
     }
 
     /// Test-only: sends an arbitrary handshake message (`msg_type` + body)
@@ -3093,7 +3170,7 @@ impl DtlsClientConnection13 {
             payload,
         )
         .expect("retired write keys usable");
-        self.out_dgrams.push(dg);
+        self.push_datagram(dg);
     }
 
     /// Test-only: `send_under_retired_keys_for_test` for one unfragmented

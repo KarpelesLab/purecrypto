@@ -68,6 +68,12 @@ use core::time::Duration;
 /// Initial retransmit timeout. RFC 9147 §5.8.1: "as in DTLS 1.2, the
 /// recommended initial timer value is 1 second".
 const INITIAL_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// How long a receiver waits for the rest of a flight before acknowledging
+/// the part it has (RFC 9147 §7.1 suggests a quarter of the retransmission
+/// timer): the sender then retransmits only what is missing, instead of
+/// the whole flight when its own timer fires.
+pub(crate) const ACK_DELAY: Duration = Duration::from_millis(250);
 /// Cap on per-attempt timeout. RFC 9147 §5.8.1 inherits the DTLS 1.2
 /// recommendation of "at most 60 seconds".
 const MAX_TIMEOUT: Duration = Duration::from_secs(60);

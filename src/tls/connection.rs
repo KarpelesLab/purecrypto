@@ -2012,6 +2012,10 @@ impl Connection {
             Engine::ServerDtls13(c) => c.on_timeout(now),
             _ => {}
         }
+        // A retransmission or an ACK the timer produced is wanted-write
+        // right away.
+        #[cfg(feature = "dtls")]
+        self.refill_dtls_pending();
     }
 
     fn wants_write(&self) -> bool {
