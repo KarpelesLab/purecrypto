@@ -2546,19 +2546,36 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let (Some(key), Some(creation_time)) = (self.ticket_seal_key(), self.ticket_now()) else {
             return;
         };
-        let plain = Ticket12Plaintext {
-            cipher_suite: suite.suite.0,
-            master_secret: *master,
-            creation_time,
-            ems_used: self.ems_negotiated,
-            alpn: self.alpn_negotiated.clone(),
-            // The chain this handshake verified (RFC 5246 §7.4.6), for a
-            // resumption to stand in for; none for an anonymous client.
-            client_leaf: self.client_cert_chain.first().cloned(),
+        // The chain this handshake verified (RFC 5246 §7.4.6), for a
+        // resumption to stand in for; none for an anonymous client. A leaf
+        // too long for the sealed ticket to fit `NewSessionTicket.ticket`
+        // (`<0..2^16-1>`) must not be minted at all: `encode` could not
+        // record it (resuming an authenticated session as an anonymous one),
+        // and a sealed ticket past the u16 would trip the encoder's length
+        // assertion — a peer-triggerable abort. Having promised a ticket in
+        // the ServerHello, send a zero-length one instead (RFC 5077 §3.3),
+        // which the client discards.
+        let client_leaf = self.client_cert_chain.first().cloned();
+        let alpn_len = self.alpn_negotiated.as_ref().map_or(0, Vec::len);
+        let ticket = if client_leaf
+            .as_ref()
+            .is_some_and(|l| l.len() > Ticket12Plaintext::max_client_leaf_len(alpn_len))
+        {
+            Vec::new()
+        } else {
+            let plain = Ticket12Plaintext {
+                cipher_suite: suite.suite.0,
+                master_secret: *master,
+                creation_time,
+                ems_used: self.ems_negotiated,
+                alpn: self.alpn_negotiated.clone(),
+                client_leaf,
+            };
+            let mut plain_bytes = plain.encode();
+            let ticket = seal_ticket_with_aad(&mut self.rng, &key, TICKET_DTLS12_AAD, &plain_bytes);
+            crate::tls::conn::wipe(&mut plain_bytes);
+            ticket
         };
-        let mut plain_bytes = plain.encode();
-        let ticket = seal_ticket_with_aad(&mut self.rng, &key, TICKET_DTLS12_AAD, &plain_bytes);
-        crate::tls::conn::wipe(&mut plain_bytes);
         let nst = NewSessionTicket12 {
             lifetime: self.config.ticket_lifetime,
             ticket,
@@ -2945,5 +2962,50 @@ mod f3_msg_seq_tests {
         }
         assert!(server.is_handshake_complete());
         assert!(client.is_handshake_complete());
+    }
+
+    /// An authenticated client leaf too long for the sealed ticket to fit
+    /// `NewSessionTicket.ticket<0..2^16-1>` yields a zero-length ticket
+    /// (RFC 5077 §3.3) rather than a `with_len_u16` panic in the encoder
+    /// (a peer-triggerable abort) or a ticket that would resume the
+    /// session anonymously. Mirrors the TLS 1.2 server's guard.
+    #[test]
+    fn oversized_client_leaf_yields_an_empty_ticket() {
+        use crate::tls::conn::SUITES_12;
+
+        fn ticket_len(server: &mut DtlsServerConnection12<HmacDrbg<Sha256>>) -> usize {
+            let mut flight = Flight::new();
+            let master = [0x5au8; 48];
+            server.push_session_ticket(&mut flight, SUITES_12[0], &master);
+            // A long ticket is fragmented; the first fragment carries the
+            // 12-byte DTLS handshake header (type, u24 length, message_seq,
+            // u24 fragment_offset, u24 fragment_length) and the body start:
+            // lifetime(4) ‖ ticket<u16>.
+            let rec = flight.records.first().expect("NewSessionTicket queued");
+            let hdr = &rec.plaintext[..12];
+            assert_eq!(hdr[0], hs_type::NEW_SESSION_TICKET);
+            let msg_len = u32::from_be_bytes([0, hdr[1], hdr[2], hdr[3]]) as usize;
+            let body = &rec.plaintext[12..];
+            let len = u16::from_be_bytes([body[4], body[5]]) as usize;
+            assert_eq!(msg_len, 6 + len);
+            len
+        }
+
+        let (cfg, _) = make_server_cfg();
+        let cfg = cfg
+            .with_ticket_key([0x44u8; 32])
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        let srng = HmacDrbg::<Sha256>::new(b"f3-dtls12-ticket", b"nonce", &[]);
+        let mut server = DtlsServerConnection12::new(Arc::new(cfg), b"client-addr".to_vec(), srng);
+
+        let max_leaf = Ticket12Plaintext::max_client_leaf_len(0);
+        server.client_cert_chain = alloc::vec![alloc::vec![0x30u8; max_leaf + 1]];
+        assert_eq!(ticket_len(&mut server), 0, "oversized leaf: empty ticket");
+
+        server.client_cert_chain = alloc::vec![alloc::vec![0x30u8; max_leaf]];
+        assert!(
+            ticket_len(&mut server) > 0,
+            "leaf at the bound: sealed ticket"
+        );
     }
 }
