@@ -418,7 +418,9 @@ pc_status pc_rand_bytes(uint8_t *out, size_t len);
  * Native C callers can simply use their own malloc/free.
  *
  * pc_malloc returns `size` UNINITIALIZED bytes, or NULL if `size` is 0 or the
- * allocation fails. The allocation is untracked, so the caller MUST remember
+ * allocation fails. The pointer is 16-byte aligned, so the buffer may hold any
+ * scalar out-parameter type (size_t, uint16_t, int32_t, uint64_t, ...) as well
+ * as raw bytes. The allocation is untracked, so the caller MUST remember
  * `size` and pass the identical value to pc_free; passing a different size, a
  * pointer that did not come from pc_malloc, or freeing twice is undefined
  * behaviour. A NULL pointer or a zero size makes pc_free a no-op. Buffers from

@@ -2952,3 +2952,30 @@ unsafe fn pump_wire_lenient(from: *mut tls::PcTls, to: *mut tls::PcTls) {
         }
     }
 }
+
+/// `pc_malloc` memory is handed to the entry points as `size_t *` /
+/// `uint16_t *` / `int32_t *` out-parameters by the wasm glue, so it must be
+/// aligned for any of them; 16 is the documented guarantee.
+#[test]
+fn pc_malloc_is_16_byte_aligned() {
+    assert!(super::pc_malloc(0).is_null());
+    let mut live = Vec::new();
+    for n in [1usize, 2, 3, 7, 8, 15, 16, 17, 100, 4096, 65_537] {
+        let p = super::pc_malloc(n);
+        assert!(!p.is_null(), "pc_malloc({n})");
+        assert_eq!(p as usize % 16, 0, "pc_malloc({n}) misaligned");
+        // Use it as the out-parameter types the glue stores there.
+        unsafe {
+            core::ptr::write_bytes(p, 0xA5, n);
+            if n >= core::mem::size_of::<usize>() {
+                *(p as *mut usize) = 0;
+                assert_eq!(*(p as *const usize), 0);
+            }
+        }
+        live.push((p, n));
+    }
+    for (p, n) in live {
+        unsafe { super::pc_free(p, n) };
+    }
+    unsafe { super::pc_free(core::ptr::null_mut(), 16) };
+}

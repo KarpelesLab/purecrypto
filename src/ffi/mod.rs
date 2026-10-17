@@ -47,22 +47,32 @@ mod xmss;
 
 pub use common::PcStatus;
 
+/// Alignment of every [`pc_malloc`] allocation. Hosts use the library heap
+/// not only for byte buffers but for the scalar out-parameters the entry
+/// points write through (`size_t *`, `uint16_t *`, `int32_t *`, `uint64_t
+/// *`), which are plain aligned stores on the Rust side; 16 covers every
+/// such type (and `max_align_t`) on every supported target.
+const PC_MALLOC_ALIGN: usize = 16;
+
 /// Allocates `size` uninitialized bytes in the module's heap and returns a
-/// pointer to them (NULL if `size` is 0 or the allocation fails).
+/// pointer to them (NULL if `size` is 0 or the allocation fails). The
+/// pointer is 16-byte aligned, so the buffer can hold any scalar
+/// out-parameter type (`size_t`, `uint16_t`, `int32_t`, `uint64_t`, ...)
+/// as well as raw bytes.
 ///
 /// Exposed chiefly for **WebAssembly** hosts: JavaScript cannot allocate inside
 /// the wasm linear memory on its own, so it calls `pc_malloc` to reserve space
 /// for the input/output buffers the `pc_*` entry points read and write, then
 /// releases it with [`pc_free`]. Native C callers can use their own `malloc`.
 ///
-/// The allocation is untracked (aligned for any byte buffer), so the caller
-/// must remember `size` and pass the SAME value to [`pc_free`].
+/// The allocation is untracked, so the caller must remember `size` and pass
+/// the SAME value to [`pc_free`].
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_malloc(size: usize) -> *mut u8 {
     if size == 0 {
         return core::ptr::null_mut();
     }
-    let Ok(layout) = alloc::alloc::Layout::from_size_align(size, 1) else {
+    let Ok(layout) = alloc::alloc::Layout::from_size_align(size, PC_MALLOC_ALIGN) else {
         return core::ptr::null_mut();
     };
     // SAFETY: `layout` has a non-zero size (checked above).
@@ -81,7 +91,9 @@ pub unsafe extern "C" fn pc_free(ptr: *mut u8, size: usize) {
     if ptr.is_null() || size == 0 {
         return;
     }
-    let Ok(layout) = alloc::alloc::Layout::from_size_align(size, 1) else {
+    // The layout must match `pc_malloc`'s exactly (same size, same
+    // alignment) for the deallocation to be sound.
+    let Ok(layout) = alloc::alloc::Layout::from_size_align(size, PC_MALLOC_ALIGN) else {
         return;
     };
     // SAFETY: the caller guarantees `ptr` came from `pc_malloc(size)`.
