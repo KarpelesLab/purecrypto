@@ -632,6 +632,52 @@ impl Generator {
         self.0.to_projective()
     }
 
+    /// Whether this is the fixed generator `H`, whose comb table is built
+    /// in. Declassified: a generator is public in every protocol here (it is
+    /// published next to the commitment), so which multiplication path it
+    /// takes is public too.
+    #[cfg(feature = "zkp-h-table")]
+    fn is_h(&self) -> bool {
+        let h = Generator::h().0;
+        (self.0.x_bytes().ct_eq(&h.x_bytes()) & self.0.y_bytes().ct_eq(&h.y_bytes())).declassify()
+    }
+
+    /// Whether [`mul_scalar`](Self::mul_scalar) runs over a comb table (true
+    /// for `H` with the `zkp-h-table` feature), so a prover can trade a
+    /// variable-base multiplication for fixed-base ones. Public.
+    pub(crate) fn has_comb(&self) -> bool {
+        #[cfg(feature = "zkp-h-table")]
+        {
+            self.is_h()
+        }
+        #[cfg(not(feature = "zkp-h-table"))]
+        {
+            false
+        }
+    }
+
+    /// `v · self` for a committed value `v < 2⁶⁴` (a [`value_scalar`]):
+    /// constant time in `v`, with a schedule that depends on the public
+    /// 64-bit width alone — a 17-window comb over the static table for `H`
+    /// with `zkp-h-table`, the public-width ladder otherwise.
+    pub(crate) fn mul_value(&self, v: &Scalar) -> ProjectivePoint {
+        #[cfg(feature = "zkp-h-table")]
+        if self.is_h() {
+            return ProjectivePoint::mul_comb_bits_table::<64>(v, &super::htable::ZKP_H_TABLE);
+        }
+        self.as_point().mul_bits::<64>(v)
+    }
+
+    /// `k · self` for a full-width secret scalar: the comb over the static
+    /// table for `H` with `zkp-h-table`, the constant-time ladder otherwise.
+    pub(crate) fn mul_scalar(&self, k: &Scalar) -> ProjectivePoint {
+        #[cfg(feature = "zkp-h-table")]
+        if self.is_h() {
+            return ProjectivePoint::mul_comb_table(k, &super::htable::ZKP_H_TABLE);
+        }
+        self.as_point().mul(k)
+    }
+
     /// Wraps a curve point as a generator.
     ///
     /// # Errors
@@ -703,8 +749,7 @@ impl Commitment {
         let v = value_scalar(value);
         // The value's width (64 bits) is public; its magnitude is not.
         let point = generator
-            .as_point()
-            .mul_bits::<64>(&v)
+            .mul_value(&v)
             .add(&ProjectivePoint::mul_generator(&r));
         point.to_affine().map(Commitment).ok_or(Error::InvalidInput)
     }
@@ -840,7 +885,7 @@ pub fn verify_sum_with_generator(
     generator: &Generator,
 ) -> bool {
     let lhs = sum(inputs);
-    let fee_point = generator.as_point().mul_bits::<64>(&value_scalar(fee));
+    let fee_point = generator.mul_value(&value_scalar(fee));
     let rhs = sum(outputs).add(&fee_point);
     bool::from(lhs.ct_eq(&rhs))
 }
@@ -935,6 +980,95 @@ mod tests {
 
     /// The oracle-generated interop corpus. See `tools/zkp-interop/README.md`.
     const VECTORS: &str = include_str!("../../tools/zkp-interop/vectors/pedersen.json");
+
+    /// Big-endian coordinate bytes as little-endian 64-bit limbs (the comb
+    /// table layout).
+    fn limbs(be: &[u8; 32]) -> [u64; 4] {
+        let l = |i: usize| u64::from_be_bytes(be[32 - 8 * (i + 1)..32 - 8 * i].try_into().unwrap());
+        [l(0), l(1), l(2), l(3)]
+    }
+
+    /// Re-derives every entry of the embedded `H` comb table from the group
+    /// law, so `ZKP_H_TABLE` is verified on every test run rather than
+    /// trusted.
+    #[test]
+    #[cfg(feature = "zkp-h-table")]
+    fn h_table_matches_computed() {
+        let mut base = Generator::h().as_point();
+        for window in super::super::htable::ZKP_H_TABLE.iter() {
+            let mut acc = base;
+            for (j, entry) in window.iter().enumerate() {
+                if j > 0 {
+                    acc = acc.add(&base);
+                }
+                let a = acc.to_affine().expect("table entry is never the identity");
+                assert_eq!(limbs(&a.x_bytes()), entry[..4], "x mismatch");
+                assert_eq!(limbs(&a.y_bytes()), entry[4..], "y mismatch");
+            }
+            for _ in 0..4 {
+                base = base.double();
+            }
+        }
+    }
+
+    /// The comb paths agree with the ladders, for `H` and for a per-asset
+    /// generator (which has no comb and must take the fallback).
+    #[test]
+    fn generator_mul_paths_agree() {
+        let h = Generator::h();
+        let asset = Generator::from_asset_tag(&[7u8; 32]).unwrap();
+        let mut x = 0x5EC9_0011u64;
+        for i in 0..40u64 {
+            x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i);
+            let v = value_scalar(if i < 4 { i } else { x });
+            let mut kb = [0u8; 32];
+            for (c, b) in kb.iter_mut().enumerate() {
+                *b = (x >> ((c % 8) * 8)) as u8 ^ c as u8;
+            }
+            let k = Scalar::from_bytes_be_reduce(&kb);
+            for g in [&h, &asset] {
+                let p = g.as_point();
+                assert!(bool::from(g.mul_value(&v).ct_eq(&p.mul(&v))));
+                assert!(bool::from(g.mul_scalar(&k).ct_eq(&p.mul(&k))));
+            }
+        }
+        assert!(!asset.has_comb());
+        assert_eq!(h.has_comb(), cfg!(feature = "zkp-h-table"));
+    }
+
+    /// Regenerates the `H` comb table source (`src/zkp/htable.rs`): paste
+    /// the emitted `static` between the file's header comment and EOF. Run
+    /// with `cargo test --release gen_zkp_h_table -- --ignored --nocapture`.
+    /// The non-ignored `h_table_matches_computed` test keeps the pasted
+    /// constants honest on every test run.
+    #[test]
+    #[ignore = "table generator; emits Rust source on stdout"]
+    #[cfg(feature = "std")]
+    fn gen_zkp_h_table() {
+        use std::{print, println};
+        let mut base = Generator::h().as_point();
+        println!("pub(crate) static ZKP_H_TABLE: CombTable = [");
+        for _ in 0..64 {
+            println!("    [");
+            let mut acc = base;
+            for j in 1..=15u32 {
+                if j > 1 {
+                    acc = acc.add(&base);
+                }
+                let a = acc.to_affine().expect("table entry is never the identity");
+                print!("        [");
+                for l in limbs(&a.x_bytes()).iter().chain(limbs(&a.y_bytes()).iter()) {
+                    print!("0x{l:016x}, ");
+                }
+                println!("],");
+            }
+            println!("    ],");
+            for _ in 0..4 {
+                base = base.double();
+            }
+        }
+        println!("];");
+    }
 
     // --- minimal JSON reading (no alloc) ---
 

@@ -55,7 +55,7 @@ name = "purecrypto"
 # The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "ed25519-table", "ed448-table", "p256-table", "secp256k1-table", "streebog-table", "whirlpool-table", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "jose"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "ed25519-table", "ed448-table", "p256-table", "secp256k1-table", "zkp-h-table", "streebog-table", "whirlpool-table", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom", "jose"]
 # `compcol?/…`: under `cert-compression` a `std` build also gets compcol's
 # brotli codec, whose encoder uses floating-point `log2` and so cannot be
 # built for `no_std` (zlib and zstd can).
@@ -216,6 +216,15 @@ zkp-adaptor = ["hazmat-secp256k1", "hash", "rng"]
 zkp-pedersen = ["hazmat-secp256k1", "hash", "rng"]
 # Borromean-ring range proofs over Pedersen commitments (Confidential Assets).
 zkp-rangeproof = ["zkp-pedersen"]
+# The precomputed fixed-base comb table for the Confidential Transactions
+# second generator `H` (~61 KB of static data), used by the Pedersen
+# commitment and range-proof provers: `v·H` becomes a 17-window comb and every
+# ring member of a range proof two fixed-base combs instead of a variable-base
+# ladder (about twice the proving speed). Implies `secp256k1-table` (the comb
+# machinery and the matching `G` table). Inert unless `zkp-pedersen` /
+# `zkp-rangeproof` are enabled; without it the same code falls back to the
+# constant-time ladders, producing identical commitments and proofs.
+zkp-h-table = ["secp256k1-table"]
 # Asset surjection proofs (Confidential Assets).
 # STAYS alloc-gated, by design, not oversight. `SurjectionProof` is a ring of
 # up to 256 scalars (`MAX_USED_INPUTS`), so the fixed-array form is an 8.3 KiB

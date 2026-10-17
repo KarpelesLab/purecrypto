@@ -697,6 +697,33 @@ fn next_step(step: &ProjectivePoint) -> ProjectivePoint {
     step.double().double()
 }
 
+/// The prover's ring point `s·G + e·K` for a member `K = member` it can open
+/// as `share·G + t·H` (`t = (dᵢ − j)·4ⁱ·scale`, see [`member_offset`]).
+///
+/// When the generator has a comb table (`use_comb`, public: it says which
+/// generator is in use, never anything about the value) both terms are
+/// fixed-base: `(s + e·share)·G + (e·t)·H` — two doubling-free combs
+/// instead of a comb plus a variable-base ladder, the same group element
+/// and hence the same proof bytes. Otherwise the member point is
+/// multiplied directly. The scalar arithmetic is constant time, and the
+/// zkp provers' secrets (`share`, `t`, `e` at the known member) never
+/// select a branch.
+fn prover_ring_point(
+    generator: &Generator,
+    use_comb: bool,
+    member: &ProjectivePoint,
+    s: &Scalar,
+    e: &Scalar,
+    share: &Scalar,
+    t: &Scalar,
+) -> ProjectivePoint {
+    if use_comb {
+        ProjectivePoint::mul_generator(&s.add(&e.mul(share))).add(&generator.mul_scalar(&e.mul(t)))
+    } else {
+        ProjectivePoint::mul_generator(s).add(&member.mul(e))
+    }
+}
+
 /// Recovers the first `count` digit commitments from a proof body into
 /// `points`, along with their 33-byte hash encodings in `encs`.
 ///
@@ -1181,9 +1208,9 @@ pub fn sign_into(
         let offset = value_scalar(member_offset(digits[i], i, params.scale));
         let share = Scalar::from_bytes_be_reduce(&sec[i]);
         // The offset is secret (it carries the digit) but its 64-bit width
-        // is public, so the public-width ladder applies.
-        digit_commits[i] = gen_point
-            .mul_bits::<64>(&offset)
+        // is public, so the public-width multiplication applies.
+        digit_commits[i] = generator
+            .mul_value(&offset)
             .add(&ProjectivePoint::mul_generator(&share));
     }
     let mut encs = [[0u8; 33]; MAX_RINGS];
@@ -1199,6 +1226,8 @@ pub fn sign_into(
     // Ring member keys are walked per ring rather than kept in a 128-entry
     // table; see `first_step` (the same trade the verifier makes).
     let step0 = first_step(&gen_point, params.scale);
+    // Whether the generator has a comb table (public: see `prover_ring_point`).
+    let use_comb = generator.has_comb();
 
     let m = proof_message(
         &commit_enc,
@@ -1226,6 +1255,11 @@ pub fn sign_into(
         }
         let neg_step = step.negate();
         let mut member = digit_commits[i];
+        // The prover's opening of the walked member: `share·G + t·H` with
+        // `t` stepping down by `4ⁱ·scale` alongside the point.
+        let share = Scalar::from_bytes_be_reduce(&sec[i]);
+        let unit = value_scalar(member_offset(1, i, params.scale));
+        let mut t = value_scalar(member_offset(digits[i], i, params.scale));
         for j in 0..layout.rsizes[i] {
             let is_known = (j as u64).ct_eq(&digits[i]);
             r = ProjectivePoint::conditional_select(&kg, &r, is_known);
@@ -1235,7 +1269,8 @@ pub fn sign_into(
                 let sj = Scalar::from_bytes_be_reduce(&s[start + j + 1]);
                 // Member j + 1.
                 member = member.add(&neg_step);
-                r = ProjectivePoint::mul_generator(&sj).add(&member.mul(&e));
+                t = t.sub(&unit);
+                r = prover_ring_point(generator, use_comb, &member, &sj, &e, &share, &t);
             }
         }
         let affine = r.to_affine().ok_or(Error::InvalidInput)?;
@@ -1255,6 +1290,9 @@ pub fn sign_into(
         }
         let neg_step = step.negate();
         let mut member = digit_commits[i];
+        let share = Scalar::from_bytes_be_reduce(&sec[i]);
+        let unit = value_scalar(member_offset(1, i, params.scale));
+        let mut t = value_scalar(member_offset(digits[i], i, params.scale));
         for j in 0..layout.rsizes[i] {
             let is_known = (j as u64).ct_eq(&digits[i]);
             e_known = <[u8; 32]>::conditional_select(&e, &e_known, is_known);
@@ -1263,8 +1301,9 @@ pub fn sign_into(
                 let sj = Scalar::from_bytes_be_reduce(&s[start + j]);
                 if j > 0 {
                     member = member.add(&neg_step);
+                    t = t.sub(&unit);
                 }
-                let r = ProjectivePoint::mul_generator(&sj).add(&member.mul(&scalar));
+                let r = prover_ring_point(generator, use_comb, &member, &sj, &scalar, &share, &t);
                 e = borromean_hash(&m, &sec1(&r), i as u32, (j + 1) as u32);
             }
         }

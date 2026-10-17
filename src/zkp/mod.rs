@@ -100,6 +100,8 @@ pub mod adaptor;
 #[cfg(feature = "zkp-halfagg")]
 pub mod halfagg;
 
+#[cfg(all(feature = "zkp-pedersen", feature = "zkp-h-table"))]
+mod htable;
 #[cfg(feature = "zkp-pedersen")]
 pub mod pedersen;
 

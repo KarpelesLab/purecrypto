@@ -89,8 +89,9 @@ impl Point {
     /// Constant-time fixed-base `scalar · B` for a scalar of public width
     /// `BITS` (as [`Point::mul_bits`]) over the comb table of `B`: only
     /// `BITS/4 + 1` of the 64 windows run, then a masked subtraction of `B`
-    /// corrects even scalars.
-    #[cfg(test)]
+    /// corrects even scalars. Only the zkp generator `H` has a table and a
+    /// 64-bit multiplier, hence the gate.
+    #[cfg(any(feature = "zkp-h-table", test))]
     pub(crate) fn mul_comb_bits<F: FieldBackend, const BITS: usize>(
         f: &F,
         scalar: &[u64; 4],

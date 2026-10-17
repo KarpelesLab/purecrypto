@@ -41,7 +41,7 @@
 pub mod schnorr;
 
 #[cfg(feature = "secp256k1-table")]
-mod comb;
+pub(crate) mod comb;
 pub mod ecdsa;
 pub(crate) mod field_backend;
 mod glv;
@@ -357,6 +357,31 @@ impl ProjectivePoint {
         {
             Self::generator().mul(scalar)
         }
+    }
+
+    /// Constant-time `scalar · B` over a precomputed comb table of a fixed
+    /// base `B` (the layout of [`comb::CombTable`]): 64 complete mixed
+    /// additions, each operand gathered by a masked scan, no doublings. Same
+    /// secret-scalar discipline as [`mul_generator`](Self::mul_generator);
+    /// crate-internal, for the zkp generator `H`'s table.
+    #[cfg(feature = "zkp-h-table")]
+    pub(crate) fn mul_comb_table(scalar: &Scalar, table: &comb::CombTable) -> ProjectivePoint {
+        ProjectivePoint(Point::mul_comb(&field(), scalar.0.as_limbs(), table))
+    }
+
+    /// [`mul_comb_table`](Self::mul_comb_table) for a scalar of public width
+    /// `BITS` (as [`mul_bits`](Self::mul_bits)): only `BITS/4 + 1` windows
+    /// of the comb run.
+    #[cfg(feature = "zkp-h-table")]
+    pub(crate) fn mul_comb_bits_table<const BITS: usize>(
+        scalar: &Scalar,
+        table: &comb::CombTable,
+    ) -> ProjectivePoint {
+        ProjectivePoint(Point::mul_comb_bits::<_, BITS>(
+            &field(),
+            scalar.0.as_limbs(),
+            table,
+        ))
     }
 
     /// **Variable-time** `a·p + b·q` (GLV split, then Straus over width-5
