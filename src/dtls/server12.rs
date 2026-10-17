@@ -58,8 +58,8 @@ use core::time::Duration;
 use super::cid::{CidState, connection_id_extension, negotiate_server};
 use super::cookie::{CookieGenerator, build_ch_fingerprint};
 use super::reassembly::{
-    HandshakeFragment, MAX_HS_MSG_SEQ, PreCookieBuffer, Reassembler, read_fragment,
-    transcript_message, write_fragments, write_message,
+    DTLS12_MAX_MESSAGE_LEN, HandshakeFragment, MAX_HS_MSG_SEQ, MAX_IN_PROGRESS, PreCookieBuffer,
+    Reassembler, read_fragment, transcript_message, write_fragments, write_message,
 };
 use super::record::{self, ParsedDtlsRecord, TLS12_CID_CONTENT_TYPE};
 use super::reliability::{Flight, FlightRecord, Retransmit};
@@ -1725,8 +1725,10 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.cid = cid_pick.map(|(local, peer)| CidState::negotiated(local, peer, Vec::new()));
         self.peer_offered_session_ticket = offered_ticket;
         // Initialise the reassembler at expected_msg_seq = msg_seq + 1
-        // (the client's next handshake msg after CH).
-        let mut reasm = Reassembler::new();
+        // (the client's next handshake msg after CH). The client's flight
+        // arrives in plaintext, so its per-message claim is capped at the
+        // stream engines' handshake ceiling (see `DTLS12_MAX_MESSAGE_LEN`).
+        let mut reasm = Reassembler::with_limits(DTLS12_MAX_MESSAGE_LEN, MAX_IN_PROGRESS);
         for s in 0..=msg_seq {
             // Drive its counter up to msg_seq+1 by feeding synthetic
             // zero-length messages of type CLIENT_HELLO. Each call

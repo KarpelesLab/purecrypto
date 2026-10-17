@@ -27,8 +27,9 @@ pub(crate) use client12::ClientConfig12;
 pub(crate) use client12::ClientConnection12;
 pub(crate) use client12::StoredSession12;
 // The handshake-message ceiling: RFC 8879 §5 wants the same limit on a
-// decompressed Certificate as on a plain one.
-#[cfg(feature = "cert-compression")]
+// decompressed Certificate as on a plain one, and the DTLS 1.2 engines cap
+// their plaintext handshake reassembly at it.
+#[cfg(any(feature = "cert-compression", feature = "dtls"))]
 pub(crate) use common::MAX_HANDSHAKE_REASSEMBLY;
 // Re-exported for the DTLS 1.2 client / server, which drive suite negotiation
 // from the same 6-entry SUITES_12 table as the TLS 1.2 layer.

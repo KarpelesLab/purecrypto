@@ -90,7 +90,10 @@ use super::epoch13::{
     KEY_UPDATE_WINDOW, MAX_KEY_UPDATES_RECEIVED, PREV_EPOCH_GRACE_RECORDS, PREV_EPOCH_GRACE_TIME,
     ReadEpoch, select_read_epoch,
 };
-use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_fragments};
+use super::reassembly::{
+    DTLS13_PLAINTEXT_MAX_IN_PROGRESS, DTLS13_PLAINTEXT_MAX_MESSAGE_LEN, HandshakeFragment,
+    MAX_IN_PROGRESS, MAX_MESSAGE_LEN, Reassembler, read_fragment, write_fragments,
+};
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
 use super::record13::{self, SnKey, header_aad, header_cid, peek_header_layout, reconstruct_seq};
 use super::reliability13::{InFlightRecord, Retransmit13};
@@ -581,7 +584,13 @@ impl DtlsClientConnection13 {
             peer_addr,
             state: State::WaitServerHello,
             out_msg_seq: 0,
-            reassembler: Reassembler::new(),
+            // Only the ServerHello / HelloRetryRequest can arrive before
+            // the handshake keys, in plaintext: start with caps sized for
+            // them (lifted in `on_server_hello`).
+            reassembler: Reassembler::with_limits(
+                DTLS13_PLAINTEXT_MAX_MESSAGE_LEN,
+                DTLS13_PLAINTEXT_MAX_IN_PROGRESS,
+            ),
             out_dgrams: Vec::new(),
             app_in: Vec::new(),
             plain_write_epoch: 0,
@@ -2005,6 +2014,12 @@ impl DtlsClientConnection13 {
         self.ks = Some(ks);
         self.client_hs_secret = Some(chts);
         self.server_hs_secret = Some(shts);
+        // From here on every handshake message is authenticated under the
+        // handshake keys (plaintext handshake records are ignored outside
+        // `WaitServerHello`), so the reassembler may hold a certificate
+        // chain again.
+        self.reassembler
+            .set_limits(MAX_MESSAGE_LEN, MAX_IN_PROGRESS);
         // RFC 9147 §7.1 implicit acknowledgement: the server's responding
         // flight proves our plaintext (epoch 0) ClientHello arrived. The
         // peer never sends explicit ACKs for epoch-0 records, so without
@@ -2887,6 +2902,19 @@ impl DtlsClientConnection13 {
                 self.out_dgrams.push(dg);
             }
         }
+    }
+
+    /// Test-only: the reassembly buffer bytes held right now.
+    #[cfg(test)]
+    pub(crate) fn reassembler_buffered_bytes_for_test(&self) -> usize {
+        self.reassembler.buffered_bytes()
+    }
+
+    /// Test-only: pins the outbound handshake `message_seq`, so a test can
+    /// drive the counter to its end without 65 535 messages.
+    #[cfg(test)]
+    pub(crate) fn set_out_msg_seq_for_test(&mut self, seq: u16) {
+        self.out_msg_seq = seq;
     }
 
     /// Test-only: queues a raw 2-byte alert (`level ‖ description`) under

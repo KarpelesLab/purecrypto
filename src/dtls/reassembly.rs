@@ -275,7 +275,7 @@ impl PartialMessage {
 /// signatures (~50 KB SLH-DSA signatures push the high end). Capping
 /// prevents a hostile peer from claiming `total_length = 16 MiB` and
 /// triggering a multi-MiB allocation per message_seq.
-const MAX_MESSAGE_LEN: u32 = 256 * 1024;
+pub(crate) const MAX_MESSAGE_LEN: u32 = 256 * 1024;
 
 /// Default upper bound on the number of reassembly candidates held in the
 /// in-progress map. RFC allows `message_seq` up to 65 535; an attacker
@@ -283,7 +283,7 @@ const MAX_MESSAGE_LEN: u32 = 256 * 1024;
 /// allocations. Eight concurrent candidates is more than any legitimate
 /// handshake flight needs, while still leaving room for a spoofed claim and
 /// the genuine message to coexist at the same `message_seq`.
-const MAX_IN_PROGRESS: usize = 8;
+pub(crate) const MAX_IN_PROGRESS: usize = 8;
 
 /// How far ahead of `expected_msg_seq` a fragment's `message_seq` may be
 /// before it is refused outright. A legitimate DTLS flight is at most a
@@ -294,6 +294,29 @@ const MAX_IN_PROGRESS: usize = 8;
 /// fill `max_in_progress` and starve the genuine head-of-queue message —
 /// `drop_stale_candidates` only ever evicts *below* `expected_msg_seq`.
 pub(crate) const MAX_SEQ_AHEAD: u16 = 8;
+
+/// Per-message ceiling for the DTLS 1.2 handshake reassemblers. Their
+/// flights travel at epoch 0, in plaintext — the server's `ServerHello ..
+/// ServerHelloDone`, the client's `Certificate .. CertificateVerify`, the
+/// server's NewSessionTicket — so an off-path spoofer who knows the
+/// 4-tuple can claim any `total_length` and have the dense buffer
+/// allocated at once; under the defaults eight one-byte fragments pin
+/// 2 MiB per handshake. The stream TLS 1.2 engines cap a handshake message
+/// at [`MAX_HANDSHAKE_REASSEMBLY`](crate::tls::conn::MAX_HANDSHAKE_REASSEMBLY),
+/// so a chain that fits there fits here. Nothing larger than a Finished
+/// follows the key switch in DTLS 1.2, so the cap stays for the life of
+/// the connection.
+pub(crate) const DTLS12_MAX_MESSAGE_LEN: u32 = crate::tls::conn::MAX_HANDSHAKE_REASSEMBLY as u32;
+
+/// Caps for the DTLS 1.3 client while it waits for the ServerHello /
+/// HelloRetryRequest — the only messages that reach it at epoch 0, in
+/// plaintext. Even a hybrid ML-KEM-1024 key share keeps a ServerHello
+/// under 2 KiB, and one genuine candidate plus a few spoofed claims at the
+/// same `message_seq` is all the map needs. [`Reassembler::set_limits`]
+/// lifts them to the defaults once the handshake keys are installed and
+/// every later message is authenticated.
+pub(crate) const DTLS13_PLAINTEXT_MAX_MESSAGE_LEN: u32 = 16 * 1024;
+pub(crate) const DTLS13_PLAINTEXT_MAX_IN_PROGRESS: usize = 4;
 
 /// Handshake-message reassembler. Tracks one in-flight reassembly per
 /// `(message_seq, msg_type, total_length)` candidate and gates dispatch on
@@ -364,6 +387,21 @@ impl Reassembler {
             progressed: false,
             stalled_fires: 0,
         }
+    }
+
+    /// Replaces the memory caps in place, keeping `expected_msg_seq` and
+    /// whatever is buffered. The DTLS 1.3 client raises its tight
+    /// pre-ServerHello caps to the defaults once the handshake keys are in
+    /// and the peer's messages are authenticated.
+    pub(crate) fn set_limits(&mut self, max_message_len: u32, max_in_progress: usize) {
+        self.max_message_len = max_message_len;
+        self.max_in_progress = max_in_progress;
+    }
+
+    /// Test-only: the bytes of dense reassembly buffers held right now.
+    #[cfg(test)]
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.in_progress.values().map(|p| p.buf.len()).sum()
     }
 
     /// Switches the full-map policy to FIFO: a new candidate evicts the

@@ -73,7 +73,8 @@ use core::time::Duration;
 
 use super::cid::{CidState, connection_id_extension, negotiate_client};
 use super::reassembly::{
-    HandshakeFragment, Reassembler, read_fragment, transcript_message, write_fragments,
+    DTLS12_MAX_MESSAGE_LEN, HandshakeFragment, MAX_IN_PROGRESS, Reassembler, read_fragment,
+    transcript_message, write_fragments,
 };
 use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, FlightRecord, Retransmit};
@@ -436,7 +437,10 @@ impl DtlsClientConnection12 {
             peer_addr,
             state: State::WaitServerHelloOrHvr,
             out_msg_seq: 0,
-            reassembler: Reassembler::new(),
+            // The server's flight arrives in plaintext: cap each message's
+            // claim at the stream engines' handshake ceiling (see
+            // `DTLS12_MAX_MESSAGE_LEN`).
+            reassembler: Reassembler::with_limits(DTLS12_MAX_MESSAGE_LEN, MAX_IN_PROGRESS),
             out_dgrams: Vec::new(),
             app_in: Vec::new(),
             write_epoch: 0,
@@ -1287,7 +1291,7 @@ impl DtlsClientConnection12 {
         // use a different approach.
         //
         // Easier: rebuild the reassembler so it starts at msg_seq=1.
-        self.reassembler = Reassembler::new();
+        self.reassembler = Reassembler::with_limits(DTLS12_MAX_MESSAGE_LEN, MAX_IN_PROGRESS);
         // Replay a "completed" msg_seq=0 to advance the counter.
         // Feed an empty-body fragment with msg_seq=0; total_length=0;
         // fragment_length=0 — this completes msg_seq=0 and advances to 1.

@@ -1087,6 +1087,75 @@ mod dtls13 {
         DtlsClientConnection13::new(cfg, b"client-addr".to_vec(), &mut crng)
     }
 
+    /// A plaintext (epoch 0) handshake record carrying one fragment with
+    /// an arbitrary `total_length` claim.
+    fn plaintext_fragment_record_13(
+        msg_type: u8,
+        message_seq: u16,
+        total_length: u32,
+        fragment: &[u8],
+    ) -> Vec<u8> {
+        let flen = fragment.len() as u32;
+        let mut hs = Vec::new();
+        hs.push(msg_type);
+        hs.extend_from_slice(&total_length.to_be_bytes()[1..]);
+        hs.extend_from_slice(&message_seq.to_be_bytes());
+        hs.extend_from_slice(&[0, 0, 0]); // fragment_offset = 0
+        hs.extend_from_slice(&flen.to_be_bytes()[1..]);
+        hs.extend_from_slice(fragment);
+        let mut rec = alloc::vec![22u8, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0x63];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    /// Regression (plaintext reassembly budget): before the ServerHello
+    /// the client's reassembler sees only unauthenticated, epoch-0 input,
+    /// so its caps are sized for a ServerHello / HelloRetryRequest. Eight
+    /// one-byte fragments each claiming `total_length = 256 KiB` at
+    /// distinct `message_seq`s used to allocate 2 MiB on the spot; now they
+    /// are refused outright, in-cap claims pin at most the small budget,
+    /// and the genuine handshake still completes around them.
+    #[test]
+    fn oversized_plaintext_claims_are_refused_before_server_hello_13() {
+        use crate::dtls::reassembly::{
+            DTLS13_PLAINTEXT_MAX_IN_PROGRESS, DTLS13_PLAINTEXT_MAX_MESSAGE_LEN,
+        };
+        let (server_cfg, cert) = make_server13();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-reasm-budget", b"nonce", &[]);
+        let mut server = DtlsServerConnection13::new(
+            Arc::new(server_cfg.with_no_cookie()),
+            b"client-addr".to_vec(),
+            srng,
+        );
+        let ch = client.pop_outbound_datagrams();
+        for seq in 0..8u16 {
+            let rec = plaintext_fragment_record_13(2, seq, 256 * 1024, &[0u8]);
+            client.feed_datagram(&rec).unwrap();
+        }
+        assert_eq!(
+            client.reassembler_buffered_bytes_for_test(),
+            0,
+            "a claim above the plaintext ceiling allocates nothing"
+        );
+        for seq in 0..8u16 {
+            let rec =
+                plaintext_fragment_record_13(2, seq, DTLS13_PLAINTEXT_MAX_MESSAGE_LEN, &[0u8]);
+            client.feed_datagram(&rec).unwrap();
+        }
+        assert!(
+            client.reassembler_buffered_bytes_for_test()
+                <= DTLS13_PLAINTEXT_MAX_IN_PROGRESS * DTLS13_PLAINTEXT_MAX_MESSAGE_LEN as usize,
+            "in-cap claims are bounded by the plaintext budget"
+        );
+        for dg in &ch {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert_eq!(client.reassembler_buffered_bytes_for_test(), 0);
+    }
+
     fn pump_handshake_13<R: crate::rng::RngCore>(
         client: &mut DtlsClientConnection13,
         server: &mut DtlsServerConnection13<R>,
