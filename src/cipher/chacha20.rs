@@ -184,8 +184,20 @@ impl ChaCha20 {
             simd::apply_keystream(&self.key, nonce, counter, buf);
             return;
         }
-        let mut block_counter = counter;
-        for block in buf.chunks_mut(64) {
+        // On aarch64 NEON is part of the baseline ISA, so the 2×4-way kernel
+        // is the normal path with no runtime probe. It hands back a tail of
+        // under two blocks, where a 4-wide pass would mostly compute
+        // discarded blocks, to the scalar loop below — which also remains the
+        // whole path in the constant-time harness's forced-portable mode.
+        #[cfg(target_arch = "aarch64")]
+        let (done, mut block_counter) = if neon::supported() {
+            neon::apply_keystream(&self.key, nonce, counter, buf)
+        } else {
+            (0, counter)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let (done, mut block_counter) = (0, counter);
+        for block in buf[done..].chunks_mut(64) {
             let mut ks = self.block(nonce, block_counter);
             for (b, k) in block.iter_mut().zip(ks.iter()) {
                 *b ^= *k;
@@ -459,10 +471,307 @@ mod simd {
     }
 }
 
+/// NEON 4-way ChaCha20 keystream (aarch64), two independent 4-block sets per
+/// pass so one set's eight quarter-round dependency chains overlap with the
+/// other's. Each of the 16 state words is a `uint32x4_t` holding one
+/// consecutive block counter per lane, so the quarter-round indices are the
+/// scalar ones and no diagonalisation is needed; the lane-to-block transpose
+/// at the end is two `trn1`/`trn2` levels per 4-word group.
+///
+/// Rotations: `<<< 16` is a `rev32.16` (swap halves), `<<< 8` a byte shuffle
+/// (`tbl`), and `<<< 12` / `<<< 7` a shift plus shift-right-insert (`sri`),
+/// two instructions instead of the shift/shift/or trio. NEON is in the
+/// aarch64 baseline, so there is no runtime feature probe and the module
+/// builds for `no_std`. Pinned byte-for-byte to the scalar path by a
+/// differential test over every length in `0..=1024` and beyond.
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+mod neon {
+    use super::CONSTANTS;
+    use core::arch::aarch64::*;
+
+    pub(super) fn supported() -> bool {
+        !crate::ct::force_portable()
+    }
+
+    #[inline(always)]
+    unsafe fn rot16(x: uint32x4_t) -> uint32x4_t {
+        unsafe { vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(x))) }
+    }
+
+    #[inline(always)]
+    unsafe fn rot12(x: uint32x4_t) -> uint32x4_t {
+        unsafe { vsriq_n_u32::<20>(vshlq_n_u32::<12>(x), x) }
+    }
+
+    #[inline(always)]
+    unsafe fn rot8(x: uint32x4_t, tbl: uint8x16_t) -> uint32x4_t {
+        unsafe { vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(x), tbl)) }
+    }
+
+    #[inline(always)]
+    unsafe fn rot7(x: uint32x4_t) -> uint32x4_t {
+        unsafe { vsriq_n_u32::<25>(vshlq_n_u32::<7>(x), x) }
+    }
+
+    #[inline(always)]
+    unsafe fn qr(
+        v: &mut [uint32x4_t; 16],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        tbl: uint8x16_t,
+    ) {
+        unsafe {
+            v[a] = vaddq_u32(v[a], v[b]);
+            v[d] = rot16(veorq_u32(v[d], v[a]));
+            v[c] = vaddq_u32(v[c], v[d]);
+            v[b] = rot12(veorq_u32(v[b], v[c]));
+            v[a] = vaddq_u32(v[a], v[b]);
+            v[d] = rot8(veorq_u32(v[d], v[a]), tbl);
+            v[c] = vaddq_u32(v[c], v[d]);
+            v[b] = rot7(veorq_u32(v[b], v[c]));
+        }
+    }
+
+    /// One double round (column round, then diagonal round) on a 4-block set.
+    #[inline(always)]
+    unsafe fn double_round(v: &mut [uint32x4_t; 16], tbl: uint8x16_t) {
+        unsafe {
+            qr(v, 0, 4, 8, 12, tbl);
+            qr(v, 1, 5, 9, 13, tbl);
+            qr(v, 2, 6, 10, 14, tbl);
+            qr(v, 3, 7, 11, 15, tbl);
+            qr(v, 0, 5, 10, 15, tbl);
+            qr(v, 1, 6, 11, 12, tbl);
+            qr(v, 2, 7, 8, 13, tbl);
+            qr(v, 3, 4, 9, 14, tbl);
+        }
+    }
+
+    /// The initial state for blocks `ctr .. ctr + 4`, lane = block.
+    #[inline(always)]
+    unsafe fn init4(key: &[u32; 8], n: &[u32; 3], ctr: u32) -> [uint32x4_t; 16] {
+        unsafe {
+            let lanes = vld1q_u32([0u32, 1, 2, 3].as_ptr());
+            [
+                vdupq_n_u32(CONSTANTS[0]),
+                vdupq_n_u32(CONSTANTS[1]),
+                vdupq_n_u32(CONSTANTS[2]),
+                vdupq_n_u32(CONSTANTS[3]),
+                vdupq_n_u32(key[0]),
+                vdupq_n_u32(key[1]),
+                vdupq_n_u32(key[2]),
+                vdupq_n_u32(key[3]),
+                vdupq_n_u32(key[4]),
+                vdupq_n_u32(key[5]),
+                vdupq_n_u32(key[6]),
+                vdupq_n_u32(key[7]),
+                vaddq_u32(vdupq_n_u32(ctr), lanes),
+                vdupq_n_u32(n[0]),
+                vdupq_n_u32(n[1]),
+                vdupq_n_u32(n[2]),
+            ]
+        }
+    }
+
+    /// Feed-forward, transpose lane-major into four 64-byte blocks, and either
+    /// XOR them into `p` (`XOR`) or store the raw keystream there. `p` must
+    /// address 256 writable bytes.
+    #[inline(always)]
+    unsafe fn emit4<const XOR: bool>(v: &[uint32x4_t; 16], init: &[uint32x4_t; 16], p: *mut u8) {
+        unsafe {
+            for g in 0..4 {
+                let w0 = vaddq_u32(v[4 * g], init[4 * g]);
+                let w1 = vaddq_u32(v[4 * g + 1], init[4 * g + 1]);
+                let w2 = vaddq_u32(v[4 * g + 2], init[4 * g + 2]);
+                let w3 = vaddq_u32(v[4 * g + 3], init[4 * g + 3]);
+                // 4×4 transpose of 32-bit lanes: row i = words 4g..4g+4 of
+                // block i.
+                let t0 = vreinterpretq_u64_u32(vtrn1q_u32(w0, w1));
+                let t1 = vreinterpretq_u64_u32(vtrn2q_u32(w0, w1));
+                let t2 = vreinterpretq_u64_u32(vtrn1q_u32(w2, w3));
+                let t3 = vreinterpretq_u64_u32(vtrn2q_u32(w2, w3));
+                let rows = [
+                    vreinterpretq_u8_u64(vtrn1q_u64(t0, t2)),
+                    vreinterpretq_u8_u64(vtrn1q_u64(t1, t3)),
+                    vreinterpretq_u8_u64(vtrn2q_u64(t0, t2)),
+                    vreinterpretq_u8_u64(vtrn2q_u64(t1, t3)),
+                ];
+                for (i, r) in rows.iter().enumerate() {
+                    let q = p.add(64 * i + 16 * g);
+                    if XOR {
+                        vst1q_u8(q, veorq_u8(vld1q_u8(q), *r));
+                    } else {
+                        vst1q_u8(q, *r);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scrubs a key-bearing state set: `init[4..12]` is the key broadcast
+    /// across lanes and `v` the pre-feed-forward state (key-equivalent).
+    #[inline(always)]
+    unsafe fn wipe(v: &mut [uint32x4_t; 16], init: &mut [uint32x4_t; 16]) {
+        unsafe {
+            for (a, b) in v.iter_mut().zip(init.iter_mut()) {
+                *a = vdupq_n_u32(0);
+                *b = vdupq_n_u32(0);
+            }
+            let _ = core::hint::black_box(&*v);
+            let _ = core::hint::black_box(&*init);
+        }
+    }
+
+    /// Applies the keystream to as much of `buf` as the wide kernels cover
+    /// and returns `(bytes done, next block counter)`. The remainder is
+    /// under 128 bytes, left for the caller's scalar loop (for a tail that
+    /// short, a 4-wide pass would mostly compute discarded blocks).
+    pub(super) fn apply_keystream(
+        key: &[u32; 8],
+        nonce: &[u8; 12],
+        counter: u32,
+        buf: &mut [u8],
+    ) -> (usize, u32) {
+        // SAFETY: NEON is a baseline feature of every aarch64 target, and the
+        // kernel's pointer arithmetic stays inside `buf` and its own scratch.
+        unsafe { apply_keystream_neon(key, nonce, counter, buf) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn apply_keystream_neon(
+        key: &[u32; 8],
+        nonce: &[u8; 12],
+        counter: u32,
+        buf: &mut [u8],
+    ) -> (usize, u32) {
+        unsafe {
+            let n =
+                |o: usize| u32::from_le_bytes([nonce[o], nonce[o + 1], nonce[o + 2], nonce[o + 3]]);
+            let n = [n(0), n(4), n(8)];
+            #[rustfmt::skip]
+            let tbl = vld1q_u8([3u8, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14].as_ptr());
+
+            let mut ctr = counter;
+            let mut off = 0usize;
+            let base = buf.as_mut_ptr();
+            let len = buf.len();
+
+            // The two state sets live outside the loops so that one wipe at
+            // the end covers them; every pass fully overwrites them.
+            let mut ia = [vdupq_n_u32(0); 16];
+            let mut ib = [vdupq_n_u32(0); 16];
+            let mut a = ia;
+            let mut b = ib;
+
+            // Eight blocks per pass: two independent 4-block sets whose round
+            // computations interleave.
+            while off + 512 <= len {
+                ia = init4(key, &n, ctr);
+                ib = init4(key, &n, ctr.wrapping_add(4));
+                a = ia;
+                b = ib;
+                for _ in 0..10 {
+                    double_round(&mut a, tbl);
+                    double_round(&mut b, tbl);
+                }
+                emit4::<true>(&a, &ia, base.add(off));
+                emit4::<true>(&b, &ib, base.add(off + 256));
+                off += 512;
+                ctr = ctr.wrapping_add(8);
+            }
+            // One more full 4-block set, if it fits.
+            if off + 256 <= len {
+                ia = init4(key, &n, ctr);
+                a = ia;
+                for _ in 0..10 {
+                    double_round(&mut a, tbl);
+                }
+                emit4::<true>(&a, &ia, base.add(off));
+                off += 256;
+                ctr = ctr.wrapping_add(4);
+            }
+            // Tail of 128..256 bytes: generate a 4-block set into scratch and
+            // XOR what is needed. Blocks past the end of `buf` are computed
+            // and discarded, so the counter wrap they could incur is harmless.
+            if off + 128 <= len {
+                ia = init4(key, &n, ctr);
+                a = ia;
+                for _ in 0..10 {
+                    double_round(&mut a, tbl);
+                }
+                let mut ks = [0u8; 256];
+                emit4::<false>(&a, &ia, ks.as_mut_ptr());
+                let used = len - off;
+                for (dst, k) in buf[off..].iter_mut().zip(ks.iter()) {
+                    *dst ^= *k;
+                }
+                // Raw keystream for this key: same `black_box` barrier as the
+                // scalar path (per-call, so not `Zeroize` — see `wipe_words`).
+                ks = [0u8; 256];
+                let _ = core::hint::black_box(&ks);
+                off = len;
+                ctr = ctr.wrapping_add(used.div_ceil(64) as u32);
+            }
+            wipe(&mut a, &mut ia);
+            wipe(&mut b, &mut ib);
+            (off, ctr)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
+
+    /// The NEON 2×4-way keystream must equal the scalar block path for every
+    /// length in `0..=1024` (partial blocks, partial 4- and 8-block groups)
+    /// plus larger buffers, across counter values near the 32-bit boundary.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar() {
+        use alloc::vec::Vec;
+        let key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
+        let nonce: [u8; 12] = core::array::from_fn(|i| (i as u8).wrapping_mul(5).wrapping_add(3));
+        let c = ChaCha20::new(&key);
+        for len in (0usize..=1024).chain([1500, 4096 + 7, 65536 + 33]) {
+            for &ctr in &[0u32, 1, 100, u32::MAX - 20] {
+                if (ctr as u64) + (len.div_ceil(64) as u64) > u64::from(u32::MAX) + 1 {
+                    continue;
+                }
+                let base: Vec<u8> = (0..len).map(|i| (i * 31 + 9) as u8).collect();
+                let mut scalar = base.clone();
+                let mut bc = ctr;
+                for block in scalar.chunks_mut(64) {
+                    let ks = c.block(&nonce, bc);
+                    for (b, k) in block.iter_mut().zip(ks.iter()) {
+                        *b ^= *k;
+                    }
+                    bc = bc.wrapping_add(1);
+                }
+                // The kernel directly, with its scalar-finished tail: it must
+                // report the right resume point and leave under 128 bytes.
+                let mut w = base.clone();
+                let (done, mut next) = super::neon::apply_keystream(&c.key, &nonce, ctr, &mut w);
+                assert!(len - done < 128, "neon tail len={len} done={done}");
+                assert_eq!(next, ctr.wrapping_add(done.div_ceil(64) as u32));
+                for block in w[done..].chunks_mut(64) {
+                    let ks = c.block(&nonce, next);
+                    for (b, k) in block.iter_mut().zip(ks.iter()) {
+                        *b ^= *k;
+                    }
+                    next = next.wrapping_add(1);
+                }
+                assert_eq!(w, scalar, "neon len={len} ctr={ctr}");
+                let mut d = base.clone();
+                c.apply_keystream(&nonce, ctr, &mut d);
+                assert_eq!(d, scalar, "dispatch len={len} ctr={ctr}");
+            }
+        }
+    }
 
     #[test]
     fn rfc8439_block_function() {
