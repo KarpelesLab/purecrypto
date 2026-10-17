@@ -138,12 +138,16 @@ fn drive_handshake(conn: &mut Connection, sock: &mut TcpStream) -> Result<(), St
     }
 }
 
-/// purecrypto **client** ↔ `openssl s_server -www`.
+/// purecrypto **client** ↔ `openssl s_server -www`. `cert_der` is the
+/// server's (self-signed) certificate: it is the client's trust anchor, so
+/// the handshake is verified like a real one — chain, name and all — not
+/// run with verification off.
 fn pc_client_vs_openssl_server(
     version: ProtocolVersion,
     suite: u16,
     cert_path: &str,
     key_path: &str,
+    cert_der: &[u8],
 ) -> Result<String, String> {
     let port = free_port();
     let mut server: Child = Command::new(openssl_bin())
@@ -173,6 +177,13 @@ fn pc_client_vs_openssl_server(
     })?;
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
+    // Trust exactly the certificate the server was started with; its CN is
+    // the name the client asks for (`main` issues it without a SAN, so the
+    // verifier's common-name fallback is what matches it).
+    let mut roots = RootCertStore::new();
+    roots
+        .add_der(cert_der.to_vec())
+        .map_err(|e| format!("trust anchor: {e:?}"))?;
     let cfg = Config::builder()
         .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
@@ -182,9 +193,8 @@ fn pc_client_vs_openssl_server(
         // RFC 7627 is undefined for SSL 3.0, so the (default) extended-master-
         // secret requirement must be lifted there; TLS 1.0/1.1 negotiate it.
         .require_extended_master_secret(version != ProtocolVersion::SSLv3)
-        .roots(RootCertStore::new())
+        .roots(roots)
         .server_name("interop.example")
-        .verify_certificates(false)
         .build();
     let mut conn = Connection::client(&cfg).map_err(|e| format!("client cfg: {e:?}"))?;
 
@@ -399,6 +409,7 @@ fn main() {
             suite,
             cert_path.to_str().unwrap(),
             key_path.to_str().unwrap(),
+            &cert_der,
         ) {
             Ok(info) => println!("PASS  pc-client  <-> openssl-server  {label}  ({info})"),
             Err(e) => {
