@@ -19,7 +19,9 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_array, wipe_vec};
+use super::common::{
+    PcStatus, guard, out_write, settle_out_len, slice, wipe_array, wipe_vec, zero_out,
+};
 use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::{
@@ -1006,7 +1008,10 @@ pub unsafe extern "C" fn pc_tls_pop(
             None => handle.inner.pop().unwrap_or_default(),
         };
         let st = unsafe { out_write(&bytes, wire_out, out_len) };
-        if st != PcStatus::Ok {
+        // Keep an undelivered chunk for the next call; an empty one
+        // (nothing was popped) must not be stashed, or the next call would
+        // report 0 bytes once before serving what the engine has by then.
+        if st != PcStatus::Ok && !bytes.is_empty() {
             handle.pending_pop = Some(bytes);
         }
         st
@@ -1178,10 +1183,10 @@ pub unsafe extern "C" fn pc_tls_is_handshake_complete(tls: *const PcTls) -> i32 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_tls_negotiated_version(tls: *const PcTls, out: *mut u16) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(out) };
         if tls.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { *out = 0 };
         let v = unsafe { &*tls }
             .inner
             .negotiated_version()
@@ -1209,10 +1214,10 @@ pub unsafe extern "C" fn pc_tls_negotiated_cipher_suite(
     out: *mut u16,
 ) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(out) };
         if tls.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { *out = 0 };
         let v = unsafe { &*tls }
             .inner
             .negotiated_cipher_suite()
@@ -1239,10 +1244,10 @@ pub unsafe extern "C" fn pc_tls_peer_signature_scheme(
     out: *mut u16,
 ) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(out) };
         if tls.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { *out = 0 };
         let v = unsafe { &*tls }.inner.peer_signature_scheme().unwrap_or(0);
         unsafe { *out = v };
         PcStatus::Ok
@@ -1288,10 +1293,10 @@ pub unsafe extern "C" fn pc_tls_negotiated_cipher_suite_name(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_tls_negotiated_group(tls: *const PcTls, out: *mut u16) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(out) };
         if tls.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { *out = 0 };
         let v = unsafe { &*tls }
             .inner
             .negotiated_group()
@@ -1438,13 +1443,13 @@ pub unsafe extern "C" fn pc_dtls_next_timeout(
     has_timeout: *mut i32,
 ) -> PcStatus {
     guard(|| {
+        unsafe {
+            zero_out(seconds_out);
+            zero_out(nanos_out);
+            zero_out(has_timeout);
+        }
         if tls.is_null() || seconds_out.is_null() || nanos_out.is_null() || has_timeout.is_null() {
             return PcStatus::NullPointer;
-        }
-        unsafe {
-            *seconds_out = 0;
-            *nanos_out = 0;
-            *has_timeout = 0;
         }
         let conn = unsafe { &*tls };
         let v = conn.inner.negotiated_version();
@@ -1550,11 +1555,9 @@ pub unsafe extern "C" fn pc_dtls_handshake_flight_pending(
     pending: *mut i32,
 ) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(pending) };
         if tls.is_null() || pending.is_null() {
             return PcStatus::NullPointer;
-        }
-        unsafe {
-            *pending = 0;
         }
         let conn = unsafe { &*tls };
         let v = conn.inner.negotiated_version();
@@ -1645,11 +1648,9 @@ pub unsafe extern "C" fn pc_dtls_datagram_allows_peer_address_update(
     allowed: *mut i32,
 ) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(allowed) };
         if tls.is_null() || allowed.is_null() {
             return PcStatus::NullPointer;
-        }
-        unsafe {
-            *allowed = 0;
         }
         let conn = unsafe { &*tls };
         if !matches!(
@@ -1731,6 +1732,7 @@ pub unsafe extern "C" fn pc_dtls_spare_connection_ids(
     count: *mut usize,
 ) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(count) };
         if tls.is_null() || count.is_null() {
             return PcStatus::NullPointer;
         }

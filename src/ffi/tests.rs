@@ -3002,6 +3002,171 @@ fn quic_cfg_set_versions_caps_the_count_before_reading() {
     unsafe { quic::pc_quic_free(q) };
 }
 
+/// The header promises that every non-NULL scalar out-parameter is 0 on
+/// every non-OK status, including `PC_NULL_POINTER` for a *different*
+/// argument. Each getter is called with a NULL handle and sentinel-filled
+/// outputs; all of them must come back as 0.
+#[test]
+fn scalar_out_params_are_zeroed_when_the_handle_is_null() {
+    const S16: u16 = 0xA5A5;
+    const S32: i32 = -0x5A5A_5A5B;
+    const SU32: u32 = 0xA5A5_A5A5;
+    const S64: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+    const SZ: usize = usize::MAX;
+    let tls_null: *mut tls::PcTls = core::ptr::null_mut();
+    let quic_null: *mut quic::PcQuic = core::ptr::null_mut();
+
+    // TLS: u16 getters.
+    type TlsU16 = unsafe extern "C" fn(*const tls::PcTls, *mut u16) -> PcStatus;
+    let u16_getters: [(&str, TlsU16); 4] = [
+        ("negotiated_version", tls::pc_tls_negotiated_version),
+        (
+            "negotiated_cipher_suite",
+            tls::pc_tls_negotiated_cipher_suite,
+        ),
+        ("peer_signature_scheme", tls::pc_tls_peer_signature_scheme),
+        ("negotiated_group", tls::pc_tls_negotiated_group),
+    ];
+    for (name, get) in u16_getters {
+        let mut out = S16;
+        assert_eq!(
+            unsafe { get(tls_null, &mut out) },
+            PcStatus::NullPointer,
+            "{name}"
+        );
+        assert_eq!(out, 0, "{name} left its out-param unwritten");
+    }
+    // TLS: i32 DTLS getters.
+    type TlsI32 = unsafe extern "C" fn(*const tls::PcTls, *mut i32) -> PcStatus;
+    let i32_getters: [(&str, TlsI32); 2] = [
+        (
+            "dtls_handshake_flight_pending",
+            tls::pc_dtls_handshake_flight_pending,
+        ),
+        (
+            "dtls_datagram_allows_peer_address_update",
+            tls::pc_dtls_datagram_allows_peer_address_update,
+        ),
+    ];
+    for (name, get) in i32_getters {
+        let mut out = S32;
+        assert_eq!(
+            unsafe { get(tls_null, &mut out) },
+            PcStatus::NullPointer,
+            "{name}"
+        );
+        assert_eq!(out, 0, "{name} left its out-param unwritten");
+    }
+    {
+        let (mut s, mut ns, mut has) = (S64, SU32, S32);
+        assert_eq!(
+            unsafe { tls::pc_dtls_next_timeout(tls_null, &mut s, &mut ns, &mut has) },
+            PcStatus::NullPointer
+        );
+        assert_eq!((s, ns, has), (0, 0, 0), "dtls_next_timeout");
+        // One NULL output among several: the others are still zeroed.
+        let (mut s, mut has) = (S64, S32);
+        assert_eq!(
+            unsafe { tls::pc_dtls_next_timeout(tls_null, &mut s, core::ptr::null_mut(), &mut has) },
+            PcStatus::NullPointer
+        );
+        assert_eq!((s, has), (0, 0), "dtls_next_timeout with a NULL nanos");
+        let mut count = SZ;
+        assert_eq!(
+            unsafe { tls::pc_dtls_spare_connection_ids(tls_null, &mut count) },
+            PcStatus::NullPointer
+        );
+        assert_eq!(count, 0, "dtls_spare_connection_ids");
+    }
+
+    // QUIC: i32 getters.
+    type QuicI32 = unsafe extern "C" fn(*const quic::PcQuic, *mut i32) -> PcStatus;
+    let quic_i32: [(&str, QuicI32); 3] = [
+        ("version", quic::pc_quic_version),
+        ("is_handshake_complete", quic::pc_quic_is_handshake_complete),
+        ("is_closed", quic::pc_quic_is_closed),
+    ];
+    for (name, get) in quic_i32 {
+        let mut out = S32;
+        assert_eq!(
+            unsafe { get(quic_null, &mut out) },
+            PcStatus::NullPointer,
+            "{name}"
+        );
+        assert_eq!(out, 0, "quic {name} left its out-param unwritten");
+    }
+    // QUIC: stream-id openers.
+    type QuicU64 = unsafe extern "C" fn(*mut quic::PcQuic, *mut u64) -> PcStatus;
+    let openers: [(&str, QuicU64); 2] = [
+        ("open_bidi", quic::pc_quic_open_bidi),
+        ("open_uni", quic::pc_quic_open_uni),
+    ];
+    for (name, open) in openers {
+        let mut id = S64;
+        assert_eq!(
+            unsafe { open(quic_null, &mut id) },
+            PcStatus::NullPointer,
+            "{name}"
+        );
+        assert_eq!(id, 0, "quic {name} left its out-param unwritten");
+    }
+    {
+        let (mut s, mut ns, mut has) = (S64, SU32, S32);
+        assert_eq!(
+            unsafe { quic::pc_quic_next_timeout(quic_null, &mut s, &mut ns, &mut has) },
+            PcStatus::NullPointer
+        );
+        assert_eq!((s, ns, has), (0, 0, 0), "quic_next_timeout");
+
+        let data = [0u8; 4];
+        let mut written = SZ;
+        assert_eq!(
+            unsafe { quic::pc_quic_stream_write(quic_null, 0, data.as_ptr(), 4, &mut written) },
+            PcStatus::NullPointer
+        );
+        assert_eq!(written, 0, "quic_stream_write written_out");
+
+        let mut cap = SZ;
+        assert_eq!(
+            unsafe { quic::pc_quic_stream_send_capacity(quic_null, 0, &mut cap) },
+            PcStatus::NullPointer
+        );
+        assert_eq!(cap, 0, "quic_stream_send_capacity");
+
+        let mut buf = [0u8; 8];
+        let mut out_len = buf.len();
+        let mut fin = S32;
+        assert_eq!(
+            unsafe {
+                quic::pc_quic_stream_read(quic_null, 0, buf.as_mut_ptr(), &mut out_len, &mut fin)
+            },
+            PcStatus::NullPointer
+        );
+        assert_eq!(
+            (out_len, fin),
+            (0, 0),
+            "quic_stream_read out_len / fin_seen"
+        );
+
+        let (mut code, mut initiator, mut is_app) = (S64, S32, S32);
+        let mut reason_len = 0usize;
+        assert_eq!(
+            unsafe {
+                quic::pc_quic_close_info(
+                    quic_null,
+                    &mut code,
+                    &mut initiator,
+                    &mut is_app,
+                    core::ptr::null_mut(),
+                    &mut reason_len,
+                )
+            },
+            PcStatus::NullPointer
+        );
+        assert_eq!((code, initiator, is_app), (0, 0, 0), "quic_close_info");
+    }
+}
+
 /// `pc_malloc` memory is handed to the entry points as `size_t *` /
 /// `uint16_t *` / `int32_t *` out-parameters by the wasm glue, so it must be
 /// aligned for any of them; 16 is the documented guarantee.
@@ -3027,4 +3192,71 @@ fn pc_malloc_is_16_byte_aligned() {
         unsafe { super::pc_free(p, n) };
     }
     unsafe { super::pc_free(core::ptr::null_mut(), 16) };
+}
+
+/// A `pc_tls_pop` size query that is itself a caller error (NULL `out_len`)
+/// when nothing is queued must not leave an *empty* pending chunk behind:
+/// the next pop has to serve the engine's real output, not a phantom 0.
+#[test]
+fn tls_pop_with_null_out_len_does_not_stash_an_empty_chunk() {
+    let (chain_pem, key_pem) = loopback_identity();
+    let scfg = tls::pc_tls_cfg_new(1 /* server */, 0x0304);
+    assert!(!scfg.is_null());
+    assert_eq!(
+        unsafe {
+            tls::pc_tls_cfg_set_certificate(
+                scfg,
+                chain_pem.as_ptr(),
+                chain_pem.len(),
+                key_pem.as_ptr(),
+                key_pem.len(),
+            )
+        },
+        PcStatus::Ok
+    );
+    let server = unsafe { tls::pc_tls_new(scfg) };
+    unsafe { tls::pc_tls_cfg_free(scfg) };
+    assert!(!server.is_null());
+
+    let ccfg = tls::pc_tls_cfg_new(0 /* client */, 0x0304);
+    assert!(!ccfg.is_null());
+    unsafe {
+        assert_eq!(
+            tls::pc_tls_cfg_set_verify_certificates(ccfg, 0),
+            PcStatus::Ok
+        );
+        let sni = b"loopback.example\0";
+        assert_eq!(
+            tls::pc_tls_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char),
+            PcStatus::Ok
+        );
+    }
+    let client = unsafe { tls::pc_tls_new(ccfg) };
+    unsafe { tls::pc_tls_cfg_free(ccfg) };
+    assert!(!client.is_null());
+
+    // The server has nothing to send yet; a pop with a NULL out_len is a
+    // caller error and produces nothing to keep.
+    assert_eq!(
+        unsafe { tls::pc_tls_pop(server, core::ptr::null_mut(), core::ptr::null_mut()) },
+        PcStatus::NullPointer
+    );
+    // Now give it the ClientHello: its first flight must be the very next
+    // thing popped (before the fix: one bogus "0 bytes" answer first).
+    unsafe {
+        let _ = tls::pc_tls_handshake(client);
+        pump_wire(client, server);
+        let _ = tls::pc_tls_handshake(server);
+    }
+    let mut len = 0usize;
+    assert_eq!(
+        unsafe { tls::pc_tls_pop(server, core::ptr::null_mut(), &mut len) },
+        PcStatus::BufferTooSmall
+    );
+    assert!(len > 0, "server flight must be served by the first pop");
+
+    unsafe {
+        tls::pc_tls_free(client);
+        tls::pc_tls_free(server);
+    }
 }

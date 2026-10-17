@@ -202,6 +202,23 @@ pub(super) unsafe fn settle_out_len(out_len: *mut usize, st: PcStatus) -> PcStat
     st
 }
 
+/// Writes `T::default()` — 0 for every scalar out-parameter type — through
+/// `p` unless it is NULL. Entry points call this on each scalar
+/// out-parameter *before* their NULL checks on the handle and the other
+/// arguments, so the header's out-parameter contract ("every non-NULL
+/// scalar out-parameter is 0 on every non-OK status") also holds when the
+/// `NullPointer` is for a *different* argument, and when the body panics
+/// (`Internal`) before writing the real value. A NULL `p` is left alone:
+/// the entry point answers `NullPointer` for it and has nowhere to write.
+///
+/// # Safety
+/// `p` is NULL or points to a writable `T`.
+pub(super) unsafe fn zero_out<T: Default>(p: *mut T) {
+    if !p.is_null() {
+        unsafe { p.write(T::default()) };
+    }
+}
+
 /// Overwrites `buf` with zeros through [`crate::zeroize::Zeroize`] (volatile
 /// stores plus a compiler fence, so LLVM cannot eliminate the writes as dead
 /// stores). Used to scrub recovered plaintext / shared secrets before their

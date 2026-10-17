@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec, zero_out};
 use super::tls::{PcKey, parse_private_key_pem};
 use crate::quic::{
     CloseInitiator, CloseKind, QuicConfig, QuicConnection, QuicVersion, Role as QuicRole, StreamId,
@@ -530,6 +530,7 @@ pub unsafe extern "C" fn pc_quic_cfg_set_versions(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_quic_version(q: *const PcQuic, out: *mut i32) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(out) };
         if q.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
@@ -714,7 +715,10 @@ pub unsafe extern "C" fn pc_quic_pop_datagram(
             None => handle.inner.pop_datagram(),
         };
         let st = unsafe { out_write(&dg, out, out_len) };
-        if st != PcStatus::Ok {
+        // Keep an undelivered datagram for the next call; an empty one
+        // (nothing was popped) must not be stashed, or the next call would
+        // report 0 bytes once before serving what the engine has by then.
+        if st != PcStatus::Ok && !dg.is_empty() {
             handle.pending_pop = Some(dg);
         }
         st
@@ -766,12 +770,12 @@ pub unsafe extern "C" fn pc_quic_is_handshake_complete(
     out: *mut i32,
 ) -> PcStatus {
     guard(|| {
+        // Written before anything is checked, so a NULL `q` or a caught
+        // panic (`Internal`) still leaves a defined `*out`.
+        unsafe { zero_out(out) };
         if q.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
-        // Written before the engine is consulted, so a caught panic
-        // (`Internal`) still leaves a defined `*out`.
-        unsafe { *out = 0 };
         unsafe {
             *out = if (*q).inner.is_handshake_complete() {
                 1
@@ -800,13 +804,13 @@ pub unsafe extern "C" fn pc_quic_next_timeout(
     has_timeout: *mut i32,
 ) -> PcStatus {
     guard(|| {
+        unsafe {
+            zero_out(seconds_out);
+            zero_out(nanos_out);
+            zero_out(has_timeout);
+        }
         if q.is_null() || seconds_out.is_null() || nanos_out.is_null() || has_timeout.is_null() {
             return PcStatus::NullPointer;
-        }
-        unsafe {
-            *seconds_out = 0;
-            *nanos_out = 0;
-            *has_timeout = 0;
         }
         let conn = unsafe { &*q };
         match conn.inner.next_timeout() {
@@ -857,10 +861,10 @@ pub unsafe extern "C" fn pc_quic_on_timeout(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_quic_open_bidi(q: *mut PcQuic, id_out: *mut u64) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(id_out) };
         if q.is_null() || id_out.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { *id_out = 0 };
         let conn = &mut unsafe { &mut *q }.inner;
         if let Some(st) = closed_status(conn) {
             return st;
@@ -884,10 +888,10 @@ pub unsafe extern "C" fn pc_quic_open_bidi(q: *mut PcQuic, id_out: *mut u64) -> 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_quic_open_uni(q: *mut PcQuic, id_out: *mut u64) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(id_out) };
         if q.is_null() || id_out.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { *id_out = 0 };
         let conn = &mut unsafe { &mut *q }.inner;
         if let Some(st) = closed_status(conn) {
             return st;
@@ -918,10 +922,10 @@ pub unsafe extern "C" fn pc_quic_stream_write(
     written_out: *mut usize,
 ) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(written_out) };
         if q.is_null() || written_out.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { *written_out = 0 };
         let Some(b) = (unsafe { slice(data, len) }) else {
             return PcStatus::NullPointer;
         };
@@ -958,10 +962,10 @@ pub unsafe extern "C" fn pc_quic_stream_send_capacity(
     out: *mut usize,
 ) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(out) };
         if q.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { *out = 0 };
         let conn = &unsafe { &*q }.inner;
         if let Some(st) = closed_status(conn) {
             return st;
@@ -1018,12 +1022,12 @@ pub unsafe extern "C" fn pc_quic_stream_read(
     fin_seen: *mut i32,
 ) -> PcStatus {
     let st = guard(|| {
+        // Defined on every path: `settle_out_len` below resets `*out_len`
+        // on error, and `*fin_seen` is rewritten only on success.
+        unsafe { zero_out(fin_seen) };
         if q.is_null() || out_len.is_null() || fin_seen.is_null() {
             return PcStatus::NullPointer;
         }
-        // Defined on every path from here on: `settle_out_len` below resets
-        // `*out_len` on error, and `*fin_seen` is rewritten only on success.
-        unsafe { *fin_seen = 0 };
         let cap = unsafe { *out_len };
         // Cap the caller-controlled capacity to defend against a
         // pathological / hostile `*out_len`. 1 MiB matches the largest
@@ -1245,10 +1249,10 @@ pub unsafe extern "C" fn pc_quic_close(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_quic_is_closed(q: *const PcQuic, out: *mut i32) -> PcStatus {
     guard(|| {
+        unsafe { zero_out(out) };
         if q.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { *out = 0 };
         unsafe { *out = i32::from((*q).inner.is_closed()) };
         PcStatus::Ok
     })
@@ -1277,6 +1281,13 @@ pub unsafe extern "C" fn pc_quic_close_info(
     reason_len: *mut usize,
 ) -> PcStatus {
     let st = guard(|| {
+        // Defined on every path: a NULL argument, `WantRead` (nothing to
+        // report yet) and `BufferTooSmall` leave all three at 0.
+        unsafe {
+            zero_out(code_out);
+            zero_out(initiator_out);
+            zero_out(is_app_out);
+        }
         if q.is_null()
             || code_out.is_null()
             || initiator_out.is_null()
@@ -1284,13 +1295,6 @@ pub unsafe extern "C" fn pc_quic_close_info(
             || reason_len.is_null()
         {
             return PcStatus::NullPointer;
-        }
-        // Defined on every path: `WantRead` (nothing to report yet) and
-        // `BufferTooSmall` leave all three at 0.
-        unsafe {
-            *code_out = 0;
-            *initiator_out = 0;
-            *is_app_out = 0;
         }
         let Some(info) = unsafe { &*q }.inner.close_info() else {
             return PcStatus::WantRead;
