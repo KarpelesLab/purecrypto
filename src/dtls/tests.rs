@@ -718,6 +718,108 @@ fn dtls12_plaintext_handshake_record(msg_type: u8, message_seq: u16, body: &[u8]
     rec
 }
 
+/// A no-cookie DTLS 1.2 pair driven until the client has queued its final
+/// flight, returned undelivered: `[ClientKeyExchange (epoch 0), CCS (epoch
+/// 0), Finished (epoch 1)]`. With no cookie exchange the ClientHello is
+/// `message_seq` 0, so the ClientKeyExchange is 1 and the Finished 2; the
+/// server's `ServerHello .. ServerHelloDone` are 0..3, so its Finished is 4.
+fn no_cookie_pair_until_client_flight_12() -> (
+    DtlsClientConnection12,
+    DtlsServerConnection12<HmacDrbg<Sha256>>,
+    Vec<Vec<u8>>,
+) {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-planted", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    let flight = client.pop_outbound_datagrams();
+    assert_eq!(flight.len(), 3, "ClientKeyExchange, CCS, Finished");
+    assert_eq!(
+        flight[0][13],
+        crate::tls::codec::hs_type::CLIENT_KEY_EXCHANGE
+    );
+    assert_eq!(flight[1][0], 20);
+    (client, server, flight)
+}
+
+/// Both sides established and exchanging data, and nothing was torn down.
+fn assert_connected_both_ways_12<R: crate::rng::RngCore>(
+    client: &mut DtlsClientConnection12,
+    server: &mut DtlsServerConnection12<R>,
+) {
+    assert!(client.is_handshake_complete() && server.is_handshake_complete());
+    client.send(b"ping").unwrap();
+    for dg in client.pop_outbound_datagrams() {
+        server.feed_datagram(&dg).unwrap();
+    }
+    assert_eq!(server.take_received(), b"ping");
+    server.send(b"pong").unwrap();
+    for dg in server.pop_outbound_datagrams() {
+        client.feed_datagram(&dg).unwrap();
+    }
+    assert_eq!(client.take_received(), b"pong");
+}
+
+/// Regression (off-path one-datagram kill of an established connection):
+/// a spoofed plaintext handshake message buffered at `Finished.seq + 1`
+/// (or any later slot within the reassembler's look-ahead) used to be
+/// popped by the drain loop right after the genuine Finished dispatched,
+/// in the `Connected` state and under the authenticated record's error
+/// policy — a fatal `UnexpectedMessage` for the server. DTLS 1.2 has no
+/// handshake messages after the Finished (renegotiation is refused), so
+/// whatever is still buffered when the handshake completes is spoofed and
+/// must be discarded. One plant lands before the client's CCS and one
+/// after it (both windows are plaintext).
+#[test]
+fn planted_future_fragments_do_not_kill_server_after_finished_12() {
+    let (mut client, mut server, flight) = no_cookie_pair_until_client_flight_12();
+    server.feed_datagram(&flight[0]).unwrap();
+    let plant = |seq: u16| {
+        dtls12_plaintext_handshake_record(crate::tls::codec::hs_type::CERTIFICATE, seq, &[0u8; 3])
+    };
+    server.feed_datagram(&plant(3)).unwrap();
+    server.feed_datagram(&flight[1]).unwrap();
+    server.feed_datagram(&plant(5)).unwrap();
+    server
+        .feed_datagram(&flight[2])
+        .expect("the planted fragments must not be fatal after the Finished");
+    assert!(server.is_handshake_complete());
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert_connected_both_ways_12(&mut client, &mut server);
+}
+
+/// The client-side twin of the test above: plants at `Finished.seq + 1`
+/// and `+ 3` before the server's Finished, one on each side of its CCS.
+#[test]
+fn planted_future_fragments_do_not_kill_client_after_finished_12() {
+    let (mut client, mut server, flight) = no_cookie_pair_until_client_flight_12();
+    for dg in &flight {
+        server.feed_datagram(dg).unwrap();
+    }
+    let sflight = server.pop_outbound_datagrams();
+    assert_eq!(sflight.len(), 2, "CCS, Finished");
+    let plant = |seq: u16| {
+        dtls12_plaintext_handshake_record(crate::tls::codec::hs_type::CERTIFICATE, seq, &[0u8; 3])
+    };
+    client.feed_datagram(&plant(5)).unwrap();
+    client.feed_datagram(&sflight[0]).unwrap();
+    client.feed_datagram(&plant(7)).unwrap();
+    client
+        .feed_datagram(&sflight[1])
+        .expect("the planted fragments must not be fatal after the Finished");
+    assert_connected_both_ways_12(&mut client, &mut server);
+}
+
 /// Regression (off-path one-datagram DoS / handshake derail): once the DTLS
 /// 1.2 client has consumed its (genuine) HelloVerifyRequest, a SECOND HVR —
 /// duplicate or off-path spoofed — must be IGNORED. A real HVR resets the

@@ -1840,6 +1840,19 @@ impl DtlsClientConnection12 {
             self.final_flight = Some(flight);
             self.final_flight_resends = 0;
         }
+        // The handshake is over, and DTLS 1.2 has no handshake message
+        // after the Finished (renegotiation is refused): anything still in
+        // the reassembler is a spoofed plaintext fragment planted at a
+        // later `message_seq` while the flight was in progress. Left
+        // there, the drain loop that just dispatched the Finished would
+        // pop it next, in `Connected`, under the authenticated record's
+        // error policy — a fatal `UnexpectedMessage`, i.e. an off-path
+        // one-datagram kill of an established connection. Discard it all;
+        // `expected_msg_seq` is kept, so a genuine (authenticated)
+        // handshake message after this point is still a fatal peer fault
+        // and a retransmitted Finished is still recognised before the
+        // reassembler (`on_retransmitted_server_finished`).
+        self.reassembler.clear();
         self.state = State::Connected;
         Ok(())
     }

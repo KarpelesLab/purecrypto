@@ -2390,7 +2390,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.client_finished = Some(client_fin);
         self.final_flight = Some(flight);
         self.final_flight_resends = 0;
-        self.state = State::Connected;
+        self.connected();
         Ok(())
     }
 }
@@ -2509,8 +2509,28 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         }
         self.transcript.update(raw);
         self.retransmit.on_peer_response();
-        self.state = State::Connected;
+        self.connected();
         Ok(())
+    }
+
+    /// The client's Finished verified: the handshake is over.
+    ///
+    /// DTLS 1.2 has no handshake message after the Finished (renegotiation
+    /// is refused), so anything still sitting in the reassembler is a
+    /// spoofed plaintext fragment planted at a later `message_seq` while
+    /// the flight was in progress. Left there, the drain loop that just
+    /// dispatched the Finished would pop it next, in `Connected`, under
+    /// the authenticated record's error policy — a fatal
+    /// `UnexpectedMessage`, i.e. an off-path one-datagram kill of an
+    /// established connection. Discard it all. `expected_msg_seq` is kept:
+    /// a genuine (authenticated) handshake message after this point is a
+    /// peer fault and stays fatal; a retransmitted Finished is recognised
+    /// before the reassembler (`on_retransmitted_client_finished`).
+    fn connected(&mut self) {
+        if let Some(r) = self.reassembler.as_mut() {
+            r.clear();
+        }
+        self.state = State::Connected;
     }
 
     /// Appends an RFC 5077 NewSessionTicket to the final flight: the
