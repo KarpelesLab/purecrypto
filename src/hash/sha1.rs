@@ -178,6 +178,10 @@ impl Digest for Sha1 {
     ) -> bool {
         inner.state.hmac_iterate(&outer.state, u, acc, rounds)
     }
+    #[inline]
+    fn hmac_short(inner: &Self, outer: &Self, parts: &[&[u8]]) -> Option<[u8; 20]> {
+        inner.state.hmac_short(&outer.state, parts)
+    }
 
     #[inline]
     fn finalize(self) -> [u8; 20] {

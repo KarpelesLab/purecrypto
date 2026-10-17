@@ -227,6 +227,33 @@ impl State512 {
         true
     }
 
+    /// [`Digest::hmac_short`] for an `N`-byte digest: the inner state must
+    /// hold exactly its pad block plus whatever short message is buffered,
+    /// the outer state exactly its pad block.
+    fn hmac_short<const N: usize>(&self, outer: &Self, parts: &[&[u8]]) -> Option<[u8; N]> {
+        if self.msg_len != 128 + self.block_len as u128
+            || outer.block_len != 0
+            || outer.msg_len != 128
+        {
+            return None;
+        }
+        super::hmac::hmac_short_with::<_, 128, N>(
+            (&self.h, &outer.h),
+            &self.block[..self.block_len],
+            parts,
+            111,
+            compress512,
+            |h, out| {
+                // Truncated variants keep a partial last word (SHA-512/224).
+                for (o, w) in out.chunks_mut(8).zip(h.iter()) {
+                    o.copy_from_slice(&w.to_be_bytes()[..o.len()]);
+                }
+            },
+            // The 128-bit length field's high half is always zero here.
+            |bits, block| block[112..].copy_from_slice(&(bits as u128).to_be_bytes()),
+        )
+    }
+
     /// Applies SHA-2 padding and returns the final state words.
     fn finalize(mut self) -> [u64; 8] {
         // 128-bit big-endian bit length occupies the last 16 bytes.
@@ -402,6 +429,10 @@ macro_rules! sha512_variant {
                 rounds: u32,
             ) -> bool {
                 inner.state.hmac_iterate(&outer.state, u, acc, rounds)
+            }
+            #[inline]
+            fn hmac_short(inner: &Self, outer: &Self, parts: &[&[u8]]) -> Option<[u8; $out]> {
+                inner.state.hmac_short(&outer.state, parts)
             }
 
             #[inline]

@@ -75,15 +75,30 @@ pub fn try_hkdf_expand_parts<D: Digest>(
     let mut filled = 0;
 
     while filled < out.len() {
-        let mut mac = prf.clone();
-        if has_prev {
-            mac.update(prev.as_ref());
-        }
-        for part in info {
-            mac.update(part);
-        }
-        mac.update(&[counter]);
-        prev = mac.finalize();
+        // T(i) = HMAC(PRK, T(i-1) ‖ info ‖ i) on the keyed state's
+        // short-message path when it fits one block (up to eight `info`
+        // parts; more is streamed).
+        let ctr = [counter];
+        let next = if info.len() <= 8 {
+            let mut parts: [&[u8]; 10] = [&[]; 10];
+            if has_prev {
+                parts[0] = prev.as_ref();
+            }
+            parts[1..1 + info.len()].copy_from_slice(info);
+            parts[1 + info.len()] = &ctr;
+            prf.mac_parts(&parts[..info.len() + 2])
+        } else {
+            let mut mac = prf.clone();
+            if has_prev {
+                mac.update(prev.as_ref());
+            }
+            for part in info {
+                mac.update(part);
+            }
+            mac.update(&ctr);
+            mac.finalize()
+        };
+        prev = next;
         has_prev = true;
 
         let block = prev.as_ref();
@@ -133,13 +148,11 @@ pub fn try_hkdf_expand<D: Digest>(
     let mut filled = 0;
 
     while filled < out.len() {
-        let mut mac = prf.clone();
-        if has_prev {
-            mac.update(prev.as_ref());
-        }
-        mac.update(info);
-        mac.update(&[counter]);
-        prev = mac.finalize();
+        // T(i) = HMAC(PRK, T(i-1) ‖ info ‖ i), on the keyed state's
+        // short-message path when it fits one block.
+        let ctr = [counter];
+        let next = prf.mac_parts(&[if has_prev { prev.as_ref() } else { &[] }, info, &ctr]);
+        prev = next;
         has_prev = true;
 
         let block = prev.as_ref();

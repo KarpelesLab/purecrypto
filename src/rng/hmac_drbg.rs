@@ -95,24 +95,39 @@ impl<D: Digest> HmacDrbg<D> {
         drbg
     }
 
-    /// `HMAC(K, V)` under the cached key.
+    /// `HMAC(K, V)` under the cached key — a one-block message, so on the
+    /// keyed state's raw-compression short path for the SHA-2 family.
     #[inline]
     fn mac_v(&self) -> D::Output {
-        let mut mac = self.keyed.clone();
-        mac.update(self.v.as_ref());
-        mac.finalize()
+        self.keyed.mac_parts(&[self.v.as_ref()])
     }
 
     /// Re-keys to `K = HMAC(K, V || sep || provided)` and then sets
     /// `V = HMAC(K, V)` under the new key.
     fn rekey(&mut self, sep: u8, provided: &[&[u8]]) {
-        let mut mac = self.keyed.clone();
-        mac.update(self.v.as_ref());
-        mac.update(&[sep]);
-        for p in provided {
-            mac.update(p);
-        }
-        let mut k = mac.finalize();
+        // `V ‖ sep ‖ provided…` as one parts list: at most three provided
+        // pieces reach here (entropy, nonce, personalization). With empty
+        // provided input — every `generate` without additional input — the
+        // message is `V ‖ sep`, one block, so this is the short path too.
+        debug_assert!(provided.len() <= 3);
+        let sep = [sep];
+        let mut parts: [&[u8]; 5] = [&[]; 5];
+        parts[0] = self.v.as_ref();
+        parts[1] = &sep;
+        let n = provided.len().min(3);
+        parts[2..2 + n].copy_from_slice(&provided[..n]);
+        let mut k = if provided.len() <= 3 {
+            self.keyed.mac_parts(&parts[..2 + n])
+        } else {
+            let mut mac = self.keyed.clone();
+            for p in &parts[..2] {
+                mac.update(p);
+            }
+            for p in provided {
+                mac.update(p);
+            }
+            mac.finalize()
+        };
         self.keyed = Hmac::new(k.as_ref());
         crate::zeroize::Zeroize::zeroize(k.as_mut());
         self.v = self.mac_v();
@@ -250,6 +265,87 @@ mod tests {
         drbg.generate(&mut buf, &[]); // discarded
         drbg.generate(&mut buf, &[]);
         assert_eq!(buf, expected);
+    }
+
+    /// The generator must equal a plain transcription of SP 800-90A §10.1.2
+    /// over `Hmac::new`/`update`/`finalize` (no fast paths), through
+    /// instantiate, generate with and without additional input, and reseed —
+    /// for SHA-256 (fast short-HMAC path) and SHA-512 (wider block) alike.
+    #[test]
+    fn matches_textbook_transcription() {
+        struct Ref<D: Digest> {
+            k: D::Output,
+            v: D::Output,
+        }
+        impl<D: Digest> Ref<D> {
+            fn hmac(&self, parts: &[&[u8]]) -> D::Output {
+                let mut m = Hmac::<D>::new(self.k.as_ref());
+                for p in parts {
+                    m.update(p);
+                }
+                m.finalize()
+            }
+            fn update(&mut self, provided: &[&[u8]]) {
+                let mut parts = alloc::vec![self.v.as_ref(), &[0x00][..]];
+                parts.extend_from_slice(provided);
+                self.k = self.hmac(&parts);
+                self.v = self.hmac(&[self.v.as_ref()]);
+                if provided.iter().any(|p| !p.is_empty()) {
+                    let mut parts = alloc::vec![self.v.as_ref(), &[0x01][..]];
+                    parts.extend_from_slice(provided);
+                    self.k = self.hmac(&parts);
+                    self.v = self.hmac(&[self.v.as_ref()]);
+                }
+            }
+            fn new(entropy: &[u8], nonce: &[u8], pers: &[u8]) -> Self {
+                let mut v = D::zeroed_output();
+                for b in v.as_mut() {
+                    *b = 0x01;
+                }
+                let mut r = Ref {
+                    k: D::zeroed_output(),
+                    v,
+                };
+                r.update(&[entropy, nonce, pers]);
+                r
+            }
+            fn generate(&mut self, out: &mut [u8], additional: &[u8]) {
+                if !additional.is_empty() {
+                    self.update(&[additional]);
+                }
+                let mut filled = 0;
+                while filled < out.len() {
+                    self.v = self.hmac(&[self.v.as_ref()]);
+                    let n = (out.len() - filled).min(self.v.as_ref().len());
+                    out[filled..filled + n].copy_from_slice(&self.v.as_ref()[..n]);
+                    filled += n;
+                }
+                self.update(&[additional]);
+            }
+        }
+        fn check<D: Digest>() {
+            let mut a = HmacDrbg::<D>::new(b"entropy-input-bytes", b"nonce", b"pers");
+            let mut r = Ref::<D>::new(b"entropy-input-bytes", b"nonce", b"pers");
+            let (mut x, mut y) = ([0u8; 100], [0u8; 100]);
+            for (len, add) in [
+                (32usize, &b""[..]),
+                (16, b"additional"),
+                (100, b""),
+                (1, b"x"),
+            ] {
+                a.generate(&mut x[..len], add);
+                r.generate(&mut y[..len], add);
+                assert_eq!(x[..len], y[..len], "{} len {len}", D::OUTPUT_LEN);
+            }
+            a.reseed(b"fresh-entropy", b"more");
+            r.update(&[b"fresh-entropy", b"more"]);
+            a.generate(&mut x[..48], &[]);
+            r.generate(&mut y[..48], &[]);
+            assert_eq!(x[..48], y[..48], "{} after reseed", D::OUTPUT_LEN);
+        }
+        check::<Sha256>();
+        check::<crate::hash::Sha512>();
+        check::<crate::hash::Sha1>();
     }
 
     #[test]

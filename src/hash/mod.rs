@@ -219,6 +219,24 @@ pub trait Digest: Clone {
         false
     }
 
+    /// Crate-internal fast path for a short HMAC; not part of the stable
+    /// API. Given the HMAC `inner`/`outer` hashers (the inner one right after
+    /// its pad block or with a short message buffered behind it, the outer
+    /// one right after its pad block), returns the tag over the buffered
+    /// message followed by `parts`, computed as exactly two bare
+    /// compressions of one pre-padded block template — when the whole
+    /// message fits a single padded block (`BLOCK_LEN - 9` bytes for the
+    /// 64-byte-block hashes, `BLOCK_LEN - 17` for SHA-512). Returns `None`
+    /// without touching anything when the digest has no such path (the
+    /// default), the states are not in that shape, or the message is too
+    /// long; the caller then takes the streaming route.
+    #[doc(hidden)]
+    #[inline]
+    fn hmac_short(inner: &Self, outer: &Self, parts: &[&[u8]]) -> Option<Self::Output> {
+        let _ = (inner, outer, parts);
+        None
+    }
+
     /// Hashes `data` in a single call.
     #[inline]
     fn digest(data: &[u8]) -> Self::Output {

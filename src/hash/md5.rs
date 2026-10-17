@@ -192,6 +192,10 @@ impl Digest for Md5 {
         self.state.update(data);
     }
     #[inline]
+    fn hmac_short(inner: &Self, outer: &Self, parts: &[&[u8]]) -> Option<[u8; 16]> {
+        inner.state.hmac_short(&outer.state, parts)
+    }
+    #[inline]
     fn finalize(self) -> [u8; 16] {
         words_to_bytes_le(&self.state.finalize())
     }

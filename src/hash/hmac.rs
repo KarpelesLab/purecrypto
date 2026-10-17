@@ -96,6 +96,13 @@ impl<D: Digest> Hmac<D> {
     /// Consumes the MAC and returns the authentication tag.
     #[inline]
     pub fn finalize(mut self) -> D::Output {
+        // Short message entirely buffered behind the inner pad block: two
+        // bare compressions of one block template, no fresh hashers, no
+        // padding logic and one wipe (`self` is still dropped, which wipes
+        // the keyed states as usual).
+        if let Some(tag) = D::hmac_short(&self.inner, &self.outer, &[]) {
+            return tag;
+        }
         // Extract the hashers rather than moving them out of `self`, which the
         // `Drop` impl forbids; the leftover fresh hashers are wiped on drop.
         let mut inner = core::mem::replace(&mut self.inner, D::new()).finalize();
@@ -128,6 +135,24 @@ impl<D: Digest> Hmac<D> {
         let mut h = Self::new(key);
         h.update(data);
         h.finalize()
+    }
+
+    /// The tag over the concatenation of `parts` under this keyed state,
+    /// leaving `self` untouched (the keyed-once, MAC-many shape of HKDF,
+    /// HMAC-DRBG and KBKDF). Takes the digest's raw-compression short-message
+    /// path ([`Digest::hmac_short`]) when the message fits one padded block,
+    /// which also skips cloning and wiping a second pair of hashers; else
+    /// clones the keyed state and streams.
+    #[cfg_attr(not(any(feature = "kdf", feature = "rng")), allow(dead_code))]
+    pub(crate) fn mac_parts(&self, parts: &[&[u8]]) -> D::Output {
+        if let Some(tag) = D::hmac_short(&self.inner, &self.outer, parts) {
+            return tag;
+        }
+        let mut mac = self.clone();
+        for part in parts {
+            mac.update(part);
+        }
+        mac.finalize()
     }
 
     /// Iterated HMAC, the PBKDF2 inner loop: `rounds` times sets
@@ -192,6 +217,63 @@ pub(super) fn hmac_iterate_with<H, const B: usize>(
     u.copy_from_slice(&block[..n]);
     block.zeroize();
     h.zeroize();
+}
+
+/// The shared raw-compression path behind the [`Digest::hmac_short`] fast
+/// paths of the Merkle–Damgård hashes.
+///
+/// `inner_h` / `outer_h` are the chaining values after absorbing exactly the
+/// `K ⊕ ipad` / `K ⊕ opad` block; `buffered` is whatever message the inner
+/// hasher already holds in its partial block, and `parts` the rest. When the
+/// whole message (`buffered ‖ parts…`) is at most `max_msg` bytes, the inner
+/// hash is one compression of `msg ‖ 0x80 ‖ 0… ‖ len(B + |msg|)` and the
+/// outer one compression of `digest ‖ 0x80 ‖ 0… ‖ len(B + N)`, so both run
+/// on one `B`-byte block template and one working state, wiped once at the
+/// end. `put_len` writes the encoded bit length into the template's tail (the
+/// hashes differ in its width and endianness); `out` serialises the leading
+/// bytes of a state. Returns `None` when the message does not fit.
+pub(super) fn hmac_short_with<H, const B: usize, const N: usize>(
+    (inner_h, outer_h): (&H, &H),
+    buffered: &[u8],
+    parts: &[&[u8]],
+    max_msg: usize,
+    compress: impl Fn(&mut H, &[u8; B]),
+    out: impl Fn(&H, &mut [u8]),
+    put_len: impl Fn(u64, &mut [u8; B]),
+) -> Option<[u8; N]>
+where
+    H: Copy + crate::zeroize::Zeroize,
+{
+    use crate::zeroize::Zeroize;
+    let total = buffered.len() + parts.iter().map(|p| p.len()).sum::<usize>();
+    if total > max_msg || N > max_msg {
+        return None;
+    }
+    let mut block = [0u8; B];
+    block[..buffered.len()].copy_from_slice(buffered);
+    let mut off = buffered.len();
+    for part in parts {
+        block[off..off + part.len()].copy_from_slice(part);
+        off += part.len();
+    }
+    block[total] = 0x80;
+    put_len(((B + total) * 8) as u64, &mut block);
+    let mut h = *inner_h;
+    compress(&mut h, &block);
+
+    // The inner digest over its own padding, under the outer state.
+    out(&h, &mut block[..N]);
+    block[N..].fill(0);
+    block[N] = 0x80;
+    put_len(((B + N) * 8) as u64, &mut block);
+    h = *outer_h;
+    compress(&mut h, &block);
+    let mut tag = [0u8; N];
+    out(&h, &mut tag);
+
+    block.zeroize();
+    h.zeroize();
+    Some(tag)
 }
 
 impl<D: Digest> Drop for Hmac<D> {
@@ -294,6 +376,95 @@ mod tests {
         check::<crate::hash::Sha512_224>();
         check::<crate::hash::Sha512_256>();
         check::<crate::hash::Md5>();
+    }
+
+    /// The raw-compression `hmac_short` fast path (behind `finalize` and
+    /// `mac_parts`) must equal the textbook two-hash HMAC bit for bit, for
+    /// every message length from empty through past the one-block limit
+    /// (where it must decline and the streaming path takes over), split
+    /// between the buffered inner state and `parts` in every way, for short
+    /// and over-long keys and every digest that has the fast path (plus one
+    /// without it, exercising the fallback).
+    #[test]
+    fn hmac_short_fast_path_matches_two_hash_reference() {
+        fn reference<D: Digest>(key: &[u8], msg: &[u8]) -> D::Output {
+            let mut block = D::zeroed_block();
+            let buf = block.as_mut();
+            if key.len() > buf.len() {
+                let h = D::digest(key);
+                buf[..h.as_ref().len()].copy_from_slice(h.as_ref());
+            } else {
+                buf[..key.len()].copy_from_slice(key);
+            }
+            let (mut ipad, mut opad) = (block, block);
+            for b in ipad.as_mut() {
+                *b ^= IPAD;
+            }
+            for b in opad.as_mut() {
+                *b ^= OPAD;
+            }
+            let mut inner = D::new();
+            inner.update(ipad.as_ref());
+            inner.update(msg);
+            let inner = inner.finalize();
+            let mut outer = D::new();
+            outer.update(opad.as_ref());
+            outer.update(inner.as_ref());
+            outer.finalize()
+        }
+        fn check<D: Digest>(has_fast_path: bool) {
+            let msg: [u8; 200] = core::array::from_fn(|i| (i as u8).wrapping_mul(13) ^ 0x5a);
+            let long_key = [0x5au8; 200];
+            let max = D::BLOCK_LEN - if D::BLOCK_LEN == 128 { 17 } else { 9 };
+            for key in [&b"pw"[..], &long_key[..]] {
+                let mac = Hmac::<D>::new(key);
+                for len in 0..=D::BLOCK_LEN + 1 {
+                    let want = reference::<D>(key, &msg[..len]);
+                    // Everything streamed into the inner hasher, then `finalize`.
+                    assert_eq!(
+                        mac.clone().chain(&msg[..len]).finalize().as_ref(),
+                        want.as_ref(),
+                        "{} len {len} finalize",
+                        D::OUTPUT_LEN
+                    );
+                    // Every split between the buffered prefix and `parts`,
+                    // with `parts` itself split in two.
+                    for cut in [0usize, 1, len / 3, len / 2, len] {
+                        let cut = cut.min(len);
+                        let mut fed = mac.clone();
+                        fed.update(&msg[..cut]);
+                        let rest = &msg[cut..len];
+                        let mid = rest.len() / 2;
+                        let got = fed.mac_parts(&[&rest[..mid], &rest[mid..]]);
+                        assert_eq!(
+                            got.as_ref(),
+                            want.as_ref(),
+                            "{} len {len} cut {cut} mac_parts",
+                            D::OUTPUT_LEN
+                        );
+                        let direct = D::hmac_short(&fed.inner, &fed.outer, &[rest]);
+                        assert_eq!(
+                            direct.is_some(),
+                            has_fast_path && len <= max,
+                            "{} len {len} cut {cut}: fast path taken?",
+                            D::OUTPUT_LEN
+                        );
+                    }
+                }
+            }
+        }
+        check::<crate::hash::Sha1>(true);
+        check::<crate::hash::Sha224>(true);
+        check::<crate::hash::Sha256>(true);
+        check::<crate::hash::Sha384>(true);
+        check::<crate::hash::Sha512>(true);
+        check::<crate::hash::Sha512_224>(true);
+        check::<crate::hash::Sha512_256>(true);
+        check::<crate::hash::Md5>(true);
+        check::<crate::hash::Ripemd160>(true);
+        check::<crate::hash::Sm3>(true);
+        check::<crate::hash::Sha3_256>(false);
+        check::<crate::hash::Blake2s256>(false);
     }
 
     // RFC 4231 test vectors.

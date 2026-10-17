@@ -141,6 +141,44 @@ impl<const W: usize> MdState<W> {
         true
     }
 
+    /// [`Digest::hmac_short`](super::Digest::hmac_short) for an `N`-byte
+    /// digest whose output words use the same byte order as the length field.
+    /// The inner state must hold exactly its pad block plus whatever short
+    /// message is buffered, the outer state exactly its pad block.
+    pub(super) fn hmac_short<const N: usize>(
+        &self,
+        outer: &Self,
+        parts: &[&[u8]],
+    ) -> Option<[u8; N]> {
+        if self.msg_len != 64 + self.block_len as u64 || outer.block_len != 0 || outer.msg_len != 64
+        {
+            return None;
+        }
+        let be = self.len_be;
+        let compress = self.compress;
+        super::hmac::hmac_short_with::<_, 64, N>(
+            (&self.h, &outer.h),
+            &self.block[..self.block_len],
+            parts,
+            55,
+            compress,
+            |h, out| {
+                for (o, w) in out.chunks_mut(4).zip(h.iter()) {
+                    let b = if be { w.to_be_bytes() } else { w.to_le_bytes() };
+                    o.copy_from_slice(&b[..o.len()]);
+                }
+            },
+            |bits, block| {
+                let b = if be {
+                    bits.to_be_bytes()
+                } else {
+                    bits.to_le_bytes()
+                };
+                block[56..].copy_from_slice(&b);
+            },
+        )
+    }
+
     /// Applies the padding and returns the final state words.
     pub(super) fn finalize(mut self) -> [u32; W] {
         let bit_len = self.msg_len.wrapping_mul(8);

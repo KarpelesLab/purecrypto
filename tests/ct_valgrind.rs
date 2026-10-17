@@ -470,6 +470,45 @@ fn hmac_sha512() -> String {
     hex8(public(&tag))
 }
 
+/// Short messages (one padded block) take the raw-compression
+/// `Digest::hmac_short` path in `Hmac::finalize` / `mac_parts`: the
+/// key-derived states and the block template must stay branch-free.
+fn hmac_sha256_short() -> String {
+    let key = secret_bytes::<32>(160);
+    let msg = secret_bytes::<40>(161);
+    let tag = HmacSha256::mac(&key, &msg);
+    let mut expected = tag;
+    declassify(&expected);
+    let ok = HmacSha256::new(&key).chain(&msg).verify(&expected);
+    expected[5] ^= 1;
+    let bad = HmacSha256::new(&key).chain(&msg).verify(&expected);
+    assert!(bool::from(ct::declassify_value(ok)));
+    assert!(!bool::from(ct::declassify_value(bad)));
+    hex8(public(&tag))
+}
+
+fn hmac_sha512_short() -> String {
+    let key = secret_bytes::<64>(162);
+    let msg = secret_bytes::<100>(163);
+    let tag = HmacSha512::mac(&key, &msg);
+    hex8(public(&tag))
+}
+
+/// HMAC-DRBG with a secret seed: `generate` (with and without additional
+/// input) and `reseed` run `HMAC(K, V)` and `HMAC(K, V ‖ sep ‖ …)` on the
+/// short path with tainted K and V.
+fn hmac_drbg_sha256() -> String {
+    let entropy = secret_bytes::<32>(164);
+    let additional = secret_bytes::<16>(165);
+    let mut drbg = HmacDrbg::<Sha256>::new(&entropy, b"nonce", b"ct_valgrind");
+    let mut out = [0u8; 48];
+    drbg.generate(&mut out, &[]);
+    drbg.generate(&mut out[..16], &additional);
+    drbg.reseed(&entropy, b"");
+    drbg.generate(&mut out, &[]);
+    hex8(public(&out))
+}
+
 fn hkdf_sha256() -> String {
     let ikm = secret_bytes::<32>(20);
     let mut okm = [0u8; 80];
@@ -2324,6 +2363,9 @@ const CASES: &[Case] = &[
     ("poly1305", poly1305),
     ("hmac_sha256", hmac_sha256),
     ("hmac_sha512", hmac_sha512),
+    ("hmac_sha256_short", hmac_sha256_short),
+    ("hmac_sha512_short", hmac_sha512_short),
+    ("hmac_drbg_sha256", hmac_drbg_sha256),
     ("hkdf_sha256", hkdf_sha256),
     ("pbkdf2_sha256", pbkdf2_sha256),
     ("argon2i", argon2i),
