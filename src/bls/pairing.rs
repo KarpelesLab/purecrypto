@@ -98,6 +98,61 @@ pub fn pairing(p: &G1, q: &G2) -> Gt {
     Gt(final_exponentiation(&miller_loop(p, q)))
 }
 
+/// Builds the legs of a shared Miller loop, normalising every input to
+/// affine coordinates with a single field inversion (Montgomery's trick
+/// over the `G1` `Z`s and the norms of the `G2` `Z`s) — or none at all
+/// when every input is already affine (`Z = 1`: decoded points, the
+/// generators) or the identity. Whether that fast path is taken depends
+/// only on how the inputs were produced (decoding versus arithmetic),
+/// never on their coordinates, and pairing inputs are public data.
+fn legs(pairs: &[(&G1, &G2)]) -> alloc::vec::Vec<Leg> {
+    // The values to invert: [zP₀, N(zQ₀), zP₁, N(zQ₁), …], identities'
+    // zeros replaced by one (their legs are masked out of the product).
+    let mut zs: alloc::vec::Vec<Fp> = alloc::vec::Vec::with_capacity(2 * pairs.len());
+    let mut any_projective = Choice::from(0);
+    for (p, q) in pairs {
+        let zp = Fp::conditional_select(&Fp::ONE, &p.0.z, p.0.z.is_zero());
+        let nq = q.0.z.c0.square().add(&q.0.z.c1.square());
+        let nq = Fp::conditional_select(&Fp::ONE, &nq, nq.is_zero());
+        any_projective |= !zp.ct_eq(&Fp::ONE) | !nq.ct_eq(&Fp::ONE);
+        zs.push(zp);
+        zs.push(nq);
+    }
+    if bool::from(any_projective) {
+        // Prefix products, one inversion, then peel the inverses off.
+        let mut acc = Fp::ONE;
+        let mut prefix: alloc::vec::Vec<Fp> = alloc::vec::Vec::with_capacity(zs.len());
+        for z in &zs {
+            prefix.push(acc);
+            acc = acc.mul(z);
+        }
+        // Nonzero by construction (every factor is nonzero).
+        let mut inv = acc.invert().unwrap_or(Fp::ZERO);
+        for (z, pre) in zs.iter_mut().zip(prefix.iter()).rev() {
+            let zi = inv.mul(pre);
+            inv = inv.mul(z);
+            *z = zi;
+        }
+    }
+    pairs
+        .iter()
+        .zip(zs.chunks_exact(2))
+        .map(|((p, q), zi)| {
+            let (zp_inv, nq_inv) = (zi[0], zi[1]);
+            let zq_inv = q.0.z.conjugate().mul_by_fp(&nq_inv);
+            let (qx, qy) = (q.0.x.mul(&zq_inv), q.0.y.mul(&zq_inv));
+            Leg {
+                px: p.0.x.mul(&zp_inv),
+                py: p.0.y.mul(&zp_inv),
+                qx,
+                qy,
+                t: Projective::from_affine(qx, qy),
+                skip: p.0.z.is_zero() | q.0.z.is_zero(),
+            }
+        })
+        .collect()
+}
+
 /// `∏ e(Pᵢ, Qᵢ)` with a single final exponentiation — the cheap way to
 /// evaluate a product-of-pairings equation such as a signature check.
 ///
@@ -106,8 +161,7 @@ pub fn pairing(p: &G1, q: &G2) -> Gt {
 /// pairs instead of once per pair, and without the per-pair `Fp12`
 /// products at the end.
 pub fn multi_pairing(pairs: &[(&G1, &G2)]) -> Gt {
-    let mut legs: alloc::vec::Vec<Leg> = pairs.iter().map(|(p, q)| Leg::new(p, q)).collect();
-    Gt(final_exponentiation(&shared_miller_loop(&mut legs)))
+    Gt(final_exponentiation(&shared_miller_loop(&mut legs(pairs))))
 }
 
 /// One pair's state in a (shared) Miller loop.
@@ -122,19 +176,6 @@ struct Leg {
 }
 
 impl Leg {
-    fn new(p: &G1, q: &G2) -> Leg {
-        let (px, py, p_inf) = p.0.to_affine();
-        let (qx, qy, q_inf) = q.0.to_affine();
-        Leg {
-            px,
-            py,
-            qx,
-            qy,
-            t: Projective::from_affine(qx, qy),
-            skip: p_inf | q_inf,
-        }
-    }
-
     /// Doubles `T` and returns the tangent line at `T` evaluated at
     /// `τ(P)`, as `(c0, c1, c4)` (one set of intermediates for both):
     /// `(Y² - 3b'Z²) - 3X²·xP·w² + 2YZ·yP·w³`.
@@ -231,7 +272,7 @@ fn shared_miller_loop(legs: &mut [Leg]) -> Fp12 {
 /// `f_{|x|,Q}(P)` conjugated (since `x < 0`), or `1` if either input is the
 /// identity. Runs a fixed schedule over the public loop constant.
 pub(crate) fn miller_loop(p: &G1, q: &G2) -> Fp12 {
-    shared_miller_loop(&mut [Leg::new(p, q)])
+    shared_miller_loop(&mut legs(&[(p, q)]))
 }
 
 /// `f^((p¹² - 1)/r)`.
@@ -333,6 +374,32 @@ mod tests {
             f = f.mul(&miller_loop(pi, qi));
         }
         assert_eq!(Gt(final_exponentiation(&f)), want);
+        // Inputs with Z ≠ 1 (the batch-inverted path), with Z = 1 and the
+        // identity mixed in, equal the pairings of their normalised forms.
+        let norm = |p: &G1| G1::from_compressed(&p.to_compressed()).unwrap();
+        let norm2 = |q: &G2| G2::from_compressed(&q.to_compressed()).unwrap();
+        let pr = [
+            p[0],
+            norm(&p[1]),
+            G1::IDENTITY,
+            g1,
+            norm(&p[0]),
+            p[1] + p[0],
+        ];
+        let qr = [q[1] + q[0], q[1], q[2], G2::IDENTITY, q[0], norm2(&q[1])];
+        let mut want = Gt::IDENTITY;
+        let mut pairs = alloc::vec::Vec::new();
+        for (pi, qi) in pr.iter().zip(qr.iter()) {
+            want = want.mul(&pairing(&norm(pi), &norm2(qi)));
+            pairs.push((pi, qi));
+        }
+        assert_eq!(multi_pairing(&pairs), want);
+        assert_eq!(
+            pairing(&pr[0], &qr[0]),
+            pairing(&norm(&pr[0]), &norm2(&qr[0]))
+        );
+        assert_eq!(pairing(&pr[2], &qr[0]), Gt::IDENTITY);
+        assert_eq!(pairing(&pr[0], &qr[3]), Gt::IDENTITY);
     }
 
     /// SHA-256 over the twelve 48-byte coefficients of a `Gt` element.
