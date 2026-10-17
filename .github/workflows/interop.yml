@@ -135,7 +135,7 @@ jobs:
           - peer: wolfssl-driver
             runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -166,7 +166,7 @@ jobs:
       - name: Cache OpenSSL (source build)
         if: matrix.peer == 'openssl-src'
         id: cache-openssl-src
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/openssl-src
           key: openssl-src-${{ env.OPENSSL_SRC_TAG }}-${{ runner.os }}-v2
@@ -195,7 +195,7 @@ jobs:
       - name: Cache bssl
         if: matrix.peer == 'boringssl'
         id: cache-bssl
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/bssl
           key: bssl-${{ env.BORINGSSL_COMMIT }}-${{ runner.os }}-v1
@@ -219,7 +219,7 @@ jobs:
       - name: Cache Mbed TLS
         if: matrix.peer == 'mbedtls'
         id: cache-mbedtls
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/mbedtls
           key: mbedtls-${{ env.MBEDTLS_TAG }}-${{ runner.os }}-v1
@@ -247,7 +247,7 @@ jobs:
       # ---- schannel ----------------------------------------------------
       - name: Set up .NET
         if: matrix.peer == 'schannel'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
 
@@ -290,7 +290,7 @@ jobs:
       - name: Cache wolfSSL
         if: matrix.peer == 'wolfssl' || matrix.peer == 'wolfssl-driver'
         id: cache-wolfssl
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/wolfssl
           key: wolfssl-${{ env.WOLFSSL_TAG }}-${{ runner.os }}-v2
@@ -340,7 +340,7 @@ jobs:
       - name: Cache LibreSSL
         if: matrix.peer == 'libressl' && matrix.libressl != 'system'
         id: cache-libressl
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/libressl
           key: libressl-${{ env.LIBRESSL_VERSION }}-${{ runner.os }}-v1
@@ -385,7 +385,7 @@ jobs:
       - name: Cache GnuTLS (source build)
         if: matrix.peer == 'gnutls-src'
         id: cache-gnutls-src
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/gnutls-src
           key: gnutls-src-${{ env.GNUTLS_SRC_VERSION }}-${{ env.LEANCRYPTO_TAG }}-nettle${{ env.NETTLE_SRC_VERSION }}-${{ runner.os }}-v2

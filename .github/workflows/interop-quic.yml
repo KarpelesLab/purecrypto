@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -62,14 +62,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: tools/quic-interop/quicgo/go.mod
           cache-dependency-path: tools/quic-interop/quicgo/go.sum
 
       - name: Cache OpenSSL
         id: cache-openssl
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/openssl
           key: openssl-${{ env.OPENSSL_TAG }}-${{ runner.os }}-v1
@@ -110,7 +110,7 @@ jobs:
 
       - name: Upload logs and qlog traces
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: quic-interop-logs
           path: |

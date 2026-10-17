@@ -29,7 +29,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -62,7 +62,7 @@ jobs:
         # `usize` shifts that overflow when `usize` is 32 bits wide).
         target: [x86_64-unknown-linux-gnu, thumbv7em-none-eabi]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -170,7 +170,7 @@ jobs:
           - target: wasm32-wasip1
             args: "--features wasi-getrandom"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -191,14 +191,14 @@ jobs:
     name: MSRV (Rust 1.89)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Keep this pin in sync with `rust-version` in Cargo.toml. Compiling on
       # the declared minimum guards against accidentally using a std/library or
       # language feature newer than 1.89 (behavior itself is covered by the
       # stable `test` jobs, so this is compile-only).
       - name: Install Rust 1.89 (declared MSRV)
-        uses: dtolnay/rust-toolchain@1.89
+        uses: dtolnay/rust-toolchain@1.120
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
@@ -212,7 +212,7 @@ jobs:
     name: C ABI smoke test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -274,7 +274,7 @@ jobs:
       # Bump when Intel retires this build (the pinned one already 403s).
       SDE_URL: https://downloadmirror.intel.com/850782/sde-external-9.44.0-2024-08-22-lin.tar.xz
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -316,7 +316,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -349,7 +349,7 @@ jobs:
           - shard: zkp
             features: zkp-rangeproof zkp-halfagg zkp-surjection zkp-whitelist zkp-adaptor zkp-pedersen zkp-sign-to-contract zkp
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

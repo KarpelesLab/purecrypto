@@ -57,7 +57,7 @@ jobs:
             asset_suffix: windows-aarch64
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ inputs.tag }}
 
@@ -142,7 +142,7 @@ jobs:
     name: build macos universal
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ inputs.tag }}
 
