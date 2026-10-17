@@ -83,7 +83,7 @@ const fmt = (s) => s.replace(/`([^`]+)`/g, '<code>$1</code>');
 
       <div class="facts mono">
         <span>MIT licensed</span>
-        <span>MSRV Rust 1.88</span>
+        <span>MSRV Rust 1.95</span>
         <span>unsafe denied crate-wide</span>
         <span>#![no_std] + alloc</span>
       </div>

@@ -222,7 +222,7 @@ cargo test                                           # full suite
 cargo test --release -- --ignored                    # heavy KATs (SLH-DSA 's' sets, RSA keygen)
 ```
 
-Requires Rust 1.89 or newer (edition 2024); the MSRV is declared in
+Requires Rust 1.95 or newer (edition 2024); the MSRV is declared in
 `Cargo.toml` and enforced in CI, which also builds bare-metal
 (`thumbv7em-none-eabi`), 32-bit ARM, RISC-V, wasm32 and WASI targets.
 
