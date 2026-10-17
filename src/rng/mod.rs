@@ -15,7 +15,14 @@
 //!   Blocks until the kernel CSPRNG is seeded — recommended for processes
 //!   that may start very early in boot. Supported arches: x86_64, aarch64,
 //!   armv7, riscv64; other Linux arches, and kernels without the syscall,
-//!   transparently fall through to `/dev/urandom`.
+//!   transparently fall through to `/dev/urandom`. Only `ENOSYS` triggers
+//!   that fallback: a sandbox (seccomp, gVisor, …) that denies the syscall
+//!   with `EPERM` makes [`OsRng`] fail closed — it panics rather than
+//!   quietly switching to `/dev/urandom`, since a refused entropy syscall is
+//!   indistinguishable from a kernel-level entropy failure. Builds that must
+//!   run under such a sandbox can opt out of the feature (e.g.
+//!   `--no-default-features` plus the features they need) to get the
+//!   `/dev/urandom` path back.
 //! * **Linux without that feature**: `/dev/urandom` (per-thread cached fd).
 //! * **Other Unix** (FreeBSD, OpenBSD, NetBSD, etc.): `/dev/urandom`.
 #![cfg_attr(not(feature = "std"), doc = "", doc = "[`OsRng`]: crate#no_std")]
