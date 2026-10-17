@@ -4,10 +4,10 @@
 //! GF(2²⁵⁵−19), in extended coordinates `(X:Y:Z:T)` with the complete
 //! Hisil–Wong–Carter–Dawson 2008 addition formulas. Scalar multiplication is a
 //! constant-time fixed 4-bit window ladder; base-point multiplication uses a
-//! precomputed comb table (`super::base_table`, feature `ed25519-table`) with
-//! no doublings, or the same ladder over the base point without it. This is
-//! the shared point backend behind Ed25519, the edwards25519 hazmat surface,
-//! and ristretto255.
+//! precomputed signed radix-16 table of affine Niels points
+//! (`super::base_table`, feature `ed25519-table`) with no doublings, or the
+//! same ladder over the base point without it. This is the shared point
+//! backend behind Ed25519, the edwards25519 hazmat surface, and ristretto255.
 //!
 //! Two clearly-marked `_vartime` entry points exist for **public-input**
 //! workloads (Ed25519 signature verification): they take data-dependent
@@ -15,9 +15,13 @@
 //! never see secret scalars or secret points.
 
 #[cfg(feature = "ed25519-table")]
-use super::base_table::ED25519_BASE_TABLE;
+use super::base_table::{ED25519_BASE_2_256, ED25519_BASE_TABLE};
+#[cfg(feature = "ed25519-table")]
+use super::field::mask_from_bit;
 use super::field::{Fe, Field, ScalarInt, eq_mask};
 use crate::ct::{Choice, ConstantTimeLess};
+#[cfg(feature = "ed25519-table")]
+use crate::zeroize::Zeroize;
 
 /// A curve point in extended homogeneous coordinates `(X:Y:Z:T)`.
 #[derive(Clone, Copy, Debug)]
@@ -28,9 +32,8 @@ pub(crate) struct Point {
     pub(crate) t: Fe,
 }
 
-/// The base point `B` as a table entry: affine `x‖y‖t` (`t = x·y`), 5
-/// little-endian 51-bit limbs each, canonical residues — the same value as
-/// the comb table's first entry. Checked against the RFC 8032 encoding by
+/// The base point `B` as affine `x‖y‖t` (`t = x·y`), 5 little-endian 51-bit
+/// limbs each, canonical residues. Checked against the RFC 8032 encoding by
 /// `tests::base_affine_matches_encoding`.
 #[cfg(any(
     test,
@@ -56,8 +59,14 @@ const BASE_AFFINE: [u64; 15] = [
     0x67875f0fd78b7,
 ];
 
-/// Lifts a stored affine table entry (`x‖y‖t`, 5 little-endian 51-bit limbs
-/// each, canonical residues) to extended coordinates with `Z = 1`.
+/// Lifts a stored affine point (`x‖y‖t`, 5 little-endian 51-bit limbs each,
+/// canonical residues) to extended coordinates with `Z = 1`.
+#[cfg(any(
+    test,
+    feature = "hazmat-edwards25519",
+    feature = "ristretto255",
+    not(feature = "ed25519-table")
+))]
 #[inline]
 fn table_point(entry: &[u64; 15], one: Fe) -> Point {
     Point {
@@ -66,6 +75,105 @@ fn table_point(entry: &[u64; 15], one: Fe) -> Point {
         z: one,
         t: Fe([entry[10], entry[11], entry[12], entry[13], entry[14]]),
     }
+}
+
+/// An affine point in **Niels** form `(y + x, y − x, 2·d·x·y)`: exactly the
+/// three values the mixed addition [`Field::add_niels`] multiplies by, so a
+/// precomputed point costs no conversion. The identity is `(1, 1, 0)`, and
+/// negation swaps the first two values and negates the third.
+#[cfg(feature = "ed25519-table")]
+#[derive(Clone, Copy)]
+pub(crate) struct Niels {
+    ypx: Fe,
+    ymx: Fe,
+    t2d: Fe,
+}
+
+#[cfg(feature = "ed25519-table")]
+impl Niels {
+    /// The neutral element `(1, 1, 0)`.
+    const IDENTITY: Niels = Niels {
+        ypx: Fe::ONE,
+        ymx: Fe::ONE,
+        t2d: Fe::ZERO,
+    };
+
+    /// Loads a stored table entry (`(y+x)‖(y−x)‖(2·d·t)`, 5 little-endian
+    /// 51-bit limbs each, canonical residues).
+    #[inline(always)]
+    fn from_entry(e: &[u64; 15]) -> Niels {
+        Niels {
+            ypx: Fe([e[0], e[1], e[2], e[3], e[4]]),
+            ymx: Fe([e[5], e[6], e[7], e[8], e[9]]),
+            t2d: Fe([e[10], e[11], e[12], e[13], e[14]]),
+        }
+    }
+
+    /// `a` when `mask` is all-ones, `b` when it is zero (same mask contract
+    /// as [`Fe::select`]).
+    #[inline(always)]
+    fn select(a: &Niels, b: &Niels, mask: u64) -> Niels {
+        Niels {
+            ypx: Fe::select(&a.ypx, &b.ypx, mask),
+            ymx: Fe::select(&a.ymx, &b.ymx, mask),
+            t2d: Fe::select(&a.t2d, &b.t2d, mask),
+        }
+    }
+
+    /// Constant-time gather of the entry with magnitude `|d|` from one
+    /// table window, negated when `d < 0`; `d = 0` yields the identity.
+    /// Scans all 8 entries with one barriered equality mask each (no
+    /// secret-indexed memory access), then applies the sign with one
+    /// barriered mask (swap `y+x`/`y−x`, negate `2dt`).
+    #[inline]
+    fn gather(window: &[[u64; 15]; 8], d: i8) -> Niels {
+        // `smask` is 0xff iff d < 0; `mag` = |d| ∈ 0..=8, both branch-free.
+        let smask = (d >> 7) as u8;
+        let mag = ((d as u8) ^ smask).wrapping_sub(smask) as u64;
+        let mut sel = Niels::IDENTITY;
+        for (j, entry) in window.iter().enumerate() {
+            let cand = Niels::from_entry(entry);
+            sel = Niels::select(&cand, &sel, eq_mask(j as u64 + 1, mag));
+        }
+        let neg = mask_from_bit((smask & 1) as u64);
+        Fe::cswap(&mut sel.ypx, &mut sel.ymx, neg);
+        sel.t2d = Fe::select(&sel.t2d.neg(), &sel.t2d, neg);
+        sel
+    }
+
+    /// `−self` (swap `y+x` and `y−x`, negate `2dt`).
+    #[cfg(any(test, feature = "ed25519-table"))]
+    #[inline]
+    fn negate(&self) -> Niels {
+        Niels {
+            ypx: self.ymx,
+            ymx: self.ypx,
+            t2d: self.t2d.neg(),
+        }
+    }
+}
+
+/// Recodes a 256-bit little-endian scalar into 65 signed radix-16 digits:
+/// `d[0..64] ∈ [−8, 8)` and a carry digit `d[64] ∈ {0, 1}`, with
+/// `scalar = Σ d[i]·16^i` exactly (no reduction, no assumption on the top
+/// bit). Constant time: a fixed carry chain of plain arithmetic, no
+/// comparisons. The digits are secret; callers wipe them.
+#[cfg(feature = "ed25519-table")]
+fn radix16_signed(scalar: &[u8; 32]) -> [i8; 65] {
+    let mut d = [0i8; 65];
+    for (i, &b) in scalar.iter().enumerate() {
+        d[2 * i] = (b & 15) as i8;
+        d[2 * i + 1] = (b >> 4) as i8;
+    }
+    let mut carry = 0i8;
+    for digit in d.iter_mut().take(64) {
+        // v ∈ [0, 16]; carry out iff v ≥ 8; the digit becomes v − 16·carry.
+        let v = *digit + carry;
+        carry = (v + 8) >> 4;
+        *digit = v - (carry << 4);
+    }
+    d[64] = carry;
+    d
 }
 
 impl Field {
@@ -261,35 +369,56 @@ impl Field {
         acc
     }
 
+    /// Mixed addition `p + n` of an extended point and an affine Niels point
+    /// (add-2008-hwcd-3 with `Z₂ = 1` and the Niels values precomputed):
+    /// 7 multiplications instead of the 9 of [`Self::point_add`]. Complete
+    /// for `a = −1` like the full formula, so adding the identity Niels
+    /// `(1, 1, 0)` is a uniform no-op.
+    #[cfg(feature = "ed25519-table")]
+    #[inline]
+    pub(crate) fn add_niels(&self, p: &Point, n: &Niels) -> Point {
+        let pp = self.mul(self.add(p.y, p.x), n.ypx);
+        let mm = self.mul(self.sub(p.y, p.x), n.ymx);
+        let tt = self.mul(p.t, n.t2d);
+        let zz2 = self.add(p.z, p.z);
+        let e = self.sub(pp, mm);
+        let h = self.add(pp, mm);
+        let ff = self.sub(zz2, tt);
+        let g = self.add(zz2, tt);
+        Point {
+            x: self.mul(e, ff),
+            y: self.mul(g, h),
+            t: self.mul(e, h),
+            z: self.mul(ff, g),
+        }
+    }
+
     /// Constant-time fixed-base multiplication `[scalar]·B` via the
-    /// precomputed comb table [`ED25519_BASE_TABLE`]:
-    /// `[k]B = Σᵢ [dᵢ · 16^i]B` over the 64 base-16 digits `dᵢ` of the
-    /// little-endian scalar, so there are **no doublings** — just 64
-    /// unconditional additions, each operand fetched by a masked scan of that
-    /// window's 15 stored points (no secret-indexed memory access, same
-    /// gather discipline as [`Self::scalar_mult`]). A zero digit adds the
-    /// identity, a uniform no-op under the complete HWCD formulas, so the
-    /// schedule depends only on the (public) scalar width. The scalar bytes
-    /// are treated as secret.
+    /// precomputed signed radix-16 table [`ED25519_BASE_TABLE`]:
+    /// `[k]B = Σᵢ [dᵢ · 16^i]B + [d₆₄ · 2^256]B` over the signed digits
+    /// `dᵢ ∈ [−8, 8)` of the little-endian scalar ([`radix16_signed`]), so
+    /// there are **no doublings** — 65 unconditional mixed additions, each
+    /// operand fetched by [`Niels::gather`] (a masked scan of the window's 8
+    /// stored points plus a masked negation; no secret-indexed memory
+    /// access). A zero digit adds the identity, a uniform no-op under the
+    /// complete formulas, so the schedule depends only on the (public)
+    /// scalar width. Any 256-bit scalar is consumed exactly (the recoding
+    /// carry is the 65th digit). The scalar bytes are treated as secret.
     #[cfg(feature = "ed25519-table")]
     pub(crate) fn mul_base(&self, scalar: &[u8; 32]) -> Point {
-        let id = self.identity();
-        let mut acc = id;
-        for (i, window) in ED25519_BASE_TABLE.iter().enumerate() {
-            // Digit i = nibble i of the little-endian scalar bytes.
-            let byte = scalar[i / 2];
-            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as u64;
-            // Constant-time gather: scan all 15 entries, keep entry j when
-            // j + 1 == digit (one barriered mask per entry); a zero digit
-            // keeps the identity. Every stored entry is affine, so Z = 1 —
-            // which also matches the identity representation (0:1:1:0).
-            let mut sel = id;
-            for (j, entry) in window.iter().enumerate() {
-                let cand = table_point(entry, self.one);
-                sel = point_select(&cand, &sel, eq_mask(j as u64 + 1, digit));
-            }
-            acc = self.point_add(&acc, &sel);
+        let mut digits = radix16_signed(scalar);
+        let mut acc = self.identity();
+        for (window, &d) in ED25519_BASE_TABLE.iter().zip(digits.iter()) {
+            acc = self.add_niels(&acc, &Niels::gather(window, d));
         }
+        // The carry digit selects [2^256]B or the identity.
+        let top = Niels::select(
+            &Niels::from_entry(&ED25519_BASE_2_256),
+            &Niels::IDENTITY,
+            mask_from_bit(digits[64] as u64),
+        );
+        acc = self.add_niels(&acc, &top);
+        digits.zeroize();
         acc
     }
 
@@ -303,8 +432,8 @@ impl Field {
     }
 
     /// **Variable-time** fixed-base multiplication `[scalar]·B` over the same
-    /// comb table as [`Self::mul_base`], but indexing each window entry
-    /// directly and skipping zero digits.
+    /// signed table as [`Self::mul_base`], but indexing each window entry
+    /// directly by the digit's magnitude and skipping zero digits.
     ///
     /// # Warning: public inputs only
     ///
@@ -314,14 +443,18 @@ impl Field {
     /// never with signing nonces or secret keys.
     #[cfg(feature = "ed25519-table")]
     pub(crate) fn mul_base_vartime(&self, scalar: &[u8; 32]) -> Point {
+        let digits = radix16_signed(scalar);
         let mut acc = self.identity();
-        for (i, window) in ED25519_BASE_TABLE.iter().enumerate() {
-            let byte = scalar[i / 2];
-            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as usize;
-            if digit != 0 {
-                let cand = table_point(&window[digit - 1], self.one);
-                acc = self.point_add(&acc, &cand);
+        for (window, &d) in ED25519_BASE_TABLE.iter().zip(digits.iter()) {
+            if d > 0 {
+                acc = self.add_niels(&acc, &Niels::from_entry(&window[d as usize - 1]));
+            } else if d < 0 {
+                let n = Niels::from_entry(&window[(-d) as usize - 1]);
+                acc = self.add_niels(&acc, &n.negate());
             }
+        }
+        if digits[64] != 0 {
+            acc = self.add_niels(&acc, &Niels::from_entry(&ED25519_BASE_2_256));
         }
         acc
     }
@@ -489,6 +622,13 @@ fn wnaf5(scalar: &[u8; 32]) -> [i8; 261] {
 /// is zero. The mask comes from `field::eq_mask` / `field::mask_from_bit`
 /// (one barrier per selection) and is applied limbwise to all four
 /// coordinates.
+// Only the constant-time `scalar_mult` gathers whole points; same gate.
+#[cfg(any(
+    test,
+    feature = "hazmat-edwards25519",
+    feature = "ristretto255",
+    not(feature = "ed25519-table")
+))]
 #[inline]
 pub(crate) fn point_select(a: &Point, b: &Point, mask: u64) -> Point {
     Point {
@@ -502,16 +642,40 @@ pub(crate) fn point_select(a: &Point, b: &Point, mask: u64) -> Point {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bignum::Uint;
 
-    /// Re-derives every entry of the embedded fixed-base table from the
-    /// group law and cross-checks the constants, so `ED25519_BASE_TABLE` is
-    /// verified on every test run rather than trusted. The check is
-    /// inversion-free: the stored affine `(x, y, t)` matches the computed
-    /// extended `(X : Y : Z : T)` iff `x·Z == X`, `y·Z == Y` and `t·Z == T`.
+    /// Re-derives every entry of the embedded fixed-base tables from the
+    /// group law and cross-checks the constants, so `ED25519_BASE_TABLE` and
+    /// `ED25519_BASE_2_256` are verified on every test run rather than
+    /// trusted. The check is inversion-free: the stored Niels values match
+    /// the computed extended `(X : Y : Z : T)` iff `(y+x)·Z == Y + X`,
+    /// `(y−x)·Z == Y − X` and `(2dt)·Z² == 2d·X·Y`; every stored limb must
+    /// also be a canonical 51-bit limb.
     #[test]
     #[cfg(feature = "ed25519-table")]
     fn base_table_matches_computed() {
         let f = Field::new();
+        let check = |entry: &[u64; 15], acc: &Point| {
+            assert!(entry.iter().all(|&l| l < (1u64 << 51)), "limb not 51-bit");
+            let n = Niels::from_entry(entry);
+            let zz = f.sq(acc.z);
+            assert!(
+                bool::from(f.ct_eq(f.mul(n.ypx, acc.z), f.add(acc.y, acc.x))),
+                "y+x mismatch"
+            );
+            assert!(
+                bool::from(f.ct_eq(f.mul(n.ymx, acc.z), f.sub(acc.y, acc.x))),
+                "y−x mismatch"
+            );
+            assert!(
+                bool::from(f.ct_eq(f.mul(n.t2d, zz), f.mul(f.d2, f.mul(acc.x, acc.y)))),
+                "2dt mismatch"
+            );
+            // Canonical: the limbs round-trip through the encoding.
+            for v in [n.ypx, n.ymx, n.t2d] {
+                assert_eq!(Fe::from_bytes(&v.to_bytes()).0, v.0, "non-canonical entry");
+            }
+        };
         let mut base = f.base();
         for window in ED25519_BASE_TABLE.iter() {
             let mut acc = base;
@@ -519,12 +683,54 @@ mod tests {
                 if j > 0 {
                     acc = f.point_add(&acc, &base);
                 }
-                let e = table_point(entry, f.one);
-                assert!(bool::from(f.ct_eq(f.mul(e.x, acc.z), acc.x)), "x mismatch");
-                assert!(bool::from(f.ct_eq(f.mul(e.y, acc.z), acc.y)), "y mismatch");
-                assert!(bool::from(f.ct_eq(f.mul(e.t, acc.z), acc.t)), "t mismatch");
+                check(entry, &acc);
             }
             base = f.point_double(&f.point_double(&f.point_double(&f.point_double(&base))));
+        }
+        // After 64 windows `base` is [16^64]B = [2^256]B.
+        check(&ED25519_BASE_2_256, &base);
+    }
+
+    /// The signed recoding reproduces every scalar exactly, with digits in
+    /// `[−8, 8)` and the carry digit in `{0, 1}` — on the edge scalars and
+    /// random ones.
+    #[test]
+    #[cfg(feature = "ed25519-table")]
+    fn radix16_signed_round_trips() {
+        use crate::hash::Sha256;
+        use crate::rng::{HmacDrbg, RngCore};
+        let check = |s: &[u8; 32]| {
+            let d = radix16_signed(s);
+            assert!(d[..64].iter().all(|&x| (-8..8).contains(&x)));
+            assert!(d[64] == 0 || d[64] == 1);
+            // Σ d[i]·16^i as a 264-bit little-endian integer, built from the
+            // top digit down (Horner), must equal the scalar.
+            let mut acc = Uint::<5>::ZERO;
+            for &x in d.iter().rev() {
+                // acc = acc·16 + x (x may be negative: add 16 then subtract).
+                let sixteen = Uint::<5>::from_u64(16);
+                let (lo, _) = acc.mul_wide(&sixteen);
+                acc = lo;
+                if x >= 0 {
+                    acc = acc.wrapping_add(&Uint::<5>::from_u64(x as u64));
+                } else {
+                    acc = acc.wrapping_sub(&Uint::<5>::from_u64((-x) as u64));
+                }
+            }
+            let mut want = [0u8; 40];
+            want[..32].copy_from_slice(s);
+            assert_eq!(acc, Uint::<5>::from_le_bytes(&want), "recoding of {s:02x?}");
+        };
+        check(&[0u8; 32]);
+        check(&[0xffu8; 32]);
+        check(&[0x80u8; 32]);
+        check(&[0x88u8; 32]);
+        check(&[0x78u8; 32]);
+        let mut rng = HmacDrbg::<Sha256>::new(b"radix16-signed", b"nonce", &[]);
+        for _ in 0..200 {
+            let mut s = [0u8; 32];
+            rng.fill_bytes(&mut s);
+            check(&s);
         }
     }
 
@@ -616,42 +822,63 @@ mod tests {
 
     /// Regenerates the fixed-base table source
     /// (`src/ec/curve25519/base_table.rs`). Run with:
-    /// `cargo test --release gen_ed25519_base_table -- --ignored --nocapture`
-    /// and paste the emitted `static` between the file's header comment and
-    /// EOF. The non-ignored `base_table_matches_computed` test keeps the
-    /// pasted constants honest on every test run.
+    /// `cargo test --release gen_ed25519_base_table -- --ignored --nocapture`,
+    /// paste the emitted `static`s between the file's header comment and
+    /// EOF, and run `cargo fmt`. The non-ignored `base_table_matches_computed`
+    /// test keeps the pasted constants honest on every test run.
     #[test]
     #[ignore = "table generator; emits Rust source on stdout"]
     #[cfg(feature = "std")]
     fn gen_ed25519_base_table() {
         use std::{print, println};
         let f = Field::new();
+        // Affine Niels (y+x, y−x, 2d·x·y) as canonical plain residues,
+        // printed as 51-bit limbs (fully reduced via the to/from bytes
+        // round-trip).
+        let niels = |p: &Point| -> [u64; 15] {
+            let zinv = f.inv(p.z);
+            let x = Fe::from_bytes(&f.mul(p.x, zinv).to_bytes());
+            let y = Fe::from_bytes(&f.mul(p.y, zinv).to_bytes());
+            let ypx = Fe::from_bytes(&f.add(y, x).to_bytes());
+            let ymx = Fe::from_bytes(&f.sub(y, x).to_bytes());
+            let t2d = Fe::from_bytes(&f.mul(f.mul(x, y), f.d2).to_bytes());
+            let mut out = [0u64; 15];
+            out[..5].copy_from_slice(&ypx.0);
+            out[5..10].copy_from_slice(&ymx.0);
+            out[10..].copy_from_slice(&t2d.0);
+            out
+        };
+        let print_entry = |e: &[u64; 15]| {
+            print!("        [");
+            for l in e {
+                print!("0x{l:013x}, ");
+            }
+            println!("],");
+        };
         // base = [16^i]B for the current window i.
         let mut base = f.base();
-        println!("pub(crate) static ED25519_BASE_TABLE: [[[u64; 15]; 15]; 64] = [");
+        println!("pub(crate) static ED25519_BASE_TABLE: [[[u64; 15]; 8]; 64] = [");
         for _ in 0..64 {
             println!("    [");
             let mut acc = base;
-            for j in 1..=15u32 {
+            for j in 1..=8u32 {
                 if j > 1 {
                     acc = f.point_add(&acc, &base);
                 }
-                // Affine (x, y, t = x·y), canonical plain residues, printed
-                // as 51-bit limbs (fully reduced via the to/from bytes
-                // round-trip).
-                let zinv = f.inv(acc.z);
-                let x = Fe::from_bytes(&f.mul(acc.x, zinv).to_bytes());
-                let y = Fe::from_bytes(&f.mul(acc.y, zinv).to_bytes());
-                let t = Fe::from_bytes(&f.mul(x, y).to_bytes());
-                print!("        [");
-                for l in x.0.iter().chain(y.0.iter()).chain(t.0.iter()) {
-                    print!("0x{l:013x}, ");
-                }
-                println!("],");
+                print_entry(&niels(&acc));
             }
             println!("    ],");
             base = f.point_double(&f.point_double(&f.point_double(&f.point_double(&base))));
         }
+        println!("];");
+        println!();
+        // base is now [16^64]B = [2^256]B.
+        println!("pub(crate) static ED25519_BASE_2_256: [u64; 15] = [");
+        print!("    ");
+        for l in &niels(&base) {
+            print!("0x{l:013x}, ");
+        }
+        println!();
         println!("];");
     }
 }
