@@ -52,7 +52,7 @@ use super::aead::{Aead, ct_find_last_nonzero};
 use super::prf;
 use super::schedule::HashAlg;
 use super::suite::AeadAlg;
-use crate::tls::{ContentType, Error};
+use crate::tls::{ContentType, Error, ProtocolVersion};
 use alloc::vec::Vec;
 
 /// AES-GCM's safe per-key record bound, RFC 8446 §5.5 / RFC 9001 §6.6:
@@ -297,15 +297,24 @@ impl RecordCrypter12 {
     /// the fragment: the explicit nonce (GCM only) followed by the
     /// ciphertext and tag.
     fn seal(&self, seq: u64, aad: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.explicit_len() + payload.len() + TAG_LEN);
+        self.seal_into(seq, aad, payload, &mut out);
+        out
+    }
+
+    /// [`Self::seal`] appended to `out`: the explicit nonce (GCM only),
+    /// then the payload, encrypted where it lands, then the tag. One copy
+    /// of the payload, into its final place.
+    fn seal_into(&self, seq: u64, aad: &[u8], payload: &[u8], out: &mut Vec<u8>) {
         let explicit = seq.to_be_bytes();
         let explicit = &explicit[..self.explicit_len()];
         let nonce = self.aead_nonce(seq, explicit);
-        let mut out = Vec::with_capacity(explicit.len() + payload.len() + TAG_LEN);
+        out.reserve(explicit.len() + payload.len() + TAG_LEN);
         out.extend_from_slice(explicit);
+        let start = out.len();
         out.extend_from_slice(payload);
-        let tag = self.aead.encrypt(&nonce, aad, &mut out[explicit.len()..]);
+        let tag = self.aead.encrypt(&nonce, aad, &mut out[start..]);
         out.extend_from_slice(&tag);
-        out
     }
 
     /// Opens the record numbered `seq`. `fragment` is the bytes after the
@@ -338,6 +347,38 @@ impl RecordCrypter12 {
             return Err(Error::BadRecordMac);
         }
         Ok(buf)
+    }
+
+    /// [`Self::open`] in place: on success the plaintext occupies
+    /// `fragment[r]` for the returned range `r` (the explicit nonce and the
+    /// tag stay around it), so a record is decrypted where it was read
+    /// rather than copied out first. Same errors as [`Self::open`].
+    fn open_in_place<A: AsRef<[u8]>>(
+        &self,
+        seq: u64,
+        fragment: &mut [u8],
+        aad_for: impl FnOnce(u16) -> A,
+    ) -> Result<core::ops::Range<usize>, Error> {
+        let explicit_len = self.explicit_len();
+        if fragment.len() < explicit_len + TAG_LEN {
+            return Err(Error::Decode);
+        }
+        let plaintext_len = fragment.len() - explicit_len - TAG_LEN;
+        if plaintext_len > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
+        let aad = aad_for(plaintext_len as u16);
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&fragment[explicit_len + plaintext_len..]);
+        let (explicit, body) = fragment.split_at_mut(explicit_len);
+        let nonce = self.aead_nonce(seq, explicit);
+        if !self
+            .aead
+            .decrypt(&nonce, aad.as_ref(), &mut body[..plaintext_len], &tag)
+        {
+            return Err(Error::BadRecordMac);
+        }
+        Ok(explicit_len..explicit_len + plaintext_len)
     }
 
     /// Encrypts one DTLS 1.2 record's payload with a caller-supplied 64-bit
@@ -465,6 +506,38 @@ impl RecordCrypter12 {
         Ok(out)
     }
 
+    /// [`Self::encrypt`] framed as a complete TLS record appended to `out`:
+    /// the 5-byte header (`content_type`, `version`, fragment length), the
+    /// explicit nonce, the payload encrypted in place and the tag. The
+    /// payload is copied once, into the output buffer, instead of into a
+    /// fragment and then into the record.
+    pub(crate) fn encrypt_into(
+        &mut self,
+        content_type: ContentType,
+        version: ProtocolVersion,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        if payload.len() > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
+        // See `encrypt`: the closing alert is let through at the cap.
+        let closing_alert = content_type == ContentType::Alert && payload.len() == 2;
+        if self.seq >= self.max_records && !closing_alert {
+            return Err(Error::TooManyRecords);
+        }
+        let aad = Self::aad(self.seq, content_type, payload.len() as u16);
+        let fragment_len = self.explicit_len() + payload.len() + TAG_LEN;
+        out.reserve(5 + fragment_len);
+        out.push(content_type.as_u8());
+        out.extend_from_slice(&version.as_u16().to_be_bytes());
+        // Fits: at most 2^14 + 8 + 16.
+        out.extend_from_slice(&(fragment_len as u16).to_be_bytes());
+        self.seal_into(self.seq, &aad, payload, out);
+        self.seq += 1;
+        Ok(())
+    }
+
     /// Decrypts one TLS 1.2 record's fragment.
     ///
     /// `record_header` is the 5-byte `TLSCiphertext` header (used to recover
@@ -493,6 +566,25 @@ impl RecordCrypter12 {
         let buf = self.open(seq, fragment, |len| Self::aad(seq, content_type, len))?;
         self.seq += 1;
         Ok((content_type, buf))
+    }
+
+    /// [`Self::decrypt`] in place: the plaintext is left in `fragment[r]`
+    /// for the returned range `r`, with no copy of the record.
+    pub(crate) fn decrypt_in_place(
+        &mut self,
+        record_header: &[u8; 5],
+        fragment: &mut [u8],
+    ) -> Result<(ContentType, core::ops::Range<usize>), Error> {
+        let content_type = ContentType::from_u8(record_header[0]);
+        let closing_alert = content_type == ContentType::Alert
+            && fragment.len() == self.explicit_len() + 2 + TAG_LEN;
+        if self.seq >= self.max_records && !closing_alert {
+            return Err(Error::TooManyRecords);
+        }
+        let seq = self.seq;
+        let r = self.open_in_place(seq, fragment, |len| Self::aad(seq, content_type, len))?;
+        self.seq += 1;
+        Ok((content_type, r))
     }
 }
 

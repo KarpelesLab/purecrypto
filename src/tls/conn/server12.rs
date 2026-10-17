@@ -1086,8 +1086,7 @@ impl<R: RngCore> ServerConnection12<R> {
             .server_crypter
             .as_mut()
             .ok_or(Error::InappropriateState)?;
-        let fragment = crypter.encrypt(ct, version, payload)?;
-        write_record(&mut self.outbuf, ct, version, &fragment)
+        crypter.encrypt_into(ct, version, payload, &mut self.outbuf)
     }
 
     /// Test-only: like [`Self::emit_encrypted`], but a CBC record is padded
@@ -1154,7 +1153,7 @@ impl<R: RngCore> ServerConnection12<R> {
             let Some(ParsedRecord {
                 content_type,
                 version,
-                fragment,
+                fragment: _,
                 len,
             }) = read_record_with_max(&self.inbuf[self.in_off..], max_fragment)?
             else {
@@ -1169,7 +1168,10 @@ impl<R: RngCore> ServerConnection12<R> {
             }
             let mut header = [0u8; 5];
             header.copy_from_slice(&self.inbuf[self.in_off..self.in_off + 5]);
-            let fragment = fragment.to_vec();
+            // The fragment stays in `inbuf` (at `frag`) and is decrypted
+            // there, in place; the read cursor moves past it now, so an
+            // error below leaves nothing to re-read.
+            let frag = self.in_off + 5..self.in_off + len;
             self.in_off += len;
 
             match content_type {
@@ -1178,7 +1180,7 @@ impl<R: RngCore> ServerConnection12<R> {
                     // accept it in the middlebox-compat window, and only when
                     // we're waiting for the client's Finished (fresh or
                     // resumed) — and we have a pending read crypter ready.
-                    if !self.ccs_window_open || fragment.as_slice() != [0x01] {
+                    if !self.ccs_window_open || self.inbuf[frag.clone()] != [0x01] {
                         return Err(Error::UnexpectedMessage);
                     }
                     // RFC 5246 §7.1: exactly one CCS per direction.
@@ -1212,31 +1214,29 @@ impl<R: RngCore> ServerConnection12<R> {
                     continue;
                 }
                 ContentType::Handshake => {
-                    if let Some(c) = self.client_crypter.as_mut() {
-                        let (_ct, plain) = c.decrypt(&header, &fragment)?;
-                        self.check_inbound_record_size_limit(plain.len())?;
-                        if plain.is_empty() {
-                            return Err(Error::UnexpectedMessage);
-                        }
-                        self.append_handshake_bytes(&plain)?;
+                    let plain = if let Some(c) = self.client_crypter.as_mut() {
+                        let (_ct, r) =
+                            c.decrypt_in_place(&header, &mut self.inbuf[frag.clone()])?;
+                        self.check_inbound_record_size_limit(r.len())?;
+                        frag.start + r.start..frag.start + r.end
                     } else {
-                        // RFC 5246 §6.2.1 / RFC 8446 §5.1: zero-length
-                        // handshake fragments MUST NOT be sent — the same
-                        // rule the protected branch above enforces, and the
-                        // 1.3 core enforces in `ConnectionCore`.
-                        if fragment.is_empty() {
-                            return Err(Error::UnexpectedMessage);
-                        }
-                        self.append_handshake_bytes(&fragment)?;
+                        frag.clone()
+                    };
+                    // RFC 5246 §6.2.1 / RFC 8446 §5.1: zero-length handshake
+                    // fragments MUST NOT be sent, protected or not — the
+                    // rule the 1.3 core enforces in `ConnectionCore`.
+                    if plain.is_empty() {
+                        return Err(Error::UnexpectedMessage);
                     }
+                    self.append_handshake_range(plain)?;
                 }
                 ContentType::ApplicationData => {
                     let c = self
                         .client_crypter
                         .as_mut()
                         .ok_or(Error::UnexpectedMessage)?;
-                    let (_ct, plain) = c.decrypt(&header, &fragment)?;
-                    self.check_inbound_record_size_limit(plain.len())?;
+                    let (_ct, r) = c.decrypt_in_place(&header, &mut self.inbuf[frag.clone()])?;
+                    self.check_inbound_record_size_limit(r.len())?;
                     // Only buffer application data once the handshake has
                     // completed (the client's Finished has verified). Before
                     // that the peer — under mTLS, its certificate — is not
@@ -1246,18 +1246,20 @@ impl<R: RngCore> ServerConnection12<R> {
                     if self.state != State::Connected {
                         return Err(Error::UnexpectedMessage);
                     }
-                    self.app_in.extend_from_slice(&plain);
+                    self.app_in
+                        .extend_from_slice(&self.inbuf[frag.start + r.start..frag.start + r.end]);
                     return Ok(Some(Incoming::ApplicationData));
                 }
                 ContentType::Alert => {
-                    let payload: Vec<u8> = if let Some(c) = self.client_crypter.as_mut() {
-                        let (_ct, plain) = c.decrypt(&header, &fragment)?;
-                        self.check_inbound_record_size_limit(plain.len())?;
-                        plain
+                    let payload = if let Some(c) = self.client_crypter.as_mut() {
+                        let (_ct, r) =
+                            c.decrypt_in_place(&header, &mut self.inbuf[frag.clone()])?;
+                        self.check_inbound_record_size_limit(r.len())?;
+                        frag.start + r.start..frag.start + r.end
                     } else {
-                        fragment
+                        frag.clone()
                     };
-                    return Ok(Some(parse_alert(&payload)?));
+                    return Ok(Some(parse_alert(&self.inbuf[payload])?));
                 }
                 _ => return Err(Error::UnexpectedMessage),
             }
@@ -1270,11 +1272,13 @@ impl<R: RngCore> ServerConnection12<R> {
     /// peer could send a giant length-claim and slow-drip fragments that
     /// never complete, pinning up to ~16 MiB per connection pre-authentication.
     /// Mirrors `ConnectionCore::append_handshake_bytes` on the TLS 1.3 path.
-    fn append_handshake_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if self.hs_pending.len().saturating_add(bytes.len()) > MAX_HANDSHAKE_REASSEMBLY {
+    /// The bytes come from `inbuf` at `r` (a record decrypted in place),
+    /// so the copy into the reassembly buffer is the only one.
+    fn append_handshake_range(&mut self, r: core::ops::Range<usize>) -> Result<(), Error> {
+        if self.hs_pending.len().saturating_add(r.len()) > MAX_HANDSHAKE_REASSEMBLY {
             return Err(Error::RecordOverflow);
         }
-        self.hs_pending.extend_from_slice(bytes);
+        self.hs_pending.extend_from_slice(&self.inbuf[r]);
         Ok(())
     }
 

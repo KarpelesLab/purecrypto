@@ -10,8 +10,8 @@
 //! For the AEAD arm the protocol version is irrelevant (the nonce/AAD encode
 //! the sequence number, not the record version); for the CBC arm the version
 //! is part of the MAC input and the record-framing version, so the connection
-//! threads its negotiated version through [`RecordProtection::encrypt`] and the
-//! decrypt path recovers it from the record header.
+//! threads its negotiated version through [`RecordProtection::encrypt_into`]
+//! and the decrypt path recovers it from the record header.
 
 use super::aead12::RecordCrypter12;
 #[cfg(feature = "tls-legacy")]
@@ -34,26 +34,12 @@ pub(crate) enum RecordProtection {
 }
 
 impl RecordProtection {
-    /// Encrypts `payload` (already at most one plaintext fragment) into a
-    /// record fragment. `version` is the negotiated protocol version; it is
-    /// ignored by the AEAD arm and used as the CBC MAC's version field.
-    pub(crate) fn encrypt(
-        &mut self,
-        ct: ContentType,
-        #[cfg_attr(not(feature = "tls-legacy"), allow(unused_variables))] version: ProtocolVersion,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, Error> {
-        match self {
-            RecordProtection::Aead(c) => c.encrypt(ct, payload),
-            #[cfg(feature = "tls-legacy")]
-            RecordProtection::Cbc(c) => Ok(c.encrypt(ct, version, payload)),
-        }
-    }
-
     /// Decrypts one record fragment given its 5-byte `record_header`. Returns
     /// the record's content type and the recovered plaintext. The CBC arm
     /// recovers the content type and version it needs for MAC verification from
     /// the header.
+    // The in-place path below covers the AEAD arm; this stays for the CBC arm.
+    #[cfg_attr(not(feature = "tls-legacy"), allow(dead_code))]
     pub(crate) fn decrypt(
         &mut self,
         record_header: &[u8; 5],
@@ -82,6 +68,49 @@ impl RecordProtection {
         }
     }
 
+    /// Encrypts `payload` (already at most one plaintext fragment) as a
+    /// complete record appended to `out`. `version` is the negotiated
+    /// protocol version: the record-header version for both arms and the
+    /// CBC MAC's version field. The AEAD arm encrypts the payload in place
+    /// inside `out` (one copy); the CBC arm keeps its own encrypt and is
+    /// framed as before.
+    pub(crate) fn encrypt_into(
+        &mut self,
+        ct: ContentType,
+        version: ProtocolVersion,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        match self {
+            RecordProtection::Aead(c) => c.encrypt_into(ct, version, payload, out),
+            #[cfg(feature = "tls-legacy")]
+            RecordProtection::Cbc(c) => {
+                crate::tls::codec::write_record(out, ct, version, &c.encrypt(ct, version, payload))
+            }
+        }
+    }
+
+    /// [`Self::decrypt`] without the copy: the plaintext is left in
+    /// `fragment[r]` for the returned range `r`. The AEAD arm decrypts in
+    /// place; the CBC arm keeps its Lucky13-equalised decrypt untouched
+    /// and moves the (shorter: IV, MAC and padding removed) plaintext to
+    /// the front of `fragment`.
+    pub(crate) fn decrypt_in_place(
+        &mut self,
+        record_header: &[u8; 5],
+        fragment: &mut [u8],
+    ) -> Result<(ContentType, core::ops::Range<usize>), Error> {
+        match self {
+            RecordProtection::Aead(c) => c.decrypt_in_place(record_header, fragment),
+            #[cfg(feature = "tls-legacy")]
+            RecordProtection::Cbc(_) => {
+                let (ct, plain) = self.decrypt(record_header, fragment)?;
+                fragment[..plain.len()].copy_from_slice(&plain);
+                Ok((ct, 0..plain.len()))
+            }
+        }
+    }
+
     /// Largest ciphertext fragment a record protected under this scheme may
     /// legally carry: RFC 5246 §6.2.3 allows `2^14 + 2048` for block ciphers
     /// (IV + MAC + up to 256 bytes of padding on a full 2^14 fragment), while
@@ -94,7 +123,7 @@ impl RecordProtection {
         }
     }
 
-    /// Test hook: like [`Self::encrypt`], but a CBC record is padded to the
+    /// Test hook: the record fragment alone, where a CBC record is padded to the
     /// maximum RFC 5246 §6.2.3.2 allows (up to 256 bytes) instead of the
     /// minimum, to exercise the peer's record-size bound. AEAD records have
     /// no padding and are emitted unchanged.
