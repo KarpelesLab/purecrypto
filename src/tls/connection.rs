@@ -197,10 +197,15 @@ enum Engine {
     ServerDtls12(Box<crate::dtls::DtlsServerConnection12<ConfigRng>>),
 }
 
-/// Upper bound on bytes buffered while waiting to decide a deferred server's
-/// version. A ClientHello (even with PQ key shares / ECH / large CA lists) fits
-/// comfortably under this; a peer that dribbles bytes without ever completing a
-/// ClientHello is cut off with `decode_error` rather than buffered unboundedly.
+/// Upper bound on bytes *retained* while waiting to decide a deferred
+/// connection's version (the server's first ClientHello, the client's first
+/// ServerHello). A ClientHello (even with PQ key shares / ECH / large CA lists)
+/// fits comfortably under this; a peer that dribbles bytes without ever
+/// completing its hello is cut off with `decode_error` rather than buffered
+/// unboundedly. The bound is checked after the pending bytes have been offered
+/// to the engine, never before: a single large read that decides the version
+/// on its own (a ServerHello followed by a big certificate chain, a ClientHello
+/// followed by 0-RTT data) retains nothing and is never cut off.
 const MAX_HS_PEEK: usize = 64 * 1024;
 
 /// The single concrete server engine a [`ServerConnectionAuto`] resolves to.
@@ -245,11 +250,18 @@ impl ServerConnectionAuto {
                 c.process_new_packets()
             }
             None => {
-                if self.buffered.len().saturating_add(wire_in.len()) > MAX_HS_PEEK {
+                // Resolve first, bound what is retained afterwards: one
+                // `feed` carrying a complete ClientHello followed by a large
+                // 0-RTT flight is legitimate and resolves on the spot (the
+                // peeker copies no more than the ClientHello itself), so the
+                // bound must only apply to bytes still held for a later
+                // replay.
+                self.buffered.extend_from_slice(wire_in);
+                let r = self.try_resolve();
+                if r.is_ok() && self.resolved.is_none() && self.buffered.len() > MAX_HS_PEEK {
                     return Err(Error::Decode);
                 }
-                self.buffered.extend_from_slice(wire_in);
-                self.try_resolve()
+                r
             }
         }
     }
@@ -468,12 +480,14 @@ impl ClientConnectionAuto {
                 }
             };
         }
-        // Undecided: only the 1.3 engine is live. Buffer the server bytes so we
-        // can replay them into a 1.2 engine if the server downgrades us.
-        if self.recv_buffer.len().saturating_add(wire_in.len()) > MAX_HS_PEEK {
-            return Err(Error::Decode);
-        }
-        self.recv_buffer.extend_from_slice(wire_in);
+        // Undecided: only the 1.3 engine is live. It sees the bytes first;
+        // whatever it has not settled is then retained so it can be replayed
+        // into a 1.2 engine if the server downgrades us. Processing before
+        // bounding the retained copy matters: a single `feed` carrying a
+        // valid TLS 1.3 ServerHello plus a large first flight (a big
+        // certificate chain) is legitimate and decides the version by
+        // itself, so the peek bound must only ever apply to bytes we would
+        // actually keep around.
         let ClientInner::Tls13(c) = &mut self.inner else {
             return Err(Error::InappropriateState);
         };
@@ -483,19 +497,30 @@ impl ClientConnectionAuto {
             // Server selected TLS 1.2: build a 1.2 engine adopting our sent
             // ClientHello, then replay the full buffered server flight into it.
             let mut t12 = Box::new(build_tls12_client_adopt(&self.config, &self.sent_ch)?);
-            let buffered = core::mem::take(&mut self.recv_buffer);
+            let mut buffered = core::mem::take(&mut self.recv_buffer);
+            buffered.extend_from_slice(wire_in);
             t12.read_tls(&buffered);
             let r = t12.process_new_packets();
             self.inner = ClientInner::Tls12(t12);
             self.decided = true;
             return r;
         }
-        // The 1.3 engine fixed its suite (ServerHello processed) ⇒ committed to
-        // 1.3; stop buffering.
-        if c.negotiated_cipher_suite().is_some() {
+        // The 1.3 engine fixed its suite (ServerHello processed) ⇒ committed
+        // to 1.3; stop buffering. A HelloRetryRequest commits the server to
+        // 1.3 just the same (RFC 8446 §4.1.4 — the engine refuses a 1.2
+        // ServerHello after one), so nothing after it can ever be replayed.
+        if c.negotiated_cipher_suite().is_some() || c.hello_retry_request_seen() {
             self.decided = true;
             self.recv_buffer = Vec::new();
+            return Ok(());
         }
+        // Still undecided (a partial ServerHello): retain the bytes for a
+        // possible replay, bounded — a server that dribbles without ever
+        // completing a ServerHello is cut off rather than buffered forever.
+        if self.recv_buffer.len().saturating_add(wire_in.len()) > MAX_HS_PEEK {
+            return Err(Error::Decode);
+        }
+        self.recv_buffer.extend_from_slice(wire_in);
         Ok(())
     }
 
@@ -4832,6 +4857,72 @@ mod tests {
         assert!(client.is_handshake_complete() && server.is_handshake_complete());
         assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
         assert_eq!(server.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+    }
+
+    /// T13-F3: the version-spanning client's peek bound (`MAX_HS_PEEK`) used
+    /// to be applied to a whole `feed` before the 1.3 engine saw any of it,
+    /// so a single read carrying a valid TLS 1.3 ServerHello followed by a
+    /// first flight larger than 64 KiB (here: a certificate chain padded well
+    /// past it) failed with `decode_error`. The flight decides the version by
+    /// itself, so nothing of it is ever retained for a 1.2 replay and the
+    /// bound must not apply. An ML-DSA-87 chain (about 7 KiB per
+    /// certificate) gets there within the client's 16-entry limit — the
+    /// post-quantum chains that make first flights this big in practice.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn auto_client_accepts_a_first_flight_larger_than_the_peek_bound() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"tls13-big-flight", b"nonce", &[]);
+        let (key, _) = crate::mldsa::MlDsa87PrivateKey::generate(&mut rng);
+        let name = DistinguishedName::common_name("tls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::MlDsa87(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["tls.example"],
+        )
+        .unwrap()
+        .to_der()
+        .to_vec();
+        // Pad the chain (the client does not verify it) until the server's
+        // first flight is comfortably past the 64 KiB peek bound.
+        let copies = (70 * 1024) / cert.len() + 1;
+        assert!(copies <= 16, "client caps the chain at 16 entries");
+        let chain: Vec<Vec<u8>> = core::iter::repeat_n(cert, copies).collect();
+        let server_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .identity(
+                chain,
+                super::super::config::SigningKey::MlDsa87(key.clone()),
+            );
+        // RFC 8879 compression would squeeze the repeated chain back under
+        // the bound; the point is the raw flight size.
+        #[cfg(feature = "cert-compression")]
+        let server_cfg = server_cfg.own_cert_compression_algorithms(Vec::new());
+        let server_cfg = server_cfg.build();
+
+        let mut client = Connection::client(&auto_client_cfg()).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let _ = client.handshake();
+        server.feed(&client.pop().unwrap()).unwrap();
+        let _ = server.handshake();
+        let flight = server.pop().unwrap();
+        assert!(
+            flight.len() > MAX_HS_PEEK,
+            "flight is {} bytes",
+            flight.len()
+        );
+        // The whole flight in one feed.
+        client.feed(&flight).unwrap();
+        assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+        drive_pair(&mut client, &mut server);
+        assert!(client.is_handshake_complete() && server.is_handshake_complete());
     }
 
     /// The same auto client completes with a TLS 1.2-only server by downgrading
