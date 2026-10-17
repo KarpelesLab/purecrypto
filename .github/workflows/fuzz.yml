@@ -6,6 +6,12 @@ name: Fuzz
 # workflow artifacts so they can be added to the per-target seed corpus
 # as regression fixtures.
 #
+# Each target runs for `duration` seconds (300 by default) and the
+# corpus libFuzzer grows is cached per target across runs, so coverage
+# accumulates week over week instead of restarting from random bytes.
+# This is still a smoke-level budget: for a real campaign run
+# `cargo +nightly fuzz run <target> -- -max_total_time=<hours>` locally.
+#
 # The targets and the `fuzz/` workspace they live in are intentionally
 # excluded from the main Cargo workspace, so nothing here affects the
 # day-to-day stable build.
@@ -15,7 +21,7 @@ on:
     inputs:
       duration:
         description: "Seconds to fuzz each target"
-        default: "60"
+        default: "300"
         required: false
   schedule:
     # Weekly. Offset off the hour so we don't pile onto the :00 cron rush.
@@ -69,6 +75,12 @@ jobs:
           - falcon_verify
           - mldsa_verify
           - slhdsa_verify
+          - jose_json
+          - jose_jws_parse
+          - jose_jwe_parse
+          - jose_jwk_parse
+          - x509_sct_list
+          - x509_verify_chain
     steps:
       - uses: actions/checkout@v6
 
@@ -86,11 +98,30 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
+      # Persist the corpus libFuzzer builds up so each weekly run starts
+      # where the last one left off. The key includes the run id so a
+      # fresh (grown) corpus is saved every time; `restore-keys` picks
+      # the newest previous one for this target.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
       - name: Run ${{ matrix.target }}
+        env:
+          # Passed through the environment, never interpolated into the
+          # script, so a dispatch input can't inject shell.
+          DURATION: ${{ inputs.duration || '300' }}
+          TARGET: ${{ matrix.target }}
         run: |
-          DURATION="${{ github.event.inputs.duration || '60' }}"
+          mkdir -p "fuzz/corpus/$TARGET"
           cd fuzz
-          cargo +nightly fuzz run "${{ matrix.target }}" \
+          # The first positional directory is the one libFuzzer writes new
+          # inputs to, so it is also what the cache step above persists.
+          cargo +nightly fuzz run "$TARGET" "corpus/$TARGET" \
             -- -max_total_time="$DURATION" -print_final_stats=1
 
       - name: Upload crash artifacts
