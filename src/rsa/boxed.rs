@@ -3084,18 +3084,21 @@ mod tests {
         }
         // A repeated prime: n = p·q·p presented with primes (p, q, p). The
         // product matches, so this is the pairwise-distinct check firing.
+        let dup_n = c.p.mul(&c.q).mul(&c.p);
         let dup = ThreePrime {
-            n: c.p.mul(&c.q).mul(&c.p),
+            // `d` is folded below the bogus modulus (whether the honest `d`
+            // is already below `p·q·p` depends on the draw), so `d` out of
+            // range is not what fires: the component checks run on any blob
+            // whose `d < n`.
+            d: c.d.reduce(&dup_n),
+            n: dup_n,
             e: c.e.clone(),
-            d: c.d.clone(),
             p: c.p.clone(),
             q: c.q.clone(),
             r: c.p.clone(),
         };
         let blob = pkcs1_blob(1, &dup, &dup.d, &[(&dup.r, &d3, &t3)], false);
         assert!(BoxedRsaPrivateKey::from_pkcs1_der(&blob).is_err());
-        // `d` out of range against the bogus modulus is not what fires: the
-        // component check runs on any blob whose `d < n`.
         assert!(dup.d.lt(&dup.n));
     }
 

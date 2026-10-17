@@ -77,6 +77,8 @@ pub(crate) fn limb_mask(choice: Choice) -> u64 {
 
 /// `out[i] ← a[i]` when `choice` is true, else `b[i]`, over the common
 /// length of the three slices, with one opaque mask for the whole select.
+/// (The slice forms serve the runtime-sized bignums, hence the gate.)
+#[cfg(feature = "alloc")]
 #[inline]
 pub(crate) fn select_limbs_into(a: &[u64], b: &[u64], choice: Choice, out: &mut [u64]) {
     let mask = limb_mask(choice);
@@ -87,6 +89,7 @@ pub(crate) fn select_limbs_into(a: &[u64], b: &[u64], choice: Choice, out: &mut 
 
 /// `dst[i] ← src[i]` when `choice` is true, else unchanged, over the common
 /// length, with one opaque mask.
+#[cfg(feature = "alloc")]
 #[inline]
 pub(crate) fn assign_limbs(dst: &mut [u64], src: &[u64], choice: Choice) {
     let mask = limb_mask(choice);
@@ -235,6 +238,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn slice_helpers() {
         assert_eq!(limb_mask(t()), u64::MAX);

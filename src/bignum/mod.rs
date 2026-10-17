@@ -48,12 +48,9 @@ pub use montgomery::MontModulus;
 // The prime-testing helpers are only reached from `prime` (above) and
 // `rsa::prime`; gate them the same way so other feature sets stay free of
 // dead code.
-#[cfg(all(
-    feature = "alloc",
-    feature = "rng",
-    any(feature = "rsa", feature = "dh", feature = "dsa")
-))]
-pub(crate) use uint::mod_u32_ct;
 pub use uint::{LIMB_BITS, Limb, Uint};
 #[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
-pub(crate) use uint::{mod_small_limbs, trailing_zeros_step};
+pub(crate) use uint::{
+    SIEVE_MIN_BITS, SIEVE_WINDOW, mod_small_limbs, mod_u32_with_recip, recip_u32,
+    trailing_zeros_step,
+};

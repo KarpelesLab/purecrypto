@@ -58,18 +58,43 @@ fn mulhi_128_by_64(a: u128, b: u64) -> u64 {
     ((hi + (lo >> 64)) >> 64) as u64
 }
 
-/// Constant-time `v mod p` for `v, p < 2^32` (`p` public, nonzero), by the
-/// same reciprocal trick with a 64-bit reciprocal.
-#[cfg(all(
-    feature = "alloc",
-    feature = "rng",
-    any(feature = "rsa", feature = "dh", feature = "dsa")
-))]
-pub(crate) fn mod_u32_ct(v: u64, p: u64) -> u64 {
-    debug_assert!(p > 0 && p < (1 << 32) && v < (1 << 32));
-    let c = u64::MAX / p + 1;
+/// The 64-bit reciprocal `⌈2^64 / p⌉` behind [`mod_u32_with_recip`], for callers
+/// that reduce many values by the same public `p` (the prime sieves).
+#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[inline]
+pub(crate) fn recip_u32(p: u64) -> u64 {
+    debug_assert!(p > 0 && p < (1 << 32));
+    u64::MAX / p + 1
+}
+
+/// Constant-time `v mod p` for `v, p < 2^32` (`p` public, nonzero) with the
+/// reciprocal `c = recip_u32(p)` precomputed (Lemire–Kaser–Kurz, exact for
+/// 32-bit operands with a 64-bit reciprocal).
+#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[inline]
+pub(crate) fn mod_u32_with_recip(v: u64, p: u64, c: u64) -> u64 {
+    debug_assert!(v < (1 << 32));
     ((c.wrapping_mul(v) as u128 * p as u128) >> 64) as u64
 }
+
+/// Odd candidates an incremental search tries past its random start before
+/// drawing a fresh one: a 2^15-wide window, which a 1024-bit search (prime
+/// density ~1/355 among odd numbers) clears with ~46 primes expected, so a
+/// redraw is rare. A candidate `n₀ + 2k` is rejected by the sieve from the
+/// residues `n₀ mod p` alone — `(r_p + 2k) mod p`, one multiply per prime —
+/// without touching the multi-limb value, which only the survivors get a
+/// Miller-Rabin round on. Which `k` survives is a function of the secret
+/// start, but so is how many fresh draws the old loop took: both leak only
+/// the (public) rejection count, and the incremental search is the one
+/// OpenSSL and BoringSSL use.
+#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+pub(crate) const SIEVE_WINDOW: u64 = 1 << 15;
+
+/// Below this many bits the sieve could reject the primes of its own table
+/// (every prime below the bound divides itself), so candidates are drawn and
+/// tested one by one instead.
+#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+pub(crate) const SIEVE_MIN_BITS: usize = 32;
 
 /// Branch-free fold step for counting the trailing zero bits of a
 /// multi-limb value, low limb first: `popcount(x | −x)` is `64 − tz(x)` for

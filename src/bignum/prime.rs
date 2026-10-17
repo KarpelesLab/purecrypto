@@ -5,7 +5,10 @@
 //! so the shared core lives here in `bignum` — which both depend on — rather
 //! than one feature depending on the other.
 
-use super::{BoxedMontModulus, BoxedUint, mod_small_limbs, mod_u32_ct, trailing_zeros_step};
+use super::{
+    BoxedMontModulus, BoxedUint, Limb, mod_small_limbs, mod_u32_with_recip, recip_u32,
+    trailing_zeros_step,
+};
 use crate::ct::{Choice, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
 use alloc::vec::Vec;
@@ -24,35 +27,86 @@ const TRIAL_DIVISION_BOUND: u64 = 1 << 14;
 /// composite by the trial division alone — `2^28`, i.e. 28 bits.
 const TRIAL_DIVISION_EXACT_BITS: usize = 28;
 
-/// The odd primes below [`TRIAL_DIVISION_BOUND`], by a plain sieve of
-/// Eratosthenes. ~16 KiB of scratch and ~20 µs: negligible next to one
-/// modular exponentiation, but not next to the trial division of one
-/// candidate, so a caller testing many candidates (RSA key generation)
-/// sieves once and passes the table to [`is_prime_boxed_with`].
-pub(crate) fn small_odd_primes() -> Vec<u64> {
-    let bound = TRIAL_DIVISION_BOUND as usize;
-    let mut composite = alloc::vec![false; bound];
-    let mut primes = Vec::with_capacity(2000);
-    // Odd numbers only: 2 is handled by the caller's parity check, and
-    // stepping by `2 * i` keeps the marking on odd multiples.
-    for i in (3..bound).step_by(2) {
-        if composite[i] {
-            continue;
-        }
-        primes.push(i as u64);
-        let mut j = i * i;
-        while j < bound {
-            composite[j] = true;
-            j += 2 * i;
-        }
-    }
-    primes
+/// The trial-division table: every odd prime below [`TRIAL_DIVISION_BOUND`]
+/// with its 64-bit reciprocal, so reducing a residue by a prime is one
+/// multiply (no division instruction, and no reciprocal recomputed per
+/// candidate).
+pub(crate) struct TrialDivision {
+    primes: Vec<u64>,
+    recips: Vec<u64>,
 }
 
-/// `n mod p` for a runtime-sized `n` and a small public `p < 2^32`, without
-/// a division instruction on the (possibly secret) `n`.
-fn mod_small_boxed(n: &BoxedUint, p: u64) -> u64 {
-    mod_small_limbs(n.as_limbs(), p)
+impl TrialDivision {
+    /// Sieves the odd primes below [`TRIAL_DIVISION_BOUND`] (Eratosthenes,
+    /// ~16 KiB of scratch and ~20 µs) and precomputes their reciprocals.
+    /// Negligible next to one modular exponentiation, but not next to the
+    /// trial division of one candidate, so a candidate loop builds it once.
+    pub(crate) fn new() -> Self {
+        let bound = TRIAL_DIVISION_BOUND as usize;
+        let mut composite = alloc::vec![false; bound];
+        let mut primes = Vec::with_capacity(2000);
+        // Odd numbers only: 2 is handled by the caller's parity check, and
+        // stepping by `2 * i` keeps the marking on odd multiples.
+        for i in (3..bound).step_by(2) {
+            if composite[i] {
+                continue;
+            }
+            primes.push(i as u64);
+            let mut j = i * i;
+            while j < bound {
+                composite[j] = true;
+                j += 2 * i;
+            }
+        }
+        let recips = primes.iter().map(|&p| recip_u32(p)).collect();
+        TrialDivision { primes, recips }
+    }
+
+    /// The primes, ascending.
+    #[cfg(test)]
+    pub(crate) fn primes(&self) -> &[u64] {
+        &self.primes
+    }
+
+    /// `n mod p` for every prime `p` of the table, as the sieve's residues.
+    ///
+    /// The primes are packed into products below `2^32` (as many consecutive
+    /// primes as fit) so each product costs one Horner pass over the limbs;
+    /// the residue is then reduced modulo each prime of the batch. Both
+    /// reductions are multiply-by-reciprocal, so no division instruction
+    /// sees `n`.
+    pub(crate) fn residues(&self, n: &[Limb]) -> Vec<u32> {
+        let mut res = Vec::with_capacity(self.primes.len());
+        let mut i = 0;
+        while i < self.primes.len() {
+            // Greedily extend the batch while the product stays below 2^32.
+            let mut product: u64 = 1;
+            let start = i;
+            while i < self.primes.len() && product * self.primes[i] < (1 << 32) {
+                product *= self.primes[i];
+                i += 1;
+            }
+            let rem = mod_small_limbs(n, product);
+            for (&p, &c) in self.primes[start..i].iter().zip(&self.recips[start..i]) {
+                res.push(mod_u32_with_recip(rem, p, c) as u32);
+            }
+        }
+        res
+    }
+
+    /// Whether `n₀ + delta` has no prime factor in the table, from the
+    /// residues `res = residues(n₀)` and a `delta < 2^31`. Branch-free over
+    /// the table (the verdict is public: a rejected candidate is discarded,
+    /// as `is_prime_boxed`'s early exits are).
+    pub(crate) fn passes(&self, res: &[u32], delta: u64) -> bool {
+        let mut any_zero: u64 = 0;
+        for ((&p, &c), &r) in self.primes.iter().zip(&self.recips).zip(res) {
+            let m = mod_u32_with_recip(r as u64 + delta, p, c);
+            // Top bit set iff m == 0 (m < 2^32, so m − 1 wraps only from 0).
+            any_zero |= m.wrapping_sub(1) >> 63;
+        }
+        crate::ct::declassify_value(any_zero) == 0
+    }
 }
 
 /// Squarings a Miller-Rabin round always performs after `a^d`; see
@@ -81,33 +135,17 @@ fn split_pow2_boxed(x: &BoxedUint) -> (BoxedUint, u32) {
 /// (sieving them first; see [`small_factor_in`]).
 #[cfg(any(feature = "dh", test))]
 fn small_factor_boxed(n: &BoxedUint) -> Option<u64> {
-    small_factor_in(n, &small_odd_primes())
+    small_factor_in(n, &TrialDivision::new())
 }
 
-/// Trial division of `n` by every prime of `primes` (the
-/// [`small_odd_primes`] table). Returns the smallest one dividing `n`, or
-/// `None`.
-///
-/// The primes are packed into products below `2^32` (as many consecutive
-/// primes as fit) so each product costs one Horner pass over the limbs; the
-/// residue is then reduced modulo each prime of the batch. Both reductions
-/// are multiply-by-reciprocal, so no division instruction sees `n`.
-fn small_factor_in(n: &BoxedUint, primes: &[u64]) -> Option<u64> {
-    let mut i = 0;
-    while i < primes.len() {
-        // Greedily extend the batch while the product stays below 2^32.
-        let mut product: u64 = 1;
-        let start = i;
-        while i < primes.len() && product * primes[i] < (1 << 32) {
-            product *= primes[i];
-            i += 1;
-        }
-        let rem = mod_small_boxed(n, product);
-        for &p in &primes[start..i] {
-            // A small factor rejects the candidate: a public verdict.
-            if crate::ct::declassify_value(mod_u32_ct(rem, p) == 0) {
-                return Some(p);
-            }
+/// Trial division of `n` by every prime of the table. Returns the smallest
+/// one dividing `n`, or `None`.
+fn small_factor_in(n: &BoxedUint, td: &TrialDivision) -> Option<u64> {
+    let res = td.residues(n.as_limbs());
+    for (&p, &r) in td.primes.iter().zip(&res) {
+        // A small factor rejects the candidate: a public verdict.
+        if crate::ct::declassify_value(r == 0) {
+            return Some(p);
         }
     }
     None
@@ -137,16 +175,16 @@ fn small_factor_in(n: &BoxedUint, primes: &[u64]) -> Option<u64> {
 // RSA keygen passes a table it sieved once to `is_prime_boxed_with`.
 #[cfg(any(test, feature = "dsa", feature = "dh"))]
 pub(crate) fn is_prime_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usize) -> bool {
-    is_prime_boxed_with(n, rng, rounds, &small_odd_primes())
+    is_prime_boxed_with(n, rng, rounds, &TrialDivision::new())
 }
 
-/// [`is_prime_boxed`] with the trial-division table supplied by the caller
-/// (`primes` must be [`small_odd_primes`]), so a candidate loop sieves once.
+/// [`is_prime_boxed`] with the trial-division table supplied by the caller,
+/// so a candidate loop sieves once.
 pub(crate) fn is_prime_boxed_with<R: RngCore>(
     n: &BoxedUint,
     rng: &mut R,
     rounds: usize,
-    primes: &[u64],
+    td: &TrialDivision,
 ) -> bool {
     let one = BoxedUint::from_u64(1);
     let two = BoxedUint::from_u64(2);
@@ -159,7 +197,7 @@ pub(crate) fn is_prime_boxed_with<R: RngCore>(
     if !crate::ct::declassify_value(n.is_odd()) {
         return false;
     }
-    if let Some(p) = small_factor_in(n, primes) {
+    if let Some(p) = small_factor_in(n, td) {
         return n.ct_eq(&BoxedUint::from_u64(p)).declassify();
     }
     // `n < 2^TRIAL_DIVISION_EXACT_BITS`, without scanning `n` for its length.
@@ -170,7 +208,15 @@ pub(crate) fn is_prime_boxed_with<R: RngCore>(
         // No prime factor below sqrt(n): n is prime, no need for Miller-Rabin.
         return true;
     }
+    miller_rabin_boxed(n, rng, rounds)
+}
 
+/// The Miller-Rabin rounds proper, for an odd `n ≥ 5` that trial division
+/// (or the incremental sieve) has already cleared: `rounds` random bases,
+/// each `a^d` by the constant-time ladder bounded by the (public) width of
+/// `n`, then the fixed number of Montgomery-domain squarings.
+pub(crate) fn miller_rabin_boxed<R: RngCore>(n: &BoxedUint, rng: &mut R, rounds: usize) -> bool {
+    let one = BoxedUint::from_u64(1);
     let n_minus_1 = n.sub(&one);
     let (d, s) = split_pow2_boxed(&n_minus_1);
 
@@ -178,9 +224,11 @@ pub(crate) fn is_prime_boxed_with<R: RngCore>(
     // The squarings stay in the Montgomery domain (one CIOS squaring each,
     // against `mul_mod`'s two multiplies), compared with M(n - 1).
     let n_minus_1_m = modulus.to_mont(&n_minus_1);
+    // `d < n`, so the modulus's (public) width bounds the ladder.
+    let bits = 64 * modulus.limbs();
     for _ in 0..rounds {
         let a = random_base(&modulus, &n_minus_1, rng);
-        let x = modulus.pow(&a, &d);
+        let x = modulus.pow_bits(&a, &d, bits);
         let mut pass = x.ct_eq(&one) | x.ct_eq(&n_minus_1);
         let mut x = modulus.to_mont(&x);
         for j in 1..MR_FIXED_SQUARINGS {
@@ -321,15 +369,29 @@ mod tests {
 
     #[test]
     fn sieve_matches_trial_division() {
-        let primes = small_odd_primes();
+        let td = TrialDivision::new();
+        let primes = td.primes();
         assert_eq!(primes.len(), 1899, "odd primes below 2^14");
         assert_eq!(primes[0], 3);
         assert_eq!(*primes.last().unwrap(), 16381);
         for w in primes.windows(2) {
             assert!(w[0] < w[1]);
         }
-        for &p in &primes {
+        for &p in primes {
             assert!(is_prime_u64(p), "{p} in sieve output but composite");
+        }
+        // Residues and the incremental sieve agree with plain arithmetic.
+        let n0: u64 = 0x9E37_79B9_7F4A_7C15 | 1;
+        let res = td.residues(&[n0]);
+        for (i, &p) in primes.iter().enumerate() {
+            assert_eq!(res[i] as u64, n0 % p);
+        }
+        for delta in (0..200u64).step_by(2) {
+            let n = n0 + delta;
+            assert_eq!(
+                td.passes(&res, delta),
+                primes.iter().all(|&p| !n.is_multiple_of(p))
+            );
         }
         let expected = (3..TRIAL_DIVISION_BOUND)
             .filter(|&n| is_prime_u64(n))
