@@ -134,12 +134,29 @@ impl core::error::Error for Error {}
 /// `N`-bit prime dividing `p − 1`, and `g` a generator of the order-`q`
 /// subgroup of `Z_p^*`. See the [module docs](self) for what
 /// [`new`](Self::new) validates.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DsaParams {
     p: BoxedUint,
     q: BoxedUint,
     g: BoxedUint,
+    /// Montgomery parameters for `p` and `q`, built once by
+    /// [`new`](Self::new) and shared by every signature, verification and
+    /// public-key derivation on the set (they are public values; rebuilding
+    /// the `p` context per operation cost an `O(log)` chain of full-width
+    /// squarings each time).
+    mont_p: BoxedMontModulus,
+    mont_q: BoxedMontModulus,
 }
+
+// Equality is over the domain parameters themselves; the cached Montgomery
+// contexts are a function of `p` and `q`.
+impl PartialEq for DsaParams {
+    fn eq(&self, other: &Self) -> bool {
+        self.p == other.p && self.q == other.q && self.g == other.g
+    }
+}
+
+impl Eq for DsaParams {}
 
 /// A DSA public key `y = g^x mod p` on a parameter set.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -312,7 +329,8 @@ impl DsaParams {
         }
         // Everything here is public, so the variable-time exponentiation is
         // the right tool.
-        if BoxedMontModulus::new(&p).pow_public(&g, &q) != one {
+        let mont_p = BoxedMontModulus::new(&p);
+        if mont_p.pow_public(&g, &q) != one {
             return Err(Error::InvalidParameters);
         }
         let mut rng = HmacDrbg::<Sha256>::new(
@@ -323,7 +341,14 @@ impl DsaParams {
         if !is_prime_boxed(&q, &mut rng, Self::Q_MR_ROUNDS) {
             return Err(Error::InvalidParameters);
         }
-        Ok(DsaParams { p, q, g })
+        let mont_q = BoxedMontModulus::new(&q);
+        Ok(DsaParams {
+            p,
+            q,
+            g,
+            mont_p,
+            mont_q,
+        })
     }
 
     /// [`new`](Self::new) from big-endian byte strings (leading zeros are
@@ -453,7 +478,7 @@ impl DsaPublicKey {
         if y.is_zero() || y == one || !y.lt(&params.p) {
             return Err(Error::InvalidPublicKey);
         }
-        if BoxedMontModulus::new(&params.p).pow_public(&y, &params.q) != one {
+        if params.mont_p.pow_public(&y, &params.q) != one {
             return Err(Error::InvalidPublicKey);
         }
         Ok(DsaPublicKey { params, y })
@@ -491,13 +516,12 @@ impl DsaPublicKey {
     ///
     /// Everything here is public, so the exponentiations are variable-time.
     pub fn verify_prehash(&self, prehash: &[u8], sig: &DsaSignature) -> Result<(), Error> {
-        let (p, q, g) = (&self.params.p, &self.params.q, &self.params.g);
+        let (q, g) = (&self.params.q, &self.params.g);
         // Plain (variable-time) comparisons: a signature is public.
         if sig.r.is_zero() || sig.s.is_zero() || !sig.r.lt(q) || !sig.s.lt(q) {
             return Err(Error::Verification);
         }
-        let fq = BoxedMontModulus::new(q);
-        let fp = BoxedMontModulus::new(p);
+        let (fq, fp) = (&self.params.mont_q, &self.params.mont_p);
         let z = fq.reduce(&bits2int(prehash, q.bit_len()));
         // `q` prime and `1 ≤ s < q` make the inverse exist; `None` can only
         // mean a composite `q` that slipped past Miller-Rabin, and then the
@@ -606,11 +630,10 @@ impl DsaPrivateKey {
     /// The public key `y = g^x mod p` (constant-time in `x`).
     pub fn public_key(&self) -> DsaPublicKey {
         // `x < q`, so `q`'s (public) width bounds the ladder instead of `p`'s.
-        let y = BoxedMontModulus::new(&self.params.p).pow_bits(
-            &self.params.g,
-            &self.x,
-            self.params.q.bit_len(),
-        );
+        let y = self
+            .params
+            .mont_p
+            .pow_bits(&self.params.g, &self.x, self.params.q.bit_len());
         DsaPublicKey {
             params: self.params.clone(),
             y,
@@ -640,9 +663,8 @@ impl DsaPrivateKey {
     /// intended message; prefer [`sign`](Self::sign) when the message is at
     /// hand.
     pub fn sign_prehash<D: Digest>(&self, prehash: &[u8]) -> Result<DsaSignature, Error> {
-        let (p, q, g) = (&self.params.p, &self.params.q, &self.params.g);
-        let fq = BoxedMontModulus::new(q);
-        let fp = BoxedMontModulus::new(p);
+        let (q, g) = (&self.params.q, &self.params.g);
+        let (fq, fp) = (&self.params.mont_q, &self.params.mont_p);
         let qbits = q.bit_len();
         let z = fq.reduce(&bits2int(prehash, qbits));
         let mut drbg = Rfc6979::<D>::new(&self.x, prehash, q, self.params.q_len(), qbits);

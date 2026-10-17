@@ -10,7 +10,7 @@
 //! standard subgroup-confinement defense (see NIST SP 800-56A §5.6.2.3).
 
 use super::groups::DhGroup;
-use crate::bignum::{BoxedMontModulus, BoxedUint};
+use crate::bignum::BoxedUint;
 use crate::ct::ConstantTimeEq;
 use crate::rng::{CryptoRng, RngCore};
 use alloc::vec;
@@ -183,8 +183,10 @@ impl DhPrivateKey {
 
     /// Computes the public value `y = g^x mod p` to send to the peer.
     pub fn public_key(&self) -> DhPublicKey {
-        let m = BoxedMontModulus::new(self.group.p());
-        let y = m.pow_bits(self.group.g(), &self.x, self.exp_bits());
+        let y = self
+            .group
+            .mont()
+            .pow_bits(self.group.g(), &self.x, self.exp_bits());
         DhPublicKey {
             group: self.group.clone(),
             y,
@@ -243,7 +245,7 @@ impl DhPrivateKey {
             return Err(Error::InvalidPublicKey);
         }
 
-        let m = BoxedMontModulus::new(p);
+        let m = self.group.mont();
 
         // peer.y ^ q mod p ∈ {1, p − 1}, q = (p − 1) / 2. For a safe prime
         // this holds for every y in [2, p − 2] (order q → 1, order 2q →
@@ -352,6 +354,7 @@ impl DhPublicKey {
 mod tests {
     use super::super::groups::{DhGroup, group14, group15, group16};
     use super::*;
+    use crate::bignum::BoxedMontModulus;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
 

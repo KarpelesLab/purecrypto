@@ -10,7 +10,7 @@
 //! lazily at call time so we never pay for groups the program doesn't use.
 
 use super::key::Error;
-use crate::bignum::BoxedUint;
+use crate::bignum::{BoxedMontModulus, BoxedUint};
 
 /// A named MODP DH group: a safe prime `p` (where `q = (p - 1) / 2` is also
 /// prime), a generator `g` of the prime-order subgroup of size `q`, and a
@@ -37,6 +37,11 @@ pub struct DhGroup {
     /// [`from_custom`](Self::from_custom) validated, whose Miller-Rabin half
     /// uses public bases — keep it.
     pub(crate) known_safe_prime: bool,
+    /// Montgomery parameters for `p`, built once with the group: every
+    /// `g^x` / `y^x` on the group reuses them instead of recomputing `R² mod
+    /// p` (an `O(log)` chain of full-width squarings) per operation. `p` is
+    /// public, so nothing secret is cached.
+    pub(crate) mont: BoxedMontModulus,
 }
 
 impl DhGroup {
@@ -64,6 +69,12 @@ impl DhGroup {
     /// The generator `g`.
     pub fn g(&self) -> &BoxedUint {
         &self.g
+    }
+
+    /// The cached Montgomery parameters for `p`.
+    #[inline]
+    pub(crate) fn mont(&self) -> &BoxedMontModulus {
+        &self.mont
     }
 
     /// The recommended private-exponent bit length for this group.
@@ -205,7 +216,6 @@ impl DhGroup {
     ///
     /// [`custom_group_mr_rounds`]: Self::custom_group_mr_rounds
     pub fn from_custom(p: BoxedUint, g: BoxedUint, priv_bits: usize) -> Result<Self, Error> {
-        use crate::bignum::BoxedMontModulus;
         use crate::bignum::prime::is_safe_prime_boxed;
         use crate::hash::Sha256;
         use crate::rng::HmacDrbg;
@@ -244,7 +254,7 @@ impl DhGroup {
         let one = BoxedUint::from_u64(1);
         let p_minus_one = group.p.sub(&one);
         let q = p_minus_one.shr_bits(1);
-        let g_to_q = BoxedMontModulus::new(&group.p).pow(&group.g, &q);
+        let g_to_q = group.mont.pow(&group.g, &q);
         if g_to_q != one && g_to_q != p_minus_one {
             return Err(Error::InvalidGroup);
         }
@@ -284,12 +294,14 @@ impl DhGroup {
         if priv_bits == 0 || priv_bits > p.bit_len() {
             return Err(Error::InvalidGroup);
         }
+        let mont = BoxedMontModulus::new(&p);
         Ok(DhGroup {
             name: "custom",
             p,
             g,
             priv_bits,
             known_safe_prime: false,
+            mont,
         })
     }
 }
@@ -523,12 +535,15 @@ static GROUP18_P: [u8; 1024] = [
 /// `priv_bits = 256` per RFC 7919 §A — twice the symmetric security level
 /// (~AES-128) targeted by a 2048-bit prime.
 pub fn group14() -> DhGroup {
+    let p = BoxedUint::from_be_bytes(&GROUP14_P);
+    let mont = BoxedMontModulus::new(&p);
     DhGroup {
         name: "group14",
-        p: BoxedUint::from_be_bytes(&GROUP14_P),
+        p,
         g: BoxedUint::from_u64(2),
         priv_bits: 256,
         known_safe_prime: true,
+        mont,
     }
 }
 
@@ -538,12 +553,15 @@ pub fn group14() -> DhGroup {
 /// bits of private exponent for a 3072-bit prime (twice the ~137-bit
 /// security estimate), rounded up to a whole number of 32-bit words.
 pub fn group15() -> DhGroup {
+    let p = BoxedUint::from_be_bytes(&GROUP15_P);
+    let mont = BoxedMontModulus::new(&p);
     DhGroup {
         name: "group15",
-        p: BoxedUint::from_be_bytes(&GROUP15_P),
+        p,
         g: BoxedUint::from_u64(2),
         priv_bits: 288,
         known_safe_prime: true,
+        mont,
     }
 }
 
@@ -551,12 +569,15 @@ pub fn group15() -> DhGroup {
 ///
 /// `priv_bits = 384` (RFC 7919 §A guidance for ~AES-192 symmetric strength).
 pub fn group16() -> DhGroup {
+    let p = BoxedUint::from_be_bytes(&GROUP16_P);
+    let mont = BoxedMontModulus::new(&p);
     DhGroup {
         name: "group16",
-        p: BoxedUint::from_be_bytes(&GROUP16_P),
+        p,
         g: BoxedUint::from_u64(2),
         priv_bits: 384,
         known_safe_prime: true,
+        mont,
     }
 }
 
@@ -564,12 +585,15 @@ pub fn group16() -> DhGroup {
 ///
 /// `priv_bits = 512` (RFC 7919 §A guidance for ~AES-256 symmetric strength).
 pub fn group17() -> DhGroup {
+    let p = BoxedUint::from_be_bytes(&GROUP17_P);
+    let mont = BoxedMontModulus::new(&p);
     DhGroup {
         name: "group17",
-        p: BoxedUint::from_be_bytes(&GROUP17_P),
+        p,
         g: BoxedUint::from_u64(2),
         priv_bits: 512,
         known_safe_prime: true,
+        mont,
     }
 }
 
@@ -577,12 +601,15 @@ pub fn group17() -> DhGroup {
 ///
 /// `priv_bits = 512` (RFC 7919 §A guidance for ~AES-256 symmetric strength).
 pub fn group18() -> DhGroup {
+    let p = BoxedUint::from_be_bytes(&GROUP18_P);
+    let mont = BoxedMontModulus::new(&p);
     DhGroup {
         name: "group18",
-        p: BoxedUint::from_be_bytes(&GROUP18_P),
+        p,
         g: BoxedUint::from_u64(2),
         priv_bits: 512,
         known_safe_prime: true,
+        mont,
     }
 }
 
