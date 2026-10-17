@@ -80,7 +80,7 @@ impl AeadAlg {
     /// RFC 9001 §B.1 / §6.6 — per-key AEAD *usage* limit (maximum number
     /// of packets that may be encrypted with the same key before the key
     /// MUST be retired). Exceeding this MUST close the connection with
-    /// AEAD_LIMIT_REACHED (transport error 0x0e, RFC 9000 §20).
+    /// AEAD_LIMIT_REACHED (transport error 0x0f, RFC 9000 §20.1).
     ///
     /// Per RFC 9001 §B.1:
     /// * AEAD_AES_128_GCM, AEAD_AES_256_GCM:   2^23 packets.
@@ -96,7 +96,7 @@ impl AeadAlg {
     /// RFC 9001 §B.2 / §6.6 — per-key AEAD *integrity* limit (maximum
     /// number of AEAD authentication failures before the receive key
     /// MUST be retired). Exceeding this MUST close the connection with
-    /// AEAD_LIMIT_REACHED (transport error 0x0e, RFC 9000 §20).
+    /// AEAD_LIMIT_REACHED (transport error 0x0f, RFC 9000 §20.1).
     ///
     /// Per RFC 9001 §B.2:
     /// * AEAD_AES_128_GCM, AEAD_AES_256_GCM:   2^52 failures.
@@ -194,6 +194,10 @@ impl Drop for DirKeys {
 pub(crate) struct PnReplayWindow {
     /// Largest PN ever accepted under this key (the bit-0 anchor).
     top: u64,
+    /// Smallest PN ever accepted under this key. RFC 9001 §6.4 orders key
+    /// generations by packet number: a packet that opens under the
+    /// *previous* keys with a PN above this is a KEY_UPDATE_ERROR.
+    low: u64,
     /// Bitmask: bit `i` ⇒ PN `top - i` already accepted.
     bits: u128,
     /// True once `top` is meaningful (i.e. at least one PN accepted).
@@ -205,9 +209,20 @@ impl PnReplayWindow {
     pub(crate) const fn new() -> Self {
         Self {
             top: 0,
+            low: 0,
             bits: 0,
             seeded: false,
         }
+    }
+
+    /// Largest PN accepted under this key, once any has been.
+    pub(crate) fn largest(&self) -> Option<u64> {
+        self.seeded.then_some(self.top)
+    }
+
+    /// Smallest PN accepted under this key, once any has been.
+    pub(crate) fn lowest(&self) -> Option<u64> {
+        self.seeded.then_some(self.low)
     }
 
     /// True if `pn` is fresh (has not previously been accepted, and lies
@@ -233,10 +248,12 @@ impl PnReplayWindow {
     pub(crate) fn record(&mut self, pn: u64) {
         if !self.seeded {
             self.top = pn;
+            self.low = pn;
             self.bits = 1; // bit 0 = top accepted.
             self.seeded = true;
             return;
         }
+        self.low = self.low.min(pn);
         if pn > self.top {
             let shift = pn - self.top;
             // Slide the window up; new bit 0 is `pn`, the *old* top is

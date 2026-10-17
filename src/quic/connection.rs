@@ -567,8 +567,13 @@ const ERROR_FRAME_ENCODING: u64 = 0x07;
 const ERROR_TRANSPORT_PARAMETER: u64 = 0x08;
 /// RFC 9000 §20.1 — `PROTOCOL_VIOLATION`.
 const ERROR_PROTOCOL_VIOLATION: u64 = 0x0a;
-/// RFC 9000 §20.1 — `AEAD_LIMIT_REACHED` (RFC 9001 §6.6).
-const ERROR_AEAD_LIMIT_REACHED: u64 = 0x0e;
+/// RFC 9000 §20.1 — `KEY_UPDATE_ERROR` (RFC 9001 §6): the peer broke the
+/// key-update rules, e.g. sent a packet under retired keys with a packet
+/// number above one already protected by the newer keys (§6.4).
+const ERROR_KEY_UPDATE_ERROR: u64 = 0x0e;
+/// RFC 9000 §20.1 — `AEAD_LIMIT_REACHED` (RFC 9001 §6.6). (This used to be
+/// sent as 0x0e, which is KEY_UPDATE_ERROR's code.)
+const ERROR_AEAD_LIMIT_REACHED: u64 = 0x0f;
 /// RFC 9368 §10.2 — `VERSION_NEGOTIATION_ERROR`: the peer's Version
 /// Information failed the §4 checks (a version it could not have chosen, or
 /// a downgrade).
@@ -5940,6 +5945,31 @@ impl QuicConnection {
         // after AEAD authentication succeeded (on either the primary or
         // previous-phase keys), so forged packets stay silent drops.
         check_reserved_bits(first_byte, false)?;
+
+        // RFC 9001 §6.4 — key generations are ordered by packet number:
+        // "Packets with higher packet numbers MUST be protected with either
+        // the same or newer packet protection keys than packets with lower
+        // packet numbers." So a packet that only opened under the
+        // *previous* keys may not carry a PN above any packet already opened
+        // under the current keys, and a packet that opens under the *next*
+        // keys (about to commit a phase flip) may not carry a PN below one
+        // already opened under the current keys. Either is a connection
+        // error of type KEY_UPDATE_ERROR. The per-key replay windows hold
+        // exactly the extrema needed (they restart on every key change).
+        {
+            let lk = self.endpoint.crypto.at(Level::OneRtt);
+            let out_of_order = if opened_with_prev {
+                lk.rx_pn_window.lowest().is_some_and(|lo| pn > lo)
+            } else if self.one_rtt_phase_initialized && pkt_phase != current_phase {
+                lk.rx_pn_window.largest().is_some_and(|hi| pn < hi)
+            } else {
+                false
+            };
+            if out_of_order {
+                self.pending_error_code = Some(ERROR_KEY_UPDATE_ERROR);
+                return Err(Error::PeerMisbehaved);
+            }
+        }
 
         // RFC 9001 §9.5 — per-key PN replay check. The Application PN
         // space's replay window lives on the OneRtt level (1-RTT rx
@@ -13288,6 +13318,109 @@ mod tests {
             got.windows(b"still-alive".len())
                 .any(|w| w == b"still-alive"),
             "post-replay data must still flow at the current phase"
+        );
+    }
+
+    /// Drives a loopback pair to a confirmed handshake with one client
+    /// stream materialised on both sides, for the RFC 9001 §6.4 tests.
+    fn key_update_fixture() -> (QuicConnection, QuicConnection, StreamId) {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let cid = c.open_bidi().expect("open");
+        c.write(cid, b"abc").expect("write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        (c, s, StreamId(cid.0))
+    }
+
+    /// F3 — RFC 9001 §6.4: a packet that only opens under the *previous*
+    /// keys but carries a packet number above one already protected by the
+    /// newer keys is a connection error of type KEY_UPDATE_ERROR (0x0e), not
+    /// a packet to accept. Before the fix any packet that opened under
+    /// `prev_rx_keys` was taken regardless of its PN.
+    #[test]
+    fn key_update_old_keys_with_higher_pn_is_a_key_update_error() {
+        let (mut c, mut s, sid) = key_update_fixture();
+        // Keep the server's phase-0 tx keys around to misuse below.
+        let old_tx = s
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .tx
+            .clone()
+            .expect("tx keys");
+        s.initiate_key_update().expect("server initiates");
+        s.write(sid, b"PHASE1").expect("server write phase 1");
+        let phase1_dg = s.pop_datagram();
+        c.feed_datagram(&phase1_dg).expect("client commits phase 1");
+        assert_eq!(c.endpoint.crypto.rx_phase, 1);
+        assert!(c.endpoint.crypto.at(Level::OneRtt).prev_rx_keys.is_some());
+
+        // A misbehaving server now protects a *later* packet with the keys
+        // it already retired (phase bit 0, old AEAD key, higher PN).
+        s.endpoint.crypto.at_mut(Level::OneRtt).tx = Some(old_tx);
+        s.endpoint.crypto.one_rtt_phase = 0;
+        s.write(sid, b"STALE").expect("server write under old keys");
+        let stale_dg = s.pop_datagram();
+        assert!(!stale_dg.is_empty());
+
+        assert!(
+            c.feed_datagram(&stale_dg).is_err(),
+            "§6.4: old keys above a new-key PN is a protocol error"
+        );
+        assert!(c.is_closing());
+        let info = c.close_info().expect("close info");
+        assert_eq!(info.error_code, ERROR_KEY_UPDATE_ERROR);
+        assert_eq!(info.kind, CloseKind::Transport);
+        assert_eq!(
+            c.endpoint.crypto.rx_phase, 1,
+            "the offending packet must not move the key phase"
+        );
+    }
+
+    /// F3 — RFC 9001 §6.4, the other direction: the packet that would
+    /// commit a key-phase flip carries a packet number *below* one already
+    /// opened under the current keys, so the peer protected a lower-numbered
+    /// packet with newer keys than a higher-numbered one. KEY_UPDATE_ERROR,
+    /// and the phase does not commit.
+    #[test]
+    fn key_update_new_keys_with_lower_pn_is_a_key_update_error() {
+        let (mut c, mut s, sid) = key_update_fixture();
+        s.write(sid, b"PHASE0").expect("server write phase 0");
+        let phase0_dg = s.pop_datagram();
+        c.feed_datagram(&phase0_dg)
+            .expect("phase-0 packet delivered");
+        let top = c
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .rx_pn_window
+            .largest()
+            .expect("current-key window seeded");
+        assert!(top >= 1);
+
+        // The server flips to phase 1 but numbers its first new-phase packet
+        // below the phase-0 packet the client already holds.
+        s.initiate_key_update().expect("server initiates");
+        s.endpoint.pn.application.next_tx = top - 1;
+        s.write(sid, b"PHASE1").expect("server write phase 1");
+        let phase1_dg = s.pop_datagram();
+        assert!(!phase1_dg.is_empty());
+
+        assert!(
+            c.feed_datagram(&phase1_dg).is_err(),
+            "§6.4: new keys below a current-key PN is a protocol error"
+        );
+        assert!(c.is_closing());
+        let info = c.close_info().expect("close info");
+        assert_eq!(info.error_code, ERROR_KEY_UPDATE_ERROR);
+        assert_eq!(
+            c.endpoint.crypto.rx_phase, 0,
+            "the offending packet must not commit the flip"
         );
     }
 
