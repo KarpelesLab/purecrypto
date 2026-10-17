@@ -5,8 +5,7 @@
 //! `Vec<Limb>` scratch so the modulus width is chosen at runtime.
 
 use super::boxed::{BoxedUint, adc_limbs, sbb_limbs, select_limbs};
-use super::montgomery::inv_mod_2_64;
-use super::mul::mac;
+use super::montgomery::{inv_mod_2_64, mont_mul_kernel, mont_sqr_kernel};
 use super::uint::{Limb, adc, sbb};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use alloc::vec;
@@ -209,158 +208,34 @@ impl BoxedMontModulus {
     }
 
     /// CIOS Montgomery multiplication of two `limbs`-wide values into `out`,
-    /// with caller-provided scratch `t` — no allocation, so the
-    /// exponentiation ladders can reuse two buffers across their thousands
-    /// of multiplies instead of hitting the allocator on each one.
+    /// with caller-provided scratch `t` (at least `limbs` limbs) — no
+    /// allocation, so the exponentiation ladders can reuse two buffers
+    /// across their thousands of multiplies instead of hitting the allocator
+    /// on each one. The arithmetic is the shared
+    /// [`mont_mul_kernel`](super::montgomery::mont_mul_kernel) (merged CIOS
+    /// rows, two per pass).
     ///
     /// `out` may alias `a` and/or `b`: the accumulation only reads them, and
     /// `out` is written exclusively in the final-subtraction step, after the
     /// last read. (Rust's borrow rules forbid literal aliasing anyway;
     /// callers ping-pong two buffers and `mem::swap`.) `t` must not alias
-    /// anything. The operation sequence is identical to the previous
-    /// allocating version — same mask-based conditional subtraction, no new
-    /// branches — so the constant-time property is unchanged.
+    /// anything.
+    #[inline]
     fn mont_mul_to(&self, a: &[Limb], b: &[Limb], t: &mut [Limb], out: &mut [Limb]) {
-        let l = self.limbs;
-        let n = &self.n;
-        // Only the low `l` limbs of `t` are used; the exponentiation ladders
-        // hand in the wider squaring scratch and share it with `mont_sqr_to`.
-        t[..l].fill(0);
-        let mut ts: Limb = 0;
-
-        for &bi in b.iter().take(l) {
-            let mut carry = 0;
-            for j in 0..l {
-                let (s, c) = mac(t[j], a[j], bi, carry);
-                t[j] = s;
-                carry = c;
-            }
-            let (s, c) = adc(ts, carry, 0);
-            ts = s;
-            let ts1 = c;
-
-            let m = t[0].wrapping_mul(self.n_prime);
-            let (_, mut carry) = mac(t[0], m, n[0], 0);
-            for j in 1..l {
-                let (s, c) = mac(t[j], m, n[j], carry);
-                t[j - 1] = s;
-                carry = c;
-            }
-            let (s, c) = adc(ts, carry, 0);
-            t[l - 1] = s;
-            ts = ts1 + c;
-        }
-
-        // Conditional final subtraction (result < 2N): out = t - n, kept only
-        // when the subtraction doesn't underflow the (l+1)-limb value.
-        let mut bo: Limb = 0;
-        for j in 0..l {
-            let (d, b) = sbb(t[j], n[j], bo);
-            out[j] = d;
-            bo = b;
-        }
-        let (_, borrow) = sbb(ts, 0, bo);
-        let ge = Choice::from((borrow ^ 1) as u8);
-        for j in 0..l {
-            out[j] = Limb::conditional_select(&out[j], &t[j], ge);
-        }
+        mont_mul_kernel(&self.n, self.n_prime, a, b, t, out);
     }
 
     /// Montgomery squaring of a `limbs`-wide value into `out`, with
-    /// caller-provided scratch `t` of at least `2 * limbs` limbs.
-    ///
-    /// Produces exactly the same value as `mont_mul_to(a, a, ..)` but uses the
-    /// standard squaring optimization: each off-diagonal partial product
-    /// `a[i]·a[j]` (`i < j`) is computed once and doubled, then the diagonal
-    /// `a[i]²` terms are added — roughly halving the `mac` count of the
-    /// schoolbook phase. The Montgomery reduction is then done as a separate
-    /// SOS pass over the full `2·limbs`-limb square (CIOS interleaving is not
-    /// possible once the product is formed up front).
-    ///
-    /// Constant time: every loop bound is a function of `self.limbs` only (a
-    /// public quantity), the doubling is an unconditional shift across the
-    /// whole product, and the final subtraction uses the same mask-based
-    /// select as `mont_mul_to` — no data-dependent branch anywhere.
+    /// caller-provided scratch `t` of at least `2 * limbs` limbs: the shared
+    /// [`mont_sqr_kernel`](super::montgomery::mont_sqr_kernel), bit-identical
+    /// to `mont_mul_to(a, a, ..)` at roughly half the multiplies.
     ///
     /// `out` may alias `a`: `a` is only read while the square is accumulated
     /// into `t`, and `out` is written exclusively in the final-subtraction
     /// step. `t` must not alias anything.
+    #[inline]
     fn mont_sqr_to(&self, a: &[Limb], t: &mut [Limb], out: &mut [Limb]) {
-        let l = self.limbs;
-        let n = &self.n;
-        let p = &mut t[..2 * l];
-        p.fill(0);
-
-        // Off-diagonal partial products a[i]·a[j] for i < j, each computed
-        // once. Iteration i writes p[2i+1 ..= i+l-1] and drops its carry into
-        // p[i+l], which iteration i+1 then accumulates into — the ordinary
-        // schoolbook triangle.
-        for i in 0..l {
-            let mut carry = 0;
-            for j in (i + 1)..l {
-                let (s, c) = mac(p[i + j], a[i], a[j], carry);
-                p[i + j] = s;
-                carry = c;
-            }
-            p[i + l] = carry;
-        }
-
-        // Double the off-diagonal sum S. 2S <= a² < 2^(128·l), so the shift
-        // cannot carry out of the 2l-limb product.
-        let mut carry: Limb = 0;
-        for w in p.iter_mut() {
-            let next = *w >> 63;
-            *w = (*w << 1) | carry;
-            carry = next;
-        }
-
-        // Add the diagonal a[i]² terms at positions (2i, 2i+1). The high half
-        // of each square lands on an odd position whose add can carry into the
-        // next even position, which is exactly where the next mac's carry-in
-        // goes. The total is a², which fits in 2l limbs, so the last carry
-        // out is zero.
-        let mut carry: Limb = 0;
-        for i in 0..l {
-            let (s, c) = mac(p[2 * i], a[i], a[i], carry);
-            p[2 * i] = s;
-            let (s, c2) = adc(p[2 * i + 1], c, 0);
-            p[2 * i + 1] = s;
-            carry = c2;
-        }
-
-        // Montgomery reduction, SOS style: for each of the l low limbs, add
-        // m·N so the limb cancels, then shift the window up one limb (done
-        // implicitly by indexing from i). `hi` carries the overflow of
-        // iteration i's top-limb add into position i+l+1, which is where
-        // iteration i+1 adds its own top carry — so a single riding limb
-        // suffices and the loop shape stays independent of the data.
-        let mut hi: Limb = 0;
-        for i in 0..l {
-            let m = p[i].wrapping_mul(self.n_prime);
-            let mut carry = 0;
-            for j in 0..l {
-                let (s, c) = mac(p[i + j], m, n[j], carry);
-                p[i + j] = s;
-                carry = c;
-            }
-            let (s, c) = adc(p[i + l], carry, hi);
-            p[i + l] = s;
-            hi = c;
-        }
-
-        // Result is the (l+1)-limb value (p[l..2l], hi) and is < 2N; same
-        // mask-based conditional final subtraction as `mont_mul_to`.
-        let mut bo: Limb = 0;
-        for j in 0..l {
-            let (d, b) = sbb(p[l + j], n[j], bo);
-            out[j] = d;
-            bo = b;
-        }
-        let (_, borrow) = sbb(hi, 0, bo);
-        let ge = Choice::from((borrow ^ 1) as u8);
-        for j in 0..l {
-            out[j] = Limb::conditional_select(&out[j], &p[l + j], ge);
-        }
+        mont_sqr_kernel(&self.n, self.n_prime, a, t, out);
     }
 
     /// CIOS Montgomery multiplication of two `limbs`-wide values.

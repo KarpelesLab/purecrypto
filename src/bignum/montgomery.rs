@@ -9,7 +9,6 @@
 use super::Uint;
 use super::mul::mac;
 use super::uint::{Limb, adc, sbb};
-use crate::ct::{Choice, ConditionallySelectable};
 
 /// Computes `n^-1 mod 2^64` for odd `n` via Newton's iteration (each step
 /// doubles the number of correct low bits; six steps cover 64 bits). Shared
@@ -44,6 +43,273 @@ const fn select<const LIMBS: usize>(a: &Uint<LIMBS>, b: &Uint<LIMBS>, bit: Limb)
         i += 1;
     }
     Uint::from_limbs(limbs)
+}
+
+/// Conditional final subtraction shared by the Montgomery kernels: the
+/// `(l + 1)`-limb value `(t, ts)` is `< 2n`; `out ← t − n` when it is `≥ n`,
+/// else `out ← t`. One opaque mask for the whole select — `black_box` on the
+/// comparison verdict, then plain `&`/`^` across the limbs — so there is
+/// neither a branch nor a per-limb barrier.
+///
+/// `out` may alias `t`'s source only through the caller's buffers (the
+/// borrow checker forbids literal aliasing); it is written limb by limb
+/// after `t[j]` is read, so an `out == t` buffer would also be correct.
+#[inline(always)]
+pub(crate) const fn mont_final_sub(n: &[Limb], t: &[Limb], ts: Limb, out: &mut [Limb]) {
+    let l = n.len();
+    let mut bo: Limb = 0;
+    let mut j = 0;
+    while j < l {
+        let (d, b) = sbb(t[j], n[j], bo);
+        out[j] = d;
+        bo = b;
+        j += 1;
+    }
+    let (_, borrow) = sbb(ts, 0, bo);
+    // All-ones when (t, ts) >= n (no borrow): keep the difference.
+    let mask = core::hint::black_box((borrow ^ 1).wrapping_neg());
+    let mut j = 0;
+    while j < l {
+        out[j] = t[j] ^ (mask & (out[j] ^ t[j]));
+        j += 1;
+    }
+}
+
+/// CIOS Montgomery multiplication kernel over limb slices: `out ← a·b·R⁻¹
+/// mod n` for `R = 2^(64·l)`, `l = n.len()`, `n` odd with `n' = −n⁻¹ mod
+/// 2^64`, and `a, b < n` (one operand may be any value `< R`; the result is
+/// then `< 2n` before the final subtraction, which still brings it below
+/// `n` — [`super::BoxedMontModulus::reduce`] relies on this). `t` is `l`
+/// limbs of scratch; `out` receives `l` limbs. Wider slices are cut to `l`
+/// up front so the bounds checks hoist out of the loops.
+///
+/// Each CIOS row is *merged*: the `a·b[i]` accumulation and the `m·n`
+/// reduction run in one pass with two independent carry chains, so the
+/// row-`i` accumulator is read and written once instead of twice. Rows are
+/// then taken two at a time — row `i + 1` consumes row `i`'s output one
+/// limb behind, so the pair streams through `t` in a single pass with four
+/// carry chains in flight — and an odd `l` finishes with one single-row
+/// step. Every loop bound is a function of `l` alone; the only conditional
+/// is the odd-`l` tail, a public width.
+///
+/// `const` so that [`MontModulus::new`] can run at compile time; at runtime
+/// the same code is constant time in `a`, `b` and `n`.
+#[inline(always)]
+pub(crate) const fn mont_mul_kernel(
+    n: &[Limb],
+    np: Limb,
+    a: &[Limb],
+    b: &[Limb],
+    t: &mut [Limb],
+    out: &mut [Limb],
+) {
+    let l = n.len();
+    let (a, _) = a.split_at(l);
+    let (b, _) = b.split_at(l);
+    let (t, _) = t.split_at_mut(l);
+    let mut j = 0;
+    while j < l {
+        t[j] = 0;
+        j += 1;
+    }
+    // `t` is the accumulator's low `l` limbs; `ts` its limb `l` (at most 1:
+    // the accumulator stays below `a + n < 2n` after every row).
+    let mut ts: Limb = 0;
+    let mut i = 0;
+    while i + 1 < l {
+        let b0 = b[i];
+        let b1 = b[i + 1];
+        // Row i, column 0: decides m0; the low limb cancels.
+        let (s0, mut c1) = mac(t[0], a[0], b0, 0);
+        let m0 = s0.wrapping_mul(np);
+        let (_, mut c2) = mac(s0, m0, n[0], 0);
+        // Row i, column 1 -> row-i output limb 0, which row i + 1 consumes
+        // at once (its column 0, deciding m1).
+        let (s, cc1) = mac(t[1], a[1], b0, c1);
+        c1 = cc1;
+        let (tp0, cc2) = mac(s, m0, n[1], c2);
+        c2 = cc2;
+        let (u0, mut d1) = mac(tp0, a[0], b1, 0);
+        let m1 = u0.wrapping_mul(np);
+        let (_, mut d2) = mac(u0, m1, n[0], 0);
+        // Column j of row i is column j − 1 of row i + 1, whose result is
+        // limb j − 2 of the pair's output.
+        let mut j = 2;
+        while j < l {
+            let (s, cc1) = mac(t[j], a[j], b0, c1);
+            c1 = cc1;
+            let (tpj1, cc2) = mac(s, m0, n[j], c2);
+            c2 = cc2;
+            let (u, dd1) = mac(tpj1, a[j - 1], b1, d1);
+            d1 = dd1;
+            let (u2, dd2) = mac(u, m1, n[j - 1], d2);
+            d2 = dd2;
+            t[j - 2] = u2;
+            j += 1;
+        }
+        // Row i's top: limb l − 1 of its output is ts + c1 + c2, limb l the
+        // carry out of that sum.
+        let s = ts as u128 + c1 as u128 + c2 as u128;
+        let tpl1 = s as Limb;
+        let tpl = (s >> 64) as Limb;
+        let (u, dd1) = mac(tpl1, a[l - 1], b1, d1);
+        d1 = dd1;
+        let (u2, dd2) = mac(u, m1, n[l - 1], d2);
+        d2 = dd2;
+        t[l - 2] = u2;
+        let s = tpl as u128 + d1 as u128 + d2 as u128;
+        t[l - 1] = s as Limb;
+        ts = (s >> 64) as Limb;
+        i += 2;
+    }
+    if i < l {
+        // Odd width: one merged single row for b[l − 1].
+        let bi = b[i];
+        let (s0, mut c1) = mac(t[0], a[0], bi, 0);
+        let m = s0.wrapping_mul(np);
+        let (_, mut c2) = mac(s0, m, n[0], 0);
+        let mut j = 1;
+        while j < l {
+            let (s, cc1) = mac(t[j], a[j], bi, c1);
+            c1 = cc1;
+            let (s2, cc2) = mac(s, m, n[j], c2);
+            c2 = cc2;
+            t[j - 1] = s2;
+            j += 1;
+        }
+        let s = ts as u128 + c1 as u128 + c2 as u128;
+        t[l - 1] = s as Limb;
+        ts = (s >> 64) as Limb;
+    }
+    mont_final_sub(n, t, ts, out);
+}
+
+/// Montgomery squaring kernel over limb slices: `out ← a²·R⁻¹ mod n`,
+/// bit-identical to [`mont_mul_kernel`]`(a, a)`, for `a < n`. `p` is
+/// `2·l` limbs of scratch holding the full square; `out` receives `l` limbs.
+///
+/// The square is formed with the usual optimisation — each off-diagonal
+/// product `a[i]·a[j]` (`i < j`) once, the triangle doubled by a shift,
+/// then the diagonal `a[i]²` added — and the triangle itself takes two rows
+/// per pass (row `i + 1` trailing row `i` by one column). The Montgomery
+/// reduction is a separate SOS pass over the `2·l`-limb product, also two
+/// rows per pass: `m_{i+1}` is decided from row `i`'s updated limb `i + 1`,
+/// then both `m·n` rows stream through the product together. Odd `l` ends
+/// each phase with a single-row step.
+///
+/// Constant time: every loop bound and every conditional is a function of
+/// `l` and the loop indices (public widths); the doubling is an
+/// unconditional shift across the whole product, and the final subtraction
+/// is the shared one-mask select.
+#[inline(always)]
+pub(crate) fn mont_sqr_kernel(n: &[Limb], np: Limb, a: &[Limb], p: &mut [Limb], out: &mut [Limb]) {
+    let l = n.len();
+    let a = &a[..l];
+    let p = &mut p[..2 * l];
+    p.fill(0);
+
+    // Off-diagonal triangle, rows i and i + 1 together. Row i writes columns
+    // 2i+1 ..= i+l−1 and drops its carry into i+l; row i + 1 writes columns
+    // 2i+3 ..= i+l and its carry into i+l+1. From column 2i+3 on both rows
+    // contribute, so the merged loop pipelines row i one column ahead.
+    let mut i = 0;
+    while i + 1 < l {
+        let ai = a[i];
+        let ai1 = a[i + 1];
+        let (s, mut c0) = mac(p[2 * i + 1], ai, ai1, 0);
+        p[2 * i + 1] = s;
+        let mut c1: Limb = 0;
+        if i + 2 < l {
+            let (s, cc0) = mac(p[2 * i + 2], ai, a[i + 2], c0);
+            c0 = cc0;
+            p[2 * i + 2] = s;
+        }
+        for j in (i + 3)..l {
+            let (s, cc0) = mac(p[i + j], ai, a[j], c0);
+            c0 = cc0;
+            let (s2, cc1) = mac(s, ai1, a[j - 1], c1);
+            c1 = cc1;
+            p[i + j] = s2;
+        }
+        if i + 3 <= l {
+            // Row i + 1's last product lands on row i's carry column.
+            let (s2, cc1) = mac(c0, ai1, a[l - 1], c1);
+            p[i + l] = s2;
+            p[i + l + 1] = cc1;
+        } else {
+            p[i + l] = c0;
+        }
+        i += 2;
+    }
+    // (An odd l leaves row l − 1, which has no off-diagonal products.)
+
+    // Double the triangle: 2S <= a² < 2^(128·l), so the shift cannot carry
+    // out of the 2l-limb product.
+    let mut carry: Limb = 0;
+    for w in p.iter_mut() {
+        let next = *w >> 63;
+        *w = (*w << 1) | carry;
+        carry = next;
+    }
+
+    // Add the diagonal a[i]² at (2i, 2i+1); the odd position's carry-out is
+    // the next even position's carry-in. The total is a², so the last carry
+    // out is zero.
+    let mut carry: Limb = 0;
+    for i in 0..l {
+        let (s, c) = mac(p[2 * i], a[i], a[i], carry);
+        p[2 * i] = s;
+        let (s, c2) = adc(p[2 * i + 1], c, 0);
+        p[2 * i + 1] = s;
+        carry = c2;
+    }
+
+    // SOS reduction, two rows per pass. `hi` is the carry riding above the
+    // top limb a pass touched (position i + l + 2 for a pair, i + l + 1 for
+    // the odd tail), which is exactly where the next pass's top add lands.
+    let mut hi: Limb = 0;
+    let mut i = 0;
+    while i + 1 < l {
+        let m0 = p[i].wrapping_mul(np);
+        let (_, mut c0) = mac(p[i], m0, n[0], 0);
+        // Row i, column i + 1: its result decides m1.
+        let (s, cc) = mac(p[i + 1], m0, n[1], c0);
+        c0 = cc;
+        let m1 = s.wrapping_mul(np);
+        let (_, mut c1) = mac(s, m1, n[0], 0);
+        for j in 2..l {
+            let (s, cc) = mac(p[i + j], m0, n[j], c0);
+            c0 = cc;
+            let (s2, cc1) = mac(s, m1, n[j - 1], c1);
+            c1 = cc1;
+            p[i + j] = s2;
+        }
+        // Column i + l: row i's carry (plus the riding carry) and row
+        // i + 1's last product; column i + l + 1: the two carries out.
+        let s = p[i + l] as u128 + c0 as u128 + hi as u128;
+        let (s2, cc1) = mac(s as Limb, m1, n[l - 1], c1);
+        p[i + l] = s2;
+        let s3 = p[i + l + 1] as u128 + cc1 as u128 + (s >> 64);
+        p[i + l + 1] = s3 as Limb;
+        hi = (s3 >> 64) as Limb;
+        i += 2;
+    }
+    if i < l {
+        // Odd width: one single row.
+        let m = p[i].wrapping_mul(np);
+        let mut carry: Limb = 0;
+        for j in 0..l {
+            let (s, c) = mac(p[i + j], m, n[j], carry);
+            p[i + j] = s;
+            carry = c;
+        }
+        let (s, c) = adc(p[i + l], carry, hi);
+        p[i + l] = s;
+        hi = c;
+    }
+
+    // The result is the (l+1)-limb value (p[l..2l], hi) < 2n.
+    mont_final_sub(n, &p[l..], hi, out);
 }
 
 /// Returns `(a + b) mod n`, assuming `a, b < n`.
@@ -153,184 +419,43 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     }
 
     /// Montgomery multiplication: given `a, b` in Montgomery form, returns
-    /// `a*b*R^-1 mod N` (the Montgomery form of the product). CIOS, constant
+    /// `a*b*R^-1 mod N` (the Montgomery form of the product). CIOS with
+    /// merged, two-rows-per-pass inner loops ([`mont_mul_kernel`]), constant
     /// time.
     pub const fn mont_mul(&self, a: &Uint<LIMBS>, b: &Uint<LIMBS>) -> Uint<LIMBS> {
-        let a = a.as_limbs();
-        let b = b.as_limbs();
-        let n = self.modulus.as_limbs();
-
-        // t spans LIMBS+2 words: the array holds t[0..LIMBS-1]; ts = t[LIMBS],
-        // ts1 = t[LIMBS+1].
         let mut t = [0 as Limb; LIMBS];
-        let mut ts: Limb = 0;
-
-        let mut i = 0;
-        while i < LIMBS {
-            // t += a * b[i]
-            let mut carry = 0;
-            let mut j = 0;
-            while j < LIMBS {
-                let (s, c) = mac(t[j], a[j], b[i], carry);
-                t[j] = s;
-                carry = c;
-                j += 1;
-            }
-            let (s, c) = adc(ts, carry, 0);
-            ts = s;
-            let ts1 = c; // t[LIMBS + 1]; only lives within this iteration
-
-            // m = t[0] * n' mod 2^64; t = (t + m*N) / 2^64
-            let m = t[0].wrapping_mul(self.n_prime);
-            let (_, mut carry) = mac(t[0], m, n[0], 0); // low word becomes 0
-            let mut j = 1;
-            while j < LIMBS {
-                let (s, c) = mac(t[j], m, n[j], carry);
-                t[j - 1] = s;
-                carry = c;
-                j += 1;
-            }
-            let (s, c) = adc(ts, carry, 0);
-            t[LIMBS - 1] = s;
-            ts = ts1 + c;
-
-            i += 1;
-        }
-
-        // Result is (t, ts) across LIMBS+1 words and is < 2N; subtract N once
-        // if it is >= N.
-        let result = Uint::from_limbs(t);
-        let (diff, borrow_low) = result.sbb(&self.modulus, 0);
-        let (_, borrow) = sbb(ts, 0, borrow_low);
-        // borrow == 0 means the (LIMBS+1)-word value was >= N: take the
-        // subtracted result; otherwise keep the original.
-        select(&diff, &result, borrow ^ 1)
+        let mut out = [0 as Limb; LIMBS];
+        mont_mul_kernel(
+            self.modulus.as_limbs(),
+            self.n_prime,
+            a.as_limbs(),
+            b.as_limbs(),
+            &mut t,
+            &mut out,
+        );
+        Uint::from_limbs(out)
     }
 
     /// Montgomery squaring: given `a` in Montgomery form, returns
     /// `a²·R^-1 mod N` — exactly [`mont_mul`](Self::mont_mul)`(a, a)`, but
-    /// with the standard squaring optimization: each off-diagonal partial
-    /// product `a[i]·a[j]` (`i < j`) is computed once and doubled, then the
-    /// diagonal `a[i]²` terms are added, roughly halving the `mac` count of
-    /// the schoolbook phase. The Montgomery reduction is a separate SOS pass
-    /// over the full `2·LIMBS`-limb square held in `(lo, hi)` halves.
+    /// with each off-diagonal product computed once ([`mont_sqr_kernel`]:
+    /// roughly half the multiplies of the general product), constant time.
     ///
-    /// Constant time: all loop bounds and the `lo`/`hi` split are functions
-    /// of the public `LIMBS` and loop indices only (the same public-index
-    /// branch pattern as [`Uint::mul_wide`]); the final subtraction uses the
-    /// same mask-based select as `mont_mul`.
+    /// The `2·LIMBS`-limb square lives in a `[[Limb; 2]; LIMBS]` viewed as
+    /// one flat slice (`2 * LIMBS` is not expressible as an array length on
+    /// stable), so the kernel indexes a single contiguous buffer — no
+    /// `lo`/`hi` split branching on every column.
     pub fn mont_sqr(&self, a: &Uint<LIMBS>) -> Uint<LIMBS> {
-        let a = a.as_limbs();
-        let n = self.modulus.as_limbs();
-
-        // The 2·LIMBS-limb square lives in (lo, hi); positions >= LIMBS map
-        // into hi. The index is always a public loop expression.
-        let mut lo = [0 as Limb; LIMBS];
-        let mut hi = [0 as Limb; LIMBS];
-
-        // Off-diagonal partial products a[i]·a[j] for i < j, each once.
-        // Iteration i drops its carry into position i+LIMBS (hi[i]), which
-        // the next iteration's top mac then accumulates into.
-        let mut i = 0;
-        while i < LIMBS {
-            let mut carry = 0;
-            let mut j = i + 1;
-            while j < LIMBS {
-                let p = i + j;
-                if p < LIMBS {
-                    let (v, c) = mac(lo[p], a[i], a[j], carry);
-                    lo[p] = v;
-                    carry = c;
-                } else {
-                    let (v, c) = mac(hi[p - LIMBS], a[i], a[j], carry);
-                    hi[p - LIMBS] = v;
-                    carry = c;
-                }
-                j += 1;
-            }
-            hi[i] = carry; // position i + LIMBS, untouched so far
-            i += 1;
-        }
-
-        // Double the off-diagonal sum S: 2S <= a² < 2^(128·LIMBS), so the
-        // shift cannot carry out of the top limb.
-        let mut carry: Limb = 0;
-        let mut k = 0;
-        while k < LIMBS {
-            let next = lo[k] >> 63;
-            lo[k] = (lo[k] << 1) | carry;
-            carry = next;
-            k += 1;
-        }
-        let mut k = 0;
-        while k < LIMBS {
-            let next = hi[k] >> 63;
-            hi[k] = (hi[k] << 1) | carry;
-            carry = next;
-            k += 1;
-        }
-
-        // Add the diagonal a[i]² terms at positions (2i, 2i+1); the high
-        // half's carry-out feeds the next even position's mac carry-in. The
-        // total is a², which fits in 2·LIMBS limbs, so the last carry is 0.
-        let mut carry: Limb = 0;
-        let mut i = 0;
-        while i < LIMBS {
-            let (p0, p1) = (2 * i, 2 * i + 1);
-            let w0 = if p0 < LIMBS { lo[p0] } else { hi[p0 - LIMBS] };
-            let (v, c) = mac(w0, a[i], a[i], carry);
-            if p0 < LIMBS {
-                lo[p0] = v;
-            } else {
-                hi[p0 - LIMBS] = v;
-            }
-            let w1 = if p1 < LIMBS { lo[p1] } else { hi[p1 - LIMBS] };
-            let (v, c2) = adc(w1, c, 0);
-            if p1 < LIMBS {
-                lo[p1] = v;
-            } else {
-                hi[p1 - LIMBS] = v;
-            }
-            carry = c2;
-            i += 1;
-        }
-
-        // Montgomery reduction, SOS style: cancel the LIMBS low limbs one at
-        // a time. `hic` carries iteration i's top-limb overflow into position
-        // i+LIMBS+1, exactly where iteration i+1 adds its own top carry, so a
-        // single riding limb suffices.
-        let mut hic: Limb = 0;
-        let mut i = 0;
-        while i < LIMBS {
-            let m = lo[i].wrapping_mul(self.n_prime);
-            let mut carry = 0;
-            let mut j = 0;
-            while j < LIMBS {
-                let p = i + j;
-                if p < LIMBS {
-                    let (v, c) = mac(lo[p], m, n[j], carry);
-                    lo[p] = v;
-                    carry = c;
-                } else {
-                    let (v, c) = mac(hi[p - LIMBS], m, n[j], carry);
-                    hi[p - LIMBS] = v;
-                    carry = c;
-                }
-                j += 1;
-            }
-            let (v, c) = adc(hi[i], carry, hic);
-            hi[i] = v;
-            hic = c;
-            i += 1;
-        }
-
-        // Result is the (LIMBS+1)-limb value (hi, hic) and is < 2N; same
-        // mask-based conditional final subtraction as `mont_mul`.
-        let result = Uint::from_limbs(hi);
-        let (diff, borrow_low) = result.sbb(&self.modulus, 0);
-        let (_, borrow) = sbb(hic, 0, borrow_low);
-        let ge = Choice::from((borrow ^ 1) as u8);
-        Uint::conditional_select(&diff, &result, ge)
+        let mut p = [[0 as Limb; 2]; LIMBS];
+        let mut out = [0 as Limb; LIMBS];
+        mont_sqr_kernel(
+            self.modulus.as_limbs(),
+            self.n_prime,
+            a.as_limbs(),
+            p.as_flattened_mut(),
+            &mut out,
+        );
+        Uint::from_limbs(out)
     }
 
     /// Converts `x` (a plain residue `< N`) into Montgomery form `xR mod N`.
