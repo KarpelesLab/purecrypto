@@ -79,6 +79,28 @@ fn m(a: u64, b: u64) -> u128 {
     (a as u128) * (b as u128)
 }
 
+/// Expands a secret `0`/`1` bit into an all-zeros / all-ones limb mask
+/// behind a single optimisation barrier, so LLVM cannot turn the masked
+/// arithmetic that follows back into a conditional jump. Every select and
+/// swap in this backend derives **one** such mask per decision and applies
+/// it with plain `&`/`^` across all limbs — the barrier is paid once per
+/// selection, not once per limb.
+#[inline(always)]
+pub(crate) fn mask_from_bit(bit: u64) -> u64 {
+    core::hint::black_box(bit.wrapping_neg())
+}
+
+/// All-ones iff `a == b`, else zero, without a branch: the barrier sits on
+/// the XOR difference, so neither input nor the verdict is ever a value the
+/// compiler can compare-and-branch on. One barrier per call.
+#[inline(always)]
+pub(crate) fn eq_mask(a: u64, b: u64) -> u64 {
+    let d = core::hint::black_box(a ^ b);
+    // `(d | −d) >> 63` is 1 iff `d != 0`; subtracting 1 flips it to the
+    // "equal" sense as a full mask.
+    ((d | d.wrapping_neg()) >> 63).wrapping_sub(1)
+}
+
 impl Fe {
     /// The additive identity `0`.
     pub(crate) const ZERO: Fe = Fe([0; 5]);
@@ -354,12 +376,44 @@ impl Fe {
     pub(crate) fn is_negative(&self) -> Choice {
         Choice::from(self.to_bytes()[0] & 1)
     }
+
+    /// `a` when `mask` is all-ones, `b` when it is zero. `mask` must come
+    /// from [`mask_from_bit`] / [`eq_mask`] (already behind the barrier);
+    /// this applies it limbwise with no further barrier.
+    #[inline(always)]
+    pub(crate) fn select(a: &Fe, b: &Fe, mask: u64) -> Fe {
+        let a = &a.0;
+        let b = &b.0;
+        Fe([
+            b[0] ^ (mask & (a[0] ^ b[0])),
+            b[1] ^ (mask & (a[1] ^ b[1])),
+            b[2] ^ (mask & (a[2] ^ b[2])),
+            b[3] ^ (mask & (a[3] ^ b[3])),
+            b[4] ^ (mask & (a[4] ^ b[4])),
+        ])
+    }
+
+    /// Swaps `a` and `b` when `mask` is all-ones, leaves them when it is
+    /// zero. Same mask contract as [`Self::select`].
+    #[inline(always)]
+    pub(crate) fn cswap(a: &mut Fe, b: &mut Fe, mask: u64) {
+        for i in 0..5 {
+            let t = mask & (a.0[i] ^ b.0[i]);
+            a.0[i] ^= t;
+            b.0[i] ^= t;
+        }
+    }
 }
 
 impl ConditionallySelectable for Fe {
     #[inline]
     fn conditional_select(a: &Fe, b: &Fe, choice: Choice) -> Fe {
-        Fe(<[u64; 5]>::conditional_select(&a.0, &b.0, choice))
+        Fe::select(a, b, mask_from_bit(choice.unwrap_u8() as u64))
+    }
+
+    #[inline]
+    fn conditional_swap(a: &mut Fe, b: &mut Fe, choice: Choice) {
+        Fe::cswap(a, b, mask_from_bit(choice.unwrap_u8() as u64));
     }
 }
 

@@ -16,8 +16,8 @@
 
 #[cfg(feature = "ed25519-table")]
 use super::base_table::ED25519_BASE_TABLE;
-use super::field::{Fe, Field, ScalarInt};
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
+use super::field::{Fe, Field, ScalarInt, eq_mask};
+use crate::ct::{Choice, ConstantTimeLess};
 
 /// A curve point in extended homogeneous coordinates `(X:Y:Z:T)`.
 #[derive(Clone, Copy, Debug)]
@@ -247,13 +247,14 @@ impl Field {
             acc = self.point_double(&acc);
 
             let byte = scalar[i / 2];
-            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as usize;
-            // Constant-time gather of table[digit]. The index comparison is
-            // the branch-free `ct_eq`, not `==`, so the secret digit never
-            // feeds a compare-and-branch the compiler could emit.
+            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as u64;
+            // Constant-time gather of table[digit]: one barriered equality
+            // mask per entry (`eq_mask`, never `==`), applied across all
+            // four coordinates, so the secret digit never feeds a
+            // compare-and-branch the compiler could emit.
             let mut sel = table[0];
             for (j, entry) in table.iter().enumerate() {
-                sel = point_select(&sel, entry, j.ct_eq(&digit));
+                sel = point_select(entry, &sel, eq_mask(j as u64, digit));
             }
             acc = self.point_add(&acc, &sel);
         }
@@ -277,15 +278,15 @@ impl Field {
         for (i, window) in ED25519_BASE_TABLE.iter().enumerate() {
             // Digit i = nibble i of the little-endian scalar bytes.
             let byte = scalar[i / 2];
-            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as usize;
+            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as u64;
             // Constant-time gather: scan all 15 entries, keep entry j when
-            // j + 1 == digit; a zero digit keeps the identity. Every stored
-            // entry is affine, so Z = 1 — which also matches the identity
-            // representation (0:1:1:0).
+            // j + 1 == digit (one barriered mask per entry); a zero digit
+            // keeps the identity. Every stored entry is affine, so Z = 1 —
+            // which also matches the identity representation (0:1:1:0).
             let mut sel = id;
             for (j, entry) in window.iter().enumerate() {
                 let cand = table_point(entry, self.one);
-                sel = point_select(&sel, &cand, (j + 1).ct_eq(&digit));
+                sel = point_select(&cand, &sel, eq_mask(j as u64 + 1, digit));
             }
             acc = self.point_add(&acc, &sel);
         }
@@ -484,16 +485,17 @@ fn wnaf5(scalar: &[u8; 32]) -> [i8; 261] {
     naf
 }
 
-/// Constant-time point selection: `b` if `c` is set, else `a`. (This crate's
-/// `conditional_select(x, y, c)` returns `x` when `c` is set, so the chosen
-/// value goes first.)
+/// Constant-time point selection: `a` when `mask` is all-ones, `b` when it
+/// is zero. The mask comes from `field::eq_mask` / `field::mask_from_bit`
+/// (one barrier per selection) and is applied limbwise to all four
+/// coordinates.
 #[inline]
-pub(crate) fn point_select(a: &Point, b: &Point, c: Choice) -> Point {
+pub(crate) fn point_select(a: &Point, b: &Point, mask: u64) -> Point {
     Point {
-        x: Fe::conditional_select(&b.x, &a.x, c),
-        y: Fe::conditional_select(&b.y, &a.y, c),
-        z: Fe::conditional_select(&b.z, &a.z, c),
-        t: Fe::conditional_select(&b.t, &a.t, c),
+        x: Fe::select(&a.x, &b.x, mask),
+        y: Fe::select(&a.y, &b.y, mask),
+        z: Fe::select(&a.z, &b.z, mask),
+        t: Fe::select(&a.t, &b.t, mask),
     }
 }
 

@@ -5,10 +5,10 @@
 //! multiplication is the Montgomery ladder with constant-time conditional
 //! swaps.
 
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
-use crate::ec::curve25519::field::Fe;
+use crate::ct::ConstantTimeEq;
 #[cfg(feature = "ed25519-table")]
 use crate::ec::curve25519::field::Field;
+use crate::ec::curve25519::field::{Fe, mask_from_bit};
 use crate::rng::RngCore;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -69,16 +69,17 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     let mut z3 = Fe::ONE;
 
     // Montgomery ladder over bits 254..0 of the clamped scalar (bit 255 is
-    // cleared and bit 254 set by clamping).
+    // cleared and bit 254 set by clamping). Each step derives one barriered
+    // swap mask from the secret bit and applies it to both coordinate pairs.
     let mut swap = 0u8;
     let mut t = 255;
     while t > 0 {
         t -= 1;
         let kt = (k[t / 8] >> (t % 8)) & 1;
         swap ^= kt;
-        let sw = Choice::from(swap);
-        Fe::conditional_swap(&mut x2, &mut x3, sw);
-        Fe::conditional_swap(&mut z2, &mut z3, sw);
+        let sw = mask_from_bit(swap as u64);
+        Fe::cswap(&mut x2, &mut x3, sw);
+        Fe::cswap(&mut z2, &mut z3, sw);
         swap = kt;
 
         let a = x2.add(&z2);
@@ -95,9 +96,9 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
         x2 = aa.mul(&bb);
         z2 = e.mul(&aa.add(&A24.mul(&e)));
     }
-    let sw = Choice::from(swap);
-    Fe::conditional_swap(&mut x2, &mut x3, sw);
-    Fe::conditional_swap(&mut z2, &mut z3, sw);
+    let sw = mask_from_bit(swap as u64);
+    Fe::cswap(&mut x2, &mut x3, sw);
+    Fe::cswap(&mut z2, &mut z3, sw);
 
     // result = x2 / z2 (or 0 if z2 == 0).
     //
