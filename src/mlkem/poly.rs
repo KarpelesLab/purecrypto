@@ -172,38 +172,37 @@ pub(crate) fn poly_basemul(a: &Poly, b: &Poly) -> Poly {
 /// PRF output. Each coefficient is `popcount(a) − popcount(b)` over two
 /// adjacent η-bit groups, so the result lies in `[-ETA, ETA]`.
 ///
-/// Implemented branch-free in `ETA`: the loop bound and shift amounts are
-/// `const`s, so monomorphization specializes the entire body per set.
-/// Supported values: η ∈ {2, 3} (FIPS 203). Other ETA still works mechanically
-/// up to ETA = 8 but is not exercised.
+/// Branch-free and specialized per `ETA` ∈ {2, 3} (FIPS 203) by
+/// monomorphization: the bit groups are popcounted bit-sliced, a word at a
+/// time, instead of extracting each group through a bit offset.
 pub(crate) fn cbd<const ETA: usize>(buf: &[u8]) -> Poly {
     debug_assert_eq!(buf.len(), 64 * ETA);
+    const { assert!(ETA == 2 || ETA == 3) };
     let mut p = Poly::zero();
-    let mask: u32 = (1u32 << ETA) - 1;
-    let group_bits = 2 * ETA;
-    for k in 0..N {
-        let bit_pos = k * group_bits;
-        let byte_idx = bit_pos / 8;
-        let bit_off = bit_pos & 7;
-        // Read up to 24 bits, which is the most we ever need (η = 3 ⇒ 6
-        // group bits; with an offset of 7 the span crosses two bytes; pad
-        // to 3 bytes to keep the indexing uniform).
-        let b0 = buf[byte_idx] as u32;
-        let b1 = if byte_idx + 1 < buf.len() {
-            buf[byte_idx + 1] as u32
-        } else {
-            0
-        };
-        let b2 = if byte_idx + 2 < buf.len() {
-            buf[byte_idx + 2] as u32
-        } else {
-            0
-        };
-        let raw = b0 | (b1 << 8) | (b2 << 16);
-        let chunk = (raw >> bit_off) & ((1u32 << group_bits) - 1);
-        let a = (chunk & mask).count_ones() as i16;
-        let b = ((chunk >> ETA) & mask).count_ones() as i16;
-        p.c[k] = a - b;
+    if ETA == 2 {
+        // Eight coefficients per 32-bit word: a bit-sliced popcount of each
+        // 2-bit group (`d` holds the eight (a, b) counts in 4-bit lanes).
+        for (word, out) in buf.chunks_exact(4).zip(p.c.chunks_exact_mut(8)) {
+            let t = u32::from_le_bytes(word.try_into().unwrap());
+            let d = (t & 0x5555_5555) + ((t >> 1) & 0x5555_5555);
+            for (j, c) in out.iter_mut().enumerate() {
+                let a = ((d >> (4 * j)) & 3) as i16;
+                let b = ((d >> (4 * j + 2)) & 3) as i16;
+                *c = a - b;
+            }
+        }
+    } else {
+        // Four coefficients per 24-bit group: popcount of each 3-bit group
+        // into 6-bit lanes.
+        for (bytes, out) in buf.chunks_exact(3).zip(p.c.chunks_exact_mut(4)) {
+            let t = bytes[0] as u32 | (bytes[1] as u32) << 8 | (bytes[2] as u32) << 16;
+            let d = (t & 0x0024_9249) + ((t >> 1) & 0x0024_9249) + ((t >> 2) & 0x0024_9249);
+            for (j, c) in out.iter_mut().enumerate() {
+                let a = ((d >> (6 * j)) & 7) as i16;
+                let b = ((d >> (6 * j + 3)) & 7) as i16;
+                *c = a - b;
+            }
+        }
     }
     p
 }
@@ -257,13 +256,14 @@ pub(crate) fn is_canonical(a: &[u8]) -> bool {
 
 /// `ByteDecode₁₂`: parses a 384-byte polynomial (12 bits/coefficient).
 pub(crate) fn from_bytes(a: &[u8]) -> Poly {
+    debug_assert_eq!(a.len(), 384);
     let mut p = Poly::zero();
-    for i in 0..N / 2 {
-        let b0 = a[3 * i] as u16;
-        let b1 = a[3 * i + 1] as u16;
-        let b2 = a[3 * i + 2] as u16;
-        p.c[2 * i] = (b0 | (b1 << 8)) as i16 & 0xfff;
-        p.c[2 * i + 1] = ((b1 >> 4) | (b2 << 4)) as i16 & 0xfff;
+    for (bytes, out) in a.chunks_exact(3).zip(p.c.chunks_exact_mut(2)) {
+        let b0 = bytes[0] as u16;
+        let b1 = bytes[1] as u16;
+        let b2 = bytes[2] as u16;
+        out[0] = (b0 | (b1 << 8)) as i16 & 0xfff;
+        out[1] = ((b1 >> 4) | (b2 << 4)) as i16 & 0xfff;
     }
     p
 }
@@ -314,57 +314,36 @@ pub(crate) fn to_msg(p: &Poly) -> [u8; 32] {
 /// Supported D: 4, 5, 10, 11 (all FIPS 203 values for `du` / `dv`).
 pub(crate) fn compress<const D: usize>(p: &Poly, out: &mut [u8]) {
     debug_assert_eq!(out.len(), N * D / 8);
-    for byte in out.iter_mut() {
-        *byte = 0;
-    }
-    let mask: u32 = (1u32 << D) - 1;
-    let mut bit_pos = 0usize;
-    for i in 0..N {
-        let x = freeze(p.c[i]) as u64;
-        // Barrett-style division by Q (see Q_BARRETT_* above).
-        let n = (x << D) + (Q as u64 / 2);
-        let v = ((n * Q_BARRETT_MUL) >> Q_BARRETT_SHIFT) as u32 & mask;
-        let mut bits_left = D;
-        let mut value = v;
-        let mut byte_idx = bit_pos / 8;
-        let mut shift = bit_pos & 7;
-        while bits_left > 0 {
-            let space = 8 - shift;
-            let take = bits_left.min(space);
-            let chunk = (value & ((1u32 << take) - 1)) as u8;
-            out[byte_idx] |= chunk << shift;
-            value >>= take;
-            bits_left -= take;
-            byte_idx += 1;
-            shift = 0;
+    const { assert!(D >= 1 && D <= 12) };
+    let mask: u64 = (1u64 << D) - 1;
+    // Eight coefficients pack into exactly `D` bytes: accumulate their
+    // `D`-bit fields little-endian in a u128 and write the low `D` bytes.
+    for (coeffs, bytes) in p.c.chunks_exact(8).zip(out.chunks_exact_mut(D)) {
+        let mut acc: u128 = 0;
+        for (j, &c) in coeffs.iter().enumerate() {
+            let x = freeze(c) as u64;
+            // Barrett-style division by Q (see Q_BARRETT_* above).
+            let n = (x << D) + (Q as u64 / 2);
+            let v = ((n * Q_BARRETT_MUL) >> Q_BARRETT_SHIFT) & mask;
+            acc |= (v as u128) << (D * j);
         }
-        bit_pos += D;
+        bytes.copy_from_slice(&acc.to_le_bytes()[..D]);
     }
 }
 
 /// `Decompress_D(ByteDecode_D(c))`: inverse of [`compress`].
 pub(crate) fn decompress<const D: usize>(input: &[u8], p: &mut Poly) {
     debug_assert_eq!(input.len(), N * D / 8);
-    let mut bit_pos = 0usize;
-    for i in 0..N {
-        let mut value = 0u32;
-        let mut bits_left = D;
-        let mut byte_idx = bit_pos / 8;
-        let mut shift = bit_pos & 7;
-        let mut out_shift = 0;
-        while bits_left > 0 {
-            let space = 8 - shift;
-            let take = bits_left.min(space);
-            // Use u32 for the mask so `take == 8` doesn't trip a u8 shift overflow.
-            let chunk = (input[byte_idx] as u32 >> shift) & ((1u32 << take) - 1);
-            value |= chunk << out_shift;
-            out_shift += take;
-            bits_left -= take;
-            byte_idx += 1;
-            shift = 0;
+    const { assert!(D >= 1 && D <= 12) };
+    let mask: u128 = (1u128 << D) - 1;
+    for (bytes, coeffs) in input.chunks_exact(D).zip(p.c.chunks_exact_mut(8)) {
+        let mut le = [0u8; 16];
+        le[..D].copy_from_slice(bytes);
+        let acc = u128::from_le_bytes(le);
+        for (j, c) in coeffs.iter_mut().enumerate() {
+            let value = ((acc >> (D * j)) & mask) as u64;
+            *c = ((value * Q as u64 + (1u64 << (D - 1))) >> D) as i16;
         }
-        p.c[i] = (((value as u64) * Q as u64 + (1u64 << (D - 1))) >> D) as i16;
-        bit_pos += D;
     }
 }
 
