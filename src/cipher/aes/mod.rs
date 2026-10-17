@@ -406,13 +406,22 @@ macro_rules! aes_variant {
 
             #[inline]
             fn encrypt_blocks(&self, blocks: &mut [u8]) {
-                debug_assert_eq!(blocks.len() % 16, 0, "encrypt_blocks needs whole blocks");
+                // Hard check (see the trait docs): every backend walks
+                // `chunks_exact_mut(16)` and would silently leave a trailing
+                // partial block unencrypted.
+                assert!(
+                    blocks.len().is_multiple_of(16),
+                    "encrypt_blocks needs whole blocks"
+                );
                 dispatch_encrypt_blocks(self.backend, &self.rk, $nr, blocks);
             }
 
             #[inline]
             fn decrypt_blocks(&self, blocks: &mut [u8]) {
-                debug_assert_eq!(blocks.len() % 16, 0, "decrypt_blocks needs whole blocks");
+                assert!(
+                    blocks.len().is_multiple_of(16),
+                    "decrypt_blocks needs whole blocks"
+                );
                 dispatch_decrypt_blocks(self.backend, &self.rk, $nr, blocks);
             }
 
@@ -458,6 +467,24 @@ aes_variant!(
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
+
+    /// A buffer that is not a whole number of blocks is rejected outright
+    /// (in release builds too) instead of having its tail skipped.
+    #[test]
+    #[should_panic(expected = "encrypt_blocks needs whole blocks")]
+    fn encrypt_blocks_rejects_partial_block() {
+        let cipher = Aes128::new(&[0u8; 16]);
+        let mut buf = [0u8; 24];
+        cipher.encrypt_blocks(&mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "decrypt_blocks needs whole blocks")]
+    fn decrypt_blocks_rejects_partial_block() {
+        let cipher = Aes256::new(&[0u8; 32]);
+        let mut buf = [0u8; 40];
+        cipher.decrypt_blocks(&mut buf);
+    }
 
     #[test]
     fn fips197_aes128() {

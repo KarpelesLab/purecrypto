@@ -168,8 +168,17 @@ pub trait BlockCipher {
     /// (CTR, GCM, GCM-SIV, OFB) build on — they prepare the counter blocks and
     /// XOR the result, so all counter arithmetic stays in the mode. Like the
     /// single-block path it is constant-time.
+    ///
+    /// # Panics
+    /// If `blocks.len()` is not a multiple of 16. (A trailing partial block
+    /// would otherwise be skipped and handed back as plaintext — a silent
+    /// failure in release builds, so the precondition is checked
+    /// unconditionally.)
     fn encrypt_blocks(&self, blocks: &mut [u8]) {
-        debug_assert_eq!(blocks.len() % 16, 0, "encrypt_blocks needs whole blocks");
+        assert!(
+            blocks.len().is_multiple_of(16),
+            "encrypt_blocks needs whole blocks"
+        );
         for chunk in blocks.chunks_exact_mut(16) {
             let block: &mut [u8; 16] = chunk.try_into().expect("16-byte chunk");
             self.encrypt_block(block);
@@ -180,8 +189,15 @@ pub trait BlockCipher {
     /// `blocks` independently (no chaining). `blocks.len()` must be a multiple
     /// of 16. Default loops over [`decrypt_block`](Self::decrypt_block);
     /// hardware backends override to pipeline. Constant-time.
+    ///
+    /// # Panics
+    /// If `blocks.len()` is not a multiple of 16 (see
+    /// [`encrypt_blocks`](Self::encrypt_blocks)).
     fn decrypt_blocks(&self, blocks: &mut [u8]) {
-        debug_assert_eq!(blocks.len() % 16, 0, "decrypt_blocks needs whole blocks");
+        assert!(
+            blocks.len().is_multiple_of(16),
+            "decrypt_blocks needs whole blocks"
+        );
         for chunk in blocks.chunks_exact_mut(16) {
             let block: &mut [u8; 16] = chunk.try_into().expect("16-byte chunk");
             self.decrypt_block(block);
