@@ -51,7 +51,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2) | RFC / NIST samples; **Wycheproof** (HMAC ×12, KMAC); M14 oracle-derived (K12-validated), cross-checked vs noble-hashes | OpenSSL (Whirlpool, SM3, SHAKE, BLAKE2), PyCryptodome (MD2), gostcrypto (Streebog), noble-hashes (M14, 14-round) | — | MAC verify CT |
 | `mac` | RFC 4418 (UMAC), SipHash (Aumasson–Bernstein), draft-krovetz-vmac-01 (VMAC, behind the opt-in `vmac` feature) | RFC / paper vectors; **Wycheproof** (SipHash ×5, VMAC ×2) | — | — | built on CT AES; SipHash ARX; VMAC mask-based arithmetic |
 | `rng` | SP 800-90A (HMAC-DRBG) | CAVP | — | — | n/a (public output) |
-| `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713, EAX, AEGIS, RFC 7518 §5.2; RFC 4269 (SEED), MORUS v2 and AEGIS-128 behind the opt-in `legacy-ciphers` feature | RFC / NIST; **Wycheproof** (GCM, GCM-SIV, CCM, EAX, ChaCha20/XChaCha20-Poly1305, AEGIS, MORUS, GMAC, CBC, CMAC, SIV, KW/KWP, XTS, CBC-HS; ARIA/Camellia/SEED/SM4 modes) | — | — | AES table-free; ARX |
+| `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713, EAX, AEGIS, RFC 7518 §5.2; RFC 4269 (SEED), MORUS v2, AEGIS-128 and TEA/XTEA/XXTEA behind the opt-in `legacy-ciphers` feature | RFC / NIST; **Wycheproof** (GCM, GCM-SIV, CCM, EAX, ChaCha20/XChaCha20-Poly1305, AEGIS, MORUS, GMAC, CBC, CMAC, SIV, KW/KWP, XTS, CBC-HS; ARIA/Camellia/SEED/SM4 modes) | — | — | AES table-free; ARX |
 | `kdf` | RFC 8018/5869/7914, SP 800-108 | RFC / CAVP; **Wycheproof** (HKDF, PBKDF2, PBES2) | — | `pbes2_decrypt` | built on CT HMAC |
 | `ascon` | NIST SP 800-232 (final); the v1.2 Ascon-128/128a/80pq AEADs behind the opt-in `legacy-ciphers` feature | ref KAT; **Wycheproof** | — | — | permutation (no tables) |
 | `fpe` | NIST SP 800-38G FF1 (Rev. 1 `radix^n >= 10^6` floor; 2016 floor via `new_legacy`) | NIST FF1 samples (AES-128/192/256, radix 10 and 36); **Wycheproof** (22 files: 13 radices as digit lists, 9 as alphabets) | — | — | AES CT; the digit arithmetic is data-dependent by the nature of FPE |
@@ -953,8 +953,8 @@ Every entry runs the positive control, then the full case list.
   none`). Under `cargo test --all-features` the client requests are no-ops
   and the same binary is a plain smoke test.
 - **Covered** (one fixed-seed instance each, 103 cases): the `ct`
-  primitives; AES-128/192/256, Camellia, ARIA, SM4 and SEED block
-  encryption; AES-GCM, AES-GCM-SIV, AES-CCM, AES-EAX, ChaCha20-Poly1305,
+  primitives; AES-128/192/256, Camellia, ARIA, SM4, SEED, TEA, XTEA and
+  XXTEA block encryption; AES-GCM, AES-GCM-SIV, AES-CCM, AES-EAX, ChaCha20-Poly1305,
   XChaCha20-Poly1305, AEGIS-128L, AEGIS-128, MORUS-640/1280, Ascon-AEAD128,
   Ascon-128/128a, SEED-GCM (seal, open, and open with a forged tag);
   AES-CBC/CTR/CFB/OFB, AES-XTS (with ciphertext stealing), AES-KW and KWP

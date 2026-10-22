@@ -78,9 +78,9 @@ use purecrypto::bls;
 use purecrypto::chunked::{self, Cobblestone128};
 use purecrypto::cipher::{
     Aegis128, Aegis128L, Aes128, Aes128Ccm, Aes128Eax, Aes128Kw, Aes128Kwp, Aes128Xts, Aes192,
-    Aes256, Aes256GcmSiv, AesCmac128, AesSiv, Aez, Aria128, BlockCipher, Camellia128, Cbc, Cfb,
-    ChaCha20Poly1305, Ctr, Gcm, Gmac, Morus640, Morus1280, Ofb, Poly1305, Seed, Sm4,
-    XChaCha20Poly1305, kwp_ciphertext_len,
+    Aes256, Aes256GcmSiv, AesCmac128, AesSiv, Aez, Aria128, BlockCipher, BlockCipher64,
+    Camellia128, Cbc, Cfb, ChaCha20Poly1305, Ctr, Gcm, Gmac, Morus640, Morus1280, Ofb, Poly1305,
+    Seed, Sm4, Tea, XChaCha20Poly1305, Xtea, Xxtea, kwp_ciphertext_len,
 };
 use purecrypto::dh::{DhPrivateKey, group14};
 use purecrypto::dsa::{self, DsaPrivateKey};
@@ -250,6 +250,17 @@ fn ct_primitives() -> String {
 
 fn aes_block<C: BlockCipher>(cipher: &C) -> String {
     let mut block = secret_bytes::<16>(3);
+    let orig = block;
+    cipher.encrypt_block(&mut block);
+    let ct_hex = hex8(public(&block));
+    cipher.decrypt_block(&mut block);
+    let back = ct::declassify_value(block.ct_eq(&orig));
+    assert!(bool::from(back));
+    ct_hex
+}
+
+fn block64<C: BlockCipher64>(cipher: &C) -> String {
+    let mut block = secret_bytes::<8>(608);
     let orig = block;
     cipher.encrypt_block(&mut block);
     let ct_hex = hex8(public(&block));
@@ -2252,6 +2263,14 @@ fn legacy_aeads() -> String {
         },
     ));
     out.push(aes_block(&Seed::new(&k16)));
+    out.push(block64(&Tea::new(&k16)));
+    out.push(block64(&Xtea::new(&k16)));
+    let mut msg = secret_bytes::<20>(607);
+    let orig = msg;
+    Xxtea::new(&k16).encrypt(&mut msg).expect("whole words");
+    out.push(hex8(public(&msg)));
+    Xxtea::new(&k16).decrypt(&mut msg).expect("whole words");
+    assert!(bool::from(ct::declassify_value(msg.ct_eq(&orig))));
     out.join(" ")
 }
 

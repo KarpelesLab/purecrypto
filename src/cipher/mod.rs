@@ -12,10 +12,10 @@
 //! combined as the [`ChaCha20Poly1305`] AEAD (RFC 8439) — both inherently
 //! constant time, built from 32-bit ARX and 130-bit limb arithmetic.
 //!
-//! SEED ([`Seed`]), MORUS ([`Morus640`] / [`Morus1280`]) and the original
-//! CAESAR AEGIS-128 ([`Aegis128`], superseded by [`Aegis128L`]) are kept for
-//! interop and test-vector coverage only, behind the opt-in `legacy-ciphers`
-//! feature.
+//! SEED ([`Seed`]), MORUS ([`Morus640`] / [`Morus1280`]), the original
+//! CAESAR AEGIS-128 ([`Aegis128`], superseded by [`Aegis128L`]) and the TEA
+//! family ([`Tea`], [`Xtea`], [`Xxtea`]) are kept for interop and
+//! test-vector coverage only, behind the opt-in `legacy-ciphers` feature.
 //!
 //! # AEAD buffer contract on tag failure
 //!
@@ -57,7 +57,10 @@
     doc = "[`Seed`]: crate",
     doc = "[`Morus640`]: crate",
     doc = "[`Morus1280`]: crate",
-    doc = "[`Aegis128`]: crate"
+    doc = "[`Aegis128`]: crate",
+    doc = "[`Tea`]: crate",
+    doc = "[`Xtea`]: crate",
+    doc = "[`Xxtea`]: crate"
 )]
 #![cfg_attr(not(feature = "alloc"), doc = "", doc = "[`AesSiv`]: crate#no_std")]
 
@@ -102,6 +105,8 @@ mod sbox_bitsliced;
 #[cfg(feature = "legacy-ciphers")]
 mod seed;
 mod sm4;
+#[cfg(feature = "legacy-ciphers")]
+mod tea;
 // AES-SIV returns variable-length `Vec` output (RFC 5297), so it needs `alloc`.
 #[cfg(feature = "alloc")]
 mod siv;
@@ -143,6 +148,8 @@ pub use seed::Seed;
 #[cfg(feature = "alloc")]
 pub use siv::AesSiv;
 pub use sm4::Sm4;
+#[cfg(feature = "legacy-ciphers")]
+pub use tea::{Tea, Xtea, Xxtea};
 pub use xchacha20poly1305::XChaCha20Poly1305;
 pub use xts::{Aes128Xts, Aes256Xts, Xts, XtsError};
 
