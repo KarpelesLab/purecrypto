@@ -538,13 +538,23 @@ fn raw_private_full_width(
 /// well-padded plaintext, so every caller fails closed instead of emitting
 /// something an attacker could use to factor `n`.
 fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUint {
+    raw_private_checked_boxed(key, c).unwrap_or_else(|| BoxedUint::zero(1))
+}
+
+/// [`raw_private_blinded_boxed`] with the double fault-check failure
+/// reported as `None` instead of folded into a zero result. The padded
+/// schemes want the zero (it fails every padding / signature check on its
+/// own); the public [`BoxedRsaPrivateKey::raw_private`] has no padding to
+/// fail, and `0` is the legitimate image of `c = 0`, so it needs the
+/// distinction.
+fn raw_private_checked_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> Option<BoxedUint> {
     let mont = &key.mont;
     // One counter bump per private operation. `Relaxed` is enough: the value
     // only has to differ between operations, it orders nothing else.
     let nonce = key.blind_counter.fetch_add(1, Ordering::Relaxed);
     let salt = super::keys::per_op_blind_salt(&key.blind_salt);
     let Some(crt) = key.crt.as_deref() else {
-        return raw_private_full_width(key, nonce, &salt, c);
+        return Some(raw_private_full_width(key, nonce, &salt, c));
     };
 
     let m = raw_private_crt_blinded(key, crt, nonce, &salt, c);
@@ -556,14 +566,14 @@ fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUi
     // time `==` would scan a value derived from the secret `m`); the
     // verdict is public — it is `true` for every fault-free operation.
     if mont.pow_public(&m, &key.e).ct_eq(&c_mod_n).declassify() {
-        return m;
+        return Some(m);
     }
     let mut m2 = raw_private_full_width(key, nonce, &salt, c);
     if mont.pow_public(&m2, &key.e).ct_eq(&c_mod_n).declassify() {
-        return m2;
+        return Some(m2);
     }
     m2.zeroize();
-    BoxedUint::zero(1)
+    None
 }
 
 /// Lower bound for `BoxedRsaPublicKey` parsing entry points. Anything smaller
@@ -573,6 +583,23 @@ fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUi
 /// `k < 11` indexing-panic class, and (b) refuse the obviously-broken
 /// modulus sizes an attacker might inject via a malicious SPKI.
 pub(crate) const MIN_RSA_BITS: usize = 1024;
+
+/// Smallest modulus [`BoxedRsaPrivateKey::generate`] /
+/// [`try_generate`](BoxedRsaPrivateKey::try_generate) produce and
+/// [`from_crt_components`](BoxedRsaPrivateKey::from_crt_components) accepts.
+///
+/// Far below anything secure — a 256-bit modulus factors in minutes — and
+/// below the parse floor [`MIN_RSA_BITS`]; it exists for interop with
+/// stacks that still create toy keys (PHP's `openssl_pkey_new` allows 384
+/// bits, OpenSSL's `genrsa` historically 512). 256 is the smallest size at
+/// which everything the key is built from still holds with margin: both
+/// primes are ≥ 128 bits, so far above the trial-division table and the
+/// usual exponents (`e = 65537` is 17 bits, so `gcd(e, p − 1) = 1` redraws
+/// stay rare), the Miller-Rabin floor for 128-bit candidates is 24 rounds,
+/// `k ≥ 32` octets leaves room for PKCS#1 v1.5 encryption padding
+/// (`k ≥ 11`), and the "`e` below `n`" invariant the public-exponent check
+/// enforces is still satisfiable (keygen requires `e < 2^(bits − 1) ≤ n`).
+pub(crate) const MIN_RSA_KEYGEN_BITS: usize = 256;
 
 /// Upper bound to prevent CPU-exhaustion on parsing huge SPKI moduli.
 /// `BoxedMontModulus::new` costs O(log(limbs)) Montgomery squarings for the
@@ -610,7 +637,6 @@ fn validate_public_exponent(n: &BoxedUint, e: &BoxedUint) -> Result<(), Error> {
 /// integer below `n`), and an oversized `d` widens the constant-time
 /// exponentiation past the modulus width — leaking, via timing, that the key
 /// is malformed and costing proportionally more per operation.
-#[cfg(feature = "der")]
 fn validate_private_exponent(n: &BoxedUint, d: &BoxedUint) -> Result<(), Error> {
     if d.is_zero() || !d.lt(n) {
         return Err(Error::InvalidKey);
@@ -627,7 +653,6 @@ fn validate_private_exponent(n: &BoxedUint, d: &BoxedUint) -> Result<(), Error> 
 /// through the CRT recombination path, and in the worst case enables a
 /// Bleichenbacher-style fault on the secret exponent. We reject before the
 /// key is constructed.
-#[cfg(feature = "der")]
 fn validate_private_components(n: &BoxedUint, primes: &[&BoxedUint]) -> Result<(), Error> {
     let one = BoxedUint::from_u64(1);
     let mut prod = one.clone();
@@ -664,7 +689,6 @@ fn validate_private_components(n: &BoxedUint, primes: &[&BoxedUint]) -> Result<(
 /// deliberately inconsistent one — otherwise silently produces wrong
 /// signatures whose CRT halves can reveal a factor of `n`. Cheap: one
 /// reduction and one multiplication per prime, once per parse.
-#[cfg(feature = "der")]
 fn validate_crt_consistency(
     e: &BoxedUint,
     d: &BoxedUint,
@@ -681,6 +705,18 @@ fn validate_crt_consistency(
     Ok(())
 }
 
+/// Whether `e` is a public exponent key generation can use for a `bits`-bit
+/// modulus: odd, `≥ 3`, below `2^256` (FIPS 186-5 §A.1.1), and below
+/// `2^(bits − 1)` — the generated `n` is at least that, so `e < n` holds and
+/// the key passes [`validate_public_exponent`] (only binding for sizes
+/// under 257 bits).
+fn keygen_exponent_ok(bits: usize, e: &BoxedUint) -> bool {
+    e.is_odd()
+        && !e.lt(&BoxedUint::from_u64(3))
+        && e.bit_len() <= MAX_RSA_EXPONENT_BITS
+        && e.bit_len() < bits
+}
+
 /// Upper bound on the number of primes of a multi-prime key accepted by the
 /// parsers (`u` in RFC 8017 §3.2, counting `p` and `q`). The RFC sets no
 /// limit; in practice multi-prime keys have three or four primes (each
@@ -689,6 +725,24 @@ fn validate_crt_consistency(
 /// parse build an unbounded number of Montgomery contexts.
 #[cfg(feature = "der")]
 pub(crate) const MAX_RSA_PRIMES: usize = 8;
+
+/// Left-pads a raw-primitive `input` to the modulus width `k` and checks it
+/// is a representative `< n` (RFC 8017 §5.1.1 / §5.1.2 step 1). The input
+/// may be secret (the message of a raw private-key "encryption"), so the
+/// range check is the constant-time byte compare and a rejected buffer is
+/// wiped; only the verdict is branched on.
+fn raw_input_be(k: usize, n: &BoxedUint, input: &[u8]) -> Result<Vec<u8>, Error> {
+    if input.len() > k {
+        return Err(Error::InvalidLength);
+    }
+    let mut buf = vec![0u8; k];
+    buf[k - input.len()..].copy_from_slice(input);
+    if !emsa::ct_lt_be(&buf, &n.to_be_bytes(k)) {
+        super::wipe(&mut buf);
+        return Err(Error::MessageTooLong);
+    }
+    Ok(buf)
+}
 
 impl BoxedRsaPublicKey {
     /// Builds a public key from modulus `n` and exponent `e`.
@@ -734,6 +788,28 @@ impl BoxedRsaPublicKey {
     /// from a parsed key.
     pub fn exponent(&self) -> &BoxedUint {
         &self.e
+    }
+
+    /// The raw RSA public operation `m^e mod n` (RFC 8017 §5.1.1 RSAEP /
+    /// §5.2.2 RSAVP1) with no padding: the primitive behind OpenSSL's
+    /// `RSA_public_encrypt` / `RSA_public_decrypt` with `RSA_NO_PADDING`.
+    /// Inverse of [`BoxedRsaPrivateKey::raw_private`].
+    ///
+    /// `input` is a big-endian integer of at most `k` octets (the modulus
+    /// length; shorter input is read as left-padded with zeros); the result
+    /// is always exactly `k` octets.
+    ///
+    /// Unpadded RSA is malleable and deterministic — use it only to
+    /// implement a padding scheme or interoperate with one.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidLength`] — `input` is longer than `k` octets.
+    /// * [`Error::MessageTooLong`] — the value is `≥ n` (RFC 8017 "message
+    ///   representative out of range").
+    pub fn raw_public(&self, input: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut buf = raw_input_be(self.k, &self.n, input)?;
+        self.raw_public_in_place(&mut buf);
+        Ok(buf)
     }
 
     /// Verifies a PKCS#1 v1.5 signature over `msg`, hashing with `D`.
@@ -940,6 +1016,8 @@ impl BoxedRsaPrivateKey {
     ///
     /// Like the other component constructors this performs **no validation**;
     /// the components must already be a consistent, trusted key.
+    /// [`from_crt_components`](Self::from_crt_components) is the checked
+    /// form for components that are not.
     ///
     /// # Panics
     /// Panics if `n` is even or zero (the Montgomery precomputation requires an
@@ -1010,6 +1088,71 @@ impl BoxedRsaPrivateKey {
         }
     }
 
+    /// Builds a two-prime private key from all eight RFC 8017 §3.2
+    /// `RSAPrivateKey` components — `n`, `e`, `d`, `p`, `q`,
+    /// `dP = d mod (p − 1)`, `dQ = d mod (q − 1)` and `qInv = q⁻¹ mod p`
+    /// (OpenSSL's `n`, `e`, `d`, `p`, `q`, `dmp1`, `dmq1`, `iqmp`) —
+    /// checking that they form one consistent key, then building it with
+    /// [`from_components_with_primes`](Self::from_components_with_primes).
+    ///
+    /// Unlike the other component constructors this **validates**, with the
+    /// same checks as the PKCS#1 / PKCS#8 parsers (which ignore a blob's
+    /// CRT values and recompute them) plus a comparison of the supplied CRT
+    /// values against the recomputed ones:
+    /// * `n` of 256 to 16384 bits (the keygen floor — lower than the
+    ///   1024-bit parse floor — so any key [`generate`](Self::generate)
+    ///   makes can be rebuilt here);
+    /// * `e` odd, `3 ≤ e < n`, `e < 2^256`; `1 ≤ d < n`;
+    /// * `p`, `q` odd, `> 1`, distinct, and `p · q = n`;
+    /// * `e · d ≡ 1 (mod p − 1)` and `(mod q − 1)`, i.e. `d` inverts `e`
+    ///   modulo `λ(n) = lcm(p − 1, q − 1)` (a `d` reduced mod `λ(n)` and the
+    ///   textbook one mod `φ(n)` are both accepted);
+    /// * `dP`, `dQ`, `qInv` equal to `d mod (p − 1)`, `d mod (q − 1)` and
+    ///   `q⁻¹ mod p` (fully reduced, so `qInv · q ≡ 1 (mod p)`).
+    ///
+    /// `p` and `q` are not tested for primality (nor are they by the
+    /// parsers): a composite factor breaks the CRT relations, which the
+    /// per-operation fault check then catches. The secret comparisons run
+    /// on the constant-time limb compare; which check failed is not
+    /// reported.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidLength`] — `n` outside 256..=16384 bits.
+    /// * [`Error::InvalidKey`] — any other inconsistency.
+    #[allow(clippy::too_many_arguments)] // the eight RFC 8017 components
+    pub fn from_crt_components(
+        n: BoxedUint,
+        e: BoxedUint,
+        d: BoxedUint,
+        p: BoxedUint,
+        q: BoxedUint,
+        dp: BoxedUint,
+        dq: BoxedUint,
+        qinv: BoxedUint,
+    ) -> Result<Self, Error> {
+        if !(MIN_RSA_KEYGEN_BITS..=MAX_RSA_BITS).contains(&n.bit_len()) {
+            return Err(Error::InvalidLength);
+        }
+        validate_public_exponent(&n, &e)?;
+        validate_private_exponent(&n, &d)?;
+        validate_private_components(&n, &[&p, &q])?;
+        validate_crt_consistency(&e, &d, &[&p, &q])?;
+        let key = Self::from_components_with_primes(n, e, d, p, q);
+        // `derive_crt_boxed` recomputed the three values on the
+        // constant-time ladder. Of the primes the checks above let through
+        // it declines only `3` (below its 3-bit floor), which leaves nothing
+        // to compare against.
+        let Some(crt) = key.crt.as_deref() else {
+            return Err(Error::InvalidKey);
+        };
+        // One public verdict over the three secret comparisons.
+        let ok = crt.dp.ct_eq(&dp) & crt.dq.ct_eq(&dq) & crt.qinv.ct_eq(&qinv);
+        if !ok.declassify() {
+            return Err(Error::InvalidKey);
+        }
+        Ok(key)
+    }
+
     /// The number of prime factors the key carries: `2` for a two-prime key
     /// (including one imported without its primes), `u ≥ 3` for a
     /// multi-prime key (RFC 8017 §3.2).
@@ -1018,23 +1161,25 @@ impl BoxedRsaPrivateKey {
     }
 
     /// Generates a runtime-sized RSA key pair with a `bits`-bit modulus and
-    /// public exponent `e` (commonly 65537). `bits` must be even; each prime is
-    /// `bits/2` bits. `rounds` is the Miller-Rabin count per candidate; it is
-    /// clamped *up* to a size-appropriate floor (FIPS 186-5 Table B.1; see
+    /// public exponent `e` (commonly 65537). The primes are `⌈bits/2⌉` and
+    /// `⌊bits/2⌋` bits (equal for an even `bits`), each with its top two bits
+    /// set, so `n` has exactly `bits` bits for odd sizes too. `rounds` is the
+    /// Miller-Rabin count per candidate; it is clamped *up* to a
+    /// size-appropriate floor (FIPS 186-5 Table B.1; see
     /// `prime::min_mr_rounds`), so passing 0 cannot yield a composite factor.
+    ///
+    /// Sizes below 2048 bits are insecure and supported for legacy interop
+    /// only. [`try_generate`](Self::try_generate) is the fallible form, and
+    /// also caps `bits` at the size the parsers accept back.
     ///
     /// # Panics
     /// Panics on parameters that can never yield a usable key rather than
     /// looping forever or producing a broken one:
-    /// * `bits < 512` or `bits` odd — the modulus size floor for anything
-    ///   the rest of the crate will accept back (`MIN_RSA_BITS` on parse is
-    ///   1024; 512 is the smallest size the prime generator's top-bit
-    ///   forcing is meaningful for), and an odd `bits` cannot split into
-    ///   two equal primes;
-    /// * `e < 3`, `e` even, or `e ≥ 2^256` — an even `e` is never coprime
-    ///   to `φ(n)` (the loop would spin forever), `e = 1` makes `d = 1`
-    ///   (encryption is the identity), and FIPS 186-5 §A.1.1 bounds `e`
-    ///   below `2^256`.
+    /// * `bits < 256` — see `MIN_RSA_KEYGEN_BITS` for why that floor;
+    /// * `e < 3`, `e` even, `e ≥ 2^256` or `e ≥ 2^(bits − 1)` — an even `e`
+    ///   is never coprime to `φ(n)` (the loop would spin forever), `e = 1`
+    ///   makes `d = 1` (encryption is the identity), FIPS 186-5 §A.1.1
+    ///   bounds `e` below `2^256`, and `e` must stay below `n`.
     ///
     /// # Side channels
     /// Key generation is shaped independently of the secret material it
@@ -1056,20 +1201,64 @@ impl BoxedRsaPrivateKey {
         rng: &mut R,
         rounds: usize,
     ) -> Self {
+        assert!(
+            bits >= MIN_RSA_KEYGEN_BITS,
+            "RsaPrivateKey::generate: bits must be >= {MIN_RSA_KEYGEN_BITS} (got {bits})"
+        );
+        assert!(
+            keygen_exponent_ok(bits, &e),
+            "RsaPrivateKey::generate: e must be odd, >= 3, < 2^256 and < 2^(bits - 1)"
+        );
+        Self::generate_unchecked(bits, e, rng, rounds)
+    }
+
+    /// Fallible [`generate`](Self::generate): any `bits` in
+    /// `256..=16384` (odd sizes included), returning an error instead of
+    /// panicking on out-of-range parameters.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidLength`] — `bits` below 256 or above 16384 (the
+    ///   largest modulus the parsers accept back).
+    /// * [`Error::InvalidKey`] — `e < 3`, `e` even, `e ≥ 2^256`, or
+    ///   `e ≥ 2^(bits − 1)`.
+    pub fn try_generate<R: RngCore + CryptoRng>(
+        bits: usize,
+        e: BoxedUint,
+        rng: &mut R,
+        rounds: usize,
+    ) -> Result<Self, Error> {
+        if !(MIN_RSA_KEYGEN_BITS..=MAX_RSA_BITS).contains(&bits) {
+            return Err(Error::InvalidLength);
+        }
+        if !keygen_exponent_ok(bits, &e) {
+            return Err(Error::InvalidKey);
+        }
+        Ok(Self::generate_unchecked(bits, e, rng, rounds))
+    }
+
+    /// The key-generation loop proper, for parameters [`generate`] /
+    /// [`try_generate`] have already checked.
+    ///
+    /// [`generate`]: Self::generate
+    /// [`try_generate`]: Self::try_generate
+    fn generate_unchecked<R: RngCore + CryptoRng>(
+        bits: usize,
+        e: BoxedUint,
+        rng: &mut R,
+        rounds: usize,
+    ) -> Self {
         use crate::bignum::inv_mod_ct_boxed;
-        assert!(
-            bits >= 512 && bits.is_multiple_of(2),
-            "RsaPrivateKey::generate: bits must be even and >= 512 (got {bits})"
-        );
-        assert!(
-            e.is_odd() && !e.lt(&BoxedUint::from_u64(3)) && e.bit_len() <= MAX_RSA_EXPONENT_BITS,
-            "RsaPrivateKey::generate: e must be odd, >= 3 and < 2^256"
-        );
         let one = BoxedUint::from_u64(1);
-        let half = bits / 2;
+        // An odd size splits as ⌈bits/2⌉ + ⌊bits/2⌋. With the top two bits of
+        // each prime forced, p·q ≥ (3/4)·2^p_bits · (3/4)·2^q_bits
+        // = (9/16)·2^bits ≥ 2^(bits−1), so `n` still has exactly `bits` bits.
+        // For an even size both are `bits/2`: the FIPS 186-5 construction,
+        // drawing exactly as before.
+        let p_bits = bits.div_ceil(2);
+        let q_bits = bits / 2;
         loop {
-            let p = super::prime::random_prime_boxed(rng, half, rounds);
-            let q = super::prime::random_prime_boxed(rng, half, rounds);
+            let p = super::prime::random_prime_boxed(rng, p_bits, rounds);
+            let q = super::prime::random_prime_boxed(rng, q_bits, rounds);
             // Redraw decisions are public (only their count is observable).
             if p.ct_eq(&q).declassify() {
                 continue;
@@ -1079,7 +1268,9 @@ impl BoxedRsaPrivateKey {
             // bit length is ≤ k, so compare bit lengths without materializing the
             // power. `saturating_sub` keeps the bound total for sub-200-bit toy
             // sizes (where the threshold collapses to 0 and the check is a no-op
-            // since `p ≠ q`).
+            // since `p ≠ q`). For an odd size `⌊bits/2⌋` is the bound; there
+            // `p` is a bit longer than `q` with both top bits set, so
+            // `p − q > 2^(q_bits − 1)` and the check always passes.
             //
             // Both differences are computed and one is selected, so which
             // prime is larger never steers a branch or a load, and the bound
@@ -1088,7 +1279,7 @@ impl BoxedRsaPrivateKey {
             let p_lt_q = crate::ct::Choice::from(p.lt(&q) as u8);
             let diff = BoxedUint::conditional_select(&q.sub(&p), &p.sub(&q), p_lt_q);
             if diff
-                .shr_bits(half.saturating_sub(100))
+                .shr_bits(q_bits.saturating_sub(100))
                 .ct_is_zero()
                 .declassify()
             {
@@ -1130,6 +1321,58 @@ impl BoxedRsaPrivateKey {
         } else {
             Some((&self.p, &self.q))
         }
+    }
+
+    /// The CRT parameters `(dP, dQ, qInv)` of RFC 8017 §3.2 —
+    /// `d mod (p − 1)`, `d mod (q − 1)` and `q⁻¹ mod p` (OpenSSL's `dmp1`,
+    /// `dmq1`, `iqmp`) — as the private operation uses them. `None` for a
+    /// key without (usable) primes: one built with
+    /// [`from_components`](Self::from_components), or whose primes are
+    /// degenerate (even, below 3 bits, or equal). A multi-prime key's
+    /// per-prime `(dᵢ, tᵢ)` are not included.
+    ///
+    /// These are as secret as `d`, `p` and `q`.
+    pub fn crt_params(&self) -> Option<(&BoxedUint, &BoxedUint, &BoxedUint)> {
+        self.crt.as_deref().map(|c| (&c.dp, &c.dq, &c.qinv))
+    }
+
+    /// The raw RSA private operation `c^d mod n` (RFC 8017 §5.1.2 RSADP /
+    /// §5.2.1 RSASP1) with no padding: the primitive behind OpenSSL's
+    /// `RSA_private_decrypt` / `RSA_private_encrypt` with `RSA_NO_PADDING`.
+    /// Inverse of [`BoxedRsaPublicKey::raw_public`].
+    ///
+    /// `input` is a big-endian integer of at most `k` octets (the modulus
+    /// length; shorter input is read as left-padded with zeros); the result
+    /// is always exactly `k` octets.
+    ///
+    /// This is the same private operation every padded scheme on this key
+    /// runs: with the primes known, Coron base blinding (`c · r^e`, the
+    /// blinder derived as described in the [type docs](Self), so no RNG is
+    /// needed) over the CRT, with the result fault-checked by re-applying
+    /// the public exponent (`m^e ≡ c mod n`) and recomputed on the
+    /// full-width path if that fails. A key built with
+    /// [`from_components`](Self::from_components) (no primes) runs the
+    /// unblinded constant-time ladder and has no CRT result to check.
+    ///
+    /// Unpadded RSA is malleable and deterministic, and decrypting
+    /// attacker-chosen inputs turns this key into a signing oracle — use it
+    /// only to implement a padding scheme or interoperate with one.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidLength`] — `input` is longer than `k` octets.
+    /// * [`Error::MessageTooLong`] — the value is `≥ n` (RFC 8017
+    ///   "ciphertext / message representative out of range").
+    /// * [`Error::InvalidKey`] — the result failed the fault check on both
+    ///   the CRT and the full-width path (a persistent fault, or a key whose
+    ///   `e`, `d` and primes are not consistent); nothing is released.
+    pub fn raw_private(&self, input: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut buf = raw_input_be(self.k, &self.n, input)?;
+        let c = BoxedUint::from_be_bytes(&buf);
+        // `buf` held the input, which can be secret (a raw "private
+        // encryption" of a message); `c` wipes itself on drop.
+        super::wipe(&mut buf);
+        let m = raw_private_checked_boxed(self, &c).ok_or(Error::InvalidKey)?;
+        Ok(m.to_be_bytes(self.k))
     }
 
     /// Signs `msg` with PKCS#1 v1.5, hashing with `D`.
@@ -2086,7 +2329,7 @@ mod tests {
 
     /// BN-5: `bits = 2` used to underflow inside the prime generator.
     #[test]
-    #[should_panic(expected = "bits must be even and >= 512")]
+    #[should_panic(expected = "bits must be >= 256")]
     fn generate_panics_on_tiny_modulus() {
         let mut r = HmacDrbg::<Sha256>::new(b"boxed-keygen-bad-bits", b"nonce", &[]);
         let _ = BoxedRsaPrivateKey::generate(2, BoxedUint::from_u64(65537), &mut r, 4);
@@ -3125,5 +3368,310 @@ mod tests {
         let faulty = raw_private_crt_blinded(&key, key.crt.as_deref().unwrap(), 0, &salt, &x);
         assert_ne!(faulty, key.mont.pow(&x, &c.d));
         assert_eq!(raw_private_blinded_boxed(&key, &x), key.mont.pow(&x, &c.d));
+    }
+
+    // ---- raw private / public primitive, any-size keygen, from_crt_components ----
+
+    /// The eight RFC 8017 components of a key, as `from_crt_components`
+    /// takes them.
+    fn crt_parts(key: &BoxedRsaPrivateKey) -> [BoxedUint; 8] {
+        let (dp, dq, qinv) = key.crt_params().expect("CRT params present");
+        let (p, q) = key.primes().expect("primes present");
+        [
+            key.n.clone(),
+            key.e.clone(),
+            key.d.clone(),
+            p.clone(),
+            q.clone(),
+            dp.clone(),
+            dq.clone(),
+            qinv.clone(),
+        ]
+    }
+
+    fn from_parts(parts: [BoxedUint; 8]) -> Result<BoxedRsaPrivateKey, Error> {
+        let [n, e, d, p, q, dp, dq, qinv] = parts;
+        BoxedRsaPrivateKey::from_crt_components(n, e, d, p, q, dp, dq, qinv)
+    }
+
+    /// Key generation at odd and sub-512-bit sizes: the modulus has exactly
+    /// the requested bit length, the primes split it as ⌈bits/2⌉ + ⌊bits/2⌋,
+    /// the key works (raw round trip and PKCS#1 v1.5 where it fits), and its
+    /// own parts rebuild it through the checked constructor.
+    #[test]
+    fn generate_accepts_odd_and_small_sizes() {
+        for bits in [256usize, 384, 511, 513, 1023, 1025] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"rsa-odd-keygen", &bits.to_be_bytes(), &[]);
+            let key = BoxedRsaPrivateKey::generate(bits, BoxedUint::from_u64(65537), &mut rng, 0);
+            assert_eq!(key.modulus().bit_len(), bits, "modulus size at {bits}");
+            let (p, q) = key.primes().unwrap();
+            assert_eq!(p.bit_len(), bits.div_ceil(2), "p size at {bits}");
+            assert_eq!(q.bit_len(), bits / 2, "q size at {bits}");
+            assert!(crate::bignum::prime::is_prime_boxed(p, &mut rng, 20));
+            assert!(crate::bignum::prime::is_prime_boxed(q, &mut rng, 20));
+
+            let pk = key.public_key();
+            let m = [0x5au8; 20];
+            let c = pk.raw_public(&m).unwrap();
+            assert_eq!(c.len(), bits.div_ceil(8));
+            let back = key.raw_private(&c).unwrap();
+            assert_eq!(&back[back.len() - m.len()..], &m);
+            assert!(back[..back.len() - m.len()].iter().all(|&b| b == 0));
+            // SHA-256 DigestInfo is 51 octets, so PKCS#1 v1.5 needs k ≥ 62.
+            if bits >= 512 {
+                let sig = key.sign_pkcs1v15::<Sha256>(b"odd size").unwrap();
+                pk.verify_pkcs1v15::<Sha256>(b"odd size", &sig).unwrap();
+            }
+
+            let rebuilt = from_parts(crt_parts(&key)).expect("own parts must rebuild");
+            assert_eq!(rebuilt.raw_private(&c).unwrap(), back);
+        }
+    }
+
+    /// Standard even sizes draw exactly as before the odd-size split: the
+    /// same DRBG seed yields the same key through `generate` and
+    /// `try_generate`.
+    #[test]
+    fn try_generate_matches_generate_and_rejects_out_of_range() {
+        let e = BoxedUint::from_u64(65537);
+        let mut r1 = HmacDrbg::<Sha256>::new(b"rsa-try-keygen", b"nonce", &[]);
+        let mut r2 = HmacDrbg::<Sha256>::new(b"rsa-try-keygen", b"nonce", &[]);
+        let a = BoxedRsaPrivateKey::generate(1024, e.clone(), &mut r1, 0);
+        let b = BoxedRsaPrivateKey::try_generate(1024, e.clone(), &mut r2, 0).unwrap();
+        assert_eq!(a.modulus(), b.modulus());
+        assert_eq!(a.private_exponent(), b.private_exponent());
+
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-try-keygen-bad", b"nonce", &[]);
+        for bits in [0usize, 2, 255, MAX_RSA_BITS + 1] {
+            assert_eq!(
+                BoxedRsaPrivateKey::try_generate(bits, e.clone(), &mut r, 0).err(),
+                Some(Error::InvalidLength),
+                "bits = {bits}"
+            );
+        }
+        // e even, e = 1, e ≥ 2^256, and e that does not fit below n.
+        let big_e = BoxedUint::from_limbs(alloc::vec![1, 0, 0, 0, 1]);
+        let e_255 = BoxedUint::from_limbs(alloc::vec![1, 0, 0, 1 << 63]);
+        for (bits, bad) in [
+            (1024, BoxedUint::from_u64(65536)),
+            (1024, BoxedUint::from_u64(1)),
+            (1024, big_e),
+            (256, e_255.clone()),
+        ] {
+            assert_eq!(
+                BoxedRsaPrivateKey::try_generate(bits, bad, &mut r, 0).err(),
+                Some(Error::InvalidKey),
+            );
+        }
+        // A 256-bit `e` is fine once the modulus is 257 bits or more.
+        let key = BoxedRsaPrivateKey::try_generate(257, e_255, &mut r, 0).unwrap();
+        assert_eq!(key.modulus().bit_len(), 257);
+    }
+
+    /// `raw_private` inverts `raw_public` (and vice versa), equals the
+    /// unblinded `c^d mod n`, pads short input, and rejects input `≥ n` or
+    /// wider than the modulus.
+    #[test]
+    fn raw_private_roundtrips_against_raw_public() {
+        let key = rsa_test_key_a().to_boxed();
+        let pk = key.public_key();
+        let k = key.k;
+        let mut m = vec![0u8; k];
+        for (i, b) in m.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        m[0] = 0x01; // below n
+        let c = pk.raw_public(&m).unwrap();
+        assert_eq!(key.raw_private(&c).unwrap(), m);
+        // Raw "private encryption" (the signing primitive) the other way.
+        let s = key.raw_private(&m).unwrap();
+        assert_eq!(s.len(), k);
+        assert_eq!(pk.raw_public(&s).unwrap(), m);
+        // Matches the plain full-width exponentiation.
+        let expect = key
+            .mont
+            .pow(&BoxedUint::from_be_bytes(&m), &key.d)
+            .to_be_bytes(k);
+        assert_eq!(s, expect);
+        // Repeated calls (fresh blinders) agree.
+        assert_eq!(key.raw_private(&m).unwrap(), s);
+
+        // Short input is a left-padded integer; zero maps to zero.
+        let short = key.raw_private(&[0x02]).unwrap();
+        let mut padded = vec![0u8; k];
+        padded[k - 1] = 0x02;
+        assert_eq!(short, key.raw_private(&padded).unwrap());
+        assert_eq!(key.raw_private(&[]).unwrap(), vec![0u8; k]);
+        assert_eq!(pk.raw_public(&[0, 0]).unwrap(), vec![0u8; k]);
+
+        // Out of range: n itself, n − 1 is the largest accepted value.
+        let n_be = key.n.to_be_bytes(k);
+        assert_eq!(key.raw_private(&n_be), Err(Error::MessageTooLong));
+        assert_eq!(pk.raw_public(&n_be), Err(Error::MessageTooLong));
+        assert_eq!(key.raw_private(&vec![0xff; k]), Err(Error::MessageTooLong));
+        let n_minus_1 = key.n.sub(&BoxedUint::from_u64(1)).to_be_bytes(k);
+        let r = key.raw_private(&n_minus_1).unwrap();
+        assert_eq!(pk.raw_public(&r).unwrap(), n_minus_1);
+        // Wider than the modulus, even with a leading zero.
+        let mut wide = vec![0u8; k + 1];
+        wide[k] = 1;
+        assert_eq!(key.raw_private(&wide), Err(Error::InvalidLength));
+        assert_eq!(pk.raw_public(&wide), Err(Error::InvalidLength));
+    }
+
+    /// A key without primes still serves `raw_private` (plain ladder), and
+    /// a key whose `d` fails the fault check on both paths reports
+    /// `InvalidKey` rather than releasing a value.
+    #[test]
+    fn raw_private_without_primes_and_on_fault() {
+        let good = rsa_test_key_a().to_boxed();
+        let m = [0x42u8; 64];
+        let s = good.raw_private(&m).unwrap();
+        assert_eq!(boxed_priv().raw_private(&m).unwrap(), s);
+
+        let broken = BoxedRsaPrivateKey::from_components_with_primes(
+            good.n.clone(),
+            good.e.clone(),
+            good.d.sub(&BoxedUint::from_u64(2)),
+            good.p.clone(),
+            good.q.clone(),
+        );
+        assert_eq!(broken.raw_private(&m), Err(Error::InvalidKey));
+    }
+
+    /// `from_crt_components` accepts a consistent key — including one whose
+    /// `d` is reduced mod `λ(n)` rather than `φ(n)` — and the accessors
+    /// return exactly what PKCS#1 carries.
+    #[test]
+    fn from_crt_components_accepts_consistent_parts() {
+        let key = rsa_test_key_a().to_boxed();
+        let parts = crt_parts(&key);
+        let one = BoxedUint::from_u64(1);
+        let (p, q) = (&parts[3], &parts[4]);
+        assert_eq!(parts[5], key.d.reduce(&p.sub(&one)));
+        assert_eq!(parts[6], key.d.reduce(&q.sub(&one)));
+        assert_eq!(parts[7], crate::bignum::inv_mod_boxed(q, p).unwrap());
+
+        let rebuilt = from_parts(parts.clone()).unwrap();
+        let sig = rebuilt.sign_pkcs1v15::<Sha256>(b"from parts").unwrap();
+        key.public_key()
+            .verify_pkcs1v15::<Sha256>(b"from parts", &sig)
+            .unwrap();
+        assert_eq!(rebuilt.private_exponent(), key.private_exponent());
+
+        // d mod λ(n), λ = (p−1)(q−1) / gcd(p−1, q−1).
+        let (pm1, qm1) = (p.sub(&one), q.sub(&one));
+        let (mut a, mut b) = (pm1.clone(), qm1.clone());
+        while !b.is_zero() {
+            let r = a.reduce(&b);
+            a = b;
+            b = r;
+        }
+        let lambda = pm1.mul(&qm1).divrem(&a).0;
+        let d_lambda = key.d.reduce(&lambda);
+        let mut lp = parts.clone();
+        lp[2] = d_lambda.clone();
+        lp[5] = d_lambda.reduce(&pm1);
+        lp[6] = d_lambda.reduce(&qm1);
+        let k2 = from_parts(lp).expect("d mod λ(n) is a valid private exponent");
+        assert_eq!(k2.sign_pkcs1v15::<Sha256>(b"from parts").unwrap(), sig);
+    }
+
+    /// Each kind of inconsistent part is refused.
+    #[test]
+    fn from_crt_components_rejects_inconsistent_parts() {
+        let key = rsa_test_key_a().to_boxed();
+        let other = gen_small_key(b"rsa-from-parts-other");
+        let good = crt_parts(&key);
+        let one = BoxedUint::from_u64(1);
+        let two = BoxedUint::from_u64(2);
+        let with = |i: usize, v: BoxedUint| {
+            let mut parts = good.clone();
+            parts[i] = v;
+            parts
+        };
+        let (n, d, p, q) = (&good[0], &good[2], &good[3], &good[4]);
+        let (dp, dq, qinv) = (&good[5], &good[6], &good[7]);
+        let cases: alloc::vec::Vec<(&str, [BoxedUint; 8], Error)> = alloc::vec![
+            // n
+            ("n ≠ p·q", with(0, other.n.clone()), Error::InvalidKey),
+            ("n even", with(0, n.add(&one)), Error::InvalidKey),
+            (
+                "n too small",
+                with(0, BoxedUint::from_u64(0xffff_fff1)),
+                Error::InvalidLength
+            ),
+            // e
+            (
+                "e even",
+                with(1, BoxedUint::from_u64(65536)),
+                Error::InvalidKey
+            ),
+            ("e = 1", with(1, one.clone()), Error::InvalidKey),
+            (
+                "e ≠ the inverse of d",
+                with(1, BoxedUint::from_u64(3)),
+                Error::InvalidKey
+            ),
+            ("e ≥ n", with(1, n.add(&two)), Error::InvalidKey),
+            // d
+            ("d = 0", with(2, BoxedUint::zero(1)), Error::InvalidKey),
+            ("d ≥ n", with(2, n.add(&one)), Error::InvalidKey),
+            ("d not e⁻¹", with(2, d.sub(&two)), Error::InvalidKey),
+            // p, q
+            ("p = 1", with(3, one.clone()), Error::InvalidKey),
+            ("p even", with(3, p.add(&one)), Error::InvalidKey),
+            (
+                "p from another key",
+                with(3, other.p.clone()),
+                Error::InvalidKey
+            ),
+            ("q = p", with(4, p.clone()), Error::InvalidKey),
+            ("q = 0", with(4, BoxedUint::zero(1)), Error::InvalidKey),
+            // CRT values
+            ("dP off by two", with(5, dp.sub(&two)), Error::InvalidKey),
+            (
+                "dP unreduced",
+                with(5, dp.add(&p.sub(&one))),
+                Error::InvalidKey
+            ),
+            ("dP = dQ", with(5, dq.clone()), Error::InvalidKey),
+            ("dQ off by two", with(6, dq.add(&two)), Error::InvalidKey),
+            (
+                "dQ unreduced",
+                with(6, dq.add(&q.sub(&one))),
+                Error::InvalidKey
+            ),
+            (
+                "qInv off by one",
+                with(7, qinv.add(&one)),
+                Error::InvalidKey
+            ),
+            ("qInv unreduced", with(7, qinv.add(p)), Error::InvalidKey),
+            (
+                "qInv = p⁻¹ mod q",
+                with(7, crate::bignum::inv_mod_boxed(p, q).unwrap()),
+                Error::InvalidKey
+            ),
+            ("qInv = 0", with(7, BoxedUint::zero(1)), Error::InvalidKey),
+        ];
+        for (what, parts, want) in cases {
+            assert_eq!(from_parts(parts).err(), Some(want), "{what}");
+        }
+        // p and q swapped is a different (equally valid) labelling, but only
+        // with the CRT values swapped and qInv recomputed to match.
+        let mut swapped = good.clone();
+        swapped.swap(3, 4);
+        assert!(from_parts(swapped.clone()).is_err());
+        swapped.swap(5, 6);
+        swapped[7] = crate::bignum::inv_mod_boxed(p, q).unwrap();
+        let k2 = from_parts(swapped).expect("p/q swapped consistently");
+        assert_eq!(
+            k2.raw_private(&[7; 32]).unwrap(),
+            key.raw_private(&[7; 32]).unwrap()
+        );
+        // The good parts themselves pass (so each case above failed for its
+        // own reason).
+        from_parts(good).unwrap();
     }
 }

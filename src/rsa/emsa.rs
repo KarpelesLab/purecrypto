@@ -69,7 +69,7 @@ pub(crate) trait PublicModulus {
 /// not on where the slices first differ. Used to reject signature
 /// representatives `s >= n` (RFC 8017 §5.2.2 step 1) without an early-exit
 /// that would leak the magnitude of `s` relative to `n`.
-fn ct_lt_be(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_lt_be(a: &[u8], b: &[u8]) -> bool {
     debug_assert_eq!(a.len(), b.len());
     // `lt` is set (low bit 1) once a strictly-smaller higher-order byte has
     // been seen, `gt` likewise for strictly-greater. Only the first differing

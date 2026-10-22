@@ -14,10 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(ec)* `named_curve()` / `boxed_curve()` on the boxed keys; every boxed constructor and signature codec now takes `impl Into<BoxedCurve>` (a `CurveId` still works)
 - *(sm2)* `Sm2PrivateKey::sign_prehash` / `sign_prehash_with_k` and `Sm2PublicKey::verify_prehash`: sign / verify a bare digest without `ZA`, as OpenSSL 3 does
 - *(ct)* `ConstantTimeGreater` / `ConstantTimeLess` for `BoxedUint`; `CtOption::into_public_option` is public
+- *(rsa)* `BoxedRsaPrivateKey::raw_private` / `BoxedRsaPublicKey::raw_public`: the unpadded RSA primitives (`RSA_NO_PADDING`), on the same blinded, fault-checked CRT path as the padded schemes; input `≥ n` is rejected
+- *(rsa)* `BoxedRsaPrivateKey::from_crt_components`: checked constructor from `(n, e, d, p, q, dP, dQ, qInv)`, and the `crt_params` accessor for `(dP, dQ, qInv)`
+- *(rsa)* `BoxedRsaPrivateKey::try_generate`: fallible key generation for 256..=16384-bit moduli
 
 ### Changed
 
 - *(ec)* `BoxedEcdsa*::curve()` panics on a key on a custom curve; use `named_curve()` or `boxed_curve()` where one can occur
+- *(rsa)* `BoxedRsaPrivateKey::generate` accepts odd sizes (primes of ⌈bits/2⌉ and ⌊bits/2⌋ bits) and sizes down to 256 bits; it still panics below that or on a bad `e`
 
 ## [0.10.1](https://github.com/KarpelesLab/purecrypto/compare/v0.10.0...v0.10.1) - 2026-10-17
 
