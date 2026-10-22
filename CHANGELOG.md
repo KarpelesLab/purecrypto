@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/KarpelesLab/purecrypto/compare/v0.10.1...v0.10.2) - 2026-10-22
+
+### Added
+
+- *(dh)* explicit-subgroup groups via DhGroup::from_params(p, g, q)
+- *(dsa)* non-standard parameters, parameter generation, run-time digest
+- *(rsa)* raw private/public primitives, any-size keygen, checked CRT-component constructor
+- *(ec)* custom curves from explicit parameters (ec-custom)
+- *(sm2,ct)* SM2 prehash signing and verification; BoxedUint constant-time ordering
+- *(cipher)* TEA, XTEA and XXTEA behind legacy-ciphers
+
+### Other
+
+- gate lean-build-only code CI's per-feature checks flagged
+
 ### Added
 
 - *(ec)* `BoxedCurve`, the curve a boxed ECDSA / ECDH key lives on; with the new opt-in `ec-custom` feature, `BoxedCurve::from_params(p, a, b, gx, gy, n, h)` builds and validates (SEC 1 §3.1.1.2.1, including cofactor, MOV and anomalous checks) any prime-field curve up to 576 bits on the constant-time engine. Keys on a cofactor curve reject points outside the generator's subgroup
