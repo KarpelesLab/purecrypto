@@ -1,8 +1,10 @@
 //! Named MODP Diffie-Hellman groups.
 //!
 //! The five RFC 3526 safe-prime groups (14 through 18) used by SSH, IKEv2,
-//! legacy TLS, and other finite-field DH consumers, plus a constructor for
-//! caller-supplied "custom" groups (RFC 4419 group-exchange).
+//! legacy TLS, and other finite-field DH consumers, plus constructors for
+//! caller-supplied "custom" groups: safe-prime `(p, g)` pairs (RFC 4419
+//! group-exchange) and `(p, g, q)` triples whose generator spans a prime
+//! order-`q` subgroup (RFC 5114, ANSI X9.42 / PKCS#3-with-`q` parameters).
 //!
 //! Each named group is exposed as a `fn group14()` / `group15()` / ... that
 //! returns an owned [`DhGroup`] — the primes are several hundred bytes each
@@ -12,13 +14,15 @@
 use super::key::Error;
 use crate::bignum::{BoxedMontModulus, BoxedUint};
 
-/// A named MODP DH group: a safe prime `p` (where `q = (p - 1) / 2` is also
-/// prime), a generator `g` of the prime-order subgroup of size `q`, and a
-/// recommended private-exponent bit length.
+/// A MODP DH group: a prime `p`, a generator `g`, and a recommended
+/// private-exponent bit length — either over a safe prime (`q = (p - 1) / 2`
+/// also prime, `g` of order `q` or `2q`) or, for an explicit-subgroup group,
+/// with `g` generating a prime-order-`q` subgroup for a stated `q | p − 1`.
 ///
 /// Constructed via the [`group14`]..[`group18`] free functions for the
-/// RFC 3526 groups, or via [`DhGroup::from_custom`] for an RFC 4419
-/// group-exchange–supplied `(p, g)` pair.
+/// RFC 3526 groups, via [`DhGroup::from_custom`] for an RFC 4419
+/// group-exchange–supplied `(p, g)` pair, or via [`DhGroup::from_params`] for
+/// an RFC 5114 / X9.42 `(p, g, q)` triple.
 #[derive(Clone)]
 pub struct DhGroup {
     pub(crate) name: &'static str,
@@ -37,6 +41,14 @@ pub struct DhGroup {
     /// [`from_custom`](Self::from_custom) validated, whose Miller-Rabin half
     /// uses public bases — keep it.
     pub(crate) known_safe_prime: bool,
+    /// The prime subgroup order `q`, for a group built by
+    /// [`from_params`](Self::from_params) (`None` for the safe-prime
+    /// constructors, whose `q = (p − 1) / 2` is implicit). When set, private
+    /// keys are drawn from `[1, q − 1]` and a peer value must satisfy
+    /// `y^q ≡ 1 (mod p)`: without a safe prime, `Z_p^*` has small subgroups
+    /// besides the order-`q` one, and only that check keeps a peer from
+    /// confining the exponent to one of them.
+    pub(crate) q: Option<BoxedUint>,
     /// Montgomery parameters for `p`, built once with the group: every
     /// `g^x` / `y^x` on the group reuses them instead of recomputing `R² mod
     /// p` (an `O(log)` chain of full-width squarings) per operation. `p` is
@@ -69,6 +81,13 @@ impl DhGroup {
     /// The generator `g`.
     pub fn g(&self) -> &BoxedUint {
         &self.g
+    }
+
+    /// The subgroup order `q` of an explicit-subgroup group
+    /// ([`from_params`](Self::from_params)); `None` for the safe-prime
+    /// groups, where it is `(p − 1) / 2` by construction.
+    pub fn q(&self) -> Option<&BoxedUint> {
+        self.q.as_ref()
     }
 
     /// The cached Montgomery parameters for `p`.
@@ -301,8 +320,111 @@ impl DhGroup {
             g,
             priv_bits,
             known_safe_prime: false,
+            q: None,
             mont,
         })
+    }
+
+    /// Minimum bit length of `p` accepted by
+    /// [`from_params`](Self::from_params).
+    ///
+    /// Lower than [`MIN_CUSTOM_GROUP_BITS`](Self::MIN_CUSTOM_GROUP_BITS)
+    /// because the explicit-subgroup groups in actual use start at 1024 bits:
+    /// RFC 5114 §2.1's 1024/160 group (IKE group 22, the `dh_1024_160`
+    /// OpenSSL ships) and the 1024-bit X9.42 parameters older PKIX / S/MIME
+    /// deployments carry. 1024 is also RFC 4419 §3's floor. It is an interop
+    /// floor, not a security one — the LogJam caveats on
+    /// `MIN_CUSTOM_GROUP_BITS` apply in full.
+    pub const MIN_PARAMS_GROUP_BITS: usize = 1024;
+
+    /// Minimum bit length of `q` accepted by
+    /// [`from_params`](Self::from_params): 160, the smallest subgroup
+    /// RFC 5114 / FIPS 186-2 use. Private exponents live in `[1, q − 1]`,
+    /// so Pollard rho in the subgroup costs `2^(N/2)` and a narrower `q`
+    /// would be the weakest part of the exchange.
+    pub const MIN_PARAMS_Q_BITS: usize = 160;
+
+    /// Builds a group from an explicit `(p, g, q)` triple: `g` generates the
+    /// order-`q` subgroup of `Z_p^*` for a prime `q | p − 1` — the RFC 5114
+    /// groups and the ANSI X9.42 `DomainParameters` (`openssl dhparam
+    /// -dsaparam`, `X9.42 DH PARAMETERS` PEM files), which are not safe
+    /// primes and so cannot go through [`from_custom`](Self::from_custom).
+    ///
+    /// Checks:
+    /// * `MIN_PARAMS_GROUP_BITS ≤ p.bit_len() ≤ MAX_CUSTOM_GROUP_BITS`
+    ///   (1024..=16384) and `q.bit_len() ≥ MIN_PARAMS_Q_BITS` (160), before
+    ///   any arithmetic;
+    /// * `p` and `q` odd, `g ∈ [2, p − 2]` (as
+    ///   [`from_custom_unchecked`](Self::from_custom_unchecked));
+    /// * `q | p − 1`;
+    /// * `g^q ≡ 1 (mod p)` — with `g ≠ 1` and `q` prime, `g` has order
+    ///   exactly `q`;
+    /// * `q` passes trial division and
+    ///   [`CUSTOM_GROUP_MR_ROUNDS`](Self::CUSTOM_GROUP_MR_ROUNDS) Miller-Rabin
+    ///   rounds, and `p` [`custom_group_mr_rounds`] rounds — both with bases
+    ///   HMAC-DRBG-derived from the candidate, i.e. deterministic and
+    ///   *public*, with the caveat spelled out on `CUSTOM_GROUP_MR_ROUNDS`.
+    ///   Unlike the safe-prime case `p` cannot be proved prime from `q`
+    ///   (`q` is far below `√p`), so both verdicts rest on Miller-Rabin.
+    ///
+    /// The resulting group draws private keys uniformly from `[1, q − 1]`
+    /// ([`priv_bits`](Self::priv_bits) reports `q`'s width; NIST SP 800-56A
+    /// Rev 3 §5.6.1.1.4), and [`DhPrivateKey::shared_secret`] requires the
+    /// peer value to satisfy `y^q ≡ 1 (mod p)` on top of `2 ≤ y ≤ p − 2`
+    /// (the SP 800-56A §5.6.2.3.1 full public-key validation for FFC
+    /// groups that are not safe primes). Passing a safe prime with
+    /// `q = (p − 1) / 2` works too, but then the order-`2q` values that
+    /// [`from_custom`](Self::from_custom) admits are rejected.
+    ///
+    /// Validation costs about `custom_group_mr_rounds(L)` full-width
+    /// exponentiations (dominated by the `p` test); validate a group once
+    /// and clone it.
+    ///
+    /// [`custom_group_mr_rounds`]: Self::custom_group_mr_rounds
+    /// [`DhPrivateKey::shared_secret`]: super::DhPrivateKey::shared_secret
+    pub fn from_params(p: BoxedUint, g: BoxedUint, q: BoxedUint) -> Result<Self, Error> {
+        use crate::bignum::prime::is_prime_boxed;
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+
+        // Size gates first — before any arithmetic on a peer-chosen width.
+        let bits = p.bit_len();
+        if !(Self::MIN_PARAMS_GROUP_BITS..=Self::MAX_CUSTOM_GROUP_BITS).contains(&bits)
+            || q.bit_len() < Self::MIN_PARAMS_Q_BITS
+            || !q.is_odd()
+        {
+            return Err(Error::InvalidGroup);
+        }
+        // Odd `p`, `g ∈ [2, p − 2]`; the exponent budget is `q`'s width,
+        // which is below `p`'s whenever `q | p − 1` holds.
+        let mut group = Self::from_custom_unchecked(p, g, q.bit_len())?;
+        let one = BoxedUint::from_u64(1);
+        if !group.p.sub(&one).reduce(&q).is_zero() {
+            return Err(Error::InvalidGroup);
+        }
+        // Everything here is public, so the variable-time ladder is fine.
+        if group.mont.pow_public(&group.g, &q) != one {
+            return Err(Error::InvalidGroup);
+        }
+        // `q` first: it is narrow, so a bad one is rejected cheaply.
+        let mut rng = HmacDrbg::<Sha256>::new(
+            &q.to_be_bytes(q.bit_len().div_ceil(8)),
+            b"purecrypto-dh-params-q-mr-bases",
+            &[],
+        );
+        if !is_prime_boxed(&q, &mut rng, Self::CUSTOM_GROUP_MR_ROUNDS) {
+            return Err(Error::InvalidGroup);
+        }
+        let mut rng = HmacDrbg::<Sha256>::new(
+            &group.p.to_be_bytes(group.byte_size()),
+            b"purecrypto-dh-params-p-mr-bases",
+            &[],
+        );
+        if !is_prime_boxed(&group.p, &mut rng, Self::custom_group_mr_rounds(bits)) {
+            return Err(Error::InvalidGroup);
+        }
+        group.q = Some(q);
+        Ok(group)
     }
 }
 
@@ -543,6 +665,7 @@ pub fn group14() -> DhGroup {
         g: BoxedUint::from_u64(2),
         priv_bits: 256,
         known_safe_prime: true,
+        q: None,
         mont,
     }
 }
@@ -561,6 +684,7 @@ pub fn group15() -> DhGroup {
         g: BoxedUint::from_u64(2),
         priv_bits: 288,
         known_safe_prime: true,
+        q: None,
         mont,
     }
 }
@@ -577,6 +701,7 @@ pub fn group16() -> DhGroup {
         g: BoxedUint::from_u64(2),
         priv_bits: 384,
         known_safe_prime: true,
+        q: None,
         mont,
     }
 }
@@ -593,6 +718,7 @@ pub fn group17() -> DhGroup {
         g: BoxedUint::from_u64(2),
         priv_bits: 512,
         known_safe_prime: true,
+        q: None,
         mont,
     }
 }
@@ -609,7 +735,87 @@ pub fn group18() -> DhGroup {
         g: BoxedUint::from_u64(2),
         priv_bits: 512,
         known_safe_prime: true,
+        q: None,
         mont,
+    }
+}
+
+/// The three RFC 5114 §2.1–2.3 groups, as `(p, g, q)` hex — transcribed
+/// from the `dh_1024_160`, `dh_2048_224` and `dh_2048_256` X9.42
+/// `DomainParameters` OpenSSL emits for `genpkey -genparam -algorithm DHX
+/// -pkeyopt dh_rfc5114:{1,2,3}` (DER order `p, g, q`). Test fixtures for
+/// [`DhGroup::from_params`].
+#[cfg(test)]
+pub(crate) mod rfc5114 {
+    use super::DhGroup;
+    use crate::bignum::BoxedUint;
+
+    // RFC 5114 §2.1: 1024-bit p, 160-bit q.
+    pub(crate) const P_1024_160: &str = "B10B8F96A080E01DDE92DE5EAE5D54EC52C99FBCFB06A3C69A6A9DCA52D23B61\
+        6073E28675A23D189838EF1E2EE652C013ECB4AEA906112324975C3CD49B83BF\
+        ACCBDD7D90C4BD7098488E9C219A73724EFFD6FAE5644738FAA31A4FF55BCCC0\
+        A151AF5F0DC8B4BD45BF37DF365C1A65E68CFDA76D4DA708DF1FB2BC2E4A4371";
+    pub(crate) const G_1024_160: &str = "A4D1CBD5C3FD34126765A442EFB99905F8104DD258AC507FD6406CFF14266D31\
+        266FEA1E5C41564B777E690F5504F213160217B4B01B886A5E91547F9E2749F4\
+        D7FBD7D3B9A92EE1909D0D2263F80A76A6A24C087A091F531DBF0A0169B6A28A\
+        D662A4D18E73AFA32D779D5918D08BC8858F4DCEF97C2A24855E6EEB22B3B2E5";
+    pub(crate) const Q_1024_160: &str = "F518AA8781A8DF278ABA4E7D64B7CB9D49462353";
+    // RFC 5114 §2.2: 2048-bit p, 224-bit q.
+    pub(crate) const P_2048_224: &str = "AD107E1E9123A9D0D660FAA79559C51FA20D64E5683B9FD1B54B1597B61D0A75\
+        E6FA141DF95A56DBAF9A3C407BA1DF15EB3D688A309C180E1DE6B85A1274A0A6\
+        6D3F8152AD6AC2129037C9EDEFDA4DF8D91E8FEF55B7394B7AD5B7D0B6C12207\
+        C9F98D11ED34DBF6C6BA0B2C8BBC27BE6A00E0A0B9C49708B3BF8A3170918836\
+        81286130BC8985DB1602E714415D9330278273C7DE31EFDC7310F7121FD5A074\
+        15987D9ADC0A486DCDF93ACC44328387315D75E198C641A480CD86A1B9E587E8\
+        BE60E69CC928B2B9C52172E413042E9B23F10B0E16E79763C9B53DCF4BA80A29\
+        E3FB73C16B8E75B97EF363E2FFA31F71CF9DE5384E71B81C0AC4DFFE0C10E64F";
+    pub(crate) const G_2048_224: &str = "AC4032EF4F2D9AE39DF30B5C8FFDAC506CDEBE7B89998CAF74866A08CFE4FFE3\
+        A6824A4E10B9A6F0DD921F01A70C4AFAAB739D7700C29F52C57DB17C620A8652\
+        BE5E9001A8D66AD7C17669101999024AF4D027275AC1348BB8A762D0521BC98A\
+        E247150422EA1ED409939D54DA7460CDB5F6C6B250717CBEF180EB34118E98D1\
+        19529A45D6F834566E3025E316A330EFBB77A86F0C1AB15B051AE3D428C8F8AC\
+        B70A8137150B8EEB10E183EDD19963DDD9E263E4770589EF6AA21E7F5F2FF381\
+        B539CCE3409D13CD566AFBB48D6C019181E1BCFE94B30269EDFE72FE9B6AA4BD\
+        7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3191F2BFA";
+    pub(crate) const Q_2048_224: &str = "801C0D34C58D93FE997177101F80535A4738CEBCBF389A99B36371EB";
+    // RFC 5114 §2.3: 2048-bit p, 256-bit q.
+    pub(crate) const P_2048_256: &str = "87A8E61DB4B6663CFFBBD19C651959998CEEF608660DD0F25D2CEED4435E3B00\
+        E00DF8F1D61957D4FAF7DF4561B2AA3016C3D91134096FAA3BF4296D830E9A7C\
+        209E0C6497517ABD5A8A9D306BCF67ED91F9E6725B4758C022E0B1EF4275BF7B\
+        6C5BFC11D45F9088B941F54EB1E59BB8BC39A0BF12307F5C4FDB70C581B23F76\
+        B63ACAE1CAA6B7902D52526735488A0EF13C6D9A51BFA4AB3AD8347796524D8E\
+        F6A167B5A41825D967E144E5140564251CCACB83E6B486F6B3CA3F7971506026\
+        C0B857F689962856DED4010ABD0BE621C3A3960A54E710C375F26375D7014103\
+        A4B54330C198AF126116D2276E11715F693877FAD7EF09CADB094AE91E1A1597";
+    pub(crate) const G_2048_256: &str = "3FB32C9B73134D0B2E77506660EDBD484CA7B18F21EF205407F4793A1A0BA125\
+        10DBC15077BE463FFF4FED4AAC0BB555BE3A6C1B0C6B47B1BC3773BF7E8C6F62\
+        901228F8C28CBB18A55AE31341000A650196F931C77A57F2DDF463E5E9EC144B\
+        777DE62AAAB8A8628AC376D282D6ED3864E67982428EBC831D14348F6F2F9193\
+        B5045AF2767164E1DFC967C1FB3F2E55A4BD1BFFE83B9C80D052B985D182EA0A\
+        DB2A3B7313D3FE14C8484B1E052588B9B7D2BBD2DF016199ECD06E1557CD0915\
+        B3353BBB64E0EC377FD028370DF92B52C7891428CDC67EB6184B523D1DB246C3\
+        2F63078490F00EF8D647D148D47954515E2327CFEF98C582664B4C0F6CC41659";
+    pub(crate) const Q_2048_256: &str =
+        "8CF83642A709A097B447997640129DA299B1A47D1EB3750BA308B0FE64F5FBD3";
+
+    pub(crate) fn hex(s: &str) -> BoxedUint {
+        let s: alloc::string::String = s.split_whitespace().collect();
+        BoxedUint::from_be_bytes(
+            &(0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect::<alloc::vec::Vec<u8>>(),
+        )
+    }
+
+    /// All three groups, validated by [`DhGroup::from_params`].
+    pub(crate) fn groups() -> [DhGroup; 3] {
+        [
+            (P_1024_160, G_1024_160, Q_1024_160),
+            (P_2048_224, G_2048_224, Q_2048_224),
+            (P_2048_256, G_2048_256, Q_2048_256),
+        ]
+        .map(|(p, g, q)| DhGroup::from_params(hex(p), hex(g), hex(q)).expect("RFC 5114 group"))
     }
 }
 
@@ -872,5 +1078,88 @@ mod tests {
                 start.elapsed()
             );
         }
+    }
+
+    #[test]
+    fn from_params_accepts_rfc5114_groups() {
+        use super::rfc5114::*;
+        for (g, (pb, qb)) in groups().iter().zip([(1024, 160), (2048, 224), (2048, 256)]) {
+            assert_eq!(g.bit_size(), pb);
+            assert_eq!(g.q().unwrap().bit_len(), qb);
+            assert_eq!(g.priv_bits(), qb);
+            assert_eq!(g.name(), "custom");
+            assert!(!g.known_safe_prime);
+        }
+        // The safe-prime constructors carry no explicit q.
+        assert!(group14().q().is_none());
+        assert!(
+            DhGroup::from_custom_unchecked(hex(P_1024_160), hex(G_1024_160), 160)
+                .unwrap()
+                .q()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn from_params_rejects_bad_triples() {
+        use super::rfc5114::*;
+        use crate::bignum::BoxedMontModulus;
+        use crate::bignum::prime::is_prime_boxed;
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+
+        let (p, g, q) = (hex(P_1024_160), hex(G_1024_160), hex(Q_1024_160));
+        let one = BoxedUint::from_u64(1);
+        let bad = |p: &BoxedUint, g: &BoxedUint, q: &BoxedUint| {
+            matches!(
+                DhGroup::from_params(p.clone(), g.clone(), q.clone()),
+                Err(Error::InvalidGroup)
+            )
+        };
+        // q does not divide p - 1: another group's (prime) q.
+        assert!(bad(&p, &g, &hex(Q_2048_224)));
+        // g outside [2, p - 2], or not of order q (2 is, with overwhelming
+        // probability, not in the order-q subgroup).
+        assert!(bad(&p, &one, &q));
+        assert!(bad(&p, &p.sub(&one), &q));
+        assert!(bad(&p, &p, &q));
+        assert!(bad(&p, &BoxedUint::from_u64(2), &q));
+        // Width floors (checked before any arithmetic) and parity.
+        assert!(bad(&p, &g, &q.shr_bits(1)));
+        assert!(bad(&p.shr_bits(1), &g, &q));
+        assert!(bad(&p, &g, &q.add(&one)));
+        // A composite q with q | p - 1 and g^q = 1: q*r for an odd prime r
+        // dividing (p - 1)/q. Only Miller-Rabin on q rejects it.
+        let (cofactor, _) = p.sub(&one).divrem(&q);
+        let r = (3u64..)
+            .step_by(2)
+            .find(|&r| cofactor.reduce(&BoxedUint::from_u64(r)).is_zero())
+            .unwrap();
+        let qr = q.mul(&BoxedUint::from_u64(r));
+        assert!(p.sub(&one).reduce(&qr).is_zero());
+        assert_eq!(BoxedMontModulus::new(&p).pow_public(&g, &qr), one);
+        assert!(bad(&p, &g, &qr));
+        // A composite p that passes every structural check: p' = p*p2 with
+        // p2 = 2kq + 1 prime (so q | p' - 1), and g' = g (mod p),
+        // g' = 1 (mod p2) by CRT (so g'^q = 1 mod p'). Only Miller-Rabin on
+        // p rejects it.
+        let mut rng = HmacDrbg::<Sha256>::new(b"dh-params-composite-p", b"", b"");
+        let two_q = q.add(&q);
+        let mut p2 = two_q.add(&one);
+        while !is_prime_boxed(&p2, &mut rng, 32) {
+            p2 = p2.add(&two_q);
+        }
+        let composite = p.mul(&p2);
+        let p2_inv = crate::bignum::inv_mod_boxed(&p2.reduce(&p), &p).unwrap();
+        let t = BoxedMontModulus::new(&p).mul_mod(&g.sub(&one), &p2_inv);
+        let g_crt = one.add(&p2.mul(&t));
+        assert!(composite.sub(&one).reduce(&q).is_zero());
+        assert_eq!(
+            BoxedMontModulus::new(&composite).pow_public(&g_crt, &q),
+            one
+        );
+        assert!(bad(&composite, &g_crt, &q));
+        // The genuine triple passes.
+        assert!(DhGroup::from_params(p, g, q).is_ok());
     }
 }

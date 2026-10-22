@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(dsa)* non-standard domain parameters (512..=10000-bit `p`, 160..=256-bit `q`, `p` Miller-Rabin-tested) via `DsaParams::new_nonstandard` and `*_nonstandard` DER/PEM/SPKI/PKCS#8 parsers; the strict FIPS 186-4 paths are unchanged
 - *(dsa)* `DsaParams::generate` parameter generation for standard and non-standard widths (e.g. 512/160, 768/160)
 - *(dsa)* run-time digest selection: `DsaPrivateKey::sign_with` / `sign_prehash_with` and `DsaPublicKey::verify_with` take a `HashAlgorithm` and match the generic RFC 6979 signatures
+- *(dh)* `DhGroup::from_params(p, g, q)` for explicit prime-order-subgroup groups (RFC 5114, X9.42): validates `p`, `q` prime, `q | p − 1`, `g^q ≡ 1`; private keys drawn from `[1, q − 1]`, peer values must satisfy `y^q ≡ 1`
 
 ### Changed
 

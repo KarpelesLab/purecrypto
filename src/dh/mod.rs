@@ -1,5 +1,7 @@
 //! Finite-field Diffie-Hellman over RFC 3526 MODP safe-prime groups,
-//! and RFC 4419 group-exchange (caller-supplied custom group).
+//! RFC 4419 group-exchange (caller-supplied custom group), and explicit
+//! prime-order-subgroup groups (RFC 5114, ANSI X9.42) via
+//! [`DhGroup::from_params`].
 //!
 //! For interop with SSH (`diffie-hellman-group14-sha256`,
 //! `diffie-hellman-group16-sha512`, `diffie-hellman-group-exchange-sha256`),
@@ -34,7 +36,9 @@
 //! [`DhPublicKey::from_bytes`] and [`DhPrivateKey::shared_secret`] both
 //! enforce the standard subgroup-confinement check `2 ≤ y < p - 1`, and
 //! the shared secret is screened against the contributory-failure values
-//! `0` and `1` (NIST SP 800-56A §5.6.2.3).
+//! `0` and `1` (NIST SP 800-56A §5.6.2.3). On a group with an explicit
+//! subgroup order `q`, [`DhPrivateKey::shared_secret`] additionally requires
+//! `y^q ≡ 1 (mod p)`, and private keys are drawn from `[1, q − 1]`.
 #![cfg_attr(not(feature = "ec"), doc = "", doc = "[`crate::ec`]: crate")]
 
 pub mod groups;

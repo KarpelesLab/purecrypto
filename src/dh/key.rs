@@ -2,9 +2,11 @@
 //!
 //! [`DhPrivateKey`] / [`DhPublicKey`] perform the classic `g^x mod p`
 //! key-agreement protocol on any [`DhGroup`]: a named RFC 3526 group such as
-//! [`group14`](super::groups::group14), or a custom group built via
+//! [`group14`](super::groups::group14), a custom group built via
 //! [`DhGroup::from_custom`](super::groups::DhGroup::from_custom) for RFC 4419
-//! SSH group-exchange.
+//! SSH group-exchange, or an explicit-subgroup group built via
+//! [`DhGroup::from_params`](super::groups::DhGroup::from_params) (RFC 5114,
+//! X9.42).
 //!
 //! The public-key validation and contributory-failure rejection follow
 //! standard subgroup-confinement defense (see NIST SP 800-56A §5.6.2.3).
@@ -21,8 +23,11 @@ use alloc::vec::Vec;
 #[non_exhaustive]
 pub enum Error {
     /// The peer's public value was outside `[2, p - 2]` — i.e. one of
-    /// `0`, `1`, `p - 1`, or `≥ p`. These are tiny-order or invalid elements
-    /// that would leak the local exponent, so the exchange is aborted.
+    /// `0`, `1`, `p - 1`, or `≥ p` — or outside the group's prime-order
+    /// subgroup (`y^q ≢ 1 (mod p)` on a
+    /// [`from_params`](super::groups::DhGroup::from_params) group). These are
+    /// small-order or invalid elements that would leak the local exponent,
+    /// so the exchange is aborted.
     InvalidPublicKey,
     /// The shared secret was `0` or `1`. This should not occur for a
     /// well-formed peer once [`Error::InvalidPublicKey`] is screened out; if
@@ -30,12 +35,14 @@ pub enum Error {
     /// the range check (e.g. on a malformed custom group) and the secret
     /// would be guessable.
     ContributoryFailure,
-    /// [`DhGroup::from_custom`](super::groups::DhGroup::from_custom) was
-    /// called with parameters that fail the cheap sanity checks (even `p`,
-    /// `g` outside `[2, p - 2]`, or a degenerate `priv_bits`).
+    /// [`DhGroup::from_custom`](super::groups::DhGroup::from_custom) or
+    /// [`DhGroup::from_params`](super::groups::DhGroup::from_params) was
+    /// called with parameters that fail validation (even `p`, `g` outside
+    /// `[2, p - 2]`, a degenerate `priv_bits`, a width out of bounds, a
+    /// composite `p` or `q`, `q ∤ p − 1`, or `g^q ≢ 1`).
     InvalidGroup,
     /// A scalar passed to [`DhPrivateKey::from_bytes`] was outside
-    /// `[1, p - 1]`.
+    /// `[1, p - 1]` (`[1, q - 1]` on a group with an explicit `q`).
     InvalidScalar,
     /// The peer's public key lives on a different group (`p` or `g` differs)
     /// than this private key. Computing `y^x mod p` across groups silently
@@ -68,7 +75,11 @@ impl std::error::Error for Error {}
 /// [`DhGroup::priv_bits`](super::groups::DhGroup) — typically 256 bits for a
 /// 2048-bit prime, doubled to 512 for the 6144- and 8192-bit primes. Shorter
 /// exponents speed up `g^x mod p` substantially while preserving the
-/// effective security level (RFC 7919 §A).
+/// effective security level (RFC 7919 §A). On a group with an explicit
+/// subgroup order `q` ([`DhGroup::from_params`]) it is uniform in
+/// `[1, q - 1]` instead.
+///
+/// [`DhGroup::from_params`]: super::groups::DhGroup::from_params
 #[derive(Clone)]
 pub struct DhPrivateKey {
     group: DhGroup,
@@ -141,8 +152,19 @@ impl DhPrivateKey {
     /// from coincidentally being 0 or 1 and keeps the modexp running time
     /// stable across keys on the same group.
     ///
+    /// On a group with an explicit `q` ([`DhGroup::from_params`]) the
+    /// exponent is instead uniform in `[1, q − 1]`, by rejection sampling
+    /// over `q`'s width (NIST SP 800-56A Rev 3 §5.6.1.1.4) — an exponent
+    /// outside that range only aliases one inside it.
+    ///
     /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]).
+    ///
+    /// [`DhGroup::from_params`]: super::groups::DhGroup::from_params
     pub fn generate<R: RngCore + CryptoRng>(group: DhGroup, rng: &mut R) -> Self {
+        if let Some(q) = &group.q {
+            let x = random_below(q, rng);
+            return DhPrivateKey { group, x };
+        }
         let priv_bits = group.priv_bits;
         let nbytes = priv_bits.div_ceil(8);
         let mut bytes = vec![0u8; nbytes];
@@ -167,14 +189,16 @@ impl DhPrivateKey {
 
     /// Builds a private key from an explicit big-endian scalar.
     ///
-    /// Validates `1 ≤ x < p`. This is `priv_bits`-agnostic — passing a
-    /// shorter or longer scalar than the group's default size is allowed,
-    /// for interop with peers that demand a fixed exponent.
+    /// Validates `1 ≤ x < p` (`1 ≤ x < q` on a group with an explicit
+    /// `q`). This is `priv_bits`-agnostic — passing a shorter or longer
+    /// scalar than the group's default size is allowed, for interop with
+    /// peers that demand a fixed exponent.
     pub fn from_bytes(group: DhGroup, bytes: &[u8]) -> Result<Self, Error> {
         let x = BoxedUint::from_be_bytes(bytes);
         // One non-short-circuiting range verdict; it is public (the caller
         // sees it as `Ok`/`Err`).
-        let too_big = crate::ct::Choice::from(!x.lt(group.p()) as u8);
+        let bound = group.q.as_ref().unwrap_or(&group.p);
+        let too_big = crate::ct::Choice::from(!x.lt(bound) as u8);
         if (x.ct_is_zero() | too_big).declassify() {
             return Err(Error::InvalidScalar);
         }
@@ -225,16 +249,31 @@ impl DhPrivateKey {
     ///   value the shared secret reveals the parity of `x` (one bit of a
     ///   ≥ 256-bit exponent), which does not affect the DLP hardness the
     ///   exchange rests on;
+    /// * on a group with an explicit `q` ([`DhGroup::from_params`]):
+    ///   `peer.y ^ q mod p ≠ 1` **instead of** the check above — such a `p`
+    ///   is not a safe prime, `Z_p^*` has small subgroups besides the
+    ///   order-`q` one, and only full subgroup membership keeps a peer from
+    ///   learning `x` modulo their orders (NIST SP 800-56A Rev 3
+    ///   §5.6.2.3.1). This costs one exponentiation by `q` (not by `p`'s
+    ///   width) and is never skipped;
     /// * a resulting shared secret of 0 or 1 — contributory-failure
     ///   rejection per NIST SP 800-56A §5.6.2.3;
     /// * a peer key on a different group ([`Error::GroupMismatch`]) — the
     ///   computation would otherwise use the *local* prime with a foreign
-    ///   public value, which is not an exchange with that peer.
+    ///   public value, which is not an exchange with that peer. A stated
+    ///   `q` is part of the group, so the same `(p, g)` with and without one
+    ///   counts as a mismatch.
+    ///
+    /// [`DhGroup::from_params`]: super::groups::DhGroup::from_params
     pub fn shared_secret(&self, peer: &DhPublicKey) -> Result<SharedSecret, Error> {
-        // Both keys must live on the same group: `p` and `g` are what define
-        // it (the private-exponent budget is a local policy knob, and an
-        // honest peer may legitimately have chosen a different one).
-        if self.group.p() != peer.group.p() || self.group.g() != peer.group.g() {
+        // Both keys must live on the same group: `p`, `g` and any stated `q`
+        // are what define it (the private-exponent budget is a local policy
+        // knob, and an honest peer may legitimately have chosen a different
+        // one).
+        if self.group.p() != peer.group.p()
+            || self.group.g() != peer.group.g()
+            || self.group.q != peer.group.q
+        {
             return Err(Error::GroupMismatch);
         }
         let p = self.group.p();
@@ -260,7 +299,13 @@ impl DhPrivateKey {
         // validation, if any, rests on public Miller-Rabin bases) keep it.
         // `y` and `q` are both public, so the variable-time ladder is fine.
         let one = BoxedUint::from_u64(1);
-        if !self.group.known_safe_prime {
+        if let Some(q) = &self.group.q {
+            // Explicit subgroup: y must have order exactly q (y ≠ 1 is
+            // already excluded above). Public inputs, variable-time ladder.
+            if m.pow_public(&peer.y, q) != one {
+                return Err(Error::InvalidPublicKey);
+            }
+        } else if !self.group.known_safe_prime {
             let q = p_minus_one.shr_bits(1);
             let y_to_q = m.pow_public(&peer.y, &q);
             if !bool::from(y_to_q.ct_eq(&one) | y_to_q.ct_eq(&p_minus_one)) {
@@ -307,6 +352,27 @@ impl DhPrivateKey {
     }
 }
 
+/// Uniform in `[1, q − 1]` by rejection sampling over `q`'s bit width (the
+/// draw is masked to that width, so each attempt succeeds with probability
+/// above one half).
+fn random_below<R: RngCore + CryptoRng>(q: &BoxedUint, rng: &mut R) -> BoxedUint {
+    let qlen = q.bit_len().div_ceil(8);
+    let keep = ((q.bit_len() - 1) % 8) + 1;
+    let mask = if keep == 8 { 0xff } else { (1u8 << keep) - 1 };
+    loop {
+        let mut buf = vec![0u8; qlen];
+        rng.fill_bytes(&mut buf);
+        buf[0] &= mask;
+        let candidate = BoxedUint::from_be_bytes(&buf);
+        crate::zeroize::Zeroize::zeroize(&mut buf[..]);
+        // Declassified (Valgrind harness): only the rejection count is
+        // observable, and it is independent of the accepted value.
+        if (!candidate.ct_is_zero() & candidate.reduce(q).ct_eq(&candidate)).declassify() {
+            return candidate;
+        }
+    }
+}
+
 impl Drop for DhPrivateKey {
     fn drop(&mut self) {
         // Best-effort wipe of the secret exponent `x` before its heap-backing
@@ -328,7 +394,9 @@ impl DhPublicKey {
     ///
     /// Validates `2 ≤ y < p - 1` (subgroup-confinement check). Values of
     /// `0`, `1`, `p - 1`, and `≥ p` are tiny-order or out-of-range and
-    /// rejected with [`Error::InvalidPublicKey`].
+    /// rejected with [`Error::InvalidPublicKey`]. The exponentiation-based
+    /// half of the validation (`y^q ≡ 1` on an explicit-subgroup group) is
+    /// left to [`DhPrivateKey::shared_secret`], which runs it on every use.
     pub fn from_bytes(group: DhGroup, bytes: &[u8]) -> Result<Self, Error> {
         let y = BoxedUint::from_be_bytes(bytes);
         let two = BoxedUint::from_u64(2);
@@ -733,5 +801,88 @@ mod tests {
         assert_eq!(a_shared.as_bytes(), b_shared.as_bytes());
         // p byte-length is 1.
         assert_eq!(a_shared.as_bytes(), &[12u8]);
+    }
+
+    /// RFC 5114 groups: agreement round-trips, private keys land in
+    /// `[1, q - 1]`, and public values in the order-`q` subgroup.
+    #[test]
+    fn rfc5114_groups_agree() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"dh-rfc5114", b"nonce", &[]);
+        for group in super::super::groups::rfc5114::groups() {
+            let q = group.q().unwrap().clone();
+            let alice = DhPrivateKey::generate(group.clone(), &mut rng);
+            let bob = DhPrivateKey::generate(group.clone(), &mut rng);
+            for k in [&alice, &bob] {
+                assert!(!k.x.is_zero() && k.x.lt(&q));
+                let y = k.public_key();
+                assert_eq!(group.mont().pow_public(y.y(), &q), BoxedUint::from_u64(1));
+            }
+            let a = alice.shared_secret(&bob.public_key()).unwrap();
+            let b = bob.shared_secret(&alice.public_key()).unwrap();
+            assert_eq!(a.as_bytes(), b.as_bytes());
+            assert_eq!(a.as_bytes().len(), group.byte_size());
+            // The wire form round-trips.
+            let bob_pub = DhPublicKey::from_bytes(group, &bob.public_key().to_bytes()).unwrap();
+            assert_eq!(
+                alice.shared_secret(&bob_pub).unwrap().as_bytes(),
+                a.as_bytes()
+            );
+        }
+    }
+
+    /// On an explicit-subgroup group a peer value in `[2, p - 2]` but
+    /// outside the order-`q` subgroup must be refused: the safe-prime
+    /// `y^((p-1)/2)` test would let it through.
+    #[test]
+    fn rfc5114_rejects_peer_outside_subgroup() {
+        let [group, ..] = super::super::groups::rfc5114::groups();
+        let q = group.q().unwrap().clone();
+        let one = BoxedUint::from_u64(1);
+        let mut rng = HmacDrbg::<Sha256>::new(b"dh-rfc5114-bad-peer", b"nonce", &[]);
+        let alice = DhPrivateKey::generate(group.clone(), &mut rng);
+        let honest = DhPrivateKey::generate(group.clone(), &mut rng).public_key();
+        let m = group.mont();
+        // 2 is in range but (checked) not of order q; so is an honest value
+        // times 2.
+        let two = BoxedUint::from_u64(2);
+        let shifted = m.mul_mod(honest.y(), &two);
+        for y in [two, shifted] {
+            assert_ne!(m.pow_public(&y, &q), one);
+            let peer = DhPublicKey::from_bytes(group.clone(), &y.to_be_bytes(group.byte_size()))
+                .expect("in range");
+            assert!(matches!(
+                alice.shared_secret(&peer),
+                Err(Error::InvalidPublicKey)
+            ));
+        }
+        // The range check still applies.
+        let pm1 = group.p().sub(&one).to_be_bytes(group.byte_size());
+        expect_invalid_pub(DhPublicKey::from_bytes(group.clone(), &pm1));
+        // And an honest value is accepted.
+        assert!(alice.shared_secret(&honest).is_ok());
+    }
+
+    #[test]
+    fn rfc5114_private_scalar_range_and_group_identity() {
+        let [group, ..] = super::super::groups::rfc5114::groups();
+        let q = group.q().unwrap().clone();
+        let one = BoxedUint::from_u64(1);
+        // x in [1, q - 1]: q itself is refused.
+        expect_invalid_scalar(DhPrivateKey::from_bytes(group.clone(), &q.to_be_bytes(20)));
+        let q_minus_1 = q.sub(&one).to_be_bytes(20);
+        let alice = DhPrivateKey::from_bytes(group.clone(), &q_minus_1).unwrap();
+        // The same (p, g) without q is a different group.
+        let no_q =
+            DhGroup::from_custom_unchecked(group.p().clone(), group.g().clone(), 160).unwrap();
+        let mut rng = HmacDrbg::<Sha256>::new(b"dh-rfc5114-identity", b"nonce", &[]);
+        let bob = DhPrivateKey::generate(no_q, &mut rng);
+        assert!(matches!(
+            alice.shared_secret(&bob.public_key()),
+            Err(Error::GroupMismatch)
+        ));
+        assert!(matches!(
+            bob.shared_secret(&alice.public_key()),
+            Err(Error::GroupMismatch)
+        ));
     }
 }
