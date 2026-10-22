@@ -150,6 +150,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `ec` | ECDSA/ECDH on P-224, P-256, P-384, P-521, secp256k1, Brainpool (224–512); X25519, X448, Ed25519, Ed448; SM2 signature and encryption (P-256 and secp256k1 ECDSA — with Bitcoin/Ethereum key recovery — need no `alloc`); with `legacy-ec`: P-192, secp160/192/224 (k1/r1/r2) and ECDH on the binary curves sect283/409/571 (k1/r1) |
 | `*-table` | Precomputed lookup tables, all on by default, each trading flash for speed: `ed25519-table` (~68 KB; Ed25519 sign 3x, verify 1.2x, ristretto255 / edwards25519 `mul_base`), `p256-table` (~61 KB; P-256 sign / keygen 3x), `secp256k1-table` (~61 KB; secp256k1 ECDSA / BIP340 sign / keygen 2x), `streebog-table` (16 KB; Streebog ~30x), `whirlpool-table` (2 KB; Whirlpool ~10x). Without one, the code recomputes what the table held: same outputs, same constant-time guarantees, slower. Signature verification speed is unaffected |
 | `legacy-ec` | Curves below the 112-bit level or deprecated by SP 800-186: secp160k1/r1/r2, secp192k1, P-192, secp224k1 and the binary curves sect283/409/571 k1/r1 (ECDH only); interop with old certificates only (opt-in) |
+| `ec-custom` | ECDSA/ECDH on curves built from explicit parameters (`ec::BoxedCurve::from_params`, prime field up to 576 bits, any cofactor), and SEC1/PKCS#8 keys with explicit `specifiedCurve` parameters: secp112/128, prime192v2/v3, prime239v1–3, WTLS, Brainpool t1, ... (opt-in) |
 | `bip340` | BIP340 Schnorr signatures over secp256k1 |
 | `zkp-*` | Experimental secp256k1 extensions mirroring `secp256k1-zkp`: sign-to-contract, ECDSA adaptor signatures, Pedersen commitments, Borromean range proofs, asset surjection proofs, half-aggregation, ring-signature whitelisting (`zkp` enables all; no semver guarantee) |
 | `ristretto255` | The RFC 9496 prime-order group (stable API) |
@@ -182,7 +183,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 The default feature set is `std` plus most modules and the CLI. Opt-in
 features are `quic`, `hpke`, `ech`, `falcon`, `ristretto255`, `bip340`, the
 `zkp-*` set, the `hazmat-*` set, `dsa`, `bls`, `fpe`, `chunked`,
-`legacy-ec`, `legacy-ciphers`, `vmac`, `tls-legacy`, `wasi-getrandom`,
+`legacy-ec`, `ec-custom`, `legacy-ciphers`, `vmac`, `tls-legacy`, `wasi-getrandom`,
 `ffi`, `tokio` and `mio`. Disable the defaults for a `no_std` build and re-enable
 only what you need:
 

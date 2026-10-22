@@ -29,7 +29,12 @@ pub(crate) mod safegcd;
 #[cfg(all(
     feature = "alloc",
     feature = "rng",
-    any(feature = "rsa", feature = "dh", feature = "dsa")
+    any(
+        feature = "rsa",
+        feature = "dh",
+        feature = "dsa",
+        feature = "ec-custom"
+    )
 ))]
 pub(crate) mod prime;
 mod uint;
@@ -49,7 +54,15 @@ pub use montgomery::MontModulus;
 // `rsa::prime`; gate them the same way so other feature sets stay free of
 // dead code.
 pub use uint::{LIMB_BITS, Limb, Uint};
-#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[cfg(all(
+    feature = "rng",
+    any(
+        feature = "rsa",
+        feature = "dh",
+        feature = "dsa",
+        feature = "ec-custom"
+    )
+))]
 pub(crate) use uint::{mod_small_limbs, mod_u32_with_recip, recip_u32, trailing_zeros_step};
 // The incremental-sieve window is RSA key generation's alone.
 #[cfg(all(feature = "rng", feature = "rsa"))]

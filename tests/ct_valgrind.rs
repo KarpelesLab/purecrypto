@@ -787,6 +787,51 @@ fn p384_ecdh() -> String {
     format!("ss={}", hex8(public(&shared[..])))
 }
 
+/// ECDSA signing and ECDH on custom curves from explicit parameters: the
+/// runtime-built engine (modulus read from memory) at two limbs on
+/// secp112r2, whose cofactor 4 also sends `r = x mod n` through the long
+/// division, and at four on brainpoolP256t1.
+#[cfg(feature = "ec-custom")]
+fn ec_custom_curves() -> String {
+    use purecrypto::ec::BoxedCurve;
+    let curves: [(&[u8], u8, u64); 2] = [
+        (
+            include_bytes!("../testdata/ec-explicit/params-secp112r2.der"),
+            0x1f,
+            140,
+        ),
+        (
+            include_bytes!("../testdata/ec-explicit/params-brainpoolP256t1.der"),
+            0x7f,
+            142,
+        ),
+    ];
+    let mut out = String::new();
+    for (der, top_mask, tag) in curves {
+        let curve = BoxedCurve::from_der(der).expect("valid explicit curve");
+        let len = curve.order_len();
+        let mut raw = secret_bytes::<32>(tag)[..len].to_vec();
+        raw[0] &= top_mask;
+        let sk = BoxedEcdsaPrivateKey::from_bytes(&curve, &raw).expect("scalar in range");
+        let sig = sk.sign::<Sha256>(b"ct_valgrind message").unwrap();
+        let sig = sig.to_bytes(&curve);
+        let mut peer = fixed_bytes::<32>(tag + 1)[..len].to_vec();
+        peer[0] &= top_mask;
+        let peer = BoxedEcdhPrivateKey::from_bytes(&curve, &peer)
+            .unwrap()
+            .public_key();
+        let shared = BoxedEcdhPrivateKey::from(sk)
+            .diffie_hellman(&peer)
+            .expect("valid peer");
+        out.push_str(&format!(
+            "sig={} ss={} ",
+            hex8(public(&sig[..])),
+            hex8(public(&shared[..]))
+        ));
+    }
+    out
+}
+
 /// sect283k1 ECDH: the binary-field López–Dahab ladder, with the GF(2^m)
 /// multiplication on the carry-less multiply instruction where detected
 /// and on the bit-sliced software kernel under `force_portable`.
@@ -2542,6 +2587,8 @@ const CASES: &[Case] = &[
     ("p384_ecdh", p384_ecdh),
     #[cfg(feature = "legacy-ec")]
     ("sect283k1_ecdh", sect283k1_ecdh),
+    #[cfg(feature = "ec-custom")]
+    ("ec_custom_curves", ec_custom_curves),
     ("sm2_sign", sm2_sign),
     ("boxed_fixed_curves", boxed_fixed_curves),
     ("ffdh_group14", ffdh_group14),

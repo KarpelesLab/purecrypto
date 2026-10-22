@@ -93,6 +93,13 @@ pub enum Algorithm {
     BrainpoolP224r1,
     /// ECDSA / ECDH over brainpoolP320r1 (RFC 5639).
     BrainpoolP320r1,
+    /// ECDSA / ECDH over a custom curve built from explicit parameters
+    /// ([`BoxedCurve::from_params`](crate::ec::BoxedCurve::from_params)).
+    /// Every such key reports this one value; key agreement additionally
+    /// checks that both keys are on the same curve. Requires the
+    /// `ec-custom` feature.
+    #[cfg(feature = "ec-custom")]
+    EcCustom,
 }
 
 /// The asymmetric operation a key was asked to perform.

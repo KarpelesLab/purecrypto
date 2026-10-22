@@ -281,6 +281,13 @@ dsa = ["bignum", "rng", "hash", "alloc", "der"]
 # sect283/409/571 k1/r1 (`ec::binary`, ECDH only). Interop with old
 # certificates and test corpora; never pick these for new designs.
 legacy-ec = ["ec", "alloc", "der"]
+# Elliptic curves from explicit parameters (`ec::BoxedCurve::from_params`):
+# any prime-field short-Weierstrass curve up to 576 bits, cofactor included,
+# for the boxed ECDSA / ECDH keys and SEC1 `specifiedCurve` key files.
+# Interop with keys on curves this crate has no `CurveId` for (secp112r1,
+# secp128r1, the X9.62 prime192v2/v3 and prime239v1–v3, WTLS, the brainpool
+# t1 twists, ...).
+ec-custom = ["ec", "alloc"]
 # Ciphers kept for interop and test-vector coverage rather than recommended
 # use: SEED (RFC 4269), MORUS-640/1280, AEGIS-128 (superseded by AEGIS-128L)
 # and the Ascon v1.2 AEADs (superseded by SP 800-232's Ascon-AEAD128, which

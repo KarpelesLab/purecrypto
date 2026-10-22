@@ -31,7 +31,15 @@ pub struct Uint<const LIMBS: usize> {
 /// computation", 2019 — exact for 64-bit dividends with a 128-bit
 /// reciprocal). No division instruction touches `n`, so a secret candidate
 /// (an RSA prime under test) never reaches a data-dependent-latency divider.
-#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[cfg(all(
+    feature = "rng",
+    any(
+        feature = "rsa",
+        feature = "dh",
+        feature = "dsa",
+        feature = "ec-custom"
+    )
+))]
 pub(crate) fn mod_small_limbs(limbs: &[Limb], p: u64) -> u64 {
     debug_assert!(p > 0 && p < (1 << 32), "mod_small_limbs: p must be < 2^32");
     // ceil(2^128 / p): public.
@@ -50,7 +58,15 @@ pub(crate) fn mod_small_limbs(limbs: &[Limb], p: u64) -> u64 {
 
 /// `(a · b) >> 128` for a 128-bit `a` and a `b < 2^32` — the high part of the
 /// 192-bit product, without a 256-bit type.
-#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[cfg(all(
+    feature = "rng",
+    any(
+        feature = "rsa",
+        feature = "dh",
+        feature = "dsa",
+        feature = "ec-custom"
+    )
+))]
 #[inline]
 fn mulhi_128_by_64(a: u128, b: u64) -> u64 {
     let lo = (a as u64) as u128 * b as u128;
@@ -60,7 +76,15 @@ fn mulhi_128_by_64(a: u128, b: u64) -> u64 {
 
 /// The 64-bit reciprocal `⌈2^64 / p⌉` behind [`mod_u32_with_recip`], for callers
 /// that reduce many values by the same public `p` (the prime sieves).
-#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[cfg(all(
+    feature = "rng",
+    any(
+        feature = "rsa",
+        feature = "dh",
+        feature = "dsa",
+        feature = "ec-custom"
+    )
+))]
 #[inline]
 pub(crate) fn recip_u32(p: u64) -> u64 {
     debug_assert!(p > 0 && p < (1 << 32));
@@ -70,7 +94,15 @@ pub(crate) fn recip_u32(p: u64) -> u64 {
 /// Constant-time `v mod p` for `v, p < 2^32` (`p` public, nonzero) with the
 /// reciprocal `c = recip_u32(p)` precomputed (Lemire–Kaser–Kurz, exact for
 /// 32-bit operands with a 64-bit reciprocal).
-#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[cfg(all(
+    feature = "rng",
+    any(
+        feature = "rsa",
+        feature = "dh",
+        feature = "dsa",
+        feature = "ec-custom"
+    )
+))]
 #[inline]
 pub(crate) fn mod_u32_with_recip(v: u64, p: u64, c: u64) -> u64 {
     debug_assert!(v < (1 << 32));
@@ -101,7 +133,15 @@ pub(crate) const SIEVE_MIN_BITS: usize = 32;
 /// a nonzero limb and `0` for zero, so no `trailing_zeros` intrinsic (a loop
 /// on targets without a hardware count) is needed. `tz_acc` accumulates
 /// while `still_zero` (1 while every lower limb was zero) is set.
-#[cfg(all(feature = "rng", any(feature = "rsa", feature = "dh", feature = "dsa")))]
+#[cfg(all(
+    feature = "rng",
+    any(
+        feature = "rsa",
+        feature = "dh",
+        feature = "dsa",
+        feature = "ec-custom"
+    )
+))]
 #[inline]
 pub(crate) fn trailing_zeros_step(limb: Limb, tz_acc: &mut u32, still_zero: &mut Limb) {
     let spread = limb | limb.wrapping_neg();

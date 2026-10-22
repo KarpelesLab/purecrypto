@@ -4,11 +4,13 @@
 //!
 //! Unlike the const-generic [`ecdsa`](super::ecdsa)/[`ecdh`](super::ecdh) P-256
 //! API — which is faster when the curve is fixed at compile time — these types
-//! carry their [`CurveId`] at runtime, so one set of types serves every
-//! supported curve. This is what the TLS and X.509 layers use, where the peer's
-//! curve is known only at parse time.
+//! carry their curve ([`BoxedCurve`]: a [`CurveId`], or a custom curve from
+//! explicit parameters) at runtime, so one set of types serves every curve.
+//! This is what the TLS and X.509 layers use, where the peer's curve is known
+//! only at parse time.
 
 use super::Error;
+use super::boxed_curve::BoxedCurve;
 use super::curves::CurveId;
 
 /// `id-ecPublicKey` (`1.2.840.10045.2.1`) — the PKCS#8 / SPKI algorithm OID for
@@ -47,7 +49,7 @@ pub(super) fn der_magnitude_len(body: &[u8]) -> usize {
 /// A runtime-curve ECDSA public key (an affine point on its curve).
 #[derive(Clone, Debug)]
 pub struct BoxedEcdsaPublicKey {
-    curve: CurveId,
+    curve: BoxedCurve,
     x: BoxedUint,
     y: BoxedUint,
 }
@@ -55,7 +57,7 @@ pub struct BoxedEcdsaPublicKey {
 /// A runtime-curve ECDSA private key (a scalar in `[1, n-1]`).
 #[derive(Clone)]
 pub struct BoxedEcdsaPrivateKey {
-    curve: CurveId,
+    curve: BoxedCurve,
     d: BoxedUint,
 }
 
@@ -69,7 +71,7 @@ pub struct BoxedEcdsaSignature {
 /// A runtime-curve ECDH private key.
 #[derive(Clone)]
 pub struct BoxedEcdhPrivateKey {
-    curve: CurveId,
+    curve: BoxedCurve,
     d: BoxedUint,
 }
 
@@ -83,22 +85,12 @@ fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
     (!v.ct_is_zero() & ct_lt(v, n)).declassify()
 }
 
-/// `a < b` as a [`Choice`]: one borrow chain over the wider of the two
-/// (public) limb widths, with no branch on and no allocation for the values,
-/// so either operand may be secret. Replaces `v.reduce(n) == v`, a
-/// bit-serial long division allocating three vectors per bit.
+/// `a < b` as a [`Choice`], constant time in both operands (see
+/// [`ConstantTimeLess`](crate::ct::ConstantTimeLess) for `BoxedUint`).
+/// Replaces `v.reduce(n) == v`, a bit-serial long division allocating three
+/// vectors per bit.
 pub(super) fn ct_lt(a: &BoxedUint, b: &BoxedUint) -> Choice {
-    let (a, b) = (a.as_limbs(), b.as_limbs());
-    let mut borrow = 0u64;
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        let d = (x as u128)
-            .wrapping_sub(y as u128)
-            .wrapping_sub(borrow as u128);
-        borrow = ((d >> 64) as u64) & 1;
-    }
-    Choice::from(borrow as u8)
+    crate::ct::ConstantTimeLess::ct_lt(a, b)
 }
 
 /// `v mod n` for `v < 2n`, by one masked subtraction (constant time in `v`),
@@ -107,8 +99,10 @@ pub(super) fn ct_lt(a: &BoxedUint, b: &BoxedUint) -> Choice {
 /// Every caller is within that bound:
 /// - `bits2int(h, qlen)` with `qlen = n.bit_len()` is `< 2^qlen ≤ 2n`, since
 ///   `n ≥ 2^(qlen-1)`;
-/// - an affine x-coordinate is `< p`, and `p < 2n` on every supported curve:
-///   they all have cofactor 1, so Hasse gives `n ≥ p + 1 − 2√p > p / 2`;
+/// - an affine x-coordinate is `< p`, and `p < 2n` on every named curve:
+///   they all have cofactor 1, so Hasse gives `n ≥ p + 1 − 2√p > p / 2`
+///   (a custom curve with a cofactor goes through
+///   [`BoxedCurve::x_mod_n`] instead);
 /// - an SM3 digest is `< 2^256 < 2n` for SM2's `n > 2^255`.
 pub(super) fn reduce_once(v: &BoxedUint, n: &BoxedUint) -> BoxedUint {
     let below = ct_lt(v, n);
@@ -135,7 +129,7 @@ fn bits2int(data: &[u8], qlen: usize) -> BoxedUint {
 /// (528 bits) while `n` is ~521 bits, so naive reduction is biased by
 /// roughly `2^-7` on a band of residues. We instead reject any sample `≥ n`
 /// (and zero) and resample — bias collapses to zero.
-fn random_scalar<R: RngCore>(curve: CurveId, n: &BoxedUint, rng: &mut R) -> BoxedUint {
+fn random_scalar<R: RngCore>(curve: &BoxedCurve, n: &BoxedUint, rng: &mut R) -> BoxedUint {
     let bytes = curve.order_len();
     // Mask the high byte to `n.bit_len()` bits so the draw is uniform over
     // `[0, 2^n.bit_len())` rather than `[0, 2^(8*order_len))` — without this
@@ -512,17 +506,21 @@ mod fixed {
 }
 
 /// The public key `d·G` for a scalar `d ∈ [1, n-1]` on `curve`.
-fn derive_public_key(curve: CurveId, d: &BoxedUint) -> BoxedEcdsaPublicKey {
-    let (x, y) = match curve {
-        CurveId::P256 => fixed::p256_public_key(d),
-        CurveId::Secp256k1 => fixed::k256_public_key(d),
+fn derive_public_key(curve: &BoxedCurve, d: &BoxedUint) -> BoxedEcdsaPublicKey {
+    let (x, y) = match curve.id() {
+        Some(CurveId::P256) => fixed::p256_public_key(d),
+        Some(CurveId::Secp256k1) => fixed::k256_public_key(d),
         _ => return derive_public_key_generic(curve, d),
     };
-    BoxedEcdsaPublicKey { curve, x, y }
+    BoxedEcdsaPublicKey {
+        curve: curve.clone(),
+        x,
+        y,
+    }
 }
 
 /// [`derive_public_key`] on the generic arithmetic.
-fn derive_public_key_generic(curve: CurveId, d: &BoxedUint) -> BoxedEcdsaPublicKey {
+fn derive_public_key_generic(curve: &BoxedCurve, d: &BoxedUint) -> BoxedEcdsaPublicKey {
     let c = curve.curve();
     let (x, y) = c
         .to_affine(&c.mul_generator(d))
@@ -530,7 +528,11 @@ fn derive_public_key_generic(curve: CurveId, d: &BoxedUint) -> BoxedEcdsaPublicK
     // The public key is public (its encoders scan it for its width).
     crate::ct::declassify_val(x.as_limbs());
     crate::ct::declassify_val(y.as_limbs());
-    BoxedEcdsaPublicKey { curve, x, y }
+    BoxedEcdsaPublicKey {
+        curve: curve.clone(),
+        x,
+        y,
+    }
 }
 
 impl BoxedEcdsaPublicKey {
@@ -542,18 +544,19 @@ impl BoxedEcdsaPublicKey {
     /// the compressed even-`Y` point `0x02 || X`.
     ///
     /// Rejects a bad length/tag, an out-of-range coordinate, an off-curve point,
-    /// or an abscissa with no square root.
-    pub fn from_sec1(curve: CurveId, bytes: &[u8]) -> Result<Self, Error> {
+    /// or an abscissa with no square root — and, on a custom curve with a
+    /// cofactor, a point outside the generator's subgroup.
+    pub fn from_sec1(curve: impl Into<BoxedCurve>, bytes: &[u8]) -> Result<Self, Error> {
+        let curve = curve.into();
         let flen = curve.field_len();
         let c = curve.curve();
-        match bytes.first().copied() {
+        let (x, y) = match bytes.first().copied() {
             Some(tag @ (0x02 | 0x03)) => {
                 if bytes.len() != 1 + flen {
                     return Err(Error::Malformed);
                 }
                 let x = BoxedUint::from_be_bytes(&bytes[1..]);
-                let (x, y) = c.decompress(&x, tag & 1 == 1).ok_or(Error::InvalidInput)?;
-                Ok(BoxedEcdsaPublicKey { curve, x, y })
+                c.decompress(&x, tag & 1 == 1).ok_or(Error::InvalidInput)?
             }
             Some(0x04) => {
                 if bytes.len() != 1 + 2 * flen {
@@ -564,10 +567,14 @@ impl BoxedEcdsaPublicKey {
                 if !c.in_field(&x) || !c.in_field(&y) || !c.is_on_curve(&x, &y) {
                     return Err(Error::InvalidInput);
                 }
-                Ok(BoxedEcdsaPublicKey { curve, x, y })
+                (x, y)
             }
-            _ => Err(Error::Malformed),
+            _ => return Err(Error::Malformed),
+        };
+        if !curve.accepts_point(&x, &y) {
+            return Err(Error::InvalidInput);
         }
+        Ok(BoxedEcdsaPublicKey { curve, x, y })
     }
 
     /// Adds two public keys as curve points: `Q = self + other`, returning the
@@ -600,7 +607,7 @@ impl BoxedEcdsaPublicKey {
         );
         let (x, y) = c.to_affine(&sum).ok_or(Error::InvalidInput)?;
         Ok(BoxedEcdsaPublicKey {
-            curve: self.curve,
+            curve: self.curve.clone(),
             x,
             y,
         })
@@ -616,9 +623,33 @@ impl BoxedEcdsaPublicKey {
         out
     }
 
-    /// The curve this key belongs to.
+    /// The named curve this key belongs to.
+    ///
+    /// # Panics
+    ///
+    /// If the key is on a custom curve ([`BoxedCurve::from_params`]); use
+    /// [`named_curve`](Self::named_curve) or [`boxed_curve`](Self::boxed_curve)
+    /// where that can happen.
+    #[cfg_attr(
+        not(feature = "ec-custom"),
+        doc = "",
+        doc = "[`BoxedCurve::from_params`]: BoxedCurve"
+    )]
+    #[track_caller]
     pub fn curve(&self) -> CurveId {
         self.curve
+            .id()
+            .expect("curve(): the key is on a custom curve; use boxed_curve()")
+    }
+
+    /// The named curve this key belongs to, or `None` for a custom curve.
+    pub fn named_curve(&self) -> Option<CurveId> {
+        self.curve.id()
+    }
+
+    /// The curve this key belongs to, named or custom.
+    pub fn boxed_curve(&self) -> &BoxedCurve {
+        &self.curve
     }
 
     /// Verifies `sig` over `msg`, hashing with `D`.
@@ -631,9 +662,9 @@ impl BoxedEcdsaPublicKey {
     /// `prehash` to the curve order's bit length. See
     /// [`BoxedEcdsaPrivateKey::sign_prehash`].
     pub fn verify_prehash(&self, prehash: &[u8], sig: &BoxedEcdsaSignature) -> Result<(), Error> {
-        let fast = match self.curve {
-            CurveId::P256 => fixed::p256_verify,
-            CurveId::Secp256k1 => fixed::k256_verify,
+        let fast = match self.curve.id() {
+            Some(CurveId::P256) => fixed::p256_verify,
+            Some(CurveId::Secp256k1) => fixed::k256_verify,
             _ => return self.verify_prehash_generic(prehash, sig),
         };
         let c = self.curve.curve();
@@ -680,7 +711,8 @@ impl BoxedEcdsaPublicKey {
 impl BoxedEcdsaPrivateKey {
     /// Creates a private key from a big-endian scalar on `curve`, checking it is
     /// in `[1, n-1]`.
-    pub fn from_bytes(curve: CurveId, bytes: &[u8]) -> Result<Self, Error> {
+    pub fn from_bytes(curve: impl Into<BoxedCurve>, bytes: &[u8]) -> Result<Self, Error> {
+        let curve = curve.into();
         let d = BoxedUint::from_be_bytes(bytes);
         let n = curve.curve().order();
         if in_range(&d, &n) {
@@ -692,22 +724,45 @@ impl BoxedEcdsaPrivateKey {
 
     /// Generates a new private key on `curve` from `rng`. The RNG must be a
     /// cryptographically secure CSPRNG (see [`CryptoRng`]).
-    pub fn generate<R: RngCore + CryptoRng>(curve: CurveId, rng: &mut R) -> Self {
+    pub fn generate<R: RngCore + CryptoRng>(curve: impl Into<BoxedCurve>, rng: &mut R) -> Self {
+        let curve = curve.into();
         let n = curve.curve().order();
-        BoxedEcdsaPrivateKey {
-            curve,
-            d: random_scalar(curve, &n, rng),
-        }
+        let d = random_scalar(&curve, &n, rng);
+        BoxedEcdsaPrivateKey { curve, d }
     }
 
-    /// The curve this key belongs to.
+    /// The named curve this key belongs to.
+    ///
+    /// # Panics
+    ///
+    /// If the key is on a custom curve ([`BoxedCurve::from_params`]); use
+    /// [`named_curve`](Self::named_curve) or [`boxed_curve`](Self::boxed_curve)
+    /// where that can happen.
+    #[cfg_attr(
+        not(feature = "ec-custom"),
+        doc = "",
+        doc = "[`BoxedCurve::from_params`]: BoxedCurve"
+    )]
+    #[track_caller]
     pub fn curve(&self) -> CurveId {
         self.curve
+            .id()
+            .expect("curve(): the key is on a custom curve; use boxed_curve()")
+    }
+
+    /// The named curve this key belongs to, or `None` for a custom curve.
+    pub fn named_curve(&self) -> Option<CurveId> {
+        self.curve.id()
+    }
+
+    /// The curve this key belongs to, named or custom.
+    pub fn boxed_curve(&self) -> &BoxedCurve {
+        &self.curve
     }
 
     /// Derives the public key `d * G`.
     pub fn public_key(&self) -> BoxedEcdsaPublicKey {
-        derive_public_key(self.curve, &self.d)
+        derive_public_key(&self.curve, &self.d)
     }
 
     /// Signs `msg`, hashing with `D` and deriving the nonce per RFC 6979.
@@ -776,7 +831,7 @@ impl BoxedEcdsaPrivateKey {
             k.zeroize();
             return Err(Error::InvalidInput);
         };
-        let r = reduce_once(&full_x, &n);
+        let r = self.curve.x_mod_n(&full_x, &n);
         // `r` is published in the signature; the degenerate `r = 0` is a
         // public error return.
         if r.ct_is_zero().declassify() {
@@ -841,6 +896,10 @@ impl BoxedEcdsaPrivateKey {
     /// secp256k1 (and never on a curve with `n > p`), so `recid` is almost
     /// always `0` or `1`. See [`BoxedEcdsaSignature::recover_prehash`] for the
     /// inverse operation.
+    ///
+    /// Returns [`Error::InvalidInput`] on a custom curve with a cofactor,
+    /// where `R.x` can exceed `r` by more than one multiple of `n` and the
+    /// two-bit recovery id cannot describe it.
     pub fn sign_prehash_recoverable<D: Digest>(
         &self,
         prehash: &[u8],
@@ -849,8 +908,11 @@ impl BoxedEcdsaPrivateKey {
             let (r, s, recid) = fixed::k256_sign_recoverable::<D>(&self.d, prehash)?;
             return Ok((BoxedEcdsaSignature { r, s }, recid));
         }
+        if !self.curve.cofactor_is_one() {
+            return Err(Error::InvalidInput);
+        }
         Ok(low_s_with_recid(
-            self.curve,
+            &self.curve,
             self.sign_prehash_inner::<D>(prehash)?,
         ))
     }
@@ -859,7 +921,7 @@ impl BoxedEcdsaPrivateKey {
 /// Turns raw `(r, s, x_overflow, y_is_odd)` into the low-S signature and its
 /// recovery id.
 fn low_s_with_recid(
-    curve: CurveId,
+    curve: &BoxedCurve,
     (r, s, x_overflow, y_is_odd): (BoxedUint, BoxedUint, bool, bool),
 ) -> (BoxedEcdsaSignature, u8) {
     // Normalize to low-S; negating s reflects R across the x-axis, flipping
@@ -905,20 +967,22 @@ impl BoxedEcdsaSignature {
     /// A component too wide for `curve` (only reachable by pairing a
     /// signature with a curve other than the one it was parsed/created for)
     /// widens the output rather than panicking.
-    pub fn r_bytes(&self, curve: CurveId) -> Vec<u8> {
-        self.r.to_be_bytes(enc_len(&self.r, curve.order_len()))
+    pub fn r_bytes(&self, curve: impl Into<BoxedCurve>) -> Vec<u8> {
+        self.r
+            .to_be_bytes(enc_len(&self.r, curve.into().order_len()))
     }
 
     /// The `s` component encoded big-endian, left-padded to
     /// `curve.order_len()` bytes. See [`Self::r_bytes`].
-    pub fn s_bytes(&self, curve: CurveId) -> Vec<u8> {
-        self.s.to_be_bytes(enc_len(&self.s, curve.order_len()))
+    pub fn s_bytes(&self, curve: impl Into<BoxedCurve>) -> Vec<u8> {
+        self.s
+            .to_be_bytes(enc_len(&self.s, curve.into().order_len()))
     }
 
     /// The fixed `r ‖ s` encoding, each half `curve.order_len()` bytes.
     /// See [`Self::r_bytes`] for the over-wide-component behaviour.
-    pub fn to_bytes(&self, curve: CurveId) -> Vec<u8> {
-        let len = curve.order_len();
+    pub fn to_bytes(&self, curve: impl Into<BoxedCurve>) -> Vec<u8> {
+        let len = curve.into().order_len();
         let mut out = self.r.to_be_bytes(enc_len(&self.r, len));
         out.extend_from_slice(&self.s.to_be_bytes(enc_len(&self.s, len)));
         out
@@ -931,9 +995,9 @@ impl BoxedEcdsaSignature {
     /// `(r, n − s)` also verifies, so callers needing bytewise unique
     /// signatures must require `is_low_s()`. Mirrors the const-generic
     /// helper in [`super::ecdsa::Signature::is_low_s`].
-    pub fn is_low_s(&self, curve: CurveId) -> bool {
+    pub fn is_low_s(&self, curve: impl Into<BoxedCurve>) -> bool {
         // half_n = (n + 1) / 2 — the smallest "high-S" boundary.
-        let n = curve.curve().order();
+        let n = curve.into().curve().order();
         let half_n = n.shr_bits(1).add(&BoxedUint::from_u64(1));
         self.s.lt(&half_n)
     }
@@ -942,8 +1006,9 @@ impl BoxedEcdsaSignature {
     /// `curve`: if `s` is already in the lower half, returns a clone;
     /// otherwise returns `(r, n − s)`, which is equally valid and bytewise
     /// unique. Mirrors [`super::ecdsa::Signature::to_low_s`].
-    pub fn to_low_s(&self, curve: CurveId) -> Self {
-        if self.is_low_s(curve) {
+    pub fn to_low_s(&self, curve: impl Into<BoxedCurve>) -> Self {
+        let curve = curve.into();
+        if self.is_low_s(&curve) {
             self.clone()
         } else {
             let n = curve.curve().order();
@@ -959,7 +1024,7 @@ impl BoxedEcdsaSignature {
     /// [`recover_prehash`](Self::recover_prehash).
     pub fn recover<D: Digest>(
         &self,
-        curve: CurveId,
+        curve: impl Into<BoxedCurve>,
         msg: &[u8],
         recid: u8,
     ) -> Result<BoxedEcdsaPublicKey, Error> {
@@ -978,7 +1043,9 @@ impl BoxedEcdsaSignature {
     ///
     /// Returns [`Error::Verification`] if `r`/`s` are out of range, if the
     /// recovery id does not yield a valid curve point, or if recovery produces
-    /// the identity. Returns [`Error::InvalidInput`] if `recid > 3`.
+    /// the identity. Returns [`Error::InvalidInput`] if `recid > 3`, or on a
+    /// custom curve with a cofactor (see
+    /// [`BoxedEcdsaPrivateKey::sign_prehash_recoverable`]).
     ///
     /// Recovery does **not** authenticate the message: any `(r, s, recid)`
     /// yields *some* key. To verify a signer, recover the key and then either
@@ -988,11 +1055,11 @@ impl BoxedEcdsaSignature {
     /// [`verify_prehash`]: BoxedEcdsaPublicKey::verify_prehash
     pub fn recover_prehash(
         &self,
-        curve: CurveId,
+        curve: impl Into<BoxedCurve>,
         prehash: &[u8],
         recid: u8,
     ) -> Result<BoxedEcdsaPublicKey, Error> {
-        self.recover_prehash_impl(curve, prehash, recid, true)
+        self.recover_prehash_impl(curve.into(), prehash, recid, true)
     }
 
     /// [`recover_prehash`](Self::recover_prehash), with `fast` choosing
@@ -1000,12 +1067,12 @@ impl BoxedEcdsaSignature {
     /// tests' generic oracle).
     fn recover_prehash_impl(
         &self,
-        curve: CurveId,
+        curve: BoxedCurve,
         prehash: &[u8],
         recid: u8,
         fast: bool,
     ) -> Result<BoxedEcdsaPublicKey, Error> {
-        if recid > 3 {
+        if recid > 3 || !curve.cofactor_is_one() {
             return Err(Error::InvalidInput);
         }
         let c = curve.curve();
@@ -1070,9 +1137,9 @@ impl Drop for BoxedEcdhPrivateKey {
 #[cfg(feature = "der")]
 impl BoxedEcdsaSignature {
     /// Encodes the signature as a DER `Ecdsa-Sig-Value`.
-    pub fn to_der(&self, curve: CurveId) -> Vec<u8> {
+    pub fn to_der(&self, curve: impl Into<BoxedCurve>) -> Vec<u8> {
         use crate::der::{encode_integer, encode_sequence};
-        let len = curve.order_len();
+        let len = curve.into().order_len();
         encode_sequence(
             &[
                 encode_integer(&self.r.to_be_bytes(enc_len(&self.r, len))),
@@ -1102,8 +1169,8 @@ impl BoxedEcdsaSignature {
     /// `s` by `curve`'s group-order width, so every fixed-width re-encoding
     /// (`r_bytes`, `s_bytes`, `to_bytes`, `to_der`) for that curve is exact.
     /// Prefer this when the curve is known at parse time.
-    pub fn from_der_for_curve(der: &[u8], curve: CurveId) -> Result<Self, Error> {
-        Self::from_der_bounded(der, curve.order_len())
+    pub fn from_der_for_curve(der: &[u8], curve: impl Into<BoxedCurve>) -> Result<Self, Error> {
+        Self::from_der_bounded(der, curve.into().order_len())
     }
 
     fn from_der_bounded(der: &[u8], max_len: usize) -> Result<Self, Error> {
@@ -1157,7 +1224,7 @@ fn check_embedded_public_key(
     let mut pr = Reader::new(field);
     let bits = pr.read_bit_string().map_err(|_| Error::Malformed)?;
     pr.finish().map_err(|_| Error::Malformed)?;
-    let embedded = BoxedEcdsaPublicKey::from_sec1(key.curve, bits)?;
+    let embedded = BoxedEcdsaPublicKey::from_sec1(&key.curve, bits)?;
     // Compare the canonical uncompressed encodings, so a compressed embedded
     // key matches the derived one.
     if embedded.to_sec1() != key.public_key().to_sec1() {
@@ -1170,17 +1237,17 @@ fn check_embedded_public_key(
 /// EC keys.
 #[cfg(feature = "der")]
 impl BoxedEcdsaPrivateKey {
-    /// Encodes the key as a SEC1 `ECPrivateKey` DER structure (with the named
-    /// curve and public key included).
+    /// Encodes the key as a SEC1 `ECPrivateKey` DER structure (with the curve
+    /// parameters — the named-curve OID, or a custom curve's explicit
+    /// `specifiedCurve` — and the public key included).
     pub fn to_sec1_der(&self) -> Vec<u8> {
         use crate::der::{
-            encode_bit_string, encode_context, encode_integer, encode_octet_string,
-            encode_sequence, oid_tlv,
+            encode_bit_string, encode_context, encode_integer, encode_octet_string, encode_sequence,
         };
         let order_len = self.curve.order_len();
         let priv_oct = encode_octet_string(&self.d.to_be_bytes(order_len));
-        // parameters [0] EXPLICIT namedCurve OID.
-        let params = encode_context(0, &oid_tlv(self.curve.named_curve_oid()));
+        // parameters [0] EXPLICIT ECParameters.
+        let params = encode_context(0, &self.curve.to_der());
         // publicKey [1] EXPLICIT BIT STRING (uncompressed SEC1 point).
         let pubkey = encode_context(1, &encode_bit_string(&self.public_key().to_sec1()));
         encode_sequence(&[encode_integer(&[1]), priv_oct, params, pubkey].concat())
@@ -1191,14 +1258,14 @@ impl BoxedEcdsaPrivateKey {
         crate::der::pem_encode("EC PRIVATE KEY", &self.to_sec1_der())
     }
 
-    /// Parses a SEC1 `ECPrivateKey` DER structure (the named curve must be one
-    /// of the supported curves).
+    /// Parses a SEC1 `ECPrivateKey` DER structure. The parameters are a
+    /// supported named curve, or explicit ones (see [`BoxedCurve::from_der`]).
     ///
     /// The OPTIONAL `[1]` publicKey is checked against the private scalar when
     /// present (a key that disagrees with itself is rejected), and trailing
     /// data after the structure is rejected.
     pub fn from_sec1_der(der: &[u8]) -> Result<Self, Error> {
-        use crate::der::{Reader, parse_oid, tag};
+        use crate::der::{Reader, tag};
         let mut outer = Reader::new(der);
         let mut seq = outer.read_sequence().map_err(|_| Error::Malformed)?;
         seq.read_integer_bytes().map_err(|_| Error::Malformed)?; // version
@@ -1209,11 +1276,7 @@ impl BoxedEcdsaPrivateKey {
         let params = seq
             .read_tlv(tag::context(0))
             .map_err(|_| Error::Malformed)?;
-        let mut pr = Reader::new(params);
-        let arcs = parse_oid(pr.read_oid().map_err(|_| Error::Malformed)?)
-            .map_err(|_| Error::Malformed)?;
-        pr.finish().map_err(|_| Error::Malformed)?;
-        let curve = CurveId::from_named_curve_oid(&arcs).ok_or(Error::Malformed)?;
+        let curve = BoxedCurve::from_der(params)?;
         let key = Self::from_bytes(curve, priv_bytes)?;
         check_embedded_public_key(&mut seq, &key)?;
         seq.finish().map_err(|_| Error::Malformed)?;
@@ -1228,17 +1291,11 @@ impl BoxedEcdsaPrivateKey {
     }
 
     /// Encodes the key as an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 5958):
-    /// `id-ecPublicKey` + the named-curve parameter, wrapping the SEC1
+    /// `id-ecPublicKey` + the curve parameters, wrapping the SEC1
     /// `ECPrivateKey` ([`Self::to_sec1_der`]) in the `privateKey` OCTET STRING.
     pub fn to_pkcs8_der(&self) -> Vec<u8> {
         use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
-        let algid = encode_sequence(
-            &[
-                oid_tlv(EC_PUBLIC_KEY_OID),
-                oid_tlv(self.curve.named_curve_oid()),
-            ]
-            .concat(),
-        );
+        let algid = encode_sequence(&[oid_tlv(EC_PUBLIC_KEY_OID), self.curve.to_der()].concat());
         let inner = encode_octet_string(&self.to_sec1_der());
         encode_sequence(&[encode_integer(&[0]), algid, inner].concat())
     }
@@ -1251,7 +1308,8 @@ impl BoxedEcdsaPrivateKey {
 
     /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 5958) wrapping a SEC1
     /// EC private key. The curve is taken from the `privateKeyAlgorithm`
-    /// named-curve parameter.
+    /// parameters (a named curve, or explicit ones — see
+    /// [`BoxedCurve::from_der`]).
     ///
     /// The inner SEC1 structure's OPTIONAL fields are no longer skipped
     /// blindly: a `[0]` namedCurve must name the same curve as the PKCS#8
@@ -1270,9 +1328,7 @@ impl BoxedEcdsaPrivateKey {
         if alg.as_slice() != EC_PUBLIC_KEY_OID {
             return Err(Error::Malformed);
         }
-        let curve_arcs = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
-            .map_err(|_| Error::Malformed)?;
-        let curve = CurveId::from_named_curve_oid(&curve_arcs).ok_or(Error::Malformed)?;
+        let curve = BoxedCurve::from_der(algid.read_element().map_err(|_| Error::Malformed)?)?;
         algid.finish().map_err(|_| Error::Malformed)?;
         let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
         // inner = SEC1 ECPrivateKey { version, privateKey OCTET STRING,
@@ -1289,11 +1345,7 @@ impl BoxedEcdsaPrivateKey {
             let params = iseq
                 .read_tlv(tag::context(0))
                 .map_err(|_| Error::Malformed)?;
-            let mut pr = Reader::new(params);
-            let arcs = parse_oid(pr.read_oid().map_err(|_| Error::Malformed)?)
-                .map_err(|_| Error::Malformed)?;
-            pr.finish().map_err(|_| Error::Malformed)?;
-            if CurveId::from_named_curve_oid(&arcs) != Some(curve) {
+            if BoxedCurve::from_der(params)? != curve {
                 return Err(Error::Malformed);
             }
         }
@@ -1367,7 +1419,7 @@ impl BoxedEcdsaPrivateKey {
 impl From<BoxedEcdsaPrivateKey> for BoxedEcdhPrivateKey {
     fn from(key: BoxedEcdsaPrivateKey) -> Self {
         BoxedEcdhPrivateKey {
-            curve: key.curve,
+            curve: key.curve.clone(),
             d: key.d.clone(),
         }
     }
@@ -1381,16 +1433,16 @@ impl BoxedEcdhPrivateKey {
     /// layers can thread a single shared RNG type through ephemeral
     /// key-share generation; production callers should pass `OsRng` or an
     /// HMAC-DRBG seeded from one.
-    pub fn generate<R: RngCore>(curve: CurveId, rng: &mut R) -> Self {
+    pub fn generate<R: RngCore>(curve: impl Into<BoxedCurve>, rng: &mut R) -> Self {
+        let curve = curve.into();
         let n = curve.curve().order();
-        BoxedEcdhPrivateKey {
-            curve,
-            d: random_scalar(curve, &n, rng),
-        }
+        let d = random_scalar(&curve, &n, rng);
+        BoxedEcdhPrivateKey { curve, d }
     }
 
     /// Creates an ECDH private key from a big-endian scalar on `curve`.
-    pub fn from_bytes(curve: CurveId, bytes: &[u8]) -> Result<Self, Error> {
+    pub fn from_bytes(curve: impl Into<BoxedCurve>, bytes: &[u8]) -> Result<Self, Error> {
+        let curve = curve.into();
         let d = BoxedUint::from_be_bytes(bytes);
         let n = curve.curve().order();
         if in_range(&d, &n) {
@@ -1418,14 +1470,38 @@ impl BoxedEcdhPrivateKey {
         BoxedEcdsaPrivateKey::from_pkcs8_pem(pem).map(Self::from)
     }
 
-    /// The curve this key lives on.
+    /// The named curve this key lives on.
+    ///
+    /// # Panics
+    ///
+    /// If the key is on a custom curve ([`BoxedCurve::from_params`]); use
+    /// [`named_curve`](Self::named_curve) or [`boxed_curve`](Self::boxed_curve)
+    /// where that can happen.
+    #[cfg_attr(
+        not(feature = "ec-custom"),
+        doc = "",
+        doc = "[`BoxedCurve::from_params`]: BoxedCurve"
+    )]
+    #[track_caller]
     pub fn curve(&self) -> CurveId {
         self.curve
+            .id()
+            .expect("curve(): the key is on a custom curve; use boxed_curve()")
+    }
+
+    /// The named curve this key lives on, or `None` for a custom curve.
+    pub fn named_curve(&self) -> Option<CurveId> {
+        self.curve.id()
+    }
+
+    /// The curve this key lives on, named or custom.
+    pub fn boxed_curve(&self) -> &BoxedCurve {
+        &self.curve
     }
 
     /// The public key `d * G` to send to the peer.
     pub fn public_key(&self) -> BoxedEcdsaPublicKey {
-        derive_public_key(self.curve, &self.d)
+        derive_public_key(&self.curve, &self.d)
     }
 
     /// The ECDH shared secret with `peer`: the affine x-coordinate of
@@ -1434,9 +1510,9 @@ impl BoxedEcdhPrivateKey {
         if peer.curve != self.curve {
             return Err(Error::InvalidInput);
         }
-        match self.curve {
-            CurveId::P256 => fixed::p256_diffie_hellman(&self.d, &peer.x, &peer.y),
-            CurveId::Secp256k1 => fixed::k256_diffie_hellman(&self.d, &peer.x, &peer.y),
+        match self.curve.id() {
+            Some(CurveId::P256) => fixed::p256_diffie_hellman(&self.d, &peer.x, &peer.y),
+            Some(CurveId::Secp256k1) => fixed::k256_diffie_hellman(&self.d, &peer.x, &peer.y),
             _ => self.diffie_hellman_generic(peer),
         }
     }
@@ -2544,7 +2620,7 @@ x2dqVh/sT12MnE=\n\
             for d in &scalars {
                 let sk = BoxedEcdsaPrivateKey::from_bytes(curve, &d.to_be_bytes(32)).unwrap();
                 let pk = sk.public_key();
-                let pk_generic = derive_public_key_generic(curve, &sk.d);
+                let pk_generic = derive_public_key_generic(&curve.into(), &sk.d);
                 assert_eq!(pk.to_sec1(), pk_generic.to_sec1(), "{curve:?} public key");
 
                 let dh = BoxedEcdhPrivateKey::from(sk.clone());
@@ -2569,7 +2645,7 @@ x2dqVh/sT12MnE=\n\
                     assert_eq!(sig512, raw512, "{curve:?} sign/SHA-512 len {len}");
                     // Low-S + recovery id.
                     let rec = sk.sign_prehash_recoverable::<Sha256>(&h).unwrap();
-                    let rec_generic = low_s_with_recid(curve, raw.unwrap());
+                    let rec_generic = low_s_with_recid(&curve.into(), raw.unwrap());
                     assert_eq!(rec, rec_generic, "{curve:?} recoverable len {len}");
 
                     // Verification verdicts.
@@ -2606,8 +2682,8 @@ x2dqVh/sT12MnE=\n\
                     // Recovery, every recid, on the signature and a malleated one.
                     for cand in [&rec.0, &neg_s] {
                         for recid in 0..5u8 {
-                            let fast = cand.recover_prehash_impl(curve, &h, recid, true);
-                            let slow = cand.recover_prehash_impl(curve, &h, recid, false);
+                            let fast = cand.recover_prehash_impl(curve.into(), &h, recid, true);
+                            let slow = cand.recover_prehash_impl(curve.into(), &h, recid, false);
                             assert_eq!(
                                 fast.map(|k| k.to_sec1()),
                                 slow.map(|k| k.to_sec1()),
@@ -2623,8 +2699,8 @@ x2dqVh/sT12MnE=\n\
                 let s = BoxedUint::from_be_bytes(&rand_bytes(&mut st, 32)).reduce(&n);
                 let sig = BoxedEcdsaSignature::from_components(BoxedUint::from_u64(r), s);
                 for recid in 0..4u8 {
-                    let fast = sig.recover_prehash_impl(curve, b"h", recid, true);
-                    let slow = sig.recover_prehash_impl(curve, b"h", recid, false);
+                    let fast = sig.recover_prehash_impl(curve.into(), b"h", recid, true);
+                    let slow = sig.recover_prehash_impl(curve.into(), b"h", recid, false);
                     assert_eq!(
                         fast.map(|k| k.to_sec1()),
                         slow.map(|k| k.to_sec1()),

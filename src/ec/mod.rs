@@ -48,11 +48,23 @@
 //! [`CurveId`] variants, and ECDH on the binary-field curves sect283/409/571
 //! k1/r1 in [`binary`]. They exist for interop with old certificates and
 //! test corpora; never pick them for new designs.
+//!
+//! # With `ec-custom`
+//!
+//! The opt-in `ec-custom` feature adds `BoxedCurve::from_params`: any
+//! prime-field short-Weierstrass curve up to 576 bits, cofactor included,
+//! validated per SEC 1 and run on the same constant-time engine as the
+//! named curves (built at run time). [`BoxedCurve`] is what every boxed key
+//! holds and every boxed constructor accepts (`impl Into<BoxedCurve>`, so a
+//! [`CurveId`] still works), and SEC1 / PKCS#8 private keys with explicit
+//! `specifiedCurve` parameters load through it. Explicit parameters that
+//! match a named curve map to its [`CurveId`] even without the feature.
 #![cfg_attr(
     not(feature = "alloc"),
     doc = "",
     doc = "[`boxed`]: crate::ec#without-alloc",
     doc = "[`CurveId`]: crate::ec#without-alloc",
+    doc = "[`BoxedCurve`]: crate::ec#without-alloc",
     doc = "[`sm2`]: crate::ec#without-alloc"
 )]
 #![cfg_attr(
@@ -65,6 +77,8 @@
 pub mod binary;
 #[cfg(feature = "alloc")]
 pub mod boxed;
+#[cfg(feature = "alloc")]
+mod boxed_curve;
 mod curve25519;
 mod curve448;
 #[cfg(feature = "alloc")]
@@ -104,6 +118,8 @@ pub mod x448;
 pub use boxed::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature,
 };
+#[cfg(feature = "alloc")]
+pub use boxed_curve::BoxedCurve;
 #[cfg(feature = "alloc")]
 pub use curves::CurveId;
 pub use ed448::{Ed448PrivateKey, Ed448PublicKey, Ed448Signature};

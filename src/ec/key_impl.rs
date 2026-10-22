@@ -414,6 +414,7 @@ impl PublicKey for Sm2PublicKey {
 use super::boxed::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature,
 };
+use super::boxed_curve::BoxedCurve;
 use super::curves::CurveId;
 use crate::bignum::BoxedUint;
 
@@ -448,6 +449,25 @@ fn curve_alg(curve: CurveId) -> Algorithm {
     }
 }
 
+/// The [`Algorithm`] of a boxed key's curve, named or custom.
+fn boxed_curve_alg(curve: &BoxedCurve) -> Algorithm {
+    match curve.id() {
+        Some(id) => curve_alg(id),
+        #[cfg(feature = "ec-custom")]
+        None => Algorithm::EcCustom,
+        #[cfg(not(feature = "ec-custom"))]
+        None => unreachable!("custom curves need the ec-custom feature"),
+    }
+}
+
+/// [`ecdsa_alg`] for a boxed key's curve: every custom curve is supported.
+fn boxed_ecdsa_alg(curve: &BoxedCurve) -> Option<Algorithm> {
+    match curve.id() {
+        Some(id) => ecdsa_alg(id),
+        None => Some(boxed_curve_alg(curve)),
+    }
+}
+
 /// The curves whose boxed ECDSA / ECDH operations are supported here.
 fn ecdsa_alg(curve: CurveId) -> Option<Algorithm> {
     match curve {
@@ -474,7 +494,7 @@ fn ecdsa_alg(curve: CurveId) -> Option<Algorithm> {
 
 impl PrivateKey for BoxedEcdsaPrivateKey {
     fn algorithm(&self) -> Algorithm {
-        curve_alg(self.curve())
+        boxed_curve_alg(self.boxed_curve())
     }
     fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
         Ok(Box::new(self.public_key()))
@@ -485,8 +505,8 @@ impl PrivateKey for BoxedEcdsaPrivateKey {
         params: &SignParams<'_>,
         _rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        let curve = self.curve();
-        ecdsa_alg(curve).ok_or(Error::InvalidParams)?;
+        let curve = self.boxed_curve();
+        boxed_ecdsa_alg(curve).ok_or(Error::InvalidParams)?;
         let mut p = params.reader();
         let hash = p.hash();
         let prehashed = p.prehashed();
@@ -509,14 +529,14 @@ impl PrivateKey for BoxedEcdsaPrivateKey {
 
 impl PublicKey for BoxedEcdsaPublicKey {
     fn algorithm(&self) -> Algorithm {
-        curve_alg(self.curve())
+        boxed_curve_alg(self.boxed_curve())
     }
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        let curve = self.curve();
-        ecdsa_alg(curve).ok_or(Error::InvalidParams)?;
+        let curve = self.boxed_curve();
+        boxed_ecdsa_alg(curve).ok_or(Error::InvalidParams)?;
         let mut p = params.reader();
         let hash = p.hash();
         let prehashed = p.prehashed();
@@ -549,13 +569,13 @@ impl PublicKey for BoxedEcdsaPublicKey {
 
 impl PrivateKey for BoxedEcdhPrivateKey {
     fn algorithm(&self) -> Algorithm {
-        curve_alg(self.curve())
+        boxed_curve_alg(self.boxed_curve())
     }
     fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
         Ok(Box::new(self.public_key()))
     }
     fn agree(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        let alg = ecdsa_alg(self.curve()).ok_or(Error::InvalidParams)?;
+        let alg = boxed_ecdsa_alg(self.boxed_curve()).ok_or(Error::InvalidParams)?;
         let peer = downcast_peer::<BoxedEcdsaPublicKey>(peer, alg)?;
         let shared = self.diffie_hellman(peer).map_err(|_| Error::KeyAgreement)?;
         Ok(Secret::from_bytes(shared))

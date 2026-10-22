@@ -356,10 +356,26 @@ const MAX_NAF: usize = 64 * MAX_LIMBS + 1;
 /// The field multiplication of curve `C`, with its modulus as immediates:
 /// the one piece of the engine instantiated per curve (reached through the
 /// function pointer in [`Engine`], so every curve of one width shares the
-/// formulas, ladders and inversions).
-fn field_mul<C: CurveParams<L>, const L: usize>(a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
+/// formulas, ladders and inversions). The engine argument is unused here;
+/// it is what lets a runtime-built curve read its modulus from memory
+/// through the same pointer type.
+fn field_mul<C: CurveParams<L>, const L: usize>(
+    _: &Engine<L>,
+    a: &Uint<L>,
+    b: &Uint<L>,
+) -> Uint<L> {
     mont_mul(a, b, &C::P, C::P_INV)
 }
+
+/// The field multiplication of a curve built at run time
+/// ([`Engine::from_params`]): the modulus comes from the engine.
+#[cfg(feature = "ec-custom")]
+fn field_mul_runtime<const L: usize>(e: &Engine<L>, a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
+    mont_mul(a, b, &e.p, e.p_inv)
+}
+
+/// A field multiplication of an [`Engine`].
+type MulFn<const L: usize> = fn(&Engine<L>, &Uint<L>, &Uint<L>) -> Uint<L>;
 
 /// A complete point addition formula of an [`Engine`].
 type AddFn<const L: usize> = fn(&Engine<L>, &Point<L>, &Point<L>) -> Point<L>;
@@ -374,6 +390,10 @@ type DblFn<const L: usize> = fn(&Engine<L>, &Point<L>) -> Point<L>;
 /// megabyte of text across the seventeen curves.
 pub(crate) struct Engine<const L: usize> {
     p: Uint<L>,
+    /// `−p⁻¹ mod 2⁶⁴` (read only by a runtime curve's multiply; a static
+    /// curve's kernel has it as an immediate).
+    #[cfg_attr(not(feature = "ec-custom"), allow(dead_code))]
+    p_inv: Limb,
     n: Uint<L>,
     /// `−n⁻¹ mod 2⁶⁴`.
     n_inv: Limb,
@@ -397,7 +417,7 @@ pub(crate) struct Engine<const L: usize> {
     p_bits: usize,
     n_bits: usize,
     /// [`field_mul`] for this curve.
-    mul: fn(&Uint<L>, &Uint<L>) -> Uint<L>,
+    mul: MulFn<L>,
     /// The complete addition and doubling formulas the curve's `a` admits
     /// (RCB Algorithms 4/6, 7/9 or 1/3), chosen at compile time; a variant
     /// no curve of this width uses is never instantiated.
@@ -415,6 +435,7 @@ impl<const L: usize> Engine<L> {
         };
         Engine {
             p: C::P,
+            p_inv: C::P_INV,
             n: C::N,
             n_inv: C::N_INV,
             one_mont: C::ONE_MONT,
@@ -441,11 +462,60 @@ impl<const L: usize> Engine<L> {
         }
     }
 
+    /// The engine of a curve whose parameters are known only at run time
+    /// (validated by the caller: `p` an odd prime, `a, b, gx, gy < p`,
+    /// `n` an odd prime, all within `L` limbs). The constants
+    /// [`CurveParams`] derives at compile time are derived here from the
+    /// same `const fn`s. Always the general RCB formulas (Algorithms 1 / 3):
+    /// they are correct for every `a`, and keep a runtime curve from
+    /// instantiating the specialised ones at widths no named curve uses.
+    #[cfg(feature = "ec-custom")]
+    pub(crate) fn from_params(
+        p: Uint<L>,
+        a: Uint<L>,
+        b: Uint<L>,
+        gx: Uint<L>,
+        gy: Uint<L>,
+        n: Uint<L>,
+    ) -> Self {
+        let fp = MontModulus::new(p);
+        let fq = MontModulus::new(n);
+        let one_mont = fp.to_mont(&Uint::ONE);
+        let one_mont_n = fq.to_mont(&Uint::ONE);
+        Engine {
+            p,
+            p_inv: neg_inv_mod_2_64(p.as_limbs()[0]),
+            n,
+            n_inv: neg_inv_mod_2_64(n.as_limbs()[0]),
+            one_mont,
+            r2_p: fp.to_mont(&one_mont),
+            one_mont_n,
+            r2_n: fq.to_mont(&one_mont_n),
+            a,
+            b,
+            gx,
+            gy,
+            a_mont: fp.to_mont(&a),
+            b_mont: fp.to_mont(&b),
+            b3_mont: fp.to_mont(&fp.add_mod(&fp.add_mod(&b, &b), &b)),
+            #[cfg(test)]
+            a_kind: ACoeff::General,
+            p_minus_2: p.wrapping_sub(&Uint::from_u64(2)),
+            n_minus_2: n.wrapping_sub(&Uint::from_u64(2)),
+            sqrt_exp: p.adc(&Uint::ONE, 0).0.shr1().shr1(),
+            p_bits: bit_len(&p),
+            n_bits: bit_len(&n),
+            mul: field_mul_runtime::<L>,
+            add_fn: Self::add_general,
+            dbl_fn: Self::double_general,
+        }
+    }
+
     // --- field arithmetic (Montgomery form) ---------------------------------
 
     #[inline(always)]
     pub(crate) fn mul(&self, a: &Uint<L>, b: &Uint<L>) -> Uint<L> {
-        (self.mul)(a, b)
+        (self.mul)(self, a, b)
     }
 
     #[inline(always)]
@@ -1007,21 +1077,44 @@ impl<const L: usize> Engine<L> {
 
     /// **VARIABLE-TIME** test that `point`'s affine x-coordinate is
     /// congruent to `v` modulo the group order (`v < n`), without the field
-    /// inversion of [`Self::to_affine`]: `x = X/Z ≡ v (mod n)` with
-    /// `x < p < 2n` (cofactor 1, so Hasse gives `n > p/2`) means
-    /// `x ∈ {v, v + n}`, and each candidate `c < p` is checked as
-    /// `c·Z == X`. The identity never matches. Public inputs only (the
-    /// ECDSA / SM2 verification equations).
+    /// inversion of [`Self::to_affine`]: `x = X/Z ≡ v (mod n)` with `x < p`
+    /// means `x ∈ {v, v + n, v + 2n, …}`, and each candidate `c < p` is
+    /// checked as `c·Z == X`. With cofactor 1 (every named curve) Hasse
+    /// gives `n > p/2`, so there are at most two candidates; a cofactor-`h`
+    /// curve has about `h + 1`. The identity never matches. Public inputs
+    /// only (the ECDSA / SM2 verification equations).
     pub(crate) fn affine_x_eq_mod_n(&self, point: &Point<L>, v: &Uint<L>) -> bool {
         if bool::from(point.z.is_zero()) {
             return false;
         }
         let check = |c: &Uint<L>| bool::from(self.mul(&self.to_mont(c), &point.z).ct_eq(&point.x));
-        if bool::from(ct_lt(v, &self.p)) && check(v) {
-            return true;
+        let mut c = *v;
+        while bool::from(ct_lt(&c, &self.p)) {
+            if check(&c) {
+                return true;
+            }
+            let (next, carry) = c.adc(&self.n, 0);
+            if carry != 0 {
+                return false;
+            }
+            c = next;
         }
-        let (v_n, carry) = v.adc(&self.n, 0);
-        carry == 0 && bool::from(ct_lt(&v_n, &self.p)) && check(&v_n)
+        false
+    }
+
+    /// **VARIABLE-TIME** test that the affine point `(x, y)` (on the curve)
+    /// lies in the order-`n` subgroup: `[n]P` is the identity. The
+    /// complete formulas are complete on that subgroup but not on a curve
+    /// with 2-torsion, where an addition whose operands differ by a point
+    /// of order 2 yields the all-zero `(0 : 0 : 0)` instead; every later
+    /// formula maps it to itself (each output coordinate is a product of
+    /// coordinates of both inputs). So the result is the true identity
+    /// `(0 : Y : 0)`, `Y ≠ 0`, exactly when no exceptional case arose and
+    /// `[n]P = O`. Public inputs only (key import on a cofactor curve).
+    #[cfg(feature = "ec-custom")]
+    pub(crate) fn in_subgroup(&self, x: &Uint<L>, y: &Uint<L>) -> bool {
+        let q = self.scalar_mul(&self.n, &self.lift_affine(x, y));
+        bool::from(q.z.is_zero()) && !bool::from(q.y.is_zero())
     }
 
     /// Whether affine `(x, y)` (plain residues `< p`) satisfies
@@ -1233,7 +1326,6 @@ pub(crate) trait Curve: Sync {
     /// The group order `n`.
     fn order(&self) -> BoxedUint;
     /// The field modulus `p`.
-    #[cfg(test)]
     fn field_modulus(&self) -> BoxedUint;
     /// The curve coefficients `(a, b)`. Used by SM2's `ZA` computation,
     /// which hashes the 32-byte big-endian `a`/`b`.
@@ -1278,6 +1370,10 @@ pub(crate) trait Curve: Sync {
     fn affine_x_eq_mod_n(&self, point: &AnyPoint, v: &BoxedUint) -> bool;
     /// Whether affine `(x, y)` (each `< p`) lies on the curve.
     fn is_on_curve(&self, x: &BoxedUint, y: &BoxedUint) -> bool;
+    /// **VARIABLE-TIME** whether the on-curve affine `(x, y)` lies in the
+    /// order-`n` subgroup (see [`Engine::in_subgroup`]). Public inputs only.
+    #[cfg(feature = "ec-custom")]
+    fn in_subgroup(&self, x: &BoxedUint, y: &BoxedUint) -> bool;
     /// Whether `v < p` (`v` public).
     fn in_field(&self, v: &BoxedUint) -> bool;
 
@@ -1305,7 +1401,6 @@ impl<const L: usize> Curve for Engine<L> {
         widen(&self.n)
     }
 
-    #[cfg(test)]
     fn field_modulus(&self) -> BoxedUint {
         widen(&self.p)
     }
@@ -1440,6 +1535,11 @@ impl<const L: usize> Curve for Engine<L> {
             (Some(x), Some(y)) => Engine::is_on_curve(self, &x, &y),
             _ => false,
         }
+    }
+
+    #[cfg(feature = "ec-custom")]
+    fn in_subgroup(&self, x: &BoxedUint, y: &BoxedUint) -> bool {
+        Engine::in_subgroup(self, &narrow(x), &narrow(y))
     }
 
     fn in_field(&self, v: &BoxedUint) -> bool {
