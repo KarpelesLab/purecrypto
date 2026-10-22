@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(rsa)* `BoxedRsaPrivateKey::raw_private` / `BoxedRsaPublicKey::raw_public`: the unpadded RSA primitives (`RSA_NO_PADDING`), on the same blinded, fault-checked CRT path as the padded schemes; input `≥ n` is rejected
 - *(rsa)* `BoxedRsaPrivateKey::from_crt_components`: checked constructor from `(n, e, d, p, q, dP, dQ, qInv)`, and the `crt_params` accessor for `(dP, dQ, qInv)`
 - *(rsa)* `BoxedRsaPrivateKey::try_generate`: fallible key generation for 256..=16384-bit moduli
+- *(dsa)* non-standard domain parameters (512..=10000-bit `p`, 160..=256-bit `q`, `p` Miller-Rabin-tested) via `DsaParams::new_nonstandard` and `*_nonstandard` DER/PEM/SPKI/PKCS#8 parsers; the strict FIPS 186-4 paths are unchanged
+- *(dsa)* `DsaParams::generate` parameter generation for standard and non-standard widths (e.g. 512/160, 768/160)
+- *(dsa)* run-time digest selection: `DsaPrivateKey::sign_with` / `sign_prehash_with` and `DsaPublicKey::verify_with` take a `HashAlgorithm` and match the generic RFC 6979 signatures
 
 ### Changed
 

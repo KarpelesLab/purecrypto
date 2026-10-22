@@ -26,6 +26,15 @@
 //! `y^q ≡ 1 (mod p)` this pins `g` and `y` to an order-`q` subgroup whether
 //! or not `p` is prime.
 //!
+//! Legacy and OpenSSL-generated keys also come in widths outside that set
+//! (512- and 768-bit `p` from FIPS 186-2-era tooling, `openssl genpkey
+//! -pkeyopt type:fips186_2` pairing a 512-bit `p` with a 224-bit `q`). The
+//! `*_nonstandard` constructors and parsers ([`DsaParams::new_nonstandard`],
+//! [`DsaPublicKey::from_spki_der_nonstandard`], …) accept any `p` of
+//! 512..=10000 bits and `q` of 160..=256 bits, and since such sets carry no
+//! FIPS pedigree they Miller-Rabin-test `p` as well. The strict parsers are
+//! unchanged, so a caller that never opts in never sees a 512-bit key.
+//!
 //! # Hashing
 //!
 //! Per FIPS 186-4 §4.6 the digest is truncated to its leftmost `min(N,
@@ -33,9 +42,20 @@
 //! to 224 bits on a 224-bit one. `sign::<D>` derives the nonce with RFC 6979
 //! (HMAC-DRBG keyed with `x` and the digest), so every signature is
 //! deterministic and the RFC 6979 A.2.1 / A.2.2 vectors are reproduced
-//! exactly. Parameter generation (FIPS 186-4 Appendix A) is not implemented:
-//! there is no new DSA deployment to generate parameters for, and every
-//! caller in practice receives `(p, q, g)` from a key file.
+//! exactly. When the digest is chosen at run time, [`DsaPrivateKey::sign_with`]
+//! / [`sign_prehash_with`](DsaPrivateKey::sign_prehash_with) and
+//! [`DsaPublicKey::verify_with`] take a [`HashAlgorithm`] instead and produce
+//! the same signatures as the generic forms for the same digest.
+//!
+//! # Parameter generation
+//!
+//! [`DsaParams::generate`] searches for fresh `(p, q, g)` the way FIPS 186-4
+//! A.1.1.2 / A.2.1 do, with the candidates drawn from a CSPRNG rather than
+//! derived from a hash of a `domain_parameter_seed` — so the result cannot be
+//! re-verified per A.1.1.3, which no consumer of DSA parameters (X.509, SSH,
+//! OpenSSL's `Dss-Parms`) records anyway. It covers the standard widths and
+//! the non-standard ones above; most callers should still take `(p, q, g)`
+//! from an existing key file.
 //!
 //! # Encodings
 //!
@@ -81,7 +101,7 @@ use crate::der::{
     Reader, encode_bit_string, encode_integer, encode_octet_string, encode_sequence, oid_tlv,
     parse_oid, tag,
 };
-use crate::hash::{Digest, Hmac};
+use crate::hash::{Digest, HashAlgorithm, Hmac};
 use crate::rng::{CryptoRng, RngCore};
 use crate::zeroize::Zeroize;
 use alloc::string::String;
@@ -96,9 +116,11 @@ const ID_DSA_OID: &[u64] = &[1, 2, 840, 10040, 4, 1];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// `(p, q, g)` failed validation: a width outside the FIPS 186-4 set, an
-    /// even `p` or `q`, `q ∤ p − 1`, `g ∉ (1, p)`, `g^q ≢ 1 (mod p)`, or a
-    /// composite `q`.
+    /// `(p, q, g)` failed validation: a width outside the FIPS 186-4 set (or
+    /// outside the non-standard bounds, for the `*_nonstandard` paths and
+    /// [`DsaParams::generate`]), an even `p` or `q`, `q ∤ p − 1`,
+    /// `g ∉ (1, p)`, `g^q ≢ 1 (mod p)`, a composite `q`, or (non-standard
+    /// paths only) a composite `p`.
     InvalidParameters,
     /// `y` was outside `(1, p)` or not in the order-`q` subgroup
     /// (`y^q ≢ 1 (mod p)`).
@@ -197,6 +219,17 @@ fn bits2int(data: &[u8], qbits: usize) -> BoxedUint {
     } else {
         v
     }
+}
+
+/// Which `(L, N)` widths a parameter-set constructor or parser admits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Widths {
+    /// The FIPS 186-4 §4.2 set, `p` not primality-tested
+    /// ([`DsaParams::new`]).
+    Fips186,
+    /// The non-standard bounds, `p` Miller-Rabin-tested
+    /// ([`DsaParams::new_nonstandard`]).
+    Nonstandard,
 }
 
 /// The RFC 6979 §3.2 HMAC-DRBG that produces DSA nonces.
@@ -300,6 +333,30 @@ impl DsaParams {
     /// same trade `dh::DhGroup::from_custom` makes.
     pub const Q_MR_ROUNDS: usize = 64;
 
+    /// The narrowest `p` the non-standard paths accept, in bits. 512 is the
+    /// FIPS 186-2 floor and the smallest `p` OpenSSL will generate (its
+    /// FIPS 186-2 parameter generator refuses anything shorter, and the 1.x
+    /// `DSA_generate_parameters_ex` rounds smaller requests up to it), so it
+    /// is the smallest DSA key a PHP / OpenSSL peer can have produced. Such
+    /// a `p` falls to a modest NFS computation; it is accepted for interop,
+    /// not for security.
+    pub const MIN_NONSTANDARD_P_BITS: usize = 512;
+    /// The widest `p` the non-standard paths accept, in bits: OpenSSL's
+    /// `OPENSSL_DSA_MAX_MODULUS_BITS`. A cap is needed because the parameter
+    /// set may be peer-supplied and every check on it is a full-width
+    /// exponentiation (see `dh::DhGroup::MAX_CUSTOM_GROUP_BITS`).
+    pub const MAX_NONSTANDARD_P_BITS: usize = 10000;
+    /// The narrowest `q` the non-standard paths accept, in bits: FIPS
+    /// 186-2's only width. OpenSSL's verifier refuses any `q` other than
+    /// 160, 224 or 256 bits, so nothing narrower interoperates, and the
+    /// subgroup's `2^(N/2)` Pollard-rho cost is already only 80 bits here.
+    pub const MIN_NONSTANDARD_Q_BITS: usize = 160;
+    /// The widest `q` the non-standard paths accept, in bits: the widest
+    /// FIPS 186-4 `N`, and the width [`DsaSignature::MAX_Q_LEN`] caps a
+    /// parsed signature component at. Any `N` in between (not only 160 / 224
+    /// / 256) is accepted.
+    pub const MAX_NONSTANDARD_Q_BITS: usize = 256;
+
     /// Builds and validates a parameter set. Checks, in order:
     /// * `p.bit_len() ∈ {1024, 2048, 3072}` and `q.bit_len() ∈ {160, 224,
     ///   256}` (any pairing);
@@ -310,11 +367,64 @@ impl DsaParams {
     ///
     /// `p` is **not** primality-tested; see the [module docs](self).
     pub fn new(p: BoxedUint, q: BoxedUint, g: BoxedUint) -> Result<Self, Error> {
+        Self::validate(p, q, g, Widths::Fips186)
+    }
+
+    /// Builds and validates a parameter set of any width OpenSSL accepts:
+    /// [`MIN_NONSTANDARD_P_BITS`](Self::MIN_NONSTANDARD_P_BITS)`..=`[`MAX_NONSTANDARD_P_BITS`](Self::MAX_NONSTANDARD_P_BITS)
+    /// for `p` and
+    /// [`MIN_NONSTANDARD_Q_BITS`](Self::MIN_NONSTANDARD_Q_BITS)`..=`[`MAX_NONSTANDARD_Q_BITS`](Self::MAX_NONSTANDARD_Q_BITS)
+    /// for `q`, standard widths included — for 512- / 768-bit legacy keys
+    /// and explicit domain parameters from PHP / OpenSSL.
+    ///
+    /// Runs every check [`new`](Self::new) does and, because a non-standard
+    /// set carries no FIPS pedigree, also Miller-Rabin-tests `p`
+    /// ([`p_mr_rounds`](Self::p_mr_rounds) rounds, bases derived from `p`).
+    /// The subgroup argument in the [module docs](self) does not need `p`
+    /// prime, but a caller importing arbitrary parameters should not be
+    /// handed a set whose "`Z_p^*`" is not a field. That makes this
+    /// constructor markedly slower than `new` for a large `p` (tens of
+    /// full-width exponentiations); validate a parameter set once and clone
+    /// it rather than re-parsing it per key.
+    pub fn new_nonstandard(p: BoxedUint, q: BoxedUint, g: BoxedUint) -> Result<Self, Error> {
+        Self::validate(p, q, g, Widths::Nonstandard)
+    }
+
+    /// Miller-Rabin rounds spent on a `bits`-bit `p` by
+    /// [`new_nonstandard`](Self::new_nonstandard) and
+    /// [`generate`](Self::generate): the FIPS 186-4 Table C.1 counts for DSA
+    /// `p` (40 up to 1024 bits, 56 up to 2048, 64 above), which bound the
+    /// error at the 2⁻⁸⁰ / 2⁻¹¹² / 2⁻¹²⁸ security level of the width.
+    pub fn p_mr_rounds(bits: usize) -> usize {
+        match bits {
+            0..=1024 => 40,
+            1025..=2048 => 56,
+            _ => 64,
+        }
+    }
+
+    /// Whether `(L, N)` lies inside the non-standard bounds.
+    fn nonstandard_widths(p_bits: usize, q_bits: usize) -> bool {
+        (Self::MIN_NONSTANDARD_P_BITS..=Self::MAX_NONSTANDARD_P_BITS).contains(&p_bits)
+            && (Self::MIN_NONSTANDARD_Q_BITS..=Self::MAX_NONSTANDARD_Q_BITS).contains(&q_bits)
+    }
+
+    /// The shared body of [`new`](Self::new) and
+    /// [`new_nonstandard`](Self::new_nonstandard).
+    fn validate(p: BoxedUint, q: BoxedUint, g: BoxedUint, widths: Widths) -> Result<Self, Error> {
         use crate::bignum::prime::is_prime_boxed;
         use crate::hash::Sha256;
         use crate::rng::HmacDrbg;
 
-        if !Self::P_BITS.contains(&p.bit_len()) || !Self::Q_BITS.contains(&q.bit_len()) {
+        // Width gates first — before any arithmetic on a possibly
+        // peer-chosen size.
+        let widths_ok = match widths {
+            Widths::Fips186 => {
+                Self::P_BITS.contains(&p.bit_len()) && Self::Q_BITS.contains(&q.bit_len())
+            }
+            Widths::Nonstandard => Self::nonstandard_widths(p.bit_len(), q.bit_len()),
+        };
+        if !widths_ok {
             return Err(Error::InvalidParameters);
         }
         if !p.is_odd() || !q.is_odd() {
@@ -341,6 +451,107 @@ impl DsaParams {
         if !is_prime_boxed(&q, &mut rng, Self::Q_MR_ROUNDS) {
             return Err(Error::InvalidParameters);
         }
+        if widths == Widths::Nonstandard {
+            // Same deterministic-bases trade as for `q`: a soundness check on
+            // an honest-but-wrong set, reproducible per `p`.
+            let mut rng = HmacDrbg::<Sha256>::new(
+                &p.to_be_bytes(p.bit_len().div_ceil(8)),
+                b"purecrypto-dsa-p-mr-bases",
+                &[],
+            );
+            if !is_prime_boxed(&p, &mut rng, Self::p_mr_rounds(p.bit_len())) {
+                return Err(Error::InvalidParameters);
+            }
+        }
+        let mont_q = BoxedMontModulus::new(&q);
+        Ok(DsaParams {
+            p,
+            q,
+            g,
+            mont_p,
+            mont_q,
+        })
+    }
+
+    /// Generates a fresh parameter set with an `p_bits`-bit `p` and a
+    /// `q_bits`-bit `q`, drawing every candidate from `rng` (a CSPRNG).
+    ///
+    /// Any `(L, N)` inside the non-standard bounds is accepted — the FIPS
+    /// pairs, and the 512 / 768-bit `p` PHP's `openssl_pkey_new` can still
+    /// ask for (pair those with `N = 160`, as FIPS 186-2 did). The search is
+    /// FIPS 186-4 A.1.1.2's, with RNG draws in place of the seed-derived
+    /// candidates (see the [module docs](self#parameter-generation)):
+    /// 1. a random `N`-bit `q` (top and low bits set) until one passes
+    ///    trial division and [`Q_MR_ROUNDS`](Self::Q_MR_ROUNDS) Miller-Rabin
+    ///    rounds;
+    /// 2. up to `4L` random `L`-bit `X`, each moved to
+    ///    `p = X − (X mod 2q) + 1 ≡ 1 (mod 2q)`, keeping the first `p` that
+    ///    is still `L` bits wide and passes
+    ///    [`p_mr_rounds(L)`](Self::p_mr_rounds) rounds; on exhaustion, back
+    ///    to step 1 with a fresh `q`;
+    /// 3. `g = h^((p − 1)/q) mod p` for `h = 2, 3, …` until `g ≠ 1`
+    ///    (A.2.1).
+    ///
+    /// [`Error::InvalidParameters`] for widths outside the bounds. Expect a
+    /// few hundred milliseconds for `L = 1024` and seconds for `L = 3072`
+    /// in an optimized build: almost all of it is the `p` search.
+    pub fn generate<R: RngCore + CryptoRng>(
+        p_bits: usize,
+        q_bits: usize,
+        rng: &mut R,
+    ) -> Result<Self, Error> {
+        use crate::bignum::prime::{TrialDivision, is_prime_boxed_with};
+
+        if !Self::nonstandard_widths(p_bits, q_bits) {
+            return Err(Error::InvalidParameters);
+        }
+        // Uniform over `[2^(bits−1), 2^bits)`, with the low bit forced on
+        // when `odd`. Parameters are public, so no wiping is needed.
+        fn draw<R: RngCore>(bits: usize, odd: bool, rng: &mut R) -> BoxedUint {
+            let mut buf = vec![0u8; bits.div_ceil(8)];
+            rng.fill_bytes(&mut buf);
+            let top = (bits - 1) % 8;
+            buf[0] &= ((1u16 << (top + 1)) - 1) as u8;
+            buf[0] |= 1 << top;
+            if odd {
+                *buf.last_mut().expect("bits > 0") |= 1;
+            }
+            BoxedUint::from_be_bytes(&buf)
+        }
+
+        let one = BoxedUint::from_u64(1);
+        // One sieve for the whole search (it is what the per-candidate trial
+        // division reads).
+        let td = TrialDivision::new();
+        let (p, q) = 'search: loop {
+            let q = draw(q_bits, true, rng);
+            if !is_prime_boxed_with(&q, rng, Self::Q_MR_ROUNDS, &td) {
+                continue;
+            }
+            let two_q = q.add(&q);
+            for _ in 0..4 * p_bits {
+                let x = draw(p_bits, false, rng);
+                // `x ≥ x mod 2q`, so the subtraction cannot wrap; `+ 1`
+                // after it keeps the `c = 0` case in range too.
+                let p = x.sub(&x.reduce(&two_q)).add(&one);
+                if p.bit_len() == p_bits
+                    && is_prime_boxed_with(&p, rng, Self::p_mr_rounds(p_bits), &td)
+                {
+                    break 'search (p, q);
+                }
+            }
+        };
+
+        let mont_p = BoxedMontModulus::new(&p);
+        let (e, _) = p.sub(&one).divrem(&q);
+        let mut h = BoxedUint::from_u64(2);
+        let g = loop {
+            let g = mont_p.pow_public(&h, &e);
+            if g != one {
+                break g;
+            }
+            h = h.add(&one);
+        };
         let mont_q = BoxedMontModulus::new(&q);
         Ok(DsaParams {
             p,
@@ -354,10 +565,21 @@ impl DsaParams {
     /// [`new`](Self::new) from big-endian byte strings (leading zeros are
     /// fine, so the DER-style `00`-prefixed forms work as-is).
     pub fn from_be_bytes(p: &[u8], q: &[u8], g: &[u8]) -> Result<Self, Error> {
-        Self::new(
+        Self::from_be_bytes_with(p, q, g, Widths::Fips186)
+    }
+
+    /// [`new_nonstandard`](Self::new_nonstandard) from big-endian byte
+    /// strings.
+    pub fn from_be_bytes_nonstandard(p: &[u8], q: &[u8], g: &[u8]) -> Result<Self, Error> {
+        Self::from_be_bytes_with(p, q, g, Widths::Nonstandard)
+    }
+
+    fn from_be_bytes_with(p: &[u8], q: &[u8], g: &[u8], widths: Widths) -> Result<Self, Error> {
+        Self::validate(
             BoxedUint::from_be_bytes(p),
             BoxedUint::from_be_bytes(q),
             BoxedUint::from_be_bytes(g),
+            widths,
         )
     }
 
@@ -412,14 +634,24 @@ impl DsaParams {
 
     /// Parses and validates a `Dss-Parms` sequence.
     pub fn from_der(der: &[u8]) -> Result<Self, Error> {
+        Self::from_der_with(der, Widths::Fips186)
+    }
+
+    /// [`from_der`](Self::from_der) under the
+    /// [`new_nonstandard`](Self::new_nonstandard) width rules.
+    pub fn from_der_nonstandard(der: &[u8]) -> Result<Self, Error> {
+        Self::from_der_with(der, Widths::Nonstandard)
+    }
+
+    fn from_der_with(der: &[u8], widths: Widths) -> Result<Self, Error> {
         let mut r = Reader::new(der);
-        let params = Self::read(&mut r)?;
+        let params = Self::read(&mut r, widths)?;
         r.finish().map_err(|_| Error::Malformed)?;
         Ok(params)
     }
 
     /// Reads one `Dss-Parms` sequence from `r`.
-    fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
+    fn read(r: &mut Reader<'_>, widths: Widths) -> Result<Self, Error> {
         let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
         let p = seq
             .read_unsigned_integer_bytes()
@@ -431,7 +663,7 @@ impl DsaParams {
             .read_unsigned_integer_bytes()
             .map_err(|_| Error::Malformed)?;
         seq.finish().map_err(|_| Error::Malformed)?;
-        Self::from_be_bytes(p, q, g)
+        Self::from_be_bytes_with(p, q, g, widths)
     }
 
     /// [`to_der`](Self::to_der) as a `-----BEGIN DSA PARAMETERS-----` PEM
@@ -446,6 +678,13 @@ impl DsaParams {
         Self::from_der(&der)
     }
 
+    /// [`from_pem`](Self::from_pem) under the
+    /// [`new_nonstandard`](Self::new_nonstandard) width rules.
+    pub fn from_pem_nonstandard(pem: &str) -> Result<Self, Error> {
+        let der = crate::der::pem_decode(pem, "DSA PARAMETERS").map_err(|_| Error::Malformed)?;
+        Self::from_der_nonstandard(&der)
+    }
+
     /// The `AlgorithmIdentifier { id-dsa, Dss-Parms }` used by both SPKI and
     /// PKCS#8.
     fn algorithm_identifier(&self) -> Vec<u8> {
@@ -453,7 +692,7 @@ impl DsaParams {
     }
 
     /// Reads an `AlgorithmIdentifier`, requiring `id-dsa` with `Dss-Parms`.
-    fn read_algorithm_identifier(r: &mut Reader<'_>) -> Result<Self, Error> {
+    fn read_algorithm_identifier(r: &mut Reader<'_>, widths: Widths) -> Result<Self, Error> {
         let mut algid = r.read_sequence().map_err(|_| Error::Malformed)?;
         let oid = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
             .map_err(|_| Error::Malformed)?;
@@ -463,7 +702,7 @@ impl DsaParams {
         // RFC 3279 makes the parameters OPTIONAL (inherited from the CA
         // certificate when absent); a key without them cannot be used, so
         // it is rejected here rather than half-parsed.
-        let params = Self::read(&mut algid)?;
+        let params = Self::read(&mut algid, widths)?;
         algid.finish().map_err(|_| Error::Malformed)?;
         Ok(params)
     }
@@ -507,6 +746,19 @@ impl DsaPublicKey {
     /// Verifies `sig` over `msg`, hashing with `D`.
     pub fn verify<D: Digest>(&self, msg: &[u8], sig: &DsaSignature) -> Result<(), Error> {
         self.verify_prehash(D::digest(msg).as_ref(), sig)
+    }
+
+    /// Verifies `sig` over `msg`, hashing with the run-time-selected `hash`.
+    /// Equivalent to [`verify::<D>`](Self::verify) for the matching `D`; when
+    /// the digest is already at hand, [`verify_prehash`](Self::verify_prehash)
+    /// needs no algorithm at all.
+    pub fn verify_with(
+        &self,
+        hash: HashAlgorithm,
+        msg: &[u8],
+        sig: &DsaSignature,
+    ) -> Result<(), Error> {
+        self.verify_prehash(hash.digest(msg).as_slice(), sig)
     }
 
     /// Verifies `sig` over an already-computed digest, per FIPS 186-4 §4.7:
@@ -553,9 +805,19 @@ impl DsaPublicKey {
     /// Parses an X.509 `SubjectPublicKeyInfo` carrying a DSA key, validating
     /// the parameters and the public value as [`new`](Self::new) does.
     pub fn from_spki_der(der: &[u8]) -> Result<Self, Error> {
+        Self::from_spki_der_with(der, Widths::Fips186)
+    }
+
+    /// [`from_spki_der`](Self::from_spki_der) with the parameters validated
+    /// by [`DsaParams::new_nonstandard`] (512-bit and other non-FIPS keys).
+    pub fn from_spki_der_nonstandard(der: &[u8]) -> Result<Self, Error> {
+        Self::from_spki_der_with(der, Widths::Nonstandard)
+    }
+
+    fn from_spki_der_with(der: &[u8], widths: Widths) -> Result<Self, Error> {
         let mut r = Reader::new(der);
         let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
-        let params = DsaParams::read_algorithm_identifier(&mut seq)?;
+        let params = DsaParams::read_algorithm_identifier(&mut seq, widths)?;
         let bits = seq.read_bit_string().map_err(|_| Error::Malformed)?;
         seq.finish().map_err(|_| Error::Malformed)?;
         r.finish().map_err(|_| Error::Malformed)?;
@@ -577,6 +839,13 @@ impl DsaPublicKey {
     pub fn from_spki_pem(pem: &str) -> Result<Self, Error> {
         let der = crate::der::pem_decode(pem, "PUBLIC KEY").map_err(|_| Error::Malformed)?;
         Self::from_spki_der(&der)
+    }
+
+    /// [`from_spki_pem`](Self::from_spki_pem) under the
+    /// [`DsaParams::new_nonstandard`] width rules.
+    pub fn from_spki_pem_nonstandard(pem: &str) -> Result<Self, Error> {
+        let der = crate::der::pem_decode(pem, "PUBLIC KEY").map_err(|_| Error::Malformed)?;
+        Self::from_spki_der_nonstandard(&der)
     }
 }
 
@@ -663,13 +932,57 @@ impl DsaPrivateKey {
     /// intended message; prefer [`sign`](Self::sign) when the message is at
     /// hand.
     pub fn sign_prehash<D: Digest>(&self, prehash: &[u8]) -> Result<DsaSignature, Error> {
+        let mut drbg = self.rfc6979::<D>(prehash);
+        self.sign_with_nonces(prehash, &mut || drbg.next_k())
+    }
+
+    /// Signs `msg`, hashing with the run-time-selected `hash` and deriving
+    /// the nonce per RFC 6979 with HMAC-`hash`: the same signature
+    /// [`sign::<D>`](Self::sign) produces for the matching `D`.
+    pub fn sign_with(&self, hash: HashAlgorithm, msg: &[u8]) -> Result<DsaSignature, Error> {
+        self.sign_prehash_with(hash, hash.digest(msg).as_slice())
+    }
+
+    /// [`sign_prehash`](Self::sign_prehash) with the RFC 6979 HMAC digest
+    /// chosen at run time: `prehash` is a digest of any length (truncated to
+    /// `N` bits as usual), and `hash` — normally the algorithm that produced
+    /// it — keys the nonce DRBG. Matches `sign_prehash::<D>` bit for bit for
+    /// the matching `D`; the same constant-time and security notes apply.
+    ///
+    /// [`Error::InvalidInput`] only for a [`HashAlgorithm`] variant newer
+    /// than this build knows how to dispatch.
+    pub fn sign_prehash_with(
+        &self,
+        hash: HashAlgorithm,
+        prehash: &[u8],
+    ) -> Result<DsaSignature, Error> {
+        // Only the DRBG is instantiated per digest; the signing core below
+        // is shared, which keeps the per-algorithm code to the HMAC loop.
+        crate::dispatch_digest!(hash, |D| {
+            let mut drbg = self.rfc6979::<D>(prehash);
+            self.sign_with_nonces(prehash, &mut || drbg.next_k())
+        }, _ => Err(Error::InvalidInput))
+    }
+
+    /// The RFC 6979 nonce DRBG for `prehash` under HMAC-`D`.
+    fn rfc6979<D: Digest>(&self, prehash: &[u8]) -> Rfc6979<D> {
+        let q = &self.params.q;
+        Rfc6979::<D>::new(&self.x, prehash, q, self.params.q_len(), q.bit_len())
+    }
+
+    /// The digest-independent signing core: `next_k` yields the successive
+    /// nonce candidates (each in `[1, q − 1]`).
+    fn sign_with_nonces(
+        &self,
+        prehash: &[u8],
+        next_k: &mut dyn FnMut() -> BoxedUint,
+    ) -> Result<DsaSignature, Error> {
         let (q, g) = (&self.params.q, &self.params.g);
         let (fq, fp) = (&self.params.mont_q, &self.params.mont_p);
         let qbits = q.bit_len();
         let z = fq.reduce(&bits2int(prehash, qbits));
-        let mut drbg = Rfc6979::<D>::new(&self.x, prehash, q, self.params.q_len(), qbits);
         loop {
-            let mut k = drbg.next_k();
+            let mut k = next_k();
             // `1 ≤ k < q`: a ladder over `q`'s width, not `p`'s.
             let r = fq.reduce(&fp.pow_bits(g, &k, qbits));
             // Declassified (Valgrind harness): `r` is the first half of the
@@ -729,6 +1042,17 @@ impl DsaPrivateKey {
     /// a file whose two halves disagree is rejected as [`Error::Malformed`]
     /// rather than yielding a key nobody can verify against.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
+        Self::from_pkcs8_der_with(der, Widths::Fips186)
+    }
+
+    /// [`from_pkcs8_der`](Self::from_pkcs8_der) with the parameters
+    /// validated by [`DsaParams::new_nonstandard`] (512-bit and other
+    /// non-FIPS keys).
+    pub fn from_pkcs8_der_nonstandard(der: &[u8]) -> Result<Self, Error> {
+        Self::from_pkcs8_der_with(der, Widths::Nonstandard)
+    }
+
+    fn from_pkcs8_der_with(der: &[u8], widths: Widths) -> Result<Self, Error> {
         let mut r = Reader::new(der);
         let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
         let version = seq
@@ -737,7 +1061,7 @@ impl DsaPrivateKey {
         if version != [0] && version != [1] {
             return Err(Error::Malformed);
         }
-        let params = DsaParams::read_algorithm_identifier(&mut seq)?;
+        let params = DsaParams::read_algorithm_identifier(&mut seq, widths)?;
         let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
         let mut xr = Reader::new(inner);
         let x = xr
@@ -781,6 +1105,13 @@ impl DsaPrivateKey {
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
         let der = crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?;
         Self::from_pkcs8_der(&der)
+    }
+
+    /// [`from_pkcs8_pem`](Self::from_pkcs8_pem) under the
+    /// [`DsaParams::new_nonstandard`] width rules.
+    pub fn from_pkcs8_pem_nonstandard(pem: &str) -> Result<Self, Error> {
+        let der = crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        Self::from_pkcs8_der_nonstandard(&der)
     }
 }
 
@@ -885,8 +1216,8 @@ impl DsaSignature {
 }
 
 /// The 2048/256 parameter set of RFC 6979 A.2.2, for doctests and examples
-/// (parameter generation is not implemented, so an example needs a set to
-/// start from). Not a hidden test hook: it is a perfectly good parameter
+/// (generating a 2048-bit set takes seconds, too slow for a doctest, so an
+/// example needs a set to start from). Not a hidden test hook: it is a perfectly good parameter
 /// set, just a well-known one, so generate keys on it only for examples.
 #[doc(hidden)]
 pub fn test_params_2048_256() -> DsaParams {
@@ -1530,6 +1861,244 @@ mod tests {
         assert_eq!(inner, encode_integer(&from_hex(X1024)));
         seq.finish().unwrap();
         r.finish().unwrap();
+    }
+
+    // OpenSSL 3.5 interop: `openssl genpkey -genparam -algorithm DSA -pkeyopt
+    // type:fips186_2 -pkeyopt dsa_paramgen_bits:512`, then `genpkey
+    // -paramfile … -pkeyopt type:fips186_2` (OpenSSL pairs the 512-bit p
+    // with a 224-bit q), and `openssl dgst -sha256 -sign` over
+    // `OPENSSL_512_MSG`.
+    const OPENSSL_512_PKCS8: &str = "-----BEGIN PRIVATE KEY-----
+MIHXAgEAMIGwBgcqhkjOOAQBMIGkAkEA4fBizKx3CPv8gyO8QmGxln+bMLhhysXN
+MsPyjjiWMGqcReIpqgOhvwUDFG6NXe+D1gJ78I+WL2GmY22isq3lSQIdAMPr2ENv
+YNL2wnL9PEfDVcRKk3THd2R2BJ8iMxECQBVRHbxnzk5s+74yWfXGIqOSnzB8/umb
+JA1aYb6q2kCTZsNzbFE4UYFVckFkkniz9J+9uuRB9JjLXaAUs46lFDYEHwIdALaX
+sRS1M+MukE86N0lJkTfZq6KPkFwt4CsGf9k=
+-----END PRIVATE KEY-----
+";
+    const OPENSSL_512_SPKI: &str = "-----BEGIN PUBLIC KEY-----
+MIH5MIGwBgcqhkjOOAQBMIGkAkEA4fBizKx3CPv8gyO8QmGxln+bMLhhysXNMsPy
+jjiWMGqcReIpqgOhvwUDFG6NXe+D1gJ78I+WL2GmY22isq3lSQIdAMPr2ENvYNL2
+wnL9PEfDVcRKk3THd2R2BJ8iMxECQBVRHbxnzk5s+74yWfXGIqOSnzB8/umbJA1a
+Yb6q2kCTZsNzbFE4UYFVckFkkniz9J+9uuRB9JjLXaAUs46lFDYDRAACQQCTsAn0
+gVEIBkgIh7SQYZ13Pbutqp0FtuR1tndo2p7Cdt2RWbf9eGqsowk4Gr0LGEG6Stb1
+gXvUOiU2jsoOp2ZN
+-----END PUBLIC KEY-----
+";
+    const OPENSSL_512_MSG: &[u8] = b"purecrypto dsa 512 interop";
+    const OPENSSL_512_SIG: &str = "303c021c07e3d6c6d0e2013a39b5c259477a7588bbd2e7a1aea2f5ecc14b8cd0\
+        021c46ea6523a5f129da9b987069147f4e1b08cd47d14de022df53a14bd8";
+
+    #[test]
+    fn nonstandard_openssl_512_224_interop() {
+        // The strict parsers keep refusing the key...
+        assert_eq!(
+            DsaPrivateKey::from_pkcs8_pem(OPENSSL_512_PKCS8).err(),
+            Some(Error::InvalidParameters)
+        );
+        assert_eq!(
+            DsaPublicKey::from_spki_pem(OPENSSL_512_SPKI),
+            Err(Error::InvalidParameters)
+        );
+        // ...the non-standard ones take it, and the two halves agree.
+        let key = DsaPrivateKey::from_pkcs8_pem_nonstandard(OPENSSL_512_PKCS8).unwrap();
+        let pk = DsaPublicKey::from_spki_pem_nonstandard(OPENSSL_512_SPKI).unwrap();
+        assert_eq!(key.params().p_bits(), 512);
+        assert_eq!(key.params().q_bits(), 224);
+        assert_eq!(key.public_key(), pk);
+        assert_eq!(
+            DsaParams::from_der_nonstandard(&pk.params().to_der()).unwrap(),
+            *pk.params()
+        );
+        assert_eq!(
+            DsaParams::from_pem_nonstandard(&pk.params().to_pem()).unwrap(),
+            *pk.params()
+        );
+        assert_eq!(
+            DsaParams::from_der(&pk.params().to_der()),
+            Err(Error::InvalidParameters)
+        );
+        // OpenSSL's signature verifies, under both digest selections.
+        let sig = DsaSignature::from_der(&from_hex(OPENSSL_512_SIG)).unwrap();
+        pk.verify::<Sha256>(OPENSSL_512_MSG, &sig).unwrap();
+        pk.verify_with(HashAlgorithm::Sha256, OPENSSL_512_MSG, &sig)
+            .unwrap();
+        assert!(pk.verify::<Sha256>(b"other", &sig).is_err());
+        // And our own signatures on the key round-trip.
+        let ours = key.sign::<Sha256>(OPENSSL_512_MSG).unwrap();
+        pk.verify::<Sha256>(OPENSSL_512_MSG, &ours).unwrap();
+        // PKCS#8 / SPKI re-encoding round-trips through the loose parsers.
+        assert_eq!(
+            DsaPrivateKey::from_pkcs8_der_nonstandard(&key.to_pkcs8_der())
+                .unwrap()
+                .x_bytes(),
+            key.x_bytes()
+        );
+        assert_eq!(
+            DsaPublicKey::from_spki_der_nonstandard(&pk.to_spki_der()).unwrap(),
+            pk
+        );
+    }
+
+    #[test]
+    fn nonstandard_params_validation() {
+        // Standard sets pass the loose path too (p is prime).
+        let (p, q, g) = (uint(P1024), uint(Q1024), uint(G1024));
+        assert_eq!(
+            DsaParams::new_nonstandard(p.clone(), q.clone(), g.clone()).unwrap(),
+            params_1024()
+        );
+        let one = BoxedUint::from_u64(1);
+        // The structural checks are the strict path's.
+        assert_eq!(
+            DsaParams::new_nonstandard(p.clone(), q.clone(), one.clone()),
+            Err(Error::InvalidParameters)
+        );
+        assert_eq!(
+            DsaParams::new_nonstandard(p.clone(), q.clone(), BoxedUint::from_u64(2)),
+            Err(Error::InvalidParameters)
+        );
+        assert_eq!(
+            DsaParams::new_nonstandard(p.clone(), uint(RFC6979_2048_Q), g.clone()),
+            Err(Error::InvalidParameters)
+        );
+        assert_eq!(
+            DsaParams::new_nonstandard(p.add(&one), q.clone(), g.clone()),
+            Err(Error::InvalidParameters)
+        );
+        // Width bounds: a 512-bit p is fine, a 511-bit one is not, nor a q
+        // outside 160..=256 bits (checked before any arithmetic).
+        let mut rng = HmacDrbg::<Sha256>::new(b"dsa-nonstandard-widths", b"", b"");
+        for (l, n) in [(511, 160), (512, 159), (512, 257), (10001, 256)] {
+            assert_eq!(
+                DsaParams::generate(l, n, &mut rng),
+                Err(Error::InvalidParameters),
+                "({l}, {n})"
+            );
+        }
+        let pk = DsaPublicKey::from_spki_pem_nonstandard(OPENSSL_512_SPKI).unwrap();
+        let (p512, q224, g512) = (
+            pk.params().p().clone(),
+            pk.params().q().clone(),
+            pk.params().g().clone(),
+        );
+        assert_eq!(
+            DsaParams::new_nonstandard(p512.shr_bits(1), q224.clone(), g512.clone()),
+            Err(Error::InvalidParameters)
+        );
+        assert_eq!(
+            DsaParams::new_nonstandard(p.clone(), q.shr_bits(1), g.clone()),
+            Err(Error::InvalidParameters)
+        );
+        // A composite p that passes every structural check: p' = p₁·p₂ with
+        // p₁ = the OpenSSL 512-bit prime and p₂ = 2kq + 1 another prime, so
+        // q | p' − 1, and g' ≡ g (mod p₁), g' ≡ 1 (mod p₂) by CRT, so
+        // g'^q ≡ 1 (mod p'). Only the Miller-Rabin test on p rejects it.
+        let two_q = q224.add(&q224);
+        let mut p2 = two_q.add(&one);
+        while !crate::bignum::prime::is_prime_boxed(&p2, &mut rng, 32) {
+            p2 = p2.add(&two_q);
+        }
+        let composite = p512.mul(&p2);
+        let p2_inv = crate::bignum::inv_mod_boxed(&p2.reduce(&p512), &p512).unwrap();
+        let t = BoxedMontModulus::new(&p512).mul_mod(&g512.sub(&one), &p2_inv);
+        let g_crt = one.add(&p2.mul(&t));
+        assert!(composite.sub(&one).reduce(&q224).is_zero());
+        assert_eq!(
+            BoxedMontModulus::new(&composite).pow_public(&g_crt, &q224),
+            one
+        );
+        assert!(g_crt != one && g_crt.lt(&composite));
+        assert!(DsaParams::nonstandard_widths(
+            composite.bit_len(),
+            q224.bit_len()
+        ));
+        assert_eq!(
+            DsaParams::new_nonstandard(composite, q224, g_crt),
+            Err(Error::InvalidParameters)
+        );
+    }
+
+    #[test]
+    fn generate_nonstandard_512_and_768() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"dsa-paramgen-test", b"", b"");
+        for (l, n) in [(512, 160), (768, 160)] {
+            let params = DsaParams::generate(l, n, &mut rng).unwrap();
+            assert_eq!((params.p_bits(), params.q_bits()), (l, n));
+            // The generated set passes full (non-standard) validation, but
+            // not the FIPS-width one.
+            assert_eq!(
+                DsaParams::new_nonstandard(
+                    params.p().clone(),
+                    params.q().clone(),
+                    params.g().clone()
+                )
+                .unwrap(),
+                params
+            );
+            assert_eq!(
+                DsaParams::new(params.p().clone(), params.q().clone(), params.g().clone()),
+                Err(Error::InvalidParameters)
+            );
+            let key = DsaPrivateKey::generate(params.clone(), &mut rng);
+            let pk = key.public_key();
+            let sig = key.sign::<Sha1>(b"legacy").unwrap();
+            pk.verify::<Sha1>(b"legacy", &sig).unwrap();
+            assert!(pk.verify::<Sha1>(b"legacz", &sig).is_err());
+            // Explicit-parameter import of the key halves.
+            let pk2 = DsaPublicKey::from_be_bytes(params.clone(), &pk.y_bytes()).unwrap();
+            pk2.verify::<Sha1>(b"legacy", &sig).unwrap();
+            let key2 = DsaPrivateKey::from_be_bytes(params, &key.x_bytes()).unwrap();
+            assert_eq!(key2.sign::<Sha1>(b"legacy").unwrap(), sig);
+        }
+        // A non-byte-aligned N works too (the masks and bits2int handle it).
+        let params = DsaParams::generate(512, 199, &mut rng).unwrap();
+        assert_eq!(params.q_bits(), 199);
+        let key = DsaPrivateKey::generate(params, &mut rng);
+        let sig = key.sign::<Sha256>(b"odd width").unwrap();
+        key.public_key()
+            .verify::<Sha256>(b"odd width", &sig)
+            .unwrap();
+    }
+
+    #[test]
+    fn runtime_digest_matches_generic() {
+        fn case<D: Digest>(key: &DsaPrivateKey, alg: HashAlgorithm) {
+            let msg = b"runtime digest";
+            let sig = key.sign::<D>(msg).unwrap();
+            assert_eq!(key.sign_with(alg, msg).unwrap(), sig, "{alg}");
+            let h = D::digest(msg);
+            assert_eq!(
+                key.sign_prehash_with(alg, h.as_ref()).unwrap(),
+                key.sign_prehash::<D>(h.as_ref()).unwrap(),
+                "{alg}"
+            );
+            let pk = key.public_key();
+            pk.verify_with(alg, msg, &sig).unwrap();
+            pk.verify::<D>(msg, &key.sign_with(alg, msg).unwrap())
+                .unwrap();
+            assert!(pk.verify_with(alg, b"other", &sig).is_err());
+        }
+        for key in [key_1024(), key_2048()] {
+            case::<Sha1>(&key, HashAlgorithm::Sha1);
+            case::<Sha224>(&key, HashAlgorithm::Sha224);
+            case::<Sha256>(&key, HashAlgorithm::Sha256);
+            case::<Sha384>(&key, HashAlgorithm::Sha384);
+            case::<Sha512>(&key, HashAlgorithm::Sha512);
+            case::<crate::hash::Sha3_256>(&key, HashAlgorithm::Sha3_256);
+        }
+        // The RFC 6979 A.2.2 SHA-256 vector, via the runtime path.
+        let sig = key_2048()
+            .sign_with(HashAlgorithm::Sha256, b"sample")
+            .unwrap();
+        assert_eq!(
+            sig.r.to_be_bytes(32),
+            from_hex("EACE8BDBBE353C432A795D9EC556C6D021F7A03F42C36E9BC87E4AC7932CC809")
+        );
+        // A digest verified under the wrong algorithm fails.
+        let pk = key_1024().public_key();
+        let sig = key_1024().sign_with(HashAlgorithm::Sha1, b"m").unwrap();
+        assert!(pk.verify_with(HashAlgorithm::Sha256, b"m", &sig).is_err());
     }
 
     #[test]
