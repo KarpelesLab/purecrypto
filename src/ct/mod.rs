@@ -318,9 +318,12 @@ impl<T> CtOption<T> {
     /// declassified for the Valgrind constant-time harness (hidden
     /// `__ct-check` feature). Identical to `into_option` in every other
     /// build. The call site must say why the flag is public.
+    ///
+    /// **Variable time**, like `into_option`: it branches on the flag. Use
+    /// it only where whether a value exists is not secret — the value
+    /// itself is never inspected.
     #[inline]
-    #[allow(dead_code)] // unused in the leanest feature sets
-    pub(crate) fn into_public_option(self) -> Option<T> {
+    pub fn into_public_option(self) -> Option<T> {
         if self.is_some.declassify() {
             Some(self.value)
         } else {

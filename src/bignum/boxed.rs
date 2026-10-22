@@ -8,7 +8,7 @@
 
 use super::mul::mac;
 use super::uint::{LIMB_BITS, Limb, adc, sbb};
-use crate::ct::{Choice, ConstantTimeEq};
+use crate::ct::{Choice, ConstantTimeEq, ConstantTimeGreater, ConstantTimeLess};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -425,6 +425,27 @@ impl ConstantTimeEq for BoxedUint {
         self.limbs_resized(n)[..].ct_eq(&other.limbs_resized(n)[..])
     }
 }
+
+/// `self > other` as a [`Choice`]: one borrow chain over the wider of the two
+/// (public) limb widths, with no branch on and no allocation for the values,
+/// so either operand may be secret. Operands of different widths compare by
+/// value (the narrower one reads as zero-extended).
+impl ConstantTimeGreater for BoxedUint {
+    fn ct_gt(&self, other: &Self) -> Choice {
+        // self > other iff (other − self) borrows.
+        let (a, b) = (&other.limbs, &self.limbs);
+        let mut borrow: Limb = 0;
+        for i in 0..a.len().max(b.len()) {
+            let x = a.get(i).copied().unwrap_or(0);
+            let y = b.get(i).copied().unwrap_or(0);
+            borrow = sbb(x, y, borrow).1;
+        }
+        Choice::from(borrow as u8)
+    }
+}
+
+// ct_lt is provided by the default impl: `self < other` ⇔ `other > self`.
+impl ConstantTimeLess for BoxedUint {}
 
 impl PartialEq for BoxedUint {
     fn eq(&self, other: &Self) -> bool {

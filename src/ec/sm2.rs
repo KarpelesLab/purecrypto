@@ -22,7 +22,7 @@ use super::Error;
 use super::boxed::reduce_once;
 use super::curves::CurveId;
 use crate::bignum::BoxedUint;
-use crate::ct::{Choice, ConstantTimeEq};
+use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, Sm3};
 use crate::rng::{CryptoRng, RngCore};
 use alloc::vec;
@@ -49,8 +49,7 @@ pub const DEFAULT_ID: &[u8] = b"1234567812345678";
 fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
     // The verdict is public in every caller: a key-import result, or a
     // rejection-sampling decision whose only observable is the retry count.
-    let lt = Choice::from(v.lt(n) as u8);
-    (!v.ct_is_zero() & lt).declassify()
+    (!v.ct_is_zero() & crate::ct::ConstantTimeLess::ct_lt(v, n)).declassify()
 }
 
 /// `1 <= d <= n-2` — the GB/T 32918.1 §6.1 private-key range. `d = n-1`
@@ -197,6 +196,21 @@ fn message_hash(za: &[u8; 32], msg: &[u8]) -> BoxedUint {
     BoxedUint::from_be_bytes(h.finalize().as_ref())
 }
 
+/// A caller-supplied digest as the integer `e mod n`. Any length is
+/// accepted, as OpenSSL does for a bare digest (`BN_bin2bn` then a full
+/// modular reduction), so a digest wider than SM3's 32 bytes is reduced
+/// rather than rejected. The digest is public, so the variable-time long
+/// division is fine.
+fn prehash_int(digest: &[u8], n: &BoxedUint) -> BoxedUint {
+    let e = BoxedUint::from_be_bytes(digest);
+    if digest.len() <= 32 {
+        // `e < 2^256 < 2n` for SM2's `n > 2^255`.
+        reduce_once(&e, n)
+    } else {
+        e.reduce(n)
+    }
+}
+
 /// The GB/T 32918 KDF built on SM3: counter-mode `Ha = SM3(Z ‖ ct)` with a
 /// 32-bit big-endian counter starting at 1, concatenated to `klen` bytes.
 fn kdf(z: &[u8], klen: usize) -> Vec<u8> {
@@ -264,14 +278,32 @@ impl Sm2PublicKey {
     /// Verifies an SM2 signature `sig` over `msg` under identity `id`
     /// (GB/T 32918.2 §7, RFC 8998 §2).
     pub fn verify(&self, msg: &[u8], sig: &Sm2Signature, id: &[u8]) -> Result<(), Error> {
+        let za = self.za(id)?;
+        let n = CURVE.curve().order();
+        self.verify_e(&reduce_once(&message_hash(&za, msg), &n), sig)
+    }
+
+    /// Verifies `sig` over a bare digest `e` the caller already computed —
+    /// no `ZA`, no identity: the signature is checked against `e` as given.
+    /// This is what OpenSSL 3 does when handed a digest to verify
+    /// (`EVP_PKEY_verify` on an SM2 key), so it interoperates with
+    /// signatures produced over `H(M)` without an ID. For the standard
+    /// scheme, `digest = SM3(ZA ‖ M)` makes this agree with
+    /// [`verify`](Self::verify). Any digest length is accepted; the integer
+    /// is reduced modulo `n`.
+    pub fn verify_prehash(&self, digest: &[u8], sig: &Sm2Signature) -> Result<(), Error> {
+        let n = CURVE.curve().order();
+        self.verify_e(&prehash_int(digest, &n), sig)
+    }
+
+    /// The verification core over `e < n`.
+    fn verify_e(&self, e: &BoxedUint, sig: &Sm2Signature) -> Result<(), Error> {
         let c = CURVE.curve();
         let n = c.order();
         // r, s ∈ [1, n-1].
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
         }
-        let za = self.za(id)?;
-        let e = reduce_once(&message_hash(&za, msg), &n);
         // t = (r + s) mod n; reject t == 0.
         let t = c.add_mod_n(&sig.r, &sig.s);
         if t.is_zero() {
@@ -284,7 +316,7 @@ impl Sm2PublicKey {
         let sum = c.mul_double_vartime(&sig.s, &t, &point);
         // Accept iff R = (e + x1) mod n equals r, i.e. x1 ≡ r − e (mod n),
         // tested without inverting Z.
-        if c.affine_x_eq_mod_n(&sum, &c.sub_mod_n(&sig.r, &e)) {
+        if c.affine_x_eq_mod_n(&sum, &c.sub_mod_n(&sig.r, e)) {
             Ok(())
         } else {
             Err(Error::Verification)
@@ -436,9 +468,47 @@ impl Sm2PrivateKey {
         }
         let n = CURVE.curve().order();
         let za = self.pk.za(id)?;
+        self.sign_e(&reduce_once(&message_hash(&za, msg), &n), rng)
+    }
+
+    /// Signs a bare digest `digest` the caller already computed — no `ZA`,
+    /// no identity: `e` is the digest itself. This is what OpenSSL 3 does
+    /// when handed a digest to sign (`EVP_PKEY_sign` on an SM2 key), so it
+    /// produces signatures over `H(M)` without an ID that such peers verify.
+    /// For the standard scheme, pass `digest = SM3(ZA ‖ M)` (see
+    /// [`Sm2PublicKey::za`]) and the result verifies under
+    /// [`Sm2PublicKey::verify`]. Any digest length is accepted; the integer
+    /// is reduced modulo `n`. The nonce comes from `rng` (a CSPRNG).
+    pub fn sign_prehash<R: RngCore + CryptoRng>(
+        &self,
+        digest: &[u8],
+        rng: &mut R,
+    ) -> Result<Sm2Signature, Error> {
+        let n = CURVE.curve().order();
+        self.sign_e(&prehash_int(digest, &n), rng)
+    }
+
+    /// [`sign_prehash`](Self::sign_prehash) with an explicit nonce `k`, for
+    /// Known-Answer-Tests; the same contract as [`sign_with_k`](Self::sign_with_k).
+    pub fn sign_prehash_with_k(&self, digest: &[u8], k: &BoxedUint) -> Result<Sm2Signature, Error> {
+        let n = CURVE.curve().order();
+        self.sign_e_with_k(&prehash_int(digest, &n), k)
+            .map_err(|f| match f {
+                SignFailure::Retry => Error::InvalidInput,
+                SignFailure::Fatal(e) => e,
+            })
+    }
+
+    /// The randomized signing loop over `e < n`.
+    fn sign_e<R: RngCore + CryptoRng>(
+        &self,
+        e: &BoxedUint,
+        rng: &mut R,
+    ) -> Result<Sm2Signature, Error> {
+        let n = CURVE.curve().order();
         for _ in 0..MAX_SIGN_ATTEMPTS {
             let mut k = random_scalar(&n, rng);
-            let out = self.sign_digest_with_k(&za, msg, &k);
+            let out = self.sign_e_with_k(e, &k);
             // The nonce alone recovers the private key; wipe it on every path.
             k.zeroize();
             match out {
@@ -461,32 +531,28 @@ impl Sm2PrivateKey {
     /// leaking it discloses the private key.
     pub fn sign_with_k(&self, msg: &[u8], id: &[u8], k: &BoxedUint) -> Result<Sm2Signature, Error> {
         let za = self.pk.za(id)?;
-        self.sign_digest_with_k(&za, msg, k).map_err(|f| match f {
+        let n = CURVE.curve().order();
+        let e = reduce_once(&message_hash(&za, msg), &n);
+        self.sign_e_with_k(&e, k).map_err(|f| match f {
             SignFailure::Retry => Error::InvalidInput,
             SignFailure::Fatal(e) => e,
         })
     }
 
-    /// The signing core: `ZA` already computed, failures split into
-    /// retryable (degenerate nonce) and permanent.
-    fn sign_digest_with_k(
-        &self,
-        za: &[u8; 32],
-        msg: &[u8],
-        k: &BoxedUint,
-    ) -> Result<Sm2Signature, SignFailure> {
+    /// The signing core over the digest integer `e < n`, failures split
+    /// into retryable (degenerate nonce) and permanent.
+    fn sign_e_with_k(&self, e: &BoxedUint, k: &BoxedUint) -> Result<Sm2Signature, SignFailure> {
         let c = CURVE.curve();
         let n = c.order();
         if !in_range(k, &n) {
             return Err(SignFailure::Fatal(Error::InvalidInput));
         }
-        let e = reduce_once(&message_hash(za, msg), &n);
 
         // (x1, _) = [k]G. k ∈ [1, n-1] and G has prime order n, so this is
         // never the identity; treat it as retryable regardless.
         let (x1, _) = c.to_affine(&c.mul_generator(k)).ok_or(SignFailure::Retry)?;
         // r = (e + x1) mod n; reject r == 0 or r + k == n.
-        let r = c.add_mod_n(&e, &reduce_once(&x1, &n));
+        let r = c.add_mod_n(e, &reduce_once(&x1, &n));
         // `r + k` involves the nonce: no early-exit zero test on it, and one
         // combined retry verdict (public: only the retry count is observable).
         if (r.ct_is_zero() | c.add_mod_n(&r, k).ct_is_zero()).declassify() {
@@ -902,6 +968,71 @@ mod tests {
         assert!(pk.verify(b"hello sm3", &sig, DEFAULT_ID).is_err());
         // Wrong id is rejected (ZA differs).
         assert!(pk.verify(b"hello sm2", &sig, b"other-id").is_err());
+    }
+
+    /// The prehash entry points agree with the `ZA` path when handed
+    /// `SM3(ZA ‖ M)`, and the pinned-nonce variant reproduces the GB/T
+    /// 32918.2 Annex A.2 signature.
+    #[test]
+    fn prehash_matches_za_path() {
+        let d = from_hex("3945208F7B2144B13F36E38AC6D39F95889393692860B51A42FB81EF4DF7C5B8");
+        let sk = Sm2PrivateKey::from_bytes(&d).unwrap();
+        let pk = sk.public_key();
+        let mut h = Sm3::new();
+        h.update(&pk.za(DEFAULT_ID).unwrap());
+        h.update(b"message digest");
+        let e = h.finalize();
+        let k = uint("59276E27D506861A16680F3AD9C02DCCEF3CC1FA3CDBE4CE6D54B80DEAC1BC21");
+        let sig = sk.sign_prehash_with_k(e.as_ref(), &k).unwrap();
+        assert_eq!(
+            sig.r(),
+            &uint("F5A03B0648D2C4630EEAC513E1BB81A15944DA3827D5B74143AC7EACEEE720B3")
+        );
+        assert_eq!(
+            sig.s(),
+            &uint("B1B6AA29DF212FD8763182BC0D421CA1BB9038FD1F7F42D4840B69C485BBC1AA")
+        );
+        pk.verify_prehash(e.as_ref(), &sig).unwrap();
+        pk.verify(b"message digest", &sig, DEFAULT_ID).unwrap();
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"sm2-prehash", b"n", &[]);
+        let sig = sk.sign_prehash(e.as_ref(), &mut rng).unwrap();
+        pk.verify(b"message digest", &sig, DEFAULT_ID).unwrap();
+        let mut bad = e;
+        bad.as_mut()[0] ^= 1;
+        assert!(pk.verify_prehash(bad.as_ref(), &sig).is_err());
+
+        // A digest wider than the order is reduced, not rejected: `D` and
+        // `D + n` (as integers) are the same `e`.
+        let wide = [0xa5u8; 64];
+        let sig = sk.sign_prehash(&wide, &mut rng).unwrap();
+        pk.verify_prehash(&wide, &sig).unwrap();
+        let n = CURVE.curve().order();
+        let shifted = BoxedUint::from_be_bytes(&wide).add(&n).to_be_bytes(64);
+        pk.verify_prehash(&shifted, &sig).unwrap();
+        let e_mod_n = BoxedUint::from_be_bytes(&wide).reduce(&n).to_be_bytes(32);
+        pk.verify_prehash(&e_mod_n, &sig).unwrap();
+    }
+
+    /// OpenSSL 3.5 `pkeyutl -sign` on an SM2 key signs the digest as given,
+    /// without an identity (`e = SHA-256("hello world")` here).
+    #[cfg(feature = "der")]
+    #[test]
+    fn prehash_openssl_interop() {
+        let pk = Sm2PublicKey::from_sec1(&from_hex(
+            "04fbda9655f80fb6f65059dd4aba23f0de9158573cfec826240f9b49dc4682ff06\
+             41c3b0f40aee5782f8f3bc1404544cc75383d6423232aa641d41581c6fcf8dbb",
+        ))
+        .unwrap();
+        let sig = Sm2Signature::from_der(&from_hex(
+            "30450221008895953da764f32a0d29863ffd4c7c8dc8f368f672b34e6e45f0dc29\
+             f0c8c2d9022071f6fb04a5d07404e1c004db4270e94c17e28706c2d7952d2e2917\
+             57fa6415b0",
+        ))
+        .unwrap();
+        let digest = Sha256::digest(b"hello world");
+        pk.verify_prehash(digest.as_ref(), &sig).unwrap();
+        assert!(pk.verify(b"hello world", &sig, DEFAULT_ID).is_err());
     }
 
     // GB/T 32918.4 SM2 public-key-encryption example (the canonical worked
