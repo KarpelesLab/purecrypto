@@ -420,7 +420,7 @@ fn xxtea_decrypt<W: Words + ?Sized>(k: &[u32; 4], v: &mut W) -> Result<(), Inval
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::cipher::Cbc64;

@@ -10,6 +10,7 @@
 //! touches: on a curve with cofactor `h > 1`, every point that enters as a
 //! public key is checked to lie in the order-`n` subgroup.
 
+#[cfg(any(feature = "ec-custom", feature = "der"))]
 use super::Error;
 use super::curves::CurveId;
 use super::weierstrass::Curve;
@@ -267,6 +268,8 @@ impl BoxedCurve {
     }
 }
 
+// Reached from `from_params` and `from_der` only.
+#[cfg(any(feature = "ec-custom", feature = "der"))]
 impl BoxedCurve {
     /// The named curve with exactly these parameters, if any: `Some(Ok)`
     /// for a match with `h = 1`, `Some(Err)` for a match with any other
