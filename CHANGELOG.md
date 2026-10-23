@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3](https://github.com/KarpelesLab/purecrypto/compare/v0.10.2...v0.10.3) - 2026-10-23
+
+### Added
+
+- *(pki)* distrust list on RootCertStore, loaded from cacrt's blocklist
+- *(bn254,bls12_377)* BLS signatures, min_pk and min_sig variants
+- *(bls12_377)* BLS12-377 pairing, hash-to-curve and encodings
+- *(bn254)* BN254 pairing curve, EIP-196/197 encodings, SVDW hash-to-curve
+
+### Fixed
+
+- *(tls)* honour Config::max_version below TLS 1.2 on the server
+- *(bn254)* straight-line Babai decomposition (armv7 memcheck)
+
+### Other
+
+- *(cli)* tolerate a lost close_notify after a DTLS rebind
+- *(bls-sig)* BN254 and BLS12-377 BLS signature vectors
+- *(bls12_377)* GLV/GLS multiplication against the ladder on edge scalars
+- *(bn254)* GLV split for G1::mul and 4-D GLS split for G2::mul
+- *(bls12-377)* black-box interop vectors and constant derivation
+- *(bn254)* constant-time harness cases, CI wiring and docs
+- *(bls)* move Montgomery core and expand_message_xmd to a shared module
+
 ## [0.10.2](https://github.com/KarpelesLab/purecrypto/compare/v0.10.1...v0.10.2) - 2026-10-22
 
 ### Added
