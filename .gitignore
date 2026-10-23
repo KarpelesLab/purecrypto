@@ -14,3 +14,4 @@ tools/pairing-interop/oracle/
 tools/interop/peers/apple/.build/
 tools/interop/peers/apple/.build.log
 tools/interop/peers/apple/.swiftpm/
+tools/pairing-interop/bn254/ark/Cargo.lock

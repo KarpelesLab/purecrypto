@@ -1,0 +1,13 @@
+[package]
+name = "bn254-ark-crosscheck"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+
+# Standalone: not part of the purecrypto workspace.
+[workspace]

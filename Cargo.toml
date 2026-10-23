@@ -298,6 +298,13 @@ vmac = ["mac"]
 # BLS12-381 pairing-friendly curve, RFC 9380 hash-to-curve and the
 # draft-irtf-cfrg-bls-signature schemes (min-pubkey-size, signatures in G2).
 bls = ["hash", "rng", "alloc"]
+# BN254 (alt_bn128): the Ethereum EIP-196/197 pairing curve. Opt-in; about
+# 100-bit security since exTNFS, so meant for interop, not new designs.
+# Allocator-free.
+bn254 = ["hash"]
+# BLS12-377: the pairing curve with a 2-adic scalar field used by
+# Zexe/Aleo/Celo-style systems. Opt-in, allocator-free.
+bls12-377 = ["hash"]
 # Format-preserving encryption: NIST SP 800-38G FF1 over AES.
 fpe = ["cipher", "bignum", "alloc"]
 # JOSE: JSON Web Key / Signature / Encryption (RFC 7515-7518) with a small
@@ -469,7 +476,7 @@ required-features = ["std", "cipher", "hash", "ec", "rsa", "mlkem", "mldsa", "sl
 [[test]]
 name = "ct_valgrind"
 harness = false
-required-features = ["__ct-check", "std", "hash", "cipher", "kdf", "rng", "rsa", "ec", "mlkem", "mldsa", "slhdsa", "der", "dh", "ascon", "alloc", "mac", "hpke", "bls", "lms", "xmss", "falcon", "tls", "dtls", "quic", "bip340", "zkp", "ristretto255", "dsa", "chunked", "jose", "aez", "legacy-ciphers", "vmac"]
+required-features = ["__ct-check", "std", "hash", "cipher", "kdf", "rng", "rsa", "ec", "mlkem", "mldsa", "slhdsa", "der", "dh", "ascon", "alloc", "mac", "hpke", "bls", "bn254", "lms", "xmss", "falcon", "tls", "dtls", "quic", "bip340", "zkp", "ristretto255", "dsa", "chunked", "jose", "aez", "legacy-ciphers", "vmac"]
 
 [lints.rust]
 # `fullrust` is a custom, out-of-tree `target_os` (a libc-free Linux
