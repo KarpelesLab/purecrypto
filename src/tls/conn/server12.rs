@@ -169,6 +169,12 @@ pub(crate) struct ServerConfig12 {
     /// the deprecated legacy suites (off by default; see the module docs).
     #[cfg(feature = "tls-legacy")]
     pub(crate) min_version: ProtocolVersion,
+    /// Highest protocol version this server will negotiate. Defaults to
+    /// TLS 1.2 (this engine's ceiling). Lowered to TLS 1.1/1.0 via
+    /// [`Self::with_max_version`] so a 1.2-capable client is answered with
+    /// the configured maximum instead of TLS 1.2.
+    #[cfg(feature = "tls-legacy")]
+    pub(crate) max_version: ProtocolVersion,
     /// RFC 7250 §3 `server_certificate_type` accept-set (`0 = X509`,
     /// `2 = RawPublicKey`). Defaults to `[X509]`; `RawPublicKey` is only
     /// ever selected when `raw_public_key_spki` is set. Mirrors
@@ -237,6 +243,8 @@ impl ServerConfig12 {
             supports_tls13: false,
             #[cfg(feature = "tls-legacy")]
             min_version: ProtocolVersion::TLSv1_2,
+            #[cfg(feature = "tls-legacy")]
+            max_version: ProtocolVersion::TLSv1_2,
             server_cert_type_preference: alloc::vec![cert_type::X509],
             client_cert_type_preference: alloc::vec![cert_type::X509],
             raw_public_key_spki: None,
@@ -345,6 +353,17 @@ impl ServerConfig12 {
     #[cfg(feature = "tls-legacy")]
     pub fn with_min_version(mut self, v: ProtocolVersion) -> Self {
         self.min_version = v;
+        self
+    }
+
+    /// Caps the highest version negotiated (at most TLS 1.2). Set below
+    /// TLS 1.2 to answer every client with TLS 1.1/1.0 at most, the way an
+    /// OpenSSL server with `max_proto_version` below 1.2 does: a client
+    /// offering 1.2 is downgraded to this version (or refused if that is
+    /// below [`Self::with_min_version`]).
+    #[cfg(feature = "tls-legacy")]
+    pub fn with_max_version(mut self, v: ProtocolVersion) -> Self {
+        self.max_version = v;
         self
     }
 
@@ -564,6 +583,11 @@ pub struct ServerConnection12<R: RngCore> {
     /// TLS 1.0/1.1). Mutually exclusive with `suite`.
     #[cfg(feature = "tls-legacy")]
     legacy_suite: Option<LegacyCbcSuite>,
+    /// `ClientHello.client_version` as sent (RFC 5246 §7.4.7.1): the version
+    /// a static-RSA premaster must start with. It can be above
+    /// `negotiated_version` when `max_version` caps the negotiation.
+    #[cfg(feature = "tls-legacy")]
+    client_offered_version: u16,
     /// Ephemeral X25519 private key (used when we pick X25519).
     x25519: Option<X25519PrivateKey>,
     /// Ephemeral P-256 ECDH private key (used when we pick SECP256R1).
@@ -714,6 +738,8 @@ impl<R: RngCore> ServerConnection12<R> {
             suite: None,
             #[cfg(feature = "tls-legacy")]
             legacy_suite: None,
+            #[cfg(feature = "tls-legacy")]
+            client_offered_version: 0,
             x25519: None,
             p256: None,
             p384: None,
@@ -1336,9 +1362,14 @@ impl<R: RngCore> ServerConnection12<R> {
         // Version negotiation. Our engine tops out at TLS 1.2; a TLS 1.3
         // client keeps `legacy_version = 0x0303` and advertises 1.3 via
         // `supported_versions` (handled below). The client's maximum is its
-        // `legacy_version` (capped at our 0x0303 ceiling); we negotiate the
-        // highest version not below our configured floor.
-        let neg_version = ch.legacy_version.min(0x0303);
+        // `legacy_version`; we negotiate the highest version both sides
+        // support (capped at our configured ceiling, at most 0x0303), and
+        // refuse if that falls below our configured floor.
+        #[cfg(feature = "tls-legacy")]
+        let ceiling = self.config.max_version.as_u16().min(0x0303);
+        #[cfg(not(feature = "tls-legacy"))]
+        let ceiling = 0x0303u16;
+        let neg_version = ch.legacy_version.min(ceiling);
         #[cfg(feature = "tls-legacy")]
         let floor = self.config.min_version.as_u16();
         #[cfg(not(feature = "tls-legacy"))]
@@ -1357,12 +1388,12 @@ impl<R: RngCore> ServerConnection12<R> {
         // Two ways we can be above `neg_version`: this engine was reached via
         // `ServerConnectionAuto`, which strips a TLS 1.3 ClientHello and sets
         // `supports_tls13` (so 1.3 was available), or the opt-in legacy path
-        // negotiated 1.0/1.1 while this engine also speaks 1.2. The check
-        // runs before the legacy dispatch so both handlers are covered.
+        // negotiated a version below our configured ceiling. The check runs
+        // before the legacy dispatch so both handlers are covered.
         if ch
             .cipher_suites
             .contains(&crate::tls::codec::CipherSuite(0x5600))
-            && (self.config.supports_tls13 || neg_version < 0x0303)
+            && (self.config.supports_tls13 || neg_version < ceiling)
         {
             return Err(Error::InappropriateFallback);
         }
@@ -1683,6 +1714,7 @@ impl<R: RngCore> ServerConnection12<R> {
             return Err(Error::HandshakeFailure);
         }
         self.negotiated_version = ProtocolVersion::from_u16(neg_version);
+        self.client_offered_version = ch.legacy_version;
         let is_ssl3 = self.negotiated_version == ProtocolVersion::SSLv3;
 
         // Pick the strongest legacy suite the client also offered. SSL 3.0 has
@@ -1773,12 +1805,15 @@ impl<R: RngCore> ServerConnection12<R> {
 
         let mut server_random: Random = [0u8; 32];
         self.rng.fill_bytes(&mut server_random);
-        // RFC 8446 §4.1.3: a server that supports TLS 1.2 (this engine always
-        // does — the legacy path is reached only because the *client* offered
-        // a pre-1.2 version) and negotiates TLS 1.1 or below MUST set the
-        // `DOWNGRD\x00` sentinel in the last 8 bytes of `server_random`, so a
-        // client that really offered 1.2/1.3 can detect the downgrade.
-        apply_downgrade_sentinel_legacy(&mut server_random);
+        // RFC 8446 §4.1.3: a server that supports TLS 1.2 and negotiates
+        // TLS 1.1 or below MUST set the `DOWNGRD\x00` sentinel in the last 8
+        // bytes of `server_random`, so a client that really offered 1.2/1.3
+        // can detect the downgrade. A server whose `max_version` is below 1.2
+        // does not support 1.2, so it must NOT set it: a 1.2/1.3-capable
+        // client would otherwise abort a legitimate negotiation.
+        if self.config.max_version.as_u16() >= 0x0303 || self.config.supports_tls13 {
+            apply_downgrade_sentinel_legacy(&mut server_random);
+        }
 
         self.legacy_suite = Some(ls);
         self.group = group;
@@ -1990,19 +2025,17 @@ impl<R: RngCore> ServerConnection12<R> {
                             .map_err(|_| Error::DecryptError)?;
                         // RFC 5246 §7.4.7.1 version-rollback check: the first
                         // two premaster bytes MUST equal the version the
-                        // client offered in its ClientHello. On this path the
-                        // offered version is exactly `negotiated_version`:
-                        // `on_client_hello_legacy` is only reached when
-                        // `ch.legacy_version < 0x0303`, where the negotiated
-                        // version is `ch.legacy_version` itself (the `min`
-                        // cap never fires below 0x0303). Per the RFC, a
+                        // client offered in its ClientHello — which is above
+                        // `negotiated_version` when our `max_version` capped
+                        // the negotiation (e.g. a 1.2 client, a 1.1 server).
+                        // Per the RFC, a
                         // mismatch MUST behave exactly like a PKCS#1 padding
                         // failure: substitute `client_version || random` via
                         // a constant-time masked select — no branch, no
                         // distinct error — so a rollback probe is
                         // indistinguishable from a Bleichenbacher probe and
                         // the handshake only fails later at Finished.
-                        let offered = self.negotiated_version.as_u16().to_be_bytes();
+                        let offered = self.client_offered_version.to_be_bytes();
                         let version_bad = !(pm[0].ct_eq(&offered[0]) & pm[1].ct_eq(&offered[1]));
                         let mut substitute = [0u8; 48];
                         self.rng.fill_bytes(&mut substitute);

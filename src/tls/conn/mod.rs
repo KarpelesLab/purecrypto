@@ -7061,6 +7061,133 @@ mod tls12_loopback_tests {
         (client, server)
     }
 
+    /// Drives a client offering TLS 1.0..=`client_max` (AEAD + CBC suites)
+    /// against a server floored at TLS 1.0 and capped at `server_max`.
+    /// Returns the pair after the handshake loop, or the first error.
+    #[cfg(feature = "tls-legacy")]
+    fn run_capped_server(
+        client_max: crate::tls::ProtocolVersion,
+        client_min: crate::tls::ProtocolVersion,
+        server_max: crate::tls::ProtocolVersion,
+        suites: &[CipherSuite],
+        accept_sentinel: bool,
+    ) -> Result<(ClientConnection12, ServerConnection12<HmacDrbg<Sha256>>), crate::tls::Error> {
+        use crate::tls::ProtocolVersion;
+        let (server_config, cert_der) = rsa_server12();
+        let server_config = server_config
+            .with_min_version(ProtocolVersion::TLSv1_0)
+            .with_max_version(server_max);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"capped-server-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"capped-server-s", b"nonce", &[]);
+        let cfg = client_config12(roots)
+            .with_min_version(client_min)
+            .with_max_version(client_max)
+            .with_accept_downgrade_sentinel(accept_sentinel);
+        let mut client = ClientConnection12::new_with_offer(
+            cfg,
+            "loopback.example",
+            &mut crng,
+            suites,
+            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets()?;
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets()?;
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        Ok((client, server))
+    }
+
+    /// Issue #81: a server capped at TLS 1.1/1.0 answers a client that offers
+    /// TLS 1.2 with its own maximum (picking a CBC suite) instead of TLS 1.2.
+    /// It does not support 1.2, so it sets no `DOWNGRD` sentinel: a client
+    /// that refuses sentinels still completes. Static RSA covers the
+    /// premaster rollback check, which must compare against the version the
+    /// client offered (1.2), not the one negotiated.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls12_server_honours_max_version_below_1_2() {
+        use crate::tls::ProtocolVersion;
+        for (server_max, name) in [
+            (ProtocolVersion::TLSv1_1, "TLSv1.1"),
+            (ProtocolVersion::TLSv1_0, "TLSv1.0"),
+        ] {
+            for suite in [
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+                CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            ] {
+                let suites = [CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, suite];
+                let (mut client, mut server) = run_capped_server(
+                    ProtocolVersion::TLSv1_2,
+                    ProtocolVersion::TLSv1_0,
+                    server_max,
+                    &suites,
+                    false,
+                )
+                .unwrap();
+                assert!(!client.is_handshaking() && !server.is_handshaking());
+                assert_eq!(server.protocol_version(), Some(name));
+                assert_eq!(client.protocol_version(), Some(name));
+                assert_eq!(server.negotiated_cipher_suite(), Some(suite.0));
+
+                client.send_application_data(b"ping").unwrap();
+                let c = client.write_tls();
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+                assert_eq!(server.take_received_plaintext(), b"ping");
+            }
+        }
+    }
+
+    /// Issue #81: a client that only speaks TLS 1.2 is refused by a server
+    /// capped at TLS 1.1 (the negotiated version would fall below the
+    /// client's floor; the server answers TLS 1.1 and the client aborts).
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls12_only_client_is_refused_by_a_tls11_capped_server() {
+        use crate::tls::ProtocolVersion;
+        let r = run_capped_server(
+            ProtocolVersion::TLSv1_2,
+            ProtocolVersion::TLSv1_2,
+            ProtocolVersion::TLSv1_1,
+            &[
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            ],
+            true,
+        );
+        assert!(matches!(r, Err(crate::tls::Error::UnsupportedVersion)));
+    }
+
+    /// The `DOWNGRD\x00` sentinel is still set when the server does support
+    /// TLS 1.2 and negotiates lower because the client asked for it.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls12_capable_server_still_marks_a_legacy_downgrade() {
+        use crate::tls::ProtocolVersion;
+        let r = run_capped_server(
+            ProtocolVersion::TLSv1_1,
+            ProtocolVersion::TLSv1_0,
+            ProtocolVersion::TLSv1_2,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA],
+            false,
+        );
+        assert!(matches!(r, Err(crate::tls::Error::IllegalParameter)));
+    }
+
     /// A record header claiming a `len`-byte fragment, with no body.
     fn bare_record_header(len: usize) -> Vec<u8> {
         let mut h = alloc::vec![ContentType::ApplicationData.as_u8(), 0x03, 0x03];

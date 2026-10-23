@@ -437,6 +437,12 @@ pub(crate) struct ClientConfig {
     /// refuse it (other server name, weaker verification, expired), when the
     /// ticket cannot fit a ClientHello, or when real ECH seals the hello.
     pub tls12_session: Option<super::StoredSession12>,
+    /// With [`Self::offer_tls12`], also offer the deprecated TLS 1.0/1.1 CBC
+    /// suites so a server capped below TLS 1.2 can pick one; the downgraded
+    /// 1.2 engine then runs the legacy handshake. Set by the version-spanning
+    /// front-end when `Config::min_version` is below TLS 1.2.
+    #[cfg(feature = "tls-legacy")]
+    pub(crate) offer_legacy: bool,
     /// Groups the first ClientHello carries a `key_share` for (a subset of
     /// the offered groups). Empty (the default) means every offered group
     /// when [`Self::groups`] is set, and [`DEFAULT_SHARE_GROUPS`] when it
@@ -511,6 +517,8 @@ impl ClientConfig {
             key_log: None,
             offer_tls12: false,
             tls12_session: None,
+            #[cfg(feature = "tls-legacy")]
+            offer_legacy: false,
             key_share_groups: Vec::new(),
             groups: Vec::new(),
             #[cfg(feature = "ech")]
@@ -1567,6 +1575,14 @@ impl ClientConnection {
         let suites = if config.offer_tls12 && !config_wants_real_ech(&config) {
             let mut available: Vec<CipherSuite> = DEFAULT_SUITES.to_vec();
             available.extend(super::SUITES_12.iter().map(|p| p.suite));
+            #[cfg(feature = "tls-legacy")]
+            if config.offer_legacy {
+                available.extend(
+                    crate::tls::crypto::cbc_rec::LEGACY_CBC_SUITES
+                        .iter()
+                        .map(|p| p.suite),
+                );
+            }
             super::select_offered_suites(&config.cipher_suites, &available)?
         } else {
             super::select_offered_suites(&config.cipher_suites, &DEFAULT_SUITES)?
@@ -2864,8 +2880,23 @@ impl ClientConnection {
         if msg_type != hs_type::SERVER_HELLO {
             return Err(Error::UnexpectedMessage);
         }
-        let sh = ServerHello::decode(body)?;
+        // A hello that also offered the TLS 1.0/1.1 CBC suites (`offer_legacy`)
+        // accepts a pre-1.2 `server_version`, which only ever leads to the
+        // downgrade below; every other hello keeps the strict 0x0303 check.
+        #[cfg(feature = "tls-legacy")]
+        let (sh, legacy_selected) = if self.offer_tls12 && self.config.offer_legacy {
+            let (sh, v) = ServerHello::decode_relaxed(body)?;
+            (sh, v < 0x0303)
+        } else {
+            (ServerHello::decode(body)?, false)
+        };
+        #[cfg(not(feature = "tls-legacy"))]
+        let (sh, legacy_selected) = (ServerHello::decode(body)?, false);
         if is_hello_retry_request(&sh.random) {
+            // RFC 8446 §4.1.4: a HelloRetryRequest carries 0x0303.
+            if legacy_selected {
+                return Err(Error::Decode);
+            }
             return self.on_hello_retry_request(sh, raw);
         }
 
@@ -2900,6 +2931,11 @@ impl ClientConnection {
             Some(sv) => ext::parse_selected_version(sv)? == crate::tls::ProtocolVersion::TLSv1_3,
             None => false,
         };
+        // A pre-1.2 `server_version` next to `supported_versions = 1.3` is
+        // contradictory (RFC 8446 §4.1.3 fixes 0x0303 for TLS 1.3).
+        if legacy_selected && selected_tls13 {
+            return Err(Error::IllegalParameter);
+        }
         if !selected_tls13 {
             // RFC 8446 §4.1.4: the server "MUST NOT change" its selected
             // version between the HelloRetryRequest and the ServerHello —

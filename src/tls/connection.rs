@@ -2210,6 +2210,12 @@ pub(crate) fn tls13_client_config(
             // ticket, and the downgraded engine picks the rest of it up
             // through `tls12_client_config`.
             cc.offer_tls12 = min_version != ProtocolVersion::TLSv1_3;
+            // A floor below TLS 1.2 also offers the legacy CBC suites, so a
+            // server capped at TLS 1.1/1.0 can still answer this hello.
+            #[cfg(feature = "tls-legacy")]
+            {
+                cc.offer_legacy = min_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16();
+            }
             if cc.offer_tls12
                 && let Some(ResumptionSession(ResumptionSessionKind::Tls12(s))) = resumption
             {
@@ -2771,6 +2777,11 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     #[cfg(feature = "tls-legacy")]
     {
         sc = sc.with_min_version(min_version);
+        // The 1.2 engine caps at TLS 1.2; only propagate a lower max so a
+        // legacy-only server answers a 1.2 client with its configured maximum.
+        if max_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16() {
+            sc = sc.with_max_version(max_version);
+        }
     }
     Ok(super::conn::ServerConnection12::new(sc, config_rng(cfg)?))
 }
@@ -4523,6 +4534,60 @@ mod tests {
             server.negotiated_cipher_suite(),
             client.negotiated_cipher_suite()
         );
+    }
+
+    /// Issue #81 through the public `Config`, mirroring php-src's
+    /// `tls_min_v1.0_max_v1.1_wrapper.phpt`: a server with versions
+    /// `TLSv1_0..=TLSv1_1` serves 1.0 and 1.1 clients, refuses a 1.2-only
+    /// client, and answers a default-range (`..=TLSv1_3`) client with 1.1.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls_server_capped_below_tls12_negotiates_its_maximum() {
+        let key = crate::test_util::rsa_test_key_a();
+        let name = DistinguishedName::common_name("tls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let boxed = crate::rsa::BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let server_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_0, ProtocolVersion::TLSv1_1)
+            .identity(
+                alloc::vec![cert.to_der().to_vec()],
+                super::super::config::SigningKey::Rsa(boxed),
+            )
+            .build();
+        let client_cfg = |min, max| {
+            Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .versions(min, max)
+                .server_name("tls.example")
+                .verify_certificates(false)
+                .build()
+        };
+        use ProtocolVersion::{TLSv1_0, TLSv1_1, TLSv1_2, TLSv1_3};
+        for (min, max, expect) in [
+            (TLSv1_0, TLSv1_0, Some(TLSv1_0)),
+            (TLSv1_1, TLSv1_1, Some(TLSv1_1)),
+            (TLSv1_0, TLSv1_2, Some(TLSv1_1)),
+            (TLSv1_0, TLSv1_3, Some(TLSv1_1)),
+            (TLSv1_2, TLSv1_2, None),
+            (TLSv1_2, TLSv1_3, None),
+        ] {
+            let mut client = Connection::client(&client_cfg(min, max)).unwrap();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let r = try_drive_pair(&mut client, &mut server);
+            match expect {
+                Some(v) => {
+                    r.unwrap_or_else(|e| panic!("{min:?}..={max:?}: {e:?}"));
+                    assert_eq!(server.negotiated_version(), Some(v), "{min:?}..={max:?}");
+                    assert_eq!(client.negotiated_version(), Some(v), "{min:?}..={max:?}");
+                }
+                None => assert!(r.is_err(), "{min:?}..={max:?} should be refused"),
+            }
+        }
     }
 
     /// A version-spanning server `Config` whose identity is also offered as
