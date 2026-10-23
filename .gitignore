@@ -15,3 +15,6 @@ tools/interop/peers/apple/.build/
 tools/interop/peers/apple/.build.log
 tools/interop/peers/apple/.swiftpm/
 tools/pairing-interop/bn254/ark/Cargo.lock
+
+# Python bytecode from the tools/ scripts
+__pycache__/
