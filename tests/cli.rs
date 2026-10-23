@@ -8153,8 +8153,12 @@ fn dtls_connection_ids_survive_a_client_rebind() {
             server_err.contains("peer address updated: 127.0.0.1:"),
             "{version}: server:\n{server_err}"
         );
+        // The client's close_notify is one unretransmitted datagram from the
+        // rebound port (DTLS does not resend alerts), so it can be lost —
+        // seen on the Windows runner. Require only that the server reached
+        // its session report, not that the goodbye arrived.
         assert!(
-            server_err.contains("close_notify: received"),
+            server_err.contains("close_notify: "),
             "{version}: server:\n{server_err}"
         );
     }
