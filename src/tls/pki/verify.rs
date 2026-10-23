@@ -491,6 +491,17 @@ fn verify_chain_inner(
     let anchor_at = anchor_at.ok_or(Error::BadCertificate)?;
     let path = &certs[..anchor_at];
 
+    // The store's distrust list (e.g. `cacrt`'s blocklist of compromised
+    // intermediates and disabled roots) applies to every certificate in the
+    // validated path and to the anchor's key: a blocked key is refused even
+    // when it is re-issued, cross-signed or installed as a root.
+    for cert in path {
+        store.check_distrust(cert)?;
+    }
+    if let Some(anchor) = matched_anchor {
+        store.check_distrust_spki(&anchor.spki_der)?;
+    }
+
     // The remaining per-certificate checks apply to the validated path only.
     for cert in path {
         // RFC 5280 §4.1.1.2 / §4.1.2.3: inner `signature` AlgorithmIdentifier
@@ -4349,6 +4360,65 @@ mod tests {
         // and must still validate.
         let (store, chain) = build_chain_with_int_eku(&[]);
         verify_chain_now(&store, &chain).unwrap();
+    }
+
+    /// The store's distrust list refuses a chain through a distrusted
+    /// intermediate (by key or by fingerprint), a distrusted leaf, and a
+    /// chain anchored on a distrusted root key. Entries that match nothing
+    /// in the path leave verification untouched.
+    #[test]
+    fn distrust_list_refuses_listed_keys_and_certificates() {
+        use crate::hash::sha256;
+        let (store, chain) = build_chain_with_int_eku(&[]);
+        verify_chain_now(&store, &chain).unwrap();
+        let leaf = Certificate::from_der(chain[0].clone()).unwrap();
+        let int = Certificate::from_der(chain[1].clone()).unwrap();
+        let (_, root_spki) = store.anchor_identities().next().unwrap();
+        let root_spki_hash = sha256(root_spki);
+
+        let with = |f: &dyn Fn(&mut RootCertStore)| {
+            let mut s = store.clone();
+            f(&mut s);
+            s
+        };
+        for (what, s) in [
+            (
+                "intermediate key",
+                with(&|s| s.distrust_spki_sha256(sha256(int.spki_der().unwrap()))),
+            ),
+            (
+                "intermediate cert",
+                with(&|s| s.distrust_cert_sha256(sha256(&chain[1]))),
+            ),
+            (
+                "leaf key",
+                with(&|s| s.distrust_spki_sha256(sha256(leaf.spki_der().unwrap()))),
+            ),
+            (
+                "root key",
+                with(&|s| s.distrust_spki_sha256(root_spki_hash)),
+            ),
+        ] {
+            assert!(
+                matches!(verify_chain_now(&s, &chain), Err(Error::BadCertificate)),
+                "{what} not refused"
+            );
+        }
+
+        // Unrelated entries change nothing; the original store is untouched
+        // by the clones above (copy-on-write).
+        let s = with(&|s| {
+            s.distrust_spki_sha256([0x11; 32]);
+            s.distrust_cert_sha256([0x22; 32]);
+        });
+        verify_chain_now(&s, &chain).unwrap();
+        verify_chain_now(&store, &chain).unwrap();
+
+        // `is_distrusted` reports the same thing for a single certificate.
+        let s = with(&|s| s.distrust_cert_sha256(sha256(&chain[1])));
+        assert!(s.is_distrusted(&chain[1]));
+        assert!(!s.is_distrusted(&chain[0]));
+        assert!(!store.is_distrusted(&chain[1]));
     }
 
     #[test]

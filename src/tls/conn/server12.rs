@@ -2223,6 +2223,13 @@ impl<R: RngCore> ServerConnection12<R> {
                     mac.update(&(spki.len() as u32).to_be_bytes());
                     mac.update(spki);
                 }
+                // A distrust entry added since the ticket was issued must
+                // not be skipped by resuming it. An empty list adds nothing,
+                // so tickets of stores without one are unaffected.
+                for (tag, hash) in policy.roots.distrust_identities() {
+                    mac.update(&[tag]);
+                    mac.update(hash);
+                }
             }
         }
         let out = mac.finalize();

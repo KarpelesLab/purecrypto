@@ -66,6 +66,12 @@ pub(crate) struct TrustAnchor {
 /// [`RootCertStore::add_der`] for the handling of constraint forms the
 /// validator cannot evaluate.
 ///
+/// A store can also carry a *distrust list*: public keys and certificates
+/// that must never be accepted, wherever they appear in a chain (a
+/// compromised intermediate, a disabled root reached through a cross-sign).
+/// See [`RootCertStore::distrust_spki_sha256`]. The embedded bundle
+/// (`RootCertStore::with_embedded_roots`, feature `embedded-roots`) loads `cacrt`'s blocklist into it.
+///
 /// Cloning a store is cheap: the anchors are shared behind a reference
 /// count (every connection built from a [`crate::tls::Config`] takes its own
 /// copy of the store, and a full embedded root bundle is hundreds of parsed
@@ -73,6 +79,21 @@ pub(crate) struct TrustAnchor {
 #[derive(Clone, Default)]
 pub struct RootCertStore {
     anchors: Arc<Vec<TrustAnchor>>,
+    distrusted: Arc<Distrust>,
+}
+
+/// The distrust list of a [`RootCertStore`]: SHA-256 hashes of refused
+/// `SubjectPublicKeyInfo`s and of refused whole certificates (DER).
+#[derive(Clone, Default)]
+struct Distrust {
+    spki_sha256: Vec<[u8; 32]>,
+    cert_sha256: Vec<[u8; 32]>,
+}
+
+impl Distrust {
+    fn is_empty(&self) -> bool {
+        self.spki_sha256.is_empty() && self.cert_sha256.is_empty()
+    }
 }
 
 impl RootCertStore {
@@ -80,6 +101,7 @@ impl RootCertStore {
     pub fn new() -> Self {
         RootCertStore {
             anchors: Arc::new(Vec::new()),
+            distrusted: Arc::new(Distrust::default()),
         }
     }
 
@@ -166,6 +188,10 @@ impl RootCertStore {
     /// `no_std`-with-alloc targets — unlike reading an OS bundle such as
     /// `/etc/ssl/certs/ca-certificates.crt`. Requires the `embedded-roots`
     /// feature.
+    ///
+    /// The store also carries `cacrt`'s blocklist (see
+    /// [`Self::add_embedded_blocklist`]), so a compromised intermediate or a
+    /// disabled root is refused even when a peer presents it.
     #[cfg(feature = "embedded-roots")]
     pub fn with_embedded_roots() -> Self {
         let mut store = RootCertStore::new();
@@ -174,7 +200,10 @@ impl RootCertStore {
     }
 
     /// Adds every certificate from the embedded [`cacrt`] bundle as a trust
-    /// anchor, returning the number successfully added. Requires the
+    /// anchor, returning the number successfully added. Also loads `cacrt`'s
+    /// blocklist (see [`Self::add_embedded_blocklist`]): the bundle and its
+    /// blocklist are curated together, and the roots alone would still
+    /// accept a compromised intermediate they issued. Requires the
     /// `embedded-roots` feature.
     ///
     /// [`cacrt`]: https://crates.io/crates/cacrt
@@ -186,7 +215,106 @@ impl RootCertStore {
                 added += 1;
             }
         }
+        self.add_embedded_blocklist();
         added
+    }
+
+    /// Adds `cacrt`'s blocklist to this store's distrust list, returning the
+    /// number of entries. It names disabled roots and compromised
+    /// intermediates. Each entry distrusts its public key (so a re-issued or
+    /// cross-signed certificate for the same key is refused too) and its
+    /// exact certificate.
+    ///
+    /// [`Self::with_embedded_roots`] and [`Self::add_embedded_roots`] call
+    /// this already; call it directly to apply the blocklist to a store
+    /// built from another bundle (an OS `ca-certificates.crt`, say).
+    /// Requires the `embedded-roots` feature.
+    #[cfg(feature = "embedded-roots")]
+    pub fn add_embedded_blocklist(&mut self) -> usize {
+        let blocked = cacrt::blocked();
+        for b in blocked {
+            self.distrust_spki_sha256(*b.spki_sha256());
+            self.distrust_cert_sha256(*b.cert_sha256());
+        }
+        blocked.len()
+    }
+
+    /// Distrusts every certificate whose `SubjectPublicKeyInfo` (DER) has
+    /// this SHA-256 hash — the same value as an HPKP / `openssl x509
+    /// -pubkey | openssl pkey -pubin -outform der | sha256sum` pin. Chain
+    /// verification refuses such a certificate anywhere in the validated
+    /// path, and refuses a trust anchor carrying that key.
+    pub fn distrust_spki_sha256(&mut self, spki_sha256: [u8; 32]) {
+        let d = Arc::make_mut(&mut self.distrusted);
+        if !d.spki_sha256.contains(&spki_sha256) {
+            d.spki_sha256.push(spki_sha256);
+        }
+    }
+
+    /// Distrusts the one certificate whose DER encoding has this SHA-256
+    /// hash (its usual fingerprint). Chain verification refuses it anywhere
+    /// in the validated path. Prefer
+    /// [`distrust_spki_sha256`](Self::distrust_spki_sha256) when the key
+    /// itself is compromised: it also catches re-issued certificates.
+    pub fn distrust_cert_sha256(&mut self, cert_sha256: [u8; 32]) {
+        let d = Arc::make_mut(&mut self.distrusted);
+        if !d.cert_sha256.contains(&cert_sha256) {
+            d.cert_sha256.push(cert_sha256);
+        }
+    }
+
+    /// Whether the DER certificate `cert_der` is on this store's distrust
+    /// list, by its own fingerprint or by its public key. A certificate that
+    /// does not parse is reported as not distrusted (verification refuses
+    /// it anyway).
+    pub fn is_distrusted(&self, cert_der: &[u8]) -> bool {
+        if self.distrusted.is_empty() {
+            return false;
+        }
+        match Certificate::from_der(cert_der.to_vec()) {
+            Ok(cert) => self.check_distrust(&cert).is_err(),
+            Err(_) => false,
+        }
+    }
+
+    /// Refuses `cert` when its fingerprint or its public key is distrusted.
+    pub(crate) fn check_distrust(&self, cert: &Certificate) -> Result<(), Error> {
+        if self.distrusted.is_empty() {
+            return Ok(());
+        }
+        let spki = cert.spki_der().map_err(|_| Error::BadCertificate)?;
+        self.check_distrust_spki(spki)?;
+        let fp = crate::hash::sha256(cert.to_der());
+        if self.distrusted.cert_sha256.contains(&fp) {
+            return Err(Error::BadCertificate);
+        }
+        Ok(())
+    }
+
+    /// Refuses a public key (`SubjectPublicKeyInfo` DER) that is distrusted.
+    pub(crate) fn check_distrust_spki(&self, spki_der: &[u8]) -> Result<(), Error> {
+        if self.distrusted.spki_sha256.is_empty() {
+            return Ok(());
+        }
+        if self
+            .distrusted
+            .spki_sha256
+            .contains(&crate::hash::sha256(spki_der))
+        {
+            return Err(Error::BadCertificate);
+        }
+        Ok(())
+    }
+
+    /// The distrust list as `(tag, hash)` pairs (`0` = public key, `1` =
+    /// certificate), in insertion order. Folded into session-ticket bindings
+    /// next to [`anchor_identities`](Self::anchor_identities).
+    pub(crate) fn distrust_identities(&self) -> impl Iterator<Item = (u8, &[u8; 32])> {
+        self.distrusted
+            .spki_sha256
+            .iter()
+            .map(|h| (0u8, h))
+            .chain(self.distrusted.cert_sha256.iter().map(|h| (1u8, h)))
     }
 
     /// Clone the entire store (compatibility shim for the unified
@@ -272,6 +400,31 @@ mod embedded_roots_tests {
                 );
             }
         }
+    }
+
+    /// `cacrt`'s blocklist is loaded with the bundle, and none of the
+    /// bundled roots is itself on it (that would silently distrust a root
+    /// the bundle ships).
+    #[test]
+    fn embedded_roots_load_the_blocklist() {
+        let store = RootCertStore::with_embedded_roots();
+        let blocked = cacrt::blocked();
+        assert!(!blocked.is_empty(), "cacrt ships an empty blocklist");
+        let spkis = store.distrust_identities().filter(|(t, _)| *t == 0).count();
+        let certs = store.distrust_identities().filter(|(t, _)| *t == 1).count();
+        assert!(spkis >= 1 && spkis <= blocked.len());
+        assert_eq!(certs, blocked.len());
+        for ca in cacrt::all() {
+            assert!(
+                !store.is_distrusted(ca.der()),
+                "embedded root {} is on the blocklist",
+                ca.label()
+            );
+        }
+
+        let mut custom = RootCertStore::new();
+        assert_eq!(custom.add_embedded_blocklist(), blocked.len());
+        assert!(custom.is_empty());
     }
 
     #[test]

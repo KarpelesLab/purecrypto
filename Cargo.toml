@@ -391,7 +391,7 @@ compcol = { version = "0.7.2", default-features = false, features = ["zlib", "zs
 # small, well-defined surface — enabled by default rather than treated as a
 # foreign-code dependency. Powers `RootCertStore::with_embedded_roots` under
 # the `embedded-roots` feature.
-cacrt = { version = "0.1", default-features = false, optional = true }
+cacrt = { version = "0.1.4", default-features = false, optional = true }
 # Optional async/reactor I/O adapters for the sans-I/O TLS engine, each behind
 # its own off-by-default feature. They are pure glue over the public
 # `Connection`/`Readiness` surface and never compile unless requested, so the
