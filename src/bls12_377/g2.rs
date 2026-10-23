@@ -315,4 +315,63 @@ mod tests {
         z[191] ^= 1;
         assert_eq!(G2::from_uncompressed(&z), Err(Error::NotOnCurve));
     }
+    /// The endomorphism-split multiplication against the plain windowed
+    /// ladder on edge scalars — 0, 1, r − 1, the powers of `x` and their
+    /// neighbours, the all-maximal base-`x` / base-`x²` digit patterns —
+    /// and pseudo-random ones, on the generator and a second point.
+    #[test]
+    fn gls_mul_matches_ladder() {
+        let g = G2::generator();
+        let p = g.mul(&Fr::from_u64(0x0f0f_1234_5678_9abc));
+        let x = Fr::from_u64(X);
+        let (x2, x3) = (x * x, x * x * x);
+        let one = Fr::ONE;
+        let mut cases = [Fr::ZERO; 48];
+        let edge = [
+            Fr::ZERO,
+            one,
+            one + one,
+            -one,
+            -one - one,
+            x,
+            x - one,
+            x + one,
+            x2,
+            x2 - one,
+            x2 + one,
+            x3,
+            x3 - one,
+            x3 + one,
+            -x + one,
+            -x2 + one,
+            -x3 + one,
+            // Every base-x² digit maximal: (x² − 1)(1 + x²).
+            (x2 - one) * (one + x2),
+            // Every base-x digit maximal: (x − 1)(1 + x + x² + x³).
+            (x - one) * (one + x + x2 + x3),
+            (x - one) * x3,
+            (x2 - one) * x2,
+            Fr::from_u64(u64::MAX),
+            Fr::from_u64(u64::MAX) * Fr::from_u64(u64::MAX),
+            -Fr::from_u64(u64::MAX),
+        ];
+        cases[..edge.len()].copy_from_slice(&edge);
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for c in cases[edge.len()..].iter_mut() {
+            let mut wide = [0u8; 64];
+            for b in wide.iter_mut() {
+                s = s
+                    .wrapping_mul(0x5851_F42D_4C95_7F2D)
+                    .wrapping_add(0x1405_7B7E_F767_814F);
+                *b = (s >> 56) as u8;
+            }
+            *c = Fr::from_bytes_wide(&wide);
+        }
+        for k in &cases {
+            let limbs = k.to_canonical();
+            assert_eq!(p.mul(k), G2(p.0.mul_limbs(&limbs)), "k = {limbs:x?}");
+            assert_eq!(g.mul(k), G2(g.0.mul_limbs(&limbs)), "k = {limbs:x?}");
+        }
+        assert_eq!(G2::IDENTITY.mul(&x), G2::IDENTITY);
+    }
 }
