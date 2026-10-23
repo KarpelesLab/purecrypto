@@ -75,6 +75,7 @@ use purecrypto::ct::hooks::{self, Suite};
 use purecrypto::ascon::{Ascon128, Ascon128a, AsconAead128};
 use purecrypto::bignum::{BoxedUint, Uint};
 use purecrypto::bls;
+use purecrypto::bn254;
 use purecrypto::chunked::{self, Cobblestone128};
 use purecrypto::cipher::{
     Aegis128, Aegis128L, Aes128, Aes128Ccm, Aes128Eax, Aes128Kw, Aes128Kwp, Aes128Xts, Aes192,
@@ -707,6 +708,45 @@ fn bls12381_sign() -> String {
         .sign(bls::Scheme::Basic, b"ct_valgrind message")
         .to_bytes();
     format!("pk={} sig={}", hex8(public(&pk)), hex8(public(&sig)))
+}
+
+/// A secret BN254 scalar (64 classified bytes, reduced: no rejection branch).
+fn bn254_scalar(seed: u64) -> bn254::Fr {
+    bn254::Fr::from_bytes_wide(&secret_bytes::<64>(seed))
+}
+
+fn bn254_g1_mul() -> String {
+    let k = bn254_scalar(260);
+    let p = bn254::G1::generator().mul(&k).to_uncompressed();
+    format!("kG1={}", hex8(public(&p)))
+}
+
+fn bn254_g2_mul() -> String {
+    let k = bn254_scalar(261);
+    let q = bn254::G2::generator().mul(&k).to_uncompressed();
+    format!("kG2={}", hex8(public(&q)))
+}
+
+fn bn254_gt_pow() -> String {
+    // The base is public (a pairing of the generators); the exponent secret.
+    let e = bn254::pairing(&bn254::G1::generator(), &bn254::G2::generator());
+    let k = bn254_scalar(262);
+    let t = e.pow(&k).to_bytes();
+    format!("e^k={}", hex8(public(&t)))
+}
+
+fn bn254_hash_to_curve() -> String {
+    // A secret message (as in an OPRF or a blinded credential).
+    let msg = secret_bytes::<48>(263);
+    let p = bn254::hash_to_g1(&msg, b"ct_valgrind BN254G1").to_uncompressed();
+    let q = bn254::hash_to_g2(&msg, b"ct_valgrind BN254G2").to_uncompressed();
+    let p2 = bn254::encode_to_g1(&msg, b"ct_valgrind BN254G1 NU").to_uncompressed();
+    format!(
+        "h1={} h2={} e1={}",
+        hex8(public(&p)),
+        hex8(public(&q)),
+        hex8(public(&p2))
+    )
 }
 
 fn lms_h5_sign() -> String {
@@ -2569,6 +2609,10 @@ const CASES: &[Case] = &[
     ("hpke_x25519_chacha", hpke_x25519_chacha),
     ("hpke_p256_aes128gcm", hpke_p256_aes128gcm),
     ("bls12381_sign", bls12381_sign),
+    ("bn254_g1_mul", bn254_g1_mul),
+    ("bn254_g2_mul", bn254_g2_mul),
+    ("bn254_gt_pow", bn254_gt_pow),
+    ("bn254_hash_to_curve", bn254_hash_to_curve),
     ("lms_h5_sign", lms_h5_sign),
     ("x25519", x25519),
     ("x448", x448),

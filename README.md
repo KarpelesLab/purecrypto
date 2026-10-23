@@ -144,6 +144,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `dh` | Finite-field DH over RFC 3526 groups 14 to 18 plus RFC 4419 group exchange |
 | `dsa` | FIPS 186-4 DSA (2048/224, 2048/256, 3072/256) with RFC 6979 nonces, for legacy interop (opt-in) |
 | `bls` | BLS12-381 pairing, RFC 9380 hash-to-curve, BLS signatures (Basic, message augmentation, proof of possession, aggregation) (opt-in) |
+| `bn254` | BN254 (`alt_bn128`) pairing, EIP-196/197 encodings and the `ecPairing` check, RFC 9380 SVDW hash-to-curve; gnark-crypto-compatible; ~100-bit security, for interop (opt-in, allocator-free) |
 | `fpe` | NIST SP 800-38G FF1 format-preserving encryption over AES, any radix up to 65536 (opt-in) |
 | `chunked` | C2SP chunked encryption (Cobblestone-128/256): streaming, seekable, key-committing AES-GCM (opt-in) |
 | `jose` | JWK / JWK Sets, JWS and JWE (RFC 7515-7518, 8037) with a strict self-contained JSON parser |
@@ -182,7 +183,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 
 The default feature set is `std` plus most modules and the CLI. Opt-in
 features are `quic`, `hpke`, `ech`, `falcon`, `ristretto255`, `bip340`, the
-`zkp-*` set, the `hazmat-*` set, `dsa`, `bls`, `fpe`, `chunked`,
+`zkp-*` set, the `hazmat-*` set, `dsa`, `bls`, `bn254`, `fpe`, `chunked`,
 `legacy-ec`, `ec-custom`, `legacy-ciphers`, `vmac`, `tls-legacy`, `wasi-getrandom`,
 `ffi`, `tokio` and `mio`. Disable the defaults for a `no_std` build and re-enable
 only what you need:

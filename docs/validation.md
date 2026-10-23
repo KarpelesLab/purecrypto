@@ -57,6 +57,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `fpe` | NIST SP 800-38G FF1 (Rev. 1 `radix^n >= 10^6` floor; 2016 floor via `new_legacy`) | NIST FF1 samples (AES-128/192/256, radix 10 and 36); **Wycheproof** (22 files: 13 radices as digit lists, 9 as alphabets) | — | — | AES CT; the digit arithmetic is data-dependent by the nature of FPE |
 | `dsa` | FIPS 186-4 (2048/224, 2048/256, 3072/256), RFC 6979 nonces | RFC 6979 A.2.1/A.2.2; **Wycheproof** (8 files) | — | — | CT ladder + CT inverse of `k`; legacy interop only |
 | `bls` | BLS12-381, RFC 9380 (`BLS12381G2_XMD:SHA-256_SSWU_RO_`, G1 too), draft-irtf-cfrg-bls-signature (min-pubkey-size; Basic / Aug / PoP) | RFC 9380 J.9.1 / J.10.1 / K; Ethereum bls12-381-tests; **Wycheproof** (4 files) | — | — | fixed-limb Montgomery fields; masked-window scalar mult; complete addition |
+| `bn254` | BN254 optimal ate pairing (gnark-crypto / arkworks value), EIP-196/197 encodings + `ecPairing`, RFC 9380 SVDW (`BN254G1_XMD:SHA-256_SVDW_RO_` / `_NU_`, G2 too) | 114 gnark-crypto v0.21 oracle records (`tools/pairing-interop/bn254/`): encodings, scalar mult, addition, GT values, 12 pairing checks, 20 hash-to-curve, raw maps, off-subgroup G2 rejections; 82 of them re-verified against arkworks 0.5 | gnark-crypto, arkworks (black-box) | — | fixed-limb Montgomery fields; masked-window scalar mult and `Gt::pow`; complete addition (no 2-torsion on either curve); straight-line SVDW |
 | `chunked` | c2sp.org/chunked-encryption (Cobblestone-128/256) | **Wycheproof** (2 files) | — | — | delegates to AES-GCM / HKDF; commitment checked in CT before any chunk |
 | `jose` | RFC 7515/7516/7517/7518/7638/8037 (JWS, JWE, JWK, thumbprints, OKP) | RFC appendix examples (bit-exact); **Wycheproof** (4 JOSE files + 6 JWK key-agreement files) | — | — | single collapsed error for every verification/decryption failure; RSA1_5 via implicit rejection |
 | `der` | ITU-T X.690 | unit | — | `der_reader`, `pem_decode` | n/a (public) |
@@ -981,7 +982,9 @@ Every entry runs the positive control, then the full case list.
   sign / ECDH (boxed path), secp256k1 ECDSA sign and ECDH, BIP340 Schnorr
   sign, ristretto255 scalar multiplication, SM2 sign and encrypt / decrypt
   (tampered ciphertext), DSA-2048 sign, FFDH group14, HPKE (X25519 and
-  P-256 KEMs, seal + open + forged ciphertext), BLS12-381 signing; the
+  P-256 KEMs, seal + open + forged ciphertext), BLS12-381 signing, BN254
+  `G1`/`G2` scalar multiplication, `Gt` exponentiation and hash-to-curve of a
+  secret message; the
   `zkp` modules — sign-to-contract, adaptor encrypt / decrypt / recover,
   Pedersen commit + an 8-bit range proof, a 3-input surjection proof and a
   3-key whitelist proof, the ring position classified as secret in the last
