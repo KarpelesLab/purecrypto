@@ -106,6 +106,9 @@ pub mod bls;
 #[cfg(feature = "bn254")]
 pub mod bn254;
 
+#[cfg(feature = "bls12-377")]
+pub mod bls12_377;
+
 #[cfg(any(feature = "bls", feature = "bn254", feature = "bls12-377"))]
 mod pairing_common;
 

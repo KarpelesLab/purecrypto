@@ -75,6 +75,7 @@ use purecrypto::ct::hooks::{self, Suite};
 use purecrypto::ascon::{Ascon128, Ascon128a, AsconAead128};
 use purecrypto::bignum::{BoxedUint, Uint};
 use purecrypto::bls;
+use purecrypto::bls12_377;
 use purecrypto::bn254;
 use purecrypto::chunked::{self, Cobblestone128};
 use purecrypto::cipher::{
@@ -735,6 +736,33 @@ fn bn254_gt_pow() -> String {
     format!("e^k={}", hex8(public(&t)))
 }
 
+/// A secret BLS12-377 scalar from 64 classified bytes (wide reduction, so
+/// no rejection on secret data).
+fn bls12377_scalar(tag: u64) -> bls12_377::Fr {
+    bls12_377::Fr::from_bytes_wide(&secret_bytes::<64>(tag))
+}
+
+fn bls12377_g1_mul() -> String {
+    let k = bls12377_scalar(7701);
+    let p = bls12_377::G1::generator() * k;
+    let q = bls12_377::G1::hash_to_curve(b"public point", b"ct_valgrind") * k;
+    let (pc, qc) = (p.to_compressed(), q.to_compressed());
+    format!("kG={} kQ={}", hex8(public(&pc)), hex8(public(&qc)))
+}
+
+fn bls12377_g2_mul() -> String {
+    let k = bls12377_scalar(7702);
+    let p = (bls12_377::G2::generator() * k).to_compressed();
+    format!("kG={}", hex8(public(&p)))
+}
+
+fn bls12377_gt_pow() -> String {
+    let k = bls12377_scalar(7703);
+    let e = bls12_377::pairing(&bls12_377::G1::generator(), &bls12_377::G2::generator());
+    let t = e.pow(&k).to_bytes();
+    format!("e^k={}", hex8(public(&t)))
+}
+
 fn bn254_hash_to_curve() -> String {
     // A secret message (as in an OPRF or a blinded credential).
     let msg = secret_bytes::<48>(263);
@@ -746,6 +774,20 @@ fn bn254_hash_to_curve() -> String {
         hex8(public(&p)),
         hex8(public(&q)),
         hex8(public(&p2))
+    )
+}
+
+fn bls12377_hash_to_curve() -> String {
+    let msg = secret_bytes::<48>(7704);
+    let dst = b"QUUX-V01-CS02-with-BLS12377G1_XMD:SHA-256_SSWU_RO_";
+    let h1 = bls12_377::hash_to_g1(&msg, dst).to_compressed();
+    let e1 = bls12_377::encode_to_g1(&msg, dst).to_compressed();
+    let h2 = bls12_377::hash_to_g2(&msg, dst).to_compressed();
+    format!(
+        "h1={} e1={} h2={}",
+        hex8(public(&h1)),
+        hex8(public(&e1)),
+        hex8(public(&h2))
     )
 }
 
@@ -2613,6 +2655,10 @@ const CASES: &[Case] = &[
     ("bn254_g2_mul", bn254_g2_mul),
     ("bn254_gt_pow", bn254_gt_pow),
     ("bn254_hash_to_curve", bn254_hash_to_curve),
+    ("bls12377_g1_mul", bls12377_g1_mul),
+    ("bls12377_g2_mul", bls12377_g2_mul),
+    ("bls12377_gt_pow", bls12377_gt_pow),
+    ("bls12377_hash_to_curve", bls12377_hash_to_curve),
     ("lms_h5_sign", lms_h5_sign),
     ("x25519", x25519),
     ("x448", x448),

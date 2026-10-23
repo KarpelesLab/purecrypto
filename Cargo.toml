@@ -476,7 +476,7 @@ required-features = ["std", "cipher", "hash", "ec", "rsa", "mlkem", "mldsa", "sl
 [[test]]
 name = "ct_valgrind"
 harness = false
-required-features = ["__ct-check", "std", "hash", "cipher", "kdf", "rng", "rsa", "ec", "mlkem", "mldsa", "slhdsa", "der", "dh", "ascon", "alloc", "mac", "hpke", "bls", "bn254", "lms", "xmss", "falcon", "tls", "dtls", "quic", "bip340", "zkp", "ristretto255", "dsa", "chunked", "jose", "aez", "legacy-ciphers", "vmac"]
+required-features = ["__ct-check", "std", "hash", "cipher", "kdf", "rng", "rsa", "ec", "mlkem", "mldsa", "slhdsa", "der", "dh", "ascon", "alloc", "mac", "hpke", "bls", "bn254", "bls12-377", "lms", "xmss", "falcon", "tls", "dtls", "quic", "bip340", "zkp", "ristretto255", "dsa", "chunked", "jose", "aez", "legacy-ciphers", "vmac"]
 
 [lints.rust]
 # `fullrust` is a custom, out-of-tree `target_os` (a libc-free Linux

@@ -347,7 +347,7 @@ jobs:
           - shard: pqc-and-protocols
             features: mlkem mldsa hazmat-mldsa slhdsa lms xmss falcon x509 pkcs12 tls dtls quic tls-legacy ech cert-compression embedded-roots tokio mio ffi cli bls bn254 jose chunked
           - shard: zkp
-            features: zkp-rangeproof zkp-halfagg zkp-surjection zkp-whitelist zkp-adaptor zkp-pedersen zkp-sign-to-contract zkp zkp-h-table
+            features: zkp-rangeproof zkp-halfagg zkp-surjection zkp-whitelist zkp-adaptor zkp-pedersen zkp-sign-to-contract zkp zkp-h-table bls12-377
     steps:
       - uses: actions/checkout@v7
 
