@@ -1,7 +1,7 @@
 //! The group `G1 = E(Fp)` of BN254, `E: y² = x³ + 3`, of prime order `r`.
 
-use super::constants::{G1_X, G1_Y};
-use super::curve::Projective;
+use super::constants::{G1_X, G1_Y, GLV_BASIS, GLV_BETA, GLV_G, GLV_NEG};
+use super::curve::{Projective, babai_decompose, sign_magnitude};
 use super::fp::Fp;
 use super::fr::Fr;
 use super::{Error, ops_for_group};
@@ -80,14 +80,37 @@ impl G1 {
         G1(self.0.neg())
     }
 
-    /// `k·P`, constant time in `k` (fixed 4-bit windows, masked table
-    /// gathers, complete formulas).
+    /// `k·P`, constant time in `k`.
+    ///
+    /// GLV: `φ(x, y) = (βx, y)` acts on `G1` as a cube root of unity `λ`,
+    /// so with the Babai split `k ≡ s₀ + s₁λ (mod r)` along the short
+    /// lattice basis (`|sᵢ| < 2^127`, proved by `tools/bn254/consts.py`)
+    /// `k·P = |s₀|·(±P) + |s₁|·(±φ(P))`, a two-dimensional multi-scalar
+    /// multiplication over 128-bit digits with the signs applied by masked
+    /// negation. Complete formulas, masked table gathers, fixed schedule.
     pub fn mul(&self, k: &Fr) -> G1 {
         // The canonical limbs are the scalar in the clear; bind them so they
         // can be wiped, rather than leaving them as an unnamed temporary.
         let mut limbs = k.to_canonical();
-        let r = G1(self.0.mul_limbs(&limbs));
+        let mut s = babai_decompose(&limbs, &GLV_BASIS, &GLV_G, &GLV_NEG);
+        let (n0, mut m0) = sign_magnitude(&s[0]);
+        let (n1, mut m1) = sign_magnitude(&s[1]);
+        let phi = Projective {
+            x: self.0.x.mul(&GLV_BETA),
+            y: self.0.y,
+            z: self.0.z,
+        };
+        let points = [self.0.conditional_neg(n0), phi.conditional_neg(n1)];
+        let mut digits = [
+            m0[0] as u128 | (m0[1] as u128) << 64,
+            m1[0] as u128 | (m1[1] as u128) << 64,
+        ];
+        let r = G1(Projective::mul_2x128(&points, &digits));
         limbs.zeroize();
+        s.zeroize();
+        m0.zeroize();
+        m1.zeroize();
+        digits.zeroize();
         r
     }
 
@@ -251,5 +274,35 @@ mod tests {
         assert_eq!(G1::from_affine(x, y).unwrap(), g);
         assert_eq!(G1::from_affine(x, x), Err(Error::NotOnCurve));
         assert_eq!(G1::from_affine(Fp::ZERO, Fp::ZERO), Err(Error::NotOnCurve));
+    }
+    /// The endomorphism-split multiplication against the plain windowed
+    /// ladder on the generated edge scalars (Babai rounding half-way points,
+    /// eigenvalues, worst-case sub-scalars) and pseudo-random ones, on the
+    /// generator and on a second point.
+    #[test]
+    fn glv_mul_matches_ladder() {
+        use super::super::constants::BABAI_EDGE_SCALARS;
+        let g = G1::generator();
+        let p = g.mul(&Fr::from_u64(0x0f0f_1234_5678_9abc));
+        assert_eq!(p, G1(g.0.mul_limbs(&[0x0f0f_1234_5678_9abc, 0, 0, 0])));
+        let mut random = [[0u64; 4]; 24];
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for k in random.iter_mut() {
+            for l in k.iter_mut() {
+                s = s
+                    .wrapping_mul(0x5851_F42D_4C95_7F2D)
+                    .wrapping_add(0x1405_7B7E_F767_814F);
+                *l = s ^ (s >> 29);
+            }
+            k[3] &= 0x2fff_ffff_ffff_ffff;
+        }
+        for k in BABAI_EDGE_SCALARS.iter().chain(random.iter()) {
+            let mut be = [0u8; 32];
+            crate::pairing_common::mont::to_be_bytes(k, &mut be);
+            let fr = Fr::from_bytes(&be).expect("edge scalars are canonical");
+            assert_eq!(p.mul(&fr), G1(p.0.mul_limbs(k)), "k = {k:x?}");
+            assert_eq!(g.mul(&fr), G1(g.0.mul_limbs(k)), "k = {k:x?}");
+        }
+        assert_eq!(G1::IDENTITY.mul(&Fr::from_u64(7)), G1::IDENTITY);
     }
 }

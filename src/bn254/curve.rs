@@ -11,10 +11,13 @@
 //! in hash-to-curve runs on arbitrary twist points). `tools/bn254/consts.py`
 //! checks both group orders.
 //!
-//! Scalar multiplication by a secret runs fixed 4-bit windows over every bit
-//! of the scalar with each table entry fetched by a masked pass over the
-//! whole table, so neither the schedule nor the memory access pattern
-//! depends on the scalar.
+//! Scalar multiplication by a secret splits the scalar along the curve's
+//! endomorphism (GLV on `G1`, four-dimensional GLS on `G2`) by a
+//! fixed-point Babai round-off ([`babai_decompose`]) and runs simultaneous
+//! fixed windows with every table entry fetched by a masked pass over the
+//! whole table. The sub-scalars are signed; their signs are applied by
+//! masked point negation. Neither the schedule nor the memory access
+//! pattern depends on the scalar.
 
 use super::Error;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
@@ -246,7 +249,10 @@ impl<F: CurveField> Projective<F> {
     /// `k·P` for a little-endian limb scalar, constant time in `k`: fixed
     /// 4-bit windows over every bit of `k` (four doublings and one complete
     /// addition each), each digit's entry fetched from the 16-entry table by
-    /// a masked pass over all entries.
+    /// a masked pass over all entries. The plain ladder the
+    /// endomorphism-split multiplications are tested against; valid on any
+    /// point, subgroup or not.
+    #[cfg(test)]
     pub(crate) fn mul_limbs(&self, k: &[u64; 4]) -> Self {
         let mut table = [Self::IDENTITY; 16];
         for i in 1..16 {
@@ -261,6 +267,75 @@ impl<F: CurveField> Projective<F> {
             // The selected entry and the digit that picked it are the scalar
             // window in the clear; wipe them rather than leave them in the
             // frame.
+            entry.zeroize();
+            digit.zeroize();
+        }
+        for t in table.iter_mut() {
+            t.zeroize();
+        }
+        acc
+    }
+
+    /// `-P` when `negate` is true, `P` otherwise (masked selection).
+    #[inline]
+    pub(crate) fn conditional_neg(&self, negate: Choice) -> Self {
+        Self::conditional_select(&self.neg(), self, negate)
+    }
+
+    /// `Σ dᵢ·Pᵢ` for four 64-bit digits, constant time in the digits:
+    /// simultaneous 1-bit windows over the 16 subset sums of the points,
+    /// 64 doublings and 64 masked-gather additions.
+    pub(crate) fn mul_4x64(points: &[Self; 4], digits: &[u64; 4]) -> Self {
+        let mut table = [Self::IDENTITY; 16];
+        for (i, p) in points.iter().enumerate() {
+            let bit = 1 << i;
+            table[bit] = *p;
+            for j in 1..bit {
+                table[bit + j] = table[j].add(p);
+            }
+        }
+        let mut acc = Self::IDENTITY;
+        for bit in (0..64).rev() {
+            acc = acc.double();
+            let mut digit = 0u64;
+            for (i, d) in digits.iter().enumerate() {
+                digit |= ((d >> bit) & 1) << i;
+            }
+            let mut entry = Self::gather(&table, digit);
+            acc = acc.add(&entry);
+            entry.zeroize();
+            digit.zeroize();
+        }
+        for t in table.iter_mut() {
+            t.zeroize();
+        }
+        acc
+    }
+
+    /// `d₀·P₀ + d₁·P₁` for two 128-bit digits, constant time in the
+    /// digits: simultaneous 2-bit windows over the 16 combinations
+    /// `a·P₀ + b·P₁` (`a, b < 4`), 128 doublings and 64 masked-gather
+    /// additions.
+    pub(crate) fn mul_2x128(points: &[Self; 2], digits: &[u128; 2]) -> Self {
+        let mut table = [Self::IDENTITY; 16];
+        table[1] = points[0];
+        table[2] = points[0].double();
+        table[3] = table[2].add(&points[0]);
+        table[4] = points[1];
+        table[8] = points[1].double();
+        table[12] = table[8].add(&points[1]);
+        for b in [4usize, 8, 12] {
+            for a in 1..4 {
+                table[a + b] = table[a].add(&table[b]);
+            }
+        }
+        let mut acc = Self::IDENTITY;
+        for w in (0..64).rev() {
+            acc = acc.double().double();
+            let shift = 2 * w;
+            let mut digit = (((digits[0] >> shift) & 3) | ((digits[1] >> shift) & 3) << 2) as u64;
+            let mut entry = Self::gather(&table, digit);
+            acc = acc.add(&entry);
             entry.zeroize();
             digit.zeroize();
         }
@@ -380,6 +455,133 @@ impl<F: CurveField> Projective<F> {
         }
         Ok(p)
     }
+}
+
+/// The Babai round-off shift `M`: `cⱼ = ⌊(k·gⱼ + 2^(M−1)) / 2^M⌋`.
+const BABAI_SHIFT: usize = 320;
+
+/// Splits a scalar `k < r` along a reduced lattice basis of the
+/// endomorphism's kernel lattice (`D = 2` for GLV on `G1`, `D = 4` for GLS
+/// on `G2`): returns `s = (k, 0, …) − Σⱼ cⱼ·bⱼ`, each `sᵢ` as a
+/// two's-complement 256-bit value, with `cⱼ` Babai's rounding of
+/// `k·αⱼ/r` computed from the fixed-point constants `gⱼ ≈ 2^320·|αⱼ|/r`
+/// (signs `neg`). Then `k ≡ Σ sᵢλⁱ (mod r)` and `|sᵢ|` is below the bound
+/// `tools/bn254/consts.py` proves (`2^127` for GLV, `2^64` for GLS).
+///
+/// Constant time in `k`: fixed-length schoolbook products and wrapping
+/// additions; the only branches are on the public basis and sign tables.
+pub(crate) fn babai_decompose<const D: usize>(
+    k: &[u64; 4],
+    basis: &[[i128; D]; D],
+    g: &[[u64; 4]; D],
+    neg: &[bool; D],
+) -> [[u64; 4]; D] {
+    // |cⱼ| < 2^192: the top three limbs of k·gⱼ + 2^319.
+    let mut c = [[0u64; 4]; D];
+    for (cj, gj) in c.iter_mut().zip(g.iter()) {
+        let mut t = mul_wide(k, gj);
+        let mut carry = 1u64 << 63;
+        for limb in t.iter_mut().skip(BABAI_SHIFT / 64 - 1) {
+            let (v, cy) = mont::adc(*limb, carry, 0);
+            *limb = v;
+            carry = cy;
+        }
+        *cj = [t[5], t[6], t[7], 0];
+        t.zeroize();
+    }
+    let mut s = [[0u64; 4]; D];
+    s[0] = *k;
+    for j in 0..D {
+        for i in 0..D {
+            let b = basis[j][i];
+            if b == 0 {
+                continue;
+            }
+            let mut prod = mul_lo_u128(&c[j], b.unsigned_abs());
+            // sᵢ −= (±|cⱼ|)·bⱼᵢ; the product's sign is public.
+            s[i] = if (b < 0) == neg[j] {
+                wrapping_sub(&s[i], &prod)
+            } else {
+                wrapping_add(&s[i], &prod)
+            };
+            prod.zeroize();
+        }
+    }
+    for cj in c.iter_mut() {
+        cj.zeroize();
+    }
+    s
+}
+
+/// The sign and magnitude of a two's-complement 256-bit value, branch-free.
+pub(crate) fn sign_magnitude(s: &[u64; 4]) -> (Choice, [u64; 4]) {
+    let bit = s[3] >> 63;
+    let mask = mont::mask_from_bit(bit);
+    let mut out = [0u64; 4];
+    let mut carry = bit;
+    for (o, l) in out.iter_mut().zip(s.iter()) {
+        let (v, c) = mont::adc(l ^ mask, carry, 0);
+        *o = v;
+        carry = c;
+    }
+    (Choice::from(bit as u8), out)
+}
+
+/// The full 512-bit product `a·b` (schoolbook, fixed schedule).
+fn mul_wide(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
+    let mut t = [0u64; 8];
+    for i in 0..4 {
+        let mut carry = 0u64;
+        for j in 0..4 {
+            let (v, c) = mont::mac(t[i + j], a[i], b[j], carry);
+            t[i + j] = v;
+            carry = c;
+        }
+        t[i + 4] = carry;
+    }
+    t
+}
+
+/// `a·b mod 2^256` for a 128-bit `b`.
+fn mul_lo_u128(a: &[u64; 4], b: u128) -> [u64; 4] {
+    let b = [b as u64, (b >> 64) as u64];
+    let mut t = [0u64; 4];
+    for i in 0..4 {
+        let mut carry = 0u64;
+        for (j, bj) in b.iter().enumerate() {
+            if i + j < 4 {
+                let (v, c) = mont::mac(t[i + j], a[i], *bj, carry);
+                t[i + j] = v;
+                carry = c;
+            }
+        }
+        if i + 2 < 4 {
+            t[i + 2] = carry;
+        }
+    }
+    t
+}
+
+fn wrapping_add(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    let mut out = [0u64; 4];
+    let mut carry = 0u64;
+    for i in 0..4 {
+        let (v, c) = mont::adc(a[i], b[i], carry);
+        out[i] = v;
+        carry = c;
+    }
+    out
+}
+
+fn wrapping_sub(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    let mut out = [0u64; 4];
+    let mut borrow = 0u64;
+    for i in 0..4 {
+        let (v, bo) = mont::sbb(a[i], b[i], borrow);
+        out[i] = v;
+        borrow = bo;
+    }
+    out
 }
 
 impl CurveField for super::fp::Fp {
@@ -509,5 +711,105 @@ impl CurveField for super::fp2::Fp2 {
         b0.copy_from_slice(&bytes[32..]);
         super::fp::Fp::from_bytes(&b1)
             .and_then(|c1| super::fp::Fp::from_bytes(&b0).map(|c0| Self::new(c0, c1)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::constants::{
+        BABAI_EDGE_SCALARS, GLS_BASIS, GLS_G, GLS_NEG, GLV_BASIS, GLV_G, GLV_NEG, X,
+    };
+    use super::super::fr::Fr;
+    use super::*;
+
+    fn fr_i128(v: i128) -> Fr {
+        let m = v.unsigned_abs();
+        let f = Fr::from_u64((m >> 64) as u64) * Fr::from_u64(1 << 32) * Fr::from_u64(1 << 32)
+            + Fr::from_u64(m as u64);
+        if v < 0 { -f } else { f }
+    }
+
+    fn fr_signed(s: &[u64; 4]) -> (Fr, [u64; 4]) {
+        let (neg, mag) = sign_magnitude(s);
+        let mut be = [0u8; 32];
+        mont::to_be_bytes(&mag, &mut be);
+        let f = Fr::from_bytes(&be).expect("small magnitude");
+        (if bool::from(neg) { -f } else { f }, mag)
+    }
+
+    fn fr_of(k: &[u64; 4]) -> Fr {
+        let mut be = [0u8; 32];
+        mont::to_be_bytes(k, &mut be);
+        Fr::from_bytes(&be).expect("canonical")
+    }
+
+    /// Every split recombines to `k` and respects the proven bounds.
+    #[test]
+    fn babai_splits_recombine_within_bounds() {
+        let lambda = -fr_i128(GLV_BASIS[0][0]) * fr_i128(GLV_BASIS[0][1]).invert().unwrap();
+        let x = Fr::from_u64(X);
+        let mu = Fr::from_u64(6) * x * x;
+        for b in GLV_BASIS.iter() {
+            assert_eq!(fr_i128(b[0]) + fr_i128(b[1]) * lambda, Fr::ZERO);
+        }
+        for b in GLS_BASIS.iter() {
+            let mut acc = Fr::ZERO;
+            let mut pw = Fr::ONE;
+            for e in b {
+                acc += fr_i128(*e) * pw;
+                pw *= mu;
+            }
+            assert_eq!(acc, Fr::ZERO);
+        }
+        for k in BABAI_EDGE_SCALARS.iter() {
+            let s = babai_decompose(k, &GLV_BASIS, &GLV_G, &GLV_NEG);
+            let (s0, m0) = fr_signed(&s[0]);
+            let (s1, m1) = fr_signed(&s[1]);
+            assert_eq!(s0 + s1 * lambda, fr_of(k), "k = {k:x?}");
+            for m in [m0, m1] {
+                assert!(
+                    m[2] == 0 && m[3] == 0 && m[1] >> 63 == 0,
+                    "GLV bound, k = {k:x?}"
+                );
+            }
+            let s = babai_decompose(k, &GLS_BASIS, &GLS_G, &GLS_NEG);
+            let mut acc = Fr::ZERO;
+            let mut pw = Fr::ONE;
+            for si in s.iter() {
+                let (f, m) = fr_signed(si);
+                assert!(m[1] == 0 && m[2] == 0 && m[3] == 0, "GLS bound, k = {k:x?}");
+                acc += f * pw;
+                pw *= mu;
+            }
+            assert_eq!(acc, fr_of(k), "k = {k:x?}");
+        }
+    }
+
+    #[test]
+    fn limb_helpers_edges() {
+        assert_eq!(sign_magnitude(&[0; 4]).1, [0; 4]);
+        assert!(!bool::from(sign_magnitude(&[0; 4]).0));
+        let (n, m) = sign_magnitude(&[u64::MAX; 4]);
+        assert!(bool::from(n) && m == [1, 0, 0, 0]);
+        let (n, m) = sign_magnitude(&[0, 0, 0, 1 << 63]);
+        assert!(bool::from(n) && m == [0, 0, 0, 1 << 63]);
+        let (n, m) = sign_magnitude(&[5, 0, 0, 0]);
+        assert!(!bool::from(n) && m == [5, 0, 0, 0]);
+        assert_eq!(
+            wrapping_sub(&[3, 0, 0, 0], &[5, 0, 0, 0]),
+            [u64::MAX - 1, u64::MAX, u64::MAX, u64::MAX]
+        );
+        assert_eq!(wrapping_add(&[u64::MAX; 4], &[1, 0, 0, 0]), [0; 4]);
+        assert_eq!(
+            mul_lo_u128(&[u64::MAX; 4], 2),
+            [u64::MAX - 1, u64::MAX, u64::MAX, u64::MAX]
+        );
+        assert_eq!(
+            mul_lo_u128(&[1, 2, 3, 4], (7u128 << 64) | 5),
+            [5, 17, 29, 41]
+        );
+        let w = mul_wide(&[u64::MAX; 4], &[u64::MAX; 4]);
+        // (2^256 − 1)² = 2^512 − 2^257 + 1.
+        assert_eq!(w, [1, 0, 0, 0, u64::MAX - 1, u64::MAX, u64::MAX, u64::MAX]);
     }
 }

@@ -1,8 +1,8 @@
 //! The group `G2 ⊂ E'(Fp2)` of BN254 on the D-type sextic twist
 //! `E': y² = x³ + 3/(9 + u)`.
 
-use super::constants::{FROB_2, FROB_3, G2_X, G2_Y, X};
-use super::curve::Projective;
+use super::constants::{FROB_2, FROB_3, G2_X, G2_Y, GLS_BASIS, GLS_G, GLS_NEG, X};
+use super::curve::{Projective, babai_decompose, sign_magnitude};
 use super::fp2::Fp2;
 use super::fr::Fr;
 use super::{Error, ops_for_group};
@@ -105,12 +105,33 @@ impl G2 {
         G2(self.0.neg())
     }
 
-    /// `k·P`, constant time in `k` (fixed 4-bit windows, masked table
-    /// gathers, complete formulas).
+    /// `k·P`, constant time in `k`.
+    ///
+    /// Four-dimensional GLS: `ψ` acts on `G2` as `6x² ≡ p (mod r)`, so
+    /// with the Babai split `k ≡ Σ sᵢ(6x²)ⁱ (mod r)` along the reduced
+    /// four-dimensional basis (`|sᵢ| < 2^64`, proved by
+    /// `tools/bn254/consts.py`) `k·P = Σ |sᵢ|·(±ψⁱ(P))`, a four-way
+    /// multi-scalar multiplication over 64-bit digits with the signs applied
+    /// by masked negation. Complete formulas, masked table gathers, fixed
+    /// schedule.
     pub fn mul(&self, k: &Fr) -> G2 {
         let mut limbs = k.to_canonical();
-        let r = G2(self.0.mul_limbs(&limbs));
+        let mut s = babai_decompose(&limbs, &GLS_BASIS, &GLS_G, &GLS_NEG);
+        let mut points = [self.0; 4];
+        for i in 1..4 {
+            points[i] = Self::psi(&points[i - 1]);
+        }
+        let mut digits = [0u64; 4];
+        for i in 0..4 {
+            let (n, mut m) = sign_magnitude(&s[i]);
+            points[i] = points[i].conditional_neg(n);
+            digits[i] = m[0];
+            m.zeroize();
+        }
+        let r = G2(Projective::mul_4x64(&points, &digits));
         limbs.zeroize();
+        s.zeroize();
+        digits.zeroize();
         r
     }
 
@@ -301,5 +322,35 @@ pub(crate) mod tests {
         let mut bad = c;
         bad[32..].copy_from_slice(&[0xff; 32]);
         assert_eq!(G2::from_compressed(&bad), Err(Error::InvalidEncoding));
+    }
+    /// The endomorphism-split multiplication against the plain windowed
+    /// ladder on the generated edge scalars (Babai rounding half-way points,
+    /// eigenvalues, worst-case sub-scalars) and pseudo-random ones, on the
+    /// generator and on a second point.
+    #[test]
+    fn gls_mul_matches_ladder() {
+        use super::super::constants::BABAI_EDGE_SCALARS;
+        let g = G2::generator();
+        let p = g.mul(&Fr::from_u64(0x0f0f_1234_5678_9abc));
+        assert_eq!(p, G2(g.0.mul_limbs(&[0x0f0f_1234_5678_9abc, 0, 0, 0])));
+        let mut random = [[0u64; 4]; 24];
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for k in random.iter_mut() {
+            for l in k.iter_mut() {
+                s = s
+                    .wrapping_mul(0x5851_F42D_4C95_7F2D)
+                    .wrapping_add(0x1405_7B7E_F767_814F);
+                *l = s ^ (s >> 29);
+            }
+            k[3] &= 0x2fff_ffff_ffff_ffff;
+        }
+        for k in BABAI_EDGE_SCALARS.iter().chain(random.iter()) {
+            let mut be = [0u8; 32];
+            crate::pairing_common::mont::to_be_bytes(k, &mut be);
+            let fr = Fr::from_bytes(&be).expect("edge scalars are canonical");
+            assert_eq!(p.mul(&fr), G2(p.0.mul_limbs(k)), "k = {k:x?}");
+            assert_eq!(g.mul(&fr), G2(g.0.mul_limbs(k)), "k = {k:x?}");
+        }
+        assert_eq!(G2::IDENTITY.mul(&Fr::from_u64(7)), G2::IDENTITY);
     }
 }
