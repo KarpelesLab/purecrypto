@@ -144,8 +144,8 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `dh` | Finite-field DH over RFC 3526 groups 14 to 18 plus RFC 4419 group exchange |
 | `dsa` | FIPS 186-4 DSA (2048/224, 2048/256, 3072/256) with RFC 6979 nonces, for legacy interop (opt-in) |
 | `bls` | BLS12-381 pairing, RFC 9380 hash-to-curve, BLS signatures (Basic, message augmentation, proof of possession, aggregation) (opt-in) |
-| `bn254` | BN254 (`alt_bn128`) pairing, EIP-196/197 encodings and the `ecPairing` check, RFC 9380 SVDW hash-to-curve; gnark-crypto-compatible; ~100-bit security, for interop (opt-in, allocator-free) |
-| `bls12-377` | BLS12-377 pairing (G1, G2, GT, multi-pairing), gnark-crypto-compatible hash-to-curve and encodings plus arkworks encodings; allocator-free (opt-in) |
+| `bn254` | BN254 (`alt_bn128`) pairing, EIP-196/197 encodings and the `ecPairing` check, RFC 9380 SVDW hash-to-curve, BLS signatures (`min_pk` / `min_sig`, all three draft schemes, aggregation; non-standard documented ciphersuite IDs); gnark-crypto-compatible; ~100-bit security, for interop (opt-in, allocator-free) |
+| `bls12-377` | BLS12-377 pairing (G1, G2, GT, multi-pairing), gnark-crypto-compatible hash-to-curve and encodings plus arkworks encodings, BLS signatures (`min_pk` / `min_sig`, all three draft schemes, aggregation; non-standard documented ciphersuite IDs); allocator-free (opt-in) |
 | `fpe` | NIST SP 800-38G FF1 format-preserving encryption over AES, any radix up to 65536 (opt-in) |
 | `chunked` | C2SP chunked encryption (Cobblestone-128/256): streaming, seekable, key-committing AES-GCM (opt-in) |
 | `jose` | JWK / JWK Sets, JWS and JWE (RFC 7515-7518, 8037) with a strict self-contained JSON parser |

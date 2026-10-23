@@ -59,6 +59,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `bls` | BLS12-381, RFC 9380 (`BLS12381G2_XMD:SHA-256_SSWU_RO_`, G1 too), draft-irtf-cfrg-bls-signature (min-pubkey-size; Basic / Aug / PoP) | RFC 9380 J.9.1 / J.10.1 / K; Ethereum bls12-381-tests; **Wycheproof** (4 files) | — | — | fixed-limb Montgomery fields; masked-window scalar mult; complete addition |
 | `bn254` | BN254 optimal ate pairing (gnark-crypto / arkworks value), EIP-196/197 encodings + `ecPairing`, RFC 9380 SVDW (`BN254G1_XMD:SHA-256_SVDW_RO_` / `_NU_`, G2 too) | 114 gnark-crypto v0.21 oracle records (`tools/pairing-interop/bn254/`): encodings, scalar mult, addition, GT values, 12 pairing checks, 20 hash-to-curve, raw maps, off-subgroup G2 rejections; 82 of them re-verified against arkworks 0.5 | gnark-crypto, arkworks (black-box) | — | fixed-limb Montgomery fields; masked-window scalar mult and `Gt::pow`; complete addition (no 2-torsion on either curve); straight-line SVDW |
 | `bls12-377` | BLS12-377 (Zexe), RFC 9380-style SSWU hash-to-curve with gnark-crypto's parameters (no RFC suite exists) | black-box KATs vs gnark-crypto v0.21 and arkworks 0.5 (scalar mult, both encodings, GT values, hash/encode, raw maps) | — | — | fixed-limb Montgomery fields; masked-window scalar mult; complete addition on the twist and in G1, 2-torsion-safe law for E(Fp) points (decoding, hashing) |
+| `bn254::min_pk`, `bn254::min_sig`, `bls12_377::min_pk`, `bls12_377::min_sig` | BLS signatures (`draft-irtf-cfrg-bls-signature-05`: KeyGen, Basic / Message Augmentation / Proof of Possession, Aggregate, AggregateVerify, FastAggregateVerify) under documented non-standard ciphersuite IDs (`BLS_SIG_<h2c suite>{NUL,AUG,POP}_`, `BLS_POP_<h2c suite>POP_`) | 120 records (`tools/pairing-interop/bls-sig/`): KeyGen from an independent stdlib-Python implementation of the draft; public keys, PoPs and all three schemes' signatures from gnark-crypto v0.21 scalar multiplication + hash-to-curve | gnark-crypto (black-box; it has no BLS signature API) | — | KeyGen wide reduction (the `SK = 0` retry is a declassified, ≈2⁻²⁵³ public decision); signing and PopProve by the constant-time scalar multiplication; Message Augmentation and aggregates are allocator-free (multi-part `expand_message_xmd`, stack-chunked pairing product); `ct_valgrind` `bn254_bls_sign` / `bls12377_bls_sign` |
 | `chunked` | c2sp.org/chunked-encryption (Cobblestone-128/256) | **Wycheproof** (2 files) | — | — | delegates to AES-GCM / HKDF; commitment checked in CT before any chunk |
 | `jose` | RFC 7515/7516/7517/7518/7638/8037 (JWS, JWE, JWK, thumbprints, OKP) | RFC appendix examples (bit-exact); **Wycheproof** (4 JOSE files + 6 JWK key-agreement files) | — | — | single collapsed error for every verification/decryption failure; RSA1_5 via implicit rejection |
 | `der` | ITU-T X.690 | unit | — | `der_reader`, `pem_decode` | n/a (public) |
@@ -987,7 +988,9 @@ Every entry runs the positive control, then the full case list.
   `G1`/`G2` scalar multiplication, `Gt` exponentiation and hash-to-curve of a
   secret message; BLS12-377
   G1 / G2 scalar multiplication, GT exponentiation and hash / encode to both
-  groups with a secret message; the
+  groups with a secret message; BN254 (`min_sig`) and BLS12-377 (`min_pk`) BLS
+  KeyGen from a secret IKM, signing (Basic and Message Augmentation) and
+  proofs of possession; the
   `zkp` modules — sign-to-contract, adaptor encrypt / decrypt / recover,
   Pedersen commit + an 8-bit range proof, a 3-input surjection proof and a
   3-key whitelist proof, the ring position classified as secret in the last
@@ -1057,7 +1060,8 @@ on a secret is a bug:
   AES-XTS `k1 == k2` check, the JOSE HS-family MAC verdict, a
   secp256k1 scalar's range and zero checks (`Scalar::from_bytes_be`, the
   BIP340 / sign-to-contract / adaptor / whitelist key checks), the DSA
-  `x` / `k` range check, the `zkp` consistency checks (an opening matches
+  `x` / `k` range check, the BN254 / BLS12-377 BLS secret-key zero check
+  (`SecretKey::from_bytes` / `from_scalar`), the `zkp` consistency checks (an opening matches
   its commitment, a ring key matches its secret, an index is in range) —
   all returned to the caller as `Ok`/`Err`. The TLS 1.3 / DTLS 1.3
   "inner plaintext is all zero" verdict (a protocol violation answered with
@@ -1066,7 +1070,8 @@ on a secret is a bug:
   and nonce candidates (ECDSA, DSA, sign-to-contract, and the key-pair
   draw of the multi-curve `ec::boxed` ECDH / ECDSA keys that the
   NIST-curve ML-KEM hybrid key shares use), SM2 nonce retries,
-  the ML-DSA signing loop, ML-DSA `RejBoundedPoly` (ExpandS), every RSA
+  the ML-DSA signing loop, ML-DSA `RejBoundedPoly` (ExpandS), the BN254 /
+  BLS12-377 BLS `KeyGen` retry on `SK = 0` (probability ≈ 2⁻²⁵³), every RSA
   key-generation decision (a composite candidate, `p = q`, `|p − q|` too
   small, `e` not invertible, the rare `2^64 | p − 1` Miller-Rabin tail),
   the Falcon signature norm bound, the Falcon sampler's loop controls (see

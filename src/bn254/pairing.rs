@@ -175,14 +175,65 @@ pub fn pairing(p: &G1, q: &G2) -> Gt {
 pub fn multi_pairing(pairs: &[(&G1, &G2)]) -> Gt {
     let mut f = Fp12::ONE;
     for chunk in pairs.chunks(CHUNK) {
-        let mut legs = [Leg::empty(); CHUNK];
-        for (leg, (p, q)) in legs.iter_mut().zip(chunk.iter()) {
-            *leg = Leg::new(p, q);
-        }
-        normalise(&mut legs[..chunk.len()]);
-        f = f.mul(&shared_miller_loop(&mut legs[..chunk.len()]));
+        f = f.mul(&chunk_miller_loop(chunk));
     }
     Gt(final_exponentiation(&f))
+}
+
+/// The shared Miller loop over at most `CHUNK` pairs.
+fn chunk_miller_loop(chunk: &[(&G1, &G2)]) -> Fp12 {
+    let mut legs = [Leg::empty(); CHUNK];
+    for (leg, (p, q)) in legs.iter_mut().zip(chunk.iter()) {
+        *leg = Leg::new(p, q);
+    }
+    normalise(&mut legs[..chunk.len()]);
+    shared_miller_loop(&mut legs[..chunk.len()])
+}
+
+/// A streaming `∏ e(Pᵢ, Qᵢ)`: pairs are pushed one at a time, buffered
+/// `CHUNK` deep on the stack and run through the shared Miller loop as each
+/// chunk fills, with one final exponentiation in [`finish`](Self::finish).
+/// Lets aggregate signature verification hash each message as it goes
+/// instead of collecting the points first (allocator-free).
+pub(crate) struct PairingAccumulator {
+    f: Fp12,
+    p: [G1; CHUNK],
+    q: [G2; CHUNK],
+    n: usize,
+}
+
+impl PairingAccumulator {
+    pub(crate) fn new() -> Self {
+        PairingAccumulator {
+            f: Fp12::ONE,
+            p: [G1::IDENTITY; CHUNK],
+            q: [G2::IDENTITY; CHUNK],
+            n: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, p: &G1, q: &G2) {
+        self.p[self.n] = *p;
+        self.q[self.n] = *q;
+        self.n += 1;
+        if self.n == CHUNK {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        let pairs: [(&G1, &G2); CHUNK] = core::array::from_fn(|i| (&self.p[i], &self.q[i]));
+        let m = chunk_miller_loop(&pairs[..self.n]);
+        self.f = self.f.mul(&m);
+        self.n = 0;
+    }
+
+    pub(crate) fn finish(mut self) -> Gt {
+        if self.n > 0 {
+            self.flush();
+        }
+        Gt(final_exponentiation(&self.f))
+    }
 }
 
 /// Whether `∏ e(Pᵢ, Qᵢ) = 1` — the pairing-product check of the Ethereum

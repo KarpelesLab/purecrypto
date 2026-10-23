@@ -39,6 +39,7 @@ use super::g1::G1;
 use super::g2::G2;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 pub use crate::pairing_common::expand_message_xmd;
+use crate::pairing_common::expand_message_xmd_parts;
 
 /// RFC 9380 `CMOV(a, b, c)`: `b` when `c` is true, else `a`.
 #[inline]
@@ -47,10 +48,10 @@ fn cmov<T: ConditionallySelectable>(a: &T, b: &T, c: Choice) -> T {
 }
 
 /// `hash_to_field` into `Fp` with `L = 64` and `N` outputs.
-fn hash_to_field_fp<const N: usize>(msg: &[u8], dst: &[u8]) -> [Fp; N] {
+fn hash_to_field_fp<const N: usize>(msg: &[&[u8]], dst: &[u8]) -> [Fp; N] {
     let mut buf = [0u8; 128];
     let buf = &mut buf[..64 * N];
-    expand_message_xmd(msg, dst, buf);
+    expand_message_xmd_parts(msg, dst, buf);
     let mut out = [Fp::ZERO; N];
     for (i, o) in out.iter_mut().enumerate() {
         let mut e = [0u8; 64];
@@ -62,10 +63,10 @@ fn hash_to_field_fp<const N: usize>(msg: &[u8], dst: &[u8]) -> [Fp; N] {
 
 /// `hash_to_field` into `Fp2` with `L = 64` and `N` outputs
 /// (`u_i = e_{i,0} + e_{i,1}·u`).
-fn hash_to_field_fp2<const N: usize>(msg: &[u8], dst: &[u8]) -> [Fp2; N] {
+fn hash_to_field_fp2<const N: usize>(msg: &[&[u8]], dst: &[u8]) -> [Fp2; N] {
     let mut buf = [0u8; 256];
     let buf = &mut buf[..128 * N];
-    expand_message_xmd(msg, dst, buf);
+    expand_message_xmd_parts(msg, dst, buf);
     let elem = |off: usize| {
         let mut e = [0u8; 64];
         e.copy_from_slice(&buf[off..off + 64]);
@@ -173,6 +174,11 @@ pub(crate) fn map_to_curve_g2(u: &Fp2) -> Projective<Fp2> {
 /// `HashToG1`) with the given domain separation tag, which must be
 /// non-empty (panics otherwise, see [`expand_message_xmd`]).
 pub fn hash_to_g1(msg: &[u8], dst: &[u8]) -> G1 {
+    hash_to_g1_parts(&[msg], dst)
+}
+
+/// [`hash_to_g1`] of the concatenation of `msg` (streamed, no buffer).
+pub(crate) fn hash_to_g1_parts(msg: &[&[u8]], dst: &[u8]) -> G1 {
     let [u0, u1] = hash_to_field_fp::<2>(msg, dst);
     let q = map_to_curve_g1(&u0).add_full(&map_to_curve_g1(&u1));
     G1::clear_cofactor(&q)
@@ -181,13 +187,18 @@ pub fn hash_to_g1(msg: &[u8], dst: &[u8]) -> G1 {
 /// `encode_to_curve` onto G1 (nonuniform variant, gnark-crypto's
 /// `EncodeToG1`): one field element, one map. Not a random oracle.
 pub fn encode_to_g1(msg: &[u8], dst: &[u8]) -> G1 {
-    let [u] = hash_to_field_fp::<1>(msg, dst);
+    let [u] = hash_to_field_fp::<1>(&[msg], dst);
     G1::clear_cofactor(&map_to_curve_g1(&u))
 }
 
 /// `hash_to_curve` onto G2 (random-oracle variant, gnark-crypto's
 /// `HashToG2`); `dst` must be non-empty.
 pub fn hash_to_g2(msg: &[u8], dst: &[u8]) -> G2 {
+    hash_to_g2_parts(&[msg], dst)
+}
+
+/// [`hash_to_g2`] of the concatenation of `msg` (streamed, no buffer).
+pub(crate) fn hash_to_g2_parts(msg: &[&[u8]], dst: &[u8]) -> G2 {
     let [u0, u1] = hash_to_field_fp2::<2>(msg, dst);
     let q = map_to_curve_g2(&u0).add(&map_to_curve_g2(&u1));
     G2::clear_cofactor(&q)
@@ -196,7 +207,7 @@ pub fn hash_to_g2(msg: &[u8], dst: &[u8]) -> G2 {
 /// `encode_to_curve` onto G2 (nonuniform variant, gnark-crypto's
 /// `EncodeToG2`). Not a random oracle.
 pub fn encode_to_g2(msg: &[u8], dst: &[u8]) -> G2 {
-    let [u] = hash_to_field_fp2::<1>(msg, dst);
+    let [u] = hash_to_field_fp2::<1>(&[msg], dst);
     G2::clear_cofactor(&map_to_curve_g2(&u))
 }
 

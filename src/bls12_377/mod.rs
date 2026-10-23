@@ -8,6 +8,11 @@
 //! `y² = x³ + 1/u` over `Fp2`), the optimal ate [`pairing`] into [`Gt`],
 //! [`multi_pairing`] / [`pairing_check`], and RFC 9380-style
 //! [hashing to both groups](hash_to_g1).
+//! On top, [`min_pk`] and [`min_sig`] provide BLS signatures
+//! (`draft-irtf-cfrg-bls-signature-05`, all three schemes and aggregation)
+//! with public keys in `G1` or in `G2` respectively — under documented,
+//! non-standard ciphersuite IDs, since the draft defines none for
+//! BLS12-377.
 //!
 //! # Interoperability
 //!
@@ -84,6 +89,8 @@ mod fr;
 mod g1;
 mod g2;
 mod hash_to_curve;
+pub mod min_pk;
+pub mod min_sig;
 mod pairing;
 #[cfg(test)]
 mod vectors;
@@ -116,6 +123,21 @@ pub enum Error {
     /// The element is on the curve (or in `Fp12*`) but outside the
     /// prime-order subgroup.
     NotInSubgroup,
+    /// The identity point where the BLS signature scheme forbids it (public
+    /// keys, aggregate public keys).
+    IdentityPoint,
+    /// A BLS secret key is zero or not a canonical scalar.
+    InvalidScalar,
+    /// BLS `KeyGen` was given fewer than 32 bytes of input keying material.
+    InsufficientKeyMaterial,
+    /// A BLS signature (or proof of possession) did not verify.
+    InvalidSignature,
+    /// A BLS aggregate operation was given no inputs.
+    EmptyAggregate,
+    /// The numbers of public keys and messages differ.
+    LengthMismatch,
+    /// The Basic scheme requires all messages of an aggregate to be distinct.
+    DuplicateMessage,
 }
 
 impl core::fmt::Display for Error {
@@ -126,6 +148,13 @@ impl core::fmt::Display for Error {
             Error::InvalidEncoding => "BLS12-377 encoding is not canonical",
             Error::NotOnCurve => "BLS12-377 point is not on the curve",
             Error::NotInSubgroup => "BLS12-377 element is not in the prime-order subgroup",
+            Error::IdentityPoint => "BLS12-377 identity point where it is forbidden",
+            Error::InvalidScalar => "BLS secret key is zero or not canonical",
+            Error::InsufficientKeyMaterial => "BLS KeyGen needs at least 32 bytes of IKM",
+            Error::InvalidSignature => "BLS signature verification failed",
+            Error::EmptyAggregate => "BLS aggregate over zero inputs",
+            Error::LengthMismatch => "BLS public key and message counts differ",
+            Error::DuplicateMessage => "BLS Basic scheme requires distinct messages",
         })
     }
 }

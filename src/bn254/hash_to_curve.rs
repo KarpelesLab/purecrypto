@@ -26,6 +26,7 @@ use super::g1::G1;
 use super::g2::G2;
 use crate::ct::{Choice, ConditionallySelectable};
 pub use crate::pairing_common::expand_message_xmd;
+use crate::pairing_common::expand_message_xmd_parts;
 
 /// RFC 9380 `CMOV(a, b, c)`: `b` when `c` is true, else `a`.
 #[inline]
@@ -109,10 +110,10 @@ fn map_to_curve_svdw<F: SvdwField>(u: &F) -> Projective<F> {
 }
 
 /// `hash_to_field` into `Fp` with `L = 48`, `count = N`.
-fn hash_to_field_fp<const N: usize>(msg: &[u8], dst: &[u8]) -> [Fp; N] {
+fn hash_to_field_fp<const N: usize>(msg: &[&[u8]], dst: &[u8]) -> [Fp; N] {
     let mut buf = [0u8; 96];
     let buf = &mut buf[..48 * N];
-    expand_message_xmd(msg, dst, buf);
+    expand_message_xmd_parts(msg, dst, buf);
     let mut out = [Fp::ZERO; N];
     for (o, c) in out.iter_mut().zip(buf.chunks_exact(48)) {
         let mut b = [0u8; 48];
@@ -123,10 +124,10 @@ fn hash_to_field_fp<const N: usize>(msg: &[u8], dst: &[u8]) -> [Fp; N] {
 }
 
 /// `hash_to_field` into `Fp2` (`m = 2`) with `L = 48`, `count = N`.
-fn hash_to_field_fp2<const N: usize>(msg: &[u8], dst: &[u8]) -> [Fp2; N] {
+fn hash_to_field_fp2<const N: usize>(msg: &[&[u8]], dst: &[u8]) -> [Fp2; N] {
     let mut buf = [0u8; 192];
     let buf = &mut buf[..96 * N];
-    expand_message_xmd(msg, dst, buf);
+    expand_message_xmd_parts(msg, dst, buf);
     let mut out = [Fp2::ZERO; N];
     for (o, c) in out.iter_mut().zip(buf.chunks_exact(96)) {
         let mut b0 = [0u8; 48];
@@ -142,6 +143,11 @@ fn hash_to_field_fp2<const N: usize>(msg: &[u8], dst: &[u8]) -> [Fp2; N] {
 /// `dst` is the domain separation tag and must be non-empty (panics
 /// otherwise, see [`expand_message_xmd`]).
 pub fn hash_to_g1(msg: &[u8], dst: &[u8]) -> G1 {
+    hash_to_g1_parts(&[msg], dst)
+}
+
+/// [`hash_to_g1`] of the concatenation of `msg` (streamed, no buffer).
+pub(crate) fn hash_to_g1_parts(msg: &[&[u8]], dst: &[u8]) -> G1 {
     let [u0, u1] = hash_to_field_fp::<2>(msg, dst);
     G1(map_to_curve_svdw(&u0).add(&map_to_curve_svdw(&u1)))
 }
@@ -150,13 +156,18 @@ pub fn hash_to_g1(msg: &[u8], dst: &[u8]) -> G1 {
 /// evaluation, cheaper than [`hash_to_g1`] but not uniformly distributed —
 /// not a random oracle. `dst` must be non-empty.
 pub fn encode_to_g1(msg: &[u8], dst: &[u8]) -> G1 {
-    let [u] = hash_to_field_fp::<1>(msg, dst);
+    let [u] = hash_to_field_fp::<1>(&[msg], dst);
     G1(map_to_curve_svdw(&u))
 }
 
 /// Hashes `msg` to `G2` (`BN254G2_XMD:SHA-256_SVDW_RO_`, a random oracle).
 /// `dst` must be non-empty.
 pub fn hash_to_g2(msg: &[u8], dst: &[u8]) -> G2 {
+    hash_to_g2_parts(&[msg], dst)
+}
+
+/// [`hash_to_g2`] of the concatenation of `msg` (streamed, no buffer).
+pub(crate) fn hash_to_g2_parts(msg: &[&[u8]], dst: &[u8]) -> G2 {
     let [u0, u1] = hash_to_field_fp2::<2>(msg, dst);
     G2::clear_cofactor(&map_to_curve_svdw(&u0).add(&map_to_curve_svdw(&u1)))
 }
@@ -164,7 +175,7 @@ pub fn hash_to_g2(msg: &[u8], dst: &[u8]) -> G2 {
 /// Encodes `msg` to `G2` (`BN254G2_XMD:SHA-256_SVDW_NU_`, not a random
 /// oracle). `dst` must be non-empty.
 pub fn encode_to_g2(msg: &[u8], dst: &[u8]) -> G2 {
-    let [u] = hash_to_field_fp2::<1>(msg, dst);
+    let [u] = hash_to_field_fp2::<1>(&[msg], dst);
     G2::clear_cofactor(&map_to_curve_svdw(&u))
 }
 

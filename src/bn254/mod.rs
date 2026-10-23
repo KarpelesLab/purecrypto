@@ -11,6 +11,10 @@
 //! pairings, the raw EIP-197 precompile ([`pairing_check_eip197`]), and
 //! RFC 9380 hash-to-curve with the Shallue–van de Woestijne map
 //! ([`hash_to_g1`], [`hash_to_g2`] and the non-uniform `encode_to_*`).
+//! On top, [`min_pk`] and [`min_sig`] provide BLS signatures
+//! (`draft-irtf-cfrg-bls-signature-05`, all three schemes and aggregation)
+//! with public keys in `G1` or in `G2` respectively — under documented,
+//! non-standard ciphersuite IDs, since the draft defines none for BN254.
 //!
 //! Interoperability is byte-exact with gnark-crypto (and, for pairing
 //! values, arkworks): the uncompressed point encodings are the EIP-196/197
@@ -77,6 +81,8 @@ mod fr;
 mod g1;
 mod g2;
 mod hash_to_curve;
+pub mod min_pk;
+pub mod min_sig;
 mod pairing;
 #[cfg(test)]
 mod vectors;
@@ -107,6 +113,21 @@ pub enum Error {
     NotOnCurve,
     /// The point (or `Gt` element) is outside the prime-order subgroup.
     NotInSubgroup,
+    /// The identity point where the BLS signature scheme forbids it (public
+    /// keys, aggregate public keys).
+    IdentityPoint,
+    /// A BLS secret key is zero or not a canonical scalar.
+    InvalidScalar,
+    /// BLS `KeyGen` was given fewer than 32 bytes of input keying material.
+    InsufficientKeyMaterial,
+    /// A BLS signature (or proof of possession) did not verify.
+    InvalidSignature,
+    /// A BLS aggregate operation was given no inputs.
+    EmptyAggregate,
+    /// The numbers of public keys and messages differ.
+    LengthMismatch,
+    /// The Basic scheme requires all messages of an aggregate to be distinct.
+    DuplicateMessage,
 }
 
 impl core::fmt::Display for Error {
@@ -117,6 +138,13 @@ impl core::fmt::Display for Error {
             Error::InvalidEncoding => "BN254 encoding is not canonical",
             Error::NotOnCurve => "BN254 point is not on the curve",
             Error::NotInSubgroup => "BN254 element is not in the prime-order subgroup",
+            Error::IdentityPoint => "BN254 identity point where it is forbidden",
+            Error::InvalidScalar => "BLS secret key is zero or not canonical",
+            Error::InsufficientKeyMaterial => "BLS KeyGen needs at least 32 bytes of IKM",
+            Error::InvalidSignature => "BLS signature verification failed",
+            Error::EmptyAggregate => "BLS aggregate over zero inputs",
+            Error::LengthMismatch => "BLS public key and message counts differ",
+            Error::DuplicateMessage => "BLS Basic scheme requires distinct messages",
         })
     }
 }

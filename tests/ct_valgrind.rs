@@ -791,6 +791,47 @@ fn bls12377_hash_to_curve() -> String {
     )
 }
 
+/// BN254 BLS (`min_sig`): KeyGen from a secret IKM, then Basic and
+/// Message Augmentation signing and a proof of possession.
+fn bn254_bls_sign() -> String {
+    use bn254::min_sig::{Scheme, SecretKey};
+    let ikm = secret_bytes::<32>(264);
+    let sk = SecretKey::generate(&ikm, b"ct_valgrind").expect("32-byte IKM");
+    let pk = sk.public_key().to_bytes();
+    let s1 = sk.sign(Scheme::Basic, b"ct_valgrind message").to_bytes();
+    let s2 = sk
+        .sign(Scheme::MessageAugmentation, b"ct_valgrind message")
+        .to_bytes();
+    let pop = sk.pop_prove().to_bytes();
+    format!(
+        "pk={} sig={} aug={} pop={}",
+        hex8(public(&pk)),
+        hex8(public(&s1)),
+        hex8(public(&s2)),
+        hex8(public(&pop))
+    )
+}
+
+/// BLS12-377 BLS (`min_pk`): the same operations with keys in G1.
+fn bls12377_bls_sign() -> String {
+    use bls12_377::min_pk::{Scheme, SecretKey};
+    let ikm = secret_bytes::<32>(7705);
+    let sk = SecretKey::generate(&ikm, b"ct_valgrind").expect("32-byte IKM");
+    let pk = sk.public_key().to_bytes();
+    let s1 = sk.sign(Scheme::Basic, b"ct_valgrind message").to_bytes();
+    let s2 = sk
+        .sign(Scheme::MessageAugmentation, b"ct_valgrind message")
+        .to_bytes();
+    let pop = sk.pop_prove().to_bytes();
+    format!(
+        "pk={} sig={} aug={} pop={}",
+        hex8(public(&pk)),
+        hex8(public(&s1)),
+        hex8(public(&s2)),
+        hex8(public(&pop))
+    )
+}
+
 fn lms_h5_sign() -> String {
     let seed = secret_bytes::<32>(137);
     let mut sk = LmsPrivateKey::from_seed(
@@ -2659,6 +2700,8 @@ const CASES: &[Case] = &[
     ("bls12377_g2_mul", bls12377_g2_mul),
     ("bls12377_gt_pow", bls12377_gt_pow),
     ("bls12377_hash_to_curve", bls12377_hash_to_curve),
+    ("bn254_bls_sign", bn254_bls_sign),
+    ("bls12377_bls_sign", bls12377_bls_sign),
     ("lms_h5_sign", lms_h5_sign),
     ("x25519", x25519),
     ("x448", x448),

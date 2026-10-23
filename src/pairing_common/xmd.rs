@@ -16,6 +16,13 @@ use crate::hash::{Digest, Sha256};
 /// as an empty one collapses the domain separation this function exists
 /// to provide).
 pub fn expand_message_xmd(msg: &[u8], dst: &[u8], out: &mut [u8]) {
+    expand_message_xmd_parts(&[msg], dst, out);
+}
+
+/// [`expand_message_xmd`] of the concatenation of `parts`, streamed into the
+/// hash instead of copied into a buffer (the BLS Message Augmentation
+/// scheme hashes `PK || msg` this way without an allocator).
+pub(crate) fn expand_message_xmd_parts(parts: &[&[u8]], dst: &[u8], out: &mut [u8]) {
     const B_IN_BYTES: usize = 32;
     const S_IN_BYTES: usize = 64;
     assert!(!dst.is_empty(), "expand_message_xmd: empty DST");
@@ -43,7 +50,9 @@ pub fn expand_message_xmd(msg: &[u8], dst: &[u8], out: &mut [u8]) {
     // b_0 = H(Z_pad || msg || l_i_b_str || 0x00 || DST')
     let mut h = Sha256::new();
     h.update(&[0u8; S_IN_BYTES]);
-    h.update(msg);
+    for part in parts {
+        h.update(part);
+    }
     h.update(&(len_in_bytes as u16).to_be_bytes());
     h.update(&[0u8]);
     h.update(dst);
