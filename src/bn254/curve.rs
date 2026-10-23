@@ -468,8 +468,14 @@ const BABAI_SHIFT: usize = 320;
 /// (signs `neg`). Then `k ≡ Σ sᵢλⁱ (mod r)` and `|sᵢ|` is below the bound
 /// `tools/bn254/consts.py` proves (`2^127` for GLV, `2^64` for GLS).
 ///
-/// Constant time in `k`: fixed-length schoolbook products and wrapping
-/// additions; the only branches are on the public basis and sign tables.
+/// Constant time in `k`, and straight-line: every basis entry is multiplied
+/// (a zero entry contributes zero), both the sum and the difference are
+/// computed, and the public sign picks one by mask. Branching on the public
+/// basis is harmless in principle, but on 32-bit Arm LLVM kept that loop's
+/// control state in a stack slot it also used for secret products and
+/// memcheck flagged the branch; with no control flow left to optimise,
+/// nothing can end up mixed with the scalar.
+#[inline(always)]
 pub(crate) fn babai_decompose<const D: usize>(
     k: &[u64; 4],
     basis: &[[i128; D]; D],
@@ -494,17 +500,15 @@ pub(crate) fn babai_decompose<const D: usize>(
     for j in 0..D {
         for i in 0..D {
             let b = basis[j][i];
-            if b == 0 {
-                continue;
-            }
             let mut prod = mul_lo_u128(&c[j], b.unsigned_abs());
             // sᵢ −= (±|cⱼ|)·bⱼᵢ; the product's sign is public.
-            s[i] = if (b < 0) == neg[j] {
-                wrapping_sub(&s[i], &prod)
-            } else {
-                wrapping_add(&s[i], &prod)
-            };
+            let mut diff = wrapping_sub(&s[i], &prod);
+            let mut sum = wrapping_add(&s[i], &prod);
+            let take_diff = Choice::from(((b < 0) == neg[j]) as u8);
+            s[i] = mont::select(&diff, &sum, take_diff);
             prod.zeroize();
+            diff.zeroize();
+            sum.zeroize();
         }
     }
     for cj in c.iter_mut() {
@@ -528,6 +532,7 @@ pub(crate) fn sign_magnitude(s: &[u64; 4]) -> (Choice, [u64; 4]) {
 }
 
 /// The full 512-bit product `a·b` (schoolbook, fixed schedule).
+#[inline(always)]
 fn mul_wide(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
     let mut t = [0u64; 8];
     for i in 0..4 {
@@ -543,6 +548,7 @@ fn mul_wide(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
 }
 
 /// `a·b mod 2^256` for a 128-bit `b`.
+#[inline(always)]
 fn mul_lo_u128(a: &[u64; 4], b: u128) -> [u64; 4] {
     let b = [b as u64, (b >> 64) as u64];
     let mut t = [0u64; 4];
@@ -562,6 +568,7 @@ fn mul_lo_u128(a: &[u64; 4], b: u128) -> [u64; 4] {
     t
 }
 
+#[inline(always)]
 fn wrapping_add(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
     let mut out = [0u64; 4];
     let mut carry = 0u64;
@@ -573,6 +580,7 @@ fn wrapping_add(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
     out
 }
 
+#[inline(always)]
 fn wrapping_sub(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
     let mut out = [0u64; 4];
     let mut borrow = 0u64;
