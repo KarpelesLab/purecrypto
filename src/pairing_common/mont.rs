@@ -1,6 +1,6 @@
-//! Fixed-limb Montgomery arithmetic shared by the 381-bit base field
-//! ([`Fp`](super::Fp), six limbs) and the 255-bit scalar field
-//! ([`Fr`](super::Fr), four limbs).
+//! Fixed-limb Montgomery arithmetic shared by the pairing-friendly curves'
+//! base and scalar fields (BLS12-381 and BLS12-377 `Fp` in six limbs; their
+//! `Fr` and both BN254 fields in four).
 //!
 //! Every routine here runs a fixed schedule in the element values: loop
 //! bounds are the limb count, carries propagate unconditionally, and the

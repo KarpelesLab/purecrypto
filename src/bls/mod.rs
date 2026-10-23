@@ -57,7 +57,7 @@ mod fr;
 mod g1;
 mod g2;
 mod hash_to_curve;
-mod mont;
+use crate::pairing_common::mont;
 mod pairing;
 mod signature;
 

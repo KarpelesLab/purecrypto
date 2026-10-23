@@ -103,6 +103,9 @@ pub mod dsa;
 #[cfg(feature = "bls")]
 pub mod bls;
 
+#[cfg(feature = "bls")]
+mod pairing_common;
+
 #[cfg(feature = "fpe")]
 pub mod fpe;
 
