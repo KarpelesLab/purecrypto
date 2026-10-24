@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4](https://github.com/KarpelesLab/purecrypto/compare/v0.10.3...v0.10.4) - 2026-10-24
+
+### Fixed
+
+- *(tls)* default TLS 1.3 server sends HelloRetryRequest for a missing share
+
 ## [0.10.3](https://github.com/KarpelesLab/purecrypto/compare/v0.10.2...v0.10.3) - 2026-10-23
 
 ### Added
