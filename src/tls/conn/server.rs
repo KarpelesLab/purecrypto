@@ -14,6 +14,7 @@
 //! `Finished`). It then verifies the client's `Finished` and switches to the
 //! application traffic keys.
 
+use super::DEFAULT_GROUPS;
 use super::common::{ConnectionCore, Incoming};
 use crate::cipher::{Aes256, Gcm};
 use crate::ec::x25519::X25519PrivateKey;
@@ -382,14 +383,13 @@ pub(crate) struct ServerConfig {
     /// asking the client to redo CH with a share for `g`. `None` (default)
     /// preserves the prior first-acceptable-share-wins behaviour.
     pub(crate) preferred_key_exchange_group: Option<crate::tls::NamedGroup>,
-    /// Key-exchange groups this server accepts, in ITS preference order.
-    /// Empty (the default) accepts every implemented group and takes the
-    /// first usable share in the client's order. Non-empty restricts the
-    /// server to these groups and selects by this order: the first listed
-    /// group the client sent a share for wins; when the client shared none
-    /// of them but advertised one in `supported_groups`, the server asks
-    /// for it with a HelloRetryRequest (RFC 8446 §4.1.4); otherwise the
-    /// handshake fails. See [`crate::tls::Config::key_exchange_groups`].
+    /// Key-exchange groups this server accepts, in ITS preference order
+    /// (default: every implemented group, [`DEFAULT_GROUPS`]). The first
+    /// listed group the client sent a share for wins; when the client
+    /// shared none of them but advertised one in `supported_groups`, the
+    /// server asks for it with a HelloRetryRequest (RFC 8446 §4.1.4);
+    /// otherwise (or when the list is empty) the handshake fails. See
+    /// [`crate::tls::Config::key_exchange_groups`].
     pub(crate) groups: Vec<NamedGroup>,
     /// Cipher suites this server accepts, in ITS preference order. Empty
     /// (the default) is the engine's full set in its built-in order. See
@@ -455,7 +455,7 @@ impl ServerConfig {
             ech_server: None,
             key_log: None,
             preferred_key_exchange_group: None,
-            groups: Vec::new(),
+            groups: DEFAULT_GROUPS.to_vec(),
             cipher_suites: Vec::new(),
             psk_modes: alloc::vec![PskKeyExchangeMode::PskDheKe],
             external_psks: Vec::new(),
@@ -2692,12 +2692,12 @@ impl<R: RngCore> ServerConnection<R> {
                 return Ok(());
             }
         }
-        // RFC 8446 §4.1.4, restricted group set (`ServerConfig::groups`):
-        // when the client shared none of the configured groups but
-        // advertised one in `supported_groups`, ask for the first such group
-        // by HelloRetryRequest. A client that neither shared nor advertised
+        // RFC 8446 §4.1.4 (`ServerConfig::groups`): when the client shared
+        // none of the configured groups but advertised one in
+        // `supported_groups`, ask for the first such group by
+        // HelloRetryRequest. A client that neither shared nor advertised
         // any of them cannot be served (`handshake_failure`, §4.2.7).
-        if !is_retry && !psk_ke && !self.config.groups.is_empty() {
+        if !is_retry && !psk_ke {
             let shared_groups: Vec<NamedGroup> =
                 match ext::find(&ch.extensions, ExtensionType::KEY_SHARE) {
                     Some(ks_body) => ext::parse_client_key_shares(ks_body)?
@@ -2807,12 +2807,6 @@ impl<R: RngCore> ServerConnection<R> {
                 return Err(Error::IllegalParameter);
             }
             Some((&shares[0].0, shares[0].1.as_slice()))
-        } else if self.config.groups.is_empty() {
-            let (g, k) = shares
-                .iter()
-                .find(|(g, _)| Self::implements_group(*g))
-                .ok_or(Error::HandshakeFailure)?;
-            Some((g, k.as_slice()))
         } else {
             // Server preference order (`ServerConfig::groups`): the first
             // configured group the client shared wins. The share-less case
@@ -5116,6 +5110,71 @@ mod tests {
         let err = forged_ch_result(exts).unwrap_err();
         assert!(matches!(err, Error::MissingExtension), "{err:?}");
         assert_eq!(alert_for(&err), AlertDescription::MissingExtension);
+    }
+
+    /// Feeds a forged TLS 1.3 ClientHello advertising `groups` and sharing
+    /// `shares` to a default-config server and returns the server with the
+    /// handshake result.
+    fn default_server_after_ch(
+        groups: &[NamedGroup],
+        shares: &[(NamedGroup, alloc::vec::Vec<u8>)],
+    ) -> (ServerConnection<ScriptedRng>, Result<(), Error>) {
+        use crate::tls::codec::{CipherSuite, ClientHello};
+        let rng = ScriptedRng {
+            data: alloc::vec![0u8; 256],
+            pos: 0,
+        };
+        let mut server = ServerConnection::new(test_server_config(), rng);
+        let raw = ClientHello {
+            legacy_version: 0x0303,
+            random: [0x22; 32],
+            session_id: alloc::vec::Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::AES_128_GCM_SHA256],
+            extensions: alloc::vec![
+                ext::client_supported_versions(),
+                ext::supported_groups_list(groups),
+                ext::signature_algorithms(),
+                ext::client_key_shares(shares),
+            ],
+        }
+        .encode();
+        let res = server.on_client_hello(hs_type::CLIENT_HELLO, &raw[4..], &raw);
+        (server, res)
+    }
+
+    /// RFC 8446 §4.1.1 / §4.2.8: with no group list configured, a client
+    /// that advertises an implemented group but sends no share for it (here
+    /// an empty `key_share`) MUST get a HelloRetryRequest, not
+    /// `handshake_failure`.
+    #[test]
+    fn default_server_retries_on_empty_key_share() {
+        let (server, res) = default_server_after_ch(&[NamedGroup::SECP384R1], &[]);
+        res.expect("an empty key_share must trigger a HelloRetryRequest");
+        assert!(server.state == State::WaitClientHelloRetry);
+        assert_eq!(server.hrr_selected_group, Some(NamedGroup::SECP384R1));
+    }
+
+    /// The default accept-set selects in server order (`DEFAULT_GROUPS`):
+    /// X25519 beats a secp256r1 share the client listed first.
+    #[test]
+    fn default_server_selects_in_server_order() {
+        let (server, _) = default_server_after_ch(
+            &[NamedGroup::SECP256R1, NamedGroup::X25519],
+            &[
+                (NamedGroup::SECP256R1, alloc::vec![0x04u8; 65]),
+                (NamedGroup::X25519, alloc::vec![0x42u8; 32]),
+            ],
+        );
+        assert_eq!(server.negotiated_group, Some(NamedGroup::X25519));
+        assert!(server.hrr_selected_group.is_none());
+    }
+
+    /// A client advertising no implemented group cannot be served
+    /// (`handshake_failure`, RFC 8446 §4.2.7), with or without a retry.
+    #[test]
+    fn default_server_refuses_unimplemented_groups() {
+        let (_, res) = default_server_after_ch(&[NamedGroup(0x0a0a)], &[]);
+        assert!(matches!(res, Err(Error::HandshakeFailure)), "{res:?}");
     }
 
     /// RFC 8446 §4.2.3 / §9.2: certificate authentication without

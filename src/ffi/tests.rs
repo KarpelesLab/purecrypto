@@ -2061,12 +2061,9 @@ fn tls_cfg_set_groups_restricts_and_negotiated_group_reports() {
 
     for (client_groups, server_groups, want, name) in [
         (&[][..], &[][..], 0x11ecu16, &b"X25519MLKEM768"[..]),
-        (
-            &[0x11eb, 0x001d][..],
-            &[][..],
-            0x11eb,
-            &b"SecP256r1MLKEM768"[..],
-        ),
+        (&[0x11eb][..], &[][..], 0x11eb, &b"SecP256r1MLKEM768"[..]),
+        // The server selects in its own order, not the client's.
+        (&[0x0018, 0x001d][..], &[][..], 0x001d, &b"x25519"[..]),
         (&[][..], &[0x0019][..], 0x0019, &b"secp521r1"[..]),
         (
             &[0x11ed][..],

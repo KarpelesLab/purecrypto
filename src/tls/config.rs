@@ -366,8 +366,9 @@ pub struct Config {
     /// Client (TLS 1.3 / QUIC): the `supported_groups` offer, in this
     /// order, with a `key_share` for each (narrowed further by
     /// [`key_shares`](Self::key_shares)).
-    /// Server (TLS 1.3): the accept-set, selected in THIS order rather than
-    /// the client's — the first listed group the client shared wins; when
+    /// Server (TLS 1.3 / QUIC): the accept-set, selected in THIS order
+    /// rather than the client's (the default included) — the first listed
+    /// group the client shared wins; when
     /// the client shared none of them but advertised one, the server asks
     /// for it with a HelloRetryRequest (RFC 8446 §4.1.4). Fail-closed: an
     /// empty list, or one naming no implemented group, makes

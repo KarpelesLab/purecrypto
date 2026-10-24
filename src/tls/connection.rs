@@ -3844,8 +3844,7 @@ mod tests {
         drive_pair(&mut client, &mut server);
         for c in [&client, &server] {
             assert_eq!(c.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
-            // The client shares X25519MLKEM768 first and the server takes
-            // the first usable share.
+            // The client shares X25519MLKEM768 and the server prefers it.
             assert_eq!(c.negotiated_group(), Some(NamedGroup::X25519MlKem768));
             assert!(!c.hello_retry_request_used());
             assert!(!c.resumed());
@@ -3904,12 +3903,13 @@ mod tests {
                 NamedGroup::X25519.to_wire()
             ]
         );
-        // The server takes the client's first share, and both agree.
+        // The server selects in its own order (X25519 over the client's
+        // first share), and both agree.
         let mut server = Connection::server(&tls13_server_cfg(false)).unwrap();
         server.feed(&ch1).unwrap();
         drive_pair(&mut client, &mut server);
-        assert_eq!(client.negotiated_group(), Some(NamedGroup::Secp384r1));
-        assert_eq!(server.negotiated_group(), Some(NamedGroup::Secp384r1));
+        assert_eq!(client.negotiated_group(), Some(NamedGroup::X25519));
+        assert_eq!(server.negotiated_group(), Some(NamedGroup::X25519));
 
         let empty = Config::builder()
             .rng(alloc::sync::Arc::new(crate::rng::OsRng))
@@ -4039,7 +4039,7 @@ mod tests {
                 .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
                 .server_name("tls.example")
                 .verify_certificates(false)
-                .key_exchange_groups(&[g, NamedGroup::X25519])
+                .key_exchange_groups(&[g])
                 .build();
             let mut client = Connection::client(&client_cfg).unwrap();
             let mut server = Connection::server(&tls13_server_cfg(false)).unwrap();
