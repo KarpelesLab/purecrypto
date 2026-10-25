@@ -86,6 +86,11 @@ int main(void) {
   const uint16_t ffdhe2048 = 0x0100;
   if (pc_tls_cfg_set_groups(ccfg, &ffdhe2048, 1) != PC_UNSUPPORTED)
     return fail("pc_tls_cfg_set_groups accepted an unimplemented group");
+  /* The server selects in ITS preference order (RFC 8446 §4.2.8), and its
+   * default order ranks X25519 above this hybrid: give it the same list so
+   * the hybrid wins on both sides. */
+  if (pc_tls_cfg_set_groups(scfg, groups, 2) != PC_OK)
+    return fail("pc_tls_cfg_set_groups (server)");
 
   /* 5. Materialise both connections. */
   PcTls *server = pc_tls_new(scfg);
@@ -138,7 +143,7 @@ int main(void) {
     return fail("pc_tls_negotiated_cipher_suite_name");
   if (cs_name_len == 0) return fail("cipher suite name empty");
 
-  /* 7a'. The key-exchange group: the hybrid the client pinned first. */
+  /* 7a'. The key-exchange group: the hybrid both sides list first. */
   uint16_t group = 0;
   if (pc_tls_negotiated_group(client, &group) != PC_OK)
     return fail("pc_tls_negotiated_group");
