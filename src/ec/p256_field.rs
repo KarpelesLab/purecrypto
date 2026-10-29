@@ -88,8 +88,46 @@ const R3: Fe = mul_const(&R2, &R2);
 /// operand, is exactly the secret-dependent control flow the Valgrind
 /// harness flags. One barrier per selection, as in the other backends.
 #[inline(always)]
-fn mask_from_bit(bit: u64) -> u64 {
-    core::hint::black_box(0u64.wrapping_sub(bit & 1))
+pub(crate) fn mask_from_bit(bit: u64) -> u64 {
+    barrier::opaque(0u64.wrapping_sub(bit & 1))
+}
+
+/// The optimisation barrier behind every mask, as in `bignum::safegcd` and
+/// `falcon::fpr`.
+///
+/// On x86-64 and AArch64 an empty `asm!` block names the value as a
+/// read/write register operand: no instruction is emitted, but the optimizer
+/// must treat the result as unknown, so it cannot prove a mask is a
+/// comparison result and turn the masked arithmetic into a branch. Elsewhere
+/// it falls back to [`core::hint::black_box`], which does the same through a
+/// memory round-trip — a store and a reload on the critical path of every
+/// field addition and subtraction. The `unsafe` opt-in is scoped to this
+/// module, per the crate's `unsafe_code = "deny"` policy.
+mod barrier {
+    #![allow(unsafe_code)]
+
+    /// Returns `x` as a value the optimizer knows nothing about.
+    #[inline(always)]
+    pub(crate) fn opaque(x: u64) -> u64 {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            let mut v = x;
+            // SAFETY: the template is a comment only; it executes nothing,
+            // names `v` as its sole (register) operand, and touches no memory.
+            unsafe {
+                core::arch::asm!(
+                    "/* {0} */",
+                    inout(reg) v,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            }
+            v
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            core::hint::black_box(x)
+        }
+    }
 }
 
 /// [`mask_from_bit`] without the barrier, for the `const` chain that
@@ -807,82 +845,57 @@ mod tests {
     fn microbench_field_ops() {
         use std::println;
         use std::time::Instant;
-        let g = Oracle::new();
         let mut rng = SplitMix64(42);
-        let mut a = rand_fe(&mut rng);
+        let a = rand_fe(&mut rng);
         let b = rand_fe(&mut rng);
-        const N: u32 = 2_000_000;
+        const N: u32 = 4_000_000;
+
+        // Latency: one dependent chain; throughput: four independent ones.
+        macro_rules! bench {
+            ($name:expr, |$x:ident, $y:ident| $e:expr) => {{
+                let t = Instant::now();
+                let mut acc = a;
+                for _ in 0..N {
+                    let $x = &acc;
+                    let $y = &b;
+                    acc = $e;
+                }
+                core::hint::black_box(&acc);
+                let lat = t.elapsed().as_secs_f64() * 1e9 / f64::from(N);
+                let t = Instant::now();
+                let mut v = [a, b, ONE, R2];
+                for _ in 0..N / 4 {
+                    for w in &mut v {
+                        let $x = &*w;
+                        let $y = &b;
+                        *w = $e;
+                    }
+                }
+                core::hint::black_box(&v);
+                let thr = t.elapsed().as_secs_f64() * 1e9 / f64::from(N);
+                println!(
+                    "{:<12} latency {lat:6.2} ns   throughput {thr:6.2} ns",
+                    $name
+                );
+            }};
+        }
+        bench!("mul", |x, y| mul(x, y));
+        bench!("mul (wide)", |x, y| Fe::from_limbs(mont_reduce(&mul_wide(
+            x.as_limbs(),
+            y.as_limbs()
+        ))));
+        bench!("square", |x, _y| square(x));
+        bench!("add", |x, y| add(x, y));
+        bench!("sub", |x, y| sub(x, y));
+        bench!("negate", |x, _y| negate(x));
 
         let t = Instant::now();
         let mut x = a;
-        for _ in 0..N {
-            x = mul(&x, &b);
-        }
-        core::hint::black_box(&x);
-        println!("native mul:   {:?}/op", t.elapsed() / N);
-
-        let t = Instant::now();
-        let mut x = a;
-        for _ in 0..N {
-            x = solinas::mul(&x, &b);
-        }
-        core::hint::black_box(&x);
-        println!("solinas mul:  {:?}/op", t.elapsed() / N);
-
-        let t = Instant::now();
-        let mut x = a;
-        for _ in 0..N {
-            x = g.fp.mont_mul(&x, &b);
-        }
-        core::hint::black_box(&x);
-        println!("mont_mul:     {:?}/op", t.elapsed() / N);
-
-        let t = Instant::now();
-        let mut x = a;
-        for _ in 0..N {
-            x = square(&x);
-        }
-        core::hint::black_box(&x);
-        println!("native sqr:   {:?}/op", t.elapsed() / N);
-
-        let t = Instant::now();
-        let mut x = a;
-        for _ in 0..N {
-            x = g.fp.mont_sqr(&x);
-        }
-        core::hint::black_box(&x);
-        println!("mont_sqr:     {:?}/op", t.elapsed() / N);
-
-        let t = Instant::now();
-        let mut x = a;
-        for _ in 0..N {
-            x = add(&x, &b);
-        }
-        core::hint::black_box(&x);
-        println!("native add:   {:?}/op", t.elapsed() / N);
-
-        let t = Instant::now();
-        let mut w = mul_wide(a.as_limbs(), b.as_limbs());
-        for _ in 0..N {
-            w = mul_wide(&[w[0], w[1], w[2], w[3]], &[w[4], w[5], w[6], w[7]]);
-        }
-        core::hint::black_box(&w);
-        println!("mul_wide:     {:?}/op", t.elapsed() / N);
-
-        let t = Instant::now();
-        let mut r = *a.as_limbs();
-        for _ in 0..N {
-            r = mont_reduce(&[r[0], r[1], r[2], r[3], r[0], r[1], r[2], r[3]]);
-        }
-        core::hint::black_box(&r);
-        println!("mont_reduce:  {:?}/op", t.elapsed() / N);
-
-        let t = Instant::now();
         for _ in 0..2000 {
-            a = invert(&a);
+            x = invert(&x);
         }
-        core::hint::black_box(&a);
-        println!("native inv:   {:?}/op", t.elapsed() / 2000);
+        core::hint::black_box(&x);
+        println!("invert       {:?}/op", t.elapsed() / 2000);
     }
 
     /// Edge-shaped *operands* whose wide products exercise extreme carry

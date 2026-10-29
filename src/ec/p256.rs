@@ -320,7 +320,6 @@ impl P256 {
     /// identity, and the result is correct for every such pair — equal and
     /// opposite points included. One multiplication and six additions
     /// cheaper than [`Self::point_add`] (11M + 2m_b vs 12M + 2m_b).
-    #[cfg(feature = "p256-table")]
     fn add_mixed(&self, p: &Point, x2: &Fe, y2: &Fe) -> Point {
         let b = self.b;
         let mut t0 = self.mul(&p.x, x2);
@@ -367,60 +366,81 @@ impl P256 {
     }
 
     /// Constant-time scalar multiplication `scalar * point` by a fixed
-    /// signed base-16 window over the odd recoding of
-    /// [`OddScalar::new`]: the accumulator starts at `[16⁶⁴]P = P` (the
-    /// recoding's implicit top digit), then each of the 64 windows, most
-    /// significant first, is 4 doublings and one *unconditional* addition
-    /// of `[dᵢ]P`, `dᵢ ∈ {±1, ±3, …, ±15}`. The operand is fetched by a
-    /// masked scan of the 8 precomputed odd multiples (one opaque mask per
-    /// entry, no secret-indexed memory access) and negated through a mask,
-    /// so the schedule depends only on the (public) scalar width. No digit
-    /// is zero, so no addition is ever a no-op, and the complete RCB
-    /// formulas absorb the remaining coincidences (`acc = ±[dᵢ]P`).
+    /// signed base-16 window over the odd recoding of [`OddScalar::new`]:
+    /// the accumulator starts at `[16⁶⁴]P = P` (the recoding's implicit top
+    /// digit), then each of the 64 windows, most significant first, is 4
+    /// doublings and one *unconditional* addition of `[dᵢ]P`, `dᵢ ∈ {±1, ±3,
+    /// …, ±15}`. The operand is fetched by a masked scan of the 8 odd
+    /// multiples (one opaque mask per entry, no secret-indexed memory
+    /// access) and negated through a mask, so the schedule depends only on
+    /// the (public) scalar width. No digit is zero, so no addition is ever a
+    /// no-op.
     ///
-    /// The base point is public in every caller (a peer's public key, the
-    /// generator); only the scalar is secret.
+    /// The odd multiples are normalised to affine with one inversion (the
+    /// base point is public in every caller — a peer's public key, the
+    /// generator — so the table is too), and the first 63 windows run in
+    /// Jacobian coordinates: `dbl-2001-b` doublings (3M + 5S) and
+    /// `madd-2007-bl` mixed additions (7M + 4S), against 8M + 3S and
+    /// 12M + 2m_b for the complete projective formulas. Those Jacobian
+    /// formulas are incomplete, but the odd recoding keeps every one of
+    /// these steps away from their exceptional inputs (see
+    /// [`Self::jac_madd`]); the last window, the only one that can
+    /// meet `acc = ±[d₀]P` (for `k ≡ 0, ±2 mod n`), runs on the complete
+    /// mixed addition [`Self::add_mixed`] after a projective conversion.
+    ///
+    /// Only the scalar is secret; a base point that is the identity (never
+    /// produced by SEC1 decoding) maps to the identity.
     pub(crate) fn scalar_mul(&self, scalar: &Fe, point: &Point) -> Point {
+        if point.z.is_zero().declassify() {
+            return *point;
+        }
+        let table = self.odd_multiples_affine(point);
         let mut k = OddScalar::new(scalar);
-
-        // table[j] = [2j + 1]P.
-        let two_p = self.double(point);
-        let mut table = [*point; 8];
-        for j in 1..8 {
-            table[j] = self.point_add(&table[j - 1], &two_p);
-        }
-
-        let mut acc = *point;
+        let mut acc = Jacobian {
+            x: Fe::from_limbs([table[0][0], table[0][1], table[0][2], table[0][3]]),
+            y: Fe::from_limbs([table[0][4], table[0][5], table[0][6], table[0][7]]),
+            z: field::ONE,
+        };
         let mut i = 64;
-        while i > 0 {
+        while i > 1 {
             i -= 1;
-            acc = self.double(&acc);
-            acc = self.double(&acc);
-            acc = self.double(&acc);
-            acc = self.double(&acc);
-
-            let (index, neg) = k.digit(i);
-            let mut sel = Point {
-                x: Fe::ZERO,
-                y: Fe::ZERO,
-                z: Fe::ZERO,
-            };
-            for (j, entry) in table.iter().enumerate() {
-                let mask = core::hint::black_box(mask_eq(j as u64, index));
-                sel.x = or_masked(&sel.x, &entry.x, mask);
-                sel.y = or_masked(&sel.y, &entry.y, mask);
-                sel.z = or_masked(&sel.z, &entry.z, mask);
-            }
-            sel.y = negate_masked(&sel.y, neg);
-            acc = self.point_add(&acc, &sel);
-            sel.zeroize();
+            acc = self.jac_double(&acc);
+            acc = self.jac_double(&acc);
+            acc = self.jac_double(&acc);
+            acc = self.jac_double(&acc);
+            let (x, mut y) = gather_affine(&table, &k, i);
+            acc = self.jac_madd(&acc, &x, &y);
+            y.zeroize();
         }
-        // The table holds the multiples [j]P; with a secret scalar those are
-        // secret intermediates, so do not leave them on the stack.
-        table.zeroize();
-        acc.y = negate_masked(&acc.y, k.negate_result);
+        acc = self.jac_double(&acc);
+        acc = self.jac_double(&acc);
+        acc = self.jac_double(&acc);
+        acc = self.jac_double(&acc);
+        let mut out = self.finish_ladder(&mut acc, &table, &mut k);
+        // The ladder's accumulators are as secret as the scalar.
+        out.y = negate_masked(&out.y, k.negate_result);
         k.zeroize();
-        acc
+        out
+    }
+
+    /// The last window of both constant-time ladders: `acc` (Jacobian) is
+    /// converted to projective `(X·Z : Y : Z³)` and window 0's digit is
+    /// added with the complete mixed formula, which absorbs the only
+    /// exceptional cases the ladders can reach (`k' = n − 2`: `acc = [d₀]P`,
+    /// a doubling; `k' = n`: `acc = −[d₀]P`, the identity). Wipes `acc`.
+    #[inline]
+    fn finish_ladder(&self, acc: &mut Jacobian, table: &[[u64; 8]; 8], k: &mut OddScalar) -> Point {
+        let z2 = self.sqr(&acc.z);
+        let proj = Point {
+            x: self.mul(&acc.x, &acc.z),
+            y: acc.y,
+            z: self.mul(&z2, &acc.z),
+        };
+        acc.zeroize();
+        let (x, mut y) = gather_affine(table, k, 0);
+        let out = self.add_mixed(&proj, &x, &y);
+        y.zeroize();
+        out
     }
 
     /// Constant-time fixed-base multiplication `scalar * G` via the
@@ -433,10 +453,19 @@ impl P256 {
     /// coordinate limbs only, no secret-indexed memory access — the same
     /// gather discipline as [`Self::scalar_mul`]) and negated through a
     /// mask. The schedule depends only on the (public) scalar width.
+    ///
+    /// The windows are added most significant first, so the accumulator
+    /// before window `i` is `[Vᵢ₊₁]G` with `Vᵢ₊₁` a positive multiple of
+    /// `16ⁱ⁺¹` below `n + 16ⁱ⁺¹`, and the added point `[dᵢ·16ⁱ]G` is an odd
+    /// multiple of `16ⁱ`: for `i ≥ 1` the two can never be equal or
+    /// opposite (see [`Self::jac_madd`]), so windows 63…1 use the
+    /// Jacobian `madd-2007-bl` (7M + 4S) instead of the complete projective
+    /// mixed addition (11M + 2m_b); window 0 goes through the complete
+    /// formula ([`Self::finish_ladder`]).
     #[cfg(feature = "p256-table")]
     pub(crate) fn mul_generator(&self, scalar: &Fe) -> Point {
         let mut k = OddScalar::new(scalar);
-        let mut acc = Point {
+        let mut acc = Jacobian {
             x: Fe::from_limbs([
                 P256_GEN_2_256[0],
                 P256_GEN_2_256[1],
@@ -451,23 +480,17 @@ impl P256 {
             ]),
             z: field::ONE,
         };
-        for (i, window) in P256_GEN_TABLE.iter().enumerate() {
-            let (index, neg) = k.digit(i);
-            let mut sel = [0u64; 8];
-            for (j, entry) in window.iter().enumerate() {
-                let mask = core::hint::black_box(mask_eq(j as u64, index));
-                for (s, e) in sel.iter_mut().zip(entry) {
-                    *s |= e & mask;
-                }
-            }
-            let x = Fe::from_limbs([sel[0], sel[1], sel[2], sel[3]]);
-            let y = negate_masked(&Fe::from_limbs([sel[4], sel[5], sel[6], sel[7]]), neg);
-            acc = self.add_mixed(&acc, &x, &y);
-            sel.zeroize();
+        let mut i = 64;
+        while i > 1 {
+            i -= 1;
+            let (x, mut y) = gather_affine(&P256_GEN_TABLE[i], &k, i);
+            acc = self.jac_madd(&acc, &x, &y);
+            y.zeroize();
         }
-        acc.y = negate_masked(&acc.y, k.negate_result);
+        let mut out = self.finish_ladder(&mut acc, &P256_GEN_TABLE[0], &mut k);
+        out.y = negate_masked(&out.y, k.negate_result);
         k.zeroize();
-        acc
+        out
     }
 
     /// Constant-time fixed-base multiplication `scalar * G` without the comb
@@ -593,7 +616,9 @@ impl P256 {
     /// affine points (Montgomery form, `x‖y` limbs), built with the complete
     /// projective formulas and normalised together with a single inversion
     /// (Montgomery's trick: `3(n − 1)` multiplications replace `n − 1`
-    /// inversions). **Variable-time** callers only (verification).
+    /// inversions). Branch-free (the inversion is the constant-time
+    /// safegcd), though every caller passes a public point: the
+    /// verification ladder and the ECDH ladder [`Self::scalar_mul`].
     fn odd_multiples_affine(&self, point: &Point) -> [[u64; 8]; 8] {
         let two_p = self.double(point);
         let mut table = [*point; 8];
@@ -623,9 +648,10 @@ impl P256 {
     }
 
     /// Jacobian doubling `dbl-2001-b` for `a = −3` (3M + 5S). The identity
-    /// (`Z = 0`) doubles to itself (`Z3 = 2·Y·Z = 0`). **Variable-time**
-    /// callers only (no exceptional inputs, but part of the public-input
-    /// verification path).
+    /// (`Z = 0`) doubles to itself (`Z3 = 2·Y·Z = 0`), and with no point of
+    /// order two on P-256 there is no other exceptional input, so the
+    /// formula is complete. Branch-free: shared by the verification ladder
+    /// and the constant-time [`Self::scalar_mul`].
     fn jac_double(&self, p: &Jacobian) -> Jacobian {
         let delta = self.sqr(&p.z);
         let gamma = self.sqr(&p.y);
@@ -678,11 +704,58 @@ impl P256 {
             }
             return Jacobian::IDENTITY;
         }
-        let r = self.add(&r, &r);
-        let hh = self.sqr(&h);
+        self.madd_tail(p, &z1z1, &h, &r)
+    }
+
+    /// Branch-free mixed Jacobian + affine addition `madd-2007-bl`
+    /// (7M + 4S): `p + (x2, y2)`, constant time in all operands.
+    ///
+    /// # Preconditions
+    /// `p` is not the identity and `p ≠ ±(x2, y2)`; otherwise the result is
+    /// wrong (`p = −(x2, y2)` happens to give `Z3 = 0`, the identity, but
+    /// `p = (x2, y2)` gives `(0 : 0 : 0)`). The constant-time ladders meet
+    /// these by construction: with the odd recoding `k'` of
+    /// [`OddScalar`] (plain base-16 digits `eᵢ`, signed digits `dᵢ`), the
+    /// partial sum of the windows above `i` is
+    /// `Vᵢ₊₁ = 16ⁱ⁺¹·(⌊k'/16ⁱ⁺¹⌋ + [eᵢ₊₁ even])`, a multiple of `16ⁱ⁺¹`
+    /// with `16ⁱ⁺¹ ≤ Vᵢ₊₁ < n + 16ⁱ⁺¹` (as `k' ≤ n`).
+    ///
+    /// - Comb ([`Self::mul_generator`], no doublings): window `i` adds
+    ///   `[dᵢ·16ⁱ]G` to `[Vᵢ₊₁]G`. A collision needs
+    ///   `Vᵢ₊₁ ∓ dᵢ·16ⁱ ∈ nℤ`; zero is impossible (`dᵢ` is odd, so the
+    ///   left side is not a multiple of `16ⁱ⁺¹`), so is anything outside
+    ///   `(0, 2n)` (for `i ≤ 62` from the bound, for `i = 63` because
+    ///   `V₆₄ = 2²⁵⁶` exactly), and `n` itself would force `16ⁱ | n` — only
+    ///   `i = 0`, as `n` is odd.
+    /// - Horner ladder ([`Self::scalar_mul`]): window `i` adds `[dᵢ]P` to
+    ///   `[Vᵢ₊₁/16ⁱ]P` with `16 ≤ Vᵢ₊₁/16ⁱ ≤ k'/16ⁱ + 16`, so for `i ≥ 1`
+    ///   both `Vᵢ₊₁/16ⁱ ± dᵢ` lie in `[1, n)` and neither is `≡ 0`.
+    ///
+    /// The accumulator is never the identity either (`Vᵢ` is positive and
+    /// not a multiple of `n`, and P-256 has prime order, so the Jacobian
+    /// doublings in between are exception-free too). Only window 0 can
+    /// collide (`k' = n − 2`: a doubling; `k' = n`, i.e. `k ≡ 0`: the
+    /// identity), so it runs on the complete formula
+    /// ([`Self::finish_ladder`]).
+    #[inline]
+    fn jac_madd(&self, p: &Jacobian, x2: &Fe, y2: &Fe) -> Jacobian {
+        let z1z1 = self.sqr(&p.z);
+        let u2 = self.mul(x2, &z1z1);
+        let s2 = self.mul(y2, &self.mul(&p.z, &z1z1));
+        let h = self.sub(&u2, &p.x);
+        let r = self.sub(&s2, &p.y);
+        self.madd_tail(p, &z1z1, &h, &r)
+    }
+
+    /// The common tail of `madd-2007-bl` once `H = U2 − X1` and
+    /// `r = S2 − Y1` are known (branch-free).
+    #[inline(always)]
+    fn madd_tail(&self, p: &Jacobian, z1z1: &Fe, h: &Fe, r: &Fe) -> Jacobian {
+        let r = self.add(r, r);
+        let hh = self.sqr(h);
         let i2 = self.add(&hh, &hh);
         let i = self.add(&i2, &i2);
-        let j = self.mul(&h, &i);
+        let j = self.mul(h, &i);
         let v = self.mul(&p.x, &i);
         // X3 = r² − J − 2V
         let x3 = self.sub(&self.sub(&self.sqr(&r), &j), &self.add(&v, &v));
@@ -690,7 +763,7 @@ impl P256 {
         let y1j = self.mul(&p.y, &j);
         let y3 = self.sub(&self.mul(&r, &self.sub(&v, &x3)), &self.add(&y1j, &y1j));
         // Z3 = (Z1 + H)² − Z1Z1 − HH
-        let z3 = self.sub(&self.sub(&self.sqr(&self.add(&p.z, &h)), &z1z1), &hh);
+        let z3 = self.sub(&self.sub(&self.sqr(&self.add(&p.z, h)), z1z1), &hh);
         Jacobian {
             x: x3,
             y: y3,
@@ -721,6 +794,35 @@ struct Jacobian {
     x: Fe,
     y: Fe,
     z: Fe,
+}
+
+impl Zeroize for Jacobian {
+    #[inline]
+    fn zeroize(&mut self) {
+        self.x.zeroize();
+        self.y.zeroize();
+        self.z.zeroize();
+    }
+}
+
+/// Window `i`'s operand for the constant-time ladders: the affine entry
+/// `[|dᵢ|]·B` of the 8-entry odd-multiple table `window` fetched by a masked
+/// scan (one opaque mask per entry over all 8 limbs, no secret-indexed
+/// memory access), with `y` negated through a mask when `dᵢ < 0`.
+#[inline(always)]
+fn gather_affine(window: &[[u64; 8]; 8], k: &OddScalar, i: usize) -> (Fe, Fe) {
+    let (index, neg) = k.digit(i);
+    let mut sel = [0u64; 8];
+    for (j, entry) in window.iter().enumerate() {
+        let mask = mask_eq(j as u64, index);
+        for (s, e) in sel.iter_mut().zip(entry) {
+            *s |= e & mask;
+        }
+    }
+    let x = Fe::from_limbs([sel[0], sel[1], sel[2], sel[3]]);
+    let y = negate_masked(&Fe::from_limbs([sel[4], sel[5], sel[6], sel[7]]), neg);
+    sel.zeroize();
+    (x, y)
 }
 
 impl Jacobian {
@@ -800,7 +902,7 @@ impl Zeroize for OddScalar {
 /// the secret bit.
 #[inline]
 fn mask_from_bit(bit: u64) -> u64 {
-    core::hint::black_box(0u64.wrapping_sub(bit & 1))
+    field::mask_from_bit(bit)
 }
 
 /// All-ones iff `a == b`, by arithmetic only.
@@ -808,19 +910,6 @@ fn mask_from_bit(bit: u64) -> u64 {
 fn mask_eq(a: u64, b: u64) -> u64 {
     let x = a ^ b;
     mask_from_bit(((x | x.wrapping_neg()) >> 63) ^ 1)
-}
-
-/// `acc | (v & mask)` per limb: the gather accumulator of a masked scan.
-#[inline]
-fn or_masked(acc: &Fe, v: &Fe, mask: u64) -> Fe {
-    let a = acc.as_limbs();
-    let v = v.as_limbs();
-    Fe::from_limbs([
-        a[0] | (v[0] & mask),
-        a[1] | (v[1] & mask),
-        a[2] | (v[2] & mask),
-        a[3] | (v[3] & mask),
-    ])
 }
 
 /// `−y` when `mask` is all-ones, `y` when it is zero (a masked select over
@@ -1221,6 +1310,62 @@ mod tests {
                 .to_affine(&curve.scalar_mul(&Fe::from_u64(7), &curve.identity()))
                 .is_none()
         );
+    }
+
+    /// The scalars whose last window meets the Jacobian formulas'
+    /// exceptional inputs (`k' = n − 2`: `acc = [d₀]P`, a doubling, for
+    /// `k ≡ ±2`; `k' = n`: `acc = −[d₀]P`, the identity, for `k ≡ 0`) and
+    /// their neighbours, through both constant-time ladders on `G` and on
+    /// a random base, against double-and-add. Window 0 runs on the complete
+    /// formula precisely so these come out right.
+    #[test]
+    fn ladders_final_window_exceptions() {
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        let curve = P256::new();
+        let n = P256::order();
+        let g = curve.generator();
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-final-window", b"nonce", &[]);
+        let mut limbs = [0u64; 4];
+        for l in &mut limbs {
+            *l = rng.next_u64();
+        }
+        let t = Fe::from_limbs(limbs).reduce(&n);
+        let (qx, qy) = curve.to_affine(&curve.mul_generator(&t)).unwrap();
+        let q = curve.lift_affine(&qx, &qy);
+        let small = |v: u64| Fe::from_u64(v);
+        let scalars = [
+            Fe::ZERO,
+            n,
+            small(1),
+            small(2),
+            small(3),
+            small(4),
+            n.wrapping_sub(&small(1)),
+            n.wrapping_sub(&small(2)),
+            n.wrapping_sub(&small(3)),
+            n.wrapping_sub(&small(4)),
+            n.wrapping_add(&small(2)),
+            n.wrapping_add(&small(1)),
+        ];
+        for k in &scalars {
+            let want_g = curve.to_affine(&reference_mul(&curve, k, &g));
+            assert_eq!(
+                curve.to_affine(&curve.mul_generator(k)),
+                want_g,
+                "comb {k:x?}"
+            );
+            assert_eq!(
+                curve.to_affine(&curve.scalar_mul(k, &g)),
+                want_g,
+                "ladder(G) {k:x?}"
+            );
+            assert_eq!(
+                curve.to_affine(&curve.scalar_mul(k, &q)),
+                curve.to_affine(&reference_mul(&curve, k, &q)),
+                "ladder(Q) {k:x?}"
+            );
+        }
     }
 
     /// The odd recoding reconstructs `k'`: `16⁶⁴ + Σ dᵢ·16ⁱ`, evaluated
