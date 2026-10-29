@@ -134,7 +134,7 @@ fn schedule(block: &[u8; 64]) -> [u32; 64] {
     mk
 }
 
-fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
+pub(super) fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
     let mk = schedule(block);
     let [mut a, mut b, mut c, mut d] = *state;
 
@@ -241,6 +241,14 @@ impl Digest for Md5 {
 pub fn md5(data: &[u8]) -> [u8; 16] {
     Md5::digest(data)
 }
+
+super::state::impl_exportable_state!(
+    Md5,
+    super::state::tag::MD5,
+    super::state::md32_state_len(4),
+    |s| s.state,
+    Md5::new()
+);
 
 #[cfg(test)]
 mod tests {

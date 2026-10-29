@@ -32,7 +32,7 @@ pub(crate) const K1: [u32; 4] = [0x5a82_7999, 0x6ed9_eba1, 0x8f1b_bcdc, 0xca62_c
     ),
     allow(unsafe_code)
 )]
-fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
+pub(super) fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
     #[cfg(any(
         target_arch = "x86_64",
         all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
@@ -210,6 +210,14 @@ impl Digest for Sha1 {
 pub fn sha1(data: &[u8]) -> [u8; 20] {
     Sha1::digest(data)
 }
+
+super::state::impl_exportable_state!(
+    Sha1,
+    super::state::tag::SHA1,
+    super::state::md32_state_len(5),
+    |s| s.state,
+    Sha1::new()
+);
 
 #[cfg(test)]
 mod tests {

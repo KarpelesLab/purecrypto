@@ -345,6 +345,31 @@ impl Core {
         to_bytes(&self.h)
     }
 
+    fn export_into(&self, w: &mut super::state::Writer<'_>) {
+        w.u64s(&self.h);
+        w.u64s(&self.n);
+        w.u64s(&self.sigma);
+        w.buffer(&self.buf, self.buf_len);
+    }
+
+    fn import_from(&mut self, r: &mut super::state::Reader<'_>) -> Result<(), super::StateError> {
+        let h = r.u64s::<8>();
+        let n = r.u64s::<8>();
+        let sigma = r.u64s::<8>();
+        let mut buf = [0u8; 64];
+        let buf_len = r.buffer(&mut buf, 63)?;
+        // Only whole 512-bit blocks are counted before finalization.
+        if !n[0].is_multiple_of(512) {
+            return Err(super::StateError::Inconsistent);
+        }
+        self.h = h;
+        self.n = n;
+        self.sigma = sigma;
+        self.buf = buf;
+        self.buf_len = buf_len;
+        Ok(())
+    }
+
     #[inline]
     fn zeroize(&mut self) {
         super::zeroize::zero_words(&mut self.h);
@@ -437,6 +462,24 @@ impl Digest for Streebog256 {
         self.0.zeroize();
     }
 }
+
+/// Serialized [`Core`]: header, `h`, `N`, `Σ`, `u8` count and the buffer.
+const STATE_LEN: usize = 2 + 3 * 64 + 1 + 64;
+
+super::state::impl_exportable_state!(
+    Streebog512,
+    super::state::tag::STREEBOG512,
+    STATE_LEN,
+    |s| s.0,
+    Streebog512::new()
+);
+super::state::impl_exportable_state!(
+    Streebog256,
+    super::state::tag::STREEBOG256,
+    STATE_LEN,
+    |s| s.0,
+    Streebog256::new()
+);
 
 /// Computes the Streebog-256 digest of `data`.
 #[inline]

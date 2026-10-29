@@ -193,32 +193,60 @@ pub struct Whirlpool {
 }
 
 impl Whirlpool {
-    /// Miyaguchi–Preneel compression of one 64-byte block into `hash`.
+    fn export_into(&self, w: &mut super::state::Writer<'_>) {
+        w.u64s(&self.hash);
+        w.u128(self.bit_len);
+        w.buffer(&self.buf, self.buf_len);
+    }
+
+    fn import_from(&mut self, r: &mut super::state::Reader<'_>) -> Result<(), super::StateError> {
+        let hash = r.u64s::<8>();
+        let bit_len = r.u128();
+        let mut buf = [0u8; 64];
+        let buf_len = r.buffer(&mut buf, 63)?;
+        // Whole bytes only, and the buffer holds the length modulo the block.
+        if !bit_len.is_multiple_of(8) || (bit_len / 8) % 64 != buf_len as u128 {
+            return Err(super::StateError::Inconsistent);
+        }
+        self.hash = hash;
+        self.bit_len = bit_len;
+        self.buf = buf;
+        self.buf_len = buf_len;
+        Ok(())
+    }
+
+    #[inline]
     fn compress(&mut self, block: &[u8; 64]) {
-        let mut m = [0u64; 8];
-        for (w, chunk) in m.iter_mut().zip(block.chunks_exact(8)) {
-            *w = u64::from_be_bytes(chunk.try_into().unwrap());
-        }
-        let mut k = self.hash;
-        let mut state = [0u64; 8];
+        compress(&mut self.hash, block);
+    }
+}
+
+/// Miyaguchi–Preneel compression of one 64-byte block into `hash` (eight
+/// big-endian lanes).
+pub(super) fn compress(hash: &mut [u64; 8], block: &[u8; 64]) {
+    let mut m = [0u64; 8];
+    for (w, chunk) in m.iter_mut().zip(block.chunks_exact(8)) {
+        *w = u64::from_be_bytes(chunk.try_into().unwrap());
+    }
+    let mut k = *hash;
+    let mut state = [0u64; 8];
+    for i in 0..8 {
+        state[i] = m[i] ^ k[i];
+    }
+    for &rc in RC.iter() {
+        // K^r = rho(K^{r-1}) with the round constant in the first lane.
+        let mut kr = w_theta(&k);
+        kr[0] ^= rc;
+        k = kr;
+        // state = rho(state) ^ K^r.
+        let mut sr = w_theta(&state);
         for i in 0..8 {
-            state[i] = m[i] ^ k[i];
+            sr[i] ^= k[i];
         }
-        for &rc in RC.iter() {
-            // K^r = rho(K^{r-1}) with the round constant in the first lane.
-            let mut kr = w_theta(&k);
-            kr[0] ^= rc;
-            k = kr;
-            // state = rho(state) ^ K^r.
-            let mut sr = w_theta(&state);
-            for i in 0..8 {
-                sr[i] ^= k[i];
-            }
-            state = sr;
-        }
-        for i in 0..8 {
-            self.hash[i] ^= state[i] ^ m[i];
-        }
+        state = sr;
+    }
+    for i in 0..8 {
+        hash[i] ^= state[i] ^ m[i];
     }
 }
 
@@ -312,6 +340,14 @@ impl Drop for Whirlpool {
         self.zeroize();
     }
 }
+
+super::state::impl_exportable_state!(
+    Whirlpool,
+    super::state::tag::WHIRLPOOL,
+    2 + 64 + 16 + 1 + 64,
+    |s| s,
+    Whirlpool::new()
+);
 
 /// Computes the Whirlpool digest of `data`.
 #[inline]

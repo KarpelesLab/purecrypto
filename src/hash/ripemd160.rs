@@ -80,7 +80,7 @@ fn boolfn(round: usize, x: u32, y: u32, z: u32) -> u32 {
     }
 }
 
-fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
+pub(super) fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
     let x = block_words_le(block);
     let (mut al, mut bl, mut cl, mut dl, mut el) =
         (state[0], state[1], state[2], state[3], state[4]);
@@ -199,6 +199,14 @@ impl Digest for Ripemd160 {
 pub fn ripemd160(data: &[u8]) -> [u8; 20] {
     Ripemd160::digest(data)
 }
+
+super::state::impl_exportable_state!(
+    Ripemd160,
+    super::state::tag::RIPEMD160,
+    super::state::md32_state_len(5),
+    |s| s.state,
+    Ripemd160::new()
+);
 
 #[cfg(test)]
 mod tests {

@@ -93,6 +93,37 @@ impl<const W: usize> MdState<W> {
         }
     }
 
+    /// Writes the chaining words, byte count and partial block (see
+    /// [`super::state`] for the layout).
+    pub(super) fn export_into(&self, w: &mut super::state::Writer<'_>) {
+        w.u32s(&self.h);
+        w.u64(self.msg_len);
+        w.buffer(&self.block, self.block_len);
+    }
+
+    /// Loads what [`Self::export_into`] wrote, keeping this state's
+    /// compression functions and length-field byte order. On error `self` is
+    /// left unchanged.
+    pub(super) fn import_from(
+        &mut self,
+        r: &mut super::state::Reader<'_>,
+    ) -> Result<(), super::StateError> {
+        let h = r.u32s::<W>();
+        let msg_len = r.u64();
+        let mut block = [0u8; 64];
+        let block_len = r.buffer(&mut block, 63)?;
+        // Whole blocks are compressed as soon as they fill, so the buffer
+        // holds exactly the message length modulo the block size.
+        if msg_len % 64 != block_len as u64 {
+            return Err(super::StateError::Inconsistent);
+        }
+        self.h = h;
+        self.msg_len = msg_len;
+        self.block = block;
+        self.block_len = block_len;
+        Ok(())
+    }
+
     /// Best-effort wipe of the state words and partial block.
     pub(super) fn zeroize(&mut self) {
         super::zeroize::zero_words(&mut self.h);

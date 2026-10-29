@@ -73,6 +73,26 @@ pub struct Md2 {
 }
 
 impl Md2 {
+    fn export_into(&self, w: &mut super::state::Writer<'_>) {
+        w.bytes(&self.x);
+        w.bytes(&self.checksum);
+        w.buffer(&self.buf, self.buf_len);
+    }
+
+    fn import_from(&mut self, r: &mut super::state::Reader<'_>) -> Result<(), super::StateError> {
+        let x = r.array::<48>();
+        let checksum = r.array::<16>();
+        let mut buf = [0u8; 16];
+        let buf_len = r.buffer(&mut buf, 15)?;
+        *self = Md2 {
+            x,
+            checksum,
+            buf,
+            buf_len,
+        };
+        Ok(())
+    }
+
     /// Processes one full 16-byte message block: state mix plus checksum update.
     fn process(&mut self, block: &[u8; 16]) {
         mix(&mut self.x, block);
@@ -160,6 +180,14 @@ impl Drop for Md2 {
 pub fn md2(data: &[u8]) -> [u8; 16] {
     Md2::digest(data)
 }
+
+super::state::impl_exportable_state!(
+    Md2,
+    super::state::tag::MD2,
+    2 + 48 + 16 + 1 + 16,
+    |s| s,
+    Md2::new()
+);
 
 #[cfg(test)]
 mod tests {

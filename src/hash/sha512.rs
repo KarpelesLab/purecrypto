@@ -185,6 +185,32 @@ impl State512 {
         }
     }
 
+    /// Writes the chaining words, the 128-bit byte count and the partial
+    /// block (see [`super::state`]).
+    fn export_into(&self, w: &mut super::state::Writer<'_>) {
+        w.u64s(&self.h);
+        w.u128(self.msg_len);
+        w.buffer(&self.block, self.block_len);
+    }
+
+    /// Loads what [`Self::export_into`] wrote; `self` is unchanged on error.
+    fn import_from(&mut self, r: &mut super::state::Reader<'_>) -> Result<(), super::StateError> {
+        let h = r.u64s::<8>();
+        let msg_len = r.u128();
+        let mut block = [0u8; 128];
+        let block_len = r.buffer(&mut block, 127)?;
+        if msg_len % 128 != block_len as u128 {
+            return Err(super::StateError::Inconsistent);
+        }
+        *self = State512 {
+            h,
+            block,
+            block_len,
+            msg_len,
+        };
+        Ok(())
+    }
+
     /// Best-effort wipe of the state words and partial block.
     fn zeroize(&mut self) {
         super::zeroize::zero_words(&mut self.h);
@@ -386,9 +412,13 @@ fn truncate_words<const N: usize>(h: &[u64; 8]) -> [u8; N] {
     out
 }
 
+/// Serialized [`State512`]: header, eight words, `u128` count, `u8` + 128-byte
+/// buffer.
+const STATE512_LEN: usize = 2 + 64 + 16 + 1 + 128;
+
 /// Generates a SHA-512-variant type with the given IV and output length.
 macro_rules! sha512_variant {
-    ($(#[$meta:meta])* $name:ident, $iv:expr, $out:literal, $fn_name:ident, $fn_doc:literal) => {
+    ($(#[$meta:meta])* $name:ident, $iv:expr, $out:literal, $fn_name:ident, $fn_doc:literal, $tag:ident) => {
         $(#[$meta])*
         #[derive(Clone)]
         pub struct $name {
@@ -454,24 +484,32 @@ macro_rules! sha512_variant {
         pub fn $fn_name(data: &[u8]) -> [u8; $out] {
             $name::digest(data)
         }
+
+        super::state::impl_exportable_state!(
+            $name,
+            super::state::tag::$tag,
+            STATE512_LEN,
+            |s| s.state,
+            $name::new()
+        );
     };
 }
 
 sha512_variant!(
     /// The SHA-512 hash function.
-    Sha512, H512, 64, sha512, "Computes the SHA-512 digest of `data`."
+    Sha512, H512, 64, sha512, "Computes the SHA-512 digest of `data`.", SHA512
 );
 sha512_variant!(
     /// The SHA-384 hash function (SHA-512 with a different IV, truncated to 384 bits).
-    Sha384, H384, 48, sha384, "Computes the SHA-384 digest of `data`."
+    Sha384, H384, 48, sha384, "Computes the SHA-384 digest of `data`.", SHA384
 );
 sha512_variant!(
     /// The SHA-512/256 hash function.
-    Sha512_256, H512_256, 32, sha512_256, "Computes the SHA-512/256 digest of `data`."
+    Sha512_256, H512_256, 32, sha512_256, "Computes the SHA-512/256 digest of `data`.", SHA512_256
 );
 sha512_variant!(
     /// The SHA-512/224 hash function.
-    Sha512_224, H512_224, 28, sha512_224, "Computes the SHA-512/224 digest of `data`."
+    Sha512_224, H512_224, 28, sha512_224, "Computes the SHA-512/224 digest of `data`.", SHA512_224
 );
 
 #[cfg(test)]

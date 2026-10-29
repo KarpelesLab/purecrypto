@@ -32,7 +32,7 @@
 //! the concrete hasher states (no `Box<dyn …>` required) and [`HashOutput`] is
 //! an inline buffer sized for the widest digest.
 
-use super::Digest;
+use super::{Digest, ExportableState, StateError};
 
 /// Errors from [`DynDigest::finalize_into`]: the output buffer's length did not
 /// match the algorithm's digest length.
@@ -854,6 +854,108 @@ impl Hasher {
 impl Clone for Hasher {
     fn clone(&self) -> Self {
         Hasher(self.0.clone())
+    }
+}
+
+/// Runs `$m!` over every [`HashAlgorithm`] variant whose hasher implements
+/// [`ExportableState`] (all but BLAKE3).
+macro_rules! exportable_algorithms {
+    ($m:ident) => {
+        $m!(
+            Sha224,
+            Sha256,
+            Sha384,
+            Sha512,
+            Sha512_224,
+            Sha512_256,
+            Sha3_224,
+            Sha3_256,
+            Sha3_384,
+            Sha3_512,
+            Keccak256,
+            Blake2b256,
+            Blake2b384,
+            Blake2b512,
+            Blake2s256,
+            Sm3,
+            Streebog256,
+            Streebog512,
+            Whirlpool,
+            Ripemd160,
+            Sha1,
+            Md5,
+            Md4,
+            Md2
+        )
+    };
+}
+
+impl HashAlgorithm {
+    /// The largest [`state_len`](HashAlgorithm::state_len) of any variant
+    /// (SHA3-224, whose rate-sized buffer is the widest).
+    pub const MAX_STATE_LEN: usize = 347;
+
+    /// Length of this algorithm's [exported state](Hasher::export_state), or
+    /// `None` when its state cannot be exported (BLAKE3 and the
+    /// `legacy-hashes` digests).
+    pub const fn state_len(self) -> Option<usize> {
+        macro_rules! arms {
+            ($($v:ident),*) => {
+                match self {
+                    $(HashAlgorithm::$v => {
+                        Some(<crate::hash::$v as ExportableState>::STATE_LEN)
+                    })*
+                    // BLAKE3 and the `legacy-hashes` digests.
+                    _ => None,
+                }
+            };
+        }
+        exportable_algorithms!(arms)
+    }
+}
+
+impl Hasher {
+    /// Serializes the current state into `out` (see [`ExportableState`] for
+    /// the format) and returns the number of bytes written,
+    /// [`state_len`](HashAlgorithm::state_len).
+    ///
+    /// Fails with [`StateError::InvalidLength`] when `out` is shorter than
+    /// that, and with [`StateError::Unsupported`] for BLAKE3 and the
+    /// `legacy-hashes` digests. A buffer of
+    /// [`HashAlgorithm::MAX_STATE_LEN`] bytes fits every algorithm.
+    pub fn export_state(&self, out: &mut [u8]) -> Result<usize, StateError> {
+        macro_rules! arms {
+            ($($v:ident),*) => {
+                match &self.0 {
+                    $(HasherState::$v(h) => {
+                        let state = ExportableState::export_state(h);
+                        let state = state.as_ref();
+                        let dst = out.get_mut(..state.len()).ok_or(StateError::InvalidLength)?;
+                        dst.copy_from_slice(state);
+                        Ok(state.len())
+                    })*
+                    _ => Err(StateError::Unsupported),
+                }
+            };
+        }
+        exportable_algorithms!(arms)
+    }
+
+    /// Rebuilds a hasher for `alg` from a state written by
+    /// [`export_state`](Self::export_state) (or by the concrete type's
+    /// [`ExportableState::export_state`]; the bytes are the same).
+    pub fn from_state(alg: HashAlgorithm, state: &[u8]) -> Result<Hasher, StateError> {
+        macro_rules! arms {
+            ($($v:ident),*) => {
+                match alg {
+                    $(HashAlgorithm::$v => Ok(Hasher(HasherState::$v(
+                        <crate::hash::$v as ExportableState>::from_state(state)?,
+                    ))),)*
+                    _ => Err(StateError::Unsupported),
+                }
+            };
+        }
+        exportable_algorithms!(arms)
     }
 }
 

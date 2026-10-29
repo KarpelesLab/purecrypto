@@ -1,8 +1,12 @@
 //! BLAKE2 (RFC 7693): BLAKE2b (64-bit) and BLAKE2s (32-bit), unkeyed.
 //!
 //! The digest length is a parameter folded into the initial state, so the same
-//! core produces BLAKE2b-256/384/512 and BLAKE2s-256. Keyed mode, salt, and
-//! personalization are not exposed.
+//! core produces BLAKE2b-256/384/512 and BLAKE2s-256. Keyed mode and a runtime
+//! digest length are [`Blake2bMac`] / [`Blake2sMac`]; their
+//! `try_new_with_salt_personal` constructors also set the parameter block's
+//! salt and personalization (libsodium's
+//! `crypto_generichash_blake2b_salt_personal`). Every type here implements
+//! [`ExportableState`](super::ExportableState).
 
 use super::{Digest, Mac};
 use crate::ct::{Choice, ConstantTimeEq};
@@ -20,6 +24,12 @@ pub enum Error {
     /// The key exceeds half a block (64 bytes for BLAKE2b, 32 for BLAKE2s;
     /// RFC 7693 §2.5).
     KeyTooLong,
+    /// The salt exceeds the parameter block's salt field (16 bytes for
+    /// BLAKE2b, 8 for BLAKE2s).
+    SaltTooLong,
+    /// The personalization exceeds its parameter-block field (16 bytes for
+    /// BLAKE2b, 8 for BLAKE2s).
+    PersonalTooLong,
 }
 
 impl core::fmt::Display for Error {
@@ -29,6 +39,10 @@ impl core::fmt::Display for Error {
                 f.write_str("BLAKE2 output length outside the variant's range")
             }
             Error::KeyTooLong => f.write_str("BLAKE2 key longer than half a block"),
+            Error::SaltTooLong => f.write_str("BLAKE2 salt longer than the parameter field"),
+            Error::PersonalTooLong => {
+                f.write_str("BLAKE2 personalization longer than the parameter field")
+            }
         }
     }
 }
@@ -186,17 +200,17 @@ impl Blake2bState {
     /// so the zero block is skipped (feeding it would add a whole extra
     /// compression and change every digest).
     fn with_key(outlen: usize, key: &[u8]) -> Self {
-        let mut s = Self::from_h(iv_from_param_b(&param_b(
-            outlen as u8,
-            key.len() as u8,
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-        )));
+        Self::with_key_salt_personal(outlen, key, &[], &[])
+    }
+
+    /// Keyed init with the parameter block's salt (bytes 32..48) and
+    /// personalization (bytes 48..64) set; shorter values are zero-padded.
+    /// Callers have checked `key.len() <= 64` and both fields `<= 16`.
+    fn with_key_salt_personal(outlen: usize, key: &[u8], salt: &[u8], personal: &[u8]) -> Self {
+        let mut p = param_b(outlen as u8, key.len() as u8, 1, 1, 0, 0, 0, 0, 0);
+        p[32..32 + salt.len()].copy_from_slice(salt);
+        p[48..48 + personal.len()].copy_from_slice(personal);
+        let mut s = Self::from_h(iv_from_param_b(&p));
         if !key.is_empty() {
             let mut block = [0u8; 128];
             block[..key.len()].copy_from_slice(key);
@@ -212,6 +226,50 @@ impl Blake2bState {
         if carry {
             self.t1 = self.t1.wrapping_add(1);
         }
+    }
+
+    /// Writes the chaining value, counter and buffer, then the digest length
+    /// and BLAKE2Xb output length the wrapper supplies (see
+    /// [`super::state`]).
+    fn export_into(&self, w: &mut super::state::Writer<'_>, out_len: usize, xof_len: u32) {
+        w.u64s(&self.h);
+        w.u64(self.t0);
+        w.u64(self.t1);
+        w.buffer(&self.buf, self.buf_len);
+        w.u8(out_len as u8);
+        w.u32(xof_len);
+    }
+
+    /// Parses an [`export_into`](Self::export_into) state, returning it with
+    /// its digest length and XOF length for the wrapper to check.
+    fn import_from(
+        r: &mut super::state::Reader<'_>,
+    ) -> Result<(Self, usize, u32), super::StateError> {
+        let h = r.u64s::<8>();
+        let t0 = r.u64();
+        let t1 = r.u64();
+        let mut buf = [0u8; 128];
+        // BLAKE2 holds back a full block (it might be the last), so 128 is a
+        // valid count here.
+        let buf_len = r.buffer(&mut buf, 128)?;
+        let out_len = r.u8() as usize;
+        let xof_len = r.u32();
+        // Only whole blocks are counted before finalization, and once one has
+        // been compressed at least one byte is always held back.
+        if !t0.is_multiple_of(128)
+            || ((t0 | t1) != 0 && buf_len == 0)
+            || !(1..=64).contains(&out_len)
+        {
+            return Err(super::StateError::Inconsistent);
+        }
+        let st = Blake2bState {
+            h,
+            t0,
+            t1,
+            buf,
+            buf_len,
+        };
+        Ok((st, out_len, xof_len))
     }
 
     /// Best-effort wipe of the chaining value and buffered block.
@@ -398,17 +456,17 @@ impl Blake2sState {
     /// As for BLAKE2b, RFC 7693 §3.3 prepends that block only when
     /// `keylen > 0`; an empty key must hash exactly like the unkeyed function.
     fn with_key(outlen: usize, key: &[u8]) -> Self {
-        let mut s = Self::from_h(iv_from_param_s(&param_s(
-            outlen as u8,
-            key.len() as u8,
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-        )));
+        Self::with_key_salt_personal(outlen, key, &[], &[])
+    }
+
+    /// Keyed init with the parameter block's salt (bytes 16..24) and
+    /// personalization (bytes 24..32) set; shorter values are zero-padded.
+    /// Callers have checked `key.len() <= 32` and both fields `<= 8`.
+    fn with_key_salt_personal(outlen: usize, key: &[u8], salt: &[u8], personal: &[u8]) -> Self {
+        let mut p = param_s(outlen as u8, key.len() as u8, 1, 1, 0, 0, 0, 0, 0);
+        p[16..16 + salt.len()].copy_from_slice(salt);
+        p[24..24 + personal.len()].copy_from_slice(personal);
+        let mut s = Self::from_h(iv_from_param_s(&p));
         if !key.is_empty() {
             let mut block = [0u8; 64];
             block[..key.len()].copy_from_slice(key);
@@ -424,6 +482,43 @@ impl Blake2sState {
         if carry {
             self.t1 = self.t1.wrapping_add(1);
         }
+    }
+
+    /// As [`Blake2bState::export_into`], with a 16-bit BLAKE2Xs length.
+    fn export_into(&self, w: &mut super::state::Writer<'_>, out_len: usize, xof_len: u16) {
+        w.u32s(&self.h);
+        w.u32(self.t0);
+        w.u32(self.t1);
+        w.buffer(&self.buf, self.buf_len);
+        w.u8(out_len as u8);
+        w.u16(xof_len);
+    }
+
+    /// As [`Blake2bState::import_from`].
+    fn import_from(
+        r: &mut super::state::Reader<'_>,
+    ) -> Result<(Self, usize, u16), super::StateError> {
+        let h = r.u32s::<8>();
+        let t0 = r.u32();
+        let t1 = r.u32();
+        let mut buf = [0u8; 64];
+        let buf_len = r.buffer(&mut buf, 64)?;
+        let out_len = r.u8() as usize;
+        let xof_len = r.u16();
+        if !t0.is_multiple_of(64)
+            || ((t0 | t1) != 0 && buf_len == 0)
+            || !(1..=32).contains(&out_len)
+        {
+            return Err(super::StateError::Inconsistent);
+        }
+        let st = Blake2sState {
+            h,
+            t0,
+            t1,
+            buf,
+            buf_len,
+        };
+        Ok((st, out_len, xof_len))
     }
 
     /// Best-effort wipe of the chaining value and buffered block.
@@ -521,7 +616,59 @@ macro_rules! blake2b {
         pub fn $func(data: &[u8]) -> [u8; $out] {
             $name::digest(data)
         }
+
+        impl super::ExportableState for $name {
+            const STATE_LEN: usize = BLAKE2B_STATE_LEN;
+            type State = [u8; BLAKE2B_STATE_LEN];
+            fn export_state(&self) -> Self::State {
+                export_b(&self.state, $out, 0)
+            }
+            fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+                let (state, out_len, xof_len) = import_b(state)?;
+                if out_len != $out || xof_len != 0 {
+                    return Err(super::StateError::WrongAlgorithm);
+                }
+                Ok($name { state })
+            }
+        }
     };
+}
+
+/// Serialized BLAKE2b state: header, `h`, `t0`, `t1`, `u8` count + 128-byte
+/// buffer, digest length, `u32` XOF length.
+const BLAKE2B_STATE_LEN: usize = 2 + 64 + 16 + 1 + 128 + 1 + 4;
+/// Serialized BLAKE2s state: as BLAKE2b with 32-bit words, a 64-byte buffer
+/// and a `u16` XOF length.
+const BLAKE2S_STATE_LEN: usize = 2 + 32 + 8 + 1 + 64 + 1 + 2;
+
+fn export_b(st: &Blake2bState, out_len: usize, xof_len: u32) -> [u8; BLAKE2B_STATE_LEN] {
+    let mut out = [0u8; BLAKE2B_STATE_LEN];
+    let mut w = super::state::Writer::new(&mut out, super::state::tag::BLAKE2B);
+    st.export_into(&mut w, out_len, xof_len);
+    w.finish();
+    out
+}
+
+fn import_b(state: &[u8]) -> Result<(Blake2bState, usize, u32), super::StateError> {
+    let mut r = super::state::Reader::new(state, super::state::tag::BLAKE2B, BLAKE2B_STATE_LEN)?;
+    let parsed = Blake2bState::import_from(&mut r)?;
+    r.finish();
+    Ok(parsed)
+}
+
+fn export_s(st: &Blake2sState, out_len: usize, xof_len: u16) -> [u8; BLAKE2S_STATE_LEN] {
+    let mut out = [0u8; BLAKE2S_STATE_LEN];
+    let mut w = super::state::Writer::new(&mut out, super::state::tag::BLAKE2S);
+    st.export_into(&mut w, out_len, xof_len);
+    w.finish();
+    out
+}
+
+fn import_s(state: &[u8]) -> Result<(Blake2sState, usize, u16), super::StateError> {
+    let mut r = super::state::Reader::new(state, super::state::tag::BLAKE2S, BLAKE2S_STATE_LEN)?;
+    let parsed = Blake2sState::import_from(&mut r)?;
+    r.finish();
+    Ok(parsed)
 }
 
 blake2b!(Blake2b256, blake2b256, 32, "BLAKE2b with a 256-bit digest.");
@@ -574,6 +721,21 @@ pub fn blake2s256(data: &[u8]) -> [u8; 32] {
     Blake2s256::digest(data)
 }
 
+impl super::ExportableState for Blake2s256 {
+    const STATE_LEN: usize = BLAKE2S_STATE_LEN;
+    type State = [u8; BLAKE2S_STATE_LEN];
+    fn export_state(&self) -> Self::State {
+        export_s(&self.state, 32, 0)
+    }
+    fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+        let (state, out_len, xof_len) = import_s(state)?;
+        if out_len != 32 || xof_len != 0 {
+            return Err(super::StateError::WrongAlgorithm);
+        }
+        Ok(Blake2s256 { state })
+    }
+}
+
 // ---- Keyed BLAKE2 (MAC) ----
 
 /// BLAKE2b in keyed mode — a MAC with a caller-chosen key and output length.
@@ -619,6 +781,44 @@ impl Blake2bMac {
         }
         Ok(Blake2bMac {
             state: Blake2bState::with_key(out_len, key),
+            out_len,
+        })
+    }
+
+    /// Keyed (or, with an empty `key`, unkeyed) BLAKE2b with the parameter
+    /// block's 16-byte salt and personalization fields set — libsodium's
+    /// `crypto_generichash_blake2b_salt_personal`, and Python's
+    /// `hashlib.blake2b(key=…, salt=…, person=…, digest_size=…)`.
+    ///
+    /// `salt` and `personal` may be shorter than 16 bytes; they are
+    /// zero-padded, so an empty one is the same as the all-zero field (what
+    /// libsodium uses for a `NULL` salt or personalization). With both empty
+    /// this is [`try_new`](Self::try_new).
+    ///
+    /// Returns [`Error::InvalidOutputLength`] for `out_len` outside `1..=64`,
+    /// [`Error::KeyTooLong`] for a key over 64 bytes, and
+    /// [`Error::SaltTooLong`] / [`Error::PersonalTooLong`] for a field over 16
+    /// bytes.
+    pub fn try_new_with_salt_personal(
+        key: &[u8],
+        out_len: usize,
+        salt: &[u8],
+        personal: &[u8],
+    ) -> Result<Self, Error> {
+        if !(1..=64).contains(&out_len) {
+            return Err(Error::InvalidOutputLength);
+        }
+        if key.len() > 64 {
+            return Err(Error::KeyTooLong);
+        }
+        if salt.len() > 16 {
+            return Err(Error::SaltTooLong);
+        }
+        if personal.len() > 16 {
+            return Err(Error::PersonalTooLong);
+        }
+        Ok(Blake2bMac {
+            state: Blake2bState::with_key_salt_personal(out_len, key, salt, personal),
             out_len,
         })
     }
@@ -698,6 +898,25 @@ impl Drop for Blake2bMac {
     }
 }
 
+/// The exported state of a keyed MAC is key-derived (and holds the key block
+/// itself until the first message byte arrives): keep it as secret as the key.
+/// The digest length travels with the state; a [`Blake2b256`] state imports
+/// here as the equivalent `new_unkeyed(32)`, and vice versa.
+impl super::ExportableState for Blake2bMac {
+    const STATE_LEN: usize = BLAKE2B_STATE_LEN;
+    type State = [u8; BLAKE2B_STATE_LEN];
+    fn export_state(&self) -> Self::State {
+        export_b(&self.state, self.out_len, 0)
+    }
+    fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+        let (state, out_len, xof_len) = import_b(state)?;
+        if xof_len != 0 {
+            return Err(super::StateError::WrongAlgorithm);
+        }
+        Ok(Blake2bMac { state, out_len })
+    }
+}
+
 /// BLAKE2s in keyed mode — a MAC with a caller-chosen key and output length.
 #[derive(Clone)]
 pub struct Blake2sMac {
@@ -737,6 +956,39 @@ impl Blake2sMac {
         }
         Ok(Blake2sMac {
             state: Blake2sState::with_key(out_len, key),
+            out_len,
+        })
+    }
+
+    /// Keyed (or, with an empty `key`, unkeyed) BLAKE2s with the parameter
+    /// block's 8-byte salt and personalization fields set (Python's
+    /// `hashlib.blake2s(key=…, salt=…, person=…, digest_size=…)`).
+    ///
+    /// Shorter `salt` / `personal` values are zero-padded. Returns
+    /// [`Error::InvalidOutputLength`] for `out_len` outside `1..=32`,
+    /// [`Error::KeyTooLong`] for a key over 32 bytes, and
+    /// [`Error::SaltTooLong`] / [`Error::PersonalTooLong`] for a field over 8
+    /// bytes.
+    pub fn try_new_with_salt_personal(
+        key: &[u8],
+        out_len: usize,
+        salt: &[u8],
+        personal: &[u8],
+    ) -> Result<Self, Error> {
+        if !(1..=32).contains(&out_len) {
+            return Err(Error::InvalidOutputLength);
+        }
+        if key.len() > 32 {
+            return Err(Error::KeyTooLong);
+        }
+        if salt.len() > 8 {
+            return Err(Error::SaltTooLong);
+        }
+        if personal.len() > 8 {
+            return Err(Error::PersonalTooLong);
+        }
+        Ok(Blake2sMac {
+            state: Blake2sState::with_key_salt_personal(out_len, key, salt, personal),
             out_len,
         })
     }
@@ -788,6 +1040,22 @@ impl Mac for Blake2sMac {
 impl Drop for Blake2sMac {
     fn drop(&mut self) {
         self.state.zeroize();
+    }
+}
+
+/// See the [`Blake2bMac`] impl: the state of a keyed MAC is secret.
+impl super::ExportableState for Blake2sMac {
+    const STATE_LEN: usize = BLAKE2S_STATE_LEN;
+    type State = [u8; BLAKE2S_STATE_LEN];
+    fn export_state(&self) -> Self::State {
+        export_s(&self.state, self.out_len, 0)
+    }
+    fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+        let (state, out_len, xof_len) = import_s(state)?;
+        if xof_len != 0 {
+            return Err(super::StateError::WrongAlgorithm);
+        }
+        Ok(Blake2sMac { state, out_len })
     }
 }
 
@@ -862,6 +1130,22 @@ impl Blake2xb {
     pub fn finalize_into(self, out: &mut [u8]) {
         use super::XofReader;
         self.finalize_xof().read(out);
+    }
+}
+
+/// The BLAKE2Xb output length travels with the state.
+impl super::ExportableState for Blake2xb {
+    const STATE_LEN: usize = BLAKE2B_STATE_LEN;
+    type State = [u8; BLAKE2B_STATE_LEN];
+    fn export_state(&self) -> Self::State {
+        export_b(&self.state, 64, self.xof_len)
+    }
+    fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+        let (state, out_len, xof_len) = import_b(state)?;
+        if out_len != 64 || xof_len == 0 {
+            return Err(super::StateError::WrongAlgorithm);
+        }
+        Ok(Blake2xb { state, xof_len })
     }
 }
 
@@ -985,6 +1269,22 @@ impl Blake2xs {
     }
 }
 
+/// The BLAKE2Xs output length travels with the state.
+impl super::ExportableState for Blake2xs {
+    const STATE_LEN: usize = BLAKE2S_STATE_LEN;
+    type State = [u8; BLAKE2S_STATE_LEN];
+    fn export_state(&self) -> Self::State {
+        export_s(&self.state, 32, self.xof_len)
+    }
+    fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+        let (state, out_len, xof_len) = import_s(state)?;
+        if out_len != 32 || xof_len == 0 {
+            return Err(super::StateError::WrongAlgorithm);
+        }
+        Ok(Blake2xs { state, xof_len })
+    }
+}
+
 impl super::XofReader for Blake2xsReader {
     fn read(&mut self, out: &mut [u8]) {
         let mut i = 0;
@@ -1038,6 +1338,103 @@ impl Drop for Blake2xsReader {
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
+
+    /// Salt and personalization (RFC 7693 parameter block bytes 32..64 for
+    /// BLAKE2b, 16..32 for BLAKE2s). Expected values from CPython's
+    /// `hashlib.blake2b` / `hashlib.blake2s` (the reference BLAKE2 code),
+    /// which zero-pads short fields exactly as here.
+    #[test]
+    fn salt_and_personalization() {
+        let m: [u8; 256] = core::array::from_fn(|i| i as u8);
+        let key32: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let salt16: [u8; 16] = core::array::from_fn(|i| i as u8);
+
+        let mac = |key: &[u8], n: usize, salt: &[u8], person: &[u8], msg: &[u8]| {
+            let mut h = Blake2bMac::try_new_with_salt_personal(key, n, salt, person).unwrap();
+            h.update(msg);
+            let mut out = [0u8; 64];
+            h.finalize_into(&mut out[..n]);
+            out
+        };
+        // blake2b(m[:200], digest_size=64, salt=bytes(range(16)),
+        //         person=b'purecrypto-test!')
+        assert_eq!(
+            mac(&[], 64, &salt16, b"purecrypto-test!", &m[..200]),
+            from_hex::<64>(
+                "56c4ab171ae43f0de2b54498d553f207128f6fda447cb5276eaa520fa4fca16a\
+                 9dbe29b7c098a682525a94508dc993ca889f11e89e9b014c07bf387652ed9b3b"
+            )
+        );
+        // blake2b(m[:3], digest_size=32, key=bytes(range(32)),
+        //         salt=b'saltsaltsaltsalt', person=b'personalpersonal')
+        assert_eq!(
+            mac(
+                &key32,
+                32,
+                b"saltsaltsaltsalt",
+                b"personalpersonal",
+                &m[..3]
+            )[..32],
+            from_hex::<32>("00c5f17b0e9de1fae365300b6f080b98f2e652367245c27ec16d03633e2d7506")
+        );
+        // blake2b(b'', digest_size=16, salt=b'abc', person=b'xy')
+        assert_eq!(
+            mac(&[], 16, b"abc", b"xy", b"")[..16],
+            from_hex::<16>("99386eeefefd3987b4b693c97598065d")
+        );
+        // Empty salt and personalization are the plain hash / MAC.
+        assert_eq!(mac(&[], 64, &[], &[], b"abc"), blake2b512(b"abc"));
+
+        let smac = |key: &[u8], n: usize, salt: &[u8], person: &[u8], msg: &[u8]| {
+            let mut h = Blake2sMac::try_new_with_salt_personal(key, n, salt, person).unwrap();
+            h.update(msg);
+            let mut out = [0u8; 32];
+            h.finalize_into(&mut out[..n]);
+            out
+        };
+        // blake2s(m[:100], digest_size=32, key=bytes(range(16)),
+        //         salt=bytes(range(8)), person=b'ABCDEFGH')
+        assert_eq!(
+            smac(&key32[..16], 32, &salt16[..8], b"ABCDEFGH", &m[..100]),
+            from_hex::<32>("7cc7fd3e9c82749ba358cf288d421872c1e37310fe47eb8db30af97150e6c49e")
+        );
+        // blake2s(b'abc', digest_size=20, salt=b'1')
+        assert_eq!(
+            smac(&[], 20, b"1", b"", b"abc")[..20],
+            from_hex::<20>("70762b31e13348ae3de4bad9c38e4816422d199f")
+        );
+        assert_eq!(smac(&[], 32, &[], &[], b"abc"), blake2s256(b"abc"));
+
+        // Over-long fields are rejected, not truncated.
+        assert_eq!(
+            Blake2bMac::try_new_with_salt_personal(&[], 32, &[0; 17], &[]).err(),
+            Some(Error::SaltTooLong)
+        );
+        assert_eq!(
+            Blake2bMac::try_new_with_salt_personal(&[], 32, &[], &[0; 17]).err(),
+            Some(Error::PersonalTooLong)
+        );
+        assert_eq!(
+            Blake2bMac::try_new_with_salt_personal(&[0; 65], 32, &[], &[]).err(),
+            Some(Error::KeyTooLong)
+        );
+        assert_eq!(
+            Blake2bMac::try_new_with_salt_personal(&[], 0, &[], &[]).err(),
+            Some(Error::InvalidOutputLength)
+        );
+        assert_eq!(
+            Blake2sMac::try_new_with_salt_personal(&[], 32, &[0; 9], &[]).err(),
+            Some(Error::SaltTooLong)
+        );
+        assert_eq!(
+            Blake2sMac::try_new_with_salt_personal(&[], 32, &[], &[0; 9]).err(),
+            Some(Error::PersonalTooLong)
+        );
+        assert_eq!(
+            Blake2sMac::try_new_with_salt_personal(&[], 33, &[], &[]).err(),
+            Some(Error::InvalidOutputLength)
+        );
+    }
 
     /// The fallible constructors report out-of-range output lengths and
     /// over-long keys as errors; for valid parameters they build the same

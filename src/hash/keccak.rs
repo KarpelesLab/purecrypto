@@ -286,6 +286,35 @@ impl Keccak {
         self.squeeze_offset = 0;
     }
 
+    /// Writes the 25 lanes and the not-yet-absorbed input (`rate` bytes of
+    /// buffer). Only meaningful while absorbing.
+    pub(super) fn export_into(&self, w: &mut super::state::Writer<'_>) {
+        w.u64s(&self.state);
+        w.buffer(&self.buf[..self.rate], self.buf_len);
+    }
+
+    /// Loads what [`Self::export_into`] wrote into this (absorbing) sponge,
+    /// keeping its rate and round count; `self` is unchanged on error.
+    pub(super) fn import_from(
+        &mut self,
+        r: &mut super::state::Reader<'_>,
+    ) -> Result<(), super::StateError> {
+        let lanes = r.u64s::<25>();
+        let mut buf = [0u8; MAX_RATE];
+        let buf_len = r.buffer(&mut buf[..self.rate], self.rate - 1)?;
+        self.state = lanes;
+        self.buf = buf;
+        self.buf_len = buf_len;
+        self.squeeze_offset = 0;
+        Ok(())
+    }
+
+    /// Serialized length for a sponge of this `rate`: header, lanes, `u8`
+    /// count and the buffer.
+    pub(super) const fn state_len(rate: usize) -> usize {
+        2 + 200 + 1 + rate
+    }
+
     /// Best-effort wipe of the sponge state and absorb buffer.
     pub(super) fn zeroize(&mut self) {
         super::zeroize::zero_words(&mut self.state);

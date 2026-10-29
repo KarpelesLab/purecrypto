@@ -48,7 +48,7 @@ macro_rules! gg1 {
 const T0: u32 = 0x79cc_4519;
 const T1: u32 = 0x7a87_9d8a;
 
-fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+pub(super) fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     // Message expansion: W[0..68], W'[j] = W[j] ^ W[j+4].
     let mut w = [0u32; 68];
     for (word, chunk) in w.iter_mut().take(16).zip(block.chunks_exact(4)) {
@@ -178,6 +178,14 @@ impl Digest for Sm3 {
 pub fn sm3(data: &[u8]) -> [u8; 32] {
     Sm3::digest(data)
 }
+
+super::state::impl_exportable_state!(
+    Sm3,
+    super::state::tag::SM3,
+    super::state::md32_state_len(8),
+    |s| s.state,
+    Sm3::new()
+);
 
 #[cfg(test)]
 mod tests {

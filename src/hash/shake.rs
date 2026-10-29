@@ -7,7 +7,7 @@ use super::keccak::{Keccak, KeccakReader};
 
 /// Generates a SHAKE variant with the given rate.
 macro_rules! shake {
-    ($name:ident, $func:ident, $rate:expr, $doc:literal) => {
+    ($name:ident, $func:ident, $rate:expr, $doc:literal, $tag:ident) => {
         #[doc = $doc]
         #[derive(Clone)]
         pub struct $name {
@@ -41,6 +41,14 @@ macro_rules! shake {
         pub fn $func(data: &[u8], out: &mut [u8]) {
             $name::xof(data, out);
         }
+
+        super::state::impl_exportable_state!(
+            $name,
+            super::state::tag::$tag,
+            Keccak::state_len($rate),
+            |s| s.keccak,
+            <$name as ExtendableOutput>::new()
+        );
     };
 }
 
@@ -48,13 +56,15 @@ shake!(
     Shake128,
     shake128,
     168,
-    "The SHAKE128 extendable-output function."
+    "The SHAKE128 extendable-output function.",
+    SHAKE128
 );
 shake!(
     Shake256,
     shake256,
     136,
-    "The SHAKE256 extendable-output function."
+    "The SHAKE256 extendable-output function.",
+    SHAKE256
 );
 
 #[cfg(test)]

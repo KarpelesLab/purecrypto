@@ -21,7 +21,7 @@ fn h(x: u32, y: u32, z: u32) -> u32 {
     x ^ y ^ z
 }
 
-fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
+pub(super) fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
     let x = block_words_le(block);
     let [mut a, mut b, mut c, mut d] = *state;
 
@@ -157,6 +157,14 @@ impl Digest for Md4 {
 pub fn md4(data: &[u8]) -> [u8; 16] {
     Md4::digest(data)
 }
+
+super::state::impl_exportable_state!(
+    Md4,
+    super::state::tag::MD4,
+    super::state::md32_state_len(4),
+    |s| s.state,
+    Md4::new()
+);
 
 #[cfg(test)]
 mod tests {

@@ -9,7 +9,7 @@ use super::keccak::Keccak;
 
 /// Generates a fixed-output Keccak hash with the given rate and domain byte.
 macro_rules! keccak_hash {
-    ($name:ident, $func:ident, $out:expr, $rate:expr, $pad:expr, $doc:literal) => {
+    ($name:ident, $func:ident, $out:expr, $rate:expr, $pad:expr, $doc:literal, $tag:ident) => {
         #[doc = $doc]
         #[derive(Clone)]
         pub struct $name {
@@ -62,6 +62,14 @@ macro_rules! keccak_hash {
         pub fn $func(data: &[u8]) -> [u8; $out] {
             $name::digest(data)
         }
+
+        super::state::impl_exportable_state!(
+            $name,
+            super::state::tag::$tag,
+            Keccak::state_len($rate),
+            |s| s.keccak,
+            $name::new()
+        );
     };
 }
 
@@ -71,7 +79,8 @@ keccak_hash!(
     28,
     144,
     0x06,
-    "The SHA3-224 hash function."
+    "The SHA3-224 hash function.",
+    SHA3_224
 );
 keccak_hash!(
     Sha3_256,
@@ -79,7 +88,8 @@ keccak_hash!(
     32,
     136,
     0x06,
-    "The SHA3-256 hash function."
+    "The SHA3-256 hash function.",
+    SHA3_256
 );
 keccak_hash!(
     Sha3_384,
@@ -87,7 +97,8 @@ keccak_hash!(
     48,
     104,
     0x06,
-    "The SHA3-384 hash function."
+    "The SHA3-384 hash function.",
+    SHA3_384
 );
 keccak_hash!(
     Sha3_512,
@@ -95,7 +106,8 @@ keccak_hash!(
     64,
     72,
     0x06,
-    "The SHA3-512 hash function."
+    "The SHA3-512 hash function.",
+    SHA3_512
 );
 keccak_hash!(
     Keccak256,
@@ -103,7 +115,8 @@ keccak_hash!(
     32,
     136,
     0x01,
-    "The legacy Keccak-256 hash (Ethereum), i.e. SHA3-256 with `0x01` padding."
+    "The legacy Keccak-256 hash (Ethereum), i.e. SHA3-256 with `0x01` padding.",
+    KECCAK256
 );
 
 #[cfg(test)]

@@ -36,6 +36,17 @@
 //! [`Blake2bMac`], [`Blake2sMac`]. Keyed constructions wipe their key-derived
 //! state on drop.
 //!
+//! # Saving and resuming a hash
+//!
+//! [`ExportableState`] serializes a hasher mid-message (chaining value,
+//! buffered partial block, length counters) to a fixed-size byte string and
+//! rebuilds it, with validation, from one — for every block hash above
+//! except BLAKE3, plus SHAKE, the keyed/salted BLAKE2 MACs and BLAKE2X.
+//! [`Hasher::export_state`] / [`Hasher::from_state`] do the same for a
+//! runtime-chosen algorithm. The format is this crate's own; see the trait
+//! for the layout. For lower-level work, [`compress`] exposes the bare
+//! compression functions of the Merkle–Damgård hashes.
+//!
 //! # Choosing the hash at runtime
 //!
 //! [`Digest`] fixes the algorithm at compile time. When it instead arrives from
@@ -72,6 +83,7 @@ mod blake3_neon;
 #[cfg(target_arch = "x86_64")]
 mod blake3_simd;
 mod block;
+pub mod compress;
 #[cfg(feature = "legacy-hashes")]
 mod gost94;
 #[cfg(feature = "legacy-hashes")]
@@ -137,6 +149,7 @@ mod simd_x86;
 mod sm3;
 #[cfg(feature = "legacy-hashes")]
 mod snefru;
+mod state;
 mod streebog;
 #[cfg(feature = "legacy-hashes")]
 mod tiger;
@@ -184,6 +197,7 @@ pub use sha256::{Sha224, Sha256, sha224, sha256};
 pub use sha512::{Sha384, Sha512, Sha512_224, Sha512_256, sha384, sha512, sha512_224, sha512_256};
 pub use shake::{Shake128, Shake256, shake128, shake256};
 pub use sm3::{Sm3, sm3};
+pub use state::{ExportableState, STATE_FORMAT_VERSION, StateError};
 pub use streebog::{Streebog256, Streebog512, streebog256, streebog512};
 pub use whirlpool::{Whirlpool, whirlpool};
 

@@ -148,6 +148,32 @@ impl State256 {
         }
     }
 
+    /// Writes the chaining words, byte count and partial block (the
+    /// [`super::state`] layout shared with the other 64-byte-block hashes).
+    fn export_into(&self, w: &mut super::state::Writer<'_>) {
+        w.u32s(&self.h);
+        w.u64(self.msg_len);
+        w.buffer(&self.block, self.block_len);
+    }
+
+    /// Loads what [`Self::export_into`] wrote; `self` is unchanged on error.
+    fn import_from(&mut self, r: &mut super::state::Reader<'_>) -> Result<(), super::StateError> {
+        let h = r.u32s::<8>();
+        let msg_len = r.u64();
+        let mut block = [0u8; 64];
+        let block_len = r.buffer(&mut block, 63)?;
+        if msg_len % 64 != block_len as u64 {
+            return Err(super::StateError::Inconsistent);
+        }
+        *self = State256 {
+            h,
+            block,
+            block_len,
+            msg_len,
+        };
+        Ok(())
+    }
+
     /// Best-effort wipe of the state words and partial block.
     fn zeroize(&mut self) {
         super::zeroize::zero_words(&mut self.h);
@@ -503,6 +529,21 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 pub fn sha224(data: &[u8]) -> [u8; 28] {
     Sha224::digest(data)
 }
+
+super::state::impl_exportable_state!(
+    Sha256,
+    super::state::tag::SHA256,
+    super::state::md32_state_len(8),
+    |s| s.state,
+    Sha256::new()
+);
+super::state::impl_exportable_state!(
+    Sha224,
+    super::state::tag::SHA224,
+    super::state::md32_state_len(8),
+    |s| s.state,
+    Sha224::new()
+);
 
 #[cfg(test)]
 mod tests {
