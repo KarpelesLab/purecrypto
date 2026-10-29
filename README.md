@@ -133,7 +133,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `ct` (always on) | Branchless equality, selection, ordering, and `Choice` |
 | `zeroize` (always on) | `Zeroize` / `ZeroizeOnDrop` traits and the `Zeroizing<T>` guard: volatile-store secret wiping, a drop-in for the `zeroize` crate |
 | `hash` | SHA-2, SHA-3 / Keccak, SHAKE, cSHAKE, KMAC, TupleHash, ParallelHash, TurboSHAKE, KangarooTwelve, BLAKE2b/2s/2X, BLAKE3, SM3, Whirlpool, Streebog, MD2/4/5, SHA-1, RIPEMD-160; HMAC and the `Mac` trait |
-| `cipher` | AES (constant-time, table-free), SM4, Camellia, ARIA; CBC/CFB/OFB/CTR; AES-GCM, CCM, EAX, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV, AEGIS-128L/256, AES-CBC-HMAC-SHA2; XTS; AES-KW/KWP; DES/3DES for legacy interop |
+| `cipher` | AES (constant-time, table-free), SM4, Camellia, ARIA; CBC/CFB/OFB/CTR; AES-GCM, CCM, EAX, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV, AEGIS-128L/256, AES-CBC-HMAC-SHA2; ChaCha20 (IETF, original 64-bit-nonce, OpenSSL counter carry), XChaCha20, Salsa20/XSalsa20/HSalsa20 and NaCl secretbox (XSalsa20-Poly1305); XTS; AES-KW/KWP; DES/3DES for legacy interop |
 | `legacy-ciphers` | SEED (table-free), TEA/XTEA/XXTEA, MORUS-640/1280, AEGIS-128 and the v1.2 Ascon-128/128a/80pq AEADs (with `ascon`): interop and test-vector coverage only (opt-in) |
 | `mac` | AES-CMAC, GMAC, UMAC-64/128, SipHash-c-d / SipHashX |
 | `vmac` | VMAC-64/128 (draft-krovetz-vmac-01) (opt-in) |

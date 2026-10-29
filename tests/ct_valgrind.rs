@@ -81,8 +81,9 @@ use purecrypto::chunked::{self, Cobblestone128};
 use purecrypto::cipher::{
     Aegis128, Aegis128L, Aes128, Aes128Ccm, Aes128Eax, Aes128Kw, Aes128Kwp, Aes128Xts, Aes192,
     Aes256, Aes256GcmSiv, AesCmac128, AesSiv, Aez, Aria128, BlockCipher, BlockCipher64,
-    Camellia128, Cbc, Cfb, ChaCha20Poly1305, Ctr, Gcm, Gmac, Morus640, Morus1280, Ofb, Poly1305,
-    Seed, Sm4, Tea, XChaCha20Poly1305, Xtea, Xxtea, kwp_ciphertext_len,
+    Camellia128, Cbc, Cfb, ChaCha20, ChaCha20Poly1305, Ctr, Gcm, Gmac, Morus640, Morus1280, Ofb,
+    Poly1305, Salsa20, Seed, Sm4, Tea, XChaCha20, XChaCha20Poly1305, XSalsa20, XSalsa20Poly1305,
+    Xtea, Xxtea, hchacha20, hsalsa20, kwp_ciphertext_len,
 };
 use purecrypto::dh::{DhPrivateKey, group14};
 use purecrypto::dsa::{self, DsaPrivateKey};
@@ -401,6 +402,69 @@ fn xchacha20_poly1305() -> String {
     aead_roundtrip(
         |b| aead.encrypt(&nonce, b"aad", b),
         |b, t| aead.decrypt(&nonce, b"aad", b, t).is_ok(),
+    )
+}
+
+/// The ChaCha20 stream variants on their own: the original 64-bit-nonce
+/// layout and the OpenSSL counter carry (both starting just below the 2³²
+/// boundary, so the wrap-splitting runs on secret data), the fallible RFC 8439
+/// form, and XChaCha20 with its HChaCha20 subkey.
+fn chacha20_streams() -> String {
+    let key = secret_bytes::<32>(9100);
+    let pt = secret_bytes::<300>(9101);
+    let c = ChaCha20::new(&key);
+    let mut out = Vec::new();
+    let mut run = |f: &dyn Fn(&mut [u8])| {
+        let mut buf = pt;
+        f(&mut buf);
+        declassify(&buf);
+        out.push(hex8(&buf));
+        f(&mut buf);
+        assert!(bool::from(ct::declassify_value(buf.ct_eq(&pt))));
+    };
+    let n8 = fixed_bytes::<8>(9102);
+    let n12 = fixed_bytes::<12>(9103);
+    let n24 = fixed_bytes::<24>(9104);
+    run(&|b| c.apply_keystream_djb(&n8, 0xffff_fffe, b).unwrap());
+    run(&|b| c.apply_keystream_carry(&n12, 0xffff_fffe, b).unwrap());
+    run(&|b| c.try_apply_keystream(&n12, 1, b).unwrap());
+    let x = XChaCha20::new(&key);
+    run(&|b| x.apply_keystream(&n24, 0, b).unwrap());
+    let sub = hchacha20(&key, &fixed_bytes::<16>(9105));
+    out.push(hex8(public(&sub)));
+    out.join(" ")
+}
+
+/// Salsa20 (across the 2³² counter carry), XSalsa20 and HSalsa20.
+fn salsa20_streams() -> String {
+    let key = secret_bytes::<32>(9110);
+    let pt = secret_bytes::<300>(9111);
+    let s = Salsa20::new(&key);
+    let x = XSalsa20::new(&key);
+    let n8 = fixed_bytes::<8>(9112);
+    let n24 = fixed_bytes::<24>(9113);
+    let mut out = Vec::new();
+    let mut run = |f: &dyn Fn(&mut [u8])| {
+        let mut buf = pt;
+        f(&mut buf);
+        declassify(&buf);
+        out.push(hex8(&buf));
+        f(&mut buf);
+        assert!(bool::from(ct::declassify_value(buf.ct_eq(&pt))));
+    };
+    run(&|b| s.apply_keystream(&n8, 0xffff_fffe, b).unwrap());
+    run(&|b| x.apply_keystream(&n24, 0, b).unwrap());
+    let sub = hsalsa20(&key, &fixed_bytes::<16>(9114));
+    out.push(hex8(public(&sub)));
+    out.join(" ")
+}
+
+fn xsalsa20_poly1305() -> String {
+    let sb = XSalsa20Poly1305::new(&secret_bytes::<32>(9120));
+    let nonce = fixed_bytes::<24>(9121);
+    aead_roundtrip(
+        |b| sb.encrypt(&nonce, b),
+        |b, t| sb.decrypt(&nonce, b, t).is_ok(),
     )
 }
 
@@ -2668,6 +2732,9 @@ const CASES: &[Case] = &[
     ("aes_gcm_fused", aes_gcm_fused),
     ("chacha20_poly1305", chacha20_poly1305),
     ("xchacha20_poly1305", xchacha20_poly1305),
+    ("chacha20_streams", chacha20_streams),
+    ("salsa20_streams", salsa20_streams),
+    ("xsalsa20_poly1305", xsalsa20_poly1305),
     ("aes256_gcm_siv", aes256_gcm_siv),
     ("aes128_ccm", aes128_ccm),
     ("aes128_eax", aes128_eax),
