@@ -328,33 +328,37 @@ impl ChaCha20 {
         // On x86_64, generate the keystream many blocks at a time — ChaCha20
         // blocks are independent, so the wide layout needs no diagonal
         // shuffles. AVX-512 does sixteen blocks per pass, AVX2 eight; both are
-        // byte-identical to the scalar path.
-        #[cfg(target_arch = "x86_64")]
-        if simd512::supported() {
-            simd512::apply_keystream(&self.key, nonce, counter, buf);
-            return;
-        }
-        #[cfg(target_arch = "x86_64")]
-        if simd::supported() {
-            simd::apply_keystream(&self.key, nonce, counter, buf);
-            return;
-        }
+        // byte-identical to the scalar path. A wide pass costs about the same
+        // whatever share of its lanes is used (measured on Zen 5: one 16-way
+        // pass ≈ 1.8 scalar blocks, one AVX2 8-way pass ≈ 2.4), so each
+        // kernel hands back a tail of at most one (AVX-512) or two (AVX2)
+        // blocks to the scalar loop below, and buffers that short — such as
+        // the single-block Poly1305 OTK derivation — never enter a kernel.
+        //
         // On aarch64 NEON is part of the baseline ISA, so the 2×4-way kernel
         // is the normal path with no runtime probe. It hands back a tail of
         // up to two blocks, where a 4-wide pass would mostly compute
         // discarded blocks (measured: slower than the scalar loop up to 128
-        // bytes, faster from three blocks on), to the scalar loop below —
-        // which also remains the whole path for buffers that short
-        // (single-block callers such as the Poly1305 OTK derivation never
-        // enter the kernel) and in the constant-time harness's
-        // forced-portable mode.
+        // bytes, faster from three blocks on).
+        //
+        // The scalar loop is also the whole path in the constant-time
+        // harness's forced-portable mode. Every choice here depends only on
+        // the public buffer length.
+        #[cfg(target_arch = "x86_64")]
+        let (done, mut block_counter) = if buf.len() > 64 && simd512::supported() {
+            simd512::apply_keystream(&self.key, nonce, counter, buf)
+        } else if buf.len() > 128 && simd::supported() {
+            simd::apply_keystream(&self.key, nonce, counter, buf)
+        } else {
+            (0, counter)
+        };
         #[cfg(target_arch = "aarch64")]
         let (done, mut block_counter) = if buf.len() > 128 && neon::supported() {
             neon::apply_keystream(&self.key, nonce, counter, buf)
         } else {
             (0, counter)
         };
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let (done, mut block_counter) = (0, counter);
         for block in buf[done..].chunks_mut(64) {
             let mut ks = self.block(nonce, block_counter);
@@ -440,10 +444,16 @@ impl XChaCha20 {
 /// below, with each of the 16 state words held in a `__m512i` lane-per-block
 /// across sixteen consecutive counters, so one pass emits 1 KiB of keystream.
 ///
-/// Two AVX-512 instructions do real work here beyond the doubled width:
-/// `vprold` rotates in one instruction where AVX2 needs a shift/shift/or trio,
-/// which matters because ChaCha20 is four rotates per quarter-round and nothing
-/// else. Pinned byte-for-byte against the scalar path by a differential test.
+/// `vprold` rotates in one instruction where AVX2 needs a shuffle or a
+/// shift/shift/or trio, which matters because ChaCha20 is four rotates per
+/// quarter-round and little else. The word-sliced state is turned back into
+/// sixteen 64-byte blocks entirely in registers (a 4×4 32-bit transpose
+/// inside each 128-bit lane, then a 4×4 transpose of the 128-bit lanes) and
+/// XORed straight into the buffer; only the final partial block of a call
+/// goes through a stack scratch block. A single trailing block is left to
+/// the scalar path; anything longer gets a (partial) 16-way pass, which on
+/// Zen 5 costs no more than an 8-way one.
+/// Pinned byte-for-byte against the scalar path by a differential test.
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod simd512 {
@@ -454,27 +464,106 @@ mod simd512 {
         !crate::ct::force_portable() && crate::cpu::avx512f()
     }
 
-    /// Rotate-left each 32-bit lane by `N` — a single `vprold`.
-    #[inline(always)]
-    unsafe fn rol<const N: i32>(x: __m512i) -> __m512i {
-        unsafe { _mm512_rol_epi32::<N>(x) }
-    }
-
     #[inline(always)]
     unsafe fn qr(v: &mut [__m512i; 16], a: usize, b: usize, c: usize, d: usize) {
         unsafe {
             v[a] = _mm512_add_epi32(v[a], v[b]);
-            v[d] = rol::<16>(_mm512_xor_si512(v[d], v[a]));
+            v[d] = _mm512_rol_epi32::<16>(_mm512_xor_si512(v[d], v[a]));
             v[c] = _mm512_add_epi32(v[c], v[d]);
-            v[b] = rol::<12>(_mm512_xor_si512(v[b], v[c]));
+            v[b] = _mm512_rol_epi32::<12>(_mm512_xor_si512(v[b], v[c]));
             v[a] = _mm512_add_epi32(v[a], v[b]);
-            v[d] = rol::<8>(_mm512_xor_si512(v[d], v[a]));
+            v[d] = _mm512_rol_epi32::<8>(_mm512_xor_si512(v[d], v[a]));
             v[c] = _mm512_add_epi32(v[c], v[d]);
-            v[b] = rol::<7>(_mm512_xor_si512(v[b], v[c]));
+            v[b] = _mm512_rol_epi32::<7>(_mm512_xor_si512(v[b], v[c]));
         }
     }
 
-    pub(super) fn apply_keystream(key: &[u32; 8], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
+    /// Sixteen keystream blocks for counters `ctr..ctr + 16` (wrapping per
+    /// lane; lanes past the caller's range are discarded), returned in block
+    /// order: element `b` is the 64-byte block for counter `ctr + b`.
+    #[inline(always)]
+    unsafe fn keystream16(key: &[u32; 8], n: &[u32; 3], ctr: u32) -> [__m512i; 16] {
+        unsafe {
+            #[rustfmt::skip]
+            let lanes = _mm512_setr_epi32(
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            );
+            let set = |w: u32| _mm512_set1_epi32(w as i32);
+            let ctrv = _mm512_add_epi32(set(ctr), lanes);
+            let init = [
+                set(CONSTANTS[0]),
+                set(CONSTANTS[1]),
+                set(CONSTANTS[2]),
+                set(CONSTANTS[3]),
+                set(key[0]),
+                set(key[1]),
+                set(key[2]),
+                set(key[3]),
+                set(key[4]),
+                set(key[5]),
+                set(key[6]),
+                set(key[7]),
+                ctrv,
+                set(n[0]),
+                set(n[1]),
+                set(n[2]),
+            ];
+            let mut v = init;
+            for _ in 0..10 {
+                qr(&mut v, 0, 4, 8, 12);
+                qr(&mut v, 1, 5, 9, 13);
+                qr(&mut v, 2, 6, 10, 14);
+                qr(&mut v, 3, 7, 11, 15);
+                qr(&mut v, 0, 5, 10, 15);
+                qr(&mut v, 1, 6, 11, 12);
+                qr(&mut v, 2, 7, 8, 13);
+                qr(&mut v, 3, 4, 9, 14);
+            }
+            for (x, i) in v.iter_mut().zip(init.iter()) {
+                *x = _mm512_add_epi32(*x, *i);
+            }
+
+            // Stage 1: per 4-word group `g`, a 4×4 32-bit transpose inside
+            // each 128-bit lane. `t[g][j]`'s lane `k` is then words
+            // `4g..4g+4` of block `4k + j`.
+            let mut t = [[_mm512_setzero_si512(); 4]; 4];
+            for g in 0..4 {
+                let (a, b, c, d) = (v[4 * g], v[4 * g + 1], v[4 * g + 2], v[4 * g + 3]);
+                let ab_lo = _mm512_unpacklo_epi32(a, b);
+                let ab_hi = _mm512_unpackhi_epi32(a, b);
+                let cd_lo = _mm512_unpacklo_epi32(c, d);
+                let cd_hi = _mm512_unpackhi_epi32(c, d);
+                t[g][0] = _mm512_unpacklo_epi64(ab_lo, cd_lo);
+                t[g][1] = _mm512_unpackhi_epi64(ab_lo, cd_lo);
+                t[g][2] = _mm512_unpacklo_epi64(ab_hi, cd_hi);
+                t[g][3] = _mm512_unpackhi_epi64(ab_hi, cd_hi);
+            }
+            // Stage 2: for each `j`, transpose the 4×4 grid of 128-bit lanes
+            // (`g` × `k`), giving block `4k + j` as lanes `g = 0..4`.
+            let mut out = [_mm512_setzero_si512(); 16];
+            for j in 0..4 {
+                let x0 = _mm512_shuffle_i32x4::<0x44>(t[0][j], t[1][j]);
+                let x1 = _mm512_shuffle_i32x4::<0xee>(t[0][j], t[1][j]);
+                let y0 = _mm512_shuffle_i32x4::<0x44>(t[2][j], t[3][j]);
+                let y1 = _mm512_shuffle_i32x4::<0xee>(t[2][j], t[3][j]);
+                out[j] = _mm512_shuffle_i32x4::<0x88>(x0, y0);
+                out[4 + j] = _mm512_shuffle_i32x4::<0xdd>(x0, y0);
+                out[8 + j] = _mm512_shuffle_i32x4::<0x88>(x1, y1);
+                out[12 + j] = _mm512_shuffle_i32x4::<0xdd>(x1, y1);
+            }
+            out
+        }
+    }
+
+    /// XORs the keystream from block `counter` into `buf`, except for a
+    /// tail of at most one block, which is left for the caller's scalar
+    /// loop. Returns the bytes done and the counter to resume from.
+    pub(super) fn apply_keystream(
+        key: &[u32; 8],
+        nonce: &[u8; 12],
+        counter: u32,
+        buf: &mut [u8],
+    ) -> (usize, u32) {
         // SAFETY: `supported()` (checked by the caller) confirmed AVX-512F.
         unsafe { apply_keystream_avx512(key, nonce, counter, buf) }
     }
@@ -485,92 +574,50 @@ mod simd512 {
         nonce: &[u8; 12],
         counter: u32,
         buf: &mut [u8],
-    ) {
+    ) -> (usize, u32) {
         unsafe {
-            let n =
-                |o: usize| u32::from_le_bytes([nonce[o], nonce[o + 1], nonce[o + 2], nonce[o + 3]]);
-            let (n0, n1, n2) = (n(0), n(4), n(8));
-            #[rustfmt::skip]
-            let lanes = _mm512_setr_epi32(
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-            );
-
+            let n = super::nonce_words(nonce);
             let mut ctr = counter;
-            let mut off = 0usize;
-            // Hoisted out of the loop so one wipe at the end covers them; they
-            // are fully overwritten every pass.
-            let mut words = [[0u32; 16]; 16];
-            let mut ks = [0u8; 1024];
-            while off < buf.len() {
-                let mut v = [
-                    _mm512_set1_epi32(CONSTANTS[0] as i32),
-                    _mm512_set1_epi32(CONSTANTS[1] as i32),
-                    _mm512_set1_epi32(CONSTANTS[2] as i32),
-                    _mm512_set1_epi32(CONSTANTS[3] as i32),
-                    _mm512_set1_epi32(key[0] as i32),
-                    _mm512_set1_epi32(key[1] as i32),
-                    _mm512_set1_epi32(key[2] as i32),
-                    _mm512_set1_epi32(key[3] as i32),
-                    _mm512_set1_epi32(key[4] as i32),
-                    _mm512_set1_epi32(key[5] as i32),
-                    _mm512_set1_epi32(key[6] as i32),
-                    _mm512_set1_epi32(key[7] as i32),
-                    _mm512_add_epi32(_mm512_set1_epi32(ctr as i32), lanes),
-                    _mm512_set1_epi32(n0 as i32),
-                    _mm512_set1_epi32(n1 as i32),
-                    _mm512_set1_epi32(n2 as i32),
-                ];
-                let mut init = v;
-                for _ in 0..10 {
-                    qr(&mut v, 0, 4, 8, 12);
-                    qr(&mut v, 1, 5, 9, 13);
-                    qr(&mut v, 2, 6, 10, 14);
-                    qr(&mut v, 3, 7, 11, 15);
-                    qr(&mut v, 0, 5, 10, 15);
-                    qr(&mut v, 1, 6, 11, 12);
-                    qr(&mut v, 2, 7, 8, 13);
-                    qr(&mut v, 3, 4, 9, 14);
+            let len = buf.len();
+            let mut passes = buf.chunks_exact_mut(1024);
+            for pass in &mut passes {
+                let ks = keystream16(key, &n, ctr);
+                let p = pass.as_mut_ptr();
+                for (b, k) in ks.iter().enumerate() {
+                    let q = p.add(64 * b).cast::<__m512i>();
+                    _mm512_storeu_si512(q, _mm512_xor_si512(_mm512_loadu_si512(q), *k));
                 }
-                for i in 0..16 {
-                    let added = _mm512_add_epi32(v[i], init[i]);
-                    _mm512_storeu_si512(words[i].as_mut_ptr() as *mut _, added);
-                }
-                // Emit up to sixteen 64-byte keystream blocks (lane = block) and
-                // XOR the bytes still needed into `buf`.
-                let avail = (buf.len() - off).min(1024);
-                for (b, blk) in ks.chunks_exact_mut(64).enumerate() {
-                    for (i, word) in blk.chunks_exact_mut(4).enumerate() {
-                        word.copy_from_slice(&words[i][b].to_le_bytes());
-                    }
-                }
-                for (dst, k) in buf[off..off + avail].iter_mut().zip(ks.iter()) {
-                    *dst ^= *k;
-                }
-                // `init[4..12]` is the key broadcast across lanes and `v` the
-                // pre-feed-forward state; both are loop-scoped, so scrub them
-                // here rather than trusting the register allocator not to have
-                // spilled them.
-                for (a, b) in v.iter_mut().zip(init.iter_mut()) {
-                    *a = _mm512_setzero_si512();
-                    *b = _mm512_setzero_si512();
-                }
-                let _ = core::hint::black_box(&v);
-                let _ = core::hint::black_box(&init);
-                off += 1024;
                 ctr = ctr.wrapping_add(16);
             }
-            // Don't leave raw keystream for this key in the stack frame — this
-            // runs on every ChaCha20 / ChaCha20-Poly1305 operation. `words`
-            // and `ks` are the same 1 KiB of keystream in two layouts.
-            //
-            // Not `Zeroize`: that is ~2 KiB of per-byte volatile stores on
-            // *every* call regardless of payload size (measured ~1% at 64 KiB,
-            // proportionally far worse on small TLS/QUIC records), so this
-            // bulk-cipher path keeps the vector store plus `black_box` barrier.
-            words = [[0u32; 16]; 16];
-            ks = [0u8; 1024];
-            let _ = core::hint::black_box(&words);
-            let _ = core::hint::black_box(&ks);
+            let rest = passes.into_remainder();
+            let rest_len = rest.len();
+            let mut done = len - rest_len;
+            if rest_len > 64 {
+                // A partial pass: every whole block it covers, plus the
+                // final partial block through a scratch block.
+                let ks = keystream16(key, &n, ctr);
+                let mut blocks = rest.chunks_exact_mut(64);
+                for (blk, k) in (&mut blocks).zip(ks.iter()) {
+                    let q = blk.as_mut_ptr().cast::<__m512i>();
+                    _mm512_storeu_si512(q, _mm512_xor_si512(_mm512_loadu_si512(q), *k));
+                }
+                let used = rest_len / 64;
+                let tail = blocks.into_remainder();
+                if !tail.is_empty() {
+                    let mut tmp = [0u8; 64];
+                    _mm512_storeu_si512(tmp.as_mut_ptr().cast(), ks[used]);
+                    for (d, k) in tail.iter_mut().zip(tmp.iter()) {
+                        *d ^= *k;
+                    }
+                    // Raw keystream; once per call, so the plain store plus
+                    // barrier (see the scalar `block`).
+                    tmp = [0u8; 64];
+                    let _ = core::hint::black_box(&tmp);
+                }
+                done = len;
+                ctr = ctr.wrapping_add(rest_len.div_ceil(64) as u32);
+            }
+            (done, ctr)
         }
     }
 }
@@ -578,7 +625,10 @@ mod simd512 {
 /// AVX2 8-way ChaCha20 keystream (x86_64). Each of the 16 state words is held in
 /// a `__m256i` lane-per-block across eight consecutive block counters; the
 /// quarter-round indices are identical to the scalar path (independent blocks =
-/// no diagonalization). Pinned byte-for-byte by a differential test.
+/// no diagonalization). The 16- and 8-bit rotations are byte shuffles
+/// (`vpshufb`), the others shift/shift/or. As in the AVX-512 kernel the blocks
+/// are transposed back in registers and XORed straight into the buffer. Pinned
+/// byte-for-byte by a differential test.
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod simd {
@@ -596,103 +646,179 @@ mod simd {
     }
 
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn qr(v: &mut [__m256i; 16], a: usize, b: usize, c: usize, d: usize) {
+    unsafe fn qr(
+        v: &mut [__m256i; 16],
+        r16: __m256i,
+        r8: __m256i,
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+    ) {
         unsafe {
             v[a] = _mm256_add_epi32(v[a], v[b]);
-            v[d] = rol::<16, 16>(_mm256_xor_si256(v[d], v[a]));
+            v[d] = _mm256_shuffle_epi8(_mm256_xor_si256(v[d], v[a]), r16);
             v[c] = _mm256_add_epi32(v[c], v[d]);
             v[b] = rol::<12, 20>(_mm256_xor_si256(v[b], v[c]));
             v[a] = _mm256_add_epi32(v[a], v[b]);
-            v[d] = rol::<8, 24>(_mm256_xor_si256(v[d], v[a]));
+            v[d] = _mm256_shuffle_epi8(_mm256_xor_si256(v[d], v[a]), r8);
             v[c] = _mm256_add_epi32(v[c], v[d]);
             v[b] = rol::<7, 25>(_mm256_xor_si256(v[b], v[c]));
         }
     }
 
-    pub(super) fn apply_keystream(key: &[u32; 8], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
+    /// Eight keystream blocks for counters `ctr..ctr + 8`, in block order:
+    /// elements `2b` and `2b + 1` are the two halves of block `b`.
+    #[inline(always)]
+    unsafe fn keystream8(key: &[u32; 8], n: &[u32; 3], ctr: u32) -> [__m256i; 16] {
+        unsafe {
+            #[rustfmt::skip]
+            let r16 = _mm256_setr_epi8(
+                2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13,
+                2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13,
+            );
+            #[rustfmt::skip]
+            let r8 = _mm256_setr_epi8(
+                3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14,
+                3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14,
+            );
+            let set = |w: u32| _mm256_set1_epi32(w as i32);
+            let ctrv = _mm256_add_epi32(set(ctr), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+            let init = [
+                set(CONSTANTS[0]),
+                set(CONSTANTS[1]),
+                set(CONSTANTS[2]),
+                set(CONSTANTS[3]),
+                set(key[0]),
+                set(key[1]),
+                set(key[2]),
+                set(key[3]),
+                set(key[4]),
+                set(key[5]),
+                set(key[6]),
+                set(key[7]),
+                ctrv,
+                set(n[0]),
+                set(n[1]),
+                set(n[2]),
+            ];
+            let mut v = init;
+            for _ in 0..10 {
+                qr(&mut v, r16, r8, 0, 4, 8, 12);
+                qr(&mut v, r16, r8, 1, 5, 9, 13);
+                qr(&mut v, r16, r8, 2, 6, 10, 14);
+                qr(&mut v, r16, r8, 3, 7, 11, 15);
+                qr(&mut v, r16, r8, 0, 5, 10, 15);
+                qr(&mut v, r16, r8, 1, 6, 11, 12);
+                qr(&mut v, r16, r8, 2, 7, 8, 13);
+                qr(&mut v, r16, r8, 3, 4, 9, 14);
+            }
+            for (x, i) in v.iter_mut().zip(init.iter()) {
+                *x = _mm256_add_epi32(*x, *i);
+            }
+
+            // 4×4 32-bit transpose inside each 128-bit lane: `t[g][j]`'s lane
+            // `k` is words `4g..4g+4` of block `4k + j`.
+            let mut t = [[_mm256_setzero_si256(); 4]; 4];
+            for g in 0..4 {
+                let (a, b, c, d) = (v[4 * g], v[4 * g + 1], v[4 * g + 2], v[4 * g + 3]);
+                let ab_lo = _mm256_unpacklo_epi32(a, b);
+                let ab_hi = _mm256_unpackhi_epi32(a, b);
+                let cd_lo = _mm256_unpacklo_epi32(c, d);
+                let cd_hi = _mm256_unpackhi_epi32(c, d);
+                t[g][0] = _mm256_unpacklo_epi64(ab_lo, cd_lo);
+                t[g][1] = _mm256_unpackhi_epi64(ab_lo, cd_lo);
+                t[g][2] = _mm256_unpacklo_epi64(ab_hi, cd_hi);
+                t[g][3] = _mm256_unpackhi_epi64(ab_hi, cd_hi);
+            }
+            let mut out = [_mm256_setzero_si256(); 16];
+            for j in 0..4 {
+                // Block j: words 0..8 from lane 0 of groups 0/1, 8..16 from
+                // lane 0 of groups 2/3; block 4 + j likewise from lane 1.
+                out[2 * j] = _mm256_permute2x128_si256::<0x20>(t[0][j], t[1][j]);
+                out[2 * j + 1] = _mm256_permute2x128_si256::<0x20>(t[2][j], t[3][j]);
+                out[2 * (4 + j)] = _mm256_permute2x128_si256::<0x31>(t[0][j], t[1][j]);
+                out[2 * (4 + j) + 1] = _mm256_permute2x128_si256::<0x31>(t[2][j], t[3][j]);
+            }
+            out
+        }
+    }
+
+    /// XORs the keystream from block `counter` into `buf`, except for a
+    /// tail of at most two blocks, which is left for the caller's scalar
+    /// loop. Returns the bytes done and the counter to resume from.
+    pub(super) fn apply_keystream(
+        key: &[u32; 8],
+        nonce: &[u8; 12],
+        counter: u32,
+        buf: &mut [u8],
+    ) -> (usize, u32) {
         // SAFETY: `supported()` (checked by the caller) confirmed AVX2.
-        unsafe { apply_keystream_avx2(key, nonce, counter, buf) }
+        unsafe { apply_keystream_avx2(key, &super::nonce_words(nonce), counter, buf) }
     }
 
     #[target_feature(enable = "avx2")]
-    unsafe fn apply_keystream_avx2(key: &[u32; 8], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
+    unsafe fn apply_keystream_avx2(
+        key: &[u32; 8],
+        n: &[u32; 3],
+        counter: u32,
+        buf: &mut [u8],
+    ) -> (usize, u32) {
         unsafe {
-            let n =
-                |o: usize| u32::from_le_bytes([nonce[o], nonce[o + 1], nonce[o + 2], nonce[o + 3]]);
-            let (n0, n1, n2) = (n(0), n(4), n(8));
-            let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-
             let mut ctr = counter;
-            let mut off = 0usize;
-            // Hoisted out of the loop so one wipe at the end covers them; they
-            // are fully overwritten every pass.
-            let mut words = [[0u32; 8]; 16];
-            let mut ks = [0u8; 512];
-            while off < buf.len() {
-                let mut v = [
-                    _mm256_set1_epi32(CONSTANTS[0] as i32),
-                    _mm256_set1_epi32(CONSTANTS[1] as i32),
-                    _mm256_set1_epi32(CONSTANTS[2] as i32),
-                    _mm256_set1_epi32(CONSTANTS[3] as i32),
-                    _mm256_set1_epi32(key[0] as i32),
-                    _mm256_set1_epi32(key[1] as i32),
-                    _mm256_set1_epi32(key[2] as i32),
-                    _mm256_set1_epi32(key[3] as i32),
-                    _mm256_set1_epi32(key[4] as i32),
-                    _mm256_set1_epi32(key[5] as i32),
-                    _mm256_set1_epi32(key[6] as i32),
-                    _mm256_set1_epi32(key[7] as i32),
-                    _mm256_add_epi32(_mm256_set1_epi32(ctr as i32), lanes),
-                    _mm256_set1_epi32(n0 as i32),
-                    _mm256_set1_epi32(n1 as i32),
-                    _mm256_set1_epi32(n2 as i32),
-                ];
-                let mut init = v;
-                for _ in 0..10 {
-                    qr(&mut v, 0, 4, 8, 12);
-                    qr(&mut v, 1, 5, 9, 13);
-                    qr(&mut v, 2, 6, 10, 14);
-                    qr(&mut v, 3, 7, 11, 15);
-                    qr(&mut v, 0, 5, 10, 15);
-                    qr(&mut v, 1, 6, 11, 12);
-                    qr(&mut v, 2, 7, 8, 13);
-                    qr(&mut v, 3, 4, 9, 14);
+            let len = buf.len();
+            let mut passes = buf.chunks_exact_mut(512);
+            for pass in &mut passes {
+                let ks = keystream8(key, n, ctr);
+                let p = pass.as_mut_ptr();
+                for (i, k) in ks.iter().enumerate() {
+                    let q = p.add(32 * i).cast::<__m256i>();
+                    _mm256_storeu_si256(q, _mm256_xor_si256(_mm256_loadu_si256(q), *k));
                 }
-                for i in 0..16 {
-                    let added = _mm256_add_epi32(v[i], init[i]);
-                    _mm256_storeu_si256(words[i].as_mut_ptr() as *mut __m256i, added);
-                }
-                // Emit up to eight 64-byte keystream blocks (lane = block) and
-                // XOR the bytes still needed into `buf`.
-                let avail = (buf.len() - off).min(512);
-                for (b, blk) in ks.chunks_exact_mut(64).enumerate() {
-                    for (i, word) in blk.chunks_exact_mut(4).enumerate() {
-                        word.copy_from_slice(&words[i][b].to_le_bytes());
-                    }
-                }
-                for (dst, k) in buf[off..off + avail].iter_mut().zip(ks.iter()) {
-                    *dst ^= *k;
-                }
-                // See the AVX-512 kernel: scrub the key-bearing vectors.
-                for (a, b) in v.iter_mut().zip(init.iter_mut()) {
-                    *a = _mm256_setzero_si256();
-                    *b = _mm256_setzero_si256();
-                }
-                let _ = core::hint::black_box(&v);
-                let _ = core::hint::black_box(&init);
-                off += 512;
                 ctr = ctr.wrapping_add(8);
             }
-            // Don't leave raw keystream for this key in the stack frame — this
-            // runs on every ChaCha20 / ChaCha20-Poly1305 operation. Not
-            // `Zeroize`, for the per-call cost noted in the AVX-512 kernel.
-            words = [[0u32; 8]; 16];
-            ks = [0u8; 512];
-            let _ = core::hint::black_box(&words);
-            let _ = core::hint::black_box(&ks);
+            let rest = passes.into_remainder();
+            let rest_len = rest.len();
+            let mut done = len - rest_len;
+            if rest_len > 128 {
+                let ks = keystream8(key, n, ctr);
+                let mut halves = rest.chunks_exact_mut(32);
+                for (h, k) in (&mut halves).zip(ks.iter()) {
+                    let q = h.as_mut_ptr().cast::<__m256i>();
+                    _mm256_storeu_si256(q, _mm256_xor_si256(_mm256_loadu_si256(q), *k));
+                }
+                let used = rest_len / 32;
+                let tail = halves.into_remainder();
+                if !tail.is_empty() {
+                    let mut tmp = [0u8; 32];
+                    _mm256_storeu_si256(tmp.as_mut_ptr().cast(), ks[used]);
+                    for (d, k) in tail.iter_mut().zip(tmp.iter()) {
+                        *d ^= *k;
+                    }
+                    // Raw keystream; once per call (see the scalar `block`).
+                    tmp = [0u8; 32];
+                    let _ = core::hint::black_box(&tmp);
+                }
+                done = len;
+                ctr = ctr.wrapping_add(rest_len.div_ceil(64) as u32);
+            }
+            (done, ctr)
         }
     }
+}
+
+/// The three nonce words (state words 13–15).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn nonce_words(nonce: &[u8; 12]) -> [u32; 3] {
+    core::array::from_fn(|i| {
+        u32::from_le_bytes([
+            nonce[4 * i],
+            nonce[4 * i + 1],
+            nonce[4 * i + 2],
+            nonce[4 * i + 3],
+        ])
+    })
 }
 
 /// NEON 4-way ChaCha20 keystream (aarch64), two independent 4-block sets per
@@ -1294,9 +1420,10 @@ only one tip for the future, sunscreen would be it.";
         );
     }
 
-    /// The AVX2 8-way keystream must equal the scalar block path for every
-    /// length, including partial blocks and partial 8-block groups, and across
-    /// a counter value near the 32-bit boundary.
+    /// The AVX2 8-way and AVX-512 16-way keystreams must each equal the
+    /// scalar block path for every length in `0..=1100` and for multi-pass
+    /// buffers, including partial blocks and partial 8-/16-block passes, and
+    /// across counter values near the 32-bit boundary.
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     #[test]
     fn simd_matches_scalar() {
@@ -1324,21 +1451,11 @@ only one tip for the future, sunscreen would be it.";
         let key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
         let nonce: [u8; 12] = core::array::from_fn(|i| (i as u8).wrapping_mul(5).wrapping_add(3));
         let c = ChaCha20::new(&key);
-        for &len in &[
-            0usize,
-            1,
-            63,
-            64,
-            65,
-            200,
-            511,
-            512,
-            513,
-            1024,
-            1500,
-            4096 + 7,
-        ] {
-            for &ctr in &[0u32, 1, 100, u32::MAX - 20] {
+        // Every length up to 1100 bytes (partial blocks, partial 8- and
+        // 16-block passes, and the AVX-512 kernel's hand-off of tails of at
+        // most 512 bytes to the AVX2 kernel), then multi-pass buffers.
+        for len in (0usize..=1100).chain([1500, 2047, 4096 + 7, 16384 + 5, 65536 + 33]) {
+            for &ctr in &[0u32, 1, 100, u32::MAX - 20, u32::MAX - 16] {
                 // Skip combinations that would legitimately overflow the counter.
                 if (ctr as u64) + (len.div_ceil(64) as u64) > u64::from(u32::MAX) + 1 {
                     continue;
@@ -1354,16 +1471,36 @@ only one tip for the future, sunscreen would be it.";
                     }
                     bc = bc.wrapping_add(1);
                 }
-                // Each wide kernel, called directly.
-                if super::simd::supported() {
+                // Each wide kernel, called directly, with its scalar-finished
+                // tail: it must report the right resume point and leave at
+                // most `max_tail` bytes.
+                let check = |name: &str, max_tail: usize, f: &dyn Fn(&mut [u8]) -> (usize, u32)| {
                     let mut w = base.clone();
-                    super::simd::apply_keystream(&c.key, &nonce, ctr, &mut w);
-                    assert_eq!(w, scalar, "avx2 len={len} ctr={ctr}");
+                    let (done, mut next) = f(&mut w);
+                    assert!(len - done <= max_tail, "{name} tail len={len} done={done}");
+                    assert_eq!(
+                        next,
+                        ctr.wrapping_add(done.div_ceil(64) as u32),
+                        "{name} ctr"
+                    );
+                    for block in w[done..].chunks_mut(64) {
+                        let ks = c.block(&nonce, next);
+                        for (b, k) in block.iter_mut().zip(ks.iter()) {
+                            *b ^= *k;
+                        }
+                        next = next.wrapping_add(1);
+                    }
+                    assert_eq!(w, scalar, "{name} len={len} ctr={ctr}");
+                };
+                if super::simd::supported() {
+                    check("avx2", 128, &|w| {
+                        super::simd::apply_keystream(&c.key, &nonce, ctr, w)
+                    });
                 }
                 if super::simd512::supported() {
-                    let mut w = base.clone();
-                    super::simd512::apply_keystream(&c.key, &nonce, ctr, &mut w);
-                    assert_eq!(w, scalar, "avx512 len={len} ctr={ctr}");
+                    check("avx512", 64, &|w| {
+                        super::simd512::apply_keystream(&c.key, &nonce, ctr, w)
+                    });
                 }
                 // ...and the dispatcher, which must agree with both.
                 let mut simd = base.clone();
