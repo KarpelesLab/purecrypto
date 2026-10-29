@@ -7,7 +7,10 @@
 //!
 //! Parameter errors return [`Error::InvalidParam`] rather than panicking,
 //! because the parameters are usually runtime-supplied (parsed from PHC
-//! strings, config, etc.).
+//! strings, config, etc.). For the same reason the working memory is
+//! allocated fallibly: valid parameters can still ask for up to ~128 GiB, and
+//! if that cannot be had the call returns [`Error::OutOfMemory`] instead of
+//! aborting the process.
 //!
 //! Internally: outer `PBKDF2-HMAC-SHA256` envelope, inner [`crate::cipher`]
 //! Salsa20/8 BlockMix on `128·r`-byte sub-blocks.
@@ -18,7 +21,6 @@
 //! side-channel posture is the same as the reference implementation.
 
 extern crate alloc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::cipher::salsa20::salsa20_8_words;
@@ -26,7 +28,7 @@ use crate::hash::Sha256;
 use crate::kdf::pbkdf2;
 use crate::zeroize::zero_bulk;
 
-/// scrypt parameter-validation errors.
+/// scrypt errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
@@ -37,12 +39,39 @@ pub enum Error {
     /// scales with `p`, so untrusted parameters need a caller-side clamp (see
     /// [`scrypt`]).
     InvalidParam,
+    /// The parameters are valid but their working memory (about
+    /// `128·r·(N + p + 2)` bytes) could not be allocated. Nothing was
+    /// computed.
+    OutOfMemory,
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("scrypt: invalid parameter")
+        match self {
+            Error::InvalidParam => f.write_str("scrypt: invalid parameter"),
+            Error::OutOfMemory => f.write_str("scrypt: cannot allocate the working memory"),
+        }
     }
+}
+
+/// Reserves exactly `len` bytes of capacity without aborting on failure; the
+/// returned vector is empty. In unit tests a per-thread ceiling can make the
+/// reservation fail deterministically (see `tests::fail_allocs_above`).
+fn try_buffer(len: usize) -> Result<Vec<u8>, Error> {
+    #[cfg(all(test, feature = "std"))]
+    if len > tests::ALLOC_CEILING.with(|c| c.get()) {
+        return Err(Error::OutOfMemory);
+    }
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).map_err(|_| Error::OutOfMemory)?;
+    Ok(v)
+}
+
+/// [`try_buffer`], zero-filled to `len`.
+fn try_zeroed(len: usize) -> Result<Vec<u8>, Error> {
+    let mut v = try_buffer(len)?;
+    v.resize(len, 0);
+    Ok(v)
 }
 
 impl core::error::Error for Error {}
@@ -67,6 +96,16 @@ impl core::error::Error for Error {}
 /// CPU-exhaustion DoS vector. Callers that derive `(log_n, r, p)` from
 /// untrusted input (e.g. a parsed PHC `$scrypt$` string) MUST clamp them to
 /// sane maxima themselves before calling.
+///
+/// # Errors
+///
+/// [`Error::InvalidParam`] for parameters outside the bounds above (or
+/// whose buffer sizes overflow `usize`), [`Error::OutOfMemory`] if the
+/// `128·r·(N + p + 2)` bytes of working memory cannot be allocated. Either
+/// way `out` is left untouched. (On systems that overcommit memory an
+/// allocation can succeed and the process still be killed later when the
+/// pages are touched; that is outside what a library can detect, so bound
+/// `r·N` for untrusted input.)
 pub fn scrypt(
     password: &[u8],
     salt: &[u8],
@@ -121,23 +160,31 @@ pub fn scrypt(
         return Err(Error::InvalidParam);
     }
 
-    // --- First PBKDF2 expansion: B = PBKDF2-HMAC-SHA256(P, S, 1, p·128·r) ---
-    let mut b: Vec<u8> = vec![0u8; b_len];
-    pbkdf2::<Sha256>(password, salt, 1, &mut b);
-
-    // --- ROMix on each p block in turn, reusing one V scratch ---
-    let n_us = n as usize;
+    let n_us = usize::try_from(n).map_err(|_| Error::InvalidParam)?;
     // Guard the V-buffer size: on 32-bit targets n_us · block_size can wrap
     // usize for attacker-influenced (but per-RFC "valid") params, which would
     // under-allocate and lead to an OOB write panic. Match the checked_mul
     // discipline of the sibling allocations above.
     let v_len = n_us.checked_mul(block_size).ok_or(Error::InvalidParam)?;
-    let mut v: Vec<u8> = vec![0u8; v_len];
-    let mut x: Vec<u8> = vec![0u8; block_size];
+
+    // --- Allocate everything up front, fallibly ---
+    // The bounds above still admit ~128 GiB for V alone, so an allocation
+    // failure is an ordinary, caller-reachable outcome: report it rather than
+    // abort the process (which `vec![0; n]` does). All four buffers are
+    // reserved before any password-derived byte is written, so the error path
+    // has nothing to wipe. V, the largest, goes first and is not pre-zeroed:
+    // ROMix's first loop fills it block by block within the reserved capacity.
+    let mut v = try_buffer(v_len)?;
+    let mut b = try_zeroed(b_len)?;
+    let mut x = try_zeroed(block_size)?;
     // One BlockMix scratch buffer, reused across all 2·N·p calls instead of
     // allocating a fresh `128·r`-byte Vec inside every BlockMix.
-    let mut y: Vec<u8> = vec![0u8; block_size];
+    let mut y = try_zeroed(block_size)?;
 
+    // --- First PBKDF2 expansion: B = PBKDF2-HMAC-SHA256(P, S, 1, p·128·r) ---
+    pbkdf2::<Sha256>(password, salt, 1, &mut b);
+
+    // --- ROMix on each p block in turn, reusing one V scratch ---
     for i in 0..p as usize {
         let off = i * block_size;
         x.copy_from_slice(&b[off..off + block_size]);
@@ -166,13 +213,19 @@ pub fn scrypt(
 /// other buffer, and the two swap roles after every call (ping-pong) instead
 /// of copying the result back. There are `2N` calls, an even number, so the
 /// result ends up back in `x`.
-fn romix(x: &mut [u8], n: usize, r: usize, v: &mut [u8], y: &mut [u8]) {
+///
+/// `v` has capacity for `N·128·r` bytes; its first loop refills it from
+/// empty (so it is never zero-filled first), leaving it full afterwards.
+fn romix(x: &mut [u8], n: usize, r: usize, v: &mut Vec<u8>, y: &mut [u8]) {
     let block_size = 128 * r;
     let (mut cur, mut next) = (x, y);
 
-    // V_i = X^{(i)} for i = 0..N
-    for i in 0..n {
-        v[i * block_size..(i + 1) * block_size].copy_from_slice(cur);
+    // V_i = X^{(i)} for i = 0..N. Within the reserved capacity, so these
+    // appends never reallocate (which would leave a stale copy behind).
+    v.clear();
+    debug_assert!(v.capacity() >= n * block_size);
+    for _ in 0..n {
+        v.extend_from_slice(cur);
         block_mix(cur, r, next);
         core::mem::swap(&mut cur, &mut next);
     }
@@ -231,6 +284,65 @@ fn integerify(b: &[u8], r: usize) -> u64 {
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
+
+    #[cfg(feature = "std")]
+    std::thread_local! {
+        /// Per-thread allocation ceiling consulted by `try_buffer`, so a test
+        /// can make an allocation fail without the machine actually running
+        /// out of memory (on a large host with overcommit, a 128 GiB
+        /// reservation genuinely succeeds).
+        pub(super) static ALLOC_CEILING: core::cell::Cell<usize> =
+            const { core::cell::Cell::new(usize::MAX) };
+    }
+
+    /// Runs `f` with every `try_buffer` reservation above `limit` bytes
+    /// failing as the allocator would.
+    #[cfg(feature = "std")]
+    fn fail_allocs_above<T>(limit: usize, f: impl FnOnce() -> T) -> T {
+        ALLOC_CEILING.with(|c| c.set(limit));
+        let out = f();
+        ALLOC_CEILING.with(|c| c.set(usize::MAX));
+        out
+    }
+
+    /// Valid but absurd parameters — `N = 2`, `r = 2²⁹ − 1`, about 128 GiB for
+    /// V plus three 64 GiB buffers — must come back as `OutOfMemory`, not
+    /// abort the process, and leave `out` alone.
+    #[cfg(feature = "std")]
+    #[test]
+    fn impossible_memory_returns_error() {
+        let mut out = [0xaau8; 32];
+        let r = (1u32 << 29) - 1;
+        assert_eq!(
+            fail_allocs_above(1 << 30, || scrypt(b"p", b"s", 1, r, 1, &mut out)),
+            Err(Error::OutOfMemory)
+        );
+        assert_eq!(out, [0xaau8; 32]);
+        // A failure on any one of the buffers is reported the same way: with
+        // N = 16, r = 1, p = 1, V is 2 KiB and the rest are 128 bytes.
+        for limit in [0, 127, 2047] {
+            assert_eq!(
+                fail_allocs_above(limit, || scrypt(b"p", b"s", 4, 1, 1, &mut out)),
+                Err(Error::OutOfMemory),
+                "limit={limit}"
+            );
+        }
+        assert_eq!(out, [0xaau8; 32]);
+        // Exactly enough is enough.
+        assert!(fail_allocs_above(2048, || scrypt(b"p", b"s", 4, 1, 1, &mut out)).is_ok());
+    }
+
+    /// On 32-bit targets the real allocator refuses a V larger than
+    /// `isize::MAX` — no ceiling needed.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn oversized_v_is_out_of_memory_on_32_bit() {
+        let mut out = [0u8; 32];
+        assert_eq!(
+            scrypt(b"p", b"s", 1, 1 << 23, 1, &mut out),
+            Err(Error::OutOfMemory)
+        );
+    }
 
     /// RFC 7914 §11 Test Vector 1: `scrypt("", "", N=16, r=1, p=1, dkLen=64)`.
     #[test]
