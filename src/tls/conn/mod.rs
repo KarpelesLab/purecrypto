@@ -111,6 +111,30 @@ pub(crate) fn select_offered_suites(
     }
 }
 
+/// The cipher suite a server negotiates: `candidates` is everything it
+/// accepts, in its own preference order, and `offered` the ClientHello's
+/// `cipher_suites` in the client's order. By default the server's order
+/// decides (the first candidate the client offered); with `client_order`
+/// the client's does (the first offered suite that is a candidate), which
+/// is OpenSSL's behaviour without `SSL_OP_CIPHER_SERVER_PREFERENCE`.
+pub(crate) fn choose_suite<T: Copy>(
+    candidates: &[T],
+    suite_of: impl Fn(&T) -> CipherSuite,
+    offered: &[CipherSuite],
+    client_order: bool,
+) -> Option<T> {
+    if client_order {
+        offered
+            .iter()
+            .find_map(|s| candidates.iter().copied().find(|c| suite_of(c) == *s))
+    } else {
+        candidates
+            .iter()
+            .copied()
+            .find(|c| offered.contains(&suite_of(c)))
+    }
+}
+
 /// Best-effort wipe of a secret buffer via [`crate::zeroize::Zeroize`]
 /// (volatile stores plus a compiler fence, so the writes are not elided as
 /// dead stores). Used by the TLS and DTLS 1.2 engines to scrub master-secret

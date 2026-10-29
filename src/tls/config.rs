@@ -335,15 +335,37 @@ pub struct Config {
     /// cannot be negotiated. TLS 1.3 and 1.2 are both covered (mix 0x13xx
     /// and classic codepoints in one list).
     ///
-    /// On a TLS 1.3 server it is the accept-set in *server* preference
-    /// order: the first listed suite the client offered wins, and a client
-    /// offering none of them is refused (`handshake_failure`). The default
-    /// is the engine's full set in its built-in order. A list naming no
-    /// TLS 1.3 suite the engine implements fails
-    /// [`Connection::server`](crate::tls::Connection::server) the same way.
-    /// The TLS 1.2 and DTLS servers pick from their own fixed orders (the
-    /// value is inert there).
+    /// On a server (TLS 1.3, TLS 1.2 including the `tls-legacy` CBC suites,
+    /// DTLS 1.2 / 1.3, QUIC) it is the accept-set, in *server* preference
+    /// order: the first listed suite the client offered wins (or the
+    /// client's first that is listed, under
+    /// [`prefer_server_cipher_order`](Self::prefer_server_cipher_order)
+    /// `= false`), and a client offering none of them is refused
+    /// (`handshake_failure`). The default is the engine's full set in its
+    /// built-in order. The server fails closed like the client: a list
+    /// naming no suite of any configured version makes
+    /// [`Connection::server`](crate::tls::Connection::server) error with
+    /// [`Error::NoUsableCipherSuites`](crate::tls::Error::NoUsableCipherSuites).
+    /// A version-spanning TLS server whose list names suites of only one of
+    /// TLS 1.2 / TLS 1.3 negotiates that version only — like OpenSSL, which
+    /// disables TLS 1.3 when no 1.3 cipher suite is configured — rather than
+    /// failing every handshake of the other.
     pub cipher_suites: Option<Vec<u16>>,
+    /// Server: `true` (the default) picks the negotiated cipher suite in the
+    /// server's preference order — the order of
+    /// [`cipher_suites`](Self::cipher_suites), or the engine's built-in
+    /// order — from those the client offered. `false` follows the client's
+    /// order instead: the first suite of the ClientHello the server accepts
+    /// wins.
+    ///
+    /// Applies to TLS 1.3, TLS 1.2 (and the `tls-legacy` versions), DTLS and
+    /// QUIC servers; inert on a client. OpenSSL follows the client unless
+    /// `SSL_OP_CIPHER_SERVER_PREFERENCE` is set, so PHP's
+    /// `honor_cipher_order` stream option (default `false`) maps directly to
+    /// this field. Either way only suites both sides accept can be chosen;
+    /// a resumption still prefers the suite its ticket was issued under, so
+    /// that 0-RTT stays possible.
+    pub prefer_server_cipher_order: bool,
     /// Client (TLS 1.3 / QUIC): the groups the first ClientHello carries a
     /// `key_share` entry for (RFC 8446 §4.2.8). Every supported group is
     /// still advertised in `supported_groups`; a server preferring one
@@ -736,6 +758,7 @@ impl Default for Config {
             replay_window: None,
             alpn_protocols: Vec::new(),
             cipher_suites: None,
+            prefer_server_cipher_order: true,
             key_shares: None,
             key_exchange_groups: None,
             record_size_limit: None,
@@ -842,7 +865,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | Option | TLS 1.3 | TLS 1.2 | DTLS 1.3 | DTLS 1.2 | QUIC |
 /// |---|---|---|---|---|---|
 /// | `versions` / `min_version` / `max_version` | yes | yes | yes | yes | inert (TLS 1.3 only) |
-/// | `rng`, `roots`, `crls`, `verification_time`, `signature_policy`, `key_log` | yes | yes | yes | yes | yes |
+/// | `rng`, `roots`, `crls`, `verification_time`, `signature_policy` / `min_rsa_key_bits`, `key_log` | yes | yes | yes | yes | yes |
 /// | `server_name`, `verify_certificates` | yes | yes | yes | yes | yes |
 /// | `identity` / `try_identity` (server) | yes | RSA, ECDSA, Ed25519, Ed448 | yes | RSA, ECDSA, Ed25519, Ed448, External | yes, not External |
 /// | `identity` (client, mTLS) | yes | yes | yes | yes, not External | yes |
@@ -850,6 +873,8 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `client_auth` | yes | yes | yes | yes | yes |
 /// | `alpn` | yes | yes | yes | yes | yes (required) |
 /// | `cipher_suites` (client) | yes | yes | yes | yes | yes (GCM / ChaCha20 only: RFC 9001 §5.3) |
+/// | `cipher_suites` (server) | yes | yes | yes | yes | yes |
+/// | `prefer_server_cipher_order` (server) | yes | yes | yes | yes | yes |
 /// | `key_shares` (client) | yes | inert | yes | inert | yes |
 /// | `key_exchange_groups` | yes | inert | yes | yes (X25519, P-256, P-384) | yes |
 /// | `record_size_limit` | yes | yes | **refused** | **refused** | inert (no records) |
@@ -1057,6 +1082,14 @@ impl ConfigBuilder {
     /// See [`Config::cipher_suites`].
     pub fn cipher_suites(mut self, suites: &[u16]) -> Self {
         self.inner.cipher_suites = Some(suites.to_vec());
+        self
+    }
+    /// Server: choose the cipher suite in the server's preference order
+    /// (`true`, the default) or the client's (`false`). PHP's
+    /// `honor_cipher_order` maps to this. See
+    /// [`Config::prefer_server_cipher_order`].
+    pub fn prefer_server_cipher_order(mut self, server_order: bool) -> Self {
+        self.inner.prefer_server_cipher_order = server_order;
         self
     }
     /// Client: send `key_share` entries only for these groups in the first

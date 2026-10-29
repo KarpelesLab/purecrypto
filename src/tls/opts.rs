@@ -98,6 +98,7 @@ pub(crate) struct ClientOpts<'a> {
 /// Options only a server consumes.
 pub(crate) struct ServerOpts<'a> {
     pub client_auth: Option<&'a ClientAuth>,
+    pub prefer_server_cipher_order: bool,
     pub stapled_crl: Option<&'a [u8]>,
     pub stapled_ocsp_response: Option<&'a [u8]>,
     pub ticket_key: Option<&'a Secret32>,
@@ -147,6 +148,7 @@ impl Config {
             replay_window,
             alpn_protocols,
             cipher_suites,
+            prefer_server_cipher_order,
             key_shares,
             key_exchange_groups,
             record_size_limit,
@@ -222,6 +224,7 @@ impl Config {
             },
             server: ServerOpts {
                 client_auth: client_auth.as_ref(),
+                prefer_server_cipher_order: *prefer_server_cipher_order,
                 stapled_crl: stapled_crl.as_deref(),
                 stapled_ocsp_response: stapled_ocsp_response.as_deref(),
                 ticket_key: ticket_key.as_ref(),

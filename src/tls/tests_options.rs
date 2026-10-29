@@ -117,27 +117,29 @@ fn run(client: &mut Connection, server: &mut Connection) -> Outcome {
         server: Ok(()),
     };
     for _ in 0..64 {
-        if out.client.is_ok() {
-            if let Err(e) = client.handshake() {
-                out.client = Err(e);
-            }
+        if out.client.is_ok()
+            && let Err(e) = client.handshake()
+        {
+            out.client = Err(e);
         }
         let c = client.pop().unwrap();
-        if !c.is_empty() && out.server.is_ok() {
-            if let Err(e) = server.feed(&c) {
-                out.server = Err(e);
-            }
+        if !c.is_empty()
+            && out.server.is_ok()
+            && let Err(e) = server.feed(&c)
+        {
+            out.server = Err(e);
         }
-        if out.server.is_ok() {
-            if let Err(e) = server.handshake() {
-                out.server = Err(e);
-            }
+        if out.server.is_ok()
+            && let Err(e) = server.handshake()
+        {
+            out.server = Err(e);
         }
         let s = server.pop().unwrap();
-        if !s.is_empty() && out.client.is_ok() {
-            if let Err(e) = client.feed(&s) {
-                out.client = Err(e);
-            }
+        if !s.is_empty()
+            && out.client.is_ok()
+            && let Err(e) = client.feed(&s)
+        {
+            out.client = Err(e);
         }
         let done = client.is_handshake_complete() && server.is_handshake_complete();
         let failed = out.client.is_err() || out.server.is_err();
@@ -234,5 +236,263 @@ fn min_rsa_key_bits_applies_to_client_certificates() {
                 assert!(server.is_handshake_complete());
             }
         }
+    }
+}
+
+const TLS13_AES_128: u16 = 0x1301;
+const TLS13_AES_256: u16 = 0x1302;
+const TLS13_CHACHA20: u16 = 0x1303;
+const ECDSA_AES_128: u16 = 0xC02B;
+const ECDSA_AES_256: u16 = 0xC02C;
+const ECDSA_CHACHA20: u16 = 0xCCA9;
+
+/// A P-256 server identity for [`HOST`].
+fn ecdsa_identity() -> (Vec<Vec<u8>>, SigningKey) {
+    let key = ecdsa_key(b"cipher-order-server");
+    let leaf = self_signed(&CertSigner::Ecdsa(&key), &validity());
+    (vec![leaf], SigningKey::Ecdsa(key))
+}
+
+/// Runs one handshake between `server_cfg` and `client_cfg` and returns
+/// the suite both sides agreed on, or the server's error.
+fn negotiate(server_cfg: &Config, client_cfg: &Config) -> Result<u16, Error> {
+    let mut client = Connection::client(client_cfg).unwrap();
+    let mut server = Connection::server(server_cfg)?;
+    let out = run(&mut client, &mut server);
+    out.server?;
+    out.client.unwrap();
+    assert!(client.is_handshake_complete() && server.is_handshake_complete());
+    let suite = server.negotiated_cipher_suite().unwrap();
+    assert_eq!(client.negotiated_cipher_suite(), Some(suite));
+    Ok(suite)
+}
+
+/// Issue #85: `prefer_server_cipher_order(false)` makes the TLS 1.3 and
+/// TLS 1.2 servers follow the client's order (OpenSSL's default, PHP's
+/// `honor_cipher_order = false`); the default keeps the server's.
+#[test]
+fn server_can_follow_the_client_cipher_order() {
+    let (chain, key) = ecdsa_identity();
+    for (v, server_list, client_list) in [
+        (
+            ProtocolVersion::TLSv1_3,
+            &[TLS13_AES_128, TLS13_AES_256, TLS13_CHACHA20][..],
+            &[TLS13_AES_256, TLS13_CHACHA20, TLS13_AES_128][..],
+        ),
+        (
+            ProtocolVersion::TLSv1_2,
+            &[ECDSA_AES_128, ECDSA_AES_256, ECDSA_CHACHA20][..],
+            &[ECDSA_AES_256, ECDSA_CHACHA20, ECDSA_AES_128][..],
+        ),
+    ] {
+        let client_cfg = unverifying_client(v, v).cipher_suites(client_list).build();
+        for (server_order, expect) in [(true, server_list[0]), (false, client_list[0])] {
+            // With an explicit server list...
+            let server_cfg = server_builder(v, v, chain.clone(), key.clone())
+                .cipher_suites(server_list)
+                .prefer_server_cipher_order(server_order)
+                .build();
+            assert_eq!(
+                negotiate(&server_cfg, &client_cfg).unwrap(),
+                expect,
+                "{v:?} server_order={server_order}"
+            );
+        }
+        // ...and with the engine's built-in order: the client's first choice
+        // wins once the server follows the client.
+        let server_cfg = server_builder(v, v, chain.clone(), key.clone())
+            .prefer_server_cipher_order(false)
+            .build();
+        assert_eq!(negotiate(&server_cfg, &client_cfg).unwrap(), client_list[0]);
+    }
+    assert!(Config::default().prefer_server_cipher_order);
+}
+
+/// The same switch through a version-spanning server (the deferred engine
+/// that picks TLS 1.2 or 1.3 from the ClientHello).
+#[test]
+fn auto_server_follows_the_client_cipher_order() {
+    let (chain, key) = ecdsa_identity();
+    let server_cfg = server_builder(
+        ProtocolVersion::TLSv1_2,
+        ProtocolVersion::TLSv1_3,
+        chain,
+        key,
+    )
+    .prefer_server_cipher_order(false)
+    .build();
+    for (v, client_list) in [
+        (
+            ProtocolVersion::TLSv1_3,
+            &[TLS13_CHACHA20, TLS13_AES_128][..],
+        ),
+        (
+            ProtocolVersion::TLSv1_2,
+            &[ECDSA_CHACHA20, ECDSA_AES_128][..],
+        ),
+    ] {
+        let client_cfg = unverifying_client(v, v).cipher_suites(client_list).build();
+        assert_eq!(negotiate(&server_cfg, &client_cfg).unwrap(), client_list[0]);
+    }
+}
+
+/// Issue #89: `Config::cipher_suites` restricts the TLS 1.2 server too. It
+/// used to be inert there, so a server configured for AES-256-GCM only
+/// still negotiated AES-128-GCM with a client offering both.
+#[test]
+fn tls12_server_honours_cipher_suites_restriction() {
+    let (chain, key) = ecdsa_identity();
+    let v = ProtocolVersion::TLSv1_2;
+    let server_cfg = server_builder(v, v, chain.clone(), key.clone())
+        .cipher_suites(&[ECDSA_AES_256])
+        .build();
+
+    let both = unverifying_client(v, v)
+        .cipher_suites(&[ECDSA_AES_128, ECDSA_AES_256])
+        .build();
+    assert_eq!(negotiate(&server_cfg, &both).unwrap(), ECDSA_AES_256);
+
+    // A client offering only an excluded suite is refused, and told so.
+    let excluded = unverifying_client(v, v)
+        .cipher_suites(&[ECDSA_AES_128])
+        .build();
+    let mut client = Connection::client(&excluded).unwrap();
+    let mut server = Connection::server(&server_cfg).unwrap();
+    let out = run(&mut client, &mut server);
+    assert!(
+        matches!(out.server, Err(Error::HandshakeFailure)),
+        "{:?}",
+        out.server
+    );
+    assert!(
+        matches!(
+            out.client,
+            Err(Error::AlertReceived(AlertDescription::HandshakeFailure))
+        ),
+        "{:?}",
+        out.client
+    );
+
+    // Fail closed: a list naming no suite this engine implements.
+    let tls13_only = server_builder(v, v, chain, key)
+        .cipher_suites(&[TLS13_AES_128])
+        .build();
+    assert!(matches!(
+        Connection::server(&tls13_only),
+        Err(Error::NoUsableCipherSuites)
+    ));
+}
+
+/// A version-spanning server whose suite list covers only one version
+/// negotiates that version — without a TLS 1.3 downgrade sentinel when the
+/// list has no TLS 1.3 suite, which a 1.3-capable client would otherwise
+/// abort on — and a list covering neither fails at construction.
+#[test]
+fn version_spanning_server_follows_its_suite_list() {
+    let (chain, key) = ecdsa_identity();
+    let (lo, hi) = (ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3);
+    let default_client = unverifying_client(lo, hi).build();
+
+    let only12 = server_builder(lo, hi, chain.clone(), key.clone())
+        .cipher_suites(&[ECDSA_AES_256])
+        .build();
+    let mut client = Connection::client(&default_client).unwrap();
+    let mut server = Connection::server(&only12).unwrap();
+    let out = run(&mut client, &mut server);
+    out.client.unwrap();
+    out.server.unwrap();
+    assert_eq!(client.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
+    assert_eq!(server.negotiated_cipher_suite(), Some(ECDSA_AES_256));
+
+    let only13 = server_builder(lo, hi, chain.clone(), key.clone())
+        .cipher_suites(&[TLS13_AES_256])
+        .build();
+    assert_eq!(negotiate(&only13, &default_client).unwrap(), TLS13_AES_256);
+    let client12 = unverifying_client(lo, lo).build();
+    assert!(negotiate(&only13, &client12).is_err());
+
+    let neither = server_builder(lo, hi, chain, key)
+        .cipher_suites(&[0x0000])
+        .build();
+    assert!(matches!(
+        Connection::server(&neither),
+        Err(Error::NoUsableCipherSuites)
+    ));
+}
+
+/// DTLS servers honour the restriction and the client-order switch too.
+#[cfg(feature = "dtls")]
+#[test]
+fn dtls_servers_honour_cipher_suites_and_client_order() {
+    let (chain, key) = ecdsa_identity();
+    for (v, server_list, client_list) in [
+        (
+            ProtocolVersion::DTLSv1_3,
+            &[TLS13_AES_128, TLS13_AES_256][..],
+            &[TLS13_AES_256, TLS13_AES_128][..],
+        ),
+        (
+            ProtocolVersion::DTLSv1_2,
+            &[ECDSA_AES_128, ECDSA_AES_256][..],
+            &[ECDSA_AES_256, ECDSA_AES_128][..],
+        ),
+    ] {
+        let client_cfg = unverifying_client(v, v).cipher_suites(client_list).build();
+        for (server_order, expect) in [(true, server_list[0]), (false, client_list[0])] {
+            let server_cfg = server_builder(v, v, chain.clone(), key.clone())
+                .no_cookie()
+                .cipher_suites(server_list)
+                .prefer_server_cipher_order(server_order)
+                .build();
+            assert_eq!(
+                negotiate(&server_cfg, &client_cfg).unwrap(),
+                expect,
+                "{v:?} server_order={server_order}"
+            );
+        }
+        // Restricted to the client's second choice: that is what is used.
+        let server_cfg = server_builder(v, v, chain.clone(), key.clone())
+            .no_cookie()
+            .cipher_suites(&client_list[1..])
+            .build();
+        assert_eq!(negotiate(&server_cfg, &client_cfg).unwrap(), client_list[1]);
+    }
+}
+
+/// The legacy CBC path (TLS 1.0/1.1) picks from the restriction as well.
+#[cfg(feature = "tls-legacy")]
+#[test]
+fn legacy_server_honours_cipher_suites_and_client_order() {
+    const RSA_AES_128_CBC: u16 = 0x002F;
+    const RSA_AES_256_CBC: u16 = 0x0035;
+    let key = crate::test_util::rsa_test_key_a();
+    let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+    let leaf = self_signed(&CertSigner::Rsa(&boxed), &validity());
+    let v = ProtocolVersion::TLSv1_0;
+    let client_cfg = unverifying_client(v, v)
+        .cipher_suites(&[RSA_AES_128_CBC, RSA_AES_256_CBC])
+        .build();
+    for (list, server_order, expect) in [
+        (
+            &[RSA_AES_256_CBC, RSA_AES_128_CBC][..],
+            true,
+            RSA_AES_256_CBC,
+        ),
+        (
+            &[RSA_AES_256_CBC, RSA_AES_128_CBC][..],
+            false,
+            RSA_AES_128_CBC,
+        ),
+        (&[RSA_AES_256_CBC][..], false, RSA_AES_256_CBC),
+    ] {
+        let server_cfg = server_builder(v, v, vec![leaf.clone()], SigningKey::Rsa(boxed.clone()))
+            .cipher_suites(list)
+            .prefer_server_cipher_order(server_order)
+            .build();
+        assert_eq!(
+            negotiate(&server_cfg, &client_cfg).unwrap(),
+            expect,
+            "{list:?}"
+        );
     }
 }

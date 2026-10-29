@@ -395,6 +395,10 @@ pub(crate) struct ServerConfig {
     /// (the default) is the engine's full set in its built-in order. See
     /// [`crate::tls::Config::cipher_suites`].
     pub(crate) cipher_suites: Vec<CipherSuite>,
+    /// Pick the first suite in the *client's* order that this server
+    /// accepts, instead of the first in the server's own order. See
+    /// [`crate::tls::Config::prefer_server_cipher_order`].
+    pub(crate) prefer_client_order: bool,
     /// PSK key-exchange modes (RFC 8446 §4.2.9) this server is willing to
     /// select, in ITS preference order; `psk_dhe_ke` alone by default. A
     /// PSK is accepted only in a mode listed here that the client also
@@ -457,6 +461,7 @@ impl ServerConfig {
             preferred_key_exchange_group: None,
             groups: DEFAULT_GROUPS.to_vec(),
             cipher_suites: Vec::new(),
+            prefer_client_order: false,
             psk_modes: alloc::vec![PskKeyExchangeMode::PskDheKe],
             external_psks: Vec::new(),
         }
@@ -702,6 +707,13 @@ impl ServerConfig {
     /// not implement are ignored; an empty list is the default order.
     pub fn with_cipher_suites(mut self, suites: Vec<CipherSuite>) -> Self {
         self.cipher_suites = suites;
+        self
+    }
+
+    /// Selects the cipher suite in the client's preference order rather
+    /// than the server's (see [`ServerConfig::prefer_client_order`]).
+    pub fn with_client_cipher_order(mut self, client_order: bool) -> Self {
+        self.prefer_client_order = client_order;
         self
     }
 
@@ -2386,18 +2398,27 @@ impl<R: RngCore> ServerConnection<R> {
                         && sp.hash == s.hash
                 })
                 .or_else(|| {
-                    preference
+                    let compatible: Vec<SuiteParams> = preference
                         .iter()
                         .copied()
-                        .find(|sp| ch.cipher_suites.contains(&sp.suite) && sp.hash == s.hash)
+                        .filter(|sp| sp.hash == s.hash)
+                        .collect();
+                    super::choose_suite(
+                        &compatible,
+                        |sp| sp.suite,
+                        &ch.cipher_suites,
+                        self.config.prefer_client_order,
+                    )
                 })
                 .ok_or(Error::HandshakeFailure)?
         } else {
-            self.config
-                .suite_preference()
-                .into_iter()
-                .find(|s| ch.cipher_suites.contains(&s.suite))
-                .ok_or(Error::HandshakeFailure)?
+            super::choose_suite(
+                &self.config.suite_preference(),
+                |sp| sp.suite,
+                &ch.cipher_suites,
+                self.config.prefer_client_order,
+            )
+            .ok_or(Error::HandshakeFailure)?
         };
 
         // RFC 8446 §4.6.1 / §4.2.10: early data is protected with keys

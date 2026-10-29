@@ -185,6 +185,13 @@ pub(crate) struct ServerConfig13Internal {
     /// (X25519MLKEM768, X25519, P-256, P-384). Forwarded from
     /// [`crate::tls::Config::key_exchange_groups`].
     pub groups: Vec<NamedGroup>,
+    /// Cipher suites this server accepts, in ITS preference order. Empty
+    /// (the default) is the engine's full set in its built-in order.
+    /// Forwarded from [`crate::tls::Config::cipher_suites`].
+    pub(crate) cipher_suites: Vec<CipherSuite>,
+    /// Select in the client's preference order instead of the server's.
+    /// Forwarded from [`crate::tls::Config::prefer_server_cipher_order`].
+    pub(crate) prefer_client_order: bool,
     /// The connection ID this server wants to receive on this connection
     /// (RFC 9146 §3), answered in the ServerHello when the client offered
     /// the `connection_id` extension; `None` never negotiates CIDs. An
@@ -247,6 +254,8 @@ impl ServerConfig13Internal {
             max_record_size: record::DEFAULT_MAX_RECORD_SIZE,
             alpn_protocols: Vec::new(),
             groups: supported_server_groups().to_vec(),
+            cipher_suites: Vec::new(),
+            prefer_client_order: false,
             connection_id: None,
             ticket_key: None,
             ticket_lifetime: 7200,
@@ -1956,11 +1965,22 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // Pick the cipher suite from the client's offer, in our preference
         // order. We need this both for HRR (which must carry the chosen
         // suite per RFC 8446 §4.1.4) and for committing the transcript hash.
-        let suite = supported_suites()
-            .iter()
-            .copied()
-            .find(|s| ch.cipher_suites.contains(&s.suite))
-            .ok_or(Error::HandshakeFailure)?;
+        let preference: Vec<SuiteParams> = if self.config.cipher_suites.is_empty() {
+            supported_suites().to_vec()
+        } else {
+            self.config
+                .cipher_suites
+                .iter()
+                .filter_map(|s| supported_suites().iter().copied().find(|p| p.suite == *s))
+                .collect()
+        };
+        let suite = crate::tls::conn::choose_suite(
+            &preference,
+            |p| p.suite,
+            &ch.cipher_suites,
+            self.config.prefer_client_order,
+        )
+        .ok_or(Error::HandshakeFailure)?;
         // ALPN (RFC 7301): decided here, before any state is touched, so a
         // no-overlap offer is rejected like any other unacceptable CH; it is
         // pinned on `self` only once this CH is committed (below the HRR

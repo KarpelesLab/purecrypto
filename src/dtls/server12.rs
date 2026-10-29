@@ -121,6 +121,13 @@ pub(crate) struct ServerConfig12Internal {
     /// Defaults to `[X25519, SECP256R1, SECP384R1, SECP521R1]`. Forwarded from
     /// [`crate::tls::Config::key_exchange_groups`].
     pub(crate) groups: Vec<NamedGroup>,
+    /// Cipher suites this server accepts, in ITS preference order. Empty
+    /// (the default) is [`SUITES_12`] in its built-in order. Forwarded from
+    /// [`crate::tls::Config::cipher_suites`].
+    pub(crate) cipher_suites: Vec<CipherSuite>,
+    /// Select in the client's preference order instead of the server's.
+    /// Forwarded from [`crate::tls::Config::prefer_server_cipher_order`].
+    pub(crate) prefer_client_order: bool,
     /// Allowed signature algorithms in a client's certificate chain and
     /// `CertificateVerify` (see [`Self::client_auth`]); also the
     /// `supported_signature_algorithms` the `CertificateRequest` lists.
@@ -188,6 +195,8 @@ impl ServerConfig12Internal {
             require_ems: true,
             alpn_protocols: Vec::new(),
             groups: crate::tls::conn::GROUPS_12.to_vec(),
+            cipher_suites: Vec::new(),
+            prefer_client_order: false,
             signature_policy: SignaturePolicy::modern(),
             client_auth: None,
             crls: CrlStore::new(),
@@ -658,7 +667,10 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             return None;
         }
         let suite_code = CipherSuite(parsed.cipher_suite);
-        if !offered.contains(&suite_code) {
+        if !offered.contains(&suite_code)
+            || !(self.config.cipher_suites.is_empty()
+                || self.config.cipher_suites.contains(&suite_code))
+        {
             return None;
         }
         let suite = lookup_suite_12(suite_code)?;
@@ -1642,11 +1654,31 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // key can be plumbed in but has no DTLS 1.2 scheme
         // (`signature_scheme` below).
         let sig_kind = sig_kind_for_key(&self.config.key);
-        let suite = SUITES_12
+        let candidates: Vec<SuiteParams12> = SUITES_12
             .iter()
             .copied()
-            .find(|p| parsed.cipher_suites.contains(&p.suite) && p.sig_kind == sig_kind)
-            .ok_or(Error::HandshakeFailure)?;
+            .filter(|p| p.sig_kind == sig_kind)
+            .filter(|p| {
+                self.config.cipher_suites.is_empty() || self.config.cipher_suites.contains(&p.suite)
+            })
+            .collect();
+        // A configured restriction is also the server's preference order.
+        let candidates: Vec<SuiteParams12> = if self.config.cipher_suites.is_empty() {
+            candidates
+        } else {
+            self.config
+                .cipher_suites
+                .iter()
+                .filter_map(|s| candidates.iter().copied().find(|p| p.suite == *s))
+                .collect()
+        };
+        let suite = crate::tls::conn::choose_suite(
+            &candidates,
+            |p| p.suite,
+            &parsed.cipher_suites,
+            self.config.prefer_client_order,
+        )
+        .ok_or(Error::HandshakeFailure)?;
         // RFC 5246 §7.4.1.4.1: a (D)TLS 1.2 ClientHello MUST carry
         // `signature_algorithms`, and §7.4.3 has the ServerKeyExchange
         // signed under a pair "present in the signature_algorithms

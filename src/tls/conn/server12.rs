@@ -62,8 +62,8 @@ use crate::tls::codec::handshake12::{
     signed_message,
 };
 use crate::tls::codec::{
-    ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
-    cert_type, hs_type, read_handshake, with_len_u24,
+    CipherSuite, ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello,
+    SignatureScheme, cert_type, hs_type, read_handshake, with_len_u24,
 };
 use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
@@ -193,6 +193,15 @@ pub(crate) struct ServerConfig12 {
     /// 7250 §4.4). A raw key has no chain, so this list is the entire trust
     /// root for that path.
     expected_client_raw_public_keys: Vec<Vec<u8>>,
+    /// Cipher suites this server accepts, in ITS preference order. Empty
+    /// (the default) is the engine's full set ([`SUITES_12`], then the
+    /// legacy CBC suites) in its built-in order. See
+    /// [`crate::tls::Config::cipher_suites`].
+    pub(crate) cipher_suites: Vec<CipherSuite>,
+    /// Pick the first suite in the *client's* order that this server
+    /// accepts, instead of the first in the server's own order. See
+    /// [`crate::tls::Config::prefer_server_cipher_order`].
+    pub(crate) prefer_client_order: bool,
 }
 
 /// Client-authentication policy for a TLS 1.2 server (RFC 5246 §7.4.4 +
@@ -249,7 +258,54 @@ impl ServerConfig12 {
             client_cert_type_preference: alloc::vec![cert_type::X509],
             raw_public_key_spki: None,
             expected_client_raw_public_keys: Vec::new(),
+            cipher_suites: Vec::new(),
+            prefer_client_order: false,
         }
+    }
+
+    /// Restricts the accepted cipher suites to `suites`, in server preference
+    /// order (see [`ServerConfig12::cipher_suites`]). Entries this engine does
+    /// not implement are ignored; an empty list is the default set.
+    pub fn with_cipher_suites(mut self, suites: Vec<CipherSuite>) -> Self {
+        self.cipher_suites = suites;
+        self
+    }
+
+    /// Selects the cipher suite in the client's preference order rather
+    /// than the server's (see [`ServerConfig12::prefer_client_order`]).
+    pub fn with_client_cipher_order(mut self, client_order: bool) -> Self {
+        self.prefer_client_order = client_order;
+        self
+    }
+
+    /// `true` when the configured restriction (if any) admits `suite`.
+    fn accepts_suite(&self, suite: CipherSuite) -> bool {
+        self.cipher_suites.is_empty() || self.cipher_suites.contains(&suite)
+    }
+
+    /// The TLS 1.2 AEAD suites this server negotiates from, in its
+    /// preference order.
+    fn suite_preference_12(&self) -> Vec<SuiteParams12> {
+        if self.cipher_suites.is_empty() {
+            return SUITES_12.to_vec();
+        }
+        self.cipher_suites
+            .iter()
+            .filter_map(|s| SUITES_12.iter().copied().find(|p| p.suite == *s))
+            .collect()
+    }
+
+    /// The legacy CBC suites this server negotiates from (TLS 1.0/1.1 and
+    /// SSL 3.0), in its preference order.
+    #[cfg(feature = "tls-legacy")]
+    fn suite_preference_legacy(&self) -> Vec<LegacyCbcSuite> {
+        if self.cipher_suites.is_empty() {
+            return LEGACY_CBC_SUITES.to_vec();
+        }
+        self.cipher_suites
+            .iter()
+            .filter_map(|s| LEGACY_CBC_SUITES.iter().copied().find(|p| p.suite == *s))
+            .collect()
     }
 
     /// Sets the RFC 7250 `server_certificate_type` accept-set (`0 = X509`,
@@ -1643,11 +1699,19 @@ impl<R: RngCore> ServerConnection12<R> {
 
         // FRESH HANDSHAKE PATH.
         let sig_kind = self.config.sig_kind();
-        let suite = SUITES_12
-            .iter()
-            .copied()
-            .find(|p| p.sig_kind == sig_kind && ch.cipher_suites.contains(&p.suite))
-            .ok_or(Error::HandshakeFailure)?;
+        let candidates: Vec<SuiteParams12> = self
+            .config
+            .suite_preference_12()
+            .into_iter()
+            .filter(|p| p.sig_kind == sig_kind)
+            .collect();
+        let suite = super::choose_suite(
+            &candidates,
+            |p| p.suite,
+            &ch.cipher_suites,
+            self.config.prefer_client_order,
+        )
+        .ok_or(Error::HandshakeFailure)?;
 
         // Pin the transcript hash now that we know the suite.
         self.transcript.set_alg(suite.hash);
@@ -1719,13 +1783,19 @@ impl<R: RngCore> ServerConnection12<R> {
 
         // Pick the strongest legacy suite the client also offered. SSL 3.0 has
         // no SHA-256 CBC suites (those are TLS 1.2+), so exclude them there.
-        let ls = LEGACY_CBC_SUITES
-            .iter()
-            .copied()
-            .find(|p| {
-                ch.cipher_suites.contains(&p.suite) && !(is_ssl3 && p.mac == CbcMacAlg::Sha256)
-            })
-            .ok_or(Error::HandshakeFailure)?;
+        let candidates: Vec<LegacyCbcSuite> = self
+            .config
+            .suite_preference_legacy()
+            .into_iter()
+            .filter(|p| !(is_ssl3 && p.mac == CbcMacAlg::Sha256))
+            .collect();
+        let ls = super::choose_suite(
+            &candidates,
+            |p| p.suite,
+            &ch.cipher_suites,
+            self.config.prefer_client_order,
+        )
+        .ok_or(Error::HandshakeFailure)?;
 
         if let Some(sni_body) = ext::find(&ch.extensions, ExtensionType::SERVER_NAME) {
             self.peer_server_name = ext::parse_server_name(sni_body)?;
@@ -2305,8 +2375,10 @@ impl<R: RngCore> ServerConnection12<R> {
             }
         }
         let suite_code = crate::tls::codec::CipherSuite(parsed.cipher_suite);
-        // The resumed suite MUST be one the client is still offering.
-        if !offered.contains(&suite_code) {
+        // The resumed suite MUST be one the client is still offering, and
+        // one this server still accepts (its `cipher_suites` restriction may
+        // be narrower than that of the listener that issued the ticket).
+        if !offered.contains(&suite_code) || !self.config.accepts_suite(suite_code) {
             return None;
         }
         let suite = lookup_suite_12(suite_code)?;

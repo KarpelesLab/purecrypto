@@ -738,9 +738,40 @@ impl Connection {
         // (immutable) `Config` clone and let `ServerConnectionAuto` build the
         // ONE matching engine after peeking the ClientHello. Pinning
         // `min_version = TLSv1_3` opts back into 1.3-only.
-        if config.max_version == ProtocolVersion::TLSv1_3
-            && config.min_version != ProtocolVersion::TLSv1_3
-        {
+        // A cipher-suite restriction that leaves only one of TLS 1.2 / 1.3
+        // pins the server to that version (OpenSSL disables TLS 1.3 when no
+        // 1.3 suite is configured); one that leaves neither fails closed.
+        let spans = config.max_version == ProtocolVersion::TLSv1_3
+            && config.min_version != ProtocolVersion::TLSv1_3;
+        if spans {
+            let suites = config.cipher_suites.as_deref();
+            match (
+                restriction_allows_tls13(suites),
+                restriction_allows_tls12(suites),
+            ) {
+                (true, true) => {}
+                (true, false) => {
+                    let inner = Engine::ServerTls13(Box::new(build_tls13_server(config)?));
+                    return Ok(Connection {
+                        inner,
+                        pending_dtls: alloc::collections::VecDeque::new(),
+                        signer: config.signer.clone(),
+                        active_sign: None,
+                    });
+                }
+                (false, true) => {
+                    let inner = Engine::ServerTls12(Box::new(build_tls12_server(config)?));
+                    return Ok(Connection {
+                        inner,
+                        pending_dtls: alloc::collections::VecDeque::new(),
+                        signer: config.signer.clone(),
+                        active_sign: None,
+                    });
+                }
+                (false, false) => return Err(Error::NoUsableCipherSuites),
+            }
+        }
+        if spans {
             let inner = Engine::ServerTlsAuto(Box::new(ServerConnectionAuto {
                 buffered: Vec::new(),
                 peeker: super::peek::ClientHelloPeeker::default(),
@@ -2511,6 +2542,7 @@ pub(crate) fn tls13_server_config(
     } = parts.common;
     let ServerOpts {
         client_auth,
+        prefer_server_cipher_order,
         stapled_crl,
         stapled_ocsp_response,
         ticket_key,
@@ -2642,11 +2674,43 @@ pub(crate) fn tls13_server_config(
             &supported,
         )?);
     }
+    sc = sc.with_client_cipher_order(!prefer_server_cipher_order);
     if let Some(t) = verification_time {
         sc = sc.with_verification_time(t.clone());
     }
     sc.key_log = key_log.clone();
     Ok(sc)
+}
+
+/// Every cipher suite the TLS 1.2 server engine can negotiate: the AEAD
+/// suites, then (with `tls-legacy`) the CBC suites of the legacy versions.
+fn tls12_server_suites() -> Vec<super::codec::CipherSuite> {
+    #[allow(unused_mut)]
+    let mut suites: Vec<super::codec::CipherSuite> =
+        super::conn::SUITES_12.iter().map(|s| s.suite).collect();
+    #[cfg(feature = "tls-legacy")]
+    suites.extend(
+        super::crypto::cbc_rec::LEGACY_CBC_SUITES
+            .iter()
+            .map(|s| s.suite),
+    );
+    suites
+}
+
+/// Whether a [`Config::cipher_suites`] restriction leaves the server a
+/// TLS 1.3 suite (`None` — no restriction — always does).
+fn restriction_allows_tls13(list: Option<&[u16]>) -> bool {
+    list.is_none_or(|l| {
+        super::crypto::supported_suites()
+            .iter()
+            .any(|s| l.contains(&s.suite.0))
+    })
+}
+
+/// Whether a [`Config::cipher_suites`] restriction leaves the server a suite
+/// the TLS 1.2 engine implements.
+fn restriction_allows_tls12(list: Option<&[u16]>) -> bool {
+    list.is_none_or(|l| tls12_server_suites().iter().any(|s| l.contains(&s.0)))
 }
 
 fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<ConfigRng>, Error> {
@@ -2686,6 +2750,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     } = parts.common;
     let ServerOpts {
         client_auth,
+        prefer_server_cipher_order,
         stapled_crl,
         stapled_ocsp_response,
         ticket_key,
@@ -2701,9 +2766,8 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     // trust anchors for mTLS come from `client_auth`; there is no per-cert
     // extension slot for a stapled CRL, no 0-RTT, no RFC 8879 compression,
     // no ECH and no HelloRetryRequest group preference (the 1.2 engine
-    // negotiates from its own fixed group list and picks its suite from its
-    // own fixed order). `rng` is drawn through `config_rng`, `signer`
-    // through `Connection::drive`.
+    // negotiates from its own fixed group list). `rng` is drawn through
+    // `config_rng`, `signer` through `Connection::drive`.
     // The PSK key-exchange modes and external PSKs are TLS 1.3 mechanisms
     // (RFC 8446 §4.2.9, §4.2.11); RFC 5077 tickets have no such modes.
     let _ = (
@@ -2712,7 +2776,6 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
         max_early_data_size,
         preferred_key_exchange_group,
         key_exchange_groups,
-        cipher_suites,
         rng,
         signer,
         psk_modes,
@@ -2739,8 +2802,20 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
         .ok_or(Error::UnsupportedVersion)?;
     // RFC 8446 §4.1.3 downgrade sentinel: only set it when this deployment is
     // actually TLS-1.3-capable (a version-spanning server). A pinned `max=1.2`
-    // server must not, or 1.3-capable clients would abort.
-    sc = sc.with_supports_tls13(max_version == ProtocolVersion::TLSv1_3);
+    // server must not, or 1.3-capable clients would abort — and neither must
+    // a server whose `cipher_suites` leave it no TLS 1.3 suite.
+    sc = sc.with_supports_tls13(
+        max_version == ProtocolVersion::TLSv1_3 && restriction_allows_tls13(cipher_suites),
+    );
+    if let Some(list) = cipher_suites {
+        // The accept-set and preference order (see `Config::cipher_suites`);
+        // fail closed when it names nothing this engine implements.
+        sc = sc.with_cipher_suites(super::conn::select_offered_suites(
+            &Some(list.to_vec()),
+            &tls12_server_suites(),
+        )?);
+    }
+    sc = sc.with_client_cipher_order(!prefer_server_cipher_order);
     if !alpn_protocols.is_empty() {
         sc = sc.with_alpn(alpn_protocols.to_vec());
     }
@@ -3167,6 +3242,8 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
 struct DtlsServerOpts<'a> {
     identity: &'a super::config::Identity,
     client_auth: Option<&'a super::config::ClientAuth>,
+    cipher_suites: Option<&'a [u16]>,
+    prefer_server_cipher_order: bool,
     crls: &'a super::pki::CrlStore,
     verification_time: Option<&'a crate::x509::Time>,
     cookie_secret: Option<&'a super::secret::Secret32>,
@@ -3236,6 +3313,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     } = parts.common;
     let ServerOpts {
         client_auth,
+        prefer_server_cipher_order,
         stapled_crl,
         stapled_ocsp_response,
         ticket_key,
@@ -3261,14 +3339,12 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     // accepts 0-RTT (so `ticket_key`, `max_early_data_size` and
     // `replay_window` are forwarded; the DTLS 1.2 server issues RFC 5077
     // tickets under the same key); the servers staple nothing, do not
-    // compress certificates, take no `preferred_key_exchange_group`
-    // (`key_exchange_groups` orders the accept-set instead) and pick the
-    // cipher suite from their own fixed order. `rng` is drawn through
-    // `config_rng` and `signer` through `Connection::drive`.
+    // compress certificates and take no `preferred_key_exchange_group`
+    // (`key_exchange_groups` orders the accept-set instead). `rng` is drawn
+    // through `config_rng` and `signer` through `Connection::drive`.
     let _ = (
         min_version,
         max_version,
-        cipher_suites,
         roots,
         stapled_crl,
         stapled_ocsp_response,
@@ -3309,6 +3385,8 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     Ok(DtlsServerOpts {
         identity,
         client_auth,
+        cipher_suites,
+        prefer_server_cipher_order,
         crls,
         verification_time,
         cookie_secret,
@@ -3337,6 +3415,8 @@ fn build_dtls12_server(
     let DtlsServerOpts {
         identity,
         client_auth,
+        cipher_suites,
+        prefer_server_cipher_order,
         crls,
         verification_time,
         cookie_secret,
@@ -3400,6 +3480,11 @@ fn build_dtls12_server(
     sc = sc.with_alpn(alpn_protocols.to_vec());
     let groups = restrict_dtls_groups(&sc.groups, key_exchange_groups)?;
     sc = sc.with_groups(groups);
+    if cipher_suites.is_some() {
+        let supported = super::conn::SUITES_12.iter().map(|s| s.suite).collect();
+        sc.cipher_suites = restrict_dtls_cipher_suites(supported, cipher_suites)?;
+    }
+    sc.prefer_client_order = !prefer_server_cipher_order;
     sc = sc.with_signature_policy(signature_policy.clone());
     if let Some(ca) = client_auth {
         sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
@@ -3432,6 +3517,8 @@ fn build_dtls13_server(
     let DtlsServerOpts {
         identity,
         client_auth,
+        cipher_suites,
+        prefer_server_cipher_order,
         crls,
         verification_time,
         cookie_secret,
@@ -3469,6 +3556,14 @@ fn build_dtls13_server(
     sc.max_record_size = max_record_size;
     sc.alpn_protocols = alpn_protocols.to_vec();
     sc.groups = restrict_dtls_groups(&sc.groups, key_exchange_groups)?;
+    if cipher_suites.is_some() {
+        let supported = super::crypto::supported_suites()
+            .iter()
+            .map(|s| s.suite)
+            .collect();
+        sc.cipher_suites = restrict_dtls_cipher_suites(supported, cipher_suites)?;
+    }
+    sc.prefer_client_order = !prefer_server_cipher_order;
     sc.signature_policy = alloc::sync::Arc::new(signature_policy.clone());
     if let Some(ca) = client_auth {
         sc = sc.with_client_auth(ca.roots.clone_store(), ca.required);
