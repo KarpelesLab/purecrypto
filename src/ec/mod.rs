@@ -45,9 +45,10 @@
 //! The opt-in `legacy-ec` feature (which implies `alloc`) adds the curves
 //! below the 112-bit security level or deprecated by SP 800-186: the SEC 2
 //! curves secp160k1/r1/r2, secp192k1, P-192 and secp224k1 as further
-//! [`CurveId`] variants, and ECDH on the binary-field curves sect283/409/571
-//! k1/r1 in [`binary`]. They exist for interop with old certificates and
-//! test corpora; never pick them for new designs.
+//! [`CurveId`] variants, and ECDSA / ECDH on every binary-field curve
+//! OpenSSL names (SEC 2 `sect113r1` … `sect571r1`, X9.62 `c2pnb*` /
+//! `c2tnb*`, WTLS 1/3/4/5/10/11) in [`binary`]. They exist for interop with
+//! old certificates and test corpora; never pick them for new designs.
 //!
 //! # With `ec-custom`
 //!

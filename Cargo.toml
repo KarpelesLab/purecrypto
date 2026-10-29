@@ -280,7 +280,8 @@ ascon = ["hash", "cipher"]
 dsa = ["bignum", "rng", "hash", "alloc", "der"]
 # Curves below the 112-bit security level or deprecated by SP 800-186:
 # secp160k1/r1/r2, secp192k1, P-192, secp224k1, and the binary-field curves
-# sect283/409/571 k1/r1 (`ec::binary`, ECDH only). Interop with old
+# (`ec::binary`: SEC 2 sect*, X9.62 c2pnb*/c2tnb*, WTLS; ECDSA and ECDH).
+# Interop with old
 # certificates and test corpora; never pick these for new designs.
 legacy-ec = ["ec", "alloc", "der"]
 # Elliptic curves from explicit parameters (`ec::BoxedCurve::from_params`):

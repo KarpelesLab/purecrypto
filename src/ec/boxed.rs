@@ -112,7 +112,7 @@ pub(super) fn reduce_once(v: &BoxedUint, n: &BoxedUint) -> BoxedUint {
 }
 
 /// RFC 6979 `bits2int`: the integer of the leftmost `qlen` bits of `data`.
-fn bits2int(data: &[u8], qlen: usize) -> BoxedUint {
+pub(super) fn bits2int(data: &[u8], qlen: usize) -> BoxedUint {
     let blen = data.len() * 8;
     let v = BoxedUint::from_be_bytes(data);
     if blen > qlen {
@@ -160,7 +160,7 @@ fn random_scalar<R: RngCore>(curve: &BoxedCurve, n: &BoxedUint, rng: &mut R) -> 
 
 /// RFC 6979 deterministic nonce `k` for order `n` (bit length `qlen`), using
 /// HMAC-`D`, with `order_len`-byte octet strings.
-fn generate_k<D: Digest>(
+pub(super) fn generate_k<D: Digest>(
     d: &BoxedUint,
     hash: &[u8],
     n: &BoxedUint,

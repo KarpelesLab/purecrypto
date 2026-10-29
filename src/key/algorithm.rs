@@ -100,6 +100,13 @@ pub enum Algorithm {
     /// `ec-custom` feature.
     #[cfg(feature = "ec-custom")]
     EcCustom,
+    /// ECDSA / ECDH over one of the binary-field (GF(2^m)) curves of
+    /// [`ec::binary`](crate::ec::binary) — SEC 2 `sect*`, X9.62 `c2pnb*` /
+    /// `c2tnb*` and the WTLS binary curves. Every such key reports this one
+    /// value; key agreement additionally checks that both keys are on the
+    /// same curve. Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
+    EcBinary,
 }
 
 /// The asymmetric operation a key was asked to perform.

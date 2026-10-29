@@ -1,24 +1,41 @@
-//! Binary-field (GF(2^m)) curves sect283k1/r1, sect409k1/r1 and sect571k1/r1
-//! (SEC 2 §3; NIST K-283/B-283, K-409/B-409, K-571/B-571) for ECDH.
+//! Binary-field (GF(2^m)) elliptic curves: every named characteristic-2
+//! curve of OpenSSL 3 — SEC 2 `sect113r1` … `sect571r1` (including NIST
+//! K-/B-163 … 571), ANSI X9.62 `c2pnb163v1` … `c2tnb431r1` and the WAP WTLS
+//! curves `wap-wsg-idm-ecid-wtls1/3/4/5/10/11` — for ECDSA, ECDH, key
+//! generation and the SEC 1 / PKCS#8 / SPKI encodings.
 //!
-//! The curves are `y² + xy = x³ + a·x² + b` over the polynomial-basis fields
-//! GF(2^283), GF(2^409) and GF(2^571) with the SEC 2 reduction polynomials.
-//! Only key agreement and point encoding are provided — no signatures — so
-//! everything runs on the constant-time López–Dahab Montgomery ladder over the
-//! full scalar width; see [`field`](self) for the field arithmetic
-//! (mask-driven carry-less multiplication, Itoh–Tsujii inversion).
+//! The curves are `y² + xy = x³ + a·x² + b` over polynomial-basis fields
+//! GF(2^m) with a trinomial or pentanomial reduction polynomial; see
+//! [`field`](self) for the arithmetic (mask-driven carry-less
+//! multiplication, word-wise reduction by public shifts, Itoh–Tsujii
+//! inversion). Every operation on a secret scalar — key generation's
+//! `d·G`, ECDH's `d·Q`, ECDSA's `k·G` — runs the constant-time López–Dahab
+//! Montgomery ladder over the full limb width of the field, with
+//! y-recovery; the ECDSA arithmetic modulo `n` uses the crate's
+//! constant-time Montgomery and inversion routines, and nonces are
+//! deterministic (RFC 6979), as for the prime-field
+//! [`boxed`](super::boxed) ECDSA. Verification is variable time (its inputs
+//! are public).
 //!
 //! Public keys ([`BinaryPublicKey`]) are validated on parse: the coordinates
 //! must be field elements, the point must satisfy the curve equation, must not
-//! be the identity and must lie in the prime-order subgroup (`n·Q = ∞`) — the
-//! curves have cofactor 2 or 4, so an unchecked peer point of small order
-//! would leak bits of the private scalar through the shared secret. SEC 1
-//! compressed points (`02`/`03`, with the binary-field `ỹ = lsb(y/x)` rule)
-//! and uncompressed points (`04`) are accepted; hybrid (`06`/`07`) encodings
-//! are not.
+//! be the identity and must lie in the prime-order subgroup (`n·Q = ∞`) —
+//! every binary curve has an even cofactor (up to 65392 on the X9.62
+//! `c2pnb` curves), so an unchecked peer point of small order would leak
+//! bits of the private scalar through the shared secret. SEC 1 compressed
+//! points (`02`/`03`, with the binary-field `ỹ = lsb(y/x)` rule) and
+//! uncompressed points (`04`) are accepted; hybrid (`06`/`07`) encodings
+//! are not. ECDH returns the plain x-coordinate of `d·Q` (no cofactor
+//! multiplication), as OpenSSL's `pkeyutl -derive` does by default.
+//!
+//! The WTLS curves 3, 4, 5, 10 and 11 have the parameters of sect163k1,
+//! sect113r1, c2pnb163v1, sect233k1 and sect233r1 under their own OIDs;
+//! they are distinct [`BinaryCurveId`]s (a key keeps the OID it was loaded
+//! with), so keys on two aliases of the same curve do not agree.
 //!
 //! ```
 //! use purecrypto::ec::binary::{BinaryCurveId, BinaryPrivateKey};
+//! use purecrypto::hash::Sha256;
 //! use purecrypto::rng::OsRng;
 //!
 //! let mut rng = OsRng;
@@ -27,10 +44,18 @@
 //! let z1 = alice.diffie_hellman(&bob.public_key()).unwrap();
 //! let z2 = bob.diffie_hellman(&alice.public_key()).unwrap();
 //! assert_eq!(z1, z2);
+//!
+//! let sig = alice.sign::<Sha256>(b"message").unwrap();
+//! alice.public_key().verify::<Sha256>(b"message", &sig).unwrap();
 //! ```
 
 mod curve;
+mod ecdsa;
 mod field;
+#[cfg(feature = "key")]
+mod key_impl;
+
+pub use ecdsa::BinarySignature;
 
 use super::Error;
 use crate::ct::{Choice, ConstantTimeEq};
@@ -42,36 +67,143 @@ use curve::{Curve, Point, limbs_is_zero, limbs_lt};
 use field::{Limbs, MAX_LIMBS};
 
 /// The `id-ecPublicKey` algorithm OID (RFC 5480 §2.1.1).
-#[cfg(feature = "der")]
 const EC_PUBLIC_KEY_OID: &[u64] = &[1, 2, 840, 10045, 2, 1];
 
-/// The supported SEC 2 binary curves.
+/// The supported binary curves: every characteristic-2 named curve of
+/// OpenSSL 3. [`name`](Self::name) is OpenSSL's short name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BinaryCurveId {
-    /// sect283k1 (NIST K-283): Koblitz, `a = 0`, cofactor 4.
+    /// `sect283k1` (SEC 2, NIST K-283): GF(2^283), cofactor 4, OID `1.3.132.0.16`.
     Sect283k1,
-    /// sect283r1 (NIST B-283): `a = 1`, cofactor 2.
+    /// `sect283r1` (SEC 2, NIST B-283): GF(2^283), cofactor 2, OID `1.3.132.0.17`.
     Sect283r1,
-    /// sect409k1 (NIST K-409): Koblitz, `a = 0`, cofactor 4.
+    /// `sect409k1` (SEC 2, NIST K-409): GF(2^409), cofactor 4, OID `1.3.132.0.36`.
     Sect409k1,
-    /// sect409r1 (NIST B-409): `a = 1`, cofactor 2.
+    /// `sect409r1` (SEC 2, NIST B-409): GF(2^409), cofactor 2, OID `1.3.132.0.37`.
     Sect409r1,
-    /// sect571k1 (NIST K-571): Koblitz, `a = 0`, cofactor 4.
+    /// `sect571k1` (SEC 2, NIST K-571): GF(2^571), cofactor 4, OID `1.3.132.0.38`.
     Sect571k1,
-    /// sect571r1 (NIST B-571): `a = 1`, cofactor 2.
+    /// `sect571r1` (SEC 2, NIST B-571): GF(2^571), cofactor 2, OID `1.3.132.0.39`.
     Sect571r1,
+    /// `sect113r1` (SEC 2): GF(2^113), cofactor 2, OID `1.3.132.0.4`.
+    Sect113r1,
+    /// `sect113r2` (SEC 2): GF(2^113), cofactor 2, OID `1.3.132.0.5`.
+    Sect113r2,
+    /// `sect131r1` (SEC 2): GF(2^131), cofactor 2, OID `1.3.132.0.22`.
+    Sect131r1,
+    /// `sect131r2` (SEC 2): GF(2^131), cofactor 2, OID `1.3.132.0.23`.
+    Sect131r2,
+    /// `sect163k1` (SEC 2, NIST K-163): GF(2^163), cofactor 2, OID `1.3.132.0.1`.
+    Sect163k1,
+    /// `sect163r1` (SEC 2): GF(2^163), cofactor 2, OID `1.3.132.0.2`.
+    Sect163r1,
+    /// `sect163r2` (SEC 2, NIST B-163): GF(2^163), cofactor 2, OID `1.3.132.0.15`.
+    Sect163r2,
+    /// `sect193r1` (SEC 2): GF(2^193), cofactor 2, OID `1.3.132.0.24`.
+    Sect193r1,
+    /// `sect193r2` (SEC 2): GF(2^193), cofactor 2, OID `1.3.132.0.25`.
+    Sect193r2,
+    /// `sect233k1` (SEC 2, NIST K-233): GF(2^233), cofactor 4, OID `1.3.132.0.26`.
+    Sect233k1,
+    /// `sect233r1` (SEC 2, NIST B-233): GF(2^233), cofactor 2, OID `1.3.132.0.27`.
+    Sect233r1,
+    /// `sect239k1` (SEC 2): GF(2^239), cofactor 4, OID `1.3.132.0.3`.
+    Sect239k1,
+    /// `c2pnb163v1` (ANSI X9.62): GF(2^163), cofactor 2, OID `1.2.840.10045.3.0.1`.
+    C2pnb163v1,
+    /// `c2pnb163v2` (ANSI X9.62): GF(2^163), cofactor 2, OID `1.2.840.10045.3.0.2`.
+    C2pnb163v2,
+    /// `c2pnb163v3` (ANSI X9.62): GF(2^163), cofactor 2, OID `1.2.840.10045.3.0.3`.
+    C2pnb163v3,
+    /// `c2pnb176v1` (ANSI X9.62): GF(2^176), cofactor 65390, OID `1.2.840.10045.3.0.4`.
+    C2pnb176v1,
+    /// `c2tnb191v1` (ANSI X9.62): GF(2^191), cofactor 2, OID `1.2.840.10045.3.0.5`.
+    C2tnb191v1,
+    /// `c2tnb191v2` (ANSI X9.62): GF(2^191), cofactor 4, OID `1.2.840.10045.3.0.6`.
+    C2tnb191v2,
+    /// `c2tnb191v3` (ANSI X9.62): GF(2^191), cofactor 6, OID `1.2.840.10045.3.0.7`.
+    C2tnb191v3,
+    /// `c2pnb208w1` (ANSI X9.62): GF(2^208), cofactor 65096, OID `1.2.840.10045.3.0.10`.
+    C2pnb208w1,
+    /// `c2tnb239v1` (ANSI X9.62): GF(2^239), cofactor 4, OID `1.2.840.10045.3.0.11`.
+    C2tnb239v1,
+    /// `c2tnb239v2` (ANSI X9.62): GF(2^239), cofactor 6, OID `1.2.840.10045.3.0.12`.
+    C2tnb239v2,
+    /// `c2tnb239v3` (ANSI X9.62): GF(2^239), cofactor 10, OID `1.2.840.10045.3.0.13`.
+    C2tnb239v3,
+    /// `c2pnb272w1` (ANSI X9.62): GF(2^272), cofactor 65286, OID `1.2.840.10045.3.0.16`.
+    C2pnb272w1,
+    /// `c2pnb304w1` (ANSI X9.62): GF(2^304), cofactor 65070, OID `1.2.840.10045.3.0.17`.
+    C2pnb304w1,
+    /// `c2tnb359v1` (ANSI X9.62): GF(2^359), cofactor 76, OID `1.2.840.10045.3.0.18`.
+    C2tnb359v1,
+    /// `c2pnb368w1` (ANSI X9.62): GF(2^368), cofactor 65392, OID `1.2.840.10045.3.0.19`.
+    C2pnb368w1,
+    /// `c2tnb431r1` (ANSI X9.62): GF(2^431), cofactor 10080, OID `1.2.840.10045.3.0.20`.
+    C2tnb431r1,
+    /// `wap-wsg-idm-ecid-wtls1` (WAP WTLS): GF(2^113), cofactor 2, OID `2.23.43.1.4.1`.
+    Wtls1,
+    /// `wap-wsg-idm-ecid-wtls3` (WAP WTLS): GF(2^163), cofactor 2, OID `2.23.43.1.4.3`. The parameters of
+    /// [`sect163k1`](Self::Sect163k1) under the WTLS OID.
+    Wtls3,
+    /// `wap-wsg-idm-ecid-wtls4` (WAP WTLS): GF(2^113), cofactor 2, OID `2.23.43.1.4.4`. The parameters of
+    /// [`sect113r1`](Self::Sect113r1) under the WTLS OID.
+    Wtls4,
+    /// `wap-wsg-idm-ecid-wtls5` (WAP WTLS): GF(2^163), cofactor 2, OID `2.23.43.1.4.5`. The parameters of
+    /// [`c2pnb163v1`](Self::C2pnb163v1) under the WTLS OID.
+    Wtls5,
+    /// `wap-wsg-idm-ecid-wtls10` (WAP WTLS): GF(2^233), cofactor 4, OID `2.23.43.1.4.10`. The parameters of
+    /// [`sect233k1`](Self::Sect233k1) under the WTLS OID.
+    Wtls10,
+    /// `wap-wsg-idm-ecid-wtls11` (WAP WTLS): GF(2^233), cofactor 2, OID `2.23.43.1.4.11`. The parameters of
+    /// [`sect233r1`](Self::Sect233r1) under the WTLS OID.
+    Wtls11,
 }
 
 impl BinaryCurveId {
     /// Every supported curve.
-    pub const ALL: [BinaryCurveId; 6] = [
+    pub const ALL: [BinaryCurveId; 40] = [
         BinaryCurveId::Sect283k1,
         BinaryCurveId::Sect283r1,
         BinaryCurveId::Sect409k1,
         BinaryCurveId::Sect409r1,
         BinaryCurveId::Sect571k1,
         BinaryCurveId::Sect571r1,
+        BinaryCurveId::Sect113r1,
+        BinaryCurveId::Sect113r2,
+        BinaryCurveId::Sect131r1,
+        BinaryCurveId::Sect131r2,
+        BinaryCurveId::Sect163k1,
+        BinaryCurveId::Sect163r1,
+        BinaryCurveId::Sect163r2,
+        BinaryCurveId::Sect193r1,
+        BinaryCurveId::Sect193r2,
+        BinaryCurveId::Sect233k1,
+        BinaryCurveId::Sect233r1,
+        BinaryCurveId::Sect239k1,
+        BinaryCurveId::C2pnb163v1,
+        BinaryCurveId::C2pnb163v2,
+        BinaryCurveId::C2pnb163v3,
+        BinaryCurveId::C2pnb176v1,
+        BinaryCurveId::C2tnb191v1,
+        BinaryCurveId::C2tnb191v2,
+        BinaryCurveId::C2tnb191v3,
+        BinaryCurveId::C2pnb208w1,
+        BinaryCurveId::C2tnb239v1,
+        BinaryCurveId::C2tnb239v2,
+        BinaryCurveId::C2tnb239v3,
+        BinaryCurveId::C2pnb272w1,
+        BinaryCurveId::C2pnb304w1,
+        BinaryCurveId::C2tnb359v1,
+        BinaryCurveId::C2pnb368w1,
+        BinaryCurveId::C2tnb431r1,
+        BinaryCurveId::Wtls1,
+        BinaryCurveId::Wtls3,
+        BinaryCurveId::Wtls4,
+        BinaryCurveId::Wtls5,
+        BinaryCurveId::Wtls10,
+        BinaryCurveId::Wtls11,
     ];
 
     fn curve(self) -> &'static Curve {
@@ -82,30 +214,88 @@ impl BinaryCurveId {
             BinaryCurveId::Sect409r1 => &curve::SECT409R1,
             BinaryCurveId::Sect571k1 => &curve::SECT571K1,
             BinaryCurveId::Sect571r1 => &curve::SECT571R1,
+            BinaryCurveId::Sect113r1 => &curve::SECT113R1,
+            BinaryCurveId::Sect113r2 => &curve::SECT113R2,
+            BinaryCurveId::Sect131r1 => &curve::SECT131R1,
+            BinaryCurveId::Sect131r2 => &curve::SECT131R2,
+            BinaryCurveId::Sect163k1 => &curve::SECT163K1,
+            BinaryCurveId::Sect163r1 => &curve::SECT163R1,
+            BinaryCurveId::Sect163r2 => &curve::SECT163R2,
+            BinaryCurveId::Sect193r1 => &curve::SECT193R1,
+            BinaryCurveId::Sect193r2 => &curve::SECT193R2,
+            BinaryCurveId::Sect233k1 => &curve::SECT233K1,
+            BinaryCurveId::Sect233r1 => &curve::SECT233R1,
+            BinaryCurveId::Sect239k1 => &curve::SECT239K1,
+            BinaryCurveId::C2pnb163v1 => &curve::C2PNB163V1,
+            BinaryCurveId::C2pnb163v2 => &curve::C2PNB163V2,
+            BinaryCurveId::C2pnb163v3 => &curve::C2PNB163V3,
+            BinaryCurveId::C2pnb176v1 => &curve::C2PNB176V1,
+            BinaryCurveId::C2tnb191v1 => &curve::C2TNB191V1,
+            BinaryCurveId::C2tnb191v2 => &curve::C2TNB191V2,
+            BinaryCurveId::C2tnb191v3 => &curve::C2TNB191V3,
+            BinaryCurveId::C2pnb208w1 => &curve::C2PNB208W1,
+            BinaryCurveId::C2tnb239v1 => &curve::C2TNB239V1,
+            BinaryCurveId::C2tnb239v2 => &curve::C2TNB239V2,
+            BinaryCurveId::C2tnb239v3 => &curve::C2TNB239V3,
+            BinaryCurveId::C2pnb272w1 => &curve::C2PNB272W1,
+            BinaryCurveId::C2pnb304w1 => &curve::C2PNB304W1,
+            BinaryCurveId::C2tnb359v1 => &curve::C2TNB359V1,
+            BinaryCurveId::C2pnb368w1 => &curve::C2PNB368W1,
+            BinaryCurveId::C2tnb431r1 => &curve::C2TNB431R1,
+            BinaryCurveId::Wtls1 => &curve::WTLS1,
+            BinaryCurveId::Wtls3 => &curve::WTLS3,
+            BinaryCurveId::Wtls4 => &curve::WTLS4,
+            BinaryCurveId::Wtls5 => &curve::WTLS5,
+            BinaryCurveId::Wtls10 => &curve::WTLS10,
+            BinaryCurveId::Wtls11 => &curve::WTLS11,
         }
     }
 
-    /// The SEC 2 name (`"sect283k1"`, ...).
+    /// OpenSSL's short name (`"sect283k1"`, `"c2pnb163v1"`,
+    /// `"wap-wsg-idm-ecid-wtls1"`, ...).
     pub fn name(self) -> &'static str {
         self.curve().name
     }
 
-    /// Bytes of one field element / coordinate (36, 52 or 72).
+    /// Looks a curve up by its OpenSSL short name ([`name`](Self::name)).
+    pub fn from_name(name: &str) -> Option<BinaryCurveId> {
+        BinaryCurveId::ALL.into_iter().find(|c| c.name() == name)
+    }
+
+    /// The extension degree `m` of the field GF(2^m).
+    pub fn field_degree(self) -> usize {
+        self.curve().field.m
+    }
+
+    /// Bytes of one field element / coordinate (`ceil(m / 8)`).
     pub fn field_len(self) -> usize {
         self.curve().field.byte_len()
     }
 
-    /// Bytes of a private scalar (`ceil(bit_len(n) / 8)`).
+    /// Bits of the group order `n`.
+    pub fn order_bits(self) -> usize {
+        self.curve().n_bits
+    }
+
+    /// Bytes of a private scalar and of each ECDSA signature half
+    /// (`ceil(bit_len(n) / 8)`).
     pub fn scalar_len(self) -> usize {
         self.curve().scalar_len()
     }
 
-    /// The cofactor `h` (2 for the `r1` curves, 4 for the Koblitz curves).
+    /// The group order `n`, big-endian ([`scalar_len`](Self::scalar_len)
+    /// bytes).
+    pub fn order(self) -> Vec<u8> {
+        limbs_to_be(&self.curve().n, self.scalar_len())
+    }
+
+    /// The cofactor `h` (2 to 65392).
     pub fn cofactor(self) -> u64 {
         self.curve().h
     }
 
-    /// The named-curve OID arcs (`1.3.132.0.{16,17,36,37,38,39}`).
+    /// The named-curve OID arcs (`1.3.132.0.*` for SEC 2,
+    /// `1.2.840.10045.3.0.*` for X9.62, `2.23.43.1.4.*` for WTLS).
     pub fn named_curve_oid(self) -> &'static [u64] {
         self.curve().oid
     }
@@ -116,12 +306,47 @@ impl BinaryCurveId {
             .into_iter()
             .find(|c| c.named_curve_oid() == arcs)
     }
+
+    /// Parses a DER `ECParameters` naming a binary curve: the `namedCurve`
+    /// OID (the only form accepted).
+    fn from_parameters_der(der: &[u8]) -> Result<BinaryCurveId, Error> {
+        use crate::der::{Reader, parse_oid};
+        let mut r = Reader::new(der);
+        let arcs =
+            parse_oid(r.read_oid().map_err(|_| Error::Malformed)?).map_err(|_| Error::Malformed)?;
+        r.finish().map_err(|_| Error::Malformed)?;
+        BinaryCurveId::from_named_curve_oid(&arcs).ok_or(Error::Malformed)
+    }
 }
 
 impl core::fmt::Display for BinaryCurveId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// `v` as `len` big-endian bytes (the low `len` bytes of the limbs).
+fn limbs_to_be(v: &Limbs, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    for (i, b) in out.iter_mut().rev().enumerate() {
+        *b = (v[i / 8] >> (8 * (i % 8))) as u8;
+    }
+    out
+}
+
+/// Parses a big-endian scalar of any width into limbs; `None` when a byte
+/// beyond the limb capacity is nonzero.
+fn limbs_from_be(bytes: &[u8]) -> Option<Limbs> {
+    let mut out = [0u64; MAX_LIMBS];
+    let mut overflow = 0u8;
+    for (i, &b) in bytes.iter().rev().enumerate() {
+        if i < 8 * MAX_LIMBS {
+            out[i / 8] |= (b as u64) << (8 * (i % 8));
+        } else {
+            overflow |= b;
+        }
+    }
+    (overflow == 0).then_some(out)
 }
 
 /// A validated public point on one of the binary curves.
@@ -173,7 +398,7 @@ impl BinaryPublicKey {
     }
 
     /// Parses an X.509 `SubjectPublicKeyInfo` (RFC 5480) whose algorithm is
-    /// `id-ecPublicKey` with one of the six named-curve OIDs. Explicit
+    /// `id-ecPublicKey` with a binary named-curve OID. Explicit
     /// (`ECParameters`) or `implicitlyCA` parameters are rejected, as is any
     /// deviation from strict DER, and the point is validated as by
     /// [`from_sec1`](Self::from_sec1).
@@ -212,9 +437,23 @@ impl BinaryPublicKey {
         );
         encode_sequence(&[algid, encode_bit_string(&self.to_sec1(false))].concat())
     }
+
+    /// Parses a PEM `SubjectPublicKeyInfo` (`-----BEGIN PUBLIC KEY-----`);
+    /// see [`from_spki_der`](Self::from_spki_der).
+    pub fn from_spki_pem(pem: &str) -> Result<Self, Error> {
+        let der = crate::der::pem_decode(pem, "PUBLIC KEY").map_err(|_| Error::Malformed)?;
+        Self::from_spki_der(&der)
+    }
+
+    /// Encodes the key as a PEM `SubjectPublicKeyInfo`
+    /// (`-----BEGIN PUBLIC KEY-----`).
+    pub fn to_spki_pem(&self) -> alloc::string::String {
+        crate::der::pem_encode("PUBLIC KEY", &self.to_spki_der())
+    }
 }
 
-/// An ECDH private scalar `d ∈ [1, n − 1]` on one of the binary curves.
+/// A private scalar `d ∈ [1, n − 1]` on one of the binary curves, for ECDSA
+/// ([`sign`](Self::sign)) and ECDH ([`diffie_hellman`](Self::diffie_hellman)).
 ///
 /// The scalar is wiped on drop.
 #[derive(Clone)]
@@ -239,21 +478,6 @@ impl Drop for BinaryPrivateKey {
 
 impl ZeroizeOnDrop for BinaryPrivateKey {}
 
-/// Parses a big-endian scalar of any width into limbs; `None` when a byte
-/// beyond the limb capacity is nonzero.
-fn limbs_from_be(bytes: &[u8]) -> Option<Limbs> {
-    let mut out = [0u64; MAX_LIMBS];
-    let mut overflow = 0u8;
-    for (i, &b) in bytes.iter().rev().enumerate() {
-        if i < 8 * MAX_LIMBS {
-            out[i / 8] |= (b as u64) << (8 * (i % 8));
-        } else {
-            overflow |= b;
-        }
-    }
-    (overflow == 0).then_some(out)
-}
-
 impl BinaryPrivateKey {
     /// Generates a uniformly random scalar in `[1, n − 1]` by rejection
     /// sampling `bit_len(n)`-bit candidates.
@@ -267,8 +491,9 @@ impl BinaryPrivateKey {
             rng.fill_bytes(&mut buf);
             buf[0] &= high_mask;
             let d = limbs_from_be(&buf).expect("scalar_len bytes fit the limbs");
-            // 1 ≤ d < n, evaluated without short-circuiting on the candidate.
-            if bool::from(!limbs_is_zero(&d) & limbs_lt(&d, &c.n)) {
+            // 1 ≤ d < n, evaluated without short-circuiting on the candidate;
+            // the verdict is public (only the retry count is observable).
+            if (!limbs_is_zero(&d) & limbs_lt(&d, &c.n)).declassify() {
                 buf.zeroize();
                 return BinaryPrivateKey { curve, d };
             }
@@ -295,12 +520,7 @@ impl BinaryPrivateKey {
     /// The scalar as a fixed-width big-endian byte string
     /// ([`BinaryCurveId::scalar_len`] bytes).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let len = self.curve.scalar_len();
-        let mut out = vec![0u8; len];
-        for (i, b) in out.iter_mut().rev().enumerate() {
-            *b = (self.d[i / 8] >> (8 * (i % 8))) as u8;
-        }
-        out
+        limbs_to_be(&self.d, self.curve.scalar_len())
     }
 
     /// The curve this key lives on.
@@ -341,6 +561,204 @@ impl BinaryPrivateKey {
             return Err(Error::InvalidInput);
         }
         Ok(out)
+    }
+}
+
+/// SEC 1 `ECPrivateKey` (`EC PRIVATE KEY`) and PKCS#8 (`PRIVATE KEY`)
+/// encodings, with the named-curve OID — the forms `openssl ecparam
+/// -genkey` and `openssl pkey` write.
+impl BinaryPrivateKey {
+    /// The SEC 1 `ECPrivateKey` (RFC 5915), with or without the `[0]`
+    /// parameters; the `[1]` public key is always included.
+    fn sec1_der(&self, with_params: bool) -> Vec<u8> {
+        use crate::der::{
+            encode_bit_string, encode_context, encode_integer, encode_octet_string,
+            encode_sequence, oid_tlv,
+        };
+        let mut d = self.to_bytes();
+        let mut body = [encode_integer(&[1]), encode_octet_string(&d)].concat();
+        d.zeroize();
+        if with_params {
+            body.extend_from_slice(&encode_context(0, &oid_tlv(self.curve.named_curve_oid())));
+        }
+        body.extend_from_slice(&encode_context(
+            1,
+            &encode_bit_string(&self.public_key().to_sec1(false)),
+        ));
+        let out = encode_sequence(&body);
+        body.zeroize();
+        out
+    }
+
+    /// Encodes the key as a SEC 1 `ECPrivateKey` DER (RFC 5915) with the
+    /// named-curve parameters and the public key.
+    pub fn to_sec1_der(&self) -> Vec<u8> {
+        self.sec1_der(true)
+    }
+
+    /// Encodes the key as a SEC 1 PEM document
+    /// (`-----BEGIN EC PRIVATE KEY-----`).
+    pub fn to_sec1_pem(&self) -> alloc::string::String {
+        let mut der = self.to_sec1_der();
+        let pem = crate::der::pem_encode("EC PRIVATE KEY", &der);
+        der.zeroize();
+        pem
+    }
+
+    /// Parses a SEC 1 `ECPrivateKey`. `outer` is the curve the PKCS#8
+    /// wrapper names (then the `[0]` parameters are optional but must
+    /// agree), or `None` for a bare SEC 1 key (then they are required).
+    fn from_sec1_inner(der: &[u8], outer: Option<BinaryCurveId>) -> Result<Self, Error> {
+        use crate::der::{Reader, tag};
+        let mut r = Reader::new(der);
+        let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
+        if seq.read_integer_bytes().map_err(|_| Error::Malformed)? != [1] {
+            return Err(Error::Malformed);
+        }
+        let priv_bytes = seq.read_octet_string().map_err(|_| Error::Malformed)?;
+        let mut curve = outer;
+        if seq.peek_tag() == Some(tag::context(0)) {
+            let params = seq
+                .read_tlv(tag::context(0))
+                .map_err(|_| Error::Malformed)?;
+            let named = BinaryCurveId::from_parameters_der(params)?;
+            if outer.is_some_and(|c| c != named) {
+                return Err(Error::Malformed);
+            }
+            curve = Some(named);
+        }
+        let curve = curve.ok_or(Error::Malformed)?;
+        let key = Self::from_bytes(curve, priv_bytes)?;
+        if seq.peek_tag() == Some(tag::context(1)) {
+            // A public key that is not this scalar's makes the key
+            // self-contradictory: reject it (as the prime-field keys do).
+            let field = seq
+                .read_tlv(tag::context(1))
+                .map_err(|_| Error::Malformed)?;
+            let mut pr = Reader::new(field);
+            let bits = pr.read_bit_string().map_err(|_| Error::Malformed)?;
+            pr.finish().map_err(|_| Error::Malformed)?;
+            if BinaryPublicKey::from_sec1(curve, bits)? != key.public_key() {
+                return Err(Error::InvalidInput);
+            }
+        }
+        seq.finish().map_err(|_| Error::Malformed)?;
+        r.finish().map_err(|_| Error::Malformed)?;
+        Ok(key)
+    }
+
+    /// Parses a SEC 1 `ECPrivateKey` DER whose parameters name a binary
+    /// curve. An embedded `[1]` public key must match the scalar.
+    pub fn from_sec1_der(der: &[u8]) -> Result<Self, Error> {
+        Self::from_sec1_inner(der, None)
+    }
+
+    /// Parses a SEC 1 PEM document (`-----BEGIN EC PRIVATE KEY-----`).
+    pub fn from_sec1_pem(pem: &str) -> Result<Self, Error> {
+        let mut der =
+            crate::der::pem_decode(pem, "EC PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        let key = Self::from_sec1_der(&der);
+        der.zeroize();
+        key
+    }
+
+    /// Encodes the key as an unencrypted PKCS#8 `PrivateKeyInfo`:
+    /// `id-ecPublicKey` with the named-curve OID, wrapping the SEC 1
+    /// `ECPrivateKey` (without the redundant `[0]` parameters, RFC 5915 §3).
+    pub fn to_pkcs8_der(&self) -> Vec<u8> {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let algid = encode_sequence(
+            &[
+                oid_tlv(EC_PUBLIC_KEY_OID),
+                oid_tlv(self.curve.named_curve_oid()),
+            ]
+            .concat(),
+        );
+        let mut inner = self.sec1_der(false);
+        let mut body = [encode_integer(&[0]), algid, encode_octet_string(&inner)].concat();
+        inner.zeroize();
+        let out = encode_sequence(&body);
+        body.zeroize();
+        out
+    }
+
+    /// Encodes the key as an unencrypted PKCS#8 PEM document
+    /// (`-----BEGIN PRIVATE KEY-----`).
+    pub fn to_pkcs8_pem(&self) -> alloc::string::String {
+        let mut der = self.to_pkcs8_der();
+        let pem = crate::der::pem_encode("PRIVATE KEY", &der);
+        der.zeroize();
+        pem
+    }
+
+    /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 5958 v1 or v2)
+    /// carrying an `id-ecPublicKey` key on a binary named curve. The inner
+    /// SEC 1 structure's `[0]` parameters, when present, must name the same
+    /// curve, and its `[1]` public key must match the scalar; the outer
+    /// `[0]` attributes and `[1]` public key are skipped.
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
+        use crate::der::{Reader, parse_oid, tag};
+        let mut r = Reader::new(der);
+        let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
+        let version = seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
+        if version != [0] && version != [1] {
+            return Err(Error::Malformed);
+        }
+        let mut algid = seq.read_sequence().map_err(|_| Error::Malformed)?;
+        let alg = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
+            .map_err(|_| Error::Malformed)?;
+        if alg.as_slice() != EC_PUBLIC_KEY_OID {
+            return Err(Error::Malformed);
+        }
+        let curve = BinaryCurveId::from_parameters_der(
+            algid.read_element().map_err(|_| Error::Malformed)?,
+        )?;
+        algid.finish().map_err(|_| Error::Malformed)?;
+        let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
+        let key = Self::from_sec1_inner(inner, Some(curve))?;
+        if seq.peek_tag() == Some(tag::context(0)) {
+            seq.read_any().map_err(|_| Error::Malformed)?;
+        }
+        if matches!(seq.peek_tag(), Some(t) if t == tag::context(1) || t == (0x80 | 1)) {
+            seq.read_any().map_err(|_| Error::Malformed)?;
+        }
+        seq.finish().map_err(|_| Error::Malformed)?;
+        r.finish().map_err(|_| Error::Malformed)?;
+        Ok(key)
+    }
+
+    /// Parses an unencrypted PKCS#8 PEM document
+    /// (`-----BEGIN PRIVATE KEY-----`).
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
+        let mut der = crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        let key = Self::from_pkcs8_der(&der);
+        der.zeroize();
+        key
+    }
+
+    /// Encrypts the PKCS#8 encoding under PBES2 (RFC 8018), returning the
+    /// DER `EncryptedPrivateKeyInfo`.
+    #[cfg(feature = "kdf")]
+    pub fn to_pkcs8_der_encrypted(
+        &self,
+        password: &[u8],
+        params: &crate::kdf::pbes2::Pbes2Params,
+        rng: &mut impl RngCore,
+    ) -> Vec<u8> {
+        let mut der = self.to_pkcs8_der();
+        let out = crate::kdf::pbes2::encrypt(&der, password, params, rng);
+        der.zeroize();
+        out
+    }
+
+    /// Decrypts a PBES2 `EncryptedPrivateKeyInfo` DER and parses the PKCS#8
+    /// key inside.
+    #[cfg(feature = "kdf")]
+    pub fn from_pkcs8_der_encrypted(der: &[u8], password: &[u8]) -> Result<Self, Error> {
+        let mut inner = crate::kdf::pbes2::decrypt(der, password).map_err(|_| Error::Malformed)?;
+        let key = Self::from_pkcs8_der(&inner);
+        inner.zeroize();
+        key
     }
 }
 
@@ -546,6 +964,121 @@ mod tests {
         );
         let spki = encode_sequence(&[algid, encode_bit_string(&[0x04; 65])].concat());
         assert_eq!(BinaryPublicKey::from_spki_der(&spki), Err(Error::Malformed));
+    }
+
+    /// OpenSSL 3.5 interop on every curve (`testdata/ec-binary/
+    /// openssl-vectors.txt`): its SEC 1 and PKCS#8 keys load (and the
+    /// PKCS#8 re-encodes byte for byte), its SPKI peers load, its ECDSA
+    /// signatures verify, and ECDH matches `pkeyutl -derive`.
+    #[test]
+    fn openssl_vectors() {
+        use crate::hash::Sha256;
+        let text = include_str!("../../../testdata/ec-binary/openssl-vectors.txt");
+        let msg = b"purecrypto binary-curve interop\n";
+        let mut seen = alloc::collections::BTreeSet::new();
+        for block in text.split("\n\n").filter(|b| b.starts_with("curve")) {
+            let field = |name: &str| {
+                block
+                    .lines()
+                    .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(" = ")))
+                    .unwrap()
+            };
+            let name = field("curve");
+            let curve = BinaryCurveId::from_name(name).unwrap();
+            seen.insert(name);
+            let sk = BinaryPrivateKey::from_sec1_der(&hex(field("key"))).unwrap();
+            assert_eq!(sk.curve(), curve);
+            let p8 = hex(field("pkcs8"));
+            let sk8 = BinaryPrivateKey::from_pkcs8_der(&p8).unwrap();
+            assert_eq!(sk8.to_bytes(), sk.to_bytes(), "{name}");
+            assert_eq!(sk.to_pkcs8_der(), p8, "{name} PKCS#8 encoding");
+            let back = BinaryPrivateKey::from_sec1_der(&sk.to_sec1_der()).unwrap();
+            assert_eq!(back.to_bytes(), sk.to_bytes());
+            let peer_der = hex(field("peer"));
+            let peer = BinaryPublicKey::from_spki_der(&peer_der).unwrap();
+            assert_eq!(peer.curve(), curve);
+            assert_eq!(peer.to_spki_der(), peer_der);
+            assert_eq!(
+                sk.diffie_hellman(&peer).unwrap(),
+                hex(field("shared")),
+                "{name} ECDH"
+            );
+            let sig = BinarySignature::from_der(curve, &hex(field("sig"))).unwrap();
+            let pk = sk.public_key();
+            pk.verify::<Sha256>(msg, &sig).unwrap();
+            assert!(pk.verify::<Sha256>(b"other", &sig).is_err());
+            // Ours verify under our own verifier too (OpenSSL's side of this
+            // was checked by hand: `openssl dgst -verify`).
+            let ours = sk.sign::<Sha256>(msg).unwrap();
+            pk.verify::<Sha256>(msg, &ours).unwrap();
+        }
+        assert_eq!(seen.len(), BinaryCurveId::ALL.len());
+    }
+
+    #[test]
+    fn key_encodings_round_trip_and_reject_mismatches() {
+        let mut rng = drbg(4);
+        let a = BinaryPrivateKey::generate(BinaryCurveId::C2pnb176v1, &mut rng);
+        let b = BinaryPrivateKey::generate(BinaryCurveId::C2pnb176v1, &mut rng);
+        for der in [a.to_sec1_der(), a.to_pkcs8_der()] {
+            let k = BinaryPrivateKey::from_sec1_der(&der)
+                .or_else(|_| BinaryPrivateKey::from_pkcs8_der(&der))
+                .unwrap();
+            assert_eq!(k.to_bytes(), a.to_bytes());
+        }
+        let pem = a.to_sec1_pem();
+        assert!(pem.starts_with("-----BEGIN EC PRIVATE KEY-----"));
+        assert_eq!(
+            BinaryPrivateKey::from_sec1_pem(&pem).unwrap().to_bytes(),
+            a.to_bytes()
+        );
+        assert_eq!(
+            BinaryPrivateKey::from_pkcs8_pem(&a.to_pkcs8_pem())
+                .unwrap()
+                .to_bytes(),
+            a.to_bytes()
+        );
+        let spki = a.public_key().to_spki_pem();
+        assert_eq!(
+            BinaryPublicKey::from_spki_pem(&spki).unwrap(),
+            a.public_key()
+        );
+        // A SEC 1 key whose [1] public key belongs to another scalar.
+        let good = a.to_sec1_der();
+        let bad = {
+            let pa = a.public_key().to_sec1(false);
+            let pb = b.public_key().to_sec1(false);
+            let i = good.windows(pa.len()).position(|w| w == pa).unwrap();
+            let mut v = good.clone();
+            v[i..i + pa.len()].copy_from_slice(&pb);
+            v
+        };
+        assert_eq!(
+            BinaryPrivateKey::from_sec1_der(&bad).unwrap_err(),
+            Error::InvalidInput
+        );
+        // Trailing data, and a SEC 1 key without parameters.
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(BinaryPrivateKey::from_sec1_der(&trailing).is_err());
+        assert!(BinaryPrivateKey::from_sec1_der(&a.sec1_der(false)).is_err());
+    }
+
+    #[test]
+    fn curve_lookup() {
+        for c in BinaryCurveId::ALL {
+            assert_eq!(BinaryCurveId::from_name(c.name()), Some(c));
+            assert_eq!(
+                BinaryCurveId::from_named_curve_oid(c.named_curve_oid()),
+                Some(c)
+            );
+            assert_eq!(c.order().len(), c.scalar_len());
+            assert!(c.order_bits() <= c.field_degree());
+        }
+        assert_eq!(BinaryCurveId::ALL.len(), 40);
+        assert_eq!(BinaryCurveId::from_name("prime256v1"), None);
+        assert_eq!(BinaryCurveId::Wtls3.field_degree(), 163);
+        assert_eq!(BinaryCurveId::C2pnb368w1.cofactor(), 0xff70);
     }
 
     fn hex(s: &str) -> Vec<u8> {

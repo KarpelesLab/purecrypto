@@ -1,9 +1,11 @@
-//! GF(2^m) polynomial-basis arithmetic for m ∈ {283, 409, 571}.
+//! GF(2^m) polynomial-basis arithmetic for every binary-curve field
+//! (113 ≤ m ≤ 571, trinomial or pentanomial reduction polynomial).
 //!
 //! An element is a polynomial over GF(2) of degree < m, stored as
 //! little-endian `u64` limbs ([`Fe`]); a [`Field`] carries the public
 //! parameters (m, the number of limbs in use and the middle exponents of the
-//! SEC 2 reduction polynomial). Every operation is branch-free in the element
+//! reduction polynomial), so one code path serves every field: each loop
+//! runs over the limbs in use. Every operation is branch-free in the element
 //! data: multiplication is a schoolbook product of 64×64 carry-less
 //! multiplications — the PMULL / PCLMULQDQ instruction where the CPU has it,
 //! otherwise a bit-sliced integer-multiply emulation (no lookup tables
@@ -192,7 +194,7 @@ fn spread(x: u32) -> u64 {
 /// the middle exponents of the reduction polynomial `x^m + Σ x^e + 1`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Field {
-    /// Extension degree `m` (odd for every SEC 2 binary curve).
+    /// Extension degree `m` (even for five X9.62 fields).
     pub(super) m: usize,
     /// Limbs actually used (`ceil(m / 64)`); the rest stay zero.
     pub(super) limbs: usize,
@@ -200,26 +202,26 @@ pub(super) struct Field {
     pub(super) mid: &'static [usize],
 }
 
-/// GF(2^283) with `x^283 + x^12 + x^7 + x^5 + 1`.
-pub(super) const F283: Field = Field {
-    m: 283,
-    limbs: 5,
-    mid: &[5, 7, 12],
-};
-
-/// GF(2^409) with `x^409 + x^87 + 1`.
-pub(super) const F409: Field = Field {
-    m: 409,
-    limbs: 7,
-    mid: &[87],
-};
-
-/// GF(2^571) with `x^571 + x^10 + x^5 + x^2 + 1`.
-pub(super) const F571: Field = Field {
-    m: 571,
-    limbs: 9,
-    mid: &[2, 5, 10],
-};
+impl Field {
+    /// The field `GF(2)[x] / (x^m + Σ_{e ∈ mid} x^e + 1)` (a trinomial or
+    /// pentanomial basis). The reduction in [`reduce`](Self::reduce) folds
+    /// one 64-bit word at a time, which needs every middle exponent below
+    /// `m − 63` and `m` not a multiple of 64 — true of every SEC 2 / X9.62 /
+    /// WTLS polynomial, and checked at compile time for each constant.
+    pub(super) const fn new(m: usize, mid: &'static [usize]) -> Field {
+        assert!(!m.is_multiple_of(64) && m <= 64 * MAX_LIMBS);
+        let mut i = 0;
+        while i < mid.len() {
+            assert!(mid[i] > 0 && mid[i] + 63 < m);
+            i += 1;
+        }
+        Field {
+            m,
+            limbs: m.div_ceil(64),
+            mid,
+        }
+    }
+}
 
 impl Field {
     /// Bytes of the fixed-width big-endian encoding (`ceil(m / 8)`).
@@ -367,7 +369,7 @@ impl Field {
 
     /// The half-trace `H(a) = Σ_{i ≤ (m−1)/2} a^(2^(2i))` (m odd), which
     /// solves `z² + z = a` whenever `Tr(a) = 0`.
-    pub(super) fn half_trace(&self, a: &Fe) -> Fe {
+    fn half_trace(&self, a: &Fe) -> Fe {
         let mut acc = *a;
         let mut t = *a;
         for _ in 0..(self.m - 1) / 2 {
@@ -377,10 +379,43 @@ impl Field {
         acc
     }
 
-    /// Solves `z² + z = c` in constant time: the value is `H(c)` and the flag
-    /// is `Tr(c) = 0`, i.e. whether a solution exists (`z + 1` is the other).
+    /// The first monomial `x^i` of trace 1 — a public constant of the
+    /// field, which the even-degree quadratic solver needs. (`Tr(1) = m mod
+    /// 2`, so for odd `m` this is `1`; an even-degree field always has
+    /// some `x^i` of trace 1, as the trace is a nonzero linear form.)
+    fn trace_one_monomial(&self) -> Fe {
+        for i in 0..self.m {
+            let mut t = Fe::ZERO;
+            t.0[i / 64] = 1 << (i % 64);
+            // Public: a function of the field polynomial alone.
+            if bool::from(self.trace(&t)) {
+                return t;
+            }
+        }
+        unreachable!("the trace form is nonzero")
+    }
+
+    /// Solves `z² + z = c` in constant time: the value is a root and the flag
+    /// is `Tr(c) = 0`, i.e. whether a root exists (`z + 1` is the other).
+    ///
+    /// Odd `m`: the half-trace `H(c)`. Even `m` (the X9.62 c2pnb176/208/272/
+    /// 304/368 fields): IEEE 1363 A.4.7 with a fixed `τ` of trace 1 —
+    /// `z ← z² + w²·τ`, `w ← w² + c`, `m − 1` times from `z = 0`, `w = c`
+    /// — whose result is a root whenever one exists.
     pub(super) fn solve_quadratic(&self, c: &Fe) -> (Fe, Choice) {
-        (self.half_trace(c), !self.trace(c))
+        let ok = !self.trace(c);
+        if self.m % 2 == 1 {
+            return (self.half_trace(c), ok);
+        }
+        let tau = self.trace_one_monomial();
+        let mut z = Fe::ZERO;
+        let mut w = *c;
+        for _ in 1..self.m {
+            let w2 = self.sqr(&w);
+            z = self.sqr(&z).add(&self.mul(&w2, &tau));
+            w = w2.add(c);
+        }
+        (z, ok)
     }
 
     /// `√a = a^(2^(m−1))` (squaring is a bijection in characteristic 2).
@@ -423,7 +458,28 @@ impl Field {
 mod tests {
     use super::*;
 
-    const FIELDS: [Field; 3] = [F283, F409, F571];
+    /// Every distinct field of the supported curves.
+    const FIELDS: [Field; 19] = [
+        Field::new(113, &[9]),
+        Field::new(131, &[2, 3, 8]),
+        Field::new(163, &[3, 6, 7]),
+        Field::new(163, &[1, 2, 8]),
+        Field::new(176, &[1, 2, 43]),
+        Field::new(191, &[9]),
+        Field::new(193, &[15]),
+        Field::new(208, &[1, 2, 83]),
+        Field::new(233, &[74]),
+        Field::new(239, &[36]),
+        Field::new(239, &[158]),
+        Field::new(272, &[1, 3, 56]),
+        Field::new(283, &[5, 7, 12]),
+        Field::new(304, &[1, 2, 11]),
+        Field::new(359, &[68]),
+        Field::new(368, &[1, 2, 85]),
+        Field::new(409, &[87]),
+        Field::new(431, &[120]),
+        Field::new(571, &[2, 5, 10]),
+    ];
 
     /// A deterministic pseudo-random element (xorshift), reduced to `m` bits.
     fn sample(f: &Field, seed: &mut u64) -> Fe {
@@ -566,11 +622,11 @@ mod tests {
     fn trace_and_half_trace() {
         let mut seed = 0x1234_5678_9ABC_DEF1u64;
         for f in &FIELDS {
-            // Tr(1) = m mod 2 = 1 for every odd m.
-            assert!(bool::from(f.trace(&Fe::ONE)));
+            // Tr(1) = m mod 2.
+            assert_eq!(bool::from(f.trace(&Fe::ONE)), f.m % 2 == 1);
             assert!(!bool::from(f.trace(&Fe::ZERO)));
             let mut solved = 0;
-            for _ in 0..6 {
+            for _ in 0..24 {
                 let c = sample(f, &mut seed);
                 let (z, ok) = f.solve_quadratic(&c);
                 let has = bool::from(ok);
@@ -597,11 +653,15 @@ mod tests {
             let v = be(f, &a);
             assert_eq!(v.len(), f.byte_len());
             assert_eq!(f.decode_be(&v).unwrap().0, a.0);
-            // 2^m (bit m set) is out of range; one byte short is rejected.
-            let mut big = alloc::vec![0u8; f.byte_len()];
+            // 2^m (bit m set) is out of range — unless m is a multiple of
+            // 8, where the encoding has no room for it; one byte short is
+            // rejected.
             let top = f.byte_len() * 8 - f.m;
-            big[0] = 1 << (8 - top);
-            assert!(f.decode_be(&big).is_none());
+            if top != 0 {
+                let mut big = alloc::vec![0u8; f.byte_len()];
+                big[0] = 1 << (8 - top);
+                assert!(f.decode_be(&big).is_none());
+            }
             assert!(f.decode_be(&v[1..]).is_none());
         }
     }

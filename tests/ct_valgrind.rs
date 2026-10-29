@@ -1045,6 +1045,46 @@ fn sect283k1_ecdh() -> String {
     )
 }
 
+/// Binary-curve ECDSA signing and ECDH beyond sect283k1: a two-limb field
+/// (sect113r1), an even-degree pentanomial field with a 16-bit cofactor
+/// (c2pnb176v1, which also sends `r = x mod n` through a wide reduction),
+/// a trinomial X9.62 field (c2tnb431r1) and the widest one (sect571r1) —
+/// the ladder for `k·G` and `d·Q`, RFC 6979, and the arithmetic mod `n`.
+#[cfg(feature = "legacy-ec")]
+fn binary_curves() -> String {
+    use purecrypto::ec::binary::{BinaryCurveId, BinaryPrivateKey};
+    let mut out = String::new();
+    for (curve, tag) in [
+        (BinaryCurveId::Sect113r1, 150),
+        (BinaryCurveId::C2pnb176v1, 152),
+        (BinaryCurveId::C2tnb431r1, 154),
+        (BinaryCurveId::Sect571r1, 156),
+    ] {
+        let len = curve.scalar_len();
+        // One bit below the order's top bit keeps the scalar in range.
+        let top_mask = (1u16 << ((curve.order_bits() - 1) % 8)) as u8 - 1;
+        let mut raw = secret_bytes::<72>(tag)[..len].to_vec();
+        raw[0] &= top_mask;
+        let sk = BinaryPrivateKey::from_bytes(curve, &raw).expect("scalar in range");
+        let mut peer_raw = fixed_bytes::<72>(tag + 1)[..len].to_vec();
+        peer_raw[0] &= top_mask;
+        let peer = BinaryPrivateKey::from_bytes(curve, &peer_raw)
+            .unwrap()
+            .public_key();
+        let sig = sk
+            .sign::<Sha256>(b"ct_valgrind message")
+            .unwrap()
+            .to_bytes();
+        let shared = sk.diffie_hellman(&peer).expect("valid peer");
+        out.push_str(&format!(
+            "sig={} ss={} ",
+            hex8(public(&sig[..])),
+            hex8(public(&shared[..]))
+        ));
+    }
+    out
+}
+
 fn sm2_sign() -> String {
     let sk = Sm2PrivateKey::from_bytes(&secret_bytes::<32>(117)).expect("scalar in range");
     let sig = sk
@@ -2788,6 +2828,8 @@ const CASES: &[Case] = &[
     ("p384_ecdh", p384_ecdh),
     #[cfg(feature = "legacy-ec")]
     ("sect283k1_ecdh", sect283k1_ecdh),
+    #[cfg(feature = "legacy-ec")]
+    ("binary_curves", binary_curves),
     #[cfg(feature = "ec-custom")]
     ("ec_custom_curves", ec_custom_curves),
     ("sm2_sign", sm2_sign),
