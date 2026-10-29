@@ -5,7 +5,7 @@
 //! so encryption and decryption are the same XOR operation, and a (key, IV)
 //! pair must never be reused.
 
-use super::BlockCipher;
+use super::{BlockCipher, BlockCipher64};
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// OFB-mode stream wrapper around a block cipher.
@@ -78,6 +78,56 @@ impl<C: BlockCipher> Drop for Ofb<C> {
 
 impl<C: BlockCipher> ZeroizeOnDrop for Ofb<C> {}
 
+// ---- OFB for 64-bit-block ciphers --------------------------------------
+
+/// OFB mode around a 64-bit-block cipher: the [`Ofb`] construction with an
+/// 8-byte register.
+///
+/// This is OpenSSL's `des-ofb`, `bf-ofb`, `cast5-ofb`, `idea-ofb` and
+/// `rc2-ofb`. Encryption and decryption are the same operation; a (key, IV)
+/// pair must never be reused.
+#[derive(Clone)]
+pub struct Ofb64<C: BlockCipher64> {
+    cipher: C,
+    /// Current keystream block, fed back into the cipher for the next.
+    block: [u8; 8],
+    /// Bytes of `block` already consumed (`8` ⇒ a fresh block is needed).
+    pos: usize,
+}
+
+impl<C: BlockCipher64> Ofb64<C> {
+    /// Creates an OFB stream from `cipher` and an 8-byte IV.
+    #[inline]
+    pub fn new(cipher: C, iv: &[u8; 8]) -> Self {
+        Ofb64 {
+            cipher,
+            block: *iv,
+            pos: 8, // force generation on first use
+        }
+    }
+
+    /// XORs the keystream into `data` in place, encrypting or decrypting it.
+    /// May be called repeatedly; the keystream continues across calls.
+    pub fn apply_keystream(&mut self, data: &mut [u8]) {
+        for b in data {
+            if self.pos == 8 {
+                self.cipher.encrypt_block(&mut self.block);
+                self.pos = 0;
+            }
+            *b ^= self.block[self.pos];
+            self.pos += 1;
+        }
+    }
+}
+
+impl<C: BlockCipher64> Drop for Ofb64<C> {
+    fn drop(&mut self) {
+        self.block.zeroize();
+    }
+}
+
+impl<C: BlockCipher64> ZeroizeOnDrop for Ofb64<C> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +187,24 @@ mod tests {
             start += len;
         }
         assert_eq!(chunked[..], reference[..]);
+    }
+
+    /// OFB over DES: `openssl enc -des-ofb` (OpenSSL 3.5), key
+    /// `0123456789abcdef`, IV `fedcba9876543210`, Eric Young's 29-byte
+    /// "7654321 Now is the time for " message, at every split.
+    #[test]
+    fn ofb64_des_matches_openssl() {
+        use crate::cipher::Des;
+        let key = from_hex::<8>("0123456789abcdef");
+        let iv = from_hex::<8>("fedcba9876543210");
+        let pt: &[u8; 29] = b"7654321 Now is the time for \0";
+        let ct = from_hex::<29>("25f0139b36b9721be9626a6590e51f582e165619b5598c1a4b1274a7e2");
+        for split in 0..=pt.len() {
+            let mut buf = *pt;
+            let mut s = Ofb64::new(Des::new(&key), &iv);
+            s.apply_keystream(&mut buf[..split]);
+            s.apply_keystream(&mut buf[split..]);
+            assert_eq!(buf, ct, "split {split}");
+        }
     }
 }

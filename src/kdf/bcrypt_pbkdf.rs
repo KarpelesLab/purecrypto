@@ -31,7 +31,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::cipher::blowfish::Blowfish;
+use crate::cipher::blowfish::BlowfishState;
 use crate::hash::{Digest, Sha512};
 use crate::zeroize::Zeroize;
 
@@ -160,7 +160,7 @@ fn wipe(buf: &mut [u8]) {
 ///    asymmetry with point 1.
 fn bcrypt_hash(sha2pass: &[u8; 64], sha2salt: &[u8; 64]) -> [u8; BCRYPT_HASHSIZE] {
     // Key schedule.
-    let mut state = Blowfish::new();
+    let mut state = BlowfishState::new();
     state.eks_setup(sha2salt, sha2pass);
     for _ in 0..64 {
         state.expand_key(sha2salt);

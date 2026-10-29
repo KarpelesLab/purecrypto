@@ -18,9 +18,15 @@
 //! interop.
 //!
 //! SEED ([`Seed`]), MORUS ([`Morus640`] / [`Morus1280`]), the original
-//! CAESAR AEGIS-128 ([`Aegis128`], superseded by [`Aegis128L`]) and the TEA
-//! family ([`Tea`], [`Xtea`], [`Xxtea`]) are kept for interop and
-//! test-vector coverage only, behind the opt-in `legacy-ciphers` feature.
+//! CAESAR AEGIS-128 ([`Aegis128`], superseded by [`Aegis128L`]), the TEA
+//! family ([`Tea`], [`Xtea`], [`Xxtea`]) and the 64-bit-block ciphers of
+//! OpenSSL's legacy provider ([`Blowfish`], [`Cast5`], [`Idea`], [`Rc2`])
+//! are kept for interop and test-vector coverage only, behind the opt-in
+//! `legacy-ciphers` feature.
+//!
+//! 64-bit-block ciphers implement [`BlockCipher64`] and compose with
+//! [`Cbc64`], [`Cfb64`] and [`Ofb64`]; ECB is
+//! [`BlockCipher64::encrypt_block`] applied to each 8-byte block.
 //!
 //! # AEAD buffer contract on tag failure
 //!
@@ -65,7 +71,11 @@
     doc = "[`Aegis128`]: crate",
     doc = "[`Tea`]: crate",
     doc = "[`Xtea`]: crate",
-    doc = "[`Xxtea`]: crate"
+    doc = "[`Xxtea`]: crate",
+    doc = "[`Blowfish`]: crate",
+    doc = "[`Cast5`]: crate",
+    doc = "[`Idea`]: crate",
+    doc = "[`Rc2`]: crate"
 )]
 #![cfg_attr(not(feature = "alloc"), doc = "", doc = "[`AesSiv`]: crate#no_std")]
 
@@ -74,14 +84,16 @@ mod aes;
 #[cfg(feature = "aez")]
 mod aez;
 mod aria;
-// Blowfish is not exposed as a cipher of its own: it exists purely as the core
-// of `kdf::bcrypt_pbkdf`, which itself needs `alloc`. Outside that combination
+// Blowfish is the core of `kdf::bcrypt_pbkdf` (which itself needs `alloc`) and,
+// behind `legacy-ciphers`, a public block cipher. Outside those combinations
 // every item in the module is dead code.
-#[cfg(all(feature = "kdf", feature = "alloc"))]
+#[cfg(any(feature = "legacy-ciphers", all(feature = "kdf", feature = "alloc")))]
 pub(crate) mod blowfish;
 mod camellia;
 mod cbc;
 // The JOSE composite needs HMAC, which lives behind the `hash` feature.
+#[cfg(feature = "legacy-ciphers")]
+mod cast5;
 #[cfg(feature = "hash")]
 mod cbc_hmac;
 mod ccm;
@@ -97,11 +109,15 @@ mod eax;
 mod gcm;
 mod gcm_siv;
 mod gmac;
+#[cfg(feature = "legacy-ciphers")]
+mod idea;
 mod kw;
 #[cfg(feature = "legacy-ciphers")]
 mod morus;
 mod ofb;
 mod poly1305;
+#[cfg(feature = "legacy-ciphers")]
+mod rc2;
 // `pub(crate)` so that `kdf::scrypt` can reach the Salsa20/8 core.
 pub(crate) mod salsa20;
 mod sbox_bitsliced;
@@ -123,12 +139,16 @@ pub use aes::{Aes128, Aes192, Aes256};
 #[cfg(feature = "aez")]
 pub use aez::Aez;
 pub use aria::{Aria128, Aria192, Aria256};
+#[cfg(feature = "legacy-ciphers")]
+pub use blowfish::Blowfish;
 pub use camellia::{Camellia128, Camellia192, Camellia256};
+#[cfg(feature = "legacy-ciphers")]
+pub use cast5::Cast5;
 pub use cbc::Cbc;
 #[cfg(feature = "hash")]
 pub use cbc_hmac::{A128CbcHs256, A192CbcHs384, A256CbcHs512, CbcHmacSha2};
 pub use ccm::{Aes128Ccm, Aes128Ccm8, Aes192Ccm, Aes256Ccm, Aes256Ccm8, Ccm};
-pub use cfb::Cfb;
+pub use cfb::{Cfb, Cfb64};
 pub use chacha20::{ChaCha20, XChaCha20, hchacha20};
 pub use chacha20poly1305::ChaCha20Poly1305;
 pub use cmac::{AesCmac128, AesCmac256, Cmac};
@@ -138,6 +158,8 @@ pub use eax::{Aes128Eax, Aes192Eax, Aes256Eax, Eax};
 pub use gcm::{Aes128Gcm, Aes256Gcm, Gcm};
 pub use gcm_siv::{Aes128GcmSiv, Aes192GcmSiv, Aes256GcmSiv, AesGcmSiv};
 pub use gmac::{AesGmac128, AesGmac256, Gmac};
+#[cfg(feature = "legacy-ciphers")]
+pub use idea::Idea;
 pub use kw::{
     Aes128Kw, Aes128KwInv, Aes128Kwp, Aes128KwpInv, Aes192Kw, Aes192KwInv, Aes192Kwp, Aes192KwpInv,
     Aes256Kw, Aes256KwInv, Aes256Kwp, Aes256KwpInv, AesKw, AesKwp, InverseCipher, KwError,
@@ -145,9 +167,11 @@ pub use kw::{
 };
 #[cfg(feature = "legacy-ciphers")]
 pub use morus::{Morus640, Morus1280};
-pub use ofb::Ofb;
+pub use ofb::{Ofb, Ofb64};
 pub use poly1305::Poly1305;
 pub use salsa20::{Salsa20, XSalsa20, XSalsa20Poly1305, hsalsa20};
+#[cfg(feature = "legacy-ciphers")]
+pub use rc2::Rc2;
 #[cfg(feature = "legacy-ciphers")]
 pub use seed::Seed;
 #[cfg(feature = "alloc")]
@@ -238,11 +262,14 @@ pub trait BlockCipher {
 }
 
 /// A 64-bit-block cipher: parallel to [`BlockCipher`] but for legacy
-/// 8-byte-block primitives (DES, 3-DES). Wire this up via [`Cbc64`] for
-/// CBC-mode interop; new code should use the 128-bit `BlockCipher` and
-/// `Cbc` instead.
+/// 8-byte-block primitives (DES, 3-DES, and behind `legacy-ciphers`
+/// Blowfish, CAST5, IDEA, RC2, TEA/XTEA). Wire this up via [`Cbc64`],
+/// [`Cfb64`] or [`Ofb64`] for interop (ECB is just
+/// [`encrypt_block`](Self::encrypt_block) per block); new code should use
+/// the 128-bit `BlockCipher` and its modes instead.
 pub trait BlockCipher64 {
-    /// Key size in bytes.
+    /// Key size in bytes. For ciphers with a variable-length key this is
+    /// the default length (the one OpenSSL's `EVP_CIPHER` reports).
     const KEY_SIZE: usize;
 
     /// Encrypts one 8-byte block in place.
@@ -264,6 +291,20 @@ impl core::fmt::Display for InvalidLength {
 }
 
 impl core::error::Error for InvalidLength {}
+
+/// Error returned by the fallible constructors of variable-key-length block
+/// ciphers (e.g. `Blowfish::try_new`) when the key length, or another key
+/// parameter such as RC2's effective key bits, is outside the accepted range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidKeyLength;
+
+impl core::fmt::Display for InvalidKeyLength {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("key length not supported by this cipher")
+    }
+}
+
+impl core::error::Error for InvalidKeyLength {}
 
 /// Error returned by AEAD decryption when the authentication tag does not
 /// match — the ciphertext is inauthentic and the plaintext must be discarded.

@@ -51,7 +51,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 | `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2); behind the opt-in `legacy-hashes` feature RIPEMD-128/256/320, Tiger, Snefru-256, GOST R 34.11-94 / RFC 5831, HAVAL | RFC / NIST samples; **Wycheproof** (HMAC ×12, KMAC); M14 oracle-derived (K12-validated), cross-checked vs noble-hashes; `legacy-hashes`: php-src `ext/hash/tests` (digest, HMAC, HKDF), Bosselaers' RIPEMD page, the Tiger reference page, RFC 5831 | OpenSSL (Whirlpool, SM3, SHAKE, BLAKE2), PyCryptodome (MD2), gostcrypto (Streebog), noble-hashes (M14, 14-round); RHash (Tiger, Snefru, GOST R 34.11-94) | — | MAC verify CT |
 | `mac` | RFC 4418 (UMAC), SipHash (Aumasson–Bernstein), draft-krovetz-vmac-01 (VMAC, behind the opt-in `vmac` feature) | RFC / paper vectors; **Wycheproof** (SipHash ×5, VMAC ×2) | — | — | built on CT AES; SipHash ARX; VMAC mask-based arithmetic |
 | `rng` | SP 800-90A (HMAC-DRBG) | CAVP | — | — | n/a (public output) |
-| `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713, EAX, AEGIS, RFC 7518 §5.2, draft-irtf-cfrg-xchacha, Salsa20 / XSalsa20 / NaCl secretbox ("Cryptography in NaCl" vectors; libsodium 1.0.20 and OpenSSL 3.5 cross-checks of the ChaCha20 / Salsa20 counter boundaries); RFC 4269 (SEED), MORUS v2, AEGIS-128 and TEA/XTEA/XXTEA behind the opt-in `legacy-ciphers` feature | RFC / NIST; **Wycheproof** (GCM, GCM-SIV, CCM, EAX, ChaCha20/XChaCha20-Poly1305, AEGIS, MORUS, GMAC, CBC, CMAC, SIV, KW/KWP, XTS, CBC-HS; ARIA/Camellia/SEED/SM4 modes) | OpenSSL (truncated GCM tags, AES-192-GCM-SIV, SM4-XTS GB/T 17964, KW/KWP custom IV and `-INV` variants) | — | AES table-free; ARX |
+| `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713, EAX, AEGIS, RFC 7518 §5.2, draft-irtf-cfrg-xchacha, Salsa20 / XSalsa20 / NaCl secretbox ("Cryptography in NaCl" vectors; libsodium 1.0.20 and OpenSSL 3.5 cross-checks of the ChaCha20 / Salsa20 counter boundaries); RFC 4269 (SEED), MORUS v2, AEGIS-128, TEA/XTEA/XXTEA, Blowfish, RFC 2144 (CAST5), IDEA and RFC 2268 (RC2) behind the opt-in `legacy-ciphers` feature | RFC / NIST; **Wycheproof** (GCM, GCM-SIV, CCM, EAX, ChaCha20/XChaCha20-Poly1305, AEGIS, MORUS, GMAC, CBC, CMAC, SIV, KW/KWP, XTS, CBC-HS; ARIA/Camellia/SEED/SM4 modes); Eric Young's Blowfish set (ECB, every key length 1–24, CBC/CFB64/OFB64), RFC 2144 B.1 and the B.2 maintenance test (CAST5), all RFC 2268 §5 vectors (RC2), the Lai–Massey IDEA vector | OpenSSL (truncated GCM tags, AES-192-GCM-SIV, SM4-XTS GB/T 17964, KW/KWP custom IV and `-INV` variants; Blowfish keys up to 72 bytes, CAST5 key lengths, IDEA, RC2 effective bits; ECB/CBC/CFB/OFB of all four, `rc2-40-cbc`, `rc2-64-cbc`) | — | AES table-free; ARX; IDEA branch-free; Blowfish/CAST5/RC2 table-based (not CT) |
 | `kdf` | RFC 8018/5869/7914, SP 800-108 | RFC / CAVP; **Wycheproof** (HKDF, PBKDF2, PBES2) | — | `pbes2_decrypt` | built on CT HMAC |
 | `ascon` | NIST SP 800-232 (final); the v1.2 Ascon-128/128a/80pq AEADs behind the opt-in `legacy-ciphers` feature | ref KAT; **Wycheproof** | — | — | permutation (no tables) |
 | `fpe` | NIST SP 800-38G FF1 (Rev. 1 `radix^n >= 10^6` floor; 2016 floor via `new_legacy`) | NIST FF1 samples (AES-128/192/256, radix 10 and 36); **Wycheproof** (22 files: 13 radices as digit lists, 9 as alphabets) | — | — | AES CT; the digit arithmetic is data-dependent by the nature of FPE |
@@ -955,9 +955,9 @@ Every entry runs the positive control, then the full case list.
   really is the one under test (`cpu dispatch: forced portable`, `tables:
   none`). Under `cargo test --all-features` the client requests are no-ops
   and the same binary is a plain smoke test.
-- **Covered** (one fixed-seed instance each, 106 cases): the `ct`
-  primitives; AES-128/192/256, Camellia, ARIA, SM4, SEED, TEA, XTEA and
-  XXTEA block encryption; AES-GCM, AES-GCM-SIV, AES-CCM, AES-EAX, ChaCha20-Poly1305,
+- **Covered** (one fixed-seed instance each, 107 cases): the `ct`
+  primitives; AES-128/192/256, Camellia, ARIA, SM4, SEED, TEA, XTEA,
+  XXTEA and IDEA block encryption; AES-GCM, AES-GCM-SIV, AES-CCM, AES-EAX, ChaCha20-Poly1305,
   XChaCha20-Poly1305, AEGIS-128L, AEGIS-128, MORUS-640/1280, Ascon-AEAD128,
   Ascon-128/128a, SEED-GCM, XSalsa20-Poly1305 (seal, open, and open with a forged tag);
   the ChaCha20 stream variants (original, OpenSSL carry, XChaCha20, HChaCha20),
@@ -1125,7 +1125,10 @@ code site:
 - **DES/3DES and Blowfish (bcrypt)** use S-box tables indexed by key-derived
   data — inherent to those designs, kept for legacy interop and
   `bcrypt_pbkdf` compatibility (the AES/ARIA/Camellia/SM4 cores are
-  table-free).
+  table-free). The same holds for the opt-in `legacy-ciphers` **Blowfish,
+  CAST5 and RC2** block ciphers (S-box lookups; RC2's "mash" rounds index
+  the expanded key with secret data bits), so they are not in the Valgrind
+  harness. IDEA's multiplication mod 2¹⁶+1 is branch-free and is.
 - **Falcon key generation and secret-key import** run the NTRU solver on
   variable-time big integers, as the module documents; signing and
   verification are data-oblivious. Signing's Gaussian sampler follows the

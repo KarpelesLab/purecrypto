@@ -5,7 +5,7 @@
 //! decryption differ (the feedback is always the ciphertext), so they are
 //! separate methods. A (key, IV) pair must never be reused.
 
-use super::BlockCipher;
+use super::{BlockCipher, BlockCipher64};
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// CFB-128 mode wrapper around a block cipher.
@@ -144,6 +144,80 @@ impl<C: BlockCipher> Drop for Cfb<C> {
 
 impl<C: BlockCipher> ZeroizeOnDrop for Cfb<C> {}
 
+// ---- CFB-64 for 64-bit-block ciphers -----------------------------------
+
+/// Full-block CFB mode (CFB-64) around a 64-bit-block cipher: the
+/// [`Cfb`] construction with an 8-byte feedback register.
+///
+/// This is what OpenSSL calls `des-cfb`, `bf-cfb`, `cast5-cfb`,
+/// `idea-cfb` and `rc2-cfb` (CFB64 with its `num` byte position carried
+/// across calls, so arbitrary chunking gives the same stream). A (key, IV)
+/// pair must never be reused.
+#[derive(Clone)]
+pub struct Cfb64<C: BlockCipher64> {
+    cipher: C,
+    /// Previous ciphertext block (IV initially), built up byte-by-byte.
+    feedback: [u8; 8],
+    /// `E(feedback)` as of the start of the current block.
+    keystream: [u8; 8],
+    /// Bytes of the current block already processed.
+    pos: usize,
+}
+
+impl<C: BlockCipher64> Cfb64<C> {
+    /// Creates a CFB-64 stream from `cipher` and an 8-byte IV.
+    #[inline]
+    pub fn new(cipher: C, iv: &[u8; 8]) -> Self {
+        Cfb64 {
+            cipher,
+            feedback: *iv,
+            keystream: [0u8; 8],
+            pos: 8, // force generation on first use
+        }
+    }
+
+    #[inline]
+    fn next_keystream_byte(&mut self) -> u8 {
+        if self.pos == 8 {
+            self.keystream = self.feedback;
+            self.cipher.encrypt_block(&mut self.keystream);
+            self.pos = 0;
+        }
+        self.keystream[self.pos]
+    }
+
+    /// Encrypts `data` in place. May be called repeatedly across chunk
+    /// boundaries.
+    pub fn encrypt(&mut self, data: &mut [u8]) {
+        for b in data {
+            let c = *b ^ self.next_keystream_byte();
+            self.feedback[self.pos] = c;
+            self.pos += 1;
+            *b = c;
+        }
+    }
+
+    /// Decrypts `data` in place. May be called repeatedly across chunk
+    /// boundaries.
+    pub fn decrypt(&mut self, data: &mut [u8]) {
+        for b in data {
+            let k = self.next_keystream_byte();
+            let c = *b;
+            self.feedback[self.pos] = c;
+            self.pos += 1;
+            *b = c ^ k;
+        }
+    }
+}
+
+impl<C: BlockCipher64> Drop for Cfb64<C> {
+    fn drop(&mut self) {
+        self.keystream.zeroize();
+    }
+}
+
+impl<C: BlockCipher64> ZeroizeOnDrop for Cfb64<C> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +318,29 @@ mod tests {
             start += len;
         }
         assert_eq!(dec[..], pt[..]);
+    }
+
+    /// CFB-64 over DES: `openssl enc -des-cfb` (OpenSSL 3.5), key
+    /// `0123456789abcdef`, IV `fedcba9876543210`, Eric Young's 29-byte
+    /// "7654321 Now is the time for " message; every split of the stream
+    /// must give the same output.
+    #[test]
+    fn cfb64_des_matches_openssl() {
+        use crate::cipher::Des;
+        let key = from_hex::<8>("0123456789abcdef");
+        let iv = from_hex::<8>("fedcba9876543210");
+        let pt: &[u8; 29] = b"7654321 Now is the time for \0";
+        let ct = from_hex::<29>("25f0139b36b9721bc32be0af814a09ad7448ce96642c5e8b6d9f6210b7");
+        for split in 0..=pt.len() {
+            let mut buf = *pt;
+            let mut enc = Cfb64::new(Des::new(&key), &iv);
+            enc.encrypt(&mut buf[..split]);
+            enc.encrypt(&mut buf[split..]);
+            assert_eq!(buf, ct, "split {split}");
+            let mut dec = Cfb64::new(Des::new(&key), &iv);
+            dec.decrypt(&mut buf[..split]);
+            dec.decrypt(&mut buf[split..]);
+            assert_eq!(&buf, pt, "split {split}");
+        }
     }
 }

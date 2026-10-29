@@ -11,13 +11,27 @@
 //!   Source URL:
 //!   `https://github.com/openbsd/src/blob/master/lib/libc/crypt/blowfish.c`
 //!
-//! This module is intentionally **not** exposed at the crate root as a
-//! general-purpose cipher (Blowfish has known weaknesses for general
-//! encryption — small 64-bit block, related-key attacks). It exists to
-//! support the KDF in [`crate::kdf::bcrypt_pbkdf`]. The implementation is
-//! not constant time with respect to key bits, which is acceptable
-//! because the only caller is a KDF whose "key" is itself a pseudorandom
-//! SHA-512 output.
+//! The crate-internal `BlowfishState` is the core of
+//! [`crate::kdf::bcrypt_pbkdf`]. Behind the opt-in `legacy-ciphers` feature
+//! the public `Blowfish` type wraps it as a `BlockCipher64` for interop
+//! with OpenSSL's `bf-ecb` / `bf-cbc` / `bf-cfb` / `bf-ofb` (via `Cbc64`,
+//! `Cfb64` and `Ofb64`).
+//!
+//! # Constant time
+//!
+//! **Not constant time.** The round function indexes the four key-dependent
+//! 256-entry S-boxes with bytes of the secret state, so every block leaks
+//! through the data cache, as with every table-based Blowfish (OpenSSL's
+//! included). For bcrypt this is the accepted trade-off of the algorithm
+//! (OpenSSH makes the same one); for general encryption it is one more
+//! reason to keep Blowfish to legacy interop.
+//!
+//! # When to use the public cipher
+//!
+//! Only to read or write existing Blowfish data. Its 64-bit block is
+//! subject to Sweet32-style birthday attacks after a few tens of gigabytes
+//! under one key, it has classes of weak keys, and it is unauthenticated.
+//! Use `Aes256Gcm` or `ChaCha20Poly1305` for new designs.
 
 #![allow(clippy::needless_range_loop)]
 
@@ -25,12 +39,13 @@
 const ROUNDS: usize = 16;
 
 /// Blowfish state: the 18-entry P-array plus four 256-entry S-boxes.
-pub(crate) struct Blowfish {
+#[derive(Clone)]
+pub(crate) struct BlowfishState {
     pub(crate) p: [u32; ROUNDS + 2],
     pub(crate) s: [[u32; 256]; 4],
 }
 
-impl Blowfish {
+impl BlowfishState {
     /// Initial state with the standard π-derived P-array and S-boxes
     /// (Schneier §3; OpenBSD `Blowfish_initstate`).
     pub(crate) fn new() -> Self {
@@ -69,9 +84,8 @@ impl Blowfish {
         *r = xl;
     }
 
-    /// Decrypts the 64-bit block `(L, R)` in place. Not used by bcrypt;
-    /// retained for KAT round-trip tests.
-    #[cfg(test)]
+    /// Decrypts the 64-bit block `(L, R)` in place. Not used by bcrypt.
+    #[cfg(any(test, feature = "legacy-ciphers"))]
     pub(crate) fn decipher(&self, l: &mut u32, r: &mut u32) {
         let mut xl = *l;
         let mut xr = *r;
@@ -131,6 +145,7 @@ impl Blowfish {
     /// with two `salt`-stream words before each encipher, with `salt`
     /// indexed cyclically across the entire walk (P then all four S
     /// boxes).
+    #[cfg(all(feature = "kdf", feature = "alloc"))]
     pub(crate) fn eks_setup(&mut self, salt: &[u8], key: &[u8]) {
         // Step 1: standard P-array XOR with the key stream.
         let mut j_key: usize = 0;
@@ -185,6 +200,100 @@ fn stream2word(data: &[u8], j: &mut usize) -> u32 {
     }
     *j = idx;
     tmp
+}
+
+// --- public block cipher (legacy-ciphers) ---------------------------------
+
+/// The Blowfish block cipher: 64-bit block, variable-length key.
+///
+/// Accepts keys of 1 to 72 bytes. Schneier's specification caps the key at
+/// 448 bits (56 bytes), but the key schedule consumes 72 key bytes (18
+/// P-array words), so bytes 57–72 still take effect; OpenSSL's
+/// `BF_set_key` (and so `EVP_CIPHER_CTX_set_key_length` on `bf-*`) accepts
+/// them, and silently ignores anything past 72. To reproduce that
+/// truncation for a longer key, pass `&key[..72]`. Keys shorter than 72
+/// bytes are repeated cyclically, per the specification.
+///
+/// **Not constant time** (key-dependent S-box lookups); legacy interop only.
+/// See the module-level docs. The expanded key is wiped on drop.
+#[cfg(feature = "legacy-ciphers")]
+#[derive(Clone)]
+pub struct Blowfish {
+    state: BlowfishState,
+}
+
+#[cfg(feature = "legacy-ciphers")]
+impl Blowfish {
+    /// Shortest accepted key, in bytes.
+    pub const MIN_KEY_SIZE: usize = 1;
+    /// Longest accepted key, in bytes (the 18 P-array words).
+    pub const MAX_KEY_SIZE: usize = 4 * (ROUNDS + 2);
+
+    /// Expands `key` (1 to 72 bytes).
+    ///
+    /// # Panics
+    /// If `key.len()` is outside `1..=72`; use [`try_new`](Self::try_new)
+    /// for keys of untrusted length.
+    pub fn new(key: &[u8]) -> Self {
+        Self::try_new(key).expect("Blowfish key must be 1 to 72 bytes")
+    }
+
+    /// Expands `key`, or returns [`InvalidKeyLength`](super::InvalidKeyLength)
+    /// if it is not 1 to 72 bytes long.
+    pub fn try_new(key: &[u8]) -> Result<Self, super::InvalidKeyLength> {
+        if !(Self::MIN_KEY_SIZE..=Self::MAX_KEY_SIZE).contains(&key.len()) {
+            return Err(super::InvalidKeyLength);
+        }
+        let mut state = BlowfishState::new();
+        state.expand_key(key);
+        Ok(Self { state })
+    }
+}
+
+#[cfg(feature = "legacy-ciphers")]
+impl super::BlockCipher64 for Blowfish {
+    /// OpenSSL's default `bf-*` key length; any of 1 to 72 bytes works.
+    const KEY_SIZE: usize = 16;
+
+    fn encrypt_block(&self, block: &mut [u8; 8]) {
+        let (mut l, mut r) = load_block(block);
+        self.state.encipher(&mut l, &mut r);
+        store_block(block, l, r);
+    }
+
+    fn decrypt_block(&self, block: &mut [u8; 8]) {
+        let (mut l, mut r) = load_block(block);
+        self.state.decipher(&mut l, &mut r);
+        store_block(block, l, r);
+    }
+}
+
+#[cfg(feature = "legacy-ciphers")]
+impl Drop for Blowfish {
+    fn drop(&mut self) {
+        use crate::zeroize::Zeroize;
+        self.state.p.zeroize();
+        self.state.s.zeroize();
+    }
+}
+
+#[cfg(feature = "legacy-ciphers")]
+impl crate::zeroize::ZeroizeOnDrop for Blowfish {}
+
+#[cfg(feature = "legacy-ciphers")]
+#[inline]
+fn load_block(block: &[u8; 8]) -> (u32, u32) {
+    (
+        u32::from_be_bytes([block[0], block[1], block[2], block[3]]),
+        u32::from_be_bytes([block[4], block[5], block[6], block[7]]),
+    )
+}
+
+#[cfg(feature = "legacy-ciphers")]
+#[inline]
+fn store_block(block: &mut [u8; 8], l: u32, r: u32) {
+    block[..4].copy_from_slice(&l.to_be_bytes());
+    block[4..].copy_from_slice(&r.to_be_bytes());
 }
 
 // --- π-derived initial constants (OpenBSD `Blowfish_initstate`) ----------
@@ -343,7 +452,7 @@ mod tests {
     /// `0x0000000000000000` encrypts to `0x4ef997456198dd78`.
     #[test]
     fn schneier_kat_zero_zero() {
-        let mut bf = Blowfish::new();
+        let mut bf = BlowfishState::new();
         bf.expand_key(&[0u8; 8]);
         let mut l: u32 = 0x00000000;
         let mut r: u32 = 0x00000000;
@@ -362,7 +471,7 @@ mod tests {
     /// ciphertext=51866fd5b85ecb8a.
     #[test]
     fn schneier_kat_ff_ff() {
-        let mut bf = Blowfish::new();
+        let mut bf = BlowfishState::new();
         bf.expand_key(&[0xffu8; 8]);
         let mut l: u32 = 0xffffffff;
         let mut r: u32 = 0xffffffff;
@@ -376,12 +485,168 @@ mod tests {
     /// ciphertext=7d856f9a613063f2.
     #[test]
     fn schneier_kat_3000_1000() {
-        let mut bf = Blowfish::new();
+        let mut bf = BlowfishState::new();
         bf.expand_key(&[0x30, 0, 0, 0, 0, 0, 0, 0]);
         let mut l: u32 = 0x10000000;
         let mut r: u32 = 0x00000001;
         bf.encipher(&mut l, &mut r);
         assert_eq!(l, 0x7d856f9a);
         assert_eq!(r, 0x613063f2);
+    }
+}
+
+#[cfg(all(test, feature = "legacy-ciphers"))]
+mod public_tests {
+    use super::Blowfish;
+    use crate::cipher::{BlockCipher64, Cbc64, Cfb64, InvalidKeyLength, Ofb64};
+    use crate::test_util::{from_hex, from_hex_vec};
+
+    fn block_kat(key: &str, pt: &str, ct: &str) {
+        let bf = Blowfish::new(&from_hex_vec(key));
+        let pt: [u8; 8] = from_hex(pt);
+        let ct: [u8; 8] = from_hex(ct);
+        let mut b = pt;
+        bf.encrypt_block(&mut b);
+        assert_eq!(b, ct, "key {key}");
+        bf.decrypt_block(&mut b);
+        assert_eq!(b, pt, "key {key}");
+    }
+
+    /// Eric Young's ECB vectors (OpenSSL `bftest.c`, from Schneier's
+    /// published set).
+    #[test]
+    fn eric_young_ecb() {
+        for (k, p, c) in [
+            ("0000000000000000", "0000000000000000", "4ef997456198dd78"),
+            ("ffffffffffffffff", "ffffffffffffffff", "51866fd5b85ecb8a"),
+            ("3000000000000000", "1000000000000001", "7d856f9a613063f2"),
+            ("1111111111111111", "1111111111111111", "2466dd878b963c9d"),
+            ("0123456789abcdef", "1111111111111111", "61f9c3802281b096"),
+            ("1111111111111111", "0123456789abcdef", "7d0cc630afda1ec7"),
+            ("fedcba9876543210", "0123456789abcdef", "0aceab0fc6a0a28d"),
+            ("7ca110454a1a6e57", "01a1d6d039776742", "59c68245eb05282b"),
+            ("0101010101010101", "0123456789abcdef", "fa34ec4847b268b2"),
+            ("ffffffffffffffff", "0000000000000000", "f21e9a77b71c49bc"),
+            ("0123456789abcdef", "0000000000000000", "245946885754369a"),
+            ("fedcba9876543210", "ffffffffffffffff", "6b5c5a9c5d9e0a5a"),
+        ] {
+            block_kat(k, p, c);
+        }
+    }
+
+    /// Eric Young's variable-key-length set: every prefix (1 to 24 bytes)
+    /// of one key, encrypting `fedcba9876543210`.
+    #[test]
+    fn eric_young_variable_key() {
+        let key = from_hex_vec("f0e1d2c3b4a5968778695a4b3c2d1e0f0011223344556677");
+        let expected = [
+            "f9ad597c49db005e",
+            "e91d21c1d961a6d6",
+            "e9c2b70a1bc65cf3",
+            "be1e639408640f05",
+            "b39e44481bdb1e6e",
+            "9457aa83b1928c0d",
+            "8bb77032f960629d",
+            "e87a244e2cc85e82",
+            "15750e7a4f4ec577",
+            "122ba70b3ab64ae0",
+            "3a833c9affc537f6",
+            "9409da87a90f6bf2",
+            "884f80625060b8b4",
+            "1f85031c19e11968",
+            "79d9373a714ca34f",
+            "93142887ee3be15c",
+            "03429e838ce2d14b",
+            "a4299e27469ff67b",
+            "afd5aed1c1bc96a8",
+            "10851c0e3858da9f",
+            "e6f51ed79b9db21f",
+            "64a6e14afd36b46f",
+            "80c7d7d45a5479ad",
+            "05044b62fa52d080",
+        ];
+        for (n, ct) in expected.iter().enumerate() {
+            let bf = Blowfish::new(&key[..n + 1]);
+            let mut b: [u8; 8] = from_hex("fedcba9876543210");
+            bf.encrypt_block(&mut b);
+            assert_eq!(b, from_hex::<8>(ct), "key length {}", n + 1);
+        }
+    }
+
+    /// Key lengths past Schneier's 56 bytes, up to OpenSSL's 72-byte
+    /// `BF_set_key` limit. Generated with OpenSSL 3.5 `BF_set_key` /
+    /// `BF_ecb_encrypt`, key byte `i` = `37 i + 12 (mod 256)`.
+    #[test]
+    fn long_keys_match_openssl() {
+        let key: [u8; 72] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(12));
+        for (len, ct) in [
+            (1, "ad726166a31b6ff4"),
+            (5, "9bd5d8d57f3a80bf"),
+            (8, "75bbae094f81caa3"),
+            (16, "07292d7b17b08f78"),
+            (56, "d73e62820ab10396"),
+            (57, "84b5ad9af015ddf4"),
+            (72, "dc2baf8cbe553871"),
+        ] {
+            let bf = Blowfish::new(&key[..len]);
+            let mut b: [u8; 8] = from_hex("0011223344556677");
+            bf.encrypt_block(&mut b);
+            assert_eq!(b, from_hex::<8>(ct), "key length {len}");
+            bf.decrypt_block(&mut b);
+            assert_eq!(b, from_hex::<8>("0011223344556677"));
+        }
+    }
+
+    #[test]
+    fn key_length_bounds() {
+        assert_eq!(Blowfish::try_new(&[]).err(), Some(InvalidKeyLength));
+        assert_eq!(Blowfish::try_new(&[0; 73]).err(), Some(InvalidKeyLength));
+        assert!(Blowfish::try_new(&[0; 1]).is_ok());
+        assert!(Blowfish::try_new(&[0; 72]).is_ok());
+    }
+
+    const EY_KEY: &str = "0123456789abcdeff0e1d2c3b4a59687";
+    const EY_IV: [u8; 8] = [0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10];
+    /// "7654321 Now is the time for " plus a NUL (29 bytes), zero-padded
+    /// to 32 for CBC.
+    const EY_DATA: &[u8; 32] = b"7654321 Now is the time for \0\0\0\0";
+
+    /// Eric Young's CBC / CFB64 / OFB64 vectors (OpenSSL `bftest.c`; also
+    /// reproduced by `openssl enc -bf-{cbc,cfb,ofb}`).
+    #[test]
+    fn eric_young_modes() {
+        let key = from_hex_vec(EY_KEY);
+
+        let mut buf = *EY_DATA;
+        Cbc64::new(Blowfish::new(&key), &EY_IV)
+            .encrypt(&mut buf)
+            .unwrap();
+        assert_eq!(
+            buf,
+            from_hex::<32>("6b77b4d63006dee605b156e27403979358deb9e7154616d959f1652bd5ff92cc")
+        );
+        Cbc64::new(Blowfish::new(&key), &EY_IV)
+            .decrypt(&mut buf)
+            .unwrap();
+        assert_eq!(&buf, EY_DATA);
+
+        let cfb = from_hex::<29>("e73214a2822139caf26ecf6d2eb9e76e3da3de04d1517200519d57a6c3");
+        let mut buf: [u8; 29] = EY_DATA[..29].try_into().unwrap();
+        // Split the stream at an odd point to exercise the carry-over.
+        let mut enc = Cfb64::new(Blowfish::new(&key), &EY_IV);
+        enc.encrypt(&mut buf[..13]);
+        enc.encrypt(&mut buf[13..]);
+        assert_eq!(buf, cfb);
+        Cfb64::new(Blowfish::new(&key), &EY_IV).decrypt(&mut buf);
+        assert_eq!(buf[..], EY_DATA[..29]);
+
+        let ofb = from_hex::<29>("e73214a2822139ca62b343cc5b65587310dd908d0c241b2263c2cf80da");
+        let mut buf: [u8; 29] = EY_DATA[..29].try_into().unwrap();
+        let mut s = Ofb64::new(Blowfish::new(&key), &EY_IV);
+        s.apply_keystream(&mut buf[..5]);
+        s.apply_keystream(&mut buf[5..]);
+        assert_eq!(buf, ofb);
+        Ofb64::new(Blowfish::new(&key), &EY_IV).apply_keystream(&mut buf);
+        assert_eq!(buf[..], EY_DATA[..29]);
     }
 }

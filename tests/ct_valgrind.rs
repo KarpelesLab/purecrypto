@@ -81,7 +81,7 @@ use purecrypto::chunked::{self, Cobblestone128};
 use purecrypto::cipher::{
     Aegis128, Aegis128L, Aes128, Aes128Ccm, Aes128Eax, Aes128Kw, Aes128Kwp, Aes128Xts, Aes192,
     Aes256, Aes256GcmSiv, AesCmac128, AesSiv, Aez, Aria128, BlockCipher, BlockCipher64,
-    Camellia128, Cbc, Cfb, ChaCha20, ChaCha20Poly1305, Ctr, Gcm, Gmac, Morus640, Morus1280, Ofb,
+    Camellia128, Cbc, Cfb, ChaCha20, ChaCha20Poly1305, Ctr, Gcm, Gmac, Idea, Morus640, Morus1280, Ofb,
     Poly1305, Salsa20, Seed, Sm4, Tea, XChaCha20, XChaCha20Poly1305, XSalsa20, XSalsa20Poly1305,
     Xtea, Xxtea, hchacha20, hsalsa20, kwp_ciphertext_len,
 };
@@ -2497,6 +2497,7 @@ fn legacy_aeads() -> String {
     out.push(aes_block(&Seed::new(&k16)));
     out.push(block64(&Tea::new(&k16)));
     out.push(block64(&Xtea::new(&k16)));
+    out.push(block64(&Idea::new(&k16)));
     let mut msg = secret_bytes::<20>(607);
     let orig = msg;
     Xxtea::new(&k16).encrypt(&mut msg).expect("whole words");
