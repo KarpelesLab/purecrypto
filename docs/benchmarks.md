@@ -19,9 +19,10 @@ cargo run --release --example bench --features std,cipher,hash,ec,rsa,mlkem,aez
 
 Because the relevant hardware instructions are present, the symmetric/hash
 numbers reflect the **hardware-accelerated** backends (AES-NI, PCLMULQDQ for
-GHASH, SHA-NI, AVX2 for ChaCha20/BLAKE3). On a machine **without** them, the
-crate falls back to its constant-time, table-free software paths, which are
-correct and constant-time but slower (see [tradeoffs](#constant-time-tradeoffs)).
+GHASH, SHA-NI, AVX2 for ChaCha20/BLAKE3; see below for AVX-512). On a
+machine **without** them, the crate falls back to its constant-time,
+table-free software paths, which are correct and constant-time but slower
+(see [tradeoffs](#constant-time-tradeoffs)).
 
 ## Symmetric (throughput, 64 KiB)
 
@@ -32,6 +33,27 @@ correct and constant-time but slower (see [tradeoffs](#constant-time-tradeoffs))
 | ChaCha20-Poly1305 (encrypt) | 1582 | 25 309 |
 | AES-256 raw block (16 B) | 1782 | 116 765 967 |
 | AEZ (τ=16, robust AE) | 481 | 7 695 |
+
+### ChaCha20 and Poly1305 on AVX-512 (Zen 5)
+
+The table above is the AVX2 picture. On a CPU with AVX-512 and IFMA the
+crate runs a 16-way ChaCha20 kernel, a 4×8-lane IFMA Poly1305 kernel, and
+for ChaCha20-Poly1305 a stitched loop that runs the Poly1305 multiplies
+between the ChaCha20 rounds. Medians of five runs, each on a random core
+in 100–180 of a shared AMD Zen 5 server (`taskset`), GB/s = 10⁹ bytes/s;
+OpenSSL 3.5 (`openssl speed -evp …`; Poly1305 through `EVP_MAC`) and
+libsodium measured the same way, interleaved with ours:
+
+| Algorithm | 16 KiB | 1 MiB | OpenSSL 16 KiB | OpenSSL 1 MiB |
+|---|--:|--:|--:|--:|
+| ChaCha20 | 8.9 | 8.9 | 8.8 | 8.6 |
+| Poly1305 | 33.4 | 40.2 | 16.0 | 17.7 |
+| ChaCha20-Poly1305 (seal) | 7.4 | 8.2 | 5.8 | 5.8 |
+
+Before these kernels the same machine gave 4.9 / 5.1 / 2.4 GB/s at 16 KiB
+(ChaCha20 / Poly1305 / AEAD). libsodium: Poly1305 5.5, ChaCha20-Poly1305
+1.7 GB/s at 16 KiB. ChaCha20 is at parity with OpenSSL: both are bound by
+the vector ALU (about 0.52 cycles/byte), not by memory or dispatch.
 
 ## Hashes (throughput, 64 KiB)
 
