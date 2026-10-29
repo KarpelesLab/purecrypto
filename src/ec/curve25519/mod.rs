@@ -16,5 +16,9 @@
 #[cfg(feature = "ed25519-table")]
 pub(crate) mod base_table;
 pub(crate) mod field;
+// The X25519 ladder's AVX-512 IFMA backend (runtime-dispatched).
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+pub(crate) mod ifma;
 pub(crate) mod point;
 pub(crate) mod scalar;

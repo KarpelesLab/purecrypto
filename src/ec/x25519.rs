@@ -64,6 +64,40 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     ub[31] &= 127;
     let x1 = Fe::from_bytes(&ub);
 
+    #[cfg(target_arch = "x86_64")]
+    let (mut x2, mut z2) = if crate::ec::curve25519::ifma::supported() {
+        crate::ec::curve25519::ifma::ladder(&k, &x1)
+    } else {
+        ladder(&k, &x1)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let (mut x2, mut z2) = ladder(&k, &x1);
+
+    // result = x2 / z2 (or 0 if z2 == 0).
+    //
+    // The inverse is the constant-time safegcd divstep machine (a fixed
+    // 590-step schedule with barriered masks), NOT a variable-time
+    // extended-Euclidean inverse — z2 depends on the secret scalar and any
+    // timing variation here would leak. It maps 0 to 0, so the small-order /
+    // contributory-failure case yields the all-zero output without a
+    // data-dependent branch.
+    let out = x2.mul(&z2.invert()).to_bytes();
+
+    // Wipe the clamped scalar copy and the ladder state: the projective
+    // coordinates are a function of the secret scalar, and (x2, z2, x3, z3)
+    // at the end of the ladder disclose it directly. `Zeroize` issues
+    // volatile stores, so LLVM cannot elide them as dead.
+    k.zeroize();
+    for v in [&mut x2, &mut z2] {
+        v.zeroize();
+    }
+    out
+}
+
+/// The portable Montgomery ladder over bits 254..0 of the clamped scalar
+/// `k` from the u-coordinate `x1`, returning the projective `(x₂, z₂)`.
+fn ladder(k: &[u8; 32], x1: &Fe) -> (Fe, Fe) {
+    let x1 = *x1;
     let mut x2 = Fe::ONE;
     let mut z2 = Fe::ZERO;
     let mut x3 = x1;
@@ -106,25 +140,10 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     Fe::cswap(&mut x2, &mut x3, sw);
     Fe::cswap(&mut z2, &mut z3, sw);
 
-    // result = x2 / z2 (or 0 if z2 == 0).
-    //
-    // The inverse is the constant-time safegcd divstep machine (a fixed
-    // 590-step schedule with barriered masks), NOT a variable-time
-    // extended-Euclidean inverse — z2 depends on the secret scalar and any
-    // timing variation here would leak. It maps 0 to 0, so the small-order /
-    // contributory-failure case yields the all-zero output without a
-    // data-dependent branch.
-    let out = x2.mul(&z2.invert()).to_bytes();
-
-    // Wipe the clamped scalar copy and the ladder state: the projective
-    // coordinates are a function of the secret scalar, and (x2, z2, x3, z3)
-    // at the end of the ladder disclose it directly. `Zeroize` issues
-    // volatile stores, so LLVM cannot elide them as dead.
-    k.zeroize();
-    for v in [&mut x2, &mut z2, &mut x3, &mut z3] {
+    for v in [&mut x3, &mut z3] {
         v.zeroize();
     }
-    out
+    (x2, z2)
 }
 
 /// `X25519(scalar, 9)` through the edwards25519 fixed-base comb instead of
@@ -338,6 +357,59 @@ mod tests {
     use super::*;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
+
+    /// The AVX-512 IFMA ladder returns exactly the portable ladder's
+    /// projective `(x₂, z₂)` (same formulas, so the same residues) on edge
+    /// and random scalars and u-coordinates: 0, 1, p − 1, the
+    /// non-canonical p, p + 1, 2^255 − 1 (after masking), the small-order
+    /// u values, and random ones.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ifma_ladder_matches_portable() {
+        use crate::ec::curve25519::ifma;
+        use crate::rng::RngCore;
+        if !ifma::supported() {
+            #[cfg(feature = "std")]
+            std::eprintln!("x25519: SKIPPED avx512-ifma ladder (not supported here)");
+            return;
+        }
+        #[cfg(feature = "std")]
+        std::eprintln!("x25519: RUNNING avx512-ifma ladder vs portable");
+        let mut us = [[0u8; 32]; 48];
+        us[1][0] = 1;
+        us[2] = hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f");
+        us[3] = hex32("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f");
+        us[4] = hex32("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f");
+        us[5] = [0xff; 32];
+        // Small-order points (RFC 7748 / libsodium blacklist).
+        us[6] = hex32("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800");
+        us[7] = hex32("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157");
+        us[8] = BASE_POINT;
+        let mut rng = HmacDrbg::<Sha256>::new(b"x25519-ifma-differential", b"nonce", &[]);
+        for u in us[9..].iter_mut() {
+            rng.fill_bytes(u);
+        }
+        let mut ks = [[0u8; 32]; 24];
+        ks[1] = [0xff; 32];
+        for k in ks[2..].iter_mut() {
+            rng.fill_bytes(k);
+        }
+        for u in &us {
+            let mut ub = *u;
+            ub[31] &= 127;
+            let x1 = Fe::from_bytes(&ub);
+            for k in &ks {
+                let mut kc = *k;
+                kc[0] &= 248;
+                kc[31] &= 127;
+                kc[31] |= 64;
+                let (x2, z2) = ladder(&kc, &x1);
+                let (vx2, vz2) = ifma::ladder(&kc, &x1);
+                assert_eq!(x2.to_bytes(), vx2.to_bytes(), "x2 for u={u:02x?}");
+                assert_eq!(z2.to_bytes(), vz2.to_bytes(), "z2 for u={u:02x?}");
+            }
+        }
+    }
 
     fn hex32(s: &str) -> [u8; 32] {
         let mut out = [0u8; 32];
