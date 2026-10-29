@@ -8,7 +8,8 @@
 //! - **x86_64**: `CPUID` (leaves 1 and 7) read through `core::arch`, cached in
 //!   an atomic after the first query. AVX/AVX2/AVX-512 additionally require
 //!   the OS to have enabled the wider register state: `CPUID.1:ECX.OSXSAVE`
-//!   and the matching `XCR0` bits (YMM for AVX2; opmask/ZMM for AVX-512),
+//!   and the matching `XCR0` bits (YMM for AVX2, VAES and VPCLMULQDQ;
+//!   opmask/ZMM for AVX-512),
 //!   read with `XGETBV`. The SSE-class extensions (SHA-NI, AES-NI, PCLMULQDQ,
 //!   SSSE3, SSE4.1) use only the XMM registers. A target whose ABI does not
 //!   itself use SSE (`target_feature = "sse2"` off, e.g. a soft-float kernel
@@ -45,6 +46,8 @@ mod x86 {
     pub(super) const BMI2: u32 = 1 << 10;
     pub(super) const AVX512VL: u32 = 1 << 11;
     pub(super) const AVX512IFMA: u32 = 1 << 12;
+    pub(super) const VAES: u32 = 1 << 13;
+    pub(super) const VPCLMULQDQ: u32 = 1 << 14;
     /// Set once the cache holds a detection result.
     const READY: u32 = 1 << 31;
 
@@ -87,12 +90,12 @@ mod x86 {
         // these intrinsics safe, hence `unused_unsafe`).
         let max_leaf = unsafe { __cpuid(0) }.eax;
         let l1 = unsafe { __cpuid(1) };
-        let (ebx7, max7) = if max_leaf >= 7 {
+        let (ebx7, ecx7, max7) = if max_leaf >= 7 {
             // SAFETY: as above; leaf 7 is in range.
             let l7 = unsafe { __cpuid_count(7, 0) };
-            (l7.ebx, true)
+            (l7.ebx, l7.ecx, true)
         } else {
-            (0, false)
+            (0, 0, false)
         };
         let bit = |reg: u32, n: u32| reg & (1 << n) != 0;
 
@@ -132,6 +135,14 @@ mod x86 {
             let zmm = xcr0 & 0b1110_0000 == 0b1110_0000; // opmask + ZMM_Hi256 + Hi16_ZMM
             if ymm && bit(ebx7, 5) {
                 f |= AVX2;
+            }
+            // VAES / VPCLMULQDQ are VEX/EVEX-only (their narrowest useful
+            // form is YMM), so they too need the YMM state enabled.
+            if ymm && bit(ecx7, 9) {
+                f |= VAES;
+            }
+            if ymm && bit(ecx7, 10) {
+                f |= VPCLMULQDQ;
             }
             if ymm && zmm && bit(ebx7, 16) {
                 f |= AVX512F;
@@ -231,6 +242,18 @@ mod x86_api {
     pub(crate) fn bmi2() -> bool {
         has(BMI2)
     }
+    /// VAES (the AES round instructions on YMM/ZMM registers), with the OS
+    /// saving YMM state. The ZMM forms additionally need [`avx512f`].
+    #[inline]
+    pub(crate) fn vaes() -> bool {
+        has(VAES)
+    }
+    /// VPCLMULQDQ (carry-less multiply on YMM/ZMM registers), with the OS
+    /// saving YMM state. The ZMM form additionally needs [`avx512f`].
+    #[inline]
+    pub(crate) fn vpclmulqdq() -> bool {
+        has(VPCLMULQDQ)
+    }
 }
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
@@ -299,6 +322,11 @@ mod tests {
         assert_eq!(
             super::avx512ifma(),
             std::is_x86_feature_detected!("avx512ifma") && super::avx512f()
+        );
+        assert_eq!(super::vaes(), std::is_x86_feature_detected!("vaes"));
+        assert_eq!(
+            super::vpclmulqdq(),
+            std::is_x86_feature_detected!("vpclmulqdq")
         );
     }
 }

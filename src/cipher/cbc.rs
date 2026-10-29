@@ -33,6 +33,11 @@ impl<C: BlockCipher> Cbc<C> {
         if !data.len().is_multiple_of(16) {
             return Err(InvalidLength);
         }
+        // The cipher's own CBC kernel when it has one (AES-NI: schedule in
+        // registers, no per-block dispatch).
+        if self.cipher.cbc_encrypt_hook(&mut self.chain, data) {
+            return Ok(());
+        }
         for chunk in data.chunks_exact_mut(16) {
             for (b, c) in chunk.iter_mut().zip(self.chain.iter()) {
                 *b ^= *c;
@@ -53,6 +58,11 @@ impl<C: BlockCipher> Cbc<C> {
     pub fn decrypt(&mut self, data: &mut [u8]) -> Result<(), InvalidLength> {
         if !data.len().is_multiple_of(16) {
             return Err(InvalidLength);
+        }
+        // The cipher's own CBC kernel when it has one (AES-NI/VAES: blocks
+        // decrypted several vectors at a time, chaining XOR in registers).
+        if self.cipher.cbc_decrypt_hook(&mut self.chain, data) {
+            return Ok(());
         }
         // Unlike encryption, CBC decryption is parallel: every block's
         // inverse permutation is independent, so a window of blocks goes

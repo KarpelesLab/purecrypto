@@ -9,13 +9,18 @@
 //!
 //! This module is compiled only on `std` + (`x86_64` | `aarch64`), gated at the
 //! `mod` declaration in `super`.
+//!
+//! On x86_64 the bulk GHASH and the stitched AES-CTR + GHASH loop of GCM live
+//! with the other width-generic kernels in `aes::wide_x86` (128-, 256- and
+//! 512-bit tiers); what remains here is the single multiply and the
+//! eight-block POLYVAL kernel of AES-GCM-SIV.
 #![allow(unsafe_code)]
 #![allow(unused_unsafe)]
 
 #[cfg(target_arch = "aarch64")]
 pub(super) use arm::{ctr_ghash_fused, gf_mul, ghash_blocks, polyval_blocks};
 #[cfg(target_arch = "x86_64")]
-pub(super) use x86::{ctr_ghash_fused, gf_mul, ghash_blocks, polyval_blocks};
+pub(super) use x86::{gf_mul, polyval_blocks};
 
 /// Whether a hardware GHASH backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
@@ -210,25 +215,12 @@ mod x86 {
         }
     }
 
-    /// Aggregated GHASH: folds whole 16-byte `blocks` (length a multiple of 16)
-    /// into the accumulator `x`, eight blocks per reduction using the
-    /// precomputed powers `hpow[i] = H^{i+1}`.
-    ///
-    /// `x ← (x ⊕ b₀)·H⁸ ⊕ b₁·H⁷ ⊕ … ⊕ b₇·H` per group, accumulating the eight
-    /// unreduced products and reducing once; a `≥ 4`-block remainder folds as
-    /// one four-block group and the final `< 4`-block tail folds serially.
-    /// Returns the same value as repeated `gf_mul(x ⊕ bᵢ, h)`.
-    #[target_feature(enable = "pclmulqdq,sse2,ssse3")]
-    pub(in super::super) unsafe fn ghash_blocks(x: u128, hpow: &[u128; 8], blocks: &[u8]) -> u128 {
-        unsafe { hash_blocks::<true>(x, hpow, blocks) }
-    }
-
-    /// [`ghash_blocks`] over little-endian POLYVAL blocks (RFC 8452 Appendix
-    /// A): with `hpow` the powers of `mulX_GHASH(ByteReverse(H))` this is
+    /// Aggregated GHASH over little-endian POLYVAL blocks (RFC 8452 Appendix
+    /// A), eight blocks per reduction: with `hpow` the powers
+    /// `hpow[i] = H'^{i+1}` of `H' = mulX_GHASH(ByteReverse(H))` this is
     /// POLYVAL, the blocks being consumed in place instead of byte-reversed
     /// into a scratch window first. The accumulator is read and returned in
-    /// the same `u128` form as `ghash_blocks` (`to_le_bytes` of it is the
-    /// POLYVAL output block).
+    /// the GCM `u128` form (`to_le_bytes` of it is the POLYVAL output block).
     #[target_feature(enable = "pclmulqdq,sse2,ssse3")]
     pub(in super::super) unsafe fn polyval_blocks(
         x: u128,
@@ -271,132 +263,6 @@ mod x86 {
             let p = bswap(acc);
             let mut out = [0u8; 16];
             _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, p);
-            u128::from_be_bytes(out)
-        }
-    }
-
-    /// Stitched AES-CTR ⊕ GHASH bulk loop — GCM "function stitching".
-    ///
-    /// Per 128-byte group the eight AESENC dependency chains and the
-    /// PCLMULQDQ aggregation of the neighbouring group are issued in the same
-    /// loop body, so the out-of-order core overlaps the AES units and the
-    /// carryless multiplier instead of running two separate passes over the
-    /// buffer.
-    ///
-    /// CTR-encrypts (⇔ decrypts) `buf` in place with AES under `round_keys`
-    /// (`nr` rounds), starting from counter block `ctr` (GCM `inc32`
-    /// semantics), while folding the *ciphertext* blocks into the GHASH
-    /// accumulator `acc` using the precomputed powers `hpow[i] = H^{i+1}`.
-    /// Encryption hashes each group's output with a one-group lag (the
-    /// ciphertext exists only after the XOR); decryption hashes its input
-    /// group directly. `buf.len()` must be a multiple of 128. Returns the
-    /// updated accumulator.
-    ///
-    /// Constant-time: AESENC and PCLMULQDQ are data-independent, and the only
-    /// branches here depend on the public buffer length and direction flag.
-    #[target_feature(enable = "aes,pclmulqdq,sse2,ssse3")]
-    pub(in super::super) unsafe fn ctr_ghash_fused(
-        round_keys: &[u8],
-        nr: usize,
-        ctr: u128,
-        hpow: &[u128; 8],
-        acc: u128,
-        buf: &mut [u8],
-        encrypt: bool,
-    ) -> u128 {
-        // Hard precondition, not a `debug_assert`: the loop below reads and
-        // writes `buf` through raw pointers in 128-byte groups and the lag
-        // flush reads `n - 128`, so a short or ragged buffer would be an
-        // out-of-bounds access in release builds.
-        assert!(
-            buf.len().is_multiple_of(128),
-            "ctr_ghash_fused: buffer length must be a multiple of 128 bytes"
-        );
-        // Defence in depth: the schedule comes from an overridable trait
-        // method, and the loads below are raw-pointer reads of
-        // `16 * (nr + 1)` bytes. The caller already validates this; the check
-        // costs one comparison per call and keeps the kernel sound on its own.
-        assert!(
-            nr <= 14 && round_keys.len() >= 16 * (nr + 1),
-            "AES round-key schedule too short for the round count"
-        );
-        unsafe {
-            // Preload the schedule once (≤ 15 round keys for AES-256).
-            let mut ks = [_mm_setzero_si128(); 15];
-            for (i, k) in ks.iter_mut().enumerate().take(nr + 1) {
-                *k = _mm_loadu_si128(round_keys.as_ptr().add(i * 16) as *const __m128i);
-            }
-            let mut h = load_hpow(hpow);
-            let ab = acc.to_le_bytes();
-            let mut acc = _mm_loadu_si128(ab.as_ptr() as *const __m128i);
-
-            // Block `i`'s counter is independent of block `i-1`'s: GCM `inc32`
-            // advances only the rightmost 32 bits, so counter `i` is
-            // `hi ‖ (lo + i mod 2³²)` — no serial dependency chain.
-            let ctr_hi = ctr & !0xffff_ffffu128;
-            let ctr_lo = ctr as u32;
-            let mut blk: u32 = 0;
-
-            let n = buf.len();
-            let base = buf.as_mut_ptr();
-            let mut off = 0;
-            // Hoisted out of the loop so the wipe below covers the last
-            // group's raw keystream.
-            let mut b = [_mm_setzero_si128(); 8];
-            while off < n {
-                // Eight counter blocks through the AES rounds, 8-wide.
-                for bj in b.iter_mut() {
-                    let cb = (ctr_hi | ctr_lo.wrapping_add(blk) as u128).to_be_bytes();
-                    *bj = _mm_xor_si128(_mm_loadu_si128(cb.as_ptr() as *const __m128i), ks[0]);
-                    blk = blk.wrapping_add(1);
-                }
-                for &k in ks.iter().take(nr).skip(1) {
-                    for bj in b.iter_mut() {
-                        *bj = _mm_aesenc_si128(*bj, k);
-                    }
-                }
-                for bj in b.iter_mut() {
-                    *bj = _mm_aesenclast_si128(*bj, ks[nr]);
-                }
-                // GHASH the neighbouring ciphertext group: the previous output
-                // group when encrypting, the current input group when
-                // decrypting (before the XOR below overwrites it).
-                if encrypt {
-                    if off >= 128 {
-                        acc = ghash_group8::<true>(acc, &h, base.add(off - 128));
-                    }
-                } else {
-                    acc = ghash_group8::<true>(acc, &h, base.add(off));
-                }
-                // XOR the keystream into the data.
-                for (j, bj) in b.iter().enumerate() {
-                    let q = base.add(off + j * 16);
-                    let d = _mm_loadu_si128(q as *const __m128i);
-                    _mm_storeu_si128(q as *mut __m128i, _mm_xor_si128(d, *bj));
-                }
-                off += 128;
-            }
-            // Flush the lag: the last output group is still unhashed.
-            if encrypt && n != 0 {
-                acc = ghash_group8::<true>(acc, &h, base.add(n - 128));
-            }
-
-            let p = bswap(acc);
-            let mut out = [0u8; 16];
-            _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, p);
-            // Round keys, GHASH key powers and the last keystream group are
-            // all key material (H alone forges tags); with 15 + 8 + 8 vectors
-            // live the allocator spills, so scrub the frame rather than trust
-            // it. A volatile zero store per lane plus a compiler fence, the
-            // same contract as `crate::zeroize::Zeroize` (which cannot take
-            // the vendor `__m128i` type directly).
-            for v in ks.iter_mut().chain(h.iter_mut()).chain(b.iter_mut()) {
-                // SAFETY: `v` is a live `&mut __m128i`, hence non-null,
-                // aligned and exclusively held; this is `*v = zero` with the
-                // store marked volatile so it cannot be elided.
-                core::ptr::write_volatile(v, _mm_setzero_si128());
-            }
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             u128::from_be_bytes(out)
         }
     }
@@ -535,7 +401,7 @@ mod arm {
     }
 
     /// Aggregated GHASH (four blocks per reduction), the NEON analogue of the
-    /// x86 [`ghash_blocks`]. `blocks.len()` must be a multiple of 16. Returns the
+    /// x86 GHASH kernels. `blocks.len()` must be a multiple of 16. Returns the
     /// same value as repeated `gf_mul(x ⊕ bᵢ, h)`.
     /// Loads a 16-byte GCM block into the byte-swapped ("reflected")
     /// representation `gfmul` expects. A `u128` reaches that form for free via
@@ -581,7 +447,7 @@ mod arm {
         }
     }
 
-    /// Aggregated GHASH, the NEON analogue of the x86 [`ghash_blocks`]: folds
+    /// Aggregated GHASH, the NEON analogue of the x86 kernels: folds
     /// whole 16-byte `blocks` (length a multiple of 16) into `x`, eight blocks
     /// per reduction using the precomputed powers `hpow[i] = H^{i+1}`; a
     /// `≥ 4`-block remainder folds as one four-block group and the final
@@ -823,11 +689,7 @@ mod arm {
     }
 }
 
-#[cfg(all(
-    test,
-    feature = "std",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(all(test, feature = "std", target_arch = "aarch64"))]
 mod tests {
     /// The fused CTR+GHASH kernel walks its buffer through raw pointers in
     /// 128-byte groups, so the length precondition is a hard `assert!`

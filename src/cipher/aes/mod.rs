@@ -11,6 +11,8 @@ pub(crate) mod gf;
 mod aes_arm;
 #[cfg(target_arch = "x86_64")]
 mod aesni;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod wide_x86;
 
 use super::BlockCipher;
 use gf::sub_words;
@@ -85,7 +87,10 @@ fn dispatch_encrypt_blocks<const NR: usize>(backend: AesBackend, rk: &[u8], bloc
     match backend {
         AesBackend::Software => crypt_blocks_soft::<false>(rk, NR, blocks),
         #[cfg(target_arch = "x86_64")]
-        AesBackend::Hardware => unsafe { aesni::encrypt_blocks(rk, NR, blocks) },
+        AesBackend::Hardware => match wide_x86::tier() {
+            Some(t) => wide_x86::ecb::<NR, false>(t, rk, blocks),
+            None => unsafe { aesni::encrypt_blocks(rk, NR, blocks) },
+        },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
         AesBackend::Hardware => unsafe { aes_arm::encrypt_blocks::<NR>(rk, blocks) },
     }
@@ -97,7 +102,10 @@ fn dispatch_decrypt_blocks<const NR: usize>(backend: AesBackend, rk: &[u8], bloc
     match backend {
         AesBackend::Software => crypt_blocks_soft::<true>(rk, NR, blocks),
         #[cfg(target_arch = "x86_64")]
-        AesBackend::Hardware => unsafe { aesni::decrypt_blocks(rk, NR, blocks) },
+        AesBackend::Hardware => match wide_x86::tier() {
+            Some(t) => wide_x86::ecb::<NR, true>(t, rk, blocks),
+            None => unsafe { aesni::decrypt_blocks(rk, NR, blocks) },
+        },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
         AesBackend::Hardware => unsafe { aes_arm::decrypt_blocks::<NR>(rk, blocks) },
     }
@@ -651,11 +659,46 @@ macro_rules! aes_variant {
             // is built on the AES instruction-set extensions).
             #[doc(hidden)]
             fn hw_aes_schedule(&self) -> Option<(&[u8], usize)> {
-                #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+                #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
                 if matches!(self.backend, AesBackend::Hardware) {
                     return Some((&self.rk[..], $nr));
                 }
                 None
+            }
+
+            // The fused CTR / CBC kernels of the hardware backend (x86_64);
+            // everything else keeps the modes' generic loops.
+            #[doc(hidden)]
+            fn ctr128_hook(&self, counter: &mut [u8; 16], blocks: &mut [u8]) -> bool {
+                #[cfg(target_arch = "x86_64")]
+                if let (AesBackend::Hardware, Some(t)) = (self.backend, wide_x86::tier()) {
+                    wide_x86::ctr::<$nr, { wide_x86::CTR128_BE }>(t, &self.rk, counter, blocks);
+                    return true;
+                }
+                let _ = (counter, blocks);
+                false
+            }
+
+            #[doc(hidden)]
+            fn cbc_encrypt_hook(&self, chain: &mut [u8; 16], blocks: &mut [u8]) -> bool {
+                #[cfg(target_arch = "x86_64")]
+                if let (AesBackend::Hardware, Some(t)) = (self.backend, wide_x86::tier()) {
+                    wide_x86::cbc_encrypt::<$nr>(t, &self.rk, chain, blocks);
+                    return true;
+                }
+                let _ = (chain, blocks);
+                false
+            }
+
+            #[doc(hidden)]
+            fn cbc_decrypt_hook(&self, chain: &mut [u8; 16], blocks: &mut [u8]) -> bool {
+                #[cfg(target_arch = "x86_64")]
+                if let (AesBackend::Hardware, Some(t)) = (self.backend, wide_x86::tier()) {
+                    wide_x86::cbc_decrypt::<$nr>(t, &self.rk, chain, blocks);
+                    return true;
+                }
+                let _ = (chain, blocks);
+                false
             }
         }
 

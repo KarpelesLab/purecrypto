@@ -259,6 +259,34 @@ pub trait BlockCipher {
     fn hw_aes_schedule(&self) -> Option<(&[u8], usize)> {
         None
     }
+
+    /// Internal hook for [`Ctr`]: XORs the CTR keystream (big-endian 128-bit
+    /// counter starting at `counter`) into `blocks` (whole blocks) in one
+    /// fused pass and advances `counter` past them. Returns `false`, touching
+    /// nothing, when the cipher has no such kernel (the default); the mode
+    /// then runs its generic windowed loop.
+    #[doc(hidden)]
+    fn ctr128_hook(&self, counter: &mut [u8; 16], blocks: &mut [u8]) -> bool {
+        let _ = (counter, blocks);
+        false
+    }
+
+    /// Internal hook for [`Cbc`] encryption of whole `blocks` in place with
+    /// chaining block `chain` (updated to the last ciphertext block).
+    /// Returns `false`, touching nothing, without a dedicated kernel.
+    #[doc(hidden)]
+    fn cbc_encrypt_hook(&self, chain: &mut [u8; 16], blocks: &mut [u8]) -> bool {
+        let _ = (chain, blocks);
+        false
+    }
+
+    /// Internal hook for [`Cbc`] decryption; as
+    /// [`cbc_encrypt_hook`](Self::cbc_encrypt_hook).
+    #[doc(hidden)]
+    fn cbc_decrypt_hook(&self, chain: &mut [u8; 16], blocks: &mut [u8]) -> bool {
+        let _ = (chain, blocks);
+        false
+    }
 }
 
 /// A 64-bit-block cipher: parallel to [`BlockCipher`] but for legacy

@@ -59,7 +59,18 @@ impl<C: BlockCipher> Ctr<C> {
             self.pos += 1;
             i += 1;
         }
-        // 2. Bulk whole-block windows (only reached with no pending keystream).
+        // 2. Bulk whole blocks: the cipher's fused CTR kernel when it has
+        //    one (counter in registers, keystream XORed in the same pass),
+        //    else windows of keystream through `encrypt_blocks`. Only
+        //    reached with no pending keystream.
+        let whole = (data.len() - i) & !15;
+        if whole > 0
+            && self
+                .cipher
+                .ctr128_hook(&mut self.counter, &mut data[i..i + whole])
+        {
+            i += whole;
+        }
         const W: usize = 64; // 1 KiB stack window
         let mut ks = [0u8; 16 * W];
         // High-water mark of `ks`: only this prefix ever held keystream, so

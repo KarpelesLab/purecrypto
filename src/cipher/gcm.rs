@@ -87,13 +87,24 @@ pub struct Gcm<C: BlockCipher> {
     /// aarch64, with `std` for the runtime feature probe).
     #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
     ghash_hw: bool,
-    /// Precomputed hash-subkey powers `hpow[i] = H^{i+1}` for the aggregated
-    /// (multi-block, single-reduction) hardware GHASH. Computed once here so
-    /// neither the bulk hash nor the fused CTR+GHASH loop rederives them per
-    /// message. All zero when the hardware backend is absent.
+    /// Precomputed hash-subkey powers for the aggregated (multi-block,
+    /// single-reduction) hardware GHASH, computed once here so neither the
+    /// bulk hash nor the fused CTR+GHASH loop rederives them per message. On
+    /// aarch64 `hpow[i] = H^{i+1}`; on x86_64 the wide kernels' table (see
+    /// `wide_x86::ghash_table`). All zero when the hardware backend is absent.
     #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
-    hpow: [u128; 8],
+    hpow: HTable,
+    /// The x86_64 kernel tier probed at construction (`Some` exactly when
+    /// `ghash_hw` is set): the proof the wide kernels may run.
+    #[cfg(target_arch = "x86_64")]
+    tier: Option<super::aes::wide_x86::Tier>,
 }
+
+/// The hash-key power table of the hardware GHASH.
+#[cfg(target_arch = "x86_64")]
+type HTable = super::aes::wide_x86::HTable;
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+type HTable = [u128; 8];
 
 impl<C: BlockCipher> Gcm<C> {
     /// Creates a GCM context, deriving the hash subkey from `cipher`.
@@ -102,7 +113,17 @@ impl<C: BlockCipher> Gcm<C> {
         let mut h = [0u8; 16];
         cipher.encrypt_block(&mut h);
         let h = u128::from_be_bytes(h);
-        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
+        #[cfg(target_arch = "x86_64")]
+        let (ghash_hw, hpow, tier) = {
+            let tier = super::aes::wide_x86::tier();
+            let hp = match tier {
+                // SAFETY: every tier includes PCLMULQDQ, SSE2 and SSSE3.
+                Some(_) => unsafe { super::aes::wide_x86::ghash_table(h) },
+                None => [0u128; super::aes::wide_x86::HTAB_LEN],
+            };
+            (tier.is_some(), hp, tier)
+        };
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
         let (ghash_hw, hpow) = {
             let hw = super::clmul::supported();
             let mut hp = [0u128; 8];
@@ -123,6 +144,31 @@ impl<C: BlockCipher> Gcm<C> {
             ghash_hw,
             #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
             hpow,
+            #[cfg(target_arch = "x86_64")]
+            tier,
+        }
+    }
+
+    /// Aggregated hardware GHASH of the whole blocks `blocks` into `x`. Only
+    /// called with `ghash_hw` set.
+    #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
+    #[allow(unsafe_code)]
+    #[inline]
+    fn ghash_bulk(&self, x: u128, blocks: &[u8]) -> u128 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            match self.tier {
+                Some(t) => super::aes::wide_x86::hash_blocks::<true>(t, &self.hpow, x, blocks),
+                None => blocks
+                    .chunks_exact(16)
+                    .fold(x, |x, b| self.mul_h(x ^ load_block(b))),
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: `ghash_hw` is only set when `clmul::supported()`
+            // confirmed the carryless-multiply features `ghash_blocks` requires.
+            unsafe { super::clmul::ghash_blocks(x, &self.hpow, blocks) }
         }
     }
 
@@ -173,9 +219,7 @@ impl<C: BlockCipher> Gcm<C> {
         #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         let tail = if self.ghash_hw {
             let full = ct.len() & !15;
-            // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
-            // the carryless-multiply features `ghash_blocks` requires.
-            x = unsafe { super::clmul::ghash_blocks(x, &self.hpow, &ct[..full]) };
+            x = self.ghash_bulk(x, &ct[..full]);
             &ct[full..]
         } else {
             ct
@@ -203,9 +247,7 @@ impl<C: BlockCipher> Gcm<C> {
         #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         let tail = if self.ghash_hw {
             let full = data.len() & !15;
-            // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
-            // the carryless-multiply features `ghash_blocks` requires.
-            x = unsafe { super::clmul::ghash_blocks(x, &self.hpow, &data[..full]) };
+            x = self.ghash_bulk(x, &data[..full]);
             &data[full..]
         } else {
             data
@@ -262,9 +304,7 @@ impl<C: BlockCipher> Gcm<C> {
     fn ghash_partial(&self, mut x: u128, data: &[u8]) -> u128 {
         let full = data.len() & !15;
         if full > 0 {
-            // SAFETY: the fused path runs only when `clmul::supported()`
-            // confirmed the features `ghash_blocks` requires.
-            x = unsafe { super::clmul::ghash_blocks(x, &self.hpow, &data[..full]) };
+            x = self.ghash_bulk(x, &data[..full]);
         }
         if full < data.len() {
             x = self.mul_h(x ^ load_block(&data[full..]));
@@ -306,14 +346,38 @@ impl<C: BlockCipher> Gcm<C> {
         if !fused_schedule_ok(rk, nr) || !hw_aes_available() {
             return None;
         }
+        // The wide kernels' tier also covers AES-NI (and VAES for the wider
+        // ones), checked against the CPU at construction.
+        #[cfg(target_arch = "x86_64")]
+        let tier = self.tier?;
         let total_len = buffer.len();
 
         // AAD prefix of the GHASH (outside the bulk loop).
         let mut x = self.ghash_partial(0, aad);
-
-        // Bulk: whole 128-byte (8-block) groups run through the fused loop.
-        let fused = total_len & !127;
         let ctr0 = inc32(j0);
+
+        // x86_64: the wide kernels take every whole block, stitched in
+        // groups of eight vectors with their own shorter tail groups.
+        #[cfg(target_arch = "x86_64")]
+        let fused = {
+            let full = total_len & !15;
+            x = super::aes::wide_x86::gcm_crypt(
+                tier,
+                rk,
+                nr,
+                ctr0,
+                &self.hpow,
+                x,
+                &mut buffer[..full],
+                encrypt,
+            );
+            full
+        };
+
+        // aarch64: whole 128-byte (8-block) groups run through the fused loop.
+        #[cfg(target_arch = "aarch64")]
+        let fused = total_len & !127;
+        #[cfg(target_arch = "aarch64")]
         if fused > 0 {
             // SAFETY: `ghash_hw` confirmed the carryless multiplier
             // (PCLMULQDQ/SSSE3 or PMULL/NEON) and the runtime check above
@@ -333,8 +397,9 @@ impl<C: BlockCipher> Gcm<C> {
             };
         }
 
-        // Tail (< 8 blocks): generic windowed CTR + aggregated GHASH. The
-        // counter after `fused/16` blocks; GCM `inc32` wraps modulo 2³².
+        // Tail (aarch64: < 8 blocks; x86_64: the final partial block, if
+        // any): generic windowed CTR + aggregated GHASH. The counter after
+        // `fused/16` blocks; GCM `inc32` wraps modulo 2³².
         let ctr_tail =
             (ctr0 & !0xffff_ffffu128) | ((ctr0 as u32).wrapping_add((fused / 16) as u32) as u128);
         let tail = &mut buffer[fused..];
@@ -844,6 +909,165 @@ mod tests {
                 g.decrypt(&nonce, aad, &mut a, &ta).unwrap();
                 assert_eq!(a, pt);
             }
+        }
+    }
+
+    /// Deterministic filler for the x86_64 tier tests.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    fn fill(seed: u64, out: &mut [u8]) {
+        let mut x = seed | 1;
+        for b in out.iter_mut() {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            *b = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+        }
+    }
+
+    /// The wide GHASH kernel of every tier the host supports against the
+    /// serial software multiply, over every chunk / vector remainder (chunks
+    /// are 8, 16 or 32 blocks) and a non-zero starting accumulator.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn wide_ghash_tiers_match_serial() {
+        use crate::cipher::aes::wide_x86::{self, test_cap};
+        let mut hb = [0u8; 16];
+        fill(5, &mut hb);
+        let h = u128::from_be_bytes(hb);
+        let mut data = std::vec![0u8; 16 * 4200];
+        fill(6, &mut data);
+        let mut counts: std::vec::Vec<usize> = (0..=100).collect();
+        counts.extend([127, 128, 129, 4096 + 9]);
+        for cap in test_cap::caps("ghash") {
+            let Some(t) = cap else { continue };
+            // SAFETY: `t` is a tier this CPU supports.
+            let table = unsafe { wide_x86::ghash_table(h) };
+            for &n in &counts {
+                let blocks = &data[3..3 + 16 * n];
+                let x0 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128 ^ n as u128;
+                let want = blocks
+                    .chunks_exact(16)
+                    .fold(x0, |x, b| gf_mul(x ^ load_block(b), h));
+                let got = wide_x86::hash_blocks::<true>(t, &table, x0, blocks);
+                assert_eq!(got, want, "{t:?} n={n}");
+            }
+        }
+    }
+
+    /// The stitched GCM kernel of every tier against a from-scratch
+    /// reference (AES on each `inc32` counter, serial software GHASH of the
+    /// ciphertext), with the counter's low 32 bits starting just below the
+    /// wrap so it rolls over inside groups, tails and single blocks.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn wide_gcm_kernel_counter_wrap() {
+        use crate::cipher::aes::wide_x86::{self, test_cap};
+        use crate::cipher::{Aes192, Aes256};
+        // `aes` is hardware-backed (for its schedule); its single-block path
+        // is checked against the portable AES elsewhere.
+        #[allow(unsafe_code)]
+        fn run<C: BlockCipher>(aes: &C, t: wide_x86::Tier) {
+            let (rk, nr) = aes.hw_aes_schedule().expect("hardware AES backend");
+            let mut hb = [0u8; 16];
+            aes.encrypt_block(&mut hb);
+            let h = u128::from_be_bytes(hb);
+            // SAFETY: `t` is a tier this CPU supports.
+            let table = unsafe { wide_x86::ghash_table(h) };
+            for &lo in &[0xffff_ffffu32, 0xffff_fffe, 0xffff_fff0, 0xffff_ff00, 7] {
+                let ctr = 0x1111_2222_3333_4444_5555_6666_0000_0000u128 | lo as u128;
+                for &n in &[1usize, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 300] {
+                    for encrypt in [true, false] {
+                        let mut buf = std::vec![0u8; 16 * n];
+                        fill(n as u64 ^ lo as u64, &mut buf);
+                        let input = buf.clone();
+                        let mut want = input.clone();
+                        for (i, blk) in want.chunks_exact_mut(16).enumerate() {
+                            let c = (ctr & !0xffff_ffff) | (lo.wrapping_add(i as u32) as u128);
+                            let mut ks = c.to_be_bytes();
+                            aes.encrypt_block(&mut ks);
+                            blk.iter_mut().zip(ks).for_each(|(b, k)| *b ^= k);
+                        }
+                        let ct = if encrypt { &want } else { &input };
+                        let x0 = 0x5a5a_u128;
+                        let want_x = ct
+                            .chunks_exact(16)
+                            .fold(x0, |x, b| gf_mul(x ^ load_block(b), h));
+                        let x = wide_x86::gcm_crypt(t, rk, nr, ctr, &table, x0, &mut buf, encrypt);
+                        assert_eq!(buf, want, "{t:?} nr={nr} lo={lo:x} n={n} enc={encrypt}");
+                        assert_eq!(x, want_x, "{t:?} nr={nr} lo={lo:x} n={n} enc={encrypt}");
+                    }
+                }
+            }
+        }
+        let mut k = [0u8; 32];
+        fill(9, &mut k);
+        for cap in test_cap::caps("gcm kernel") {
+            let Some(t) = cap else { continue };
+            run(&Aes128::new(k[..16].try_into().unwrap()), t);
+            run(&Aes192::new(k[..24].try_into().unwrap()), t);
+            run(&Aes256::new(&k), t);
+        }
+    }
+
+    /// End-to-end `Gcm` under every tier (and the portable path) against a
+    /// fully portable context: every byte length 0..=600, large buffers,
+    /// AAD lengths that are not multiples of 16, non-96-bit nonces, an
+    /// unaligned buffer, all three key sizes, and decrypt /
+    /// reject-and-restore.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn wide_gcm_tiers_match_portable() {
+        use crate::cipher::aes::wide_x86::test_cap;
+        use crate::cipher::{Aes192, Aes256};
+        fn run<C: BlockCipher>(hw: &Gcm<C>, sw: &Gcm<C>, name: &str, full: bool) {
+            let nonce = from_hex::<12>("cafebabefacedbaddecaf888");
+            let long_nonce = [0x42u8; 20];
+            let mut lens: std::vec::Vec<usize> = if full {
+                (0..=600).collect()
+            } else {
+                std::vec![0, 1, 15, 16, 17, 255, 256, 257, 511, 512, 513, 600]
+            };
+            lens.extend([16 * 1024 + 5, 65536 + 16 * 3]);
+            for &len in &lens {
+                let aad_len = [0usize, 1, 13, 16, 31, 33, 100][len % 7];
+                let mut aad = std::vec![0u8; aad_len];
+                fill(aad_len as u64 + 1000, &mut aad);
+                let n: &[u8] = if len % 5 == 4 { &long_nonce } else { &nonce };
+                let mut buf = std::vec![0u8; len + 7];
+                fill(len as u64, &mut buf);
+                let pt = buf[7..].to_vec();
+                let mut want = pt.clone();
+                let want_tag = sw.encrypt(n, &aad, &mut want);
+                let tag = hw.encrypt(n, &aad, &mut buf[7..]);
+                assert_eq!(&buf[7..], &want[..], "{name} ct len={len} aad={aad_len}");
+                assert_eq!(tag, want_tag, "{name} tag len={len} aad={aad_len}");
+                let mut bad = tag;
+                bad[0] ^= 0x80;
+                assert!(hw.decrypt(n, &aad, &mut buf[7..], &bad).is_err());
+                assert_eq!(&buf[7..], &want[..], "{name} restore len={len}");
+                hw.decrypt(n, &aad, &mut buf[7..], &tag).unwrap();
+                assert_eq!(&buf[7..], &pt[..], "{name} pt len={len} aad={aad_len}");
+            }
+        }
+        let mut k = [0u8; 32];
+        fill(11, &mut k);
+        let k16: [u8; 16] = k[..16].try_into().unwrap();
+        let k24: [u8; 24] = k[..24].try_into().unwrap();
+        // The reference is portable end to end (software AES and GHASH).
+        let (s128, s192, s256) = test_cap::with(None, || {
+            (
+                Gcm::new(Aes128::new_software(&k16)),
+                Gcm::new(Aes192::new_software(&k24)),
+                Gcm::new(Aes256::new_software(&k)),
+            )
+        });
+        for cap in test_cap::caps("gcm") {
+            test_cap::with(cap, || {
+                run(&Gcm::new(Aes128::new(&k16)), &s128, "AES-128", true);
+                run(&Gcm::new(Aes192::new(&k24)), &s192, "AES-192", false);
+                run(&Gcm::new(Aes256::new(&k)), &s256, "AES-256", true);
+            });
         }
     }
 
