@@ -8,40 +8,6 @@
 //!
 //! A given (key, nonce) pair must **never** be reused with overlapping counter
 //! ranges: as with any stream cipher, keystream reuse destroys confidentiality.
-//!
-//! # Variants and counter overflow
-//!
-//! State words 12..=15 hold the block counter and the nonce; the variants
-//! differ only in where the boundary between them sits:
-//!
-//! | API | words 12..=15 | counter range | libsodium / OpenSSL |
-//! | --- | --- | --- | --- |
-//! | [`ChaCha20::apply_keystream`] / [`try_apply_keystream`](ChaCha20::try_apply_keystream) | `ctr32 ‖ nonce96` (RFC 8439) | `2³²` blocks (256 GiB) | `crypto_stream_chacha20_ietf_xor_ic` |
-//! | [`ChaCha20::apply_keystream_djb`] / [`block_djb`](ChaCha20::block_djb) | `ctr64 ‖ nonce64` (original) | `2⁶⁴` blocks | `crypto_stream_chacha20_xor_ic` |
-//! | [`ChaCha20::apply_keystream_carry`] | `ctr32 ‖ nonce96`, carry into the first nonce word | `2⁶⁴` blocks | OpenSSL `EVP_chacha20` (16-byte IV `ctr32 ‖ nonce96`) |
-//! | [`XChaCha20::apply_keystream`] | HChaCha20 subkey, then `ctr64 ‖ nonce[16..24]` | `2⁶⁴` blocks | `crypto_stream_xchacha20_xor_ic` |
-//!
-//! None of them ever wraps silently, because a wrapped counter replays
-//! keystream already used for this (key, nonce):
-//!
-//! * RFC 8439 defines no carry, so the IETF form stops at `2³²` blocks.
-//!   [`apply_keystream`](ChaCha20::apply_keystream) keeps its historical
-//!   panic there; [`try_apply_keystream`](ChaCha20::try_apply_keystream)
-//!   returns [`CounterOverflow`] instead (libsodium aborts the process).
-//! * [`apply_keystream_carry`](ChaCha20::apply_keystream_carry) is the same
-//!   state layout, but when word 12 wraps it carries into word 13 — the first
-//!   word of the nonce — exactly as OpenSSL does. Output is identical to the
-//!   IETF form up to the `2³²` boundary and continues past it with what
-//!   OpenSSL produces. (OpenSSL lets word 13 itself wrap without further
-//!   carry; that is the `2⁶⁴`-block limit of this form, where it returns
-//!   [`CounterOverflow`].) Use it only where OpenSSL interop is the point:
-//!   the blocks past the boundary belong to a *different* RFC 8439 nonce.
-//! * The 64-bit-counter forms carry between words 12 and 13 naturally and
-//!   return [`CounterOverflow`] only if the counter would pass `2⁶⁴ − 1`,
-//!   which needs a starting counter within a buffer's length of the top.
-//!
-//! In every case the check happens before any byte is touched, so on error
-//! the buffer is unchanged.
 
 use super::CounterOverflow;
 
@@ -125,6 +91,40 @@ pub fn hchacha20(key: &[u8; 32], nonce16: &[u8; 16]) -> [u8; 32] {
 }
 
 /// A ChaCha20 cipher keyed with a 256-bit key.
+///
+/// # Variants and counter overflow
+///
+/// State words 12..=15 hold the block counter and the nonce; the variants
+/// differ only in where the boundary between them sits:
+///
+/// | API | words 12..=15 | counter range | libsodium / OpenSSL |
+/// | --- | --- | --- | --- |
+/// | [`ChaCha20::apply_keystream`] / [`try_apply_keystream`](ChaCha20::try_apply_keystream) | `ctr32 ‖ nonce96` (RFC 8439) | `2³²` blocks (256 GiB) | `crypto_stream_chacha20_ietf_xor_ic` |
+/// | [`ChaCha20::apply_keystream_djb`] / [`block_djb`](ChaCha20::block_djb) | `ctr64 ‖ nonce64` (original) | `2⁶⁴` blocks | `crypto_stream_chacha20_xor_ic` |
+/// | [`ChaCha20::apply_keystream_carry`] | `ctr32 ‖ nonce96`, carry into the first nonce word | `2⁶⁴` blocks | OpenSSL `EVP_chacha20` (16-byte IV `ctr32 ‖ nonce96`) |
+/// | [`XChaCha20::apply_keystream`] | HChaCha20 subkey, then `ctr64 ‖ nonce[16..24]` | `2⁶⁴` blocks | `crypto_stream_xchacha20_xor_ic` |
+///
+/// None of them ever wraps silently, because a wrapped counter replays
+/// keystream already used for this (key, nonce):
+///
+/// * RFC 8439 defines no carry, so the IETF form stops at `2³²` blocks.
+///   [`apply_keystream`](ChaCha20::apply_keystream) keeps its historical
+///   panic there; [`try_apply_keystream`](ChaCha20::try_apply_keystream)
+///   returns [`CounterOverflow`] instead (libsodium aborts the process).
+/// * [`apply_keystream_carry`](ChaCha20::apply_keystream_carry) is the same
+///   state layout, but when word 12 wraps it carries into word 13 — the first
+///   word of the nonce — exactly as OpenSSL does. Output is identical to the
+///   IETF form up to the `2³²` boundary and continues past it with what
+///   OpenSSL produces. (OpenSSL lets word 13 itself wrap without further
+///   carry; that is the `2⁶⁴`-block limit of this form, where it returns
+///   [`CounterOverflow`].) Use it only where OpenSSL interop is the point:
+///   the blocks past the boundary belong to a *different* RFC 8439 nonce.
+/// * The 64-bit-counter forms carry between words 12 and 13 naturally and
+///   return [`CounterOverflow`] only if the counter would pass `2⁶⁴ − 1`,
+///   which needs a starting counter within a buffer's length of the top.
+///
+/// In every case the check happens before any byte is touched, so on error
+/// the buffer is unchanged.
 #[derive(Clone)]
 pub struct ChaCha20 {
     key: [u32; 8],
@@ -214,7 +214,7 @@ impl ChaCha20 {
     /// [`try_apply_keystream`](Self::try_apply_keystream) to get an error
     /// instead, or [`apply_keystream_carry`](Self::apply_keystream_carry) for
     /// OpenSSL's carry-into-the-nonce behaviour (see the
-    /// [module docs](self#variants-and-counter-overflow)).
+    /// [type-level docs](ChaCha20#variants-and-counter-overflow)).
     pub fn apply_keystream(&self, nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
         assert!(
             ietf_fits(counter, buf.len()),

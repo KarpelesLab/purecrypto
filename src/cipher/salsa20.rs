@@ -281,6 +281,10 @@ impl XSalsa20 {
 ///
 /// On a failed [`decrypt`](Self::decrypt) the buffer is left as ciphertext:
 /// the tag is checked before anything is decrypted.
+///
+/// This exists for NaCl / libsodium interop. For new designs prefer
+/// [`XChaCha20Poly1305`](super::XChaCha20Poly1305), which also binds
+/// associated data and has wide SIMD kernels.
 #[derive(Clone)]
 pub struct XSalsa20Poly1305 {
     key: [u8; 32],
