@@ -511,3 +511,11 @@ unsafe_code = "deny"
 [profile.release]
 # Crypto code benefits from aggressive inlining of the small primitive ops.
 lto = "thin"
+
+[profile.test]
+# Unoptimised, the hash-based signatures (XMSS, SLH-DSA, LMS), the pairings
+# and the bignum keygen tests dominate: the lib suite takes ~2 minutes and
+# single XMSS tests over 60 s. At opt-level 2 the whole `cargo test` run is
+# ~10x faster for ~20 s more compile time. Debug assertions and overflow
+# checks stay on, as in `dev`.
+opt-level = 2
