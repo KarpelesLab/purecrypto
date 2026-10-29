@@ -78,7 +78,7 @@
 mod algorithm;
 mod blake2;
 mod blake3;
-#[cfg(all(feature = "std", target_arch = "aarch64"))]
+#[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 mod blake3_neon;
 #[cfg(target_arch = "x86_64")]
 mod blake3_simd;
