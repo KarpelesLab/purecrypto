@@ -797,6 +797,19 @@ pc_status pc_tls_cfg_set_verify_certificates(PcTlsCfg *cfg, int32_t verify);
 pc_status pc_tls_cfg_set_client_auth(PcTlsCfg *cfg, int32_t required,
                                      const uint8_t *roots_pem, size_t roots_pem_len);
 pc_status pc_tls_cfg_add_crl_pem(PcTlsCfg *cfg, const uint8_t *pem, size_t len);
+/* TLS 1.2 secure renegotiation (RFC 5746). enabled != 0 accepts the peer's
+ * requests and allows pc_tls_renegotiate; 0 (the default) declines them
+ * with a warning no_renegotiation alert. Server only: at most `limit`
+ * client-initiated renegotiations per `window_secs` seconds (PHP's
+ * reneg_limit / reneg_window; limit < 0 lifts it; default 2 per 300 s);
+ * on_exceeded 0 closes the connection (pc_tls_feed fails; the default),
+ * 1 declines the renegotiation and keeps the session, 2 lets it proceed
+ * and only sets pc_tls_renegotiation_limit_exceeded (PHP's
+ * reneg_limit_callback hook). Renegotiation additionally requires Extended
+ * Master Secret and the same peer certificate. Inert on TLS 1.3 / DTLS.
+ * PC_UNSUPPORTED for an unknown on_exceeded. */
+pc_status pc_tls_cfg_set_renegotiation(PcTlsCfg *cfg, int32_t enabled, int32_t limit,
+                                       uint32_t window_secs, int32_t on_exceeded);
 
 /* DTLS server only: cookie-exchange secret. `secret_len` MUST be 32; any
  * other length is rejected with PC_UNSUPPORTED. The explicit-length form
@@ -883,6 +896,17 @@ pc_status pc_tls_abort(PcTls *tls, uint8_t alert);
  * NULL handle. A transport EOF with 0 here is a truncated stream. Always 0
  * for DTLS. */
 int pc_tls_received_close_notify(const PcTls *tls);
+/* TLS 1.2 renegotiation: a client sends a new ClientHello, a server a
+ * HelloRequest; keep pumping pc_tls_pop / pc_tls_feed (pc_tls_send data is
+ * held back until it completes). PC_UNSUPPORTED unless enabled with
+ * pc_tls_cfg_set_renegotiation on an established TLS 1.2 session with
+ * Extended Master Secret; PC_CLOSED after pc_tls_close. */
+pc_status pc_tls_renegotiate(PcTls *tls);
+/* Completed TLS 1.2 renegotiations, -1 on a NULL handle. */
+int pc_tls_renegotiation_count(const PcTls *tls);
+/* Server: 1 once the client exceeded the renegotiation limit (sticky), 0
+ * otherwise, -1 on a NULL handle. */
+int pc_tls_renegotiation_limit_exceeded(const PcTls *tls);
 
 int pc_tls_is_handshake_complete(const PcTls *tls);
 pc_status pc_tls_negotiated_version(const PcTls *tls, uint16_t *out);

@@ -118,6 +118,8 @@ pub struct PcTlsCfg {
     /// DTLS: the RFC 9146 connection ID to receive under (see
     /// [`pc_dtls_cfg_set_connection_id`] / [`pc_dtls_cfg_set_connection_id_len`]).
     connection_id: Option<crate::tls::ConnectionId>,
+    /// TLS 1.2 renegotiation policy (see [`pc_tls_cfg_set_renegotiation`]).
+    renegotiation: crate::tls::RenegotiationPolicy,
 }
 
 struct CertAndKey {
@@ -192,6 +194,7 @@ impl PcTlsCfg {
             no_cookie: false,
             peer_addr: None,
             connection_id: None,
+            renegotiation: crate::tls::RenegotiationPolicy::default(),
         }
     }
 
@@ -284,6 +287,7 @@ impl PcTlsCfg {
             Some(crate::tls::ConnectionId::Random(len)) => b = b.connection_id_len(*len),
             _ => {}
         }
+        b = b.renegotiation(self.renegotiation.clone());
         if let Some(ck) = &self.cert {
             b = b.identity(ck.chain_der.clone(), ck.key.to_signing_key());
         }
@@ -629,6 +633,58 @@ pub unsafe extern "C" fn pc_tls_cfg_add_crl_pem(
             return PcStatus::BadEncoding;
         }
         unsafe { &mut *cfg }.crls_pem.push(s.to_string());
+        PcStatus::Ok
+    })
+}
+
+/// TLS 1.2 secure renegotiation (RFC 5746). `enabled` non-zero accepts the
+/// peer's renegotiation requests and allows [`pc_tls_renegotiate`]; zero
+/// (the default) declines them with a warning `no_renegotiation` alert.
+///
+/// Server only, the limit on client-initiated renegotiations (PHP's
+/// `reneg_limit` / `reneg_window`): `limit` renegotiations per
+/// `window_secs` seconds, a negative `limit` lifting it (PHP's `-1`); the
+/// default is 2 per 300 s. `on_exceeded` picks what exceeding it does: `0`
+/// closes the connection (the default; `pc_tls_feed` fails), `1` declines
+/// the renegotiation and keeps the session, `2` lets it proceed and only
+/// raises [`pc_tls_renegotiation_limit_exceeded`] — the hook for PHP's
+/// `reneg_limit_callback`.
+///
+/// A renegotiation must also run Extended Master Secret and keep the peer's
+/// certificate; see `tls::RenegotiationPolicy`. Inert on TLS 1.3 and DTLS.
+/// Returns [`PcStatus::Unsupported`] for an unknown `on_exceeded`.
+///
+/// # Safety
+/// `cfg` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_cfg_set_renegotiation(
+    cfg: *mut PcTlsCfg,
+    enabled: i32,
+    limit: i32,
+    window_secs: u32,
+    on_exceeded: i32,
+) -> PcStatus {
+    guard(|| {
+        if cfg.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let action = match on_exceeded {
+            0 => crate::tls::RenegotiationLimitAction::Close,
+            1 => crate::tls::RenegotiationLimitAction::Refuse,
+            2 => crate::tls::RenegotiationLimitAction::Notify,
+            _ => return PcStatus::Unsupported,
+        };
+        let client_limit = u32::try_from(limit)
+            .ok()
+            .map(|max| crate::tls::RenegotiationLimit { max, window_secs });
+        let policy = if enabled != 0 {
+            crate::tls::RenegotiationPolicy::enabled()
+        } else {
+            crate::tls::RenegotiationPolicy::disabled()
+        };
+        unsafe { &mut *cfg }.renegotiation = policy
+            .with_client_limit(client_limit)
+            .with_limit_action(action);
         PcStatus::Ok
     })
 }
@@ -1456,6 +1512,64 @@ pub unsafe extern "C" fn pc_tls_abort(tls: *mut PcTls, alert: u8) -> PcStatus {
         }
         handle.closed_locally = true;
         PcStatus::Ok
+    })
+}
+
+/// TLS 1.2 renegotiation (RFC 5746): a client sends a new ClientHello, a
+/// server a HelloRequest. Drive it like any traffic — drain with
+/// [`pc_tls_pop`], keep feeding the peer's bytes; [`pc_tls_send`] data is
+/// held back until it completes. Returns [`PcStatus::Unsupported`] when
+/// renegotiation is not enabled ([`pc_tls_cfg_set_renegotiation`]) or the
+/// connection cannot renegotiate (not an established TLS 1.2 session with
+/// Extended Master Secret, one already in flight, or closed).
+///
+/// # Safety
+/// `tls` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_renegotiate(tls: *mut PcTls) -> PcStatus {
+    guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let handle = unsafe { &mut *tls };
+        if handle.closed_locally {
+            return PcStatus::Closed;
+        }
+        match handle.inner.renegotiate() {
+            Ok(()) => PcStatus::Ok,
+            Err(_) => PcStatus::Unsupported,
+        }
+    })
+}
+
+/// Completed TLS 1.2 renegotiations on this connection, or -1 on a NULL
+/// handle.
+///
+/// # Safety
+/// `tls` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_renegotiation_count(tls: *const PcTls) -> i32 {
+    crate::ffi::common::guard_i32(-1, || {
+        if tls.is_null() {
+            return -1;
+        }
+        let n = unsafe { &*tls }.inner.renegotiation_count();
+        i32::try_from(n).unwrap_or(i32::MAX)
+    })
+}
+
+/// Server: 1 once the client exceeded the renegotiation limit (sticky), 0
+/// otherwise, -1 on a NULL handle. See [`pc_tls_cfg_set_renegotiation`].
+///
+/// # Safety
+/// `tls` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_renegotiation_limit_exceeded(tls: *const PcTls) -> i32 {
+    crate::ffi::common::guard_i32(-1, || {
+        if tls.is_null() {
+            return -1;
+        }
+        i32::from(unsafe { &*tls }.inner.renegotiation_limit_exceeded())
     })
 }
 

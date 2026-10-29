@@ -2249,6 +2249,129 @@ fn ec_self_signed_pem_rejects_unencodable_days() {
     unsafe { ec::pc_ec_free(key) };
 }
 
+/// `pc_tls_cfg_set_renegotiation` + `pc_tls_renegotiate`: a TLS 1.2 pair
+/// renegotiates from either side, and a limit of 0 with the `Notify` action
+/// lets the client-initiated one through while raising the flag. Without
+/// the opt-in `pc_tls_renegotiate` is refused.
+#[test]
+fn tls12_renegotiation_through_the_c_api() {
+    fn pair(enable: bool, limit: i32, action: i32) -> (*mut tls::PcTls, *mut tls::PcTls) {
+        let (chain_pem, key_pem) = loopback_identity();
+        let scfg = tls::pc_tls_cfg_new(1, 0x0303);
+        let ccfg = tls::pc_tls_cfg_new(0, 0x0303);
+        let sni = b"loopback.example\0";
+        unsafe {
+            assert_eq!(
+                tls::pc_tls_cfg_set_certificate(
+                    scfg,
+                    chain_pem.as_ptr(),
+                    chain_pem.len(),
+                    key_pem.as_ptr(),
+                    key_pem.len()
+                ),
+                PcStatus::Ok
+            );
+            if enable {
+                assert_eq!(
+                    tls::pc_tls_cfg_set_renegotiation(scfg, 1, limit, 300, action),
+                    PcStatus::Ok
+                );
+                assert_eq!(
+                    tls::pc_tls_cfg_set_renegotiation(ccfg, 1, -1, 0, 0),
+                    PcStatus::Ok
+                );
+            }
+            assert_eq!(
+                tls::pc_tls_cfg_set_renegotiation(ccfg, 1, -1, 0, 7),
+                PcStatus::Unsupported
+            );
+            assert_eq!(
+                tls::pc_tls_cfg_set_verify_certificates(ccfg, 0),
+                PcStatus::Ok
+            );
+            assert_eq!(
+                tls::pc_tls_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char),
+                PcStatus::Ok
+            );
+        }
+        let server = unsafe { tls::pc_tls_new(scfg) };
+        let client = unsafe { tls::pc_tls_new(ccfg) };
+        unsafe {
+            tls::pc_tls_cfg_free(scfg);
+            tls::pc_tls_cfg_free(ccfg);
+        }
+        for _ in 0..20 {
+            unsafe {
+                let _ = tls::pc_tls_handshake(client);
+                pump_wire(client, server);
+                let _ = tls::pc_tls_handshake(server);
+                pump_wire(server, client);
+            }
+        }
+        assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(client) }, 1);
+        assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(server) }, 1);
+        (client, server)
+    }
+    unsafe fn settle(client: *mut tls::PcTls, server: *mut tls::PcTls) {
+        for _ in 0..8 {
+            unsafe {
+                pump_wire(client, server);
+                pump_wire(server, client);
+            }
+        }
+    }
+
+    let (client, server) = pair(false, 2, 0);
+    assert_eq!(
+        unsafe { tls::pc_tls_renegotiate(client) },
+        PcStatus::Unsupported
+    );
+    assert_eq!(
+        unsafe { tls::pc_tls_renegotiate(server) },
+        PcStatus::Unsupported
+    );
+    unsafe {
+        tls::pc_tls_free(client);
+        tls::pc_tls_free(server);
+    }
+
+    let (client, server) = pair(true, 0, 2);
+    assert_eq!(unsafe { tls::pc_tls_renegotiate(server) }, PcStatus::Ok);
+    unsafe { settle(client, server) };
+    assert_eq!(unsafe { tls::pc_tls_renegotiation_count(client) }, 1);
+    assert_eq!(
+        unsafe { tls::pc_tls_renegotiation_limit_exceeded(server) },
+        0
+    );
+    assert_eq!(unsafe { tls::pc_tls_renegotiate(client) }, PcStatus::Ok);
+    let msg = b"after renegotiation";
+    assert_eq!(
+        unsafe { tls::pc_tls_send(client, msg.as_ptr(), msg.len()) },
+        PcStatus::Ok
+    );
+    unsafe { settle(client, server) };
+    assert_eq!(unsafe { tls::pc_tls_renegotiation_count(server) }, 2);
+    assert_eq!(
+        unsafe { tls::pc_tls_renegotiation_limit_exceeded(server) },
+        1
+    );
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    assert_eq!(
+        unsafe { tls::pc_tls_recv(server, buf.as_mut_ptr(), &mut len) },
+        PcStatus::Ok
+    );
+    assert_eq!(&buf[..len], msg);
+    assert_eq!(
+        unsafe { tls::pc_tls_renegotiation_count(core::ptr::null()) },
+        -1
+    );
+    unsafe {
+        tls::pc_tls_free(client);
+        tls::pc_tls_free(server);
+    }
+}
+
 // ---- Closed connections report `Closed` on the send paths -----------------
 
 /// `pc_tls_abort` queues the chosen fatal alert; once it is popped and fed
