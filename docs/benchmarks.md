@@ -156,6 +156,30 @@ Jacobian coordinates; verification a variable-time interleaved wNAF
 multiplication: OpenSSL's hand-written `mulx`/`adx` kernel against
 portable `u128` Rust.
 
+### RSA on AVX-512 IFMA (Zen 5)
+
+On a CPU with AVX-512 IFMA, `BoxedMontModulus` exponentiations run on 52-bit
+radix IFMA kernels, and the two CRT halves of a private operation run in
+lock step. The private operation keeps its base blinding, CRT fault check and
+fixed-window constant-time ladders; the blinding pair is cached and updated
+per use instead of re-derived and inverted each time. µs/op, medians of five
+runs, each on a random core in 100–180 of a shared AMD Zen 5 server
+(`taskset`), interleaved with OpenSSL 3.5 (`openssl speed rsaNNNN`, which also
+uses its IFMA code here). `BoxedRsaPrivateKey`, PKCS#1 v1.5 with SHA-256:
+
+| Operation | purecrypto | OpenSSL | before |
+|---|--:|--:|--:|
+| RSA-2048 sign | 149 | 176 | 720 |
+| RSA-2048 verify | 4.9 | 11 | 15.5 |
+| RSA-3072 sign | 348 | 515 | 2200 |
+| RSA-3072 verify | 8.0 | 23 | 32 |
+| RSA-4096 sign | 689 | 1140 | 4800 |
+| RSA-4096 verify | 11.9 | 41 | 56 |
+
+Without IFMA (portable kernels, same machine) RSA-2048 is 571 µs sign and
+15.5 µs verify; OpenSSL with IFMA masked off (`OPENSSL_ia32cap=:~0x200000`,
+its `mulx`/`adcx` assembly) signs in about 390 µs.
+
 ## Constant-time tradeoffs
 
 The crate is **pure Rust with no hand-written assembly** and prioritises
@@ -175,8 +199,9 @@ constant-time, no-foreign-code implementations. That shapes the numbers:
   methods fast libraries use (P-256 signing is the exception, at parity with
   OpenSSL — see the note under the table). We trade raw speed for the constant-time property and
   the no-assembly portability.
-- **RSA private-key ops are blinded** (per-call base blinding), which adds a
-  modular multiply but removes the timing dependence on the private exponent.
+- **RSA private-key ops are blinded** (base blinding with a cached pair that
+  is updated, with fresh randomness, on every use), which adds a few modular
+  multiplies but removes the timing dependence on the private exponent.
 - **ML-KEM is fast and constant-time** (the lattice arithmetic is naturally
   data-independent; decapsulation runs both the FO check and the
   implicit-rejection branch unconditionally).
