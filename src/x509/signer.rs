@@ -57,6 +57,11 @@ pub enum CertSigner<'a> {
     RsaPss(&'a BoxedRsaPrivateKey, PssHash),
     /// An ECDSA signing key.
     Ecdsa(&'a BoxedEcdsaPrivateKey),
+    /// An ECDSA signing key on a binary-field curve, signing with SHA-256
+    /// up to a 256-bit group order, SHA-384 up to 384 bits and SHA-512
+    /// above. Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
+    EcBinary(&'a crate::ec::binary::BinaryPrivateKey),
     /// An Ed25519 signing key.
     Ed25519(&'a Ed25519PrivateKey),
     /// An Ed448 signing key.
@@ -192,6 +197,17 @@ impl SignatureAlgId {
 /// §3.1, [`PssParams::for_hash`](super::PssParams::for_hash)) — the set
 /// [`CertSigner::RsaPss`] and the `SignatureAlgId::RsaPss*` variants sign
 /// with.
+/// The SHA-2 width a binary-curve [`CertSigner::EcBinary`] signs with: the
+/// smallest of 256 / 384 / 512 bits that covers the group order.
+#[cfg(feature = "legacy-ec")]
+fn binary_hash_bits(k: &crate::ec::binary::BinaryPrivateKey) -> usize {
+    match k.curve().order_bits() {
+        0..=256 => 256,
+        257..=384 => 384,
+        _ => 512,
+    }
+}
+
 fn rsassa_pss_algid(hash: PssHash) -> Vec<u8> {
     let params = PssRestriction::for_hash(hash).encode_params();
     encode_sequence(&[oid_tlv(oid::ID_RSASSA_PSS), params].concat())
@@ -242,6 +258,12 @@ impl CertSigner<'_> {
                     oid::ECDSA_WITH_SHA384
                 }
                 CurveId::P521 | CurveId::BrainpoolP512r1 => oid::ECDSA_WITH_SHA512,
+            },
+            #[cfg(feature = "legacy-ec")]
+            CertSigner::EcBinary(k) => match binary_hash_bits(k) {
+                256 => oid::ECDSA_WITH_SHA256,
+                384 => oid::ECDSA_WITH_SHA384,
+                _ => oid::ECDSA_WITH_SHA512,
             },
             CertSigner::Ed25519(_) => oid::ID_ED25519,
             CertSigner::Ed448(_) => oid::ID_ED448,
@@ -308,6 +330,15 @@ impl CertSigner<'_> {
                 .map_err(|_| Error::Verification)?;
                 Ok(sig.to_der(curve))
             }
+            // Must agree with `sig_alg_oid` above.
+            #[cfg(feature = "legacy-ec")]
+            CertSigner::EcBinary(k) => match binary_hash_bits(k) {
+                256 => k.sign::<Sha256>(tbs),
+                384 => k.sign::<Sha384>(tbs),
+                _ => k.sign::<Sha512>(tbs),
+            }
+            .map(|sig| sig.to_der())
+            .map_err(|_| Error::Verification),
             // Ed25519 is PureEdDSA: the raw 64-byte R‖S over the message itself.
             CertSigner::Ed25519(k) => Ok(k.sign(tbs).to_bytes().to_vec()),
             // Ed448 is PureEdDSA with the empty context: the raw 114-byte R‖S.
@@ -375,6 +406,8 @@ impl CertSigner<'_> {
                 AnyPublicKey::RsaPss(k.public_key(), PssRestriction::for_hash(*hash))
             }
             CertSigner::Ecdsa(k) => AnyPublicKey::Ecdsa(k.public_key()),
+            #[cfg(feature = "legacy-ec")]
+            CertSigner::EcBinary(k) => AnyPublicKey::EcBinary(k.public_key()),
             CertSigner::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()),
             CertSigner::Ed448(k) => AnyPublicKey::Ed448(k.public_key()),
             #[cfg(feature = "mldsa")]

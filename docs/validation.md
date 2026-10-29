@@ -159,6 +159,15 @@ update with the commands in `tools/wycheproof/README.md`.
 - **OpenSSL, byte-exact**: X25519 PKCS#8 (RFC 8410), ML-KEM-768 SPKI + ct/ss,
   ML-DSA-65 SPKI, X.509 SPKI pin (SHA-256 over the SPKI), PKCS#12 archives
   (OpenSSL 3 default *and* OpenSSL legacy 3DES), RSA-PSS (`examples/pss_interop`).
+- **OpenSSL 3.5, binary curves** (`ec::binary`, all 40 named curves):
+  OpenSSL's SEC 1 / PKCS#8 keys and SPKIs load (PKCS#8 re-encodes byte for
+  byte), its ECDSA signatures verify and ECDH matches `pkeyutl -derive`
+  (committed: `testdata/ec-binary/openssl-vectors.txt`), as do its
+  self-signed certificates on sect163k1, sect571r1, c2pnb176v1 and WTLS 1;
+  in the other direction `openssl dgst -verify`, `ec -check`, `pkey
+  -pubcheck`, `pkeyutl -derive` and `verify -check_ss_sig` accepted our
+  keys, signatures, shared secrets and certificates on every curve
+  (checked by hand when the curves were added).
 - **OpenSSL, behavioural**: ECDSA sign↔verify via `openssl dgst`, TLS 1.0/1.1
   legacy interop against OpenSSL 1.1.1 (`examples/tls_legacy_interop`, the
   `tls-legacy` feature).

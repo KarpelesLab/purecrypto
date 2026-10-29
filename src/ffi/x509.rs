@@ -200,6 +200,8 @@ fn key_json(cert: &Certificate) -> String {
         AnyPublicKey::Rsa(k) => ("RSA", None, Some(k.modulus().bit_len())),
         AnyPublicKey::RsaPss(k, _) => ("RSA-PSS", None, Some(k.modulus().bit_len())),
         AnyPublicKey::Ecdsa(k) => ("ECDSA", Some(curve_label(k.curve())), None),
+        #[cfg(feature = "legacy-ec")]
+        AnyPublicKey::EcBinary(k) => ("ECDSA", Some(k.curve().name()), None),
         AnyPublicKey::Ed25519(_) => ("Ed25519", None, None),
         AnyPublicKey::X25519(_) => ("X25519", None, None),
         AnyPublicKey::X448(_) => ("X448", None, None),

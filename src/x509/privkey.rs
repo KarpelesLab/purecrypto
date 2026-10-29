@@ -38,6 +38,10 @@ pub enum AnyPrivateKey {
     Rsa(BoxedRsaPrivateKey),
     /// An ECDSA private key on one of the supported curves.
     Ecdsa(BoxedEcdsaPrivateKey),
+    /// An ECDSA / ECDH private key on a binary-field curve (SEC 2 `sect*`,
+    /// X9.62 `c2pnb*` / `c2tnb*`, WTLS). Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
+    EcBinary(crate::ec::binary::BinaryPrivateKey),
     /// An Ed25519 private key.
     Ed25519(Ed25519PrivateKey),
     /// An Ed448 private key.
@@ -67,6 +71,8 @@ impl core::fmt::Debug for AnyPrivateKey {
         let kind = match self {
             AnyPrivateKey::Rsa(_) => "Rsa",
             AnyPrivateKey::Ecdsa(_) => "Ecdsa",
+            #[cfg(feature = "legacy-ec")]
+            AnyPrivateKey::EcBinary(_) => "EcBinary",
             AnyPrivateKey::Ed25519(_) => "Ed25519",
             AnyPrivateKey::Ed448(_) => "Ed448",
             AnyPrivateKey::X25519(_) => "X25519",
@@ -123,6 +129,8 @@ impl AnyPrivateKey {
         Ok(match self {
             AnyPrivateKey::Rsa(k) => CertSigner::Rsa(k),
             AnyPrivateKey::Ecdsa(k) => CertSigner::Ecdsa(k),
+            #[cfg(feature = "legacy-ec")]
+            AnyPrivateKey::EcBinary(k) => CertSigner::EcBinary(k),
             AnyPrivateKey::Ed25519(k) => CertSigner::Ed25519(k),
             AnyPrivateKey::Ed448(k) => CertSigner::Ed448(k),
             AnyPrivateKey::X25519(_) | AnyPrivateKey::X448(_) => {
@@ -184,6 +192,17 @@ impl AnyPrivateKey {
                 BoxedRsaPrivateKey::from_pkcs8_der(plain).map_err(|_| Error::Malformed)?,
             ))
         } else if alg == oid::EC_PUBLIC_KEY {
+            // A binary-field named curve goes to its own key type.
+            #[cfg(feature = "legacy-ec")]
+            if algid.peek_tag() == Some(crate::der::tag::OID)
+                && let Ok(curve) = parse_oid(algid.read_oid()?)
+                && crate::ec::binary::BinaryCurveId::from_named_curve_oid(&curve).is_some()
+            {
+                return Ok(AnyPrivateKey::EcBinary(
+                    crate::ec::binary::BinaryPrivateKey::from_pkcs8_der(plain)
+                        .map_err(|_| Error::Malformed)?,
+                ));
+            }
             Ok(AnyPrivateKey::Ecdsa(
                 BoxedEcdsaPrivateKey::from_pkcs8_der(plain).map_err(|_| Error::Malformed)?,
             ))
@@ -259,6 +278,8 @@ impl AnyPrivateKey {
         match self {
             AnyPrivateKey::Rsa(k) => Box::new(k),
             AnyPrivateKey::Ecdsa(k) => Box::new(k),
+            #[cfg(feature = "legacy-ec")]
+            AnyPrivateKey::EcBinary(k) => Box::new(k),
             AnyPrivateKey::Ed25519(k) => Box::new(k),
             AnyPrivateKey::Ed448(k) => Box::new(k),
             AnyPrivateKey::X25519(k) => Box::new(k),
@@ -279,6 +300,8 @@ impl AnyPrivateKey {
         match self {
             AnyPrivateKey::Rsa(k) => k,
             AnyPrivateKey::Ecdsa(k) => k,
+            #[cfg(feature = "legacy-ec")]
+            AnyPrivateKey::EcBinary(k) => k,
             AnyPrivateKey::Ed25519(k) => k,
             AnyPrivateKey::Ed448(k) => k,
             AnyPrivateKey::X25519(k) => k,

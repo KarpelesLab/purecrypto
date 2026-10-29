@@ -2172,6 +2172,82 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
         cert.verify_signature_with(&key).unwrap();
     }
 
+    /// Self-signed OpenSSL 3.5 certificates on binary curves (`openssl req
+    /// -x509 -sha256`): the SPKI loads as a binary-curve key and the
+    /// ecdsa-with-SHA256 signature verifies; a tampered TBS does not.
+    #[cfg(feature = "legacy-ec")]
+    #[test]
+    fn parse_and_verify_openssl_binary_curve_certs() {
+        use crate::ec::binary::BinaryCurveId;
+        let certs: [(BinaryCurveId, &str); 4] = [
+            (
+                BinaryCurveId::Sect163k1,
+                include_str!("../../testdata/ec-binary/cert-sect163k1.pem"),
+            ),
+            (
+                BinaryCurveId::Sect571r1,
+                include_str!("../../testdata/ec-binary/cert-sect571r1.pem"),
+            ),
+            (
+                BinaryCurveId::C2pnb176v1,
+                include_str!("../../testdata/ec-binary/cert-c2pnb176v1.pem"),
+            ),
+            (
+                BinaryCurveId::Wtls1,
+                include_str!("../../testdata/ec-binary/cert-wap-wsg-idm-ecid-wtls1.pem"),
+            ),
+        ];
+        for (curve, pem) in certs {
+            let cert = Certificate::from_pem(pem).unwrap();
+            let key = cert.subject_public_key().unwrap();
+            match &key {
+                crate::x509::AnyPublicKey::EcBinary(k) => assert_eq!(k.curve(), curve),
+                other => panic!("{curve}: {other:?}"),
+            }
+            assert_eq!(key.to_spki_der(), cert.spki_der().unwrap());
+            cert.verify_signature_with(&key).unwrap();
+            // Rename the subject ("purecrypto" -> "Purecrypto"): same
+            // length, so the certificate still parses, but the TBS changed.
+            let mut der = cert.to_der().to_vec();
+            let at = der.windows(10).position(|w| w == b"purecrypto").unwrap();
+            der[at] = b'P';
+            let bad = Certificate::from_der(der).unwrap();
+            assert!(bad.verify_signature_with(&key).is_err(), "{curve}");
+        }
+    }
+
+    /// A binary-curve CA key signs certificates (`CertSigner::EcBinary`)
+    /// whose signatures verify, through the registry, under its SPKI.
+    #[cfg(feature = "legacy-ec")]
+    #[test]
+    fn binary_curve_self_signed() {
+        use crate::ec::binary::{BinaryCurveId, BinaryPrivateKey};
+        use crate::rng::HmacDrbg;
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"binary-ca", b"n", &[]);
+        for curve in [
+            BinaryCurveId::Sect233r1,
+            BinaryCurveId::C2tnb359v1,
+            BinaryCurveId::Sect571k1,
+        ] {
+            let key = BinaryPrivateKey::generate(curve, &mut rng);
+            let signer = crate::x509::CertSigner::EcBinary(&key);
+            let name = DistinguishedName::common_name("binary self-signed");
+            let cert = Certificate::self_signed_general(&signer, &name, &validity(), 1, true, &[])
+                .unwrap();
+            let pk = cert.subject_public_key().unwrap();
+            assert!(matches!(pk, crate::x509::AnyPublicKey::EcBinary(_)));
+            cert.verify_signature_with(&pk).unwrap();
+            cert.check_well_formed().unwrap();
+            // The AnyPrivateKey path finds the same signer.
+            let any = crate::x509::AnyPrivateKey::from_pkcs8_der(
+                &key.to_pkcs8_der(),
+                crate::x509::Pkcs8ReadOptions::new(),
+            )
+            .unwrap();
+            assert!(matches!(any, crate::x509::AnyPrivateKey::EcBinary(_)));
+        }
+    }
+
     #[test]
     fn ec_self_signed_general() {
         use crate::ec::{BoxedEcdsaPrivateKey, CurveId};

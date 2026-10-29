@@ -380,6 +380,10 @@ pub enum AnyPublicKey {
     RsaPss(BoxedRsaPublicKey, PssRestriction),
     /// An ECDSA public key on one of the supported curves.
     Ecdsa(BoxedEcdsaPublicKey),
+    /// An ECDSA / ECDH public key on a binary-field curve (SEC 2 `sect*`,
+    /// X9.62 `c2pnb*` / `c2tnb*`, WTLS). Requires the `legacy-ec` feature.
+    #[cfg(feature = "legacy-ec")]
+    EcBinary(crate::ec::binary::BinaryPublicKey),
     /// An Ed25519 public key.
     Ed25519(Ed25519PublicKey),
     /// An X25519 key-agreement public key.
@@ -428,6 +432,8 @@ impl AnyPublicKey {
                 );
                 encode_sequence(&[algid, encode_bit_string(&k.to_sec1())].concat())
             }
+            #[cfg(feature = "legacy-ec")]
+            AnyPublicKey::EcBinary(k) => k.to_spki_der(),
             AnyPublicKey::Ed25519(k) => {
                 // RFC 8410: AlgorithmIdentifier is the bare OID (no parameters).
                 let algid = encode_sequence(&oid_tlv(oid::ID_ED25519));
@@ -514,6 +520,17 @@ impl AnyPublicKey {
             // are the namedCurve. Reject ECParameters trailers, implicitCA,
             // or any junk.
             algid.finish()?;
+            #[cfg(feature = "legacy-ec")]
+            if let Some(curve) =
+                crate::ec::binary::BinaryCurveId::from_named_curve_oid(curve_arcs.as_slice())
+            {
+                let key_bits = spki.read_bit_string()?;
+                spki.finish()?;
+                return Ok(AnyPublicKey::EcBinary(
+                    crate::ec::binary::BinaryPublicKey::from_sec1(curve, key_bits)
+                        .map_err(|_| Error::Malformed)?,
+                ));
+            }
             let curve = curve_from_oid(curve_arcs.as_slice()).ok_or(Error::UnsupportedAlgorithm)?;
             let key_bits = spki.read_bit_string()?;
             spki.finish()?;
@@ -717,6 +734,8 @@ impl AnyPublicKey {
             // 4055 restriction, so the boxed object stays an `AnyPublicKey`.
             k @ AnyPublicKey::RsaPss(..) => Box::new(k),
             AnyPublicKey::Ecdsa(k) => Box::new(k),
+            #[cfg(feature = "legacy-ec")]
+            AnyPublicKey::EcBinary(k) => Box::new(k),
             AnyPublicKey::Ed25519(k) => Box::new(k),
             AnyPublicKey::Ed448(k) => Box::new(k),
             AnyPublicKey::X25519(k) => Box::new(k),
@@ -742,6 +761,8 @@ impl AnyPublicKey {
         match self {
             AnyPublicKey::Rsa(k) | AnyPublicKey::RsaPss(k, _) => k,
             AnyPublicKey::Ecdsa(k) => k,
+            #[cfg(feature = "legacy-ec")]
+            AnyPublicKey::EcBinary(k) => k,
             AnyPublicKey::Ed25519(k) => k,
             AnyPublicKey::Ed448(k) => k,
             AnyPublicKey::X25519(k) => k,

@@ -118,9 +118,56 @@ pub(crate) fn curve_order_bits(curve: CurveId) -> u32 {
 /// Reads the curve OID alone: the point is not decoded (the on-curve check
 /// is `verify`'s, and costs more than the rest of the policy decision).
 fn ecdsa_spki_curve_bits(spki: &[u8]) -> Option<u32> {
-    ecdsa_spki_curve(spki)
-        .ok()
-        .map(|(curve, _)| curve_order_bits(curve))
+    match ecdsa_spki_curve(spki) {
+        Ok((curve, _)) => Some(curve_order_bits(curve)),
+        #[cfg(feature = "legacy-ec")]
+        Err(_) => binary_spki_curve(spki).map(|c| c.order_bits() as u32),
+        #[cfg(not(feature = "legacy-ec"))]
+        Err(_) => None,
+    }
+}
+
+/// The binary curve an `id-ecPublicKey` SPKI names, if it names one (the
+/// point is not decoded).
+#[cfg(feature = "legacy-ec")]
+fn binary_spki_curve(spki: &[u8]) -> Option<crate::ec::binary::BinaryCurveId> {
+    let mut reader = Reader::new(spki);
+    let mut outer = reader.read_sequence().ok()?;
+    let mut algid = outer.read_sequence().ok()?;
+    let alg = parse_oid(algid.read_oid().ok()?).ok()?;
+    if alg.as_slice() != oid::EC_PUBLIC_KEY {
+        return None;
+    }
+    let arcs = parse_oid(algid.read_oid().ok()?).ok()?;
+    crate::ec::binary::BinaryCurveId::from_named_curve_oid(&arcs)
+}
+
+/// Verifies a DER `Ecdsa-Sig-Value` over `message` under a binary-curve
+/// key, hashing with `D`.
+#[cfg(feature = "legacy-ec")]
+fn verify_ecdsa_binary_key<D: crate::hash::Digest>(
+    key: &crate::ec::binary::BinaryPublicKey,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), Error> {
+    let sig = crate::ec::binary::BinarySignature::from_der(key.curve(), signature)
+        .map_err(|_| Error::Malformed)?;
+    key.verify::<D>(message, &sig)
+        .map_err(|_| Error::Verification)
+}
+
+/// The any-curve entries' `verify_key`: an ECDSA key on any supported
+/// prime curve but SM2, or (with `legacy-ec`) on a binary curve.
+fn verify_ecdsa_any_key<D: crate::hash::Digest>(
+    key: &AnyPublicKey,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), Error> {
+    #[cfg(feature = "legacy-ec")]
+    if let AnyPublicKey::EcBinary(k) = key {
+        return verify_ecdsa_binary_key::<D>(k, message, signature);
+    }
+    verify_ecdsa_key::<D>(ecdsa_key(key, None)?, message, signature)
 }
 
 /// Verifies a raw 64-byte `R‖S` Ed25519 signature over `message`.
@@ -206,6 +253,12 @@ fn verify_ecdsa_any_curve<D: crate::hash::Digest>(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), Error> {
+    #[cfg(feature = "legacy-ec")]
+    if binary_spki_curve(spki).is_some() {
+        let key = crate::ec::binary::BinaryPublicKey::from_spki_der(spki)
+            .map_err(|_| Error::Malformed)?;
+        return verify_ecdsa_binary_key::<D>(&key, message, signature);
+    }
     let (_curve, key) = parse_ecdsa_spki(spki)?;
     verify_ecdsa_key::<D>(&key, message, signature)
 }
@@ -235,7 +288,7 @@ impl SignatureAlgorithm for EcdsaSha256AnyCurve {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), Error> {
-        verify_ecdsa_key::<Sha256>(ecdsa_key(key, None)?, message, signature)
+        verify_ecdsa_any_key::<Sha256>(key, message, signature)
     }
     fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
         ecdsa_spki_curve_bits(spki)
@@ -264,7 +317,7 @@ impl SignatureAlgorithm for EcdsaSha384AnyCurve {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), Error> {
-        verify_ecdsa_key::<Sha384>(ecdsa_key(key, None)?, message, signature)
+        verify_ecdsa_any_key::<Sha384>(key, message, signature)
     }
     fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
         ecdsa_spki_curve_bits(spki)
@@ -293,7 +346,7 @@ impl SignatureAlgorithm for EcdsaSha512AnyCurve {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), Error> {
-        verify_ecdsa_key::<Sha512>(ecdsa_key(key, None)?, message, signature)
+        verify_ecdsa_any_key::<Sha512>(key, message, signature)
     }
     fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
         ecdsa_spki_curve_bits(spki)
