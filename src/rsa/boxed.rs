@@ -601,6 +601,19 @@ pub(crate) const MIN_RSA_BITS: usize = 1024;
 /// enforces is still satisfiable (keygen requires `e < 2^(bits − 1) ≤ n`).
 pub(crate) const MIN_RSA_KEYGEN_BITS: usize = 256;
 
+/// Smallest modulus the `*_insecure` constructors and parsers
+/// ([`BoxedRsaPublicKey::try_new_insecure`],
+/// `BoxedRsaPublicKey::from_spki_der_insecure`,
+/// `BoxedRsaPrivateKey::from_pkcs1_der_insecure`, …) accept, in bits.
+///
+/// The same 256-bit floor as [`BoxedRsaPrivateKey::generate`], so every key
+/// this crate can generate can also be re-imported. Keys this small are
+/// breakable — a 512-bit modulus factors in hours on commodity hardware —
+/// and exist only for interop with legacy stacks and test suites (PHP's
+/// ext/openssl tests use 512-bit keys). The default constructors and parsers
+/// keep their 1024-bit floor.
+pub const MIN_RSA_INSECURE_BITS: usize = MIN_RSA_KEYGEN_BITS;
+
 /// Upper bound to prevent CPU-exhaustion on parsing huge SPKI moduli.
 /// `BoxedMontModulus::new` costs O(log(limbs)) Montgomery squarings for the
 /// R² precomp, and every subsequent `mont_mul` is O(limbs²). 16384 bits is
@@ -770,8 +783,23 @@ impl BoxedRsaPublicKey {
     /// or `e ≥ n`). Used by the attacker-controlled parse paths
     /// (SPKI / certificates).
     pub fn try_new(n: BoxedUint, e: BoxedUint) -> Result<Self, Error> {
+        Self::try_new_with_floor(n, e, MIN_RSA_BITS)
+    }
+
+    /// **Insecure.** [`try_new`](Self::try_new) with the modulus floor
+    /// lowered from 1024 to [`MIN_RSA_INSECURE_BITS`] (256) bits, for
+    /// interop with legacy / test keys such as 512-bit ones. Every other
+    /// check (exponent shape, the 16384-bit cap) still applies.
+    ///
+    /// A modulus this small can be factored by anyone who cares to; never
+    /// use such a key to protect anything.
+    pub fn try_new_insecure(n: BoxedUint, e: BoxedUint) -> Result<Self, Error> {
+        Self::try_new_with_floor(n, e, MIN_RSA_INSECURE_BITS)
+    }
+
+    fn try_new_with_floor(n: BoxedUint, e: BoxedUint, min_bits: usize) -> Result<Self, Error> {
         let bits = n.bit_len();
-        if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
+        if !(min_bits..=MAX_RSA_BITS).contains(&bits) {
             return Err(Error::InvalidLength);
         }
         validate_public_exponent(&n, &e)?;
@@ -1651,6 +1679,17 @@ impl RawPrivate for BoxedRsaPrivateKey {
 impl BoxedRsaPublicKey {
     /// Parses a PKCS#1 `RSAPublicKey` DER structure (`SEQUENCE { n, e }`).
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs1_der_with_floor(der, MIN_RSA_BITS)
+    }
+
+    /// **Insecure.** [`from_pkcs1_der`](Self::from_pkcs1_der) accepting
+    /// moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits instead of 1024
+    /// — see [`try_new_insecure`](Self::try_new_insecure).
+    pub fn from_pkcs1_der_insecure(der: &[u8]) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs1_der_with_floor(der, MIN_RSA_INSECURE_BITS)
+    }
+
+    fn from_pkcs1_der_with_floor(der: &[u8], min_bits: usize) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut seq = reader.read_sequence()?;
         let n = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
@@ -1658,7 +1697,7 @@ impl BoxedRsaPublicKey {
         seq.finish()?;
         reader.finish()?;
         let bits = n.bit_len();
-        if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
+        if !(min_bits..=MAX_RSA_BITS).contains(&bits) {
             return Err(crate::der::Error::Malformed);
         }
         validate_public_exponent(&n, &e).map_err(|_| crate::der::Error::Malformed)?;
@@ -1705,6 +1744,17 @@ impl BoxedRsaPublicKey {
     /// applied to the X.509 SPKI parser), and the inner BIT STRING decodes
     /// as a valid PKCS#1 `RSAPublicKey`.
     pub fn from_spki_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        Self::from_spki_der_with_floor(der, MIN_RSA_BITS)
+    }
+
+    /// **Insecure.** [`from_spki_der`](Self::from_spki_der) accepting
+    /// moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits instead of 1024
+    /// — see [`try_new_insecure`](Self::try_new_insecure).
+    pub fn from_spki_der_insecure(der: &[u8]) -> Result<Self, crate::der::Error> {
+        Self::from_spki_der_with_floor(der, MIN_RSA_INSECURE_BITS)
+    }
+
+    fn from_spki_der_with_floor(der: &[u8], min_bits: usize) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut outer = reader.read_sequence()?;
         let mut algid = outer.read_sequence()?;
@@ -1717,7 +1767,7 @@ impl BoxedRsaPublicKey {
         let key_bits = outer.read_bit_string()?;
         outer.finish()?;
         reader.finish()?;
-        Self::from_pkcs1_der(key_bits)
+        Self::from_pkcs1_der_with_floor(key_bits, min_bits)
     }
 
     /// Parses an SPKI PEM document (`-----BEGIN PUBLIC KEY-----`, RFC 7468).
@@ -1726,6 +1776,12 @@ impl BoxedRsaPublicKey {
     /// that form.
     pub fn from_spki_pem(pem: &str) -> Result<Self, crate::der::Error> {
         Self::from_spki_der(&crate::der::pem_decode(pem, "PUBLIC KEY")?)
+    }
+
+    /// **Insecure.** [`from_spki_pem`](Self::from_spki_pem) accepting
+    /// moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits instead of 1024.
+    pub fn from_spki_pem_insecure(pem: &str) -> Result<Self, crate::der::Error> {
+        Self::from_spki_der_insecure(&crate::der::pem_decode(pem, "PUBLIC KEY")?)
     }
 }
 
@@ -1758,6 +1814,18 @@ impl BoxedRsaPrivateKey {
     /// every prime field (`e·dP ≢ 1 mod p−1`, `e·dQ ≢ 1 mod q−1`, and
     /// likewise `dᵢ`) — the relation the CRT path depends on.
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs1_der_with_floor(der, MIN_RSA_BITS)
+    }
+
+    /// **Insecure.** [`from_pkcs1_der`](Self::from_pkcs1_der) accepting
+    /// moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits instead of 1024,
+    /// for legacy / test keys (e.g. 512-bit). Every consistency check still
+    /// runs. A key this small offers no security.
+    pub fn from_pkcs1_der_insecure(der: &[u8]) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs1_der_with_floor(der, MIN_RSA_INSECURE_BITS)
+    }
+
+    fn from_pkcs1_der_with_floor(der: &[u8], min_bits: usize) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut seq = reader.read_sequence()?;
         // RFC 8017 A.1.2: `version` is 0 for the two-prime structure, 1 for
@@ -1799,7 +1867,7 @@ impl BoxedRsaPrivateKey {
         seq.finish()?;
         reader.finish()?;
         let bits = n.bit_len();
-        if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
+        if !(min_bits..=MAX_RSA_BITS).contains(&bits) {
             return Err(crate::der::Error::Malformed);
         }
         validate_public_exponent(&n, &e).map_err(|_| crate::der::Error::Malformed)?;
@@ -1823,6 +1891,12 @@ impl BoxedRsaPrivateKey {
     /// Decodes a PKCS#1 PEM private key (`-----BEGIN RSA PRIVATE KEY-----`).
     pub fn from_pkcs1_pem(pem: &str) -> Result<Self, crate::der::Error> {
         Self::from_pkcs1_der(&crate::der::pem_decode(pem, "RSA PRIVATE KEY")?)
+    }
+
+    /// **Insecure.** [`from_pkcs1_pem`](Self::from_pkcs1_pem) accepting
+    /// moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits instead of 1024.
+    pub fn from_pkcs1_pem_insecure(pem: &str) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs1_der_insecure(&crate::der::pem_decode(pem, "RSA PRIVATE KEY")?)
     }
 
     /// Encodes the key as a PKCS#1 `RSAPrivateKey` DER structure with the CRT
@@ -1948,6 +2022,17 @@ impl BoxedRsaPrivateKey {
     /// at the outer SEQUENCE — its first field is an `AlgorithmIdentifier`,
     /// not the version INTEGER.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs8_der_with_floor(der, MIN_RSA_BITS)
+    }
+
+    /// **Insecure.** [`from_pkcs8_der`](Self::from_pkcs8_der) accepting
+    /// moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits instead of 1024
+    /// — see [`from_pkcs1_der_insecure`](Self::from_pkcs1_der_insecure).
+    pub fn from_pkcs8_der_insecure(der: &[u8]) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs8_der_with_floor(der, MIN_RSA_INSECURE_BITS)
+    }
+
+    fn from_pkcs8_der_with_floor(der: &[u8], min_bits: usize) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut outer = reader.read_sequence()?;
         let version = outer.read_integer_bytes()?;
@@ -1969,7 +2054,7 @@ impl BoxedRsaPrivateKey {
         // by anything mainstream for RSA). Reject trailing junk strictly.
         outer.finish()?;
         reader.finish()?;
-        Self::from_pkcs1_der(inner)
+        Self::from_pkcs1_der_with_floor(inner, min_bits)
     }
 
     /// Parses a PKCS#8 PEM document (`-----BEGIN PRIVATE KEY-----`,
@@ -1978,6 +2063,12 @@ impl BoxedRsaPrivateKey {
     /// that form.
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
         Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+    }
+
+    /// **Insecure.** [`from_pkcs8_pem`](Self::from_pkcs8_pem) accepting
+    /// moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits instead of 1024.
+    pub fn from_pkcs8_pem_insecure(pem: &str) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs8_der_insecure(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
     }
 
     /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 + RFC 8018
@@ -2023,6 +2114,30 @@ impl BoxedRsaPrivateKey {
         let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
             .map_err(|_| crate::der::Error::Malformed)?;
         Self::from_pkcs8_der(&inner)
+    }
+
+    /// **Insecure.** [`from_pkcs8_der_encrypted`](Self::from_pkcs8_der_encrypted)
+    /// accepting moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits.
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn from_pkcs8_der_encrypted_insecure(
+        der: &[u8],
+        password: &[u8],
+    ) -> Result<Self, crate::der::Error> {
+        let inner =
+            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?;
+        Self::from_pkcs8_der_insecure(&inner)
+    }
+
+    /// **Insecure.** [`from_pkcs8_pem_encrypted`](Self::from_pkcs8_pem_encrypted)
+    /// accepting moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits.
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn from_pkcs8_pem_encrypted_insecure(
+        pem: &str,
+        password: &[u8],
+    ) -> Result<Self, crate::der::Error> {
+        let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
+            .map_err(|_| crate::der::Error::Malformed)?;
+        Self::from_pkcs8_der_insecure(&inner)
     }
 }
 
@@ -3673,5 +3788,125 @@ mod tests {
         // The good parts themselves pass (so each case above failed for its
         // own reason).
         from_parts(good).unwrap();
+    }
+    /// A 512-bit key generated by OpenSSL 3.5 (`genpkey -algorithm RSA
+    /// -pkeyopt rsa_keygen_bits:512`) in its PKCS#8, PKCS#1 and SPKI forms.
+    #[cfg(feature = "der")]
+    const RSA512_PKCS8: &str = "-----BEGIN PRIVATE KEY-----
+MIIBUwIBADANBgkqhkiG9w0BAQEFAASCAT0wggE5AgEAAkEAp5m74bV6vpYubUNe
+51fjdq4rfqlSFvOy0cmuR6+ZqmxRwjXNbFgof/kLhUpFPv5OTg/VxVMfwaY64lB1
+cAw/qwIDAQABAkBlzNQ5CaFPqCr1BQndHR41lR8oJTKObGG+WXE5a6i7wWm6QZPH
+s/Uo3qNFUcW9eX1Winm34iD8NLmtnuoVQPoZAiEA1bdM7wI4qqlLHv+AzJWMHnqj
+PmB76h0wEECUzMs3c0cCIQDIwq/toOkf4Dy5WebAXcVIikW9Z8l8j8mmAkPycf5a
+fQIgcLGNceLb+rH2mMvmIPsivdexSO0bqmHlvEwxqqPmA3UCIH/+l9mBqH+5IB3v
+8k0cu6XW+kWagPwYVDCx6w4MnWSlAiAUKvxa3NXxkGZa2bLgm93kKehpLx72n2H0
+tpN+A9zZgw==
+-----END PRIVATE KEY-----
+";
+    #[cfg(feature = "der")]
+    const RSA512_PKCS1: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIBOQIBAAJBAKeZu+G1er6WLm1DXudX43auK36pUhbzstHJrkevmapsUcI1zWxY
+KH/5C4VKRT7+Tk4P1cVTH8GmOuJQdXAMP6sCAwEAAQJAZczUOQmhT6gq9QUJ3R0e
+NZUfKCUyjmxhvllxOWuou8FpukGTx7P1KN6jRVHFvXl9Vop5t+Ig/DS5rZ7qFUD6
+GQIhANW3TO8COKqpSx7/gMyVjB56oz5ge+odMBBAlMzLN3NHAiEAyMKv7aDpH+A8
+uVnmwF3FSIpFvWfJfI/JpgJD8nH+Wn0CIHCxjXHi2/qx9pjL5iD7Ir3XsUjtG6ph
+5bxMMaqj5gN1AiB//pfZgah/uSAd7/JNHLul1vpFmoD8GFQwsesODJ1kpQIgFCr8
+WtzV8ZBmWtmy4Jvd5CnoaS8e9p9h9LaTfgPc2YM=
+-----END RSA PRIVATE KEY-----
+";
+    #[cfg(feature = "der")]
+    const RSA512_SPKI: &str = "-----BEGIN PUBLIC KEY-----
+MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAKeZu+G1er6WLm1DXudX43auK36pUhbz
+stHJrkevmapsUcI1zWxYKH/5C4VKRT7+Tk4P1cVTH8GmOuJQdXAMP6sCAwEAAQ==
+-----END PUBLIC KEY-----
+";
+
+    /// The default parsers keep the 1024-bit floor; the `*_insecure` ones
+    /// load the 512-bit OpenSSL key, and it interoperates: OpenSSL's
+    /// `dgst -sha256 -sign` signature over `"hello"` verifies, and our
+    /// (deterministic) PKCS#1 v1.5 signature is byte-identical to it.
+    #[cfg(feature = "der")]
+    #[test]
+    fn insecure_parsers_accept_512_bit_openssl_key() {
+        use crate::der::Error as DerError;
+        use crate::test_util::from_hex_vec;
+        let ossl_sig = from_hex_vec(
+            "1ff21365a01c26137e0cc3c1299614ffa8a4aa1bbd77283e26f88be4cfae3764\
+             81c57ea06e7009341eb603ea9d16abe59850fce9cdf1f8fa9d7087d82d92d86a",
+        );
+
+        assert_eq!(
+            BoxedRsaPrivateKey::from_pkcs8_pem(RSA512_PKCS8).err(),
+            Some(DerError::Malformed)
+        );
+        assert_eq!(
+            BoxedRsaPrivateKey::from_pkcs1_pem(RSA512_PKCS1).err(),
+            Some(DerError::Malformed)
+        );
+        assert_eq!(
+            BoxedRsaPublicKey::from_spki_pem(RSA512_SPKI).err(),
+            Some(DerError::Malformed)
+        );
+
+        let sk8 = BoxedRsaPrivateKey::from_pkcs8_pem_insecure(RSA512_PKCS8).unwrap();
+        let sk1 = BoxedRsaPrivateKey::from_pkcs1_pem_insecure(RSA512_PKCS1).unwrap();
+        let pk = BoxedRsaPublicKey::from_spki_pem_insecure(RSA512_SPKI).unwrap();
+        assert_eq!(pk.modulus().bit_len(), 512);
+        assert!(bool::from(sk8.modulus().ct_eq(pk.modulus())));
+        assert!(bool::from(sk1.modulus().ct_eq(pk.modulus())));
+        assert_eq!(sk1.to_pkcs1_pem(), RSA512_PKCS1);
+        assert_eq!(sk8.to_pkcs8_pem(), RSA512_PKCS8);
+        assert_eq!(pk.to_spki_pem(), RSA512_SPKI);
+
+        pk.verify_pkcs1v15::<Sha256>(b"hello", &ossl_sig).unwrap();
+        assert_eq!(sk8.sign_pkcs1v15::<Sha256>(b"hello").unwrap(), ossl_sig);
+        assert!(pk.verify_pkcs1v15::<Sha256>(b"hellO", &ossl_sig).is_err());
+
+        // The DER entry points and the raw-component constructor agree.
+        let spki_der = pk.to_spki_der();
+        assert!(BoxedRsaPublicKey::from_spki_der(&spki_der).is_err());
+        let pk2 = BoxedRsaPublicKey::from_spki_der_insecure(&spki_der).unwrap();
+        assert!(BoxedRsaPublicKey::from_pkcs1_der(&pk.to_pkcs1_der()).is_err());
+        BoxedRsaPublicKey::from_pkcs1_der_insecure(&pk.to_pkcs1_der()).unwrap();
+        assert!(BoxedRsaPrivateKey::from_pkcs8_der(&sk8.to_pkcs8_der()).is_err());
+        BoxedRsaPrivateKey::from_pkcs8_der_insecure(&sk8.to_pkcs8_der()).unwrap();
+        assert!(BoxedRsaPrivateKey::from_pkcs1_der(&sk8.to_pkcs1_der()).is_err());
+        BoxedRsaPrivateKey::from_pkcs1_der_insecure(&sk8.to_pkcs1_der()).unwrap();
+        assert_eq!(
+            BoxedRsaPublicKey::try_new(pk2.modulus().clone(), pk2.exponent().clone()).err(),
+            Some(Error::InvalidLength)
+        );
+        BoxedRsaPublicKey::try_new_insecure(pk2.modulus().clone(), pk2.exponent().clone()).unwrap();
+    }
+
+    /// The insecure floor is 256 bits (the keygen floor): a generated
+    /// 256-bit key round-trips through the insecure parsers, anything
+    /// shorter is refused, and the other public-key checks still apply.
+    #[cfg(feature = "der")]
+    #[test]
+    fn insecure_floor_is_256_bits() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"insecure-floor", b"nonce", &[]);
+        let sk = BoxedRsaPrivateKey::generate(256, BoxedUint::from_u64(65537), &mut rng, 12);
+        let back = BoxedRsaPrivateKey::from_pkcs1_der_insecure(&sk.to_pkcs1_der()).unwrap();
+        assert!(bool::from(back.modulus().ct_eq(sk.modulus())));
+        BoxedRsaPublicKey::from_spki_der_insecure(&sk.public_key().to_spki_der()).unwrap();
+        assert_eq!(MIN_RSA_INSECURE_BITS, 256);
+
+        // A 255-bit odd modulus is below the floor.
+        let mut nb = [0u8; 32];
+        nb[0] = 0x40;
+        nb[31] = 1;
+        let n = BoxedUint::from_be_bytes(&nb);
+        assert_eq!(n.bit_len(), 255);
+        assert_eq!(
+            BoxedRsaPublicKey::try_new_insecure(n, BoxedUint::from_u64(65537)).err(),
+            Some(Error::InvalidLength)
+        );
+        // An even exponent is still refused.
+        let pk = sk.public_key();
+        assert_eq!(
+            BoxedRsaPublicKey::try_new_insecure(pk.modulus().clone(), BoxedUint::from_u64(4)).err(),
+            Some(Error::InvalidKey)
+        );
     }
 }

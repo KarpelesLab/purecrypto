@@ -141,7 +141,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `kdf` | HKDF, PBKDF2, scrypt, Argon2id/2d/2i, SP 800-108 KBKDF, PBES2 |
 | `rng` | `RngCore`/`CryptoRng`, HMAC-DRBG, `OsRng` (Unix, Linux `getrandom(2)`, Windows, Apple, WASI, browser wasm) |
 | `bignum` | Const-generic `Uint` and runtime `BoxedUint`, Montgomery arithmetic, constant-time modexp |
-| `rsa` | Key generation (512 to 65536 bits), PKCS#1 v1.5, OAEP, PSS, blinded CRT with fault check, PKCS#1 DER/PEM |
+| `rsa` | Key generation (512 to 65536 bits), PKCS#1 v1.5, OAEP, PSS, blinded CRT with fault check, PKCS#1 DER/PEM; opt-in `*_insecure` loaders for legacy keys down to 256 bits (default floor 1024) |
 | `dh` | Finite-field DH over RFC 3526 groups 14 to 18 plus RFC 4419 group exchange |
 | `dsa` | FIPS 186-4 DSA (2048/224, 2048/256, 3072/256) with RFC 6979 nonces, for legacy interop (opt-in) |
 | `bls` | BLS12-381 pairing, RFC 9380 hash-to-curve, BLS signatures (Basic, message augmentation, proof of possession, aggregation) (opt-in) |

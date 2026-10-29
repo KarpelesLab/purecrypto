@@ -27,7 +27,7 @@ mod pss;
 pub(crate) mod registry;
 
 #[cfg(feature = "alloc")]
-pub use boxed::{BoxedRsaPrivateKey, BoxedRsaPublicKey};
+pub use boxed::{BoxedRsaPrivateKey, BoxedRsaPublicKey, MIN_RSA_INSECURE_BITS};
 pub use keys::{RsaPrivateKey, RsaPublicKey};
 pub use prime::{is_prime, random_prime};
 
