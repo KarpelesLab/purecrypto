@@ -105,8 +105,12 @@ impl Default for RenegotiationLimit {
 /// `no_renegotiation` alert (RFC 5746 §4.2 / §4.4) and the connection
 /// stays up, and
 /// [`Connection::renegotiate`](crate::tls::Connection::renegotiate) is
-/// refused. See the [module docs](self) for the security conditions every
-/// renegotiation must also meet.
+/// refused. When enabled, every renegotiation must also use the Extended
+/// Master Secret (RFC 7627) on both the replaced and the new handshake (the
+/// triple-handshake defence), and the peer must present the same leaf
+/// certificate unless
+/// [`allow_peer_certificate_change`](Self::allow_peer_certificate_change) is
+/// set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RenegotiationPolicy {
