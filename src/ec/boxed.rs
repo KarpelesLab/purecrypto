@@ -22,7 +22,7 @@ use crate::bignum::BoxedUint;
 use crate::ct::Choice;
 use crate::hash::{Digest, Hmac};
 use crate::rng::{CryptoRng, RngCore};
-use crate::zeroize::Zeroize;
+use crate::zeroize::{Zeroize, Zeroizing};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -729,6 +729,16 @@ impl BoxedEcdsaPrivateKey {
         let n = curve.curve().order();
         let d = random_scalar(&curve, &n, rng);
         BoxedEcdsaPrivateKey { curve, d }
+    }
+
+    /// The secret scalar `d` as a big-endian byte string of the curve's
+    /// order width ([`BoxedCurve::order_len`] bytes, e.g. 32 for P-256, 66
+    /// for P-521), left-padded with zeros — the `privateKey` octets of a
+    /// SEC1 `ECPrivateKey` and the input [`from_bytes`](Self::from_bytes)
+    /// takes back. Returned in a [`Zeroizing`] buffer that wipes itself on
+    /// drop.
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.d.to_be_bytes(self.curve.order_len()))
     }
 
     /// The named curve this key belongs to.
@@ -1450,6 +1460,14 @@ impl BoxedEcdhPrivateKey {
         } else {
             Err(Error::InvalidInput)
         }
+    }
+
+    /// The secret scalar `d`, big-endian, [`BoxedCurve::order_len`] bytes
+    /// wide (zero-padded), in a [`Zeroizing`] buffer — the inverse of
+    /// [`from_bytes`](Self::from_bytes). See
+    /// [`BoxedEcdsaPrivateKey::to_bytes`].
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.d.to_be_bytes(self.curve.order_len()))
     }
 
     /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` carrying an
@@ -2745,5 +2763,62 @@ x2dqVh/sT12MnE=\n\
                 }
             }
         }
+    }
+    /// `to_bytes` returns the scalar at the curve's order width, left-padded,
+    /// and round-trips through `from_bytes` for both boxed key types — on
+    /// every width class (32, 48 and the 66-byte P-521), and for a scalar
+    /// with leading zero bytes.
+    #[test]
+    fn private_scalar_to_bytes_fixed_width() {
+        // RFC 6979 A.2.5 P-256 key.
+        let d = from_hex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+        let sk = BoxedEcdsaPrivateKey::from_bytes(CurveId::P256, &d).unwrap();
+        assert_eq!(&**sk.to_bytes(), &d[..]);
+        let ek = BoxedEcdhPrivateKey::from(sk.clone());
+        assert_eq!(&**ek.to_bytes(), &d[..]);
+
+        // A small scalar comes back zero-padded to the full order width.
+        for (curve, width) in [
+            (CurveId::P256, 32),
+            (CurveId::P384, 48),
+            (CurveId::P521, 66),
+            (CurveId::Secp256k1, 32),
+        ] {
+            let sk = BoxedEcdsaPrivateKey::from_bytes(curve, &[0x01, 0x23]).unwrap();
+            let b = sk.to_bytes();
+            assert_eq!(b.len(), width, "{curve:?}");
+            assert!(b[..width - 2].iter().all(|&x| x == 0));
+            assert_eq!(&b[width - 2..], &[0x01, 0x23]);
+            let ek = BoxedEcdhPrivateKey::from_bytes(curve, &b).unwrap();
+            assert_eq!(*ek.to_bytes(), *b);
+
+            let mut rng = HmacDrbg::<Sha256>::new(b"to_bytes", b"n", &[]);
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            let b = sk.to_bytes();
+            assert_eq!(b.len(), width);
+            let back = BoxedEcdsaPrivateKey::from_bytes(curve, &b).unwrap();
+            assert_eq!(back.public_key().to_sec1(), sk.public_key().to_sec1());
+            let mut rng = HmacDrbg::<Sha256>::new(b"to_bytes-ecdh", b"n", &[]);
+            let ek = BoxedEcdhPrivateKey::generate(curve, &mut rng);
+            let b = ek.to_bytes();
+            assert_eq!(b.len(), width);
+            let back = BoxedEcdhPrivateKey::from_bytes(curve, &b).unwrap();
+            assert_eq!(back.public_key().to_sec1(), ek.public_key().to_sec1());
+        }
+    }
+
+    /// The scalar `to_bytes` returns is the `privateKey` OCTET STRING of the
+    /// SEC1 encoding.
+    #[cfg(feature = "der")]
+    #[test]
+    fn private_scalar_matches_sec1_octets() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"to_bytes-sec1", b"n", &[]);
+        let sk = BoxedEcdsaPrivateKey::generate(CurveId::P384, &mut rng);
+        let der = sk.to_sec1_der();
+        let d = sk.to_bytes();
+        // SEQUENCE { INTEGER 1, OCTET STRING d, ... }: the scalar follows
+        // the 30 xx 02 01 01 04 30 header.
+        let pos = der.windows(2).position(|w| w == [0x04, 48]).unwrap();
+        assert_eq!(&der[pos + 2..pos + 2 + 48], &d[..]);
     }
 }

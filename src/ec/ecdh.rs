@@ -52,6 +52,17 @@ impl EcdhPrivateKey {
         }
     }
 
+    /// The 32-byte big-endian scalar — the inverse of
+    /// [`from_bytes`](Self::from_bytes), like
+    /// [`EcdsaPrivateKey::to_bytes`](super::ecdsa::EcdsaPrivateKey::to_bytes). The
+    /// result is secret key material; wipe it (e.g. via
+    /// [`Zeroizing`](crate::zeroize::Zeroizing)) when done.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        self.d.write_be_bytes(&mut out);
+        out
+    }
+
     /// The public key `d * G` to send to the peer.
     pub fn public_key(&self) -> EcdsaPublicKey {
         let curve = P256::new();
@@ -127,5 +138,24 @@ mod tests {
         let b_shared = bob.diffie_hellman(&alice.public_key()).unwrap();
         assert_eq!(a_shared, b_shared);
         assert_ne!(a_shared, [0u8; 32]);
+    }
+    /// `to_bytes` is the inverse of `from_bytes` (NIST KAS-ECC-CDH P-256 key
+    /// and a generated one), matching the ECDSA key's encoding of the same
+    /// scalar.
+    #[test]
+    fn to_bytes_roundtrip() {
+        let d = be32("7d7dc5f71eb29ddaf80d6214632eeae03d9058af1fb6d22ed80badb62bc1a534");
+        let k = EcdhPrivateKey::from_bytes(&d).unwrap();
+        assert_eq!(k.to_bytes(), d);
+        assert_eq!(
+            crate::ec::ecdsa::EcdsaPrivateKey::from_bytes(&d)
+                .unwrap()
+                .to_bytes(),
+            k.to_bytes()
+        );
+        let mut rng = HmacDrbg::<Sha256>::new(b"ecdh-to-bytes", b"n", &[]);
+        let k = EcdhPrivateKey::generate(&mut rng);
+        let back = EcdhPrivateKey::from_bytes(&k.to_bytes()).unwrap();
+        assert_eq!(back.public_key().to_sec1(), k.public_key().to_sec1());
     }
 }
