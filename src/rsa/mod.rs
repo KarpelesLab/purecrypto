@@ -9,6 +9,8 @@ mod keys;
 mod prime;
 
 #[cfg(feature = "alloc")]
+mod blinding;
+#[cfg(feature = "alloc")]
 mod boxed;
 mod digest_info;
 // Allocation-free: works entirely in caller-supplied buffers.

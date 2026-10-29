@@ -9,6 +9,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::blinding::BlindingCache;
 use super::emsa::{self, RawPrivate, RawPublic};
 use super::{Error, Pkcs1Digest, PssShake};
 use crate::bignum::{BoxedMontModulus, BoxedUint};
@@ -92,6 +93,9 @@ pub struct BoxedRsaPrivateKey {
     /// with an OS CSPRNG, all-zero on bare-metal `no_std`. Re-drawn on
     /// `Clone`.
     blind_salt: [u8; 16],
+    /// The cached blinding pair of the two-prime CRT path (see
+    /// [`super::blinding`]); empty on construction and on `Clone`.
+    blind_cache: BlindingCache,
 }
 
 // Manual `Clone`: `AtomicU32` is not `Clone`. The clone starts from the
@@ -113,6 +117,8 @@ impl Clone for BoxedRsaPrivateKey {
             blind_counter: AtomicU32::new(self.blind_counter.load(Ordering::Relaxed)),
             // Fresh salt: a clone must not replay the original's blinders.
             blind_salt: super::keys::fresh_blind_salt(),
+            // Likewise an empty blinding cache.
+            blind_cache: BlindingCache::new(self.mont.limbs()),
         }
     }
 }
@@ -454,21 +460,33 @@ fn raw_private_crt_blinded(
         rx.zeroize();
         mx
     };
-    let mut m_p = half(mont_p, &crt.dp, &crt.pm2);
-    let mut m_q = half(mont_q, &crt.dq, &crt.qm2);
+    // The two halves are independent: run them as one pair (in lock step on
+    // the IFMA backend).
+    let (mut m_p, mut m_q) = {
+        let mut cp = mont_p.reduce(&c_blind);
+        let mut rp = mont_p.reduce(&r);
+        let mut cq = mont_q.reduce(&c_blind);
+        let mut rq = mont_q.reduce(&r);
+        let bits = 64 * mont_p.limbs().max(mont_q.limbs());
+        let out = BoxedMontModulus::pow2_bits_pair(
+            mont_p,
+            (&cp, &crt.dp, &rp, &crt.pm2),
+            mont_q,
+            (&cq, &crt.dq, &rq, &crt.qm2),
+            bits,
+        );
+        cp.zeroize();
+        rp.zeroize();
+        cq.zeroize();
+        rq.zeroize();
+        out
+    };
 
-    // Garner recombination: m = m_q + q·(qInv·(m_p − m_q) mod p).
-    let mut m_q_mod_p = mont_p.reduce(&m_q);
-    let mut diff = mont_p.sub_mod(&m_p, &m_q_mod_p);
-    let mut h = mont_p.mul_mod(&diff, &crt.qinv);
-    let mut m = m_q.add(&key.q.mul(&h));
+    let mut m = garner(key, crt, &m_p, &m_q);
 
     r_e.zeroize();
     m_p.zeroize();
     m_q.zeroize();
-    m_q_mod_p.zeroize();
-    diff.zeroize();
-    h.zeroize();
 
     // Multi-prime continuation (RFC 8017 §5.1.2 step 2.b.v): `m` is so far
     // the residue mod `R = p·q`; each extra prime lifts it to mod `R·rᵢ`.
@@ -497,6 +515,121 @@ fn raw_private_crt_blinded(
     r.zeroize();
     c_blind.zeroize();
     m
+}
+
+/// Garner recombination of the two-prime CRT residues:
+/// `m = m_q + q·(qInv·(m_p − m_q) mod p)`, the value below `p·q` congruent
+/// to `m_p` mod `p` and `m_q` mod `q`. Constant-time arithmetic throughout
+/// (masked `sub_mod`, Montgomery `mul_mod`, fixed-schedule `add` / `mul`).
+fn garner(
+    key: &BoxedRsaPrivateKey,
+    crt: &BoxedRsaCrt,
+    m_p: &BoxedUint,
+    m_q: &BoxedUint,
+) -> BoxedUint {
+    let mont_p = &crt.mont_p;
+    let mut m_q_mod_p = mont_p.reduce(m_q);
+    let mut diff = mont_p.sub_mod(m_p, &m_q_mod_p);
+    let mut h = mont_p.mul_mod(&diff, &crt.qinv);
+    let mut qh = key.q.mul(&h);
+    let m = m_q.add(&qh);
+    m_q_mod_p.zeroize();
+    diff.zeroize();
+    h.zeroize();
+    qh.zeroize();
+    m
+}
+
+/// The per-operation multiplier index `t ∈ 0..16` of the cached blinding
+/// walk (see [`super::blinding`]): four bits of
+/// `HMAC-SHA256(seed, "t" ‖ nonce ‖ salt)`, so fresh whenever the salt is
+/// (OS entropy per operation) and unpredictable without the key otherwise.
+fn blind_walk_index(blinding_seed: &[u8; 32], nonce: u32, salt: &[u8; 16]) -> usize {
+    let mut m = HmacSha256::new(blinding_seed);
+    m.update(b"t");
+    m.update(&nonce.to_be_bytes());
+    m.update(salt);
+    let tag = m.finalize();
+    (tag.as_ref()[0] & 0x0f) as usize
+}
+
+/// A fresh blinding base for the cache: `(xᵉ, x⁻¹) mod n` for an
+/// HMAC-derived `x` ([`derive_blinder_boxed`]), with `x⁻¹` by Fermat in each
+/// prime field (`x^(p−2)`, `x^(q−2)`, run as one pair) and Garner. `None`
+/// when `x` is not invertible mod `n` (only if it shares a factor with `n`,
+/// or the key's primes are inconsistent) — checked by `x·x⁻¹ ≡ 1`.
+fn fresh_blinding_base(
+    key: &BoxedRsaPrivateKey,
+    crt: &BoxedRsaCrt,
+    nonce: u32,
+    salt: &[u8; 16],
+    c: &BoxedUint,
+) -> Option<(BoxedUint, BoxedUint)> {
+    let mont = &key.mont;
+    let (mont_p, mont_q) = (&crt.mont_p, &crt.mont_q);
+    let mut x = derive_blinder_boxed(mont, &key.blinding_seed, key.k, nonce, salt, c);
+    let mut xp = mont_p.reduce(&x);
+    let mut xq = mont_q.reduce(&x);
+    let bits = 64 * mont_p.limbs().max(mont_q.limbs());
+    let (mut ip, mut iq) =
+        BoxedMontModulus::pow_bits_pair(mont_p, &xp, &crt.pm2, mont_q, &xq, &crt.qm2, bits);
+    let mut xinv = garner(key, crt, &ip, &iq);
+    let mut check = mont.mul_mod(&x, &xinv);
+    // Public verdict: true for every consistent key.
+    let ok = check.ct_eq(&BoxedUint::from_u64(1)).declassify();
+    let xe = mont.pow_public(&x, &key.e);
+    for v in [&mut x, &mut xp, &mut xq, &mut ip, &mut iq, &mut check] {
+        v.zeroize();
+    }
+    if ok {
+        Some((xe, xinv))
+    } else {
+        let mut xe = xe;
+        xe.zeroize();
+        xinv.zeroize();
+        None
+    }
+}
+
+/// The two-prime CRT private op with a cached blinding pair
+/// ([`super::blinding`]): `m = ((c·rᵉ)^d mod n)·r⁻¹`, the exponentiation
+/// split by the CRT into `(c·rᵉ mod p)^dP` and `(c·rᵉ mod q)^dQ` — plain
+/// fixed-window ladders, run as one pair — and recombined by Garner. No
+/// inversion and no `rᵉ` exponentiation per operation: the cache hands out
+/// the pair after a few multiplications.
+///
+/// `None` when the cache is busy (another thread is in it) or could not be
+/// refreshed; the caller then runs [`raw_private_crt_blinded`]. Like that
+/// path, the result MUST be fault-checked before release.
+fn raw_private_crt_cached(
+    key: &BoxedRsaPrivateKey,
+    crt: &BoxedRsaCrt,
+    nonce: u32,
+    salt: &[u8; 16],
+    c: &BoxedUint,
+) -> Option<BoxedUint> {
+    let mont = &key.mont;
+    let t = blind_walk_index(&key.blinding_seed, nonce, salt);
+    let (mut a, mut b) = key
+        .blind_cache
+        .take(mont, t, || fresh_blinding_base(key, crt, nonce, salt, c))?;
+    // `a`, `b` are in Montgomery form, so one Montgomery multiply by a plain
+    // value yields the plain product.
+    let mut cb = mont.mont_mul(c, &a);
+    let (mont_p, mont_q) = (&crt.mont_p, &crt.mont_q);
+    let mut cp = mont_p.reduce(&cb);
+    let mut cq = mont_q.reduce(&cb);
+    let bits = 64 * mont_p.limbs().max(mont_q.limbs());
+    let (mut m_p, mut m_q) =
+        BoxedMontModulus::pow_bits_pair(mont_p, &cp, &crt.dp, mont_q, &cq, &crt.dq, bits);
+    let mut mr = garner(key, crt, &m_p, &m_q);
+    let m = mont.mont_mul(&mr, &b);
+    for v in [
+        &mut a, &mut b, &mut cb, &mut cp, &mut cq, &mut m_p, &mut m_q, &mut mr,
+    ] {
+        v.zeroize();
+    }
+    Some(m)
 }
 
 /// The full-width (non-CRT) base-blinded private op, `c^d mod n`.
@@ -557,7 +690,17 @@ fn raw_private_checked_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> Option<
         return Some(raw_private_full_width(key, nonce, &salt, c));
     };
 
-    let m = raw_private_crt_blinded(key, crt, nonce, &salt, c);
+    // Two-prime keys take the cached-blinding path unless another thread
+    // holds the cache; multi-prime keys always the stateless one.
+    let cached = if crt.others.is_empty() {
+        raw_private_crt_cached(key, crt, nonce, &salt, c)
+    } else {
+        None
+    };
+    let m = match cached {
+        Some(m) => m,
+        None => raw_private_crt_blinded(key, crt, nonce, &salt, c),
+    };
     // `c` is public in every caller (a ciphertext or an EMSA-encoded
     // digest), so the variable-time `lt` shortcut leaks nothing.
     let n = mont.modulus();
@@ -1033,6 +1176,7 @@ impl BoxedRsaPrivateKey {
             blinding_seed,
             blind_counter: AtomicU32::new(0),
             blind_salt: super::keys::fresh_blind_salt(),
+            blind_cache: BlindingCache::new(k.div_ceil(8)),
         }
     }
 
@@ -1113,6 +1257,7 @@ impl BoxedRsaPrivateKey {
             blinding_seed,
             blind_counter: AtomicU32::new(0),
             blind_salt: super::keys::fresh_blind_salt(),
+            blind_cache: BlindingCache::new(k.div_ceil(8)),
         }
     }
 
@@ -3908,5 +4053,113 @@ stHJrkevmapsUcI1zWxYKH/5C4VKRT7+Tk4P1cVTH8GmOuJQdXAMP6sCAwEAAQ==
             BoxedRsaPublicKey::try_new_insecure(pk.modulus().clone(), BoxedUint::from_u64(4)).err(),
             Some(Error::InvalidKey)
         );
+    }
+
+    /// The cached-blinding CRT path through several refresh cycles: PKCS#1
+    /// v1.5 signatures are deterministic, so every one must equal the
+    /// first (whatever blinder it ran under), and the cache must actually
+    /// be in use (its counter moves) — then a busy cache must fall back to
+    /// the stateless path with the same result, and a clone must start
+    /// empty.
+    #[test]
+    fn cached_blinding_through_refreshes() {
+        use super::super::blinding::REFRESH_INTERVAL;
+        let key = gen_small_key(b"blinding-cache");
+        let pk = key.public_key();
+        let sig0 = key.sign_pkcs1v15::<Sha256>(b"cache").unwrap();
+        pk.verify_pkcs1v15::<Sha256>(b"cache", &sig0).unwrap();
+        assert_eq!(key.blind_cache.uses_left(), REFRESH_INTERVAL - 1);
+        for i in 0..2 * REFRESH_INTERVAL + 5 {
+            let sig = key.sign_pkcs1v15::<Sha256>(b"cache").unwrap();
+            assert_eq!(sig, sig0, "signature {i}");
+        }
+        let left = key.blind_cache.uses_left();
+        assert!(left > 0 && left < REFRESH_INTERVAL);
+
+        key.blind_cache.set_busy(true);
+        assert_eq!(key.sign_pkcs1v15::<Sha256>(b"cache").unwrap(), sig0);
+        assert_eq!(key.blind_cache.uses_left(), left, "busy cache untouched");
+        key.blind_cache.set_busy(false);
+
+        let clone = key.clone();
+        assert_eq!(clone.blind_cache.uses_left(), 0);
+        assert_eq!(clone.sign_pkcs1v15::<Sha256>(b"cache").unwrap(), sig0);
+    }
+
+    /// Every pair the cache hands out is a valid blinding pair:
+    /// `A = rᵉ`, `B = r⁻¹`, so `A·Bᵉ ≡ 1 (mod n)`, for every walk index and
+    /// across a refresh; and consecutive pairs differ.
+    #[test]
+    fn cached_blinding_pairs_are_consistent() {
+        use super::super::blinding::REFRESH_INTERVAL;
+        let key = gen_small_key(b"blinding-pairs");
+        let crt = key.crt.as_deref().unwrap();
+        let mont = &key.mont;
+        let c = BoxedUint::from_u64(12345);
+        let mut prev: Option<BoxedUint> = None;
+        for i in 0..REFRESH_INTERVAL as usize + 20 {
+            let salt = [i as u8; 16];
+            let (a, b) = key
+                .blind_cache
+                .take(mont, i % 16, || {
+                    fresh_blinding_base(&key, crt, i as u32, &salt, &c)
+                })
+                .unwrap();
+            let (a, b) = (mont.from_mont(&a), mont.from_mont(&b));
+            let check = mont.mul_mod(&a, &mont.pow_public(&b, &key.e));
+            assert!(
+                check.ct_eq(&BoxedUint::from_u64(1)).declassify(),
+                "pair {i}"
+            );
+            assert!(prev.as_ref() != Some(&a), "pair {i} repeats");
+            prev = Some(a);
+        }
+    }
+
+    /// Raw private / public round trips (both directions) at modulus sizes
+    /// that land on and off the limb and 52-bit-digit boundaries of the
+    /// exponentiation kernels, under the cached-blinding CRT path.
+    #[test]
+    fn raw_round_trips_across_sizes() {
+        for bits in [512usize, 768, 1024, 1031, 1536, 2048, 2049] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"sizes", &bits.to_be_bytes(), &[]);
+            let key = BoxedRsaPrivateKey::generate(bits, BoxedUint::from_u64(65537), &mut rng, 4);
+            let pk = key.public_key();
+            let k = key.k;
+            for j in 0..3u8 {
+                let mut msg = vec![0u8; k];
+                for (i, b) in msg.iter_mut().enumerate().skip(1) {
+                    *b = (i as u8).wrapping_mul(31).wrapping_add(j);
+                }
+                let c = pk.raw_public(&msg).unwrap();
+                assert_eq!(key.raw_private(&c).unwrap(), msg, "bits={bits} j={j}");
+                let s = key.raw_private(&msg).unwrap();
+                assert_eq!(pk.raw_public(&s).unwrap(), msg, "bits={bits} j={j}");
+            }
+        }
+    }
+
+    /// Concurrent signing with one key: threads race for the blinding
+    /// cache, the losers take the stateless path, and every signature is
+    /// still the deterministic PKCS#1 v1.5 one.
+    #[cfg(feature = "std")]
+    #[test]
+    fn concurrent_signing_with_shared_cache() {
+        let key = std::sync::Arc::new(gen_small_key(b"blinding-threads"));
+        let sig0 = key.sign_pkcs1v15::<Sha256>(b"threads").unwrap();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let key = key.clone();
+                let sig0 = sig0.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..40 {
+                        assert_eq!(key.sign_pkcs1v15::<Sha256>(b"threads").unwrap(), sig0);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
