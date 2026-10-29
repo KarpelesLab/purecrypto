@@ -322,6 +322,29 @@ impl ChaCha20 {
         Ok(())
     }
 
+    /// ChaCha20-Poly1305's stitched loop: one 1 KiB AVX-512 pass from block
+    /// `counter` over the 1024 bytes at `p`, with `hook` run between double
+    /// rounds.
+    ///
+    /// # Safety
+    /// `p` must be valid for 1024 bytes of reads and writes, the counter
+    /// must not wrap within the pass, and the caller must be compiled with
+    /// AVX-512F.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    pub(super) unsafe fn xor_pass_avx512<H: FnMut(usize)>(
+        &self,
+        nonce: &[u8; 12],
+        counter: u32,
+        p: *mut u8,
+        hook: &mut H,
+    ) {
+        unsafe {
+            simd512::xor_pass_hooked(&self.key, &nonce_words(nonce), counter, p, hook);
+        }
+    }
+
     /// The RFC 8439 keystream XOR without the range check: the caller
     /// guarantees `counter + ⌈len/64⌉ ≤ 2³²`.
     fn xor_ctr32(&self, nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
@@ -481,8 +504,16 @@ mod simd512 {
     /// Sixteen keystream blocks for counters `ctr..ctr + 16` (wrapping per
     /// lane; lanes past the caller's range are discarded), returned in block
     /// order: element `b` is the 64-byte block for counter `ctr + b`.
+    /// `hook(i)` runs before double round `i` (`0..10`): ChaCha20-Poly1305
+    /// stitches its Poly1305 work in there, so the two instruction streams
+    /// interleave; everything else passes a no-op.
     #[inline(always)]
-    unsafe fn keystream16(key: &[u32; 8], n: &[u32; 3], ctr: u32) -> [__m512i; 16] {
+    unsafe fn keystream16<H: FnMut(usize)>(
+        key: &[u32; 8],
+        n: &[u32; 3],
+        ctr: u32,
+        hook: &mut H,
+    ) -> [__m512i; 16] {
         unsafe {
             #[rustfmt::skip]
             let lanes = _mm512_setr_epi32(
@@ -509,7 +540,8 @@ mod simd512 {
                 set(n[2]),
             ];
             let mut v = init;
-            for _ in 0..10 {
+            for i in 0..10 {
+                hook(i);
                 qr(&mut v, 0, 4, 8, 12);
                 qr(&mut v, 1, 5, 9, 13);
                 qr(&mut v, 2, 6, 10, 14);
@@ -558,6 +590,30 @@ mod simd512 {
     /// XORs the keystream from block `counter` into `buf`, except for a
     /// tail of at most one block, which is left for the caller's scalar
     /// loop. Returns the bytes done and the counter to resume from.
+    /// XORs one full 16-block pass of keystream from block `ctr` into the
+    /// 1024 bytes at `p`, calling `hook` between double rounds (see
+    /// [`keystream16`]).
+    ///
+    /// # Safety
+    /// `p` must be valid for 1024 bytes of reads and writes; the caller must
+    /// be compiled with AVX-512F.
+    #[inline(always)]
+    pub(super) unsafe fn xor_pass_hooked<H: FnMut(usize)>(
+        key: &[u32; 8],
+        n: &[u32; 3],
+        ctr: u32,
+        p: *mut u8,
+        hook: &mut H,
+    ) {
+        unsafe {
+            let ks = keystream16(key, n, ctr, hook);
+            for (b, k) in ks.iter().enumerate() {
+                let q = p.add(64 * b).cast::<__m512i>();
+                _mm512_storeu_si512(q, _mm512_xor_si512(_mm512_loadu_si512(q), *k));
+            }
+        }
+    }
+
     pub(super) fn apply_keystream(
         key: &[u32; 8],
         nonce: &[u8; 12],
@@ -581,7 +637,7 @@ mod simd512 {
             let len = buf.len();
             let mut passes = buf.chunks_exact_mut(1024);
             for pass in &mut passes {
-                let ks = keystream16(key, &n, ctr);
+                let ks = keystream16(key, &n, ctr, &mut |_| {});
                 let p = pass.as_mut_ptr();
                 for (b, k) in ks.iter().enumerate() {
                     let q = p.add(64 * b).cast::<__m512i>();
@@ -595,7 +651,7 @@ mod simd512 {
             if rest_len > 64 {
                 // A partial pass: every whole block it covers, plus the
                 // final partial block through a scratch block.
-                let ks = keystream16(key, &n, ctr);
+                let ks = keystream16(key, &n, ctr, &mut |_| {});
                 let mut blocks = rest.chunks_exact_mut(64);
                 for (blk, k) in (&mut blocks).zip(ks.iter()) {
                     let q = blk.as_mut_ptr().cast::<__m512i>();

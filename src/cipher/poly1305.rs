@@ -111,6 +111,22 @@ impl Poly1305 {
         }
     }
 
+    /// Whether ChaCha20-Poly1305's stitched loop can run: AVX-512 IFMA (and
+    /// so AVX-512F) is available and the state is block-aligned. Public
+    /// facts only.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn stitch_ready(&self) -> bool {
+        self.leftover == 0 && ifma::supported()
+    }
+
+    /// Starts ChaCha20-Poly1305's stitched loop (see [`ifma::Stitch`]).
+    /// Only valid once [`stitch_ready`](Self::stitch_ready) said so.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn stitch(&mut self) -> ifma::Stitch<'_> {
+        debug_assert!(self.stitch_ready());
+        ifma::Stitch::new(&mut self.st)
+    }
+
     /// Finalizes and returns the 16-byte authentication tag.
     pub fn finish(mut self) -> [u8; 16] {
         if self.leftover > 0 {
@@ -638,7 +654,7 @@ mod imp {
 /// `0..=1100`, large messages, extreme limbs and odd-sized streaming chunks.
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
-mod ifma {
+pub(super) mod ifma {
     use super::imp;
     use crate::zeroize::Zeroize;
     use core::arch::x86_64::*;
@@ -759,20 +775,33 @@ mod ifma {
         }
     }
 
-    #[target_feature(enable = "avx512f,avx512ifma")]
-    unsafe fn blocks_ifma(st: &mut imp::State, data: &[u8]) {
-        unsafe {
-            let groups = data.len() / 128;
-            let p = data.as_ptr();
-            let z = [_mm512_setzero_si512(); 3];
-            let bcast = |x: &[u64; 3]| -> [__m512i; 3] {
-                core::array::from_fn(|l| _mm512_set1_epi64(x[l] as i64))
-            };
-            let mults = |r: &[__m512i; 3]| [times20(r[1]), times20(r[2])];
+    /// The per-call constants: the fold powers and the stride.
+    struct Pow {
+        /// `pw[k]` = `r^(8k + 8 − j)` per lane: what a chain owes when its
+        /// final group is `k` groups before the message's last one.
+        pw: [[__m512i; 3]; CHAINS],
+        /// `r^(8·CHAINS)` = `r³²` in every lane and its `20·r` multiples.
+        step: [__m512i; 3],
+        step_s: [__m512i; 2],
+    }
 
-            // Lane power vectors. Lane `L` holds block `j(L)` of a group and,
-            // in the chain holding the final group, owes `r^(8 − j)`:
-            // `r · Π r^(2^i)` over the set bits `i` of `7 − j`.
+    #[inline(always)]
+    unsafe fn bcast(x: &[u64; 3]) -> [__m512i; 3] {
+        unsafe { core::array::from_fn(|l| _mm512_set1_epi64(x[l] as i64)) }
+    }
+
+    #[inline(always)]
+    unsafe fn mults(r: &[__m512i; 3]) -> [__m512i; 2] {
+        unsafe { [times20(r[1]), times20(r[2])] }
+    }
+
+    /// Builds the lane power vectors. Lane `L` holds block `j(L)` of a group
+    /// and, in the chain holding the final group, owes `r^(8 − j)`:
+    /// `r · Π r^(2^i)` over the set bits `i` of `7 − j`.
+    #[inline(always)]
+    unsafe fn setup(st: &imp::State) -> Pow {
+        unsafe {
+            let z = [_mm512_setzero_si512(); 3];
             let mut rp = st.r_pows();
             let one = [
                 _mm512_set1_epi64(1),
@@ -790,22 +819,29 @@ mod ifma {
             let x01 = mul_add(&x0, &x1, &mults(&x1), &z);
             let x2r = mul_add(&x2, &r1, &mults(&r1), &z);
             let lo_pow = mul_add(&x01, &x2r, &mults(&x2r), &z);
-            // pw[k] = r^(8k + 8 − j): what a chain owes when its final group
-            // is k groups before the message's last one.
             let r8 = bcast(&rp[3]);
             let r16 = bcast(&rp[4]);
             let p1 = mul_add(&lo_pow, &r8, &mults(&r8), &z);
             let p2 = mul_add(&lo_pow, &r16, &mults(&r16), &z);
             let p3 = mul_add(&p1, &r16, &mults(&r16), &z);
-            let pw = [lo_pow, p1, p2, p3];
-            // The stride: every chain advances by r^(8·CHAINS) = r³² per step.
             let step = bcast(&rp[5]);
             let step_s = mults(&step);
             rp.zeroize();
+            Pow {
+                pw: [lo_pow, p1, p2, p3],
+                step,
+                step_s,
+            }
+        }
+    }
 
-            // Chain `c` takes the 128-byte groups `g ≡ c (mod CHAINS)`; the
-            // running `h` joins lane 0 of chain 0 (block 0, the oldest).
-            let mut acc = [z; CHAINS];
+    /// Starts the chains on the first `CHAINS` groups at `p` (fewer if
+    /// `groups` is smaller; missing chains stay zero), with the running `h`
+    /// joining lane 0 of chain 0 (block 0, the oldest).
+    #[inline(always)]
+    unsafe fn start(st: &imp::State, p: *const u8, groups: usize) -> [[__m512i; 3]; CHAINS] {
+        unsafe {
+            let mut acc = [[_mm512_setzero_si512(); 3]; CHAINS];
             for (c, x) in acc.iter_mut().enumerate() {
                 if c < groups {
                     *x = load8(p.add(128 * c));
@@ -815,31 +851,127 @@ mod ifma {
             for (x, &hl) in acc[0].iter_mut().zip(h.iter()) {
                 *x = _mm512_add_epi64(*x, _mm512_set_epi64(0, 0, 0, 0, 0, 0, 0, hl as i64));
             }
-            let mut g = CHAINS;
-            while g + CHAINS <= groups {
-                for (c, x) in acc.iter_mut().enumerate() {
-                    *x = mul_add(x, &step, &step_s, &load8(p.add(128 * (g + c))));
-                }
-                g += CHAINS;
-            }
-            for (c, x) in acc.iter_mut().enumerate().take(groups.saturating_sub(g)) {
-                *x = mul_add(x, &step, &step_s, &load8(p.add(128 * (g + c))));
-            }
+            acc
+        }
+    }
 
-            // Fold: chain `c`'s last group is `(groups − 1 − c) mod CHAINS`
-            // groups before the final one (a chain with no groups is zero
-            // and its power is irrelevant). Then sum every lane of every
-            // chain: at most 32 limbs below 2⁴⁴ + 2¹⁴, far from overflow.
+    /// Advances chains `0..n` by one group each from `p` (chain `c` takes
+    /// the group at `p + 128c`).
+    #[inline(always)]
+    unsafe fn step(acc: &mut [[__m512i; 3]; CHAINS], pow: &Pow, p: *const u8, n: usize) {
+        unsafe {
+            for (c, x) in acc.iter_mut().enumerate().take(n) {
+                *x = mul_add(x, &pow.step, &pow.step_s, &load8(p.add(128 * c)));
+            }
+        }
+    }
+
+    /// Folds the chains after `groups` groups in total back into `st.h`:
+    /// chain `c`'s last group is `(groups − 1 − c) mod CHAINS` groups before
+    /// the final one (a chain with no groups is zero and its power is
+    /// irrelevant), then every lane of every chain is summed — at most 32
+    /// limbs below 2⁴⁴ + 2¹⁴, far from overflow.
+    #[inline(always)]
+    unsafe fn fold(st: &mut imp::State, pow: &Pow, acc: &[[__m512i; 3]; CHAINS], groups: usize) {
+        unsafe {
+            let z = [_mm512_setzero_si512(); 3];
             let mut tot = z;
             for (c, x) in acc.iter().enumerate() {
                 let k = (groups + CHAINS - 1 - c) % CHAINS;
-                let f = mul_add(x, &pw[k], &mults(&pw[k]), &z);
+                let f = mul_add(x, &pow.pw[k], &mults(&pow.pw[k]), &z);
                 for (t, v) in tot.iter_mut().zip(f.iter()) {
                     *t = _mm512_add_epi64(*t, *v);
                 }
             }
             let sum: [u64; 3] = core::array::from_fn(|l| _mm512_reduce_add_epi64(tot[l]) as u64);
             st.set_h44(sum);
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn blocks_ifma(st: &mut imp::State, data: &[u8]) {
+        unsafe {
+            let groups = data.len() / 128;
+            let p = data.as_ptr();
+            let pow = setup(st);
+            let mut acc = start(st, p, groups);
+            let mut g = CHAINS;
+            while g + CHAINS <= groups {
+                step(&mut acc, &pow, p.add(128 * g), CHAINS);
+                g += CHAINS;
+            }
+            step(
+                &mut acc,
+                &pow,
+                p.add(128 * g.min(groups)),
+                groups.saturating_sub(g),
+            );
+            fold(st, &pow, &acc, groups);
+        }
+    }
+
+    /// ChaCha20-Poly1305's stitched-loop handle: absorbs 128-byte groups
+    /// one at a time (so the cipher can call it between its rounds) into
+    /// the same four chains as [`blocks_ifma`], and folds them back into
+    /// the state when finished. Its methods are `#[inline(always)]` and
+    /// must only be called from code compiled with AVX-512F and AVX-512
+    /// IFMA enabled, which [`Poly1305::stitch`](super::Poly1305) having
+    /// returned it guarantees the CPU supports.
+    pub(in crate::cipher) struct Stitch<'a> {
+        st: &'a mut imp::State,
+        pow: Option<Pow>,
+        acc: [[__m512i; 3]; CHAINS],
+        groups: usize,
+    }
+
+    impl<'a> Stitch<'a> {
+        pub(super) fn new(st: &'a mut imp::State) -> Self {
+            Stitch {
+                st,
+                pow: None,
+                // SAFETY: `__m512i` is plain integer data, for which all-zero
+                // bytes are a valid value.
+                acc: unsafe { core::mem::zeroed() },
+                groups: 0,
+            }
+        }
+
+        /// Absorbs the 128 bytes at `p` as the next group.
+        ///
+        /// # Safety
+        /// `p` must be valid for 128 bytes of reads; the caller must be
+        /// compiled with AVX-512F and AVX-512 IFMA.
+        #[inline(always)]
+        pub(in crate::cipher) unsafe fn absorb(&mut self, p: *const u8) {
+            unsafe {
+                let g = self.groups;
+                let c = g % CHAINS;
+                if g < CHAINS {
+                    if g == 0 {
+                        self.pow = Some(setup(self.st));
+                        self.acc = start(self.st, p, 1);
+                    } else {
+                        self.acc[c] = load8(p);
+                    }
+                } else {
+                    let pow = self.pow.as_ref().expect("set up on the first group");
+                    self.acc[c] = mul_add(&self.acc[c], &pow.step, &pow.step_s, &load8(p));
+                }
+                self.groups = g + 1;
+            }
+        }
+
+        /// Folds the chains back into the Poly1305 state.
+        ///
+        /// # Safety
+        /// The caller must be compiled with AVX-512F and AVX-512 IFMA.
+        #[inline(always)]
+        pub(in crate::cipher) unsafe fn finish(self) {
+            unsafe {
+                if let Some(pow) = &self.pow {
+                    fold(self.st, pow, &self.acc, self.groups);
+                }
+            }
         }
     }
 }
