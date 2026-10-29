@@ -13,7 +13,9 @@
 //! constant time, built from 32-bit ARX and 130-bit limb arithmetic.
 //! [`ChaCha20`] also offers the original 64-bit-nonce variant and an
 //! OpenSSL-compatible counter carry; [`XChaCha20`] is the 192-bit-nonce
-//! stream.
+//! stream. The Salsa20 family ([`Salsa20`], [`XSalsa20`], [`hsalsa20`]) and
+//! NaCl's `secretbox` ([`XSalsa20Poly1305`]) are there for libsodium / NaCl
+//! interop.
 //!
 //! SEED ([`Seed`]), MORUS ([`Morus640`] / [`Morus1280`]), the original
 //! CAESAR AEGIS-128 ([`Aegis128`], superseded by [`Aegis128L`]) and the TEA
@@ -100,9 +102,7 @@ mod kw;
 mod morus;
 mod ofb;
 mod poly1305;
-// Likewise Salsa20/8: only `kdf::scrypt` (also `alloc`-gated) uses its core
-// permutation.
-#[cfg(all(feature = "kdf", feature = "alloc"))]
+// `pub(crate)` so that `kdf::scrypt` can reach the Salsa20/8 core.
 pub(crate) mod salsa20;
 mod sbox_bitsliced;
 #[cfg(feature = "legacy-ciphers")]
@@ -146,6 +146,7 @@ pub use kw::{
 pub use morus::{Morus640, Morus1280};
 pub use ofb::Ofb;
 pub use poly1305::Poly1305;
+pub use salsa20::{Salsa20, XSalsa20, XSalsa20Poly1305, hsalsa20};
 #[cfg(feature = "legacy-ciphers")]
 pub use seed::Seed;
 #[cfg(feature = "alloc")]
@@ -331,7 +332,7 @@ impl From<TagMismatch> for AeadError {
 
 /// Error returned by the fallible stream-cipher entry points
 /// ([`ChaCha20::try_apply_keystream`], [`ChaCha20::apply_keystream_djb`],
-/// [`XChaCha20::apply_keystream`], …) when the request would run the block
+/// [`Salsa20::apply_keystream`], …) when the request would run the block
 /// counter past the end of its range.
 ///
 /// Wrapping the counter would repeat keystream already used under the same
