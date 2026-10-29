@@ -861,7 +861,7 @@ impl Clone for Hasher {
 /// [`ExportableState`] (all but BLAKE3).
 macro_rules! exportable_algorithms {
     ($m:ident) => {
-        $m!(
+        with_legacy_exportable!($m;
             Sha224,
             Sha256,
             Sha384,
@@ -890,14 +890,38 @@ macro_rules! exportable_algorithms {
     };
 }
 
+/// Appends the `legacy-hashes` variants to an [`exportable_algorithms!`]
+/// list when that feature is on.
+#[cfg(feature = "legacy-hashes")]
+macro_rules! with_legacy_exportable {
+    ($m:ident; $($v:ident),*) => {
+        $m!(
+            $($v,)*
+            Ripemd128, Ripemd256, Ripemd320,
+            Tiger128_3, Tiger160_3, Tiger192_3, Tiger128_4, Tiger160_4, Tiger192_4,
+            Snefru256, Gost94, Gost94CryptoPro,
+            Haval128_3, Haval160_3, Haval192_3, Haval224_3, Haval256_3,
+            Haval128_4, Haval160_4, Haval192_4, Haval224_4, Haval256_4,
+            Haval128_5, Haval160_5, Haval192_5, Haval224_5, Haval256_5
+        )
+    };
+}
+
+/// Without `legacy-hashes`, the list as given.
+#[cfg(not(feature = "legacy-hashes"))]
+macro_rules! with_legacy_exportable {
+    ($m:ident; $($v:ident),*) => {
+        $m!($($v),*)
+    };
+}
+
 impl HashAlgorithm {
     /// The largest [`state_len`](HashAlgorithm::state_len) of any variant
     /// (SHA3-224, whose rate-sized buffer is the widest).
     pub const MAX_STATE_LEN: usize = 347;
 
     /// Length of this algorithm's [exported state](Hasher::export_state), or
-    /// `None` when its state cannot be exported (BLAKE3 and the
-    /// `legacy-hashes` digests).
+    /// `None` when its state cannot be exported (BLAKE3).
     pub const fn state_len(self) -> Option<usize> {
         macro_rules! arms {
             ($($v:ident),*) => {
@@ -905,7 +929,7 @@ impl HashAlgorithm {
                     $(HashAlgorithm::$v => {
                         Some(<crate::hash::$v as ExportableState>::STATE_LEN)
                     })*
-                    // BLAKE3 and the `legacy-hashes` digests.
+                    // BLAKE3.
                     _ => None,
                 }
             };
@@ -920,8 +944,7 @@ impl Hasher {
     /// [`state_len`](HashAlgorithm::state_len).
     ///
     /// Fails with [`StateError::InvalidLength`] when `out` is shorter than
-    /// that, and with [`StateError::Unsupported`] for BLAKE3 and the
-    /// `legacy-hashes` digests. A buffer of
+    /// that, and with [`StateError::Unsupported`] for BLAKE3. A buffer of
     /// [`HashAlgorithm::MAX_STATE_LEN`] bytes fits every algorithm.
     pub fn export_state(&self, out: &mut [u8]) -> Result<usize, StateError> {
         macro_rules! arms {

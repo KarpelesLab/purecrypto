@@ -263,6 +263,28 @@ ripemd!(
     compress320
 );
 
+super::state::impl_exportable_state!(
+    Ripemd128,
+    super::state::tag::RIPEMD128,
+    super::state::md32_state_len(4),
+    |s| s.state,
+    Ripemd128::new()
+);
+super::state::impl_exportable_state!(
+    Ripemd256,
+    super::state::tag::RIPEMD256,
+    super::state::md32_state_len(8),
+    |s| s.state,
+    Ripemd256::new()
+);
+super::state::impl_exportable_state!(
+    Ripemd320,
+    super::state::tag::RIPEMD320,
+    super::state::md32_state_len(10),
+    |s| s.state,
+    Ripemd320::new()
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

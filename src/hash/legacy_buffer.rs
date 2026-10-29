@@ -62,6 +62,30 @@ impl<const B: usize> BlockBuffer<B> {
         self.total.wrapping_mul(8)
     }
 
+    /// Exported-state length of the buffer part: the byte counter (`u64`),
+    /// the buffered count (`u8`) and the `B`-byte buffer.
+    pub(super) const STATE_LEN: usize = 8 + 1 + B;
+
+    /// Writes the byte counter, then the buffered count and buffer (see
+    /// [`ExportableState`](super::ExportableState)).
+    pub(super) fn export_into(&self, w: &mut super::state::Writer<'_>) {
+        w.u64(self.total);
+        w.buffer(&self.buf, self.len);
+    }
+
+    /// Reads what [`Self::export_into`] wrote. Full blocks are compressed as
+    /// soon as they fill, so the buffered count must be below `B` and equal
+    /// to the byte counter modulo `B`.
+    pub(super) fn import_from(r: &mut super::state::Reader<'_>) -> Result<Self, super::StateError> {
+        let total = r.u64();
+        let mut buf = [0u8; B];
+        let len = r.buffer(&mut buf, B - 1)?;
+        if total % B as u64 != len as u64 {
+            return Err(super::StateError::Inconsistent);
+        }
+        Ok(BlockBuffer { buf, len, total })
+    }
+
     /// Best-effort wipe of the buffered bytes and the counter.
     pub(super) fn zeroize(&mut self) {
         super::zeroize::zero_bytes(&mut self.buf);

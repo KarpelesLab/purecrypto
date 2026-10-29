@@ -173,6 +173,37 @@ impl<const PASSES: usize, const N: usize> Digest for Tiger<PASSES, N> {
     }
 }
 
+/// Exported-state length: header, chaining words, then the buffer part.
+const STATE_LEN: usize = 2 + 24 + BlockBuffer::<64>::STATE_LEN;
+
+impl<const PASSES: usize, const N: usize> super::ExportableState for Tiger<PASSES, N> {
+    const STATE_LEN: usize = STATE_LEN;
+    type State = [u8; STATE_LEN];
+
+    fn export_state(&self) -> Self::State {
+        let mut out = [0u8; STATE_LEN];
+        let mut w = super::state::Writer::new(&mut out, Self::TAG);
+        w.u64s(&self.h);
+        self.buf.export_into(&mut w);
+        w.finish();
+        out
+    }
+
+    fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+        let () = Self::VALID;
+        let mut r = super::state::Reader::new(state, Self::TAG, Self::STATE_LEN)?;
+        let h = r.u64s::<3>();
+        let buf = BlockBuffer::import_from(&mut r)?;
+        r.finish();
+        Ok(Tiger { h, buf })
+    }
+}
+
+impl<const PASSES: usize, const N: usize> Tiger<PASSES, N> {
+    /// The exported-state tag: one per pass count and output length.
+    const TAG: u8 = super::state::tag::TIGER + 3 * (PASSES as u8 - 3) + (N as u8 - 16) / 4;
+}
+
 /// Tiger, 3 passes, 128-bit truncation (PHP `tiger128,3`).
 pub type Tiger128_3 = Tiger<3, 16>;
 /// Tiger, 3 passes, 160-bit truncation (PHP `tiger160,3`).

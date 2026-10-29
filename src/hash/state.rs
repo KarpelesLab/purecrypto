@@ -87,6 +87,14 @@ impl core::error::Error for StateError {}
 ///   the plain hash and MAC). A keyed state still carries the key block in
 ///   its buffer until more input arrives, and the chaining value is
 ///   key-derived either way: **treat an exported keyed state as secret**.
+/// - With `legacy-hashes`: **RIPEMD-128/256/320** use the MD4 layout above
+///   (4, 8 or 10 words). **Tiger** writes its three 64-bit words, **Snefru**
+///   and **HAVAL** their eight 32-bit chaining words, and **GOST R 34.11-94**
+///   its eight 32-bit chaining words followed by the eight 32-bit words of
+///   the running block sum Σ (least significant first); then each the
+///   message length in bytes (`u64`), the buffered byte count (`u8`, below
+///   the block: 64 for Tiger, 32 for Snefru and GOST, 128 for HAVAL) and the
+///   block buffer. Every pass count and output length has its own tag.
 ///
 /// Buffer bytes past the buffered count are always written as zero and must
 /// be zero on import, so each hasher state has exactly one encoding.
@@ -162,6 +170,26 @@ pub(super) mod tag {
     pub(crate) const BLAKE2B: u8 = 23;
     /// All BLAKE2s states.
     pub(crate) const BLAKE2S: u8 = 24;
+    #[cfg(feature = "legacy-hashes")]
+    pub(crate) const RIPEMD128: u8 = 25;
+    #[cfg(feature = "legacy-hashes")]
+    pub(crate) const RIPEMD256: u8 = 26;
+    #[cfg(feature = "legacy-hashes")]
+    pub(crate) const RIPEMD320: u8 = 27;
+    /// Tiger: `TIGER + 3 * (passes - 3) + (bytes - 16) / 4`, so 28..=33 for
+    /// tiger128,3, tiger160,3, tiger192,3, tiger128,4, tiger160,4, tiger192,4.
+    #[cfg(feature = "legacy-hashes")]
+    pub(crate) const TIGER: u8 = 28;
+    #[cfg(feature = "legacy-hashes")]
+    pub(crate) const SNEFRU256: u8 = 34;
+    #[cfg(feature = "legacy-hashes")]
+    pub(crate) const GOST94: u8 = 35;
+    #[cfg(feature = "legacy-hashes")]
+    pub(crate) const GOST94_CRYPTOPRO: u8 = 36;
+    /// HAVAL: `HAVAL + 5 * (passes - 3) + (bytes - 16) / 4`, so 37..=51 for
+    /// haval128,3 … haval256,3, haval128,4 … haval256,5.
+    #[cfg(feature = "legacy-hashes")]
+    pub(crate) const HAVAL: u8 = 37;
 }
 
 /// Serializes fields into a state buffer after the two header bytes.
@@ -467,6 +495,150 @@ mod tests {
         roundtrip::<Blake2s256>();
     }
 
+    #[cfg(feature = "legacy-hashes")]
+    #[test]
+    fn legacy_hashes_states_round_trip() {
+        use super::super::{
+            Gost94, Gost94CryptoPro, Haval128_3, Haval128_4, Haval128_5, Haval160_3, Haval160_4,
+            Haval160_5, Haval192_3, Haval192_4, Haval192_5, Haval224_3, Haval224_4, Haval224_5,
+            Haval256_3, Haval256_4, Haval256_5, Ripemd128, Ripemd256, Ripemd320, Snefru256,
+            Tiger128_3, Tiger128_4, Tiger160_3, Tiger160_4, Tiger192_3, Tiger192_4,
+        };
+        roundtrip::<Ripemd128>();
+        roundtrip::<Ripemd256>();
+        roundtrip::<Ripemd320>();
+        roundtrip::<Tiger128_3>();
+        roundtrip::<Tiger160_3>();
+        roundtrip::<Tiger192_3>();
+        roundtrip::<Tiger128_4>();
+        roundtrip::<Tiger160_4>();
+        roundtrip::<Tiger192_4>();
+        roundtrip::<Snefru256>();
+        roundtrip::<Gost94>();
+        roundtrip::<Gost94CryptoPro>();
+        roundtrip::<Haval128_3>();
+        roundtrip::<Haval160_3>();
+        roundtrip::<Haval192_3>();
+        roundtrip::<Haval224_3>();
+        roundtrip::<Haval256_3>();
+        roundtrip::<Haval128_4>();
+        roundtrip::<Haval160_4>();
+        roundtrip::<Haval192_4>();
+        roundtrip::<Haval224_4>();
+        roundtrip::<Haval256_4>();
+        roundtrip::<Haval128_5>();
+        roundtrip::<Haval160_5>();
+        roundtrip::<Haval192_5>();
+        roundtrip::<Haval224_5>();
+        roundtrip::<Haval256_5>();
+    }
+
+    #[cfg(feature = "legacy-hashes")]
+    #[test]
+    fn legacy_hashes_inconsistent_states_are_rejected() {
+        use super::super::{
+            Gost94, Gost94CryptoPro, Haval128_3, Haval256_3, Haval256_5, Ripemd128, Snefru256,
+            Tiger128_3, Tiger192_3, Tiger192_4,
+        };
+
+        // Tiger: header, 3 × u64, u64 byte count, u8 buffered, 64-byte buffer.
+        let mut h = Tiger192_3::new();
+        h.update(b"abc");
+        let good = h.export_state();
+        let count = 2 + 24;
+        let buffered = count + 8;
+        let mut s = good;
+        s[count] = 4; // 4 bytes absorbed, 3 buffered
+        assert_eq!(
+            Tiger192_3::from_state(&s).err(),
+            Some(StateError::Inconsistent)
+        );
+        let mut s = good;
+        s[buffered] = 64;
+        s[count] = 64;
+        assert_eq!(
+            Tiger192_3::from_state(&s).err(),
+            Some(StateError::Inconsistent)
+        );
+        let mut s = good;
+        s[buffered + 1 + 3] = 1; // stale byte past the buffered data
+        assert_eq!(
+            Tiger192_3::from_state(&s).err(),
+            Some(StateError::Inconsistent)
+        );
+        let mut s = good;
+        s[count..count + 8].copy_from_slice(&(64u64 * 9 + 3).to_le_bytes());
+        assert!(Tiger192_3::from_state(&s).is_ok());
+
+        // Snefru and GOST buffer 32-byte blocks; HAVAL 128-byte ones.
+        let mut h = Snefru256::new();
+        h.update(&[5u8; 40]);
+        let mut s = h.export_state();
+        s[2 + 32 + 8] = 32;
+        assert_eq!(
+            Snefru256::from_state(&s).err(),
+            Some(StateError::Inconsistent)
+        );
+        let mut h = Gost94::new();
+        h.update(&[5u8; 40]);
+        let mut s = h.export_state();
+        s[2 + 64] ^= 1; // byte count 41, buffered 8
+        assert_eq!(Gost94::from_state(&s).err(), Some(StateError::Inconsistent));
+        let mut h = Haval256_3::new();
+        h.update(&[5u8; 130]);
+        let mut s = h.export_state();
+        s[2 + 32 + 8] = 128;
+        assert_eq!(
+            Haval256_3::from_state(&s).err(),
+            Some(StateError::Inconsistent)
+        );
+
+        // Each pass count, output length and S-box set has its own tag, even
+        // where the layouts coincide.
+        let s = Tiger192_3::new().export_state();
+        assert_eq!(
+            Tiger192_4::from_state(&s).err(),
+            Some(StateError::WrongAlgorithm)
+        );
+        assert_eq!(
+            Tiger128_3::from_state(&s).err(),
+            Some(StateError::WrongAlgorithm)
+        );
+        let s = Haval256_3::new().export_state();
+        assert_eq!(
+            Haval256_5::from_state(&s).err(),
+            Some(StateError::WrongAlgorithm)
+        );
+        assert_eq!(
+            Haval128_3::from_state(&s).err(),
+            Some(StateError::WrongAlgorithm)
+        );
+        let s = Gost94::new().export_state();
+        assert_eq!(
+            Gost94CryptoPro::from_state(&s).err(),
+            Some(StateError::WrongAlgorithm)
+        );
+        let s = Md4::new().export_state();
+        assert_eq!(
+            Ripemd128::from_state(&s).err(),
+            Some(StateError::WrongAlgorithm)
+        );
+
+        // The tags are distinct across every exportable algorithm (BLAKE2
+        // aside: one tag per family, told apart by the length fields).
+        let mut seen = [false; 256];
+        for &alg in HashAlgorithm::ALL {
+            let mut buf = [0u8; HashAlgorithm::MAX_STATE_LEN];
+            if matches!(alg, HashAlgorithm::Blake2b384 | HashAlgorithm::Blake2b512) {
+                continue;
+            }
+            if alg.hasher().export_state(&mut buf).is_ok() {
+                assert!(!seen[buf[1] as usize], "{alg}: tag {} reused", buf[1]);
+                seen[buf[1] as usize] = true;
+            }
+        }
+    }
+
     /// A fresh `T` rebuilt from `x`'s exported state.
     fn resumed<T: ExportableState>(x: &T) -> T {
         T::from_state(x.export_state().as_ref()).expect("own state imports")
@@ -655,9 +827,8 @@ mod tests {
         let mut widest = 0;
         for &alg in HashAlgorithm::ALL {
             let Some(len) = alg.state_len() else {
-                // BLAKE3 has no exportable state; nor (yet) do the
-                // `legacy-hashes` digests, which are all `is_legacy()`.
-                assert!(alg == HashAlgorithm::Blake3 || alg.is_legacy(), "{alg:?}");
+                // BLAKE3 is the only digest without an exportable state.
+                assert_eq!(alg, HashAlgorithm::Blake3);
                 assert_eq!(
                     alg.hasher().export_state(&mut buf).err(),
                     Some(StateError::Unsupported)

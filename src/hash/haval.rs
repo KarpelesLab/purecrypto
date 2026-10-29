@@ -293,6 +293,37 @@ impl<const PASSES: usize, const N: usize> Digest for Haval<PASSES, N> {
     }
 }
 
+/// Exported-state length: header, chaining words, then the buffer part.
+const STATE_LEN: usize = 2 + 32 + BlockBuffer::<128>::STATE_LEN;
+
+impl<const PASSES: usize, const N: usize> super::ExportableState for Haval<PASSES, N> {
+    const STATE_LEN: usize = STATE_LEN;
+    type State = [u8; STATE_LEN];
+
+    fn export_state(&self) -> Self::State {
+        let mut out = [0u8; STATE_LEN];
+        let mut w = super::state::Writer::new(&mut out, Self::TAG);
+        w.u32s(&self.h);
+        self.buf.export_into(&mut w);
+        w.finish();
+        out
+    }
+
+    fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+        let () = Self::VALID;
+        let mut r = super::state::Reader::new(state, Self::TAG, Self::STATE_LEN)?;
+        let h = r.u32s::<8>();
+        let buf = BlockBuffer::import_from(&mut r)?;
+        r.finish();
+        Ok(Haval { h, buf })
+    }
+}
+
+impl<const PASSES: usize, const N: usize> Haval<PASSES, N> {
+    /// The exported-state tag: one per pass count and output length.
+    const TAG: u8 = super::state::tag::HAVAL + 5 * (PASSES as u8 - 3) + (N as u8 - 16) / 4;
+}
+
 macro_rules! haval_aliases {
     ($($name:ident = $passes:literal, $bytes:literal, $php:literal;)*) => {$(
         #[doc = concat!("HAVAL, ", stringify!($passes), " passes, ", stringify!($bytes),

@@ -283,6 +283,29 @@ impl State {
         out
     }
 
+    const STATE_LEN: usize = 2 + 32 + 32 + BlockBuffer::<32>::STATE_LEN;
+
+    fn export_state(&self, tag: u8) -> [u8; Self::STATE_LEN] {
+        let mut out = [0u8; Self::STATE_LEN];
+        let mut w = super::state::Writer::new(&mut out, tag);
+        w.u32s(&self.h);
+        w.u32s(&self.sum);
+        self.buf.export_into(&mut w);
+        w.finish();
+        out
+    }
+
+    /// Any chaining value and block sum are possible, so only the buffer is
+    /// checked.
+    fn from_state(state: &[u8], tag: u8) -> Result<Self, super::StateError> {
+        let mut r = super::state::Reader::new(state, tag, Self::STATE_LEN)?;
+        let h = r.u32s::<8>();
+        let sum = r.u32s::<8>();
+        let buf = BlockBuffer::import_from(&mut r)?;
+        r.finish();
+        Ok(State { h, sum, buf })
+    }
+
     fn zeroize(&mut self) {
         super::zeroize::zero_words(&mut self.h);
         super::zeroize::zero_words(&mut self.sum);
@@ -291,7 +314,7 @@ impl State {
 }
 
 macro_rules! gost94 {
-    ($(#[$doc:meta])* $name:ident, $func:ident, $tables:ident) => {
+    ($(#[$doc:meta])* $name:ident, $func:ident, $tables:ident, $tag:ident) => {
         $(#[$doc])*
         ///
         /// Its block — the unit HMAC keys on — is the 32-byte message block,
@@ -331,6 +354,19 @@ macro_rules! gost94 {
             }
         }
 
+        impl super::ExportableState for $name {
+            const STATE_LEN: usize = State::STATE_LEN;
+            type State = [u8; State::STATE_LEN];
+
+            fn export_state(&self) -> Self::State {
+                self.0.export_state(super::state::tag::$tag)
+            }
+
+            fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+                State::from_state(state, super::state::tag::$tag).map($name)
+            }
+        }
+
         #[doc = concat!("Computes the ", stringify!($name), " digest of `data`.")]
         #[inline]
         pub fn $func(data: &[u8]) -> [u8; 32] {
@@ -341,12 +377,12 @@ macro_rules! gost94 {
 
 gost94!(
     /// GOST R 34.11-94 with the test parameter S-boxes (PHP `gost`).
-    Gost94, gost94, TABLES_TEST
+    Gost94, gost94, TABLES_TEST, GOST94
 );
 gost94!(
     /// GOST R 34.11-94 with the CryptoPro S-boxes of RFC 4357 (PHP
     /// `gost-crypto`).
-    Gost94CryptoPro, gost94_cryptopro, TABLES_CRYPTOPRO
+    Gost94CryptoPro, gost94_cryptopro, TABLES_CRYPTOPRO, GOST94_CRYPTOPRO
 );
 
 #[cfg(test)]

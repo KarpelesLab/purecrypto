@@ -126,6 +126,29 @@ impl Digest for Snefru256 {
     }
 }
 
+impl super::ExportableState for Snefru256 {
+    const STATE_LEN: usize = 2 + 32 + BlockBuffer::<32>::STATE_LEN;
+    type State = [u8; 2 + 32 + BlockBuffer::<32>::STATE_LEN];
+
+    fn export_state(&self) -> Self::State {
+        let mut out = [0u8; Self::STATE_LEN];
+        let mut w = super::state::Writer::new(&mut out, super::state::tag::SNEFRU256);
+        w.u32s(&self.h);
+        self.buf.export_into(&mut w);
+        w.finish();
+        out
+    }
+
+    fn from_state(state: &[u8]) -> Result<Self, super::StateError> {
+        let mut r =
+            super::state::Reader::new(state, super::state::tag::SNEFRU256, Self::STATE_LEN)?;
+        let h = r.u32s::<8>();
+        let buf = BlockBuffer::import_from(&mut r)?;
+        r.finish();
+        Ok(Snefru256 { h, buf })
+    }
+}
+
 /// Computes the Snefru-256 (8-pass) digest of `data`.
 #[inline]
 pub fn snefru256(data: &[u8]) -> [u8; 32] {
