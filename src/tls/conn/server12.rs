@@ -85,6 +85,7 @@ use crate::tls::crypto::ssl3;
 use crate::tls::crypto::verify_signature_tls12;
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::RootCertStore;
+use crate::tls::reneg::RenegState;
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
 use crate::x509::AnyPublicKey;
 use alloc::sync::Arc;
@@ -205,6 +206,9 @@ pub(crate) struct ServerConfig12 {
     /// accepts, instead of the first in the server's own order. See
     /// [`crate::tls::Config::prefer_server_cipher_order`].
     pub(crate) prefer_client_order: bool,
+    /// RFC 5746 secure renegotiation. See
+    /// [`crate::tls::Config::renegotiation`].
+    pub(crate) renegotiation: crate::tls::RenegotiationPolicy,
 }
 
 /// Client-authentication policy for a TLS 1.2 server (RFC 5246 §7.4.4 +
@@ -264,6 +268,7 @@ impl ServerConfig12 {
             cipher_suites: Vec::new(),
             certificate_verifier: None,
             prefer_client_order: false,
+            renegotiation: crate::tls::RenegotiationPolicy::default(),
         }
     }
 
@@ -609,6 +614,8 @@ pub struct ServerConnection12<R: RngCore> {
     /// set after a later transition to [`State::Closed`], and — unlike
     /// `!is_handshaking()` — is never set by a pre-completion failure or alert.
     handshake_completed: bool,
+    /// RFC 5746 renegotiation bookkeeping (see [`crate::tls::reneg`]).
+    reneg: RenegState,
 
     /// Inbound TLS bytes to parse into records.
     inbuf: Vec<u8>,
@@ -746,6 +753,10 @@ pub struct ServerConnection12<R: RngCore> {
     /// derivation against an EMS-offering client.
     #[cfg(test)]
     pub(crate) test_force_no_ems: bool,
+    /// Test-only: the renegotiation limiter's clock, overriding the system
+    /// time.
+    #[cfg(test)]
+    pub(crate) test_reneg_now: Option<u64>,
     /// RFC 7627 §4 — snapshot of `Hash(CH ‖ SH ‖ … ‖ CKE)` captured the
     /// instant the ClientKeyExchange is fed into the transcript. Used as
     /// the `session_hash` input to `extended_master_secret`.
@@ -786,6 +797,7 @@ impl<R: RngCore> ServerConnection12<R> {
             received_close_notify: false,
             sent_close_notify: false,
             handshake_completed: false,
+            reneg: RenegState::default(),
             inbuf: Vec::new(),
             in_off: 0,
             outbuf: Vec::new(),
@@ -831,6 +843,8 @@ impl<R: RngCore> ServerConnection12<R> {
             ems_session_hash: None,
             #[cfg(test)]
             test_force_no_ems: false,
+            #[cfg(test)]
+            test_reneg_now: None,
             peer_offered_server_cert_type: false,
             peer_offered_client_cert_type: false,
             negotiated_server_cert_type: cert_type::X509,
@@ -997,8 +1011,18 @@ impl<R: RngCore> ServerConnection12<R> {
     /// only until [`Self::send_close_notify`] — RFC 5246 §7.2.1 forbids
     /// sending anything after our own `close_notify`; both misuses are
     /// reported as `InappropriateState`).
+    ///
+    /// While a renegotiation is in flight the data is queued and sent under
+    /// the new keys once it completes.
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.state != State::Connected || self.sent_close_notify {
+        if self.sent_close_notify {
+            return Err(Error::InappropriateState);
+        }
+        if self.reneg.active && self.state != State::Closed {
+            self.reneg.pending_app_out.extend_from_slice(data);
+            return Ok(());
+        }
+        if self.state != State::Connected {
             return Err(Error::InappropriateState);
         }
         // Fragment to at most 2^14 bytes per record (RFC 5246 §6.2.1), or
@@ -1066,6 +1090,11 @@ impl<R: RngCore> ServerConnection12<R> {
             return;
         }
         self.sent_close_notify = true;
+        // Behind any application data queued during a renegotiation.
+        if self.reneg.active {
+            self.reneg.close_pending = true;
+            return;
+        }
         let body = [1u8, AlertDescription::CloseNotify.as_u8()];
         let _ = self.emit_alert(&body);
     }
@@ -1101,7 +1130,7 @@ impl<R: RngCore> ServerConnection12<R> {
                     }
                 }
                 Ok(Some(Incoming::ApplicationData)) => {
-                    if self.state != State::Connected {
+                    if !self.app_data_readable() {
                         let e = Error::UnexpectedMessage;
                         self.fail(&e);
                         return Err(e);
@@ -1131,6 +1160,11 @@ impl<R: RngCore> ServerConnection12<R> {
                         AlertDescription::UserCanceled | AlertDescription::NoRenegotiation
                             if !alert.fatal =>
                         {
+                            // The client declined our HelloRequest (RFC 5746
+                            // §4.2): the session simply carries on.
+                            if alert.description == AlertDescription::NoRenegotiation {
+                                self.reneg.hello_request_pending = false;
+                            }
                             continue;
                         }
                         _ => {
@@ -1166,7 +1200,24 @@ impl<R: RngCore> ServerConnection12<R> {
     /// §6.2.1 requires; unprotected records are not subject to the peer's
     /// `record_size_limit` (RFC 8449 §4). Each fragment is within the bound
     /// `write_record` enforces, so it cannot fail.
+    ///
+    /// During a renegotiation (RFC 5746) the handshake runs under the
+    /// current write keys: once a `server_crypter` is installed, every
+    /// record written here — the new handshake's messages and our
+    /// ChangeCipherSpec — is protected under it instead, fragmented to the
+    /// client's `record_size_limit`. A protection failure (the record
+    /// sequence cap) closes the connection.
     fn write_plain_record(&mut self, ct: ContentType, payload: &[u8]) {
+        if self.server_crypter.is_some() {
+            let cap = super::client12::record_fragment_cap(self.peer_record_size_limit);
+            for chunk in fragments(payload, cap) {
+                if self.emit_encrypted(ct, chunk).is_err() {
+                    self.state = State::Closed;
+                    return;
+                }
+            }
+            return;
+        }
         for chunk in fragments(payload, MAX_PLAINTEXT_FRAGMENT) {
             let _ = write_record(&mut self.outbuf, ct, self.negotiated_version, chunk);
         }
@@ -1199,6 +1250,29 @@ impl<R: RngCore> ServerConnection12<R> {
             .ok_or(Error::InappropriateState)?;
         let fragment = crypter.encrypt_max_padding(ct, version, payload)?;
         write_record(&mut self.outbuf, ct, version, &fragment)
+    }
+
+    /// Test-only: swaps the configuration (identity, renegotiation policy)
+    /// of an established connection, to drive a renegotiation that presents
+    /// a different certificate.
+    #[cfg(test)]
+    pub(super) fn test_replace_config(&mut self, config: ServerConfig12) {
+        self.config = config;
+    }
+
+    /// Test-only: corrupts the `verify_data` the next renegotiation binds
+    /// to, as a man in the middle splicing two connections would see it.
+    #[cfg(test)]
+    pub(super) fn test_corrupt_renegotiation_binding(&mut self) {
+        if let Some(b) = self.reneg.server_verify_data.first_mut() {
+            *b ^= 1;
+        }
+    }
+
+    /// Test-only: the limiter's clock, in seconds.
+    #[cfg(test)]
+    pub(super) fn test_set_renegotiation_clock(&mut self, now: u64) {
+        self.test_reneg_now = Some(now);
     }
 
     /// Test-only: encrypt and emit an attacker-shaped record (any content
@@ -1273,7 +1347,20 @@ impl<R: RngCore> ServerConnection12<R> {
                     // accept it in the middlebox-compat window, and only when
                     // we're waiting for the client's Finished (fresh or
                     // resumed) — and we have a pending read crypter ready.
-                    if !self.ccs_window_open || self.inbuf[frag.clone()] != [0x01] {
+                    //
+                    // During a renegotiation the CCS itself is protected
+                    // under the current read keys (RFC 5246 §6.1).
+                    if !self.ccs_window_open {
+                        return Err(Error::UnexpectedMessage);
+                    }
+                    let body = if let Some(c) = self.client_crypter.as_mut() {
+                        let (_ct, r) =
+                            c.decrypt_in_place(&header, &mut self.inbuf[frag.clone()])?;
+                        frag.start + r.start..frag.start + r.end
+                    } else {
+                        frag.clone()
+                    };
+                    if self.inbuf[body] != [0x01] {
                         return Err(Error::UnexpectedMessage);
                     }
                     // RFC 5246 §7.1: exactly one CCS per direction.
@@ -1335,8 +1422,10 @@ impl<R: RngCore> ServerConnection12<R> {
                     // that the peer — under mTLS, its certificate — is not
                     // authenticated, so the plaintext must never reach
                     // `take_received_plaintext`, even on the error path.
-                    // Mirrors `ConnectionCore::app_data_allowed` (1.3).
-                    if self.state != State::Connected {
+                    // Mirrors `ConnectionCore::app_data_allowed` (1.3). A
+                    // renegotiation keeps accepting it under the
+                    // authenticated keys still in force (RFC 5246 §7.4.1.1).
+                    if !self.app_data_readable() {
                         return Err(Error::UnexpectedMessage);
                     }
                     self.app_in
@@ -1410,9 +1499,194 @@ impl<R: RngCore> ServerConnection12<R> {
                 self.on_resumed_client_finished(msg_type, body, &msg)
             }
             // RFC 5246 §7.4.1: a `ClientHello` post-Connected is a
-            // renegotiation attempt. We do not support renegotiation.
+            // renegotiation attempt (RFC 5746).
+            State::Connected if msg_type == hs_type::CLIENT_HELLO => {
+                self.on_renegotiation_client_hello(body, &msg)
+            }
             State::Connected | State::Closed => Err(Error::UnexpectedMessage),
         }
+    }
+
+    /// Whether application data may be delivered now: once connected, and
+    /// during a renegotiation until the client's ChangeCipherSpec switches
+    /// the read side to keys whose handshake is not yet authenticated.
+    fn app_data_readable(&self) -> bool {
+        self.state == State::Connected || (self.reneg.active && !self.ccs_received)
+    }
+
+    /// Whether the current session can be renegotiated: an established
+    /// TLS 1.2 AEAD session (never the `tls-legacy` versions) that ran
+    /// Extended Master Secret (RFC 7627 §6.2), with our side still open.
+    fn renegotiation_eligible(&self) -> bool {
+        #[cfg(feature = "tls-legacy")]
+        if self.legacy_suite.is_some() {
+            return false;
+        }
+        self.state == State::Connected
+            && self.handshake_completed
+            && !self.reneg.active
+            && !self.sent_close_notify
+            && self.suite.is_some()
+            && self.ems_negotiated
+            && self.reneg.client_verify_data.len() == 12
+    }
+
+    /// Server-initiated TLS 1.2 renegotiation (RFC 5246 §7.4.1.1): queues a
+    /// `HelloRequest` under the current keys. The client answers with a new
+    /// ClientHello (which is then not counted against
+    /// [`RenegotiationPolicy::client_limit`](crate::tls::RenegotiationPolicy::client_limit))
+    /// or with a `no_renegotiation` warning, after which the session simply
+    /// carries on. Repeated calls while a request is outstanding send
+    /// nothing more.
+    ///
+    /// Errors with [`Error::InappropriateState`] unless
+    /// [`ServerConfig12::renegotiation`] is enabled and the session is
+    /// eligible: connected, TLS 1.2 with an AEAD suite (not a `tls-legacy`
+    /// version), Extended Master Secret negotiated, no renegotiation in
+    /// flight, no `close_notify` sent.
+    pub fn renegotiate(&mut self) -> Result<(), Error> {
+        if !self.config.renegotiation.enabled || !self.renegotiation_eligible() {
+            return Err(Error::InappropriateState);
+        }
+        if self.reneg.hello_request_pending {
+            return Ok(());
+        }
+        let hr = crate::tls::codec::handshake12::HelloRequest.encode();
+        self.emit_encrypted(ContentType::Handshake, &hr)?;
+        self.reneg.hello_request_pending = true;
+        Ok(())
+    }
+
+    /// Completed renegotiations on this connection.
+    pub fn renegotiation_count(&self) -> u32 {
+        self.reneg.completed
+    }
+
+    /// Whether a renegotiation handshake is in flight.
+    pub fn is_renegotiating(&self) -> bool {
+        self.reneg.active
+    }
+
+    /// Client-initiated renegotiation requests received (accepted or not;
+    /// those answering our `HelloRequest` are not counted).
+    pub fn peer_renegotiation_requests(&self) -> u32 {
+        self.reneg.peer_requests
+    }
+
+    /// Sticky: the client exceeded
+    /// [`RenegotiationPolicy::client_limit`](crate::tls::RenegotiationPolicy::client_limit)
+    /// (whatever the configured action).
+    pub fn renegotiation_limit_exceeded(&self) -> bool {
+        self.reneg.limit_exceeded
+    }
+
+    /// A `ClientHello` on an established connection: a renegotiation
+    /// request (RFC 5746). Declined with a warning `no_renegotiation` alert
+    /// (§4.4) when renegotiation is off or the session is not eligible;
+    /// otherwise rate-limited (client-initiated requests only) and run as a
+    /// full handshake under the current keys.
+    fn on_renegotiation_client_hello(&mut self, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        // After our close_notify nothing more goes out (RFC 5246 §7.2.1),
+        // not even a refusal.
+        if self.sent_close_notify {
+            return Ok(());
+        }
+        let solicited = core::mem::take(&mut self.reneg.hello_request_pending);
+        if !solicited {
+            self.reneg.peer_requests = self.reneg.peer_requests.saturating_add(1);
+        }
+        if !self.config.renegotiation.enabled || !self.renegotiation_eligible() {
+            return self.decline_renegotiation();
+        }
+        if !solicited && let Some(limit) = self.config.renegotiation.client_limit {
+            let now = self.reneg_now();
+            if self.reneg.limiter.record(limit, now) {
+                self.reneg.limit_exceeded = true;
+                match self.config.renegotiation.on_limit_exceeded {
+                    crate::tls::RenegotiationLimitAction::Close => {
+                        return Err(Error::RenegotiationLimitExceeded);
+                    }
+                    crate::tls::RenegotiationLimitAction::Refuse => {
+                        return self.decline_renegotiation();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Reset the per-handshake state. The session-visible state (suite,
+        // master secret, ALPN, the client's certificate) is replaced as the
+        // new handshake proceeds; the record keys at the ChangeCipherSpecs.
+        // The record-size limits are re-decided by the new hello (none
+        // unless it offers one again, RFC 8449 §4).
+        self.peer_record_size_limit = None;
+        self.inbound_record_size_limit = None;
+        self.reneg.active = true;
+        self.reneg.prev_peer_leaf = self.client_cert_chain.first().cloned();
+        self.state = State::WaitClientHello;
+        self.transcript = Transcript::new();
+        self.ccs_window_open = true;
+        self.ccs_received = false;
+        self.pending_client_crypter = None;
+        self.pending_server_crypter = None;
+        self.x25519 = None;
+        self.p256 = None;
+        self.p384 = None;
+        self.p521 = None;
+        self.group = None;
+        self.alpn_negotiated = None;
+        self.peer_offered_reneg_info = false;
+        self.peer_offered_record_size_limit = false;
+        self.client_leaf_key = None;
+        self.ske_scheme = None;
+        self.cert_request_schemes = Vec::new();
+        self.peer_offered_session_ticket = false;
+        self.peer_offered_ocsp_staple = false;
+        self.resumed = false;
+        self.client_session_id = Vec::new();
+        self.ems_negotiated = false;
+        self.ems_session_hash = None;
+        self.peer_offered_server_cert_type = false;
+        self.peer_offered_client_cert_type = false;
+        self.on_client_hello(hs_type::CLIENT_HELLO, body, raw)
+    }
+
+    /// RFC 5746 §4.4: answer a renegotiation request we do not take with a
+    /// warning `no_renegotiation` alert; the session carries on.
+    fn decline_renegotiation(&mut self) -> Result<(), Error> {
+        let alert = [1u8, AlertDescription::NoRenegotiation.as_u8()]; // level = warning
+        self.emit_alert(&alert)
+    }
+
+    /// The limiter's clock (wall-clock seconds), or `None` without one.
+    fn reneg_now(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(t) = self.test_reneg_now {
+            return Some(t);
+        }
+        crate::tls::reneg::now_secs()
+    }
+
+    /// Leaves renegotiation mode: sends the application data (and any
+    /// `close_notify`) the caller queued meanwhile.
+    fn end_renegotiation(&mut self) -> Result<(), Error> {
+        self.reneg.active = false;
+        self.reneg.prev_peer_leaf = None;
+        self.reneg.completed = self.reneg.completed.saturating_add(1);
+        let queued = core::mem::take(&mut self.reneg.pending_app_out);
+        if !queued.is_empty() {
+            // `send_application_data` refuses after our close_notify; the
+            // data was queued before it.
+            let closing = core::mem::replace(&mut self.sent_close_notify, false);
+            let r = self.send_application_data(&queued);
+            self.sent_close_notify = closing;
+            r?;
+        }
+        if core::mem::take(&mut self.reneg.close_pending) {
+            let body = [1u8, AlertDescription::CloseNotify.as_u8()];
+            self.emit_alert(&body)?;
+        }
+        Ok(())
     }
 
     fn on_client_hello(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
@@ -1463,6 +1737,18 @@ impl<R: RngCore> ServerConnection12<R> {
             && (self.config.supports_tls13 || neg_version < ceiling)
         {
             return Err(Error::InappropriateFallback);
+        }
+
+        // A renegotiation stays at TLS 1.2 (only 1.2 sessions are
+        // renegotiated) and MUST NOT carry the
+        // `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` (RFC 5746 §3.7).
+        if self.reneg.active
+            && (neg_version != 0x0303
+                || ch
+                    .cipher_suites
+                    .contains(&crate::tls::codec::CipherSuite(0x00ff)))
+        {
+            return Err(Error::HandshakeFailure);
         }
 
         // TLS 1.0/1.1 take the opt-in legacy handshake path (separate from the
@@ -1567,8 +1853,21 @@ impl<R: RngCore> ServerConnection12<R> {
         // instead of the extension. A strict client that signalled either
         // way and gets no echo aborts with "unsafe legacy renegotiation
         // disabled".
-        if let Some(reneg) = ext::find(&ch.extensions, ExtensionType::RENEGOTIATION_INFO) {
-            let inner = ext::parse_renegotiation_info(reneg)?;
+        //
+        // On a renegotiation (§3.7) the extension is mandatory and MUST
+        // carry the replaced handshake's `client_verify_data`; anything else
+        // is a `handshake_failure` — the binding that defeats the RFC 5746
+        // prefix-injection attack.
+        let reneg_info = ext::find(&ch.extensions, ExtensionType::RENEGOTIATION_INFO)
+            .map(ext::parse_renegotiation_info)
+            .transpose()?;
+        if self.reneg.active {
+            let inner = reneg_info.ok_or(Error::HandshakeFailure)?;
+            if !RenegState::binding_matches(&self.reneg.client_verify_data, &inner) {
+                return Err(Error::HandshakeFailure);
+            }
+            self.peer_offered_reneg_info = true;
+        } else if let Some(inner) = reneg_info {
             if !inner.is_empty() {
                 return Err(Error::HandshakeFailure);
             }
@@ -1605,7 +1904,13 @@ impl<R: RngCore> ServerConnection12<R> {
         // secret isn't bound to the handshake transcript, enabling the
         // triple-handshake family of cross-protocol attacks (TLS-3
         // audit finding).
-        if self.config.require_ems && !client_offered_ems {
+        //
+        // A renegotiation requires EMS whatever the setting (RFC 7627 §6.2:
+        // the triple-handshake defence; the replaced session ran it too, see
+        // `renegotiation_eligible`).
+        if (self.config.require_ems && !client_offered_ems)
+            || (self.reneg.active && !self.ems_negotiated)
+        {
             return Err(Error::HandshakeFailure);
         }
 
@@ -1618,8 +1923,9 @@ impl<R: RngCore> ServerConnection12<R> {
         // Attempt resumption only if a ticket key is configured, the client
         // presented a non-empty ticket, and we can decrypt + parse it into a
         // suite we still support (matching the client's offered list).
+        // A renegotiation is always a full handshake.
         let resume = ticket_ext
-            .filter(|t| !t.is_empty())
+            .filter(|t| !t.is_empty() && !self.reneg.active)
             .and_then(|t| self.try_resume(t, &ch.cipher_suites));
 
         // RFC 7627 §5.3, with the current handshake's EMS status
@@ -1703,6 +2009,7 @@ impl<R: RngCore> ServerConnection12<R> {
             let finished = build_finished(&verify_data);
             self.transcript.update(&finished);
             self.emit_encrypted(ContentType::Handshake, &finished)?;
+            self.reneg.server_verify_data = verify_data.to_vec();
 
             self.state = State::WaitResumedClientFinished;
             return Ok(());
@@ -2482,7 +2789,10 @@ impl<R: RngCore> ServerConnection12<R> {
         let sr = self.server_random.expect("server_random set");
 
         let mut extensions: Vec<(ExtensionType, Vec<u8>)> = Vec::new();
-        if self.peer_offered_reneg_info {
+        if self.reneg.active {
+            // RFC 5746 §3.7: `client_verify_data || server_verify_data`.
+            extensions.push(ext::renegotiation_info(&self.reneg.server_binding()));
+        } else if self.peer_offered_reneg_info {
             extensions.push(ext::renegotiation_info_empty());
         }
         if let Some(p) = self.alpn_negotiated.as_ref() {
@@ -2639,6 +2949,10 @@ impl<R: RngCore> ServerConnection12<R> {
             .client_auth
             .as_ref()
             .ok_or(Error::InappropriateState)?;
+        // A renegotiation must not switch (or drop) the client identity the
+        // replaced handshake authenticated, unless the policy allows it.
+        self.reneg
+            .check_peer_leaf(&self.config.renegotiation, chain.first().map(Vec::as_slice))?;
         if chain.is_empty() {
             if policy.required {
                 return Err(Error::CertificateRequired);
@@ -2996,8 +3310,9 @@ impl<R: RngCore> ServerConnection12<R> {
             return Err(Error::Decode);
         }
         // The client's CCS must have arrived first so the Finished decrypts
-        // under `client_crypter`.
-        if self.client_crypter.is_none() {
+        // under the new `client_crypter` (on a renegotiation, not under the
+        // old one).
+        if self.client_crypter.is_none() || !self.ccs_received {
             return Err(Error::UnexpectedMessage);
         }
         let suite = self.suite.expect("suite set");
@@ -3045,10 +3360,27 @@ impl<R: RngCore> ServerConnection12<R> {
         let finished = build_finished(&verify_data);
         self.transcript.update(&finished);
         self.emit_encrypted(ContentType::Handshake, &finished)?;
+        // RFC 5746 §3.1: the next renegotiation's binding.
+        self.reneg.client_verify_data = body.to_vec();
+        self.reneg.server_verify_data = verify_data.to_vec();
 
         self.ccs_window_open = false;
         self.state = State::Connected;
-        self.handshake_completed = true;
+        self.complete_handshake()
+    }
+
+    /// The `Connected` transition: the initial handshake starts the
+    /// renegotiation limiter's clock; a renegotiation flushes what the
+    /// caller queued meanwhile.
+    fn complete_handshake(&mut self) -> Result<(), Error> {
+        if !self.handshake_completed {
+            self.handshake_completed = true;
+            let now = self.reneg_now();
+            self.reneg.limiter.initial_handshake(now);
+        }
+        if self.reneg.active {
+            self.end_renegotiation()?;
+        }
         Ok(())
     }
 
@@ -3067,7 +3399,7 @@ impl<R: RngCore> ServerConnection12<R> {
         if body.len() != 12 {
             return Err(Error::Decode);
         }
-        if self.client_crypter.is_none() {
+        if self.client_crypter.is_none() || !self.ccs_received {
             return Err(Error::UnexpectedMessage);
         }
         let suite = self.suite.expect("suite set");
@@ -3079,10 +3411,10 @@ impl<R: RngCore> ServerConnection12<R> {
             return Err(Error::HandshakeFailure);
         }
         self.transcript.update(raw);
+        self.reneg.client_verify_data = body.to_vec();
         self.ccs_window_open = false;
         self.state = State::Connected;
-        self.handshake_completed = true;
-        Ok(())
+        self.complete_handshake()
     }
 
     /// RFC 5077 §3.3: emit one `NewSessionTicket` encoding the negotiated

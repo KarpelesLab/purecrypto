@@ -92,10 +92,13 @@ pub(crate) mod peek;
 pub(crate) mod pki;
 pub(crate) mod psk;
 pub(crate) mod quic_hooks;
+mod reneg;
 mod secret;
 mod signer;
 #[cfg(all(test, feature = "std"))]
 mod tests_options;
+#[cfg(all(test, feature = "std"))]
+mod tests_reneg;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 mod version;
@@ -121,6 +124,7 @@ pub use keylog::{WriterKeyLog, file_keylog};
 pub use peek::{ClientHelloInfo, peek_client_hello};
 pub use pki::{CrlStore, PolicyOptions, RootCertStore};
 pub use psk::{ExternalPsk, PskKeyExchangeMode};
+pub use reneg::{RenegotiationLimit, RenegotiationLimitAction, RenegotiationPolicy};
 pub use secret::Secret32;
 #[cfg(feature = "std")]
 pub use signer::LocalSigner;

@@ -1611,6 +1611,28 @@ impl Connection {
         }
     }
 
+    fn tls12_client_mut(&mut self) -> Option<&mut super::conn::ClientConnection12> {
+        match &mut self.inner {
+            Engine::ClientTls12(c) => Some(c),
+            Engine::ClientTlsAuto(a) => match &mut a.inner {
+                ClientInner::Tls12(c) => Some(c),
+                ClientInner::Tls13(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn tls12_server_mut(&mut self) -> Option<&mut super::conn::ServerConnection12<ConfigRng>> {
+        match &mut self.inner {
+            Engine::ServerTls12(c) => Some(c),
+            Engine::ServerTlsAuto(a) => match &mut a.resolved {
+                Some(ResolvedServer::Tls12(c)) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn tls12_server(&self) -> Option<&super::conn::ServerConnection12<ConfigRng>> {
         match &self.inner {
             Engine::ServerTls12(c) => Some(c),
@@ -1854,6 +1876,84 @@ impl Connection {
                 _ => 0,
             }
         }
+    }
+
+    /// TLS 1.2 secure renegotiation (RFC 5746). On a client, sends a new
+    /// ClientHello (client-initiated renegotiation, OpenSSL's `R` in
+    /// `s_client`); on a server, sends a `HelloRequest` asking the client to
+    /// renegotiate (server-initiated, which the client may decline with a
+    /// `no_renegotiation` warning). The new handshake runs under the current
+    /// keys; drain it with [`pop`](Self::pop) and keep feeding the peer's
+    /// bytes as usual. [`renegotiation_count`](Self::renegotiation_count)
+    /// rises when it completes; application data sent meanwhile is held
+    /// back until then, and data the peer sends meanwhile is delivered.
+    ///
+    /// Errors with [`Error::InappropriateState`] unless
+    /// [`Config::renegotiation`](super::Config::renegotiation) is enabled and
+    /// the connection is an established TLS 1.2 session with an AEAD suite
+    /// (not a `tls-legacy` version), negotiated Extended Master Secret, has
+    /// no renegotiation already in flight and has not sent `close_notify`.
+    /// TLS 1.3 has no renegotiation (see
+    /// [`request_key_update`](Self::request_key_update)); neither do DTLS
+    /// and QUIC here.
+    pub fn renegotiate(&mut self) -> Result<(), Error> {
+        if self.aborted {
+            return Err(Error::InappropriateState);
+        }
+        if let Some(c) = self.tls12_client_mut() {
+            c.renegotiate()
+        } else if let Some(c) = self.tls12_server_mut() {
+            c.renegotiate()
+        } else {
+            Err(Error::InappropriateState)
+        }
+    }
+
+    /// Completed TLS 1.2 renegotiations on this connection (either side
+    /// initiating). Always 0 on other protocol versions.
+    pub fn renegotiation_count(&self) -> u32 {
+        if let Some(c) = self.tls12_client() {
+            c.renegotiation_count()
+        } else if let Some(c) = self.tls12_server() {
+            c.renegotiation_count()
+        } else {
+            0
+        }
+    }
+
+    /// Whether a TLS 1.2 renegotiation handshake is in flight.
+    /// [`is_handshake_complete`](Self::is_handshake_complete) stays `true`
+    /// meanwhile: the established session keeps working.
+    pub fn is_renegotiating(&self) -> bool {
+        if let Some(c) = self.tls12_client() {
+            c.is_renegotiating()
+        } else if let Some(c) = self.tls12_server() {
+            c.is_renegotiating()
+        } else {
+            false
+        }
+    }
+
+    /// Server: client-initiated TLS 1.2 renegotiation requests received so
+    /// far, accepted or declined (a ClientHello answering our
+    /// [`renegotiate`](Self::renegotiate) is not counted). 0 on a client.
+    pub fn peer_renegotiation_requests(&self) -> u32 {
+        self.tls12_server()
+            .map_or(0, |c| c.peer_renegotiation_requests())
+    }
+
+    /// Server: `true` once the client exceeded
+    /// [`RenegotiationPolicy::client_limit`](super::RenegotiationPolicy::client_limit)
+    /// (sticky). Under
+    /// [`RenegotiationLimitAction::Notify`](super::RenegotiationLimitAction::Notify)
+    /// this is the event to act on — PHP's `reneg_limit_callback`, whose
+    /// `true` return keeps the stream open; call [`close`](Self::close)
+    /// otherwise. Under `Close` the connection has already failed with
+    /// [`Error::RenegotiationLimitExceeded`], under `Refuse` the
+    /// renegotiation was declined.
+    pub fn renegotiation_limit_exceeded(&self) -> bool {
+        self.tls12_server()
+            .is_some_and(|c| c.renegotiation_limit_exceeded())
     }
 
     /// RFC 7250: `true` when the peer authenticated with a raw public key
@@ -2286,6 +2386,7 @@ pub(crate) fn tls13_client_config(
         cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
+        renegotiation,
         server_cert_type_preference,
         client_cert_type_preference,
         raw_public_key_spki,
@@ -2315,9 +2416,11 @@ pub(crate) fn tls13_client_config(
     // 1.2 mechanism; `rng` is drawn through `config_rng` and `signer` through
     // `Connection::drive`; the caller resolves `server_name` (see
     // `client_server_name` / `QuicConnection::client`).
+    // Renegotiation is a TLS 1.2 mechanism (TLS 1.3 has KeyUpdate).
     let _ = (
         max_version,
         require_extended_master_secret,
+        renegotiation,
         rng,
         signer,
         server_name,
@@ -2457,6 +2560,7 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
+        renegotiation,
         server_cert_type_preference,
         client_cert_type_preference,
         raw_public_key_spki,
@@ -2528,6 +2632,7 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
     }
     cc = cc.with_signature_policy(signature_policy.clone());
     cc = cc.with_require_ems(require_extended_master_secret);
+    cc.renegotiation = renegotiation.clone();
     if let Some(id) = identity
         && let Some(c) = client_cert_from_signing(id)
     {
@@ -2638,6 +2743,7 @@ pub(crate) fn tls13_server_config(
         cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
+        renegotiation,
         server_cert_type_preference,
         client_cert_type_preference,
         raw_public_key_spki,
@@ -2672,10 +2778,12 @@ pub(crate) fn tls13_server_config(
     // a server's trust anchors for mTLS come from `client_auth`, not `roots`;
     // `rng` is drawn through `config_rng` and `signer` through
     // `Connection::drive`.
+    // Renegotiation is a TLS 1.2 mechanism (TLS 1.3 has KeyUpdate).
     let _ = (
         min_version,
         max_version,
         require_extended_master_secret,
+        renegotiation,
         roots,
         rng,
         signer,
@@ -2848,6 +2956,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
         cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
+        renegotiation,
         server_cert_type_preference,
         client_cert_type_preference,
         raw_public_key_spki,
@@ -2953,6 +3062,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     }
     sc = sc.with_signature_policy(signature_policy.clone());
     sc = sc.with_require_ems(require_extended_master_secret);
+    sc.renegotiation = renegotiation.clone();
     if let Some(t) = verification_time {
         sc = sc.with_verification_time(t.clone());
     }
@@ -3026,6 +3136,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
+        renegotiation,
         server_cert_type_preference,
         client_cert_type_preference,
         raw_public_key_spki,
@@ -3069,9 +3180,12 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     // engine resumes with `psk_dhe_ke` only). RFC 8879 certificate
     // compression is not implemented over DTLS: the advertisement is not
     // sent, and the peer's certificate arrives uncompressed.
+    // The DTLS engines do not renegotiate: a DTLS 1.2 peer's request is
+    // declined (RFC 5746 §4.2 / §4.4), as with renegotiation disabled.
     let _ = (
         min_version,
         max_version,
+        renegotiation,
         cookie_secret,
         previous_cookie_secret,
         require_cookie,
@@ -3419,6 +3533,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         cipher_suites,
         key_exchange_groups,
         require_extended_master_secret,
+        renegotiation,
         server_cert_type_preference,
         client_cert_type_preference,
         raw_public_key_spki,
@@ -3466,9 +3581,12 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     // compress certificates and take no `preferred_key_exchange_group`
     // (`key_exchange_groups` orders the accept-set instead). `rng` is drawn
     // through `config_rng` and `signer` through `Connection::drive`.
+    // The DTLS engines do not renegotiate: a DTLS 1.2 client's request is
+    // declined, as with renegotiation disabled.
     let _ = (
         min_version,
         max_version,
+        renegotiation,
         roots,
         stapled_crl,
         stapled_ocsp_response,

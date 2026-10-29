@@ -225,23 +225,25 @@ pub(crate) fn parse_ec_point_formats(body: &[u8]) -> Result<Vec<u8>, Error> {
 
 /// `renegotiation_info` (RFC 5746 §3.2). In TLS 1.2 a fresh handshake carries
 /// an empty `renegotiated_connection` field (one u8 zero), which advertises
-/// support for secure renegotiation. This crate never actually renegotiates;
-/// we emit the empty form to keep modern servers from rejecting us, and we
-/// expect the server's echo to also be empty.
-// Used by the TLS 1.2 client/server in a follow-up commit.
-#[allow(dead_code)]
+/// support for secure renegotiation; the server's echo is empty too.
 pub(crate) fn renegotiation_info_empty() -> RawExtension {
+    renegotiation_info(&[])
+}
+
+/// `renegotiation_info` carrying `renegotiated_connection` (RFC 5746 §3.2):
+/// the previous handshake's `client_verify_data` in a renegotiating
+/// ClientHello, `client_verify_data || server_verify_data` in the
+/// ServerHello answering it. At most 255 bytes (`<0..255>`); the TLS 1.2
+/// values are 12 or 24.
+pub(crate) fn renegotiation_info(renegotiated_connection: &[u8]) -> RawExtension {
     let mut body = Vec::new();
-    with_len_u8(&mut body, |_| {});
+    with_len_u8(&mut body, |b| b.extend_from_slice(renegotiated_connection));
     (ExtensionType::RENEGOTIATION_INFO, body)
 }
 
 /// Parses a `renegotiation_info` body, returning the embedded
-/// `renegotiated_connection` bytes. For a fresh handshake (the only case this
-/// crate handles), the inner vector must be empty — non-empty inputs come
-/// from an actual renegotiation, which we never initiate.
-// Used by the TLS 1.2 client/server in a follow-up commit.
-#[allow(dead_code)]
+/// `renegotiated_connection` bytes: empty on an initial handshake, the
+/// previous handshake's verify data on a renegotiation.
 pub(crate) fn parse_renegotiation_info(body: &[u8]) -> Result<Vec<u8>, Error> {
     let mut c = ReadCursor::new(body);
     let inner = c.vec_u8()?;

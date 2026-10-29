@@ -13,9 +13,8 @@ use alloc::vec::Vec;
 /// Handshake message type codes.
 pub(crate) mod hs_type {
     /// `hello_request` (RFC 5246 §7.4.1.1). TLS 1.2 only; body is empty. The
-    /// server uses this to prompt renegotiation — we emit it for legacy peers
-    /// only, and never accept it after the handshake.
-    #[allow(dead_code)]
+    /// server uses this to prompt a (RFC 5746 secure) renegotiation, which
+    /// the TLS 1.2 engines perform only when `Config::renegotiation` allows.
     pub(crate) const HELLO_REQUEST: u8 = 0;
     pub(crate) const CLIENT_HELLO: u8 = 1;
     pub(crate) const SERVER_HELLO: u8 = 2;

@@ -419,8 +419,9 @@ impl NewSessionTicket12 {
 }
 
 /// `HelloRequest` (RFC 5246 §7.4.1.1). Empty body. The server uses this to
-/// prompt the client to renegotiate. We provide only an encoder; we never
-/// accept it after the handshake (commit 6 hardens that path).
+/// prompt the client to renegotiate (`ServerConnection12::renegotiate`); the
+/// client recognises it by type before any decoding, so only an encoder
+/// exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) struct HelloRequest;
 

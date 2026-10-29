@@ -353,6 +353,18 @@ pub enum Error {
     /// would produce a `CertificateVerify` / `ServerKeyExchange` every
     /// conformant peer rejects.
     UnsupportedKeyType,
+    /// A client renegotiated more often than
+    /// [`RenegotiationPolicy::client_limit`](crate::tls::RenegotiationPolicy::client_limit)
+    /// allows, under
+    /// [`RenegotiationLimitAction::Close`](crate::tls::RenegotiationLimitAction::Close).
+    /// The connection is closed with a fatal `handshake_failure` alert.
+    RenegotiationLimitExceeded,
+    /// A TLS 1.2 renegotiation presented a different peer leaf certificate
+    /// than the handshake it replaces (or none, where the peer had
+    /// authenticated before) and
+    /// [`RenegotiationPolicy::allow_peer_certificate_change`](crate::tls::RenegotiationPolicy::allow_peer_certificate_change)
+    /// is off. Maps to `handshake_failure`.
+    PeerCertificateChanged,
 }
 
 impl core::fmt::Display for Error {
@@ -420,6 +432,12 @@ impl core::fmt::Display for Error {
                 "signing key has no TLS signature scheme for this protocol version \
                  (secp256k1 / SM2 have none; Brainpool is TLS 1.3 only)",
             ),
+            Error::RenegotiationLimitExceeded => {
+                f.write_str("peer exceeded the TLS renegotiation rate limit")
+            }
+            Error::PeerCertificateChanged => {
+                f.write_str("peer certificate changed during TLS renegotiation")
+            }
         }
     }
 }

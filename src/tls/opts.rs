@@ -33,6 +33,7 @@ use super::groups::NamedGroup;
 use super::keylog::KeyLog;
 use super::pki::{CrlStore, RootCertStore};
 use super::psk::{ExternalPsk, PskKeyExchangeMode};
+use super::reneg::RenegotiationPolicy;
 use super::secret::Secret32;
 use super::signer::HandshakeSigner;
 use super::version::ProtocolVersion;
@@ -67,6 +68,7 @@ pub(crate) struct CommonOpts<'a> {
     pub cipher_suites: Option<&'a [u16]>,
     pub key_exchange_groups: Option<&'a [NamedGroup]>,
     pub require_extended_master_secret: bool,
+    pub renegotiation: &'a RenegotiationPolicy,
     pub server_cert_type_preference: &'a [u8],
     pub client_cert_type_preference: &'a [u8],
     pub raw_public_key_spki: Option<&'a [u8]>,
@@ -156,6 +158,7 @@ impl Config {
             key_exchange_groups,
             record_size_limit,
             require_extended_master_secret,
+            renegotiation,
             server_cert_type_preference,
             client_cert_type_preference,
             raw_public_key_spki,
@@ -200,6 +203,7 @@ impl Config {
                 cipher_suites: cipher_suites.as_deref(),
                 key_exchange_groups: key_exchange_groups.as_deref(),
                 require_extended_master_secret: *require_extended_master_secret,
+                renegotiation,
                 server_cert_type_preference,
                 client_cert_type_preference,
                 raw_public_key_spki: raw_public_key_spki.as_deref(),

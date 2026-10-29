@@ -305,9 +305,8 @@ u16_id!(
         /// and delegates encoding/decoding to the QUIC layer via `QuicHooks`.
         QUIC_TRANSPORT_PARAMETERS = 0x0039,
         /// renegotiation_info (RFC 5746). In TLS 1.2 ClientHello/ServerHello,
-        /// an empty body advertises support for secure renegotiation. We
-        /// never actually renegotiate; we only emit/expect the empty form.
-        #[allow(dead_code)]
+        /// an empty body advertises support for secure renegotiation; a
+        /// renegotiation carries the previous handshake's `verify_data`.
         RENEGOTIATION_INFO = 0xff01,
         /// CRL stapling, a purecrypto private/experimental extension carried
         /// as a per-certificate extension in the TLS 1.3 `Certificate` message

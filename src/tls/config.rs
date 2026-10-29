@@ -18,6 +18,7 @@ use super::groups::NamedGroup;
 use super::keylog::KeyLog;
 use super::pki::{CrlStore, RootCertStore};
 use super::psk::{ExternalPsk, PskKeyExchangeMode};
+use super::reneg::{RenegotiationLimit, RenegotiationLimitAction, RenegotiationPolicy};
 use super::secret::Secret32;
 use super::version::ProtocolVersion;
 use crate::x509::Time;
@@ -420,6 +421,19 @@ pub struct Config {
     /// covers every version from 1.0 up); SSL 3.0 has no extended master
     /// secret, so an SSL 3.0 handshake is refused unless this is `false`.
     pub require_extended_master_secret: bool,
+    /// TLS 1.2 secure renegotiation (RFC 5746). Off by default: a peer's
+    /// renegotiation request is declined with a warning `no_renegotiation`
+    /// alert and the connection carries on. When enabled, a renegotiation
+    /// must also run Extended Master Secret on both handshakes and keep the
+    /// peer's certificate (see [`RenegotiationPolicy`]); the server
+    /// additionally rate-limits client-initiated renegotiations
+    /// ([`RenegotiationPolicy::client_limit`], PHP's `reneg_limit` /
+    /// `reneg_window`). Start one with
+    /// [`Connection::renegotiate`](super::Connection::renegotiate).
+    /// Honoured by the TLS 1.2 engines (client and server, the modern AEAD
+    /// suites); inert on TLS 1.3, QUIC and DTLS, and on the `tls-legacy`
+    /// versions, where requests are always declined.
+    pub renegotiation: RenegotiationPolicy,
 
     // ---- RFC 7250 raw public keys (TLS 1.3 and TLS 1.2) ----
     /// Server-cert-type preference list offered in the `server_certificate_type`
@@ -822,6 +836,7 @@ impl Default for Config {
             key_exchange_groups: None,
             record_size_limit: None,
             require_extended_master_secret: true,
+            renegotiation: RenegotiationPolicy::default(),
             server_cert_type_preference: alloc::vec![0u8], // X.509 only.
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
@@ -939,6 +954,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `key_exchange_groups` | yes | inert | yes | yes (X25519, P-256, P-384) | yes |
 /// | `record_size_limit` | yes | yes | **refused** | **refused** | inert (no records) |
 /// | `require_extended_master_secret` | inert | yes | inert | yes | inert |
+/// | `renegotiation` / `allow_renegotiation` / `renegotiation_limit` | inert | yes (not the `tls-legacy` versions) | inert | inert (not supported) | inert |
 /// | `stapled_ocsp_response` | yes | yes | inert | inert | yes |
 /// | `stapled_crl` | yes | inert | inert | inert | yes |
 /// | `ticket_key` | yes | yes | inert (no tickets) | inert (no tickets) | yes |
@@ -1370,6 +1386,31 @@ impl ConfigBuilder {
     /// stacks already mandate EMS).
     pub fn require_extended_master_secret(mut self, required: bool) -> Self {
         self.inner.require_extended_master_secret = required;
+        self
+    }
+    /// Replaces the TLS 1.2 renegotiation policy. See
+    /// [`Config::renegotiation`].
+    pub fn renegotiation(mut self, policy: RenegotiationPolicy) -> Self {
+        self.inner.renegotiation = policy;
+        self
+    }
+    /// Enables (or disables) TLS 1.2 secure renegotiation (RFC 5746),
+    /// keeping the rest of the policy. See [`Config::renegotiation`].
+    pub fn allow_renegotiation(mut self, enabled: bool) -> Self {
+        self.inner.renegotiation.enabled = enabled;
+        self
+    }
+    /// Server: limits client-initiated renegotiations to `max` per
+    /// `window_secs` seconds (PHP's `reneg_limit` / `reneg_window`; `None`
+    /// lifts the limit) and sets what exceeding it does. See
+    /// [`RenegotiationLimit`].
+    pub fn renegotiation_limit(
+        mut self,
+        limit: Option<RenegotiationLimit>,
+        on_exceeded: RenegotiationLimitAction,
+    ) -> Self {
+        self.inner.renegotiation.client_limit = limit;
+        self.inner.renegotiation.on_limit_exceeded = on_exceeded;
         self
     }
     /// Sets the `server_certificate_type` preference list (RFC 7250). On the

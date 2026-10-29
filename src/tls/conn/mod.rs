@@ -6341,6 +6341,9 @@ mod loopback_tests {
 }
 
 #[cfg(test)]
+mod tests_reneg;
+
+#[cfg(test)]
 mod tls12_loopback_tests {
     //! End-to-end loopback for the TLS 1.2 client + server: drive a full
     //! handshake in-process across every AEAD-ECDHE suite × cert combination
