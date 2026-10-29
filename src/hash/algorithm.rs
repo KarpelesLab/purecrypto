@@ -257,9 +257,12 @@ pub(crate) use impl_dyn_digest;
 
 /// Defines [`HashAlgorithm`], its per-variant metadata, and the [`Hasher`]
 /// state enum from one table, so the algorithm list is stated exactly once.
+/// An entry may carry one `#[cfg(...)]` (after its doc comment), which then
+/// gates the variant and every arm generated for it.
 macro_rules! hash_algorithms {
     ($(
-        $(#[$attr:meta])*
+        $(#[doc = $doc:literal])*
+        $(#[cfg($cfg:meta)])?
         $variant:ident => $ty:ty, $name:literal $(| $alias:literal)*, legacy: $legacy:literal;
     )*) => {
         /// A hash function selected at runtime.
@@ -279,17 +282,17 @@ macro_rules! hash_algorithms {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[non_exhaustive]
         pub enum HashAlgorithm {
-            $( $(#[$attr])* $variant, )*
+            $( $(#[doc = $doc])* $(#[cfg($cfg)])? $variant, )*
         }
 
         impl HashAlgorithm {
             /// Every algorithm this enum names, in declaration order.
-            pub const ALL: &'static [HashAlgorithm] = &[$(HashAlgorithm::$variant,)*];
+            pub const ALL: &'static [HashAlgorithm] = &[$($(#[cfg($cfg)])? HashAlgorithm::$variant,)*];
 
             /// The digest output length, in bytes.
             pub const fn output_len(self) -> usize {
                 match self {
-                    $(HashAlgorithm::$variant => <$ty as Digest>::OUTPUT_LEN,)*
+                    $($(#[cfg($cfg)])? HashAlgorithm::$variant => <$ty as Digest>::OUTPUT_LEN,)*
                 }
             }
 
@@ -297,7 +300,7 @@ macro_rules! hash_algorithms {
             /// constructions), in bytes.
             pub const fn block_len(self) -> usize {
                 match self {
-                    $(HashAlgorithm::$variant => <$ty as Digest>::BLOCK_LEN,)*
+                    $($(#[cfg($cfg)])? HashAlgorithm::$variant => <$ty as Digest>::BLOCK_LEN,)*
                 }
             }
 
@@ -306,17 +309,18 @@ macro_rules! hash_algorithms {
             /// [`from_name`](HashAlgorithm::from_name).
             pub const fn name(self) -> &'static str {
                 match self {
-                    $(HashAlgorithm::$variant => $name,)*
+                    $($(#[cfg($cfg)])? HashAlgorithm::$variant => $name,)*
                 }
             }
 
             /// Whether the algorithm is kept only for interop and must not be
             /// used for new signatures or commitments — the digests with
             /// broken (MD2, MD4, MD5, SHA-1) or sub-128-bit (RIPEMD-160)
-            /// collision resistance.
+            /// collision resistance, and every digest of the `legacy-hashes`
+            /// feature.
             pub const fn is_legacy(self) -> bool {
                 match self {
-                    $(HashAlgorithm::$variant => $legacy,)*
+                    $($(#[cfg($cfg)])? HashAlgorithm::$variant => $legacy,)*
                 }
             }
 
@@ -326,6 +330,7 @@ macro_rules! hash_algorithms {
             /// common spellings (`"sha-256"`, `"sha2-256"`, `"sha512/256"`, …).
             pub fn from_name(name: &str) -> Option<Self> {
                 $(
+                    $(#[cfg($cfg)])?
                     if name.eq_ignore_ascii_case($name)
                         $(|| name.eq_ignore_ascii_case($alias))*
                     {
@@ -338,7 +343,10 @@ macro_rules! hash_algorithms {
             /// A [`Hasher`] for this algorithm, in its initial state.
             pub fn hasher(self) -> Hasher {
                 Hasher(match self {
-                    $(HashAlgorithm::$variant => HasherState::$variant(<$ty as Digest>::new()),)*
+                    $(
+                        $(#[cfg($cfg)])?
+                        HashAlgorithm::$variant => HasherState::$variant(<$ty as Digest>::new()),
+                    )*
                 })
             }
         }
@@ -349,14 +357,14 @@ macro_rules! hash_algorithms {
         #[allow(clippy::large_enum_variant)]
         #[derive(Clone)]
         enum HasherState {
-            $( $variant($ty), )*
+            $( $(#[cfg($cfg)])? $variant($ty), )*
         }
 
         impl Hasher {
             /// The algorithm being computed.
             pub fn algorithm(&self) -> HashAlgorithm {
                 match &self.0 {
-                    $(HasherState::$variant(_) => HashAlgorithm::$variant,)*
+                    $($(#[cfg($cfg)])? HasherState::$variant(_) => HashAlgorithm::$variant,)*
                 }
             }
 
@@ -364,14 +372,14 @@ macro_rules! hash_algorithms {
             // funnels every input shape through this one match.
             fn update_bytes(&mut self, data: &[u8]) {
                 match &mut self.0 {
-                    $(HasherState::$variant(h) => Digest::update(h, data),)*
+                    $($(#[cfg($cfg)])? HasherState::$variant(h) => Digest::update(h, data),)*
                 }
             }
 
             /// Best-effort wipe of the internal state. Called on drop.
             pub fn zeroize(&mut self) {
                 match &mut self.0 {
-                    $(HasherState::$variant(h) => Digest::zeroize(h),)*
+                    $($(#[cfg($cfg)])? HasherState::$variant(h) => Digest::zeroize(h),)*
                 }
             }
 
@@ -379,7 +387,7 @@ macro_rules! hash_algorithms {
             // have already checked against `output_len`) and resets the state.
             fn finalize_reset_into(&mut self, out: &mut [u8]) {
                 match &mut self.0 {
-                    $(HasherState::$variant(h) => {
+                    $($(#[cfg($cfg)])? HasherState::$variant(h) => {
                         let fresh = <$ty as Digest>::new();
                         let digest = Digest::finalize(core::mem::replace(h, fresh));
                         out.copy_from_slice(digest.as_ref());
@@ -388,7 +396,7 @@ macro_rules! hash_algorithms {
             }
         }
 
-        $( impl_dyn_digest!($ty, HashAlgorithm::$variant); )*
+        $( $(#[cfg($cfg)])? impl_dyn_digest!($ty, HashAlgorithm::$variant); )*
     };
 }
 
@@ -443,6 +451,87 @@ hash_algorithms! {
     Md4 => crate::hash::Md4, "md4", legacy: true;
     /// MD2 — legacy interop only; thoroughly broken.
     Md2 => crate::hash::Md2, "md2", legacy: true;
+    /// RIPEMD-128 — legacy; 128-bit output.
+    #[cfg(feature = "legacy-hashes")]
+    Ripemd128 => crate::hash::Ripemd128, "ripemd128" | "ripemd-128", legacy: true;
+    /// RIPEMD-256 — legacy; RIPEMD-128's security with a longer output.
+    #[cfg(feature = "legacy-hashes")]
+    Ripemd256 => crate::hash::Ripemd256, "ripemd256" | "ripemd-256", legacy: true;
+    /// RIPEMD-320 — legacy; RIPEMD-160's security with a longer output.
+    #[cfg(feature = "legacy-hashes")]
+    Ripemd320 => crate::hash::Ripemd320, "ripemd320" | "ripemd-320", legacy: true;
+    /// Tiger, 3 passes, 128-bit truncation — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Tiger128_3 => crate::hash::Tiger128_3, "tiger128,3" | "tiger128-3", legacy: true;
+    /// Tiger, 3 passes, 160-bit truncation — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Tiger160_3 => crate::hash::Tiger160_3, "tiger160,3" | "tiger160-3", legacy: true;
+    /// Tiger, 3 passes, 192-bit (the original Tiger) — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Tiger192_3 => crate::hash::Tiger192_3, "tiger192,3" | "tiger192-3" | "tiger192" | "tiger", legacy: true;
+    /// Tiger, 4 passes, 128-bit truncation — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Tiger128_4 => crate::hash::Tiger128_4, "tiger128,4" | "tiger128-4", legacy: true;
+    /// Tiger, 4 passes, 160-bit truncation — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Tiger160_4 => crate::hash::Tiger160_4, "tiger160,4" | "tiger160-4", legacy: true;
+    /// Tiger, 4 passes, 192-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Tiger192_4 => crate::hash::Tiger192_4, "tiger192,4" | "tiger192-4", legacy: true;
+    /// Snefru-256, 8 passes — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Snefru256 => crate::hash::Snefru256, "snefru" | "snefru256" | "snefru-256", legacy: true;
+    /// GOST R 34.11-94, test parameter S-boxes — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Gost94 => crate::hash::Gost94, "gost" | "gost94" | "gostr3411-94", legacy: true;
+    /// GOST R 34.11-94, CryptoPro S-boxes (RFC 4357) — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Gost94CryptoPro => crate::hash::Gost94CryptoPro, "gost-crypto" | "gost94-cryptopro", legacy: true;
+    /// HAVAL, 3 passes, 128-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval128_3 => crate::hash::Haval128_3, "haval128,3" | "haval128-3", legacy: true;
+    /// HAVAL, 3 passes, 160-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval160_3 => crate::hash::Haval160_3, "haval160,3" | "haval160-3", legacy: true;
+    /// HAVAL, 3 passes, 192-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval192_3 => crate::hash::Haval192_3, "haval192,3" | "haval192-3", legacy: true;
+    /// HAVAL, 3 passes, 224-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval224_3 => crate::hash::Haval224_3, "haval224,3" | "haval224-3", legacy: true;
+    /// HAVAL, 3 passes, 256-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval256_3 => crate::hash::Haval256_3, "haval256,3" | "haval256-3", legacy: true;
+    /// HAVAL, 4 passes, 128-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval128_4 => crate::hash::Haval128_4, "haval128,4" | "haval128-4", legacy: true;
+    /// HAVAL, 4 passes, 160-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval160_4 => crate::hash::Haval160_4, "haval160,4" | "haval160-4", legacy: true;
+    /// HAVAL, 4 passes, 192-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval192_4 => crate::hash::Haval192_4, "haval192,4" | "haval192-4", legacy: true;
+    /// HAVAL, 4 passes, 224-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval224_4 => crate::hash::Haval224_4, "haval224,4" | "haval224-4", legacy: true;
+    /// HAVAL, 4 passes, 256-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval256_4 => crate::hash::Haval256_4, "haval256,4" | "haval256-4", legacy: true;
+    /// HAVAL, 5 passes, 128-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval128_5 => crate::hash::Haval128_5, "haval128,5" | "haval128-5", legacy: true;
+    /// HAVAL, 5 passes, 160-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval160_5 => crate::hash::Haval160_5, "haval160,5" | "haval160-5", legacy: true;
+    /// HAVAL, 5 passes, 192-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval192_5 => crate::hash::Haval192_5, "haval192,5" | "haval192-5", legacy: true;
+    /// HAVAL, 5 passes, 224-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval224_5 => crate::hash::Haval224_5, "haval224,5" | "haval224-5", legacy: true;
+    /// HAVAL, 5 passes, 256-bit — legacy.
+    #[cfg(feature = "legacy-hashes")]
+    Haval256_5 => crate::hash::Haval256_5, "haval256,5" | "haval256-5", legacy: true;
 }
 
 /// Bridges a runtime [`HashAlgorithm`] into code that is generic over a
@@ -581,13 +670,57 @@ macro_rules! dispatch_digest {
                 type $d = $crate::hash::Md2;
                 $body
             }
-            // Reachable only for a caller outside this crate (where the
+            // The `legacy-hashes` variants exist only when *this* crate was
+            // built with that feature, which a `cfg` written here would test
+            // against the caller's features instead; the helper below is
+            // defined per this crate's build. Past those, the fallback is
+            // reachable only for a caller outside this crate (where the
             // `#[non_exhaustive]` enum may carry a newer variant); in-crate
             // uses cover every variant, so silence the lint there.
+            #[allow(unreachable_patterns)]
+            __other => $crate::__dispatch_digest_legacy!(__other, |$d| $body, _ => $fallback),
+        }
+    };
+}
+
+/// The `legacy-hashes` arms of [`dispatch_digest!`]; not public API.
+#[cfg(feature = "legacy-hashes")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __dispatch_digest_legacy {
+    ($alg:expr, |$d:ident| $body:block, _ => $fallback:expr) => {
+        $crate::__dispatch_digest_legacy!(@arms $alg, $d, $body, $fallback;
+            Ripemd128 Ripemd256 Ripemd320
+            Tiger128_3 Tiger160_3 Tiger192_3 Tiger128_4 Tiger160_4 Tiger192_4
+            Snefru256 Gost94 Gost94CryptoPro
+            Haval128_3 Haval160_3 Haval192_3 Haval224_3 Haval256_3
+            Haval128_4 Haval160_4 Haval192_4 Haval224_4 Haval256_4
+            Haval128_5 Haval160_5 Haval192_5 Haval224_5 Haval256_5)
+    };
+    (@arms $alg:expr, $d:ident, $body:block, $fallback:expr; $($v:ident)*) => {
+        match $alg {
+            $(
+                $crate::hash::HashAlgorithm::$v => {
+                    type $d = $crate::hash::$v;
+                    $body
+                }
+            )*
             #[allow(unreachable_patterns)]
             _ => $fallback,
         }
     };
+}
+
+/// Without `legacy-hashes` there are no further arms: straight to the
+/// fallback.
+#[cfg(not(feature = "legacy-hashes"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __dispatch_digest_legacy {
+    ($alg:expr, |$d:ident| $body:block, _ => $fallback:expr) => {{
+        let _ = $alg;
+        $fallback
+    }};
 }
 
 impl HashAlgorithm {
@@ -1095,8 +1228,61 @@ mod tests {
                     | HashAlgorithm::Md5
                     | HashAlgorithm::Sha1
                     | HashAlgorithm::Ripemd160
-            );
+            ) || is_legacy_hashes_variant(alg);
             assert_eq!(alg.is_legacy(), expect, "{alg}");
         }
+    }
+
+    /// Whether `alg` comes from the `legacy-hashes` feature (all of which
+    /// are legacy): the table lists them last, from RIPEMD-128 on.
+    fn is_legacy_hashes_variant(alg: HashAlgorithm) -> bool {
+        #[cfg(feature = "legacy-hashes")]
+        {
+            HashAlgorithm::ALL
+                .iter()
+                .position(|&a| a == HashAlgorithm::Ripemd128)
+                .is_some_and(|first| HashAlgorithm::ALL[first..].contains(&alg))
+        }
+        #[cfg(not(feature = "legacy-hashes"))]
+        {
+            let _ = alg;
+            false
+        }
+    }
+
+    // The `legacy-hashes` digests under their PHP `hash()` names.
+    #[cfg(feature = "legacy-hashes")]
+    #[test]
+    fn legacy_hashes_by_php_name() {
+        let cases: [(&str, &str); 4] = [
+            (
+                "tiger192,3",
+                "2aab1484e8c158f2bfb8c5ff41b57a525129131c957b5f93",
+            ),
+            ("haval128,3", "9e40ed883fb63e985d299b40cda2b8f2"),
+            ("ripemd128", "c14a12199c66e4ba84636b0f69144c77"),
+            (
+                "snefru256",
+                "7d033205647a2af3dc8339f6cb25643c33ebc622d32979c4b612b02c4903031b",
+            ),
+        ];
+        for (name, want) in cases {
+            let alg = HashAlgorithm::from_name(name).unwrap();
+            assert!(alg.is_legacy());
+            let got = alg.digest(b"abc");
+            let mut hex = [0u8; 2 * HashAlgorithm::MAX_OUTPUT_LEN];
+            for (i, b) in got.iter().enumerate() {
+                hex[2 * i] = b"0123456789abcdef"[(b >> 4) as usize];
+                hex[2 * i + 1] = b"0123456789abcdef"[(b & 15) as usize];
+            }
+            assert_eq!(&hex[..2 * got.len()], want.as_bytes(), "{name}");
+        }
+        assert_eq!(
+            HashAlgorithm::from_name("GOST-CRYPTO"),
+            Some(HashAlgorithm::Gost94CryptoPro)
+        );
+        assert_eq!(HashAlgorithm::Haval256_5.name(), "haval256,5");
+        assert_eq!(HashAlgorithm::Haval256_5.block_len(), 128);
+        assert_eq!(HashAlgorithm::Snefru256.block_len(), 32);
     }
 }
