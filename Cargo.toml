@@ -473,6 +473,12 @@ required-features = ["tls", "std"]
 name = "tls_legacy_interop"
 required-features = ["tls-legacy", "std"]
 
+# TLS 1.2 secure renegotiation (RFC 5746) against `openssl s_server` /
+# `s_client` (`cargo run --example tls_reneg_interop`; needs `openssl`).
+[[example]]
+name = "tls_reneg_interop"
+required-features = ["tls", "std"]
+
 # Ad-hoc throughput/latency harness used to find optimization choke points
 # (`cargo run --release --example bench`). Gated so `--no-default-features`
 # (no_std) builds don't try to compile it.
