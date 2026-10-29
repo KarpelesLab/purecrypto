@@ -111,6 +111,11 @@ Present for talking to existing systems; each has a documented weakness:
 - **RSA PKCS#1 v1.5 *encryption*** — Bleichenbacher padding oracle.
 - **SHA-1 / MD5 / MD4 / RIPEMD-160** for signing — not collision-resistant.
   (Verification of legacy signatures is fine.)
+- `legacy-hashes` feature: RIPEMD-128/256/320, Tiger, Snefru, GOST R 34.11-94
+  and HAVAL, for byte-compatibility with PHP's `hash()`. Old designs, several
+  with practical collisions (3-pass HAVAL) or differential attacks (Snefru);
+  Tiger, Snefru and GOST use data-indexed S-box tables, so do not key them
+  (HMAC) with secrets an attacker can time.
 - **DES / 3DES**, RC2 — broken / disallowed; interop only.
 - **Finite-field `dh`** (RFC 3526 MODP) — prefer ECDH (`ec`) for new code.
 - **SM2** — use only for GB/T 32918 / RFC 8998 regional compliance.

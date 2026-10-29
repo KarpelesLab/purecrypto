@@ -48,7 +48,7 @@ vectors · **CAVP** = NIST CAVP · **OpenSSL** = vectors produced by OpenSSL ·
 |---|---|---|---|---|---|
 | `ct` | — (foundation) | unit (exhaustive u8/i8) | — | — | foundation |
 | `bignum` | — (foundation) | unit | — | — | yes (unconditional) |
-| `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2) | RFC / NIST samples; **Wycheproof** (HMAC ×12, KMAC); M14 oracle-derived (K12-validated), cross-checked vs noble-hashes | OpenSSL (Whirlpool, SM3, SHAKE, BLAKE2), PyCryptodome (MD2), gostcrypto (Streebog), noble-hashes (M14, 14-round) | — | MAC verify CT |
+| `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2); behind the opt-in `legacy-hashes` feature RIPEMD-128/256/320, Tiger, Snefru-256, GOST R 34.11-94 / RFC 5831, HAVAL | RFC / NIST samples; **Wycheproof** (HMAC ×12, KMAC); M14 oracle-derived (K12-validated), cross-checked vs noble-hashes; `legacy-hashes`: php-src `ext/hash/tests` (digest, HMAC, HKDF), Bosselaers' RIPEMD page, the Tiger reference page, RFC 5831 | OpenSSL (Whirlpool, SM3, SHAKE, BLAKE2), PyCryptodome (MD2), gostcrypto (Streebog), noble-hashes (M14, 14-round); RHash (Tiger, Snefru, GOST R 34.11-94) | — | MAC verify CT |
 | `mac` | RFC 4418 (UMAC), SipHash (Aumasson–Bernstein), draft-krovetz-vmac-01 (VMAC, behind the opt-in `vmac` feature) | RFC / paper vectors; **Wycheproof** (SipHash ×5, VMAC ×2) | — | — | built on CT AES; SipHash ARX; VMAC mask-based arithmetic |
 | `rng` | SP 800-90A (HMAC-DRBG) | CAVP | — | — | n/a (public output) |
 | `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713, EAX, AEGIS, RFC 7518 §5.2, draft-irtf-cfrg-xchacha, Salsa20 / XSalsa20 / NaCl secretbox ("Cryptography in NaCl" vectors; libsodium 1.0.20 and OpenSSL 3.5 cross-checks of the ChaCha20 / Salsa20 counter boundaries); RFC 4269 (SEED), MORUS v2, AEGIS-128 and TEA/XTEA/XXTEA behind the opt-in `legacy-ciphers` feature | RFC / NIST; **Wycheproof** (GCM, GCM-SIV, CCM, EAX, ChaCha20/XChaCha20-Poly1305, AEGIS, MORUS, GMAC, CBC, CMAC, SIV, KW/KWP, XTS, CBC-HS; ARIA/Camellia/SEED/SM4 modes) | — | — | AES table-free; ARX |
@@ -1021,7 +1021,8 @@ Every entry runs the positive control, then the full case list.
   harness (they would be flagged, correctly); nothing is suppressed.
   Beyond the list below that also excludes FF1 (its radix arithmetic on the
   digits is data-dependent by construction), the table-driven hashes
-  (Streebog, Whirlpool, MD2 — documented at the code site) and PKCS#12
+  (Streebog, Whirlpool, MD2, and the `legacy-hashes` Tiger, Snefru and
+  GOST R 34.11-94 — documented at the code site) and PKCS#12
   (its archives are PBES2 CBC-PAD envelopes).
 
 The first run found and fixed four cases where LLVM had undone
@@ -1162,7 +1163,9 @@ code site:
 - **Compat-only / legacy** (off by default or to be avoided in new code): the
   `tls-legacy` feature (SSL 3.0 / TLS 1.0/1.1 — BEAST/POODLE/Lucky13 residue,
   MD5/SHA-1 PRF, static-RSA); RSA PKCS#1 v1.5 *encryption* (Bleichenbacher
-  oracle); MD2/MD4/MD5/SHA-1/RIPEMD-160 (not collision-resistant); DES/3DES;
+  oracle); MD2/MD4/MD5/SHA-1/RIPEMD-160 (not collision-resistant) and the
+  opt-in `legacy-hashes` set (RIPEMD-128/256/320, Tiger, Snefru,
+  GOST R 34.11-94, HAVAL — PHP interop only); DES/3DES;
   finite-field `dh` (prefer ECDH); SM2 (regional). See
   [`recommended-usage.md`](recommended-usage.md).
 - **Stateful keys**: LMS and XMSS advance a one-time-key index on every
