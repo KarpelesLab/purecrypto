@@ -41,8 +41,34 @@ correct and constant-time but slower (see [tradeoffs](#constant-time-tradeoffs))
 | SHA-512 | 718 |
 | BLAKE3 | 2674 |
 
-(SHA-256 reflects SHA-NI; SHA-512 has no SHA-NI on this CPU, so it runs the
-scalar path — hence the gap. BLAKE3 uses the AVX2 8-way backend.)
+(SHA-256 reflects SHA-NI; BLAKE3 uses the AVX2 8-way backend. x86 has no
+SHA-512 instruction, and the SHA-512 figure above predates the vectorised
+x86_64 kernel — see below.)
+
+### SHA-512 on AMD Zen 5
+
+SHA-512 (and SHA-384, SHA-512/224, SHA-512/256, HMAC over them) runs an x86_64
+kernel that computes the message schedule of two blocks at a time in 256-bit
+vectors (AVX-512VL rotations where available, else AVX2) while BMI2 `rorx`
+rounds run on the scalar side; the portable fallback is fully unrolled. Median
+µs per message on a Threadripper PRO 9995WX (Zen 5, pinned to one core, five
+runs; libsodium 1.0.18 and OpenSSL 3.5.8 `speed -evp sha512` / `-hmac sha512`
+on the same core):
+
+| Message | purecrypto (before) | purecrypto | libsodium | OpenSSL |
+|---|--:|--:|--:|--:|
+| SHA-512, 64 B | 0.226 | 0.129 | 0.177 | 0.160 |
+| SHA-512, 1 KiB | 1.83 | 0.90 | 1.46 | 1.13 |
+| SHA-512, 16 KiB | 25.7 | 12.3 | 20.3 | 12.4 |
+| SHA-512, 1 MiB | 1628 | 780 | 1292 | 798 |
+| HMAC-SHA512, 64 B | 0.855 | 0.482 | 0.745 | 0.268 |
+| HMAC-SHA512, 1 KiB | 2.51 | 1.30 | 2.03 | 1.07 |
+| HMAC-SHA512, 1 MiB | 1633 | 782 | 1285 | 830 |
+
+The HMAC rows include keying (`Hmac::mac`); OpenSSL's `speed -hmac` reuses one
+keyed context, so its short-message figures leave out the two key-block
+compressions. The AVX2 build of the kernel (CPUs without AVX-512VL) is about
+18% slower than the AVX-512VL one here, the portable path about 50% slower.
 
 ## Asymmetric (latency)
 

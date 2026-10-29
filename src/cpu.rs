@@ -42,6 +42,8 @@ mod x86 {
     pub(super) const AVX512F: u32 = 1 << 7;
     pub(super) const AVX512BW: u32 = 1 << 8;
     pub(super) const BMI1: u32 = 1 << 9;
+    pub(super) const BMI2: u32 = 1 << 10;
+    pub(super) const AVX512VL: u32 = 1 << 11;
     /// Set once the cache holds a detection result.
     const READY: u32 = 1 << 31;
 
@@ -115,6 +117,9 @@ mod x86 {
         if max7 && bit(ebx7, 3) {
             f |= BMI1;
         }
+        if max7 && bit(ebx7, 8) {
+            f |= BMI2;
+        }
 
         // The wide-register extensions also need the OS to save that state.
         let osxsave = bit(l1.ecx, 27);
@@ -131,6 +136,9 @@ mod x86 {
                 f |= AVX512F;
                 if bit(ebx7, 30) {
                     f |= AVX512BW;
+                }
+                if bit(ebx7, 31) {
+                    f |= AVX512VL;
                 }
             }
         }
@@ -198,10 +206,21 @@ mod x86_api {
     pub(crate) fn avx512bw() -> bool {
         has(AVX512BW | AVX512F)
     }
+    /// AVX-512 Vector Length extensions (the AVX-512 instructions on 128-
+    /// and 256-bit vectors; implies [`avx512f`]).
+    #[inline]
+    pub(crate) fn avx512vl() -> bool {
+        has(AVX512VL | AVX512F)
+    }
     /// BMI1 (`ANDN` and friends).
     #[inline]
     pub(crate) fn bmi1() -> bool {
         has(BMI1)
+    }
+    /// BMI2 (`RORX`, `MULX`, `SHLX` and friends).
+    #[inline]
+    pub(crate) fn bmi2() -> bool {
+        has(BMI2)
     }
 }
 #[cfg(target_arch = "x86_64")]
@@ -266,5 +285,7 @@ mod tests {
         assert_eq!(super::avx512f(), std::is_x86_feature_detected!("avx512f"));
         assert_eq!(super::avx512bw(), std::is_x86_feature_detected!("avx512bw"));
         assert_eq!(super::bmi1(), std::is_x86_feature_detected!("bmi1"));
+        assert_eq!(super::bmi2(), std::is_x86_feature_detected!("bmi2"));
+        assert_eq!(super::avx512vl(), std::is_x86_feature_detected!("avx512vl"));
     }
 }
