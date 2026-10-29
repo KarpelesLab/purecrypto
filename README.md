@@ -116,6 +116,11 @@ cc app.c -I include target/release/libpurecrypto.a -lpthread -ldl -lm -o app
 - **`no_std` core.** The crate is `#![no_std]`; `alloc` and `std` are
   opt-in features (`std` is the default and implies `alloc`). Most
   primitives, and the fixed-curve half of `ec`, need no allocator at all.
+  The x86_64 hardware backends (SHA-NI, AES-NI, PCLMULQDQ, AVX2/AVX-512)
+  are detected with `CPUID` and work without `std`. A `no_std` aarch64
+  build cannot ask the OS, so it uses the SHA-1/SHA-2 instructions when
+  the target enables them at compile time (`-C target-feature=+sha2,+sha3`);
+  its other crypto-extension kernels still need `std`.
 - **Validated.** Where a standard publishes test vectors they run in CI
   (RFC 8439, RFC 8032, RFC 8448, FIPS 203/204/205 ACVP, BIP340, and more),
   the **entire** [Wycheproof](https://github.com/C2SP/wycheproof) corpus

@@ -65,7 +65,7 @@ impl Poly1305 {
         // (< 128 bytes of full blocks plus any partial block) falls through
         // to the scalar paths. Control flow depends only on the public
         // message length.
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         if data.len() >= simd::MIN_LEN && simd::supported() {
             let vec_len = data.len() & !127;
             simd::blocks(self, &data[..vec_len]);
@@ -376,7 +376,7 @@ mod imp {
         }
 
         /// `r` as five 26-bit limbs, for the AVX2 kernel's power table.
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         pub(super) fn r26(&self) -> [u32; 5] {
             let r = u128::from(self.r[0])
                 | (u128::from(self.r[1]) << 44)
@@ -385,7 +385,7 @@ mod imp {
         }
 
         /// `h` as five lazily reduced 26-bit limbs (each below 2²⁷).
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         pub(super) fn h26(&self) -> [u32; 5] {
             let [h0, h1, h2] = self.carry();
             [
@@ -398,7 +398,7 @@ mod imp {
         }
 
         /// Loads `h` from five lazily reduced 26-bit limbs (each below 2²⁸).
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         pub(super) fn set_h26(&mut self, l: [u32; 5]) {
             let l = l.map(u64::from);
             // Sum (not OR) the correctly weighted pieces, so lazily reduced
@@ -582,7 +582,7 @@ mod imp {
 /// large and chunked-streaming cases. The scalar state is radix 2⁴⁴ on this
 /// target; `r` and `h` are converted to and from 26-bit limbs at the
 /// kernel boundary.
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod simd {
     use super::Poly1305;
@@ -595,7 +595,7 @@ mod simd {
     const MASK26: u64 = 0x03ff_ffff;
 
     pub(super) fn supported() -> bool {
-        !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
+        !crate::ct::force_portable() && crate::cpu::avx2()
     }
 
     /// Absorbs `data` (a non-empty multiple of 128 bytes) into `st.h`.

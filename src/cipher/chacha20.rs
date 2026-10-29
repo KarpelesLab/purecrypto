@@ -329,12 +329,12 @@ impl ChaCha20 {
         // blocks are independent, so the wide layout needs no diagonal
         // shuffles. AVX-512 does sixteen blocks per pass, AVX2 eight; both are
         // byte-identical to the scalar path.
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         if simd512::supported() {
             simd512::apply_keystream(&self.key, nonce, counter, buf);
             return;
         }
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         if simd::supported() {
             simd::apply_keystream(&self.key, nonce, counter, buf);
             return;
@@ -444,14 +444,14 @@ impl XChaCha20 {
 /// `vprold` rotates in one instruction where AVX2 needs a shift/shift/or trio,
 /// which matters because ChaCha20 is four rotates per quarter-round and nothing
 /// else. Pinned byte-for-byte against the scalar path by a differential test.
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod simd512 {
     use super::CONSTANTS;
     use core::arch::x86_64::*;
 
     pub(super) fn supported() -> bool {
-        !crate::ct::force_portable() && std::is_x86_feature_detected!("avx512f")
+        !crate::ct::force_portable() && crate::cpu::avx512f()
     }
 
     /// Rotate-left each 32-bit lane by `N` — a single `vprold`.
@@ -579,14 +579,14 @@ mod simd512 {
 /// a `__m256i` lane-per-block across eight consecutive block counters; the
 /// quarter-round indices are identical to the scalar path (independent blocks =
 /// no diagonalization). Pinned byte-for-byte by a differential test.
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod simd {
     use super::CONSTANTS;
     use core::arch::x86_64::*;
 
     pub(super) fn supported() -> bool {
-        !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
+        !crate::ct::force_portable() && crate::cpu::avx2()
     }
 
     /// Rotate-left each 32-bit lane by `N` (with `M = 32 - N`).

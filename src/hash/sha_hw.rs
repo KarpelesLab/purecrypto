@@ -6,23 +6,23 @@
 //!
 //! Each path produces identical state to the `*_soft` software compression, so
 //! it drops into the dispatch unchanged; pinned by differential tests. The SHA
-//! instructions are data-independent (constant-time). Compiled only on `std` +
-//! (`x86_64` | `aarch64`), gated at the `mod` declaration in `super`.
+//! instructions are data-independent (constant-time). Compiled on `x86_64`
+//! (with or without `std`: [`crate::cpu`] reads `CPUID` itself) and on
+//! `aarch64` with `std` or with the `sha2` target feature enabled at compile
+//! time (a `no_std` aarch64 build cannot ask the OS, so it uses the hardware
+//! path exactly when the target guarantees it); gated at the `mod` declaration
+//! in `super`.
 #![allow(unsafe_code)]
 #![allow(unused_unsafe)]
 
 /// Whether a hardware SHA-256 backend is available.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn sha256_supported() -> bool {
-    !crate::ct::force_portable()
-        && std::is_x86_feature_detected!("sha")
-        && std::is_x86_feature_detected!("sse2")
-        && std::is_x86_feature_detected!("ssse3")
-        && std::is_x86_feature_detected!("sse4.1")
+    !crate::ct::force_portable() && crate::cpu::sha_ni()
 }
 #[cfg(target_arch = "aarch64")]
 pub(super) fn sha256_supported() -> bool {
-    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha2")
+    !crate::ct::force_portable() && crate::cpu::sha2()
 }
 
 /// SHA-256 compression of one 64-byte block, dispatched to the active backend.
@@ -67,7 +67,7 @@ pub(super) unsafe fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
 #[cfg(target_arch = "aarch64")]
 pub(super) fn sha512_supported() -> bool {
     // The SHA512 instructions are reported under the FEAT_SHA512 / "sha3" gate.
-    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha3")
+    !crate::ct::force_portable() && crate::cpu::sha3()
 }
 
 /// SHA-512 compression of one 128-byte block (aarch64 hardware only; never
@@ -92,15 +92,11 @@ pub(super) unsafe fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
 /// SHA-1 dispatch is a different call site.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn sha1_supported() -> bool {
-    !crate::ct::force_portable()
-        && std::is_x86_feature_detected!("sha")
-        && std::is_x86_feature_detected!("sse2")
-        && std::is_x86_feature_detected!("ssse3")
-        && std::is_x86_feature_detected!("sse4.1")
+    !crate::ct::force_portable() && crate::cpu::sha_ni()
 }
 #[cfg(target_arch = "aarch64")]
 pub(super) fn sha1_supported() -> bool {
-    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha2")
+    !crate::ct::force_portable() && crate::cpu::sha2()
 }
 
 /// SHA-1 compression of one 64-byte block, dispatched to the active backend.

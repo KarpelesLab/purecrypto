@@ -9,7 +9,7 @@ pub(crate) mod gf;
 
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 mod aes_arm;
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod aesni;
 
 use super::BlockCipher;
@@ -22,7 +22,7 @@ use gf::sub_words;
 #[derive(Clone, Copy)]
 enum AesBackend {
     Software,
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
     Hardware,
 }
 
@@ -35,15 +35,15 @@ fn detect_backend() -> AesBackend {
     if crate::ct::force_portable() {
         return AesBackend::Software;
     }
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("aes") {
+        if crate::cpu::aes() {
             return AesBackend::Hardware;
         }
     }
     #[cfg(all(feature = "std", target_arch = "aarch64"))]
     {
-        if std::arch::is_aarch64_feature_detected!("aes") {
+        if crate::cpu::aes() {
             return AesBackend::Hardware;
         }
     }
@@ -60,7 +60,7 @@ fn detect_backend() -> AesBackend {
 fn dispatch_encrypt_block<const NR: usize>(backend: AesBackend, rk: &[u8], block: &mut [u8; 16]) {
     match backend {
         AesBackend::Software => encrypt(rk, NR, block),
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         AesBackend::Hardware => unsafe { aesni::encrypt_block(rk, NR, block) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
         AesBackend::Hardware => unsafe { aes_arm::encrypt_block::<NR>(rk, block) },
@@ -72,7 +72,7 @@ fn dispatch_encrypt_block<const NR: usize>(backend: AesBackend, rk: &[u8], block
 fn dispatch_decrypt_block<const NR: usize>(backend: AesBackend, rk: &[u8], block: &mut [u8; 16]) {
     match backend {
         AesBackend::Software => decrypt(rk, NR, block),
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         AesBackend::Hardware => unsafe { aesni::decrypt_block(rk, NR, block) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
         AesBackend::Hardware => unsafe { aes_arm::decrypt_block::<NR>(rk, block) },
@@ -84,7 +84,7 @@ fn dispatch_decrypt_block<const NR: usize>(backend: AesBackend, rk: &[u8], block
 fn dispatch_encrypt_blocks<const NR: usize>(backend: AesBackend, rk: &[u8], blocks: &mut [u8]) {
     match backend {
         AesBackend::Software => crypt_blocks_soft::<false>(rk, NR, blocks),
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         AesBackend::Hardware => unsafe { aesni::encrypt_blocks(rk, NR, blocks) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
         AesBackend::Hardware => unsafe { aes_arm::encrypt_blocks::<NR>(rk, blocks) },
@@ -96,7 +96,7 @@ fn dispatch_encrypt_blocks<const NR: usize>(backend: AesBackend, rk: &[u8], bloc
 fn dispatch_decrypt_blocks<const NR: usize>(backend: AesBackend, rk: &[u8], blocks: &mut [u8]) {
     match backend {
         AesBackend::Software => crypt_blocks_soft::<true>(rk, NR, blocks),
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         AesBackend::Hardware => unsafe { aesni::decrypt_blocks(rk, NR, blocks) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
         AesBackend::Hardware => unsafe { aes_arm::decrypt_blocks::<NR>(rk, blocks) },
@@ -204,7 +204,7 @@ fn inv_mix_columns(s: u128) -> u128 {
 fn sub_word(backend: AesBackend, w: [u8; 4]) -> [u8; 4] {
     match backend {
         AesBackend::Software => {}
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         AesBackend::Hardware => return unsafe { aesni::sub_word(w) },
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
         AesBackend::Hardware => return unsafe { aes_arm::sub_word(w) },
@@ -340,11 +340,11 @@ fn aes_round_soft(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
 /// Round-function modes of the AEGIS bulk kernels: absorb the data
 /// unchanged, encrypt it in place (update with the plaintext), or decrypt it
 /// in place (update with the recovered plaintext).
-#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
 const AEGIS_ABSORB: u8 = 0;
-#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
 const AEGIS_ENC: u8 = 1;
-#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
 const AEGIS_DEC: u8 = 2;
 
 /// Dispatch handle for the constructions built on the bare AES round (AEGIS,
@@ -383,7 +383,7 @@ impl AesRounds {
     pub(crate) fn round(self, state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
         match self.backend {
             AesBackend::Software => aes_round_soft(state, round_key),
-            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            #[cfg(target_arch = "x86_64")]
             AesBackend::Hardware => unsafe { aesni::aes_round(state, round_key) },
             #[cfg(all(feature = "std", target_arch = "aarch64"))]
             AesBackend::Hardware => unsafe { aes_arm::aes_round(state, round_key) },
@@ -401,7 +401,7 @@ impl AesRounds {
     // Without a hardware backend only the `Software => false` arm remains
     // and the arguments go unused.
     #[cfg_attr(
-        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        not(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64"))),
         allow(unused_variables)
     )]
     #[inline]
@@ -421,7 +421,7 @@ impl AesRounds {
         let n = buf.len() / 32;
         match self.backend {
             AesBackend::Software => false,
-            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            #[cfg(target_arch = "x86_64")]
             AesBackend::Hardware => {
                 // SAFETY: `buf` is a live exclusive slice of `32 * n` bytes.
                 unsafe { aesni::aez_pass1(keys, i1, j1, l, i2, n, buf.as_mut_ptr(), x) };
@@ -442,7 +442,7 @@ impl AesRounds {
     // Without a hardware backend only the `Software => false` arm remains
     // and the arguments go unused.
     #[cfg_attr(
-        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        not(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64"))),
         allow(unused_variables)
     )]
     #[inline]
@@ -464,7 +464,7 @@ impl AesRounds {
         let n = buf.len() / 32;
         match self.backend {
             AesBackend::Software => false,
-            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            #[cfg(target_arch = "x86_64")]
             AesBackend::Hardware => {
                 // SAFETY: `buf` is a live exclusive slice of `32 * n` bytes.
                 unsafe { aesni::aez_pass2(keys, i1, j1, j2, l, i2, s, n, buf.as_mut_ptr(), y) };
@@ -492,7 +492,7 @@ macro_rules! aegis_bulk {
             // Without a hardware backend only the `Software => false` arm remains
             // and the arguments go unused.
             #[cfg_attr(
-                not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+                not(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64"))),
                 allow(unused_variables)
             )]
             #[inline]
@@ -501,7 +501,7 @@ macro_rules! aegis_bulk {
                 debug_assert!(data.len().is_multiple_of($blk));
                 match self.backend {
                     AesBackend::Software => false,
-                    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+                    #[cfg(target_arch = "x86_64")]
                     AesBackend::Hardware => {
                         // SAFETY: the absorb mode never writes through the
                         // pointer, which is valid for `data.len()` bytes.
@@ -528,7 +528,7 @@ macro_rules! aegis_bulk {
             // Without a hardware backend only the `Software => false` arm remains
             // and the arguments go unused.
             #[cfg_attr(
-                not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+                not(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64"))),
                 allow(unused_variables)
             )]
             #[inline]
@@ -542,7 +542,7 @@ macro_rules! aegis_bulk {
                 debug_assert!(buf.len().is_multiple_of($blk));
                 match self.backend {
                     AesBackend::Software => false,
-                    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+                    #[cfg(target_arch = "x86_64")]
                     AesBackend::Hardware => {
                         // SAFETY: `buf` is a live exclusive slice of `len` bytes.
                         unsafe {

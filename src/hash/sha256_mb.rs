@@ -43,7 +43,7 @@ pub(crate) const LANES2: usize = 2;
 /// extension; `false` elsewhere).
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn supported2() -> bool {
-    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha2")
+    !crate::ct::force_portable() && crate::cpu::sha2()
 }
 #[cfg(not(target_arch = "aarch64"))]
 #[allow(dead_code)]
@@ -159,9 +159,7 @@ mod arm {
 /// zmm register, which is a BW instruction.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn supported16() -> bool {
-    !crate::ct::force_portable()
-        && std::is_x86_feature_detected!("avx512f")
-        && std::is_x86_feature_detected!("avx512bw")
+    !crate::ct::force_portable() && crate::cpu::avx512f() && crate::cpu::avx512bw()
 }
 
 /// Applies one SHA-256 block compression to each of the sixteen
@@ -184,7 +182,7 @@ pub(crate) fn compress16(states: &mut [[u32; 8]; LANES16], blocks: &[[u8; 64]; L
 /// Whether the multi-buffer SHA-256 backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn supported() -> bool {
-    !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
+    !crate::ct::force_portable() && crate::cpu::avx2()
 }
 
 /// Applies one SHA-256 block compression to each of the eight `(state, block)`

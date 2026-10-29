@@ -21,17 +21,15 @@ pub(super) use x86::{ctr_ghash_fused, gf_mul, ghash_blocks, polyval_blocks};
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn supported() -> bool {
     !crate::ct::force_portable()
-        && std::is_x86_feature_detected!("pclmulqdq")
-        && std::is_x86_feature_detected!("sse2")
-        && std::is_x86_feature_detected!("ssse3")
+        && crate::cpu::pclmulqdq()
+        && crate::cpu::sse2()
+        && crate::cpu::ssse3()
 }
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn supported() -> bool {
     // FEAT_PMULL (the 64→128 polynomial multiply) is reported under "aes".
-    !crate::ct::force_portable()
-        && std::arch::is_aarch64_feature_detected!("aes")
-        && std::arch::is_aarch64_feature_detected!("neon")
+    !crate::ct::force_portable() && crate::cpu::aes() && crate::cpu::neon()
 }
 
 /// Raw 64×64 → 128 carry-less product `a · b` over GF(2)[X] (no
@@ -825,7 +823,11 @@ mod arm {
     }
 }
 
-#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod tests {
     /// The fused CTR+GHASH kernel walks its buffer through raw pointers in
     /// 128-byte groups, so the length precondition is a hard `assert!`

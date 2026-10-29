@@ -6,7 +6,7 @@
 //!
 //! Every entry point is `#[target_feature(enable = "aes")]` (NEON is baseline on
 //! aarch64) and therefore `unsafe`: callers in [`super`] invoke them only after
-//! a runtime `is_aarch64_feature_detected!("aes")` check. The round keys are
+//! a runtime `crate::cpu::aes()` check. The round keys are
 //! read straight from the software-expanded FIPS-197 `rk` byte array, one
 //! `vld1q` per round key per group of blocks — never copied into a stack
 //! array, so there is no schedule spill to wipe and no memcpy prologue.

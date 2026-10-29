@@ -54,7 +54,7 @@ fn inc32(block: u128) -> u128 {
 /// trait method, so a safe third-party implementation could return anything;
 /// the kernel dereferences the schedule through a raw pointer for
 /// `16 * (nr + 1)` bytes, so nothing may be taken on trust.
-#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
 fn fused_schedule_ok(rk: &[u8], nr: usize) -> bool {
     matches!(nr, 10 | 12 | 14) && rk.len() >= 16 * (nr + 1)
 }
@@ -62,16 +62,16 @@ fn fused_schedule_ok(rk: &[u8], nr: usize) -> bool {
 /// Whether this CPU implements the AES instruction-set extension the fused
 /// kernel executes (AES-NI on x86_64, FEAT_AES on aarch64). Re-checked here
 /// rather than trusting `hw_aes_schedule`'s word for it.
-#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
 #[inline]
 fn hw_aes_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        std::is_x86_feature_detected!("aes")
+        crate::cpu::aes()
     }
     #[cfg(target_arch = "aarch64")]
     {
-        std::arch::is_aarch64_feature_detected!("aes")
+        crate::cpu::aes()
     }
 }
 
@@ -85,13 +85,13 @@ pub struct Gcm<C: BlockCipher> {
     /// once at construction; the software `gf_mul` is the fallback. Only
     /// present on the targets that have a hardware GHASH backend (x86_64 and
     /// aarch64, with `std` for the runtime feature probe).
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
     ghash_hw: bool,
     /// Precomputed hash-subkey powers `hpow[i] = H^{i+1}` for the aggregated
     /// (multi-block, single-reduction) hardware GHASH. Computed once here so
     /// neither the bulk hash nor the fused CTR+GHASH loop rederives them per
     /// message. All zero when the hardware backend is absent.
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
     hpow: [u128; 8],
 }
 
@@ -102,7 +102,7 @@ impl<C: BlockCipher> Gcm<C> {
         let mut h = [0u8; 16];
         cipher.encrypt_block(&mut h);
         let h = u128::from_be_bytes(h);
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         let (ghash_hw, hpow) = {
             let hw = super::clmul::supported();
             let mut hp = [0u128; 8];
@@ -119,9 +119,9 @@ impl<C: BlockCipher> Gcm<C> {
         Gcm {
             cipher,
             h,
-            #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
             ghash_hw,
-            #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
             hpow,
         }
     }
@@ -131,7 +131,7 @@ impl<C: BlockCipher> Gcm<C> {
     #[inline]
     #[allow(unsafe_code)]
     fn mul_h(&self, x: u128) -> u128 {
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         if self.ghash_hw {
             // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
             // the PCLMULQDQ/SSSE3 features this function requires.
@@ -170,7 +170,7 @@ impl<C: BlockCipher> Gcm<C> {
         // blocks via the aggregated-reduction path (one reduction per four
         // blocks), leaving any partial trailing block to the serial multiply.
         // NB: keep `ct` intact — the length block below reads `ct.len()`.
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         let tail = if self.ghash_hw {
             let full = ct.len() & !15;
             // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
@@ -180,7 +180,7 @@ impl<C: BlockCipher> Gcm<C> {
         } else {
             ct
         };
-        #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        #[cfg(not(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64"))))]
         let tail = ct;
         for chunk in tail.chunks(16) {
             x = self.mul_h(x ^ load_block(chunk));
@@ -200,7 +200,7 @@ impl<C: BlockCipher> Gcm<C> {
     /// whole blocks until the last call.
     #[allow(unsafe_code)]
     pub(super) fn ghash_fold(&self, mut x: u128, data: &[u8]) -> u128 {
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         let tail = if self.ghash_hw {
             let full = data.len() & !15;
             // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
@@ -210,7 +210,7 @@ impl<C: BlockCipher> Gcm<C> {
         } else {
             data
         };
-        #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        #[cfg(not(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64"))))]
         let tail = data;
         for chunk in tail.chunks(16) {
             x = self.mul_h(x ^ load_block(chunk));
@@ -257,7 +257,7 @@ impl<C: BlockCipher> Gcm<C> {
     /// Folds `data` (any length; the final partial block is zero-padded) into
     /// the GHASH accumulator `x` via the aggregated hardware path. Only called
     /// from the fused path, i.e. with `ghash_hw` set.
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
     #[allow(unsafe_code)]
     fn ghash_partial(&self, mut x: u128, data: &[u8]) -> u128 {
         let full = data.len() & !15;
@@ -284,7 +284,7 @@ impl<C: BlockCipher> Gcm<C> {
     /// falls back to the generic path. NB: on decrypt the tag is computed but
     /// NOT verified here — and the buffer has already been decrypted — so the
     /// caller must check the tag and restore the ciphertext on mismatch.
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
     #[allow(unsafe_code)]
     fn crypt_fused(
         &self,
@@ -429,7 +429,7 @@ impl<C: BlockCipher> Gcm<C> {
     ) -> Result<[u8; 16], AeadError> {
         Self::validate(nonce, buffer)?;
         let j0 = self.j0(nonce);
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         if let Some(tag) = self.crypt_fused(j0, aad, buffer, true) {
             return Ok(tag);
         }
@@ -561,7 +561,7 @@ impl<C: BlockCipher> Gcm<C> {
         Self::validate(nonce, buffer)?;
         let t = tag.len();
         let j0 = self.j0(nonce);
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         if let Some(expected) = self.crypt_fused(j0, aad, buffer, false) {
             // The accept/reject verdict is the public outcome of decryption.
             if expected[..t].ct_eq(tag).declassify() {
@@ -594,7 +594,7 @@ impl<C: BlockCipher> Drop for Gcm<C> {
         // them as dead stores; the key itself lives in `cipher`, whose own
         // `Drop` wipes it.
         self.h.zeroize();
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         {
             self.hpow.zeroize();
         }

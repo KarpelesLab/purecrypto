@@ -34,7 +34,7 @@ pub(super) const IV: [u32; 8] = [
 // Only the SIMD backends permute message vectors between rounds; the scalar
 // compression reads through `MSG_SCHEDULE` instead.
 #[cfg_attr(
-    not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+    not(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64"))),
     allow(dead_code)
 )]
 pub(super) const MSG_PERMUTATION: [usize; 16] =
@@ -381,7 +381,7 @@ impl Blake3 {
                 }
             }
         }
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         {
             use super::blake3_simd::{
                 DEGREE, DEGREE16, hash_chunks8, hash_chunks16, supported, supported16,

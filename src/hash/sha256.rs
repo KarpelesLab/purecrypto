@@ -263,11 +263,17 @@ const fn rotr(x: u32, n: u32) -> u32 {
 /// otherwise. Both produce identical state and are constant-time.
 #[inline]
 #[cfg_attr(
-    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
+    ),
     allow(unsafe_code)
 )]
 pub(crate) fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
+    ))]
     if super::sha_hw::sha256_supported() {
         // SAFETY: guarded by the `sha256_supported()` feature check.
         unsafe { super::sha_hw::compress256(h, block) };
@@ -284,12 +290,18 @@ pub(crate) fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
 /// otherwise loops the software compression.
 #[inline]
 #[cfg_attr(
-    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
+    ),
     allow(unsafe_code)
 )]
 fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
     debug_assert!(data.len().is_multiple_of(64));
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
+    ))]
     if super::sha_hw::sha256_supported() {
         // SAFETY: guarded by the `sha256_supported()` feature check.
         unsafe { super::sha_hw::compress256_blocks(h, data) };

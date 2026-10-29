@@ -69,7 +69,7 @@ mod blake2;
 mod blake3;
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 mod blake3_neon;
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod blake3_simd;
 mod block;
 #[cfg(feature = "legacy-hashes")]
@@ -123,10 +123,16 @@ pub(crate) mod sha512;
     feature = "slhdsa"
 ))]
 pub(crate) mod sha512_mb;
-#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+// SHA-NI / aarch64 SHA: x86_64 always (run-time CPUID detection needs no
+// `std`); aarch64 with `std` (OS detection) or with the `sha2` target feature
+// enabled at compile time (see `crate::cpu`).
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
+))]
 mod sha_hw;
 mod shake;
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod simd_x86;
 mod sm3;
 #[cfg(feature = "legacy-hashes")]

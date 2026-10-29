@@ -304,9 +304,12 @@ const fn rotr(x: u64, n: u32) -> u64 {
 /// the portable software path. Both produce identical state and are
 /// constant-time. (x86 has no broadly-available SHA-512 instruction.)
 #[inline]
-#[cfg_attr(all(feature = "std", target_arch = "aarch64"), allow(unsafe_code))]
+#[cfg_attr(
+    all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2")),
+    allow(unsafe_code)
+)]
 pub(crate) fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
-    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2")))]
     if super::sha_hw::sha512_supported() {
         // SAFETY: guarded by the `sha512_supported()` feature check.
         unsafe { super::sha_hw::compress512(h, block) };

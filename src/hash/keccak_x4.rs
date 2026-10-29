@@ -51,7 +51,7 @@ pub(crate) const LANES2: usize = 2;
 /// (FEAT_SHA3; `false` elsewhere).
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn supported2() -> bool {
-    !crate::ct::force_portable() && std::arch::is_aarch64_feature_detected!("sha3")
+    !crate::ct::force_portable() && crate::cpu::sha3()
 }
 #[cfg(not(target_arch = "aarch64"))]
 #[allow(dead_code)]
@@ -84,7 +84,7 @@ const MAX_STATE: usize = 25 * LANES8;
 /// Whether the 8-way Keccak backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn supported8() -> bool {
-    !crate::ct::force_portable() && std::is_x86_feature_detected!("avx512f")
+    !crate::ct::force_portable() && crate::cpu::avx512f()
 }
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn supported8() -> bool {
@@ -114,7 +114,7 @@ pub(crate) const MAX_RATE: usize = 168;
 /// Whether the 4-way Keccak backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn supported() -> bool {
-    !crate::ct::force_portable() && std::is_x86_feature_detected!("avx2")
+    !crate::ct::force_portable() && crate::cpu::avx2()
 }
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn supported() -> bool {

@@ -26,11 +26,17 @@ pub(crate) const K1: [u32; 4] = [0x5a82_7999, 0x6ed9_eba1, 0x8f1b_bcdc, 0xca62_c
 /// path otherwise. Both produce identical state and are constant-time.
 #[inline]
 #[cfg_attr(
-    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
+    ),
     allow(unsafe_code)
 )]
 fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
+    ))]
     if super::sha_hw::sha1_supported() {
         // SAFETY: guarded by the `sha1_supported()` feature check.
         unsafe { super::sha_hw::compress_sha1(state, block) };
@@ -47,12 +53,18 @@ fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
 /// otherwise loops the software compression.
 #[inline]
 #[cfg_attr(
-    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
+    ),
     allow(unsafe_code)
 )]
 fn compress_blocks(state: &mut [u32; 5], data: &[u8]) {
     debug_assert!(data.len().is_multiple_of(64));
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "std", target_feature = "sha2"))
+    ))]
     if super::sha_hw::sha1_supported() {
         // SAFETY: guarded by the `sha1_supported()` feature check.
         unsafe { super::sha_hw::compress_sha1_blocks(state, data) };

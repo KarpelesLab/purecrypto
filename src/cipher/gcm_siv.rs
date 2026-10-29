@@ -59,7 +59,7 @@ fn polyval_mul(a: u128, b: u128) -> u128 {
 
 /// `mulX_GHASH` (RFC 8452 Appendix A): multiplication by `x` in GHASH's
 /// field and bit order (a GCM `u128` holds `x⁰` in its top bit).
-#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
 fn mulx_ghash(v: u128) -> u128 {
     const R: u128 = 0xe1000000000000000000000000000000;
     (v >> 1) ^ (0u128.wrapping_sub(v & 1) & R)
@@ -80,7 +80,7 @@ struct Polyval {
     acc: u128,
     /// `hpow[i] = (H·x)^{i+1}` in GHASH's representation, for the aggregated
     /// hardware GHASH (computed per message: the POLYVAL key is per nonce).
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
     hpow: Option<[u128; 8]>,
 }
 
@@ -91,7 +91,7 @@ impl Polyval {
         Polyval {
             h,
             acc: 0,
-            #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
             hpow: super::clmul::supported().then(|| {
                 let hx = mulx_ghash(h);
                 let mut hp = [hx; 8];
@@ -109,7 +109,7 @@ impl Polyval {
     /// and returns what is left for the software path (all or nothing).
     #[allow(unsafe_code)]
     fn update_blocks_hw<'a>(&mut self, blocks: &'a [u8]) -> &'a [u8] {
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         if let Some(hpow) = &self.hpow {
             // The aggregated GHASH kernel in its POLYVAL form: little-endian
             // blocks already are the kernel's reflected representation, so
@@ -142,7 +142,7 @@ impl Polyval {
     #[allow(unsafe_code)]
     fn update_block(&mut self, block: &[u8; 16]) {
         self.acc ^= u128::from_le_bytes(*block);
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         if let Some(hpow) = &self.hpow {
             // SAFETY: as in `update_padded`.
             self.acc = unsafe { super::clmul::gf_mul(self.acc, hpow[0]) };
@@ -163,7 +163,7 @@ impl Drop for Polyval {
         // the stack.
         self.h.zeroize();
         self.acc.zeroize();
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", all(feature = "std", target_arch = "aarch64")))]
         if let Some(hp) = &mut self.hpow {
             hp.zeroize();
         }

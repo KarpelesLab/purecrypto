@@ -20,7 +20,7 @@ use core::arch::x86_64::*;
 /// # Safety
 /// Requires AVX2. The `#[target_feature]` makes the intrinsics legal here, but
 /// the caller must only reach this on a CPU where AVX2 is actually present
-/// (the kernels gate on a runtime `is_x86_feature_detected!("avx2")` check).
+/// (the kernels gate on a runtime `crate::cpu::avx2()` check).
 #[target_feature(enable = "avx2")]
 #[inline]
 pub(crate) unsafe fn transpose8_epi32(rows: &mut [__m256i; 8]) {
@@ -67,7 +67,7 @@ pub(crate) unsafe fn transpose8_epi32(rows: &mut [__m256i; 8]) {
 /// # Safety
 /// Requires AVX-512F. The `#[target_feature]` makes the intrinsics legal here,
 /// but the caller must only reach this where AVX-512F is actually present
-/// (the kernels gate on a runtime `is_x86_feature_detected!("avx512f")` check).
+/// (the kernels gate on a runtime `crate::cpu::avx512f()` check).
 #[target_feature(enable = "avx512f")]
 #[inline]
 pub(crate) unsafe fn transpose16_epi32(rows: &mut [__m512i; 16]) {
@@ -104,14 +104,14 @@ pub(crate) unsafe fn transpose16_epi32(rows: &mut [__m512i; 16]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 
     /// `transpose16_epi32` must be an exact matrix transpose.
     #[test]
     fn transpose16_is_a_transpose() {
-        if !std::is_x86_feature_detected!("avx512f") {
+        if !crate::cpu::avx512f() {
             std::eprintln!("transpose16: SKIPPED (no AVX-512F)");
             return;
         }

@@ -22,6 +22,15 @@
 //! default, implies `alloc`) adds the pieces that genuinely need the operating
 //! system, such as file I/O, the CLI, and system randomness. Build with
 //! `--no-default-features` for a bare `no_std` target.
+//!
+//! Hardware acceleration does not depend on `std` on x86_64: SHA-NI, AES-NI,
+//! PCLMULQDQ and the AVX2/AVX-512 kernels of the hash and cipher modules are
+//! selected at run time from `CPUID` (with the `XGETBV` OS-support check for
+//! the AVX state). On aarch64 a `std` build asks the OS; a `no_std` one uses
+//! the SHA-1/SHA-256/SHA-512 instructions when the target enables them at
+//! compile time (`-C target-feature=+sha2,+sha3`), while the other aarch64
+//! kernels (AES, PMULL, NEON) and the multi-buffer kernels behind the
+//! post-quantum schemes still require `std`.
 
 #![no_std]
 // `clippy::chunks_exact_to_as_chunks` (new in Clippy 1.98) fires ~80 times
@@ -43,6 +52,9 @@ extern crate alloc;
 extern crate std;
 
 pub mod ct;
+
+// Run-time CPU feature detection for the hardware backends (`no_std`-capable).
+mod cpu;
 
 pub mod zeroize;
 

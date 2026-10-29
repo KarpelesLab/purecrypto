@@ -7,7 +7,7 @@
 //!
 //! Every entry point is `#[target_feature(enable = "aes,sse2")]` and therefore
 //! `unsafe`: callers in [`super`] invoke them only after a runtime
-//! `is_x86_feature_detected!("aes")` check. AES-NI consumes the standard
+//! `crate::cpu::aes()` (CPUID) check. AES-NI consumes the standard
 //! FIPS-197 round-key schedule directly, so the round keys are read straight
 //! from the software-expanded `rk` byte array; decryption derives the
 //! equivalent-inverse-cipher round keys on the fly with `aesimc`.
