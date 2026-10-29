@@ -83,19 +83,24 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
         Fe::cswap(&mut z2, &mut z3, sw);
         swap = kt;
 
-        let a = x2.add(&z2);
+        // Every sum/difference here feeds a multiplication directly, so it
+        // skips the carry pass (`add_lazy`/`sub_lazy`, limbs < 2^53): all
+        // their operands are mul/sq/mul_small outputs (limbs < 2^51 + 2^13)
+        // or the loaded `x1` (< 2^51), and every multiplier input stays
+        // inside the 2^54 bound.
+        let a = x2.add_lazy(&z2);
         let aa = a.sq();
-        let b = x2.sub(&z2);
+        let b = x2.sub_lazy(&z2);
         let bb = b.sq();
-        let e = aa.sub(&bb);
-        let c = x3.add(&z3);
-        let d = x3.sub(&z3);
+        let e = aa.sub_lazy(&bb);
+        let c = x3.add_lazy(&z3);
+        let d = x3.sub_lazy(&z3);
         let da = d.mul(&a);
         let cb = c.mul(&b);
-        x3 = da.add(&cb).sq();
-        z3 = x1.mul(&da.sub(&cb).sq());
+        x3 = da.add_lazy(&cb).sq();
+        z3 = x1.mul(&da.sub_lazy(&cb).sq());
         x2 = aa.mul(&bb);
-        z2 = e.mul(&aa.add(&e.mul_small(A24)));
+        z2 = e.mul(&aa.add_lazy(&e.mul_small(A24)));
     }
     let sw = mask_from_bit(swap as u64);
     Fe::cswap(&mut x2, &mut x3, sw);

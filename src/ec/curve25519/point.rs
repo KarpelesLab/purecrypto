@@ -172,6 +172,274 @@ fn radix16_signed(scalar: &[u8; 32]) -> [i8; 65] {
     d
 }
 
+/// A projective point `(X:Y:Z)` (`x = X/Z`, `y = Y/Z`): an extended point
+/// with `T` dropped, the input of a doubling. Coordinates are reduced
+/// multiplier outputs (limbs `< 2^51 + 2^13`).
+#[derive(Clone, Copy)]
+pub(crate) struct Projective {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+}
+
+/// A "completed" point `((X:Z), (Y:T))` (`x = X/Z`, `y = Y/T`), the raw
+/// output of the HWCD addition and doubling formulas before the final
+/// multiplications. Its coordinates are **lazy** — sums and differences
+/// that skipped the carry pass (limbs `< 2^54`, see [`Fe::add_lazy`]) — and
+/// they are only ever consumed as multiplier inputs by
+/// [`Self::to_extended`] (4M) or [`Self::to_projective`] (3M), so a run of
+/// doublings never computes the `T` it would throw away.
+#[derive(Clone, Copy)]
+pub(crate) struct Completed {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+    t: Fe,
+}
+
+/// An extended point in **cached** form `(Y + X, Y − X, 2·Z, 2·d·T)`: the
+/// four values the addition [`add_cached`] multiplies by, so a table entry
+/// costs 8 multiplications per addition instead of 9. The identity is
+/// `(1, 1, 2, 0)`; negation swaps the first two values and negates the
+/// last. `Y ± X` and `2·Z` are lazy (limbs `< 2^53`, multiplier inputs only).
+#[derive(Clone, Copy)]
+pub(crate) struct Cached {
+    ypx: Fe,
+    ymx: Fe,
+    z2: Fe,
+    t2d: Fe,
+}
+
+impl Point {
+    /// Drops `T`.
+    #[inline(always)]
+    fn to_projective(self) -> Projective {
+        Projective {
+            x: self.x,
+            y: self.y,
+            z: self.z,
+        }
+    }
+
+    /// The cached form `(Y + X, Y − X, 2·Z, 2·d·T)`: one multiplication.
+    #[inline(always)]
+    fn to_cached(self) -> Cached {
+        Cached {
+            ypx: self.y.add_lazy(&self.x),
+            ymx: self.y.sub_lazy(&self.x),
+            z2: self.z.add_lazy(&self.z),
+            t2d: self.t.mul(&Fe::D2),
+        }
+    }
+}
+
+impl Projective {
+    /// The neutral element `(0:1:1)`.
+    const IDENTITY: Projective = Projective {
+        x: Fe::ZERO,
+        y: Fe::ONE,
+        z: Fe::ONE,
+    };
+
+    /// dbl-2008-hwcd for `a = −1`, stopping at the completed point: 4
+    /// squarings, every sum and difference lazy.
+    ///
+    /// Bounds (inputs reduced, `< 2^51 + 2^13`): `YY + XX` and `2·ZZ` are
+    /// `< 2^52 + 2^14`; `YY − XX` (2p bias) is `< 2^53`; the two outer
+    /// differences take the 4p bias of [`Fe::sub_lazy_wide`] (their
+    /// subtrahends are `< 2^53 − 76`) and stay `< 2^54`.
+    #[inline(always)]
+    fn double(&self) -> Completed {
+        let xx = self.x.sq();
+        let yy = self.y.sq();
+        let zz = self.z.sq();
+        let zz2 = zz.add_lazy(&zz);
+        let xpy2 = self.x.add_lazy(&self.y).sq();
+        let yy_plus_xx = yy.add_lazy(&xx);
+        let yy_minus_xx = yy.sub_lazy(&xx);
+        Completed {
+            x: xpy2.sub_lazy_wide(&yy_plus_xx),
+            y: yy_plus_xx,
+            z: yy_minus_xx,
+            t: zz2.sub_lazy_wide(&yy_minus_xx),
+        }
+    }
+}
+
+impl Completed {
+    /// The neutral element as a completed point `((0:1), (1:1))`.
+    const IDENTITY: Completed = Completed {
+        x: Fe::ZERO,
+        y: Fe::ONE,
+        z: Fe::ONE,
+        t: Fe::ONE,
+    };
+
+    /// `(X·T : Y·Z : Z·T : X·Y)`: 4 multiplications, reduced output.
+    #[inline(always)]
+    fn to_extended(self) -> Point {
+        Point {
+            x: self.x.mul(&self.t),
+            y: self.y.mul(&self.z),
+            z: self.z.mul(&self.t),
+            t: self.x.mul(&self.y),
+        }
+    }
+
+    /// `(X·T : Y·Z : Z·T)`: 3 multiplications, reduced output.
+    #[inline(always)]
+    fn to_projective(self) -> Projective {
+        Projective {
+            x: self.x.mul(&self.t),
+            y: self.y.mul(&self.z),
+            z: self.z.mul(&self.t),
+        }
+    }
+}
+
+impl Cached {
+    /// The neutral element `(1, 1, 2, 0)`.
+    #[cfg(any(
+        test,
+        feature = "hazmat-edwards25519",
+        feature = "ristretto255",
+        not(feature = "ed25519-table")
+    ))]
+    const IDENTITY: Cached = Cached {
+        ypx: Fe::ONE,
+        ymx: Fe::ONE,
+        z2: Fe([2, 0, 0, 0, 0]),
+        t2d: Fe::ZERO,
+    };
+
+    /// `a` when `mask` is all-ones, `b` when it is zero (same mask contract
+    /// as [`Fe::select`]).
+    #[cfg(any(
+        test,
+        feature = "hazmat-edwards25519",
+        feature = "ristretto255",
+        not(feature = "ed25519-table")
+    ))]
+    #[inline(always)]
+    fn select(a: &Cached, b: &Cached, mask: u64) -> Cached {
+        Cached {
+            ypx: Fe::select(&a.ypx, &b.ypx, mask),
+            ymx: Fe::select(&a.ymx, &b.ymx, mask),
+            z2: Fe::select(&a.z2, &b.z2, mask),
+            t2d: Fe::select(&a.t2d, &b.t2d, mask),
+        }
+    }
+
+    /// Negates in place when `mask` is all-ones (swap `Y+X`/`Y−X`, negate
+    /// `2dT`), leaves it when zero. Same mask contract as [`Fe::select`].
+    #[cfg(any(
+        test,
+        feature = "hazmat-edwards25519",
+        feature = "ristretto255",
+        not(feature = "ed25519-table")
+    ))]
+    #[inline(always)]
+    fn conditional_negate(&mut self, mask: u64) {
+        Fe::cswap(&mut self.ypx, &mut self.ymx, mask);
+        self.t2d = Fe::select(&self.t2d.neg(), &self.t2d, mask);
+    }
+
+    /// Wipes the limbs (table entries of a secret-scalar multiplication).
+    #[cfg(any(
+        test,
+        feature = "hazmat-edwards25519",
+        feature = "ristretto255",
+        not(feature = "ed25519-table")
+    ))]
+    fn zeroize(&mut self) {
+        self.ypx.zeroize();
+        self.ymx.zeroize();
+        self.z2.zeroize();
+        self.t2d.zeroize();
+    }
+}
+
+/// add-2008-hwcd-3 against a cached point, stopping at the completed point:
+/// 4 multiplications (`(Y₁+X₁)(Y₂+X₂)`, `(Y₁−X₁)(Y₂−X₂)`, `T₁·2dT₂`,
+/// `Z₁·2Z₂`). Complete for `a = −1`. The extended input is reduced; the
+/// outputs are lazy sums/differences of reduced products (limbs `< 2^53`).
+#[inline(always)]
+fn add_cached(p: &Point, q: &Cached) -> Completed {
+    let pp = p.y.add_lazy(&p.x).mul(&q.ypx);
+    let mm = p.y.sub_lazy(&p.x).mul(&q.ymx);
+    let tt = p.t.mul(&q.t2d);
+    let zz = p.z.mul(&q.z2);
+    Completed {
+        x: pp.sub_lazy(&mm),
+        y: pp.add_lazy(&mm),
+        z: zz.add_lazy(&tt),
+        t: zz.sub_lazy(&tt),
+    }
+}
+
+/// `p − q` for a cached `q` (the formula of [`add_cached`] with `q`
+/// negated: `Y+X`/`Y−X` exchanged and `2dT` negated, folded into the sign
+/// pattern). **Variable-time callers only** pick between this and
+/// [`add_cached`]; the formula itself is branch-free.
+#[inline(always)]
+fn sub_cached(p: &Point, q: &Cached) -> Completed {
+    let pp = p.y.add_lazy(&p.x).mul(&q.ymx);
+    let mm = p.y.sub_lazy(&p.x).mul(&q.ypx);
+    let tt = p.t.mul(&q.t2d);
+    let zz = p.z.mul(&q.z2);
+    Completed {
+        x: pp.sub_lazy(&mm),
+        y: pp.add_lazy(&mm),
+        z: zz.sub_lazy(&tt),
+        t: zz.add_lazy(&tt),
+    }
+}
+
+/// Mixed addition against an affine Niels point (`Z₂ = 1`): 3
+/// multiplications to the completed point. Same lazy-output bounds as
+/// [`add_cached`].
+#[cfg(feature = "ed25519-table")]
+#[inline(always)]
+fn add_niels_completed(p: &Point, n: &Niels) -> Completed {
+    let pp = p.y.add_lazy(&p.x).mul(&n.ypx);
+    let mm = p.y.sub_lazy(&p.x).mul(&n.ymx);
+    let tt = p.t.mul(&n.t2d);
+    let zz2 = p.z.add_lazy(&p.z);
+    Completed {
+        x: pp.sub_lazy(&mm),
+        y: pp.add_lazy(&mm),
+        z: zz2.add_lazy(&tt),
+        t: zz2.sub_lazy(&tt),
+    }
+}
+
+/// The odd multiples `[1]P, [3]P, …, [15]P` in cached form, the lookup
+/// table of the width-5 wNAF ladders. **Public points only** (no wiping).
+fn odd_multiples(p: &Point) -> [Cached; 8] {
+    let p2 = p.to_projective().double().to_extended().to_cached();
+    let mut odd = [p.to_cached(); 8];
+    let mut acc = *p;
+    for entry in odd.iter_mut().skip(1) {
+        acc = add_cached(&acc, &p2).to_extended();
+        *entry = acc.to_cached();
+    }
+    odd
+}
+
+/// Adds the wNAF digit `d` (odd, `|d| <= 15`, or zero for a no-op) times
+/// the point whose odd multiples are `odd` to the completed point `t`.
+/// **Variable-time.**
+#[inline]
+fn add_naf_digit(t: Completed, d: i8, odd: &[Cached; 8]) -> Completed {
+    if d > 0 {
+        add_cached(&t.to_extended(), &odd[(d as usize) / 2])
+    } else if d < 0 {
+        sub_cached(&t.to_extended(), &odd[(-d as usize) / 2])
+    } else {
+        t
+    }
+}
+
 impl Field {
     /// The base point `B`.
     // With the comb table, library-path base multiplications never touch the
@@ -281,41 +549,19 @@ impl Field {
     }
 
     /// Point addition (add-2008-hwcd-3), complete for `a = −1` since `d` is a
-    /// non-square on edwards25519.
+    /// non-square on edwards25519: `q` is brought to [`Cached`] form (one
+    /// multiplication) and added in 8 more.
+    // The library's own ladders add cached/Niels points directly; only the
+    // group APIs (and tests) add two extended points.
+    #[cfg(any(test, feature = "hazmat-edwards25519", feature = "ristretto255"))]
     pub(crate) fn point_add(&self, p: &Point, q: &Point) -> Point {
-        let aa = self.mul(self.sub(p.y, p.x), self.sub(q.y, q.x));
-        let bb = self.mul(self.add(p.y, p.x), self.add(q.y, q.x));
-        let cc = self.mul(self.mul(p.t, self.d2), q.t);
-        let dd = self.mul(self.add(p.z, p.z), q.z);
-        let e = self.sub(bb, aa);
-        let ff = self.sub(dd, cc);
-        let g = self.add(dd, cc);
-        let h = self.add(bb, aa);
-        Point {
-            x: self.mul(e, ff),
-            y: self.mul(g, h),
-            t: self.mul(e, h),
-            z: self.mul(ff, g),
-        }
+        add_cached(p, &q.to_cached()).to_extended()
     }
 
-    /// Point doubling (dbl-2008-hwcd) for `a = −1`.
+    /// Point doubling (dbl-2008-hwcd) for `a = −1`: 4 squarings and 4
+    /// multiplications.
     pub(crate) fn point_double(&self, p: &Point) -> Point {
-        let a = self.sq(p.x);
-        let b = self.sq(p.y);
-        let zz = self.sq(p.z);
-        let c = self.add(zz, zz);
-        let d = self.neg(a);
-        let e = self.sub(self.sub(self.sq(self.add(p.x, p.y)), a), b);
-        let g = self.add(d, b);
-        let ff = self.sub(g, c);
-        let h = self.sub(d, b);
-        Point {
-            x: self.mul(e, ff),
-            y: self.mul(g, h),
-            t: self.mul(e, h),
-            z: self.mul(ff, g),
-        }
+        p.to_projective().double().to_extended()
     }
 
     /// Negates a point: `−(X:Y:Z:T) = (−X:Y:Z:−T)`.
@@ -332,13 +578,18 @@ impl Field {
     /// a fixed signed 4-bit window ([`radix16_signed`], digits in `[−8, 8)`
     /// plus a carry digit in `{0, 1}` that seeds the accumulator): 4
     /// doublings and one *unconditional* addition per digit, with the
-    /// operand fetched by a masked scan of the 8 table entries `[1]P..[8]P`
-    /// (one barriered equality mask each, no secret-indexed memory access)
-    /// followed by a masked negation (one barriered mask). A zero digit adds
-    /// the identity — a no-op with the same operation sequence, since the
-    /// HWCD formulas are complete — so the schedule depends only on the
-    /// (public) scalar width. The scalar bytes and digits are treated as
-    /// secret (the digits are wiped).
+    /// operand fetched by a masked scan of the 8 [`Cached`] table entries
+    /// `[1]P..[8]P` (one barriered equality mask each, no secret-indexed
+    /// memory access) followed by a masked negation (one barriered mask). A
+    /// zero digit adds the identity — a no-op with the same operation
+    /// sequence, since the HWCD formulas are complete — so the schedule
+    /// depends only on the (public) scalar width. The scalar bytes and
+    /// digits are treated as secret (the digits are wiped).
+    ///
+    /// The doublings chain through [`Projective`] / [`Completed`] points, so
+    /// only the doubling that feeds the addition computes `T` (4·(4S) +
+    /// 3·3M + 4M per window, then 8M for the cached addition and 3M back to
+    /// projective).
     // Ed25519 verification moved to the vartime path (its inputs are public),
     // so on the default build this constant-time generic multiplication only
     // backs the test-side differential oracles; the hazmat/ristretto group
@@ -351,42 +602,81 @@ impl Field {
         not(feature = "ed25519-table")
     ))]
     pub(crate) fn scalar_mult(&self, scalar: &[u8; 32], p: &Point) -> Point {
-        // table[j] = [j + 1]P.
-        let mut table = [*p; 8];
-        for i in 1..8 {
-            table[i] = self.point_add(&table[i - 1], p);
+        // table[j] = [j + 1]P, cached.
+        let p_cached = p.to_cached();
+        let mut table = [p_cached; 8];
+        let mut multiple = *p;
+        for entry in table.iter_mut().skip(1) {
+            multiple = add_cached(&multiple, &p_cached).to_extended();
+            *entry = multiple.to_cached();
         }
 
         let mut digits = radix16_signed(scalar);
         // The carry digit (bit 256 of the recoding) seeds the accumulator
         // with [d₆₄]P ∈ {O, P}, selected by one barriered mask.
-        let mut acc = point_select(p, &self.identity(), mask_from_bit(digits[64] as u64));
-        for &d in digits[..64].iter().rev() {
-            acc = self.point_double(&acc);
-            acc = self.point_double(&acc);
-            acc = self.point_double(&acc);
-            acc = self.point_double(&acc);
-
+        let seed = point_select(p, &self.identity(), mask_from_bit(digits[64] as u64));
+        // Out-of-line copies of the formulas for this loop: with every one
+        // inlined, the 64-iteration body (four doublings, the gather and the
+        // addition) grows to several thousand instructions and measured
+        // ~15% slower than calling one compact copy of each formula. (The
+        // formulas themselves stay `inline(always)` for the vartime paths,
+        // which measured the other way round.)
+        #[inline(never)]
+        fn dbl(r: &Projective) -> Completed {
+            r.double()
+        }
+        #[inline(never)]
+        fn to_proj(c: &Completed) -> Projective {
+            c.to_projective()
+        }
+        #[inline(never)]
+        fn to_ext(c: &Completed) -> Point {
+            c.to_extended()
+        }
+        #[inline(never)]
+        fn add(p: &Point, q: &Cached) -> Completed {
+            add_cached(p, q)
+        }
+        // Constant-time gather of table[|d| − 1], negated when d < 0: one
+        // barriered equality mask per entry (`eq_mask`, never `==`), applied
+        // across all four coordinates, so the secret digit never feeds a
+        // compare-and-branch the compiler could emit; d = 0 keeps the
+        // identity. Then one barriered mask for the sign (swap Y+X / Y−X,
+        // negate 2dT).
+        let gather = |d: i8| -> Cached {
             // `smask` is 0xff iff d < 0; `mag` = |d| ∈ 0..=8, branch-free.
             let smask = (d >> 7) as u8;
             let mag = ((d as u8) ^ smask).wrapping_sub(smask) as u64;
-            // Constant-time gather of table[mag − 1]: one barriered equality
-            // mask per entry (`eq_mask`, never `==`), applied across all
-            // four coordinates, so the secret digit never feeds a
-            // compare-and-branch the compiler could emit; mag = 0 keeps the
-            // identity.
-            let mut sel = self.identity();
+            let mut sel = Cached::IDENTITY;
             for (j, entry) in table.iter().enumerate() {
-                sel = point_select(entry, &sel, eq_mask(j as u64 + 1, mag));
+                sel = Cached::select(entry, &sel, eq_mask(j as u64 + 1, mag));
             }
-            // Masked negation: −(X:Y:Z:T) = (−X:Y:Z:−T).
-            let neg = mask_from_bit((smask & 1) as u64);
-            sel.x = Fe::select(&sel.x.neg(), &sel.x, neg);
-            sel.t = Fe::select(&sel.t.neg(), &sel.t, neg);
-            acc = self.point_add(&acc, &sel);
+            sel.conditional_negate(mask_from_bit((smask & 1) as u64));
+            sel
+        };
+
+        // Digits 63..1 leave the accumulator projective; digit 0 finishes
+        // in extended coordinates.
+        let mut r = seed.to_projective();
+        for &d in digits[1..64].iter().rev() {
+            r = to_proj(&dbl(&r));
+            r = to_proj(&dbl(&r));
+            r = to_proj(&dbl(&r));
+            let e = to_ext(&dbl(&r));
+            r = to_proj(&add(&e, &gather(d)));
         }
+        r = to_proj(&dbl(&r));
+        r = to_proj(&dbl(&r));
+        r = to_proj(&dbl(&r));
+        let e = to_ext(&dbl(&r));
+        let mut last = gather(digits[0]);
+        let out = to_ext(&add(&e, &last));
+        last.zeroize();
         digits.zeroize();
-        acc
+        for entry in table.iter_mut() {
+            entry.zeroize();
+        }
+        out
     }
 
     /// Mixed addition `p + n` of an extended point and an affine Niels point
@@ -397,20 +687,7 @@ impl Field {
     #[cfg(feature = "ed25519-table")]
     #[inline]
     pub(crate) fn add_niels(&self, p: &Point, n: &Niels) -> Point {
-        let pp = self.mul(self.add(p.y, p.x), n.ypx);
-        let mm = self.mul(self.sub(p.y, p.x), n.ymx);
-        let tt = self.mul(p.t, n.t2d);
-        let zz2 = self.add(p.z, p.z);
-        let e = self.sub(pp, mm);
-        let h = self.add(pp, mm);
-        let ff = self.sub(zz2, tt);
-        let g = self.add(zz2, tt);
-        Point {
-            x: self.mul(e, ff),
-            y: self.mul(g, h),
-            t: self.mul(e, h),
-            z: self.mul(ff, g),
-        }
+        add_niels_completed(p, n).to_extended()
     }
 
     /// Constant-time fixed-base multiplication `[scalar]·B` via the
@@ -465,28 +742,31 @@ impl Field {
     // as a test oracle.
     #[cfg(test)]
     pub(crate) fn scalar_mult_vartime(&self, scalar: &[u8; 32], p: &Point) -> Point {
-        let odd = self.odd_multiples(p);
+        let odd = odd_multiples(p);
         let naf = wnaf(scalar, 5);
         let Some(top) = naf.iter().rposition(|&d| d != 0) else {
             return self.identity();
         };
 
-        let mut acc = self.identity();
+        let mut r = Projective::IDENTITY;
+        let mut t = Completed::IDENTITY;
         for i in (0..=top).rev() {
-            acc = self.point_double(&acc);
-            acc = self.add_naf_digit(&acc, naf[i], &odd);
+            t = r.double();
+            t = add_naf_digit(t, naf[i], &odd);
+            r = t.to_projective();
         }
-        acc
+        t.to_extended()
     }
 
     /// **Variable-time** `[a]·p + [b]·B`, the Ed25519 verification
     /// combination: both wNAF ladders interleaved (Straus) so they share one
     /// run of ~254 doublings. The variable point uses width 5 against its 8
-    /// odd multiples computed on the fly; the base point uses width 8
-    /// against the static Niels table [`ED25519_BASE_ODD`] (`[1]B, [3]B, …,
-    /// [127]B`, feature `ed25519-table`; ≈ 1 mixed addition per 9 bits) or,
-    /// without the table, width 5 against odd multiples of `B` computed on
-    /// the fly.
+    /// odd multiples computed on the fly (in [`Cached`] form); the base point
+    /// uses width 8 against the static Niels table [`ED25519_BASE_ODD`]
+    /// (`[1]B, [3]B, …, [127]B`, feature `ed25519-table`; ≈ 1 mixed addition
+    /// per 9 bits) or, without the table, width 5 against odd multiples of
+    /// `B` computed on the fly. The accumulator stays projective between
+    /// doublings; `T` is only computed ahead of an addition.
     ///
     /// # Warning: public inputs only
     ///
@@ -498,14 +778,14 @@ impl Field {
         p: &Point,
         b: &[u8; 32],
     ) -> Point {
-        let odd_p = self.odd_multiples(p);
+        let odd_p = odd_multiples(p);
         let naf_a = wnaf(a, 5);
         #[cfg(feature = "ed25519-table")]
         let naf_b = wnaf(b, 8);
         #[cfg(not(feature = "ed25519-table"))]
         let naf_b = wnaf(b, 5);
         #[cfg(not(feature = "ed25519-table"))]
-        let odd_b = self.odd_multiples(&self.base());
+        let odd_b = odd_multiples(&self.base());
         let Some(top) = naf_a
             .iter()
             .zip(naf_b.iter())
@@ -514,51 +794,29 @@ impl Field {
             return self.identity();
         };
 
-        let mut acc = self.identity();
+        let mut r = Projective::IDENTITY;
+        let mut t = Completed::IDENTITY;
         for i in (0..=top).rev() {
-            acc = self.point_double(&acc);
-            acc = self.add_naf_digit(&acc, naf_a[i], &odd_p);
+            t = r.double();
+            t = add_naf_digit(t, naf_a[i], &odd_p);
             #[cfg(feature = "ed25519-table")]
             {
                 let d = naf_b[i];
                 if d > 0 {
-                    acc =
-                        self.add_niels(&acc, &Niels::from_entry(&ED25519_BASE_ODD[d as usize / 2]));
+                    let n = Niels::from_entry(&ED25519_BASE_ODD[d as usize / 2]);
+                    t = add_niels_completed(&t.to_extended(), &n);
                 } else if d < 0 {
                     let n = Niels::from_entry(&ED25519_BASE_ODD[(-d) as usize / 2]);
-                    acc = self.add_niels(&acc, &n.negate());
+                    t = add_niels_completed(&t.to_extended(), &n.negate());
                 }
             }
             #[cfg(not(feature = "ed25519-table"))]
             {
-                acc = self.add_naf_digit(&acc, naf_b[i], &odd_b);
+                t = add_naf_digit(t, naf_b[i], &odd_b);
             }
+            r = t.to_projective();
         }
-        acc
-    }
-
-    /// The odd multiples `odd[i] = [2i+1]P` for `i in 0..8`, the lookup table
-    /// of the width-5 wNAF ladders.
-    fn odd_multiples(&self, p: &Point) -> [Point; 8] {
-        let p2 = self.point_double(p);
-        let mut odd = [*p; 8];
-        for i in 1..8 {
-            odd[i] = self.point_add(&odd[i - 1], &p2);
-        }
-        odd
-    }
-
-    /// Adds the wNAF digit `d` (odd, `|d| <= 15`, or zero for a no-op) times
-    /// the point whose odd multiples are `odd`. **Variable-time.**
-    #[inline]
-    fn add_naf_digit(&self, acc: &Point, d: i8, odd: &[Point; 8]) -> Point {
-        if d > 0 {
-            self.point_add(acc, &odd[(d as usize) / 2])
-        } else if d < 0 {
-            self.point_add(acc, &self.point_negate(&odd[(-d as usize) / 2]))
-        } else {
-            *acc
-        }
+        t.to_extended()
     }
 
     /// Constant-time equality of two points, comparing the affine
@@ -679,7 +937,7 @@ mod tests {
                 "y−x mismatch"
             );
             assert!(
-                bool::from(f.ct_eq(f.mul(n.t2d, zz), f.mul(f.d2, f.mul(acc.x, acc.y)))),
+                bool::from(f.ct_eq(f.mul(n.t2d, zz), f.mul(Fe::D2, f.mul(acc.x, acc.y)))),
                 "2dt mismatch"
             );
             // Canonical: the limbs round-trip through the encoding.
@@ -884,6 +1142,145 @@ mod tests {
         }
     }
 
+    /// The pre-lazy HWCD formulas — every sum and difference fully reduced,
+    /// `T` computed on every doubling, no cached/completed forms — as an
+    /// independent oracle for the optimized point arithmetic.
+    fn ref_add(f: &Field, p: &Point, q: &Point) -> Point {
+        let aa = f.mul(f.sub(p.y, p.x), f.sub(q.y, q.x));
+        let bb = f.mul(f.add(p.y, p.x), f.add(q.y, q.x));
+        let cc = f.mul(f.mul(p.t, Fe::D2), q.t);
+        let dd = f.mul(f.add(p.z, p.z), q.z);
+        let (e, ff, g, h) = (f.sub(bb, aa), f.sub(dd, cc), f.add(dd, cc), f.add(bb, aa));
+        Point {
+            x: f.mul(e, ff),
+            y: f.mul(g, h),
+            t: f.mul(e, h),
+            z: f.mul(ff, g),
+        }
+    }
+
+    fn ref_double(f: &Field, p: &Point) -> Point {
+        let a = f.sq(p.x);
+        let b = f.sq(p.y);
+        let zz = f.sq(p.z);
+        let c = f.add(zz, zz);
+        let d = f.neg(a);
+        let e = f.sub(f.sub(f.sq(f.add(p.x, p.y)), a), b);
+        let (g, h) = (f.add(d, b), f.sub(d, b));
+        let ff = f.sub(g, c);
+        Point {
+            x: f.mul(e, ff),
+            y: f.mul(g, h),
+            t: f.mul(e, h),
+            z: f.mul(ff, g),
+        }
+    }
+
+    /// MSB-first binary double-and-add over all 256 bits.
+    fn ref_mul(f: &Field, s: &[u8; 32], p: &Point) -> Point {
+        let mut acc = f.identity();
+        for i in (0..256).rev() {
+            acc = ref_double(f, &acc);
+            if (s[i / 8] >> (i % 8)) & 1 == 1 {
+                acc = ref_add(f, &acc, p);
+            }
+        }
+        acc
+    }
+
+    /// Every optimized path (cached/completed formulas with lazy
+    /// reductions: `point_add`, `point_double`, the constant-time window
+    /// ladder, the comb, the vartime Straus ladder) against the
+    /// fully-reduced reference formulas, on prime-order points, the
+    /// small-order points (orders 1, 2, 4, 8), mixed-order sums, and edge
+    /// plus random scalars. Equality is projective (`point_ct_eq`) and on
+    /// the canonical encoding, and every output coordinate must satisfy the
+    /// reduced-limb invariant.
+    #[test]
+    fn optimized_formulas_match_reference() {
+        use crate::hash::Sha256;
+        use crate::rng::{HmacDrbg, RngCore};
+        let f = Field::new();
+        let reduced = |p: &Point| {
+            [p.x, p.y, p.z, p.t]
+                .iter()
+                .all(|c| c.0.iter().all(|&l| l < (1u64 << 51) + (1u64 << 13)))
+        };
+        let same = |a: &Point, b: &Point, what: &str| {
+            assert!(reduced(a), "{what}: unreduced output limb");
+            assert!(bool::from(f.point_ct_eq(a, b)), "{what}: point mismatch");
+            assert_eq!(f.encode(a), f.encode(b), "{what}: encoding mismatch");
+            // T·Z == X·Y (the extended-coordinate invariant).
+            assert!(
+                bool::from(f.ct_eq(f.mul(a.t, a.z), f.mul(a.x, a.y))),
+                "{what}: T"
+            );
+        };
+
+        let b = f.base();
+        // Small-order points: y = −1 (order 2), y = 0 (order 4), and an
+        // order-8 point; each also added to B (mixed order).
+        let mut minus_one = [0xffu8; 32];
+        minus_one[0] = 0xec;
+        minus_one[31] = 0x7f;
+        let order8 = crate::ec::uint_from_be_hex::<4>(
+            "7a03ac9277fdc74ec6cc392cfa53202a0f67100d760b3cba4fd84d3d706a17c7",
+        );
+        let mut o8 = [0u8; 32];
+        order8.write_le_bytes(&mut o8);
+        let small = [minus_one, [0u8; 32], o8]
+            .map(|enc| f.decode(&enc).expect("small-order encoding decodes"));
+        let points = [
+            f.identity(),
+            b,
+            ref_mul(&f, &[7u8; 32], &b),
+            small[0],
+            small[1],
+            small[2],
+            ref_add(&f, &b, &small[0]),
+            ref_add(&f, &b, &small[1]),
+            ref_add(&f, &b, &small[2]),
+        ];
+
+        let int_bytes = |v: &ScalarInt| {
+            let mut out = [0u8; 32];
+            v.write_le_bytes(&mut out);
+            out
+        };
+        let mut scalars = [[0u8; 32]; 19];
+        scalars[1] = [0xff; 32];
+        scalars[2] = int_bytes(&f.l);
+        scalars[3] = int_bytes(&f.l.wrapping_sub(&ScalarInt::ONE));
+        scalars[4][0] = 1;
+        scalars[5][31] = 0x80;
+        scalars[6] = [0x88; 32]; // every signed radix-16 digit −8
+        let mut rng = HmacDrbg::<Sha256>::new(b"ed25519-ref-formulas", b"nonce", &[]);
+        for s in scalars[7..].iter_mut() {
+            rng.fill_bytes(s);
+        }
+
+        for (i, p) in points.iter().enumerate() {
+            same(&f.point_double(p), &ref_double(&f, p), "point_double");
+            for q in &points {
+                same(&f.point_add(p, q), &ref_add(&f, p, q), "point_add");
+            }
+            for (j, s) in scalars.iter().enumerate() {
+                let want = ref_mul(&f, s, p);
+                same(&f.scalar_mult(s, p), &want, "scalar_mult");
+                if i == 0 {
+                    same(&f.mul_base(s), &ref_mul(&f, s, &b), "mul_base");
+                }
+                let s2 = &scalars[(j + 5) % scalars.len()];
+                same(
+                    &f.double_scalar_mult_base_vartime(s, p, s2),
+                    &ref_add(&f, &want, &ref_mul(&f, s2, &b)),
+                    "double_scalar_mult_base_vartime",
+                );
+                same(&f.scalar_mult_vartime(s, p), &want, "scalar_mult_vartime");
+            }
+        }
+    }
+
     /// Regenerates the fixed-base table source
     /// (`src/ec/curve25519/base_table.rs`). Run with:
     /// `cargo test --release gen_ed25519_base_table -- --ignored --nocapture`,
@@ -905,7 +1302,7 @@ mod tests {
             let y = Fe::from_bytes(&f.mul(p.y, zinv).to_bytes());
             let ypx = Fe::from_bytes(&f.add(y, x).to_bytes());
             let ymx = Fe::from_bytes(&f.sub(y, x).to_bytes());
-            let t2d = Fe::from_bytes(&f.mul(f.mul(x, y), f.d2).to_bytes());
+            let t2d = Fe::from_bytes(&f.mul(f.mul(x, y), Fe::D2).to_bytes());
             let mut out = [0u64; 15];
             out[..5].copy_from_slice(&ypx.0);
             out[5..10].copy_from_slice(&ymx.0);

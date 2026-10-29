@@ -47,6 +47,26 @@ const SIXTEEN_P: [u64; 5] = [
     0x7ffffffffffff0,
 ];
 
+/// `2·p` spread as five per-limb constants (`2·(2^51−19)` then
+/// `2·(2^51−1)`), the bias of [`Fe::sub_lazy`].
+const TWO_P: [u64; 5] = [
+    0xfffffffffffda,
+    0xffffffffffffe,
+    0xffffffffffffe,
+    0xffffffffffffe,
+    0xffffffffffffe,
+];
+
+/// `4·p` spread as five per-limb constants, the bias of
+/// [`Fe::sub_lazy_wide`].
+const FOUR_P: [u64; 5] = [
+    0x1fffffffffffb4,
+    0x1ffffffffffffc,
+    0x1ffffffffffffc,
+    0x1ffffffffffffc,
+    0x1ffffffffffffc,
+];
+
 /// A field element of GF(2²⁵⁵−19) in unsaturated 5×51-bit limb form.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Fe(pub(crate) [u64; 5]);
@@ -252,6 +272,61 @@ impl Fe {
         ])
     }
 
+    /// `self + rhs` **without** the carry pass, for operands that only feed
+    /// a multiplication or squaring. Both inputs must have limbs `< 2^52`
+    /// (e.g. any output of [`Self::mul`], [`Self::sq`] or a reducing op,
+    /// whose limbs are `< 2^51 + 2^13`); the result's limbs are `< 2^53`,
+    /// inside the `2^54` input bound of [`Self::mul`] / [`Self::sq`] /
+    /// [`Self::mul_small`]. It must not be fed to another lazy op.
+    #[inline(always)]
+    pub(crate) fn add_lazy(&self, rhs: &Fe) -> Fe {
+        let a = &self.0;
+        let b = &rhs.0;
+        Fe([
+            a[0] + b[0],
+            a[1] + b[1],
+            a[2] + b[2],
+            a[3] + b[3],
+            a[4] + b[4],
+        ])
+    }
+
+    /// `self − rhs` **without** the carry pass: adds `2·p` limbwise (limb 0
+    /// `2^52 − 38`, the others `2^52 − 2`) before subtracting, so `rhs`
+    /// must have limbs `≤ 2^52 − 38` (true of every reduced output, limbs
+    /// `< 2^51 + 2^13`) and `self` limbs `< 2^52`; the result's limbs are
+    /// `< 2^53`. Same consumer contract as [`Self::add_lazy`].
+    #[inline(always)]
+    pub(crate) fn sub_lazy(&self, rhs: &Fe) -> Fe {
+        let a = &self.0;
+        let b = &rhs.0;
+        Fe([
+            (a[0] + TWO_P[0]) - b[0],
+            (a[1] + TWO_P[1]) - b[1],
+            (a[2] + TWO_P[2]) - b[2],
+            (a[3] + TWO_P[3]) - b[3],
+            (a[4] + TWO_P[4]) - b[4],
+        ])
+    }
+
+    /// `self − rhs` **without** the carry pass, with a `4·p` bias (limb 0
+    /// `2^53 − 76`, the others `2^53 − 4`) for a subtrahend that is itself a
+    /// lazy sum or difference: `rhs` limbs must be `≤ 2^53 − 76` and `self`
+    /// limbs `< 2^53`; the result's limbs are `< 2^54`. Same consumer
+    /// contract as [`Self::add_lazy`].
+    #[inline(always)]
+    pub(crate) fn sub_lazy_wide(&self, rhs: &Fe) -> Fe {
+        let a = &self.0;
+        let b = &rhs.0;
+        Fe([
+            (a[0] + FOUR_P[0]) - b[0],
+            (a[1] + FOUR_P[1]) - b[1],
+            (a[2] + FOUR_P[2]) - b[2],
+            (a[3] + FOUR_P[3]) - b[3],
+            (a[4] + FOUR_P[4]) - b[4],
+        ])
+    }
+
     /// `−self`, reduced.
     #[inline]
     pub(crate) fn neg(&self) -> Fe {
@@ -261,6 +336,7 @@ impl Fe {
     /// `self · rhs`: 25 `u128` partial products with ×19 folding and a fixed
     /// carry chain. Inputs may have limbs up to `2^54`; output limbs are
     /// `< 2^51 + 2^13`.
+    #[inline(always)]
     pub(crate) fn mul(&self, rhs: &Fe) -> Fe {
         let a = &self.0;
         let b = &rhs.0;
@@ -280,41 +356,52 @@ impl Fe {
     }
 
     /// `self²`: 15 `u128` partial products (squaring symmetry) with ×19
-    /// folding. Same bounds as [`Self::mul`].
+    /// folding. The doubled cross terms come from doubling a *limb* (one
+    /// `u64` add, limbs `< 2^55`) rather than shifting the `u128` sums,
+    /// which keeps the dependency chain short. Same bounds as
+    /// [`Self::mul`].
+    #[inline]
     pub(crate) fn sq(&self) -> Fe {
         let a = &self.0;
         let a3_19 = a[3] * 19;
         let a4_19 = a[4] * 19;
+        let d0 = a[0] * 2;
+        let d1 = a[1] * 2;
+        let d2 = a[2] * 2;
+        let d4 = a[4] * 2;
 
-        let c0 = m(a[0], a[0]) + ((m(a[1], a4_19) + m(a[2], a3_19)) << 1);
-        let c1 = m(a[3], a3_19) + ((m(a[0], a[1]) + m(a[2], a4_19)) << 1);
-        let c2 = m(a[1], a[1]) + ((m(a[0], a[2]) + m(a[4], a3_19)) << 1);
-        let c3 = m(a[4], a4_19) + ((m(a[0], a[3]) + m(a[1], a[2])) << 1);
-        let c4 = m(a[2], a[2]) + ((m(a[0], a[4]) + m(a[1], a[3])) << 1);
+        let c0 = m(a[0], a[0]) + (m(d1, a4_19) + m(d2, a3_19));
+        let c1 = m(a[3], a3_19) + (m(d0, a[1]) + m(d2, a4_19));
+        let c2 = m(a[1], a[1]) + (m(d0, a[2]) + m(d4, a3_19));
+        let c3 = m(a[4], a4_19) + (m(d0, a[3]) + m(d1, a[2]));
+        let c4 = m(a[2], a[2]) + (m(d0, a[4]) + m(d1, a[3]));
 
         Fe::carry_chain(c0, c1, c2, c3, c4)
     }
 
-    /// The shared post-product carry chain: propagates 51-bit carries once,
-    /// folds the limb-4 carry back into limb 0 via ×19, and does one final
-    /// 0→1 carry, leaving all limbs `< 2^51 + 2^13`.
+    /// The shared post-product carry chain, as two interleaved half-chains
+    /// (`0→1→2→3` and `3→4→0`, then `0→1` and `3→4` once more) so the
+    /// serial `u128` carry path is half as long. Accepts the column sums of
+    /// [`Self::mul`] / [`Self::sq`] for inputs with limbs `< 2^54` (each
+    /// column `< 2^114`, so every carry is `< 2^63` and `19·carry` fits a
+    /// `u64`); leaves all limbs `< 2^51 + 2^13`.
     #[inline(always)]
-    fn carry_chain(c0: u128, mut c1: u128, mut c2: u128, mut c3: u128, mut c4: u128) -> Fe {
-        let mut out = [0u64; 5];
+    fn carry_chain(c0: u128, mut c1: u128, mut c2: u128, c3: u128, mut c4: u128) -> Fe {
         c1 += (c0 >> 51) as u64 as u128;
-        out[0] = (c0 as u64) & M51;
-        c2 += (c1 >> 51) as u64 as u128;
-        out[1] = (c1 as u64) & M51;
-        c3 += (c2 >> 51) as u64 as u128;
-        out[2] = (c2 as u64) & M51;
+        let mut o0 = (c0 as u64) & M51;
         c4 += (c3 >> 51) as u64 as u128;
-        out[3] = (c3 as u64) & M51;
-        let carry = (c4 >> 51) as u64;
-        out[4] = (c4 as u64) & M51;
-        out[0] += carry * 19;
-        out[1] += out[0] >> 51;
-        out[0] &= M51;
-        Fe(out)
+        let mut o3 = (c3 as u64) & M51;
+        c2 += (c1 >> 51) as u64 as u128;
+        let mut o1 = (c1 as u64) & M51;
+        o0 += ((c4 >> 51) as u64) * 19;
+        let mut o4 = (c4 as u64) & M51;
+        o3 += (c2 >> 51) as u64;
+        let o2 = (c2 as u64) & M51;
+        o1 += o0 >> 51;
+        o0 &= M51;
+        o4 += o3 >> 51;
+        o3 &= M51;
+        Fe([o0, o1, o2, o3, o4])
     }
 
     /// `self^(2^k)`: `k` back-to-back squarings.
@@ -493,8 +580,6 @@ pub(crate) struct Field {
     pub(crate) one: Fe,
     /// The curve constant `d`.
     pub(crate) d: Fe,
-    /// `2·d` (for the addition formula).
-    pub(crate) d2: Fe,
     /// `√−1 mod p` (for point decompression).
     pub(crate) sqrtm1: Fe,
     /// The prime `p`, as a saturated integer for encoding canonicity checks.
@@ -508,7 +593,6 @@ impl Field {
         Field {
             one: Fe::ONE,
             d: Fe::D,
-            d2: Fe::D2,
             sqrtm1: Fe::SQRT_M1,
             p: P_INT,
             l: L_INT,
@@ -823,6 +907,141 @@ mod tests {
                     o.out(&o.fp.sub_mod(&am, &bm)),
                     "sub mismatch"
                 );
+            }
+        }
+    }
+
+    /// The value of an arbitrary (possibly unreduced) limb vector modulo
+    /// `p`, in the oracle's Montgomery domain: `Σ limbs[i]·2^(51·i)`
+    /// computed with the independent saturated arithmetic.
+    fn oracle_value(o: &Oracle, limbs: &[u64; 5]) -> ScalarInt {
+        let mut acc = ScalarInt::ZERO;
+        for (i, &l) in limbs.iter().enumerate() {
+            let mut w = [0u8; 32];
+            let bit = 51 * i;
+            w[bit / 8] = 1 << (bit % 8);
+            let weight = o.fp.to_mont(&ScalarInt::from_le_bytes(&w));
+            let term =
+                o.fp.mont_mul(&o.fp.to_mont(&ScalarInt::from_u64(l)), &weight);
+            acc = o.fp.add_mod(&acc, &term);
+        }
+        acc
+    }
+
+    /// The multiplier, squaring and lazy add/sub paths at their documented
+    /// input bounds, against the saturated Montgomery oracle on the *values*
+    /// of the limb vectors (so unreduced inputs are checked, not just
+    /// canonical ones):
+    ///
+    /// - `mul` / `sq` / `mul_small` on limbs up to `2^54 − 1` (all-max,
+    ///   single-max, random below `2^54`), plus every reduced edge value
+    ///   (0, 1, p − 1, p, p + 1, 2p − 1, 2^255 − 1);
+    /// - `add_lazy` / `sub_lazy` on reduced operands at the reduced-output
+    ///   bound `2^51 + 2^13`, and `sub_lazy_wide` with a lazy-sum
+    ///   subtrahend, each result then fed through `mul` (their only
+    ///   consumer) and checked;
+    /// - every output's limbs against the `< 2^51 + 2^13` invariant.
+    #[test]
+    fn lazy_bounds_differential() {
+        let o = Oracle::new();
+        let mut rng = HmacDrbg::<Sha256>::new(b"fe51-lazy-bounds", b"nonce", &[]);
+        let mut rand_below = |bits: u32| -> [u64; 5] {
+            let mut l = [0u64; 5];
+            for v in l.iter_mut() {
+                let mut b = [0u8; 8];
+                rng.fill_bytes(&mut b);
+                *v = u64::from_le_bytes(b) & ((1u64 << bits) - 1);
+            }
+            l
+        };
+        const MAX54: u64 = (1u64 << 54) - 1;
+        const RMAX: u64 = (1u64 << 51) + (1u64 << 13) - 1;
+        let reduced_ok = |f: &Fe| f.0.iter().all(|&l| l < (1u64 << 51) + (1u64 << 13));
+
+        // Wide (unreduced) inputs for the multipliers.
+        let mut wide: [[u64; 5]; 40] = [[0; 5]; 40];
+        wide[0] = [MAX54; 5];
+        wide[1] = [MAX54, 0, 0, 0, 0];
+        wide[2] = [0, 0, 0, 0, MAX54];
+        wide[3] = [RMAX; 5];
+        wide[4] = [MAX54, 1, MAX54, 1, MAX54];
+        let edges = edge_values();
+        for (slot, e) in wide[5..5 + edges.len()].iter_mut().zip(edges.iter()) {
+            *slot = Fe::from_bytes(e).0;
+        }
+        // 2p − 1 as limbs (non-canonical, < 2^52 per limb).
+        wide[15] = [TWO_P[0] - 1, TWO_P[1], TWO_P[2], TWO_P[3], TWO_P[4]];
+        for slot in wide[16..].iter_mut() {
+            *slot = rand_below(54);
+        }
+        for a in &wide {
+            let fa = Fe(*a);
+            let va = oracle_value(&o, a);
+            let s = fa.sq();
+            assert!(reduced_ok(&s), "sq output bound {a:x?}");
+            assert_eq!(s.to_bytes(), o.out(&o.fp.mont_sqr(&va)), "sq {a:x?}");
+            let k = fa.mul_small(121665);
+            assert!(reduced_ok(&k), "mul_small output bound");
+            assert_eq!(
+                k.to_bytes(),
+                o.out(
+                    &o.fp
+                        .mont_mul(&va, &o.fp.to_mont(&ScalarInt::from_u64(121665)))
+                ),
+                "mul_small {a:x?}"
+            );
+            for b in &wide {
+                let vb = oracle_value(&o, b);
+                let m = fa.mul(&Fe(*b));
+                assert!(reduced_ok(&m), "mul output bound");
+                assert_eq!(m.to_bytes(), o.out(&o.fp.mont_mul(&va, &vb)), "mul");
+            }
+        }
+
+        // Reduced operands (limbs < 2^51 + 2^13) for the lazy add/sub.
+        let mut red: [[u64; 5]; 24] = [[0; 5]; 24];
+        red[0] = [RMAX; 5];
+        red[1] = [0; 5];
+        red[2] = [RMAX, 0, RMAX, 0, RMAX];
+        red[3] = [0, RMAX, 0, RMAX, 0];
+        for slot in red[4..].iter_mut() {
+            let r = rand_below(51);
+            // Mix of random reduced elements and ones pushed to the bound.
+            *slot = Fe(r).sq().0;
+        }
+        let probe = Fe(rand_below(51));
+        let vprobe = oracle_value(&o, &probe.0);
+        for a in &red {
+            let (fa, va) = (Fe(*a), oracle_value(&o, a));
+            for b in &red {
+                let (fb, vb) = (Fe(*b), oracle_value(&o, b));
+                let sum = fa.add_lazy(&fb);
+                let diff = fa.sub_lazy(&fb);
+                assert!(sum.0.iter().all(|&l| l < 1 << 53));
+                assert!(diff.0.iter().all(|&l| l < 1 << 53));
+                let vsum = o.fp.add_mod(&va, &vb);
+                let vdiff = o.fp.sub_mod(&va, &vb);
+                assert_eq!(oracle_value(&o, &sum.0), vsum, "add_lazy");
+                assert_eq!(oracle_value(&o, &diff.0), vdiff, "sub_lazy");
+                assert_eq!(
+                    sum.mul(&diff).to_bytes(),
+                    o.out(&o.fp.mont_mul(&vsum, &vdiff)),
+                    "mul of lazy operands"
+                );
+                // A lazy sum (or 2p-biased difference) as the subtrahend of
+                // the wide subtraction, minuend another lazy sum.
+                for sub in [sum, diff] {
+                    let w = sum.sub_lazy_wide(&sub);
+                    assert!(w.0.iter().all(|&l| l < 1 << 54));
+                    let vw = o.fp.sub_mod(&vsum, &oracle_value(&o, &sub.0));
+                    assert_eq!(oracle_value(&o, &w.0), vw, "sub_lazy_wide");
+                    assert_eq!(
+                        w.mul(&probe).to_bytes(),
+                        o.out(&o.fp.mont_mul(&vw, &vprobe)),
+                        "mul of a wide difference"
+                    );
+                    assert_eq!(w.sq().to_bytes(), o.out(&o.fp.mont_sqr(&vw)));
+                }
             }
         }
     }
