@@ -439,6 +439,10 @@ required-features = ["ech", "std"]
 
 # Verifies an OpenSSL-generated RSA-PSS signature from disk.
 [[example]]
+name = "aes_modes"
+required-features = ["cipher", "std"]
+
+[[example]]
 name = "pss_interop"
 required-features = ["rsa", "der", "hash", "std"]
 
