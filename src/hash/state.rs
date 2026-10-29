@@ -655,7 +655,9 @@ mod tests {
         let mut widest = 0;
         for &alg in HashAlgorithm::ALL {
             let Some(len) = alg.state_len() else {
-                assert_eq!(alg, HashAlgorithm::Blake3);
+                // BLAKE3 has no exportable state; nor (yet) do the
+                // `legacy-hashes` digests, which are all `is_legacy()`.
+                assert!(alg == HashAlgorithm::Blake3 || alg.is_legacy(), "{alg:?}");
                 assert_eq!(
                     alg.hasher().export_state(&mut buf).err(),
                     Some(StateError::Unsupported)
