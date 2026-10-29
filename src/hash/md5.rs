@@ -83,8 +83,13 @@ const K: [u32; 64] = [
     0xeb86_d391,
 ];
 
-/// The four MD5 round functions, in the `d ^ (b & (c ^ d))` form (one fewer
-/// operation than the RFC's `(b & c) | (!b & d)`, same truth table).
+/// The four MD5 round functions, each arranged so that as few operations as
+/// possible wait on `b` (the value the previous step just produced): `F` as
+/// `d ^ (b & (c ^ d))` (one fewer operation than the RFC's
+/// `(b & c) | (!b & d)`, same truth table), and `G` as the *sum* of its two
+/// bit-disjoint halves `(d & b) + (!d & c)` — equal to the RFC's OR because no
+/// bit is set in both — so that `!d & c` is computed early and only one AND
+/// plus one add sit on the chain.
 macro_rules! f1 {
     ($b:ident, $c:ident, $d:ident) => {
         $d ^ ($b & ($c ^ $d))
@@ -92,7 +97,7 @@ macro_rules! f1 {
 }
 macro_rules! f2 {
     ($b:ident, $c:ident, $d:ident) => {
-        $c ^ ($d & ($b ^ $c))
+        ($d & $b).wrapping_add(!$d & $c)
     };
 }
 macro_rules! f3 {
@@ -106,54 +111,80 @@ macro_rules! f4 {
     };
 }
 
-fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
+/// Message-word index used by step `i`: `i` in round 1, then
+/// `(5i + 1) mod 16`, `(3i + 5) mod 16` and `7i mod 16` in rounds 2–4.
+const G: [usize; 64] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1, 6, 11, 0, 5, 10, 15, 4, 9, 14, 3, 8,
+    13, 2, 7, 12, 5, 8, 11, 14, 1, 4, 7, 10, 13, 0, 3, 6, 9, 12, 15, 2, 0, 7, 14, 5, 12, 3, 10, 1,
+    8, 15, 6, 13, 4, 11, 2, 9,
+];
+
+/// `m[G[i]] + K[i]` for every step, computed ahead of the rounds.
+///
+/// Kept out of line on purpose: inlined, LLVM re-associates each step's
+/// `a + K + m + f` sum so that the constant `K` is added *after* the round
+/// function — back onto the serial dependency chain (see `compress`).
+#[inline(never)]
+fn schedule(block: &[u8; 64]) -> [u32; 64] {
     let m = block_words_le(block);
+    let mut mk = [0u32; 64];
+    for i in 0..64 {
+        mk[i] = m[G[i]].wrapping_add(K[i]);
+    }
+    mk
+}
+
+fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
+    let mk = schedule(block);
     let [mut a, mut b, mut c, mut d] = *state;
 
     // Step `i`: `a = b + rotl(a + f(b, c, d) + K[i] + m[g], S[i])`. Instead of
     // the RFC's `a = d; d = c; c = b` register shuffle, consecutive steps are
     // called with the register names rotated `(a, b, c, d) -> (d, a, b, c)`,
-    // and the whole 64-step schedule is straight-line so every `K`/`S`/`m`
+    // and the whole 64-step schedule is straight-line so every `mk`/`S`
     // index is a constant (the loop form with a per-step `match` on the round
     // measured 2.3x slower).
+    //
+    // `a + (m[g] + K[i])` depends only on values that are ready a full step
+    // early (`a` is the register written three steps back), so it is summed
+    // first and the round function — which waits on the `b` just produced by
+    // the previous step — joins last. That leaves one add, the rotate and the
+    // final add on the serial `b -> f -> b` chain instead of three adds.
+    // Together with the additive `G` this measured ~810 -> ~995 MB/s.
     macro_rules! step {
-        ($a:ident, $b:ident, $c:ident, $d:ident, $f:ident, $i:expr, $g:expr) => {
-            $a = $b.wrapping_add(
-                $a.wrapping_add($f!($b, $c, $d))
-                    .wrapping_add(K[$i])
-                    .wrapping_add(m[$g])
-                    .rotate_left(S[$i]),
-            );
+        ($a:ident, $b:ident, $c:ident, $d:ident, $f:ident, $i:expr) => {
+            let early = $a.wrapping_add(mk[$i]);
+            $a = $b.wrapping_add(early.wrapping_add($f!($b, $c, $d)).rotate_left(S[$i]));
         };
     }
     macro_rules! r4 {
-        ($f:ident, $i:expr, $g0:expr, $g1:expr, $g2:expr, $g3:expr) => {
-            step!(a, b, c, d, $f, $i, $g0);
-            step!(d, a, b, c, $f, $i + 1, $g1);
-            step!(c, d, a, b, $f, $i + 2, $g2);
-            step!(b, c, d, a, $f, $i + 3, $g3);
+        ($f:ident, $i:expr) => {
+            step!(a, b, c, d, $f, $i);
+            step!(d, a, b, c, $f, $i + 1);
+            step!(c, d, a, b, $f, $i + 2);
+            step!(b, c, d, a, $f, $i + 3);
         };
     }
-    // Round 1: g = i.
-    r4!(f1, 0, 0, 1, 2, 3);
-    r4!(f1, 4, 4, 5, 6, 7);
-    r4!(f1, 8, 8, 9, 10, 11);
-    r4!(f1, 12, 12, 13, 14, 15);
-    // Round 2: g = (5i + 1) mod 16.
-    r4!(f2, 16, 1, 6, 11, 0);
-    r4!(f2, 20, 5, 10, 15, 4);
-    r4!(f2, 24, 9, 14, 3, 8);
-    r4!(f2, 28, 13, 2, 7, 12);
-    // Round 3: g = (3i + 5) mod 16.
-    r4!(f3, 32, 5, 8, 11, 14);
-    r4!(f3, 36, 1, 4, 7, 10);
-    r4!(f3, 40, 13, 0, 3, 6);
-    r4!(f3, 44, 9, 12, 15, 2);
-    // Round 4: g = 7i mod 16.
-    r4!(f4, 48, 0, 7, 14, 5);
-    r4!(f4, 52, 12, 3, 10, 1);
-    r4!(f4, 56, 8, 15, 6, 13);
-    r4!(f4, 60, 4, 11, 2, 9);
+    // Round 1.
+    r4!(f1, 0);
+    r4!(f1, 4);
+    r4!(f1, 8);
+    r4!(f1, 12);
+    // Round 2.
+    r4!(f2, 16);
+    r4!(f2, 20);
+    r4!(f2, 24);
+    r4!(f2, 28);
+    // Round 3.
+    r4!(f3, 32);
+    r4!(f3, 36);
+    r4!(f3, 40);
+    r4!(f3, 44);
+    // Round 4.
+    r4!(f4, 48);
+    r4!(f4, 52);
+    r4!(f4, 56);
+    r4!(f4, 60);
 
     state[0] = state[0].wrapping_add(a);
     state[1] = state[1].wrapping_add(b);
