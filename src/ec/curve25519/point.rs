@@ -256,6 +256,20 @@ impl Field {
         (x.to_bytes(), y.to_bytes())
     }
 
+    /// The Montgomery `u`-coordinate of the birationally equivalent
+    /// curve25519 point, `u = (1 + y)/(1 − y) = (Z + Y)/(Z − Y)`, as its
+    /// canonical 32-byte little-endian encoding (RFC 7748 §4.1).
+    ///
+    /// The identity has `Z == Y`; the inversion of `0` is `0`, so it maps to
+    /// `u = 0` (as do the other points the map sends to infinity). Callers
+    /// that must refuse such inputs (libsodium's `pk_to_curve25519`) reject
+    /// small-order points first. Constant-time.
+    pub(crate) fn to_montgomery_u(&self, p: &Point) -> [u8; 32] {
+        let num = self.add(p.z, p.y);
+        let den = self.sub(p.z, p.y);
+        self.mul(num, self.inv(den)).to_bytes()
+    }
+
     /// The neutral element `(0:1:1:0)`.
     pub(crate) fn identity(&self) -> Point {
         Point {

@@ -20,11 +20,28 @@
 //! some torsion-tainted signatures that a cofactorless verifier rejects (never
 //! the reverse for canonical inputs), so implementations disagree on those
 //! edge cases — do not use this for consensus-critical validation.
+//! [`Ed25519PublicKey::verify_libsodium`] instead reproduces libsodium's
+//! `crypto_sign_verify_detached` accept/reject decisions bit for bit
+//! (cofactorless, small-order `R` and `A` rejected).
+//!
+//! # libsodium interoperability
+//!
+//! - libsodium's 64-byte secret key (`seed ‖ pk`) maps to
+//!   [`Ed25519PrivateKey::from_keypair_bytes`] (checked) /
+//!   [`Ed25519PrivateKey::from_keypair_bytes_unchecked`] (trusts the stored
+//!   public key, as libsodium does) and
+//!   [`Ed25519PrivateKey::to_keypair_bytes`].
+//! - `crypto_sign_verify_detached` maps to
+//!   [`Ed25519PublicKey::verify_libsodium`].
+//! - `crypto_sign_ed25519_pk_to_curve25519` /
+//!   `crypto_sign_ed25519_sk_to_curve25519` map to
+//!   [`Ed25519PublicKey::to_x25519`] / [`Ed25519PrivateKey::to_x25519`].
 
 use crate::ct::ConstantTimeLess;
 use crate::ec::Error;
 use crate::ec::curve25519::field::{Field, ScalarInt};
 use crate::ec::curve25519::scalar::{clamp, scalar_muladd, scalar_reduce_wide};
+use crate::ec::x25519::{X25519PrivateKey, X25519PublicKey};
 use crate::hash::{Digest, Sha512};
 use crate::rng::{CryptoRng, RngCore};
 
@@ -80,6 +97,93 @@ impl Ed25519PrivateKey {
     /// The 32-byte seed.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.seed
+    }
+
+    /// Creates a private key from libsodium's 64-byte secret-key format
+    /// `seed ‖ public_key` (`crypto_sign_SECRETKEYBYTES`), **checking** that
+    /// the stored public key is the one the seed derives.
+    ///
+    /// This costs one fixed-base scalar multiplication (the same as
+    /// [`from_bytes`](Self::from_bytes)). Returns [`Error::InvalidInput`] if
+    /// the stored half does not match; prefer this over
+    /// [`from_keypair_bytes_unchecked`](Self::from_keypair_bytes_unchecked)
+    /// whenever the 64 bytes come from anywhere you do not fully control.
+    pub fn from_keypair_bytes(bytes: &[u8; 64]) -> Result<Self, Error> {
+        use crate::ct::ConstantTimeEq;
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&bytes[..32]);
+        let key = Self::from_seed(seed);
+        wipe(&mut seed);
+        if bool::from(key.public[..].ct_eq(&bytes[32..])) {
+            Ok(key)
+        } else {
+            Err(Error::InvalidInput)
+        }
+    }
+
+    /// Creates a private key from libsodium's 64-byte secret-key format
+    /// `seed ‖ public_key`, **trusting** the stored public key without
+    /// recomputing it — exactly what libsodium's `crypto_sign_detached` does
+    /// with its `sk` argument. No scalar multiplication is performed.
+    ///
+    /// # Caveat: a mismatched public key leaks the private key
+    ///
+    /// The public key is hashed into every signature's challenge
+    /// `k = SHA-512(R ‖ A ‖ M)`, while the nonce `r = SHA-512(prefix ‖ M)`
+    /// depends only on the seed and message. If the stored `A` is not the
+    /// seed's real public key:
+    ///
+    /// - every signature produced is invalid under the real key (and under
+    ///   the stored one);
+    /// - worse, anyone who obtains signatures over the **same message** under
+    ///   two different stored public keys gets `S₁ = r + k₁·a` and
+    ///   `S₂ = r + k₂·a` with the same `r`, and solves for the secret scalar
+    ///   `a = (S₁ − S₂)/(k₁ − k₂)`. This is the well-known libsodium
+    ///   "wrong public key" signing-oracle misuse.
+    ///
+    /// Use this only for key material you produced yourself (or verified
+    /// once with [`from_keypair_bytes`](Self::from_keypair_bytes)) and stored
+    /// with integrity protection; it exists to avoid the per-load scalar
+    /// multiplication when interoperating with libsodium's key format.
+    /// [`from_bytes`](Self::from_bytes) (seed only) always recomputes the
+    /// public key and is unaffected.
+    pub fn from_keypair_bytes_unchecked(bytes: &[u8; 64]) -> Self {
+        let mut key = Ed25519PrivateKey {
+            seed: [0u8; 32],
+            public: [0u8; 32],
+        };
+        key.seed.copy_from_slice(&bytes[..32]);
+        key.public.copy_from_slice(&bytes[32..]);
+        key
+    }
+
+    /// The 64-byte libsodium secret-key encoding `seed ‖ public_key`. The
+    /// first half is secret key material; the caller owns the returned array
+    /// and is responsible for wiping it.
+    pub fn to_keypair_bytes(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&self.seed);
+        out[32..].copy_from_slice(&self.public);
+        out
+    }
+
+    /// Converts this signing key to the X25519 private key of the
+    /// birationally equivalent Montgomery curve, as libsodium's
+    /// `crypto_sign_ed25519_sk_to_curve25519`: the first 32 bytes of
+    /// `SHA-512(seed)`, clamped (RFC 7748 §5 / RFC 8032 §5.1.5). The result's
+    /// [`to_bytes`](X25519PrivateKey::to_bytes) is byte-identical to
+    /// libsodium's output, and its public key equals
+    /// `self.public_key().to_x25519()` for a key whose public half is genuine.
+    ///
+    /// Reusing one key pair for both signatures and key agreement is a
+    /// cross-protocol design decision the caller owns; prefer independent keys
+    /// where you can. Constant-time; the intermediate hash is wiped.
+    pub fn to_x25519(&self) -> X25519PrivateKey {
+        let (mut a, mut prefix) = self.expand();
+        wipe(&mut prefix);
+        let key = X25519PrivateKey::from_bytes(a);
+        wipe(&mut a);
+        key
     }
 
     /// Derives the secret scalar `a` (clamped) and the signing prefix from the
@@ -409,6 +513,165 @@ impl Ed25519PublicKey {
             Err(Error::Verification)
         }
     }
+
+    /// Verifies `signature` over `message` with exactly libsodium's
+    /// (≥ 1.0.16, default build) `crypto_sign_verify_detached` rules, for
+    /// callers that must agree with libsodium on every edge case:
+    ///
+    /// * `S` must be canonical (`S < L`);
+    /// * `R` must not be a small-order encoding, and `A` must be neither a
+    ///   small-order encoding nor non-canonical (`y ≥ p`). The small-order
+    ///   test is libsodium's byte blacklist, which ignores the sign bit and
+    ///   also lists the non-canonical spellings `y = p` and `y = p + 1`;
+    /// * the *cofactorless* equation `R == [S]B − [k]A`, checked by comparing
+    ///   the canonical encoding of the right-hand side with the 32 `R` bytes
+    ///   of the signature (so any non-canonical `R` encoding is rejected, and
+    ///   `R` itself is never decompressed).
+    ///
+    /// Compared with [`verify`](Self::verify) this additionally rejects
+    /// small-order `R`, and rejects signatures that only satisfy the
+    /// cofactored equation (mixed-order `A` or `R`). On the 12 edge-case
+    /// vectors of Chalkias et al., *Taming the many EdDSAs* (SSR 2020), it
+    /// accepts only case 3, matching the published libsodium column.
+    ///
+    /// Returns [`Error::Verification`] on any failure. Like
+    /// [`verify`](Self::verify), every input is public and the group
+    /// arithmetic is **variable-time**.
+    pub fn verify_libsodium(
+        &self,
+        message: &[u8],
+        signature: &Ed25519Signature,
+    ) -> Result<(), Error> {
+        let f = Field::new();
+        let r_bytes = signature.r_bytes();
+        let s_bytes = signature.s_bytes();
+
+        // sc25519_is_canonical(S) and ge25519_has_small_order(R).
+        if !bool::from(ScalarInt::from_le_bytes(&s_bytes).ct_lt(&f.l))
+            || libsodium_has_small_order(&r_bytes)
+        {
+            return Err(Error::Verification);
+        }
+        // ge25519_is_canonical(A) and ge25519_has_small_order(A).
+        if !libsodium_is_canonical(&self.0) || libsodium_has_small_order(&self.0) {
+            return Err(Error::Verification);
+        }
+        // `A` is canonical here, and the only negative-zero encodings
+        // (x = 0, sign bit set: y = ±1) are blacklisted above, so the strict
+        // decoder accepts exactly what libsodium's
+        // `ge25519_frombytes_negate_vartime` accepts.
+        let a_point = f.decode(&self.0).ok_or(Error::Verification)?;
+
+        // k = SHA-512(R ‖ A ‖ message) mod L.
+        let mut hk = Sha512::new();
+        hk.update(&r_bytes);
+        hk.update(&self.0);
+        hk.update(message);
+        let k = scalar_reduce_wide(&hk.finalize());
+        let mut k_bytes = [0u8; 32];
+        k.write_le_bytes(&mut k_bytes);
+
+        // Cofactorless: encode([S]B + [k](−A)) must equal the R bytes.
+        // Public inputs only, so the vartime ladder is fine.
+        let check =
+            f.double_scalar_mult_base_vartime(&k_bytes, &f.point_negate(&a_point), &s_bytes);
+        if f.encode(&check) == r_bytes {
+            Ok(())
+        } else {
+            Err(Error::Verification)
+        }
+    }
+
+    /// Converts this Ed25519 public key to the X25519 public key (Montgomery
+    /// `u = (1 + y)/(1 − y)`) of the birationally equivalent curve25519 point,
+    /// as libsodium's `crypto_sign_ed25519_pk_to_curve25519`, with the same
+    /// rejections: [`Error::InvalidInput`] if the encoding is on libsodium's
+    /// small-order blacklist, does not decode to a curve point, or the point
+    /// is not in the prime-order subgroup (`[L]A ≠ identity`).
+    ///
+    /// Like libsodium, a non-canonical `y` encoding (`y ∈ [p, 2²⁵⁵)`) is
+    /// reduced modulo `p` rather than rejected, so the accepted set matches
+    /// libsodium's exactly. Inputs are public; the subgroup check is
+    /// variable-time.
+    pub fn to_x25519(&self) -> Result<X25519PublicKey, Error> {
+        let f = Field::new();
+        if libsodium_has_small_order(&self.0) {
+            return Err(Error::InvalidInput);
+        }
+        // libsodium's `fe25519_frombytes` reduces y mod p; canonicalize it so
+        // the strict decoder sees the same value. The only negative-zero
+        // encodings (y = ±1) were blacklisted above.
+        let mut y = self.0;
+        y[31] &= 0x7f;
+        let mut enc = crate::ec::curve25519::field::Fe::from_bytes(&y).to_bytes();
+        enc[31] |= self.0[31] & 0x80;
+        let a = f.decode(&enc).ok_or(Error::InvalidInput)?;
+        // ge25519_is_on_main_subgroup: [L]A == identity (public input).
+        let mut l_bytes = [0u8; 32];
+        f.l.write_le_bytes(&mut l_bytes);
+        let la = f.double_scalar_mult_base_vartime(&l_bytes, &a, &[0u8; 32]);
+        if !bool::from(f.point_ct_eq(&la, &f.identity())) {
+            return Err(Error::InvalidInput);
+        }
+        Ok(X25519PublicKey::from_bytes(f.to_montgomery_u(&a)))
+    }
+}
+
+/// libsodium's `ge25519_has_small_order` (≥ 1.0.16): whether the 32-byte
+/// encoding `s`, **ignoring its sign bit**, is one of the seven `y` values of
+/// the 8-torsion points — `0`, `1`, the two order-8 `y`s, `p − 1` — or the
+/// non-canonical spellings `p` (≡ 0) and `p + 1` (≡ 1). Byte comparison on a
+/// public encoding; transcribed table, checked against the torsion subgroup
+/// by `libsodium_blacklist_is_the_torsion_subgroup`.
+fn libsodium_has_small_order(s: &[u8; 32]) -> bool {
+    const P_MINUS_1: [u8; 32] = p_plus(0xec);
+    const P: [u8; 32] = p_plus(0xed);
+    const P_PLUS_1: [u8; 32] = p_plus(0xee);
+    const fn p_plus(low: u8) -> [u8; 32] {
+        let mut b = [0xffu8; 32];
+        b[0] = low;
+        b[31] = 0x7f;
+        b
+    }
+    const BLACKLIST: [[u8; 32]; 7] = [
+        // 0 (order 4)
+        [0u8; 32],
+        // 1 (order 1)
+        {
+            let mut b = [0u8; 32];
+            b[0] = 1;
+            b
+        },
+        // order 8
+        [
+            0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef,
+            0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88,
+            0x6d, 0x53, 0xfc, 0x05,
+        ],
+        // order 8
+        [
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0x7a,
+        ],
+        // p − 1 (order 2)
+        P_MINUS_1,
+        // p (≡ 0, order 4)
+        P,
+        // p + 1 (≡ 1, order 1)
+        P_PLUS_1,
+    ];
+    let mut y = *s;
+    y[31] &= 0x7f;
+    BLACKLIST.contains(&y)
+}
+
+/// libsodium's `ge25519_is_canonical`: the `y` field of the encoding (sign
+/// bit ignored) is `< p`. Public input.
+fn libsodium_is_canonical(s: &[u8; 32]) -> bool {
+    let mut y = *s;
+    y[31] &= 0x7f;
+    bool::from(ScalarInt::from_le_bytes(&y).ct_lt(&Field::new().p))
 }
 
 impl Ed25519Signature {
@@ -922,6 +1185,304 @@ mod tests {
             // As A.
             let bad_pk = Ed25519PublicKey::from_bytes(bad);
             assert!(bad_pk.verify(msg, &sig).is_err(), "A = {enc} accepted");
+        }
+    }
+
+    /// The 12 edge-case vectors of Chalkias, Garillot, Nikolaenko,
+    /// *Taming the many EdDSAs* (SSR 2020, <https://eprint.iacr.org/2020/1244>),
+    /// transcribed from `cases.json` of
+    /// <https://github.com/novifinancial/ed25519-speccheck> (Apache-2.0):
+    /// (message, public key, signature).
+    const SPECCHECK: [(&str, &str, &str); 12] = [
+        (
+            "8c93255d71dcab10e8f379c26200f3c7bd5f09d9bc3068d3ef4edeb4853022b6",
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a\
+             0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+        (
+            "9bd9f44f4dcc75bd531b56b2cd280b0bb38fc1cd6d1230e14861d861de092e79",
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+            "f7badec5b8abeaf699583992219b7b223f1df3fbbea919844e3f7c554a43dd43\
+             a5bb704786be79fc476f91d3f3f89b03984d8068dcf1bb7dfc6637b45450ac04",
+        ),
+        (
+            "aebf3f2601a0c8c5d39cc7d8911642f740b78168218da8471772b35f9d35b9ab",
+            "f7badec5b8abeaf699583992219b7b223f1df3fbbea919844e3f7c554a43dd43",
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa\
+             8c4bd45aecaca5b24fb97bc10ac27ac8751a7dfe1baff8b953ec9f5833ca260e",
+        ),
+        (
+            "9bd9f44f4dcc75bd531b56b2cd280b0bb38fc1cd6d1230e14861d861de092e79",
+            "cdb267ce40c5cd45306fa5d2f29731459387dbf9eb933b7bd5aed9a765b88d4d",
+            "9046a64750444938de19f227bb80485e92b83fdb4b6506c160484c016cc1852f\
+             87909e14428a7a1d62e9f22f3d3ad7802db02eb2e688b6c52fcd6648a98bd009",
+        ),
+        (
+            "e47d62c63f830dc7a6851a0b1f33ae4bb2f507fb6cffec4011eaccd55b53f56c",
+            "cdb267ce40c5cd45306fa5d2f29731459387dbf9eb933b7bd5aed9a765b88d4d",
+            "160a1cb0dc9c0258cd0a7d23e94d8fa878bcb1925f2c64246b2dee1796bed512\
+             5ec6bc982a269b723e0668e540911a9a6a58921d6925e434ab10aa7940551a09",
+        ),
+        (
+            "e47d62c63f830dc7a6851a0b1f33ae4bb2f507fb6cffec4011eaccd55b53f56c",
+            "cdb267ce40c5cd45306fa5d2f29731459387dbf9eb933b7bd5aed9a765b88d4d",
+            "21122a84e0b5fca4052f5b1235c80a537878b38f3142356b2c2384ebad4668b7\
+             e40bc836dac0f71076f9abe3a53f9c03c1ceeeddb658d0030494ace586687405",
+        ),
+        (
+            "85e241a07d148b41e47d62c63f830dc7a6851a0b1f33ae4bb2f507fb6cffec40",
+            "442aad9f089ad9e14647b1ef9099a1ff4798d78589e66f28eca69c11f582a623",
+            "e96f66be976d82e60150baecff9906684aebb1ef181f67a7189ac78ea23b6c0e\
+             547f7690a0e2ddcd04d87dbc3490dc19b3b3052f7ff0538cb68afb369ba3a514",
+        ),
+        (
+            "85e241a07d148b41e47d62c63f830dc7a6851a0b1f33ae4bb2f507fb6cffec40",
+            "442aad9f089ad9e14647b1ef9099a1ff4798d78589e66f28eca69c11f582a623",
+            "8ce5b96c8f26d0ab6c47958c9e68b937104cd36e13c33566acd2fe8d38aa1942\
+             7e71f98a473474f2f13f06f97c20d58cc3f54b8bd0d272f42b695dd7e89a8c22",
+        ),
+        (
+            "9bedc267423725d473888631ebf45988bad3db83851ee85c85e241a07d148b41",
+            "f7badec5b8abeaf699583992219b7b223f1df3fbbea919844e3f7c554a43dd43",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
+             03be9678ac102edcd92b0210bb34d7428d12ffc5df5f37e359941266a4e35f0f",
+        ),
+        (
+            "9bedc267423725d473888631ebf45988bad3db83851ee85c85e241a07d148b41",
+            "f7badec5b8abeaf699583992219b7b223f1df3fbbea919844e3f7c554a43dd43",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
+             ca8c5b64cd208982aa38d4936621a4775aa233aa0505711d8fdcfdaa943d4908",
+        ),
+        (
+            "e96b7021eb39c1a163b6da4e3093dcd3f21387da4cc4572be588fafae23c155b",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "a9d55260f765261eb9b84e106f665e00b867287a761990d7135963ee0a7d59dc\
+             a5bb704786be79fc476f91d3f3f89b03984d8068dcf1bb7dfc6637b45450ac04",
+        ),
+        (
+            "39a591f5321bbe07fd5a23dc2f39d025d74526615746727ceefd6e82ae65c06f",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "a9d55260f765261eb9b84e106f665e00b867287a761990d7135963ee0a7d59dc\
+             a5bb704786be79fc476f91d3f3f89b03984d8068dcf1bb7dfc6637b45450ac04",
+        ),
+    ];
+
+    fn speccheck_case(i: usize) -> ([u8; 32], Ed25519PublicKey, Ed25519Signature) {
+        let (m, a, sig) = SPECCHECK[i];
+        (
+            from_hex::<32>(m),
+            Ed25519PublicKey::from_bytes(from_hex::<32>(a)),
+            Ed25519Signature::from_bytes(from_hex::<64>(sig)),
+        )
+    }
+
+    /// `verify_libsodium` reproduces the "LibSodium" row of the speccheck
+    /// results table (README of ed25519-speccheck): only case 3 verifies.
+    #[test]
+    fn speccheck_libsodium_column() {
+        const LIBSODIUM: [bool; 12] = [
+            false, false, false, true, false, false, false, false, false, false, false, false,
+        ];
+        for (i, &want) in LIBSODIUM.iter().enumerate() {
+            let (m, pk, sig) = speccheck_case(i);
+            assert_eq!(
+                pk.verify_libsodium(&m, &sig).is_ok(),
+                want,
+                "speccheck case {i}"
+            );
+        }
+    }
+
+    /// Pins the default (cofactored, strict-encoding, small-order-A-rejecting)
+    /// `verify` on the same vectors, so the libsodium mode demonstrably did
+    /// not change it.
+    #[test]
+    fn speccheck_default_verify_column() {
+        const DEFAULT: [bool; 12] = [
+            false, false, true, true, true, true, false, false, false, false, false, false,
+        ];
+        for (i, &want) in DEFAULT.iter().enumerate() {
+            let (m, pk, sig) = speccheck_case(i);
+            assert_eq!(pk.verify(&m, &sig).is_ok(), want, "speccheck case {i}");
+        }
+    }
+
+    #[test]
+    fn verify_libsodium_accepts_rfc8032() {
+        let f = Field::new();
+        for v in vectors() {
+            let pk = Ed25519PublicKey::from_bytes(v.public);
+            let sig = Ed25519Signature::from_bytes(v.signature);
+            pk.verify_libsodium(v.message, &sig).unwrap();
+            let mut bad = v.signature;
+            bad[0] ^= 1;
+            assert!(
+                pk.verify_libsodium(v.message, &Ed25519Signature::from_bytes(bad))
+                    .is_err()
+            );
+            // S + L (non-canonical, same residue) is rejected.
+            let s = ScalarInt::from_le_bytes(&sig.s_bytes());
+            let mut s_bytes = [0u8; 32];
+            s.wrapping_add(&f.l).write_le_bytes(&mut s_bytes);
+            let sig2 = Ed25519Signature::from_components(&sig.r_bytes(), &s_bytes);
+            assert!(pk.verify_libsodium(v.message, &sig2).is_err());
+        }
+    }
+
+    /// The transcribed blacklist is exactly the `y`s of the 8-torsion
+    /// subgroup (plus the non-canonical `p`, `p + 1`): every torsion point's
+    /// encoding hits it with either sign bit.
+    #[test]
+    fn libsodium_blacklist_is_the_torsion_subgroup() {
+        let f = Field::new();
+        // An order-8 point (a blacklist entry with the sign bit clear).
+        let t8 = f
+            .decode(&from_hex::<32>(
+                "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+            ))
+            .unwrap();
+        let mut p = f.identity();
+        for i in 0..8 {
+            let enc = f.encode(&p);
+            assert!(libsodium_has_small_order(&enc), "[{i}]T8");
+            let mut flipped = enc;
+            flipped[31] ^= 0x80;
+            assert!(libsodium_has_small_order(&flipped), "[{i}]T8 sign-flipped");
+            p = f.point_add(&p, &t8);
+        }
+        assert!(bool::from(f.point_ct_eq(&p, &f.identity())));
+        assert!(!libsodium_has_small_order(&f.encode(&f.base())));
+        // The non-canonical aliases of 0 and 1.
+        let mut pp = [0xffu8; 32];
+        pp[31] = 0x7f;
+        pp[0] = 0xed;
+        assert!(libsodium_has_small_order(&pp));
+        assert!(!libsodium_is_canonical(&pp));
+        pp[0] = 0xee;
+        assert!(libsodium_has_small_order(&pp));
+        pp[0] = 0xec;
+        assert!(libsodium_is_canonical(&pp));
+    }
+
+    /// libsodium's 64-byte `seed ‖ pk` secret key: checked and unchecked
+    /// constructors round-trip and sign the RFC 8032 vectors.
+    #[test]
+    fn keypair_bytes_roundtrip() {
+        for v in vectors() {
+            let mut kp = [0u8; 64];
+            kp[..32].copy_from_slice(&v.seed);
+            kp[32..].copy_from_slice(&v.public);
+            let checked = Ed25519PrivateKey::from_keypair_bytes(&kp).unwrap();
+            let unchecked = Ed25519PrivateKey::from_keypair_bytes_unchecked(&kp);
+            assert_eq!(checked.to_keypair_bytes(), kp);
+            assert_eq!(unchecked.to_keypair_bytes(), kp);
+            assert_eq!(unchecked.public_key().to_bytes(), v.public);
+            assert_eq!(checked.sign(v.message).to_bytes(), v.signature);
+            assert_eq!(unchecked.sign(v.message).to_bytes(), v.signature);
+            assert_eq!(Ed25519PrivateKey::from_bytes(v.seed).to_keypair_bytes(), kp);
+        }
+    }
+
+    /// A mismatched stored public key: the checked constructor refuses it;
+    /// the unchecked one keeps it verbatim (no recomputation), and its
+    /// signatures verify under neither key.
+    #[test]
+    fn keypair_bytes_mismatched_public_key() {
+        let v = &vectors()[1];
+        let other = vectors()[2].public;
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(&v.seed);
+        kp[32..].copy_from_slice(&other);
+        assert_eq!(
+            Ed25519PrivateKey::from_keypair_bytes(&kp).err(),
+            Some(Error::InvalidInput)
+        );
+        let sk = Ed25519PrivateKey::from_keypair_bytes_unchecked(&kp);
+        assert_eq!(sk.public_key().to_bytes(), other);
+        let sig = sk.sign(b"msg");
+        assert!(sk.public_key().verify(b"msg", &sig).is_err());
+        assert!(
+            Ed25519PublicKey::from_bytes(v.public)
+                .verify(b"msg", &sig)
+                .is_err()
+        );
+    }
+
+    /// libsodium `test/default/ed25519_convert.c` / `.exp` (1.0.18).
+    #[test]
+    fn libsodium_ed25519_convert_vector() {
+        let seed =
+            from_hex::<32>("421151a459faeade3d247115f94aedae42318124095afabe4d1451a559faedee");
+        let sk = Ed25519PrivateKey::from_bytes(seed);
+        assert_eq!(
+            sk.public_key().to_x25519().unwrap().to_bytes(),
+            from_hex::<32>("f1814f0e8ff1043d8a44d25babff3cedcae6c22c3edaa48f857ae70de2baae50")
+        );
+        assert_eq!(
+            sk.to_x25519().to_bytes(),
+            from_hex::<32>("8052030376d47112be7f73ed7a019293dd12ad910b654455798b4667d73de166")
+        );
+        // The same file's rejections: y = 0 (small order), y = 2 and y = 5.
+        for first in [0u8, 2, 5] {
+            let mut pk = [0u8; 32];
+            pk[0] = first;
+            assert_eq!(
+                Ed25519PublicKey::from_bytes(pk).to_x25519(),
+                Err(Error::InvalidInput),
+                "y = {first}"
+            );
+        }
+    }
+
+    /// The `ed25519_convert.c` loop: for random keys, X25519 of the converted
+    /// secret equals the converted public key.
+    #[test]
+    fn x25519_conversion_commutes() {
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed25519-convert", b"n", &[]);
+        for _ in 0..32 {
+            let sk = Ed25519PrivateKey::generate(&mut rng);
+            let xpk = sk.public_key().to_x25519().unwrap();
+            assert_eq!(sk.to_x25519().public_key(), xpk.to_bytes());
+        }
+    }
+
+    /// Conversion rejects every small-order and torsion-tainted key, and
+    /// treats non-canonical `y` spellings exactly like their reduced form.
+    #[test]
+    fn x25519_conversion_rejections() {
+        let f = Field::new();
+        let t8 = f
+            .decode(&from_hex::<32>(
+                "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+            ))
+            .unwrap();
+        let a = f.decode(&vectors()[1].public).unwrap();
+        let mut t = f.identity();
+        for i in 0..8 {
+            let pk = Ed25519PublicKey::from_bytes(f.encode(&t));
+            assert!(pk.to_x25519().is_err(), "[{i}]T8");
+            // Mixed-order A + [i]T8 (i > 0) fails the subgroup check.
+            let mixed = Ed25519PublicKey::from_bytes(f.encode(&f.point_add(&a, &t)));
+            assert_eq!(mixed.to_x25519().is_ok(), i == 0, "A + [{i}]T8");
+            t = f.point_add(&t, &t8);
+        }
+        // y ∈ [p, 2²⁵⁵) aliases y − p ∈ [0, 19): same outcome as the
+        // canonical spelling, for both sign bits.
+        for low in 0u8..19 {
+            for sign in [0u8, 0x80] {
+                let mut canon = [0u8; 32];
+                canon[0] = low;
+                canon[31] = sign;
+                let mut alias = [0xffu8; 32];
+                alias[0] = 0xed + low;
+                alias[31] = 0x7f | sign;
+                assert_eq!(
+                    Ed25519PublicKey::from_bytes(canon).to_x25519(),
+                    Ed25519PublicKey::from_bytes(alias).to_x25519(),
+                    "y = {low}, sign {sign:#x}"
+                );
+            }
         }
     }
 }
