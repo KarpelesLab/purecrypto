@@ -6410,6 +6410,16 @@ mod tests {
                 .rng(alloc::sync::Arc::new(crate::rng::OsRng))
                 .build();
             assert!(Connection::client(&ok_cfg).is_ok());
+
+            // `os_rng()` is the same opt-in in one call.
+            let os_cfg = Config::builder()
+                .versions(v, v)
+                .verify_certificates(false)
+                .server_name("rng.example")
+                .os_rng()
+                .build();
+            assert!(os_cfg.rng.is_some());
+            assert!(Connection::client(&os_cfg).is_ok());
         }
 
         // Server path (TLS 1.3): an identity but no rng → MissingEntropySource.

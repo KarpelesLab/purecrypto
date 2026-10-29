@@ -573,10 +573,18 @@ pub struct Config {
 
     /// Optional entropy source for all randomness this endpoint draws (server
     /// random, ephemeral (EC)DHE / ML-KEM key shares, RSA-PSS salts, ML-DSA
-    /// hedging, session-ticket nonces). `None` (the default) uses the platform
-    /// [`OsRng`][crate::rng::OsRng]. Supply an [`EntropySource`] to route
-    /// entropy through a hardware device (TPM/HSM). Shared (`Arc`) across every
+    /// hedging, session-ticket nonces). Shared (`Arc`) across every
     /// connection built from this `Config`.
+    ///
+    /// There is no implicit default: `None` makes
+    /// [`Connection::client`](super::Connection::client) /
+    /// [`server`](super::Connection::server) fail with
+    /// [`Error::MissingEntropySource`](super::Error::MissingEntropySource),
+    /// because the sans-I/O engine takes entropy as an input. Under `std`,
+    /// [`ConfigBuilder::os_rng`] installs the platform
+    /// [`OsRng`][crate::rng::OsRng] in one call; supply your own
+    /// [`EntropySource`] through [`ConfigBuilder::rng`] to route entropy
+    /// through a hardware device (TPM/HSM).
     #[cfg_attr(
         not(feature = "std"),
         doc = "",
@@ -904,6 +912,26 @@ impl ConfigBuilder {
     pub fn rng(mut self, source: Arc<dyn EntropySource>) -> Self {
         self.inner.rng = Some(source);
         self
+    }
+    /// Uses the platform [`OsRng`](crate::rng::OsRng) as this endpoint's
+    /// entropy source: shorthand for `.rng(Arc::new(OsRng))`.
+    ///
+    /// The engine never picks an RNG on its own (see [`Config::rng`]); this
+    /// is the explicit opt-in for the common case. Only available where
+    /// `OsRng` is (`std` on a platform with an OS entropy source), so a
+    /// `no_std` build keeps requiring [`rng`](Self::rng).
+    #[cfg(all(
+        feature = "std",
+        any(
+            unix,
+            windows,
+            target_os = "fullrust",
+            all(target_arch = "wasm32", target_os = "unknown"),
+            all(target_arch = "wasm32", target_os = "wasi", feature = "wasi-getrandom"),
+        )
+    ))]
+    pub fn os_rng(self) -> Self {
+        self.rng(Arc::new(crate::rng::OsRng))
     }
     /// Install a cert chain + signing key **without** checking that the key
     /// belongs to the leaf certificate.
