@@ -652,6 +652,18 @@ impl Certificate {
         super::AnyPublicKey::from_spki_der(self.spki_der()?)
     }
 
+    /// **Insecure.** [`subject_public_key`](Self::subject_public_key) that
+    /// also accepts RSA keys below 1024 bits (down to
+    /// [`MIN_RSA_INSECURE_BITS`](crate::rsa::MIN_RSA_INSECURE_BITS), 256),
+    /// via [`AnyPublicKey::from_spki_der_insecure`]. Pair it with a policy
+    /// gate such as [`verify_signature_with_policy`](Self::verify_signature_with_policy)
+    /// so the key size is still decided explicitly.
+    ///
+    /// [`AnyPublicKey::from_spki_der_insecure`]: super::AnyPublicKey::from_spki_der_insecure
+    pub fn subject_public_key_insecure(&self) -> Result<super::AnyPublicKey, Error> {
+        super::AnyPublicKey::from_spki_der_insecure(self.spki_der()?)
+    }
+
     /// `true` when `key` is the subject public key this certificate certifies.
     ///
     /// Both sides are compared as their *canonical* `SubjectPublicKeyInfo`
@@ -678,7 +690,9 @@ impl Certificate {
     /// [`AnyPublicKey::RsaPss`]: super::AnyPublicKey::RsaPss
     pub fn subject_public_key_matches(&self, key: &super::AnyPublicKey) -> Result<bool, Error> {
         use super::AnyPublicKey;
-        let certified = self.subject_public_key()?;
+        // A pure comparison against a key the caller already holds, so the
+        // small-RSA floor of the default parser protects nothing here.
+        let certified = self.subject_public_key_insecure()?;
         Ok(match (&certified, key) {
             (AnyPublicKey::Rsa(a) | AnyPublicKey::RsaPss(a, _), AnyPublicKey::Rsa(b))
             | (AnyPublicKey::Rsa(a), AnyPublicKey::RsaPss(b, _)) => {
@@ -750,6 +764,34 @@ impl Certificate {
         let parts = self.parts()?;
         let alg = super::SignatureAlgorithmIdentifier::from_der(parts.sig_algid)?;
         issuer.verify(&alg, parts.tbs, parts.signature)
+    }
+
+    /// [`verify_signature_with`](Self::verify_signature_with) behind a
+    /// [`SignaturePolicy`](crate::signature_registry::SignaturePolicy) gate —
+    /// the check the TLS chain validator applies to every chain signature:
+    /// the registry entry the signature dispatches to must be on the
+    /// policy's whitelist, and the issuer key must meet its key-size floors
+    /// (RSA ≥ 2048 bits and EC ≥ 256-bit order under
+    /// [`SignaturePolicy::modern`](crate::signature_registry::SignaturePolicy::modern)).
+    /// A refused algorithm or key is [`Error::Verification`].
+    ///
+    /// This is how a non-TLS caller (e.g. an `openssl_x509_verify`
+    /// equivalent) opts in to legacy keys: parse the issuer with
+    /// [`subject_public_key_insecure`](Self::subject_public_key_insecure) and
+    /// verify under `SignaturePolicy::modern().with_min_rsa_bits(512)`.
+    pub fn verify_signature_with_policy(
+        &self,
+        issuer: &super::AnyPublicKey,
+        policy: &crate::signature_registry::SignaturePolicy,
+    ) -> Result<(), Error> {
+        let alg = self.signature_algorithm()?;
+        let algo = issuer
+            .signature_algorithm(&alg)
+            .ok_or(Error::Verification)?;
+        if !policy.permits(algo, &issuer.to_spki_der()) {
+            return Err(Error::Verification);
+        }
+        self.verify_signature_with(issuer)
     }
 
     /// The OID arcs of the certificate's outer `signatureAlgorithm` field,
@@ -4025,5 +4067,61 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
             failures.is_empty(),
             "embedded roots rejected: {failures:#?}"
         );
+    }
+    /// A 512-bit RSA self-signed certificate made by OpenSSL 3.5
+    /// (`testdata/rsa512_selfsigned_cert.pem`): the certificate parses, the
+    /// default key parser refuses its key, the insecure one loads it, and
+    /// the policy-gated verify rejects it under the default 2048-bit floor
+    /// (and under 1024) but accepts it once the floor is lowered to 512.
+    #[test]
+    fn rsa512_certificate_needs_explicit_policy_opt_in() {
+        use crate::signature_registry::SignaturePolicy;
+        use crate::x509::AnyPublicKey;
+        let cert = Certificate::from_pem(include_str!("../../testdata/rsa512_selfsigned_cert.pem"))
+            .unwrap();
+        assert!(cert.subject_public_key().is_err());
+        let key = cert.subject_public_key_insecure().unwrap();
+        match &key {
+            AnyPublicKey::Rsa(k) => assert_eq!(k.modulus().bit_len(), 512),
+            _ => panic!("expected an RSA key"),
+        }
+        let spki = cert.spki_der().unwrap();
+        assert!(AnyPublicKey::from_spki_der(spki).is_err());
+        assert!(AnyPublicKey::from_spki_der_insecure(spki).is_ok());
+        assert!(cert.subject_public_key_matches(&key).unwrap());
+
+        for policy in [
+            SignaturePolicy::modern(),
+            SignaturePolicy::modern().with_min_rsa_bits(1024),
+        ] {
+            assert_eq!(
+                cert.verify_signature_with_policy(&key, &policy),
+                Err(Error::Verification)
+            );
+        }
+        let legacy = SignaturePolicy::modern().with_min_rsa_bits(512);
+        cert.verify_signature_with_policy(&key, &legacy).unwrap();
+
+        // A policy that does not whitelist the algorithm still refuses it,
+        // whatever the key size.
+        let narrow = SignaturePolicy::empty()
+            .permit("ed25519")
+            .with_min_rsa_bits(512);
+        assert_eq!(
+            cert.verify_signature_with_policy(&key, &narrow),
+            Err(Error::Verification)
+        );
+        // A different key never verifies.
+        let other = Certificate::self_signed(
+            &rsa_test_key_a(),
+            &DistinguishedName::common_name("x"),
+            &validity(),
+            1,
+            false,
+        )
+        .unwrap()
+        .subject_public_key()
+        .unwrap();
+        assert!(cert.verify_signature_with_policy(&other, &legacy).is_err());
     }
 }

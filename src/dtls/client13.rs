@@ -2478,7 +2478,7 @@ impl DtlsClientConnection13 {
             verify_hostname(&leaf, name)?;
             key
         } else {
-            leaf.subject_public_key()
+            crate::tls::pki::cert_key(&leaf, &self.config.signature_policy)
                 .map_err(|_| Error::BadCertificate)?
         };
 

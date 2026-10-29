@@ -543,8 +543,8 @@ impl ServerConfig12 {
     /// pair "present in the signature_algorithms extension").
     fn signature_scheme(&self, offered: &[SignatureScheme]) -> Result<SignatureScheme, Error> {
         let own = match &self.key {
-            ServerKey::Rsa(_) => {
-                return crate::tls::crypto::sign::tls12_rsa_scheme(offered)
+            ServerKey::Rsa(k) => {
+                return crate::tls::crypto::sign::tls12_rsa_scheme_for(k, offered)
                     .ok_or(Error::HandshakeFailure);
             }
             ServerKey::RsaPss(_, hash) => Some(crate::tls::crypto::sign::rsa_pss_pss_scheme(*hash)),
@@ -2661,7 +2661,8 @@ impl<R: RngCore> ServerConnection12<R> {
                 &self.config.expected_client_raw_public_keys,
                 spki,
             )?;
-            let leaf_key = AnyPublicKey::from_spki_der(spki).map_err(|_| Error::BadCertificate)?;
+            let leaf_key = crate::tls::pki::spki_key(spki, &self.config.signature_policy)
+                .map_err(|_| Error::BadCertificate)?;
             self.transcript.update(raw);
             self.client_cert_chain = chain;
             self.client_leaf_key = Some(leaf_key);

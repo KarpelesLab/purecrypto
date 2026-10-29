@@ -294,7 +294,7 @@ impl ClientCertConfig {
         &self,
         offered: &[SignatureScheme],
     ) -> Option<SignatureScheme> {
-        use crate::tls::crypto::sign::{is_tls12_signature_scheme, tls12_rsa_scheme};
+        use crate::tls::crypto::sign::{is_tls12_signature_scheme, tls12_rsa_scheme_for};
         match &self.key {
             ClientKey::External { schemes } => schemes
                 .iter()
@@ -303,7 +303,7 @@ impl ClientCertConfig {
             // RSA-PSS if the server lists it, else PKCS#1 v1.5 (RFC 5246
             // §7.4.1.4.1; RFC 8446 forbids it only in TLS 1.3), as the TLS
             // 1.2 client does.
-            ClientKey::Rsa(_) => tls12_rsa_scheme(offered),
+            ClientKey::Rsa(k) => tls12_rsa_scheme_for(k, offered),
             key => Self::signature_scheme_for(key)
                 .filter(|s| is_tls12_signature_scheme(*s) && offered.contains(s)),
         }
@@ -4301,7 +4301,8 @@ impl ClientConnection {
         // apply.
         if self.negotiated_server_cert_type == crate::tls::codec::cert_type::RAW_PUBLIC_KEY {
             let spki = self.cert_chain.first().ok_or(Error::BadCertificate)?;
-            let leaf_key = AnyPublicKey::from_spki_der(spki).map_err(|_| Error::BadCertificate)?;
+            let leaf_key = crate::tls::pki::spki_key(spki, &self.config.signature_policy)
+                .map_err(|_| Error::BadCertificate)?;
             // The allowlist decision is shared with the TLS 1.2 engine
             // (`check_raw_public_key`): a configured pin is always
             // enforced, and verification-on with no pin is refused.
@@ -4379,7 +4380,7 @@ impl ClientConnection {
             }
             key
         } else {
-            leaf.subject_public_key()
+            crate::tls::pki::cert_key(&leaf, &self.config.signature_policy)
                 .map_err(|_| Error::BadCertificate)?
         };
         super::common::run_certificate_verifier(

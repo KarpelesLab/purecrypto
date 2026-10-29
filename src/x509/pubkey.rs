@@ -487,6 +487,32 @@ impl AnyPublicKey {
     /// * `id-X25519` / `id-X448` — no parameters.
     /// * `id-ml-dsa-*` / SLH-DSA — bare OID, no parameters.
     pub fn from_spki_der(der: &[u8]) -> Result<Self, Error> {
+        Self::from_spki_der_rsa_floor(der, false)
+    }
+
+    /// **Insecure.** [`from_spki_der`](Self::from_spki_der), except that an
+    /// RSA key (`rsaEncryption` or `id-RSASSA-PSS`) may be as small as
+    /// [`MIN_RSA_INSECURE_BITS`](crate::rsa::MIN_RSA_INSECURE_BITS) (256)
+    /// bits rather than 1024 — for legacy / test material such as 512-bit
+    /// certificates. Every other check is unchanged.
+    ///
+    /// The key-size decision then belongs to the caller: verify with a
+    /// [`SignaturePolicy`](crate::signature_registry::SignaturePolicy) gate
+    /// (e.g. [`Certificate::verify_signature_with_policy`](crate::x509::Certificate::verify_signature_with_policy)),
+    /// whose default RSA floor (2048 bits) still refuses such a key unless
+    /// lowered explicitly.
+    pub fn from_spki_der_insecure(der: &[u8]) -> Result<Self, Error> {
+        Self::from_spki_der_rsa_floor(der, true)
+    }
+
+    fn from_spki_der_rsa_floor(der: &[u8], insecure: bool) -> Result<Self, Error> {
+        let rsa = |bits: &[u8]| {
+            if insecure {
+                BoxedRsaPublicKey::from_pkcs1_der_insecure(bits)
+            } else {
+                BoxedRsaPublicKey::from_pkcs1_der(bits)
+            }
+        };
         let mut reader = Reader::new(der);
         let mut spki = reader.read_sequence()?;
         // Nothing may follow the outer SEQUENCE: a trailing byte after a
@@ -501,19 +527,14 @@ impl AnyPublicKey {
             algid.finish()?;
             let key_bits = spki.read_bit_string()?;
             spki.finish()?;
-            Ok(AnyPublicKey::Rsa(BoxedRsaPublicKey::from_pkcs1_der(
-                key_bits,
-            )?))
+            Ok(AnyPublicKey::Rsa(rsa(key_bits)?))
         } else if alg.as_slice() == oid::ID_RSASSA_PSS {
             // RFC 4055 §3.1: absent parameters or one RSASSA-PSS-params.
             let restriction = PssRestriction::decode(&mut algid)?;
             algid.finish()?;
             let key_bits = spki.read_bit_string()?;
             spki.finish()?;
-            Ok(AnyPublicKey::RsaPss(
-                BoxedRsaPublicKey::from_pkcs1_der(key_bits)?,
-                restriction,
-            ))
+            Ok(AnyPublicKey::RsaPss(rsa(key_bits)?, restriction))
         } else if alg.as_slice() == oid::EC_PUBLIC_KEY {
             let curve_arcs = parse_oid(algid.read_oid()?)?;
             // RFC 5480 §2.1.1: the only parameters we accept after the OID
@@ -612,6 +633,12 @@ impl AnyPublicKey {
     /// Parses a PKIX PEM public key.
     pub fn from_spki_pem(pem: &str) -> Result<Self, Error> {
         Self::from_spki_der(&pem_decode(pem, SPKI_LABEL)?)
+    }
+
+    /// **Insecure.** [`from_spki_pem`](Self::from_spki_pem) with the RSA
+    /// floor of [`from_spki_der_insecure`](Self::from_spki_der_insecure).
+    pub fn from_spki_pem_insecure(pem: &str) -> Result<Self, Error> {
+        Self::from_spki_der_insecure(&pem_decode(pem, SPKI_LABEL)?)
     }
 
     /// Verifies `sig` over `msg` under the signature `AlgorithmIdentifier`

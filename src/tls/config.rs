@@ -1112,7 +1112,9 @@ impl ConfigBuilder {
         key: Arc<dyn super::signer::HandshakeSigner>,
     ) -> Result<Self, super::Error> {
         if let Some(spki) = key.public_key_spki() {
-            let declared = crate::x509::AnyPublicKey::from_spki_der(&spki)
+            // The endpoint's own key: parsed without the small-RSA floor
+            // (it is never verified against, only compared with the leaf).
+            let declared = crate::x509::AnyPublicKey::from_spki_der_insecure(&spki)
                 .map_err(|_| super::Error::Decode)?;
             leaf_certifies(&chain, &declared)?;
         }
@@ -1199,9 +1201,10 @@ impl ConfigBuilder {
     /// well-funded attackers and anything smaller is broken outright; a
     /// value below 2048 exists only to talk to old devices and test
     /// fixtures (PHP/OpenSSL test suites still ship 1024-bit certificates).
-    /// Keys under 1024 bits remain unusable whatever this says, because the
-    /// RSA key parser refuses them. Raising the floor (e.g. to 3072) is
-    /// always safe.
+    /// A value below 1024 also makes the peer-certificate parser accept RSA
+    /// keys that small (down to 256 bits, `rsa::MIN_RSA_INSECURE_BITS`),
+    /// which it otherwise refuses outright; the floor given here is then
+    /// what decides. Raising the floor (e.g. to 3072) is always safe.
     pub fn min_rsa_key_bits(mut self, bits: u32) -> Self {
         self.inner.signature_policy = self.inner.signature_policy.with_min_rsa_bits(bits);
         self

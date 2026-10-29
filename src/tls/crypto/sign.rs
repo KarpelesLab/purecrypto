@@ -147,11 +147,44 @@ pub(crate) const TLS12_RSA_SCHEME_PREFERENCE: [SignatureScheme; 6] = [
 /// or `None` when it offered none of them (the caller answers
 /// `handshake_failure`, or — for a client's certificate — withholds it).
 /// For (D)TLS 1.2 only; TLS 1.3 signs RSA-PSS and nothing else.
+///
+/// The engines call [`tls12_rsa_scheme_for`], which also drops schemes the
+/// key is too small to sign; this key-independent form is kept for tests.
+#[cfg(test)]
 pub(crate) fn tls12_rsa_scheme(offered: &[SignatureScheme]) -> Option<SignatureScheme> {
     TLS12_RSA_SCHEME_PREFERENCE
         .iter()
         .copied()
         .find(|s| offered.contains(s))
+}
+
+/// [`tls12_rsa_scheme`] restricted to the schemes `key` can actually sign:
+/// RSA-PSS with a digest-length salt needs an encoded message of
+/// `2·hLen + 2` octets (RFC 8017 §9.1.1 — a 522-bit modulus for SHA-256)
+/// and PKCS#1 v1.5 needs `tLen + 11` (§9.2), so a small legacy key (e.g.
+/// 512-bit) falls through to `rsa_pkcs1_sha256` instead of failing to sign.
+/// For every key of 1024 bits or more this is exactly `tls12_rsa_scheme`.
+pub(crate) fn tls12_rsa_scheme_for(
+    key: &BoxedRsaPrivateKey,
+    offered: &[SignatureScheme],
+) -> Option<SignatureScheme> {
+    let mod_bits = key.modulus().bit_len();
+    let em_len = (mod_bits - 1).div_ceil(8); // PSS: emBits = modBits − 1
+    let k = mod_bits.div_ceil(8);
+    TLS12_RSA_SCHEME_PREFERENCE
+        .iter()
+        .copied()
+        .filter(|s| offered.contains(s))
+        .find(|&s| match s {
+            SignatureScheme::RSA_PSS_RSAE_SHA256 => em_len >= 2 * 32 + 2,
+            SignatureScheme::RSA_PSS_RSAE_SHA384 => em_len >= 2 * 48 + 2,
+            SignatureScheme::RSA_PSS_RSAE_SHA512 => em_len >= 2 * 64 + 2,
+            // DigestInfo is 19 octets of prefix plus the digest.
+            SignatureScheme::RSA_PKCS1_SHA256 => k >= 19 + 32 + 11,
+            SignatureScheme::RSA_PKCS1_SHA384 => k >= 19 + 48 + 11,
+            SignatureScheme::RSA_PKCS1_SHA512 => k >= 19 + 64 + 11,
+            _ => false,
+        })
 }
 
 /// Signs `content` with an `rsaEncryption` RSA key for a (D)TLS 1.2
@@ -239,7 +272,9 @@ pub(crate) fn leaf_rsa_form(chain: &[Vec<u8>]) -> LeafRsaForm {
     let Ok(cert) = Certificate::from_der(leaf.clone()) else {
         return LeafRsaForm::Other;
     };
-    match cert.subject_public_key() {
+    // Only the key's form is read, so a small (legacy) RSA key is classified
+    // too; whether it may sign is the signature policy's call.
+    match cert.subject_public_key_insecure() {
         Ok(AnyPublicKey::Rsa(_)) => LeafRsaForm::RsaEncryption,
         Ok(AnyPublicKey::RsaPss(_, restriction)) => LeafRsaForm::RsaPss(restriction.hash()),
         _ => LeafRsaForm::Other,
@@ -1252,6 +1287,34 @@ mod tests {
     /// order, else nothing; and a PKCS#1 v1.5 signature made for it
     /// verifies under the 1.2 verifier and the default policy (which admits
     /// `(sha256, rsa)` / `(sha384, rsa)`, not `(sha512, rsa)`).
+    #[test]
+    fn tls12_rsa_scheme_for_skips_schemes_a_small_key_cannot_sign() {
+        let s = |v: &[u16]| v.iter().map(|&c| SignatureScheme(c)).collect::<Vec<_>>();
+        let offered = s(&[0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]);
+        let big = crate::test_util::rsa_test_key_a();
+        let big = BoxedRsaPrivateKey::from_pkcs1_der(&big.to_pkcs1_der()).unwrap();
+        assert_eq!(
+            tls12_rsa_scheme_for(&big, &offered),
+            Some(SignatureScheme::RSA_PSS_RSAE_SHA256)
+        );
+        // 512 bits: too small for any PSS digest-length salt and for the
+        // SHA-384/512 DigestInfo, but `rsa_pkcs1_sha256` fits (64 ≥ 62).
+        let small = BoxedRsaPrivateKey::from_pkcs8_pem_insecure(include_str!(
+            "../../../testdata/rsa512_selfsigned_key.pem"
+        ))
+        .unwrap();
+        assert_eq!(
+            tls12_rsa_scheme_for(&small, &offered),
+            Some(SignatureScheme::RSA_PKCS1_SHA256)
+        );
+        assert_eq!(tls12_rsa_scheme_for(&small, &s(&[0x0804, 0x0601])), None);
+        let mut rng = crate::rng::HmacDrbg::<Sha256>::new(b"small-rsa", b"n", &[]);
+        sign_rsa_tls12(&small, SignatureScheme::RSA_PKCS1_SHA256, b"x", &mut rng).unwrap();
+        assert!(
+            sign_rsa_tls12(&small, SignatureScheme::RSA_PSS_RSAE_SHA256, b"x", &mut rng).is_err()
+        );
+    }
+
     #[test]
     fn tls12_rsa_scheme_prefers_pss_then_pkcs1() {
         use crate::rng::HmacDrbg;

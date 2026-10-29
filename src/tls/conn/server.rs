@@ -3573,7 +3573,7 @@ impl<R: RngCore> ServerConnection<R> {
             if !trusted {
                 return Err(Error::BadCertificate);
             }
-            let leaf_key = crate::x509::AnyPublicKey::from_spki_der(spki)
+            let leaf_key = crate::tls::pki::spki_key(spki, &self.config.signature_policy)
                 .map_err(|_| Error::BadCertificate)?;
             self.client_cert_chain = chain;
             self.client_leaf_key = Some(leaf_key);

@@ -103,6 +103,47 @@ impl LeafIssuer {
     }
 }
 
+/// RSA keys below this many bits are only parsed when the policy in force
+/// admits them ([`policy_parses_small_rsa`]).
+const RSA_PARSE_FLOOR_BITS: u32 = 1024;
+
+/// Whether `policy` has been lowered below the RSA parse floor (via
+/// `SignaturePolicy::with_min_rsa_bits` / `ConfigBuilder::min_rsa_key_bits`),
+/// so a peer key under 1024 bits must be parsed for the policy to judge it.
+/// Under the default 2048-bit floor this is `false` and keys are parsed
+/// exactly as before.
+fn policy_parses_small_rsa(policy: &SignaturePolicy) -> bool {
+    policy.min_rsa_bits < RSA_PARSE_FLOOR_BITS
+}
+
+/// The subject key of `cert`, parsed with the RSA floor `policy` calls for:
+/// the default 1024-bit parse floor, or — when the policy has been lowered
+/// below it — down to `rsa::MIN_RSA_INSECURE_BITS`. Every use of the key in
+/// the TLS engines still passes `policy.permits`, which applies the
+/// policy's own `min_rsa_bits`.
+pub(crate) fn cert_key(
+    cert: &Certificate,
+    policy: &SignaturePolicy,
+) -> Result<AnyPublicKey, crate::x509::Error> {
+    if policy_parses_small_rsa(policy) {
+        cert.subject_public_key_insecure()
+    } else {
+        cert.subject_public_key()
+    }
+}
+
+/// [`cert_key`] for a bare `SubjectPublicKeyInfo` (RFC 7250 raw keys).
+pub(crate) fn spki_key(
+    spki: &[u8],
+    policy: &SignaturePolicy,
+) -> Result<AnyPublicKey, crate::x509::Error> {
+    if policy_parses_small_rsa(policy) {
+        AnyPublicKey::from_spki_der_insecure(spki)
+    } else {
+        AnyPublicKey::from_spki_der(spki)
+    }
+}
+
 /// The result of a successful chain verification.
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedChain {
@@ -162,9 +203,7 @@ pub(crate) fn leaf_issuer(
     }
     let issuer_der = chain.get(1).ok_or(Error::BadCertificate)?;
     let issuer = Certificate::from_der(issuer_der.clone()).map_err(|_| Error::BadCertificate)?;
-    let issuer_key = issuer
-        .subject_public_key()
-        .map_err(|_| Error::BadCertificate)?;
+    let issuer_key = cert_key(&issuer, policy).map_err(|_| Error::BadCertificate)?;
     verify_cert_against_issuer(&leaf, &issuer_key, policy)?;
     if names_differ(&leaf, &issuer)? {
         return Err(Error::BadCertificate);
@@ -482,9 +521,7 @@ fn verify_chain_inner(
                 Error::UnknownIssuer
             });
         };
-        let issuer_key = issuer
-            .subject_public_key()
-            .map_err(|_| Error::BadCertificate)?;
+        let issuer_key = cert_key(issuer, policy).map_err(|_| Error::BadCertificate)?;
         verify_cert_against_issuer(&certs[i], &issuer_key, policy)?;
         if names_differ(&certs[i], issuer)? {
             return Err(Error::BadCertificate);
@@ -563,9 +600,7 @@ fn verify_chain_inner(
     // processing, so the default path is unaffected.
     super::policy::check_policies(path, policy_opts)?;
 
-    let leaf_key = certs[0]
-        .subject_public_key()
-        .map_err(|_| Error::BadCertificate)?;
+    let leaf_key = cert_key(&certs[0], policy).map_err(|_| Error::BadCertificate)?;
     // Set on the very first loop iteration on both the anchored and the
     // in-chain branch (any other outcome returned early).
     let leaf_issuer = leaf_issuer.ok_or(Error::BadCertificate)?;

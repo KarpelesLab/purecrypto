@@ -125,8 +125,13 @@ impl RootCertStore {
             .subject_der()
             .map_err(|_| Error::BadCertificate)?
             .to_vec();
+        // Parsed with the insecure RSA floor (256 bits): an anchor key is
+        // only ever used behind `SignaturePolicy::permits`, whose own
+        // `min_rsa_bits` (2048 by default) decides whether a small root
+        // can anchor anything. A sub-1024-bit root therefore loads but
+        // verifies nothing until the policy is lowered explicitly.
         let key = cert
-            .subject_public_key()
+            .subject_public_key_insecure()
             .map_err(|_| Error::BadCertificate)?;
         let spki_der = cert.spki_der().map_err(|_| Error::BadCertificate)?.to_vec();
         let name_constraints = cert.name_constraints().map_err(|_| Error::BadCertificate)?;

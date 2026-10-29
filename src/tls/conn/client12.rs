@@ -2239,7 +2239,8 @@ impl ClientConnection12 {
             if spki.is_empty() {
                 return Err(Error::BadCertificate);
             }
-            let key = AnyPublicKey::from_spki_der(&spki).map_err(|_| Error::BadCertificate)?;
+            let key = crate::tls::pki::spki_key(&spki, &self.config.signature_policy)
+                .map_err(|_| Error::BadCertificate)?;
             super::common::check_raw_public_key(
                 self.config.verify_certificates,
                 &self.config.expected_raw_public_keys,
@@ -2278,7 +2279,7 @@ impl ClientConnection12 {
                 verify_hostname(&leaf, &self.server_name)?;
                 key
             } else {
-                leaf.subject_public_key()
+                crate::tls::pki::cert_key(&leaf, &self.config.signature_policy)
                     .map_err(|_| Error::BadCertificate)?
             };
             super::common::run_certificate_verifier(
@@ -2296,8 +2297,17 @@ impl ClientConnection12 {
         // RSA, no SKE).
         #[cfg(feature = "tls-legacy")]
         if let Some(ls) = self.legacy_suite {
-            if !matches!(leaf_key, AnyPublicKey::Rsa(_)) {
+            let AnyPublicKey::Rsa(rsa) = &leaf_key else {
                 return Err(Error::HandshakeFailure);
+            };
+            // Static RSA encrypts the premaster secret to the leaf key with
+            // no handshake signature, so no `SignaturePolicy::permits` call
+            // ever sees the leaf's size. Keep the 1024-bit floor the key
+            // parser enforces by default, lowered only as far as an explicit
+            // `min_rsa_key_bits` below 1024 asks.
+            let floor = self.config.signature_policy.min_rsa_bits.min(1024);
+            if (rsa.modulus().bit_len() as u64) < u64::from(floor) {
+                return Err(Error::BadCertificate);
             }
             self.cert_chain = chain;
             self.leaf_key = Some(leaf_key);
@@ -2988,8 +2998,11 @@ impl ClientConnection12 {
         // An `rsaEncryption` key signs the first of the 1.2 RSA preference
         // (RSA-PSS, then PKCS#1 v1.5 — RFC 5246 §7.4.1.4.1; RFC 8446
         // forbids the latter only in TLS 1.3) that the request lists.
-        if let ClientKey::Rsa(_) = cc.key() {
-            return Ok(crate::tls::crypto::sign::tls12_rsa_scheme(&cr.sig_schemes));
+        if let ClientKey::Rsa(k) = cc.key() {
+            return Ok(crate::tls::crypto::sign::tls12_rsa_scheme_for(
+                k,
+                &cr.sig_schemes,
+            ));
         }
         let scheme = ClientCertConfig::signature_scheme_for(cc.key())
             .filter(|s| is_tls12_signature_scheme(*s))

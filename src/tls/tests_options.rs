@@ -1009,3 +1009,58 @@ fn certificate_alert_codes() {
     }
     assert!(!Error::HandshakeFailure.is_certificate_error());
 }
+
+/// OpenSSL-generated 512-bit RSA self-signed certificate for [`HOST`]
+/// (`openssl req -x509 -newkey rsa:512 -sha256`, CA:FALSE, serverAuth +
+/// clientAuth, valid 2026-10-29..2046-10-24) and its PKCS#8 key.
+const RSA512_CERT_PEM: &str = include_str!("../../testdata/rsa512_selfsigned_cert.pem");
+const RSA512_KEY_PEM: &str = include_str!("../../testdata/rsa512_selfsigned_key.pem");
+
+/// End to end over TLS 1.2 (`ECDHE-RSA` with an `rsa_pkcs1_sha256`
+/// `ServerKeyExchange`): a 512-bit RSA server certificate is refused by
+/// default — the root still loads, but the chain signature fails the
+/// 2048-bit policy floor — and by a client that lowered the floor only to
+/// 1024, and accepted with `min_rsa_key_bits(512)`, both verifying and with
+/// verification off. TLS 1.3 cannot carry such a key at all:
+/// `rsa_pss_rsae_sha256` needs a modulus of at least 522 bits, and TLS 1.3
+/// has no PKCS#1 v1.5 handshake signature to fall back to.
+#[test]
+fn min_rsa_key_bits_512_admits_openssl_512_bit_certificate() {
+    let leaf = Certificate::from_pem(RSA512_CERT_PEM)
+        .unwrap()
+        .to_der()
+        .to_vec();
+    let key = BoxedRsaPrivateKey::from_pkcs8_pem_insecure(RSA512_KEY_PEM).unwrap();
+    assert!(BoxedRsaPrivateKey::from_pkcs8_pem(RSA512_KEY_PEM).is_err());
+    let v = ProtocolVersion::TLSv1_2;
+    let server_cfg = server_builder(v, v, vec![leaf.clone()], SigningKey::Rsa(key)).build();
+
+    for (floor, ok) in [(None, false), (Some(1024), false), (Some(512), true)] {
+        for verify in [true, false] {
+            let mut b = if verify {
+                verifying_client(v, v, roots_of(&leaf))
+            } else {
+                unverifying_client(v, v)
+            };
+            if let Some(bits) = floor {
+                b = b.min_rsa_key_bits(bits);
+            }
+            let client_cfg = b.build();
+            let mut client = Connection::client(&client_cfg).unwrap();
+            let mut server = Connection::server(&server_cfg).unwrap();
+            let out = run(&mut client, &mut server);
+            if ok {
+                out.server.unwrap();
+                out.client.unwrap();
+                assert!(client.is_handshake_complete() && server.is_handshake_complete());
+                assert_eq!(client.negotiated_version(), Some(v));
+            } else {
+                assert!(
+                    matches!(out.client, Err(Error::BadCertificate)),
+                    "floor {floor:?} verify={verify}: {:?}",
+                    out.client
+                );
+            }
+        }
+    }
+}

@@ -2789,8 +2789,8 @@ fn signature_scheme(
     offered: &[SignatureScheme],
 ) -> Result<SignatureScheme, Error> {
     let own = match key {
-        ServerKey::Rsa(_) => {
-            return crate::tls::crypto::sign::tls12_rsa_scheme(offered)
+        ServerKey::Rsa(k) => {
+            return crate::tls::crypto::sign::tls12_rsa_scheme_for(k, offered)
                 .ok_or(Error::HandshakeFailure);
         }
         ServerKey::RsaPss(_, hash) => Some(crate::tls::crypto::sign::rsa_pss_pss_scheme(*hash)),
