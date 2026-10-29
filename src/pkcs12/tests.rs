@@ -16,6 +16,13 @@ const P12_DEFAULT: &[u8] = include_bytes!("../../testdata/pkcs12_openssl3_defaul
 /// OpenSSL legacy: pbeWithSHAAnd3-KeyTripleDES-CBC content + SHA-1 MAC.
 const P12_LEGACY: &[u8] = include_bytes!("../../testdata/pkcs12_openssl_legacy_3des.p12");
 const PASSWORD: &str = "hunter2";
+/// OpenSSL 3.5 `pkcs12 -export -legacy -certpbe PBE-SHA1-RC2-40 -keypbe
+/// PBE-SHA1-3DES` (OpenSSL 1.x's defaults).
+const P12_LEGACY_RC2_40: &[u8] = include_bytes!("../../testdata/pkcs12_openssl_legacy_rc2_40.p12");
+/// OpenSSL 3.5 `pkcs12 -export -legacy -certpbe PBE-SHA1-RC2-128 -keypbe
+/// PBE-SHA1-RC2-128`.
+const P12_LEGACY_RC2_128: &[u8] =
+    include_bytes!("../../testdata/pkcs12_openssl_legacy_rc2_128.p12");
 
 #[test]
 fn openssl3_default_interop() {
@@ -38,6 +45,30 @@ fn openssl_legacy_3des_interop() {
     assert_eq!(parsed.certs[0], CERT_DER);
     assert_eq!(parsed.keys.len(), 1);
     assert_eq!(parsed.keys[0], KEY_PK8);
+}
+
+#[cfg(feature = "legacy-ciphers")]
+#[test]
+fn openssl_legacy_rc2_interop() {
+    for p12 in [P12_LEGACY_RC2_40, P12_LEGACY_RC2_128] {
+        let parsed = Pfx::parse(p12, PASSWORD).expect("parse OpenSSL legacy RC2 p12");
+        assert_eq!(parsed.certs.len(), 1);
+        assert_eq!(parsed.certs[0], CERT_DER);
+        assert_eq!(parsed.keys.len(), 1);
+        assert_eq!(parsed.keys[0], KEY_PK8);
+        assert!(parsed.friendly_names.iter().any(|n| n == "purecrypto test"));
+    }
+}
+
+#[cfg(not(feature = "legacy-ciphers"))]
+#[test]
+fn openssl_legacy_rc2_needs_legacy_ciphers() {
+    for p12 in [P12_LEGACY_RC2_40, P12_LEGACY_RC2_128] {
+        assert_eq!(
+            Pfx::parse(p12, PASSWORD).unwrap_err(),
+            Error::UnsupportedAlgorithm
+        );
+    }
 }
 
 #[test]

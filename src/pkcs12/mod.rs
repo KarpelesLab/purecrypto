@@ -18,12 +18,16 @@
 //!
 //! | Layer                  | Supported on parse                                  | Emitted by `build` |
 //! |------------------------|-----------------------------------------------------|--------------------|
-//! | Shrouded key envelope  | PBES2 (PBKDF2 + AES-CBC/GCM); PBE-SHA1-3DES (legacy) | PBES2 (PBKDF2-SHA256 + AES-256-CBC) |
-//! | `encryptedData` content| PBES2; PBE-SHA1-3DES (legacy, OpenSSL `-legacy`)    | plaintext certBag  |
+//! | Shrouded key envelope  | PBES2 (PBKDF2 + AES-CBC/GCM); PBE-SHA1-3DES (legacy); PBE-SHA1-RC2-128/40 (`legacy-ciphers`) | PBES2 (PBKDF2-SHA256 + AES-256-CBC) |
+//! | `encryptedData` content| PBES2; PBE-SHA1-3DES (legacy, OpenSSL `-legacy`); PBE-SHA1-RC2-128/40 (`legacy-ciphers`) | plaintext certBag  |
 //! | File MAC               | SHA-based HMAC (SHA-1 / SHA-256); PBMAC1 (PBKDF2)   | SHA-256 SHA-based  |
 //!
-//! The PBE-SHA1-3DES paths use the RFC 7292 Appendix B key derivation; the
-//! 40-bit RC2 variant (`pbeWithSHAAnd40BitRC2-CBC`) is **not** supported.
+//! The PBE-SHA1-3DES and PBE-SHA1-RC2 paths use the RFC 7292 Appendix B key
+//! derivation. `pbeWithSHAAnd128BitRC2-CBC` and `pbeWithSHAAnd40BitRC2-CBC`
+//! (the latter OpenSSL 1.x's default certificate encryption) parse only
+//! with the opt-in `legacy-ciphers` feature, which provides RC2; without it
+//! they are [`Error::UnsupportedAlgorithm`]. The RC4 PBEs are not
+//! supported.
 //!
 //! # Security
 //!
@@ -93,6 +97,12 @@ const OID_LOCAL_KEY_ID: &[u64] = &[1, 2, 840, 113549, 1, 9, 21];
 /// `pbeWithSHAAnd3-KeyTripleDES-CBC` (RFC 7292 §C / appendix) — the legacy
 /// 3DES content/key encryption.
 const OID_PBE_SHA1_3DES: &[u64] = &[1, 2, 840, 113549, 1, 12, 1, 3];
+/// `pbeWithSHAAnd128BitRC2-CBC` (RFC 7292 Appendix C).
+#[cfg(feature = "legacy-ciphers")]
+const OID_PBE_SHA1_RC2_128: &[u64] = &[1, 2, 840, 113549, 1, 12, 1, 5];
+/// `pbeWithSHAAnd40BitRC2-CBC` (RFC 7292 Appendix C).
+#[cfg(feature = "legacy-ciphers")]
+const OID_PBE_SHA1_RC2_40: &[u64] = &[1, 2, 840, 113549, 1, 12, 1, 6];
 
 /// `id-PBES2` (RFC 8018 §A.4).
 const OID_PBES2: &[u64] = &[1, 2, 840, 113549, 1, 5, 13];
@@ -247,8 +257,9 @@ pub enum Error {
     /// The archive has no MacData and integrity could not be checked. We
     /// refuse such files rather than trust unauthenticated contents.
     MissingMac,
-    /// An algorithm OID we do not implement (e.g. 40-bit RC2, an unknown
-    /// MAC PRF, or a PBES2 cipher outside the supported set).
+    /// An algorithm OID we do not implement (e.g. the RC4 PBEs, RC2 without
+    /// the `legacy-ciphers` feature, an unknown MAC PRF, or a PBES2 cipher
+    /// outside the supported set).
     UnsupportedAlgorithm,
     /// Content decryption failed (bad password on an inner encrypted bag,
     /// or corrupt ciphertext).
@@ -740,8 +751,9 @@ fn decrypt_shrouded_key(
 }
 
 /// Dispatches a content/key decryption on the AlgorithmIdentifier `alg`,
-/// covering the legacy `pbeWithSHAAnd3-KeyTripleDES-CBC`. (PBES2 is handled by
-/// the callers, which key it on the raw UTF-8 password.)
+/// covering the legacy `pbeWithSHAAnd3-KeyTripleDES-CBC` and (with
+/// `legacy-ciphers`) the two RC2-CBC PBEs. (PBES2 is handled by the callers,
+/// which key it on the raw UTF-8 password.)
 fn decrypt_pbe_blob(
     alg: &[u8],
     ciphertext: &[u8],
@@ -763,7 +775,49 @@ fn decrypt_pbe_blob(
         budget.charge(iterations, 2)?;
         return pbe_sha1_3des_decrypt(pw_bmp, &salt, iterations, ciphertext);
     }
+    #[cfg(feature = "legacy-ciphers")]
+    if oid == OID_PBE_SHA1_RC2_128 || oid == OID_PBE_SHA1_RC2_40 {
+        // Same pkcs-12PbeParams as above.
+        let mut params = alg_seq.read_sequence()?;
+        let salt = params.read_octet_string()?.to_vec();
+        let iterations = read_iterations(&mut params)?;
+        budget.check_iterations(iterations)?;
+        budget.charge(iterations, 2)?;
+        let key_len = if oid == OID_PBE_SHA1_RC2_128 { 16 } else { 5 };
+        return pbe_sha1_rc2_decrypt(pw_bmp, &salt, iterations, key_len, ciphertext);
+    }
     Err(Error::UnsupportedAlgorithm)
+}
+
+/// Decrypts `pbeWithSHAAnd128BitRC2-CBC` / `pbeWithSHAAnd40BitRC2-CBC`:
+/// derive a `key_len`-byte RC2 key (ID=1, used with `8 · key_len` effective
+/// bits) and an 8-byte IV (ID=2) via the RFC 7292 §B KDF with SHA-1, then
+/// CBC-decrypt and strip PKCS#7 padding.
+#[cfg(feature = "legacy-ciphers")]
+fn pbe_sha1_rc2_decrypt(
+    pw_bmp: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    key_len: usize,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, Error> {
+    use crate::cipher::{Cbc64, Rc2};
+
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(8) {
+        return Err(Error::Decryption);
+    }
+    let mut key = [0u8; 16];
+    let mut iv = [0u8; 8];
+    let key = &mut key[..key_len];
+    derive(PkcsHash::Sha1, pw_bmp, salt, iterations, ID_KEY, key);
+    derive(PkcsHash::Sha1, pw_bmp, salt, iterations, ID_IV, &mut iv);
+
+    let mut buf = ciphertext.to_vec();
+    let mut cbc = Cbc64::new(Rc2::with_effective_bits(key, 8 * key_len), &iv);
+    crate::zeroize::Zeroize::zeroize(key);
+    cbc.decrypt(&mut buf).map_err(|_| Error::Decryption)?;
+
+    strip_pkcs7(buf, 8)
 }
 
 /// Decrypts `pbeWithSHAAnd3-KeyTripleDES-CBC`: derive a 24-byte 3DES key

@@ -113,7 +113,7 @@ x509 = ["der", "rsa", "hash", "alloc", "ec"]
 # password-protected key+certificate bundles OpenSSL emits. Wraps PKCS#8
 # (PBES2 for the shrouded key) and X.509 cert bags, sealed with the RFC 7292
 # Appendix B SHA-based HMAC. Legacy `pbeWithSHAAnd3-KeyTripleDES-CBC` archives
-# parse too (40-bit RC2 is not supported).
+# parse too, and with `legacy-ciphers` the 40- and 128-bit RC2-CBC PBEs.
 pkcs12 = ["x509", "kdf", "cipher", "der", "alloc"]
 # Usable without `alloc`: the fixed-curve primitives (P-256 ECDSA/ECDH, secp256k1
 # ECDSA incl. public-key recovery, X25519, X448, Ed25519, Ed448) and their
@@ -291,9 +291,10 @@ legacy-ec = ["ec", "alloc", "der"]
 # t1 twists, ...).
 ec-custom = ["ec", "alloc"]
 # Ciphers kept for interop and test-vector coverage rather than recommended
-# use: SEED (RFC 4269), MORUS-640/1280, AEGIS-128 (superseded by AEGIS-128L)
-# and the Ascon v1.2 AEADs (superseded by SP 800-232's Ascon-AEAD128, which
-# stays in `ascon`).
+# use: SEED (RFC 4269), TEA/XTEA/XXTEA, Blowfish, CAST5 (RFC 2144), IDEA,
+# RC2 (RFC 2268), MORUS-640/1280, AEGIS-128 (superseded by AEGIS-128L) and
+# the Ascon v1.2 AEADs (superseded by SP 800-232's Ascon-AEAD128, which stays
+# in `ascon`). With `pkcs12`, also enables the RC2 PKCS#12 PBEs.
 legacy-ciphers = ["cipher"]
 # VMAC-64/128 (draft-krovetz-vmac-01), a niche AES-based MAC.
 vmac = ["mac"]

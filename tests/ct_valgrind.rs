@@ -81,9 +81,9 @@ use purecrypto::chunked::{self, Cobblestone128};
 use purecrypto::cipher::{
     Aegis128, Aegis128L, Aes128, Aes128Ccm, Aes128Eax, Aes128Kw, Aes128Kwp, Aes128Xts, Aes192,
     Aes256, Aes256GcmSiv, AesCmac128, AesSiv, Aez, Aria128, BlockCipher, BlockCipher64,
-    Camellia128, Cbc, Cfb, ChaCha20, ChaCha20Poly1305, Ctr, Gcm, Gmac, Idea, Morus640, Morus1280, Ofb,
-    Poly1305, Salsa20, Seed, Sm4, Tea, XChaCha20, XChaCha20Poly1305, XSalsa20, XSalsa20Poly1305,
-    Xtea, Xxtea, hchacha20, hsalsa20, kwp_ciphertext_len,
+    Camellia128, Cbc, Cfb, ChaCha20, ChaCha20Poly1305, Ctr, Gcm, Gmac, Idea, Morus640, Morus1280,
+    Ofb, Poly1305, Salsa20, Seed, Sm4, Tea, XChaCha20, XChaCha20Poly1305, XSalsa20,
+    XSalsa20Poly1305, Xtea, Xxtea, hchacha20, hsalsa20, kwp_ciphertext_len,
 };
 use purecrypto::dh::{DhPrivateKey, group14};
 use purecrypto::dsa::{self, DsaPrivateKey};

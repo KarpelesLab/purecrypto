@@ -169,9 +169,9 @@ pub use kw::{
 pub use morus::{Morus640, Morus1280};
 pub use ofb::{Ofb, Ofb64};
 pub use poly1305::Poly1305;
-pub use salsa20::{Salsa20, XSalsa20, XSalsa20Poly1305, hsalsa20};
 #[cfg(feature = "legacy-ciphers")]
 pub use rc2::Rc2;
+pub use salsa20::{Salsa20, XSalsa20, XSalsa20Poly1305, hsalsa20};
 #[cfg(feature = "legacy-ciphers")]
 pub use seed::Seed;
 #[cfg(feature = "alloc")]
