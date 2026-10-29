@@ -11,6 +11,9 @@
 //! Also provides the [`ChaCha20`] stream cipher and [`Poly1305`] authenticator,
 //! combined as the [`ChaCha20Poly1305`] AEAD (RFC 8439) — both inherently
 //! constant time, built from 32-bit ARX and 130-bit limb arithmetic.
+//! [`ChaCha20`] also offers the original 64-bit-nonce variant and an
+//! OpenSSL-compatible counter carry; [`XChaCha20`] is the 192-bit-nonce
+//! stream.
 //!
 //! SEED ([`Seed`]), MORUS ([`Morus640`] / [`Morus1280`]), the original
 //! CAESAR AEGIS-128 ([`Aegis128`], superseded by [`Aegis128L`]) and the TEA
@@ -126,7 +129,7 @@ pub use cbc::Cbc;
 pub use cbc_hmac::{A128CbcHs256, A192CbcHs384, A256CbcHs512, CbcHmacSha2};
 pub use ccm::{Aes128Ccm, Aes128Ccm8, Aes192Ccm, Aes256Ccm, Aes256Ccm8, Ccm};
 pub use cfb::Cfb;
-pub use chacha20::ChaCha20;
+pub use chacha20::{ChaCha20, XChaCha20, hchacha20};
 pub use chacha20poly1305::ChaCha20Poly1305;
 pub use cmac::{AesCmac128, AesCmac256, Cmac};
 pub use ctr::Ctr;
@@ -325,3 +328,22 @@ impl From<TagMismatch> for AeadError {
         AeadError::TagMismatch
     }
 }
+
+/// Error returned by the fallible stream-cipher entry points
+/// ([`ChaCha20::try_apply_keystream`], [`ChaCha20::apply_keystream_djb`],
+/// [`XChaCha20::apply_keystream`], …) when the request would run the block
+/// counter past the end of its range.
+///
+/// Wrapping the counter would repeat keystream already used under the same
+/// (key, nonce) — a two-time pad — so these functions refuse instead and leave
+/// the buffer untouched: the check happens before any byte is processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterOverflow;
+
+impl core::fmt::Display for CounterOverflow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("stream cipher block counter would overflow")
+    }
+}
+
+impl core::error::Error for CounterOverflow {}

@@ -8,6 +8,42 @@
 //!
 //! A given (key, nonce) pair must **never** be reused with overlapping counter
 //! ranges: as with any stream cipher, keystream reuse destroys confidentiality.
+//!
+//! # Variants and counter overflow
+//!
+//! State words 12..=15 hold the block counter and the nonce; the variants
+//! differ only in where the boundary between them sits:
+//!
+//! | API | words 12..=15 | counter range | libsodium / OpenSSL |
+//! | --- | --- | --- | --- |
+//! | [`ChaCha20::apply_keystream`] / [`try_apply_keystream`](ChaCha20::try_apply_keystream) | `ctr32 ‖ nonce96` (RFC 8439) | `2³²` blocks (256 GiB) | `crypto_stream_chacha20_ietf_xor_ic` |
+//! | [`ChaCha20::apply_keystream_djb`] / [`block_djb`](ChaCha20::block_djb) | `ctr64 ‖ nonce64` (original) | `2⁶⁴` blocks | `crypto_stream_chacha20_xor_ic` |
+//! | [`ChaCha20::apply_keystream_carry`] | `ctr32 ‖ nonce96`, carry into the first nonce word | `2⁶⁴` blocks | OpenSSL `EVP_chacha20` (16-byte IV `ctr32 ‖ nonce96`) |
+//! | [`XChaCha20::apply_keystream`] | HChaCha20 subkey, then `ctr64 ‖ nonce[16..24]` | `2⁶⁴` blocks | `crypto_stream_xchacha20_xor_ic` |
+//!
+//! None of them ever wraps silently, because a wrapped counter replays
+//! keystream already used for this (key, nonce):
+//!
+//! * RFC 8439 defines no carry, so the IETF form stops at `2³²` blocks.
+//!   [`apply_keystream`](ChaCha20::apply_keystream) keeps its historical
+//!   panic there; [`try_apply_keystream`](ChaCha20::try_apply_keystream)
+//!   returns [`CounterOverflow`] instead (libsodium aborts the process).
+//! * [`apply_keystream_carry`](ChaCha20::apply_keystream_carry) is the same
+//!   state layout, but when word 12 wraps it carries into word 13 — the first
+//!   word of the nonce — exactly as OpenSSL does. Output is identical to the
+//!   IETF form up to the `2³²` boundary and continues past it with what
+//!   OpenSSL produces. (OpenSSL lets word 13 itself wrap without further
+//!   carry; that is the `2⁶⁴`-block limit of this form, where it returns
+//!   [`CounterOverflow`].) Use it only where OpenSSL interop is the point:
+//!   the blocks past the boundary belong to a *different* RFC 8439 nonce.
+//! * The 64-bit-counter forms carry between words 12 and 13 naturally and
+//!   return [`CounterOverflow`] only if the counter would pass `2⁶⁴ − 1`,
+//!   which needs a starting counter within a buffer's length of the top.
+//!
+//! In every case the check happens before any byte is touched, so on error
+//! the buffer is unchanged.
+
+use super::CounterOverflow;
 
 /// The ChaCha20 constants — the ASCII string `"expand 32-byte k"` as four
 /// little-endian words (RFC 8439 §2.3).
@@ -51,8 +87,12 @@ fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
 /// subkey from a 256-bit key and a 128-bit nonce. It runs the 20-round ChaCha20
 /// permutation over `constants ‖ key ‖ nonce16` and returns the first and last
 /// four state words **without** the final feed-forward addition. Used to derive
-/// the per-message subkey in XChaCha20-Poly1305.
-pub(crate) fn hchacha20(key: &[u8; 32], nonce16: &[u8; 16]) -> [u8; 32] {
+/// the per-message subkey in [`XChaCha20`] and
+/// [`XChaCha20Poly1305`](super::XChaCha20Poly1305); equivalent to libsodium's
+/// `crypto_core_hchacha20` with the default constant (`c = NULL`).
+///
+/// Constant time. The output is a full-strength key: wipe it when done.
+pub fn hchacha20(key: &[u8; 32], nonce16: &[u8; 16]) -> [u8; 32] {
     let mut s = [0u32; 16];
     s[0..4].copy_from_slice(&CONSTANTS);
     for (word, chunk) in s[4..12].iter_mut().zip(key.chunks_exact(4)) {
@@ -153,6 +193,14 @@ impl ChaCha20 {
         out
     }
 
+    /// Generates the 64-byte keystream block for the original (DJB) layout:
+    /// a 64-bit block `counter` in state words 12–13 and a 64-bit `nonce` in
+    /// words 14–15 (libsodium `crypto_stream_chacha20`).
+    pub fn block_djb(&self, nonce: &[u8; 8], counter: u64) -> [u8; 64] {
+        let n12 = djb_nonce12((counter >> 32) as u32, nonce);
+        self.block(&n12, counter as u32)
+    }
+
     /// XORs the keystream into `buf` in place, starting at block `counter`
     /// (RFC 8439 §2.4). The counter increments per 64-byte block.
     ///
@@ -162,14 +210,121 @@ impl ChaCha20 {
     /// (256 GiB), and the AEAD wrapper at `2^32 − 1` (because counter 0 is
     /// reserved for the Poly1305 OTK). Wrapping would reuse keystream and
     /// catastrophically break confidentiality — fail loud rather than
-    /// silently produce a two-time pad.
+    /// silently produce a two-time pad. Use
+    /// [`try_apply_keystream`](Self::try_apply_keystream) to get an error
+    /// instead, or [`apply_keystream_carry`](Self::apply_keystream_carry) for
+    /// OpenSSL's carry-into-the-nonce behaviour (see the
+    /// [module docs](self#variants-and-counter-overflow)).
     pub fn apply_keystream(&self, nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
-        let blocks_needed = buf.len().div_ceil(64) as u64;
-        let counter_end = (counter as u64) + blocks_needed;
         assert!(
-            counter_end <= u64::from(u32::MAX) + 1,
+            ietf_fits(counter, buf.len()),
             "ChaCha20 counter would overflow 2^32 (buf too large for a single invocation)"
         );
+        self.xor_ctr32(nonce, counter, buf);
+    }
+
+    /// Fallible [`apply_keystream`](Self::apply_keystream): XORs the RFC 8439
+    /// keystream into `buf` starting at block `counter`, or returns
+    /// [`CounterOverflow`] — with `buf` untouched — if that would need more
+    /// than the `2³² − counter` blocks left before the 32-bit counter wraps.
+    /// Matches libsodium's `crypto_stream_chacha20_ietf_xor_ic`, which aborts
+    /// the process in the same case.
+    pub fn try_apply_keystream(
+        &self,
+        nonce: &[u8; 12],
+        counter: u32,
+        buf: &mut [u8],
+    ) -> Result<(), CounterOverflow> {
+        if !ietf_fits(counter, buf.len()) {
+            return Err(CounterOverflow);
+        }
+        self.xor_ctr32(nonce, counter, buf);
+        Ok(())
+    }
+
+    /// XORs the keystream of the original (DJB) ChaCha20 into `buf` in place:
+    /// 64-bit `nonce`, 64-bit block `counter` starting at the given value
+    /// (libsodium `crypto_stream_chacha20_xor_ic`; `counter = 0` gives
+    /// `crypto_stream_chacha20_xor`).
+    ///
+    /// The counter carries from its low word into its high word as the
+    /// original design specifies, so for `counter < 2³²` the output also
+    /// matches [`apply_keystream_carry`](Self::apply_keystream_carry) with a
+    /// nonce of `[0; 4] ‖ nonce`. Returns [`CounterOverflow`], with `buf`
+    /// untouched, only if the counter would pass `2⁶⁴ − 1` — where libsodium
+    /// silently wraps.
+    pub fn apply_keystream_djb(
+        &self,
+        nonce: &[u8; 8],
+        counter: u64,
+        buf: &mut [u8],
+    ) -> Result<(), CounterOverflow> {
+        self.xor_ctr64(counter, nonce, buf)
+    }
+
+    /// XORs the keystream into `buf` in place with OpenSSL's counter
+    /// semantics: the state is laid out as in RFC 8439 (`counter ‖ nonce`,
+    /// i.e. OpenSSL `EVP_chacha20`'s 16-byte IV is `counter` little-endian
+    /// followed by `nonce`), but when the 32-bit block counter wraps it
+    /// carries into the first nonce word instead of stopping.
+    ///
+    /// Byte-identical to [`apply_keystream`](Self::apply_keystream) whenever
+    /// that does not panic. Past the `2³²`-block boundary it reproduces
+    /// OpenSSL's output; note that those blocks are the keystream of a
+    /// different RFC 8439 nonce (first nonce word + 1), so do not mix this
+    /// with nonces chosen as consecutive integers in that word. Returns
+    /// [`CounterOverflow`], with `buf` untouched, if the 64-bit combined
+    /// counter would pass `2⁶⁴ − 1` (where OpenSSL silently wraps).
+    pub fn apply_keystream_carry(
+        &self,
+        nonce: &[u8; 12],
+        counter: u32,
+        buf: &mut [u8],
+    ) -> Result<(), CounterOverflow> {
+        let hi = u32::from_le_bytes([nonce[0], nonce[1], nonce[2], nonce[3]]);
+        let tail: [u8; 8] = nonce[4..].try_into().expect("8 bytes");
+        self.xor_ctr64((u64::from(hi) << 32) | u64::from(counter), &tail, buf)
+    }
+
+    /// The 64-bit-counter driver shared by the DJB, carry and XChaCha20
+    /// forms: words 12–13 are `counter`, words 14–15 `tail`. Splits `buf` at
+    /// each point where the low counter word wraps, so the 32-bit-counter
+    /// kernels below never see a wrap inside the bytes they emit.
+    fn xor_ctr64(
+        &self,
+        counter: u64,
+        tail: &[u8; 8],
+        buf: &mut [u8],
+    ) -> Result<(), CounterOverflow> {
+        let blocks = buf.len().div_ceil(64) as u128;
+        if u128::from(counter) + blocks > 1u128 << 64 {
+            return Err(CounterOverflow);
+        }
+        let mut ctr = counter;
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let lo = ctr as u32;
+            // Blocks left before the low word wraps: 1..=2^32.
+            let seg_blocks = (1u64 << 32) - u64::from(lo);
+            let seg_bytes = usize::try_from(seg_blocks.saturating_mul(64))
+                .unwrap_or(usize::MAX)
+                .min(rest.len());
+            let (seg, tail_buf) = rest.split_at_mut(seg_bytes);
+            self.xor_ctr32(&djb_nonce12((ctr >> 32) as u32, tail), lo, seg);
+            rest = tail_buf;
+            // Only reached with bytes left when the segment ran to the wrap,
+            // so `ctr + seg_blocks` is the next counter and (by the check
+            // above) still in range.
+            if !rest.is_empty() {
+                ctr += seg_blocks;
+            }
+        }
+        Ok(())
+    }
+
+    /// The RFC 8439 keystream XOR without the range check: the caller
+    /// guarantees `counter + ⌈len/64⌉ ≤ 2³²`.
+    fn xor_ctr32(&self, nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
         // On x86_64, generate the keystream many blocks at a time — ChaCha20
         // blocks are independent, so the wide layout needs no diagonal
         // shuffles. AVX-512 does sixteen blocks per pass, AVX2 eight; both are
@@ -213,6 +368,71 @@ impl ChaCha20 {
             let _ = core::hint::black_box(&ks);
             block_counter = block_counter.wrapping_add(1);
         }
+    }
+}
+
+/// Whether `len` bytes starting at block `counter` stay within RFC 8439's
+/// 32-bit counter (`counter + ⌈len/64⌉ ≤ 2³²`).
+#[inline]
+fn ietf_fits(counter: u32, len: usize) -> bool {
+    u64::from(counter) + len.div_ceil(64) as u64 <= 1u64 << 32
+}
+
+/// The RFC 8439-shaped 12-byte "nonce" (state words 13–15) for the 64-bit
+/// counter layout: the counter's high word followed by the 8-byte nonce.
+#[inline]
+fn djb_nonce12(counter_hi: u32, nonce: &[u8; 8]) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[..4].copy_from_slice(&counter_hi.to_le_bytes());
+    n[4..].copy_from_slice(nonce);
+    n
+}
+
+/// The XChaCha20 stream cipher: ChaCha20 with a 192-bit nonce
+/// (draft-irtf-cfrg-xchacha §2.3; libsodium `crypto_stream_xchacha20`).
+///
+/// Each call derives the subkey `HChaCha20(key, nonce[0..16])` and runs the
+/// original 64-bit-counter ChaCha20 with `nonce[16..24]`. With a counter
+/// below `2³²` this is the same keystream that
+/// [`XChaCha20Poly1305`](super::XChaCha20Poly1305) uses (whose inner nonce is
+/// `[0; 4] ‖ nonce[16..24]`). The nonce is long enough to pick at random.
+#[derive(Clone)]
+pub struct XChaCha20 {
+    key: [u8; 32],
+}
+
+impl Drop for XChaCha20 {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for XChaCha20 {}
+
+impl XChaCha20 {
+    /// Creates an XChaCha20 cipher from a 32-byte key.
+    pub fn new(key: &[u8; 32]) -> Self {
+        XChaCha20 { key: *key }
+    }
+
+    /// XORs the keystream for `nonce` into `buf` in place, starting at
+    /// 64-byte block `counter` (libsodium `crypto_stream_xchacha20_xor_ic`;
+    /// `counter = 0` gives `crypto_stream_xchacha20_xor`).
+    ///
+    /// Returns [`CounterOverflow`], with `buf` untouched, only if the 64-bit
+    /// counter would pass `2⁶⁴ − 1`; from `counter = 0` that cannot happen.
+    pub fn apply_keystream(
+        &self,
+        nonce: &[u8; 24],
+        counter: u64,
+        buf: &mut [u8],
+    ) -> Result<(), CounterOverflow> {
+        let n16: &[u8; 16] = nonce[..16].try_into().expect("16 bytes");
+        let tail: &[u8; 8] = nonce[16..].try_into().expect("8 bytes");
+        let mut subkey = hchacha20(&self.key, n16);
+        let inner = ChaCha20::new(&subkey);
+        subkey.zeroize();
+        inner.apply_keystream_djb(tail, counter, buf)
     }
 }
 
@@ -833,6 +1053,245 @@ only one tip for the future, sunscreen would be it.";
         // Keystream is its own inverse: re-applying recovers the plaintext.
         ChaCha20::new(&key).apply_keystream(&nonce, 1, &mut buf);
         assert_eq!(buf, plaintext);
+    }
+
+    /// Key `00..1f`, 24-byte nonce `40..57` (prefixes used for the shorter
+    /// nonces) and the message `00 01 .. c7`: the inputs of the libsodium
+    /// 1.0.20 / OpenSSL 3.5 cross-check vectors below.
+    fn xcheck_inputs() -> ([u8; 32], [u8; 24], [u8; 200]) {
+        (
+            core::array::from_fn(|i| i as u8),
+            core::array::from_fn(|i| 0x40 + i as u8),
+            core::array::from_fn(|i| i as u8),
+        )
+    }
+
+    /// The original ChaCha20 with an all-zero key and nonce
+    /// (draft-agl-tls-chacha20poly1305-04 §7, first vector).
+    #[test]
+    fn djb_zero_vector() {
+        let c = ChaCha20::new(&[0u8; 32]);
+        let expected = from_hex::<64>(
+            "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7\
+             da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586",
+        );
+        assert_eq!(c.block_djb(&[0u8; 8], 0), expected);
+        let mut buf = [0u8; 64];
+        c.apply_keystream_djb(&[0u8; 8], 0, &mut buf).unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    /// `crypto_stream_chacha20_xor_ic` from libsodium, at counter 0 and at
+    /// `2³² − 2`, where the 200 bytes carry the counter into its high word
+    /// (which also exercises the wrap-splitting in front of the wide
+    /// kernels).
+    #[test]
+    fn djb_matches_libsodium() {
+        let (key, nonce, msg) = xcheck_inputs();
+        let n8: [u8; 8] = nonce[..8].try_into().unwrap();
+        let c = ChaCha20::new(&key);
+        let mut buf = msg;
+        c.apply_keystream_djb(&n8, 0, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            from_hex::<200>(
+                "db6544e75e520e6f3457a0722e1d7ee83149d8bb24cec13dba33bc8fd2a2ed47\
+                 dfef89dee3d446e36517df97cc4077db520c09644e2a6ae8cd3557b6f52ec349\
+                 2451a7dbece1425048bbc702e9f70724a075842990f5f77338f0f55b5a568f82\
+                 a744fe6770593fbdd90b8b7383d33bb6cd3ffa7371f01f2dff5ecac803617050\
+                 fdb09f84aaf7a9cf68d32e5eed55dd331d58cceba210b54087e16274df4f3dfe\
+                 33f44fe4d69b7b81761c9216e0086d48ba23cc8be51e9ac37f727e5c6bef3355\
+                 615b8d4c06eb7187"
+            )
+        );
+        let mut buf = msg;
+        c.apply_keystream_djb(&n8, 0xffff_fffe, &mut buf).unwrap();
+        let expected = from_hex::<200>(
+            "3056f1c5f59d5378b7f247dddff565ff1a61ced11cf1e4f869a200fe18f8622a\
+             7c5e1a0652ccd16202ceba34789c38847df0a14362566892417aaf0839d99d32\
+             f1770ff01a8b4561d561db54633f9da6e1c1ff35dd1019b395307cdae03896b1\
+             66f218ab92328ee936cd13c003b2e5290ef9bef166b4a82686b8b0e313a55104\
+             3c2db9ca28bd75616b77789ae77d47d30d597d46de3c01c2b69f67fc0d1a827d\
+             3bad835cb5bd4b5bf74d60df219dd45889729977f5f163a2c10fecf5509e5bfd\
+             357ae2eb31613156",
+        );
+        assert_eq!(buf, expected);
+        // Block by block through `block_djb` agrees.
+        let mut ks = msg;
+        for (i, chunk) in ks.chunks_mut(64).enumerate() {
+            let b = c.block_djb(&n8, 0xffff_fffe + i as u64);
+            for (x, k) in chunk.iter_mut().zip(b.iter()) {
+                *x ^= *k;
+            }
+        }
+        assert_eq!(ks, expected);
+        // …as does the carry form with a zero first nonce word.
+        let mut n12 = [0u8; 12];
+        n12[4..].copy_from_slice(&n8);
+        let mut buf = msg;
+        c.apply_keystream_carry(&n12, 0xffff_fffe, &mut buf)
+            .unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    /// The 64-bit counter may run up to and including `2⁶⁴ − 1`, never past.
+    #[test]
+    fn djb_counter_overflow_is_an_error() {
+        let c = ChaCha20::new(&[3u8; 32]);
+        let mut buf = [0x55u8; 129];
+        assert_eq!(
+            c.apply_keystream_djb(&[0u8; 8], u64::MAX - 1, &mut buf),
+            Err(CounterOverflow)
+        );
+        assert_eq!(buf, [0x55u8; 129], "untouched on error");
+        let mut buf = [0u8; 128];
+        c.apply_keystream_djb(&[0u8; 8], u64::MAX - 1, &mut buf)
+            .unwrap();
+        assert_eq!(buf[64..], c.block_djb(&[0u8; 8], u64::MAX)[..]);
+        // An empty buffer never overflows.
+        c.apply_keystream_djb(&[0u8; 8], u64::MAX, &mut []).unwrap();
+    }
+
+    /// `crypto_stream_chacha20_ietf_xor_ic` from libsodium.
+    #[test]
+    fn ietf_matches_libsodium() {
+        let (key, nonce, msg) = xcheck_inputs();
+        let n12: [u8; 12] = nonce[..12].try_into().unwrap();
+        let mut buf = msg;
+        ChaCha20::new(&key)
+            .try_apply_keystream(&n12, 7, &mut buf)
+            .unwrap();
+        assert_eq!(
+            buf,
+            from_hex::<200>(
+                "92a0a025fa40cbf99f10c1feac62539159a1a44e2b12eb2abe953cc1a80c23fb\
+                 445d85e8adc5d6297243ac0e790af863731b8d4fe146d58d3564228a40c8c214\
+                 a35b056c6f2e046319d636e931f5c2f334695b990a3e66f1d432b59ecd92733d\
+                 9b48b6ef40a4ec3979ecc7997398beb1cb2e1bb636d9789c9bb821c9d95c5010\
+                 8def3f7d8324304ab42e80e55ce36d4b5331ee6a5cbccab86ae2cb8764692c70\
+                 8946cd0b7e926a0f8527c9e0b452391d91fbeecf4023443d9ae4c522250cb23c\
+                 c87d9a723f53f1d3"
+            )
+        );
+    }
+
+    /// The IETF form refuses (libsodium: aborts) to run past `2³²` blocks,
+    /// while the carry form continues exactly as OpenSSL's `EVP_chacha20`.
+    #[test]
+    fn ietf_overflow_and_openssl_carry() {
+        let (key, nonce, msg) = xcheck_inputs();
+        let n12: [u8; 12] = nonce[..12].try_into().unwrap();
+        let c = ChaCha20::new(&key);
+
+        // The last block of the 32-bit range is fine …
+        let mut buf = [0u8; 64];
+        c.try_apply_keystream(&n12, u32::MAX, &mut buf).unwrap();
+        assert_eq!(buf, c.block(&n12, u32::MAX));
+        // … one byte more is not, and leaves the buffer alone.
+        let mut buf = msg;
+        assert_eq!(
+            c.try_apply_keystream(&n12, 0xffff_fffe, &mut buf),
+            Err(CounterOverflow)
+        );
+        assert_eq!(buf, msg);
+        let mut short = [0u8; 65];
+        assert_eq!(
+            c.try_apply_keystream(&n12, u32::MAX, &mut short),
+            Err(CounterOverflow)
+        );
+
+        // OpenSSL 3.5: EVP_chacha20 with IV = fe ff ff ff ‖ n12.
+        let openssl = from_hex::<200>(
+            "673c490d4ca6ddc5f9e0c641aa5b085f2b0069fced2c08647216f1352bf580bd\
+             8d65baad3ab34dcf4049ac1c13c5f7ae600db950678165cc73bba6bff673f818\
+             6ca2517ce61031e33432ed51fbbbe66afd5a51a011e70bd3e7f66194303955b7\
+             b59cf2c9ec89e7fa16a1103834fc4f63c9d81205c36f990921a569d4ddc5dc98\
+             f89f2ece238af4fc2c507c5746a72b602688636d1638013e97d67419bd1005d0\
+             a4c929b8d423c1bfdb6f99a330774aa3554d80b4439da65c8c234b116a40c802\
+             b8bee7719f21b175",
+        );
+        let mut buf = msg;
+        c.apply_keystream_carry(&n12, 0xffff_fffe, &mut buf)
+            .unwrap();
+        assert_eq!(buf, openssl);
+        // Up to the boundary the carry form is the IETF form.
+        let mut a = [7u8; 128];
+        let mut b = a;
+        c.apply_keystream_carry(&n12, 0xffff_fffe, &mut a).unwrap();
+        c.apply_keystream(&n12, 0xffff_fffe, &mut b);
+        assert_eq!(a, b);
+
+        // OpenSSL with IV = fe ff ‖ ff×14: its first two blocks (counter
+        // words up to 2⁶⁴ − 1); OpenSSL then silently wraps to keystream it
+        // already produced for counter 0, which the carry form refuses.
+        let openssl_top = from_hex::<128>(
+            "995808b89abacb7e9be40490c51aa3a176a02c2b7e84a3851fbfe0aecdf511c2\
+             36696cf3272fee51648265d408c821d33d553cf7109daa073c60e4c7b4b807a4\
+             7a352185f6ef57ad52b15b0dd0c1daf6774b1244ae29a700183aab71e888e8da\
+             6e891a901f9f537280b680149904d0681af7b7636d320d2542f202dddfade699",
+        );
+        let ff = [0xffu8; 12];
+        let mut buf: [u8; 128] = msg[..128].try_into().unwrap();
+        c.apply_keystream_carry(&ff, 0xffff_fffe, &mut buf).unwrap();
+        assert_eq!(buf, openssl_top);
+        let mut buf = msg;
+        assert_eq!(
+            c.apply_keystream_carry(&ff, 0xffff_fffe, &mut buf),
+            Err(CounterOverflow)
+        );
+        assert_eq!(buf, msg);
+    }
+
+    /// libsodium `crypto_core_hchacha20` and `crypto_stream_xchacha20_xor_ic`
+    /// (counter `2³² − 2`, so the 64-bit counter carries).
+    #[test]
+    fn xchacha20_matches_libsodium() {
+        let (key, nonce, msg) = xcheck_inputs();
+        let n16: [u8; 16] = nonce[..16].try_into().unwrap();
+        assert_eq!(
+            hchacha20(&key, &n16),
+            from_hex::<32>("001b38f1bc654a0470f0172049103eccb67d8bb16b11d2a468db66a2dd53d47d")
+        );
+        let x = XChaCha20::new(&key);
+        let mut buf = msg;
+        x.apply_keystream(&nonce, 0xffff_fffe, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            from_hex::<200>(
+                "77d5d28d9de11cde63b48477ea8de070b6d8316dc6403009c44aff78fe04b0bb\
+                 14bf77d2c2f2d978c6f94d6eff0f03cc22496971543e8b3a14421c26147e8f25\
+                 fb049f571cab9236d3f229723612b9ed1b6d1e30a87af433b1b2e42dbd1a3d7f\
+                 62672e9f4ec76c507e78ca9522271b1f04561fe62914f9246d549eeb5f262855\
+                 f988d94a8dbb5326f49670757d0048b3edf6b3925fa53ae02b2bab98ac6cad2b\
+                 fc5522a9e34179dcc911bf000b69d69848917abf1167140d52c6c7fefe91f6a2\
+                 cdc2a3ecc6071683"
+            )
+        );
+        x.apply_keystream(&nonce, 0xffff_fffe, &mut buf).unwrap();
+        assert_eq!(buf, msg);
+    }
+
+    /// XChaCha20 at counter 1 is the keystream XChaCha20-Poly1305 encrypts
+    /// with (draft-irtf-cfrg-xchacha §A.3.1 plaintext and ciphertext).
+    #[test]
+    fn xchacha20_matches_aead_keystream() {
+        let key =
+            from_hex::<32>("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+        let nonce = from_hex::<24>("404142434445464748494a4b4c4d4e4f5051525354555657");
+        let mut buf = *b"Ladies and Gentlemen of the class of '99: If I could offer you \
+only one tip for the future, sunscreen would be it.";
+        XChaCha20::new(&key)
+            .apply_keystream(&nonce, 1, &mut buf)
+            .unwrap();
+        assert_eq!(
+            buf,
+            from_hex::<114>(
+                "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb\
+                 731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b452\
+                 2f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff9\
+                 21f9664c97637da9768812f615c68b13b52e"
+            )
+        );
     }
 
     /// The AVX2 8-way keystream must equal the scalar block path for every
