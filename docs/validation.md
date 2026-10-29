@@ -120,7 +120,7 @@ file whose cases were all skipped fails. Coverage at the time of writing:
 
 | Family | Files | Cases (valid / invalid / acceptable) | Notes |
 |---|---|---|---|
-| AEADs (AES/ARIA/SM4/SEED-GCM, GCM-SIV, AES/ARIA/Camellia/SM4/SEED-CCM, AES-EAX, ChaCha20-/XChaCha20-Poly1305, AEGIS-128/128L/256, MORUS-640/1280, Ascon-128/128a/80pq and Ascon-AEAD128, GMAC, A128/192/256CBC-HS) | 26 | 5700 / 2565 / 0 | all tag lengths CCM defines; wrong-length nonces/keys rejected via the `try_*` APIs |
+| AEADs (AES/ARIA/SM4/SEED-GCM, GCM-SIV, AES/ARIA/Camellia/SM4/SEED-CCM, AES-EAX, ChaCha20-/XChaCha20-Poly1305, AEGIS-128/128L/256, MORUS-640/1280, Ascon-128/128a/80pq and Ascon-AEAD128, GMAC, A128/192/256CBC-HS) | 26 | 5700 / 2565 / 0 | all tag lengths CCM defines; truncated GCM tags (4..=16 bytes) through `try_{en,de}crypt_truncated`; wrong-length nonces/keys rejected via the `try_*` APIs |
 | Block-cipher modes (CBC/PKCS#7, CMAC, AES-SIV incl. AES-192, KW/KWP, XTS over AES/ARIA/Camellia/SEED) | 15 | 1150 / 2910 / 10 | `Cbc` is unpadded by design; the harness pads |
 | HMAC (SHA-1/2/3, SHA-512/t, SM3), KMAC, SipHash-1-3/2-4/4-8, SipHashX, VMAC-64/128 | 21 | 2089 / 2154 / 0 | truncated tags prefix-compared; `verify` is length-strict; VMAC nonces with the top bit set rejected |
 | HKDF, PBKDF2, PBES2 | 24 | 1884 / 12 / 0 | one PBKDF2 case skipped (16M iterations); PBES2 vectors are the bare RFC 8018 primitive, checked through PBKDF2 + CBC and — where in the wrapper's algorithm set — asserted to hit the 10 000-iteration floor |

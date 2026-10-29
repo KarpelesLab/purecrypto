@@ -93,52 +93,59 @@ macro_rules! keyed {
     }};
 }
 
-fn gcm_with<C: BlockCipher>(cipher: C, _group: &Fields, case: &Fields) -> Outcome {
+fn gcm_with<C: BlockCipher>(cipher: C, group: &Fields, case: &Fields) -> Outcome {
     let gcm = Gcm::new(cipher);
+    let tag_len = group.int("tagSize") as usize / 8;
+    if tag_len == 16 {
+        return aead_case(
+            case,
+            |iv, aad, buf| gcm.try_encrypt(iv, aad, buf).ok().map(|t| t.to_vec()),
+            |iv, aad, buf, tag| {
+                let tag: [u8; 16] = tag.try_into().ok()?;
+                Some(gcm.try_decrypt(iv, aad, buf, &tag).is_ok())
+            },
+        );
+    }
+    // Truncated-tag groups go through the `*_truncated` entry points, which
+    // take 4..=16-byte tags and report any other length.
     aead_case(
         case,
-        |iv, aad, buf| gcm.try_encrypt(iv, aad, buf).ok().map(|t| t.to_vec()),
-        |iv, aad, buf, tag| {
-            let tag: [u8; 16] = tag.try_into().ok()?;
-            Some(gcm.try_decrypt(iv, aad, buf, &tag).is_ok())
+        |iv, aad, buf| {
+            let mut tag = vec![0u8; tag_len];
+            gcm.try_encrypt_truncated(iv, aad, buf, &mut tag)
+                .ok()
+                .map(|()| tag)
+        },
+        |iv, aad, buf, tag| match gcm.try_decrypt_truncated(iv, aad, buf, tag) {
+            Ok(()) => Some(true),
+            Err(purecrypto::cipher::AeadError::TagMismatch) => Some(false),
+            Err(_) => None,
         },
     )
 }
 
-/// GCM vectors also carry truncated-tag groups; only the full 128-bit tag is
-/// exposed by the API, so those are skipped.
-fn gcm_group_ok(group: &Fields) -> bool {
-    group.int("tagSize") == 128
-}
-
 #[test]
 fn aes_gcm() {
-    check("aes_gcm", |group, case| {
-        if !gcm_group_ok(group) {
-            return Outcome::Skipped;
-        }
-        keyed!(group, case, gcm_with; 16 => Aes128, 24 => Aes192, 32 => Aes256)
-    });
+    check(
+        "aes_gcm",
+        |group, case| keyed!(group, case, gcm_with; 16 => Aes128, 24 => Aes192, 32 => Aes256),
+    );
 }
 
 #[test]
 fn aria_gcm() {
-    check("aria_gcm", |group, case| {
-        if !gcm_group_ok(group) {
-            return Outcome::Skipped;
-        }
-        keyed!(group, case, gcm_with; 16 => Aria128, 24 => Aria192, 32 => Aria256)
-    });
+    check(
+        "aria_gcm",
+        |group, case| keyed!(group, case, gcm_with; 16 => Aria128, 24 => Aria192, 32 => Aria256),
+    );
 }
 
 #[test]
 fn sm4_gcm() {
-    check("sm4_gcm", |group, case| {
-        if !gcm_group_ok(group) {
-            return Outcome::Skipped;
-        }
-        keyed!(group, case, gcm_with; 16 => Sm4)
-    });
+    check(
+        "sm4_gcm",
+        |group, case| keyed!(group, case, gcm_with; 16 => Sm4),
+    );
 }
 
 /// CCM with an `M`-byte tag. `try_new` reports the tag lengths CCM does not
@@ -379,12 +386,10 @@ fn aes_eax() {
 #[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]
 #[test]
 fn seed_gcm() {
-    check("seed_gcm", |group, case| {
-        if !gcm_group_ok(group) {
-            return Outcome::Skipped;
-        }
-        keyed!(group, case, gcm_with; 16 => Seed)
-    });
+    check(
+        "seed_gcm",
+        |group, case| keyed!(group, case, gcm_with; 16 => Seed),
+    );
 }
 
 #[cfg(all(feature = "legacy-ciphers", feature = "ascon"))]

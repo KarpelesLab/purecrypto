@@ -488,12 +488,83 @@ impl<C: BlockCipher> Gcm<C> {
         buffer: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<(), AeadError> {
+        self.decrypt_inner(nonce, aad, buffer, tag)
+    }
+
+    /// Smallest truncated tag [`try_encrypt_truncated`](Self::try_encrypt_truncated)
+    /// / [`try_decrypt_truncated`](Self::try_decrypt_truncated) accept, in bytes.
+    pub const MIN_TAG_LEN: usize = 4;
+
+    /// Encrypts `buffer` in place and writes a **truncated** authentication
+    /// tag of `tag.len()` bytes — the leftmost `tag.len()` bytes of the full
+    /// 16-byte tag (NIST SP 800-38D §5.2.1.2, `MSB_t`).
+    ///
+    /// Any length in `4..=16` is accepted, matching OpenSSL's
+    /// `EVP_CTRL_GCM_SET_TAG` / PHP's `openssl_encrypt(…, $tag, …, $tag_length)`.
+    /// SP 800-38D itself only approves 16, 15, 14, 13 and 12 bytes in general,
+    /// and 8 or 4 bytes under the strict message-length / invocation limits
+    /// of its Appendix C; shorter tags make forgeries proportionally cheaper,
+    /// so use them only for interoperability. Every other length is rejected
+    /// with [`AeadError::InvalidTagLength`] (before `buffer` is touched).
+    ///
+    /// Other errors are as for [`try_encrypt`](Self::try_encrypt).
+    pub fn try_encrypt_truncated(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        buffer: &mut [u8],
+        tag: &mut [u8],
+    ) -> Result<(), AeadError> {
+        Self::check_tag_len(tag.len())?;
+        let full = self.try_encrypt(nonce, aad, buffer)?;
+        tag.copy_from_slice(&full[..tag.len()]);
+        Ok(())
+    }
+
+    /// Verifies a **truncated** tag (`tag.len()` in `4..=16`, see
+    /// [`try_encrypt_truncated`](Self::try_encrypt_truncated)) and, only if it
+    /// matches, decrypts `buffer` in place.
+    ///
+    /// The leftmost `tag.len()` bytes of the recomputed tag are compared with
+    /// `tag` in constant time. A tag length outside `4..=16` is reported as
+    /// [`AeadError::InvalidTagLength`]; everything else — including the buffer
+    /// contract on [`AeadError::TagMismatch`] — is as for
+    /// [`try_decrypt`](Self::try_decrypt).
+    pub fn try_decrypt_truncated(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        buffer: &mut [u8],
+        tag: &[u8],
+    ) -> Result<(), AeadError> {
+        Self::check_tag_len(tag.len())?;
+        self.decrypt_inner(nonce, aad, buffer, tag)
+    }
+
+    fn check_tag_len(len: usize) -> Result<(), AeadError> {
+        if (Self::MIN_TAG_LEN..=16).contains(&len) {
+            Ok(())
+        } else {
+            Err(AeadError::InvalidTagLength)
+        }
+    }
+
+    /// Shared decrypt path: `tag` is 1..=16 bytes (validated by the callers)
+    /// and is compared against the same-length prefix of the full tag.
+    fn decrypt_inner(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        buffer: &mut [u8],
+        tag: &[u8],
+    ) -> Result<(), AeadError> {
         Self::validate(nonce, buffer)?;
+        let t = tag.len();
         let j0 = self.j0(nonce);
         #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         if let Some(expected) = self.crypt_fused(j0, aad, buffer, false) {
             // The accept/reject verdict is the public outcome of decryption.
-            if expected.ct_eq(tag).declassify() {
+            if expected[..t].ct_eq(tag).declassify() {
                 return Ok(());
             }
             // The stitched pass decrypts while it hashes, so `buffer` already
@@ -506,7 +577,7 @@ impl<C: BlockCipher> Gcm<C> {
         // GHASH is computed over the ciphertext, which is still in `buffer`.
         let expected = self.tag(j0, aad, buffer);
         // The accept/reject verdict is the public outcome of decryption.
-        if !expected.ct_eq(tag).declassify() {
+        if !expected[..t].ct_eq(tag).declassify() {
             return Err(AeadError::TagMismatch);
         }
         self.gctr(inc32(j0), buffer);
@@ -1014,5 +1085,78 @@ mod tests {
         let g = gcm128("00000000000000000000000000000000");
         let mut buf = [0u8; 4];
         let _ = g.encrypt(&[], b"", &mut buf);
+    }
+    /// Truncated tags are the leftmost `t` bytes of the full tag (SP 800-38D
+    /// `MSB_t`). Checked on McGrew–Viega TC4 and on a 37-byte message whose
+    /// ciphertext and every truncated tag were produced by OpenSSL 3.5
+    /// (`EVP_aes_128_gcm`, `EVP_CTRL_GCM_GET_TAG` with lengths 4..16).
+    #[test]
+    fn truncated_tags() {
+        use std::vec::Vec;
+        let g = gcm128("feffe9928665731c6d6a8f9467308308");
+        let nonce = from_hex::<12>("cafebabefacedbaddecaf888");
+        let aad = from_hex::<20>("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+
+        // TC4: the 96-, 104-, 112- and 120-bit truncations of 5bc94fbc….
+        let pt = from_hex::<60>(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72\
+             1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39",
+        );
+        let full = from_hex::<16>("5bc94fbc3221a5db94fae95ae7121a47");
+        for t in [4usize, 8, 12, 13, 14, 15, 16] {
+            let mut buf = pt;
+            let mut tag = [0u8; 16];
+            g.try_encrypt_truncated(&nonce, &aad, &mut buf, &mut tag[..t])
+                .unwrap();
+            assert_eq!(&tag[..t], &full[..t], "t={t}");
+            assert_eq!(
+                g.try_decrypt_truncated(&nonce, &aad, &mut buf, &full[..t]),
+                Ok(())
+            );
+            assert_eq!(buf, pt);
+        }
+
+        // OpenSSL 3.5 cross-check: 37-byte message 00 01 .. 24, 4-byte tag.
+        let msg: Vec<u8> = (0u8..37).collect();
+        let ct = from_hex::<37>(
+            "9bb32ee4ddf674c6e62222792728fc09751c9a6f2d23452d03945405bf8035431dc83a04e5",
+        );
+        let ossl_tag = from_hex::<16>("ab8d224bb691691aa4ad4b4dfc686439");
+        let mut buf = msg.clone();
+        let mut tag4 = [0u8; 4];
+        g.try_encrypt_truncated(&nonce, &aad, &mut buf, &mut tag4)
+            .unwrap();
+        assert_eq!(buf, ct);
+        assert_eq!(tag4, ossl_tag[..4]);
+
+        // A flipped bit in the truncated tag is rejected, ciphertext intact.
+        let mut bad = ossl_tag;
+        bad[7] ^= 0x80;
+        assert_eq!(
+            g.try_decrypt_truncated(&nonce, &aad, &mut buf, &bad[..8]),
+            Err(AeadError::TagMismatch)
+        );
+        assert_eq!(buf, ct);
+        // Bytes past the truncation point are not part of the tag.
+        assert_eq!(
+            g.try_decrypt_truncated(&nonce, &aad, &mut buf, &bad[..7]),
+            Ok(())
+        );
+        assert_eq!(buf, msg);
+
+        // Lengths outside 4..=16 are refused before anything is touched.
+        for t in [0usize, 1, 3, 17] {
+            let mut tag = [0u8; 17];
+            let mut b = msg.clone();
+            assert_eq!(
+                g.try_encrypt_truncated(&nonce, &aad, &mut b, &mut tag[..t]),
+                Err(AeadError::InvalidTagLength)
+            );
+            assert_eq!(b, msg);
+            assert_eq!(
+                g.try_decrypt_truncated(&nonce, &aad, &mut b, &tag[..t]),
+                Err(AeadError::InvalidTagLength)
+            );
+        }
     }
 }
