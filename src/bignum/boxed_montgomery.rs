@@ -73,7 +73,7 @@ pub struct BoxedMontModulus {
     r2: Vec<Limb>,
     limbs: usize,
     /// The AVX-512 IFMA form of the modulus, built when the CPU has IFMA
-    /// (see [`super::ifma`]); the exponentiations use it whenever the
+    /// (see `bignum::ifma`); the exponentiations use it whenever the
     /// portable-dispatch override is off.
     #[cfg(target_arch = "x86_64")]
     ifma: Option<IfmaModulus>,
@@ -418,7 +418,7 @@ impl BoxedMontModulus {
     /// only, leaking nothing about `base` or the exponent's bits.
     ///
     /// On x86_64 CPUs with AVX-512 IFMA the same ladder runs on the 52-bit
-    /// radix kernels of [`super::ifma`] (5-bit windows, 32-entry table), with
+    /// radix kernels of `bignum::ifma` (5-bit windows, 32-entry table), with
     /// the identical constant-time structure.
     pub fn pow_bits(&self, base: &BoxedUint, exp: &BoxedUint, bits: usize) -> BoxedUint {
         #[cfg(target_arch = "x86_64")]

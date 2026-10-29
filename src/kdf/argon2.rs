@@ -16,7 +16,7 @@
 //! chosen.
 //!
 //! [`argon2`] fills the lanes one after another on the calling thread. With
-//! `std`, [`argon2_threaded`] fills the `parallelism` lanes of each slice on
+//! `std`, `argon2_threaded` fills the `parallelism` lanes of each slice on
 //! up to that many scoped threads instead. Both produce the same output: the
 //! slice structure already makes the lanes of a slice independent of one
 //! another.
@@ -79,7 +79,7 @@ pub struct Argon2Params {
     /// Memory cost in KiB (`m`).
     pub m_cost_kib: u32,
     /// Lane count / parallelism (`p`). [`argon2`] computes the lanes
-    /// sequentially; [`argon2_threaded`] can run them on separate threads.
+    /// sequentially; `argon2_threaded` can run them on separate threads.
     pub parallelism: u32,
     /// Variant.
     pub variant: Argon2Type,
@@ -124,7 +124,7 @@ impl core::error::Error for Error {}
 /// recommended).
 ///
 /// Runs entirely on the calling thread, whatever `parallelism` is; see
-/// [`argon2_threaded`] for a multi-threaded fill.
+/// `argon2_threaded` for a multi-threaded fill.
 ///
 /// # Untrusted parameters
 ///
