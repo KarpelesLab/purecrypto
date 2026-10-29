@@ -138,11 +138,12 @@ ed25519-table = ["ec"]
 # binary, slower signing and verification. Leave it out on flash-constrained
 # targets.
 ed448-table = ["ec"]
-# The precomputed fixed-base comb table for P-256 (~61 KB of static data)
+# The precomputed fixed-base comb table for P-256 (~52 KB of static data)
 # behind P-256 ECDSA signing, key generation and ECDH key generation. Without
 # it `[k]G` falls back to the constant-time windowed ladder and ECDSA
 # verification to an interleaved double-scalar multiplication: identical
-# results, a smaller binary, slower signing and key generation.
+# results, a smaller binary, slower signing and key generation, and slightly
+# slower verification (whose width-6 wNAF table for `G` is the first window).
 p256-table = ["ec"]
 # The precomputed fixed-base comb table for secp256k1 (~61 KB of static data)
 # behind secp256k1 ECDSA / BIP340 signing and key generation, the secp256k1

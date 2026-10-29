@@ -98,14 +98,34 @@ compressions. The AVX2 build of the kernel (CPUs without AVX-512VL) is about
 |---|--:|--:|
 | RSA-2048 sign (PKCS#1 v1.5) | 117 | 8517 |
 | RSA-2048 verify | 25 269 | 39.6 |
-| ECDSA P-256 sign | 6 378 | 156.8 |
-| ECDSA P-256 verify | 3 489 | 286.6 |
+| ECDSA P-256 sign | 94 200 | 10.6 ¹ |
+| ECDSA P-256 verify | 23 900 | 41.9 ¹ |
 | Ed25519 sign | 4 973 | 201.1 |
 | Ed25519 verify | 4 850 | 206.2 |
 | X25519 (Diffie–Hellman) | 18 843 | 53.1 |
 | ML-KEM-768 keygen | 43 287 | 23.1 |
 | ML-KEM-768 encapsulate | 42 846 | 23.3 |
 | ML-KEM-768 decapsulate | 35 157 | 28.4 |
+
+¹ The P-256 rows were remeasured after the P-256 performance pass on a
+different machine (AMD Ryzen Threadripper PRO 9995WX, rustc 1.97, pinned
+with `taskset` to one core, median of five runs on random cores), next to
+`openssl speed -seconds 3 ecdsap256 ecdhp256` (OpenSSL 3, assembly
+`ecp_nistz256`) pinned the same way:
+
+| P-256 operation | purecrypto µs/op | OpenSSL µs/op |
+|---|--:|--:|
+| ECDSA sign (SHA-256, RFC 6979) | 10.6 | 11.3 |
+| ECDSA verify | 41.9 | 34.8 |
+| ECDH (shared secret) | 40.6 | 26.4 |
+| Key generation (`d·G`) | 8.6 | — |
+
+Signing and key generation run the constant-time 5-bit comb over
+Jacobian mixed additions; ECDH the constant-time 4-bit window ladder in
+Jacobian coordinates; verification a variable-time interleaved wNAF
+(width 6 for `G`, 5 for `Q`). The remaining verify / ECDH gap is the field
+multiplication: OpenSSL's hand-written `mulx`/`adx` kernel against
+portable `u128` Rust.
 
 ## Constant-time tradeoffs
 
@@ -123,8 +143,8 @@ constant-time, no-foreign-code implementations. That shapes the numbers:
   for the Weierstrass curves, the Montgomery ladder for X25519/X448, fixed
   double-and-add for Ed25519) with no secret-dependent table lookups or
   branches. That is slower than the variable-time windowed/precomputed-table
-  methods fast libraries use, and the P-256 field arithmetic in particular is
-  not yet fully optimised. We trade raw speed for the constant-time property and
+  methods fast libraries use (P-256 signing is the exception, at parity with
+  OpenSSL — see the note under the table). We trade raw speed for the constant-time property and
   the no-assembly portability.
 - **RSA private-key ops are blinded** (per-call base blinding), which adds a
   modular multiply but removes the timing dependence on the private exponent.
