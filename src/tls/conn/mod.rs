@@ -2946,8 +2946,8 @@ mod loopback_tests {
             }
         }
         assert!(
-            matches!(server_err, Some(crate::tls::Error::BadCertificate)),
-            "expected BadCertificate from server, got {server_err:?}"
+            matches!(server_err, Some(crate::tls::Error::UnknownIssuer)),
+            "expected UnknownIssuer from server, got {server_err:?}"
         );
     }
 
@@ -4850,7 +4850,7 @@ mod loopback_tests {
 
         assert_eq!(
             drive_until_client_error(&mut client, &mut server),
-            crate::tls::Error::BadCertificate
+            crate::tls::Error::CertificateExpired
         );
     }
 
@@ -4970,7 +4970,7 @@ mod loopback_tests {
         let mut server = ServerConnection::new(server_config, srng);
         assert_eq!(
             drive_until_client_error(&mut client, &mut server),
-            crate::tls::Error::BadCertificate
+            crate::tls::Error::CertificateRevoked
         );
     }
 

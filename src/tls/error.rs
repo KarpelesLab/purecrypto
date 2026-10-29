@@ -82,6 +82,23 @@ impl AlertDescription {
     /// [`INAPPROPRIATE_FALLBACK`](Self::INAPPROPRIATE_FALLBACK).
     pub const TOO_MANY_CIDS_REQUESTED: AlertDescription = AlertDescription::Unknown(52);
 
+    /// `certificate_revoked` (44) — RFC 8446 §6.2: the peer's certificate
+    /// was revoked by its signer. Spelled as an associated constant for the
+    /// same reason as [`INAPPROPRIATE_FALLBACK`](Self::INAPPROPRIATE_FALLBACK).
+    pub const CERTIFICATE_REVOKED: AlertDescription = AlertDescription::Unknown(44);
+
+    /// `unknown_ca` (48) — RFC 8446 §6.2: a valid chain was received but no
+    /// trusted CA issued it (OpenSSL reports it as `tlsv1 alert unknown ca`).
+    /// Spelled as an associated constant for the same reason as
+    /// [`INAPPROPRIATE_FALLBACK`](Self::INAPPROPRIATE_FALLBACK).
+    pub const UNKNOWN_CA: AlertDescription = AlertDescription::Unknown(48);
+
+    /// `access_denied` (49) — RFC 8446 §6.2: a valid certificate was
+    /// received, but access control refused the peer. Spelled as an
+    /// associated constant for the same reason as
+    /// [`INAPPROPRIATE_FALLBACK`](Self::INAPPROPRIATE_FALLBACK).
+    pub const ACCESS_DENIED: AlertDescription = AlertDescription::Unknown(49);
+
     /// The 8-bit wire encoding.
     pub fn as_u8(self) -> u8 {
         match self {
@@ -153,7 +170,16 @@ pub enum Error {
     HandshakeFailure,
     /// The negotiated/offered version is unsupported.
     UnsupportedVersion,
-    /// The peer's certificate could not be validated.
+    /// The peer's certificate could not be validated (maps to
+    /// `bad_certificate`): it is malformed, a chain signature does not verify
+    /// or uses an algorithm / key size the signature policy refuses, the
+    /// leaf does not match the expected host name, a constraint is violated,
+    /// or the key is distrusted. The more specific chain failures have
+    /// variants of their own: [`UnknownIssuer`](Self::UnknownIssuer),
+    /// [`CertificateExpired`](Self::CertificateExpired),
+    /// [`CertificateRevoked`](Self::CertificateRevoked) and, for a
+    /// [`CertificateVerifier`](crate::tls::CertificateVerifier) rejection,
+    /// [`CertificateRejected`](Self::CertificateRejected).
     BadCertificate,
     /// A signature (CertificateVerify or chain) failed to verify.
     PeerMisbehaved,
@@ -196,8 +222,23 @@ pub enum Error {
     /// Server required a client certificate but the client did not present
     /// one. Maps to `certificate_required`.
     CertificateRequired,
-    /// A stapled OCSP response (RFC 6066 + RFC 6960) reports the peer's
-    /// certificate as `revoked`. Maps to `bad_certificate`.
+    /// The peer's chain does not lead to a trust anchor: the issuer of its
+    /// topmost certificate is neither in the trust store nor in the chain
+    /// (a self-signed certificate that is not trusted included). Maps to
+    /// `unknown_ca` (48), as in OpenSSL and rustls.
+    UnknownIssuer,
+    /// A certificate in the peer's chain is outside its validity period at
+    /// the verification time: expired, or not yet valid. Maps to
+    /// `certificate_expired` (45), as in OpenSSL and rustls.
+    CertificateExpired,
+    /// The handshake was refused with this alert: a
+    /// [`CertificateVerifier`](crate::tls::CertificateVerifier) rejected the
+    /// peer's certificate. The alert is sent to the peer as is.
+    CertificateRejected(AlertDescription),
+    /// The peer's certificate (or one in its chain) is revoked: a stapled
+    /// OCSP response (RFC 6066 + RFC 6960) reports it `revoked`, or a CRL in
+    /// [`Config::crls`](crate::tls::Config::crls) (or a stapled one) lists
+    /// it. Maps to `certificate_revoked` (44).
     CertificateRevoked,
     /// A stapled OCSP response is malformed, signed by an unrecognised
     /// authority, outside its validity window, or reports `unknown` for the
@@ -337,7 +378,12 @@ impl core::fmt::Display for Error {
                 f.write_str("TLS_FALLBACK_SCSV offered below our maximum version")
             }
             Error::CertificateRequired => f.write_str("server required a client certificate"),
-            Error::CertificateRevoked => f.write_str("peer certificate revoked (stapled OCSP)"),
+            Error::CertificateRevoked => f.write_str("peer certificate revoked"),
+            Error::UnknownIssuer => f.write_str("peer certificate issued by an unknown CA"),
+            Error::CertificateExpired => f.write_str("peer certificate expired or not yet valid"),
+            Error::CertificateRejected(a) => {
+                write!(f, "peer certificate rejected by the verifier ({a:?})")
+            }
             Error::OcspResponseInvalid => f.write_str("stapled OCSP response invalid"),
             #[cfg(feature = "ech")]
             Error::EchRejected(_) => f.write_str("ECH rejected; retry_configs available"),
@@ -379,3 +425,39 @@ impl core::fmt::Display for Error {
 }
 
 impl core::error::Error for Error {}
+
+impl Error {
+    /// `true` for every error that says the peer's certificate was not
+    /// accepted: [`BadCertificate`](Self::BadCertificate),
+    /// [`UnknownIssuer`](Self::UnknownIssuer),
+    /// [`CertificateExpired`](Self::CertificateExpired),
+    /// [`CertificateRevoked`](Self::CertificateRevoked),
+    /// [`OcspResponseInvalid`](Self::OcspResponseInvalid) and
+    /// [`CertificateRejected`](Self::CertificateRejected). Handy for code
+    /// that matched `BadCertificate` alone before the specific chain
+    /// failures got variants of their own.
+    pub fn is_certificate_error(&self) -> bool {
+        matches!(
+            self,
+            Error::BadCertificate
+                | Error::UnknownIssuer
+                | Error::CertificateExpired
+                | Error::CertificateRevoked
+                | Error::OcspResponseInvalid
+                | Error::CertificateRejected(_)
+        )
+    }
+
+    /// The alert a certificate-verification failure is answered with, for
+    /// the errors whose alert is the same in every engine; `None` leaves the
+    /// choice to the engine's own table.
+    pub(crate) fn certificate_alert(&self) -> Option<AlertDescription> {
+        match self {
+            Error::UnknownIssuer => Some(AlertDescription::UNKNOWN_CA),
+            Error::CertificateExpired => Some(AlertDescription::CertificateExpired),
+            Error::CertificateRevoked => Some(AlertDescription::CERTIFICATE_REVOKED),
+            Error::CertificateRejected(a) => Some(*a),
+            _ => None,
+        }
+    }
+}

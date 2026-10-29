@@ -13,7 +13,7 @@ use core::time::Duration;
 use crate::rng::{CryptoRng, RngCore};
 
 use super::config::Config;
-use super::error::Error;
+use super::error::{AlertDescription, Error};
 use super::groups::NamedGroup;
 #[cfg(feature = "dtls")]
 use super::opts::DtlsOpts;
@@ -164,6 +164,9 @@ pub struct Connection {
     /// The in-flight external signing operation, while [`Connection::drive`] is
     /// waiting on the signer's device.
     active_sign: Option<Box<dyn super::signer::SignOp>>,
+    /// Set by [`Connection::abort_with_alert`]: the connection is dead and
+    /// only drains its queued output.
+    aborted: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -234,6 +237,8 @@ struct ServerConnectionAuto {
     config: Option<Config>,
     /// The selected engine, once the version is known.
     resolved: Option<ResolvedServer>,
+    /// A fatal alert queued by [`Self::abort`] before any engine existed.
+    aborted_out: Vec<u8>,
 }
 
 impl ServerConnectionAuto {
@@ -297,7 +302,27 @@ impl ServerConnectionAuto {
         match &mut self.resolved {
             Some(ResolvedServer::Tls13(c)) => c.write_tls(),
             Some(ResolvedServer::Tls12(c)) => c.write_tls(),
-            None => Vec::new(),
+            None => core::mem::take(&mut self.aborted_out),
+        }
+    }
+
+    /// Queues a fatal alert and closes. Before the ClientHello resolved the
+    /// version there is no engine (and no key): the alert goes out as a
+    /// plaintext record, and nothing further is ever processed.
+    fn abort(&mut self, description: AlertDescription) {
+        match &mut self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.abort(description),
+            Some(ResolvedServer::Tls12(c)) => c.abort(description),
+            None => {
+                self.config = None;
+                self.buffered = Vec::new();
+                let _ = super::codec::write_record(
+                    &mut self.aborted_out,
+                    super::ContentType::Alert,
+                    ProtocolVersion::TLSv1_2,
+                    &[2, description.as_u8()],
+                );
+            }
         }
     }
 
@@ -417,7 +442,7 @@ impl ServerConnectionAuto {
         match &self.resolved {
             Some(ResolvedServer::Tls13(c)) => c.wants_write(),
             Some(ResolvedServer::Tls12(c)) => c.wants_write(),
-            None => false,
+            None => !self.aborted_out.is_empty(),
         }
     }
 
@@ -582,6 +607,16 @@ impl ClientConnectionAuto {
         }
     }
 
+    fn abort(&mut self, description: AlertDescription) {
+        match &mut self.inner {
+            ClientInner::Tls13(c) => c.abort(description),
+            ClientInner::Tls12(c) => c.abort(description),
+        }
+        // Nothing the server sends afterwards may reach a fresh engine.
+        self.decided = true;
+        self.recv_buffer = Vec::new();
+    }
+
     fn is_handshaking(&self) -> bool {
         match &self.inner {
             ClientInner::Tls13(c) => c.is_handshaking(),
@@ -688,6 +723,7 @@ impl Connection {
                 pending_dtls: alloc::collections::VecDeque::new(),
                 signer: config.signer.clone(),
                 active_sign: None,
+                aborted: false,
             });
         }
         let inner = match config.max_version {
@@ -714,6 +750,7 @@ impl Connection {
             pending_dtls: alloc::collections::VecDeque::new(),
             signer: config.signer.clone(),
             active_sign: None,
+            aborted: false,
         })
     }
 
@@ -757,6 +794,7 @@ impl Connection {
                         pending_dtls: alloc::collections::VecDeque::new(),
                         signer: config.signer.clone(),
                         active_sign: None,
+                        aborted: false,
                     });
                 }
                 (false, true) => {
@@ -766,6 +804,7 @@ impl Connection {
                         pending_dtls: alloc::collections::VecDeque::new(),
                         signer: config.signer.clone(),
                         active_sign: None,
+                        aborted: false,
                     });
                 }
                 (false, false) => return Err(Error::NoUsableCipherSuites),
@@ -777,12 +816,14 @@ impl Connection {
                 peeker: super::peek::ClientHelloPeeker::default(),
                 config: Some(config.clone()),
                 resolved: None,
+                aborted_out: Vec::new(),
             }));
             return Ok(Connection {
                 inner,
                 pending_dtls: alloc::collections::VecDeque::new(),
                 signer: config.signer.clone(),
                 active_sign: None,
+                aborted: false,
             });
         }
         let inner = match config.max_version {
@@ -807,11 +848,15 @@ impl Connection {
             pending_dtls: alloc::collections::VecDeque::new(),
             signer: config.signer.clone(),
             active_sign: None,
+            aborted: false,
         })
     }
 
     /// Drive the handshake forward. Returns the next [`HandshakeStatus`].
     pub fn handshake(&mut self) -> Result<HandshakeStatus, Error> {
+        if self.aborted {
+            return Err(Error::InappropriateState);
+        }
         if self.is_handshake_complete() {
             return Ok(HandshakeStatus::Complete);
         }
@@ -870,6 +915,14 @@ impl Connection {
     /// # }
     /// ```
     pub fn drive(&mut self) -> Result<Step, Error> {
+        // An aborted connection only flushes its fatal alert.
+        if self.aborted {
+            return if self.wants_write() {
+                Ok(Step::WantWrite)
+            } else {
+                Err(Error::InappropriateState)
+            };
+        }
         // If the engine has parked awaiting the identity signature, broker it
         // through the installed HandshakeSigner rather than asking the caller.
         if self.active_sign.is_none()
@@ -974,6 +1027,9 @@ impl Connection {
     /// Wire bytes from the peer into the engine. Returns the number of
     /// bytes consumed.
     pub fn feed(&mut self, wire_in: &[u8]) -> Result<usize, Error> {
+        if self.aborted {
+            return Err(Error::InappropriateState);
+        }
         match &mut self.inner {
             Engine::ClientTls13(c) => {
                 c.read_tls(wire_in);
@@ -1032,6 +1088,9 @@ impl Connection {
 
     /// App bytes into the engine (post-handshake).
     pub fn send(&mut self, app: &[u8]) -> Result<(), Error> {
+        if self.aborted {
+            return Err(Error::InappropriateState);
+        }
         match &mut self.inner {
             Engine::ClientTls13(c) => c.send_application_data(app),
             Engine::ClientTls12(c) => c.send_application_data(app),
@@ -1232,6 +1291,56 @@ impl Connection {
             #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.send_close_notify()?,
         }
+        Ok(())
+    }
+
+    /// Aborts the connection with a fatal alert of `description` — e.g.
+    /// [`AlertDescription::UNKNOWN_CA`], [`BadCertificate`] or
+    /// [`CertificateExpired`] after the caller's own check of
+    /// [`peer_certificates`](Self::peer_certificates) failed, the way an
+    /// OpenSSL verify callback makes the peer see `tlsv1 alert unknown ca`
+    /// instead of an unexpected EOF.
+    ///
+    /// Works in either role, during the handshake or after it. The alert is
+    /// queued in the outgoing buffer — protected under the current write key
+    /// once one is installed, in a plaintext record before that — so the
+    /// caller must still [`pop`](Self::pop) and send it before closing the
+    /// transport ([`drive`](Self::drive) reports
+    /// [`Step::WantWrite`] until it is drained). Afterwards the connection
+    /// is dead: [`feed`](Self::feed), [`send`](Self::send),
+    /// [`handshake`](Self::handshake) and [`drive`](Self::drive) fail with
+    /// [`Error::InappropriateState`]. A second call queues nothing.
+    ///
+    /// For a graceful shutdown use [`close`](Self::close) (`close_notify`)
+    /// instead. To have the alert chosen during the handshake, before the
+    /// handshake completes, install a
+    /// [`CertificateVerifier`](super::CertificateVerifier).
+    ///
+    /// # Errors
+    /// [`Error::InappropriateState`] on a DTLS connection, whose engines do
+    /// not send caller-chosen alerts.
+    ///
+    /// [`BadCertificate`]: AlertDescription::BadCertificate
+    /// [`CertificateExpired`]: AlertDescription::CertificateExpired
+    pub fn abort_with_alert(&mut self, description: AlertDescription) -> Result<(), Error> {
+        if self.aborted {
+            return Ok(());
+        }
+        match &mut self.inner {
+            Engine::ClientTls13(c) => c.abort(description),
+            Engine::ClientTls12(c) => c.abort(description),
+            Engine::ServerTls13(c) => c.abort(description),
+            Engine::ServerTls12(c) => c.abort(description),
+            Engine::ServerTlsAuto(c) => c.abort(description),
+            Engine::ClientTlsAuto(c) => c.abort(description),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(_)
+            | Engine::ClientDtls13(_)
+            | Engine::ServerDtls12(_)
+            | Engine::ServerDtls13(_) => return Err(Error::InappropriateState),
+        }
+        self.aborted = true;
+        self.active_sign = None;
         Ok(())
     }
 
@@ -2191,6 +2300,7 @@ pub(crate) fn tls13_client_config(
         signer,
         psk_modes,
         external_psks,
+        certificate_verifier,
     } = parts.common;
     let ClientOpts {
         server_name,
@@ -2215,6 +2325,7 @@ pub(crate) fn tls13_client_config(
 
     let mut cc = super::conn::ClientConfig::new(roots.clone_store());
     cc.verify_certificates = verify_certificates;
+    cc.certificate_verifier = certificate_verifier.clone();
     // RFC 8446 §4.2.9 / §4.2.11: the PSK key-exchange modes and the
     // external PSKs belong to the TLS 1.3 handshake, so they apply to QUIC
     // unchanged (RFC 9001 §4 places no restriction on either).
@@ -2360,6 +2471,7 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
         signer,
         psk_modes,
         external_psks,
+        certificate_verifier,
     } = parts.common;
     let ClientOpts {
         server_name,
@@ -2400,6 +2512,7 @@ fn tls12_client_config(cfg: &Config) -> Result<super::conn::ClientConfig12, Erro
 
     let mut cc = super::conn::ClientConfig12::new(roots.clone_store());
     cc.verify_certificates = verify_certificates;
+    cc.certificate_verifier = certificate_verifier.clone();
     cc.cipher_suites = cipher_suites.map(<[u16]>::to_vec);
     if !alpn_protocols.is_empty() {
         cc = cc.with_alpn(alpn_protocols.to_vec());
@@ -2539,6 +2652,7 @@ pub(crate) fn tls13_server_config(
         signer,
         psk_modes,
         external_psks,
+        certificate_verifier,
     } = parts.common;
     let ServerOpts {
         client_auth,
@@ -2588,6 +2702,7 @@ pub(crate) fn tls13_server_config(
     };
     sc.psk_modes = psk_modes.to_vec();
     sc.external_psks = external_psks.to_vec();
+    sc.certificate_verifier = certificate_verifier.clone();
     if !alpn_protocols.is_empty() {
         sc = sc.with_alpn(alpn_protocols.to_vec());
     }
@@ -2747,6 +2862,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
         signer,
         psk_modes,
         external_psks,
+        certificate_verifier,
     } = parts.common;
     let ServerOpts {
         client_auth,
@@ -2807,6 +2923,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     sc = sc.with_supports_tls13(
         max_version == ProtocolVersion::TLSv1_3 && restriction_allows_tls13(cipher_suites),
     );
+    sc.certificate_verifier = certificate_verifier.clone();
     if let Some(list) = cipher_suites {
         // The accept-set and preference order (see `Config::cipher_suites`);
         // fail closed when it names nothing this engine implements.
@@ -2923,6 +3040,7 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
         signer,
         psk_modes,
         external_psks,
+        certificate_verifier,
     } = parts.common;
     let ClientOpts {
         server_name,
@@ -2977,6 +3095,11 @@ fn dtls_client_opts(cfg: &Config) -> Result<DtlsClientOpts<'_>, Error> {
     // provisioned one expects a PSK-authenticated handshake, which a
     // silent certificate handshake is not.
     if !external_psks.is_empty() {
+        return Err(Error::InappropriateState);
+    }
+    // A certificate verifier is a security check: refuse rather than skip
+    // it on engines that do not run it.
+    if certificate_verifier.is_some() {
         return Err(Error::InappropriateState);
     }
     if record_size_limit.is_some() {
@@ -3310,6 +3433,7 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
         signer,
         psk_modes,
         external_psks,
+        certificate_verifier,
     } = parts.common;
     let ServerOpts {
         client_auth,
@@ -3364,6 +3488,10 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     // their own tickets): refuse rather than run a certificate handshake
     // the caller did not ask for.
     if !external_psks.is_empty() {
+        return Err(Error::InappropriateState);
+    }
+    // Nor is a certificate verifier, which must not be skipped silently.
+    if certificate_verifier.is_some() {
         return Err(Error::InappropriateState);
     }
     #[cfg(feature = "ech")]

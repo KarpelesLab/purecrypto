@@ -357,6 +357,9 @@ impl ClientCertConfig {
 pub(crate) struct ClientConfig {
     /// Trust anchors used to authenticate the server certificate chain.
     pub roots: RootCertStore,
+    /// Caller check of the server's chain. See
+    /// [`crate::tls::Config::certificate_verifier`].
+    pub(crate) certificate_verifier: Option<Arc<dyn crate::tls::CertificateVerifier>>,
     /// When `false`, the certificate chain, validity period, and host name are
     /// not checked (the `CertificateVerify` signature is still verified against
     /// the presented leaf key, and the leaf is still rejected if malformed).
@@ -501,6 +504,7 @@ impl ClientConfig {
     pub fn new(roots: RootCertStore) -> Self {
         ClientConfig {
             roots,
+            certificate_verifier: None,
             verify_certificates: true,
             verification_time: None,
             alpn_protocols: Vec::new(),
@@ -2613,6 +2617,13 @@ impl ClientConnection {
         self.core.send_close_notify();
     }
 
+    /// Queues a fatal alert with `description` and closes the connection
+    /// (see [`crate::tls::Connection::abort_with_alert`]).
+    pub(crate) fn abort(&mut self, description: AlertDescription) {
+        self.core.send_alert(description);
+        self.close();
+    }
+
     /// Processes all buffered records, advancing the handshake. On a protocol
     /// error it queues a fatal alert and returns the error.
     pub fn process_new_packets(&mut self) -> Result<(), Error> {
@@ -4237,6 +4248,22 @@ impl ClientConnection {
         Ok(())
     }
 
+    /// The name the server certificate is verified against.
+    /// draft-ietf-tls-esni-22 §6.1.6: when the server rejected ECH the
+    /// handshake continues under the *outer* identity — the outer CH carried
+    /// `ECHConfig.public_name` as its SNI — so the certificate is checked
+    /// against the public_name. Any other path (no ECH, GREASE, or ECH
+    /// accepted) verifies against the real `server_name`.
+    fn reference_name(&self) -> &str {
+        #[cfg(feature = "ech")]
+        if let Some(state) = self.ech_state.as_ref()
+            && matches!(state.outcome, Some(EchOutcome::Rejected))
+        {
+            return &state.outer_public_name;
+        }
+        &self.server_name
+    }
+
     pub(crate) fn on_certificate_verify(
         &mut self,
         msg_type: u8,
@@ -4332,16 +4359,7 @@ impl ClientConnection {
             // certificate is checked against the public_name. Any other
             // path (no ECH, GREASE, or ECH accepted) verifies against the
             // real `server_name`.
-            #[cfg(feature = "ech")]
-            let reference_name: &str = match self.ech_state.as_ref() {
-                Some(state) if matches!(state.outcome, Some(EchOutcome::Rejected)) => {
-                    &state.outer_public_name
-                }
-                _ => &self.server_name,
-            };
-            #[cfg(not(feature = "ech"))]
-            let reference_name: &str = &self.server_name;
-            verify_hostname(&leaf, reference_name)?;
+            verify_hostname(&leaf, self.reference_name())?;
             // RFC 6066 §8 / RFC 6960: a stapled OCSP response is only
             // meaningful once the chain is trusted. Validate now against the
             // leaf's ACTUAL issuer within the validated path — the matched
@@ -4364,6 +4382,13 @@ impl ClientConnection {
             leaf.subject_public_key()
                 .map_err(|_| Error::BadCertificate)?
         };
+        super::common::run_certificate_verifier(
+            &self.config.certificate_verifier,
+            &self.cert_chain,
+            Some(self.reference_name()),
+            self.config.verify_certificates,
+            true,
+        )?;
 
         let th = self.core.transcript.current_hash();
         let content = certificate_verify_content(true, th.as_slice());
@@ -4945,6 +4970,9 @@ fn seal_real_ech_on_ch1<R: RngCore>(
 
 /// Maps an internal error to the alert to send the peer.
 fn alert_for(error: &Error) -> AlertDescription {
+    if let Some(alert) = error.certificate_alert() {
+        return alert;
+    }
     match error {
         Error::Decode => AlertDescription::DecodeError,
         Error::UnexpectedMessage => AlertDescription::UnexpectedMessage,
@@ -4961,7 +4989,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::MissingExtension => AlertDescription::MissingExtension,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
-        Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
+        Error::OcspResponseInvalid => AlertDescription::BadCertificate,
         #[cfg(feature = "ech")]
         Error::EchDecryptionFailed => AlertDescription::DecryptError,
         #[cfg(feature = "ech")]

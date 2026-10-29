@@ -103,6 +103,9 @@ use alloc::vec::Vec;
 pub(crate) struct ClientConfig12 {
     /// Trust anchors used to authenticate the server certificate chain.
     pub roots: RootCertStore,
+    /// Caller check of the server's chain. See
+    /// [`crate::tls::Config::certificate_verifier`].
+    pub(crate) certificate_verifier: Option<Arc<dyn crate::tls::CertificateVerifier>>,
     /// When `false`, the certificate chain, validity period, and host name are
     /// not checked (the SKE signature is still verified against the presented
     /// leaf key, and a malformed leaf is still rejected). Intended for tests
@@ -219,6 +222,7 @@ impl ClientConfig12 {
     pub fn new(roots: RootCertStore) -> Self {
         ClientConfig12 {
             roots,
+            certificate_verifier: None,
             verify_certificates: true,
             verification_time: None,
             alpn_protocols: Vec::new(),
@@ -1598,6 +1602,13 @@ impl ClientConnection12 {
         let _ = self.emit_alert(&body);
     }
 
+    /// Queues a fatal alert with `description` and closes the connection
+    /// (see [`crate::tls::Connection::abort_with_alert`]).
+    pub(crate) fn abort(&mut self, description: AlertDescription) {
+        let _ = self.emit_alert(&[2u8, description.as_u8()]); // level = fatal
+        self.state = State::Closed;
+    }
+
     /// Processes all buffered records, advancing the handshake. On a protocol
     /// error it queues a fatal alert and returns the error.
     pub fn process_new_packets(&mut self) -> Result<(), Error> {
@@ -2270,6 +2281,13 @@ impl ClientConnection12 {
                 leaf.subject_public_key()
                     .map_err(|_| Error::BadCertificate)?
             };
+            super::common::run_certificate_verifier(
+                &self.config.certificate_verifier,
+                &chain,
+                Some(&self.server_name),
+                self.config.verify_certificates,
+                true,
+            )?;
             (chain, key)
         };
 
@@ -3320,6 +3338,9 @@ fn build_finished(verify_data: &[u8; 12]) -> Vec<u8> {
 
 /// Maps an internal error to the alert to send the peer.
 fn alert_for(error: &Error) -> AlertDescription {
+    if let Some(alert) = error.certificate_alert() {
+        return alert;
+    }
     match error {
         Error::Decode => AlertDescription::DecodeError,
         Error::UnexpectedMessage => AlertDescription::UnexpectedMessage,
@@ -3334,7 +3355,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
-        Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
+        Error::OcspResponseInvalid => AlertDescription::BadCertificate,
         #[cfg(feature = "ech")]
         Error::EchDecryptionFailed => AlertDescription::DecryptError,
         #[cfg(feature = "ech")]

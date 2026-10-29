@@ -871,6 +871,14 @@ pc_status pc_tls_handshake(PcTls *tls);
  * pc_tls_pop; plaintext the peer sent before its own close_notify stays
  * readable through pc_tls_recv. Idempotent. */
 pc_status pc_tls_close(PcTls *tls);
+/* Aborts with a fatal alert of code `alert` (48 unknown_ca, 42
+ * bad_certificate, 45 certificate_expired, ...) — e.g. after the caller's
+ * own check of pc_tls_peer_certificate failed — and marks the handle closed
+ * like pc_tls_close. The alert is queued: drain it with pc_tls_pop and send
+ * it before closing the socket, so the peer sees the alert rather than an
+ * unexpected EOF. Later pc_tls_feed / pc_tls_handshake fail and pc_tls_send
+ * returns PC_CLOSED. Idempotent. PC_UNSUPPORTED on DTLS. */
+pc_status pc_tls_abort(PcTls *tls, uint8_t alert);
 /* 1 once the peer's close_notify has been processed, 0 otherwise, -1 on a
  * NULL handle. A transport EOF with 0 here is a truncated stream. Always 0
  * for DTLS. */

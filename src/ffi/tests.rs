@@ -2251,6 +2251,44 @@ fn ec_self_signed_pem_rejects_unencodable_days() {
 
 // ---- Closed connections report `Closed` on the send paths -----------------
 
+/// `pc_tls_abort` queues the chosen fatal alert; once it is popped and fed
+/// to the peer, the peer fails with `TlsAlert`. The aborting handle is
+/// closed for sending.
+#[test]
+fn tls_abort_delivers_the_chosen_alert() {
+    let (client, server) = tls13_loopback_pair();
+    assert_eq!(unsafe { tls::pc_tls_abort(client, 48) }, PcStatus::Ok);
+    assert_eq!(unsafe { tls::pc_tls_abort(client, 42) }, PcStatus::Ok);
+    let msg = b"after abort";
+    assert_eq!(
+        unsafe { tls::pc_tls_send(client, msg.as_ptr(), msg.len()) },
+        PcStatus::Closed
+    );
+    let mut len = 0usize;
+    assert_eq!(
+        unsafe { tls::pc_tls_pop(client, core::ptr::null_mut(), &mut len) },
+        PcStatus::BufferTooSmall
+    );
+    let mut buf = vec![0u8; len];
+    assert_eq!(
+        unsafe { tls::pc_tls_pop(client, buf.as_mut_ptr(), &mut len) },
+        PcStatus::Ok
+    );
+    let mut consumed = 0usize;
+    assert_eq!(
+        unsafe { tls::pc_tls_feed(server, buf.as_ptr(), len, &mut consumed) },
+        PcStatus::TlsAlert
+    );
+    assert_eq!(
+        unsafe { tls::pc_tls_abort(core::ptr::null_mut(), 48) },
+        PcStatus::NullPointer
+    );
+    unsafe {
+        tls::pc_tls_free(client);
+        tls::pc_tls_free(server);
+    }
+}
+
 /// A local `pc_tls_close` must make every later `pc_tls_send` on that handle
 /// come back as `Closed` by name — not `Ok` for a record the peer is bound
 /// to ignore, and not an unexplained `Internal`. The peer's view of the

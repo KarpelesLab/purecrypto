@@ -607,14 +607,16 @@ pub struct Config {
     /// [`server`](super::Connection::server) fail with
     /// [`Error::MissingEntropySource`](super::Error::MissingEntropySource),
     /// because the sans-I/O engine takes entropy as an input. Under `std`,
-    /// [`ConfigBuilder::os_rng`] installs the platform
+    /// [`ConfigBuilder::os_rng`][os_rng] installs the platform
     /// [`OsRng`][crate::rng::OsRng] in one call; supply your own
     /// [`EntropySource`] through [`ConfigBuilder::rng`] to route entropy
     /// through a hardware device (TPM/HSM).
+    #[cfg_attr(feature = "std", doc = "", doc = "[os_rng]: ConfigBuilder::os_rng")]
     #[cfg_attr(
         not(feature = "std"),
         doc = "",
-        doc = "[crate::rng::OsRng]: crate#no_std"
+        doc = "[crate::rng::OsRng]: crate#no_std",
+        doc = "[os_rng]: crate#no_std"
     )]
     pub rng: Option<Arc<dyn EntropySource>>,
 
@@ -692,6 +694,63 @@ pub struct Config {
     /// Honoured by TLS 1.3 and QUIC; inert when TLS 1.2 is negotiated
     /// (certificate handshake); **refused** on DTLS.
     pub external_psks: Vec<ExternalPsk>,
+
+    /// A caller-supplied check of the peer's X.509 certificate chain, run
+    /// during the handshake after the built-in checks, which can reject the
+    /// peer with a fatal alert of its choosing (`unknown_ca`,
+    /// `access_denied`, …). See [`CertificateVerifier`]. `None` (the
+    /// default) runs only the built-in verification.
+    ///
+    /// Client role: called with the server's chain on every full handshake,
+    /// also when [`verify_certificates`](Self::verify_certificates) is off —
+    /// which is how a caller substitutes its own verification for the
+    /// built-in one. Server role: called with a client's chain under
+    /// [`client_auth`](Self::client_auth) once it validated against the
+    /// client-auth roots. Not called for an RFC 7250 raw public key, for a
+    /// resumed session (no certificate is exchanged), or when the peer sent
+    /// no certificate.
+    ///
+    /// Honoured by TLS 1.3, TLS 1.2 (and the `tls-legacy` versions) and
+    /// QUIC; **refused** on DTLS, whose engines cannot report the alert.
+    pub certificate_verifier: Option<Arc<dyn CertificateVerifier>>,
+}
+
+/// A caller-supplied peer-certificate check, installed via
+/// [`ConfigBuilder::certificate_verifier`] (see
+/// [`Config::certificate_verifier`] for when it runs).
+///
+/// Returning `Err(alert)` aborts the handshake: the engine queues a fatal
+/// alert with that description — so a peer that flushes its output before
+/// closing delivers e.g. `unknown_ca`, reported by OpenSSL as `tlsv1 alert
+/// unknown ca` — and the handshake fails locally with
+/// [`Error::CertificateRejected(alert)`](super::Error::CertificateRejected).
+///
+/// The verifier can only reject: a chain the built-in verification refused
+/// fails before it is called (with that failure's own alert), so it cannot
+/// override a rejection. Turn [`Config::verify_certificates`] off on a
+/// client to take over the decision entirely.
+pub trait CertificateVerifier: Send + Sync {
+    /// Checks `peer`; `Err(alert)` refuses it with that alert.
+    fn verify(&self, peer: &PeerCertificates<'_>) -> Result<(), super::AlertDescription>;
+}
+
+/// What a [`CertificateVerifier`] is shown.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct PeerCertificates<'a> {
+    /// The peer's chain as received, DER, leaf first.
+    pub chain: &'a [Vec<u8>],
+    /// Client role: the name the server certificate is checked against
+    /// ([`Config::server_name`], or the ECH public name when the server
+    /// rejected ECH). `None` on the server role.
+    pub server_name: Option<&'a str>,
+    /// `true` when the built-in verification ran and accepted the chain
+    /// (trust anchor, validity, revocation, host name); `false` when it was
+    /// switched off with [`Config::verify_certificates`].
+    pub verified: bool,
+    /// `true` when this is a server's chain (we are the client), `false`
+    /// for a client certificate a server checks (mTLS).
+    pub peer_is_server: bool,
 }
 
 /// A caller-supplied entropy source (e.g. a TPM/HSM RNG), installed via
@@ -791,6 +850,7 @@ impl Default for Config {
             resumption: None,
             psk_modes: alloc::vec![PskKeyExchangeMode::PskDheKe],
             external_psks: Vec::new(),
+            certificate_verifier: None,
         }
     }
 }
@@ -893,6 +953,7 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `cookie_secret`, `previous_cookie_secret`, `no_cookie`, `peer_address` | inert | inert | yes | yes | inert |
 /// | `max_record_size` | inert | inert | yes | inert (fixed 1100) | inert |
 /// | `connection_id` / `connection_id_len` | inert | inert | yes | yes | inert |
+/// | `certificate_verifier` | yes | yes | **refused** | **refused** | yes |
 ///
 /// Internally every engine builder consumes the same exhaustive split of
 /// `Config`, so a new option cannot be added without deciding, for each
@@ -1473,6 +1534,14 @@ impl ConfigBuilder {
     )]
     pub fn key_log(mut self, sink: Arc<dyn KeyLog>) -> Self {
         self.inner.key_log = Some(sink);
+        self
+    }
+
+    /// Installs a [`CertificateVerifier`] that can refuse the peer's
+    /// certificate with an alert of its choosing. See
+    /// [`Config::certificate_verifier`].
+    pub fn certificate_verifier(mut self, verifier: Arc<dyn CertificateVerifier>) -> Self {
+        self.inner.certificate_verifier = Some(verifier);
         self
     }
 

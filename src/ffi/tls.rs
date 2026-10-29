@@ -1428,6 +1428,37 @@ pub unsafe extern "C" fn pc_tls_close(tls: *mut PcTls) -> PcStatus {
     })
 }
 
+/// Aborts the connection with a fatal TLS alert of code `alert` (e.g. 48
+/// `unknown_ca`, 42 `bad_certificate`, 45 `certificate_expired`) — for a
+/// caller that rejected the peer's certificate itself — and marks the
+/// handle closed like [`pc_tls_close`]. The alert is queued: drain it with
+/// [`pc_tls_pop`] and send it before closing the transport, so the peer
+/// reports the alert instead of an unexpected EOF. Afterwards
+/// [`pc_tls_feed`] and [`pc_tls_handshake`] fail and [`pc_tls_send`]
+/// returns [`PcStatus::Closed`]. Idempotent: a second call queues nothing.
+/// Returns [`PcStatus::Unsupported`] on DTLS.
+///
+/// # Safety
+/// `tls` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_abort(tls: *mut PcTls, alert: u8) -> PcStatus {
+    guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let handle = unsafe { &mut *tls };
+        if handle
+            .inner
+            .abort_with_alert(AlertDescription::from_u8(alert))
+            .is_err()
+        {
+            return PcStatus::Unsupported;
+        }
+        handle.closed_locally = true;
+        PcStatus::Ok
+    })
+}
+
 /// DTLS: returns the next retransmission timeout in `(seconds, nanos)`, with
 /// `has_timeout` set to 1 if a timeout is currently scheduled and 0
 /// otherwise. Returns [`PcStatus::Unsupported`] for TLS connections (all

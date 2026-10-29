@@ -395,6 +395,9 @@ pub(crate) struct ServerConfig {
     /// (the default) is the engine's full set in its built-in order. See
     /// [`crate::tls::Config::cipher_suites`].
     pub(crate) cipher_suites: Vec<CipherSuite>,
+    /// Caller check of a client's chain (mTLS). See
+    /// [`crate::tls::Config::certificate_verifier`].
+    pub(crate) certificate_verifier: Option<Arc<dyn crate::tls::CertificateVerifier>>,
     /// Pick the first suite in the *client's* order that this server
     /// accepts, instead of the first in the server's own order. See
     /// [`crate::tls::Config::prefer_server_cipher_order`].
@@ -461,6 +464,7 @@ impl ServerConfig {
             preferred_key_exchange_group: None,
             groups: DEFAULT_GROUPS.to_vec(),
             cipher_suites: Vec::new(),
+            certificate_verifier: None,
             prefer_client_order: false,
             psk_modes: alloc::vec![PskKeyExchangeMode::PskDheKe],
             external_psks: Vec::new(),
@@ -1827,6 +1831,13 @@ impl<R: RngCore> ServerConnection<R> {
     /// Queues a `close_notify`.
     pub fn send_close_notify(&mut self) {
         self.core.send_close_notify();
+    }
+
+    /// Queues a fatal alert with `description` and closes the connection
+    /// (see [`crate::tls::Connection::abort_with_alert`]).
+    pub(crate) fn abort(&mut self, description: AlertDescription) {
+        self.core.send_alert(description);
+        self.close();
     }
 
     /// Test hook: the algorithm IDs the client advertised in its
@@ -3582,6 +3593,13 @@ impl<R: RngCore> ServerConnection<R> {
             self.config.verification_time.as_ref(),
             &self.config.signature_policy,
         )?;
+        super::common::run_certificate_verifier(
+            &self.config.certificate_verifier,
+            &chain,
+            None,
+            true,
+            false,
+        )?;
         self.client_cert_chain = chain;
         self.client_leaf_key = Some(leaf_key);
         self.state = State::WaitClientCertVerify;
@@ -4630,6 +4648,9 @@ pub(crate) fn open_ticket13(
 
 /// Maps an internal error to the alert to send the peer.
 fn alert_for(error: &Error) -> AlertDescription {
+    if let Some(alert) = error.certificate_alert() {
+        return alert;
+    }
     match error {
         Error::Decode => AlertDescription::DecodeError,
         Error::UnexpectedMessage => AlertDescription::UnexpectedMessage,
@@ -4649,7 +4670,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::MissingExtension => AlertDescription::MissingExtension,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
-        Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
+        Error::OcspResponseInvalid => AlertDescription::BadCertificate,
         #[cfg(feature = "ech")]
         Error::EchDecryptionFailed => AlertDescription::DecryptError,
         #[cfg(feature = "ech")]
@@ -5724,7 +5745,7 @@ mod tests {
         let (body, raw) = encode_client_certificate_13(&cert_der);
         assert!(matches!(
             s.on_client_certificate(hs_type::CERTIFICATE, &body, &raw),
-            Err(Error::BadCertificate)
+            Err(Error::CertificateExpired)
         ));
     }
 

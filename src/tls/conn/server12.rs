@@ -198,6 +198,9 @@ pub(crate) struct ServerConfig12 {
     /// legacy CBC suites) in its built-in order. See
     /// [`crate::tls::Config::cipher_suites`].
     pub(crate) cipher_suites: Vec<CipherSuite>,
+    /// Caller check of a client's chain (mTLS). See
+    /// [`crate::tls::Config::certificate_verifier`].
+    pub(crate) certificate_verifier: Option<Arc<dyn crate::tls::CertificateVerifier>>,
     /// Pick the first suite in the *client's* order that this server
     /// accepts, instead of the first in the server's own order. See
     /// [`crate::tls::Config::prefer_server_cipher_order`].
@@ -259,6 +262,7 @@ impl ServerConfig12 {
             raw_public_key_spki: None,
             expected_client_raw_public_keys: Vec::new(),
             cipher_suites: Vec::new(),
+            certificate_verifier: None,
             prefer_client_order: false,
         }
     }
@@ -1064,6 +1068,13 @@ impl<R: RngCore> ServerConnection12<R> {
         self.sent_close_notify = true;
         let body = [1u8, AlertDescription::CloseNotify.as_u8()];
         let _ = self.emit_alert(&body);
+    }
+
+    /// Queues a fatal alert with `description` and closes the connection
+    /// (see [`crate::tls::Connection::abort_with_alert`]).
+    pub(crate) fn abort(&mut self, description: AlertDescription) {
+        let _ = self.emit_alert(&[2u8, description.as_u8()]); // level = fatal
+        self.state = State::Closed;
     }
 
     /// Processes all buffered records, advancing the handshake.
@@ -2669,6 +2680,13 @@ impl<R: RngCore> ServerConnection12<R> {
             self.config.verification_time.as_ref(),
             &self.config.signature_policy,
         )?;
+        super::common::run_certificate_verifier(
+            &self.config.certificate_verifier,
+            &chain,
+            None,
+            true,
+            false,
+        )?;
         self.transcript.update(raw);
         self.client_cert_chain = chain;
         self.client_leaf_key = Some(leaf_key);
@@ -3250,6 +3268,9 @@ fn apply_downgrade_sentinel_legacy(sr: &mut [u8; 32]) {
 
 /// Maps an internal error to the alert to send the peer.
 fn alert_for(error: &Error) -> AlertDescription {
+    if let Some(alert) = error.certificate_alert() {
+        return alert;
+    }
     match error {
         Error::Decode => AlertDescription::DecodeError,
         Error::UnexpectedMessage => AlertDescription::UnexpectedMessage,
@@ -3265,7 +3286,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
-        Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
+        Error::OcspResponseInvalid => AlertDescription::BadCertificate,
         #[cfg(feature = "ech")]
         Error::EchDecryptionFailed => AlertDescription::DecryptError,
         #[cfg(feature = "ech")]
@@ -3785,7 +3806,7 @@ mod tests {
         // Expired cert must be rejected now that `now` is enforced (F1).
         assert!(matches!(
             s.on_client_certificate(hs_type::CERTIFICATE, &body, &raw),
-            Err(Error::BadCertificate)
+            Err(Error::CertificateExpired)
         ));
     }
 

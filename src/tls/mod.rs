@@ -101,7 +101,8 @@ pub mod tokio;
 mod version;
 
 pub use config::{
-    ClientAuth, Config, ConfigBuilder, ConnectionId, EntropySource, Identity, SigningKey,
+    CertificateVerifier, ClientAuth, Config, ConfigBuilder, ConnectionId, EntropySource, Identity,
+    PeerCertificates, SigningKey,
 };
 #[cfg(test)]
 pub(crate) use conn::ClientCertConfig;

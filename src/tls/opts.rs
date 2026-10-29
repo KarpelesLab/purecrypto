@@ -25,7 +25,9 @@ use alloc::vec::Vec;
 use crate::signature_registry::SignaturePolicy;
 use crate::x509::Time;
 
-use super::config::{ClientAuth, Config, ConnectionId, EntropySource, Identity};
+use super::config::{
+    CertificateVerifier, ClientAuth, Config, ConnectionId, EntropySource, Identity,
+};
 use super::connection::ResumptionSession;
 use super::groups::NamedGroup;
 use super::keylog::KeyLog;
@@ -82,6 +84,7 @@ pub(crate) struct CommonOpts<'a> {
     pub signer: &'a Option<Arc<dyn HandshakeSigner>>,
     pub psk_modes: &'a [PskKeyExchangeMode],
     pub external_psks: &'a [ExternalPsk],
+    pub certificate_verifier: &'a Option<Arc<dyn CertificateVerifier>>,
 }
 
 /// Options only a client consumes.
@@ -181,6 +184,7 @@ impl Config {
             resumption,
             psk_modes,
             external_psks,
+            certificate_verifier,
         } = self;
         ConfigParts {
             common: CommonOpts {
@@ -212,6 +216,7 @@ impl Config {
                 signer,
                 psk_modes,
                 external_psks,
+                certificate_verifier,
             },
             client: ClientOpts {
                 server_name: server_name.as_deref(),

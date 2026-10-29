@@ -471,7 +471,16 @@ fn verify_chain_inner(
         //     Running off the top of the chain without reaching an anchor means
         //     the chain does not lead to a trusted root — reject.
         let Some(issuer) = certs.get(i + 1) else {
-            return Err(Error::BadCertificate);
+            // An anchor carrying the issuer's name exists but did not verify
+            // the signature (a bad signature, or an algorithm / key size the
+            // policy refuses): the certificate is bad, not its issuer
+            // unknown. Otherwise nobody we trust issued it (`unknown_ca`).
+            let issuer_der = certs[i].issuer_der().map_err(|_| Error::BadCertificate)?;
+            return Err(if store.anchors_with_subject(issuer_der).next().is_some() {
+                Error::BadCertificate
+            } else {
+                Error::UnknownIssuer
+            });
         };
         let issuer_key = issuer
             .subject_public_key()
@@ -526,7 +535,7 @@ fn verify_chain_inner(
         for cert in path {
             let validity = cert.validity().map_err(|_| Error::BadCertificate)?;
             if !validity.accepts(now) {
-                return Err(Error::BadCertificate);
+                return Err(Error::CertificateExpired);
             }
         }
     }
@@ -569,7 +578,7 @@ fn verify_chain_inner(
 /// Consults `crls` for any CRL whose issuer name matches `cert.issuer_der()`
 /// and whose signature verifies against `issuer_key`. If a matching CRL
 /// lists `cert.serial_bytes()`, the cert is revoked (returns
-/// [`Error::BadCertificate`]).
+/// [`Error::CertificateRevoked`]).
 ///
 /// A CRL outside its `thisUpdate..=nextUpdate` window (when `now` is given)
 /// is treated as "not covering" — advisory behavior. CRLs that fail their
@@ -664,7 +673,7 @@ fn check_revocation(
         // A covering, validly-signed CRL gets the deciding vote.
         let revoked = crl.is_revoked(serial).map_err(|_| Error::BadCertificate)?;
         if revoked {
-            return Err(Error::BadCertificate);
+            return Err(Error::CertificateRevoked);
         }
     }
     Ok(())
@@ -1709,7 +1718,7 @@ mod tests {
         let policy = policy();
         assert!(matches!(
             verify_chain(&empty, &[root.to_der().to_vec()], None, &policy),
-            Err(Error::BadCertificate)
+            Err(Error::UnknownIssuer)
         ));
 
         // Empty chain.
@@ -1989,7 +1998,7 @@ mod tests {
         // Expired at `now`.
         assert!(matches!(
             verify_chain(&store, &[cert.to_der().to_vec()], Some(&now), &policy),
-            Err(Error::BadCertificate)
+            Err(Error::CertificateExpired)
         ));
         // Accepted when no clock is supplied (expiry skipped).
         verify_chain(&store, &[cert.to_der().to_vec()], None, &policy).unwrap();
@@ -2537,7 +2546,7 @@ mod tests {
                 None,
                 &policy(),
             ),
-            Err(Error::BadCertificate)
+            Err(Error::CertificateRevoked)
         ));
         // With an empty CRL store the revoked leaf would have passed (sanity
         // check that we're testing the CRL path, not a different bug).
@@ -2818,7 +2827,7 @@ mod tests {
         let chain = alloc::vec![leaf.to_der().to_vec(), int.to_der().to_vec()];
         assert!(matches!(
             verify_chain_with_crls(&store, &crls, &chain, Some(&now), &policy()),
-            Err(Error::BadCertificate)
+            Err(Error::CertificateRevoked)
         ));
     }
 
@@ -2898,7 +2907,7 @@ mod tests {
         crls.add_der(real.clone()).unwrap();
         assert!(matches!(
             verify_chain_with_crls(&store, &crls, &chain, Some(&now), &policy()),
-            Err(Error::BadCertificate)
+            Err(Error::CertificateRevoked)
         ));
 
         // Sanity: the genuine CRL alone revokes (the filler above is inert).
@@ -2906,7 +2915,7 @@ mod tests {
         only_real.add_der(real).unwrap();
         assert!(matches!(
             verify_chain_with_crls(&store, &only_real, &chain, Some(&now), &policy()),
-            Err(Error::BadCertificate)
+            Err(Error::CertificateRevoked)
         ));
 
         // A pure flood consults nothing valid and leaves the chain accepted —
@@ -3013,7 +3022,7 @@ mod tests {
         let with_sha1 = SignaturePolicy::modern().permit("rsa-pkcs1-sha1");
         assert!(matches!(
             verify_chain_with_crls(&store, &crls, &[leaf.to_der().to_vec()], None, &with_sha1,),
-            Err(Error::BadCertificate)
+            Err(Error::CertificateRevoked)
         ));
     }
 

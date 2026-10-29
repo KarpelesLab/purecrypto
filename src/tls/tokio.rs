@@ -635,4 +635,44 @@ mod tests {
         .await
         .expect("fatal alert never reached the peer");
     }
+
+    /// Issue #84 through the async adapter: a client whose
+    /// `CertificateVerifier` refuses the server fails its handshake, and the
+    /// `unknown_ca` alert it chose reaches the server, whose own handshake
+    /// fails with exactly that alert rather than an unexpected EOF.
+    #[::tokio::test]
+    async fn verifier_alert_reaches_the_peer_through_the_adapter() {
+        struct Refuse;
+        impl crate::tls::CertificateVerifier for Refuse {
+            fn verify(
+                &self,
+                _peer: &crate::tls::PeerCertificates<'_>,
+            ) -> Result<(), AlertDescription> {
+                Err(AlertDescription::UNKNOWN_CA)
+            }
+        }
+        let (server_cfg, _leaf) = server_config();
+        let client_cfg = Config::builder()
+            .tls_only()
+            .rng(Arc::new(OsRng))
+            .server_name("tokio.example")
+            .verify_certificates(false)
+            .certificate_verifier(Arc::new(Refuse))
+            .build();
+        let (a, b) = duplex(64 * 1024);
+        let client = TlsStream::handshake(Connection::client(&client_cfg).unwrap(), a);
+        let server = TlsStream::handshake(Connection::server(&server_cfg).unwrap(), b);
+        let (c, s) = ::tokio::time::timeout(TIMEOUT, async { ::tokio::join!(client, server) })
+            .await
+            .expect("handshake hung");
+        let unwrap_tls = |e: io::Error| e.into_inner().unwrap().downcast::<Error>().unwrap();
+        assert_eq!(
+            *unwrap_tls(c.err().unwrap()),
+            Error::CertificateRejected(AlertDescription::UNKNOWN_CA)
+        );
+        assert_eq!(
+            *unwrap_tls(s.err().unwrap()),
+            Error::AlertReceived(AlertDescription::UNKNOWN_CA)
+        );
+    }
 }

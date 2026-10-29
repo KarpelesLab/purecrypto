@@ -588,15 +588,16 @@ const ERROR_CRYPTO_BASE: u64 = 0x0100;
 /// carried in the CONNECTION_CLOSE error code instead. The mapping mirrors
 /// the `alert_for` tables in `tls::conn`.
 fn crypto_error_code(err: &Error) -> u64 {
+    if let Some(alert) = err.certificate_alert() {
+        return ERROR_CRYPTO_BASE + u64::from(alert.as_u8());
+    }
     let alert = match err {
         Error::AlertReceived(a) => *a,
         Error::Decode => AlertDescription::DecodeError,
         Error::UnexpectedMessage => AlertDescription::UnexpectedMessage,
         Error::BadRecordMac => AlertDescription::BadRecordMac,
         Error::UnsupportedVersion => AlertDescription::ProtocolVersion,
-        Error::BadCertificate | Error::CertificateRevoked | Error::OcspResponseInvalid => {
-            AlertDescription::BadCertificate
-        }
+        Error::BadCertificate | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
         Error::PeerMisbehaved | Error::InappropriateState | Error::IllegalParameter => {
             AlertDescription::IllegalParameter
         }

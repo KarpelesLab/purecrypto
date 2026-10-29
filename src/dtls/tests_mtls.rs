@@ -388,7 +388,7 @@ fn untrusted_or_expired_client_chain_is_refused_13() {
     let mut setup = Setup::mutual(true);
     setup.client_auth = Some((other, true));
     let (mut client, mut server) = setup.pair13();
-    assert_eq!(pump13(&mut client, &mut server), Err(Error::BadCertificate));
+    assert_eq!(pump13(&mut client, &mut server), Err(Error::UnknownIssuer));
 
     // Expired: the client's own certificate, but its validity is over.
     let (ckey, ccert) = identity(b"mtls-expired-key", "client.example", expired());
@@ -399,7 +399,10 @@ fn untrusted_or_expired_client_chain_is_refused_13() {
         client_mtu: 1200,
     };
     let (mut client, mut server) = setup.pair13();
-    assert_eq!(pump13(&mut client, &mut server), Err(Error::BadCertificate));
+    assert_eq!(
+        pump13(&mut client, &mut server),
+        Err(Error::CertificateExpired)
+    );
     assert!(server.peer_certificates().is_empty());
 }
 

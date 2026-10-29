@@ -903,6 +903,31 @@ pub(crate) fn parse_alert(body: &[u8]) -> Result<Incoming, Error> {
     }))
 }
 
+/// Runs the caller's [`CertificateVerifier`](crate::tls::CertificateVerifier)
+/// (when one is installed) on the peer's X.509 `chain`; a rejection becomes
+/// [`Error::CertificateRejected`], which the engines answer with the alert
+/// the verifier chose. `verified` says whether the built-in chain
+/// verification ran (and passed) before this call.
+pub(crate) fn run_certificate_verifier(
+    verifier: &Option<alloc::sync::Arc<dyn crate::tls::CertificateVerifier>>,
+    chain: &[Vec<u8>],
+    server_name: Option<&str>,
+    verified: bool,
+    peer_is_server: bool,
+) -> Result<(), Error> {
+    let Some(verifier) = verifier else {
+        return Ok(());
+    };
+    verifier
+        .verify(&crate::tls::PeerCertificates {
+            chain,
+            server_name,
+            verified,
+            peer_is_server,
+        })
+        .map_err(Error::CertificateRejected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
