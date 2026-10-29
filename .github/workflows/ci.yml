@@ -51,6 +51,18 @@ jobs:
       - name: Test (all features)
         run: cargo test --all-features
 
+      # Which SIMD tiers did this runner actually exercise? The differential
+      # tests print RUNNING / SKIPPED per kernel, but `cargo test` captures
+      # that output, so rerun them uncaptured (cheap: already built). Azure
+      # x86_64 runners are often AVX-512 (sometimes IFMA/VAES) hosts, which is
+      # the only CI coverage the AVX-512 kernels get outside the manual SDE job.
+      - name: SIMD tier report (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          grep -o -w -E 'avx2|bmi2|sha_ni|vaes|vpclmulqdq|avx512f|avx512vl|avx512bw|avx512ifma' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          cargo test --all-features --lib -q -- --nocapture tier kernel stitched avx simd ifma 2>&1 | grep -E 'RUNNING|SKIPPED' | sort | uniq -c
+
   no_std:
     name: no_std builds (${{ matrix.target }})
     runs-on: ubuntu-latest
