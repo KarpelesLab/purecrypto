@@ -198,6 +198,12 @@ impl Cipher {
 
 /// AES-GCM-SIV context (RFC 8452), keyed once and reused per message with a
 /// fresh 96-bit nonce.
+///
+/// The key-generating key may be 16 (AES-128), 32 (AES-256) or — as an
+/// OpenSSL 3.2+ extension, `aes-192-gcm-siv` — 24 bytes (AES-192). RFC 8452
+/// defines only the first two; for AES-192 the message-encryption key is
+/// built from three key-derivation blocks (counters 2..=4) instead of two
+/// or four, and nothing else changes.
 pub struct AesGcmSiv {
     cipher: Cipher,
     /// Key length (16, 24 or 32) — selects how many key-derivation blocks to read.
@@ -207,7 +213,7 @@ pub struct AesGcmSiv {
 impl AesGcmSiv {
     /// Creates a GCM-SIV context from a 16-byte (AES-128) or 32-byte (AES-256)
     /// key-generating key — or a 24-byte (AES-192) one, the OpenSSL extension
-    /// described in the [module docs](self).
+    /// described on [`AesGcmSiv`].
     ///
     /// # Panics
     /// Panics if `key.len()` is not 16, 24 or 32. See [`try_new`](Self::try_new)

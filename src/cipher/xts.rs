@@ -176,6 +176,9 @@ impl<C: BlockCipher> Xts<C> {
     /// Like [`new`](Self::new), but selects the tweak-update rule — e.g.
     /// [`XtsStandard::Gb`] for GB/T 17964 (OpenSSL's SM4-XTS with
     /// `xts_standard = "GB"`). The same `K1 ≠ K2` caveat applies.
+    ///
+    /// Under either rule the 16-byte IV OpenSSL takes is the sector index's
+    /// little-endian encoding, so pass a raw IV as `u128::from_le_bytes(iv)`.
     pub fn with_standard(cipher_data: C, cipher_tweak: C, standard: XtsStandard) -> Self {
         Self {
             cipher_data,
