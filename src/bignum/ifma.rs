@@ -64,31 +64,11 @@ const MAX_V: usize = 16;
 /// register file anyway.
 const MAX_PAIR_V: usize = 8;
 
-/// Whether the CPU (and OS) support the IFMA kernels. Cached after the first
-/// query; racing first calls run the idempotent detection and store the same
-/// value.
+/// Whether the CPU (and OS) support the IFMA kernels: AVX-512F + AVX-512
+/// IFMA with the opmask / ZMM state saved, from the shared probe.
+#[inline]
 fn cpu_has_ifma() -> bool {
-    use core::sync::atomic::{AtomicU8, Ordering};
-    // 0 = unknown, 1 = absent, 2 = present.
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            // `avx512f()` has already checked CPUID leaf 7 exists and that the
-            // OS saves the opmask / ZMM state; IFMA is leaf 7, EBX bit 21.
-            let on = crate::cpu::avx512f() && {
-                // SAFETY: `CPUID` exists on every x86_64 CPU and leaf 7 is in
-                // range (checked by `avx512f`). Newer toolchains make the
-                // intrinsic safe, hence `unused_unsafe`.
-                #[allow(unused_unsafe)]
-                let l7 = unsafe { __cpuid_count(7, 0) };
-                l7.ebx & (1 << 21) != 0
-            };
-            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
+    crate::cpu::avx512ifma()
 }
 
 /// Whether the IFMA kernels may run now: hardware support, and the
