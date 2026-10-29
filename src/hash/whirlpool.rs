@@ -5,13 +5,15 @@
 //! ten rounds of `SubBytes`/`ShiftColumns`/`MixRows`/`AddRoundKey` in
 //! GF(2⁸) under the reduction polynomial `x⁸ + x⁴ + x³ + x² + 1` (`0x11d`).
 //!
-//! Implemented in the standard table-driven form: a single 256-entry round
-//! table `C0` (the S-box composed with the MDS column), with the other seven
-//! tables obtained by byte rotation. The table is built at compile time from
-//! the S-box, so the module stays `no_std` and allocation-free; without the
-//! `whirlpool-table` feature each entry is recomputed from the S-box instead. Lookups are not
-//! constant time: they are indexed by the state, so with an unkeyed digest they
-//! leak only the (public) message bytes.
+//! With the `whirlpool-table` feature it is implemented in the standard
+//! table-driven form: eight 256-entry round tables (16 KB; `C0` is the S-box
+//! composed with the MDS row, the other seven its byte rotations), built at
+//! compile time from the S-box, so the module stays `no_std` and
+//! allocation-free. Without the feature only the 256-byte S-box is kept, and
+//! `MixRows` is evaluated on whole 64-bit rows with bytewise-parallel GF(2⁸)
+//! doublings instead. Either way the lookups are not constant time: they are
+//! indexed by the state, so with an unkeyed digest they leak only the (public)
+//! message bytes.
 //!
 //! **Do not use this hash under [`Hmac`](crate::hash::Hmac).** The caveat above
 //! holds only while the state is a function of public data. `Hmac::new` seeds
@@ -95,36 +97,89 @@ const fn build_rc(c0: &[u64; 256]) -> [u64; 10] {
     rc
 }
 
-/// The round table (2 KB, feature `whirlpool-table`). Without the feature the
-/// entries are recomputed from `SBOX` on every lookup.
+/// The eight round tables (16 KB, feature `whirlpool-table`): `C[t][x]` is
+/// `C0[x]` rotated right by `8t` bits, so each of the 64 lookups per round is
+/// a single load with no rotate. Without the feature the entries are
+/// recomputed from `SBOX` on every lookup.
 #[cfg(feature = "whirlpool-table")]
-static C0: [u64; 256] = build_c0();
+static C: [[u64; 256]; 8] = {
+    let c0 = build_c0();
+    let mut c = [[0u64; 256]; 8];
+    let mut t = 0;
+    while t < 8 {
+        let mut x = 0;
+        while x < 256 {
+            c[t][x] = c0[x].rotate_right(8 * t as u32);
+            x += 1;
+        }
+        t += 1;
+    }
+    c
+};
 const RC: [u64; 10] = build_rc(&build_c0());
 
-/// One application of the W round's linear layer (the eight table lookups), used
-/// both for the key schedule and the state transformation.
-#[inline]
+/// One application of the W round's nonlinear and linear layers (`SubBytes`,
+/// `ShiftColumns`, `MixRows`), used both for the key schedule and the state
+/// transformation: output lane `i` gathers byte `t` (most significant first)
+/// of input lane `i - t mod 8` through table `t` — 64 single-load lookups.
+#[cfg(feature = "whirlpool-table")]
+#[inline(always)]
 fn w_theta(inp: &[u64; 8]) -> [u64; 8] {
     let mut out = [0u64; 8];
-    let mut i = 0;
-    while i < 8 {
-        let mut acc = 0u64;
-        let mut t = 0;
-        while t < 8 {
-            let word = inp[(i + 8 - t) & 7];
-            let byte = ((word >> (56 - 8 * t)) & 0xff) as usize;
-            #[cfg(feature = "whirlpool-table")]
-            let c = C0[byte];
-            #[cfg(not(feature = "whirlpool-table"))]
-            let c = c0_entry(byte);
-            acc ^= c.rotate_right(8 * t as u32);
-            t += 1;
-        }
-        out[i] = acc;
-        i += 1;
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = C[0][(inp[i] >> 56) as u8 as usize]
+            ^ C[1][(inp[(i + 7) & 7] >> 48) as u8 as usize]
+            ^ C[2][(inp[(i + 6) & 7] >> 40) as u8 as usize]
+            ^ C[3][(inp[(i + 5) & 7] >> 32) as u8 as usize]
+            ^ C[4][(inp[(i + 4) & 7] >> 24) as u8 as usize]
+            ^ C[5][(inp[(i + 3) & 7] >> 16) as u8 as usize]
+            ^ C[6][(inp[(i + 2) & 7] >> 8) as u8 as usize]
+            ^ C[7][inp[(i + 1) & 7] as u8 as usize];
     }
     out
 }
+
+/// [`w_theta`] without the round tables: the S-box is applied byte by byte
+/// (with `ShiftColumns` folded into which byte goes where), then `MixRows` —
+/// multiplication of each 8-byte row by the circulant `[1, 1, 4, 1, 8, 5, 2,
+/// 9]` — runs on the whole lane at once, with the GF(2⁸) doublings done
+/// bytewise in parallel (SWAR). Same result as the table form; only the
+/// 256-byte S-box is needed.
+#[cfg(any(test, not(feature = "whirlpool-table")))]
+#[inline(always)]
+fn w_theta_small(inp: &[u64; 8]) -> [u64; 8] {
+    /// Doubles each of the eight bytes of `v` in GF(2⁸) mod `0x11d`.
+    #[inline(always)]
+    fn xtime8(v: u64) -> u64 {
+        ((v & 0x7f7f_7f7f_7f7f_7f7f) << 1) ^ (((v >> 7) & 0x0101_0101_0101_0101) * 0x1d)
+    }
+    let mut out = [0u64; 8];
+    for (i, o) in out.iter_mut().enumerate() {
+        // SubBytes + ShiftColumns: byte `t` of row `i` comes from lane
+        // `i - t mod 8`.
+        let mut r = 0u64;
+        for t in 0..8 {
+            let byte = (inp[(i + 8 - t) & 7] >> (56 - 8 * t)) as u8;
+            r |= (SBOX[byte as usize] as u64) << (56 - 8 * t);
+        }
+        // MixRows: out = XOR_d rotr(coef[d] * r, 8d).
+        let x2 = xtime8(r);
+        let x4 = xtime8(x2);
+        let x8 = xtime8(x4);
+        *o = r
+            ^ r.rotate_right(8)
+            ^ x4.rotate_right(16)
+            ^ r.rotate_right(24)
+            ^ x8.rotate_right(32)
+            ^ (x4 ^ r).rotate_right(40)
+            ^ x2.rotate_right(48)
+            ^ (x8 ^ r).rotate_right(56);
+    }
+    out
+}
+
+#[cfg(not(feature = "whirlpool-table"))]
+use w_theta_small as w_theta;
 
 /// The Whirlpool hash function (512-bit output).
 #[derive(Clone)]
@@ -322,6 +377,24 @@ mod tests {
         h.update(&msg[65..130]);
         h.update(&msg[130..]);
         assert_eq!(h.finalize(), oneshot);
+    }
+
+    /// The table-free round layer must equal the table-driven one (only
+    /// compiled side by side when the tables are in the build).
+    #[cfg(feature = "whirlpool-table")]
+    #[test]
+    fn small_theta_matches_tables() {
+        let mut x = 0x0123_4567_89ab_cdefu64;
+        for _ in 0..500 {
+            let mut lanes = [0u64; 8];
+            for l in lanes.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *l = x;
+            }
+            assert_eq!(w_theta(&lanes), w_theta_small(&lanes));
+        }
     }
 
     // A message whose padded length forces an extra all-padding final block

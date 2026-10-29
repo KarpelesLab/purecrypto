@@ -64,8 +64,9 @@ alloc = []
 
 # --- module gates (added as each layer lands) ---
 hash = []
-# Compile-time lookup tables for Streebog (16 KB) and Whirlpool (2 KB). Without
-# them each entry is recomputed from the 256-byte S-box on use: identical
+# Compile-time lookup tables for Streebog (16 KB) and Whirlpool (16 KB). Without
+# them each entry is recomputed from the 256-byte S-box on use (Whirlpool
+# instead evaluates MixRows bytewise-parallel on whole rows): identical
 # digests, less flash, slower hashing.
 streebog-table = ["hash"]
 whirlpool-table = ["hash"]
