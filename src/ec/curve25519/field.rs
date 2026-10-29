@@ -114,15 +114,18 @@ pub(crate) fn mask_from_bit(bit: u64) -> u64 {
     core::hint::black_box(bit.wrapping_neg())
 }
 
-/// All-ones iff `a == b`, else zero, without a branch: the barrier sits on
-/// the XOR difference, so neither input nor the verdict is ever a value the
-/// compiler can compare-and-branch on. One barrier per call.
+/// All-ones iff `a == b`, else zero, without a branch. One barrier sits on
+/// the XOR difference, so the inputs are never a value the compiler can
+/// compare-and-branch on; a second sits on the verdict, so the compiler
+/// cannot prove the mask is `0` or `!0` and turn a downstream
+/// [`Fe::select`] back into a branch (it did exactly that in the comb's
+/// table scan, caught by the Valgrind harness).
 #[inline(always)]
 pub(crate) fn eq_mask(a: u64, b: u64) -> u64 {
     let d = core::hint::black_box(a ^ b);
     // `(d | −d) >> 63` is 1 iff `d != 0`; subtracting 1 flips it to the
     // "equal" sense as a full mask.
-    ((d | d.wrapping_neg()) >> 63).wrapping_sub(1)
+    core::hint::black_box(((d | d.wrapping_neg()) >> 63).wrapping_sub(1))
 }
 
 impl Fe {
