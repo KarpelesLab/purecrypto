@@ -55,6 +55,35 @@ Before these kernels the same machine gave 4.9 / 5.1 / 2.4 GB/s at 16 KiB
 1.7 GB/s at 16 KiB. ChaCha20 is at parity with OpenSSL: both are bound by
 the vector ALU (about 0.52 cycles/byte), not by memory or dispatch.
 
+### AES modes on VAES / VPCLMULQDQ / AVX-512 (Zen 5)
+
+On x86_64 the AES modes run width-generic kernels in one of three tiers
+picked at run time: 128-bit (AES-NI + PCLMULQDQ), 256-bit (VAES +
+VPCLMULQDQ) or 512-bit (with AVX-512F/BW). Each keeps eight vectors in
+flight (8/16/32 blocks): CTR with the counter in registers, CBC decryption
+eight vectors wide, GHASH with one reduction per eight vectors, and GCM with
+AES-CTR and GHASH stitched round by round. Same protocol as above (medians,
+random cores in 100–180, GB/s = 10⁹ bytes/s), 512-bit tier, reproduce with
+`cargo run --release --example aes_modes --features std,cipher`:
+
+| Mode | 16 KiB | 1 MiB | OpenSSL 16 KiB | OpenSSL 1 MiB | before, 16 KiB |
+|---|--:|--:|--:|--:|--:|
+| AES-128-GCM encrypt | 32.7 | 37.6 | 24.8 | 31.1 | 6.5 |
+| AES-128-GCM decrypt | 32.6 | 37.6 | 23.4 | 30.6 | 6.5 |
+| AES-256-GCM encrypt | 26.3 | 28.5 | 22.7 | 27.0 | 5.7 |
+| AES-128-CTR | 43.7 | 46.6 | 14.4 | 14.7 | 9.7 |
+| AES-256-CTR | 33.4 | 35.4 | 10.8 | 10.3 | 7.7 |
+| AES-128-CBC encrypt | 1.90 | 1.98 | 1.91 | 1.82 | 1.11 |
+| AES-128-CBC decrypt | 55.1 | 58.0 | 15.4 | 13.7 | 8.0 |
+| AES-256-CBC encrypt | 1.40 | 1.39 | 1.38 | 1.38 | 0.90 |
+
+CBC encryption is one serial dependency chain (each block's input is the
+previous ciphertext), so it runs at the AES latency, `NR` AES instructions
+per block, like OpenSSL; what changed is the overhead around the chain. On
+the same machine the 256-bit tier gives about half the 512-bit numbers
+(AES-128-GCM 17, CTR 23 GB/s at 16 KiB) and the 128-bit tier about a
+quarter (GCM 7, CTR 11).
+
 ## Hashes (throughput, 64 KiB)
 
 | Algorithm | MiB/s |
