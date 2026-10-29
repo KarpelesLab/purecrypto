@@ -297,6 +297,12 @@ ec-custom = ["ec", "alloc"]
 legacy-ciphers = ["cipher"]
 # VMAC-64/128 (draft-krovetz-vmac-01), a niche AES-based MAC.
 vmac = ["mac"]
+# The rest of PHP ext/hash's cryptographic digests, for interop only:
+# RIPEMD-128/256/320, Tiger (3/4 passes, 128/160/192-bit; original 0x01
+# padding), Snefru-256, GOST R 34.11-94 (test and CryptoPro S-boxes) and the
+# fifteen HAVAL variants. All are legacy designs, several with practical
+# attacks; Tiger, Snefru and GOST use data-indexed S-box tables.
+legacy-hashes = ["hash"]
 # BLS12-381 pairing-friendly curve, RFC 9380 hash-to-curve and the
 # draft-irtf-cfrg-bls-signature schemes (min-pubkey-size, signatures in G2).
 bls = ["hash", "rng", "alloc"]

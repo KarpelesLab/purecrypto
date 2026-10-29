@@ -19,6 +19,10 @@
 //!   (GOST R 34.11-2012), [`Whirlpool`] (ISO/IEC 10118-3).
 //! - Legacy (interop only, not collision-resistant): [`Md2`], [`Md4`], [`Md5`],
 //!   [`Sha1`], [`Ripemd160`].
+//! - With the opt-in `legacy-hashes` feature, the rest of PHP's `hash()`
+//!   digests: RIPEMD-128/256/320, Tiger (3/4 passes, 128/160/192-bit), Snefru,
+//!   GOST R 34.11-94 (test and CryptoPro S-boxes) and the fifteen HAVAL
+//!   variants. Interop only; see each module for its known weaknesses.
 //!
 //! Extendable-output functions ([`ExtendableOutput`] or an inherent
 //! `finalize_xof`): [`Shake128`], [`Shake256`], [`CShake128`], [`CShake256`],
@@ -68,6 +72,10 @@ mod blake3_neon;
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 mod blake3_simd;
 mod block;
+#[cfg(feature = "legacy-hashes")]
+mod gost94;
+#[cfg(feature = "legacy-hashes")]
+mod haval;
 mod hmac;
 mod k12;
 pub(crate) mod keccak;
@@ -86,10 +94,16 @@ pub(crate) mod keccak;
 ))]
 pub(crate) mod keccak_x4;
 mod kmac;
+#[cfg(feature = "legacy-hashes")]
+mod legacy_buffer;
+#[cfg(all(test, feature = "legacy-hashes"))]
+mod legacy_tests;
 mod md2;
 mod md4;
 mod md5;
 mod ripemd160;
+#[cfg(feature = "legacy-hashes")]
+mod ripemd_ext;
 mod sha1;
 pub(crate) mod sha256;
 // The multi-buffer kernels exist for the hash-based signature schemes' WOTS
@@ -115,7 +129,11 @@ mod shake;
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 mod simd_x86;
 mod sm3;
+#[cfg(feature = "legacy-hashes")]
+mod snefru;
 mod streebog;
+#[cfg(feature = "legacy-hashes")]
+mod tiger;
 mod whirlpool;
 mod zeroize;
 
@@ -162,6 +180,22 @@ pub use shake::{Shake128, Shake256, shake128, shake256};
 pub use sm3::{Sm3, sm3};
 pub use streebog::{Streebog256, Streebog512, streebog256, streebog512};
 pub use whirlpool::{Whirlpool, whirlpool};
+
+#[cfg(feature = "legacy-hashes")]
+pub use gost94::{Gost94, Gost94CryptoPro, gost94, gost94_cryptopro};
+#[cfg(feature = "legacy-hashes")]
+pub use haval::{
+    Haval, Haval128_3, Haval128_4, Haval128_5, Haval160_3, Haval160_4, Haval160_5, Haval192_3,
+    Haval192_4, Haval192_5, Haval224_3, Haval224_4, Haval224_5, Haval256_3, Haval256_4, Haval256_5,
+};
+#[cfg(feature = "legacy-hashes")]
+pub use ripemd_ext::{Ripemd128, Ripemd256, Ripemd320, ripemd128, ripemd256, ripemd320};
+#[cfg(feature = "legacy-hashes")]
+pub use snefru::{Snefru256, snefru256};
+#[cfg(feature = "legacy-hashes")]
+pub use tiger::{
+    Tiger, Tiger128_3, Tiger128_4, Tiger160_3, Tiger160_4, Tiger192_3, Tiger192_4, tiger,
+};
 
 /// A cryptographic hash function with an incremental (streaming) interface.
 ///
