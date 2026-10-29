@@ -337,26 +337,31 @@ const fn mont_reduce_raw(t: &[u64; 8]) -> ([u64; 4], u64) {
 /// agnostic: Montgomery form is closed under addition).
 #[inline]
 pub(crate) fn add(a: &Fe, b: &Fe) -> Fe {
-    let a = a.as_limbs();
+    // a + b = a − (p − b): `p − b` is in [1, p] and needs no reduction, and
+    // the subtraction's masked +p is cheaper than a sum's masked −p
+    // (which needs a full compare-and-select after the carry chain).
     let b = b.as_limbs();
-    let mut r = [0u64; 4];
-    let mut carry: u128 = 0;
+    let mut nb = [0u64; 4];
+    let mut borrow: u128 = 0;
     let mut i = 0;
     while i < 4 {
-        let acc = (a[i] as u128) + (b[i] as u128) + carry;
-        r[i] = acc as u64;
-        carry = acc >> 64;
+        let tmp = (P_LIMBS[i] as u128).wrapping_sub(b[i] as u128 + borrow);
+        nb[i] = tmp as u64;
+        borrow = (tmp >> 64) & 1;
         i += 1;
     }
-    // Sum < 2p; reduce_once's masked −p restores [0, p).
-    Fe::from_limbs(reduce_once(r, carry as u64))
+    sub_limbs(a.as_limbs(), &nb)
 }
 
 /// Returns `(a - b) mod p`. Operands must be in `[0, p)`.
 #[inline]
 pub(crate) fn sub(a: &Fe, b: &Fe) -> Fe {
-    let a = a.as_limbs();
-    let b = b.as_limbs();
+    sub_limbs(a.as_limbs(), b.as_limbs())
+}
+
+/// `(a − b) mod p` on raw limbs, for `a < p` and `b <= p`.
+#[inline(always)]
+fn sub_limbs(a: &[u64; 4], b: &[u64; 4]) -> Fe {
     let mut r = [0u64; 4];
     let mut borrow: u128 = 0;
     let mut i = 0;

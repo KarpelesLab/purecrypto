@@ -8,7 +8,7 @@
 
 use super::p256_field as field;
 #[cfg(feature = "p256-table")]
-use super::p256_gtable::{P256_GEN_2_256, P256_GEN_TABLE};
+use super::p256_gtable::{P256_GEN_TABLE, P256_GEN_TOP};
 use crate::bignum::safegcd::SafegcdModulus;
 use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
@@ -68,6 +68,29 @@ const ORDER: Fe = fe_from_hex(N_HEX);
 static ORDER_MODULUS: MontModulus<4> = MontModulus::new(ORDER);
 /// The order-`n` safegcd inversion context, built at compile time.
 static ORDER_SAFEGCD: SafegcdModulus = SafegcdModulus::new(&ORDER);
+
+/// Width in bits of the fixed-base comb's signed windows: each window holds
+/// the `2^(COMB_W − 1)` odd multiples `[1, 3, …, 2^COMB_W − 1]·B^i·G`,
+/// `B = 2^COMB_W`. Wider windows mean fewer additions per `[k]G` but larger
+/// windows to scan and a larger table. 5 bits (52 windows × 16 entries,
+/// 52 KB) takes 12 additions off the 4-bit comb (32 KB) for ~1 µs of
+/// signing on x86-64; 6 bits (88 KB) buys only ~0.6 µs more.
+/// (Defined without the table too, for its generator test.)
+#[cfg(any(all(test, feature = "std"), feature = "p256-table"))]
+pub(crate) const COMB_W: usize = 5;
+/// Entries per comb window.
+#[cfg(any(all(test, feature = "std"), feature = "p256-table"))]
+pub(crate) const COMB_ENTRIES: usize = 1 << (COMB_W - 1);
+/// Number of comb windows: enough `COMB_W`-bit digits to cover 256 bits.
+#[cfg(any(all(test, feature = "std"), feature = "p256-table"))]
+pub(crate) const COMB_WINDOWS: usize = 256usize.div_ceil(COMB_W);
+/// Width of the wNAF recoding of `u1` (the generator's scalar) in
+/// verification: the comb's first window holds the odd multiples of `G` up
+/// to `2^COMB_W − 1`, exactly a width-`COMB_W + 1` wNAF table.
+#[cfg(feature = "p256-table")]
+const G_NAF_W: u32 = COMB_W as u32 + 1;
+#[cfg(not(feature = "p256-table"))]
+const G_NAF_W: u32 = 5;
 
 /// Decodes a 64-character hex string into a [`Fe`].
 pub(crate) const fn fe_from_hex(hex: &str) -> Fe {
@@ -408,7 +431,7 @@ impl P256 {
             acc = self.jac_double(&acc);
             acc = self.jac_double(&acc);
             acc = self.jac_double(&acc);
-            let (x, mut y) = gather_affine(&table, &k, i);
+            let (x, mut y) = gather_affine(&table, k.digit(i));
             acc = self.jac_madd(&acc, &x, &y);
             y.zeroize();
         }
@@ -416,7 +439,7 @@ impl P256 {
         acc = self.jac_double(&acc);
         acc = self.jac_double(&acc);
         acc = self.jac_double(&acc);
-        let mut out = self.finish_ladder(&mut acc, &table, &mut k);
+        let mut out = self.finish_ladder(&mut acc, &table, k.digit(0));
         // The ladder's accumulators are as secret as the scalar.
         out.y = negate_masked(&out.y, k.negate_result);
         k.zeroize();
@@ -429,7 +452,7 @@ impl P256 {
     /// exceptional cases the ladders can reach (`k' = n − 2`: `acc = [d₀]P`,
     /// a doubling; `k' = n`: `acc = −[d₀]P`, the identity). Wipes `acc`.
     #[inline]
-    fn finish_ladder(&self, acc: &mut Jacobian, table: &[[u64; 8]; 8], k: &mut OddScalar) -> Point {
+    fn finish_ladder(&self, acc: &mut Jacobian, table: &[[u64; 8]], digit: (u64, u64)) -> Point {
         let z2 = self.sqr(&acc.z);
         let proj = Point {
             x: self.mul(&acc.x, &acc.z),
@@ -437,7 +460,7 @@ impl P256 {
             z: self.mul(&z2, &acc.z),
         };
         acc.zeroize();
-        let (x, mut y) = gather_affine(table, k, 0);
+        let (x, mut y) = gather_affine(table, digit);
         let out = self.add_mixed(&proj, &x, &y);
         y.zeroize();
         out
@@ -445,49 +468,47 @@ impl P256 {
 
     /// Constant-time fixed-base multiplication `scalar * G` via the
     /// precomputed comb table [`P256_GEN_TABLE`]: with the odd recoding of
-    /// [`OddScalar::new`], `[k]G = [16⁶⁴]G + Σᵢ [dᵢ · 16ⁱ]G` over 64 digits
-    /// `dᵢ ∈ {±1, ±3, …, ±15}`, so there are **no doublings** — just 64
-    /// unconditional mixed additions from the constant `[16⁶⁴]G`
-    /// ([`P256_GEN_2_256`]), each operand fetched by a masked scan of that
-    /// window's 8 stored affine points (one opaque mask per entry, the 8
-    /// coordinate limbs only, no secret-indexed memory access — the same
-    /// gather discipline as [`Self::scalar_mul`]) and negated through a
-    /// mask. The schedule depends only on the (public) scalar width.
+    /// [`OddScalar::new`] in base `B = 2^COMB_W`, `[k]G = [B^W]G +
+    /// Σᵢ [dᵢ·Bⁱ]G` over `W = COMB_WINDOWS` odd digits `|dᵢ| < B`, so there
+    /// are **no doublings** — just `W` unconditional mixed additions from
+    /// the constant `[B^W]G` ([`P256_GEN_TOP`]), each operand fetched by a
+    /// masked scan of that window's stored affine points (one opaque mask
+    /// per entry, the 8 coordinate limbs only, no secret-indexed memory
+    /// access — the same gather discipline as [`Self::scalar_mul`]) and
+    /// negated through a mask. The schedule depends only on the (public)
+    /// scalar width.
     ///
-    /// The windows are added most significant first, so the accumulator
-    /// before window `i` is `[Vᵢ₊₁]G` with `Vᵢ₊₁` a positive multiple of
-    /// `16ⁱ⁺¹` below `n + 16ⁱ⁺¹`, and the added point `[dᵢ·16ⁱ]G` is an odd
-    /// multiple of `16ⁱ`: for `i ≥ 1` the two can never be equal or
-    /// opposite (see [`Self::jac_madd`]), so windows 63…1 use the
-    /// Jacobian `madd-2007-bl` (7M + 4S) instead of the complete projective
-    /// mixed addition (11M + 2m_b); window 0 goes through the complete
-    /// formula ([`Self::finish_ladder`]).
+    /// The windows are added most significant first, which keeps every
+    /// window but the last away from the exceptional inputs of the
+    /// Jacobian `madd-2007-bl` (7M + 4S, see [`Self::jac_madd`]), used
+    /// instead of the complete projective mixed addition (11M + 2m_b);
+    /// window 0 goes through the complete formula ([`Self::finish_ladder`]).
     #[cfg(feature = "p256-table")]
     pub(crate) fn mul_generator(&self, scalar: &Fe) -> Point {
         let mut k = OddScalar::new(scalar);
         let mut acc = Jacobian {
             x: Fe::from_limbs([
-                P256_GEN_2_256[0],
-                P256_GEN_2_256[1],
-                P256_GEN_2_256[2],
-                P256_GEN_2_256[3],
+                P256_GEN_TOP[0],
+                P256_GEN_TOP[1],
+                P256_GEN_TOP[2],
+                P256_GEN_TOP[3],
             ]),
             y: Fe::from_limbs([
-                P256_GEN_2_256[4],
-                P256_GEN_2_256[5],
-                P256_GEN_2_256[6],
-                P256_GEN_2_256[7],
+                P256_GEN_TOP[4],
+                P256_GEN_TOP[5],
+                P256_GEN_TOP[6],
+                P256_GEN_TOP[7],
             ]),
             z: field::ONE,
         };
-        let mut i = 64;
+        let mut i = COMB_WINDOWS;
         while i > 1 {
             i -= 1;
-            let (x, mut y) = gather_affine(&P256_GEN_TABLE[i], &k, i);
+            let (x, mut y) = gather_affine(&P256_GEN_TABLE[i], k.digit_w(COMB_W, i));
             acc = self.jac_madd(&acc, &x, &y);
             y.zeroize();
         }
-        let mut out = self.finish_ladder(&mut acc, &P256_GEN_TABLE[0], &mut k);
+        let mut out = self.finish_ladder(&mut acc, &P256_GEN_TABLE[0], k.digit_w(COMB_W, 0));
         out.y = negate_masked(&out.y, k.negate_result);
         k.zeroize();
         out
@@ -512,8 +533,9 @@ impl P256 {
     /// generation and ECDH must keep using the constant-time
     /// [`Self::mul_generator`] / [`Self::scalar_mul`] paths.
     ///
-    /// Strategy: Straus–Shamir interleaving of two width-5 wNAF ladders
-    /// (one shared run of doublings, ~43 additions each) over Jacobian
+    /// Strategy: Straus–Shamir interleaving of two wNAF ladders (one shared
+    /// run of doublings; width 5 for `Q`, ~43 additions, and width
+    /// [`G_NAF_W`] for `G`, ~37 additions with the comb table) over Jacobian
     /// coordinates — `dbl-2001-b` doublings (3M + 5S, `a = −3`) and
     /// `madd-2007-bl` mixed additions (7M + 4S) with the exceptional cases
     /// handled explicitly. Both operand tables are affine: the odd
@@ -564,9 +586,9 @@ impl P256 {
     /// Jacobian coordinates. **Variable-time.**
     fn straus_vartime(&self, u1: &Fe, u2: &Fe, q: &Point) -> Jacobian {
         #[cfg(feature = "p256-table")]
-        let g_odd = &P256_GEN_TABLE[0];
+        let g_odd: &[[u64; 8]] = &P256_GEN_TABLE[0];
         #[cfg(not(feature = "p256-table"))]
-        let g_odd = &self.odd_multiples_affine(&self.generator());
+        let g_odd: &[[u64; 8]] = &self.odd_multiples_affine(&self.generator());
 
         // u2·Q vanishes for the identity (and its odd multiples could not
         // be normalised); `q` is public, so the branch is sound.
@@ -576,8 +598,8 @@ impl P256 {
         } else {
             self.odd_multiples_affine(q)
         };
-        let naf1 = wnaf5(u1);
-        let naf2 = if q_identity { [0i8; 257] } else { wnaf5(u2) };
+        let naf1 = wnaf(u1, G_NAF_W);
+        let naf2 = if q_identity { [0i8; 257] } else { wnaf(u2, 5) };
 
         let mut acc = Jacobian::IDENTITY;
         let Some(top) = naf1
@@ -599,7 +621,7 @@ impl P256 {
         acc
     }
 
-    /// Adds the nonzero wNAF digit `d` (odd, `|d| <= 15`) times the point
+    /// Adds the nonzero wNAF digit `d` (odd, `|d| < 2·odd.len()`) times the point
     /// whose affine odd multiples are `odd`. **Variable-time.**
     #[inline]
     fn jac_add_naf_digit(&self, acc: &Jacobian, d: i8, odd: &[[u64; 8]]) -> Jacobian {
@@ -714,29 +736,25 @@ impl P256 {
     /// `p` is not the identity and `p ≠ ±(x2, y2)`; otherwise the result is
     /// wrong (`p = −(x2, y2)` happens to give `Z3 = 0`, the identity, but
     /// `p = (x2, y2)` gives `(0 : 0 : 0)`). The constant-time ladders meet
-    /// these by construction: with the odd recoding `k'` of
-    /// [`OddScalar`] (plain base-16 digits `eᵢ`, signed digits `dᵢ`), the
-    /// partial sum of the windows above `i` is
-    /// `Vᵢ₊₁ = 16ⁱ⁺¹·(⌊k'/16ⁱ⁺¹⌋ + [eᵢ₊₁ even])`, a multiple of `16ⁱ⁺¹`
-    /// with `16ⁱ⁺¹ ≤ Vᵢ₊₁ < n + 16ⁱ⁺¹` (as `k' ≤ n`).
+    /// these by construction. With the odd recoding `k' ∈ [1, n]` of
+    /// [`OddScalar`] in base `B = 2^w` (plain digits `eᵢ`, signed odd digits
+    /// `|dᵢ| < B`), the windows above `i` sum to `Vᵢ₊₁ = Bⁱ⁺¹·qᵢ₊₁` with
+    /// `qᵢ₊₁ = ⌊k'/Bⁱ⁺¹⌋ + [eᵢ₊₁ even]`, so `1 ≤ qᵢ₊₁` and
+    /// `B·qᵢ₊₁ ≤ k'/Bⁱ + B`.
     ///
     /// - Comb ([`Self::mul_generator`], no doublings): window `i` adds
-    ///   `[dᵢ·16ⁱ]G` to `[Vᵢ₊₁]G`. A collision needs
-    ///   `Vᵢ₊₁ ∓ dᵢ·16ⁱ ∈ nℤ`; zero is impossible (`dᵢ` is odd, so the
-    ///   left side is not a multiple of `16ⁱ⁺¹`), so is anything outside
-    ///   `(0, 2n)` (for `i ≤ 62` from the bound, for `i = 63` because
-    ///   `V₆₄ = 2²⁵⁶` exactly), and `n` itself would force `16ⁱ | n` — only
-    ///   `i = 0`, as `n` is odd.
-    /// - Horner ladder ([`Self::scalar_mul`]): window `i` adds `[dᵢ]P` to
-    ///   `[Vᵢ₊₁/16ⁱ]P` with `16 ≤ Vᵢ₊₁/16ⁱ ≤ k'/16ⁱ + 16`, so for `i ≥ 1`
-    ///   both `Vᵢ₊₁/16ⁱ ± dᵢ` lie in `[1, n)` and neither is `≡ 0`.
+    ///   `[dᵢ·Bⁱ]G` to `[Bⁱ⁺¹·qᵢ₊₁]G`.
+    /// - Horner ladder ([`Self::scalar_mul`], `w = 4`): window `i` adds
+    ///   `[dᵢ]P` to `[B·qᵢ₊₁]P`.
     ///
-    /// The accumulator is never the identity either (`Vᵢ` is positive and
-    /// not a multiple of `n`, and P-256 has prime order, so the Jacobian
-    /// doublings in between are exception-free too). Only window 0 can
-    /// collide (`k' = n − 2`: a doubling; `k' = n`, i.e. `k ≡ 0`: the
-    /// identity), so it runs on the complete formula
-    /// ([`Self::finish_ladder`]).
+    /// Both collide iff `B·qᵢ₊₁ ∓ dᵢ ≡ 0 (mod n)` (for the comb after
+    /// cancelling the invertible `Bⁱ`). For `i ≥ 1`, `B·qᵢ₊₁ ∓ dᵢ` lies in
+    /// `[1, n/B + 2B)` ⊂ `[1, n)`, so it never does. Likewise the
+    /// accumulator `[qᵢ]` (times `Bⁱ`) is never the identity for `i ≥ 1`
+    /// (`1 ≤ qᵢ < n`), and with P-256's prime order the Jacobian doublings in
+    /// between are exception-free too. Only window 0 can collide
+    /// (`k' = n − 2`: a doubling; `k' = n`, i.e. `k ≡ 0`: the identity), so
+    /// it runs on the complete formula ([`Self::finish_ladder`]).
     #[inline]
     fn jac_madd(&self, p: &Jacobian, x2: &Fe, y2: &Fe) -> Jacobian {
         let z1z1 = self.sqr(&p.z);
@@ -805,13 +823,13 @@ impl Zeroize for Jacobian {
     }
 }
 
-/// Window `i`'s operand for the constant-time ladders: the affine entry
-/// `[|dᵢ|]·B` of the 8-entry odd-multiple table `window` fetched by a masked
-/// scan (one opaque mask per entry over all 8 limbs, no secret-indexed
-/// memory access), with `y` negated through a mask when `dᵢ < 0`.
+/// A window's operand for the constant-time ladders: for the digit
+/// `(index, neg)` of [`OddScalar::digit_w`], the affine entry `index` of the
+/// odd-multiple table `window` fetched by a masked scan (one opaque mask per
+/// entry over all 8 limbs, no secret-indexed memory access; the table length
+/// is public), with `y` negated through a mask when the digit is negative.
 #[inline(always)]
-fn gather_affine(window: &[[u64; 8]; 8], k: &OddScalar, i: usize) -> (Fe, Fe) {
-    let (index, neg) = k.digit(i);
+fn gather_affine(window: &[[u64; 8]], (index, neg): (u64, u64)) -> (Fe, Fe) {
     let mut sel = [0u64; 8];
     for (j, entry) in window.iter().enumerate() {
         let mask = mask_eq(j as u64, index);
@@ -868,24 +886,46 @@ impl OddScalar {
         }
     }
 
-    /// Digit `i` (window `i` of 64) as `(table index (|dᵢ| − 1) / 2, mask
-    /// that is all-ones iff dᵢ < 0)`. Constant time in the scalar (`i` is
-    /// the public loop index).
+    /// Digit `i` of the base-16 recoding (window `i` of 64); see
+    /// [`Self::digit_w`].
     #[inline]
     fn digit(&self, i: usize) -> (u64, u64) {
-        let limbs = self.k.as_limbs();
-        let e = (limbs[i / 16] >> ((i % 16) * 4)) & 0xF;
+        self.digit_w(4, i)
+    }
+
+    /// Digit `i` of the recoding in base `2^w` (`2 <= w <= 8`, window `i`
+    /// of `⌈256/w⌉`) as `(table index (|dᵢ| − 1) / 2, mask that is
+    /// all-ones iff dᵢ < 0)`: with `eᵢ` the plain base-`2^w` digits of `k'`,
+    /// `dᵢ = (eᵢ + 1 − (eᵢ mod 2)) − 2^w·(1 − (eᵢ₊₁ mod 2))`, and
+    /// `k' = 2^(w·⌈256/w⌉) + Σ dᵢ·2^(w·i)` (the base-16 description on
+    /// [`OddScalar`] carries over unchanged). Constant time in the scalar
+    /// (`w` and `i` are public).
+    #[inline]
+    fn digit_w(&self, w: usize, i: usize) -> (u64, u64) {
+        let e = self.bits(w * i, w);
         // Lowest bit of window i + 1 (zero above the top window).
-        let next_odd = if i + 1 < 64 {
-            (limbs[(i + 1) / 16] >> (((i + 1) % 16) * 4)) & 1
-        } else {
-            0
-        };
-        // Odd value in [1, 15]; negative iff the window above is even.
+        let next_odd = self.bits(w * (i + 1), 1);
+        // Odd value in [1, 2^w − 1]; negative iff the window above is even.
         let v = e + 1 - (e & 1);
         let neg = mask_from_bit(next_odd ^ 1);
-        let mag = v ^ ((v ^ (16 - v)) & neg);
+        let mag = v ^ ((v ^ ((1u64 << w) - v)) & neg);
         (mag >> 1, neg)
+    }
+
+    /// The `w` bits of `k'` starting at bit `pos` (zero above bit 255).
+    /// Branches only on the public `pos` and `w`.
+    #[inline(always)]
+    fn bits(&self, pos: usize, w: usize) -> u64 {
+        if pos >= 256 {
+            return 0;
+        }
+        let limbs = self.k.as_limbs();
+        let (idx, sh) = (pos / 64, pos % 64);
+        let mut x = limbs[idx] >> sh;
+        if sh + w > 64 && idx + 1 < 4 {
+            x |= limbs[idx + 1] << (64 - sh);
+        }
+        x & ((1u64 << w) - 1)
     }
 }
 
@@ -927,22 +967,24 @@ fn negate_masked(y: &Fe, mask: u64) -> Fe {
     ])
 }
 
-/// Width-5 wNAF recoding of a 256-bit scalar: digits in
-/// `{0, ±1, ±3, …, ±15}` with any two nonzero digits at least 5 positions
-/// apart. **Variable time** in the scalar — public scalars only.
-fn wnaf5(k: &Fe) -> [i8; 257] {
+/// Width-`w` wNAF recoding of a 256-bit scalar (`2 <= w <= 7`): digits
+/// odd with `|d| < 2^(w−1)`, or zero, with any two nonzero digits at least
+/// `w` positions apart. **Variable time** in the scalar — public scalars
+/// only.
+fn wnaf(k: &Fe, w: u32) -> [i8; 257] {
     let mut naf = [0i8; 257];
     let mut k = *k;
     let mut i = 0;
+    let full = 1i16 << w;
     while !bool::from(k.is_zero()) {
         if bool::from(k.is_odd()) {
-            let low = (k.as_limbs()[0] & 31) as i8;
-            let d = if low > 16 { low - 32 } else { low };
-            naf[i] = d;
+            let low = (k.as_limbs()[0] & (full as u64 - 1)) as i16;
+            let d = if low > full / 2 { low - full } else { low };
+            naf[i] = d as i8;
             if d > 0 {
                 k = k.wrapping_sub(&Fe::from_u64(d as u64));
             } else {
-                // k < 2^256 - 15 always holds here (k only shrinks from an
+                // k < 2^256 - 63 always holds here (k only shrinks from an
                 // initial value < 2^256 - 2^224), so this cannot wrap.
                 k = k.wrapping_add(&Fe::from_u64((-d) as u64));
             }
@@ -1047,7 +1089,7 @@ mod tests {
             assert_eq!(curve.mul(&ex, &acc.z), acc.x, "x mismatch");
             assert_eq!(curve.mul(&ey, &acc.z), acc.y, "y mismatch");
         };
-        // base = [16^i]G; entry j of window i is [(2j + 1)·16^i]G.
+        // base = [B^i]G; entry j of window i is [(2j + 1)·B^i]G.
         let mut base = curve.generator();
         for window in P256_GEN_TABLE.iter() {
             let two_base = curve.double(&base);
@@ -1058,10 +1100,12 @@ mod tests {
                 }
                 check(entry, &acc);
             }
-            base = curve.double(&curve.double(&curve.double(&curve.double(&base))));
+            for _ in 0..COMB_W {
+                base = curve.double(&base);
+            }
         }
-        // After 64 windows, base = [16^64]G, the comb's starting point.
-        check(&P256_GEN_2_256, &base);
+        // After every window, base = [B^W]G, the comb's starting point.
+        check(&P256_GEN_TOP, &base);
     }
 
     /// Differential test: the fixed-base comb agrees with the generic
@@ -1167,11 +1211,11 @@ mod tests {
         }
     }
 
-    /// Regenerates the fixed-base table source (`src/ec/p256_gtable.rs`).
-    /// Run with:
+    /// Regenerates the fixed-base table source (`src/ec/p256_gtable.rs`) for
+    /// the current [`COMB_W`]. Run with:
     /// `cargo test --release gen_p256_gen_table -- --ignored --nocapture`
     /// and paste the emitted `static`s between the file's header comment and
-    /// EOF (the trailing `],` of the last item becomes `];`). The non-ignored `gen_table_matches_computed` test keeps the
+    /// EOF. The non-ignored `gen_table_matches_computed` test keeps the
     /// pasted constants honest on every test run.
     #[test]
     #[ignore = "table generator; emits Rust source on stdout"]
@@ -1179,7 +1223,7 @@ mod tests {
     fn gen_p256_gen_table() {
         use std::{print, println};
         let curve = P256::new();
-        // base = [16^i]G for the current window i.
+        // base = [B^i]G for the current window i.
         let mut base = curve.generator();
         let emit = |indent: &str, point: &Point| {
             let (x, y) = curve
@@ -1194,24 +1238,26 @@ mod tests {
             }
             println!("],");
         };
-        println!("pub(crate) static P256_GEN_TABLE: [[[u64; 8]; 8]; 64] = [");
-        for _ in 0..64 {
+        println!("pub(crate) static P256_GEN_TABLE: [[[u64; 8]; COMB_ENTRIES]; COMB_WINDOWS] = [");
+        for _ in 0..COMB_WINDOWS {
             println!("    [");
             let two_base = curve.double(&base);
             let mut acc = base;
-            for j in 0..8 {
+            for j in 0..COMB_ENTRIES {
                 if j > 0 {
                     acc = curve.point_add(&acc, &two_base);
                 }
                 emit("        ", &acc);
             }
             println!("    ],");
-            base = curve.double(&curve.double(&curve.double(&curve.double(&base))));
+            for _ in 0..COMB_W {
+                base = curve.double(&base);
+            }
         }
         println!("];");
         println!();
-        println!("/// `[16^64]G` (`[2^256 mod n]G`), the comb's starting point.");
-        print!("pub(crate) static P256_GEN_2_256: [u64; 8] = ");
+        println!("/// `[B^W]G` (`B = 2^COMB_W`, `W = COMB_WINDOWS`), the comb's starting point.");
+        print!("pub(crate) static P256_GEN_TOP: [u64; 8] = ");
         emit("", &base);
     }
 
@@ -1365,6 +1411,49 @@ mod tests {
                 curve.to_affine(&reference_mul(&curve, k, &q)),
                 "ladder(Q) {k:x?}"
             );
+        }
+    }
+
+    /// The base-`2^w` recoding (`w = 2..=8`, the comb's widths and beyond)
+    /// reconstructs `k'`: `2^(w·W) + Σ dᵢ·2^(w·i)` over `W = ⌈256/w⌉`
+    /// windows, evaluated mod `n` (the top term exceeds `2²⁵⁶` when `w ∤
+    /// 256`), with every digit odd and below `2^w` in magnitude.
+    #[test]
+    fn odd_scalar_recoding_any_width() {
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        let n = P256::order();
+        let fq = P256::order_modulus();
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-odd-recoding-w", b"nonce", &[]);
+        let mut scalars = recoding_edge_scalars().to_vec();
+        for _ in 0..32 {
+            let mut limbs = [0u64; 4];
+            for l in &mut limbs {
+                *l = rng.next_u64();
+            }
+            scalars.push(Fe::from_limbs(limbs));
+        }
+        for w in 2..=8usize {
+            let windows = 256usize.div_ceil(w);
+            let base = Fe::from_u64(1 << w);
+            for k in &scalars {
+                let odd = OddScalar::new(k);
+                // Horner mod n from the implicit top digit 1.
+                let mut acc = Fe::ONE;
+                for i in (0..windows).rev() {
+                    let (index, neg) = odd.digit_w(w, i);
+                    assert!(index < (1 << (w - 1)), "index out of range");
+                    assert!(neg == 0 || neg == u64::MAX);
+                    let mag = Fe::from_u64(2 * index + 1);
+                    acc = fq.mul_mod(&acc, &base);
+                    acc = if neg == u64::MAX {
+                        fq.sub_mod(&acc, &mag)
+                    } else {
+                        fq.add_mod(&acc, &mag)
+                    };
+                }
+                assert_eq!(acc, odd.k.reduce(&n), "w={w} k={:x?}", k.as_limbs());
+            }
         }
     }
 
