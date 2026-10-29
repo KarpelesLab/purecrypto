@@ -136,7 +136,7 @@ pub use ctr::Ctr;
 pub use des::{Cbc64, Des, TdesEde2, TdesEde3};
 pub use eax::{Aes128Eax, Aes192Eax, Aes256Eax, Eax};
 pub use gcm::{Aes128Gcm, Aes256Gcm, Gcm};
-pub use gcm_siv::{Aes128GcmSiv, Aes256GcmSiv, AesGcmSiv};
+pub use gcm_siv::{Aes128GcmSiv, Aes192GcmSiv, Aes256GcmSiv, AesGcmSiv};
 pub use gmac::{AesGmac128, AesGmac256, Gmac};
 pub use kw::{
     Aes128Kw, Aes128Kwp, Aes192Kw, Aes192Kwp, Aes256Kw, Aes256Kwp, AesKw, AesKwp, KwError,
@@ -288,7 +288,7 @@ impl core::error::Error for TagMismatch {}
 #[non_exhaustive]
 pub enum AeadError {
     /// The key length does not select any variant of the mode (e.g. AES-SIV
-    /// needs 32, 48 or 64 bytes, AES-GCM-SIV 16 or 32).
+    /// needs 32, 48 or 64 bytes, AES-GCM-SIV 16, 24 or 32).
     InvalidKeyLength,
     /// The nonce length is outside the mode's permitted range (e.g. empty
     /// for AES-GCM, outside `7..=13` bytes for AES-CCM).

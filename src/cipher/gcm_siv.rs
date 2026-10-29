@@ -7,11 +7,20 @@
 //! derived from a 96-bit nonce, supporting AES-128 (16-byte key) and AES-256
 //! (32-byte key).
 //!
+//! AES-192 (24-byte key) is also accepted for interoperability with
+//! OpenSSL 3.2+'s `aes-192-gcm-siv`. RFC 8452 defines only the 128- and
+//! 256-bit variants; OpenSSL extends its §4 key derivation in the obvious
+//! way — the message-encryption key is still built from the low 8 bytes of
+//! `AES_K(LE32(counter) ‖ nonce)` for counters 2, 3, …, taking as many
+//! blocks as the key needs (three for a 192-bit key, so counters 0..=4 in
+//! all) — and everything else is unchanged. The test vectors for it were
+//! produced with OpenSSL 3.5 `libcrypto`.
+//!
 //! POLYVAL here uses its **own** GF(2¹²⁸) multiply over the field
 //! `x¹²⁸ + x¹²⁷ + x¹²⁶ + x¹²¹ + 1` — this is *not* the GHASH bit ordering, so
 //! it is implemented separately from `gcm::gf_mul`.
 
-use super::{AeadError, Aes128, Aes256, BlockCipher, TagMismatch};
+use super::{AeadError, Aes128, Aes192, Aes256, BlockCipher, TagMismatch};
 use crate::ct::ConstantTimeEq;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -161,9 +170,10 @@ impl Drop for Polyval {
     }
 }
 
-/// The two block-cipher choices GCM-SIV is instantiated over.
+/// The block-cipher choices GCM-SIV is instantiated over.
 enum Cipher {
     Aes128(Aes128),
+    Aes192(Aes192),
     Aes256(Aes256),
 }
 
@@ -171,6 +181,7 @@ impl Cipher {
     fn encrypt_block(&self, block: &mut [u8; 16]) {
         match self {
             Cipher::Aes128(c) => c.encrypt_block(block),
+            Cipher::Aes192(c) => c.encrypt_block(block),
             Cipher::Aes256(c) => c.encrypt_block(block),
         }
     }
@@ -179,6 +190,7 @@ impl Cipher {
     fn encrypt_blocks(&self, blocks: &mut [u8]) {
         match self {
             Cipher::Aes128(c) => c.encrypt_blocks(blocks),
+            Cipher::Aes192(c) => c.encrypt_blocks(blocks),
             Cipher::Aes256(c) => c.encrypt_blocks(blocks),
         }
     }
@@ -188,30 +200,32 @@ impl Cipher {
 /// fresh 96-bit nonce.
 pub struct AesGcmSiv {
     cipher: Cipher,
-    /// Key length (16 or 32) — selects how many key-derivation blocks to read.
+    /// Key length (16, 24 or 32) — selects how many key-derivation blocks to read.
     key_len: usize,
 }
 
 impl AesGcmSiv {
     /// Creates a GCM-SIV context from a 16-byte (AES-128) or 32-byte (AES-256)
-    /// key-generating key.
+    /// key-generating key — or a 24-byte (AES-192) one, the OpenSSL extension
+    /// described in the [module docs](self).
     ///
     /// # Panics
-    /// Panics if `key.len()` is not 16 or 32. See [`try_new`](Self::try_new)
+    /// Panics if `key.len()` is not 16, 24 or 32. See [`try_new`](Self::try_new)
     /// for the fallible form.
     pub fn new(key: &[u8]) -> Self {
         Self::try_new(key).unwrap_or_else(|_| {
-            panic!("AES-GCM-SIV key must be 16 bytes (AES-128) or 32 bytes (AES-256)")
+            panic!("AES-GCM-SIV key must be 16, 24 or 32 bytes (AES-128/192/256)")
         })
     }
 
     /// Fallible [`new`](Self::new): returns [`AeadError::InvalidKeyLength`]
-    /// instead of panicking when `key.len()` is neither 16 nor 32.
+    /// instead of panicking when `key.len()` is not 16, 24 or 32.
     pub fn try_new(key: &[u8]) -> Result<Self, AeadError> {
         // The key-generating key lives only as the AES schedule (wiped by
         // the cipher's own `Drop`); no raw copy is kept.
         let cipher = match key.len() {
             16 => Cipher::Aes128(Aes128::new(key.try_into().unwrap())),
+            24 => Cipher::Aes192(Aes192::new(key.try_into().unwrap())),
             32 => Cipher::Aes256(Aes256::new(key.try_into().unwrap())),
             _ => return Err(AeadError::InvalidKeyLength),
         };
@@ -227,7 +241,7 @@ impl AesGcmSiv {
     fn derive_keys(&self, nonce: &[u8; 12]) -> ([u8; 16], Cipher) {
         // Counters 0,1 -> auth key; 2.. -> encryption key: all 4 or 6 blocks
         // in one batched call.
-        let n = 2 + self.key_len / 8; // 4 for AES-128, 6 for AES-256.
+        let n = 2 + self.key_len / 8; // 4 for AES-128, 5 for AES-192, 6 for AES-256.
         let mut blocks = [0u8; 16 * 6];
         for (counter, b) in blocks.chunks_exact_mut(16).take(n).enumerate() {
             b[..4].copy_from_slice(&(counter as u32).to_le_bytes());
@@ -251,6 +265,7 @@ impl AesGcmSiv {
 
         let enc_cipher = match self.key_len {
             16 => Cipher::Aes128(Aes128::new(enc_key[..16].try_into().unwrap())),
+            24 => Cipher::Aes192(Aes192::new(enc_key[..24].try_into().unwrap())),
             _ => Cipher::Aes256(Aes256::new(&enc_key)),
         };
         // Wipe the derived encryption-key bytes from the stack.
@@ -384,6 +399,8 @@ impl ZeroizeOnDrop for AesGcmSiv {}
 
 /// AES-128-GCM-SIV (16-byte key).
 pub type Aes128GcmSiv = AesGcmSiv;
+/// AES-192-GCM-SIV (24-byte key; OpenSSL extension, not in RFC 8452).
+pub type Aes192GcmSiv = AesGcmSiv;
 /// AES-256-GCM-SIV (32-byte key).
 pub type Aes256GcmSiv = AesGcmSiv;
 
@@ -602,11 +619,11 @@ mod tests {
         assert_eq!(buf, [0u8; 32]);
     }
 
-    /// `try_new` reports a key length that selects neither AES-128 nor
-    /// AES-256; for a valid key it builds the same context as `new`.
+    /// `try_new` reports a key length that selects none of AES-128/192/256;
+    /// for a valid key it builds the same context as `new`.
     #[test]
     fn try_new_rejects_bad_key_lengths() {
-        for bad in [0usize, 15, 17, 24, 31, 33, 64] {
+        for bad in [0usize, 15, 17, 23, 25, 31, 33, 64] {
             assert!(
                 matches!(
                     AesGcmSiv::try_new(&alloc::vec![0u8; bad]),
@@ -627,8 +644,78 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "AES-GCM-SIV key must be 16 bytes")]
+    #[should_panic(expected = "AES-GCM-SIV key must be 16, 24 or 32 bytes")]
     fn new_bad_key_length_still_panics() {
-        let _ = AesGcmSiv::new(&[0u8; 24]);
+        let _ = AesGcmSiv::new(&[0u8; 20]);
+    }
+
+    /// AES-192-GCM-SIV (the OpenSSL 3.2+ extension). Every expected
+    /// ciphertext and tag here was produced by OpenSSL 3.5 `libcrypto`
+    /// (`EVP_CIPHER_fetch("AES-192-GCM-SIV")`); the key/nonce of the first
+    /// four mirror RFC 8452 Appendix C.1 with a 24-byte `01 00 … 00` key.
+    #[test]
+    fn aes192_matches_openssl() {
+        use alloc::vec::Vec;
+        let k = from_hex::<24>("010000000000000000000000000000000000000000000000");
+        let n = from_hex::<12>("030000000000000000000000");
+        let seq = |len: u8| (0..len).collect::<Vec<u8>>();
+        let cases: [(Vec<u8>, Vec<u8>, &str, &str); 4] = [
+            (
+                Vec::new(),
+                Vec::new(),
+                "",
+                "d4737bf26d29e1da380392e4deca2d92",
+            ),
+            (
+                from_hex::<8>("0100000000000000").to_vec(),
+                Vec::new(),
+                "0e49fb119666c8ae",
+                "6b0606875a845eec145f44ae5b92e834",
+            ),
+            (
+                seq(40),
+                alloc::vec![1u8],
+                "89e52c072c9e2fc373c68a497877637fa63e75e3e8a1143809cc502cee386cac342bc12e6a314125",
+                "47fa67a71e55561e6bfafc7c43452fc6",
+            ),
+            (
+                seq(100),
+                seq(33),
+                "71ac8218c76b40fa97abac4a471115910394b31718d49954fb467e3207292df4\
+                 b934d8194f239d7df03c7969e1e7c555cf67811460b7cd8f556267d048d209db\
+                 0fbc48b3d76b77bd8b83742d4aff3b97762d048a4992b38d100e0884fd5cf4e5\
+                 954b6ae5",
+                "a769e9535b0c0a431fe505095dd9d20c",
+            ),
+        ];
+        let siv = AesGcmSiv::new(&k);
+        for (pt, aad, ct, tag) in cases {
+            let ct = from_hex_vec(ct);
+            let mut buf = pt.clone();
+            let t = siv.encrypt(&n, &aad, &mut buf);
+            assert_eq!(buf, ct);
+            assert_eq!(t.to_vec(), from_hex_vec(tag));
+            siv.decrypt(&n, &aad, &mut buf, &t).unwrap();
+            assert_eq!(buf, pt);
+        }
+
+        let k = from_hex::<24>("404142434445464748494a4b4c4d4e4f5051525354555657");
+        let n = from_hex::<12>("a0a1a2a3a4a5a6a7a8a9aaab");
+        let mut buf = *b"Hello, GCM-SIV world!";
+        let t = AesGcmSiv::try_new(&k)
+            .unwrap()
+            .encrypt(&n, b"header", &mut buf);
+        assert_eq!(
+            buf,
+            from_hex::<21>("c4a89841bacddc36f979031c60e7e0d6cac8a1fd05")
+        );
+        assert_eq!(t, from_hex::<16>("43e7a6cb7e843358c8e845b9e0fe69f7"));
+        let mut bad = t;
+        bad[15] ^= 1;
+        assert!(
+            AesGcmSiv::new(&k)
+                .decrypt(&n, b"header", &mut buf, &bad)
+                .is_err()
+        );
     }
 }
