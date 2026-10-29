@@ -15,6 +15,8 @@ mod boxed;
 #[cfg(feature = "alloc")]
 mod boxed_montgomery;
 mod ct_inverse;
+#[cfg(all(feature = "alloc", target_arch = "x86_64"))]
+mod ifma;
 mod inverse;
 mod modpow;
 mod montgomery;

@@ -11,6 +11,9 @@ use crate::ct::{Choice, ConstantTimeEq};
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[cfg(target_arch = "x86_64")]
+use super::ifma::{self, IfmaModulus, Job};
+
 /// Best-effort wipe of a secret-dependent `Vec<Limb>` scratch buffer.
 ///
 /// Mirrors [`BoxedUint::zeroize`](super::boxed::BoxedUint): the writes are
@@ -69,6 +72,11 @@ pub struct BoxedMontModulus {
     n_prime: Limb,
     r2: Vec<Limb>,
     limbs: usize,
+    /// The AVX-512 IFMA form of the modulus, built when the CPU has IFMA
+    /// (see [`super::ifma`]); the exponentiations use it whenever the
+    /// portable-dispatch override is off.
+    #[cfg(target_arch = "x86_64")]
+    ifma: Option<IfmaModulus>,
 }
 
 // The modulus may be a secret prime (RSA CRT), so never format the limbs:
@@ -128,9 +136,40 @@ impl BoxedMontModulus {
             n_prime,
             r2: vec![0 as Limb; limbs],
             limbs,
+            #[cfg(target_arch = "x86_64")]
+            ifma: None,
         };
         m.r2 = m.compute_r2();
+        #[cfg(target_arch = "x86_64")]
+        if ifma::supported() {
+            // The bit length is public (see `compute_r2`).
+            let top = crate::ct::declassify_value(m.n[limbs - 1].leading_zeros()) as usize;
+            let bits = 64 * limbs - top;
+            m.ifma = IfmaModulus::new(&m.n, bits, |e| {
+                // 2^e mod n through the portable Horner reduction.
+                let mut x = vec![0 as Limb; e / 64 + 1];
+                x[e / 64] = 1 << (e % 64);
+                let r = m.reduce(&BoxedUint::from_limbs(x));
+                r.as_limbs().to_vec()
+            });
+        }
         m
+    }
+
+    /// The IFMA parameters, when present and the kernels may run now.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn ifma(&self) -> Option<&IfmaModulus> {
+        self.ifma.as_ref().filter(|_| ifma::enabled())
+    }
+
+    /// Runs one exponentiation job on the IFMA backend, if available.
+    #[cfg(target_arch = "x86_64")]
+    fn ifma_job(&self, job: Job<'_>) -> Option<BoxedUint> {
+        let im = self.ifma()?;
+        let mut out = vec![0 as Limb; self.limbs];
+        ifma::run([im], [job], [&mut out]);
+        Some(BoxedUint::from_limbs(out))
     }
 
     /// `R² mod n` for `R = 2^(64·l)`, `l = limbs`, without the `2·64·l`
@@ -377,7 +416,30 @@ impl BoxedMontModulus {
     /// secret-indexed memory access) and the per-nibble multiply is
     /// unconditional, so the operation sequence is a function of `bits`
     /// only, leaking nothing about `base` or the exponent's bits.
+    ///
+    /// On x86_64 CPUs with AVX-512 IFMA the same ladder runs on the 52-bit
+    /// radix kernels of [`super::ifma`] (5-bit windows, 32-entry table), with
+    /// the identical constant-time structure.
     pub fn pow_bits(&self, base: &BoxedUint, exp: &BoxedUint, bits: usize) -> BoxedUint {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let l = self.limbs;
+            let mut b = base.limbs_resized(l);
+            let r = self.ifma_job(Job::Pow {
+                base: &b,
+                exp: exp.as_limbs(),
+                bits,
+            });
+            zeroize_limbs(&mut b);
+            if let Some(r) = r {
+                return r;
+            }
+        }
+        self.pow_bits_portable(base, exp, bits)
+    }
+
+    /// The portable (64-bit-limb CIOS) body of [`pow_bits`](Self::pow_bits).
+    fn pow_bits_portable(&self, base: &BoxedUint, exp: &BoxedUint, bits: usize) -> BoxedUint {
         let l = self.limbs;
         // Flat 16-entry table, entry i at `table[i*l..(i+1)*l]`: base^i in
         // Montgomery form (entry 0 is R mod n, the Montgomery 1).
@@ -424,6 +486,35 @@ impl BoxedMontModulus {
     /// discipline as `pow_bits`: the 16-entry table is gathered by a full
     /// masked scan and every window multiplies unconditionally.
     pub fn pow2_bits(
+        &self,
+        a: &BoxedUint,
+        x: &BoxedUint,
+        b: &BoxedUint,
+        y: &BoxedUint,
+        bits: usize,
+    ) -> BoxedUint {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let l = self.limbs;
+            let (mut al, mut bl) = (a.limbs_resized(l), b.limbs_resized(l));
+            let r = self.ifma_job(Job::Pow2 {
+                a: &al,
+                x: x.as_limbs(),
+                b: &bl,
+                y: y.as_limbs(),
+                bits,
+            });
+            zeroize_limbs(&mut al);
+            zeroize_limbs(&mut bl);
+            if let Some(r) = r {
+                return r;
+            }
+        }
+        self.pow2_bits_portable(a, x, b, y, bits)
+    }
+
+    /// The portable body of [`pow2_bits`](Self::pow2_bits).
+    fn pow2_bits_portable(
         &self,
         a: &BoxedUint,
         x: &BoxedUint,
@@ -557,6 +648,23 @@ impl BoxedMontModulus {
     /// multiply) run left-to-right binary, multiplying only on set bits;
     /// wider ones a fixed 4-bit window that skips zero windows.
     pub fn pow_public(&self, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
+        #[cfg(target_arch = "x86_64")]
+        if exp.bit_len() <= 64
+            && let Some(im) = self.ifma()
+        {
+            let l = self.limbs;
+            let mut b = base.limbs_resized(l);
+            let mut out = vec![0 as Limb; l];
+            let e = exp.as_limbs().first().copied().unwrap_or(0);
+            ifma::pow_public_u64(im, &b, e, &mut out);
+            zeroize_limbs(&mut b);
+            return BoxedUint::from_limbs(out);
+        }
+        self.pow_public_portable(base, exp)
+    }
+
+    /// The portable body of [`pow_public`](Self::pow_public).
+    fn pow_public_portable(&self, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
         let l = self.limbs;
         let bits = exp.bit_len();
         if bits == 0 {
@@ -616,6 +724,111 @@ impl BoxedMontModulus {
             zeroize_limbs(entry);
         }
         result
+    }
+
+    /// Two independent constant-time exponentiations, `base_a^exp_a mod a`
+    /// and `base_b^exp_b mod b`, each as [`pow_bits`](Self::pow_bits) with
+    /// the same public bound `bits`. On the IFMA backend, two moduli of the
+    /// same width run in lock step (the RSA CRT halves); otherwise this is
+    /// two `pow_bits` calls.
+    #[cfg_attr(not(feature = "rsa"), allow(dead_code))]
+    pub(crate) fn pow_bits_pair(
+        ma: &Self,
+        base_a: &BoxedUint,
+        exp_a: &BoxedUint,
+        mb: &Self,
+        base_b: &BoxedUint,
+        exp_b: &BoxedUint,
+        bits: usize,
+    ) -> (BoxedUint, BoxedUint) {
+        #[cfg(target_arch = "x86_64")]
+        if let (Some(ia), Some(ib)) = (ma.ifma(), mb.ifma())
+            && ia.pairs_with(ib)
+        {
+            let (mut ba, mut bb) = (
+                base_a.limbs_resized(ma.limbs),
+                base_b.limbs_resized(mb.limbs),
+            );
+            let mut oa = vec![0 as Limb; ma.limbs];
+            let mut ob = vec![0 as Limb; mb.limbs];
+            ifma::run(
+                [ia, ib],
+                [
+                    Job::Pow {
+                        base: &ba,
+                        exp: exp_a.as_limbs(),
+                        bits,
+                    },
+                    Job::Pow {
+                        base: &bb,
+                        exp: exp_b.as_limbs(),
+                        bits,
+                    },
+                ],
+                [&mut oa, &mut ob],
+            );
+            zeroize_limbs(&mut ba);
+            zeroize_limbs(&mut bb);
+            return (BoxedUint::from_limbs(oa), BoxedUint::from_limbs(ob));
+        }
+        (
+            ma.pow_bits(base_a, exp_a, bits),
+            mb.pow_bits(base_b, exp_b, bits),
+        )
+    }
+
+    /// Two independent [`pow2_bits`](Self::pow2_bits), run in lock step on
+    /// the IFMA backend when the moduli have the same width.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "rsa"), allow(dead_code))]
+    pub(crate) fn pow2_bits_pair(
+        ma: &Self,
+        (a1, x1, b1, y1): (&BoxedUint, &BoxedUint, &BoxedUint, &BoxedUint),
+        mb: &Self,
+        (a2, x2, b2, y2): (&BoxedUint, &BoxedUint, &BoxedUint, &BoxedUint),
+        bits: usize,
+    ) -> (BoxedUint, BoxedUint) {
+        #[cfg(target_arch = "x86_64")]
+        if let (Some(ia), Some(ib)) = (ma.ifma(), mb.ifma())
+            && ia.pairs_with(ib)
+        {
+            let mut ins = [
+                a1.limbs_resized(ma.limbs),
+                b1.limbs_resized(ma.limbs),
+                a2.limbs_resized(mb.limbs),
+                b2.limbs_resized(mb.limbs),
+            ];
+            let mut oa = vec![0 as Limb; ma.limbs];
+            let mut ob = vec![0 as Limb; mb.limbs];
+            ifma::run(
+                [ia, ib],
+                [
+                    Job::Pow2 {
+                        a: &ins[0],
+                        x: x1.as_limbs(),
+                        b: &ins[1],
+                        y: y1.as_limbs(),
+                        bits,
+                    },
+                    Job::Pow2 {
+                        a: &ins[2],
+                        x: x2.as_limbs(),
+                        b: &ins[3],
+                        y: y2.as_limbs(),
+                        bits,
+                    },
+                ],
+                [&mut oa, &mut ob],
+            );
+            for v in ins.iter_mut() {
+                zeroize_limbs(v);
+            }
+            return (BoxedUint::from_limbs(oa), BoxedUint::from_limbs(ob));
+        }
+        (
+            ma.pow2_bits(a1, x1, b1, y1, bits),
+            mb.pow2_bits(a2, x2, b2, y2, bits),
+        )
     }
 
     /// Returns `(a + b) mod n`.
@@ -1029,5 +1242,156 @@ mod tests {
             &BoxedUint::from_u64(65537),
         );
         assert_eq!(boxed.to_be_bytes(32), fixed_bytes);
+    }
+
+    /// A random `bits`-bit odd modulus; `shape` picks the top limbs: random,
+    /// all ones (stresses the `< 2n` bound of the almost-Montgomery
+    /// kernels), or `2^(bits−1) + small` (the smallest modulus of the width).
+    fn random_modulus(rng: &mut u64, bits: usize, shape: usize) -> BoxedUint {
+        let l = bits.div_ceil(64);
+        let mut n: Vec<Limb> = (0..l).map(|_| splitmix64(rng)).collect();
+        match shape {
+            1 => n.iter_mut().for_each(|w| *w = u64::MAX),
+            2 => {
+                n.iter_mut().for_each(|w| *w = 0);
+                n[0] = splitmix64(rng) & 0xffff;
+            }
+            _ => {}
+        }
+        let top = bits - 64 * (l - 1);
+        if top < 64 {
+            n[l - 1] &= (1u64 << top) - 1;
+        }
+        n[l - 1] |= 1u64 << (top - 1);
+        n[0] |= 1;
+        BoxedUint::from_limbs(n)
+    }
+
+    /// A random value below `n` (same limb width).
+    fn random_below(rng: &mut u64, n: &BoxedUint) -> BoxedUint {
+        let x: Vec<Limb> = (0..n.limbs()).map(|_| splitmix64(rng)).collect();
+        BoxedUint::from_limbs(x).reduce(n)
+    }
+
+    /// The dispatched exponentiations (the AVX-512 IFMA kernels on a CPU
+    /// that has them) against the portable CIOS bodies, across widths that
+    /// hit every digit/register boundary of the IFMA layout: RSA prime and
+    /// modulus sizes, odd sizes one bit past a limb or digit boundary, the
+    /// largest width the IFMA backend takes (6654 bits) and one past it.
+    #[test]
+    fn dispatched_pow_matches_portable() {
+        let mut rng = 0x1f3a_9b2c_77d1_0e45u64;
+        let sizes = [
+            62usize, 64, 65, 127, 256, 414, 415, 512, 1022, 1023, 1024, 1025, 1038, 1039, 1536,
+            2047, 2048, 2049, 3072, 3326, 3327, 4096, 4097, 6654, 6655,
+        ];
+        for (si, &bits) in sizes.iter().enumerate() {
+            let shape = si % 3;
+            let n = random_modulus(&mut rng, bits, shape);
+            let m = BoxedMontModulus::new(&n);
+            let big = bits > 3000;
+            let trials = if big { 1 } else { 3 };
+            for t in 0..trials {
+                let base = match t {
+                    0 => random_below(&mut rng, &n),
+                    1 => n.sub(&BoxedUint::from_u64(1)),
+                    _ => BoxedUint::from_u64(t as u64 - 2),
+                };
+                let base2 = random_below(&mut rng, &n);
+                let exp = random_below(&mut rng, &n);
+                let exp2 = random_below(&mut rng, &n);
+                // Bounds that are and are not multiples of the window
+                // widths, and one that cuts the exponent short (bits above
+                // the bound must be ignored identically).
+                let ebits = [64 * n.limbs(), bits, bits.saturating_sub(3).max(1), 1];
+                for &eb in &ebits[..if big { 1 } else { 4 }] {
+                    // The bound is a precondition (`exp < 2^eb`).
+                    let cut = |e: &BoxedUint| {
+                        let mut l = e.as_limbs().to_vec();
+                        for (i, w) in l.iter_mut().enumerate() {
+                            let lo = 64 * i;
+                            if lo >= eb {
+                                *w = 0;
+                            } else if eb - lo < 64 {
+                                *w &= (1u64 << (eb - lo)) - 1;
+                            }
+                        }
+                        BoxedUint::from_limbs(l)
+                    };
+                    let (exp, exp2) = (cut(&exp), cut(&exp2));
+                    assert_eq!(
+                        m.pow_bits(&base, &exp, eb),
+                        m.pow_bits_portable(&base, &exp, eb),
+                        "pow_bits bits={bits} eb={eb} t={t}"
+                    );
+                    if !big {
+                        assert_eq!(
+                            m.pow2_bits(&base, &exp, &base2, &exp2, eb),
+                            m.pow2_bits_portable(&base, &exp, &base2, &exp2, eb),
+                            "pow2_bits bits={bits} eb={eb} t={t}"
+                        );
+                    }
+                }
+                for e in [0u64, 1, 2, 3, 65537, splitmix64(&mut rng), u64::MAX] {
+                    let e = BoxedUint::from_u64(e);
+                    assert_eq!(
+                        m.pow_public(&base, &e),
+                        m.pow_public_portable(&base, &e),
+                        "pow_public bits={bits} t={t}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The paired exponentiations (lock-step on the IFMA backend) against
+    /// two portable runs, for equal-width moduli (paired) and unequal ones
+    /// (sequential fallback).
+    #[test]
+    fn pow_pairs_match_portable() {
+        let mut rng = 0x5eed_0fba_1100_u64;
+        for &(ba, bb) in &[
+            (256usize, 256usize),
+            (512, 512),
+            (1024, 1024),
+            (1025, 1025),
+            (1536, 1536),
+            (2048, 2048),
+            (1024, 1023),
+            (1024, 1100),
+            (4096, 4096),
+            (4200, 4200),
+        ] {
+            let (na, nb) = (
+                random_modulus(&mut rng, ba, 0),
+                random_modulus(&mut rng, bb, 1),
+            );
+            let (ma, mb) = (BoxedMontModulus::new(&na), BoxedMontModulus::new(&nb));
+            let bits = 64 * na.limbs().max(nb.limbs());
+            let (xa, ea, ya, fa) = (
+                random_below(&mut rng, &na),
+                random_below(&mut rng, &na),
+                random_below(&mut rng, &na),
+                random_below(&mut rng, &na),
+            );
+            let (xb, eb, yb, fb) = (
+                random_below(&mut rng, &nb),
+                random_below(&mut rng, &nb),
+                random_below(&mut rng, &nb),
+                random_below(&mut rng, &nb),
+            );
+            let (ra, rb) = BoxedMontModulus::pow_bits_pair(&ma, &xa, &ea, &mb, &xb, &eb, bits);
+            assert_eq!(ra, ma.pow_bits_portable(&xa, &ea, bits), "{ba}/{bb}");
+            assert_eq!(rb, mb.pow_bits_portable(&xb, &eb, bits), "{ba}/{bb}");
+            let (ra, rb) = BoxedMontModulus::pow2_bits_pair(
+                &ma,
+                (&xa, &ea, &ya, &fa),
+                &mb,
+                (&xb, &eb, &yb, &fb),
+                bits,
+            );
+            assert_eq!(ra, ma.pow2_bits_portable(&xa, &ea, &ya, &fa, bits));
+            assert_eq!(rb, mb.pow2_bits_portable(&xb, &eb, &yb, &fb, bits));
+        }
     }
 }
