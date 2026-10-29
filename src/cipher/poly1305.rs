@@ -7,6 +7,10 @@
 //! stripes hide the carry-chain latency on long inputs), five 26-bit limbs
 //! with `u64` products on 32-bit targets. Both use a branchless final
 //! reduction — there are no secret-dependent branches or table lookups.
+//! On x86_64, long runs of blocks go through a vector kernel instead: AVX-512
+//! IFMA (32 blocks per step, in the same radix 2⁴⁴) or AVX2 (eight blocks per
+//! step, radix 2²⁶), each evaluating the polynomial with precomputed powers
+//! of `r`.
 //!
 //! The (`r`, `s`) key is **single-use**: authenticating two messages under the
 //! same Poly1305 key reveals `r` and breaks the MAC. In ChaCha20-Poly1305 a
@@ -59,14 +63,18 @@ impl Poly1305 {
             self.leftover = 0;
         }
 
-        // On x86_64 with AVX2, evaluate eight blocks per step with
-        // precomputed powers r¹..r⁸ (parallel Horner). Only worth it once the
-        // message is long enough to amortize the power setup; the tail
-        // (< 128 bytes of full blocks plus any partial block) falls through
-        // to the scalar paths. Control flow depends only on the public
-        // message length.
+        // On x86_64, evaluate many blocks per step with precomputed powers
+        // of r (parallel Horner): 32 per step with AVX-512 IFMA, eight with
+        // AVX2. Only worth it once the message is long enough to amortize
+        // the vector setup; the tail (< 128 bytes of full blocks plus any
+        // partial block) falls through to the scalar paths. Control flow
+        // depends only on the public message length.
         #[cfg(target_arch = "x86_64")]
-        if data.len() >= simd::MIN_LEN && simd::supported() {
+        if data.len() >= ifma::MIN_LEN && ifma::supported() {
+            let vec_len = data.len() & !127;
+            ifma::blocks(&mut self.st, &data[..vec_len]);
+            data = &data[vec_len..];
+        } else if data.len() >= simd::MIN_LEN && simd::supported() {
             let vec_len = data.len() & !127;
             simd::blocks(self, &data[..vec_len]);
             data = &data[vec_len..];
@@ -375,6 +383,45 @@ mod imp {
             self.h.zeroize();
         }
 
+        /// `[r, r², r⁴, r⁸, r¹⁶, r³²]` (lazily reduced limbs), the IFMA
+        /// kernel's seeds for its lane power vectors. The caller wipes the
+        /// result.
+        #[cfg(target_arch = "x86_64")]
+        pub(super) fn r_pows(&self) -> [[u64; 3]; 6] {
+            let mut p = [self.r, self.r2, [0; 3], [0; 3], [0; 3], [0; 3]];
+            for k in 2..6 {
+                let sq = p[k - 1];
+                p[k] = mul(sq, sq, [sq[1] * 20, sq[2] * 20]);
+            }
+            p
+        }
+
+        /// The raw (lazily reduced) radix-2⁴⁴ accumulator.
+        #[cfg(target_arch = "x86_64")]
+        pub(super) fn h44(&self) -> [u64; 3] {
+            self.h
+        }
+
+        /// Loads `h` from radix-2⁴⁴ limbs of up to 2⁶⁰ each, carrying them
+        /// back under the lazy bounds the scalar steps assume.
+        #[cfg(target_arch = "x86_64")]
+        pub(super) fn set_h44(&mut self, l: [u64; 3]) {
+            let [mut h0, mut h1, mut h2] = l;
+            let c = h0 >> 44;
+            h0 &= M44;
+            h1 += c;
+            let c = h1 >> 44;
+            h1 &= M44;
+            h2 += c;
+            let c = h2 >> 42;
+            h2 &= M42;
+            h0 += c * 5;
+            let c = h0 >> 44;
+            h0 &= M44;
+            h1 += c;
+            self.h = [h0, h1, h2];
+        }
+
         /// `r` as five 26-bit limbs, for the AVX2 kernel's power table.
         #[cfg(target_arch = "x86_64")]
         pub(super) fn r26(&self) -> [u32; 5] {
@@ -564,6 +611,235 @@ mod imp {
             self.r.zeroize();
             self.s.zeroize();
             self.h.zeroize();
+        }
+    }
+}
+
+/// AVX-512 IFMA multi-block Poly1305 (x86_64), in the scalar path's own
+/// radix 2⁴⁴: eight consecutive 16-byte blocks sit one per 64-bit lane of a
+/// `__m512i` per limb, and `vpmadd52luq`/`vpmadd52huq` produce the low and
+/// high 52 bits of each 44×49-bit partial product directly — three limbs
+/// instead of AVX2's five, so a block costs far fewer multiplies. Four such
+/// 8-lane accumulators take the 128-byte groups round-robin and each
+/// advances by `r³²` (`h = h·r³² + m`, parallel Horner), so four carry
+/// chains overlap (measured on Zen 5: 0.131 → 0.117 cycles/byte going from
+/// two chains to four); a final lane-wise multiply by the matching powers
+/// and a horizontal sum fold them back into the scalar accumulator, with no
+/// limb conversion.
+///
+/// Bounds: inputs to the multiplier stay below 2⁴⁶ (`h`) and 2⁴⁹ (`20·r`),
+/// inside IFMA's 52-bit operand width; each column's low halves sum below
+/// 2⁵⁵ and the carry chain is the scalar one. Multiply/add/shift/mask only —
+/// no secret-dependent branches or lookups. The lane power vectors are built
+/// per call from `r, r², r⁴, r⁸, r¹⁶, r³²` with six vector multiplies (no
+/// table to store, copy or wipe in the state).
+///
+/// Pinned to the scalar path by a differential test over every length in
+/// `0..=1100`, large messages, extreme limbs and odd-sized streaming chunks.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+mod ifma {
+    use super::imp;
+    use crate::zeroize::Zeroize;
+    use core::arch::x86_64::*;
+
+    /// Below this many bytes the scalar path wins: the power vectors and the
+    /// fold cost more than they save (measured on Zen 5: ~1.8 vs 1.5 cycles
+    /// per byte at 256 bytes, 1.2 vs 1.4 at 384).
+    pub(super) const MIN_LEN: usize = 384;
+
+    /// Accumulators advancing in lockstep (each over every fourth group).
+    const CHAINS: usize = 4;
+
+    const M44: i64 = 0x0fff_ffff_ffff;
+    const M42: i64 = 0x03ff_ffff_ffff;
+
+    pub(super) fn supported() -> bool {
+        !crate::ct::force_portable() && crate::cpu::avx512ifma()
+    }
+
+    /// Absorbs `data` (a non-empty multiple of 128 bytes) into `st`.
+    pub(super) fn blocks(st: &mut imp::State, data: &[u8]) {
+        debug_assert!(!data.is_empty() && data.len().is_multiple_of(128));
+        // SAFETY: `supported()` (checked by the caller) confirmed AVX-512F
+        // and AVX-512 IFMA.
+        unsafe { blocks_ifma(st, data) }
+    }
+
+    /// Lane mask of the lanes whose fold exponent `e = 8 − j` (for the block
+    /// `j` that [`load8`] places in the lane) has bit `bit` set in `e − 1`.
+    const fn exp_mask(bit: u32) -> __mmask8 {
+        let mut m = 0;
+        let mut lane = 0;
+        while lane < 8 {
+            let j = lane / 2 + 4 * (lane % 2);
+            if ((7 - j) >> bit) & 1 == 1 {
+                m |= 1 << lane;
+            }
+            lane += 1;
+        }
+        m
+    }
+
+    /// `20·r` per lane (the wrap-around multiples of limbs 1 and 2).
+    #[inline(always)]
+    unsafe fn times20(r: __m512i) -> __m512i {
+        unsafe { _mm512_add_epi64(_mm512_slli_epi64::<4>(r), _mm512_slli_epi64::<2>(r)) }
+    }
+
+    /// Eight consecutive full blocks as radix-2⁴⁴ limbs with the 2¹²⁸ bit.
+    /// Lane `2k` holds block `k`, lane `2k + 1` block `4 + k`.
+    #[inline(always)]
+    unsafe fn load8(p: *const u8) -> [__m512i; 3] {
+        unsafe {
+            let a = _mm512_loadu_si512(p.cast());
+            let b = _mm512_loadu_si512(p.add(64).cast());
+            let t0 = _mm512_unpacklo_epi64(a, b);
+            let t1 = _mm512_unpackhi_epi64(a, b);
+            let m44 = _mm512_set1_epi64(M44);
+            [
+                _mm512_and_si512(t0, m44),
+                _mm512_and_si512(
+                    _mm512_or_si512(_mm512_srli_epi64::<44>(t0), _mm512_slli_epi64::<20>(t1)),
+                    m44,
+                ),
+                _mm512_or_si512(_mm512_srli_epi64::<24>(t1), _mm512_set1_epi64(1 << 40)),
+            ]
+        }
+    }
+
+    /// Lane-wise `h·r + m mod 2¹³⁰−5` with the scalar path's carry chain.
+    /// `s = [20·r₁, 20·r₂]`. Output limbs: `h₀ < 2⁴⁴`, `h₁ < 2⁴⁴ + 2¹⁴`,
+    /// `h₂ < 2⁴²`.
+    #[inline(always)]
+    unsafe fn mul_add(
+        h: &[__m512i; 3],
+        r: &[__m512i; 3],
+        s: &[__m512i; 2],
+        m: &[__m512i; 3],
+    ) -> [__m512i; 3] {
+        unsafe {
+            let z = _mm512_setzero_si512();
+            let lo = |acc, a, b| _mm512_madd52lo_epu64(acc, a, b);
+            let hi = |acc, a, b| _mm512_madd52hi_epu64(acc, a, b);
+            // Column k: d_k = Σ h_i·r_j over i + j ≡ k, split into the low
+            // 52 bits (`l`, weight 2^(44k)) and the rest (`u`, weight
+            // 2^(44k + 52)). Ordered h₂, h₀, h₁: the carry chain below
+            // finishes `h₂` first and `h₁` last, so the next step's
+            // multiplies can start early (measured: 0.141 → 0.131
+            // cycles/byte with two chains).
+            let l0 = lo(lo(lo(m[0], h[2], s[0]), h[0], r[0]), h[1], s[1]);
+            let l1 = lo(lo(lo(m[1], h[2], s[1]), h[0], r[1]), h[1], r[0]);
+            let l2 = lo(lo(lo(m[2], h[2], r[0]), h[0], r[2]), h[1], r[1]);
+            let u0 = hi(hi(hi(z, h[2], s[0]), h[0], r[0]), h[1], s[1]);
+            let u1 = hi(hi(hi(z, h[2], s[1]), h[0], r[1]), h[1], r[0]);
+            let u2 = hi(hi(hi(z, h[2], r[0]), h[0], r[2]), h[1], r[1]);
+
+            let m44 = _mm512_set1_epi64(M44);
+            let m42 = _mm512_set1_epi64(M42);
+            let add = |a, b| _mm512_add_epi64(a, b);
+            // 2⁵² = 2⁴⁴·2⁸ moves `u_k` one limb up; past limb 2 the weight
+            // is 2¹³⁰·2¹⁰ ≡ 5·2¹⁰.
+            let l1 = add(
+                l1,
+                add(_mm512_srli_epi64::<44>(l0), _mm512_slli_epi64::<8>(u0)),
+            );
+            let h0 = _mm512_and_si512(l0, m44);
+            let l2 = add(
+                l2,
+                add(_mm512_srli_epi64::<44>(l1), _mm512_slli_epi64::<8>(u1)),
+            );
+            let h1 = _mm512_and_si512(l1, m44);
+            let c = add(_mm512_srli_epi64::<42>(l2), _mm512_slli_epi64::<10>(u2));
+            let h2 = _mm512_and_si512(l2, m42);
+            let h0 = add(h0, add(c, _mm512_slli_epi64::<2>(c)));
+            let h1 = add(h1, _mm512_srli_epi64::<44>(h0));
+            let h0 = _mm512_and_si512(h0, m44);
+            [h0, h1, h2]
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn blocks_ifma(st: &mut imp::State, data: &[u8]) {
+        unsafe {
+            let groups = data.len() / 128;
+            let p = data.as_ptr();
+            let z = [_mm512_setzero_si512(); 3];
+            let bcast = |x: &[u64; 3]| -> [__m512i; 3] {
+                core::array::from_fn(|l| _mm512_set1_epi64(x[l] as i64))
+            };
+            let mults = |r: &[__m512i; 3]| [times20(r[1]), times20(r[2])];
+
+            // Lane power vectors. Lane `L` holds block `j(L)` of a group and,
+            // in the chain holding the final group, owes `r^(8 − j)`:
+            // `r · Π r^(2^i)` over the set bits `i` of `7 − j`.
+            let mut rp = st.r_pows();
+            let one = [
+                _mm512_set1_epi64(1),
+                _mm512_setzero_si512(),
+                _mm512_setzero_si512(),
+            ];
+            let pick = |mask: __mmask8, x: &[u64; 3]| -> [__m512i; 3] {
+                let b = bcast(x);
+                core::array::from_fn(|l| _mm512_mask_blend_epi64(mask, one[l], b[l]))
+            };
+            let x0 = pick(exp_mask(0), &rp[0]);
+            let x1 = pick(exp_mask(1), &rp[1]);
+            let x2 = pick(exp_mask(2), &rp[2]);
+            let r1 = bcast(&rp[0]);
+            let x01 = mul_add(&x0, &x1, &mults(&x1), &z);
+            let x2r = mul_add(&x2, &r1, &mults(&r1), &z);
+            let lo_pow = mul_add(&x01, &x2r, &mults(&x2r), &z);
+            // pw[k] = r^(8k + 8 − j): what a chain owes when its final group
+            // is k groups before the message's last one.
+            let r8 = bcast(&rp[3]);
+            let r16 = bcast(&rp[4]);
+            let p1 = mul_add(&lo_pow, &r8, &mults(&r8), &z);
+            let p2 = mul_add(&lo_pow, &r16, &mults(&r16), &z);
+            let p3 = mul_add(&p1, &r16, &mults(&r16), &z);
+            let pw = [lo_pow, p1, p2, p3];
+            // The stride: every chain advances by r^(8·CHAINS) = r³² per step.
+            let step = bcast(&rp[5]);
+            let step_s = mults(&step);
+            rp.zeroize();
+
+            // Chain `c` takes the 128-byte groups `g ≡ c (mod CHAINS)`; the
+            // running `h` joins lane 0 of chain 0 (block 0, the oldest).
+            let mut acc = [z; CHAINS];
+            for (c, x) in acc.iter_mut().enumerate() {
+                if c < groups {
+                    *x = load8(p.add(128 * c));
+                }
+            }
+            let h = st.h44();
+            for (x, &hl) in acc[0].iter_mut().zip(h.iter()) {
+                *x = _mm512_add_epi64(*x, _mm512_set_epi64(0, 0, 0, 0, 0, 0, 0, hl as i64));
+            }
+            let mut g = CHAINS;
+            while g + CHAINS <= groups {
+                for (c, x) in acc.iter_mut().enumerate() {
+                    *x = mul_add(x, &step, &step_s, &load8(p.add(128 * (g + c))));
+                }
+                g += CHAINS;
+            }
+            for (c, x) in acc.iter_mut().enumerate().take(groups.saturating_sub(g)) {
+                *x = mul_add(x, &step, &step_s, &load8(p.add(128 * (g + c))));
+            }
+
+            // Fold: chain `c`'s last group is `(groups − 1 − c) mod CHAINS`
+            // groups before the final one (a chain with no groups is zero
+            // and its power is irrelevant). Then sum every lane of every
+            // chain: at most 32 limbs below 2⁴⁴ + 2¹⁴, far from overflow.
+            let mut tot = z;
+            for (c, x) in acc.iter().enumerate() {
+                let k = (groups + CHAINS - 1 - c) % CHAINS;
+                let f = mul_add(x, &pw[k], &mults(&pw[k]), &z);
+                for (t, v) in tot.iter_mut().zip(f.iter()) {
+                    *t = _mm512_add_epi64(*t, *v);
+                }
+            }
+            let sum: [u64; 3] = core::array::from_fn(|l| _mm512_reduce_add_epi64(tot[l]) as u64);
+            st.set_h44(sum);
         }
     }
 }
@@ -966,7 +1242,8 @@ mod tests {
     /// Every length in `0..=1024`, one-shot and under chunked streaming that
     /// straddles the leftover buffer, the two-stripe / vector paths and the
     /// single-block tail, must match the independent big-integer reference.
-    /// This pins the radix-2⁴⁴ two-stripe fold and the AVX2 kernel alike.
+    /// This pins the radix-2⁴⁴ stripe folds and whichever vector kernel the
+    /// dispatcher picks alike.
     #[cfg(feature = "alloc")]
     #[test]
     fn all_lengths_match_reference() {
@@ -1003,17 +1280,25 @@ mod tests {
         }
     }
 
-    /// The AVX2 4-way path must produce the exact scalar tag for every
-    /// length (byte-by-byte sweep across the dispatch threshold), for large
-    /// messages, and under chunked streaming that straddles the leftover
-    /// buffer, the vector stripes, and the scalar tail.
+    /// Each x86_64 vector tier, driven directly (so an IFMA host still tests
+    /// the AVX2 kernel, which the dispatcher would never pick there), must
+    /// produce the exact scalar tag for every length in `0..=1100`, for
+    /// large messages and for extreme limbs, with the kernel entered both
+    /// from a zero and from a non-zero accumulator. Then the dispatcher
+    /// itself, under one-shot and odd-sized streaming updates that straddle
+    /// the leftover buffer, the vector thresholds and the scalar tail.
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     #[test]
     fn simd_matches_scalar() {
         use alloc::vec::Vec;
-        if !super::simd::supported() {
-            std::eprintln!("poly1305: SKIPPED avx2 differential (no AVX2 on this CPU)");
-            return;
+        let ifma = super::ifma::supported();
+        let avx2 = super::simd::supported();
+        for (name, on) in [("avx512-ifma 4x8-way", ifma), ("avx2 2x4-way", avx2)] {
+            if on {
+                std::eprintln!("poly1305: RUNNING {name} kernel vs scalar");
+            } else {
+                std::eprintln!("poly1305: SKIPPED {name} kernel (not supported here)");
+            }
         }
 
         let mut state = 0x243f_6a88_85a3_08d3u64;
@@ -1023,8 +1308,8 @@ mod tests {
             }
         };
 
-        // Scalar oracle: feeding in sub-threshold chunks never dispatches to
-        // the SIMD path (`update` only vectorizes runs of >= MIN_LEN bytes).
+        // Scalar oracle: updates of under 128 bytes never reach a vector
+        // kernel (every vector path needs at least one 128-byte group).
         let scalar_tag = |key: &[u8; 32], data: &[u8]| -> [u8; 16] {
             let mut p = Poly1305::new(key);
             for chunk in data.chunks(48) {
@@ -1032,9 +1317,46 @@ mod tests {
             }
             p.finish()
         };
+        // `pre` bytes (a multiple of 16) through the scalar path, then the
+        // largest multiple of 128 bytes through the chosen kernel, then the
+        // rest through the scalar path again.
+        let forced = |key: &[u8; 32], data: &[u8], pre: usize, tier: u8| -> [u8; 16] {
+            let mut p = Poly1305::new(key);
+            let pre = pre.min(data.len() & !15);
+            p.update(&data[..pre]);
+            let rest = &data[pre..];
+            let vec_len = rest.len() & !127;
+            if vec_len > 0 {
+                match tier {
+                    0 => super::ifma::blocks(&mut p.st, &rest[..vec_len]),
+                    _ => super::simd::blocks(&mut p, &rest[..vec_len]),
+                }
+            }
+            for chunk in rest[vec_len..].chunks(48) {
+                p.update(chunk);
+            }
+            p.finish()
+        };
+
+        // Extreme limbs: the largest clamped `r` with all-ones data keeps
+        // every lazy carry at its bound.
+        for len in [384usize, 512, 1024 + 15, 4096 + 128, 65536] {
+            let key = [0xffu8; 32];
+            let data = std::vec![0xffu8; len];
+            let expected = scalar_tag(&key, &data);
+            assert_eq!(expected, reference_tag(&key, &data), "oracle len={len}");
+            for pre in [0usize, 16] {
+                if ifma {
+                    assert_eq!(forced(&key, &data, pre, 0), expected, "ifma ff len={len}");
+                }
+                if avx2 {
+                    assert_eq!(forced(&key, &data, pre, 1), expected, "avx2 ff len={len}");
+                }
+            }
+        }
 
         let mut data = Vec::new();
-        for len in (0usize..=1024).chain([4096, 65536, 65536 + 17, 100_003]) {
+        for len in (0usize..=1100).chain([2048 + 5, 4096, 16384 + 13, 65536 + 17, 100_003]) {
             let mut key = [0u8; 32];
             fill(&mut key);
             data.resize(len, 0);
@@ -1042,13 +1364,31 @@ mod tests {
 
             let expected = scalar_tag(&key, &data);
 
-            // One-shot (SIMD-dispatched for len >= MIN_LEN).
+            for pre in [0usize, 16, 48] {
+                if ifma {
+                    assert_eq!(
+                        forced(&key, &data, pre, 0),
+                        expected,
+                        "ifma len={len} pre={pre}"
+                    );
+                }
+                if avx2 {
+                    assert_eq!(
+                        forced(&key, &data, pre, 1),
+                        expected,
+                        "avx2 len={len} pre={pre}"
+                    );
+                }
+            }
+
+            // One-shot through the dispatcher.
             let mut p = Poly1305::new(&key);
             p.update(&data);
             assert_eq!(p.finish(), expected, "one-shot len={len}");
 
-            // Odd-sized chunks large enough to keep hitting the SIMD path,
-            // preceded by a tiny chunk so the leftover buffer engages first.
+            // Odd-sized chunks large enough to keep hitting the vector
+            // paths, preceded by a tiny chunk so the leftover buffer engages
+            // first.
             let mut p = Poly1305::new(&key);
             let mut rest = &data[..];
             for chunk_len in [5usize, 301, 4096 + 63, 257] {
@@ -1058,6 +1398,20 @@ mod tests {
             }
             p.update(rest);
             assert_eq!(p.finish(), expected, "chunked len={len}");
+
+            // A cycle of odd chunk sizes either side of every threshold
+            // (16-byte blocks, 128-byte groups, the 384-byte IFMA minimum).
+            let mut p = Poly1305::new(&key);
+            let mut rest = &data[..];
+            for chunk_len in [1usize, 15, 17, 127, 129, 383, 385, 3, 1023].iter().cycle() {
+                if rest.is_empty() {
+                    break;
+                }
+                let take = (*chunk_len).min(rest.len());
+                p.update(&rest[..take]);
+                rest = &rest[take..];
+            }
+            assert_eq!(p.finish(), expected, "odd-chunked len={len}");
         }
     }
 

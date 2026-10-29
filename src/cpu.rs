@@ -44,6 +44,7 @@ mod x86 {
     pub(super) const BMI1: u32 = 1 << 9;
     pub(super) const BMI2: u32 = 1 << 10;
     pub(super) const AVX512VL: u32 = 1 << 11;
+    pub(super) const AVX512IFMA: u32 = 1 << 12;
     /// Set once the cache holds a detection result.
     const READY: u32 = 1 << 31;
 
@@ -140,6 +141,9 @@ mod x86 {
                 if bit(ebx7, 31) {
                     f |= AVX512VL;
                 }
+                if bit(ebx7, 21) {
+                    f |= AVX512IFMA;
+                }
             }
         }
         f
@@ -211,6 +215,11 @@ mod x86_api {
     #[inline]
     pub(crate) fn avx512vl() -> bool {
         has(AVX512VL | AVX512F)
+    }
+    /// AVX-512 IFMA (52-bit integer multiply-add; implies [`avx512f`]).
+    #[inline]
+    pub(crate) fn avx512ifma() -> bool {
+        has(AVX512IFMA | AVX512F)
     }
     /// BMI1 (`ANDN` and friends).
     #[inline]
@@ -287,5 +296,9 @@ mod tests {
         assert_eq!(super::bmi1(), std::is_x86_feature_detected!("bmi1"));
         assert_eq!(super::bmi2(), std::is_x86_feature_detected!("bmi2"));
         assert_eq!(super::avx512vl(), std::is_x86_feature_detected!("avx512vl"));
+        assert_eq!(
+            super::avx512ifma(),
+            std::is_x86_feature_detected!("avx512ifma") && super::avx512f()
+        );
     }
 }
