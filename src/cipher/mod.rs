@@ -139,7 +139,8 @@ pub use gcm::{Aes128Gcm, Aes256Gcm, Gcm};
 pub use gcm_siv::{Aes128GcmSiv, Aes192GcmSiv, Aes256GcmSiv, AesGcmSiv};
 pub use gmac::{AesGmac128, AesGmac256, Gmac};
 pub use kw::{
-    Aes128Kw, Aes128Kwp, Aes192Kw, Aes192Kwp, Aes256Kw, Aes256Kwp, AesKw, AesKwp, KwError,
+    Aes128Kw, Aes128KwInv, Aes128Kwp, Aes128KwpInv, Aes192Kw, Aes192KwInv, Aes192Kwp, Aes192KwpInv,
+    Aes256Kw, Aes256KwInv, Aes256Kwp, Aes256KwpInv, AesKw, AesKwp, InverseCipher, KwError,
     kw_ciphertext_len, kwp_ciphertext_len,
 };
 #[cfg(feature = "legacy-ciphers")]

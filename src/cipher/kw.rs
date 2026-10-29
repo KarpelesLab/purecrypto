@@ -26,6 +26,23 @@
 //! Both schemes use only the underlying [`BlockCipher`]'s `encrypt_block` /
 //! `decrypt_block`; no GF arithmetic. The final integrity check is performed
 //! in constant time against the expected IV.
+//!
+//! # Custom IVs and the inverse-cipher variants
+//!
+//! RFC 3394 §2.2.3 lets an application replace the default IV; use
+//! [`AesKw::wrap_with_iv`] / [`AesKw::unwrap_with_iv`]. For KWP the
+//! equivalent is the 32-bit constant in the high half of the AIV
+//! (`0xA65959A6`), which OpenSSL lets a caller replace through the 4-byte IV
+//! of `id-aes*-wrap-pad`: [`AesKwp::wrap_with_aiv_prefix`] /
+//! [`AesKwp::unwrap_with_aiv_prefix`].
+//!
+//! SP 800-38F §5.1 also allows running KW / KWP with the *inverse* cipher
+//! function as the forward one: the wrap uses `CIPH⁻¹_K` and the unwrap uses
+//! `CIPH_K`. OpenSSL calls these `AES-*-WRAP-INV` and `AES-*-WRAP-PAD-INV`.
+//! They are obtained here by keying [`AesKw`] / [`AesKwp`] with an
+//! [`InverseCipher`] (see [`AesKw::new_inverse`] and the `*KwInv` /
+//! `*KwpInv` aliases); the output is not interchangeable with the ordinary
+//! modes'.
 
 use super::{BlockCipher, TagMismatch};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater};
@@ -80,6 +97,44 @@ pub fn kwp_ciphertext_len(plaintext_len: usize) -> usize {
     plaintext_len.div_ceil(8) * 8 + 8
 }
 
+/// A [`BlockCipher`] adapter that swaps the forward and inverse permutations
+/// of `C`: its `encrypt_block` is `C::decrypt_block` and vice versa.
+///
+/// Its only purpose is the SP 800-38F inverse-cipher key-wrap variants
+/// (OpenSSL's `AES-*-WRAP-INV` / `AES-*-WRAP-PAD-INV`): [`AesKw`] /
+/// [`AesKwp`] over `InverseCipher<C>` wrap with `CIPH⁻¹` and unwrap with
+/// `CIPH`. Do not use it to build other modes.
+#[derive(Clone)]
+pub struct InverseCipher<C: BlockCipher>(C);
+
+impl<C: BlockCipher> InverseCipher<C> {
+    /// Wraps `cipher`, exchanging its two directions.
+    pub fn new(cipher: C) -> Self {
+        InverseCipher(cipher)
+    }
+}
+
+impl<C: BlockCipher> BlockCipher for InverseCipher<C> {
+    const BLOCK_SIZE: usize = C::BLOCK_SIZE;
+    const KEY_SIZE: usize = C::KEY_SIZE;
+
+    fn encrypt_block(&self, block: &mut [u8; 16]) {
+        self.0.decrypt_block(block);
+    }
+
+    fn decrypt_block(&self, block: &mut [u8; 16]) {
+        self.0.encrypt_block(block);
+    }
+
+    fn encrypt_blocks(&self, blocks: &mut [u8]) {
+        self.0.decrypt_blocks(blocks);
+    }
+
+    fn decrypt_blocks(&self, blocks: &mut [u8]) {
+        self.0.encrypt_blocks(blocks);
+    }
+}
+
 /// AES key wrap (RFC 3394) keyed by an arbitrary [`BlockCipher`].
 ///
 /// AES-128 KW is the most common form; AES-192 and AES-256 KW are defined by
@@ -101,10 +156,23 @@ impl<C: BlockCipher> AesKw<C> {
     /// must equal `plaintext.len() + 8` (see [`kw_ciphertext_len`]). The
     /// integrity IV `0xA6A6_…` is implied.
     pub fn wrap(&self, plaintext: &[u8], out: &mut [u8]) -> Result<(), KwError> {
+        self.wrap_with_iv(&RFC3394_IV.to_be_bytes(), plaintext, out)
+    }
+
+    /// [`wrap`](Self::wrap) with an application-chosen 64-bit initial value
+    /// in place of `0xA6A6_A6A6_A6A6_A6A6` (RFC 3394 §2.2.3.2; OpenSSL's
+    /// 8-byte IV for `id-aes*-wrap`). The same `iv` must be given to
+    /// [`unwrap_with_iv`](Self::unwrap_with_iv).
+    pub fn wrap_with_iv(
+        &self,
+        iv: &[u8; 8],
+        plaintext: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), KwError> {
         if plaintext.len() < 16 {
             return Err(KwError::InvalidLength);
         }
-        wrap_w(&self.cipher, RFC3394_IV, plaintext, out)
+        wrap_w(&self.cipher, u64::from_be_bytes(*iv), plaintext, out)
     }
 
     /// Unwraps `ciphertext` into `out` per RFC 3394, verifying the integrity IV.
@@ -112,16 +180,24 @@ impl<C: BlockCipher> AesKw<C> {
     /// `ciphertext.len()` must be a multiple of 8 and at least 24; `out.len()`
     /// must equal `ciphertext.len() - 8`.
     pub fn unwrap(&self, ciphertext: &[u8], out: &mut [u8]) -> Result<(), KwError> {
+        self.unwrap_with_iv(&RFC3394_IV.to_be_bytes(), ciphertext, out)
+    }
+
+    /// [`unwrap`](Self::unwrap), checking the recovered integrity register
+    /// against `iv` (constant time) instead of the default IV. On
+    /// [`KwError::IntegrityCheck`] `out` is zeroed.
+    pub fn unwrap_with_iv(
+        &self,
+        iv: &[u8; 8],
+        ciphertext: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), KwError> {
         if ciphertext.len() < 24 {
             return Err(KwError::InvalidLength);
         }
         let recovered = unwrap_w(&self.cipher, ciphertext, out)?;
         // The accept/reject verdict is the public outcome of decryption.
-        if recovered
-            .to_be_bytes()
-            .ct_eq(&RFC3394_IV.to_be_bytes())
-            .declassify()
-        {
+        if recovered.to_be_bytes().ct_eq(iv).declassify() {
             Ok(())
         } else {
             // Wipe the candidate plaintext on failure so a caller can't leak
@@ -219,6 +295,20 @@ impl<C: BlockCipher> AesKwp<C> {
     /// Wraps a plaintext of any length in `[1, 2³²−1]` bytes per RFC 5649.
     /// `out.len()` must equal [`kwp_ciphertext_len`]`(plaintext.len())`.
     pub fn wrap(&self, plaintext: &[u8], out: &mut [u8]) -> Result<(), KwError> {
+        self.wrap_with_aiv_prefix(&RFC5649_AIV_TAG.to_be_bytes(), plaintext, out)
+    }
+
+    /// [`wrap`](Self::wrap) with `prefix` in place of the RFC 5649 constant
+    /// `A6 59 59 A6` as the high 32 bits of the AIV (OpenSSL's 4-byte IV for
+    /// `id-aes*-wrap-pad`). The length indicator in the low half is still
+    /// derived from `plaintext`. Unwrap with
+    /// [`unwrap_with_aiv_prefix`](Self::unwrap_with_aiv_prefix).
+    pub fn wrap_with_aiv_prefix(
+        &self,
+        prefix: &[u8; 4],
+        plaintext: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), KwError> {
         if plaintext.is_empty() || plaintext.len() > u32::MAX as usize {
             return Err(KwError::InvalidLength);
         }
@@ -227,9 +317,9 @@ impl<C: BlockCipher> AesKwp<C> {
             return Err(KwError::InvalidLength);
         }
 
-        // AIV = 0xA659_59A6 ‖ len_be32.
-        let aiv =
-            (u64::from(RFC5649_AIV_TAG) << 32) | u64::from(u32::try_from(plaintext.len()).unwrap());
+        // AIV = prefix (0xA659_59A6 by default) ‖ len_be32.
+        let aiv = (u64::from(u32::from_be_bytes(*prefix)) << 32)
+            | u64::from(u32::try_from(plaintext.len()).unwrap());
 
         if padded_len == 8 {
             // Single-block special case (RFC 5649 §4.1): one AES encrypt.
@@ -266,6 +356,19 @@ impl<C: BlockCipher> AesKwp<C> {
     /// actual plaintext length is returned and written to the leading bytes
     /// of `out`. Untouched tail bytes are zeroed.
     pub fn unwrap(&self, ciphertext: &[u8], out: &mut [u8]) -> Result<usize, KwError> {
+        self.unwrap_with_aiv_prefix(&RFC5649_AIV_TAG.to_be_bytes(), ciphertext, out)
+    }
+
+    /// [`unwrap`](Self::unwrap), requiring the high 32 bits of the recovered
+    /// AIV to equal `prefix` instead of `A6 59 59 A6` (see
+    /// [`wrap_with_aiv_prefix`](Self::wrap_with_aiv_prefix)). All checks stay
+    /// constant time and fold into the single [`KwError::IntegrityCheck`].
+    pub fn unwrap_with_aiv_prefix(
+        &self,
+        prefix: &[u8; 4],
+        ciphertext: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, KwError> {
         if ciphertext.len() < 16
             || !ciphertext.len().is_multiple_of(8)
             || out.len() + 8 < ciphertext.len()
@@ -296,7 +399,7 @@ impl<C: BlockCipher> AesKwp<C> {
 
         // Validate AIV in constant time, accumulating every failure condition
         // into a single Choice. The three checks RFC 5649 §3 requires are:
-        //   (1) high 32 bits of AIV == 0xA659_59A6
+        //   (1) high 32 bits of AIV == 0xA659_59A6 (or the caller's prefix)
         //   (2) MLI is in (padded_len - 8, padded_len]
         //   (3) padded[mli..padded_len] is all zero
         // The original implementation short-circuited on (1) and used `mli` as
@@ -309,7 +412,7 @@ impl<C: BlockCipher> AesKwp<C> {
         // lossless and a public value.
         let padded_len_u32 = padded_len as u32;
 
-        let tag_ok = high.ct_eq(&RFC5649_AIV_TAG);
+        let tag_ok = high.ct_eq(&u32::from_be_bytes(*prefix));
         // (2a) mli != 0
         let mli_nonzero = !mli_u32.ct_eq(&0u32);
         // (2b) mli <= padded_len  <=>  !(mli > padded_len)
@@ -377,6 +480,37 @@ pub type Aes128Kwp = AesKwp<super::Aes128>;
 pub type Aes192Kwp = AesKwp<super::Aes192>;
 /// AES-256 in padded key-wrap mode (RFC 5649).
 pub type Aes256Kwp = AesKwp<super::Aes256>;
+
+impl<C: BlockCipher> AesKw<InverseCipher<C>> {
+    /// Creates an inverse-cipher key-wrap instance (SP 800-38F §5.1;
+    /// OpenSSL's `AES-*-WRAP-INV`): wrap applies `cipher`'s decryption
+    /// direction and unwrap its encryption direction.
+    pub fn new_inverse(cipher: C) -> Self {
+        AesKw::new(InverseCipher::new(cipher))
+    }
+}
+
+impl<C: BlockCipher> AesKwp<InverseCipher<C>> {
+    /// Creates an inverse-cipher padded key-wrap instance (OpenSSL's
+    /// `AES-*-WRAP-PAD-INV`); see [`AesKw::new_inverse`].
+    pub fn new_inverse(cipher: C) -> Self {
+        AesKwp::new(InverseCipher::new(cipher))
+    }
+}
+
+/// AES-128 key wrap with the inverse cipher (OpenSSL `AES-128-WRAP-INV`).
+pub type Aes128KwInv = AesKw<InverseCipher<super::Aes128>>;
+/// AES-192 key wrap with the inverse cipher (OpenSSL `AES-192-WRAP-INV`).
+pub type Aes192KwInv = AesKw<InverseCipher<super::Aes192>>;
+/// AES-256 key wrap with the inverse cipher (OpenSSL `AES-256-WRAP-INV`).
+pub type Aes256KwInv = AesKw<InverseCipher<super::Aes256>>;
+
+/// AES-128 padded key wrap with the inverse cipher (OpenSSL `AES-128-WRAP-PAD-INV`).
+pub type Aes128KwpInv = AesKwp<InverseCipher<super::Aes128>>;
+/// AES-192 padded key wrap with the inverse cipher (OpenSSL `AES-192-WRAP-PAD-INV`).
+pub type Aes192KwpInv = AesKwp<InverseCipher<super::Aes192>>;
+/// AES-256 padded key wrap with the inverse cipher (OpenSSL `AES-256-WRAP-PAD-INV`).
+pub type Aes256KwpInv = AesKwp<InverseCipher<super::Aes256>>;
 
 #[cfg(test)]
 mod tests {
@@ -626,5 +760,148 @@ mod tests {
                 "case {name}: expected IntegrityCheck, got {err:?}",
             );
         }
+    }
+    /// Custom RFC 3394 IVs and custom KWP AIV prefixes, checked against
+    /// OpenSSL 3.5 (`AES-*-WRAP` with an 8-byte IV, `AES-*-WRAP-PAD` with a
+    /// 4-byte IV). The plaintexts and KEKs are those of RFC 3394 §4.1 / §4.5
+    /// and RFC 5649 §6.
+    #[test]
+    fn custom_iv_matches_openssl() {
+        let kek = from_hex::<16>("000102030405060708090A0B0C0D0E0F");
+        let kek256 =
+            from_hex::<32>("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
+        let pt = from_hex::<16>("00112233445566778899AABBCCDDEEFF");
+        let pt24 = from_hex::<24>("00112233445566778899AABBCCDDEEFF0001020304050607");
+        let iv = from_hex::<8>("0123456789abcdef");
+
+        let kw = Aes128Kw::new(Aes128::new(&kek));
+        let mut ct = [0u8; 24];
+        kw.wrap_with_iv(&iv, &pt, &mut ct).unwrap();
+        assert_eq!(
+            ct,
+            from_hex::<24>("a0f76f4b09e1f2191b8d94da2ca57adfd45ee9732992a98f")
+        );
+        let mut out = [0u8; 16];
+        kw.unwrap_with_iv(&iv, &ct, &mut out).unwrap();
+        assert_eq!(out, pt);
+        // The default-IV unwrap (and any other IV) refuses it, wiping `out`.
+        assert_eq!(kw.unwrap(&ct, &mut out), Err(KwError::IntegrityCheck));
+        assert_eq!(out, [0u8; 16]);
+        // The default IV through the explicit form is plain RFC 3394 §4.1.
+        kw.wrap_with_iv(&[0xA6; 8], &pt, &mut ct).unwrap();
+        assert_eq!(
+            ct,
+            from_hex::<24>("1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5")
+        );
+
+        let kw = Aes256Kw::new(Aes256::new(&kek256));
+        let mut ct = [0u8; 32];
+        kw.wrap_with_iv(&iv, &pt24, &mut ct).unwrap();
+        assert_eq!(
+            ct,
+            from_hex::<32>("48faa68c40bd84e5e9fc5549a6753f62820478931f7c19a40092186b83ef94b2")
+        );
+        let mut out = [0u8; 24];
+        kw.unwrap_with_iv(&iv, &ct, &mut out).unwrap();
+        assert_eq!(out, pt24);
+
+        let kwp = Aes128Kwp::new(Aes128::new(&kek));
+        let prefix = from_hex::<4>("deadbeef");
+        let p7 = from_hex::<7>("466f7250617369");
+        let mut ct = [0u8; 16];
+        kwp.wrap_with_aiv_prefix(&prefix, &p7, &mut ct).unwrap();
+        assert_eq!(ct, from_hex::<16>("d6af17aa7c5ae986baed7b77211aabeb"));
+        let mut out = [0u8; 8];
+        assert_eq!(kwp.unwrap_with_aiv_prefix(&prefix, &ct, &mut out), Ok(7));
+        assert_eq!(&out[..7], &p7);
+        assert_eq!(kwp.unwrap(&ct, &mut out), Err(KwError::IntegrityCheck));
+
+        let p20 = from_hex::<20>("c37b7e6492584340bed12207808941155068f738");
+        let mut ct = [0u8; 32];
+        kwp.wrap_with_aiv_prefix(&prefix, &p20, &mut ct).unwrap();
+        assert_eq!(
+            ct,
+            from_hex::<32>("c5fb137245bd3adaf19794c4e7b4e2c94b9e57217ff9f1baff87c498a5e55739")
+        );
+        let mut out = [0u8; 24];
+        assert_eq!(kwp.unwrap_with_aiv_prefix(&prefix, &ct, &mut out), Ok(20));
+        assert_eq!(&out[..20], &p20);
+    }
+
+    /// The inverse-cipher variants (wrap with AES decryption, unwrap with AES
+    /// encryption) against OpenSSL 3.5 `AES-{128,256}-WRAP-INV` and
+    /// `AES-128-WRAP-PAD-INV`, with and without custom IVs.
+    #[test]
+    fn inverse_cipher_matches_openssl() {
+        let kek = from_hex::<16>("000102030405060708090A0B0C0D0E0F");
+        let kek256 =
+            from_hex::<32>("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
+        let pt = from_hex::<16>("00112233445566778899AABBCCDDEEFF");
+        let pt24 = from_hex::<24>("00112233445566778899AABBCCDDEEFF0001020304050607");
+
+        let kw = Aes128KwInv::new_inverse(Aes128::new(&kek));
+        let mut ct = [0u8; 24];
+        kw.wrap(&pt, &mut ct).unwrap();
+        assert_eq!(
+            ct,
+            from_hex::<24>("88176ec1a7facee6daf9562fc6ca95f894a41b629a6ae5a2")
+        );
+        let mut out = [0u8; 16];
+        kw.unwrap(&ct, &mut out).unwrap();
+        assert_eq!(out, pt);
+        // Not interchangeable with the forward-cipher mode.
+        assert_eq!(
+            Aes128Kw::new(Aes128::new(&kek)).unwrap(&ct, &mut out),
+            Err(KwError::IntegrityCheck)
+        );
+        kw.wrap_with_iv(&from_hex::<8>("0123456789abcdef"), &pt, &mut ct)
+            .unwrap();
+        assert_eq!(
+            ct,
+            from_hex::<24>("7ccc41e6172fb685f1e52a4f398d00151d23d6af45cca612")
+        );
+
+        let kw = Aes256KwInv::new_inverse(Aes256::new(&kek256));
+        let mut ct = [0u8; 32];
+        kw.wrap(&pt24, &mut ct).unwrap();
+        assert_eq!(
+            ct,
+            from_hex::<32>("f6cca933f72cdc085f5c9d170d93e2babea9225450671f38aaf1ae1a3411b73c")
+        );
+        let mut out = [0u8; 24];
+        kw.unwrap(&ct, &mut out).unwrap();
+        assert_eq!(out, pt24);
+
+        let kwp = Aes128KwpInv::new_inverse(Aes128::new(&kek));
+        let prefix = from_hex::<4>("deadbeef");
+        let p7 = from_hex::<7>("466f7250617369");
+        let p20 = from_hex::<20>("c37b7e6492584340bed12207808941155068f738");
+        let mut c16 = [0u8; 16];
+        kwp.wrap(&p7, &mut c16).unwrap();
+        assert_eq!(c16, from_hex::<16>("9bad28ed3a3441d9fae80bb90a94b9b4"));
+        let mut out = [0u8; 8];
+        assert_eq!(kwp.unwrap(&c16, &mut out), Ok(7));
+        assert_eq!(&out[..7], &p7);
+        kwp.wrap_with_aiv_prefix(&prefix, &p7, &mut c16).unwrap();
+        assert_eq!(c16, from_hex::<16>("20081ee1280eab8829ac26da2ce64eaf"));
+
+        let mut c32 = [0u8; 32];
+        kwp.wrap(&p20, &mut c32).unwrap();
+        assert_eq!(
+            c32,
+            from_hex::<32>("e81344ff709e57ef0d19052a1e3cdd7bde4b1311e5a47045dc52d97282fa2c57")
+        );
+        kwp.wrap_with_aiv_prefix(&prefix, &p20, &mut c32).unwrap();
+        assert_eq!(
+            c32,
+            from_hex::<32>("0e456b17cf86124ccf8cb3db48f72142b22895ee4a45609a04aa651c9df88e59")
+        );
+        let mut out = [0u8; 24];
+        assert_eq!(kwp.unwrap_with_aiv_prefix(&prefix, &c32, &mut out), Ok(20));
+        assert_eq!(&out[..20], &p20);
+        assert_eq!(
+            Aes128Kwp::new(Aes128::new(&kek)).unwrap_with_aiv_prefix(&prefix, &c32, &mut out),
+            Err(KwError::IntegrityCheck)
+        );
     }
 }
