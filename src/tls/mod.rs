@@ -94,6 +94,8 @@ pub(crate) mod psk;
 pub(crate) mod quic_hooks;
 mod secret;
 mod signer;
+#[cfg(all(test, feature = "std"))]
+mod tests_options;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 mod version;

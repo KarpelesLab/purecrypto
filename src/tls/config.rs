@@ -262,7 +262,11 @@ pub struct Config {
     pub roots: RootCertStore,
     /// CRLs consulted during chain validation. Empty by default.
     pub crls: CrlStore,
-    /// Signature-algorithm policy (chain + CertificateVerify / SKE sig).
+    /// Signature-algorithm policy (chain + CertificateVerify / SKE sig),
+    /// applied to the peer's certificates and handshake signature. The
+    /// default ([`SignaturePolicy::modern`]) refuses RSA keys under 2048 bits;
+    /// [`ConfigBuilder::min_rsa_key_bits`] lowers that floor for legacy
+    /// peers on this `Config` only.
     pub signature_policy: SignaturePolicy,
 
     // ---- Client-side ----
@@ -1085,6 +1089,27 @@ impl ConfigBuilder {
     /// Replace the signature-algorithm policy.
     pub fn signature_policy(mut self, p: SignaturePolicy) -> Self {
         self.inner.signature_policy = p;
+        self
+    }
+    /// **Insecure, legacy interop only.** Lowers (or raises) the minimum RSA
+    /// modulus size, in bits, that this endpoint's
+    /// [`signature_policy`](Config#structfield.signature_policy) accepts for
+    /// the peer's keys — certificate-chain signatures *and* the handshake
+    /// signature (`CertificateVerify` / `ServerKeyExchange`) — on this
+    /// `Config` only. Shorthand for
+    /// `signature_policy(policy.with_min_rsa_bits(bits))` on the policy
+    /// already installed, so call it *after* any
+    /// [`signature_policy`](Self::signature_policy), which would replace it.
+    ///
+    /// The default floor is 2048 bits. RSA-1024 is within reach of
+    /// well-funded attackers and anything smaller is broken outright; a
+    /// value below 2048 exists only to talk to old devices and test
+    /// fixtures (PHP/OpenSSL test suites still ship 1024-bit certificates).
+    /// Keys under 1024 bits remain unusable whatever this says, because the
+    /// RSA key parser refuses them. Raising the floor (e.g. to 3072) is
+    /// always safe.
+    pub fn min_rsa_key_bits(mut self, bits: u32) -> Self {
+        self.inner.signature_policy = self.inner.signature_policy.with_min_rsa_bits(bits);
         self
     }
     /// Install a CRL store consulted during chain validation.
