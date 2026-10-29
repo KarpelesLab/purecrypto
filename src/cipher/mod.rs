@@ -155,7 +155,7 @@ pub use sm4::Sm4;
 #[cfg(feature = "legacy-ciphers")]
 pub use tea::{Tea, Xtea, Xxtea};
 pub use xchacha20poly1305::XChaCha20Poly1305;
-pub use xts::{Aes128Xts, Aes256Xts, Xts, XtsError};
+pub use xts::{Aes128Xts, Aes256Xts, Sm4Xts, Xts, XtsError, XtsStandard};
 
 /// A block cipher: a keyed, invertible permutation on fixed-size blocks.
 pub trait BlockCipher {

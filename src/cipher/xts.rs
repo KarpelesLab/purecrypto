@@ -19,6 +19,19 @@
 //! Sectors must be at least 16 bytes (one full block); if their length is not
 //! a multiple of 16, ciphertext stealing is used on the trailing partial block.
 //!
+//! # GB/T 17964-2021 tweak variant
+//!
+//! The Chinese national standard GB/T 17964-2021 specifies XTS (typically
+//! over SM4) with the *bit-reversed* tweak arithmetic: the 16-byte tweak is
+//! read as a big-endian GHASH-style field element and multiplied by `x` as
+//! GCM does — shift right by one bit, folding a carried-out bit back in as
+//! `0xE1 ‖ 0¹²⁰`. Everything else (`T₀ = E_{K2}(IV)`, XEX, ciphertext
+//! stealing) is as in IEEE 1619. OpenSSL exposes it as `SM4-XTS` with
+//! `xts_standard = "GB"`; select it here with [`Xts::with_standard`] and
+//! [`XtsStandard::Gb`] (or [`Sm4Xts::from_keys_gb`]). For both standards
+//! the OpenSSL / GB IV is `sector_index.to_le_bytes()`, so a raw 16-byte IV
+//! is passed as `u128::from_le_bytes(iv)`.
+//!
 //! # Limits
 //!
 //! * IEEE 1619-2007 §5.1 and NIST SP 800-38E cap a **data unit** (a "sector"
@@ -103,12 +116,43 @@ fn double_tweak_u128(t: u128) -> u128 {
     (t << 1) ^ (0u128.wrapping_sub(t >> 127) & 0x87)
 }
 
+/// Which tweak-update rule an [`Xts`] context applies between blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum XtsStandard {
+    /// IEEE 1619-2007 / NIST SP 800-38E: little-endian tweak, multiply by α
+    /// modulo `x¹²⁸ + x⁷ + x² + x + 1` (reduction `0x87`). The default.
+    #[default]
+    Ieee1619,
+    /// GB/T 17964-2021: big-endian, bit-reversed tweak, multiplied by `x` as
+    /// in GHASH (reduction `0xE1 ‖ 0¹²⁰`). OpenSSL's `xts_standard = "GB"`.
+    Gb,
+}
+
+/// GB/T 17964 tweak update on the big-endian `u128` form: multiply by `x` in
+/// the GHASH bit order (shift right, fold the carry back as `0xE1 ‖ 0¹²⁰`),
+/// branch-free like [`double_tweak_u128`].
+#[inline]
+fn gb_mul_x_u128(t: u128) -> u128 {
+    (t >> 1) ^ (0u128.wrapping_sub(t & 1) & (0xe1u128 << 120))
+}
+
+/// Advances a tweak by one block position under `std`.
+#[inline]
+fn step_tweak(std: XtsStandard, t: &mut [u8; 16]) {
+    match std {
+        XtsStandard::Ieee1619 => double_tweak(t),
+        XtsStandard::Gb => *t = gb_mul_x_u128(u128::from_be_bytes(*t)).to_be_bytes(),
+    }
+}
+
 /// AES-XTS context — uses two independent block-cipher instances (data key
 /// and tweak key) of the same type.
 #[derive(Clone)]
 pub struct Xts<C: BlockCipher> {
     cipher_data: C,
     cipher_tweak: C,
+    standard: XtsStandard,
 }
 
 impl<C: BlockCipher> Xts<C> {
@@ -126,10 +170,23 @@ impl<C: BlockCipher> Xts<C> {
     /// zero) purely to pin the arithmetic, which is why this is not a hard
     /// reject here.
     pub fn new(cipher_data: C, cipher_tweak: C) -> Self {
+        Self::with_standard(cipher_data, cipher_tweak, XtsStandard::Ieee1619)
+    }
+
+    /// Like [`new`](Self::new), but selects the tweak-update rule — e.g.
+    /// [`XtsStandard::Gb`] for GB/T 17964 (OpenSSL's SM4-XTS with
+    /// `xts_standard = "GB"`). The same `K1 ≠ K2` caveat applies.
+    pub fn with_standard(cipher_data: C, cipher_tweak: C, standard: XtsStandard) -> Self {
         Self {
             cipher_data,
             cipher_tweak,
+            standard,
         }
+    }
+
+    /// The tweak-update rule this context applies.
+    pub fn standard(&self) -> XtsStandard {
+        self.standard
     }
 
     /// Maximum number of 16-byte blocks in one data unit (IEEE 1619-2007
@@ -195,6 +252,7 @@ impl<C: BlockCipher> Xts<C> {
         // Encrypt the first `full_to_emit` complete blocks.
         xex_blocks(
             &self.cipher_data,
+            self.standard,
             &mut buf[..full_to_emit * 16],
             &mut t,
             true,
@@ -221,7 +279,7 @@ impl<C: BlockCipher> Xts<C> {
         let cc = block;
 
         // Step the tweak by α: T → T'.
-        double_tweak(&mut t);
+        step_tweak(self.standard, &mut t);
 
         // PP = P_partial ‖ CC[rem..]
         let mut pp = [0u8; 16];
@@ -253,6 +311,7 @@ impl<C: BlockCipher> Xts<C> {
         // Decrypt the first `full_to_emit` complete blocks.
         xex_blocks(
             &self.cipher_data,
+            self.standard,
             &mut buf[..full_to_emit * 16],
             &mut t,
             false,
@@ -272,7 +331,7 @@ impl<C: BlockCipher> Xts<C> {
 
         // Compute T' = T · α (the same step the encrypter did).
         let mut t_next = t;
-        double_tweak(&mut t_next);
+        step_tweak(self.standard, &mut t_next);
 
         // PP = XEX_T'^{-1}(C_{n-1})
         let mut pp = [0u8; 16];
@@ -298,18 +357,61 @@ impl<C: BlockCipher> Xts<C> {
 /// window are generated serially (`t` advances by α per block, ending at the
 /// tweak for the block after `buf`), and the masked blocks go through the
 /// batched cipher, which feeds the hardware pipeline.
-fn xex_blocks<C: BlockCipher>(cipher: &C, buf: &mut [u8], t: &mut [u8; 16], encrypt: bool) {
+fn xex_blocks<C: BlockCipher>(
+    cipher: &C,
+    standard: XtsStandard,
+    buf: &mut [u8],
+    t: &mut [u8; 16],
+    encrypt: bool,
+) {
+    // The tweak advances as a `u128` (one shift, one mask, one XOR per block)
+    // in the byte order its standard multiplies in — little-endian for IEEE
+    // 1619, big-endian for GB/T 17964. Each rule gets its own monomorphised
+    // copy of the loop so the step inlines.
+    match standard {
+        XtsStandard::Ieee1619 => xex_blocks_with(
+            cipher,
+            buf,
+            t,
+            encrypt,
+            u128::from_le_bytes,
+            u128::to_le_bytes,
+            double_tweak_u128,
+        ),
+        XtsStandard::Gb => xex_blocks_with(
+            cipher,
+            buf,
+            t,
+            encrypt,
+            u128::from_be_bytes,
+            u128::to_be_bytes,
+            gb_mul_x_u128,
+        ),
+    }
+}
+
+/// [`xex_blocks`] for one tweak representation: `load` / `store` convert
+/// between the tweak bytes and the `u128` that `step` multiplies.
+fn xex_blocks_with<C: BlockCipher>(
+    cipher: &C,
+    buf: &mut [u8],
+    t: &mut [u8; 16],
+    encrypt: bool,
+    load: impl Fn([u8; 16]) -> u128,
+    store: impl Fn(u128) -> [u8; 16],
+    step: impl Fn(u128) -> u128,
+) {
     const W: usize = 64;
     let mut tweaks = [0u8; 16 * W];
-    // The tweak advances as a little-endian `u128` (one shift, one mask, one
-    // XOR per block) and is stored once per block for the post-XOR.
-    let mut tw = u128::from_le_bytes(*t);
+    let mut tw = load(*t);
     for window in buf.chunks_mut(16 * W) {
         for (blk, slot) in window.chunks_exact_mut(16).zip(tweaks.chunks_exact_mut(16)) {
-            slot.copy_from_slice(&tw.to_le_bytes());
-            let b: &mut [u8; 16] = blk.try_into().expect("16-byte block");
-            *b = (u128::from_le_bytes(*b) ^ tw).to_le_bytes();
-            tw = double_tweak_u128(tw);
+            let tb = store(tw);
+            slot.copy_from_slice(&tb);
+            for (b, k) in blk.iter_mut().zip(tb.iter()) {
+                *b ^= *k;
+            }
+            tw = step(tw);
         }
         if encrypt {
             cipher.encrypt_blocks(window);
@@ -320,7 +422,7 @@ fn xex_blocks<C: BlockCipher>(cipher: &C, buf: &mut [u8], t: &mut [u8; 16], encr
             *b ^= *k;
         }
     }
-    *t = tw.to_le_bytes();
+    *t = store(tw);
     // The tweaks are E_K2(sector) multiples: key-derived masks.
     tweaks.zeroize();
 }
@@ -381,6 +483,25 @@ macro_rules! xts_byte_key_ctors {
 
 xts_byte_key_ctors!(super::Aes128, 16, 32, "XTS-AES-128");
 xts_byte_key_ctors!(super::Aes256, 32, 64, "XTS-AES-256");
+
+/// SM4-XTS — two 128-bit SM4 keys. Use [`Sm4Xts::from_keys_gb`] (or
+/// [`Xts::with_standard`]) for the GB/T 17964 tweak rule.
+pub type Sm4Xts = Xts<super::Sm4>;
+
+xts_byte_key_ctors!(super::Sm4, 16, 32, "SM4-XTS");
+
+impl Xts<super::Sm4> {
+    /// Creates a GB/T 17964-2021 SM4-XTS context (OpenSSL's `SM4-XTS` with
+    /// `xts_standard = "GB"`) from the data key `k1` and tweak key `k2`.
+    ///
+    /// Returns [`XtsError::RepeatedKey`] if `k1 == k2` (constant-time
+    /// comparison), like [`from_keys`](Self::from_keys).
+    pub fn from_keys_gb(k1: &[u8; 16], k2: &[u8; 16]) -> Result<Self, XtsError> {
+        let mut x = Self::from_keys(k1, k2)?;
+        x.standard = XtsStandard::Gb;
+        Ok(x)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -612,5 +733,99 @@ mod tests {
             xts.decrypt_sector(0x4242, &mut buf[..len]).unwrap();
             assert_eq!(&buf[..len], &original[..len]);
         }
+    }
+    /// GB/T 17964 SM4-XTS against OpenSSL 3.5 (`SM4-XTS` with the
+    /// `xts_standard = "GB"` parameter), plus the IEEE rule over SM4 for
+    /// contrast. Key, IV and plaintext are those of OpenSSL's
+    /// `evpciph_sm4.txt` SM4-XTS entries; every ciphertext here was produced
+    /// with OpenSSL 3.5 libcrypto. IV `f0f1…ff` is passed as
+    /// `u128::from_le_bytes(iv)`.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn sm4_xts_gb_matches_openssl() {
+        use crate::test_util::from_hex_vec;
+        let key =
+            from_hex::<32>("2b7e151628aed2a6abf7158809cf4f3c000102030405060708090a0b0c0d0e0f");
+        let iv = u128::from_le_bytes(from_hex::<16>("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"));
+        let pt = from_hex::<64>(
+            "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51\
+             30c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710",
+        );
+        let gb: &[(usize, &str)] = &[
+            (16, "e9538251c71d7b80bbe4483fef497bd1"),
+            (17, "81496f38c32b1c51380ab419f387b71be9"),
+            (
+                31,
+                "bf79d6ef4d74424b9e33bd542b226451e9538251c71d7b80bbe4483fef497b",
+            ),
+            (
+                33,
+                "e9538251c71d7b80bbe4483fef497bd19034da0becda99dc089aa233aec3a62a2c",
+            ),
+            (
+                47,
+                "e9538251c71d7b80bbe4483fef497bd160f7d838e533b475e9b0c7127f706797\
+                 2c5c581bd6242fc51e08964fb4f60f",
+            ),
+            (
+                64,
+                "e9538251c71d7b80bbe4483fef497bd12c5c581bd6242fc51e08964fb4f60fdb\
+                 903be7f93a1b3479d04feccfb820302cdd775df32ae47354cf4e925252d50796",
+            ),
+        ];
+        let ieee: &[(usize, &str)] = &[
+            (17, "9e1222501a2c11d97b0c7b22f5580d59e9"),
+            (
+                64,
+                "e9538251c71d7b80bbe4483fef497bd1b3db1a3e60408c575d63ff7db39f8326\
+                 27d16c0db6d2cfc741314642ed88079d5036738c357cd24d0781c9f477f2d316",
+            ),
+        ];
+        let (k1, k2) = key.split_at(16);
+        let (k1, k2): (&[u8; 16], &[u8; 16]) = (k1.try_into().unwrap(), k2.try_into().unwrap());
+        let x_gb = Sm4Xts::from_keys_gb(k1, k2).unwrap();
+        assert_eq!(x_gb.standard(), XtsStandard::Gb);
+        let x_ieee = Sm4Xts::new_from_key_bytes(&key).unwrap();
+        assert_eq!(x_ieee.standard(), XtsStandard::Ieee1619);
+        for (xts, cases) in [(&x_gb, gb), (&x_ieee, ieee)] {
+            for &(len, ct) in cases {
+                let mut buf = pt[..len].to_vec();
+                xts.encrypt_sector_checked(iv, &mut buf).unwrap();
+                assert_eq!(buf, from_hex_vec(ct), "{:?} len {len}", xts.standard());
+                xts.decrypt_sector_checked(iv, &mut buf).unwrap();
+                assert_eq!(buf, &pt[..len]);
+            }
+        }
+        assert_eq!(
+            Sm4Xts::from_keys_gb(k1, k1).err(),
+            Some(XtsError::RepeatedKey)
+        );
+    }
+
+    /// The GB rule through the windowed bulk path (more than one 64-block
+    /// window, with stealing): OpenSSL 3.5 GB SM4-XTS of the 1125-byte
+    /// message `(7i + 3) mod 256` has the SHA-256 below.
+    #[cfg(all(feature = "alloc", feature = "hash"))]
+    #[test]
+    fn sm4_xts_gb_bulk_matches_openssl() {
+        use alloc::vec::Vec;
+        let key =
+            from_hex::<32>("2b7e151628aed2a6abf7158809cf4f3c000102030405060708090a0b0c0d0e0f");
+        let iv = u128::from_le_bytes(from_hex::<16>("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"));
+        let pt: Vec<u8> = (0..16 * 70 + 5).map(|i| (i * 7 + 3) as u8).collect();
+        let (k1, k2) = key.split_at(16);
+        let xts = Xts::with_standard(
+            crate::cipher::Sm4::new(k1.try_into().unwrap()),
+            crate::cipher::Sm4::new(k2.try_into().unwrap()),
+            XtsStandard::Gb,
+        );
+        let mut buf = pt.clone();
+        xts.encrypt_sector(iv, &mut buf).unwrap();
+        assert_eq!(
+            crate::hash::sha256(&buf),
+            from_hex::<32>("f8aee7e656cce364beae149258e4f5712715b2381c650c195de9ed619cb5a704")
+        );
+        xts.decrypt_sector(iv, &mut buf).unwrap();
+        assert_eq!(buf, pt);
     }
 }
