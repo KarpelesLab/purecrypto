@@ -495,7 +495,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "legacy-ciphers"))]
+#[cfg(all(test, feature = "legacy-ciphers", feature = "alloc"))]
 mod public_tests {
     use super::Blowfish;
     use crate::cipher::{BlockCipher64, Cbc64, Cfb64, InvalidKeyLength, Ofb64};

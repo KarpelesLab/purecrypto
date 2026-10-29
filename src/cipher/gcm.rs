@@ -1092,7 +1092,6 @@ mod tests {
     /// (`EVP_aes_128_gcm`, `EVP_CTRL_GCM_GET_TAG` with lengths 4..16).
     #[test]
     fn truncated_tags() {
-        use std::vec::Vec;
         let g = gcm128("feffe9928665731c6d6a8f9467308308");
         let nonce = from_hex::<12>("cafebabefacedbaddecaf888");
         let aad = from_hex::<20>("feedfacedeadbeeffeedfacedeadbeefabaddad2");
@@ -1117,12 +1116,12 @@ mod tests {
         }
 
         // OpenSSL 3.5 cross-check: 37-byte message 00 01 .. 24, 4-byte tag.
-        let msg: Vec<u8> = (0u8..37).collect();
+        let msg: [u8; 37] = core::array::from_fn(|i| i as u8);
         let ct = from_hex::<37>(
             "9bb32ee4ddf674c6e62222792728fc09751c9a6f2d23452d03945405bf8035431dc83a04e5",
         );
         let ossl_tag = from_hex::<16>("ab8d224bb691691aa4ad4b4dfc686439");
-        let mut buf = msg.clone();
+        let mut buf = msg;
         let mut tag4 = [0u8; 4];
         g.try_encrypt_truncated(&nonce, &aad, &mut buf, &mut tag4)
             .unwrap();
@@ -1147,7 +1146,7 @@ mod tests {
         // Lengths outside 4..=16 are refused before anything is touched.
         for t in [0usize, 1, 3, 17] {
             let mut tag = [0u8; 17];
-            let mut b = msg.clone();
+            let mut b = msg;
             assert_eq!(
                 g.try_encrypt_truncated(&nonce, &aad, &mut b, &mut tag[..t]),
                 Err(AeadError::InvalidTagLength)

@@ -171,7 +171,7 @@ impl Drop for Idea {
 
 impl ZeroizeOnDrop for Idea {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::cipher::{Cbc64, Cfb64, Ofb64};

@@ -973,7 +973,9 @@ mod tests {
     #[test]
     fn openssl_vectors() {
         use crate::hash::Sha256;
-        let text = include_str!("../../../testdata/ec-binary/openssl-vectors.txt");
+        // A Windows checkout may have converted the file to CRLF.
+        let text =
+            include_str!("../../../testdata/ec-binary/openssl-vectors.txt").replace("\r\n", "\n");
         let msg = b"purecrypto binary-curve interop\n";
         let mut seen = alloc::collections::BTreeSet::new();
         for block in text.split("\n\n").filter(|b| b.starts_with("curve")) {

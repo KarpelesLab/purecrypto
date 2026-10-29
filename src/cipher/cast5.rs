@@ -552,7 +552,7 @@ static S8: [u32; 256] = [
     0x04f19130, 0xba6e4ec0, 0x99265164, 0x1ee7230d, 0x50b2ad80, 0xeaee6801, 0x8db2a283, 0xea8bf59e,
 ];
 
-#[cfg(test)]
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::cipher::{Cbc64, Cfb64, Ofb64};
