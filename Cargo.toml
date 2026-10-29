@@ -189,7 +189,9 @@ __ct-check = []
 # hazmat: low-level arithmetic exposures with NO semver-stability guarantee;
 # the caller owns correctness and constant-time discipline. Off by default.
 # `edwards25519::hazmat` exposes the order-L `Scalar` and the `EdwardsPoint`
-# group over the shared curve25519 backend (for FROST / threshold callers).
+# group over the shared curve25519 backend (for FROST / threshold callers),
+# plus point coordinates, a minimal GF(2^255-19) `FieldElement`, the
+# Montgomery u map, and a vartime `[a]A + [b]B`.
 hazmat-edwards25519 = ["ec"]
 # ristretto255 (RFC 9496) — a STABLE public prime-order group module (not
 # hazmat), the natural FROST dependency. Shares the order-L `Scalar` with
