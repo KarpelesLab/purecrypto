@@ -161,6 +161,10 @@ pub(crate) trait Lanes: Copy {
     unsafe fn andnot(self, o: Self) -> Self;
     unsafe fn add64(self, o: Self) -> Self;
     unsafe fn add32(self, o: Self) -> Self;
+    /// `self + d` as a 128-bit integer per lane, for `d` below 2⁶⁴ (low
+    /// half only): the 64-bit add plus the branch-free carry into the high
+    /// half, in each tier's cheapest form.
+    unsafe fn add128(self, d: Self) -> Self;
     /// Logical right shift of each 64-bit element by 63.
     unsafe fn srl63(self) -> Self;
     /// Byte shift left by 8 within each 128-bit lane.
@@ -245,6 +249,15 @@ impl Lanes for Xmm {
     #[inline(always)]
     unsafe fn add32(self, o: Self) -> Self {
         unsafe { Xmm(_mm_add_epi32(self.0, o.0)) }
+    }
+    #[inline(always)]
+    unsafe fn add128(self, d: Self) -> Self {
+        // carry = msb((c ∧ d) ∨ ((c ∨ d) ∧ ¬s)); SSE2 has no 64-bit compare.
+        unsafe {
+            let s = self.add64(d);
+            let carry = self.and(d).or(s.andnot(self.or(d))).srl63().bsll8();
+            s.add64(carry)
+        }
     }
     #[inline(always)]
     unsafe fn srl63(self) -> Self {
@@ -359,6 +372,18 @@ impl Lanes for Ymm {
     #[inline(always)]
     unsafe fn add32(self, o: Self) -> Self {
         unsafe { Ymm(_mm256_add_epi32(self.0, o.0)) }
+    }
+    #[inline(always)]
+    unsafe fn add128(self, d: Self) -> Self {
+        // The low half carried iff s < d (unsigned): a signed compare with
+        // both sides offset by 2⁶³ gives an all-ones mask, which moved to
+        // the high half and subtracted adds the carry.
+        unsafe {
+            let s = _mm256_add_epi64(self.0, d.0);
+            let bias = _mm256_set1_epi64x(i64::MIN);
+            let m = _mm256_cmpgt_epi64(_mm256_xor_si256(d.0, bias), _mm256_xor_si256(s, bias));
+            Ymm(_mm256_sub_epi64(s, _mm256_bslli_epi128::<8>(m)))
+        }
     }
     #[inline(always)]
     unsafe fn srl63(self) -> Self {
@@ -481,6 +506,16 @@ impl Lanes for Zmm {
         unsafe { Zmm(_mm512_add_epi32(self.0, o.0)) }
     }
     #[inline(always)]
+    unsafe fn add128(self, d: Self) -> Self {
+        // As `Xmm` (a compare into a mask register and a masked add measured
+        // slower on Zen 5; the formula becomes one VPTERNLOGQ here).
+        unsafe {
+            let s = self.add64(d);
+            let carry = self.and(d).or(s.andnot(self.or(d))).srl63().bsll8();
+            s.add64(carry)
+        }
+    }
+    #[inline(always)]
     unsafe fn srl63(self) -> Self {
         unsafe { Zmm(_mm512_srli_epi64::<63>(self.0)) }
     }
@@ -584,6 +619,19 @@ unsafe fn dec_keys<V: Lanes, const NR: usize>(rk: *const u8) -> [V; 15] {
     }
 }
 
+/// Keeps the instruction schedule round-major. Under register pressure
+/// (eight state vectors, the round keys, counter constants, GHASH operands)
+/// LLVM's machine scheduler otherwise reorders the independent AES chains
+/// vector by vector, leaving only two or so in flight, and hoists the
+/// stitched GHASH work out of the rounds; measured on Zen 5 that costs
+/// 10-25% in CTR and GCM. A compiler fence emits no instruction but splits
+/// the scheduling region, so each round's AES instructions (and the GHASH
+/// step placed with it) stay together.
+#[inline(always)]
+fn round_fence() {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 /// The full forward cipher on `N` vectors.
 #[inline(always)]
 unsafe fn encrypt_n<V: Lanes, const NR: usize, const N: usize>(b: &mut [V; G], k: &[V; 15]) {
@@ -595,6 +643,7 @@ unsafe fn encrypt_n<V: Lanes, const NR: usize, const N: usize>(b: &mut [V; G], k
             for x in b[..N].iter_mut() {
                 *x = x.enc(*kr);
             }
+            round_fence();
         }
         for x in b[..N].iter_mut() {
             *x = x.enc_last(k[NR]);
@@ -613,6 +662,7 @@ unsafe fn decrypt_n<V: Lanes, const NR: usize, const N: usize>(b: &mut [V; G], k
             for x in b[..N].iter_mut() {
                 *x = x.dec(k[r]);
             }
+            round_fence();
         }
         for x in b[..N].iter_mut() {
             *x = x.dec_last(k[0]);
@@ -642,14 +692,12 @@ pub(crate) const CTR32_LE: u8 = 2; // AES-GCM-SIV: first 4 bytes, little-endian
 
 /// `c + d` per lane in the counter flavour `MODE` (`d` < 2⁶⁴ in the low
 /// half). The 128-bit form propagates the carry out of the low half
-/// branch-free: `carry = msb((c ∧ d) ∨ ((c ∨ d) ∧ ¬s))`.
+/// branch-free ([`Lanes::add128`]).
 #[inline(always)]
 unsafe fn ctr_add<V: Lanes, const MODE: u8>(c: V, d: V) -> V {
     unsafe {
         if MODE == CTR128_BE {
-            let s = c.add64(d);
-            let carry = c.and(d).or(s.andnot(c.or(d))).srl63().bsll8();
-            s.add64(carry)
+            c.add128(d)
         } else {
             c.add32(d)
         }
@@ -673,10 +721,12 @@ unsafe fn ctr_to_reg<const MODE: u8>(b: __m128i) -> __m128i {
 #[inline(always)]
 unsafe fn ecb_group<V: Lanes, const NR: usize, const DEC: bool, const N: usize>(
     k: &[V; 15],
-    b: &mut [V; G],
     p: *mut u8,
 ) {
     unsafe {
+        // A local array: kept in registers, not pinned to a stack slot.
+        let mut b = [V::zero(); G];
+        let b = &mut b;
         for (j, x) in b[..N].iter_mut().enumerate() {
             *x = V::load(p.add(16 * V::L * j));
         }
@@ -705,30 +755,28 @@ unsafe fn ecb_run<V: Lanes, const NR: usize, const DEC: bool>(
         } else {
             enc_keys::<V, NR>(rk)
         };
-        let mut b = [V::zero(); G];
         let l = V::L;
         while n >= G * l {
-            ecb_group::<V, NR, DEC, G>(&k, &mut b, p);
+            ecb_group::<V, NR, DEC, G>(&k, p);
             p = p.add(16 * G * l);
             n -= G * l;
         }
         if n >= 4 * l {
-            ecb_group::<V, NR, DEC, 4>(&k, &mut b, p);
+            ecb_group::<V, NR, DEC, 4>(&k, p);
             p = p.add(64 * l);
             n -= 4 * l;
         }
         if n >= 2 * l {
-            ecb_group::<V, NR, DEC, 2>(&k, &mut b, p);
+            ecb_group::<V, NR, DEC, 2>(&k, p);
             p = p.add(32 * l);
             n -= 2 * l;
         }
         if n >= l {
-            ecb_group::<V, NR, DEC, 1>(&k, &mut b, p);
+            ecb_group::<V, NR, DEC, 1>(&k, p);
             p = p.add(16 * l);
             n -= l;
         }
         wipe(&mut k);
-        wipe(&mut b);
         (p, n)
     }
 }
@@ -752,10 +800,12 @@ unsafe fn ecb_kernel<V: Lanes, const NR: usize, const DEC: bool>(rk: &[u8], buf:
 unsafe fn ctr_group<V: Lanes, const NR: usize, const MODE: u8, const N: usize>(
     k: &[V; 15],
     c: &mut V,
-    b: &mut [V; G],
     p: *mut u8,
 ) {
     unsafe {
+        // A local array: kept in registers, not pinned to a stack slot.
+        let mut b = [V::zero(); G];
+        let b = &mut b;
         for (j, x) in b[..N].iter_mut().enumerate() {
             *x = if j == 0 {
                 *c
@@ -792,44 +842,40 @@ unsafe fn ctr_run<V: Lanes, const NR: usize, const MODE: u8>(
         let mut next = c;
         if n >= l {
             let mut k = enc_keys::<V, NR>(rk);
-            let mut b = [V::zero(); G];
             let mut cv = ctr_add::<V, MODE>(V::splat(c), lane_index());
             while n >= G * l {
-                ctr_group::<V, NR, MODE, G>(&k, &mut cv, &mut b, p);
+                ctr_group::<V, NR, MODE, G>(&k, &mut cv, p);
                 p = p.add(16 * G * l);
                 n -= G * l;
             }
             if n >= 4 * l {
-                ctr_group::<V, NR, MODE, 4>(&k, &mut cv, &mut b, p);
+                ctr_group::<V, NR, MODE, 4>(&k, &mut cv, p);
                 p = p.add(64 * l);
                 n -= 4 * l;
             }
             if n >= 2 * l {
-                ctr_group::<V, NR, MODE, 2>(&k, &mut cv, &mut b, p);
+                ctr_group::<V, NR, MODE, 2>(&k, &mut cv, p);
                 p = p.add(32 * l);
                 n -= 2 * l;
             }
             if n >= l {
-                ctr_group::<V, NR, MODE, 1>(&k, &mut cv, &mut b, p);
+                ctr_group::<V, NR, MODE, 1>(&k, &mut cv, p);
                 p = p.add(16 * l);
                 n -= l;
             }
             next = cv.first();
             wipe(&mut k);
-            wipe(&mut b);
         }
         if n > 0 {
             // At most three blocks (`L ≤ 4`), one at a time.
             let mut k = enc_keys::<Xmm, NR>(rk);
-            let mut b = [Xmm::zero(); G];
             let mut cv = Xmm(next);
             for _ in 0..n {
-                ctr_group::<Xmm, NR, MODE, 1>(&k, &mut cv, &mut b, p);
+                ctr_group::<Xmm, NR, MODE, 1>(&k, &mut cv, p);
                 p = p.add(16);
             }
             next = cv.0;
             wipe(&mut k);
-            wipe(&mut b);
         }
         next
     }
@@ -899,11 +945,13 @@ unsafe fn cbc_encrypt_kernel<const NR: usize>(rk: &[u8], iv: &mut [u8; 16], buf:
 #[inline(always)]
 unsafe fn cbc_dec_group<V: Lanes, const NR: usize, const N: usize>(
     k: &[V; 15],
-    b: &mut [V; G],
     last: &mut __m128i,
     p: *mut u8,
 ) {
     unsafe {
+        // A local array: kept in registers, not pinned to a stack slot.
+        let mut b = [V::zero(); G];
+        let b = &mut b;
         let l = V::L;
         for (j, x) in b[..N].iter_mut().enumerate() {
             *x = V::load(p.add(16 * l * j));
@@ -934,29 +982,27 @@ unsafe fn cbc_dec_run<V: Lanes, const NR: usize>(
     unsafe {
         let l = V::L;
         let mut k = dec_keys::<V, NR>(rk);
-        let mut b = [V::zero(); G];
         while n >= G * l {
-            cbc_dec_group::<V, NR, G>(&k, &mut b, last, p);
+            cbc_dec_group::<V, NR, G>(&k, last, p);
             p = p.add(16 * G * l);
             n -= G * l;
         }
         if n >= 4 * l {
-            cbc_dec_group::<V, NR, 4>(&k, &mut b, last, p);
+            cbc_dec_group::<V, NR, 4>(&k, last, p);
             p = p.add(64 * l);
             n -= 4 * l;
         }
         if n >= 2 * l {
-            cbc_dec_group::<V, NR, 2>(&k, &mut b, last, p);
+            cbc_dec_group::<V, NR, 2>(&k, last, p);
             p = p.add(32 * l);
             n -= 2 * l;
         }
         if n >= l {
-            cbc_dec_group::<V, NR, 1>(&k, &mut b, last, p);
+            cbc_dec_group::<V, NR, 1>(&k, last, p);
             p = p.add(16 * l);
             n -= l;
         }
         wipe(&mut k);
-        wipe(&mut b);
         (p, n)
     }
 }
@@ -1200,7 +1246,6 @@ pub(crate) unsafe fn ghash_table(h: u128) -> HTable {
 unsafe fn gcm_group<V: Lanes, const NR: usize>(
     k: &[V; 15],
     c: &mut V,
-    b: &mut [V; G],
     hp: &[V; G],
     hk: &[V; G],
     a: &mut __m128i,
@@ -1208,6 +1253,9 @@ unsafe fn gcm_group<V: Lanes, const NR: usize>(
     io: *mut u8,
 ) {
     unsafe {
+        // A local array: kept in registers, not pinned to a stack slot.
+        let mut b = [V::zero(); G];
+        let b = &mut b;
         let l = V::L;
         for (j, x) in b.iter_mut().enumerate() {
             *x = if j == 0 {
@@ -1235,6 +1283,7 @@ unsafe fn gcm_group<V: Lanes, const NR: usize>(
                 }
                 acc.mul(d, hp[j], hk[j]);
             }
+            round_fence();
         }
         for x in b.iter_mut() {
             *x = x.enc_last(k[NR]);
@@ -1246,6 +1295,9 @@ unsafe fn gcm_group<V: Lanes, const NR: usize>(
         }
     }
 }
+
+/// How many groups behind its AES the stitched encryption hashes.
+const LAG: usize = 2;
 
 /// GCM bulk: CTR (`inc32`) from counter block `ctr` (a big-endian `u128`)
 /// over the whole blocks of `buf` in place, and GHASH of the ciphertext into
@@ -1269,34 +1321,44 @@ unsafe fn gcm_kernel<V: Lanes, const NR: usize, const ENC: bool>(
         let mut c = _mm_loadu_si128(ctr.to_le_bytes().as_ptr() as *const __m128i);
         let mut a = _mm_loadu_si128(x.to_le_bytes().as_ptr() as *const __m128i);
 
-        if n >= 2 * G * l || (!ENC && n >= G * l) {
+        if n >= LAG * G * l + G * l || (!ENC && n >= G * l) {
             let mut k = enc_keys::<V, NR>(rkp);
-            let mut b = [V::zero(); G];
             let mut hp = [V::zero(); G];
             let mut hk = [V::zero(); G];
             load_powers(htab, G * l, G, &mut hp, &mut hk);
             let mut cv = ctr_add::<V, CTR32_BE>(V::splat(c), lane_index());
             if ENC {
-                // The first group has no ciphertext before it to hash.
-                ctr_group::<V, NR, CTR32_BE, G>(&k, &mut cv, &mut b, p);
-                p = p.add(16 * G * l);
-                n -= G * l;
-                while n >= G * l {
-                    gcm_group::<V, NR>(&k, &mut cv, &mut b, &hp, &hk, &mut a, p.sub(16 * G * l), p);
-                    p = p.add(16 * G * l);
+                // Encryption hashes the ciphertext of the group `LAG` groups
+                // back, so the GHASH loads never wait on the stores that end
+                // the group just before (two groups back measured a few
+                // percent faster than one on Zen 5). The first `LAG` groups
+                // have nothing to hash yet.
+                let gb = 16 * G * l;
+                for _ in 0..LAG {
+                    ctr_group::<V, NR, CTR32_BE, G>(&k, &mut cv, p);
+                    p = p.add(gb);
                     n -= G * l;
                 }
-                a = ghash_chunk::<V, true>(a, &hp, &hk, p.sub(16 * G * l), G);
-            } else {
                 while n >= G * l {
-                    gcm_group::<V, NR>(&k, &mut cv, &mut b, &hp, &hk, &mut a, p, p);
-                    p = p.add(16 * G * l);
+                    gcm_group::<V, NR>(&k, &mut cv, &hp, &hk, &mut a, p.sub(LAG * gb), p);
+                    p = p.add(gb);
+                    n -= G * l;
+                }
+                for i in (1..=LAG).rev() {
+                    a = ghash_chunk::<V, true>(a, &hp, &hk, p.sub(i * gb), G);
+                }
+            } else {
+                // Decryption hashes the ciphertext of the group it is
+                // decrypting, before the XOR overwrites it.
+                let gb = 16 * G * l;
+                while n >= G * l {
+                    gcm_group::<V, NR>(&k, &mut cv, &hp, &hk, &mut a, p, p);
+                    p = p.add(gb);
                     n -= G * l;
                 }
             }
             c = cv.first();
             wipe(&mut k);
-            wipe(&mut b);
             wipe(&mut hp);
             wipe(&mut hk);
         }

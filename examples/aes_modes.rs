@@ -60,6 +60,9 @@ fn main() {
             flip = !flip;
             g128.decrypt(&nonce, b"", b, t).expect("valid tag");
         });
+        run("ghash (aad only)", &mut |b| {
+            black_box(g128.encrypt(&nonce, b, &mut []));
+        });
         run("aes256-gcm-enc", &mut |b| {
             black_box(g256.encrypt(&nonce, b"", b));
         });
