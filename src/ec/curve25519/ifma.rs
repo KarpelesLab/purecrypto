@@ -161,10 +161,12 @@ unsafe fn blend<const IMM: i32>(a: &[__m256i; 5], b: &[__m256i; 5]) -> [__m256i;
 }
 
 /// 32-bit blend immediates selecting whole 64-bit lanes.
+const LANE0: i32 = 0b0000_0011;
 const LANE1: i32 = 0b0000_1100;
 const LANE01: i32 = 0b0000_1111;
 const LANE2: i32 = 0b0011_0000;
 const LANE13: i32 = 0b1100_1100;
+const LANE3: i32 = 0b1100_0000;
 const LANE23: i32 = 0b1111_0000;
 
 #[inline(always)]
@@ -280,3 +282,371 @@ unsafe fn ladder_ifma(k: &[u8; 32], x1: &Fe) -> (Fe, Fe) {
         (x2, z2)
     }
 }
+
+/// `vpermq` immediate placing source lanes `(a, b, c, d)` into lanes 0..3.
+const fn sel(a: i32, b: i32, c: i32, d: i32) -> i32 {
+    a | (b << 2) | (c << 4) | (d << 6)
+}
+
+/// `a` where the broadcast mask `m` is zero, `b` where it is all-ones.
+#[inline(always)]
+unsafe fn select(a: &F4, b: &F4, m: __m256i) -> F4 {
+    let mut r = a.0;
+    for i in 0..5 {
+        r[i] = unsafe {
+            _mm256_xor_si256(
+                a.0[i],
+                _mm256_and_si256(m, _mm256_xor_si256(a.0[i], b.0[i])),
+            )
+        };
+    }
+    F4(r)
+}
+
+/// Edwards points on four lanes: extended `[X, Y, Z, T]`, or cached
+/// `[Y − X, Y + X, 2Z, 2dT]` (the addend of [`ext_add`]), dalek-style.
+mod edwards {
+    use super::*;
+    use crate::ec::curve25519::point::Point;
+
+    /// `[Y − X, Y + X, Z, T]` of an extended point, carried.
+    #[inline(always)]
+    unsafe fn diff_sum(p: &F4) -> F4 {
+        unsafe {
+            let pa = permute::<{ sel(1, 1, 2, 3) }>(p);
+            let pb = permute::<{ sel(0, 0, 0, 0) }>(p);
+            carry(blend::<LANE23>(
+                &blend::<LANE1>(&sub(&pa, &pb), &add(&pa, &pb)),
+                &pa.0,
+            ))
+        }
+    }
+
+    /// HWCD addition `p + q` (`p` extended, `q` cached): two 4-way
+    /// multiplications. Complete for `a = −1`.
+    #[inline(always)]
+    pub(super) unsafe fn ext_add(p: &F4, q: &F4) -> F4 {
+        unsafe {
+            // [A, B, C, D] = [(Y1−X1)(Y2−X2), (Y1+X1)(Y2+X2), 2·Z1·Z2, 2d·T1·T2].
+            let m = mul(&diff_sum(p), q);
+            let msw = permute::<{ sel(1, 0, 3, 2) }>(&m);
+            // [E, H, F, G] = [B − A, B + A, C − D, C + D].
+            let u = carry(blend::<LANE2>(
+                &blend::<LANE13>(&sub(&msw, &m), &add(&m, &msw)),
+                &sub(&m, &msw),
+            ));
+            // [EF, GH, FG, EH] = [X3, Y3, Z3, T3].
+            mul(
+                &permute::<{ sel(0, 3, 2, 0) }>(&u),
+                &permute::<{ sel(2, 1, 3, 1) }>(&u),
+            )
+        }
+    }
+
+    /// dbl-2008-hwcd (`a = −1`): one 4-way squaring and one multiplication.
+    /// The input `T` is ignored.
+    #[inline(always)]
+    pub(super) unsafe fn ext_double(p: &F4) -> F4 {
+        unsafe {
+            let pp = permute::<{ sel(0, 1, 2, 0) }>(p);
+            let q = permute::<{ sel(0, 1, 2, 1) }>(p);
+            // [X, Y, Z, X + Y] squared: [A, B, Z², K] = [X², Y², Z², (X+Y)²].
+            let v = carry(blend::<LANE3>(&pp.0, &add(&pp, &q)));
+            let s = mul(&v, &v);
+            let zero = F4([_mm256_setzero_si256(); 5]);
+            let a4 = permute::<{ sel(0, 0, 0, 0) }>(&s);
+            let b4 = permute::<{ sel(1, 1, 1, 1) }>(&s);
+            // y = [B, 0, 2Z², B], z = [0, B, B, K].
+            let y = F4(blend::<LANE2>(
+                &blend::<{ LANE0 | LANE3 }>(&zero.0, &b4.0),
+                &add(&s, &s),
+            ));
+            let z = F4(blend::<LANE3>(
+                &blend::<{ LANE1 | LANE2 }>(&zero.0, &b4.0),
+                &s.0,
+            ));
+            // w = [A + B, A − B, A − B + 2Z², A + B − K] = [−H, −G, −F, −E].
+            let w = carry(sub(&F4(add(&a4, &y)), &z));
+            // [(−E)(−F), (−G)(−H), (−F)(−G), (−E)(−H)] = [X3, Y3, Z3, T3].
+            mul(
+                &permute::<{ sel(3, 1, 2, 3) }>(&w),
+                &permute::<{ sel(2, 0, 1, 0) }>(&w),
+            )
+        }
+    }
+
+    /// `−c` for a cached `c`: `[Y+X, Y−X, 2Z, −2dT]`. The negated lane is
+    /// `2p − x` for a multiplier output `x`, so it stays `< 2^52`.
+    #[inline(always)]
+    unsafe fn neg_cached(c: &F4) -> F4 {
+        unsafe {
+            let sw = permute::<{ sel(1, 0, 2, 3) }>(c);
+            F4(blend::<LANE3>(
+                &sw.0,
+                &sub(&F4([_mm256_setzero_si256(); 5]), &sw),
+            ))
+        }
+    }
+
+    /// The four lanes as a [`Point`], carried to the scalar backend's
+    /// reduced-limb invariant.
+    #[inline(always)]
+    unsafe fn to_point(v: &F4) -> Point {
+        let mut lanes = [[0u64; 4]; 5];
+        for i in 0..5 {
+            // SAFETY: `lanes[i]` is 32 writable bytes (unaligned store).
+            unsafe { _mm256_storeu_si256(lanes[i].as_mut_ptr() as *mut __m256i, v.0[i]) };
+        }
+        let coord = |l: usize| {
+            Fe::weak_reduce([
+                lanes[0][l],
+                lanes[1][l],
+                lanes[2][l],
+                lanes[3][l],
+                lanes[4][l],
+            ])
+        };
+        let out = Point {
+            x: coord(0),
+            y: coord(1),
+            z: coord(2),
+            t: coord(3),
+        };
+        crate::zeroize::Zeroize::zeroize(&mut lanes);
+        out
+    }
+
+    /// The odd multiples `[1]P, [3]P, …, [15]P` in cached form (public
+    /// points only).
+    #[inline(always)]
+    unsafe fn odd_multiples(pv: &F4, k: &F4) -> [F4; 8] {
+        unsafe {
+            let p2 = to_cached(&ext_double(pv), k);
+            let mut odd = [to_cached(pv, k); 8];
+            let mut acc = *pv;
+            for j in 1..8 {
+                acc = ext_add(&acc, &p2);
+                odd[j] = to_cached(&acc, k);
+            }
+            odd
+        }
+    }
+
+    /// What the vartime ladder needs about the base point: nothing with the
+    /// static wNAF-8 table, the point itself without it.
+    #[cfg(feature = "ed25519-table")]
+    pub(crate) type Base = ();
+    /// What the vartime ladder needs about the base point: nothing with the
+    /// static wNAF-8 table, the point itself without it.
+    #[cfg(not(feature = "ed25519-table"))]
+    pub(crate) type Base = Point;
+
+    /// **Variable-time** `[a]·P + [b]·B` from the wNAF recodings computed
+    /// by `Field::double_scalar_mult_base_vartime` (width 5 for `a`, width 8
+    /// against the static Niels table for `b`, or width 5 against computed
+    /// odd multiples of `B` without the table), `top` being the highest
+    /// nonzero position. Branches and table indices follow the scalars:
+    /// **public inputs only**.
+    pub(crate) fn double_scalar_mult_vartime(
+        naf_a: &[i8; 264],
+        p: &Point,
+        naf_b: &[i8; 264],
+        top: usize,
+        base: &Base,
+    ) -> Point {
+        // SAFETY: the caller checked `supported()` (AVX-512 IFMA + VL).
+        unsafe { double_scalar_mult_vartime_ifma(naf_a, p, naf_b, top, base) }
+    }
+
+    #[target_feature(enable = "avx512f,avx512vl,avx512ifma")]
+    unsafe fn double_scalar_mult_vartime_ifma(
+        naf_a: &[i8; 264],
+        p: &Point,
+        naf_b: &[i8; 264],
+        top: usize,
+        base: &Base,
+    ) -> Point {
+        unsafe {
+            let two = Fe([2, 0, 0, 0, 0]);
+            let k = splat_lanes([&Fe::ONE, &Fe::ONE, &two, &Fe::D2]);
+            let odd_p = odd_multiples(&splat_lanes([&p.x, &p.y, &p.z, &p.t]), &k);
+            #[cfg(not(feature = "ed25519-table"))]
+            let odd_b = odd_multiples(&splat_lanes([&base.x, &base.y, &base.z, &base.t]), &k);
+            #[cfg(feature = "ed25519-table")]
+            let () = *base;
+            let mut acc = splat_lanes([&Fe::ZERO, &Fe::ONE, &Fe::ONE, &Fe::ZERO]);
+            for i in (0..=top).rev() {
+                acc = ext_double(&acc);
+                let d = naf_a[i];
+                if d > 0 {
+                    acc = ext_add(&acc, &odd_p[d as usize / 2]);
+                } else if d < 0 {
+                    acc = ext_add(&acc, &neg_cached(&odd_p[(-d) as usize / 2]));
+                }
+                let d = naf_b[i];
+                if d != 0 {
+                    #[cfg(feature = "ed25519-table")]
+                    let c = niels_cached(
+                        &crate::ec::curve25519::base_table::ED25519_BASE_ODD
+                            [d.unsigned_abs() as usize / 2],
+                    );
+                    #[cfg(not(feature = "ed25519-table"))]
+                    let c = odd_b[d.unsigned_abs() as usize / 2];
+                    acc = ext_add(&acc, &if d > 0 { c } else { neg_cached(&c) });
+                }
+            }
+            to_point(&acc)
+        }
+    }
+
+    /// A stored affine Niels entry (`(y+x)‖(y−x)‖(2dt)`, canonical limbs)
+    /// as a cached point `[y−x, y+x, 2, 2dt]` (`Z = 1`).
+    #[cfg(feature = "ed25519-table")]
+    #[inline(always)]
+    unsafe fn niels_cached(e: &[u64; 15]) -> F4 {
+        let mut r = [unsafe { _mm256_setzero_si256() }; 5];
+        for l in 0..5 {
+            r[l] = unsafe {
+                _mm256_setr_epi64x(
+                    e[5 + l] as i64,
+                    e[l] as i64,
+                    if l == 0 { 2 } else { 0 },
+                    e[10 + l] as i64,
+                )
+            };
+        }
+        F4(r)
+    }
+
+    /// The constant-time fixed-base comb of `Field::mul_base` on four
+    /// lanes: 65 unconditional additions of the window entry selected by a
+    /// masked scan over all 8 stored points (one barriered equality mask
+    /// each) and a masked negation, with the carry digit selecting
+    /// `[2^256]B` or the identity. `digits` are secret; the caller wipes them.
+    #[cfg(feature = "ed25519-table")]
+    pub(crate) fn mul_base(digits: &[i8; 65]) -> Point {
+        // SAFETY: the caller checked `supported()` (AVX-512 IFMA + VL).
+        unsafe { mul_base_ifma(digits) }
+    }
+
+    #[cfg(feature = "ed25519-table")]
+    #[target_feature(enable = "avx512f,avx512vl,avx512ifma")]
+    unsafe fn mul_base_ifma(digits: &[i8; 65]) -> Point {
+        use crate::ec::curve25519::base_table::{ED25519_BASE_2_256, ED25519_BASE_TABLE};
+        use crate::ec::curve25519::field::eq_mask;
+        unsafe {
+            let two = Fe([2, 0, 0, 0, 0]);
+            let identity_cached = splat_lanes([&Fe::ONE, &Fe::ONE, &two, &Fe::ZERO]);
+            let mut acc = splat_lanes([&Fe::ZERO, &Fe::ONE, &Fe::ONE, &Fe::ZERO]);
+            for (window, &d) in ED25519_BASE_TABLE.iter().zip(digits.iter()) {
+                // `smask` is 0xff iff d < 0; `mag` = |d| ∈ 0..=8, branch-free.
+                let smask = (d >> 7) as u8;
+                let mag = ((d as u8) ^ smask).wrapping_sub(smask) as u64;
+                let mut c = identity_cached;
+                for (j, entry) in window.iter().enumerate() {
+                    let m = _mm256_set1_epi64x(eq_mask(j as u64 + 1, mag) as i64);
+                    c = select(&c, &niels_cached(entry), m);
+                }
+                let mneg = _mm256_set1_epi64x(mask_from_bit((smask & 1) as u64) as i64);
+                c = select(&c, &neg_cached(&c), mneg);
+                acc = ext_add(&acc, &c);
+            }
+            let m = _mm256_set1_epi64x(mask_from_bit(digits[64] as u64) as i64);
+            let top = select(&identity_cached, &niels_cached(&ED25519_BASE_2_256), m);
+            acc = ext_add(&acc, &top);
+            let out = to_point(&acc);
+            core::ptr::write_volatile(&mut acc, F4([_mm256_setzero_si256(); 5]));
+            out
+        }
+    }
+
+    /// Cached form of an extended point: `[Y−X, Y+X, Z, T]·[1, 1, 2, 2d]`.
+    #[inline(always)]
+    unsafe fn to_cached(p: &F4, k: &F4) -> F4 {
+        unsafe { mul(&diff_sum(p), k) }
+    }
+
+    /// The constant-time signed-radix-16 window ladder of
+    /// `Field::scalar_mult` on four lanes: the same digit schedule, the same
+    /// masked scan over the 8 cached multiples and the same masked negation,
+    /// with each doubling and addition being two 4-way multiplications.
+    /// `digits` are the 65 recoded digits (secret; the caller wipes them).
+    #[cfg(any(
+        test,
+        feature = "hazmat-edwards25519",
+        feature = "ristretto255",
+        not(feature = "ed25519-table")
+    ))]
+    pub(crate) fn scalar_mult(digits: &[i8; 65], p: &Point) -> Point {
+        // SAFETY: the caller checked `supported()` (AVX-512 IFMA + VL).
+        unsafe { scalar_mult_ifma(digits, p) }
+    }
+
+    #[cfg(any(
+        test,
+        feature = "hazmat-edwards25519",
+        feature = "ristretto255",
+        not(feature = "ed25519-table")
+    ))]
+    #[target_feature(enable = "avx512f,avx512vl,avx512ifma")]
+    unsafe fn scalar_mult_ifma(digits: &[i8; 65], p: &Point) -> Point {
+        unsafe {
+            let two = Fe([2, 0, 0, 0, 0]);
+            let k = splat_lanes([&Fe::ONE, &Fe::ONE, &two, &Fe::D2]);
+            let pv = splat_lanes([&p.x, &p.y, &p.z, &p.t]);
+            let identity = splat_lanes([&Fe::ZERO, &Fe::ONE, &Fe::ONE, &Fe::ZERO]);
+            let identity_cached = splat_lanes([&Fe::ONE, &Fe::ONE, &two, &Fe::ZERO]);
+
+            // table[j] = [j + 1]P, cached.
+            let mut table = [to_cached(&pv, &k); 8];
+            let mut multiple = pv;
+            for j in 1..8 {
+                multiple = ext_add(&multiple, &table[0]);
+                table[j] = to_cached(&multiple, &k);
+            }
+
+            let m64 = _mm256_set1_epi64x(mask_from_bit(digits[64] as u64) as i64);
+            let mut acc = select(&identity, &pv, m64);
+            for &d in digits[..64].iter().rev() {
+                acc = ext_double(&acc);
+                acc = ext_double(&acc);
+                acc = ext_double(&acc);
+                acc = ext_double(&acc);
+                // `smask` is 0xff iff d < 0; `mag` = |d| ∈ 0..=8, branch-free.
+                let smask = (d >> 7) as u8;
+                let mag = ((d as u8) ^ smask).wrapping_sub(smask) as u64;
+                let mut c = identity_cached;
+                for j in 0..8 {
+                    let m = _mm256_set1_epi64x(crate::ec::curve25519::field::eq_mask(
+                        j as u64 + 1,
+                        mag,
+                    ) as i64);
+                    c = select(&c, &table[j], m);
+                }
+                let neg = neg_cached(&c);
+                let mneg = _mm256_set1_epi64x(mask_from_bit((smask & 1) as u64) as i64);
+                c = select(&c, &neg, mneg);
+                acc = ext_add(&acc, &c);
+            }
+
+            let out = to_point(&acc);
+            // Best-effort wipe of the secret-dependent table and state.
+            for j in 0..8 {
+                core::ptr::write_volatile(&mut table[j], F4([_mm256_setzero_si256(); 5]));
+            }
+            core::ptr::write_volatile(&mut acc, F4([_mm256_setzero_si256(); 5]));
+            out
+        }
+    }
+}
+
+pub(crate) use edwards::double_scalar_mult_vartime;
+#[cfg(feature = "ed25519-table")]
+pub(crate) use edwards::mul_base;
+#[cfg(any(
+    test,
+    feature = "hazmat-edwards25519",
+    feature = "ristretto255",
+    not(feature = "ed25519-table")
+))]
+pub(crate) use edwards::scalar_mult;

@@ -602,6 +602,24 @@ impl Field {
         not(feature = "ed25519-table")
     ))]
     pub(crate) fn scalar_mult(&self, scalar: &[u8; 32], p: &Point) -> Point {
+        #[cfg(target_arch = "x86_64")]
+        if super::ifma::supported() {
+            let mut digits = radix16_signed(scalar);
+            let out = super::ifma::scalar_mult(&digits, p);
+            digits.zeroize();
+            return out;
+        }
+        self.scalar_mult_portable(scalar, p)
+    }
+
+    /// The portable body of [`Self::scalar_mult`].
+    #[cfg(any(
+        test,
+        feature = "hazmat-edwards25519",
+        feature = "ristretto255",
+        not(feature = "ed25519-table")
+    ))]
+    pub(crate) fn scalar_mult_portable(&self, scalar: &[u8; 32], p: &Point) -> Point {
         // table[j] = [j + 1]P, cached.
         let p_cached = p.to_cached();
         let mut table = [p_cached; 8];
@@ -704,9 +722,25 @@ impl Field {
     #[cfg(feature = "ed25519-table")]
     pub(crate) fn mul_base(&self, scalar: &[u8; 32]) -> Point {
         let mut digits = radix16_signed(scalar);
-        let mut acc = self.identity();
+        #[cfg(target_arch = "x86_64")]
+        if super::ifma::supported() {
+            let out = super::ifma::mul_base(&digits);
+            digits.zeroize();
+            return out;
+        }
+        let out = Self::mul_base_portable(&digits);
+        digits.zeroize();
+        out
+    }
+
+    /// The portable body of the comb [`Self::mul_base`], from the recoded
+    /// (secret) digits; the caller wipes them.
+    #[cfg(feature = "ed25519-table")]
+    fn mul_base_portable(digits: &[i8; 65]) -> Point {
+        let f = Field::new();
+        let mut acc = f.identity();
         for (window, &d) in ED25519_BASE_TABLE.iter().zip(digits.iter()) {
-            acc = self.add_niels(&acc, &Niels::gather(window, d));
+            acc = f.add_niels(&acc, &Niels::gather(window, d));
         }
         // The carry digit selects [2^256]B or the identity.
         let top = Niels::select(
@@ -714,8 +748,7 @@ impl Field {
             &Niels::IDENTITY,
             mask_from_bit(digits[64] as u64),
         );
-        acc = self.add_niels(&acc, &top);
-        digits.zeroize();
+        acc = f.add_niels(&acc, &top);
         acc
     }
 
@@ -778,14 +811,11 @@ impl Field {
         p: &Point,
         b: &[u8; 32],
     ) -> Point {
-        let odd_p = odd_multiples(p);
         let naf_a = wnaf(a, 5);
         #[cfg(feature = "ed25519-table")]
         let naf_b = wnaf(b, 8);
         #[cfg(not(feature = "ed25519-table"))]
         let naf_b = wnaf(b, 5);
-        #[cfg(not(feature = "ed25519-table"))]
-        let odd_b = odd_multiples(&self.base());
         let Some(top) = naf_a
             .iter()
             .zip(naf_b.iter())
@@ -793,6 +823,29 @@ impl Field {
         else {
             return self.identity();
         };
+        #[cfg(target_arch = "x86_64")]
+        if super::ifma::supported() {
+            #[cfg(feature = "ed25519-table")]
+            let base = ();
+            #[cfg(not(feature = "ed25519-table"))]
+            let base = self.base();
+            return super::ifma::double_scalar_mult_vartime(&naf_a, p, &naf_b, top, &base);
+        }
+        self.double_scalar_mult_vartime_portable(&naf_a, p, &naf_b, top)
+    }
+
+    /// The portable body of [`Self::double_scalar_mult_base_vartime`], from
+    /// the recodings and their highest nonzero position. **Variable-time.**
+    pub(crate) fn double_scalar_mult_vartime_portable(
+        &self,
+        naf_a: &[i8; 264],
+        p: &Point,
+        naf_b: &[i8; 264],
+        top: usize,
+    ) -> Point {
+        let odd_p = odd_multiples(p);
+        #[cfg(not(feature = "ed25519-table"))]
+        let odd_b = odd_multiples(&self.base());
 
         let mut r = Projective::IDENTITY;
         let mut t = Completed::IDENTITY;
@@ -1277,6 +1330,84 @@ mod tests {
                     "double_scalar_mult_base_vartime",
                 );
                 same(&f.scalar_mult_vartime(s, p), &want, "scalar_mult_vartime");
+            }
+        }
+    }
+
+    /// The AVX-512 IFMA window ladder agrees with the portable one (the
+    /// reference test above already pins `scalar_mult`, which dispatches to
+    /// it when supported; this pins the two backends against each other
+    /// directly, on edge digits and random scalars over several points).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ifma_scalar_mult_matches_portable() {
+        use crate::hash::Sha256;
+        use crate::rng::{HmacDrbg, RngCore};
+        if !super::super::ifma::supported() {
+            #[cfg(feature = "std")]
+            std::eprintln!("edwards25519: SKIPPED avx512-ifma ladder (not supported here)");
+            return;
+        }
+        #[cfg(feature = "std")]
+        std::eprintln!("edwards25519: RUNNING avx512-ifma ladder vs portable");
+        let f = Field::new();
+        let b = f.base();
+        let mut minus_one = [0xffu8; 32];
+        minus_one[0] = 0xec;
+        minus_one[31] = 0x7f;
+        let points = [
+            f.identity(),
+            b,
+            f.scalar_mult_portable(&[0x5au8; 32], &b),
+            f.decode(&minus_one).expect("order-2 point"),
+        ];
+        let mut rng = HmacDrbg::<Sha256>::new(b"edwards-ifma-differential", b"nonce", &[]);
+        let mut scalars = [[0u8; 32]; 24];
+        scalars[1] = [0xff; 32];
+        scalars[2] = [0x88; 32];
+        scalars[3] = [0x77; 32];
+        scalars[4][0] = 1;
+        for s in scalars[5..].iter_mut() {
+            rng.fill_bytes(s);
+        }
+        for p in &points {
+            for s in &scalars {
+                let mut digits = radix16_signed(s);
+                let v = super::super::ifma::scalar_mult(&digits, p);
+                digits.zeroize();
+                let w = f.scalar_mult_portable(s, p);
+                assert!(bool::from(f.point_ct_eq(&v, &w)), "ifma/portable mismatch");
+                assert_eq!(f.encode(&v), f.encode(&w));
+                assert!(bool::from(f.ct_eq(f.mul(v.t, v.z), f.mul(v.x, v.y))), "T");
+
+                // The vartime Straus ladder, [s]P + [s']B.
+                let mut s2 = *s;
+                s2.reverse();
+                let naf_a = wnaf(s, 5);
+                #[cfg(feature = "ed25519-table")]
+                let (naf_b, base) = (wnaf(&s2, 8), ());
+                #[cfg(not(feature = "ed25519-table"))]
+                let (naf_b, base) = (wnaf(&s2, 5), f.base());
+                let Some(top) = naf_a
+                    .iter()
+                    .zip(naf_b.iter())
+                    .rposition(|(&x, &y)| x != 0 || y != 0)
+                else {
+                    continue;
+                };
+                #[cfg(feature = "ed25519-table")]
+                {
+                    let mut digits = radix16_signed(s);
+                    let v = super::super::ifma::mul_base(&digits);
+                    let w = Field::mul_base_portable(&digits);
+                    digits.zeroize();
+                    assert_eq!(f.encode(&v), f.encode(&w), "comb ifma/portable");
+                }
+                let v =
+                    super::super::ifma::double_scalar_mult_vartime(&naf_a, p, &naf_b, top, &base);
+                let w = f.double_scalar_mult_vartime_portable(&naf_a, p, &naf_b, top);
+                assert!(bool::from(f.point_ct_eq(&v, &w)), "vartime ifma/portable");
+                assert_eq!(f.encode(&v), f.encode(&w));
             }
         }
     }

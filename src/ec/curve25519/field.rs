@@ -167,7 +167,7 @@ impl Fe {
     /// One pass of carry propagation with the `2^255 ≡ 19` fold. Accepts any
     /// limbs `< 2^63`; the result's limbs are `< 2^51 + 2^13·19`.
     #[inline(always)]
-    fn weak_reduce(mut l: [u64; 5]) -> Fe {
+    pub(crate) fn weak_reduce(mut l: [u64; 5]) -> Fe {
         let c0 = l[0] >> 51;
         let c1 = l[1] >> 51;
         let c2 = l[2] >> 51;
