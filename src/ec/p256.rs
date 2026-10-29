@@ -680,20 +680,18 @@ impl P256 {
         let beta = self.mul(&p.x, &gamma);
         // alpha = 3·(X − delta)·(X + delta)
         let t = self.mul(&self.sub(&p.x, &delta), &self.add(&p.x, &delta));
-        let alpha = self.add(&self.add(&t, &t), &t);
+        let alpha = field::mul_small(&t, 3);
         // X3 = alpha² − 8·beta
-        let beta2 = self.add(&beta, &beta);
-        let beta4 = self.add(&beta2, &beta2);
+        let beta4 = field::mul_small(&beta, 4);
         let beta8 = self.add(&beta4, &beta4);
         let x3 = self.sub(&self.sqr(&alpha), &beta8);
-        // Z3 = (Y + Z)² − gamma − delta
-        let yz = self.add(&p.y, &p.z);
-        let z3 = self.sub(&self.sub(&self.sqr(&yz), &gamma), &delta);
+        // Z3 = 2·Y·Z (= (Y + Z)² − gamma − delta; the dedicated squaring
+        // is no cheaper than a product here, so the product form saves two
+        // subtractions).
+        let yz = self.mul(&p.y, &p.z);
+        let z3 = self.add(&yz, &yz);
         // Y3 = alpha·(4·beta − X3) − 8·gamma²
-        let gamma2 = self.sqr(&gamma);
-        let g2 = self.add(&gamma2, &gamma2);
-        let g4 = self.add(&g2, &g2);
-        let g8 = self.add(&g4, &g4);
+        let g8 = field::mul_small(&self.sqr(&gamma), 8);
         let y3 = self.sub(&self.mul(&alpha, &self.sub(&beta4, &x3)), &g8);
         Jacobian {
             x: x3,
@@ -726,7 +724,7 @@ impl P256 {
             }
             return Jacobian::IDENTITY;
         }
-        self.madd_tail(p, &z1z1, &h, &r)
+        self.madd_tail(p, &h, &r)
     }
 
     /// Branch-free mixed Jacobian + affine addition `madd-2007-bl`
@@ -762,17 +760,15 @@ impl P256 {
         let s2 = self.mul(y2, &self.mul(&p.z, &z1z1));
         let h = self.sub(&u2, &p.x);
         let r = self.sub(&s2, &p.y);
-        self.madd_tail(p, &z1z1, &h, &r)
+        self.madd_tail(p, &h, &r)
     }
 
     /// The common tail of `madd-2007-bl` once `H = U2 − X1` and
     /// `r = S2 − Y1` are known (branch-free).
     #[inline(always)]
-    fn madd_tail(&self, p: &Jacobian, z1z1: &Fe, h: &Fe, r: &Fe) -> Jacobian {
+    fn madd_tail(&self, p: &Jacobian, h: &Fe, r: &Fe) -> Jacobian {
         let r = self.add(r, r);
-        let hh = self.sqr(h);
-        let i2 = self.add(&hh, &hh);
-        let i = self.add(&i2, &i2);
+        let i = field::mul_small(&self.sqr(h), 4);
         let j = self.mul(h, &i);
         let v = self.mul(&p.x, &i);
         // X3 = r² − J − 2V
@@ -780,8 +776,10 @@ impl P256 {
         // Y3 = r·(V − X3) − 2·Y1·J
         let y1j = self.mul(&p.y, &j);
         let y3 = self.sub(&self.mul(&r, &self.sub(&v, &x3)), &self.add(&y1j, &y1j));
-        // Z3 = (Z1 + H)² − Z1Z1 − HH
-        let z3 = self.sub(&self.sub(&self.sqr(&self.add(&p.z, h)), z1z1), &hh);
+        // Z3 = 2·Z1·H (= (Z1 + H)² − Z1Z1 − HH, but a product costs the
+        // same as a square here and saves two subtractions).
+        let zh = self.mul(&p.z, h);
+        let z3 = self.add(&zh, &zh);
         Jacobian {
             x: x3,
             y: y3,

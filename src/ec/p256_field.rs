@@ -385,6 +385,39 @@ fn sub_limbs(a: &[u64; 4], b: &[u64; 4]) -> Fe {
     Fe::from_limbs(out)
 }
 
+/// Returns `(c·a) mod p` for a small constant `1 <= c <= 8` (representation
+/// agnostic, like [`add`]): the point formulas' `3·t`, `4·t` and `8·t` in
+/// one pass instead of a chain of two or three modular additions.
+///
+/// `a·c` is four limbs plus a top word `hi < c`; since `2²⁵⁶ ≡ R (mod p)`
+/// with `R = 2²⁵⁶ − p < 2²²⁴`, `hi·2²⁵⁶ + r ≡ r + hi·R`, and that sum is
+/// `< 2²⁵⁶ + 2²²⁷ < 2p`, so one masked subtraction canonicalises.
+#[inline]
+pub(crate) fn mul_small(a: &Fe, c: u64) -> Fe {
+    debug_assert!((1..=8).contains(&c));
+    let a = a.as_limbs();
+    let mut r = [0u64; 4];
+    let mut carry: u128 = 0;
+    let mut i = 0;
+    while i < 4 {
+        let acc = (a[i] as u128) * (c as u128) + carry;
+        r[i] = acc as u64;
+        carry = acc >> 64;
+        i += 1;
+    }
+    let hi = carry as u64;
+    let mut out = [0u64; 4];
+    let mut carry: u128 = 0;
+    let mut i = 0;
+    while i < 4 {
+        let acc = (r[i] as u128) + (hi as u128) * (R_LIMBS[i] as u128) + carry;
+        out[i] = acc as u64;
+        carry = acc >> 64;
+        i += 1;
+    }
+    Fe::from_limbs(reduce_once(out, carry as u64))
+}
+
 /// Returns `(-a) mod p`. The operand must be in `[0, p)`.
 #[inline]
 pub(crate) fn negate(a: &Fe) -> Fe {
@@ -763,6 +796,17 @@ mod tests {
             "negate mismatch: a={:x?}",
             a.as_limbs()
         );
+        // Small-constant multiples against repeated (oracle) addition.
+        let mut sum = *a;
+        for c in 1..=8u64 {
+            assert_eq!(
+                bytes(&sum),
+                bytes(&mul_small(a, c)),
+                "mul_small({c}) mismatch: a={:x?}",
+                a.as_limbs()
+            );
+            sum = g.add(&sum, a);
+        }
         // Conversions round-trip and match the generic oracle's.
         let am = to_mont(a);
         assert_eq!(bytes(&g.fp.to_mont(a)), bytes(&am), "to_mont mismatch");
