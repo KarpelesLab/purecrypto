@@ -5,6 +5,7 @@
 
 use super::field::{Fe, Field, Limbs, MAX_LIMBS, limbs_from_hex};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::zeroize::Zeroize;
 
 /// One curve's public parameters.
 #[derive(Clone, Copy, Debug)]
@@ -818,17 +819,37 @@ impl Curve {
         let z1_zero = z1.is_zero();
         let z2_zero = z2.is_zero();
         let x_zero = x.is_zero();
-        let xk = f.mul(&x1, &f.inv(&z1));
-        let t1 = x1.add(&f.mul(&x, &z1));
-        let t2 = x2.add(&f.mul(&x, &z2));
-        let z1z2 = f.mul(&z1, &z2);
-        let num = f.mul(&t1, &t2).add(&f.mul(&f.sqr(&x).add(&y), &z1z2));
-        let den = f.inv(&f.mul(&x, &z1z2));
-        let yk = f.mul(&x.add(&xk), &f.mul(&num, &den)).add(&y);
+        let mut z1_inv = f.inv(&z1);
+        let mut xk = f.mul(&x1, &z1_inv);
+        let mut t1 = x1.add(&f.mul(&x, &z1));
+        let mut t2 = x2.add(&f.mul(&x, &z2));
+        let mut z1z2 = f.mul(&z1, &z2);
+        let mut num = f.mul(&t1, &t2).add(&f.mul(&f.sqr(&x).add(&y), &z1z2));
+        let mut den = f.inv(&f.mul(&x, &z1z2));
+        let mut yk = f.mul(&x.add(&xk), &f.mul(&num, &den)).add(&y);
         // (k+1)P = ∞ ⇒ kP = −P = (x, x + y); x = 0 and kP ≠ ∞ ⇒ kP = P.
-        let yk = Fe::conditional_select(&x.add(&y), &yk, z2_zero);
-        let yk = Fe::conditional_select(&y, &yk, x_zero);
-        let xk = Fe::conditional_select(&x, &xk, z2_zero | x_zero);
+        let yk_out = Fe::conditional_select(&x.add(&y), &yk, z2_zero);
+        let yk_out = Fe::conditional_select(&y, &yk_out, x_zero);
+        let xk_out = Fe::conditional_select(&x, &xk, z2_zero | x_zero);
+        // The ladder state and the y-recovery intermediates encode the
+        // scalar (e.g. (k+1)P); wipe them before returning.
+        for v in [
+            &mut x1,
+            &mut z1,
+            &mut x2,
+            &mut z2,
+            &mut z1_inv,
+            &mut xk,
+            &mut t1,
+            &mut t2,
+            &mut z1z2,
+            &mut num,
+            &mut den,
+            &mut yk,
+        ] {
+            v.zeroize();
+        }
+        let (xk, yk) = (xk_out, yk_out);
         Point {
             x: xk,
             y: yk,

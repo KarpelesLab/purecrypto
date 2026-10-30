@@ -1539,7 +1539,9 @@ impl BoxedEcdhPrivateKey {
     fn diffie_hellman_generic(&self, peer: &BoxedEcdsaPublicKey) -> Result<Vec<u8>, Error> {
         let c = self.curve.curve();
         let point = c.lift_affine(&peer.x, &peer.y);
-        let shared = c.scalar_mul(&self.d, &point);
+        // The projective shared point is wiped on drop; the affine
+        // coordinates are `BoxedUint`s, which wipe themselves.
+        let shared = Zeroizing::new(c.scalar_mul(&self.d, &point));
         let (x, _) = c.to_affine(&shared).ok_or(Error::InvalidInput)?;
         Ok(x.to_be_bytes(self.curve.field_len()))
     }

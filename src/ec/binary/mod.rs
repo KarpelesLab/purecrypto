@@ -60,7 +60,7 @@ pub use ecdsa::BinarySignature;
 use super::Error;
 use crate::ct::{Choice, ConstantTimeEq};
 use crate::rng::{CryptoRng, RngCore};
-use crate::zeroize::{Zeroize, ZeroizeOnDrop};
+use crate::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use alloc::vec;
 use alloc::vec::Vec;
 use curve::{Curve, Point, limbs_is_zero, limbs_lt};
@@ -575,19 +575,24 @@ impl BinaryPrivateKey {
             encode_bit_string, encode_context, encode_integer, encode_octet_string,
             encode_sequence, oid_tlv,
         };
-        let mut d = self.to_bytes();
-        let mut body = [encode_integer(&[1]), encode_octet_string(&d)].concat();
-        d.zeroize();
-        if with_params {
-            body.extend_from_slice(&encode_context(0, &oid_tlv(self.curve.named_curve_oid())));
-        }
-        body.extend_from_slice(&encode_context(
-            1,
-            &encode_bit_string(&self.public_key().to_sec1(false)),
+        // Every buffer that holds `d` is wiped on drop, and `body` is sized
+        // up front so no growth leaves an unwiped copy behind.
+        let d = Zeroizing::new(self.to_bytes());
+        let d_tlv = Zeroizing::new(encode_octet_string(&d));
+        let params = if with_params {
+            encode_context(0, &oid_tlv(self.curve.named_curve_oid()))
+        } else {
+            Vec::new()
+        };
+        let public = encode_context(1, &encode_bit_string(&self.public_key().to_sec1(false)));
+        let version = encode_integer(&[1]);
+        let mut body = Zeroizing::new(Vec::with_capacity(
+            version.len() + d_tlv.len() + params.len() + public.len(),
         ));
-        let out = encode_sequence(&body);
-        body.zeroize();
-        out
+        for part in [&version[..], &d_tlv[..], &params[..], &public[..]] {
+            body.extend_from_slice(part);
+        }
+        encode_sequence(&body)
     }
 
     /// Encodes the key as a SEC 1 `ECPrivateKey` DER (RFC 5915) with the
@@ -674,12 +679,18 @@ impl BinaryPrivateKey {
             ]
             .concat(),
         );
-        let mut inner = self.sec1_der(false);
-        let mut body = [encode_integer(&[0]), algid, encode_octet_string(&inner)].concat();
-        inner.zeroize();
-        let out = encode_sequence(&body);
-        body.zeroize();
-        out
+        // `inner` and its OCTET STRING wrapping hold `d`: wipe both on drop,
+        // and size `body` up front so no growth leaves a copy behind.
+        let inner = Zeroizing::new(self.sec1_der(false));
+        let inner_tlv = Zeroizing::new(encode_octet_string(&inner));
+        let version = encode_integer(&[0]);
+        let mut body = Zeroizing::new(Vec::with_capacity(
+            version.len() + algid.len() + inner_tlv.len(),
+        ));
+        for part in [&version[..], &algid[..], &inner_tlv[..]] {
+            body.extend_from_slice(part);
+        }
+        encode_sequence(&body)
     }
 
     /// Encodes the key as an unencrypted PKCS#8 PEM document
