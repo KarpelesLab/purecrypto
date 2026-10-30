@@ -1083,16 +1083,31 @@ impl<const L: usize> Engine<L> {
     /// gives `n > p/2`, so there are at most two candidates; a cofactor-`h`
     /// curve has about `h + 1`. The identity never matches. Public inputs
     /// only (the ECDSA / SM2 verification equations).
+    ///
+    /// The candidate scan is capped at [`Self::AFFINE_X_MAX_CANDIDATES`]:
+    /// past that (a large-cofactor custom curve, whose `h` is attacker-chosen
+    /// in explicit key parameters) it falls back to one field inversion and
+    /// a direct `x mod n` comparison, so the cost stays bounded.
     pub(crate) fn affine_x_eq_mod_n(&self, point: &Point<L>, v: &Uint<L>) -> bool {
         if bool::from(point.z.is_zero()) {
             return false;
         }
         let check = |c: &Uint<L>| bool::from(self.mul(&self.to_mont(c), &point.z).ct_eq(&point.x));
         let mut c = *v;
+        let mut tried = 0;
         while bool::from(ct_lt(&c, &self.p)) {
+            if tried == Self::AFFINE_X_MAX_CANDIDATES {
+                // Too many candidates: invert once instead (public data,
+                // so the variable time of this path reveals nothing).
+                return match self.to_affine(point) {
+                    Some((x, _)) => bool::from(x.reduce(&self.n).ct_eq(v)),
+                    None => false,
+                };
+            }
             if check(&c) {
                 return true;
             }
+            tried += 1;
             let (next, carry) = c.adc(&self.n, 0);
             if carry != 0 {
                 return false;
@@ -1101,6 +1116,11 @@ impl<const L: usize> Engine<L> {
         }
         false
     }
+
+    /// Candidate cap of [`Self::affine_x_eq_mod_n`] before it falls back to
+    /// an inversion. Cofactor-1 curves need at most two; small-cofactor
+    /// curves (`h ≤ 3`) stay on the inversion-free path.
+    const AFFINE_X_MAX_CANDIDATES: usize = 4;
 
     /// **VARIABLE-TIME** test that the affine point `(x, y)` (on the curve)
     /// lies in the order-`n` subgroup: `[n]P` is the identity. The

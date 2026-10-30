@@ -2821,4 +2821,47 @@ x2dqVh/sT12MnE=\n\
         let pos = der.windows(2).position(|w| w == [0x04, 48]).unwrap();
         assert_eq!(&der[pos + 2..pos + 2 + 48], &d[..]);
     }
+
+    /// Verification on a custom curve with a huge cofactor (`h ≈ 2^42`,
+    /// attacker-chosen in explicit key parameters) must not walk the
+    /// `r + j·n < p` candidates one by one (~`h` field multiplications per
+    /// verify, minutes of CPU): it falls back to one inversion. The valid
+    /// signature still verifies and tampered ones are rejected.
+    #[cfg(feature = "ec-custom")]
+    #[test]
+    fn verify_large_cofactor_custom_curve_is_bounded() {
+        let h = |s: &str| BoxedUint::from_be_bytes(&from_hex(s));
+        // p ≡ 1 (mod 3), y² = x³ + 1, #E = n·h with h = 0x3a6ab1111f4.
+        let curve = BoxedCurve::from_params(
+            &h("c381e88f38c0c8fd8712b8bc076f3787"),
+            &h("00"),
+            &h("01"),
+            &h("57ac8756464059a3bc01540da5caf4e7"),
+            &h("447d8e516e3c8f357f64582b292a05e7"),
+            &h("358c5e59630fcb5f72b6f3"),
+            &h("03a6ab1111f4"),
+        )
+        .expect("custom curve accepted");
+        let n = curve.order();
+        let mut rng = HmacDrbg::<Sha256>::new(b"large-cofactor", b"n", &[]);
+        let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+        let pk = sk.public_key();
+        #[cfg(feature = "std")]
+        let start = std::time::Instant::now();
+        for i in 0..8u8 {
+            let msg = [b'm', i];
+            let sig = sk.sign::<Sha256>(&msg).unwrap();
+            pk.verify::<Sha256>(&msg, &sig).unwrap();
+            assert!(pk.verify::<Sha256>(b"other", &sig).is_err());
+            let bad_r = BoxedEcdsaSignature {
+                r: sig.r.add(&BoxedUint::from_u64(1)).reduce(&n),
+                s: sig.s.clone(),
+            };
+            assert!(pk.verify::<Sha256>(&msg, &bad_r).is_err());
+        }
+        // The candidate walk took over a minute per verify; the inversion
+        // fallback is microseconds. Generous bound for slow CI runners.
+        #[cfg(feature = "std")]
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+    }
 }
