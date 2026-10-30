@@ -942,6 +942,9 @@ macro_rules! ml_dsa_level {
                 let mut sig = [0u8; $params.sig];
                 let mut pfx = [0u8; 2];
                 sign_internal::<$k, $l>(&self.0, &rnd, &m_prime_parts(&mut pfx, ctx, msg), &$params, &mut sig);
+                // `rnd` feeds ρ'' = H(K ‖ rnd ‖ μ) and is not part of the
+                // signature: wipe it rather than leave it on the stack.
+                Zeroize::zeroize(&mut rnd);
                 Ok(sig)
             }
 

@@ -2105,6 +2105,9 @@ impl PrivateKey {
         let mut rnd = [0u8; MAX_N];
         rng.fill_bytes(&mut rnd[..n]);
         self.do_sign(msg, ctx, &rnd[..n], out);
+        // `opt_rand` is the hedging secret feeding PRF_msg; it is not part of
+        // the signature, so wipe it rather than leave it on the stack.
+        wipe(&mut rnd);
         Ok(out.len())
     }
 
