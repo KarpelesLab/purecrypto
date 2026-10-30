@@ -967,6 +967,25 @@ impl Certificate {
         Ok(forms)
     }
 
+    /// Every `GeneralName` of the `subjectAltName` extension as a raw
+    /// `(tag, content)` pair, in wire order; empty when there is no such
+    /// extension. Used by the chain validator to compare the name set of a
+    /// re-issued pinned certificate against the pinned anchor's byte-for-byte.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub(crate) fn subject_alt_name_entries(&self) -> Result<Vec<(u8, Vec<u8>)>, Error> {
+        let mut out = Vec::new();
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::SUBJECT_ALT_NAME {
+                walk_general_names(value, |t, v| {
+                    out.push((t, v.to_vec()));
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Returns `(is_ca, path_len_constraint)` from the `basicConstraints`
     /// extension, or `None` if the certificate has none. `path_len_constraint`
     /// is `None` when omitted (i.e. unlimited).

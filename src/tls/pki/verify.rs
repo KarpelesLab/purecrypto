@@ -41,7 +41,7 @@ use alloc::vec::Vec;
 /// `keyUsage` bit-0 `digitalSignature` (RFC 5280 §4.2.1.3).
 const KU_DIGITAL_SIGNATURE: u16 = 0x80; // bit 0 in BIT STRING wire order = MSB of byte 0
 /// `keyUsage` bit-5 `keyCertSign`.
-const KU_KEY_CERT_SIGN: u16 = 0x04;
+pub(super) const KU_KEY_CERT_SIGN: u16 = 0x04;
 /// `keyUsage` bit-6 `cRLSign` (RFC 5280 §4.2.1.3 / §6.3.3).
 const KU_CRL_SIGN: u16 = 0x02;
 
@@ -867,7 +867,13 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
 ///   certificate itself — the path is just the leaf, and its subject and
 ///   SPKI are the anchor's — but the pinned key must NOT be able to sign a
 ///   certificate for some other name and have it accepted, which is exactly
-///   what a `CA:FALSE` anchor without this check could do.
+///   what a `CA:FALSE` anchor without this check could do. A re-issued
+///   copy of such a pin (same subject and SPKI, different bytes) is accepted
+///   only when its `subjectAltName` entries are a subset of the anchor's and
+///   its `extKeyUsage` a subset of the anchor's (an anchor without EKU
+///   permits any): otherwise the pinned key could re-mint itself for another
+///   service's name. Validity is not bounded by the anchor's, so renewing a
+///   pin keeps working.
 /// * `pathLenConstraint = N` bounds the number of non-self-issued
 ///   intermediates between the anchor and the leaf — here, everything in
 ///   `path` above the leaf (RFC 5280 §4.2.1.9 / §6.1.4(h)).
@@ -895,6 +901,28 @@ fn enforce_anchor_constraints(
             && (mask & KU_KEY_CERT_SIGN) == 0
         {
             return Err(Error::BadCertificate);
+        }
+    } else if let Some(pin) = &anchor.pinned {
+        // The pinned key's holder can mint any certificate under the pinned
+        // subject and key; only a re-issue that claims no more than the pin
+        // is "the pin itself" (see [`super::store::PinnedIdentity`]).
+        if top.to_der() != pin.cert_der.as_slice() {
+            let sans = top
+                .subject_alt_name_entries()
+                .map_err(|_| Error::BadCertificate)?;
+            if !sans.iter().all(|e| pin.san_entries.contains(e)) {
+                return Err(Error::BadCertificate);
+            }
+            if !anchor.extended_key_usages.is_empty() {
+                let ekus = top
+                    .extended_key_usages()
+                    .map_err(|_| Error::BadCertificate)?;
+                // A leaf without EKU is unrestricted, but the anchor's own
+                // EKU is enforced against the purpose below regardless.
+                if !ekus.iter().all(|o| anchor.extended_key_usages.contains(o)) {
+                    return Err(Error::BadCertificate);
+                }
+            }
         }
     }
     if let Some(plc) = anchor.path_len_constraint {
@@ -3406,6 +3434,111 @@ mod tests {
             ),
             Err(Error::BadCertificate),
             "a CA:FALSE anchor must not issue an intermediate"
+        );
+        // The pinned key re-minting itself (same subject, same key) with a
+        // different SAN — e.g. another pinned service's host name — is not
+        // the pin.
+        let san_swap = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            10,
+            &leaf_exts("other-pinned.example"),
+        )
+        .unwrap();
+        assert_eq!(
+            check(&pinned, alloc::vec![san_swap.to_der().to_vec()]),
+            Err(Error::BadCertificate),
+            "a re-minted pin must not carry a SAN the anchor lacks"
+        );
+        // Adding a SAN on top of the pinned one is equally refused.
+        let san_extra = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            11,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+                subject_alt_name(&[
+                    GeneralName::Dns("pinned.example".into()),
+                    GeneralName::Dns("victim.example".into()),
+                ]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            check(&pinned, alloc::vec![san_extra.to_der().to_vec()]),
+            Err(Error::BadCertificate)
+        );
+        // Widening the EKU beyond the anchor's is refused.
+        let eku_wide = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            12,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH, oid::ID_KP_CLIENT_AUTH]),
+                subject_alt_name(&[GeneralName::Dns("pinned.example".into())]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            check(&pinned, alloc::vec![eku_wide.to_der().to_vec()]),
+            Err(Error::BadCertificate),
+            "a re-minted pin must not widen the anchor's EKU"
+        );
+        // Renewal with a new validity window and the same SAN/EKU still
+        // validates (validity is deliberately not bounded by the anchor's).
+        let renewed_later = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &Validity::new(
+                Time::utc(2025, 6, 1, 0, 0, 0),
+                Time::utc(2040, 1, 1, 0, 0, 0),
+            ),
+            15,
+            &leaf_exts("pinned.example"),
+        )
+        .unwrap();
+        assert_eq!(
+            check(&pinned, alloc::vec![renewed_later.to_der().to_vec()]),
+            Ok(())
+        );
+        // A SAN-less anchor admits only SAN-less re-issues.
+        let pinned_nosan = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            13,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+            ],
+        )
+        .unwrap();
+        let renewed_nosan = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &pinned_name,
+            &validity(),
+            14,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            check(&pinned_nosan, alloc::vec![renewed_nosan.to_der().to_vec()]),
+            Ok(())
+        );
+        assert_eq!(
+            check(&pinned_nosan, alloc::vec![renewed.to_der().to_vec()]),
+            Err(Error::BadCertificate),
+            "a SAN-less pin must not be re-minted with a SAN"
         );
 
         // Case 2: CA:TRUE but keyUsage without keyCertSign — may not issue.
