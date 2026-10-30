@@ -169,6 +169,15 @@ fn export(args: &Args) {
     write_output_with_mode(out, &p12, /* private = */ true);
 }
 
+/// Renders an attacker-controlled label (a bag's `friendlyName`, a
+/// certificate subject) for the terminal: control characters (ESC, CR, BEL,
+/// ...) and other non-printables are shown as Rust escapes instead of being
+/// emitted raw, so a crafted `.p12` cannot inject terminal escape sequences
+/// or forge extra output lines in `pkcs12 -info`.
+fn terminal_safe(s: &str) -> String {
+    s.escape_debug().to_string()
+}
+
 fn unpack(args: &Args) {
     let in_path = args
         .value("-in")
@@ -192,13 +201,13 @@ fn unpack(args: &Args) {
             match Certificate::from_der(der.clone()).and_then(|c| c.subject()) {
                 Ok(subject) => text.push_str(&format!(
                     "certificate {i}: subject {}\n",
-                    crate::pki::format_dn(&subject)
+                    terminal_safe(&crate::pki::format_dn(&subject))
                 )),
                 Err(_) => text.push_str(&format!("certificate {i}: (unparseable)\n")),
             }
         }
         for name in &parsed.friendly_names {
-            text.push_str(&format!("friendly name: {name}\n"));
+            text.push_str(&format!("friendly name: {}\n", terminal_safe(name)));
         }
         write_output(args.value("-out"), text.as_bytes());
         return;
@@ -244,5 +253,23 @@ pub(crate) fn run(args: Args) {
         export(&args);
     } else {
         unpack(&args);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_safe;
+
+    #[test]
+    fn terminal_safe_escapes_control_characters() {
+        assert_eq!(terminal_safe("my key"), "my key");
+        assert_eq!(terminal_safe("Bj\u{f6}rn"), "Bj\u{f6}rn");
+        let hostile = "x\u{1b}]0;pwned\u{7}\r\nfriendly name: forged";
+        let out = terminal_safe(hostile);
+        assert!(
+            !out.chars().any(|c| c.is_control()),
+            "control character survived: {out:?}"
+        );
+        assert_eq!(out, "x\\u{1b}]0;pwned\\u{7}\\r\\nfriendly name: forged");
     }
 }
