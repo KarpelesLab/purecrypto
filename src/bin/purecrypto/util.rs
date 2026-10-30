@@ -733,16 +733,13 @@ pub(crate) fn apply_dtls_cid(
     }
 }
 
-/// Best-effort overwrite of `buf` with zeros, mirroring
-/// `src/hash/zeroize.rs::zero_bytes`. Used after parsing a hex-encoded secret
+/// Overwrites `buf` with zeros through the library's volatile-backed
+/// [`purecrypto::zeroize::Zeroize`]. Used after parsing a hex-encoded secret
 /// off argv (or out of a file) into a `Vec<u8>` we no longer need — the
 /// `Vec`'s heap allocation is dropped immediately after, but at least the
 /// bytes are wiped before the allocator can hand the chunk back out.
 pub(crate) fn zero_buf(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(buf);
+    purecrypto::zeroize::Zeroize::zeroize(buf);
 }
 
 /// The warning every subcommand prints when a secret is taken off argv:
