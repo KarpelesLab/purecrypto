@@ -37,6 +37,12 @@ pub(super) fn supported16() -> bool {
     !crate::ct::force_portable() && crate::cpu::avx512f()
 }
 
+/// Whether the 8-lane kernels can use AVX-512VL's rotations.
+#[cfg(target_arch = "x86_64")]
+fn supported_vl() -> bool {
+    supported16() && crate::cpu::avx512vl()
+}
+
 /// Whether the AVX2 BLAKE3 backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn supported() -> bool {
@@ -87,7 +93,8 @@ pub(super) fn hash_parents16(cvs: &[[u32; 8]], key: &[u32; 8], flags: u32, out: 
 }
 
 /// Compresses `out.len()` (1..=8) consecutive full 1024-byte chunks in
-/// parallel with AVX2. Same contract as [`hash_chunks16`], eight lanes wide.
+/// parallel with AVX2 (with AVX-512VL's rotations where the CPU has them).
+/// Same contract as [`hash_chunks16`], eight lanes wide.
 ///
 /// Callers are expected to have checked [`supported`]; this re-checks the
 /// (cached) CPU feature flag and panics rather than executing the kernel on a
@@ -100,28 +107,86 @@ pub(super) fn hash_chunks8(
     flags: u32,
     out: &mut [[u32; 8]],
 ) {
+    chunks8(supported_vl(), input, key, counter_base, flags, out)
+}
+
+/// Compresses `out.len()` (1..=8) parent nodes in parallel with AVX2 (with
+/// AVX-512VL's rotations where the CPU has them). Same contract as
+/// [`hash_parents16`], eight lanes wide.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn hash_parents8(cvs: &[[u32; 8]], key: &[u32; 8], flags: u32, out: &mut [[u32; 8]]) {
+    parents8(supported_vl(), cvs, key, flags, out)
+}
+
+/// [`hash_chunks8`] without AVX-512VL, so an AVX-512 host still tests the
+/// plain AVX2 kernel.
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
+pub(super) fn hash_chunks8_no_vl(
+    input: &[u8],
+    key: &[u32; 8],
+    counter_base: u64,
+    flags: u32,
+    out: &mut [[u32; 8]],
+) {
+    chunks8(false, input, key, counter_base, flags, out)
+}
+
+/// [`hash_parents8`] without AVX-512VL, as [`hash_chunks8_no_vl`].
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
+pub(super) fn hash_parents8_no_vl(
+    cvs: &[[u32; 8]],
+    key: &[u32; 8],
+    flags: u32,
+    out: &mut [[u32; 8]],
+) {
+    parents8(false, cvs, key, flags, out)
+}
+
+/// [`hash_chunks8`], with `vl` choosing the AVX-512VL build.
+#[cfg(target_arch = "x86_64")]
+fn chunks8(
+    vl: bool,
+    input: &[u8],
+    key: &[u32; 8],
+    counter_base: u64,
+    flags: u32,
+    out: &mut [[u32; 8]],
+) {
     assert!(
         supported(),
         "blake3 hash_chunks8 called on a CPU without AVX2; check supported() first"
     );
+    assert!(!vl || supported_vl());
     assert!((1..=DEGREE).contains(&out.len()) && input.len() == out.len() * CHUNK_LEN);
-    // SAFETY: `supported()` just confirmed AVX2 on this CPU, and the assert
-    // above pins `input` to the `out.len()` chunks the kernel reads.
-    unsafe { avx2::hash_many::<true>(input.as_ptr(), key, counter_base, flags, out) }
+    // SAFETY: the asserts just confirmed AVX2, and AVX-512F/VL when `vl`, on
+    // this CPU, and pin `input` to the `out.len()` chunks the kernel reads.
+    unsafe {
+        if vl {
+            avx2::hash_many_vl::<true>(input.as_ptr(), key, counter_base, flags, out)
+        } else {
+            avx2::hash_many::<true>(input.as_ptr(), key, counter_base, flags, out)
+        }
+    }
 }
 
-/// Compresses `out.len()` (1..=8) parent nodes in parallel with AVX2. Same
-/// contract as [`hash_parents16`], eight lanes wide.
+/// [`hash_parents8`], with `vl` choosing the AVX-512VL build.
 #[cfg(target_arch = "x86_64")]
-pub(super) fn hash_parents8(cvs: &[[u32; 8]], key: &[u32; 8], flags: u32, out: &mut [[u32; 8]]) {
+fn parents8(vl: bool, cvs: &[[u32; 8]], key: &[u32; 8], flags: u32, out: &mut [[u32; 8]]) {
     assert!(
         supported(),
         "blake3 hash_parents8 called on a CPU without AVX2; check supported() first"
     );
+    assert!(!vl || supported_vl());
     assert!((1..=DEGREE).contains(&out.len()) && cvs.len() == 2 * out.len());
-    // SAFETY: as in `hash_chunks8`; `cvs` is `out.len()` 64-byte parent
-    // blocks, laid out as the kernel reads them (see `hash_many`).
-    unsafe { avx2::hash_many::<false>(cvs.as_ptr().cast(), key, 0, flags | PARENT, out) }
+    // SAFETY: as in `chunks8`; `cvs` is `out.len()` 64-byte parent blocks,
+    // laid out as the kernel reads them (see `avx512::hash_many`).
+    unsafe {
+        if vl {
+            avx2::hash_many_vl::<false>(cvs.as_ptr().cast(), key, 0, flags | PARENT, out)
+        } else {
+            avx2::hash_many::<false>(cvs.as_ptr().cast(), key, 0, flags | PARENT, out)
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -325,21 +390,47 @@ mod avx2 {
 
     // The intrinsics need the shift amount as a compile-time immediate, so the
     // four BLAKE3 rotations (16/12/8/7) are specialised rather than parametric.
+    // With `VL` (AVX-512VL) each is one `vprord`; plain AVX2 needs a
+    // shift/shift/or trio, which is most of the gap between the two.
     #[inline(always)]
-    unsafe fn rotr16(x: __m256i) -> __m256i {
-        unsafe { _mm256_or_si256(_mm256_srli_epi32::<16>(x), _mm256_slli_epi32::<16>(x)) }
+    unsafe fn rotr16<const VL: bool>(x: __m256i) -> __m256i {
+        unsafe {
+            if VL {
+                _mm256_ror_epi32::<16>(x)
+            } else {
+                _mm256_or_si256(_mm256_srli_epi32::<16>(x), _mm256_slli_epi32::<16>(x))
+            }
+        }
     }
     #[inline(always)]
-    unsafe fn rotr12(x: __m256i) -> __m256i {
-        unsafe { _mm256_or_si256(_mm256_srli_epi32::<12>(x), _mm256_slli_epi32::<20>(x)) }
+    unsafe fn rotr12<const VL: bool>(x: __m256i) -> __m256i {
+        unsafe {
+            if VL {
+                _mm256_ror_epi32::<12>(x)
+            } else {
+                _mm256_or_si256(_mm256_srli_epi32::<12>(x), _mm256_slli_epi32::<20>(x))
+            }
+        }
     }
     #[inline(always)]
-    unsafe fn rotr8(x: __m256i) -> __m256i {
-        unsafe { _mm256_or_si256(_mm256_srli_epi32::<8>(x), _mm256_slli_epi32::<24>(x)) }
+    unsafe fn rotr8<const VL: bool>(x: __m256i) -> __m256i {
+        unsafe {
+            if VL {
+                _mm256_ror_epi32::<8>(x)
+            } else {
+                _mm256_or_si256(_mm256_srli_epi32::<8>(x), _mm256_slli_epi32::<24>(x))
+            }
+        }
     }
     #[inline(always)]
-    unsafe fn rotr7(x: __m256i) -> __m256i {
-        unsafe { _mm256_or_si256(_mm256_srli_epi32::<7>(x), _mm256_slli_epi32::<25>(x)) }
+    unsafe fn rotr7<const VL: bool>(x: __m256i) -> __m256i {
+        unsafe {
+            if VL {
+                _mm256_ror_epi32::<7>(x)
+            } else {
+                _mm256_or_si256(_mm256_srli_epi32::<7>(x), _mm256_slli_epi32::<25>(x))
+            }
+        }
     }
 
     #[inline(always)]
@@ -355,7 +446,7 @@ mod avx2 {
     /// The 8-wide BLAKE3 `g` mixing function (lanes are independent inputs).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn g(
+    unsafe fn g<const VL: bool>(
         v: &mut [__m256i; 16],
         a: usize,
         b: usize,
@@ -366,30 +457,30 @@ mod avx2 {
     ) {
         unsafe {
             v[a] = add(add(v[a], v[b]), mx);
-            v[d] = rotr16(xor(v[d], v[a]));
+            v[d] = rotr16::<VL>(xor(v[d], v[a]));
             v[c] = add(v[c], v[d]);
-            v[b] = rotr12(xor(v[b], v[c]));
+            v[b] = rotr12::<VL>(xor(v[b], v[c]));
             v[a] = add(add(v[a], v[b]), my);
-            v[d] = rotr8(xor(v[d], v[a]));
+            v[d] = rotr8::<VL>(xor(v[d], v[a]));
             v[c] = add(v[c], v[d]);
-            v[b] = rotr7(xor(v[b], v[c]));
+            v[b] = rotr7::<VL>(xor(v[b], v[c]));
         }
     }
 
     #[inline(always)]
-    unsafe fn round<const R: usize>(v: &mut [__m256i; 16], m: &[__m256i; 16]) {
+    unsafe fn round<const R: usize, const VL: bool>(v: &mut [__m256i; 16], m: &[__m256i; 16]) {
         let s = &MSG_SCHEDULE[R];
         unsafe {
             // Columns.
-            g(v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
-            g(v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
-            g(v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
-            g(v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+            g::<VL>(v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+            g::<VL>(v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+            g::<VL>(v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+            g::<VL>(v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
             // Diagonals.
-            g(v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
-            g(v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
-            g(v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
-            g(v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+            g::<VL>(v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+            g::<VL>(v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+            g::<VL>(v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+            g::<VL>(v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
         }
     }
 
@@ -426,6 +517,35 @@ mod avx2 {
     /// Requires AVX2, and `input` must be valid for `out.len()` inputs.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn hash_many<const CHUNKS: bool>(
+        input: *const u8,
+        key: &[u32; 8],
+        counter_base: u64,
+        flags: u32,
+        out: &mut [[u32; 8]],
+    ) {
+        unsafe { body::<CHUNKS, false>(input, key, counter_base, flags, out) }
+    }
+
+    /// [`hash_many`] with AVX-512VL's one-instruction rotations: the same
+    /// 256-bit lanes, so it beats a part-filled 512-bit pass on CPUs where
+    /// 512-bit operations cost more (Zen 4, Intel) and matches it on Zen 5.
+    ///
+    /// # Safety
+    /// Requires AVX-512F and AVX-512VL, and `input` must be valid for
+    /// `out.len()` inputs.
+    #[target_feature(enable = "avx512f,avx512vl")]
+    pub(super) unsafe fn hash_many_vl<const CHUNKS: bool>(
+        input: *const u8,
+        key: &[u32; 8],
+        counter_base: u64,
+        flags: u32,
+        out: &mut [[u32; 8]],
+    ) {
+        unsafe { body::<CHUNKS, true>(input, key, counter_base, flags, out) }
+    }
+
+    #[inline(always)]
+    unsafe fn body<const CHUNKS: bool, const VL: bool>(
         input: *const u8,
         key: &[u32; 8],
         counter_base: u64,
@@ -493,13 +613,13 @@ mod avx2 {
 
                 // All seven rounds unrolled, each reading the message words
                 // in its own order, so no vectors move between rounds.
-                round::<0>(&mut v, &msg);
-                round::<1>(&mut v, &msg);
-                round::<2>(&mut v, &msg);
-                round::<3>(&mut v, &msg);
-                round::<4>(&mut v, &msg);
-                round::<5>(&mut v, &msg);
-                round::<6>(&mut v, &msg);
+                round::<0, VL>(&mut v, &msg);
+                round::<1, VL>(&mut v, &msg);
+                round::<2, VL>(&mut v, &msg);
+                round::<3, VL>(&mut v, &msg);
+                round::<4, VL>(&mut v, &msg);
+                round::<5, VL>(&mut v, &msg);
+                round::<6, VL>(&mut v, &msg);
 
                 // Chaining value = first 8 words: state[i] ^ state[i + 8].
                 for i in 0..8 {

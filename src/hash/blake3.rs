@@ -1093,8 +1093,8 @@ mod tests {
     #[test]
     fn simd_kernels_match_scalar() {
         use super::super::blake3_simd::{
-            DEGREE, DEGREE16, hash_chunks8, hash_chunks16, hash_parents8, hash_parents16,
-            supported, supported16,
+            DEGREE, DEGREE16, hash_chunks8, hash_chunks8_no_vl, hash_chunks16, hash_parents8,
+            hash_parents8_no_vl, hash_parents16, supported, supported16,
         };
         std::eprintln!(
             "blake3: avx2={} avx512={}",
@@ -1103,8 +1103,21 @@ mod tests {
         );
         type Chunks = fn(&[u8], &[u32; 8], u64, u32, &mut [[u32; 8]]);
         type Parents = fn(&[[u32; 8]], &[u32; 8], u32, &mut [[u32; 8]]);
-        let kernels: [(bool, usize, Chunks, Parents, &str); 2] = [
-            (supported(), DEGREE, hash_chunks8, hash_parents8, "avx2"),
+        let kernels: [(bool, usize, Chunks, Parents, &str); 3] = [
+            (
+                supported(),
+                DEGREE,
+                hash_chunks8_no_vl,
+                hash_parents8_no_vl,
+                "avx2",
+            ),
+            (
+                supported(),
+                DEGREE,
+                hash_chunks8,
+                hash_parents8,
+                "avx2 (vl if present)",
+            ),
             (
                 supported16(),
                 DEGREE16,
