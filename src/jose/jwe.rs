@@ -563,8 +563,25 @@ fn ecdh_es_derive(
 }
 
 /// The `epk` header parameter parsed as a public JWK.
+///
+/// The header is unauthenticated input, so the shape is screened before
+/// [`Jwk::from_object`] runs any key validation: only the ECDH key types
+/// (`EC`, `OKP`) are accepted and any private-key member is refused
+/// ([`Error::Malformed`]). An `RSA` or `oct` `epk` could never be used for
+/// ECDH-ES anyway, and parsing one (an RSA private key's consistency
+/// checks in particular) is work an attacker should not get for free.
 fn header_epk(header: &Object) -> Result<Jwk, Error> {
     let epk = header.get_object("epk")?.ok_or(Error::Malformed)?;
+    match epk.get_str("kty")? {
+        Some("EC" | "OKP") => {}
+        _ => return Err(Error::Malformed),
+    }
+    if ["d", "p", "q", "dp", "dq", "qi", "oth", "k"]
+        .iter()
+        .any(|m| epk.contains(m))
+    {
+        return Err(Error::Malformed);
+    }
     let jwk = Jwk::from_object(epk)?;
     if jwk.is_private() {
         // A private ephemeral key in the header is nonsense; refuse it.
@@ -1556,5 +1573,50 @@ mod tests {
         }
         #[cfg(not(feature = "cert-compression"))]
         assert_eq!(res.unwrap_err(), Error::Unsupported("zip"));
+    }
+
+    /// An `epk` that is not an `EC` / `OKP` public key is refused before
+    /// it is parsed: an RSA "private key" with huge `p` / `q` in the
+    /// unauthenticated header used to cost seconds of CPU per recipient.
+    #[test]
+    fn epk_shape_screened_before_parsing() {
+        let key = Jwk::from_ec_private(&BoxedEcdsaPrivateKey::generate(
+            crate::ec::CurveId::P256,
+            &mut rng(),
+        ))
+        .unwrap();
+        let token = |epk: &str| {
+            let hdr = alloc::format!(r#"{{"alg":"ECDH-ES","enc":"A128GCM","epk":{epk}}}"#);
+            alloc::format!(
+                "{}..AAAAAAAAAAAAAAAA.AA.AAAAAAAAAAAAAAAAAAAAAA",
+                base64url::encode(hdr.as_bytes())
+            )
+        };
+        let rsa_public = Jwk::parse(A1_KEY).unwrap().to_public().unwrap().to_json();
+        let mut big = alloc::vec![0x77u8; 64 * 1024];
+        big[64 * 1024 - 1] |= 1;
+        let big = base64url::encode(&big);
+        let n = Jwk::parse(A1_KEY).unwrap().to_object();
+        let n = n.get_str("n").unwrap().unwrap();
+        let rsa_dos = alloc::format!(
+            r#"{{"kty":"RSA","n":"{n}","e":"AQAB","d":"AQ","p":"{big}","q":"{big}","dp":"AQ","dq":"AQ","qi":"AQ"}}"#
+        );
+        let ec_private = key.to_json();
+        let ec_public = key.to_public().unwrap().to_json();
+        let ec_with_oth = ec_public.replacen('{', r#"{"oth":[],"#, 1);
+        for epk in [
+            rsa_public.as_str(),
+            rsa_dos.as_str(),
+            r#"{"kty":"oct","k":"AAAAAAAAAAAAAAAAAAAAAA"}"#,
+            r#"{"crv":"P-256"}"#,
+            ec_private.as_str(),
+            ec_with_oth.as_str(),
+        ] {
+            let jwe = Jwe::parse(&token(epk)).unwrap();
+            assert_eq!(jwe.decrypt(&key).unwrap_err(), Error::Malformed, "{epk}");
+        }
+        // A well-formed public epk gets as far as the content tag.
+        let jwe = Jwe::parse(&token(&ec_public)).unwrap();
+        assert_eq!(jwe.decrypt(&key).unwrap_err(), Error::Decryption);
     }
 }

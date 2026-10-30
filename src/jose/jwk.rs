@@ -248,6 +248,12 @@ fn require_b64(obj: &Object, name: &str) -> Result<Vec<u8>, Error> {
     b64_member(obj, name)?.ok_or(Error::Malformed)
 }
 
+/// The decoded length of the base64url string `s` (exact for well-formed
+/// input, padded or not), computed without decoding it.
+fn base64url_decoded_len(s: &str) -> usize {
+    s.trim_end_matches('=').len() * 3 / 4
+}
+
 fn uint(bytes: &[u8]) -> BoxedUint {
     BoxedUint::from_be_bytes(bytes)
 }
@@ -351,6 +357,22 @@ impl Jwk {
         }
         if obj.contains("oth") {
             return Err(Error::Unsupported("oth"));
+        }
+        // Every private member is an integer below `n` (`d < n`, the
+        // primes `p, q < n`, and `dp`, `dq`, `qi` are reduced modulo `p` or
+        // `q`), so none may be longer than `n`'s minimal encoding. This is
+        // checked on the encoded lengths before any decoding or arithmetic:
+        // the `p·q == n` and `e·d mod (p−1)` checks below are quadratic in
+        // the operand sizes, and unbounded `p` / `q` turned a few hundred
+        // KiB of JSON (an attacker-supplied JWE `epk`, for one) into
+        // seconds of CPU.
+        let n_len = n_int.bit_len().div_ceil(8);
+        for name in ["d", "p", "q", "dp", "dq", "qi"] {
+            if let Some(s) = obj.get_str(name)?
+                && base64url_decoded_len(s) > n_len
+            {
+                return Err(Error::InvalidKey);
+            }
         }
         // Wrapped at once so a key refused below does not leave it behind.
         let d = b64_member(obj, "d")?.map(Zeroizing::new);
@@ -1450,5 +1472,41 @@ mod tests {
                 .to_json()
                 .replace(",\"kid\":\"1\",\"use\":\"enc\"", "")
         );
+    }
+
+    /// The RFC 7517 A.2 RSA private key with members `names` replaced by
+    /// one `len`-byte value.
+    fn rsa_with_members(names: &[&str], len: usize) -> Object {
+        let set = JwkSet::parse(RFC7517_A2).unwrap();
+        let mut big = alloc::vec![0x77u8; len];
+        big[0] = 0x01;
+        big[len - 1] |= 1;
+        let big = base64url::encode(&big);
+        let mut out = Object::new();
+        for (k, v) in set.keys()[1].to_object().iter() {
+            let v = if names.contains(&k) {
+                crate::jose::json::Value::String(big.clone())
+            } else {
+                v.clone()
+            };
+            out.insert(k, v).unwrap();
+        }
+        out
+    }
+
+    /// Private RSA members longer than `n` are refused before any
+    /// arithmetic: a `p` and `q` of 128 KiB each used to cost seconds of
+    /// schoolbook multiplication, reachable through an unauthenticated
+    /// JWE `epk`.
+    #[test]
+    fn rsa_oversized_private_members_rejected() {
+        assert!(Jwk::from_object(&rsa_with_members(&[], 1)).is_ok());
+        for name in ["d", "p", "q", "dp", "dq", "qi"] {
+            // One byte longer than n (256 bytes).
+            let r = Jwk::from_object(&rsa_with_members(&[name], 257));
+            assert!(matches!(r, Err(Error::InvalidKey)), "{name}");
+        }
+        let r = Jwk::from_object(&rsa_with_members(&["p", "q"], 128 * 1024));
+        assert!(matches!(r, Err(Error::InvalidKey)));
     }
 }
