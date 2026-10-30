@@ -286,9 +286,24 @@ fn parent_cv(left: [u32; 8], right: [u32; 8], key: [u32; 8], flags: u32) -> [u32
 const MAX_DEPTH: usize = 54;
 
 /// Chunks hashed per pass of the bulk path in [`Blake3::update`]: a whole
-/// number of the widest kernel's lanes, and a 64-leaf subtree whose parent
-/// levels still fill a 16-lane parent pass.
-const MAX_BATCH: usize = 64;
+/// number of the widest kernel's lanes. Larger batches mean fewer subtree
+/// pushes and scalar stack merges per byte; past 128 the gain stops, while
+/// the scratch on the stack (`MAX_BATCH * 48` bytes, here 6 KiB) keeps
+/// growing.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(feature = "std", target_arch = "aarch64", target_endian = "little")
+))]
+const MAX_BATCH: usize = 128;
+
+/// Without SIMD kernels a batch does the same compressions as chunk-by-chunk
+/// hashing, so it is kept small for the small stacks of the targets
+/// concerned (`no_std`, wasm).
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(feature = "std", target_arch = "aarch64", target_endian = "little")
+)))]
+const MAX_BATCH: usize = 8;
 
 /// Inputs (chunks or parents) the next kernel pass should take out of
 /// `left`, or 0 to take one on the scalar path. A lone input stays scalar,
