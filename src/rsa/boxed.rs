@@ -809,7 +809,28 @@ fn validate_private_exponent(n: &BoxedUint, d: &BoxedUint) -> Result<(), Error> 
 /// through the CRT recombination path, and in the worst case enables a
 /// Bleichenbacher-style fault on the secret exponent. We reject before the
 /// key is constructed.
+///
+/// The primes are size-checked *before* anything is multiplied: no prime may
+/// be wider than `n`, and the bit lengths must sum to at most
+/// `bits(n) + (#primes − 1)` (a product of factors of `b₁ … b_k` bits has at
+/// least `Σbᵢ − (k − 1)` bits, so a larger sum can never equal `n`). Without
+/// this, an attacker-supplied blob with megabyte-sized "primes" drove the
+/// schoolbook product quadratically (a 2 MB key file cost ~12 s of CPU)
+/// before the final comparison rejected it.
 fn validate_private_components(n: &BoxedUint, primes: &[&BoxedUint]) -> Result<(), Error> {
+    let n_bits = n.bit_len();
+    let max_sum = n_bits + primes.len().saturating_sub(1);
+    let mut sum = 0usize;
+    for r in primes {
+        let b = r.bit_len();
+        if b > n_bits {
+            return Err(Error::InvalidKey);
+        }
+        sum += b;
+        if sum > max_sum {
+            return Err(Error::InvalidKey);
+        }
+    }
     let one = BoxedUint::from_u64(1);
     let mut prod = one.clone();
     for (i, r) in primes.iter().enumerate() {
@@ -1957,7 +1978,10 @@ impl BoxedRsaPrivateKey {
     /// exponent outside `[1, n)`, primes `≤ 1` or even, repeated primes,
     /// a product of primes `≠ n`, and a `d` that does not invert `e` in
     /// every prime field (`e·dP ≢ 1 mod p−1`, `e·dQ ≢ 1 mod q−1`, and
-    /// likewise `dᵢ`) — the relation the CRT path depends on.
+    /// likewise `dᵢ`) — the relation the CRT path depends on. Any private
+    /// INTEGER whose encoding is longer than `n`'s, a prime wider than `n`,
+    /// or primes whose bit lengths cannot multiply out to `n`'s are rejected
+    /// up front, before any bignum arithmetic runs on them.
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
         Self::from_pkcs1_der_with_floor(der, MIN_RSA_BITS)
     }
@@ -1981,14 +2005,30 @@ impl BoxedRsaPrivateKey {
             [1] => true,
             _ => return Err(crate::der::Error::Malformed),
         };
-        let n = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
+        let n_der = seq.read_unsigned_integer_bytes()?;
+        // Every private component is at most `n` (RFC 8017 §3.2), so its
+        // minimal DER body is never longer than `n`'s. Bounding the raw
+        // lengths up front keeps an oversized blob from reaching any
+        // bignum arithmetic (see `validate_private_components`).
+        let n_len = n_der.len();
+        fn bounded<'a>(
+            s: &mut crate::der::Reader<'a>,
+            max_len: usize,
+        ) -> Result<&'a [u8], crate::der::Error> {
+            let v = s.read_unsigned_integer_bytes()?;
+            if v.len() > max_len {
+                return Err(crate::der::Error::Malformed);
+            }
+            Ok(v)
+        }
+        let n = BoxedUint::from_be_bytes(n_der);
         let e = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
-        let d = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
-        let p = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
-        let q = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
-        let _dp = seq.read_unsigned_integer_bytes()?;
-        let _dq = seq.read_unsigned_integer_bytes()?;
-        let _qinv = seq.read_unsigned_integer_bytes()?;
+        let d = BoxedUint::from_be_bytes(bounded(&mut seq, n_len)?);
+        let p = BoxedUint::from_be_bytes(bounded(&mut seq, n_len)?);
+        let q = BoxedUint::from_be_bytes(bounded(&mut seq, n_len)?);
+        let _dp = bounded(&mut seq, n_len)?;
+        let _dq = bounded(&mut seq, n_len)?;
+        let _qinv = bounded(&mut seq, n_len)?;
         // otherPrimeInfos: "shall be omitted if version is 0 and shall
         // contain at least one instance of OtherPrimeInfo if version is 1".
         let mut other_primes = Vec::new();
@@ -1999,9 +2039,9 @@ impl BoxedRsaPrivateKey {
                     return Err(crate::der::Error::Malformed);
                 }
                 let mut info = infos.read_sequence()?;
-                let r = BoxedUint::from_be_bytes(info.read_unsigned_integer_bytes()?);
-                let _d_i = info.read_unsigned_integer_bytes()?;
-                let _t_i = info.read_unsigned_integer_bytes()?;
+                let r = BoxedUint::from_be_bytes(bounded(&mut info, n_len)?);
+                let _d_i = bounded(&mut info, n_len)?;
+                let _t_i = bounded(&mut info, n_len)?;
                 info.finish()?;
                 other_primes.push(r);
             }
@@ -3131,6 +3171,75 @@ mod tests {
             BoxedRsaPrivateKey::from_pkcs1_der(&der),
             Err(crate::der::Error::Malformed)
         ));
+    }
+
+    /// Oversized "primes" are rejected before any multiplication: a crafted
+    /// PKCS#1 blob carrying megabyte-wide `p`/`q` (or extra primes) used to
+    /// run the schoolbook product quadratically (~12 s for 2 MB) before the
+    /// `prod == n` comparison failed.
+    #[test]
+    fn from_pkcs1_der_rejects_oversized_primes_quickly() {
+        use crate::der::{encode_integer, encode_sequence};
+        let sk = gen_small_key(b"rsa-pkcs1-oversized");
+        let be = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8).max(1));
+        // A 1 MiB odd integer: harmless to build, several seconds to square
+        // with the schoolbook product.
+        let mut huge = alloc::vec![0x5au8; 1024 * 1024];
+        *huge.last_mut().unwrap() |= 1;
+        let small = be(&BoxedUint::from_u64(3));
+        let build = |p: &[u8], q: &[u8], d: &[u8]| {
+            encode_sequence(
+                &[
+                    encode_integer(&[0]),
+                    encode_integer(&be(sk.modulus())),
+                    encode_integer(&be(&sk.e)),
+                    encode_integer(d),
+                    encode_integer(p),
+                    encode_integer(q),
+                    encode_integer(&small),
+                    encode_integer(&small),
+                    encode_integer(&small),
+                ]
+                .concat(),
+            )
+        };
+        let start = std::time::Instant::now();
+        for der in [
+            build(&huge, &huge, &be(&sk.d)),
+            build(&be(&sk.p), &huge, &be(&sk.d)),
+            build(&be(&sk.p), &be(&sk.q), &huge),
+        ] {
+            assert!(matches!(
+                BoxedRsaPrivateKey::from_pkcs1_der_insecure(&der),
+                Err(crate::der::Error::Malformed)
+            ));
+        }
+        // The component-level guard (also reached via `from_crt_components`):
+        // a prime wider than `n`, and primes each narrower than `n` whose bit
+        // lengths cannot multiply to `n`.
+        let n = sk.modulus();
+        let wide = BoxedUint::from_be_bytes(&huge);
+        assert!(validate_private_components(n, &[&wide, &sk.q]).is_err());
+        let mut half = n.shr_bits(1);
+        if !half.is_odd() {
+            half = half.add(&BoxedUint::from_u64(1));
+        }
+        assert!(validate_private_components(n, &[&half, &half]).is_err());
+        assert!(validate_private_components(n, &[&sk.p, &sk.q]).is_ok());
+        assert!(
+            BoxedRsaPrivateKey::from_crt_components(
+                n.clone(),
+                sk.e.clone(),
+                sk.d.clone(),
+                wide.clone(),
+                wide,
+                BoxedUint::from_u64(3),
+                BoxedUint::from_u64(3),
+                BoxedUint::from_u64(3),
+            )
+            .is_err()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     /// `p == q` is rejected — the resulting `n = p²` shares only one prime
