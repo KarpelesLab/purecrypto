@@ -299,7 +299,12 @@ impl ClientIo {
                 // The socket is connected, so the datagram came from the
                 // peer; the engine needs the address only for its
                 // address-validation bookkeeping.
-                if let Err(e) = qc.feed_datagram_from_with_ecn(self.peer, ecn, &self.buf[..n]) {
+                // Only an error that ended the connection is fatal; a
+                // spoofed or malformed datagram must not kill the client
+                // (RFC 9000 §5.2 / §12.2 — drop it silently).
+                if let Err(e) = qc.feed_datagram_from_with_ecn(self.peer, ecn, &self.buf[..n])
+                    && (qc.is_closing() || qc.is_draining() || qc.is_closed())
+                {
                     return Err(format!("QUIC feed_datagram failed: {e:?}"));
                 }
             }

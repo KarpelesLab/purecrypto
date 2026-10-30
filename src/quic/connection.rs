@@ -991,6 +991,10 @@ pub struct QuicConnection {
     /// after it is a genuine protocol violation by the peer and terminates
     /// the connection with a CONNECTION_CLOSE (RFC 9000 §10.2).
     rx_packet_authenticated: bool,
+    /// Datagrams whose remainder was discarded because an unauthenticated
+    /// packet in them failed to parse (RFC 9000 §5.2 / §12.2). Diagnostic
+    /// only; see [`Self::rx_dropped_datagrams`].
+    rx_dropped_datagrams: u64,
     /// The transport error code to report for the error currently
     /// propagating out of the receive path, when the raising site knows a
     /// more specific one than [`transport_error_code`] can infer (chiefly
@@ -1403,6 +1407,7 @@ impl QuicConnection {
             ecn_acked: EcnCounts::default(),
             prev_rx_keys_installed_at: None,
             rx_packet_authenticated: false,
+            rx_dropped_datagrams: 0,
             pending_error_code: None,
             reset_token_pinned: false,
             require_client_auth: false,
@@ -1562,6 +1567,7 @@ impl QuicConnection {
             ecn_acked: EcnCounts::default(),
             prev_rx_keys_installed_at: None,
             rx_packet_authenticated: false,
+            rx_dropped_datagrams: 0,
             pending_error_code: None,
             reset_token_pinned,
             require_client_auth,
@@ -1689,9 +1695,22 @@ impl QuicConnection {
     /// multiple coalesced QUIC packets (RFC 9000 §12.2). Each packet is
     /// header-protection-stripped, AEAD-opened, and frame-decoded.
     ///
-    /// Returns `Err` on parse failure or AEAD authentication failure (a
-    /// returned error means the engine state was *not* updated by that
-    /// packet; previously-applied progress remains).
+    /// # Errors
+    ///
+    /// Unauthenticated input never produces an error: a datagram (or the
+    /// tail of one) that fails to parse, is truncated, or fails AEAD
+    /// authentication is silently discarded (RFC 9000 §5.2 / §12.2) and the
+    /// call returns `Ok(())` — anyone can forge such bytes, so they must not
+    /// be able to end the connection. Packets coalesced ahead of the bad one
+    /// stay applied. [`Self::rx_dropped_datagrams`] counts these drops.
+    ///
+    /// `Err` is returned only when the datagram ended the connection: an
+    /// authenticated packet carried a protocol violation or a TLS failure
+    /// (the connection is now closing, see [`Self::is_closing`]), or the
+    /// client aborted its connection attempt on a Version Negotiation packet
+    /// (see [`Self::is_closed`]). A caller may therefore treat an `Err` as
+    /// fatal; checking `is_closing() || is_draining() || is_closed()` gives
+    /// the same answer.
     pub fn feed_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
         let now = self.now_since_start();
         self.feed_datagram_at(now, datagram)
@@ -1823,8 +1842,15 @@ impl QuicConnection {
                     // telling the peer, and still accepting further packets.
                     //
                     // An error raised before authentication (a malformed
-                    // header, a truncated packet) comes from bytes anyone can
-                    // forge, so it only discards the rest of this datagram.
+                    // header, a truncated packet, a Length past the end of
+                    // the datagram) comes from bytes anyone can forge, so it
+                    // only discards the rest of this datagram — silently
+                    // (RFC 9000 §5.2 / §12.2). Returning it as an error let a
+                    // single spoofed byte (`[0x40]`) look fatal to callers
+                    // that treat any feed error as the end of the connection.
+                    // The only pre-authentication errors that still surface
+                    // are the ones that ended the connection attempt (a
+                    // client aborting on Version Negotiation, RFC 9368 §2.1).
                     if self.rx_packet_authenticated {
                         let code = self
                             .pending_error_code
@@ -1833,7 +1859,11 @@ impl QuicConnection {
                         self.close_with_transport_error(code);
                     }
                     self.pending_error_code = None;
-                    return Err(e);
+                    if self.closed || self.draining || self.pending_close.is_some() {
+                        return Err(e);
+                    }
+                    self.rx_dropped_datagrams = self.rx_dropped_datagrams.saturating_add(1);
+                    break;
                 }
             };
             // RFC 9000 §10.2.2 — a CONNECTION_CLOSE in one of the coalesced
@@ -4084,6 +4114,17 @@ impl QuicConnection {
     /// [`Self::pop_datagram`] become no-ops.
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Number of received datagrams (or datagram tails) silently discarded
+    /// because an unauthenticated packet in them was malformed — a bad
+    /// header, a truncated packet, a Length running past the datagram
+    /// (RFC 9000 §5.2 / §12.2). Such input is dropped without an error from
+    /// [`Self::feed_datagram`]; this counter is the only trace it leaves.
+    /// Packets that parse but fail AEAD authentication are not counted here
+    /// (they count toward the RFC 9001 §6.6 integrity limit instead).
+    pub fn rx_dropped_datagrams(&self) -> u64 {
+        self.rx_dropped_datagrams
     }
 
     /// The set of local connection IDs the peer may currently address us by
@@ -11422,7 +11463,51 @@ mod tests {
         // Length = (1 << 32) + 40, followed by exactly 40 bytes.
         dg.extend_from_slice(&[0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x28]);
         dg.extend_from_slice(&[0u8; 40]);
-        assert!(matches!(c.feed_datagram(&dg), Err(Error::Decode)));
+        // Rejected as malformed — and, being unauthenticated, dropped
+        // silently (RFC 9000 §12.2) rather than surfaced as an error.
+        assert_eq!(c.feed_datagram(&dg), Ok(()));
+        assert_eq!(c.rx_dropped_datagrams(), 1);
+        assert!(!c.is_closed() && !c.is_closing() && !c.is_draining());
+    }
+
+    /// RFC 9000 §5.2 / §12.2 regression: malformed unauthenticated datagrams
+    /// (a lone short-header byte, a truncated long header, a Length past the
+    /// end of the datagram) are dropped silently. `feed_datagram` used to
+    /// return `Err(Decode)` for them without closing, and callers that treat
+    /// any feed error as fatal (the CLI client, the FFI) let one spoofed
+    /// 1-byte datagram kill an established connection.
+    #[test]
+    fn malformed_unauthenticated_datagrams_are_silent_drops() {
+        let (mut client, mut server) = loopback_pair();
+        drive_until_complete(&mut client, &mut server, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut client, &mut server);
+        }
+        let mut long_past_end = alloc::vec![0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
+        long_past_end.extend_from_slice(&[0x00, 0x40, 0x80, 0x01, 0x02]);
+        let junk: [&[u8]; 4] = [
+            &[0x40],
+            &[0xC0, 0x00, 0x00],
+            &[0xC0, 0x00, 0x00, 0x00, 0x01, 0x14],
+            &long_past_end,
+        ];
+        for (i, dg) in junk.iter().enumerate() {
+            assert_eq!(client.feed_datagram(dg), Ok(()), "client, junk #{i}");
+            assert_eq!(server.feed_datagram(dg), Ok(()), "server, junk #{i}");
+        }
+        assert!(client.rx_dropped_datagrams() >= 1);
+        for conn in [&client, &server] {
+            assert!(!conn.is_closed() && !conn.is_closing() && !conn.is_draining());
+        }
+        // The connection keeps working end to end.
+        let sid = client.open_bidi().expect("open");
+        client.write(sid, b"still-alive").expect("write");
+        for _ in 0..4 {
+            let _ = pump(&mut client, &mut server);
+        }
+        let mut buf = [0u8; 32];
+        let (n, _) = server.read(sid, &mut buf).expect("server read");
+        assert_eq!(&buf[..n], b"still-alive");
     }
 
     /// A server never has a preferred address to move to, and a client cannot

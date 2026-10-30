@@ -659,6 +659,10 @@ pub unsafe extern "C" fn pc_quic_free(q: *mut PcQuic) {
 
 /// Feeds one received UDP datagram into the engine.
 ///
+/// Malformed or unauthenticated datagrams are silently discarded and return
+/// [`PcStatus::Ok`] (RFC 9000 §5.2 / §12.2): anyone can forge them. A
+/// non-`Ok` status means the datagram ended the connection.
+///
 /// # Safety
 /// All pointers valid for their declared lengths.
 #[unsafe(no_mangle)]
@@ -683,7 +687,14 @@ pub unsafe extern "C" fn pc_quic_feed_datagram(
         }
         match conn.feed_datagram(b) {
             Ok(()) => PcStatus::Ok,
-            Err(_) => PcStatus::Internal,
+            // A feed error is fatal only when it ended the connection.
+            // Unauthenticated junk (RFC 9000 §5.2 / §12.2) is dropped by
+            // the engine without an error; this guard keeps a forged
+            // datagram from ever surfacing as a failure here.
+            Err(_) if conn.is_closing() || conn.is_draining() || conn.is_closed() => {
+                PcStatus::Internal
+            }
+            Err(_) => PcStatus::Ok,
         }
     })
 }
