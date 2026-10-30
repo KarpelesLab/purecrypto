@@ -5781,7 +5781,9 @@ fn req_and_x509_accept_ed448_keys() {
             "-key",
             &p("leaf.key"),
             "-subj",
-            "/CN=leaf",
+            // Not host-shaped: a single-label CN like `leaf` would now be
+            // refused by the requester-chosen-CN screen without a SAN.
+            "/CN=Ed448 leaf",
             "-out",
             &p("leaf.csr"),
         ],

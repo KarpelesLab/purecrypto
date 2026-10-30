@@ -316,6 +316,13 @@ picked. Supply your own names with `-san`, accept the request's with
 `-copy-csr-san`, replace the subject with `-subj /CN=...`, or override the
 check with `-allow-cn-hostname`.
 
+"Looks like a host name" means the commonName consists only of letters,
+digits, `-` and `_` (dot-separated labels, optionally a leading `*.` and a
+trailing dot) or is an IP literal. A **single** label such as `vault`,
+`intranet` or `wpad` counts: the commonName fallback matches dotless
+intranet names too. Names with spaces or punctuation (`John Smith`,
+`Example Corp Root CA`) are not affected.
+
 ## `ca`
 
 A small development CA that keeps its state in a directory.

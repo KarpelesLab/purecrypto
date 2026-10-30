@@ -535,7 +535,9 @@ pub(crate) fn parse_sans(spec: &str) -> Vec<String> {
 
 /// Whether `cn` reads as a *host identifier* — a dNSName, a `*.` wildcard
 /// pattern, or an IP literal — rather than a human-facing organizational
-/// name ("Acme Inc", "Test CA", "R3").
+/// name ("Acme Inc", "Test CA", "Alice Smith"). Single-label names
+/// (`vault`, `intranet`, `R3`) count as host identifiers: the CN fallback
+/// matches them like any other host name.
 ///
 /// This is the shape that RFC 6125 §6.4.4's deprecated commonName fallback
 /// still matches: a relying party (this crate's own `tls::pki::verify`
@@ -555,18 +557,17 @@ pub(crate) fn cn_is_host_identifier(cn: &str) -> bool {
     if ip.parse::<core::net::IpAddr>().is_ok() {
         return true;
     }
-    // The one dotless name a browser will actually resolve and match.
-    if cn.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    // dNSName shape: two or more LDH labels separated by dots, optionally
-    // with a wildcard in the leftmost label and an absolute trailing dot.
+    // dNSName shape: one or more LDH(+underscore) labels separated by dots,
+    // optionally with a wildcard in the leftmost label and an absolute
+    // trailing dot. A *single* label counts too: the CN fallback in
+    // `tls::pki::verify` (and in other relying parties) matches dotless
+    // intranet names such as `vault`, `intranet` or `wpad` exactly like
+    // multi-label ones, so `CN=vault` in a SAN-less certificate
+    // authenticates `https://vault`. Human-facing names ("Test CA",
+    // "Acme Inc.", "Alice Smith") contain a space or other non-LDH
+    // character and are therefore not affected.
     let host = cn.strip_suffix('.').unwrap_or(cn);
-    let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() < 2 {
-        return false;
-    }
-    labels.iter().enumerate().all(|(i, l)| {
+    host.split('.').enumerate().all(|(i, l)| {
         !l.is_empty()
             && l.bytes().all(|b| {
                 b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || (i == 0 && b == b'*')
@@ -779,6 +780,13 @@ mod tests {
             "::1",
             "[::1]",
             "2001:db8::1",
+            // Dotless intranet names: matched by the CN fallback too.
+            "intranet",
+            "vault",
+            "WPAD",
+            "vault.",
+            "R3",
+            "*",
         ] {
             assert!(cn_is_host_identifier(host), "missed host-shaped CN: {host}");
         }
@@ -786,12 +794,16 @@ mod tests {
             "",
             "Test CA",
             "Acme Inc.",
-            "R3",
+            "John Smith",
+            "Example Corp Root CA",
             "Alice Smith",
             "purecrypto development root",
             "Acme, Inc. Issuing CA",
             "CN with space.example",
             "alice@example.com",
+            ".",
+            "a..b",
+            "Acme, Inc.",
         ] {
             assert!(
                 !cn_is_host_identifier(name),
