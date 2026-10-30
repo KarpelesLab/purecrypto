@@ -16,6 +16,7 @@ use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::x509::AnyPublicKey;
 use purecrypto::xmss::{XmssMtPrivateKey, XmssPrivateKey};
+use purecrypto::zeroize::Zeroizing;
 
 const USAGE: &str = "\
 purecrypto pkeyutl <subcommand>
@@ -335,8 +336,13 @@ fn stateful_sign(key_path: &str, msg: &[u8]) -> Vec<u8> {
             .unwrap_or_else(|| die("stateful key path is not valid UTF-8")),
     );
     crate::util::warn_if_world_readable_key(key_path);
-    let raw = std::fs::read(&key_file)
-        .unwrap_or_else(|e| die(format!("cannot read {}: {e}", key_file.display())));
+    // Both the on-disk state and its advanced re-serialization are the
+    // plaintext private key: keep them in `Zeroizing` so they are wiped on
+    // drop instead of lingering in freed heap memory.
+    let raw = Zeroizing::new(
+        std::fs::read(&key_file)
+            .unwrap_or_else(|e| die(format!("cannot read {}: {e}", key_file.display()))),
+    );
     let key = parse_stateful(&raw)
         .unwrap_or_else(|| die("not a recognized LMS/HSS/XMSS/XMSS^MT private key"));
 
@@ -349,22 +355,22 @@ fn stateful_sign(key_path: &str, msg: &[u8]) -> Vec<u8> {
         StatefulKey::Lms(mut k) => {
             let s = LmsPrivateKey::sign(&mut k, &mut OsRng, msg)
                 .unwrap_or_else(|e| die(format!("LMS sign failed: {e:?}")));
-            (s, k.to_bytes_with_cache())
+            (s, Zeroizing::new(k.to_bytes_with_cache()))
         }
         StatefulKey::Hss(mut k) => {
             let s = HssPrivateKey::sign(&mut k, &mut OsRng, msg)
                 .unwrap_or_else(|e| die(format!("HSS sign failed: {e:?}")));
-            (s, k.to_bytes_with_cache())
+            (s, Zeroizing::new(k.to_bytes_with_cache()))
         }
         StatefulKey::Xmss(mut k) => {
             let s = XmssPrivateKey::sign(&mut k, msg)
                 .unwrap_or_else(|e| die(format!("XMSS sign failed: {e:?}")));
-            (s, k.to_bytes())
+            (s, Zeroizing::new(k.to_bytes()))
         }
         StatefulKey::XmssMt(mut k) => {
             let s = XmssMtPrivateKey::sign(&mut k, msg)
                 .unwrap_or_else(|e| die(format!("XMSS^MT sign failed: {e:?}")));
-            (s, k.to_bytes())
+            (s, Zeroizing::new(k.to_bytes()))
         }
     };
 

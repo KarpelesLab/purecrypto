@@ -126,7 +126,7 @@ fn export(args: &Args) {
     warn_if_world_readable_key(key_path);
     let mut key_pem =
         std::fs::read(key_path).unwrap_or_else(|e| die(format!("cannot read {key_path}: {e}")));
-    let pem = String::from_utf8_lossy(&key_pem).into_owned();
+    let pem = Zeroizing::new(String::from_utf8_lossy(&key_pem).into_owned());
     let mut pkcs8 = pkcs8_from_pem(&pem, key_path);
     zero_buf(&mut key_pem);
 
@@ -204,11 +204,23 @@ fn unpack(args: &Args) {
         return;
     }
 
-    let mut pem: Vec<u8> = Vec::new();
+    // Sized up front (PEM is < 2x the DER plus armour) so the buffer holding
+    // plaintext keys never reallocates and leaves an unwiped copy behind;
+    // `Zeroizing` wipes it on drop.
+    let capacity: usize = parsed
+        .keys
+        .iter()
+        .chain(parsed.certs.iter())
+        .map(|d| d.len() * 2 + 128)
+        .sum();
+    let mut pem: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(capacity));
     let with_keys = !args.flag("-nokeys");
     if with_keys {
         for k in &parsed.keys {
-            pem.extend_from_slice(pem_encode("PRIVATE KEY", k).as_bytes());
+            // Each block is a plaintext private key: wipe the temporary
+            // String once it has been copied into the output buffer.
+            let block = Zeroizing::new(pem_encode("PRIVATE KEY", k));
+            pem.extend_from_slice(block.as_bytes());
         }
     }
     if !args.flag("-nocerts") {
@@ -221,7 +233,6 @@ fn unpack(args: &Args) {
         &pem,
         /* private = */ with_keys && !parsed.keys.is_empty(),
     );
-    zero_buf(&mut pem);
 }
 
 pub(crate) fn run(args: Args) {

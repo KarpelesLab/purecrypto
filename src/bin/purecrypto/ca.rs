@@ -45,6 +45,7 @@ use purecrypto::x509::{
     AnyPublicKey, CertSigner, Certificate, CertificateRevocationList, CertificationRequest,
     CrlBuilder, CrlReason, DistinguishedName, Time, Validity,
 };
+use purecrypto::zeroize::Zeroizing;
 
 /// CA directory layout helpers.
 struct CaDir {
@@ -343,7 +344,9 @@ fn run_init(args: Args) {
         .or(root_tmpl.default_days.map(u64::from))
         .unwrap_or(365);
 
-    // Generate the key.
+    // Generate the key. The PEM is wrapped in `Zeroizing` so the plaintext
+    // root key is wiped when it goes out of scope rather than left in a
+    // freed heap chunk.
     let (key_pem, key_for_signer) = match algorithm.to_ascii_uppercase().as_str() {
         "EC" | "ECDSA" => {
             let curve_id = match curve.to_ascii_lowercase().as_str() {
@@ -353,24 +356,25 @@ fn run_init(args: Args) {
                 other => die(format!("unknown curve: {other}")),
             };
             let k = BoxedEcdsaPrivateKey::generate(curve_id, &mut OsRng);
-            (k.to_sec1_pem(), RootKey::Ec(k))
+            (Zeroizing::new(k.to_sec1_pem()), RootKey::Ec(k))
         }
         "RSA" => {
             use purecrypto::bignum::Uint;
             let k = RsaPrivateKey::<32>::generate(Uint::from_u64(65537), &mut OsRng, 20);
-            let pem = k.to_pkcs1_pem();
+            let pem = Zeroizing::new(k.to_pkcs1_pem());
+            let der = Zeroizing::new(k.to_pkcs1_der());
             (
                 pem,
-                RootKey::Rsa(BoxedRsaPrivateKey::from_pkcs1_der(&k.to_pkcs1_der()).unwrap()),
+                RootKey::Rsa(BoxedRsaPrivateKey::from_pkcs1_der(&der).unwrap()),
             )
         }
         "ED25519" => {
             let k = Ed25519PrivateKey::generate(&mut OsRng);
-            (k.to_pkcs8_pem(), RootKey::Ed25519(k))
+            (Zeroizing::new(k.to_pkcs8_pem()), RootKey::Ed25519(k))
         }
         "ED448" => {
             let k = Ed448PrivateKey::generate(&mut OsRng);
-            (k.to_pkcs8_pem(), RootKey::Ed448(k))
+            (Zeroizing::new(k.to_pkcs8_pem()), RootKey::Ed448(k))
         }
         other => die(format!(
             "unsupported -algorithm {other} (try EC, RSA, ED25519, ED448)"
