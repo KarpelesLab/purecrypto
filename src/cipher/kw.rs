@@ -277,6 +277,9 @@ fn unwrap_w<C: BlockCipher>(cipher: &C, ciphertext: &[u8], out: &mut [u8]) -> Re
             out[r_off..r_off + 8].copy_from_slice(&block[8..]);
         }
     }
+    // After the final step `block` holds A ‖ R_1 — the first 8 bytes of the
+    // recovered key — so wipe it before it is left behind on the stack.
+    block.zeroize();
     Ok(a)
 }
 
@@ -388,12 +391,21 @@ impl<C: BlockCipher> AesKwp<C> {
             block.copy_from_slice(ciphertext);
             self.cipher.decrypt_block(&mut block);
             scratch[..8].copy_from_slice(&block[8..]);
-            (
-                u64::from_be_bytes(block[..8].try_into().unwrap()),
-                &scratch[..8],
-            )
+            let aiv = u64::from_be_bytes(block[..8].try_into().unwrap());
+            // `block` holds AIV ‖ plaintext key: wipe the local copy now that
+            // both halves have been moved out.
+            block.zeroize();
+            (aiv, &scratch[..8])
         } else {
-            let recovered = unwrap_w(&self.cipher, ciphertext, &mut scratch[..padded_len])?;
+            let recovered = match unwrap_w(&self.cipher, ciphertext, &mut scratch[..padded_len]) {
+                Ok(a) => a,
+                Err(e) => {
+                    // Unreachable today (lengths were checked above), but
+                    // never leave a partially unwrapped key in `scratch`.
+                    scratch[..padded_len].zeroize();
+                    return Err(e);
+                }
+            };
             (recovered, &scratch[..padded_len])
         };
 
@@ -517,6 +529,41 @@ mod tests {
     use super::*;
     use crate::cipher::{Aes128, Aes192, Aes256};
     use crate::test_util::from_hex;
+
+    /// The single-block KWP unwrap path and the multi-block `unwrap_w` path
+    /// wipe their local working blocks; this exercises both on success and
+    /// on integrity failure (stack residue itself is not observable from a
+    /// unit test — see the kw stack-scan PoC in the 2026-10 audit).
+    #[test]
+    fn unwrap_paths_after_local_wipes() {
+        let kek = [7u8; 16];
+        let secret = *b"SeCrEtK!";
+        let kwp = Aes128Kwp::new(Aes128::new(&kek));
+        let mut ct = [0u8; 16];
+        kwp.wrap(&secret, &mut ct).unwrap();
+        let mut out = [0u8; 8];
+        assert_eq!(kwp.unwrap(&ct, &mut out), Ok(8));
+        assert_eq!(out, secret);
+        let mut out = [0xAAu8; 8];
+        assert_eq!(
+            kwp.unwrap_with_aiv_prefix(&[1, 2, 3, 4], &ct, &mut out),
+            Err(KwError::IntegrityCheck)
+        );
+        assert_eq!(out, [0xAAu8; 8], "failed unwrap must not write `out`");
+
+        let kw = Aes128Kw::new(Aes128::new(&kek));
+        let pt = *b"SeCrEtK!secondhf";
+        let mut ct2 = [0u8; 24];
+        kw.wrap(&pt, &mut ct2).unwrap();
+        let mut out2 = [0u8; 16];
+        kw.unwrap(&ct2, &mut out2).unwrap();
+        assert_eq!(out2, pt);
+        assert_eq!(
+            kw.unwrap_with_iv(&[9; 8], &ct2, &mut out2),
+            Err(KwError::IntegrityCheck)
+        );
+        assert_eq!(out2, [0u8; 16]);
+    }
 
     /// RFC 3394 §4.1: 128-bit data with a 128-bit KEK.
     #[test]
