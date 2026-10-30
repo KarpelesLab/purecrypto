@@ -344,6 +344,25 @@ fn simd_chunks(input: &[u8], key: &[u32; 8], base: u64, flags: u32, out: &mut [[
     }
 }
 
+/// One kernel pass writing the `out.len() / 64` output blocks
+/// [`simd_lanes`] chose.
+#[cfg(target_arch = "x86_64")]
+fn simd_xof(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    out: &mut [u8],
+) {
+    use super::blake3_simd::{DEGREE, supported, xof8, xof16};
+    if out.len() / BLOCK_LEN > DEGREE || !supported() {
+        xof16(cv, block, counter, block_len, flags, out);
+    } else {
+        xof8(cv, block, counter, block_len, flags, out);
+    }
+}
+
 /// One kernel pass over the `out.len()` parents [`simd_lanes`] chose.
 #[cfg(target_arch = "x86_64")]
 fn simd_parents(cvs: &[[u32; 8]], key: &[u32; 8], flags: u32, out: &mut [[u32; 8]]) {
@@ -356,7 +375,9 @@ fn simd_parents(cvs: &[[u32; 8]], key: &[u32; 8], flags: u32, out: &mut [[u32; 8
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
-use super::blake3_neon::{hash_chunks4 as simd_chunks, hash_parents4 as simd_parents};
+use super::blake3_neon::{
+    hash_chunks4 as simd_chunks, hash_parents4 as simd_parents, xof4 as simd_xof,
+};
 
 // No kernels here: `simd_lanes` is always 0, so these are never reached.
 #[cfg(not(any(
@@ -371,6 +392,13 @@ fn simd_chunks(_: &[u8], _: &[u32; 8], _: u64, _: u32, _: &mut [[u32; 8]]) {
     all(feature = "std", target_arch = "aarch64", target_endian = "little")
 )))]
 fn simd_parents(_: &[[u32; 8]], _: &[u32; 8], _: u32, _: &mut [[u32; 8]]) {
+    unreachable!("blake3: no SIMD backend on this target")
+}
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(feature = "std", target_arch = "aarch64", target_endian = "little")
+)))]
+fn simd_xof(_: &[u32; 8], _: &[u32; 16], _: u64, _: u32, _: u32, _: &mut [u8]) {
     unreachable!("blake3: no SIMD backend on this target")
 }
 
@@ -681,32 +709,61 @@ impl Blake3Reader {
     }
 
     fn fill(&mut self) {
-        let words = compress(
-            &self.output.input_cv,
-            &self.output.block,
-            self.block_counter,
-            self.output.block_len,
-            self.output.flags | ROOT,
-        );
-        for (chunk, w) in self.block.chunks_exact_mut(4).zip(words.iter()) {
-            chunk.copy_from_slice(&w.to_le_bytes());
-        }
-        self.block_counter += 1;
+        xof_blocks(&self.output, self.block_counter, &mut self.block);
+        self.block_counter = self.block_counter.wrapping_add(1);
         self.offset = 0;
     }
 }
 
 impl XofReader for Blake3Reader {
     fn read(&mut self, mut out: &mut [u8]) {
-        while !out.is_empty() {
-            if self.offset == BLOCK_LEN {
-                self.fill();
+        // What is left of the buffered block first; then whole blocks
+        // straight into `out` (several per kernel pass); then a final
+        // partial block through the buffer.
+        let n = (BLOCK_LEN - self.offset).min(out.len());
+        out[..n].copy_from_slice(&self.block[self.offset..self.offset + n]);
+        self.offset += n;
+        out = &mut out[n..];
+        let whole = out.len() / BLOCK_LEN * BLOCK_LEN;
+        let (blocks, tail) = out.split_at_mut(whole);
+        xof_blocks(&self.output, self.block_counter, blocks);
+        self.block_counter = self.block_counter.wrapping_add((whole / BLOCK_LEN) as u64);
+        if !tail.is_empty() {
+            self.fill();
+            tail.copy_from_slice(&self.block[..tail.len()]);
+            self.offset = tail.len();
+        }
+    }
+}
+
+/// Writes the root node's extended-output blocks `counter`, `counter + 1`,
+/// … into `out` (a whole number of 64-byte blocks), on the widest kernel
+/// available.
+fn xof_blocks(output: &Output, counter: u64, out: &mut [u8]) {
+    let blocks = out.len() / BLOCK_LEN;
+    let flags = output.flags | ROOT;
+    let mut done = 0;
+    while done < blocks {
+        let at = counter.wrapping_add(done as u64);
+        let dst = &mut out[done * BLOCK_LEN..];
+        let take = simd_lanes(blocks - done);
+        if take > 0 {
+            let dst = &mut dst[..take * BLOCK_LEN];
+            simd_xof(
+                &output.input_cv,
+                &output.block,
+                at,
+                output.block_len,
+                flags,
+                dst,
+            );
+            done += take;
+        } else {
+            let words = compress(&output.input_cv, &output.block, at, output.block_len, flags);
+            for (chunk, w) in dst[..BLOCK_LEN].chunks_exact_mut(4).zip(words.iter()) {
+                chunk.copy_from_slice(&w.to_le_bytes());
             }
-            let n = (BLOCK_LEN - self.offset).min(out.len());
-            let (head, rest) = out.split_at_mut(n);
-            head.copy_from_slice(&self.block[self.offset..self.offset + n]);
-            self.offset += n;
-            out = rest;
+            done += 1;
         }
     }
 }
@@ -1162,6 +1219,128 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The scalar extended-output blocks `counter..counter + n` of a random
+    /// root node, for the XOF kernel tests.
+    #[cfg(all(
+        feature = "std",
+        any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        )
+    ))]
+    fn xof_case(seed: u64, n: usize, counter: u64) -> (Output, alloc::vec::Vec<u8>) {
+        let mut next = xorshift(seed);
+        let mut word = || u32::from_le_bytes([next(), next(), next(), next()]);
+        let output = Output {
+            input_cv: core::array::from_fn(|_| word()),
+            block: core::array::from_fn(|_| word()),
+            counter: 0,
+            block_len: word() % 65,
+            flags: KEYED_HASH | CHUNK_END,
+        };
+        let mut want = alloc::vec![0u8; n * BLOCK_LEN];
+        for (k, dst) in want.chunks_exact_mut(BLOCK_LEN).enumerate() {
+            let words = compress(
+                &output.input_cv,
+                &output.block,
+                counter.wrapping_add(k as u64),
+                output.block_len,
+                output.flags | ROOT,
+            );
+            for (c, w) in dst.chunks_exact_mut(4).zip(words.iter()) {
+                c.copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        (output, want)
+    }
+
+    /// Each x86 XOF kernel, at every lane count from one to its width and at
+    /// counters that carry into the high word, must write exactly the scalar
+    /// output blocks.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn simd_xof_kernels_match_scalar() {
+        use super::super::blake3_simd::{
+            DEGREE, DEGREE16, supported, supported16, xof8, xof8_no_vl, xof16,
+        };
+        type Xof = fn(&[u32; 8], &[u32; 16], u64, u32, u32, &mut [u8]);
+        let kernels: [(bool, usize, Xof, &str); 3] = [
+            (supported(), DEGREE, xof8_no_vl, "avx2"),
+            (supported(), DEGREE, xof8, "avx2 (vl if present)"),
+            (supported16(), DEGREE16, xof16, "avx512"),
+        ];
+        for (ok, width, xof, name) in kernels {
+            if !ok {
+                continue;
+            }
+            for n in 1..=width {
+                for counter in [0u64, 5, (1u64 << 32) - 3, u64::MAX - 2] {
+                    let (o, want) = xof_case(n as u64 ^ counter, n, counter);
+                    let mut got = alloc::vec![0u8; n * BLOCK_LEN];
+                    xof(
+                        &o.input_cv,
+                        &o.block,
+                        counter,
+                        o.block_len,
+                        o.flags | ROOT,
+                        &mut got,
+                    );
+                    assert_eq!(got, want, "{name} xof: {n} blocks, counter {counter}");
+                }
+            }
+        }
+    }
+
+    /// The NEON XOF kernel, at every lane count from one to four and at
+    /// counters that carry into the high word, must write exactly the scalar
+    /// output blocks.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_xof_kernel_matches_scalar() {
+        use super::super::blake3_neon::{DEGREE, xof4};
+        for n in 1..=DEGREE {
+            for counter in [0u64, 5, (1u64 << 32) - 3, u64::MAX - 2] {
+                let (o, want) = xof_case(n as u64 ^ counter, n, counter);
+                let mut got = alloc::vec![0u8; n * BLOCK_LEN];
+                xof4(
+                    &o.input_cv,
+                    &o.block,
+                    counter,
+                    o.block_len,
+                    o.flags | ROOT,
+                    &mut got,
+                );
+                assert_eq!(got, want, "neon xof: {n} blocks, counter {counter}");
+            }
+        }
+    }
+
+    /// Long extended output read in one call (whole blocks straight from the
+    /// kernels) must equal the same stream read in pieces that only ever go
+    /// through the one-block buffer, from every starting offset.
+    #[cfg(feature = "std")]
+    #[test]
+    fn xof_bulk_matches_piecewise() {
+        let mk = || {
+            let mut h = Blake3::new_keyed(KEY);
+            h.update(b"xof");
+            h
+        };
+        let total = 40 * BLOCK_LEN + 17;
+        let mut want = alloc::vec![0u8; total];
+        let mut r = mk().finalize_xof();
+        for b in want.iter_mut() {
+            r.read(core::slice::from_mut(b));
+        }
+        for first in [0usize, 1, 63, 64, 65, 200] {
+            let mut got = alloc::vec![0u8; total];
+            let mut r = mk().finalize_xof();
+            r.read(&mut got[..first]);
+            r.read(&mut got[first..]);
+            assert_eq!(got, want, "first read {first}");
         }
     }
 

@@ -59,6 +59,24 @@ pub(super) fn hash_parents4(cvs: &[[u32; 8]], key: &[u32; 8], flags: u32, out: &
     unsafe { neon::hash_many::<false>(cvs.as_ptr().cast(), key, 0, flags | PARENT, out) }
 }
 
+/// Writes `out.len() / 64` (1..=4) consecutive extended-output blocks of a
+/// root node in parallel: block `k` is the compression of `block` under `cv`
+/// at counter `counter + k`, all 16 words, little-endian. `flags` must
+/// already carry `ROOT`.
+pub(super) fn xof4(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    out: &mut [u8],
+) {
+    assert!(out.len().is_multiple_of(64) && (1..=DEGREE).contains(&(out.len() / 64)));
+    // SAFETY: NEON is a baseline aarch64 feature, and the assert above sizes
+    // `out` to the blocks the kernel writes.
+    unsafe { neon::xof_many(cv, block, counter, block_len, flags, out) }
+}
+
 mod neon {
     use super::*;
 
@@ -287,6 +305,83 @@ mod neon {
             for ((o, l), h) in out.iter_mut().zip(lo).zip(hi) {
                 vst1q_u32(o.as_mut_ptr(), l);
                 vst1q_u32(o.as_mut_ptr().add(4), h);
+            }
+        }
+    }
+
+    /// One compression of a root node per lane, at counters `counter`,
+    /// `counter + 1`, …: lane `k` writes the full 16-word output block `k` to
+    /// `out[64 * k..]`. The message is the same in every lane, so it is a
+    /// broadcast rather than a transpose. Lanes past `out.len() / 64` are
+    /// computed and dropped.
+    ///
+    /// # Safety
+    /// `out.len()` is a multiple of 64, at most 4 blocks.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn xof_many(
+        cv: &[u32; 8],
+        block: &[u32; 16],
+        counter: u64,
+        block_len: u32,
+        flags: u32,
+        out: &mut [u8],
+    ) {
+        unsafe {
+            let tbl_bytes: [u8; 16] = [1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
+            let tbl = vld1q_u8(tbl_bytes.as_ptr());
+            let mut clo = [0u32; DEGREE];
+            let mut chi = [0u32; DEGREE];
+            for (k, (lo, hi)) in clo.iter_mut().zip(chi.iter_mut()).enumerate() {
+                let c = counter.wrapping_add(k as u64);
+                *lo = c as u32;
+                *hi = (c >> 32) as u32;
+            }
+            let m: [uint32x4_t; 16] = core::array::from_fn(|j| vdupq_n_u32(block[j]));
+            let h: [uint32x4_t; 8] = core::array::from_fn(|i| vdupq_n_u32(cv[i]));
+            let mut v = [
+                h[0],
+                h[1],
+                h[2],
+                h[3],
+                h[4],
+                h[5],
+                h[6],
+                h[7],
+                vdupq_n_u32(IV[0]),
+                vdupq_n_u32(IV[1]),
+                vdupq_n_u32(IV[2]),
+                vdupq_n_u32(IV[3]),
+                vld1q_u32(clo.as_ptr()),
+                vld1q_u32(chi.as_ptr()),
+                vdupq_n_u32(block_len),
+                vdupq_n_u32(flags),
+            ];
+            round::<0>(&mut v, &m, tbl);
+            round::<1>(&mut v, &m, tbl);
+            round::<2>(&mut v, &m, tbl);
+            round::<3>(&mut v, &m, tbl);
+            round::<4>(&mut v, &m, tbl);
+            round::<5>(&mut v, &m, tbl);
+            round::<6>(&mut v, &m, tbl);
+            // Output words: state[i] ^ state[i + 8], then state[i + 8] ^ cv[i].
+            // Each group of four word-vectors transposes to one 16-byte
+            // quarter of every lane's block.
+            let mut rows = [vdupq_n_u32(0); 16];
+            for i in 0..8 {
+                rows[i] = xor(v[i], v[i + 8]);
+                rows[i + 8] = xor(v[i + 8], h[i]);
+            }
+            for q in 0..4 {
+                let mut quad = [
+                    rows[4 * q],
+                    rows[4 * q + 1],
+                    rows[4 * q + 2],
+                    rows[4 * q + 3],
+                ];
+                transpose4(&mut quad);
+                for (o, row) in out.chunks_exact_mut(64).zip(quad) {
+                    vst1q_u8(o.as_mut_ptr().add(16 * q), vreinterpretq_u8_u32(row));
+                }
             }
         }
     }

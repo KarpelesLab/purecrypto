@@ -92,6 +92,86 @@ pub(super) fn hash_parents16(cvs: &[[u32; 8]], key: &[u32; 8], flags: u32, out: 
     unsafe { avx512::hash_many::<false>(cvs.as_ptr().cast(), key, 0, flags | PARENT, out) }
 }
 
+/// Writes `out.len() / 64` (1..=16) consecutive extended-output blocks of
+/// a root node in parallel with AVX-512: block `k` is the compression of
+/// `block` under `cv` at counter `counter + k`, all 16 words, little-endian.
+/// `flags` must already carry `ROOT`.
+///
+/// Same CPU-feature contract as [`hash_chunks16`].
+#[cfg(target_arch = "x86_64")]
+pub(super) fn xof16(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    out: &mut [u8],
+) {
+    assert!(
+        supported16(),
+        "blake3 xof16 called on a CPU without AVX-512F; check supported16() first"
+    );
+    assert!(out.len().is_multiple_of(64) && (1..=DEGREE16).contains(&(out.len() / 64)));
+    // SAFETY: `supported16()` just confirmed AVX-512F on this CPU, and the
+    // assert above sizes `out` to the blocks the kernel writes.
+    unsafe { avx512::xof_many(cv, block, counter, block_len, flags, out) }
+}
+
+/// [`xof16`] eight lanes wide, with AVX2 (and AVX-512VL's rotations where
+/// the CPU has them). Same CPU-feature contract as [`hash_chunks8`].
+#[cfg(target_arch = "x86_64")]
+pub(super) fn xof8(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    out: &mut [u8],
+) {
+    xof8_impl(supported_vl(), cv, block, counter, block_len, flags, out)
+}
+
+/// [`xof8`] without AVX-512VL, as [`hash_chunks8_no_vl`].
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
+pub(super) fn xof8_no_vl(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    out: &mut [u8],
+) {
+    xof8_impl(false, cv, block, counter, block_len, flags, out)
+}
+
+/// [`xof8`], with `vl` choosing the AVX-512VL build.
+#[cfg(target_arch = "x86_64")]
+fn xof8_impl(
+    vl: bool,
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    out: &mut [u8],
+) {
+    assert!(
+        supported(),
+        "blake3 xof8 called on a CPU without AVX2; check supported() first"
+    );
+    assert!(!vl || supported_vl());
+    assert!(out.len().is_multiple_of(64) && (1..=DEGREE).contains(&(out.len() / 64)));
+    // SAFETY: the asserts just confirmed AVX2, and AVX-512F/VL when `vl`, on
+    // this CPU, and size `out` to the blocks the kernel writes.
+    unsafe {
+        if vl {
+            avx2::xof_many_vl(cv, block, counter, block_len, flags, out)
+        } else {
+            avx2::xof_many(cv, block, counter, block_len, flags, out)
+        }
+    }
+}
+
 /// Compresses `out.len()` (1..=8) consecutive full 1024-byte chunks in
 /// parallel with AVX2 (with AVX-512VL's rotations where the CPU has them).
 /// Same contract as [`hash_chunks16`], eight lanes wide.
@@ -379,6 +459,71 @@ mod avx512 {
             }
         }
     }
+
+    /// One compression of a root node per lane, at counters `counter`,
+    /// `counter + 1`, …: lane `k` writes the full 16-word output block `k` to
+    /// `out[64 * k..]`. The message is the same in every lane, so it is a
+    /// broadcast rather than a transpose. Lanes past `out.len() / 64` are
+    /// computed and dropped.
+    ///
+    /// # Safety
+    /// Requires AVX-512F; `out.len()` is a multiple of 64, at most 16 blocks.
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn xof_many(
+        cv: &[u32; 8],
+        block: &[u32; 16],
+        counter: u64,
+        block_len: u32,
+        flags: u32,
+        out: &mut [u8],
+    ) {
+        unsafe {
+            let mut clo = [0u32; 16];
+            let mut chi = [0u32; 16];
+            for (k, (lo, hi)) in clo.iter_mut().zip(chi.iter_mut()).enumerate() {
+                let c = counter.wrapping_add(k as u64);
+                *lo = c as u32;
+                *hi = (c >> 32) as u32;
+            }
+            let m: [__m512i; 16] = core::array::from_fn(|j| _mm512_set1_epi32(block[j] as i32));
+            let h: [__m512i; 8] = core::array::from_fn(|i| _mm512_set1_epi32(cv[i] as i32));
+            let mut v = [
+                h[0],
+                h[1],
+                h[2],
+                h[3],
+                h[4],
+                h[5],
+                h[6],
+                h[7],
+                _mm512_set1_epi32(IV[0] as i32),
+                _mm512_set1_epi32(IV[1] as i32),
+                _mm512_set1_epi32(IV[2] as i32),
+                _mm512_set1_epi32(IV[3] as i32),
+                _mm512_loadu_si512(clo.as_ptr() as *const _),
+                _mm512_loadu_si512(chi.as_ptr() as *const _),
+                _mm512_set1_epi32(block_len as i32),
+                _mm512_set1_epi32(flags as i32),
+            ];
+            round::<0>(&mut v, &m);
+            round::<1>(&mut v, &m);
+            round::<2>(&mut v, &m);
+            round::<3>(&mut v, &m);
+            round::<4>(&mut v, &m);
+            round::<5>(&mut v, &m);
+            round::<6>(&mut v, &m);
+            // Output words: state[i] ^ state[i + 8], then state[i + 8] ^ cv[i].
+            let mut rows = [_mm512_setzero_si512(); 16];
+            for i in 0..8 {
+                rows[i] = xor(v[i], v[i + 8]);
+                rows[i + 8] = xor(v[i + 8], h[i]);
+            }
+            transpose16(&mut rows);
+            for (o, row) in out.chunks_exact_mut(64).zip(rows.iter()) {
+                _mm512_storeu_si512(o.as_mut_ptr() as *mut _, *row);
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -631,6 +776,99 @@ mod avx2 {
             transpose8(&mut h);
             for (o, row) in out.iter_mut().zip(h.iter()) {
                 _mm256_storeu_si256(o.as_mut_ptr() as *mut __m256i, *row);
+            }
+        }
+    }
+
+    /// The 8-lane counterpart of `avx512::xof_many`, same contract.
+    ///
+    /// # Safety
+    /// Requires AVX2; `out.len()` is a multiple of 64, at most 8 blocks.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn xof_many(
+        cv: &[u32; 8],
+        block: &[u32; 16],
+        counter: u64,
+        block_len: u32,
+        flags: u32,
+        out: &mut [u8],
+    ) {
+        unsafe { xof_body::<false>(cv, block, counter, block_len, flags, out) }
+    }
+
+    /// [`xof_many`] with AVX-512VL's rotations, as [`hash_many_vl`].
+    ///
+    /// # Safety
+    /// Requires AVX-512F and AVX-512VL; `out` as in [`xof_many`].
+    #[target_feature(enable = "avx512f,avx512vl")]
+    pub(super) unsafe fn xof_many_vl(
+        cv: &[u32; 8],
+        block: &[u32; 16],
+        counter: u64,
+        block_len: u32,
+        flags: u32,
+        out: &mut [u8],
+    ) {
+        unsafe { xof_body::<true>(cv, block, counter, block_len, flags, out) }
+    }
+
+    #[inline(always)]
+    unsafe fn xof_body<const VL: bool>(
+        cv: &[u32; 8],
+        block: &[u32; 16],
+        counter: u64,
+        block_len: u32,
+        flags: u32,
+        out: &mut [u8],
+    ) {
+        unsafe {
+            let mut clo = [0u32; 8];
+            let mut chi = [0u32; 8];
+            for (k, (lo, hi)) in clo.iter_mut().zip(chi.iter_mut()).enumerate() {
+                let c = counter.wrapping_add(k as u64);
+                *lo = c as u32;
+                *hi = (c >> 32) as u32;
+            }
+            let m: [__m256i; 16] = core::array::from_fn(|j| _mm256_set1_epi32(block[j] as i32));
+            let h: [__m256i; 8] = core::array::from_fn(|i| _mm256_set1_epi32(cv[i] as i32));
+            let mut v = [
+                h[0],
+                h[1],
+                h[2],
+                h[3],
+                h[4],
+                h[5],
+                h[6],
+                h[7],
+                _mm256_set1_epi32(IV[0] as i32),
+                _mm256_set1_epi32(IV[1] as i32),
+                _mm256_set1_epi32(IV[2] as i32),
+                _mm256_set1_epi32(IV[3] as i32),
+                _mm256_loadu_si256(clo.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(chi.as_ptr() as *const __m256i),
+                _mm256_set1_epi32(block_len as i32),
+                _mm256_set1_epi32(flags as i32),
+            ];
+            round::<0, VL>(&mut v, &m);
+            round::<1, VL>(&mut v, &m);
+            round::<2, VL>(&mut v, &m);
+            round::<3, VL>(&mut v, &m);
+            round::<4, VL>(&mut v, &m);
+            round::<5, VL>(&mut v, &m);
+            round::<6, VL>(&mut v, &m);
+            // Output words: state[i] ^ state[i + 8], then state[i + 8] ^ cv[i];
+            // each half transposes to one 32-byte half of every lane's block.
+            let mut lo = [_mm256_setzero_si256(); 8];
+            let mut hi = [_mm256_setzero_si256(); 8];
+            for i in 0..8 {
+                lo[i] = xor(v[i], v[i + 8]);
+                hi[i] = xor(v[i + 8], h[i]);
+            }
+            transpose8(&mut lo);
+            transpose8(&mut hi);
+            for ((o, l), h) in out.chunks_exact_mut(64).zip(lo).zip(hi) {
+                _mm256_storeu_si256(o.as_mut_ptr() as *mut __m256i, l);
+                _mm256_storeu_si256(o.as_mut_ptr().add(32) as *mut __m256i, h);
             }
         }
     }
