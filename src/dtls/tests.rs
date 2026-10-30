@@ -6465,3 +6465,44 @@ mod resume12 {
         assert_done_with_ticket(&mut c, &mut s);
     }
 }
+
+/// Regression (audit 2026-10-31): a spoofed plaintext ServerHello that
+/// carries ALPN (and EMS) and then fails a later check (an unsolicited
+/// `connection_id`) is silently dropped on the epoch-0 path. It must leave
+/// nothing behind: the genuine, ALPN-less handshake then completes with no
+/// protocol selected — not with the attacker-planted one.
+#[test]
+fn spoofed_server_hello_does_not_plant_alpn_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut roots = RootCertStore::new();
+    roots.add_der(cert.clone()).unwrap();
+    let cfg = PcClientConfig12::new(roots, "dtls.example")
+        .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0))
+        .with_alpn(alloc::vec![b"safe".to_vec(), b"evil".to_vec()]);
+    let mut crng = HmacDrbg::<Sha256>::new(b"dtls12-client", b"nonce", &[]);
+    let mut client = DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-alpn", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    let mut sh_body = Vec::new();
+    sh_body.extend_from_slice(&[0xfe, 0xfd]);
+    sh_body.extend_from_slice(&[0x11; 32]);
+    sh_body.push(0);
+    sh_body.extend_from_slice(&[0xc0, 0x2b]); // offered suite
+    sh_body.push(0);
+    // extensions: EMS + ALPN("evil") + connection_id (unsolicited -> error)
+    let mut exts = Vec::new();
+    exts.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]); // EMS
+    exts.extend_from_slice(&[0x00, 0x10, 0x00, 0x07, 0x00, 0x05, 0x04]);
+    exts.extend_from_slice(b"evil");
+    exts.extend_from_slice(&[0x00, 0x36, 0x00, 0x01, 0x00]); // connection_id (54), empty cid
+    sh_body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    sh_body.extend_from_slice(&exts);
+    let forged_sh = dtls12_plaintext_handshake_record(2, 0, &sh_body);
+    assert_eq!(client.feed_datagram(&forged_sh), Ok(()));
+    assert!(pump_handshake(&mut client, &mut server));
+    assert_eq!(server.alpn_protocol(), None);
+    assert_eq!(client.alpn_protocol(), None);
+}

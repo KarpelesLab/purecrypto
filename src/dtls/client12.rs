@@ -1393,46 +1393,56 @@ impl DtlsClientConnection12 {
         if !self.config.cipher_suites.contains(&sh.cipher_suite) {
             return Err(Error::HandshakeFailure);
         }
-        // Pin the transcript hash now that the suite is known. The buffered
-        // bytes (CH-with-cookie and onward) will be hashed on demand under
-        // this algorithm.
-        self.transcript.set_alg(suite.hash);
-        self.suite = Some(suite);
+        // Everything below is computed into locals and only committed to
+        // `self` once every check has passed: this message is unauthenticated
+        // epoch-0 input, and a dispatch fault here is silently dropped (see
+        // `process_handshake_record`), so a half-applied ServerHello — a
+        // spoofed one that plants an ALPN selection or the EMS flag and then
+        // fails a later check — would otherwise survive into the genuine
+        // handshake.
+        //
         // RFC 7627 §5.1: detect the EMS echo. Body MUST be empty; a
         // non-empty body fails parsing → decode_error.
-        if let Some(ems_body) = ext::find(
+        let ems_negotiated = match ext::find(
             &sh.extensions,
             crate::tls::codec::ExtensionType::EXTENDED_MASTER_SECRET,
         ) {
-            ext::parse_extended_master_secret(ems_body)?;
-            self.ems_negotiated = true;
-        }
+            Some(ems_body) => {
+                ext::parse_extended_master_secret(ems_body)?;
+                true
+            }
+            None => false,
+        };
         // RFC 7627 §5.3: we always offer EMS, so a server that does not echo
         // it either predates RFC 7627 or had the offer stripped by an
         // attacker; either way the master secret would not be bound to the
         // handshake transcript (the triple-handshake family). Abort unless
         // the caller opted into legacy interop, as the TLS 1.2 client does.
-        if self.config.require_ems && !self.ems_negotiated {
+        if self.config.require_ems && !ems_negotiated {
             return Err(Error::HandshakeFailure);
         }
         // RFC 7301 §3.1: the server may select exactly one of the protocols
         // we offered; an unsolicited or foreign selection is a protocol
         // violation.
-        if let Some(alpn_body) = ext::find(&sh.extensions, crate::tls::codec::ExtensionType::ALPN) {
-            let selected = ext::parse_alpn(alpn_body)?;
-            let [proto] = selected.as_slice() else {
-                return Err(Error::IllegalParameter);
+        let alpn_negotiated =
+            match ext::find(&sh.extensions, crate::tls::codec::ExtensionType::ALPN) {
+                Some(alpn_body) => {
+                    let selected = ext::parse_alpn(alpn_body)?;
+                    let [proto] = selected.as_slice() else {
+                        return Err(Error::IllegalParameter);
+                    };
+                    if !self.config.alpn_protocols.iter().any(|p| p == proto) {
+                        return Err(Error::IllegalParameter);
+                    }
+                    Some(proto.clone())
+                }
+                None => None,
             };
-            if !self.config.alpn_protocols.iter().any(|p| p == proto) {
-                return Err(Error::IllegalParameter);
-            }
-            self.alpn_negotiated = Some(proto.clone());
-        }
         // RFC 9146 §3: the server answers our `connection_id` offer with
         // the CID it wants to receive, or not at all; an answer we never
         // asked for is `unsupported_extension`. DTLS 1.2 issues no further
         // CIDs, so there is no pool to draw.
-        self.cid = negotiate_client(
+        let cid = negotiate_client(
             self.config.connection_id.as_deref(),
             ext::find(
                 &sh.extensions,
@@ -1448,7 +1458,7 @@ impl DtlsClientConnection12 {
             .resume_session_id
             .as_deref()
             .is_some_and(|sid| !sh.session_id.is_empty() && sh.session_id == sid);
-        if server_resumed {
+        let resumed_keys = if server_resumed {
             let stored = self
                 .config
                 .session
@@ -1459,7 +1469,7 @@ impl DtlsClientConnection12 {
                 return Err(Error::IllegalParameter);
             }
             // RFC 7627 §5.3: EMS status must match the original session.
-            if stored.ems_used != self.ems_negotiated {
+            if stored.ems_used != ems_negotiated {
                 return Err(Error::IllegalParameter);
             }
             let master = stored.master_secret;
@@ -1476,6 +1486,20 @@ impl DtlsClientConnection12 {
                 &sr,
                 &cr,
             );
+            Some((master, write_crypter, read_crypter))
+        } else {
+            None
+        };
+
+        // All checks passed: commit. Pin the transcript hash now that the
+        // suite is known; the buffered bytes (CH-with-cookie and onward) are
+        // hashed on demand under this algorithm.
+        self.transcript.set_alg(suite.hash);
+        self.suite = Some(suite);
+        self.ems_negotiated = ems_negotiated;
+        self.alpn_negotiated = alpn_negotiated;
+        self.cid = cid;
+        if let Some((master, write_crypter, read_crypter)) = resumed_keys {
             self.master = Some(master);
             // The read keys are needed for the server's CCS; ours are only
             // used once we send our own CCS (write_epoch stays 0 till then).
