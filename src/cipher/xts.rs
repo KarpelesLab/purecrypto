@@ -351,6 +351,10 @@ impl<C: BlockCipher> Xts<C> {
 
         buf[full_off..full_off + 16].copy_from_slice(&cc);
         buf[full_off + 16..].copy_from_slice(&pp[..rem]);
+        // `cc` is P_{n-1} and `pp` holds the trailing partial plaintext: wipe
+        // the local copies, as the rest of the module does for tweaks.
+        cc.zeroize();
+        pp.zeroize();
 
         Ok(())
     }
