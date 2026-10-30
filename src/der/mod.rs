@@ -331,6 +331,22 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Finishes the body of a PKCS#8 `OneAsymmetricKey` (RFC 5958 §2) after its
+/// `privateKey` OCTET STRING: skips the OPTIONAL `[0]` attributes and the
+/// OPTIONAL `[1]` publicKey (primitive or constructed spelling), in that
+/// order, then rejects anything else. Used by the post-quantum PKCS#8
+/// parsers, which previously ignored arbitrary trailing elements.
+#[allow(dead_code)]
+pub(crate) fn finish_one_asymmetric_key_tail(mut seq: Reader<'_>) -> Result<(), Error> {
+    if seq.peek_tag() == Some(tag::context(0)) {
+        seq.read_any()?;
+    }
+    if matches!(seq.peek_tag(), Some(0x81)) || seq.peek_tag() == Some(tag::context(1)) {
+        seq.read_any()?;
+    }
+    seq.finish()
+}
+
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;

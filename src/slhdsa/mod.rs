@@ -2222,7 +2222,13 @@ impl PrivateKey {
         let oid = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
             .map_err(|_| Error::Malformed)?;
         let set = ParamSet::from_oid(oid.as_slice()).ok_or(Error::Malformed)?;
+        // LAMPS: the AlgorithmIdentifier parameters MUST be absent.
+        algid.finish().map_err(|_| Error::Malformed)?;
         let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
+        // Only the RFC 5958 OPTIONAL `[0]` attributes / `[1]` publicKey may
+        // follow, and nothing may follow the PrivateKeyInfo.
+        crate::der::finish_one_asymmetric_key_tail(seq).map_err(|_| Error::Malformed)?;
+        r.finish().map_err(|_| Error::Malformed)?;
         Self::from_bytes(set, inner)
     }
 
@@ -2358,7 +2364,13 @@ impl PublicKey {
         if oid.as_slice() != set.params().oid {
             return Err(Error::Malformed);
         }
+        // draft-ietf-lamps-x509-slhdsa: parameters MUST be absent, and nothing
+        // may follow the subjectPublicKey BIT STRING or the SPKI itself
+        // (mirrors `x509::pubkey`).
+        algid.finish().map_err(|_| Error::Malformed)?;
         let bits = spki.read_bit_string().map_err(|_| Error::Malformed)?;
+        spki.finish().map_err(|_| Error::Malformed)?;
+        reader.finish().map_err(|_| Error::Malformed)?;
         Self::from_bytes(set, bits).map_err(|_| Error::Malformed)
     }
 
@@ -2513,6 +2525,60 @@ mod tests {
         assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----"));
         let parsed = PublicKey::from_spki_pem(ParamSet::Sha2_128f, &pem).unwrap();
         assert_eq!(parsed, pk);
+    }
+
+    /// SPKI and PKCS#8 parsers reject NULL AlgorithmIdentifier parameters
+    /// (LAMPS: MUST be absent) and trailing junk inside and after the
+    /// structure, mirroring `x509::pubkey` and the registry parser.
+    #[cfg(feature = "der")]
+    #[test]
+    fn spki_and_pkcs8_noncanonical_rejected() {
+        use crate::der::{encode_bit_string, encode_integer, encode_octet_string, encode_sequence};
+        use crate::der::{encode_tlv, oid_tlv};
+        let set = ParamSet::Sha2_128f;
+        let oid = set.params().oid;
+        let mut rng = HmacDrbg::<Sha256>::new(b"slhdsa-spki-junk", b"n", &[]);
+        let (sk, pk) = PrivateKey::generate(set, &mut rng);
+        let junk = [0x05u8, 0x00];
+
+        // SPKI.
+        let bits = encode_bit_string(pk.to_bytes());
+        assert_eq!(
+            PublicKey::from_spki_der(set, &pk.to_spki_der()).unwrap(),
+            pk
+        );
+        let null_algid = encode_sequence(&[oid_tlv(oid), junk.to_vec()].concat());
+        let der = encode_sequence(&[null_algid, bits.clone()].concat());
+        assert!(PublicKey::from_spki_der(set, &der).is_err());
+        let der = encode_sequence(&[encode_sequence(&oid_tlv(oid)), bits, junk.to_vec()].concat());
+        assert!(PublicKey::from_spki_der(set, &der).is_err());
+        let mut der = pk.to_spki_der();
+        der.extend_from_slice(&junk);
+        assert!(PublicKey::from_spki_der(set, &der).is_err());
+
+        // PKCS#8.
+        let build = |params: &[u8], tail: &[u8]| {
+            let algid = encode_sequence(&[oid_tlv(oid), params.to_vec()].concat());
+            encode_sequence(
+                &[
+                    encode_integer(&[0]),
+                    algid,
+                    encode_octet_string(sk.to_bytes()),
+                    tail.to_vec(),
+                ]
+                .concat(),
+            )
+        };
+        assert!(PrivateKey::from_pkcs8_der(&build(&[], &[])).is_ok());
+        let mut pkbits = alloc::vec![0x00];
+        pkbits.extend_from_slice(pk.to_bytes());
+        let tail = [&[0xa0, 0x00][..], &encode_tlv(0x81, &pkbits)].concat();
+        assert!(PrivateKey::from_pkcs8_der(&build(&[], &tail)).is_ok());
+        assert!(PrivateKey::from_pkcs8_der(&build(&junk, &[])).is_err());
+        assert!(PrivateKey::from_pkcs8_der(&build(&[], &junk)).is_err());
+        let mut der = build(&[], &[]);
+        der.extend_from_slice(&junk);
+        assert!(PrivateKey::from_pkcs8_der(&der).is_err());
     }
 
     #[test]

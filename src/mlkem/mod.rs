@@ -404,7 +404,13 @@ macro_rules! ml_kem_set {
                 if parse_oid(algid.read_oid()?)?.as_slice() != oids::$oid {
                     return Err(Error::Malformed);
                 }
+                // LAMPS: the AlgorithmIdentifier parameters MUST be absent.
+                algid.finish()?;
                 let inner = seq.read_octet_string()?;
+                // Only the RFC 5958 OPTIONAL `[0]` attributes / `[1]` publicKey
+                // may follow, and nothing may follow the PrivateKeyInfo.
+                crate::der::finish_one_asymmetric_key_tail(seq)?;
+                r.finish()?;
 
                 // Legacy fast-path: the historical encoding was the raw `dk`
                 // with no inner CHOICE tag. Its length is exactly `$dk_size`,
@@ -426,7 +432,7 @@ macro_rules! ml_kem_set {
                 };
 
                 let mut cr = Reader::new(inner);
-                match cr.peek_tag() {
+                let key = match cr.peek_tag() {
                     // expandedKey ::= OCTET STRING
                     Some(0x04) => {
                         let expanded = cr.read_octet_string()?;
@@ -441,6 +447,7 @@ macro_rules! ml_kem_set {
                         let mut both = cr.read_sequence()?;
                         let seed = both.read_octet_string()?;
                         let expanded = both.read_octet_string()?;
+                        both.finish()?;
                         let key = from_seed(seed)?;
                         // LAMPS: a `both` whose seed and expandedKey disagree
                         // MUST be rejected. (Length check guards `ct_eq`'s zip
@@ -455,7 +462,10 @@ macro_rules! ml_kem_set {
                         Ok(key)
                     }
                     _ => Err(Error::Malformed),
-                }
+                }?;
+                // The CHOICE must fill the whole `privateKey` OCTET STRING.
+                cr.finish()?;
+                Ok(key)
             }
 
             /// Parses a PKCS#8 PEM private key.
@@ -535,7 +545,13 @@ macro_rules! ml_kem_set {
                 if parse_oid(algid.read_oid()?)?.as_slice() != oids::$oid {
                     return Err(Error::Malformed);
                 }
+                // draft-ietf-lamps-kyber-certificates: parameters MUST be
+                // absent, and nothing may follow the subjectPublicKey BIT
+                // STRING or the SPKI itself (mirrors `x509::pubkey`).
+                algid.finish()?;
                 let key_bits = spki.read_bit_string()?;
+                spki.finish()?;
+                reader.finish()?;
                 let bytes: [u8; $ek_size] = key_bits.try_into().map_err(|_| Error::Malformed)?;
                 // SPKI input is untrusted: run the FIPS 203 §7.2 modulus
                 // check rather than constructing the key unvalidated.
@@ -926,6 +942,68 @@ mod tests {
         assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----"));
         let parsed = MlKem768EncapsKey::from_spki_pem(&pem).unwrap();
         assert_eq!(parsed, ek);
+    }
+
+    /// SPKI and PKCS#8 parsers reject NULL AlgorithmIdentifier parameters
+    /// (LAMPS: MUST be absent) and trailing junk inside and after the
+    /// structure, while PKCS#8 still accepts the RFC 5958 OPTIONAL
+    /// `[0]` attributes / `[1]` publicKey.
+    #[cfg(feature = "der")]
+    #[test]
+    fn spki_and_pkcs8_noncanonical_rejected() {
+        use crate::der::{encode_bit_string, encode_integer, encode_octet_string, encode_sequence};
+        use crate::der::{encode_tlv, oid_tlv};
+        let oid = oids::ML_KEM_768;
+        let junk = [0x05u8, 0x00];
+        let seed = [3u8; 64];
+        let (_dk, ek) = MlKem768DecapsKey::from_seeds(
+            seed[..32].try_into().unwrap(),
+            seed[32..].try_into().unwrap(),
+        );
+
+        // SPKI.
+        let bits = encode_bit_string(&ek.to_bytes());
+        assert_eq!(
+            MlKem768EncapsKey::from_spki_der(&ek.to_spki_der()).unwrap(),
+            ek
+        );
+        let null_algid = encode_sequence(&[oid_tlv(oid), junk.to_vec()].concat());
+        let der = encode_sequence(&[null_algid, bits.clone()].concat());
+        assert!(MlKem768EncapsKey::from_spki_der(&der).is_err());
+        let der = encode_sequence(&[encode_sequence(&oid_tlv(oid)), bits, junk.to_vec()].concat());
+        assert!(MlKem768EncapsKey::from_spki_der(&der).is_err());
+        let mut der = ek.to_spki_der();
+        der.extend_from_slice(&junk);
+        assert!(MlKem768EncapsKey::from_spki_der(&der).is_err());
+
+        // PKCS#8 (seed [0] CHOICE form).
+        let mut choice = alloc::vec![0x80u8, 64];
+        choice.extend_from_slice(&seed);
+        let build = |params: &[u8], inner: &[u8], tail: &[u8]| {
+            let algid = encode_sequence(&[oid_tlv(oid), params.to_vec()].concat());
+            encode_sequence(
+                &[
+                    encode_integer(&[0]),
+                    algid,
+                    encode_octet_string(inner),
+                    tail.to_vec(),
+                ]
+                .concat(),
+            )
+        };
+        assert!(MlKem768DecapsKey::from_pkcs8_der(&build(&[], &choice, &[])).is_ok());
+        let mut pkbits = alloc::vec![0x00];
+        pkbits.extend_from_slice(&ek.to_bytes());
+        let tail = [&[0xa0, 0x00][..], &encode_tlv(0x81, &pkbits)].concat();
+        assert!(MlKem768DecapsKey::from_pkcs8_der(&build(&[], &choice, &tail)).is_ok());
+        assert!(MlKem768DecapsKey::from_pkcs8_der(&build(&junk, &choice, &[])).is_err());
+        assert!(MlKem768DecapsKey::from_pkcs8_der(&build(&[], &choice, &junk)).is_err());
+        let mut junk_choice = choice.clone();
+        junk_choice.extend_from_slice(&junk);
+        assert!(MlKem768DecapsKey::from_pkcs8_der(&build(&[], &junk_choice, &[])).is_err());
+        let mut der = build(&[], &choice, &[]);
+        der.extend_from_slice(&junk);
+        assert!(MlKem768DecapsKey::from_pkcs8_der(&der).is_err());
     }
 
     #[cfg(feature = "der")]

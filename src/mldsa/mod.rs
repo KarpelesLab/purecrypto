@@ -1033,7 +1033,13 @@ macro_rules! ml_dsa_level {
                 if oid.as_slice() != $oid {
                     return Err(Error::Malformed);
                 }
+                // LAMPS: the AlgorithmIdentifier parameters MUST be absent.
+                algid.finish().map_err(|_| Error::Malformed)?;
                 let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
+                // Only the RFC 5958 OPTIONAL `[0]` attributes / `[1]` publicKey
+                // may follow, and nothing may follow the PrivateKeyInfo.
+                crate::der::finish_one_asymmetric_key_tail(seq).map_err(|_| Error::Malformed)?;
+                r.finish().map_err(|_| Error::Malformed)?;
 
                 // Legacy fast-path: the historical encoding was the raw expanded
                 // key with no inner CHOICE tag. Its length is exactly `privkey`,
@@ -1044,7 +1050,7 @@ macro_rules! ml_dsa_level {
                 }
 
                 let mut cr = Reader::new(inner);
-                match cr.peek_tag() {
+                let key = match cr.peek_tag() {
                     // expandedKey ::= OCTET STRING
                     Some(0x04) => {
                         let expanded = cr.read_octet_string().map_err(|_| Error::Malformed)?;
@@ -1062,6 +1068,7 @@ macro_rules! ml_dsa_level {
                         let mut both = cr.read_sequence().map_err(|_| Error::Malformed)?;
                         let seed = both.read_octet_string().map_err(|_| Error::Malformed)?;
                         let expanded = both.read_octet_string().map_err(|_| Error::Malformed)?;
+                        both.finish().map_err(|_| Error::Malformed)?;
                         let seed: [u8; SEED_SIZE] =
                             seed.try_into().map_err(|_| Error::Malformed)?;
                         let key = Self::from_seed(&seed).0;
@@ -1078,7 +1085,10 @@ macro_rules! ml_dsa_level {
                         Ok(key)
                     }
                     _ => Err(Error::Malformed),
-                }
+                }?;
+                // The CHOICE must fill the whole `privateKey` OCTET STRING.
+                cr.finish().map_err(|_| Error::Malformed)?;
+                Ok(key)
             }
 
             /// Parses a PKCS#8 PEM private key.
@@ -1210,7 +1220,13 @@ macro_rules! ml_dsa_level {
                 if oid.as_slice() != $oid {
                     return Err(Error::Malformed);
                 }
+                // draft-ietf-lamps-dilithium-certificates §4: parameters MUST
+                // be absent, and nothing may follow the subjectPublicKey BIT
+                // STRING or the SPKI itself (mirrors `x509::pubkey`).
+                algid.finish().map_err(|_| Error::Malformed)?;
                 let bits = spki.read_bit_string().map_err(|_| Error::Malformed)?;
+                spki.finish().map_err(|_| Error::Malformed)?;
+                reader.finish().map_err(|_| Error::Malformed)?;
                 Self::from_bytes(bits)
             }
 
@@ -1447,6 +1463,77 @@ mod tests {
         // Round-trip through SPKI PEM.
         let parsed = MlDsa65PublicKey::from_spki_pem(&pk.to_spki_pem()).unwrap();
         assert_eq!(parsed, pk);
+    }
+
+    /// `from_spki_der` is as strict as `x509::pubkey` and the registry parser:
+    /// NULL AlgorithmIdentifier parameters (LAMPS: MUST be absent), junk
+    /// after the BIT STRING inside the SPKI, and junk after the SPKI are all
+    /// rejected.
+    #[cfg(feature = "der")]
+    #[test]
+    fn spki_noncanonical_rejected() {
+        use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
+        let (_sk, pk) = MlDsa44PrivateKey::from_seed(&[7u8; 32]);
+        let bits = encode_bit_string(pk.to_bytes());
+        assert_eq!(
+            MlDsa44PublicKey::from_spki_der(&pk.to_spki_der()).unwrap(),
+            pk
+        );
+
+        let null_algid = encode_sequence(&[oid_tlv(OID_44), alloc::vec![0x05, 0x00]].concat());
+        let der = encode_sequence(&[null_algid, bits.clone()].concat());
+        assert!(MlDsa44PublicKey::from_spki_der(&der).is_err());
+
+        let algid = encode_sequence(&oid_tlv(OID_44));
+        let der = encode_sequence(&[algid, bits, alloc::vec![0x05, 0x00]].concat());
+        assert!(MlDsa44PublicKey::from_spki_der(&der).is_err());
+
+        let mut der = pk.to_spki_der();
+        der.extend_from_slice(&[0x05, 0x00]);
+        assert!(MlDsa44PublicKey::from_spki_der(&der).is_err());
+    }
+
+    /// `from_pkcs8_der` rejects NULL parameters, junk inside the
+    /// `privateKey` OCTET STRING after the CHOICE, unknown trailing elements
+    /// in the `PrivateKeyInfo`, and junk after it, while still accepting the
+    /// RFC 5958 OPTIONAL `[0]` attributes / `[1]` publicKey.
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_noncanonical_rejected() {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let seed = [9u8; 32];
+        let (sk, pk) = MlDsa44PrivateKey::from_seed(&seed);
+        let mut choice = alloc::vec![0x80, 32];
+        choice.extend_from_slice(&seed);
+        let build = |params: &[u8], inner: &[u8], tail: &[u8]| {
+            let algid = encode_sequence(&[oid_tlv(TEST_OID_44), params.to_vec()].concat());
+            encode_sequence(
+                &[
+                    encode_integer(&[0]),
+                    algid,
+                    encode_octet_string(inner),
+                    tail.to_vec(),
+                ]
+                .concat(),
+            )
+        };
+        let ok = MlDsa44PrivateKey::from_pkcs8_der(&build(&[], &choice, &[])).unwrap();
+        assert_eq!(ok.0, sk.0);
+
+        // OPTIONAL [0] attributes + [1] publicKey still parse.
+        let mut pkbits = alloc::vec![0x00];
+        pkbits.extend_from_slice(pk.to_bytes());
+        let tail = [&[0xa0, 0x00][..], &crate::der::encode_tlv(0x81, &pkbits)].concat();
+        assert!(MlDsa44PrivateKey::from_pkcs8_der(&build(&[], &choice, &tail)).is_ok());
+
+        assert!(MlDsa44PrivateKey::from_pkcs8_der(&build(&[0x05, 0x00], &choice, &[])).is_err());
+        assert!(MlDsa44PrivateKey::from_pkcs8_der(&build(&[], &choice, &[0x05, 0x00])).is_err());
+        let mut junk_choice = choice.clone();
+        junk_choice.extend_from_slice(&[0x05, 0x00]);
+        assert!(MlDsa44PrivateKey::from_pkcs8_der(&build(&[], &junk_choice, &[])).is_err());
+        let mut der = build(&[], &choice, &[]);
+        der.extend_from_slice(&[0x05, 0x00]);
+        assert!(MlDsa44PrivateKey::from_pkcs8_der(&der).is_err());
     }
 
     /// The FIPS 204 *external* interface (`M' = 0 ‖ |ctx| ‖ ctx ‖ M`, and the
