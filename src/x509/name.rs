@@ -230,7 +230,7 @@ const TAG_UNIVERSAL: u8 = 0x1c;
 /// transcoding the wide string types to `String` rather than reinterpreting
 /// their raw bytes as UTF-8 (which would silently mis-render and enable
 /// display spoofing). Unrecognized / non-string tags are rejected.
-fn decode_directory_string(tag: u8, value: &[u8]) -> Result<String, Error> {
+pub(crate) fn decode_directory_string(tag: u8, value: &[u8]) -> Result<String, Error> {
     let mut s = String::new();
     for_each_directory_char(tag, value, |c| s.push(c))?;
     Ok(s)

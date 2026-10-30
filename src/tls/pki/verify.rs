@@ -1186,7 +1186,7 @@ fn enforce_constraints_on_cert(
                 .any(|n| ex.uri.iter().any(|b| uri_in_subtree(n, b)))
             || dir_names
                 .iter()
-                .any(|n| ex.directory.iter().any(|b| dn_in_subtree(n, b)))
+                .any(|n| ex.directory.iter().any(|b| dn_in_subtree(n, b, true)))
         {
             return Err(Error::BadCertificate);
         }
@@ -1228,7 +1228,7 @@ fn enforce_constraints_on_cert(
         if !pm.directory.is_empty()
             && !dir_names
                 .iter()
-                .all(|n| pm.directory.iter().any(|b| dn_in_subtree(n, b)))
+                .all(|n| pm.directory.iter().any(|b| dn_in_subtree(n, b, false)))
         {
             return Err(Error::BadCertificate);
         }
@@ -1368,31 +1368,132 @@ fn uri_in_subtree(uri: &str, base: &str) -> bool {
     uri_host(uri).is_some_and(|host| host_in_subtree(host, base))
 }
 
-/// Splits a DER `Name` TLV into its RDN encodings (each the full
-/// `SET` TLV), or `None` if the bytes are not a well-formed
-/// `SEQUENCE OF RelativeDistinguishedName`.
-fn dn_rdns(name_der: &[u8]) -> Option<Vec<&[u8]>> {
+/// One `AttributeTypeAndValue` of an RDN: the type OID body, and the value's
+/// tag and content.
+type Atv<'a> = (&'a [u8], u8, &'a [u8]);
+
+/// Splits a DER `Name` TLV into its RDNs, each as the list of its
+/// `AttributeTypeAndValue`s, or `None` if the bytes are not a well-formed
+/// `SEQUENCE OF SET OF SEQUENCE { OID, ANY }`.
+fn dn_rdns(name_der: &[u8]) -> Option<Vec<Vec<Atv<'_>>>> {
     let mut reader = crate::der::Reader::new(name_der);
     let mut seq = reader.read_sequence().ok()?;
     reader.finish().ok()?;
     let mut out = Vec::new();
     while !seq.is_empty() {
-        out.push(seq.read_element().ok()?);
+        let mut set = crate::der::Reader::new(seq.read_tlv(crate::der::tag::SET).ok()?);
+        let mut atvs = Vec::new();
+        while !set.is_empty() {
+            let mut atv = set.read_sequence().ok()?;
+            let ty = atv.read_oid().ok()?;
+            let (t, v) = atv.read_any().ok()?;
+            atv.finish().ok()?;
+            atvs.push((ty, t, v));
+        }
+        if atvs.is_empty() {
+            return None;
+        }
+        out.push(atvs);
     }
     Some(out)
 }
 
+/// RFC 4518-lite normalization of a decoded directory string for the
+/// `caseIgnoreMatch`-style comparison RFC 5280 §7.1 asks for: leading and
+/// trailing whitespace removed, internal whitespace runs collapsed to one
+/// space, and every character lower-cased (`char::to_lowercase`).
+fn normalize_dir_string(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len());
+    for word in s.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.extend(word.chars().flat_map(char::to_lowercase));
+    }
+    out
+}
+
+/// Whether two `AttributeTypeAndValue`s match: the type OIDs must be equal;
+/// the values match when byte-identical (same tag and content), or when
+/// both decode as directory strings (of any string type) that are equal
+/// after [`normalize_dir_string`]. A value that does not decode as a
+/// directory string matches exactly when `fail_closed` (see
+/// [`dn_in_subtree`]).
+fn atv_matches(name: &Atv<'_>, base: &Atv<'_>, fail_closed: bool) -> bool {
+    if name.0 != base.0 {
+        return false;
+    }
+    if name.1 == base.1 && name.2 == base.2 {
+        return true;
+    }
+    match (
+        crate::x509::decode_directory_string(name.1, name.2),
+        crate::x509::decode_directory_string(base.1, base.2),
+    ) {
+        (Ok(n), Ok(b)) => normalize_dir_string(&n) == normalize_dir_string(&b),
+        _ => fail_closed,
+    }
+}
+
+/// Upper bound on the attributes of one RDN that [`rdn_matches`] pairs up;
+/// a larger RDN is treated as undecodable.
+const MAX_RDN_ATTRS: usize = 8;
+
+/// Whether two RDNs (sets of `AttributeTypeAndValue`) match: same number of
+/// attributes and a one-to-one pairing of matching attributes, irrespective
+/// of order (an RDN is a SET).
+fn rdn_matches(name: &[Atv<'_>], base: &[Atv<'_>], fail_closed: bool) -> bool {
+    fn pair(name: &[Atv<'_>], base: &[Atv<'_>], used: &mut [bool], fail_closed: bool) -> bool {
+        let Some((first, rest)) = base.split_first() else {
+            return true;
+        };
+        for i in 0..name.len() {
+            if !used[i] && atv_matches(&name[i], first, fail_closed) {
+                used[i] = true;
+                if pair(name, rest, used, fail_closed) {
+                    return true;
+                }
+                used[i] = false;
+            }
+        }
+        false
+    }
+    if name.len() != base.len() {
+        return false;
+    }
+    // Multi-valued RDNs are rare and tiny; anything implausibly large is
+    // treated as undecodable rather than searched exhaustively.
+    if name.len() > MAX_RDN_ATTRS {
+        return fail_closed;
+    }
+    let mut used = [false; MAX_RDN_ATTRS];
+    pair(name, base, &mut used[..name.len()], fail_closed)
+}
+
 /// True if the distinguished name `name` (a DER `Name` TLV) falls within
-/// the directoryName subtree `base` (likewise): RFC 5280 §4.2.1.10 /
-/// §7.1 — the subtree's RDN sequence is a prefix of the name's, each RDN
-/// compared as the crate compares issuer and subject names, byte-for-byte
-/// (so encoding differences and a different RDN order are non-matches). An
-/// empty subtree is a prefix of every name. Undecodable bytes on either
-/// side never match.
-fn dn_in_subtree(name: &[u8], base: &[u8]) -> bool {
+/// the directoryName subtree `base` (likewise): RFC 5280 §4.2.1.10 — the
+/// subtree's RDN sequence is a prefix of the name's. RDNs are compared per
+/// RFC 5280 §7.1 / RFC 4518 (lite): attribute types exactly, values
+/// decoded from whichever string type carries them (PrintableString,
+/// UTF8String, IA5String, TeletexString as Latin-1, BMPString,
+/// UniversalString), case-folded and whitespace-normalized
+/// ([`normalize_dir_string`]), so an encoding or case difference can no
+/// longer slip a name past an `excluded` subtree. A different RDN order is
+/// a non-match. An empty subtree is a prefix of every name.
+///
+/// `fail_closed` selects how bytes that cannot be decoded are treated:
+/// `true` (excluded subtrees) counts them as a match and `false` (permitted
+/// subtrees) as a non-match, so either way a name the validator cannot
+/// read is refused rather than admitted.
+fn dn_in_subtree(name: &[u8], base: &[u8], fail_closed: bool) -> bool {
     match (dn_rdns(name), dn_rdns(base)) {
-        (Some(n), Some(b)) => b.len() <= n.len() && n.iter().zip(&b).all(|(x, y)| x == y),
-        _ => false,
+        (Some(n), Some(b)) => {
+            b.len() <= n.len()
+                && n.iter()
+                    .zip(&b)
+                    .all(|(x, y)| rdn_matches(x, y, fail_closed))
+        }
+        _ => fail_closed,
     }
 }
 
@@ -5361,22 +5462,64 @@ mod tests {
         leaf_under(nc, &corp_dn("host.example"), &[Dns("host.example".into())]).unwrap();
     }
 
-    /// RDNs are compared byte-for-byte, like issuer/subject chaining: a
-    /// PrintableString `O=Corp` in the constraint does not match the
-    /// UTF8String `O=Corp` the crate's builder emits.
+    /// RDN values are compared per RFC 5280 §7.1 / RFC 4518: the string
+    /// type, case and whitespace runs do not matter. A PrintableString
+    /// `O=Corp` constraint therefore admits the UTF8String `O=Corp` the
+    /// crate's builder emits, and an `excluded` subtree cannot be dodged by
+    /// re-encoding or re-casing the leaf's attribute.
     #[test]
-    fn nc_directory_name_rdn_comparison_is_byte_exact() {
+    fn nc_directory_name_rdn_comparison_is_normalized() {
         use crate::der::{encode_tlv, tag};
         use crate::x509::GeneralName::Dns;
+        let san = [Dns("host.example".into())];
         let printable = raw_name(&[
             (oid::COUNTRY, tag::PRINTABLE_STRING, "US"),
             (oid::ORGANIZATION, tag::PRINTABLE_STRING, "Corp"),
         ]);
         let nc = nc_ext_raw(&[encode_tlv(0xA4, &printable)], &[], true);
+        leaf_under(nc, &corp_dn("host.example"), &san).unwrap();
+        // Permitted O=Corp still refuses O=Other.
+        let nc = nc_ext_raw(&[encode_tlv(0xA4, &printable)], &[], true);
         assert!(matches!(
-            leaf_under(nc, &corp_dn("host.example"), &[Dns("host.example".into())]),
+            leaf_under(
+                nc,
+                &DistinguishedName::common_name("host.example")
+                    .with_country("US")
+                    .with_organization("Other"),
+                &san
+            ),
             Err(Error::BadCertificate)
         ));
+
+        // Excluded C=US, O=Victim in every encoding / case the leaf's
+        // UTF8String `O=Victim` used to slip past.
+        let victim = DistinguishedName::common_name("host.example")
+            .with_country("US")
+            .with_organization("Victim");
+        for (t, org) in [
+            (tag::UTF8_STRING, "Victim"),
+            (tag::PRINTABLE_STRING, "Victim"),
+            (tag::UTF8_STRING, "VICTIM"),
+            (tag::PRINTABLE_STRING, "  victim "),
+            (tag::IA5_STRING, "vIcTiM"),
+        ] {
+            let excluded = raw_name(&[
+                (oid::COUNTRY, tag::PRINTABLE_STRING, "US"),
+                (oid::ORGANIZATION, t, org),
+            ]);
+            let nc = nc_ext_raw(&[], &[encode_tlv(0xA4, &excluded)], true);
+            assert!(
+                matches!(leaf_under(nc, &victim, &san), Err(Error::BadCertificate)),
+                "excluded O={org:?} (tag {t:#x}) must catch the leaf"
+            );
+        }
+        // An unrelated organization is still outside the excluded subtree.
+        let excluded = raw_name(&[
+            (oid::COUNTRY, tag::PRINTABLE_STRING, "US"),
+            (oid::ORGANIZATION, tag::PRINTABLE_STRING, "Victims"),
+        ]);
+        let nc = nc_ext_raw(&[], &[encode_tlv(0xA4, &excluded)], true);
+        leaf_under(nc, &victim, &san).unwrap();
     }
 
     #[test]
@@ -5984,16 +6127,64 @@ mod tests {
         let o = (oid::ORGANIZATION, tag::UTF8_STRING, "Corp");
         let cn = (oid::COMMON_NAME, tag::UTF8_STRING, "x");
         let full = raw_name(&[c, o, cn]);
-        assert!(super::dn_in_subtree(&full, &raw_name(&[c, o])));
-        assert!(super::dn_in_subtree(&full, &raw_name(&[c])));
-        assert!(super::dn_in_subtree(&full, &raw_name(&[c, o, cn])));
-        assert!(super::dn_in_subtree(&full, &raw_name(&[])));
-        assert!(!super::dn_in_subtree(&full, &raw_name(&[o, c])));
-        assert!(!super::dn_in_subtree(&full, &raw_name(&[o])));
-        assert!(!super::dn_in_subtree(&raw_name(&[c]), &raw_name(&[c, o])));
-        assert!(!super::dn_in_subtree(&raw_name(&[]), &raw_name(&[c])));
-        // Not a Name on either side: no match.
-        assert!(!super::dn_in_subtree(&[0x30, 0x01], &raw_name(&[c])));
-        assert!(!super::dn_in_subtree(&full, &[0x04, 0x00]));
+        for fc in [false, true] {
+            assert!(super::dn_in_subtree(&full, &raw_name(&[c, o]), fc));
+            assert!(super::dn_in_subtree(&full, &raw_name(&[c]), fc));
+            assert!(super::dn_in_subtree(&full, &raw_name(&[c, o, cn]), fc));
+            assert!(super::dn_in_subtree(&full, &raw_name(&[]), fc));
+            assert!(!super::dn_in_subtree(&full, &raw_name(&[o, c]), fc));
+            assert!(!super::dn_in_subtree(&full, &raw_name(&[o]), fc));
+            assert!(!super::dn_in_subtree(
+                &raw_name(&[c]),
+                &raw_name(&[c, o]),
+                fc
+            ));
+            assert!(!super::dn_in_subtree(&raw_name(&[]), &raw_name(&[c]), fc));
+            // Normalized value comparison: string type, case, whitespace.
+            let o2 = (oid::ORGANIZATION, tag::PRINTABLE_STRING, " CORP ");
+            assert!(super::dn_in_subtree(&full, &raw_name(&[c, o2]), fc));
+            let o3 = (oid::ORGANIZATION, tag::UTF8_STRING, "Co rp");
+            assert!(!super::dn_in_subtree(&full, &raw_name(&[c, o3]), fc));
+            // Same value under a different attribute type: no match.
+            let ou = (oid::ORGANIZATIONAL_UNIT, tag::UTF8_STRING, "Corp");
+            assert!(!super::dn_in_subtree(&full, &raw_name(&[c, ou]), fc));
+        }
+        // Not a Name on either side: no match for permitted, match for
+        // excluded (fail closed both ways).
+        assert!(!super::dn_in_subtree(&[0x30, 0x01], &raw_name(&[c]), false));
+        assert!(!super::dn_in_subtree(&full, &[0x04, 0x00], false));
+        assert!(super::dn_in_subtree(&[0x30, 0x01], &raw_name(&[c]), true));
+        assert!(super::dn_in_subtree(&full, &[0x04, 0x00], true));
+        // A value that does not decode as a directory string (invalid
+        // UTF-8 here) under the constrained attribute type.
+        let bad = {
+            use crate::der::{encode_sequence, encode_tlv, oid_tlv};
+            let c_rdn = encode_tlv(
+                tag::SET,
+                &encode_sequence(
+                    &[
+                        oid_tlv(oid::COUNTRY),
+                        encode_tlv(tag::PRINTABLE_STRING, b"US"),
+                    ]
+                    .concat(),
+                ),
+            );
+            let o_rdn = encode_tlv(
+                tag::SET,
+                &encode_sequence(
+                    &[
+                        oid_tlv(oid::ORGANIZATION),
+                        encode_tlv(tag::UTF8_STRING, &[0xff, 0xfe]),
+                    ]
+                    .concat(),
+                ),
+            );
+            crate::der::encode_sequence(&[c_rdn, o_rdn].concat())
+        };
+        assert!(!super::dn_in_subtree(&bad, &raw_name(&[c, o]), false));
+        assert!(super::dn_in_subtree(&bad, &raw_name(&[c, o]), true));
+        // ...but only under the same attribute type.
+        let ou = (oid::ORGANIZATIONAL_UNIT, tag::UTF8_STRING, "Corp");
+        assert!(!super::dn_in_subtree(&bad, &raw_name(&[c, ou]), true));
     }
 }

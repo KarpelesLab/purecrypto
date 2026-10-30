@@ -31,6 +31,8 @@ pub use csr::CertificationRequest;
 pub use extension::{Extension, GeneralName, KeyUsageBits};
 pub use name::DistinguishedName;
 #[cfg_attr(not(feature = "tls"), allow(unused_imports))]
+pub(crate) use name::decode_directory_string;
+#[cfg_attr(not(feature = "tls"), allow(unused_imports))]
 pub(crate) use name::email_addresses_in_name;
 pub use ocsp::{
     OcspCertStatus, OcspCheckOptions, OcspRequest, OcspRequestBuilder, OcspResponse,
