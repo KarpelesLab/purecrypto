@@ -238,6 +238,9 @@ pub(crate) fn format_dn(dn: &DistinguishedName) -> String {
     if let Some(cn) = &dn.common_name {
         parts.push(format!("CN={cn}"));
     }
+    if let Some(email) = &dn.email_address {
+        parts.push(format!("emailAddress={email}"));
+    }
     parts.join(", ")
 }
 
@@ -625,6 +628,16 @@ pub(crate) fn guard_requester_chosen_cn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_dn_includes_email_address() {
+        let dn =
+            DistinguishedName::common_name("Alice Smith").with_email_address("alice@example.com");
+        assert_eq!(
+            format_dn(&dn),
+            "CN=Alice Smith, emailAddress=alice@example.com"
+        );
+    }
 
     /// The `validity_days` notAfter arithmetic (`now + days * 86_400`) must
     /// not silently wrap u64 on a user-controlled `-days` value (reached
