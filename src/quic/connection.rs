@@ -5665,10 +5665,12 @@ impl QuicConnection {
             // Negotiation packet that lists the version we actually sent (the
             // Original Version) is ignored — the genuine server would have
             // parsed that flight, so this can only be an off-path forgery or
-            // the server contradicting itself.
+            // the server contradicting itself. RFC 9000 §6.2: "A client MUST
+            // discard a Version Negotiation packet that lists the QUIC version
+            // selected by the client" — discard, not abort: aborting let an
+            // unauthenticated datagram end the connection attempt.
             if offered.contains(&self.original_version.wire()) {
-                self.closed = true;
-                return Err(Error::IllegalParameter);
+                return Ok(datagram.len());
             }
             // RFC 9368 §2.1: pick a mutually supported version (our
             // preference order) and start a NEW connection attempt with it.
@@ -5688,7 +5690,17 @@ impl QuicConnection {
             // A fresh connection attempt (RFC 9368 §2.4) uses a new random
             // DCID, in the chosen version, and remembers it reacted to VN so
             // it will validate the server's Version Information (§4).
-            let new = Self::client_inner(*cfg, &server_name, random_default_cid(), Some(chosen))?;
+            let new =
+                match Self::client_inner(*cfg, &server_name, random_default_cid(), Some(chosen)) {
+                    Ok(new) => new,
+                    Err(e) => {
+                        // The old attempt has been given up (its config was
+                        // consumed); surface the failure as the end of the
+                        // connection, never as a silently-dropped datagram.
+                        self.closed = true;
+                        return Err(e);
+                    }
+                };
             *self = new;
             return Ok(datagram.len());
         }
@@ -15403,23 +15415,23 @@ mod tests {
         assert!(c.is_closed(), "G-4: client must close on unsupported VN");
     }
 
-    /// G-4: a client that receives a VN packet listing v1 (contradictory
-    /// — the server received our v1 Initial and is now telling us to
-    /// switch back to v1) MUST treat it as a protocol violation.
+    /// RFC 9000 §6.2: a client MUST *discard* a VN packet listing the version
+    /// it selected (contradictory — the server parsed our v1 Initial). It
+    /// used to abort the attempt instead, so a forged VN (the CIDs are
+    /// visible on path) killed the connection.
     #[test]
-    fn vn_with_v1_is_protocol_violation() {
+    fn vn_listing_our_version_is_discarded() {
         use crate::quic::pkt::{QUIC_V1, build_version_negotiation};
-        let (mut c, _) = loopback_pair();
-        let _ = c.pop_datagram();
+        let (mut c, mut s) = loopback_pair();
+        let first = c.pop_datagram();
         let (dcid, scid) = vn_cids_for(&c);
         let vn = build_version_negotiation(&dcid, &scid, &[QUIC_V1, 0xDEAD_BEEF]);
-        let r = c.feed_datagram(&vn);
-        assert!(
-            matches!(r, Err(Error::IllegalParameter)),
-            "G-4: VN containing v1 must be a protocol violation; got {:?}",
-            r
-        );
-        assert!(c.is_closed());
+        assert_eq!(c.feed_datagram(&vn), Ok(()));
+        assert!(!c.is_closed() && !c.is_closing() && !c.is_draining());
+        // The genuine handshake still completes.
+        s.feed_datagram(&first).expect("server feed");
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete());
     }
 
     /// G-4: a client that has already processed a server Initial MUST
