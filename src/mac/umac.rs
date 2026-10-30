@@ -768,9 +768,12 @@ impl Umac64 {
     /// accept. The comparison time of the full-length path depends only on the
     /// (public) tag length, not on where any mismatch occurs, and the
     /// recomputed tag is wiped before returning. `nonce` follows the same
-    /// rules as in [`finalize`](Self::finalize).
+    /// rules as in [`finalize`](Self::finalize), except that an out-of-range
+    /// nonce (empty or longer than 16 bytes) makes `verify` return `false`
+    /// instead of panicking, so attacker-supplied nonces cannot abort the
+    /// verifier.
     pub fn verify(self, nonce: &[u8], expected: &[u8]) -> bool {
-        if expected.len() != 8 {
+        if expected.len() != 8 || nonce.is_empty() || nonce.len() > 16 {
             return false;
         }
         let mut tag = self.finalize(nonce);
@@ -831,9 +834,10 @@ impl Umac128 {
     ///
     /// Returns `true` iff `expected` is a full 16-byte tag equal to the
     /// recomputed tag; see [`Umac64::verify`] for why truncated tags are
-    /// rejected unconditionally and what the timing depends on.
+    /// rejected unconditionally and what the timing depends on. An empty or
+    /// over-long (> 16 bytes) nonce returns `false` rather than panicking.
     pub fn verify(self, nonce: &[u8], expected: &[u8]) -> bool {
-        if expected.len() != 16 {
+        if expected.len() != 16 || nonce.is_empty() || nonce.len() > 16 {
             return false;
         }
         let mut tag = self.finalize(nonce);
@@ -858,6 +862,27 @@ impl Umac128 {
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
+
+    /// `verify` with an empty or > 16-byte nonce used to reach `finalize`'s
+    /// `assert!` and panic; it must now reject like VMAC's `verify`.
+    #[test]
+    fn verify_bad_nonce_rejects_without_panic() {
+        let key = [0x11u8; 16];
+        for nonce in [&[][..], &[0u8; 17][..], &[0u8; 64][..]] {
+            assert!(!Umac64::new(&key).verify(nonce, &[0u8; 8]));
+            assert!(!Umac128::new(&key).verify(nonce, &[0u8; 16]));
+        }
+        // Valid nonces still verify.
+        let n = [1u8; 8];
+        let t64 = Umac64::compute(&key, b"abc", &n);
+        let t128 = Umac128::compute(&key, b"abc", &n);
+        let mut m = Umac64::new(&key);
+        m.update(b"abc");
+        assert!(m.verify(&n, &t64));
+        let mut m = Umac128::new(&key);
+        m.update(b"abc");
+        assert!(m.verify(&n, &t128));
+    }
     extern crate alloc;
 
     fn from_hex<const N: usize>(s: &str) -> [u8; N] {
