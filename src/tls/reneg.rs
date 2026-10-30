@@ -218,6 +218,15 @@ impl RenegotiationLimiter {
     }
 }
 
+/// Upper bound on the application data a TLS 1.2 engine queues while a
+/// renegotiation is in flight (1 MiB). The queue cannot drain until the
+/// peer completes the new handshake, so without a cap a peer that starts a
+/// renegotiation and then stalls makes every `send_application_data` call
+/// grow memory without limit. Past the cap the call fails with
+/// [`Error::RenegotiationBufferFull`](crate::tls::Error::RenegotiationBufferFull)
+/// and queues nothing.
+pub(crate) const MAX_RENEG_PENDING_APP_OUT: usize = 1 << 20;
+
 /// Per-connection renegotiation bookkeeping shared by the TLS 1.2 client and
 /// server engines.
 #[derive(Default)]
@@ -256,6 +265,18 @@ pub(crate) struct RenegState {
 }
 
 impl RenegState {
+    /// Queues `data` to send once the in-flight renegotiation completes,
+    /// all or nothing: refuses with
+    /// [`Error::RenegotiationBufferFull`](crate::tls::Error::RenegotiationBufferFull)
+    /// when it would take the queue past [`MAX_RENEG_PENDING_APP_OUT`].
+    pub(crate) fn queue_app_out(&mut self, data: &[u8]) -> Result<(), crate::tls::Error> {
+        if data.len() > MAX_RENEG_PENDING_APP_OUT - self.pending_app_out.len() {
+            return Err(crate::tls::Error::RenegotiationBufferFull);
+        }
+        self.pending_app_out.extend_from_slice(data);
+        Ok(())
+    }
+
     /// The `renegotiated_connection` a server's renegotiating `ServerHello`
     /// carries: `client_verify_data || server_verify_data` (RFC 5746 §3.5).
     /// A client's renegotiating `ClientHello` carries `client_verify_data`

@@ -398,3 +398,60 @@ fn sessions_without_ems_do_not_renegotiate() {
     assert!(!client.is_renegotiating());
     assert_eq!(client.renegotiation_count(), 0);
 }
+
+/// A peer that starts a renegotiation and then stalls cannot make the other
+/// side buffer without limit: past 1 MiB, `send_application_data` refuses
+/// (queueing nothing) with `RenegotiationBufferFull`, and once the
+/// renegotiation completes the queued data is delivered and sending works
+/// again.
+#[test]
+fn stalled_renegotiation_bounds_the_send_queue() {
+    use crate::tls::reneg::MAX_RENEG_PENDING_APP_OUT;
+    let (mut client, mut server) = connected_pair();
+    // The client asks for a renegotiation; the server enters it and sends
+    // its flight, which the client then sits on.
+    client.renegotiate().unwrap();
+    let ch = client.write_tls();
+    server.read_tls(&ch);
+    server.process_new_packets().unwrap();
+    assert!(server.is_renegotiating());
+
+    let chunk = alloc::vec![0x5a; 64 * 1024];
+    let mut queued = 0usize;
+    loop {
+        match server.send_application_data(&chunk) {
+            Ok(()) => queued += chunk.len(),
+            Err(e) => {
+                assert_eq!(e, Error::RenegotiationBufferFull);
+                break;
+            }
+        }
+        assert!(
+            queued <= MAX_RENEG_PENDING_APP_OUT,
+            "queue grew past the cap"
+        );
+    }
+    assert_eq!(queued, MAX_RENEG_PENDING_APP_OUT);
+    assert_eq!(
+        server.send_application_data(b"x"),
+        Err(Error::RenegotiationBufferFull)
+    );
+    // The client side is bounded the same way.
+    let mut cqueued = 0usize;
+    while client.send_application_data(&chunk).is_ok() {
+        cqueued += chunk.len();
+        assert!(cqueued <= MAX_RENEG_PENDING_APP_OUT);
+    }
+    assert_eq!(cqueued, MAX_RENEG_PENDING_APP_OUT);
+
+    // The client resumes: the renegotiation completes and both queues flush.
+    let (c, s) = pump(&mut client, &mut server);
+    c.unwrap();
+    s.unwrap();
+    assert!(!client.is_renegotiating() && !server.is_renegotiating());
+    assert_eq!(client.take_received_plaintext().len(), queued);
+    assert_eq!(server.take_received_plaintext().len(), cqueued);
+    server.send_application_data(&chunk).unwrap();
+    pump_ok(&mut client, &mut server);
+    assert_eq!(client.take_received_plaintext().len(), chunk.len());
+}

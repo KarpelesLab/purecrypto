@@ -1580,14 +1580,17 @@ impl ClientConnection12 {
     /// reported as `InappropriateState`).
     ///
     /// While a renegotiation is in flight the data is queued and sent under
-    /// the new keys once it completes.
+    /// the new keys once it completes. That queue is bounded (1 MiB): a
+    /// call that would overflow it queues nothing and fails with
+    /// [`Error::RenegotiationBufferFull`], a transient condition — keep
+    /// feeding the peer's records in until [`Self::is_renegotiating`]
+    /// turns `false`, then retry.
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.sent_close_notify {
             return Err(Error::InappropriateState);
         }
         if self.reneg.active && self.state != State::Closed {
-            self.reneg.pending_app_out.extend_from_slice(data);
-            return Ok(());
+            return self.reneg.queue_app_out(data);
         }
         if self.state != State::Connected {
             return Err(Error::InappropriateState);

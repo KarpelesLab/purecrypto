@@ -365,6 +365,14 @@ pub enum Error {
     /// [`RenegotiationPolicy::allow_peer_certificate_change`](crate::tls::RenegotiationPolicy::allow_peer_certificate_change)
     /// is off. Maps to `handshake_failure`.
     PeerCertificateChanged,
+    /// `send_application_data` was called on a TLS 1.2 connection while a
+    /// renegotiation is in flight and the data queued for after it would
+    /// exceed the 1 MiB bound. Nothing was queued and the connection is
+    /// unaffected: this is backpressure, not a failure. Keep processing
+    /// the peer's records until the renegotiation completes, then retry.
+    /// A peer that starts a renegotiation and never finishes it can no
+    /// longer make the sender buffer without limit.
+    RenegotiationBufferFull,
 }
 
 impl core::fmt::Display for Error {
@@ -438,6 +446,9 @@ impl core::fmt::Display for Error {
             Error::PeerCertificateChanged => {
                 f.write_str("peer certificate changed during TLS renegotiation")
             }
+            Error::RenegotiationBufferFull => f.write_str(
+                "send queue full while a TLS renegotiation is in flight (retry once it completes)",
+            ),
         }
     }
 }
