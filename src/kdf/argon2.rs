@@ -41,7 +41,6 @@
 //! (plus one cache line, for alignment) for the memory matrix.
 
 extern crate alloc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::hash::Blake2bMac;
@@ -100,19 +99,58 @@ impl Argon2Params {
     }
 }
 
-/// Argon2 parameter-validation errors.
+/// Argon2 errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// One of the cost parameters is outside RFC 9106's permitted range, or
     /// the output buffer is too small / large.
     InvalidParam,
+    /// The parameters are valid but the memory matrix (about
+    /// `m_cost_kib · 1024` bytes) could not be allocated. Nothing was
+    /// computed.
+    OutOfMemory,
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("argon2: invalid parameter")
+        match self {
+            Error::InvalidParam => f.write_str("argon2: invalid parameter"),
+            Error::OutOfMemory => f.write_str("argon2: cannot allocate the memory matrix"),
+        }
     }
+}
+
+/// Allocates `len` zero bytes without aborting on failure.
+///
+/// Equivalent to `vec![0u8; len]` — in particular it goes through
+/// `alloc_zeroed`, so a large matrix comes back as untouched demand-zero
+/// pages (which the huge-page advice below relies on) — except that an
+/// allocation failure returns [`Error::OutOfMemory`] instead of aborting the
+/// process. (The stable fallible `Vec` APIs only reserve capacity; zero-filling
+/// that would touch every page up front.) In unit tests a per-thread ceiling
+/// can make it fail deterministically (see `tests::fail_allocs_above`).
+#[allow(unsafe_code)] // alloc_zeroed + Vec::from_raw_parts
+fn try_zeroed_vec(len: usize) -> Result<Vec<u8>, Error> {
+    #[cfg(all(test, feature = "std"))]
+    if len > tests::ALLOC_CEILING.with(|c| c.get()) {
+        return Err(Error::OutOfMemory);
+    }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    // Fails for `len > isize::MAX`, which the allocator could never satisfy.
+    let layout = core::alloc::Layout::array::<u8>(len).map_err(|_| Error::OutOfMemory)?;
+    // SAFETY: `layout` has non-zero size (len > 0).
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return Err(Error::OutOfMemory);
+    }
+    // SAFETY: `ptr` was allocated by the global allocator with the layout of
+    // `[u8; len]` (alignment 1, size `len`), which is exactly the layout a
+    // `Vec<u8>` of capacity `len` deallocates with; all `len` bytes are
+    // initialized (zeroed); length == capacity.
+    Ok(unsafe { Vec::from_raw_parts(ptr, len, len) })
 }
 
 impl core::error::Error for Error {}
@@ -135,6 +173,16 @@ impl core::error::Error for Error {}
 /// parsed PHC `$argon2...$` string — MUST clamp them to sane maxima before
 /// calling. (Compare PBES2, which caps the attacker-controlled PBKDF2
 /// iteration count it accepts from a key file.)
+///
+/// # Errors
+///
+/// [`Error::InvalidParam`] for parameters outside the bounds above (or whose
+/// matrix size overflows `usize`), [`Error::OutOfMemory`] if the memory
+/// matrix cannot be allocated — the process is not aborted. Either way `out`
+/// is left untouched. (On systems that overcommit memory an allocation can
+/// succeed and the process still be killed later when the pages are touched;
+/// that is outside what a library can detect, so bound `m_cost_kib` for
+/// untrusted input.)
 pub fn argon2(
     params: &Argon2Params,
     password: &[u8],
@@ -238,6 +286,22 @@ fn argon2_impl(
     let seg_len = q / 4;
     let seg_bytes = seg_len * BLOCK;
 
+    // --- Allocate the memory matrix: m' 1024-byte blocks ---
+    // Guard the matrix size: on 32-bit targets m' · 1024 can wrap usize for
+    // per-RFC "valid" params, which would under-allocate and lead to OOB
+    // panics. Match the checked_mul discipline of the sibling scrypt code.
+    //
+    // One spare cache line lets the matrix start 64-byte aligned (a large
+    // allocation typically comes back 16 bytes past a page boundary, which
+    // would split every other 32-byte SIMD access across two cache lines).
+    //
+    // Valid parameters can ask for up to ~4 TiB, so an allocation failure is
+    // an ordinary, caller-reachable outcome: report it rather than abort the
+    // process (which `vec![0; n]` does). This happens before H0 is computed,
+    // so the error path has no password-derived state to wipe.
+    let mem_len = m_prime.checked_mul(BLOCK).ok_or(Error::InvalidParam)?;
+    let mut mem = try_zeroed_vec(mem_len.checked_add(64).ok_or(Error::InvalidParam)?)?;
+
     // --- H0 = BLAKE2b(p ‖ T ‖ m ‖ t ‖ v ‖ y ‖ |P| ‖ P ‖ |S| ‖ S ‖ |K| ‖ K ‖ |X| ‖ X) ---
     let mut h0 = [0u8; 64];
     {
@@ -260,16 +324,6 @@ fn argon2_impl(
         mac.finalize_into(&mut h0);
     }
 
-    // --- Allocate the memory matrix: m' 1024-byte blocks ---
-    // Guard the matrix size: on 32-bit targets m' · 1024 can wrap usize for
-    // per-RFC "valid" params, which would under-allocate and lead to OOB
-    // panics. Match the checked_mul discipline of the sibling scrypt code.
-    //
-    // One spare cache line lets the matrix start 64-byte aligned (a large
-    // allocation typically comes back 16 bytes past a page boundary, which
-    // would split every other 32-byte SIMD access across two cache lines).
-    let mem_len = m_prime.checked_mul(BLOCK).ok_or(Error::InvalidParam)?;
-    let mut mem: Vec<u8> = vec![0u8; mem_len.checked_add(64).ok_or(Error::InvalidParam)?];
     let align = match mem.as_ptr().align_offset(64) {
         a if a < 64 => a,
         _ => 0,
@@ -1349,6 +1403,85 @@ mod simd {
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
+    use alloc::vec;
+
+    #[cfg(feature = "std")]
+    std::thread_local! {
+        /// Per-thread allocation ceiling consulted by `try_zeroed_vec`, so a
+        /// test can make the matrix allocation fail without the machine
+        /// actually running out of memory (with overcommit, a multi-TiB
+        /// `alloc_zeroed` can genuinely succeed).
+        pub(super) static ALLOC_CEILING: core::cell::Cell<usize> =
+            const { core::cell::Cell::new(usize::MAX) };
+    }
+
+    /// Runs `f` with every `try_zeroed_vec` allocation above `limit` bytes
+    /// failing as the allocator would.
+    #[cfg(feature = "std")]
+    fn fail_allocs_above<T>(limit: usize, f: impl FnOnce() -> T) -> T {
+        ALLOC_CEILING.with(|c| c.set(limit));
+        let out = f();
+        ALLOC_CEILING.with(|c| c.set(usize::MAX));
+        out
+    }
+
+    /// Valid but absurd memory costs (`m = 2³² − 1` KiB ≈ 4 TiB on 64-bit
+    /// targets) must come back as `OutOfMemory` rather than abort the process, and leave `out`
+    /// alone; a cost that fits still works.
+    #[cfg(feature = "std")]
+    #[test]
+    fn impossible_memory_returns_error() {
+        // On 32-bit targets 4 TiB overflows `usize` (InvalidParam, covered by
+        // the 32-bit test below); 1 GiB still exceeds the ceiling there.
+        #[cfg(target_pointer_width = "64")]
+        let absurd = u32::MAX;
+        #[cfg(not(target_pointer_width = "64"))]
+        let absurd = 1 << 20;
+        let mut params = Argon2Params {
+            t_cost: 1,
+            m_cost_kib: absurd,
+            parallelism: 1,
+            variant: Argon2Type::Argon2id,
+            version: 0x13,
+        };
+        let mut out = [0xaau8; 32];
+        assert_eq!(
+            fail_allocs_above(1 << 30, || argon2(
+                &params,
+                b"password",
+                b"saltsalt",
+                &[],
+                &[],
+                &mut out
+            )),
+            Err(Error::OutOfMemory)
+        );
+        assert_eq!(out, [0xaau8; 32]);
+        // 8 KiB matrix (+ 64 alignment bytes): one byte short fails, exact fits.
+        params.m_cost_kib = 8;
+        let run = |limit, out: &mut [u8; 32]| {
+            fail_allocs_above(limit, || {
+                argon2(&params, b"password", b"saltsalt", &[], &[], out)
+            })
+        };
+        assert_eq!(run(8 * 1024 + 63, &mut out), Err(Error::OutOfMemory));
+        assert_eq!(out, [0xaau8; 32]);
+        assert_eq!(run(8 * 1024 + 64, &mut out), Ok(()));
+    }
+
+    /// On 32-bit targets an oversized matrix is refused by the size checks or
+    /// the real allocator, never by aborting.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn oversized_matrix_is_an_error_on_32_bit() {
+        let params = Argon2Params {
+            m_cost_kib: 3 << 20, // 3 GiB
+            parallelism: 1,
+            ..Argon2Params::recommended()
+        };
+        let mut out = [0u8; 32];
+        assert!(argon2(&params, b"password", b"saltsalt", &[], &[], &mut out).is_err());
+    }
 
     /// Common RFC 9106 §5 test-vector parameters.
     fn rfc_inputs() -> (Argon2Params, [u8; 32], [u8; 16], [u8; 8], [u8; 12]) {
