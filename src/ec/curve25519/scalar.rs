@@ -10,6 +10,7 @@ use crate::bignum::Uint;
 #[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
 use crate::bignum::safegcd::SafegcdModulus;
 use crate::ct::{Choice, ConditionallySelectable};
+use crate::zeroize::Zeroize;
 
 use super::field::ScalarInt;
 
@@ -47,20 +48,35 @@ fn sub_l_if_ge(r: &Uint<5>) -> Uint<5> {
 /// two masked conditional subtractions. HAC 14.42 bounds the remainder
 /// estimate by `r < 3L`, so two always suffice. There is no data-dependent
 /// branch or early exit.
+///
+/// The input is often secret (a nonce hash, or `r + k·a` with a secret `a`),
+/// so every intermediate — the quotient estimate, the partial remainders
+/// and the dropped product halves — is wiped before returning.
 fn reduce512(x: &Uint<8>) -> ScalarInt {
     let x = x.as_limbs();
     // q1 = ⌊x / b^(k−1)⌋ = x >> 192, five limbs.
-    let q1 = Uint::<5>::from_limbs([x[3], x[4], x[5], x[6], x[7]]);
+    let mut q1 = Uint::<5>::from_limbs([x[3], x[4], x[5], x[6], x[7]]);
     // q3 = ⌊q1·μ / b^(k+1)⌋: the high half of the ten-limb product.
-    let (_, q3) = q1.mul_wide(&MU);
+    let (mut q2, mut q3) = q1.mul_wide(&MU);
     // r = (x − q3·L) mod b^(k+1); the true value is in [0, 3L).
-    let r1 = Uint::<5>::from_limbs([x[0], x[1], x[2], x[3], x[4]]);
-    let (r2, _) = q3.mul_wide(&L5);
-    let r = r1.wrapping_sub(&r2);
-    let r = sub_l_if_ge(&sub_l_if_ge(&r));
-    let r = r.as_limbs();
+    let mut r1 = Uint::<5>::from_limbs([x[0], x[1], x[2], x[3], x[4]]);
+    let (mut r2, mut r2_hi) = q3.mul_wide(&L5);
+    let mut r3 = r1.wrapping_sub(&r2);
+    let mut r4 = sub_l_if_ge(&r3);
+    let mut r = sub_l_if_ge(&r4);
+    let l = r.as_limbs();
     // r < L < 2²⁵³, so the top limb is zero.
-    Uint::from_limbs([r[0], r[1], r[2], r[3]])
+    let out = Uint::from_limbs([l[0], l[1], l[2], l[3]]);
+    q1.zeroize();
+    q2.zeroize();
+    q3.zeroize();
+    r1.zeroize();
+    r2.zeroize();
+    r2_hi.zeroize();
+    r3.zeroize();
+    r4.zeroize();
+    r.zeroize();
+    out
 }
 
 /// Joins low/high 256-bit halves into a 512-bit integer.
@@ -82,11 +98,24 @@ pub(crate) fn scalar_reduce_wide(bytes: &[u8; 64]) -> ScalarInt {
 }
 
 /// Computes `(r + k·a) mod L`.
+///
+/// In Ed25519 signing `k` is the public challenge while `r` (the nonce) and
+/// `a` (the secret scalar) are secret, so `k·a` and the 512-bit sum reveal
+/// `a`: they are wiped before returning (as is everything inside
+/// [`reduce512`]).
 pub(crate) fn scalar_muladd(r: &ScalarInt, k: &ScalarInt, a: &ScalarInt) -> ScalarInt {
     // k, a < 2²⁵⁶ and r < 2²⁵⁶, so k·a + r < 2⁵¹²: the carry out is zero.
-    let (lo, hi) = k.mul_wide(a);
-    let (sum, _) = join(&lo, &hi).adc(&widen(r), 0);
-    reduce512(&sum)
+    let (mut lo, mut hi) = k.mul_wide(a);
+    let mut prod = join(&lo, &hi);
+    let mut wide_r = widen(r);
+    let (mut sum, _) = prod.adc(&wide_r, 0);
+    let out = reduce512(&sum);
+    lo.zeroize();
+    hi.zeroize();
+    prod.zeroize();
+    wide_r.zeroize();
+    sum.zeroize();
+    out
 }
 
 /// Computes `(a · b) mod L` for `a, b < L`.

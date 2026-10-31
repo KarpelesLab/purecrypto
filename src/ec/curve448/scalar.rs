@@ -9,6 +9,7 @@
 
 use crate::bignum::Uint;
 use crate::ct::{Choice, ConditionallySelectable};
+use crate::zeroize::Zeroize;
 
 use super::field::ScalarInt;
 
@@ -58,20 +59,35 @@ fn sub_l_if_ge(r: &Uint<9>) -> Uint<9> {
 ///
 /// Constant time: a fixed sequence of limb multiplies and adds, then exactly
 /// two masked conditional subtractions, with no data-dependent branch.
+///
+/// The input is often secret (a nonce hash, or `r + k·s` with a secret `s`),
+/// so every intermediate — the quotient estimate, the partial remainders
+/// and the dropped product halves — is wiped before returning.
 fn reduce960(x: &Uint<15>) -> ScalarInt {
     let x = x.as_limbs();
     // x₁ = x >> 384, nine limbs.
-    let q1 = Uint::<9>::from_limbs([x[6], x[7], x[8], x[9], x[10], x[11], x[12], x[13], x[14]]);
+    let mut q1 = Uint::<9>::from_limbs([x[6], x[7], x[8], x[9], x[10], x[11], x[12], x[13], x[14]]);
     // q = ⌊x₁·μ / 2⁵⁷⁶⌋: the high half of the eighteen-limb product.
-    let (_, q) = q1.mul_wide(&MU);
+    let (mut q_lo, mut q) = q1.mul_wide(&MU);
     // r = (x − q·L) mod 2⁵⁷⁶; the true value is in [0, 3L).
-    let r1 = Uint::<9>::from_limbs([x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8]]);
-    let (r2, _) = q.mul_wide(&L9);
-    let r = r1.wrapping_sub(&r2);
-    let r = sub_l_if_ge(&sub_l_if_ge(&r));
-    let r = r.as_limbs();
+    let mut r1 = Uint::<9>::from_limbs([x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8]]);
+    let (mut r2, mut r2_hi) = q.mul_wide(&L9);
+    let mut r3 = r1.wrapping_sub(&r2);
+    let mut r4 = sub_l_if_ge(&r3);
+    let mut r = sub_l_if_ge(&r4);
+    let l = r.as_limbs();
     // r < L < 2⁴⁴⁶, so the top two limbs are zero.
-    Uint::from_limbs([r[0], r[1], r[2], r[3], r[4], r[5], r[6]])
+    let out = Uint::from_limbs([l[0], l[1], l[2], l[3], l[4], l[5], l[6]]);
+    q1.zeroize();
+    q_lo.zeroize();
+    q.zeroize();
+    r1.zeroize();
+    r2.zeroize();
+    r2_hi.zeroize();
+    r3.zeroize();
+    r4.zeroize();
+    r.zeroize();
+    out
 }
 
 /// Zero-extends a seven-limb integer to fifteen limbs.
@@ -89,19 +105,35 @@ pub(crate) fn scalar_reduce_wide(bytes: &[u8; 114]) -> ScalarInt {
     reduce960(&Uint::<15>::from_le_bytes(bytes))
 }
 
-/// Computes `(r + k·a) mod L` for `r, k, a < L`.
+/// Computes `(r + k·a) mod L` for any seven-limb `r, k, a < 2⁴⁴⁸`.
+///
+/// The operands need not be reduced: Ed448 signing passes the nonce
+/// `r < L` and the challenge `k < L`, but `a` is the pruned secret scalar
+/// `s ∈ [2⁴⁴⁷, 2⁴⁴⁸)`, which exceeds `L ≈ 2⁴⁴⁶`. The bound still holds with
+/// room to spare: `k·a + r < 2⁸⁹⁶ + 2⁴⁴⁸ < 2⁹⁶⁰`, the width [`reduce960`]
+/// reduces exactly (and in practice `k·a < 2⁴⁴⁶·2⁴⁴⁸ = 2⁸⁹⁴`).
+///
+/// `k` is public while `r` and `a` are secret, so `k·a` and the wide sum
+/// reveal `a`: they are wiped before returning (as is everything inside
+/// [`reduce960`]).
 pub(crate) fn scalar_muladd(r: &ScalarInt, k: &ScalarInt, a: &ScalarInt) -> ScalarInt {
     // k·a is the full 14-limb product; widen both operands to 15 limbs so the
     // sum with r cannot carry out of the representation.
-    let (lo, hi) = k.mul_wide(a); // each seven limbs
-    let lo = lo.as_limbs();
-    let hi = hi.as_limbs();
-    let prod = Uint::<15>::from_limbs([
-        lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], hi[0], hi[1], hi[2], hi[3], hi[4], hi[5],
-        hi[6], 0,
+    let (mut lo, mut hi) = k.mul_wide(a); // each seven limbs
+    let l = lo.as_limbs();
+    let h = hi.as_limbs();
+    let mut prod = Uint::<15>::from_limbs([
+        l[0], l[1], l[2], l[3], l[4], l[5], l[6], h[0], h[1], h[2], h[3], h[4], h[5], h[6], 0,
     ]);
-    let (sum, _) = prod.adc(&widen(r), 0);
-    reduce960(&sum)
+    let mut wide_r = widen(r);
+    let (mut sum, _) = prod.adc(&wide_r, 0);
+    let out = reduce960(&sum);
+    lo.zeroize();
+    hi.zeroize();
+    prod.zeroize();
+    wide_r.zeroize();
+    sum.zeroize();
+    out
 }
 
 /// Prunes the lower 57 bytes of the seed hash into the secret scalar
@@ -210,6 +242,40 @@ mod tests {
             }
             let x = Uint::<15>::from_limbs(w);
             assert_eq!(reduce960(&x), reduce960_ref(&x), "input {x:?}");
+        }
+    }
+
+    /// `scalar_muladd` is exact for unreduced operands up to `2⁴⁴⁸ − 1`,
+    /// the documented contract: Ed448 passes the pruned secret scalar
+    /// `s ∈ [2⁴⁴⁷, 2⁴⁴⁸)`, which exceeds `L`.
+    #[test]
+    fn scalar_muladd_accepts_unreduced_operands() {
+        let l = L9.as_limbs();
+        let lm1 = ScalarInt::from_limbs([l[0] - 1, l[1], l[2], l[3], l[4], l[5], l[6]]);
+        let max = ScalarInt::from_limbs([u64::MAX; 7]);
+        let mut pruned = [0x5au8; 57];
+        prune(&mut pruned);
+        let mut p56 = [0u8; 56];
+        p56.copy_from_slice(&pruned[..56]);
+        let s = ScalarInt::from_le_bytes(&p56);
+        let reference = |r: &ScalarInt, k: &ScalarInt, a: &ScalarInt| {
+            let (lo, hi) = k.mul_wide(a);
+            let (lo, hi) = (lo.as_limbs(), hi.as_limbs());
+            let prod = Uint::<15>::from_limbs([
+                lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], hi[0], hi[1], hi[2], hi[3], hi[4],
+                hi[5], hi[6], 0,
+            ]);
+            let (sum, carry) = prod.adc(&widen(r), 0);
+            assert_eq!(carry, 0);
+            reduce960_ref(&sum)
+        };
+        for (r, k, a) in [
+            (lm1, lm1, s),
+            (lm1, lm1, max),
+            (max, max, max),
+            (ScalarInt::ZERO, ScalarInt::ONE, s),
+        ] {
+            assert_eq!(scalar_muladd(&r, &k, &a), reference(&r, &k, &a));
         }
     }
 }
