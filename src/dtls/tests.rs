@@ -2705,6 +2705,71 @@ mod dtls13 {
         assert!(!server.is_handshake_complete());
     }
 
+    /// Regression (audit 2026-10-31): with cookies off, a group-change HRR
+    /// followed by a CH2 whose PSK binder is wrong must be rejected without
+    /// committing any state. The binder used to be checked only after the
+    /// suite / transcript / message_seq were committed — the transcript had
+    /// already been rewritten to `message_hash(CH1) ‖ HRR` — so the genuine
+    /// CH2 then ran `replace_with_message_hash` a second time and the
+    /// handshake could never complete.
+    #[test]
+    fn bad_binder_after_group_hrr_commits_no_state() {
+        use crate::tls::codec::NamedGroup;
+        let (server_cfg, cert) = make_ticket_server13(false, 0);
+        let session = first_handshake_for_session(server_cfg, &cert, b"dtls13-badbinder-c1");
+
+        let (mut server_cfg, _) = make_server13();
+        server_cfg = server_cfg
+            .with_no_cookie()
+            .with_ticket_key([0x5a; 32])
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.groups = alloc::vec![
+            NamedGroup::X25519MLKEM768,
+            NamedGroup::X25519,
+            NamedGroup::SECP256R1,
+        ];
+        client_cfg.key_share_groups = Some(alloc::vec![NamedGroup::SECP256R1]);
+        client_cfg.session = Some(session);
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-badbinder-c2", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-badbinder-s2", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        // CH1 -> group-change HRR -> CH2.
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        for dg in server.pop_outbound_datagrams() {
+            client.feed_datagram(&dg).unwrap();
+        }
+        assert!(client.hello_retry_request_seen());
+        let ch2 = client.pop_outbound_datagrams();
+        assert!(!ch2.is_empty());
+        // Flip the last byte of the hello: the tail of the last binder.
+        let mut tampered = ch2.clone();
+        let last = tampered.last_mut().unwrap();
+        *last.last_mut().unwrap() ^= 0x01;
+        // Rejected — silently, as all epoch-0 input (RFC 9147 §4.5.2).
+        for dg in &tampered {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(
+            server.pop_outbound_datagrams().is_empty(),
+            "a wrong binder must not be answered"
+        );
+        // The genuine CH2 still completes the (resumed) handshake.
+        for dg in &ch2 {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert!(client.psk_accepted() && server.psk_used());
+    }
+
     /// HRR-driven group upgrade (RFC 8446 §4.1.4): client offers all three
     /// groups in `supported_groups` but only sends a `key_share` for
     /// P-256. The server prefers X25519MLKEM768 and issues an HRR

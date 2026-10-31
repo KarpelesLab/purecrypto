@@ -2351,35 +2351,51 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let mut sr: Random = [0u8; 32];
         self.rng.fill_bytes(&mut sr);
 
+        // Resolve the transcript plan into the transcript preceding this
+        // ClientHello, without touching `self` yet.
+        let plan_was_fresh = matches!(plan, TranscriptPlan::Fresh);
+        let new_transcript = match plan {
+            TranscriptPlan::Replace(t) => t,
+            TranscriptPlan::ReplayGroupHrr => {
+                // `replace_with_message_hash()` is not idempotent: rebuild
+                // into a fresh transcript so a rejected hello leaves
+                // `self.transcript` (CH1 only) intact for a retry.
+                let mut t = Transcript::new();
+                t.set_alg(suite.hash);
+                t.update(self.transcript.buffered_bytes());
+                t.replace_with_message_hash();
+                t.update(&Self::build_hrr_bytes_explicit(
+                    suite.suite,
+                    None,
+                    hrr_group,
+                ));
+                t
+            }
+            TranscriptPlan::Fresh => {
+                let mut t = Transcript::new();
+                t.set_alg(suite.hash);
+                t
+            }
+        };
+
+        // PSK resumption (RFC 8446 §4.2.11): the binder is verified over the
+        // transcript preceding this ClientHello — empty on a first hello,
+        // `message_hash(CH1) ‖ HelloRetryRequest` after any HRR (§4.2.11.2),
+        // which `new_transcript` holds. A binder mismatch is fatal, and is
+        // checked before any state is committed: a wrong binder must not
+        // leave a half-applied suite / transcript / message_seq behind.
+        let psk_state = self.accept_ticket_psk(&ch, &raw_ch, new_transcript.buffered_bytes())?;
+
         // ---- Commit phase ----------------------------------------------
         // Nothing below can reject the CH any more; apply the negotiated
         // state in one go.
         self.suite = Some(suite);
         self.hrr_selected_group = hrr_group;
         self.negotiated_group = Some(selected_group);
-        let plan_was_fresh = matches!(plan, TranscriptPlan::Fresh);
         self.hrr_sent = !plan_was_fresh;
         self.out_msg_seq = next_out_msg_seq;
-        match plan {
-            TranscriptPlan::Replace(t) => self.transcript = t,
-            TranscriptPlan::ReplayGroupHrr => {
-                self.transcript.replace_with_message_hash();
-                let hrr_bytes = self.build_hrr_bytes(None, hrr_group);
-                self.transcript.update(&hrr_bytes);
-            }
-            TranscriptPlan::Fresh => {
-                self.transcript = Transcript::new();
-                self.transcript.set_alg(suite.hash);
-            }
-        }
+        self.transcript = new_transcript;
         self.client_random = Some(ch.random);
-
-        // PSK resumption (RFC 8446 §4.2.11): the binder is verified over the
-        // transcript preceding this ClientHello — empty on a first hello,
-        // `message_hash(CH1) ‖ HelloRetryRequest` after any HRR (§4.2.11.2),
-        // which the transcript now holds. A binder mismatch is fatal.
-        let binder_prefix = self.transcript.buffered_bytes().to_vec();
-        let psk_state = self.accept_ticket_psk(&ch, &raw_ch, &binder_prefix)?;
         self.psk_used = psk_state.is_some();
 
         // 0-RTT: accept only when a PSK was taken, the client offered early
