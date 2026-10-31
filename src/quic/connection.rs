@@ -13151,6 +13151,48 @@ mod tests {
         assert_eq!(pending, alloc::vec![0u64], "RETIRE_CID queued for seq 0");
     }
 
+    /// RFC 9000 §5.1.2 — a NEW_CONNECTION_ID whose own CID is the only one at
+    /// or above its Retire Prior To must still move us off the retired DCID
+    /// and queue its RETIRE_CONNECTION_ID. `retire_prior_to` is applied
+    /// before the frame's CID is added, so the active CID used to be kept
+    /// (no replacement yet) and then never revisited.
+    #[test]
+    fn new_connection_id_retiring_active_with_its_own_cid_rotates() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let before = c.endpoint.cids.peer;
+        let high = {
+            let pool = c.cid_remote.as_ref().expect("pool");
+            *pool.entries.keys().max().expect("non-empty")
+        };
+        let seq = high + 1;
+        let new_cid = [0xD7u8; 8];
+        let mut payload = Vec::new();
+        Frame::NewConnectionId {
+            seq,
+            retire_prior_to: seq,
+            cid: &new_cid,
+            reset_token: [0x77; 16],
+        }
+        .encode(&mut payload);
+        c.dispatch_frames(Level::OneRtt, 1_000, &payload)
+            .expect("NEW_CONNECTION_ID");
+        assert_ne!(c.endpoint.cids.peer, before, "the retired DCID is left");
+        assert_eq!(c.endpoint.cids.peer.as_slice(), &new_cid);
+        let pool = c.cid_remote.as_mut().expect("pool");
+        assert_eq!(pool.active_seq, seq);
+        assert_eq!(pool.entries.len(), 1, "everything below rpt is retired");
+        let mut pending = Vec::new();
+        while let Some(s) = pool.pop_pending_retire() {
+            pending.push(s);
+        }
+        pending.sort();
+        assert_eq!(pending, (0..seq).collect::<Vec<u64>>());
+    }
+
     /// RFC 9000 §5.1.2 — `switch_connection_id` moves the outbound DCID to
     /// a spare the peer issued and retires the old one with a
     /// RETIRE_CONNECTION_ID the peer acts on; traffic keeps flowing on the

@@ -295,7 +295,36 @@ impl CidPool {
         }
         self.issued_high = self.issued_high.max(entry.sequence);
         self.entries.insert(entry.sequence, entry);
-        Ok(())
+        self.retire_retained_active()
+    }
+
+    /// Finishes an L-2 deferral: when [`Self::note_retire_prior_to`] had to
+    /// keep a retired active CID because no replacement existed yet, and one
+    /// now does, rotate to the lowest surviving sequence, drop the stale
+    /// entry and queue its RETIRE_CONNECTION_ID.
+    ///
+    /// This has to run from [`Self::add`]: a NEW_CONNECTION_ID frame advances
+    /// `retire_prior_to` *before* its own CID is added, so when that CID is
+    /// the only one `>= retire_prior_to` the deferral is taken, and any later
+    /// frame repeating the same `retire_prior_to` returns early from
+    /// `note_retire_prior_to` — the stale CID would otherwise stay in use
+    /// (and never be retired) forever.
+    fn retire_retained_active(&mut self) -> Result<(), Error> {
+        if self.active_seq >= self.retire_prior_to || !self.entries.contains_key(&self.active_seq) {
+            return Ok(());
+        }
+        let Some(repl) = self
+            .entries
+            .range(self.retire_prior_to..)
+            .next()
+            .map(|(s, _)| *s)
+        else {
+            return Ok(());
+        };
+        let stale = self.active_seq;
+        self.active_seq = repl;
+        self.entries.remove(&stale);
+        self.queue_pending_retire(stale)
     }
 
     /// Retires the CID at `sequence`. Returns the removed entry, or
@@ -377,9 +406,9 @@ impl CidPool {
                     None
                 }
                 // No replacement available yet: keep the active entry so
-                // we still have a usable outbound DCID. It will be
-                // retired by a later note_retire_prior_to once the peer
-                // supplies a higher-sequence CID.
+                // we still have a usable outbound DCID. It is retired by
+                // `add` (`retire_retained_active`) as soon as the peer
+                // supplies a CID at or above `retire_prior_to`.
                 None => Some(self.active_seq),
             }
         } else {
@@ -678,6 +707,41 @@ mod tests {
         // Issued, retired once, then retired again: idempotent.
         assert!(pool.retire(1).expect("ok").is_some());
         assert!(pool.retire(1).expect("ok").is_none());
+    }
+
+    // L-2 follow-up: a NEW_CONNECTION_ID frame whose own CID is the only
+    // one >= retire_prior_to (seq=2, rpt=2 with the active CID at seq 0).
+    // `note_retire_prior_to` runs first and must keep the active entry; the
+    // `add` that follows must then rotate to seq 2 and retire seq 0 — a
+    // repeat of rpt=2 returns early, so nothing else would ever do it.
+    #[test]
+    fn cidpool_add_completes_deferred_active_retire() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        pool.set_limit(2);
+        pool.add(CidEntry {
+            cid: cid_n(1),
+            sequence: 1,
+            reset_token: Some([1; 16]),
+        })
+        .unwrap();
+        pool.note_retire_prior_to(2).expect("retire ok");
+        assert_eq!(pool.active_seq, 0, "kept: no replacement yet");
+        pool.add(CidEntry {
+            cid: cid_n(2),
+            sequence: 2,
+            reset_token: Some([2; 16]),
+        })
+        .unwrap();
+        assert_eq!(pool.active_seq, 2, "rotated onto the new CID");
+        assert_eq!(pool.active().map(|e| e.cid), Some(cid_n(2)));
+        assert!(!pool.entries.contains_key(&0));
+        assert!(!pool.entries.contains_key(&1));
+        let mut got = alloc::vec::Vec::new();
+        while let Some(s) = pool.pop_pending_retire() {
+            got.push(s);
+        }
+        got.sort();
+        assert_eq!(got, alloc::vec![0u64, 1]);
     }
 
     #[test]
