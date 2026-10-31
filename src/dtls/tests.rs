@@ -1568,6 +1568,36 @@ mod dtls13 {
         assert_ne!(c_out, c_other);
     }
 
+    /// Regression (audit 2026-10-31): the DTLS 1.3 server derives its
+    /// exporter secret when it sends its flight, before the client's
+    /// Finished is verified. The exporter must refuse until the handshake
+    /// is complete.
+    #[test]
+    fn exporter_refused_before_handshake_complete_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-exp-early", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        let mut out = [0u8; 32];
+        assert_eq!(
+            client.tls_exporter(b"EXPORTER-x", b"", &mut out),
+            Err(crate::tls::Error::InappropriateState)
+        );
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        // The server flight is out: its exporter secret exists, but the
+        // client's Finished has not been seen.
+        assert!(!server.pop_outbound_datagrams().is_empty());
+        assert!(!server.is_handshake_complete());
+        assert_eq!(
+            server.tls_exporter(b"EXPORTER-x", b"", &mut out),
+            Err(crate::tls::Error::InappropriateState)
+        );
+    }
+
     /// DTLS 1.3 + Ed25519 server certificate: proves the generalised
     /// signing path (RFC 8446 §4.4.3 `CertificateVerify` dispatch) works
     /// for non-ECDSA key types in the DTLS server. Before the
@@ -6505,4 +6535,55 @@ fn spoofed_server_hello_does_not_plant_alpn_12() {
     assert!(pump_handshake(&mut client, &mut server));
     assert_eq!(server.alpn_protocol(), None);
     assert_eq!(client.alpn_protocol(), None);
+}
+
+/// Regression (audit 2026-10-31): the DTLS 1.2 exporter refuses before the
+/// handshake has completed — the client holds a master secret as soon as it
+/// sends its final flight, before the server's Finished is verified — and
+/// refuses a context that cannot be length-prefixed as a uint16 (RFC 5705
+/// §4), matching the TLS 1.2 engines.
+#[test]
+fn exporter_refused_before_complete_and_oversized_context_12() {
+    use crate::tls::Error;
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-exp-early", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    let mut out = [0u8; 32];
+    for dg in client.pop_outbound_datagrams() {
+        server.feed_datagram(&dg).unwrap();
+    }
+    for dg in server.pop_outbound_datagrams() {
+        client.feed_datagram(&dg).unwrap();
+    }
+    // The client has derived its master secret and sent CKE/CCS/Finished,
+    // but has not yet verified the server's Finished.
+    assert!(!client.is_handshake_complete());
+    assert_eq!(
+        client.tls_exporter(b"EXPERIMENTAL-x", None, &mut out),
+        Err(Error::InappropriateState)
+    );
+    assert_eq!(
+        server.tls_exporter(b"EXPERIMENTAL-x", None, &mut out),
+        Err(Error::InappropriateState)
+    );
+    assert!(pump_handshake(&mut client, &mut server));
+    client
+        .tls_exporter(b"EXPERIMENTAL-x", None, &mut out)
+        .unwrap();
+    let big = alloc::vec![0u8; u16::MAX as usize + 1];
+    assert_eq!(
+        client.tls_exporter(b"EXPERIMENTAL-x", Some(&big), &mut out),
+        Err(Error::IllegalParameter)
+    );
+    assert_eq!(
+        server.tls_exporter(b"EXPERIMENTAL-x", Some(&big), &mut out),
+        Err(Error::IllegalParameter)
+    );
+    let max = alloc::vec![0u8; u16::MAX as usize];
+    server
+        .tls_exporter(b"EXPERIMENTAL-x", Some(&max), &mut out)
+        .unwrap();
 }

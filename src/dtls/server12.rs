@@ -840,13 +840,26 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// `context = None` omits the length-prefixed context block;
     /// `context = Some(&[])` emits a zero-length context — the two outputs
     /// MUST differ per RFC 5705 §4. Returns `Err(InappropriateState)`
-    /// before the handshake derives the master secret.
+    /// until the handshake has completed (the peer's Finished verified),
+    /// and `Err(IllegalParameter)` for a context longer than 65535 bytes.
     pub fn tls_exporter(
         &self,
         label: &[u8],
         context: Option<&[u8]>,
         out: &mut [u8],
     ) -> Result<(), Error> {
+        // RFC 5705 §4: the context is length-prefixed as a uint16 inside the
+        // PRF seed; a longer one cannot be encoded (and would be silently
+        // truncated to its low 16 bits of length).
+        if context.is_some_and(|c| c.len() > u16::MAX as usize) {
+            return Err(Error::IllegalParameter);
+        }
+        // The key material exists before the peer's Finished has been
+        // verified; exporting it then would hand the application keys bound
+        // to a handshake that may still fail (or be a forgery).
+        if !self.is_handshake_complete() {
+            return Err(Error::InappropriateState);
+        }
         let master = self.master.as_ref().ok_or(Error::InappropriateState)?;
         let suite = self.suite.ok_or(Error::InappropriateState)?;
         let cr = self.client_random.ok_or(Error::InappropriateState)?;

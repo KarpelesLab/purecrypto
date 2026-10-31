@@ -945,8 +945,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// Derives `out.len()` bytes from the `exporter_master_secret` under
     /// `(label, context)`. The derivation matches TLS 1.3's exporter —
     /// DTLS 1.3 explicitly reuses the TLS 1.3 key schedule. Returns
-    /// `Err(InappropriateState)` until the handshake completes.
+    /// `Err(InappropriateState)` until the handshake completes (the peer's
+    /// Finished verified), even once the exporter secret is derived.
     pub fn tls_exporter(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        // The key material exists before the peer's Finished has been
+        // verified; exporting it then would hand the application keys bound
+        // to a handshake that may still fail (or be a forgery).
+        if !self.is_handshake_complete() {
+            return Err(Error::InappropriateState);
+        }
         let ems = self
             .exporter_secret
             .as_ref()
