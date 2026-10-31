@@ -1591,6 +1591,26 @@ mod tests {
                 .unwrap_err(),
             Error::KeyMismatch
         );
+        // `dir` with the key's `alg` saying `dir`: any content encryption
+        // whose key length matches, and nothing but `dir`.
+        let dir = Jwk::oct(&[9u8; 32]).with_alg("dir").unwrap();
+        for enc in [Enc::A256Gcm, Enc::A128CbcHs256] {
+            let text = Jwe::encrypt_compact(&dir, KeyAlg::Dir, enc, b"hi", &mut rng()).unwrap();
+            let jwe = Jwe::parse(&text).unwrap();
+            assert_eq!(jwe.decrypt(&dir).unwrap(), b"hi");
+            let mut set = JwkSet::new();
+            set.push(dir.clone()).unwrap();
+            assert_eq!(jwe.decrypt_with_set(&set).unwrap(), b"hi");
+        }
+        assert_eq!(
+            Jwe::encrypt_compact(&dir, KeyAlg::Dir, Enc::A128Gcm, b"hi", &mut rng()).unwrap_err(),
+            Error::InvalidKey
+        );
+        assert_eq!(
+            Jwe::encrypt_compact(&dir, KeyAlg::A256KW, Enc::A128Gcm, b"hi", &mut rng())
+                .unwrap_err(),
+            Error::KeyMismatch
+        );
     }
 
     #[test]

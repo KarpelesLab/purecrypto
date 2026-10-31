@@ -28,7 +28,7 @@
 //!
 //! * The key decides the algorithm, never the message. A key that carries
 //!   `alg` is only ever used with that algorithm (for `dir` the key's `alg`
-//!   names the content encryption); `use` and `key_ops` are enforced; the
+//!   is either `dir` or names the content encryption); `use` and `key_ops` are enforced; the
 //!   key type must match the algorithm family. Any mismatch is
 //!   [`Error::KeyMismatch`] and no cryptographic operation is attempted.
 //!   `RSA1_5` is only used with a key that explicitly declares `alg: RSA1_5`,

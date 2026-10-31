@@ -563,8 +563,10 @@ impl Jwk {
 
     /// Checks the key may be used with header algorithm `alg` for
     /// operation `op` (`sign`, `verify`, `encrypt`, `decrypt`, ...).
-    /// `dir_enc` is the content-encryption name when `alg` is `dir` (the
-    /// key's own `alg` then names the content encryption).
+    /// `dir_enc` is the content-encryption name when `alg` is `dir`; the
+    /// key's own `alg` may then name that content encryption or be `dir`
+    /// itself (the key length is checked against the content encryption
+    /// either way).
     pub(crate) fn check_usable(
         &self,
         alg: &str,
@@ -577,11 +579,11 @@ impl Jwk {
             return Err(Error::KeyMismatch);
         }
         if let Some(key_alg) = self.alg.as_deref() {
-            let expected = match dir_enc {
-                Some(enc) => enc,
-                None => alg,
+            let fits = match dir_enc {
+                Some(enc) => key_alg == enc || key_alg == alg,
+                None => key_alg == alg,
             };
-            if key_alg != expected {
+            if !fits {
                 return Err(Error::KeyMismatch);
             }
         } else if matches!(
