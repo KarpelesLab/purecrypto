@@ -104,7 +104,12 @@ impl Poly {
     /// back to `[0, q)`, so the public contract (every coefficient a field
     /// element) is unchanged; the crate's own signing / verification paths
     /// stay in the lazy domain instead (see `LPoly`).
+    ///
+    /// Every input coefficient must already be a canonical field element in
+    /// `[0, q)`. Out-of-range input is not reduced first and yields a wrong
+    /// (not merely non-canonical) result; debug builds assert the range.
     pub fn ntt(&mut self) {
+        debug_assert!(self.is_canonical(), "Poly::ntt input must be in [0, q)");
         let mut f = to_lazy(self);
         ntt_lazy(&mut f);
         for (c, x) in self.c.iter_mut().zip(f.iter()) {
@@ -113,10 +118,21 @@ impl Poly {
     }
 
     /// Inverse NTT (FIPS 204 Algorithm 42), in place.
+    ///
+    /// Every input coefficient must already be a canonical field element in
+    /// `[0, q)`. Out-of-range input is not reduced first and yields a wrong
+    /// (not merely non-canonical) result; debug builds assert the range.
     pub fn inv_ntt(&mut self) {
+        debug_assert!(self.is_canonical(), "Poly::inv_ntt input must be in [0, q)");
         let mut f = to_lazy(self);
         invntt_lazy(&mut f);
         *self = from_lazy(&f);
+    }
+
+    /// Whether every coefficient is in `[0, q)` (the `ntt` / `inv_ntt`
+    /// precondition).
+    fn is_canonical(&self) -> bool {
+        self.c.iter().all(|&c| c < Q)
     }
 }
 
