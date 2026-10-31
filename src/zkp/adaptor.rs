@@ -151,6 +151,12 @@ const TAG_DLEQ: &[u8] = b"DLEQ";
 // =====================================================================
 
 /// BIP-340 tagged hash: `SHA256(SHA256(tag) ‖ SHA256(tag) ‖ parts…)`.
+///
+/// Safe on secret input (the hardened nonce hashes the raw signing key when
+/// no auxiliary randomness is supplied, and its output *is* the nonce):
+/// `Sha256::finalize` consumes the hasher and wipes its buffered block and
+/// chaining words itself, and the digest is returned straight to the caller
+/// — no intermediate copy is left behind — which wipes it when it is secret.
 fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let t = Sha256::digest(tag);
     let mut h = Sha256::new();
@@ -159,10 +165,7 @@ fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     for p in parts {
         h.update(p);
     }
-    let out = h.finalize();
-    let mut o = [0u8; 32];
-    o.copy_from_slice(out.as_ref());
-    o
+    h.finalize()
 }
 
 /// The hardened nonce function shared by encrypted signing and the DLEQ proof.
@@ -181,10 +184,13 @@ fn hardened_nonce(
 ) -> [u8; 32] {
     let mut t = *key32;
     if let Some(a) = aux {
-        let mask = tagged_hash(TAG_AUX, &[a]);
+        // The mask together with `t` (or the nonce input) recovers the key;
+        // wipe it once applied.
+        let mut mask = tagged_hash(TAG_AUX, &[a]);
         for (b, m) in t.iter_mut().zip(mask.iter()) {
             *b ^= *m;
         }
+        mask.zeroize();
     }
     let out = tagged_hash(algo, &[&t, pk33.as_slice(), msg32]);
     // `t` is the (possibly masked) signing key / nonce; wipe it.

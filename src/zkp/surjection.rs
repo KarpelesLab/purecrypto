@@ -709,7 +709,12 @@ impl SurjectionProof {
             let mut h = Sha256::new();
             h.update(&seed);
             h.update(&counter.to_be_bytes());
-            Scalar::from_bytes_be_reduce(&h.finalize())
+            // The last derivation is the secret signing nonce; wipe every
+            // digest rather than leave it on the stack.
+            let mut d = h.finalize();
+            let out = Scalar::from_bytes_be_reduce(&d);
+            d.zeroize();
+            out
         };
         let s: Vec<Scalar> = (0..ring).map(|j| derive(j as u32)).collect();
         let nonce = derive(u32::MAX);

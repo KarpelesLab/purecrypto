@@ -182,10 +182,9 @@ fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     for part in parts {
         h.update(part);
     }
-    let digest = h.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest.as_ref());
-    out
+    // Returned directly: `Sha256::finalize` wipes the hasher's own state,
+    // and no intermediate digest copy is left on the stack.
+    h.finalize()
 }
 
 /// The anti-exfil *host commitment* to `data`, which doubles as the auxiliary
