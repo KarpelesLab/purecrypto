@@ -8,6 +8,7 @@ use super::boxed::{BoxedUint, adc_limbs, sbb_limbs, select_limbs};
 use super::montgomery::{inv_mod_2_64, mont_mul_kernel, mont_sqr_kernel};
 use super::uint::{Limb, adc, sbb};
 use crate::ct::{Choice, ConstantTimeEq};
+use crate::zeroize::Zeroizing;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -28,7 +29,9 @@ fn zeroize_limbs(v: &mut [Limb]) {
 /// `(a + b) mod n` for equal-length `a, b < n`.
 fn add_mod_limbs(n: &[Limb], a: &[Limb], b: &[Limb]) -> Vec<Limb> {
     let (sum, carry) = adc_limbs(a, b, 0);
+    let sum = Zeroizing::new(sum);
     let (diff, borrow) = sbb_limbs(&sum, n, 0);
+    let diff = Zeroizing::new(diff);
     let subtract = carry | (borrow ^ 1);
     select_limbs(&diff, &sum, Choice::from(subtract as u8))
 }
@@ -57,7 +60,9 @@ fn add_mod_in_place(n: &[Limb], a: &mut [Limb], b: &[Limb], out: &mut [Limb]) {
 /// `(a - b) mod n` for equal-length `a, b < n`.
 fn sub_mod_limbs(n: &[Limb], a: &[Limb], b: &[Limb]) -> Vec<Limb> {
     let (diff, borrow) = sbb_limbs(a, b, 0);
+    let diff = Zeroizing::new(diff);
     let (wrapped, _) = adc_limbs(&diff, n, 0);
+    let wrapped = Zeroizing::new(wrapped);
     select_limbs(&wrapped, &diff, Choice::from(borrow as u8))
 }
 
@@ -302,20 +307,18 @@ impl BoxedMontModulus {
 
     /// Converts a plain value `< n` into the Montgomery domain.
     pub fn to_mont(&self, x: &BoxedUint) -> BoxedUint {
-        BoxedUint::from_limbs(self.to_mont_limbs(&x.limbs_resized(self.limbs)))
+        BoxedUint::from_limbs(self.to_mont_limbs(&x.limbs_at(self.limbs)))
     }
 
     /// Converts a Montgomery-domain value back to a plain value.
     pub fn from_mont(&self, x: &BoxedUint) -> BoxedUint {
-        BoxedUint::from_limbs(self.demont_limbs(&x.limbs_resized(self.limbs)))
+        BoxedUint::from_limbs(self.demont_limbs(&x.limbs_at(self.limbs)))
     }
 
     /// Montgomery-domain multiply: given `a, b` in Montgomery form, returns
     /// `a·b` in Montgomery form (a single CIOS reduction).
     pub fn mont_mul(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
-        BoxedUint::from_limbs(
-            self.mont_mul_limbs(&a.limbs_resized(self.limbs), &b.limbs_resized(self.limbs)),
-        )
+        BoxedUint::from_limbs(self.mont_mul_limbs(&a.limbs_at(self.limbs), &b.limbs_at(self.limbs)))
     }
 
     /// Reduces `x` (of any width) modulo `n` — the result is `limbs` wide.
@@ -370,16 +373,16 @@ impl BoxedMontModulus {
     pub fn mont_sqr(&self, a: &BoxedUint) -> BoxedUint {
         let mut t = vec![0 as Limb; 2 * self.limbs];
         let mut out = vec![0 as Limb; self.limbs];
-        self.mont_sqr_to(&a.limbs_resized(self.limbs), &mut t, &mut out);
+        self.mont_sqr_to(&a.limbs_at(self.limbs), &mut t, &mut out);
         zeroize_limbs(&mut t);
         BoxedUint::from_limbs(out)
     }
 
     /// Returns `(a * b) mod n` for `a, b < n`.
     pub fn mul_mod(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
-        let a = a.limbs_resized(self.limbs);
-        let b = b.limbs_resized(self.limbs);
-        let t = self.mont_mul_limbs(&a, &b);
+        // `t = a·b·R⁻¹` is as secret as the operands: wipe it on drop.
+        let t =
+            Zeroizing::new(self.mont_mul_limbs(&a.limbs_at(self.limbs), &b.limbs_at(self.limbs)));
         BoxedUint::from_limbs(self.mont_mul_limbs(&t, &self.r2))
     }
 
@@ -448,12 +451,7 @@ impl BoxedMontModulus {
         let mut one = vec![0 as Limb; l];
         one[0] = 1;
         self.mont_mul_to(&one, &self.r2, &mut t, &mut table[..l]);
-        self.mont_mul_to(
-            &base.limbs_resized(l),
-            &self.r2,
-            &mut t,
-            &mut table[l..2 * l],
-        );
+        self.mont_mul_to(&base.limbs_at(l), &self.r2, &mut t, &mut table[l..2 * l]);
         for i in 2..16 {
             let (done, rest) = table.split_at_mut(i * l);
             self.mont_mul_to(
@@ -530,13 +528,8 @@ impl BoxedMontModulus {
         let mut one = vec![0 as Limb; l];
         one[0] = 1;
         self.mont_mul_to(&one, &self.r2, &mut t, &mut table[..l]);
-        self.mont_mul_to(&a.limbs_resized(l), &self.r2, &mut t, &mut table[l..2 * l]);
-        self.mont_mul_to(
-            &b.limbs_resized(l),
-            &self.r2,
-            &mut t,
-            &mut table[4 * l..5 * l],
-        );
+        self.mont_mul_to(&a.limbs_at(l), &self.r2, &mut t, &mut table[l..2 * l]);
+        self.mont_mul_to(&b.limbs_at(l), &self.r2, &mut t, &mut table[4 * l..5 * l]);
         // Entry 8 = b², entry 12 = b³.
         for (dst, src) in [(8usize, 4usize), (12, 8)] {
             let (done, rest) = table.split_at_mut(dst * l);
@@ -675,7 +668,7 @@ impl BoxedMontModulus {
         }
         let exp = exp.as_limbs();
         let bit = |i: usize| (exp[i / 64] >> (i % 64)) & 1 == 1;
-        let mut base_m = self.to_mont_limbs(&base.limbs_resized(l));
+        let mut base_m = self.to_mont_limbs(&base.limbs_at(l));
         let mut t = vec![0 as Limb; 2 * l];
         let mut nxt = vec![0 as Limb; l];
         let mut table: Vec<Vec<Limb>> = Vec::new();
@@ -835,8 +828,8 @@ impl BoxedMontModulus {
     pub fn add_mod(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
         BoxedUint::from_limbs(add_mod_limbs(
             &self.n,
-            &a.limbs_resized(self.limbs),
-            &b.limbs_resized(self.limbs),
+            &a.limbs_at(self.limbs),
+            &b.limbs_at(self.limbs),
         ))
     }
 
@@ -844,8 +837,8 @@ impl BoxedMontModulus {
     pub fn sub_mod(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
         BoxedUint::from_limbs(sub_mod_limbs(
             &self.n,
-            &a.limbs_resized(self.limbs),
-            &b.limbs_resized(self.limbs),
+            &a.limbs_at(self.limbs),
+            &b.limbs_at(self.limbs),
         ))
     }
 }

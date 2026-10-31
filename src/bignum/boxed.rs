@@ -260,6 +260,21 @@ impl BoxedUint {
         n
     }
 
+    /// The limbs padded or truncated to exactly `n` limbs, for read-only
+    /// use: a borrowed prefix when the value already has at least `n` limbs
+    /// (no allocation, no copy), otherwise a zero-padded copy that is wiped
+    /// when dropped. Operands are routinely secret (RSA primes and residues,
+    /// DSA `x` and `k⁻¹`), so a resized copy must not go back to the
+    /// allocator intact. Branches only on the public storage widths.
+    #[inline]
+    pub(super) fn limbs_at(&self, n: usize) -> LimbsAt<'_> {
+        if self.limbs.len() >= n {
+            LimbsAt::Borrowed(&self.limbs[..n])
+        } else {
+            LimbsAt::Owned(crate::zeroize::Zeroizing::new(self.limbs_resized(n)))
+        }
+    }
+
     /// Returns the limbs padded or truncated to exactly `n` limbs.
     pub(super) fn limbs_resized(&self, n: usize) -> Vec<Limb> {
         let mut v = vec![0 as Limb; n];
@@ -272,7 +287,7 @@ impl BoxedUint {
     /// operand; an underflow wraps modulo `2^(64·limbs)`).
     pub fn sub(&self, other: &BoxedUint) -> BoxedUint {
         let n = self.limbs.len().max(other.limbs.len());
-        let (diff, _borrow) = sbb_limbs(&self.limbs_resized(n), &other.limbs_resized(n), 0);
+        let (diff, _borrow) = sbb_limbs(&self.limbs_at(n), &other.limbs_at(n), 0);
         BoxedUint::from_limbs(diff)
     }
 
@@ -317,7 +332,7 @@ impl BoxedUint {
             "BoxedUint::reduce: modulus must be nonzero"
         );
         let m = modulus.significant_limbs();
-        let n = modulus.limbs_resized(m);
+        let n = modulus.limbs_at(m);
         let mut r = vec![0 as Limb; m];
         let mut scratch = vec![0 as Limb; m];
         long_divide(&self.limbs, &n, &mut r, &mut scratch, |_, _, _| {});
@@ -376,7 +391,7 @@ impl BoxedUint {
     /// Whether `self < other` (not constant time).
     pub fn lt(&self, other: &BoxedUint) -> bool {
         let n = self.limbs.len().max(other.limbs.len());
-        let (_, borrow) = sbb_limbs(&self.limbs_resized(n), &other.limbs_resized(n), 0);
+        let (_, borrow) = sbb_limbs(&self.limbs_at(n), &other.limbs_at(n), 0);
         borrow == 1
     }
 
@@ -393,7 +408,7 @@ impl BoxedUint {
             "BoxedUint::divrem: divisor must be nonzero"
         );
         let m = divisor.significant_limbs();
-        let d = divisor.limbs_resized(m);
+        let d = divisor.limbs_at(m);
         let mut q = vec![0 as Limb; self.limbs.len()];
         let mut r = vec![0 as Limb; m];
         let mut scratch = vec![0 as Limb; m];
@@ -402,6 +417,7 @@ impl BoxedUint {
         long_divide(&self.limbs, &d, &mut r, &mut scratch, |i, bit, ge| {
             q[i] |= (ge.unwrap_u8() as Limb) << bit;
         });
+        crate::zeroize::Zeroize::zeroize(scratch.as_mut_slice());
         (BoxedUint::from_limbs(q), BoxedUint::from_limbs(r))
     }
 
@@ -411,18 +427,14 @@ impl BoxedUint {
     /// that trait requires `Copy`, so this is an inherent method.
     pub fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         let n = a.limbs.len().max(b.limbs.len());
-        BoxedUint::from_limbs(select_limbs(
-            &a.limbs_resized(n),
-            &b.limbs_resized(n),
-            choice,
-        ))
+        BoxedUint::from_limbs(select_limbs(&a.limbs_at(n), &b.limbs_at(n), choice))
     }
 }
 
 impl ConstantTimeEq for BoxedUint {
     fn ct_eq(&self, other: &Self) -> Choice {
         let n = self.limbs.len().max(other.limbs.len());
-        self.limbs_resized(n)[..].ct_eq(&other.limbs_resized(n)[..])
+        self.limbs_at(n).ct_eq(&*other.limbs_at(n))
     }
 }
 
@@ -457,6 +469,23 @@ impl PartialEq for BoxedUint {
 }
 
 impl Eq for BoxedUint {}
+
+/// Read-only limbs at a requested width; see [`BoxedUint::limbs_at`].
+pub(super) enum LimbsAt<'a> {
+    Borrowed(&'a [Limb]),
+    Owned(crate::zeroize::Zeroizing<Vec<Limb>>),
+}
+
+impl core::ops::Deref for LimbsAt<'_> {
+    type Target = [Limb];
+    #[inline]
+    fn deref(&self) -> &[Limb] {
+        match self {
+            LimbsAt::Borrowed(l) => l,
+            LimbsAt::Owned(v) => v,
+        }
+    }
+}
 
 // Best-effort zeroize on drop: every BoxedUint may carry secret material
 // (RSA `d`/`p`/`q`, ECDSA/ECDH scalars, blinding intermediates, …) and the
