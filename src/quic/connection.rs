@@ -5539,10 +5539,27 @@ impl QuicConnection {
         // exact stateless-reset token we advertised in our transport
         // parameters (RFC 9000 §10.3.1) so server and client agree on it.
         if self.cid_local.is_none() {
-            self.cid_local = Some(CidPool::new(
-                our_scid,
-                self.our_params.stateless_reset_token,
-            ));
+            let mut pool = CidPool::new(our_scid, self.our_params.stateless_reset_token);
+            // RFC 9000 §5.1.1: "the sequence number of the connection ID
+            // supplied in the preferred_address transport parameter is 1".
+            // Seed it so it is routable (a `QuicServer` learns our CIDs from
+            // this pool) and so `issue_new_local_cids` starts at sequence 2
+            // instead of minting an unrelated CID at the reserved sequence 1,
+            // which made the client refuse the preferred address.
+            if let Some(pa) = self
+                .our_params
+                .preferred_address
+                .as_deref()
+                .and_then(|raw| PreferredAddress::decode(raw).ok())
+                && let Some(cid) = ConnectionId::from_slice(&pa.connection_id)
+            {
+                let _ = pool.add(CidEntry {
+                    cid,
+                    sequence: 1,
+                    reset_token: Some(pa.stateless_reset_token),
+                });
+            }
+            self.cid_local = Some(pool);
         }
         // Seed the remote CID pool with the peer's SCID at sequence 0, and
         // propagate OUR advertised `active_connection_id_limit` (RFC 9000
@@ -10121,6 +10138,77 @@ mod tests {
         let mut bad_len = encoded.clone();
         bad_len[24] = 21;
         assert!(PreferredAddress::decode(&bad_len).is_err());
+    }
+
+    /// RFC 9000 §5.1.1 / §9.6 — a server advertising a preferred address
+    /// answers to its connection ID (sequence 1) and never issues a different
+    /// CID at that reserved sequence, so the client can actually migrate.
+    /// Before the fix the CID was absent from the server's local pool (so
+    /// never routed by a `QuicServer`) and NEW_CONNECTION_ID numbering
+    /// started at 1, which the client rejects as contradicting the
+    /// parameter.
+    #[test]
+    fn server_preferred_address_cid_is_sequence_one() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let pa = PreferredAddress {
+            ipv4: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 4433)),
+            ipv6: None,
+            connection_id: alloc::vec![0xC1; 8],
+            stateless_reset_token: [0x77; 16],
+        };
+        let (server_tls, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: Config {
+                    roots,
+                    alpn_protocols: alloc::vec![b"test".to_vec()],
+                    max_version: crate::tls::ProtocolVersion::TLSv1_3,
+                    min_version: crate::tls::ProtocolVersion::TLSv1_3,
+                    ..Config::default()
+                },
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client");
+        let mut server_params = loopback_params();
+        server_params.preferred_address = Some(pa.encode());
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_tls,
+            transport_params: server_params,
+            ..QuicConfig::default()
+        })
+        .expect("server");
+        c.set_peer_addr(ip4(198, 51, 100, 1, 443));
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let pa_cid = ConnectionId::from_slice(&pa.connection_id).unwrap();
+        assert!(
+            s.local_cids().contains(&pa_cid),
+            "the server answers to (and routes) the preferred-address CID"
+        );
+        assert_eq!(
+            s.cid_local
+                .as_ref()
+                .and_then(|p| p.entries.get(&1))
+                .map(|e| e.cid),
+            Some(pa_cid),
+            "sequence 1 is the preferred-address CID"
+        );
+        assert!(
+            c.cid_remote
+                .as_ref()
+                .is_none_or(|p| p.entries.get(&1).is_none_or(|e| e.cid == pa_cid)),
+            "no other CID was issued at the reserved sequence 1"
+        );
+        let target = c.migrate_to_preferred_address().expect("migrate");
+        assert_eq!(target, ip4(203, 0, 113, 7, 4433));
+        assert_eq!(c.endpoint.cids.peer, pa_cid);
     }
 
     /// RFC 9000 §9.6 — a client migrates to the server's advertised preferred
