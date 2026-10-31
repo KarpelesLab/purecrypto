@@ -306,13 +306,18 @@ mod tests {
     }
 
     /// Valid but absurd parameters — `N = 2`, `r = 2²⁹ − 1`, about 128 GiB for
-    /// V plus three 64 GiB buffers — must come back as `OutOfMemory`, not
+    /// V plus three 64 GiB buffers (on 64-bit targets) — must come back as `OutOfMemory`, not
     /// abort the process, and leave `out` alone.
     #[cfg(feature = "std")]
     #[test]
     fn impossible_memory_returns_error() {
         let mut out = [0xaau8; 32];
+        // On 32-bit targets those sizes overflow `usize` (InvalidParam), so
+        // use r = 2²³ there: a 2 GiB V, still above the ceiling.
+        #[cfg(target_pointer_width = "64")]
         let r = (1u32 << 29) - 1;
+        #[cfg(not(target_pointer_width = "64"))]
+        let r = 1u32 << 23;
         assert_eq!(
             fail_allocs_above(1 << 30, || scrypt(b"p", b"s", 1, r, 1, &mut out)),
             Err(Error::OutOfMemory)
