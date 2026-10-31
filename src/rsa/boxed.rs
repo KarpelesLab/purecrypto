@@ -3238,6 +3238,7 @@ mod tests {
                 .concat(),
             )
         };
+        #[cfg(feature = "std")]
         let start = std::time::Instant::now();
         for der in [
             build(&huge, &huge, &be(&sk.d)),
@@ -3274,6 +3275,7 @@ mod tests {
             )
             .is_err()
         );
+        #[cfg(feature = "std")]
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
