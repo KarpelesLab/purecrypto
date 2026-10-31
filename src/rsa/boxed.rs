@@ -2075,13 +2075,19 @@ impl BoxedRsaPrivateKey {
 
     /// Decodes a PKCS#1 PEM private key (`-----BEGIN RSA PRIVATE KEY-----`).
     pub fn from_pkcs1_pem(pem: &str) -> Result<Self, crate::der::Error> {
-        Self::from_pkcs1_der(&crate::der::pem_decode(pem, "RSA PRIVATE KEY")?)
+        Self::from_pkcs1_der(&crate::zeroize::Zeroizing::new(crate::der::pem_decode(
+            pem,
+            "RSA PRIVATE KEY",
+        )?))
     }
 
     /// **Insecure.** [`from_pkcs1_pem`](Self::from_pkcs1_pem) accepting
     /// moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits instead of 1024.
     pub fn from_pkcs1_pem_insecure(pem: &str) -> Result<Self, crate::der::Error> {
-        Self::from_pkcs1_der_insecure(&crate::der::pem_decode(pem, "RSA PRIVATE KEY")?)
+        Self::from_pkcs1_der_insecure(&crate::zeroize::Zeroizing::new(crate::der::pem_decode(
+            pem,
+            "RSA PRIVATE KEY",
+        )?))
     }
 
     /// Encodes the key as a PKCS#1 `RSAPrivateKey` DER structure with the CRT
@@ -2097,7 +2103,9 @@ impl BoxedRsaPrivateKey {
     /// is structurally broken and re-exporting would emit a CRT parameter
     /// silently set to zero. We refuse to round-trip a corrupted key.
     pub fn to_pkcs1_der(&self) -> Vec<u8> {
-        use crate::der::{encode_integer, encode_sequence};
+        use super::encoding::{into_plain, secret_concat, secret_integer, secret_tlv};
+        use crate::der::{encode_integer, tag};
+        use crate::zeroize::Zeroizing;
         assert!(
             !self.p.is_zero() && !self.q.is_zero(),
             "to_pkcs1_der requires the prime factors (generated keys only)"
@@ -2115,45 +2123,52 @@ impl BoxedRsaPrivateKey {
             Some(crt) => crt.qinv.clone(),
             None => BoxedUint::zero(1),
         };
-        let be = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8).max(1));
+        // Every intermediate holding secret bytes (the big-endian limbs, the
+        // encoded INTEGERs, the concatenated body) is allocated at its final
+        // size and wiped on drop; only the returned encoding outlives this
+        // call. (`BoxedUint` temporaries wipe themselves.)
+        let int = |v: &BoxedUint| {
+            secret_integer(&Zeroizing::new(
+                v.to_be_bytes(v.bit_len().div_ceil(8).max(1)),
+            ))
+        };
         let multi = !self.other_primes.is_empty();
-        let mut body = [
-            encode_integer(&[u8::from(multi)]),
-            encode_integer(&be(&self.n)),
-            encode_integer(&be(&self.e)),
-            encode_integer(&be(&self.d)),
-            encode_integer(&be(&self.p)),
-            encode_integer(&be(&self.q)),
-            encode_integer(&be(&dp)),
-            encode_integer(&be(&dq)),
-            encode_integer(&be(&qinv)),
-        ]
-        .concat();
+        let mut parts: Vec<Zeroizing<Vec<u8>>> = alloc::vec![
+            encode_integer(&[u8::from(multi)]).into(),
+            int(&self.n),
+            int(&self.e),
+            int(&self.d),
+            int(&self.p),
+            int(&self.q),
+            int(&dp),
+            int(&dq),
+            int(&qinv),
+        ];
         if multi {
-            let mut infos = Vec::new();
+            let mut infos: Vec<Zeroizing<Vec<u8>>> = Vec::with_capacity(self.other_primes.len());
             for (i, r) in self.other_primes.iter().enumerate() {
                 let d_i = self.d.reduce(&r.sub(&one));
                 let t_i = match self.crt.as_deref() {
                     Some(crt) => crt.others[i].t.clone(),
                     None => BoxedUint::zero(1),
                 };
-                infos.extend_from_slice(&encode_sequence(
-                    &[
-                        encode_integer(&be(r)),
-                        encode_integer(&be(&d_i)),
-                        encode_integer(&be(&t_i)),
-                    ]
-                    .concat(),
-                ));
+                let fields = [int(r), int(&d_i), int(&t_i)];
+                let body = secret_concat(&[&fields[0], &fields[1], &fields[2]]);
+                infos.push(secret_tlv(tag::SEQUENCE, &body));
             }
-            body.extend_from_slice(&encode_sequence(&infos));
+            let refs: Vec<&[u8]> = infos.iter().map(|v| v.as_slice()).collect();
+            parts.push(secret_tlv(tag::SEQUENCE, &secret_concat(&refs)));
         }
-        encode_sequence(&body)
+        let refs: Vec<&[u8]> = parts.iter().map(|v| v.as_slice()).collect();
+        into_plain(secret_tlv(tag::SEQUENCE, &secret_concat(&refs)))
     }
 
     /// Encodes the key as a PKCS#1 PEM document.
     pub fn to_pkcs1_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("RSA PRIVATE KEY", &self.to_pkcs1_der())
+        crate::der::pem_encode(
+            "RSA PRIVATE KEY",
+            &crate::zeroize::Zeroizing::new(self.to_pkcs1_der()),
+        )
     }
 
     /// Encodes the key as an unencrypted PKCS#8 `PrivateKeyInfo` DER
@@ -2176,25 +2191,23 @@ impl BoxedRsaPrivateKey {
     /// via [`from_components`](Self::from_components) or imported, not
     /// generated). Matches [`to_pkcs1_der`](Self::to_pkcs1_der).
     pub fn to_pkcs8_der(&self) -> Vec<u8> {
-        use crate::der::{
-            encode_integer, encode_null, encode_octet_string, encode_sequence, oid_tlv,
-        };
+        use super::encoding::{into_plain, secret_concat, secret_tlv};
+        use crate::der::{encode_integer, encode_null, encode_sequence, oid_tlv, tag};
         let algid = encode_sequence(&[oid_tlv(&RSA_ENCRYPTION_OID), encode_null()].concat());
-        encode_sequence(
-            &[
-                encode_integer(&[0]),
-                algid,
-                encode_octet_string(&self.to_pkcs1_der()),
-            ]
-            .concat(),
-        )
+        let pkcs1 = crate::zeroize::Zeroizing::new(self.to_pkcs1_der());
+        let key = secret_tlv(tag::OCTET_STRING, &pkcs1);
+        let body = secret_concat(&[&encode_integer(&[0]), &algid, &key]);
+        into_plain(secret_tlv(tag::SEQUENCE, &body))
     }
 
     /// Encodes the key as a PKCS#8 PEM document
     /// (`-----BEGIN PRIVATE KEY-----`, RFC 7468). Distinct from the legacy
     /// `RSA PRIVATE KEY` label which carries a bare PKCS#1 body.
     pub fn to_pkcs8_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+        crate::der::pem_encode(
+            "PRIVATE KEY",
+            &crate::zeroize::Zeroizing::new(self.to_pkcs8_der()),
+        )
     }
 
     /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` DER structure for an
@@ -2247,13 +2260,19 @@ impl BoxedRsaPrivateKey {
     /// accepted here — use [`from_pkcs1_pem`](Self::from_pkcs1_pem) for
     /// that form.
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
-        Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+        Self::from_pkcs8_der(&crate::zeroize::Zeroizing::new(crate::der::pem_decode(
+            pem,
+            "PRIVATE KEY",
+        )?))
     }
 
     /// **Insecure.** [`from_pkcs8_pem`](Self::from_pkcs8_pem) accepting
     /// moduli down to [`MIN_RSA_INSECURE_BITS`] (256) bits instead of 1024.
     pub fn from_pkcs8_pem_insecure(pem: &str) -> Result<Self, crate::der::Error> {
-        Self::from_pkcs8_der_insecure(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+        Self::from_pkcs8_der_insecure(&crate::zeroize::Zeroizing::new(crate::der::pem_decode(
+            pem,
+            "PRIVATE KEY",
+        )?))
     }
 
     /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 + RFC 8018
@@ -2266,7 +2285,12 @@ impl BoxedRsaPrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> Vec<u8> {
-        crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+        crate::kdf::pbes2::encrypt(
+            &crate::zeroize::Zeroizing::new(self.to_pkcs8_der()),
+            password,
+            params,
+            rng,
+        )
     }
 
     /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
@@ -2278,7 +2302,12 @@ impl BoxedRsaPrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> alloc::string::String {
-        crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+        crate::kdf::pbes2::encrypt_pem(
+            &crate::zeroize::Zeroizing::new(self.to_pkcs8_der()),
+            password,
+            params,
+            rng,
+        )
     }
 
     /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it back to a
@@ -2288,16 +2317,19 @@ impl BoxedRsaPrivateKey {
         der: &[u8],
         password: &[u8],
     ) -> Result<Self, crate::der::Error> {
-        let inner =
-            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?;
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 
     /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
     #[cfg(all(feature = "kdf", feature = "der"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, crate::der::Error> {
-        let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
-            .map_err(|_| crate::der::Error::Malformed)?;
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt_pem(pem, password)
+                .map_err(|_| crate::der::Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 
@@ -2308,8 +2340,9 @@ impl BoxedRsaPrivateKey {
         der: &[u8],
         password: &[u8],
     ) -> Result<Self, crate::der::Error> {
-        let inner =
-            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?;
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?,
+        );
         Self::from_pkcs8_der_insecure(&inner)
     }
 
@@ -2320,8 +2353,10 @@ impl BoxedRsaPrivateKey {
         pem: &str,
         password: &[u8],
     ) -> Result<Self, crate::der::Error> {
-        let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
-            .map_err(|_| crate::der::Error::Malformed)?;
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt_pem(pem, password)
+                .map_err(|_| crate::der::Error::Malformed)?,
+        );
         Self::from_pkcs8_der_insecure(&inner)
     }
 }

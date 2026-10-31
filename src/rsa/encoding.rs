@@ -8,9 +8,10 @@ use super::{RsaPrivateKey, RsaPublicKey};
 use crate::bignum::{MontModulus, Uint};
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::der::{
-    Error, Reader, encode_bit_string, encode_integer, encode_null, encode_octet_string,
-    encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode,
+    Error, Reader, encode_bit_string, encode_integer, encode_null, encode_sequence, oid_tlv,
+    parse_oid, pem_decode, pem_encode,
 };
+use crate::zeroize::Zeroizing;
 
 const PUBLIC_LABEL: &str = "RSA PUBLIC KEY";
 const PRIVATE_LABEL: &str = "RSA PRIVATE KEY";
@@ -26,6 +27,78 @@ pub(crate) const RSA_ENCRYPTION_OID: [u64; 7] = [1, 2, 840, 113549, 1, 1, 1];
 /// fix H-7).
 fn rsa_encryption_algid() -> Vec<u8> {
     encode_sequence(&[oid_tlv(&RSA_ENCRYPTION_OID), encode_null()].concat())
+}
+
+/// Writes a DER tag and definite-form length into `out`.
+fn push_header(out: &mut Vec<u8>, tag: u8, len: usize) {
+    out.push(tag);
+    if len < 0x80 {
+        out.push(len as u8);
+        return;
+    }
+    let n = (usize::BITS - len.leading_zeros()).div_ceil(8) as usize;
+    out.push(0x80 | n as u8);
+    for i in (0..n).rev() {
+        out.push((len >> (8 * i)) as u8);
+    }
+}
+
+/// Upper bound on a DER tag + length header.
+const MAX_HEADER: usize = 2 + core::mem::size_of::<usize>();
+
+/// [`crate::der::encode_tlv`] for secret content: the result is allocated
+/// once at its final size (so no reallocation leaves an unwiped copy behind)
+/// and is wiped on drop.
+pub(super) fn secret_tlv(tag: u8, content: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(content.len() + MAX_HEADER));
+    push_header(&mut out, tag, content.len());
+    out.extend_from_slice(content);
+    out
+}
+
+/// [`encode_integer`] for secret values: same canonical DER `INTEGER`
+/// (leading zeros trimmed, `0x00` prepended for a set high bit, empty input
+/// encoded as zero), built without the intermediate content buffer the
+/// generic encoder frees unwiped.
+pub(super) fn secret_integer(unsigned_be: &[u8]) -> Zeroizing<Vec<u8>> {
+    let start = unsigned_be
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(unsigned_be.len().saturating_sub(1));
+    let trimmed = unsigned_be.get(start..).unwrap_or(&[]);
+    let trimmed: &[u8] = if trimmed.is_empty() { &[0] } else { trimmed };
+    let pad = usize::from(trimmed[0] & 0x80 != 0);
+    let len = trimmed.len() + pad;
+    let mut out = Zeroizing::new(Vec::with_capacity(len + MAX_HEADER));
+    push_header(&mut out, crate::der::tag::INTEGER, len);
+    if pad == 1 {
+        out.push(0);
+    }
+    out.extend_from_slice(trimmed);
+    out
+}
+
+/// Concatenates already-encoded secret elements into one buffer allocated
+/// at its final size and wiped on drop.
+pub(super) fn secret_concat(parts: &[&[u8]]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(parts.iter().map(|p| p.len()).sum()));
+    for p in parts {
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// Moves the encoding out of its wrapper for a caller that takes ownership
+/// of it (the wrapper is left holding an empty vector).
+pub(super) fn into_plain(mut z: Zeroizing<Vec<u8>>) -> Vec<u8> {
+    core::mem::take(&mut *z)
+}
+
+/// [`uint_be`] for a secret value, wiped on drop.
+fn secret_uint_be<const LIMBS: usize>(u: &Uint<LIMBS>) -> Zeroizing<Vec<u8>> {
+    let mut buf = Zeroizing::new(alloc::vec![0u8; LIMBS * 8]);
+    u.write_be_bytes(&mut buf);
+    buf
 }
 
 /// Big-endian bytes of a `Uint` (with leading zeros, which `encode_integer`
@@ -286,14 +359,14 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         let (p, q) = self.primes();
         let d = self.private_exponent();
         let one = Uint::ONE;
-        let dp = d.reduce(&p.wrapping_sub(&one));
-        let dq = d.reduce(&q.wrapping_sub(&one));
+        let dp = Zeroizing::new(d.reduce(&p.wrapping_sub(&one)));
+        let dq = Zeroizing::new(d.reduce(&q.wrapping_sub(&one)));
         // `qInv = q^-1 mod p` over the *secret* primes, so use the constant-time
         // Fermat inversion (`p` is prime) rather than the variable-time
         // extended-Euclid `inv_mod`, whose iteration count depends on the
         // operands. `q` is reduced first because Fermat needs a residue.
         let mp = MontModulus::new(*p);
-        let qinv = mp.inv_prime(&q.reduce(p));
+        let qinv = Zeroizing::new(mp.inv_prime(&q.reduce(p)));
         // Fermat yields a garbage value instead of failing when `q ≡ 0 (mod p)`
         // (i.e. the primes are not coprime), so keep the old contract — refuse
         // to re-export a structurally broken key — by checking the result.
@@ -302,19 +375,22 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             "to_pkcs1_der: gcd(q, p) ≠ 1 — RSA primes are not coprime"
         );
 
-        let body = [
-            encode_integer(&[0]), // version = 0 (two-prime)
-            encode_integer(&uint_be(self.modulus())),
-            encode_integer(&uint_be(self.exponent())),
-            encode_integer(&uint_be(d)),
-            encode_integer(&uint_be(p)),
-            encode_integer(&uint_be(q)),
-            encode_integer(&uint_be(&dp)),
-            encode_integer(&uint_be(&dq)),
-            encode_integer(&uint_be(&qinv)),
-        ]
-        .concat();
-        encode_sequence(&body)
+        // Every intermediate holding secret bytes is built at its final size
+        // and wiped on drop; only the returned encoding outlives this call.
+        let int = |u: &Uint<LIMBS>| secret_integer(&secret_uint_be(u));
+        let parts = [
+            encode_integer(&[0]).into(), // version = 0 (two-prime)
+            int(self.modulus()),
+            int(self.exponent()),
+            int(d),
+            int(p),
+            int(q),
+            int(&dp),
+            int(&dq),
+            int(&qinv),
+        ];
+        let refs: [&[u8]; 9] = core::array::from_fn(|i| parts[i].as_slice());
+        into_plain(secret_tlv(crate::der::tag::SEQUENCE, &secret_concat(&refs)))
     }
 
     /// Decodes a PKCS#1 `RSAPrivateKey` DER structure. The CRT parameters are
@@ -360,12 +436,12 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
 
     /// Encodes the key as a PKCS#1 PEM document (`-----BEGIN RSA PRIVATE KEY-----`).
     pub fn to_pkcs1_pem(&self) -> String {
-        pem_encode(PRIVATE_LABEL, &self.to_pkcs1_der())
+        pem_encode(PRIVATE_LABEL, &Zeroizing::new(self.to_pkcs1_der()))
     }
 
     /// Decodes a PKCS#1 PEM private key.
     pub fn from_pkcs1_pem(pem: &str) -> Result<Self, Error> {
-        Self::from_pkcs1_der(&pem_decode(pem, PRIVATE_LABEL)?)
+        Self::from_pkcs1_der(&Zeroizing::new(pem_decode(pem, PRIVATE_LABEL)?))
     }
 
     /// Encodes the key as an unencrypted PKCS#8 `PrivateKeyInfo` DER
@@ -383,21 +459,17 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// PBKDF2) is intentionally not implemented — wrap with a stream-cipher
     /// AEAD of your own choosing instead.
     pub fn to_pkcs8_der(&self) -> Vec<u8> {
-        encode_sequence(
-            &[
-                encode_integer(&[0]),
-                rsa_encryption_algid(),
-                encode_octet_string(&self.to_pkcs1_der()),
-            ]
-            .concat(),
-        )
+        let pkcs1 = Zeroizing::new(self.to_pkcs1_der());
+        let key = secret_tlv(crate::der::tag::OCTET_STRING, &pkcs1);
+        let body = secret_concat(&[&encode_integer(&[0]), &rsa_encryption_algid(), &key]);
+        into_plain(secret_tlv(crate::der::tag::SEQUENCE, &body))
     }
 
     /// Encodes the key as a PKCS#8 PEM document
     /// (`-----BEGIN PRIVATE KEY-----`, RFC 7468). Distinct from the legacy
     /// `RSA PRIVATE KEY` PKCS#1 label.
     pub fn to_pkcs8_pem(&self) -> String {
-        pem_encode(PKCS8_LABEL, &self.to_pkcs8_der())
+        pem_encode(PKCS8_LABEL, &Zeroizing::new(self.to_pkcs8_der()))
     }
 
     /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` DER structure for an
@@ -428,7 +500,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// Parses a PKCS#8 PEM document (`-----BEGIN PRIVATE KEY-----`,
     /// RFC 7468).
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
-        Self::from_pkcs8_der(&pem_decode(pem, PKCS8_LABEL)?)
+        Self::from_pkcs8_der(&Zeroizing::new(pem_decode(pem, PKCS8_LABEL)?))
     }
 
     /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 + RFC 8018
@@ -441,7 +513,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> Vec<u8> {
-        crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+        crate::kdf::pbes2::encrypt(&Zeroizing::new(self.to_pkcs8_der()), password, params, rng)
     }
 
     /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
@@ -453,21 +525,25 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> String {
-        crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+        crate::kdf::pbes2::encrypt_pem(&Zeroizing::new(self.to_pkcs8_der()), password, params, rng)
     }
 
     /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it back to a
     /// PKCS#8 RSA private key.
     #[cfg(all(feature = "kdf", feature = "der"))]
     pub fn from_pkcs8_der_encrypted(der: &[u8], password: &[u8]) -> Result<Self, Error> {
-        let inner = crate::kdf::pbes2::decrypt(der, password).map_err(|_| Error::Malformed)?;
+        let inner = Zeroizing::new(
+            crate::kdf::pbes2::decrypt(der, password).map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 
     /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
     #[cfg(all(feature = "kdf", feature = "der"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, Error> {
-        let inner = crate::kdf::pbes2::decrypt_pem(pem, password).map_err(|_| Error::Malformed)?;
+        let inner = Zeroizing::new(
+            crate::kdf::pbes2::decrypt_pem(pem, password).map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 }
@@ -475,8 +551,38 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::der::encode_octet_string;
     use crate::hash::Sha256;
     use crate::test_util::rsa_test_key_a;
+
+    /// The wipe-on-drop encoders used for private-key export must produce
+    /// exactly the bytes of the generic `crate::der` writers.
+    #[test]
+    fn secret_der_helpers_match_generic_encoders() {
+        for v in [
+            &[][..],
+            &[0],
+            &[0, 0, 0],
+            &[1],
+            &[0x7f],
+            &[0x80],
+            &[0, 0, 0x80, 1],
+            &[0, 0x12, 0x34],
+        ] {
+            assert_eq!(secret_integer(v).as_slice(), encode_integer(v).as_slice());
+        }
+        for len in [0usize, 1, 127, 128, 255, 256, 65535, 65536, 70000] {
+            let content = alloc::vec![0xa5u8; len];
+            assert_eq!(
+                secret_tlv(crate::der::tag::OCTET_STRING, &content).as_slice(),
+                encode_octet_string(&content).as_slice()
+            );
+        }
+        assert_eq!(
+            secret_concat(&[&[1, 2], &[], &[3]]).as_slice(),
+            &[1, 2, 3][..]
+        );
+    }
 
     #[test]
     fn public_key_der_pem_roundtrip() {
