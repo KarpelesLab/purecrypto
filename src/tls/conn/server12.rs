@@ -1110,8 +1110,22 @@ impl<R: RngCore> ServerConnection12<R> {
     }
 
     /// Processes all buffered records, advancing the handshake.
+    ///
+    /// Once the peer's `close_notify` has been processed, everything received
+    /// after it — records coalesced behind the alert or fed later — is
+    /// discarded unread (RFC 5246 §7.2.1 ends the read side; RFC 8446 §6.1
+    /// spells out "MUST be ignored", which the TLS 1.3 engines already do)
+    /// rather than failing the cleanly closed connection with a fatal alert.
     pub fn process_new_packets(&mut self) -> Result<(), Error> {
+        if self.received_close_notify {
+            self.discard_input();
+            return Ok(());
+        }
         let r = self.process_buffered_records();
+        if self.received_close_notify {
+            self.discard_input();
+            return r;
+        }
         // One compaction per call (see `in_off`), on both the success and
         // the error path.
         if self.in_off != 0 {
@@ -1119,6 +1133,14 @@ impl<R: RngCore> ServerConnection12<R> {
             self.in_off = 0;
         }
         r
+    }
+
+    /// Drops every received byte not yet handed to the state machine (see
+    /// [`Self::process_new_packets`]).
+    fn discard_input(&mut self) {
+        self.inbuf.clear();
+        self.in_off = 0;
+        self.hs_pending.clear();
     }
 
     /// Drains every complete buffered record, advancing the state machine.

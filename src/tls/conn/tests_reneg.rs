@@ -455,3 +455,45 @@ fn stalled_renegotiation_bounds_the_send_queue() {
     pump_ok(&mut client, &mut server);
     assert_eq!(client.take_received_plaintext().len(), chunk.len());
 }
+
+/// RFC 5246 §7.2.1 / RFC 8446 §6.1 parity: bytes after the peer's
+/// `close_notify` — coalesced behind it or fed later — are ignored, in both
+/// roles, instead of failing the cleanly closed connection with a fatal
+/// alert.
+#[test]
+fn input_after_close_notify_is_ignored() {
+    // An application_data record no key could open.
+    let junk: &[u8] = &[23, 3, 3, 0, 5, 1, 2, 3, 4, 5];
+
+    let (mut client, mut server) = connected_pair();
+    client.send_close_notify();
+    let mut wire = client.write_tls();
+    wire.extend_from_slice(junk);
+    server.read_tls(&wire);
+    server.process_new_packets().unwrap();
+    assert!(server.received_close_notify());
+    server.process_new_packets().unwrap();
+    server.read_tls(junk);
+    server.process_new_packets().unwrap();
+    assert!(
+        server.write_tls().is_empty(),
+        "no fatal alert after a clean close"
+    );
+    // Our own close_notify still goes out.
+    server.send_close_notify();
+    assert!(!server.write_tls().is_empty());
+
+    let (mut client, mut server) = connected_pair();
+    server.send_close_notify();
+    let mut wire = server.write_tls();
+    wire.extend_from_slice(junk);
+    client.read_tls(&wire);
+    client.process_new_packets().unwrap();
+    assert!(client.received_close_notify());
+    client.read_tls(junk);
+    client.process_new_packets().unwrap();
+    assert!(
+        client.write_tls().is_empty(),
+        "no fatal alert after a clean close"
+    );
+}
