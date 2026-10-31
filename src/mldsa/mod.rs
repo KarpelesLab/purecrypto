@@ -59,6 +59,13 @@ pub enum Error {
     /// returning this error keeps subsequent `sign` calls from panicking on
     /// an attacker-supplied byte string.
     InvalidCoefficient,
+    /// Signing gave up because the rejection loop exhausted the 16-bit
+    /// `ExpandMask` nonce space (FIPS 204 Algorithm 7, `κ`) without finding
+    /// a valid candidate. With honest parameters each attempt is accepted
+    /// with probability ≳ 1/5, so reaching the ~13k-16k attempts this needs
+    /// is cryptographically negligible; the bound exists so `κ` can never
+    /// wrap and reuse mask vectors.
+    SigningFailed,
 }
 
 /// Per-level ML-DSA parameters.
@@ -472,16 +479,31 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
     wipe_polys(&mut t0);
 }
 
+/// Advances the `ExpandMask` nonce base `κ` by `l` for the next rejection
+/// attempt, returning `None` once any nonce `κ + i` (`i < l`) of that attempt
+/// would exceed `u16::MAX` (FIPS 204 encodes `κ + i` in two bytes).
+fn next_kappa(kappa: u16, l: usize) -> Option<u16> {
+    let l = u16::try_from(l).ok()?;
+    let k = kappa.checked_add(l)?;
+    k.checked_add(l.checked_sub(1)?)?;
+    Some(k)
+}
+
 /// ML-DSA.Sign_internal (FIPS 204 Algorithm 7). `m_prime` is the already-formed
 /// message representative; `rnd` is the per-signature randomness (zero for the
 /// deterministic variant).
+///
+/// Returns [`Error::SigningFailed`] (with `sig_out` left untouched) if the
+/// rejection loop would need a mask nonce `κ + i` beyond `u16::MAX`: wrapping
+/// would replay the masks of already-rejected attempts (same `μ`, same `y`,
+/// same verdict), so the loop would never terminate.
 pub(crate) fn sign_internal<const K: usize, const L: usize>(
     sk: &[u8],
     rnd: &[u8; 32],
     m_prime: &[&[u8]],
     p: &Params,
     sig_out: &mut [u8],
-) {
+) -> Result<(), Error> {
     let rho = &sk[..32];
     let key = &sk[32..64];
     let tr = &sk[64..128];
@@ -535,6 +557,7 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     let mut z = [Poly::zero(); L];
     let mut r0 = [[0i32; N]; K];
     let mut ct0 = [Poly::zero(); K];
+    let mut result = Ok(());
     loop {
         // Masking vector y (four SHAKE256 streams per 4-way Keccak
         // permutation when the AVX2 kernel is available).
@@ -611,7 +634,13 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         // The reject decision is public (only the attempt count is
         // observable; docs/validation.md).
         if crate::ct::declassify_value(z_bad | r0_bad) {
-            kappa += L as u16;
+            match next_kappa(kappa, L) {
+                Some(k) => kappa = k,
+                None => {
+                    result = Err(Error::SigningFailed);
+                    break;
+                }
+            }
             continue;
         }
 
@@ -634,7 +663,13 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         let hint_bad = count_ones(&hints) > p.omega;
         // As above: the reject decision is public.
         if crate::ct::declassify_value(ct0_bad | hint_bad) {
-            kappa += L as u16;
+            match next_kappa(kappa, L) {
+                Some(k) => kappa = k,
+                None => {
+                    result = Err(Error::SigningFailed);
+                    break;
+                }
+            }
             continue;
         }
 
@@ -676,6 +711,7 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     for row in r0.iter_mut() {
         Zeroize::zeroize(row);
     }
+    result
 }
 
 /// ML-DSA.Verify_internal (FIPS 204 Algorithm 8), with `tr = H(pk, 64)`
@@ -941,11 +977,11 @@ macro_rules! ml_dsa_level {
                 rng.fill_bytes(&mut rnd);
                 let mut sig = [0u8; $params.sig];
                 let mut pfx = [0u8; 2];
-                sign_internal::<$k, $l>(&self.0, &rnd, &m_prime_parts(&mut pfx, ctx, msg), &$params, &mut sig);
+                let res = sign_internal::<$k, $l>(&self.0, &rnd, &m_prime_parts(&mut pfx, ctx, msg), &$params, &mut sig);
                 // `rnd` feeds ρ'' = H(K ‖ rnd ‖ μ) and is not part of the
                 // signature: wipe it rather than leave it on the stack.
                 Zeroize::zeroize(&mut rnd);
-                Ok(sig)
+                res.map(|()| sig)
             }
 
             /// Signs `msg` deterministically (zero randomness).
@@ -955,7 +991,7 @@ macro_rules! ml_dsa_level {
                 }
                 let mut sig = [0u8; $params.sig];
                 let mut pfx = [0u8; 2];
-                sign_internal::<$k, $l>(&self.0, &[0u8; 32], &m_prime_parts(&mut pfx, ctx, msg), &$params, &mut sig);
+                sign_internal::<$k, $l>(&self.0, &[0u8; 32], &m_prime_parts(&mut pfx, ctx, msg), &$params, &mut sig)?;
                 Ok(sig)
             }
 
@@ -1331,7 +1367,7 @@ mod tests {
                     let msg = unhex(it.next().unwrap());
                     let sig_exp = unhex(it.next().unwrap());
                     let mut sig = alloc::vec![0u8; $params.sig];
-                    sign_internal::<$k, $l>(&sk, &rnd, &[&msg[..]], &$params, &mut sig);
+                    sign_internal::<$k, $l>(&sk, &rnd, &[&msg[..]], &$params, &mut sig).unwrap();
                     assert_eq!(sig, sig_exp, "signature");
                 }
             }
@@ -1417,7 +1453,8 @@ mod tests {
                         &m_prime_parts(&mut pfx, &ctx, &msg),
                         &$params,
                         &mut sig,
-                    );
+                    )
+                    .unwrap();
                     assert_eq!(sig, sig_exp, "hedged external signature");
                     // The public external verifier accepts it under exactly
                     // this (msg, ctx), with the public key derived from sk.
@@ -1570,6 +1607,31 @@ mod tests {
             assert!(!pk.verify(&theirs, msg, b"other"), "context is bound");
             let ours = sk.sign_deterministic(msg, ctx).unwrap();
             assert_eq!(&ours[..], &theirs[..], "deterministic signature bytes");
+        }
+    }
+
+    /// The rejection-loop nonce never wraps: the last attempt whose nonces
+    /// `κ..κ+L-1` all fit in a `u16` is allowed, the one after is refused
+    /// (previously `kappa += L` panicked in debug / wrapped in release).
+    #[test]
+    fn next_kappa_stops_before_u16_wrap() {
+        for l in [4usize, 5, 7] {
+            let l16 = l as u16;
+            assert_eq!(next_kappa(0, l), Some(l16));
+            // Last valid base: κ + l - 1 == u16::MAX.
+            let last = u16::MAX - (l16 - 1);
+            assert_eq!(next_kappa(last - l16, l), Some(last));
+            assert_eq!(next_kappa(last, l), None);
+            assert_eq!(next_kappa(last - l16 + 1, l), None);
+            assert_eq!(next_kappa(u16::MAX, l), None);
+            // Walking from 0 terminates without wrapping.
+            let (mut k, mut steps) = (0u16, 0u32);
+            while let Some(n) = next_kappa(k, l) {
+                assert!(n > k);
+                k = n;
+                steps += 1;
+            }
+            assert_eq!(steps, (u16::MAX as u32 + 1) / l as u32 - 1);
         }
     }
 
