@@ -7,6 +7,145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4](https://github.com/KarpelesLab/purecrypto/compare/v0.10.3...v0.10.4) - 2026-10-31
+
+### Added
+
+- *(ffi)* C API for TLS 1.2 renegotiation
+- *(tls)* TLS 1.2 secure renegotiation (RFC 5746)
+- *(x509,tls)* sub-1024-bit RSA certificate keys behind an explicit policy opt-in
+- *(hash)* exportable state for the legacy-hashes digests
+- *(tls)* matching alerts for rejected certificates, verifier hook, abort API
+- *(tls)* server cipher-suite restriction everywhere, optional client order
+- *(tls)* ConfigBuilder::min_rsa_key_bits per-Config RSA floor override
+- *(tls)* ConfigBuilder::os_rng() as the std opt-in entropy source
+- *(hash)* exportable hasher state, BLAKE2 salt/personal, raw compression
+- *(cpu)* no_std run-time CPU feature detection for every hardware backend
+- *(x509)* binary-curve keys and ECDSA certificates
+- *(ec)* every OpenSSL binary curve, with ECDSA and key encodings
+- *(pkcs12)* parse the RC2-CBC PBEs with legacy-ciphers
+- *(cipher)* Blowfish, CAST5, IDEA and RC2 behind legacy-ciphers
+- *(ec)* private-scalar getters for the boxed ECDSA/ECDH keys and P-256 ECDH
+- *(rsa)* opt-in *_insecure constructors and parsers for sub-1024-bit keys
+- *(kw)* custom IV / AIV prefix and inverse-cipher (WRAP-INV) variants
+- *(xts)* GB/T 17964 tweak rule (OpenSSL xts_standard=GB), Sm4Xts
+- *(gcm-siv)* AES-192 key-generating keys, as OpenSSL's aes-192-gcm-siv
+- *(gcm)* truncated 4..=16-byte tags via try_{en,de}crypt_truncated
+- *(hash)* name the legacy-hashes digests in HashAlgorithm
+- *(hash)* legacy-hashes feature with PHP ext/hash's remaining digests
+- *(cipher)* public Salsa20, HSalsa20, XSalsa20 and NaCl secretbox
+- *(cipher)* original ChaCha20, XChaCha20 stream, no-panic counter handling
+- *(edwards25519)* hazmat field elements, coordinates and vartime double-scalar mul
+- *(ed25519)* libsodium key format, verification mode and X25519 conversion
+
+### Fixed
+
+- *(zkp)* make the rangeproof message fill branch-free per byte
+- *(zkp)* wipe rangeproof prover/rewind secrets on every return path
+- *(zkp)* stop leaving secret digests on the stack in nonce derivation
+- *(curve25519)* wipe the final vector state of the IFMA X25519 ladder
+- *(curve25519,curve448)* wipe scalar_muladd and Barrett intermediates
+- *(curve448)* wipe the recoded scalar digits and gathered entries
+- *(tls)* ignore TLS 1.2 input after the peer's close_notify
+- *(fuzz)* give the TLS/DTLS feed targets an entropy source
+- *(tls)* use the per-architecture O_NOFOLLOW value for the keylog file
+- *(tls)* skip the TLS 1.3 NewSessionTicket when the sealed ticket overflows
+- *(tls)* bound TLS 1.2 session tickets and make the ClientHello fallible
+- *(tls)* bound the TLS 1.2 send queue during renegotiation
+- *(quic)* seed the server's preferred-address CID at sequence 1
+- *(quic)* saturate u64 flow-control credit when narrowing to usize
+- *(quic)* route CIDs issued on transmit; gate by_addr on validation
+- *(quic)* keep the AEAD integrity-failure count across key updates
+- *(quic)* rotate off a retired DCID once its replacement is added
+- *(quic)* discard a Version Negotiation packet listing our version
+- *(quic)* drop malformed unauthenticated datagrams silently
+- *(dsa)* reserve the RFC 6979 candidate buffer at its final size
+- *(dsa)* cap non-standard p at 4096 bits
+- *(bignum)* stop leaking resized operand copies of secrets to the allocator
+- *(rsa)* keep RsaPrivateKey::generate's |p − q| check branch-free
+- *(rsa)* reject fixed-width keys whose CRT relation cannot be evaluated
+- *(rsa)* wipe private-key DER/PEM intermediates on export and import
+- *(rsa)* bound private-key component sizes before multiplying primes
+- *(mldsa)* document and debug-assert the hazmat NTT input range
+- *(mldsa)* bound the rejection-loop nonce instead of overflowing u16
+- *(pqc)* wipe hedged-signing randomness after ML-DSA / SLH-DSA sign
+- *(pqc)* strict DER in ML-DSA / SLH-DSA / ML-KEM SPKI and PKCS#8 parsers
+- *(dtls)* verify the DTLS 1.3 PSK binder before committing CH state
+- *(dtls)* require pre_shared_key to be the last DTLS 1.3 CH extension
+- *(dtls)* refuse tls_exporter before the handshake completes
+- *(dtls)* commit DTLS 1.2 ServerHello state only after every check
+- *(kdf)* pbkdf2 no longer panics after the last legal block
+- *(kdf)* argon2 returns OutOfMemory instead of aborting
+- *(xts)* wipe CTS plaintext locals in decrypt_sector
+- *(umac)* reject bad nonce lengths in verify instead of panicking
+- *(kw)* wipe local working blocks holding unwrapped key bytes
+- *(tls/pki)* ignore a trailing dot in rfc822Name / URI name-constraint hosts
+- *(pkcs12)* reject trailing bytes in the MAC's DigestInfo and MacData
+- *(tls/pki)* normalize directoryName name-constraint comparison
+- *(tls/pki)* a re-minted pin must not claim more names or EKUs than the anchor
+- *(ec)* wipe the binary-curve ladder's last-bit flag; zeroize for ct::Choice
+- *(jose)* let a JWK with "alg":"dir" be used for dir JWEs
+- *(jose)* make PBES2 opt-in like RSA1_5
+- *(jose)* bound RSA private JWK members and screen JWE epk before parsing
+- *(ec)* wipe secret temporaries in binary-curve encoding/ladder and boxed ECDH
+- *(ec)* bound the r-candidate walk in ECDSA/SM2 verify on custom curves
+- *(cli)* show emailAddress in rendered distinguished names
+- *(cli)* escape control characters in pkcs12 -info labels
+- *(cli)* wipe transient plaintext private-key copies
+- *(cli)* wipe secret buffers through the library's zeroize
+- *(cli)* treat single-label CSR commonNames as host identifiers
+- *(curve25519)* keep the comb table scan branch-free (Valgrind CT failure)
+- *(hash)* let the legacy-hashes digests report no exportable state
+- *(kdf)* scrypt returns OutOfMemory instead of aborting
+- *(tls)* default TLS 1.3 server sends HelloRetryRequest for a missing share
+
+### Other
+
+- *(rsa)* gate the oversized-component timing check on std
+- *(bls)* warn that PoP aggregate_verify needs pop_verify'd keys
+- *(dtls)* pin that an oversized cached DTLS 1.2 ticket is never offered
+- *(scrypt)* make the OutOfMemory test pass on 32-bit targets
+- *(blake3)* SIMD extended output (long XOF reads ~9.4x)
+- *(blake3)* 128-chunk batches on SIMD targets, 8 elsewhere
+- *(blake3)* AVX-512VL rotations in the 8-lane kernel (4 KiB +30%)
+- *(blake3)* SIMD parent nodes, subtree batching, lazy merges (~1.5-5x)
+- report which SIMD tiers the Linux runner exercised
+- fix intra-doc links the lean per-feature builds can't resolve
+- *(curve25519)* 4-way AVX-512 IFMA edwards25519 point arithmetic
+- *(x25519)* 4-way AVX-512 IFMA Montgomery ladder
+- *(curve25519)* lazy reductions, cached/completed point forms, faster squaring
+- gate the aes_modes example on cipher + std
+- *(benchmarks)* RSA numbers on AVX-512 IFMA vs OpenSSL
+- *(bignum)* use the shared cpu::avx512ifma probe for the IFMA backend
+- *(rsa)* cached blinding pair and paired CRT exponentiations
+- *(bignum)* AVX-512 IFMA backend for the runtime-width exponentiations
+- *(tls)* don't link RenegotiationPolicy to the private reneg module
+- *(benchmarks)* AES-GCM/CTR/CBC numbers on VAES/AVX-512 vs OpenSSL
+- *(sde)* list the VAES/VPCLMULQDQ AES and GHASH kernels
+- *(gcm)* keep the stitched loop round-major and the AES state in registers
+- *(aes,gcm)* width-generic AES-NI/VAES/VPCLMULQDQ kernels for ECB, CTR, CBC and GCM
+- *(bench)* P-256 numbers after the performance pass, next to OpenSSL
+- *(p256)* product-form Z3 and one-pass small multiples in the Jacobian formulas
+- *(p256)* 5-bit fixed-base comb, width-6 wNAF for G, cheaper field add
+- *(p256)* Jacobian constant-time ladders, register-only mask barrier
+- *(benchmarks)* ChaCha20/Poly1305 AVX-512 numbers vs OpenSSL
+- *(chacha20poly1305)* stitch IFMA Poly1305 into the AVX-512 rounds
+- *(poly1305)* AVX-512 IFMA kernel, 4x8 lanes in radix 2^44
+- *(chacha20)* transpose AVX-512/AVX2 keystream in registers
+- *(sha512)* vectorised two-block schedule with BMI2 rounds on x86_64
+- *(tls)* renegotiation interop example against OpenSSL
+- *(argon2)* AVX2/AVX-512 G, prefetch, huge pages, threaded lanes
+- run the test profile at opt-level 2
+- fix lean-feature and Windows CI breakage from the gap-issue merges
+- *(whirlpool)* eight round tables and a SWAR table-free fallback
+- *(md5)* take message word and constant off the round's dependency chain
+- restore the #89 cipher/RSA capability notes lost in merge
+- *(cipher)* surface the AES-192-GCM-SIV and XTS IV notes on public items
+- list the legacy-hashes feature and its vector sources
+- *(ct)* cover the Salsa20 family and ChaCha20 stream variants
+- *(cipher)* move the ChaCha20 variant table onto the public type
+- *(ffi)* give the TLS smoke server the client's group list
+
 ## [0.10.3](https://github.com/KarpelesLab/purecrypto/compare/v0.10.2...v0.10.3) - 2026-10-23
 
 ### Added
