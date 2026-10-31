@@ -298,7 +298,9 @@ impl<D: Digest> Rfc6979<D> {
                 self.step();
             }
             self.started = true;
-            let mut t = Vec::with_capacity(self.qlen);
+            // Reserve the final size up front: growing `t` would move the
+            // nonce bytes to a new buffer and free the old one unwiped.
+            let mut t = Vec::with_capacity(self.qlen + self.v.as_ref().len());
             while t.len() < self.qlen {
                 self.v = Hmac::<D>::mac(self.k.as_ref(), self.v.as_ref());
                 t.extend_from_slice(self.v.as_ref());
