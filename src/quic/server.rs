@@ -530,18 +530,28 @@ impl QuicServer {
         if let Some(p) = self.pending.pop_front() {
             return Some(p);
         }
-        for h in self.conns.values_mut() {
+        let mut out = None;
+        for (&id, h) in self.conns.iter_mut() {
             // RFC 9000 §8.2.2 — a PATH_RESPONSE for a path the peer is only
             // probing goes to that address, not the connection's current one.
             if let Some((to, dg)) = h.conn.pop_offpath_datagram() {
-                return Some((to, h.conn.egress_ecn(), dg));
+                out = Some((id, (to, h.conn.egress_ecn(), dg)));
+                break;
             }
             let dg = h.conn.pop_datagram();
             if !dg.is_empty() {
-                return Some((h.addr, h.conn.egress_ecn(), dg));
+                out = Some((id, (h.addr, h.conn.egress_ecn(), dg)));
+                break;
             }
         }
-        None
+        let (id, datagram) = out?;
+        // Building a datagram may mint fresh local CIDs (NEW_CONNECTION_ID,
+        // RFC 9000 §5.1.1). Route them *before* the datagram announcing them
+        // leaves: otherwise a peer that switches to a just-issued CID (e.g.
+        // when migrating, §9.5) lands on an unknown DCID and draws a valid
+        // stateless reset for its own connection.
+        self.refresh_cid_routes(id);
+        Some(datagram)
     }
 
     /// The earliest pending timer across all hosted connections, as a duration
@@ -603,7 +613,7 @@ impl QuicServer {
     }
 
     fn feed(&mut self, id: u64, from: SocketAddr, ecn: EcnCodepoint, datagram: &[u8]) {
-        let (cids, prev_cids, initial_cids, prev_initial) = match self.conns.get_mut(&id) {
+        let (initial_cids, prev_initial) = match self.conns.get_mut(&id) {
             Some(h) => {
                 // Per-packet decode/auth errors are non-fatal: drop the bad
                 // packet, keep the connection (RFC 9000 §5.2). A *fatal*
@@ -623,22 +633,29 @@ impl QuicServer {
                 // output with a single spoofed datagram, valid or not.
                 let addr = h.conn.peer_address().unwrap_or(from);
                 if addr != h.addr {
-                    self.by_addr.remove(&h.addr);
+                    if self.by_addr.get(&h.addr) == Some(&id) {
+                        self.by_addr.remove(&h.addr);
+                    }
                     h.addr = addr;
                 }
-                let cids = h.conn.local_cids();
-                let prev = core::mem::replace(&mut h.cids, cids.clone());
                 // Pre-handshake routing keys: the client's own first-Initial
                 // DCID, plus the Retry SCID when one was issued. They drop
                 // out once the handshake completes (M-3).
                 let initial_cids = h.conn.pre_handshake_cids();
                 let prev_initial = core::mem::replace(&mut h.initial_cids, initial_cids.clone());
-                (cids, prev, initial_cids, prev_initial)
+                (initial_cids, prev_initial)
             }
             None => return,
         };
         let addr = self.conns[&id].addr;
-        self.by_addr.insert(addr, id);
+        // The address fallback is only claimed by a connection whose peer
+        // has proven it receives at that address (RFC 9000 §8.1). Every
+        // unrecognised ≥1200-byte Initial creates a connection, so claiming
+        // it on arrival let one spoofed junk Initial from an established
+        // client's address take that address's routing away from it.
+        if self.conns[&id].conn.is_address_validated() {
+            self.by_addr.insert(addr, id);
+        }
         for old in prev_initial {
             if !initial_cids.contains(&old) {
                 self.by_initial.retain(|(_, c), v| *v != id || *c != old);
@@ -647,17 +664,30 @@ impl QuicServer {
         for cid in initial_cids {
             self.by_initial.insert((addr, cid), id);
         }
+        self.refresh_cid_routes(id);
+    }
+
+    /// Re-syncs `by_cid` with the local CIDs connection `id` currently
+    /// answers to (its SCID after the first Initial, plus any issued via
+    /// NEW_CONNECTION_ID), dropping the ones it no longer does.
+    fn refresh_cid_routes(&mut self, id: u64) {
+        let Some(h) = self.conns.get_mut(&id) else {
+            return;
+        };
+        let cids = h.conn.local_cids();
+        if cids == h.cids {
+            return;
+        }
+        let prev_cids = core::mem::replace(&mut h.cids, cids.clone());
         // M-5: forget the CIDs this connection has stopped answering to. A
         // peer that spams RETIRE_CONNECTION_ID makes us mint a replacement
         // each time; inserting cumulatively left every superseded CID in the
         // routing table for the life of the process.
         for old in prev_cids {
-            if !cids.contains(&old) {
+            if !cids.contains(&old) && self.by_cid.get(&old) == Some(&id) {
                 self.by_cid.remove(&old);
             }
         }
-        // Learn any CIDs this connection now answers to (its SCID after the
-        // first Initial, plus any issued via NEW_CONNECTION_ID).
         for cid in cids {
             self.by_cid.insert(cid, id);
         }
@@ -709,7 +739,6 @@ impl QuicServer {
                 initial_cids: Vec::new(),
             },
         );
-        self.by_addr.insert(from, id);
         self.feed(id, from, ecn, datagram);
         Ok(())
     }
@@ -1261,6 +1290,109 @@ mod server_tests {
             srv.by_cid.len(),
             before - 1,
             "the retired CID must be dropped from the routing table"
+        );
+    }
+
+    /// Drives `c` ↔ `srv` (client at `ca`) until both sides finish the
+    /// handshake and nothing is left to send.
+    fn drive_router(srv: &mut QuicServer, c: &mut QuicConnection, ca: SocketAddr) {
+        let sa = addr(443);
+        for _ in 0..64 {
+            c.expire_ack_delay();
+            let mut moved = false;
+            loop {
+                let d = c.pop_datagram();
+                if d.is_empty() {
+                    break;
+                }
+                moved = true;
+                srv.recv(ca, EcnCodepoint::NotEct, &d).unwrap();
+            }
+            while let Some((_, _, d)) = srv.poll_transmit() {
+                moved = true;
+                c.feed_datagram_from(sa, &d).unwrap();
+            }
+            if !moved && c.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete(), "handshake must complete");
+    }
+
+    /// RFC 9000 §5.1.1 / §9.5 — a CID minted while building an outbound
+    /// datagram (NEW_CONNECTION_ID replacing one the peer retired) must be
+    /// routable as soon as that datagram leaves. `by_cid` used to be refreshed
+    /// only on inbound datagrams, so a client that switched onto the
+    /// just-issued CID from a new address matched no route and drew a valid
+    /// stateless reset that killed its own connection.
+    #[test]
+    fn cids_issued_on_transmit_are_routed_immediately() {
+        let (_, cert) = server_identity();
+        let mut srv = server([0x35; 32]);
+        let mut c = client(&cert);
+        let (ca, a_new, sa) = (addr(41300), addr(41301), addr(443));
+        drive_router(&mut srv, &mut c, ca);
+
+        // The client retires the CID in use (RETIRE_CONNECTION_ID); the server
+        // mints a replacement while building its reply.
+        c.switch_connection_id().expect("a spare CID");
+        let d = c.pop_datagram();
+        assert!(!d.is_empty());
+        srv.recv(ca, EcnCodepoint::NotEct, &d).unwrap();
+        while let Some((_, _, d)) = srv.poll_transmit() {
+            c.feed_datagram_from(sa, &d).unwrap();
+        }
+        let (_, conn) = srv.connections_mut().next().expect("hosted");
+        let local = conn.local_cids();
+        for cid in &local {
+            assert!(
+                srv.by_cid.contains_key(cid),
+                "every CID the connection answers to is routed"
+            );
+        }
+
+        // The client moves onto the freshly issued CID, from a new address.
+        c.switch_connection_id().expect("the replacement CID");
+        let sid = c.open_bidi().unwrap();
+        c.write(sid, b"moved").unwrap();
+        let d = c.pop_datagram();
+        assert!(!d.is_empty());
+        srv.recv(a_new, EcnCodepoint::NotEct, &d).unwrap();
+        assert!(
+            srv.pending.is_empty(),
+            "no stateless reset for a CID we issued"
+        );
+        let mut buf = [0u8; 16];
+        let (_, conn) = srv.connections_mut().next().expect("hosted");
+        let (n, _) = conn.read(sid, &mut buf).expect("delivered");
+        assert_eq!(&buf[..n], b"moved");
+    }
+
+    /// A spoofed junk Initial claiming an established client's source address
+    /// creates a (half-open) connection — it must not take over that
+    /// address's `by_addr` fallback route from the established connection.
+    #[test]
+    fn junk_initial_does_not_steal_the_address_route() {
+        let (_, cert) = server_identity();
+        let mut srv = server([0x36; 32]);
+        let mut c = client(&cert);
+        let ca = addr(41400);
+        drive_router(&mut srv, &mut c, ca);
+        let owner = *srv.by_addr.get(&ca).expect("validated peer is routed");
+
+        let mut junk = alloc::vec![0xC0u8, 0x00, 0x00, 0x00, 0x01, 8];
+        junk.extend_from_slice(&[0xAB; 8]);
+        junk.push(8);
+        junk.extend_from_slice(&[0xCD; 8]);
+        junk.push(0x00); // token length
+        junk.extend_from_slice(&[0x44, 0xB0]); // Length = 1200
+        junk.resize(1200 + 32, 0x5A);
+        srv.recv(ca, EcnCodepoint::NotEct, &junk).unwrap();
+        assert_eq!(srv.conns.len(), 2, "the junk Initial was accepted");
+        assert_eq!(
+            srv.by_addr.get(&ca),
+            Some(&owner),
+            "the address route stays with the validated connection"
         );
     }
 
