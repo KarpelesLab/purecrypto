@@ -794,3 +794,34 @@ fn mac_kdf_is_charged_against_the_budget() {
     );
     assert_eq!(run(4048).expect("exact fit"), 1);
 }
+
+/// Trailing bytes inside the MAC's `DigestInfo` or `MacData` SEQUENCE are
+/// malformed, not silently ignored.
+#[test]
+fn mac_data_trailing_bytes_rejected() {
+    let content = b"authenticated safe";
+    let password = "hunter2";
+    let pw_bmp = password_to_bmp(password);
+    let salt = [0x55u8; 8];
+    let iterations = 3u32;
+    let verify = |mac: &[u8]| verify_mac(mac, content, password, &pw_bmp, &mut Budget::new());
+    let good = build_mac_data(content, &pw_bmp, &salt, iterations);
+    assert_eq!(verify(&good), Ok(()));
+
+    let tag = sha_based_hmac(PkcsHash::Sha256, &pw_bmp, &salt, iterations, content);
+    let alg = encode_sequence(&[oid_tlv(OID_SHA256), crate::der::encode_null()].concat());
+    let salt_os = encode_octet_string(&salt);
+    let iter = encode_integer(&iterations.to_be_bytes());
+    let extra = crate::der::encode_null();
+
+    // Extra element after the digest inside DigestInfo.
+    let di_trailing =
+        encode_sequence(&[alg.clone(), encode_octet_string(&tag), extra.clone()].concat());
+    let mac = encode_sequence(&[di_trailing, salt_os.clone(), iter.clone()].concat());
+    assert_eq!(verify(&mac), Err(Error::Malformed));
+
+    // Extra element after the iteration count inside MacData.
+    let di = encode_sequence(&[alg, encode_octet_string(&tag)].concat());
+    let mac = encode_sequence(&[di, salt_os, iter, extra].concat());
+    assert_eq!(verify(&mac), Err(Error::Malformed));
+}

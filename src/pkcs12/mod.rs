@@ -938,7 +938,7 @@ fn verify_mac(
     let mut alg = di.read_sequence()?;
     let alg_oid = parse_oid(alg.read_oid()?)?;
     let expected = di.read_octet_string()?.to_vec();
-    di.finish().ok();
+    di.finish()?;
 
     let salt = md.read_octet_string()?.to_vec();
     let iterations = if md.peek_tag().is_some() {
@@ -946,7 +946,7 @@ fn verify_mac(
     } else {
         1
     };
-    md.finish().ok();
+    md.finish()?;
     // The MAC iteration count is attacker-controlled; cap it so a crafted
     // MacData can't demand billions of hash iterations before the (failing)
     // comparison (a decryption-as-DoS vector). `DEFAULT 1` means 0 is
