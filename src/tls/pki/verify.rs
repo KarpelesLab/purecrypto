@@ -1301,10 +1301,13 @@ fn ip_in_subtree(host: &[u8], addr: &[u8], mask: &[u8]) -> bool {
 ///   "a.example.com", "a.b.example.com" — but NOT "example.com" itself.
 ///
 /// Unlike dNSName subtrees, a host-form constraint without a leading dot
-/// names one host, not a domain. Case-insensitive (RFC 4343 §2).
+/// names one host, not a domain. Case-insensitive (RFC 4343 §2). A single
+/// trailing dot (the fully-qualified form) is stripped from both sides first
+/// ([`strip_trailing_dot`]), so `a@victim.example.` cannot escape an
+/// excluded `victim.example`.
 fn host_in_subtree(host: &str, base: &str) -> bool {
-    let host_l = host.to_ascii_lowercase();
-    let base_l = base.to_ascii_lowercase();
+    let host_l = strip_trailing_dot(host).to_ascii_lowercase();
+    let base_l = strip_trailing_dot(base).to_ascii_lowercase();
     if base_l.starts_with('.') {
         host_l.len() > base_l.len() && host_l.ends_with(&base_l)
     } else {
@@ -1316,7 +1319,8 @@ fn host_in_subtree(host: &str, base: &str) -> bool {
 /// `base` per RFC 5280 §4.2.1.10. `base` is either a full mailbox
 /// (`user@example.com`: exact match, the domain part compared
 /// case-insensitively and the local part verbatim, as RFC 5321 §2.4 leaves
-/// local-part case to the receiving host) or a host / leading-dot domain
+/// local-part case to the receiving host; a single trailing dot on either
+/// domain is ignored) or a host / leading-dot domain
 /// applied to the mailbox's domain part ([`host_in_subtree`]). A name
 /// without an `@` has no domain part and matches no subtree.
 fn email_in_subtree(mailbox: &str, base: &str) -> bool {
@@ -1325,7 +1329,8 @@ fn email_in_subtree(mailbox: &str, base: &str) -> bool {
     };
     match base.rsplit_once('@') {
         Some((base_local, base_domain)) => {
-            local == base_local && domain.eq_ignore_ascii_case(base_domain)
+            local == base_local
+                && strip_trailing_dot(domain).eq_ignore_ascii_case(strip_trailing_dot(base_domain))
         }
         None => host_in_subtree(domain, base),
     }
@@ -6063,6 +6068,11 @@ mod tests {
         assert!(!super::host_in_subtree("notexample.com", ".example.com"));
         assert!(!super::host_in_subtree("", ".example.com"));
         assert!(!super::host_in_subtree("example.com", ""));
+        // A single trailing dot on either side is the same host.
+        assert!(super::host_in_subtree("example.com.", "example.com"));
+        assert!(super::host_in_subtree("example.com", "example.com."));
+        assert!(super::host_in_subtree("a.example.com.", ".example.com"));
+        assert!(!super::host_in_subtree("example.com.", ".example.com"));
     }
 
     #[test]
@@ -6080,6 +6090,56 @@ mod tests {
             "example.com"
         ));
         assert!(!super::email_in_subtree("a@b@evil.example", "b"));
+        // A trailing dot on the domain part does not escape a subtree; the
+        // local part stays case-sensitive.
+        assert!(super::email_in_subtree(
+            "a@victim.example.",
+            "victim.example"
+        ));
+        assert!(super::email_in_subtree(
+            "a@x.victim.example.",
+            ".victim.example"
+        ));
+        assert!(super::email_in_subtree(
+            "a@Victim.Example.",
+            "a@victim.example"
+        ));
+        assert!(super::email_in_subtree(
+            "a@victim.example",
+            "a@victim.example."
+        ));
+        assert!(!super::email_in_subtree(
+            "A@victim.example.",
+            "a@victim.example"
+        ));
+        assert!(super::uri_in_subtree(
+            "https://victim.example./x",
+            "victim.example"
+        ));
+        assert!(super::uri_in_subtree(
+            "https://a.victim.example.:443/",
+            ".victim.example"
+        ));
+    }
+
+    /// Regression: an rfc822Name / URI whose host carries a trailing dot
+    /// used to slip past an excluded host subtree.
+    #[test]
+    fn nc_trailing_dot_email_and_uri_cannot_escape_excluded_subtree() {
+        use crate::x509::GeneralName::{Email, Uri};
+        let cn = DistinguishedName::common_name("mail");
+        let nc = || nc_ext(&[], &[Email("victim.example".into())], true);
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Email("a@victim.example.".into())]),
+            Err(Error::BadCertificate)
+        ));
+        leaf_under(nc(), &cn, &[Email("a@other.example.".into())]).unwrap();
+        let nc = || nc_ext(&[], &[Uri("victim.example".into())], true);
+        assert!(matches!(
+            leaf_under(nc(), &cn, &[Uri("https://victim.example./".into())]),
+            Err(Error::BadCertificate)
+        ));
+        leaf_under(nc(), &cn, &[Uri("https://other.example./".into())]).unwrap();
     }
 
     #[test]
