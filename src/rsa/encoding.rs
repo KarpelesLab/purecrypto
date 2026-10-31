@@ -228,10 +228,12 @@ fn validate_private_components<const LIMBS: usize>(
 /// signatures whose halves can reveal a factor of `n`.
 ///
 /// The products are computed with `mul_wide`; if the high half is non-zero
-/// the operands are too wide for the fixed-width reduction to check (only
-/// possible for a pathological key whose "prime" is nearly the width of `n`,
-/// which `validate_private_components` has already tied to `p · q = n`), and
-/// the check is skipped rather than rejecting a key it cannot evaluate.
+/// the operands are too wide for the fixed-width reduction to check. Since
+/// `e < 2^256`, that needs a factor within ~256 bits of the full `LIMBS`
+/// width — i.e. a cofactor of at most ~256 bits, a pathological key no
+/// generator emits — and such a key is **rejected**: a consistency check
+/// that cannot be evaluated must not pass silently. (Earlier versions
+/// skipped the check and accepted the key.)
 fn validate_crt_consistency<const LIMBS: usize>(
     e: &Uint<LIMBS>,
     d: &Uint<LIMBS>,
@@ -244,7 +246,8 @@ fn validate_crt_consistency<const LIMBS: usize>(
         let dx = d.reduce(&pm1);
         let (lo, hi) = e.reduce(&pm1).mul_wide(&dx);
         if !bool::from(hi.ct_eq(&Uint::<LIMBS>::ZERO)) {
-            continue; // not checkable at this width; see the doc comment
+            // Not checkable at this width; see the doc comment.
+            return Err(Error::Malformed);
         }
         if !bool::from(lo.reduce(&pm1).ct_eq(&one)) {
             return Err(Error::Malformed);
@@ -554,6 +557,23 @@ mod tests {
     use crate::der::encode_octet_string;
     use crate::hash::Sha256;
     use crate::test_util::rsa_test_key_a;
+
+    /// A CRT relation too wide to evaluate at the fixed width (a factor
+    /// within ~256 bits of the full `LIMBS` width) is rejected, not skipped.
+    #[test]
+    fn crt_consistency_rejects_unevaluable_width() {
+        // p ≈ 2^120 in a 128-bit Uint: e·(d mod (p−1)) overflows 128 bits.
+        let mut pb = [0u8; 16];
+        pb[1] = 0x80;
+        pb[15] = 0x01;
+        let p = Uint::<2>::from_be_bytes(&pb);
+        let q = Uint::<2>::from_u64(3);
+        let e = Uint::<2>::from_u64(65537);
+        // d = p − 2: odd, so the `q = 3` relation (mod 2) holds and only the
+        // unevaluable `p` relation decides.
+        let d = p.wrapping_sub(&Uint::from_u64(2));
+        assert!(validate_crt_consistency(&e, &d, &p, &q).is_err());
+    }
 
     /// The wipe-on-drop encoders used for private-key export must produce
     /// exactly the bytes of the generic `crate::der` writers.
