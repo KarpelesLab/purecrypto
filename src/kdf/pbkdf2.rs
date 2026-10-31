@@ -97,16 +97,21 @@ pub fn try_pbkdf2<D: Digest>(
     // rounds. `prf` holds password-derived state and is wiped on drop.
     let prf = Hmac::<D>::new(password);
 
-    let mut block_index: u32 = 1;
-    for chunk in out.chunks_mut(hlen) {
+    // The length check above bounds the chunk count by 2^32 - 1, the length
+    // of `block_counters()`, so the zip never truncates `out`. (The previous
+    // `checked_add(1).expect(..)` after every block panicked right after
+    // filling the very last legal block, at exactly (2^32 - 1)·hLen bytes.)
+    debug_assert!(out.len().div_ceil(hlen) <= u32::MAX as usize);
+    for (chunk, block_index) in out.chunks_mut(hlen).zip(block_counters()) {
         derive_block::<D>(&prf, salt, iterations, block_index, chunk);
-        // Use checked_add so an off-by-one bug would trip the length check
-        // above on entry rather than silently wrap to 1.
-        block_index = block_index
-            .checked_add(1)
-            .expect("PBKDF2 block counter overflowed 2^32");
     }
     Ok(())
+}
+
+/// The RFC 8018 §5.2 block counters `1, 2, …, 2^32 − 1`, without ever
+/// computing the out-of-range successor of the last one.
+fn block_counters() -> core::ops::RangeInclusive<u32> {
+    1..=u32::MAX
 }
 
 /// Computes one PBKDF2 output block `T_i = U_1 ^ U_2 ^ … ^ U_c` and copies its
@@ -146,6 +151,24 @@ mod tests {
     use super::*;
     use crate::hash::Sha256;
     use crate::test_util::from_hex;
+
+    /// The counter sequence covers exactly the 2^32 - 1 legal block indices
+    /// and ends at u32::MAX without overflowing (the old per-block
+    /// `checked_add(1).expect(..)` panicked after the last legal block). The
+    /// full-length output itself (~137 GB for SHA-256) is not testable.
+    #[test]
+    fn block_counters_cover_full_range_without_overflow() {
+        let mut c = block_counters();
+        assert_eq!(c.next(), Some(1));
+        assert_eq!(
+            c.size_hint(),
+            (u32::MAX as usize - 1, Some(u32::MAX as usize - 1))
+        );
+        let mut tail = block_counters().skip(u32::MAX as usize - 2);
+        assert_eq!(tail.next(), Some(u32::MAX - 1));
+        assert_eq!(tail.next(), Some(u32::MAX));
+        assert_eq!(tail.next(), None);
+    }
 
     // Well-known PBKDF2-HMAC-SHA256 test vectors.
 
