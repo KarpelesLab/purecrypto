@@ -4465,11 +4465,12 @@ impl QuicConnection {
             let next_keys = derive_dir_keys_preserve_hp(self.version, alg, &next_secret, &hp_bytes);
             self.endpoint.crypto.at_mut(Level::OneRtt).rx_by_phase[old_phase as usize] =
                 Some(next_keys);
-            // RFC 9001 §6.6 — per-key rx integrity counter is per
-            // *key*. The rx key just rotated, so reset the failure
-            // counter. Likewise the replay window (RFC 9001 §9.5) is
-            // per-key: restart it for the new key.
-            self.endpoint.crypto.at_mut(Level::OneRtt).rx_aead_failures = 0;
+            // RFC 9001 §6.6 — the integrity limit counts packets that
+            // fail authentication "across all keys used" in the
+            // connection, so `rx_aead_failures` deliberately survives the
+            // key update (resetting it let a forger who can provoke key
+            // updates probe forever). The replay window (RFC 9001 §9.5)
+            // is per-key: restart it for the new key.
             self.endpoint.crypto.at_mut(Level::OneRtt).rx_pn_window = PnReplayWindow::new();
         }
         let tx_pending = self
@@ -16091,6 +16092,60 @@ mod tests {
         assert!(s.is_draining());
         assert_eq!(
             s.close_info().expect("peer close info").error_code,
+            ERROR_AEAD_LIMIT_REACHED
+        );
+    }
+
+    /// RFC 9001 §6.6 — the integrity limit counts authentication failures
+    /// "across all keys used", so a 1-RTT key update must not reset the
+    /// counter (it used to, letting forgeries spread over key phases stay
+    /// under the limit indefinitely).
+    #[test]
+    fn rx_integrity_failures_survive_key_update() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        c.endpoint
+            .crypto
+            .at_mut(Level::OneRtt)
+            .integrity_limit_override = Some(2);
+        let mut forged = alloc::vec![0x43u8];
+        forged.extend_from_slice(c.endpoint.cids.local.as_slice());
+        forged.extend(core::iter::repeat_n(0x5Au8, 64));
+        c.feed_datagram(&forged)
+            .expect("first failure is a silent drop");
+        assert!(!c.is_closing());
+
+        // The server rotates keys; the client commits the new phase.
+        let sid = c.open_bidi().expect("open");
+        c.write(sid, b"x").expect("write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let phase_before = c.endpoint.crypto.one_rtt_phase;
+        s.initiate_key_update().expect("server initiates");
+        s.write(StreamId(sid.0), b"y").expect("server write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert_ne!(
+            c.endpoint.crypto.one_rtt_phase, phase_before,
+            "client committed the server-initiated key update"
+        );
+        assert!(!c.is_closing());
+
+        // One more failure under the new key reaches the limit of 2.
+        forged[20] ^= 0xFF;
+        c.feed_datagram(&forged)
+            .expect("second failure trips the limit");
+        assert!(
+            c.is_closing(),
+            "failures under both keys count toward one limit"
+        );
+        assert_eq!(
+            c.close_info().expect("close info").error_code,
             ERROR_AEAD_LIMIT_REACHED
         );
     }

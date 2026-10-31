@@ -399,9 +399,10 @@ pub(crate) struct LevelKeys {
     /// on each tx-side key update (the per-key limit is per *key*, not per
     /// connection).
     pub(crate) tx_packets: u64,
-    /// Number of AEAD authentication failures observed on the rx side for
-    /// the current rx key. RFC 9001 §6.6: on reaching the integrity limit
-    /// the connection MUST be closed.
+    /// Number of AEAD authentication failures observed on the rx side at
+    /// this level. For 1-RTT it is NOT reset on key update: RFC 9001 §6.6
+    /// counts failures "across all keys used". On reaching the integrity
+    /// limit the connection MUST be closed.
     pub(crate) rx_aead_failures: u64,
     /// Test-only override of the usage limit. `None` ⇒ use
     /// `AeadAlg::usage_limit()`. Lets the test suite trip the close path
