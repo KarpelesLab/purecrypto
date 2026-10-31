@@ -3803,6 +3803,16 @@ impl<R: RngCore> ServerConnection<R> {
         // on drop, and `seal_ticket13` scrubs the serialised copy.)
         let ticket = seal_ticket13(&mut self.rng, &key, TICKET13_AAD, &plain);
         drop(plain);
+        // `NewSessionTicket.ticket` is `opaque ticket<1..2^16-1>`
+        // (RFC 8446 §4.6.1). A client leaf that still fits the plaintext's
+        // u16 `leaf_len` can push `nonce ‖ plaintext ‖ tag` past that, and
+        // the encoder's length assertion would then panic. Issue no ticket
+        // instead (sending none is always allowed in TLS 1.3); dropping the
+        // leaf would resume an authenticated session as an anonymous one.
+        if ticket.len() > MAX_NST_TICKET_LEN {
+            self.pending_nst = false;
+            return Ok(());
+        }
 
         let mut extensions = Vec::new();
         if self.config.max_early_data_size > 0 {
@@ -4329,6 +4339,9 @@ impl<R: RngCore> ServerConnection<R> {
 /// feeds both engines: a ticket minted by one can never authenticate under
 /// the other, regardless of how the plaintext happens to parse.
 pub(crate) const TICKET13_AAD: &[u8] = b"purecrypto tls13 ticket v1";
+/// Largest sealed ticket a `NewSessionTicket` can carry: the field is
+/// `opaque ticket<1..2^16-1>` (RFC 8446 §4.6.1).
+const MAX_NST_TICKET_LEN: usize = u16::MAX as usize;
 /// Leading byte of the TLS 1.3 ticket plaintext: format/version tag.
 /// `0x13` is the original layout; `0x14` adds the issuing `cipher_suite`
 /// right after `ticket_age_add` (RFC 8446 §4.6.1: 0-RTT is keyed under the
@@ -6189,6 +6202,38 @@ mod tests {
         );
         let other = ticket_engine(base().add_expected_client_raw_public_key(alloc::vec![0x30; 44]));
         assert!(other.try_accept_psk(&ch, &raw, &[]).unwrap().is_none());
+    }
+
+    /// A client leaf that fits the ticket plaintext's u16 `leaf_len` but
+    /// pushes the sealed ticket past `NewSessionTicket.ticket<1..2^16-1>`
+    /// used to panic the server in the NST encoder. It now issues no
+    /// ticket; a leaf small enough still gets one.
+    #[test]
+    fn tls13_large_client_leaf_skips_the_session_ticket() {
+        let emit = |leaf_len: usize| -> Vec<u8> {
+            let mut server = ticket_engine(
+                test_server_config()
+                    .with_ticket_key([0x48u8; 32])
+                    .with_verification_time(Time::from_unix(TEST_TICKET_NOW)),
+            );
+            server.suite = crate::tls::crypto::lookup_suite(CipherSuite::AES_128_GCM_SHA256);
+            server.rms = Some(Secret::new(&[0x11u8; 32]));
+            server.client_cert_chain = alloc::vec![alloc::vec![0x30u8; leaf_len]];
+            server.pending_nst = true;
+            server.emit_session_ticket().unwrap();
+            assert!(!server.pending_nst);
+            server.write_tls()
+        };
+        // ≈65.5 KB: under the u16 leaf field, over the sealed-ticket bound.
+        assert!(
+            emit(65_500).is_empty(),
+            "no NewSessionTicket for a huge leaf"
+        );
+        assert!(emit(u16::MAX as usize).is_empty());
+        // A leaf of a few KiB still gets its ticket.
+        let out = emit(4096);
+        let rec = read_record(&out).unwrap().unwrap();
+        assert!(NewSessionTicket::decode(&rec.fragment[4..]).is_ok());
     }
 
     /// Ticket chaining: a ticket issued after a PSK-resumed handshake
