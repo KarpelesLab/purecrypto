@@ -465,7 +465,9 @@ impl StoredSession12 {
     /// Whether this session may be offered on a connection to `server_name`
     /// with the given verification setting at time `now` (`None`: no clock,
     /// so no expiry check). Mirrors the TLS 1.3 [`super::StoredSession`]
-    /// scoping: same name, no weaker verification context, not expired.
+    /// scoping: same name, no weaker verification context, not expired —
+    /// and, like it, a ticket no longer than the 16 KiB the client stores
+    /// (a larger one could not be re-presented in a ClientHello).
     pub(crate) fn usable_for(
         &self,
         server_name: &str,
@@ -480,6 +482,7 @@ impl StoredSession12 {
                 _ => false,
             };
         !self.ticket.is_empty()
+            && self.ticket.len() <= super::client::MAX_SESSION_TICKET_LEN
             && self.server_name.eq_ignore_ascii_case(server_name)
             && (self.verify_certificates || !verify_certificates)
             && !expired
@@ -952,18 +955,11 @@ impl ClientConnection12 {
         let suites: Vec<CipherSuite> = SUITES_12.iter().map(|p| p.suite).collect();
         // Apply the optional caller cipher-suite restriction (curl --ciphers).
         let suites = super::select_offered_suites(&config.cipher_suites, &suites)?;
-        Ok(Self::new_with_offer(
-            config,
-            server_name,
-            rng,
-            &suites,
-            &GROUPS_12,
-        ))
+        Self::try_new_with_offer(config, server_name, rng, &suites, &GROUPS_12)
     }
 
-    /// Like [`new`](Self::new) but with an explicit cipher-suite and
-    /// key-exchange-group offer. The given suites are filtered to those we
-    /// recognise; unknown codepoints are silently dropped.
+    /// Test shorthand for [`Self::try_new_with_offer`] that panics on error.
+    #[cfg(test)]
     pub(crate) fn new_with_offer<R: RngCore>(
         config: ClientConfig12,
         server_name: &str,
@@ -971,6 +967,21 @@ impl ClientConnection12 {
         suites: &[CipherSuite],
         groups: &[NamedGroup],
     ) -> Self {
+        Self::try_new_with_offer(config, server_name, rng, suites, groups)
+            .expect("ClientHello encodes")
+    }
+
+    /// Like [`new`](Self::new) but with an explicit cipher-suite and
+    /// key-exchange-group offer. The given suites are filtered to those we
+    /// recognise; unknown codepoints are silently dropped. Fails with
+    /// `HandshakeFailure` when the ClientHello cannot be encoded.
+    pub(crate) fn try_new_with_offer<R: RngCore>(
+        config: ClientConfig12,
+        server_name: &str,
+        rng: &mut R,
+        suites: &[CipherSuite],
+        groups: &[NamedGroup],
+    ) -> Result<Self, Error> {
         let mut config = config;
         drop_unusable_session(&mut config, server_name);
         let x25519 = X25519PrivateKey::generate(rng);
@@ -1090,13 +1101,13 @@ impl ClientConnection12 {
             negotiated_server_cert_type: cert_type::X509,
             negotiated_client_cert_type: cert_type::X509,
         };
-        let hello = conn.build_client_hello(&offered_suites, groups);
+        let hello = conn.build_client_hello(&offered_suites, groups)?;
         // Update the transcript even though the hash isn't selected yet —
         // `Transcript` buffers the bytes and applies the hash on demand once
         // `set_alg` is called (when we process SH).
         conn.transcript.update(&hello);
         conn.write_plain_record(ContentType::Handshake, &hello);
-        conn
+        Ok(conn)
     }
 
     /// Builds a TLS 1.2 client that ADOPTS a ClientHello already sent by a TLS
@@ -1258,7 +1269,15 @@ impl ClientConnection12 {
     }
 
     /// Builds the ClientHello with all the TLS-1.2-required extensions.
-    fn build_client_hello(&self, suites: &[CipherSuite], groups: &[NamedGroup]) -> Vec<u8> {
+    /// Encodes this engine's ClientHello. Fallible rather than panicking:
+    /// the hello carries bytes from outside the engine (a stored session's
+    /// ticket, caller-configured lists), and one that would overflow a
+    /// wire length prefix is refused with `HandshakeFailure`.
+    fn build_client_hello(
+        &self,
+        suites: &[CipherSuite],
+        groups: &[NamedGroup],
+    ) -> Result<Vec<u8>, Error> {
         // A client that tops out below TLS 1.2 (opt-in legacy) emits a clean
         // pre-1.2 ClientHello: no `signature_algorithms` (1.2+ only).
         #[cfg(feature = "tls-legacy")]
@@ -1368,7 +1387,7 @@ impl ClientConnection12 {
             cipher_suites: cipher_suites_wire,
             extensions,
         }
-        .encode()
+        .try_encode()
     }
 
     /// The negotiated cipher-suite wire identifier, available once the
@@ -2173,7 +2192,7 @@ impl ClientConnection12 {
             .filter(|s| lookup_suite_12(*s).is_some())
             .collect();
         let groups = self.offered_groups.clone();
-        let hello = self.build_client_hello(&suites, &groups);
+        let hello = self.build_client_hello(&suites, &groups)?;
         self.transcript.update(&hello);
         self.write_plain_record(ContentType::Handshake, &hello);
         Ok(())
@@ -3431,7 +3450,12 @@ impl ClientConnection12 {
                 }
                 self.nst_received = true;
                 let nst = NewSessionTicket12::decode(body)?;
-                if !nst.ticket.is_empty() {
+                // An oversized ticket (the u16 field allows ~64 KiB) is not
+                // kept: re-presented in the next ClientHello it would
+                // overflow the extensions block. Same bound as TLS 1.3.
+                if !nst.ticket.is_empty()
+                    && nst.ticket.len() <= super::client::MAX_SESSION_TICKET_LEN
+                {
                     self.received_ticket = Some(nst.ticket);
                     self.received_ticket_lifetime = nst.lifetime;
                 }
@@ -3471,7 +3495,12 @@ impl ClientConnection12 {
             }
             self.nst_received = true;
             let nst = NewSessionTicket12::decode(body)?;
-            if !nst.ticket.is_empty() {
+            // RFC 5077 puts the ticket in a u16 field (~64 KiB), but it is
+            // re-presented verbatim in a later ClientHello's
+            // `session_ticket` extension, so an oversized one is a hello we
+            // could not encode. Like the TLS 1.3 client, keep only tickets up
+            // to `MAX_SESSION_TICKET_LEN`; the handshake itself is unaffected.
+            if !nst.ticket.is_empty() && nst.ticket.len() <= super::client::MAX_SESSION_TICKET_LEN {
                 self.received_ticket = Some(nst.ticket);
                 self.received_ticket_lifetime = nst.lifetime;
             }
@@ -4649,6 +4678,78 @@ mod tests {
         )
         .unwrap();
         rec
+    }
+
+    /// A cached session whose ticket is too large to re-present (the u16
+    /// NewSessionTicket field allows ~64 KiB) used to panic the next
+    /// ClientHello build in `with_len_u16`. It is now dropped like an
+    /// expired one: the hello goes out without it.
+    #[test]
+    fn client12_oversized_cached_ticket_is_not_offered() {
+        for len in [super::super::client::MAX_SESSION_TICKET_LEN + 1, 65535] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"c12-huge-ticket", b"nonce", &[]);
+            let mut s = stored_session(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+            s.ticket = alloc::vec![0x41; len];
+            let cfg = ClientConfig12::new(RootCertStore::new()).with_session(s);
+            let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
+            assert!(client_hello_session_id(&c.write_tls()).is_empty());
+        }
+        // At the bound it is still usable.
+        let mut s = stored_session(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+        s.ticket = alloc::vec![0x41; super::super::client::MAX_SESSION_TICKET_LEN];
+        assert!(s.usable_for("example.com", true, None));
+        s.ticket.push(0x41);
+        assert!(!s.usable_for("example.com", true, None));
+    }
+
+    /// A NewSessionTicket larger than the client will ever re-present is
+    /// not stored, so `take_session` never hands out a session that would
+    /// poison the next ClientHello.
+    #[test]
+    fn client12_oversized_new_session_ticket_is_not_stored() {
+        use crate::tls::codec::write_record;
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-nst-huge", b"nonce", &[]);
+        let mut c = ClientConnection12::new(
+            ClientConfig12::new(RootCertStore::new()),
+            "example.com",
+            &mut rng,
+        )
+        .unwrap();
+        let _ = c.write_tls();
+        c.state = State::WaitServerFinished;
+        c.suite = lookup_suite_12(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+        c.master = Some([0u8; 48]);
+        c.transcript.set_alg(c.suite.expect("suite set").hash);
+
+        let ticket_len = 65535usize;
+        let mut body = 3600u32.to_be_bytes().to_vec();
+        body.extend_from_slice(&(ticket_len as u16).to_be_bytes());
+        body.extend_from_slice(&alloc::vec![0xEE; ticket_len]);
+        let n = body.len();
+        let mut msg = alloc::vec![
+            hs_type::NEW_SESSION_TICKET,
+            (n >> 16) as u8,
+            (n >> 8) as u8,
+            n as u8
+        ];
+        msg.extend_from_slice(&body);
+        let mut rec = Vec::new();
+        for frag in msg.chunks(1 << 14) {
+            write_record(
+                &mut rec,
+                ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                frag,
+            )
+            .unwrap();
+        }
+        c.read_tls(&rec);
+        c.process_new_packets().unwrap();
+        c.handshake_completed = true;
+        assert!(
+            c.take_session().is_none(),
+            "an oversized ticket must not be cached"
+        );
     }
 
     /// RFC 5077 §3.4: a ClientHello that presents a ticket also carries a

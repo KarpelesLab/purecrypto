@@ -85,7 +85,7 @@ const MAX_HRR_COOKIE_LEN: usize = 8 * 1024;
 /// encode. RFC 8446 puts no cap on the field; real tickets run from a few
 /// hundred bytes to a couple of KiB. Larger ones are simply not stored (the
 /// handshake that carried them is unaffected).
-const MAX_SESSION_TICKET_LEN: usize = 16 * 1024;
+pub(super) const MAX_SESSION_TICKET_LEN: usize = 16 * 1024;
 
 /// Ceiling on `CertificateEntry` structures in a server `Certificate`
 /// message. A real chain is a leaf plus a handful of intermediates; RFC 8446
