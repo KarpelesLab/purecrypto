@@ -6509,6 +6509,34 @@ mod resume12 {
         assert!(!c.did_resume() && !s.did_resume());
     }
 
+    /// `StoredSession12` is shared with the TLS 1.2 client, whose
+    /// ClientHello encoder once panicked on a ticket too large for the
+    /// `session_ticket` extension's u16 length. The DTLS 1.2 client must
+    /// drop such a cached session at construction (it caps tickets at
+    /// `MAX_DTLS_SESSION_TICKET_LEN`, both on receipt and on reuse) and run
+    /// a full handshake instead of panicking or offering it.
+    #[test]
+    fn oversized_cached_ticket_is_not_offered() {
+        let (cfg, cert) = server(false, TICKET_KEY);
+        for len in [
+            crate::dtls::ticket::MAX_DTLS_SESSION_TICKET_LEN + 1,
+            u16::MAX as usize + 1,
+            200_000,
+        ] {
+            let mut session = first_session(&cfg, &cert);
+            session.ticket = alloc::vec![0x42; len];
+            let mut c = client(&cert, Some(session), b"resume12-bigticket-c");
+            let ch = c.pop_outbound_datagrams();
+            assert!(ch.iter().all(|dg| dg.len() < 4096), "ticket not offered");
+            let mut s = server_conn(&cfg, b"resume12-bigticket-s");
+            for dg in &ch {
+                s.feed_datagram(dg).unwrap();
+            }
+            assert!(pump_handshake(&mut c, &mut s));
+            assert!(!c.did_resume() && !s.did_resume());
+        }
+    }
+
     /// RFC 5246 §7.4.1.3: a resumed session keeps its suite, and the
     /// server only resumes one the client still offers.
     #[test]
