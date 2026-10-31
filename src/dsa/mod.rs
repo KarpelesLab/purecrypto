@@ -31,7 +31,7 @@
 //! -pkeyopt type:fips186_2` pairing a 512-bit `p` with a 224-bit `q`). The
 //! `*_nonstandard` constructors and parsers ([`DsaParams::new_nonstandard`],
 //! [`DsaPublicKey::from_spki_der_nonstandard`], …) accept any `p` of
-//! 512..=10000 bits and `q` of 160..=256 bits, and since such sets carry no
+//! 512..=4096 bits and `q` of 160..=256 bits, and since such sets carry no
 //! FIPS pedigree they Miller-Rabin-test `p` as well. The strict parsers are
 //! unchanged, so a caller that never opts in never sees a 512-bit key.
 //!
@@ -341,11 +341,16 @@ impl DsaParams {
     /// a `p` falls to a modest NFS computation; it is accepted for interop,
     /// not for security.
     pub const MIN_NONSTANDARD_P_BITS: usize = 512;
-    /// The widest `p` the non-standard paths accept, in bits: OpenSSL's
-    /// `OPENSSL_DSA_MAX_MODULUS_BITS`. A cap is needed because the parameter
-    /// set may be peer-supplied and every check on it is a full-width
-    /// exponentiation (see `dh::DhGroup::MAX_CUSTOM_GROUP_BITS`).
-    pub const MAX_NONSTANDARD_P_BITS: usize = 10000;
+    /// The widest `p` the non-standard paths accept, in bits. A cap is
+    /// needed because the parameter set may be peer-supplied and every
+    /// check on it is a full-width exponentiation — including the up-to-64
+    /// Miller-Rabin rounds on `p` — whose cost grows roughly cubically.
+    ///
+    /// Earlier versions used OpenSSL's `OPENSSL_DSA_MAX_MODULUS_BITS`
+    /// (10000), at which a single hostile `*_nonstandard` parse cost ~13 s
+    /// of CPU; 4096 bits (above every width DSA tooling actually produces —
+    /// FIPS 186-4 tops out at 3072) bounds it to well under a second.
+    pub const MAX_NONSTANDARD_P_BITS: usize = 4096;
     /// The narrowest `q` the non-standard paths accept, in bits: FIPS
     /// 186-2's only width. OpenSSL's verifier refuses any `q` other than
     /// 160, 224 or 256 bits, so nothing narrower interoperates, and the
@@ -2015,6 +2020,28 @@ gXvUOiU2jsoOp2ZN
         ));
         assert_eq!(
             DsaParams::new_nonstandard(composite, q224, g_crt),
+            Err(Error::InvalidParameters)
+        );
+    }
+
+    /// The non-standard `p` cap is 4096 bits (was 10000, where one hostile
+    /// parse ran ~13 s of Miller-Rabin): wider sets fail the width gate
+    /// before any arithmetic.
+    #[test]
+    fn nonstandard_p_capped_at_4096_bits() {
+        assert!(DsaParams::nonstandard_widths(4096, 160));
+        assert!(!DsaParams::nonstandard_widths(4097, 160));
+        assert!(!DsaParams::nonstandard_widths(10000, 256));
+        let one = BoxedUint::from_u64(1);
+        let mut p_bytes = alloc::vec![0u8; 10000 / 8];
+        p_bytes[0] = 0x80;
+        let p = BoxedUint::from_be_bytes(&p_bytes).add(&one);
+        let mut q_bytes = [0u8; 20];
+        q_bytes[0] = 0x80;
+        q_bytes[19] = 1;
+        let q = BoxedUint::from_be_bytes(&q_bytes);
+        assert_eq!(
+            DsaParams::new_nonstandard(p, q, BoxedUint::from_u64(2)),
             Err(Error::InvalidParameters)
         );
     }
