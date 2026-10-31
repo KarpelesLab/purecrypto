@@ -1082,271 +1082,281 @@ pub fn sign_into(
     if out.len() < MAX_PROOF_LEN {
         return Err(Error::InvalidInput);
     }
-    let (params, mantissa_value) = choose_params(value, min_value, exp, min_bits)?;
-    let layout = Layout::new(params.mantissa);
-    let (ncommit, sign_bytes) = layout.commitments();
-    if message.len() > max_message_len(&layout) {
-        return Err(Error::InvalidInput);
-    }
-    let blind_scalar = Scalar::from_bytes_be(blind)?;
-    // Fail closed if the opening does not match the commitment: a proof made
-    // from a mismatched opening can only ever fail verification.
-    // Declassified (Valgrind harness): the verdict is returned as an error.
-    if !Commitment::with_generator(value, blind, generator)?
-        .ct_eq(commit)
-        .declassify()
-    {
-        return Err(Error::InvalidInput);
-    }
+    let (params, mut mantissa_value) = choose_params(value, min_value, exp, min_bits)?;
 
-    let (header_buf, header_len) = write_header(&params);
-    let header = &header_buf[..header_len];
-
-    let commit_enc = point_enc(&commit.serialize());
-    let generator_enc = point_enc(&generator.serialize());
-    let (mut seed, seed_len) = drbg_seed(nonce, &commit_enc, &generator_enc, header);
-    let mut rng = Drbg::new(&seed[..seed_len]);
-    // The seed's first 32 bytes are the nonce.
-    seed.zeroize();
-
-    // --- the prover's randomness -------------------------------------
-    //
-    // Per ring, in order: two draws whose second is the ring's blinding share
-    // (the last ring's share is whatever balances the total), then one draw
-    // per ring member. The draw at the member the prover knows becomes that
-    // ring's Borromean nonce k; the rest are the forged scalars.
+    // Everything below that would reveal the value, the blinding factor or
+    // the embedded message lives outside the single-exit body, so one wipe
+    // covers the error returns too.
     let mut sec = [[0u8; 32]; MAX_RINGS];
     let mut raw = [[0u8; 32]; MAX_NPUB];
-    let mut acc = Scalar::ZERO;
-    let mut slot = 0;
-    for (i, share) in sec.iter_mut().enumerate().take(layout.rings) {
-        if i + 1 < layout.rings {
-            let mut tmp = [0u8; 32];
-            rng.generate(&mut tmp);
-            rng.generate(&mut tmp);
-            *share = tmp;
-            acc = acc.add(&Scalar::from_bytes_be_reduce(&tmp));
-            tmp.zeroize();
-        }
-        for _ in 0..layout.rsizes[i] {
-            rng.generate(&mut raw[slot]);
-            slot += 1;
-        }
-    }
-    sec[layout.rings - 1] = blind_scalar.sub(&acc).to_bytes_be();
-
-    // --- the embedded data -------------------------------------------
-    //
-    // `prep` is XORed into the DRBG stream slot by slot. The caller's message
-    // occupies the leading slots; the last slot that is not the final ring's
-    // known member carries the mantissa value, which is how `rewind` learns
-    // the top digit it cannot derive from the digit commitments.
     let mut prep_buf = [0u8; 32 * MAX_NPUB];
-    let prep = &mut prep_buf[..32 * layout.npub];
-    // The embedded message is secret, and so is its length (the proof is
-    // fixed-size): fill the whole slot with a masked select rather than a
-    // `message.len()`-byte copy.
-    for (i, slot) in prep.iter_mut().enumerate() {
-        let in_range =
-            0u8.wrapping_sub(((i.wrapping_sub(message.len())) >> (usize::BITS - 1)) as u8);
-        *slot = message.get(i).copied().unwrap_or(0) & in_range;
-    }
-    let last_ring = layout.rings - 1;
     let mut digits = [0u64; MAX_RINGS];
-    for (i, digit) in digits.iter_mut().enumerate().take(layout.rings) {
-        *digit = (mantissa_value >> (2 * i)) & 3;
-    }
-    if layout.npub >= 2 {
-        let mut marker = [0u8; 32];
-        marker[0] = 0x80;
-        for chunk in 1..4 {
-            marker[8 * chunk..8 * (chunk + 1)].copy_from_slice(&mantissa_value.to_be_bytes());
-        }
-        let mut known = (layout.starts[last_ring] as u64) + digits[last_ring];
-        let at_end = known.ct_eq(&((layout.npub - 1) as u64));
-        let mut tail: [u8; 32] = prep[32 * (layout.npub - 1)..].try_into().unwrap();
-        let mut prev: [u8; 32] = prep[32 * (layout.npub - 2)..32 * (layout.npub - 1)]
-            .try_into()
-            .unwrap();
-        // When the final ring's known member is the very last slot, the marker
-        // moves one slot earlier; both writes always happen.
-        let mut new_tail = <[u8; 32]>::conditional_select(&tail, &marker, at_end);
-        let mut new_prev = <[u8; 32]>::conditional_select(&marker, &prev, at_end);
-        prep[32 * (layout.npub - 1)..].copy_from_slice(&new_tail);
-        prep[32 * (layout.npub - 2)..32 * (layout.npub - 1)].copy_from_slice(&new_prev);
-        // All of these carry the mantissa value or the known-member position.
-        marker.zeroize();
-        tail.zeroize();
-        prev.zeroize();
-        new_tail.zeroize();
-        new_prev.zeroize();
-        known.zeroize();
-    }
-
     let mut s = [[0u8; 32]; MAX_NPUB];
-    for i in 0..layout.npub {
-        for b in 0..32 {
-            s[i][b] = raw[i][b] ^ prep[32 * i + b];
-        }
-    }
-    // k_i is the draw at the member the prover knows, chosen without a
-    // secret-dependent index.
     let mut nonces = [[0u8; 32]; MAX_RINGS];
-    for i in 0..layout.rings {
-        let mut k = [0u8; 32];
-        for j in 0..layout.rsizes[i] {
-            let is_known = (j as u64).ct_eq(&digits[i]);
-            k = <[u8; 32]>::conditional_select(&s[layout.starts[i] + j], &k, is_known);
+
+    let result = (|| -> Result<usize, Error> {
+        let layout = Layout::new(params.mantissa);
+        let (ncommit, sign_bytes) = layout.commitments();
+        if message.len() > max_message_len(&layout) {
+            return Err(Error::InvalidInput);
         }
-        nonces[i] = k;
-    }
-
-    // --- digit commitments and ring public keys ----------------------
-    let gen_point = generator.as_point();
-    let mut digit_commits = [ProjectivePoint::identity(); MAX_RINGS];
-    for i in 0..layout.rings {
-        let offset = value_scalar(member_offset(digits[i], i, params.scale));
-        let share = Scalar::from_bytes_be_reduce(&sec[i]);
-        // The offset is secret (it carries the digit) but its 64-bit width
-        // is public, so the public-width multiplication applies.
-        digit_commits[i] = generator
-            .mul_value(&offset)
-            .add(&ProjectivePoint::mul_generator(&share));
-    }
-    let mut encs = [[0u8; 33]; MAX_RINGS];
-    let mut body_buf = [0u8; MAX_BODY_LEN];
-    let body = &mut body_buf[..sign_bytes + 32 * ncommit];
-    for (i, digit_commit) in digit_commits.iter().enumerate().take(ncommit) {
-        let tagged = Commitment::from_point(digit_commit)?.serialize();
-        body[i / 8] |= (tagged[0] & 1) << (i % 8);
-        body[sign_bytes + 32 * i..sign_bytes + 32 * (i + 1)].copy_from_slice(&tagged[1..]);
-        encs[i] = point_enc(&tagged);
-    }
-
-    // Ring member keys are walked per ring rather than kept in a 128-entry
-    // table; see `first_step` (the same trade the verifier makes).
-    let step0 = first_step(&gen_point, params.scale);
-    // Whether the generator has a comb table (public: see `prover_ring_point`).
-    let use_comb = generator.has_comb();
-
-    let m = proof_message(
-        &commit_enc,
-        &generator_enc,
-        header,
-        &encs[..ncommit],
-        extra_commit,
-    );
-
-    // --- Borromean signature, forward pass ---------------------------
-    //
-    // Each ring is walked from member 0 to the end. Before the known member
-    // the running point is a fixed dummy whose chain is discarded; at the
-    // known member it is replaced by k·G with a constant-time select; after it
-    // the real chain runs. The work is identical whatever the digit is.
-    let mut e0h = Sha256::new();
-    let mut step = step0;
-    for i in 0..layout.rings {
-        let start = layout.starts[i];
-        let k = Scalar::from_bytes_be_reduce(&nonces[i]);
-        let kg = ProjectivePoint::mul_generator(&k);
-        let mut r = ProjectivePoint::generator();
-        if i > 0 {
-            step = next_step(&step);
+        let blind_scalar = Scalar::from_bytes_be(blind)?;
+        // Fail closed if the opening does not match the commitment: a proof made
+        // from a mismatched opening can only ever fail verification.
+        // Declassified (Valgrind harness): the verdict is returned as an error.
+        if !Commitment::with_generator(value, blind, generator)?
+            .ct_eq(commit)
+            .declassify()
+        {
+            return Err(Error::InvalidInput);
         }
-        let neg_step = step.negate();
-        let mut member = digit_commits[i];
-        // The prover's opening of the walked member: `share·G + t·H` with
-        // `t` stepping down by `4ⁱ·scale` alongside the point.
-        let share = Scalar::from_bytes_be_reduce(&sec[i]);
-        let unit = value_scalar(member_offset(1, i, params.scale));
-        let mut t = value_scalar(member_offset(digits[i], i, params.scale));
-        for j in 0..layout.rsizes[i] {
-            let is_known = (j as u64).ct_eq(&digits[i]);
-            r = ProjectivePoint::conditional_select(&kg, &r, is_known);
-            if j + 1 < layout.rsizes[i] {
-                let e = borromean_hash(&m, &sec1(&r), i as u32, (j + 1) as u32);
-                let e = Scalar::from_bytes_be_reduce(&e);
-                let sj = Scalar::from_bytes_be_reduce(&s[start + j + 1]);
-                // Member j + 1.
-                member = member.add(&neg_step);
-                t = t.sub(&unit);
-                r = prover_ring_point(generator, use_comb, &member, &sj, &e, &share, &t);
+
+        let (header_buf, header_len) = write_header(&params);
+        let header = &header_buf[..header_len];
+
+        let commit_enc = point_enc(&commit.serialize());
+        let generator_enc = point_enc(&generator.serialize());
+        let (mut seed, seed_len) = drbg_seed(nonce, &commit_enc, &generator_enc, header);
+        let mut rng = Drbg::new(&seed[..seed_len]);
+        // The seed's first 32 bytes are the nonce.
+        seed.zeroize();
+
+        // --- the prover's randomness -------------------------------------
+        //
+        // Per ring, in order: two draws whose second is the ring's blinding share
+        // (the last ring's share is whatever balances the total), then one draw
+        // per ring member. The draw at the member the prover knows becomes that
+        // ring's Borromean nonce k; the rest are the forged scalars.
+        let mut acc = Scalar::ZERO;
+        let mut slot = 0;
+        for (i, share) in sec.iter_mut().enumerate().take(layout.rings) {
+            if i + 1 < layout.rings {
+                let mut tmp = [0u8; 32];
+                rng.generate(&mut tmp);
+                rng.generate(&mut tmp);
+                *share = tmp;
+                acc = acc.add(&Scalar::from_bytes_be_reduce(&tmp));
+                tmp.zeroize();
+            }
+            for _ in 0..layout.rsizes[i] {
+                rng.generate(&mut raw[slot]);
+                slot += 1;
             }
         }
-        let affine = r.to_affine().ok_or(Error::InvalidInput)?;
-        e0h.update(&affine.to_sec1_compressed());
-    }
-    e0h.update(&m);
-    let e0 = e0h.finalize();
+        sec[layout.rings - 1] = blind_scalar.sub(&acc).to_bytes_be();
 
-    // --- Borromean signature, closing pass ---------------------------
-    let mut step = step0;
-    for i in 0..layout.rings {
-        let start = layout.starts[i];
-        let mut e = borromean_hash(&m, &e0, i as u32, 0);
-        let mut e_known = [0u8; 32];
-        if i > 0 {
-            step = next_step(&step);
+        // --- the embedded data -------------------------------------------
+        //
+        // `prep` is XORed into the DRBG stream slot by slot. The caller's message
+        // occupies the leading slots; the last slot that is not the final ring's
+        // known member carries the mantissa value, which is how `rewind` learns
+        // the top digit it cannot derive from the digit commitments.
+        let prep = &mut prep_buf[..32 * layout.npub];
+        // The embedded message is secret, and so is its length (the proof is
+        // fixed-size): fill the whole slot with a masked select rather than a
+        // `message.len()`-byte copy.
+        for (i, slot) in prep.iter_mut().enumerate() {
+            let in_range =
+                0u8.wrapping_sub(((i.wrapping_sub(message.len())) >> (usize::BITS - 1)) as u8);
+            *slot = message.get(i).copied().unwrap_or(0) & in_range;
         }
-        let neg_step = step.negate();
-        let mut member = digit_commits[i];
-        let share = Scalar::from_bytes_be_reduce(&sec[i]);
-        let unit = value_scalar(member_offset(1, i, params.scale));
-        let mut t = value_scalar(member_offset(digits[i], i, params.scale));
-        for j in 0..layout.rsizes[i] {
-            let is_known = (j as u64).ct_eq(&digits[i]);
-            e_known = <[u8; 32]>::conditional_select(&e, &e_known, is_known);
-            if j + 1 < layout.rsizes[i] {
-                let scalar = Scalar::from_bytes_be_reduce(&e);
-                let sj = Scalar::from_bytes_be_reduce(&s[start + j]);
-                if j > 0 {
+        let last_ring = layout.rings - 1;
+        for (i, digit) in digits.iter_mut().enumerate().take(layout.rings) {
+            *digit = (mantissa_value >> (2 * i)) & 3;
+        }
+        if layout.npub >= 2 {
+            let mut marker = [0u8; 32];
+            marker[0] = 0x80;
+            for chunk in 1..4 {
+                marker[8 * chunk..8 * (chunk + 1)].copy_from_slice(&mantissa_value.to_be_bytes());
+            }
+            let mut known = (layout.starts[last_ring] as u64) + digits[last_ring];
+            let at_end = known.ct_eq(&((layout.npub - 1) as u64));
+            let mut tail: [u8; 32] = prep[32 * (layout.npub - 1)..].try_into().unwrap();
+            let mut prev: [u8; 32] = prep[32 * (layout.npub - 2)..32 * (layout.npub - 1)]
+                .try_into()
+                .unwrap();
+            // When the final ring's known member is the very last slot, the marker
+            // moves one slot earlier; both writes always happen.
+            let mut new_tail = <[u8; 32]>::conditional_select(&tail, &marker, at_end);
+            let mut new_prev = <[u8; 32]>::conditional_select(&marker, &prev, at_end);
+            prep[32 * (layout.npub - 1)..].copy_from_slice(&new_tail);
+            prep[32 * (layout.npub - 2)..32 * (layout.npub - 1)].copy_from_slice(&new_prev);
+            // All of these carry the mantissa value or the known-member position.
+            marker.zeroize();
+            tail.zeroize();
+            prev.zeroize();
+            new_tail.zeroize();
+            new_prev.zeroize();
+            known.zeroize();
+        }
+
+        for i in 0..layout.npub {
+            for b in 0..32 {
+                s[i][b] = raw[i][b] ^ prep[32 * i + b];
+            }
+        }
+        // k_i is the draw at the member the prover knows, chosen without a
+        // secret-dependent index.
+        for i in 0..layout.rings {
+            let mut k = [0u8; 32];
+            for j in 0..layout.rsizes[i] {
+                let is_known = (j as u64).ct_eq(&digits[i]);
+                k = <[u8; 32]>::conditional_select(&s[layout.starts[i] + j], &k, is_known);
+            }
+            nonces[i] = k;
+        }
+
+        // --- digit commitments and ring public keys ----------------------
+        let gen_point = generator.as_point();
+        let mut digit_commits = [ProjectivePoint::identity(); MAX_RINGS];
+        for i in 0..layout.rings {
+            let offset = value_scalar(member_offset(digits[i], i, params.scale));
+            let share = Scalar::from_bytes_be_reduce(&sec[i]);
+            // The offset is secret (it carries the digit) but its 64-bit width
+            // is public, so the public-width multiplication applies.
+            digit_commits[i] = generator
+                .mul_value(&offset)
+                .add(&ProjectivePoint::mul_generator(&share));
+        }
+        let mut encs = [[0u8; 33]; MAX_RINGS];
+        let mut body_buf = [0u8; MAX_BODY_LEN];
+        let body = &mut body_buf[..sign_bytes + 32 * ncommit];
+        for (i, digit_commit) in digit_commits.iter().enumerate().take(ncommit) {
+            let tagged = Commitment::from_point(digit_commit)?.serialize();
+            body[i / 8] |= (tagged[0] & 1) << (i % 8);
+            body[sign_bytes + 32 * i..sign_bytes + 32 * (i + 1)].copy_from_slice(&tagged[1..]);
+            encs[i] = point_enc(&tagged);
+        }
+
+        // Ring member keys are walked per ring rather than kept in a 128-entry
+        // table; see `first_step` (the same trade the verifier makes).
+        let step0 = first_step(&gen_point, params.scale);
+        // Whether the generator has a comb table (public: see `prover_ring_point`).
+        let use_comb = generator.has_comb();
+
+        let m = proof_message(
+            &commit_enc,
+            &generator_enc,
+            header,
+            &encs[..ncommit],
+            extra_commit,
+        );
+
+        // --- Borromean signature, forward pass ---------------------------
+        //
+        // Each ring is walked from member 0 to the end. Before the known member
+        // the running point is a fixed dummy whose chain is discarded; at the
+        // known member it is replaced by k·G with a constant-time select; after it
+        // the real chain runs. The work is identical whatever the digit is.
+        let mut e0h = Sha256::new();
+        let mut step = step0;
+        for i in 0..layout.rings {
+            let start = layout.starts[i];
+            let k = Scalar::from_bytes_be_reduce(&nonces[i]);
+            let kg = ProjectivePoint::mul_generator(&k);
+            let mut r = ProjectivePoint::generator();
+            if i > 0 {
+                step = next_step(&step);
+            }
+            let neg_step = step.negate();
+            let mut member = digit_commits[i];
+            // The prover's opening of the walked member: `share·G + t·H` with
+            // `t` stepping down by `4ⁱ·scale` alongside the point.
+            let share = Scalar::from_bytes_be_reduce(&sec[i]);
+            let unit = value_scalar(member_offset(1, i, params.scale));
+            let mut t = value_scalar(member_offset(digits[i], i, params.scale));
+            for j in 0..layout.rsizes[i] {
+                let is_known = (j as u64).ct_eq(&digits[i]);
+                r = ProjectivePoint::conditional_select(&kg, &r, is_known);
+                if j + 1 < layout.rsizes[i] {
+                    let e = borromean_hash(&m, &sec1(&r), i as u32, (j + 1) as u32);
+                    let e = Scalar::from_bytes_be_reduce(&e);
+                    let sj = Scalar::from_bytes_be_reduce(&s[start + j + 1]);
+                    // Member j + 1.
                     member = member.add(&neg_step);
                     t = t.sub(&unit);
+                    r = prover_ring_point(generator, use_comb, &member, &sj, &e, &share, &t);
                 }
-                let r = prover_ring_point(generator, use_comb, &member, &sj, &scalar, &share, &t);
-                e = borromean_hash(&m, &sec1(&r), i as u32, (j + 1) as u32);
             }
+            let affine = r.to_affine().ok_or(Error::InvalidInput)?;
+            e0h.update(&affine.to_sec1_compressed());
         }
-        // s = k − e·rᵢ at the known member.
-        let k = Scalar::from_bytes_be_reduce(&nonces[i]);
-        let share = Scalar::from_bytes_be_reduce(&sec[i]);
-        let closing = k
-            .sub(&Scalar::from_bytes_be_reduce(&e_known).mul(&share))
-            .to_bytes_be();
-        for j in 0..layout.rsizes[i] {
-            let is_known = (j as u64).ct_eq(&digits[i]);
-            s[start + j] = <[u8; 32]>::conditional_select(&closing, &s[start + j], is_known);
-        }
-        // The challenge at the known member identifies the digit.
-        e_known.zeroize();
-    }
+        e0h.update(&m);
+        let e0 = e0h.finalize();
 
-    let total = header.len() + body.len() + 32 + 32 * layout.npub;
-    // `MAX_PROOF_LEN` bounds every shape, and `out` was checked against it.
-    debug_assert!(total <= MAX_PROOF_LEN);
-    out[..header.len()].copy_from_slice(header);
-    let mut at = header.len();
-    out[at..at + body.len()].copy_from_slice(body);
-    at += body.len();
-    out[at..at + 32].copy_from_slice(&e0);
-    at += 32;
-    for chunk in &s[..layout.npub] {
-        out[at..at + 32].copy_from_slice(chunk);
+        // --- Borromean signature, closing pass ---------------------------
+        let mut step = step0;
+        for i in 0..layout.rings {
+            let start = layout.starts[i];
+            let mut e = borromean_hash(&m, &e0, i as u32, 0);
+            let mut e_known = [0u8; 32];
+            if i > 0 {
+                step = next_step(&step);
+            }
+            let neg_step = step.negate();
+            let mut member = digit_commits[i];
+            let share = Scalar::from_bytes_be_reduce(&sec[i]);
+            let unit = value_scalar(member_offset(1, i, params.scale));
+            let mut t = value_scalar(member_offset(digits[i], i, params.scale));
+            for j in 0..layout.rsizes[i] {
+                let is_known = (j as u64).ct_eq(&digits[i]);
+                e_known = <[u8; 32]>::conditional_select(&e, &e_known, is_known);
+                if j + 1 < layout.rsizes[i] {
+                    let scalar = Scalar::from_bytes_be_reduce(&e);
+                    let sj = Scalar::from_bytes_be_reduce(&s[start + j]);
+                    if j > 0 {
+                        member = member.add(&neg_step);
+                        t = t.sub(&unit);
+                    }
+                    let r =
+                        prover_ring_point(generator, use_comb, &member, &sj, &scalar, &share, &t);
+                    e = borromean_hash(&m, &sec1(&r), i as u32, (j + 1) as u32);
+                }
+            }
+            // s = k − e·rᵢ at the known member.
+            let k = Scalar::from_bytes_be_reduce(&nonces[i]);
+            let share = Scalar::from_bytes_be_reduce(&sec[i]);
+            let closing = k
+                .sub(&Scalar::from_bytes_be_reduce(&e_known).mul(&share))
+                .to_bytes_be();
+            for j in 0..layout.rsizes[i] {
+                let is_known = (j as u64).ct_eq(&digits[i]);
+                s[start + j] = <[u8; 32]>::conditional_select(&closing, &s[start + j], is_known);
+            }
+            // The challenge at the known member identifies the digit.
+            e_known.zeroize();
+        }
+
+        let total = header.len() + body.len() + 32 + 32 * layout.npub;
+        // `MAX_PROOF_LEN` bounds every shape, and `out` was checked against it.
+        debug_assert!(total <= MAX_PROOF_LEN);
+        out[..header.len()].copy_from_slice(header);
+        let mut at = header.len();
+        out[at..at + body.len()].copy_from_slice(body);
+        at += body.len();
+        out[at..at + 32].copy_from_slice(&e0);
         at += 32;
-    }
+        for chunk in &s[..layout.npub] {
+            out[at..at + 32].copy_from_slice(chunk);
+            at += 32;
+        }
 
-    // Wipe everything that would reveal the value or the blinding factor.
+        Ok(at)
+    })();
+
     for buf in sec
         .iter_mut()
         .chain(raw.iter_mut())
+        .chain(s.iter_mut())
         .chain(nonces.iter_mut())
     {
         buf.zeroize();
     }
     prep_buf.zeroize();
     digits.zeroize();
-
-    Ok(at)
+    mantissa_value.zeroize();
+    result
 }
 
 /// What [`rewind`] recovers from a proof.
@@ -1438,175 +1448,198 @@ pub fn rewind(
     // The seed's first 32 bytes are the nonce.
     seed.zeroize();
 
+    // Every buffer below carries the value, the blinding factor, the
+    // embedded message or the DRBG stream that reveals them. They live
+    // outside the single-exit body so that one wipe covers every return
+    // path — the verification failures included, which a caller probing
+    // with a wrong nonce or a mismatched commitment can trigger at will.
     let mut sec = [[0u8; 32]; MAX_RINGS];
     let mut raw = [[0u8; 32]; MAX_NPUB];
-    let mut acc = Scalar::ZERO;
-    let mut slot = 0;
-    for (i, share) in sec.iter_mut().enumerate().take(layout.rings) {
-        if i + 1 < layout.rings {
-            let mut tmp = [0u8; 32];
-            rng.generate(&mut tmp);
-            rng.generate(&mut tmp);
-            *share = tmp;
-            acc = acc.add(&Scalar::from_bytes_be_reduce(&tmp));
-            tmp.zeroize();
-        }
-        for _ in 0..layout.rsizes[i] {
-            rng.generate(&mut raw[slot]);
-            slot += 1;
-        }
-    }
-
-    // The digits of every ring but the last follow from its blinding share:
-    // Cᵢ − rᵢ·G must be dᵢ·4ⁱ·scale·H.
+    let mut folded = [[0u8; 32]; MAX_NPUB];
     let mut digits = [0u64; MAX_RINGS];
-    let mut step = first_step(&parsed.gen_point, params.scale);
-    for i in 0..layout.rings - 1 {
-        if i > 0 {
-            step = next_step(&step);
-        }
-        let share = Scalar::from_bytes_be_reduce(&sec[i]);
-        let target = parsed.digit_commits[i].add(&ProjectivePoint::mul_generator(&share).negate());
-        let mut found = Choice::from(0u8);
-        // Candidates j·stepᵢ, walked by addition from the identity.
-        let mut candidate = ProjectivePoint::identity();
-        for j in 0..layout.rsizes[i] {
-            if j > 0 {
-                candidate = candidate.add(&step);
-            }
-            let hit = target.ct_eq(&candidate);
-            digits[i] = u64::conditional_select(&(j as u64), &digits[i], hit);
-            found |= hit;
-        }
-        if !bool::from(found) {
-            return Err(Error::Verification);
-        }
-    }
-
-    // The last ring's digit comes from the marker slot: the mantissa value the
-    // prover folded into the stream. It sits in the final slot unless that is
-    // the ring's known member, in which case it sits one slot earlier. Both
-    // candidates are examined, so which one carried it stays secret.
-    let last_ring = layout.rings - 1;
     let mut mantissa_value = 0u64;
-    let mut have_marker = Choice::from(0u8);
-    if layout.npub >= 2 {
-        for slot in [layout.npub - 1, layout.npub - 2] {
-            let mut folded = parsed.scalar(slot);
-            for b in 0..32 {
-                folded[b] ^= raw[slot][b];
-            }
-            let mut first = u64::from_be_bytes(folded[8..16].try_into().unwrap());
-            let mut second = u64::from_be_bytes(folded[16..24].try_into().unwrap());
-            let mut third = u64::from_be_bytes(folded[24..32].try_into().unwrap());
-            let shaped = folded[0].ct_eq(&0x80)
-                & folded[1..8].ct_eq(&[0u8; 7][..])
-                & first.ct_eq(&second)
-                & second.ct_eq(&third);
-            let take = shaped & !have_marker;
-            mantissa_value = u64::conditional_select(&first, &mantissa_value, take);
-            have_marker |= shaped;
-            folded.zeroize();
-            first.zeroize();
-            second.zeroize();
-            third.zeroize();
-        }
-    }
-    if params.mantissa != 0 && !bool::from(have_marker) {
-        return Err(Error::Verification);
-    }
-    digits[last_ring] = (mantissa_value >> (2 * last_ring)) & 3;
-    let value = params
-        .min_value
-        .checked_add(
-            mantissa_value
-                .checked_mul(params.scale)
-                .ok_or(Error::Verification)?,
-        )
-        .ok_or(Error::Verification)?;
-
-    // The last ring's blinding share falls out of its closing scalar,
-    // `s = k − e·r`, with `k` the raw draw at the known member. That member is
-    // read by scanning the ring rather than indexing it.
-    let last_start = layout.starts[last_ring];
-    let last_size = layout.rsizes[last_ring];
-    let mut known = (last_start as u64) + digits[last_ring];
+    let mut value = 0u64;
+    let mut known = 0u64;
+    let mut marker_slot = 0u64;
     let mut k_bytes = [0u8; 32];
     let mut s_bytes = [0u8; 32];
     let mut e_bytes = [0u8; 32];
-    for j in 0..last_size {
-        let slot = last_start + j;
-        let hit = (j as u64).ct_eq(&digits[last_ring]);
-        k_bytes = <[u8; 32]>::conditional_select(&raw[slot], &k_bytes, hit);
-        s_bytes = <[u8; 32]>::conditional_select(&parsed.scalar(slot), &s_bytes, hit);
-        e_bytes = <[u8; 32]>::conditional_select(&challenges[slot], &e_bytes, hit);
-    }
-    let e = Scalar::from_bytes_be_reduce(&e_bytes);
-    if bool::from(e.is_zero()) {
-        return Err(Error::Verification);
-    }
-    let last_share = Scalar::from_bytes_be_reduce(&k_bytes)
-        .sub(&Scalar::from_bytes_be_reduce(&s_bytes))
-        .mul(&e.invert());
-    let mut blind_scalar = Scalar::from_bytes_be_reduce(&last_share.to_bytes_be());
-    for share in sec.iter().take(last_ring) {
-        blind_scalar = blind_scalar.add(&Scalar::from_bytes_be_reduce(share));
-    }
-    let blind = blind_scalar.to_bytes_be();
-    sec[last_ring] = last_share.to_bytes_be();
+    let mut blind = [0u8; 32];
+    let mut message = [0u8; MAX_REWOUND_LEN];
 
-    // Undo the stream fold on every slot. A forged scalar carries its embedded
-    // bytes directly; the known member of a ring carries them inside its
-    // closing equation. Both forms are computed and one is selected.
-    let mut folded = [[0u8; 32]; MAX_NPUB];
-    for i in 0..layout.rings {
-        let share = Scalar::from_bytes_be_reduce(&sec[i]);
-        for j in 0..layout.rsizes[i] {
-            let slot = layout.starts[i] + j;
-            let s = Scalar::from_bytes_be_reduce(&parsed.scalar(slot));
-            let e = Scalar::from_bytes_be_reduce(&challenges[slot]);
-            let closing = s.add(&e.mul(&share)).to_bytes_be();
-            let is_known = (j as u64).ct_eq(&digits[i]);
-            let chosen = <[u8; 32]>::conditional_select(&closing, &parsed.scalar(slot), is_known);
-            for b in 0..32 {
-                folded[slot][b] = chosen[b] ^ raw[slot][b];
+    let result = (|| -> Result<Rewound, Error> {
+        let mut acc = Scalar::ZERO;
+        let mut slot = 0;
+        for (i, share) in sec.iter_mut().enumerate().take(layout.rings) {
+            if i + 1 < layout.rings {
+                let mut tmp = [0u8; 32];
+                rng.generate(&mut tmp);
+                rng.generate(&mut tmp);
+                *share = tmp;
+                acc = acc.add(&Scalar::from_bytes_be_reduce(&tmp));
+                tmp.zeroize();
+            }
+            for _ in 0..layout.rsizes[i] {
+                rng.generate(&mut raw[slot]);
+                slot += 1;
             }
         }
-    }
 
-    // Every slot but the last ring's known member and the marker is
-    // recoverable. Which two those are is secret, so the last ring's chunks
-    // are emitted by a constant-time scan rather than an indexed skip.
-    let mut marker_slot = u64::conditional_select(
-        &(layout.npub.saturating_sub(2) as u64),
-        &(layout.npub.saturating_sub(1) as u64),
-        known.ct_eq(&(layout.npub.saturating_sub(1) as u64)),
-    );
-    let mut message = [0u8; MAX_REWOUND_LEN];
-    let mut message_len = 0;
-    for chunk in folded.iter().take(last_start) {
-        message[message_len..message_len + 32].copy_from_slice(chunk);
-        message_len += 32;
-    }
-    for p in 0..last_size.saturating_sub(2) {
-        let mut out = [0u8; 32];
-        let mut rank = 0u64;
-        for j in 0..last_size {
-            let slot = (last_start + j) as u64;
-            let excluded = slot.ct_eq(&known) | slot.ct_eq(&marker_slot);
-            let hit = !excluded & rank.ct_eq(&(p as u64));
-            out = <[u8; 32]>::conditional_select(&folded[last_start + j], &out, hit);
-            rank = u64::conditional_select(&(rank + 1), &rank, !excluded);
+        // The digits of every ring but the last follow from its blinding share:
+        // Cᵢ − rᵢ·G must be dᵢ·4ⁱ·scale·H.
+        let mut step = first_step(&parsed.gen_point, params.scale);
+        for i in 0..layout.rings - 1 {
+            if i > 0 {
+                step = next_step(&step);
+            }
+            let share = Scalar::from_bytes_be_reduce(&sec[i]);
+            let target =
+                parsed.digit_commits[i].add(&ProjectivePoint::mul_generator(&share).negate());
+            let mut found = Choice::from(0u8);
+            // Candidates j·stepᵢ, walked by addition from the identity.
+            let mut candidate = ProjectivePoint::identity();
+            for j in 0..layout.rsizes[i] {
+                if j > 0 {
+                    candidate = candidate.add(&step);
+                }
+                let hit = target.ct_eq(&candidate);
+                digits[i] = u64::conditional_select(&(j as u64), &digits[i], hit);
+                found |= hit;
+            }
+            if !bool::from(found) {
+                return Err(Error::Verification);
+            }
         }
-        message[message_len..message_len + 32].copy_from_slice(&out);
-        message_len += 32;
-    }
 
-    // The recovered opening must actually open the commitment.
-    let reopened = Commitment::with_generator(value, &blind, generator)?;
-    if !bool::from(reopened.ct_eq(commit)) {
-        return Err(Error::Verification);
-    }
+        // The last ring's digit comes from the marker slot: the mantissa value the
+        // prover folded into the stream. It sits in the final slot unless that is
+        // the ring's known member, in which case it sits one slot earlier. Both
+        // candidates are examined, so which one carried it stays secret.
+        let last_ring = layout.rings - 1;
+        let mut have_marker = Choice::from(0u8);
+        if layout.npub >= 2 {
+            for slot in [layout.npub - 1, layout.npub - 2] {
+                let mut folded = parsed.scalar(slot);
+                for b in 0..32 {
+                    folded[b] ^= raw[slot][b];
+                }
+                let mut first = u64::from_be_bytes(folded[8..16].try_into().unwrap());
+                let mut second = u64::from_be_bytes(folded[16..24].try_into().unwrap());
+                let mut third = u64::from_be_bytes(folded[24..32].try_into().unwrap());
+                let shaped = folded[0].ct_eq(&0x80)
+                    & folded[1..8].ct_eq(&[0u8; 7][..])
+                    & first.ct_eq(&second)
+                    & second.ct_eq(&third);
+                let take = shaped & !have_marker;
+                mantissa_value = u64::conditional_select(&first, &mantissa_value, take);
+                have_marker |= shaped;
+                folded.zeroize();
+                first.zeroize();
+                second.zeroize();
+                third.zeroize();
+            }
+        }
+        if params.mantissa != 0 && !bool::from(have_marker) {
+            return Err(Error::Verification);
+        }
+        digits[last_ring] = (mantissa_value >> (2 * last_ring)) & 3;
+        value = params
+            .min_value
+            .checked_add(
+                mantissa_value
+                    .checked_mul(params.scale)
+                    .ok_or(Error::Verification)?,
+            )
+            .ok_or(Error::Verification)?;
+
+        // The last ring's blinding share falls out of its closing scalar,
+        // `s = k − e·r`, with `k` the raw draw at the known member. That member is
+        // read by scanning the ring rather than indexing it.
+        let last_start = layout.starts[last_ring];
+        let last_size = layout.rsizes[last_ring];
+        known = (last_start as u64) + digits[last_ring];
+        for j in 0..last_size {
+            let slot = last_start + j;
+            let hit = (j as u64).ct_eq(&digits[last_ring]);
+            k_bytes = <[u8; 32]>::conditional_select(&raw[slot], &k_bytes, hit);
+            s_bytes = <[u8; 32]>::conditional_select(&parsed.scalar(slot), &s_bytes, hit);
+            e_bytes = <[u8; 32]>::conditional_select(&challenges[slot], &e_bytes, hit);
+        }
+        let e = Scalar::from_bytes_be_reduce(&e_bytes);
+        if bool::from(e.is_zero()) {
+            return Err(Error::Verification);
+        }
+        let last_share = Scalar::from_bytes_be_reduce(&k_bytes)
+            .sub(&Scalar::from_bytes_be_reduce(&s_bytes))
+            .mul(&e.invert());
+        let mut blind_scalar = Scalar::from_bytes_be_reduce(&last_share.to_bytes_be());
+        for share in sec.iter().take(last_ring) {
+            blind_scalar = blind_scalar.add(&Scalar::from_bytes_be_reduce(share));
+        }
+        blind = blind_scalar.to_bytes_be();
+        sec[last_ring] = last_share.to_bytes_be();
+
+        // Undo the stream fold on every slot. A forged scalar carries its embedded
+        // bytes directly; the known member of a ring carries them inside its
+        // closing equation. Both forms are computed and one is selected.
+        for i in 0..layout.rings {
+            let share = Scalar::from_bytes_be_reduce(&sec[i]);
+            for j in 0..layout.rsizes[i] {
+                let slot = layout.starts[i] + j;
+                let s = Scalar::from_bytes_be_reduce(&parsed.scalar(slot));
+                let e = Scalar::from_bytes_be_reduce(&challenges[slot]);
+                let closing = s.add(&e.mul(&share)).to_bytes_be();
+                let is_known = (j as u64).ct_eq(&digits[i]);
+                let chosen =
+                    <[u8; 32]>::conditional_select(&closing, &parsed.scalar(slot), is_known);
+                for b in 0..32 {
+                    folded[slot][b] = chosen[b] ^ raw[slot][b];
+                }
+            }
+        }
+
+        // Every slot but the last ring's known member and the marker is
+        // recoverable. Which two those are is secret, so the last ring's chunks
+        // are emitted by a constant-time scan rather than an indexed skip.
+        marker_slot = u64::conditional_select(
+            &(layout.npub.saturating_sub(2) as u64),
+            &(layout.npub.saturating_sub(1) as u64),
+            known.ct_eq(&(layout.npub.saturating_sub(1) as u64)),
+        );
+        let mut message_len = 0;
+        for chunk in folded.iter().take(last_start) {
+            message[message_len..message_len + 32].copy_from_slice(chunk);
+            message_len += 32;
+        }
+        for p in 0..last_size.saturating_sub(2) {
+            let mut out = [0u8; 32];
+            let mut rank = 0u64;
+            for j in 0..last_size {
+                let slot = (last_start + j) as u64;
+                let excluded = slot.ct_eq(&known) | slot.ct_eq(&marker_slot);
+                let hit = !excluded & rank.ct_eq(&(p as u64));
+                out = <[u8; 32]>::conditional_select(&folded[last_start + j], &out, hit);
+                rank = u64::conditional_select(&(rank + 1), &rank, !excluded);
+            }
+            message[message_len..message_len + 32].copy_from_slice(&out);
+            message_len += 32;
+        }
+
+        // The recovered opening must actually open the commitment.
+        let reopened = Commitment::with_generator(value, &blind, generator)?;
+        if !bool::from(reopened.ct_eq(commit)) {
+            return Err(Error::Verification);
+        }
+
+        Ok(Rewound {
+            value,
+            blind,
+            min_value: params.min_value,
+            max_value: params.max_value,
+            message,
+            message_len,
+        })
+    })();
 
     for buf in sec
         .iter_mut()
@@ -1620,17 +1653,12 @@ pub fn rewind(
     s_bytes.zeroize();
     e_bytes.zeroize();
     mantissa_value.zeroize();
+    value.zeroize();
     known.zeroize();
     marker_slot.zeroize();
-
-    Ok(Rewound {
-        value,
-        blind,
-        min_value: params.min_value,
-        max_value: params.max_value,
-        message,
-        message_len,
-    })
+    blind.zeroize();
+    message.zeroize();
+    result
 }
 
 // =====================================================================
