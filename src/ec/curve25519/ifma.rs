@@ -258,7 +258,7 @@ unsafe fn ladder_ifma(k: &[u8; 32], x1: &Fe) -> (Fe, Fe) {
         }
         let s = _mm256_set1_epi64x((mask_from_bit(swap as u64) & 2) as i64);
         // Lanes 0, 1 after the final conditional swap.
-        let fin = permute_var(_mm256_xor_si256(_mm256_setr_epi64x(0, 1, 2, 3), s), &v);
+        let mut fin = permute_var(_mm256_xor_si256(_mm256_setr_epi64x(0, 1, 2, 3), s), &v);
         let mut lanes = [[0u64; 4]; 5];
         for (i, out) in lanes.iter_mut().enumerate() {
             _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, fin.0[i]);
@@ -277,8 +277,13 @@ unsafe fn ladder_ifma(k: &[u8; 32], x1: &Fe) -> (Fe, Fe) {
             lanes[3][1],
             lanes[4][1],
         ]);
-        // Best-effort wipe of the ladder state left in memory.
+        // Best-effort wipe of the ladder state left in memory: the stored
+        // lanes and the final vector state (lanes 2, 3 hold `(x₃, z₃)`, the
+        // other ladder point, which the caller never sees), as
+        // `scalar_mult_ifma` does for its accumulator.
         crate::zeroize::Zeroize::zeroize(&mut lanes);
+        core::ptr::write_volatile(&mut v, F4([_mm256_setzero_si256(); 5]));
+        core::ptr::write_volatile(&mut fin, F4([_mm256_setzero_si256(); 5]));
         (x2, z2)
     }
 }
