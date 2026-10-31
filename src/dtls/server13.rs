@@ -1938,6 +1938,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         if !super::client_offers_dtls13(sv)? {
             return Err(Error::UnsupportedVersion);
         }
+        // RFC 8446 §4.2.11: when `pre_shared_key` is present it MUST be the
+        // last extension in the ClientHello. The binder check
+        // (`try_accept_psk13`) truncates the hello by the binders field's
+        // length on the assumption that the binders are its tail; a PSK
+        // extension anywhere else would make it hash unrelated bytes.
+        // Mirrors the TLS 1.3 server.
+        if ext::find(&ch.extensions, ExtensionType::PRE_SHARED_KEY).is_some()
+            && ch.extensions.last().map(|(t, _)| *t) != Some(ExtensionType::PRE_SHARED_KEY)
+        {
+            return Err(Error::IllegalParameter);
+        }
         // Fail closed: a server that asks for cookie enforcement but never
         // supplied a `cookie_secret` MUST NOT silently degrade to the
         // no-cookie path (which would emit the full, expensive server flight

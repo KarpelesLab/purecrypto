@@ -2662,6 +2662,49 @@ mod dtls13 {
         assert!(server.take_early_data().is_empty());
     }
 
+    /// Regression (audit 2026-10-31): RFC 8446 §4.2.11 — `pre_shared_key`
+    /// MUST be the last ClientHello extension. The DTLS 1.3 server's binder
+    /// check assumed the binders were the hello's tail without ever checking
+    /// it; a hello with the extension elsewhere is now `illegal_parameter`.
+    #[test]
+    fn psk_extension_not_last_is_illegal_parameter() {
+        use crate::dtls::reassembly::write_fragments;
+        use crate::tls::codec::{ClientHello, ExtensionType, hs_type};
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        // The hello, reassembled from its fragments (13-byte record header,
+        // then a 12-byte handshake header per fragment).
+        let mut body = Vec::new();
+        for dg in client.pop_outbound_datagrams() {
+            body.extend_from_slice(&dg[13 + 12..]);
+        }
+        let (mut ch, _) = ClientHello::decode_dtls(&body).unwrap();
+        // A (syntactically irrelevant) pre_shared_key placed first.
+        ch.extensions
+            .insert(0, (ExtensionType::PRE_SHARED_KEY, alloc::vec![0, 0, 0, 0]));
+        let full = ch.encode_dtls(&[]);
+        let mut dg = Vec::new();
+        for frag in write_fragments(hs_type::CLIENT_HELLO, 0, &full[4..], 1100) {
+            crate::dtls::record::write_record(
+                &mut dg,
+                crate::tls::ContentType::Handshake,
+                crate::tls::ProtocolVersion::DTLSv1_2,
+                0,
+                0,
+                &frag,
+            )
+            .unwrap();
+        }
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-psk-not-last", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        // Epoch-0 rejections are silent drops (RFC 9147 §4.5.2): no flight.
+        assert_eq!(server.feed_datagram(&dg), Ok(()));
+        assert!(server.pop_outbound_datagrams().is_empty());
+        assert!(!server.is_handshake_complete());
+    }
+
     /// HRR-driven group upgrade (RFC 8446 §4.1.4): client offers all three
     /// groups in `supported_groups` but only sends a `key_share` for
     /// P-256. The server prefers X25519MLKEM768 and issues an HRR
