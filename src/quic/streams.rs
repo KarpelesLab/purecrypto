@@ -784,7 +784,9 @@ impl Streams {
         let stream_room = send
             .available_credit()
             .saturating_sub(send.write_buf.len() as u64);
-        core::cmp::min(conn_room, stream_room) as usize
+        // Saturate rather than truncate: on a 32-bit target a peer-granted
+        // credit above 4 GiB would otherwise wrap to a tiny (or zero) value.
+        usize::try_from(core::cmp::min(conn_room, stream_room)).unwrap_or(usize::MAX)
     }
 
     /// RFC 9001 §4.6.1 — adopt the peer's real transport parameters after a
@@ -934,7 +936,10 @@ impl Streams {
         }
         // Connection-level credit.
         let conn_room = self.conn_send_max.saturating_sub(self.conn_send_used);
-        let cap = core::cmp::min(conn_room as usize, data.len());
+        // Saturating u64 -> usize: `as` would wrap a > 4 GiB credit on
+        // 32-bit targets.
+        let conn_room_usize = usize::try_from(conn_room).unwrap_or(usize::MAX);
+        let cap = core::cmp::min(conn_room_usize, data.len());
         if cap == 0 {
             // If the per-stream credit is also exhausted, queue a
             // STREAM_DATA_BLOCKED. If the conn credit is exhausted,
@@ -963,7 +968,7 @@ impl Streams {
         self.conn_send_used += stream_take as u64;
         // Surface DATA_BLOCKED if conn-level credit was the limiter and
         // we accepted strictly less than `data.len()`.
-        if cap < data.len() && conn_room as usize == cap {
+        if cap < data.len() && conn_room_usize == cap {
             self.data_blocked_at = Some(self.conn_send_max);
         }
         // Surface STREAM_DATA_BLOCKED if the per-stream credit limited.

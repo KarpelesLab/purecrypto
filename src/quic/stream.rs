@@ -585,7 +585,12 @@ impl SendStream {
         // credit available than data.len()); we accept up to cap.
         let already_buffered = self.write_buf.len() as u64;
         let stream_room = cap.saturating_sub(already_buffered);
-        let take = core::cmp::min(stream_room as usize, data.len());
+        // Saturating u64 -> usize (a wrapping `as` truncates > 4 GiB of
+        // credit on 32-bit targets).
+        let take = core::cmp::min(
+            usize::try_from(stream_room).unwrap_or(usize::MAX),
+            data.len(),
+        );
         if take == 0 {
             return 0;
         }
@@ -1359,6 +1364,15 @@ mod tests {
         let e = StreamId(0x4000_0000); // ...0000 in low 2 bits
         assert!(e.is_client_initiated());
         assert!(e.is_bidi());
+    }
+
+    /// Credit above 4 GiB saturates instead of wrapping when narrowed to
+    /// `usize`: with `as usize`, 2^32 + 3 bytes of credit became 3 on a
+    /// 32-bit target and a 5-byte write was cut short.
+    #[test]
+    fn enqueue_with_credit_beyond_u32_is_not_truncated() {
+        let mut s = SendStream::new((1u64 << 32) + 3);
+        assert_eq!(s.enqueue(b"hello"), 5);
     }
 
     /// Ready → Send → DataSent → DataRecvd lifecycle (RFC 9000 §3.1).
