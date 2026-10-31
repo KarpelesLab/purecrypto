@@ -19,7 +19,9 @@ use alloc::vec::Vec;
 /// PBES2 recipient it tries from one budget of this size, and a recipient
 /// that would overdraw it is refused without running PBKDF2. A single
 /// recipient may therefore use the full count, but several recipients
-/// cannot multiply it.
+/// cannot multiply it. PBES2 is only used with a key whose `alg` names
+/// the PBES2 variant, so this work is only on offer against keys meant as
+/// passwords.
 pub const MAX_PBES2_ITERATIONS: u64 = 1_000_000;
 
 /// Upper bound on the number of recipients accepted in a general-JSON
@@ -265,8 +267,9 @@ impl Jwe {
 
     /// Decrypts with `key` and returns the plaintext. Every recipient is
     /// tried in turn; the key's `alg`, `use` and `key_ops` must permit the
-    /// recipient's algorithm. PBES2 recipients share one
-    /// [`MAX_PBES2_ITERATIONS`] budget for the whole message.
+    /// recipient's algorithm. `RSA1_5` and PBES2 recipients are only tried
+    /// with a key whose `alg` names that algorithm. PBES2 recipients share
+    /// one [`MAX_PBES2_ITERATIONS`] budget for the whole message.
     pub fn decrypt(&self, key: &Jwk) -> Result<Vec<u8>, Error> {
         let mut last = Error::Decryption;
         let mut pbes2_budget = MAX_PBES2_ITERATIONS;
@@ -1233,7 +1236,14 @@ mod tests {
                 KeyAlg::Pbes2Hs384A192KW,
                 KeyAlg::Pbes2Hs512A256KW,
             ] {
-                round_trip(&Jwk::oct(b"correct horse battery staple"), alg, enc, &fast);
+                let password = Jwk::oct(b"correct horse battery staple");
+                // PBES2 needs a key that opts into it.
+                assert_eq!(
+                    Jwe::encrypt_compact_with_header(&password, alg, enc, &fast, b"x", &mut rng())
+                        .unwrap_err(),
+                    Error::KeyMismatch
+                );
+                round_trip(&password.with_alg(alg.name()).unwrap(), alg, enc, &fast);
             }
         }
     }
@@ -1312,7 +1322,9 @@ mod tests {
 
     #[test]
     fn pbes2_limits() {
-        let key = Jwk::oct(b"password");
+        let key = Jwk::oct(b"password")
+            .with_alg("PBES2-HS256+A128KW")
+            .unwrap();
         let mut extra = Object::new();
         extra
             .insert(
@@ -1353,6 +1365,36 @@ mod tests {
             Jwe::parse(&text).unwrap().decrypt(&key).unwrap_err(),
             Error::Malformed
         );
+        // PBES2 is opt-in: a full-budget token against an `oct` key that
+        // does not name a PBES2 algorithm (an alg-less AES-KW / dir key,
+        // or one pinned to something else) is refused before PBKDF2 runs.
+        let hdr = base64url::encode(
+            br#"{"alg":"PBES2-HS512+A256KW","enc":"A128GCM","p2s":"AAAAAAAAAAA","p2c":1000000}"#,
+        );
+        let text = alloc::format!(
+            "{hdr}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAA.AA.AAAAAAAAAAAAAAAAAAAAAA"
+        );
+        for other in [
+            Jwk::oct(&[7u8; 32]),
+            Jwk::oct(&[7u8; 32]).with_alg("A256KW").unwrap(),
+            Jwk::oct(b"password")
+                .with_alg("PBES2-HS256+A128KW")
+                .unwrap(),
+        ] {
+            assert_eq!(
+                Jwe::parse(&text).unwrap().decrypt(&other).unwrap_err(),
+                Error::KeyMismatch
+            );
+            let mut set = JwkSet::new();
+            set.push(other).unwrap();
+            assert_eq!(
+                Jwe::parse(&text)
+                    .unwrap()
+                    .decrypt_with_set(&set)
+                    .unwrap_err(),
+                Error::NoKey
+            );
+        }
     }
 
     /// A general-JSON JWE (`enc: A128GCM`, plaintext `pt`) with one
@@ -1393,7 +1435,9 @@ mod tests {
     /// each claim `MAX_PBES2_ITERATIONS`.
     #[test]
     fn pbes2_budget_is_per_message() {
-        let key = Jwk::oct(b"password");
+        let key = Jwk::oct(b"password")
+            .with_alg("PBES2-HS256+A128KW")
+            .unwrap();
         let mut set = JwkSet::new();
         set.push(key.clone()).unwrap();
         let good = (1000u64, &[1u8; 16][..], &b"password"[..]);

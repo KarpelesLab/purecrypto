@@ -31,7 +31,13 @@
 //!   names the content encryption); `use` and `key_ops` are enforced; the
 //!   key type must match the algorithm family. Any mismatch is
 //!   [`Error::KeyMismatch`] and no cryptographic operation is attempted.
-//!   `RSA1_5` is only used with a key that explicitly declares `alg: RSA1_5`.
+//!   `RSA1_5` is only used with a key that explicitly declares `alg: RSA1_5`,
+//!   and the `PBES2-*` algorithms only with a key whose `alg` names that
+//!   PBES2 variant (a password is not interchangeable with a key-wrap key,
+//!   and PBES2 lets the message choose up to
+//!   [`MAX_PBES2_ITERATIONS`] PBKDF2 rounds of work). An `alg`-less `oct`
+//!   key is therefore refused ([`Error::KeyMismatch`]) for PBES2, in both
+//!   directions.
 //! * `jwk`, `jku`, `x5c` and `x5u` header parameters are never used to
 //!   select a key. `crit` is rejected: no extension header is understood.
 //! * A JWK Set is rejected when it mixes public and private/secret keys

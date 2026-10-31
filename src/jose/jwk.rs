@@ -584,8 +584,20 @@ impl Jwk {
             if key_alg != expected {
                 return Err(Error::KeyMismatch);
             }
-        } else if alg == KeyAlg::RSA1_5.name() {
-            // RSA1_5 is only honoured for a key that opts into it.
+        } else if matches!(
+            KeyAlg::from_name(alg),
+            Some(
+                KeyAlg::RSA1_5
+                    | KeyAlg::Pbes2Hs256A128KW
+                    | KeyAlg::Pbes2Hs384A192KW
+                    | KeyAlg::Pbes2Hs512A256KW
+            )
+        ) {
+            // RSA1_5 and the PBES2 family are only honoured for a key that
+            // opts into them. PBES2 lets the message pick up to
+            // `MAX_PBES2_ITERATIONS` PBKDF2 rounds, so without the opt-in
+            // any `alg`-less `oct` key (an AES-KW or `dir` key, say) would
+            // let a short forged token buy a large amount of CPU.
             return Err(Error::KeyMismatch);
         }
         match self.key_use.as_deref() {
