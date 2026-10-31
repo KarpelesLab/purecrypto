@@ -1153,12 +1153,26 @@ pub fn sign_into(
         // the top digit it cannot derive from the digit commitments.
         let prep = &mut prep_buf[..32 * layout.npub];
         // The embedded message is secret, and so is its length (the proof is
-        // fixed-size): fill the whole slot with a masked select rather than a
-        // `message.len()`-byte copy.
+        // fixed-size): every byte of every slot goes through the same
+        // branch-free step — a read at an index clamped into the message
+        // (`i` itself while `i < len`, the last byte after), masked to zero
+        // past the end — rather than a `message.len()`-byte copy or a
+        // bounds-checked `get` whose branch flips at `len`. (`idx ≤ last`
+        // always, so the indexing check is never taken.) The only
+        // length-dependent branch is the one-off empty-message fallback,
+        // outside the loop.
+        //
+        // The reads stay inside the caller's slice, so the addresses
+        // touched still reflect the length at cache-line granularity; what
+        // this removes is the per-byte, length-dependent control flow.
+        let src: &[u8] = if message.is_empty() { &[0] } else { message };
+        let len = message.len();
+        let last = src.len() - 1;
         for (i, slot) in prep.iter_mut().enumerate() {
-            let in_range =
-                0u8.wrapping_sub(((i.wrapping_sub(message.len())) >> (usize::BITS - 1)) as u8);
-            *slot = message.get(i).copied().unwrap_or(0) & in_range;
+            // All-ones iff i < len (both far below 2^(BITS−1)).
+            let in_range = 0usize.wrapping_sub(i.wrapping_sub(len) >> (usize::BITS - 1));
+            let idx = (i & in_range) | (last & !in_range);
+            *slot = src[idx] & (in_range as u8);
         }
         let last_ring = layout.rings - 1;
         for (i, digit) in digits.iter_mut().enumerate().take(layout.rings) {
@@ -1985,6 +1999,27 @@ mod tests {
         let mut over = msg.clone();
         over.push(0);
         assert!(sign(&commit, &blind, &nonce, 9, 0, 0, 32, &over, &[], &h()).is_err());
+    }
+
+    /// The clamped, masked message fill embeds every length exactly —
+    /// including the empty message (the one-byte fallback source must not
+    /// leak into the proof) and the slot boundaries — and zero-pads the rest.
+    #[test]
+    fn message_fill_is_exact_at_every_boundary() {
+        let blind = blind_of(33);
+        let nonce = nonce_of(33);
+        let commit = Commitment::new(9, &blind).unwrap();
+        let cap = message_capacity(9, 0, 0, 32).unwrap();
+        for len in [0, 1, 31, 32, 33, 64, cap - 1, cap] {
+            let msg: Vec<u8> = (0..len).map(|i| 0xa5 ^ (i as u8)).collect();
+            let proof = sign(&commit, &blind, &nonce, 9, 0, 0, 32, &msg, &[], &h()).unwrap();
+            let out = rewind(&commit, &proof, &nonce, &[], &h()).unwrap();
+            assert_eq!(&out.message()[..len], &msg[..], "len {len}");
+            assert!(
+                out.message()[len..].iter().all(|&b| b == 0),
+                "padding after len {len}"
+            );
+        }
     }
 
     #[test]
