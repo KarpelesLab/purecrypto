@@ -32,14 +32,21 @@ fn server_cfg() -> &'static Config {
         let server_key = BoxedRsaPrivateKey::from_pkcs1_pem(SERVER_KEY_PEM).unwrap();
         Config::builder()
             .dtls()
+            .os_rng()
+            // Cookie-less, so a fuzzed ClientHello reaches the full
+            // handshake logic instead of stopping at the HelloVerifyRequest
+            // (a fuzzer cannot forge a valid cookie). The cookie check
+            // itself is the narrower surface; without either setting the
+            // server refuses to build at all.
+            .no_cookie()
             .identity(vec![cert_der], SigningKey::Rsa(server_key))
             .build()
     })
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(mut server) = Connection::server(server_cfg()) else {
-        return;
-    };
+    // A config that cannot build a connection would make the target fuzz
+    // nothing at all; fail loudly instead.
+    let mut server = Connection::server(server_cfg()).expect("server connection");
     let _ = server.feed(data);
 });

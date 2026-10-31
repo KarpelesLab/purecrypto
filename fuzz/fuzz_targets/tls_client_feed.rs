@@ -32,6 +32,7 @@ fn client_cfg() -> &'static Config {
         roots.add_der(cert_der).unwrap();
         Config::builder()
             .tls_only()
+            .os_rng()
             .roots(roots)
             .server_name("fuzz.example")
             .build()
@@ -39,8 +40,8 @@ fn client_cfg() -> &'static Config {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(mut client) = Connection::client(client_cfg()) else {
-        return;
-    };
+    // A config that cannot build a connection would make the target fuzz
+    // nothing at all; fail loudly instead.
+    let mut client = Connection::client(client_cfg()).expect("client connection");
     let _ = client.feed(data);
 });

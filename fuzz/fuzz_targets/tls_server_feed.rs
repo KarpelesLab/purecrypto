@@ -41,6 +41,7 @@ fn identity() -> &'static Identity {
         let server_key = BoxedRsaPrivateKey::from_pkcs1_pem(SERVER_KEY_PEM).unwrap();
         let cfg = Config::builder()
             .tls_only()
+            .os_rng()
             .identity(vec![cert_der], SigningKey::Rsa(server_key))
             .build();
         Identity { cfg }
@@ -48,8 +49,8 @@ fn identity() -> &'static Identity {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(mut server) = Connection::server(&identity().cfg) else {
-        return;
-    };
+    // A config that cannot build a connection would make the target fuzz
+    // nothing at all; fail loudly instead.
+    let mut server = Connection::server(&identity().cfg).expect("server connection");
     let _ = server.feed(data);
 });

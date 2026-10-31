@@ -51,6 +51,7 @@ fn identity() -> &'static Identity {
 
         let server_cfg = Config::builder()
             .tls_only()
+            .os_rng()
             .min_version(ProtocolVersion::SSLv3)
             .max_version(ProtocolVersion::TLSv1_1)
             .identity(vec![cert_der.clone()], SigningKey::Rsa(server_key))
@@ -60,6 +61,7 @@ fn identity() -> &'static Identity {
         roots.add_der(cert_der).unwrap();
         let client_cfg = Config::builder()
             .tls_only()
+            .os_rng()
             .min_version(ProtocolVersion::SSLv3)
             .max_version(ProtocolVersion::TLSv1_1)
             .roots(roots)
@@ -78,10 +80,10 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let id = identity();
-    if let Ok(mut server) = Connection::server(&id.server_cfg) {
-        let _ = server.feed(data);
-    }
-    if let Ok(mut client) = Connection::client(&id.client_cfg) {
-        let _ = client.feed(data);
-    }
+    // A config that cannot build a connection would make the target fuzz
+    // nothing at all; fail loudly instead.
+    let mut server = Connection::server(&id.server_cfg).expect("server connection");
+    let _ = server.feed(data);
+    let mut client = Connection::client(&id.client_cfg).expect("client connection");
+    let _ = client.feed(data);
 });
