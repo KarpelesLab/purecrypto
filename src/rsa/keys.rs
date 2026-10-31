@@ -649,12 +649,22 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             // power. `saturating_sub` keeps the bound total for sub-200-bit toy
             // sizes (where the threshold collapses to 0 and the check is a no-op
             // since `p ≠ q`).
-            let diff = if bool::from(p.ct_lt(&q)) {
-                q.wrapping_sub(&p)
-            } else {
-                p.wrapping_sub(&q)
-            };
-            if diff.bit_len() <= half_bits.saturating_sub(100) {
+            //
+            // Both differences are computed and one is selected (the crate's
+            // select returns its first operand on a set choice), so which
+            // prime is larger never steers a branch, and the bound is tested
+            // as `|p − q| >> k == 0` rather than by scanning the secret
+            // difference for its length. Mirrors the boxed generator.
+            let diff = <Uint<LIMBS> as crate::ct::ConditionallySelectable>::conditional_select(
+                &q.wrapping_sub(&p),
+                &p.wrapping_sub(&q),
+                p.ct_lt(&q),
+            );
+            if diff
+                .shr_bits(half_bits.saturating_sub(100))
+                .is_zero()
+                .declassify()
+            {
                 continue;
             }
 
