@@ -13,6 +13,7 @@ use super::base_table::{ED448_BASE_TABLE, ED448_BASE_TOP, ED448_ODD_MULTIPLES};
 use super::field::mask_from_bit;
 use super::field::{Fe, Field, ScalarInt, eq_mask};
 use crate::ct::{Choice, ConstantTimeLess};
+use crate::zeroize::Zeroize;
 
 /// A curve point in extended homogeneous coordinates `(X:Y:Z:T)` with
 /// `T = X·Y/Z`.
@@ -22,6 +23,17 @@ pub(crate) struct Point {
     pub(crate) y: Fe,
     pub(crate) z: Fe,
     pub(crate) t: Fe,
+}
+
+impl Zeroize for Point {
+    /// Wipes all four coordinates: window entries and gathered multiples are
+    /// as secret as the scalar digit that selected them.
+    fn zeroize(&mut self) {
+        self.x.zeroize();
+        self.y.zeroize();
+        self.z.zeroize();
+        self.t.zeroize();
+    }
 }
 
 /// A precomputed affine point in the "Niels" form of the `a = +1` mixed
@@ -34,6 +46,16 @@ struct Affine {
     x: Fe,
     y: Fe,
     dxy: Fe,
+}
+
+#[cfg(feature = "ed448-table")]
+impl Zeroize for Affine {
+    /// Wipes a gathered table entry (it encodes a secret digit).
+    fn zeroize(&mut self) {
+        self.x.zeroize();
+        self.y.zeroize();
+        self.dxy.zeroize();
+    }
 }
 
 #[cfg(feature = "ed448-table")]
@@ -87,15 +109,18 @@ impl Affine {
 /// multiples `[1]base..[8]base`, for a signed digit in `[−8, 8)`: scan all 8
 /// entries with one opaque equality mask each (no secret-indexed memory
 /// access), then negate under one more mask. A zero digit yields the
-/// identity.
+/// identity. `sel` is scratch space (left holding `[|digit|]·base`); the
+/// caller wipes it.
 #[cfg(feature = "ed448-table")]
-fn gather(window: &[[u64; 24]; 8], digit: i8) -> Affine {
+fn gather(window: &[[u64; 24]; 8], digit: i8, sel: &mut [u64; 24]) -> Affine {
     // |digit| and its sign without a branch: `m` is −1 for a negative digit.
     let m = digit >> 7;
     let mag = ((digit ^ m) - m) as u64;
     let neg = (m & 1) as u64;
-    // The identity entry (x = 0, y = 1, d·x·y = 0).
-    let mut sel = [0u64; 24];
+    // The identity entry (x = 0, y = 1, d·x·y = 0), built in the caller's
+    // scratch buffer so the caller can wipe the last selection once at the
+    // end instead of paying a volatile wipe per digit.
+    *sel = [0u64; 24];
     sel[8] = 1;
     for (j, entry) in window.iter().enumerate() {
         let mask = eq_mask(j as u64 + 1, mag);
@@ -103,7 +128,7 @@ fn gather(window: &[[u64; 24]; 8], digit: i8) -> Affine {
             *s ^= mask & (*s ^ e);
         }
     }
-    let a = Affine::from_entry(&sel);
+    let a = Affine::from_entry(sel);
     Affine::select(&a.neg(), &a, mask_from_bit(neg))
 }
 
@@ -283,6 +308,7 @@ impl Field {
         }
 
         let mut acc = self.identity();
+        let mut sel = table[0];
         let mut i = 112;
         while i > 0 {
             i -= 1;
@@ -297,13 +323,20 @@ impl Field {
             // per entry (`eq_mask`, branch-free), applied across all 32
             // limbs of the candidate, so the secret digit never feeds a
             // compare-and-branch the compiler could emit.
-            let mut sel = table[0];
+            sel = table[0];
             for (j, entry) in table.iter().enumerate() {
                 sel = point_select(&sel, entry, eq_mask(j as u64, digit));
             }
             acc = self.point_add(&acc, &sel);
         }
-        acc
+        // The last gathered multiple and the window are functions of the
+        // secret scalar (the window together with the output pins it down
+        // for a known `p`); the accumulator is moved out as the result.
+        let out = acc;
+        acc.zeroize();
+        sel.zeroize();
+        table.zeroize();
+        out
     }
 
     /// Mixed addition `p + q` of an extended point and a stored affine point
@@ -344,25 +377,37 @@ impl Field {
     /// scalar width. The scalar bytes are treated as secret.
     #[cfg(feature = "ed448-table")]
     pub(crate) fn mul_base(&self, scalar: &[u8; 57]) -> Point {
-        let digits = radix16_signed(scalar);
+        // The 113 signed digits encode the secret scalar (the Ed448 nonce
+        // `r` or the private scalar `s`) exactly: wiped before returning,
+        // together with the last gathered entry and its scratch buffer.
+        let mut digits = radix16_signed(scalar);
         let mut acc = self.identity();
+        let mut scratch = [0u64; 24];
+        let mut sel;
         for (j, window) in ED448_BASE_TABLE.iter().enumerate() {
-            acc = self.add_affine(&acc, &gather(window, digits[2 * j + 1]));
+            sel = gather(window, digits[2 * j + 1], &mut scratch);
+            acc = self.add_affine(&acc, &sel);
         }
         acc = self.point_double(&acc);
         acc = self.point_double(&acc);
         acc = self.point_double(&acc);
         acc = self.point_double(&acc);
         for (j, window) in ED448_BASE_TABLE.iter().enumerate() {
-            acc = self.add_affine(&acc, &gather(window, digits[2 * j]));
+            sel = gather(window, digits[2 * j], &mut scratch);
+            acc = self.add_affine(&acc, &sel);
         }
         // d₁₁₂ ∈ {0, 1}: add [2⁴⁴⁸]B or the identity under one mask.
-        let top = Affine::select(
+        sel = Affine::select(
             &Affine::from_entry(&ED448_BASE_TOP),
             &Affine::IDENTITY,
             mask_from_bit(digits[112] as u64),
         );
-        self.add_affine(&acc, &top)
+        let out = self.add_affine(&acc, &sel);
+        digits.zeroize();
+        scratch.zeroize();
+        sel.zeroize();
+        acc.zeroize();
+        out
     }
 
     /// Constant-time fixed-base multiplication `[scalar]·B` without the
