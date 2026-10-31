@@ -175,6 +175,12 @@ impl<const LIMBS: usize> DefaultIsZeroes for crate::bignum::Uint<LIMBS> {
     }
 }
 
+/// A [`Choice`](crate::ct::Choice) derived from secret data (a ladder's
+/// previous scalar bit, a comparison result) is as sensitive as the data, so
+/// it wipes like any primitive. Its `Default` is `false`, and the default
+/// per-element volatile store needs no `unsafe`.
+impl DefaultIsZeroes for crate::ct::Choice {}
+
 impl<Z: DefaultIsZeroes> Zeroize for Z {
     #[inline]
     fn zeroize(&mut self) {
@@ -595,6 +601,16 @@ mod tests {
             i32 => -7, i64 => i64::MIN, i128 => -1, isize => isize::MIN,
             bool => true, char => 'x', f32 => 1.5, f64 => -2.25,
         );
+    }
+
+    #[test]
+    fn choice() {
+        let mut c = crate::ct::Choice::from(1);
+        c.zeroize();
+        assert_eq!(c.unwrap_u8(), 0);
+        let mut cs = [crate::ct::Choice::from(1); 3];
+        cs.zeroize();
+        assert!(cs.iter().all(|c| c.unwrap_u8() == 0));
     }
 
     #[test]

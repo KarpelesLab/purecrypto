@@ -813,6 +813,8 @@ impl Curve {
         }
         Fe::conditional_swap(&mut x1, &mut x2, prev);
         Fe::conditional_swap(&mut z1, &mut z2, prev);
+        // `prev` is the scalar's lowest bit.
+        prev.zeroize();
 
         // (x1 : z1) = kP, (x2 : z2) = (k+1)P. Recover y (López–Dahab Mxy):
         // y_k = (x + x_k)·[(X₁ + xZ₁)(X₂ + xZ₂) + (x² + y)Z₁Z₂] / (xZ₁Z₂) + y.
