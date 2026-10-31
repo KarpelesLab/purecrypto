@@ -149,15 +149,81 @@ pub fn file_keylog(path: &std::path::Path) -> std::io::Result<Arc<WriterKeyLog<s
 /// The platform's `O_NOFOLLOW` open flag, or `None` where its value is not
 /// known here (the caller then relies on the symlink pre-check alone). Kept
 /// as literals so the crate stays free of a `libc` dependency; the values are
-/// the kernels' ABI constants, which do not change.
+/// the kernels' ABI constants, which do not change (cross-checked against
+/// the `libc` crate's per-target definitions). Getting one wrong is not
+/// harmless: on Linux the bit means something else on other architectures
+/// (`O_LARGEFILE` on arm / aarch64), so the open would quietly follow links.
 #[cfg(all(feature = "std", unix))]
 fn o_nofollow() -> Option<i32> {
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "solaris",
-        target_os = "illumos"
+    // Linux / Android: the value is per architecture. arm, aarch64,
+    // powerpc(64) and m68k use 0o100000 (there 0o400000 is `O_LARGEFILE`
+    // or `O_DIRECT`, which would silently follow links); the asm-generic
+    // value 0o400000 holds for the rest Rust targets (sparc and mips spell
+    // it 0x20000 in their own headers — the same number). An architecture
+    // not listed gets `None` and the symlink pre-check alone.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "m68k"
+        )
     ))]
+    {
+        Some(0o100000)
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "s390x",
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "mips32r6",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64",
+            target_arch = "csky",
+            target_arch = "hexagon"
+        )
+    ))]
+    {
+        Some(0o400000)
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "m68k",
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "s390x",
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "mips32r6",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64",
+            target_arch = "csky",
+            target_arch = "hexagon"
+        ))
+    ))]
+    {
+        None
+    }
+    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
     {
         Some(0o400000)
     }
@@ -310,6 +376,40 @@ mod tests {
         // A directory is not a regular file.
         assert!(file_keylog(&dir).is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `O_NOFOLLOW` value is the kernel's for this target: on its own
+    /// (without the symlink pre-check) it makes opening a link fail. A wrong
+    /// value — the arm / aarch64 / powerpc builds once used the x86 one,
+    /// which is `O_LARGEFILE` there — opens straight through the link.
+    #[cfg(unix)]
+    #[test]
+    fn o_nofollow_flag_refuses_links_by_itself() {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        assert!(o_nofollow().is_some());
+        let Some(flag) = o_nofollow() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(alloc::format!(
+            "purecrypto-nofollow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.log");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.join("link.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let open = |p: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .custom_flags(flag)
+                .open(p)
+        };
+        assert!(open(&target).is_ok(), "a regular file opens");
+        assert!(open(&link).is_err(), "O_NOFOLLOW must refuse the link");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
