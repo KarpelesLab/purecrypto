@@ -446,6 +446,14 @@ macro_rules! bls_signature {
         /// is hashed and fed to a streaming pairing product as it comes, so
         /// any number of signers verifies in fixed stack space with one
         /// final exponentiation.
+        ///
+        /// With [`Scheme::ProofOfPossession`] this is only sound when each
+        /// public key's proof of possession has been checked with
+        /// [`PublicKey::pop_verify`]: that scheme neither requires distinct
+        /// messages nor binds the key into the hashed message, so an
+        /// unchecked rogue key (`pk' = x·g − pk_victim`) lets an attacker
+        /// forge an aggregate that appears to include the victim's
+        /// signature.
         pub fn aggregate_verify(
             scheme: Scheme,
             pks: &[PublicKey],
