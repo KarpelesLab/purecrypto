@@ -186,12 +186,13 @@ pub(crate) fn sign_internal<R: SamplerRng>(
         let (mut z0, mut z1) = ff_sampling(&key.fft, &t0, &t1, n, &key.tree, rng);
 
         // v = z·B; s = (c, 0) − v.
-        let mut v0 = key
-            .fft
-            .ifft(&add_fft(&mul_fft(&z0, &key.a), &mul_fft(&z1, &key.c)));
-        let mut v1 = key
-            .fft
-            .ifft(&add_fft(&mul_fft(&z0, &key.b), &mul_fft(&z1, &key.d)));
+        // The products and sums are bound (rather than left as temporaries)
+        // so they can be wiped below: each is `z·B` in FFT form.
+        let (mut za, mut zc) = (mul_fft(&z0, &key.a), mul_fft(&z1, &key.c));
+        let (mut zb, mut zd) = (mul_fft(&z0, &key.b), mul_fft(&z1, &key.d));
+        let (mut v0h, mut v1h) = (add_fft(&za, &zc), add_fft(&zb, &zd));
+        let mut v0 = key.fft.ifft(&v0h);
+        let mut v1 = key.fft.ifft(&v1h);
         let mut s0: Vec<i64> = (0..n).map(|i| c[i] as i64 - v0[i].rint()).collect();
         let mut s1: Vec<i64> = (0..n).map(|i| -v1[i].rint()).collect();
 
@@ -216,11 +217,14 @@ pub(crate) fn sign_internal<R: SamplerRng>(
         }
 
         // Every buffer above is a function of the secret basis: `z0`/`z1` the
-        // sampled lattice point, `v0`/`v1` = z·B, and `s0`/`s1` a rejected (or
-        // accepted) short vector. The accepted `s1` survives only inside the
+        // sampled lattice point, `v0`/`v1` = z·B (and its FFT-domain terms
+        // `za`..`zd`, `v0h`/`v1h`), and `s0`/`s1` a rejected (or accepted)
+        // short vector. The accepted `s1` survives only inside the
         // compressed signature; none of the raw buffers may be freed in the
         // clear, on any exit path.
-        for v in [&mut z0, &mut z1] {
+        for v in [
+            &mut z0, &mut z1, &mut za, &mut zb, &mut zc, &mut zd, &mut v0h, &mut v1h,
+        ] {
             wipe_cplx(v);
         }
         for v in [&mut v0, &mut v1] {

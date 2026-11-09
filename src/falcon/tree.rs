@@ -131,13 +131,14 @@ pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr, sigmin: Fpr) -> FftTree {
     let mut d00 = g[0][0].clone();
     let l10 = div_fft(&g[1][0], &g[0][0]);
     let mut adj_l10 = adj_fft(&l10);
-    let mut tmp = mul_fft(&mul_fft(&l10, &adj_l10), &g[0][0]);
+    let mut l10_sq = mul_fft(&l10, &adj_l10);
+    let mut tmp = mul_fft(&l10_sq, &g[0][0]);
     let mut d11 = sub_fft(&g[1][1], &tmp);
 
     let node = if m > 2 {
         // Bisect each diagonal block and recurse.
-        let (d00a, d00b) = fft.split_fft(&d00, m);
-        let (d11a, d11b) = fft.split_fft(&d11, m);
+        let (d00a, mut d00b) = fft.split_fft(&d00, m);
+        let (d11a, mut d11b) = fft.split_fft(&d11, m);
         let mut g0: Gram = [[d00a.clone(), d00b.clone()], [adj_fft(&d00b), d00a]];
         let mut g1: Gram = [[d11a.clone(), d11b.clone()], [adj_fft(&d11b), d11a]];
         let left = Box::new(ffldl(fft, &g0, sigma, sigmin));
@@ -146,6 +147,10 @@ pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr, sigmin: Fpr) -> FftTree {
         // build; only the tree itself (wiped by `FftTree::wipe`) may survive.
         wipe_gram(&mut g0);
         wipe_gram(&mut g1);
+        // `d00a`/`d11a` moved into the matrices above; the off-diagonal
+        // halves were cloned in, so the originals are still live here.
+        wipe_cplx(&mut d00b);
+        wipe_cplx(&mut d11b);
         FftTree::Node { l10, left, right }
     } else {
         // m == 2: the two diagonal entries become normalized leaves.
@@ -157,7 +162,7 @@ pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr, sigmin: Fpr) -> FftTree {
             right: Box::new(FftTree::Leaf(leaf1)),
         }
     };
-    for v in [&mut d00, &mut d11, &mut tmp, &mut adj_l10] {
+    for v in [&mut d00, &mut d11, &mut tmp, &mut l10_sq, &mut adj_l10] {
         wipe_cplx(v);
     }
     node
@@ -192,7 +197,8 @@ pub(crate) fn ff_sampling<R: SamplerRng>(
             let z1 = fft.merge_fft(&z1a, &z1b, m);
             // t0' = t0 + (t1 − z1)·L10.
             let mut diff = sub_fft(t1, &z1);
-            let mut t0b = add_fft(t0, &mul_fft(&diff, l10));
+            let mut corr = mul_fft(&diff, l10);
+            let mut t0b = add_fft(t0, &corr);
             let (mut t0a, mut t0bb) = fft.split_fft(&t0b, m);
             let (mut z0a, mut z0b) = ff_sampling(fft, &t0a, &t0bb, m / 2, left, rng);
             let z0 = fft.merge_fft(&z0a, &z0b, m);
@@ -201,8 +207,8 @@ pub(crate) fn ff_sampling<R: SamplerRng>(
             // only the merged `(z0, z1)` leave this frame, so the rest is wiped
             // rather than freed in the clear.
             for v in [
-                &mut t1a, &mut t1b, &mut z1a, &mut z1b, &mut diff, &mut t0b, &mut t0a, &mut t0bb,
-                &mut z0a, &mut z0b,
+                &mut t1a, &mut t1b, &mut z1a, &mut z1b, &mut diff, &mut corr, &mut t0b, &mut t0a,
+                &mut t0bb, &mut z0a, &mut z0b,
             ] {
                 wipe_cplx(v);
             }

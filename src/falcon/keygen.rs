@@ -317,22 +317,44 @@ fn reduce(f: &[Zint], g: &[Zint], cap_f: &mut [Zint], cap_g: &mut [Zint]) {
             .map(|c| Fpr::of_i64(c.shr(sz - 53).to_i64().unwrap_or(0)))
             .collect()
     };
-    let fa = fft.fft(&adjust(f, size));
-    let ga = fft.fft(&adjust(g, size));
-    let adj_fa = adj_fft(&fa);
-    let adj_ga = adj_fft(&ga);
-    let den = add_fft(&mul_fft(&fa, &adj_fa), &mul_fft(&ga, &adj_ga));
+    // Every array below is the secret basis (top bits of `f, g`, then of the
+    // `F, G` being reduced) or a function of it; each is bound and wiped
+    // rather than left to be freed in the clear as a temporary.
+    let fft_of = |p: &[Zint], sz: usize| -> Vec<Cplx> {
+        let mut c = adjust(p, sz);
+        let h = fft.fft(&c);
+        wipe_fpr(&mut c);
+        h
+    };
+    // `x·adj_x + y·adj_y` (FFT domain), with the two products wiped.
+    let dot = |x: &[Cplx], adj_x: &[Cplx], y: &[Cplx], adj_y: &[Cplx]| -> Vec<Cplx> {
+        let (mut p, mut q) = (mul_fft(x, adj_x), mul_fft(y, adj_y));
+        let s = add_fft(&p, &q);
+        wipe_cplx(&mut p);
+        wipe_cplx(&mut q);
+        s
+    };
+    let mut fa = fft_of(f, size);
+    let mut ga = fft_of(g, size);
+    let mut adj_fa = adj_fft(&fa);
+    let mut adj_ga = adj_fft(&ga);
+    let mut den = dot(&fa, &adj_fa, &ga, &adj_ga);
 
     loop {
         let big = max_bitsize(cap_f, cap_g);
         if big < size {
             break;
         }
-        let cap_fa = fft.fft(&adjust(cap_f, big));
-        let cap_ga = fft.fft(&adjust(cap_g, big));
-        let num = add_fft(&mul_fft(&cap_fa, &adj_fa), &mul_fft(&cap_ga, &adj_ga));
-        let k_real = fft.ifft(&div_fft(&num, &den));
+        let mut cap_fa = fft_of(cap_f, big);
+        let mut cap_ga = fft_of(cap_g, big);
+        let mut num = dot(&cap_fa, &adj_fa, &cap_ga, &adj_ga);
+        let mut quo = div_fft(&num, &den);
+        let mut k_real = fft.ifft(&quo);
         let k: Vec<Zint> = k_real.iter().map(|x| Zint::from_i64(x.rint())).collect();
+        for v in [&mut cap_fa, &mut cap_ga, &mut num, &mut quo] {
+            wipe_cplx(v);
+        }
+        wipe_fpr(&mut k_real);
         if k.iter().all(|z| z.is_zero()) {
             break;
         }
@@ -343,6 +365,9 @@ fn reduce(f: &[Zint], g: &[Zint], cap_f: &mut [Zint], cap_g: &mut [Zint]) {
             cap_f[i] = cap_f[i].sub(&fk[i].shl(sh));
             cap_g[i] = cap_g[i].sub(&gk[i].shl(sh));
         }
+    }
+    for v in [&mut fa, &mut ga, &mut adj_fa, &mut adj_ga, &mut den] {
+        wipe_cplx(v);
     }
 }
 
@@ -415,13 +440,13 @@ fn gs_norm(f: &[i64], g: &[i64], n: usize) -> Fpr {
     let mut f_fft = fft.fft(&ff);
     let mut g_fft = fft.fft(&gf);
     // ffgg = f·adj(f) + g·adj(g).
-    let mut ffgg = add_fft(
-        &mul_fft(&f_fft, &adj_fft(&f_fft)),
-        &mul_fft(&g_fft, &adj_fft(&g_fft)),
-    );
+    let (mut adj_f, mut adj_g) = (adj_fft(&f_fft), adj_fft(&g_fft));
+    let (mut ff_sq, mut gg_sq) = (mul_fft(&f_fft, &adj_f), mul_fft(&g_fft, &adj_g));
+    let mut ffgg = add_fft(&ff_sq, &gg_sq);
     // Ft = adj(g)/ffgg, Gt = adj(f)/ffgg, then back to coefficients.
-    let mut ft = fft.ifft(&div_fft(&adj_fft(&g_fft), &ffgg));
-    let mut gt = fft.ifft(&div_fft(&adj_fft(&f_fft), &ffgg));
+    let (mut ft_fft, mut gt_fft) = (div_fft(&adj_g, &ffgg), div_fft(&adj_f, &ffgg));
+    let mut ft = fft.ifft(&ft_fft);
+    let mut gt = fft.ifft(&gt_fft);
     let mut s_ftgt = Fpr::from_f64(0.0);
     for c in ft.iter().chain(gt.iter()) {
         s_ftgt = s_ftgt.add(c.mul(*c));
@@ -431,7 +456,17 @@ fn gs_norm(f: &[i64], g: &[i64], n: usize) -> Fpr {
 
     // Only the scalar norm leaves; every array here is the secret basis (or an
     // invertible function of it) and must not be freed in the clear.
-    for v in [&mut f_fft, &mut g_fft, &mut ffgg] {
+    for v in [
+        &mut f_fft,
+        &mut g_fft,
+        &mut ffgg,
+        &mut adj_f,
+        &mut adj_g,
+        &mut ff_sq,
+        &mut gg_sq,
+        &mut ft_fft,
+        &mut gt_fft,
+    ] {
         wipe_cplx(v);
     }
     for v in [&mut ff, &mut gf, &mut ft, &mut gt] {

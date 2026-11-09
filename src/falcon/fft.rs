@@ -166,11 +166,16 @@ impl Fft {
     /// evaluations (see "Layout" on [`Fft`]).
     pub(crate) fn fft(&self, f: &[Fpr]) -> Vec<Cplx> {
         debug_assert_eq!(f.len(), self.n);
-        let cplx: Vec<Cplx> = f
+        let mut cplx: Vec<Cplx> = f
             .iter()
             .map(|&c| Cplx::new(c, Fpr::from_f64(0.0)))
             .collect();
-        self.fft_rec(&cplx)
+        let out = self.fft_rec(&cplx);
+        // `cplx` is a verbatim copy of the input polynomial, which on the
+        // signing and key-expansion paths is a secret one (`f`, `g`, `F`,
+        // `G`); it must not be freed in the clear.
+        wipe_cplx(&mut cplx);
+        out
     }
 
     fn fft_rec(&self, f: &[Cplx]) -> Vec<Cplx> {
@@ -190,17 +195,26 @@ impl Fft {
             f0.push(f[2 * i]);
             f1.push(f[2 * i + 1]);
         }
-        let f0h = self.fft_rec(&f0);
-        let f1h = self.fft_rec(&f1);
-        self.merge_fft(&f0h, &f1h, m)
+        let mut f0h = self.fft_rec(&f0);
+        let mut f1h = self.fft_rec(&f1);
+        let out = self.merge_fft(&f0h, &f1h, m);
+        // The coefficient halves and their transforms are lossless images of
+        // the (possibly secret) input; only the merged result leaves.
+        for v in [&mut f0, &mut f1, &mut f0h, &mut f1h] {
+            wipe_cplx(v);
+        }
+        out
     }
 
     /// Inverse FFT: the `n/2` stored evaluations → real coefficients
     /// (length `n`).
     pub(crate) fn ifft(&self, fh: &[Cplx]) -> Vec<Fpr> {
         debug_assert_eq!(fh.len(), self.n / 2);
-        let c = self.ifft_rec(fh, self.n);
-        c.iter().map(|z| z.re).collect()
+        let mut c = self.ifft_rec(fh, self.n);
+        let out = c.iter().map(|z| z.re).collect();
+        // The complex coefficient array duplicates the returned polynomial.
+        wipe_cplx(&mut c);
+        out
     }
 
     /// Inverse FFT of a logical size-`m` polynomial stored as `m/2` values.
@@ -212,14 +226,19 @@ impl Fft {
                 Cplx::new(fh[0].im, Fpr::from_f64(0.0)),
             ];
         }
-        let (f0h, f1h) = self.split_fft(fh, m);
-        let f0 = self.ifft_rec(&f0h, m / 2);
-        let f1 = self.ifft_rec(&f1h, m / 2);
+        let (mut f0h, mut f1h) = self.split_fft(fh, m);
+        let mut f0 = self.ifft_rec(&f0h, m / 2);
+        let mut f1 = self.ifft_rec(&f1h, m / 2);
         // Coefficient merge (interleave even/odd).
         let mut out = vec![Cplx::zero(); m];
         for i in 0..m / 2 {
             out[2 * i] = f0[i];
             out[2 * i + 1] = f1[i];
+        }
+        // As in `fft_rec`: the split halves are images of the (possibly
+        // secret) input and only the interleaved result leaves.
+        for v in [&mut f0h, &mut f1h, &mut f0, &mut f1] {
+            wipe_cplx(v);
         }
         out
     }
