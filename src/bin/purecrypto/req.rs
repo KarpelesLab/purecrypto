@@ -1,6 +1,8 @@
 //! `purecrypto req` — create or inspect a PKCS#10 certificate request.
 
-use crate::pki::{describe_key, dns_general_names, format_dn, load_key, parse_sans, parse_subject};
+use crate::pki::{
+    describe_key, display_dn, dns_general_names, load_key, parse_sans, parse_subject,
+};
 use crate::template::CertTemplate;
 use crate::util::{Args, die, read_input, write_output};
 use purecrypto::x509::CertificationRequest;
@@ -50,10 +52,13 @@ pub(crate) fn run(args: Args) {
             .unwrap_or_else(|e| die(format!("bad key: {e}")));
         let sans = csr.subject_alt_names().unwrap_or_default();
         println!("Certificate Request:");
-        println!("    Subject: {}", format_dn(&subject));
+        println!("    Subject: {}", display_dn(&subject));
         println!("    Public Key: {}", describe_key(&key));
         if !sans.is_empty() {
-            println!("    Subject Alternative Names: {}", sans.join(", "));
+            println!(
+                "    Subject Alternative Names: {}",
+                crate::util::terminal_safe(&sans.join(", "))
+            );
         }
         return;
     }

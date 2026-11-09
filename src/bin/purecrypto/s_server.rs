@@ -508,7 +508,10 @@ fn run_tcp(
         }
         crate::ech::report_server(conn, ech);
         if let Some(p) = conn.alpn_selected() {
-            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
+            eprintln!(
+                "ALPN: {}",
+                crate::util::terminal_safe(&String::from_utf8_lossy(p))
+            );
         }
         if !conn.peer_certificates().is_empty() {
             eprintln!(
@@ -862,7 +865,10 @@ fn run_udp_one(
         };
         eprintln!("handshake complete: {v_str}");
         if let Some(p) = conn.alpn_selected() {
-            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
+            eprintln!(
+                "ALPN: {}",
+                crate::util::terminal_safe(&String::from_utf8_lossy(p))
+            );
         }
         tlsinfo::report_handshake(&conn, Role::Server);
     }

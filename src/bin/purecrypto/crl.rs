@@ -5,8 +5,8 @@
 //! *not* revoked, 2 any error — so `crl -is-revoked … && reject` cannot
 //! mistake an unreadable or forged CRL for an answer.
 
-use crate::pki::format_dn;
-use crate::util::{Args, die, from_hex, read_input, set_error_exit_status, to_hex};
+use crate::pki::display_dn;
+use crate::util::{Args, die, from_hex, read_input, set_error_exit_status, terminal_safe, to_hex};
 use purecrypto::x509::{Certificate, CertificateRevocationList};
 
 /// Exit status for "the serial is not on the list" (`-is-revoked` only).
@@ -89,10 +89,10 @@ fn text(crl: &CertificateRevocationList) {
         .next_update()
         .unwrap_or_else(|e| die(format!("bad nextUpdate: {e}")));
     println!("Certificate Revocation List:");
-    println!("    Issuer:      {}", format_dn(&issuer));
-    println!("    This Update: {}", this.as_str());
+    println!("    Issuer:      {}", display_dn(&issuer));
+    println!("    This Update: {}", terminal_safe(this.as_str()));
     if let Some(n) = next {
-        println!("    Next Update: {}", n.as_str());
+        println!("    Next Update: {}", terminal_safe(n.as_str()));
     }
     // RFC 5280 §5.2.3 cRLNumber: an unsigned big-endian magnitude of up to
     // 20 octets, so print it as hex rather than squeezing it into a u64.
@@ -109,16 +109,10 @@ fn text(crl: &CertificateRevocationList) {
         // `0x`-prefixed, exactly what `-serial` takes back: unprefixed hex
         // made of digits only would be read as a decimal number there.
         let serial = serial_display(&e.serial);
+        let date = terminal_safe(e.revocation_date.as_str());
         match e.reason {
-            Some(r) => println!(
-                "        serial={serial} date={} reason={:?}",
-                e.revocation_date.as_str(),
-                r
-            ),
-            None => println!(
-                "        serial={serial} date={}",
-                e.revocation_date.as_str()
-            ),
+            Some(r) => println!("        serial={serial} date={date} reason={r:?}"),
+            None => println!("        serial={serial} date={date}"),
         }
     }
 }

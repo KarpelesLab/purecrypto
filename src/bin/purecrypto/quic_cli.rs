@@ -165,7 +165,7 @@ fn sha256_hex(data: &[u8]) -> String {
 fn negotiated_line(qc: &QuicConnection) -> String {
     let alpn = qc
         .alpn_protocol()
-        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .map(|a| crate::util::terminal_safe(&String::from_utf8_lossy(a)))
         .unwrap_or_else(|| "none".into());
     let suite = qc
         .negotiated_cipher_suite()

@@ -8904,3 +8904,75 @@ fn crl_runs_every_mode_and_separates_errors_from_not_revoked() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `x509 -text [-ext]` printed strings taken from the certificate raw: a
+/// subjectAltName (or subject) carrying ESC / BEL / CR could retitle the
+/// terminal, clear the screen, or forge output lines when an operator
+/// inspected someone else's certificate. Same class as the `pkcs12 -info`
+/// fix; every certificate-controlled string now goes through the shared
+/// terminal-safe escaper.
+#[test]
+fn x509_text_escapes_control_characters_from_the_certificate() {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::extension::{GeneralName, subject_alt_name};
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let dir = std::env::temp_dir().join(format!("pc_x509_esc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = Ed25519PrivateKey::generate(&mut OsRng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let exts = [subject_alt_name(&[
+        GeneralName::Uri("https://a.example/\u{1b}]0;x\u{7}".into()),
+        GeneralName::Dns("b.example\r\n    Issuer:    CN=Forged".into()),
+        GeneralName::Email("c\u{1b}[2J@example".into()),
+    ])];
+    let cert = Certificate::self_signed_with_extensions(
+        &CertSigner::Ed25519(&key),
+        &DistinguishedName::common_name("Evil CA"),
+        &validity,
+        7,
+        &exts,
+    )
+    .expect("build the hostile certificate");
+    let path = dir.join("evil.crt");
+    std::fs::write(&path, cert.to_pem()).unwrap();
+
+    for argv in [
+        vec!["x509", "-in", path.to_str().unwrap(), "-text", "-ext"],
+        vec!["x509", "-in", path.to_str().unwrap(), "-text"],
+    ] {
+        let (out, err, ok) = run_capture(&argv, b"");
+        assert!(ok, "{argv:?}: {err}");
+        let bad: Vec<char> = out
+            .chars()
+            .chain(err.chars())
+            .filter(|c| c.is_control() && *c != '\n')
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{argv:?} printed control characters {bad:?}:\n{out:?}"
+        );
+        // The embedded CR/LF did not start a forged line.
+        assert!(
+            !out.lines()
+                .any(|l| l.trim_start().starts_with("Issuer:    CN=Forged")),
+            "{out}"
+        );
+    }
+    let (out, _err, ok) = run_capture(
+        &["x509", "-in", path.to_str().unwrap(), "-text", "-ext"],
+        b"",
+    );
+    assert!(ok);
+    assert!(
+        out.contains("URI:https://a.example/\\u{1b}]0;x\\u{7}"),
+        "{out}"
+    );
+    assert!(out.contains("email:c\\u{1b}[2J@example"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

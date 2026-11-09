@@ -54,6 +54,27 @@ pub(crate) fn die(msg: impl AsRef<str>) -> ! {
     exit(ERROR_EXIT_STATUS.load(std::sync::atomic::Ordering::SeqCst));
 }
 
+/// Renders a string the CLI did not write itself — a certificate, CSR or CRL
+/// field, a PKCS#12 `friendlyName`, anything a peer sent — for the terminal.
+/// Control characters (ESC, CR, LF, BEL, …), bidirectional overrides and
+/// other non-printables come out as Rust escapes (`\u{1b}`, `\r`) and a
+/// backslash as `\\`, so crafted input cannot inject terminal escape
+/// sequences, forge extra output lines, or reorder what is displayed.
+/// Printable text, non-ASCII included, passes through unchanged.
+///
+/// Every place that prints such a string goes through here (or through
+/// [`crate::pki::display_dn`] for a distinguished name).
+pub(crate) fn terminal_safe(s: &str) -> String {
+    // `escape_debug` also escapes the two quote characters, which are
+    // harmless on a terminal and common in names (`O=Bob's Bakery`). Every
+    // quote in its output carries exactly one escaping backslash of its own,
+    // so dropping that backslash is unambiguous.
+    s.escape_debug()
+        .to_string()
+        .replace("\\'", "'")
+        .replace("\\\"", "\"")
+}
+
 /// Parses a TLS identity private key from PEM in every form the stack can
 /// sign with: PKCS#1 RSA, SEC1 EC, and PKCS#8 (RSA, EC, Ed25519, Ed448,
 /// ML-DSA-44/65/87). The PKCS#8 parsers each check the algorithm OID, so
@@ -1146,6 +1167,29 @@ mod tests {
         let a = args(&["-dtls1_2", "-servername", "-quic"], &["-servername"]);
         assert_eq!(a.last_pos("-quic"), None);
         assert_eq!(a.last_pos("-dtls1_2"), Some(0));
+    }
+
+    #[test]
+    fn terminal_safe_escapes_control_characters() {
+        assert_eq!(terminal_safe("my key"), "my key");
+        assert_eq!(terminal_safe("Bj\u{f6}rn"), "Bj\u{f6}rn");
+        // Quotes are harmless and common in names; a backslash is doubled
+        // so the escapes stay unambiguous.
+        assert_eq!(terminal_safe("O=Bob's \"Bakery\""), "O=Bob's \"Bakery\"");
+        assert_eq!(terminal_safe("a\\'b"), "a\\\\'b");
+        let hostile = "x\u{1b}]0;pwned\u{7}\r\nfriendly name: forged";
+        let out = terminal_safe(hostile);
+        assert!(
+            !out.chars().any(|c| c.is_control()),
+            "control character survived: {out:?}"
+        );
+        assert_eq!(out, "x\\u{1b}]0;pwned\\u{7}\\r\\nfriendly name: forged");
+        // Bidirectional overrides and other invisible format characters too.
+        assert_eq!(
+            terminal_safe("a\u{202e}b\u{200b}c"),
+            "a\\u{202e}b\\u{200b}c"
+        );
+        assert_eq!(terminal_safe("\u{9b}31m"), "\\u{9b}31m"); // C1 CSI
     }
 
     #[test]

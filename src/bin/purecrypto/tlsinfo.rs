@@ -78,7 +78,7 @@ pub(crate) fn report_handshake(conn: &Connection, role: Role) {
         eprintln!(
             "external PSK: {}",
             conn.external_psk_identity()
-                .map(|id| String::from_utf8_lossy(id).into_owned())
+                .map(|id| crate::util::terminal_safe(&String::from_utf8_lossy(id)))
                 .unwrap_or_else(|| "none".to_string())
         );
         let early = if conn.early_data_accepted() {

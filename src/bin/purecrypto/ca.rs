@@ -27,8 +27,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::pki::{
-    MAX_X509_UNIX_TIME, Profile, default_extensions, describe_key, dns_general_names, format_dn,
-    guard_requester_chosen_cn, issuer_ski_bytes, json_escape, parse_sans, parse_subject,
+    MAX_X509_UNIX_TIME, Profile, default_extensions, describe_key, display_dn, dns_general_names,
+    format_dn, guard_requester_chosen_cn, issuer_ski_bytes, json_escape, parse_sans, parse_subject,
     random_serial, require_ca_issuer, require_key_matches_cert, spki_bit_string_contents,
     validity_days, verify_and_screen_csr,
 };
@@ -418,8 +418,8 @@ fn run_init(args: Args) {
     println!(
         "Initialized CA at {} (subject: {}, algorithm: {}, serial: {root_serial:#x}, valid {days_n} days)",
         ca.dir.display(),
-        format_dn(&subject),
-        algorithm
+        display_dn(&subject),
+        crate::util::terminal_safe(algorithm)
     );
 }
 
@@ -751,7 +751,7 @@ fn resolve_sign_csr_sans(args: &Args, csr: &CertificationRequest) -> Vec<String>
             "purecrypto: WARNING: -copy-csr-san given — certifying {} subjectAltName(s) \
              claimed by the request without any verification: {}",
             requested.len(),
-            requested.join(", ")
+            crate::util::terminal_safe(&requested.join(", "))
         );
         return requested;
     }
@@ -760,7 +760,7 @@ fn resolve_sign_csr_sans(args: &Args, csr: &CertificationRequest) -> Vec<String>
          pass -san NAME[,NAME] to certify names you have verified, or -copy-csr-san \
          to take the request's list as-is",
         requested.len(),
-        requested.join(", ")
+        crate::util::terminal_safe(&requested.join(", "))
     );
     Vec::new()
 }
@@ -1026,7 +1026,7 @@ fn run_show(args: Args) {
     let crl_present = ca.crl_pem().exists();
 
     println!("CA at {}", ca.dir.display());
-    println!("    Subject:    {}", format_dn(&subject));
+    println!("    Subject:    {}", display_dn(&subject));
     println!("    Key:        {}", describe_key(&key));
     // Not "next serial": serials are random per issuance (BR §7.1). This is
     // the audit index the next `issued.jsonl` row will carry.
@@ -1043,10 +1043,10 @@ fn run_show(args: Args) {
         let pem = read_string(&ca.crl_pem());
         if let Ok(crl) = CertificateRevocationList::from_pem(&pem) {
             if let Ok(t) = crl.this_update() {
-                println!("    thisUpdate: {}", t.as_str());
+                println!("    thisUpdate: {}", crate::util::terminal_safe(t.as_str()));
             }
             if let Ok(Some(t)) = crl.next_update() {
-                println!("    nextUpdate: {}", t.as_str());
+                println!("    nextUpdate: {}", crate::util::terminal_safe(t.as_str()));
             }
             if let Ok(entries) = crl.entries() {
                 println!("    CRL entries: {}", entries.len());

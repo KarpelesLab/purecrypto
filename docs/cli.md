@@ -25,6 +25,11 @@ Two conventions apply across the tool:
   not.
 - **Positional arguments beyond what a subcommand takes are refused** with
   `unexpected argument(s): ...` rather than silently ignored.
+- **Strings read out of a certificate, CSR, CRL, PKCS#12 file or the peer
+  are printed terminal-safe**: control characters, bidirectional overrides
+  and other non-printables appear as escapes (`\u{1b}`, `\r`) and a backslash
+  as `\\`, so inspecting a hostile file cannot drive the terminal or forge
+  output lines.
 - **A flag's value is only ever a value.** The token after a value-taking
   flag is taken verbatim, even when it looks like a flag, and is never also
   read as one: `ca issue ... -cn -ca` issues a leaf whose commonName is the

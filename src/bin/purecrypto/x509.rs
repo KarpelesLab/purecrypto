@@ -1,11 +1,11 @@
 //! `purecrypto x509` — inspect, self-sign, or CA-sign certificates.
 
 use crate::pki::{
-    Profile, default_extensions, describe_key, dns_general_names, format_dn,
+    Profile, default_extensions, describe_key, display_dn, dns_general_names,
     guard_requester_chosen_cn, load_key, parse_sans, parse_subject, random_serial,
     require_ca_issuer, require_key_matches_cert, validity_days, verify_and_screen_csr,
 };
-use crate::util::{Args, die, read_input, write_output};
+use crate::util::{Args, die, read_input, terminal_safe, write_output};
 use purecrypto::x509::extension::Extension;
 use purecrypto::x509::{Certificate, CertificationRequest, oid};
 
@@ -57,7 +57,7 @@ fn resolve_req_sans(args: &Args, csr: &CertificationRequest) -> Vec<String> {
             "purecrypto: WARNING: -copy-csr-san given — certifying {} subjectAltName(s) \
              claimed by the request without any verification: {}",
             requested.len(),
-            requested.join(", ")
+            terminal_safe(&requested.join(", "))
         );
         return requested;
     }
@@ -66,7 +66,7 @@ fn resolve_req_sans(args: &Args, csr: &CertificationRequest) -> Vec<String> {
          pass -san NAME[,NAME] to certify names you have verified, or -copy-csr-san \
          to take the request's list as-is",
         requested.len(),
-        requested.join(", ")
+        terminal_safe(&requested.join(", "))
     );
     Vec::new()
 }
@@ -89,13 +89,24 @@ fn dump(cert: &Certificate, with_ext: bool) {
         .unwrap_or_else(|e| die(format!("bad key: {e}")));
     let sans = cert.subject_alt_names().unwrap_or_default();
     println!("Certificate:");
-    println!("    Subject:   {}", format_dn(&subject));
-    println!("    Issuer:    {}", format_dn(&issuer));
-    println!("    Not Before: {}", validity.not_before.as_str());
-    println!("    Not After:  {}", validity.not_after.as_str());
+    // Everything below is read out of the certificate: attacker-controlled
+    // when the file is someone else's, so it is printed terminal-safe.
+    println!("    Subject:   {}", display_dn(&subject));
+    println!("    Issuer:    {}", display_dn(&issuer));
+    println!(
+        "    Not Before: {}",
+        terminal_safe(validity.not_before.as_str())
+    );
+    println!(
+        "    Not After:  {}",
+        terminal_safe(validity.not_after.as_str())
+    );
     println!("    Public Key: {}", describe_key(&key));
     if !sans.is_empty() {
-        println!("    Subject Alternative Names: {}", sans.join(", "));
+        println!(
+            "    Subject Alternative Names: {}",
+            terminal_safe(&sans.join(", "))
+        );
     }
     if with_ext {
         match cert.extensions() {
@@ -227,9 +238,11 @@ fn decode_known_extension(e: &Extension) -> Option<String> {
         while !seq.is_empty() {
             let (t, v) = seq.read_any().ok()?;
             match t {
-                0x82 => parts.push(format!("DNS:{}", String::from_utf8_lossy(v))),
-                0x81 => parts.push(format!("email:{}", String::from_utf8_lossy(v))),
-                0x86 => parts.push(format!("URI:{}", String::from_utf8_lossy(v))),
+                // IA5String bodies straight out of the certificate: never
+                // printed raw (an ESC here would drive the terminal).
+                0x82 => parts.push(format!("DNS:{}", lossy_terminal_safe(v))),
+                0x81 => parts.push(format!("email:{}", lossy_terminal_safe(v))),
+                0x86 => parts.push(format!("URI:{}", lossy_terminal_safe(v))),
                 0x87 => parts.push(format!("IP:{}", hex(v))),
                 _ => parts.push(format!("tag-{t:#x}")),
             }
@@ -252,6 +265,12 @@ fn decode_known_extension(e: &Extension) -> Option<String> {
         return Some("(empty)".into());
     }
     None
+}
+
+/// Attacker-controlled string bytes, decoded lossily and made
+/// [`terminal_safe`].
+fn lossy_terminal_safe(bytes: &[u8]) -> String {
+    terminal_safe(&String::from_utf8_lossy(bytes))
 }
 
 fn hex(bytes: &[u8]) -> String {

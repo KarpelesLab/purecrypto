@@ -20,7 +20,7 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::dtls_io::{self, Clock, Link, Step};
-use crate::pki::format_dn;
+use crate::pki::display_dn;
 use crate::tlsinfo::{self, Role};
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn};
 use purecrypto::tls::{
@@ -137,15 +137,15 @@ fn print_chain(chain: &[Vec<u8>], showcerts: bool) {
     for (i, der) in chain.iter().enumerate() {
         match Certificate::from_der(der.clone()) {
             Ok(cert) => {
-                let subject = cert.subject().map(|d| format_dn(&d)).unwrap_or_default();
-                let issuer = cert.issuer().map(|d| format_dn(&d)).unwrap_or_default();
+                let subject = cert.subject().map(|d| display_dn(&d)).unwrap_or_default();
+                let issuer = cert.issuer().map(|d| display_dn(&d)).unwrap_or_default();
                 eprintln!("  [{i}] subject: {subject}");
                 eprintln!("      issuer:  {issuer}");
                 if let Ok(v) = cert.validity() {
                     eprintln!(
                         "      valid:   {} .. {}",
-                        v.not_before.as_str(),
-                        v.not_after.as_str()
+                        crate::util::terminal_safe(v.not_before.as_str()),
+                        crate::util::terminal_safe(v.not_after.as_str())
                     );
                 }
                 if showcerts {
@@ -588,7 +588,10 @@ fn tcp_handshake_and_report(conn: &mut Connection, sock: &mut TcpStream, opts: &
             }
         );
         if let Some(p) = conn.alpn_selected() {
-            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
+            eprintln!(
+                "ALPN: {}",
+                crate::util::terminal_safe(&String::from_utf8_lossy(p))
+            );
         }
         crate::ech::report_client(conn, opts.ech);
         tlsinfo::report_handshake(conn, Role::Client);
@@ -751,7 +754,10 @@ fn run_udp(conn: &mut Connection, link: &mut Link, opts: &UdpOpts) {
             }
         );
         if let Some(p) = conn.alpn_selected() {
-            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
+            eprintln!(
+                "ALPN: {}",
+                crate::util::terminal_safe(&String::from_utf8_lossy(p))
+            );
         }
         tlsinfo::report_handshake(conn, Role::Client);
         let chain = conn.peer_certificates();

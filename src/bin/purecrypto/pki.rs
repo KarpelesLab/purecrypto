@@ -244,6 +244,13 @@ pub(crate) fn format_dn(dn: &DistinguishedName) -> String {
     parts.join(", ")
 }
 
+/// [`format_dn`] for the terminal: the name comes out of a certificate, CSR
+/// or CRL, so it goes through [`terminal_safe`](crate::util::terminal_safe).
+/// (The raw form stays for the CA ledger, which has its own JSON escaping.)
+pub(crate) fn display_dn(dn: &DistinguishedName) -> String {
+    crate::util::terminal_safe(&format_dn(dn))
+}
+
 /// A human label for a public key's algorithm and size/curve.
 pub(crate) fn describe_key(key: &AnyPublicKey) -> String {
     match key {
@@ -606,6 +613,8 @@ pub(crate) fn guard_requester_chosen_cn(
     if !cn_is_host_identifier(cn) {
         return;
     }
+    // From here on the name is only printed, and it is the requester's.
+    let cn = &crate::util::terminal_safe(cn);
     if allow {
         eprintln!(
             "purecrypto: WARNING: -allow-cn-hostname given — certifying the request's own \
