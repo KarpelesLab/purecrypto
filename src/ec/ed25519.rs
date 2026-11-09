@@ -312,22 +312,45 @@ pub(crate) fn check_pkcs8_public_key(
     Ok(())
 }
 
+/// Encodes an RFC 8410 §7 PKCS#8 v1 `OneAsymmetricKey` for the algorithm
+/// `oid` (which takes no parameters) around the raw private key `secret`.
+///
+/// Every intermediate that holds `secret` — the `CurvePrivateKey` OCTET
+/// STRING, the `privateKey` OCTET STRING wrapping it, and the concatenated
+/// body — is wiped on drop, and the body is allocated at its final size so
+/// no growth leaves an unwiped copy behind; only the returned encoding
+/// outlives the call. Shared by the Ed448, X25519 and X448 encoders.
+#[cfg(all(feature = "der", feature = "alloc"))]
+pub(crate) fn encode_pkcs8_private_key(oid: &[u64], secret: &[u8]) -> alloc::vec::Vec<u8> {
+    use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+    use crate::zeroize::Zeroizing;
+    let version = encode_integer(&[0]);
+    let algid = encode_sequence(&oid_tlv(oid));
+    // privateKey is an OCTET STRING wrapping the CurvePrivateKey OCTET STRING.
+    let curve_key = Zeroizing::new(encode_octet_string(secret));
+    let privkey = Zeroizing::new(encode_octet_string(&curve_key));
+    let mut body = Zeroizing::new(alloc::vec::Vec::with_capacity(
+        version.len() + algid.len() + privkey.len(),
+    ));
+    for part in [&version[..], &algid[..], &privkey[..]] {
+        body.extend_from_slice(part);
+    }
+    encode_sequence(&body)
+}
+
 /// PKCS#8 v1 (RFC 8410) private-key serialization.
 #[cfg(all(feature = "der", feature = "alloc"))]
 impl Ed25519PrivateKey {
     /// Encodes the key as a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
-        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
-        let version = encode_integer(&[0]);
-        let algid = encode_sequence(&oid_tlv(ED25519_OID));
-        // privateKey is an OCTET STRING wrapping the CurvePrivateKey OCTET STRING.
-        let privkey = encode_octet_string(&encode_octet_string(&self.seed));
-        encode_sequence(&[version, algid, privkey].concat())
+        encode_pkcs8_private_key(ED25519_OID, &self.seed)
     }
 
     /// Encodes the key as a PKCS#8 PEM document (`-----BEGIN PRIVATE KEY-----`).
     pub fn to_pkcs8_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+        // The plaintext DER is wiped once it has been armoured.
+        let der = crate::zeroize::Zeroizing::new(self.to_pkcs8_der());
+        crate::der::pem_encode("PRIVATE KEY", &der)
     }
 
     /// Parses a PKCS#8 `OneAsymmetricKey` DER structure.
@@ -352,6 +375,8 @@ impl Ed25519PrivateKey {
         let mut seed = [0u8; 32];
         seed.copy_from_slice(seed_bytes);
         let key = Self::from_seed(seed);
+        // `from_seed` took a copy, which the key wipes on drop; wipe ours.
+        crate::zeroize::Zeroize::zeroize(&mut seed);
         // RFC 5958 (PKCS#8 v2 / OneAsymmetricKey): an OPTIONAL `[0]` attributes
         // (IMPLICIT SET, constructed) and an OPTIONAL `[1]` publicKey may
         // follow the privateKey OCTET STRING. Attributes are skipped; the
@@ -367,7 +392,9 @@ impl Ed25519PrivateKey {
 
     /// Parses a PKCS#8 PEM private key.
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
-        Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+        // The decoded plaintext DER is wiped once the key has been read.
+        let der = crate::zeroize::Zeroizing::new(crate::der::pem_decode(pem, "PRIVATE KEY")?);
+        Self::from_pkcs8_der(&der)
     }
 
     /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 + RFC 8018
@@ -380,7 +407,8 @@ impl Ed25519PrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> alloc::vec::Vec<u8> {
-        crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+        let der = crate::zeroize::Zeroizing::new(self.to_pkcs8_der());
+        crate::kdf::pbes2::encrypt(&der, password, params, rng)
     }
 
     /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
@@ -392,7 +420,8 @@ impl Ed25519PrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> alloc::string::String {
-        crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+        let der = crate::zeroize::Zeroizing::new(self.to_pkcs8_der());
+        crate::kdf::pbes2::encrypt_pem(&der, password, params, rng)
     }
 
     /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it back to a
@@ -402,16 +431,20 @@ impl Ed25519PrivateKey {
         der: &[u8],
         password: &[u8],
     ) -> Result<Self, crate::der::Error> {
-        let inner =
-            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?;
+        // The decrypted PrivateKeyInfo is wiped once the key has been read.
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 
     /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
     #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, crate::der::Error> {
-        let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
-            .map_err(|_| crate::der::Error::Malformed)?;
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt_pem(pem, password)
+                .map_err(|_| crate::der::Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 }
@@ -871,6 +904,27 @@ mod tests {
         let sk = Ed25519PrivateKey::from_bytes(seed);
         let der = sk.to_pkcs8_der();
         let sk2 = Ed25519PrivateKey::from_pkcs8_der(&der).expect("v1 parse");
+        assert_eq!(sk2.to_bytes(), seed);
+    }
+
+    /// The PKCS#8 encoder's output is pinned byte for byte (RFC 8410 §7
+    /// layout; captured before its temporaries were made wipe-on-drop), and
+    /// the PEM body is the same bytes.
+    #[cfg(all(feature = "der", feature = "alloc"))]
+    #[test]
+    fn pkcs8_encoding_is_pinned() {
+        let seed =
+            from_hex::<32>("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let sk = Ed25519PrivateKey::from_bytes(seed);
+        let mut expected = from_hex::<16>("302e020100300506032b657004220420").to_vec();
+        expected.extend_from_slice(&seed);
+        assert_eq!(sk.to_pkcs8_der(), expected);
+        let pem = sk.to_pkcs8_pem();
+        assert_eq!(
+            crate::der::pem_decode(&pem, "PRIVATE KEY").unwrap(),
+            expected
+        );
+        let sk2 = Ed25519PrivateKey::from_pkcs8_pem(&pem).unwrap();
         assert_eq!(sk2.to_bytes(), seed);
     }
 

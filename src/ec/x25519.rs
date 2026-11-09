@@ -299,17 +299,14 @@ pub(crate) const X25519_OID: &[u64] = &[1, 3, 101, 110];
 impl X25519PrivateKey {
     /// Encodes the key as a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
-        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
-        let version = encode_integer(&[0]);
-        let algid = encode_sequence(&oid_tlv(X25519_OID));
-        // privateKey is an OCTET STRING wrapping the CurvePrivateKey OCTET STRING.
-        let privkey = encode_octet_string(&encode_octet_string(&self.scalar));
-        encode_sequence(&[version, algid, privkey].concat())
+        super::ed25519::encode_pkcs8_private_key(X25519_OID, &self.scalar)
     }
 
     /// Encodes the key as a PKCS#8 PEM document (`-----BEGIN PRIVATE KEY-----`).
     pub fn to_pkcs8_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+        // The plaintext DER is wiped once it has been armoured.
+        let der = crate::zeroize::Zeroizing::new(self.to_pkcs8_der());
+        crate::der::pem_encode("PRIVATE KEY", &der)
     }
 
     /// Parses a PKCS#8 `OneAsymmetricKey` DER structure.
@@ -334,6 +331,8 @@ impl X25519PrivateKey {
         let mut scalar = [0u8; 32];
         scalar.copy_from_slice(scalar_bytes);
         let key = X25519PrivateKey { scalar };
+        // The key holds a copy, which it wipes on drop; wipe ours.
+        scalar.zeroize();
         // RFC 5958 (PKCS#8 v2): skip the OPTIONAL `[0]` attributes; the
         // OPTIONAL `[1]` publicKey must match the scalar's (see
         // `ed25519::check_pkcs8_public_key`).
@@ -348,7 +347,9 @@ impl X25519PrivateKey {
 
     /// Parses a PKCS#8 PEM private key.
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
-        Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+        // The decoded plaintext DER is wiped once the key has been read.
+        let der = crate::zeroize::Zeroizing::new(crate::der::pem_decode(pem, "PRIVATE KEY")?);
+        Self::from_pkcs8_der(&der)
     }
 }
 

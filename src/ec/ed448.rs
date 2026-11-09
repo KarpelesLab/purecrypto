@@ -235,17 +235,14 @@ fn fe_to_scalar_bytes(x: &ScalarInt) -> [u8; 57] {
 impl Ed448PrivateKey {
     /// Encodes the key as a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
-        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
-        let version = encode_integer(&[0]);
-        let algid = encode_sequence(&oid_tlv(ED448_OID));
-        // privateKey is an OCTET STRING wrapping the CurvePrivateKey OCTET STRING.
-        let privkey = encode_octet_string(&encode_octet_string(&self.seed));
-        encode_sequence(&[version, algid, privkey].concat())
+        super::ed25519::encode_pkcs8_private_key(ED448_OID, &self.seed)
     }
 
     /// Encodes the key as a PKCS#8 PEM document (`-----BEGIN PRIVATE KEY-----`).
     pub fn to_pkcs8_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+        // The plaintext DER is wiped once it has been armoured.
+        let der = crate::zeroize::Zeroizing::new(self.to_pkcs8_der());
+        crate::der::pem_encode("PRIVATE KEY", &der)
     }
 
     /// Parses a PKCS#8 `OneAsymmetricKey` DER structure.
@@ -270,6 +267,8 @@ impl Ed448PrivateKey {
         let mut seed = [0u8; 57];
         seed.copy_from_slice(seed_bytes);
         let key = Self::from_seed(seed);
+        // `from_seed` took a copy, which the key wipes on drop; wipe ours.
+        crate::zeroize::Zeroize::zeroize(&mut seed);
         // RFC 5958 (PKCS#8 v2 / OneAsymmetricKey): skip the OPTIONAL `[0]`
         // attributes; the OPTIONAL `[1]` publicKey must match the seed's
         // (see `ed25519::check_pkcs8_public_key`).
@@ -284,7 +283,9 @@ impl Ed448PrivateKey {
 
     /// Parses a PKCS#8 PEM private key.
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
-        Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+        // The decoded plaintext DER is wiped once the key has been read.
+        let der = crate::zeroize::Zeroizing::new(crate::der::pem_decode(pem, "PRIVATE KEY")?);
+        Self::from_pkcs8_der(&der)
     }
 
     /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 + RFC 8018 §6.2)
@@ -297,7 +298,8 @@ impl Ed448PrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> alloc::vec::Vec<u8> {
-        crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+        let der = crate::zeroize::Zeroizing::new(self.to_pkcs8_der());
+        crate::kdf::pbes2::encrypt(&der, password, params, rng)
     }
 
     /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
@@ -309,7 +311,8 @@ impl Ed448PrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> alloc::string::String {
-        crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+        let der = crate::zeroize::Zeroizing::new(self.to_pkcs8_der());
+        crate::kdf::pbes2::encrypt_pem(&der, password, params, rng)
     }
 
     /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it back to a PKCS#8
@@ -319,16 +322,20 @@ impl Ed448PrivateKey {
         der: &[u8],
         password: &[u8],
     ) -> Result<Self, crate::der::Error> {
-        let inner =
-            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?;
+        // The decrypted PrivateKeyInfo is wiped once the key has been read.
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 
     /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
     #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, crate::der::Error> {
-        let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
-            .map_err(|_| crate::der::Error::Malformed)?;
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt_pem(pem, password)
+                .map_err(|_| crate::der::Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 }
@@ -665,6 +672,23 @@ mod tests {
         assert!(
             der.windows(3).any(|w| w == [0x2b, 0x65, 0x71]),
             "id-Ed448 OID not present in DER"
+        );
+    }
+
+    /// The PKCS#8 encoder's output is pinned byte for byte (RFC 8410 §7
+    /// layout; captured before its temporaries were made wipe-on-drop), and
+    /// the PEM body is the same bytes.
+    #[cfg(all(feature = "der", feature = "alloc"))]
+    #[test]
+    fn pkcs8_encoding_is_pinned() {
+        let seed: [u8; 57] = core::array::from_fn(|i| i as u8 + 1);
+        let sk = Ed448PrivateKey::from_bytes(seed);
+        let mut expected = from_hex::<16>("3047020100300506032b6571043b0439").to_vec();
+        expected.extend_from_slice(&seed);
+        assert_eq!(sk.to_pkcs8_der(), expected);
+        assert_eq!(
+            crate::der::pem_decode(&sk.to_pkcs8_pem(), "PRIVATE KEY").unwrap(),
+            expected
         );
     }
 
