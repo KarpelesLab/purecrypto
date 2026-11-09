@@ -631,8 +631,10 @@ Behaviour worth knowing:
   stderr banner, so a harness can start the server first and read the port
   back from that line, rather than probing for a free port and hoping nobody
   takes it before the server binds. `-quiet` suppresses the banner.
-- A TCP close without a TLS `close_notify` is reported as a possible
-  truncation on stderr and the client exits non-zero.
+- A TCP stream that ends without a TLS `close_notify` — a bare FIN, or a
+  read error such as a connection reset — is reported as a possible
+  truncation on stderr and the client exits non-zero. (A read *timeout* is
+  not an end of stream: the client then closes the session itself.)
 - `-key` must match `-cert`; a mismatch is refused before listening.
 - `-Verify` (client certificate authentication) works over DTLS as over
   TCP: the DTLS server sends a `CertificateRequest`, verifies the client's

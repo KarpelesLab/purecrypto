@@ -817,6 +817,49 @@ fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream, ech: &crate:
     }
 }
 
+/// How the TCP data phase ends, as far as one `read` outcome can tell.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamEnd {
+    /// Nothing arrived within the read timeout: this side stops waiting and
+    /// closes the session itself.
+    Idle,
+    /// The transport ended after the peer's close_notify: a clean end.
+    Clean,
+    /// The transport ended — a FIN, or an error such as a reset — *before*
+    /// any close_notify. Whatever was printed may be a truncated response;
+    /// the string says what happened.
+    Cut(String),
+}
+
+/// Classifies a data-phase `read` result; `None` means "keep reading"
+/// (bytes arrived, or the call was merely interrupted).
+///
+/// A TCP stream is only cleanly over once the peer's close_notify has been
+/// seen (RFC 8446 §6.1 / RFC 5246 §7.2.1). Without it the stream was cut —
+/// by the server, or by an on-path attacker — and it makes no difference
+/// whether the cut shows up as an EOF (an injected FIN) or as a read error
+/// (an injected RST): both are forgeable, neither is authenticated. The
+/// error case used to count as a clean end and exit 0.
+fn classify_stream_end(read: &std::io::Result<usize>, got_close_notify: bool) -> Option<StreamEnd> {
+    use std::io::ErrorKind;
+    let cut = |what: String| {
+        Some(if got_close_notify {
+            StreamEnd::Clean
+        } else {
+            StreamEnd::Cut(what)
+        })
+    };
+    match read {
+        Ok(0) => cut("connection closed without close_notify".into()),
+        Ok(_) => None,
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            Some(StreamEnd::Idle)
+        }
+        Err(e) if e.kind() == ErrorKind::Interrupted => None,
+        Err(e) => cut(format!("connection lost without close_notify ({e})")),
+    }
+}
+
 fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream, opts: &TcpOpts<'_>) {
     let mut stdout = std::io::stdout();
 
@@ -860,46 +903,37 @@ fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream, opts: &TcpOpts<'_
 
     let mut buf = [0u8; 4096];
     loop {
-        match sock.read(&mut buf) {
-            Ok(0) => {
-                // A TCP EOF is only a clean end of stream if the peer's
-                // close_notify came first (RFC 8446 §6.1 / RFC 5246 §7.2.1).
-                // Without it, the stream was cut — by the server, or by an
-                // on-path attacker injecting a FIN — and whatever we printed
-                // may be a truncated response. Say so and fail, like
-                // `openssl s_client` reporting "unexpected eof while reading".
-                if !conn.received_close_notify() {
-                    let _ = stdout.flush();
-                    eprintln!(
-                        "WARNING: connection closed without close_notify (possible truncation)"
-                    );
-                    std::process::exit(1);
-                }
-                break;
+        let read = sock.read(&mut buf);
+        match classify_stream_end(&read, conn.received_close_notify()) {
+            None => {}
+            Some(StreamEnd::Idle | StreamEnd::Clean) => break,
+            Some(StreamEnd::Cut(what)) => {
+                // The stream was cut — by the server, or by an on-path
+                // attacker injecting a FIN or a RST — and whatever we
+                // printed may be a truncated response. Say so and fail,
+                // like `openssl s_client` reporting "unexpected eof while
+                // reading".
+                let _ = stdout.flush();
+                eprintln!("WARNING: {what} (possible truncation)");
+                std::process::exit(1);
             }
-            Ok(n) => {
-                if let Err(e) = conn.feed(&buf[..n]) {
-                    // A record that fails to decrypt / a fatal alert
-                    // mid-stream is a broken session, not a clean end.
-                    let _ = stdout.flush();
-                    die(format!("TLS error after handshake: {e:?}"));
-                }
-                // The engine answers a `KeyUpdate(update_requested)` with its
-                // own KeyUpdate: put it on the wire before anything else
-                // goes out under the new key.
-                flush_out(conn, sock);
-                let plain = conn.recv().unwrap_or_default();
-                if !plain.is_empty() && stdout.write_all(&plain).is_err() {
-                    break;
-                }
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                break;
-            }
-            Err(_) => break,
+        }
+        // (Only an `Interrupted` read is an `Err` here: every other error
+        // ended the loop above.)
+        let Ok(n) = read else { continue };
+        if let Err(e) = conn.feed(&buf[..n]) {
+            // A record that fails to decrypt / a fatal alert mid-stream is
+            // a broken session, not a clean end.
+            let _ = stdout.flush();
+            die(format!("TLS error after handshake: {e:?}"));
+        }
+        // The engine answers a `KeyUpdate(update_requested)` with its own
+        // KeyUpdate: put it on the wire before anything else goes out under
+        // the new key.
+        flush_out(conn, sock);
+        let plain = conn.recv().unwrap_or_default();
+        if !plain.is_empty() && stdout.write_all(&plain).is_err() {
+            break;
         }
     }
     // Tell the peer we are done (RFC 8446 §6.1 / RFC 5246 §7.2.1) rather
@@ -1195,5 +1229,60 @@ fn drive_udp_data(conn: &mut Connection, link: &mut Link, clock: &Clock, opts: &
     }
     if !opts.quiet {
         tlsinfo::report_session_end(conn);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StreamEnd, classify_stream_end};
+    use std::io::{Error, ErrorKind};
+
+    /// A TCP reset mid-stream used to hit `Err(_) => break` and end the
+    /// session as if it were clean (exit 0), while an EOF without
+    /// close_notify warned and failed. Both are a cut stream.
+    #[test]
+    fn a_reset_before_close_notify_is_a_truncation() {
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::Other,
+        ] {
+            let read = Err(Error::from(kind));
+            assert!(
+                matches!(
+                    classify_stream_end(&read, false),
+                    Some(StreamEnd::Cut(what)) if what.contains("without close_notify")
+                ),
+                "{kind:?} before close_notify must be reported as a cut"
+            );
+            // After the peer's close_notify the session is over either way.
+            assert_eq!(classify_stream_end(&read, true), Some(StreamEnd::Clean));
+        }
+        assert!(matches!(
+            classify_stream_end(&Ok(0), false),
+            Some(StreamEnd::Cut(_))
+        ));
+        assert_eq!(classify_stream_end(&Ok(0), true), Some(StreamEnd::Clean));
+    }
+
+    #[test]
+    fn timeouts_and_data_are_not_a_truncation() {
+        for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            for seen in [false, true] {
+                assert_eq!(
+                    classify_stream_end(&Err(Error::from(kind)), seen),
+                    Some(StreamEnd::Idle)
+                );
+            }
+        }
+        for seen in [false, true] {
+            assert_eq!(classify_stream_end(&Ok(17), seen), None);
+            assert_eq!(
+                classify_stream_end(&Err(Error::from(ErrorKind::Interrupted)), seen),
+                None
+            );
+        }
     }
 }
