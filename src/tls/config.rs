@@ -321,7 +321,8 @@ pub struct Config {
     pub ticket_key: Option<Secret32>,
     /// Cap on bytes the server accepts as 0-RTT early data. `0` = no 0-RTT.
     pub max_early_data_size: u32,
-    /// 0-RTT replay protection (TLS 1.3 server). `None` = skip the check.
+    /// 0-RTT replay protection (TLS 1.3 / DTLS 1.3 server). `None` = skip
+    /// the check.
     #[cfg(feature = "std")]
     pub replay_window: Option<ReplayWindow>,
 
@@ -964,10 +965,10 @@ fn version_rank(v: ProtocolVersion) -> u8 {
 /// | `renegotiation` / `allow_renegotiation` / `renegotiation_limit` | inert | yes (not the `tls-legacy` versions) | inert | inert (not supported) | inert |
 /// | `stapled_ocsp_response` | yes | yes | inert | inert | yes |
 /// | `stapled_crl` | yes | inert | inert | inert | yes |
-/// | `ticket_key` | yes | yes | inert (no tickets) | inert (no tickets) | yes |
-/// | `max_early_data`, `replay_window` | yes | inert | inert (no 0-RTT) | inert (no 0-RTT) | via `QuicConfig::enable_early_data` |
-/// | `resumption_session` | yes | yes | inert | inert | via `QuicConfig::resumption` |
-/// | `psk_modes` | yes | inert | inert (no PSKs) | inert | yes |
+/// | `ticket_key` | yes | yes | yes | yes (RFC 5077 tickets) | yes |
+/// | `max_early_data`, `replay_window` | yes (not under a pinned `verification_time`) | inert | yes, with a `ticket_key` (not under a pinned `verification_time`) | inert (no 0-RTT) | via `QuicConfig::enable_early_data` |
+/// | `resumption_session` | yes | yes | yes | yes | via `QuicConfig::resumption` |
+/// | `psk_modes` | yes | inert | yes (`psk_dhe_ke` only) | inert | yes |
 /// | `external_psk` | yes | inert (certificate handshake) | **refused** | **refused** | yes |
 /// | `preferred_key_exchange_group` | yes | inert | inert | inert | yes |
 /// | RFC 7250 raw public keys / cert-type preferences | yes | yes | **refused** | **refused** | yes |
@@ -1363,13 +1364,15 @@ impl ConfigBuilder {
         self.inner.stapled_ocsp_response = Some(der);
         self
     }
-    /// TLS 1.2 / 1.3 server: session-ticket / NewSessionTicket key (a
+    /// (D)TLS 1.2 / 1.3 server: session-ticket / NewSessionTicket key (a
     /// `[u8; 32]` or a [`Secret32`]).
     pub fn ticket_key(mut self, key: impl Into<Secret32>) -> Self {
         self.inner.ticket_key = Some(key.into());
         self
     }
-    /// TLS 1.3 server: 0-RTT max early data size.
+    /// TLS 1.3 / DTLS 1.3 server: 0-RTT max early data size (the DTLS 1.3
+    /// server accepts early data only on a resumption, so it also needs a
+    /// [`Self::ticket_key`]).
     ///
     /// 0-RTT data is replayable. The server enforces the RFC 8446 §8.2
     /// ticket-age freshness window (~10 s), which bounds the replay
@@ -1380,9 +1383,9 @@ impl ConfigBuilder {
     ///
     /// The freshness window needs a clock that advances, i.e. the system
     /// clock (`std`). With a pinned [`Self::verification_time`] — the only
-    /// clock a `no_std` server has — the TLS 1.3 server neither advertises
-    /// nor accepts early data, replay window or not: every 0-RTT flight
-    /// falls back to the 1-RTT handshake.
+    /// clock a `no_std` server has — the TLS 1.3 and DTLS 1.3 servers
+    /// neither advertise nor accept early data, replay window or not: every
+    /// 0-RTT flight falls back to the 1-RTT handshake.
     #[cfg_attr(
         not(feature = "std"),
         doc = "",
@@ -1392,7 +1395,7 @@ impl ConfigBuilder {
         self.inner.max_early_data_size = max;
         self
     }
-    /// TLS 1.3 server: shared anti-replay set for 0-RTT.
+    /// TLS 1.3 / DTLS 1.3 server: shared anti-replay set for 0-RTT.
     #[cfg(feature = "std")]
     pub fn replay_window(mut self, window: ReplayWindow) -> Self {
         self.inner.replay_window = Some(window);
@@ -1500,11 +1503,12 @@ impl ConfigBuilder {
     ///   then is accepted for as long as the config (and the
     ///   [`ticket_key`](Self::ticket_key)) lives. Rebuild the `Config` with
     ///   a current time, or rotate the ticket key, to age tickets out.
-    /// - **0-RTT is disabled on the TLS 1.3 server.** The RFC 8446 §8.2
-    ///   ticket-age freshness check cannot bound replay against a clock that
-    ///   never moves (a captured early-data flight would stay "fresh"
-    ///   forever), so the server does not advertise early data and refuses
-    ///   every 0-RTT flight, falling back to 1-RTT, whatever
+    /// - **0-RTT is disabled on the TLS 1.3 and DTLS 1.3 servers.** The
+    ///   RFC 8446 §8.2 ticket-age freshness check cannot bound replay
+    ///   against a clock that never moves (a captured early-data flight
+    ///   would stay "fresh" forever), so the server does not advertise
+    ///   early data and refuses every 0-RTT flight, falling back to 1-RTT,
+    ///   whatever
     ///   [`max_early_data`](Self::max_early_data) says. Resumption without
     ///   early data is unaffected.
     pub fn verification_time(mut self, t: Time) -> Self {

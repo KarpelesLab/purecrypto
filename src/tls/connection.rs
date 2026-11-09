@@ -3575,9 +3575,11 @@ fn dtls_server_opts(cfg: &Config) -> Result<DtlsServerOpts<'_>, Error> {
     // Inert on a DTLS server (see the `Config` docs): the version pair chose
     // the engine; a server's trust anchors for mTLS come from `client_auth`,
     // not `roots`; the DTLS 1.3 server issues RFC 8446 §4.6.1 tickets and
-    // accepts 0-RTT (so `ticket_key`, `max_early_data_size` and
-    // `replay_window` are forwarded; the DTLS 1.2 server issues RFC 5077
-    // tickets under the same key); the servers staple nothing, do not
+    // accepts 0-RTT — unless its clock is a pinned `verification_time`,
+    // under which it neither advertises nor accepts early data — (so
+    // `ticket_key`, `max_early_data_size` and `replay_window` are
+    // forwarded; the DTLS 1.2 server issues RFC 5077 tickets under the
+    // same key); the servers staple nothing, do not
     // compress certificates and take no `preferred_key_exchange_group`
     // (`key_exchange_groups` orders the accept-set instead). `rng` is drawn
     // through `config_rng` and `signer` through `Connection::drive`.
