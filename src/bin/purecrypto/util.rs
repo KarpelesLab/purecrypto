@@ -43,14 +43,38 @@ pub(crate) fn set_error_exit_status(status: i32) {
     ERROR_EXIT_STATUS.store(status, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// A line [`die`] adds after its own message; see [`set_die_note`].
+static DIE_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Sets (or, with `None`, clears) a note that every later [`die`] prints
+/// after its own message.
+///
+/// For a stretch of work during which *any* failure leaves something the
+/// operator must be told about, whichever helper happens to notice it:
+/// `ca issue` sets it once the certificate has been delivered and clears it
+/// once the ledger row is written, so a failure in between — the index lock,
+/// the counter, a symlinked ledger, a full disk — always names the serial of
+/// the certificate that is now out there unrecorded.
+pub(crate) fn set_die_note(note: Option<String>) {
+    *DIE_NOTE.lock().unwrap_or_else(|e| e.into_inner()) = note;
+}
+
 /// Prints `purecrypto: <msg>` to stderr and exits with status 1 (or the
-/// status a subcommand chose with [`set_error_exit_status`]).
+/// status a subcommand chose with [`set_error_exit_status`]), followed by
+/// the [`set_die_note`] line if one is set.
 ///
 /// Releases any held [`SentinelLock`] first: `exit` skips `Drop`, and a
 /// leaked sentinel blocks every subsequent run for 30 s before failing.
 pub(crate) fn die(msg: impl AsRef<str>) -> ! {
     release_held_locks();
     eprintln!("purecrypto: {}", msg.as_ref());
+    if let Some(note) = DIE_NOTE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+    {
+        eprintln!("purecrypto: {note}");
+    }
     exit(ERROR_EXIT_STATUS.load(std::sync::atomic::Ordering::SeqCst));
 }
 

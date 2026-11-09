@@ -8976,3 +8976,59 @@ fn x509_text_escapes_control_characters_from_the_certificate() {
     assert!(out.contains("email:c\\u{1b}[2J@example"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `ca issue` delivers the certificate before it touches the ledger, so a
+/// ledger failure leaves a certificate out there with no record — and its
+/// serial is random. The failure used to die before the `issued serial`
+/// note was printed, leaving the operator nothing to record or revoke; it
+/// now names the serial, whichever step of the recording failed.
+#[cfg(unix)]
+#[test]
+fn ca_issue_ledger_failure_names_the_delivered_serial() {
+    let (dir, p) = ca_with_leaf_key("ledgerserial");
+    let d = dir.to_str().unwrap().to_string();
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, "important\n").unwrap();
+    let ledger = dir.join("issued.jsonl");
+    std::fs::remove_file(&ledger).unwrap();
+    std::os::unix::fs::symlink(&victim, &ledger).unwrap();
+
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "host.example",
+            "-out",
+            &p("leaf.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok, "a symlinked ledger must fail: {err}");
+    assert!(err.contains("symbolic link"), "{err}");
+    assert!(dir.join("leaf.crt").exists(), "delivery comes first");
+    assert!(
+        err.contains("was issued and delivered but is NOT recorded"),
+        "the failure must say the certificate is out there: {err}"
+    );
+    // The serial is named in both forms `ca revoke -serial` takes, and it
+    // really is the delivered certificate's: revoking it by that serial
+    // (with -force, as it is not in the ledger) puts it on the CRL.
+    let serial = err
+        .split("certificate serial ")
+        .nth(1)
+        .map(|t| {
+            t.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .unwrap_or_else(|| panic!("no serial in: {err}"));
+    let n: u64 = serial.parse().unwrap_or_else(|e| panic!("{serial:?}: {e}"));
+    assert!(err.contains(&format!("({n:#x})")), "{err}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "important\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}

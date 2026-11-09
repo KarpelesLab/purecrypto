@@ -34,8 +34,8 @@ use crate::pki::{
 };
 use crate::template::{CertTemplate, builtin_names};
 use crate::util::{
-    Args, SentinelLock, atomic_overwrite, die, open_nofollow, write_new_file, write_output,
-    write_output_with_mode,
+    Args, SentinelLock, atomic_overwrite, die, open_nofollow, set_die_note, write_new_file,
+    write_output, write_output_with_mode,
 };
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
@@ -131,6 +131,27 @@ fn append_line(path: &Path, line: &str) {
     let mut f = open_nofollow(&mut opts, path)
         .unwrap_or_else(|e| die(format!("cannot open {}: {e}", path.display())));
     writeln!(f, "{line}").unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+}
+
+/// Records a certificate that has ALREADY been delivered: allocates its
+/// audit index and appends its `issued.jsonl` row (`row` builds the row
+/// from the index), returning the index.
+///
+/// If any of that fails the certificate is out there with no record of it,
+/// and its serial is random — so for the duration every `die`, wherever it
+/// fires (the index lock, the counter file, a symlinked or unwritable
+/// ledger), also names the serial, which is what the operator needs to
+/// record or revoke it by hand.
+fn record_issued(ca: &CaDir, serial: u64, row: impl FnOnce(u64) -> String) -> u64 {
+    set_die_note(Some(format!(
+        "certificate serial {serial} ({serial:#x}) was issued and delivered but is NOT \
+         recorded in {}; note the serial (`ca revoke -serial {serial:#x} -force` revokes it)",
+        ca.issued().display()
+    )));
+    let index = allocate_index(ca);
+    append_line(&ca.issued(), &row(index));
+    set_die_note(None);
+    index
 }
 
 /// Loads `DIR/root.crt`.
@@ -538,10 +559,10 @@ fn run_issue(args: Args) {
     // Deliver the certificate BEFORE touching the CA's state: a failed `-out`
     // write must not consume an audit index or leave a ledger row for a
     // certificate nobody ever received. The reverse failure — delivered but
-    // not recorded — still fails loudly, with the serial named below for the
-    // operator.
+    // not recorded — still fails loudly, and `record_issued` makes that
+    // error name the serial (the `issued serial` note at the end is only
+    // reached on success).
     write_output(args.value("-out"), cert.to_pem().as_bytes());
-    let index = allocate_index(&ca);
 
     // Record in issued.jsonl. Every string field goes through `json_escape`
     // so a control character or `"` in a SAN / subject cannot corrupt the
@@ -551,16 +572,17 @@ fn run_issue(args: Args) {
         .map(|s| format!("\"{}\"", json_escape(s)))
         .collect::<Vec<_>>()
         .join(",");
-    let record = format!(
-        "{{\"index\":{},\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
-        index,
-        serial,
-        json_escape(&format_dn(&subject)),
-        sans_json,
-        json_escape(validity.not_after.as_str()),
-        now_unix()
-    );
-    append_line(&ca.issued(), &record);
+    let index = record_issued(&ca, serial, |index| {
+        format!(
+            "{{\"index\":{},\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
+            index,
+            serial,
+            json_escape(&format_dn(&subject)),
+            sans_json,
+            json_escape(validity.not_after.as_str()),
+            now_unix()
+        )
+    });
     // Serials are random now, so the operator cannot infer one: always say
     // what was issued (on stderr, so `-out -` piping stays clean). `ca revoke
     // -serial` accepts either form printed here.
@@ -708,7 +730,6 @@ fn run_sign_csr(args: Args) {
 
     // Deliver before touching CA state (see `run_issue`).
     write_output(args.value("-out"), cert.to_pem().as_bytes());
-    let index = allocate_index(&ca);
 
     let subject = subject_from_csr;
     let sans_json = sans
@@ -716,16 +737,17 @@ fn run_sign_csr(args: Args) {
         .map(|s| format!("\"{}\"", json_escape(s)))
         .collect::<Vec<_>>()
         .join(",");
-    let record = format!(
-        "{{\"index\":{},\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
-        index,
-        serial,
-        json_escape(&format_dn(&subject)),
-        sans_json,
-        json_escape(validity.not_after.as_str()),
-        now_unix()
-    );
-    append_line(&ca.issued(), &record);
+    let index = record_issued(&ca, serial, |index| {
+        format!(
+            "{{\"index\":{},\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
+            index,
+            serial,
+            json_escape(&format_dn(&subject)),
+            sans_json,
+            json_escape(validity.not_after.as_str()),
+            now_unix()
+        )
+    });
     eprintln!("issued serial {serial} ({serial:#x}), index {index}");
 }
 
