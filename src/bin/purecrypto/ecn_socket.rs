@@ -181,7 +181,10 @@ mod imp {
             let len = usize::from_ne_bytes(ctrl[off..off + 8].try_into().unwrap());
             let level = i32::from_ne_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
             let ctype = i32::from_ne_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
-            if len < 16 || off + len > ctrl.len() {
+            // `len` is whatever the control buffer says: bound it with
+            // checked arithmetic rather than trusting `off + len` not to wrap.
+            let in_bounds = off.checked_add(len).is_some_and(|end| end <= ctrl.len());
+            if len < 16 || !in_bounds {
                 break;
             }
             let is_tos = (level == IPPROTO_IP && ctype == IP_TOS)
