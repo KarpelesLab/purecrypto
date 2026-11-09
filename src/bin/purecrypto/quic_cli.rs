@@ -1164,6 +1164,33 @@ struct ServerConnState {
     ended: bool,
 }
 
+impl ServerConnState {
+    /// Bytes this connection is holding for the peer: uni streams still
+    /// being collected plus every reply not yet written out.
+    fn buffered(&self) -> usize {
+        self.uni_in.values().map(Vec::len).sum::<usize>()
+            + self.out.values().map(|o| o.pending.len()).sum::<usize>()
+    }
+
+    /// Frees the stream buffers of a connection that is over.
+    fn drop_buffers(&mut self) {
+        self.out = HashMap::new();
+        self.uni_in = HashMap::new();
+    }
+}
+
+/// Most bytes the demo server buffers for one stream: the echo backlog of a
+/// bidi stream, or a peer uni stream being collected until its FIN.
+const BACKLOG_CAP: usize = 256 * 1024;
+
+/// Most bytes the demo server buffers for one connection across all of its
+/// uni streams and pending replies (see [`ServerConnState::buffered`]).
+const CONN_BACKLOG_CAP: usize = 8 * BACKLOG_CAP;
+
+/// Application error code the demo server closes with when a peer makes it
+/// buffer past [`BACKLOG_CAP`] / [`CONN_BACKLOG_CAP`].
+const CLOSE_BACKLOG_EXCEEDED: u64 = 1;
+
 /// Drives the [`QuicServer`] router I/O loop: receive → route, run the demo
 /// application logic (echo, or a canned `-www` reply) per connection, and
 /// send outbound datagrams (including connection-less resets / Version
@@ -1321,6 +1348,7 @@ fn serve_connection(
             eprintln!("{}", ecn_line(conn));
             eprintln!("{}", close_line(conn));
         }
+        st.drop_buffers();
         return;
     }
     if !conn.is_handshake_complete() {
@@ -1358,8 +1386,8 @@ fn serve_connection(
 
     // Inbound streams. Bidi: echo (bounded backlog so a peer that stops
     // granting credit cannot make us buffer without limit). Uni: collect,
-    // then answer on a uni stream of ours.
-    const BACKLOG_CAP: usize = 256 * 1024;
+    // then answer on a uni stream of ours — bounded too, see below.
+    let mut over_cap: Option<StreamId> = None;
     let ids: Vec<StreamId> = conn.readable_streams().collect();
     for id in ids {
         if !id.is_client_initiated() {
@@ -1392,10 +1420,18 @@ fn serve_connection(
                     }
                 }
             } else {
-                st.uni_in
-                    .entry(id)
-                    .or_default()
-                    .extend_from_slice(&buf[..n]);
+                let collected = st.uni_in.entry(id).or_default();
+                collected.extend_from_slice(&buf[..n]);
+                // A uni stream is echoed only after its FIN, so unlike the
+                // bidi echo there is no backlog to pause on: every read
+                // renews the peer's flow-control credit, and a peer that
+                // never finishes (or never takes the replies) would make us
+                // buffer without limit. Past the cap the connection is
+                // closed with an application error instead.
+                if collected.len() > BACKLOG_CAP || st.buffered() > CONN_BACKLOG_CAP {
+                    over_cap = Some(id);
+                    break;
+                }
                 if fin && let Some(data) = st.uni_in.remove(&id) {
                     match conn.open_uni() {
                         Ok(reply_id) => {
@@ -1433,6 +1469,20 @@ fn serve_connection(
                 break;
             }
         }
+        if over_cap.is_some() {
+            break;
+        }
+    }
+    if let Some(id) = over_cap {
+        eprintln!(
+            "purecrypto: uni stream {} from {addr}: more than {BACKLOG_CAP} bytes on the stream \
+             or {CONN_BACKLOG_CAP} buffered on the connection; closing it",
+            id.value()
+        );
+        let _ = conn.close(CLOSE_BACKLOG_EXCEEDED, b"uni stream backlog exceeded");
+        st.ended = true;
+        st.drop_buffers();
+        return;
     }
 
     // `-www`: send the canned body once we know the peer's bidi stream.

@@ -791,6 +791,13 @@ on a unidirectional stream of its own, and echoes every DATAGRAM frame (RFC
 9221); the client sends stdin on one stream (or as DATAGRAMs) and writes the
 reply to stdout. ALPN is mandatory (RFC 9001 §8.1).
 
+The server's buffering is bounded. A bidirectional echo stops reading once
+256 KiB are waiting to be written back. A unidirectional stream is answered
+only after its FIN, so it has to be held in full: one that exceeds 256 KiB —
+or a connection whose unidirectional streams and pending replies together
+exceed 2 MiB — is closed with application error `0x1` (`uni stream backlog
+exceeded`).
+
 ```text
 purecrypto q_client -connect host:port -alpn proto [-insecure] [-servername name] [-CAfile bundle.pem]
                     [-uni | -datagram] [-exchanges N] [-pause ms] [-migrate] [-switch-cid]
