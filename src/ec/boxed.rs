@@ -305,12 +305,18 @@ mod fixed {
     ) -> Result<Vec<u8>, Error> {
         let c = P256::new();
         let mut k = to_fe(d);
-        let shared = c.scalar_mul(&k, &c.lift_affine(&to_fe(px), &to_fe(py)));
+        let mut shared = c.scalar_mul(&k, &c.lift_affine(&to_fe(px), &to_fe(py)));
         k.zeroize();
-        let (mut x, _) = c.to_affine(&shared).ok_or(Error::InvalidInput)?;
+        // The shared point is the secret: wipe the projective form and both
+        // affine coordinates (y is as good as x to an attacker), as the
+        // generic engine does.
+        let affine = c.to_affine(&shared);
+        shared.zeroize();
+        let (mut x, mut y) = affine.ok_or(Error::InvalidInput)?;
         let mut out = [0u8; 32];
         x.write_be_bytes(&mut out);
         x.zeroize();
+        y.zeroize();
         let v = out.to_vec();
         out.zeroize();
         Ok(v)
@@ -1254,18 +1260,28 @@ impl BoxedEcdsaPrivateKey {
         use crate::der::{
             encode_bit_string, encode_context, encode_integer, encode_octet_string, encode_sequence,
         };
-        let order_len = self.curve.order_len();
-        let priv_oct = encode_octet_string(&self.d.to_be_bytes(order_len));
+        // Every buffer that holds `d` is wiped on drop, and `body` is sized
+        // up front so no growth leaves an unwiped copy behind.
+        let d = Zeroizing::new(self.d.to_be_bytes(self.curve.order_len()));
+        let priv_oct = Zeroizing::new(encode_octet_string(&d));
+        let version = encode_integer(&[1]);
         // parameters [0] EXPLICIT ECParameters.
         let params = encode_context(0, &self.curve.to_der());
         // publicKey [1] EXPLICIT BIT STRING (uncompressed SEC1 point).
         let pubkey = encode_context(1, &encode_bit_string(&self.public_key().to_sec1()));
-        encode_sequence(&[encode_integer(&[1]), priv_oct, params, pubkey].concat())
+        let mut body = Zeroizing::new(Vec::with_capacity(
+            version.len() + priv_oct.len() + params.len() + pubkey.len(),
+        ));
+        for part in [&version[..], &priv_oct[..], &params[..], &pubkey[..]] {
+            body.extend_from_slice(part);
+        }
+        encode_sequence(&body)
     }
 
     /// Encodes the key as a SEC1 PEM document (`-----BEGIN EC PRIVATE KEY-----`).
     pub fn to_sec1_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("EC PRIVATE KEY", &self.to_sec1_der())
+        let der = Zeroizing::new(self.to_sec1_der());
+        crate::der::pem_encode("EC PRIVATE KEY", &der)
     }
 
     /// Parses a SEC1 `ECPrivateKey` DER structure. The parameters are a
@@ -1296,7 +1312,9 @@ impl BoxedEcdsaPrivateKey {
 
     /// Parses a SEC1 PEM EC private key.
     pub fn from_sec1_pem(pem: &str) -> Result<Self, Error> {
-        let der = crate::der::pem_decode(pem, "EC PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        let der = Zeroizing::new(
+            crate::der::pem_decode(pem, "EC PRIVATE KEY").map_err(|_| Error::Malformed)?,
+        );
         Self::from_sec1_der(&der)
     }
 
@@ -1306,14 +1324,25 @@ impl BoxedEcdsaPrivateKey {
     pub fn to_pkcs8_der(&self) -> Vec<u8> {
         use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
         let algid = encode_sequence(&[oid_tlv(EC_PUBLIC_KEY_OID), self.curve.to_der()].concat());
-        let inner = encode_octet_string(&self.to_sec1_der());
-        encode_sequence(&[encode_integer(&[0]), algid, inner].concat())
+        // The SEC1 encoding and its OCTET STRING wrapping hold `d`: wipe
+        // both on drop, and size `body` up front so no growth leaves a copy.
+        let sec1 = Zeroizing::new(self.to_sec1_der());
+        let inner = Zeroizing::new(encode_octet_string(&sec1));
+        let version = encode_integer(&[0]);
+        let mut body = Zeroizing::new(Vec::with_capacity(
+            version.len() + algid.len() + inner.len(),
+        ));
+        for part in [&version[..], &algid[..], &inner[..]] {
+            body.extend_from_slice(part);
+        }
+        encode_sequence(&body)
     }
 
     /// Encodes the key as an unencrypted PKCS#8 PEM document
     /// (`-----BEGIN PRIVATE KEY-----`).
     pub fn to_pkcs8_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+        let der = Zeroizing::new(self.to_pkcs8_der());
+        crate::der::pem_encode("PRIVATE KEY", &der)
     }
 
     /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 5958) wrapping a SEC1
@@ -1380,7 +1409,9 @@ impl BoxedEcdsaPrivateKey {
     /// Parses an unencrypted PKCS#8 PEM private key
     /// (`-----BEGIN PRIVATE KEY-----`).
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
-        let der = crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        let der = Zeroizing::new(
+            crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&der)
     }
 
@@ -1393,7 +1424,8 @@ impl BoxedEcdsaPrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> Vec<u8> {
-        crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+        let der = Zeroizing::new(self.to_pkcs8_der());
+        crate::kdf::pbes2::encrypt(&der, password, params, rng)
     }
 
     /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
@@ -1405,21 +1437,26 @@ impl BoxedEcdsaPrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> alloc::string::String {
-        crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+        let der = Zeroizing::new(self.to_pkcs8_der());
+        crate::kdf::pbes2::encrypt_pem(&der, password, params, rng)
     }
 
     /// Parses an `EncryptedPrivateKeyInfo` DER (PBES2) and decrypts it back to a
     /// PKCS#8 EC private key. Mirrors `BoxedRsaPrivateKey` / `Ed25519PrivateKey`.
     #[cfg(all(feature = "kdf", feature = "der"))]
     pub fn from_pkcs8_der_encrypted(der: &[u8], password: &[u8]) -> Result<Self, Error> {
-        let inner = crate::kdf::pbes2::decrypt(der, password).map_err(|_| Error::Malformed)?;
+        let inner = Zeroizing::new(
+            crate::kdf::pbes2::decrypt(der, password).map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 
     /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
     #[cfg(all(feature = "kdf", feature = "der"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, Error> {
-        let inner = crate::kdf::pbes2::decrypt_pem(pem, password).map_err(|_| Error::Malformed)?;
+        let inner = Zeroizing::new(
+            crate::kdf::pbes2::decrypt_pem(pem, password).map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 }
@@ -2822,6 +2859,62 @@ x2dqVh/sT12MnE=\n\
         // the 30 xx 02 01 01 04 30 header.
         let pos = der.windows(2).position(|w| w == [0x04, 48]).unwrap();
         assert_eq!(&der[pos + 2..pos + 2 + 48], &d[..]);
+    }
+
+    /// The private-key encoders' output is pinned byte for byte (captured
+    /// before their temporaries were made wipe-on-drop).
+    #[cfg(feature = "der")]
+    #[test]
+    fn private_key_encodings_are_pinned() {
+        let d: Vec<u8> = (1..=32u8).collect();
+        let d_hex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let sec1_256 = [
+            "30770201010420",
+            d_hex,
+            "a00a06082a8648ce3d030107a14403420004",
+            "515c3d6eb9e396b904d3feca7f54fdcd0cc1e997bf375dca515ad0a6c3b4035f",
+            "4536be3a50f318fbf9a5475902a221502bef0d57e08c53b2cc0a56f17d9f9354",
+        ]
+        .concat();
+        let p8_256 = [
+            "308193020100301306072a8648ce3d020106082a8648ce3d0301070479",
+            &sec1_256,
+        ]
+        .concat();
+        let sk = BoxedEcdsaPrivateKey::from_bytes(CurveId::P256, &d).unwrap();
+        assert_eq!(sk.to_sec1_der(), from_hex(&sec1_256));
+        assert_eq!(sk.to_pkcs8_der(), from_hex(&p8_256));
+
+        // P-521: the scalar is left-padded to the 66-byte order width.
+        let sec1_521 = [
+            "3081dc0201010442",
+            &"00".repeat(34),
+            d_hex,
+            "a00706052b81040023a181890381860004",
+            "00e0cc20a810bd546bef70c86a146a580bedebc7c26a89674de52eb8c6b95ab2",
+            "5e149f3c99a437f91dfaf13d3d82b3aae1f0a2c08d9112c0ef4defb099b87562",
+            "b61001fb28728578fbf97491819b8b6b25da2826a352605ed26eb0abfb841165",
+            "60177f7887b327dd4d7d8df6f98d50e86e355db3e81ace9ebfba8a3417ee13f9",
+            "4c608f67",
+        ]
+        .concat();
+        let p8_521 = [
+            "3081f7020100301006072a8648ce3d020106052b810400230481df",
+            &sec1_521,
+        ]
+        .concat();
+        let sk = BoxedEcdsaPrivateKey::from_bytes(CurveId::P521, &d).unwrap();
+        assert_eq!(sk.to_sec1_der(), from_hex(&sec1_521));
+        assert_eq!(sk.to_pkcs8_der(), from_hex(&p8_521));
+        // The PEM bodies are the same bytes.
+        assert_eq!(
+            crate::der::pem_decode(&sk.to_sec1_pem(), "EC PRIVATE KEY").unwrap(),
+            from_hex(&sec1_521)
+        );
+        assert_eq!(
+            crate::der::pem_decode(&sk.to_pkcs8_pem(), "PRIVATE KEY").unwrap(),
+            from_hex(&p8_521)
+        );
     }
 
     /// Verification on a custom curve with a huge cofactor (`h ≈ 2^42`,

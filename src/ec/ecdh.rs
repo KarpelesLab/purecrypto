@@ -5,6 +5,7 @@ use super::ecdsa::EcdsaPublicKey;
 use super::p256::{Fe, P256, random_scalar};
 use crate::ct::ConstantTimeLess;
 use crate::rng::{CryptoRng, RngCore};
+use crate::zeroize::Zeroize;
 
 /// An ephemeral ECDH private value (a scalar in `[1, n-1]`).
 ///
@@ -82,10 +83,17 @@ impl EcdhPrivateKey {
         let curve = P256::new();
         let (px, py) = peer.coordinates();
         let point = curve.lift_affine(&px, &py);
-        let shared = curve.scalar_mul(&self.d, &point);
-        let (x, _) = curve.to_affine(&shared).ok_or(Error::InvalidInput)?;
+        let mut shared = curve.scalar_mul(&self.d, &point);
+        // The shared point is the secret: wipe the projective form and both
+        // affine coordinates (y is as good as x to an attacker), as the
+        // generic engine does. Only the returned bytes outlive the call.
+        let affine = curve.to_affine(&shared);
+        shared.zeroize();
+        let (mut x, mut y) = affine.ok_or(Error::InvalidInput)?;
         let mut out = [0u8; 32];
         x.write_be_bytes(&mut out);
+        x.zeroize();
+        y.zeroize();
         Ok(out)
     }
 }

@@ -212,9 +212,13 @@ impl P256 {
         if point.z.is_zero().declassify() {
             return None;
         }
-        let z_inv = field::invert(&point.z);
+        let mut z_inv = field::invert(&point.z);
         let x = field::from_mont(&field::mul(&point.x, &z_inv));
         let y = field::from_mont(&field::mul(&point.y, &z_inv));
+        // With an affine coordinate, `z⁻¹` gives back the projective point
+        // the ladder ended on; wipe it, as the generic engine does. (Four
+        // limbs, once per conversion — nothing next to the inversion.)
+        z_inv.zeroize();
         Some((x, y))
     }
 
@@ -453,8 +457,8 @@ impl P256 {
     /// a doubling; `k' = n`: `acc = −[d₀]P`, the identity). Wipes `acc`.
     #[inline]
     fn finish_ladder(&self, acc: &mut Jacobian, table: &[[u64; 8]], digit: (u64, u64)) -> Point {
-        let z2 = self.sqr(&acc.z);
-        let proj = Point {
+        let mut z2 = self.sqr(&acc.z);
+        let mut proj = Point {
             x: self.mul(&acc.x, &acc.z),
             y: acc.y,
             z: self.mul(&z2, &acc.z),
@@ -463,6 +467,10 @@ impl P256 {
         let (x, mut y) = gather_affine(table, digit);
         let out = self.add_mixed(&proj, &x, &y);
         y.zeroize();
+        // `proj` (and `z2`) is `acc` in other coordinates: as secret as
+        // the scalar.
+        proj.zeroize();
+        z2.zeroize();
         out
     }
 

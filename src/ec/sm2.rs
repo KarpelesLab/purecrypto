@@ -25,6 +25,8 @@ use crate::bignum::BoxedUint;
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, Sm3};
 use crate::rng::{CryptoRng, RngCore};
+#[cfg(feature = "der")]
+use crate::zeroize::Zeroizing;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -779,15 +781,26 @@ impl Sm2PrivateKey {
             encode_bit_string, encode_context, encode_integer, encode_octet_string,
             encode_sequence, oid_tlv,
         };
-        let priv_oct = encode_octet_string(&self.to_bytes());
+        // Every buffer that holds `d` is wiped on drop, and `body` is sized
+        // up front so no growth leaves an unwiped copy behind.
+        let d = Zeroizing::new(self.to_bytes());
+        let priv_oct = Zeroizing::new(encode_octet_string(&d));
+        let version = encode_integer(&[1]);
         let params = encode_context(0, &oid_tlv(CURVE.named_curve_oid()));
         let pubkey = encode_context(1, &encode_bit_string(&self.public_key().to_sec1()));
-        encode_sequence(&[encode_integer(&[1]), priv_oct, params, pubkey].concat())
+        let mut body = Zeroizing::new(Vec::with_capacity(
+            version.len() + priv_oct.len() + params.len() + pubkey.len(),
+        ));
+        for part in [&version[..], &priv_oct[..], &params[..], &pubkey[..]] {
+            body.extend_from_slice(part);
+        }
+        encode_sequence(&body)
     }
 
     /// Encodes the key as a SEC1 PEM document (`-----BEGIN EC PRIVATE KEY-----`).
     pub fn to_sec1_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("EC PRIVATE KEY", &self.to_sec1_der())
+        let der = Zeroizing::new(self.to_sec1_der());
+        crate::der::pem_encode("EC PRIVATE KEY", &der)
     }
 
     /// Parses a SEC1 `ECPrivateKey` DER structure (the named curve must be
@@ -827,7 +840,9 @@ impl Sm2PrivateKey {
 
     /// Parses a SEC1 PEM EC private key (`sm2p256v1`).
     pub fn from_sec1_pem(pem: &str) -> Result<Self, Error> {
-        let der = crate::der::pem_decode(pem, "EC PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        let der = Zeroizing::new(
+            crate::der::pem_decode(pem, "EC PRIVATE KEY").map_err(|_| Error::Malformed)?,
+        );
         Self::from_sec1_der(&der)
     }
 }
@@ -1106,6 +1121,10 @@ mod tests {
 
         let pem = sk.to_sec1_pem();
         assert!(pem.starts_with("-----BEGIN EC PRIVATE KEY-----"));
+        assert_eq!(
+            crate::der::pem_decode(&pem, "EC PRIVATE KEY").unwrap(),
+            sk.to_sec1_der()
+        );
         let parsed = Sm2PrivateKey::from_sec1_pem(&pem).unwrap();
         assert_eq!(parsed.public_key().to_sec1(), sk.public_key().to_sec1());
 
@@ -1116,6 +1135,24 @@ mod tests {
         let sig = sk.sign(b"der", DEFAULT_ID, &mut rng).unwrap();
         let der = sig.to_der();
         assert_eq!(Sm2Signature::from_der(&der).unwrap(), sig);
+    }
+
+    /// The SEC1 encoder's output is pinned byte for byte (captured before
+    /// its temporaries were made wipe-on-drop).
+    #[cfg(feature = "der")]
+    #[test]
+    fn sec1_encoding_is_pinned() {
+        let d: Vec<u8> = (1..=32u8).collect();
+        let sk = Sm2PrivateKey::from_bytes(&d).unwrap();
+        let want = [
+            "30770201010420",
+            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+            "a00a06082a811ccf5501822da14403420004",
+            "46d1086f6e5c938447f05280db707c279a7b459c38f19e4d9a30ad2dadf9f28a",
+            "f45fc1dc5b377736b57e97e7e0563ccca24c97f440e1d137e5941d84d2eb43c9",
+        ]
+        .concat();
+        assert_eq!(sk.to_sec1_der(), from_hex(&want));
     }
 
     /// The SEC1 / SPKI parsers must be as strict as the boxed EC ones: an
