@@ -278,6 +278,13 @@ pub(crate) struct PskAcceptContext<'a> {
     /// RFC 7250 raw client keys this listener accepts (see
     /// [`resumable_client_leaf`]).
     pub(crate) expected_client_raw_public_keys: &'a [Vec<u8>],
+    /// The hash of the cipher suite this handshake runs under — the one
+    /// just negotiated from the hello, or, on the retry after a
+    /// HelloRetryRequest, the one the HRR pinned. RFC 8446 §4.2.11: the
+    /// server "MUST ensure that it selects a compatible PSK (if any) and
+    /// cipher suite", i.e. the PSK's hash must be the suite's. A PSK of
+    /// another hash is not selectable (see [`try_accept_psk13`]).
+    pub(crate) suite_hash: HashAlg,
 }
 
 /// Tries to accept a `pre_shared_key` offer from a DTLS 1.3 ClientHello:
@@ -290,6 +297,14 @@ pub(crate) struct PskAcceptContext<'a> {
 /// preceding it: empty for a first ClientHello, `message_hash(CH1) ‖
 /// HelloRetryRequest` for the cookie-bearing retry (RFC 8446 §4.2.11.2
 /// binds the retry binder to the HRR-inclusive transcript).
+///
+/// Only a PSK whose hash is that of the negotiated cipher suite
+/// ([`PskAcceptContext::suite_hash`]) is selectable (RFC 8446 §4.2.11):
+/// the binder is an HMAC under the PSK's hash, but the `pre_shared_key`
+/// answer commits the handshake to a key schedule seeded with that PSK
+/// under the *suite's* hash. A ticket minted under a SHA-384 suite and
+/// offered where a SHA-256 suite is negotiated is therefore passed over
+/// like one that does not open — the suite was chosen first and stands.
 ///
 /// Returns `Ok(None)` when nothing offered is usable (a full handshake
 /// follows), `Err(DecryptError)` when a ticket opened but its binder is
@@ -351,6 +366,13 @@ pub(crate) fn try_accept_psk13(
             48 => HashAlg::Sha384,
             _ => continue,
         };
+        // RFC 8446 §4.2.11: the PSK must be compatible with the cipher
+        // suite. Not an error — the client may offer several identities
+        // and several suites — but this identity cannot be selected, and
+        // its binder is not this handshake's business.
+        if hash != ctx.suite_hash {
+            continue;
+        }
         let hash_len = hash.output_len();
         // The binders list is the tail of the hello (RFC 8446 §4.2.11:
         // `pre_shared_key` is the last extension, which the caller checked).

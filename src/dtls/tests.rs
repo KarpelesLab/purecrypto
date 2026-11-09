@@ -2496,6 +2496,15 @@ mod dtls13 {
         roots.add_der(cert.to_vec()).unwrap();
         let client_cfg = PcClientConfig13::new(roots, "dtls.example")
             .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        first_handshake_for_session_with(server_cfg, client_cfg, client_seed)
+    }
+
+    /// [`first_handshake_for_session`] with the client configuration given.
+    fn first_handshake_for_session_with(
+        server_cfg: PcServerConfig13,
+        client_cfg: PcClientConfig13,
+        client_seed: &[u8],
+    ) -> crate::tls::conn::StoredSession {
         let mut crng = HmacDrbg::<Sha256>::new(client_seed, b"nonce", &[]);
         let mut client =
             DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
@@ -2581,6 +2590,154 @@ mod dtls13 {
         assert!(!client.psk_accepted());
         assert!(!server.psk_used());
         assert!(!client.peer_certificates().is_empty(), "full handshake");
+    }
+
+    /// A resuming ClientHello whose ticket was issued under
+    /// `TLS_AES_256_GCM_SHA384` (a 48-byte PSK, SHA-384 binder) but which
+    /// also offers `TLS_AES_128_GCM_SHA256`. This crate's client narrows a
+    /// resuming offer to the suites of the session's hash, so the hello is
+    /// its own, re-encoded with the extra suite and the binder recomputed
+    /// over the new bytes — what another stack (or an attacker holding the
+    /// session) puts on the wire. Returned as one datagram.
+    fn sha384_ticket_hello_offering_sha256_too(cert: &[u8]) -> Vec<u8> {
+        use crate::dtls::reassembly::write_fragments;
+        use crate::tls::codec::{CipherSuite, ClientHello, NamedGroup, hs_type};
+        use crate::tls::crypto::{HashAlg, LabelPrefix, psk_binder_with};
+
+        let client_cfg = || {
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert.to_vec()).unwrap();
+            let mut cfg = PcClientConfig13::new(roots, "dtls.example")
+                .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+            cfg.cipher_suites = alloc::vec![CipherSuite::AES_256_GCM_SHA384];
+            // One share, so the ClientHello fits one record.
+            cfg.groups = alloc::vec![NamedGroup::X25519];
+            cfg
+        };
+        let (issuer, _) = make_ticket_server13(false, 0);
+        let session = first_handshake_for_session_with(issuer, client_cfg(), b"dtls13-pskhash-c1");
+        assert_eq!(session.cipher_suite_hash, HashAlg::Sha384);
+        assert_eq!(session.psk.len(), 48);
+        let psk = session.psk.to_vec();
+
+        let mut cfg = client_cfg();
+        cfg.session = Some(session);
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-pskhash-c2", b"nonce", &[]);
+        let mut client = DtlsClientConnection13::new(cfg, b"client-addr".to_vec(), &mut crng);
+        let dgs = client.pop_outbound_datagrams();
+        assert_eq!(dgs.len(), 1);
+        let (mut ch, _) = ClientHello::decode_dtls(&dgs[0][13 + 12..]).unwrap();
+        assert_eq!(ch.cipher_suites, [CipherSuite::AES_256_GCM_SHA384]);
+        ch.cipher_suites.push(CipherSuite::AES_128_GCM_SHA256);
+        let mut raw = ch.encode_dtls(&[]);
+        // One identity: the binders field is `len(2) ‖ len(1) ‖ binder(48)`.
+        let truncated = raw.len() - (2 + 1 + 48);
+        let binder = psk_binder_with(
+            LabelPrefix::Dtls13,
+            HashAlg::Sha384,
+            &psk,
+            &[],
+            &raw[..truncated],
+        );
+        let at = raw.len() - 48;
+        raw[at..].copy_from_slice(binder.as_slice());
+
+        let mut dg = Vec::new();
+        for frag in write_fragments(hs_type::CLIENT_HELLO, 0, &raw[4..], 0) {
+            crate::dtls::record::write_record(
+                &mut dg,
+                crate::tls::ContentType::Handshake,
+                crate::tls::ProtocolVersion::DTLSv1_2,
+                0,
+                0,
+                &frag,
+            )
+            .unwrap();
+        }
+        dg
+    }
+
+    /// RFC 8446 §4.2.11: a PSK is only selectable with a cipher suite of
+    /// its hash. A ticket issued under `TLS_AES_256_GCM_SHA384`, offered to
+    /// a server that negotiates `TLS_AES_128_GCM_SHA256`, used to be taken
+    /// anyway: the binder was verified under SHA-384 (the PSK's length),
+    /// `pre_shared_key` echoed, and the key schedule then seeded with the
+    /// 48-byte PSK under SHA-256. It is passed over now, and the server
+    /// runs a full handshake under the suite it negotiated.
+    #[test]
+    fn psk_of_another_hash_than_the_suite_is_not_resumed() {
+        use crate::tls::codec::CipherSuite;
+
+        let (_, cert) = make_server13();
+        let hello = sha384_ticket_hello_offering_sha256_too(&cert);
+
+        // Control: a server that can negotiate the ticket's suite resumes
+        // from this very hello — the ticket opens and the binder verifies.
+        let (server_cfg, _) = make_ticket_server13(false, 0);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-pskhash-s0", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        // The server's preference puts AES-128 first; restrict it to the
+        // ticket's suite for the control.
+        let (mut server_cfg, _) = make_ticket_server13(false, 0);
+        server_cfg.cipher_suites = alloc::vec![CipherSuite::AES_256_GCM_SHA384];
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-pskhash-s1", b"nonce", &[]);
+        let mut control =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        control.feed_datagram(&hello).unwrap();
+        assert!(control.psk_used(), "same hash: resumed");
+
+        // Default preference: AES-128-GCM-SHA256 wins, the SHA-384 PSK is
+        // not selectable.
+        server.feed_datagram(&hello).unwrap();
+        assert!(!server.psk_used(), "PSK hash != suite hash: full handshake");
+        assert!(
+            !server.pop_outbound_datagrams().is_empty(),
+            "the hello was answered, not dropped"
+        );
+
+        // The same with the server restricted to the SHA-256 suite.
+        let (mut server_cfg, _) = make_ticket_server13(false, 0);
+        server_cfg.cipher_suites = alloc::vec![CipherSuite::AES_128_GCM_SHA256];
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-pskhash-s2", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        server.feed_datagram(&hello).unwrap();
+        assert!(!server.psk_used());
+        assert!(!server.pop_outbound_datagrams().is_empty());
+    }
+
+    /// The same on a cookie-requiring server: RFC 9147 §5.1 lets a
+    /// same-address resumption skip the cookie exchange, but only a PSK
+    /// the handshake can actually use earns that — an incompatible one
+    /// gets the ordinary stateless HelloRetryRequest.
+    #[test]
+    fn psk_of_another_hash_does_not_skip_the_cookie_exchange() {
+        use crate::tls::codec::CipherSuite;
+
+        let (_, cert) = make_server13();
+        let hello = sha384_ticket_hello_offering_sha256_too(&cert);
+
+        let (mut server_cfg, _) = make_ticket_server13(true, 0);
+        server_cfg.cipher_suites = alloc::vec![CipherSuite::AES_256_GCM_SHA384];
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-pskhash-s3", b"nonce", &[]);
+        let mut control =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        control.feed_datagram(&hello).unwrap();
+        assert!(
+            control.psk_used(),
+            "compatible PSK: cookie skipped, resumed"
+        );
+
+        let (server_cfg, _) = make_ticket_server13(true, 0);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-pskhash-s4", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        server.feed_datagram(&hello).unwrap();
+        assert!(!server.psk_used());
+        let out = server.pop_outbound_datagrams();
+        assert_eq!(out.len(), 1, "just the HelloRetryRequest");
+        assert_eq!(out[0][0], 22, "a plaintext handshake record");
     }
 
     /// RFC 8446 §4.2.10 / RFC 9147 §5.6 0-RTT over DTLS 1.3: with the cookie

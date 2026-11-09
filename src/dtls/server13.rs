@@ -728,11 +728,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// transcript before it (empty on a first hello, `message_hash(CH1) ‖
     /// HelloRetryRequest` on the cookie/HRR retry — RFC 8446 §4.2.11.2). A
     /// binder mismatch is fatal; `Ok(None)` when nothing usable is offered.
+    ///
+    /// `suite_hash` is the hash of the cipher suite the handshake runs
+    /// under (negotiated from this hello, or pinned by the HRR / carried
+    /// in the cookie on a retry): a PSK of another hash is not selectable
+    /// (RFC 8446 §4.2.11), and the handshake falls back to a full one.
     fn accept_ticket_psk(
         &self,
         ch: &ClientHello,
         raw: &[u8],
         transcript_prefix: &[u8],
+        suite_hash: HashAlg,
     ) -> Result<Option<AcceptedPsk13>, Error> {
         let (Some(seal), Some(now)) = (self.ticket_seal_key(), self.ticket_now()) else {
             return Ok(None);
@@ -746,6 +752,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             // a session whose issuing handshake authenticated one.
             client_auth_required: self.config.client_auth.as_ref().is_some_and(|p| p.required),
             expected_client_raw_public_keys: &[],
+            suite_hash,
         };
         try_accept_psk13(&ctx, ch, raw, transcript_prefix)
     }
@@ -2062,7 +2069,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             && presented_cookie.is_none()
             && preferred_share.is_some()
             && self
-                .accept_ticket_psk(&ch, &raw_ch, &[])?
+                .accept_ticket_psk(&ch, &raw_ch, &[], suite.hash)?
                 .is_some_and(|s| s.same_address);
         let do_cookie = cookie_required && !resume_skip_cookie;
 
@@ -2384,7 +2391,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // which `new_transcript` holds. A binder mismatch is fatal, and is
         // checked before any state is committed: a wrong binder must not
         // leave a half-applied suite / transcript / message_seq behind.
-        let psk_state = self.accept_ticket_psk(&ch, &raw_ch, new_transcript.buffered_bytes())?;
+        // Only a PSK of the negotiated suite's hash is taken (§4.2.11): the
+        // key schedule below is seeded under `suite.hash` — the suite
+        // negotiated from this hello, or the one the HRR pinned (parked in
+        // the cookie on the stateless path) on a retry.
+        let psk_state =
+            self.accept_ticket_psk(&ch, &raw_ch, new_transcript.buffered_bytes(), suite.hash)?;
 
         // ---- Commit phase ----------------------------------------------
         // Nothing below can reject the CH any more; apply the negotiated
