@@ -111,6 +111,21 @@ impl<W: std::io::Write + Send> KeyLog for WriterKeyLog<W> {
 /// creation mode never applies to a pre-existing file, and a world-readable
 /// file (or a link into someone else's directory) planted ahead of time
 /// would otherwise collect the session secrets.
+///
+/// On Unix a file that already existed must also belong to this process
+/// and have no other hard link. Resetting the mode is not enough for a
+/// privileged caller: root may `chmod` a file another user planted, and
+/// that user — still its owner — can read the secrets back (or simply
+/// restore the mode). Such a file is refused, before its mode is touched.
+/// "This process" means the user id new files are created with, which is
+/// read off a short-lived, owner-only probe file created next to `path`
+/// (or, when that directory is not writable, in
+/// [`std::env::temp_dir`]); the crate has no `libc` dependency to ask the
+/// kernel directly. If no probe file can be created at all, a pre-existing
+/// `path` is refused. A file this call creates needs no probe.
+///
+/// On other platforms there is no ownership check: the protection there is
+/// the symlink and regular-file checks only.
 #[cfg(feature = "std")]
 pub fn file_keylog(path: &std::path::Path) -> std::io::Result<Arc<WriterKeyLog<std::fs::File>>> {
     // A link at `path` is refused rather than opened through: `O_NOFOLLOW`
@@ -122,28 +137,151 @@ pub fn file_keylog(path: &std::path::Path) -> std::io::Result<Arc<WriterKeyLog<s
             "keylog path is a symbolic link; refusing to write secrets through it",
         ));
     }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-        if let Some(flag) = o_nofollow() {
-            opts.custom_flags(flag);
+    let options = |exclusive: bool| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.append(true);
+        if exclusive {
+            // `O_CREAT | O_EXCL`: succeeds only by creating the file (and
+            // never through a link), so the result is ours by construction.
+            opts.create_new(true);
+        } else {
+            opts.create(true);
         }
-    }
-    let f = opts.open(path)?;
-    if !f.metadata()?.file_type().is_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+            if let Some(flag) = o_nofollow() {
+                opts.custom_flags(flag);
+            }
+        }
+        opts
+    };
+    // First try to create the file. Only when it is already there does the
+    // question of whose file it is arise. Any failure of the exclusive
+    // create falls back to the plain open — not only "already exists",
+    // since a kernel may report an existing file in an unwritable directory
+    // or on a read-only filesystem differently — and whatever that returns
+    // is treated as pre-existing (if it lost a race and created the file
+    // after all, the file is ours and passes the check).
+    let (f, created) = match options(true).open(path) {
+        Ok(f) => (f, true),
+        Err(_) => (options(false).open(path)?, false),
+    };
+    let meta = f.metadata()?;
+    if !meta.file_type().is_file() {
         return Err(std::io::Error::other(
             "keylog path is not a regular file; refusing to write secrets to it",
         ));
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !created {
+            // Checked on the open handle (`fstat`), so the file examined is
+            // the file written to, and before the mode reset, so a refused
+            // file is left exactly as it was.
+            check_owner(meta.uid(), file_creation_uid(path)?, meta.nlink())?;
+        }
         f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(not(unix))]
+    let _ = created;
     Ok(Arc::new(WriterKeyLog::new(f)))
+}
+
+/// Whether a pre-existing keylog file may receive secrets: it must be owned
+/// by `process_uid` (the user id this process creates files with) and be the
+/// only link to its inode. A file owned by anyone else stays readable — and
+/// re-`chmod`-able — by that owner whatever mode we set; a second hard link
+/// is a second name for the secrets that this call knows nothing about.
+#[cfg(all(feature = "std", unix))]
+fn check_owner(file_uid: u32, process_uid: u32, nlink: u64) -> std::io::Result<()> {
+    if file_uid != process_uid {
+        return Err(std::io::Error::other(
+            "keylog file already exists and is owned by another user; refusing to write secrets to it",
+        ));
+    }
+    if nlink != 1 {
+        return Err(std::io::Error::other(
+            "keylog file already exists and has more than one hard link; refusing to write secrets to it",
+        ));
+    }
+    Ok(())
+}
+
+/// The user id this process creates files with — the effective uid (on
+/// Linux the filesystem uid, which tracks it) — as it shows on the
+/// filesystem holding `path`.
+///
+/// Without `libc` there is no `geteuid()`, so the id is read from the
+/// metadata of a file this process has just created: an owner-only probe
+/// file made with `O_CREAT | O_EXCL` under a name nobody else can have
+/// prepared, examined through its open handle, and removed again. The probe
+/// goes in `path`'s own directory first, so that any id translation the
+/// filesystem applies (an id-mapped or squashing mount) applies to both
+/// files alike, and in [`std::env::temp_dir`] when that directory is not
+/// writable (a keylog file pre-created for an unprivileged service). An
+/// error is returned when neither works; the caller then refuses the file.
+#[cfg(all(feature = "std", unix))]
+fn file_creation_uid(path: &std::path::Path) -> std::io::Result<u32> {
+    let beside = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    probe_uid_in(&beside)
+        .or_else(|_| probe_uid_in(&std::env::temp_dir()))
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                alloc::format!(
+                    "keylog file already exists and its ownership cannot be checked \
+                     (no probe file could be created: {e}); refusing to write secrets to it"
+                ),
+            )
+        })
+}
+
+/// Creates an owner-only file in `dir`, returns the uid it was created
+/// with, and removes it. See [`file_creation_uid`].
+#[cfg(all(feature = "std", unix))]
+fn probe_uid_in(dir: &std::path::Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut last = None;
+    // The name only has to be unused: `create_new` fails on any existing
+    // entry (a symbolic link included) rather than opening it, so a name
+    // somebody guessed costs a retry, never a wrong answer.
+    for _ in 0..8 {
+        let name = alloc::format!(
+            ".purecrypto-keylog-probe-{}-{nanos:x}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let probe = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&probe)
+        {
+            Ok(f) => {
+                // The handle's metadata, not the path's: the name could be
+                // re-pointed in a directory others can write to.
+                let uid = f.metadata().map(|m| m.uid());
+                drop(f);
+                let _ = std::fs::remove_file(&probe);
+                return uid;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no free probe file name")))
 }
 
 /// The platform's `O_NOFOLLOW` open flag, or `None` where its value is not
@@ -376,6 +514,87 @@ mod tests {
         // A directory is not a regular file.
         assert!(file_keylog(&dir).is_err());
 
+        // A second hard link to an existing file: refused, mode untouched.
+        let linked = dir.join("linked.log");
+        std::fs::write(&linked, b"").unwrap();
+        std::fs::set_permissions(&linked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&linked, dir.join("second-name.log")).unwrap();
+        assert!(file_keylog(&linked).is_err(), "hard-linked file refused");
+        let mode = std::fs::metadata(&linked).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "a refused file must be left as it was");
+        assert!(std::fs::read(&linked).unwrap().is_empty());
+
+        // A file the call creates itself: owner-only, and reopened fine.
+        let fresh = dir.join("fresh.log");
+        let sink = file_keylog(&fresh).unwrap();
+        sink.log("CLIENT_RANDOM", &[0x01; 32], &[0x02; 48]);
+        drop(sink);
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let len = std::fs::metadata(&fresh).unwrap().len();
+        let sink = file_keylog(&fresh).unwrap();
+        sink.log("CLIENT_RANDOM", &[0x01; 32], &[0x02; 48]);
+        drop(sink);
+        assert_eq!(std::fs::metadata(&fresh).unwrap().len(), 2 * len, "appends");
+
+        // No probe file is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("keylog-probe"))
+            .collect();
+        assert!(leftovers.is_empty(), "probe files left: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-existing keylog file owned by another user was accepted when
+    /// the caller could `chmod` it anyway (root): its owner keeps read
+    /// access whatever the mode. The decision is a pure function of the
+    /// file's owner, the process's file-creation uid and the link count.
+    #[cfg(unix)]
+    #[test]
+    fn check_owner_requires_own_single_link_file() {
+        assert!(check_owner(1000, 1000, 1).is_ok());
+        assert!(check_owner(0, 0, 1).is_ok());
+        // Root opening a file planted by uid 1000 - the finding.
+        assert!(check_owner(1000, 0, 1).is_err());
+        // An unprivileged process and a root-owned file.
+        assert!(check_owner(0, 1000, 1).is_err());
+        assert!(check_owner(1001, 1000, 1).is_err());
+        // Our own file, but reachable under a second name (or unlinked).
+        assert!(check_owner(1000, 1000, 2).is_err());
+        assert!(check_owner(1000, 1000, 0).is_err());
+    }
+
+    /// The probe reports the uid this process creates files with: the same
+    /// one an ordinary file it creates carries, from either probe location.
+    #[cfg(unix)]
+    #[test]
+    fn file_creation_uid_matches_files_this_process_creates() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(alloc::format!(
+            "purecrypto-keylog-uid-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = dir.join("mine.log");
+        std::fs::write(&mine, b"").unwrap();
+        let uid = std::fs::metadata(&mine).unwrap().uid();
+        assert_eq!(probe_uid_in(&dir).unwrap(), uid);
+        assert_eq!(file_creation_uid(&mine).unwrap(), uid);
+        // A directory that does not exist: falls back to the temp dir.
+        assert_eq!(
+            file_creation_uid(&dir.join("missing").join("x.log")).unwrap(),
+            uid
+        );
+        assert!(probe_uid_in(&dir.join("missing")).is_err());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "probes removed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
