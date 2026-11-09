@@ -172,9 +172,15 @@ fn anchor_for<'a>(
     policy: &SignaturePolicy,
 ) -> Result<Option<&'a TrustAnchor>, Error> {
     let issuer_der = cert.issuer_der().map_err(|_| Error::BadCertificate)?;
-    Ok(store
-        .anchors_with_subject(issuer_der)
-        .find(|anchor| verify_cert_against_issuer(cert, &anchor.key, policy).is_ok()))
+    // An anchor whose own certificate is distrusted by fingerprint
+    // (`RootCertStore::distrust_cert_sha256`) is not an anchor: the root
+    // certificate is never part of the validated path, so this is the only
+    // place its fingerprint can be honoured. Skipping it (rather than
+    // failing) lets another anchor with the same name still close the path.
+    Ok(store.anchors_with_subject(issuer_der).find(|anchor| {
+        !store.anchor_cert_distrusted(anchor)
+            && verify_cert_against_issuer(cert, &anchor.key, policy).is_ok()
+    }))
 }
 
 /// Resolves the issuer of `chain[0]` exactly as the chain verifier does —
@@ -540,7 +546,9 @@ fn verify_chain_inner(
     // The store's distrust list (e.g. `cacrt`'s blocklist of compromised
     // intermediates and disabled roots) applies to every certificate in the
     // validated path and to the anchor's key: a blocked key is refused even
-    // when it is re-issued, cross-signed or installed as a root.
+    // when it is re-issued, cross-signed or installed as a root. (A root
+    // blocked by its certificate fingerprint was already passed over by
+    // `anchor_for`.)
     for cert in path {
         store.check_distrust(cert)?;
     }
@@ -4702,6 +4710,127 @@ mod tests {
         assert!(s.is_distrusted(&chain[1]));
         assert!(!s.is_distrusted(&chain[0]));
         assert!(!store.is_distrusted(&chain[1]));
+    }
+
+    /// A fingerprint-only distrust entry for a root that is *in the store*
+    /// must take that root out of service. The root certificate is never
+    /// part of the validated path (the path closes at the first anchored
+    /// certificate), so it has to be honoured at anchor selection.
+    #[test]
+    fn distrust_cert_fingerprint_applies_to_a_root_in_the_store() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::hash::sha256;
+        use crate::rng::HmacDrbg;
+        use crate::x509::{
+            CertSigner, DistinguishedName, KeyUsageBits,
+            extension::{basic_constraints, key_usage},
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"distrust-root", b"n", &[]);
+        let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let int_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let root_signer = CertSigner::Ecdsa(&root_key);
+        let int_signer = CertSigner::Ecdsa(&int_key);
+        let root_name = DistinguishedName::common_name("distrust-root");
+        let int_name = DistinguishedName::common_name("distrust-int");
+        let ca_exts = [
+            basic_constraints(true, None),
+            key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+        ];
+        // Two root certificates for the same name and key (a re-issue):
+        // only the serial differs, so their fingerprints differ.
+        let mk_root = |serial| {
+            Certificate::self_signed_with_extensions(
+                &root_signer,
+                &root_name,
+                &validity(),
+                serial,
+                &ca_exts,
+            )
+            .unwrap()
+            .to_der()
+            .to_vec()
+        };
+        let root_der = mk_root(1);
+        let reissued_root_der = mk_root(9);
+        assert_ne!(root_der, reissued_root_der);
+        let int = Certificate::issue_with_extensions(
+            &root_signer,
+            &root_name,
+            &int_name,
+            &crate::x509::AnyPublicKey::Ecdsa(int_key.public_key()),
+            &validity(),
+            2,
+            &ca_exts,
+        )
+        .unwrap();
+        let leaf = Certificate::issue_with_extensions(
+            &int_signer,
+            &int_name,
+            &DistinguishedName::common_name("distrust-leaf"),
+            &crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity(),
+            3,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+            ],
+        )
+        .unwrap();
+        let chain = alloc::vec![leaf.to_der().to_vec(), int.to_der().to_vec()];
+        let mut with_root = chain.clone();
+        with_root.push(root_der.clone());
+
+        let mut store = RootCertStore::new();
+        store.add_der(root_der.clone()).unwrap();
+        verify_chain_now(&store, &chain).unwrap();
+        verify_chain_now(&store, &with_root).unwrap();
+
+        // Distrusted after it was added.
+        let mut s = store.clone();
+        s.distrust_cert_sha256(sha256(&root_der));
+        assert!(s.is_distrusted(&root_der));
+        assert!(matches!(
+            verify_chain_now(&s, &chain),
+            Err(Error::BadCertificate)
+        ));
+        assert!(matches!(
+            verify_chain_now(&s, &with_root),
+            Err(Error::BadCertificate)
+        ));
+        // A certificate issued directly by the distrusted root has no
+        // issuer to resolve either.
+        assert!(leaf_issuer(&s, &chain[1..], &policy()).is_err());
+        leaf_issuer(&store, &chain[1..], &policy()).unwrap();
+
+        // Distrusted before it was added: the order does not matter.
+        let mut s = RootCertStore::new();
+        s.distrust_cert_sha256(sha256(&root_der));
+        s.add_der(root_der.clone()).unwrap();
+        assert!(matches!(
+            verify_chain_now(&s, &chain),
+            Err(Error::BadCertificate)
+        ));
+
+        // A fingerprint names one certificate, not its key: a re-issued
+        // root for the same key that is also in the store still anchors
+        // the chain, whichever of the two was added first.
+        for first_is_distrusted in [true, false] {
+            let mut s = RootCertStore::new();
+            s.distrust_cert_sha256(sha256(&root_der));
+            if first_is_distrusted {
+                s.add_der(root_der.clone()).unwrap();
+                s.add_der(reissued_root_der.clone()).unwrap();
+            } else {
+                s.add_der(reissued_root_der.clone()).unwrap();
+                s.add_der(root_der.clone()).unwrap();
+            }
+            verify_chain_now(&s, &chain).unwrap();
+        }
+
+        // The original store is untouched.
+        verify_chain_now(&store, &chain).unwrap();
     }
 
     #[test]

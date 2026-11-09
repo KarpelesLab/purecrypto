@@ -25,6 +25,12 @@ pub(crate) struct TrustAnchor {
     /// `issuerKeyHash` is computed over the on-the-wire `subjectPublicKey`
     /// BIT STRING (RFC 6960 §4.1.1), not over a re-encoding of `key`.
     pub(crate) spki_der: Vec<u8>,
+    /// SHA-256 of the root certificate's DER (its fingerprint), so a
+    /// certificate-fingerprint distrust entry
+    /// ([`RootCertStore::distrust_cert_sha256`]) applies to a root that is in
+    /// the store: the root certificate itself is not part of the validated
+    /// path and is otherwise never hashed.
+    pub(crate) cert_sha256: [u8; 32],
     pub(crate) name_constraints: Option<NameConstraints>,
     /// The anchor's own `basicConstraints.pathLenConstraint`, when it declared
     /// one. RFC 5280 §6.1 does not process the anchor's certificate at all,
@@ -161,6 +167,7 @@ impl RootCertStore {
             .subject_public_key_insecure()
             .map_err(|_| Error::BadCertificate)?;
         let spki_der = cert.spki_der().map_err(|_| Error::BadCertificate)?.to_vec();
+        let cert_sha256 = crate::hash::sha256(cert.to_der());
         let name_constraints = cert.name_constraints().map_err(|_| Error::BadCertificate)?;
         // RFC 5937 anchor constraints: keep the anchor's own
         // `pathLenConstraint` and `extKeyUsage`, when it declares them, so the
@@ -196,6 +203,7 @@ impl RootCertStore {
             subject_der,
             key,
             spki_der,
+            cert_sha256,
             name_constraints,
             path_len_constraint,
             is_ca,
@@ -298,7 +306,11 @@ impl RootCertStore {
 
     /// Distrusts the one certificate whose DER encoding has this SHA-256
     /// hash (its usual fingerprint). Chain verification refuses it anywhere
-    /// in the validated path. Prefer
+    /// in the validated path, and stops using it as a trust anchor when it
+    /// is a root in this store (whether it was added before or after this
+    /// call): a chain that leads only to that root fails, while one that
+    /// also reaches another, still-trusted anchor — a re-issued root with
+    /// the same key, a cross-sign — keeps verifying through that one. Prefer
     /// [`distrust_spki_sha256`](Self::distrust_spki_sha256) when the key
     /// itself is compromised: it also catches re-issued certificates.
     pub fn distrust_cert_sha256(&mut self, cert_sha256: [u8; 32]) {
@@ -349,6 +361,13 @@ impl RootCertStore {
             return Err(Error::BadCertificate);
         }
         Ok(())
+    }
+
+    /// Whether `anchor`'s own certificate is distrusted by fingerprint. Such
+    /// an anchor terminates no path (its key is covered separately, by
+    /// [`check_distrust_spki`](Self::check_distrust_spki)).
+    pub(crate) fn anchor_cert_distrusted(&self, anchor: &TrustAnchor) -> bool {
+        self.distrusted.cert_sha256.contains(&anchor.cert_sha256)
     }
 
     /// The distrust list as `(tag, hash)` pairs (`0` = public key, `1` =
