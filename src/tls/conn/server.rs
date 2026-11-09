@@ -564,6 +564,13 @@ impl ServerConfig {
     /// validity period of client certificates under mTLS. Set this on `no_std`
     /// targets (where the system clock is unavailable) or for reproducible
     /// verification; under `std` the system clock is used when this is unset.
+    ///
+    /// The same time is the session-ticket clock, and it is a constant: for
+    /// as long as this config is in use, ticket expiry is evaluated at that
+    /// one instant (a ticket valid then never expires here) and 0-RTT is
+    /// neither advertised nor accepted, because the RFC 8446 §8.2 freshness
+    /// check cannot bound replay without a clock that advances (see
+    /// [`Self::with_max_early_data`]). 1-RTT resumption is unaffected.
     pub fn with_verification_time(mut self, t: crate::x509::Time) -> Self {
         self.verification_time = Some(t);
         self
@@ -782,17 +789,20 @@ impl ServerConfig {
     /// doing so is idempotent.
     ///
     /// Anti-replay (RFC 8446 §8): the server always enforces the §8.2
-    /// ticket-age freshness window (~10 s) when a wall clock is available,
-    /// which bounds how long a captured 0-RTT flight stays replayable but
-    /// does NOT detect replays inside that window. Deployments acting on
-    /// early data should also install a [`Self::with_replay_window`] shared
-    /// across all server instances that accept the same ticket key.
+    /// ticket-age freshness window (~10 s), which bounds how long a
+    /// captured 0-RTT flight stays replayable but does NOT detect replays
+    /// inside that window. Deployments acting on early data should also
+    /// install a [`Self::with_replay_window`] shared across all server
+    /// instances that accept the same ticket key.
     ///
-    /// If neither defense is active for a given flight — i.e. there is no
-    /// wall clock (`no_std`, or a clock that reads 0) AND no `ReplayWindow`
-    /// is installed — the server fails closed and refuses 0-RTT for that
-    /// flight, transparently falling back to the (replay-safe) 1-RTT
-    /// handshake rather than accepting undefended early data.
+    /// The freshness window needs a clock that advances, which here means
+    /// the system clock (`std`). Under a pinned
+    /// [`Self::with_verification_time`] — the only clock a `no_std` server
+    /// has — the expected ticket age never changes, so the server fails
+    /// closed: it does not advertise early data in its tickets and refuses
+    /// any 0-RTT flight, transparently falling back to the (replay-safe)
+    /// 1-RTT handshake. A `ReplayWindow` does not change that, since it
+    /// only remembers a binder for the freshness horizon.
     pub fn with_max_early_data(mut self, max: u32) -> Self {
         self.max_early_data_size = max;
         self
@@ -2362,18 +2372,17 @@ impl<R: RngCore> ServerConnection<R> {
         }
 
         // Anti-replay floor (RFC 8446 §8 / Appendix E.5): never accept 0-RTT
-        // unless some replay defense is actually active for this flight. The
-        // §8.2 freshness window only runs against a real clock; if it was
-        // skipped (`now == 0`, e.g. a no_std server with no wall clock) AND no
-        // ReplayWindow is installed, a captured early-data flight would be
-        // unboundedly replayable — so fall back to the spec-compliant 1-RTT
-        // path instead of silently accepting undefended 0-RTT.
-        #[cfg(feature = "std")]
-        let has_replay_window = self.config.replay_window.is_some();
-        #[cfg(not(feature = "std"))]
-        let has_replay_window = false;
+        // unless the §8.2 freshness window is an actual bound for this
+        // flight, i.e. it ran against a live clock. A pinned
+        // `verification_time` never advances, so a captured early-data
+        // flight would stay "fresh" forever; fall back to the
+        // spec-compliant 1-RTT path instead. A `ReplayWindow` does not lift
+        // this: it only remembers a binder for the freshness horizon
+        // (`REPLAY_WINDOW_RETENTION_MS`) and relies on freshness to reject
+        // the flight afterwards. (`age_fresh` is already `false` in that
+        // case; this is the explicit backstop.)
         let freshness_active = psk_state.as_ref().is_some_and(|s| s.age_checked);
-        if accept_early && !freshness_active && !has_replay_window {
+        if accept_early && !freshness_active {
             accept_early = false;
         }
 
@@ -3815,7 +3824,9 @@ impl<R: RngCore> ServerConnection<R> {
         }
 
         let mut extensions = Vec::new();
-        if self.config.max_early_data_size > 0 {
+        // Only advertise 0-RTT when it can actually be accepted (not under
+        // a pinned `verification_time`).
+        if self.early_data_available() {
             extensions.push(ext::early_data_with_size(self.config.max_early_data_size));
         }
         let nst = NewSessionTicket {
@@ -3908,15 +3919,16 @@ struct AcceptedPsk {
     /// RFC 8446 §8.2: whether the client's reported ticket age
     /// (de-obfuscated with `ticket_age_add`) agrees with the server-side
     /// expected age within [`MAX_TICKET_AGE_DEVIATION_MS`]. `false` refuses
-    /// 0-RTT only — 1-RTT resumption proceeds normally. Always `true` when
-    /// the server has no wall clock (`now == 0`, e.g. `no_std`), where
-    /// freshness cannot be assessed and anti-replay falls back to the
-    /// optional `ReplayWindow`.
+    /// 0-RTT only — 1-RTT resumption proceeds normally. Always `false` when
+    /// the ticket clock is not live (a pinned `verification_time`, see
+    /// `ServerConnection::ticket_clock`): agreement with a clock that never
+    /// advances says nothing about how old the flight is.
     age_fresh: bool,
-    /// Whether the §8.2 freshness check actually ran against a real clock
-    /// (`now != 0`). When `false` the freshness window provided no
-    /// anti-replay protection, so 0-RTT is only safe if a `ReplayWindow`
-    /// is installed (see the 0-RTT acceptance floor in `process_client_hello`).
+    /// Whether the §8.2 freshness check ran against a live clock, i.e.
+    /// whether it is an actual anti-replay bound for this flight. `false`
+    /// for an external PSK and under a pinned `verification_time`; the
+    /// 0-RTT acceptance floor in `process_client_hello` refuses early data
+    /// then.
     age_checked: bool,
     /// The cipher suite the issuing handshake used, when the ticket records
     /// one. 0-RTT is refused unless this handshake negotiates the very same
@@ -4000,13 +4012,42 @@ impl<R: RngCore> ServerConnection<R> {
     /// explicit verification time) — tickets are then disabled outright
     /// rather than issued with a `creation_time` of 0, which could never
     /// expire and would turn every ticket into a permanent bearer token.
+    ///
+    /// Callers that treat the reading as *advancing* time — the 0-RTT
+    /// anti-replay logic — must use [`Self::ticket_clock`] instead, which
+    /// also says whether the clock is live.
     fn ticket_now(&self) -> Option<u64> {
-        self.config
-            .verification_time
-            .clone()
-            .or_else(system_now)
-            .and_then(|t| t.to_unix_checked())
+        self.ticket_clock().map(|(now, _live)| now)
+    }
+
+    /// [`Self::ticket_now`] plus whether that reading comes from a *live*
+    /// clock: `true` for the system clock, `false` for a configured
+    /// [`ServerConfig::with_verification_time`].
+    ///
+    /// A configured time is a constant for the lifetime of the (immutable)
+    /// config, so it bounds nothing that relies on time passing: against it
+    /// the RFC 8446 §8.2 expected ticket age never grows, and a captured
+    /// ClientHello whose reported age was in tolerance once stays in
+    /// tolerance forever. Ticket *expiry* against such a clock is merely
+    /// frozen (the embedder's documented trade-off); 0-RTT freshness would
+    /// be an anti-replay defence that does not exist, so it is not counted
+    /// (see `try_accept_psk`).
+    fn ticket_clock(&self) -> Option<(u64, bool)> {
+        let (time, live) = match self.config.verification_time.clone() {
+            Some(pinned) => (pinned, false),
+            None => (system_now()?, true),
+        };
+        time.to_unix_checked()
             .filter(|t| *t != 0)
+            .map(|now| (now, live))
+    }
+
+    /// Whether 0-RTT can be accepted at all: a budget is configured and the
+    /// ticket clock is live (see [`Self::ticket_clock`]). Also gates the
+    /// `early_data` advertisement in NewSessionTicket, so clients are not
+    /// invited to send a flight this server will always refuse.
+    fn early_data_available(&self) -> bool {
+        self.config.max_early_data_size > 0 && self.ticket_clock().is_some_and(|(_, live)| live)
     }
 
     /// Whether this engine can issue / accept RFC 8446 §4.6.1 tickets: a key
@@ -4154,8 +4195,10 @@ impl<R: RngCore> ServerConnection<R> {
         // with different client roots simply fails to open (full
         // handshake). The derived key is wiped on every exit path
         // (including the `?`s below).
-        let tickets = match (self.ticket_now(), self.ticket_seal_key()) {
-            (Some(now), Some(key)) => Some((now, crate::zeroize::Zeroizing::new(key))),
+        let tickets = match (self.ticket_clock(), self.ticket_seal_key()) {
+            (Some((now, live)), Some(key)) => {
+                Some((now, live, crate::zeroize::Zeroizing::new(key)))
+            }
             _ => None,
         };
         let external_psks: &[ExternalPsk] =
@@ -4249,10 +4292,10 @@ impl<R: RngCore> ServerConnection<R> {
                     client_auth_secs: 0,
                 }));
             }
-            let Some((now, ticket_key)) = tickets.as_ref() else {
+            let Some((now, clock_live, ticket_key)) = tickets.as_ref() else {
                 continue;
             };
-            let now = *now;
+            let (now, clock_live) = (*now, *clock_live);
             let Some(decrypted) = decrypt_ticket(ticket_key, ticket, now, ticket_lifetime) else {
                 continue;
             };
@@ -4307,9 +4350,17 @@ impl<R: RngCore> ServerConnection<R> {
             // de-obfuscate it and require agreement with our own view
             // (now − issuance) within a small window. A stale or
             // forward-dated report marks the PSK as unfit for 0-RTT —
-            // resumption itself is unaffected. A clock is guaranteed here
-            // (`ticket_now()` returned `Some`), so the check always runs.
-            let age_fresh = {
+            // resumption itself is unaffected.
+            //
+            // The check is only a replay bound against a clock that
+            // advances. Under a pinned `verification_time` the expected age
+            // is a constant, so a captured flight that matched once would
+            // match forever (and the `ReplayWindow`, which forgets a binder
+            // once freshness is supposed to have taken over, would re-admit
+            // it every retention period). Such a clock therefore never
+            // yields a fresh ticket: 0-RTT is refused, 1-RTT resumption
+            // proceeds.
+            let age_fresh = clock_live && {
                 let client_age_ms = obfuscated_age.wrapping_sub(age_add) as u64;
                 let expected_age_ms = now.saturating_sub(creation_secs).saturating_mul(1000);
                 client_age_ms.abs_diff(expected_age_ms) <= MAX_TICKET_AGE_DEVIATION_MS
@@ -4321,7 +4372,7 @@ impl<R: RngCore> ServerConnection<R> {
                 external: None,
                 alpn,
                 age_fresh,
-                age_checked: true,
+                age_checked: clock_live,
                 suite,
                 selected_identity,
                 selected_binder: presented.to_vec(),

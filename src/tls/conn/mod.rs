@@ -3220,6 +3220,135 @@ mod loopback_tests {
         assert_eq!(server2.take_received_plaintext(), b"after-eoed");
     }
 
+    /// A pinned `verification_time` is a clock that never advances, so the
+    /// RFC 8446 §8.2 ticket-age check against it cannot bound replay: a
+    /// captured 0-RTT flight would stay "fresh" forever. Such a server must
+    /// refuse early data (with or without a `ReplayWindow`, whose entries
+    /// only outlive the freshness horizon), must not advertise it in its own
+    /// tickets, and must still resume over 1-RTT. The live-clock acceptance
+    /// path is covered by `zero_rtt_echo`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn zero_rtt_refused_under_pinned_verification_time() {
+        fn drive(client: &mut ClientConnection, server: &mut ServerConnection<HmacDrbg<Sha256>>) {
+            for _ in 0..16 {
+                let c = client.write_tls();
+                if !c.is_empty() {
+                    server.read_tls(&c);
+                    server.process_new_packets().unwrap();
+                }
+                let s = server.write_tls();
+                if !s.is_empty() {
+                    client.read_tls(&s);
+                    client.process_new_packets().unwrap();
+                }
+                if c.is_empty() && s.is_empty() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+        }
+        fn connect(
+            server_config: ServerConfig,
+            cert_der: Vec<u8>,
+            session: Option<super::StoredSession>,
+            early: Option<&[u8]>,
+            label: &[u8],
+        ) -> (ClientConnection, ServerConnection<HmacDrbg<Sha256>>) {
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert_der).unwrap();
+            let mut config = client_config(roots);
+            if let Some(session) = session {
+                config = config.with_session(session);
+            }
+            let mut crng = HmacDrbg::<Sha256>::new(label, b"client", &[]);
+            let srng = HmacDrbg::<Sha256>::new(label, b"server", &[]);
+            let mut client = ClientConnection::new_with_offer(
+                config,
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+            let mut server = ServerConnection::new(server_config, srng);
+            if let Some(early) = early {
+                client.write_early_data(early).unwrap();
+            }
+            drive(&mut client, &mut server);
+            (client, server)
+        }
+        // The pinned time is the real "now", so a ticket the live-clock
+        // server issues a moment earlier is in its lifetime *and* inside the
+        // ±10 s age tolerance: before the fix this flight was accepted.
+        let pinned_now = || {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            Time::from_unix(secs)
+        };
+        const KEY: [u8; 32] = [0x3au8; 32];
+
+        for with_window in [false, true] {
+            // A live-clock server hands out a ticket advertising 0-RTT.
+            let (live, cert_der) = rsa_server();
+            let live = live.with_ticket_key(KEY).with_max_early_data(16384);
+            let (mut client, _server) = connect(live, cert_der, None, None, b"pinned-0rtt-issue");
+            let session = client.take_session().expect("ticket");
+            assert_eq!(session.max_early_data_size, Some(16384));
+
+            // The same ticket + early data against a pinned-clock server.
+            let (pinned, cert_der) = rsa_server();
+            let mut pinned = pinned
+                .with_ticket_key(KEY)
+                .with_max_early_data(16384)
+                .with_verification_time(pinned_now());
+            if with_window {
+                pinned = pinned.with_replay_window(super::ReplayWindow::new());
+            }
+            let (mut client, mut server) = connect(
+                pinned,
+                cert_der,
+                Some(session),
+                Some(b"replayable"),
+                b"pinned-0rtt-offer",
+            );
+            assert!(server.early_data_offered());
+            assert!(
+                !server.early_data_accepted(),
+                "pinned clock must refuse 0-RTT (replay window: {with_window})"
+            );
+            assert!(!client.early_data_accepted());
+            assert!(server.take_early_data().is_empty());
+            // ... but the handshake is a 1-RTT *resumption*, not a full one.
+            assert!(server.psk_used(), "resumption must survive a pinned clock");
+            assert!(client.psk_accepted());
+            client.send_application_data(b"one-rtt").unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets().unwrap();
+            assert_eq!(server.take_received_plaintext(), b"one-rtt");
+            assert!(server.take_early_data().is_empty());
+
+            // The pinned server's own ticket does not invite early data,
+            // and resumes.
+            let session = client.take_session().expect("ticket from pinned server");
+            assert!(
+                !matches!(session.max_early_data_size, Some(n) if n > 0),
+                "a server that never accepts 0-RTT must not advertise it"
+            );
+            let (pinned, cert_der) = rsa_server();
+            let pinned = pinned
+                .with_ticket_key(KEY)
+                .with_max_early_data(16384)
+                .with_verification_time(pinned_now());
+            let (client, server) =
+                connect(pinned, cert_der, Some(session), None, b"pinned-0rtt-resume");
+            assert!(server.psk_used() && client.psk_accepted());
+            assert!(!server.early_data_accepted());
+        }
+    }
+
     /// RFC 8446 §4.2.10: the server MUST refuse 0-RTT when the ALPN
     /// protocol selected on the new connection differs from the one in
     /// use on the connection that issued the ticket. The refusal is NOT

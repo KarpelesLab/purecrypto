@@ -293,6 +293,10 @@ pub struct Config {
     /// Clock used for cert validity (`notBefore`/`notAfter`). Applies to the
     /// server certificate the client verifies AND to the client certificate a
     /// server verifies under mTLS. `None` = system clock under `std`.
+    ///
+    /// On a server this is also the session-ticket clock, and a pinned time
+    /// never advances: see [`ConfigBuilder::verification_time`] for what
+    /// that freezes (ticket expiry) and disables (0-RTT).
     pub verification_time: Option<Time>,
 
     // ---- Server-side ----
@@ -1357,9 +1361,13 @@ impl ConfigBuilder {
     /// exposure in time but does not detect replays inside that window —
     /// pair this knob with [`Self::replay_window`] (shared across all
     /// instances accepting the same ticket key) when early data triggers
-    /// non-idempotent actions. Without a wall clock (`no_std`) the
-    /// freshness check is skipped and the replay window is the only
-    /// anti-replay protection.
+    /// non-idempotent actions.
+    ///
+    /// The freshness window needs a clock that advances, i.e. the system
+    /// clock (`std`). With a pinned [`Self::verification_time`] — the only
+    /// clock a `no_std` server has — the TLS 1.3 server neither advertises
+    /// nor accepts early data, replay window or not: every 0-RTT flight
+    /// falls back to the 1-RTT handshake.
     #[cfg_attr(
         not(feature = "std"),
         doc = "",
@@ -1467,6 +1475,23 @@ impl ConfigBuilder {
     }
     /// Verification clock (use this on `no_std` targets or for reproducible
     /// verification).
+    ///
+    /// The time is a constant for as long as the `Config` is in use — it
+    /// does not advance — and a server uses it as its session-ticket clock
+    /// too. Two consequences for a server with a pinned time:
+    ///
+    /// - **Ticket expiry and ticket age are frozen.** A ticket is checked
+    ///   against this one instant, so a ticket that is within its lifetime
+    ///   then is accepted for as long as the config (and the
+    ///   [`ticket_key`](Self::ticket_key)) lives. Rebuild the `Config` with
+    ///   a current time, or rotate the ticket key, to age tickets out.
+    /// - **0-RTT is disabled on the TLS 1.3 server.** The RFC 8446 §8.2
+    ///   ticket-age freshness check cannot bound replay against a clock that
+    ///   never moves (a captured early-data flight would stay "fresh"
+    ///   forever), so the server does not advertise early data and refuses
+    ///   every 0-RTT flight, falling back to 1-RTT, whatever
+    ///   [`max_early_data`](Self::max_early_data) says. Resumption without
+    ///   early data is unaffected.
     pub fn verification_time(mut self, t: Time) -> Self {
         self.inner.verification_time = Some(t);
         self
