@@ -1947,46 +1947,80 @@ impl DtlsClientConnection13 {
                 len: frag.len,
             };
             off += consumed;
-            // On the unauthenticated (epoch-0, plaintext) path a single
-            // spoofed handshake record — e.g. a forged ServerHello or HRR —
-            // must never abort OR derail the in-flight handshake: feed and
-            // dispatch, but turn any reassembly/dispatch fault into a silent
-            // drop, keeping only our own `InappropriateState` misconfig fatal
-            // — mirroring the DTLS 1.3 server pre-cookie wrapper.
-            // `feed`/`pop_ready` advance `expected_msg_seq` BEFORE dispatch, so
-            // on a silent drop we also rewind the reassembler: otherwise a
-            // spoofed but well-framed ServerHello/HRR would pin
-            // `expected_msg_seq` past the genuine message (same message_seq),
-            // which would then be rejected as stale. The authenticated
-            // (epoch ≥ 1) path keeps every error fatal.
-            let snapshot = self.reassembler.expected_msg_seq();
-            if let Some((mt, body)) = self.reassembler.feed(frag) {
-                match self.dispatch_one(mt, &body) {
-                    Ok(()) => {}
-                    Err(e) if authenticated || matches!(e, Error::InappropriateState) => {
-                        return Err(e);
-                    }
-                    Err(_) => {
-                        self.reassembler.rewind_expected_msg_seq(snapshot);
-                        return Ok(());
-                    }
+            if !authenticated {
+                // The reassembler is shared between the epoch-0 plaintext
+                // path and the AEAD-protected one, so what the plaintext
+                // path may leave in it is bounded here, by construction:
+                //
+                // - Plaintext handshake input only exists while we await
+                //   the ServerHello / HelloRetryRequest. The record gate
+                //   already checks that per record; this re-checks it per
+                //   fragment, because a ServerHello dispatched earlier in
+                //   this very record has installed the handshake keys and
+                //   whatever follows it in the same plaintext record is as
+                //   unauthenticated as before.
+                // - The only plaintext messages of DTLS 1.3 are the
+                //   HelloRetryRequest and the ServerHello, and each is
+                //   exactly the head of the queue when it is legitimate
+                //   (`message_seq` 0, or 1 for the ServerHello that follows
+                //   an HRR — which the server only sends in answer to our
+                //   second ClientHello, i.e. after we dispatched the HRR).
+                //   A plaintext fragment at any LATER `message_seq` can
+                //   only be an attempt to plant a message for the
+                //   authenticated part of the handshake: buffered, it
+                //   would be popped once a genuine protected record moved
+                //   the head there and dispatched as if it had been
+                //   authenticated — a forged EncryptedExtensions, a fatal
+                //   `UnexpectedMessage` from garbage, or a KeyUpdate /
+                //   NewConnectionId processed in `Connected`. It never
+                //   reaches the reassembler.
+                //
+                // Both are silent drops of the rest of the record (RFC
+                // 9147 §4.5.2).
+                if self.state != State::WaitServerHello
+                    || frag.message_seq != self.reassembler.expected_msg_seq()
+                {
+                    return Ok(());
                 }
-            }
-            loop {
+                // A single spoofed handshake record — e.g. a forged
+                // ServerHello or HRR — must never abort OR derail the
+                // in-flight handshake: feed and dispatch, but turn any
+                // dispatch fault into a silent drop, keeping only our own
+                // `InappropriateState` misconfig fatal — mirroring the
+                // DTLS 1.3 server pre-cookie wrapper. `feed` advances
+                // `expected_msg_seq` BEFORE dispatch, so on a silent drop
+                // we also rewind the reassembler: otherwise a spoofed but
+                // well-framed ServerHello/HRR would pin `expected_msg_seq`
+                // past the genuine message (same message_seq), which would
+                // then be rejected as stale.
+                //
+                // Nothing is drained with `pop_ready` here: the gate above
+                // admits head-of-queue fragments only, so no plaintext
+                // message is ever buffered ahead of the head, and after a
+                // ServerHello the head belongs to the protected flight.
                 let snapshot = self.reassembler.expected_msg_seq();
-                let Some((mt, body)) = self.reassembler.pop_ready() else {
-                    break;
-                };
-                match self.dispatch_one(mt, &body) {
-                    Ok(()) => {}
-                    Err(e) if authenticated || matches!(e, Error::InappropriateState) => {
-                        return Err(e);
-                    }
-                    Err(_) => {
-                        self.reassembler.rewind_expected_msg_seq(snapshot);
-                        return Ok(());
+                if let Some((mt, body)) = self.reassembler.feed(frag) {
+                    match self.dispatch_one(mt, &body) {
+                        Ok(()) => {}
+                        Err(e) if matches!(e, Error::InappropriateState) => return Err(e),
+                        Err(_) => {
+                            self.reassembler.rewind_expected_msg_seq(snapshot);
+                            return Ok(());
+                        }
                     }
                 }
+                continue;
+            }
+            // Authenticated (epoch ≥ 2) path: every fault is a genuine peer
+            // fault and stays fatal. Whatever `pop_ready` releases was
+            // buffered from authenticated records too — the plaintext path
+            // above never buffers ahead of the head, and `on_server_hello`
+            // empties the reassembler when the keys are installed.
+            if let Some((mt, body)) = self.reassembler.feed(frag) {
+                self.dispatch_one(mt, &body)?;
+            }
+            while let Some((mt, body)) = self.reassembler.pop_ready() {
+                self.dispatch_one(mt, &body)?;
             }
         }
         Ok(())
@@ -2178,7 +2212,17 @@ impl DtlsClientConnection13 {
         // From here on every handshake message is authenticated under the
         // handshake keys (plaintext handshake records are ignored outside
         // `WaitServerHello`), so the reassembler may hold a certificate
-        // chain again.
+        // chain again. Whatever it still holds was fed in plaintext (no
+        // protected record is readable before this point: there was no
+        // read key), i.e. is unauthenticated: competing claims at the
+        // ServerHello's own `message_seq` were evicted when it dispatched,
+        // and the plaintext path buffers nothing ahead of the head, but
+        // the switch from spoofable to authenticated input is exactly
+        // here, so make the hand-over explicit — nothing fed before the
+        // keys existed may ever be delivered as an authenticated message.
+        // The genuine ServerHello has already left the reassembler, and
+        // the protected records of its datagram are fed after this.
+        self.reassembler.clear();
         self.reassembler
             .set_limits(MAX_MESSAGE_LEN, MAX_IN_PROGRESS);
         // RFC 9147 §7.1 implicit acknowledgement: the server's responding

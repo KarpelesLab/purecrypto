@@ -3289,6 +3289,183 @@ mod dtls13 {
         // The handshake still completes with the genuine server.
         assert!(pump_handshake_13(&mut client, &mut server));
     }
+
+    /// The spoofed plaintext records of the planted-fragment tests: one
+    /// complete message per `message_seq` in `first..first + 8` (the whole
+    /// look-ahead window of the reassembler), each a well-formed KeyUpdate
+    /// (`update_not_requested`) except for garbage at `garbage_seq`.
+    fn planted_plaintext_messages_13(first: u16, garbage_seq: u16) -> Vec<Vec<u8>> {
+        (first..first + 8)
+            .map(|seq| {
+                if seq == garbage_seq {
+                    // HandshakeType 0xee does not exist.
+                    super::dtls12_plaintext_handshake_record(0xee, seq, &[0xde, 0xad])
+                } else {
+                    // KeyUpdate = handshake type 24, body = request_update.
+                    super::dtls12_plaintext_handshake_record(24, seq, &[0])
+                }
+            })
+            .collect()
+    }
+
+    /// After a planted-fragment handshake: nothing planted was processed
+    /// and the session is not deaf in either direction.
+    fn assert_untouched_by_planted_messages_13<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection13,
+        server: &mut DtlsServerConnection13<R>,
+    ) {
+        assert_eq!(client.peer_key_updates(), 0, "no planted KeyUpdate ran");
+        assert_eq!(client.read_epoch(), Some(3), "read epoch did not rotate");
+        assert_eq!(client.reassembler_buffered_bytes_for_test(), 0);
+        // A few more rounds (NewSessionTicket / ACKs) must not surface a
+        // planted message either.
+        for _ in 0..4 {
+            for dg in client.pop_outbound_datagrams() {
+                server.feed_datagram(&dg).unwrap();
+            }
+            for dg in server.pop_outbound_datagrams() {
+                client.feed_datagram(&dg).unwrap();
+            }
+        }
+        assert_eq!(client.peer_key_updates(), 0);
+        assert_eq!(client.read_epoch(), Some(3));
+        server.send(b"server-to-client").unwrap();
+        for dg in server.pop_outbound_datagrams() {
+            client.feed_datagram(&dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"server-to-client");
+        client.send(b"client-to-server").unwrap();
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"client-to-server");
+    }
+
+    /// Regression (planted plaintext fragment, DTLS 1.3 client): the client
+    /// reassembles the plaintext ServerHello and the protected rest of the
+    /// server's flight in one reassembler. A spoofed plaintext message at a
+    /// LATER `message_seq`, sent between the ClientHello and the
+    /// ServerHello, used to be buffered and then popped — and dispatched as
+    /// if authenticated — once the genuine protected flight moved the queue
+    /// head there: garbage at the Certificate's `message_seq` 2 killed the
+    /// handshake with a fatal `UnexpectedMessage`, and a KeyUpdate at 5 (the
+    /// first sequence number after the server Finished) rotated the read
+    /// keys of the established session to ones the server never uses.
+    #[test]
+    fn planted_plaintext_fragments_are_not_dispatched_after_server_hello_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-planted", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        let ch = client.pop_outbound_datagrams();
+        // ServerHello 0, EncryptedExtensions 1, Certificate 2,
+        // CertificateVerify 3, Finished 4; 5.. is post-handshake.
+        for rec in planted_plaintext_messages_13(1, 2) {
+            assert_eq!(client.feed_datagram(&rec), Ok(()));
+        }
+        assert_eq!(
+            client.reassembler_buffered_bytes_for_test(),
+            0,
+            "a plaintext fragment ahead of the queue head is never buffered"
+        );
+        for dg in &ch {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert_untouched_by_planted_messages_13(&mut client, &mut server);
+    }
+
+    /// The same through a HelloRetryRequest: the ServerHello then arrives
+    /// at `message_seq` 1 and the whole flight is one later. Messages are
+    /// planted both before the HRR and between the HRR and the ServerHello.
+    #[test]
+    fn planted_plaintext_fragments_are_not_dispatched_after_hrr_13() {
+        use crate::tls::codec::NamedGroup;
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        // Offer only a P-256 share so the server sends a group HRR.
+        client_cfg.groups = alloc::vec![NamedGroup::X25519, NamedGroup::SECP256R1];
+        client_cfg.key_share_groups = Some(alloc::vec![NamedGroup::SECP256R1]);
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-planted-hrr-c", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-planted-hrr-s", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        // HRR 0, ServerHello 1, EncryptedExtensions 2, Certificate 3,
+        // CertificateVerify 4, Finished 5; 6.. is post-handshake.
+        let ch1 = client.pop_outbound_datagrams();
+        for rec in planted_plaintext_messages_13(1, 3) {
+            assert_eq!(client.feed_datagram(&rec), Ok(()));
+        }
+        for dg in &ch1 {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr = server.pop_outbound_datagrams();
+        assert!(!hrr.is_empty());
+        for dg in &hrr {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(!client.is_handshake_complete());
+        let ch2 = client.pop_outbound_datagrams();
+        assert!(!ch2.is_empty(), "the HRR was answered with a second CH");
+        // The queue head is now 1, so the look-ahead window reaches 8.
+        for rec in planted_plaintext_messages_13(2, 3) {
+            assert_eq!(client.feed_datagram(&rec), Ok(()));
+        }
+        assert_eq!(client.reassembler_buffered_bytes_for_test(), 0);
+        for dg in &ch2 {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert_untouched_by_planted_messages_13(&mut client, &mut server);
+    }
+
+    /// A plaintext record that carries a genuine-looking ServerHello and
+    /// then further handshake fragments: the ServerHello installs the
+    /// handshake keys, and the rest of that record — still plaintext —
+    /// must not be fed to the reassembler as part of the protected flight.
+    #[test]
+    fn plaintext_fragments_after_server_hello_in_one_record_are_ignored_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-planted-tail", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        let mut flight = server.pop_outbound_datagrams();
+        // The first record of the flight is the plaintext ServerHello.
+        // Append a KeyUpdate fragment at message_seq 5 and garbage at 1 to
+        // its record body (as an on-path attacker rewriting it could).
+        let first = &mut flight[0];
+        assert_eq!(first[0], 22, "plaintext handshake record");
+        let rec_len = u16::from_be_bytes([first[11], first[12]]) as usize;
+        let tail = first.split_off(13 + rec_len);
+        for (ty, seq, body) in [(24u8, 5u16, &[0u8][..]), (0xee, 1, &[0xde, 0xad])] {
+            let planted = super::dtls12_plaintext_handshake_record(ty, seq, body);
+            first.extend_from_slice(&planted[13..]);
+        }
+        let new_len = (first.len() - 13) as u16;
+        first[11..13].copy_from_slice(&new_len.to_be_bytes());
+        first.extend_from_slice(&tail);
+        for dg in &flight {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert_untouched_by_planted_messages_13(&mut client, &mut server);
+    }
 }
 
 /// DTLS 1.2 multi-suite negotiation tests (Phase 4). The server has an
