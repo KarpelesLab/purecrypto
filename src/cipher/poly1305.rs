@@ -785,6 +785,32 @@ pub(super) mod ifma {
         step_s: [__m512i; 2],
     }
 
+    impl Pow {
+        /// Scrubs the powers of `r` (one lane of `pw[0]` is `r` itself).
+        #[inline(always)]
+        fn wipe(&mut self) {
+            wipe(self.pw.as_flattened_mut());
+            wipe(&mut self.step);
+            wipe(&mut self.step_s);
+        }
+    }
+
+    /// Best-effort wipe of vector state (volatile stores plus a compiler
+    /// fence, the contract of [`crate::zeroize::Zeroize`], which cannot take
+    /// a vendor vector type): powers of `r` and the chain accumulators.
+    /// Once per kernel call, so the stores being volatile costs nothing
+    /// measurable. Uses no AVX-512 intrinsic, so it is also sound from
+    /// [`Stitch`]'s `Drop`, which is not compiled with the feature.
+    #[inline(always)]
+    fn wipe(v: &mut [__m512i]) {
+        for x in v.iter_mut() {
+            // SAFETY: `x` is a live exclusive reference, and `__m512i` is
+            // plain integer data for which all-zero bytes are a valid value.
+            unsafe { core::ptr::write_volatile(x, core::mem::zeroed()) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+
     #[inline(always)]
     unsafe fn bcast(x: &[u64; 3]) -> [__m512i; 3] {
         unsafe { core::array::from_fn(|l| _mm512_set1_epi64(x[l] as i64)) }
@@ -893,7 +919,7 @@ pub(super) mod ifma {
         unsafe {
             let groups = data.len() / 128;
             let p = data.as_ptr();
-            let pow = setup(st);
+            let mut pow = setup(st);
             let mut acc = start(st, p, groups);
             let mut g = CHAINS;
             while g + CHAINS <= groups {
@@ -907,6 +933,11 @@ pub(super) mod ifma {
                 groups.saturating_sub(g),
             );
             fold(st, &pow, &acc, groups);
+            // The powers of `r` forge tags for this key and the chains are
+            // the running hash: do not leave them in the dead frame (the
+            // AVX2 kernel and the scalar paths wipe theirs likewise).
+            pow.wipe();
+            wipe(acc.as_flattened_mut());
         }
     }
 
@@ -917,6 +948,10 @@ pub(super) mod ifma {
     /// must only be called from code compiled with AVX-512F and AVX-512
     /// IFMA enabled, which [`Poly1305::stitch`](super::Poly1305) having
     /// returned it guarantees the CPU supports.
+    ///
+    /// Dropping it (after [`finish`](Self::finish), or on any other path
+    /// out of the caller) scrubs the powers of `r` and the accumulators in
+    /// place.
     pub(in crate::cipher) struct Stitch<'a> {
         st: &'a mut imp::State,
         pow: Option<Pow>,
@@ -961,17 +996,31 @@ pub(super) mod ifma {
             }
         }
 
-        /// Folds the chains back into the Poly1305 state.
+        /// Folds the chains back into the Poly1305 state. Call it once,
+        /// last. It borrows rather than consumes the handle: taking `self`
+        /// by value would move (copy) the powers and accumulators to a
+        /// second stack location, and the drop-time wipe would then scrub
+        /// only that copy.
         ///
         /// # Safety
         /// The caller must be compiled with AVX-512F and AVX-512 IFMA.
         #[inline(always)]
-        pub(in crate::cipher) unsafe fn finish(self) {
+        pub(in crate::cipher) unsafe fn finish(&mut self) {
             unsafe {
                 if let Some(pow) = &self.pow {
                     fold(self.st, pow, &self.acc, self.groups);
                 }
             }
+        }
+    }
+
+    impl Drop for Stitch<'_> {
+        #[inline]
+        fn drop(&mut self) {
+            if let Some(pow) = &mut self.pow {
+                pow.wipe();
+            }
+            wipe(self.acc.as_flattened_mut());
         }
     }
 }
