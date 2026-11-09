@@ -115,9 +115,14 @@
 //! fail-closed argument checks, which reveal that the arguments were invalid
 //! and nothing else. The DRBG state, the per-ring secrets, the derived
 //! nonces and the scratch buffers are wiped with the crate's volatile
-//! [`zeroize`](crate::zeroize) stores. [`rewind`] is likewise branch-free in the recovered digits, and
-//! wipes its scratch on success; its early error returns (a proof that does
-//! not verify, a wrong nonce) drop the DRBG output without an explicit wipe.
+//! [`zeroize`](crate::zeroize) stores. [`rewind`] is likewise branch-free in
+//! the recovered digits, and wipes the same scratch — the DRBG output, the
+//! blinding shares, the digits, the partial opening and the message — on
+//! every return path, the error returns (a wrong nonce, a mismatched
+//! commitment) included. Curve-point intermediates are not wiped: the
+//! [`secp256k1`](crate::ec::secp256k1) point types carry no wipe, so the
+//! per-ring `Cᵢ − rᵢ·G` that [`rewind`] compares against the digit candidates
+//! (and the `v·H` term inside a commitment) are left to the stack.
 //!
 //! [`verify`] and [`info`] see only public data and are deliberately
 //! variable-time. They never panic: every byte string either parses or returns
