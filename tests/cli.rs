@@ -8898,7 +8898,16 @@ fn crl_runs_every_mode_and_separates_errors_from_not_revoked() {
         .nth(1)
         .and_then(|t| t.split_whitespace().next())
         .unwrap_or_else(|| panic!("no serial in -text output: {out}"));
-    assert_eq!(shown, format!("{serial:#x}"), "{out}");
+    // `-text` prints whole bytes, so a serial whose top nibble is zero shows
+    // a leading `0` that `{:#x}` would drop: compare the numbers.
+    let shown_hex = shown
+        .strip_prefix("0x")
+        .unwrap_or_else(|| panic!("serial not 0x-prefixed: {out}"));
+    assert_eq!(
+        u128::from_str_radix(shown_hex, 16).ok(),
+        Some(u128::from(serial)),
+        "{out}"
+    );
     let (out, _e, code) = run_status(&["crl", "-in", &crl, "-is-revoked", "-serial", shown]);
     assert_eq!((out.trim(), code), ("revoked", Some(0)));
 
