@@ -891,3 +891,103 @@ fn failed_renegotiation_stops_delivering_application_data() {
     assert_eq!(client.process_new_packets(), Err(Error::UnexpectedMessage));
     assert!(client.take_received_plaintext().is_empty());
 }
+
+/// A default server (renegotiation off) declines a ClientHello with a
+/// `no_renegotiation` warning — a bounded number of times. A flood of
+/// 4-byte ClientHellos does not buy an alert each: past the budget the
+/// connection is closed with a fatal `unexpected_message`, and what the
+/// server queued stays small.
+#[test]
+fn client_hello_flood_gets_bounded_declines() {
+    let (cfg, der) = ecdsa_server12(b"reneg-server-key-a");
+    let mut server = server_with(cfg, RenegotiationPolicy::default(), b"reneg-fl-s");
+    server.test_set_renegotiation_clock(1_000);
+    let mut client = client_with(roots(&der), enabled(), b"reneg-fl-c");
+    pump_ok(&mut client, &mut server);
+
+    // `ClientHello` with an empty body: declined before it is parsed.
+    for _ in 0..10_000 {
+        client
+            .test_emit_encrypted(ContentType::Handshake, &[1, 0, 0, 0])
+            .unwrap();
+    }
+    server.read_tls(&client.write_tls());
+    assert_eq!(server.process_new_packets(), Err(Error::UnexpectedMessage));
+    let out = split_records(&server.write_tls());
+    // Four warnings and the fatal alert.
+    assert_eq!(out.len(), 5);
+    assert!(out.iter().all(|r| r[0] == 21 && r.len() < 64));
+    assert_eq!(server.peer_renegotiation_requests(), 5);
+    // The engine is closed: nothing further is answered or delivered.
+    assert_eq!(
+        server.send_application_data(b"x"),
+        Err(Error::InappropriateState)
+    );
+
+    // The budget is a rate, not a lifetime cap: a client asking (and being
+    // refused) now and then is never cut off.
+    let (cfg, der) = ecdsa_server12(b"reneg-server-key-a");
+    let mut server = server_with(cfg, RenegotiationPolicy::default(), b"reneg-fl2-s");
+    let mut client = client_with(roots(&der), enabled(), b"reneg-fl2-c");
+    pump_ok(&mut client, &mut server);
+    for round in 0..20u64 {
+        server.test_set_renegotiation_clock(1_000 + round * 300);
+        for _ in 0..4 {
+            client
+                .test_emit_encrypted(ContentType::Handshake, &[1, 0, 0, 0])
+                .unwrap();
+        }
+        server.read_tls(&client.write_tls());
+        server.process_new_packets().unwrap();
+        assert_eq!(split_records(&server.write_tls()).len(), 4);
+    }
+    client.send_application_data(b"still up").unwrap();
+    server.read_tls(&client.write_tls());
+    server.process_new_packets().unwrap();
+    assert_eq!(server.take_received_plaintext(), b"still up");
+}
+
+/// A server that keeps asking for a renegotiation (`HelloRequest`) and then
+/// declining it (`no_renegotiation`) gets a bounded number of ClientHellos
+/// — each of which costs the client fresh ephemeral keys — out of a
+/// renegotiation-enabled client; after that its prompts earn one warning
+/// and are then ignored. The session stays up throughout.
+#[test]
+fn solicited_then_declined_renegotiations_are_bounded() {
+    use crate::tls::reneg::MAX_SOLICITED_DECLINES;
+    let (mut client, mut server) = connected_pair();
+    let hr = crate::tls::codec::handshake12::HelloRequest.encode();
+    let mut hellos = 0usize;
+    let mut alerts = 0usize;
+    for _ in 0..200 {
+        server
+            .test_emit_encrypted(ContentType::Handshake, &hr)
+            .unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        // The server never reads the ClientHello; it just says no.
+        for record in split_records(&client.write_tls()) {
+            match record[0] {
+                22 => hellos += 1,
+                21 => alerts += 1,
+                other => panic!("unexpected record type {other}"),
+            }
+        }
+        server
+            .test_emit_encrypted(ContentType::Alert, &[1, 100])
+            .unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert!(!client.is_renegotiating());
+    }
+    assert_eq!(hellos, usize::from(MAX_SOLICITED_DECLINES));
+    assert_eq!(alerts, 1, "one no_renegotiation warning, then silence");
+    assert_eq!(client.renegotiation_count(), 0);
+    server.send_application_data(b"still up").unwrap();
+    client.read_tls(&server.write_tls());
+    client.process_new_packets().unwrap();
+    assert_eq!(client.take_received_plaintext(), b"still up");
+    // The application's own renegotiations are not affected by the cap.
+    client.renegotiate().unwrap();
+    assert!(client.is_renegotiating());
+}

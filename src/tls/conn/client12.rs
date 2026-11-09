@@ -1797,6 +1797,7 @@ impl ClientConnection12 {
     fn close(&mut self) {
         self.state = State::Closed;
         self.reneg.active = false;
+        self.reneg.solicited = false;
         self.reneg.prev_peer_leaf = None;
         self.reneg.pending_app_out = Vec::new();
         self.reneg.close_pending = false;
@@ -2221,7 +2222,16 @@ impl ClientConnection12 {
             if !body.is_empty() {
                 return Err(Error::Decode);
             }
-            if self.config.renegotiation.enabled && self.renegotiation_eligible() {
+            // A server that asks for renegotiations and then declines them
+            // gets a bounded number of ClientHellos (and of the ephemeral
+            // key generations behind each) out of us; after that its
+            // prompts are treated like those of a session we do not
+            // renegotiate.
+            if self.config.renegotiation.enabled
+                && self.renegotiation_eligible()
+                && self.reneg.solicited_declines < crate::tls::reneg::MAX_SOLICITED_DECLINES
+            {
+                self.reneg.solicited = true;
                 return self.start_renegotiation();
             }
             // One warning per connection; further prompts are ignored so a
@@ -2298,6 +2308,7 @@ impl ClientConnection12 {
         if !self.config.renegotiation.enabled || !self.renegotiation_eligible() {
             return Err(Error::InappropriateState);
         }
+        self.reneg.solicited = false;
         self.start_renegotiation()
     }
 
@@ -2374,6 +2385,9 @@ impl ClientConnection12 {
     /// The server declined our renegotiation (`no_renegotiation` before any
     /// ServerHello): keep the current session, flushing what was queued.
     fn abandon_renegotiation(&mut self) -> Result<(), Error> {
+        if self.reneg.solicited {
+            self.reneg.solicited_declines = self.reneg.solicited_declines.saturating_add(1);
+        }
         self.restore_replaced_session();
         self.state = State::Connected;
         self.ccs_window_open = false;
@@ -2384,6 +2398,7 @@ impl ClientConnection12 {
     /// `close_notify`) the caller queued meanwhile.
     fn end_renegotiation(&mut self) -> Result<(), Error> {
         self.reneg.active = false;
+        self.reneg.solicited = false;
         self.reneg.prev_peer_leaf = None;
         let queued = core::mem::take(&mut self.reneg.pending_app_out);
         if !queued.is_empty() {

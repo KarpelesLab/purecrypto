@@ -1748,7 +1748,8 @@ impl<R: RngCore> ServerConnection12<R> {
 
     /// A `ClientHello` on an established connection: a renegotiation
     /// request (RFC 5746). Declined with a warning `no_renegotiation` alert
-    /// (§4.4) when renegotiation is off or the session is not eligible;
+    /// (§4.4) when renegotiation is off or the session is not eligible (a
+    /// bounded number of times, see [`Self::decline_renegotiation`]);
     /// otherwise rate-limited (client-initiated requests only) and run as a
     /// full handshake under the current keys.
     fn on_renegotiation_client_hello(&mut self, body: &[u8], raw: &[u8]) -> Result<(), Error> {
@@ -1835,7 +1836,22 @@ impl<R: RngCore> ServerConnection12<R> {
 
     /// RFC 5746 §4.4: answer a renegotiation request we do not take with a
     /// warning `no_renegotiation` alert; the session carries on.
+    ///
+    /// Within a budget ([`crate::tls::reneg::DECLINE_LIMIT`]): a client
+    /// that keeps sending ClientHellos it has been refused is not
+    /// negotiating anything, and each reply is an encrypted alert parked
+    /// in `outbuf` for a 4-byte request. Past the budget the request is a
+    /// fatal `unexpected_message`, as a ClientHello on an established
+    /// connection is for a server that does not renegotiate at all.
     fn decline_renegotiation(&mut self) -> Result<(), Error> {
+        let now = self.reneg_now();
+        if self
+            .reneg
+            .decline_limiter
+            .record(crate::tls::reneg::DECLINE_LIMIT, now)
+        {
+            return Err(Error::UnexpectedMessage);
+        }
         let alert = [1u8, AlertDescription::NoRenegotiation.as_u8()]; // level = warning
         self.emit_alert(&alert)
     }

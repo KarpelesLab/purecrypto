@@ -24,6 +24,18 @@
 //!   certificate) may present one on the renegotiation — the
 //!   "certificate on demand" use of renegotiation.
 //!
+//! Declining is rate-limited too, whatever the policy. A server answers at
+//! most [`DECLINE_LIMIT`] refused requests (4 per 300 s, a plain 4 per
+//! connection without a clock) with the `no_renegotiation` warning; a
+//! client that keeps asking past that is flooding, and the connection is
+//! closed with a fatal `unexpected_message` — otherwise each 4-byte
+//! ClientHello would buy an encrypted alert in the server's send buffer,
+//! without bound. A client, for its part, stops answering `HelloRequest`s
+//! with a new ClientHello (fresh ephemeral keys each time) once the server
+//! has declined [`MAX_SOLICITED_DECLINES`] of the renegotiations it asked
+//! for itself; further prompts get the one `no_renegotiation` warning and
+//! are then ignored.
+//!
 //! Renegotiation is a TLS 1.2 mechanism only (TLS 1.3 replaced it with
 //! `KeyUpdate` and post-handshake authentication). It is not performed on
 //! the opt-in `tls-legacy` versions (TLS 1.0 / 1.1 / SSL 3.0), where a
@@ -103,7 +115,10 @@ impl Default for RenegotiationLimit {
 /// Off by default: a peer's renegotiation request (a client's new
 /// `ClientHello`, a server's `HelloRequest`) is declined with a warning
 /// `no_renegotiation` alert (RFC 5746 §4.2 / §4.4) and the connection
-/// stays up, and
+/// stays up — up to a point: a server closes the connection with a fatal
+/// `unexpected_message` when a client keeps sending requests it has
+/// already been refused (more than 4 per 300 s), rather than queue an
+/// alert for each — and
 /// [`Connection::renegotiate`](crate::tls::Connection::renegotiate) is
 /// refused. When enabled, every renegotiation must also use the Extended
 /// Master Secret (RFC 7627) on both the replaced and the new handshake (the
@@ -218,6 +233,30 @@ impl RenegotiationLimiter {
     }
 }
 
+/// Server: how many renegotiation requests are *declined* politely (a
+/// `no_renegotiation` warning each) before the next one is treated as a
+/// flood and closes the connection — the same token bucket as
+/// [`RenegotiationLimit`], so 4 in quick succession and one more per 75 s
+/// after that; without a clock, 4 per connection. It applies in every
+/// configuration (renegotiation disabled, session not eligible,
+/// [`RenegotiationLimitAction::Refuse`]): the reply to a 4-byte
+/// ClientHello is a ~30-byte encrypted alert held in the send buffer until
+/// the transport drains it, which a client that never reads could
+/// otherwise grow without bound.
+pub(crate) const DECLINE_LIMIT: RenegotiationLimit = RenegotiationLimit {
+    max: 4,
+    window_secs: 300,
+};
+
+/// Client: how many renegotiations the *server asked for* (`HelloRequest`)
+/// and then declined (`no_renegotiation`) are tolerated per connection.
+/// Each one costs a fresh set of ephemeral keys and a ClientHello for a
+/// 4-byte prompt; past this the client stops answering `HelloRequest`s with
+/// a ClientHello. Renegotiations the application starts itself are not
+/// counted. (The server-side [`RenegotiationPolicy::client_limit`] is inert
+/// on a client and does not cover this.)
+pub(crate) const MAX_SOLICITED_DECLINES: u8 = 4;
+
 /// Upper bound on the application data a TLS 1.2 engine queues while a
 /// renegotiation is in flight (1 MiB). The queue cannot drain until the
 /// peer completes the new handshake, so without a cap a peer that starts a
@@ -262,6 +301,13 @@ pub(crate) struct RenegState {
     pub(crate) limit_exceeded: bool,
     /// Server: the rate limiter.
     pub(crate) limiter: RenegotiationLimiter,
+    /// Server: the budget of declined requests ([`DECLINE_LIMIT`]).
+    pub(crate) decline_limiter: RenegotiationLimiter,
+    /// Client: the renegotiation in flight answers a `HelloRequest`.
+    pub(crate) solicited: bool,
+    /// Client: server-solicited renegotiations the server then declined
+    /// (capped at [`MAX_SOLICITED_DECLINES`]).
+    pub(crate) solicited_declines: u8,
 }
 
 impl RenegState {
