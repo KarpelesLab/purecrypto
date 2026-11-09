@@ -115,6 +115,21 @@ Algorithms: `AES-128-GCM`, `AES-256-GCM`, `CHACHA20-POLY1305`,
 `AES-256-KW`, `AES-128-KWP`, `AES-256-KWP`. On a tag failure nothing is
 written.
 
+`-aad` / `-aadfile` are authenticated by every AEAD above. AES key wrap
+(`-KW` / `-KWP`) has no associated-data input, so the flags are refused
+there rather than ignored.
+
+`AES-128-SIV` / `AES-256-SIV` (RFC 5297) take the associated data and the
+nonce as the S2V header vector `[aad, nonce]`, or `[nonce]` alone when there
+is no AAD; the output is `V ‖ ciphertext`.
+
+> **Compatibility.** Releases up to 0.10.4 parsed `-aad` / `-aadfile` for the
+> AES-SIV modes and then left them out, so those ciphertexts were **not**
+> bound to the AAD they were encrypted with. They still decrypt, but only
+> *without* `-aad` / `-aadfile` (passing the original AAD now fails the tag
+> check); re-encrypt them to get the binding. AES-SIV ciphertexts made
+> without AAD are unaffected.
+
 ## `rand`
 
 ```sh

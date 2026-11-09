@@ -141,6 +141,23 @@ fn aead_die(alg_name: &str, e: AeadError) -> ! {
     }
 }
 
+/// The RFC 5297 header vector AES-SIV authenticates: the associated data
+/// (when there is any) followed by the nonce, each its own S2V component —
+/// the layout §3 of the RFC gives for nonce-based use, with the nonce last.
+/// With no AAD the vector is the nonce alone, which is what `enc` always
+/// produced, so AAD-less ciphertexts stay readable.
+///
+/// The AAD used to be left out entirely: `-aad` / `-aadfile` were parsed
+/// and then dropped, so an AES-SIV ciphertext was not bound to them and
+/// decrypted under any `-aad` at all.
+fn siv_headers<'a>(aad: &'a [u8], nonce: &'a [u8]) -> Vec<&'a [u8]> {
+    if aad.is_empty() {
+        vec![nonce]
+    } else {
+        vec![aad, nonce]
+    }
+}
+
 fn aead_encrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], buf: &mut Vec<u8>) {
     let tag = match alg {
         Algo::Aes128Gcm => {
@@ -202,11 +219,12 @@ fn aead_encrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], buf: &mut Vec<u
             XChaCha20Poly1305::new(&k).encrypt(&n, aad, buf.as_mut_slice())
         }
         Algo::Aes128Siv | Algo::Aes256Siv => {
-            // AES-SIV is deterministic: the nonce is supplied as the single
-            // associated-data header and the output is `V ‖ ciphertext`.
+            // AES-SIV is deterministic: the AAD and the nonce are supplied
+            // as associated-data headers (see `siv_headers`) and the output
+            // is `V ‖ ciphertext`.
             let siv = AesSiv::try_new(key).unwrap_or_else(|e| die(format!("AES-SIV: {e}")));
             let out = siv
-                .try_seal(&[nonce], buf.as_slice())
+                .try_seal(&siv_headers(aad, nonce), buf.as_slice())
                 .unwrap_or_else(|e| die(format!("AES-SIV: {e}")));
             *buf = out;
             return;
@@ -238,11 +256,12 @@ fn aead_encrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], buf: &mut Vec<u
 }
 
 fn aead_decrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], ct_and_tag: &[u8]) -> Vec<u8> {
-    // AES-SIV's output is `V ‖ ciphertext` (V prepended), with the nonce passed
-    // as the single associated-data header; handle it before the append-tag path.
+    // AES-SIV's output is `V ‖ ciphertext` (V prepended), with the AAD and the
+    // nonce passed as associated-data headers; handle it before the
+    // append-tag path.
     if let Algo::Aes128Siv | Algo::Aes256Siv = alg {
         let siv = AesSiv::try_new(key).unwrap_or_else(|e| die(format!("AES-SIV: {e}")));
-        return match siv.try_open(&[nonce], ct_and_tag) {
+        return match siv.try_open(&siv_headers(aad, nonce), ct_and_tag) {
             Ok(pt) => pt,
             Err(AeadError::TagMismatch) => die("authentication tag verification failed"),
             Err(e) => die(format!("AES-SIV: {e}")),
@@ -504,6 +523,16 @@ pub(crate) fn run(args: Args) {
 
     let result = match alg {
         Algo::Aes128Kw | Algo::Aes256Kw | Algo::Aes128Kwp | Algo::Aes256Kwp => {
+            // AES key wrap has no associated-data input (RFC 3394 / 5649).
+            // Accepting `-aad` and dropping it would leave the caller
+            // believing the wrapped key is bound to it.
+            if !aad.is_empty() {
+                zero_buf(&mut key);
+                die(format!(
+                    "{alg_name} has no associated data: -aad / -aadfile cannot be used with \
+                     AES key wrap"
+                ));
+            }
             if decrypt {
                 // An AES-KW/KWP unwrap recovers KEY MATERIAL: write it like
                 // the kem/kex secrets (0600, create_new, refuse a TTY) rather

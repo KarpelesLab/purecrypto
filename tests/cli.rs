@@ -8615,3 +8615,121 @@ fn ca_sign_csr_ca_flag_with_leaf_template_keeps_the_cn_guard() {
     assert!(ok, "ca-intermediate template must still issue: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `enc -alg AES-*-SIV` parsed `-aad` / `-aadfile` and then dropped them:
+/// only the nonce went into the RFC 5297 header vector, so the ciphertext was
+/// not bound to the AAD and decrypted under any `-aad` at all. The AAD is now
+/// the first header and the nonce the last (RFC 5297 §3); with no AAD the
+/// vector is the nonce alone, as before.
+#[test]
+fn enc_aes_siv_binds_the_aad() {
+    use purecrypto::cipher::AesSiv;
+    let dir = std::env::temp_dir().join(format!("pc_enc_sivaad_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    let pt = b"AES-SIV must authenticate its AAD";
+    std::fs::write(dir.join("pt.bin"), pt).unwrap();
+    let nonce = "101112131415161718191a1b";
+    let nonce_bytes: Vec<u8> = (0x10..=0x1bu8).collect();
+
+    for (alg, key_len) in [("AES-256-SIV", 64usize), ("AES-128-SIV", 32)] {
+        let key_bytes: Vec<u8> = (0..key_len as u8).collect();
+        let key: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let enc = |aad: Option<&str>, out: &str| {
+            let out = p(out);
+            let pt_path = p("pt.bin");
+            let mut a = vec!["enc", "-alg", alg, "-key", &key, "-nonce", nonce];
+            if let Some(aad) = aad {
+                a.extend(["-aad", aad]);
+            }
+            a.extend(["-in", &pt_path, "-out", &out]);
+            let (_o, err, ok) = run_capture(&a, b"");
+            assert!(ok, "{alg} encrypt failed: {err}");
+            std::fs::read(&out).unwrap()
+        };
+        let dec = |aad: Option<&str>, input: &str| {
+            let input = p(input);
+            let mut a = vec!["enc", "-alg", alg, "-d", "-key", &key, "-nonce", nonce];
+            if let Some(aad) = aad {
+                a.extend(["-aad", aad]);
+            }
+            a.extend(["-in", &input]);
+            let mut child = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+                .args(&a)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn purecrypto");
+            let mut out = Vec::new();
+            child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+            let mut err = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut err)
+                .unwrap();
+            (out, err, child.wait().unwrap().success())
+        };
+
+        let with_aad = enc(Some("01"), "aad.ct");
+        let without = enc(None, "noaad.ct");
+        assert_ne!(with_aad, without, "{alg}: the AAD did not change the SIV");
+
+        // The layouts are the library's, with the nonce as the last header.
+        let siv = AesSiv::try_new(&key_bytes).unwrap();
+        assert_eq!(
+            with_aad,
+            siv.try_seal(&[&[0x01], &nonce_bytes], pt).unwrap(),
+            "{alg}: header vector is not [aad, nonce]"
+        );
+        assert_eq!(
+            without,
+            siv.try_seal(&[&nonce_bytes], pt).unwrap(),
+            "{alg}: the AAD-less layout changed"
+        );
+
+        // Matching AAD opens it.
+        let (out, err, ok) = dec(Some("01"), "aad.ct");
+        assert!(ok, "{alg}: matching -aad must decrypt: {err}");
+        assert_eq!(out, pt);
+        // A different AAD, or none, does not — and nothing is written.
+        for wrong in [Some("02"), None] {
+            let (out, err, ok) = dec(wrong, "aad.ct");
+            assert!(!ok, "{alg}: decrypted under the wrong AAD {wrong:?}");
+            assert!(out.is_empty(), "{alg}: plaintext leaked on a tag failure");
+            assert!(
+                err.contains("authentication tag verification failed"),
+                "{err}"
+            );
+        }
+        // The AAD-less round trip is unchanged, and is not opened by an AAD.
+        let (out, err, ok) = dec(None, "noaad.ct");
+        assert!(ok, "{alg}: AAD-less round trip failed: {err}");
+        assert_eq!(out, pt);
+        let (_out, _err, ok) = dec(Some("01"), "noaad.ct");
+        assert!(!ok, "{alg}: AAD-less ciphertext opened under an AAD");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AES key wrap has no associated-data input; `-aad` used to be accepted and
+/// silently dropped.
+#[test]
+fn enc_key_wrap_refuses_aad() {
+    let key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    for alg in ["AES-256-KW", "AES-256-KWP"] {
+        let (out, err, ok) = run_capture(
+            &["enc", "-alg", alg, "-key", key, "-aad", "01"],
+            &[0x42; 16],
+        );
+        assert!(!ok, "{alg} accepted -aad");
+        assert!(out.is_empty());
+        assert!(err.contains("has no associated data"), "{err}");
+    }
+    // Without it the wrap still works.
+    let (_out, err, ok) = run_capture(&["enc", "-alg", "AES-256-KW", "-key", key], &[0x42; 16]);
+    assert!(ok, "{err}");
+}
