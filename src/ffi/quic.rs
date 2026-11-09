@@ -446,13 +446,14 @@ pub unsafe extern "C" fn pc_quic_cfg_set_max_datagram_frame_size(
 /// secret is generated internally on [`pc_quic_new`] when this is set.
 /// Ignored on the client side.
 ///
-/// Retry tokens are time-bounded (5-minute lifetime). The C API sources
+/// Retry tokens are time-bounded (30-second lifetime). The C API sources
 /// the required clock internally from system time — it is set on
 /// [`pc_quic_new`] and refreshed before each [`pc_quic_feed_datagram`].
-/// If the system clock reads before the Unix epoch the engine fails
-/// closed: no Retry is emitted and no token is accepted (address
-/// validation falls back to the RFC 9000 §8.1 3× anti-amplification
-/// limit).
+/// If the system clock reads before the Unix epoch, token handling fails
+/// closed (no Retry is emitted and no token is accepted) but the Retry
+/// *requirement* itself fails open: the handshake proceeds without one,
+/// and address validation falls back to the RFC 9000 §8.1 3×
+/// anti-amplification limit.
 ///
 /// # Safety
 /// `cfg` valid.
@@ -541,8 +542,9 @@ pub unsafe extern "C" fn pc_quic_version(q: *const PcQuic, out: *mut i32) -> PcS
 
 /// Wall-clock seconds since the Unix epoch, for the retry-token clock
 /// ([`QuicConnection::set_now_secs`]). Returns 0 — the engine's "no
-/// clock" sentinel, which disables stateless Retry fail-closed — if the
-/// system clock reads before the epoch.
+/// clock" sentinel, under which no Retry token is minted or accepted and
+/// the Retry requirement is not enforced — if the system clock reads
+/// before the epoch.
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -630,9 +632,9 @@ pub unsafe extern "C" fn pc_quic_new(cfg: *const PcQuicCfg) -> *mut PcQuic {
         };
         let retry_clock = c.role == QuicRole::Server && c.require_retry;
         if retry_clock {
-            // Retry tokens are time-bounded; the engine fails closed (no
-            // Retry, no token accepted) while its clock is unset, so seed
-            // it before the first datagram is fed.
+            // Retry tokens are time-bounded; while its clock is unset the
+            // engine mints and accepts none (and does not enforce Retry),
+            // so seed it before the first datagram is fed.
             inner.set_now_secs(unix_now_secs());
         }
         Box::into_raw(Box::new(PcQuic {
