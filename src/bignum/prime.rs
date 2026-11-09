@@ -142,8 +142,10 @@ fn small_factor_boxed(n: &BoxedUint) -> Option<u64> {
 /// Trial division of `n` by every prime of the table. Returns the smallest
 /// one dividing `n`, or `None`.
 fn small_factor_in(n: &BoxedUint, td: &TrialDivision) -> Option<u64> {
-    let res = td.residues(n.as_limbs());
-    for (&p, &r) in td.primes.iter().zip(&res) {
+    // The residues determine `n` (or a large part of it) by CRT, and `n` may
+    // be a prime candidate that becomes a key: wipe them on every return.
+    let res = crate::zeroize::Zeroizing::new(td.residues(n.as_limbs()));
+    for (&p, &r) in td.primes.iter().zip(res.iter()) {
         // A small factor rejects the candidate: a public verdict.
         if crate::ct::declassify_value(r == 0) {
             return Some(p);

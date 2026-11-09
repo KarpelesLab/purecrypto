@@ -3,6 +3,7 @@
 use crate::bignum::{MontModulus, Uint, mod_u32_with_recip, recip_u32};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
+use crate::zeroize::Zeroizing;
 
 /// The first 256 odd primes (3 ..= 1621), used to reject composites before
 /// the expensive Miller-Rabin rounds. `u16`: 512 bytes, for the
@@ -147,7 +148,8 @@ pub fn is_prime<const LIMBS: usize, R: RngCore>(
     }
 
     // Trial division by small primes.
-    let res = residues(n, &reciprocals());
+    // The residues determine a candidate of up to ~2700 bits by CRT.
+    let res = Zeroizing::new(residues(n, &reciprocals()));
     for (i, &p) in SMALL_PRIMES.iter().enumerate() {
         if res[i] == 0 {
             // Divisible by p ⇒ composite, unless n *is* p.
@@ -300,8 +302,11 @@ pub fn random_prime<const LIMBS: usize, R: RngCore>(
     // the old draw-and-test loop's rejection count.
     let recips = reciprocals();
     loop {
-        let start = draw_candidate::<LIMBS, R>(rng, bits);
-        let res = residues(&start, &recips);
+        // The window start is the prime minus a small public-sized offset,
+        // and its residues determine it by CRT: both are wiped when the
+        // window ends, whether by a redraw or by returning the prime.
+        let start = Zeroizing::new(draw_candidate::<LIMBS, R>(rng, bits));
+        let res = Zeroizing::new(residues(&start, &recips));
         let mut delta: u64 = 0;
         while delta < crate::bignum::SIEVE_WINDOW {
             if sieve_passes(&res, &recips, delta) {
@@ -382,13 +387,19 @@ pub(crate) fn random_prime_boxed<R: RngCore>(
     // residues of the start decide each `n₀ + 2k` with one multiply per
     // prime, and only the survivors get a Miller-Rabin round.
     loop {
-        let start = draw(rng);
-        let res = td.residues(&start);
+        // The window start is the prime minus `delta < SIEVE_WINDOW`, and its
+        // residues determine it by CRT: neither may go back to the allocator
+        // intact. Both are wiped when the window ends, whether by a redraw,
+        // by returning the prime, or by a panic unwinding out of the RNG.
+        let start = Zeroizing::new(draw(rng));
+        let res = Zeroizing::new(td.residues(&start));
         let mut delta: u64 = 0;
         while delta < SIEVE_WINDOW {
             if td.passes(&res, delta) {
                 // n₀ + delta in place, tracking the carry out of the width.
-                let mut limbs = start.clone();
+                // (A plain `Vec` copy: it moves into the self-wiping
+                // `BoxedUint` below without being reallocated.)
+                let mut limbs = start.to_vec();
                 let mut carry = delta;
                 for limb in limbs.iter_mut() {
                     let (s, c) = limb.overflowing_add(carry);
