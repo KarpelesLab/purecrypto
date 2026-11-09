@@ -267,7 +267,10 @@ pub struct Config {
     /// applied to the peer's certificates and handshake signature. The
     /// default ([`SignaturePolicy::modern`]) refuses RSA keys under 2048 bits;
     /// [`ConfigBuilder::min_rsa_key_bits`] lowers that floor for legacy
-    /// peers on this `Config` only.
+    /// peers on this `Config` only. It governs keys that *sign*; the leaf
+    /// key of a TLS 1.2 static-RSA key exchange (`tls-legacy`) signs
+    /// nothing and is held to `min(floor, 1024)` bits instead — see
+    /// [`ConfigBuilder::min_rsa_key_bits`].
     pub signature_policy: SignaturePolicy,
 
     // ---- Client-side ----
@@ -1225,6 +1228,18 @@ impl ConfigBuilder {
     /// keys that small (down to 256 bits, `rsa::MIN_RSA_INSECURE_BITS`),
     /// which it otherwise refuses outright; the floor given here is then
     /// what decides. Raising the floor (e.g. to 3072) is always safe.
+    ///
+    /// One key is outside this floor: the server's leaf key in a TLS 1.2
+    /// **static-RSA** key exchange (the `TLS_RSA_WITH_*` suites of the
+    /// `tls-legacy` feature). There the client encrypts the premaster secret
+    /// to the leaf key and the server signs nothing, so no signature — and
+    /// hence no signature-policy check — ever involves that key. The client
+    /// holds it to `min(bits, 1024)` instead: 1024 bits under the default
+    /// (not 2048), lower only when a value below 1024 is given here, and
+    /// never higher — raising the floor does not raise it for this key. The
+    /// certificates *above* that leaf are signed, and their issuers' keys
+    /// obey the floor as usual. A client that must not accept a sub-2048-bit
+    /// static-RSA server key should not offer those suites.
     pub fn min_rsa_key_bits(mut self, bits: u32) -> Self {
         self.inner.signature_policy = self.inner.signature_policy.with_min_rsa_bits(bits);
         self
