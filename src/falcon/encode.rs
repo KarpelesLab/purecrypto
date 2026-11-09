@@ -5,6 +5,7 @@
 //! the high bits in unary. [`encode_pubkey`] packs `h` at 14 bits/coefficient,
 //! matching `FalconPublicKey::from_bytes`.
 
+use crate::zeroize::Zeroizing;
 use alloc::vec::Vec;
 
 /// Compress the signature polynomial `s` into exactly `slen` bytes, or `None`
@@ -26,7 +27,11 @@ pub(crate) fn compress(s: &[i16], slen: usize) -> Option<Vec<u8>> {
     if overflow >= 2048 {
         return None;
     }
-    let mut bits: Vec<u8> = Vec::with_capacity(s.len() * 9);
+    // One byte per bit of a signature candidate the signer may yet discard:
+    // wiped on drop, on the too-long path as well. (The capacity is only a
+    // hint; `Vec` growth may still move the buffer, which a signature that is
+    // about to be published or resampled can tolerate.)
+    let mut bits: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(s.len() * 9));
     for &coef in s {
         let c = coef as i32;
         bits.push((c < 0) as u8);
@@ -36,7 +41,8 @@ pub(crate) fn compress(s: &[i16], slen: usize) -> Option<Vec<u8>> {
             bits.push(((a >> k) & 1) as u8);
         }
         // High bits in unary: `a >> 7` zeros, then a terminating 1.
-        bits.resize(bits.len() + (a >> 7) as usize, 0);
+        let unary_end = bits.len() + (a >> 7) as usize;
+        bits.resize(unary_end, 0);
         bits.push(1);
     }
     if bits.len() > 8 * slen {
@@ -90,18 +96,22 @@ pub(crate) fn fits_reference_signed(coeffs: &[i64], w: u32) -> bool {
 /// instead (`c & ((1 << w) - 1)`, as this used to do) produces a corrupt
 /// encoding that the decoder later rejects — silent, unrecoverable key loss for
 /// anyone who generated a key, wrote it to disk and restarted.
-fn pack_signed(coeffs: &[i64], w: u32) -> Option<Vec<u8>> {
+fn pack_signed(coeffs: &[i64], w: u32) -> Option<Zeroizing<Vec<u8>>> {
     if !fits_signed(coeffs, w) {
         return None;
     }
-    let mut bits: Vec<u8> = Vec::with_capacity(coeffs.len() * w as usize);
+    // One byte per bit of a secret polynomial: exactly sized (so it never
+    // reallocates) and wiped on drop, as is the packed result — the caller
+    // copies it into the key encoding.
+    let mut bits: Zeroizing<Vec<u8>> =
+        Zeroizing::new(Vec::with_capacity(coeffs.len() * w as usize));
     for &c in coeffs {
         let u = c & ((1i64 << w) - 1);
         for k in (0..w).rev() {
             bits.push(((u >> k) & 1) as u8);
         }
     }
-    let mut out = alloc::vec![0u8; bits.len() / 8];
+    let mut out = Zeroizing::new(alloc::vec![0u8; bits.len() / 8]);
     for (i, &b) in bits.iter().enumerate() {
         if b == 1 {
             out[i / 8] |= 1 << (7 - (i % 8));
@@ -115,12 +125,12 @@ fn pack_signed(coeffs: &[i64], w: u32) -> Option<Vec<u8>> {
 /// Returns `None` if `bytes` is too short to hold `n·w` bits, so the primitive
 /// is total on any input rather than relying on the caller having pre-validated
 /// the length (which would otherwise panic on an out-of-bounds index).
-fn unpack_signed(bytes: &[u8], n: usize, w: u32) -> Option<Vec<i64>> {
+fn unpack_signed(bytes: &[u8], n: usize, w: u32) -> Option<Zeroizing<Vec<i64>>> {
     // Reject inputs that cannot supply every requested bit before indexing.
     if (n * w as usize).div_ceil(8) > bytes.len() {
         return None;
     }
-    let mut out = Vec::with_capacity(n);
+    let mut out = Zeroizing::new(Vec::with_capacity(n));
     let mut pos = 0usize;
     for _ in 0..n {
         let mut v: i64 = 0;
@@ -152,11 +162,17 @@ pub(crate) fn fg_bits(n: usize) -> u32 {
 pub(crate) fn encode_privkey(f: &[i64], g: &[i64], cap_f: &[i64], logn: u8) -> Option<Vec<u8>> {
     let n = f.len();
     let w = fg_bits(n);
-    let mut out = Vec::new();
+    // The packed fields are wiped on drop (also when a later field fails),
+    // and the output is allocated at its final size so appending them never
+    // reallocates and strands a partial copy of the key.
+    let pf = pack_signed(f, w)?;
+    let pg = pack_signed(g, w)?;
+    let pcf = pack_signed(cap_f, 8)?;
+    let mut out = Vec::with_capacity(1 + pf.len() + pg.len() + pcf.len());
     out.push(0x50 | logn);
-    out.extend_from_slice(&pack_signed(f, w)?);
-    out.extend_from_slice(&pack_signed(g, w)?);
-    out.extend_from_slice(&pack_signed(cap_f, 8)?);
+    out.extend_from_slice(&pf);
+    out.extend_from_slice(&pg);
+    out.extend_from_slice(&pcf);
     Some(out)
 }
 
@@ -177,16 +193,22 @@ pub(crate) fn decode_privkey(bytes: &[u8], n: usize) -> Option<(Vec<i64>, Vec<i6
         return None;
     }
     let body = &bytes[1..];
-    let f = unpack_signed(&body[..fg_len], n, w)?;
-    let g = unpack_signed(&body[fg_len..2 * fg_len], n, w)?;
-    let cap_f = unpack_signed(&body[2 * fg_len..], n, 8)?;
+    // Held wiped-on-drop until the range checks pass, so a rejected key's
+    // polynomials are not freed in the clear.
+    let mut f = unpack_signed(&body[..fg_len], n, w)?;
+    let mut g = unpack_signed(&body[fg_len..2 * fg_len], n, w)?;
+    let mut cap_f = unpack_signed(&body[2 * fg_len..], n, 8)?;
     if !fits_reference_signed(&f, w)
         || !fits_reference_signed(&g, w)
         || !fits_reference_signed(&cap_f, 8)
     {
         return None;
     }
-    Some((f, g, cap_f))
+    Some((
+        core::mem::take(&mut *f),
+        core::mem::take(&mut *g),
+        core::mem::take(&mut *cap_f),
+    ))
 }
 
 /// Pack a public key `h` (each coefficient in `[0, q)`) into the encoded form:

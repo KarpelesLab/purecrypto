@@ -45,6 +45,34 @@ impl core::error::Error for EncapsKeyCheckError {}
 
 use crate::rng::RngCore;
 
+/// DER tag-length-value whose content is the concatenation of `parts`, for
+/// secret content (the private-key encodings below).
+///
+/// Unlike [`crate::der::encode_tlv`] over a `concat()`, every buffer holding
+/// key bytes is allocated once at its final size — so no reallocation leaves
+/// an unwiped copy behind — and is wiped on drop. Byte-for-byte the same
+/// encoding as the generic writer.
+#[cfg(feature = "der")]
+fn secret_tlv(tag: u8, parts: &[&[u8]]) -> crate::zeroize::Zeroizing<alloc::vec::Vec<u8>> {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    // Length octets of the long form (unused below 0x80).
+    let n = (usize::BITS - len.leading_zeros()).div_ceil(8) as usize;
+    let mut out = crate::zeroize::Zeroizing::new(alloc::vec::Vec::with_capacity(2 + n + len));
+    out.push(tag);
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        out.push(0x80 | n as u8);
+        for i in (0..n).rev() {
+            out.push((len >> (8 * i)) as u8);
+        }
+    }
+    for p in parts {
+        out.extend_from_slice(p);
+    }
+    out
+}
+
 /// Marker for one ML-KEM parameter set; carries no data, only used to choose
 /// among the typed APIs by name.
 pub struct MlKem512;
@@ -367,24 +395,38 @@ macro_rules! ml_kem_set {
             /// `seed-priv` output), or the `expandedKey` OCTET STRING form for
             /// keys imported from expanded `dk` bytes. OpenSSL 3.5 loads both.
             pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
-                use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+                use crate::der::{encode_integer, encode_sequence, oid_tlv, tag};
+                // Every intermediate holding key bytes is built at its final
+                // size and wiped on drop; only the returned encoding outlives
+                // this call.
+                let expanded = crate::mlkem::secret_tlv(tag::OCTET_STRING, &[&self.0[..]]);
                 let inner = match &self.1 {
                     // both ::= SEQUENCE { seed OCTET STRING, expandedKey OCTET STRING }
-                    Some(seed) => encode_sequence(
-                        &[encode_octet_string(seed), encode_octet_string(&self.0)].concat(),
-                    ),
+                    Some(seed) => {
+                        let seed = crate::mlkem::secret_tlv(tag::OCTET_STRING, &[&seed[..]]);
+                        crate::mlkem::secret_tlv(
+                            tag::SEQUENCE,
+                            &[seed.as_slice(), expanded.as_slice()],
+                        )
+                    }
                     // expandedKey ::= OCTET STRING
-                    None => encode_octet_string(&self.0),
+                    None => expanded,
                 };
                 let algid = encode_sequence(&oid_tlv(oids::$oid));
-                encode_sequence(
-                    &[encode_integer(&[0]), algid, encode_octet_string(&inner)].concat(),
-                )
+                let key = crate::mlkem::secret_tlv(tag::OCTET_STRING, &[inner.as_slice()]);
+                let mut out = crate::mlkem::secret_tlv(
+                    tag::SEQUENCE,
+                    &[&encode_integer(&[0]), &algid, key.as_slice()],
+                );
+                core::mem::take(&mut *out)
             }
 
             /// Encodes the key as a PKCS#8 PEM document.
             pub fn to_pkcs8_pem(&self) -> alloc::string::String {
-                crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+                crate::der::pem_encode(
+                    "PRIVATE KEY",
+                    &crate::zeroize::Zeroizing::new(self.to_pkcs8_der()),
+                )
             }
 
             /// Parses a PKCS#8 `PrivateKeyInfo` DER.
@@ -423,12 +465,19 @@ macro_rules! ml_kem_set {
 
                 // Regenerates a validated key from a 64-byte `d‖z` seed.
                 let from_seed = |seed: &[u8]| -> Result<Self, Error> {
-                    let seed: [u8; 64] = seed.try_into().map_err(|_| Error::Malformed)?;
+                    if seed.len() != 64 {
+                        return Err(Error::Malformed);
+                    }
                     let mut d = [0u8; 32];
                     let mut z = [0u8; 32];
                     d.copy_from_slice(&seed[..32]);
                     z.copy_from_slice(&seed[32..]);
-                    Ok(Self::from_seeds(&d, &z).0)
+                    let key = Self::from_seeds(&d, &z).0;
+                    // The key keeps its own (wiped-on-drop) copy of `d‖z`;
+                    // these stack copies reconstruct it and must not linger.
+                    crate::zeroize::Zeroize::zeroize(&mut d);
+                    crate::zeroize::Zeroize::zeroize(&mut z);
+                    Ok(key)
                 };
 
                 let mut cr = Reader::new(inner);
@@ -470,7 +519,10 @@ macro_rules! ml_kem_set {
 
             /// Parses a PKCS#8 PEM private key.
             pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
-                Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+                Self::from_pkcs8_der(&crate::zeroize::Zeroizing::new(crate::der::pem_decode(
+                    pem,
+                    "PRIVATE KEY",
+                )?))
             }
 
             /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 +
@@ -483,7 +535,12 @@ macro_rules! ml_kem_set {
                 params: &crate::kdf::pbes2::Pbes2Params,
                 rng: &mut impl crate::rng::RngCore,
             ) -> alloc::vec::Vec<u8> {
-                crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+                crate::kdf::pbes2::encrypt(
+                    &crate::zeroize::Zeroizing::new(self.to_pkcs8_der()),
+                    password,
+                    params,
+                    rng,
+                )
             }
 
             /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`].
@@ -494,7 +551,12 @@ macro_rules! ml_kem_set {
                 params: &crate::kdf::pbes2::Pbes2Params,
                 rng: &mut impl crate::rng::RngCore,
             ) -> alloc::string::String {
-                crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+                crate::kdf::pbes2::encrypt_pem(
+                    &crate::zeroize::Zeroizing::new(self.to_pkcs8_der()),
+                    password,
+                    params,
+                    rng,
+                )
             }
 
             /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it
@@ -504,8 +566,10 @@ macro_rules! ml_kem_set {
                 der: &[u8],
                 password: &[u8],
             ) -> Result<Self, crate::der::Error> {
-                let inner = crate::kdf::pbes2::decrypt(der, password)
-                    .map_err(|_| crate::der::Error::Malformed)?;
+                let inner = crate::zeroize::Zeroizing::new(
+                    crate::kdf::pbes2::decrypt(der, password)
+                        .map_err(|_| crate::der::Error::Malformed)?,
+                );
                 Self::from_pkcs8_der(&inner)
             }
 
@@ -515,8 +579,10 @@ macro_rules! ml_kem_set {
                 pem: &str,
                 password: &[u8],
             ) -> Result<Self, crate::der::Error> {
-                let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
-                    .map_err(|_| crate::der::Error::Malformed)?;
+                let inner = crate::zeroize::Zeroizing::new(
+                    crate::kdf::pbes2::decrypt_pem(pem, password)
+                        .map_err(|_| crate::der::Error::Malformed)?,
+                );
                 Self::from_pkcs8_der(&inner)
             }
         }
@@ -622,6 +688,24 @@ mod tests {
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
     use alloc::vec::Vec;
+
+    /// `secret_tlv` must emit exactly what the generic DER writer does, across
+    /// the short/long length-form boundaries.
+    #[cfg(feature = "der")]
+    #[test]
+    fn secret_tlv_matches_generic_der_writer() {
+        for len in [0usize, 1, 127, 128, 255, 256, 4000, 65535, 65536] {
+            let content: alloc::vec::Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let (a, b) = content.split_at(len / 3);
+            for tag in [crate::der::tag::OCTET_STRING, crate::der::tag::SEQUENCE] {
+                assert_eq!(
+                    secret_tlv(tag, &[a, b]).as_slice(),
+                    crate::der::encode_tlv(tag, &content).as_slice(),
+                    "len {len}"
+                );
+            }
+        }
+    }
 
     fn unhex(s: &str) -> Vec<u8> {
         let b = s.as_bytes();

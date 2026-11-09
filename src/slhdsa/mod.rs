@@ -38,6 +38,34 @@ fn wipe(v: &mut [u8]) {
     crate::zeroize::Zeroize::zeroize(v);
 }
 
+/// DER tag-length-value whose content is the concatenation of `parts`, for
+/// secret content (the private-key encodings below).
+///
+/// Unlike [`crate::der::encode_tlv`] over a `concat()`, every buffer holding
+/// key bytes is allocated once at its final size — so no reallocation leaves
+/// an unwiped copy behind — and is wiped on drop. Byte-for-byte the same
+/// encoding as the generic writer.
+#[cfg(feature = "der")]
+fn secret_tlv(tag: u8, parts: &[&[u8]]) -> crate::zeroize::Zeroizing<alloc::vec::Vec<u8>> {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    // Length octets of the long form (unused below 0x80).
+    let n = (usize::BITS - len.leading_zeros()).div_ceil(8) as usize;
+    let mut out = crate::zeroize::Zeroizing::new(alloc::vec::Vec::with_capacity(2 + n + len));
+    out.push(tag);
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        out.push(0x80 | n as u8);
+        for i in (0..n).rev() {
+            out.push((len >> (8 * i)) as u8);
+        }
+    }
+    for p in parts {
+        out.extend_from_slice(p);
+    }
+    out
+}
+
 /// Errors from SLH-DSA operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2194,22 +2222,25 @@ impl PrivateKey {
     /// `SK.seed ‖ SK.prf ‖ PK.seed ‖ PK.root` bytes).
     #[cfg(feature = "der")]
     pub fn to_pkcs8_der(&self) -> Vec<u8> {
-        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        use crate::der::{encode_integer, encode_sequence, oid_tlv, tag};
         let algid = encode_sequence(&oid_tlv(self.set.params().oid));
-        encode_sequence(
-            &[
-                encode_integer(&[0]),
-                algid,
-                encode_octet_string(self.to_bytes()),
-            ]
-            .concat(),
-        )
+        // Every intermediate holding key bytes is built at its final size and
+        // wiped on drop; only the returned encoding outlives this call.
+        let key = secret_tlv(tag::OCTET_STRING, &[self.to_bytes()]);
+        let mut out = secret_tlv(
+            tag::SEQUENCE,
+            &[&encode_integer(&[0]), &algid, key.as_slice()],
+        );
+        core::mem::take(&mut *out)
     }
 
     /// Encodes the private key as a PKCS#8 PEM document.
     #[cfg(feature = "der")]
     pub fn to_pkcs8_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+        crate::der::pem_encode(
+            "PRIVATE KEY",
+            &crate::zeroize::Zeroizing::new(self.to_pkcs8_der()),
+        )
     }
 
     /// Parses a PKCS#8 `PrivateKeyInfo` DER, returning `(set, key)`. The set is
@@ -2238,7 +2269,9 @@ impl PrivateKey {
     /// Parses a PKCS#8 PEM private key.
     #[cfg(feature = "der")]
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
-        let der = crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        let der = crate::zeroize::Zeroizing::new(
+            crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&der)
     }
 
@@ -2251,7 +2284,12 @@ impl PrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> Vec<u8> {
-        crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+        crate::kdf::pbes2::encrypt(
+            &crate::zeroize::Zeroizing::new(self.to_pkcs8_der()),
+            password,
+            params,
+            rng,
+        )
     }
 
     /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`].
@@ -2262,21 +2300,30 @@ impl PrivateKey {
         params: &crate::kdf::pbes2::Pbes2Params,
         rng: &mut impl crate::rng::RngCore,
     ) -> alloc::string::String {
-        crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+        crate::kdf::pbes2::encrypt_pem(
+            &crate::zeroize::Zeroizing::new(self.to_pkcs8_der()),
+            password,
+            params,
+            rng,
+        )
     }
 
     /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it back to a
     /// PKCS#8 SLH-DSA private key.
     #[cfg(all(feature = "der", feature = "kdf"))]
     pub fn from_pkcs8_der_encrypted(der: &[u8], password: &[u8]) -> Result<Self, Error> {
-        let inner = crate::kdf::pbes2::decrypt(der, password).map_err(|_| Error::Malformed)?;
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt(der, password).map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 
     /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
     #[cfg(all(feature = "der", feature = "kdf"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, Error> {
-        let inner = crate::kdf::pbes2::decrypt_pem(pem, password).map_err(|_| Error::Malformed)?;
+        let inner = crate::zeroize::Zeroizing::new(
+            crate::kdf::pbes2::decrypt_pem(pem, password).map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&inner)
     }
 }
@@ -2392,6 +2439,24 @@ mod tests {
     use super::*;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
+
+    /// `secret_tlv` must emit exactly what the generic DER writer does, across
+    /// the short/long length-form boundaries.
+    #[cfg(feature = "der")]
+    #[test]
+    fn secret_tlv_matches_generic_der_writer() {
+        for len in [0usize, 1, 127, 128, 255, 256, 4000, 65535, 65536] {
+            let content: alloc::vec::Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let (a, b) = content.split_at(len / 3);
+            for tag in [crate::der::tag::OCTET_STRING, crate::der::tag::SEQUENCE] {
+                assert_eq!(
+                    secret_tlv(tag, &[a, b]).as_slice(),
+                    crate::der::encode_tlv(tag, &content).as_slice(),
+                    "len {len}"
+                );
+            }
+        }
+    }
 
     fn unhex(s: &str) -> Vec<u8> {
         let b = s.as_bytes();

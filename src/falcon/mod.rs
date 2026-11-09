@@ -950,13 +950,21 @@ impl FalconPrivateKey {
         }
         let degree = Degree::from_logn(header & 0x0F).ok_or(Error::Malformed)?;
         let n = degree.n();
+        // The decoded polynomials are held wiped-on-drop until the key is
+        // assembled (whose own `Drop` then takes over), so that none of the
+        // rejection paths below frees them in the clear.
         let (f, g, cap_f) = encode::decode_privkey(sk, n).ok_or(Error::InvalidLength)?;
+        let (mut f, mut g, mut cap_f) = (
+            crate::zeroize::Zeroizing::new(f),
+            crate::zeroize::Zeroizing::new(g),
+            crate::zeroize::Zeroizing::new(cap_f),
+        );
         // Cheapest structural check first (O(n log n)), before the O(n²) `h`.
         if !keygen::gs_norm_ok(&f, &g, n) {
             return Err(Error::Malformed);
         }
         let h = keygen::compute_h(&f, &g, n).ok_or(Error::Malformed)?;
-        let cap_g = keygen::recompute_g(&f, &g, &cap_f, n);
+        let mut cap_g = crate::zeroize::Zeroizing::new(keygen::recompute_g(&f, &g, &cap_f, n));
         // Validate the NTRU equation `f·G − g·F ≡ q (mod xⁿ+1)`: a corrupted but
         // still-invertible `f` produces a structurally valid key whose signatures
         // would silently fail to verify. Reject it here instead.
@@ -966,10 +974,10 @@ impl FalconPrivateKey {
         let expanded = sign::expand_key(&f, &g, &cap_f, &cap_g, degree);
         Ok(FalconPrivateKey {
             degree,
-            f,
-            g,
-            cap_f,
-            cap_g,
+            f: core::mem::take(&mut *f),
+            g: core::mem::take(&mut *g),
+            cap_f: core::mem::take(&mut *cap_f),
+            cap_g: core::mem::take(&mut *cap_g),
             h,
             expanded,
         })
