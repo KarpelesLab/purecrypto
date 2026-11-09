@@ -54,8 +54,19 @@ property of the issuer key, and the policy floors it the way it floors the
 RSA modulus: `SignaturePolicy::min_ec_bits` (default 256) is the minimum
 bit length of the curve's group order. P-256, P-384, P-521, secp256k1, SM2
 and brainpoolP256/320/384/512r1 pass; P-224, brainpoolP224r1 and every
-`legacy-ec` curve (secp160k1/r1/r2, secp192k1, P-192, secp224k1) are refused
-unless the caller lowers the floor with `with_min_ec_bits`.
+`legacy-ec` prime curve (secp160k1/r1/r2, secp192k1, P-192, secp224k1) are
+refused unless the caller lowers the floor with `with_min_ec_bits`.
+
+The `legacy-ec` binary-field curves (`sect*`, `c2pnb*` / `c2tnb*`, WTLS) are
+refused by default regardless of their order: order size does not separate
+them from the prime curves (sect283k1/r1, sect409k1/r1, sect571k1/r1,
+c2pnb272w1, c2pnb304w1, c2tnb359v1, c2pnb368w1 and c2tnb431r1 all reach 256
+bits), so they have a switch of their own,
+`SignaturePolicy::allow_binary_curves` (default `false`, set with
+`with_binary_curves(true)`). The floor still applies once it is set: the
+opt-in alone admits only those eleven curves, and the smaller binary curves
+need `with_min_ec_bits` lowered too.
+Lowering the floor without the opt-in admits no binary curve.
 
 The three `rsa-pss-rsae-*` entries carry **no** X.509 OID: in X.509 the
 `sha*WithRSAEncryption` OIDs mean PKCS#1 v1.5 and belong to the

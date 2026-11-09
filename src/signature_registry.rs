@@ -35,7 +35,11 @@
 //! supported curve at or above the `min_ec_bits` floor (P-256 / P-384 /
 //! P-521, secp256k1, brainpoolP256/320/384/512r1) is accepted with the
 //! OID's hash — P-224, brainpoolP224r1 and the `legacy-ec` curves are
-//! refused by default; the matched-curve / matched-hash restriction over
+//! refused by default: the sub-256-bit prime curves by the floor, and every
+//! `legacy-ec` binary-field curve — whatever its order, eleven of them
+//! reach 256 bits — until the caller opts in with
+//! `SignaturePolicy::with_binary_curves` (the floor then applies to them
+//! as well). The matched-curve / matched-hash restriction over
 //! P-256/P-384/P-521 applies to TLS 1.3 `CertificateVerify` scheme dispatch.
 
 use crate::x509::Error;
@@ -144,6 +148,20 @@ pub trait SignatureAlgorithm: Sync + 'static {
     /// floors it.
     fn ec_curve_bits(&self, _spki: &[u8]) -> Option<u32> {
         None
+    }
+
+    /// For policy decisions: whether `spki` is an ECDSA key on a
+    /// binary-field (characteristic-two) curve — the `sect*` / `c2*` /
+    /// WTLS curves of the `legacy-ec` feature. `false` for every other
+    /// key and algorithm, and always `false` without `legacy-ec`.
+    ///
+    /// Group-order size alone does not tell these curves apart from the
+    /// prime curves: sect283k1 … sect571r1 and five X9.62 `c2*` curves
+    /// have an order of 256 bits or more, so
+    /// [`SignaturePolicy::min_ec_bits`] would let them through.
+    /// [`SignaturePolicy::allow_binary_curves`] gates them.
+    fn ec_binary_curve(&self, _spki: &[u8]) -> bool {
+        false
     }
 }
 
@@ -336,6 +354,18 @@ mod policy {
         /// P-224 — or, under `legacy-ec`, secp160r1 — verified under the
         /// "modern" whitelist. Mirrors `min_rsa_bits`.
         pub min_ec_bits: u32,
+        /// Whether ECDSA keys on a binary-field curve (the `sect*` / `c2*` /
+        /// WTLS curves of the `legacy-ec` feature) are acceptable at all.
+        /// `false` in [`modern`](Self::modern) and [`empty`](Self::empty).
+        ///
+        /// `min_ec_bits` measures the group order only, and eleven binary
+        /// curves (sect283k1/r1, sect409k1/r1, sect571k1/r1, c2pnb272w1,
+        /// c2pnb304w1, c2tnb359v1, c2pnb368w1, c2tnb431r1) have an order
+        /// of 256 bits or more, so the floor alone would admit them
+        /// through the OID-keyed `ecdsa-with-sha*` entries. When `true`, a
+        /// binary curve is still subject to `min_ec_bits`. Has no effect
+        /// in a build without `legacy-ec`, which has no binary curves.
+        pub allow_binary_curves: bool,
     }
 
     impl SignaturePolicy {
@@ -357,8 +387,11 @@ mod policy {
         ///     **any supported curve at or above the `min_ec_bits` floor**
         ///     (256 by default: P-256, P-384, P-521, secp256k1,
         ///     brainpoolP256r1/P320r1/P384r1/P512r1) with the OID's hash.
-        ///     P-224, brainpoolP224r1 and the `legacy-ec` curves fall below
-        ///     the floor and need [`Self::with_min_ec_bits`].
+        ///     P-224, brainpoolP224r1 and the `legacy-ec` prime curves fall
+        ///     below the floor and need [`Self::with_min_ec_bits`]. The
+        ///     `legacy-ec` binary-field curves are refused whatever their
+        ///     order and need [`Self::with_binary_curves`] (plus a lowered
+        ///     floor for those under 256 bits).
         ///   * `ecdsa-secp256r1-sha256`, `ecdsa-secp384r1-sha384`,
         ///     `ecdsa-secp521r1-sha512`, and the RFC 8734 Brainpool pairs
         ///     `ecdsa-brainpoolP256r1-sha256`, `ecdsa-brainpoolP384r1-sha384`,
@@ -419,17 +452,20 @@ mod policy {
                 permitted,
                 min_rsa_bits: 2048,
                 min_ec_bits: 256,
+                allow_binary_curves: false,
             }
         }
 
         /// An empty policy — accepts nothing. Build it up by chaining
         /// [`SignaturePolicy::permit`]. The key-size floors are the
-        /// `modern()` ones (RSA ≥ 2048 bits, EC ≥ 256-bit order).
+        /// `modern()` ones (RSA ≥ 2048 bits, EC ≥ 256-bit order, no
+        /// binary-field curves).
         pub fn empty() -> Self {
             SignaturePolicy {
                 permitted: Vec::new(),
                 min_rsa_bits: 2048,
                 min_ec_bits: 256,
+                allow_binary_curves: false,
             }
         }
 
@@ -471,17 +507,32 @@ mod policy {
         /// Overrides the EC curve-strength floor (bit length of the curve's
         /// group order; see [`Self::min_ec_bits`]). `with_min_ec_bits(224)`
         /// admits P-224 and brainpoolP224r1 chain signatures; 160 admits
-        /// every `legacy-ec` curve.
+        /// every `legacy-ec` prime curve. The floor never admits a
+        /// binary-field curve by itself: those also need
+        /// [`with_binary_curves`](Self::with_binary_curves).
         pub fn with_min_ec_bits(mut self, bits: u32) -> Self {
             self.min_ec_bits = bits;
             self
         }
 
+        /// Sets whether ECDSA keys on a `legacy-ec` binary-field curve are
+        /// acceptable (see [`Self::allow_binary_curves`]; `false` by
+        /// default). The [`min_ec_bits`](Self::min_ec_bits) floor still
+        /// applies: `with_binary_curves(true)` alone admits the eleven binary
+        /// curves of 256-bit order or more (sect283k1 … sect571r1,
+        /// c2pnb272w1 … c2tnb431r1); the smaller ones need the floor
+        /// lowered as well (`with_min_ec_bits(112)` admits all of them).
+        pub fn with_binary_curves(mut self, allow: bool) -> Self {
+            self.allow_binary_curves = allow;
+            self
+        }
+
         /// `true` if `algo` is on the whitelist and `spki`'s parameters meet
         /// the key-size floors: `min_rsa_bits` for an RSA entry,
-        /// `min_ec_bits` for an ECDSA / SM2 one. An EC entry whose SPKI it
-        /// cannot read reports no curve size and is not floored here — it
-        /// fails at verify time instead.
+        /// `min_ec_bits` for an ECDSA / SM2 one, and — for an ECDSA key on a
+        /// binary-field curve — only when `allow_binary_curves` is set. An
+        /// EC entry whose SPKI it cannot read reports no curve size and is
+        /// not floored here — it fails at verify time instead.
         pub fn permits(&self, algo: &dyn SignatureAlgorithm, spki: &[u8]) -> bool {
             if !self.permitted.iter().any(|a| algo_eq(*a, algo)) {
                 return false;
@@ -494,6 +545,9 @@ mod policy {
             if let Some(bits) = algo.ec_curve_bits(spki)
                 && bits < self.min_ec_bits
             {
+                return false;
+            }
+            if !self.allow_binary_curves && algo.ec_binary_curve(spki) {
                 return false;
             }
             true

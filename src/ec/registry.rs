@@ -127,6 +127,24 @@ fn ecdsa_spki_curve_bits(spki: &[u8]) -> Option<u32> {
     }
 }
 
+/// [`SignatureAlgorithm::ec_binary_curve`] for the OID-keyed ECDSA entries
+/// (the only ones that verify under a binary-curve key): whether `spki`
+/// names a binary-field curve. Its order size, which
+/// [`ecdsa_spki_curve_bits`] reports, does not say so — ten binary curves
+/// have a 256-bit-or-wider order — hence a predicate of its own for
+/// [`SignaturePolicy::allow_binary_curves`](crate::signature_registry::SignaturePolicy::allow_binary_curves).
+fn ecdsa_spki_is_binary(spki: &[u8]) -> bool {
+    #[cfg(feature = "legacy-ec")]
+    {
+        binary_spki_curve(spki).is_some()
+    }
+    #[cfg(not(feature = "legacy-ec"))]
+    {
+        let _ = spki;
+        false
+    }
+}
+
 /// The binary curve an `id-ecPublicKey` SPKI names, if it names one (the
 /// point is not decoded).
 #[cfg(feature = "legacy-ec")]
@@ -293,6 +311,9 @@ impl SignatureAlgorithm for EcdsaSha256AnyCurve {
     fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
         ecdsa_spki_curve_bits(spki)
     }
+    fn ec_binary_curve(&self, spki: &[u8]) -> bool {
+        ecdsa_spki_is_binary(spki)
+    }
 }
 
 /// X.509 `ecdsa-with-SHA384` — OID-keyed dispatch entry.
@@ -322,6 +343,9 @@ impl SignatureAlgorithm for EcdsaSha384AnyCurve {
     fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
         ecdsa_spki_curve_bits(spki)
     }
+    fn ec_binary_curve(&self, spki: &[u8]) -> bool {
+        ecdsa_spki_is_binary(spki)
+    }
 }
 
 /// X.509 `ecdsa-with-SHA512` — OID-keyed dispatch entry.
@@ -350,6 +374,9 @@ impl SignatureAlgorithm for EcdsaSha512AnyCurve {
     }
     fn ec_curve_bits(&self, spki: &[u8]) -> Option<u32> {
         ecdsa_spki_curve_bits(spki)
+    }
+    fn ec_binary_curve(&self, spki: &[u8]) -> bool {
+        ecdsa_spki_is_binary(spki)
     }
 }
 
@@ -739,6 +766,161 @@ mod tests {
                 .with_min_ec_bits(4096)
                 .permits(find_by_id("ed25519").unwrap(), &ed)
         );
+    }
+
+    /// `min_ec_bits` floors the group-order size only, and eleven `legacy-ec`
+    /// binary curves have an order of 256 bits or more: their keys passed
+    /// `SignaturePolicy::modern()` through the OID-keyed `ecdsa-with-sha*`
+    /// entries although every `legacy-ec` curve is documented as refused by
+    /// default. A binary curve now needs `with_binary_curves(true)`, on
+    /// top of (not instead of) the floor.
+    #[cfg(feature = "legacy-ec")]
+    #[test]
+    fn modern_policy_refuses_binary_curves_without_opt_in() {
+        use crate::ec::binary::{BinaryCurveId, BinaryPrivateKey};
+        use crate::signature_registry::SignaturePolicy;
+        use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+        let mut rng = HmacDrbg::<Sha256>::new(b"reg-binary-policy", b"n", &[]);
+        let modern = SignaturePolicy::modern();
+        assert!(!modern.allow_binary_curves);
+        assert!(!SignaturePolicy::empty().allow_binary_curves);
+
+        // Every binary curve, by SPKI alone, under each OID-keyed entry.
+        let mut wide = alloc::vec::Vec::new();
+        for curve in BinaryCurveId::ALL {
+            let spki = BinaryPrivateKey::generate(curve, &mut rng)
+                .public_key()
+                .to_spki_der();
+            let bits = curve.order_bits() as u32;
+            if bits >= 256 {
+                wide.push(curve);
+            }
+            for id in [
+                "ecdsa-with-sha256",
+                "ecdsa-with-sha384",
+                "ecdsa-with-sha512",
+            ] {
+                let algo = find_by_id(id).unwrap();
+                assert!(algo.ec_binary_curve(&spki), "{curve:?} {id}");
+                assert_eq!(algo.ec_curve_bits(&spki), Some(bits), "{curve:?} {id}");
+                assert!(!modern.permits(algo, &spki), "{curve:?} {id}: default");
+                // Lowering the floor is not an opt-in to binary curves.
+                assert!(
+                    !modern.clone().with_min_ec_bits(1).permits(algo, &spki),
+                    "{curve:?} {id}: floor alone"
+                );
+                // The opt-in admits exactly the curves that meet the floor.
+                let opted = modern.clone().with_binary_curves(true);
+                assert_eq!(opted.permits(algo, &spki), bits >= 256, "{curve:?} {id}");
+                assert!(
+                    opted.clone().with_min_ec_bits(112).permits(algo, &spki),
+                    "{curve:?} {id}: opt-in + floor"
+                );
+                assert!(
+                    !opted.clone().with_min_ec_bits(600).permits(algo, &spki),
+                    "{curve:?} {id}: raised floor"
+                );
+                // And it can be withdrawn again.
+                assert!(
+                    !opted.with_binary_curves(false).permits(algo, &spki),
+                    "{curve:?} {id}"
+                );
+            }
+        }
+        // The curves the order-size floor used to let through.
+        let mut expected = alloc::vec![
+            BinaryCurveId::Sect283k1,
+            BinaryCurveId::Sect283r1,
+            BinaryCurveId::Sect409k1,
+            BinaryCurveId::Sect409r1,
+            BinaryCurveId::Sect571k1,
+            BinaryCurveId::Sect571r1,
+            BinaryCurveId::C2pnb272w1,
+            BinaryCurveId::C2pnb304w1,
+            BinaryCurveId::C2tnb359v1,
+            BinaryCurveId::C2pnb368w1,
+            BinaryCurveId::C2tnb431r1,
+        ];
+        let name = |c: &BinaryCurveId| c.name();
+        wide.sort_by_key(name);
+        expected.sort_by_key(name);
+        assert_eq!(wide, expected);
+
+        // End to end: a self-signed certificate on such a curve.
+        let validity = Validity::new(
+            Time::utc(2025, 1, 1, 0, 0, 0),
+            Time::utc(2035, 1, 1, 0, 0, 0),
+        );
+        for curve in [BinaryCurveId::Sect571r1, BinaryCurveId::C2pnb272w1] {
+            let key = BinaryPrivateKey::generate(curve, &mut rng);
+            let cert = Certificate::self_signed_general(
+                &CertSigner::EcBinary(&key),
+                &DistinguishedName::common_name("binary policy"),
+                &validity,
+                1,
+                true,
+                &[],
+            )
+            .unwrap();
+            let pk = cert.subject_public_key().unwrap();
+            // The signature itself is fine; only the policy refuses it.
+            cert.verify_signature_with(&pk).unwrap();
+            assert!(
+                cert.verify_signature_with_policy(&pk, &modern).is_err(),
+                "{curve:?} must be refused by default"
+            );
+            assert!(
+                cert.verify_signature_with_policy(&pk, &modern.clone().with_min_ec_bits(160))
+                    .is_err(),
+                "{curve:?} must not be admitted by the floor"
+            );
+            cert.verify_signature_with_policy(&pk, &modern.clone().with_binary_curves(true))
+                .unwrap();
+        }
+    }
+
+    /// The binary-curve gate leaves prime curves alone: with or without the
+    /// opt-in, the order-size floor is the only thing deciding them.
+    #[test]
+    fn binary_curve_gate_does_not_touch_prime_curves() {
+        use crate::signature_registry::SignaturePolicy;
+        let mut rng = HmacDrbg::<Sha256>::new(b"reg-prime-policy", b"n", &[]);
+        let modern = SignaturePolicy::modern();
+        let algo = find_by_id("ecdsa-with-sha256").unwrap();
+        for &curve in CurveId::ALL {
+            if curve == CurveId::Sm2p256v1 {
+                continue;
+            }
+            let spki =
+                AnyPublicKey::Ecdsa(BoxedEcdsaPrivateKey::generate(curve, &mut rng).public_key())
+                    .to_spki_der();
+            assert!(!algo.ec_binary_curve(&spki), "{curve:?}");
+            let expected = curve_order_bits(curve) >= 256;
+            assert_eq!(modern.permits(algo, &spki), expected, "{curve:?}");
+            assert_eq!(
+                modern.clone().with_binary_curves(true).permits(algo, &spki),
+                expected,
+                "{curve:?}"
+            );
+        }
+        for curve in [
+            CurveId::P256,
+            CurveId::P384,
+            CurveId::P521,
+            CurveId::Secp256k1,
+            CurveId::BrainpoolP256r1,
+            CurveId::BrainpoolP320r1,
+            CurveId::BrainpoolP384r1,
+            CurveId::BrainpoolP512r1,
+        ] {
+            let spki =
+                AnyPublicKey::Ecdsa(BoxedEcdsaPrivateKey::generate(curve, &mut rng).public_key())
+                    .to_spki_der();
+            assert!(modern.permits(algo, &spki), "{curve:?}");
+        }
+        // Non-EC keys and unreadable SPKIs are never "binary".
+        assert!(!algo.ec_binary_curve(&[]));
+        assert!(!find_by_id("ed25519").unwrap().ec_binary_curve(&[]));
     }
 
     #[test]
