@@ -35,7 +35,11 @@ env:
 jobs:
   interop:
     name: ECH vs BoringSSL bssl
-    runs-on: ubuntu-latest
+    # Pinned: the pinned BoringSSL commit does not build with the GCC of the
+    # ubuntu-26.04 image `ubuntu-latest` moved to on 2026-11-01 (a
+    # -Werror=stringop-overflow in keccak.cc.inc). Move back to
+    # `ubuntu-latest` together with a BORINGSSL_COMMIT bump.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

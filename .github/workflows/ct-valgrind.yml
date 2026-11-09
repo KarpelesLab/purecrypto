@@ -74,7 +74,11 @@ jobs:
           # 32-bit x86: no hardware backends are compiled for it, so this is
           # the portable code with 32-bit `usize` and multi-word arithmetic.
           - name: i686
-            os: ubuntu-latest
+            # Pinned: on the ubuntu-26.04 image (`ubuntu-latest` since
+            # 2026-11-01) the 32-bit memcheck preload dies with SIGILL in
+            # its own calloc during Rust runtime start-up, before any code
+            # under test runs.
+            os: ubuntu-24.04
             target: i686-unknown-linux-gnu
           # 32-bit Arm, run in AArch32 compatibility mode on the arm64 runner
           # (its Neoverse-N2 cores execute AArch32 at EL0).

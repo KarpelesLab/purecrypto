@@ -91,7 +91,9 @@ jobs:
             runs-on: ubuntu-latest
           # BoringSSL's bssl tool at $BORINGSSL_COMMIT, built here and cached.
           - peer: boringssl
-            runs-on: ubuntu-latest
+            # Pinned: the pinned BoringSSL commit does not build with the
+            # GCC of ubuntu-26.04 (see interop-boringssl.yml).
+            runs-on: ubuntu-24.04
           # Mbed TLS ssl_client2 / ssl_server2 at $MBEDTLS_TAG, built here
           # and cached.
           - peer: mbedtls
