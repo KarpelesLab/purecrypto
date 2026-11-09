@@ -10,7 +10,7 @@
 //! Construction here (the aux-carrying DTLS 1.3 form; the DTLS 1.2 form
 //! below is the same MAC without an aux payload, truncated to fit the
 //! HelloVerifyRequest):
-//! `HMAC-SHA256(secret, client_addr ‖ client_random ‖ ch_fingerprint ‖ TS)`.
+//! `HMAC-SHA256(secret, len8(client_addr) ‖ client_addr ‖ client_random ‖ len8(ch_fingerprint) ‖ ch_fingerprint ‖ TS)`.
 //!
 //! Including the `client_random` binds the cookie to the specific handshake
 //! attempt; including `client_addr` binds it to the source; the
@@ -36,11 +36,11 @@
 //!
 //! where
 //!
-//! `HMAC := HMAC-SHA256(secret, client_addr ‖ client_random ‖ ch_fingerprint ‖ TS ‖ aux_len ‖ aux)`.
+//! `HMAC := HMAC-SHA256(secret, len8(client_addr) ‖ client_addr ‖ client_random ‖ len8(ch_fingerprint) ‖ ch_fingerprint ‖ TS ‖ aux_len ‖ aux)`.
 //!
 //! DTLS 1.2 (the HelloVerifyRequest cookie, `opaque<0..2^8-1>`):
 //!
-//! `cookie := TS(4) ‖ HMAC-SHA256(secret, 0x12 ‖ client_addr ‖ client_random ‖ ch_fingerprint ‖ TS)[..28]`
+//! `cookie := TS(4) ‖ HMAC-SHA256(secret, 0x12 ‖ len8(client_addr) ‖ client_addr ‖ client_random ‖ len8(ch_fingerprint) ‖ ch_fingerprint ‖ TS)[..28]`
 //!
 //! — 32 bytes, the bound RFC 4347 §4.2.1 set for DTLS 1.0 (`opaque
 //! cookie<0..32>`). RFC 6347 widened the field to 255 bytes, but a widely
@@ -128,10 +128,14 @@ impl CookieGenerator {
         now_minutes: u32,
     ) -> [u8; COOKIE_LEN] {
         let ts = now_minutes.to_be_bytes();
+        // Both variable-length inputs are length-prefixed (see
+        // `mac_len_prefix`); the rest is fixed-width.
         let tag = HmacSha256::new(&self.secret)
             .chain(&[COOKIE12_DOMAIN])
+            .chain(&mac_len_prefix(client_addr))
             .chain(client_addr)
             .chain(client_random)
+            .chain(&mac_len_prefix(ch_fingerprint))
             .chain(ch_fingerprint)
             .chain(&ts)
             .finalize();
@@ -167,9 +171,13 @@ impl CookieGenerator {
     ) -> alloc::vec::Vec<u8> {
         let ts = now_minutes.to_be_bytes();
         let aux_len = (aux.len() as u16).to_be_bytes();
+        // Every variable-length input is length-prefixed (see
+        // `mac_len_prefix`; `aux` by the `aux_len` the cookie carries).
         let tag = HmacSha256::new(&self.secret)
+            .chain(&mac_len_prefix(client_addr))
             .chain(client_addr)
             .chain(client_random)
+            .chain(&mac_len_prefix(ch_fingerprint))
             .chain(ch_fingerprint)
             .chain(&ts)
             .chain(&aux_len)
@@ -256,6 +264,23 @@ impl CookieGenerator {
             None
         }
     }
+}
+
+/// Length prefix for a variable-length cookie-MAC input.
+///
+/// The MAC input is a concatenation, and the client address is an opaque
+/// caller-supplied byte string (`Config::peer_address`) — fixed-size for
+/// the canonical socket-address encoding, but nothing enforces that.
+/// Without a prefix, the boundary between a variable-length field and
+/// what follows it is not part of what is authenticated: bytes could
+/// move between the address and the client random (and between the
+/// fingerprint and the fields after it) without changing the MAC input,
+/// so a cookie issued for one address could be made to verify for another
+/// address that is a prefix or an extension of it. Prefixing each
+/// variable-length field with its length makes the encoding injective.
+/// Eight bytes, so no length is ever truncated.
+fn mac_len_prefix(field: &[u8]) -> [u8; 8] {
+    (field.len() as u64).to_be_bytes()
 }
 
 /// Builds a deterministic, length-prefixed fingerprint of the
@@ -501,5 +526,39 @@ mod tests {
         // And identical inputs reproduce.
         let c = build_ch_fingerprint(b"AA", Some(b"BB"), Some(b""), b"");
         assert_eq!(a, c);
+    }
+
+    /// The client address is an opaque, caller-supplied byte string. With
+    /// the MAC taken over a bare concatenation, shifting one byte from the
+    /// end of the address into the client random (and one from the random
+    /// into the fingerprint) left the MAC input unchanged, so the cookie
+    /// verified for the shorter address. The length prefixes make the
+    /// field boundaries part of what is authenticated.
+    #[test]
+    fn field_boundaries_are_bound_by_the_mac() {
+        let cg = CookieGenerator::new(fixed_secret());
+        let addr: &[u8] = b"variable-length-address";
+        let rand = fixed_random();
+        const FP: &[u8] = b"fingerprint";
+        const TS: u32 = 1_000_000;
+
+        // The same bytes, cut one byte earlier at each boundary.
+        let (short_addr, moved) = addr.split_at(addr.len() - 1);
+        let mut shifted_rand = [0u8; 32];
+        shifted_rand[0] = moved[0];
+        shifted_rand[1..].copy_from_slice(&rand[..31]);
+        let mut shifted_fp = alloc::vec![rand[31]];
+        shifted_fp.extend_from_slice(FP);
+
+        let cookie = cg.generate(addr, &rand, FP, TS);
+        assert!(cg.validate(addr, &rand, FP, TS, &cookie));
+        assert!(!cg.validate(short_addr, &shifted_rand, &shifted_fp, TS, &cookie));
+
+        let cookie = cg.generate_with_aux(addr, &rand, FP, b"aux", TS);
+        assert!(cg.validate_with_aux(addr, &rand, FP, TS, &cookie).is_some());
+        assert!(
+            cg.validate_with_aux(short_addr, &shifted_rand, &shifted_fp, TS, &cookie)
+                .is_none()
+        );
     }
 }
