@@ -14,12 +14,14 @@
 use super::Error;
 use super::curves::CurveId;
 use super::weierstrass::Curve;
+#[cfg(any(feature = "ec-custom", feature = "der"))]
+use super::weierstrass::MAX_LIMBS;
 use crate::bignum::BoxedUint;
 #[cfg(feature = "der")]
 use alloc::vec::Vec;
 #[cfg(feature = "ec-custom")]
 use {
-    super::weierstrass::{Engine, MAX_LIMBS},
+    super::weierstrass::Engine,
     crate::bignum::{BoxedMontModulus, Uint},
     alloc::sync::Arc,
 };
@@ -352,6 +354,11 @@ impl BoxedCurve {
     /// cofactor is recovered as `round((p + 1) / n)`, which Hasse's bound
     /// makes exact once `n > 4√p`.
     ///
+    /// The widths are bounded as the parameters are read, before any
+    /// arithmetic: `p` and `n` to 576 bits, `a` and `b` to the width of
+    /// `p`, the cofactor to half of it (plus slack). Anything wider is
+    /// [`Error::InvalidInput`], at the cost of a length comparison.
+    ///
     /// Returns [`Error::Malformed`] for a structural error, an unknown OID
     /// or `implicitCurve`, and [`Error::InvalidInput`] for parameters that
     /// fail validation (or need `ec-custom`).
@@ -387,17 +394,21 @@ impl BoxedCurve {
         if field_type.as_slice() != PRIME_FIELD_OID {
             return Err(Error::Malformed);
         }
-        let p = BoxedUint::from_be_bytes(field.read_unsigned_integer_bytes().map_err(mal)?);
+        // Every width is bounded as it is read, before any `BoxedUint` is
+        // built from it: the arithmetic below (and in `from_params`) is
+        // quadratic in these widths, and the DER carries whatever length an
+        // attacker likes.
+        let p = bounded_uint(field.read_unsigned_integer_bytes().map_err(mal)?, MAX_BITS)?;
         field.finish().map_err(mal)?;
+        let flen = p.bit_len().div_ceil(8);
         let mut curve = seq.read_sequence().map_err(mal)?;
-        let a = BoxedUint::from_be_bytes(curve.read_octet_string().map_err(mal)?);
-        let b = BoxedUint::from_be_bytes(curve.read_octet_string().map_err(mal)?);
+        let a = bounded_uint(curve.read_octet_string().map_err(mal)?, p.bit_len())?;
+        let b = bounded_uint(curve.read_octet_string().map_err(mal)?, p.bit_len())?;
         if curve.peek_tag() == Some(tag::BIT_STRING) {
             curve.read_any().map_err(mal)?; // seed
         }
         curve.finish().map_err(mal)?;
         let base = seq.read_octet_string().map_err(mal)?;
-        let flen = p.bit_len().div_ceil(8);
         let (gx, gy) = match base {
             [0x04, xy @ ..] if xy.len() == 2 * flen => (
                 BoxedUint::from_be_bytes(&xy[..flen]),
@@ -405,9 +416,12 @@ impl BoxedCurve {
             ),
             _ => return Err(Error::Malformed),
         };
-        let n = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes().map_err(mal)?);
+        let n = bounded_uint(seq.read_unsigned_integer_bytes().map_err(mal)?, MAX_BITS)?;
         let h = if seq.peek_tag() == Some(tag::INTEGER) {
-            BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes().map_err(mal)?)
+            bounded_uint(
+                seq.read_unsigned_integer_bytes().map_err(mal)?,
+                max_cofactor_bits(p.bit_len()),
+            )?
         } else {
             if n.is_zero() {
                 return Err(Error::InvalidInput);
@@ -429,10 +443,40 @@ impl BoxedCurve {
     }
 }
 
-/// The widest field (and order) a custom curve may have: the engine's
-/// widest limb width.
-#[cfg(feature = "ec-custom")]
+/// The widest field (and order) a curve may have: the engine's widest limb
+/// width. `from_der` applies it in every build, before it does arithmetic on
+/// explicit parameters.
+#[cfg(any(feature = "ec-custom", feature = "der"))]
 const MAX_BITS: usize = 64 * MAX_LIMBS;
+
+/// The widest cofactor a curve over a `p_bits`-bit field can have. With
+/// `n > 4√p` (which `from_params` requires), Hasse's `h·n ≤ p + 1 + 2√p`
+/// gives `h < √p`, i.e. at most `⌈p_bits / 2⌉` bits; the bound leaves a
+/// little slack and is only there to keep `h` out of the quadratic
+/// arithmetic until the exact Hasse check has run.
+#[cfg(any(feature = "ec-custom", feature = "der"))]
+fn max_cofactor_bits(p_bits: usize) -> usize {
+    p_bits / 2 + 2
+}
+
+/// The integer of the big-endian `bytes`, or [`Error::InvalidInput`] if it
+/// is wider than `max_bits`. Leading zero octets (a DER sign octet, octet
+/// string padding) are dropped by a linear scan and the width is checked
+/// before the `BoxedUint` is built, so neither an oversized value nor an
+/// oversized limb vector ever reaches the bignum arithmetic.
+#[cfg(feature = "der")]
+fn bounded_uint(bytes: &[u8], max_bits: usize) -> Result<BoxedUint, Error> {
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let magnitude = &bytes[start..];
+    let bits = match magnitude.first() {
+        Some(top) => 8 * magnitude.len() - top.leading_zeros() as usize,
+        None => 0,
+    };
+    if bits > max_bits {
+        return Err(Error::InvalidInput);
+    }
+    Ok(BoxedUint::from_be_bytes(magnitude))
+}
 
 /// The narrowest field a custom curve may have. Anything near this is
 /// breakable (secp112r1 was broken in 2009); the floor only keeps out
@@ -490,6 +534,10 @@ impl BoxedCurve {
         let one = BoxedUint::from_u64(1);
         let (p_bits, n_bits) = (p.bit_len(), n.bit_len());
         if !(MIN_FIELD_BITS..=MAX_BITS).contains(&p_bits) || n_bits > MAX_BITS {
+            return Err(Error::InvalidInput);
+        }
+        // Before `h` enters any multiplication: nothing else bounds it.
+        if h.bit_len() > max_cofactor_bits(p_bits) {
             return Err(Error::InvalidInput);
         }
         if !p.is_odd() || !n.is_odd() || h.is_zero() {
@@ -943,5 +991,114 @@ mod tests {
             der.truncate(der.len() - 1);
             assert_eq!(BoxedCurve::from_der(&der), Err(Error::Malformed));
         }
+
+        /// The cofactor is bounded before it is multiplied: a 64 KiB `h`
+        /// is refused, and so is one just past `p_bits / 2 + 2` bits.
+        #[test]
+        fn oversized_cofactor_is_rejected_before_arithmetic() {
+            let c = curve("secp128r1");
+            let (p, n) = (c.p(), c.order());
+            let (a, b) = c.coefficients();
+            let (gx, gy) = c.generator();
+            let build = |h: &BoxedUint| BoxedCurve::from_params(&p, &a, &b, &gx, &gy, &n, h);
+            assert!(build(&c.cofactor()).is_ok());
+            let huge = BoxedUint::from_be_bytes(&[0xff; 64 * 1024]);
+            assert_eq!(build(&huge).err(), Some(Error::InvalidInput));
+            let limit = max_cofactor_bits(p.bit_len());
+            let mut over = alloc::vec![0u8; limit / 8 + 1];
+            over[0] = 1 << (limit % 8);
+            let over = BoxedUint::from_be_bytes(&over);
+            assert_eq!(over.bit_len(), limit + 1);
+            assert_eq!(build(&over).err(), Some(Error::InvalidInput));
+            // The same through DER, where `h` is the trailing INTEGER.
+            let der = specified_curve(&p, &n, Some(&[0x7f; 64 * 1024]));
+            assert_eq!(BoxedCurve::from_der(&der).err(), Some(Error::InvalidInput));
+        }
+    }
+
+    /// A `specifiedCurve` over `p` with order `n` (both given as values;
+    /// `a = b = 0`, `G = (0, 0)` at the field width) and the cofactor
+    /// INTEGER body `h`, if any. Structurally valid, so only the size
+    /// checks can refuse it early.
+    fn specified_curve_raw(p: &[u8], n: &[u8], h: Option<&[u8]>) -> Vec<u8> {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let flen = p.len();
+        let mut base = alloc::vec![0x04];
+        base.resize(1 + 2 * flen, 0);
+        let mut body = [
+            encode_integer(&[1]),
+            encode_sequence(&[oid_tlv(PRIME_FIELD_OID), encode_integer(p)].concat()),
+            encode_sequence(
+                &[
+                    encode_octet_string(&alloc::vec![0; flen]),
+                    encode_octet_string(&alloc::vec![0; flen]),
+                ]
+                .concat(),
+            ),
+            encode_octet_string(&base),
+            encode_integer(n),
+        ]
+        .concat();
+        if let Some(h) = h {
+            body.extend_from_slice(&encode_integer(h));
+        }
+        encode_sequence(&body)
+    }
+
+    #[cfg(feature = "ec-custom")]
+    fn specified_curve(p: &BoxedUint, n: &BoxedUint, h: Option<&[u8]>) -> Vec<u8> {
+        let bytes = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8));
+        specified_curve_raw(&bytes(p), &bytes(n), h)
+    }
+
+    /// The width check sits in front of the `BoxedUint` constructor, so an
+    /// oversized INTEGER or OCTET STRING never becomes a bignum at all.
+    #[test]
+    fn bounded_uint_checks_width_before_construction() {
+        assert_eq!(
+            bounded_uint(&[0xff; 73], MAX_BITS).err(),
+            Some(Error::InvalidInput)
+        );
+        assert_eq!(
+            bounded_uint(&[0x01; 64 * 1024], MAX_BITS).err(),
+            Some(Error::InvalidInput)
+        );
+        // Exactly at the bound, with and without a sign octet / padding.
+        let max = bounded_uint(&[0xff; 72], MAX_BITS).unwrap();
+        assert_eq!(max.bit_len(), MAX_BITS);
+        let mut padded = alloc::vec![0u8; 64 * 1024];
+        padded.extend_from_slice(&[0xff; 72]);
+        let same = bounded_uint(&padded, MAX_BITS).unwrap();
+        assert_eq!(same, max);
+        // The padding is dropped, not carried as zero limbs.
+        assert_eq!(same.limbs(), max.limbs());
+        assert_eq!(bounded_uint(&[], 0).unwrap().bit_len(), 0);
+        assert_eq!(bounded_uint(&[0, 0], 0).unwrap().bit_len(), 0);
+        assert_eq!(bounded_uint(&[1], 0).err(), Some(Error::InvalidInput));
+    }
+
+    /// A specifiedCurve with a 64 KiB `p` and `n` and no cofactor used to
+    /// run a 64 KiB × 64 KiB bit-serial division (to recover `h`) before any
+    /// size check — minutes of CPU; it is now refused on the widths alone,
+    /// in every build (a regression shows up as this test hanging).
+    #[test]
+    fn oversized_explicit_parameters_are_rejected_before_arithmetic() {
+        let big = alloc::vec![0x7f; 64 * 1024];
+        let small = [0x7f; 32];
+        // Oversized p (the field width then makes a, b, G oversized too).
+        let der = specified_curve_raw(&big, &big, None);
+        assert_eq!(BoxedCurve::from_der(&der).err(), Some(Error::InvalidInput));
+        // Oversized n alone, with and without a cofactor.
+        let der = specified_curve_raw(&small, &big, None);
+        assert_eq!(BoxedCurve::from_der(&der).err(), Some(Error::InvalidInput));
+        let der = specified_curve_raw(&small, &big, Some(&[1]));
+        assert_eq!(BoxedCurve::from_der(&der).err(), Some(Error::InvalidInput));
+        // Oversized a (an OCTET STRING wider than the field).
+        let mut der = specified_curve_raw(&small, &small, Some(&[1]));
+        let at = der
+            .windows(34)
+            .position(|w| w[..2] == [0x04, 0x20] && w[2..] == [0; 32]);
+        der[at.unwrap() + 2] = 0xff;
+        assert_eq!(BoxedCurve::from_der(&der).err(), Some(Error::InvalidInput));
     }
 }
